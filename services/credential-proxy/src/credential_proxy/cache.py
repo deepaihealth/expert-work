@@ -59,8 +59,16 @@ class SecretCache:
             self._entries.popitem(last=False)
 
     def invalidate_all(self) -> None:
-        """Drop every cached secret — used by ``/admin/cache/invalidate``."""
+        """Drop every cached secret — ``/admin/cache/invalidate`` and the
+        unscoped invalidation-bus events (B-31 ①)."""
         self._entries.clear()
+
+    def invalidate_tenant(self, tenant_id: UUID) -> None:
+        """Drop every cached secret of one tenant — the tenant-scoped
+        invalidation-bus events (B-31 ①). The key already carries the
+        tenant, so this is a filter, not a second index."""
+        for key in [k for k in self._entries if k[0] == tenant_id]:
+            del self._entries[key]
 
     def __len__(self) -> int:
         return len(self._entries)

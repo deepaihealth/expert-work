@@ -45,6 +45,12 @@ class CredentialProxySettings(BaseSettings):
     #: down (subsystems/11 § 9 M0: flat 60s TTL).
     cache_max_size: int = Field(default=10_000, gt=0)
     cache_ttl_s: float = Field(default=60.0, gt=0, le=3600)
+    #: B-31 ① — Redis the control-plane broadcasts cache invalidations on
+    #: (its ``EXPERT_WORK_QUOTA_REDIS_URL``; the k8s Deployment maps that
+    #: Secret key onto this env). Set → the proxy subscribes and drops the
+    #: cache the moment a secret is rotated. Unset → no subscriber, the TTL
+    #: above is the only bound on staleness (logged once at boot).
+    redis_url: str | None = None
 
     # -------------------------------------------------------------- upstream
     upstream_timeout_s: float = Field(default=60.0, gt=0, le=600)

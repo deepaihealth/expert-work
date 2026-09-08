@@ -28,6 +28,7 @@ from credential_proxy.domain import (
 )
 from credential_proxy.egress_proxy import EgressProxyServer
 from credential_proxy.forwarder import AiohttpForwarder
+from credential_proxy.invalidation import InvalidationSubscriber, build_invalidation_subscriber
 from credential_proxy.proxy import CredentialProxy
 from credential_proxy.settings import CredentialProxySettings
 from expert_work.persistence import (
@@ -46,6 +47,9 @@ _ENGINE_KEY: web.AppKey[object] = web.AppKey("engine", object)
 _FORWARDER_KEY: web.AppKey[AiohttpForwarder] = web.AppKey("forwarder", AiohttpForwarder)
 _EGRESS_SERVER_KEY: web.AppKey[asyncio.AbstractServer] = web.AppKey(
     "egress_server", asyncio.AbstractServer
+)
+_INVALIDATION_KEY: web.AppKey[InvalidationSubscriber] = web.AppKey(
+    "invalidation", InvalidationSubscriber
 )
 
 #: Hop-by-hop / body-framing response headers the proxy must not relay
@@ -118,6 +122,14 @@ def _make_startup(settings: CredentialProxySettings):  # type: ignore[no-untyped
         # CodeQL's clear-text-logging query taints any `secret*`-named field.
         logger.info("credential_proxy.start")
 
+        # B-31 ① — drop cached secrets the moment control-plane rotates one,
+        # instead of serving the old value for up to ``cache_ttl_s``. Off
+        # (TTL-only, as before) when no Redis URL is configured.
+        subscriber = build_invalidation_subscriber(settings, cache)
+        if subscriber is not None:
+            subscriber.start()
+            app[_INVALIDATION_KEY] = subscriber
+
         # Transparent egress proxy on its own port + asyncio listener, same
         # event loop (sandbox-egress §3.1). Audited, on by default.
         if settings.egress_enabled:
@@ -137,6 +149,9 @@ def _wall_clock() -> float:
 
 
 async def _cleanup(app: web.Application) -> None:
+    subscriber = app.get(_INVALIDATION_KEY)
+    if subscriber is not None:
+        await subscriber.stop()
     egress_server = app.get(_EGRESS_SERVER_KEY)
     if egress_server is not None:
         egress_server.close()

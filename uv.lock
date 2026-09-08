@@ -996,6 +996,7 @@ dependencies = [
     { name = "expert-work-runtime" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
@@ -1009,6 +1010,7 @@ requires-dist = [
     { name = "expert-work-runtime", editable = "packages/expert-work-runtime" },
     { name = "pydantic", specifier = ">=2.9,<3" },
     { name = "pydantic-settings", specifier = ">=2.5,<3" },
+    { name = "redis", specifier = ">=5.0,<9" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.30,<3" },
 ]
 
