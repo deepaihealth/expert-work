@@ -19,7 +19,13 @@ from expert_work.persistence.models import AuditLogRow, EventLogRow, ThreadMetaR
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # ``disable_existing_loggers`` defaults to True, which sets ``disabled=True``
+    # on every logger created before this point. In the single-process CI
+    # integration job that is every test module's logger (collection imports
+    # them all before the first migration test runs), so their warnings
+    # vanished and caplog came back empty — #1440. The ini's own loggers
+    # (root / sqlalchemy / alembic) are still configured as before.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 if (env_url := os.environ.get("EXPERT_WORK_DB_URL")) is not None:
     # set_main_option values pass through configparser interpolation, so a
