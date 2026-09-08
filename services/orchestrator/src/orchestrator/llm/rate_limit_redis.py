@@ -12,12 +12,12 @@ Same admission contract as the local bucket (see the module docstring of
 :mod:`orchestrator.llm.rate_limit`): an over-limit call **awaits** the
 refill, it never raises — a vendor 429 would count against the E.4 breaker.
 
-Bucket identity ``rl:llm:{handle_key}:{sha256(secret_ref)[:16]}``: the
-handle key (``provider:model[#idx]``) keeps primary / fallback apart as
-before; the credential hash keeps two tenants' own keys for one model apart
-(a vendor's limit is per API key). The hash is of the *reference*, never
-the secret value. ``rl:`` is the control-plane's rate-limit prefix, so the
-keys sort next to the gateway / tenant buckets in the same db.
+Bucket identity ``rl:llm:{handle_key}:{secret_ref}``: the handle key
+(``provider:model[#idx]``) keeps primary / fallback apart as before; the
+credential *reference* (a ``secret://`` name, never the value) keeps two
+tenants' own keys for one model apart — a vendor's limit is per API key.
+``rl:`` is the control-plane's rate-limit prefix, so the keys sort next to
+the gateway / tenant buckets in the same db.
 
 Units (B-32 — the quota bucket shipped with a 1000x refill error that its
 own retry formula agreed with, so write them down): capacity and tokens are
@@ -37,8 +37,8 @@ exactly the pre-波2 behaviour.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from types import TracebackType
@@ -58,6 +58,7 @@ from orchestrator.llm.rate_limit import (
 logger = logging.getLogger(__name__)
 
 _KEY_PREFIX = "rl:llm:"
+_WHITESPACE = re.compile(r"\s")
 
 #: Idle buckets age out (same horizon as the control-plane ``rl:`` buckets).
 _BUCKET_TTL_MS = 30 * 86_400 * 1_000
@@ -90,9 +91,12 @@ return {1, 0}
 
 
 def bucket_key(*, key: str, secret_ref: str) -> str:
-    """``rl:llm:{handle_key}:{sha256(secret_ref)[:16]}`` — see module docstring."""
-    digest = hashlib.sha256(secret_ref.encode("utf-8")).hexdigest()[:16]
-    return f"{_KEY_PREFIX}{key}:{digest}"
+    """``rl:llm:{handle_key}:{secret_ref}`` — see module docstring.
+
+    The reference goes in verbatim except for whitespace (a Redis key is
+    binary-safe, but a space or newline would make it unreadable in ops
+    tooling and ambiguous in logs)."""
+    return f"{_KEY_PREFIX}{key}:{_WHITESPACE.sub('_', secret_ref)}"
 
 
 class RedisRpmLimiter:
@@ -173,7 +177,7 @@ class RedisRpmLimiter:
         argv = [
             str(self._capacity),
             repr(self._refill_per_s),
-            str(int(self._clock() * 1000)),
+            str(round(self._clock() * 1000)),
             str(_BUCKET_TTL_MS),
         ]
         result: Any
@@ -192,11 +196,12 @@ class RedisRpmLimiter:
         first = self._reprobe_at is None
         self._reprobe_at = self._clock() + self.REPROBE_S
         if first:
+            # Class name only: redis-py error text can carry the connection
+            # URL, password included.
             logger.warning(
-                "rate_limit.redis_degraded bucket=%s error=%s:%s fallback_rpm=%s",
+                "rate_limit.redis_degraded bucket=%s error=%s fallback_rpm=%s",
                 self._key,
                 type(exc).__name__,
-                exc,
                 self._local.max_rate,
             )
 

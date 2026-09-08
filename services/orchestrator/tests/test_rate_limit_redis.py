@@ -194,7 +194,7 @@ async def test_argv_carries_capacity_in_requests_and_rate_in_requests_per_second
     assert argv_60[2] == str(int(clock.now * 1000)), "now travels in milliseconds"
 
 
-def test_bucket_key_is_handle_key_plus_hashed_credential_ref() -> None:
+def test_bucket_key_is_handle_key_plus_credential_ref() -> None:
     key_a = bucket_key(
         key="anthropic:claude-sonnet-4-6#1", secret_ref="secret://tenant-a/anthropic"
     )
@@ -202,12 +202,12 @@ def test_bucket_key_is_handle_key_plus_hashed_credential_ref() -> None:
         key="anthropic:claude-sonnet-4-6#1", secret_ref="secret://tenant-b/anthropic"
     )
 
-    assert key_a.startswith("rl:llm:anthropic:claude-sonnet-4-6#1:")
+    assert key_a == "rl:llm:anthropic:claude-sonnet-4-6#1:secret://tenant-a/anthropic"
     assert key_a != key_b, "two credentials for one model are two upstream limits"
-    assert key_a == bucket_key(
-        key="anthropic:claude-sonnet-4-6#1", secret_ref="secret://tenant-a/anthropic"
-    )
-    assert "tenant-a" not in key_a, "the ref itself must not appear in the key"
+    assert (
+        bucket_key(key="openai:gpt-4o", secret_ref="secret://odd name\nwith\tspace")
+        == "rl:llm:openai:gpt-4o:secret://odd_name_with_space"
+    ), "only whitespace is escaped; the ref stays readable in the key"
 
 
 def test_factory_builds_a_redis_limiter_per_handle() -> None:
@@ -304,6 +304,27 @@ async def test_redis_error_degrades_to_local_division_bucket_and_logs_once(
 
 
 @pytest.mark.asyncio
+async def test_degrade_log_carries_the_exception_class_but_never_its_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """redis-py error text can embed the connection URL (password included);
+    the warning names the exception class only."""
+    caplog.set_level(logging.WARNING, logger="orchestrator.llm.rate_limit_redis")
+    redis = _FakeBucketRedis()
+    redis.fail_with = RedisConnectionError(
+        "Error connecting to redis://default:hunter2-s3cret@redis.internal:6379/0"
+    )
+    clock = _FakeClock()
+
+    await _limiter(redis, clock, rpm=100).acquire()
+
+    (record,) = _degrade_records(caplog)
+    assert "ConnectionError" in record.getMessage()
+    assert "hunter2-s3cret" not in caplog.text
+    assert "redis.internal" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_degraded_bucket_does_not_touch_redis_until_the_reprobe_cooldown(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -396,6 +417,6 @@ async def test_cancellation_is_not_swallowed_as_degradation() -> None:
     await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        _ = await task
 
     assert limiter.degraded is False

@@ -89,14 +89,16 @@ class AdmissionLimiter(Protocol):
     per upstream credential shared by every replica — 波 2 线 A).
     """
 
-    async def __aenter__(self) -> None: ...
+    async def __aenter__(self) -> None:
+        """Await admission of one request."""
 
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         tb: TracebackType | None,
-    ) -> None: ...
+    ) -> None:
+        """Nothing to release — tokens are not refunded on exit."""
 
 
 class RateLimiterFactory(Protocol):
@@ -109,7 +111,8 @@ class RateLimiterFactory(Protocol):
     per-process default applies :func:`effective_rpm`.
     """
 
-    def __call__(self, *, key: str, secret_ref: str, rate_limit_rpm: int) -> AdmissionLimiter: ...
+    def __call__(self, *, key: str, secret_ref: str, rate_limit_rpm: int) -> AdmissionLimiter:
+        """Return the limiter the handle's :class:`RateLimitedProvider` wraps."""
 
 
 @dataclass

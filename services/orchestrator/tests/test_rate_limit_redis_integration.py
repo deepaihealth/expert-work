@@ -5,19 +5,25 @@ they cannot catch a wrong Lua. This file runs the script itself and pins its
 **units** (B-32: the quota bucket shipped with a 1000x refill error that its
 own retry formula agreed with):
 
-* a deficit of one token at 1 req/s is reported as ~1000 ms, not 1 s or 1 µs;
+* a deficit of one token at 1 req/s is reported as 1000 ms, not 1 s or 1 µs;
 * 50 ms later the bucket is still empty (refill is not 1000x too fast);
 * ~1 s later it has a token back (refill is not zero).
 
+Time is **injected**: the limiter takes ``clock`` (what it stamps into
+``now_ms`` for the Lua — production uses the wall clock the same way, the
+script never reads the server clock) and ``sleep`` (here: record the
+requested duration and advance the clock). Every assertion is therefore
+exact and independent of CI speed, while the arithmetic under test is still
+Redis's.
+
 Plus the properties the design rests on: two limiters on one key share the
-bucket and the 4th call really waits for the refill; different keys are
-independent; ``SCRIPT FLUSH`` is survived; an unreachable Redis degrades to
-the local bucket instead of failing the call.
+bucket and the 4th call waits for the refill; different keys are independent;
+``SCRIPT FLUSH`` is survived; an unreachable Redis degrades to the local
+bucket instead of failing the call.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -51,18 +57,34 @@ async def redis_client(redis_container: RedisContainer) -> AsyncIterator[redis_a
         await client.aclose()
 
 
-class _AbortError(Exception):
-    """Raised by the recording sleep so a denied acquire surfaces the Lua's
-    retry hint instead of actually waiting."""
+class _FakeClock:
+    """Injected wall clock: ``sleep`` records the duration the limiter asked
+    for and advances the clock instead of waiting. Kept in whole
+    milliseconds so the ``now_ms`` the limiter stamps is exact."""
 
-
-class _RecordingSleep:
     def __init__(self) -> None:
-        self.seconds: list[float] = []
+        self.now_ms = 1_700_000_000_000
+        self.sleeps: list[float] = []
 
-    async def __call__(self, seconds: float) -> None:
-        self.seconds.append(seconds)
-        raise _AbortError
+    def time(self) -> float:
+        return self.now_ms / 1000
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now_ms += round(seconds * 1000)
+
+
+def _limiter(
+    client: redis_async.Redis, clock: _FakeClock, *, key: str, rpm: int, period_s: float
+) -> RedisRpmLimiter:
+    return RedisRpmLimiter(
+        redis_client=client,
+        bucket_key=key,
+        rate_limit_rpm=rpm,
+        time_period_s=period_s,
+        clock=clock.time,
+        sleep=clock.sleep,
+    )
 
 
 # --------------------------------------------------------------------- units
@@ -71,34 +93,31 @@ class _RecordingSleep:
 @pytest.mark.asyncio
 async def test_lua_units_retry_in_ms_refill_per_second(redis_client: redis_async.Redis) -> None:
     """rpm=2 over 2 s → capacity 2, refill 1 req/s."""
-    sleep = _RecordingSleep()
-    limiter = RedisRpmLimiter(
-        redis_client=redis_client,
-        bucket_key="rl:llm:it:units",
-        rate_limit_rpm=2,
-        time_period_s=2.0,
-        sleep=sleep,
-    )
+    clock = _FakeClock()
+    limiter = _limiter(redis_client, clock, key="rl:llm:it:units", rpm=2, period_s=2.0)
 
     await limiter.acquire()
     await limiter.acquire()  # capacity of 2 spent
+    assert clock.sleeps == []
 
-    with pytest.raises(_AbortError):
-        await limiter.acquire()
-    assert 0.9 <= sleep.seconds[-1] <= 1.0, (
-        f"one token owed at 1 req/s is ~1000 ms, got {sleep.seconds[-1]}s"
+    await limiter.acquire()
+    assert clock.sleeps == [pytest.approx(1.0, abs=0.001)], (
+        "one token owed at 1 req/s is 1000 ms — not 1 (seconds) and not 1e-3 (µs)"
     )
 
-    await asyncio.sleep(0.05)
-    with pytest.raises(_AbortError):
-        await limiter.acquire()
-    assert 0.85 <= sleep.seconds[-1] <= 0.96, (
-        "50 ms at 1 req/s must NOT refill a token (B-32: not 1000x too fast)"
+    # The sleep above advanced the clock exactly to the refill point and the
+    # call went through, so the bucket is empty again at ``now``.
+    clock.now_ms += 50
+    await limiter.acquire()
+    assert clock.sleeps[-1] == pytest.approx(0.95, abs=0.001), (
+        "50 ms at 1 req/s refills 0.05 token, so 0.95 is still owed (B-32: not 1000x too fast)"
     )
 
-    await asyncio.sleep(1.0)
-    await limiter.acquire()  # no sleep → no _AbortError: a token came back
-    assert len(sleep.seconds) == 2, "1.05 s at 1 req/s owes exactly one token"
+    clock.now_ms += 1000
+    await limiter.acquire()
+    assert len(clock.sleeps) == 2, (
+        "a full second at 1 req/s owes no wait at all (refill is not zero)"
+    )
 
 
 # ------------------------------------------------------------------ sharing
@@ -108,49 +127,34 @@ async def test_lua_units_retry_in_ms_refill_per_second(redis_client: redis_async
 async def test_two_limiters_share_one_bucket_and_wait_for_real_refill(
     redis_client: redis_async.Redis,
 ) -> None:
-    """rpm=3 over 1 s: A,B,A pass instantly; the 4th waits ~333 ms on the
-    shared bucket, then goes through."""
+    """rpm=3 over 1 s: A,B,A pass; the 4th (on B) waits one refill of the
+    shared bucket — 1/3 s, as reported by the Lua — then goes through."""
+    clock = _FakeClock()
+    replica_a = _limiter(redis_client, clock, key="rl:llm:it:shared", rpm=3, period_s=1.0)
+    replica_b = _limiter(redis_client, clock, key="rl:llm:it:shared", rpm=3, period_s=1.0)
 
-    def _replica() -> RedisRpmLimiter:
-        return RedisRpmLimiter(
-            redis_client=redis_client,
-            bucket_key="rl:llm:it:shared",
-            rate_limit_rpm=3,
-            time_period_s=1.0,
-        )
-
-    replica_a = _replica()
-    replica_b = _replica()
-
-    start = time.monotonic()
     await replica_a.acquire()
     await replica_b.acquire()
     await replica_a.acquire()
-    burst = time.monotonic() - start
-    await replica_b.acquire()
-    total = time.monotonic() - start
+    assert clock.sleeps == [], "3 calls fit the shared 3-token bucket"
 
-    assert burst < 0.3, f"3 calls fit the shared 3-token bucket; took {burst:.3f}s"
-    assert 0.25 <= total < 1.0, (
-        f"4th call across replicas waits one refill (~0.333s); total {total:.3f}s"
+    await replica_b.acquire()
+    assert clock.sleeps == [pytest.approx(1 / 3, abs=0.002)], (
+        "4th call across replicas waits one refill (ceil(333.3 ms) reported by the Lua)"
     )
     assert replica_a.degraded is False and replica_b.degraded is False
 
 
 @pytest.mark.asyncio
 async def test_different_keys_are_independent(redis_client: redis_async.Redis) -> None:
-    primary = RedisRpmLimiter(
-        redis_client=redis_client, bucket_key="rl:llm:it:p", rate_limit_rpm=1, time_period_s=60.0
-    )
-    fallback = RedisRpmLimiter(
-        redis_client=redis_client, bucket_key="rl:llm:it:f", rate_limit_rpm=1, time_period_s=60.0
-    )
+    clock = _FakeClock()
+    primary = _limiter(redis_client, clock, key="rl:llm:it:p", rpm=1, period_s=60.0)
+    fallback = _limiter(redis_client, clock, key="rl:llm:it:f", rpm=1, period_s=60.0)
 
-    start = time.monotonic()
     await primary.acquire()
     await fallback.acquire()
 
-    assert time.monotonic() - start < 0.3
+    assert clock.sleeps == [], "each key has its own 1-token bucket"
 
 
 # --------------------------------------------------------------- resilience
@@ -158,12 +162,8 @@ async def test_different_keys_are_independent(redis_client: redis_async.Redis) -
 
 @pytest.mark.asyncio
 async def test_script_flush_is_survived(redis_client: redis_async.Redis) -> None:
-    limiter = RedisRpmLimiter(
-        redis_client=redis_client,
-        bucket_key="rl:llm:it:noscript",
-        rate_limit_rpm=10,
-        time_period_s=60.0,
-    )
+    clock = _FakeClock()
+    limiter = _limiter(redis_client, clock, key="rl:llm:it:noscript", rpm=10, period_s=60.0)
     await limiter.acquire()
     await redis_client.script_flush()
 
@@ -171,7 +171,7 @@ async def test_script_flush_is_survived(redis_client: redis_async.Redis) -> None
 
     assert limiter.degraded is False
     tokens = await redis_client.hget("rl:llm:it:noscript", "tokens")
-    assert tokens is not None and float(tokens) == pytest.approx(8.0, abs=0.01)
+    assert tokens is not None and float(tokens) == pytest.approx(8.0, abs=0.001)
 
 
 @pytest.mark.asyncio
@@ -194,6 +194,8 @@ async def test_unreachable_redis_degrades_to_local_bucket(
         await dead.aclose()
 
     assert limiter.degraded is True
+    # Connection refused is immediate; the bound only guards against the
+    # call being stuck on Redis (the limiter's own op timeout is 2 s).
     assert elapsed < 2.0, "the call is served locally, not stuck on Redis"
     warnings = [r for r in caplog.records if "rate_limit.redis_degraded" in r.getMessage()]
     assert len(warnings) == 1

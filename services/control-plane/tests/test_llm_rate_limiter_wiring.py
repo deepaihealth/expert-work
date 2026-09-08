@@ -15,10 +15,13 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from control_plane.app import create_app
-from control_plane.runtime import make_agent_builder, resolve_defenses
+from control_plane.aux_model_adapter import make_llm_router_aux_model
+from control_plane.quality_judge import QualityJudge
+from control_plane.runtime import DynamicResolvingReranker, make_agent_builder, resolve_defenses
 from control_plane.settings import Settings
 from control_plane.subagent_runtime import make_child_agent_builder, make_worker_build_fn
 from expert_work.common.credentials import CredentialsResolver
@@ -198,6 +201,105 @@ async def test_judge_caller_uses_the_factory() -> None:
     assert isinstance(defenses.output_judge, LLMOutputJudge)
     assert [c["key"] for c in spy.calls] == ["anthropic:claude-haiku-4-5"]
     assert spy.calls[0]["secret_ref"] == f"secret://{_ANTHROPIC_KEY_NAME}"
+
+
+# ------------------------------------ the three non-agent LLM callers (审查补)
+
+
+class _FakeResolver:
+    async def resolve_provider(self, *, tenant_id: Any, provider: Any) -> str:
+        return f"secret://{provider}"
+
+
+def _capture_router_kwargs(monkeypatch: pytest.MonkeyPatch, target: str) -> dict[str, Any]:
+    """Replace ``build_llm_router`` at ``target`` with a recorder that hands
+    back a router answering with a fixed structured verdict."""
+    captured: dict[str, Any] = {}
+
+    async def _router(*, messages: Any, tools: Any, output_schema: Any = None) -> AIMessage:
+        return AIMessage(
+            content="ok",
+            additional_kwargs={
+                "parsed": {
+                    "overall": 4,
+                    "addressed_request": 4,
+                    "coherence": 4,
+                    "safety": 5,
+                    "rationale": "fine",
+                }
+            },
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    async def _fake_build(spec: Any, *, secret_store: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _router
+
+    monkeypatch.setattr(target, _fake_build, raising=False)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_dynamic_reranker_llm_branch_passes_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Cfg:
+        async def effective_rerank_config(self) -> tuple[str, str]:
+            return ("anthropic", "claude-haiku-4-5")  # chat model → LLM rerank branch
+
+    class _FakeLLMReranker:
+        def __init__(self, *, llm_caller: Any) -> None:
+            pass
+
+        async def rerank(self, **_kw: Any) -> list[int]:
+            return [0]
+
+    captured = _capture_router_kwargs(monkeypatch, "control_plane.runtime.build_llm_router")
+    monkeypatch.setattr("control_plane.runtime.LLMReranker", _FakeLLMReranker)
+    spy = _Spy()
+    reranker = DynamicResolvingReranker(
+        config_service=_Cfg(),  # type: ignore[arg-type]
+        resolver=_FakeResolver(),  # type: ignore[arg-type]
+        secret_store=object(),  # type: ignore[arg-type]
+        rate_limiter_factory=spy,
+    )
+
+    await reranker.rerank(query="q", documents=["a"], top_k=1, tenant_id=uuid4())
+
+    assert captured["rate_limiter_factory"] is spy
+
+
+@pytest.mark.asyncio
+async def test_aux_model_adapter_passes_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _capture_router_kwargs(monkeypatch, "orchestrator.build_llm_router")
+    spy = _Spy()
+    aux = make_llm_router_aux_model(
+        resolver=_FakeResolver(),  # type: ignore[arg-type]
+        secret_store=object(),  # type: ignore[arg-type]
+        default_provider="anthropic",
+        default_model="claude-haiku-4-5",
+        rate_limiter_factory=spy,
+    )
+
+    await aux(prompt="p", model=None, tenant_id=uuid4())
+
+    assert captured["rate_limiter_factory"] is spy
+
+
+@pytest.mark.asyncio
+async def test_quality_judge_passes_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _capture_router_kwargs(monkeypatch, "orchestrator.build_llm_router")
+    spy = _Spy()
+    judge = QualityJudge(
+        resolver=_FakeResolver(),  # type: ignore[arg-type]
+        secret_store=object(),  # type: ignore[arg-type]
+        rate_limiter_factory=spy,
+    )
+
+    result = await judge.score(
+        tenant_id=uuid4(), prompt="q", reply="a", provider="anthropic", model="claude-haiku-4-5"
+    )
+
+    assert result is not None, "the stubbed router must have been reached"
+    assert captured["rate_limiter_factory"] is spy
 
 
 # ------------------------------------------------------------ app lifespan

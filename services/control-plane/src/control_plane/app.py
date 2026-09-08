@@ -1704,6 +1704,8 @@ def create_app(
                     secret_store=resolved_secret_store,
                     http=shared_http,
                     secret_cache=credential_value_cache,
+                    # 波 2 线 A — the LLM-rerank branch is a real vendor call.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 )
                 knowledge_retriever = make_knowledge_retriever(
                     store=resolved_knowledge_store, embedder=embedder, reranker=reranker
@@ -2040,6 +2042,8 @@ def create_app(
                     default_provider=default_provider,
                     default_model=(resolved_settings.memory_consolidator_default_aux_model),
                     secret_cache=credential_value_cache,
+                    # 波 2 线 A — consolidator calls draw from the global RPM bucket.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 )
                 memory_consolidator = MemoryConsolidator(
                     memory_store=resolved_memory_store,
@@ -2115,6 +2119,8 @@ def create_app(
                         default_provider=se_provider,
                         default_model=resolved_settings.memory_consolidator_default_aux_model,
                         secret_cache=credential_value_cache,
+                        # 波 2 线 A — evolution-worker aux calls share the global bucket.
+                        rate_limiter_factory=llm_rate_limiter_factory,
                     ),
                     aux_default_model=resolved_settings.memory_consolidator_default_aux_model,
                     tenant_gate=_skill_evolution_tenant_gate,
@@ -2248,6 +2254,8 @@ def create_app(
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
                     secret_cache=credential_value_cache,
+                    # 波 2 线 A — quality-judge calls share the global RPM bucket.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 ),
                 runtime=resolved_agent_runtime,
                 usage_store=resolved_token_usage,
