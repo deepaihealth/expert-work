@@ -42,6 +42,29 @@ async def test_is_suspended_reads_scoped_to_the_tenant_it_asks_about() -> None:
 
 
 @pytest.mark.asyncio
+async def test_is_suspended_restores_context_when_the_store_raises() -> None:
+    """The scoped read resets both ContextVars (LIFO) even when the store
+    blows up mid-read — the caller's context must never leak."""
+
+    class _ExplodingStore(InMemoryTenantConfigStore):
+        async def get(self, *, tenant_id: UUID) -> TenantConfigRecord | None:
+            raise RuntimeError("db down")
+
+    svc = TenantStatusService(store=_ExplodingStore())
+    outer_tenant = uuid4()
+    token_t = current_tenant_id_var.set(outer_tenant)
+    token_b = bypass_rls_var.set(True)
+    try:
+        with pytest.raises(RuntimeError, match="db down"):
+            await svc.is_suspended(uuid4())
+        assert current_tenant_id_var.get() == outer_tenant
+        assert bypass_rls_var.get() is True
+    finally:
+        bypass_rls_var.reset(token_b)
+        current_tenant_id_var.reset(token_t)
+
+
+@pytest.mark.asyncio
 async def test_missing_row_reads_as_not_suspended() -> None:
     svc = TenantStatusService(store=InMemoryTenantConfigStore())
     assert await svc.is_suspended(uuid4()) is False

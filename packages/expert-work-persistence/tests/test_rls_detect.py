@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -35,6 +36,7 @@ from expert_work.persistence.rls import (
     _rls_after_begin,
     bypass_rls_var,
     current_tenant_id_var,
+    current_user_id_var,
 )
 
 _LOGGER_NAME = "expert_work.persistence.rls"
@@ -46,11 +48,13 @@ def reset_context() -> Iterator[None]:
     """Each test gets a clean ContextVar state and a fresh rate-limit window."""
     token_b = bypass_rls_var.set(False)
     token_t = current_tenant_id_var.set(None)
+    token_u = current_user_id_var.set(None)
     rls._reset_signal_state()
     try:
         yield
     finally:
         rls._reset_signal_state()
+        current_user_id_var.reset(token_u)
         bypass_rls_var.reset(token_b)
         current_tenant_id_var.reset(token_t)
 
@@ -240,3 +244,99 @@ def test_rate_limit_is_per_caller(
     assert len(callers) == 2
     assert callers[0].endswith(" _fire_listener")
     assert callers[1].endswith(" other_call_site")
+
+
+def test_signal_state_is_bounded_and_evicts_the_oldest_window(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-caller table cannot grow without bound: past the cap the
+    caller whose window started earliest is evicted — a new caller's first
+    occurrence still logs."""
+    clock = [1000.0]
+
+    def ticking_monotonic() -> float:
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(rls, "_monotonic", ticking_monotonic)
+    monkeypatch.setattr(rls, "_SIGNAL_MAX_CALLERS", 2)
+
+    def site_a() -> None:
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    def site_b() -> None:
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    def site_c() -> None:
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        site_a()
+        site_b()
+        site_c()
+
+    callers = [r.__dict__["rls_caller"] for r in _signal_records(caplog)]
+    assert [c.rsplit(" ", 1)[1] for c in callers] == ["site_a", "site_b", "site_c"]
+    tracked = sorted(key.rsplit(" ", 1)[1] for key in rls._signal_state)
+    assert tracked == ["site_b", "site_c"]
+
+
+# --- the signal must never break the transaction --------------------------
+
+
+def test_detect_failure_never_reaches_the_transaction(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attribution / rate limiting / logging blowing up is reported as one
+    ``rls.detect_failed`` line (exception class, once per type) and the
+    listener carries on with its real job — it never raises out of
+    ``after_begin`` and kills the transaction."""
+
+    def broken_locate() -> tuple[str, str | None]:
+        raise RuntimeError("attribution exploded")
+
+    monkeypatch.setattr(rls, "_locate_caller", broken_locate)
+    # Give the listener work to do *after* the failed emit: a user-scoped
+    # session still needs its ``app.user_id`` GUC.
+    current_user_id_var.set(uuid4())
+    connection = MagicMock()
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        _rls_after_begin(MagicMock(), MagicMock(), connection)
+        _rls_after_begin(MagicMock(), MagicMock(), connection)
+
+    assert connection.execute.call_count == 2
+    assert _signal_records(caplog) == []
+    failures = [
+        r for r in caplog.records if r.name == _LOGGER_NAME and r.message == "rls.detect_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].__dict__["error"] == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "current",
+    [object(), SimpleNamespace(parent=SimpleNamespace(parent=None))],
+    ids=["no-parent-attribute", "parent-without-gr_frame"],
+)
+def test_attribution_degrades_to_plain_stack_without_greenlet_parent(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, current: object
+) -> None:
+    """A greenlet that exposes no ``parent`` / ``gr_frame`` (the main
+    greenlet, a foreign implementation) must not break attribution — the
+    plain stack is still walked and names this frame."""
+
+    def stub_getcurrent() -> object:
+        return current
+
+    monkeypatch.setattr(rls, "getcurrent", stub_getcurrent)
+    # Make the plain stack yield no early answer, so the walk has to continue
+    # into the greenlet section and actually touch the stub.
+    monkeypatch.setattr(rls, "_STORE_LAYER_PREFIXES", ("",))
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    (record,) = _signal_records(caplog)
+    caller = record.__dict__["rls_caller"]
+    assert caller.endswith(" test_attribution_degrades_to_plain_stack_without_greenlet_parent")

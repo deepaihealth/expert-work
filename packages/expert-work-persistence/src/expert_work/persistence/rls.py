@@ -155,26 +155,36 @@ _STORE_LAYER_PREFIXES: Final[tuple[str, ...]] = ("expert_work.persistence.", "ex
 #: instead of a line per transaction.
 _SIGNAL_MAX_PER_WINDOW: int = 10
 _SIGNAL_WINDOW_S: float = 60.0
+#: Upper bound on tracked callers; past it the caller whose window started
+#: earliest is evicted (a newcomer's first occurrence still logs).
+_SIGNAL_MAX_CALLERS: int = 512
 _signal_lock = threading.Lock()
 _signal_state: dict[str, tuple[float, int]] = {}
+#: Exception class names already reported as ``rls.detect_failed``.
+_detect_failures: set[str] = set()
 _monotonic = time.monotonic
 
 
 def _iter_frames() -> Iterator[FrameType]:
     """Yield frames from the current stack outward, then from each parent
     greenlet's suspended stack — the only way to reach the ``await``-side
-    application frames from inside a ``greenlet_spawn``'d ORM call."""
+    application frames from inside a ``greenlet_spawn``'d ORM call.
+
+    The greenlet attributes are read defensively: the main greenlet has no
+    parent, and a foreign greenlet implementation may expose neither
+    ``parent`` nor ``gr_frame`` — either way we degrade to the plain stack.
+    """
     frame: FrameType | None = sys._getframe()
     while frame is not None:
         yield frame
         frame = frame.f_back
-    parent = getcurrent().parent
+    parent = getattr(getcurrent(), "parent", None)
     while parent is not None:
-        frame = parent.gr_frame
+        frame = getattr(parent, "gr_frame", None)
         while frame is not None:
             yield frame
             frame = frame.f_back
-        parent = parent.parent
+        parent = getattr(parent, "parent", None)
 
 
 def _module_of(frame: FrameType) -> str:
@@ -214,7 +224,11 @@ def _locate_caller() -> tuple[str, str | None]:
 def _should_emit(caller: str, now: float) -> tuple[bool, int]:
     """Apply the per-caller window; returns ``(emit, suppressed_last_window)``."""
     with _signal_lock:
-        start, count = _signal_state.get(caller, (now, 0))
+        entry = _signal_state.get(caller)
+        if entry is None and len(_signal_state) >= _SIGNAL_MAX_CALLERS:
+            oldest = min(_signal_state, key=lambda key: _signal_state[key][0])
+            del _signal_state[oldest]
+        start, count = entry if entry is not None else (now, 0)
         suppressed = 0
         if now - start >= _SIGNAL_WINDOW_S:
             suppressed = max(0, count - _SIGNAL_MAX_PER_WINDOW)
@@ -225,24 +239,41 @@ def _should_emit(caller: str, now: float) -> tuple[bool, int]:
 
 
 def _reset_signal_state() -> None:
-    """Test hook — forget every caller's window."""
+    """Test hook — forget every caller's window and every reported failure."""
     with _signal_lock:
         _signal_state.clear()
+        _detect_failures.clear()
+
+
+def _report_detect_failure(exc: Exception) -> None:
+    """One ``rls.detect_failed`` line per exception type, per process."""
+    name = type(exc).__name__
+    with _signal_lock:
+        if name in _detect_failures:
+            return
+        _detect_failures.add(name)
+    logger.warning("rls.detect_failed", extra={"error": name}, exc_info=exc)
 
 
 def _emit_would_fail_closed() -> None:
-    caller, outer = _locate_caller()
-    emit, suppressed = _should_emit(caller, _monotonic())
-    if not emit:
-        return
-    logger.warning(
-        "rls.would_fail_closed",
-        extra={
-            "rls_caller": caller,
-            "rls_caller_outer": outer,
-            "rls_suppressed": suppressed,
-        },
-    )
+    # The signal is observability only. Attribution, the rate limiter and the
+    # log call itself must never raise out of ``after_begin`` — that would
+    # kill the caller's transaction over a diagnostic.
+    try:
+        caller, outer = _locate_caller()
+        emit, suppressed = _should_emit(caller, _monotonic())
+        if not emit:
+            return
+        logger.warning(
+            "rls.would_fail_closed",
+            extra={
+                "rls_caller": caller,
+                "rls_caller_outer": outer,
+                "rls_suppressed": suppressed,
+            },
+        )
+    except Exception as exc:
+        _report_detect_failure(exc)
 
 
 def _emit_set_config(connection: Connection, name: str, value: str) -> None:
