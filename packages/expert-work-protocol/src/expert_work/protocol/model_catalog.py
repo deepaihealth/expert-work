@@ -65,6 +65,14 @@ class ModelEntry(BaseModel):
     # and keeps its provider-branch handling.
     always_thinking: bool = False
     sampling: bool = True
+    # B-33 — the model accepts exactly ONE ``temperature`` value (vendor 400
+    # on anything else). The agent factory clamps the manifest value to it
+    # at build time and logs a warning, so the vendor 400 never becomes the
+    # validator (seen live 2026-08-28: an agent switched to kimi-k3 kept its
+    # old 0.9 and every run died at the first call). ``None`` = no
+    # constraint, manifest value sent as-is. Declared only where the vendor
+    # docs say so; first case kimi-k3 (``temperature=1`` only).
+    temperature_fixed: float | None = None
     # Stream HX-13 (Mini-ADR HX-J5) — vendor-native tool-disclosure tier:
     #   "native_search"  — Anthropic tool-search beta: deferred tools go to
     #                      the API with ``defer_loading: true`` (server-side
@@ -179,9 +187,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # (thinking docs 2026-08; the earlier max-only restriction is lifted).
     # The adapter maps the unified levels (no "medium" on K3), floors "off"
     # at low, and must NOT send the K2.x ``thinking.type`` param (the K3
-    # docs forbid it). (K3's sampling params are fixed; the openai-compat
-    # build path does not honor ``sampling=False`` today — only the
-    # anthropic path does — so temperature is still sent and K3 ignores it.)
+    # docs forbid it). K3's ``temperature`` is fixed at 1 — any other value
+    # is a vendor 400 (confirmed live 2026-08-28, B-33), NOT ignored — so
+    # the entry declares ``temperature_fixed=1.0`` and the factory clamps.
     # kimi-k2.6 (2026-04-20) is natively multimodal — text + image + video via
     # the MoonViT encoder — with a 256K context; k2.5 also accepts images and is
     # 256K too (K2.6's gain over K2.5 is stability at length, not window size).
@@ -193,6 +201,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="effort",
             thinking_default=True,
+            temperature_fixed=1.0,
         ),
         ModelEntry(
             name="kimi-k2.6",

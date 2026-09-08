@@ -2344,6 +2344,35 @@ def _flatten_chain(model: ModelSpec) -> list[ModelSpec]:
     return flat
 
 
+def _constrained_temperature(model: ModelSpec, entry: ModelEntry | None) -> float:
+    """B-33 — apply the catalog's ``temperature_fixed`` constraint.
+
+    A model that accepts exactly one ``temperature`` (kimi-k3: 1 only) turns
+    any other manifest value into a vendor 400 that kills the whole run —
+    seen live after an agent switched model and kept its old 0.9. The
+    catalog declares the constraint; this clamps at build time and says so,
+    instead of letting the vendor 400 act as the validator. Off-catalog and
+    unconstrained entries pass the manifest value through untouched.
+
+    The warning fires for the ``ModelSpec.temperature`` default (0.2) too:
+    stored manifests are a full ``model_dump``, so an omitted temperature is
+    indistinguishable from an explicit 0.2 here, and 0.2 would 400 all the
+    same. Model name + numbers only — no tenant data in the log line.
+    """
+    if entry is None or entry.temperature_fixed is None:
+        return model.temperature
+    if model.temperature == entry.temperature_fixed:
+        return model.temperature
+    logger.warning(
+        "agent_factory.temperature_clamped model=%s configured=%s fixed=%s — the model "
+        "accepts only this temperature; set it in the manifest to silence this",
+        model.name,
+        model.temperature,
+        entry.temperature_fixed,
+    )
+    return entry.temperature_fixed
+
+
 def _build_provider(
     model: ModelSpec,
     api_key: str,
@@ -2391,7 +2420,7 @@ def _build_provider(
                 f"model {model.name!r} has no thinking toggle; "
                 "remove model.thinking_enabled from the manifest"
             )
-        temperature: float | None = model.temperature
+        temperature: float | None = _constrained_temperature(model, entry)
         if entry is not None and not entry.sampling:
             # Opus 4.7+ removed sampling params — sending one is a 400.
             if temperature is not None:
@@ -2441,12 +2470,13 @@ def _build_provider(
             model.effort,
         )
     thinking_payload = _thinking_payload(model)
+    compat_temperature = _constrained_temperature(model, compat_entry)
 
     if provider == "openai":
         return OpenAIProvider(
             client=HTTPOpenAIClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
-            temperature=model.temperature,
+            temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
         )
@@ -2472,7 +2502,7 @@ def _build_provider(
         return OpenAICompatibleProvider(
             client=make_client(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
-            temperature=model.temperature,
+            temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
             stream_extra_body=stream_extra_body,
@@ -2486,7 +2516,7 @@ def _build_provider(
                 api_key, base_url=model.base_url, timeout_s=timeout_eff, http=http_client
             ),
             model=model.name,
-            temperature=model.temperature,
+            temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
         )
@@ -2507,7 +2537,7 @@ def _build_provider(
                 http=http_client,
             ),
             model=model.name,
-            temperature=model.temperature,
+            temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
         )
