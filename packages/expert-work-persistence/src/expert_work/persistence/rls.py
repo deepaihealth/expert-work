@@ -44,10 +44,18 @@ PgBouncer compatibility:
 from __future__ import annotations
 
 import logging
+import sys
+import threading
+import time
+from collections.abc import Iterator
 from contextvars import ContextVar
+from types import FrameType
 from typing import Final
 from uuid import UUID
 
+# greenlet is what ``sqlalchemy[asyncio]`` runs every sync ORM call on; it
+# ships no type stubs (SQLAlchemy itself imports it under a local Protocol).
+from greenlet import getcurrent  # type: ignore[import-untyped]
 from sqlalchemy import event, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -103,6 +111,138 @@ bypass_rls_var: ContextVar[bool] = ContextVar(
 # registry survives.
 _LISTENER_INSTALLED: list[bool] = []
 
+# ---------------------------------------------------------------------------
+# Phase-1 Detect signal attribution (``rls.would_fail_closed``).
+#
+# The signal is only useful if each occurrence names the code path that
+# opened a session with neither tenant context nor explicit bypass. Two
+# things defeated the original ``stack_info=True`` attempt:
+#
+# * The JSON formatter (expert_work.common.observability.log) drops
+#   ``stack_info`` as a reserved LogRecord attribute, so production logs
+#   carried a byte-identical message and nothing else.
+# * Even in a plain-text sink the stack would have been useless: the ORM
+#   runs every sync call inside a *greenlet* (``greenlet_spawn``), and a
+#   greenlet's frame chain stops at its own entry point. From inside the
+#   listener, ``sys._getframe()`` only ever sees SQLAlchemy frames. The
+#   application frames live on the **parent** greenlet's suspended stack.
+#
+# So: walk the current stack, then continue into the parent greenlet's
+# ``gr_frame`` chain (and its parents'), skip the transport layers that sit
+# on every path, and report the first frame outside the store layer as
+# ``rls_caller`` (the code that owns the tenant context) plus the next
+# frame as ``rls_caller_outer``.
+# ---------------------------------------------------------------------------
+
+#: Module families between the listener and the application frame on every
+#: path: ORM/engine machinery, the greenlet bridge, asyncio task plumbing,
+#: contextmanager wrappers. Never the attributable owner of a session.
+_TRANSPORT_MODULES: Final[frozenset[str]] = frozenset(
+    {"sqlalchemy", "greenlet", "asyncio", "contextlib", "concurrent", "threading"}
+)
+
+#: SQL stores are mechanism, not policy — the tenant context is set (or the
+#: bypass declared) by whoever calls them. Attribution skips past the store
+#: layer to that caller; the store frame is only used as a fallback when the
+#: whole chain lives inside persistence.
+_STORE_LAYER_PREFIX: Final[str] = "expert_work.persistence."
+
+#: Per-caller rate limit for the signal: the first occurrence of a caller
+#: always logs; beyond ``_SIGNAL_MAX_PER_WINDOW`` records in a window the
+#: rest are dropped and the drop count rides on the next emitted record as
+#: ``rls_suppressed``. Bounds a hot loop to a few hundred bytes a minute
+#: instead of a line per transaction.
+_SIGNAL_MAX_PER_WINDOW: int = 10
+_SIGNAL_WINDOW_S: float = 60.0
+_signal_lock = threading.Lock()
+_signal_state: dict[str, tuple[float, int]] = {}
+_monotonic = time.monotonic
+
+
+def _iter_frames() -> Iterator[FrameType]:
+    """Yield frames from the current stack outward, then from each parent
+    greenlet's suspended stack — the only way to reach the ``await``-side
+    application frames from inside a ``greenlet_spawn``'d ORM call."""
+    frame: FrameType | None = sys._getframe()
+    while frame is not None:
+        yield frame
+        frame = frame.f_back
+    parent = getcurrent().parent
+    while parent is not None:
+        frame = parent.gr_frame
+        while frame is not None:
+            yield frame
+            frame = frame.f_back
+        parent = parent.parent
+
+
+def _module_of(frame: FrameType) -> str:
+    name = frame.f_globals.get("__name__")
+    return name if isinstance(name, str) else frame.f_code.co_filename
+
+
+def _is_transport(frame: FrameType) -> bool:
+    module = _module_of(frame)
+    return module == __name__ or module.partition(".")[0] in _TRANSPORT_MODULES
+
+
+def _describe(frame: FrameType) -> str:
+    return f"{_module_of(frame)}:{frame.f_lineno} {frame.f_code.co_name}"
+
+
+def _locate_caller() -> tuple[str, str | None]:
+    """Return ``(rls_caller, rls_caller_outer)`` for the current session.
+
+    ``rls_caller`` is the innermost non-transport frame outside the store
+    layer (falling back to the innermost non-transport frame at all);
+    ``rls_caller_outer`` is the next non-transport frame above it.
+    """
+    frames = (frame for frame in _iter_frames() if not _is_transport(frame))
+    fallback: FrameType | None = None
+    for frame in frames:
+        if fallback is None:
+            fallback = frame
+        if not _module_of(frame).startswith(_STORE_LAYER_PREFIX):
+            outer = next(frames, None)
+            return _describe(frame), None if outer is None else _describe(outer)
+    if fallback is None:
+        return "<unknown>", None
+    return _describe(fallback), None
+
+
+def _should_emit(caller: str, now: float) -> tuple[bool, int]:
+    """Apply the per-caller window; returns ``(emit, suppressed_last_window)``."""
+    with _signal_lock:
+        start, count = _signal_state.get(caller, (now, 0))
+        suppressed = 0
+        if now - start >= _SIGNAL_WINDOW_S:
+            suppressed = max(0, count - _SIGNAL_MAX_PER_WINDOW)
+            start, count = now, 0
+        count += 1
+        _signal_state[caller] = (start, count)
+        return count <= _SIGNAL_MAX_PER_WINDOW, suppressed
+
+
+def _reset_signal_state() -> None:
+    """Test hook — forget every caller's window."""
+    with _signal_lock:
+        _signal_state.clear()
+
+
+def _emit_would_fail_closed() -> None:
+    caller, outer = _locate_caller()
+    emit, suppressed = _should_emit(caller, _monotonic())
+    if not emit:
+        return
+    logger.warning(
+        "rls.would_fail_closed",
+        extra={
+            "rls_caller": caller,
+            "rls_caller_outer": outer,
+            "rls_suppressed": suppressed,
+        },
+    )
+
 
 def _emit_set_config(connection: Connection, name: str, value: str) -> None:
     """Run ``SELECT set_config(name, value, true)`` on ``connection``."""
@@ -130,13 +270,10 @@ def _rls_after_begin(
         # Non-bypass session with no tenant context: under RLS enforcement this
         # fail-closes (zero rows). Phase-1 Detect signal — surfaces every path
         # that is neither tenant-scoped nor explicit-bypass so it can be fixed
-        # BEFORE enforcement lands. No behavior change here.
-        # stack_info=True attaches the call stack so each occurrence is
-        # attributable to its call site — every occurrence otherwise logs the
-        # byte-identical message, making the Phase-1 enumeration (Spec §6.3)
-        # impossible to attribute. Log-volume sampling for high-traffic
-        # fail-closed paths is a deferred follow-up, not needed for correctness.
-        logger.warning("rls.would_fail_closed", stack_info=True)
+        # BEFORE enforcement lands. No behavior change here. Attribution
+        # (``rls_caller`` / ``rls_caller_outer``) and rate limiting live in
+        # ``_emit_would_fail_closed`` — see the block comment above it.
+        _emit_would_fail_closed()
     if tenant_id is not None:
         _emit_set_config(connection, RLS_GUC_NAME, str(tenant_id))
     user_id = current_user_id_var.get()
