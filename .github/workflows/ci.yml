@@ -201,13 +201,24 @@ jobs:
     # Public throttles anonymous pulls per source IP too — five red runs that
     # day, all ``toomanyrequests: Rate exceeded`` on nginx / mock-upstream /
     # python base images, whenever 3-5 runs started within a few minutes.
-    # Docker Hub pulls still left: pgvector/pgvector, edoburu/pgbouncer,
-    # searxng/searxng. Mitigation below = pre-pull with backoff OUTSIDE the
-    # pytest clock (tools/ci/prepull_images.py) + fixtures with ``pull=False``
-    # so a locally cached image is not re-validated against a throttled
-    # registry. The structural fix is a self-hosted GHCR mirror (backlog).
+    # Mitigation = pre-pull with backoff OUTSIDE the pytest clock
+    # (tools/ci/prepull_images.py) + fixtures with ``pull=False`` so a locally
+    # cached image is not re-validated against a throttled registry.
+    #
+    # 2026-09-08 (X-8 收官): pgvector / pgbouncer (Docker Hub only, no other
+    # public source) now come from ghcr.io/deepaihealth/mirror/ — copied weekly
+    # by .github/workflows/mirror-images.yml, pulled here with GITHUB_TOKEN
+    # (credentialed quota, not the anonymous per-IP one). Docker Hub pull
+    # still left: searxng/searxng. ECR Public official images stay anonymous,
+    # so the pre-pull backoff stays.
     timeout-minutes: 40
     continue-on-error: true
+    # ghcr.io needs packages:read (a private mirror package is a hard
+    # requirement; a public one does not care). The read-only GITHUB_TOKEN of
+    # dependabot / fork PRs includes it too.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
 
@@ -222,6 +233,16 @@ jobs:
 
       - name: Sync workspace
         run: uv sync --frozen
+
+      - name: Log in to GHCR (mirror packages)
+        # Before the pre-pull: the mirror refs are in the compose image set.
+        # Works whether the packages are public or private; SHA-pinned like
+        # every other docker/* action in this repo.
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pre-pull images (backoff on registry throttling)
         # Computes the image set (compose full+proxy profiles + Dockerfile

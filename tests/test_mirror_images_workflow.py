@@ -5,7 +5,7 @@ mirror 的 tag 手写在 workflow 的 matrix 里,compose 的 ``image:`` 也是�
 会在 40 分钟后用一句 ``manifest unknown`` 告诉你。这里在 Lint 时就把两边对上。
 
 对照用「以 ``/<name>:<tag>`` 结尾」而不是整串相等:切换前 compose 写的是
-``pgvector/pgvector:pg16``,切换后是 ``ghcr.io/deepaihealth/mirror/pgvector:pg16``,
+裸的 Docker Hub 名(``<上游>/pgvector:pg16``),切换后是 ``ghcr.io/deepaihealth/mirror/pgvector:pg16``,
 两种状态下这条测试都得成立,否则它会在两个 PR 之间的窗口里红。
 """
 

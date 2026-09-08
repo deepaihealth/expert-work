@@ -156,8 +156,9 @@ def test_pg_restore_round_trip_recovers_seeded_rows(restore_target: str) -> None
 def _container_id_from_dsn(dsn: str) -> str:
     """Find the testcontainers-managed Postgres container by the port
     embedded in the DSN. The default expert_work testcontainers image is
-    ``pgvector/pgvector:pg16`` (see root conftest); we filter for that
-    so an unrelated Postgres on the host doesn't get picked up."""
+    ``ghcr.io/deepaihealth/mirror/pgvector:pg16`` (see root conftest); we
+    filter for that so an unrelated Postgres on the host doesn't get picked
+    up."""
     # DSN shape: postgresql+psycopg://test:test@localhost:PORT/test
     port = dsn.rsplit(":", 1)[-1].split("/")[0]
     # ``docker`` is on PATH in CI and on every dev box that ran this
@@ -168,7 +169,7 @@ def _container_id_from_dsn(dsn: str) -> str:
         "--filter",
         f"publish={port}",
         "--filter",
-        "ancestor=pgvector/pgvector:pg16",
+        "ancestor=ghcr.io/deepaihealth/mirror/pgvector:pg16",
         "--format",
         "{{.ID}}",
     ]

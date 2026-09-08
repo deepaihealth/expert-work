@@ -30,15 +30,21 @@ from prepull_images import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# 2026-09-07 真实 `docker compose --profile full --profile proxy config --images`
+# 2026-09-08 真实 `docker compose --profile full --profile proxy config --images`
+# (X-8 收官后:pgvector / pgbouncer 走 GHCR mirror)
 _COMPOSE_OUTPUT = """\
-edoburu/pgbouncer:v1.24.1-p1
-expert-work-control-plane:dev
-expert-work-control-plane:dev
-infra-credential-proxy
-pgvector/pgvector:pg16
 public.ecr.aws/docker/library/nginx:1.27-alpine
+quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
+ghcr.io/deepaihealth/mirror/pgbouncer:v1.24.1-p1
 quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+public.ecr.aws/docker/library/redis:7-alpine
+expert-work-sandbox-supervisor
+expert-work-control-plane:dev
+expert-work-control-plane:dev
+searxng/searxng:latest
+ghcr.io/deepaihealth/mirror/pgvector:pg16
+infra-credential-proxy
+expert-work-control-plane:dev
 """
 
 _DOCKERFILE = """\
@@ -53,7 +59,7 @@ FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 def test_compose_output_keeps_registry_refs_and_drops_locally_built_ones() -> None:
     refs = compose_image_refs(_COMPOSE_OUTPUT)
 
-    assert "pgvector/pgvector:pg16" in refs
+    assert "ghcr.io/deepaihealth/mirror/pgvector:pg16" in refs
     assert "public.ecr.aws/docker/library/nginx:1.27-alpine" in refs
     assert "expert-work-control-plane:dev" not in refs
     assert "infra-credential-proxy" not in refs
@@ -74,10 +80,10 @@ def test_collect_merges_three_sources_without_duplicates() -> None:
     refs = collect_refs(
         compose_output=_COMPOSE_OUTPUT,
         dockerfile_texts=[_DOCKERFILE, _DOCKERFILE],
-        extra=("pgvector/pgvector:pg16", "x/y:z"),
+        extra=("ghcr.io/deepaihealth/mirror/pgvector:pg16", "x/y:z"),
     )
 
-    assert refs.count("pgvector/pgvector:pg16") == 1
+    assert refs.count("ghcr.io/deepaihealth/mirror/pgvector:pg16") == 1
     assert refs[-1] == "x/y:z"
 
 
@@ -143,7 +149,11 @@ def test_images_already_present_are_not_pulled_again() -> None:
     assert docker.sleeps == []
 
 
-_LITERAL_RE = re.compile(r"public\.ecr\.aws/[A-Za-z0-9_./-]+:[A-Za-z0-9_.-]+")
+#: 测试代码里会出现的两类 registry 字面量:ECR Public 的官方镜像,和 X-8 收官后
+#: 走 GHCR mirror 的 pgvector / pgbouncer(testcontainers 直接点名的那几处)。
+_LITERAL_RE = re.compile(
+    r"(?:public\.ecr\.aws|ghcr\.io/deepaihealth/mirror)/[A-Za-z0-9_./-]+:[A-Za-z0-9_.-]+"
+)
 
 
 def _refs_in_repo_static() -> set[str]:
@@ -161,8 +171,9 @@ def _refs_in_repo_static() -> set[str]:
 
 
 @pytest.mark.parametrize("subtree", ["packages", "services", "tools"])
-def test_every_ecr_literal_in_test_code_is_covered(subtree: str) -> None:
-    """测试里直接 ``docker run`` 一个新镜像却没登记进 EXTRA_REFS —— 这里红。"""
+def test_every_registry_literal_in_test_code_is_covered(subtree: str) -> None:
+    """测试里直接 ``docker run`` 一个新镜像却没登记进 EXTRA_REFS,或 testcontainers
+    点名的 mirror 引用与 compose 的 tag 漂了 —— 这里红。"""
     covered = _refs_in_repo_static()
     missing: dict[str, str] = {}
     for path in (_REPO_ROOT / subtree).rglob("*.py"):

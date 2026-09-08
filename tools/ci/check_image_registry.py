@@ -25,9 +25,14 @@ ECR Public 的 ``docker/library`` 是 AWS 对 Docker 官方镜像的镜像站,�
 本身不会红任何测试(它照样能构建),只会在某个繁忙的早上变成又一条假红。
 所以要有这一道。
 
-例外只有 ``pgvector/pgvector``:它不是官方镜像,ECR Public / GHCR / quay
-都没有第二个公共源,只能留在 Docker Hub(见 ROADMAP X-8 余项)。非官方
-镜像(``minio/`` ``grafana/`` ``prom/`` ``searxng/`` ``edoburu/``
+**第二条规矩(X-8 收官)**:只在 Docker Hub 上有、没有第二个公共源的
+``pgvector/pgvector`` 与 ``edoburu/pgbouncer``,一律写
+``ghcr.io/deepaihealth/mirror/<name>`` —— ``.github/workflows/mirror-images.yml``
+每周把上游 manifest 原样复制过去,CI 用 ``GITHUB_TOKEN`` 拉。这两个名字的
+裸引用(含 ``docker.io/`` 全称)同样违规;唯一合法提到上游的地方是那个
+workflow,它把名字和 tag 拆成两个字段在运行时拼,所以卫兵仍然零豁免。
+
+其余非官方镜像(``minio/`` ``grafana/`` ``prom/`` ``searxng/``
 ``clickhouse/`` ``langfuse/`` 等)不在本卫兵管辖内 —— 它们各有各的上游,
 统一搬运是另一件事。
 
@@ -51,6 +56,13 @@ MIRROR = "public.ecr.aws/docker/library"
 #: 区别不该由一条正则的运气来判。用到新的官方镜像时,同一个 PR 加进来。
 OFFICIAL = ("python", "node", "nginx", "postgres", "redis", "alpine", "busybox", "debian")
 
+#: 只在 Docker Hub 上有、已自建 GHCR 镜像的镜像:Docker Hub 名 → 该走的引用
+#: (不含 tag)。改这里要同步 .github/workflows/mirror-images.yml 的 matrix。
+MIRRORED = {
+    "pgvector/pgvector": "ghcr.io/deepaihealth/mirror/pgvector",
+    "edoburu/pgbouncer": "ghcr.io/deepaihealth/mirror/pgbouncer",
+}
+
 #: 扫这些后缀;``.md`` 刻意不扫 —— 文档里的示例片段不拉镜像,把它们一起
 #: 改会让这条卫兵变成文风检查。
 SUFFIXES = (".yml", ".yaml", ".py", ".sh")
@@ -66,13 +78,25 @@ _PATTERNS = (
     re.compile(r"[\"'](?P<ref>(?P<name>[a-z0-9]+):[\w.\-]+)[\"']"),
 )
 
+# 已镜像到 GHCR 的两个名字:任何 ``name:tag`` 形态都算(compose 的 image:、
+# Python 字符串、``docker ps --filter ancestor=name:tag`` 那种不带引号紧贴的),
+# 含 ``docker.io/`` 全称。前面不能是路径字符 —— 那是别的 registry 下的同名段。
+_MIRRORED_PATTERN = re.compile(
+    r"(?<![\w.\-/])(?P<ref>(?:docker\.io/)?(?P<name>"
+    + "|".join(re.escape(name) for name in MIRRORED)
+    + r"):(?P<tag>[\w.\-]+))"
+)
+
 
 def _files(root: Path) -> list[Path]:
     out: list[Path] = []
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if any(part in SKIP_PARTS for part in path.parts):
+        # 只看 root 以下的路径段:root 自己的绝对路径里出现 ``.claude`` / ``dist``
+        # 之类(agent worktree 就在 ``.claude/worktrees/`` 下)不算 —— 否则卫兵
+        # 在那种 checkout 里一个文件都不扫、永远绿(2026-09-08 变异自证时逮到)。
+        if any(part in SKIP_PARTS for part in path.relative_to(root).parts):
             continue
         if path.suffix in SUFFIXES or path.name in DOCKERFILE_NAMES:
             out.append(path)
@@ -98,6 +122,14 @@ def check(root: Path) -> list[str]:
                     f"会从 Docker Hub 拉,共享 runner IP 上按小时撞限流。\n"
                     f"    改成: {MIRROR}/{m.group('ref')}"
                 )
+        for m in _MIRRORED_PATTERN.finditer(text):
+            line = text[: m.start()].count("\n") + 1
+            rel = path.relative_to(root)
+            violations.append(
+                f"{rel}:{line}: {m.group('ref')} 直接从 Docker Hub 拉 —— 它已镜像到 GHCR"
+                f"(.github/workflows/mirror-images.yml),裸名又回到匿名 per-IP 限流。\n"
+                f"    改成: {MIRRORED[m.group('name')]}:{m.group('tag')}"
+            )
     return sorted(set(violations))
 
 

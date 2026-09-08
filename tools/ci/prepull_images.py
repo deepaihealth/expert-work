@@ -16,8 +16,9 @@ exceeded``(nginx / mock-upstream / python 基础镜像 —— 全是 ECR Public,
 配合两个 compose fixture 改成 ``pull=False``:镜像已在本机时 ``compose pull``
 仍会去 registry 核对 manifest,限流一到照样失败,本地缓存等于白拉。
 
-根治仍是自托管 GHCR mirror(同 org 拉 ``ghcr.io`` 走 ``GITHUB_TOKEN``,不吃
-匿名 per-IP 限流),排在上线后;本脚本是它落地前的减震。
+只在 Docker Hub 上有的 pgvector / pgbouncer 已改从自托管 GHCR mirror 拉
+(``.github/workflows/mirror-images.yml``,CI 用 ``GITHUB_TOKEN`` 登录,不吃匿名
+per-IP 限流);ECR Public 上的官方镜像仍是匿名拉,所以这里的退避还得留着。
 """
 
 from __future__ import annotations

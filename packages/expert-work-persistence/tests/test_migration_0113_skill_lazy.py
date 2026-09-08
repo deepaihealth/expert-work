@@ -54,7 +54,7 @@ def _seed_eager_skill(conn: object, *, tenant_id: object) -> object:
 def test_migration_0113_retro_lazies_only_curated_skills() -> None:
     from testcontainers.postgres import PostgresContainer
 
-    with PostgresContainer("pgvector/pgvector:pg16") as container:
+    with PostgresContainer("ghcr.io/deepaihealth/mirror/pgvector:pg16") as container:
         dsn = _sync_dsn(str(container.get_connection_url()))
         cfg = Config(str(ALEMBIC_INI))
         cfg.set_main_option("sqlalchemy.url", dsn)
