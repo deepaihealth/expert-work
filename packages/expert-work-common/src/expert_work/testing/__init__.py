@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 
@@ -116,4 +116,49 @@ def explain_compose_pull_failure(
     )
 
 
-__all__ = ["FakeCompletion", "InMemorySecretStore", "MockLLM", "explain_compose_pull_failure"]
+#: CI 在 pytest 之前用 gha cache 预构建好的沙箱镜像 tag(ci.yml integration job)。
+#: 设了它,集成测试的 fixture 不再各自 ``docker build`` infra/sandbox-image,而是
+#: ``docker tag`` 成自己要的名字;没设或为空(本地开发、CI 预构建步骤失败时置空)
+#: 行为与从前逐字相同。命名沿用 ``EXPERT_WORK_TEST_*`` 测试专用前缀,与 supervisor
+#: 的运行时设置 ``EXPERT_WORK_SANDBOX_SANDBOX_IMAGE`` 区分开。
+PREBUILT_SANDBOX_IMAGE_ENV = "EXPERT_WORK_TEST_SANDBOX_IMAGE"
+
+
+@dataclass(frozen=True)
+class SandboxImagePlan:
+    """把沙箱镜像准备成某个 tag 要跑的那条 docker 命令(不含 ``docker`` 本身)。"""
+
+    argv: tuple[str, ...]
+    #: 借用预构建镜像时是它的 tag;自己 build 时为 ``None``。调用方据此决定失败
+    #: 是 skip(本地没法 build)还是 fail(CI 说建好了却不在本机 = 配置错)。
+    prebuilt: str | None
+
+
+def sandbox_image_plan(
+    tag: str,
+    context: str | os.PathLike[str],
+    *,
+    environ: Mapping[str, str] = os.environ,
+) -> SandboxImagePlan:
+    """集成测试 fixture 的沙箱镜像来源判断 —— 纯函数,好单测。
+
+    2026-09-07 两次 40 分钟的 integration 红,日志里基础镜像预拉都成功了,慢的
+    是 Dockerfile 的 apt 层(mirrors.aliyun.com 在 GitHub 美国 runner 上冷构建
+    10-22 分钟),而且两个 fixture 各建一次。CI 现在在 pytest 前用 gha cache
+    建一次、通过 ``PREBUILT_SANDBOX_IMAGE_ENV`` 告诉 fixture 借用。
+    """
+    prebuilt = environ.get(PREBUILT_SANDBOX_IMAGE_ENV, "").strip()
+    if prebuilt:
+        return SandboxImagePlan(argv=("tag", prebuilt, tag), prebuilt=prebuilt)
+    return SandboxImagePlan(argv=("build", "-t", tag, str(context)), prebuilt=None)
+
+
+__all__ = [
+    "PREBUILT_SANDBOX_IMAGE_ENV",
+    "FakeCompletion",
+    "InMemorySecretStore",
+    "MockLLM",
+    "SandboxImagePlan",
+    "explain_compose_pull_failure",
+    "sandbox_image_plan",
+]

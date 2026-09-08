@@ -31,6 +31,7 @@ from typing import Any
 import asyncpg
 import pytest
 
+from expert_work.testing import PREBUILT_SANDBOX_IMAGE_ENV, sandbox_image_plan
 from orchestrator.tools import ExecPythonTool, HTTPSupervisorRuntime, ToolContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e]
@@ -158,15 +159,16 @@ def _egress_stack() -> Iterator[None]:
     if probe.returncode != 0:
         pytest.skip("docker daemon unavailable")
 
-    built = _docker(
-        "build",
-        "-t",
-        _SANDBOX_IMAGE,
-        str(_INFRA / "sandbox-image"),
-        timeout=_DOCKER_BUILD_TIMEOUT_S,
-    )
+    # CI 预构建过(EXPERT_WORK_TEST_SANDBOX_IMAGE)就 docker tag 借用,否则自己 build。
+    plan = sandbox_image_plan(_SANDBOX_IMAGE, _INFRA / "sandbox-image")
+    built = _docker(*plan.argv, timeout=_DOCKER_BUILD_TIMEOUT_S)
     if built.returncode != 0:
-        pytest.fail(f"sandbox image build failed:\n{built.stderr[-600:]}")
+        what = (
+            f"{PREBUILT_SANDBOX_IMAGE_ENV}={plan.prebuilt} 不在本机(CI 预构建步骤没落地?)"
+            if plan.prebuilt is not None
+            else "sandbox image build failed"
+        )
+        pytest.fail(f"{what}:\n{built.stderr[-600:]}")
 
     images = _compose("build", *_BUILD_SERVICES, timeout=_DOCKER_BUILD_TIMEOUT_S)
     if images.returncode != 0:

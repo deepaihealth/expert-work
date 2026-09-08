@@ -231,6 +231,40 @@ jobs:
         # image (expert_work.testing.explain_compose_pull_failure).
         run: uv run python tools/ci/prepull_images.py
 
+      # X-8 收官 ③ — the sandbox image is built ONCE here with the gha layer
+      # cache, and the two integration fixtures that used to `docker build`
+      # infra/sandbox-image themselves (control-plane egress e2e, then the
+      # sandbox-supervisor acceptance suite) `docker tag` it instead when
+      # EXPERT_WORK_TEST_SANDBOX_IMAGE is set. Evidence (2026-09-07, two
+      # 40-min reds, jobs 101723418926 / 101731671992): the pre-pull step
+      # reported 12/12 images present — the base image was local — yet the
+      # egress e2e build hit its 600s gate inside the Dockerfile's apt layer
+      # (`Get:4 http://mirrors.aliyun.com/debian ...`), and the supervisor
+      # fixture then rebuilt from scratch for 22 min more. ~350 MB of debs
+      # from a mainland mirror on a US runner is the slow layer, not the
+      # registry pull; a cache hit restores it without touching apt at all.
+      #
+      # Same Dockerfile + context + inputs as sandbox-image.yml → same cache
+      # keys, one shared scope. cache-to only on main pushes: every PR branch
+      # writing its own copy would eat the repo's 10 GB cache budget and
+      # evict main's warm layers. continue-on-error + the env fallback below:
+      # if this step fails (e.g. the FROM metadata resolve hits ECR Public
+      # throttling), pytest runs exactly as before — the fixtures build.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build sandbox image (gha cache)
+        id: sandbox-image
+        continue-on-error: true
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: infra/sandbox-image
+          file: infra/sandbox-image/Dockerfile
+          load: true
+          tags: expert-work-sandbox:ci
+          cache-from: type=gha
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
+
       - name: Run pytest (integration)
         # --timeout: second gate behind the per-command docker timeouts in
         # test_fullstack_egress_e2e. A hung test names itself and fails fast
@@ -239,6 +273,9 @@ jobs:
         # 1800s is deliberately loose — this suite's own baseline is 9-15 min
         # end to end, and the slowest single test (the #60 egress stack, which
         # builds four images) sits around 5 min on a warm runner.
+        env:
+          # Empty when the prebuild step failed → fixtures build themselves.
+          EXPERT_WORK_TEST_SANDBOX_IMAGE: ${{ steps.sandbox-image.outcome == 'success' && 'expert-work-sandbox:ci' || '' }}
         run: uv run pytest -v -m integration --timeout=1800 --timeout-method=thread
 
   security:
