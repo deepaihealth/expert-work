@@ -45,6 +45,19 @@ spec:
               containerPort: 8080
             - name: egress
               containerPort: 8081
+          env:
+            # B-31 ① — the cache-invalidation bus. Same Redis, same Secret
+            # key the control-plane publishes on (control-plane-secrets /
+            # EXPERT_WORK_QUOTA_REDIS_URL): no new key to provision. Optional
+            # so a namespace without it still boots — the proxy then logs
+            # `invalidation.disabled` once and its secret cache falls back
+            # to the 60s TTL, exactly the pre-B-31 ① behaviour.
+            - name: EXPERT_WORK_CRED_PROXY_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: control-plane-secrets
+                  key: EXPERT_WORK_QUOTA_REDIS_URL
+                  optional: true
           envFrom:
             - configMapRef:
                 name: credential-proxy-config

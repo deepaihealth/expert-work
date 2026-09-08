@@ -20,6 +20,9 @@ dependencies = [
     "pydantic-settings>=2.5,<3",
     "sqlalchemy[asyncio]>=2.0.30,<3",
     "asyncpg>=0.29,<1",
+    # B-31 ① — subscriber on control-plane's Redis invalidation bus
+    # (``credential_proxy.invalidation``). Same pin as control-plane.
+    "redis>=5.0,<9",
 ]
 
 [build-system]
