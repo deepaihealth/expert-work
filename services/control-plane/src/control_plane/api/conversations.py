@@ -43,7 +43,11 @@ from control_plane.tenant_scope import (
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.thread_message import ThreadMessageStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.persistence.token_usage_store import TokenTotals, TokenUsageStore
+from expert_work.persistence.token_usage_store import (
+    TokenTotals,
+    TokenUsageStore,
+    merge_model_buckets,
+)
 from expert_work.protocol import AuditAction, AuditResult, ThreadStatus
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
@@ -89,6 +93,21 @@ def _sum_totals(totals: list[TokenTotals]) -> dict[str, Any] | None:
         "total_tokens": input_tokens + output_tokens,
         "llm_calls": sum(t.llm_calls for t in totals),
         "models": sorted({m for t in totals for m in t.models}),
+        # B-42 — same shape as a run's ``tokens.usage_by_model`` (runs.py),
+        # merged across the thread's runs by ``(provider, model)``.
+        "usage_by_model": [
+            {
+                "provider": b.provider,
+                "model": b.model,
+                "input_tokens": b.input_tokens,
+                "output_tokens": b.output_tokens,
+                "cache_creation_tokens": b.cache_creation_tokens,
+                "cache_read_tokens": b.cache_read_tokens,
+                "total_tokens": b.total_tokens,
+                "llm_calls": b.llm_calls,
+            }
+            for b in merge_model_buckets(totals)
+        ],
     }
 
 

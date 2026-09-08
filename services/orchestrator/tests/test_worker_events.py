@@ -441,3 +441,51 @@ def test_a_workers_account_excludes_what_came_back_from_its_child() -> None:
     assert usage["total_tokens"] == 330
     assert usage["input_tokens"] == 300
     assert usage["output_tokens"] == 30
+
+
+def test_end_frame_carries_usage_by_model_buckets() -> None:
+    """B-42 —— end 帧除总量外还要带按 ``(provider, model)`` 分桶的明细。
+
+    ``usage`` 只说「烧了多少」,不说「按谁的价」。``dynamic_workers.model``
+    允许 worker 换模型(#1322),而前端把整轮 token 一律乘主 Agent 那张
+    费率卡(#1374 把 worker 的 token 计进总量之后)—— 线上 run f562fa69
+    里 95% 的计价 token 来自 worker,全按错的价算。分桶明细是前端按各自
+    费率计价的唯一数据来源:帧里没有,前端修不了。
+    """
+    usage = {
+        "input_tokens": 3_200_000,
+        "output_tokens": 117_974,
+        "total_tokens": 3_317_974,
+        "input_token_details": {"cache_read": 1_000, "cache_creation": 2_000},
+        "output_token_details": {"reasoning": 4_000},
+    }
+    frame = build_worker_end_frame(
+        _IDENT,
+        wseq=9,
+        outcome="success",
+        iteration_used=49,
+        llm_call_count=49,
+        wall_clock_ms=933_000,
+        usage=usage,
+        usage_by_model=[{"provider": "zhipu", "model": "glm-5.3", **usage}],
+    )
+    buckets = frame["data"]["usage_by_model"]
+    assert buckets == [{"provider": "zhipu", "model": "glm-5.3", **usage}]
+    # 总量字段原样保留 —— 老消费者(只认 usage 的)零变化。
+    assert frame["data"]["usage"] == usage
+    json.dumps(frame)
+
+
+def test_end_frame_usage_by_model_absent_stays_absent() -> None:
+    """拿不到分桶(模型未知)时不写这个键 —— 消费者退回「按主 Agent 费率」
+    的老算法,而不是拿到一个空列表当成「零成本」。"""
+    frame = build_worker_end_frame(
+        _IDENT,
+        wseq=1,
+        outcome="success",
+        iteration_used=2,
+        llm_call_count=2,
+        wall_clock_ms=10,
+        usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    assert "usage_by_model" not in frame["data"]
