@@ -125,6 +125,7 @@ from orchestrator.llm import (
     OpenAIProvider,
     ProviderHandle,
     RateLimitedProvider,
+    RateLimiterFactory,
     effective_rpm,
     make_azure_client,
     make_deepseek_client,
@@ -529,6 +530,10 @@ async def build_agent(
     # (tests / eval CLI / not-yet-wired build paths) keeps every provider on
     # its original per-call ``httpx.AsyncClient``.
     http_client: httpx.AsyncClient | None = None,
+    # 波 2 线 A — global provider RPM bucket. The control-plane injects the
+    # Redis-backed factory when it has Redis; ``None`` keeps every provider
+    # on the per-process bucket with the PROD-12 replica division.
+    rate_limiter_factory: RateLimiterFactory | None = None,
     # Platform-default wall-clock floor (seconds) applied when the manifest
     # leaves ``policies.run_deadline_s`` at 0. ``0`` = no floor.
     default_run_deadline_s: int = 0,
@@ -660,6 +665,7 @@ async def build_agent(
         # (LLM spend must go through platform-metered credentials).
         ignore_api_key_ref=True,
         http_client=http_client,
+        rate_limiter_factory=rate_limiter_factory,
     )
     # Stream CM-9 (Mini-ADR CM-J4) — pre-build the one-step-up effort
     # caller for limit-hit escalation. Only the primary caller escalates
@@ -680,6 +686,7 @@ async def build_agent(
             provider_key_resolver=provider_key_resolver,
             ignore_api_key_ref=True,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
     # Stream J.6 Path B — build the VL router when a ``vision:`` block is
     # declared; ``ask_image`` will route through it. Stream L.L3 — the VL
@@ -712,6 +719,7 @@ async def build_agent(
             provider_key_resolver=provider_key_resolver,
             ignore_api_key_ref=True,  # Stream Y-2 (manifest-sourced VL model)
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
     # Stream J.7a (Mini-ADR J-23) — resolve + merge declared skills BEFORE the
     # tool registry so the sandbox tools can be bound with the skill seed-file
@@ -2082,6 +2090,7 @@ async def build_llm_router(
     provider_key_resolver: ProviderKeyResolver | None = None,
     ignore_api_key_ref: bool = False,
     http_client: httpx.AsyncClient | None = None,
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> LLMRouter:
     """Build an :class:`LLMRouter` from a ``ModelSpec`` + its fallback tree.
 
@@ -2121,6 +2130,12 @@ async def build_llm_router(
 
     ``http_client`` (一期 Task 5) forwards the process-level shared ``httpx``
     client to every provider built for this chain (see ``_build_provider``).
+
+    ``rate_limiter_factory`` (波 2 线 A) builds each handle's admission
+    bucket from ``(handle key, credential ref, rate_limit_rpm)``; the
+    control-plane passes the Redis-backed one so every replica shares a
+    single bucket per upstream credential. ``None`` = the per-process
+    ``AsyncLimiter`` at :func:`effective_rpm` (PROD-12), unchanged.
     """
     handles: list[ProviderHandle] = []
     chain: list[ModelSpec] = list(_flatten_chain(model))
@@ -2171,11 +2186,20 @@ async def build_llm_router(
                 timeout_s=provider_timeout_s,
                 http_client=http_client,
             )
-            # PROD-12(多副本)—— 每副本吃 ceil(rpm/副本数),总量上界=配置值。
-            rate_limited = RateLimitedProvider.with_rpm(
-                provider, rate_limit_rpm=effective_rpm(entry.rate_limit_rpm)
-            )
             key = f"{group}#{idx}" if multikey else group
+            if rate_limiter_factory is None:
+                # PROD-12(多副本)—— 每副本吃 ceil(rpm/副本数),总量上界=配置值。
+                rate_limited = RateLimitedProvider.with_rpm(
+                    provider, rate_limit_rpm=effective_rpm(entry.rate_limit_rpm)
+                )
+            else:
+                # 波 2 线 A —— 全局桶自己持有整个上限,rpm 不再除副本数。
+                rate_limited = RateLimitedProvider(
+                    inner=provider,
+                    limiter=rate_limiter_factory(
+                        key=key, secret_ref=secret_ref, rate_limit_rpm=entry.rate_limit_rpm
+                    ),
+                )
             handles.append(ProviderHandle(provider=rate_limited, key=key, group=group))
     return LLMRouter(
         providers=handles,
@@ -2194,6 +2218,7 @@ async def build_step_routers(
     provider_key_resolver: ProviderKeyResolver | None = None,
     ignore_api_key_ref: bool = False,
     http_client: httpx.AsyncClient | None = None,
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> StepRouters:
     """Resolve the LLM router for each step class (Stream J.11).
 
@@ -2231,6 +2256,7 @@ async def build_step_routers(
         provider_key_resolver=provider_key_resolver,
         ignore_api_key_ref=ignore_api_key_ref,
         http_client=http_client,
+        rate_limiter_factory=rate_limiter_factory,
     )
     planning = default
     reflection = default
@@ -2248,6 +2274,7 @@ async def build_step_routers(
                 provider_key_resolver=provider_key_resolver,
                 ignore_api_key_ref=ignore_api_key_ref,
                 http_client=http_client,
+                rate_limiter_factory=rate_limiter_factory,
             )
             if rule.when == "planning":
                 planning = routed

@@ -39,6 +39,7 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.secret_store import SecretStore
 from expert_work.runtime.skill_assets import ObjectStore as SkillAssetStore
 from orchestrator import BuiltAgent, MemoryEnv, MiddlewareEnv, ToolEnv, build_agent
+from orchestrator.llm import RateLimiterFactory
 from orchestrator.tools import ChildAgentBuilder
 from orchestrator.tools.spawn_worker import WorkerBuildFn
 
@@ -292,6 +293,9 @@ def make_child_agent_builder(
     # delegated child build's ``build_agent`` call. ``None`` keeps every LLM
     # provider client on its original per-call ``httpx.AsyncClient``.
     http_client: httpx.AsyncClient | None = None,
+    # 波 2 线 A — global provider RPM bucket factory, forwarded into every
+    # delegated child build (+ its judge caller). ``None`` = per-process bucket.
+    rate_limiter_factory: RateLimiterFactory | None = None,
     # 二期 PR2 T4 — child-cache bounds: LRU capacity + flat TTL, plus the
     # injectable monotonic time source (tests). Mirrors AgentRuntime._cache.
     cache_max_size: int = 256,
@@ -420,6 +424,7 @@ def make_child_agent_builder(
             platform_judge_config_service=platform_judge_config_service,
             platform_tool_budget_config_service=platform_tool_budget_config_service,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
         built = await build_agent(
             child_spec,
@@ -449,6 +454,7 @@ def make_child_agent_builder(
             skill_asset_store=skill_asset_store,
             skill_activity_recorder=skill_activity_recorder,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
         cache[key] = (built, clock() + cache_ttl_s)
         cache.move_to_end(key)
@@ -551,6 +557,9 @@ def make_worker_build_fn(
     # spawned worker's ``build_agent`` call. ``None`` keeps every LLM
     # provider client on its original per-call ``httpx.AsyncClient``.
     http_client: httpx.AsyncClient | None = None,
+    # 波 2 线 A — global provider RPM bucket factory, forwarded into every
+    # spawned worker build (+ its judge caller). ``None`` = per-process bucket.
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> WorkerBuildFn:
     """Build the :class:`WorkerBuildFn` the orchestrator's ``ToolEnv`` carries
     for the ``spawn_worker`` tool (1.3 dynamic Orchestrator-Worker).
@@ -624,6 +633,7 @@ def make_worker_build_fn(
             platform_judge_config_service=platform_judge_config_service,
             platform_tool_budget_config_service=platform_tool_budget_config_service,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
         built = await build_agent(
             worker_spec,
@@ -654,6 +664,7 @@ def make_worker_build_fn(
             # 模型不匹配 / 工具名冲突软跳过,别让一个技能炸掉整次委派。
             skills_inherited=True,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
         logger.info("control_plane.worker.built role=%s depth=%d", role or "general", depth)
         return built

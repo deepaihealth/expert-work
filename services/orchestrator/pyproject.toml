@@ -26,6 +26,10 @@ dependencies = [
     # async leaky bucket so over-limit calls await instead of bursting
     # into 429s and tripping the E.4 breaker.
     "aiolimiter>=1.1,<2",
+    # 波 2 线 A — Redis-backed global provider RPM bucket (one bucket per
+    # upstream credential shared by every replica). Same range as
+    # control-plane; the client is built there and injected.
+    "redis>=5.0,<9",
     # HX-12 ranked deferred-tool retrieval (Mini-ADR HX-I1): BM25 over the
     # deferred pool + CJK-aware tokenization (jieba precedent: J.5 keyword
     # search in expert-work-persistence).

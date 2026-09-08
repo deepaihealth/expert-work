@@ -105,7 +105,13 @@ from orchestrator.llm.rate_limit import (
     RateLimitedProvider as RateLimitedProvider,
 )
 from orchestrator.llm.rate_limit import (
+    RateLimiterFactory as RateLimiterFactory,
+)
+from orchestrator.llm.rate_limit import (
     effective_rpm as effective_rpm,
+)
+from orchestrator.llm.rate_limit_redis import (
+    make_redis_rate_limiter_factory as make_redis_rate_limiter_factory,
 )
 from orchestrator.llm.rerank import (
     DASHSCOPE_RERANK_URL as DASHSCOPE_RERANK_URL,
@@ -167,6 +173,7 @@ __all__ = [
     "OpenAIProvider",
     "ProviderHandle",
     "RateLimitedProvider",
+    "RateLimiterFactory",
     "RecordingAnthropicClient",
     "RecordingOpenAIClient",
     "RerankClient",
