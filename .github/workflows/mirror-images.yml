@@ -1,0 +1,98 @@
+name: Mirror images (GHCR)
+
+# X-8 收官 —— 把只在 Docker Hub 上有的两个依赖镜像复制到本 org 的 GHCR。
+#
+# 为什么:CI 里任何**匿名**拉取都不可靠 —— Docker Hub 和 ECR Public 都按
+# 出口 IP 限流,而 GitHub 托管 runner 的 IP 是全世界共享的(2026-08-20 起
+# 十几次 integration 假红,ROADMAP X-8 有逐次记录)。官方镜像已迁到
+# public.ecr.aws(#1402),剩下 pgvector/pgvector 与 edoburu/pgbouncer 在
+# ECR Public / GHCR / quay 三处都探过、没有第二个公共源。同 org 的 ghcr.io
+# 用 GITHUB_TOKEN 拉,走的是带凭据的配额,不吃匿名 per-IP 那份。
+#
+# 做什么:`docker buildx imagetools create` 把上游的 manifest list(amd64 +
+# arm64 一起)原样复制到 ghcr.io/deepaihealth/mirror/<name>:<tag>。不 pull、
+# 不 build、不改 digest;每周一同步一次 + 手动触发。`pg16` 是上游会重新发布
+# 的浮动 tag,周同步保持新鲜;`v1.24.1-p1` 是固定 tag,同步只是幂等重放。
+#
+# **首次跑完后要做一件手工事**(只做一次):
+#   GitHub → deepaihealth org → Packages → `mirror/pgvector` 与 `mirror/pgbouncer`
+#   → Package settings → Change visibility → **Public**。
+# 原因:infra/docker-compose.yml 切到 ghcr 引用后(PR「ci/x8-switch-to-ghcr」),
+# 本地开发的 `docker compose up` 也从这里拉,私有包意味着每个开发者都要先
+# `docker login ghcr.io` 拿 PAT —— 那是平台缺口转嫁给人去配。Public 之后
+# 任何人零配置可拉。
+#
+# CI 侧不依赖 Public:integration job 用 GITHUB_TOKEN `docker login ghcr.io`
+# 后再拉(两种可见性都通)。用 GITHUB_TOKEN 从本仓库 workflow 首次发布的包
+# 会自动关联到本仓库(仓库拿到 admin 角色),此后本仓库任何 workflow 的
+# GITHUB_TOKEN 只要带 `packages: read` 就能拉 —— 包括 dependabot 触发的 PR
+# run(它拿不到普通 Actions secret,但 GITHUB_TOKEN 还在,只读、含
+# packages:read)和 fork 发的 PR(同样只读)。这是 GitHub 文档的说法
+# (docs.github.com → "Configuring a package's access control and visibility"
+# → Inheriting access from a repository),第一个 dependabot PR 的
+# integration 跑绿才算实证 —— 若那时红在 ghcr 401/403,就是包还没设 Public。
+#
+# tag 从哪来:与 infra/docker-compose.yml 里对应服务的 `image:` 一致。两处
+# 都是手写的,tests/test_mirror_images_workflow.py 在 Lint 时把两边对上 ——
+# compose 升级 tag 必须同一个 PR 改这里的 matrix,否则 integration 会在
+# 40 分钟后用一句 `manifest unknown` 告诉你。
+#
+# 上游引用刻意拆成 `upstream` + `tag` 两个字段在 run 里拼:镜像来源卫兵
+# (tools/ci/check_image_registry.py)把这两个名字的 `name:tag` 裸引用视为
+# 违规,本文件是唯一合法提到上游的地方,拼接而不是字面量,卫兵才能零豁免。
+
+on:
+  schedule:
+    - cron: "43 2 * * 1" # Mondays 02:43 UTC — 避开整点高峰
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# 只写 packages:目标是 ghcr.io;不需要 checkout,contents 也留 read 即可。
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: ${{ matrix.name }}:${{ matrix.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: pgvector
+            upstream: pgvector/pgvector
+            tag: pg16
+          - name: pgbouncer
+            upstream: edoburu/pgbouncer
+            tag: v1.24.1-p1
+    steps:
+      # Actions SHA-pinned —— 这个 workflow 持有能往 org 包仓写入的 token,
+      # 可变 tag 被重指向恶意代码的风险不能留(与 sandbox-image.yml 同一规矩)。
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # imagetools create 跨 registry 复制整份 manifest list(每个架构的
+      # manifest + 缺的 blob),目标上的 digest 与上游逐位相同。源端是对
+      # Docker Hub 的匿名读,一周两次,远在限额之内。
+      - name: Copy manifest list to GHCR
+        env:
+          SRC: docker.io/${{ matrix.upstream }}:${{ matrix.tag }}
+          DST: ghcr.io/deepaihealth/mirror/${{ matrix.name }}:${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          echo "== $SRC -> $DST"
+          docker buildx imagetools create --tag "$DST" "$SRC"
+          echo "== 目标上现在是:"
+          docker buildx imagetools inspect "$DST"
