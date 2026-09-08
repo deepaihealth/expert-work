@@ -17,9 +17,15 @@ What it does:
    - the durable row flips to ``interrupted`` with ``error='user_cancel'``
      immediately (green's CAS won);
    - **blue actually stops**: its SSE stream delivers an ``end`` frame with
-     ``interrupted`` within the heartbeat-detection bound
-     (``lease_ttl/3`` ≈ 10s + margin) — the ``_heartbeat_loop`` →
+     ``interrupted`` within ``--stop-timeout`` (sized for the heartbeat
+     fallback, ``lease_ttl/3`` ≈ 10s + margin) — the ``_heartbeat_loop`` →
      ``abort_event`` link, previously untested anywhere;
+   - **blue stops fast**(跨副本取消亚秒化): the same ``end`` frame lands
+     within ``--bus-stop-bound`` (default 2s) — green's CAS win published a
+     ``run_cancel`` on the invalidation bus and blue's handler re-ran the
+     heartbeat CAS at once instead of waiting for its 10s cadence. A stop
+     that only beats ``--stop-timeout`` means the bus link is dead and the
+     heartbeat fallback did the work;
    - blue's lease heartbeat stops advancing (the owner loop exited);
    - the run is never resurrected (row still ``interrupted`` after a grace
      re-check — the set_status CAS guard holding in production shape).
@@ -257,6 +263,12 @@ async def _amain(args: argparse.Namespace) -> int:
         "row interrupted + user_cancel (CAS won)": row_ok,
         f"blue stopped ≤ {args.stop_timeout:.0f}s (end frame interrupted)": end_status
         == "interrupted",
+        # 跨副本取消亚秒化 —— 总线那条链活着才可能在心跳周期(10s)之内停。
+        f"blue stopped ≤ {args.bus_stop_bound:.1f}s (run_cancel bus, not the heartbeat)": (
+            end_status == "interrupted"
+            and stop_latency is not None
+            and stop_latency <= args.bus_stop_bound
+        ),
         "owner heartbeat frozen (loop exited)": hb_frozen,
         "run never resurrected (guarded set_status)": not_resurrected,
     }
@@ -286,7 +298,19 @@ def main(argv: list[str] | None = None) -> int:
         "--stop-timeout",
         type=float,
         default=45.0,
-        help="max seconds for blue to stop after the cancel (lease_ttl/3 + margin)",
+        help=(
+            "max seconds for blue to stop after the cancel "
+            "(heartbeat fallback: lease_ttl/3 + margin)"
+        ),
+    )
+    parser.add_argument(
+        "--bus-stop-bound",
+        type=float,
+        default=2.0,
+        help=(
+            "max seconds for blue to stop via the run_cancel invalidation-bus path "
+            "(must be well under the 10s heartbeat cadence to tell the two apart)"
+        ),
     )
     parser.add_argument(
         "--heartbeat-grace",
