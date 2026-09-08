@@ -1242,6 +1242,124 @@ describe("PlaygroundTab", () => {
     expect(runLink).toHaveAttribute("href", `/runs/${sampleThread.thread_id}/run-77`);
   });
 
+  // B-42 — worker 换了模型(dynamic_workers.model)时,它的 token 按它自己的
+  // 费率卡算,不是整轮 × 主 Agent 那张卡。卡按出现过的 (provider, model) 各
+  // 拉一次。
+  it("prices a worker's tokens at the worker model's own rate card (B-42)", async () => {
+    const user = userEvent.setup();
+    const costDetail: AgentDetailResponse = {
+      record: {
+        ...sampleDetail.record,
+        spec: {
+          apiVersion: "expert_work.io/v1",
+          kind: "Agent",
+          metadata: { name: "demo-agent", version: "1.0.0", tenant: "acme" },
+          spec: { model: { provider: "anthropic", name: "claude-x" } },
+        },
+      },
+    };
+    createSessionMock.mockResolvedValue(sampleThread);
+    const cardOf = (provider: string, model: string, input: number, output: number) => ({
+      id: `rc-${model}`,
+      tenant_id: null,
+      provider,
+      model,
+      input_per_mtok_micros: input,
+      output_per_mtok_micros: output,
+      cache_creation_per_mtok_micros: 0,
+      cache_read_per_mtok_micros: 0,
+    });
+    listRateCardsMock.mockImplementation(async (params) => {
+      if (params?.provider === "anthropic" && params.model === "claude-x")
+        return [cardOf("anthropic", "claude-x", 3_000_000, 15_000_000)];
+      if (params?.provider === "zhipu" && params.model === "glm-5.3")
+        return [cardOf("zhipu", "glm-5.3", 500_000, 2_000_000)];
+      return [];
+    });
+    const workerUsage = {
+      input_tokens: 2_000_000,
+      output_tokens: 100_000,
+      total_tokens: 2_100_000,
+    };
+    streamRunMock.mockReturnValue(
+      makeStream([
+        {
+          id: "m",
+          event: "metadata",
+          data: { run_id: "run-78" },
+          rawData: "",
+          receivedAt: "2026-05-25T00:00:01Z",
+        },
+        {
+          id: "u",
+          event: "updates",
+          data: {
+            agent: {
+              messages: [
+                {
+                  type: "ai",
+                  content: "派个 worker",
+                  usage_metadata: { input_tokens: 1_000_000, output_tokens: 100_000, total_tokens: 1_100_000 },
+                },
+              ],
+              step_count: 1,
+            },
+          },
+          rawData: "",
+          receivedAt: "2026-05-25T00:00:02Z",
+        },
+        {
+          id: "w",
+          event: "worker",
+          data: {
+            worker_id: "w-1",
+            parent_worker_id: null,
+            parent_tool_call_id: "call-1",
+            label: "spawn_worker",
+            agent_ref: "dynamic:general",
+            depth: 1,
+            kind: "end",
+            wseq: 2,
+            data: {
+              outcome: "success",
+              iteration_used: 1,
+              llm_call_count: 1,
+              wall_clock_ms: 10,
+              usage: workerUsage,
+              usage_by_model: [{ provider: "zhipu", model: "glm-5.3", ...workerUsage }],
+            },
+          },
+          rawData: "",
+          receivedAt: "2026-05-25T00:00:03Z",
+        },
+        {
+          id: "e",
+          event: "end",
+          data: "ok",
+          rawData: "ok",
+          receivedAt: "2026-05-25T00:00:04Z",
+        },
+      ]),
+    );
+    renderPg(costDetail, { admin: true });
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "q");
+    await user.click(screen.getByTestId("playground-run"));
+    await screen.findByTestId("console-turn");
+
+    // 主线 (1,000,000 × 3 + 100,000 × 15) / 1e6 = 4.5;worker (2,000,000 × 0.5 +
+    // 100,000 × 2) / 1e6 = 1.2 → 5.7。按老算法(全部 × 主 Agent 卡)会是
+    // (3,000,000 × 3 + 200,000 × 15) / 1e6 = 12.0。
+    const meta = await screen.findByTestId("console-footer-meta");
+    await user.hover(meta);
+    const tip = await screen.findByRole("tooltip");
+    await waitFor(() => expect(tip).toHaveTextContent("≈ ¥5.7000"));
+    expect(tip).not.toHaveTextContent("¥12.0000");
+    expect(listRateCardsMock).toHaveBeenCalledWith({ provider: "zhipu", model: "glm-5.3" });
+    // 每张卡只拉一次:主 Agent 的一次,worker 模型的一次。
+    expect(listRateCardsMock).toHaveBeenCalledTimes(2);
+  });
+
   // R7 — 「已恢复」提示条退役(左栏选中态已表达「你在哪个会话」);这条改钉
   // 「左栏直接列出会话,点一下就拉历史」。
   it("lists past sessions in the left rail and loads one on click", async () => {
