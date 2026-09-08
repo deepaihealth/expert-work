@@ -188,7 +188,10 @@ def build_invalidation_subscriber(
 
     Unset is the pre-B-31 ① posture — the cache TTL is the only bound on
     staleness — and is logged once so an operator can tell the bus is off.
-    The URL carries the Redis password and is never logged.
+    A URL the client refuses (bad scheme, unparsable) degrades to the same
+    posture with a WARNING: the bus is optional, the proxy's job is not,
+    so a config typo must not stop the pod. The URL carries the Redis
+    password and is never logged — only the exception's type name is.
     """
     if not settings.redis_url:
         logger.info(
@@ -197,5 +200,14 @@ def build_invalidation_subscriber(
             settings.cache_ttl_s,
         )
         return None
-    client = redis_async.from_url(settings.redis_url, encoding="utf-8", decode_responses=True)
+    try:
+        client = redis_async.from_url(settings.redis_url, encoding="utf-8", decode_responses=True)
+    except Exception as exc:
+        logger.warning(
+            "invalidation.disabled could not build the Redis client (%s); "
+            "secret cache falls back to its %.0fs TTL",
+            type(exc).__name__,
+            settings.cache_ttl_s,
+        )
+        return None
     return InvalidationSubscriber(redis_client=client, cache=cache)

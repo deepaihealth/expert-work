@@ -300,6 +300,63 @@ def test_unset_redis_url_builds_no_subscriber(caplog: pytest.LogCaptureFixture) 
     assert any("invalidation.disabled" in r.getMessage() for r in caplog.records)
 
 
+def test_malformed_redis_url_disables_the_bus_instead_of_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The bus is optional; a bad URL must degrade to "unconfigured", not
+    take the proxy down. Only the exception type is logged — the URL
+    carries the Redis password."""
+    bad_url = "not-a-redis-url://secret-password@nowhere"
+    with caplog.at_level(logging.WARNING, logger="credential_proxy.invalidation"):
+        subscriber = build_invalidation_subscriber(
+            CredentialProxySettings(redis_url=bad_url), _cache_with()
+        )
+    assert subscriber is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "invalidation.disabled" in warnings[0]
+    assert "ValueError" in warnings[0]
+    assert "secret-password" not in warnings[0]
+    assert bad_url not in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_app_boots_and_admin_invalidate_works_with_a_malformed_redis_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real ``create_app`` startup path (DB engine + secret store are
+    lazy, egress off): a malformed bus URL must not stop the pod from
+    serving, and the manual ``/admin/cache/invalidate`` fallback must still
+    work."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from credential_proxy.app import CACHE_KEY, create_app
+
+    settings = CredentialProxySettings(
+        redis_url="not-a-redis-url://secret-password@nowhere",
+        egress_enabled=False,
+        admin_token="admin-token-for-tests",
+    )
+    app = create_app(settings)
+    with caplog.at_level(logging.WARNING, logger="credential_proxy.invalidation"):
+        async with TestClient(TestServer(app)) as client:
+            health = await client.get("/admin/health")
+            assert health.status == 200
+
+            cache = app[CACHE_KEY]
+            cache.put((uuid4(), "anthropic/api-key"), "sk-value")
+            resp = await client.post(
+                "/admin/cache/invalidate",
+                headers={"Authorization": "Bearer admin-token-for-tests"},
+            )
+            assert resp.status == 204
+            assert len(cache) == 0
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("invalidation.disabled" in m and "ValueError" in m for m in warnings)
+    assert not any("secret-password" in m for m in warnings)
+
+
 def test_redis_url_setting_reads_the_prefixed_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXPERT_WORK_CRED_PROXY_REDIS_URL", "redis://:pw@redis:6379/0")
     assert CredentialProxySettings().redis_url == "redis://:pw@redis:6379/0"
