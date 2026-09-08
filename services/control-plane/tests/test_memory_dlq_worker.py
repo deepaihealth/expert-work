@@ -20,10 +20,20 @@ import pytest
 from control_plane.memory import MemoryDLQWorker
 from control_plane.memory.dlq_worker import _build_memory_items
 from expert_work.persistence import InMemoryMemoryStore
-from expert_work.persistence.memory import InMemoryMemoryWritebackDLQ
+from expert_work.persistence.memory import DLQRow, InMemoryMemoryWritebackDLQ
+from expert_work.persistence.rls import (
+    bypass_rls_var,
+    current_tenant_id_var,
+    current_user_id_var,
+)
+from expert_work.protocol import MemoryItem
 
 _TENANT = uuid4()
 _USER = uuid4()
+
+
+def _rls_context() -> tuple[bool, UUID | None, UUID | None]:
+    return bypass_rls_var.get(), current_tenant_id_var.get(), current_user_id_var.get()
 
 
 class _ScriptedEmbedder:
@@ -100,6 +110,38 @@ async def test_happy_retry_writes_memory_and_clears_dlq() -> None:
     items = await store.list_for_user(tenant_id=_TENANT, user_id=_USER)
     assert len(items) == 1
     assert items[0].content == "Likes coffee"
+
+
+@pytest.mark.asyncio
+async def test_run_once_scans_under_bypass_and_rewrites_under_row_tenant_scope() -> None:
+    """RLS posture (Phase-1 Detect, ``rls.would_fail_closed``): the claim
+    scan is a cross-tenant read — explicit bypass, no tenant — while each
+    row's re-write runs scoped to that row's own tenant + user, because
+    ``memory_item`` is FORCE-RLS on both axes. Nothing leaks past
+    ``run_once``. Mirrors ``knowledge/recovery.py``."""
+    seen: dict[str, tuple[bool, UUID | None, UUID | None]] = {}
+
+    class _RecordingDLQ(InMemoryMemoryWritebackDLQ):
+        async def take_ready(self, *, limit: int, now: datetime) -> list[DLQRow]:
+            seen["take_ready"] = _rls_context()
+            return await super().take_ready(limit=limit, now=now)
+
+    class _RecordingStore(InMemoryMemoryStore):
+        async def write(self, items: Sequence[MemoryItem]) -> None:
+            seen["write"] = _rls_context()
+            await super().write(items)
+
+    dlq = _RecordingDLQ()
+    store = _RecordingStore()
+    await _seed_dlq(dlq)
+    embedder = _ScriptedEmbedder([[(0.1, 0.2, 0.3)]])
+
+    worker = MemoryDLQWorker(dlq=dlq, memory_store=store, embedder=embedder)
+    assert await worker.run_once() == (1, 0, 0)
+
+    assert seen["take_ready"] == (True, None, None)
+    assert seen["write"] == (False, _TENANT, _USER)
+    assert _rls_context() == (False, None, None)
 
 
 @pytest.mark.asyncio
