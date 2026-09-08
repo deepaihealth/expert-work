@@ -5,7 +5,8 @@ Mini-ADR J-23 § 15.5 endpoints:
 * ``POST   /v1/skills``                                   create skill (draft)
 * ``POST   /v1/skills/{id}/versions``                     append version
 * ``PATCH  /v1/skills/{id}``                              draft|active|archived
-* ``GET    /v1/skills?status=&category=&cursor=&limit=``  list (cursor paging)
+* ``GET    /v1/skills?status=&category=&cursor=&limit=&platform_cursor=&platform_limit=``
+  list (cursor paging; ``platform_items`` page on their own cursor)
 * ``GET    /v1/skills/{id}``                              get one
 * ``GET    /v1/skills/{id}/versions``                     list versions
 * ``GET    /v1/skills/{id}/versions/{n}``                 get single version
@@ -1103,6 +1104,12 @@ def build_skills_router() -> APIRouter:
         category: Annotated[str | None, Query()] = None,
         cursor: Annotated[UUID | None, Query()] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        # B-23 — ``platform_items`` page on their own cursor, independent of
+        # the tenant page. The default keeps the historical 200-row first
+        # page, so a caller that never passes these sees what it saw before
+        # (plus ``platform_items_truncated`` telling it when that is not all).
+        platform_cursor: Annotated[UUID | None, Query()] = None,
+        platform_limit: Annotated[int, Query(ge=1, le=200)] = 200,
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,  # Stream N
         # Stream SE (SE-8) — agent-self-authored slice for the governance
         # surface (e.g. "this user's agent_private skills"). Single-tenant only.
@@ -1131,6 +1138,7 @@ def build_skills_router() -> APIRouter:
         # plus the platform-curated NULL-tenant library it can see
         # ("platform_items"), each tagged with ``source`` + ``entitled``.
         platform_items: list[dict[str, Any]] = []
+        platform_next_cursor: UUID | None = None
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
                 rows, next_cursor = await store.list_skills_all_tenants(
@@ -1175,16 +1183,20 @@ def build_skills_router() -> APIRouter:
                 # tenant-scoped); semantic A, so this never affects binding.
                 subs = await sub_store.list_for_tenant(tenant_id=scope.tenant_id)
                 subscribed_ids = {s.platform_skill_id for s in subs if s.enabled}
-                # Only ACTIVE platform skills are bindable. The library is
-                # small; a single 200 cap is acceptable here.
+                # Only ACTIVE platform skills are bindable. B-23 — keyset page
+                # (200/page by default) instead of one capped fetch, so a
+                # library past the cap is walkable; ``platform_next_cursor``
+                # doubles as the truncation signal.
                 async with bypass_rls_session():
-                    p_rows, _ = await store.list_platform_skills(
-                        status=SkillStatus.ACTIVE, limit=200
+                    p_rows, platform_next_cursor = await store.list_platform_skills_keyset(
+                        status=SkillStatus.ACTIVE, cursor=platform_cursor, limit=platform_limit
                     )
                 # Name-shadowing (R2): a tenant skill of the same name hides the
                 # platform one. One batch lookup in tenant scope (outside the
                 # bypass block above) — the platform library can be large, so a
-                # per-row ``get_skill_by_name`` would be an N+1.
+                # per-row ``get_skill_by_name`` would be an N+1. Applied after
+                # the page is cut, so a page may come back short while the
+                # cursor still advances past the hidden row.
                 shadowed = await store.shadowed_skill_names(
                     tenant_id=scope.tenant_id, names=[p.name for p in p_rows]
                 )
@@ -1217,6 +1229,10 @@ def build_skills_router() -> APIRouter:
                 "items": items,
                 "platform_items": platform_items,
                 "next_cursor": str(next_cursor) if next_cursor is not None else None,
+                "platform_next_cursor": (
+                    str(platform_next_cursor) if platform_next_cursor is not None else None
+                ),
+                "platform_items_truncated": platform_next_cursor is not None,
                 "cross_tenant": isinstance(scope, CrossTenant),
             },
         )

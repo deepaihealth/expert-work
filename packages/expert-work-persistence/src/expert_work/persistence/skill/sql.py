@@ -353,6 +353,23 @@ class SqlSkillStore(SkillStore):
             limit=limit,
         )
 
+    async def list_platform_skills_keyset(
+        self,
+        *,
+        status: SkillStatus | None = None,
+        cursor: UUID | None = None,
+        limit: int = 50,
+    ) -> tuple[list[Skill], UUID | None]:
+        # B-23 — NULL-tenant rows only; caller must wrap in bypass_rls_session().
+        return await self._list_skills(
+            tenant_id=None,
+            platform_only=True,
+            status=status,
+            category=None,
+            cursor=cursor,
+            limit=limit,
+        )
+
     async def _list_skills(
         self,
         *,
@@ -364,11 +381,14 @@ class SqlSkillStore(SkillStore):
         visibility: SkillVisibility | None = None,
         created_by_user_id: UUID | None = None,
         created_by_agent_name: str | None = None,
+        platform_only: bool = False,
     ) -> tuple[list[Skill], UUID | None]:
         async with self._sf() as session:
             stmt = select(SkillRow).order_by(SkillRow.created_at.desc(), SkillRow.id)
             if tenant_id is not None:
                 stmt = stmt.where(SkillRow.tenant_id == tenant_id)
+            elif platform_only:
+                stmt = stmt.where(SkillRow.tenant_id.is_(None))
             if status is not None:
                 stmt = stmt.where(SkillRow.status == status.value)
             if category is not None:
@@ -383,6 +403,8 @@ class SqlSkillStore(SkillStore):
                 cur_stmt = select(SkillRow).where(SkillRow.id == cursor)
                 if tenant_id is not None:
                     cur_stmt = cur_stmt.where(SkillRow.tenant_id == tenant_id)
+                elif platform_only:
+                    cur_stmt = cur_stmt.where(SkillRow.tenant_id.is_(None))
                 cur_row = (await session.execute(cur_stmt)).scalar_one_or_none()
                 if cur_row is not None:
                     stmt = stmt.where(

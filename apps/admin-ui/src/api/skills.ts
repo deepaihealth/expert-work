@@ -130,6 +130,13 @@ export interface SkillList {
   platform_items: SkillRecord[];
   /** Opaque UUID-encoded cursor; pass back verbatim. */
   next_cursor: string | null;
+  /** B-23 — cursor for the next page of ``platform_items`` (``null`` on the
+   *  last page); pass back as ``platformCursor``. Optional: absent on older
+   *  backends. */
+  platform_next_cursor?: string | null;
+  /** B-23 — ``true`` when ``platform_items`` is not the whole library (a
+   *  ``platform_next_cursor`` follows). Optional: absent on older backends. */
+  platform_items_truncated?: boolean;
   cross_tenant: boolean;
 }
 
@@ -139,6 +146,9 @@ export interface ListSkillsParams {
   category?: string;
   cursor?: string | null;
   limit?: number;
+  /** B-23 — page ``platform_items`` independently of the tenant page. */
+  platformCursor?: string | null;
+  platformLimit?: number;
   /** Stream SE (SE-8) — filter to the agent-self-authored slice. */
   visibility?: SkillVisibility;
   createdByUserId?: string;
@@ -156,6 +166,8 @@ export async function listSkills(
     category,
     cursor,
     limit,
+    platformCursor,
+    platformLimit,
     visibility,
     createdByUserId,
     createdByAgentName,
@@ -166,6 +178,8 @@ export async function listSkills(
       category,
       cursor: cursor ?? undefined,
       limit,
+      platform_cursor: platformCursor ?? undefined,
+      platform_limit: platformLimit,
       visibility,
       created_by_user_id: createdByUserId,
       created_by_agent_name: createdByAgentName,

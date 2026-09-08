@@ -102,10 +102,11 @@ export function SkillsList() {
 
   const [data, setData] = useState<SkillList | null>(null);
   const [accumulated, setAccumulated] = useState<SkillRecord[]>([]);
-  // Stream X-6 — platform skills returned by the merged view. They arrive
-  // on the first page only (no pagination), so we capture them on refresh
-  // and prepend them to the table. Server-side name-shadowing already
-  // de-dupes against the tenant's own skills.
+  // Stream X-6 — platform skills returned by the merged view. They page on
+  // their own cursor (B-23), independent of the tenant rows, so refresh
+  // walks platform_next_cursor to exhaustion and prepends the whole set to
+  // the table. Server-side name-shadowing already de-dupes against the
+  // tenant's own skills.
   const [platformItems, setPlatformItems] = useState<SkillRecord[]>([]);
   const [statusFilter, setStatusFilter] = useState<SkillStatus | undefined>(undefined);
   const [visibilityFilter, setVisibilityFilter] = useState<SkillVisibility | undefined>(undefined);
@@ -131,9 +132,23 @@ export function SkillsList() {
         visibility: visibilityFilter,
         category: categoryFilter.trim().length > 0 ? categoryFilter.trim() : undefined,
       });
+      // B-23 — the platform half is capped at 200 per page; follow
+      // platform_next_cursor (bounded) before rendering. Follow-up pages
+      // carry a 1-row tenant stub that is discarded.
+      let platformRows = [...(result.platform_items ?? [])];
+      let platformCursor = result.platform_next_cursor ?? null;
+      for (let i = 0; platformCursor !== null && i < 20; i += 1) {
+        const page = await listSkills({
+          tenantScope: apiTenantScope,
+          platformCursor,
+          limit: 1,
+        });
+        platformRows = [...platformRows, ...(page.platform_items ?? [])];
+        platformCursor = page.platform_next_cursor ?? null;
+      }
       setData(result);
       setAccumulated(result.items);
-      setPlatformItems(result.platform_items ?? []);
+      setPlatformItems(platformRows);
     } catch (err) {
       const msg =
         err instanceof ApiError

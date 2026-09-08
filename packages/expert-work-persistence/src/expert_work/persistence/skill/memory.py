@@ -785,6 +785,28 @@ class InMemorySkillStore(SkillStore):
         rows.sort(key=lambda r: r.created_at, reverse=True)
         return rows[offset : offset + limit], len(rows)
 
+    async def list_platform_skills_keyset(
+        self,
+        *,
+        status: SkillStatus | None = None,
+        cursor: UUID | None = None,
+        limit: int = 50,
+    ) -> tuple[list[Skill], UUID | None]:
+        rows = self._platform_matches(status=status, category=None, q=None)
+        # Same order as ``list_platform_skills`` (created_at DESC, id ASC) so
+        # the two platform listings agree on what "next" means.
+        rows.sort(key=lambda r: str(r.id))
+        rows.sort(key=lambda r: r.created_at, reverse=True)
+        if cursor is not None:
+            # Mirror the SQL keyset: an unknown cursor adds no predicate.
+            cut = next((i for i, r in enumerate(rows) if r.id == cursor), None)
+            if cut is not None:
+                rows = rows[cut + 1 :]
+        page = rows[: limit + 1]
+        if len(page) > limit:
+            return page[:limit], page[limit - 1].id
+        return page, None
+
     def _platform_matches(
         self, *, status: SkillStatus | None, category: str | None, q: str | None
     ) -> list[Skill]:

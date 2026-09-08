@@ -105,8 +105,10 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
     let alive = true;
     // The backend caps a page at 200 (default 50) — a single call silently
     // truncates a 50+ tenant roster, making skills #51+ unselectable here
-    // while SkillsList shows them. Walk next_cursor to exhaustion (bounded);
-    // platform_items ride along complete on every page, take the first.
+    // while SkillsList shows them. Walk next_cursor to exhaustion (bounded).
+    // platform_items ride along on every page but are capped at 200 too
+    // (B-23): walk platform_next_cursor the same way, keeping only the
+    // platform half of each follow-up page (its tenant half is a 1-row stub).
     const loadAll = async (): Promise<void> => {
       const first = await listSkills({ tenantScope: apiTenantScope, limit: 200 });
       let rows = [...(first?.items ?? [])];
@@ -120,8 +122,19 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
         rows = [...rows, ...(page?.items ?? [])];
         cursor = page?.next_cursor ?? null;
       }
+      let platformRows = [...(first?.platform_items ?? [])];
+      let platformCursor = first?.platform_next_cursor ?? null;
+      for (let i = 0; platformCursor !== null && i < 20; i += 1) {
+        const page = await listSkills({
+          tenantScope: apiTenantScope,
+          platformCursor,
+          limit: 1,
+        });
+        platformRows = [...platformRows, ...(page?.platform_items ?? [])];
+        platformCursor = page?.platform_next_cursor ?? null;
+      }
       if (!alive) return;
-      setSkillRecords([...rows, ...(first?.platform_items ?? [])]);
+      setSkillRecords([...rows, ...platformRows]);
     };
     loadAll().catch(() => {});
     return () => {
