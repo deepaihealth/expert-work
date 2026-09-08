@@ -206,3 +206,44 @@ async def test_bulk_cancel_paginates_and_includes_pending() -> None:
         row = await store.get(run_id=rid, tenant_id=tenant)
         assert row is not None
         assert row.status is RunStatus.INTERRUPTED
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_bulk_cancel_broadcasts_run_cancel_for_peer_owned_runs_only() -> None:
+    """跨副本取消亚秒化 —— 租户停用的批量取消:别的副本持有的 run 走 CAS,赢一个
+    广播一个 ``run_cancel``;本副本自己的 run 就地叫停,不广播。"""
+    store = InMemoryRunStore()
+    tenant = uuid4()
+    base = datetime(2026, 7, 4, tzinfo=UTC)
+    peer_ids = [uuid4(), uuid4()]
+    for i, rid in enumerate(peer_ids):
+        await store.create(_run_info(rid, tenant, RunStatus.RUNNING, base + timedelta(seconds=i)))
+    manager = RunManager(store)
+    local = await manager.create(run_id=uuid4(), thread_id=uuid4(), tenant_id=tenant)
+    assert await manager.set_status(local.run_id, RunStatus.RUNNING)
+    spy = _SpyBus()
+
+    cancelled = await _bulk_cancel_tenant_runs(
+        tenant_id=tenant,
+        run_store=store,
+        runtime=SimpleNamespace(run_manager=manager),  # type: ignore[arg-type]
+        audit=build_default_audit_logger(InMemoryAuditLogStore()),
+        actor_id="admin",
+        trace_id=None,
+        bus=spy,
+    )
+    assert cancelled == 3
+    assert local.abort_event.is_set()
+    broadcast = sorted((e.kind, e.run_id, e.tenant_id) for e in spy.events)  # type: ignore[attr-defined]
+    assert broadcast == sorted(("run_cancel", str(rid), str(tenant)) for rid in peer_ids)

@@ -5,10 +5,13 @@ Three live-proof harnesses share this dir:
 - **`verify_failover.py`** (Stream 9.4) — orphaned-run automatic hot-handoff.
 - **`verify_queue.py`** (Stream 9.5) — distributed run-queue cross-instance drain
   (see [§ Stream 9.5](#stream-95--distributed-run-queue-live-e2e) below).
-- **`verify_cancel.py`**(多副本 CAS 守卫执行面)— cross-replica cancel:
-  非属主副本发 cancel → durable CAS → 属主心跳 CAS 失败 → abort。四断言:
-  行立即 interrupted+user_cancel / blue 在心跳检测上界内停(end 帧)/ 属主
-  心跳冻结 / 不复活。用法与两个姊妹脚本一致(`EXPERT_WORK_API_TOKEN` + 双色栈)。
+- **`verify_cancel.py`**(多副本 CAS 守卫执行面 + 跨副本取消亚秒化)—
+  cross-replica cancel:非属主副本发 cancel → durable CAS → 总线 `run_cancel`
+  → 属主立刻做心跳 CAS(失败)→ abort;总线不通时退回 10s 一次的周期心跳。
+  五断言:行立即 interrupted+user_cancel / blue 在 `--stop-timeout` 内停
+  (end 帧,心跳兜底上界)/ blue 在 `--bus-stop-bound`(默认 2s)内停(总线
+  那条链活着)/ 属主心跳冻结 / 不复活。用法与两个姊妹脚本一致
+  (`EXPERT_WORK_API_TOKEN` + 双色栈)。
 
 ---
 

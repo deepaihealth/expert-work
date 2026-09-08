@@ -322,6 +322,46 @@ async def test_disable_cancels_a_run_owned_by_another_replica(ctx: _Ctx) -> None
 
 
 @pytest.mark.asyncio
+async def test_disable_broadcasts_run_cancel_for_a_peer_owned_run(ctx: _Ctx) -> None:
+    """跨副本取消亚秒化 —— kill switch 对别的副本持有的 run 走 CAS,赢了就广播
+    ``run_cancel``,属主副本立刻叫停而不是等下一次心跳。"""
+    sess = await ctx.client.post(
+        "/v1/sessions", json={"agent_name": "support-bot", "agent_version": "1.0.0"}
+    )
+    thread_id = UUID(sess.json()["data"]["thread_id"])
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    await ctx.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=ctx.tenant_id,
+            thread_id=thread_id,
+            user_id=None,
+            status=RunStatus.RUNNING,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=None,
+            claimed_by="peer-instance-xyz",
+        )
+    )
+    spy_bus = _SpyBusE3b()
+    ctx.app.state.invalidation_bus = spy_bus
+
+    resp = await ctx.client.post("/v1/agents/support-bot/disable", json={"reason": "stop"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["cancelled_runs"] == 1
+
+    kinds = [e.kind for e in spy_bus.events]  # type: ignore[attr-defined]
+    assert kinds == ["agent_disable", "run_cancel"]
+    cancel = spy_bus.events[1]
+    assert cancel.run_id == str(run_id)  # type: ignore[attr-defined]
+    assert cancel.tenant_id == str(ctx.tenant_id)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_queued_run_for_disabled_agent_not_claimed(ctx: _Ctx) -> None:
     sess = await ctx.client.post(
         "/v1/sessions", json={"agent_name": "support-bot", "agent_version": "1.0.0"}

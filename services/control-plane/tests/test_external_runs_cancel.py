@@ -354,6 +354,66 @@ async def test_cancel_is_idempotent(ctx: _Ctx) -> None:
     assert second.json()["data"]["stopped"] is False
 
 
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def publish(self, event: Any) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: Any) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_a_peer_owned_run_broadcasts_run_cancel(ctx: _Ctx) -> None:
+    """跨副本取消亚秒化 —— 对外取消端点走到 CAS 那一步且赢了,就广播
+    ``run_cancel``(run_id + tenant_id,不带 end-user 数据)。"""
+    await ctx.seed_agent()
+    thread_id = await ctx.bind_session("cust-77")
+    end_user_id = await ctx.end_user_id("cust-77")
+    run_id = uuid4()
+    peer_manager = RunManager(store=ctx.run_store)
+    await peer_manager.create(
+        run_id=run_id, thread_id=thread_id, tenant_id=ctx.tenant_id, user_id=end_user_id
+    )
+    spy = _SpyBus()
+    ctx.app.state.invalidation_bus = spy
+
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:cancel",
+        json={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["stopped"] is True
+    assert [(e.kind, e.run_id, e.tenant_id, e.user_id) for e in spy.events] == [
+        ("run_cancel", str(run_id), str(ctx.tenant_id), None)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_a_local_run_does_not_broadcast(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    thread_id = await ctx.bind_session("cust-77")
+    end_user_id = await ctx.end_user_id("cust-77")
+    run_id = uuid4()
+    await ctx.app.state.agent_runtime.run_manager.create(
+        run_id=run_id, thread_id=thread_id, tenant_id=ctx.tenant_id, user_id=end_user_id
+    )
+    spy = _SpyBus()
+    ctx.app.state.invalidation_bus = spy
+
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:cancel",
+        json={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["stopped"] is True
+    assert spy.events == []
+
+
 @pytest.mark.asyncio
 async def test_cancel_is_a_noop_for_an_already_finished_run(ctx: _Ctx) -> None:
     """A run that already reached SUCCESS (not via cancel — e.g. it simply

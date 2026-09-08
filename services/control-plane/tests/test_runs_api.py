@@ -2084,6 +2084,60 @@ async def test_cancel_run_interrupts_a_running_row(runs_client: AsyncClient) -> 
     assert listed[str(run_id)]["finished_at"] is not None
 
 
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def publish(self, event: Any) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: Any) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_peer_owned_broadcasts_run_cancel(runs_client: AsyncClient) -> None:
+    """跨副本取消亚秒化 —— CAS 赢了就广播 ``run_cancel``(只带 run_id + tenant_id,
+    不带用户数据),属主副本据此立刻叫停,不等 lease_ttl/3 的周期心跳。"""
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_run_row(runs_client, thread_id, status=RunStatus.RUNNING)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    spy = _SpyBus()
+    app.state.invalidation_bus = spy
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 200, resp.text
+
+    assert [(e.kind, e.run_id, e.tenant_id, e.user_id) for e in spy.events] == [
+        ("run_cancel", str(run_id), str(DEFAULT_DEV_TENANT_ID), None)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_local_run_does_not_broadcast(runs_client: AsyncClient) -> None:
+    """本副本自己的 run 走 ``RunManager.cancel`` 就地叫停,没有 CAS 那一步,也就
+    没有事件 —— 总线只为非属主那条路服务。"""
+    from expert_work.runtime.runs import RunStatus
+
+    thread_id = await _create_session(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    run_manager = app.state.agent_runtime.run_manager
+    run_id = uuid4()
+    record = await run_manager.create(
+        run_id=run_id, thread_id=UUID(thread_id), tenant_id=DEFAULT_DEV_TENANT_ID
+    )
+    assert await run_manager.set_status(run_id, RunStatus.RUNNING)
+    spy = _SpyBus()
+    app.state.invalidation_bus = spy
+
+    resp = await runs_client.post(f"/v1/sessions/{thread_id}/runs/{run_id}:cancel", json={})
+    assert resp.status_code == 200, resp.text
+    assert record.abort_event.is_set()
+    assert spy.events == []
+
+
 @pytest.mark.asyncio
 async def test_cancel_run_terminal_row_is_409(runs_client: AsyncClient) -> None:
     from expert_work.runtime.runs import RunStatus

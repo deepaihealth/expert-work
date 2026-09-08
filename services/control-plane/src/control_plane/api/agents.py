@@ -78,6 +78,7 @@ from control_plane.manifest import (
     ManifestValidationError,
 )
 from control_plane.quota.base import QuotaService
+from control_plane.run_cancel import cancel_run_two_level
 from control_plane.runtime import AgentRuntime
 from control_plane.tenancy import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import (
@@ -2520,13 +2521,14 @@ def build_agents_router() -> APIRouter:
             )
             now = datetime.now(UTC)
             for run in running:
-                stopped = await runtime.run_manager.cancel(
-                    run.run_id, reason=InterruptReason.AGENT_DISABLED
-                ) or await run_store.request_cancel(
+                stopped = await cancel_run_two_level(
+                    run_manager=runtime.run_manager,
+                    run_store=run_store,
+                    bus=getattr(request.app.state, "invalidation_bus", None),
                     run_id=run.run_id,
                     tenant_id=tenant_id,
-                    updated_at=now,
                     reason=InterruptReason.AGENT_DISABLED,
+                    now=now,
                 )
                 if stopped:
                     cancelled += 1
@@ -2624,13 +2626,14 @@ def build_agents_router() -> APIRouter:
         cancelled = 0
         now = datetime.now(UTC)
         for run in running:
-            stopped = await runtime.run_manager.cancel(
-                run.run_id, reason=InterruptReason.AGENT_DISABLED
-            ) or await run_store.request_cancel(
+            stopped = await cancel_run_two_level(
+                run_manager=runtime.run_manager,
+                run_store=run_store,
+                bus=bus,
                 run_id=run.run_id,
                 tenant_id=tenant_id,
-                updated_at=now,
                 reason=InterruptReason.AGENT_DISABLED,
+                now=now,
             )
             if stopped:
                 cancelled += 1
