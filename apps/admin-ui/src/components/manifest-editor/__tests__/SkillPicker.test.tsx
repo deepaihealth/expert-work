@@ -387,7 +387,9 @@ describe("SkillPicker", () => {
         cross_tenant: false,
       })
       .mockResolvedValueOnce({
-        items: [rec({ name: "t-only", source: "tenant" })],
+        // A follow-up platform page carries a 1-row tenant stub the walk
+        // must discard (it is not a tenant page).
+        items: [rec({ name: "stub-row", source: "tenant" })],
         platform_items: [
           rec({ name: "plat-page2", source: "platform", entitled: true }),
         ],
@@ -399,9 +401,8 @@ describe("SkillPicker", () => {
     render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
     expect(await screen.findByTestId("af-skill-row-plat-page1")).toBeInTheDocument();
     expect(screen.getByTestId("af-skill-row-plat-page2")).toBeInTheDocument();
-    // The platform walk takes only platform_items — tenant rows ride along
-    // on every page and must not be appended twice.
-    expect(screen.getAllByTestId("af-skill-row-t-only")).toHaveLength(1);
+    expect(screen.getByTestId("af-skill-row-t-only")).toBeInTheDocument();
+    expect(screen.queryByTestId("af-skill-row-stub-row")).not.toBeInTheDocument();
     expect(listSkills).toHaveBeenCalledTimes(2);
     expect(listSkills).toHaveBeenLastCalledWith(
       expect.objectContaining({ platformCursor: "pcursor-1" }),

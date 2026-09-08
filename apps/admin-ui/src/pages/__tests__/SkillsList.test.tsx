@@ -321,7 +321,9 @@ describe("SkillsList", () => {
           seenParams.push(params);
           if (params?.platform_cursor === "pc-1") {
             return {
-              items: [],
+              // Follow-up platform pages carry a 1-row tenant stub the walk
+              // must discard (they are not tenant pages).
+              items: [{ ...skillRow, id: "stub", name: "stub_row_discarded" }],
               platform_items: [platformRow("pk2", "platform_page2")],
               next_cursor: null,
               platform_next_cursor: null,
@@ -344,6 +346,7 @@ describe("SkillsList", () => {
     await waitFor(() => expect(screen.getByText("platform_page2")).toBeInTheDocument());
     expect(screen.getByText("platform_page1")).toBeInTheDocument();
     expect(screen.getByText("web_search")).toBeInTheDocument();
+    expect(screen.queryByText("stub_row_discarded")).not.toBeInTheDocument();
     // Exactly one follow-up request, carrying the cursor back verbatim.
     expect(seenParams).toHaveLength(2);
     expect(seenParams[1]).toMatchObject({ platform_cursor: "pc-1" });
