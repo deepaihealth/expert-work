@@ -6,6 +6,24 @@
 > 各 program 的完整执行历史仍在各自的(本机)`.superpowers/sdd/<plan>/progress.md`;入仓的设计与计划在
 > `docs/superpowers/specs/` 与 `docs/superpowers/plans/`。
 
+## 排期(2026-09-08 拍板;生产已于 09-08 上线 `ad79ba28`)
+
+> 生产已在线,发布从「一个日子」变成**每周一班车:默认周二**(周一合完泡测试一天)。本周(09-08 ~ 09-12)只进测试环境。
+> 并行按文件冲突分线,零交集的线 worktree 并跑;每条线一个或两个 PR。开工前按行内来源核实现状(本文件两次误报都是没核实)。
+
+| 周 | 生产班车 | 同周开发(周五前上测试) |
+|---|---|---|
+| 09-08 ~ 09-12 | 无(09-08 已发 `ad79ba28`) | **六线并行**:A MCP 探针拆 ExceptionGroup(消息+日志给叶子原因)/ B release.sh(X-14 P5 记录 PR 写上一版 tag + B-29 ③ 失败分支假成功)/ C X-8 收官(pgvector·pgbouncer 镜像进 GHCR + 沙箱镜像 build 走 buildx 缓存,integration 不再每 PR 烧 40 分钟)/ D B-42 worker token 错价(usage 按 provider·model 分桶 + admin-ui 按桶计价,2 PR)/ E B-33 模型参数 catalog 约束 / F B-23 platform_items 200 截断 |
+| 09-15 ~ 09-19 | **班车 1(09-15)**= 本周六线 | 波 2 多副本第一波:Redis 全局令牌桶 / 取消亚秒化 / B-31 ① credential-proxy 失效链;**RLS PR B(FORCE RLS,2 PR)合完只上测试** |
+| 09-22 ~ 09-26 | **班车 2(09-22)**= 波 2 前三条;RLS 留测试泡一周 | 波 3 留存链(串行 4 PR):X-15 ① 删第二套审批超时 → retention CronJob 首部署(test 先)→ B-27 threads/ GC + B-28 产物留存 + X-4 ② 90 天硬删。留存天数待拍板 |
+| 09-29 ~ 09-30 | **班车 3(09-29)**= RLS + 留存链;国庆前最后一班 | 10-01 ~ 10-07 不发生产、不合大改 |
+| 10-09 起 | 每条迁移单独一班 | 波 4 依赖迁移串行(都动 uv.lock):X-12 fastapi 路由自审 → X-11 mcp SDK 2.x + httpx2 → X-13 e2b;每条合前真栈测 MCP 工具 / 沙箱工具,做完删对应 dependabot ignore |
+| 之后 | 按需 | 波 5 收尾池:X-1 沙箱波 4 / X-10 方案文档 / X-7 观测三小项 / X-9 perf 池 / X-14 P3-P4 / D-7 / X-5 / X-6 ③ / B-14 / B-9~B-11 / 小 B 打包 |
+
+- **B-40 乱码验收**不占排期:对方发版当天查库贴结果。
+- **待拍板才排**:P-3/P-4(建议先把「只发 write key、永不发 admin」写进 runbook 硬流程,admin scope 收窄放波 5)/ P-5 审批角色 / P-1·P-2·X-3 三个新功能做不做与先后 / B-30 kimi-k2.7-code 上架 / X-4 ① 成员清除是否仍暂缓。
+- **新入册(2026-09-08)**:MCP 探针把真因吞成 `ExceptionGroup` —— `mcp_probe.py` 只把异常类名放进消息,`mcp_probe.failed` 日志不带栈;真栈复现:生产建 `deep-ai-health-mcp` 六次 422 无一处能看出是 401 还是 DNS(从 pod 手探才定位到对方生产服务在、无 token 回 401)。修法=递归拆 ExceptionGroup 取叶子异常进消息(截断、脱敏),日志带 `exc_info`。
+
 ## 状态(2026-08-30)
 
 > 近三日新增(08-28 晚 → 08-30),按 program 归拢;逐 PR 明细见「生产发布前置」节末的进度条目。
