@@ -626,3 +626,43 @@ async def test_bulk_no_action_raises() -> None:
     a = await _seed_platform(store, "a")
     with pytest.raises(ValueError):
         await store.bulk_update_platform_skills(ids=[a])  # no set_* and update_category=False
+
+
+# ---------------------------------------------------------------------------
+# platform list — keyset pagination (B-23, feeds the merged ``GET /v1/skills``)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_platform_list_keyset_walks_whole_library_without_overlap() -> None:
+    store = InMemorySkillStore()
+    seeded = {await _seed_platform(store, f"plat-{i}") for i in range(5)}
+    pages: list[list[UUID]] = []
+    cursor: UUID | None = None
+    for _ in range(10):
+        rows, cursor = await store.list_platform_skills_keyset(cursor=cursor, limit=2)
+        pages.append([s.id for s in rows])
+        if cursor is None:
+            break
+    assert [len(p) for p in pages] == [2, 2, 1]
+    walked = [sid for p in pages for sid in p]
+    assert len(walked) == len(set(walked)) == 5
+    assert set(walked) == seeded
+    # Same order as the offset listing (created_at DESC, id) — the two
+    # platform listings must agree on what "next" means.
+    offset_rows, _ = await store.list_platform_skills(limit=10)
+    assert walked == [s.id for s in offset_rows]
+
+
+@pytest.mark.asyncio
+async def test_platform_list_keyset_filters_status_and_skips_tenant_rows() -> None:
+    store = InMemorySkillStore()
+    active = await _seed_platform(store, "active-one")
+    await store.set_platform_status(skill_id=active, status=SkillStatus.ACTIVE)
+    await _seed_platform(store, "still-draft")
+    await store.create_skill(skill_id=uuid4(), tenant_id=uuid4(), name="tenant-owned")
+    rows, next_cursor = await store.list_platform_skills_keyset(
+        status=SkillStatus.ACTIVE, limit=50
+    )
+    assert [s.id for s in rows] == [active]
+    assert next_cursor is None
