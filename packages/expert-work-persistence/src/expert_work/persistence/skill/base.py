@@ -647,6 +647,23 @@ class SkillStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def list_platform_skills_keyset(
+        self,
+        *,
+        status: SkillStatus | None = None,
+        cursor: UUID | None = None,
+        limit: int = 50,
+    ) -> tuple[list[Skill], UUID | None]:
+        """Keyset-page through platform (NULL-tenant) skills — B-23.
+
+        Same ``(rows, next_cursor)`` contract and ``created_at DESC, id``
+        order as :meth:`list_skills`, so the merged ``GET /v1/skills`` view
+        can walk the platform library the way it already walks tenant rows.
+        :meth:`list_platform_skills` stays offset-based for the admin table.
+        Caller MUST be inside ``bypass_rls_session()``.
+        """
+
+    @abc.abstractmethod
     async def bulk_update_platform_skills(
         self,
         *,

@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -38,8 +38,13 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.persistence.rls import build_rls_sessionmaker, current_tenant_id_var
+from expert_work.persistence.rls import (
+    build_rls_sessionmaker,
+    bypass_rls_var,
+    current_tenant_id_var,
+)
 from expert_work.persistence.skill.base import DuplicateSkillError
+from expert_work.protocol import SkillStatus
 from expert_work.protocol.tenant_config import TenantPlan
 
 pytestmark = pytest.mark.integration
@@ -233,3 +238,82 @@ async def test_x2_migration_safe_preexisting_tenant_skill(
     finally:
         current_tenant_id_var.set(None)
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_b23_platform_keyset_paging_walks_library_and_respects_rls(
+    skill_rls: tuple[SqlSkillStore, AsyncEngine],
+    postgres_container: PostgresContainer,
+) -> None:
+    """``list_platform_skills_keyset`` (feeds the merged ``GET /v1/skills``)
+    pages the NULL-tenant library without gaps or repeats, in the same order
+    as the offset listing, stays behind the same RLS trap, and — under a
+    session RLS does not apply to — still keeps tenant rows out by itself."""
+    store, engine = skill_rls
+    # Production connects as the table owner (RLS inert), so the store's own
+    # ``tenant_id IS NULL`` predicate is the only thing keeping tenant rows out
+    # of the platform walk. Exercise that where it can fail: a superuser
+    # session, with a real tenant row in the table.
+    su_engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    su_store = SqlSkillStore(create_async_session_factory(su_engine))
+    try:
+        current_tenant_id_var.set(None)
+        prefix = f"page-{uuid4().hex[:8]}"
+        seeded: list[UUID] = []
+        for i in range(5):
+            created = await store.create_platform_skill(skill_id=uuid4(), name=f"{prefix}-{i}")
+            seeded.append(created.id)
+        await store.set_platform_status(skill_id=seeded[0], status=SkillStatus.ACTIVE)
+
+        walked: list[UUID] = []
+        cursor: UUID | None = None
+        for _ in range(50):
+            rows, cursor = await store.list_platform_skills_keyset(cursor=cursor, limit=2)
+            walked.extend(s.id for s in rows)
+            if cursor is None:
+                break
+        assert cursor is None
+        assert len(walked) == len(set(walked))  # no row served twice
+        assert set(seeded) <= set(walked)  # container is shared across tests: ⊆ not ==
+        offset_rows, _ = await store.list_platform_skills(limit=len(walked))
+        assert walked == [s.id for s in offset_rows]
+
+        active_rows, _ = await store.list_platform_skills_keyset(
+            status=SkillStatus.ACTIVE, limit=50
+        )
+        active_ids = {s.id for s in active_rows}
+        assert seeded[0] in active_ids
+        assert not (set(seeded[1:]) & active_ids)
+
+        # X-8 / W-8 trap: a TENANT-scoped session sees ZERO platform rows.
+        current_tenant_id_var.set(uuid4())
+        tenant_view, tenant_cursor = await store.list_platform_skills_keyset(limit=2)
+        assert tenant_view == []
+        assert tenant_cursor is None
+
+        # Superuser session (RLS inert, like production): a tenant row is
+        # visible to the session yet never enters the platform walk.
+        current_tenant_id_var.set(None)
+        bypass_tok = bypass_rls_var.set(True)
+        try:
+            tenant = uuid4()
+            tenant_row = await su_store.create_skill(
+                skill_id=uuid4(), tenant_id=tenant, name=f"{prefix}-tenant"
+            )
+            own, _ = await su_store.list_skills(tenant_id=tenant)
+            assert [s.id for s in own] == [tenant_row.id]  # the session does see it
+            su_walk: list[UUID] = []
+            cursor = None
+            for _ in range(50):
+                rows, cursor = await su_store.list_platform_skills_keyset(cursor=cursor, limit=2)
+                su_walk.extend(s.id for s in rows)
+                if cursor is None:
+                    break
+            assert tenant_row.id not in su_walk
+            assert set(seeded) <= set(su_walk)
+        finally:
+            bypass_rls_var.reset(bypass_tok)
+    finally:
+        current_tenant_id_var.set(None)
+        await engine.dispose()
+        await su_engine.dispose()

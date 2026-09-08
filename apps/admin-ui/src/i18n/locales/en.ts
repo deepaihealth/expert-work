@@ -1128,6 +1128,7 @@ export interface TranslationKeys {
     section_skills: string;
     section_skills_help: string;
     skills_hint: string;
+    skills_truncated: string;
     auto_attach_evolved: string;
     auto_attach_evolved_help: string;
     skills_search: string;
@@ -2451,6 +2452,7 @@ export interface TranslationKeys {
     empty_filtered: string;
     clear_filter: string;
     filter_partial_hint: string;
+    platform_truncated: string;
     load_more: string;
     create: string;
     create_modal_title: string;
@@ -4370,6 +4372,8 @@ const en: TranslationKeys = {
       "Skill packages (instructions + scripts) attached to the agent.\nPick from your tenant's and the platform's skills.\nExample: pptx-builder, sql-analyst",
     skills_hint:
       "Check the skills to attach to this agent. Platform skills your plan tier cannot use are not selectable.",
+    skills_truncated:
+      "Too many skills to load at once — this list is incomplete, and skills not listed cannot be checked here.",
     auto_attach_evolved: "Auto-attach self-evolved skills",
     auto_attach_evolved_help:
       "When on, builds automatically attach this agent's own promoted (ACTIVE) distilled skills without editing the manifest.\nAttached lazily: a summary in <available-skills> only, never eager prompt content.\nSkills you check below always take precedence over an auto-attached duplicate.",
@@ -5827,6 +5831,7 @@ const en: TranslationKeys = {
     empty_filtered: 'No skills match "{{q}}"',
     clear_filter: "Clear search",
     filter_partial_hint: "Search covers loaded skills only — Load more below fetches the rest.",
+    platform_truncated: "Too many platform skills to load at once — this list is incomplete.",
     load_more: "Load more",
     create: "Create",
     create_modal_title: "Create skill (empty draft)",

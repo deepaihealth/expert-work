@@ -6,6 +6,12 @@
  */
 export const TABLE_PAGE_SIZE = 20;
 
+/** Hard cap on cursor pages one loader walks (SkillPicker / SkillsList,
+ *  200 rows a page). Hitting it with a cursor still in hand must surface a
+ *  visible warning, never a silent cut (B-29 kin: no signal where there
+ *  should be one). */
+export const MAX_CURSOR_PAGES = 20;
+
 /** Spread into an antd ``Table``/``Pagination`` ``pagination`` prop; add
  *  ``current``/``onChange`` at the call site when the page is controlled. */
 export const TABLE_PAGINATION = {

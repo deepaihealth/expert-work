@@ -52,7 +52,7 @@ import { tenantSkillApi } from "../api/skillApi";
 import { useAuth } from "../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
-import { TABLE_PAGE_SIZE, TABLE_PAGINATION } from "../utils/pagination";
+import { MAX_CURSOR_PAGES, TABLE_PAGE_SIZE, TABLE_PAGINATION } from "../utils/pagination";
 import { PageHeader } from "../components/PageHeader";
 import { SkillEvolutionKillSwitch } from "../components/SkillEvolutionKillSwitch";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
@@ -102,11 +102,15 @@ export function SkillsList() {
 
   const [data, setData] = useState<SkillList | null>(null);
   const [accumulated, setAccumulated] = useState<SkillRecord[]>([]);
-  // Stream X-6 — platform skills returned by the merged view. They arrive
-  // on the first page only (no pagination), so we capture them on refresh
-  // and prepend them to the table. Server-side name-shadowing already
-  // de-dupes against the tenant's own skills.
+  // Stream X-6 — platform skills returned by the merged view. They page on
+  // their own cursor (B-23), independent of the tenant rows, so refresh
+  // walks platform_next_cursor to exhaustion and prepends the whole set to
+  // the table. Server-side name-shadowing already de-dupes against the
+  // tenant's own skills.
   const [platformItems, setPlatformItems] = useState<SkillRecord[]>([]);
+  // The platform walk stopped at its page cap with a cursor still in hand
+  // → the platform half is incomplete and the user must be told (B-29 kin).
+  const [platformTruncated, setPlatformTruncated] = useState(false);
   const [statusFilter, setStatusFilter] = useState<SkillStatus | undefined>(undefined);
   const [visibilityFilter, setVisibilityFilter] = useState<SkillVisibility | undefined>(undefined);
   const [categoryFilter, setCategoryFilter] = useState("");
@@ -131,9 +135,24 @@ export function SkillsList() {
         visibility: visibilityFilter,
         category: categoryFilter.trim().length > 0 ? categoryFilter.trim() : undefined,
       });
+      // B-23 — the platform half is capped at 200 per page; follow
+      // platform_next_cursor (bounded) before rendering. Follow-up pages
+      // carry a 1-row tenant stub that is discarded.
+      let platformRows = [...(result.platform_items ?? [])];
+      let platformCursor = result.platform_next_cursor ?? null;
+      for (let i = 0; platformCursor !== null && i < MAX_CURSOR_PAGES; i += 1) {
+        const page = await listSkills({
+          tenantScope: apiTenantScope,
+          platformCursor,
+          limit: 1,
+        });
+        platformRows = [...platformRows, ...(page.platform_items ?? [])];
+        platformCursor = page.platform_next_cursor ?? null;
+      }
       setData(result);
       setAccumulated(result.items);
-      setPlatformItems(result.platform_items ?? []);
+      setPlatformItems(platformRows);
+      setPlatformTruncated(platformCursor !== null);
     } catch (err) {
       const msg =
         err instanceof ApiError
@@ -502,6 +521,9 @@ export function SkillsList() {
 
       {error !== null && (
         <Alert type="error" showIcon message={t("skills.failed_to_load")} description={error} style={{ marginBottom: 12 }} data-testid="skills-error" />
+      )}
+      {platformTruncated && (
+        <Alert type="warning" showIcon message={t("skills.platform_truncated")} style={{ marginBottom: 12 }} data-testid="skills-platform-truncated" />
       )}
 
       <Table<SkillRecord>

@@ -19,6 +19,7 @@ import {
   type ReactNode,
 } from "react";
 import {
+  Alert,
   Checkbox,
   Empty,
   Input,
@@ -33,7 +34,11 @@ import { useTranslation } from "react-i18next";
 
 import { listSkills, type SkillRecord } from "../../api/skills";
 import { useTenantScope } from "../../tenant/TenantScopeContext";
-import { TABLE_PAGE_SIZE, TABLE_PAGINATION } from "../../utils/pagination";
+import {
+  MAX_CURSOR_PAGES,
+  TABLE_PAGE_SIZE,
+  TABLE_PAGINATION,
+} from "../../utils/pagination";
 import { FieldHelp } from "../FieldHelp";
 import {
   readAutoAttachEvolvedSkills,
@@ -83,6 +88,9 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
   // Cross-tenant W3 — list the switched-in tenant's skills for the picker.
   const { apiTenantScope } = useTenantScope();
   const [skills, setSkillRecords] = useState<SkillRecord[]>([]);
+  // Either walk below stopped at its page cap with a cursor still in hand
+  // → the roster is incomplete and the user must be told (B-29 kin).
+  const [truncated, setTruncated] = useState(false);
   const [query, setQuery] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string | undefined>(
     undefined,
@@ -105,13 +113,16 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
     let alive = true;
     // The backend caps a page at 200 (default 50) — a single call silently
     // truncates a 50+ tenant roster, making skills #51+ unselectable here
-    // while SkillsList shows them. Walk next_cursor to exhaustion (bounded);
-    // platform_items ride along complete on every page, take the first.
+    // while SkillsList shows them. Walk next_cursor to exhaustion (bounded;
+    // hitting the bound surfaces a warning instead of a silent cut).
+    // platform_items ride along on every page but are capped at 200 too
+    // (B-23): walk platform_next_cursor the same way, keeping only the
+    // platform half of each follow-up page (its tenant half is a 1-row stub).
     const loadAll = async (): Promise<void> => {
       const first = await listSkills({ tenantScope: apiTenantScope, limit: 200 });
       let rows = [...(first?.items ?? [])];
       let cursor = first?.next_cursor ?? null;
-      for (let i = 0; cursor !== null && i < 20; i += 1) {
+      for (let i = 0; cursor !== null && i < MAX_CURSOR_PAGES; i += 1) {
         const page = await listSkills({
           tenantScope: apiTenantScope,
           cursor,
@@ -120,8 +131,20 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
         rows = [...rows, ...(page?.items ?? [])];
         cursor = page?.next_cursor ?? null;
       }
+      let platformRows = [...(first?.platform_items ?? [])];
+      let platformCursor = first?.platform_next_cursor ?? null;
+      for (let i = 0; platformCursor !== null && i < MAX_CURSOR_PAGES; i += 1) {
+        const page = await listSkills({
+          tenantScope: apiTenantScope,
+          platformCursor,
+          limit: 1,
+        });
+        platformRows = [...platformRows, ...(page?.platform_items ?? [])];
+        platformCursor = page?.platform_next_cursor ?? null;
+      }
       if (!alive) return;
-      setSkillRecords([...rows, ...(first?.platform_items ?? [])]);
+      setSkillRecords([...rows, ...platformRows]);
+      setTruncated(cursor !== null || platformCursor !== null);
     };
     loadAll().catch(() => {});
     return () => {
@@ -195,6 +218,15 @@ export function SkillPicker({ formData, onChange }: SkillPickerProps) {
       <Text type="secondary" style={{ display: "block", marginBottom: 8 }}>
         {t("agent_form.skills_hint")}
       </Text>
+      {truncated && (
+        <Alert
+          type="warning"
+          showIcon
+          message={t("agent_form.skills_truncated")}
+          style={{ marginBottom: 12 }}
+          data-testid="af-skills-truncated"
+        />
+      )}
 
       {/* SE-16 (SE-A42) — evolution flywheel opt-in: build auto-attaches
           this agent's own ACTIVE distilled skills (lazy, summary only). */}

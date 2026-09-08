@@ -20,6 +20,7 @@ import base64
 import io
 import zipfile
 from collections.abc import AsyncIterator
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -1582,3 +1583,103 @@ async def test_batch_tenant_principal_forbidden(ctx: _Ctx) -> None:
         headers=ctx.tenant_headers,
     )
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# B-23 — platform_items cursor paging + ``platform_items_truncated``
+# ---------------------------------------------------------------------------
+
+
+async def _walk_platform_pages(ctx: _Ctx, *, platform_limit: int) -> list[dict[str, Any]]:
+    """Follow ``platform_next_cursor`` to exhaustion; returns every page body."""
+    pages: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(10):
+        params: dict[str, Any] = {"platform_limit": platform_limit}
+        if cursor is not None:
+            params["platform_cursor"] = cursor
+        resp = await ctx.client.get("/v1/skills", params=params, headers=ctx.tenant_headers)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        pages.append(body)
+        cursor = body["platform_next_cursor"]
+        if cursor is None:
+            break
+    return pages
+
+
+@pytest.mark.asyncio
+async def test_merged_view_platform_items_page_by_cursor_and_flag_truncation(ctx: _Ctx) -> None:
+    names = {f"plat-{i}" for i in range(5)}
+    for name in sorted(names):
+        await _seed_platform_skill(ctx.skill_store, name=name, required_tier=TenantPlan.FREE)
+
+    pages = await _walk_platform_pages(ctx, platform_limit=2)
+
+    assert [len(p["platform_items"]) for p in pages] == [2, 2, 1]
+    assert [p["platform_items_truncated"] for p in pages] == [True, True, False]
+    assert pages[0]["platform_next_cursor"] is not None
+    assert pages[-1]["platform_next_cursor"] is None
+    seen = [item["name"] for p in pages for item in p["platform_items"]]
+    # Union of the pages is the whole library, with no row served twice.
+    assert len(seen) == len(set(seen)) == 5
+    assert set(seen) == names
+
+
+@pytest.mark.asyncio
+async def test_merged_view_platform_items_not_truncated_when_library_fits(ctx: _Ctx) -> None:
+    await _seed_platform_skill(ctx.skill_store, name="a", required_tier=TenantPlan.FREE)
+    await _seed_platform_skill(ctx.skill_store, name="b", required_tier=TenantPlan.FREE)
+
+    # No new params → today's shape, plus the two new keys in their "all
+    # here" state, so a caller that ignores the cursor still sees the flag.
+    resp = await ctx.client.get("/v1/skills", headers=ctx.tenant_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {item["name"] for item in body["platform_items"]} == {"a", "b"}
+    assert body["platform_items_truncated"] is False
+    assert body["platform_next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_merged_view_platform_page_advances_past_shadowed_rows(ctx: _Ctx) -> None:
+    # Name-shadowing is applied after the page is cut: a shadowed row makes
+    # its page short, but the cursor still advances past it, so a walk stays
+    # complete (no row is skipped just because its page-mate was hidden).
+    for name in ("a", "b", "c"):
+        await _seed_platform_skill(ctx.skill_store, name=name, required_tier=TenantPlan.FREE)
+    own = await ctx.client.post("/v1/skills", json={"name": "b"}, headers=ctx.tenant_headers)
+    assert own.status_code == 201
+
+    pages = await _walk_platform_pages(ctx, platform_limit=2)
+
+    seen = [item["name"] for p in pages for item in p["platform_items"]]
+    assert sorted(seen) == ["a", "c"]
+    # created_at DESC → page 1 fetched (c, b), dropped b, and still reports a
+    # next page; page 2 is (a).
+    assert [len(p["platform_items"]) for p in pages] == [1, 1]
+    assert pages[0]["platform_items_truncated"] is True
+    assert pages[1]["platform_items_truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_cross_tenant_view_reports_no_platform_paging(ctx: _Ctx) -> None:
+    await _seed_platform_skill(ctx.skill_store, name="plat", required_tier=TenantPlan.FREE)
+
+    resp = await ctx.client.get("/v1/skills?tenant_id=*", headers=ctx.admin_headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["platform_items"] == []
+    assert body["platform_items_truncated"] is False
+    assert body["platform_next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_platform_paging_params_are_validated(ctx: _Ctx) -> None:
+    h = ctx.tenant_headers
+    too_small = await ctx.client.get("/v1/skills?platform_limit=0", headers=h)
+    too_big = await ctx.client.get("/v1/skills?platform_limit=201", headers=h)
+    bad_cursor = await ctx.client.get("/v1/skills?platform_cursor=not-a-uuid", headers=h)
+    assert too_small.status_code == 422
+    assert too_big.status_code == 422
+    assert bad_cursor.status_code == 422

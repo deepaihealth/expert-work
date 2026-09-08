@@ -18,6 +18,7 @@ import { SkillDetail } from "../SkillDetail";
 import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
+import { MAX_CURSOR_PAGES } from "../../utils/pagination";
 
 // Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
@@ -66,7 +67,12 @@ function makeJwt(payload: Record<string, unknown>): string {
 
 interface RouteHandler {
   match: (url: string, method: string) => boolean;
-  respond: (config: { data?: unknown; url: string; method: string }) => unknown;
+  respond: (config: {
+    data?: unknown;
+    params?: Record<string, unknown>;
+    url: string;
+    method: string;
+  }) => unknown;
   status?: number;
 }
 
@@ -84,7 +90,13 @@ function installAdapter(handlers: RouteHandler[]) {
       });
     }
     return Promise.resolve({
-      data: handler.respond({ data: config.data, url, method }) ?? {},
+      data:
+        handler.respond({
+          data: config.data,
+          params: config.params as Record<string, unknown> | undefined,
+          url,
+          method,
+        }) ?? {},
       status: handler.status ?? 200,
       statusText: "OK",
       headers: {},
@@ -290,6 +302,126 @@ describe("SkillsList", () => {
     await user.click(screen.getByTestId("skills-load-more"));
     await waitFor(() => expect(screen.getByText("sql_query")).toBeInTheDocument());
     expect(screen.getByText("web_search")).toBeInTheDocument();
+  });
+
+  // B-23 — platform_items are cursor-paged (server caps a page at 200).
+  it("walks platform_next_cursor so a 200+ platform library shows in full", async () => {
+    const seenParams: Array<Record<string, unknown> | undefined> = [];
+    const platformRow = (id: string, name: string) => ({
+      ...skillRow,
+      id,
+      name,
+      source: "platform" as const,
+      entitled: true,
+    });
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: ({ params }) => {
+          seenParams.push(params);
+          if (params?.platform_cursor === "pc-1") {
+            return {
+              // Follow-up platform pages carry a 1-row tenant stub the walk
+              // must discard (they are not tenant pages).
+              items: [{ ...skillRow, id: "stub", name: "stub_row_discarded" }],
+              platform_items: [platformRow("pk2", "platform_page2")],
+              next_cursor: null,
+              platform_next_cursor: null,
+              platform_items_truncated: false,
+              cross_tenant: false,
+            };
+          }
+          return {
+            items: [{ ...skillRow, source: "tenant" as const, entitled: true }],
+            platform_items: [platformRow("pk1", "platform_page1")],
+            next_cursor: null,
+            platform_next_cursor: "pc-1",
+            platform_items_truncated: true,
+            cross_tenant: false,
+          };
+        },
+      },
+    ]);
+    renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("platform_page2")).toBeInTheDocument());
+    expect(screen.getByText("platform_page1")).toBeInTheDocument();
+    expect(screen.getByText("web_search")).toBeInTheDocument();
+    expect(screen.queryByText("stub_row_discarded")).not.toBeInTheDocument();
+    // Exactly one follow-up request, carrying the cursor back verbatim.
+    expect(seenParams).toHaveLength(2);
+    expect(seenParams[1]).toMatchObject({ platform_cursor: "pc-1" });
+  });
+
+  // B-29 kin — the bounded walk must not go silent when it hits its cap.
+  it("warns when the platform walk hits its page cap with pages still left", async () => {
+    let calls = 0;
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => {
+          calls += 1;
+          return {
+            items: [{ ...skillRow, source: "tenant" as const, entitled: true }],
+            platform_items: [
+              {
+                ...skillRow,
+                id: `pk-${calls}`,
+                name: `platform_${calls}`,
+                source: "platform" as const,
+                entitled: true,
+              },
+            ],
+            next_cursor: null,
+            platform_next_cursor: `pc-${calls}`,
+            platform_items_truncated: true,
+            cross_tenant: false,
+          };
+        },
+      },
+    ]);
+    renderSkillsRouter();
+    await waitFor(() =>
+      expect(screen.getByTestId("skills-platform-truncated")).toBeInTheDocument(),
+    );
+    // First page + exactly MAX_CURSOR_PAGES follow-ups, then stop.
+    expect(calls).toBe(MAX_CURSOR_PAGES + 1);
+    expect(screen.getByText("platform_1")).toBeInTheDocument();
+  });
+
+  it("shows no cap warning when the platform walk finishes within two pages", async () => {
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: ({ params }) =>
+          params?.platform_cursor === "pc-1"
+            ? {
+                items: [],
+                platform_items: [
+                  { ...skillRow, id: "pk2", name: "platform_page2", source: "platform" as const, entitled: true },
+                ],
+                next_cursor: null,
+                platform_next_cursor: null,
+                platform_items_truncated: false,
+                cross_tenant: false,
+              }
+            : {
+                items: [{ ...skillRow, source: "tenant" as const, entitled: true }],
+                platform_items: [
+                  { ...skillRow, id: "pk1", name: "platform_page1", source: "platform" as const, entitled: true },
+                ],
+                next_cursor: null,
+                platform_next_cursor: "pc-1",
+                platform_items_truncated: true,
+                cross_tenant: false,
+              },
+      },
+    ]);
+    renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("platform_page2")).toBeInTheDocument());
+    expect(screen.queryByTestId("skills-platform-truncated")).not.toBeInTheDocument();
   });
 
   it("renders platform_items with source badge + entitled lock (X-6)", async () => {
