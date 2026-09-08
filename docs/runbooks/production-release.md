@@ -202,7 +202,11 @@ seed 金库,再重跑 `release.sh prod --images control-plane`(或直接
 3. **control-plane 转绿**:重跑 §1.5 第二跑,smoke 全绿为准。
 4. **首个平台管理员**:configmap 已设 `EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL`,
    该邮箱首登自动升(兜底走 bootstrap-admin.md break-glass)。
-5. **租户开通 + LLM key**:admin-ui 建租户 → 金库粘贴 LLM provider key。
+5. **租户开通 + LLM key**:admin-ui 建租户 → 设置 → 平台凭证录 LLM provider key(平台级,
+   租户默认 `credentials_mode=platform`)。**建租户时首位管理员的初始密码只在弹窗显示一次**;
+   password 模式下 Keycloak 那步失败会显示黄色「初始密码未生成」+ 重新生成按钮,弹窗关了
+   也能在租户列表用「重发首位管理员凭据」再铸(平台级入口
+   `POST /v1/tenants/{id}/first-admin/resend`,2026-09-07 生产实发后补)。
 6. **平台技能导入(可选,可发布后补)**:走 §1.8 的批量导出/导入(#1344,
    2026-08-27 起替代旧「52 导出包」手工路径);幂等,不阻塞发布。
 7. **金丝雀 seed(X-14 P1,发布合格判据的前置)**:release.sh 阶段 6 需要

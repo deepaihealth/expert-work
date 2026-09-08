@@ -40,6 +40,12 @@ export interface FirstAdminSummary {
    * generated password.
    */
   initial_password?: string | null;
+  /**
+   * Password mode only: ``true`` when Keycloak accepted the account but the
+   * initial-password reset failed, so ``initial_password`` is null *and* the
+   * admin cannot sign in. Recover with :func:`resendFirstAdmin`.
+   */
+  credential_pending?: boolean;
 }
 
 /** ``POST /v1/tenants`` data payload: the tenant record + optional first admin. */
@@ -72,4 +78,24 @@ export async function deactivateTenant(tenantId: string): Promise<void> {
 
 export async function activateTenant(tenantId: string): Promise<void> {
   await postJson(`/v1/tenants/${tenantId}/activate`, {});
+}
+
+/** ``POST /v1/tenants/{id}/first-admin/resend`` data payload. */
+export interface FirstAdminResendResult {
+  member_id: string;
+  email: string;
+  status: string;
+  keycloak_user_id: string | null;
+  /** Fresh generated password (password mode) — shown once, never returned again. */
+  initial_password?: string | null;
+  credential_pending?: boolean;
+}
+
+/**
+ * Re-drive a tenant's first admin's credential handoff from the platform
+ * scope (system_admin). The per-tenant member "resend" needs a tenant-admin
+ * principal, which nobody has when that very admin never got a password.
+ */
+export async function resendFirstAdmin(tenantId: string): Promise<FirstAdminResendResult> {
+  return postJson<FirstAdminResendResult>(`/v1/tenants/${tenantId}/first-admin/resend`, {});
 }

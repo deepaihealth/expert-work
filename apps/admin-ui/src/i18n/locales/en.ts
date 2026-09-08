@@ -1762,6 +1762,9 @@ export interface TranslationKeys {
     failed_to_load: string;
     empty: string;
     create: string;
+    resend_first_admin: string;
+    resend_first_admin_sent: string;
+    resend_first_admin_failed: string;
   };
   settings_create_tenant: {
     page_title: string;
@@ -1784,6 +1787,10 @@ export interface TranslationKeys {
     first_admin_email_invalid: string;
     first_admin_provisioned: string;
     credentials_close: string;
+    credential_pending_title: string;
+    credential_pending_body: string;
+    regenerate_password: string;
+    regenerate_failed: string;
   };
   credential_panel: {
     title: string;
@@ -5032,6 +5039,10 @@ const en: TranslationKeys = {
     failed_to_load: "Failed to load tenants",
     empty: "No tenants yet — create one from Create Tenant.",
     create: "Create Tenant",
+    resend_first_admin: "Resend first-admin credentials",
+    resend_first_admin_sent: "First-admin setup email resent.",
+    resend_first_admin_failed:
+      "Failed to resend first-admin credentials (the tenant may have no invited admin).",
   },
   settings_create_tenant: {
     page_title: "Create Tenant",
@@ -5059,6 +5070,12 @@ const en: TranslationKeys = {
     first_admin_email_invalid: "Enter a valid email address",
     first_admin_provisioned: "First admin invited:",
     credentials_close: "I've saved it, close",
+    credential_pending_title: "Initial password was not generated",
+    credential_pending_body:
+      "The first admin {{email}} was created, but Keycloak failed to set the initial password. Regenerate it now — the tenant admin cannot sign in until then.",
+    regenerate_password: "Regenerate initial password",
+    regenerate_failed:
+      "Failed to regenerate the initial password. Retry, or use “Resend first-admin credentials” on the Tenants page.",
   },
   credential_panel: {
     title: "One-time credentials",

@@ -1856,6 +1856,9 @@ const zhCN: TranslationKeys = {
     failed_to_load: "租户列表加载失败",
     empty: "还没有租户——去「创建租户」新建一个。",
     create: "创建租户",
+    resend_first_admin: "重发首位管理员凭据",
+    resend_first_admin_sent: "首位管理员设置邮件已重发。",
+    resend_first_admin_failed: "重发失败（该租户可能没有待激活的管理员）。",
   },
   settings_create_tenant: {
     page_title: "创建租户",
@@ -1882,6 +1885,11 @@ const zhCN: TranslationKeys = {
     first_admin_email_invalid: "请输入有效的邮箱地址",
     first_admin_provisioned: "首位管理员已邀请：",
     credentials_close: "我已保存，关闭",
+    credential_pending_title: "初始密码未生成",
+    credential_pending_body:
+      "首位管理员 {{email}} 已创建，但 Keycloak 设置初始密码那一步失败。请立即重新生成——在此之前该管理员无法登录。",
+    regenerate_password: "重新生成初始密码",
+    regenerate_failed: "重新生成失败。请重试，或在租户列表用「重发首位管理员凭据」。",
   },
   credential_panel: {
     title: "一次性凭据",

@@ -17,7 +17,12 @@ import { SettingsTenants } from "../SettingsTenants";
 import { AuthProvider } from "../../auth/AuthContext";
 import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { setStoredToken } from "../../api/client";
-import { activateTenant, deactivateTenant, listTenants } from "../../api/tenants";
+import {
+  activateTenant,
+  deactivateTenant,
+  listTenants,
+  resendFirstAdmin,
+} from "../../api/tenants";
 
 const mockNavigate = vi.fn();
 
@@ -25,6 +30,7 @@ vi.mock("../../api/tenants", () => ({
   listTenants: vi.fn(),
   deactivateTenant: vi.fn(),
   activateTenant: vi.fn(),
+  resendFirstAdmin: vi.fn(),
 }));
 
 vi.mock("../../components/CreateTenantDrawer", () => ({
@@ -219,6 +225,40 @@ describe("SettingsTenants", () => {
       "11111111-1111-1111-1111-111111111111",
     );
     await vi.waitFor(() => expect(listTenants).toHaveBeenCalledTimes(2));
+  });
+
+  it("resend first-admin credentials shows the one-time password panel", async () => {
+    const user = userEvent.setup();
+    setStoredToken(
+      makeJwt({ sub: "u1", tenant_id: "t1", roles: ["admin", "system_admin"] }),
+    );
+    vi.mocked(listTenants).mockResolvedValue([
+      {
+        tenant_id: "33333333-3333-3333-3333-333333333333",
+        display_name: "锁死公司",
+        plan: "free",
+        created_at: "2026-09-07T00:00:00Z",
+        status: "active",
+      },
+    ]);
+    vi.mocked(resendFirstAdmin).mockResolvedValue({
+      member_id: "m1",
+      email: "boss@locked.example",
+      status: "invited",
+      keycloak_user_id: "kc-1",
+      initial_password: "lark-opal-fern-2048",
+      credential_pending: false,
+    });
+    renderPage();
+
+    await screen.findByText("锁死公司");
+    await user.click(
+      screen.getByTestId("st-resend-first-admin-33333333-3333-3333-3333-333333333333"),
+    );
+
+    expect(resendFirstAdmin).toHaveBeenCalledWith("33333333-3333-3333-3333-333333333333");
+    expect(await screen.findByTestId("one-time-credential-panel")).toBeInTheDocument();
+    expect(screen.getByText("lark-opal-fern-2048")).toBeInTheDocument();
   });
 
   it("opens the create-tenant drawer from the Create button", async () => {

@@ -29,6 +29,11 @@ from control_plane.api.first_admin import (
     FirstAdminKeycloakUnavailableError,
     provision_first_admin,
 )
+from control_plane.api.member_ops import (
+    MemberConflictError,
+    MemberKeycloakUnavailableError,
+    resend_member,
+)
 from control_plane.audit import emit
 from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.keycloak import KeycloakAdminClient
@@ -291,6 +296,13 @@ def build_tenants_router() -> APIRouter:
                     "status": result.status,
                     "keycloak_user_id": result.keycloak_user_id,
                     "initial_password": result.initial_password,
+                    # password 模式下密码没铸出来(Keycloak reset 那步失败,不回滚,
+                    # 见 first_admin.py)——显式打旗,前端不得当成功静默吞掉;补偿走
+                    # 下面的 ``/{tenant_id}/first-admin/resend``(2026-09-07 生产实发)。
+                    "credential_pending": (
+                        settings.member_provisioning_mode == "password"
+                        and result.initial_password is None
+                    ),
                 }
         # ``data`` stays the tenant record (backwards compatible with Stream P
         # callers that read ``data.tenant_id`` / ``data.display_name``); the
@@ -452,5 +464,86 @@ def build_tenants_router() -> APIRouter:
             audit=audit,
             status_svc=status_svc,
         )
+
+    @router.post(
+        "/{tenant_id}/first-admin/resend",
+        dependencies=[
+            Depends(
+                platform_only("only a system admin may resend a tenant's first-admin credentials")
+            )
+        ],
+    )
+    async def resend_first_admin(
+        tenant_id: UUID,
+        principal: Annotated[Principal, Depends(_principal)],
+        member_repo: Annotated[TenantMemberStore, Depends(_get_member_repo)],
+        role_binding_repo: Annotated[RoleBindingStore, Depends(_get_role_binding_repo)],
+        keycloak: Annotated[KeycloakAdminClient, Depends(_get_keycloak)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        settings: Annotated[Settings, Depends(_get_settings)],
+    ) -> dict[str, object]:
+        """Re-drive the first admin's Keycloak handoff from the platform scope.
+
+        The per-tenant ``POST /v1/members/{id}/resend`` needs a tenant-admin
+        principal — which, for a tenant whose only admin never received a
+        password, nobody has. This is the same ``resend_member`` compensation
+        (Mini-ADR R-4), reachable by the system admin who created the tenant.
+        Target tenant ≠ caller's home tenant, hence bypass-RLS (Mini-ADR P-1).
+        """
+        async with bypass_rls_session():
+            invited = await member_repo.list_for_tenant(tenant_id=tenant_id, status="invited")
+            admins = [m for m in invited if m.role == "admin"]
+            if not admins:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "FIRST_ADMIN_NOT_RESENDABLE",
+                        "message": "tenant has no invited admin to resend credentials to",
+                    },
+                )
+            # ``list_for_tenant`` is newest-invite-first; the first admin is the oldest.
+            member = admins[-1]
+            try:
+                summary = await resend_member(
+                    member=member,
+                    actor_id=principal.subject_id,
+                    member_store=member_repo,
+                    role_binding_store=role_binding_repo,
+                    keycloak=keycloak,
+                    audit=audit,
+                    email_action_lifespan_s=settings.keycloak_email_action_lifespan_s,
+                    provisioning_mode=settings.member_provisioning_mode,
+                )
+            except MemberConflictError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "MEMBER_KEYCLOAK_CONFLICT",
+                        "message": "email already exists in keycloak",
+                    },
+                ) from exc
+            except MemberKeycloakUnavailableError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "KEYCLOAK_UNAVAILABLE",
+                        "message": "keycloak unavailable; retry resend later",
+                    },
+                ) from exc
+        return {
+            "success": True,
+            "data": {
+                "member_id": str(summary.member_id),
+                "email": member.email,
+                "status": summary.status,
+                "keycloak_user_id": summary.keycloak_user_id,
+                "initial_password": summary.initial_password,
+                "credential_pending": (
+                    settings.member_provisioning_mode == "password"
+                    and summary.initial_password is None
+                ),
+            },
+            "error": None,
+        }
 
     return router
