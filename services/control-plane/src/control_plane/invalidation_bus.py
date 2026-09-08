@@ -29,6 +29,7 @@ from typing import Any
 from uuid import UUID
 
 from expert_work.common.observability import expert_work_counter
+from expert_work.runtime.runs.schemas import RunStatus
 
 logger = logging.getLogger("expert_work.control_plane.invalidation_bus")
 
@@ -59,6 +60,8 @@ KINDS = frozenset(
         "agent_disable",  # (tenant, agent) kill-switch TTL cache — whole tenant drops
         "quota_rules",  # per-tenant quota-rule cache inside the QuotaService
         "rate_limit_override",  # per-tenant rate-limit override cache (PR-D wires the service)
+        # --- 跨副本取消亚秒化 ---
+        "run_cancel",  # (tenant, run) a peer's cancel CAS won → the owner re-checks its lease now
     }
 )
 
@@ -88,6 +91,9 @@ class InvalidationEvent:
     tenant_id: str | None = None
     user_id: str | None = None
     origin: str = ""
+    #: ``run_cancel`` only — the run whose cancel CAS just won. Serialized only
+    #: when set, so every other kind keeps its exact pre-existing wire shape.
+    run_id: str | None = None
 
 
 Handler = Callable[[InvalidationEvent], Awaitable[None]]
@@ -119,14 +125,15 @@ class InvalidationBus:
         """Broadcast ``event``. NEVER raises — Redis-down degrades to a
         WARNING + counter; the caller's local invalidation already happened
         and the cache TTLs are the cross-replica fallback."""
-        payload = json.dumps(
-            {
-                "kind": event.kind,
-                "tenant_id": event.tenant_id,
-                "user_id": event.user_id,
-                "origin": event.origin or self._origin,
-            }
-        )
+        body: dict[str, Any] = {
+            "kind": event.kind,
+            "tenant_id": event.tenant_id,
+            "user_id": event.user_id,
+        }
+        if event.run_id is not None:
+            body["run_id"] = event.run_id
+        body["origin"] = event.origin or self._origin
+        payload = json.dumps(body)
         try:
             await self._redis.publish(self._channel, payload)
         except Exception:
@@ -188,6 +195,7 @@ class InvalidationBus:
                 tenant_id=data.get("tenant_id"),
                 user_id=data.get("user_id"),
                 origin=str(data.get("origin") or ""),
+                run_id=data.get("run_id"),
             )
         except Exception:
             _errors.labels(stage="subscribe").inc()
@@ -388,6 +396,35 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
         if service is not None:
             service.invalidate(UUID(event.tenant_id))
 
+    async def _run_cancel(event: InvalidationEvent) -> None:
+        """跨副本取消亚秒化 —— 一条 ``run_cancel`` = 「某个副本对这个 run 的
+        ``request_cancel`` CAS 赢了」。属主副本不等 ``_heartbeat_loop`` 下一次
+        续租(``lease_ttl_s / 3``,生产 10s),现在就做**同一个**心跳 CAS:
+        租约没了(行已 interrupted)→ 置位 ``abort_event``,与周期心跳丢租约
+        时一模一样的中断路径;租约还在(消息来路不明 / 乱序)→ 只是多续了
+        一次租,什么都不停 —— 真相在 durable 行,不在消息里。
+
+        幂等:不是本副本的 run / 租户不符 / 已 abort / 已终态 → 静默;PENDING
+        留给 → RUNNING 的守卫(洞 A)处理,不另开一条路。
+        """
+        runtime = getattr(state, "agent_runtime", None)
+        if runtime is None or event.run_id is None or event.tenant_id is None:
+            return
+        run_manager = runtime.run_manager
+        run_id = UUID(event.run_id)
+        record = run_manager.get(run_id)
+        if (
+            record is None
+            or record.tenant_id != UUID(event.tenant_id)
+            or record.status is not RunStatus.RUNNING
+            or record.abort_event.is_set()
+        ):
+            return
+        if await run_manager.heartbeat(run_id):
+            return
+        logger.info("invalidation_bus.run_cancel.abort run_id=%s origin=%s", run_id, event.origin)
+        record.abort_event.set()
+
     return {
         "agent_build": _agent_build,
         "agent_build_all": _agent_build_all,
@@ -417,4 +454,5 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
         "agent_disable": _agent_disable,
         "quota_rules": _quota_rules,
         "rate_limit_override": _rate_limit_override,
+        "run_cancel": _run_cancel,
     }

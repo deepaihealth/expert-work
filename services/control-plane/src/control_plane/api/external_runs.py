@@ -9,7 +9,6 @@ execution and leaves the conversation usable.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -27,6 +26,7 @@ from control_plane.api._external import (
     reject_nul_path_params,
 )
 from control_plane.api._user_scope import get_user_repo
+from control_plane.run_cancel import cancel_run_two_level
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import Principal
@@ -210,12 +210,12 @@ def build_external_runs_router() -> APIRouter:
             stopped = False
         else:
             runtime = request.app.state.agent_runtime
-            stopped = await runtime.run_manager.cancel(
-                run.run_id, reason=InterruptReason.USER_CANCEL
-            ) or await runs.request_cancel(
+            stopped = await cancel_run_two_level(
+                run_manager=runtime.run_manager,
+                run_store=runs,
+                bus=getattr(request.app.state, "invalidation_bus", None),
                 run_id=run.run_id,
                 tenant_id=tenant_id,
-                updated_at=datetime.now(UTC),
                 reason=InterruptReason.USER_CANCEL,
             )
         return JSONResponse(

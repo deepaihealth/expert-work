@@ -35,8 +35,13 @@ from control_plane.api.member_ops import (
     resend_member,
 )
 from control_plane.audit import emit
-from control_plane.invalidation_bus import InvalidationEvent
+from control_plane.invalidation_bus import (
+    InvalidationBus,
+    InvalidationEvent,
+    NoopInvalidationBus,
+)
 from control_plane.keycloak import KeycloakAdminClient
+from control_plane.run_cancel import cancel_run_two_level
 from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
 from control_plane.tenant_scope import bypass_rls_session
@@ -132,6 +137,7 @@ async def _bulk_cancel_tenant_runs(
     audit: AuditLogger,
     actor_id: str,
     trace_id: str | None,
+    bus: InvalidationBus | NoopInvalidationBus | None = None,
 ) -> int:
     """Stream RT-4 (RT-ADR-17) — terminate a suspended tenant's in-flight runs.
 
@@ -181,13 +187,14 @@ async def _bulk_cancel_tenant_runs(
     for run_id in run_ids:
         # Local run: aborts immediately. Peer-owned run: guarded store CAS
         # (running/pending → interrupted) so its next heartbeat fails and it stops.
-        stopped = await runtime.run_manager.cancel(
-            run_id, reason=InterruptReason.TENANT_SUSPENDED
-        ) or await run_store.request_cancel(
+        stopped = await cancel_run_two_level(
+            run_manager=runtime.run_manager,
+            run_store=run_store,
+            bus=bus,
             run_id=run_id,
             tenant_id=tenant_id,
-            updated_at=now,
             reason=InterruptReason.TENANT_SUSPENDED,
+            now=now,
         )
         if stopped:
             cancelled += 1
@@ -438,6 +445,7 @@ def build_tenants_router() -> APIRouter:
                 audit=audit,
                 actor_id=principal.subject_id,
                 trace_id=current_trace_id_hex(),
+                bus=getattr(request.app.state, "invalidation_bus", None),
             )
         return result
 

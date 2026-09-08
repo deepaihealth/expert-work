@@ -62,6 +62,7 @@ from control_plane.prompt_render import (
     validate_prompt_inputs,
 )
 from control_plane.quota.base import QuotaService
+from control_plane.run_cancel import cancel_run_two_level
 from control_plane.run_trace import bind_exec_spec
 from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
@@ -2099,12 +2100,12 @@ def build_runs_router() -> APIRouter:
             )
 
         async with applied_scope(scope):
-            stopped = await runtime.run_manager.cancel(
-                run_id, reason=InterruptReason.USER_CANCEL
-            ) or await runs.request_cancel(
+            stopped = await cancel_run_two_level(
+                run_manager=runtime.run_manager,
+                run_store=runs,
+                bus=getattr(request.app.state, "invalidation_bus", None),
                 run_id=run_id,
                 tenant_id=target_tenant,
-                updated_at=datetime.now(UTC),
                 reason=InterruptReason.USER_CANCEL,
             )
         if not stopped:
