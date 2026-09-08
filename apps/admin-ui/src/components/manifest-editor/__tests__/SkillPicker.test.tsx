@@ -372,6 +372,49 @@ describe("SkillPicker", () => {
     expect(scroll).toHaveStyle({ overflowY: "auto" });
   });
 
+  // B-23 — platform_items are cursor-paged too (server caps a page at 200).
+  it("follows platform_next_cursor so a 200+ platform library loads completely", async () => {
+    vi.mocked(listSkills).mockClear();
+    vi.mocked(listSkills)
+      .mockResolvedValueOnce({
+        items: [rec({ name: "t-only", source: "tenant" })],
+        platform_items: [
+          rec({ name: "plat-page1", source: "platform", entitled: true }),
+        ],
+        next_cursor: null,
+        platform_next_cursor: "pcursor-1",
+        platform_items_truncated: true,
+        cross_tenant: false,
+      })
+      .mockResolvedValueOnce({
+        items: [rec({ name: "t-only", source: "tenant" })],
+        platform_items: [
+          rec({ name: "plat-page2", source: "platform", entitled: true }),
+        ],
+        next_cursor: null,
+        platform_next_cursor: null,
+        platform_items_truncated: false,
+        cross_tenant: false,
+      });
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    expect(await screen.findByTestId("af-skill-row-plat-page1")).toBeInTheDocument();
+    expect(screen.getByTestId("af-skill-row-plat-page2")).toBeInTheDocument();
+    // The platform walk takes only platform_items — tenant rows ride along
+    // on every page and must not be appended twice.
+    expect(screen.getAllByTestId("af-skill-row-t-only")).toHaveLength(1);
+    expect(listSkills).toHaveBeenCalledTimes(2);
+    expect(listSkills).toHaveBeenLastCalledWith(
+      expect.objectContaining({ platformCursor: "pcursor-1" }),
+    );
+  });
+
+  it("issues a single request when platform_items fit in one page", async () => {
+    vi.mocked(listSkills).mockClear();
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    await screen.findByTestId("af-skill-row-sql-analyst");
+    expect(listSkills).toHaveBeenCalledTimes(1);
+  });
+
   it("threads the ambient tenant scope into listSkills (W3)", async () => {
     scopeRef.current = "22222222-2222-2222-2222-222222222222";
     try {

@@ -66,7 +66,12 @@ function makeJwt(payload: Record<string, unknown>): string {
 
 interface RouteHandler {
   match: (url: string, method: string) => boolean;
-  respond: (config: { data?: unknown; url: string; method: string }) => unknown;
+  respond: (config: {
+    data?: unknown;
+    params?: Record<string, unknown>;
+    url: string;
+    method: string;
+  }) => unknown;
   status?: number;
 }
 
@@ -84,7 +89,13 @@ function installAdapter(handlers: RouteHandler[]) {
       });
     }
     return Promise.resolve({
-      data: handler.respond({ data: config.data, url, method }) ?? {},
+      data:
+        handler.respond({
+          data: config.data,
+          params: config.params as Record<string, unknown> | undefined,
+          url,
+          method,
+        }) ?? {},
       status: handler.status ?? 200,
       statusText: "OK",
       headers: {},
@@ -290,6 +301,52 @@ describe("SkillsList", () => {
     await user.click(screen.getByTestId("skills-load-more"));
     await waitFor(() => expect(screen.getByText("sql_query")).toBeInTheDocument());
     expect(screen.getByText("web_search")).toBeInTheDocument();
+  });
+
+  // B-23 — platform_items are cursor-paged (server caps a page at 200).
+  it("walks platform_next_cursor so a 200+ platform library shows in full", async () => {
+    const seenParams: Array<Record<string, unknown> | undefined> = [];
+    const platformRow = (id: string, name: string) => ({
+      ...skillRow,
+      id,
+      name,
+      source: "platform" as const,
+      entitled: true,
+    });
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: ({ params }) => {
+          seenParams.push(params);
+          if (params?.platform_cursor === "pc-1") {
+            return {
+              items: [],
+              platform_items: [platformRow("pk2", "platform_page2")],
+              next_cursor: null,
+              platform_next_cursor: null,
+              platform_items_truncated: false,
+              cross_tenant: false,
+            };
+          }
+          return {
+            items: [{ ...skillRow, source: "tenant" as const, entitled: true }],
+            platform_items: [platformRow("pk1", "platform_page1")],
+            next_cursor: null,
+            platform_next_cursor: "pc-1",
+            platform_items_truncated: true,
+            cross_tenant: false,
+          };
+        },
+      },
+    ]);
+    renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("platform_page2")).toBeInTheDocument());
+    expect(screen.getByText("platform_page1")).toBeInTheDocument();
+    expect(screen.getByText("web_search")).toBeInTheDocument();
+    // Exactly one follow-up request, carrying the cursor back verbatim.
+    expect(seenParams).toHaveLength(2);
+    expect(seenParams[1]).toMatchObject({ platform_cursor: "pc-1" });
   });
 
   it("renders platform_items with source badge + entitled lock (X-6)", async () => {
