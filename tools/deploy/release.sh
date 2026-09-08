@@ -193,7 +193,86 @@ run() {
 
 readonly ACR="crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work"
 
+# ------------------------------------------- previous tags + failure trap
+# X-14 P5 — the tag the overlay pinned BEFORE step 2 overwrites it. The
+# record PR must name it (a rollback is then one paste), and a red stage
+# 3-6 needs the rollback command right there instead of "<上一版 tag>".
+current_new_tag() {
+    local name="$1"
+    awk -v name="${name}" '
+        $1 == "-" && $2 == "name:" { hit = ($3 == name) }
+        hit && $1 == "newTag:" { gsub(/"/, "", $2); print $2; exit }
+    ' "${OVERLAY}/kustomization.yaml"
+}
+is_real_tag() { [[ -n "$1" && "$1" != PROD_PLACEHOLDER* ]]; }
+
+# rollback.sh takes the control-plane (bare) tag and derives admin-ui's
+# <tag><suffix> itself, so admin-ui's previous tag is reduced to its base.
+# One command when every released image shares that base (lockstep — every
+# release since 2026-09-07 leaves the overlay that way); one line per image
+# otherwise (e.g. a hand-pinned credential-proxy, see rollback.sh header).
+rollback_commands() {
+    local name base common="" mixed=0
+    local -a per_image=() selected=()
+    IFS=',' read -ra selected <<<"${images}"
+    for name in "${selected[@]}"; do
+        case "${name}" in
+            control-plane) base="${prev_cp_tag}" ;;
+            admin-ui) base="${prev_ui_tag%"${ADMIN_UI_TAG_SUFFIX}"}" ;;
+            credential-proxy) base="${prev_proxy_tag}" ;;
+            *) continue ;;
+        esac
+        if ! is_real_tag "${base}"; then
+            per_image+=("  (${name}: no previous tag in the overlay — first release, nothing to roll back to)")
+            mixed=1
+            continue
+        fi
+        per_image+=("  tools/deploy/rollback.sh ${env_name} ${base} --images ${name}")
+        if [[ -z "${common}" ]]; then
+            common="${base}"
+        elif [[ "${common}" != "${base}" ]]; then
+            mixed=1
+        fi
+    done
+    if [[ "${mixed}" -eq 0 && -n "${common}" ]]; then
+        if [[ "${images}" == "control-plane,admin-ui,credential-proxy" ]]; then
+            echo "  tools/deploy/rollback.sh ${env_name} ${common}"
+        else
+            echo "  tools/deploy/rollback.sh ${env_name} ${common} --images ${images}"
+        fi
+    elif [[ ${#per_image[@]} -gt 0 ]]; then
+        printf '%s\n' "${per_image[@]}"
+    fi
+}
+
+# B-29 ③ — every failure names its stage (set -e alone dies with only the
+# failing command's own stderr, and a silent death mid-rollout reads like a
+# hang), and from stage 3 on — when the cluster may already run the new
+# images — the rollback command is printed with it.
+stage="0 preflight"
+on_exit() {
+    local status=$?
+    if [[ "${status}" -eq 0 ]]; then
+        return
+    fi
+    echo >&2
+    echo "RELEASE FAILED at stage ${stage} (exit ${status})." >&2
+    case "${stage}" in
+        3* | 4* | 5* | 6*)
+            echo "The cluster may already run the new images — roll back with:" >&2
+            rollback_commands >&2
+            ;;
+    esac
+}
+trap on_exit EXIT
+
+prev_cp_tag="$(current_new_tag "${ACR}/control-plane")"
+prev_ui_tag="$(current_new_tag "${ACR}/admin-ui")"
+prev_proxy_tag="$(current_new_tag "${ACR}/credential-proxy")"
+readonly prev_cp_tag prev_ui_tag prev_proxy_tag
+
 # ------------------------------------------------------------- 1. build+push
+stage="1 build-push"
 if [[ ",${images}," == *",admin-ui,"* ]]; then
     # admin-ui gets its env-specific tag in a SEPARATE build-push call so
     # the bare-sha images (control-plane, credential-proxy) keep their tag.
@@ -215,6 +294,7 @@ fi
 
 # ------------------------------------------------------- 2. overlay newTags
 # kustomize edit operates on the cwd's kustomization.yaml.
+stage="2 overlay newTag"
 set_new_tag() {
     local image="$1" new_tag="$2"
     if [[ "${dry_run}" -eq 1 ]]; then
@@ -235,14 +315,25 @@ if [[ ",${images}," == *",credential-proxy,"* ]]; then
 fi
 
 # --------------------------------------------------------- 3. migrate+apply
+stage="3 migrate+apply"
 export KUBECONFIG="${KUBECONFIG_PATH}"
 run kubectl -n expert-work delete job migrate --ignore-not-found
 run kubectl apply -k "${OVERLAY}"
 
 # ------------------------------------------------------------- 4. rollouts
+stage="4 rollout"
 if [[ "${dry_run}" -eq 0 ]]; then
     kubectl -n expert-work wait --for=condition=complete job/migrate --timeout=300s
-    for d in $(kubectl -n expert-work get deploy -o name); do
+    # A plain assignment, not `for d in $(kubectl ...)`: errexit ignores a
+    # failing substitution in a for-list, so a kubectl hiccup here used to
+    # wait for ZERO rollouts and hand smoke the still-healthy OLD pods —
+    # "Release done", nothing verified (B-29 ③).
+    deployments="$(kubectl -n expert-work get deploy -o name)"
+    if [[ -z "${deployments}" ]]; then
+        echo "kubectl listed no Deployments in expert-work — nothing to wait for is not a rollout." >&2
+        exit 1
+    fi
+    for d in ${deployments}; do
         kubectl -n expert-work rollout status "${d}" --timeout=300s
     done
 else
@@ -250,6 +341,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 5. smoke
+stage="5 smoke"
 run "${SCRIPT_DIR}/smoke.sh" "${env_name}"
 
 # --------------------------------------------------------------- 6. canary
@@ -260,6 +352,7 @@ run "${SCRIPT_DIR}/smoke.sh" "${env_name}"
 # 见 docs/runbooks/production-release.md §1.6);未 seed 时打 WARNING 跳过而
 # 不失败 —— 未预置金丝雀的环境发布不能被打断。rollback.sh 不跑 canary
 # (救火路径只复用 smoke,不能被真 run 拖住)。
+stage="6 canary"
 echo
 echo "== canary (X-14 P1) =="
 canary_skipped=0
@@ -318,9 +411,8 @@ if [[ "${dry_run}" -eq 0 && "${canary_skipped}" -eq 0 ]]; then
             python -c 'import os, sys
 os.environ["EXPERT_WORK_CANARY_API_KEY"] = sys.stdin.readline().rstrip("\n")
 exec(compile(sys.stdin.read(), "canary.py", "exec"))'; then
-        echo "CANARY FAILED — the release is NOT good. Roll back:" >&2
-        echo "  tools/deploy/rollback.sh ${env_name} <上一版 tag>" >&2
-        echo "  (上一版 tag 在上一个 chore(deploy) 记录 PR 里 —— 记录 PR 按约定写明它)" >&2
+        # The rollback command itself comes from the EXIT trap (stage 6).
+        echo "CANARY FAILED — the release is NOT good." >&2
         exit 1
     fi
 fi
@@ -329,3 +421,30 @@ echo
 echo "Release ${tag} done. Overlay newTag edits are uncommitted —"
 echo "commit them as the chore(deploy) record PR:"
 git -C "${REPO_ROOT}" --no-pager diff --stat -- "${OVERLAY}" || true
+
+# X-14 P5 — the record PR names the previous tag, so a rollback is one paste
+# instead of a dig through the previous record PR.
+tag_line() {
+    local name="$1" prev="$2" new="$3"
+    if [[ ",${images}," == *",${name},"* ]]; then
+        echo "- ${name}: ${prev:-?} → ${new}"
+    else
+        echo "- ${name}: ${prev:-?} (unchanged — not in --images)"
+    fi
+}
+echo
+echo "Image tags (previous → new) — record PR body, paste as-is:"
+echo "----8<----"
+echo "chore(deploy): ${env_name} newTag ${tag} —— <这次带了什么>"
+echo
+tag_line control-plane "${prev_cp_tag}" "${tag}"
+tag_line admin-ui "${prev_ui_tag}" "${admin_ui_tag}"
+tag_line credential-proxy "${prev_proxy_tag}" "${tag}"
+echo
+if is_real_tag "${prev_cp_tag}"; then
+    echo "上一版 tag:${prev_cp_tag} —— 回滚:"
+else
+    echo "上一版 tag:无(首次发布)—— 回滚:"
+fi
+rollback_commands
+echo "----8<----"
