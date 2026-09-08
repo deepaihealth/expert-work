@@ -9,10 +9,10 @@
  */
 import type { TurnTiming } from "../components/console/types";
 import type { TurnStatus } from "../components/turn/types";
-import type { RateCardRecord } from "./rate_card";
+import { costCnyOfBuckets, type RateBook } from "./cost";
 import type { RunTokens } from "./runs";
 import type { SseEvent } from "./sessions";
-import { summarizeTurn } from "./turn_summary";
+import { summarizeTurn, type UsageBucket } from "./turn_summary";
 
 export interface StatsTurnInput {
   events: readonly SseEvent[];
@@ -74,6 +74,69 @@ interface TurnContribution {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  /** B-42 — the turn's usage split by ``(provider, model)`` for pricing. */
+  buckets: readonly UsageBucket[];
+}
+
+/** An unloaded history turn's persisted rollup as pricing buckets: its
+ *  ``usage_by_model`` split when the backend sent one (B-42), else the whole
+ *  rollup as one unattributed bucket (the agent's card — today's algorithm).
+ *  A bucket with a NULL provider (pre-Y-3 rows) is unattributed too. */
+function bucketsOfRunTokens(tokens: RunTokens): UsageBucket[] {
+  const split = tokens.usage_by_model;
+  if (Array.isArray(split) && split.length > 0) {
+    return split.map((b) => ({
+      provider: b.provider,
+      model: b.provider === null ? null : b.model,
+      usage: {
+        inputTokens: b.input_tokens,
+        outputTokens: b.output_tokens,
+        totalTokens: b.total_tokens,
+        cacheReadTokens: b.cache_read_tokens,
+        cacheCreationTokens: b.cache_creation_tokens,
+        reasoningTokens: 0,
+      },
+    }));
+  }
+  return [
+    {
+      provider: null,
+      model: null,
+      usage: {
+        inputTokens: tokens.input_tokens,
+        outputTokens: tokens.output_tokens,
+        totalTokens: tokens.total_tokens,
+        cacheReadTokens: tokens.cache_read_tokens,
+        cacheCreationTokens: tokens.cache_creation_tokens,
+        reasoningTokens: 0,
+      },
+    },
+  ];
+}
+
+function bucketsOfTurn(t: StatsTurnInput): readonly UsageBucket[] {
+  if (t.loaded) return contributionOf(t.events).buckets;
+  return t.tokens ? bucketsOfRunTokens(t.tokens) : [];
+}
+
+/** Every distinct ``(provider, model)`` the session's usage names, in first-
+ *  seen order — the cards ``PlaygroundTab`` must fetch beyond the agent's own.
+ *  Unattributed buckets contribute nothing (they price at the agent's card). */
+export function attributedModelsOf(
+  turns: readonly StatsTurnInput[],
+): Array<{ provider: string; model: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ provider: string; model: string }> = [];
+  for (const t of turns) {
+    for (const b of bucketsOfTurn(t)) {
+      if (b.provider === null || b.model === null) continue;
+      const key = `${b.provider} ${b.model}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ provider: b.provider, model: b.model });
+    }
+  }
+  return out;
 }
 
 // PlaygroundTab 每收一帧就整表重算(consoleTurns 每帧换新引用),而
@@ -96,6 +159,7 @@ function contributionOf(events: readonly SseEvent[]): TurnContribution {
     inputTokens: summary.usage?.inputTokens ?? 0,
     outputTokens: summary.usage?.outputTokens ?? 0,
     cacheReadTokens: summary.usage?.cacheReadTokens ?? 0,
+    buckets: summary.usageByModel,
   };
   CONTRIBUTION_CACHE.set(events, contribution);
   return contribution;
@@ -103,7 +167,7 @@ function contributionOf(events: readonly SseEvent[]): TurnContribution {
 
 export function computeSessionStats(
   turns: readonly StatsTurnInput[],
-  rate: RateCardRecord | null,
+  rateBook: RateBook | null,
 ): SessionStats {
   let turnsCount = 0;
   let steps = 0;
@@ -116,11 +180,15 @@ export function computeSessionStats(
   const ttfts: number[] = [];
   let tokSum = 0;
   let secSum = 0;
+  // B-42 — every turn's (provider, model) buckets, priced together at the end
+  // so a worker on another model is billed at its own card.
+  const buckets: UsageBucket[] = [];
 
   for (const t of turns) {
     let turnInput = 0;
     let turnOutput = 0;
     let turnCacheRead = 0;
+    buckets.push(...bucketsOfTurn(t));
 
     if (t.loaded) {
       const c = contributionOf(t.events);
@@ -166,12 +234,7 @@ export function computeSessionStats(
   const ttftAvgMs = ttfts.length > 0 ? ttfts.reduce((a, b) => a + b, 0) / ttfts.length : null;
   const tokPerSec = secSum > 0 ? Math.round((tokSum / secSum) * 10) / 10 : null;
   const cacheHitPct = inputTokens > 0 ? Math.round((cacheReadTokens / inputTokens) * 100) : null;
-  const costCny = rate
-    ? (Math.max(0, inputTokens - cacheReadTokens) * rate.input_per_mtok_micros +
-        cacheReadTokens * rate.cache_read_per_mtok_micros +
-        outputTokens * rate.output_per_mtok_micros) /
-      1e12
-    : null;
+  const costCny = costCnyOfBuckets(buckets, rateBook);
 
   return {
     turns: turnsCount,

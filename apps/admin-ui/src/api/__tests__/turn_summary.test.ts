@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "../sessions";
-import { summarizeTurn } from "../turn_summary";
+import { summarizeTurn, type TurnUsage } from "../turn_summary";
 
 function updates(messages: unknown[]): SseEvent {
   return {
@@ -448,5 +448,105 @@ describe("summarizeTurn — worker usage counts the end frame only", () => {
     const done = workerEnd({ input_tokens: 100, output_tokens: 10, total_tokens: 110 });
 
     expect(summarizeTurn([running, done]).usage?.totalTokens).toBe(110);
+  });
+});
+
+describe("summarizeTurn — usage buckets by (provider, model)", () => {
+  // B-42:``usage`` 只说「烧了多少」,``usageByModel`` 说「按谁的价」。
+  const mainUsage = {
+    input_tokens: 170_000,
+    output_tokens: 5_137,
+    total_tokens: 175_137,
+    input_token_details: { cache_read: 1_000, cache_creation: 0 },
+    output_token_details: { reasoning: 500 },
+  };
+  const workerUsage = {
+    input_tokens: 3_200_000,
+    output_tokens: 117_974,
+    total_tokens: 3_317_974,
+    input_token_details: { cache_read: 900_000, cache_creation: 7 },
+    output_token_details: { reasoning: 20_000 },
+  };
+
+  function workerEndByModel(
+    buckets: Array<Record<string, unknown>>,
+    usage: Record<string, unknown> = workerUsage,
+  ): SseEvent {
+    const evt = workerEnd(usage);
+    ((evt.data as Record<string, unknown>).data as Record<string, unknown>).usage_by_model =
+      buckets;
+    return evt;
+  }
+
+  it("keeps the main line as one unattributed bucket and a worker under its own (provider, model)", () => {
+    const events: SseEvent[] = [
+      updates([{ type: "ai", content: "派个 worker", usage_metadata: mainUsage }]),
+      workerEndByModel([{ provider: "zhipu", model: "glm-5.3", ...workerUsage }]),
+    ];
+    const s = summarizeTurn(events);
+    expect(s.usageByModel).toEqual([
+      {
+        provider: null,
+        model: null,
+        usage: {
+          inputTokens: 170_000,
+          outputTokens: 5_137,
+          totalTokens: 175_137,
+          cacheReadTokens: 1_000,
+          cacheCreationTokens: 0,
+          reasoningTokens: 500,
+        },
+      },
+      {
+        provider: "zhipu",
+        model: "glm-5.3",
+        usage: {
+          inputTokens: 3_200_000,
+          outputTokens: 117_974,
+          totalTokens: 3_317_974,
+          cacheReadTokens: 900_000,
+          cacheCreationTokens: 7,
+          reasoningTokens: 20_000,
+        },
+      },
+    ]);
+    // 桶的和 == 总量,逐字段。
+    const sum = (k: keyof TurnUsage): number =>
+      s.usageByModel.reduce((acc, b) => acc + b.usage[k], 0);
+    for (const k of Object.keys(s.usage ?? {}) as Array<keyof TurnUsage>) {
+      expect(sum(k)).toBe(s.usage?.[k]);
+    }
+  });
+
+  it("merges buckets that share a (provider, model) — two workers on the same model are one bucket", () => {
+    const one = { input_tokens: 100, output_tokens: 10, total_tokens: 110 };
+    const events: SseEvent[] = [
+      workerEndByModel([{ provider: "zhipu", model: "glm-5.3", ...one }], one),
+      workerEndByModel([{ provider: "zhipu", model: "glm-5.3", ...one }], one),
+    ];
+    const s = summarizeTurn(events);
+    expect(s.usageByModel).toHaveLength(1);
+    // 桶的身份也要钉住:忽略 usage_by_model 同样会得到「一个桶 220」——
+    // 只是那个桶是未归属的(按主 Agent 卡算),而不是 zhipu/glm-5.3。
+    expect(s.usageByModel[0]).toMatchObject({ provider: "zhipu", model: "glm-5.3" });
+    expect(s.usageByModel[0].usage.totalTokens).toBe(220);
+  });
+
+  it("falls back to an unattributed bucket when a worker end frame carries usage but no usage_by_model", () => {
+    // 老后端 / 模型未知:退回今天的算法 —— 按主 Agent 的费率算,不是丢掉。
+    const events: SseEvent[] = [
+      updates([{ type: "ai", content: "x", usage_metadata: mainUsage }]),
+      workerEnd(workerUsage),
+    ];
+    const s = summarizeTurn(events);
+    expect(s.usageByModel).toHaveLength(1);
+    expect(s.usageByModel[0]).toMatchObject({ provider: null, model: null });
+    expect(s.usageByModel[0].usage.totalTokens).toBe(3_493_111);
+  });
+
+  it("has no buckets when nothing reported usage", () => {
+    const s = summarizeTurn([updates([{ type: "ai", content: "hi" }]), workerEnd(null)]);
+    expect(s.usage).toBeNull();
+    expect(s.usageByModel).toEqual([]);
   });
 });

@@ -17,7 +17,7 @@ import { Empty } from "antd";
 import { useTranslation } from "react-i18next";
 
 import type { ApprovalItem } from "../../api/approvals";
-import type { RateCardRecord } from "../../api/rate_card";
+import type { RateBook } from "../../api/cost";
 import type { HistoryMessage } from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
@@ -56,7 +56,7 @@ export interface TranscriptProps {
     threadId: string,
   ) => (el: HTMLElement | null) => void;
   // 透传给 TurnBlock 的一组回调 / 标志(同上)。
-  rate: RateCardRecord | null;
+  rateBook: RateBook | null;
   isSystemAdmin: boolean;
   readOnly: boolean;
   /** D-6 — 透传 ``TurnBlock.allowDecide``:只读页上单独放行审批卡。 */
@@ -101,7 +101,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     liveByStep,
     inputOrder,
     registerHistoryRow,
-    rate,
+    rateBook,
     isSystemAdmin,
     readOnly,
     allowDecide = false,
@@ -219,7 +219,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onInspect={onInspectTurn}
           onInspectRow={onInspectRow}
           inputOrder={inputOrder}
-          rate={rate}
+          rateBook={rateBook}
           isSystemAdmin={isSystemAdmin}
           readOnly={readOnly}
           allowDecide={allowDecide}
@@ -253,7 +253,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onInspectRow={onInspectRow}
           liveByStep={turn.key === streamTurnKey ? liveByStep : undefined}
           inputOrder={inputOrder}
-          rate={rate}
+          rateBook={rateBook}
           isSystemAdmin={isSystemAdmin}
           readOnly={readOnly}
           allowDecide={allowDecide}

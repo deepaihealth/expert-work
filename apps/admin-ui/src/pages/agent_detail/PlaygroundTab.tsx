@@ -27,9 +27,8 @@ import { useTranslation } from "react-i18next";
 
 import { downloadArtifact } from "../../api/artifacts";
 import { ApiError, errMessage } from "../../api/client";
-import { listRateCards, type RateCardRecord } from "../../api/rate_card";
 import { streamRunEvents } from "../../api/runs";
-import { computeSessionStats } from "../../api/session_stats";
+import { attributedModelsOf, computeSessionStats } from "../../api/session_stats";
 import { createSession, type SseEvent, type ThreadMeta } from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
 import { uploadDocument, uploadImage } from "../../api/uploads";
@@ -62,6 +61,7 @@ import { downloadJson } from "../../components/turn/download_json";
 import type { Attachment, Turn } from "../../components/turn/types";
 import { useHistoryTurns } from "../../components/turn/useHistoryTurns";
 import type { AgentDetailResponse } from "../../api/agents";
+import { useRateBook } from "./playground/useRateBook";
 import { useRunEngine, type RunDraft } from "./playground/useRunEngine";
 import {
   readModel,
@@ -136,7 +136,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [varValues, setVarValues] = useState<Record<string, string>>({});
-  const [rate, setRate] = useState<RateCardRecord | null>(null);
   // R9 — 中栏轮高亮:``null`` = 跟最新一轮;点轮块 / 脚注「查看轨迹」置为该轮。
   const [selectedTurnKey, setSelectedTurnKey] = useState<string | null>(null);
   const [view, setView] = useState<ConsoleView>("chat");
@@ -220,9 +219,24 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     loaded: planLoaded,
     save: savePlan,
   } = usePlanCard({ threadId: thread?.thread_id ?? null, liveEvents });
+  const statsInputs = useMemo(() => consoleTurns.map(statsInputOf), [consoleTurns]);
+  // #4 cost (B-42) — one rate card per (provider, model) the session's usage
+  // names: the agent's own model plus every worker model, each fetched once.
+  // Cross-tenant W4(D2)— rate_card 是 system_admin-only:租户用户不发请求
+  // (否则每次进调试台吃一发静默 403),成本区随现有「无数据」态自然隐藏。
+  const agentModel = useMemo(() => {
+    const model = readModel(r.spec);
+    return model.provider && model.name ? { provider: model.provider, model: model.name } : null;
+  }, [r.spec]);
+  const attributedModels = useMemo(() => attributedModelsOf(statsInputs), [statsInputs]);
+  const rateBook = useRateBook({
+    enabled: isSystemAdmin,
+    agentModel,
+    models: attributedModels,
+  });
   const stats = useMemo(
-    () => computeSessionStats(consoleTurns.map(statsInputOf), rate),
-    [consoleTurns, rate],
+    () => computeSessionStats(statsInputs, rateBook),
+    [statsInputs, rateBook],
   );
   const missing = missingRequired(promptVariables, varValues);
 
@@ -236,26 +250,6 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   } = useRunSettingsCollapse({ agentCode: r.name, missingCount: missing.length });
   // <1200px:行内侧栏被 CSS 隐藏,内容走页头按钮触发的 Drawer。
   const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false);
-
-  // #4 cost — the agent model's rate, fetched once per (provider, model).
-  // Cross-tenant W4(D2)— rate_card 是 system_admin-only:租户用户不发请求
-  // (否则每次进调试台吃一发静默 403),成本区随现有「无数据」态自然隐藏。
-  useEffect(() => {
-    if (!isSystemAdmin) return;
-    const model = readModel(r.spec);
-    if (!model.provider || !model.name) return;
-    let cancelled = false;
-    void listRateCards({ provider: model.provider, model: model.name })
-      .then((rows) => {
-        if (!cancelled) setRate(rows[0] ?? null);
-      })
-      .catch(() => {
-        // No rate / not authorized → cost simply hidden.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [r.spec, isSystemAdmin]);
 
   // Freeze the finished stream's timing onto its turn — the shared
   // ``tokenStream`` buffer is reset by the next run, so the status bar would
@@ -706,7 +700,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               // 直接给声明序;拿不到 manifest 的对话详情页不传 = 现状序)。
               inputOrder={promptVariables.map((v) => v.name)}
               registerHistoryRow={registerHistoryRow}
-              rate={rate}
+              rateBook={rateBook}
               isSystemAdmin={isSystemAdmin}
               readOnly={false}
               isTenantSwitched={isTenantSwitched}

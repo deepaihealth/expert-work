@@ -74,7 +74,7 @@ function makeBaseProps(turn: ConsoleTurn): TurnBlockProps {
     onSelect: vi.fn(),
     onInspect: vi.fn(),
     onInspectRow: vi.fn(),
-    rate: null,
+    rateBook: null,
     isSystemAdmin: false,
     readOnly: false,
     isTenantSwitched: false,

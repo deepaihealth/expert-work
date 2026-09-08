@@ -56,6 +56,7 @@ const FULL_SUMMARY: TurnSummary = {
   finishReason: "stop",
   modelName: "glm-5.2",
   perStepUsage: [],
+  usageByModel: [],
 };
 
 const EMPTY_SUMMARY: TurnSummary = {
@@ -68,6 +69,7 @@ const EMPTY_SUMMARY: TurnSummary = {
   finishReason: null,
   modelName: null,
   perStepUsage: [],
+  usageByModel: [],
 };
 
 describe("TurnFooter", () => {
