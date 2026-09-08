@@ -57,6 +57,49 @@ def _default_client_factory(config: MCPServerConfig, headers: Mapping[str, str])
     return StreamableHttpMCPClient(config=config, resolved_headers=dict(headers))
 
 
+# The SDK's streamable_http/sse clients run inside an anyio task group, so the
+# real cause (httpx 401 / DNS gaierror / ConnectError) reaches us wrapped in an
+# ``ExceptionGroup``. ``type(exc).__name__`` alone told the admin nothing
+# (2026-09-08: six attempts, six times "ExceptionGroup").
+_MAX_LEAF_CAUSES = 3
+_MAX_LEAF_TEXT = 200
+_REDACTED = "***"
+
+
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """Flatten (possibly nested) exception groups into their leaf exceptions, in order."""
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for sub in exc.exceptions for leaf in _leaf_exceptions(sub)]
+    return [exc]
+
+
+def _summarize_leaf(exc: BaseException) -> str:
+    """``TypeName: first line of str(exc)`` — bare ``TypeName`` when str(exc) is empty."""
+    text = str(exc).strip()
+    first_line = text.splitlines()[0].strip() if text else ""
+    summary = f"{type(exc).__name__}: {first_line}" if first_line else type(exc).__name__
+    return summary[:_MAX_LEAF_TEXT]
+
+
+def _redact(text: str, secrets: Sequence[str]) -> str:
+    # Longest first so "Bearer <token>" collapses to one "***" instead of "Bearer ***".
+    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
+        text = text.replace(secret, _REDACTED)
+    return text
+
+
+def _describe_failure(exc: BaseException, secrets: Sequence[str]) -> str:
+    """Leaf-cause summary for the API message: deduped, capped, secret-free."""
+    summaries: list[str] = []
+    for leaf in _leaf_exceptions(exc):
+        summary = _redact(_summarize_leaf(leaf), secrets)
+        if summary not in summaries:
+            summaries.append(summary)
+        if len(summaries) == _MAX_LEAF_CAUSES:
+            break
+    return "; ".join(summaries)
+
+
 async def probe_remote_mcp(
     *,
     name: str,
@@ -112,13 +155,19 @@ async def probe_remote_mcp(
         tools: Sequence[MCPToolDef] = await asyncio.wait_for(client.list_tools(), timeout=timeout_s)
         return tools
     except Exception as exc:  # probe maps all failures (incl. TimeoutError) to McpProbeError
-        # NB: do not log the tenant-supplied server name/url/transport — CodeQL
-        # py/log-injection flags request-derived values; the caller surfaces the
-        # failure (with context) to the API response + audit already.
-        logger.warning("mcp_probe.failed")
+        # NB: do not put the tenant-supplied server name/url/transport in the log
+        # message — CodeQL py/log-injection flags request-derived values; the
+        # caller surfaces the failure (with context) to the API response + audit
+        # already. exc_info carries the full chain for pod-log debugging.
+        logger.warning("mcp_probe.failed", exc_info=True)
+        # Exception text is never expected to echo header values, but the
+        # message goes to the tenant UI — strip them if it ever does.
+        secrets = [*headers.values()]
+        if bearer_token is not None:
+            secrets.append(bearer_token)
         raise McpProbeError(
             "MCP_SERVER_PROBE_FAILED",
-            f"could not connect to MCP server {name!r}: {type(exc).__name__}",
+            f"could not connect to MCP server {name!r}: {_describe_failure(exc, secrets)}",
         ) from exc
     finally:
         try:
