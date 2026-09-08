@@ -711,6 +711,65 @@ async def test_delete_cancels_in_flight_runs(cascade_ctx: _CascadeCtx) -> None:
     assert details["runs_cancelled"] == 1
 
 
+class _SpyBusRunCancel:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_delete_broadcasts_run_cancel_for_a_peer_owned_run(
+    cascade_ctx: _CascadeCtx,
+) -> None:
+    """跨副本取消亚秒化 —— 删除级联对别的副本持有的 run 走 CAS,赢了就广播
+    ``run_cancel``;本副本没有它的记录,只有 durable 行。"""
+    from datetime import UTC, datetime
+
+    from expert_work.runtime.runs import DisconnectMode, RunInfo
+
+    sess = await cascade_ctx.client.post(
+        "/v1/sessions", json={"agent_name": "code-reviewer", "agent_version": "1.0.0"}
+    )
+    assert sess.status_code == 201, sess.text
+    thread_id = UUID(sess.json()["data"]["thread_id"])
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    await cascade_ctx.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=cascade_ctx.tenant_id,
+            thread_id=thread_id,
+            user_id=None,
+            status=RunStatus.RUNNING,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=None,
+            claimed_by="peer-instance-xyz",
+        )
+    )
+    spy = _SpyBusRunCancel()
+    cascade_ctx.app.state.invalidation_bus = spy  # type: ignore[attr-defined]
+
+    resp = await cascade_ctx.client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert resp.status_code == 204, resp.text
+
+    info = await cascade_ctx.run_store.get(run_id=run_id, tenant_id=cascade_ctx.tenant_id)
+    assert info is not None
+    assert info.status is RunStatus.INTERRUPTED
+    cancels = [e for e in spy.events if e.kind == "run_cancel"]  # type: ignore[attr-defined]
+    assert [(e.run_id, e.tenant_id) for e in cancels] == [  # type: ignore[attr-defined]
+        (str(run_id), str(cascade_ctx.tenant_id))
+    ]
+
+
 @pytest.mark.asyncio
 async def test_delete_cancels_only_this_versions_in_flight_runs(
     cascade_ctx: _CascadeCtx,

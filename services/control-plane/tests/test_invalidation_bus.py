@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -20,6 +21,7 @@ from control_plane.invalidation_bus import (
     NoopInvalidationBus,
     build_invalidation_handlers,
 )
+from expert_work.runtime.runs import InMemoryRunStore, RunManager, RunStatus
 
 # ---------------------------------------------------------------------------
 # Fakes / spies
@@ -730,3 +732,171 @@ async def test_end_to_end_publish_reaches_own_pod_handlers() -> None:
         assert runtime.tenant_calls == [tid]
     finally:
         await bus.stop()
+
+
+# ---------------------------------------------------------------------------
+# run_cancel — 跨副本取消亚秒化(属主副本收到事件立刻做一次心跳检查)
+# ---------------------------------------------------------------------------
+
+
+def _run_cancel_event(run_id: Any, tenant_id: Any) -> InvalidationEvent:
+    return InvalidationEvent(kind="run_cancel", tenant_id=str(tenant_id), run_id=str(run_id))
+
+
+class _CountingManager:
+    """Wrap a real ``RunManager`` and count ``heartbeat`` calls — the handler's
+    only side-effecting step; a duplicate / late event must not add one."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.heartbeats = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def heartbeat(self, run_id: Any) -> bool:
+        self.heartbeats += 1
+        return bool(await self._inner.heartbeat(run_id))
+
+
+def _handlers_for(manager: Any) -> dict[str, Any]:
+    return build_invalidation_handlers(
+        SimpleNamespace(agent_runtime=SimpleNamespace(run_manager=manager))
+    )
+
+
+async def _running_run(manager: Any) -> Any:
+    record = await manager.create(run_id=uuid4(), thread_id=uuid4(), tenant_id=uuid4())
+    assert await manager.set_status(record.run_id, RunStatus.RUNNING)
+    return record
+
+
+@pytest.mark.asyncio
+async def test_publish_serializes_run_id_only_when_present() -> None:
+    """``run_id`` rides the same payload; kinds that don't carry one keep the
+    exact wire shape of before (a rolling deploy has old pods parsing it)."""
+    redis = _FakeRedis()
+    bus = _bus(redis)
+    rid, tid = uuid4(), uuid4()
+    await bus.publish(_run_cancel_event(rid, tid))
+    data = json.loads(redis.published[0][1])
+    assert data == {
+        "kind": "run_cancel",
+        "tenant_id": str(tid),
+        "user_id": None,
+        "run_id": str(rid),
+        "origin": "pod-test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_subscriber_delivers_run_id() -> None:
+    redis = _FakeRedis()
+    bus = _bus(redis)
+    seen: list[InvalidationEvent] = []
+
+    async def _on(event: InvalidationEvent) -> None:
+        seen.append(event)
+
+    bus.start({"run_cancel": _on})
+    try:
+        await _wait_until(lambda: redis.queues)
+        rid, tid = uuid4(), uuid4()
+        await bus.publish(_run_cancel_event(rid, tid))
+        await _wait_until(lambda: seen)
+        assert seen[0].run_id == str(rid)
+        assert seen[0].tenant_id == str(tid)
+    finally:
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_handler_aborts_a_local_run_the_cas_already_interrupted() -> None:
+    """The owner's record is RUNNING, a peer's ``request_cancel`` CAS has
+    flipped the durable row: the handler re-runs the heartbeat CAS (the SAME
+    check ``_heartbeat_loop`` makes every ``lease_ttl/3``), sees the lease is
+    gone and sets ``abort_event`` — now, not up to 10s later."""
+    store = InMemoryRunStore()
+    manager = _CountingManager(RunManager(store=store))
+    record = await _running_run(manager)
+    assert await store.request_cancel(
+        run_id=record.run_id,
+        tenant_id=record.tenant_id,
+        updated_at=datetime.now(UTC),
+        reason="user_cancel",
+    )
+    handlers = _handlers_for(manager)
+
+    await handlers["run_cancel"](_run_cancel_event(record.run_id, record.tenant_id))
+
+    assert record.abort_event.is_set(), "属主没有被叫停 —— 事件到了却还得等周期心跳"
+    assert manager.heartbeats == 1
+    # 重复 / 晚到的同一事件:abort 已置位,不再碰 store。
+    await handlers["run_cancel"](_run_cancel_event(record.run_id, record.tenant_id))
+    assert manager.heartbeats == 1
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_handler_trusts_the_cas_not_the_message() -> None:
+    """A run_cancel event for a run whose durable row is STILL running (no CAS
+    won — a spurious / mis-ordered message) must not abort anything: the
+    heartbeat renews the lease and returns True. The CAS state machine of
+    #1313 is the truth; the bus only makes the owner look sooner."""
+    store = InMemoryRunStore()
+    manager = _CountingManager(RunManager(store=store))
+    record = await _running_run(manager)
+    handlers = _handlers_for(manager)
+
+    await handlers["run_cancel"](_run_cancel_event(record.run_id, record.tenant_id))
+
+    assert not record.abort_event.is_set()
+    assert manager.heartbeats == 1
+    row = await store.get(run_id=record.run_id, tenant_id=record.tenant_id)
+    assert row is not None and row.status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_handler_ignores_runs_this_replica_does_not_own() -> None:
+    store = InMemoryRunStore()
+    manager = _CountingManager(RunManager(store=store))
+    record = await _running_run(manager)
+    handlers = _handlers_for(manager)
+
+    # Unknown run_id — a peer's run.
+    await handlers["run_cancel"](_run_cancel_event(uuid4(), record.tenant_id))
+    # Known run_id but the wrong tenant — never act across the tenant line.
+    await handlers["run_cancel"](_run_cancel_event(record.run_id, uuid4()))
+    # Payload without a run_id — nothing to look up.
+    await handlers["run_cancel"](
+        InvalidationEvent(kind="run_cancel", tenant_id=str(record.tenant_id))
+    )
+
+    assert not record.abort_event.is_set()
+    assert manager.heartbeats == 0
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_handler_ignores_terminal_and_pending_records() -> None:
+    """Terminal: nothing to stop (a late event after the run finished). PENDING:
+    the → RUNNING CAS guard (洞 A) already refuses to start a cancelled run, so
+    the handler leaves it to that path rather than adding a second one."""
+    store = InMemoryRunStore()
+    manager = _CountingManager(RunManager(store=store))
+    handlers = _handlers_for(manager)
+
+    done = await _running_run(manager)
+    assert await manager.set_status(done.run_id, RunStatus.SUCCESS)
+    await handlers["run_cancel"](_run_cancel_event(done.run_id, done.tenant_id))
+    assert not done.abort_event.is_set()
+
+    pending = await manager.create(run_id=uuid4(), thread_id=uuid4(), tenant_id=uuid4())
+    await handlers["run_cancel"](_run_cancel_event(pending.run_id, pending.tenant_id))
+    assert not pending.abort_event.is_set()
+
+    assert manager.heartbeats == 0
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_handler_is_noop_without_a_runtime() -> None:
+    handlers = build_invalidation_handlers(SimpleNamespace())
+    await handlers["run_cancel"](_run_cancel_event(uuid4(), uuid4()))
