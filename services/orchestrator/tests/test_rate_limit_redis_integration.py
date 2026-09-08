@@ -24,7 +24,6 @@ bucket instead of failing the call.
 
 from __future__ import annotations
 
-import logging
 import time
 from collections.abc import AsyncIterator, Iterator
 
@@ -175,10 +174,13 @@ async def test_script_flush_is_survived(redis_client: redis_async.Redis) -> None
 
 
 @pytest.mark.asyncio
-async def test_unreachable_redis_degrades_to_local_bucket(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level(logging.WARNING, logger="orchestrator.llm.rate_limit_redis")
+async def test_unreachable_redis_degrades_to_local_bucket() -> None:
+    """Asserts the limiter's own state, not caplog: the CI integration job
+    runs the whole repo in one process, and alembic's ``env.py`` calls
+    ``logging.config.fileConfig`` (default ``disable_existing_loggers=True``)
+    during the persistence migration tests, which switches off every logger
+    created at collection time — this module's included. "Logs once per
+    outage" is pinned by the unit tests with a fake client."""
     dead = redis_async.from_url(
         "redis://127.0.0.1:1/0", encoding="utf-8", decode_responses=True, socket_connect_timeout=0.2
     )
@@ -194,8 +196,9 @@ async def test_unreachable_redis_degrades_to_local_bucket(
         await dead.aclose()
 
     assert limiter.degraded is True
+    assert limiter.last_degrade_error == "ConnectionError", (
+        "the real redis-py refusal is what tripped the bucket"
+    )
     # Connection refused is immediate; the bound only guards against the
     # call being stuck on Redis (the limiter's own op timeout is 2 s).
     assert elapsed < 2.0, "the call is served locally, not stuck on Redis"
-    warnings = [r for r in caplog.records if "rate_limit.redis_degraded" in r.getMessage()]
-    assert len(warnings) == 1

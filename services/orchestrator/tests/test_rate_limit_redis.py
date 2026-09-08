@@ -292,6 +292,7 @@ async def test_redis_error_degrades_to_local_division_bucket_and_logs_once(
     elapsed = time.monotonic() - start
 
     assert limiter.degraded is True
+    assert limiter.last_degrade_error == "ConnectionError"
     assert first_two < 0.1, "2 local tokens (4 rpm / 2 replicas) dispatch instantly"
     assert elapsed >= window_s / 2 * 0.8, (
         f"3rd call must wait a local refill (division applied); got {elapsed:.3f}s"
@@ -345,6 +346,7 @@ async def test_degraded_bucket_does_not_touch_redis_until_the_reprobe_cooldown(
     await limiter.acquire()
     assert len(redis.calls) == 1, "cooldown elapsed → re-probe hits Redis"
     assert limiter.degraded is False
+    assert limiter.last_degrade_error is None, "recovery clears the last error"
     assert len(_recover_records(caplog)) == 1
 
 

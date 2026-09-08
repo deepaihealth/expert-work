@@ -136,6 +136,7 @@ class RedisRpmLimiter:
         # Wall-clock time at which a degraded bucket re-probes Redis; ``None``
         # while healthy.
         self._reprobe_at: float | None = None
+        self._last_degrade_error: str | None = None
 
     @property
     def bucket_key(self) -> str:
@@ -144,6 +145,12 @@ class RedisRpmLimiter:
     @property
     def degraded(self) -> bool:
         return self._reprobe_at is not None
+
+    @property
+    def last_degrade_error(self) -> str | None:
+        """Class name of the Redis failure behind the current degradation
+        (the same string the warning carries); ``None`` while healthy."""
+        return self._last_degrade_error
 
     async def __aenter__(self) -> None:
         await self.acquire()
@@ -195,6 +202,7 @@ class RedisRpmLimiter:
     def _degrade(self, exc: BaseException) -> None:
         first = self._reprobe_at is None
         self._reprobe_at = self._clock() + self.REPROBE_S
+        self._last_degrade_error = type(exc).__name__
         if first:
             # Class name only: redis-py error text can carry the connection
             # URL, password included.
@@ -209,6 +217,7 @@ class RedisRpmLimiter:
         if self._reprobe_at is None:
             return
         self._reprobe_at = None
+        self._last_degrade_error = None
         logger.info("rate_limit.redis_recovered bucket=%s", self._key)
 
 
