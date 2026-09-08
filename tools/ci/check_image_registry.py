@@ -93,7 +93,10 @@ def _files(root: Path) -> list[Path]:
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if any(part in SKIP_PARTS for part in path.parts):
+        # 只看 root 以下的路径段:root 自己的绝对路径里出现 ``.claude`` / ``dist``
+        # 之类(agent worktree 就在 ``.claude/worktrees/`` 下)不算 —— 否则卫兵
+        # 在那种 checkout 里一个文件都不扫、永远绿(2026-09-08 变异自证时逮到)。
+        if any(part in SKIP_PARTS for part in path.relative_to(root).parts):
             continue
         if path.suffix in SUFFIXES or path.name in DOCKERFILE_NAMES:
             out.append(path)

@@ -128,3 +128,16 @@ def test_worktree_copies_are_not_scanned(tmp_path: Path) -> None:
     (nested / "Dockerfile").write_text(f"FROM {_bare('python', '3.12-slim')}\n", encoding="utf-8")
 
     assert check(tmp_path) == []
+
+
+def test_a_checkout_that_itself_lives_under_a_skipped_name_is_still_scanned(
+    tmp_path: Path,
+) -> None:
+    """跳过规则只看 root **以下**的路径段。root 自己在 ``.claude/worktrees/`` 里
+    (agent worktree 就是)时,原实现把每个文件都跳掉,卫兵在那种 checkout 里
+    永远绿 —— 2026-09-08 变异自证时逮到的。"""
+    root = tmp_path / ".claude" / "worktrees" / "agent-x"
+    root.mkdir(parents=True)
+    (root / "Dockerfile").write_text(f"FROM {_bare('python', '3.12-slim')}\n", encoding="utf-8")
+
+    assert len(check(root)) == 1
