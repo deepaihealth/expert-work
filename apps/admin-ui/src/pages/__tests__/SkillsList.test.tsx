@@ -18,6 +18,7 @@ import { SkillDetail } from "../SkillDetail";
 import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
+import { MAX_CURSOR_PAGES } from "../../utils/pagination";
 
 // Cross-tenant W3 — 切入态置灰;``isTenantSwitchedMock`` 可翻转做两态断言。
 const { isTenantSwitchedMock } = vi.hoisted(() => ({
@@ -350,6 +351,77 @@ describe("SkillsList", () => {
     // Exactly one follow-up request, carrying the cursor back verbatim.
     expect(seenParams).toHaveLength(2);
     expect(seenParams[1]).toMatchObject({ platform_cursor: "pc-1" });
+  });
+
+  // B-29 kin — the bounded walk must not go silent when it hits its cap.
+  it("warns when the platform walk hits its page cap with pages still left", async () => {
+    let calls = 0;
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: () => {
+          calls += 1;
+          return {
+            items: [{ ...skillRow, source: "tenant" as const, entitled: true }],
+            platform_items: [
+              {
+                ...skillRow,
+                id: `pk-${calls}`,
+                name: `platform_${calls}`,
+                source: "platform" as const,
+                entitled: true,
+              },
+            ],
+            next_cursor: null,
+            platform_next_cursor: `pc-${calls}`,
+            platform_items_truncated: true,
+            cross_tenant: false,
+          };
+        },
+      },
+    ]);
+    renderSkillsRouter();
+    await waitFor(() =>
+      expect(screen.getByTestId("skills-platform-truncated")).toBeInTheDocument(),
+    );
+    // First page + exactly MAX_CURSOR_PAGES follow-ups, then stop.
+    expect(calls).toBe(MAX_CURSOR_PAGES + 1);
+    expect(screen.getByText("platform_1")).toBeInTheDocument();
+  });
+
+  it("shows no cap warning when the platform walk finishes within two pages", async () => {
+    installAdapter([
+      { match: (u) => u === "/v1/me", respond: () => meResponse },
+      {
+        match: (u) => u === "/v1/skills",
+        respond: ({ params }) =>
+          params?.platform_cursor === "pc-1"
+            ? {
+                items: [],
+                platform_items: [
+                  { ...skillRow, id: "pk2", name: "platform_page2", source: "platform" as const, entitled: true },
+                ],
+                next_cursor: null,
+                platform_next_cursor: null,
+                platform_items_truncated: false,
+                cross_tenant: false,
+              }
+            : {
+                items: [{ ...skillRow, source: "tenant" as const, entitled: true }],
+                platform_items: [
+                  { ...skillRow, id: "pk1", name: "platform_page1", source: "platform" as const, entitled: true },
+                ],
+                next_cursor: null,
+                platform_next_cursor: "pc-1",
+                platform_items_truncated: true,
+                cross_tenant: false,
+              },
+      },
+    ]);
+    renderSkillsRouter();
+    await waitFor(() => expect(screen.getByText("platform_page2")).toBeInTheDocument());
+    expect(screen.queryByTestId("skills-platform-truncated")).not.toBeInTheDocument();
   });
 
   it("renders platform_items with source badge + entitled lock (X-6)", async () => {

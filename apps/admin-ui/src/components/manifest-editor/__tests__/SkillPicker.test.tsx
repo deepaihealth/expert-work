@@ -5,6 +5,7 @@ import "../../../i18n";
 
 import { SkillPicker } from "../SkillPicker";
 import { listSkills, type SkillRecord } from "../../../api/skills";
+import { MAX_CURSOR_PAGES } from "../../../utils/pagination";
 import type { AgentManifest } from "../form_model";
 
 // Cross-tenant W3 — the picker reads the ambient tenant scope; these tests
@@ -414,6 +415,58 @@ describe("SkillPicker", () => {
     render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
     await screen.findByTestId("af-skill-row-sql-analyst");
     expect(listSkills).toHaveBeenCalledTimes(1);
+  });
+
+  // B-29 kin — the bounded walk must not go silent when it hits its cap.
+  it("warns when the platform walk hits its page cap with pages still left", async () => {
+    vi.mocked(listSkills).mockClear();
+    const endless = {
+      items: [rec({ name: "t-only", source: "tenant" })],
+      platform_items: [
+        rec({ name: "plat-x", source: "platform", entitled: true }),
+      ],
+      next_cursor: null,
+      platform_next_cursor: "pc-always",
+      platform_items_truncated: true,
+      cross_tenant: false,
+    };
+    // First page + exactly MAX_CURSOR_PAGES follow-ups. A 22nd call would
+    // fall through to the default single-page mock and break the count.
+    for (let i = 0; i < MAX_CURSOR_PAGES + 1; i += 1) {
+      vi.mocked(listSkills).mockResolvedValueOnce(endless);
+    }
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    expect(await screen.findByTestId("af-skills-truncated")).toBeInTheDocument();
+    expect(screen.getByTestId("af-skill-row-plat-x")).toBeInTheDocument();
+    expect(listSkills).toHaveBeenCalledTimes(MAX_CURSOR_PAGES + 1);
+  });
+
+  it("shows no cap warning when the platform walk finishes within two pages", async () => {
+    vi.mocked(listSkills).mockClear();
+    vi.mocked(listSkills)
+      .mockResolvedValueOnce({
+        items: [rec({ name: "t-only", source: "tenant" })],
+        platform_items: [
+          rec({ name: "plat-page1", source: "platform", entitled: true }),
+        ],
+        next_cursor: null,
+        platform_next_cursor: "pcursor-1",
+        platform_items_truncated: true,
+        cross_tenant: false,
+      })
+      .mockResolvedValueOnce({
+        items: [rec({ name: "stub-row", source: "tenant" })],
+        platform_items: [
+          rec({ name: "plat-page2", source: "platform", entitled: true }),
+        ],
+        next_cursor: null,
+        platform_next_cursor: null,
+        platform_items_truncated: false,
+        cross_tenant: false,
+      });
+    render(<SkillPicker formData={SEED} onChange={vi.fn()} />);
+    expect(await screen.findByTestId("af-skill-row-plat-page2")).toBeInTheDocument();
+    expect(screen.queryByTestId("af-skills-truncated")).not.toBeInTheDocument();
   });
 
   it("threads the ambient tenant scope into listSkills (W3)", async () => {
