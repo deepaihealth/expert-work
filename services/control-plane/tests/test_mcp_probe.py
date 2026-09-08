@@ -227,7 +227,9 @@ async def test_probe_message_redacts_bearer_token_and_custom_header_values() -> 
         f"upstream rejected headers Authorization: Bearer {token}; X-Api-Key: {api_key}"
     )
 
-    err = await _probe_failing_with(leaky, bearer_token=token, custom_headers={"X-Api-Key": api_key})
+    err = await _probe_failing_with(
+        leaky, bearer_token=token, custom_headers={"X-Api-Key": api_key}
+    )
 
     assert token not in err.message
     assert api_key not in err.message
