@@ -199,7 +199,8 @@ def test_first_occurrence_always_logs_then_window_caps(
         return clock[0]
 
     monkeypatch.setattr(rls, "_monotonic", fake_monotonic)
-    cap = rls._SIGNAL_MAX_PER_WINDOW
+    cap = 3
+    monkeypatch.setattr(rls, "_SIGNAL_MAX_PER_WINDOW", cap)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
         for _ in range(cap + 3):
