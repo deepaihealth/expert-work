@@ -56,6 +56,7 @@ import pytest
 
 from expert_work.persistence import SANDBOX_SKILLS_ROOT, InMemoryUserWorkspaceStore
 from expert_work.runtime.sandbox import SandboxRuntimeProvider
+from expert_work.testing import PREBUILT_SANDBOX_IMAGE_ENV, sandbox_image_plan
 from sandbox_supervisor.docker_client import CliDockerClient
 from sandbox_supervisor.domain import SandboxRecord, SandboxState, SupervisorError
 from sandbox_supervisor.pool import PoolReplenisher, SandboxPool
@@ -154,8 +155,16 @@ def _docker_env() -> Iterator[None]:
     if probe.returncode != 0:
         pytest.skip("docker daemon unreachable")
 
-    build = _docker("build", "-t", _IMAGE, str(_IMAGE_CONTEXT))
+    # CI 预构建过(EXPERT_WORK_TEST_SANDBOX_IMAGE)就 docker tag 借用,否则自己 build。
+    plan = sandbox_image_plan(_IMAGE, _IMAGE_CONTEXT)
+    build = _docker(*plan.argv)
     if build.returncode != 0:
+        if plan.prebuilt is not None:
+            # CI 说建好了却不在本机 —— 配置错,必须响,skip 会静默丢掉整套验收。
+            pytest.fail(
+                f"{PREBUILT_SANDBOX_IMAGE_ENV}={plan.prebuilt} 不在本机(CI 预构建步骤没落地?):"
+                f"{build.stderr[-400:]}"
+            )
         pytest.skip(f"sandbox image build failed: {build.stderr[-400:]}")
 
     # Clean slate, then (re)create the egress network as ``--internal`` —
