@@ -47,6 +47,7 @@ from expert_work.protocol import ModelSpec, Provider, StructuredOutputSpec
 
 if TYPE_CHECKING:
     from expert_work.runtime.secret_store import SecretStore
+    from orchestrator.llm import RateLimiterFactory
 
 logger = logging.getLogger("expert_work.control_plane.credentials_aux_adapter")
 
@@ -76,11 +77,15 @@ class LLMRouterAuxModelAdapter:
         default_provider: Provider,
         default_model: str,
         secret_cache: CredentialValueCache | None = None,
+        rate_limiter_factory: RateLimiterFactory | None = None,
     ) -> None:
         self._resolver = resolver
         self._secret_store = secret_store
         self._default_provider = default_provider
         self._default_model = default_model
+        # 波 2 线 A — global provider RPM bucket; the consolidator's calls are
+        # real vendor calls and must draw from the same bucket as agents.
+        self._rate_limiter_factory = rate_limiter_factory
         # 二期 PR2 T3 — the adapter has no direct ``secret_store.get``; its
         # vault read happens inside ``build_llm_router``. ``None`` (tests /
         # not yet wired) keeps the direct-read behaviour.
@@ -135,7 +140,9 @@ class LLMRouterAuxModelAdapter:
             store = CachingSecretStore(
                 inner=self._secret_store, cache=self._secret_cache, tenant_id=tenant_id
             )
-        router = await build_llm_router(spec, secret_store=store)
+        router = await build_llm_router(
+            spec, secret_store=store, rate_limiter_factory=self._rate_limiter_factory
+        )
         message = HumanMessage(content=prompt)
         # RT-1 — ``output_schema`` threads straight through to the router's
         # validation loop; ``None`` keeps the call wire-identical to the
@@ -183,6 +190,7 @@ def make_llm_router_aux_model(
     default_provider: Provider,
     default_model: str,
     secret_cache: CredentialValueCache | None = None,
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> ConsolidatorAuxModel:
     """Factory mirroring :func:`make_null_consolidator_aux_model` so the
     app.py wire-up can swap one for the other with no code change at
@@ -193,4 +201,5 @@ def make_llm_router_aux_model(
         default_provider=default_provider,
         default_model=default_model,
         secret_cache=secret_cache,
+        rate_limiter_factory=rate_limiter_factory,
     )

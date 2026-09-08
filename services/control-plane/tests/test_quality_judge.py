@@ -31,7 +31,7 @@ def _patch_router(monkeypatch: pytest.MonkeyPatch, response: AIMessage) -> None:
     async def _fake_router(*, messages: Any, tools: Any, output_schema: Any) -> AIMessage:
         return response
 
-    async def _fake_build(spec: Any, *, secret_store: Any) -> Any:
+    async def _fake_build(spec: Any, *, secret_store: Any, **kwargs: Any) -> Any:
         return _fake_router
 
     monkeypatch.setattr("orchestrator.build_llm_router", _fake_build, raising=False)

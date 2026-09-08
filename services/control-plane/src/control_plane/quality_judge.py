@@ -32,6 +32,7 @@ from expert_work.protocol import ModelSpec, Provider, StructuredOutputSpec
 
 if TYPE_CHECKING:
     from expert_work.runtime.secret_store import SecretStore
+    from orchestrator.llm import RateLimiterFactory
 
 logger = logging.getLogger("expert_work.control_plane.quality_judge")
 
@@ -92,9 +93,13 @@ class QualityJudge:
         resolver: CredentialsResolver,
         secret_store: SecretStore,
         secret_cache: CredentialValueCache | None = None,
+        rate_limiter_factory: RateLimiterFactory | None = None,
     ) -> None:
         self._resolver = resolver
         self._secret_store = secret_store
+        # 波 2 线 A — global provider RPM bucket; the judge's calls are real
+        # vendor calls and must draw from the same bucket as agents.
+        self._rate_limiter_factory = rate_limiter_factory
         # 二期 PR2 T3 — the judge has no direct ``secret_store.get``; its
         # vault read happens inside ``build_llm_router``. ``None`` (tests /
         # not yet wired) keeps the direct-read behaviour.
@@ -132,7 +137,9 @@ class QualityJudge:
                 store = CachingSecretStore(
                     inner=self._secret_store, cache=self._secret_cache, tenant_id=tenant_id
                 )
-            router = await build_llm_router(spec, secret_store=store)
+            router = await build_llm_router(
+                spec, secret_store=store, rate_limiter_factory=self._rate_limiter_factory
+            )
             content = f"{_RUBRIC}\n\nUSER REQUEST:\n{prompt}\n\nAGENT REPLY:\n{reply}"
             response = await router(
                 messages=[HumanMessage(content=content)], tools=[], output_schema=_QUALITY_SPEC

@@ -527,6 +527,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.secret_store import SecretStore, make_secret_store
 from expert_work.runtime.storage import make_object_store
 from orchestrator import MemoryEnv
+from orchestrator.llm import RateLimiterFactory, make_redis_rate_limiter_factory
 from orchestrator.tools import (
     AgentSandboxClient,
     HTTPSupervisorRuntime,
@@ -1304,6 +1305,24 @@ def create_app(
             )
             _app.state.shared_http = shared_http  # ops introspection hook; no reader yet
             stack.push_async_callback(shared_http.aclose)
+            # 波 2 线 A — 供应商 RPM 全局令牌桶。有 quota_redis_url 就把 Redis 后端的
+            # 限流器工厂注入三条构建路径(主 / 子 Agent / worker)+ judge caller,
+            # 每个上游凭据一只桶、所有副本共用,rate_limit_rpm 不再除副本数;
+            # 没有 Redis → None,orchestrator 保持进程内桶 + PROD-12 除法。
+            # 连接方式与本文件其它 Redis 消费者一致;Redis 故障在限流器内部
+            # 降级为进程内桶,不会让 LLM 调用失败。
+            llm_rate_limiter_factory: RateLimiterFactory | None = None
+            if resolved_settings.quota_redis_url:
+                import redis.asyncio as redis_async
+
+                llm_rate_limit_redis = redis_async.from_url(
+                    resolved_settings.quota_redis_url,
+                    encoding="utf-8",
+                    decode_responses=True,
+                )
+                stack.push_async_callback(llm_rate_limit_redis.aclose)
+                llm_rate_limiter_factory = make_redis_rate_limiter_factory(llm_rate_limit_redis)
+            _app.state.llm_rate_limiter_factory = llm_rate_limiter_factory
             # 二期 PR2 T3 — process-level secret-value cache(LRU 256 / TTL
             # 300s,plan 拍定值 = 类默认参数)。embed / rerank / aux / judge
             # 的 vault 读变缓存命中;T2 的凭据写入口经
@@ -1685,6 +1704,8 @@ def create_app(
                     secret_store=resolved_secret_store,
                     http=shared_http,
                     secret_cache=credential_value_cache,
+                    # 波 2 线 A — the LLM-rerank branch is a real vendor call.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 )
                 knowledge_retriever = make_knowledge_retriever(
                     store=resolved_knowledge_store, embedder=embedder, reranker=reranker
@@ -1805,6 +1826,8 @@ def create_app(
                     register_user_invalidation=resolved_agent_runtime.register_user_invalidation_hook,
                     # 一期 Task 5 — delegated sub-agent builds reuse the shared pool too.
                     http_client=shared_http,
+                    # 波 2 线 A — delegated sub-agent builds share the global RPM bucket.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 )
                 # 1.3 Orchestrator-Worker — the spawn_worker builder (synthesizes
                 # ephemeral workers from the parent). ``None`` when the platform
@@ -1844,6 +1867,8 @@ def create_app(
                         default_run_deadline_s=resolved_settings.default_run_deadline_s,
                         # 一期 Task 5 — spawned worker builds reuse the shared pool too.
                         http_client=shared_http,
+                        # 波 2 线 A — spawned worker builds share the global RPM bucket.
+                        rate_limiter_factory=llm_rate_limiter_factory,
                     )
                     if resolved_settings.enable_dynamic_workers
                     else None
@@ -1905,6 +1930,9 @@ def create_app(
                     # 一期 Task 5 — every LLM provider client this builder
                     # constructs reuses the process-level shared connection pool.
                     http_client=shared_http,
+                    # 波 2 线 A — every provider handle this builder constructs
+                    # draws from the global (Redis) RPM bucket when wired.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 )
                 # Stream MCP-OAUTH (OA-3b) — let get_agent decide per-user builds.
                 resolved_agent_runtime.user_oauth_pool_provider = _user_mcp_oauth_pool_provider
@@ -2014,6 +2042,8 @@ def create_app(
                     default_provider=default_provider,
                     default_model=(resolved_settings.memory_consolidator_default_aux_model),
                     secret_cache=credential_value_cache,
+                    # 波 2 线 A — consolidator calls draw from the global RPM bucket.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 )
                 memory_consolidator = MemoryConsolidator(
                     memory_store=resolved_memory_store,
@@ -2089,6 +2119,8 @@ def create_app(
                         default_provider=se_provider,
                         default_model=resolved_settings.memory_consolidator_default_aux_model,
                         secret_cache=credential_value_cache,
+                        # 波 2 线 A — evolution-worker aux calls share the global bucket.
+                        rate_limiter_factory=llm_rate_limiter_factory,
                     ),
                     aux_default_model=resolved_settings.memory_consolidator_default_aux_model,
                     tenant_gate=_skill_evolution_tenant_gate,
@@ -2222,6 +2254,8 @@ def create_app(
                     resolver=credentials_resolver,
                     secret_store=resolved_secret_store,
                     secret_cache=credential_value_cache,
+                    # 波 2 线 A — quality-judge calls share the global RPM bucket.
+                    rate_limiter_factory=llm_rate_limiter_factory,
                 ),
                 runtime=resolved_agent_runtime,
                 usage_store=resolved_token_usage,

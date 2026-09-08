@@ -36,7 +36,8 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Self
+from types import TracebackType
+from typing import Protocol, Self
 
 from aiolimiter import AsyncLimiter
 from langchain_core.messages import AIMessage, BaseMessage
@@ -79,6 +80,41 @@ def effective_rpm(rate_limit_rpm: int) -> int:
     return max(1, math.ceil(rate_limit_rpm / replicas))
 
 
+class AdmissionLimiter(Protocol):
+    """What :class:`RateLimitedProvider` needs from a bucket: an ``async with``
+    that awaits admission and never raises on a full bucket.
+
+    Satisfied by :class:`aiolimiter.AsyncLimiter` (per-process, the default)
+    and :class:`orchestrator.llm.rate_limit_redis.RedisRpmLimiter` (one bucket
+    per upstream credential shared by every replica — 波 2 线 A).
+    """
+
+    async def __aenter__(self) -> None:
+        """Await admission of one request."""
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Nothing to release — tokens are not refunded on exit."""
+
+
+class RateLimiterFactory(Protocol):
+    """Builds the admission limiter for one provider handle (波 2 线 A).
+
+    ``key`` is the :class:`~orchestrator.llm.router.ProviderHandle` key
+    (``provider:model[#idx]``), ``secret_ref`` the credential *reference* the
+    handle was built with (never the value), ``rate_limit_rpm`` the manifest
+    value **undivided** — a global backend owns the whole ceiling; only the
+    per-process default applies :func:`effective_rpm`.
+    """
+
+    def __call__(self, *, key: str, secret_ref: str, rate_limit_rpm: int) -> AdmissionLimiter:
+        """Return the limiter the handle's :class:`RateLimitedProvider` wraps."""
+
+
 @dataclass
 class RateLimitedProvider:
     """Wraps an :class:`LLMProvider` with a per-instance token bucket.
@@ -95,7 +131,7 @@ class RateLimitedProvider:
     """
 
     inner: LLMProvider
-    limiter: AsyncLimiter
+    limiter: AdmissionLimiter
 
     @classmethod
     def with_rpm(

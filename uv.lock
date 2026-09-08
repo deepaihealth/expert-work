@@ -1062,6 +1062,7 @@ dependencies = [
     { name = "mcp" },
     { name = "python-dateutil" },
     { name = "rank-bm25" },
+    { name = "redis" },
 ]
 
 [package.metadata]
@@ -1082,6 +1083,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "python-dateutil", specifier = ">=2.9,<3" },
     { name = "rank-bm25", specifier = ">=0.2,<1" },
+    { name = "redis", specifier = ">=5.0,<9" },
 ]
 
 [[package]]

@@ -97,6 +97,7 @@ from orchestrator.llm import (
     HTTPDashScopeRerankClient,
     HTTPEmbeddingClient,
     OpenAICompatibleEmbedder,
+    RateLimiterFactory,
 )
 from orchestrator.multimodal import (
     CachingImageResolver,
@@ -638,6 +639,7 @@ async def _build_judge_caller(
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None,
     http_client: httpx.AsyncClient | None = None,
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> LLMCaller:
     """Stream PI-3-A2 — the LLM caller backing the output/action judges.
 
@@ -659,7 +661,13 @@ async def _build_judge_caller(
             provider, name = cast(Provider, configured[0]), configured[1]
     secret_ref = await credentials_resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
     judge_spec = ModelSpec(provider=provider, name=name, api_key_ref=secret_ref)
-    return await build_llm_router(judge_spec, secret_store=secret_store, http_client=http_client)
+    return await build_llm_router(
+        judge_spec,
+        secret_store=secret_store,
+        http_client=http_client,
+        # 波 2 线 A — the judge's provider handle draws from the same global bucket.
+        rate_limiter_factory=rate_limiter_factory,
+    )
 
 
 async def _make_output_judge(
@@ -670,6 +678,7 @@ async def _make_output_judge(
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> OutputJudge | None:
     """Stream PI-2b-3 / PI-3-A2 — build the output judge when the manifest opts
     in (``defenses.output_judge == "block"``), over the platform judge model
@@ -683,6 +692,7 @@ async def _make_output_judge(
         secret_store=secret_store,
         judge_config_service=judge_config_service,
         http_client=http_client,
+        rate_limiter_factory=rate_limiter_factory,
     )
     return LLMOutputJudge(caller=caller)
 
@@ -695,6 +705,7 @@ async def _make_action_judge(
     secret_store: SecretStore,
     judge_config_service: PlatformJudgeConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> ActionJudge | None:
     """Stream PI-3b-2 — build the action judge when the manifest opts in
     (``defenses.action_screen != "off"``), over the platform judge model (or
@@ -708,6 +719,7 @@ async def _make_action_judge(
         secret_store=secret_store,
         judge_config_service=judge_config_service,
         http_client=http_client,
+        rate_limiter_factory=rate_limiter_factory,
     )
     return LLMActionJudge(caller=caller)
 
@@ -730,6 +742,7 @@ async def resolve_defenses(
     platform_judge_config_service: PlatformJudgeConfigService | None = None,
     platform_tool_budget_config_service: PlatformToolBudgetConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> ResolvedDefenses:
     """Resolve the model-backed judges + the platform tool-budget switch for a build.
 
@@ -756,6 +769,7 @@ async def resolve_defenses(
             secret_store=secret_store,
             judge_config_service=platform_judge_config_service,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
         if credentials_resolver is not None and tenant_id is not None
         else None
@@ -768,6 +782,7 @@ async def resolve_defenses(
             secret_store=secret_store,
             judge_config_service=platform_judge_config_service,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
         if credentials_resolver is not None and tenant_id is not None
         else None
@@ -851,6 +866,10 @@ def make_agent_builder(
     # ``None`` (tests / pre-lifespan placeholder builder) keeps every LLM
     # provider client on its original per-call ``httpx.AsyncClient``.
     http_client: httpx.AsyncClient | None = None,
+    # 波 2 线 A — global provider RPM bucket factory (Redis-backed when the
+    # lifespan has Redis). Forwarded into ``build_agent`` + the judge caller;
+    # ``None`` keeps the orchestrator's per-process bucket.
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> AgentBuilder:
     """Production :data:`AgentBuilder` bound to a SecretStore + checkpointer.
 
@@ -978,6 +997,7 @@ def make_agent_builder(
             platform_judge_config_service=platform_judge_config_service,
             platform_tool_budget_config_service=platform_tool_budget_config_service,
             http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
         )
         return await build_agent(
             spec,
@@ -1007,6 +1027,8 @@ def make_agent_builder(
             skill_asset_store=skill_asset_store,
             # 一期 Task 5 — process-level shared HTTP client.
             http_client=http_client,
+            # 波 2 线 A — global provider RPM bucket.
+            rate_limiter_factory=rate_limiter_factory,
         )
 
     return _build
@@ -1215,6 +1237,9 @@ class DynamicResolvingReranker:
     #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
     #: yet wired) reads the vault every call (pre-T3 behaviour).
     secret_cache: CredentialValueCache | None = None
+    #: 波 2 线 A — global provider RPM bucket factory for the LLM-rerank
+    #: branch (a real vendor call). ``None`` = per-process bucket.
+    rate_limiter_factory: RateLimiterFactory | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -1261,7 +1286,10 @@ class DynamicResolvingReranker:
         # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
         # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
-            model_spec, secret_store=self.secret_store, http_client=self.http
+            model_spec,
+            secret_store=self.secret_store,
+            http_client=self.http,
+            rate_limiter_factory=self.rate_limiter_factory,
         )
         return await LLMReranker(llm_caller=router).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
