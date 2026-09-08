@@ -239,3 +239,24 @@ def test_tool_disclosure_catalog_annotations() -> None:
     for provider in ("kimi", "glm", "deepseek", "qwen", "doubao"):
         for entry in MODEL_CATALOG[provider]:
             assert entry.tool_disclosure is None, (provider, entry.name)
+
+
+def test_temperature_fixed_declared_only_where_documented() -> None:
+    """B-33 — kimi-k3 accepts only ``temperature=1`` (platform.kimi.com docs;
+    confirmed on the live stack 2026-08-28: any other value is a vendor 400
+    that killed the whole run). The catalog declares the constraint so the
+    factory clamps at build time instead of letting the vendor 400 act as the
+    validator. No other entry has documented evidence, so every other entry
+    stays ``None`` (manifest value sent as-is)."""
+    k3 = catalog_entry("kimi", "kimi-k3")
+    assert k3 is not None
+    assert k3.temperature_fixed == 1.0
+    constrained = [
+        (provider, entry.name)
+        for provider, entries in MODEL_CATALOG.items()
+        for entry in entries
+        if entry.temperature_fixed is not None
+    ]
+    assert constrained == [("kimi", "kimi-k3")]
+    # Field default — an entry that says nothing constrains nothing.
+    assert ModelEntry(name="x").temperature_fixed is None

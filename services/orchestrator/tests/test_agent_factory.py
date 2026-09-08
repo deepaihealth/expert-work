@@ -1623,6 +1623,71 @@ def test_non_glm_compat_has_no_stream_extra_body() -> None:
 
 
 # ---------------------------------------------------------------------------
+# B-33 — catalog-declared temperature constraint (ModelEntry.temperature_fixed)
+# ---------------------------------------------------------------------------
+
+
+def test_kimi_k3_temperature_clamped_to_catalog_fixed_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # kimi-k3 accepts only temperature=1 (vendor 400 otherwise — seen on the
+    # live stack 2026-08-28 after sop2 switched model with its old 0.9). The
+    # factory clamps to the catalog value and says so; the vendor 400 is no
+    # longer the validator.
+    with caplog.at_level(logging.WARNING, logger="expert_work.orchestrator.agent_factory"):
+        provider = _build_provider(_vendor_model("kimi", "kimi-k3", temperature=0.9), "k")
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.temperature == 1.0
+    clamped = [r for r in caplog.records if "agent_factory.temperature_clamped" in r.message]
+    assert len(clamped) == 1
+    assert clamped[0].levelno == logging.WARNING
+    assert "model=kimi-k3" in clamped[0].message
+    assert "configured=0.9" in clamped[0].message
+    assert "fixed=1.0" in clamped[0].message
+
+
+def test_kimi_k3_omitted_temperature_is_clamped_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # ModelSpec.temperature defaults to 0.2 (not None): a manifest that omits
+    # it would still send 0.2 and 400 on K3, so the default is clamped as
+    # well. The warning fires here too — stored manifests are a full
+    # ``model_dump`` (persistence agent_spec/sql.py), so "omitted" and
+    # "explicit 0.2" are indistinguishable at build time; the warning names
+    # the effective value the config page shows.
+    with caplog.at_level(logging.WARNING, logger="expert_work.orchestrator.agent_factory"):
+        provider = _build_provider(_vendor_model("kimi", "kimi-k3"), "k")
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.temperature == 1.0
+    assert "agent_factory.temperature_clamped" in caplog.text
+    assert "configured=0.2" in caplog.text
+
+
+def test_kimi_k3_matching_temperature_is_silent(caplog: pytest.LogCaptureFixture) -> None:
+    # Manifest already says 1.0 → nothing to clamp, nothing to warn about.
+    with caplog.at_level(logging.WARNING, logger="expert_work.orchestrator.agent_factory"):
+        provider = _build_provider(_vendor_model("kimi", "kimi-k3", temperature=1.0), "k")
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.temperature == 1.0
+    assert "agent_factory.temperature_clamped" not in caplog.text
+
+
+def test_unconstrained_models_keep_manifest_temperature(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # No catalog constraint (kimi-k2.6) and off-catalog (custom gateway) →
+    # the manifest value goes out as-is, no warning.
+    with caplog.at_level(logging.WARNING, logger="expert_work.orchestrator.agent_factory"):
+        k26 = _build_provider(_vendor_model("kimi", "kimi-k2.6", temperature=0.9), "k")
+        off = _build_provider(_vendor_model("kimi", "custom-gateway-model", temperature=0.9), "k")
+    assert isinstance(k26, OpenAICompatibleProvider)
+    assert isinstance(off, OpenAICompatibleProvider)
+    assert k26.temperature == 0.9
+    assert off.temperature == 0.9
+    assert "agent_factory.temperature_clamped" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Thinking-Toggle — tri-state thinking_enabled (force on / force off / gate)
 # ---------------------------------------------------------------------------
 
