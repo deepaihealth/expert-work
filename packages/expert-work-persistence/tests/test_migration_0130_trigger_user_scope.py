@@ -22,7 +22,7 @@ def _sync_dsn(url: str) -> str:
 
 @pytest.mark.integration
 def test_migration_0130_schema() -> None:
-    with PostgresContainer("pgvector/pgvector:pg16") as container:
+    with PostgresContainer("ghcr.io/deepaihealth/mirror/pgvector:pg16") as container:
         dsn = _sync_dsn(str(container.get_connection_url()))
         cfg = Config(str(ALEMBIC_INI))
         cfg.set_main_option("sqlalchemy.url", dsn)
@@ -105,7 +105,7 @@ def test_migration_0130_partial_unique_indexes_enforce_scope() -> None:
     """The two partial unique indexes must actually ENFORCE their scoped
     uniqueness, not just exist by name (``test_migration_0130_schema`` only
     checks names)."""
-    with PostgresContainer("pgvector/pgvector:pg16") as container:
+    with PostgresContainer("ghcr.io/deepaihealth/mirror/pgvector:pg16") as container:
         dsn = _sync_dsn(str(container.get_connection_url()))
         cfg = Config(str(ALEMBIC_INI))
         cfg.set_main_option("sqlalchemy.url", dsn)

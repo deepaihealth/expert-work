@@ -39,6 +39,9 @@ concurrency:
 
 permissions:
   contents: read
+  # postgres service container 从 ghcr.io/deepaihealth/mirror/ 拉(X-8 收官),
+  # 包私有时 credentials 要这一项;包 Public 后多余但无害。
+  packages: read
 
 env:
   PYTHON_VERSION: "3.12"
@@ -103,7 +106,11 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        # X-8 收官:mirror-images.yml 从 Docker Hub 原样复制到 GHCR。
+        image: ghcr.io/deepaihealth/mirror/pgvector:pg16
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           POSTGRES_USER: expert_work
           POSTGRES_PASSWORD: expert_work_dev

@@ -47,18 +47,18 @@ def postgres_container() -> Iterator[PostgresContainer]:
     extension, Stream J.3) — a superset of stock Postgres, so every
     pre-J.3 migration / test is unaffected.
 
-    **X-8 余项**:这是全仓最后一个仍从 Docker Hub 拉的镜像,不是漏改 ——
-    官方镜像都搬到了 ``public.ecr.aws/docker/library``(见
-    ``tools/ci/check_image_registry.py``),但 pgvector 不是官方镜像,
-    ECR Public / GHCR / quay 三处都探过,没有第二个公共源。要摘掉它只能
-    自建镜像仓(GHCR + 一条定时 ``imagetools create``)。
+    **X-8 收官**:pgvector 不是官方镜像,ECR Public / GHCR / quay 三处都没有
+    第二个公共源,所以从 ``ghcr.io/deepaihealth/mirror/`` 拉 —— 那是
+    ``.github/workflows/mirror-images.yml`` 每周从 Docker Hub 原样复制过来的
+    (digest 相同)。裸名 ``pgvector/pgvector:<tag>`` 会被
+    ``tools/ci/check_image_registry.py`` 卫兵拦下。
 
     Requires Docker daemon available; tests using this fixture should
     be marked ``@pytest.mark.integration``.
     """
     from testcontainers.postgres import PostgresContainer
 
-    container = PostgresContainer("pgvector/pgvector:pg16")
+    container = PostgresContainer("ghcr.io/deepaihealth/mirror/pgvector:pg16")
     with container:
         yield container
 

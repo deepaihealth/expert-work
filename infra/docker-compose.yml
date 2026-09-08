@@ -182,7 +182,11 @@ x-control-plane-base: &control-plane-base
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    # X-8 收官:pgvector 与下面的 pgbouncer 只在 Docker Hub 上有,匿名拉取按
+    # 共享 runner IP 限流;.github/workflows/mirror-images.yml 每周把上游
+    # manifest 原样复制到 ghcr.io/deepaihealth/mirror/(digest 相同)。改 tag
+    # 要同 PR 改那边的 matrix(tests/test_mirror_images_workflow.py 对照)。
+    image: ghcr.io/deepaihealth/mirror/pgvector:pg16
     container_name: expert-work-postgres
     environment:
       POSTGRES_USER: ${EXPERT_WORK_DB_USER:-expert_work}
@@ -220,7 +224,7 @@ services:
       retries: 15
 
   pgbouncer:
-    image: edoburu/pgbouncer:v1.24.1-p1
+    image: ghcr.io/deepaihealth/mirror/pgbouncer:v1.24.1-p1
     container_name: expert-work-pgbouncer
     environment:
       # edoburu/pgbouncer generates pgbouncer.ini from these env vars.

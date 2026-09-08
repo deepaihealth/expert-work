@@ -24,14 +24,14 @@ def _runner(*, returncode: int, stdout: str = "", stderr: str = "") -> Any:
 def test_a_failed_pull_surfaces_the_registry_error() -> None:
     """限流那句话必须原样出现在结果里 —— 这才是整个 helper 的目的。"""
     err = (
-        "pgvector/pgvector:pg16: toomanyrequests: You have reached your unauthenticated "
-        "pull rate limit. https://www.docker.com/increase-rate-limit"
+        "ghcr.io/deepaihealth/mirror/pgvector:pg16: toomanyrequests: You have reached your "
+        "unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit"
     )
 
     out = explain_compose_pull_failure("/infra", runner=_runner(returncode=1, stderr=err))
 
     assert "toomanyrequests" in out
-    assert "pgvector/pgvector:pg16" in out
+    assert "ghcr.io/deepaihealth/mirror/pgvector:pg16" in out
     assert "exit=1" in out
 
 
