@@ -526,6 +526,9 @@ describe("summarizeTurn — usage buckets by (provider, model)", () => {
     ];
     const s = summarizeTurn(events);
     expect(s.usageByModel).toHaveLength(1);
+    // 桶的身份也要钉住:忽略 usage_by_model 同样会得到「一个桶 220」——
+    // 只是那个桶是未归属的(按主 Agent 卡算),而不是 zhipu/glm-5.3。
+    expect(s.usageByModel[0]).toMatchObject({ provider: "zhipu", model: "glm-5.3" });
     expect(s.usageByModel[0].usage.totalTokens).toBe(220);
   });
 

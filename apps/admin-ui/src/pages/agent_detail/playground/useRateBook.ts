@@ -31,25 +31,38 @@ export function useRateBook(args: {
   const cardsRef = useRef(new Map<string, RateCardRecord | null>());
   const [version, setVersion] = useState(0);
   const agentKey = agentModel ? rateKey(agentModel.provider, agentModel.model) : null;
-  // A stable signature of the wanted keys, so the effect runs when a *new*
-  // model shows up rather than on every frame's fresh ``models`` array.
+
   const wanted = useMemo(() => {
     const refs = agentModel ? [agentModel, ...models] : [...models];
     const keys = new Map<string, ModelRef>();
     for (const r of refs) keys.set(rateKey(r.provider, r.model), r);
     return keys;
   }, [agentModel, models]);
+  // ``models`` is a fresh array every streamed frame; the fetch effect keys on
+  // this signature so it only runs when a *new* model shows up. The map itself
+  // rides along in a ref — an in-flight fetch must not be abandoned just
+  // because another frame arrived (a cancelled-and-never-retried card would
+  // hide the cost for the rest of the session).
+  const wantedRef = useRef(wanted);
+  wantedRef.current = wanted;
   const wantedSig = [...wanted.keys()].join("|");
+
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!enabled) return;
-    let cancelled = false;
-    for (const [key, ref] of wanted) {
+    for (const [key, ref] of wantedRef.current) {
       if (cardsRef.current.has(key)) continue;
       cardsRef.current.set(key, null);
       void listRateCards({ provider: ref.provider, model: ref.model })
         .then((rows) => {
-          if (cancelled) return;
+          if (!mountedRef.current) return;
           cardsRef.current.set(key, rows[0] ?? null);
           setVersion((v) => v + 1);
         })
@@ -57,12 +70,6 @@ export function useRateBook(args: {
           // No rate / not authorized → cost simply hidden.
         });
     }
-    return () => {
-      cancelled = true;
-    };
-    // ``wanted`` is derived from ``wantedSig``; keying on the signature keeps
-    // the effect from re-running on identical-content arrays.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, wantedSig]);
 
   return useMemo(() => {
@@ -70,7 +77,6 @@ export function useRateBook(args: {
     const byModel = new Map<string, RateCardRecord>();
     for (const [key, card] of cardsRef.current) if (card !== null) byModel.set(key, card);
     return { agentKey, byModel };
-    // ``version`` bumps when a card lands; it is the actual dependency.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // ``version`` bumps when a card lands — that is what invalidates the book.
   }, [enabled, agentKey, version]);
 }
