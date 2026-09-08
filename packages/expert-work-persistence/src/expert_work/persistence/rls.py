@@ -143,9 +143,10 @@ _TRANSPORT_MODULES: Final[frozenset[str]] = frozenset(
 
 #: SQL stores are mechanism, not policy — the tenant context is set (or the
 #: bypass declared) by whoever calls them. Attribution skips past the store
-#: layer to that caller; the store frame is only used as a fallback when the
-#: whole chain lives inside persistence.
-_STORE_LAYER_PREFIX: Final[str] = "expert_work.persistence."
+#: layer (this package, and the runtime library's stores such as
+#: ``expert_work.runtime.event_log.db`` / ``runs.store``) to that caller; a
+#: store frame is only used as a fallback when the whole chain is store layer.
+_STORE_LAYER_PREFIXES: Final[tuple[str, ...]] = ("expert_work.persistence.", "expert_work.runtime.")
 
 #: Per-caller rate limit for the signal: the first occurrence of a caller
 #: always logs; beyond ``_SIGNAL_MAX_PER_WINDOW`` records in a window the
@@ -202,7 +203,7 @@ def _locate_caller() -> tuple[str, str | None]:
     for frame in frames:
         if fallback is None:
             fallback = frame
-        if not _module_of(frame).startswith(_STORE_LAYER_PREFIX):
+        if not _module_of(frame).startswith(_STORE_LAYER_PREFIXES):
             outer = next(frames, None)
             return _describe(frame), None if outer is None else _describe(outer)
     if fallback is None:

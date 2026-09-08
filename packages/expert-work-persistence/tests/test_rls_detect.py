@@ -171,9 +171,9 @@ def test_fallback_when_every_frame_is_store_layer_never_names_rls_itself(
     """If nothing outside the store layer is on the stack, the innermost
     non-transport frame is reported — and that must still never be
     ``rls.py``'s own emit helper (which is also under the store prefix)."""
-    # Widen the store prefix to match every module (this one, pytest's own
+    # Widen the store prefixes to match every module (this one, pytest's own
     # frames, everything), so the fallback path is what gets exercised.
-    monkeypatch.setattr(rls, "_STORE_LAYER_PREFIX", "")
+    monkeypatch.setattr(rls, "_STORE_LAYER_PREFIXES", ("",))
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
         _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
