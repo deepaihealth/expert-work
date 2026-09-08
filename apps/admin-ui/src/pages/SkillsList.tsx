@@ -52,7 +52,7 @@ import { tenantSkillApi } from "../api/skillApi";
 import { useAuth } from "../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
-import { TABLE_PAGE_SIZE, TABLE_PAGINATION } from "../utils/pagination";
+import { MAX_CURSOR_PAGES, TABLE_PAGE_SIZE, TABLE_PAGINATION } from "../utils/pagination";
 import { PageHeader } from "../components/PageHeader";
 import { SkillEvolutionKillSwitch } from "../components/SkillEvolutionKillSwitch";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
@@ -108,6 +108,9 @@ export function SkillsList() {
   // the table. Server-side name-shadowing already de-dupes against the
   // tenant's own skills.
   const [platformItems, setPlatformItems] = useState<SkillRecord[]>([]);
+  // The platform walk stopped at its page cap with a cursor still in hand
+  // → the platform half is incomplete and the user must be told (B-29 kin).
+  const [platformTruncated, setPlatformTruncated] = useState(false);
   const [statusFilter, setStatusFilter] = useState<SkillStatus | undefined>(undefined);
   const [visibilityFilter, setVisibilityFilter] = useState<SkillVisibility | undefined>(undefined);
   const [categoryFilter, setCategoryFilter] = useState("");
@@ -137,7 +140,7 @@ export function SkillsList() {
       // carry a 1-row tenant stub that is discarded.
       let platformRows = [...(result.platform_items ?? [])];
       let platformCursor = result.platform_next_cursor ?? null;
-      for (let i = 0; platformCursor !== null && i < 20; i += 1) {
+      for (let i = 0; platformCursor !== null && i < MAX_CURSOR_PAGES; i += 1) {
         const page = await listSkills({
           tenantScope: apiTenantScope,
           platformCursor,
@@ -149,6 +152,7 @@ export function SkillsList() {
       setData(result);
       setAccumulated(result.items);
       setPlatformItems(platformRows);
+      setPlatformTruncated(platformCursor !== null);
     } catch (err) {
       const msg =
         err instanceof ApiError
@@ -517,6 +521,9 @@ export function SkillsList() {
 
       {error !== null && (
         <Alert type="error" showIcon message={t("skills.failed_to_load")} description={error} style={{ marginBottom: 12 }} data-testid="skills-error" />
+      )}
+      {platformTruncated && (
+        <Alert type="warning" showIcon message={t("skills.platform_truncated")} style={{ marginBottom: 12 }} data-testid="skills-platform-truncated" />
       )}
 
       <Table<SkillRecord>
