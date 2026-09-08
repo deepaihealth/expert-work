@@ -110,6 +110,7 @@ async def test_two_limiters_share_one_bucket_and_wait_for_real_refill(
 ) -> None:
     """rpm=3 over 1 s: A,B,A pass instantly; the 4th waits ~333 ms on the
     shared bucket, then goes through."""
+
     def _replica() -> RedisRpmLimiter:
         return RedisRpmLimiter(
             redis_client=redis_client,
