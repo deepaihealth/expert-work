@@ -244,6 +244,19 @@ async def test_list_rolls_up_runs_and_tokens(
     assert convo["tokens"]["output_tokens"] == 30
     assert convo["tokens"]["total_tokens"] == 180
     assert convo["tokens"]["llm_calls"] == 2
+    # B-42 —— 跨 run 合并后的分桶:两条 run 同一模型 → 一桶,和 == 总量。
+    assert convo["tokens"]["usage_by_model"] == [
+        {
+            "provider": None,
+            "model": "claude-sonnet-4-5",
+            "input_tokens": 150,
+            "output_tokens": 30,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "total_tokens": 180,
+            "llm_calls": 2,
+        }
+    ]
 
 
 @pytest.mark.asyncio

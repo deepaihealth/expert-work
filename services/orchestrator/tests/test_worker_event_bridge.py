@@ -255,3 +255,90 @@ async def test_sink_failure_does_not_swallow_cancel_reraise() -> None:
             trajectory_recorder=None,
             trajectory_metadata={},
         )
+
+
+# ---------------------------------------------------------------------------
+# B-42 —— end 帧的 usage_by_model:按子代自己的 (provider, model) 记账
+# ---------------------------------------------------------------------------
+
+
+def _usage_msg(text: str, *, inp: int, out: int, cache_read: int = 0) -> AIMessage:
+    return AIMessage(
+        content=text,
+        usage_metadata={
+            "input_tokens": inp,
+            "output_tokens": out,
+            "total_tokens": inp + out,
+            "input_token_details": {"cache_read": cache_read, "cache_creation": 0},
+            "output_token_details": {"reasoning": 0},
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_frame_buckets_usage_under_the_childs_own_model() -> None:
+    """worker 的 token 记在 worker **自己**的 (provider, model) 名下。
+
+    父侧只知道主 Agent 的模型;``dynamic_workers.model`` 换过模型的 worker
+    烧的 token 若不带模型名回传,前端只能按主 Agent 的费率算 —— 错价。
+    桶的和必须等于 ``usage`` 总量:两个字段说的是同一笔账。
+    """
+    msgs = [
+        _usage_msg("a", inp=100, out=10, cache_read=40),
+        AIMessage(content="no usage reported"),
+        _usage_msg("b", inp=200, out=20, cache_read=60),
+    ]
+    graph = _StreamingGraph(updates=[], final={"messages": msgs, "step_count": 2})
+    child = BuiltAgent(
+        graph=graph,  # type: ignore[arg-type]
+        system_prompt="p",
+        max_steps=5,
+        model_provider="zhipu",
+        model_name="glm-5.3",
+    )
+    frames: list[dict[str, Any]] = []
+    await run_child_to_result(
+        child=child,
+        task="t",
+        ctx=_collecting_ctx(frames),
+        child_depth=1,
+        label="spawn_worker",
+        agent_ref="dynamic:general",
+        trajectory_recorder=None,
+        trajectory_metadata={},
+    )
+    end = frames[-1]
+    assert end["kind"] == "end"
+    usage = end["data"]["usage"]
+    buckets = end["data"]["usage_by_model"]
+    assert [(b["provider"], b["model"]) for b in buckets] == [("zhipu", "glm-5.3")]
+    expected = {"input_tokens": 300, "output_tokens": 30, "total_tokens": 330}
+    # 桶的和 == 总量,逐字段。
+    for key, want in expected.items():
+        assert sum(b[key] for b in buckets) == usage[key] == want, key
+    assert sum(b["input_token_details"]["cache_read"] for b in buckets) == 100
+    assert usage["input_token_details"]["cache_read"] == 100
+
+
+@pytest.mark.asyncio
+async def test_end_frame_omits_usage_by_model_when_child_model_unknown() -> None:
+    """模型未知(老构造路径 / 测试桩)→ 只有 ``usage``,没有 ``usage_by_model``。
+    消费者据此退回老算法;绝不编一个空桶列表让「未知」变成「零成本」。"""
+    graph = _StreamingGraph(
+        updates=[], final={"messages": [_usage_msg("a", inp=1, out=1)], "step_count": 1}
+    )
+    frames: list[dict[str, Any]] = []
+    await run_child_to_result(
+        child=_built(graph),
+        task="t",
+        ctx=_collecting_ctx(frames),
+        child_depth=1,
+        label="spawn_worker",
+        agent_ref="dynamic:general",
+        trajectory_recorder=None,
+        trajectory_metadata={},
+    )
+    end = frames[-1]
+    assert end["kind"] == "end"
+    assert "usage" in end["data"]
+    assert "usage_by_model" not in end["data"]

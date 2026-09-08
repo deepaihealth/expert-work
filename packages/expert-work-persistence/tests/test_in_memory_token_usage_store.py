@@ -434,3 +434,136 @@ async def test_usage_kind_defaults_and_round_trips(store: InMemoryTokenUsageStor
     assert evo.usage_kind == "skill_evolution"
     kinds = {r.usage_kind for r in await store.list_for_tenant(tenant_id=tenant)}
     assert kinds == {"conversation", "skill_evolution"}
+
+
+# ---------------------------------------------------------------------------
+# B-42 —— totals_by_trace_ids 按 (provider, model) 分桶:主 Agent 模型 A 与
+# worker 模型 B 同一 trace,桶的和 == 总量
+# ---------------------------------------------------------------------------
+
+
+async def _priced_usage(
+    store: InMemoryTokenUsageStore,
+    *,
+    tenant_id: UUID,
+    trace_id: str,
+    provider: str | None,
+    model: str,
+    agent_name: str,
+    inp: int,
+    out: int,
+    cache_creation: int = 0,
+    cache_read: int = 0,
+) -> None:
+    await store.insert(
+        TokenUsageRecord(
+            tenant_id=tenant_id,
+            agent_name=agent_name,
+            agent_version="1.0.0",
+            model=model,
+            provider=provider,
+            trace_id=trace_id,
+            input_tokens=inp,
+            output_tokens=out,
+            cache_creation_tokens=cache_creation,
+            cache_read_tokens=cache_read,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_totals_bucket_by_provider_and_model_and_sum_to_totals(
+    store: InMemoryTokenUsageStore,
+) -> None:
+    """同一 run 里主 Agent 用模型 A、worker 用模型 B(``dynamic_workers.model``),
+    两者的行共享一个 trace_id。总量字段照旧;``by_model`` 把它拆成两桶,
+    每桶带自己的 (provider, model),各字段之和等于总量 —— 前端据此按各自
+    费率计价,而不是整轮乘主 Agent 那张卡。"""
+    tenant = uuid4()
+    await _priced_usage(
+        store,
+        tenant_id=tenant,
+        trace_id="run-1",
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        agent_name="bot",
+        inp=100,
+        out=10,
+        cache_read=40,
+    )
+    await _priced_usage(
+        store,
+        tenant_id=tenant,
+        trace_id="run-1",
+        provider="zhipu",
+        model="glm-5.3",
+        agent_name="bot-worker",
+        inp=3_000,
+        out=300,
+        cache_creation=7,
+        cache_read=900,
+    )
+    await _priced_usage(
+        store,
+        tenant_id=tenant,
+        trace_id="run-1",
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        agent_name="bot",
+        inp=50,
+        out=5,
+    )
+
+    totals = (await store.totals_by_trace_ids(["run-1"]))["run-1"]
+    assert totals.input_tokens == 3_150
+    assert totals.output_tokens == 315
+    assert totals.llm_calls == 3
+    assert totals.models == ("claude-sonnet-4-6", "glm-5.3")
+
+    buckets = totals.by_model
+    assert [(b.provider, b.model) for b in buckets] == [
+        ("anthropic", "claude-sonnet-4-6"),
+        ("zhipu", "glm-5.3"),
+    ]
+    main, worker = buckets
+    assert (main.input_tokens, main.output_tokens, main.cache_read_tokens, main.llm_calls) == (
+        150,
+        15,
+        40,
+        2,
+    )
+    assert (
+        worker.input_tokens,
+        worker.output_tokens,
+        worker.cache_creation_tokens,
+        worker.cache_read_tokens,
+        worker.llm_calls,
+    ) == (3_000, 300, 7, 900, 1)
+    # 桶的和 == 总量,逐字段。
+    for field in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_tokens",
+        "cache_read_tokens",
+        "llm_calls",
+    ):
+        assert sum(getattr(b, field) for b in buckets) == getattr(totals, field), field
+    assert sum(b.total_tokens for b in buckets) == totals.total_tokens
+
+
+@pytest.mark.asyncio
+async def test_totals_bucket_keeps_legacy_null_provider_as_its_own_bucket(
+    store: InMemoryTokenUsageStore,
+) -> None:
+    """provider 列是 Y-3 追加的可空列:老行 NULL。NULL 不和任何 provider 合桶
+    (同名模型在两家 provider 下价钱可以不同),自成一桶且 provider 为 None,
+    让消费者决定怎么兜底,而不是这里替它猜。"""
+    tenant = uuid4()
+    await _priced_usage(
+        store, tenant_id=tenant, trace_id="t", provider=None, model="m", agent_name="a", inp=1, out=1
+    )
+    await _priced_usage(
+        store, tenant_id=tenant, trace_id="t", provider="p", model="m", agent_name="a", inp=2, out=2
+    )
+    buckets = (await store.totals_by_trace_ids(["t"]))["t"].by_model
+    assert [(b.provider, b.model, b.input_tokens) for b in buckets] == [(None, "m", 1), ("p", "m", 2)]

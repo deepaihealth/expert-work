@@ -124,3 +124,52 @@ async def test_list_window_all_tenants_crosses_tenants(usage_store: SqlStoreFixt
         assert await store.list_window_all_tenants(start=wide_end, end=wide_end) == []
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_totals_by_trace_ids_buckets_by_provider_and_model(
+    usage_store: SqlStoreFixture,
+) -> None:
+    """B-42 —— SQL 版与内存版同义:同一 trace 下主 Agent 模型 A + worker 模型 B
+    分成两桶,桶的和 == 总量;总量字段与 ``models`` 照旧。"""
+    store, engine = usage_store
+    try:
+        tenant = uuid4()
+        trace = f"trace-{uuid4().hex}"
+
+        def _row(
+            provider: str | None, model: str, inp: int, out: int, cache_read: int = 0
+        ) -> TokenUsageRecord:
+            return TokenUsageRecord(
+                tenant_id=tenant,
+                agent_name="agent",
+                agent_version="v1",
+                model=model,
+                provider=provider,
+                trace_id=trace,
+                input_tokens=inp,
+                output_tokens=out,
+                cache_read_tokens=cache_read,
+            )
+
+        await store.insert(_row("anthropic", "claude-sonnet-4-6", 100, 10, cache_read=40))
+        await store.insert(_row("zhipu", "glm-5.3", 3_000, 300, cache_read=900))
+        await store.insert(_row("anthropic", "claude-sonnet-4-6", 50, 5))
+        await store.insert(_row(None, "glm-5.3", 7, 7))  # legacy NULL provider → own bucket
+
+        totals = (await store.totals_by_trace_ids([trace]))[trace]
+        assert totals.input_tokens == 3_157
+        assert totals.output_tokens == 322
+        assert totals.cache_read_tokens == 940
+        assert totals.llm_calls == 4
+        assert totals.models == ("claude-sonnet-4-6", "glm-5.3")
+
+        assert [(b.provider, b.model, b.llm_calls) for b in totals.by_model] == [
+            (None, "glm-5.3", 1),
+            ("anthropic", "claude-sonnet-4-6", 2),
+            ("zhipu", "glm-5.3", 1),
+        ]
+        for field in ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens"):
+            assert sum(getattr(b, field) for b in totals.by_model) == getattr(totals, field), field
+    finally:
+        await engine.dispose()

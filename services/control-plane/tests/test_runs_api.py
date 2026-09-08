@@ -914,6 +914,90 @@ async def test_get_run_includes_token_summary(runs_client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_run_tokens_buckets_main_and_worker_by_model(runs_client: AsyncClient) -> None:
+    """B-42 —— ``tokens.usage_by_model``:主 Agent 模型 A 与 worker 模型 B 各一桶。
+
+    worker 的行以 ``{agent}-worker`` 记在同一 trace 下;总量字段照旧,分桶
+    让前端能按各自的费率卡计价,而不是整轮乘主 Agent 那张。桶的和 == 总量。
+    """
+    from datetime import UTC, datetime
+
+    from expert_work.persistence.token_usage_store import TokenUsageRecord
+    from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = uuid4()
+    trace = "b42b42b42b42b42b42b42b42b42b42b4"
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    await app.state.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=DEFAULT_DEV_TENANT_ID,
+            thread_id=UUID(thread_id),
+            user_id=None,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+            trace_id=trace,
+        )
+    )
+    rows = (
+        ("code-reviewer", "anthropic", "claude-sonnet-4-6", 100, 40, 30),
+        ("code-reviewer-worker", "zhipu", "glm-5.3", 3_000, 300, 900),
+        ("code-reviewer", "anthropic", "claude-sonnet-4-6", 50, 10, 0),
+    )
+    for agent, provider, model, inp, out, cache_read in rows:
+        await app.state.token_usage_store.insert(
+            TokenUsageRecord(
+                tenant_id=DEFAULT_DEV_TENANT_ID,
+                agent_name=agent,
+                agent_version="1.0.0",
+                model=model,
+                provider=provider,
+                trace_id=trace,
+                input_tokens=inp,
+                output_tokens=out,
+                cache_read_tokens=cache_read,
+            )
+        )
+
+    resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")
+    assert resp.status_code == 200
+    tokens = resp.json()["tokens"]
+    assert tokens["input_tokens"] == 3_150
+    assert tokens["models"] == ["claude-sonnet-4-6", "glm-5.3"]
+    assert tokens["usage_by_model"] == [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "input_tokens": 150,
+            "output_tokens": 50,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 30,
+            "total_tokens": 200,
+            "llm_calls": 2,
+        },
+        {
+            "provider": "zhipu",
+            "model": "glm-5.3",
+            "input_tokens": 3_000,
+            "output_tokens": 300,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 900,
+            "total_tokens": 3_300,
+            "llm_calls": 1,
+        },
+    ]
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens", "total_tokens", "llm_calls"):
+        assert sum(b[key] for b in tokens["usage_by_model"]) == tokens[key], key
+
+
+@pytest.mark.asyncio
 async def test_list_runs_enriches_tokens_and_filters_by_q(runs_client: AsyncClient) -> None:
     """GET /v1/runs carries per-run token totals; ``q`` filters by id fragment."""
     from datetime import UTC, datetime
@@ -1643,6 +1727,18 @@ async def test_thread_runs_carry_per_run_tokens(runs_client: AsyncClient) -> Non
         "total_tokens": 150,
         "llm_calls": 1,
         "models": ["claude-sonnet-4-6"],
+        "usage_by_model": [
+            {
+                "provider": None,
+                "model": "claude-sonnet-4-6",
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 150,
+                "llm_calls": 1,
+            }
+        ],
     }
     assert runs[1]["tokens"] is None
 
