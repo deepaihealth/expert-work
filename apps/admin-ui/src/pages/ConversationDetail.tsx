@@ -697,7 +697,7 @@ export function ConversationDetail() {
                     streamTurnKey={null}
                     liveByStep={EMPTY_LIVE_BY_STEP}
                     registerHistoryRow={registerHistoryRow}
-                    rate={null}
+                    rateBook={null}
                     isSystemAdmin={isSystemAdmin}
                     readOnly
                     allowDecide={canOperate}

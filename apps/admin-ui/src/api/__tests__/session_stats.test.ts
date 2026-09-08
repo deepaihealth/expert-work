@@ -47,8 +47,7 @@ describe("computeSessionStats", () => {
     expect(s).toMatchObject({ turns: 2, steps: 0, inputTokens: 400, outputTokens: 40, cacheHitPct: 50, partial: true });
   });
   it("prices with the rate card exactly like TurnCard.costCny (non-cached input + cache read + output)", () => {
-    const rate = { input_per_mtok_micros: 3_000_000, cache_read_per_mtok_micros: 300_000, output_per_mtok_micros: 15_000_000 } as never;
-    const s = computeSessionStats([live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 })])], rate);
+    const s = computeSessionStats([live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 })])], AGENT_ONLY);
     // (600k*3e6 + 400k*3e5 + 100k*1.5e7)/1e12 = 1.8 + 0.12 + 1.5
     expect(s.costCny).toBeCloseTo(3.42, 6);
   });
@@ -68,10 +67,9 @@ describe("computeSessionStats", () => {
     expect(s.cacheHitPct).toBe(67);
   });
   it("clamps costCny's non-cached-input term at 0 when cache_read exceeds input (TurnCard.tsx's Math.max(0, …))", () => {
-    const rate = { input_per_mtok_micros: 3_000_000, cache_read_per_mtok_micros: 300_000, output_per_mtok_micros: 15_000_000 } as never;
     // input=100, cacheRead=900 (unrealistic but exercises the clamp): an
     // unclamped (input − cacheRead) would go negative and under-price.
-    const s = computeSessionStats([live([aiStep(1, 1, { in: 100, out: 0, cacheRead: 900 })])], rate);
+    const s = computeSessionStats([live([aiStep(1, 1, { in: 100, out: 0, cacheRead: 900 })])], AGENT_ONLY);
     // (max(0,100-900)*3e6 + 900*3e5 + 0)/1e12 = (0 + 2.7e8)/1e12
     expect(s.costCny).toBeCloseTo(0.00027, 10);
   });

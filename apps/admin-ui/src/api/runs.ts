@@ -62,6 +62,19 @@ export interface PendingApproval {
  *  ``token_usage`` (G.9), joined to the run by ``trace_id``. ``null``
  *  when the run has no trace_id / no recorded usage (legacy or
  *  auto-triggered runs). Deep per-span traces stay in Langfuse. */
+/** One ``(provider, model)`` slice of a run's ``tokens`` (B-42). ``provider``
+ *  is ``null`` for rows recorded before the column existed. */
+export interface RunTokensBucket {
+  provider: string | null;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+  llm_calls: number;
+}
+
 export interface RunTokens {
   input_tokens: number;
   output_tokens: number;
@@ -70,6 +83,9 @@ export interface RunTokens {
   total_tokens: number;
   llm_calls: number;
   models: string[];
+  /** The counters above split by ``(provider, model)``; the buckets sum to
+   *  them. Absent on a backend older than B-42. */
+  usage_by_model?: RunTokensBucket[];
 }
 
 export interface RunDetail {

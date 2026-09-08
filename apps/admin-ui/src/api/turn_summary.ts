@@ -28,6 +28,19 @@ export interface StepUsage {
   usage: TurnUsage;
 }
 
+/** One ``(provider, model)`` slice of a turn's usage — B-42.
+ *
+ *  ``provider`` / ``model`` are ``null`` for usage nothing attributed: the
+ *  main line (priced at the agent's own model, as before) and a worker end
+ *  frame that carries ``usage`` but no ``usage_by_model`` (older backend).
+ *  ``api/cost.ts`` prices attributed buckets at their own card and
+ *  unattributed ones at the agent's. */
+export interface UsageBucket {
+  provider: string | null;
+  model: string | null;
+  usage: TurnUsage;
+}
+
 export type SegmentChannel = "commentary" | "final";
 
 export interface AnswerSegment {
@@ -49,6 +62,11 @@ export interface TurnSummary {
   reasoning: string[];
   /** Token usage summed across the turn's AI messages (null if none reported). */
   usage: TurnUsage | null;
+  /** The same usage split by ``(provider, model)`` — the buckets sum to
+   *  ``usage``; ``[]`` when ``usage`` is null. Worker end frames contribute
+   *  their ``usage_by_model`` entries (B-42); everything else lands in one
+   *  unattributed bucket. */
+  usageByModel: UsageBucket[];
   /** Highest ``step_count`` seen across the turn's node updates (null if none). */
   stepCount: number | null;
   /** Wall-clock from the turn's first frame to its last, in ms (null if <2 frames). */
@@ -117,6 +135,34 @@ function workerEndUsageOf(data: unknown): Record<string, unknown> | null {
   return um !== null && typeof um === "object" ? (um as Record<string, unknown>) : null;
 }
 
+/** A ``worker`` end frame's ``usage_by_model`` entries (B-42), or ``null``
+ *  when the frame has none / the list is empty — the caller then files the
+ *  frame's ``usage`` as unattributed. Each entry is ``usage``-shaped plus
+ *  ``provider`` / ``model``; an entry missing either string is unattributed
+ *  too (a legacy NULL provider must not borrow another card). */
+function workerEndBucketsOf(
+  data: unknown,
+): Array<{ provider: string | null; model: string | null; um: Record<string, unknown> }> | null {
+  if (data === null || typeof data !== "object") return null;
+  const inner = (data as Record<string, unknown>).data;
+  if (inner === null || typeof inner !== "object") return null;
+  const raw = (inner as Record<string, unknown>).usage_by_model;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const out: Array<{ provider: string | null; model: string | null; um: Record<string, unknown> }> =
+    [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const attributed = typeof e.provider === "string" && typeof e.model === "string";
+    out.push({
+      provider: attributed ? (e.provider as string) : null,
+      model: attributed ? (e.model as string) : null,
+      um: e,
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
 function addUsage(target: TurnUsage, delta: TurnUsage): void {
   target.inputTokens += delta.inputTokens;
   target.outputTokens += delta.outputTokens;
@@ -124,6 +170,34 @@ function addUsage(target: TurnUsage, delta: TurnUsage): void {
   target.cacheReadTokens += delta.cacheReadTokens;
   target.cacheCreationTokens += delta.cacheCreationTokens;
   target.reasoningTokens += delta.reasoningTokens;
+}
+
+function emptyUsage(): TurnUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    reasoningTokens: 0,
+  };
+}
+
+/** Fold ``delta`` into the bucket keyed ``(provider, model)``, creating it on
+ *  first sight. Insertion order is kept (main line first, then workers as
+ *  their end frames arrive). */
+function addToBucket(
+  buckets: UsageBucket[],
+  provider: string | null,
+  model: string | null,
+  delta: TurnUsage,
+): void {
+  let bucket = buckets.find((b) => b.provider === provider && b.model === model);
+  if (bucket === undefined) {
+    bucket = { provider, model, usage: emptyUsage() };
+    buckets.push(bucket);
+  }
+  addUsage(bucket.usage, delta);
 }
 
 /** Distill a turn's frames into answer + reasoning + usage. */
@@ -135,14 +209,8 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
   let finishReason: string | null = null;
   let modelName: string | null = null;
   const perStepUsage: StepUsage[] = [];
-  const usage: TurnUsage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    totalTokens: 0,
-    cacheReadTokens: 0,
-    cacheCreationTokens: 0,
-    reasoningTokens: 0,
-  };
+  const usage: TurnUsage = emptyUsage();
+  const usageByModel: UsageBucket[] = [];
 
   for (const evt of events) {
     // 委派出去的那部分账:worker 的 LLM 调用不产生父的 ``updates`` 帧,
@@ -158,6 +226,16 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
       if (um !== null) {
         reported = true;
         addUsage(usage, usageFromMetadata(um));
+        // B-42 — file the same tokens under the worker's own (provider, model)
+        // so they can be priced at the worker's card; a frame without the
+        // split (older backend / model unknown) files as unattributed → the
+        // agent's card, i.e. today's algorithm.
+        const buckets = workerEndBucketsOf(evt.data);
+        if (buckets !== null) {
+          for (const b of buckets) addToBucket(usageByModel, b.provider, b.model, usageFromMetadata(b.um));
+        } else {
+          addToBucket(usageByModel, null, null, usageFromMetadata(um));
+        }
       }
       continue;
     }
@@ -212,12 +290,10 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
       if (um !== null && typeof um === "object") {
         reported = true;
         const su = usageFromMetadata(um as Record<string, unknown>);
-        usage.inputTokens += su.inputTokens;
-        usage.outputTokens += su.outputTokens;
-        usage.totalTokens += su.totalTokens;
-        usage.cacheReadTokens += su.cacheReadTokens;
-        usage.cacheCreationTokens += su.cacheCreationTokens;
-        usage.reasoningTokens += su.reasoningTokens;
+        addUsage(usage, su);
+        // Main-line usage is the agent's own model — unattributed here, priced
+        // at the agent's card by ``api/cost.ts`` (unchanged from before B-42).
+        addToBucket(usageByModel, null, null, su);
       }
     }
   }
@@ -261,6 +337,7 @@ export function summarizeTurn(events: readonly SseEvent[]): TurnSummary {
     segments,
     reasoning,
     usage: reported ? usage : null,
+    usageByModel,
     stepCount,
     latencyMs,
     finishReason,

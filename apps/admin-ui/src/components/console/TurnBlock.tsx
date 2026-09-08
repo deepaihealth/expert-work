@@ -16,8 +16,8 @@
 import { useCallback, useMemo, useState, type JSX } from "react";
 
 import type { ApprovalItem } from "../../api/approvals";
+import { costCnyOfBuckets, type RateBook } from "../../api/cost";
 import type { ThreadPlan } from "../../api/plan";
-import type { RateCardRecord } from "../../api/rate_card";
 import type { FireNowResult } from "../../api/triggers";
 import { compactRowsOf } from "../../api/trajectory_rows";
 import { summarizeTurn } from "../../api/turn_summary";
@@ -54,7 +54,9 @@ export interface TurnBlockProps {
   /** BUG-13(修订)— 本轮产出的计划快照。省略 → 不渲染轮内计划卡
    *  (`runHrefOf` 同款 opt-in:调试台不传,零变化)。 */
   plan?: ThreadPlan | null;
-  rate: RateCardRecord | null;
+  /** #4 cost — rate cards keyed by (provider, model) (B-42); ``null`` hides
+   *  the cost (non-admin, or the conversation page which never prices). */
+  rateBook: RateBook | null;
   isSystemAdmin: boolean;
   readOnly: boolean;
   /** D-6 — let the approval gate render (and decide) even on a read-only
@@ -79,24 +81,6 @@ export interface TurnBlockProps {
   /** PR-B Task 3 — ConversationDetail 脚注「查看运行」深链;透传给
    *  ``TurnFooter``。Omitted → 零变化(链接不渲染)。 */
   runHrefOf?: (turn: ConsoleTurn) => string | null;
-}
-
-/** #4 cost — same formula as ``TurnCard.tsx:643-653``: non-cached input +
- *  cache_read + output, each at its per-mtok rate (micro-元 per 1M tokens).
- *  null when no usage or no rate for the model. */
-function costCnyOf(
-  summary: ReturnType<typeof summarizeTurn>,
-  rate: RateCardRecord | null,
-): number | null {
-  if (!summary.usage || !rate) return null;
-  const usage = summary.usage;
-  return (
-    (Math.max(0, usage.inputTokens - usage.cacheReadTokens) *
-      rate.input_per_mtok_micros +
-      usage.cacheReadTokens * rate.cache_read_per_mtok_micros +
-      usage.outputTokens * rate.output_per_mtok_micros) /
-    1e12
-  );
 }
 
 /** The highest not-yet-settled step's buffered answer content — the
@@ -126,7 +110,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     liveByStep,
     inputOrder,
     plan,
-    rate,
+    rateBook,
     readOnly,
     allowDecide = false,
     isTenantSwitched,
@@ -178,7 +162,12 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     () => liveAnswerTextOf(events, liveByStep),
     [events, liveByStep],
   );
-  const costCny = useMemo(() => costCnyOf(summary, rate), [summary, rate]);
+  // #4 cost (B-42) — each (provider, model) bucket at its own card; the same
+  // formula as before for a turn whose usage is all on the agent's model.
+  const costCny = useMemo(
+    () => costCnyOfBuckets(summary.usageByModel, rateBook),
+    [summary, rateBook],
+  );
 
   const approval = turn.turn.approval;
 

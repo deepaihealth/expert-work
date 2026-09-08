@@ -60,7 +60,7 @@ function makeBaseProps(overrides: Partial<TranscriptProps> = {}): TranscriptProp
     streamTurnKey: null,
     liveByStep: new Map(),
     registerHistoryRow: vi.fn(() => vi.fn()),
-    rate: null,
+    rateBook: null,
     isSystemAdmin: false,
     readOnly: false,
     isTenantSwitched: false,
