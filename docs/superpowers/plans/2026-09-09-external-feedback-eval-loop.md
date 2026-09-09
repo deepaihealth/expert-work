@@ -2121,7 +2121,7 @@ git commit -m "feat(curation): 候选带 feedback_run_id/comment/changed_at;stor
 **Interfaces:**
 - Consumes: `TrajectoryReader.list_keys(tenant_id=…)` / `read(key)`(`reader.py:64-99`;key 形如 `trajectories/{tenant}/{outcome}/{YYYY}/{MM}/{DD}/{thread_id}.jsonl`,`recorder.py:182-201`);`ThreadMetaStore.get(thread_id, tenant_id=)`;Task 8 的两个 store 方法;`app.state.object_store`(`app.py:1595`,注入 runtime 的测试里是 `None`,`:2471`)。
 - Produces:
-  - `TrajectoryReader.find_by_thread(*, tenant_id: UUID, thread_id: UUID) -> StoredTrajectory | None` —— 列租户前缀,取以 `/{thread_id}.jsonl` 结尾、按 key 字典序最大的那一个(`YYYY/MM/DD` 零填充,字典序 = 时间序;同一天多个 outcome 时取字典序最大者,见「最不确定」)。
+  - `TrajectoryReader.find_by_thread(*, tenant_id: UUID, thread_id: UUID) -> StoredTrajectory | None` —— 列租户前缀,取以 `/{thread_id}.jsonl` 结尾的全部 key(同一 thread 只有个位数:每个 `(outcome, 日期)` 分区至多一个),**逐个 `read()`**,按 `finished_at` 取最大,并列取 key 大的。**不能按 key 字典序取**:key 里 `outcome` 排在日期前面(`recorder.py:198-200`),`…/success/2026/09/01/x.jsonl` 字典序大于 `…/failed/2026/09/09/x.jsonl`,`max(keys)` 会挑到旧的。
   - `feedback_candidates.py`:
 
     ```python
@@ -2148,26 +2148,45 @@ git commit -m "feat(curation): 候选带 feedback_run_id/comment/changed_at;stor
 
 ```python
 @pytest.mark.asyncio
-async def test_find_by_thread_returns_newest_partition_or_none() -> None:
+async def test_find_by_thread_returns_newest_by_finished_at_not_by_key_order() -> None:
+    """旧 ``success``、新 ``failed``:key 字典序里 ``success/…`` 排在 ``failed/…`` 后面
+    (outcome 段在日期段前面),按 key 取最大会拿到旧的 —— 必须按 ``finished_at``。"""
     store = InMemoryObjectStore()
     recorder = TrajectoryRecorder(object_store=store)
     tenant, thread = uuid4(), uuid4()
     old = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
-    new = datetime(2026, 9, 3, 8, 0, tzinfo=UTC)
+    new = datetime(2026, 9, 9, 8, 0, tzinfo=UTC)
     await recorder.record(
-        TrajectoryRecord(thread_id=thread, tenant_id=tenant, outcome="failed",
+        TrajectoryRecord(thread_id=thread, tenant_id=tenant, outcome="success",
                          messages=[HumanMessage(content="a")], finished_at=old)
     )
     await recorder.record(
-        TrajectoryRecord(thread_id=thread, tenant_id=tenant, outcome="success",
+        TrajectoryRecord(thread_id=thread, tenant_id=tenant, outcome="failed",
                          messages=[HumanMessage(content="b")], run_id=uuid4(), finished_at=new)
     )
     reader = TrajectoryReader(object_store=store)
+    keys = sorted(k for k in await reader.list_keys(tenant_id=tenant) if k.endswith(f"/{thread}.jsonl"))
+    assert keys[-1].split("/")[2] == "success"  # 钉住前提:字典序最大的 key 是旧的那个
     found = await reader.find_by_thread(tenant_id=tenant, thread_id=thread)
     assert found is not None
-    assert found.outcome == "success" and found.finished_at == new
+    assert found.outcome == "failed" and found.finished_at == new
     assert await reader.find_by_thread(tenant_id=tenant, thread_id=uuid4()) is None
     assert await reader.find_by_thread(tenant_id=uuid4(), thread_id=thread) is None
+
+
+@pytest.mark.asyncio
+async def test_find_by_thread_breaks_finished_at_ties_by_key() -> None:
+    store = InMemoryObjectStore()
+    recorder = TrajectoryRecorder(object_store=store)
+    tenant, thread = uuid4(), uuid4()
+    at = datetime(2026, 9, 9, 8, 0, tzinfo=UTC)
+    for outcome in ("failed", "success"):
+        await recorder.record(
+            TrajectoryRecord(thread_id=thread, tenant_id=tenant, outcome=outcome,  # type: ignore[arg-type]
+                             messages=[HumanMessage(content=outcome)], finished_at=at)
+        )
+    found = await TrajectoryReader(object_store=store).find_by_thread(tenant_id=tenant, thread_id=thread)
+    assert found is not None and found.outcome == "success"  # 同 finished_at → key 大者(确定性)
 ```
 
 - [ ] **Step 2: 实现 `find_by_thread`**
@@ -2179,17 +2198,40 @@ async def test_find_by_thread_returns_newest_partition_or_none() -> None:
         P-2 — the synchronous 👎 → candidate path needs "is this thread's
         trajectory on disk yet" without waiting for the curation worker's
         300 s sweep. Keys are ``{prefix}/{tenant}/{outcome}/{YYYY}/{MM}/{DD}/
-        {thread}.jsonl`` with zero-padded dates, so lexical order of the
-        matching keys is time order; the lexically greatest key wins. Same
-        list-prefix call the worker already issues per sweep, scoped to one
-        tenant.
+        {thread}.jsonl`` — the OUTCOME segment comes BEFORE the date, so key
+        order is NOT time order (``…/success/2026/09/01/…`` sorts after
+        ``…/failed/2026/09/09/…``). A thread matches at most one key per
+        ``(outcome, day)`` partition, i.e. a handful, so every match is read
+        and the one with the greatest ``finished_at`` wins; ties (same
+        instant, or no ``finished_at`` on a legacy envelope) fall back to the
+        greater key so the choice is deterministic. Same list-prefix call the
+        worker already issues per sweep, scoped to one tenant.
         """
         suffix = f"/{thread_id}.jsonl"
         keys = [k for k in await self.list_keys(tenant_id=tenant_id) if k.endswith(suffix)]
-        if not keys:
-            return None
-        return await self.read(max(keys))
+        newest: StoredTrajectory | None = None
+        for key in keys:
+            stored = await self.read(key)
+            if stored is None:
+                continue
+            if newest is None or _recency(stored) > _recency(newest):
+                newest = stored
+        return newest
 ```
+
+模块级(与 `_opt_uuid` / `_opt_dt` 并列)加一个具名 key 函数,不用 lambda:
+
+```python
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _recency(stored: StoredTrajectory) -> tuple[datetime, str]:
+    """Sort key for :meth:`TrajectoryReader.find_by_thread` — ``finished_at``
+    first (legacy envelopes without one sort oldest), key string second."""
+    return (stored.finished_at or _EPOCH, stored.key)
+```
+
+(`from datetime import UTC, datetime` —— `reader.py:17` 现只 import `datetime`,补 `UTC`。)
 
 Run: `uv run --no-sync pytest services/orchestrator/tests/test_trajectory_reader.py -q` → 绿(先跑一次确认红:`AttributeError`)。
 
@@ -2513,7 +2555,7 @@ Run: `uv run --no-sync pytest services/control-plane/tests/test_feedback_candida
 
 1. **删升级逻辑**:`sync_candidate_for_feedback` 末尾的 `await deps.candidates.upgrade_to_negative(...)` 整段删掉、直接 `return "upgraded"` → `test_down_upgrades_existing_failed_outcome_candidate` 的 `rows[0].signal == "negative_feedback"` 红;改回 → 绿。
 2. `if rating == "up": if previous_rating != "down": return "noop"` 改成无条件 `mark_feedback_changed` → `test_up_never_creates_and_marks_change_only_after_a_down` 不红(标记按 run 命中不了)→ 这刀说明「👍 不建候选」的守卫是 `rating == "up"` 早返回,不是这行;改成删掉整个 `if rating == "up":` 分支让 👍 也走 👎 路径 → 同一用例第一段 `list_for_review == []` 红;改回 → 绿。
-3. `find_by_thread` 里 `max(keys)` 改 `min(keys)` → reader 用例 `found.outcome == "success"` 红;改回 → 绿。
+3. `find_by_thread` 整个循环换回 `return await self.read(max(keys))`(按 key 字典序取)→ `test_find_by_thread_returns_newest_by_finished_at_not_by_key_order` 在 `found.outcome == "failed"` 红(拿到的是旧的 `success`);改回 → 绿。再把 `_recency` 的元组第二项 `stored.key` 删掉(只剩 `finished_at`)→ `test_find_by_thread_breaks_finished_at_ties_by_key` 的结果取决于 `list_prefix` 顺序,`InMemoryObjectStore` 下会红或时红时绿;改回 → 稳定绿。
 4. 端点里把 `try/except` 去掉并让 `sync_deps.candidates` 抛错(临时在测试里 monkeypatch `upsert` raise)→ 用户那一票返回 500;恢复 → 200 且 `candidate` 仍写进审计。这一刀做完就撤,不留测试(它测的是 except 分支,`test_down_without_trajectory_or_meta_defers_and_creates_nothing` 已覆盖 deferred)。
 
 - [ ] **Step 9: lint + 提交**
@@ -3571,7 +3613,7 @@ P-1 触及(按其 spec §3-§5、§7):`agent_run` 模型 + 迁移 0153、`api/ru
 
 ## 最不确定的两处(给审阅者)
 
-1. **`TrajectoryReader.find_by_thread` 的定位方式**(Task 9):按租户前缀 `list_prefix` 再按 `/{thread_id}.jsonl` 后缀过滤、取字典序最大 key。同一天同一 thread 若同时存在 `failed/` 与 `success/` 两个分区,字典序会选 `success`(`s` > `f`)而不是时间更晚的那个;且大租户一次 👎 = 一次全租户前缀列举(与 worker 每 300s 的跨租户列举同量级,但落在请求路径上)。替代方案是在 `agent_run` 上记 `trajectory_key`(orchestrator 写 trajectory 时回填),那是跨服务改动,本计划没做。
+1. **`TrajectoryReader.find_by_thread` 的定位方式**(Task 9):按租户前缀 `list_prefix` 再按 `/{thread_id}.jsonl` 后缀过滤,匹配到的每个 key 都 `read()` 一次,按 `finished_at` 取最大(并列取 key 大的)。代价:大租户一次 👎 = 一次全租户前缀列举 + 个位数次对象读(与 worker 每 300s 的跨租户列举同量级,但落在请求路径上);同一 thread 同一时刻两个 outcome 分区并列时按 key 定胜负是为了确定性,不代表业务上哪个更「新」。替代方案是在 `agent_run` 上记 `trajectory_key`(orchestrator 写 trajectory 时回填),那是跨服务改动,本计划没做。
 2. **覆盖时 `processed_at` 不重置**(Task 2 Step 5,spec-literal):👍→👎 改票后,`FeedbackConsumerWorker`(`feedback_consumer.py:149` 只扫 `processed_at IS NULL` 的 👎)不会再为这一行打记忆 `review_flagged_at`。spec 只写了「rating/comment/item_id 全量替换」,没提 `processed_at`;若拍板要重置,改 Task 2 的 `.values(...)` / `replace(...)` 各加一行 `processed_at=None`,测试在 `_upsert_scenario` 加一条断言即可。
 
 其它待拍板(不阻塞):被取代轮(P-1)可否打分 / `:regenerate` 是否迁移旧轮的 👎(交集表 #12);`upgrade_to_negative` 对 `promoted` / `dismissed` 状态的候选同样改 signal(Task 8,spec「任何 signal」,未提 status)。
