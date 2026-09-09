@@ -90,6 +90,8 @@ _EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/v1/agents/{agent_code}/artifacts"),
         # 附件模型统一 Task 4 — 对外下载端点(external_uploads.py)。
         ("GET", "/v1/agents/{agent_code}/uploads/{upload_id}"),
+        # P-2 — 对外打分(external_feedback.py)。与 ``:cancel`` 同一路由族。
+        ("POST", "/v1/agents/{agent_code}/runs/{run_id}/feedback"),
     }
 )
 

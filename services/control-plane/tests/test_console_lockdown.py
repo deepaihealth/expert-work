@@ -279,6 +279,9 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # 附件模型统一 Task 4 — 对外下载端点(external_uploads.py),同样挂
         # ``require("session", "read")`` 而非 ``console_only()``。
         ("GET", "/v1/agents/{agent_code}/uploads/{upload_id}"),
+        # P-2 — 对外打分(external_feedback.py),挂 ``require("session", "write")``
+        # 而非 ``console_only()``。
+        ("POST", "/v1/agents/{agent_code}/runs/{run_id}/feedback"),
     }
 )
 
