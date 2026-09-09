@@ -271,6 +271,7 @@ async def test_third_party_full_chain(ctx: _Ctx) -> None:
             "channel": None,
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
         {
             "role": "assistant",
@@ -278,6 +279,7 @@ async def test_third_party_full_chain(ctx: _Ctx) -> None:
             "channel": "final",
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
     ], msgs.text
 

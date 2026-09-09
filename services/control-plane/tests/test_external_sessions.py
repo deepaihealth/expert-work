@@ -30,6 +30,7 @@ from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.feedback_store import FeedbackRecord
 from expert_work.protocol import AgentSpec
 from expert_work.protocol.multimodal import IMAGE_REF_PREFIX, ImageRef
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
@@ -115,6 +116,14 @@ class _Ctx:
         await self.app.state.agent_spec_repo.create(
             tenant_id=self.tenant_id, spec=_spec(), spec_sha256="a" * 64, created_by="seed"
         )
+
+    async def bind_session(self, user_id: str) -> UUID:
+        """Bind a session for ``user_id`` against ``support-bot`` and return its thread id."""
+        bound = await self.client.post(
+            "/v1/agents/support-bot/sessions", json={"user_id": user_id}, headers=self.headers
+        )
+        assert bound.status_code == 201, bound.text
+        return UUID(bound.json()["data"]["session_id"])
 
 
 @pytest.fixture
@@ -407,6 +416,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "channel": None,
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
         {
             "role": "assistant",
@@ -414,6 +424,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "channel": "final",
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
         {
             "role": "user",
@@ -421,6 +432,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "channel": None,
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
         {
             "role": "assistant",
@@ -428,6 +440,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "channel": "final",
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
     ]
 
@@ -445,6 +458,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "channel": "final",
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
         {
             "role": "user",
@@ -452,6 +466,7 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "channel": None,
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
     ]
 
@@ -515,6 +530,7 @@ async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
             "channel": None,
             "created_at": stamped_at.isoformat(),
             "run_id": str(run_id),
+            "feedback": None,
         },
         {
             "role": "assistant",
@@ -522,6 +538,7 @@ async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
             "channel": "final",
             "created_at": None,
             "run_id": None,
+            "feedback": None,
         },
     ]
 
@@ -853,3 +870,58 @@ async def test_archive_requires_at_least_write_scope(ctx: _Ctx) -> None:
         headers={"Authorization": f"Bearer {read_only_jwt}"},
     )
     assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_messages_echo_only_the_callers_own_feedback(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    checkpointer = InMemorySaver()
+    ctx.app.state.agent_runtime.durable_checkpointer = checkpointer
+    session_id = await ctx.bind_session("cust-77")
+    run_id = uuid4()
+    stamp = {
+        STAMP_RUN_ID: str(run_id),
+        STAMP_CREATED_AT: datetime(2026, 9, 9, tzinfo=UTC).isoformat(),
+    }
+    await _seed_thread_messages(
+        checkpointer,
+        str(session_id),
+        [
+            HumanMessage(content="hi", additional_kwargs=dict(stamp)),
+            AIMessage(content="hello", additional_kwargs=dict(stamp)),
+        ],
+    )
+    me = await ctx.app.state.tenant_user_repo.resolve(
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id="ext:cust-77"
+    )
+    store = ctx.app.state.feedback_store
+    await store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            run_id=run_id,
+            rating="up",
+            source="external",
+            actor_id=str(me.id),
+        )
+    )
+    await store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            run_id=run_id,
+            rating="down",
+            comment="nope",
+            source="external",
+            actor_id="someone-else",
+        )
+    )
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{session_id}/messages",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    msgs = resp.json()["data"]["messages"]
+    assert len(msgs) == 2
+    assert all(m["feedback"] == {"rating": "up", "comment": None, "item_id": None} for m in msgs)
