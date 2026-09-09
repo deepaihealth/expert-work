@@ -40,13 +40,22 @@
 ## 3. 数据模型
 
 迁移 `0152_feedback_run_scope`(当前最新 0151):
-- `feedback` 加列:`run_id UUID NULL`(对外与控制台新写入必填;历史行 NULL)、`source TEXT NOT NULL DEFAULT 'console'`(`console|external`)、`item_id TEXT NULL`(对接方附带的段落标签,**只存不 join**)。
+- `feedback` 加列:`run_id UUID NULL`(对外与控制台新写入必填;历史行 NULL)、`source TEXT NOT NULL DEFAULT 'console'`(`console|external`)、`item_id TEXT NULL`(对接方附带的段落标签,**只存不 join**)、`updated_at TIMESTAMPTZ NULL`(改票时间;NULL = 从没改过,见 §4.1 的覆盖语义)。
 - 部分唯一索引 `(tenant_id, run_id, actor_id) WHERE run_id IS NOT NULL` —— 「可改票」= upsert。
 - 索引 `(tenant_id, run_id)`。
 - `turn_seq` 保留不动(死字段,另议)。
 - `actor_id`:对外写入时 = 终端用户的内部 id(`lookup_external_user_id` 解析,与 `/messages` 的 `user_id` 校验同源)。
 
-`curation_candidate`(现有表)加两列:`feedback_run_id UUID NULL`、`feedback_comment TEXT NULL` —— 审阅员打开候选能直接看到「哪一轮被踩 + 用户原话」,不用翻整条 trajectory。
+`curation_candidate`(现有表)加**四列** —— 一组「候选行上的反馈快照」,让审阅员打开候选不用翻整条 trajectory 就能判断:
+
+| 列 | 类型 | 含义 | 来自 |
+|---|---|---|---|
+| `feedback_run_id` | `UUID NULL` | 哪一轮被踩 | §5 |
+| `feedback_comment` | `TEXT NULL` | 用户原话 | §5 |
+| `feedback_changed_at` | `TIMESTAMPTZ NULL` | 👎→👍 改票时间;NULL = 没改过 | §5「改票:候选行加 `feedback_changed_at`」 |
+| `feedback_source` | `TEXT NULL` | 这一踩是谁打的:`console` = 员工、`external` = 终端用户;**NULL = worker 兜底建的候选**,归因不到某一条 feedback。CHECK `feedback_source IS NULL OR feedback_source IN ('console','external')` | §6(2026-09-09 拍板)「凡是人看的地方显示来源」 |
+
+四列**同进同出,都在 `0152` 一次加完**:它们是同一形状的东西(把那条 feedback 的快照 denormalize 到候选行上),拆成多次迁移会让这组列分散在不同版本里。其中 `feedback_source` 的**消费方**在 PR4(候选行显示来源),但列本身仍由 0152 建 —— 在 PR4 合入前它是一列没人写也没人读的空列,这是预期状态。
 
 ## 4. 对外 API
 
@@ -81,12 +90,27 @@
 - `GET /v1/conversations` 加筛选 `has_down_rated`(复用 `feedback_store.py:65` `down_rated_threads`,按 `api/conversations.py:243-253` 的 `narrowed_ids` 组合)。
 - 对话详情页(`pages/ConversationDetail.tsx`)每轮脚部显示 👍/👎 与评论;Curation 候选行显示「被踩的轮 + 原话 + 是否后改票」。
 - 控制台自己的 `POST /v1/sessions/{thread_id}/feedback` 改为必带 `run_id`(`components/console/ledger.ts:204` 已有 `runId`),`source='console'`。
+- **对话详情页放开打分(2026-09-09 用户拍板,PR4)**:今天 `TurnFooter.tsx:155` 用同一个 `readOnly` 同时挡「打分」与「重跑」,而 `ConversationDetail.tsx:702` 恒传 `readOnly` → 员工在对话详情页**看得到别人的分、自己打不了**。拍板改为 **operator 及以上能打、viewer 只能看**:前端把打分从 `readOnly` 里拆出来走独立开关(重跑仍然挡住),后端 `POST /v1/sessions/{thread_id}/feedback` **自己加 operator+ 闸**(前端置灰不算闸,viewer 打分必须 403)。员工打的分与终端用户的分同表同列,只靠 `source` 区分:`source='console'` / `run_id` 照 PR1 既有语义,不新增写入通道。
+- **凡是人看的地方必须显示来源**:控制台反馈列表与轮脚展示、策展候选行,都要能一眼看出这条 👎 是员工打的还是终端用户打的 —— 审阅员不能把两者当一回事。
+- **但四个下游消费者一律不按 `source` 过滤**(§2.2 那四处):回滚闸取的是「该技能版本在时间窗内被用过的会话」再看其中哪些被踩,那里的「踩」本来就是在说这个技能跑砸了,员工说的和终端用户说的同样有效;候选池 / 记忆待复核 / 技能蒸馏证据同理 —— 专家的负反馈只会更值钱。**不要**给这四处加来源判据。
 
 ## 7. 待真跑确认(实施第一天做,结果回填本文)
 
-1. 控制台 promote 是否真 422(`CandidatesPanel.tsx:141` vs `protocol/eval_dataset.py:36`);signal 筛选下拉是否恒 422/筛空。
-2. 生产 `curation_candidate` 是否有行、`feedback` 是否有行、`turn_seq` 长什么样(实证它是 UI 局部序号)。
-3. 多副本下 `curation_worker` 是否两个 pod 都在跑(base `ENABLE_CURATION_WORKER=true` 全局,worker 自称 single-replica);同步 upsert 与 worker 的竞争靠唯一键 + 升级语义幂等,要实测。
+1. ~~控制台 promote 是否真 422(`CandidatesPanel.tsx:141` vs `protocol/eval_dataset.py:36`);signal 筛选下拉是否恒 422/筛空。~~ **✅ 已核实(09-09)**:两处都真断,回路最后一步今天走不通。
+   - promote:拿控制台原样载荷 `{"name": …, "source": "promoted_candidate"}` 真打 `POST /v1/curation/candidates/{id}/promote`(真 app + 真路由 + 真 JWT)→ **422**,`detail[0].type = "literal_error"`、`msg = "Input should be 'golden', 'trajectory' or 'regression'"`。同一候选只把 `source` 换成 `trajectory` → **201**,说明 promote 本身没坏,**唯一病因就是词表漂移**。
+   - signal 筛选:前端 `SIGNAL_OPTIONS`(`CandidatesPanel.tsx:56-62`)五个值里 `manual` / `tool_failure` / `timeout` / `policy_block` **四个全 422**,只有 `negative_feedback` 通(200,0 条)。后端真值是 `('negative_feedback', 'failed_outcome', 'positive_feedback', 'implicit_success')` —— 前端**漏掉的恰好是库里唯二真实存在的两个**(`failed_outcome` / `implicit_success`,见第 2 条),所以这个下拉今天要么 422、要么必然筛空。
+   - 第三处漂移(spec §2.3 只写了两处):`api/curation.ts:39` 声明 `feedback_rating: number | null`,线上真值是字符串 —— 实测候选行回 `'down'`。
+   - 旁证:生产与测试 `eval_dataset` **双双 0 行**,与「从来没有一条候选成功 promote 过」一致。
+2. ~~生产 `curation_candidate` 是否有行、`feedback` 是否有行、`turn_seq` 长什么样(实证它是 UI 局部序号)。~~ **✅ 已核实(09-09,生产 + 测试 pod 内只读)**:
+   - `curation_candidate`:生产 **2 行**(全 `implicit_success` / `pending`,detected 09-07~09-08);测试 **167 行**(162 `implicit_success` + 5 `failed_outcome`,全 `pending`,07-29~08-28)。**一行 `negative_feedback` 都没有** —— 池子里今天全是 worker 自动产出的隐式正例与失败例,人审入口从未被真实差评喂过。
+   - `feedback`:生产与测试**都是 0 行**,且 `pg_stat_user_tables.n_tup_ins = 0` —— **建表至今没写进过任何一行**。阳性对照(同一次读):`curation_candidate` n_tup_ins = 167、`agent_run` 597 行,连接角色 `rolbypassrls = True`,所以这不是 FORCE-RLS 把结果静默滤空。`feedback` 现有索引只有 `pkey` + 两个非唯一索引 + 一个部分索引,**确实没有任何唯一约束**(spec §2.1 成立)。
+   - `eval_dataset`:两边都 0 行。迁移头两边都是 `0151_backfill_approval_user_id`,0152 可直接续。
+   - `turn_seq`:**数据侧无从实证**(0 行,连一个样本都取不到),改由源码定判 —— `TurnFooter.tsx:157` 传 `turnSeq={turn.seq}`,`turn.seq` 即 `ConsoleTurn.seq`(`components/console/types.ts:29-30` 注释明写「0-based;history turns come first, live turns after」)= 控制台时间线的**局部下标**,`FeedbackBar.tsx:45` 原样 POST 成 `turn_seq`。而迁移 `0014_feedback.py:11` 声称它指 `event_log.seq`:`event_log` 表在生产与测试**都是 0 行**(真正在用的事件表是 `run_event`,生产 18 / 测试 10540 行),那个所指根本没有数据。结论:`turn_seq` 是 UI 局部序号无疑,死字段结论成立,**保留不动**。
+3. ~~多副本下 `curation_worker` 是否两个 pod 都在跑(base `ENABLE_CURATION_WORKER=true` 全局,worker 自称 single-replica);同步 upsert 与 worker 的竞争靠唯一键 + 升级语义幂等,要实测。~~ **✅ 已核实(09-09)**:**两个 pod 都在跑**。`curation_worker.py:3` 的「single-replica」只是一句陈旧注释,不是机制 —— 全文件 grep `advisory|lock|replica` 只命中那句话本身,**没有任何 leader 选举 / advisory lock / lease**。
+   - 配置面:`ENABLE_CURATION_WORKER=true` 只在 `infra/k8s/base/configmap.yaml:34`,两个 overlay 都没覆盖;两个生产 pod 各自在 pod 内读自己的 `Settings().enable_curation_worker` 均为 `True`(interval 300s / batch 200)。
+   - 代码面:`app.py:1389 if agent_runtime is None:` 分支内 `:1665` 构造、`:1998` 启动 —— 部署形态下**每个进程**都起一个。
+   - 运行期实证(不只看配置):测试环境按 `client_addr` 采样 `pg_stat_activity` 340s,**两个 pod 各自独立**发出了 worker 的 `curation_candidate` 预检查询 —— `172.16.176.31` 于 t=178s、`172.16.176.32` 于 t=276s,相隔 ~98s,正是两 pod 启动错峰的相位差;另一次 20s 采样还抓到 `.32` 的 `thread_meta` + `curation_candidate` 连发(一次完整 sweep)。生产侧,pod `…-sdpzg` 的 `expert_work_control_plane_curation_candidates_detected_total = 1.0`(该计数器只在 `curation_worker.py:228` 的 `run_once()` 内自增),同期 pod `…-pz5s8` 为 `0.0` —— 正是「两边都扫、谁先扫到谁建行、另一边预检跳过」的形态。
+   - 今天不炸的原因已实测坐实:生产库上 `curation_candidate_trajectory_uniq (tenant_id, trajectory_key)` 唯一索引真实存在,配 `curation/sql.py:246` 的 `on_conflict_do_nothing(constraint=…)`。**结论:Task 8 的并发集成测是必做项**;P-2 的同步 upsert 只要复用同一把唯一键 + 升级 UPDATE 幂等即可,不需要引入锁。
 4. ~~对接方在 `stream_format=legacy` 实时流里哪一帧拿到 `run_id`~~ **✅ 已核实(09-09)**:legacy 流首帧 `metadata` 就带 `run_id` + `thread_id`,`docs-site/guide/sse-events.md` 明写「保存 run_id」,对接方现有代码已在存。
 5. ~~对接方客户端对新增 `feedback` 字段是否 strict 解析~~ **✅ 已确认(09-09,用户)**:对接方无 strict,自动忽略多出的字段。
 
