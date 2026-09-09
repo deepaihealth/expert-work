@@ -21,7 +21,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 from control_plane.app import create_app
 from control_plane.aux_model_adapter import make_llm_router_aux_model
 from control_plane.quality_judge import QualityJudge
-from control_plane.runtime import DynamicResolvingReranker, make_agent_builder, resolve_defenses
+from control_plane.runtime import (
+    DynamicResolvingReranker,
+    ResolvingReranker,
+    make_agent_builder,
+    resolve_defenses,
+    resolve_reranker,
+)
 from control_plane.settings import Settings
 from control_plane.subagent_runtime import make_child_agent_builder, make_worker_build_fn
 from expert_work.common.credentials import CredentialsResolver
@@ -239,18 +245,19 @@ def _capture_router_kwargs(monkeypatch: pytest.MonkeyPatch, target: str) -> dict
     return captured
 
 
+class _FakeLLMReranker:
+    def __init__(self, *, llm_caller: Any) -> None:
+        pass
+
+    async def rerank(self, **_kw: Any) -> list[int]:
+        return [0]
+
+
 @pytest.mark.asyncio
 async def test_dynamic_reranker_llm_branch_passes_factory(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Cfg:
         async def effective_rerank_config(self) -> tuple[str, str]:
             return ("anthropic", "claude-haiku-4-5")  # chat model → LLM rerank branch
-
-    class _FakeLLMReranker:
-        def __init__(self, *, llm_caller: Any) -> None:
-            pass
-
-        async def rerank(self, **_kw: Any) -> list[int]:
-            return [0]
 
     captured = _capture_router_kwargs(monkeypatch, "control_plane.runtime.build_llm_router")
     monkeypatch.setattr("control_plane.runtime.LLMReranker", _FakeLLMReranker)
@@ -261,6 +268,29 @@ async def test_dynamic_reranker_llm_branch_passes_factory(monkeypatch: pytest.Mo
         secret_store=object(),  # type: ignore[arg-type]
         rate_limiter_factory=spy,
     )
+
+    await reranker.rerank(query="q", documents=["a"], top_k=1, tenant_id=uuid4())
+
+    assert captured["rate_limiter_factory"] is spy
+
+
+@pytest.mark.asyncio
+async def test_static_reranker_llm_branch_passes_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-44 ② — the static ``ResolvingReranker`` is only ever built by
+    ``resolve_reranker``; the factory must survive that hop and reach the
+    same ``build_llm_router`` call as its dynamic sibling."""
+    captured = _capture_router_kwargs(monkeypatch, "control_plane.runtime.build_llm_router")
+    monkeypatch.setattr("control_plane.runtime.LLMReranker", _FakeLLMReranker)
+    spy = _Spy()
+    reranker = await resolve_reranker(
+        resolver=_FakeResolver(),  # type: ignore[arg-type]
+        secret_store=object(),  # type: ignore[arg-type]
+        provider="anthropic",
+        model="claude-haiku-4-5",  # chat model → LLM rerank branch
+        supported_providers=["anthropic"],
+        rate_limiter_factory=spy,
+    )
+    assert isinstance(reranker, ResolvingReranker)
 
     await reranker.rerank(query="q", documents=["a"], top_k=1, tenant_id=uuid4())
 
