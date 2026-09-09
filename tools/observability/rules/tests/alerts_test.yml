@@ -1,12 +1,12 @@
 # promtool unit tests for alerts.yml — sandbox-egress-age-quota Task 3 fix round 1.
-# Run: promtool test rules tools/observability/rules/alerts_test.yml
+# Run: promtool test rules tools/observability/rules/tests/alerts_test.yml
 #
 # Covers ExpertWorkSandboxEgressAuthBlocked: the 407/blocked_auth sandbox-egress
 # alert fed by the control-plane's SandboxEgressMetricsWorker scan of
 # sandbox_egress_audit.
 
 rule_files:
-  - alerts.yml
+  - ../alerts.yml
 
 evaluation_interval: 1m
 

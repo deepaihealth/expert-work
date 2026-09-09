@@ -30,7 +30,7 @@ UI：<http://localhost:3001>（登录 `dev@expert_work.local` / `expert_work_lan
 
 ## 2. API key（dev 已自动预置）
 
-`langfuse-web` 用 `LANGFUSE_INIT_*` 自动建好 org `Expert Work` + project `Expert Work` +
+`langfuse-web` 用 `LANGFUSE_INIT_*` 自动建好 org `Expert Work` + project `Expert Work (dev)` +
 固定 key，无需点 UI：
 
 | 项 | dev 默认值 | 覆盖 env |
@@ -63,7 +63,7 @@ EXPERT_WORK_LANGFUSE_SECRET_KEY=sk-lf-expert-work-dev
 ## 4. 验证
 
 1. 跑一次真 agent run（需真模型 key —— CI 无凭证,只能本地/SE 验）。
-2. Langfuse UI → project `Expert Work` → Traces，应出现一条 generation，
+2. Langfuse UI → project `Expert Work (dev)` → Traces，应出现一条 generation，
    含 input messages / output / model / token usage。
 3. **PII 脱敏自检**：prompt 里故意放 `测试 alice@example.com 13812345678`，
    UI 里这两个值应显示成 `***REDACTED***`。

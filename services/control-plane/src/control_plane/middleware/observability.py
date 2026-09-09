@@ -36,6 +36,15 @@ from expert_work.common.observability import (
 
 TRACE_ID_HEADER = "X-Expert-Work-Trace-Id"
 
+#: Paths that never open a span (X-7 ④). kubelet hits the liveness/readiness
+#: probes every few seconds and Prometheus scrapes ``/metrics`` every 15s —
+#: each used to become an empty root trace, thousands a day drowning the real
+#: runs in Tempo. Exact-path match on the raw request path (the route is not
+#: resolved yet when the outermost middleware runs). The request counter /
+#: histogram still record these hits — the availability SLO in
+#: tools/observability/rules/sli.yml counts every request.
+TRACE_EXCLUDED_PATHS: frozenset[str] = frozenset({"/healthz/live", "/healthz/ready", "/metrics"})
+
 # ---------------------------------------------------------------------------
 # Metrics — registered exactly once at import time (Stream A.9 helpers handle
 # duplicate registration by raising, which is fine: each control_plane process
@@ -62,6 +71,17 @@ def _route_template(request: Request) -> str:
     return "_unmatched"
 
 
+def _record_request(request: Request, status_code: int, start: float) -> None:
+    duration = time.perf_counter() - start
+    labels = {
+        "method": request.method,
+        "route": _route_template(request),
+        "status_code": str(status_code),
+    }
+    _request_total.labels(**labels).inc()
+    _request_duration.labels(**labels).observe(duration)
+
+
 class ObservabilityMiddleware(BaseHTTPMiddleware):
     """Outermost middleware (sees raw request / final response)."""
 
@@ -73,6 +93,9 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        if request.url.path in TRACE_EXCLUDED_PATHS:
+            return await self._dispatch_untraced(request, call_next)
+
         parent_ctx = extract_context(dict(request.headers))
         ctx_token = otel_context.attach(parent_ctx)
 
@@ -106,9 +129,20 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
                     response.headers[TRACE_ID_HEADER] = trace_id_hex
                 return response
         finally:
-            duration = time.perf_counter() - start
-            route = _route_template(request)
-            labels = {"method": method, "route": route, "status_code": str(status_code)}
-            _request_total.labels(**labels).inc()
-            _request_duration.labels(**labels).observe(duration)
+            _record_request(request, status_code, start)
             otel_context.detach(ctx_token)
+
+    async def _dispatch_untraced(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """Probe / scrape path: metrics only, no span, no trace-id binding."""
+        start = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            _record_request(request, status_code, start)

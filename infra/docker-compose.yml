@@ -862,7 +862,9 @@ services:
       # control plane can point at them without clicking through the UI.
       # Override the keys in any shared environment.
       LANGFUSE_INIT_ORG_ID: expert_work
+      LANGFUSE_INIT_ORG_NAME: Expert Work
       LANGFUSE_INIT_PROJECT_ID: expert_work
+      LANGFUSE_INIT_PROJECT_NAME: Expert Work (dev)
       LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${EXPERT_WORK_LANGFUSE_PUBLIC_KEY:-pk-lf-expert-work-dev}
       LANGFUSE_INIT_PROJECT_SECRET_KEY: ${EXPERT_WORK_LANGFUSE_SECRET_KEY:-sk-lf-expert-work-dev}
       LANGFUSE_INIT_USER_EMAIL: ${EXPERT_WORK_LANGFUSE_INIT_EMAIL:-dev@expert-work.local}
