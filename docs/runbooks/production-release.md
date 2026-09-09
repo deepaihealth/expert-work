@@ -260,6 +260,17 @@ canonical-agent-e2e-test.md 是全量 SOP,以下是最小闭环):
 
 顺序:技能批量导入 → MCP 连接器 → Agent 手建(依赖前两者)。
 
+### 1.9 对接方开通:发 key 硬规矩(P-3 / P-4 · PROD-11,2026-09-09 拍板)
+
+对外接口的定位是「只给 agent run」,key 摸得到的任何租户管理面能力都是缺口不是设计语义。在 admin scope 收窄(ROADMAP P-3 / P-4 代码项,排波 5)落地前,靠流程堵:
+
+1. **只发 `write`**(已含 `read` 的全部只读能力);纯只读集成发 `read`。
+2. **永不发 `admin`**。一把 admin key 等于整个租户控制台权限,且能枚举 / 回显 / 新铸本租户其它 key —— 一把泄露 = 全租户失守。控制台创建 key 时若勾了 `admin`,当场删掉重发。
+3. key 绑**服务账号**(设置 → 服务账号,一个对接方一个),不绑任何人的账号;`expires_at` 必填(建议 ≤ 1 年),到期前一周轮换。
+4. 发放走「控制台一次性显示 → 对接方自行保存」;平台侧不落盘、不进聊天工具、不进工单。`~/.kube/expert-work-prod-params.env` 只记 **服务账号名 + key 前缀 + 到期日**,不记 key。
+5. 疑似泄露:控制台立即撤销 → 同一服务账号新铸一把 → 审计页按 `api_key_id` 查撤销前 24h 的调用(对外路由三张手工表见 `docs/superpowers/specs/2026-08-17-external-docs-style-guide.md` 引用的登记表)→ 通知对接方换 key。
+6. 对外文档 `apps/admin-ui/docs-site/guide/auth.md` §权限档位 已写明同一规则,改这里要同步改那里。
+
 ## 2. 日常发布
 
 ```sh
