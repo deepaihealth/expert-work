@@ -87,8 +87,8 @@
 1. 控制台 promote 是否真 422(`CandidatesPanel.tsx:141` vs `protocol/eval_dataset.py:36`);signal 筛选下拉是否恒 422/筛空。
 2. 生产 `curation_candidate` 是否有行、`feedback` 是否有行、`turn_seq` 长什么样(实证它是 UI 局部序号)。
 3. 多副本下 `curation_worker` 是否两个 pod 都在跑(base `ENABLE_CURATION_WORKER=true` 全局,worker 自称 single-replica);同步 upsert 与 worker 的竞争靠唯一键 + 升级语义幂等,要实测。
-4. 对接方在 `stream_format=legacy` 实时流里哪一帧拿到 `run_id`(端点按 run 的硬前提;历史侧 `external_session_items.py:481-491` 确定有)。
-5. 对接方客户端对新增 `feedback` 字段是否 strict 解析 —— 问一句,不替他们假设。
+4. ~~对接方在 `stream_format=legacy` 实时流里哪一帧拿到 `run_id`~~ **✅ 已核实(09-09)**:legacy 流首帧 `metadata` 就带 `run_id` + `thread_id`,`docs-site/guide/sse-events.md` 明写「保存 run_id」,对接方现有代码已在存。
+5. ~~对接方客户端对新增 `feedback` 字段是否 strict 解析~~ **✅ 已确认(09-09,用户)**:对接方无 strict,自动忽略多出的字段。
 
 ## 8. PR 切分与验收
 
