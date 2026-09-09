@@ -23,19 +23,20 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.artifact import ArtifactStore
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.memory import MemoryStore
+from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.workspace import UserWorkspaceStore
-from expert_work.protocol import ApprovalStatus
 from expert_work.runtime.storage import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,26 @@ logger = logging.getLogger(__name__)
 # actually matches rows intermittently returns "permission denied"
 # even when ``has_table_privilege`` confirms the GRANT. Connecting
 # directly as the worker role sidesteps the issue entirely.
+
+
+@contextmanager
+def _bypass_rls() -> Iterator[None]:
+    """B-45 —— 整个 sweep 都是跨租户扫描,显式声明 RLS bypass。
+
+    main.py 把 session factory 包进 ``build_rls_sessionmaker``,``after_begin``
+    listener 从此在本进程存在;没有 tenant 上下文又没声明 bypass 的会话会被
+    listener 记成 ``rls.would_fail_closed``(Detect 信号),将来 enforce 时会
+    直接 fail-closed 拿到 0 行。这个 job 本来就以 BYPASSRLS 角色跨租户删行,
+    所以在这里把意图写明,与 billing-rollup-job / control-plane 的各 sweep
+    同一个形状(``bypass_rls_var=True`` + ``current_tenant_id_var=None``)。
+    """
+    bypass = bypass_rls_var.set(True)
+    tenant = current_tenant_id_var.set(None)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(tenant)
+        bypass_rls_var.reset(bypass)
 
 
 @dataclass(frozen=True)
@@ -67,9 +88,6 @@ class CleanupReport:
     # Mini-ADR J-25 (J.9-step1) — artifact lifecycle counts.
     artifacts_soft_deleted: int = 0
     artifacts_hard_deleted: int = 0
-    # Mini-ADR J-24 (J.8-step3b) — approvals auto-rejected past their
-    # 24h ``timeout_at``.
-    approvals_timed_out: int = 0
     # Deletion hygiene PR1 (Task 7) — 90-day physical hard-delete sweeps.
     memory_hard_deleted: int = 0
     workspaces_hard_deleted: int = 0
@@ -98,7 +116,6 @@ class RetentionCleanupJob:
         artifact_store: ArtifactStore | None = None,
         artifact_retention_days: int = 90,
         artifact_hard_delete_grace_days: int = 60,
-        approval_store: ApprovalStore | None = None,
         memory_store: MemoryStore | None = None,
         memory_hard_delete_grace_days: int = 90,
         workspace_store: UserWorkspaceStore | None = None,
@@ -139,7 +156,6 @@ class RetentionCleanupJob:
         self._artifact_store = artifact_store
         self._artifact_retention_days = artifact_retention_days
         self._artifact_hard_delete_grace_days = artifact_hard_delete_grace_days
-        self._approval_store = approval_store
         self._memory_store = memory_store
         self._memory_grace_days = memory_hard_delete_grace_days
         self._workspace_store = workspace_store
@@ -165,22 +181,22 @@ class RetentionCleanupJob:
         keep working).
         """
         started = time.monotonic()
-        audit_deleted, audit_by_tenant = await self._delete_audit_log()
-        audit_skipped = await self._count_unacked_past_retention()
-        event_deleted = await self._delete_event_log()
-        sandbox_egress_audit_deleted = await self._delete_sandbox_egress_audit()
-        jwt_deleted = await self._delete_expired_jwt_blacklist()
-        image_rows, image_keys_ok, image_keys_failed = await self._delete_expired_images()
-        artifact_soft, artifact_hard = await self._sweep_artifacts()
-        approvals_timed_out = await self._sweep_approval_timeouts()
-        memory_hard_deleted = await self._sweep_memory()
-        tenant_users_hard_deleted = await self._sweep_tenant_users()
-        (
-            workspaces_hard_deleted,
-            workspace_archives_removed,
-            workspace_archives_failed,
-            workspaces_pending_archive,
-        ) = await self._sweep_workspaces()
+        with _bypass_rls():
+            audit_deleted, audit_by_tenant = await self._delete_audit_log()
+            audit_skipped = await self._count_unacked_past_retention()
+            event_deleted = await self._delete_event_log()
+            sandbox_egress_audit_deleted = await self._delete_sandbox_egress_audit()
+            jwt_deleted = await self._delete_expired_jwt_blacklist()
+            image_rows, image_keys_ok, image_keys_failed = await self._delete_expired_images()
+            artifact_soft, artifact_hard = await self._sweep_artifacts()
+            memory_hard_deleted = await self._sweep_memory()
+            tenant_users_hard_deleted = await self._sweep_tenant_users()
+            (
+                workspaces_hard_deleted,
+                workspace_archives_removed,
+                workspace_archives_failed,
+                workspaces_pending_archive,
+            ) = await self._sweep_workspaces()
 
         return CleanupReport(
             audit_deleted=audit_deleted,
@@ -193,7 +209,6 @@ class RetentionCleanupJob:
             image_object_keys_failed=image_keys_failed,
             artifacts_soft_deleted=artifact_soft,
             artifacts_hard_deleted=artifact_hard,
-            approvals_timed_out=approvals_timed_out,
             memory_hard_deleted=memory_hard_deleted,
             workspaces_hard_deleted=workspaces_hard_deleted,
             workspace_archives_removed=workspace_archives_removed,
@@ -203,36 +218,6 @@ class RetentionCleanupJob:
             sandbox_egress_audit_deleted=sandbox_egress_audit_deleted,
             duration_seconds=time.monotonic() - started,
         )
-
-    async def _sweep_approval_timeouts(self) -> int:
-        """Mini-ADR J-24 (J.8-step3b) — auto-reject approvals past 24h.
-
-        A run paused for human approval has a ``timeout_at`` (default
-        ``requested_at + 24h``). A pending row past that horizon is
-        auto-rejected: ``mark_decided`` flips it to ``TIMEOUT`` with
-        ``decided_by='system'``, so a later ``POST .../resume`` is
-        refused (409 already-decided) and the paused checkpoint becomes
-        logically dead — no run pins an approval slot forever.
-
-        No-op when no :class:`ApprovalStore` is wired (unit-test path /
-        deployments not running J.8).
-        """
-        if self._approval_store is None:
-            return 0
-        now = datetime.now(UTC)
-        expired = await self._approval_store.list_expired(before=now, limit=self._batch_size)
-        timed_out = 0
-        for row in expired:
-            ok = await self._approval_store.mark_decided(
-                run_id=row.run_id,
-                tenant_id=row.tenant_id,
-                status=ApprovalStatus.TIMEOUT,
-                decided_by="system",
-                decided_at=now,
-            )
-            if ok:
-                timed_out += 1
-        return timed_out
 
     async def _sweep_memory(self) -> int:
         """Deletion hygiene PR1 (Task 7) — physically remove memory rows

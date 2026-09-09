@@ -1,0 +1,87 @@
+# retention-cleanup-job —— 每日一次的留存清理(services/retention-cleanup-job)。
+#
+# 首部署(波 3 线 R PR1)。此前只有代码没有部署物:infra/k8s 零 CronJob,test /
+# prod 都没跑过(PROD-4 / runbook § 4)。上线前置两条已在同一 PR 修掉:
+#   X-15 ① —— job 里那套「直接 mark_decided(TIMEOUT)」的第二套审批超时已删,
+#            审批超时只剩 control-plane 的 ApprovalTimeoutSweep 一个内核;
+#   B-45  —— job 的 session factory 走 build_rls_sessionmaker,跨租户扫描显式
+#            声明 bypass,RLS Detect 信号在这个进程里也能出现。
+#
+# 镜像:复用 control-plane 镜像(tools/deploy/build-push.sh 只构建三个镜像,
+# 不为一个 5 模块的 job 再开一个)。job 包作为 control-plane 的依赖进镜像
+# (services/control-plane/pyproject.toml),入口 `python -m retention_cleanup_job`。
+# overlay 的 images: 变换会把这里的 :latest 钉成与 control-plane 同一个 tag ——
+# 与 control-plane / credential-proxy 同 tag、同发布,不再有「手工钉死」的第三个坑
+# (2026-09-07 credential-proxy 的教训)。
+#
+# 配置:job 的 settings 前缀是 EXPERT_WORK_RETENTION_*,extra="ignore" —— envFrom
+# 把 control-plane 的整套 configmap / secrets 挂进来,它只认里面显式映射的那条
+# DSN(下面 env:),其余键全部忽略。对象存储后端保持 job 默认的 `memory`:
+# 首部署不给它 OSS 凭据(control-plane 的 AK/SK 是 secret:// 引用,要经
+# sql_encrypted 金库解析,job 不走那条链),于是 image_upload 的 blob 回收与
+# 旧的「删归档 key」两条 pass 是 no-op —— 留存链 PR2 起,job 对 OSS 归档对象
+# **不主动删**,靠桶生命周期到期。
+#
+# 并发:concurrencyPolicy Forbid —— 上一次还没跑完就跳过这一次;每条清理规则
+# 自身幂等,重跑无副作用。多副本 control-plane 与本 job 之间没有互斥需求:
+# 各 pass 都是「按谓词删过期行」,没有共享的进行中状态。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: retention-cleanup
+  labels:
+    app.kubernetes.io/name: retention-cleanup
+spec:
+  # 每日一次。CronJob 的 schedule 按 kube-controller-manager 的时区(UTC)算,
+  # 不用 spec.timeZone(集群版本不一定认这个字段,认不出会整条 apply 失败)。
+  # 19:23 UTC = 次日 03:23 北京时间,避开业务高峰与 janitor 的整点周期。
+  schedule: "23 19 * * *"
+  concurrencyPolicy: Forbid
+  # 错过调度(controller 重启、节点抖动)一小时内补跑,再晚就等下一天。
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: retention-cleanup
+    spec:
+      # 失败重试一次就够:每个 pass 幂等,第二天还会再跑;反复重试只会把
+      # 同一个错误刷到 3 份日志里。
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 259200
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: retention-cleanup
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: retention-cleanup
+              # Overlay pins the real tag; :latest here is a build-time
+              # placeholder only (kustomize does not resolve/validate images).
+              image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:latest
+              command: ["python", "-m", "retention_cleanup_job"]
+              env:
+                # 唯一真正消费的键:与 control-plane 同一条 asyncpg DSN(直连 RDS,
+                # 没有 PgBouncer)。DB 角色同 control-plane —— job 的各 DELETE 需要
+                # 表级 DELETE 权限,audit_log 那条走 backup_acked 前置闸。
+                - name: EXPERT_WORK_RETENTION_DB_DSN
+                  valueFrom:
+                    secretKeyRef:
+                      name: control-plane-secrets
+                      key: EXPERT_WORK_DB_DSN
+                - name: EXPERT_WORK_RETENTION_LOG_LEVEL
+                  value: "INFO"
+              envFrom:
+                - configMapRef:
+                    name: control-plane-config
+                - secretRef:
+                    name: control-plane-secrets
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 1Gi

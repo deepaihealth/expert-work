@@ -1,0 +1,20 @@
+# retention-cleanup-job —— 留存清理 CronJob(波 3 线 R,PR1 首部署)。
+#
+# 刻意做成 base/ 下的一个**独立** kustomization,而不是挂进 base/kustomization.yaml
+# 的 resources:base 是 test 与 prod 共用的,而这个 job 先只在 test 跑一周观察
+# (runbook production-release.md § 4)。overlays/test/kustomization.yaml 引用
+# 本目录;overlays/prod 不引用 —— prod 什么时候接,是看过 test 一周的
+# 日志之后另开 PR 改一行 overlay 的事,不是这里的默认值。
+#
+# 同 base 的 namespace / part-of 标签:kustomize 的 namespace 与 commonLabels
+# 不会跨 kustomization 继承,所以在这里重申一遍。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: expert-work
+
+commonLabels:
+  app.kubernetes.io/part-of: expert-work
+
+resources:
+  - cronjob.yaml
