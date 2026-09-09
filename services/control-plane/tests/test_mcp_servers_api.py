@@ -1731,3 +1731,153 @@ async def test_disable_with_stale_cache_still_removes() -> None:
         assert resp.status_code == 200, resp.text
     record = await svc.store.get(tenant_id=tenant_id)
     assert record is not None and record.mcp_allowlist == []
+
+
+# ---------------------------------------------------------------------------
+# X-5 — DELETE /v1/mcp-servers/allowlist/{name}
+#
+# 目录条目被删后,租户 mcp_allowlist 里的名字成了残留:catalog-id 路径
+# (DELETE /catalog/{id}/enable)无从寻址,UI 只能「禁用 + 提示」。这条按名字
+# 直接移出,不经目录解析。语义与 catalog-id 侧一致:幂等、真变更才失效/广播/审计。
+# ---------------------------------------------------------------------------
+
+
+class _SpyBusX5:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
+
+    def publish_soon(self, event: object) -> None:
+        self.events.append(event)
+
+
+class _PoolSpyX5:
+    def __init__(self) -> None:
+        self.invalidated: list[UUID] = []
+
+    async def invalidate(self, tid: UUID) -> None:
+        self.invalidated.append(tid)
+
+
+@pytest.mark.asyncio
+async def test_remove_allowlist_name_drops_stale_entry_and_broadcasts() -> None:
+    """残留名(目录里没有)按名字移出:200 + allowlist 清空 + /available 不再列出;
+    本 pod MCP 池失效,总线收到 tenant_mcp(池/构建)与 tenant_config(60s 配置缓存)。"""
+    app, headers, tenant_id = await _make_app_with_admin()
+    await _enable_for_tenant(app, tenant_id, "ghost-server")  # never seeded in the catalog
+    bus = _SpyBusX5()
+    pool = _PoolSpyX5()
+    app.state.invalidation_bus = bus  # type: ignore[attr-defined]
+    app.state.tenant_mcp_pool_service = pool  # type: ignore[attr-defined]
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        resp = await client.delete("/v1/mcp-servers/allowlist/ghost-server", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"] == {
+            "name": "ghost-server",
+            "tenant_enabled": False,
+            "changed": True,
+        }
+        avail = await client.get("/v1/mcp-servers/available", headers=headers)
+        assert avail.status_code == 200, avail.text
+        assert [r["name"] for r in avail.json()["data"]] == []
+    record = await app.state.tenant_config_service.store.get(tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert record is not None and record.mcp_allowlist == []
+    assert pool.invalidated == [tenant_id]
+    kinds = [getattr(e, "kind", None) for e in bus.events]
+    assert "tenant_mcp" in kinds
+    assert "tenant_config" in kinds
+    assert all(getattr(e, "tenant_id", None) == str(tenant_id) for e in bus.events)
+
+
+@pytest.mark.asyncio
+async def test_remove_allowlist_name_viewer_403() -> None:
+    """非管理角色 403,且 allowlist 一字不动。"""
+    app, _headers, tenant_id = await _make_app_with_admin()
+    await _enable_for_tenant(app, tenant_id, "ghost-server")
+    viewer = await _seed_viewer_headers(app, tenant_id)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        resp = await client.delete("/v1/mcp-servers/allowlist/ghost-server", headers=viewer)
+    assert resp.status_code == 403, resp.text
+    record = await app.state.tenant_config_service.store.get(tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert record is not None and record.mcp_allowlist == ["ghost-server"]
+
+
+@pytest.mark.asyncio
+async def test_remove_allowlist_name_absent_is_idempotent_noop() -> None:
+    """名字不在 allowlist(含租户根本没有配置行)→ 200 changed=False,不失效不广播。
+
+    选幂等而不是 404:与 DELETE /catalog/{id}/enable 同语义;这是个清理动作,
+    两个管理员(或两个副本)先后点同一行,第二下不该报错;``changed`` 字段
+    保住「真删了 / 本来就没有」的差异给调用方看。"""
+    app, headers, tenant_id = await _make_app_with_admin()
+    bus = _SpyBusX5()
+    pool = _PoolSpyX5()
+    app.state.invalidation_bus = bus  # type: ignore[attr-defined]
+    app.state.tenant_mcp_pool_service = pool  # type: ignore[attr-defined]
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        # (a) tenant has no config row at all
+        r1 = await client.delete("/v1/mcp-servers/allowlist/ghost-server", headers=headers)
+        assert r1.status_code == 200, r1.text
+        assert r1.json()["data"]["changed"] is False
+        assert bus.events == []
+        # (b) configured, but the name was never (or no longer) enabled
+        await _configure_tenant(app, tenant_id)
+        events_before = list(bus.events)
+        r2 = await client.delete("/v1/mcp-servers/allowlist/ghost-server", headers=headers)
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["data"] == {
+            "name": "ghost-server",
+            "tenant_enabled": False,
+            "changed": False,
+        }
+    assert bus.events == events_before
+    assert pool.invalidated == []
+
+
+@pytest.mark.asyncio
+async def test_remove_allowlist_name_rejects_invalid_name() -> None:
+    """路径名与目录/自定义服务器同一字符集(^[a-z0-9][a-z0-9_-]{0,63}$)→ 422。"""
+    app, headers, _tenant_id = await _make_app_with_admin()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        resp = await client.delete("/v1/mcp-servers/allowlist/Ghost%20Server", headers=headers)
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_remove_allowlist_name_emits_audit() -> None:
+    """真变更写一条 mcp_catalog:disable,resource_id=名字,details 标 by_name;
+    第二次(no-op)不再写。"""
+    from control_plane.audit import build_default_audit_logger
+    from expert_work.persistence.audit_log import InMemoryAuditLogStore
+    from expert_work.protocol import AuditQuery
+
+    lifecycle = Lifecycle()
+    lifecycle.mark_ready()
+    audit_store = InMemoryAuditLogStore()
+    app = create_app(
+        settings=_build_settings(),
+        lifecycle=lifecycle,
+        jwt_verifier=build_test_jwt_verifier(),
+        audit_logger=build_default_audit_logger(audit_store),
+    )
+    tenant_id = uuid4()
+    token = make_test_jwt(tenant_id=tenant_id, subject=str(uuid4()), roles=("admin",))
+    headers = {"Authorization": f"Bearer {token}"}
+    await _enable_for_tenant(app, tenant_id, "ghost-server")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        first = await client.delete("/v1/mcp-servers/allowlist/ghost-server", headers=headers)
+        assert first.status_code == 200, first.text
+        again = await client.delete("/v1/mcp-servers/allowlist/ghost-server", headers=headers)
+        assert again.status_code == 200, again.text
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    hits = [r for r in page.entries if r.action.value == "mcp_catalog:disable"]
+    assert len(hits) == 1
+    assert hits[0].resource_id == "ghost-server"
+    assert hits[0].details == {"name": "ghost-server", "by_name": True}
