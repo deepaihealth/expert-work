@@ -267,6 +267,19 @@ async def test_cancel_run_nul_agent_code_is_422(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rate_run_nul_agent_code_is_422(ctx: _Ctx) -> None:
+    """P-2 — 对外打分挂在自己的 ``tags=["external"]`` router 上,由
+    ``test_every_external_agents_route_carries_the_nul_path_guard`` 按 tag
+    自动发现;这条是同一形状的逐端点活证,与上面十四条并列。"""
+    resp = await ctx.client.post(
+        f"/v1/agents/support{_NUL}bot/runs/{uuid4()}/feedback",
+        json={"user_id": "cust-77", "rating": "up"},
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp)
+
+
+@pytest.mark.asyncio
 async def test_decide_run_nul_agent_code_is_422(ctx: _Ctx) -> None:
     resp = await ctx.client.post(
         f"/v1/agents/support{_NUL}bot/runs/{uuid4()}:decide",
@@ -350,6 +363,16 @@ async def test_cancel_run_nul_run_id_is_422(ctx: _Ctx) -> None:
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/run{_NUL}id:cancel",
         json={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp)
+
+
+@pytest.mark.asyncio
+async def test_rate_run_nul_run_id_is_422(ctx: _Ctx) -> None:
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/run{_NUL}id/feedback",
+        json={"user_id": "cust-77", "rating": "up"},
         headers=ctx.headers,
     )
     _assert_envelope_422(resp)
