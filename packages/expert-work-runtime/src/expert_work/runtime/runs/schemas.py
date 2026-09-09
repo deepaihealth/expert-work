@@ -148,6 +148,10 @@ class RunInfo:
     #: ``None`` = 这一列上线前的历史 run,或 run 在构建成功之前就结束了
     #: (配额拒绝 / Agent 被停用 / 构建失败)。**不是**「用了空配置」。
     agent_spec_sha256: str | None = None
+    #: P-1 —— 这一轮被哪个新 run 取代;``None`` = 未被取代。
+    superseded_by_run_id: UUID | None = None
+    #: P-1 —— 这一轮是对哪个旧 run 的重新生成 / 编辑重发;``None`` = 普通轮。
+    regenerated_from_run_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)

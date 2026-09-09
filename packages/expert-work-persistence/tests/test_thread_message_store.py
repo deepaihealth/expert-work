@@ -83,3 +83,31 @@ async def test_pending_is_noop_in_memory() -> None:
     # backend owns the real selection (see base docstring).
     store = InMemoryThreadMessageStore()
     assert await store.pending_thread_ids(limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_mark_superseded_updates_only_the_seq_range() -> None:
+    store = InMemoryThreadMessageStore()
+    thread, tenant, new_run = uuid4(), uuid4(), uuid4()
+    now = datetime.now(UTC)
+    turns = [
+        MessageTurn(seq=s, role="user" if s % 2 else "assistant", content=f"m{s}")
+        for s in (1, 3, 5, 7)
+    ]
+    await store.sync_thread(thread_id=thread, tenant_id=tenant, turns=turns, synced_at=now)
+    assert (
+        await store.mark_superseded(
+            thread_id=thread, tenant_id=tenant, seq_from=3, seq_to=6, superseded_by=new_run
+        )
+        == 2
+    )
+    assert (
+        await store.mark_superseded(
+            thread_id=thread, tenant_id=uuid4(), seq_from=0, seq_to=99, superseded_by=new_run
+        )
+        == 0
+    )
+    marked = {
+        seq: turn.superseded_by for (tid, seq), (_t, turn) in store._turns.items() if tid == thread
+    }
+    assert marked == {1: None, 3: new_run, 5: new_run, 7: None}

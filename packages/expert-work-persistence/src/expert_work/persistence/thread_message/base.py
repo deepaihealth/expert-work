@@ -43,6 +43,10 @@ class MessageTurn:
     #: P2 —— 产生这条消息的 run。来自写入侧盖的 ``expert_work_run_id``。
     #: ``None`` 同上。
     run_id: UUID | None = None
+    #: P-1 —— 取代这条消息的新 run;``None`` = 未被取代。
+    superseded_by: UUID | None = None
+    #: P-1 —— 墓碑(正文已清理),此时 ``content == ""``。
+    tombstone: bool = False
 
 
 class ThreadMessageStore(abc.ABC):
@@ -64,6 +68,23 @@ class ThreadMessageStore(abc.ABC):
         never change. The watermark row is upserted (``synced_at`` +
         ``message_count``) even when ``turns`` is empty, so an empty
         conversation leaves the backfill queue.
+        """
+
+    @abc.abstractmethod
+    async def mark_superseded(
+        self,
+        *,
+        thread_id: UUID,
+        tenant_id: UUID,
+        seq_from: int,
+        seq_to: int,
+        superseded_by: UUID,
+    ) -> int:
+        """把镜像里 ``seq ∈ [seq_from, seq_to)`` 的行标成被 ``superseded_by`` 取代,返回更新行数。
+
+        镜像可能落后于检查点(sweep 还没跑到),更新 0 行不是错误 —— sweep
+        之后写入的行也拿不到标记,所以镜像的这一列只是尽力而为的搜索/审计
+        辅助,真相永远在检查点。
         """
 
     @abc.abstractmethod

@@ -33,6 +33,9 @@ class ThreadMessageRow(Base):
     tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     role: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # P-1 —— 镜像上的「已被取代」标记(值 = 新 run_id)。检查点是真相,这一列
+    # 由 supersede 显式 UPDATE 同步(DO NOTHING 学不到)。
+    superseded_by: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

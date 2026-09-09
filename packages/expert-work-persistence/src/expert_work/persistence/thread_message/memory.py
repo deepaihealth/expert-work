@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 from uuid import UUID
 
@@ -27,6 +28,23 @@ class InMemoryThreadMessageStore(ThreadMessageStore):
         for turn in turns:
             self._turns.setdefault((thread_id, turn.seq), (tenant_id, turn))
         self._sync[thread_id] = (tenant_id, synced_at, len(turns))
+
+    async def mark_superseded(
+        self,
+        *,
+        thread_id: UUID,
+        tenant_id: UUID,
+        seq_from: int,
+        seq_to: int,
+        superseded_by: UUID,
+    ) -> int:
+        updated = 0
+        for (tid, seq), (row_tenant, turn) in list(self._turns.items()):
+            if tid != thread_id or row_tenant != tenant_id or not (seq_from <= seq < seq_to):
+                continue
+            self._turns[(tid, seq)] = (row_tenant, replace(turn, superseded_by=superseded_by))
+            updated += 1
+        return updated
 
     async def search_thread_ids(
         self,

@@ -66,6 +66,9 @@ class RunRecord:
     #: create time by the caller. ``None`` for auto-triggered runs
     #: (scheduler / J.13a curation) where no caller-bound trace exists.
     trace_id: str | None = None
+    #: P-1 —— 这一轮是对哪个旧 run 的重新生成 / 编辑重发;``None`` = 普通轮。
+    #: 与 ``trace_id`` 同样是建行时写死、之后不再改的字段。
+    regenerated_from_run_id: UUID | None = None
     #: Stream SE (SE-7d-3b-ii) — distilled skill versions bound into this run's
     #: agent at build time (from ``BuiltAgent.bound_distilled_skills``). The SSE
     #: worker emits one ``skill_run_usage`` row per entry at the run's terminal
@@ -107,6 +110,7 @@ def _record_to_info(record: RunRecord) -> RunInfo:
         trace_id=record.trace_id,
         idempotency_key=record.idempotency_key,
         request_digest=record.request_digest,
+        regenerated_from_run_id=record.regenerated_from_run_id,
     )
 
 
@@ -184,6 +188,7 @@ class RunManager:
         trace_id: str | None = None,
         idempotency_key: str | None = None,
         request_digest: str | None = None,
+        regenerated_from_run_id: UUID | None = None,
     ) -> RunRecord:
         """Create + register a new run in PENDING state.
 
@@ -222,6 +227,7 @@ class RunManager:
                 trace_id=trace_id,
                 idempotency_key=idempotency_key,
                 request_digest=request_digest,
+                regenerated_from_run_id=regenerated_from_run_id,
             )
             # Mirror to the durable store before the in-memory insert —
             # a store failure then leaves no orphan registry entry.
@@ -243,6 +249,7 @@ class RunManager:
         trace_id: str | None = None,
         idempotency_key: str | None = None,
         request_digest: str | None = None,
+        regenerated_from_run_id: UUID | None = None,
     ) -> None:
         """Persist a ``QUEUED`` run for the distributed queue (Stream 9.5).
 
@@ -284,6 +291,7 @@ class RunManager:
             enqueued_input=enqueued_input,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            regenerated_from_run_id=regenerated_from_run_id,
         )
         await self._store.create(info)
         logger.info("run.enqueue id=%s thread=%s tenant=%s", run_id, thread_id, tenant_id)

@@ -107,6 +107,12 @@ class AgentRunRow(Base):
     # (配额拒绝 / Agent 被停用 / 构建失败)。都**不是**「用了空配置」。
     agent_spec_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # P-1 —— 被哪个新 run 取代 / 是哪个旧 run 的重发。无外键,理由见迁移 0153。
+    superseded_by_run_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    regenerated_from_run_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+
     __table_args__ = (
         CheckConstraint(f"status IN {_STATUS_VALUES}", name="agent_run_status_valid"),
         CheckConstraint(
