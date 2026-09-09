@@ -46,5 +46,11 @@ data:
   LANGFUSE_INIT_ORG_ID: "expert_work"
   LANGFUSE_INIT_PROJECT_ID: "expert_work"
   LANGFUSE_INIT_USER_NAME: "expert_work"
+  # Display names (X-7 ③): without these Langfuse labels the org/project
+  # "Provisioned Org" / "Provisioned Project" in the UI. The PROJECT_NAME
+  # default is generic on purpose — overlays/<env>/langfuse-configmap-patch.yaml
+  # overrides it with the environment name (e.g. "Expert Work (test)").
+  LANGFUSE_INIT_ORG_NAME: "Expert Work"
+  LANGFUSE_INIT_PROJECT_NAME: "Expert Work"
 
   TELEMETRY_ENABLED: "false"

@@ -117,11 +117,12 @@ configMapGenerator:
   - name: prometheus-config
     files:
       - observability/prometheus.yml
-  # NOTE: tools/observability/rules/burn_rate_test.yml is deliberately NOT
-  # vendored/listed — it is a promtool UNIT-TEST file (`rule_files:`/`tests:`
-  # top-level keys), and Prometheus' strict rulefmt parser exits 1 on it,
-  # crash-looping the pod (terminal-review C1). The compose stack has the
-  # same latent bug (whole-directory mount + *.yml glob) — follow-up.
+  # NOTE: the promtool UNIT-TEST files (`rule_files:`/`tests:` top-level
+  # keys) live in tools/observability/rules/tests/ and are deliberately NOT
+  # vendored/listed — Prometheus' strict rulefmt parser exits 1 on them,
+  # crash-looping the pod (terminal-review C1). The compose stack mounts the
+  # whole rules/ directory with a *.yml glob, which is why the tests sit in
+  # a subdirectory the glob does not descend into (X-7 ②).
   - name: prometheus-rules
     files:
       - observability/rules/alerts.yml

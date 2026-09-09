@@ -1,11 +1,11 @@
 # promtool unit tests for burn_rate.yml — Stream 10.5.
-# Run: promtool test rules tools/observability/rules/burn_rate_test.yml
+# Run: promtool test rules tools/observability/rules/tests/burn_rate_test.yml
 #
 # Drives synthetic control-plane request counters and asserts the recorded
 # error-budget burn rate + the multi-window alert firing logic.
 
 rule_files:
-  - burn_rate.yml
+  - ../burn_rate.yml
 
 evaluation_interval: 1m
 
