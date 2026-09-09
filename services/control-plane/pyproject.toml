@@ -17,6 +17,11 @@ dependencies = [
     # the orchestrator as a library — agent graphs execute as background
     # asyncio tasks in this process, not a separate service.
     "expert-work-orchestrator",
+    # 留存 CronJob(infra/k8s/base/retention-cleanup-job/)复用本镜像跑
+    # ``python -m retention_cleanup_job``:Dockerfile 只 ``uv sync --package``
+    # 本包,job 包不在依赖树里就进不了镜像。不另起镜像(build-push.sh 只有
+    # 三个),代价是把 job 当依赖挂在这里 —— 它本身只有 5 个模块。
+    "expert-work-retention-cleanup-job",
     # Stream B.1 — FastAPI + Pydantic v2 + uvicorn.
     # <0.137:fastapi 0.137 起 include_router 变懒挂载(app.routes 里是
     # _IncludedRouter,APIRoute 不再摊平;实测 0.136.3 摊平 / 0.137.2 起不摊),

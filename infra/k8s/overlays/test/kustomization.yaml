@@ -8,6 +8,9 @@ kind: Kustomization
 
 resources:
 - ../../base
+# 留存清理 CronJob —— 先只在 test 跑(波 3 线 R PR1);prod overlay 不引用,
+# 观察一周后另开 PR 接。见 base/retention-cleanup-job/kustomization.yaml 头注。
+- ../../base/retention-cleanup-job
 
 # Deployed image tags — updated by hand at release time (edit + commit,
 # then `kubectl apply -k`). Tag convention: `<main sha>` for

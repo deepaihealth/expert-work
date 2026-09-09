@@ -11,9 +11,10 @@ import asyncio
 import contextlib
 import logging
 
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
 from expert_work.persistence import (
     DatabaseConfig,
-    SqlApprovalStore,
     SqlArtifactStore,
     SqlImageUploadStore,
     SqlMemoryStore,
@@ -22,6 +23,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.rls import build_rls_sessionmaker
 from expert_work.runtime.storage import make_object_store
 from expert_work.runtime.storage.factory import S3CompatibleConfig
 from retention_cleanup_job.job import RetentionCleanupJob
@@ -30,12 +32,21 @@ from retention_cleanup_job.settings import RetentionCleanupSettings
 logger = logging.getLogger(__name__)
 
 
+def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    """B-45 —— 与 control-plane / billing-rollup-job 同款:session factory 必须
+    经过 ``build_rls_sessionmaker``,``after_begin`` listener 才在本进程存在。
+    此前这个 job 从不调它,RLS Detect 信号在这里根本不会出现,生产 enforce
+    之前也就没人知道它哪条路径会 fail-closed。sweep 本身在
+    :func:`retention_cleanup_job.job._bypass_rls` 里显式声明跨租户 bypass。"""
+    return build_rls_sessionmaker(create_async_session_factory(engine))
+
+
 async def _amain() -> None:
     settings = RetentionCleanupSettings()
     logging.basicConfig(level=settings.log_level)
 
     engine = create_async_engine_from_config(DatabaseConfig(dsn=settings.db_dsn))
-    session_factory = create_async_session_factory(engine)
+    session_factory = build_session_factory(engine)
 
     async with contextlib.AsyncExitStack() as stack:
         # Mini-ADR J-32 (J.6.补强-3b) — the image pass needs both a
@@ -74,13 +85,12 @@ async def _amain() -> None:
         # metadata-only (no object store / supervisor calls), so it is
         # safe to enable even on deployments without J.6 image uploads.
         artifact_store = SqlArtifactStore(session_factory)
-        # Mini-ADR J-24 (J.8-step3b) — approval-timeout sweep; also
-        # metadata-only, safe to wire unconditionally.
-        approval_store = SqlApprovalStore(session_factory)
+        # X-15 ① —— 审批超时不在这里做:control-plane 的 ``ApprovalTimeoutSweep``
+        # 是唯一内核(走 ``resolve_approval_decision``,写 checkpoint、spawn 续跑)。
 
         # Deletion hygiene PR1 (Task 7) — memory / tenant_user hard-delete
         # sweeps are metadata-only (no object store), safe to wire
-        # unconditionally like artifact_store / approval_store above. The
+        # unconditionally like artifact_store above. The
         # workspace-archive sweep is metadata-only too, but its own pass
         # still gates on ``object_store`` being wired (it deletes the
         # archive's ObjectStore key before dropping the row).
@@ -97,7 +107,6 @@ async def _amain() -> None:
             artifact_store=artifact_store,
             artifact_retention_days=settings.artifact_retention_days,
             artifact_hard_delete_grace_days=settings.artifact_hard_delete_grace_days,
-            approval_store=approval_store,
             memory_store=memory_store,
             memory_hard_delete_grace_days=settings.memory_hard_delete_grace_days,
             workspace_store=workspace_store,
@@ -111,7 +120,7 @@ async def _amain() -> None:
         logger.info(
             "retention_cleanup_job.done audit=%d audit_skipped_unacked=%d "
             "event=%d jwt=%d image_rows=%d image_keys_ok=%d image_keys_failed=%d "
-            "artifact_soft=%d artifact_hard=%d approvals_timed_out=%d "
+            "artifact_soft=%d artifact_hard=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspace_archives_removed=%d workspace_archives_failed=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -125,7 +134,6 @@ async def _amain() -> None:
             report.image_object_keys_failed,
             report.artifacts_soft_deleted,
             report.artifacts_hard_deleted,
-            report.approvals_timed_out,
             report.memory_hard_deleted,
             report.workspaces_hard_deleted,
             report.workspace_archives_removed,
