@@ -19,7 +19,7 @@ import { MemoryRouter } from "react-router-dom";
 import { App } from "antd";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import "../../i18n";
+import i18n from "../../i18n";
 
 import { SettingsMembers } from "../SettingsMembers";
 import { AuthProvider } from "../../auth/AuthContext";
@@ -30,6 +30,7 @@ import {
   purgeMember,
   resendMember,
   resetMemberPassword,
+  revokeMember,
   type MemberPurgeResult,
   type TenantMember,
 } from "../../api/members";
@@ -648,5 +649,64 @@ describe("SettingsMembers — cross-tenant read-only view", () => {
     await screen.findByText("alice@example.com");
     const expected = new Date("2026-08-27T08:00:00Z").toLocaleString();
     expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+});
+
+describe("SettingsMembers — last active admin guard", () => {
+  it("disables remove (with tooltip) for the only active admin — invited / suspended admins do not count", async () => {
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [activeMember, invitedNoLogin, suspendedMember],
+      total: 3,
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-remove-m-1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("members-remove-m-1")).toBeDisabled();
+    await user.hover(screen.getByTestId("members-last-admin-m-1"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      i18n.t("settings_members.last_admin_tooltip"),
+    );
+    // The gate is about admins only — an invited admin's "remove" stays live.
+    expect(screen.getByTestId("members-remove-m-2")).toBeEnabled();
+  });
+
+  it("enables remove once a second active admin exists and maps the backend MEMBER_LAST_ADMIN 409 to the i18n message", async () => {
+    const secondAdmin: TenantMember = {
+      ...activeMember,
+      id: "m-5",
+      email: "fay@example.com",
+      display_name: "Fay",
+      keycloak_user_id: "kc-5",
+      subject_id: "s-5",
+    };
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [activeMember, secondAdmin],
+      total: 2,
+    });
+    // Backend is the source of truth (the page only sees one roster page):
+    // a concurrent change can still make the server refuse.
+    vi.mocked(revokeMember).mockRejectedValue(
+      new ApiError("cannot suspend the tenant's last active admin", "MEMBER_LAST_ADMIN", 409),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-remove-m-5")).toBeEnabled(),
+    );
+    expect(screen.getByTestId("members-remove-m-1")).toBeEnabled();
+    await user.click(screen.getByTestId("members-remove-m-5"));
+    await user.click(
+      await screen.findByRole("button", { name: i18n.t("common.delete") }),
+    );
+
+    await waitFor(() => expect(revokeMember).toHaveBeenCalledWith("m-5"));
+    expect(
+      await screen.findByText(i18n.t("settings_members.last_admin_error")),
+    ).toBeInTheDocument();
+    expect(listMembers).toHaveBeenCalledTimes(1); // refused → no refresh
   });
 });

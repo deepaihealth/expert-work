@@ -2452,6 +2452,9 @@ const zhCN: TranslationKeys = {
       "该成员从未登录过系统，没有业务数据可清除；仅删除登录账号。",
     purge_done: "成员已清除。",
     purge_partial: "部分步骤失败——可安全重跑补齐清除。",
+    last_admin_tooltip:
+      "这是本租户唯一的活跃管理员——先邀请并激活另一位管理员，才能移除。",
+    last_admin_error: "不能移除本租户最后一个活跃管理员，请先激活另一位管理员。",
   },
   settings_platform_users: {
     page_title: "平台管理员",

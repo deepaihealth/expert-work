@@ -141,6 +141,18 @@ export function SettingsMembers() {
   // Purge (step two of offboarding) — type-to-confirm.
   const [purgeTarget, setPurgeTarget] = useState<TenantMember | null>(null);
 
+  // Last-active-admin guard (mirrors the backend 409 MEMBER_LAST_ADMIN):
+  // the only active admin in the loaded roster cannot be removed. The
+  // backend stays the source of truth — the page only sees one roster page
+  // and a concurrent change can still make the server refuse.
+  const activeAdminCount = useMemo(
+    () =>
+      (data?.items ?? []).filter(
+        (m) => m.status === "active" && m.role === "admin",
+      ).length,
+    [data],
+  );
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -235,6 +247,10 @@ export function SettingsMembers() {
         message.success(t("settings_members.removed"));
         refresh();
       } catch (err) {
+        if (err instanceof ApiError && err.code === "MEMBER_LAST_ADMIN") {
+          message.error(t("settings_members.last_admin_error"));
+          return;
+        }
         message.error(err instanceof Error ? err.message : "failed");
       }
     },
@@ -369,6 +385,10 @@ export function SettingsMembers() {
         render: (_: unknown, record: TenantMember) => {
           const removable =
             record.status === "invited" || record.status === "active";
+          const isLastActiveAdmin =
+            record.status === "active" &&
+            record.role === "admin" &&
+            activeAdminCount <= 1;
           // Purge is step two: only a deactivated row (the backend 409s
           // anything else, and the caller's own row).
           const purgeable =
@@ -408,7 +428,25 @@ export function SettingsMembers() {
                   </Button>
                 </ReadonlyTooltip>
               )}
-              {removable && (
+              {removable && isLastActiveAdmin && (
+                <Tooltip title={t("settings_members.last_admin_tooltip")}>
+                  <span
+                    data-testid={`members-last-admin-${record.id}`}
+                    style={{ display: "inline-flex", cursor: "not-allowed" }}
+                  >
+                    <Button
+                      size="small"
+                      danger
+                      disabled
+                      icon={<Trash2 size={12} strokeWidth={1.75} />}
+                      data-testid={`members-remove-${record.id}`}
+                    >
+                      {t("settings_members.remove")}
+                    </Button>
+                  </span>
+                </Tooltip>
+              )}
+              {removable && !isLastActiveAdmin && (
                 <ReadonlyTooltip on={isTenantSwitched}>
                   <Popconfirm
                     title={
@@ -459,7 +497,7 @@ export function SettingsMembers() {
       },
           ] satisfies TableColumnsType<TenantMember>)),
     ],
-    [t, onResend, onRemove, crossTenant, isTenantSwitched],
+    [t, onResend, onRemove, crossTenant, isTenantSwitched, activeAdminCount],
   );
 
   return (

@@ -2307,6 +2307,8 @@ export interface TranslationKeys {
     purge_no_data_note: string;
     purge_done: string;
     purge_partial: string;
+    last_admin_tooltip: string;
+    last_admin_error: string;
   };
   settings_platform_users: {
     page_title: string;
@@ -5669,6 +5671,10 @@ const en: TranslationKeys = {
       "This member has never signed in — there is no business data to purge; only the login account is deleted.",
     purge_done: "Member purged.",
     purge_partial: "Some steps failed — safe to run again to finish cleanup.",
+    last_admin_tooltip:
+      "This is the tenant's only active admin — invite and activate another admin before removing them.",
+    last_admin_error:
+      "Cannot remove the tenant's last active admin. Activate another admin first.",
   },
   settings_platform_users: {
     page_title: "Platform Admins",
