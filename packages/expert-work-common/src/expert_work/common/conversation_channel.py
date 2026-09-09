@@ -29,6 +29,14 @@ HIDE_FROM_UI = "expert_work_hide_from_ui"
 #: 的 ``final`` 抢走。
 SCHEDULED_DELIVERY = "expert_work_scheduled_delivery"
 
+#: P-1「已被取代」—— 值 = 取代它的新 run_id(字符串 UUID)。带这个标记的消息
+#: 留在历史里、进读面,但 agent 的 prompt 视图整轮剔除(``supersede.filter_superseded_turns``)。
+SUPERSEDED_BY = "expert_work_superseded_by"
+#: 打标时刻,ISO8601。
+SUPERSEDED_AT = "expert_work_superseded_at"
+#: 墓碑:超过保留份数的最老版本,正文已清空、id 与下标保留。墓碑必然同时带 SUPERSEDED_BY。
+TOMBSTONE = "expert_work_tombstone"
+
 #: ``channel`` 的两个取值。与 ``conversation_items.CHANNELS`` 的一致性由
 #: 契约测试钉住(那份是对外词表,这份是判定实现)。
 CHANNEL_FINAL = "final"
@@ -77,6 +85,22 @@ def _kwargs(msg: Any) -> dict[str, Any]:
 def is_hidden(msg: Any) -> bool:
     """这条消息是否是不该出现在对外视图里的编排层脚手架。"""
     return bool(_kwargs(msg).get(HIDE_FROM_UI))
+
+
+def superseded_by(msg: Any) -> str | None:
+    """取代这条消息的新 run_id;没被取代就是 ``None``。"""
+    value = _kwargs(msg).get(SUPERSEDED_BY)
+    return value if isinstance(value, str) and value else None
+
+
+def is_superseded(msg: Any) -> bool:
+    """这条消息是否已被某个新 run 取代(墓碑同样为真)。"""
+    return superseded_by(msg) is not None
+
+
+def is_tombstone(msg: Any) -> bool:
+    """这条消息是否是墓碑(正文已清理)。"""
+    return bool(_kwargs(msg).get(TOMBSTONE))
 
 
 def has_tool_calls(msg: Any) -> bool:
@@ -155,11 +179,17 @@ __all__ = [
     "CHANNEL_FINAL",
     "HIDE_FROM_UI",
     "SCHEDULED_DELIVERY",
+    "SUPERSEDED_AT",
+    "SUPERSEDED_BY",
+    "TOMBSTONE",
     "VisibleTurn",
     "has_tool_calls",
     "is_hidden",
+    "is_superseded",
+    "is_tombstone",
     "message_field",
     "message_text",
     "opens_segment",
+    "superseded_by",
     "visible_turns",
 ]
