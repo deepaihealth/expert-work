@@ -4,7 +4,7 @@
 
 **Goal:** 对接方能对会话**最后一轮**调 `POST …/runs/{run_id}:regenerate` / `:edit`,旧轮原地标「已被取代」(读面可见、agent 看不见、计划回退),新一轮照常跑。
 
-**Architecture:** B 方案:不分叉、不删消息。`supersede_run` 内核在 per-thread advisory lock 里用 checkpoint 历史(`aget_state_history(filter={"run_id"})`)划出旧轮的下标区间 `[s, e)`,一次 `aupdate_state(as_node="agent")` 把该区间每条消息按**原 id** 写回带 `expert_work_superseded_by` 标记的副本并把 `plan` 回退到轮前值;再顺序写三张 SQL 表(`agent_run.superseded_by_run_id` / `thread_message.superseded_by` / `thread_meta.message_count`)。构图侧在 `agent_node` 取到 `state["messages"]` 之后、working_window 之前整轮剔除带标记的消息。新一轮走既有 `spawn_run`,只多一个 `supersede=` 参数;`:regenerate` 用旧轮的 System+Human 两条消息原样(换 id、换戳)重放,`:edit` 用新 input 走普通路径。
+**Architecture:** B 方案:不分叉、不删消息。`supersede_run` 内核在 per-thread advisory lock 里划出旧轮的下标区间 `[s, e)` —— **两步取法**(Task 0 实测把原来的 `aget_state_history(filter={"run_id"})` 否掉了,见 §Task 0 与 spec §8-2):走 checkpointer 自己的 psycopg 池发两条窄列轻 SQL 定位该轮**最早** checkpoint 的 `parent_checkpoint_id` 与**最新** checkpoint 的 id(各 4–8 ms),再用 `aget_state(config 带 checkpoint_id=…)` 取这**两条** checkpoint 拿 `s` / `plan_before` / `e`;一次 `aupdate_state(as_node="agent")` 把该区间每条消息按**原 id** 写回带 `expert_work_superseded_by` 标记的副本并把 `plan` 回退到轮前值;再顺序写三张 SQL 表(`agent_run.superseded_by_run_id` / `thread_message.superseded_by` / `thread_meta.message_count`)。构图侧在 `agent_node` 取到 `state["messages"]` 之后、working_window 之前整轮剔除带标记的消息。新一轮走既有 `spawn_run`,只多一个 `supersede=` 参数;`:regenerate` 用旧轮的 System+Human 两条消息原样(换 id、换戳)重放,`:edit` 用新 input 走普通路径。
 
 **Tech Stack:** Python 3.13 / FastAPI / LangGraph(`add_messages` reducer、`AsyncPostgresSaver`)/ SQLAlchemy async + Alembic / pytest + testcontainers;admin-ui React + antd + vitest;docs-site VitePress。
 
@@ -170,6 +170,8 @@ async def test_summary_never_lands_in_checkpoint() -> None:
 
 `aget_state_history(filter=…)` 落到 `AsyncPostgresSaver.alist`,SQL 形如 `SELECT … FROM checkpoints WHERE thread_id = %s AND checkpoint_ns = %s AND metadata @> %s ORDER BY checkpoint_id DESC`。只用 psycopg 跑 `EXPLAIN (ANALYZE, BUFFERS)`,不 import checkpointer(它的 `setup()` 会 `CREATE TABLE IF NOT EXISTS`,虽是幂等但不算只读)。
 
+> ⚠️ **执行时踩到的坑,留给后来人(09-09)**:下面这段脚本里的 `SELECT checkpoint_id, parent_checkpoint_id FROM checkpoints WHERE …` **不是** `alist` 真跑的 SQL —— 按它量出来是 **4–8 ms 的假 PASS**。`alist`(`langgraph/checkpoint/postgres/aio.py:119`)用的是 `SELECT_SQL`(`base.py:93`),除 checkpoints 六列外**还带两个相关子查询**:一个按 `channel_versions` 把 `checkpoint_blobs` 聚成 `channel_values`(= 每个 checkpoint 一整份 messages 通道 blob),一个聚 `checkpoint_writes`;而且 `alist` 一次 `fetchall()` 全量拉回。**必须 `from langgraph.checkpoint.postgres.base import SELECT_SQL`**(只 import 模块常量,不实例化 saver、不触发 `setup()`),把 EXPLAIN 打在**部署版本原样**的 SQL 上,并顺手核对 pod 内与本地的 `importlib.metadata.version("langgraph-checkpoint-postgres")` 一致。按真 SQL 量出来的是:服务端 ~173 ms、**客户端整轮 810–950 ms、拉回 52 MB**。这一条同样适用于以后任何「量 checkpointer 某个 API 的耗时」的活 —— **别照着自己猜的 SQL 量,去库里把真 SQL 拿出来。**
+
 ```bash
 export KUBECONFIG=~/.kube/expert-work-test.yaml
 kubectl get pods -A | grep control-plane          # 记下 NAMESPACE 与一个 Running 的 pod 名
@@ -205,11 +207,15 @@ PY
 
 判据:最长会话上该查询 < 100 ms 且 plan 是 `Index Scan`/`Bitmap` 走 `(thread_id, checkpoint_ns, checkpoint_id)` 主键再按 `metadata @>` 过滤。若 > 100 ms 或 Seq Scan,把「`agent_run` 加 `base_checkpoint_id` 锚点列」作为 Task 4 的备选写进 spec §8-2 结论,本计划不做。
 
+**实测结果(09-09,PR #1462)**:**判据不过,但不加锚点列**。索引没问题(`Index Scan Backward using checkpoints_pkey`,无 Seq Scan;`metadata @>` 无 GIN 只作后置 Filter,`Rows Removed by Filter: 136`),不过瓶颈是 blob:测试库最长会话 185 条 checkpoint、其中最大的一个 run 占 49 条 → 客户端整轮 810–950 ms / 52 MB(全表最大的单个 run 有 100 条,再翻一倍)。**改法已回写进 spec §8-2 与 §3.1 步骤 2,并已按它改掉本计划的 Task 4**:两条窄列轻查询(各 4–8 ms)+ 两次单条 `aget_state`(36–89 ms),合计 40–97 ms、只拉 0.89 MB。**锚点列实测不必要** —— 它只省得掉那 4–8 ms,却要一列迁移,而且存量 run 没有锚点仍得走轻查询。
+
 - [ ] **Step 4: §8-4 queue 模式 supersede 与 worker 认领的先后**
 
-读 `services/control-plane/src/control_plane/run_queue_worker.py:172-232`:`run_once` → `self._runs.list_queued()` 只拿 `status='queued'` 的行 → `_claim_and_start` → `claim_queued` CAS(`runs/store.py:557`)→ `_execute`。worker **只可能看到已经存在的 QUEUED 行**。
+读 `services/control-plane/src/control_plane/run_queue_worker.py`:`run_once`(**`:172`**)→ `self._runs.list_queued()` 只拿 `status='queued'` 的行(`packages/expert-work-runtime/src/expert_work/runtime/runs/store.py:1601`)→ `_claim_and_start`(**`:213`**)→ `claim_queued` CAS(真 SQL 实现在同文件 **`store.py:1613`**;`:557` 只是 ABC 上的抽象声明、`:977` 是内存栈那份)→ `_execute`(**`:262`**)。worker **只可能看到已经存在的 QUEUED 行**。
 
-结论(Task 7 照此实现):`spawn_run` 里 `supersede_thread_lock` 包住「`supersede_run` → `run_manager.enqueue` / `run_manager.create`」整段;QUEUED 行在 supersede 全部写完之后才 INSERT,worker 在此之前没有任何可认领的东西;stream 模式同理(`run_agent` task 在锁外起,但那时标记已落)。锁的放置点 = `api/runs.py` `spawn_run` 内 `run_id = uuid4()` 之后到两个分支的建行调用为止。
+结论(Task 7 照此实现):`spawn_run` 里 `supersede_thread_lock` 包住「`supersede_run` → `run_manager.enqueue` / `run_manager.create`」整段;QUEUED 行在 supersede 全部写完之后才 INSERT,worker 在此之前没有任何可认领的东西;stream 模式同理(`run_agent` task 在锁外起,但那时标记已落)。锁的放置点 = `api/runs.py` `spawn_run`(`:953`)内 `run_id = uuid4()`(**`:1077`**)之后到两个分支的建行调用为止(queue `enqueue` **`:1082`** / stream `create` **`:1109`**;stream 的 `asyncio.create_task(run_agent…)` 在 `:1156`,晚于建行)。
+
+**实测校正(09-09,PR #1462)**:挡住 worker 抢跑的是**顺序**,不是锁 —— advisory lock 照 `trigger_delivery.delivery_thread_lock`(`trigger_delivery.py:57-88`)开在**独立的 lock session** 上,queue worker 走另一条连接、全文件不取任何 advisory lock。锁的职责是另一件事:把「同一 thread 上两个并发 supersede / spawn」串行化。两件事都要,但别把它们当成同一个理由写进注释。
 
 - [ ] **Step 5: 回填 spec §8 并提交**
 
@@ -1170,6 +1176,7 @@ from control_plane.api.runs import build_run_graph_input
 from control_plane.supersede import (
     MAX_SUPERSEDED_VERSIONS,
     SupersedeError,
+    _checkpoint_pool,   # 只为断言这套集成测真的走了 SQL 取法,不是内存回退
     supersede_run,
     supersede_thread_lock,
 )
@@ -1388,8 +1395,24 @@ reducer 同 id 原地替换,条数 / 下标 / 内容都不变(spike 反证:丢 i
 **定轮不靠消息戳**(ToolMessage 与每轮的 SystemMessage 没有戳),靠检查点
 metadata 的 ``run_id``(langchain ``ensure_config`` 把 configurable 标量复制进
 metadata;spike 实测 keys = parents / run_id / source / step / tenant_id):
-该 run 最早的 checkpoint(``source == "input"``)的 ``parent_config`` 就是
-「该轮之前」—— 它的 ``len(messages)`` 是起始下标,它的 ``plan`` 是回退值。
+该 run 最早的 checkpoint(``source == "input"``)的 parent 就是「该轮之前」——
+它的 ``len(messages)`` 是起始下标,它的 ``plan`` 是回退值。
+
+**但不能用 ``aget_state_history(filter={"run_id": …})`` 去拿**(Task 0 实测,
+spec §8-2):它落到 ``AsyncPostgresSaver.alist``,SQL 带两个相关子查询把每个
+checkpoint 的 ``checkpoint_blobs`` / ``checkpoint_writes`` 全聚回来,再一次
+``fetchall()`` 全量拉回 —— 测试环境最长会话里一个 49 条 checkpoint 的 run 就要
+**810–950 ms、52 MB**(每个 checkpoint 都带一整份 messages 通道,随轮数二次
+增长;全表最大的 run 有 100 条)。
+
+所以走**两步**:先发两条只取窄列、不碰 blob 的轻 SQL 拿到边界 checkpoint 的
+id(各 4–8 ms),再用 ``aget_state(config 带 checkpoint_id=…)`` 取那**两条**
+checkpoint(36–89 ms、0.89 MB)。合计实测 40–97 ms。**轻 SQL 走 checkpointer
+自己的 psycopg 池,不走 app 的 SQLAlchemy 池** —— ``checkpoints`` 表在
+``Settings.checkpointer_dsn``(``settings.py:179``)那个库里,与 ``db_dsn``
+(``:53``)是两个独立设置,现网指同一个库但内核不能赌这一点。``InMemorySaver``
+没有表可查(单测 / 内存栈形态),那条路回退到 ``aget_state_history``:内存
+saver 上它是纯 Python 遍历,没有上面的 blob 放大问题。
 
 **审批链**:审批把一轮切成 PAUSED run + continuation run(``runs.py:857-951``,
 ``is_resume=True``、``graph_input=None``),continuation 的最早 checkpoint 是
@@ -1515,20 +1538,69 @@ class SupersedeResult:
     superseded_run_ids: tuple[UUID, ...]
 
 
-async def locate_turn(
-    graph: Any,
-    config: RunnableConfig,
-    *,
-    run_ids: Sequence[UUID],
-    current_len: int,
-    current_plan: Any,
-) -> TurnLocation:
-    """取法 A:按 run 过滤检查点历史,链首 run 最早的 ``source=="input"`` 快照的
-    parent 就是「该轮之前」。
+@dataclass(frozen=True)
+class _Bounds:
+    """一条审批链在 checkpoints 里的两个端点(只有 id / parent / source,不含 blob)。"""
 
-    ``run_ids[0]`` 是目标(最新的),之后是它的 PAUSED 前驱(审批链)。没有任何
-    检查点(run 在图开始前就失败)→ 空区间 ``[current_len, current_len)``、
-    plan 不动 —— 只链接 ``agent_run`` 行。
+    oldest_id: str
+    oldest_parent_id: str | None
+    oldest_source: str | None
+    newest_id: str
+
+
+#: 只取窄列,**不碰 checkpoint / checkpoint_blobs / checkpoint_writes** —— 这正是
+#: `alist` 慢的根源。谓词与 Task 0 EXPLAIN 量过的 `metadata @> '{"run_id":…}'::jsonb`
+#: 同为「`checkpoints_pkey` 索引扫描 + 后置 Filter」,只是这里要一次覆盖整条审批链,
+#: 所以写成 `= ANY(...)`。实测各 4–8 ms。
+_BOUNDS_SQL = """
+SELECT checkpoint_id, parent_checkpoint_id, metadata->>'source' AS source
+FROM checkpoints
+WHERE thread_id = %(thread_id)s AND checkpoint_ns = '' AND metadata->>'run_id' = ANY(%(run_ids)s)
+ORDER BY checkpoint_id {order}
+LIMIT 1
+"""
+
+
+def _checkpoint_pool(graph: Any) -> Any | None:
+    """checkpointer **自己的** psycopg 池;内存 saver / 非池形态返回 ``None``。
+
+    `checkpoints` 表在 `Settings.checkpointer_dsn` 那个库里(`settings.py:179`),
+    与 app 的 `db_dsn`(`:53`)是两个独立设置 —— 轻查询必须走这个池,不能借
+    `app.state.session_factory`。`TimingCheckpointSaver` 是我们自己的包装
+    (`expert_work/runtime/checkpointer/timing.py:48`,内层存在 `_inner`);
+    `AsyncPostgresSaver` 把池存在 `.conn`(`aio.py:57`),`make_checkpointer` 走的
+    是池那一支(`factory.py`,BUG-18 之后不再是单连接)。
+    """
+    cp = getattr(graph, "checkpointer", None)
+    inner = getattr(cp, "_inner", cp)
+    pool = getattr(inner, "conn", None)
+    return pool if hasattr(pool, "connection") else None
+
+
+async def _bounds_sql(pool: Any, thread_id: UUID, run_ids: Sequence[UUID]) -> _Bounds | None:
+    params = {"thread_id": str(thread_id), "run_ids": [str(r) for r in run_ids]}
+    async with pool.connection() as conn, conn.cursor() as cur:
+        await cur.execute(_BOUNDS_SQL.format(order="ASC"), params)
+        oldest = await cur.fetchone()
+        if oldest is None:
+            return None
+        await cur.execute(_BOUNDS_SQL.format(order="DESC"), params)
+        newest = await cur.fetchone()
+    # 池的 row_factory 是 dict_row(factory.py 的 kwargs),所以按键取。
+    return _Bounds(
+        oldest_id=oldest["checkpoint_id"],
+        oldest_parent_id=oldest["parent_checkpoint_id"],
+        oldest_source=oldest["source"],
+        newest_id=newest["checkpoint_id"],
+    )
+
+
+async def _bounds_history(graph: Any, config: RunnableConfig, run_ids: Sequence[UUID]) -> _Bounds | None:
+    """``InMemorySaver`` 回退路径(单测 / 内存栈)——**只在没有 psycopg 池时走**。
+
+    内存 saver 上 ``aget_state_history`` 是纯 Python 遍历,没有 Postgres 那边
+    「每个 checkpoint 都把 blob 聚回来」的放大,所以这里用它没有性能问题。
+    生产永远走 :func:`_bounds_sql`。
     """
     oldest: Any = None
     newest: Any = None
@@ -1540,19 +1612,60 @@ async def locate_turn(
             newest = snaps[0]  # 历史最新在前;run_ids[0] 是目标,它的最新就是轮尾
         oldest = snaps[-1]
     if oldest is None or newest is None:
+        return None
+    return _Bounds(
+        oldest_id=oldest.config["configurable"]["checkpoint_id"],
+        oldest_parent_id=(oldest.parent_config or {}).get("configurable", {}).get("checkpoint_id"),
+        oldest_source=(oldest.metadata or {}).get("source"),
+        newest_id=newest.config["configurable"]["checkpoint_id"],
+    )
+
+
+def _at(config: RunnableConfig, checkpoint_id: str) -> RunnableConfig:
+    return {"configurable": {**(config.get("configurable") or {}), "checkpoint_id": checkpoint_id}}
+
+
+async def locate_turn(
+    graph: Any,
+    config: RunnableConfig,
+    *,
+    run_ids: Sequence[UUID],
+    current_len: int,
+    current_plan: Any,
+) -> TurnLocation:
+    """取法 A(两步版):先窄列 SQL 定位该轮的边界 checkpoint,再单条读那两个快照。
+
+    ``run_ids[0]`` 是目标(最新的),之后是它的 PAUSED 前驱(审批链);两条边界
+    查询一次覆盖整条链。没有任何检查点(run 在图开始前就失败)→ 空区间
+    ``[current_len, current_len)``、plan 不动 —— 只链接 ``agent_run`` 行。
+
+    **只读两条 checkpoint**:链首的 parent(给 ``start`` / ``plan_before``)与链尾
+    本身(给 ``end``)。不要为了省一次 ``aget_state`` 用 ``current_len`` 顶替
+    ``end`` —— 别的写入缝(投递注入、审批裁定)也会往通道里追加,``end`` 必须
+    是这一轮自己最后一个 checkpoint 的长度。
+    """
+    thread_id = UUID(str((config.get("configurable") or {})["thread_id"]))
+    pool = _checkpoint_pool(graph)
+    bounds = (
+        await _bounds_sql(pool, thread_id, run_ids)
+        if pool is not None
+        else await _bounds_history(graph, config, run_ids)
+    )
+    if bounds is None:
         return TurnLocation(start=current_len, end=current_len, plan_before=current_plan, chain_run_ids=tuple(run_ids))
-    if (oldest.metadata or {}).get("source") != "input":
+    if bounds.oldest_source != "input":
         # 链首不是入口写入 —— 只可能是历史损坏或链没串全;宁可拒绝也别乱标。
         raise SupersedeError(
             "RUN_NOT_LAST", "run boundary could not be established from checkpoint history", 422
         )
-    if oldest.parent_config is None:
+    if bounds.oldest_parent_id is None:
         start, plan_before = 0, None
     else:
-        parent = await graph.aget_state(oldest.parent_config)
+        parent = await graph.aget_state(_at(config, bounds.oldest_parent_id))
         start = len(parent.values.get("messages") or [])
         plan_before = parent.values.get("plan")
-    end = len(newest.values.get("messages") or [])
+    last = await graph.aget_state(_at(config, bounds.newest_id))
+    end = len(last.values.get("messages") or [])
     if not (0 <= start <= end <= current_len):
         raise SupersedeError("RUN_NOT_LAST", "run boundary is outside the current history", 422)
     return TurnLocation(start=start, end=end, plan_before=plan_before, chain_run_ids=tuple(run_ids))
@@ -1700,6 +1813,7 @@ Run: 同 Step 2 命令。Expected: 2 passed。
 3. 去掉 `"plan": location.plan_before` → 主场景 `plan.goal == GOAL_ONE` 红、`test_plan_reverts_to_none…` 红;改回。
 4. 注释掉 `thread_messages.mark_superseded(...)` → `mirror == {...}` 红;改回。
 5. 注释掉 `runs.mark_superseded(...)` 循环 → `superseded_by_run_id == r3` 红;改回。
+6. **两步取法的边界**:`_BOUNDS_SQL.format(order="ASC")` 改成 `order="DESC"`(即链首取成了链尾)→ `start` 落到轮尾,`_marks(...)` 主场景断言红;改回。这条集成测跑在真 Postgres checkpointer 上,走的正是 `_bounds_sql` 而不是内存回退 —— 顺手在 Step 4 跑完后加一句 `assert _checkpoint_pool(st.compiled) is not None`(放主场景测试里),否则整条 SQL 路径可能一次都没被执行过就全绿了。
 
 - [ ] **Step 6: 补场景测试(追加到同一文件)**
 
@@ -2035,6 +2149,10 @@ git commit -m "feat(api): P-1 读面字段 —— /messages /items 控制台 mes
 **Interfaces:**
 - Consumes: Task 1 `filter_superseded_turns`、`mark_superseded`
 - Produces: `agent_node` 的 prompt 视图不含任何带 `SUPERSEDED_BY` 的消息,且被取代轮的 AI(tool_calls)/ToolMessage 成对消失
+
+> **📌 注记(Task 0 顺带发现的结构性缝,09-09)——「prompt 视图永不落检查点」是个约定,不是机制。**
+> 本 Task 的整轮过滤和上游的压缩 / 窗口 / 剪枝一样,都只改 `agent_node` 里的**本地** `messages` 变量,靠的是「返回字典里只装新增的尾巴」这条约定(`builder.py:1206` / `:1246` 的 `"messages"` 只装 `persisted_messages` / `emit_messages`)。这条约定有一个出口:`_extract_post_llm_messages`(`builder.py:2397`)在「中间件返回的列表比原 prompt 短、或前缀被改过」时会 `return list(updated)` —— **把那份(源自已被过滤/压缩的 prompt 视图的)完整列表整个交给 reducer**。眼下走不通:全仓只有四处写 `ctx.payload["messages"]`(`context_pressure` / `pii_redact` / `dynamic_context` 都挂 `before_llm_call`),挂 `after_llm_call` 的只有 `loop_detection`(`middleware/loop_detection.py:182`),它写的是 `[cleaned, reminder]` 两条,与 prompt 视图无关。
+> **但以后谁在 `after_llm_call` 上加一个「重写整份 messages」的中间件,压缩摘要和被过滤掉的被取代轮就会一起写进检查点**,而现有测试一条都不会红。Task 0 的动态探针(真 graph + 真 `ContextCompressor`,检查点里 0 条 `<context-summary>`)是这条不变式**目前**的唯一实证。若本 Task 之后有人动 `_extract_post_llm_messages` 或往 `after_llm_call` 加中间件,必须补一条「检查点里不含 prompt 视图产物」的断言。
 
 - [ ] **Step 1: 写失败测试(直接断言送进 LLM 的 messages 列表,不看日志)**
 
@@ -2735,8 +2853,11 @@ def external_run_bounds_error(
 """P-1 —— POST /v1/agents/{code}/runs/{run_id}:regenerate / :edit。
 
 夹具照 test_external_runs_cancel.py(内存 store + stub_agent_runtime + 服务账号 JWT);
-stub 的图跑在 InMemorySaver 上,aget_state_history / aupdate_state 都可用,所以
-「先跑一轮再 :regenerate」是**真** supersede 内核 + 假 LLM 的端到端。
+stub 的图跑在 InMemorySaver 上:``aupdate_state`` 一样可用,``locate_turn`` 会因为
+拿不到 psycopg 池而走 ``_bounds_history`` 回退(Task 4),所以「先跑一轮再
+:regenerate」是**真** supersede 内核 + 假 LLM 的端到端。**注意这套测试覆盖不到
+生产用的 ``_bounds_sql`` 那条路** —— 那条由 Task 4 的真 Postgres 集成测覆盖
+(它带 ``assert _checkpoint_pool(...) is not None``),两边缺一不可。
 """
 from __future__ import annotations
 
@@ -3058,7 +3179,7 @@ async def _supersede_and_run(
 - [ ] **Step 5: 跑测试确认通过**
 
 Run: `uv run --no-sync pytest services/control-plane/tests/test_external_runs_regenerate.py services/control-plane/tests/test_external_runs_cancel.py -q`
-Expected: 全绿。若 `test_regenerate_marks_old_turn…` 的 `/messages` 断言拿到 `superseded_by=None`:stub 图的 `aget_state_history(filter=)` 在 `InMemorySaver` 上要求 metadata 含 `run_id` —— `spawn_run` 的 config 已带 `run_id`,若仍空,改用 `MemorySaver` 之外的路径不可取,先在测试里打印 `[s.metadata for s in history]` 定位;这是 Task 4 内核在内存 saver 上的唯一差异点。
+Expected: 全绿。若 `test_regenerate_marks_old_turn…` 的 `/messages` 断言拿到 `superseded_by=None`:stub 图在 `InMemorySaver` 上走的是 `locate_turn` 的 `_bounds_history` 回退(Task 4),它要求检查点 metadata 含 `run_id` —— `spawn_run` 的 config 已带 `run_id`,若仍空,先在 `_bounds_history` 里打印 `[s.metadata for s in snaps]` 定位,**别**为了绕开而去改成真 Postgres saver(那就不是这套端到端测试的形态了)。这是 Task 4 内核在内存 saver 上的唯一差异点:生产走 `_bounds_sql`(窄列 SQL + 两次单条 `aget_state`),内存栈走 `_bounds_history`,两条路产出同一个 `_Bounds`,后面的逻辑完全共用。
 
 - [ ] **Step 6: 变异自证**
 
