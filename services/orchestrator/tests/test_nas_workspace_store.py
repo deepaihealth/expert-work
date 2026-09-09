@@ -1347,3 +1347,73 @@ async def test_list_files_does_not_use_path_is_dir(
     files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
 
     assert files == [WorkspaceFileEntry(path="a.txt", size=1)]
+
+
+# --------------------------------------------- 留存链 B-27:delete_tree(会话 purge 钩子)
+
+
+async def test_delete_tree_removes_only_that_directory(tmp_path: Path) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    gone, kept = uuid4(), uuid4()
+    await store.write_file(
+        tenant_id=tenant_id, user_id=user_id, path=f"threads/{gone}/MEMORY.md", data=b"m"
+    )
+    await store.write_file(
+        tenant_id=tenant_id, user_id=user_id, path=f"threads/{gone}/PLAN.md", data=b"p"
+    )
+    await store.write_file(
+        tenant_id=tenant_id, user_id=user_id, path=f"threads/{kept}/MEMORY.md", data=b"k"
+    )
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="style/rules.md", data=b"s")
+
+    await store.delete_tree(tenant_id=tenant_id, user_id=user_id, path=f"threads/{gone}")
+
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    assert not (user_root / "threads" / str(gone)).exists()
+    assert (user_root / "threads" / str(kept) / "MEMORY.md").read_bytes() == b"k"
+    assert (user_root / "style" / "rules.md").read_bytes() == b"s"
+
+
+async def test_delete_tree_missing_is_a_noop(tmp_path: Path) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.delete_tree(tenant_id=tenant_id, user_id=user_id, path=f"threads/{uuid4()}")
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"a")
+    await store.delete_tree(tenant_id=tenant_id, user_id=user_id, path=f"threads/{uuid4()}")
+
+
+async def test_delete_tree_rejects_reserved_traversal_and_file(tmp_path: Path) -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="uploads/a.txt", data=b"in")
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="note.txt", data=b"n")
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_tree(tenant_id=tenant_id, user_id=user_id, path="uploads")
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_tree(tenant_id=tenant_id, user_id=user_id, path="../escape")
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_tree(tenant_id=tenant_id, user_id=user_id, path="note.txt")
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    assert (user_root / "uploads" / "a.txt").exists()
+    assert (user_root / "note.txt").exists()
+
+
+async def test_delete_tree_refuses_symlink_target(tmp_path: Path) -> None:
+    """A ``threads/<id>`` entry swapped for a symlink pointing outside the
+    workspace must not be followed — the link stays, the target is untouched."""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_bytes(b"secret")
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="threads/.keep", data=b"")
+    tid = uuid4()
+    link = tmp_path / str(tenant_id) / str(user_id) / "threads" / str(tid)
+    link.symlink_to(outside)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.delete_tree(tenant_id=tenant_id, user_id=user_id, path=f"threads/{tid}")
+    assert (outside / "victim.txt").read_bytes() == b"secret"
+    assert link.is_symlink()

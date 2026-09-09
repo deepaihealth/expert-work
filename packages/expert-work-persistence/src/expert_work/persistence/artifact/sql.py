@@ -294,6 +294,69 @@ class SqlArtifactStore(ArtifactStore):
             )
         return [_row_to_version(row) for row in rows]
 
+    async def list_versions_expired(
+        self,
+        *,
+        before: datetime,
+        limit: int = 1000,
+    ) -> list[ArtifactVersion]:
+        # 同一 ``created_at`` 的版本(同一事务里连登记几版、时钟粒度内的批量)按
+        # ``artifact_id, version`` 定序 —— 老版本先于新版本,跨 store 实现同义;
+        # 用 ``id``(uuid4)做 tiebreak 则同一产物两个版本谁先谁后是随机的
+        # (CI 实测:三跑两红)。
+        stmt = (
+            select(ArtifactVersionRow)
+            .where(ArtifactVersionRow.created_at < before)
+            .order_by(
+                ArtifactVersionRow.created_at.asc(),
+                ArtifactVersionRow.artifact_id.asc(),
+                ArtifactVersionRow.version.asc(),
+            )
+            .limit(limit)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_version(row) for row in rows]
+
+    async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:
+        stmt = (
+            select(ArtifactVersionRow)
+            .where(ArtifactVersionRow.artifact_id == artifact_id)
+            .order_by(ArtifactVersionRow.version.desc())
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_version(row) for row in rows]
+
+    async def delete_versions(self, *, version_ids: Sequence[UUID]) -> int:
+        if not version_ids:
+            return 0
+        async with self._sf() as session:
+            result = await session.execute(
+                delete(ArtifactVersionRow).where(ArtifactVersionRow.id.in_(list(version_ids)))
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
+
+    async def mark_expired_if_versionless(self, *, artifact_id: UUID, now: datetime) -> bool:
+        remaining = (
+            select(ArtifactVersionRow.id)
+            .where(ArtifactVersionRow.artifact_id == artifact_id)
+            .exists()
+        )
+        async with self._sf() as session:
+            result = await session.execute(
+                update(ArtifactRow)
+                .where(
+                    ArtifactRow.id == artifact_id,
+                    ArtifactRow.deleted_at.is_(None),
+                    ~remaining,
+                )
+                .values(deleted_at=now)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
     async def hard_delete(self, *, artifact_ids: Sequence[UUID]) -> int:
         if not artifact_ids:
             return 0

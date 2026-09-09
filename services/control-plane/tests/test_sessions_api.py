@@ -1338,3 +1338,58 @@ async def test_session_detail_tenant_id_star_400(
     )
     assert resp.status_code == 400, f"{name}: {resp.status_code} {resp.text}"
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED", name
+
+
+# ---------------------------------------------------------------------------
+# 留存链 B-27 —— purge 同步删 threads/<thread_id>/
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_purge_deletes_the_thread_projection_dir(
+    session_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """Purge asks the workspace file store to rm -rf exactly ``threads/<thread_id>``
+    for the thread's owner — nothing else in the (user-shared) workspace."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    store = RecordingWorkspaceStore()
+    app.state.workspace_store = store
+    meta = await app.state.thread_meta_repo.get(UUID(tid), tenant_id=_DEFAULT_TENANT)
+    assert meta is not None and meta.user_id is not None
+
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["threads_dir"] is True
+
+    assert store.workspace_tree_deletes == [(_DEFAULT_TENANT, meta.user_id, f"threads/{tid}")]
+    assert store.workspace_deletes == []  # no single-file deletes, no mark_deleted
+    assert store.workspace_deletions == []
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    assert _purge_audit_details(page, tid)["threads_dir"] is True
+
+
+@pytest.mark.asyncio
+async def test_purge_thread_dir_failure_is_audit_visible_and_not_fatal(
+    session_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """A failing rm -rf (e.g. the supervisor backend has none) still completes the
+    purge; the flag lands in the response + audit details, and the retention
+    job's orphan scan is the backstop."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    app.state.workspace_store = RecordingWorkspaceStore(
+        workspace_tree_delete_error=SandboxSupervisorError("no recursive delete")
+    )
+
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["threads_dir"] is False
+    assert data["threads_dir_delete_failed"] is True
+    assert (await session_client.get(f"/v1/sessions/{tid}")).status_code == 404
+
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    details = _purge_audit_details(page, tid)
+    assert details["meta_removed"] is True
+    assert details["threads_dir_delete_failed"] is True

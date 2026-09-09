@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -401,5 +401,139 @@ async def test_hard_delete_removes_artifact_and_versions(
         )
         # Empty list is a no-op.
         assert await store.hard_delete(artifact_ids=[]) == 0
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 留存链 B-28 —— 按版本 90 天(SQL)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_version_retention_methods_round_trip(sql_store: SqlStoreFixture) -> None:
+    """list_versions_expired 按版本 created_at 跨租户取;delete_versions 只删版本行;
+    mark_expired_if_versionless 只在版本清空且行仍活着时翻 deleted_at;
+    list_versions_by_artifact 不管父行软删与否都能列。"""
+    store, engine = sql_store
+    try:
+        tenant_a, user_a = uuid4(), uuid4()
+        tenant_b, user_b = uuid4(), uuid4()
+        for path in ("a.v1", "a.v2", "a.v3"):
+            v = await store.save_version(
+                tenant_id=tenant_a,
+                user_id=user_a,
+                name="a.md",
+                kind="document",
+                path_in_workspace=path,
+                created_in_thread="t",
+            )
+        artifact_a = v.artifact_id
+        vb = await store.save_version(
+            tenant_id=tenant_b,
+            user_id=user_b,
+            name="b.md",
+            kind="document",
+            path_in_workspace="b.v1",
+            created_in_thread="t",
+        )
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE artifact_version SET created_at = now() - make_interval(days => :d) "
+                    "WHERE artifact_id = :a AND version <= 2"
+                ),
+                {"d": 120, "a": artifact_a},
+            )
+            await conn.execute(
+                text(
+                    "UPDATE artifact_version SET created_at = now() - make_interval(days => :d) "
+                    "WHERE id = :v"
+                ),
+                {"d": 200, "v": vb.id},
+            )
+        cutoff = datetime.now(UTC) - timedelta(days=90)
+
+        expired = await store.list_versions_expired(before=cutoff)
+        mine = [(x.artifact_id, x.version) for x in expired if x.tenant_id in {tenant_a, tenant_b}]
+        assert mine == [(vb.artifact_id, 1), (artifact_a, 1), (artifact_a, 2)]
+        assert len(await store.list_versions_expired(before=cutoff, limit=2)) == 2
+
+        now = datetime.now(UTC)
+        a_old = [x.id for x in expired if x.artifact_id == artifact_a]
+        assert await store.delete_versions(version_ids=a_old) == 2
+        assert await store.delete_versions(version_ids=a_old) == 0
+        assert await store.delete_versions(version_ids=[]) == 0
+        assert await store.mark_expired_if_versionless(artifact_id=artifact_a, now=now) is False
+        remaining = await store.list_versions_by_artifact(artifact_id=artifact_a)
+        assert [x.version for x in remaining] == [3]
+        latest = await store.get_latest_version(tenant_id=tenant_a, user_id=user_a, name="a.md")
+        assert latest is not None and latest.version == 3
+
+        assert await store.delete_versions(version_ids=[vb.id]) == 1
+        assert await store.mark_expired_if_versionless(artifact_id=vb.artifact_id, now=now) is True
+        assert await store.mark_expired_if_versionless(artifact_id=vb.artifact_id, now=now) is False
+        assert (
+            await store.get_latest_version(tenant_id=tenant_b, user_id=user_b, name="b.md") is None
+        )
+        deleted = await store.list_for_user(
+            tenant_id=tenant_b, user_id=user_b, include_deleted=True
+        )
+        assert len(deleted) == 1 and deleted[0].deleted_at is not None
+        # Soft-deleted parent: list_versions hides it, list_versions_by_artifact does not.
+        assert await store.list_versions(tenant_id=tenant_b, user_id=user_b, name="b.md") is None
+        assert await store.list_versions_by_artifact(artifact_id=vb.artifact_id) == []
+        # A soft-deleted parent that still has versions is listable too.
+        await store.soft_delete(tenant_id=tenant_a, user_id=user_a, name="a.md", now=now)
+        still = await store.list_versions_by_artifact(artifact_id=artifact_a)
+        assert [x.version for x in still] == [3]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_versions_expired_orders_same_timestamp_by_version(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """CI 复盘:同一 ``created_at`` 的版本此前按 ``id``(uuid4)tiebreak,同一产物
+    v1 / v2 谁先谁后是随机的(三跑两红)。ids 故意改成与 version 反序,
+    ``version`` tiebreak 不在就必红。"""
+    store, engine = sql_store
+    try:
+        tenant_id, user_id = uuid4(), uuid4()
+        ids: list[UUID] = []
+        for path in ("t.v1", "t.v2", "t.v3"):
+            v = await store.save_version(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                name="tie.md",
+                kind="document",
+                path_in_workspace=path,
+                created_in_thread="t",
+            )
+            ids.append(v.id)
+        artifact_id = v.artifact_id
+        # Same timestamp for all three, and ids that sort in REVERSE version order.
+        reversed_ids = [
+            UUID("ffffffff-0000-4000-8000-000000000001"),
+            UUID("88888888-0000-4000-8000-000000000002"),
+            UUID("00000000-0000-4000-8000-000000000003"),
+        ]
+        async with engine.begin() as conn:
+            for old_id, new_id in zip(ids, reversed_ids, strict=True):
+                await conn.execute(
+                    text(
+                        "UPDATE artifact_version SET id = :new, "
+                        "created_at = now() - interval '100 days' WHERE id = :old"
+                    ),
+                    {"new": new_id, "old": old_id},
+                )
+        cutoff = datetime.now(UTC) - timedelta(days=90)
+        expired = [
+            (x.artifact_id, x.version)
+            for x in await store.list_versions_expired(before=cutoff)
+            if x.artifact_id == artifact_id
+        ]
+        assert expired == [(artifact_id, 1), (artifact_id, 2), (artifact_id, 3)]
     finally:
         await engine.dispose()

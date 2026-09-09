@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -154,3 +155,54 @@ async def test_delete_all_for_user_counts_and_scopes() -> None:
     assert await store.get(upload_id=other_tenant_id, tenant_id=other_tenant) is not None
     # Re-deleting is a safe no-op.
     assert await store.delete_all_for_user(tenant_id=tenant, user_id=user1) == 0
+
+
+# ---------------------------------------------------------------------------
+# 留存链 —— 上传 90 天:list_expired / soft_delete
+# ---------------------------------------------------------------------------
+
+
+async def _seed_upload(store: InMemoryUserUploadStore, *, tenant: UUID, age_days: int) -> UUID:
+    upload_id = uuid4()
+    await store.insert(
+        upload_id=upload_id,
+        tenant_id=tenant,
+        user_id=uuid4(),
+        thread_id=uuid4(),
+        kind="document",
+        ref="uploads/f.pdf",
+        mime_type="application/pdf",
+        size_bytes=1,
+        filename="f.pdf",
+    )
+    row = store._rows[(tenant, upload_id)]
+    store._rows[(tenant, upload_id)] = row.model_copy(
+        update={"created_at": datetime.now(UTC) - timedelta(days=age_days)}
+    )
+    return upload_id
+
+
+@pytest.mark.asyncio
+async def test_list_expired_and_soft_delete() -> None:
+    store = InMemoryUserUploadStore()
+    tenant, other = uuid4(), uuid4()
+    old = await _seed_upload(store, tenant=tenant, age_days=120)
+    older = await _seed_upload(store, tenant=other, age_days=200)
+    fresh = await _seed_upload(store, tenant=tenant, age_days=1)
+    cutoff = datetime.now(UTC) - timedelta(days=90)
+
+    expired = await store.list_expired(before=cutoff)
+    assert [r.id for r in expired] == [older, old]  # cross-tenant, oldest first
+    assert [r.id for r in await store.list_expired(before=cutoff, limit=1)] == [older]
+
+    now = datetime.now(UTC)
+    assert await store.soft_delete(upload_id=old, tenant_id=tenant, now=now) is True
+    assert await store.soft_delete(upload_id=old, tenant_id=tenant, now=now) is False  # idempotent
+    assert await store.soft_delete(upload_id=old, tenant_id=other, now=now) is False  # wrong tenant
+    assert await store.soft_delete(upload_id=uuid4(), tenant_id=tenant, now=now) is False
+    row = await store.get(upload_id=old, tenant_id=tenant)
+    assert row is not None and row.deleted_at == now
+    # Already soft-deleted rows are no longer candidates; the fresh one never was.
+    assert [r.id for r in await store.list_expired(before=cutoff)] == [older]
+    fresh_row = await store.get(upload_id=fresh, tenant_id=tenant)
+    assert fresh_row is not None and fresh_row.deleted_at is None

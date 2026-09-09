@@ -74,6 +74,13 @@ class WorkspaceStore(Protocol):
         Backs the playground workspace cleanup. Only the supervisor can
         mutate a per-user docker volume; the control-plane proxies here."""
 
+    async def delete_tree(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
+        """Recursively delete one directory under a user's persistent workspace.
+
+        ``rm -rf`` semantics — a missing target is a no-op; reserved prefixes
+        are refused like :meth:`delete_file`. 留存链 B-27:会话 purge 同步删
+        ``threads/<thread_id>/``(该会话的 MEMORY.md / PLAN.md / TODO.md 投影)。"""
+
     async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
         """Soft-delete a user's whole persistent workspace (Phase 3a purge_user).
 
@@ -202,6 +209,15 @@ class SupervisorWorkspaceStore:
             )
             raise SandboxSupervisorError(msg)
 
+    async def delete_tree(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
+        # The supervisor HTTP API has no recursive delete, and that backend is
+        # retired on the cluster (local dev / CI only). Raise rather than
+        # no-op: the session purge hook records the failure in its audit
+        # details, and the retention job's daily orphan scan is the NAS-side
+        # backstop either way.
+        msg = f"sandbox supervisor workspace backend has no recursive delete: {path!r}"
+        raise SandboxSupervisorError(msg)
+
     async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
         await self._post(
             f"/v1/workspaces/{tenant_id}/{user_id}:delete",
@@ -257,6 +273,9 @@ class RecordingWorkspaceStore:
     workspace_write_error: Exception | None = None
     workspace_deletes: list[tuple[UUID, UUID, str]] = field(default_factory=list)
     workspace_delete_error: Exception | None = None
+    #: 留存链 B-27 — the ``(tenant_id, user_id, path)`` of each delete_tree call.
+    workspace_tree_deletes: list[tuple[UUID, UUID, str]] = field(default_factory=list)
+    workspace_tree_delete_error: Exception | None = None
     #: Phase 3a — the ``(tenant_id, user_id)`` of each mark_deleted call.
     workspace_deletions: list[tuple[UUID, UUID]] = field(default_factory=list)
     workspace_deletion_error: Exception | None = None
@@ -282,6 +301,11 @@ class RecordingWorkspaceStore:
         if self.workspace_delete_error is not None:
             raise self.workspace_delete_error
         self.workspace_deletes.append((tenant_id, user_id, path))
+
+    async def delete_tree(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
+        if self.workspace_tree_delete_error is not None:
+            raise self.workspace_tree_delete_error
+        self.workspace_tree_deletes.append((tenant_id, user_id, path))
 
     async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
         if self.workspace_deletion_error is not None:

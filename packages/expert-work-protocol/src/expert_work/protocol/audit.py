@@ -131,6 +131,11 @@ class AuditAction(StrEnum):
     # (Phase 1 shipped the delete with no audit; Phase 2 backfills it — the
     # governance surface lets an admin delete another user's file).
     WORKSPACE_FILE_DELETE = "workspace:file_delete"
+    # 留存链 X-4 ②(retention-cleanup-job):软删且已归档满 90 天的
+    # ``user_workspace`` 行连同从属行(artifact / artifact_version / user_upload)
+    # 物理删除;OSS 归档对象不在这里删(桶生命周期到期)。resource_type 复用
+    # ``user_workspace``。
+    WORKSPACE_HARD_DELETE = "workspace:hard_delete"
     # workspace state projection (Stream CM-0 — Mini-ADR CM-A6); DB→file
     # projection of agent state (PLAN.md / TODO.md / MEMORY.md). resource_type
     # reuses ``user_workspace``.
@@ -231,6 +236,10 @@ class AuditAction(StrEnum):
     # wiring lands when ToolEnv gains an :class:`AuditLogger` handle.
     ARTIFACT_DELETE = "artifact:delete"
     ARTIFACT_UPDATE = "artifact:update"
+    # 留存链 B-28(retention-cleanup-job):``artifact_version`` 满 90 天的版本
+    # 连文件带行一起清掉;一个逻辑产物所有版本都清完时行标过期(``deleted_at``)。
+    # 一条审计对应一个逻辑产物一次 sweep,details 里列出清掉的版本号。
+    ARTIFACT_EXPIRED = "artifact:expired"
     # approval / HITL (Stream J.8 — Mini-ADR J-24)
     APPROVAL_REQUESTED = "approval:requested"
     APPROVAL_DECIDED = "approval:decided"

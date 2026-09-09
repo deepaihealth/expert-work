@@ -13,6 +13,7 @@ forgotten WHERE clause cannot cross-leak.
 from __future__ import annotations
 
 import abc
+from datetime import datetime
 from uuid import UUID
 
 from expert_work.protocol import UserUpload, UserUploadKind
@@ -52,6 +53,22 @@ class UserUploadStore(abc.ABC):
         """Return the row by id, or ``None`` when the id is unknown or
         belongs to a different tenant. Does **not** filter on ``user_id``
         or ``deleted_at`` — the caller compares both itself."""
+
+    @abc.abstractmethod
+    async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
+        """留存链(上传 90 天)—— 跨租户列出 ``deleted_at IS NULL AND created_at <
+        before`` 的行,最老在前。Caller MUST be inside an RLS bypass scope(the
+        retention job's ``_bypass_rls``)。Already soft-deleted rows are not
+        candidates — the sweep marks, it does not re-mark."""
+
+    @abc.abstractmethod
+    async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        """Flip ``deleted_at`` on an active row; ``True`` on that transition.
+
+        ``False`` when the id is unknown for this tenant or already
+        soft-deleted (idempotent). The external read surfaces already treat
+        ``deleted_at IS NOT NULL`` as 404 (``external_uploads.py``), so this is
+        the whole "expired" state — no new column."""
 
     @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:

@@ -53,6 +53,18 @@ class InMemoryUserUploadStore(UserUploadStore):
     async def get(self, *, upload_id: UUID, tenant_id: UUID) -> UserUpload | None:
         return self._rows.get((tenant_id, upload_id))
 
+    async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
+        rows = [r for r in self._rows.values() if r.deleted_at is None and r.created_at < before]
+        rows.sort(key=lambda r: (r.created_at, str(r.id)))
+        return rows[:limit]
+
+    async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        row = self._rows.get((tenant_id, upload_id))
+        if row is None or row.deleted_at is not None:
+            return False
+        self._rows[(tenant_id, upload_id)] = row.model_copy(update={"deleted_at": now})
+        return True
+
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         victims = [
             key

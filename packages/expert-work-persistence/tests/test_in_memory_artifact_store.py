@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -439,3 +439,96 @@ async def test_set_version_digest_backfills_size_and_sha() -> None:
     assert latest is not None
     assert latest.size_bytes == 128
     assert latest.sha256 == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# 留存链 B-28 —— 按版本 90 天:list_versions_expired / delete_versions /
+# mark_expired_if_versionless / list_versions_by_artifact
+# ---------------------------------------------------------------------------
+
+
+async def _seed_versions(store: InMemoryArtifactStore, *, name: str, ages_days: list[int]) -> UUID:
+    tenant_id, user_id = uuid4(), uuid4()
+    artifact_id: UUID | None = None
+    for i, age in enumerate(ages_days, start=1):
+        v = await store.save_version(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            name=name,
+            kind="document",
+            path_in_workspace=f"{name}.v{i}",
+            created_in_thread="t",
+        )
+        artifact_id = v.artifact_id
+        backdated = datetime.now(UTC) - timedelta(days=age)
+        store._versions = [
+            x.model_copy(update={"created_at": backdated}) if x.id == v.id else x
+            for x in store._versions
+        ]
+    assert artifact_id is not None
+    return artifact_id
+
+
+@pytest.mark.asyncio
+async def test_list_versions_expired_is_per_version_oldest_first() -> None:
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="a.md", ages_days=[120, 100, 5])
+    b = await _seed_versions(store, name="b.md", ages_days=[3])
+    cutoff = datetime.now(UTC) - timedelta(days=90)
+
+    expired = await store.list_versions_expired(before=cutoff)
+
+    assert [(v.artifact_id, v.version) for v in expired] == [(a, 1), (a, 2)]
+    assert b not in {v.artifact_id for v in expired}
+    assert await store.list_versions_expired(before=cutoff, limit=1) == expired[:1]
+
+
+@pytest.mark.asyncio
+async def test_delete_versions_then_mark_expired_only_when_none_left() -> None:
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="a.md", ages_days=[120, 5])
+    now = datetime.now(UTC)
+    versions = await store.list_versions_by_artifact(artifact_id=a)
+    assert [v.version for v in versions] == [2, 1]
+
+    assert await store.delete_versions(version_ids=[versions[1].id]) == 1
+    assert await store.delete_versions(version_ids=[versions[1].id]) == 0  # idempotent
+    assert await store.mark_expired_if_versionless(artifact_id=a, now=now) is False
+    assert [v.version for v in await store.list_versions_by_artifact(artifact_id=a)] == [2]
+
+    assert await store.delete_versions(version_ids=[versions[0].id]) == 1
+    assert await store.mark_expired_if_versionless(artifact_id=a, now=now) is True
+    assert await store.mark_expired_if_versionless(artifact_id=a, now=now) is False  # already
+    assert await store.mark_expired_if_versionless(artifact_id=uuid4(), now=now) is False
+
+    row = next(iter(store._artifacts.values()))
+    assert row.deleted_at == now
+    # list_versions hides the soft-deleted parent; list_versions_by_artifact does not.
+    assert (
+        await store.list_versions(tenant_id=row.tenant_id, user_id=row.user_id, name="a.md") is None
+    )
+    assert await store.list_versions_by_artifact(artifact_id=a) == []
+
+
+@pytest.mark.asyncio
+async def test_list_versions_expired_orders_same_timestamp_by_version() -> None:
+    """Same tiebreak as the SQL store: identical ``created_at`` → ``version``
+    ascending, never the (random) row id. Ids are forced into reverse
+    version order so an ``id`` tiebreak is deterministically wrong."""
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="tie.md", ages_days=[100, 100, 100])
+    reversed_ids = [
+        UUID("ffffffff-0000-4000-8000-000000000001"),
+        UUID("88888888-0000-4000-8000-000000000002"),
+        UUID("00000000-0000-4000-8000-000000000003"),
+    ]
+    same_ts = datetime.now(UTC) - timedelta(days=100)
+    store._versions = [
+        v.model_copy(update={"id": reversed_ids[v.version - 1], "created_at": same_ts})
+        for v in store._versions
+    ]
+    cutoff = datetime.now(UTC) - timedelta(days=90)
+
+    expired = await store.list_versions_expired(before=cutoff)
+
+    assert [(v.artifact_id, v.version) for v in expired] == [(a, 1), (a, 2), (a, 3)]
