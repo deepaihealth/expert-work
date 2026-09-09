@@ -6,27 +6,31 @@
  * login (backend forces ``temporary=true``). Short passwords surface an
  * inline error and never hit the API.
  *
- * Deletion-hygiene PR5 adds the one-shot "deactivate & purge" action:
- * type-to-confirm (the member's email) arms the danger button, success
- * refreshes the roster, a partial failure keeps the modal open for a
- * retry, and a never-signed-in member shows the "no data" note.
+ * Deletion-hygiene PR5 added the "purge" action; X-4 ① (2026-09-09) made
+ * it step two of a two-step offboarding: the button only shows on a
+ * suspended / revoked row. Type-to-confirm (the member's email) arms the
+ * danger button, success refreshes the roster, a partial failure keeps
+ * the modal open for a retry, a Keycloak outage (502) surfaces the error
+ * and keeps the modal open, and a never-signed-in member shows the "no
+ * data" note.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "antd";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import "../../i18n";
+import i18n from "../../i18n";
 
 import { SettingsMembers } from "../SettingsMembers";
 import { AuthProvider } from "../../auth/AuthContext";
-import { setStoredToken } from "../../api/client";
+import { ApiError, setStoredToken } from "../../api/client";
 import {
   inviteMembers,
   listMembers,
   purgeMember,
   resendMember,
   resetMemberPassword,
+  revokeMember,
   type MemberPurgeResult,
   type TenantMember,
 } from "../../api/members";
@@ -140,6 +144,16 @@ const suspendedMember: TenantMember = {
   subject_id: "s-3",
 };
 
+/** Invite withdrawn before first sign-in — purgeable, no business data. */
+const revokedNoLogin: TenantMember = {
+  ...invitedNoLogin,
+  id: "m-4",
+  email: "erin@example.com",
+  display_name: "Erin",
+  status: "revoked",
+  keycloak_user_id: "kc-4",
+};
+
 const PURGE_SUMMARY_OK: PurgeSummary = {
   tenant_id: "t1",
   user_id: "s-1",
@@ -156,20 +170,20 @@ const PURGE_SUMMARY_OK: PurgeSummary = {
 };
 
 const PURGE_OK: MemberPurgeResult = {
-  member_id: "m-1",
+  member_id: "m-3",
   status: "suspended",
   kc_deleted: true,
-  kc_delete_failed: false,
   role_bindings_removed: 1,
   role_bindings_cleanup_failed: false,
   data_purged: true,
   purge: PURGE_SUMMARY_OK,
 };
 
+// A Keycloak outage is a 502 now (nothing purged), so the partial shape is a
+// best-effort step after the account delete — here the role-binding sweep.
 const PURGE_PARTIAL: MemberPurgeResult = {
   ...PURGE_OK,
-  kc_deleted: false,
-  kc_delete_failed: true,
+  role_bindings_cleanup_failed: true,
   data_purged: false,
   purge: null,
 };
@@ -207,26 +221,32 @@ afterEach(() => {
 
 describe("SettingsMembers — 切入态置灰 (W3)", () => {
   it("home 态邀请/清除可用(两态其一)", async () => {
-    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [activeMember, suspendedMember],
+      total: 2,
+    });
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
     );
     expect(screen.getByTestId("members-invite-btn")).toBeEnabled();
-    expect(screen.getByTestId("members-purge-m-1")).toBeEnabled();
+    expect(screen.getByTestId("members-purge-m-3")).toBeEnabled();
   });
 
   it("切入态置灰邀请/清除(两态其二)", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
-    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [activeMember, suspendedMember],
+      total: 2,
+    });
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
     );
     expect(screen.getByTestId("members-invite-btn")).toBeDisabled();
-    expect(screen.getByTestId("members-purge-m-1")).toBeDisabled();
+    expect(screen.getByTestId("members-purge-m-3")).toBeDisabled();
     expect(screen.getByTestId("members-remove-m-1")).toBeDisabled();
   });
 });
@@ -278,30 +298,35 @@ describe("SettingsMembers — set password", () => {
   });
 });
 
-describe("SettingsMembers — deactivate & purge", () => {
-  it("shows the purge action for invited, active and suspended members", async () => {
+describe("SettingsMembers — purge (step two of offboarding)", () => {
+  it("shows the purge action only for suspended / revoked members", async () => {
     vi.mocked(listMembers).mockResolvedValue({
-      items: [activeMember, invitedNoLogin, suspendedMember],
-      total: 3,
+      items: [activeMember, invitedNoLogin, suspendedMember, revokedNoLogin],
+      total: 4,
     });
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
     );
-    expect(screen.getByTestId("members-purge-m-2")).toBeInTheDocument();
-    expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument();
+    expect(screen.getByTestId("members-purge-m-4")).toBeInTheDocument();
+    // active / invited rows must be deactivated first (DELETE) — no purge.
+    expect(screen.queryByTestId("members-purge-m-1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("members-purge-m-2")).not.toBeInTheDocument();
+    // …and the deactivated rows have no "remove" button to double up on.
+    expect(screen.queryByTestId("members-remove-m-3")).not.toBeInTheDocument();
+    expect(screen.getByTestId("members-remove-m-1")).toBeInTheDocument();
   });
 
   it("arms the confirm button only on an exact email match", async () => {
-    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    vi.mocked(listMembers).mockResolvedValue({ items: [suspendedMember], total: 1 });
     const user = userEvent.setup();
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
     );
-    await user.click(screen.getByTestId("members-purge-m-1"));
+    await user.click(screen.getByTestId("members-purge-m-3"));
 
     const ok = await screen.findByTestId("purge-confirm-ok");
     expect(ok).toBeDisabled();
@@ -314,27 +339,27 @@ describe("SettingsMembers — deactivate & purge", () => {
     await user.type(input, "wrong@example.com");
     expect(ok).toBeDisabled();
     await user.clear(input);
-    await user.type(input, "alice@example.com");
+    await user.type(input, "dave@example.com");
     expect(ok).toBeEnabled();
   });
 
   it("purges the member and refreshes the roster on success", async () => {
-    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    vi.mocked(listMembers).mockResolvedValue({ items: [suspendedMember], total: 1 });
     vi.mocked(purgeMember).mockResolvedValue(PURGE_OK);
     const user = userEvent.setup();
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
     );
-    await user.click(screen.getByTestId("members-purge-m-1"));
+    await user.click(screen.getByTestId("members-purge-m-3"));
     await user.type(
       await screen.findByTestId("purge-confirm-input"),
-      "alice@example.com",
+      "dave@example.com",
     );
     await user.click(screen.getByTestId("purge-confirm-ok"));
 
-    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-1"));
+    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-3"));
     // Success closes the modal and re-fetches the roster.
     await waitFor(() => expect(listMembers).toHaveBeenCalledTimes(2));
     await waitFor(() =>
@@ -345,61 +370,87 @@ describe("SettingsMembers — deactivate & purge", () => {
   });
 
   it("keeps the modal open on a partial failure so retry stays actionable", async () => {
-    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    vi.mocked(listMembers).mockResolvedValue({ items: [suspendedMember], total: 1 });
     vi.mocked(purgeMember).mockResolvedValue(PURGE_PARTIAL);
     const user = userEvent.setup();
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
     );
-    await user.click(screen.getByTestId("members-purge-m-1"));
+    await user.click(screen.getByTestId("members-purge-m-3"));
     await user.type(
       await screen.findByTestId("purge-confirm-input"),
-      "alice@example.com",
+      "dave@example.com",
     );
     await user.click(screen.getByTestId("purge-confirm-ok"));
 
-    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-1"));
+    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-3"));
     // Partial failure stays put — modal open for a retry, no roster refresh.
     expect(screen.getByTestId("purge-confirm-input")).toBeInTheDocument();
     expect(listMembers).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the modal open when the data-purge step failed to even start", async () => {
-    vi.mocked(listMembers).mockResolvedValue({ items: [activeMember], total: 1 });
+    vi.mocked(listMembers).mockResolvedValue({ items: [suspendedMember], total: 1 });
     vi.mocked(purgeMember).mockResolvedValue(PURGE_DATA_STEP_FAILED);
     const user = userEvent.setup();
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-1")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
     );
-    await user.click(screen.getByTestId("members-purge-m-1"));
+    await user.click(screen.getByTestId("members-purge-m-3"));
     await user.type(
       await screen.findByTestId("purge-confirm-input"),
-      "alice@example.com",
+      "dave@example.com",
     );
     await user.click(screen.getByTestId("purge-confirm-ok"));
 
-    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-1"));
+    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-3"));
     // Partial failure stays put — modal open for a retry, no roster refresh.
+    expect(screen.getByTestId("purge-confirm-input")).toBeInTheDocument();
+    expect(listMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a Keycloak outage (502) and keeps the modal open for a retry", async () => {
+    vi.mocked(listMembers).mockResolvedValue({ items: [suspendedMember], total: 1 });
+    vi.mocked(purgeMember).mockRejectedValue(
+      new ApiError("keycloak unreachable; nothing purged, retry", "KEYCLOAK_UNAVAILABLE", 502),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-purge-m-3")).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId("members-purge-m-3"));
+    await user.type(
+      await screen.findByTestId("purge-confirm-input"),
+      "dave@example.com",
+    );
+    await user.click(screen.getByTestId("purge-confirm-ok"));
+
+    await waitFor(() => expect(purgeMember).toHaveBeenCalledWith("m-3"));
+    // The backend touched nothing — the error dialog names the code, the
+    // confirm modal stays open (retryable) and the roster is not refreshed.
+    expect(await screen.findByText(/KEYCLOAK_UNAVAILABLE/)).toBeInTheDocument();
     expect(screen.getByTestId("purge-confirm-input")).toBeInTheDocument();
     expect(listMembers).toHaveBeenCalledTimes(1);
   });
 
   it("notes there is no business data for a member who never signed in", async () => {
     vi.mocked(listMembers).mockResolvedValue({
-      items: [invitedNoLogin],
+      items: [revokedNoLogin],
       total: 1,
     });
     const user = userEvent.setup();
     renderPage();
 
     await waitFor(() =>
-      expect(screen.getByTestId("members-purge-m-2")).toBeInTheDocument(),
+      expect(screen.getByTestId("members-purge-m-4")).toBeInTheDocument(),
     );
-    await user.click(screen.getByTestId("members-purge-m-2"));
+    await user.click(screen.getByTestId("members-purge-m-4"));
 
     expect(
       await screen.findByTestId("members-purge-no-data-note"),
@@ -598,5 +649,76 @@ describe("SettingsMembers — cross-tenant read-only view", () => {
     await screen.findByText("alice@example.com");
     const expected = new Date("2026-08-27T08:00:00Z").toLocaleString();
     expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+});
+
+describe("SettingsMembers — last active admin guard", () => {
+  it("disables remove (with tooltip) for the only active admin — invited / suspended admins and active non-admins do not count", async () => {
+    const activeOperator: TenantMember = {
+      ...activeMember,
+      id: "m-6",
+      email: "olu@example.com",
+      display_name: "Olu",
+      role: "operator",
+      keycloak_user_id: "kc-6",
+      subject_id: "s-6",
+    };
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [activeMember, invitedNoLogin, suspendedMember, activeOperator],
+      total: 4,
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-remove-m-1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("members-remove-m-1")).toBeDisabled();
+    // An active operator is not an admin — it neither unlocks m-1 nor is
+    // itself blocked.
+    expect(screen.getByTestId("members-remove-m-6")).toBeEnabled();
+    await user.hover(screen.getByTestId("members-last-admin-m-1"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      i18n.t("settings_members.last_admin_tooltip"),
+    );
+    // The gate is about admins only — an invited admin's "remove" stays live.
+    expect(screen.getByTestId("members-remove-m-2")).toBeEnabled();
+  });
+
+  it("enables remove once a second active admin exists and maps the backend MEMBER_LAST_ADMIN 409 to the i18n message", async () => {
+    const secondAdmin: TenantMember = {
+      ...activeMember,
+      id: "m-5",
+      email: "fay@example.com",
+      display_name: "Fay",
+      keycloak_user_id: "kc-5",
+      subject_id: "s-5",
+    };
+    vi.mocked(listMembers).mockResolvedValue({
+      items: [activeMember, secondAdmin],
+      total: 2,
+    });
+    // Backend is the source of truth (the page only sees one roster page):
+    // a concurrent change can still make the server refuse.
+    vi.mocked(revokeMember).mockRejectedValue(
+      new ApiError("cannot suspend the tenant's last active admin", "MEMBER_LAST_ADMIN", 409),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("members-remove-m-5")).toBeEnabled(),
+    );
+    expect(screen.getByTestId("members-remove-m-1")).toBeEnabled();
+    await user.click(screen.getByTestId("members-remove-m-5"));
+    await user.click(
+      await screen.findByRole("button", { name: i18n.t("common.delete") }),
+    );
+
+    await waitFor(() => expect(revokeMember).toHaveBeenCalledWith("m-5"));
+    expect(
+      await screen.findByText(i18n.t("settings_members.last_admin_error")),
+    ).toBeInTheDocument();
+    expect(listMembers).toHaveBeenCalledTimes(1); // refused → no refresh
   });
 });

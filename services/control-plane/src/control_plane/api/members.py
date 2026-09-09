@@ -27,11 +27,13 @@ from control_plane.api._user_scope import get_user_repo
 
 # Same-app private share (deletion-hygiene PR5 design decision): the purge-deps
 # assembly stays in agent_users.py next to the user-purge endpoint; the members
-# one-shot purge below reuses it rather than duplicating the wiring.
+# purge below reuses it rather than duplicating the wiring.
 from control_plane.api.agent_users import _build_purge_deps
 from control_plane.api.member_ops import (
+    MEMBER_LAST_ADMIN,
     MemberConflictError,
     MemberKeycloakUnavailableError,
+    has_other_active_admin,
     invite_member,
     resend_member,
 )
@@ -343,6 +345,31 @@ def build_members_router() -> APIRouter:
         if member is None:
             raise HTTPException(status_code=404, detail={"code": "MEMBER_NOT_FOUND"})
 
+        # Last-active-admin guard (X-4 ① follow-up, 2026-09-09): suspending
+        # the tenant's only reachable admin — yourself included — locks the
+        # tenant out of its own console, and the two-step purge downstream
+        # can then never be undone. Sits before any branch and has no
+        # principal-specific bypass (a system_admin acting in the tenant
+        # hits it too). Same judgement as ``DELETE /v1/role_bindings/{id}``
+        # (``member_ops.has_other_active_admin``).
+        if (
+            member.status == "active"
+            and member.role == "admin"
+            and not await has_other_active_admin(
+                member_store=member_repo,
+                role_binding_store=role_binding_repo,
+                tenant_id=principal.tenant_id,
+                exclude_member_id=member.id,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": MEMBER_LAST_ADMIN,
+                    "message": "cannot suspend the tenant's last active admin",
+                },
+            )
+
         now = datetime.now(UTC)
         if member.status == "invited":
             # Withdraw the invite — soft-delete + remove the Keycloak account.
@@ -420,53 +447,70 @@ def build_members_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> dict[str, object]:
-        """One-shot deactivate + purge — deletion-hygiene PR5 (D1 + D2).
+        """Purge a deactivated member — step two of the two-step offboarding.
 
-        The employee-offboarding combo the members page calls: lifecycle
-        transition (invited→revoked / active→suspended), role-binding
-        cleanup, Keycloak account DELETE (unlike revoke's disable), and the
-        ``purge_user`` data cascade for members who have logged in
-        (``subject_id`` back-filled). Terminal states (suspended / revoked)
-        re-enter without a transition — the backfill-cleanup path — so
-        re-running is safe and idempotent.
+        X-4 ① (2026-09-09) tightened the deletion-hygiene PR5 one-shot into a
+        two-step flow: the member must already be ``suspended`` / ``revoked``
+        (``DELETE /{member_id}`` is step one) — purging an ``active`` /
+        ``invited`` row is refused with 409 so a single click can never take
+        a working account down. The caller's own row is refused too (409),
+        even when suspended: a still-valid JWT must not finish its own
+        offboarding.
 
-        The lifecycle transition is the one BLOCKING step: a lost race
-        aborts with 409 before any side effect (continuing would purge a
-        still-active member's data). Every later step is best-effort with
-        its failure surfaced in the response + audit details.
+        Cascade, in order: Keycloak account DELETE (the one BLOCKING step —
+        unreachable IdP → 502 with **no** local row touched, so the call is
+        retryable), then the role bindings keyed on the KC sub, then the
+        ``purge_user`` data cascade for members who have signed in
+        (``subject_id`` back-filled — the *employee's own* ``tenant_user``
+        registry row and its threads / memory / workspace; external end-users
+        are distinct ``tenant_user`` rows and are never touched here). The
+        ``tenant_member`` row itself is kept in its terminal status (audit
+        trail; the 90-day retention sweep owns physical deletion), so a
+        re-run is idempotent: 200 with every step a no-op.
+
+        Every step after the Keycloak delete is best-effort with its failure
+        surfaced in the response + audit details — the operator re-runs to
+        finish a partial purge.
         """
-        from datetime import UTC, datetime
-
         member = await member_repo.get(tenant_id=principal.tenant_id, member_id=member_id)
         if member is None:
             raise HTTPException(status_code=404, detail={"code": "MEMBER_NOT_FOUND"})
-
-        now = datetime.now(UTC)
-        # 1) Lifecycle — same state machine as revoke; failure blocks all.
-        target_status: MemberStatus = member.status
-        if member.status == "invited":
-            target_status = "revoked"
-            moved = await member_repo.transition(
-                member_id=member.id, tenant_id=principal.tenant_id, to="revoked", now=now
+        if member.keycloak_user_id is not None and member.keycloak_user_id == principal.subject_id:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "MEMBER_PURGE_SELF", "message": "cannot purge your own account"},
             )
-        elif member.status == "active":
-            target_status = "suspended"
-            moved = await member_repo.transition(
-                member_id=member.id, tenant_id=principal.tenant_id, to="suspended", now=now
-            )
-        else:  # suspended / revoked — already terminal; backfill cleanup only.
-            moved = True
-        if not moved:
+        if member.status not in ("suspended", "revoked"):
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "code": "MEMBER_STATE_CONFLICT",
-                    "message": "member state changed concurrently; re-read and retry",
+                    "code": "MEMBER_NOT_DEACTIVATED",
+                    "message": f"member is {member.status}; suspend or revoke it first",
                 },
             )
 
-        # 2) Role-binding cleanup (same shape as revoke — keyed on the KC sub;
-        #    best-effort, failure flagged in the response + audit).
+        # 1) Keycloak account DELETE — blocking. The client treats a 404 as
+        #    success, so a re-run (or a revoked row whose account went at
+        #    revoke time) stays idempotent. Runs before any local write: an
+        #    unreachable IdP leaves nothing half-done.
+        kc_deleted = False
+        if member.keycloak_user_id is not None:
+            try:
+                await keycloak.delete_user(user_id=member.keycloak_user_id)
+                kc_deleted = True
+            except KeycloakUnavailableError as exc:
+                logger.warning("member_purge.keycloak_delete_failed", exc_info=True)
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "code": "KEYCLOAK_UNAVAILABLE",
+                        "message": "keycloak unreachable; nothing purged, retry",
+                    },
+                ) from exc
+
+        # 2) Role-binding sweep (same shape as revoke — keyed on the KC sub;
+        #    suspend already removed the originals, this catches anything
+        #    granted since). Best-effort, failure flagged in response + audit.
         removed = 0
         cleanup_failed = False
         if member.keycloak_user_id is not None:
@@ -480,29 +524,17 @@ def build_members_router() -> APIRouter:
                 cleanup_failed = True
                 logger.warning("member_purge.role_binding_cleanup_failed", exc_info=True)
 
-        # 3) Keycloak account DELETE (D2) — best-effort; the client treats a
-        #    404 as success, so a re-run stays idempotent.
-        kc_deleted = False
-        kc_delete_failed = False
-        if member.keycloak_user_id is not None:
-            try:
-                await keycloak.delete_user(user_id=member.keycloak_user_id)
-                kc_deleted = True
-            except KeycloakUnavailableError:
-                kc_delete_failed = True
-                logger.warning("member_purge.keycloak_delete_failed", exc_info=True)
-
-        # 4) Data cascade — only for members who have logged in.
+        # 3) Data cascade — only for members who have signed in.
         #    ``member.subject_id`` is the tenant_user surrogate; ``purge_user``
         #    also needs the user row's string subject (mcp_oauth key), read
         #    from the registry. A missing row (anomalous) skips the data step
         #    rather than erroring — ``data_purged: false`` flags it.
-        #    Best-effort like every step after the lifecycle move: the registry
-        #    read and the dep assembly sit outside ``purge_user``'s per-step
-        #    net, and raising here would 500 *after* the Keycloak account is
-        #    already gone — a destructive prefix with no audit row. Flag it and
-        #    fall through to the audit + response instead; the endpoint is
-        #    idempotent, so the operator re-runs to finish the data step.
+        #    Best-effort like every step after the Keycloak delete: the
+        #    registry read and the dep assembly sit outside ``purge_user``'s
+        #    per-step net, and raising here would 500 *after* the Keycloak
+        #    account is already gone — a destructive prefix with no audit row.
+        #    Flag it and fall through to the audit + response instead; the
+        #    endpoint is idempotent, so the operator re-runs to finish.
         data_purged = False
         data_purge_failed = False
         summary: PurgeSummary | None = None
@@ -535,7 +567,6 @@ def build_members_router() -> APIRouter:
                 "email": member.email,
                 "from_status": member.status,
                 "kc_deleted": kc_deleted,
-                "kc_delete_failed": kc_delete_failed,
                 "role_bindings_removed": removed,
                 "role_bindings_cleanup_failed": cleanup_failed,
                 "data_purged": data_purged,
@@ -551,9 +582,8 @@ def build_members_router() -> APIRouter:
             "success": True,
             "data": {
                 "member_id": str(member.id),
-                "status": target_status,
+                "status": member.status,
                 "kc_deleted": kc_deleted,
-                "kc_delete_failed": kc_delete_failed,
                 "role_bindings_removed": removed,
                 "role_bindings_cleanup_failed": cleanup_failed,
                 "data_purged": data_purged,

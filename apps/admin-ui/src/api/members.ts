@@ -119,15 +119,16 @@ export async function resetMemberPassword(
   );
 }
 
-/** ``POST /v1/members/{id}:purge`` response — deletion-hygiene PR5. Every
- *  step after the lifecycle transition is best-effort, so failures surface
- *  as booleans instead of an error status. ``purge`` is ``null`` when the
+/** ``POST /v1/members/{id}:purge`` response. The Keycloak account delete
+ *  is the one blocking step (an unreachable IdP is a 502 with nothing
+ *  purged); every step after it is best-effort, so failures surface as
+ *  booleans instead of an error status. ``purge`` is ``null`` when the
  *  member never signed in (``subject_id`` null — no business data). */
 export interface MemberPurgeResult {
   member_id: string;
   status: MemberStatus;
+  /** ``false`` only when the member never had a Keycloak account. */
   kc_deleted: boolean;
-  kc_delete_failed: boolean;
   role_bindings_removed: number;
   role_bindings_cleanup_failed: boolean;
   data_purged: boolean;
@@ -144,18 +145,19 @@ export interface MemberPurgeResult {
  *  supervisor (the workspace step fails there) — still "partial". */
 export function isMemberPurgePartial(result: MemberPurgeResult): boolean {
   return (
-    result.kc_delete_failed ||
     result.role_bindings_cleanup_failed ||
     result.data_purge_failed === true ||
     (result.purge !== null && !result.purge.ok)
   );
 }
 
-/** POST /v1/members/{id}:purge — one-shot deactivate + purge (admin-only).
- *  Lifecycle transition (invited→revoked / active→suspended), role-binding
- *  cleanup, Keycloak account DELETE, then the ``purge_user`` data cascade
- *  for members who have signed in. Idempotent — safe to re-run to finish
- *  a partial purge. */
+/** POST /v1/members/{id}:purge — step two of the two-step offboarding
+ *  (admin-only). The member must already be suspended / revoked (``DELETE``
+ *  is step one; an active / invited row is a 409, so is the caller's own
+ *  row). Keycloak account DELETE (502 + nothing purged when the IdP is
+ *  down), role-binding sweep, then the ``purge_user`` data cascade for
+ *  members who have signed in. Idempotent — safe to re-run to finish a
+ *  partial purge. */
 export async function purgeMember(memberId: string): Promise<MemberPurgeResult> {
   return postJson<MemberPurgeResult>(
     `/v1/members/${encodeURIComponent(memberId)}:purge`,

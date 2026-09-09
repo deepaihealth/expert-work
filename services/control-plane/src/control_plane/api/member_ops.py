@@ -36,6 +36,69 @@ _ROLE_BY_NAME: dict[MemberRole, Role] = {
 }
 
 
+#: 409 code shared by ``DELETE /v1/members/{id}`` and
+#: ``DELETE /v1/role_bindings/{id}`` when the target is the tenant's last
+#: reachable admin.
+MEMBER_LAST_ADMIN = "MEMBER_LAST_ADMIN"
+
+#: Roster page size for the last-active-admin scan (``list_for_tenant`` pages).
+_ROSTER_PAGE = 200
+
+
+async def has_other_active_admin(
+    *,
+    member_store: TenantMemberStore,
+    role_binding_store: RoleBindingStore,
+    tenant_id: UUID,
+    exclude_member_id: UUID | None = None,
+    exclude_binding_id: UUID | None = None,
+) -> bool:
+    """``True`` when the tenant keeps at least one **active** member with
+    roster role ``admin`` who still holds an unconditioned tenant-scope
+    ADMIN role binding — ignoring ``exclude_member_id`` (the member about
+    to be suspended) and ``exclude_binding_id`` (the binding about to be
+    deleted).
+
+    Both halves are required to keep the console reachable: an invited
+    admin has never signed in, a suspended one has no access, and an active
+    admin whose binding is gone fails ``require()``. Conditioned bindings
+    grant nothing at the matrix level (``auth/tenant_roles.py``) and
+    platform-scope rows are outside the tenant lifecycle (``list_for_tenant``
+    excludes them), so neither counts. One judgement, two call sites —
+    ``DELETE /v1/members/{id}`` and ``DELETE /v1/role_bindings/{id}``.
+    Optimistic (no lock): two admins removing each other concurrently can
+    both pass.
+    """
+    bindings = await role_binding_store.list_for_tenant(tenant_id=tenant_id)
+    admin_subjects = {
+        b.subject_id
+        for b in bindings
+        if b.role is Role.ADMIN
+        and b.subject_type == "user"
+        and not b.has_conditions
+        and b.id != exclude_binding_id
+    }
+    if not admin_subjects:
+        return False
+    offset = 0
+    while True:
+        page = await member_store.list_for_tenant(
+            tenant_id=tenant_id, status="active", limit=_ROSTER_PAGE, offset=offset
+        )
+        for m in page:
+            if m.role != "admin" or m.id == exclude_member_id or m.keycloak_user_id is None:
+                continue
+            try:
+                subject = UUID(m.keycloak_user_id)
+            except ValueError:
+                continue
+            if subject in admin_subjects:
+                return True
+        if len(page) < _ROSTER_PAGE:
+            return False
+        offset += _ROSTER_PAGE
+
+
 class MemberConflictError(Exception):
     """The email already exists in Keycloak (Mini-ADR R-11) — surfaced as 409."""
 

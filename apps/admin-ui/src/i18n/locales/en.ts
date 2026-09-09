@@ -2307,6 +2307,8 @@ export interface TranslationKeys {
     purge_no_data_note: string;
     purge_done: string;
     purge_partial: string;
+    last_admin_tooltip: string;
+    last_admin_error: string;
   };
   settings_platform_users: {
     page_title: string;
@@ -5661,15 +5663,19 @@ const en: TranslationKeys = {
     failed_to_load: "Failed to load members",
     empty: "No members in this tenant yet.",
     empty_cross: "No members across all tenants.",
-    purge_action: "Deactivate & purge",
-    purge_confirm_title: "Deactivate and purge this member · irreversible",
+    purge_action: "Purge",
+    purge_confirm_title: "Purge this member · irreversible",
     purge_confirm_body:
-      "This deactivates {{email}}, deletes their Keycloak account, removes their role bindings, and irreversibly purges their business data. If some steps fail it is safe to run again.",
+      "This member is already deactivated. This deletes {{email}}'s login account, removes any remaining role bindings, and irreversibly purges their business data (conversations · memory · workspace · uploads). If the login system is unreachable nothing is changed — retry later; if some steps fail it is safe to run again.",
     purge_type_to_confirm: "Type the member's email to confirm:",
     purge_no_data_note:
-      "This member has never signed in — there is no business data to purge; the account is deactivated and deleted only.",
-    purge_done: "Member deactivated and purged.",
+      "This member has never signed in — there is no business data to purge; only the login account is deleted.",
+    purge_done: "Member purged.",
     purge_partial: "Some steps failed — safe to run again to finish cleanup.",
+    last_admin_tooltip:
+      "This is the tenant's only active admin — invite and activate another admin before removing them.",
+    last_admin_error:
+      "Cannot remove the tenant's last active admin. Activate another admin first.",
   },
   settings_platform_users: {
     page_title: "Platform Admins",

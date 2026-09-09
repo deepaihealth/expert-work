@@ -2443,15 +2443,18 @@ const zhCN: TranslationKeys = {
     failed_to_load: "加载成员失败",
     empty: "当前租户还没有成员。",
     empty_cross: "所有租户都没有成员。",
-    purge_action: "停用并清除",
-    purge_confirm_title: "停用并清除该成员 · 不可逆",
+    purge_action: "清除",
+    purge_confirm_title: "清除该成员 · 不可逆",
     purge_confirm_body:
-      "将停用 {{email}}、删除其 Keycloak 账号、移除角色授权，并不可逆地清除其业务数据。若部分步骤失败，可安全重跑补齐。",
+      "该成员已停用。将删除 {{email}} 的登录账号、移除残留的角色授权，并不可逆地清除其业务数据（对话 · 记忆 · 工作区 · 上传）。若登录系统暂不可达，本次不会改动任何数据，可稍后重试；若部分步骤失败，可安全重跑补齐。",
     purge_type_to_confirm: "输入该成员的邮箱以确认：",
     purge_no_data_note:
-      "该成员从未登录过系统，没有业务数据可清除；仅停用并删除账号。",
-    purge_done: "成员已停用并清除。",
+      "该成员从未登录过系统，没有业务数据可清除；仅删除登录账号。",
+    purge_done: "成员已清除。",
     purge_partial: "部分步骤失败——可安全重跑补齐清除。",
+    last_admin_tooltip:
+      "这是本租户唯一的活跃管理员——先邀请并激活另一位管理员，才能移除。",
+    last_admin_error: "不能移除本租户最后一个活跃管理员，请先激活另一位管理员。",
   },
   settings_platform_users: {
     page_title: "平台管理员",
