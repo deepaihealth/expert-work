@@ -255,6 +255,13 @@ def console_only() -> Callable[..., Awaitable[None]]:
     return _dep
 
 
+#: Attribute stamped on every dependency callable :func:`external_only`
+#: returns, so "is this route on the external plane" can be answered from
+#: the compiled route (``route.dependant``) without comparing closure
+#: qualnames — see :func:`route_is_external`.
+_EXTERNAL_ONLY_MARK = "_expert_work_external_only"
+
+
 def external_only() -> Callable[..., Awaitable[None]]:
     """Route dependency — 403 any non-service-account principal outright.
 
@@ -311,7 +318,36 @@ def external_only() -> Callable[..., Awaitable[None]]:
             },
         )
 
+    setattr(_dep, _EXTERNAL_ONLY_MARK, True)
     return _dep
+
+
+def route_is_external(route: object) -> bool:
+    """Whether a compiled FastAPI route carries the :func:`external_only` gate.
+
+    B-9: this is THE definition of "external plane" for cross-cutting
+    behaviour such as ``app.py``'s 422 envelope. The previous predicate
+    (``path.startswith("/v1/agents/") OR "external" in route.tags``) was a
+    proxy for it that over-matched: ``/v1/agents`` is the one prefix both
+    planes share, so every ``console_only()`` manifest route on
+    ``agents.py`` (``GET/PUT/DELETE /{name}/{version}``, ``/revisions``,
+    ``/disable``, …) got the third-party envelope on a plain validation
+    422 — a shape the admin-ui never parses. Reading the guard off the
+    route makes the envelope follow the gate by construction: a route can
+    only be enveloped if it is also closed to console credentials, and the
+    two ``external_only()`` routes that live on ``agents.py`` without the
+    ``external`` tag (``bind_session`` / ``run_agent_for_user``) are covered
+    without a prefix table.
+
+    Router-level ``dependencies=[...]`` are flattened into the route's
+    top-level ``dependant.dependencies`` by FastAPI, so a one-level walk
+    sees both per-route and per-router placements.
+    """
+    dependant = getattr(route, "dependant", None)
+    return any(
+        getattr(dep.call, _EXTERNAL_ONLY_MARK, False) is True
+        for dep in getattr(dependant, "dependencies", ())
+    )
 
 
 async def _conditioned_bindings(request: Request, principal: Principal) -> list[RoleBinding]:

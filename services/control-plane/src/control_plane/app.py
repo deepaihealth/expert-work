@@ -108,6 +108,7 @@ from control_plane.api import (
     build_webhooks_router,
     build_workspace_router,
 )
+from control_plane.api._authz import route_is_external
 from control_plane.api.model_catalog import PlatformConfiguredProviders
 from control_plane.approval_metrics import ApprovalGaugeWorker
 from control_plane.approval_timeout_sweep import ApprovalTimeoutSweep
@@ -2708,40 +2709,33 @@ def create_app(
     # for a bad query/body param is ``{"detail": [...]}`` — the one response
     # shape that breaks the third-party envelope contract
     # (``{"success", "data", "error"}``), and parameter validation is the
-    # error class a third-party integrator hits the most. Scoped to
-    # ``/v1/agents/`` + ``tags=["external"]``: the console's own frontend
-    # already parses FastAPI's default shape, so every other route keeps it
-    # unchanged.
+    # error class a third-party integrator hits the most. Scoped to the
+    # external plane only: the console's own frontend parses FastAPI's
+    # default shape (``admin-ui/src/api/client.ts`` reads ``data.detail``),
+    # so every other route keeps it unchanged.
     #
-    # Phase 3 PR-A Task 4 follow-up (production bug found in review): this
-    # used to be ``/v1/agents/`` alone, so ``GET /v1/agent-catalog`` — not
-    # under that prefix — fell back to the bare FastAPI shape (see
-    # ``test_external_hardening.py::test_agent_catalog_422_uses_the_external_envelope``
-    # for the regression test and its mutation proof). The ``/v1/agents/``
-    # half is kept AS-IS rather than replaced by a tag check: that whole
-    # router (``agents.py``) needs the envelope regardless of which guard a
-    # given route carries — ``bind_session``/``run_agent_for_user`` are
-    # ``external_only()``-gated, ``disable``/``enable`` are
-    # ``console_only()``, and both are tagged ``"agents"``, not
-    # ``"external"`` (confirmed live: a tag-only replacement of the prefix
-    # check regressed ``test_bind_session_and_run_422_use_the_external_envelope``
-    # AND ``test_disable_agent_nul_name_is_422`` /
-    # ``test_enable_agent_nul_name_is_422`` in
-    # ``test_external_path_param_nul_guard.py`` — three routes across two
-    # different guard mechanisms a tag-only check cannot see). The
-    # ``tags=["external"]`` half is ADDED, not substituted, so a future
-    # external router under yet another new prefix is covered without
-    # extending a hand-maintained prefix table (the anti-pattern Task 4
-    # exists to remove from the three self-audit tests).
+    # B-9: "external plane" is decided by the matched route carrying the
+    # ``external_only()`` gate (``route_is_external``), not by URL prefix or
+    # tag. The previous predicate — ``path.startswith("/v1/agents/") OR
+    # "external" in tags`` — over-matched: ``/v1/agents`` is the one prefix
+    # both planes share, so the dozen-plus ``console_only()`` manifest routes
+    # on ``agents.py`` got the envelope too and the admin-ui degraded every
+    # such 422 to ``HTTP_422`` + a generic message. Reading the gate off the
+    # route covers everything the old predicate was reaching for — the
+    # seven ``external_*.py`` routers (router-level gate), ``GET
+    # /v1/agent-catalog`` (a different prefix; the Phase 3 PR-A Task 4 bug)
+    # and the two untagged ``external_only()`` routes on ``agents.py``
+    # (``bind_session`` / ``run_agent_for_user``) — with no prefix table and
+    # no tag to forget. Both directions are pinned in
+    # ``test_external_hardening.py`` (``…keep_the_fastapi_422_shape`` /
+    # ``…decided_by_the_guard_not_the_prefix``); the ``disable``/``enable``
+    # NUL cases in ``test_external_path_param_nul_guard.py`` assert the bare
+    # shape for the same reason.
     @app.exception_handler(RequestValidationError)
     async def _external_validation_error(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        route = request.scope.get("route")
-        is_external = request.url.path.startswith("/v1/agents/") or "external" in (
-            getattr(route, "tags", None) or []
-        )
-        if not is_external:
+        if not route_is_external(request.scope.get("route")):
             return await request_validation_exception_handler(request, exc)
         errors = exc.errors()
         message = errors[0]["msg"] if errors else "invalid request"
