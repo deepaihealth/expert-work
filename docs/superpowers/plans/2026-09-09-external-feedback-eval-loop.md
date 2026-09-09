@@ -136,6 +136,12 @@ EOF
 Run with: `STORAGE=/private/tmp/claude-501/-Users-mac-src-github-jone-qian-expert-work/c8d39282-34dd-4791-b489-4f59e02f59b0/scratchpad/console-test.json node - <<'EOF' ... EOF`(把上面的脚本喂进去)。
 Expected: `signal=tool_failure -> 422`;有候选时 `promote source=promoted_candidate -> 422`(信封 `detail` 里含 `literal_error`)。注意 storage 里 token 键名以 `apps/admin-ui/src/api/client.ts` 的 `getStoredToken` 为准,先 `rg -n "localStorage" apps/admin-ui/src/api/client.ts` 核对。
 
+> **✅ 已执行(09-09):拿不到登录态时的等价路径(给后来人)。** 本步要求用户先跑一次 `playwright codegen --save-storage` 亲自登一次;这个前提当时不满足(scratchpad 里也没有存量 storage),于是改走**进程内真 HTTP**:复用 `services/control-plane/tests/test_curation_api.py` 的 `ctx` 夹具(真 `create_app()` + 真路由 + 真 JWT,`auth_mode="dev"`),在临时探针文件里对同一批端点发请求,拿到的是**真实状态码**而非读代码推断的结论;载荷逐字对齐 `CandidatesPanel.tsx:141` 的实际发送内容。
+>
+> 结论强度等价的理由:curation 端点挂 `require("session","write")` / `("session","read")`,**依赖先于 body/query 校验求解** —— 没有登录态只会拿到 401,原步骤本来也必须先有 token 才走得到 422。唯一没覆盖的是「在真实浏览器里点下按钮」那一层,而那一层的结论另有出路(见 Task 5 的「前置事实」:控制台写路径今天只在调试台可达)。
+>
+> 探针文件放 `services/control-plane/tests/` 下才吃得到 `conftest` 夹具,**跑完必须删掉**并用 `git status` 确认工作树只剩预期改动。
+
 - [ ] **Step 3: §7-2 生产库只读三问(pod 内,永不打印 DSN)**
 
 ```bash
@@ -173,6 +179,13 @@ done
 ```
 
 Expected: `configmap.yaml:34` 是 `"true"` 且两个 overlay 都没有覆盖 → 两个 pod 都跑(`app.py:1665-1675` 每个进程都构造 `CurationWorker`);日志计数两边都 >0 即坐实。结论写进 spec §7-3:同步 upsert 与 worker 的竞争靠 `curation_candidate_trajectory_uniq` + `ON CONFLICT DO NOTHING`(`curation/sql.py:246`)+ 升级 UPDATE 幂等;Task 8 的并发集成测(两副本同一 key 同时 upsert 只成一行)是必做项。若某 pod 24h 内一条日志都没有,再看 `logs --previous` 与 `_worker_cycle_errors` 指标,别下「没在跑」的结论(`swept` 只在 detected>0 时打)。
+
+> **⚠️ 已执行(09-09):上面这条「日志计数两边都 >0 即坐实」的判据在实践中不成立。** `curation_worker.swept` 只在 `detected > 0` 时打(`curation_worker.py:322`),而两个环境近期都没有**新**检测(测试环境最后一次 detected_at 是 08-28),所以四个 pod 的 `rg -c "curation_worker\."` 全是 0 —— 本步原文已经提醒了「别下没在跑的结论」,但没给替代判据。**替代判据(实测有效,建议后来人直接用这两条)**:
+>
+> 1. **`pg_stat_activity` 按 `client_addr` 采样**:在任一 pod 内连库,每 0.5s 取一次 `SELECT host(client_addr), left(regexp_replace(query,'\s+',' ','g'),90) FROM pg_stat_activity WHERE datname = current_database() AND client_addr IS NOT NULL AND pid <> pg_backend_pid()`,滚 **≥ 340s**(> 一个 300s 周期),把 query 里含 `curation_candidate` / `thread_meta` / `trajector` 的行按 IP 归堆。worker 的预检查询会把自己暴露出来。**实测:测试环境 `172.16.176.31` 于 t=178s、`172.16.176.32` 于 t=276s 各自独立出现,相隔 ~98s = 两 pod 启动错峰的相位差 → 两个 pod 都在扫,坐实。** 注意别只看 `state='idle'` 的 `query` —— 连接池上最后一条语句常被 `ROLLBACK;` / `COMMIT;` 盖掉,要靠高频采样抓 `active` 的那一瞬。
+> 2. **per-pod metrics 计数器**(比日志强,因为它是进程内累计值):逐 pod 取 `http://127.0.0.1:8000/metrics` 里的 `expert_work_control_plane_curation_candidates_detected_total` —— 该计数器**只在 `curation_worker.py:228` 的 `run_once()` 内自增**,非零即证明该 pod 的 loop 真的跑过并落过行。**实测:生产 pod `…-sdpzg` = `1.0`,同期 `…-pz5s8` = `0.0`** —— 这一对数正是「两边都扫、谁先扫到谁建行、另一边预检跳过」的形态,**`0.0` 不能读成「没在跑」**。
+>
+> 另外两条实测顺带记下:①`rolbypassrls` 前置检查通过 —— 生产 `expert_work` / 测试 `expert_work_dev` 都是 `rolsuper=False, rolbypassrls=True`,计数可信,**不需要** `SET ROLE audit_reader`。②本步 Expected 里的 `app.py:1665-1675` 外面还套着 `app.py:1389 if agent_runtime is None:` —— 部署形态走这个分支,注入 runtime 的测试才跳过;判「每个进程都起」要连这层一起看。
 
 - [ ] **Step 5: 回填 spec §7 并提交**
 
@@ -1572,6 +1585,24 @@ git commit -m "feat(external): /items runs[] 与 /messages 每条消息回显本
 - Consumes: Task 2 的 `upsert`。
 - Produces: `FeedbackRequest` 新增必填 `run_id: UUID`;响应 201 body 加 `run_id` 与 `updated`;`submitSessionFeedback(threadId, {rating, comment?, run_id})`;`FeedbackBar` 新 prop `runId: string`;`TurnFooter` 只在 `turn.runId !== null` 时渲染 `FeedbackBar`。控制台老式 `turn_seq` 继续可选透传(死字段不动)。
 
+**前置事实(Task 0 实测,09-09 —— 动手前先读):控制台的写路径今天只在「调试台」可达,对话详情页根本不渲染 `FeedbackBar`。** 渲染链逐层核过:
+
+| 层 | 位置 | 决定性的那一行 |
+|---|---|---|
+| 渲染闸 | `components/console/TurnFooter.tsx:155` | `{!readOnly && (status === "done" \|\| status === "interrupted") && threadId && (<FeedbackBar …/>)}` |
+| 唯一上游 | `components/console/TurnBlock.tsx:238` | `<TurnFooter … readOnly={readOnly} />` |
+| 唯一上游 | `components/console/Transcript.tsx:213` / `:246` | 两处 `<TurnBlock … readOnly={readOnly} />` |
+| 调用点 ① | `pages/ConversationDetail.tsx:702` | 裸 `readOnly`(= `true`)→ **对话详情页永不渲染反馈条** |
+| 调用点 ② | `pages/agent_detail/PlaygroundTab.tsx:705` | `readOnly={false}` → **只有调试台渲染** |
+
+这解释了 Task 0 §7-2 测到的「`feedback` 表两个环境都 0 行、`n_tup_ins = 0`(建表至今没写进过一行)」:能点的地方只有员工自己的调试试跑,**没人会给自己的试跑打分**。
+
+两个由此而来的判断,别搞反:
+
+- **这个 Task 不是「在一条从没通电的线上加约束」。** 调试台那条线是通的(渲染链完整、`services/control-plane/tests/test_feedback_api.py` 三条测试在跑、后端写路径有覆盖),改成必带 `run_id` 是给一条能用的线换键,不是复活死代码。
+- **但也别宣称它会立刻带来数据。** 本 Task 之后 `feedback` 大概率仍然接近 0 行 —— P-2 真正的写入来源是 **Task 3 的对外端点**(终端用户在对接方界面上打分),控制台这条只是顺手对齐语义、避免同一张表两种写法。给用户/审阅者汇报时不要把这个 Task 说成「反馈功能上线了」。
+- **与 PR3 Task 15 不矛盾。** Task 15 在对话详情页加的是**只读展示**(员工看终端用户打的分),`readOnly=true` 挡的是写入按钮,不挡展示。「写只在调试台、读在对话详情页」是本设计的既定形态,不是需要修的 bug;要不要把写入也放开到对话详情页,是另一个产品问题,**本计划不做**。
+
 - [ ] **Step 1: 后端失败测试**
 
 `test_feedback_api.py`:三条既有用例的 body 都加 `"run_id": str(uuid4())`(`:76`、`:109`、`:133` 的 `bad_body` 各项加 `run_id`,并在 `bad_body` 列表**新增** `{"rating": "up"}` 一项 —— 漏 `run_id` 是 422);新增:
@@ -2121,9 +2152,17 @@ Expected: `AttributeError: 'InMemoryCurationCandidateStore' object has no attrib
         ),
 ```
 
-- [ ] **Step 6: 跑确认绿(含并发集成测,§7-3 的结论)**
+- [ ] **Step 6: 跑确认绿(含并发集成测 —— §7-3 已核实,这条 🔴 必做,不是可选)**
 
-`test_sql_curation_store.py` 再加一条并发用例:两个协程同时对同一 `(tenant, key)` 做 `upsert`(`asyncio.gather`)→ `sum(results) == 1`、表里一行;再 `gather` 两个 `upgrade_to_negative` → 两个都 `True`、行仍一条、`feedback_comment` 是其中之一。
+> **为什么必做(Task 0 §7-3 实测,09-09):`curation_worker` 在两个 pod 上同时跑,而且代码里没有任何互斥。** `curation_worker.py:3` 那句「single-replica」只是一句陈旧注释,不是机制 —— 全文件 grep `advisory|lock|replica` 只命中那句话本身,**没有 leader 选举 / advisory lock / lease**。运行期实证:`pg_stat_activity` 按 `client_addr` 采样 340s,测试环境两个 pod(`172.16.176.31` 于 t=178s、`172.16.176.32` 于 t=276s)**各自独立**发出 worker 的 `curation_candidate` 预检查询;生产 pod `…-sdpzg` 的 `expert_work_control_plane_curation_candidates_detected_total = 1.0` 而同期 `…-pz5s8 = 0.0`。
+>
+> **今天不炸的唯一原因**(生产库上实测确认存在,不是推测):唯一索引
+> `curation_candidate_trajectory_uniq ON curation_candidate (tenant_id, trajectory_key)`
+> 配 `packages/expert-work-persistence/src/expert_work/persistence/curation/sql.py:246` 的 `on_conflict_do_nothing(constraint="curation_candidate_trajectory_uniq")`。
+>
+> P-2 把**同步 upsert**(Task 9,落在请求路径上)加进来之后,同一把键上的并发方从「两个 worker」变成「两个 worker + N 个对外写反馈请求」。**只要新路径复用同一把唯一键 + 升级 UPDATE 幂等,就不需要引入锁** —— 但这条不变式必须有测试钉住,否则下次谁把 `on_conflict_do_nothing` 改成 `INSERT` 或者给升级加个「先读后写」就静默退化成竞争。这就是下面这条用例存在的理由。
+
+`test_sql_curation_store.py` 再加一条并发用例:两个协程同时对同一 `(tenant, key)` 做 `upsert`(`asyncio.gather`)→ `sum(results) == 1`、表里一行;再 `gather` 两个 `upgrade_to_negative` → 两个都 `True`、行仍一条、`feedback_comment` 是其中之一。**变异自证**:把 `sql.py:246` 的 `.on_conflict_do_nothing(constraint=…)` 去掉 → 并发用例必须红(`IntegrityError` / 两行);改回 → 绿。
 
 Run: `uv run --no-sync pytest packages/expert-work-persistence/tests/test_in_memory_curation_store.py packages/expert-work-persistence/tests/test_sql_curation_store.py services/control-plane/tests/test_curation_api.py -q` → 全绿。
 
@@ -2742,6 +2781,41 @@ git commit -m "feat(curation): worker 预检去重改「可升级」—— 已�
 **Interfaces:**
 - Consumes: 后端真值:`EvalDatasetSource = "golden" | "trajectory" | "regression"`(`protocol/eval_dataset.py:36`);`CurationSignal` 四值(`:42-50`);`FeedbackRating = "up" | "down"`(`:57`);`EvalDatasetRecord._check_expected`(`:146-156`):`golden` / `regression` 必须带非空 `expected`。
 - Produces: 前端 `EvalDatasetSource` / `CurationSignal` / `feedback_rating` 与后端一致;promote 请求体 `source` 按候选 signal 推导:`negative_feedback` / `failed_outcome` → `"regression"`(弹窗必填 `expected` JSON),`positive_feedback` / `implicit_success` → `"trajectory"`(`expected` 选填)。`CurationCandidate` 新增 `feedback_run_id: string | null`、`feedback_comment: string | null`、`feedback_changed_at: string | null`(展示在 PR3 Task 17)。
+
+**实测前提(Task 0 §7-1,09-09 —— 下面的步骤已按这些真值写好,这里补上「凭什么」)。** 用控制台**原样载荷**在真 app + 真路由 + 真 JWT 上进程内发 HTTP,拿到的是真实状态码:
+
+| 真打的请求 | 返回 |
+|---|---|
+| `POST /v1/curation/candidates/{id}/promote` `{"name":…,"source":"promoted_candidate"}`(= `CandidatesPanel.tsx:141` 今天发的) | **422** `literal_error`,`msg = "Input should be 'golden', 'trajectory' or 'regression'"` |
+| 同一候选,只把 `source` 换成 `"trajectory"` | **201** |
+
+→ **promote 本身没坏,唯一病因就是词表漂移** —— 这也是 Step 5 那句「回路最后一步走通的证据」的底气。
+
+signal 下拉逐个真打 `GET /v1/curation/candidates?status=pending&signal=…`:
+
+| 前端 `SIGNAL_OPTIONS`(`CandidatesPanel.tsx:56-62`)今天的五个值 | 返回 |
+|---|---|
+| `manual` | **422** |
+| `negative_feedback` | 200(0 条) |
+| `tool_failure` | **422** |
+| `timeout` | **422** |
+| `policy_block` | **422** |
+
+后端真值只有四个:`('negative_feedback', 'failed_outcome', 'positive_feedback', 'implicit_success')`。所以这个下拉**五个选项里四个 422、唯一能通的那个必然筛空** —— 因为前端漏掉的 `failed_outcome` / `implicit_success` **恰好是库里唯二真实有数据的**(Task 0 §7-2 实测:测试环境 167 行 = 162 `implicit_success` + 5 `failed_outcome`,生产 2 行全 `implicit_success`,**一行 `negative_feedback` 都没有**)。两种坏法都占齐了,所以 Step 3 的 `SIGNAL_OPTIONS` 不是「修」而是**换掉四个、补上两个**,en / zh-CN 两个 locale 的标签键要跟着**同步增删**(Step 4)。
+
+三处漂移逐一对应(标题说的「三处」就是这三处):
+
+1. `CandidatesPanel.tsx:141` 发 `source: "promoted_candidate"` → Step 3 改成 `promoteSourceOf(signal)`。
+2. `api/curation.ts:20-26` `CurationSignal` 五值 → Step 2 改成后端四值;`CandidatesPanel.tsx:56-62` 的 `SIGNAL_OPTIONS` 跟着换(Step 3)。
+3. `api/curation.ts:39` `feedback_rating: number | null` → **线上真值是字符串**(实测候选行回 `'down'`)→ Step 2 改成 `"up" | "down" | null`。
+
+**外加一处类型本身就错、但改法是「收窄即可」的**:`api/curation.ts:27`
+
+```ts
+export type EvalDatasetSource = "golden" | "promoted_candidate";   // 两个值都对不上后端
+```
+
+后端是 `"golden" | "trajectory" | "regression"`。这个类型被 **三处**引用 —— `:103`(`PromoteCandidateBody.source`)、`:130`(`EvalDataset.source`,响应形状)、`:169`(`CreateEvalDatasetBody.source`)。Step 2 只改类型定义那一行就够,`:130` / `:169` **不需要动**:收窄联合类型对它们是源码兼容的,全仓唯一会因此报错的赋值点就是 `CandidatesPanel.tsx:141`,而那正是 Step 3 要改的地方。**但 Step 5 的 `pnpm typecheck` 必须真跑**(裸 `tsc --noEmit` 恒绿不算数),它是这条「只改一行就够」的判据。
 
 - [ ] **Step 1: 失败测试**
 
@@ -3544,8 +3618,16 @@ git commit -m "feat(curation-ui): 候选行显示被踩的轮、用户原话与�
 **Files:** 无代码改动;结果贴进各 PR 描述。
 
 **Interfaces:**
-- Consumes: 测试环境 `https://expert-work-test.deepaihealth.com`;金丝雀 agent `release-canary`(user `canary:release`)或对接测试 agent 下的探针 user `pc:proj_8f52dd4458d24ff4a3cc71af94a534c1:emp:probe-delegation`;一把 `write` 档 API key(由用户从控制台发,**只经 stdin 喂进脚本**);控制台登录态(Task 0 Step 2 的 storage 文件)。**永不碰 `ai-health-plan` / `sop2-designer`。**
+- Consumes: 测试环境 `https://expert-work-test.deepaihealth.com`;金丝雀 agent `release-canary`(user `canary:release`)或对接测试 agent 下的探针 user `pc:proj_8f52dd4458d24ff4a3cc71af94a534c1:emp:probe-delegation`;一把 `write` 档 API key(由用户从控制台发,**只经 stdin 喂进脚本**);控制台登录态(需要用户亲自登一次 —— Task 0 Step 2 当时**没能**拿到,scratchpad 里没有存量 storage 文件可复用,本 Task 开跑前要先跟用户要)。**永不碰 `ai-health-plan` / `sop2-designer`。**
 - Produces: spec §8 三段验收的真栈证据。
+
+**前置事实(Task 0 §7-2 实测,09-09):`feedback` 是一张空表,没有任何存量数据可以拿来演示。** 生产与测试 **都是 0 行**,且 `pg_stat_user_tables.n_tup_ins = 0` —— **建表至今没写进过任何一行**(原因见 Task 5 的「前置事实」:控制台写路径今天只在调试台可达)。连带地:`curation_candidate` 里**一行 `negative_feedback` 都没有**(测试 167 行全是 `implicit_success` / `failed_outcome`,生产 2 行全 `implicit_success`),`eval_dataset` 两个环境**都是 0 行**。
+
+对本 Task 的三个直接后果:
+
+1. **每一段验收都必须自己先造数据,顺序不能颠倒。** 下面 Step 1 起 run → Step 2 用 **PR1 的对外端点**打 👎,这就是全平台第一条 `feedback` 行。别指望「翻到一条现成的有 👎 的会话」—— 翻不到。
+2. **PR3 的 `has_down_rated` 筛选(Step 4-1)天然只有你自己造的那一条**。「勾上只剩有 👎 的会话」要拿「勾上 = 1 条(你造的那条)、勾掉 = N 条」来判,不是拿「筛出一堆」来判。
+3. **Step 3-4 的 promote 是全平台第一条 `eval_dataset` 行**。验收时 `GET /v1/eval-datasets?agent_name=release-canary` 从 0 行变 1 行 —— 这个「从 0 到 1」本身就是 spec §8 PR2「promote 一路走通(今天走不通)」最干净的证据形态,记得把两次查询都贴进 PR 描述。
 
 - [ ] **Step 1: 起一轮拿 `run_id`(key 从 stdin 读,不落文件、不上 argv)**
 
@@ -3653,3 +3735,14 @@ P-1 触及(按其 spec §3-§5、§7):`agent_run` 模型 + 迁移 0153、`api/ru
 已拍板、不再是问号(2026-09-09):**旧轮的 👍/👎 不迁到新轮**,被取代的轮仍可被打分 —— 交集表 #12 与 Task 4 Step 6b 有结论、理由与对应断言。
 
 其它待拍板(不阻塞):`upgrade_to_negative` 对 `promoted` / `dismissed` 状态的候选是否同样改 signal(Task 8,spec 写「任何 signal」,没提 status)。
+
+## 顺带发现(Task 0 途中撞见,**不属于本计划范围,不要在 P-2 里改**)
+
+用户已知悉,会另行入册。列在这里只为留住证据、避免下一个人重新查一遍。
+
+1. **`event_log` 表在生产与测试都是 0 行,是一张死表。** 真正在用的事件表是 `run_event`(生产 18 行 / 测试 10540 行)。连带后果:`packages/expert-work-persistence/migrations/versions/0014_feedback.py:11` 那句
+   > ``turn_seq`` points at ``event_log.seq`` but carries no foreign key
+
+   是**双重过时** —— 既指错了表(控制台实际传的是 UI 时间线的 0-based 局部下标,见 `components/console/types.ts:29-30` → `TurnFooter.tsx:157` → `FeedbackBar.tsx:45`),它所指的那张表**本身也没有数据**。本计划对 `turn_seq` 的处置维持不变:**保留不动,不读不写不删**(spec §3)。要不要给 `event_log` 立清理 / 弃用条目,由用户决定。
+
+2. **控制台「写反馈」与「看反馈」天生不在同一个页面**,详见 Task 5 的「前置事实」表:写只在调试台(`PlaygroundTab.tsx:705` `readOnly={false}`),对话详情页恒 `readOnly`(`ConversationDetail.tsx:702`)因而永不渲染 `FeedbackBar`。这是既定形态、不是 bug,P-2 也**不**改它 —— 但「要不要让员工在对话详情页也能替终端用户补打分」是一个真实的产品问题,值得单独入册,别在本计划里顺手做掉。
