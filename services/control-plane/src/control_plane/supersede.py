@@ -175,6 +175,55 @@ LIMIT 1
 """
 
 
+#: 慢路径告警只发一条 —— 一次就够定位,每次取代都打会把日志刷成噪声。
+#: 进程级(pod 重启后会重新发一条,那正是我们想要的:换了镜像还没修就再提醒一次)。
+_slow_path_warned = False
+
+
+def _configured_checkpointer_backend() -> str | None:
+    """部署**声称**用的 checkpointer 后端;读不到配置就是 ``None``。
+
+    这是「该不该为拿不到池而告警」的判据。**不拿 saver 的类名去猜** —— 要防的
+    正是「vendor 改了属性名、类还是那个类」这种情形,拿类名判等于用被怀疑的
+    东西给自己作证。配置是独立于 saver 实现的一路信息。
+
+    读不到(环境变量缺失、Settings 构造失败)一律返回 ``None`` = 保持安静:
+    宁可漏一条告警,也不能让一条诊断日志把 supersede 本身弄挂。
+    """
+    try:
+        from control_plane.settings import Settings
+
+        return str(Settings().checkpointer_backend)
+    except Exception:  # pragma: no cover - 配置读不出来时不猜、也不炸
+        return None
+
+
+def _warn_slow_path_once(graph: Any) -> None:
+    """配置说是 postgres、却拿不到池 —— 发**一条** warning。
+
+    没有它,``.conn`` 一旦被 vendor 改名,``locate_turn`` 会静悄悄退到
+    ``aget_state_history``:每次取代慢一个数量级、多拉几十 MB,却零信号,
+    只有有人专门去看耗时才会发现(Task 0 实测 810-950 ms / 52 MB)。
+    ``memory`` 后端走 history 是**预期**的(单测 / 本地),不告警。
+    """
+    global _slow_path_warned
+    if _slow_path_warned:
+        return
+    if _configured_checkpointer_backend() != "postgres":
+        return
+    _slow_path_warned = True
+    cp = getattr(graph, "checkpointer", None)
+    inner = getattr(cp, "_inner", cp)
+    logger.warning(
+        "supersede.checkpoint_pool_unavailable —— 配置是 postgres 但拿不到 checkpointer "
+        "的连接池,定轮回退到全量历史取法(慢路径:每次取代多花几百毫秒、多拉几十 MB)。"
+        "多半是 checkpointer 的内部属性名变了,对着 saver 类核一遍 _checkpoint_pool。 "
+        "checkpointer=%s inner=%s",
+        type(cp).__name__,
+        type(inner).__name__,
+    )
+
+
 def _checkpoint_pool(graph: Any) -> Any | None:
     """checkpointer **自己的** psycopg 池;内存 saver / 非池形态返回 ``None``。
 
@@ -217,23 +266,36 @@ async def _bounds_history(
     内存 saver 上 ``aget_state_history`` 是纯 Python 遍历,没有 Postgres 那边
     「每个 checkpoint 都把 blob 聚回来」的放大,所以这里用它没有性能问题。
     生产永远走 :func:`_bounds_sql`。
+
+    **必须与 :func:`_bounds_sql` 逐字段同义**(仓库老教训:SQL 与内存实现的
+    谓词/定序一旦漂了,单测全绿而生产走另一套)。同义的两条:
+
+    * **排序键是 ``checkpoint_id``**,与 SQL 的 ``ORDER BY checkpoint_id`` 一致
+      (langgraph 的 checkpoint_id 单调递增,字典序即时间序);
+    * **与 ``run_ids`` 的顺序无关** —— SQL 那边是 ``= ANY(run_ids)`` 一次覆盖
+      整条链再取全链的最小/最大,和参数顺序没关系。所以这里也把整条链的快照
+      收齐之后取 min/max,**不能**靠「``run_ids[0]`` 是最新的」这种不成文约定:
+      链的构造方式一变,或者链中某个 run 压根没有 checkpoint(审批链里完全
+      可能),按顺序取就会给出与 SQL 不同的边界。
     """
-    oldest: Any = None
-    newest: Any = None
+    snaps: list[Any] = []
     for run_id in run_ids:
-        snaps = [s async for s in graph.aget_state_history(config, filter={"run_id": str(run_id)})]
-        if not snaps:
-            continue
-        if newest is None:
-            newest = snaps[0]  # 历史最新在前;run_ids[0] 是目标,它的最新就是轮尾
-        oldest = snaps[-1]
-    if oldest is None or newest is None:
+        snaps.extend(
+            [s async for s in graph.aget_state_history(config, filter={"run_id": str(run_id)})]
+        )
+    if not snaps:
         return None
+
+    def _checkpoint_id_of(snap: Any) -> str:
+        return str((snap.config or {}).get("configurable", {}).get("checkpoint_id") or "")
+
+    oldest = min(snaps, key=_checkpoint_id_of)
+    newest = max(snaps, key=_checkpoint_id_of)
     return _Bounds(
-        oldest_id=oldest.config["configurable"]["checkpoint_id"],
+        oldest_id=_checkpoint_id_of(oldest),
         oldest_parent_id=(oldest.parent_config or {}).get("configurable", {}).get("checkpoint_id"),
         oldest_source=(oldest.metadata or {}).get("source"),
-        newest_id=newest.config["configurable"]["checkpoint_id"],
+        newest_id=_checkpoint_id_of(newest),
     )
 
 
@@ -262,6 +324,8 @@ async def locate_turn(
     """
     thread_id = UUID(str((config.get("configurable") or {})["thread_id"]))
     pool = _checkpoint_pool(graph)
+    if pool is None:
+        _warn_slow_path_once(graph)
     bounds = (
         await _bounds_sql(pool, thread_id, run_ids)
         if pool is not None
@@ -275,7 +339,11 @@ async def locate_turn(
             chain_run_ids=tuple(run_ids),
         )
     if bounds.oldest_source != "input":
-        # 链首不是入口写入 —— 只可能是历史损坏或链没串全;宁可拒绝也别乱标。
+        # 链首不是入口写入 —— 只可能是历史损坏或链没串全(例如审批单被清掉、
+        # PAUSED 前驱串不回去);宁可拒绝也别乱标。
+        # TODO(Task 8):这里借用 ``RUN_NOT_LAST`` 会误导对接方 —— 目标**就是**
+        # 最后一轮,拒绝的真实原因是「这一轮的边界划不出来」。接对外端点时给它
+        # 一个独立错误码,别让调用方按「换一轮重试」去理解。
         raise SupersedeError(
             "RUN_NOT_LAST", "run boundary could not be established from checkpoint history", 422
         )
@@ -300,9 +368,10 @@ async def _approval_chain(
     chain = [target.run_id]
     by_id = {r.run_id: r for r in rows}
     ordered = [r.run_id for r in rows]  # list_by_thread 最老在前
+    position = {run_id: i for i, run_id in enumerate(ordered)}  # 别在循环里 index()
     cursor = target.run_id
     while True:
-        idx = ordered.index(cursor)
+        idx = position[cursor]
         if idx == 0:
             return chain
         prev = by_id[ordered[idx - 1]]

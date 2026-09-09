@@ -2150,6 +2150,10 @@ git commit -m "feat(api): P-1 读面字段 —— /messages /items 控制台 mes
 - Consumes: Task 1 `filter_superseded_turns`、`mark_superseded`
 - Produces: `agent_node` 的 prompt 视图不含任何带 `SUPERSEDED_BY` 的消息,且被取代轮的 AI(tool_calls)/ToolMessage 成对消失
 
+> **📌 注记(PR1 评审带出来的,09-09)——「agent 看不见被取代轮」这道闸只在本 Task,别指望读面的 `include_superseded`。**
+> PR1 给 `visible_turns` / `extract_turns` / `read_turns` 加的 `include_superseded` 开关**默认 `True`**,而且它服务的是读面(`/messages`、`/items`、控制台),**不在 agent 的取数路径上** —— agent 的上下文来自 `state["messages"]`,不经过 `extract_turns`。所以「新一轮的模型上下文不含被取代轮」这条 spec §1 的核心承诺,**唯一的实现点就是本 Task 的 `filter_superseded_turns`**。
+> 推论有两条:① 本 Task 的探针测试(断言真送进 LLM 的 messages 列表)是这条承诺的唯一活证,拿掉过滤必须红;② 以后若有人给 agent 侧新开一条读检查点的路径,别以为传个 `include_superseded=False` 就够了 —— 那个开关不整轮剔除,漏标的 ToolMessage 会变成孤儿 tool_call,厂商 400。
+
 > **📌 注记(Task 0 顺带发现的结构性缝,09-09)——「prompt 视图永不落检查点」是个约定,不是机制。**
 > 本 Task 的整轮过滤和上游的压缩 / 窗口 / 剪枝一样,都只改 `agent_node` 里的**本地** `messages` 变量,靠的是「返回字典里只装新增的尾巴」这条约定(`builder.py:1206` / `:1246` 的 `"messages"` 只装 `persisted_messages` / `emit_messages`)。这条约定有一个出口:`_extract_post_llm_messages`(`builder.py:2397`)在「中间件返回的列表比原 prompt 短、或前缀被改过」时会 `return list(updated)` —— **把那份(源自已被过滤/压缩的 prompt 视图的)完整列表整个交给 reducer**。眼下走不通:全仓只有四处写 `ctx.payload["messages"]`(`context_pressure` / `pii_redact` / `dynamic_context` 都挂 `before_llm_call`),挂 `after_llm_call` 的只有 `loop_detection`(`middleware/loop_detection.py:182`),它写的是 `[cleaned, reminder]` 两条,与 prompt 视图无关。
 > **但以后谁在 `after_llm_call` 上加一个「重写整份 messages」的中间件,压缩摘要和被过滤掉的被取代轮就会一起写进检查点**,而现有测试一条都不会红。Task 0 的动态探针(真 graph + 真 `ContextCompressor`,检查点里 0 条 `<context-summary>`)是这条不变式**目前**的唯一实证。若本 Task 之后有人动 `_extract_post_llm_messages` 或往 `after_llm_call` 加中间件,必须补一条「检查点里不含 prompt 视图产物」的断言。

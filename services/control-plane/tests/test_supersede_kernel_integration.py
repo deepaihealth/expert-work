@@ -28,6 +28,8 @@ from control_plane.api.runs import build_run_graph_input
 from control_plane.supersede import (
     MAX_SUPERSEDED_VERSIONS,
     SupersedeError,
+    _bounds_history,
+    _bounds_sql,
     _checkpoint_pool,
     supersede_run,
     supersede_thread_lock,
@@ -573,3 +575,63 @@ async def test_two_replicas_concurrent_supersede_single_winner(
         )
         assert sorted(outcomes) == ["RUN_ALREADY_SUPERSEDED", "ok"]
         assert len({m.additional_kwargs.get(SUPERSEDED_BY) for m in (await st.messages())[3:]}) == 1
+
+
+# ---------------------------------------------------------------------------
+# 两条取法必须同义 —— SQL 路径与 history 回退路径给出逐字段相同的边界
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bounds_sql_and_history_agree_field_by_field(
+    postgres_container: PostgresContainer, engine: AsyncEngine
+) -> None:
+    """`_bounds_sql`(生产)与 `_bounds_history`(内存回退)必须逐字段相等。
+
+    仓库老教训:SQL 与内存实现的谓词 / 定序一旦漂了,单测全绿而生产走另一套。
+    这条测试同时握着真池和真图,所以能把两条路摆在**同一批 checkpoint** 上对。
+
+    三种形态各对一次:单 run、审批链(多 run)、链中夹一个压根没有 checkpoint
+    的 run —— 第三种正是「按 ``run_ids`` 顺序取」会漂掉的那种。
+    """
+    async with make_checkpointer("postgres", _sync_dsn(postgres_container)) as cp:
+        st = await _stack(
+            cp,
+            engine,
+            [*_turn_script(None, "A1"), *_turn_script(GOAL_TWO, "A2"), *_turn_script(None, "A3")],
+        )
+        r1, r2, r3 = uuid4(), uuid4(), uuid4()
+        await st.run_turn(r1, "U1")
+        await st.run_turn(r2, "U2")
+        await st.run_turn(r3, "U3")
+        pool = _checkpoint_pool(st.compiled)
+        assert pool is not None  # 没有池的话下面对的是同一条路,等于没对
+        cfg = _cfg(st.thread_id)
+        ghost = uuid4()  # 从来没跑过 → 一条 checkpoint 都没有
+
+        # 判据的覆盖面(实测过,别照直觉写):把 `_bounds_history` 改回「按 run_ids
+        # 顺序取」之后,**只有「顺序颠倒」这一种会红**。其余四种在老写法下也对得上
+        # —— `_approval_chain` 产出的就是新在前,老写法的隐含约定正好被满足;空 run
+        # 只是被 `continue` 跳过,不移动首尾。所以顺序无关这条同义性,全靠最后那种
+        # 形态兜着。前四种留着钉常规形态不回归,不要以为它们在证顺序无关。
+        shapes: list[tuple[str, list[UUID]]] = [
+            ("单 run", [r2]),
+            ("多 run 链(新在前)", [r3, r2, r1]),
+            ("链中夹空 run", [r3, ghost, r1]),
+            ("空 run 排在最后", [r2, r1, ghost]),
+            ("顺序颠倒", [r1, r2, r3]),  # ← 唯一能照出顺序依赖的那种
+        ]
+        # 收齐所有形态再断言,失败信息才说得出「哪几种漂了」——
+        # fail-fast 只会报第一种,看不出判据的覆盖面。
+        disagreed: list[tuple[str, Any, Any]] = []
+        for label, run_ids in shapes:
+            via_sql = await _bounds_sql(pool, st.thread_id, run_ids)
+            via_history = await _bounds_history(st.compiled, cfg, run_ids)
+            assert via_sql is not None, label  # 形态本身得有快照,否则对的是两个 None
+            if via_sql != via_history:
+                disagreed.append((label, via_sql, via_history))
+        assert disagreed == [], disagreed
+
+        # 全空链两侧都得是 None(而不是一侧 None、一侧崩)。
+        assert await _bounds_sql(pool, st.thread_id, [ghost]) is None
+        assert await _bounds_history(st.compiled, cfg, [ghost]) is None

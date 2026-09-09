@@ -199,6 +199,10 @@ def visible_turns(
         )
     if not stones:
         return out
+    # ``out`` 与 ``stones`` 各自都已按 ``seq`` 升序 —— 两者都来自上面那一趟
+    # ``enumerate(raw_messages)``,``seq`` 就是下标。所以这里的 ``sorted`` 是把
+    # 两条升序流**归并**回一条,不是在修一个乱序的输入(输入的顺序由检查点的
+    # ``messages`` 通道保证,``add_messages`` 是追加型 reducer)。
     return sorted([*out, *stones], key=attrgetter("seq"))
 
 

@@ -22,6 +22,7 @@ docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -32,6 +33,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from expert_work.common.conversation_channel import visible_turns
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import MessageTurn
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_stamp_created_at(ak: dict[str, Any]) -> datetime | None:
@@ -61,12 +64,18 @@ def _parse_stamp_run_id(ak: dict[str, Any]) -> UUID | None:
 
 
 def _parse_uuid_or_none(raw: str | None) -> UUID | None:
-    """标记里存的是字符串 run_id;损坏就退化成 ``None``,与两个 ``_parse_stamp_*`` 同规矩。"""
+    """标记里存的是字符串 run_id;损坏就退化成 ``None``,与两个 ``_parse_stamp_*`` 同规矩。
+
+    降级是对的(一条坏标记不该让整段会话读不出来),但**不能一声不吭** —— 静默
+    吞掉之后,「被取代轮在读面上没标记」看起来和「这轮本来就没被取代」一模一样。
+    只记前缀:这是检查点里的值,整串打进日志等于把租户数据抄进日志。
+    """
     if raw is None:
         return None
     try:
         return UUID(raw)
     except ValueError:
+        logger.debug("transcript.superseded_by_unparseable prefix=%r", raw[:8])
         return None
 
 
