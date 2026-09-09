@@ -18,7 +18,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models.feedback import FeedbackRow
@@ -43,6 +44,18 @@ class FeedbackRecord:
     created_at: datetime | None = None
     #: Stream HX-2 (Mini-ADR HX-B1) -- FeedbackConsumerWorker stamp.
     processed_at: datetime | None = None
+    #: P-2 — 打分对象(run);NULL = 0152 之前的历史行。
+    run_id: UUID | None = None
+    #: P-2 — 'console' | 'external'。
+    source: str = "console"
+    #: P-2 — 对接方附带的段落标签,只存不 join。
+    item_id: str | None = None
+    #: P-2 — 改票时间;None = 从没改过。
+    updated_at: datetime | None = None
+
+
+def _record_id(record: FeedbackRecord) -> int:
+    return record.id or 0
 
 
 class FeedbackStore(abc.ABC):
@@ -109,6 +122,40 @@ class FeedbackStore(abc.ABC):
         explicit ``WHERE`` even applies).
         """
 
+    @abc.abstractmethod
+    async def upsert(self, record: FeedbackRecord) -> tuple[FeedbackRecord, bool]:
+        """Insert-or-overwrite keyed by ``(tenant_id, run_id, actor_id)`` — P-2「可改票」.
+
+        Returns ``(stored, updated)``: ``updated`` is ``True`` when an existing
+        row was overwritten. Overwrite replaces ``rating / comment / item_id /
+        trace_id / turn_seq / source`` and stamps ``updated_at``; ``id``,
+        ``created_at`` and ``processed_at`` are left alone. ``record.run_id``
+        must be set — raises ``ValueError`` otherwise (thread-only rows are
+        append-only history, never upserted).
+        """
+
+    @abc.abstractmethod
+    async def list_for_thread_scoped(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[FeedbackRecord]:
+        """Like :meth:`list_for_thread` but with an explicit tenant predicate,
+        newest (``id``) first. New read paths use this — the runtime connects
+        with a BYPASSRLS role, so :meth:`list_for_thread`'s "RLS is the tenant
+        filter" contract is not something P-2 read paths can lean on.
+        """
+
+    @abc.abstractmethod
+    async def down_rated_thread_ids(self, *, tenant_id: UUID | None, limit: int = 500) -> set[UUID]:
+        """Thread ids carrying ≥1 👎, oldest-👎-first, capped at ``limit``.
+
+        Feeds ``GET /v1/conversations?has_down_rated`` (P-2 §6), mirroring
+        ``RunStore.thread_ids_with_runs``. ``tenant_id=None`` is the
+        cross-tenant aggregate: the SQL implementation assumes the
+        ``audit_reader`` BYPASSRLS role for that read (same precedent as
+        :meth:`list_unprocessed_down_all_tenants`); the caller must be in a
+        bypass scope so no tenant GUC is emitted.
+        """
+
 
 class InMemoryFeedbackStore(FeedbackStore):
     """In-memory :class:`FeedbackStore` — dev / unit tests."""
@@ -124,7 +171,7 @@ class InMemoryFeedbackStore(FeedbackStore):
 
     async def list_for_thread(self, *, thread_id: UUID) -> list[FeedbackRecord]:
         rows = [r for r in self._rows if r.thread_id == thread_id]
-        return sorted(rows, key=lambda r: r.id or 0, reverse=True)
+        return sorted(rows, key=_record_id, reverse=True)
 
     async def down_rated_threads(self, *, thread_ids: Sequence[UUID]) -> set[UUID]:
         wanted = set(thread_ids)
@@ -132,7 +179,7 @@ class InMemoryFeedbackStore(FeedbackStore):
 
     async def list_unprocessed_down_all_tenants(self, *, limit: int) -> list[FeedbackRecord]:
         rows = [r for r in self._rows if r.rating == "down" and r.processed_at is None]
-        return sorted(rows, key=lambda r: r.id or 0)[:limit]
+        return sorted(rows, key=_record_id)[:limit]
 
     async def mark_processed(self, *, feedback_id: int, processed_at: datetime) -> bool:
         for i, r in enumerate(self._rows):
@@ -150,6 +197,51 @@ class InMemoryFeedbackStore(FeedbackStore):
             r for r in self._rows if not (r.tenant_id == tenant_id and r.thread_id in wanted)
         ]
         return before - len(self._rows)
+
+    async def upsert(self, record: FeedbackRecord) -> tuple[FeedbackRecord, bool]:
+        if record.run_id is None:
+            raise ValueError("upsert requires run_id")
+        for i, r in enumerate(self._rows):
+            if (
+                r.tenant_id == record.tenant_id
+                and r.run_id == record.run_id
+                and r.actor_id == record.actor_id
+            ):
+                stored = replace(
+                    r,
+                    rating=record.rating,
+                    comment=record.comment,
+                    item_id=record.item_id,
+                    trace_id=record.trace_id,
+                    turn_seq=record.turn_seq,
+                    source=record.source,
+                    updated_at=datetime.now(UTC),
+                )
+                self._rows[i] = stored
+                return stored, True
+        stored = replace(record, id=next(self._ids), created_at=datetime.now(UTC), updated_at=None)
+        self._rows.append(stored)
+        return stored, False
+
+    async def list_for_thread_scoped(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[FeedbackRecord]:
+        rows = [r for r in self._rows if r.tenant_id == tenant_id and r.thread_id == thread_id]
+        return sorted(rows, key=_record_id, reverse=True)
+
+    async def down_rated_thread_ids(self, *, tenant_id: UUID | None, limit: int = 500) -> set[UUID]:
+        out: list[UUID] = []
+        for r in sorted(self._rows, key=_record_id):
+            if r.rating != "down":
+                continue
+            if tenant_id is not None and r.tenant_id != tenant_id:
+                continue
+            if r.thread_id in out:
+                continue
+            out.append(r.thread_id)
+            if len(out) >= limit:
+                break
+        return set(out)
 
 
 class DbFeedbackStore(FeedbackStore):
@@ -170,6 +262,9 @@ class DbFeedbackStore(FeedbackStore):
             row = FeedbackRow(
                 tenant_id=record.tenant_id,
                 thread_id=record.thread_id,
+                run_id=record.run_id,
+                source=record.source,
+                item_id=record.item_id,
                 turn_seq=record.turn_seq,
                 trace_id=record.trace_id,
                 rating=record.rating,
@@ -248,6 +343,107 @@ class DbFeedbackStore(FeedbackStore):
             await session.commit()
         return total
 
+    async def upsert(self, record: FeedbackRecord) -> tuple[FeedbackRecord, bool]:
+        if record.run_id is None:
+            raise ValueError("upsert requires run_id")
+        return await self._upsert_once(record, retry=True)
+
+    async def _upsert_once(
+        self, record: FeedbackRecord, *, retry: bool
+    ) -> tuple[FeedbackRecord, bool]:
+        """One SELECT-then-INSERT/UPDATE attempt; ``retry`` allows exactly one more.
+
+        Bounded on purpose. The INSERT branch loses a race only when a
+        concurrent writer inserted the same ``(tenant, run, actor)`` first, and
+        the retry then finds that row and takes the UPDATE branch — so one
+        extra attempt is all the race needs. Retrying without a bound would
+        turn an interleaved purge (DELETE between our SELECT and our INSERT)
+        into unbounded recursion: each attempt would keep finding no row,
+        keep inserting, and keep losing to the next writer. The second
+        ``IntegrityError`` propagates instead.
+        """
+        async with self._sf() as session:
+            existing_id = (
+                await session.execute(
+                    select(FeedbackRow.id).where(
+                        FeedbackRow.tenant_id == record.tenant_id,
+                        FeedbackRow.run_id == record.run_id,
+                        FeedbackRow.actor_id == record.actor_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing_id is not None:
+                row = (
+                    await session.execute(
+                        update(FeedbackRow)
+                        .where(FeedbackRow.id == existing_id)
+                        .values(
+                            rating=record.rating,
+                            comment=record.comment,
+                            item_id=record.item_id,
+                            trace_id=record.trace_id,
+                            turn_seq=record.turn_seq,
+                            source=record.source,
+                            updated_at=datetime.now(UTC),
+                        )
+                        .returning(FeedbackRow)
+                    )
+                ).scalar_one()
+                stored = _row_to_record(row)
+                await session.commit()
+                return stored, True
+            row = FeedbackRow(
+                tenant_id=record.tenant_id,
+                thread_id=record.thread_id,
+                run_id=record.run_id,
+                source=record.source,
+                item_id=record.item_id,
+                turn_seq=record.turn_seq,
+                trace_id=record.trace_id,
+                rating=record.rating,
+                comment=record.comment,
+                actor_id=record.actor_id,
+            )
+            session.add(row)
+            try:
+                await session.flush()
+            except IntegrityError:
+                # Lost a concurrent-insert race on ``feedback_run_actor_uniq`` —
+                # the row exists now, so the retry takes the UPDATE branch.
+                await session.rollback()
+                if not retry:
+                    raise
+                return await self._upsert_once(record, retry=False)
+            await session.refresh(row)
+            stored = _row_to_record(row)
+            await session.commit()
+            return stored, False
+
+    async def list_for_thread_scoped(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[FeedbackRecord]:
+        async with self._sf() as session:
+            result = await session.execute(
+                select(FeedbackRow)
+                .where(FeedbackRow.tenant_id == tenant_id, FeedbackRow.thread_id == thread_id)
+                .order_by(FeedbackRow.id.desc())
+            )
+            return [_row_to_record(row) for row in result.scalars().all()]
+
+    async def down_rated_thread_ids(self, *, tenant_id: UUID | None, limit: int = 500) -> set[UUID]:
+        stmt = select(FeedbackRow.thread_id).where(FeedbackRow.rating == "down")
+        if tenant_id is not None:
+            stmt = stmt.where(FeedbackRow.tenant_id == tenant_id)
+        stmt = (
+            stmt.group_by(FeedbackRow.thread_id)
+            .order_by(func.min(FeedbackRow.id).asc())
+            .limit(limit)
+        )
+        async with self._sf() as session:
+            if tenant_id is None:
+                await session.execute(_SET_AUDIT_READER_ROLE)
+            return set((await session.execute(stmt)).scalars().all())
+
 
 def _row_to_record(row: FeedbackRow) -> FeedbackRecord:
     return FeedbackRecord(
@@ -261,4 +457,8 @@ def _row_to_record(row: FeedbackRow) -> FeedbackRecord:
         actor_id=row.actor_id,
         created_at=row.created_at,
         processed_at=row.processed_at,
+        run_id=row.run_id,
+        source=row.source,
+        item_id=row.item_id,
+        updated_at=row.updated_at,
     )

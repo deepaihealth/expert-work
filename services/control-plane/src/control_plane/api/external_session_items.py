@@ -29,6 +29,7 @@ from control_plane.api._external import (
     ExternalScopeError,
     external_error,
     load_owned_session,
+    own_feedback_by_run,
     reject_nul_path_params,
 )
 from control_plane.api._user_scope import get_user_repo
@@ -45,6 +46,7 @@ from expert_work.common.conversation_items import (
 )
 from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.approval import ApprovalStore
+from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol.approval import ApprovalStatus
@@ -93,6 +95,10 @@ def _get_run_event_store(request: Request) -> RunEventStore | None:
 
 def _get_approval_store(request: Request) -> ApprovalStore:
     return request.app.state.approval_store  # type: ignore[no-any-return]
+
+
+def _get_feedback_store(request: Request) -> FeedbackStore:
+    return request.app.state.feedback_store  # type: ignore[no-any-return]
 
 
 def _stamped_run_id(msg: Any) -> str | None:
@@ -364,6 +370,7 @@ def build_external_session_items_router() -> APIRouter:
         runs: Annotated[RunStore, Depends(_get_run_store)],
         event_store: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
         approvals: Annotated[ApprovalStore, Depends(_get_approval_store)],
+        feedback: Annotated[FeedbackStore, Depends(_get_feedback_store)],
         runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
         limit: Annotated[int, Query(ge=1, le=MAX_TURNS_PER_PAGE)] = DEFAULT_TURNS_PER_PAGE,
@@ -383,7 +390,7 @@ def build_external_session_items_router() -> APIRouter:
         """
         tenant_id: UUID = request.state.tenant_id
         try:
-            await load_owned_session(
+            meta = await load_owned_session(
                 tenant_id=tenant_id,
                 agent_code=agent_code,
                 user_id=user_id,
@@ -423,6 +430,11 @@ def build_external_session_items_router() -> APIRouter:
         active_ids = {r.run_id for r in active}
         # 正序:客户端整页 prepend,与实时流追加在同一个列表末尾。
         turns = [r for r in reversed(page) if r.run_id not in active_ids]
+
+        own = own_feedback_by_run(
+            await feedback.list_for_thread_scoped(tenant_id=tenant_id, thread_id=session_id),
+            actor_id=str(meta.user_id),
+        )
 
         messages: list[Any] = []
         checkpointer = runtime.durable_checkpointer
@@ -488,6 +500,8 @@ def build_external_session_items_router() -> APIRouter:
                             # 产物清单契约 —— run 行固化的登记快照;null =
                             # 历史 run 无记录(≠ 零交付,零交付是 [])。
                             "artifacts": run.artifacts,
+                            # P-2 —— 只回显当前 ``user_id`` 自己打的那一票。
+                            "feedback": own.get(str(run.run_id)),
                         }
                         for run in turns
                     ],

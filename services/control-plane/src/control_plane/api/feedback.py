@@ -7,7 +7,8 @@ The endpoint does not check that the thread exists: feedback is a
 fire-and-forget user signal, the row is tenant-scoped by RLS, and the
 schema carries no foreign key (``turn_seq`` points at ``event_log``,
 which is cold-archived — G.8). The 👍/👎 button itself is Stream H
-(Admin UI); G.6 is the backend (Mini-ADR G-5).
+(Admin UI); G.6 is the backend (Mini-ADR G-5). P-2 起按 run 打分、
+同 (run, actor) 覆盖;不再校验 thread 存在这一点不变。
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ class FeedbackRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: P-2 — 打分对象是一轮(run),必填。
+    run_id: UUID
     rating: Literal["up", "down"]
     comment: str | None = Field(default=None, max_length=4000)
     turn_seq: int | None = Field(default=None, ge=0)
@@ -65,14 +68,16 @@ def build_feedback_router() -> APIRouter:
         actor_id: str = request.state.actor_id
         trace_id = current_trace_id_hex()
 
-        stored = await store.insert(
+        stored, updated = await store.upsert(
             FeedbackRecord(
                 tenant_id=tenant_id,
                 thread_id=thread_id,
+                run_id=payload.run_id,
                 turn_seq=payload.turn_seq,
                 trace_id=trace_id,
                 rating=payload.rating,
                 comment=payload.comment,
+                source="console",
                 actor_id=actor_id,
             )
         )
@@ -87,7 +92,13 @@ def build_feedback_router() -> APIRouter:
             resource_type="feedback",
             resource_id=str(stored.id),
             trace_id=trace_id,
-            details={"thread_id": str(thread_id), "rating": payload.rating},
+            details={
+                "thread_id": str(thread_id),
+                "run_id": str(payload.run_id),
+                "rating": payload.rating,
+                "updated": updated,
+                "source": "console",
+            },
         )
 
         return JSONResponse(
@@ -95,9 +106,11 @@ def build_feedback_router() -> APIRouter:
             content={
                 "id": stored.id,
                 "thread_id": str(stored.thread_id),
+                "run_id": str(payload.run_id),
                 "rating": stored.rating,
                 "turn_seq": stored.turn_seq,
                 "trace_id": stored.trace_id,
+                "updated": updated,
             },
         )
 

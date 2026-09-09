@@ -61,16 +61,20 @@ export async function createSession(
 export interface SessionFeedback {
   id: number;
   thread_id: string;
+  run_id: string;
   rating: "up" | "down";
   turn_seq: number | null;
   trace_id: string | null;
+  /** true = 覆盖了同 (run, 本人) 的上一票。 */
+  updated: boolean;
 }
 
 /** POST /v1/sessions/{threadId}/feedback — the endpoint returns a bare JSON
- *  row (201, no ``{success,data}`` envelope), so no ``unwrap`` here. */
+ *  row (201, no ``{success,data}`` envelope), so no ``unwrap`` here.
+ *  P-2:按 run 打分,同 (run, 本人) 再打 = 覆盖。 */
 export async function submitSessionFeedback(
   threadId: string,
-  payload: { rating: "up" | "down"; comment?: string; turn_seq?: number },
+  payload: { rating: "up" | "down"; comment?: string; run_id: string; turn_seq?: number },
 ): Promise<SessionFeedback> {
   const response = await apiClient.post<SessionFeedback>(
     `/v1/sessions/${threadId}/feedback`,

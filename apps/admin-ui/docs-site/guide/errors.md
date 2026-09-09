@@ -13,6 +13,7 @@
 - 历史消息：`GET /v1/agents/{agent_code}/sessions/{session_id}/messages`
 - 事件接口：`GET /v1/agents/{agent_code}/runs/{run_id}/events`，断线后的续传也走它，见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传)
 - 产物删除：`DELETE /v1/agents/{agent_code}/artifacts`
+- 打分：`POST /v1/agents/{agent_code}/runs/{run_id}/feedback`
 
 | 错误码 | HTTP 状态 | 端点 | 含义与处理 |
 |---|---|---|---|
@@ -29,7 +30,7 @@
 | [`SESSION_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 提前获取 session_id / 上传附件 / 历史消息 / 重命名会话 / 归档会话 / run 列表 | `session_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配 |
 | [`UPLOAD_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 附件下载 | 附件不存在、不属于这个 `user_id`、已被删除，或内容已被回收。核对 `upload_id` 与 `user_id`，图片还要核对 `session_id` |
 | [`WORKSPACE_FILE_FAILED`](#_8-6-404-目标不存在) | 404 | 工作区文件下载 | `user_id` 未被识别，或该路径下没有文件。核对 `user_id` 与 `path` |
-| [`RUN_NOT_FOUND`](./run-control#_4-1-取消-run) | 404 | 取消 run / 审批决策 / 事件接口 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配，不要当作「run 尚未创建」重试 |
+| [`RUN_NOT_FOUND`](./run-control#_4-1-取消-run) | 404 | 取消 run / 审批决策 / 事件接口 / 打分 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配，不要当作「run 尚未创建」重试 |
 | [`APPROVAL_NOT_FOUND`](./run-control#_4-2-审批决策) | 404 | 审批决策 | 这个 run 没有待审批记录。确认该 run 处于等待审批的状态 |
 | [`ARTIFACT_NOT_FOUND`](./query#_5-7-产物) | 404 | 产物下载 / 产物删除 | 产物不存在、已删除，或不属于这个 `user_id`。核对 `user_id` 与产物 `name` |
 | [`APPROVAL_CONFLICT`](./run-control#_4-2-审批决策) | 409 | 审批决策 | 这条审批已经被决定过。不要重复决策；需要取回上次结果时，带上当时用的 `idempotency_key` |
@@ -185,7 +186,7 @@
 
 `WORKSPACE_FILE_FAILED`：工作区文件下载（`GET /v1/agents/{agent_code}/workspace/file`）时 `user_id` 未被识别，或者 `path` 指向的文件不存在。两种情况返回同一个 404，无法从响应里区分。同一个错误码在 400 与 500 下另有含义，靠 HTTP 状态码区分，见 [8.3](#_8-3-400-路径或上传内容不合法) 与 [8.12](#_8-12-500-服务端内部错误)。
 
-`RUN_NOT_FOUND` 与 `APPROVAL_NOT_FOUND`：取消 run（`:cancel`）与审批决策（`:decide`）两个端点的归属校验与审批查找失败。这两个端点还有各自特有的 409 / 403 / 410 / 422，完整说明见 [4 对话过程中的控制](./run-control)。
+`RUN_NOT_FOUND` 与 `APPROVAL_NOT_FOUND`：取消 run（`:cancel`）、审批决策（`:decide`）、打分（`/feedback`）三个端点的归属校验与审批查找失败。取消 run 与审批决策还有各自特有的 409 / 403 / 410 / 422，完整说明见 [4 对话过程中的控制](./run-control)；打分的请求体校验失败是统一的 422 `INVALID_REQUEST`，见 [2.9 给一轮回答打分](./chat#_2-9-给一轮回答打分)。
 
 ## 8.7 409 冲突
 
@@ -250,7 +251,7 @@
 
 - `inputs` 的三条上限（键数量、单值长度、序列化后总字节数）互相独立，不能互相替代。把一个长字符串包进数组或对象可以绕开单值长度检查，但总字节数上限仍然会拦下它。
 - `untrusted_content` 的单块字符数上限与最多 16 项的条数上限，同样是两条互相独立的限制。
-- `INVALID_USER_ID` 不止发起对话会触发，凡是要求 `user_id` 的端点都会：提前获取 session_id、会话列表与历史消息、重命名会话、归档会话、上传附件、附件下载、工作区文件读取。取消 run 与审批决策是例外，空 `user_id` 在这两个端点上不会走到这条校验，而是被 `run_id` 的归属校验统一处理成 404 `RUN_NOT_FOUND`，见 [4 对话过程中的控制](./run-control)。
+- `INVALID_USER_ID` 不止发起对话会触发，凡是要求 `user_id` 的端点都会：提前获取 session_id、会话列表与历史消息、重命名会话、归档会话、上传附件、附件下载、工作区文件读取。取消 run、审批决策与打分是例外，空 `user_id` 在这三个端点上不会走到这条校验，而是被 `run_id` 的归属校验统一处理成 404 `RUN_NOT_FOUND`，见 [4 对话过程中的控制](./run-control)。
 
 ### 模板变量与 Agent 的声明不匹配
 

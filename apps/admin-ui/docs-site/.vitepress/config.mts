@@ -48,6 +48,7 @@ export default withMermaid(
                 { text: "2.6 带图片和文档", link: "/guide/chat#_2-6-带图片和文档" },
                 { text: "2.7 外部内容与模板变量", link: "/guide/chat#_2-7-外部内容与模板变量" },
                 { text: "2.8 防重复下发 Idempotency-Key", link: "/guide/chat#_2-8-防重复下发-idempotency-key" },
+                { text: "2.9 给一轮回答打分", link: "/guide/chat#_2-9-给一轮回答打分" },
               ],
             },
             {

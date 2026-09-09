@@ -27,6 +27,7 @@ from control_plane.api._external import (
     external_error,
     load_owned_session,
     lookup_external_user_id,
+    own_feedback_by_run,
     reject_nul,
     reject_nul_path_params,
 )
@@ -35,6 +36,7 @@ from control_plane.audit import emit
 from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_turns
 from expert_work.common.observability import current_trace_id_hex
+from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import AuditAction, ThreadStatus
@@ -112,6 +114,10 @@ def _get_runtime(request: Request) -> AgentRuntime:
 
 def _get_run_store(request: Request) -> RunStore:
     return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+def _get_feedback_store(request: Request) -> FeedbackStore:
+    return request.app.state.feedback_store  # type: ignore[no-any-return]
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -252,6 +258,7 @@ def build_external_sessions_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
+        feedback: Annotated[FeedbackStore, Depends(_get_feedback_store)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -264,7 +271,7 @@ def build_external_sessions_router() -> APIRouter:
         """
         tenant_id = request.state.tenant_id
         try:
-            await load_owned_session(
+            meta = await load_owned_session(
                 tenant_id=tenant_id,
                 agent_code=agent_code,
                 user_id=user_id,
@@ -293,6 +300,10 @@ def build_external_sessions_router() -> APIRouter:
             logger.warning("external_messages.read_failed", exc_info=True)
             turns = []
         page = turns[offset : offset + limit]
+        own = own_feedback_by_run(
+            await feedback.list_for_thread_scoped(tenant_id=tenant_id, thread_id=session_id),
+            actor_id=str(meta.user_id),
+        )
         out = [
             {
                 "role": t.role,
@@ -300,6 +311,8 @@ def build_external_sessions_router() -> APIRouter:
                 "channel": t.channel,
                 "created_at": t.created_at.isoformat() if t.created_at else None,
                 "run_id": str(t.run_id) if t.run_id else None,
+                # P-2 —— 只回显当前 ``user_id`` 自己对这条消息所在那一轮打的票。
+                "feedback": own.get(str(t.run_id)) if t.run_id else None,
             }
             for t in page
         ]

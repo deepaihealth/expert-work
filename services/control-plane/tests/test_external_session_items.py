@@ -28,6 +28,7 @@ from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.common.spotlight import spotlight_untrusted
 from expert_work.persistence.approval import InMemoryApprovalStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.feedback_store import FeedbackRecord
 from expert_work.protocol import AgentSpec
 from expert_work.protocol.approval import ApprovalRecord, ApprovalStatus
 from expert_work.runtime.runs import (
@@ -370,6 +371,8 @@ async def test_items_renders_one_turn_end_to_end(ctx: _Ctx) -> None:
             "error": None,
             # 产物清单契约 —— 迁移前建的行无记录 = null(≠ 零交付 [])。
             "artifacts": None,
+            # P-2 —— 没打过分 = null。
+            "feedback": None,
         }
     ]
     assert body["runs"][0]["created_at"] is not None
@@ -1025,3 +1028,100 @@ async def test_worker_frames_do_not_crowd_out_the_plan_frame(ctx: _Ctx) -> None:
     # 子任务这一路同样没被计划挤掉。
     calls = {i["call_id"]: i for i in body["items"] if i["type"] == "tool_call"}
     assert calls["call-worker"]["worker"]["worker_id"] == "w-1"
+
+
+@pytest.mark.asyncio
+async def test_runs_echo_only_the_callers_own_feedback(ctx: _Ctx) -> None:
+    """``runs[]`` 回显本 user_id 自己那条;别的终端用户在同一轮打的分不对外。"""
+    await ctx.seed_agent()
+    session_id, run_id = await ctx.open_session()
+    me = await ctx.app.state.tenant_user_repo.resolve(
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id="ext:u-123"
+    )
+    store = ctx.app.state.feedback_store
+    await store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            run_id=run_id,
+            rating="down",
+            comment="太慢",
+            item_id="p1",
+            source="external",
+            actor_id=str(me.id),
+        )
+    )
+    await store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            run_id=run_id,
+            rating="up",
+            source="external",
+            actor_id="someone-else",
+        )
+    )
+    # 第二轮**只有别人**打了分 —— 这一条才是「别人的分不外泄」的判据。
+    # 只靠上面那一轮证不出来:两条行按 id 降序投影、后写的覆盖先写的,
+    # 就算把 actor 过滤整个删掉,本人那条(id 更小、排在后面)仍然最后落盘,
+    # 断言照样绿。要让缺陷现形,必须有一轮**本人没打过分**。
+    other_run = await ctx.add_run(session_id, created_at=ctx.origin + timedelta(minutes=1))
+    await store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            run_id=other_run,
+            rating="up",
+            comment="别人的原话",
+            source="external",
+            actor_id="someone-else",
+        )
+    )
+
+    resp = await ctx.items(session_id)
+    assert resp.status_code == 200, resp.text
+    runs = resp.json()["data"]["runs"]
+    by_run = {r["run_id"]: r["feedback"] for r in runs}
+    assert by_run[str(run_id)] == {"rating": "down", "comment": "太慢", "item_id": "p1"}
+    assert by_run[str(other_run)] is None
+
+
+@pytest.mark.asyncio
+async def test_runs_feedback_defaults_to_null(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    session_id, _ = await ctx.open_session()
+    resp = await ctx.items(session_id)
+    assert resp.json()["data"]["runs"][0]["feedback"] is None
+
+
+@pytest.mark.asyncio
+async def test_feedback_stays_on_the_run_it_was_given_for(ctx: _Ctx) -> None:
+    """分只跟着它评的那一轮走:同一段会话里再来一轮,新轮的 ``feedback`` 是 ``null``。
+
+    这就是「重新生成 / 编辑重发后旧轮的分不迁到新轮」(2026-09-09 拍板)在读面上的
+    形状 —— 评分是对那一次回答的评价。这里用普通的第二轮构造,不依赖 P-1 的
+    supersede;带 ``superseded_by`` 的那一版断言等 P-1 PR1 合入后补。
+    """
+    await ctx.seed_agent()
+    session_id, first_run = await ctx.open_session()
+    me = await ctx.app.state.tenant_user_repo.resolve(
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id="ext:u-123"
+    )
+    await ctx.app.state.feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            run_id=first_run,
+            rating="down",
+            comment="答非所问",
+            source="external",
+            actor_id=str(me.id),
+        )
+    )
+    second_run = await ctx.add_run(session_id, created_at=ctx.origin + timedelta(minutes=1))
+
+    resp = await ctx.items(session_id)
+    assert resp.status_code == 200, resp.text
+    by_run = {r["run_id"]: r["feedback"] for r in resp.json()["data"]["runs"]}
+    assert by_run[str(first_run)] == {"rating": "down", "comment": "答非所问", "item_id": None}
+    assert by_run[str(second_run)] is None

@@ -3622,3 +3622,207 @@ active_run_id 非空
 ```
 
 两个接口的条目字段一致，所以 `upsert` 一个函数从头用到尾。历史接口的 `id` 与事件流的 `id` 不保证一致，但同一个 run 不会同时出现在两边（历史不返回正在执行的那一轮），两套编号不会落进同一个列表。
+
+## 10.9 给一轮回答打分
+
+`user_id` 与 `rating` 在**请求体**里，`run_id` 在路径里。同一个终端用户对同一轮再次打分是覆盖，响应的 `updated` 为 `true`。字段含义见 [2.9 给一轮回答打分](./chat#_2-9-给一轮回答打分)。
+
+::: code-group
+
+```bash [curl]
+curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/feedback" \
+  -H "Authorization: Bearer ${EXPERT_WORK_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u-123", "rating": "down", "comment": "答非所问"}'
+```
+
+```python [Python]
+import json
+import os
+import urllib.error
+import urllib.request
+
+API_KEY = os.environ["EXPERT_WORK_API_KEY"]
+BASE_URL = "https://<your-domain>"
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
+
+
+def rate_run(user_id, run_id, rating, comment=None):
+    url = f"{BASE_URL}/v1/agents/{AGENT_CODE}/runs/{run_id}/feedback"
+    payload = {"user_id": user_id, "rating": rating}
+    if comment is not None:
+        payload["comment"] = comment
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # 先读成文本、解得动才当 JSON 用:失败响应不一定是 JSON(网关自己返回的 502 常常是
+        # HTML,也可能整个是空的),无条件 json.loads 会当场抛 JSONDecodeError 顶掉原来的
+        # HTTPError,状态码和响应体全看不见。
+        error_text = exc.read().decode("utf-8", errors="replace")
+        try:
+            error_body = json.loads(error_text)
+        except ValueError:
+            error_body = error_text  # 不是 JSON,原样打出来
+        print("打分失败:", exc.code, error_body)
+        raise
+
+
+if __name__ == "__main__":
+    result = rate_run("u-123", "<要打分的 run_id>", "down", "答非所问")
+    print(result)  # {"success": true, "data": {"run_id": "...", "rating": "down", "updated": false}, "error": null}
+```
+
+```js [Node.js]
+const API_KEY = process.env.EXPERT_WORK_API_KEY;
+const BASE_URL = "https://<your-domain>";
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
+
+async function rateRun(userId, runId, rating, comment) {
+  const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs/${runId}/feedback`;
+  const payload = { user_id: userId, rating };
+  if (comment !== undefined) payload.comment = comment;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    // 用 text() 而不是 json():失败响应不一定是 JSON(网关自己返回的 502 常常是 HTML),
+    // 先 await response.json() 会当场抛 SyntaxError,想打的错误信息反而永远打不出来。
+    console.error("打分失败:", response.status, await response.text());
+    throw new Error(`feedback failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function main() {
+  const result = await rateRun("u-123", "<要打分的 run_id>", "down", "答非所问");
+  console.log(result); // {"success": true, "data": {"run_id": "...", "rating": "down", "updated": false}, "error": null}
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+```java [Java]
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * 10.9 给一轮回答打分 —— JDK 8 + HttpURLConnection,零依赖。
+ * JSON 用手工拼接字符串构造请求体,生产环境建议使用 Gson / Jackson 等成熟的 JSON 库。
+ */
+public class RateRun {
+
+    static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
+    static final String BASE_URL = "https://<your-domain>";
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
+
+    static String readBody(InputStream in) throws IOException {
+        // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+            return sb.toString();
+        }
+    }
+
+    /**
+     * 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。
+     * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
+     * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
+     */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        return (err == null) ? "" : readBody(err);
+    }
+
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // 就会把请求体拼坏,服务端解析失败(422),不是风格建议。生产环境建议使用 Gson / Jackson
+    // 等成熟的 JSON 库自动处理,这里手写是为了保持示例零依赖。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    static String rateRun(String userId, String runId, String rating, String comment) throws IOException {
+        URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs/" + runId + "/feedback");
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setRequestMethod("POST");
+        connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
+        connection.setRequestProperty("Content-Type", "application/json");
+        connection.setDoOutput(true);
+
+        StringBuilder body = new StringBuilder();
+        body.append("{\"user_id\":\"").append(jsonEscape(userId)).append("\"");
+        body.append(",\"rating\":\"").append(jsonEscape(rating)).append("\"");
+        if (comment != null) {
+            body.append(",\"comment\":\"").append(jsonEscape(comment)).append("\"");
+        }
+        body.append("}");
+        try (OutputStream out = connection.getOutputStream()) {
+            out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+        }
+
+        try {
+            int status = connection.getResponseCode();
+            if (status >= 200 && status < 300) {
+                return readBody(connection.getInputStream());
+            }
+
+            System.out.println("打分失败:" + status + " " + readErrorBody(connection));
+            throw new IOException("feedback failed: " + status);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        String result = rateRun("u-123", "<要打分的 run_id>", "down", "答非所问");
+        System.out.println(result); // {"success": true, "data": {"run_id": "...", "rating": "down", "updated": false}, "error": null}
+    }
+}
+```
+
+:::

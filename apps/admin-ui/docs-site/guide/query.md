@@ -216,6 +216,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/messages
 | `channel` | string \| null | 只对 `assistant` 消息有意义。取值：`"final"`（这一轮最终展示给终端用户的回答）/ `"commentary"`（同一轮里 `final` 之前的其它文本，例如阶段性说明）；`role` 为 `"user"` 的消息恒为 `null` |
 | `created_at` | string（ISO 8601） \| null | 这条消息产生的时间。这个字段是后来增加的，更早产生的消息为 `null`，服务端不做历史补齐 |
 | `run_id` | string（UUID） \| null | 产生这条消息的 run。按这个字段分组，可以把消息归到各自的 run 上；渲染对话界面不必自己分组，见 [5.8 对话条目](#_5-8-对话条目)。同样是后来增加的字段，更早产生的消息为 `null` |
+| `feedback` | object \| null | 当前 `user_id` 对这条消息所在的那一轮打过的分；没打过是 `null`。字段：`rating`（取值：`up` / `down`）、`comment`（string \| null）、`item_id`（string \| null），含义见 [2.9 给一轮回答打分](./chat#_2-9-给一轮回答打分) |
 
 ### 示例
 
@@ -978,6 +979,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
 | `duration_ms` | number \| null | 这一轮从开始到结束用了多少毫秒；还没有结束时是 `null` |
 | `error` | string \| null | 失败诊断文本，只在失败时非空，读法见 [5.4 的 error 字段的读法](#error-字段的读法) |
 | `artifacts` | array \| null | 这一轮登记过的产物清单，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同。`[]` = 明确零交付；`null` = 无记录（平台升级前的历史轮，或还没终局的轮） |
+| `feedback` | object \| null | 当前 `user_id` 对这一轮打过的分；没打过是 `null`。字段与 [5.3 的 `feedback`](#_5-3-历史消息) 相同 |
 
 一轮的内容可能是空的（`runs` 里有这一轮，`items` 里没有它的条目），失败在第一步之前的轮次就是这样。`runs` 仍然给出它的状态与失败原因。
 

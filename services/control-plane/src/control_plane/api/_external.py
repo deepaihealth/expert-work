@@ -10,6 +10,7 @@ so the response carries no existence information. Mirrors the check
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
@@ -17,6 +18,7 @@ from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from expert_work.persistence.feedback_store import FeedbackRecord
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import ThreadMeta
@@ -396,3 +398,26 @@ async def load_owned_run(
     except ExternalScopeError:
         raise ExternalScopeError("RUN_NOT_FOUND", "run not found", 404) from None
     return run, meta
+
+
+def own_feedback_by_run(
+    rows: Sequence[FeedbackRecord], *, actor_id: str
+) -> dict[str, dict[str, Any]]:
+    """P-2 §4.2 — the caller's OWN per-run feedback, keyed by ``str(run_id)``.
+
+    Only rows whose ``actor_id`` is the end user named by ``user_id`` (their
+    ``tenant_user.id``, the same value ``load_owned_session`` verified) and
+    which are run-scoped (``run_id`` set) are projected; another end user's
+    rating on the same run never leaves the platform. ``/messages`` and
+    ``/items`` both go through here so the wire shape cannot drift.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row.run_id is None or row.actor_id != actor_id:
+            continue
+        out[str(row.run_id)] = {
+            "rating": row.rating,
+            "comment": row.comment,
+            "item_id": row.item_id,
+        }
+    return out

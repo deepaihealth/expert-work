@@ -275,6 +275,16 @@ function renderPg(
 async function establishThread(user: ReturnType<typeof userEvent.setup>) {
   streamRunMock.mockReturnValue(
     makeStream([
+      // 真实的 legacy 流首帧就是 metadata 且带 run_id(见对外文档
+      // sse-events.md「保存 run_id」)。P-2 起打分按 run 走,轮上没有
+      // run id 就不渲染反馈条 —— 这一帧不是布景,是被测行为的前提。
+      {
+        id: "m",
+        event: "metadata",
+        data: { run_id: "run-1", thread_id: sampleThread.thread_id },
+        rawData: '{"run_id":"run-1"}',
+        receivedAt: "",
+      },
       { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
     ]),
   );
@@ -1577,9 +1587,11 @@ describe("PlaygroundTab", () => {
       .mockResolvedValue({
         id: 1,
         thread_id: sampleThread.thread_id,
+        run_id: "run-1",
         rating: "up",
         turn_seq: 0,
         trace_id: null,
+        updated: false,
       });
     renderPg();
     await screen.findByTestId("playground-input");
@@ -1590,6 +1602,7 @@ describe("PlaygroundTab", () => {
       expect(feedbackMock).toHaveBeenCalledWith(sampleThread.thread_id, {
         rating: "up",
         comment: undefined,
+        run_id: "run-1",
         turn_seq: 0,
       }),
     );
@@ -1606,9 +1619,11 @@ describe("PlaygroundTab", () => {
       .mockResolvedValue({
         id: 2,
         thread_id: sampleThread.thread_id,
+        run_id: "run-1",
         rating: "down",
         turn_seq: 0,
         trace_id: null,
+        updated: false,
       });
     renderPg();
     await screen.findByTestId("playground-input");
@@ -1625,6 +1640,7 @@ describe("PlaygroundTab", () => {
       expect(feedbackMock).toHaveBeenCalledWith(sampleThread.thread_id, {
         rating: "down",
         comment: "答非所问",
+        run_id: "run-1",
         turn_seq: 0,
       }),
     );

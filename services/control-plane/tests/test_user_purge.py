@@ -203,6 +203,19 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
     await feedback.insert(
         FeedbackRecord(tenant_id=t1, thread_id=t_a, rating="up", actor_id="subj-a")
     )
+    # P-2 — 同一条 thread 上再放一条 run 级行(对外打分写出来的形态)。清除按
+    # thread 删,两种形态都该归零。
+    await feedback.upsert(
+        FeedbackRecord(
+            tenant_id=t1,
+            thread_id=t_a,
+            run_id=uuid4(),
+            rating="down",
+            comment="run-scoped",
+            source="external",
+            actor_id=str(a.id),
+        )
+    )
 
     # --- User B (same tenant) + User C (other tenant) — must survive intact. ---
     await memory.write([_mem(tenant=t1, user=b.id, content="b-keep")])
@@ -272,7 +285,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
         await object_store.get(image_key)
 
     # --- A's thread feedback is gone; B's (a different thread) survives. ---
-    assert summary.deleted["feedback"] == 1
+    assert summary.deleted["feedback"] == 2
     assert await feedback.list_for_thread(thread_id=t_a) == []
     assert len(await feedback.list_for_thread(thread_id=b_thread)) == 1
 

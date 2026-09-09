@@ -333,6 +333,44 @@ async def test_feedback_down_rated_threads_rls_scoped(
 
 
 @pytest.mark.asyncio
+async def test_feedback_upsert_and_scoped_reads_isolated_by_tenant(
+    feedback_rls_store: tuple[DbFeedbackStore, AsyncEngine],
+) -> None:
+    """P-2 — 同一 (run, actor) 在两个租户各自 upsert 成一行。
+
+    租户 A 的 scoped 读与 ``down_rated_thread_ids`` 都看不到 B 的 👎。
+    """
+    store, engine = feedback_rls_store
+    try:
+        tenant_a, tenant_b = uuid4(), uuid4()
+        thread_id, run_id = uuid4(), uuid4()
+
+        current_tenant_id_var.set(tenant_a)
+        await store.upsert(
+            FeedbackRecord(
+                tenant_id=tenant_a, thread_id=thread_id, run_id=run_id, rating="up", actor_id="x"
+            )
+        )
+        current_tenant_id_var.set(tenant_b)
+        _, updated = await store.upsert(
+            FeedbackRecord(
+                tenant_id=tenant_b, thread_id=thread_id, run_id=run_id, rating="down", actor_id="x"
+            )
+        )
+        assert updated is False  # 不是覆盖 A 的行
+
+        current_tenant_id_var.set(tenant_a)
+        a_rows = await store.list_for_thread_scoped(tenant_id=tenant_a, thread_id=thread_id)
+        assert [r.rating for r in a_rows] == ["up"]
+        assert await store.down_rated_thread_ids(tenant_id=tenant_a) == set()
+
+        current_tenant_id_var.set(tenant_b)
+        assert await store.down_rated_thread_ids(tenant_id=tenant_b) == {thread_id}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_feedback_worker_scan_and_stamp_lifecycle(
     feedback_rls_store: tuple[DbFeedbackStore, AsyncEngine],
 ) -> None:

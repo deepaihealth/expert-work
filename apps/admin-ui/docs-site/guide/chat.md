@@ -536,3 +536,54 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 翻页要改用 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=…&since_seq={next_seq}`，其中 `run_id` 取自 `X-Expert-Work-Run-Id` 响应头。见 [3 读懂 SSE 流](./sse-events)。
 :::
+
+## 2.9 给一轮回答打分
+
+终端用户对 Agent 的某一轮回答点「好」或「不好」时，调用方把这一票记到平台；平台据此改进 Agent。打分的对象是一轮，也就是一次 run，不是单条消息。
+
+打分需要 `run_id`。发起对话时事件流的第一个 `metadata` 事件就带 `run_id`（见 [3.4 metadata](./sse-events#metadata)），历史会话里每一轮的 `run_id` 见 [5.4 run 列表](./query#_5-4-run-列表) 或 [5.8 对话条目](./query#_5-8-对话条目) 的 `runs`。
+
+### 请求
+
+``` [端点]
+POST /v1/agents/{agent_code}/runs/{run_id}/feedback
+```
+
+需要 `write` 权限。`agent_code` 与 `run_id` 在路径里，其余参数在请求体里。
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | string，长度 1–255 字符。必须是发起这一轮的终端用户 |
+| `rating` | 是 | string。取值：`up`（回答好）/ `down`（回答不好） |
+| `comment` | 否 | string，最长 4000 字符。终端用户的原话，`down` 时建议附上，平台的审阅人员会看到 |
+| `item_id` | 否 | string，最长 255 字符。调用方自己的段落标签，原样保存、原样回显，平台不解释它 |
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `run_id` | string（UUID） | 被打分的那一轮 |
+| `rating` | string | 本次记下的取值。取值：`up` / `down` |
+| `updated` | boolean | `true` 表示这一轮此前已被同一个终端用户打过分，本次是覆盖 |
+
+同一个终端用户对同一轮再次打分，以最后一次为准：`rating`、`comment`、`item_id` 三个字段整体替换，没有传的字段视为清空。
+
+### 示例
+
+```bash [请求]
+curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/feedback" \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u-123", "rating": "down", "comment": "答非所问", "item_id": "p2"}'
+```
+
+```json [响应 200]
+{ "success": true, "data": { "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "rating": "down", "updated": false }, "error": null }
+```
+
+### 错误
+
+- `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`，返回 404 `RUN_NOT_FOUND`，响应不透露这一轮是否存在；`user_id` 为空白时同样是这个 404，不是 422。
+- `rating` 不是 `up` / `down`、`comment` 超过 4000 字符、`item_id` 超过 255 字符、请求体带了未声明的字段，返回 422 `INVALID_REQUEST`。
+
+打过的分会出现在 [5.3 历史消息](./query#_5-3-历史消息) 与 [5.8 对话条目](./query#_5-8-对话条目) 的 `feedback` 字段里，只回显当前 `user_id` 自己打的那一票。
