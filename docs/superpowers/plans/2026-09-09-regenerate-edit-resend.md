@@ -41,7 +41,8 @@ spec 行号以 `723c5a40` 为准,中间合了 #1447/#1449/#1452/#1453/#1455/#145
 | 迁移号 | ✅ `ls migrations/versions/` 最新 `0151_backfill_approval_user_id.py`;P-2 占 `0152_feedback_run_scope` | 本线 `0153_agent_run_supersede`(24 字符 < 32),`down_revision="0152_feedback_run_scope"` → **P-2 PR1 先合** |
 | advisory classid | 既有 1 / 2 / 8615 / 8616 / 8617 / 8618 / **8619 已被 `trigger_delivery.py:54` 与 `workspace_janitor.py:69` 同时占用**(各自注释都说自己独占,键串不同所以没撞;只记录不改) | 本线取 **8620** |
 | `audit.py` Literal(#1457 动过) | 复用 `resource_type="session"` + `AuditAction.SESSION_WRITE` + `details["stage"]`,**不加新 Literal 值** | — |
-| i18n | `en.ts` 有两个 `conversations_detail:`(`:396` 是 `TranslationKeys` 接口、`:3547` 是值),`zh-CN.ts:406` | Task 12 三处都加 |
+| i18n | `en.ts` 有两个 `conversations_detail:`(`:396` 是 `TranslationKeys` 接口、`:3547` 是值),`zh-CN.ts:406` | Task 11 三处都加 |
+| §4「缺省不出现(对接方按既有约定忽略未知字段)」 | 改成**始终出现、缺省 `null` / `false`**:与 P-2 的 `feedback: null` 同一约定,对接方已确认无 strict 解析;字段恒在,对接方不用区分「没这个字段」与「值为空」 | Task 5;spec §4 该句已在本 PR 同步改口 |
 
 ## Global Constraints
 
@@ -2391,7 +2392,7 @@ def replay_graph_input(built: Any, replay: Sequence[BaseMessage], *, run_id: UUI
     }
 ```
 
-import:`from dataclasses import dataclass`、`from collections.abc import Sequence`、`from langchain_core.messages import BaseMessage, message_to_dict`(`SystemMessage` 已有)、`from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY`、`from control_plane.supersede import SupersedeRequest?` —— 不,`SupersedeRequest` 定义在本文件;`from control_plane.supersede import supersede_run, supersede_thread_lock`。
+`api/runs.py` 新增 import(`SupersedeRequest` 定义在本文件,不从别处 import):`from contextlib import nullcontext`、`from dataclasses import dataclass`、`from collections.abc import Sequence`、`from langchain_core.messages import BaseMessage, message_to_dict`(`SystemMessage` 已有)、`from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY`、`from control_plane.supersede import supersede_run, supersede_thread_lock`。
 
 - [ ] **Step 4: `spawn_run` 改造**
 
@@ -2561,12 +2562,53 @@ async def test_worker_uses_replay_graph_input_when_present(monkeypatch: pytest.M
     assert [type(m).__name__ for m in msgs] == ["SystemMessage", "HumanMessage"]
     assert msgs[1].content == "U-old" and msgs[1].additional_kwargs[STAMP_RUN_ID] == str(run_id)
     assert "turn_documents" not in captured["graph_input"]
+
+
+def test_replay_messages_survive_the_jsonb_round_trip() -> None:
+    """``:regenerate`` queue 分支的存亡判据:旧轮 [System, Human] 原件经
+    ``message_to_dict`` → JSON(JSONB 列)→ ``messages_from_dict`` 之后,``id`` /
+    ``additional_kwargs``(run 戳 + 被取代标记)/ 多段 ``content``(text + image 块,
+    ``build_run_graph_input`` 在 ``supports_vision=True`` 下的真实产出)逐项相等。
+    只有 langchain 文档背书的往返,这里用真实形状钉死。"""
+    import json
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from langchain_core.messages import messages_from_dict
+
+    from control_plane.api.runs import build_run_graph_input
+    from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY
+    from expert_work.common.supersede import mark_superseded
+
+    built = SimpleNamespace(supports_vision=True, spotlight_nonce=None, max_steps=5, max_no_progress=0,
+                            system_prompt="You are the replay probe.", prompt_jinja=False)
+    tenant_id, thread_id, old_run, new_run = uuid4(), uuid4(), uuid4(), uuid4()
+    image_ref = f"expert_work://image/{tenant_id}/{thread_id}/{uuid4()}.png"
+    graph_input = build_run_graph_input(
+        built, input_text="看一下这张图", image_refs=[image_ref], untrusted_content=["<ticket>外部文本</ticket>"],
+        run_id=old_run, document_names=["report.pdf"],
+    )
+    system, human = graph_input["messages"]
+    assert isinstance(human.content, list) and len(human.content) >= 2            # 真实多段形态,不是自己编的
+    system = system.model_copy(update={"id": "sys-id-1"})                           # reducer 补 id 之前就带 id 的形态也要过
+    human = mark_superseded(human.model_copy(update={"id": "human-id-1"}), new_run_id=str(new_run), now=datetime(2026, 9, 10, tzinfo=UTC))
+
+    wire = json.loads(json.dumps([message_to_dict(m) for m in (system, human)]))   # 走一遍 JSON,与 JSONB 列同形
+    back_system, back_human = messages_from_dict(wire)
+
+    assert (back_system.id, back_human.id) == ("sys-id-1", "human-id-1")
+    assert back_system.content == system.content
+    assert back_human.content == human.content                                     # 每个 block 的 type / text / image 引用逐项相等
+    assert back_human.additional_kwargs == human.additional_kwargs                 # STAMP_RUN_ID / created_at / SUPERSEDED_BY / SUPERSEDED_AT 全在
+    assert back_human.additional_kwargs[STAMP_RUN_ID] == str(old_run)
+    assert back_human.additional_kwargs[SUPERSEDED_BY] == str(new_run) and SUPERSEDED_AT in back_human.additional_kwargs
+    assert type(back_system).__name__ == "SystemMessage" and type(back_human).__name__ == "HumanMessage"
 ```
 
 `worker_ctx` 夹具照 `services/control-plane/tests/test_run_queue_worker.py`(`ls services/control-plane/tests | rg run_queue_worker` 找到的那份)里构造 `RunQueueWorker` 的写法抄,并暴露 `enqueue(run_id, enqueued_input)`(调 `runtime.run_manager.enqueue(..., thread_id=<seed 的 thread>, tenant_id=...)`)与 `worker`。
 
 Run: `uv run --no-sync pytest services/control-plane/tests/test_run_queue_worker_replay.py services/control-plane/tests/test_run_queue_worker.py -q`
-Expected: 全绿。变异:worker 里 `if replay:` 改 `if False:` → 断言 `msgs[1].content == "U-old"` 红(走了 `input=None` 的普通路径);改回。
+Expected: 全绿。变异:worker 里 `if replay:` 改 `if False:` → 断言 `msgs[1].content == "U-old"` 红(走了 `input=None` 的普通路径);改回。往返测试:在 `wire = …` 之后临时加 `wire[0]["data"]["id"] = None; wire[1]["data"]["id"] = None`(模拟序列化丢 id)→ `(back_system.id, back_human.id) == ("sys-id-1", "human-id-1")` 红;再把 `wire[1]["data"]["additional_kwargs"].pop(SUPERSEDED_BY)` → `additional_kwargs ==` 那条红;两处都去掉 → 绿。
 
 - [ ] **Step 8: lint / 提交**
 
@@ -3032,17 +3074,18 @@ git commit -m "feat(external): P-1 POST …/runs/{run_id}:regenerate 与 :edit(�
 
 ---
 
-### Task 9: Idempotency-Key 测试 + 三张路由表 + NUL 逐端点测试 + `errors.md` 先占位行(文档正文在 Task 10)
+### Task 9: Idempotency-Key 测试 + 三张路由表 + NUL 逐端点测试 + `errors.md` 五个错误码(随 PR3 一起上线)
 
 **Files:**
 - Modify: `services/control-plane/tests/test_external_only_gate.py:67-95`(`_EXTERNAL_ROUTES` 加两条)
 - Modify: `services/control-plane/tests/test_console_lockdown.py:251-286`(`_EXTERNAL_AGENT_ROUTES` 加两条)
 - Modify: `services/control-plane/tests/test_external_path_param_nul_guard.py`(`:259` `test_cancel_run_nul_agent_code_is_422` 之后加两条;`:348` `test_cancel_run_nul_run_id_is_422` 之后加一条)
 - Modify: `services/control-plane/tests/test_external_runs_regenerate.py`(加幂等测试)
+- Modify: `apps/admin-ui/docs-site/guide/errors.md`(§8.1 速查表五行 + 端点路径两行、§8.7 一段、§8.10 两条)—— PR3 合并后 docs-site 随 admin-ui 发测试环境,对接方看到的必须是完整的错误码行,不能等 PR4
 
 **Interfaces:**
 - Consumes: Task 8 两条路由
-- Produces: 三张表登记的精确行(下)
+- Produces: 三张表登记的精确行(下);`errors.md` 五个错误码的完整行(链接先指本页 §8.7 / §8.10 —— chat §2.9 要到 Task 10 才存在,指过去会让 `check_links.py` 红;Task 10 再把链接改指 chat §2.9)
 
 - [ ] **Step 1: 先跑完备性断言,看它红**
 
@@ -3139,11 +3182,45 @@ async def test_both_runs_keep_their_token_usage_rows(ctx: Any) -> None:
 
 Run: `uv run --no-sync pytest services/control-plane/tests/test_external_runs_regenerate.py -q`。Expected:全绿。变异:`_supersede_and_run` 里 digest 的 salt 去掉 `\x00{op}` → `reused.status_code == 422` 红(变成幂等命中 202);改回。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 5: `errors.md` 五个错误码(完整行,随 PR3 发布)**
+
+§8.1 速查表在 `RUN_NOT_FOUND` 行(`:32`)之后加五行(链接指本页小节;Task 10 再改指 chat §2.9):
+
+```markdown
+| [`RUN_NOT_LAST`](#_8-10-422-请求参数不合法) | 422 | 重新生成 / 编辑重发 | 目标不是这段会话的最后一轮。只能对最后一轮操作 |
+| [`RUN_INPUT_UNAVAILABLE`](#_8-10-422-请求参数不合法) | 422 | 重新生成 | 目标轮在开始执行前就失败了，没有可复用的输入。改用编辑重发并提供 `input` |
+| [`THREAD_BUSY`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 这段会话有一轮正在执行或排队。等它结束或先取消它 |
+| [`RUN_AWAITING_APPROVAL`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 目标轮正等待审批决策。先决策，再对续跑后的那一轮操作 |
+| [`RUN_ALREADY_SUPERSEDED`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 目标轮已经被重新生成过。对最新的那一轮操作 |
+```
+
+`RUN_NOT_FOUND` 行(`:32`)的「端点」列改为「取消 run / 审批决策 / 事件接口 / 重新生成 / 编辑重发」。§8.1 端点路径清单(`:10-14`)加两行:
+
+```markdown
+- 重新生成：`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate`，同一输入再跑一次
+- 编辑重发：`POST /v1/agents/{agent_code}/runs/{run_id}:edit`，改输入后再跑一次
+```
+
+§8.7 首句「两个端点会返回 409，都是标准格式。」改「四个端点会返回 409，都是标准格式。」,并在「产物下载」段之后加:
+
+```markdown
+**重新生成与编辑重发**（`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate` 与 `…:edit`）：`THREAD_BUSY` 表示这段会话有一轮正在执行或排队，等它结束或先取消它再试；`RUN_AWAITING_APPROVAL` 表示目标轮正等待审批决策，先决策（[4.2](./run-control#_4-2-审批决策)），再对续跑后的那一轮操作；`RUN_ALREADY_SUPERSEDED` 表示目标轮已经被重新生成过，对最新的那一轮操作。三个错误都不要原样重试。两个端点只对一段会话的最后一轮有效，旧轮不删除、标成「已被取代」，副作用不撤销、两轮都计费。
+```
+
+§8.10「另外三种独立的 422」(`:267`)改「另外五种独立的 422」,表里追加:
+
+```markdown
+| `RUN_NOT_LAST` | 重新生成 / 编辑重发的目标不是这段会话的最后一轮 |
+| `RUN_INPUT_UNAVAILABLE` | 重新生成的目标轮在开始执行前就失败了，没有可复用的输入；改用编辑重发并提供 `input` |
+```
+
+自检:`rg -n "图|节点|落库|游标|回放|帧|注入|铸造|mint|闸|门禁|终态|载荷|通路|编排|graph|LangGraph|checkpoint|supervisor" apps/admin-ui/docs-site/guide/errors.md` 零新增命中;`cd apps/admin-ui/docs-site && pnpm build && python3 scripts/check_links.py` 过(锚点 `#_8-7-409-冲突` / `#_8-10-422-请求参数不合法` 是本页既有标题的 VitePress slug,与 `:37` 行 `ARTIFACT_VERSION_MISMATCH` 用的同一个)。
+
+- [ ] **Step 6: 提交**
 
 ```bash
-git add services/control-plane/tests
-git commit -m "test(external): P-1 三张路由表登记 + NUL 逐端点 + Idempotency-Key 重发不产生第二条 run"
+git add services/control-plane/tests apps/admin-ui/docs-site/guide/errors.md
+git commit -m "test(external): P-1 三张路由表登记 + NUL 逐端点 + Idempotency-Key 重发不产生第二条 run;docs: errors.md 五个错误码"
 ```
 
 **PR3 到此**(Task 8-9)。
@@ -3157,14 +3234,14 @@ git commit -m "test(external): P-1 三张路由表登记 + NUL 逐端点 + Idemp
 - Modify: `apps/admin-ui/docs-site/guide/run-control.md:1-6`(章首加一句指引)
 - Modify: `apps/admin-ui/docs-site/guide/sse-events.md`(§3.4 `metadata` 小节末,`:186-227` 内)
 - Modify: `apps/admin-ui/docs-site/guide/query.md`(§5.3 响应字段表 `:208-219`、§5.4 响应 `:284-297`、§5.8 条目公共字段 `:799-811` + 轮的信息 `:969-983`)
-- Modify: `apps/admin-ui/docs-site/guide/errors.md`(§8.1 速查表、§8.7 409、§8.10 422)
+- Modify: `apps/admin-ui/docs-site/guide/errors.md`(只改 Task 9 写的五行 + §8.7 段落里的链接目标 → chat §2.9;错误码正文 PR3 已上线)
 - Modify: `apps/admin-ui/docs-site/guide/examples.md`(§10.8 之后新增 §10.9)
 - Modify: `apps/admin-ui/docs-site/guide/best-practices.md`(§9.5 常见问题加一问)
 - Modify: `apps/admin-ui/docs-site/.vitepress/config.mts:40-52`(chat 子项加 2.9)
 
 **Interfaces:**
 - Consumes: Task 8/9 的端点、body、错误码;Task 5 的读面字段
-- Produces: 六页(+run-control 一句)文档;`errors.md` 五个新码行
+- Produces: 六页(+run-control 一句)文档;`errors.md` 五个码行的链接改指 chat §2.9(码行本身 Task 9 已上线)
 
 - [ ] **Step 1: `chat.md` 新节(放在 §2.8「重复请求的响应」之后、文件末尾)**
 
@@ -3258,23 +3335,7 @@ git commit -m "test(external): P-1 三张路由表登记 + NUL 逐端点 + Idemp
 
 §5.4 run 列表响应字段表加两行 `superseded_by`(string \| null,同上)与 `regenerated_from`(string \| null,「这一轮是对哪个旧 `run_id` 的重新生成或编辑重发；普通轮为 `null`」);§5.8「条目的公共字段」加 `superseded_by` / `tombstone` 两行,「轮的信息」加 `superseded_by` / `regenerated_from` 两行(文字同上)。
 
-`errors.md` §8.1 速查表在 `RUN_NOT_FOUND` 行之后加五行(链接到 `./chat#_2-9-重新生成与编辑重发`):
-
-```markdown
-| [`RUN_NOT_LAST`](./chat#_2-9-重新生成与编辑重发) | 422 | 重新生成 / 编辑重发 | 目标不是这段会话的最后一轮。只能对最后一轮操作 |
-| [`RUN_INPUT_UNAVAILABLE`](./chat#_2-9-重新生成与编辑重发) | 422 | 重新生成 | 目标轮在开始执行前就失败了，没有可复用的输入。改用编辑重发并提供 `input` |
-| [`THREAD_BUSY`](./chat#_2-9-重新生成与编辑重发) | 409 | 重新生成 / 编辑重发 | 这段会话有一轮正在执行或排队。等它结束或先取消它 |
-| [`RUN_AWAITING_APPROVAL`](./chat#_2-9-重新生成与编辑重发) | 409 | 重新生成 / 编辑重发 | 目标轮正等待审批决策。先决策，再对续跑后的那一轮操作 |
-| [`RUN_ALREADY_SUPERSEDED`](./chat#_2-9-重新生成与编辑重发) | 409 | 重新生成 / 编辑重发 | 目标轮已经被重新生成过。对最新的那一轮操作 |
-```
-
-§8.1 导语「取消 run 与审批决策两个端点的错误码详解在…」后补「重新生成与编辑重发的错误码详解在 [2.9](./chat#_2-9-重新生成与编辑重发)」;§8.1 的端点路径清单加 `- 重新生成：POST /v1/agents/{agent_code}/runs/{run_id}:regenerate` 与 `- 编辑重发：POST /v1/agents/{agent_code}/runs/{run_id}:edit`;§8.7 首句「两个端点会返回 409」改「四个端点会返回 409」并加一段:
-
-```markdown
-**重新生成与编辑重发**（`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate` 与 `…:edit`）：`THREAD_BUSY` 表示这段会话有一轮正在执行或排队；`RUN_AWAITING_APPROVAL` 表示目标轮正等待审批决策；`RUN_ALREADY_SUPERSEDED` 表示目标轮已经被重新生成过。三个错误都不要重试同一个请求，处理办法见 [2.9](./chat#_2-9-重新生成与编辑重发)。
-```
-
-§8.10「另外三种独立的 422」改「另外五种独立的 422」并追加 `RUN_NOT_LAST` / `RUN_INPUT_UNAVAILABLE` 两条(文字同速查表);`RUN_NOT_FOUND` 行的「端点」列加「重新生成 / 编辑重发」。
+`errors.md`(码行与段落 Task 9 已随 PR3 上线,这里只改链接目标):§8.1 速查表里 Task 9 加的五行,链接从 `(#_8-10-422-请求参数不合法)` / `(#_8-7-409-冲突)` 改为 `(./chat#_2-9-重新生成与编辑重发)`;§8.1 导语「取消 run 与审批决策两个端点的错误码详解在…」后补一句「重新生成与编辑重发的错误码详解在 [2.9](./chat#_2-9-重新生成与编辑重发)」;§8.7「重新生成与编辑重发」段末追加「完整规则见 [2.9](./chat#_2-9-重新生成与编辑重发)」。
 
 `examples.md` §10.8 之后加 §10.9(结构照 §10.6 取消 run:curl + Python + Node.js 各一段,示例值与全站一致):
 
@@ -3658,7 +3719,7 @@ git commit -m "docs(runbook): P-1 上线那次的迁移与真栈验收一句"
 |---|---|---|---|
 | **PR1 内核 + 读面** | 1, 2, 3, 4, 5 | `packages/expert-work-common/src/expert_work/common/{conversation_channel,supersede}.py`;`packages/expert-work-persistence/{migrations/versions/0153_agent_run_supersede.py, src/expert_work/persistence/models/{agent_run,thread_message}.py, src/expert_work/persistence/thread_message/{base,memory,sql}.py}`;`packages/expert-work-runtime/src/expert_work/runtime/runs/{schemas,store,manager}.py`;`services/control-plane/src/control_plane/{transcript,supersede}.py`;`services/control-plane/src/control_plane/api/{external_sessions,external_session_items,runs,conversations,external_runs}.py`;对应 tests | **等 P-2 PR1 合并**(迁移 0152 是 0153 的 down_revision;`external_session_items.py` / `external_sessions.py` / `external_runs.py` 三个文件 P-2 也改)→ rebase 后再开 |
 | **PR2 执行侧** | 6, 7 | `services/orchestrator/src/orchestrator/graph_builder/builder.py`;`services/control-plane/src/control_plane/{api/runs.py, run_queue_worker.py}`;tests | 依赖 PR1(`supersede_run` / `RunManager` 签名);Task 6 与 Task 7 文件不相交,可两个 worktree 并行 |
-| **PR3 对外端点** | 8, 9 | `services/control-plane/src/control_plane/api/{external_runs,agents}.py`;`services/control-plane/tests/{test_external_only_gate,test_console_lockdown,test_external_path_param_nul_guard,test_external_runs_regenerate}.py` | 依赖 PR2(`spawn_run(supersede=)`);三张路由表与 P-2 PR1 同文件 —— P-2 先合,本 PR 在其后追加行 |
+| **PR3 对外端点** | 8, 9 | `services/control-plane/src/control_plane/api/{external_runs,agents}.py`;`services/control-plane/tests/{test_external_only_gate,test_console_lockdown,test_external_path_param_nul_guard,test_external_runs_regenerate}.py`;`apps/admin-ui/docs-site/guide/errors.md`(五个错误码行,随 PR3 发到测试环境) | 依赖 PR2(`spawn_run(supersede=)`);三张路由表与 P-2 PR1 同文件 —— P-2 先合,本 PR 在其后追加行 |
 | **PR4 文档 + 控制台** | 10, 11, 12 | `apps/admin-ui/docs-site/guide/{chat,run-control,sse-events,query,errors,examples,best-practices}.md` + `.vitepress/config.mts`;`apps/admin-ui/src/{api/{sessions,runs,conversations}.ts, pages/agent_detail/playground/history_turns.ts, components/console/{types,console_turns,Transcript}.{ts,tsx}, components/turn/SupersededFold.tsx, i18n/locales/{en,zh-CN}.ts}`;`docs/runbooks/production-release.md` | Task 10(文档)与 Task 11(控制台)文件不相交,可并行;Task 10 只依赖 PR3 的 wire 契约(可与 PR3 同步写,合并顺序在 PR3 后);Task 12 要测试环境已部署 PR1-3 |
 | Task 0 | 0 | `docs/superpowers/specs/2026-09-09-regenerate-edit-resend-design.md` | 第一天,单独一个小 PR,不阻塞 PR1 开工(PR1 的 Task 4 若 §8-2 耗时判据不过,加锚点列另议) |
 
