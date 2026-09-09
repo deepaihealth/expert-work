@@ -86,9 +86,9 @@
 ## 8. 实施前要核实(第一天做,回填本文)
 1. 压缩摘要是否落检查点、是否带 run 戳(§6)。
 2. `filter={"run_id"}` 历史过滤在生产版本 langgraph-checkpoint-postgres 上的性能(长会话 history 条数);必要时给 `agent_run` 加 `base_checkpoint_id` 列走 A 方案的锚点(与 B 不冲突)。
-3. 对接方在 `stream_format=legacy` 实时流里取 `run_id` 的帧位置(端点按 run 的前提;历史侧已确定有)。
+3. ~~对接方在 `stream_format=legacy` 实时流里取 `run_id` 的帧位置~~ **✅ 已核实(09-09)**:legacy 流首帧 `metadata` 就带 `run_id` + `thread_id`,`docs-site/guide/sse-events.md` 明写「保存 run_id」,对接方现有代码已在存。
 4. 队列模式(`mode=queue`)下 supersede 与 queue worker 认领的先后顺序:supersede 必须在建 run 行**之前**完成并持锁,防止 worker 抢跑。
-5. 对接方对新增字段是否 strict 解析 —— 问一句。
+5. ~~对接方对新增字段是否 strict 解析~~ **✅ 已确认(09-09,用户)**:对接方无 strict,自动忽略多出的字段。
 
 ## 9. 关联
 - 探索报告结论(A/B/C 对比)与 spike 文件:`scratchpad/spike_p1_supersede.py`、`spike_p1_run.log`(留档,不入仓)。
