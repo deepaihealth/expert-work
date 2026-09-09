@@ -234,3 +234,20 @@ export async function disablePlatformServer(
   );
   return unwrap(response.data);
 }
+
+/** Result of a by-name allowlist removal; ``changed`` = the name was actually
+ *  present (false when it was already gone — the call is idempotent). */
+export interface AllowlistRemoval extends PlatformServerToggle {
+  changed: boolean;
+}
+
+/** ``DELETE /v1/mcp-servers/allowlist/{name}`` — X-5: drop a name from
+ *  ``mcp_allowlist`` by NAME, without resolving the catalog. For residual
+ *  entries whose catalog entry was deleted (the catalog-id route has nothing
+ *  to address). Idempotent. */
+export async function removeAllowlistName(name: string): Promise<AllowlistRemoval> {
+  const response = await apiClient.delete<ApiEnvelope<AllowlistRemoval>>(
+    `/v1/mcp-servers/allowlist/${encodeURIComponent(name)}`,
+  );
+  return unwrap(response.data);
+}

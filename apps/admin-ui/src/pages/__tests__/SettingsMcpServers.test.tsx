@@ -7,6 +7,7 @@ import i18n from "../../i18n";
 
 import { SettingsMcpServers } from "../SettingsMcpServers";
 import * as serversSdk from "../../api/mcp-servers";
+import * as catalogSdk from "../../api/mcp-catalog";
 import type { McpServer } from "../../api/mcp-servers";
 
 // Cross-tenant W3 — the page reads the ambient tenant scope; these tests
@@ -32,6 +33,7 @@ vi.mock("../../tenant/useIsTenantSwitched", () => ({
 const listMock = vi.spyOn(serversSdk, "listMcpServers");
 const availMock = vi.spyOn(serversSdk, "listAvailableMcpServers");
 const toolsMock = vi.spyOn(serversSdk, "listMcpServerTools");
+const removeByNameMock = vi.spyOn(catalogSdk, "removeAllowlistName");
 
 // The default test-time locale resolves to "en" (jsdom's navigator.language
 // is "en-US"; see AgentsList.test.tsx for the same forced-locale idiom) —
@@ -42,6 +44,7 @@ beforeEach(async () => {
   listMock.mockReset();
   availMock.mockReset();
   toolsMock.mockReset();
+  removeByNameMock.mockReset();
   scopeRef.current = undefined;
   // vitest 4 的 reset 不复位 mockReturnValue — 显式归位防串台。
   isTenantSwitchedMock.mockReturnValue(false);
@@ -146,9 +149,15 @@ describe("SettingsMcpServers unified list", () => {
   // used to show a Test button that 404s and a Remove button whose handler
   // silently no-ops. Neither is a real affordance, so both must be hidden
   // or disabled instead.
-  it("degraded platform row (catalog deleted) hides Test/authorize and disables Remove", async () => {
+  // X-5 — a residual allowlist name (catalog entry deleted) has no catalog id
+  // to address, so Remove goes by NAME: confirm → DELETE /allowlist/{name} →
+  // reload drops the row. Test/authorize stay hidden (nothing to probe).
+  it("degraded platform row (catalog deleted): Remove by name → confirm → API → row gone", async () => {
     listMock.mockResolvedValue([]);
-    availMock.mockResolvedValue([{ name: "ghost", source: "platform", display_name: "Ghost" }]);
+    availMock
+      .mockResolvedValueOnce([{ name: "ghost", source: "platform", display_name: "Ghost" }])
+      .mockResolvedValue([]);
+    removeByNameMock.mockResolvedValue({ name: "ghost", tenant_enabled: false, changed: true });
     renderPage();
     await screen.findByText("Ghost");
 
@@ -156,7 +165,16 @@ describe("SettingsMcpServers unified list", () => {
     expect(screen.queryByTestId("ms-authorize-ghost")).not.toBeInTheDocument();
 
     const removeButton = screen.getByTestId("ms-remove-ghost");
-    expect(removeButton).toBeDisabled();
+    expect(removeButton).toBeEnabled();
+    fireEvent.click(removeButton);
+    // App.useApp().modal.confirm — nothing fires until the operator confirms.
+    expect(removeByNameMock).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: "OK" }));
+
+    await waitFor(() => expect(removeByNameMock).toHaveBeenCalledWith("ghost"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("ms-remove-ghost")).not.toBeInTheDocument(),
+    );
   });
 
   // Regression: /available (platform allowlist) is supplementary. If it fails,
@@ -221,6 +239,8 @@ describe("SettingsMcpServers — cross-tenant W4 aggregate", () => {
     listMock.mockResolvedValue([{ ...custom, tenant_id: "tenant-2" }]);
     availMock.mockResolvedValue([
       { name: "amap", source: "platform", display_name: "高德地图", auth_type: "none", catalog_id: "c1" },
+      // X-5 — the by-name Remove on a residual row is a write too.
+      { name: "ghost", source: "platform", display_name: "Ghost" },
     ]);
 
     renderPage();
@@ -231,6 +251,7 @@ describe("SettingsMcpServers — cross-tenant W4 aggregate", () => {
     expect(screen.getByTestId("ms-toggle-my-custom")).toBeDisabled();
     expect(screen.getByTestId("ms-delete-my-custom")).toBeDisabled();
     expect(screen.getByTestId("ms-remove-amap")).toBeDisabled();
+    expect(screen.getByTestId("ms-remove-ghost")).toBeDisabled();
   });
 
   // Review C-2 — /available rejects "*" with 400: the aggregate list read

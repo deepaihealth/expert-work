@@ -37,7 +37,7 @@ import {
   type McpServer,
   type McpTool,
 } from "../api/mcp-servers";
-import { disablePlatformServer } from "../api/mcp-catalog";
+import { disablePlatformServer, removeAllowlistName } from "../api/mcp-catalog";
 import { ApiError } from "../api/client";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
@@ -61,7 +61,7 @@ function errMsg(err: unknown): string {
 
 export function SettingsMcpServers() {
   const { t } = useTranslation();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const navigate = useNavigate();
   // Cross-tenant W3 — lists ride the ambient scope; the per-server tools
   // probe is a detail read (concrete UUID only, "*" 400s).
@@ -186,11 +186,7 @@ export function SettingsMcpServers() {
   );
 
   const handleRemovePlatform = useCallback(
-    async (catalogId: string | null) => {
-      if (catalogId === null) {
-        message.error(t("mcp_servers.remove_unavailable"));
-        return;
-      }
+    async (catalogId: string) => {
       try {
         await disablePlatformServer(catalogId);
         reload();
@@ -198,7 +194,29 @@ export function SettingsMcpServers() {
         message.error(errMsg(err));
       }
     },
-    [message, reload, t],
+    [message, reload],
+  );
+
+  // X-5 — residual row (catalog entry deleted): there is no catalog id to
+  // address, so the removal goes by NAME. Confirm through App.useApp().modal
+  // so the dialog rides the App context (a static Modal.confirm never
+  // renders under the test App tree).
+  const handleRemoveStale = useCallback(
+    (name: string, displayName: string) => {
+      modal.confirm({
+        title: t("mcp_servers.remove_confirm", { name: displayName }),
+        content: t("mcp_servers.remove_stale_hint"),
+        onOk: async () => {
+          try {
+            await removeAllowlistName(name);
+            reload();
+          } catch (err) {
+            message.error(errMsg(err));
+          }
+        },
+      });
+    },
+    [message, modal, reload, t],
   );
 
   const openCreate = useCallback(() => setAddOpen(true), []);
@@ -345,23 +363,31 @@ export function SettingsMcpServers() {
       render: (_: unknown, row: UnifiedRow) => {
         if (row.source === "platform") {
           if (row.catalogId === null) {
-            // Degraded row: the catalog entry was deleted while the tenant
-            // still had it allowlisted. Test would 404 (nothing to probe)
-            // and Remove has no catalog id to act on — show neither as a
-            // live affordance; Remove stays visible but disabled so the
-            // stale entry is still explainable, not silently broken.
+            // X-5 — degraded row: the catalog entry was deleted while the
+            // tenant still had it allowlisted. Test would 404 (nothing to
+            // probe), so no Test/authorize; Remove goes by NAME since there
+            // is no catalog id to address (DELETE /allowlist/{name}).
             return (
               <Space size={4}>
-                <Tooltip title={t("mcp_servers.remove_unavailable")}>
-                  <span>
-                    <Button size="small" disabled data-testid={`ms-remove-${row.name}`}>
+                <ReadonlyTooltip
+                  on={writeDisabled}
+                  title={isAggregate ? t("common.cross_tenant_readonly") : undefined}
+                >
+                  <Tooltip title={writeDisabled ? undefined : t("mcp_servers.remove_stale_hint")}>
+                    <Button
+                      size="small"
+                      disabled={writeDisabled}
+                      data-testid={`ms-remove-${row.name}`}
+                      onClick={() => handleRemoveStale(row.name, row.displayName)}
+                    >
                       {t("mcp_servers.remove")}
                     </Button>
-                  </span>
-                </Tooltip>
+                  </Tooltip>
+                </ReadonlyTooltip>
               </Space>
             );
           }
+          const catalogId = row.catalogId;
           const isOauth = row.authType === "oauth2";
           return (
             <Space size={4}>
@@ -390,7 +416,7 @@ export function SettingsMcpServers() {
               >
                 <Popconfirm
                   title={t("mcp_servers.remove_confirm", { name: row.displayName })}
-                  onConfirm={() => void handleRemovePlatform(row.catalogId)}
+                  onConfirm={() => void handleRemovePlatform(catalogId)}
                   disabled={writeDisabled}
                 >
                   <Button

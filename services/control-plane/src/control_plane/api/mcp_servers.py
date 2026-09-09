@@ -364,6 +364,55 @@ async def _tenant_allowlist(tenant_config_service: object, tenant_id: UUID) -> l
     return list(cfg.mcp_allowlist)  # type: ignore[attr-defined]
 
 
+async def _drop_allowlist_name(
+    *,
+    tenant_config_service: object,
+    principal: Principal,
+    name: str,
+    pool_service: object,
+    agent_runtime: object,
+    bus: object,
+    audit: AuditLogger,
+    details: dict[str, object],
+) -> bool:
+    """Remove ``name`` from the tenant's ``mcp_allowlist``; on a real change evict
+    this pod's MCP pool + built agents, broadcast to peers and write the audit
+    record. Returns whether the allowlist actually changed.
+
+    Shared by the catalog-id opt-out and the X-5 by-name removal so the two
+    never drift: BUG-1 atomic store-level remove (never the cached list), and
+    PR-E3a's double broadcast — ``tenant_mcp`` for pools/builds plus
+    ``tenant_config`` because the allowlist lives on tenant_config, a
+    BUILD-TIME input peers cache for 60s. An unconfigured tenant has nothing
+    enabled → no-op.
+    """
+    tenant_id = principal.tenant_id
+    try:
+        _, changed = await tenant_config_service.remove_mcp_allowlist_name(  # type: ignore[attr-defined]
+            tenant_id=tenant_id, name=name, actor_id=principal.subject_id
+        )
+    except TenantConfigNotConfiguredError:
+        return False
+    if not changed:
+        return False
+    await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id, bus)
+    if bus is not None:
+        await bus.publish(  # type: ignore[attr-defined]
+            InvalidationEvent(kind="tenant_config", tenant_id=str(tenant_id))
+        )
+    await emit(
+        audit,
+        tenant_id=tenant_id,
+        actor_id=principal.subject_id,
+        action=AuditAction.MCP_CATALOG_DISABLE,
+        resource_type="mcp_connector_catalog",
+        resource_id=name,
+        trace_id=current_trace_id_hex(),
+        details=details,
+    )
+    return True
+
+
 def _public(record: object) -> dict[str, object]:
     # Serialize the record WITHOUT exposing the token_secret_ref — a ref
     # (not a secret value) but dropped from the public payload to keep the
@@ -693,7 +742,6 @@ def build_mcp_servers_router() -> APIRouter:
     ) -> dict[str, object]:
         """Tenant opts out of a platform shared server (removes it from
         mcp_allowlist). Idempotent — a name already absent is a no-op."""
-        tenant_id = principal.tenant_id
         if tenant_config_service is None:
             raise HTTPException(
                 status_code=503,
@@ -708,33 +756,58 @@ def build_mcp_servers_router() -> APIRouter:
             )
         # BUG-1 同款原子化(见 enable 侧注释)。未配置的租户本来就没有任何
         # 启用项 → 与旧行为一致按 no-op 处理。
-        try:
-            _, changed = await tenant_config_service.remove_mcp_allowlist_name(  # type: ignore[attr-defined]
-                tenant_id=tenant_id, name=entry.name, actor_id=principal.subject_id
-            )
-        except TenantConfigNotConfiguredError:
-            changed = False
-        if changed:
-            await _invalidate_tenant_mcp(pool_service, agent_runtime, tenant_id, bus)
-            # PR-E3a — same as the enable side: the allowlist is tenant_config,
-            # so peers must drop config cache + builds together.
-            if bus is not None:
-                await bus.publish(  # type: ignore[attr-defined]
-                    InvalidationEvent(kind="tenant_config", tenant_id=str(tenant_id))
-                )
-            await emit(
-                audit,
-                tenant_id=tenant_id,
-                actor_id=principal.subject_id,
-                action=AuditAction.MCP_CATALOG_DISABLE,
-                resource_type="mcp_connector_catalog",
-                resource_id=entry.name,
-                trace_id=current_trace_id_hex(),
-                details={"name": entry.name},
-            )
+        await _drop_allowlist_name(
+            tenant_config_service=tenant_config_service,
+            principal=principal,
+            name=entry.name,
+            pool_service=pool_service,
+            agent_runtime=agent_runtime,
+            bus=bus,
+            audit=audit,
+            details={"name": entry.name},
+        )
         return {
             "success": True,
             "data": {"name": entry.name, "tenant_enabled": False},
+            "error": None,
+        }
+
+    @router.delete("/allowlist/{name}", status_code=200)
+    async def remove_allowlist_name(
+        name: Annotated[str, Path(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")],
+        principal: Annotated[Principal, Depends(require("mcp_server", "write"))],
+        tenant_config_service: Annotated[object, Depends(_get_tenant_config_service)],
+        pool_service: Annotated[object, Depends(_get_tenant_mcp_pool_service)],
+        agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
+        bus: Annotated[object, Depends(_get_invalidation_bus)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> dict[str, object]:
+        """X-5 — drop a name from ``mcp_allowlist`` WITHOUT resolving it through
+        the catalog. Once the platform deletes a catalog entry the catalog-id
+        opt-out above has nothing to address (404), which left the tenant's
+        residual name unremovable from the UI. Works for any name (present in
+        the catalog or not); the catalog itself is untouched. Idempotent like
+        the catalog-id side — ``changed`` tells the caller whether anything was
+        actually dropped.
+        """
+        if tenant_config_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "TENANT_CONFIG_UNAVAILABLE", "message": "config service unwired"},
+            )
+        changed = await _drop_allowlist_name(
+            tenant_config_service=tenant_config_service,
+            principal=principal,
+            name=name,
+            pool_service=pool_service,
+            agent_runtime=agent_runtime,
+            bus=bus,
+            audit=audit,
+            details={"name": name, "by_name": True},
+        )
+        return {
+            "success": True,
+            "data": {"name": name, "tenant_enabled": False, "changed": changed},
             "error": None,
         }
 
