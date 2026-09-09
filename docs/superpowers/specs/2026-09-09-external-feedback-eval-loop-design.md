@@ -40,13 +40,22 @@
 ## 3. 数据模型
 
 迁移 `0152_feedback_run_scope`(当前最新 0151):
-- `feedback` 加列:`run_id UUID NULL`(对外与控制台新写入必填;历史行 NULL)、`source TEXT NOT NULL DEFAULT 'console'`(`console|external`)、`item_id TEXT NULL`(对接方附带的段落标签,**只存不 join**)。
+- `feedback` 加列:`run_id UUID NULL`(对外与控制台新写入必填;历史行 NULL)、`source TEXT NOT NULL DEFAULT 'console'`(`console|external`)、`item_id TEXT NULL`(对接方附带的段落标签,**只存不 join**)、`updated_at TIMESTAMPTZ NULL`(改票时间;NULL = 从没改过,见 §4.1 的覆盖语义)。
 - 部分唯一索引 `(tenant_id, run_id, actor_id) WHERE run_id IS NOT NULL` —— 「可改票」= upsert。
 - 索引 `(tenant_id, run_id)`。
 - `turn_seq` 保留不动(死字段,另议)。
 - `actor_id`:对外写入时 = 终端用户的内部 id(`lookup_external_user_id` 解析,与 `/messages` 的 `user_id` 校验同源)。
 
-`curation_candidate`(现有表)加两列:`feedback_run_id UUID NULL`、`feedback_comment TEXT NULL` —— 审阅员打开候选能直接看到「哪一轮被踩 + 用户原话」,不用翻整条 trajectory。
+`curation_candidate`(现有表)加**四列** —— 一组「候选行上的反馈快照」,让审阅员打开候选不用翻整条 trajectory 就能判断:
+
+| 列 | 类型 | 含义 | 来自 |
+|---|---|---|---|
+| `feedback_run_id` | `UUID NULL` | 哪一轮被踩 | §5 |
+| `feedback_comment` | `TEXT NULL` | 用户原话 | §5 |
+| `feedback_changed_at` | `TIMESTAMPTZ NULL` | 👎→👍 改票时间;NULL = 没改过 | §5「改票:候选行加 `feedback_changed_at`」 |
+| `feedback_source` | `TEXT NULL` | 这一踩是谁打的:`console` = 员工、`external` = 终端用户;**NULL = worker 兜底建的候选**,归因不到某一条 feedback。CHECK `feedback_source IS NULL OR feedback_source IN ('console','external')` | §6(2026-09-09 拍板)「凡是人看的地方显示来源」 |
+
+四列**同进同出,都在 `0152` 一次加完**:它们是同一形状的东西(把那条 feedback 的快照 denormalize 到候选行上),拆成多次迁移会让这组列分散在不同版本里。其中 `feedback_source` 的**消费方**在 PR4(候选行显示来源),但列本身仍由 0152 建 —— 在 PR4 合入前它是一列没人写也没人读的空列,这是预期状态。
 
 ## 4. 对外 API
 
