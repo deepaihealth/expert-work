@@ -1409,6 +1409,34 @@ async def test_runs_feedback_defaults_to_null(ctx: _Ctx) -> None:
     session_id, _ = await ctx.open_session()
     resp = await ctx.items(session_id)
     assert resp.json()["data"]["runs"][0]["feedback"] is None
+
+
+@pytest.mark.asyncio
+async def test_feedback_stays_on_the_run_it_was_given_for(ctx: _Ctx) -> None:
+    """分只跟着它评的那一轮走:同一段会话里再来一轮,新轮的 ``feedback`` 是 ``null``。
+
+    这就是「重新生成 / 编辑重发后旧轮的分不迁到新轮」(2026-09-09 拍板)在读面上的
+    形状 —— 评分是对那一次回答的评价。这里用普通的第二轮构造,不依赖 P-1 的
+    supersede;带 ``superseded_by`` 的那一版断言等 P-1 PR1 合入后补(见下方说明)。
+    """
+    await ctx.seed_agent()
+    session_id, first_run = await ctx.open_session()
+    me = await ctx.app.state.tenant_user_repo.resolve(
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id="ext:u-123"
+    )
+    await ctx.app.state.feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id, thread_id=session_id, run_id=first_run,
+            rating="down", comment="答非所问", source="external", actor_id=str(me.id),
+        )
+    )
+    second_run = await ctx.add_run(session_id, created_at=ctx.origin + timedelta(minutes=1))
+
+    resp = await ctx.items(session_id)
+    assert resp.status_code == 200, resp.text
+    by_run = {r["run_id"]: r["feedback"] for r in resp.json()["data"]["runs"]}
+    assert by_run[str(first_run)] == {"rating": "down", "comment": "答非所问", "item_id": None}
+    assert by_run[str(second_run)] is None
 ```
 
 `test_external_sessions.py` 末尾追加(该文件已有 `_seed_thread_messages` / `STAMP_RUN_ID` / `ctx` 夹具;若其 `_Ctx` 没有 `bind_session`,照 `test_external_runs_cancel.py:128-134` 加一个):
@@ -1513,7 +1541,13 @@ Expected: 全绿(既有 `:364-375` 的 `runs == [...]` 全等断言要补 `"feed
 
 - [ ] **Step 6: 变异自证**
 
-`own_feedback_by_run` 里删掉 `or row.actor_id != actor_id` → `test_runs_echo_only_the_callers_own_feedback` 红(取到 `someone-else` 的 `up`,因为 `id` 降序后者在前);改回 → 绿。`external_sessions.py` 里把 `own.get(str(t.run_id)) if t.run_id else None` 改成常量 `None` → `test_messages_echo_only_the_callers_own_feedback` 红;改回 → 绿。
+`own_feedback_by_run` 里删掉 `or row.actor_id != actor_id` → `test_runs_echo_only_the_callers_own_feedback` 红(取到 `someone-else` 的 `up`,因为 `id` 降序后者在前);改回 → 绿。`external_sessions.py` 里把 `own.get(str(t.run_id)) if t.run_id else None` 改成常量 `None` → `test_messages_echo_only_the_callers_own_feedback` 红;改回 → 绿。`external_session_items.py` 里把 `own.get(str(run.run_id))` 改成 `next(iter(own.values()), None)`(退化成「这段会话的任意一条反馈」)→ `test_feedback_stays_on_the_run_it_was_given_for` 在 `by_run[str(second_run)] is None` 红;改回 → 绿。
+
+- [ ] **Step 6b: 记下 P-1 合入后要补的那条测试(本 PR 不写)**
+
+拍板(2026-09-09):**重新生成 / 编辑重发后,旧轮上已打的 👍/👎 不迁到新轮** —— 评分是对那一次回答的评价,新一轮是新的回答;候选池里的候选指向旧 trajectory,分留在旧轮才对得上。两侧都不写迁移代码,这条拍板在 P-2 侧是「什么都不做」。
+
+上面的 `test_feedback_stays_on_the_run_it_was_given_for` 用普通第二轮钉住了同一条行为(分只属于它评的那一轮),**不依赖 supersede**,所以现在就能跑。带 supersede 形状的那一版 —— 对一轮打 👎、再 `:regenerate`、读 `/items` 断言「旧轮 `superseded_by` 非空且 `feedback` 仍在,新轮 `feedback` 为 `null`」—— 需要 P-1 的 `supersede_run` 与 `:regenerate` 端点才能构造,**P-1 PR1/PR3 合入后**加到 `test_external_session_items.py`,由那时在手的一方补(在 P-1 的 PR 描述里引本节)。不在 P-2 里写一个跑不了的测试。
 
 - [ ] **Step 7: lint + 提交**
 
@@ -3586,7 +3620,7 @@ P-1 触及(按其 spec §3-§5、§7):`agent_run` 模型 + 迁移 0153、`api/ru
 | 9 | `docs-site/guide/errors.md` | 8.1 表改 `RUN_NOT_FOUND` 端点列、8.6 段落、8.10 例外说明 | 8.1 表加 `RUN_NOT_LAST` / `THREAD_BUSY` / `RUN_AWAITING_APPROVAL` / `RUN_ALREADY_SUPERSEDED` 四行,`RUN_NOT_FOUND` 端点列也要加 `:regenerate` / `:edit` | `RUN_NOT_FOUND` 那一行两边都改 → 必冲突,合并后端点列应为「取消 run / 审批决策 / 事件接口 / 打分 / 重新生成 / 编辑重发」 |
 | 10 | `docs-site/.vitepress/config.mts` | `:50` 后加 2.9 | 加 2.10 与其它节 | 相邻行插入 → 文本冲突,按编号排 |
 | 11 | `apps/admin-ui/src/pages/ConversationDetail.tsx` | `:170-175` 并行取反馈;`<Transcript feedbackOf=…>`(Task 15) | 被取代轮折叠态(改 `buildConsoleTurns` 输入或 `TurnBlock` 渲染) | `<Transcript …/>` 的 prop 列表两边都加 → 文本冲突;语义上无关。若 P-1 改 `TurnBlock` / `Transcript` 的 props 接口,与 P-2 的 `feedbackOf` 同一 interface 块 → 手工合并 |
-| 12 | `RunInfo` / `agent_run` | 只读 `run.thread_id` / `run.run_id` | 加 `superseded_by_run_id` / `regenerated_from_run_id` 列与字段 | 无代码冲突。**语义点**:被取代的轮仍可被打分(P-2 不检查 supersede 状态);P-1 的 `/items` 回显被取代轮时 `feedback` 照常带出。是否要在 `:regenerate` 时把旧轮的 👎 迁到新轮,两份 spec 都没说 —— 记为待拍板,不在本计划做 |
+| 12 | `RunInfo` / `agent_run` | 只读 `run.thread_id` / `run.run_id` | 加 `superseded_by_run_id` / `regenerated_from_run_id` 列与字段 | 无代码冲突。**语义点(2026-09-09 用户拍板)**:重新生成 / 编辑重发后,旧轮上已打的 👍/👎 **不迁到新轮**。理由:评分是对**那一次回答**的评价,新一轮是新的回答;而且候选池里的候选指向的是旧 trajectory,分留在旧轮才对得上。落到行为上 = 被取代轮的 `feedback` 照常回显、新轮 `feedback` 为 `null`(见 Task 4 的行为说明与断言),被取代的轮仍可被打分(P-2 不检查 supersede 状态),两侧都无需为此写迁移代码 |
 | 13 | `test_external_session_items.py:364-375` 的 `runs == [...]` 全等断言 | 补 `"feedback": None` | 补 `"superseded_by": None` 等 | 同一字面量两边加键,手工合 |
 | 14 | `api/__init__.py` / `app.py:2643-2651` | 加 `build_external_feedback_router`(Task 3) | 若 P-1 不新建 router 则不动;若新建则同一 import 块 / `include_router` 块 | 相邻行插入冲突,按字母序保留两份 |
 
@@ -3616,4 +3650,6 @@ P-1 触及(按其 spec §3-§5、§7):`agent_run` 模型 + 迁移 0153、`api/ru
 1. **`TrajectoryReader.find_by_thread` 的定位方式**(Task 9):按租户前缀 `list_prefix` 再按 `/{thread_id}.jsonl` 后缀过滤,匹配到的每个 key 都 `read()` 一次,按 `finished_at` 取最大(并列取 key 大的)。代价:大租户一次 👎 = 一次全租户前缀列举 + 个位数次对象读(与 worker 每 300s 的跨租户列举同量级,但落在请求路径上);同一 thread 同一时刻两个 outcome 分区并列时按 key 定胜负是为了确定性,不代表业务上哪个更「新」。替代方案是在 `agent_run` 上记 `trajectory_key`(orchestrator 写 trajectory 时回填),那是跨服务改动,本计划没做。
 2. **覆盖时 `processed_at` 不重置**(Task 2 Step 5,spec-literal):👍→👎 改票后,`FeedbackConsumerWorker`(`feedback_consumer.py:149` 只扫 `processed_at IS NULL` 的 👎)不会再为这一行打记忆 `review_flagged_at`。spec 只写了「rating/comment/item_id 全量替换」,没提 `processed_at`;若拍板要重置,改 Task 2 的 `.values(...)` / `replace(...)` 各加一行 `processed_at=None`,测试在 `_upsert_scenario` 加一条断言即可。
 
-其它待拍板(不阻塞):被取代轮(P-1)可否打分 / `:regenerate` 是否迁移旧轮的 👎(交集表 #12);`upgrade_to_negative` 对 `promoted` / `dismissed` 状态的候选同样改 signal(Task 8,spec「任何 signal」,未提 status)。
+已拍板、不再是问号(2026-09-09):**旧轮的 👍/👎 不迁到新轮**,被取代的轮仍可被打分 —— 交集表 #12 与 Task 4 Step 6b 有结论、理由与对应断言。
+
+其它待拍板(不阻塞):`upgrade_to_negative` 对 `promoted` / `dismissed` 状态的候选是否同样改 signal(Task 8,spec 写「任何 signal」,没提 status)。
