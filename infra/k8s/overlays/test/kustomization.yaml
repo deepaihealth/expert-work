@@ -6,10 +6,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-resources:
-- ../../base
 # 留存清理 CronJob —— 先只在 test 跑(波 3 线 R PR1);prod overlay 不引用,
 # 观察一周后另开 PR 接。见 base/retention-cleanup-job/kustomization.yaml 头注。
+resources:
+- ../../base
 - ../../base/retention-cleanup-job
 
 # Deployed image tags — updated by hand at release time (edit + commit,
@@ -40,13 +40,13 @@ images:
   newTag: 24.12-alpine-r1
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-  newTag: 723c5a40-test
+  newTag: a7c29e20-test
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-  newTag: 723c5a40
+  newTag: a7c29e20
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
-  newTag: 723c5a40
+  newTag: a7c29e20
 - name: grafana/grafana
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
 - name: grafana/tempo
