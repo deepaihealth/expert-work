@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from control_plane.api._authz import console_only, require
+from control_plane.api.member_ops import MEMBER_LAST_ADMIN, has_other_active_admin
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -22,6 +23,7 @@ from expert_work.persistence.auth import (
     DuplicateRoleBindingError,
     RoleBindingStore,
 )
+from expert_work.persistence.tenant_member import TenantMemberStore
 from expert_work.protocol import AuditAction, BindingConditions, Principal, Role
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -50,6 +52,10 @@ class CreateRoleBindingRequest(BaseModel):
         if self.platform_scope and self.conditions is not None:
             raise ValueError("platform_scope bindings must not carry conditions")
         return self
+
+
+def _get_member_repo(request: Request) -> TenantMemberStore:
+    return request.app.state.tenant_member_repo  # type: ignore[no-any-return]
 
 
 def _get_repo(request: Request) -> RoleBindingStore:
@@ -183,8 +189,36 @@ def build_role_bindings_router() -> APIRouter:
         binding_id: UUID,
         principal: Annotated[Principal, Depends(require("role_binding", "delete"))],
         repo: Annotated[RoleBindingStore, Depends(_get_repo)],
+        members: Annotated[TenantMemberStore, Depends(_get_member_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> None:
+        # Last-active-admin guard (X-4 ① follow-up, 2026-09-09) — the same
+        # judgement ``DELETE /v1/members/{id}`` makes: removing the
+        # unconditioned ADMIN binding of the tenant's only active admin
+        # locks the tenant out. Platform-scope rows never enter the gate
+        # (``list_for_tenant`` excludes them, and this tenant-scoped delete
+        # cannot reach them anyway). No principal-specific bypass.
+        tenant_bindings = await repo.list_for_tenant(tenant_id=principal.tenant_id)
+        target = next((b for b in tenant_bindings if b.id == binding_id), None)
+        if (
+            target is not None
+            and target.role is Role.ADMIN
+            and target.subject_type == "user"
+            and not target.has_conditions
+            and not await has_other_active_admin(
+                member_store=members,
+                role_binding_store=repo,
+                tenant_id=principal.tenant_id,
+                exclude_binding_id=binding_id,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": MEMBER_LAST_ADMIN,
+                    "message": "cannot remove the tenant's last active admin's role binding",
+                },
+            )
         ok = await repo.delete(tenant_id=principal.tenant_id, role_binding_id=binding_id)
         if not ok:
             raise HTTPException(status_code=404, detail="role_binding not found")

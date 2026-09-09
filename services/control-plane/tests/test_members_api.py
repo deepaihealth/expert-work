@@ -1143,6 +1143,160 @@ async def test_last_admin_gate_ignores_non_admins_and_invited_admins(
     assert await _status(app, tenant_id, a) == "active"
 
 
+# --- last active admin guard on DELETE /v1/role_bindings/{id} ----------------
+
+
+async def _admin_binding_id(app: object, tenant_id: UUID, member_id: UUID) -> UUID:
+    """The tenant-scope ADMIN binding the invite wrote for ``member_id``."""
+    from expert_work.protocol import Role
+
+    kc_uuid = await _kc_uuid(app, tenant_id, member_id)
+    bindings = await app.state.role_binding_repo.list_for_subject(  # type: ignore[attr-defined]
+        subject_type="user", subject_id=kc_uuid, tenant_id=tenant_id
+    )
+    admin = [b for b in bindings if b.role is Role.ADMIN and not b.platform_scope]
+    assert len(admin) == 1
+    return admin[0].id
+
+
+@pytest.mark.asyncio
+async def test_delete_last_admin_role_binding_409(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """Deleting the tenant-scope ADMIN binding of the only active admin →
+    409 MEMBER_LAST_ADMIN; the binding stays."""
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    binding_id = await _admin_binding_id(app, tenant_id, a)
+
+    resp = await client.delete(f"/v1/role_bindings/{binding_id}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "MEMBER_LAST_ADMIN"
+
+    still = await app.state.role_binding_repo.list_for_tenant(tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert binding_id in {b.id for b in still}
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    assert [r for r in page.entries if r.action is AuditAction.ROLE_BINDING_DELETE] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_admin_role_binding_with_other_active_admin_204(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """Another active admin (with their own ADMIN binding) keeps the tenant
+    reachable → 204 and the binding is gone."""
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    b = await _invite_one(client, tenant_id, email="b@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    await _activate(app, tenant_id, b, "sub-b")
+    binding_b = await _admin_binding_id(app, tenant_id, b)
+
+    resp = await client.delete(f"/v1/role_bindings/{binding_b}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 204, resp.text
+    left = await app.state.role_binding_repo.list_for_tenant(tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert binding_b not in {x.id for x in left}
+
+    # …and now a's binding is the last one: the same gate refuses it.
+    binding_a = await _admin_binding_id(app, tenant_id, a)
+    resp = await client.delete(f"/v1/role_bindings/{binding_a}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_delete_role_binding_gate_only_counts_active_admin_members(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """An ADMIN binding whose member is only *invited* (never signed in) does
+    not keep the tenant reachable — deleting the active admin's binding is
+    still refused; a viewer's binding is never gated."""
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    _i = await _invite_one(client, tenant_id, email="i@co.com", role="admin")  # stays invited
+    v = await _invite_one(client, tenant_id, email="v@co.com", role="viewer")
+    await _activate(app, tenant_id, a, "sub-a")
+    await _activate(app, tenant_id, v, "sub-v")
+
+    binding_a = await _admin_binding_id(app, tenant_id, a)
+    resp = await client.delete(f"/v1/role_bindings/{binding_a}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "MEMBER_LAST_ADMIN"
+
+    kc_v = await _kc_uuid(app, tenant_id, v)
+    v_bindings = await app.state.role_binding_repo.list_for_subject(  # type: ignore[attr-defined]
+        subject_type="user", subject_id=kc_v, tenant_id=tenant_id
+    )
+    assert len(v_bindings) == 1
+    resp = await client.delete(
+        f"/v1/role_bindings/{v_bindings[0].id}", headers=_admin_headers(tenant_id)
+    )
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_platform_scope_binding_is_outside_the_gate(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """Platform-scope bindings are neither counted nor blocked: a
+    SYSTEM_ADMIN grant on the last admin's subject does not substitute for
+    the tenant ADMIN binding (still 409), and the tenant route cannot reach
+    the platform row at all (404, unchanged)."""
+    from expert_work.protocol import Role
+
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    kc_a = await _kc_uuid(app, tenant_id, a)
+    platform = await app.state.role_binding_repo.create(  # type: ignore[attr-defined]
+        subject_type="user",
+        subject_id=kc_a,
+        tenant_id=None,
+        role=Role.SYSTEM_ADMIN,
+        granted_by="test",
+        platform_scope=True,
+    )
+    binding_a = await _admin_binding_id(app, tenant_id, a)
+
+    resp = await client.delete(f"/v1/role_bindings/{binding_a}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+
+    resp = await client.delete(
+        f"/v1/role_bindings/{platform.id}", headers=_admin_headers(tenant_id)
+    )
+    assert resp.status_code == 404, resp.text
+    assert (
+        await app.state.role_binding_repo.get_platform_admin_for_subject(  # type: ignore[attr-defined]
+            subject_type="user", subject_id=kc_a
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_suspend_gate_requires_a_live_admin_binding(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """The member-suspend gate shares the joint check: a second active admin
+    whose ADMIN binding is already gone does not keep the tenant reachable."""
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    b = await _invite_one(client, tenant_id, email="b@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    await _activate(app, tenant_id, b, "sub-b")
+    binding_b = await _admin_binding_id(app, tenant_id, b)
+    resp = await client.delete(f"/v1/role_bindings/{binding_b}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 204, resp.text
+
+    resp = await client.delete(f"/v1/members/{a}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "MEMBER_LAST_ADMIN"
+    assert await _status(app, tenant_id, a) == "active"
+
+
 @pytest.mark.asyncio
 async def test_cross_tenant_list_requires_system_admin(
     admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
