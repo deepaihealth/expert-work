@@ -227,6 +227,16 @@ def _assert_envelope_422(resp: Any) -> None:
     assert body["error"]["code"] == "INVALID_REQUEST"
 
 
+def _assert_console_422(resp: Any) -> None:
+    """``disable``/``enable`` are ``console_only()`` — the guard still fires
+    (router-level), but the 422 keeps FastAPI's own ``{"detail": [...]}``
+    shape (B-9: the envelope follows the ``external_only()`` gate)."""
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert set(body) == {"detail"}, body
+    assert "NUL" in body["detail"][0]["msg"], body
+
+
 @pytest.mark.asyncio
 async def test_sql_bind_session_nul_agent_code_is_422_not_500(ctx: _Ctx) -> None:
     """``_resolve_session``'s FIRST call is ``disable_service.is_disabled`` —
@@ -295,7 +305,7 @@ async def test_sql_disable_agent_nul_name_is_422_not_500(ctx: _Ctx) -> None:
         json={},
         headers=ctx.headers,
     )
-    _assert_envelope_422(resp)
+    _assert_console_422(resp)
 
 
 @pytest.mark.asyncio
@@ -305,7 +315,7 @@ async def test_sql_enable_agent_nul_name_is_422_not_500(ctx: _Ctx) -> None:
         json={},
         headers=ctx.headers,
     )
-    _assert_envelope_422(resp)
+    _assert_console_422(resp)
 
 
 # ---------------------------------------------------------------------------

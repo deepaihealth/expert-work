@@ -23,6 +23,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 
+from control_plane.api.runs import _build_human_message
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -30,6 +31,7 @@ from expert_work.common.lifecycle import Lifecycle
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec
+from expert_work.protocol.multimodal import IMAGE_REF_PREFIX, ImageRef
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -521,6 +523,79 @@ async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
         },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_messages_never_leak_the_internal_image_ref(ctx: _Ctx) -> None:
+    """B-14 — the last place an ``expert_work://`` URI could cross the
+    external boundary.
+
+    A text-only model (``supports_vision=False``) with an Agent that still
+    declares a ``vision:`` block gets its images as inline text mentions
+    (``api/runs.py::_build_human_message`` Path B: ``[image attached:
+    expert_work://image/…]``) so the model can call ``ask_image``. That
+    line is a prompt-engineering artefact for the model, not something the
+    end user typed — and it carries the internal image URI the attachment
+    unification (spec 2026-08-17) removed from every other external
+    response in favour of the opaque ``upl_`` id.
+
+    Seeds the REAL Path-B message (built by the production helper, not a
+    hand-written string) so this test tracks the producer's exact format.
+    The turn itself stays — ``message_count`` is documented as "the same
+    messages 5.3 returns", so an image-only turn must remain a (now empty)
+    entry rather than vanish and skew pagination.
+    """
+    await ctx.seed_agent()
+    checkpointer = InMemorySaver()
+    ctx.app.state.agent_runtime.durable_checkpointer = checkpointer
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    session_id = started.json()["data"]["thread_id"]
+    refs = [
+        ImageRef(
+            tenant_id=ctx.tenant_id, thread_id=UUID(session_id), image_id=uuid4(), ext=".png"
+        ).to_uri()
+        for _ in range(2)
+    ]
+    assert all(r.startswith(IMAGE_REF_PREFIX) for r in refs)
+    await _seed_thread_messages(
+        checkpointer,
+        session_id,
+        [
+            # Text + two images + one document — every Path-B part at once.
+            _build_human_message(
+                input_text="what's in these?\n\nsecond paragraph",
+                image_refs=refs,
+                supports_vision=False,
+                document_names=["report.pdf"],
+            ),
+            AIMessage(content="two photos and a report"),
+            # Image-only turn: nothing typed, only attachments.
+            _build_human_message(input_text=None, image_refs=refs[:1], supports_vision=False),
+            AIMessage(content="another photo"),
+        ],
+    )
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{session_id}/messages",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert IMAGE_REF_PREFIX not in resp.text
+    assert "image attached" not in resp.text
+    contents = [(m["role"], m["content"]) for m in resp.json()["data"]["messages"]]
+    assert contents == [
+        # User paragraphs (including the blank line the user typed) and the
+        # document mention are untouched; only the image-ref lines go.
+        ("user", "what's in these?\n\nsecond paragraph\n\n[file attached: report.pdf]"),
+        ("assistant", "two photos and a report"),
+        ("user", ""),
+        ("assistant", "another photo"),
     ]
 
 

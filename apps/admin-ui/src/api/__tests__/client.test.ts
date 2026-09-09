@@ -81,6 +81,63 @@ function rejectWithStatus(status: number) {
   };
 }
 
+// ③ B-9 — 422 的两种形状。控制台路由(含 /v1/agents 下的 console_only 路由)
+// 必须回 FastAPI 自己的 ``{ detail: [...] }``:拦截器读的就是 ``data.detail``,
+// 字段级错误经 ``ApiError.details`` 透出;第三方信封里没有 ``detail`` 可读,
+// 只能退化成 ``HTTP_422`` + axios 通用文案 —— 这正是后端不能给控制台路由
+// 套信封的原因。
+function rejectWithData(status: number, data: unknown) {
+  return (config: AxiosRequestConfig) => {
+    const error = new Error(`HTTP ${status}`) as Error & {
+      isAxiosError: boolean;
+      response: { status: number; data: unknown };
+      config: AxiosRequestConfig;
+    };
+    error.isAxiosError = true;
+    error.response = { status, data };
+    error.config = config;
+    return Promise.reject(error);
+  };
+}
+
+describe("422 detail shapes (B-9)", () => {
+  const fastapiDetail = [
+    {
+      type: "int_parsing",
+      loc: ["query", "limit"],
+      msg: "Input should be a valid integer, unable to parse string as an integer",
+      input: "abc",
+    },
+  ];
+
+  it("surfaces FastAPI's bare detail list from a console route under /v1/agents", async () => {
+    await expect(
+      createClient().get("/v1/agents/support-bot/1.0.0/revisions", {
+        adapter: rejectWithData(422, { detail: fastapiDetail }),
+      }),
+    ).rejects.toMatchObject({ status: 422, code: "HTTP_422", details: fastapiDetail });
+  });
+
+  it("finds nothing to read in the third-party envelope (why console routes stay bare)", async () => {
+    const err = await createClient()
+      .get("/v1/agents/support-bot/1.0.0/revisions", {
+        adapter: rejectWithData(422, {
+          success: false,
+          data: null,
+          error: { code: "INVALID_REQUEST", message: "Input should be a valid integer" },
+        }),
+      })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    const apiErr = err as ApiError;
+    expect(apiErr.status).toBe(422);
+    expect(apiErr.code).toBe("HTTP_422");
+    expect(apiErr.details).toBeUndefined();
+    // The envelope's own code/message never reach the caller.
+    expect(apiErr.message).not.toContain("valid integer");
+  });
+});
+
 describe("401 unauthorized handler", () => {
   afterEach(() => {
     setUnauthorizedHandler(null);

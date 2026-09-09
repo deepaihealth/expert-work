@@ -176,6 +176,17 @@ def _assert_envelope_422(resp: Any) -> None:
     assert "NUL" in body["error"]["message"]
 
 
+def _assert_console_422(resp: Any) -> None:
+    """The guard fires on ``console_only()`` routes too (``disable``/``enable``
+    share ``agents.py``'s router), but there the 422 keeps FastAPI's own
+    ``{"detail": [...]}`` shape — B-9: the envelope follows the
+    ``external_only()`` gate, not the ``/v1/agents/`` prefix."""
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert set(body) == {"detail"}, body
+    assert "NUL" in body["detail"][0]["msg"], body
+
+
 # ---------------------------------------------------------------------------
 # Per-route-family rejection — one test per third-party-reachable route that
 # carries ``agent_code`` or ``name`` in its path. The guard runs before any
@@ -313,7 +324,7 @@ async def test_disable_agent_nul_name_is_422(ctx: _Ctx) -> None:
         json={},
         headers=ctx.headers,
     )
-    _assert_envelope_422(resp)
+    _assert_console_422(resp)
 
 
 @pytest.mark.asyncio
@@ -323,7 +334,7 @@ async def test_enable_agent_nul_name_is_422(ctx: _Ctx) -> None:
         json={},
         headers=ctx.headers,
     )
-    _assert_envelope_422(resp)
+    _assert_console_422(resp)
 
 
 # ---------------------------------------------------------------------------

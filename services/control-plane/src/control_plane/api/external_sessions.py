@@ -12,6 +12,7 @@ rejects a missing ``user_id`` with 422 before a handler ever runs.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Collection
 from typing import Annotated
 from uuid import UUID
@@ -37,11 +38,42 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import AuditAction, ThreadStatus
+from expert_work.protocol.multimodal import IMAGE_REF_PREFIX
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStatus, RunStore
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 
 logger = logging.getLogger("expert_work.control_plane.api.external_sessions")
+
+#: One line of ``api/runs.py::_build_human_message``'s Path B (text-only
+#: model + images): ``[image attached: expert_work://image/…]``. Anchored to
+#: the whole line so nothing the end user typed can match it.
+_IMAGE_MENTION_LINE = re.compile(rf"\[image attached: {re.escape(IMAGE_REF_PREFIX)}[^\]\n]*\]")
+
+
+def _strip_image_mentions(text: str) -> str:
+    """Drop Path-B image mentions from a transcript turn — B-14.
+
+    The mention is prompt scaffolding for the model (so it can call
+    ``ask_image``), not something the end user typed, and it is the last
+    place an internal ``expert_work://`` URI could reach a third party
+    (attachment unification, spec 2026-08-17: third parties only ever see
+    the opaque ``upl_`` id). Exact inverse of the producer — it joins
+    ``(text, mentions, doc_mentions, untrusted)`` with ``"\\n\\n"`` and the
+    mentions block with ``"\\n"`` — so it works paragraph by paragraph and
+    leaves every other paragraph byte-for-byte alone (a user's own blank
+    lines included). Image-only turns come back as ``""`` rather than
+    disappearing: ``message_count`` is documented as "the same messages
+    this endpoint returns", so dropping a turn here would skew pagination.
+    """
+    if IMAGE_REF_PREFIX not in text:
+        return text
+    kept: list[str] = []
+    for paragraph in text.split("\n\n"):
+        lines = [ln for ln in paragraph.split("\n") if not _IMAGE_MENTION_LINE.fullmatch(ln)]
+        if lines:
+            kept.append("\n".join(lines))
+    return "\n\n".join(kept)
 
 
 class ExternalRenameRequest(BaseModel):
@@ -264,7 +296,7 @@ def build_external_sessions_router() -> APIRouter:
         out = [
             {
                 "role": t.role,
-                "content": t.content,
+                "content": _strip_image_mentions(t.content),
                 "channel": t.channel,
                 "created_at": t.created_at.isoformat() if t.created_at else None,
                 "run_id": str(t.run_id) if t.run_id else None,

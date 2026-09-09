@@ -292,14 +292,12 @@ async def test_bind_session_and_run_422_use_the_external_envelope(ctx: _Ctx) -> 
     ``POST .../runs`` variants) — this test adds coverage via a DIFFERENT
     trigger, a plain missing required body field (vanilla pydantic
     validation, no NUL involved), so the envelope is proven on both
-    validation paths, not just the NUL one. ``app.py`` keeps the
-    ``/v1/agents/`` prefix check and ADDS the tag check in addition to it
-    (not a replacement) for this reason — the whole ``agents.py`` router
-    needs the envelope regardless of which guard a given route carries
-    (``disable``/``enable`` are ``console_only()``, not ``external_only()``,
-    and are covered by the NUL-guard envelope tests in
-    ``test_external_path_param_nul_guard.py``). Locks in that both bind/run
-    stay enveloped on this trigger path too.
+    validation paths, not just the NUL one. Since B-9, ``app.py`` decides
+    the shape by whether the matched route carries ``external_only()`` —
+    not by URL prefix or tag — which is exactly why these two untagged
+    routes matter as a regression case: they are the only enveloped routes
+    that a tag-driven predicate would miss. Locks in that both bind/run stay
+    enveloped on this trigger path too.
     """
     await ctx.seed_agent()
     bind_resp = await ctx.client.post(
@@ -707,3 +705,85 @@ async def test_addressing_a_foreign_session_never_resurrects_a_purged_user(
         f"POST .../{endpoint} cleared deleted_at (resurrected a purged user) "
         "on a call it rejected with 404"
     )
+
+
+# ---------------------------------------------------------------------------
+# B-9 — the 422 shape follows the ``external_only()`` guard, not the URL.
+#
+# ``/v1/agents`` is the one prefix both planes share: ``agents.py`` hosts a
+# dozen-plus ``console_only()`` manifest routes (``GET/PUT/DELETE
+# /{name}/{version}``, ``/revisions``, ``/disable``, …) next to the two
+# ``external_only()`` ones. The old predicate (``path.startswith("/v1/agents/")
+# OR "external" in tags``) enveloped ALL of them, so a console 422 came back
+# as ``{"success": false, "error": {...}}`` — a shape ``admin-ui/src/api/
+# client.ts`` never reads (it reads ``data.detail``), degrading every such
+# error to ``HTTP_422`` + axios's generic message.
+# ---------------------------------------------------------------------------
+
+
+def _console_headers(ctx: _Ctx) -> dict[str, str]:
+    """An employee (console) JWT for the fixture's tenant — the caller every
+    ``console_only()`` route under ``/v1/agents/`` is shaped for."""
+    jwt = make_test_jwt(
+        tenant_id=ctx.tenant_id, subject="employee-test", sub_type="user", roles=("admin",)
+    )
+    return {"Authorization": f"Bearer {jwt}"}
+
+
+def _assert_bare_fastapi_422(resp: Any) -> list[dict[str, Any]]:
+    """FastAPI's own ``{"detail": [...]}`` — the one shape the console
+    frontend parses. Returns the error list for trigger-specific checks."""
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert set(body) == {"detail"}, body
+    assert isinstance(body["detail"], list) and body["detail"], body
+    return body["detail"]
+
+
+@pytest.mark.asyncio
+async def test_console_only_routes_under_v1_agents_keep_the_fastapi_422_shape(ctx: _Ctx) -> None:
+    """Two different 422 triggers on two ``console_only()`` routes that share
+    the ``/v1/agents/`` prefix with the external plane — both must come
+    back in FastAPI's default shape, with the field-level error list the
+    admin-ui reads off ``data.detail``.
+    """
+    await ctx.seed_agent()
+    headers = _console_headers(ctx)
+
+    # Vanilla query validation (``limit: int``) on a console read.
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/1.0.0/revisions", params={"limit": "abc"}, headers=headers
+    )
+    errors = _assert_bare_fastapi_422(resp)
+    assert errors[0]["loc"] == ["query", "limit"], errors
+
+    # The router-level NUL path guard — raised as the same
+    # ``RequestValidationError``, so it goes through the same handler.
+    resp = await ctx.client.get("/v1/agents/support%00bot/1.0.0", headers=headers)
+    errors = _assert_bare_fastapi_422(resp)
+    assert "NUL" in errors[0]["msg"], errors
+
+
+@pytest.mark.asyncio
+async def test_422_shape_is_decided_by_the_guard_not_the_prefix(ctx: _Ctx) -> None:
+    """Both directions, same prefix, same trigger (a NUL path param): the
+    ``console_only()`` route answers bare, the ``external_only()`` route
+    answers enveloped. Pinning them side by side is what makes a future
+    "simplify the predicate back to the prefix" regression impossible to
+    miss — either half alone would still pass under the old predicate OR
+    under a predicate that enveloped nothing.
+    """
+    await ctx.seed_agent()
+    console = await ctx.client.get("/v1/agents/support%00bot/1.0.0", headers=_console_headers(ctx))
+    external = await ctx.client.get(
+        "/v1/agents/support%00bot/sessions", params={"user_id": "cust-77"}, headers=ctx.headers
+    )
+
+    _assert_bare_fastapi_422(console)
+
+    assert external.status_code == 422, external.text
+    body = external.json()
+    assert "detail" not in body
+    assert body["success"] is False
+    assert body["data"] is None
+    assert body["error"]["code"] == "INVALID_REQUEST"

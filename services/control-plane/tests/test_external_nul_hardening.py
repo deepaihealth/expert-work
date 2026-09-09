@@ -354,7 +354,13 @@ async def test_disable_reason_with_nul_is_422(ctx: _Ctx) -> None:
         json={"reason": "a\x00b"},
         headers=ctx.console_headers,
     )
-    _assert_envelope_422(resp, code="INVALID_REQUEST")
+    # B-9: a ``console_only()`` route answers in FastAPI's own
+    # ``{"detail": [...]}`` shape — the envelope follows the
+    # ``external_only()`` gate, not the shared ``/v1/agents/`` prefix.
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    assert set(body) == {"detail"}, body
+    assert "NUL" in body["detail"][0]["msg"], body
 
 
 # ---------------------------------------------------------------------------
