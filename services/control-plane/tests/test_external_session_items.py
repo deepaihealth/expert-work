@@ -1061,11 +1061,29 @@ async def test_runs_echo_only_the_callers_own_feedback(ctx: _Ctx) -> None:
             actor_id="someone-else",
         )
     )
+    # 第二轮**只有别人**打了分 —— 这一条才是「别人的分不外泄」的判据。
+    # 只靠上面那一轮证不出来:两条行按 id 降序投影、后写的覆盖先写的,
+    # 就算把 actor 过滤整个删掉,本人那条(id 更小、排在后面)仍然最后落盘,
+    # 断言照样绿。要让缺陷现形,必须有一轮**本人没打过分**。
+    other_run = await ctx.add_run(session_id, created_at=ctx.origin + timedelta(minutes=1))
+    await store.upsert(
+        FeedbackRecord(
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            run_id=other_run,
+            rating="up",
+            comment="别人的原话",
+            source="external",
+            actor_id="someone-else",
+        )
+    )
+
     resp = await ctx.items(session_id)
     assert resp.status_code == 200, resp.text
     runs = resp.json()["data"]["runs"]
-    assert [r["run_id"] for r in runs] == [str(run_id)]
-    assert runs[0]["feedback"] == {"rating": "down", "comment": "太慢", "item_id": "p1"}
+    by_run = {r["run_id"]: r["feedback"] for r in runs}
+    assert by_run[str(run_id)] == {"rating": "down", "comment": "太慢", "item_id": "p1"}
+    assert by_run[str(other_run)] is None
 
 
 @pytest.mark.asyncio
