@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -31,6 +32,11 @@ from control_plane.uplift.threat_metrics import record_memory_blocked
 from expert_work.common.observability import expert_work_counter
 from expert_work.persistence.memory import MemoryStore, MemoryWritebackDLQ
 from expert_work.persistence.memory.base import MemoryInjectionBlockedError
+from expert_work.persistence.rls import (
+    bypass_rls_var,
+    current_tenant_id_var,
+    current_user_id_var,
+)
 from expert_work.protocol import MemoryItem
 from orchestrator.llm import Embedder
 
@@ -71,6 +77,33 @@ def _backoff_seconds(next_attempt: int) -> int:
         return _BACKOFF_SCHEDULE[0]
     idx = min(next_attempt - 1, len(_BACKOFF_SCHEDULE) - 1)
     return _BACKOFF_SCHEDULE[idx]
+
+
+@contextmanager
+def _bypass_rls() -> Iterator[None]:
+    """RLS-bypass scope for the cross-tenant claim scan (reaper pattern)."""
+    bypass = bypass_rls_var.set(True)
+    tenant = current_tenant_id_var.set(None)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(tenant)
+        bypass_rls_var.reset(bypass)
+
+
+@contextmanager
+def _tenant_scope(tenant_id: UUID, user_id: UUID) -> Iterator[None]:
+    """Scope one row's re-write to its own tenant + user — ``memory_item``
+    is FORCE-RLS on both axes (mirrors ``knowledge/recovery.py``)."""
+    tenant = current_tenant_id_var.set(tenant_id)
+    bypass = bypass_rls_var.set(False)
+    user = current_user_id_var.set(user_id)
+    try:
+        yield
+    finally:
+        current_user_id_var.reset(user)
+        bypass_rls_var.reset(bypass)
+        current_tenant_id_var.reset(tenant)
 
 
 class MemoryDLQWorker:
@@ -147,28 +180,36 @@ class MemoryDLQWorker:
         Returns ``(succeeded, retried, dead_lettered)``.
         """
         now = datetime.now(UTC)
-        ready = await self._dlq.take_ready(limit=self._batch_size, now=now)
+        # The claim scan is cross-tenant — an explicit bypass, not a session
+        # with no tenant at all (which the RLS Detect signal flags and which
+        # fails closed once RLS is enforced).
+        with _bypass_rls():
+            ready = await self._dlq.take_ready(limit=self._batch_size, now=now)
         succeeded = 0
         retried = 0
         dead = 0
         for row in ready:
-            try:
-                outcome = await self._attempt_one(row, now=now)
-            except Exception as exc:
-                # take_ready already claimed this row (attempts bumped,
-                # next_retry_at pushed to the claim lease) before handing
-                # it to _attempt_one. If the DLQ-store call *inside* one of
-                # _attempt_one's own except-branches raises (mark_done /
-                # record_failure itself failing — e.g. a DB hiccup), that
-                # exception is not caught there, so neither the success nor
-                # the failure path settles the claim. Left alone the row
-                # would sit stuck until the lease elapses — the same trap
-                # the webhook delivery worker's unhandled-exception branch
-                # hit (see ``webhook_delivery_worker._release``). Release
-                # it immediately instead.
-                logger.warning("memory.dlq_worker.unhandled row_id=%s err=%s", row.id, exc)
-                await self._release(row, now=now, error=exc)
-                continue
+            # Each row's re-write runs scoped to its own tenant + user:
+            # ``memory_item`` is FORCE-RLS on both axes, and the settle calls
+            # (mark_done / record_failure) address the row by id.
+            with _tenant_scope(row.tenant_id, row.user_id):
+                try:
+                    outcome = await self._attempt_one(row, now=now)
+                except Exception as exc:
+                    # take_ready already claimed this row (attempts bumped,
+                    # next_retry_at pushed to the claim lease) before handing
+                    # it to _attempt_one. If the DLQ-store call *inside* one of
+                    # _attempt_one's own except-branches raises (mark_done /
+                    # record_failure itself failing — e.g. a DB hiccup), that
+                    # exception is not caught there, so neither the success nor
+                    # the failure path settles the claim. Left alone the row
+                    # would sit stuck until the lease elapses — the same trap
+                    # the webhook delivery worker's unhandled-exception branch
+                    # hit (see ``webhook_delivery_worker._release``). Release
+                    # it immediately instead.
+                    logger.warning("memory.dlq_worker.unhandled row_id=%s err=%s", row.id, exc)
+                    await self._release(row, now=now, error=exc)
+                    continue
             if outcome == "ok":
                 succeeded += 1
                 _retries_succeeded.inc()
@@ -297,7 +338,7 @@ class DLQRowLike:  # pragma: no cover - protocol-only
 
     id: object
     tenant_id: UUID
-    user_id: object
+    user_id: UUID
     source_thread_id: str | None
     source_run_id: str | None
     extracted: Sequence[tuple[str, str]]

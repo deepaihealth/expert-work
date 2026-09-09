@@ -12,36 +12,59 @@ This exercises the listener directly with a stub connection, in the same
 style as ``test_rls_unit.py`` — no database needed. (The task brief's
 sketch used ``sqlite+aiosqlite``, but ``aiosqlite`` is not a dependency
 of this repo — confirmed absent from ``pyproject.toml``/``uv.lock``.)
+
+Attribution (the ``rls_caller`` / ``rls_caller_outer`` extras) is pinned
+here too: the signal must name an application frame — never ``rls.py``
+itself, never SQLAlchemy — and must still do so when the listener runs
+inside the ORM's greenlet, where the plain frame chain is cut off from
+the awaiting application code.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.util import greenlet_spawn
 
+from expert_work.persistence import rls
 from expert_work.persistence.rls import (
     _rls_after_begin,
     bypass_rls_var,
     current_tenant_id_var,
+    current_user_id_var,
 )
 
 _LOGGER_NAME = "expert_work.persistence.rls"
+_SIGNAL = "rls.would_fail_closed"
 
 
 @pytest.fixture(autouse=True)
 def reset_context() -> Iterator[None]:
-    """Each test gets a clean ContextVar state."""
+    """Each test gets a clean ContextVar state and a fresh rate-limit window."""
     token_b = bypass_rls_var.set(False)
     token_t = current_tenant_id_var.set(None)
+    token_u = current_user_id_var.set(None)
+    rls._reset_signal_state()
     try:
         yield
     finally:
+        rls._reset_signal_state()
+        current_user_id_var.reset(token_u)
         bypass_rls_var.reset(token_b)
         current_tenant_id_var.reset(token_t)
+
+
+def _signal_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _LOGGER_NAME and r.message == _SIGNAL]
+
+
+def _fire_listener() -> None:
+    _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
 
 
 def test_detects_would_fail_closed_when_no_tenant_and_not_bypass(
@@ -86,3 +109,234 @@ def test_no_warning_when_tenant_set(caplog: pytest.LogCaptureFixture) -> None:
 
     assert [r.message for r in caplog.records if r.name == _LOGGER_NAME] == []
     connection.execute.assert_called_once()
+
+
+# --- attribution -----------------------------------------------------------
+
+
+def test_signal_names_the_application_frame_not_rls_itself(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``rls_caller`` points at the code that opened the session — this test
+    function — not at ``rls.py`` (which always sits at the top of the stack)
+    and not at a stdlib/transport frame."""
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    (record,) = _signal_records(caplog)
+    caller = record.__dict__["rls_caller"]
+    assert caller.startswith(f"{__name__}:")
+    assert caller.endswith(" test_signal_names_the_application_frame_not_rls_itself")
+    assert "expert_work.persistence.rls" not in caller
+    # The next frame up is reported too, so a shared helper is still traceable.
+    outer = record.__dict__["rls_caller_outer"]
+    assert outer is not None
+    assert "expert_work.persistence.rls" not in outer
+
+
+async def test_signal_attributes_across_the_greenlet_boundary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ORM runs the listener inside ``greenlet_spawn``; the plain frame
+    chain there ends at SQLAlchemy. Attribution must reach the awaiting
+    application frame on the parent greenlet's stack."""
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        await greenlet_spawn(_rls_after_begin, MagicMock(), MagicMock(), MagicMock())
+
+    (record,) = _signal_records(caplog)
+    caller = record.__dict__["rls_caller"]
+    assert caller.endswith(" test_signal_attributes_across_the_greenlet_boundary"), caller
+    assert "sqlalchemy" not in caller
+
+
+def test_signal_skips_store_layer_frames(caplog: pytest.LogCaptureFixture) -> None:
+    """A store method (``expert_work.persistence.*``) is mechanism; the owner
+    of the tenant context is whoever called it. Attribution reports that
+    caller, and the store frame is not mistaken for it."""
+    # ``exec`` only so the frame's ``__name__`` reads as a persistence module.
+    namespace: dict[str, object] = {"__name__": "expert_work.persistence.fake_store.sql"}
+    exec("def store_method(listener):\n    listener(None, None, None)\n", namespace)  # noqa: S102
+    store_method = namespace["store_method"]
+    assert callable(store_method)
+    typed_store_method: Callable[[Callable[..., None]], None] = store_method
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        typed_store_method(_rls_after_begin)
+
+    (record,) = _signal_records(caplog)
+    caller = record.__dict__["rls_caller"]
+    assert caller.endswith(" test_signal_skips_store_layer_frames"), caller
+    assert not caller.startswith("expert_work.persistence.")
+
+
+def test_fallback_when_every_frame_is_store_layer_never_names_rls_itself(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If nothing outside the store layer is on the stack, the innermost
+    non-transport frame is reported — and that must still never be
+    ``rls.py``'s own emit helper (which is also under the store prefix)."""
+    # Widen the store prefixes to match every module (this one, pytest's own
+    # frames, everything), so the fallback path is what gets exercised.
+    monkeypatch.setattr(rls, "_STORE_LAYER_PREFIXES", ("",))
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    (record,) = _signal_records(caplog)
+    caller = record.__dict__["rls_caller"]
+    assert caller.endswith(" test_fallback_when_every_frame_is_store_layer_never_names_rls_itself")
+    assert "expert_work.persistence.rls" not in caller
+
+
+# --- rate limit ------------------------------------------------------------
+
+
+def test_first_occurrence_always_logs_then_window_caps(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per caller: the first record is never dropped; past the cap the rest of
+    the window is dropped; a new window logs again and reports how many were
+    dropped."""
+    clock = [1000.0]
+
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    monkeypatch.setattr(rls, "_monotonic", fake_monotonic)
+    cap = 3
+    monkeypatch.setattr(rls, "_SIGNAL_MAX_PER_WINDOW", cap)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        for _ in range(cap + 3):
+            _fire_listener()
+        first_window = _signal_records(caplog)
+        clock[0] += rls._SIGNAL_WINDOW_S
+        _fire_listener()
+        after_roll = _signal_records(caplog)[len(first_window) :]
+
+    assert len(first_window) == cap
+    assert first_window[0].__dict__["rls_suppressed"] == 0
+    (rolled,) = after_roll
+    assert rolled.__dict__["rls_suppressed"] == 3
+
+
+def test_rate_limit_is_per_caller(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exhausting one caller's window must not silence a different caller's
+    first occurrence."""
+
+    def frozen_monotonic() -> float:
+        return 1000.0
+
+    monkeypatch.setattr(rls, "_monotonic", frozen_monotonic)
+    monkeypatch.setattr(rls, "_SIGNAL_MAX_PER_WINDOW", 1)
+
+    def other_call_site() -> None:
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        _fire_listener()
+        _fire_listener()  # same caller (the helper) — dropped
+        other_call_site()  # new caller — its first, must log
+
+    callers = [r.__dict__["rls_caller"] for r in _signal_records(caplog)]
+    assert len(callers) == 2
+    assert callers[0].endswith(" _fire_listener")
+    assert callers[1].endswith(" other_call_site")
+
+
+def test_signal_state_is_bounded_and_evicts_the_oldest_window(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-caller table cannot grow without bound: past the cap the
+    caller whose window started earliest is evicted — a new caller's first
+    occurrence still logs."""
+    clock = [1000.0]
+
+    def ticking_monotonic() -> float:
+        clock[0] += 1.0
+        return clock[0]
+
+    monkeypatch.setattr(rls, "_monotonic", ticking_monotonic)
+    monkeypatch.setattr(rls, "_SIGNAL_MAX_CALLERS", 2)
+
+    def site_a() -> None:
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    def site_b() -> None:
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    def site_c() -> None:
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        site_a()
+        site_b()
+        site_c()
+
+    callers = [r.__dict__["rls_caller"] for r in _signal_records(caplog)]
+    assert [c.rsplit(" ", 1)[1] for c in callers] == ["site_a", "site_b", "site_c"]
+    tracked = sorted(key.rsplit(" ", 1)[1] for key in rls._signal_state)
+    assert tracked == ["site_b", "site_c"]
+
+
+# --- the signal must never break the transaction --------------------------
+
+
+def test_detect_failure_never_reaches_the_transaction(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attribution / rate limiting / logging blowing up is reported as one
+    ``rls.detect_failed`` line (exception class, once per type) and the
+    listener carries on with its real job — it never raises out of
+    ``after_begin`` and kills the transaction."""
+
+    def broken_locate() -> tuple[str, str | None]:
+        raise RuntimeError("attribution exploded")
+
+    monkeypatch.setattr(rls, "_locate_caller", broken_locate)
+    # Give the listener work to do *after* the failed emit: a user-scoped
+    # session still needs its ``app.user_id`` GUC.
+    current_user_id_var.set(uuid4())
+    connection = MagicMock()
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        _rls_after_begin(MagicMock(), MagicMock(), connection)
+        _rls_after_begin(MagicMock(), MagicMock(), connection)
+
+    assert connection.execute.call_count == 2
+    assert _signal_records(caplog) == []
+    failures = [
+        r for r in caplog.records if r.name == _LOGGER_NAME and r.message == "rls.detect_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].__dict__["error"] == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "current",
+    [object(), SimpleNamespace(parent=SimpleNamespace(parent=None))],
+    ids=["no-parent-attribute", "parent-without-gr_frame"],
+)
+def test_attribution_degrades_to_plain_stack_without_greenlet_parent(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, current: object
+) -> None:
+    """A greenlet that exposes no ``parent`` / ``gr_frame`` (the main
+    greenlet, a foreign implementation) must not break attribution — the
+    plain stack is still walked and names this frame."""
+
+    def stub_getcurrent() -> object:
+        return current
+
+    monkeypatch.setattr(rls, "getcurrent", stub_getcurrent)
+    # Make the plain stack yield no early answer, so the walk has to continue
+    # into the greenlet section and actually touch the stub.
+    monkeypatch.setattr(rls, "_STORE_LAYER_PREFIXES", ("",))
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        _rls_after_begin(MagicMock(), MagicMock(), MagicMock())
+
+    (record,) = _signal_records(caplog)
+    caller = record.__dict__["rls_caller"]
+    assert caller.endswith(" test_attribution_degrades_to_plain_stack_without_greenlet_parent")
