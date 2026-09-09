@@ -793,14 +793,16 @@ async def test_purge_operator_forbidden(
     admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
 ) -> None:
     """⑤ operator (no ``user:write``) → 403; nothing happens."""
-    client, tenant_id, _app, kc = admin_app
+    client, tenant_id, app, kc = admin_app
     member_id = await _invite_one(client, tenant_id)
-    await _deactivate(client, tenant_id, member_id)
-    resp = await client.post(
-        f"/v1/members/{member_id}:purge", headers=_operator_headers(tenant_id)
-    )
+    _user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
+    await _deactivate(client, tenant_id, member_id)  # suspend: KC account only disabled
+    resp = await client.post(f"/v1/members/{member_id}:purge", headers=_operator_headers(tenant_id))
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "FORBIDDEN"
+    assert len(kc.users) == 1
+    still = await app.state.thread_meta_repo.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
+    assert still is not None
 
 
 @pytest.mark.asyncio
@@ -1001,6 +1003,7 @@ async def test_purge_data_step_failure_is_best_effort_and_audited(
     assert details["data_purged"] is False
     assert details["data_purge_failed"] is True
     assert details["purge_ok"] is None
+
 
 @pytest.mark.asyncio
 async def test_cross_tenant_list_requires_system_admin(
