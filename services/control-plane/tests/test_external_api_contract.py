@@ -272,6 +272,8 @@ async def test_third_party_full_chain(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
         {
             "role": "assistant",
@@ -280,6 +282,8 @@ async def test_third_party_full_chain(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
     ], msgs.text
 

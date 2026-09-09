@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -66,6 +66,29 @@ class SqlThreadMessageStore(ThreadMessageStore):
                 )
             )
             await session.commit()
+
+    async def mark_superseded(
+        self,
+        *,
+        thread_id: UUID,
+        tenant_id: UUID,
+        seq_from: int,
+        seq_to: int,
+        superseded_by: UUID,
+    ) -> int:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(ThreadMessageRow)
+                .where(
+                    ThreadMessageRow.thread_id == thread_id,
+                    ThreadMessageRow.tenant_id == tenant_id,
+                    ThreadMessageRow.seq >= seq_from,
+                    ThreadMessageRow.seq < seq_to,
+                )
+                .values({"superseded_by": superseded_by})
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
 
     async def search_thread_ids(
         self,

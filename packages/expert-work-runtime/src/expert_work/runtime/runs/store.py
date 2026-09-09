@@ -464,6 +464,17 @@ class RunStore(abc.ABC):
         return ``False`` so callers can hide existence.
         """
 
+    @abc.abstractmethod
+    async def mark_superseded(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        superseded_by_run_id: UUID,
+    ) -> bool:
+        """P-1 —— 记下这一轮被 ``superseded_by_run_id`` 取代。幂等覆盖;
+        返回 ``True`` iff 行存在且同租户(跨租户探测返回 ``False`` 以隐藏存在性)。"""
+
     # --- Stream 9.4 (HA failover) — ownership lease ------------------------
 
     @abc.abstractmethod
@@ -893,6 +904,19 @@ class InMemoryRunStore(RunStore):
         self._rows[run_id] = replace(row, agent_spec_sha256=agent_spec_sha256)
         return True
 
+    async def mark_superseded(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        superseded_by_run_id: UUID,
+    ) -> bool:
+        row = self._rows.get(run_id)
+        if row is None or row.tenant_id != tenant_id:
+            return False
+        self._rows[run_id] = replace(row, superseded_by_run_id=superseded_by_run_id)
+        return True
+
     async def claim(
         self,
         *,
@@ -1056,6 +1080,8 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         request_digest=row.request_digest,
         artifacts=row.artifacts,
         agent_spec_sha256=row.agent_spec_sha256,
+        superseded_by_run_id=row.superseded_by_run_id,
+        regenerated_from_run_id=row.regenerated_from_run_id,
     )
 
 
@@ -1090,6 +1116,8 @@ class SqlRunStore(RunStore):
                     request_digest=info.request_digest,
                     artifacts=info.artifacts,
                     agent_spec_sha256=info.agent_spec_sha256,
+                    superseded_by_run_id=info.superseded_by_run_id,
+                    regenerated_from_run_id=info.regenerated_from_run_id,
                 )
             )
             try:
@@ -1493,6 +1521,22 @@ class SqlRunStore(RunStore):
                 update(AgentRunRow)
                 .where(AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id)
                 .values({"agent_spec_sha256": agent_spec_sha256})
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def mark_superseded(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        superseded_by_run_id: UUID,
+    ) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(AgentRunRow)
+                .where(AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id)
+                .values({"superseded_by_run_id": superseded_by_run_id})
             )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0

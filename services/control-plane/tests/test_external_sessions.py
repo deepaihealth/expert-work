@@ -417,6 +417,8 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
         {
             "role": "assistant",
@@ -425,6 +427,8 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
         {
             "role": "user",
@@ -433,6 +437,8 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
         {
             "role": "assistant",
@@ -441,6 +447,8 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
     ]
 
@@ -459,6 +467,8 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
         {
             "role": "user",
@@ -467,6 +477,8 @@ async def test_messages_returns_envelope_for_its_owner(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
     ]
 
@@ -531,6 +543,8 @@ async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
             "created_at": stamped_at.isoformat(),
             "run_id": str(run_id),
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
         {
             "role": "assistant",
@@ -539,6 +553,8 @@ async def test_messages_exposes_created_at_and_run_id_stamps(ctx: _Ctx) -> None:
             "created_at": None,
             "run_id": None,
             "feedback": None,
+            "superseded_by": None,
+            "tombstone": False,
         },
     ]
 
@@ -925,3 +941,49 @@ async def test_messages_echo_only_the_callers_own_feedback(ctx: _Ctx) -> None:
     msgs = resp.json()["data"]["messages"]
     assert len(msgs) == 2
     assert all(m["feedback"] == {"rating": "up", "comment": None, "item_id": None} for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_messages_expose_superseded_by_and_tombstone(ctx: _Ctx) -> None:
+    """P-1 —— 被取代轮在 ``/messages`` 上可见且带标记;墓碑正文为空但仍占一行。"""
+    from expert_work.common.supersede import mark_superseded, tombstone_message
+
+    await ctx.seed_agent()
+    checkpointer = InMemorySaver()
+    ctx.app.state.agent_runtime.durable_checkpointer = checkpointer
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    session_id = started.json()["data"]["thread_id"]
+    new_run = uuid4()
+    now = datetime(2026, 9, 10, tzinfo=UTC)
+    old = [
+        mark_superseded(m, new_run_id=str(new_run), now=now)
+        for m in (HumanMessage(content="U1"), AIMessage(content="A1"))
+    ]
+    stone = tombstone_message(
+        mark_superseded(HumanMessage(content="U0"), new_run_id=str(new_run), now=now)
+    )
+    await _seed_thread_messages(
+        checkpointer,
+        session_id,
+        [stone, *old, HumanMessage(content="U2"), AIMessage(content="A2")],
+    )
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{session_id}/messages",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    msgs = resp.json()["data"]["messages"]
+    rows = msgs
+    assert [(r["content"], r["superseded_by"], r["tombstone"]) for r in rows] == [
+        ("", str(new_run), True),
+        ("U1", str(new_run), False),
+        ("A1", str(new_run), False),
+        ("U2", None, False),
+        ("A2", None, False),
+    ]

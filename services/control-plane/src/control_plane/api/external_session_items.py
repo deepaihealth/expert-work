@@ -36,7 +36,7 @@ from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_sessions import _ACTIVE_RUN_STATUSES
 from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_messages
-from expert_work.common.conversation_channel import message_field
+from expert_work.common.conversation_channel import is_tombstone
 from expert_work.common.conversation_derive import derive_run_items
 from expert_work.common.conversation_items import (
     ApprovalItem,
@@ -44,7 +44,7 @@ from expert_work.common.conversation_items import (
     ConversationItem,
     ToolCallItem,
 )
-from expert_work.common.message_stamp import STAMP_RUN_ID
+from expert_work.common.supersede import group_messages_by_run
 from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -99,41 +99,6 @@ def _get_approval_store(request: Request) -> ApprovalStore:
 
 def _get_feedback_store(request: Request) -> FeedbackStore:
     return request.app.state.feedback_store  # type: ignore[no-any-return]
-
-
-def _stamped_run_id(msg: Any) -> str | None:
-    """写入侧盖的 ``expert_work_run_id``,没盖就是 ``None``。"""
-    stamp = (message_field(msg, "additional_kwargs") or {}).get(STAMP_RUN_ID)
-    return stamp if isinstance(stamp, str) else None
-
-
-def _group_messages_by_run(messages: Sequence[Any]) -> dict[str, list[Any]]:
-    """按 ``run_id`` 戳把检查点消息分到各轮,保持原始顺序。
-
-    两条规则决定一条消息归到哪一轮:
-
-    * 盖了戳的消息归戳上那一轮。
-    * 工具结果消息(``type == "tool"``)**从来不盖戳** —— 写入侧只给 agent
-      节点的助手消息与入口的用户消息盖戳。它归到前一条已归属消息的那一轮,
-      因为工具结果结构上必定紧跟发起调用的那条助手消息。
-
-    其余没盖戳的消息(上线前写入的老消息)归不到任何一轮,直接丢弃 —— 编一个
-    归属会让它出现在错误的轮次里。
-    """
-    grouped: dict[str, list[Any]] = {}
-    current: str | None = None
-    for msg in messages:
-        stamped = _stamped_run_id(msg)
-        if stamped is not None:
-            current = stamped
-        elif message_field(msg, "type") != "tool":
-            # 老消息:丢弃,并且不让它顶掉「当前轮」—— 后面的工具结果仍然
-            # 该跟着它自己那条助手消息走。
-            continue
-        if current is None:
-            continue
-        grouped.setdefault(current, []).append(msg)
-    return grouped
 
 
 def _aux_frames(
@@ -445,7 +410,7 @@ def build_external_session_items_router() -> APIRouter:
                 # 会话历史读不到时给不完整的结果,不报错 —— 与 ``/messages``
                 # 同款降级。轮级信息(状态 / 耗时 / 错误)仍然是准的。
                 logger.warning("external_session_items.read_failed", exc_info=True)
-        by_run = _group_messages_by_run(messages)
+        by_run = group_messages_by_run(messages)
 
         items: list[dict[str, Any]] = []
         for run in turns:
@@ -483,7 +448,16 @@ def build_external_session_items_router() -> APIRouter:
                     derived = _with_decision(
                         derived, request_id=record.request_id, decision=record.status.value
                     )
-            items.extend(item.to_wire() for item in derived)
+            # P-1 —— 轮级标记:被取代的一轮,它的每个条目都带 superseded_by;
+            # 墓碑轮的条目 content 已是空串,再打 tombstone 让客户端能区分
+            # 「空回答」与「已清理」。
+            superseded_by = str(run.superseded_by_run_id) if run.superseded_by_run_id else None
+            tombstoned = any(is_tombstone(m) for m in by_run.get(key, []))
+            for item in derived:
+                wire = item.to_wire()
+                wire["superseded_by"] = superseded_by
+                wire["tombstone"] = tombstoned
+                items.append(wire)
 
         return JSONResponse(
             {
@@ -502,6 +476,13 @@ def build_external_session_items_router() -> APIRouter:
                             "artifacts": run.artifacts,
                             # P-2 —— 只回显当前 ``user_id`` 自己打的那一票。
                             "feedback": own.get(str(run.run_id)),
+                            # P-1 —— 被取代 / 重发链接;两者都是 null = 普通一轮。
+                            "superseded_by": str(run.superseded_by_run_id)
+                            if run.superseded_by_run_id
+                            else None,
+                            "regenerated_from": str(run.regenerated_from_run_id)
+                            if run.regenerated_from_run_id
+                            else None,
                         }
                         for run in turns
                     ],

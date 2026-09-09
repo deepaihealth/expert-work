@@ -1751,6 +1751,9 @@ def build_runs_router() -> APIRouter:
                 "content": t.content,
                 "channel": t.channel,
                 "run_id": str(t.run_id) if t.run_id else None,
+                # P-1 —— 与对外 ``/messages`` 同一投影:被取代 / 墓碑标记。
+                "superseded_by": str(t.superseded_by) if t.superseded_by else None,
+                "tombstone": t.tombstone,
             }
             for t in turns
         ]
@@ -1838,6 +1841,14 @@ def build_runs_router() -> APIRouter:
                     # 会话页据此标出「第 N 轮之后配置变更过」——同一个会话里
                     # 相邻两轮的哈希不同,就是中间有人改了配置。
                     "agent_spec_sha256": r.agent_spec_sha256,
+                    # P-1 —— 这一轮被哪个新 run 取代 / 它自己是哪个旧 run 的
+                    # 重新生成或编辑重发。两者都是 null = 普通的、未被取代的一轮。
+                    "superseded_by": str(r.superseded_by_run_id)
+                    if r.superseded_by_run_id
+                    else None,
+                    "regenerated_from": str(r.regenerated_from_run_id)
+                    if r.regenerated_from_run_id
+                    else None,
                     "tokens": _tokens_to_dict(
                         by_trace.get(r.trace_id) if r.trace_id is not None else None
                     ),

@@ -22,6 +22,7 @@ docs/superpowers/specs/2026-07-30-conversation-output-channels-design.md.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -32,6 +33,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from expert_work.common.conversation_channel import visible_turns
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import MessageTurn
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_stamp_created_at(ak: dict[str, Any]) -> datetime | None:
@@ -60,7 +63,25 @@ def _parse_stamp_run_id(ak: dict[str, Any]) -> UUID | None:
         return None
 
 
-def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> list[MessageTurn]:
+def _parse_uuid_or_none(raw: str | None) -> UUID | None:
+    """标记里存的是字符串 run_id;损坏就退化成 ``None``,与两个 ``_parse_stamp_*`` 同规矩。
+
+    降级是对的(一条坏标记不该让整段会话读不出来),但**不能一声不吭** —— 静默
+    吞掉之后,「被取代轮在读面上没标记」看起来和「这轮本来就没被取代」一模一样。
+    只记前缀:这是检查点里的值,整串打进日志等于把租户数据抄进日志。
+    """
+    if raw is None:
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        logger.debug("transcript.superseded_by_unparseable prefix=%r", raw[:8])
+        return None
+
+
+def extract_turns(
+    raw_messages: list[Any], *, include_hidden: bool = True, include_superseded: bool = True
+) -> list[MessageTurn]:
     """把检查点 ``messages`` 通道的原始消息抽成用户/助手文本轮次。
 
     从 :func:`read_turns` 拆出的纯函数(P2)。拆的目的是让「对外消息列表」
@@ -73,9 +94,14 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
     import control-plane,所以那条规则住在 common。本函数只负责把可见轮次映射
     成 :class:`MessageTurn` 并补上写入侧盖的时间戳 / run 归属(它们是
     control-plane 的 ``datetime`` / ``UUID`` 形态,不进 common 的纯结构层)。
+
+    P-1:``include_superseded=False`` 时被取代的消息(含墓碑)不产出,其余
+    轮次的 ``seq`` 不变。
     """
     out: list[MessageTurn] = []
-    for turn in visible_turns(raw_messages, include_hidden=include_hidden):
+    for turn in visible_turns(
+        raw_messages, include_hidden=include_hidden, include_superseded=include_superseded
+    ):
         ak = getattr(raw_messages[turn.seq], "additional_kwargs", None) or {}
         out.append(
             MessageTurn(
@@ -85,6 +111,8 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
                 channel=turn.channel,
                 created_at=_parse_stamp_created_at(ak),
                 run_id=_parse_stamp_run_id(ak),
+                superseded_by=_parse_uuid_or_none(turn.superseded_by),
+                tombstone=turn.tombstone,
             )
         )
     return out
@@ -116,6 +144,7 @@ async def read_turns(
     thread_id: UUID,
     *,
     include_hidden: bool = True,
+    include_superseded: bool = True,
 ) -> list[MessageTurn]:
     """Read a thread's user/assistant text turns off its durable checkpoint.
 
@@ -135,9 +164,14 @@ async def read_turns(
     raw record still carries it and the model always sees it in-prompt. This
     mirrors deer-flow, which reads the checkpoint faithfully and applies the
     ``hide_from_ui`` visibility filter only at its UI-serving router.
+
+    P-1:``include_superseded`` 透传给 :func:`extract_turns` —— 默认 ``True``
+    (读面看得见被取代轮),``False`` 是 agent 的 prompt 视图那一侧的口径。
     """
     return extract_turns(
-        await read_messages(checkpointer, thread_id), include_hidden=include_hidden
+        await read_messages(checkpointer, thread_id),
+        include_hidden=include_hidden,
+        include_superseded=include_superseded,
     )
 
 

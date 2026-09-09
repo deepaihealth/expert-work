@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from operator import attrgetter
 from typing import Any
 
 #: 编排层自己写进 checkpoint 的脚手架标记(CM-1 ``<recovery-advisory>`` /
@@ -28,6 +29,14 @@ HIDE_FROM_UI = "expert_work_hide_from_ui"
 #: **自己开一个段落** —— 否则它会被接到用户上一个真实提问的段尾,把那一段
 #: 的 ``final`` 抢走。
 SCHEDULED_DELIVERY = "expert_work_scheduled_delivery"
+
+#: P-1「已被取代」—— 值 = 取代它的新 run_id(字符串 UUID)。带这个标记的消息
+#: 留在历史里、进读面,但 agent 的 prompt 视图整轮剔除(``supersede.filter_superseded_turns``)。
+SUPERSEDED_BY = "expert_work_superseded_by"
+#: 打标时刻,ISO8601。
+SUPERSEDED_AT = "expert_work_superseded_at"
+#: 墓碑:超过保留份数的最老版本,正文已清空、id 与下标保留。墓碑必然同时带 SUPERSEDED_BY。
+TOMBSTONE = "expert_work_tombstone"
 
 #: ``channel`` 的两个取值。与 ``conversation_items.CHANNELS`` 的一致性由
 #: 契约测试钉住(那份是对外词表,这份是判定实现)。
@@ -79,6 +88,22 @@ def is_hidden(msg: Any) -> bool:
     return bool(_kwargs(msg).get(HIDE_FROM_UI))
 
 
+def superseded_by(msg: Any) -> str | None:
+    """取代这条消息的新 run_id;没被取代就是 ``None``。"""
+    value = _kwargs(msg).get(SUPERSEDED_BY)
+    return value if isinstance(value, str) and value else None
+
+
+def is_superseded(msg: Any) -> bool:
+    """这条消息是否已被某个新 run 取代(墓碑同样为真)。"""
+    return superseded_by(msg) is not None
+
+
+def is_tombstone(msg: Any) -> bool:
+    """这条消息是否是墓碑(正文已清理)。"""
+    return bool(_kwargs(msg).get(TOMBSTONE))
+
+
 def has_tool_calls(msg: Any) -> bool:
     """助手消息是否带工具调用(带 = 它还没说完,必然是 ``commentary``)。"""
     return message_field(msg, "type") == "ai" and bool(message_field(msg, "tool_calls"))
@@ -113,9 +138,15 @@ class VisibleTurn:
     text: str
     #: 助手轮的 ``final`` / ``commentary``;用户轮恒为 ``None``。
     channel: str | None
+    #: P-1 —— 取代这条消息的新 run_id;``None`` = 未被取代。
+    superseded_by: str | None = None
+    #: P-1 —— 墓碑:正文已清理,``text == ""``、``channel is None``。
+    tombstone: bool = False
 
 
-def visible_turns(raw_messages: Sequence[Any], *, include_hidden: bool = True) -> list[VisibleTurn]:
+def visible_turns(
+    raw_messages: Sequence[Any], *, include_hidden: bool = True, include_superseded: bool = True
+) -> list[VisibleTurn]:
     """抽出带文本的用户/助手轮次,并给助手轮定 ``channel``。
 
     工具/系统消息不在此列(它们不是「轮次」);正文空白的 human/ai 也丢弃
@@ -125,29 +156,54 @@ def visible_turns(raw_messages: Sequence[Any], *, include_hidden: bool = True) -
     对外视图。隐藏消息从不开启段落,所以过滤它们不会移动段落边界;但它若
     正好排在某条助手轮之后,两种视图给那条助手轮的 ``channel`` 仍可能不同
     (忠实视图里它「后面还有一行」)。
+
+    ``include_superseded=True``(默认)= 被取代的消息照常产出并带
+    ``superseded_by``,墓碑产出为空文本、``tombstone=True``、``channel=None``,
+    且**不参与** final/commentary 判定(它不是「后面还有一行」);``False`` =
+    两者都不产出,其余消息的 ``seq`` 不变(下标是镜像的主键,不能因视图而漂)。
     """
-    collected: list[tuple[int, str, str, bool, bool]] = []
+    collected: list[tuple[int, str, str, bool, bool, str | None]] = []
+    stones: list[VisibleTurn] = []
     for seq, msg in enumerate(raw_messages):
         mtype = message_field(msg, "type")
         if mtype not in ("human", "ai"):
             continue
         if not include_hidden and is_hidden(msg):
             continue
+        by = superseded_by(msg)
+        if by is not None and not include_superseded:
+            continue
+        if is_tombstone(msg):
+            role = "user" if mtype == "human" else "assistant"
+            stones.append(
+                VisibleTurn(
+                    seq=seq, role=role, text="", channel=None, superseded_by=by, tombstone=True
+                )
+            )
+            continue
         text = message_text(message_field(msg, "content", ""))
         if not text.strip():
             continue
-        collected.append((seq, mtype, text, has_tool_calls(msg), opens_segment(msg)))
+        collected.append((seq, mtype, text, has_tool_calls(msg), opens_segment(msg), by))
 
     out: list[VisibleTurn] = []
-    for i, (seq, mtype, text, tool_calls, _opens) in enumerate(collected):
+    for i, (seq, mtype, text, tool_calls, _opens, by) in enumerate(collected):
         if mtype == "human":
-            out.append(VisibleTurn(seq=seq, role="user", text=text, channel=None))
+            out.append(VisibleTurn(seq=seq, role="user", text=text, channel=None, superseded_by=by))
             continue
         nxt = collected[i + 1] if i + 1 < len(collected) else None
         last_in_segment = nxt is None or nxt[4]
         channel = CHANNEL_FINAL if last_in_segment and not tool_calls else CHANNEL_COMMENTARY
-        out.append(VisibleTurn(seq=seq, role="assistant", text=text, channel=channel))
-    return out
+        out.append(
+            VisibleTurn(seq=seq, role="assistant", text=text, channel=channel, superseded_by=by)
+        )
+    if not stones:
+        return out
+    # ``out`` 与 ``stones`` 各自都已按 ``seq`` 升序 —— 两者都来自上面那一趟
+    # ``enumerate(raw_messages)``,``seq`` 就是下标。所以这里的 ``sorted`` 是把
+    # 两条升序流**归并**回一条,不是在修一个乱序的输入(输入的顺序由检查点的
+    # ``messages`` 通道保证,``add_messages`` 是追加型 reducer)。
+    return sorted([*out, *stones], key=attrgetter("seq"))
 
 
 __all__ = [
@@ -155,11 +211,17 @@ __all__ = [
     "CHANNEL_FINAL",
     "HIDE_FROM_UI",
     "SCHEDULED_DELIVERY",
+    "SUPERSEDED_AT",
+    "SUPERSEDED_BY",
+    "TOMBSTONE",
     "VisibleTurn",
     "has_tool_calls",
     "is_hidden",
+    "is_superseded",
+    "is_tombstone",
     "message_field",
     "message_text",
     "opens_segment",
+    "superseded_by",
     "visible_turns",
 ]

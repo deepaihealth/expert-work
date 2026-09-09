@@ -156,6 +156,13 @@ def build_external_runs_router() -> APIRouter:
                             # 产物清单契约 —— 覆盖「没消费到 end 就终局」的
                             # 重连收尾重建;null = 历史 run 无记录。
                             "artifacts": r.artifacts,
+                            # P-1 —— 被取代 / 重发链接;两者都是 null = 普通一轮。
+                            "superseded_by": str(r.superseded_by_run_id)
+                            if r.superseded_by_run_id
+                            else None,
+                            "regenerated_from": str(r.regenerated_from_run_id)
+                            if r.regenerated_from_run_id
+                            else None,
                         }
                         for r in rows
                     ],
