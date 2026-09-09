@@ -3,7 +3,7 @@
 The protocol-side Literal (``expert_work.protocol.audit``) has carried
 ``"artifact"`` since Stream J.9-step3; the control-plane copy
 (``control_plane.audit``) never got it, so the three ``emit(...,
-resource_type="artifact")`` call sites (``api/artifacts.py`` ×2,
+resource_type="artifact")`` call sites (two in ``api/artifacts.py``, one in
 ``api/external_artifacts.py``) were type errors that never turned red —
 CI's mypy job does not scan ``services/control-plane`` (``ci.yml``
 "mypy strict" step lists ``packages`` + five other services). This pytest
