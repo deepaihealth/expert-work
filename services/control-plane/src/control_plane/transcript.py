@@ -60,7 +60,19 @@ def _parse_stamp_run_id(ak: dict[str, Any]) -> UUID | None:
         return None
 
 
-def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> list[MessageTurn]:
+def _parse_uuid_or_none(raw: str | None) -> UUID | None:
+    """标记里存的是字符串 run_id;损坏就退化成 ``None``,与两个 ``_parse_stamp_*`` 同规矩。"""
+    if raw is None:
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        return None
+
+
+def extract_turns(
+    raw_messages: list[Any], *, include_hidden: bool = True, include_superseded: bool = True
+) -> list[MessageTurn]:
     """把检查点 ``messages`` 通道的原始消息抽成用户/助手文本轮次。
 
     从 :func:`read_turns` 拆出的纯函数(P2)。拆的目的是让「对外消息列表」
@@ -73,9 +85,14 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
     import control-plane,所以那条规则住在 common。本函数只负责把可见轮次映射
     成 :class:`MessageTurn` 并补上写入侧盖的时间戳 / run 归属(它们是
     control-plane 的 ``datetime`` / ``UUID`` 形态,不进 common 的纯结构层)。
+
+    P-1:``include_superseded=False`` 时被取代的消息(含墓碑)不产出,其余
+    轮次的 ``seq`` 不变。
     """
     out: list[MessageTurn] = []
-    for turn in visible_turns(raw_messages, include_hidden=include_hidden):
+    for turn in visible_turns(
+        raw_messages, include_hidden=include_hidden, include_superseded=include_superseded
+    ):
         ak = getattr(raw_messages[turn.seq], "additional_kwargs", None) or {}
         out.append(
             MessageTurn(
@@ -85,6 +102,8 @@ def extract_turns(raw_messages: list[Any], *, include_hidden: bool = True) -> li
                 channel=turn.channel,
                 created_at=_parse_stamp_created_at(ak),
                 run_id=_parse_stamp_run_id(ak),
+                superseded_by=_parse_uuid_or_none(turn.superseded_by),
+                tombstone=turn.tombstone,
             )
         )
     return out
@@ -116,6 +135,7 @@ async def read_turns(
     thread_id: UUID,
     *,
     include_hidden: bool = True,
+    include_superseded: bool = True,
 ) -> list[MessageTurn]:
     """Read a thread's user/assistant text turns off its durable checkpoint.
 
@@ -135,9 +155,14 @@ async def read_turns(
     raw record still carries it and the model always sees it in-prompt. This
     mirrors deer-flow, which reads the checkpoint faithfully and applies the
     ``hide_from_ui`` visibility filter only at its UI-serving router.
+
+    P-1:``include_superseded`` 透传给 :func:`extract_turns` —— 默认 ``True``
+    (读面看得见被取代轮),``False`` 是 agent 的 prompt 视图那一侧的口径。
     """
     return extract_turns(
-        await read_messages(checkpointer, thread_id), include_hidden=include_hidden
+        await read_messages(checkpointer, thread_id),
+        include_hidden=include_hidden,
+        include_superseded=include_superseded,
     )
 
 

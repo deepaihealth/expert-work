@@ -203,3 +203,34 @@ def test_items_channel_follows_the_ui_view_not_the_faithful_view() -> None:
     assert _assistant_channels(derive_run_items(run_id="r1", messages=run)) == _channels(
         run, include_hidden=False
     )
+
+
+def test_extract_turns_projects_superseded_by_and_tombstone() -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from expert_work.common.supersede import mark_superseded, tombstone_message
+
+    new_run = UUID("11111111-2222-4333-8444-555555555555")
+    marked = mark_superseded(
+        AIMessage(content="A1"), new_run_id=str(new_run), now=datetime(2026, 9, 10, tzinfo=UTC)
+    )
+    stone = tombstone_message(
+        mark_superseded(
+            HumanMessage(content="U0"),
+            new_run_id=str(new_run),
+            now=datetime(2026, 9, 10, tzinfo=UTC),
+        )
+    )
+    turns = extract_turns([stone, marked, HumanMessage(content="U2")])
+    assert [(t.seq, t.superseded_by, t.tombstone, t.content) for t in turns] == [
+        (0, new_run, True, ""),
+        (1, new_run, False, "A1"),
+        (2, None, False, "U2"),
+    ]
+    assert [
+        t.seq
+        for t in extract_turns(
+            [stone, marked, HumanMessage(content="U2")], include_superseded=False
+        )
+    ] == [2]
