@@ -771,6 +771,9 @@ async def test_purge_self_409(
     """④ the caller's own member row → 409 MEMBER_PURGE_SELF, even when it is
     already suspended (a still-valid JWT could otherwise finish the job)."""
     client, tenant_id, app, kc = admin_app
+    # A second active admin so suspending "me" clears the last-admin gate.
+    other = await _invite_one(client, tenant_id, email="other@co.com", role="admin")
+    await _activate(app, tenant_id, other, "sub-other")
     member_id = await _invite_one(client, tenant_id, email="me@co.com", role="admin")
     _user_id, thread_id = await _activate_with_data(app, tenant_id, member_id)
     await _deactivate(client, tenant_id, member_id)
@@ -782,7 +785,7 @@ async def test_purge_self_409(
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["code"] == "MEMBER_PURGE_SELF"
 
-    assert len(kc.users) == 1
+    assert len(kc.users) == 2  # "me" and "other" both still there
     still = await app.state.thread_meta_repo.get(thread_id, tenant_id=tenant_id)  # type: ignore[attr-defined]
     assert still is not None
     assert await _purge_rows(audit_store, tenant_id) == []
@@ -1003,6 +1006,141 @@ async def test_purge_data_step_failure_is_best_effort_and_audited(
     assert details["data_purged"] is False
     assert details["data_purge_failed"] is True
     assert details["purge_ok"] is None
+
+
+# --- last active admin guard on DELETE (X-4 ① follow-up, 2026-09-09) ---------
+
+
+async def _activate(app: object, tenant_id: UUID, member_id: UUID, sub: str) -> None:
+    """First-login promotion (invited → active) without seeding data."""
+    from datetime import UTC, datetime
+
+    user = await app.state.tenant_user_repo.resolve(  # type: ignore[attr-defined]
+        tenant_id=tenant_id, subject_type="user", subject_id=sub, display_name=sub
+    )
+    moved = await app.state.tenant_member_repo.transition(  # type: ignore[attr-defined]
+        member_id=member_id,
+        tenant_id=tenant_id,
+        to="active",
+        now=datetime.now(UTC),
+        subject_id=user.id,
+    )
+    assert moved
+
+
+async def _status(app: object, tenant_id: UUID, member_id: UUID) -> str:
+    member = await app.state.tenant_member_repo.get(tenant_id=tenant_id, member_id=member_id)  # type: ignore[attr-defined]
+    assert member is not None
+    return str(member.status)
+
+
+@pytest.mark.asyncio
+async def test_suspend_one_of_two_active_admins_ok(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """Two active admins → suspending one is fine (one stays)."""
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    b = await _invite_one(client, tenant_id, email="b@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    await _activate(app, tenant_id, b, "sub-b")
+
+    resp = await client.delete(f"/v1/members/{b}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 204, resp.text
+    assert await _status(app, tenant_id, b) == "suspended"
+    assert await _status(app, tenant_id, a) == "active"
+
+
+@pytest.mark.asyncio
+async def test_suspend_last_active_admin_409(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+    audit_store: InMemoryAuditLogStore,
+) -> None:
+    """The only active admin → 409 MEMBER_LAST_ADMIN; nothing touched."""
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    client, tenant_id, app, kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    kc_uuid = await _kc_uuid(app, tenant_id, a)
+
+    resp = await client.delete(f"/v1/members/{a}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "MEMBER_LAST_ADMIN"
+
+    assert await _status(app, tenant_id, a) == "active"
+    assert kc.users[str(kc_uuid)].user.enabled is True
+    bindings = await app.state.role_binding_repo.list_for_subject(  # type: ignore[attr-defined]
+        subject_type="user", subject_id=kc_uuid, tenant_id=tenant_id
+    )
+    assert len(bindings) == 1
+    page = await audit_store.query(AuditQuery(tenant_id=tenant_id))
+    assert [r for r in page.entries if r.action is AuditAction.MEMBER_SUSPEND] == []
+
+
+@pytest.mark.asyncio
+async def test_suspend_self_as_last_active_admin_409(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """Self-suspend by the only active admin → 409 (no lock-out)."""
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="me@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-me")
+    kc_uuid = await _kc_uuid(app, tenant_id, a)
+
+    resp = await client.delete(f"/v1/members/{a}", headers=_headers_as(tenant_id, str(kc_uuid)))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "MEMBER_LAST_ADMIN"
+    assert await _status(app, tenant_id, a) == "active"
+
+
+@pytest.mark.asyncio
+async def test_suspended_and_invited_admins_do_not_count(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """Only ``active`` counts: a suspended admin and an invited admin beside
+    the last active one do not unlock the suspend."""
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    b = await _invite_one(client, tenant_id, email="b@co.com", role="admin")
+    _c_invited = await _invite_one(client, tenant_id, email="c@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    await _activate(app, tenant_id, b, "sub-b")
+    first = await client.delete(f"/v1/members/{b}", headers=_admin_headers(tenant_id))
+    assert first.status_code == 204, first.text  # a still active
+
+    resp = await client.delete(f"/v1/members/{a}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "MEMBER_LAST_ADMIN"
+    assert await _status(app, tenant_id, a) == "active"
+
+
+@pytest.mark.asyncio
+async def test_last_admin_gate_ignores_non_admins_and_invited_admins(
+    admin_app: tuple[AsyncClient, UUID, object, FakeKeycloakAdminClient],
+) -> None:
+    """A single active admin does not block suspending a viewer, nor
+    withdrawing an admin *invite* (invited is not active)."""
+    client, tenant_id, app, _kc = admin_app
+    a = await _invite_one(client, tenant_id, email="a@co.com", role="admin")
+    v = await _invite_one(client, tenant_id, email="v@co.com", role="viewer")
+    i = await _invite_one(client, tenant_id, email="i@co.com", role="admin")
+    await _activate(app, tenant_id, a, "sub-a")
+    await _activate(app, tenant_id, v, "sub-v")
+
+    # An active *viewer* beside the admin does not make the admin removable.
+    resp = await client.delete(f"/v1/members/{a}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "MEMBER_LAST_ADMIN"
+
+    resp = await client.delete(f"/v1/members/{v}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 204, resp.text
+    assert await _status(app, tenant_id, v) == "suspended"
+
+    resp = await client.delete(f"/v1/members/{i}", headers=_admin_headers(tenant_id))
+    assert resp.status_code == 204, resp.text
+    assert await _status(app, tenant_id, i) == "revoked"
+    assert await _status(app, tenant_id, a) == "active"
 
 
 @pytest.mark.asyncio

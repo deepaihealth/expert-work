@@ -55,6 +55,8 @@ from expert_work.runtime.audit.logger import AuditLogger
 logger = logging.getLogger("expert_work.control_plane.api.members")
 
 _MAX_BATCH = 50
+#: Roster page size for the last-active-admin scan (``list_for_tenant`` pages).
+_ROSTER_PAGE = 200
 
 
 def _normalise_email(value: str) -> str:
@@ -84,6 +86,27 @@ class InviteRequest(BaseModel):
 class ResetPasswordBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     password: SecretStr = Field(min_length=8, max_length=256)
+
+
+async def _has_other_active_admin(
+    member_repo: TenantMemberStore, *, tenant_id: UUID, exclude: UUID
+) -> bool:
+    """``True`` when the tenant has an ``active`` admin other than ``exclude``.
+
+    Only ``active`` counts — an invited admin has not signed in and a
+    suspended one holds no working access, so neither keeps the tenant's
+    console reachable. Pages the roster and stops at the first hit.
+    """
+    offset = 0
+    while True:
+        page = await member_repo.list_for_tenant(
+            tenant_id=tenant_id, status="active", limit=_ROSTER_PAGE, offset=offset
+        )
+        if any(m.role == "admin" and m.id != exclude for m in page):
+            return True
+        if len(page) < _ROSTER_PAGE:
+            return False
+        offset += _ROSTER_PAGE
 
 
 def _get_member_repo(request: Request) -> TenantMemberStore:
@@ -342,6 +365,28 @@ def build_members_router() -> APIRouter:
         member = await member_repo.get(tenant_id=principal.tenant_id, member_id=member_id)
         if member is None:
             raise HTTPException(status_code=404, detail={"code": "MEMBER_NOT_FOUND"})
+
+        # Last-active-admin guard (X-4 ① follow-up, 2026-09-09): suspending
+        # the tenant's only active admin — yourself included — locks the
+        # tenant out of its own console, and the two-step purge downstream
+        # can then never be undone. Sits before any branch and has no
+        # principal-specific bypass (a system_admin acting in the tenant
+        # hits it too). Optimistic like ``transition``: two admins
+        # suspending each other concurrently can still both pass.
+        if (
+            member.status == "active"
+            and member.role == "admin"
+            and not await _has_other_active_admin(
+                member_repo, tenant_id=principal.tenant_id, exclude=member.id
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MEMBER_LAST_ADMIN",
+                    "message": "cannot suspend the tenant's last active admin",
+                },
+            )
 
         now = datetime.now(UTC)
         if member.status == "invited":
