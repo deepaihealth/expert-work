@@ -81,6 +81,9 @@
 - `GET /v1/conversations` 加筛选 `has_down_rated`(复用 `feedback_store.py:65` `down_rated_threads`,按 `api/conversations.py:243-253` 的 `narrowed_ids` 组合)。
 - 对话详情页(`pages/ConversationDetail.tsx`)每轮脚部显示 👍/👎 与评论;Curation 候选行显示「被踩的轮 + 原话 + 是否后改票」。
 - 控制台自己的 `POST /v1/sessions/{thread_id}/feedback` 改为必带 `run_id`(`components/console/ledger.ts:204` 已有 `runId`),`source='console'`。
+- **对话详情页放开打分(2026-09-09 用户拍板,PR4)**:今天 `TurnFooter.tsx:155` 用同一个 `readOnly` 同时挡「打分」与「重跑」,而 `ConversationDetail.tsx:702` 恒传 `readOnly` → 员工在对话详情页**看得到别人的分、自己打不了**。拍板改为 **operator 及以上能打、viewer 只能看**:前端把打分从 `readOnly` 里拆出来走独立开关(重跑仍然挡住),后端 `POST /v1/sessions/{thread_id}/feedback` **自己加 operator+ 闸**(前端置灰不算闸,viewer 打分必须 403)。员工打的分与终端用户的分同表同列,只靠 `source` 区分:`source='console'` / `run_id` 照 PR1 既有语义,不新增写入通道。
+- **凡是人看的地方必须显示来源**:控制台反馈列表与轮脚展示、策展候选行,都要能一眼看出这条 👎 是员工打的还是终端用户打的 —— 审阅员不能把两者当一回事。
+- **但四个下游消费者一律不按 `source` 过滤**(§2.2 那四处):回滚闸取的是「该技能版本在时间窗内被用过的会话」再看其中哪些被踩,那里的「踩」本来就是在说这个技能跑砸了,员工说的和终端用户说的同样有效;候选池 / 记忆待复核 / 技能蒸馏证据同理 —— 专家的负反馈只会更值钱。**不要**给这四处加来源判据。
 
 ## 7. 待真跑确认(实施第一天做,结果回填本文)
 
