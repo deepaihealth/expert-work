@@ -653,10 +653,19 @@ describe("SettingsMembers — cross-tenant read-only view", () => {
 });
 
 describe("SettingsMembers — last active admin guard", () => {
-  it("disables remove (with tooltip) for the only active admin — invited / suspended admins do not count", async () => {
+  it("disables remove (with tooltip) for the only active admin — invited / suspended admins and active non-admins do not count", async () => {
+    const activeOperator: TenantMember = {
+      ...activeMember,
+      id: "m-6",
+      email: "olu@example.com",
+      display_name: "Olu",
+      role: "operator",
+      keycloak_user_id: "kc-6",
+      subject_id: "s-6",
+    };
     vi.mocked(listMembers).mockResolvedValue({
-      items: [activeMember, invitedNoLogin, suspendedMember],
-      total: 3,
+      items: [activeMember, invitedNoLogin, suspendedMember, activeOperator],
+      total: 4,
     });
     const user = userEvent.setup();
     renderPage();
@@ -665,6 +674,9 @@ describe("SettingsMembers — last active admin guard", () => {
       expect(screen.getByTestId("members-remove-m-1")).toBeInTheDocument(),
     );
     expect(screen.getByTestId("members-remove-m-1")).toBeDisabled();
+    // An active operator is not an admin — it neither unlocks m-1 nor is
+    // itself blocked.
+    expect(screen.getByTestId("members-remove-m-6")).toBeEnabled();
     await user.hover(screen.getByTestId("members-last-admin-m-1"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       i18n.t("settings_members.last_admin_tooltip"),
