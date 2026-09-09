@@ -23,6 +23,10 @@ from tests.auth_fixtures import (
 
 _DEFAULT_TENANT = DEFAULT_DEV_TENANT_ID
 
+#: 固定值而非 ``uuid4()`` —— 它会进 parametrize id,随机值会让 xdist 各 worker
+#: 收集到不同的用例集(见 test_console_lockdown.py 同款注释)。
+_RUN_ID = "00000000-0000-4000-8000-000000000021"
+
 
 @pytest.fixture
 def audit_store() -> InMemoryAuditLogStore:
@@ -73,7 +77,7 @@ async def test_submit_feedback_persists_and_correlates(
     thread_id = uuid4()
     response = await client.post(
         f"/v1/sessions/{thread_id}/feedback",
-        json={"rating": "up", "comment": "great answer", "turn_seq": 3},
+        json={"rating": "up", "comment": "great answer", "turn_seq": 3, "run_id": str(uuid4())},
     )
     assert response.status_code == 201
     body = response.json()
@@ -106,7 +110,7 @@ async def test_submit_feedback_down_without_comment(
     thread_id = uuid4()
     response = await client.post(
         f"/v1/sessions/{thread_id}/feedback",
-        json={"rating": "down"},
+        json={"rating": "down", "run_id": str(uuid4())},
     )
     assert response.status_code == 201
     rows = await feedback_store.list_for_thread(thread_id=thread_id)
@@ -120,9 +124,10 @@ async def test_submit_feedback_down_without_comment(
     "bad_body",
     [
         {},  # missing rating
-        {"rating": "sideways"},  # not up/down
-        {"rating": "up", "unexpected": 1},  # extra field forbidden
-        {"rating": "up", "turn_seq": -1},  # negative turn_seq
+        {"rating": "sideways", "run_id": _RUN_ID},  # not up/down
+        {"rating": "up", "unexpected": 1, "run_id": _RUN_ID},  # extra field forbidden
+        {"rating": "up", "turn_seq": -1, "run_id": _RUN_ID},  # negative turn_seq
+        {"rating": "up"},  # P-2:漏 run_id 也是 422
     ],
 )
 async def test_submit_feedback_rejects_bad_input(
@@ -132,3 +137,25 @@ async def test_submit_feedback_rejects_bad_input(
     """#65 — input validation rejects malformed bodies with 422."""
     response = await client.post(f"/v1/sessions/{uuid4()}/feedback", json=bad_body)
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_console_feedback_is_run_scoped_upsert(
+    client: AsyncClient, feedback_store: InMemoryFeedbackStore
+) -> None:
+    thread_id, run_id = uuid4(), uuid4()
+    first = await client.post(
+        f"/v1/sessions/{thread_id}/feedback",
+        json={"rating": "down", "comment": "bad", "run_id": str(run_id)},
+    )
+    assert first.status_code == 201
+    assert first.json()["run_id"] == str(run_id)
+    assert first.json()["updated"] is False
+    second = await client.post(
+        f"/v1/sessions/{thread_id}/feedback", json={"rating": "up", "run_id": str(run_id)}
+    )
+    assert second.status_code == 201
+    assert second.json()["updated"] is True
+    rows = await feedback_store.list_for_thread(thread_id=thread_id)
+    assert len(rows) == 1
+    assert rows[0].rating == "up" and rows[0].run_id == run_id and rows[0].source == "console"

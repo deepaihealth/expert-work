@@ -13,7 +13,12 @@ import type { ConsoleTurn } from "../types";
 import type { Turn } from "../../turn/types";
 import type { TurnSummary } from "../../../api/turn_summary";
 
-function makeConsoleTurn(turnOver: Partial<Turn> = {}): ConsoleTurn {
+/** ``runId`` 默认给一个真值:P-2 起打分按 run 走,一轮真跑过就有 run id,
+ *  ``null`` 是例外(还没拿到 run id 的那一瞬)。要测那个例外的用例显式传 null。 */
+function makeConsoleTurn(
+  turnOver: Partial<Turn> = {},
+  runId: string | null = "run-1",
+): ConsoleTurn {
   return {
     key: "t1",
     seq: 3,
@@ -28,7 +33,7 @@ function makeConsoleTurn(turnOver: Partial<Turn> = {}): ConsoleTurn {
       approval: null,
       ...turnOver,
     },
-    runId: null,
+    runId,
     loadState: "done",
     fallbackLines: [],
     tokens: null,
@@ -309,6 +314,42 @@ describe("TurnFooter", () => {
     );
     expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
     expect(screen.getByTestId("playground-feedback-up")).toBeDisabled();
+  });
+
+  it("feedback bar needs a run id: hidden for a settled turn whose runId is null, shown once runId is known", () => {
+    const { rerender } = render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" }, null)}
+          threadId="th-1"
+          summary={FULL_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" }, "run-1")}
+          threadId="th-1"
+          summary={FULL_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
   });
 
   // PR-B Task 3 — ConversationDetail's per-turn "查看运行" deep link: an

@@ -20,10 +20,13 @@ const { Text } = Typography;
  *  ``disabled`` (Track C W2) — 切入态只读:反馈是写操作,置灰两个按钮。 */
 export function FeedbackBar({
   threadId,
+  runId,
   turnSeq,
   disabled = false,
 }: {
   threadId: string;
+  /** P-2 — 打分对象是这一轮(run),后端必填。 */
+  runId: string;
   turnSeq: number;
   disabled?: boolean;
 }) {
@@ -42,6 +45,7 @@ export function FeedbackBar({
         await submitSessionFeedback(threadId, {
           rating,
           comment: text?.trim() || undefined,
+          run_id: runId,
           turn_seq: turnSeq,
         });
         setSubmitted(rating);
@@ -54,7 +58,7 @@ export function FeedbackBar({
         setBusy(false);
       }
     },
-    [threadId, turnSeq],
+    [threadId, runId, turnSeq],
   );
 
   return (

@@ -152,11 +152,20 @@ export function TurnFooter({
             only. Track C W2: 切入态只读——反馈是写操作,置灰 + Tooltip。 */}
         {/* 终审 F4 — interrupted turns keep the feedback bar: a run that
             broke off midway is exactly the turn worth a 👎. */}
-        {!readOnly && (status === "done" || status === "interrupted") && threadId && (
-          <ReadonlyTooltip on={isTenantSwitched}>
-            <FeedbackBar threadId={threadId} turnSeq={turn.seq} disabled={isTenantSwitched} />
-          </ReadonlyTooltip>
-        )}
+        {/* P-2 — 打分按 run 走,没有 run id 就没有打分对象,整条不渲染。 */}
+        {!readOnly &&
+          (status === "done" || status === "interrupted") &&
+          threadId &&
+          turn.runId !== null && (
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <FeedbackBar
+                threadId={threadId}
+                runId={turn.runId}
+                turnSeq={turn.seq}
+                disabled={isTenantSwitched}
+              />
+            </ReadonlyTooltip>
+          )}
         {onRetry && status !== "running" && (
           <Button
             type="text"
