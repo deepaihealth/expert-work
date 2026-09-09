@@ -16,14 +16,22 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from expert_work.persistence import (
     DatabaseConfig,
     SqlArtifactStore,
+    SqlAuditLogStore,
     SqlImageUploadStore,
     SqlMemoryStore,
     SqlTenantUserStore,
+    SqlThreadMetaStore,
+    SqlUserUploadStore,
     SqlUserWorkspaceStore,
     create_async_engine_from_config,
     create_async_session_factory,
 )
 from expert_work.persistence.rls import build_rls_sessionmaker
+from expert_work.runtime.audit import (
+    AuditLogger,
+    DefaultSecretRedactor,
+    InMemoryAuditFallbackQueue,
+)
 from expert_work.runtime.storage import make_object_store
 from expert_work.runtime.storage.factory import S3CompatibleConfig
 from retention_cleanup_job.job import RetentionCleanupJob
@@ -98,6 +106,23 @@ async def _amain() -> None:
         tenant_user_store = SqlTenantUserStore(session_factory)
         workspace_store = SqlUserWorkspaceStore(session_factory)
 
+        # 留存链 PR2 —— 三条工作区规则的登记表 + 审计。审计走 SqlAuditLogStore
+        # (append 时 SET LOCAL ROLE audit_writer —— DSN 用户与 control-plane 同一
+        # 个,本来就是 audit_writer 成员);fallback 队列是进程内的,一次性 job
+        # 写不进库就只剩 error 日志,与 control-plane 的 best-effort 语义一致。
+        user_upload_store = SqlUserUploadStore(session_factory)
+        thread_store = SqlThreadMetaStore(session_factory)
+        audit_logger = AuditLogger(
+            store=SqlAuditLogStore(session_factory),
+            redactor=DefaultSecretRedactor(),
+            fallback=InMemoryAuditFallbackQueue(),
+        )
+        if settings.workspace_root is None:
+            logger.warning(
+                "retention.workspace_root_unset — artifact-version / upload-file / "
+                "orphan-thread-dir rules are skipped (set EXPERT_WORK_RETENTION_WORKSPACE_ROOT)"
+            )
+
         job = RetentionCleanupJob(
             db_session_factory=session_factory,
             batch_size=settings.batch_size,
@@ -114,6 +139,11 @@ async def _amain() -> None:
             tenant_user_store=tenant_user_store,
             tenant_user_hard_delete_grace_days=settings.tenant_user_hard_delete_grace_days,
             sandbox_egress_audit_retention_days=settings.sandbox_egress_audit_retention_days,
+            user_upload_store=user_upload_store,
+            upload_retention_days=settings.upload_retention_days,
+            thread_store=thread_store,
+            workspace_root=settings.workspace_root,
+            audit_logger=audit_logger,
         )
         logger.info("retention_cleanup_job.start batch=%d", settings.batch_size)
         report = await job.run_once()
@@ -121,8 +151,9 @@ async def _amain() -> None:
             "retention_cleanup_job.done audit=%d audit_skipped_unacked=%d "
             "event=%d jwt=%d image_rows=%d image_keys_ok=%d image_keys_failed=%d "
             "artifact_soft=%d artifact_hard=%d "
+            "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
+            "uploads_expired=%d upload_files_removed=%d thread_dirs_removed=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
-            "workspace_archives_removed=%d workspace_archives_failed=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
             "sandbox_egress_audit=%d duration=%.2fs",
             report.audit_deleted,
@@ -134,10 +165,14 @@ async def _amain() -> None:
             report.image_object_keys_failed,
             report.artifacts_soft_deleted,
             report.artifacts_hard_deleted,
+            report.artifact_versions_deleted,
+            report.artifact_files_removed,
+            report.artifacts_expired,
+            report.uploads_expired,
+            report.upload_files_removed,
+            report.thread_dirs_removed,
             report.memory_hard_deleted,
             report.workspaces_hard_deleted,
-            report.workspace_archives_removed,
-            report.workspace_archives_failed,
             report.workspaces_pending_archive,
             report.tenant_users_hard_deleted,
             report.sandbox_egress_audit_deleted,
@@ -152,11 +187,6 @@ async def _amain() -> None:
             logger.warning(
                 "retention.image_object_keys_failed count=%d — object store unhealthy?",
                 report.image_object_keys_failed,
-            )
-        if report.workspace_archives_failed > 0:
-            logger.warning(
-                "retention.workspace_archives_failed count=%d — object store unhealthy?",
-                report.workspace_archives_failed,
             )
 
     await engine.dispose()

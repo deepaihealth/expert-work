@@ -32,9 +32,13 @@ def test_cleanup_report_default_is_all_zero() -> None:
     assert report.artifacts_hard_deleted == 0
     assert report.memory_hard_deleted == 0
     assert report.workspaces_hard_deleted == 0
-    assert report.workspace_archives_removed == 0
-    assert report.workspace_archives_failed == 0
     assert report.workspaces_pending_archive == 0
+    assert report.artifact_versions_deleted == 0
+    assert report.artifact_files_removed == 0
+    assert report.artifacts_expired == 0
+    assert report.uploads_expired == 0
+    assert report.upload_files_removed == 0
+    assert report.thread_dirs_removed == 0
     assert report.tenant_users_hard_deleted == 0
     assert report.sandbox_egress_audit_deleted == 0
     assert report.duration_seconds == 0.0
@@ -452,134 +456,128 @@ async def test_sweep_tenant_users_noop_without_store() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Deletion hygiene PR1 (Task 7) — workspace archive hard-delete sweep
+# X-4 ② —— 已删工作区 90 天销账(行 + 从属行;不碰 OSS 归档对象)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_sweep_workspaces_removes_archive_key_and_hard_deletes_row() -> None:
-    """An archived row past retention gets its ObjectStore key removed and
-    the row physically deleted."""
-    store = InMemoryUserWorkspaceStore()
-    object_store = InMemoryObjectStore()
-    tenant = uuid4()
-    now = datetime.now(UTC)
+async def _archived_workspace(
+    store: InMemoryUserWorkspaceStore, *, tenant: object, user: object, days_ago: int
+) -> object:
+    ws = await store.resolve(tenant_id=tenant, user_id=user)  # type: ignore[arg-type]
+    await store.soft_delete(workspace_id=ws.id, now=datetime.now(UTC) - timedelta(days=days_ago))
+    await store.mark_archived(workspace_id=ws.id, archived_object_key=f"ws-archives/{ws.id}.tar.gz")
+    refreshed = await store.get(tenant_id=tenant, user_id=user)  # type: ignore[arg-type]
+    assert refreshed is not None
+    return refreshed
 
-    ws = await store.resolve(tenant_id=tenant, user_id=uuid4())
-    await store.soft_delete(workspace_id=ws.id, now=now - timedelta(days=100))
-    await store.mark_archived(workspace_id=ws.id, archived_object_key="ws-archives/x.tar.zst")
-    await object_store.put("ws-archives/x.tar.zst", b"ARCHIVE")
+
+@pytest.mark.asyncio
+async def test_sweep_workspaces_hard_deletes_row_and_dependents_without_touching_object_store() -> (
+    None
+):
+    """软删 + 已归档满 90 天:该用户的 artifact(+版本)/ user_upload 行连同工作区行
+    一起硬删;OSS 归档对象**不删**(桶生命周期);写一条 WORKSPACE_HARD_DELETE 审计。"""
+    from expert_work.persistence import InMemoryAuditLogStore, InMemoryUserUploadStore
+    from expert_work.protocol import AuditAction, AuditQuery
+    from expert_work.runtime.audit import (
+        AuditLogger,
+        DefaultSecretRedactor,
+        InMemoryAuditFallbackQueue,
+    )
+
+    store = InMemoryUserWorkspaceStore()
+    artifacts = InMemoryArtifactStore()
+    uploads = InMemoryUserUploadStore()
+    object_store = InMemoryObjectStore()
+    audit_store = InMemoryAuditLogStore()
+    tenant, user, other = uuid4(), uuid4(), uuid4()
+
+    ws = await _archived_workspace(store, tenant=tenant, user=user, days_ago=100)
+    await object_store.put(ws.archived_object_key, b"ARCHIVE")  # type: ignore[attr-defined]
+    for owner in (user, other):
+        await artifacts.save_version(
+            tenant_id=tenant,
+            user_id=owner,
+            name="r.md",
+            kind="document",
+            path_in_workspace="r.md",
+            created_in_thread="t",
+        )
+        await uploads.insert(
+            upload_id=uuid4(),
+            tenant_id=tenant,
+            user_id=owner,
+            thread_id=uuid4(),
+            kind="document",
+            ref="uploads/a.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="a.pdf",
+        )
 
     job = RetentionCleanupJob(
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         workspace_store=store,
+        artifact_store=artifacts,
+        user_upload_store=uploads,
         object_store=object_store,
         workspace_archive_retention_days=90,
+        audit_logger=AuditLogger(
+            store=audit_store,
+            redactor=DefaultSecretRedactor(),
+            fallback=InMemoryAuditFallbackQueue(),
+        ),
     )
-    hard, keys_ok, keys_failed, pending = await job._sweep_workspaces()
-    assert (hard, keys_ok, keys_failed, pending) == (1, 1, 0, 0)
-    assert await store.get(tenant_id=tenant, user_id=ws.user_id) is None
-    from expert_work.runtime.storage.base import ObjectNotFoundError
+    assert await job._sweep_workspaces() == (1, 0)
 
-    with pytest.raises(ObjectNotFoundError):
-        await object_store.get("ws-archives/x.tar.zst")
+    assert await store.get(tenant_id=tenant, user_id=user) is None
+    assert await artifacts.list_for_user(tenant_id=tenant, user_id=user, include_deleted=True) == []
+    assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=user) == 0
+    # The other user's rows are untouched (tenant AND user scoped cascade).
+    assert len(await artifacts.list_for_user(tenant_id=tenant, user_id=other)) == 1
+    assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=other) == 1
+    # The archive object is still there — bucket lifecycle owns it, not this job.
+    assert await object_store.get(ws.archived_object_key) == b"ARCHIVE"  # type: ignore[attr-defined]
+
+    page = await audit_store.query(AuditQuery(tenant_id=tenant))
+    rows = [r for r in page.entries if r.action is AuditAction.WORKSPACE_HARD_DELETE]
+    assert len(rows) == 1
+    assert rows[0].resource_type == "user_workspace"
+    assert rows[0].resource_id == str(ws.id)  # type: ignore[attr-defined]
+    assert rows[0].actor_id == "retention_cleanup_job"
+    assert rows[0].details["artifacts_deleted"] == 1
+    assert rows[0].details["uploads_deleted"] == 1
+    assert rows[0].details["archived_object_key"] == ws.archived_object_key  # type: ignore[attr-defined]
+
+    # Idempotent: a second sweep finds nothing and writes no second audit row.
+    assert await job._sweep_workspaces() == (0, 0)
+    page = await audit_store.query(AuditQuery(tenant_id=tenant))
+    assert len([r for r in page.entries if r.action is AuditAction.WORKSPACE_HARD_DELETE]) == 1
 
 
 @pytest.mark.asyncio
-async def test_sweep_workspaces_keeps_row_when_key_delete_fails() -> None:
-    """A real object-store failure keeps the row (it's the only lookup
-    back to the orphaned key) and is tallied as failed — the opposite
-    tradeoff from the image-upload pass."""
+async def test_sweep_workspaces_skips_recent_and_counts_pending_archive() -> None:
+    """软删不满 90 天的行不动;满 90 天但 janitor 还没归档的只计入 pending。"""
     store = InMemoryUserWorkspaceStore()
     tenant = uuid4()
-    now = datetime.now(UTC)
-    ws = await store.resolve(tenant_id=tenant, user_id=uuid4())
-    await store.soft_delete(workspace_id=ws.id, now=now - timedelta(days=100))
-    await store.mark_archived(workspace_id=ws.id, archived_object_key="ws-archives/y.tar.zst")
-
-    class _FailingStore:
-        async def delete(self, key: str) -> None:
-            raise RuntimeError("boom")
-
-        async def put(self, *args: object, **kwargs: object) -> None:
-            return None
-
-        async def get(self, key: str) -> bytes | None:
-            return None
-
-        async def list_prefix(self, prefix: str) -> list[str]:
-            return []
-
-    job = RetentionCleanupJob(
-        db_session_factory=lambda: None,  # type: ignore[arg-type]
-        workspace_store=store,
-        object_store=_FailingStore(),  # type: ignore[arg-type]
-        workspace_archive_retention_days=90,
-    )
-    hard, keys_ok, keys_failed, pending = await job._sweep_workspaces()
-    assert (hard, keys_ok, keys_failed, pending) == (0, 0, 1, 0)
-    # Row survives — it's the only remaining lookup back to the key.
-    assert await store.get(tenant_id=tenant, user_id=ws.user_id) is not None
-
-
-@pytest.mark.asyncio
-async def test_sweep_workspaces_treats_missing_key_as_success() -> None:
-    """The archive key is already gone from ObjectStore (e.g. a previous
-    sweep removed it but crashed before the row hard-delete committed).
-    ``ObjectStore.delete`` is idempotent for a missing key, so this reads
-    as success and the row is reaped."""
-    store = InMemoryUserWorkspaceStore()
-    object_store = InMemoryObjectStore()
-    tenant = uuid4()
-    now = datetime.now(UTC)
-    ws = await store.resolve(tenant_id=tenant, user_id=uuid4())
-    await store.soft_delete(workspace_id=ws.id, now=now - timedelta(days=100))
-    await store.mark_archived(workspace_id=ws.id, archived_object_key="ws-archives/gone.tar.zst")
-    # Deliberately never ``put`` the key — it's already absent.
-
-    job = RetentionCleanupJob(
-        db_session_factory=lambda: None,  # type: ignore[arg-type]
-        workspace_store=store,
-        object_store=object_store,
-        workspace_archive_retention_days=90,
-    )
-    hard, keys_ok, keys_failed, pending = await job._sweep_workspaces()
-    assert (hard, keys_ok, keys_failed, pending) == (1, 1, 0, 0)
-    assert await store.get(tenant_id=tenant, user_id=ws.user_id) is None
-
-
-@pytest.mark.asyncio
-async def test_sweep_workspaces_counts_pending_archive_without_deleting() -> None:
-    """A soft-deleted row whose J.15 archive job hasn't run yet
-    (``archived_object_key IS NULL``) is not a hard-delete candidate even
-    once its ``deleted_at`` is past the retention cutoff — it only shows
-    up in the ``pending_archive`` tally."""
-    store = InMemoryUserWorkspaceStore()
-    object_store = InMemoryObjectStore()
-    tenant = uuid4()
-    now = datetime.now(UTC)
+    recent = await _archived_workspace(store, tenant=tenant, user=uuid4(), days_ago=10)
     stuck = await store.resolve(tenant_id=tenant, user_id=uuid4())
-    await store.soft_delete(workspace_id=stuck.id, now=now - timedelta(days=100))
+    await store.soft_delete(workspace_id=stuck.id, now=datetime.now(UTC) - timedelta(days=100))
     # No mark_archived() call — the archive job hasn't run yet.
 
     job = RetentionCleanupJob(
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         workspace_store=store,
-        object_store=object_store,
         workspace_archive_retention_days=90,
     )
-    hard, keys_ok, keys_failed, pending = await job._sweep_workspaces()
-    assert (hard, keys_ok, keys_failed, pending) == (0, 0, 0, 1)
+    assert await job._sweep_workspaces() == (0, 1)
+    assert await store.get(tenant_id=tenant, user_id=recent.user_id) is not None  # type: ignore[attr-defined]
     assert await store.get(tenant_id=tenant, user_id=stuck.user_id) is not None
 
 
 @pytest.mark.asyncio
-async def test_sweep_workspaces_noop_without_object_store() -> None:
-    """Job constructed with a workspace store but no object store skips
-    the pass cleanly (the pass has its own object-store gate)."""
-    store = InMemoryUserWorkspaceStore()
+async def test_sweep_workspaces_noop_without_workspace_store() -> None:
     job = RetentionCleanupJob(
         db_session_factory=lambda: None,  # type: ignore[arg-type]
-        workspace_store=store,
     )
-    assert await job._sweep_workspaces() == (0, 0, 0, 0)
+    assert await job._sweep_workspaces() == (0, 0)

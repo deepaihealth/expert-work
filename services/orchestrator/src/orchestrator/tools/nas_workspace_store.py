@@ -152,6 +152,7 @@ import asyncio
 import errno
 import logging
 import os
+import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -812,6 +813,49 @@ class NasWorkspaceStore:
                 os.close(dfd)
 
         await asyncio.to_thread(_delete)
+
+    async def delete_tree(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
+        """留存链 B-27 —— ``rm -rf`` 用户工作区下的一个子目录(会话 purge 钩子删
+        ``threads/<thread_id>/`` 用)。
+
+        与 :meth:`delete_file` 同一套闸:先过 :func:`_normalize_workspace_path`
+        再判保留前缀,父链走 dir_fd;最后一段交给 ``shutil.rmtree(name,
+        dir_fd=...)``(3.11 起的 fd 版)—— 它先 ``lstat`` 再 ``openat``,``name``
+        本身是 symlink 时直接拒绝,这里翻成 :class:`SandboxSupervisorError`,
+        绝不顺着链接删到工作区外面。目标不存在同 ``rm -rf``,静默返回。
+        """
+
+        def _rmtree() -> None:
+            relpath, _parts = _normalize_workspace_path(path)
+            if is_reserved_workspace_path(relpath):
+                raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be deleted")
+            try:
+                dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=False)
+            except _WorkspacePathNotFoundError:
+                return  # rm -rf semantics — the parent chain doesn't exist, nothing to delete.
+            try:
+                try:
+                    shutil.rmtree(name, dir_fd=dfd)
+                except FileNotFoundError:
+                    pass  # rm -rf semantics — already gone.
+                except NotADirectoryError as exc:
+                    raise SandboxSupervisorError(
+                        f"workspace path is not a directory: {path!r}"
+                    ) from exc
+                except PermissionError as exc:
+                    raise WorkspacePermissionError(
+                        f"workspace directory not deletable: {path!r}"
+                    ) from exc
+                except OSError as exc:
+                    # 含 rmtree 对 symlink 的拒绝("Cannot call rmtree on a
+                    # symbolic link")—— 与 delete_file 同款,只留 strerror 不带路径。
+                    raise SandboxSupervisorError(
+                        f"workspace directory delete failed: {path!r}: {exc.strerror or exc}"
+                    ) from exc
+            finally:
+                os.close(dfd)
+
+        await asyncio.to_thread(_rmtree)
 
     async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
         """Soft-delete the workspace, then tear down any warm sandbox session.

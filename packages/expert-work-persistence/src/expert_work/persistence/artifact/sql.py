@@ -294,6 +294,61 @@ class SqlArtifactStore(ArtifactStore):
             )
         return [_row_to_version(row) for row in rows]
 
+    async def list_versions_expired(
+        self,
+        *,
+        before: datetime,
+        limit: int = 1000,
+    ) -> list[ArtifactVersion]:
+        stmt = (
+            select(ArtifactVersionRow)
+            .where(ArtifactVersionRow.created_at < before)
+            .order_by(ArtifactVersionRow.created_at.asc(), ArtifactVersionRow.id.asc())
+            .limit(limit)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_version(row) for row in rows]
+
+    async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:
+        stmt = (
+            select(ArtifactVersionRow)
+            .where(ArtifactVersionRow.artifact_id == artifact_id)
+            .order_by(ArtifactVersionRow.version.desc())
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_version(row) for row in rows]
+
+    async def delete_versions(self, *, version_ids: Sequence[UUID]) -> int:
+        if not version_ids:
+            return 0
+        async with self._sf() as session:
+            result = await session.execute(
+                delete(ArtifactVersionRow).where(ArtifactVersionRow.id.in_(list(version_ids)))
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
+
+    async def mark_expired_if_versionless(self, *, artifact_id: UUID, now: datetime) -> bool:
+        remaining = (
+            select(ArtifactVersionRow.id)
+            .where(ArtifactVersionRow.artifact_id == artifact_id)
+            .exists()
+        )
+        async with self._sf() as session:
+            result = await session.execute(
+                update(ArtifactRow)
+                .where(
+                    ArtifactRow.id == artifact_id,
+                    ArtifactRow.deleted_at.is_(None),
+                    ~remaining,
+                )
+                .values(deleted_at=now)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
     async def hard_delete(self, *, artifact_ids: Sequence[UUID]) -> int:
         if not artifact_ids:
             return 0

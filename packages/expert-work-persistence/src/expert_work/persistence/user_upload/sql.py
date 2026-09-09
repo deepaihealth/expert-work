@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import UserUploadRow
@@ -79,6 +79,31 @@ class SqlUserUploadStore(UserUploadStore):
                 )
             ).scalar_one_or_none()
         return _row_to_dto(row) if row is not None else None
+
+    async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
+        stmt = (
+            select(UserUploadRow)
+            .where(UserUploadRow.deleted_at.is_(None), UserUploadRow.created_at < before)
+            .order_by(UserUploadRow.created_at.asc(), UserUploadRow.id.asc())
+            .limit(limit)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_dto(row) for row in rows]
+
+    async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(UserUploadRow)
+                .where(
+                    UserUploadRow.id == upload_id,
+                    UserUploadRow.tenant_id == tenant_id,
+                    UserUploadRow.deleted_at.is_(None),
+                )
+                .values(deleted_at=now)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         async with self._sf() as session:

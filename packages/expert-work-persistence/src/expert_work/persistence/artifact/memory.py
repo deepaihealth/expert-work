@@ -223,6 +223,36 @@ class InMemoryArtifactStore(ArtifactStore):
         rows.sort(key=lambda v: v.version, reverse=True)
         return rows
 
+    async def list_versions_expired(
+        self,
+        *,
+        before: datetime,
+        limit: int = 1000,
+    ) -> list[ArtifactVersion]:
+        rows = [v for v in self._versions if v.created_at is not None and v.created_at < before]
+        rows.sort(key=lambda v: (v.created_at or _MIN_AWARE, str(v.id)))
+        return rows[:limit]
+
+    async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:
+        rows = [v for v in self._versions if v.artifact_id == artifact_id]
+        rows.sort(key=lambda v: v.version, reverse=True)
+        return rows
+
+    async def delete_versions(self, *, version_ids: Sequence[UUID]) -> int:
+        ids = set(version_ids)
+        before = len(self._versions)
+        self._versions = [v for v in self._versions if v.id not in ids]
+        return before - len(self._versions)
+
+    async def mark_expired_if_versionless(self, *, artifact_id: UUID, now: datetime) -> bool:
+        artifact = self._artifacts.get(artifact_id)
+        if artifact is None or artifact.deleted_at is not None:
+            return False
+        if any(v.artifact_id == artifact_id for v in self._versions):
+            return False
+        self._artifacts[artifact_id] = artifact.model_copy(update={"deleted_at": now})
+        return True
+
     async def hard_delete(self, *, artifact_ids: Sequence[UUID]) -> int:
         ids = set(artifact_ids)
         removed = 0

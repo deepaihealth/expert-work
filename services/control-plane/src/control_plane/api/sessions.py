@@ -68,6 +68,7 @@ from expert_work.protocol import (
     ThreadStatus,
 )
 from expert_work.runtime.audit.logger import AuditLogger
+from orchestrator.context.workspace_projection import thread_projection_prefix
 from orchestrator.tools import (
     SandboxSupervisorError,
     WorkspaceFileTooLargeError,
@@ -934,21 +935,29 @@ def build_sessions_router() -> APIRouter:
         runtime: Annotated[AgentRuntime, Depends(_get_agent_runtime)],
         approvals: Annotated[ApprovalStore, Depends(_get_approval_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
     ) -> JSONResponse:
         """Hard-delete — irreversibly purge the whole conversation.
 
         Removes ONLY thread-scoped data (checkpoint messages, run rows +
-        their run_event children, agent_approval rows, the thread_meta row).
-        The user's persistent workspace + artifacts are keyed by ``user_id``
-        and SHARED across that user's other threads, so they are
+        their run_event children, agent_approval rows, the thread_meta row,
+        and — 留存链 B-27 — the thread's own ``threads/<thread_id>/``
+        projection directory in the user's workspace). The user's persistent
+        workspace + artifacts are keyed by ``user_id`` and SHARED across that
+        user's other threads, so everything else in the workspace is
         intentionally left untouched. Best-effort: a failed step is logged
         AND flagged in the audit details (``*_delete_failed``), not fatal,
         and the thread_meta row is deleted LAST so a partial failure never
         orphans the metadata.
         """
-        await _load_owned_session(thread_id, request, threads, users)
+        meta = await _load_owned_session(thread_id, request, threads, users)
         tenant_id: UUID = request.state.tenant_id
-        deleted: dict[str, object] = {"checkpoint": False, "runs": 0, "approvals": 0}
+        deleted: dict[str, object] = {
+            "checkpoint": False,
+            "runs": 0,
+            "approvals": 0,
+            "threads_dir": False,
+        }
 
         checkpointer = runtime.durable_checkpointer
         adelete = getattr(checkpointer, "adelete_thread", None)
@@ -974,6 +983,24 @@ def build_sessions_router() -> APIRouter:
             deleted["approvals_delete_failed"] = True
 
         removed = await threads.delete(thread_id, tenant_id=tenant_id)
+        # 留存链 B-27 —— the thread's projected-state directory
+        # (``threads/<thread_id>/``: MEMORY.md / PLAN.md / TODO.md) goes with the
+        # thread. After the row delete on purpose: once the row is gone the
+        # retention job's daily orphan scan (thread row missing → dir removed)
+        # is the backstop for a failure here, so a partial purge can never
+        # strand the directory. No ``user_id`` (pre-J.14 thread) → no
+        # workspace to clean.
+        if meta.user_id is not None and workspace_store is not None:
+            try:
+                await workspace_store.delete_tree(
+                    tenant_id=tenant_id,
+                    user_id=meta.user_id,
+                    path=thread_projection_prefix(thread_id).rstrip("/"),
+                )
+                deleted["threads_dir"] = True
+            except Exception:
+                logger.warning("session_purge.threads_dir_failed", exc_info=True)
+                deleted["threads_dir_delete_failed"] = True
         await emit(
             audit,
             tenant_id=tenant_id,

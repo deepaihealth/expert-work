@@ -73,6 +73,18 @@ class RetentionCleanupSettings(BaseSettings):
     # ``backup_acked`` 之类的前置闸。
     sandbox_egress_audit_retention_days: int = Field(default=90, ge=1, le=3650)
 
+    # --------------------------------------------------- 留存链 PR2(波 3 线 R)
+    # 用户拍板(2026-09-09):产物 90 天、上传 90 天、已删工作区库行 90 天销账。
+    # 产物版本复用上面的 ``artifact_retention_days``,已删工作区复用
+    # ``workspace_archive_retention_days``;上传是新旋钮。三个都是 job 级默认,
+    # test / prod overlay 不另设。
+    upload_retention_days: int = Field(default=90, ge=1, le=3650)
+    # NAS 工作区根 —— 与 control-plane 的 EXPERT_WORK_WORKSPACE_NAS_ROOT 同一个挂载
+    # 点(CronJob 挂同一个 PVC)。``None`` → 三条碰文件的规则(产物版本 / 上传文件 /
+    # 孤儿 threads 目录)整体跳过并打 warning:只删行不删文件会留下永远没人认领
+    # 的字节,所以没有「半开」这一档。
+    workspace_root: str | None = None
+
     # Object-store backend that owns the uploaded image bytes. ``memory``
     # (default) skips the image pass — useful for unit-tested local cron
     # ticks and for envs that haven't deployed J.6 yet. ``s3-compatible``

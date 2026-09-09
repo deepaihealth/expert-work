@@ -521,3 +521,221 @@ async def test_run_once_idempotent_on_empty_state(
     finally:
         await app_engine.dispose()
         await worker_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 留存链 PR2 —— 三条工作区规则 + X-4 ② 走真 Postgres(SQL store + audit_writer)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_rules_end_to_end_against_postgres(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str], tmp_path: Path
+) -> None:
+    """SQL 版 store + main.py 同款 RLS session factory + SqlAuditLogStore(append 时
+    SET LOCAL ROLE audit_writer)—— 单测里在内存 store 上验过的规则,这里证明
+    真库路径也通:版本行 / 上传行 / 工作区行按谓词删,审计行真落到 audit_log。
+    """
+    from expert_work.persistence import (
+        SqlArtifactStore,
+        SqlThreadMetaStore,
+        SqlUserUploadStore,
+        SqlUserWorkspaceStore,
+    )
+    from expert_work.runtime.audit import (
+        AuditLogger,
+        DefaultSecretRedactor,
+        InMemoryAuditFallbackQueue,
+    )
+    from retention_cleanup_job.main import build_session_factory
+
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        artifacts = SqlArtifactStore(sf)
+        uploads = SqlUserUploadStore(sf)
+        threads = SqlThreadMetaStore(sf)
+        workspaces = SqlUserWorkspaceStore(sf)
+        tenant, user, purged_user = uuid4(), uuid4(), uuid4()
+        root = tmp_path
+
+        def _write(owner: UUID, rel: str) -> Path:
+            target = root / str(tenant) / str(owner) / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"x")
+            return target
+
+        # ---- artifacts: old version (goes) + fresh version (stays) ----------
+        old_v = await artifacts.save_version(
+            tenant_id=tenant,
+            user_id=user,
+            name="report.pptx",
+            kind="document",
+            path_in_workspace="report.pptx",
+            created_in_thread="t",
+        )
+        fresh_v = await artifacts.save_version(
+            tenant_id=tenant,
+            user_id=user,
+            name="plan.json",
+            kind="data",
+            path_in_workspace="plan.json",
+            created_in_thread="t",
+        )
+        old_file = _write(user, "report.pptx")
+        fresh_file = _write(user, "plan.json")
+        style = _write(user, "style/rules.md")
+        memory_md = _write(user, "MEMORY.md")
+
+        # ---- uploads: old (goes) + fresh (stays) ----------------------------
+        old_upload = await uploads.insert(
+            upload_id=uuid4(),
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=uuid4(),
+            kind="document",
+            ref="uploads/old.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="old.pdf",
+        )
+        fresh_upload = await uploads.insert(
+            upload_id=uuid4(),
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=uuid4(),
+            kind="document",
+            ref="uploads/new.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="new.pdf",
+        )
+        old_upload_file = _write(user, "uploads/old.pdf")
+        fresh_upload_file = _write(user, "uploads/new.pdf")
+
+        # ---- threads: live row (dir stays) + orphan dir (goes) --------------
+        live_thread, orphan_thread = uuid4(), uuid4()
+        await threads.create(thread_id=live_thread, tenant_id=tenant, created_by="u", user_id=user)
+        live_dir = _write(user, f"threads/{live_thread}/MEMORY.md").parent
+        orphan_dir = _write(user, f"threads/{orphan_thread}/MEMORY.md").parent
+
+        # ---- a purged user's workspace: soft-deleted + archived 100d ago -----
+        ws = await workspaces.resolve(tenant_id=tenant, user_id=purged_user)
+        await workspaces.soft_delete(
+            workspace_id=ws.id, now=datetime.now(tz=UTC) - timedelta(days=100)
+        )
+        await workspaces.mark_archived(workspace_id=ws.id, archived_object_key="ws/x.tar.gz")
+        await artifacts.save_version(
+            tenant_id=tenant,
+            user_id=purged_user,
+            name="left.md",
+            kind="document",
+            path_in_workspace="left.md",
+            created_in_thread="t",
+        )
+
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE artifact_version SET created_at = now() - interval '100 days' "
+                        "WHERE id = :v"
+                    ),
+                    {"v": old_v.id},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE user_upload SET created_at = now() - interval '100 days' "
+                        "WHERE id = :u"
+                    ),
+                    {"u": old_upload.id},
+                )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            batch_size=10000,
+            artifact_store=artifacts,
+            user_upload_store=uploads,
+            thread_store=threads,
+            workspace_store=workspaces,
+            workspace_root=str(root),
+            audit_logger=AuditLogger(
+                store=SqlAuditLogStore(sf),
+                redactor=DefaultSecretRedactor(),
+                fallback=InMemoryAuditFallbackQueue(),
+            ),
+        )
+        report = await job.run_once()
+
+        # Files: exactly the three registered shapes went; everything else stayed.
+        assert not old_file.exists()
+        assert not old_upload_file.exists()
+        assert not orphan_dir.exists()
+        assert fresh_file.exists()
+        assert fresh_upload_file.exists()
+        assert style.exists() and memory_md.exists()
+        assert (live_dir / "MEMORY.md").exists()
+
+        # Rows.
+        assert await artifacts.list_versions_by_artifact(artifact_id=old_v.artifact_id) == []
+        kept = await artifacts.list_versions_by_artifact(artifact_id=fresh_v.artifact_id)
+        assert [v.id for v in kept] == [fresh_v.id]
+        by_name = {
+            a.name: a
+            for a in await artifacts.list_for_user(
+                tenant_id=tenant, user_id=user, include_deleted=True
+            )
+        }
+        assert by_name["report.pptx"].deleted_at is not None
+        assert by_name["plan.json"].deleted_at is None
+        old_row = await uploads.get(upload_id=old_upload.id, tenant_id=tenant)
+        fresh_row = await uploads.get(upload_id=fresh_upload.id, tenant_id=tenant)
+        assert old_row is not None and old_row.deleted_at is not None
+        assert fresh_row is not None and fresh_row.deleted_at is None
+        assert await workspaces.get(tenant_id=tenant, user_id=purged_user) is None
+        assert (
+            await artifacts.list_for_user(
+                tenant_id=tenant, user_id=purged_user, include_deleted=True
+            )
+            == []
+        )
+        assert report.thread_dirs_removed >= 1
+        assert report.workspaces_hard_deleted >= 1
+
+        # Audit rows really landed in audit_log (SET LOCAL ROLE audit_writer path).
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT action, resource_type, resource_id, actor_id FROM audit_log "
+                        "WHERE tenant_id = :t ORDER BY id"
+                    ),
+                    {"t": str(tenant)},
+                ).all()
+        finally:
+            admin.dispose()
+        actions = {(r[0], r[1], r[2]) for r in rows}
+        assert ("artifact:expired", "artifact", str(old_v.artifact_id)) in actions
+        assert ("workspace:hard_delete", "user_workspace", str(ws.id)) in actions
+        assert {r[3] for r in rows} == {"retention_cleanup_job"}
+
+        # Idempotent: the second run finds nothing for this tenant.
+        second = await job.run_once()
+        assert second.thread_dirs_removed == 0
+        assert fresh_file.exists() and style.exists()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                count = conn.execute(
+                    text("SELECT count(*) FROM audit_log WHERE tenant_id = :t"),
+                    {"t": str(tenant)},
+                ).scalar_one()
+        finally:
+            admin.dispose()
+        assert count == len(rows)
+    finally:
+        await worker_engine.dispose()

@@ -185,3 +185,59 @@ async def test_migration_downgrade_then_upgrade(postgres_container: PostgresCont
     command.upgrade(cfg, "head")
     command.downgrade(cfg, "-1")
     command.upgrade(cfg, "head")
+
+
+@pytest.mark.asyncio
+async def test_list_expired_and_soft_delete(sql_store: SqlStoreFixture) -> None:
+    """留存链 —— 上传 90 天:list_expired 跨租户按 created_at 取活着的行;soft_delete
+    只翻活着的行,tenant 不对不翻。"""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import text
+
+    store, engine = sql_store
+    try:
+        tenant, other = uuid4(), uuid4()
+
+        async def _seed(*, tenant_id: UUID, age_days: int) -> UUID:
+            uid = uuid4()
+            await store.insert(
+                upload_id=uid,
+                tenant_id=tenant_id,
+                user_id=uuid4(),
+                thread_id=uuid4(),
+                kind="document",
+                ref="uploads/f.pdf",
+                mime_type="application/pdf",
+                size_bytes=1,
+                filename="f.pdf",
+            )
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE user_upload SET created_at = now() - make_interval(days => :d) "
+                        "WHERE id = :i"
+                    ),
+                    {"d": age_days, "i": uid},
+                )
+            return uid
+
+        old = await _seed(tenant_id=tenant, age_days=120)
+        older = await _seed(tenant_id=other, age_days=200)
+        fresh = await _seed(tenant_id=tenant, age_days=1)
+        cutoff = datetime.now(UTC) - timedelta(days=90)
+
+        expired = await store.list_expired(before=cutoff)
+        assert [r.id for r in expired if r.id in {old, older, fresh}] == [older, old]
+
+        now = datetime.now(UTC)
+        assert await store.soft_delete(upload_id=old, tenant_id=other, now=now) is False
+        assert await store.soft_delete(upload_id=old, tenant_id=tenant, now=now) is True
+        assert await store.soft_delete(upload_id=old, tenant_id=tenant, now=now) is False
+        row = await store.get(upload_id=old, tenant_id=tenant)
+        assert row is not None and row.deleted_at is not None
+        assert old not in {r.id for r in await store.list_expired(before=cutoff)}
+        fresh_row = await store.get(upload_id=fresh, tenant_id=tenant)
+        assert fresh_row is not None and fresh_row.deleted_at is None
+    finally:
+        await engine.dispose()

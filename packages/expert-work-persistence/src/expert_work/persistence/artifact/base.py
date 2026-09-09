@@ -179,12 +179,57 @@ class ArtifactStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def list_versions_expired(
+        self,
+        *,
+        before: datetime,
+        limit: int = 1000,
+    ) -> list[ArtifactVersion]:
+        """留存链 B-28 —— 跨租户列出 ``created_at < before`` 的版本行,最老在前。
+
+        Caller MUST be inside an RLS bypass scope (the retention job's
+        ``_bypass_rls``). 按版本而不是按逻辑产物判:同名产物有多个版本时,
+        老版本先到期、新版本留着。父 ``artifact`` 行是否软删不影响 —— 版本
+        行到期就是到期。
+        """
+
+    @abc.abstractmethod
+    async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:
+        """One artifact's every version row, newest first — **regardless of the
+        parent row's ``deleted_at``**. :meth:`list_versions` hides soft-deleted
+        parents (API 404 semantics); the retention sweep needs the paths of a
+        soft-deleted artifact's versions to unlink the files before
+        :meth:`hard_delete` drops the rows. Caller MUST be inside an RLS
+        bypass scope. ``[]`` when the artifact is unknown."""
+
+    @abc.abstractmethod
+    async def delete_versions(self, *, version_ids: Sequence[UUID]) -> int:
+        """留存链 B-28 —— 按 id 删版本行,返回删掉的行数。
+
+        Only the version rows: the parent ``artifact`` row and its
+        ``latest_version`` are left alone (see
+        :meth:`mark_expired_if_versionless` for the parent's fate). Caller
+        has already unlinked the workspace files. Idempotent — unknown ids
+        are skipped."""
+
+    @abc.abstractmethod
+    async def mark_expired_if_versionless(self, *, artifact_id: UUID, now: datetime) -> bool:
+        """留存链 B-28 —— 一个逻辑产物的版本全部清完后,把行标成过期。
+
+        Sets ``deleted_at = now`` on an **active** row that has no version
+        rows left; returns ``True`` on that transition. ``False`` when the
+        row still has versions, is already soft-deleted, or is unknown.
+        Reuses the J-25 soft-delete state on purpose: the row then follows
+        the existing hard-delete grace path, and a re-save on the name
+        un-deletes it exactly like a user-initiated soft delete."""
+
+    @abc.abstractmethod
     async def hard_delete(self, *, artifact_ids: Sequence[UUID]) -> int:
         """Remove the named artifact rows + their version rows.
 
-        Caller has already cleared the workspace files via the
-        supervisor (or accepted that an orphaned file is a smaller
-        problem than a stuck row — see :class:`RetentionCleanupJob`).
+        Caller has already cleared the workspace files (the retention
+        job unlinks every remaining version's file first, via
+        :meth:`list_versions_by_artifact`).
         Returns the count of ``artifact`` rows actually deleted.
         Cascades deletion of the corresponding ``artifact_version`` rows.
         """

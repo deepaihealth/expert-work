@@ -73,11 +73,21 @@ spec:
                       key: EXPERT_WORK_DB_DSN
                 - name: EXPERT_WORK_RETENTION_LOG_LEVEL
                   value: "INFO"
+                # 留存链 PR2 —— 三条碰文件的规则(产物版本 / 上传文件 / 孤儿
+                # threads 目录)要摸 NAS 工作区:与 control-plane 同一个 PVC、
+                # 同一个挂载点(configmap 的 EXPERT_WORK_WORKSPACE_NAS_ROOT)。
+                # 不设这个键 → 那三条规则整体跳过(settings.py 说明了为什么没有
+                # 「只删行不删文件」这一档)。
+                - name: EXPERT_WORK_RETENTION_WORKSPACE_ROOT
+                  value: "/mnt/workspaces"
               envFrom:
                 - configMapRef:
                     name: control-plane-config
                 - secretRef:
                     name: control-plane-secrets
+              volumeMounts:
+                - name: workspace-nas
+                  mountPath: /mnt/workspaces
               resources:
                 requests:
                   cpu: 100m
@@ -85,3 +95,11 @@ spec:
                 limits:
                   cpu: 500m
                   memory: 1Gi
+          # 与 control-plane/deployment.yaml 同一个 PVC(base/control-plane/
+          # workspace-nas.yaml);ReadWriteMany,多消费者是 W2 PoC 验证过的形态。
+          # 镜像里的服务账号 uid 10000 与沙箱侧同 uid(W2 BUG-1),删得动 agent
+          # 写的文件。
+          volumes:
+            - name: workspace-nas
+              persistentVolumeClaim:
+                claimName: workspace-nas
