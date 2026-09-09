@@ -346,6 +346,22 @@ class DbFeedbackStore(FeedbackStore):
     async def upsert(self, record: FeedbackRecord) -> tuple[FeedbackRecord, bool]:
         if record.run_id is None:
             raise ValueError("upsert requires run_id")
+        return await self._upsert_once(record, retry=True)
+
+    async def _upsert_once(
+        self, record: FeedbackRecord, *, retry: bool
+    ) -> tuple[FeedbackRecord, bool]:
+        """One SELECT-then-INSERT/UPDATE attempt; ``retry`` allows exactly one more.
+
+        Bounded on purpose. The INSERT branch loses a race only when a
+        concurrent writer inserted the same ``(tenant, run, actor)`` first, and
+        the retry then finds that row and takes the UPDATE branch — so one
+        extra attempt is all the race needs. Retrying without a bound would
+        turn an interleaved purge (DELETE between our SELECT and our INSERT)
+        into unbounded recursion: each attempt would keep finding no row,
+        keep inserting, and keep losing to the next writer. The second
+        ``IntegrityError`` propagates instead.
+        """
         async with self._sf() as session:
             existing_id = (
                 await session.execute(
@@ -395,7 +411,9 @@ class DbFeedbackStore(FeedbackStore):
                 # Lost a concurrent-insert race on ``feedback_run_actor_uniq`` —
                 # the row exists now, so the retry takes the UPDATE branch.
                 await session.rollback()
-                return await self.upsert(record)
+                if not retry:
+                    raise
+                return await self._upsert_once(record, retry=False)
             await session.refresh(row)
             stored = _row_to_record(row)
             await session.commit()
