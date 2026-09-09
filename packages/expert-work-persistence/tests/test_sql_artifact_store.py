@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -487,5 +487,53 @@ async def test_version_retention_methods_round_trip(sql_store: SqlStoreFixture) 
         await store.soft_delete(tenant_id=tenant_a, user_id=user_a, name="a.md", now=now)
         still = await store.list_versions_by_artifact(artifact_id=artifact_a)
         assert [x.version for x in still] == [3]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_versions_expired_orders_same_timestamp_by_version(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """CI 复盘:同一 ``created_at`` 的版本此前按 ``id``(uuid4)tiebreak,同一产物
+    v1 / v2 谁先谁后是随机的(三跑两红)。ids 故意改成与 version 反序,
+    ``version`` tiebreak 不在就必红。"""
+    store, engine = sql_store
+    try:
+        tenant_id, user_id = uuid4(), uuid4()
+        ids: list[UUID] = []
+        for path in ("t.v1", "t.v2", "t.v3"):
+            v = await store.save_version(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                name="tie.md",
+                kind="document",
+                path_in_workspace=path,
+                created_in_thread="t",
+            )
+            ids.append(v.id)
+        artifact_id = v.artifact_id
+        # Same timestamp for all three, and ids that sort in REVERSE version order.
+        reversed_ids = [
+            UUID("ffffffff-0000-4000-8000-000000000001"),
+            UUID("88888888-0000-4000-8000-000000000002"),
+            UUID("00000000-0000-4000-8000-000000000003"),
+        ]
+        async with engine.begin() as conn:
+            for old_id, new_id in zip(ids, reversed_ids, strict=True):
+                await conn.execute(
+                    text(
+                        "UPDATE artifact_version SET id = :new, "
+                        "created_at = now() - interval '100 days' WHERE id = :old"
+                    ),
+                    {"new": new_id, "old": old_id},
+                )
+        cutoff = datetime.now(UTC) - timedelta(days=90)
+        expired = [
+            (x.artifact_id, x.version)
+            for x in await store.list_versions_expired(before=cutoff)
+            if x.artifact_id == artifact_id
+        ]
+        assert expired == [(artifact_id, 1), (artifact_id, 2), (artifact_id, 3)]
     finally:
         await engine.dispose()

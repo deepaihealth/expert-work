@@ -16,6 +16,8 @@ The test app role is granted both ``audit_writer`` (for seeding) and
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -618,6 +620,10 @@ async def test_workspace_rules_end_to_end_against_postgres(
         await threads.create(thread_id=live_thread, tenant_id=tenant, created_by="u", user_id=user)
         live_dir = _write(user, f"threads/{live_thread}/MEMORY.md").parent
         orphan_dir = _write(user, f"threads/{orphan_thread}/MEMORY.md").parent
+        # Past the 24h orphan grace (dir + entry); the live dir stays fresh.
+        stale = time.time() - 25 * 3600
+        for p in (orphan_dir, *orphan_dir.iterdir()):
+            os.utime(p, (stale, stale))
 
         # ---- a purged user's workspace: soft-deleted + archived 100d ago -----
         ws = await workspaces.resolve(tenant_id=tenant, user_id=purged_user)

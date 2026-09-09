@@ -16,6 +16,8 @@ threads 子目录、已软删用户的整棵树)永不触碰。
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -234,6 +236,12 @@ async def world(tmp_path: Path) -> Iterator[_World]:
         _write(root, t, u, f"threads/{tid}/MEMORY.md")
         _write(root, t, u, f"threads/{tid}/PLAN.md")
     _write(root, t, u, "threads/not-a-uuid/x.md")
+    # The orphan is past the 24h grace (dir + every entry); the live thread's
+    # dir is left fresh on purpose — age must never be what decides it.
+    orphan_dir = root / str(t) / str(u) / "threads" / str(w.orphan_thread)
+    stale = time.time() - 25 * 3600
+    for p in (orphan_dir, *orphan_dir.iterdir()):
+        os.utime(p, (stale, stale))
 
     # ---- everything else at the root: must survive untouched -------------
     for rel in (
@@ -332,6 +340,11 @@ async def test_run_once_touches_only_the_three_registered_shapes(world: _World) 
     summary_row = next(r for r in expired_rows if r.resource_id == str(w.ids["summary"]))
     assert summary_row.details["versions_deleted"] == [1]
     assert summary_row.details["artifact_expired"] is False
+    assert summary_row.details["reason"] == "versions_remaining"
+    assert summary_row.details["versions_remaining"] == 1
+    report_row = next(r for r in expired_rows if r.resource_id == str(w.ids["report"]))
+    assert report_row.details["artifact_expired"] is True
+    assert "reason" not in report_row.details
     assert all(r.actor_id == "retention_cleanup_job" for r in expired_rows)
 
 
@@ -409,9 +422,6 @@ async def test_orphan_scan_never_deletes_a_live_thread_dir_by_age(world: _World)
     """The live thread's directory is 'old' in every sense the filesystem can
     express, and still survives: the only criterion is the thread row."""
     w = world
-    import os
-    import time
-
     live_dir = w.root / str(w.tenant) / str(w.user) / "threads" / str(w.live_thread)
     ancient = time.time() - 365 * 86400
     for p in (live_dir, *live_dir.iterdir()):
@@ -440,3 +450,45 @@ async def test_soft_deleted_artifact_files_are_unlinked_before_hard_delete(world
     assert report.artifacts_hard_deleted == 1
     assert not target.exists()
     assert await w.artifacts.list_versions_by_artifact(artifact_id=w.ids["plan"]) == []
+
+
+# ------------------------------------------------ 审查补:孤儿目录 24h 宽限
+
+
+@pytest.mark.asyncio
+async def test_fresh_orphan_thread_dir_survives_the_grace_window(world: _World) -> None:
+    """thread 行不存在、但目录 1 分钟前才写的 → 不删(宽限 24h);25h 的才删。
+    行提交与首次写目录之间没有同一事务的保证,宽限是对「刚写完还没来得及
+    看到行」这类顺序问题的兜底。"""
+    w = world
+    fresh_orphan = uuid4()
+    fresh_dir = w.root / str(w.tenant) / str(w.user) / "threads" / str(fresh_orphan)
+    fresh_dir.mkdir(parents=True)
+    (fresh_dir / "MEMORY.md").write_bytes(b"m")
+    minute_ago = time.time() - 60
+    os.utime(fresh_dir, (minute_ago, minute_ago))
+    os.utime(fresh_dir / "MEMORY.md", (minute_ago, minute_ago))
+
+    report = await w.job().run_once()
+
+    assert (fresh_dir / "MEMORY.md").exists()
+    # The fixture's 25h-old orphan still goes.
+    old_dir = w.root / str(w.tenant) / str(w.user) / "threads" / str(w.orphan_thread)
+    assert not old_dir.exists()
+    assert report.thread_dirs_removed == 1
+
+
+@pytest.mark.asyncio
+async def test_old_orphan_dir_with_one_fresh_file_is_kept(world: _World) -> None:
+    """目录本身很老、但里面有个文件刚被写(投影在 purge 之后落地的竞态形态)→
+    以最新的那个 mtime 为准,仍在宽限内,不删。"""
+    w = world
+    old_dir = w.root / str(w.tenant) / str(w.user) / "threads" / str(w.orphan_thread)
+    (old_dir / "TODO.md").write_bytes(b"t")  # fresh entry; dir + others are 25h old
+    now = time.time()
+    os.utime(old_dir, (now - 25 * 3600, now - 25 * 3600))
+
+    report = await w.job().run_once()
+
+    assert (old_dir / "TODO.md").exists()
+    assert report.thread_dirs_removed == 0

@@ -30,6 +30,7 @@ from retention_cleanup_job.workspace_files import (
     remove_thread_dir,
     unlink_registered_file,
     user_root,
+    validate_workspace_root,
 )
 
 # ---------------------------------------------------------------------- parity
@@ -172,3 +173,95 @@ def test_iter_thread_dirs_only_uuid_shaped_and_skips_soft_deleted_users(tmp_path
 def test_iter_thread_dirs_missing_root_is_empty(tmp_path: Path) -> None:
     assert list(iter_thread_dirs(str(tmp_path / "nope"))) == []
     assert os.path.exists(tmp_path)
+
+
+# ------------------------------------------------ 审查补:中间层 symlink + 根校验
+
+
+@pytest.mark.parametrize("which", ["tenant", "user"])
+def test_unlink_refuses_escape_through_symlinked_tenant_or_user_dir(
+    tmp_path: Path, which: str
+) -> None:
+    """tenant 或 user 目录本身是指向工作区外的 symlink:登记路径在词法上仍在
+    ``{root}/{tenant}/{user}`` 下,但真实落点在外面 —— 必须拒绝。"""
+    tenant, user = uuid4(), uuid4()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.txt").write_bytes(b"secret")
+    if which == "tenant":
+        (tmp_path / str(tenant)).symlink_to(outside)
+        (outside / str(user)).mkdir()
+        (outside / str(user) / "victim.txt").write_bytes(b"secret")
+        target = outside / str(user) / "victim.txt"
+    else:
+        (tmp_path / str(tenant)).mkdir()
+        (tmp_path / str(tenant) / str(user)).symlink_to(outside)
+        target = outside / "victim.txt"
+
+    with pytest.raises(UnsafeWorkspacePathError):
+        unlink_registered_file(str(tmp_path), tenant, user, "victim.txt")
+    assert target.read_bytes() == b"secret"
+
+
+def test_remove_thread_dir_refuses_symlinked_user_dir(tmp_path: Path) -> None:
+    tenant, user, tid = uuid4(), uuid4(), uuid4()
+    outside = tmp_path / "outside"
+    (outside / "threads" / str(tid)).mkdir(parents=True)
+    (outside / "threads" / str(tid) / "MEMORY.md").write_bytes(b"secret")
+    (tmp_path / str(tenant)).mkdir()
+    (tmp_path / str(tenant) / str(user)).symlink_to(outside)
+
+    with pytest.raises(UnsafeWorkspacePathError):
+        remove_thread_dir(str(tmp_path), tenant, user, tid)
+    assert (outside / "threads" / str(tid) / "MEMORY.md").exists()
+
+
+def test_iter_thread_dirs_skips_symlinked_tenant_and_user_dirs(tmp_path: Path) -> None:
+    tenant, user, tid = uuid4(), uuid4(), uuid4()
+    outside = tmp_path / "outside"
+    (outside / str(user) / "threads" / str(tid)).mkdir(parents=True)
+    (tmp_path / str(tenant)).symlink_to(outside)
+
+    assert list(iter_thread_dirs(str(tmp_path))) == []
+
+
+def test_iter_thread_dirs_reports_newest_mtime_of_dir_and_direct_entries(tmp_path: Path) -> None:
+    import time
+
+    tenant, user, tid = uuid4(), uuid4(), uuid4()
+    memory = _seed(tmp_path, tenant, user, f"threads/{tid}/MEMORY.md")
+    old = time.time() - 30 * 86400
+    os.utime(memory.parent, (old, old))
+    os.utime(memory, (old, old))
+    (found,) = iter_thread_dirs(str(tmp_path))
+    assert abs(found.newest_mtime - old) < 2
+
+    # A file inside touched later than the dir itself bumps the reading.
+    fresh = time.time() - 60
+    os.utime(memory, (fresh, fresh))
+    (found,) = iter_thread_dirs(str(tmp_path))
+    assert abs(found.newest_mtime - fresh) < 2
+
+
+def test_validate_workspace_root_accepts_a_real_directory(tmp_path: Path) -> None:
+    assert validate_workspace_root(str(tmp_path)) == tmp_path.resolve()
+
+
+@pytest.mark.parametrize("shape", ["missing", "file", "symlink"])
+def test_validate_workspace_root_rejects_missing_file_and_symlink(
+    tmp_path: Path, shape: str
+) -> None:
+    """NAS 没挂上(目录不存在)最危险:每个登记文件都会「看起来不在」,行被删、
+    字节永远留在没挂上的卷里。文件 / symlink 同样拒绝。"""
+    if shape == "missing":
+        root = tmp_path / "nope"
+    elif shape == "file":
+        root = tmp_path / "afile"
+        root.write_bytes(b"x")
+    else:
+        real = tmp_path / "real"
+        real.mkdir()
+        root = tmp_path / "link"
+        root.symlink_to(real)
+    with pytest.raises(ValueError, match="workspace_root"):
+        validate_workspace_root(str(root))

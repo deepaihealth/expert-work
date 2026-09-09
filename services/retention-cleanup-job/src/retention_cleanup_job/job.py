@@ -66,12 +66,10 @@ from expert_work.protocol import (
 )
 from expert_work.runtime.audit import AuditLogger
 from expert_work.runtime.storage import ObjectStore
+from retention_cleanup_job.orphan_threads import sweep_orphan_thread_dirs
 from retention_cleanup_job.report import CleanupReport
 from retention_cleanup_job.workspace_files import (
-    ThreadDir,
     UnsafeWorkspacePathError,
-    iter_thread_dirs,
-    remove_thread_dir,
     unlink_registered_file,
 )
 
@@ -79,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 #: 审计行的 actor —— 与 control-plane 的 sweep 同款写法(``actor_type="system"``)。
 _ACTOR_ID = "retention_cleanup_job"
+
 
 # The cleanup runs against a DB connection that's already authenticated
 # as a role with DELETE privilege on the target tables — typically
@@ -281,10 +280,16 @@ class RetentionCleanupJob:
         """X-4 ② —— 已删工作区 90 天销账。
 
         软删(``deleted_at``)且已归档(``archived_object_key``)满
-        ``workspace_archive_retention_days`` 的 ``user_workspace`` 行:先删从属行
-        (该用户的 artifact / artifact_version / user_upload —— 与 ``purge_user``
-        的级联清单同一批「字节住在工作区里」的表),再硬删工作区行,写一条
-        ``WORKSPACE_HARD_DELETE`` 审计。
+        ``workspace_archive_retention_days`` 的 ``user_workspace`` 行:**先硬删
+        工作区行**,成功了再删从属行(该用户的 artifact / artifact_version /
+        user_upload —— 与 ``purge_user`` 的级联清单同一批「字节住在工作区里」的
+        表),写一条 ``WORKSPACE_HARD_DELETE`` 审计。
+
+        顺序是审查(High)钉下来的:三个 store 各开各的 session,做不成一个事务;
+        先删从属行再硬删工作区行,硬删一失败从属行就成了永远没人认领的孤儿
+        (工作区行是明天重试的唯一索引)。反过来,工作区行删掉后从属行删失败,
+        行本身仍按 ``(tenant, user)`` 可查,log + 审计 ``dependents_failed`` 记下,
+        由人处理 —— 这条路径不会静默。
 
         **OSS 归档对象不在这里删**:桶生命周期到期自然清掉。此前这条 pass 会先
         ``ObjectStore.delete(archived_object_key)`` 再删行,PR2 起 job 不持有 OSS
@@ -307,18 +312,27 @@ class RetentionCleanupJob:
         )
         hard = 0
         for ws in rows:
-            artifacts_deleted = uploads_deleted = 0
-            if self._artifact_store is not None:
-                artifacts_deleted = await self._artifact_store.delete_all_for_user(
-                    tenant_id=ws.tenant_id, user_id=ws.user_id
-                )
-            if self._user_upload_store is not None:
-                uploads_deleted = await self._user_upload_store.delete_all_for_user(
-                    tenant_id=ws.tenant_id, user_id=ws.user_id
-                )
             if not await self._workspace_store.hard_delete(workspace_id=ws.id):
                 continue
             hard += 1
+            artifacts_deleted = uploads_deleted = 0
+            dependents_failed: list[str] = []
+            try:
+                if self._artifact_store is not None:
+                    artifacts_deleted = await self._artifact_store.delete_all_for_user(
+                        tenant_id=ws.tenant_id, user_id=ws.user_id
+                    )
+            except Exception:
+                dependents_failed.append("artifact")
+                logger.exception("retention.workspace_dependents_failed store=artifact")
+            try:
+                if self._user_upload_store is not None:
+                    uploads_deleted = await self._user_upload_store.delete_all_for_user(
+                        tenant_id=ws.tenant_id, user_id=ws.user_id
+                    )
+            except Exception:
+                dependents_failed.append("user_upload")
+                logger.exception("retention.workspace_dependents_failed store=user_upload")
             await self._audit(
                 tenant_id=ws.tenant_id,
                 action=AuditAction.WORKSPACE_HARD_DELETE,
@@ -331,6 +345,7 @@ class RetentionCleanupJob:
                     "archive_object": "left to bucket lifecycle",
                     "artifacts_deleted": artifacts_deleted,
                     "uploads_deleted": uploads_deleted,
+                    "dependents_failed": dependents_failed,
                 },
             )
         return hard, len(pending)
@@ -380,18 +395,33 @@ class RetentionCleanupJob:
                 artifact_id=artifact_id, now=now
             )
             artifacts_expired += int(expired_now)
+            details: dict[str, object] = {
+                "user_id": str(versions[0].user_id),
+                "versions_deleted": sorted(v.version for v in versions if v.id in deletable),
+                "files_removed": removed_here,
+                "artifact_expired": expired_now,
+                "retention_days": self._artifact_retention_days,
+            }
+            if not expired_now:
+                # 审计要能自解释:没标过期是因为还有版本(正常,含本轮删不掉
+                # 而保留的),还是行早已软删 / 不存在(mark 的 CAS 谓词没命中)。
+                remaining = await self._artifact_store.list_versions_by_artifact(
+                    artifact_id=artifact_id
+                )
+                details["versions_remaining"] = len(remaining)
+                details["reason"] = (
+                    "versions_remaining" if remaining else "artifact_already_deleted_or_missing"
+                )
+                if len(deletable) < len(versions):
+                    details["versions_kept_undeletable"] = sorted(
+                        v.version for v in versions if v.id not in deletable
+                    )
             await self._audit(
                 tenant_id=versions[0].tenant_id,
                 action=AuditAction.ARTIFACT_EXPIRED,
                 resource_type="artifact",
                 resource_id=str(artifact_id),
-                details={
-                    "user_id": str(versions[0].user_id),
-                    "versions_deleted": sorted(v.version for v in versions if v.id in deletable),
-                    "files_removed": removed_here,
-                    "artifact_expired": expired_now,
-                    "retention_days": self._artifact_retention_days,
-                },
+                details=details,
             )
         return versions_deleted, files_removed, artifacts_expired
 
@@ -470,6 +500,12 @@ class RetentionCleanupJob:
         expired = await self._user_upload_store.list_expired(before=cutoff, limit=self._batch_size)
         marked = files_removed = 0
         for row in expired:
+            # 两种 ``ref`` 形态,两种字节归属(见 protocol.UserUpload.ref):
+            # * 文档类:工作区相对路径 ``uploads/<file>`` —— 字节在 NAS,这里
+            #   unlink;删不掉就整行跳过(不标),明天再试,绝不留孤儿文件。
+            # * 图片类:``expert_work://image/…`` 对象存储 URI —— 字节在 OSS,
+            #   归 ``image_upload`` 自己的 90 天 pass(需要 OSS 凭据),这里不碰;
+            #   行照样标 ``deleted_at``,对外 GET 与文档类同一天起 404。
             if row.ref.startswith(f"{WORKSPACE_UPLOADS_DIR}/"):
                 try:
                     removed = await asyncio.to_thread(
@@ -490,41 +526,12 @@ class RetentionCleanupJob:
         return marked, files_removed
 
     async def _sweep_orphan_thread_dirs(self) -> int:
-        """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录。
-
-        以文件系统为发现源(``{root}/<tenant>/<user>/threads/<uuid>``,三层都要
-        是 UUID 名),按 ``(tenant, user)`` 一批查 ``thread_meta``:行不存在的目录
-        删掉。**行还在的目录一律不动,不管多老** —— 会话被删除/purge 时的同步
-        清理是 control-plane 的 purge 钩子,这里只兜那次钩子失败或早于钩子存在的
-        存量。已软删的用户整棵树跳过(归 janitor 归档)。
-
-        No-op when :class:`ThreadMetaStore` or ``workspace_root`` is missing.
-        """
+        """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录;规则本体在
+        :func:`retention_cleanup_job.orphan_threads.sweep_orphan_thread_dirs`。
+        No-op when :class:`ThreadMetaStore` or ``workspace_root`` is missing."""
         if self._thread_store is None or self._workspace_root is None:
             return 0
-        root = self._workspace_root
-        entries = await asyncio.to_thread(lambda: list(iter_thread_dirs(root)))
-        grouped: dict[tuple[UUID, UUID], list[ThreadDir]] = {}
-        for entry in entries:
-            grouped.setdefault((entry.tenant_id, entry.user_id), []).append(entry)
-        removed = 0
-        for (tenant_id, user_id), dirs in grouped.items():
-            existing = await self._thread_store.get_many(
-                [d.thread_id for d in dirs], tenant_id=tenant_id
-            )
-            for entry in dirs:
-                if entry.thread_id in existing:
-                    continue
-                try:
-                    if await asyncio.to_thread(
-                        remove_thread_dir, root, tenant_id, user_id, entry.thread_id
-                    ):
-                        removed += 1
-                except (OSError, UnsafeWorkspacePathError):
-                    logger.exception(
-                        "retention.thread_dir_remove_failed thread_id=%s", entry.thread_id
-                    )
-        return removed
+        return await sweep_orphan_thread_dirs(self._workspace_root, self._thread_store)
 
     async def _unlink(self, version: ArtifactVersion) -> bool | None:
         """Unlink one registered artifact file. ``True`` removed, ``False`` was

@@ -230,7 +230,8 @@ class InMemoryArtifactStore(ArtifactStore):
         limit: int = 1000,
     ) -> list[ArtifactVersion]:
         rows = [v for v in self._versions if v.created_at is not None and v.created_at < before]
-        rows.sort(key=lambda v: (v.created_at or _MIN_AWARE, str(v.id)))
+        # Same tiebreak as the SQL store: ``created_at, artifact_id, version``.
+        rows.sort(key=lambda v: (v.created_at or _MIN_AWARE, str(v.artifact_id), v.version))
         return rows[:limit]
 
     async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:

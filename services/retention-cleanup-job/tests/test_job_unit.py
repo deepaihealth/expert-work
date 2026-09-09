@@ -581,3 +581,81 @@ async def test_sweep_workspaces_noop_without_workspace_store() -> None:
         db_session_factory=lambda: None,  # type: ignore[arg-type]
     )
     assert await job._sweep_workspaces() == (0, 0)
+
+
+class _StuckWorkspaceStore(InMemoryUserWorkspaceStore):
+    """``hard_delete`` never lands — raises or returns False, configurable."""
+
+    def __init__(self, *, raise_on_hard_delete: bool) -> None:
+        super().__init__()
+        self.raise_on_hard_delete = raise_on_hard_delete
+
+    async def hard_delete(self, *, workspace_id: object) -> bool:
+        if self.raise_on_hard_delete:
+            raise RuntimeError("db down")
+        return False
+
+
+@pytest.mark.parametrize("raises", [True, False])
+@pytest.mark.asyncio
+async def test_sweep_workspaces_hard_delete_failure_leaves_dependents_untouched(
+    raises: bool,
+) -> None:
+    """审查 High:硬删工作区行失败(抛错或返回 False)时,该用户的 artifact /
+    user_upload 行必须原样还在 —— 行是明天重试的唯一索引,先删从属行再硬删失败
+    就是孤儿。顺序钉成:先硬删工作区行,成功了再删从属行。"""
+    from expert_work.persistence import InMemoryAuditLogStore, InMemoryUserUploadStore
+    from expert_work.protocol import AuditQuery
+    from expert_work.runtime.audit import (
+        AuditLogger,
+        DefaultSecretRedactor,
+        InMemoryAuditFallbackQueue,
+    )
+
+    store = _StuckWorkspaceStore(raise_on_hard_delete=raises)
+    artifacts = InMemoryArtifactStore()
+    uploads = InMemoryUserUploadStore()
+    audit_store = InMemoryAuditLogStore()
+    tenant, user = uuid4(), uuid4()
+    await _archived_workspace(store, tenant=tenant, user=user, days_ago=100)
+    await artifacts.save_version(
+        tenant_id=tenant,
+        user_id=user,
+        name="r.md",
+        kind="document",
+        path_in_workspace="r.md",
+        created_in_thread="t",
+    )
+    await uploads.insert(
+        upload_id=uuid4(),
+        tenant_id=tenant,
+        user_id=user,
+        thread_id=uuid4(),
+        kind="document",
+        ref="uploads/a.pdf",
+        mime_type="application/pdf",
+        size_bytes=1,
+        filename="a.pdf",
+    )
+    job = RetentionCleanupJob(
+        db_session_factory=lambda: None,  # type: ignore[arg-type]
+        workspace_store=store,
+        artifact_store=artifacts,
+        user_upload_store=uploads,
+        workspace_archive_retention_days=90,
+        audit_logger=AuditLogger(
+            store=audit_store,
+            redactor=DefaultSecretRedactor(),
+            fallback=InMemoryAuditFallbackQueue(),
+        ),
+    )
+
+    if raises:
+        with pytest.raises(RuntimeError):
+            await job._sweep_workspaces()
+    else:
+        assert await job._sweep_workspaces() == (0, 0)
+
+    assert len(await artifacts.list_for_user(tenant_id=tenant, user_id=user)) == 1
+    assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=user) == 1
+    assert (await audit_store.query(AuditQuery(tenant_id=tenant))).entries == []

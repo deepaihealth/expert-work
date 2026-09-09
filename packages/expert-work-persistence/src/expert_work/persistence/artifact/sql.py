@@ -300,10 +300,18 @@ class SqlArtifactStore(ArtifactStore):
         before: datetime,
         limit: int = 1000,
     ) -> list[ArtifactVersion]:
+        # 同一 ``created_at`` 的版本(同一事务里连登记几版、时钟粒度内的批量)按
+        # ``artifact_id, version`` 定序 —— 老版本先于新版本,跨 store 实现同义;
+        # 用 ``id``(uuid4)做 tiebreak 则同一产物两个版本谁先谁后是随机的
+        # (CI 实测:三跑两红)。
         stmt = (
             select(ArtifactVersionRow)
             .where(ArtifactVersionRow.created_at < before)
-            .order_by(ArtifactVersionRow.created_at.asc(), ArtifactVersionRow.id.asc())
+            .order_by(
+                ArtifactVersionRow.created_at.asc(),
+                ArtifactVersionRow.artifact_id.asc(),
+                ArtifactVersionRow.version.asc(),
+            )
             .limit(limit)
         )
         async with self._sf() as session:

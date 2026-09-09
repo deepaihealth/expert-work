@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -20,6 +21,7 @@ import pytest
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from retention_cleanup_job import main as main_module
 from retention_cleanup_job.job import RetentionCleanupJob, _bypass_rls
+from retention_cleanup_job.settings import RetentionCleanupSettings
 
 
 def test_build_session_factory_goes_through_build_rls_sessionmaker(
@@ -95,3 +97,47 @@ def test_run_once_wraps_every_pass_in_bypass() -> None:
             continue
         awaits_outside.extend(ast.unparse(n) for n in ast.walk(node) if isinstance(n, ast.Await))
     assert awaits_outside == []
+
+
+# ------------------------------------------------ 审查补:启动时校验 workspace_root
+
+
+def test_resolve_workspace_root_none_is_a_warning_not_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = RetentionCleanupSettings(_env_file=None, workspace_root=None)  # type: ignore[call-arg]
+    with caplog.at_level("WARNING"):
+        assert main_module.resolve_workspace_root(settings, environ={}) is None
+    assert any("workspace_root_unset" in r.message for r in caplog.records)
+
+
+def test_resolve_workspace_root_returns_a_validated_root(tmp_path: Path) -> None:
+    settings = RetentionCleanupSettings(_env_file=None, workspace_root=str(tmp_path))  # type: ignore[call-arg]
+    environ = {"EXPERT_WORK_WORKSPACE_NAS_ROOT": str(tmp_path)}
+    assert main_module.resolve_workspace_root(settings, environ=environ) == str(tmp_path.resolve())
+
+
+def test_resolve_workspace_root_refuses_to_run_on_control_plane_mismatch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """envFrom 带进来的 control-plane 键(EXPERT_WORK_WORKSPACE_NAS_ROOT)与 job 自己
+    的根不一致 → 整个 job 拒跑:两边看的不是同一棵树,删的就不是登记的那份文件。"""
+    settings = RetentionCleanupSettings(_env_file=None, workspace_root=str(tmp_path))  # type: ignore[call-arg]
+    environ = {"EXPERT_WORK_WORKSPACE_NAS_ROOT": "/somewhere/else"}
+    with caplog.at_level("ERROR"), pytest.raises(SystemExit):
+        main_module.resolve_workspace_root(settings, environ=environ)
+    assert any("workspace_root_mismatch" in r.message for r in caplog.records)
+
+
+def test_resolve_workspace_root_refuses_symlink_or_missing_root(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    for bad in (str(link), str(tmp_path / "missing")):
+        settings = RetentionCleanupSettings(_env_file=None, workspace_root=bad)  # type: ignore[call-arg]
+        with caplog.at_level("ERROR"), pytest.raises(SystemExit):
+            main_module.resolve_workspace_root(settings, environ={})
+    assert sum("workspace_root_invalid" in r.message for r in caplog.records) == 2

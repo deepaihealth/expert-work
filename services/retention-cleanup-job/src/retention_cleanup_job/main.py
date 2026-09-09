@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+from collections.abc import Mapping
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -36,8 +38,49 @@ from expert_work.runtime.storage import make_object_store
 from expert_work.runtime.storage.factory import S3CompatibleConfig
 from retention_cleanup_job.job import RetentionCleanupJob
 from retention_cleanup_job.settings import RetentionCleanupSettings
+from retention_cleanup_job.workspace_files import validate_workspace_root
 
 logger = logging.getLogger(__name__)
+
+
+#: control-plane 自己的 NAS 根键 —— CronJob 的 envFrom 把它带进本进程;job 的
+#: ``EXPERT_WORK_RETENTION_WORKSPACE_ROOT`` 在 manifest 里就是从这个键取值的,
+#: 这里再校验一遍是防 manifest 被人改成两个值。
+_CONTROL_PLANE_NAS_ROOT_KEY = "EXPERT_WORK_WORKSPACE_NAS_ROOT"
+
+
+def resolve_workspace_root(
+    settings: RetentionCleanupSettings, *, environ: Mapping[str, str]
+) -> str | None:
+    """启动时决定 ``workspace_root``,不合格就**整个 job 拒跑**(审查项 3 / 4)。
+
+    * 未配 → ``None`` + warning:三条碰文件的规则整体跳过,其余 pass 照跑。
+    * 与 control-plane 的 ``EXPERT_WORK_WORKSPACE_NAS_ROOT``(envFrom 带进来)不一致
+      → error + ``SystemExit(2)``:两边看的不是同一棵树,删的就不是登记的那份文件。
+    * 目录不存在 / 不是目录 / 是 symlink → error + ``SystemExit(2)``:NAS 没挂上时
+      每个登记文件都「看起来不在」,行删了、字节永远留在卷里;拒跑比跳过安全。
+    """
+    root = settings.workspace_root
+    if root is None:
+        logger.warning(
+            "retention.workspace_root_unset — artifact-version / upload-file / "
+            "orphan-thread-dir rules are skipped (set EXPERT_WORK_RETENTION_WORKSPACE_ROOT)"
+        )
+        return None
+    control_plane_root = environ.get(_CONTROL_PLANE_NAS_ROOT_KEY)
+    if control_plane_root is not None and control_plane_root != root:
+        logger.error(
+            "retention.workspace_root_mismatch job=%r control_plane=%r — refusing to run",
+            root,
+            control_plane_root,
+        )
+        raise SystemExit(2)
+    try:
+        resolved = validate_workspace_root(root)
+    except ValueError as exc:
+        logger.error("retention.workspace_root_invalid %s — refusing to run", exc)
+        raise SystemExit(2) from exc
+    return str(resolved)
 
 
 def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
@@ -52,6 +95,8 @@ def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessio
 async def _amain() -> None:
     settings = RetentionCleanupSettings()
     logging.basicConfig(level=settings.log_level)
+    # 连库之前先定工作区根:不合格就退出,一条 DELETE 都不发。
+    workspace_root = resolve_workspace_root(settings, environ=os.environ)
 
     engine = create_async_engine_from_config(DatabaseConfig(dsn=settings.db_dsn))
     session_factory = build_session_factory(engine)
@@ -117,12 +162,6 @@ async def _amain() -> None:
             redactor=DefaultSecretRedactor(),
             fallback=InMemoryAuditFallbackQueue(),
         )
-        if settings.workspace_root is None:
-            logger.warning(
-                "retention.workspace_root_unset — artifact-version / upload-file / "
-                "orphan-thread-dir rules are skipped (set EXPERT_WORK_RETENTION_WORKSPACE_ROOT)"
-            )
-
         job = RetentionCleanupJob(
             db_session_factory=session_factory,
             batch_size=settings.batch_size,
@@ -142,7 +181,7 @@ async def _amain() -> None:
             user_upload_store=user_upload_store,
             upload_retention_days=settings.upload_retention_days,
             thread_store=thread_store,
-            workspace_root=settings.workspace_root,
+            workspace_root=workspace_root,
             audit_logger=audit_logger,
         )
         logger.info("retention_cleanup_job.start batch=%d", settings.batch_size)

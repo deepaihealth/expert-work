@@ -508,3 +508,27 @@ async def test_delete_versions_then_mark_expired_only_when_none_left() -> None:
         await store.list_versions(tenant_id=row.tenant_id, user_id=row.user_id, name="a.md") is None
     )
     assert await store.list_versions_by_artifact(artifact_id=a) == []
+
+
+@pytest.mark.asyncio
+async def test_list_versions_expired_orders_same_timestamp_by_version() -> None:
+    """Same tiebreak as the SQL store: identical ``created_at`` → ``version``
+    ascending, never the (random) row id. Ids are forced into reverse
+    version order so an ``id`` tiebreak is deterministically wrong."""
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="tie.md", ages_days=[100, 100, 100])
+    reversed_ids = [
+        UUID("ffffffff-0000-4000-8000-000000000001"),
+        UUID("88888888-0000-4000-8000-000000000002"),
+        UUID("00000000-0000-4000-8000-000000000003"),
+    ]
+    same_ts = datetime.now(UTC) - timedelta(days=100)
+    store._versions = [
+        v.model_copy(update={"id": reversed_ids[v.version - 1], "created_at": same_ts})
+        for v in store._versions
+    ]
+    cutoff = datetime.now(UTC) - timedelta(days=90)
+
+    expired = await store.list_versions_expired(before=cutoff)
+
+    assert [(v.artifact_id, v.version) for v in expired] == [(a, 1), (a, 2), (a, 3)]
