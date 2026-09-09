@@ -15,7 +15,9 @@ UUID path param. The kill-switch API is SE-8-3; this PR is read + approval only.
 
 Authz (SE-8): a tenant admin manages their own tenant; a system_admin manages
 all tenants (``?tenant_id=<uuid>`` to act on another, ``?tenant_id=*`` to span
-the review queue). Enforced via :func:`ensure_tenant_scope`. Responses are raw
+the review queue). Enforced via :func:`ensure_tenant_scope`. ``approve`` /
+``reject`` additionally require ``manifest:write`` — operator and above (P-5,
+same convention as the 阶段 1.5 content plane). Responses are raw
 ``JSONResponse`` (matching ``/v1/skills`` / ``/v1/curation``); every write emits
 an audit row.
 """
@@ -30,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.api.skills import (
     _get_audit,
     _get_skill_store,
@@ -277,8 +279,20 @@ def build_skill_evolution_router() -> APIRouter:
         return JSONResponse(status_code=201, content=_promote_request_dict(req))
 
     # ------------------------------------------------ approve / reject (write)
+    #
+    # P-5 — deciding a promote-request is a write on the skill library. The
+    # SE-8 owner gate inside ``_decide`` only guards ``agent_private``
+    # targets, so on a ``tenant`` skill any employee — a ``viewer`` included
+    # — could approve someone else's request. Ruling 2026-09-09: operator
+    # and above, reusing the 阶段 1.5 content-plane convention (``manifest``
+    # read all / write operator+ / delete admin); a platform system_admin
+    # passes through ``is_allowed``'s ADMIN widening.
 
-    @router.post("/promote-requests/{request_id}/approve", response_model=None)
+    @router.post(
+        "/promote-requests/{request_id}/approve",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def approve_promote(
         request_id: UUID,
         body: _DecideBody,
@@ -297,7 +311,11 @@ def build_skill_evolution_router() -> APIRouter:
             approve=True,
         )
 
-    @router.post("/promote-requests/{request_id}/reject", response_model=None)
+    @router.post(
+        "/promote-requests/{request_id}/reject",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def reject_promote(
         request_id: UUID,
         body: _DecideBody,

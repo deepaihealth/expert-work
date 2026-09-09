@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -89,8 +89,8 @@ async def _seed_agent_private(app: FastAPI, *, name: str) -> str:
     return str(skill_id)
 
 
-def _role_headers(role: str) -> dict[str, str]:
-    """JWT headers for a non-admin employee (``viewer`` / ``operator``).
+def _role_headers(*roles: str) -> dict[str, str]:
+    """JWT headers for an employee carrying exactly ``roles`` (none when empty).
 
     Unlike ``test_skills_api.py``'s helper of the same name, the subject
     must be a real UUID here — ``approve``/``reject`` resolve the decider
@@ -98,7 +98,7 @@ def _role_headers(role: str) -> dict[str, str]:
     ("a user identity is required to decide") for a non-UUID subject,
     which would mask the SE-8 owner-gate 403 these tests are asserting on.
     """
-    token = make_test_jwt(tenant_id=_TENANT, subject=str(uuid4()), roles=(role,))
+    token = make_test_jwt(tenant_id=_TENANT, subject=str(uuid4()), roles=roles)
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -323,10 +323,11 @@ async def test_global_kill_switch_system_admin() -> None:
 # all — and ``approve`` flips visibility ``agent_private`` → ``tenant``
 # *unconditionally* (``SkillStore.approve_skill_promote``), so a non-admin
 # could permanently de-privatize someone else's private skill via
-# request+approve. This router has no ``require(role, ...)`` check anywhere
+# request+approve. This router had no ``require(role, ...)`` check anywhere
 # (only ``console_only()``, which blocks service accounts, not employee
-# roles) — the SE-8 owner gate is the only thing standing between a viewer
-# JWT and every one of these actions.
+# roles) — the SE-8 owner gate was the only thing standing between a viewer
+# JWT and every one of these actions. (P-5 later put ``manifest:write`` on
+# ``approve``/``reject`` — see the P-5 section below.)
 # ---------------------------------------------------------------------------
 
 
@@ -452,7 +453,10 @@ async def test_request_promote_403_for_non_admin_employee_agent_private(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# P-5 — ``viewer`` dropped: approve/reject now carry ``require("manifest",
+# "write")``, so a viewer is stopped by the role gate (``FORBIDDEN``) before
+# reaching the owner gate this case is about; see the P-5 section below.
+@pytest.mark.parametrize("role", ["operator"])
 async def test_approve_promote_403_for_non_admin_employee_agent_private(
     setup: Setup, role: str
 ) -> None:
@@ -480,7 +484,8 @@ async def test_approve_promote_403_for_non_admin_employee_agent_private(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# P-5 — ``viewer`` dropped, same reason as the approve case above.
+@pytest.mark.parametrize("role", ["operator"])
 async def test_reject_promote_403_for_non_admin_employee_agent_private(
     setup: Setup, role: str
 ) -> None:
@@ -501,13 +506,13 @@ async def test_reject_promote_403_for_non_admin_employee_agent_private(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# P-5 — ``viewer`` dropped: a viewer may still open a request but no longer
+# decides one (403 at approve, see the P-5 section below).
+@pytest.mark.parametrize("role", ["operator"])
 async def test_promote_flow_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
     """Regression guard (biggest risk of this change) — the C-3 gate must not
-    touch the ordinary tenant-visibility promote flow. This matters more here
-    than elsewhere: the router has *no* role check of its own anywhere, so
-    the SE-8 owner gate is the only thing that could accidentally 403 a
-    legitimate non-admin governance action on a public skill."""
+    touch the ordinary tenant-visibility promote flow: the SE-8 owner gate
+    must not 403 a legitimate non-admin governance action on a public skill."""
     client, _, _ = setup
     sid = await _seed_tenant_skill(client, name=f"promote-tenant-{role}")
     headers = _role_headers(role)
@@ -522,6 +527,75 @@ async def test_promote_flow_tenant_visibility_unaffected(setup: Setup, role: str
         f"/v1/skill-evolution/promote-requests/{rid}/approve", json={}, headers=headers
     )
     assert approved.status_code == 200, f"{role}: {approved.status_code} {approved.text}"
+
+
+# ── P-5 — approve / reject role gate ────────────────────────────────────────
+#
+# Until P-5 the only thing between an employee JWT and ``approve``/``reject``
+# was the SE-8 owner gate, which by design lets *any* role decide on a
+# ``tenant``-visibility skill — so a ``viewer`` could approve someone else's
+# promote-request on a public skill. Ruling (2026-09-09): operator and above
+# may decide, reusing the 阶段 1.5 content-plane convention
+# ``require("manifest", "write")`` (read all / write operator+ / delete admin).
+#
+# What proves the gate: ``viewer`` and a role-less employee are the provers
+# for the 403 (neither holds ``manifest:write``); ``operator`` is the prover
+# against over-tightening (gate at ``delete`` and it goes red); ``admin`` pins
+# that the widest tenant role still passes. The target is a plain ``tenant``
+# skill so the SE-8 owner gate cannot be the one refusing.
+
+
+def _assert_role_denied(resp: Response) -> None:
+    """The 403 must come from the RBAC gate, not from the SE-8 owner gate."""
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "FORBIDDEN", detail
+    assert detail["message"] == "principal lacks required role", detail
+
+
+async def _open_tenant_promote_request(client: AsyncClient, *, name: str) -> str:
+    """Admin opens a promote-request on a fresh ``tenant`` skill; returns its id."""
+    sid = await _seed_tenant_skill(client, name=name)
+    opened = await client.post(
+        f"/v1/skill-evolution/skills/{sid}/promote-requests", json={"skill_version": 1}
+    )
+    assert opened.status_code == 201, opened.text
+    return str(opened.json()["id"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+@pytest.mark.parametrize("roles", [(), ("viewer",)], ids=["roleless", "viewer"])
+async def test_decide_promote_403_below_operator(
+    setup: Setup, decision: str, roles: tuple[str, ...]
+) -> None:
+    client, _, _ = setup
+    rid = await _open_tenant_promote_request(client, name=f"p5-{decision}-{len(roles)}")
+    r = await client.post(
+        f"/v1/skill-evolution/promote-requests/{rid}/{decision}",
+        json={},
+        headers=_role_headers(*roles),
+    )
+    _assert_role_denied(r)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "expected_status"), [("approve", "approved"), ("reject", "rejected")]
+)
+@pytest.mark.parametrize("role", ["operator", "admin"])
+async def test_decide_promote_operator_and_admin_pass(
+    setup: Setup, decision: str, expected_status: str, role: str
+) -> None:
+    client, _, _ = setup
+    rid = await _open_tenant_promote_request(client, name=f"p5-{decision}-{role}")
+    r = await client.post(
+        f"/v1/skill-evolution/promote-requests/{rid}/{decision}",
+        json={},
+        headers=_role_headers(role),
+    )
+    assert r.status_code == 200, f"{role}: {r.status_code} {r.text}"
+    assert r.json()["status"] == expected_status
 
 
 # ── list_promote_requests owner filter (backlog task 8) ────────────────────
