@@ -8,8 +8,9 @@
  * per-item results, so a partial failure (Keycloak conflict / down)
  * surfaces the failing emails without aborting the whole batch.
  *
- * Deletion-hygiene PR5 adds the one-shot "deactivate & purge" action:
- * type-to-confirm (the member's email) then ``POST /{id}:purge`` —
+ * Deletion-hygiene PR5 added the "purge" action; X-4 ① (2026-09-09) made
+ * it step two of a two-step offboarding — only a suspended / revoked row
+ * shows it. Type-to-confirm (the member's email) then ``POST /{id}:purge`` —
  * lifecycle + role bindings + Keycloak account DELETE + data cascade.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -137,7 +138,7 @@ export function SettingsMembers() {
   const [pw, setPw] = useState("");
   const [pwErr, setPwErr] = useState<string | null>(null);
 
-  // One-shot deactivate & purge (deletion-hygiene PR5) — type-to-confirm.
+  // Purge (step two of offboarding) — type-to-confirm.
   const [purgeTarget, setPurgeTarget] = useState<TenantMember | null>(null);
 
   const refresh = useCallback(async () => {
@@ -368,6 +369,10 @@ export function SettingsMembers() {
         render: (_: unknown, record: TenantMember) => {
           const removable =
             record.status === "invited" || record.status === "active";
+          // Purge is step two: only a deactivated row (the backend 409s
+          // anything else, and the caller's own row).
+          const purgeable =
+            record.status === "suspended" || record.status === "revoked";
           const settable =
             record.keycloak_user_id !== null &&
             (record.status === "active" || record.status === "invited");
@@ -434,20 +439,20 @@ export function SettingsMembers() {
                   </Popconfirm>
                 </ReadonlyTooltip>
               )}
-              {/* One-shot deactivate & purge — every status is purgeable
-                  (suspended / revoked rows re-enter as backfill cleanup). */}
-              <ReadonlyTooltip on={isTenantSwitched}>
-                <Button
-                  size="small"
-                  danger
-                  disabled={isTenantSwitched}
-                  icon={<UserX size={12} strokeWidth={1.75} />}
-                  onClick={() => setPurgeTarget(record)}
-                  data-testid={`members-purge-${record.id}`}
-                >
-                  {t("settings_members.purge_action")}
-                </Button>
-              </ReadonlyTooltip>
+              {purgeable && (
+                <ReadonlyTooltip on={isTenantSwitched}>
+                  <Button
+                    size="small"
+                    danger
+                    disabled={isTenantSwitched}
+                    icon={<UserX size={12} strokeWidth={1.75} />}
+                    onClick={() => setPurgeTarget(record)}
+                    data-testid={`members-purge-${record.id}`}
+                  >
+                    {t("settings_members.purge_action")}
+                  </Button>
+                </ReadonlyTooltip>
+              )}
             </Space>
           );
         },

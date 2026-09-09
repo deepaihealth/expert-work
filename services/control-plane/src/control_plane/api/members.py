@@ -27,7 +27,7 @@ from control_plane.api._user_scope import get_user_repo
 
 # Same-app private share (deletion-hygiene PR5 design decision): the purge-deps
 # assembly stays in agent_users.py next to the user-purge endpoint; the members
-# one-shot purge below reuses it rather than duplicating the wiring.
+# purge below reuses it rather than duplicating the wiring.
 from control_plane.api.agent_users import _build_purge_deps
 from control_plane.api.member_ops import (
     MemberConflictError,

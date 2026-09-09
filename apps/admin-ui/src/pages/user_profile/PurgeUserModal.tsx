@@ -12,7 +12,7 @@
  * employees — kept in case some other conflict ever surfaces here.
  *
  * Deletion-hygiene PR5 generalizes the type-to-confirm interaction so the
- * members page can reuse it for the one-shot deactivate + purge: all new
+ * members page can reuse it for the member purge: all new
  * props (``confirmTarget`` / ``onSubmit`` / ``copy``) are optional and
  * default to the original /users profile behavior.
  */
@@ -57,7 +57,7 @@ interface PurgeUserModalProps {
   onPurged: () => void;
   /** Overrides the value the admin must type (default: ``subjectId``). */
   confirmTarget?: string;
-  /** Overrides the default ``purgeUser`` call (the members one-shot purge). */
+  /** Overrides the default ``purgeUser`` call (the members purge). */
   onSubmit?: () => Promise<PurgeSummary | MemberPurgeResult>;
   copy?: PurgeModalCopy;
 }

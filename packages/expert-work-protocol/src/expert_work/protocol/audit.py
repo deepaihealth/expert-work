@@ -83,9 +83,10 @@ class AuditAction(StrEnum):
     MEMBER_RESEND = "member:resend"
     MEMBER_REVOKE = "member:revoke"
     MEMBER_SUSPEND = "member:suspend"
-    # deletion-hygiene PR5 — the members-page one-shot deactivate + purge
-    # (lifecycle + role-binding cleanup + Keycloak account delete + data
-    # cascade); details carry the per-step booleans/counts.
+    # deletion-hygiene PR5 / X-4 ① — the members-page purge, step two of the
+    # two-step offboarding (target already suspended / revoked): Keycloak
+    # account delete + role-binding sweep + data cascade; details carry the
+    # per-step booleans/counts.
     MEMBER_PURGE = "member:purge"
     MEMBER_ACTIVATE = "member:activate"
     MEMBER_PASSWORD_RESET = "member:password_reset"
