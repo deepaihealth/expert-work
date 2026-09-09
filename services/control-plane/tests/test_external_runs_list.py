@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -22,7 +22,12 @@ from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.thread_meta import InMemoryThreadMetaStore
 from expert_work.protocol import AgentSpec
-from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
+from expert_work.runtime.runs import (
+    InMemoryRunEventStore,
+    InMemoryRunStore,
+    RunInfo,
+    RunStatus,
+)
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -366,6 +371,8 @@ async def test_response_shape_is_a_whitelist(ctx: _Ctx) -> None:
             "finished_at",
             "artifacts",
             "error",
+            "superseded_by",
+            "regenerated_from",
         }
 
 
@@ -469,3 +476,51 @@ async def test_run_summary_carries_the_artifact_manifest(ctx: _Ctx) -> None:
     assert resp.status_code == 200, resp.text
     runs = resp.json()["data"]["runs"]
     assert runs[0]["artifacts"] == manifest
+
+
+@pytest.mark.asyncio
+async def test_runs_expose_supersede_links(ctx: _Ctx) -> None:
+    """P-1 —— 对外 run 列表每条都带 ``superseded_by`` / ``regenerated_from``,
+    缺省 ``null``(字段恒在,对接方不用区分「没这个字段」与「值为空」)。"""
+    await ctx.seed_agent()
+    started = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    assert started.status_code == 202, started.text
+    old_run = UUID(started.json()["data"]["run_id"])
+    session_id = UUID(started.json()["data"]["thread_id"])
+
+    old_row = await ctx.run_store.get(run_id=old_run, tenant_id=ctx.tenant_id)
+    assert old_row is not None
+    new_run = uuid4()
+    await ctx.run_store.create(
+        RunInfo(
+            run_id=new_run,
+            tenant_id=ctx.tenant_id,
+            thread_id=session_id,
+            user_id=old_row.user_id,
+            status=RunStatus.SUCCESS,
+            on_disconnect=old_row.on_disconnect,
+            is_resume=False,
+            error=None,
+            created_at=old_row.created_at + timedelta(seconds=5),
+            updated_at=old_row.created_at + timedelta(seconds=5),
+            finished_at=old_row.created_at + timedelta(seconds=9),
+            regenerated_from_run_id=old_run,
+        )
+    )
+    await ctx.run_store.mark_superseded(
+        run_id=old_run, tenant_id=ctx.tenant_id, superseded_by_run_id=new_run
+    )
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/runs", params={"user_id": "cust-77"}, headers=ctx.headers
+    )
+    assert resp.status_code == 200, resp.text
+    by_run = {r["run_id"]: r for r in resp.json()["data"]["runs"]}
+    assert by_run[str(old_run)]["superseded_by"] == str(new_run)
+    assert by_run[str(old_run)]["regenerated_from"] is None
+    assert by_run[str(new_run)]["regenerated_from"] == str(old_run)
+    assert by_run[str(new_run)]["superseded_by"] is None

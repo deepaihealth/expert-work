@@ -175,6 +175,7 @@ class _Ctx:
         status: RunStatus = RunStatus.SUCCESS,
         finished_at: datetime | None = None,
         error: str | None = None,
+        regenerated_from_run_id: UUID | None = None,
     ) -> UUID:
         """在同一段会话上再加一轮 —— 直接写 store,时刻才可控。"""
         run_id = uuid4()
@@ -191,6 +192,7 @@ class _Ctx:
                 created_at=created_at,
                 updated_at=created_at,
                 finished_at=finished_at,
+                regenerated_from_run_id=regenerated_from_run_id,
             )
         )
         return run_id
@@ -373,6 +375,9 @@ async def test_items_renders_one_turn_end_to_end(ctx: _Ctx) -> None:
             "artifacts": None,
             # P-2 —— 没打过分 = null。
             "feedback": None,
+            # P-1 —— 普通一轮:两个链接键恒在、恒 null。
+            "superseded_by": None,
+            "regenerated_from": None,
         }
     ]
     assert body["runs"][0]["created_at"] is not None
@@ -1125,3 +1130,45 @@ async def test_feedback_stays_on_the_run_it_was_given_for(ctx: _Ctx) -> None:
     by_run = {r["run_id"]: r["feedback"] for r in resp.json()["data"]["runs"]}
     assert by_run[str(first_run)] == {"rating": "down", "comment": "答非所问", "item_id": None}
     assert by_run[str(second_run)] is None
+async def test_items_and_runs_expose_supersede_links(ctx: _Ctx) -> None:
+    """P-1 —— 被取代的一轮:``runs[]`` 两个链接键 + 该轮每个条目带 ``superseded_by``。"""
+    from expert_work.common.supersede import mark_superseded
+
+    await ctx.seed_agent()
+    session_id, old_run = await ctx.open_session()
+    t0 = ctx.origin
+    new_run = await ctx.add_run(
+        session_id,
+        created_at=t0 + timedelta(seconds=5),
+        finished_at=t0 + timedelta(seconds=9),
+        regenerated_from_run_id=old_run,
+    )
+    await ctx.run_store.mark_superseded(
+        run_id=old_run, tenant_id=ctx.tenant_id, superseded_by_run_id=new_run
+    )
+    old_msgs = [
+        mark_superseded(m, new_run_id=str(new_run), now=t0)
+        for m in (
+            HumanMessage(content="U1", additional_kwargs=_stamp(old_run, t0)),
+            AIMessage(content="A1", additional_kwargs=_stamp(old_run, t0 + timedelta(seconds=1))),
+        )
+    ]
+    new_msgs = [
+        HumanMessage(content="U1'", additional_kwargs=_stamp(new_run, t0 + timedelta(seconds=5))),
+        AIMessage(content="A1'", additional_kwargs=_stamp(new_run, t0 + timedelta(seconds=6))),
+    ]
+    await _seed_thread_messages(ctx.checkpointer, str(session_id), [*old_msgs, *new_msgs])
+
+    resp = await ctx.items(session_id)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    by_run = {r["run_id"]: r for r in data["runs"]}
+    assert by_run[str(old_run)]["superseded_by"] == str(new_run)
+    assert by_run[str(old_run)]["regenerated_from"] is None
+    assert by_run[str(new_run)]["regenerated_from"] == str(old_run)
+    assert by_run[str(new_run)]["superseded_by"] is None
+    old_items = [i for i in data["items"] if i["run_id"] == str(old_run)]
+    assert old_items
+    assert all(i["superseded_by"] == str(new_run) for i in old_items)
+    assert all(i["tombstone"] is False for i in old_items)
+    assert all(i["superseded_by"] is None for i in data["items"] if i["run_id"] == str(new_run))

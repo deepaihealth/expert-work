@@ -313,6 +313,10 @@ def build_external_sessions_router() -> APIRouter:
                 "run_id": str(t.run_id) if t.run_id else None,
                 # P-2 —— 只回显当前 ``user_id`` 自己对这条消息所在那一轮打的票。
                 "feedback": own.get(str(t.run_id)) if t.run_id else None,
+                # P-1 —— 这一条被哪个新 run 取代(null = 未被取代);墓碑的正文
+                # 已清理成空串,``tombstone`` 让客户端能把它与「空回答」区分开。
+                "superseded_by": str(t.superseded_by) if t.superseded_by else None,
+                "tombstone": t.tombstone,
             }
             for t in page
         ]

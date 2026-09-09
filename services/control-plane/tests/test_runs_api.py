@@ -270,12 +270,21 @@ async def test_thread_messages_reads_durable_checkpoint_directly() -> None:
         response = await client.get(f"/v1/sessions/{thread_id}/messages")
         assert response.status_code == 200
         assert response.json()["data"]["messages"] == [
-            {"role": "user", "content": "今天几号", "channel": None, "run_id": None},
+            {
+                "role": "user",
+                "content": "今天几号",
+                "channel": None,
+                "run_id": None,
+                "superseded_by": None,
+                "tombstone": False,
+            },
             {
                 "role": "assistant",
                 "content": "今天是 2026年6月30日",
                 "channel": "final",
                 "run_id": None,
+                "superseded_by": None,
+                "tombstone": False,
             },
         ]
 
@@ -394,12 +403,21 @@ async def test_thread_messages_self_read_hides_scaffolding_but_record_keeps_it()
         response = await client.get(f"/v1/sessions/{thread_id}/messages")
         assert response.status_code == 200
         assert response.json()["data"]["messages"] == [
-            {"role": "user", "content": "今天几号", "channel": None, "run_id": None},
+            {
+                "role": "user",
+                "content": "今天几号",
+                "channel": None,
+                "run_id": None,
+                "superseded_by": None,
+                "tombstone": False,
+            },
             {
                 "role": "assistant",
                 "content": "今天是 2026年6月30日",
                 "channel": "final",
                 "run_id": None,
+                "superseded_by": None,
+                "tombstone": False,
             },
         ]
 

@@ -36,6 +36,7 @@ from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_sessions import _ACTIVE_RUN_STATUSES
 from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_messages
+from expert_work.common.conversation_channel import is_tombstone
 from expert_work.common.conversation_derive import derive_run_items
 from expert_work.common.conversation_items import (
     ApprovalItem,
@@ -447,7 +448,16 @@ def build_external_session_items_router() -> APIRouter:
                     derived = _with_decision(
                         derived, request_id=record.request_id, decision=record.status.value
                     )
-            items.extend(item.to_wire() for item in derived)
+            # P-1 —— 轮级标记:被取代的一轮,它的每个条目都带 superseded_by;
+            # 墓碑轮的条目 content 已是空串,再打 tombstone 让客户端能区分
+            # 「空回答」与「已清理」。
+            superseded_by = str(run.superseded_by_run_id) if run.superseded_by_run_id else None
+            tombstoned = any(is_tombstone(m) for m in by_run.get(key, []))
+            for item in derived:
+                wire = item.to_wire()
+                wire["superseded_by"] = superseded_by
+                wire["tombstone"] = tombstoned
+                items.append(wire)
 
         return JSONResponse(
             {
@@ -466,6 +476,13 @@ def build_external_session_items_router() -> APIRouter:
                             "artifacts": run.artifacts,
                             # P-2 —— 只回显当前 ``user_id`` 自己打的那一票。
                             "feedback": own.get(str(run.run_id)),
+                            # P-1 —— 被取代 / 重发链接;两者都是 null = 普通一轮。
+                            "superseded_by": str(run.superseded_by_run_id)
+                            if run.superseded_by_run_id
+                            else None,
+                            "regenerated_from": str(run.regenerated_from_run_id)
+                            if run.regenerated_from_run_id
+                            else None,
                         }
                         for run in turns
                     ],

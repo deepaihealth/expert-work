@@ -146,8 +146,10 @@ _AUX_TYPES = frozenset({"plan", "approval", "error"})
 _USER_MESSAGE = "user_message"
 
 #: 比对时剔除的字段。``id`` 不跨路径承诺;``worker`` 是 spec §五 拍板的
-#: 「唯一不完全同构处」(只有历史填)。两者各有一条独立断言兜着。
-_NOT_COMPARED = frozenset({"id", "worker"})
+#: 「唯一不完全同构处」(只有历史填);P-1 的 ``superseded_by`` / ``tombstone``
+#: 同理只有历史填 —— 「这一轮后来被取代了」是 run 结束**之后**才发生的事,
+#: 实时流与单 run 回放在物理上产不出它。三者各有一条独立断言兜着。
+_NOT_COMPARED = frozenset({"id", "worker", "superseded_by", "tombstone"})
 
 
 async def _never_disconnected() -> bool:
@@ -666,6 +668,31 @@ def test_worker_never_leaks_into_live_or_replay(golden: _Golden) -> None:
             checked += len(calls)
     # 先证兄弟事实:真的有工具调用条目被检查过,否则 ``all(...)`` 在空集上恒真。
     assert checked >= 8, checked
+
+
+def test_supersede_marks_are_history_only_and_always_present(golden: _Golden) -> None:
+    """P-1 的两个标记与 ``worker`` 同类:**只有历史给**,而且历史**每条都给**。
+
+    方向两边都钉住 —— 上面那条只钉了 ``worker`` 的「流式没有」一半,这里把
+    P-1 的两半一起钉上:实时 / 回放恒缺席(它们跑在 supersede 发生之前),
+    历史侧每个条目恒存在(缺省 ``null`` / ``False``,不是「缺省不出现」)。
+    """
+    streamed = 0
+    for turn in golden.turns:
+        for label, items in (("live", _fold(turn.live)), ("replay", _fold(turn.replay))):
+            for item in items:
+                assert "superseded_by" not in item, (label, turn.run_id, item)
+                assert "tombstone" not in item, (label, turn.run_id, item)
+            streamed += len(items)
+    assert streamed >= 8, streamed
+
+    historic = 0
+    for run_id, items in golden.history.items():
+        for item in items:
+            assert item["superseded_by"] is None, (run_id, item)
+            assert item["tombstone"] is False, (run_id, item)
+            historic += 1
+    assert historic >= 8, historic
 
 
 # ---------------------------------------------------------------------------

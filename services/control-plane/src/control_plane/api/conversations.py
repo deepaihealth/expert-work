@@ -165,6 +165,11 @@ def _run_to_dict(info: RunInfo, tokens: dict[str, Any] | None) -> dict[str, Any]
         # 前后一样。``null`` = 这一列上线前的历史 run,或 run 在构建成功前就
         # 结束了 —— **不是**「配置为空」,所以前端只在两侧都有值时才比较。
         "agent_spec_sha256": info.agent_spec_sha256,
+        # P-1 —— 这一轮被哪个新 run 取代 / 它自己是哪个旧 run 的重发。
+        "superseded_by": str(info.superseded_by_run_id) if info.superseded_by_run_id else None,
+        "regenerated_from": str(info.regenerated_from_run_id)
+        if info.regenerated_from_run_id
+        else None,
         "tokens": tokens,
     }
 
