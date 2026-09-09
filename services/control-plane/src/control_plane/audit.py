@@ -136,6 +136,13 @@ ResourceType = Literal[
     # Literal per [memory:audit-literal-drift] (both must stay in sync).
     "skill_promote_request",
     "skill_evolution_kill_switch",
+    # Stream J.9-step3 — Mini-ADR J-25 (ARTIFACT_DELETE / ARTIFACT_UPDATE).
+    # Was only ever on the protocol side; the three ``emit(resource_type=
+    # "artifact")`` call sites (``api/artifacts.py``, ``api/external_artifacts.py``)
+    # were silent type errors because CI mypy does not scan control-plane
+    # (B-11). Mirrors the protocol-side ``ResourceType`` Literal per
+    # [memory:audit-literal-drift] (both must stay in sync).
+    "artifact",
     "trigger",  # Stream J.10 — Mini-ADR J-26 / J-42
     "webhook_endpoint",  # HX-9 — STREAM-HX § 13 (outbound webhook hook)
     "eval_dataset",  # Stream J.12 — Mini-ADR J-43
