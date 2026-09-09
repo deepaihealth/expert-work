@@ -1130,6 +1130,9 @@ async def test_feedback_stays_on_the_run_it_was_given_for(ctx: _Ctx) -> None:
     by_run = {r["run_id"]: r["feedback"] for r in resp.json()["data"]["runs"]}
     assert by_run[str(first_run)] == {"rating": "down", "comment": "答非所问", "item_id": None}
     assert by_run[str(second_run)] is None
+
+
+@pytest.mark.asyncio
 async def test_items_and_runs_expose_supersede_links(ctx: _Ctx) -> None:
     """P-1 —— 被取代的一轮:``runs[]`` 两个链接键 + 该轮每个条目带 ``superseded_by``。"""
     from expert_work.common.supersede import mark_superseded

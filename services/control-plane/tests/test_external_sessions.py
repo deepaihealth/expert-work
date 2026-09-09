@@ -932,6 +932,18 @@ async def test_messages_echo_only_the_callers_own_feedback(ctx: _Ctx) -> None:
             actor_id="someone-else",
         )
     )
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/sessions/{session_id}/messages",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    msgs = resp.json()["data"]["messages"]
+    assert len(msgs) == 2
+    assert all(m["feedback"] == {"rating": "up", "comment": None, "item_id": None} for m in msgs)
+
+
+@pytest.mark.asyncio
 async def test_messages_expose_superseded_by_and_tombstone(ctx: _Ctx) -> None:
     """P-1 —— 被取代轮在 ``/messages`` 上可见且带标记;墓碑正文为空但仍占一行。"""
     from expert_work.common.supersede import mark_superseded, tombstone_message
@@ -967,9 +979,7 @@ async def test_messages_expose_superseded_by_and_tombstone(ctx: _Ctx) -> None:
     )
     assert resp.status_code == 200, resp.text
     msgs = resp.json()["data"]["messages"]
-    assert len(msgs) == 2
-    assert all(m["feedback"] == {"rating": "up", "comment": None, "item_id": None} for m in msgs)
-    rows = resp.json()["data"]["messages"]
+    rows = msgs
     assert [(r["content"], r["superseded_by"], r["tombstone"]) for r in rows] == [
         ("", str(new_run), True),
         ("U1", str(new_run), False),
