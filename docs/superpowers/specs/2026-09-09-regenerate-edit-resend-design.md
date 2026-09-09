@@ -55,7 +55,7 @@
   - body:`{ user_id, mode: "stream"|"queue", stream_format?, input? (仅 :edit 必填), files?: [{upload_id}] }`;支持 `Idempotency-Key`(重发不产生第二条 run);`on_disconnect=CONTINUE` 与普通 run 一致。
   - 响应与 `POST …/runs` 完全一致(stream 模式直接是 SSE;queue 模式 202 + run_id)。
   - 错误:`RUN_NOT_LAST`(422,目标不是最后一轮)/ `THREAD_BUSY`(409,有 run 在跑)/ `RUN_AWAITING_APPROVAL`(409,目标轮等审批)/ `RUN_ALREADY_SUPERSEDED`(409)。进 `docs-site/guide/errors.md`。
-- 读面:`/messages` 每条、`/items` 每个条目与 `runs[]` 加 `superseded_by: run_id | null`;`runs[]` 加 `regenerated_from: run_id | null`;墓碑条目 `tombstone: true` 且无 content。缺省不出现(对接方按既有约定忽略未知字段)。
+- 读面:`/messages` 每条、`/items` 每个条目与 `runs[]` 加 `superseded_by: run_id | null`;`runs[]` 加 `regenerated_from: run_id | null`;墓碑条目 `tombstone: true` 且无 content。**字段始终出现,缺省 `null` / `false`**(与 P-2 的 `feedback: null` 同一约定;对接方已确认无 strict 解析 —— 09-09 计划评审改口,原写「缺省不出现」)。
 - SSE **无新帧**;新一轮的帧序与普通 run 相同。
 - 三张手工路由表登记(`test_external_only_gate.py:66` / `test_console_lockdown.py:251` / `test_external_path_param_nul_guard.py:502`)。
 - 文档:`chat.md`(新节「重新生成与编辑重发」,明写不撤销副作用、两轮都计费、只对最后一轮)、`sse-events.md`(无新帧但说明 `superseded_by`)、`query.md`(字段表)、`errors.md`、`examples.md`、`best-practices.md`。
