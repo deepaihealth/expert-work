@@ -97,6 +97,16 @@ class CurationCandidateRow(Base):
     retry_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0"), default=0
     )
+    #: P-2 — 被踩的那一轮 / 用户原话 / 👎→👍 改票时间(NULL = 没改过)/
+    #: 这一踩的来源('console' = 员工,'external' = 终端用户;NULL = worker
+    #: 兜底建的候选,归因不到某一条 feedback)。四列是同一组反馈快照。
+    #: ``feedback_source`` 的写入方与展示方在 PR4 Task 20,本 PR 只建列。
+    feedback_run_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    feedback_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feedback_changed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    feedback_source: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(f"outcome IN {_OUTCOME_VALUES}", name="curation_candidate_outcome_valid"),
@@ -105,6 +115,10 @@ class CurationCandidateRow(Base):
             f"feedback_rating IN {_RATING_VALUES}", name="curation_candidate_rating_valid"
         ),
         CheckConstraint(f"status IN {_STATUS_VALUES}", name="curation_candidate_status_valid"),
+        CheckConstraint(
+            "feedback_source IS NULL OR feedback_source IN ('console', 'external')",
+            name="candidate_feedback_source_valid",
+        ),
         UniqueConstraint("tenant_id", "trajectory_key", name="curation_candidate_trajectory_uniq"),
         Index("ix_curation_candidate_tenant_id", "tenant_id"),
         Index("ix_curation_candidate_agent", "tenant_id", "agent_name"),
@@ -113,5 +127,11 @@ class CurationCandidateRow(Base):
             "tenant_id",
             "agent_name",
             postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_curation_candidate_feedback_run",
+            "tenant_id",
+            "feedback_run_id",
+            postgresql_where=text("feedback_run_id IS NOT NULL"),
         ),
     )
