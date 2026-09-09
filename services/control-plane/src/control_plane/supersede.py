@@ -177,7 +177,9 @@ LIMIT 1
 
 #: 慢路径告警只发一条 —— 一次就够定位,每次取代都打会把日志刷成噪声。
 #: 进程级(pod 重启后会重新发一条,那正是我们想要的:换了镜像还没修就再提醒一次)。
-_slow_path_warned = False
+#: 用 set 而不是 bool + ``global``:后者被 CodeQL 判成 unused global(它不认
+#: ``global`` 里的赋值),而且模块级可变状态用容器改起来也不必声明 global。
+_slow_path_warned: set[str] = set()
 
 
 def _configured_checkpointer_backend() -> str | None:
@@ -206,12 +208,11 @@ def _warn_slow_path_once(graph: Any) -> None:
     只有有人专门去看耗时才会发现(Task 0 实测 810-950 ms / 52 MB)。
     ``memory`` 后端走 history 是**预期**的(单测 / 本地),不告警。
     """
-    global _slow_path_warned
     if _slow_path_warned:
         return
     if _configured_checkpointer_backend() != "postgres":
         return
-    _slow_path_warned = True
+    _slow_path_warned.add("checkpoint_pool_unavailable")
     cp = getattr(graph, "checkpointer", None)
     inner = getattr(cp, "_inner", cp)
     logger.warning(

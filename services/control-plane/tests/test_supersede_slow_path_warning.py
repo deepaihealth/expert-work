@@ -44,9 +44,9 @@ class _Graph:
 
 @pytest.fixture(autouse=True)
 def _reset_once_flag() -> Any:
-    supersede_mod._slow_path_warned = False
+    supersede_mod._slow_path_warned.clear()
     yield
-    supersede_mod._slow_path_warned = False
+    supersede_mod._slow_path_warned.clear()
 
 
 def _no_config() -> str | None:
