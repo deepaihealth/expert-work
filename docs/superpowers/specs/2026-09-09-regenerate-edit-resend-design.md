@@ -35,7 +35,7 @@
 1. **并发闸**:per-thread advisory lock(照 `trigger_delivery.py:59-75`);会话有 run 处于 `_WRITE_BLOCKED_STATUSES`(running/pending/paused…)→ 409。
 2. **定轮边界(取法 A)**:`aget_state_history(cfg, filter={"run_id": target})` → 最早的 checkpoint(`source=="input"`)的 `parent_config` → `aget_state(parent)`:`len(messages)` = 该轮起始下标 `s`,`plan` = 回退值 `plan_before`;目标 run 最新 checkpoint 的 `len(messages)` = 结束下标 `e`。**不靠消息戳划轮**(Tool/System 无戳)。
 3. **一次 `aupdate_state(values={"messages": copies, "plan": plan_before}, as_node="agent")`**:`copies` = 下标 `[s, e)` 的每条消息按**原 id** 复制,`additional_kwargs["expert_work_superseded_by"] = new_run_id`、`["expert_work_superseded_at"] = now`。reducer 同 id 原地替换:条数、下标、内容不变(spike 反证:副本无 id → 被当新消息追加)。**`as_node` 必须是 `"agent"`**(`"__start__"` 会让 `next=("agent",)`,orphan sweep / 审批续跑会把被取代轮再跑一次;`None` 靠运气)。
-4. 同一事务:`agent_run.superseded_by_run_id = new_run_id`(迁移 0152);`thread_message` 镜像**显式更新**该 `seq` 范围的 `superseded_by`(镜像 `DO NOTHING` 永远学不到标记,spike 实测);`thread_meta.message_count` 重算。
+4. 同一事务:`agent_run.superseded_by_run_id = new_run_id`(迁移 0153);`thread_message` 镜像**显式更新**该 `seq` 范围的 `superseded_by`(镜像 `DO NOTHING` 永远学不到标记,spike 实测);`thread_meta.message_count` 重算。
 5. **留 5 份**:同一起始下标 `s` 的被取代版本数 > 5 时,最老版本的消息**内容置为墓碑**(`content=""`、`additional_kwargs["expert_work_tombstone"]=true`,保留 id 与下标)—— **不用 `RemoveMessage` 真删**,真删会让后续下标左移、镜像 `seq` 错位。
 6. 若目标轮结束在 PAUSED:直接 409(拍板);不做「清 `pending_approval` 再 supersede」。
 
@@ -46,7 +46,7 @@
 
 ### 3.3 新一轮
 - `spawn_run` 加 `supersedes_run_id` 参数:先 `supersede_run`,再照常建 run 行、`build_run_graph_input`、`run_agent`。`:regenerate` 用目标轮的原输入(从被取代轮的 HumanMessage 取,含附件引用);`:edit` 用新 `input`。
-- 新 run 行加 `regenerated_from_run_id`(迁移 0152 同批)。
+- 新 run 行加 `regenerated_from_run_id`(迁移 0153 同批)。
 
 ## 4. 对外 API
 
@@ -70,7 +70,7 @@
 
 ## 7. PR 切分与验收
 
-**PR1 内核 + 读面**(共享分组函数下沉 common;`supersede_run`;迁移 0152 两列;`extract_turns`/`visible_turns` 的 `include_superseded` 开关;镜像与 message_count 更新;墓碑上限 5)
+**PR1 内核 + 读面**(共享分组函数下沉 common;`supersede_run`;迁移 0153 两列(0152 归 P-2 反馈表,P-2 先合);`extract_turns`/`visible_turns` 的 `include_superseded` 开关;镜像与 message_count 更新;墓碑上限 5)
 - 验收:supersede 后 `/messages`、`/items`、控制台消息接口三者对被取代轮一致标记且内容仍在;`message_count` 与 `/messages` 同口径;第 6 次 supersede 最老版本变墓碑、下标不变、镜像 seq 不变;拿掉写入 → 红。
 
 **PR2 执行侧**(builder 整轮过滤 + 变异自证;`spawn_run(supersedes_run_id=)`;per-thread 409 闸;PAUSED 409)
