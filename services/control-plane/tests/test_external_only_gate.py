@@ -26,10 +26,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import Depends
 from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 
-from control_plane.api._authz import external_only
+from control_plane.api._authz import external_only, route_is_external
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -640,3 +641,95 @@ def test_agents_router_external_only_routes_carry_the_guard() -> None:
         if should_carry != actually
     ]
     assert not mismatched, f"external_only() correspondence mismatch: {mismatched}"
+
+
+# ---------------------------------------------------------------------------
+# B-10 — the converse audit: ``external_only()`` ⇒ ``tags=["external"]``.
+#
+# The audits above (and the two sibling files' NUL-guard / reachability
+# audits) DISCOVER the external plane by tag. That direction is sound as far
+# as it goes — every tagged route is checked — but it is blind to a router
+# that someone builds with ``Depends(external_only())`` and forgets to tag:
+# the routes are live, they are the external plane, and no audit ever sees
+# them. Nothing today enforces the tag. This closes the gap from the other
+# side, using the PRODUCTION notion of "external" (``route_is_external``,
+# the predicate ``app.py``'s 422 envelope reads) so the audit and the
+# envelope can never disagree about what the external plane is.
+# ---------------------------------------------------------------------------
+
+
+def _external_only_routes_missing_the_tag(app: Any) -> set[tuple[str, str]]:
+    """``(method, path)`` of every live route that carries ``external_only()``
+    but no ``external`` tag — a full enumeration of the compiled app, filtered
+    by route SHAPE (guard present, tag absent), never by table membership."""
+    return {
+        (method, route.path)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        and route_is_external(route)
+        and "external" not in (route.tags or [])
+        for method in (route.methods or set())
+        if method not in ("HEAD", "OPTIONS")
+    }
+
+
+def test_every_external_only_route_is_tagged_external_except_the_allowlist() -> None:
+    """Set EQUALITY against ``_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES`` — the
+    two ``agents.py`` routes that predate the ``external_*.py`` split and
+    are the only legitimate "guarded but untagged" routes.
+
+    Equality, not ``<=``, so the allowlist cannot become a self-certifying
+    black box: an allowlist entry that is NOT live, or that no longer
+    carries ``external_only()``, or that has since gained the tag, makes
+    the two sides differ just as loudly as a new untagged route does. Each
+    allowlisted route is therefore proven, on every run, to be exactly what
+    the allowlist claims it is.
+    """
+    missing = _external_only_routes_missing_the_tag(_build_audit_app())
+    assert missing == _AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES, (
+        f"untagged external_only() routes outside the allowlist: "
+        f"{sorted(missing - _AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES)}; "
+        f"allowlist entries that are not a live untagged external_only() route: "
+        f"{sorted(_AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES - missing)}"
+    )
+
+
+def test_the_tag_audit_sees_an_untagged_external_only_route() -> None:
+    """The permanent form of this audit's mutation proof: mount one route
+    that carries ``external_only()`` and no tag on the REAL compiled app —
+    the exact "someone forgot the tag" case — and require the audit to flag
+    it, and only it, beyond the allowlist. An audit that filtered by table
+    membership (the construction bug ``_AGENTS_ROUTER_UNIVERSE``'s docstring
+    records) would pass the test above vacuously and fail this one.
+    """
+    app = _build_audit_app()
+    probe = ("GET", "/v1/b10-probe/{agent_code}/thing")
+
+    async def _handler() -> dict[str, str]:  # pragma: no cover - never called
+        return {}
+
+    app.add_api_route(
+        probe[1], _handler, methods=[probe[0]], dependencies=[Depends(external_only())]
+    )
+    flagged = _external_only_routes_missing_the_tag(app)
+    assert probe in flagged, "audit did not see an untagged external_only() route"
+    assert flagged - {probe} == _AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES
+
+
+def test_route_is_external_agrees_with_the_qualname_discoverer() -> None:
+    """``route_is_external`` (production: a marker attribute stamped by
+    ``external_only()``) and this file's ``_carries_external_only_guard``
+    (closure qualname) must agree on every compiled route. If the marker
+    were ever dropped, ``app.py`` would silently envelope NOTHING while the
+    qualname-based audits above stayed green — this is the one place that
+    would turn red.
+    """
+    app = _build_audit_app()
+    routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    disagreeing = [
+        f"{sorted(r.methods or ())} {r.path}"
+        for r in routes
+        if route_is_external(r) != _carries_external_only_guard(r)
+    ]
+    assert not disagreeing, disagreeing
+    assert any(route_is_external(r) for r in routes), "vacuous: no external route seen"
