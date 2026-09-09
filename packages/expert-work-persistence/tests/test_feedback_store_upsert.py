@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic import command
@@ -17,7 +17,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
-from expert_work.persistence import DatabaseConfig, create_async_engine_from_config
+from expert_work.persistence import (
+    DatabaseConfig,
+    create_async_engine_from_config,
+    create_async_session_factory,
+)
+from expert_work.persistence.feedback_store import (
+    DbFeedbackStore,
+    FeedbackRecord,
+    FeedbackStore,
+    InMemoryFeedbackStore,
+)
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 
@@ -113,3 +123,97 @@ async def test_0152_source_check_and_candidate_columns(migrated_engine: AsyncEng
         "feedback_changed_at",
         "feedback_source",
     } <= cols
+
+
+def _rec(
+    *,
+    tenant_id: UUID,
+    thread_id: UUID,
+    run_id: UUID | None,
+    actor_id: str = "ext-user-1",
+    rating: str = "down",
+    comment: str | None = None,
+    item_id: str | None = None,
+    source: str = "external",
+) -> FeedbackRecord:
+    return FeedbackRecord(
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        rating=rating,
+        comment=comment,
+        item_id=item_id,
+        source=source,
+        actor_id=actor_id,
+    )
+
+
+async def _upsert_scenario(store: FeedbackStore) -> None:
+    tenant, thread, run = uuid4(), uuid4(), uuid4()
+    first, updated = await store.upsert(
+        _rec(tenant_id=tenant, thread_id=thread, run_id=run, comment="太慢", item_id="p1")
+    )
+    assert updated is False
+    assert first.id is not None and first.created_at is not None and first.updated_at is None
+
+    second, updated = await store.upsert(
+        _rec(tenant_id=tenant, thread_id=thread, run_id=run, rating="up", comment=None)
+    )
+    assert updated is True
+    assert second.id == first.id
+    assert second.created_at == first.created_at
+    assert second.rating == "up" and second.comment is None and second.item_id is None
+    assert second.updated_at is not None
+
+    rows = await store.list_for_thread_scoped(tenant_id=tenant, thread_id=thread)
+    assert [r.id for r in rows] == [first.id]  # 一行,不是两行
+
+    # 另一个 actor 同一轮 → 各自一行。
+    other, updated = await store.upsert(
+        _rec(tenant_id=tenant, thread_id=thread, run_id=run, actor_id="ext-user-2")
+    )
+    assert updated is False and other.id != first.id
+    rows = await store.list_for_thread_scoped(tenant_id=tenant, thread_id=thread)
+    assert [r.id for r in rows] == [other.id, first.id]  # id 降序
+
+    # 显式租户谓词:别的租户看不到。
+    assert await store.list_for_thread_scoped(tenant_id=uuid4(), thread_id=thread) == []
+
+    with pytest.raises(ValueError, match="run_id"):
+        await store.upsert(_rec(tenant_id=tenant, thread_id=thread, run_id=None))
+
+
+async def _down_rated_scenario(store: FeedbackStore) -> None:
+    tenant = uuid4()
+    t_down, t_up, t_mixed = uuid4(), uuid4(), uuid4()
+    await store.upsert(_rec(tenant_id=tenant, thread_id=t_up, run_id=uuid4(), rating="up"))
+    await store.upsert(_rec(tenant_id=tenant, thread_id=t_down, run_id=uuid4(), rating="down"))
+    await store.upsert(_rec(tenant_id=tenant, thread_id=t_mixed, run_id=uuid4(), rating="up"))
+    await store.upsert(
+        _rec(tenant_id=tenant, thread_id=t_mixed, run_id=uuid4(), rating="down", actor_id="b")
+    )
+    assert await store.down_rated_thread_ids(tenant_id=tenant) == {t_down, t_mixed}
+    assert await store.down_rated_thread_ids(tenant_id=tenant, limit=1) == {t_down}
+    assert await store.down_rated_thread_ids(tenant_id=uuid4()) == set()
+
+
+@pytest.mark.asyncio
+async def test_in_memory_upsert_overwrites_same_run_actor() -> None:
+    await _upsert_scenario(InMemoryFeedbackStore())
+
+
+@pytest.mark.asyncio
+async def test_in_memory_down_rated_thread_ids() -> None:
+    await _down_rated_scenario(InMemoryFeedbackStore())
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sql_upsert_overwrites_same_run_actor(migrated_engine: AsyncEngine) -> None:
+    await _upsert_scenario(DbFeedbackStore(create_async_session_factory(migrated_engine)))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sql_down_rated_thread_ids(migrated_engine: AsyncEngine) -> None:
+    await _down_rated_scenario(DbFeedbackStore(create_async_session_factory(migrated_engine)))
