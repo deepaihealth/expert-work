@@ -353,9 +353,27 @@ jobs:
         # upstream yet; ignore until pyjwt cuts a patched release.
         # Track: https://github.com/jpadilla/pyjwt/security/advisories
         # (re-evaluate when ``uvx pip index versions pyjwt`` shows >2.12.1).
+        #
+        # B-24 — pypi.org occasionally read-times-out mid-audit (observed
+        # 2026-07-27 as an uncaught ``requests.exceptions.ReadTimeout:
+        # HTTPSConnectionPool(host='pypi.org', port=443): Read timed out.
+        # (read timeout=15)``). That exits 1 — the same code as "vulnerabilities
+        # found" — so the only lever is to retry the whole step: 3 attempts,
+        # 10s/20s back-off. A genuine finding just fails three times (~7s
+        # each, still far inside the job's 5-minute cap).
         run: |
-          uvx pip-audit -r requirements-audit.txt --strict --disable-pip \
-            --no-deps --ignore-vuln PYSEC-2025-183
+          for attempt in 1 2 3; do
+            if uvx pip-audit -r requirements-audit.txt --strict --disable-pip \
+                --no-deps --ignore-vuln PYSEC-2025-183; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::pip-audit attempt ${attempt}/3 failed; retrying in $((attempt * 10))s"
+              sleep $((attempt * 10))
+            fi
+          done
+          echo "::error::pip-audit failed on all 3 attempts"
+          exit 1
 
   pre-commit:
     name: Pre-commit

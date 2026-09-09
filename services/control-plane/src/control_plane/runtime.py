@@ -1135,6 +1135,9 @@ class ResolvingReranker:
     #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
     #: yet wired) reads the vault every call (pre-T3 behaviour).
     secret_cache: CredentialValueCache | None = None
+    #: B-44 ② — global provider RPM bucket factory for the LLM-rerank branch,
+    #: same as :class:`DynamicResolvingReranker`. ``None`` = per-process bucket.
+    rate_limiter_factory: RateLimiterFactory | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -1173,7 +1176,10 @@ class ResolvingReranker:
         # 刻意不传 cache——plan 拍定不穿透 build_llm_router 的 vault 读
         # (rerank-LLM 分支少见配置,见 plan Global Constraints)。
         router = await build_llm_router(
-            model_spec, secret_store=self.secret_store, http_client=self.http
+            model_spec,
+            secret_store=self.secret_store,
+            http_client=self.http,
+            rate_limiter_factory=self.rate_limiter_factory,
         )
         return await LLMReranker(llm_caller=router).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
@@ -1328,6 +1334,7 @@ async def resolve_reranker(
     provider: Provider,
     model: str,
     supported_providers: Sequence[Provider],
+    rate_limiter_factory: RateLimiterFactory | None = None,
 ) -> Reranker | None:
     """Build the per-tenant credential-resolving reranker (Stream J.5 +
     Mini-ADR O-9). ``provider`` not in ``supported_providers`` → ``None``
@@ -1335,7 +1342,11 @@ async def resolve_reranker(
     if provider not in supported_providers:
         return None
     return ResolvingReranker(
-        resolver=resolver, secret_store=secret_store, provider=provider, model=model
+        resolver=resolver,
+        secret_store=secret_store,
+        provider=provider,
+        model=model,
+        rate_limiter_factory=rate_limiter_factory,
     )
 
 
