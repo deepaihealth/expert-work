@@ -319,6 +319,56 @@ async def test_bind_session_and_run_422_use_the_external_envelope(ctx: _Ctx) -> 
     assert run_body["error"]["code"] == "INVALID_REQUEST"
 
 
+@pytest.mark.asyncio
+async def test_a_write_without_content_type_is_rejected_in_the_external_envelope(
+    ctx: _Ctx,
+) -> None:
+    """A JSON body sent WITHOUT ``Content-Type`` must be refused — enveloped.
+
+    FastAPI's ``strict_content_type`` (default ``True``) stops it from
+    guessing that a bodied request is JSON when the caller declares no media
+    type; the body then arrives at the model as a raw string and pydantic
+    raises, so the caller gets a 422 rather than a silently-parsed 200. This
+    is CSRF hardening: a form POST cross-site can set no useful media type,
+    and "we'll parse it as JSON anyway" is what makes such a request reach a
+    write endpoint.
+
+    Pinned here because it is the external plane's contract, and the failure
+    it produces is not self-describing: the message says the *body* is not a
+    dictionary, never that the *header* is missing (see
+    ``docs-site/guide/conventions.md`` § 7.3, which already lists
+    ``Content-Type: application/json`` as required for every write). Two
+    things this catches: someone passing ``strict_content_type=False`` to
+    ``FastAPI(...)`` in ``app.py`` to "fix" a caller's 422, and a future
+    FastAPI flipping the default back. Not a behaviour change of the
+    X-12 bump — measured identical on 0.136.3 (the version this repo ran
+    before) and 0.141.1.
+    """
+    await ctx.seed_agent()
+    body = b'{"user_id": "cust-ct", "input": "hi", "mode": "queue"}'
+
+    # Control — the exact same bytes, with the header the docs require.
+    declared = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        content=body,
+        headers={**ctx.headers, "Content-Type": "application/json"},
+    )
+    assert declared.status_code == 202, declared.text
+
+    undeclared = await ctx.client.post(
+        "/v1/agents/support-bot/runs", content=body, headers=ctx.headers
+    )
+    assert undeclared.status_code == 422, undeclared.text
+    envelope = undeclared.json()
+    # Enveloped, not FastAPI's bare ``{"detail": [...]}`` — a third party
+    # parses one error shape, including for this one.
+    assert "detail" not in envelope
+    assert envelope["success"] is False
+    assert envelope["data"] is None
+    assert envelope["error"]["code"] == "INVALID_REQUEST"
+    assert envelope["error"]["message"]
+
+
 # ---------------------------------------------------------------------------
 # External-API-v1 P1 followup — lookup_external_user_id's 500-row scan ceiling
 # ---------------------------------------------------------------------------
