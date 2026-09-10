@@ -43,6 +43,40 @@ def _principal(request: Request) -> Principal:
     return principal
 
 
+async def _require_allowed(
+    principal: Principal, audit: AuditLogger, *, resource: Resource, action: Action
+) -> Principal:
+    """The one RBAC decision + denial path behind :func:`require` and
+    :func:`ensure_allowed` — same audit row, same 403 body, by construction."""
+    if is_allowed(principal, resource=resource, action=action):
+        return principal
+    try:
+        await emit(
+            audit,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.subject_id,
+            action=AuditAction.AUTH_LOGIN_FAILED,
+            resource_type="user",
+            resource_id=f"{resource}:{action}",
+            result=AuditResult.DENIED,
+            reason="RBAC_FORBIDDEN",
+            trace_id=current_trace_id_hex(),
+            details={
+                "resource": resource,
+                "action": action,
+                "roles": list(collect_roles_for_audit(principal)),
+                "subject_type": principal.subject_type,
+            },
+        )
+    except Exception:
+        # Never block the 403 on audit failure; record it and proceed.
+        logger.exception("authz.deny_audit_emit_failed")
+    raise HTTPException(
+        status_code=403,
+        detail={"code": "FORBIDDEN", "message": "principal lacks required role"},
+    )
+
+
 def require(resource: Resource, action: Action) -> Callable[..., Awaitable[Principal]]:
     """Return a FastAPI dependency that 403s if the principal lacks ``(resource, action)``."""
 
@@ -51,35 +85,22 @@ def require(resource: Resource, action: Action) -> Callable[..., Awaitable[Princ
         principal: Annotated[Principal, Depends(_principal)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> Principal:
-        if is_allowed(principal, resource=resource, action=action):
-            return principal
-        try:
-            await emit(
-                audit,
-                tenant_id=principal.tenant_id,
-                actor_id=principal.subject_id,
-                action=AuditAction.AUTH_LOGIN_FAILED,
-                resource_type="user",
-                resource_id=f"{resource}:{action}",
-                result=AuditResult.DENIED,
-                reason="RBAC_FORBIDDEN",
-                trace_id=current_trace_id_hex(),
-                details={
-                    "resource": resource,
-                    "action": action,
-                    "roles": list(collect_roles_for_audit(principal)),
-                    "subject_type": principal.subject_type,
-                },
-            )
-        except Exception:
-            # Never block the 403 on audit failure; record it and proceed.
-            logger.exception("authz.deny_audit_emit_failed")
-        raise HTTPException(
-            status_code=403,
-            detail={"code": "FORBIDDEN", "message": "principal lacks required role"},
-        )
+        return await _require_allowed(principal, audit, resource=resource, action=action)
 
     return _dep
+
+
+async def ensure_allowed(request: Request, *, resource: Resource, action: Action) -> Principal:
+    """Handler-body form of :func:`require` — same decision, same audit row, same 403.
+
+    For the rare route whose gate depends on the request *body* and so
+    cannot be a route dependency: ``POST /v1/skill-evolution/kill-switch/*``
+    is one endpoint that branches on ``body.scope`` (``global`` →
+    system_admin, ``tenant`` → this). Call it before touching anything.
+    """
+    return await _require_allowed(
+        _principal(request), _get_audit(request), resource=resource, action=action
+    )
 
 
 def require_key_scope(action: Action) -> Callable[..., Awaitable[None]]:

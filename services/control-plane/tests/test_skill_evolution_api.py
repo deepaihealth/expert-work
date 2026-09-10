@@ -664,3 +664,66 @@ async def test_list_promote_requests_tenant_visibility_unaffected(setup: Setup, 
     )
     assert q.status_code == 200, f"{role}: {q.status_code} {q.text}"
     assert rid in [x["id"] for x in q.json()["items"]], f"{role}: {q.json()['items']}"
+
+
+# ── B-49 — tenant kill-switch role gate ─────────────────────────────────────
+#
+# Found by the B-49 live scan (viewer / operator / admin each sent real
+# requests at all 182 console routes): ``_set_kill_switch``'s ``global``
+# branch checks ``is_system_admin``, but its ``tenant`` branch only ran
+# ``_single_scope`` (the tenant axis) — no role check at all. A ``viewer``
+# posting ``{scope: "tenant"}`` could halt the whole tenant's skill evolution
+# and then release it again. The module docstring says "a tenant admin
+# manages their own tenant"; the code did not.
+#
+# The gate lives in the handler body (one endpoint branches on ``body.scope``,
+# so a route-level ``require`` can't be scoped to the tenant branch) and
+# reuses ``tenant_config:write`` — held by ADMIN only in the matrix, and a
+# tenant-wide halt switch is tenant configuration.
+#
+# What proves the gate: ``viewer`` and ``operator`` are both provers for the
+# 403 (neither holds ``tenant_config:write``; the operator case also pins
+# that the gate is admin-only, not operator+); ``admin`` proves it isn't
+# over-tightened. The refusal must be the same shape a route-level
+# ``require()`` produces (``_assert_role_denied``) and leave the same
+# ``RBAC_FORBIDDEN`` audit row.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verb", ["engage", "release"])
+@pytest.mark.parametrize("role", ["viewer", "operator"])
+async def test_tenant_kill_switch_403_below_admin(setup: Setup, verb: str, role: str) -> None:
+    client, _, audit_store = setup
+    r = await client.post(
+        f"/v1/skill-evolution/kill-switch/{verb}",
+        json={"scope": "tenant"},
+        headers=_role_headers(role),
+    )
+    _assert_role_denied(r)
+    # nothing was flipped
+    g = (await client.get("/v1/skill-evolution/kill-switch")).json()
+    assert g["tenant"] is None
+    # the in-handler gate leaves the same audit trace a route-level require() would
+    denied = [
+        e
+        for e in (await audit_store.query(AuditQuery(tenant_id=_TENANT))).entries
+        if e.reason == "RBAC_FORBIDDEN"
+    ]
+    assert denied, "no RBAC_FORBIDDEN audit row"
+    assert denied[-1].resource_id == "tenant_config:write"
+
+
+@pytest.mark.asyncio
+async def test_tenant_kill_switch_admin_passes(setup: Setup) -> None:
+    client, _, _ = setup
+    headers = _role_headers("admin")
+    e = await client.post(
+        "/v1/skill-evolution/kill-switch/engage", json={"scope": "tenant"}, headers=headers
+    )
+    assert e.status_code == 200, e.text
+    assert e.json()["engaged"] is True
+    r = await client.post(
+        "/v1/skill-evolution/kill-switch/release", json={"scope": "tenant"}, headers=headers
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["engaged"] is False

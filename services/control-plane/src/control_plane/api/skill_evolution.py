@@ -17,9 +17,10 @@ Authz (SE-8): a tenant admin manages their own tenant; a system_admin manages
 all tenants (``?tenant_id=<uuid>`` to act on another, ``?tenant_id=*`` to span
 the review queue). Enforced via :func:`ensure_tenant_scope`. ``approve`` /
 ``reject`` additionally require ``manifest:write`` — operator and above (P-5,
-same convention as the 阶段 1.5 content plane). Responses are raw
-``JSONResponse`` (matching ``/v1/skills`` / ``/v1/curation``); every write emits
-an audit row.
+same convention as the 阶段 1.5 content plane). The tenant-scope kill-switch
+requires ``tenant_config:write`` — admin only (B-49); the global one is
+system_admin only. Responses are raw ``JSONResponse`` (matching ``/v1/skills``
+/ ``/v1/curation``); every write emits an audit row.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from control_plane.api._authz import console_only, require
+from control_plane.api._authz import console_only, ensure_allowed, require
 from control_plane.api.skills import (
     _get_audit,
     _get_skill_store,
@@ -560,6 +561,14 @@ def build_skill_evolution_router() -> APIRouter:
                 )
             audit_tenant = request.state.principal.tenant_id  # home tenant for attribution
         else:
+            # B-49 — this branch had no role check at all (only the tenant
+            # axis via ``_single_scope``): a viewer could halt the whole
+            # tenant's evolution and release it again. Tenant admin only —
+            # ``tenant_config:write`` is ADMIN-only in the matrix and a
+            # tenant-wide halt switch is tenant configuration. In the handler
+            # body because this one endpoint branches on ``body.scope``; same
+            # audit row + 403 body as a route-level ``require()``.
+            await ensure_allowed(request, resource="tenant_config", action="write")
             scope = await _single_scope(request, tenant_id, audit, "POST .../kill-switch")
             async with applied_scope(scope):
                 sw = await store.set_kill_switch(
