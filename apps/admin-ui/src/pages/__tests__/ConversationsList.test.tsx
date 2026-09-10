@@ -245,6 +245,23 @@ describe("ConversationsList", () => {
     );
   });
 
+  it("rated-bad checkbox flows into the hasDownRated param", async () => {
+    const user = userEvent.setup();
+    listConversationsMock.mockResolvedValue({ items: [], total: 0, cross_tenant: false });
+    renderPage();
+    await waitFor(() => expect(listConversationsMock).toHaveBeenCalled());
+    // 不勾时不能悄悄带上 —— 否则「筛选」变成了默认行为。
+    expect(listConversationsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ hasDownRated: false }),
+    );
+    await user.click(screen.getByTestId("conversations-down-rated-only"));
+    await waitFor(() =>
+      expect(listConversationsMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ hasDownRated: true, offset: 0 }),
+      ),
+    );
+  });
+
   it("renders the agent filter fed from the agents list", async () => {
     listConversationsMock.mockResolvedValue({ items: [], total: 0, cross_tenant: false });
     renderPage();

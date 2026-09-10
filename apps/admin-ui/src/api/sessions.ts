@@ -151,6 +151,40 @@ export async function getSessionMessages(
   return unwrap(response.data).messages;
 }
 
+/** P-2 — one 👍/👎 recorded on a run of this thread.
+ *
+ *  Console-side the whole thread's feedback is visible to every employee
+ *  (``session:read``, comments included) — the external ``/items`` /
+ *  ``/messages`` read is the one that shows only the caller's own vote. */
+export interface SessionFeedbackItem {
+  id: number;
+  run_id: string | null;
+  rating: "up" | "down";
+  comment: string | null;
+  item_id: string | null;
+  /** ``console`` = an employee rated it, ``external`` = an end user did. */
+  source: "console" | "external";
+  actor_id: string;
+  created_at: string | null;
+  /** Vote-change time; ``null`` = never changed. */
+  updated_at: string | null;
+}
+
+/** GET /v1/sessions/{threadId}/feedback — every rating on the thread, newest
+ *  first. Bare ``{items}`` (no envelope), same convention as the POST. */
+export async function getSessionFeedback(
+  threadId: string,
+  /** The thread's tenant — lets a system_admin read a foreign tenant's
+   *  feedback when drilling in from the cross-tenant browser. */
+  tenantId?: string,
+): Promise<SessionFeedbackItem[]> {
+  const response = await apiClient.get<{ items: SessionFeedbackItem[] }>(
+    `/v1/sessions/${threadId}/feedback`,
+    { params: tenantId ? { tenant_id: tenantId } : undefined },
+  );
+  return response.data.items;
+}
+
 /** Playground-Uplift #6 — list the caller's threads (user-scoped server-side),
  *  newest first; the playground filters to the current agent for resume.
  *  ``q`` searches the title; ``offset`` paginates; ``includeArchived`` also

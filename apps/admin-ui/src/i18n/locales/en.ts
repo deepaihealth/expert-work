@@ -378,6 +378,7 @@ export interface TranslationKeys {
     filter_agent: string;
     filter_errors_only: string;
     filter_pending_only: string;
+    filter_down_rated_only: string;
     auto_refresh: string;
     filter_window: string;
     window_all: string;
@@ -1204,6 +1205,10 @@ export interface TranslationKeys {
     no_turns: string;
     row_think: string;
     row_think_live: string;
+    feedback_up_label: string;
+    feedback_down_label: string;
+    feedback_source_external: string;
+    feedback_source_console: string;
     row_plan_update: string;
     row_plan_create: string;
     row_memory_recall: string;
@@ -1602,6 +1607,8 @@ export interface TranslationKeys {
     col_status: string;
     col_detected: string;
     col_outcome: string;
+    col_feedback_comment: string;
+    feedback_changed_tag: string;
     filter_status: string;
     filter_status_all: string;
     filter_signal: string;
@@ -1609,6 +1616,8 @@ export interface TranslationKeys {
     detail_title: string;
     detail_signal: string;
     detail_outcome: string;
+    detail_feedback_run: string;
+    detail_feedback_comment: string;
     detail_trajectory: string;
     trajectory_missing: string;
     promote: string;
@@ -3532,6 +3541,7 @@ const en: TranslationKeys = {
     filter_agent: "Filter by agent",
     filter_errors_only: "Errors only",
     filter_pending_only: "Awaiting approval",
+    filter_down_rated_only: "Rated bad",
     auto_refresh: "Auto-refresh (30s)",
     filter_window: "Time window",
     window_all: "All time",
@@ -4464,6 +4474,10 @@ const en: TranslationKeys = {
     no_turns: "No conversation yet — type below, or open a session on the left.",
     row_think: "Thinking",
     row_think_live: "Thinking…",
+    feedback_up_label: "Rated good",
+    feedback_down_label: "Rated bad",
+    feedback_source_external: "end user",
+    feedback_source_console: "employee",
     row_plan_update: "Plan · updated to {{n}} steps",
     row_plan_create: "Plan drafted · {{n}} steps",
     row_memory_recall: "Memory recall · {{n}}",
@@ -4872,6 +4886,8 @@ const en: TranslationKeys = {
     col_status: "Status",
     col_detected: "Detected",
     col_outcome: "Outcome",
+    col_feedback_comment: "User's words",
+    feedback_changed_tag: "later changed to 👍",
     filter_status: "Status filter",
     filter_status_all: "All statuses",
     filter_signal: "Signal filter",
@@ -4879,6 +4895,8 @@ const en: TranslationKeys = {
     detail_title: "Candidate detail",
     detail_signal: "Signal",
     detail_outcome: "Outcome",
+    detail_feedback_run: "Rated-down run",
+    detail_feedback_comment: "User's words",
     detail_trajectory: "Trajectory",
     trajectory_missing:
       "Trajectory artifact missing — promote / dismiss still allowed.",

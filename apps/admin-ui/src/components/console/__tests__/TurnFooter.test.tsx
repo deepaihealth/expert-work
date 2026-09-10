@@ -440,6 +440,160 @@ describe("TurnFooter", () => {
     expect(retryBtn).toBeInTheDocument();
     expect(retryBtn.className).toContain("dangerous"); // failed turn → danger styling
   });
+
+  it("P-2 — 摆出这一轮已记录的 👍/👎:评分 + 评论 + 来源", () => {
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+          feedback={[
+            {
+              id: 1,
+              run_id: "run-1",
+              rating: "down",
+              comment: "答非所问",
+              item_id: "p2",
+              source: "external",
+              actor_id: "u",
+              created_at: null,
+              updated_at: null,
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+    const summary = screen.getByTestId("console-turn-feedback-summary");
+    expect(summary).toHaveTextContent("点踩");
+    expect(summary).toHaveTextContent("答非所问");
+    expect(summary).toHaveTextContent("终端用户");
+    // readOnly 页只有只读展示,没有打分条 —— 两者不是同一个东西。
+    expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+  });
+
+  it("P-2 — 员工打的分标「员工」,👍 标「点赞」(与终端用户的 👎 区分开)", () => {
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+          feedback={[
+            {
+              id: 2,
+              run_id: "run-1",
+              rating: "up",
+              comment: null,
+              item_id: null,
+              source: "console",
+              actor_id: "emp-1",
+              created_at: null,
+              updated_at: null,
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+    const summary = screen.getByTestId("console-turn-feedback-summary");
+    expect(summary).toHaveTextContent("点赞");
+    expect(summary).toHaveTextContent("员工");
+    expect(summary).not.toHaveTextContent("点踩");
+    expect(summary).not.toHaveTextContent("终端用户");
+  });
+
+  it("P-2 — 不传 / 空数组时整块不渲染(调试台零变化)", () => {
+    const { rerender } = render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("console-turn-feedback-summary")).not.toBeInTheDocument();
+    // 调试台仍然有打分条 —— 新 prop 不能顺手把它挤掉。
+    expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
+    rerender(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+          feedback={[]}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("console-turn-feedback-summary")).not.toBeInTheDocument();
+  });
+
+  it("P-2 — 多条反馈各渲染一格(同一轮不同人打的分不合并)", () => {
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+          feedback={[
+            {
+              id: 1,
+              run_id: "run-1",
+              rating: "down",
+              comment: "太慢",
+              item_id: null,
+              source: "external",
+              actor_id: "end-user",
+              created_at: null,
+              updated_at: null,
+            },
+            {
+              id: 2,
+              run_id: "run-1",
+              rating: "up",
+              comment: null,
+              item_id: null,
+              source: "console",
+              actor_id: "emp-1",
+              created_at: null,
+              updated_at: null,
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getAllByTestId("console-turn-feedback-item")).toHaveLength(2);
+  });
 });
 
 

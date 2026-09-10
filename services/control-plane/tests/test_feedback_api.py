@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -247,3 +247,204 @@ async def test_candidate_sync_failure_never_loses_the_vote(
     entries = [e for e in page.entries if e.action.value == "feedback:create"]
     assert len(entries) == 1
     assert entries[0].details["candidate"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/sessions/{thread_id}/feedback — P-2 PR3 Task 12
+# ---------------------------------------------------------------------------
+
+
+async def _seed_thread(app: Any, thread_id: UUID, *, tenant_id: UUID = _DEFAULT_TENANT) -> None:
+    await app.state.thread_meta_repo.create(
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        created_by="seed",
+        user_id=uuid4(),
+        agent_name="alpha",
+        agent_version="1.0.0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_feedback_lists_every_rating_on_the_thread_newest_first(
+    client: AsyncClient, app: Any, feedback_store: InMemoryFeedbackStore
+) -> None:
+    """全员可见的是**这条会话的全部**反馈,不只是调用者自己那条。
+
+    与对外 ``/items`` / ``/messages`` 的「只回显本人」语义**刻意不同**:控制台
+    是运营审阅面,员工要看得到终端用户打的分。
+    """
+    thread_id, run_a, run_b = uuid4(), uuid4(), uuid4()
+    await _seed_thread(app, thread_id)
+    await feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=_DEFAULT_TENANT,
+            thread_id=thread_id,
+            run_id=run_a,
+            rating="down",
+            comment="太慢",
+            item_id="p1",
+            source="external",
+            actor_id="ext-1",
+        )
+    )
+    await feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=_DEFAULT_TENANT,
+            thread_id=thread_id,
+            run_id=run_b,
+            rating="up",
+            source="console",
+            actor_id="emp-1",
+        )
+    )
+    resp = await client.get(f"/v1/sessions/{thread_id}/feedback")
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    assert [i["run_id"] for i in items] == [str(run_b), str(run_a)]
+    assert items[1]["created_at"] is not None
+    assert items[1] == {
+        "id": items[1]["id"],
+        "run_id": str(run_a),
+        "rating": "down",
+        "comment": "太慢",
+        "item_id": "p1",
+        "source": "external",
+        "actor_id": "ext-1",
+        "created_at": items[1]["created_at"],
+        "updated_at": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_feedback_does_not_leak_another_threads_rows(
+    client: AsyncClient, app: Any, feedback_store: InMemoryFeedbackStore
+) -> None:
+    """同租户里另一条会话的反馈不能出现在这条会话的列表里(thread 谓词自证)。"""
+    thread_id, other_thread = uuid4(), uuid4()
+    await _seed_thread(app, thread_id)
+    await _seed_thread(app, other_thread)
+    await feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=_DEFAULT_TENANT,
+            thread_id=other_thread,
+            run_id=uuid4(),
+            rating="down",
+            comment="OTHER-THREAD",
+            source="external",
+            actor_id="ext-2",
+        )
+    )
+    resp = await client.get(f"/v1/sessions/{thread_id}/feedback")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+    assert "OTHER-THREAD" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_get_feedback_is_readable_by_a_viewer_including_comments(
+    feedback_store: InMemoryFeedbackStore, audit_store: InMemoryAuditLogStore
+) -> None:
+    """用户拍板:评论原文全员可见,与会话原文的门槛**有意不一致**。
+
+    这条用例同时钉住两条轴 —— ``viewer-1`` 既**不是 admin**、也**不是这条会话的
+    owner**(``_seed_thread`` 给的 ``user_id`` 是另一个 uuid):
+    * 角色轴:``session:read`` 就够,不要求 ``write``;
+    * 归属轴:没有 ``caller_owns_thread``(``GET /v1/sessions/{tid}`` 与
+      ``.../messages`` 都挂着它,这条运营审阅面刻意不挂)。
+    """
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    viewer_app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(audit_store),
+        feedback_repo=feedback_store,
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    thread_id = uuid4()
+    await _seed_thread(viewer_app, thread_id)
+    await feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=_DEFAULT_TENANT,
+            thread_id=thread_id,
+            run_id=uuid4(),
+            rating="down",
+            comment="VISIBLE-TO-VIEWER",
+            source="external",
+            actor_id="ext-1",
+        )
+    )
+    token = make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="viewer-1", roles=("viewer",))
+    async with AsyncClient(
+        transport=ASGITransport(app=viewer_app),
+        base_url="http://control-plane.test",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as viewer:
+        resp = await viewer.get(f"/v1/sessions/{thread_id}/feedback")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"][0]["comment"] == "VISIBLE-TO-VIEWER"
+
+
+@pytest.mark.asyncio
+async def test_get_feedback_404s_for_a_thread_of_another_tenant(
+    client: AsyncClient, app: Any, feedback_store: InMemoryFeedbackStore
+) -> None:
+    """跨租户:thread 属于别人 → 404,且别人的评论原文一个字都不出现。"""
+    other_tenant, thread_id = uuid4(), uuid4()
+    await _seed_thread(app, thread_id, tenant_id=other_tenant)
+    await feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=other_tenant,
+            thread_id=thread_id,
+            run_id=uuid4(),
+            rating="down",
+            comment="LEAK?",
+            source="external",
+            actor_id="ext-9",
+        )
+    )
+    resp = await client.get(f"/v1/sessions/{thread_id}/feedback")
+    assert resp.status_code == 404, resp.text
+    assert "LEAK?" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_get_feedback_404s_for_an_unknown_thread(client: AsyncClient) -> None:
+    resp = await client.get(f"/v1/sessions/{uuid4()}/feedback")
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_get_feedback_read_carries_its_own_tenant_predicate(
+    client: AsyncClient, app: Any, feedback_store: InMemoryFeedbackStore
+) -> None:
+    """第二道门单独自证:thread **在**本租户(404 那道门放行),同 id 上挂着另一
+    租户的反馈行 → 读行本身必须再滤一次租户。
+
+    没有这一条,把 ``list_for_thread_scoped`` 换回无租户谓词的 ``list_for_thread``
+    整套用例照样全绿 —— 因为跨租户那条被 404 先挡住了,两道门里只有一道被测到。
+    运行期以 BYPASSRLS 角色连库,RLS 兜底是空的,这道谓词就是唯一的过滤。
+    """
+    other_tenant, thread_id = uuid4(), uuid4()
+    await _seed_thread(app, thread_id)  # 本租户有这条会话 → 404 那道门放行
+    await feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=other_tenant,
+            thread_id=thread_id,
+            run_id=uuid4(),
+            rating="down",
+            comment="OTHER-TENANT-ROW",
+            source="external",
+            actor_id="ext-9",
+        )
+    )
+    resp = await client.get(f"/v1/sessions/{thread_id}/feedback")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+    assert "OTHER-TENANT-ROW" not in resp.text

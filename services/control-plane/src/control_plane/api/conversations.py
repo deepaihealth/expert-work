@@ -41,6 +41,7 @@ from control_plane.tenant_scope import (
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
+from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.thread_message import ThreadMessageStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.token_usage_store import (
@@ -73,6 +74,10 @@ def _get_thread_message_store(request: Request) -> ThreadMessageStore:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+def _get_feedback_store(request: Request) -> FeedbackStore:
+    return request.app.state.feedback_store  # type: ignore[no-any-return]
 
 
 def _sum_totals(totals: list[TokenTotals]) -> dict[str, Any] | None:
@@ -197,6 +202,7 @@ def build_conversations_router() -> APIRouter:
         runs: Annotated[RunStore, Depends(_get_run_store)],
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         messages: Annotated[ThreadMessageStore, Depends(_get_thread_message_store)],
+        feedback: Annotated[FeedbackStore, Depends(_get_feedback_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         agent_name: Annotated[str | None, Query(min_length=1)] = None,
         agent_version: Annotated[str | None, Query(min_length=1)] = None,
@@ -210,6 +216,10 @@ def build_conversations_router() -> APIRouter:
         # Only conversations with ≥1 run paused at an approval gate — the
         # "needs a human" queue, in conversation context.
         has_pending: Annotated[bool, Query()] = False,
+        # P-2 — only conversations carrying ≥1 👎 (any actor, any run; an
+        # employee's and an end user's count the same). Composes with
+        # has_error / has_pending / since the same way: intersection.
+        has_down_rated: Annotated[bool, Query()] = False,
         # Activity window — only conversations with ≥1 run created at or
         # after this instant ("active in the last N hours"). Composes with
         # ``has_error`` ("what broke today"). Naive datetimes are read as UTC.
@@ -261,6 +271,13 @@ def build_conversations_router() -> APIRouter:
                 ]
                 set_capped = any(len(s) >= 500 for s in id_sets)
                 narrowed_ids = set.intersection(*id_sets)
+            if has_down_rated:
+                # Its own store / own table, so it joins the intersection
+                # separately rather than through ``thread_ids_with_runs``.
+                fb_scope = None if isinstance(scope, CrossTenant) else scope.tenant_id
+                down_ids = await feedback.down_rated_thread_ids(tenant_id=fb_scope)
+                set_capped = set_capped or len(down_ids) >= 500
+                narrowed_ids = down_ids if narrowed_ids is None else narrowed_ids & down_ids
 
             # Content search (IA M4): resolve message-content matches from
             # the transcript mirror; the metadata query then treats a ``q``

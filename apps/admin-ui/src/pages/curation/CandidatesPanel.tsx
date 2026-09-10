@@ -214,6 +214,28 @@ export function CandidatesPanel() {
         </Tooltip>
       ),
     },
+    {
+      // P-2 — 审阅员在列表这一层就要看到「用户到底说了什么」,以及这一踩后来
+      // 有没有被改成 👍(改过票的负例份量不同)。worker 兜底建的候选归因不到
+      // 某一条 feedback,两格都空。
+      title: t("curation.col_feedback_comment"),
+      key: "feedback_comment",
+      ellipsis: true,
+      render: (_: unknown, record) => (
+        <Space size={4}>
+          {record.feedback_comment !== null && (
+            <Tooltip title={record.feedback_comment}>
+              <Text style={{ fontSize: 12 }}>{record.feedback_comment}</Text>
+            </Tooltip>
+          )}
+          {record.feedback_changed_at !== null && (
+            <Tag color="gold" data-testid="curation-feedback-changed-tag">
+              {t("curation.feedback_changed_tag")}
+            </Tag>
+          )}
+        </Space>
+      ),
+    },
   ], [t]);
 
   const isCrossTenant = data?.cross_tenant ?? false;
@@ -320,6 +342,27 @@ export function CandidatesPanel() {
               <Text type="secondary" style={{ fontSize: 12 }}>{t("curation.detail_outcome")}</Text>
               <div>{selected.outcome}</div>
             </div>
+            {selected.feedback_run_id !== null && (
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>{t("curation.detail_feedback_run")}</Text>
+                <div data-testid="curation-detail-feedback-run">
+                  <Tooltip title={selected.feedback_run_id}>
+                    <code>{selected.feedback_run_id.slice(0, 8)}</code>
+                  </Tooltip>
+                  {selected.feedback_changed_at !== null && (
+                    <Tag color="gold" style={{ marginInlineStart: 8 }}>
+                      {t("curation.feedback_changed_tag")}
+                    </Tag>
+                  )}
+                </div>
+              </div>
+            )}
+            {selected.feedback_comment !== null && (
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>{t("curation.detail_feedback_comment")}</Text>
+                <div data-testid="curation-detail-feedback-comment">{selected.feedback_comment}</div>
+              </div>
+            )}
             <div>
               <Text type="secondary" style={{ fontSize: 12 }}>{t("curation.detail_trajectory")}</Text>
               {selected.trajectory === null ? (

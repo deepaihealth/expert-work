@@ -18,6 +18,7 @@ import { useCallback, useMemo, useState, type JSX } from "react";
 import type { ApprovalItem } from "../../api/approvals";
 import { costCnyOfBuckets, type RateBook } from "../../api/cost";
 import type { ThreadPlan } from "../../api/plan";
+import type { SessionFeedbackItem } from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
 import { compactRowsOf } from "../../api/trajectory_rows";
 import { summarizeTurn } from "../../api/turn_summary";
@@ -81,6 +82,9 @@ export interface TurnBlockProps {
   /** PR-B Task 3 — ConversationDetail 脚注「查看运行」深链;透传给
    *  ``TurnFooter``。Omitted → 零变化(链接不渲染)。 */
   runHrefOf?: (turn: ConsoleTurn) => string | null;
+  /** P-2 — 每轮取该轮已记录的 👍/👎,透传 ``TurnFooter.feedback``
+   *  (``runHrefOf`` 同款 opt-in:调试台不传,零变化)。 */
+  feedbackOf?: (turn: ConsoleTurn) => readonly SessionFeedbackItem[] | undefined;
 }
 
 /** The highest not-yet-settled step's buffered answer content — the
@@ -123,6 +127,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     onFireResult,
     rowRef,
     runHrefOf,
+    feedbackOf,
   } = props;
 
   const events = turn.turn.events;
@@ -247,6 +252,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         exporting={exporting}
         onInspect={() => onInspect(turn.key)}
         runHref={runHrefOf?.(turn) ?? undefined}
+        feedback={feedbackOf?.(turn)}
       />
     </div>
   );

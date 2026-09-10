@@ -230,6 +230,74 @@ describe("CandidatesPanel", () => {
     expect(screen.getByTestId("curation-promote-btn")).toBeDisabled();
   });
 
+  it("P-2 — 列表与详情摆出被踩的轮、用户原话与改票标记", async () => {
+    const changed = { ...candidateRow, feedback_changed_at: "2026-09-09T12:00:00Z" };
+    installAdapter([
+      {
+        match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
+        respond: () => ({ items: [changed], total: 1, cross_tenant: false }),
+      },
+      {
+        match: (u, m) => u === "/v1/curation/candidates/c1" && m === "get",
+        respond: () => ({ ...changed, trajectory: null }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderCuration();
+    await waitFor(() => expect(screen.getByText("太慢")).toBeInTheDocument());
+    expect(screen.getByTestId("curation-feedback-changed-tag")).toBeInTheDocument();
+    await user.click(screen.getByText("research"));
+    await waitFor(() =>
+      expect(screen.getByTestId("curation-detail-feedback-run")).toHaveTextContent("7c9e6679"),
+    );
+    expect(screen.getByTestId("curation-detail-feedback-comment")).toHaveTextContent("太慢");
+  });
+
+  it("P-2 — 没改过票就不挂「后改为 👍」标记(阴性对照)", async () => {
+    installAdapter([
+      {
+        match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
+        respond: () => ({ items: [candidateRow], total: 1, cross_tenant: false }),
+      },
+      {
+        match: (u, m) => u === "/v1/curation/candidates/c1" && m === "get",
+        respond: () => ({ ...candidateRow, trajectory: null }),
+      },
+    ]);
+    renderCuration();
+    await waitFor(() => expect(screen.getByText("太慢")).toBeInTheDocument());
+    expect(screen.queryByTestId("curation-feedback-changed-tag")).not.toBeInTheDocument();
+  });
+
+  it("P-2 — worker 兜底建的候选(没有反馈快照)不渲染空的原话 / 被踩的轮", async () => {
+    const noFeedback = {
+      ...candidateRow,
+      signal: "implicit_success",
+      feedback_rating: null,
+      feedback_run_id: null,
+      feedback_comment: null,
+      feedback_changed_at: null,
+    };
+    installAdapter([
+      {
+        match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
+        respond: () => ({ items: [noFeedback], total: 1, cross_tenant: false }),
+      },
+      {
+        match: (u, m) => u === "/v1/curation/candidates/c1" && m === "get",
+        respond: () => ({ ...noFeedback, trajectory: null }),
+      },
+    ]);
+    const user = userEvent.setup();
+    renderCuration();
+    await waitFor(() => expect(screen.getByText("research")).toBeInTheDocument());
+    expect(screen.queryByTestId("curation-feedback-changed-tag")).not.toBeInTheDocument();
+    await user.click(screen.getByText("research"));
+    await waitFor(() => expect(screen.getByTestId("curation-promote-btn")).toBeInTheDocument());
+    expect(screen.queryByTestId("curation-detail-feedback-run")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("curation-detail-feedback-comment")).not.toBeInTheDocument();
+  });
+
   it("threads the switched tenant scope into the getCandidate detail read (W3)", async () => {
     scopeRef.current = "22222222-2222-2222-2222-222222222222";
     let detailParams: Record<string, unknown> | undefined;
