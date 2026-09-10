@@ -254,9 +254,11 @@ describe("CandidatesPanel", () => {
     expect(screen.getByTestId("curation-detail-feedback-comment")).toHaveTextContent("太慢");
   });
 
-  it("PR4 — 候选行标出这一踩是谁打的(员工 / 终端用户),worker 兜底行不标", async () => {
+  // 勘误(2026-09-10):原标题写「worker 兜底行不标」—— worker 建的负例候选
+  // 现在也带来源了。空的是「没采纳任何一条 👎」的候选,本用例的第二行正是它。
+  it("PR4 — 候选行标出这一踩是谁打的(员工 / 终端用户),没采纳 👎 的行不标", async () => {
     const external = { ...candidateRow, feedback_source: "external" };
-    const workerBuilt = {
+    const noDownAdopted = {
       ...candidateRow,
       id: "c2",
       signal: "implicit_success",
@@ -268,7 +270,7 @@ describe("CandidatesPanel", () => {
     installAdapter([
       {
         match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
-        respond: () => ({ items: [external, workerBuilt], total: 2, cross_tenant: false }),
+        respond: () => ({ items: [external, noDownAdopted], total: 2, cross_tenant: false }),
       },
     ]);
     renderCuration();
