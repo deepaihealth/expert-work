@@ -31,6 +31,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID, uuid4
 
 from expert_work.common.observability import expert_work_counter
@@ -45,6 +46,7 @@ from expert_work.protocol import (
     CurationCandidateRecord,
     CurationSignal,
     FeedbackRating,
+    FeedbackSource,
     TrajectoryOutcome,
 )
 from expert_work.runtime.runs import RunStore
@@ -248,6 +250,7 @@ class CurationWorker:
                 trajectory_key=existing.trajectory_key,
                 feedback_run_id=newest_down.run_id,
                 feedback_comment=newest_down.comment,
+                feedback_source=newest_down.source,
             )
         return upgraded
 
@@ -294,6 +297,11 @@ class CurationWorker:
             detected_at=datetime.now(UTC),
             feedback_run_id=newest_down.run_id if newest_down is not None else None,
             feedback_comment=newest_down.comment if newest_down is not None else None,
+            # 来源与上面两格同源(都取 ``newest_down``):这一行采纳了哪条 👎,
+            # 就记哪条 👎 的来源。没有 👎 → NULL,那才是「归因不到」的本义。
+            feedback_source=(
+                cast(FeedbackSource, newest_down.source) if newest_down is not None else None
+            ),
         )
 
     async def _settled_quietly(self, stored: StoredTrajectory) -> bool:
