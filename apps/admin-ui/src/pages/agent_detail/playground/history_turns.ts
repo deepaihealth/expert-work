@@ -55,6 +55,12 @@ export interface HistoryTurn {
   finishedAt: string | null;
   /** ``ThreadRunSummary.error`` —— INTERRUPTED 的中断原因短码 / ERROR 的异常文本。 */
   runError: string | null;
+  /** P-1 —— 这一轮被哪个新 run 取代(``ThreadRunSummary.supersededBy``);
+   *  ``null`` = 未被取代。run 行是权威,两条配对路径都从它取。 */
+  supersededBy: string | null;
+  /** P-1 —— 这一轮的消息已置墓碑(正文清理)。只有按 run_id 分组的路径能判:
+   *  顺序配对路径下消息归不到具体的一轮,恒 ``false``。 */
+  tombstone: boolean;
 }
 
 /** Group the messages by their owning run, or ``null`` if grouping them is
@@ -120,6 +126,8 @@ export function buildHistoryTurns(
         createdAt: r.createdAt ?? null,
         finishedAt: r.finishedAt ?? null,
         runError: r.error ?? null,
+        supersededBy: r.supersededBy ?? null,
+        tombstone: own.some((m) => m.tombstone === true),
       };
     });
   }
@@ -161,5 +169,10 @@ export function buildHistoryTurns(
     createdAt: r.createdAt ?? null,
     finishedAt: r.finishedAt ?? null,
     runError: r.error ?? null,
+    // P-1 —— run 行与这一路径的轮仍是 1:1(``runs.map``),所以「被取代」照常
+    // 取得到;墓碑要看这一轮自己的消息,而这条路径上的消息正是归不到具体一轮
+    // 的那种(没有 run 戳),只能给 false。
+    supersededBy: r.supersededBy ?? null,
+    tombstone: false,
   }));
 }

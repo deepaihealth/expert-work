@@ -128,6 +128,8 @@ export function buildConsoleTurns(args: {
       createdAt: h.createdAt,
       finishedAt: h.finishedAt,
       runError: h.runError,
+      supersededBy: h.supersededBy,
+      tombstone: h.tombstone,
     });
     seq += 1;
   }
@@ -146,6 +148,9 @@ export function buildConsoleTurns(args: {
       createdAt: null,
       finishedAt: null,
       runError: null,
+      // P-1 —— 本会话刚跑出来的一轮不可能已经被取代。
+      supersededBy: null,
+      tombstone: false,
     });
     seq += 1;
   }

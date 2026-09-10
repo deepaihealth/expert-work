@@ -293,6 +293,10 @@ export interface ThreadRunSummary {
   /** PR-A — persisted per-run token rollup (``null`` when the run has no
    *  recorded usage; absent on old backends → treated as null). */
   tokens: RunTokens | null;
+  /** P-1 —— 这一轮被哪个新 run 取代(重新生成 / 编辑重发);``null`` = 未被取代。 */
+  supersededBy: string | null;
+  /** P-1 —— 这一轮是对哪个旧 run 的重新生成 / 编辑重发;``null`` = 普通一轮。 */
+  regeneratedFrom: string | null;
 }
 
 interface ThreadRunRow {
@@ -303,6 +307,8 @@ interface ThreadRunRow {
   finished_at?: string | null;
   error?: string | null;
   tokens?: RunTokens | null;
+  superseded_by?: string | null;
+  regenerated_from?: string | null;
 }
 
 /** List a thread's runs oldest-first. ``tenantId`` (a system_admin drilling
@@ -323,6 +329,8 @@ export async function listThreadRuns(
     finishedAt: r.finished_at ?? null,
     error: r.error ?? null,
     tokens: r.tokens ?? null,
+    supersededBy: r.superseded_by ?? null,
+    regeneratedFrom: r.regenerated_from ?? null,
   }));
 }
 

@@ -134,6 +134,11 @@ export interface HistoryMessage {
    *  backfilled — so ``buildHistoryTurns`` treats a single null as "this
    *  thread can't be grouped by run" and falls back to order pairing. */
   run_id?: string | null;
+  /** P-1 —— 取代这条消息的新 run_id;``null`` = 未被取代。老后端不带这个键。 */
+  superseded_by?: string | null;
+  /** P-1 —— 正文已清理(此时 ``content`` 是空串);只出现在被取代且超出保留
+   *  份数的老版本上。老后端不带这个键。 */
+  tombstone?: boolean;
 }
 
 export async function getSessionMessages(

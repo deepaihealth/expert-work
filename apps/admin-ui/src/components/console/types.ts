@@ -49,4 +49,10 @@ export interface ConsoleTurn {
   /** History turns' ``ThreadRunSummary.error`` —— INTERRUPTED 的原因短码
    *  (InterruptReason 词表)/ ERROR 的异常文本;live turns ``null``。 */
   runError: string | null;
+  /** P-1 —— 这一轮被哪个新 run 取代(重新生成 / 编辑重发);``null`` = 未被
+   *  取代。live turns 恒 ``null``:本会话刚跑出来的一轮不可能已经被取代。 */
+  supersededBy: string | null;
+  /** P-1 —— 这一轮的消息正文已清理(被取代的老版本超出保留份数);live turns
+   *  恒 ``false``。 */
+  tombstone: boolean;
 }
