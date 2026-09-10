@@ -212,3 +212,38 @@ async def test_up_from_a_different_actor_does_not_mark_someone_elses_down_as_cha
     assert resp.status_code == 201, resp.text
     rows = await candidates.list_for_review(tenant_id=_DEFAULT_TENANT)
     assert len(rows) == 1 and rows[0].feedback_changed_at is None
+
+
+@pytest.mark.asyncio
+async def test_candidate_sync_failure_never_loses_the_vote(
+    client: AsyncClient,
+    feedback_store: InMemoryFeedbackStore,
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """控制台侧同一条不变式:进池炸了,员工那一票照样落库、照样 201。
+
+    与对外端点是两条独立的写路径 —— 两边各留一条,改坏一边不会被另一边遮住。
+    """
+
+    async def _boom(**_kwargs: Any) -> str:
+        raise RuntimeError("candidate sync is down")
+
+    monkeypatch.setattr("control_plane.api.feedback.sync_candidate_for_feedback", _boom)
+    thread_id, run_id = uuid4(), uuid4()
+
+    resp = await client.post(
+        f"/v1/sessions/{thread_id}/feedback",
+        json={"rating": "down", "comment": "bad", "run_id": str(run_id)},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["rating"] == "down"
+
+    rows = await feedback_store.list_for_thread(thread_id=thread_id)
+    assert len(rows) == 1
+    assert rows[0].rating == "down" and rows[0].comment == "bad" and rows[0].run_id == run_id
+
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT, limit=100))
+    entries = [e for e in page.entries if e.action.value == "feedback:create"]
+    assert len(entries) == 1
+    assert entries[0].details["candidate"] == "failed"

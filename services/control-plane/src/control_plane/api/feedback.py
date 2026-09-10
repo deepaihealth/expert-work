@@ -128,6 +128,8 @@ def build_feedback_router() -> APIRouter:
             )
         except Exception:
             # 进池是反馈的副产品:它失败不能让员工那一票丢掉;worker 300s 后兜底。
+            # 记进审计的 ``candidate`` 一格,否则失败与真正的 ``noop`` 无从分辨。
+            candidate = "failed"
             logger.warning("feedback.candidate_sync_failed", exc_info=True)
 
         # Audit the action — never the free-text comment (keeps user

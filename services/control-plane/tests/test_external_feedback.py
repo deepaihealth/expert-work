@@ -317,3 +317,37 @@ async def test_up_never_lands_a_candidate_and_change_is_marked(ctx: _Ctx) -> Non
     assert (await ctx.rate(run_id, {"user_id": "cust-77", "rating": "up"})).status_code == 200
     rows = await candidates.list_for_review(tenant_id=ctx.tenant_id)
     assert len(rows) == 1 and rows[0].feedback_changed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_candidate_sync_failure_never_loses_the_vote(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """进池炸了,用户那一票照样落库、照样 200 —— 失败记进审计,不静默吞掉。
+
+    进池是反馈的副产品:候选表 / ObjectStore 出问题时,worker 300s 后还会兜底,
+    但用户那一票丢了就是丢了。这条不变式住在两个端点的 ``try/except`` 里,
+    没有用例守着的话,把它收窄成只吃某一类异常、或者干脆放异常穿出去,CI 不会红。
+    """
+
+    async def _boom(**_kwargs: Any) -> str:
+        raise RuntimeError("candidate sync is down")
+
+    monkeypatch.setattr("control_plane.api.external_feedback.sync_candidate_for_feedback", _boom)
+    await ctx.seed_agent()
+    thread = await ctx.bind_session("cust-77")
+    run_id = await ctx.seed_run(thread, "cust-77")
+    await _land_trajectory(ctx, thread, run_id)
+
+    resp = await ctx.rate(run_id, {"user_id": "cust-77", "rating": "down", "comment": "太慢"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"] == {"run_id": str(run_id), "rating": "down", "updated": False}
+
+    rows = await ctx.feedback.list_for_thread_scoped(tenant_id=ctx.tenant_id, thread_id=thread)
+    assert len(rows) == 1
+    assert rows[0].rating == "down" and rows[0].comment == "太慢" and rows[0].run_id == run_id
+
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=ctx.tenant_id, limit=100))
+    entries = [e for e in page.entries if e.action.value == "feedback:create"]
+    assert len(entries) == 1
+    assert entries[0].details["candidate"] == "failed"

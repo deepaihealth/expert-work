@@ -17,7 +17,10 @@ from expert_work.persistence import CurationCandidateStore, ThreadMetaStore
 from expert_work.protocol import CurationCandidateRecord
 from orchestrator.trajectory import TrajectoryReader
 
-CandidateSyncResult = Literal["inserted", "upgraded", "changed", "deferred", "noop"]
+#: ``failed`` 不是本模块的返回值 —— 它是**调用方**在同步抛异常时写进审计的那一格。
+#: 进池是反馈的副产品(见两个端点的 ``try/except``),失败被吞掉不能让用户那一票
+#: 丢掉;但吞掉不等于不记,否则审计里的失败与真正的 ``noop`` 无从分辨。
+CandidateSyncResult = Literal["inserted", "upgraded", "changed", "deferred", "noop", "failed"]
 
 
 @dataclass(frozen=True)
