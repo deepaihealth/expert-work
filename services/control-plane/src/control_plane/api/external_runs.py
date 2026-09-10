@@ -157,8 +157,8 @@ async def _supersede_and_run(
 
     取代本身在 ``spawn_run`` 的 per-thread 锁里由 ``supersede_run`` 完成,它抛的
     :class:`SupersedeError`(``THREAD_BUSY`` / ``RUN_NOT_LAST`` / ``RUN_AWAITING_APPROVAL``
-    / ``RUN_ALREADY_SUPERSEDED`` / ``RUN_INPUT_UNAVAILABLE``)在这里渲染成对外信封,
-    code 与 HTTP 码原样搬过去。
+    / ``RUN_ALREADY_SUPERSEDED`` / ``RUN_INPUT_UNAVAILABLE`` / ``RUN_BOUNDARY_UNRESOLVED``)
+    在这里渲染成对外信封,code 与 HTTP 码原样搬过去。
 
     ``on_disconnect=CONTINUE`` 与 ``POST …/runs`` 一致:断线在对外场景是意外而不是
     「我不要了」,而这一轮的旧轮已经标成被取代,取消会把一次网络抖动放大成整段
