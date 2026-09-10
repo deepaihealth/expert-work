@@ -92,11 +92,13 @@ def build_external_agent_catalog_router() -> APIRouter:
         客户端有意义。
 
         新鲜度提示:目录这里直接查 store,是当下最新状态;run 端点走的是
-        ``AgentDisableService`` 的 30s TTL 缓存(见
-        ``agent_disable_status.py``),所以**两个方向**都可能出现目录与 run
-        端点暂时不一致:重新启用一个 agent 后,最长 30s 内可能出现目录说
-        ``available: true``、run 却仍 403;禁用一个 agent 后,同样最长 30s
-        内可能出现目录说 ``available: false``、run 却仍被接受。后一种更容易
+        ``AgentDisableService`` 的 TTL 缓存(见 ``agent_disable_status.py``;
+        窗口 = ``settings.kill_switch_cache_ttl_s``,默认 5s —— 类构造器上
+        那个 30.0 只是从不生效的形参默认值,``app.py`` 装配时一律传设置项),
+        所以**两个方向**都可能出现目录与 run 端点暂时不一致:重新启用一个
+        agent 后,最长一个 TTL 窗口内可能出现目录说 ``available: true``、run
+        却仍 403;禁用一个 agent 后,同样最长一个 TTL 窗口内可能出现目录说
+        ``available: false``、run 却仍被接受。后一种更容易
         漏想——``invalidate()`` 只清处理这次禁用请求的那个副本自己的缓存
         (见该方法 docstring),生产是多副本部署(见
         ``infra/k8s/base/control-plane/deployment.yaml`` 的 ``replicas``),

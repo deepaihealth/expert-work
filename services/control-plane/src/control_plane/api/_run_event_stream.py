@@ -24,7 +24,7 @@ from uuid import UUID
 from control_plane.api._run_event_seq import _merge_ranges, _seq_of
 from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunStatus, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
-from expert_work.runtime.runs.store import MAX_LIST_LIMIT
+from expert_work.runtime.runs.store import MAX_LIST_LIMIT as _RUN_STORE_MAX_LIST_LIMIT
 from expert_work.runtime.stream_bridge import (
     HEARTBEAT_FRAME,
     HEARTBEAT_SENTINEL,
@@ -40,6 +40,17 @@ from orchestrator.stream_items import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: B-17 ② —— 事件流一页读多少条落库帧。以前这里直接写 run store 的
+#: ``MAX_LIST_LIMIT``,借的是别人的名字:那个常量的语义是「``GET /v1/runs``
+#: 一次最多列多少个 run 行」,和「续传一页发多少个事件」不是一回事。名字归
+#: 位到本层,取值不变。
+#:
+#: 取值**不是**随便挑的,它钉在 store 的上限上:``RunEventStore.list`` 会把
+#: ``limit`` 夹到 ``MAX_LIST_LIMIT``,而下面补库循环拿「读回来的行数 <
+#: 本常量」当「这是最后一页」的信号 —— 本常量一旦大过那个上限,循环会在
+#: 第一页就误判收尾,把后面的事件静默丢掉。要调只能连 store 上限一起调。
+EVENT_PAGE_LIMIT: int = _RUN_STORE_MAX_LIST_LIMIT
 
 #: 对外平面(API key)恒不可见的帧集合 —— 目前只有 ``system_prompt``
 #: (PR-A.3 §十.1 服务端合成的系统提示词全文,是控制台调试专用的可观测性
@@ -185,7 +196,7 @@ async def build_event_producer(
     被写进 wire。控制台调用方(``runs.py`` 的 console 回放 / live)不传这个
     参数,继续拿到未过滤的全量帧。
 
-    * Terminal run → :meth:`RunEventStore.list`,**一页**(``MAX_LIST_LIMIT``),
+    * Terminal run → :meth:`RunEventStore.list`,**一页**(``EVENT_PAGE_LIMIT``),
       按 seq 排序。后面还有的话流以 ``truncated`` 帧收尾而**不发 ``end``** ——
       流并没有结束,客户端得带 ``next_seq`` 再来一次。
     * Active run → 先把 ``since_seq`` 之后的落库帧补齐,再挂
@@ -221,7 +232,7 @@ async def build_event_producer(
     converter = ItemStreamConverter(run_id=run_id) if stream_format == STREAM_FORMAT_ITEMS else None
 
     async def _list_page(
-        after: int | None, *, limit: int = MAX_LIST_LIMIT
+        after: int | None, *, limit: int = EVENT_PAGE_LIMIT
     ) -> Sequence[RunEventRecord]:
         """读一页落库帧(``seq > after``,最多 ``limit`` 条)。
 
@@ -427,7 +438,7 @@ async def build_event_producer(
                     ):
                         yield chunk
                     last = row.seq
-                if len(rows) < MAX_LIST_LIMIT:
+                if len(rows) < EVENT_PAGE_LIMIT:
                     break
 
         # 1. 补库。
@@ -542,7 +553,7 @@ async def build_event_producer(
                         ):
                             yield chunk
                         last = row.seq
-                    if len(rows) < MAX_LIST_LIMIT:
+                    if len(rows) < EVENT_PAGE_LIMIT:
                         break
                 if last + 1 < seq:
                     logger.warning(  # codeql[py/log-injection]
@@ -565,7 +576,7 @@ async def build_event_producer(
     # StreamingResponse 时就已知(响应头没法在流开始后再改)。
     rows = await _list_page(since_seq)
     next_seq: int | None = None
-    if len(rows) == MAX_LIST_LIMIT:
+    if len(rows) == EVENT_PAGE_LIMIT:
         # **不能**用「行数 == 页大小」单独判定 —— 总帧数恰好整除页大小时会误报
         # 截断,客户端白拉一页空的。真去看后面还有没有东西。
         if await _list_page(rows[-1].seq, limit=1):
