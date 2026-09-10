@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane._tenant_resource_lock import tenant_resource_lock
 from control_plane.api._authz import console_only
+from control_plane.api._user_scope import get_user_repo, resolve_caller_user_id
 from control_plane.audit import emit
 from control_plane.auth.rbac import is_admin
 from control_plane.settings import Settings
@@ -39,6 +40,7 @@ from control_plane.tenant_scope import (
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.url_validation import RemoteURLError, validate_remote_url
 from expert_work.persistence import WebhookDeliveryStore, WebhookEndpointStore
+from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import (
     AuditAction,
     WebhookEndpointRecord,
@@ -198,6 +200,7 @@ def build_webhook_endpoints_router() -> APIRouter:
         body: _CreateBody,
         request: Request,
         store: Annotated[WebhookEndpointStore, Depends(_get_store)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         settings: Annotated[Settings, Depends(_get_settings)],
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
@@ -209,6 +212,12 @@ def build_webhook_endpoints_router() -> APIRouter:
         actor_id: str = request.state.actor_id
         _validate_url(body.url)
         event_types = _validate_event_types(body.event_types)
+        # B-1 — record who registered this endpoint. Same helper the J.10
+        # triggers CRUD uses: a human principal resolves to their
+        # ``tenant_user.id``, a machine principal (service / service_account)
+        # to ``None`` — it owns no per-user row, so such an endpoint stays
+        # tenant-owned exactly as every endpoint was before this landed.
+        creator_user_id = await resolve_caller_user_id(request, users)
 
         # Task 4 — count-then-insert is TOCTOU-vulnerable across replicas;
         # the whole check + insert is one per-tenant advisory-locked
@@ -237,7 +246,7 @@ def build_webhook_endpoints_router() -> APIRouter:
             record = WebhookEndpointRecord(
                 id=endpoint_id,
                 tenant_id=tenant_id,
-                user_id=None,
+                user_id=creator_user_id,
                 name=body.name,
                 url=body.url,
                 event_types=event_types,

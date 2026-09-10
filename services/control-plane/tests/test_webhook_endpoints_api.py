@@ -620,3 +620,51 @@ async def test_viewer_reads_are_unaffected(client: AsyncClient) -> None:
     got = await client.get(f"/v1/webhook-endpoints/{created['id']}", headers=viewer_headers)
     assert got.status_code == 200, got.text
     assert got.json()["id"] == created["id"]
+
+
+@pytest.mark.asyncio
+async def test_create_records_the_calling_user_as_owner(client: AsyncClient) -> None:
+    """B-1 — ``webhook_endpoint.user_id`` used to be hardcoded ``None``, so a
+    registered endpoint carried no trace of who added it.
+
+    Asserted against the stored row, not the response body: the endpoint's
+    public shape deliberately does not expose ``user_id``. Two different
+    employees register one endpoint each; the rows must carry two different
+    non-null owners, which a fixed value (``None`` or otherwise) cannot
+    satisfy.
+    """
+    app = client._transport.app  # type: ignore[attr-defined]
+    store = app.state.webhook_endpoint_store
+    users = app.state.tenant_user_repo
+
+    alice = await _create_as(client, subject="alice", name="alice-hook")
+    bob = await _create_as(client, subject="bob", name="bob-hook")
+
+    alice_row = await store.get(endpoint_id=UUID(alice["id"]), tenant_id=_DEFAULT_TENANT)
+    bob_row = await store.get(endpoint_id=UUID(bob["id"]), tenant_id=_DEFAULT_TENANT)
+    assert alice_row is not None and bob_row is not None
+
+    expected_alice = await users.resolve(
+        tenant_id=_DEFAULT_TENANT, subject_type="user", subject_id="alice"
+    )
+    expected_bob = await users.resolve(
+        tenant_id=_DEFAULT_TENANT, subject_type="user", subject_id="bob"
+    )
+    assert alice_row.user_id == expected_alice.id
+    assert bob_row.user_id == expected_bob.id
+    assert alice_row.user_id != bob_row.user_id
+
+
+async def _create_as(client: AsyncClient, *, subject: str, name: str) -> dict[str, object]:
+    """Register an endpoint as a named admin employee (not the default subject)."""
+    resp = await client.post(
+        "/v1/webhook-endpoints",
+        json={
+            "name": name,
+            "url": f"https://hooks.example.com/{name}",
+            "event_types": ["run.completed"],
+        },
+        headers=_employee_headers(roles=("admin",), subject=subject),
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
