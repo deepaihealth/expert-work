@@ -12,6 +12,7 @@ from control_plane.app import create_app
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from tests.auth_fixtures import build_test_jwt_verifier
+from tests.route_audit import mounted_api_routes
 
 
 def test_create_app_returns_fastapi_instance() -> None:
@@ -45,7 +46,8 @@ def test_health_and_metrics_routes_registered() -> None:
         settings=Settings(_env_file=None),  # type: ignore[call-arg]
         jwt_verifier=build_test_jwt_verifier(),
     )
-    paths = {route.path for route in app.routes if hasattr(route, "path")}
+    paths = {route.path for route in mounted_api_routes(app)}
+    assert paths, "no routes enumerated — the walk is broken, not the app"
     assert "/healthz/live" in paths
     assert "/healthz/ready" in paths
     assert "/healthz/startup" in paths

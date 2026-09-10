@@ -10,25 +10,24 @@ registered after it (``version`` would just bind to the literal, e.g.
 though its own unit tests (which call the handler directly / build a
 router-only app) stay green.
 
-This test walks ``app.routes`` in the real ``create_app(...)`` order and
-proves every external route is still the *first* route that matches a
-concrete instance of its own path — so a future two-segment external route
-added in the wrong place (or before the wrong router) fails loudly here
-instead of degrading into a silent 404 at runtime. A second test proves the
-fix didn't break the reverse direction: ``agents.py``'s own
-``GET /{name}/{version}`` must still win for a real agent/version pair.
+This test walks the real ``create_app(...)`` route table in registration
+order (``tests/route_audit.py``) and proves every external route is still the
+*first* route that matches a concrete instance of its own path — so a future
+two-segment external route added in the wrong place (or before the wrong
+router) fails loudly here instead of degrading into a silent 404 at runtime.
+A second test proves the fix didn't break the reverse direction:
+``agents.py``'s own ``GET /{name}/{version}`` must still win for a real
+agent/version pair.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
-
-from starlette.routing import BaseRoute, Match, Route
 
 from control_plane.app import create_app
 from control_plane.settings import Settings
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier
+from tests.route_audit import MountedRoute, mounted_routes
 
 
 def _build_settings() -> Settings:
@@ -44,9 +43,9 @@ def _build_settings() -> Settings:
     )
 
 
-def _build_routes() -> list[BaseRoute]:
+def _build_routes() -> list[MountedRoute]:
     app = create_app(settings=_build_settings(), jwt_verifier=build_test_jwt_verifier())
-    return list(app.routes)
+    return mounted_routes(app)
 
 
 # Sample values for every path-param name that appears in a `/v1/agents/...`
@@ -82,25 +81,19 @@ def _concretize(path_template: str) -> str:
     return _PARAM_RE.sub(_sub, path_template)
 
 
-def _first_match(routes: list[BaseRoute], path: str, method: str) -> BaseRoute | None:
+def _first_match(routes: list[MountedRoute], path: str, method: str) -> MountedRoute | None:
     """The first route in registration order that FULLY matches (path + method)."""
-    scope: dict[str, Any] = {"type": "http", "method": method, "path": path, "root_path": ""}
     for route in routes:
-        match, _ = route.matches(scope)
-        if match is Match.FULL:
+        if route.full_matches(path, method):
             return route
     return None
 
 
-def _external_routes(routes: list[BaseRoute]) -> list[Route]:
+def _external_routes(routes: list[MountedRoute]) -> list[MountedRoute]:
     """Discovery is by ``tags=["external"]`` alone — see the same-named
     function in ``test_external_only_gate.py`` for why the path-prefix
     condition this used to also require was dropped."""
-    return [
-        route
-        for route in routes
-        if isinstance(route, Route) and "external" in (getattr(route, "tags", None) or [])
-    ]
+    return [route for route in routes if route.is_api_route and "external" in route.tags]
 
 
 def test_every_external_agents_route_is_reachable() -> None:
@@ -116,16 +109,14 @@ def test_every_external_agents_route_is_reachable() -> None:
     assert external_routes, "expected at least one tags=['external'] route"
 
     for route in external_routes:
-        for method in sorted(route.methods or set()):
-            if method in ("HEAD", "OPTIONS"):
-                continue
+        for method in sorted(route.verbs):
             concrete_path = _concretize(route.path)
             winner = _first_match(routes, concrete_path, method)
             assert winner is route, (
                 f"{method} {route.path} (tagged external) is shadowed: the router "
                 f"resolves {method} {concrete_path} to "
-                f"{getattr(winner, 'path', winner)!r} instead — registration order "
-                f"in app.py must put the external routers before build_agents_router()"
+                f"{winner.path if winner is not None else None!r} instead — registration "
+                f"order in app.py must put the external routers before build_agents_router()"
             )
 
 
@@ -140,10 +131,9 @@ def test_name_version_route_still_wins_for_a_real_agent_and_version() -> None:
     routes = _build_routes()
     winner = _first_match(routes, "/v1/agents/some-agent/1.0.0", "GET")
     assert winner is not None
-    assert isinstance(winner, Route)
     assert winner.path == "/v1/agents/{name}/{version}"
-    assert "agents" in (winner.tags or [])
-    assert "external" not in (winner.tags or [])
+    assert "agents" in winner.tags
+    assert "external" not in winner.tags
 
 
 def test_the_discovery_is_not_tied_to_the_agents_path_prefix() -> None:

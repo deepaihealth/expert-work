@@ -27,7 +27,6 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi import Depends
-from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.api._authz import external_only, route_is_external
@@ -45,6 +44,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.route_audit import MountedRoute, mounted_api_routes
 
 _TID = uuid4()
 _RID = uuid4()
@@ -388,7 +388,7 @@ def _build_audit_app() -> Any:
     )
 
 
-def _external_agents_routes(app: Any) -> list[APIRoute]:
+def _external_agents_routes(app: Any) -> list[MountedRoute]:
     """Every route tagged ``external`` — discovered from the live app, not a
     hand-maintained list, so a new route mounted on any of the seven
     ``external_*.py`` routers is picked up automatically.
@@ -402,17 +402,17 @@ def _external_agents_routes(app: Any) -> list[APIRoute]:
     precise, and dropping the prefix means any future new prefix is covered
     automatically instead of silently falling outside this audit.
     """
-    return [
-        route
-        for route in app.routes
-        if isinstance(route, APIRoute) and "external" in (route.tags or [])
-    ]
+    routes = [route for route in mounted_api_routes(app) if "external" in route.tags]
+    assert routes, "no tags=['external'] route found — the enumeration is broken, not the app"
+    return routes
 
 
 _EXTERNAL_ONLY_DEP_QUALNAME = f"{external_only.__qualname__}.<locals>._dep"
 
 
-def _carries_external_only_guard(route: APIRoute) -> bool:
+def _carries_external_only_guard(route: MountedRoute) -> bool:
+    """Reads the COMPOSED dependency graph — router-level ``dependencies=[...]``
+    included, which is where the seven ``external_*.py`` routers put the gate."""
     return any(
         dep.call.__qualname__ == _EXTERNAL_ONLY_DEP_QUALNAME for dep in route.dependant.dependencies
     )
@@ -445,9 +445,9 @@ def test_route_table_covers_every_live_external_agents_route() -> None:
         (method, route.path)
         for route in _external_agents_routes(_build_audit_app())
         if route.path.startswith("/v1/agents/")
-        for method in (route.methods or set())
-        if method not in ("HEAD", "OPTIONS")
+        for method in route.verbs
     }
+    assert live, "no /v1/agents external route found — the enumeration is broken"
     assert live <= _EXTERNAL_ROUTES, (
         f"表缺(应用里有、表里没有,于是这几条没有凭据测试): {sorted(live - _EXTERNAL_ROUTES)}"
     )
@@ -470,7 +470,7 @@ def test_every_external_agents_route_carries_the_external_only_guard() -> None:
     external_routes = _external_agents_routes(app)
     assert external_routes, "expected at least one tags=['external'] route"
     missing = [
-        f"{sorted(m for m in (r.methods or ()) if m not in ('HEAD', 'OPTIONS'))} {r.path}"
+        f"{sorted(r.verbs)} {r.path}"
         for r in external_routes
         if not _carries_external_only_guard(r)
     ]
@@ -534,7 +534,7 @@ _AGENTS_ROUTER_EXTERNAL_ONLY_ROUTES: frozenset[tuple[str, str]] = frozenset(
 #: a TRUE full enumeration of the app, independent of this table's contents.
 #:
 #: Self-audit blind-spot fix (found in review): the ORIGINAL version of the
-#: enumeration below built ``live`` by walking ``app.routes`` and keeping only
+#: enumeration below built ``live`` by walking the live route table and keeping only
 #: entries that were ALREADY present in this table
 #: (``if (method, route.path) in _AGENTS_ROUTER_UNIVERSE: live[...] = route``).
 #: That construction makes ``set(live)`` a subset of ``_AGENTS_ROUTER_UNIVERSE``
@@ -589,7 +589,7 @@ _AGENTS_ROUTER_UNIVERSE: frozenset[tuple[str, str]] = frozenset(
 _AGENTS_ROUTER_CANDIDATE_SHAPE = re.compile(r"^/v1/agents/\{[^{}/]+\}/[^{}/]+$")
 
 
-def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], APIRoute]:
+def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], MountedRoute]:
     """Every ``(method, path)`` matching ``_AGENTS_ROUTER_CANDIDATE_SHAPE`` on
     agents.py's OWN router (excludes ``tags=["external"]`` routes, which live
     on the seven ``external_*.py`` routers and match the same path shape but are
@@ -602,18 +602,17 @@ def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], APIRo
     matches the shape and exists in the app always lands in the returned
     dict, whether or not any test-file table already knows about it.
     """
-    live: dict[tuple[str, str], APIRoute] = {}
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or not route.path.startswith("/v1/agents/"):
+    live: dict[tuple[str, str], MountedRoute] = {}
+    for route in mounted_api_routes(app):
+        if not route.path.startswith("/v1/agents/"):
             continue
-        if "external" in (route.tags or []):
+        if "external" in route.tags:
             continue
         if not _AGENTS_ROUTER_CANDIDATE_SHAPE.match(route.path):
             continue
-        for method in route.methods or ():
-            if method in ("HEAD", "OPTIONS"):
-                continue
+        for method in route.verbs:
             live[(method, route.path)] = route
+    assert live, "no agents.py-owned candidate route found — the enumeration is broken"
     return live
 
 
@@ -669,12 +668,19 @@ def _external_only_routes_missing_the_tag(app: Any) -> set[tuple[str, str]]:
     by route SHAPE (guard present, tag absent), never by table membership."""
     return {
         (method, route.path)
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        and route_is_external(route)
-        and "external" not in (route.tags or [])
-        for method in (route.methods or set())
-        if method not in ("HEAD", "OPTIONS")
+        for route in mounted_api_routes(app)
+        # ``route_is_external`` is fed ``original_route`` on purpose: that is the
+        # object FastAPI puts in ``request.scope["route"]``, so this audit asks
+        # the production predicate exactly the production question. The composed
+        # view answers the same today (every gate is placed on an
+        # ``APIRouter(...)`` constructor, which FastAPI applies eagerly at route
+        # registration). The day the two diverge — a gate placed via
+        # ``include_router(dependencies=[...])``, which the original route never
+        # sees — the 422 envelope silently stops firing in production, and
+        # ``test_route_is_external_agrees_with_the_qualname_discoverer`` below is
+        # what goes red.
+        if route_is_external(route.original_route) and "external" not in route.tags
+        for method in route.verbs
     }
 
 
@@ -730,11 +736,13 @@ def test_route_is_external_agrees_with_the_qualname_discoverer() -> None:
     would turn red.
     """
     app = _build_audit_app()
-    routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    routes = mounted_api_routes(app)
     disagreeing = [
-        f"{sorted(r.methods or ())} {r.path}"
+        f"{sorted(r.verbs)} {r.path}"
         for r in routes
-        if route_is_external(r) != _carries_external_only_guard(r)
+        if route_is_external(r.original_route) != _carries_external_only_guard(r)
     ]
     assert not disagreeing, disagreeing
-    assert any(route_is_external(r) for r in routes), "vacuous: no external route seen"
+    assert any(route_is_external(r.original_route) for r in routes), (
+        "vacuous: no external route seen"
+    )

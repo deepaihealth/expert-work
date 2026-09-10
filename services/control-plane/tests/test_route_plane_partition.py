@@ -5,9 +5,9 @@ route by route. It cannot tell you about a route that belongs to no plane at
 all: a new router mounted without `console_only()` / `external_only()` is
 invisible to it, and there is no third category to fall into by accident.
 
-This module closes that hole. It walks **every** compiled `APIRoute` in the
-real app and classifies it from evidence in the code — never from a table
-somebody hand-maintains. The pinned sets below are change *detectors*: a new
+This module closes that hole. It walks **every** route the real app mounts
+(`tests/route_audit.py`) and classifies it from evidence in the code — never
+from a table somebody hand-maintains. The pinned sets below are change *detectors*: a new
 route lands in whatever plane its gates put it in, and if that shifts a
 pinned set the test fails and forces the decision to be made explicitly.
 
@@ -33,7 +33,6 @@ from uuid import uuid4
 
 import pytest
 from fastapi.dependencies.models import Dependant
-from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
@@ -49,6 +48,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.route_audit import MountedRoute, mounted_api_routes
 
 # ---------------------------------------------------------------- the planes
 
@@ -138,7 +138,7 @@ def _source(fn: Callable[..., Any]) -> str:
         return ""
 
 
-def _classify(route: APIRoute) -> str:
+def _classify(route: MountedRoute) -> str:
     """The plane this route's own code puts it in.
 
     Two signals, both needed. A factory-built gate
@@ -165,13 +165,12 @@ def _classify(route: APIRoute) -> str:
     return "tenant"
 
 
-def _routes(app: Any) -> list[APIRoute]:
-    return [r for r in app.routes if isinstance(r, APIRoute)]
+def _routes(app: Any) -> list[MountedRoute]:
+    return mounted_api_routes(app)
 
 
-def _label(route: APIRoute) -> str:
-    methods = sorted(m for m in (route.methods or ()) if m not in ("HEAD", "OPTIONS"))
-    return f"{','.join(methods)} {route.path}"
+def _label(route: MountedRoute) -> str:
+    return f"{','.join(sorted(route.verbs))} {route.path}"
 
 
 def _build_settings() -> Settings:
@@ -395,7 +394,7 @@ async def test_every_platform_route_actually_refuses_a_tenant_admin() -> None:
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
         for route in platform_routes:
             path = re.sub(r"\{[^}]+\}", "00000000-0000-4000-8000-000000000001", route.path)
-            for method in sorted(m for m in (route.methods or ()) if m not in ("HEAD", "OPTIONS")):
+            for method in sorted(route.verbs):
                 resp = await client.request(method, path, json={}, headers=headers)
                 if resp.status_code != 403:
                     bad.append(f"{method} {route.path} → {resp.status_code}")

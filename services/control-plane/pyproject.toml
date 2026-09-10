@@ -23,12 +23,13 @@ dependencies = [
     # 三个),代价是把 job 当依赖挂在这里 —— 它本身只有 5 个模块。
     "expert-work-retention-cleanup-job",
     # Stream B.1 — FastAPI + Pydantic v2 + uvicorn.
-    # <0.137:fastapi 0.137 起 include_router 变懒挂载(app.routes 里是
-    # _IncludedRouter,APIRoute 不再摊平;实测 0.136.3 摊平 / 0.137.2 起不摊),
-    # 控制面整族路由自审(console lockdown / external gate / NUL guard /
-    # reachability)会集体失明。迁移(改用 iter_route_contexts 并重组依赖
-    # 合成)单独立项:ROADMAP X-12;届时连同这条上界一起放开。
-    "fastapi>=0.115,<0.137",
+    # >=0.138:0.137 起 include_router 变懒挂载(app.routes 里装的是
+    # _IncludedRouter,APIRoute 不再摊平),路由自审必须改走
+    # ``fastapi.routing.iter_route_contexts``——那个 API 是 0.138.0 才有的
+    # (0.137.x 只有懒挂载、没有替代枚举口,是个两头不着的空档)。
+    # 自审全部收在 tests/_route_audit.py 一处,枚举空了会红而不是静默变绿,
+    # 所以这里不再压 minor 上界(ROADMAP X-12)。
+    "fastapi>=0.138,<1",
     "uvicorn[standard]>=0.32,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",

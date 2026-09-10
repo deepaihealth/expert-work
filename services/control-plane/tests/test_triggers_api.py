@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
@@ -27,6 +26,7 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
+from tests.route_audit import mounted_api_routes
 
 _DEFAULT_TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -172,8 +172,8 @@ def _find_endpoint(app: object, *, method: str, path: str):  # type: ignore[no-u
     file that needs to pin the handler's internal scoping logic for a
     principal (``service_account``) the HTTP path no longer admits.
     """
-    for route in app.routes:  # type: ignore[attr-defined]
-        if isinstance(route, APIRoute) and route.path == path and method in (route.methods or ()):
+    for route in mounted_api_routes(app):  # type: ignore[arg-type]
+        if route.path == path and method in route.methods:
             return route.endpoint
     raise AssertionError(f"route not found: {method} {path}")
 
