@@ -52,7 +52,7 @@ function makeConsoleTurn(
     timing: null,
     createdAt: null,
     finishedAt: null,
-    runError: null,
+    runError: null, supersededBy: null, tombstone: false,
   };
 }
 

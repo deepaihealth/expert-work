@@ -1,6 +1,6 @@
 # 10 多语言示例
 
-本章为八个常见场景各提供一份可直接运行的最小示例，每个场景给出 curl、Python、Node.js、Java 四种语言的实现。通用约定如下：
+本章为十个常见场景各提供一份可直接运行的最小示例，每个场景给出 curl、Python、Node.js、Java 四种语言的实现。通用约定如下：
 
 - **key 只能从环境变量读取，示例代码中不出现明文 key。** 运行示例前，先设置这个环境变量：
 
@@ -3821,6 +3821,235 @@ public class RateRun {
     public static void main(String[] args) throws IOException {
         String result = rateRun("u-123", "<要打分的 run_id>", "down", "答非所问");
         System.out.println(result); // {"success": true, "data": {"run_id": "...", "rating": "down", "updated": false}, "error": null}
+    }
+}
+```
+
+:::
+
+## 10.10 重新生成与编辑重发
+
+`user_id` 在**请求体**里，要重来的那一轮的 `run_id` 在路径里。重新生成不带 `input`，编辑重发必须带 `input`；两个端点都只对一段会话的最后一轮有效。字段、错误码与保留规则见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发)。
+
+下面四段代码都用 `queue` 模式，返回 202 与新那一轮的 `run_id`；换成 `stream` 模式时返回的是 SSE 流，按 [10.1](#_10-1-发起-stream-模式的-run-并解析事件流) 的方式接收。
+
+::: code-group
+
+```bash [curl]
+# 重新生成:用同一条输入再跑一次,不能带 input / files / inputs / untrusted_content
+curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:regenerate" \
+  -H "Authorization: Bearer ${EXPERT_WORK_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u-123", "mode": "queue"}'
+
+# 编辑重发:改掉输入再跑一次,input 必填
+# Idempotency-Key 可选,带上之后同一个键重发不会产生第二轮
+curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:edit" \
+  -H "Authorization: Bearer ${EXPERT_WORK_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: resend-order-8899" \
+  -d '{"user_id": "u-123", "input": "换一个更简短的说法", "mode": "queue"}'
+
+# 读回历史消息,被取代那一轮的每条消息都带 superseded_by
+curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/messages?user_id=u-123" \
+  -H "Authorization: Bearer ${EXPERT_WORK_API_KEY}"
+```
+
+```python [Python]
+import json
+import os
+import urllib.error
+import urllib.request
+
+API_KEY = os.environ["EXPERT_WORK_API_KEY"]
+BASE_URL = "https://<your-domain>"
+AGENT_CODE = "{agent_code}"  # 替换成实际的 agent_code
+
+
+def resend_run(user_id, run_id, new_input=None, idempotency_key=None):
+    """new_input 省略走 :regenerate(同一条输入再跑一次),给了就走 :edit。"""
+    op = "regenerate" if new_input is None else "edit"
+    url = f"{BASE_URL}/v1/agents/{AGENT_CODE}/runs/{run_id}:{op}"
+    payload = {"user_id": user_id, "mode": "queue"}
+    if new_input is not None:
+        payload["input"] = new_input  # :regenerate 不接受 input,带上是 422 INVALID_REQUEST
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    if idempotency_key is not None:
+        headers["Idempotency-Key"] = idempotency_key
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # 先读成文本、解得动才当 JSON 用:失败响应不一定是 JSON(网关自己返回的 502 常常是
+        # HTML,也可能整个是空的),无条件 json.loads 会当场抛 JSONDecodeError 顶掉原来的
+        # HTTPError,状态码和响应体全看不见。
+        error_text = exc.read().decode("utf-8", errors="replace")
+        try:
+            error_body = json.loads(error_text)
+        except ValueError:
+            error_body = error_text  # 不是 JSON,原样打出来
+        # 409 THREAD_BUSY / RUN_AWAITING_APPROVAL / RUN_ALREADY_SUPERSEDED 与 422
+        # RUN_NOT_LAST / RUN_INPUT_UNAVAILABLE / RUN_BOUNDARY_UNRESOLVED 原样重试都无效
+        print("重发失败:", exc.code, error_body)
+        raise
+
+
+if __name__ == "__main__":
+    result = resend_run("u-123", "<要重来的 run_id>", "换一个更简短的说法")
+    print(result)  # {"success": true, "data": {"run_id": "...", "thread_id": "...", "status": "queued"}, "error": null}
+```
+
+```js [Node.js]
+const API_KEY = process.env.EXPERT_WORK_API_KEY;
+const BASE_URL = "https://<your-domain>";
+const AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
+
+// newInput 省略走 :regenerate(同一条输入再跑一次),给了就走 :edit
+async function resendRun(userId, runId, newInput, idempotencyKey) {
+  const op = newInput === undefined ? "regenerate" : "edit";
+  const url = `${BASE_URL}/v1/agents/${AGENT_CODE}/runs/${runId}:${op}`;
+  const payload = { user_id: userId, mode: "queue" };
+  if (newInput !== undefined) payload.input = newInput; // :regenerate 不接受 input,带上是 422
+  const headers = {
+    Authorization: `Bearer ${API_KEY}`,
+    "Content-Type": "application/json",
+  };
+  if (idempotencyKey !== undefined) headers["Idempotency-Key"] = idempotencyKey;
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+  if (!response.ok) {
+    // 用 text() 而不是 json():失败响应不一定是 JSON(网关自己返回的 502 常常是 HTML),
+    // 先 await response.json() 会当场抛 SyntaxError,想打的错误信息反而永远打不出来。
+    console.error("重发失败:", response.status, await response.text());
+    throw new Error(`${op} failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function main() {
+  const result = await resendRun("u-123", "<要重来的 run_id>", "换一个更简短的说法");
+  console.log(result); // {"success": true, "data": {"run_id": "...", "thread_id": "...", "status": "queued"}, "error": null}
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+```java [Java]
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * 10.10 重新生成与编辑重发 —— JDK 8 + HttpURLConnection,零依赖。
+ * JSON 用手工拼接字符串构造请求体,生产环境建议使用 Gson / Jackson 等成熟的 JSON 库。
+ */
+public class ResendRun {
+
+    static final String API_KEY = System.getenv("EXPERT_WORK_API_KEY");
+    static final String BASE_URL = "https://<your-domain>";
+    static final String AGENT_CODE = "{agent_code}"; // 替换成实际的 agent_code
+
+    static String readBody(InputStream in) throws IOException {
+        // InputStreamReader 必须显式指定 UTF-8——JDK 8 默认字符集跟平台走,中文会乱码
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+            return sb.toString();
+        }
+    }
+
+    /**
+     * 非 2xx 时,真正的原因在 getErrorStream() 里;getInputStream() 抛出的异常只带状态码,不含原因。
+     * 必须判 null:错误响应没有 body(网关的空体 502 就是这样)时 getErrorStream() 返回
+     * null,直接丢给 readBody 会当场 NPE,连状态码都跟着一起丢掉。
+     */
+    static String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream err = connection.getErrorStream();
+        return (err == null) ? "" : readBody(err);
+    }
+
+    // JSON 字符串转义——手工拼接 JSON 时,插值进去的字符串必须转义,不然输入里出现一个双引号
+    // 就会把请求体拼坏,服务端解析失败(422),不是风格建议。
+    static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** newInput 传 null 走 :regenerate(同一条输入再跑一次),非 null 走 :edit。 */
+    static String resendRun(String userId, String runId, String newInput, String idempotencyKey)
+            throws IOException {
+        String op = (newInput == null) ? "regenerate" : "edit";
+        URL url = new URL(BASE_URL + "/v1/agents/" + AGENT_CODE + "/runs/" + runId + ":" + op);
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setRequestMethod("POST");
+        connection.setRequestProperty("Authorization", "Bearer " + API_KEY);
+        connection.setRequestProperty("Content-Type", "application/json");
+        if (idempotencyKey != null) {
+            connection.setRequestProperty("Idempotency-Key", idempotencyKey);
+        }
+        connection.setDoOutput(true);
+
+        StringBuilder body = new StringBuilder();
+        body.append("{\"user_id\":\"").append(jsonEscape(userId)).append("\"");
+        body.append(",\"mode\":\"queue\"");
+        if (newInput != null) {
+            // :regenerate 不接受 input,带上是 422 INVALID_REQUEST
+            body.append(",\"input\":\"").append(jsonEscape(newInput)).append("\"");
+        }
+        body.append("}");
+        try (OutputStream out = connection.getOutputStream()) {
+            out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+        }
+
+        try {
+            int status = connection.getResponseCode();
+            if (status >= 200 && status < 300) {
+                return readBody(connection.getInputStream());
+            }
+
+            // 409 与 422 这两档原样重试都无效,按错误码分别处理
+            System.out.println("重发失败:" + status + " " + readErrorBody(connection));
+            throw new IOException(op + " failed: " + status);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        String result = resendRun("u-123", "<要重来的 run_id>", "换一个更简短的说法", null);
+        System.out.println(result); // {"success": true, "data": {"run_id": "...", "thread_id": "...", "status": "queued"}, "error": null}
     }
 }
 ```

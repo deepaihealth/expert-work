@@ -282,6 +282,13 @@ tools/deploy/release.sh prod            # 确认 'prod';或 --yes 走脚本
 算完(金丝雀未 seed 会 WARNING 跳过 —— 先按 §1.6.7 补 seed)。
 发布窗口:migrate 是 expand-only 约定(向后兼容一版,deployment.md §10)。
 
+P-1(重新生成 / 编辑重发)上线那一次:`alembic upgrade head` 会带上
+`0153_agent_run_supersede`(三列 NULL,秒级)。发布后用探针 user 对金丝雀 agent
+`release-canary` 跑一次 `POST …/runs/{run_id}:regenerate`(queue 模式),再拉
+`/messages` 看旧轮每条带 `superseded_by`、拉 `GET /v1/runs/{id}` 看两轮 `tokens`
+都在(明确不回滚计费)—— 脚本形态见
+`docs/superpowers/plans/2026-09-09-regenerate-edit-resend.md` 的 Task 12。
+
 ## 3. 回滚
 
 ```sh

@@ -24,6 +24,7 @@ import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStrea
 import { MarkdownView } from "../MarkdownView";
 import { CommentarySegmentLine } from "../turn/CommentarySegmentLine";
 import { HistoryDivider } from "../turn/HistoryDivider";
+import { SupersededFold } from "../turn/SupersededFold";
 import { TaskResultCard } from "../turn/TaskResultCard";
 import type { Turn } from "../turn/types";
 import type { ThreadPlan } from "../../api/plan";
@@ -216,39 +217,55 @@ export function Transcript(props: TranscriptProps): JSX.Element {
         </div>
       )}
 
-      {historyPart.map((turn) => (
-        <TurnBlock
-          key={turn.key}
-          turn={turn}
-          threadId={threadId}
-          selected={turn.key === selected}
-          onSelect={onSelectTurn}
-          onInspect={onInspectTurn}
-          onInspectRow={onInspectRow}
-          inputOrder={inputOrder}
-          rateBook={rateBook}
-          isSystemAdmin={isSystemAdmin}
-          readOnly={readOnly}
-          allowDecide={allowDecide}
-          allowRate={allowRate}
-          isTenantSwitched={isTenantSwitched}
-          onDecide={onDecide}
-          deciding={deciding}
-          onExport={onExport}
-          exporting={exportingKey === turn.key}
-          onRetry={onRetryHistory}
-          onDownloadArtifact={onDownloadArtifact}
-          onFireResult={onFireResult}
-          runHrefOf={runHrefOf}
-          feedbackOf={feedbackOf}
-          plan={planOf ? planOf(turn) : undefined}
-          rowRef={
-            turn.runId !== null
-              ? registerHistoryRow(turn.runId, threadId ?? "")
-              : undefined
-          }
-        />
-      ))}
+      {historyPart.map((turn) => {
+        const block = (
+          <TurnBlock
+            key={turn.key}
+            turn={turn}
+            threadId={threadId}
+            selected={turn.key === selected}
+            onSelect={onSelectTurn}
+            onInspect={onInspectTurn}
+            onInspectRow={onInspectRow}
+            inputOrder={inputOrder}
+            rateBook={rateBook}
+            isSystemAdmin={isSystemAdmin}
+            readOnly={readOnly}
+            allowDecide={allowDecide}
+            allowRate={allowRate}
+            isTenantSwitched={isTenantSwitched}
+            onDecide={onDecide}
+            deciding={deciding}
+            onExport={onExport}
+            exporting={exportingKey === turn.key}
+            onRetry={onRetryHistory}
+            onDownloadArtifact={onDownloadArtifact}
+            onFireResult={onFireResult}
+            runHrefOf={runHrefOf}
+            feedbackOf={feedbackOf}
+            plan={planOf ? planOf(turn) : undefined}
+            rowRef={
+              turn.runId !== null
+                ? registerHistoryRow(turn.runId, threadId ?? "")
+                : undefined
+            }
+          />
+        );
+        // P-1 —— 被取代的一轮包一层默认折叠的壳(只读展示,不加重跑入口)。
+        // 取代它的那一轮不在本页时(翻页翻掉了)给不出深链,壳照样折叠。
+        if (turn.supersededBy === null) return block;
+        const successor = turns.find((t) => t.runId === turn.supersededBy) ?? null;
+        return (
+          <SupersededFold
+            key={turn.key}
+            supersededBy={turn.supersededBy}
+            tombstone={turn.tombstone}
+            newRunHref={successor !== null && runHrefOf ? runHrefOf(successor) : null}
+          >
+            {block}
+          </SupersededFold>
+        );
+      })}
       {historyPart.length > 0 && <HistoryDivider />}
 
       {livePart.map((turn) => (

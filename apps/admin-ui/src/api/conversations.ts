@@ -71,6 +71,10 @@ export interface ConversationRun {
    *  构建成功前就结束了)—— **不是**「用了另一套配置」。 */
   agent_spec_sha256: string | null;
   tokens: RunTokens | null;
+  /** P-1 —— 这一轮被哪个新 run 取代(重新生成 / 编辑重发);``null`` = 未被取代。 */
+  superseded_by: string | null;
+  /** P-1 —— 这一轮是对哪个旧 run 的重新生成 / 编辑重发;``null`` = 普通一轮。 */
+  regenerated_from: string | null;
 }
 
 /** ``GET /v1/conversations/{thread_id}`` — the list item + its runs. */

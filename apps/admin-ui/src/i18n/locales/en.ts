@@ -412,6 +412,9 @@ export interface TranslationKeys {
     cancel_failed: string;
     role_user: string;
     role_assistant: string;
+    superseded_tag: string;
+    superseded_link: string;
+    tombstone_label: string;
   };
   skills_tab: {
     title: string;
@@ -3575,6 +3578,9 @@ const en: TranslationKeys = {
     cancel_failed: "Could not cancel the run.",
     role_user: "User",
     role_assistant: "Agent",
+    superseded_tag: "Superseded",
+    superseded_link: "→ replaced by run {{runId}}",
+    tombstone_label: "content cleared",
   },
   skills_tab: {
     title: "Skills authored by this agent",

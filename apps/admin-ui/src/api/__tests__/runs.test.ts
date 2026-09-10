@@ -17,12 +17,12 @@ describe("listThreadRuns", () => {
         success: true,
         data: {
           runs: [
-            // r1 = 新后端行(带 finished_at + error);r2 = 老后端行(缺
-            // 两字段)→ 必须映射成 null 而不是 undefined。
+            // r1 = 新后端行(带 finished_at / error / P-1 的两条重发链接);
+            // r2 = 老后端行(这四个键都缺)→ 必须映射成 null 而不是 undefined。
             {
               run_id: "r1",
               status: "interrupted",
-              is_resume: false,
+              is_resume: false, superseded_by: "r3", regenerated_from: "r0",
               created_at: "2026-01-01T00:00:00Z",
               finished_at: "2026-01-01T00:00:30Z",
               error: "user_cancel",
@@ -41,7 +41,7 @@ describe("listThreadRuns", () => {
       {
         runId: "r1",
         status: "interrupted",
-        isResume: false,
+        isResume: false, supersededBy: "r3", regeneratedFrom: "r0",
         createdAt: "2026-01-01T00:00:00Z",
         finishedAt: "2026-01-01T00:00:30Z",
         error: "user_cancel",
@@ -50,7 +50,7 @@ describe("listThreadRuns", () => {
       {
         runId: "r2",
         status: "paused",
-        isResume: true,
+        isResume: true, supersededBy: null, regeneratedFrom: null,
         createdAt: "2026-01-01T00:01:00Z",
         finishedAt: null,
         error: null,

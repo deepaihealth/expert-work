@@ -422,6 +422,9 @@ const zhCN: TranslationKeys = {
     cancel_failed: "取消失败。",
     role_user: "用户",
     role_assistant: "智能体",
+    superseded_tag: "已被取代",
+    superseded_link: "→ 新一轮 {{runId}}",
+    tombstone_label: "内容已清理",
   },
   skills_tab: {
     title: "该智能体创作的技能",

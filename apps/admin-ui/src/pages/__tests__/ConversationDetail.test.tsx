@@ -196,7 +196,7 @@ const TWO_RUNS = [
   {
     runId: RUN_1,
     status: "success" as const,
-    isResume: false,
+    isResume: false, supersededBy: null, regeneratedFrom: null,
     createdAt: "2026-06-30T12:00:00Z",
     finishedAt: null,
     error: null,
@@ -205,7 +205,7 @@ const TWO_RUNS = [
   {
     runId: RUN_2,
     status: "success" as const,
-    isResume: true,
+    isResume: true, supersededBy: null, regeneratedFrom: null,
     createdAt: "2026-06-30T12:05:00Z",
     finishedAt: null,
     error: null,
@@ -242,7 +242,7 @@ const CONVO: ConversationDetailModel = {
       thread_id: THREAD_ID,
       user_id: "88888888-8888-8888-8888-888888888888",
       status: "success",
-      is_resume: false,
+      is_resume: false, superseded_by: null, regenerated_from: null,
       error: null,
       created_at: "2026-06-30T12:00:00Z",
       updated_at: "2026-06-30T12:01:00Z",
@@ -256,7 +256,7 @@ const CONVO: ConversationDetailModel = {
       thread_id: THREAD_ID,
       user_id: "88888888-8888-8888-8888-888888888888",
       status: "error",
-      is_resume: false,
+      is_resume: false, superseded_by: null, regenerated_from: null,
       error: "boom",
       created_at: "2026-06-30T12:05:00Z",
       updated_at: "2026-06-30T12:05:30Z",
@@ -857,7 +857,7 @@ describe("ConversationDetail", () => {
         {
           runId: RUN_1,
           status: "timeout",
-          isResume: false,
+          isResume: false, supersededBy: null, regeneratedFrom: null,
           createdAt: "2026-06-30T12:00:00Z",
           finishedAt: null,
           error: null,
@@ -866,7 +866,7 @@ describe("ConversationDetail", () => {
         {
           runId: RUN_2,
           status: "interrupted",
-          isResume: true,
+          isResume: true, supersededBy: null, regeneratedFrom: null,
           createdAt: "2026-06-30T12:05:00Z",
           finishedAt: null,
           error: null,
@@ -875,7 +875,7 @@ describe("ConversationDetail", () => {
         {
           runId: RUN_3,
           status: "error",
-          isResume: true,
+          isResume: true, supersededBy: null, regeneratedFrom: null,
           createdAt: "2026-06-30T12:10:00Z",
           finishedAt: null,
           error: null,
@@ -1102,7 +1102,7 @@ const pausedFixture = () => {
     {
       runId: RUN_1,
       status: "success" as const,
-      isResume: false,
+      isResume: false, supersededBy: null, regeneratedFrom: null,
       createdAt: "2026-06-30T12:00:00Z",
       finishedAt: null,
       error: null,
@@ -1111,7 +1111,7 @@ const pausedFixture = () => {
     {
       runId: PAUSED_RUN,
       status: "paused" as const,
-      isResume: true,
+      isResume: true, supersededBy: null, regeneratedFrom: null,
       createdAt: "2026-06-30T12:05:00Z",
       finishedAt: null,
       error: null,

@@ -53,7 +53,7 @@ function turnOf(over: Partial<ConsoleTurn> & Pick<ConsoleTurn, "key" | "seq">): 
     timing: null,
     createdAt: null,
     finishedAt: null,
-    runError: null,
+    runError: null, supersededBy: null, tombstone: false,
     ...over,
   };
 }

@@ -49,6 +49,7 @@ export default withMermaid(
                 { text: "2.7 外部内容与模板变量", link: "/guide/chat#_2-7-外部内容与模板变量" },
                 { text: "2.8 防重复下发 Idempotency-Key", link: "/guide/chat#_2-8-防重复下发-idempotency-key" },
                 { text: "2.9 给一轮回答打分", link: "/guide/chat#_2-9-给一轮回答打分" },
+                { text: "2.10 重新生成与编辑重发", link: "/guide/chat#_2-10-重新生成与编辑重发" },
               ],
             },
             {
@@ -162,6 +163,8 @@ export default withMermaid(
                 { text: "10.6 取消 run", link: "/guide/examples#_10-6-取消-run" },
                 { text: "10.7 审批决策", link: "/guide/examples#_10-7-审批决策" },
                 { text: "10.8 条目模式的接收器", link: "/guide/examples#_10-8-条目模式的接收器" },
+                { text: "10.9 给一轮回答打分", link: "/guide/examples#_10-9-给一轮回答打分" },
+                { text: "10.10 重新生成与编辑重发", link: "/guide/examples#_10-10-重新生成与编辑重发" },
               ],
             },
           ],
