@@ -55,6 +55,7 @@ from langchain_core.runnables import RunnableConfig
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import SUPERSEDE_LOCK_CLASSID
 from control_plane.transcript import extract_turns
 from expert_work.common.conversation_channel import is_hidden, is_tombstone
 from expert_work.common.supersede import mark_superseded, tombstone_message
@@ -68,7 +69,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MAX_SUPERSEDED_VERSIONS",
     "SUPERSEDE_BUSY_STATUSES",
-    "SUPERSEDE_LOCK_CLASSID",
     "SupersedeError",
     "SupersedeResult",
     "TurnLocation",
@@ -76,12 +76,6 @@ __all__ = [
     "supersede_run",
     "supersede_thread_lock",
 ]
-
-#: advisory classid。既有取值:workspace_lock 1、mcp_oauth_refresh_lock 2、
-#: quality_drift 8615、memory_consolidator 8616、skill_curator 8617、
-#: tenant_resource_lock 8618、trigger_delivery / workspace_janitor 8619(历史
-#: 上重复占用,键串不同没撞)—— 本模块取 8620,永不共键。
-SUPERSEDE_LOCK_CLASSID = 8620
 
 #: 会话里任一 run 处于这些状态 → 409 THREAD_BUSY。与
 #: ``api/external_sessions._ACTIVE_RUN_STATUSES`` 同集合(PENDING / QUEUED /

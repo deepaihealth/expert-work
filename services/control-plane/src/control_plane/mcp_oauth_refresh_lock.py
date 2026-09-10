@@ -16,8 +16,9 @@ already fresh. It mirrors :class:`PgWorkspaceLock` (``pg_advisory_xact_lock``,
 auto-released at commit, safe under PgBouncer transaction mode) with two
 differences:
 
-- **Its own ``classid`` (2)** in the two-arg advisory key space, namespaced away
-  from workspace locks (``classid`` 1) so the key spaces never collide.
+- **Its own ``classid``** in the two-arg advisory key space, namespaced away
+  from every other lock so the key spaces never collide (the value and the
+  no-duplicates rule live in :mod:`control_plane.advisory_locks`).
 - A **modest idle/statement timeout** (covers one discover+refresh HTTP round
   trip held inside the lock) rather than the workspace lock's 360 s — refresh is
   seconds, not a 300 s sandbox exec.
@@ -36,9 +37,8 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-#: ``classid`` for the two-arg advisory key space — distinct from the workspace
-#: lock's ``classid`` 1 so an OAuth-refresh key can never collide with one.
-_OAUTH_REFRESH_LOCK_CLASSID = 2
+from control_plane.advisory_locks import MCP_OAUTH_REFRESH_LOCK_CLASSID
+
 #: Cap the lock txn's idle / statement time above one discover+refresh HTTP round
 #: trip (held idle-in-transaction inside the lock). ``SET LOCAL`` only (txn-scoped,
 #: PgBouncer-safe). Generous over the ~15 s per-call HTTP timeout.
@@ -64,6 +64,6 @@ class PgMcpOAuthRefreshLock:
             await session.execute(text(f"SET LOCAL statement_timeout = {_LOCK_TXN_TIMEOUT_MS}"))
             await session.execute(
                 text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
-                {"classid": _OAUTH_REFRESH_LOCK_CLASSID, "k": key},
+                {"classid": MCP_OAUTH_REFRESH_LOCK_CLASSID, "k": key},
             )
             yield

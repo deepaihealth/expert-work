@@ -38,6 +38,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import WORKSPACE_JANITOR_LOCK_CLASSID
 from control_plane.workspace_archive import (
     empty_tar_gz_bytes,
     stream_directory_tar_gz,
@@ -59,14 +60,6 @@ _INTERVAL_S = 1800.0
 #: 优雅期还长,等于没有上界。5 秒足够一轮正常 cycle 收尾;收不了尾就取
 #: 消——三个阶段都是周期性、幂等的,下次启动会重来。
 _STOP_TIMEOUT_S = 5.0
-
-#: Advisory-lock classid for the single-flight janitor cycle. Registry (each
-#: value distinct so no two locks ever share a key): ``workspace_lock.py``
-#: uses 1, ``mcp_oauth_refresh_lock.py`` uses 2,
-#: ``quality_drift_worker.py`` uses 8615, ``memory_consolidator.py`` uses
-#: 8616, ``skill_curator.py`` uses 8617, ``_tenant_resource_lock.py`` uses
-#: 8618, and this worker uses 8619 — two-arg ``(int4, int4)`` classid space.
-_JANITOR_LOCK_CLASSID = 8619
 
 #: 这个超时守的不是「正常一轮该多久」,而是「一个挂死/泄漏的锁会话最多
 #: 赖多久」——连接掉线本就会立即放锁,超时只在会话活着但卡住时兜底。真
@@ -215,7 +208,7 @@ class WorkspaceJanitorWorker:
             got = (
                 await lock_session.execute(
                     text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-                    {"cid": _JANITOR_LOCK_CLASSID, "k": "workspace_janitor"},
+                    {"cid": WORKSPACE_JANITOR_LOCK_CLASSID, "k": "workspace_janitor"},
                 )
             ).scalar_one()
             if not got:

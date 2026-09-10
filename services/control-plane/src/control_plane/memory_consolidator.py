@@ -44,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import MEMORY_CONSOLIDATOR_LOCK_CLASSID
 from control_plane.audit import emit as audit_emit
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from expert_work.common.observability import current_trace_id_hex
@@ -71,13 +72,6 @@ logger = logging.getLogger("expert_work.control_plane.memory_consolidator")
 # so tests drive a fast loop and operators dial it.
 _DEFAULT_INTERVAL_S: float = 14_400.0
 
-#: Advisory-lock classid for the single-flight sweep — makes concurrent
-#: replicas race for one winner per cycle instead of each spending LLM
-#: calls on the same work. Mirrors ``QualityDriftWorker._DRIFT_LOCK_CLASSID``
-#: (quality_drift_worker.py); a distinct value so the two never share a key
-#: (workspace_lock.py uses 1, mcp_oauth_refresh_lock.py uses 2, the drift
-#: worker uses 8615).
-_CONSOLIDATOR_LOCK_CLASSID = 8616
 #: The lock txn is held open for the whole sweep; keep it off any idle
 #: reaper.
 _LOCK_TXN_TIMEOUT_MS = 5 * 60 * 1000
@@ -632,7 +626,7 @@ class MemoryConsolidator:
             got = (
                 await lock_session.execute(
                     text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-                    {"cid": _CONSOLIDATOR_LOCK_CLASSID, "k": "memory_consolidator"},
+                    {"cid": MEMORY_CONSOLIDATOR_LOCK_CLASSID, "k": "memory_consolidator"},
                 )
             ).scalar_one()
             if not got:
