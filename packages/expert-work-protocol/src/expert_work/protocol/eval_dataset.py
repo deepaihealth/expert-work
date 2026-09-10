@@ -56,6 +56,10 @@ TrajectoryOutcome = Literal["success", "failed", "max_steps", "cancelled"]
 #: A G.6 user feedback rating — 👍 / 👎.
 FeedbackRating = Literal["up", "down"]
 
+#: PR4 — 一条反馈是谁打的:``console`` = 员工(控制台)、``external`` = 终端
+#: 用户(对接方应用)。与 ``feedback.source`` 同词表。
+FeedbackSource = Literal["console", "external"]
+
 
 class CandidateStatus(StrEnum):
     """Review lifecycle of a :class:`CurationCandidateRecord`.
@@ -111,6 +115,11 @@ class CurationCandidateRecord(BaseModel):
     feedback_comment: str | None = None
     #: P-2 — 👎→👍 改票时间;None = 没改过(升级为 negative_feedback 时清空)。
     feedback_changed_at: datetime | None = None
+    #: PR4 — 这一踩是谁打的:``console`` = 员工(控制台),``external`` = 终端
+    #: 用户(对接方应用)。None = worker 兜底建的候选,归因不到具体某一条
+    #: feedback。**展示面要区分来源,判断面不区分**(spec §6:四个下游消费者
+    #: 一律不按来源过滤)。
+    feedback_source: FeedbackSource | None = None
 
     @model_validator(mode="after")
     def _check_review_state(self) -> CurationCandidateRecord:

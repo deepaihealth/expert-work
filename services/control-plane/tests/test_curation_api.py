@@ -311,6 +311,30 @@ async def test_list_candidates_and_filter_by_signal(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_candidate_projection_carries_the_feedback_source(ctx: _Ctx) -> None:
+    """PR4 —— 候选投影带来源:审阅员要一眼看出这一踩是员工还是终端用户打的。
+
+    ``upgrade_to_negative`` 是唯一会写这一列的路径(worker 兜底建的行留 NULL),
+    所以这里先建行再升级,复现真实形态。
+    """
+    seeded = await ctx.seed_candidate(signal="failed_outcome")
+    await ctx.candidates.upgrade_to_negative(
+        tenant_id=_TENANT,
+        trajectory_key=seeded.trajectory_key,
+        feedback_run_id=uuid4(),
+        feedback_comment="答非所问",
+        feedback_source="console",
+    )
+    worker_built = await ctx.seed_candidate(signal="implicit_success", outcome="success")
+
+    items = (await ctx.client.get("/v1/curation/candidates")).json()["items"]
+    by_id = {i["id"]: i for i in items}
+    assert by_id[str(seeded.id)]["feedback_source"] == "console"
+    # worker 兜底建的候选归因不到某一条 feedback → 这一格是空的,不是漏投影。
+    assert by_id[str(worker_built.id)]["feedback_source"] is None
+
+
+@pytest.mark.asyncio
 async def test_get_candidate_detail_includes_trajectory(ctx: _Ctx) -> None:
     thread_id, tenant = uuid4(), _TENANT
     record = TrajectoryRecord(

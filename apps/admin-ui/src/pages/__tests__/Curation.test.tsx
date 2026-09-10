@@ -117,6 +117,7 @@ const candidateRow = {
   feedback_run_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7",
   feedback_comment: "太慢",
   feedback_changed_at: null,
+  feedback_source: "console",
 };
 
 const datasetRow = {
@@ -251,6 +252,48 @@ describe("CandidatesPanel", () => {
       expect(screen.getByTestId("curation-detail-feedback-run")).toHaveTextContent("7c9e6679"),
     );
     expect(screen.getByTestId("curation-detail-feedback-comment")).toHaveTextContent("太慢");
+  });
+
+  it("PR4 — 候选行标出这一踩是谁打的(员工 / 终端用户),worker 兜底行不标", async () => {
+    const external = { ...candidateRow, feedback_source: "external" };
+    const workerBuilt = {
+      ...candidateRow,
+      id: "c2",
+      signal: "implicit_success",
+      feedback_rating: null,
+      feedback_run_id: null,
+      feedback_comment: null,
+      feedback_source: null,
+    };
+    installAdapter([
+      {
+        match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
+        respond: () => ({ items: [external, workerBuilt], total: 2, cross_tenant: false }),
+      },
+    ]);
+    renderCuration();
+    // 本文件不钉 locale,两种语言都收。
+    await waitFor(() =>
+      expect(screen.getAllByTestId("curation-feedback-source-tag")).toHaveLength(1),
+    );
+    expect(screen.getByTestId("curation-feedback-source-tag").textContent).toMatch(
+      /终端用户|end user/,
+    );
+  });
+
+  it("PR4 — 员工打的踩标「员工」(与终端用户区分开)", async () => {
+    installAdapter([
+      {
+        match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
+        respond: () => ({ items: [candidateRow], total: 1, cross_tenant: false }),
+      },
+    ]);
+    renderCuration();
+    await waitFor(() =>
+      expect(screen.getByTestId("curation-feedback-source-tag").textContent).toMatch(
+        /员工|employee/,
+      ),
+    );
   });
 
   it("P-2 — 没改过票就不挂「后改为 👍」标记(阴性对照)", async () => {

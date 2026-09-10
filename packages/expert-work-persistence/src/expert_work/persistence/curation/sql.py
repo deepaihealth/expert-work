@@ -26,6 +26,7 @@ from expert_work.protocol import (
     EvalDatasetRecord,
     EvalDatasetSource,
     FeedbackRating,
+    FeedbackSource,
     TrajectoryOutcome,
 )
 
@@ -217,6 +218,7 @@ def _candidate_row_to_dto(row: CurationCandidateRow) -> CurationCandidateRecord:
         feedback_run_id=row.feedback_run_id,
         feedback_comment=row.feedback_comment,
         feedback_changed_at=row.feedback_changed_at,
+        feedback_source=cast(FeedbackSource | None, row.feedback_source),
     )
 
 
@@ -248,6 +250,7 @@ class SqlCurationCandidateStore(CurationCandidateStore):
                     feedback_run_id=record.feedback_run_id,
                     feedback_comment=record.feedback_comment,
                     feedback_changed_at=record.feedback_changed_at,
+                    feedback_source=record.feedback_source,
                 )
                 .on_conflict_do_nothing(constraint="curation_candidate_trajectory_uniq")
             )
@@ -385,6 +388,7 @@ class SqlCurationCandidateStore(CurationCandidateStore):
                     feedback_run_id=record.feedback_run_id,
                     feedback_comment=record.feedback_comment,
                     feedback_changed_at=record.feedback_changed_at,
+                    feedback_source=record.feedback_source,
                 )
             )
             await session.commit()
@@ -397,6 +401,7 @@ class SqlCurationCandidateStore(CurationCandidateStore):
         trajectory_key: str,
         feedback_run_id: UUID,
         feedback_comment: str | None,
+        feedback_source: str | None = None,
     ) -> bool:
         async with self._sf() as session:
             result = await session.execute(
@@ -410,6 +415,7 @@ class SqlCurationCandidateStore(CurationCandidateStore):
                     feedback_rating="down",
                     feedback_run_id=feedback_run_id,
                     feedback_comment=feedback_comment,
+                    feedback_source=feedback_source,
                     feedback_changed_at=None,
                 )
             )

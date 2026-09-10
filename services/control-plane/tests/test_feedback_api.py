@@ -448,3 +448,46 @@ async def test_get_feedback_read_carries_its_own_tenant_predicate(
     assert resp.status_code == 200, resp.text
     assert resp.json()["items"] == []
     assert "OTHER-TENANT-ROW" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_submit_feedback(client: AsyncClient) -> None:
+    """PR4 —— 前端置灰不算闸:viewer 直接打端点必须 403。
+
+    ``require_key_scope("write")`` 对人类 JWT 直接放行(它只卡 service
+    account),``console_only()`` 又把 API key 整个挡在门外 —— 所以这条路由上
+    员工侧的角色闸只能由 ``require("session", "write")`` 自己来。
+    """
+    viewer_jwt = make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="viewer-1", roles=("viewer",))
+    resp = await client.post(
+        f"/v1/sessions/{uuid4()}/feedback",
+        json={"rating": "down", "run_id": _RUN_ID},
+        headers={"Authorization": f"Bearer {viewer_jwt}"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["code"] == "FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_operator_can_submit_feedback(
+    client: AsyncClient, feedback_store: InMemoryFeedbackStore
+) -> None:
+    """PR4 —— operator 仍然能打(闸不能宽到把该放的也拦了)。
+
+    与上一条一起把闸钉在 ``write`` 这一档:降到 ``read`` 会放行 viewer,
+    升到 ``delete`` 会连 operator 一起拦掉。
+    """
+    operator_jwt = make_test_jwt(
+        tenant_id=_DEFAULT_TENANT, subject="operator-1", roles=("operator",)
+    )
+    thread_id = uuid4()
+    resp = await client.post(
+        f"/v1/sessions/{thread_id}/feedback",
+        json={"rating": "up", "run_id": _RUN_ID},
+        headers={"Authorization": f"Bearer {operator_jwt}"},
+    )
+    assert resp.status_code == 201, resp.text
+    rows = await feedback_store.list_for_thread_scoped(
+        tenant_id=_DEFAULT_TENANT, thread_id=thread_id
+    )
+    assert [r.rating for r in rows] == ["up"]

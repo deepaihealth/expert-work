@@ -576,11 +576,10 @@ describe("ConversationDetail", () => {
       expect(screen.queryByTestId("conversation-message-0")).not.toBeInTheDocument();
       // Task 3 — the console tabs replace the old flat block.
       expect(screen.getByTestId("console-view-tabs")).toBeInTheDocument();
-      // Fix round 1 — a settled, non-tenant-switched turn is the one case
-      // FeedbackBar *would* render for if `readOnly` weren't threaded down
-      // (TurnFooter.tsx: `!readOnly && status === "done" && threadId`); this
-      // fixture actually reaches that branch, so this queryBy is a real gate.
-      expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+      // PR4 — 这一条从「不该有打分条」翻成「该有」:打分已从 `readOnly` 里
+      // 拆成独立的 `allowRate`,本用例的默认身份是 admin(beforeEach)→
+      // `canOperate` 为真 → 两轮都给打分条。viewer 那一侧由下面的专用用例钉。
+      expect(screen.getAllByTestId("playground-turn-feedback")).toHaveLength(2);
       // Approval buttons are asserted in dedicated tests below (fire-now,
       // plan editor) — `console-turn`'s approval gate isn't checked here:
       // history turns are always synthesised with `approval: null`
@@ -617,8 +616,37 @@ describe("ConversationDetail", () => {
       // 本文件不钉 locale(TurnFooter.test.tsx 才钉 zh-CN),两种语言都收。
       expect(summaries[0].textContent).toMatch(/点踩|Rated bad/);
       expect(summaries[0].textContent).toMatch(/终端用户|end user/);
-      // 页面仍然只读:摆出来的是记录,不是可点的打分条。
+      // PR4 — 「已记录的分」与「现在去打分」是两块东西,互不排斥:admin
+      // (本用例默认身份)两轮都拿得到打分条,而 👎 记录只挂在 RUN_2 那一轮。
+      expect(screen.getAllByTestId("playground-turn-feedback")).toHaveLength(2);
+    });
+
+    // PR4 — 对话详情页放开打分:operator+ 能打,viewer 只能看。页面本身
+    // 仍然恒 ``readOnly``(重跑/过程条照旧挡着),放开的只有打分这一个口子。
+    it("PR4 — viewer 在对话详情页看不到打分条", async () => {
+      setStoredToken(jwt({ sub: "v", tenant_id: TENANT_ID, roles: ["viewer"] }));
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+
+      renderPage();
+
+      await waitFor(() => expect(screen.getAllByTestId("console-turn")).toHaveLength(2));
       expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+    });
+
+    it("PR4 — operator 在对话详情页能打分(重跑按钮仍然没有)", async () => {
+      setStoredToken(jwt({ sub: "o", tenant_id: TENANT_ID, roles: ["operator"] }));
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+
+      renderPage();
+
+      await waitFor(() => expect(screen.getAllByTestId("console-turn")).toHaveLength(2));
+      expect(await screen.findAllByTestId("playground-turn-feedback")).toHaveLength(2);
+      // 打分放开 ≠ 重跑放开:这一页从不传 retry handler。
+      expect(screen.queryByTestId("playground-turn-retry")).not.toBeInTheDocument();
     });
 
     it("P-2 — 反馈读失败不影响页面(best-effort,轮脚只是没有标记)", async () => {
@@ -1128,8 +1156,10 @@ describe("D-5/D-6 live tail + operations", () => {
       expect(screen.getByTestId("playground-approval")).toBeInTheDocument(),
     );
     expect(screen.getByTestId("playground-approval-approve")).toBeInTheDocument();
-    // R2 still holds for everything but the gate: no feedback bar.
-    expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+    // PR4 — 打分是第二个从只读里单独放行的口子(operator+),所以已经结
+    // 束的那一轮现在有打分条;暂停中的那一轮仍然没有(状态不是 done /
+    // interrupted)。R2 的其余部分不变。
+    expect(screen.getAllByTestId("playground-turn-feedback")).toHaveLength(1);
   });
 
   it("viewer gets no approval buttons on the same paused turn", async () => {

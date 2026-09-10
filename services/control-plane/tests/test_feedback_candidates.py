@@ -63,6 +63,7 @@ class _Fx:
         rating: str,
         previous: str | None = None,
         comment: str | None = None,
+        source: str = "console",
     ) -> str:
         return await sync_candidate_for_feedback(
             deps=self.deps,
@@ -72,6 +73,7 @@ class _Fx:
             rating=rating,
             previous_rating=previous,
             comment=comment,
+            source=source,
         )
 
 
@@ -122,6 +124,32 @@ async def test_down_upgrades_existing_failed_outcome_candidate() -> None:
     rows = await fx.candidates.list_for_review(tenant_id=tenant)
     assert len(rows) == 1
     assert rows[0].signal == "negative_feedback" and rows[0].feedback_run_id == run
+
+
+@pytest.mark.asyncio
+async def test_candidate_carries_the_rating_source_on_both_write_paths() -> None:
+    """PR4 —— 写反馈那一侧的 ``source`` 一路传到候选行:建行与升级两条路径都带。
+
+    员工(``console``)与终端用户(``external``)的踩同表同列,只靠这一格区分 ——
+    展示面要分得开(spec §6),判断面不分。
+    """
+    fx = _Fx()
+    tenant, thread, run = uuid4(), uuid4(), uuid4()
+    await fx.seed_thread(tenant, thread)
+    await fx.seed_trajectory(tenant, thread)
+
+    # 建行路径:终端用户踩的。
+    assert await fx.sync(tenant, thread, run, rating="down", source="external") == "inserted"
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert len(rows) == 1 and rows[0].feedback_source == "external"
+
+    # 升级路径:员工随后也踩了同一条会话 → 来源跟着最后那一票走。
+    assert (
+        await fx.sync(tenant, thread, run, rating="down", previous="down", source="console")
+        == "upgraded"
+    )
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert len(rows) == 1 and rows[0].feedback_source == "console"
 
 
 @pytest.mark.asyncio

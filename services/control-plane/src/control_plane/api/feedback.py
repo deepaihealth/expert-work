@@ -86,7 +86,18 @@ def build_feedback_router() -> APIRouter:
         "/{thread_id}/feedback",
         response_model=None,
         status_code=201,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        # PR4 — operator+(与同一页审批决策同级)。``require_key_scope`` 只卡
+        # service account,对人类 JWT 直接放行,而 ``console_only()`` 又把 API
+        # key 整个挡在门外 —— 所以这条路由上员工侧的角色闸必须由 ``require``
+        # 自己来;前端置灰不算闸。``require_key_scope("write")`` 因此在这里恒
+        # 不触发,属于本 PR 之前就有的冗余,不在本 PR 范围内删。
+        # 只收紧 POST:下面的 GET 挂 ``session:read``,viewer 要读得到评论原文
+        # (2026-09-09 拍板的「viewer 只能看」的另一半),别顺手统一。
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def submit_feedback(
         thread_id: UUID,
@@ -135,6 +146,7 @@ def build_feedback_router() -> APIRouter:
                 rating=payload.rating,
                 previous_rating=previous,
                 comment=payload.comment,
+                source="console",
             )
         except Exception:
             # 进池是反馈的副产品:它失败不能让员工那一票丢掉;worker 300s 后兜底。

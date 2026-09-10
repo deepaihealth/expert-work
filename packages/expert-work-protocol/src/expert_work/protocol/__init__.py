@@ -102,6 +102,7 @@ from expert_work.protocol.eval_dataset import (
     EvalDatasetRecord,
     EvalDatasetSource,
     FeedbackRating,
+    FeedbackSource,
     TrajectoryOutcome,
 )
 from expert_work.protocol.eval_run import (
@@ -360,6 +361,7 @@ __all__ = [
     "EventType",
     "EvolutionOrigin",
     "FeedbackRating",
+    "FeedbackSource",
     "FieldTier",
     "FilesystemSpec",
     "HTTPToolSpec",

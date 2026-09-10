@@ -83,6 +83,8 @@ def _candidate_dict(record: CurationCandidateRecord) -> dict[str, Any]:
             str(record.feedback_run_id) if record.feedback_run_id is not None else None
         ),
         "feedback_comment": record.feedback_comment,
+        # PR4 — 这一踩是员工还是终端用户打的;NULL = worker 兜底建的候选。
+        "feedback_source": record.feedback_source,
         "feedback_changed_at": (
             record.feedback_changed_at.isoformat()
             if record.feedback_changed_at is not None

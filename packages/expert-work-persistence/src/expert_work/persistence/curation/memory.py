@@ -177,6 +177,7 @@ class InMemoryCurationCandidateStore(CurationCandidateStore):
         trajectory_key: str,
         feedback_run_id: UUID,
         feedback_comment: str | None,
+        feedback_source: str | None = None,
     ) -> bool:
         for cid, r in list(self._rows.items()):
             if r.tenant_id == tenant_id and r.trajectory_key == trajectory_key:
@@ -186,6 +187,7 @@ class InMemoryCurationCandidateStore(CurationCandidateStore):
                         "feedback_rating": "down",
                         "feedback_run_id": feedback_run_id,
                         "feedback_comment": feedback_comment,
+                        "feedback_source": feedback_source,
                         "feedback_changed_at": None,
                     }
                 )

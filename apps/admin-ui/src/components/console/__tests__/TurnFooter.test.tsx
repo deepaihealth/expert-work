@@ -352,6 +352,52 @@ describe("TurnFooter", () => {
     expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
   });
 
+  // PR4 — 打分从 ``readOnly`` 里拆出来走 ``allowRate``:对话详情页恒
+  // ``readOnly``,operator+ 仍要能打分,viewer 只能看。
+  it("PR4 — 只读页 + allowRate=false(viewer):打分条不渲染", () => {
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={FULL_SUMMARY}
+          costCny={null}
+          readOnly
+          allowRate={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+  });
+
+  it("PR4 — 只读页 + allowRate=true(operator+):打分条渲染,重跑按钮仍然没有", () => {
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={makeConsoleTurn({ status: "done" })}
+          threadId="th-1"
+          summary={FULL_SUMMARY}
+          costCny={null}
+          readOnly
+          allowRate
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
+    // 回归护栏,不是 ``readOnly`` 的变异证明:重跑按钮的开关是「有没有传
+    // ``onRetry``」(见 ``TurnFooter`` 里 ``{onRetry && …}``),对话详情页
+    // 根本不传 handler。这条钉住的是「放开打分没有顺手放开重跑」。
+    expect(screen.queryByTestId("playground-turn-retry")).not.toBeInTheDocument();
+  });
+
   // PR-B Task 3 — ConversationDetail's per-turn "查看运行" deep link: an
   // explicit ``runHref`` prop (not derived from the turn's own events, unlike
   // the old TurnMeta chip the test above guards against resurrecting).

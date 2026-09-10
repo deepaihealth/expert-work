@@ -64,6 +64,9 @@ export interface TurnBlockProps {
    *  page: the conversation page keeps every other affordance read-only but
    *  gives operator+ the in-place approve/reject. Default off. */
   allowDecide?: boolean;
+  /** PR4 — 透传 ``TurnFooter.allowRate``:只读页上单独放行打分(``allowDecide``
+   *  的同族开关,默认关 = 不放行)。 */
+  allowRate?: boolean;
   isTenantSwitched: boolean;
   onDecide: (
     turnId: string,
@@ -117,6 +120,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     rateBook,
     readOnly,
     allowDecide = false,
+    allowRate = false,
     isTenantSwitched,
     onDecide,
     deciding,
@@ -246,6 +250,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         summary={summary}
         costCny={costCny}
         readOnly={readOnly}
+        allowRate={allowRate}
         isTenantSwitched={isTenantSwitched}
         onRetry={onRetry}
         onExport={onExport}

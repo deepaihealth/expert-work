@@ -175,6 +175,7 @@ def build_external_feedback_router() -> APIRouter:
                 rating=payload.rating,
                 previous_rating=previous,
                 comment=payload.comment,
+                source="external",
             )
         except Exception:
             # 进池是反馈的副产品:它失败不能让用户那一票丢掉;worker 300s 后兜底。
