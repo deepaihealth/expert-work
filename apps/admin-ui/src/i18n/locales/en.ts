@@ -1602,6 +1602,8 @@ export interface TranslationKeys {
     col_status: string;
     col_detected: string;
     col_outcome: string;
+    col_feedback_comment: string;
+    feedback_changed_tag: string;
     filter_status: string;
     filter_status_all: string;
     filter_signal: string;
@@ -1609,6 +1611,8 @@ export interface TranslationKeys {
     detail_title: string;
     detail_signal: string;
     detail_outcome: string;
+    detail_feedback_run: string;
+    detail_feedback_comment: string;
     detail_trajectory: string;
     trajectory_missing: string;
     promote: string;
@@ -4872,6 +4876,8 @@ const en: TranslationKeys = {
     col_status: "Status",
     col_detected: "Detected",
     col_outcome: "Outcome",
+    col_feedback_comment: "User's words",
+    feedback_changed_tag: "later changed to 👍",
     filter_status: "Status filter",
     filter_status_all: "All statuses",
     filter_signal: "Signal filter",
@@ -4879,6 +4885,8 @@ const en: TranslationKeys = {
     detail_title: "Candidate detail",
     detail_signal: "Signal",
     detail_outcome: "Outcome",
+    detail_feedback_run: "Rated-down run",
+    detail_feedback_comment: "User's words",
     detail_trajectory: "Trajectory",
     trajectory_missing:
       "Trajectory artifact missing — promote / dismiss still allowed.",
