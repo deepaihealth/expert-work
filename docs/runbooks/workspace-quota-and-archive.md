@@ -114,7 +114,7 @@
 
 ## 故障排查
 
-- **janitor 活着吗**:日志 `workspace_janitor.*`;多副本 advisory lock(classid 8619)单飞,
+- **janitor 活着吗**:日志 `workspace_janitor.*`;多副本 advisory lock(classid 8621)单飞,
   loser 静默跳过是常态,不是故障。
 - **单用户归档反复失败**:`workspace_janitor.archive_failed` 有堆栈;幂等重试,无 DLQ;
   连续多轮失败按堆栈修,手工补救走「归档恢复」逆操作。

@@ -24,6 +24,34 @@ Adding a lock:
   and two different locks sharing a class during that window is exactly the
   collision this registry exists to prevent.
 
+Renumbering a live lock:
+
+Changing an already-deployed lock's ``classid`` is **not** free housekeeping. A
+rolling deploy runs old and new pods together for a minute or two, and during
+that window old pods lock on the old class while new pods lock on the new one —
+the two do not exclude each other at all. So when a collision has to be broken
+by moving one of the two locks, move the one whose **split-brain is survivable**,
+not the one whose name reads better in the docs.
+
+That is why ``workspace_janitor`` moved and ``trigger_delivery`` stayed on
+``8619``, even though the janitor took the number first and a runbook already
+named it:
+
+* ``trigger_delivery`` without exclusion delivers a result twice, or lets two
+  ``aupdate_state`` calls write sibling versions of the same parent checkpoint —
+  a lost update. User-visible, and it corrupts conversation state.
+* ``workspace_janitor`` without exclusion just runs a second copy of an
+  idempotent sweep (reaping an already-gone dir / an already-swept size is a
+  no-op); the cost is one cycle's wasted archive upload, not wrong data. The
+  janitor already tolerates exactly this: its lock txn is killed at 12 h and a
+  peer replica then starts a concurrent cycle, which
+  ``docs/runbooks/workspace-quota-and-archive.md`` documents as a known,
+  non-corrupting state.
+
+If **neither** side of a future collision is survivable, do not pick one — take
+both classes at once in one release (acquire old *and* new), then drop the old
+one in the next release, so no window exists where the two are unlocked.
+
 Scope: the two-arg ``(int4, int4)`` key space only. Postgres keeps the
 single-arg ``pg_advisory_xact_lock(bigint)`` space structurally separate and it
 carries no ``classid``; its only user is the event-log thread lock
@@ -70,18 +98,19 @@ SKILL_CURATOR_LOCK_CLASSID: Final[int] = 8617
 #: section, key ``"{tenant_id}:{resource_kind}"``.
 TENANT_RESOURCE_LOCK_CLASSID: Final[int] = 8618
 
-#: ``workspace_janitor`` — single-flight janitor cycle, key
-#: ``"workspace_janitor"``. Also named in
-#: ``docs/runbooks/workspace-quota-and-archive.md``.
-WORKSPACE_JANITOR_LOCK_CLASSID: Final[int] = 8619
+#: ``trigger_delivery`` — per-thread delivery close-the-window lock, key =
+#: thread id. Shared ``8619`` with the janitor until the registry landed; kept
+#: the value because it is the one that must not lose exclusion for even a
+#: deploy window (see "Renumbering a live lock" above).
+TRIGGER_DELIVERY_LOCK_CLASSID: Final[int] = 8619
 
 #: ``supersede`` — per-thread regenerate / edit-resend lock, key = thread id.
 SUPERSEDE_LOCK_CLASSID: Final[int] = 8620
 
-#: ``trigger_delivery`` — per-thread delivery close-the-window lock, key =
-#: thread id. Held ``8619`` until the registry landed, overlapping the janitor;
-#: moved to its own value here.
-TRIGGER_DELIVERY_LOCK_CLASSID: Final[int] = 8621
+#: ``workspace_janitor`` — single-flight janitor cycle, key
+#: ``"workspace_janitor"``. Moved off the shared ``8619`` when the registry
+#: landed. Also named in ``docs/runbooks/workspace-quota-and-archive.md``.
+WORKSPACE_JANITOR_LOCK_CLASSID: Final[int] = 8621
 
 #: Every registered classid, keyed by the owning module. The self-audit test
 #: asserts the values are unique *and* that every ``*_CLASSID`` constant above
@@ -94,8 +123,8 @@ CLASSID_BY_OWNER: Final[Mapping[str, int]] = MappingProxyType(
         "memory_consolidator": MEMORY_CONSOLIDATOR_LOCK_CLASSID,
         "skill_curator": SKILL_CURATOR_LOCK_CLASSID,
         "_tenant_resource_lock": TENANT_RESOURCE_LOCK_CLASSID,
-        "workspace_janitor": WORKSPACE_JANITOR_LOCK_CLASSID,
-        "supersede": SUPERSEDE_LOCK_CLASSID,
         "trigger_delivery": TRIGGER_DELIVERY_LOCK_CLASSID,
+        "supersede": SUPERSEDE_LOCK_CLASSID,
+        "workspace_janitor": WORKSPACE_JANITOR_LOCK_CLASSID,
     }
 )
