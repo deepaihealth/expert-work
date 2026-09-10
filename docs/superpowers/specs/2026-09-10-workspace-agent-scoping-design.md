@@ -192,13 +192,31 @@ OVERFLOW_DIR = ".tool_results"
 | `list_artifacts` | `list_for_user(tenant, user)` | 默认只列本 agent;描述改成实话 |
 | `list_dir` 描述 | "the agent's workspace" | 说明并集语义与 `shared:` 前缀 |
 
-### 5.3 这是命名空间,不是安全边界
+### 5.3 四个文件工具是真边界,bash / exec_python 不是
 
-`bash` / `exec_python` 能 `cd /workspace && ls` 走出去。与 `/opt/skills/<agent_key>` 的性质完全一致 ——
-**它防的是「拿错」,不防「故意拿」**。同一用户的不同 agent 之间本就不构成信任边界
-(跨用户、跨租户的隔离由归属轴和 RLS 负责,不在本设计范围)。
+**订正立项时的判断。** 路径解析不在 orchestrator 侧 —— `_require_path` 只产出相对路径,
+`build_*_wrapper(rel, ws=...)` 把它编进沙箱内的片段,真正的 join 在沙箱里
+(`file_ops.py:126-155` 的 `_PRELUDE`):
 
-这一条要写进工具描述与文档,**不要在别处把它说成隔离**。
+```python
+_WS = os.path.realpath(_P["ws"])
+def _resolve(rel):
+    full = os.path.realpath(os.path.join(_WS, rel))
+    if full == _WS or full.startswith(_WS + os.sep):
+        return full
+    return None
+```
+
+`ws` 本来就是 wrapper 的参数(默认 `/workspace`)。把它换成
+`/workspace/agents/<agent_key>` 之后,**这个 `realpath` + `startswith` 守卫会把
+`read_file` / `write_file` / `list_dir` / `edit_file` 真正关在 agent 子树内**,
+连符号链接逃逸一起挡 —— 与它今天挡 `..` 是同一道闸,不是新加的约定。
+
+**`bash` / `exec_python` 绕得过**(它们在沙箱里跑任意代码,`cd /workspace` 即可)。
+与 `/opt/skills/<agent_key>` 的性质一致。
+
+所以准确的说法是:**四个文件工具是强制的,bash / exec_python 是约定。**
+工具描述与文档按这个说法写,不要笼统说成「隔离」,也不要笼统说成「只是约定」。
 
 ## 六、数据模型
 
@@ -235,10 +253,20 @@ OVERFLOW_DIR = ".tool_results"
 | 内容 | 反推路径 | 可推? |
 |---|---|---|
 | `uploads/` | `user_upload.thread_id` → `thread_meta.agent_name` | ✅ `thread_id` NOT NULL |
-| 产物 | `artifact_version.created_in_thread` → `thread_meta.agent_name` | ✅ |
+| 产物 | `created_in_thread` → `agent_run` → `thread_id` → `thread_meta.agent_name` | ✅ 见下方勘误 |
 | `threads/<id>/` | `thread_id` 直接查 | ✅ |
 | `.tool_results/<run_id>/` | `run_id` → `agent_run` → thread → agent | ✅ |
 | `MEMORY.md` / `style/` / `客户案例/` / `payload/` / `assets/` / 根级散文件 | 无登记行 | ❌ → `shared/` |
+
+> **勘误:`artifact_version.created_in_thread` 存的是 `run_id`,不是 `thread_id`。**
+> `SaveArtifactTool.call()` 写的是 `str(ctx.run_id)`(`tools/artifact.py:137`,
+> 无 `run_id` 时回落常量 `_FALLBACK_THREAD_ID`)。字段名与内容不符。
+> 反推链因此多一跳:`created_in_thread` → `agent_run.id` → `agent_run.thread_id`
+> → `thread_meta.agent_name`。回落常量那批推不出来,按规则进 `shared/`。
+
+> **简化:`path_in_workspace` 存含前缀的完整相对路径**(`agents/<agent_key>/artifacts/x.docx`),
+> 于是 §7.3 列的七个下游消费点**全部不用改** —— 它们都是拿这一列去 join 用户根,
+> 前缀在值里就自然对了。迁移只需 `UPDATE` 这一列 + 物理搬文件。
 
 ### 7.2 已接受的代价
 
