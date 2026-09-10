@@ -92,6 +92,7 @@ export function ConversationsList() {
   const agentFilter = searchParams.get("agent") ?? undefined;
   const errorsOnly = searchParams.get("errors") === "1";
   const pendingOnly = searchParams.get("pending") === "1";
+  const downRatedOnly = searchParams.get("down") === "1";
   const windowHours = Number(searchParams.get("window")) || undefined;
   const q = searchParams.get("q") ?? undefined;
   const page = Math.max(1, Number(searchParams.get("page")) || 1);
@@ -166,6 +167,7 @@ export function ConversationsList() {
         agentName: agentFilter,
         hasError: errorsOnly,
         hasPending: pendingOnly,
+        hasDownRated: downRatedOnly,
         since: windowHours
           ? new Date(Date.now() - windowHours * 3_600_000).toISOString()
           : undefined,
@@ -194,6 +196,7 @@ export function ConversationsList() {
     agentFilter,
     errorsOnly,
     pendingOnly,
+    downRatedOnly,
     windowHours,
     q,
     userFilter,
@@ -423,6 +426,13 @@ export function ConversationsList() {
               data-testid="conversations-pending-only"
             >
               {t("conversations_page.filter_pending_only")}
+            </Checkbox>
+            <Checkbox
+              checked={downRatedOnly}
+              onChange={(e) => setParam("down", e.target.checked ? "1" : undefined)}
+              data-testid="conversations-down-rated-only"
+            >
+              {t("conversations_page.filter_down_rated_only")}
             </Checkbox>
             <Checkbox
               checked={autoRefresh}

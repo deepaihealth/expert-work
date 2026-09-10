@@ -378,6 +378,7 @@ export interface TranslationKeys {
     filter_agent: string;
     filter_errors_only: string;
     filter_pending_only: string;
+    filter_down_rated_only: string;
     auto_refresh: string;
     filter_window: string;
     window_all: string;
@@ -3536,6 +3537,7 @@ const en: TranslationKeys = {
     filter_agent: "Filter by agent",
     filter_errors_only: "Errors only",
     filter_pending_only: "Awaiting approval",
+    filter_down_rated_only: "Rated bad",
     auto_refresh: "Auto-refresh (30s)",
     filter_window: "Time window",
     window_all: "All time",

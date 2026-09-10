@@ -388,6 +388,7 @@ const zhCN: TranslationKeys = {
     filter_agent: "按智能体筛选",
     filter_errors_only: "仅看错误",
     filter_pending_only: "待审批",
+    filter_down_rated_only: "被点踩",
     auto_refresh: "自动刷新（30 秒）",
     filter_window: "时间范围",
     window_all: "全部时间",

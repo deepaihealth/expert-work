@@ -96,6 +96,10 @@ export interface ListConversationsParams {
   /** Only conversations with ≥1 run paused at an approval gate — the
    *  "needs a human" queue in conversation context. */
   hasPending?: boolean;
+  /** P-2 — only conversations carrying ≥1 👎 (any actor, any run; an
+   *  employee's and an end user's count the same). Composes with the
+   *  other filters the same way: intersection. */
+  hasDownRated?: boolean;
   /** ISO instant — only conversations with ≥1 run at/after it (the
    *  "active in the last N hours" window; composes with ``hasError``). */
   since?: string;
@@ -116,6 +120,7 @@ export async function listConversations(
     q,
     hasError,
     hasPending,
+    hasDownRated,
     since,
     limit,
     offset,
@@ -129,6 +134,7 @@ export async function listConversations(
       q,
       has_error: hasError ? true : undefined,
       has_pending: hasPending ? true : undefined,
+      has_down_rated: hasDownRated ? true : undefined,
       since,
       limit,
       offset,
