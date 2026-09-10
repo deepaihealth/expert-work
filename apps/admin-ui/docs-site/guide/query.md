@@ -217,6 +217,8 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/messages
 | `created_at` | string（ISO 8601） \| null | 这条消息产生的时间。这个字段是后来增加的，更早产生的消息为 `null`，服务端不做历史补齐 |
 | `run_id` | string（UUID） \| null | 产生这条消息的 run。按这个字段分组，可以把消息归到各自的 run 上；渲染对话界面不必自己分组，见 [5.8 对话条目](#_5-8-对话条目)。同样是后来增加的字段，更早产生的消息为 `null` |
 | `feedback` | object \| null | 当前 `user_id` 对这条消息所在的那一轮打过的分；没打过是 `null`。字段：`rating`（取值：`up` / `down`）、`comment`（string \| null）、`item_id`（string \| null），含义见 [2.9 给一轮回答打分](./chat#_2-9-给一轮回答打分) |
+| `superseded_by` | string（UUID） \| null | 取代这条消息所在那一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
+| `tombstone` | boolean | `true` 表示这条消息的正文已经清理，此时 `content` 是空字符串；正常消息恒为 `false` |
 
 ### 示例
 
@@ -295,6 +297,8 @@ GET /v1/agents/{agent_code}/runs
 | `finished_at` | string（ISO 8601） \| null | 进入最终状态的时间；还没有进入最终状态时为 `null` |
 | `error` | string \| null | 失败诊断文本，只在失败时非空，读法见下文 |
 | `artifacts` | array \| null | 这次 run 登记过的产物清单，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同：`{name, kind, version, created_at}`。`[]` 表示这轮明确零交付；`null` 表示没有记录——平台升级前的历史 run，以及还没跑到终局的 run，都没有清单。**没消费到 `end` 事件就发现 run 已终局的重连场景，从这里拿清单重建，不要用工作区文件状态倒推** |
+| `superseded_by` | string（UUID） \| null | 取代这一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
+| `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
 
 ### 示例
 
@@ -799,7 +803,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 
 ### 条目的公共字段
 
-每个条目都有这四个字段，`type` 决定它还带哪些字段。
+每个条目都有这六个字段，`type` 决定它还带哪些字段。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -807,6 +811,8 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 | `type` | string | 条目类型，七个取值见下表 |
 | `run_id` | string（UUID） | 产生这个条目的那一轮 |
 | `created_at` | string（ISO 8601） \| null | 产生时间。取不到时是 `null`，服务端不会补一个 |
+| `superseded_by` | string（UUID） \| null | 取代这个条目所在那一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
+| `tombstone` | boolean | `true` 表示这一轮的正文已经清理，此时条目的 `content` 是空字符串；正常条目恒为 `false` |
 
 条目**专有**字段的缺席规则与公共字段不同：取不到时整个键不出现，而不是给 `null`。客户端按「键不存在」判断，不要读到 `null` 才判断。
 
@@ -980,6 +986,8 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
 | `error` | string \| null | 失败诊断文本，只在失败时非空，读法见 [5.4 的 error 字段的读法](#error-字段的读法) |
 | `artifacts` | array \| null | 这一轮登记过的产物清单，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同。`[]` = 明确零交付；`null` = 无记录（平台升级前的历史轮，或还没终局的轮） |
 | `feedback` | object \| null | 当前 `user_id` 对这一轮打过的分；没打过是 `null`。字段与 [5.3 的 `feedback`](#_5-3-历史消息) 相同 |
+| `superseded_by` | string（UUID） \| null | 取代这一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
+| `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
 
 一轮的内容可能是空的（`runs` 里有这一轮，`items` 里没有它的条目），失败在第一步之前的轮次就是这样。`runs` 仍然给出它的状态与失败原因。
 

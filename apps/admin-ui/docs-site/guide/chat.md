@@ -587,3 +587,99 @@ curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/feedbac
 - `rating` 不是 `up` / `down`、`comment` 超过 4000 字符、`item_id` 超过 255 字符、请求体带了未声明的字段，返回 422 `INVALID_REQUEST`。
 
 打过的分会出现在 [5.3 历史消息](./query#_5-3-历史消息) 与 [5.8 对话条目](./query#_5-8-对话条目) 的 `feedback` 字段里，只回显当前 `user_id` 自己打的那一票。
+
+## 2.10 重新生成与编辑重发
+
+终端用户对 Agent 最新一轮的回答不满意时，调用方可以让这一轮重来：**重新生成**用同一条输入再跑一次，**编辑重发**改掉输入再跑一次。两个动作都只对一段会话的最后一轮有效。
+
+被取代的那一轮不会被删除。它在历史消息与对话条目里仍然读得到，只是带上了「已被取代」的标记；Agent 在后续对话里不再看见它，它在那一轮里写下的计划也退回到这一轮开始之前的状态。
+
+### 请求
+
+``` [端点]
+POST /v1/agents/{agent_code}/runs/{run_id}:regenerate
+POST /v1/agents/{agent_code}/runs/{run_id}:edit
+```
+
+两个端点都需要 `write` 权限。`{run_id}` 是要重来的那一轮，取值见 [5.4 run 列表](./query#_5-4-run-列表) 或 [5.8 对话条目](./query#_5-8-对话条目) 的 `runs`。
+
+重新生成的请求体：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | string，长度 1–255 字符。必须是发起这一轮的那个终端用户 |
+| `mode` | 否 | string。执行模式，取值：`stream`（默认）/ `queue`。含义见 [2.4](#_2-4-stream-还是-queue) |
+| `stream_format` | 否 | string。事件流的形态，取值：`legacy`（默认）/ `items`。含义见 [3.7 条目模式](./sse-events#_3-7-条目模式) |
+
+重新生成不接受 `input`、`files`、`inputs`、`untrusted_content`。这一轮的输入就是被取代那一轮的原文与附件，服务端原样复用；带上其中任何一个字段返回 422 `INVALID_REQUEST`，不会被忽略。
+
+编辑重发的请求体：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `user_id` | 是 | string，长度 1–255 字符。含义同上 |
+| `input` | 是 | string，不超过 65536 字符。这一轮改过之后的输入 |
+| `mode` | 否 | string。取值与含义同上 |
+| `stream_format` | 否 | string。取值与含义同上 |
+| `untrusted_content` | 否 | string 数组，最多 16 项。含义见 [2.7](#_2-7-外部内容与模板变量) |
+| `inputs` | 否 | object。提示词模板变量，含义见 [2.7](#_2-7-外部内容与模板变量) |
+| `files` | 否 | 数组，最多 64 项，每项形如 `{ "upload_id": "…" }`。**省略时这一轮不带任何附件**，被取代那一轮的附件不会沿用 |
+
+### 响应
+
+与 [2.2 发起对话](#_2-2-发起对话) 完全一致：`stream` 模式返回 200 与一条 SSE 流，`queue` 模式返回 202 与新的 `run_id`。
+
+事件流没有新增的事件类型，处理方式与普通的一轮相同。第一个 `metadata` 事件里的 `run_id` 是新的这一轮，`thread_id` 与被取代的那一轮相同——两个动作都在原来那段会话里继续，不会开出新的会话。
+
+### 示例
+
+```bash [请求]
+curl -X POST "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}:edit" \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u-123", "input": "换一个更简短的说法", "mode": "queue"}'
+```
+
+```json [响应 202]
+{ "success": true, "data": { "run_id": "...", "thread_id": "...", "status": "queued" }, "error": null }
+```
+
+### 三件不会撤销的事
+
+1. **被取代那一轮产生的影响保留。** 它写过的工作区文件、登记过的产物、记下的长期记忆都不会回退。新的一轮可能再次产生同类内容，同名的工作区文件与产物以后写的为准。
+2. **两轮都计费。** 被取代那一轮已经消耗的用量照常计入，不退还。
+3. **被取代那一轮仍然读得到。** 历史消息与对话条目照常返回它的内容，只是每条都带上「已被取代」的标记。
+
+同一轮最多保留 5 个被取代的版本。超出之后，最早的那个版本正文会被清理，此时它的 `content` 是空字符串、`tombstone` 是 `true`。
+
+### 在历史里怎么识别
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `superseded_by` | string（UUID） \| null | 取代它的那一轮的 `run_id`；没有被取代时是 `null`。历史消息的每条、对话条目的每个条目、`runs` 的每一项都带这个字段 |
+| `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或编辑重发；不是重来的一轮时是 `null`。只出现在 `runs` 的每一项上 |
+| `tombstone` | boolean | `true` 表示正文已经清理，此时 `content` 是空字符串。历史消息的每条与对话条目的每个条目都带这个字段 |
+
+三个字段恒定出现，没有取值时给 `null` 或 `false`，不会整个键消失。字段总表见 [5.3 历史消息](./query#_5-3-历史消息)、[5.4 run 列表](./query#_5-4-run-列表) 与 [5.8 对话条目](./query#_5-8-对话条目)。
+
+界面上的一般做法：把带 `superseded_by` 的消息折叠或者划掉，只把最新的那一轮当作当前回答；`tombstone` 为 `true` 的消息不必再展示正文，标一句内容已清理即可。
+
+### 错误
+
+| 错误码 | 状态码 | 含义与处理 |
+|---|---|---|
+| `RUN_NOT_FOUND` | 404 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。响应不透露这一轮是否存在 |
+| `THREAD_BUSY` | 409 | 这段会话有一轮正在执行或排队。等它结束，或者先用 [4.1 取消 run](./run-control#_4-1-取消-run) 停掉它 |
+| `RUN_AWAITING_APPROVAL` | 409 | 目标那一轮正等待审批决策。先做决策（[4.2 审批决策](./run-control#_4-2-审批决策)），再对续跑之后的那一轮操作 |
+| `RUN_ALREADY_SUPERSEDED` | 409 | 目标那一轮已经被重新生成过。改对最新的那一轮操作 |
+| `RUN_NOT_LAST` | 422 | 目标不是这段会话的最后一轮。要改更早的内容，只能从那一轮之后逐轮重做 |
+| `RUN_INPUT_UNAVAILABLE` | 422 | 只有重新生成会返回：目标那一轮在开始执行之前就失败了，没有可以复用的输入。改用编辑重发并给出 `input` |
+| `RUN_BOUNDARY_UNRESOLVED` | 422 | 服务端保存的这一轮的历史记录不完整，认不出它的起止范围。原样重试与换一个 `run_id` 都无效，换一段新会话继续，或者联系我们排查 |
+
+上面七个错误码原样重试都无效。逐条的处理方式见 [8 错误码总表](./errors)。
+
+### 防重复下发
+
+两个端点都支持 `Idempotency-Key`，规则见 [2.8](#_2-8-防重复下发-idempotency-key)：同一个键重发不会产生第二轮。
+
+判定依据除了键与请求体，还包含 `agent_code`、路径里的 `{run_id}` 以及用的是哪一个端点。同一个键换掉其中任何一项，返回 422 `IDEMPOTENCY_KEY_REUSED`。
