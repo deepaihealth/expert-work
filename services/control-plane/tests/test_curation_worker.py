@@ -103,10 +103,23 @@ class _Fixture:
             agent_version="1.0.0",
         )
 
-    async def seed_feedback(self, *, tenant_id: UUID, thread_id: UUID, rating: str) -> None:
+    async def seed_feedback(
+        self,
+        *,
+        tenant_id: UUID,
+        thread_id: UUID,
+        rating: str,
+        run_id: UUID | None = None,
+        comment: str | None = None,
+    ) -> None:
         await self.feedback.insert(
             FeedbackRecord(
-                tenant_id=tenant_id, thread_id=thread_id, rating=rating, actor_id="user@example.com"
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                rating=rating,
+                comment=comment,
+                actor_id="user@example.com",
             )
         )
 
@@ -340,3 +353,34 @@ async def test_later_followup_does_not_disqualify_implicit() -> None:
     assert await fx.worker.run_once() == 1
     rows = await fx.candidates.list_for_review(tenant_id=tenant, agent_name="reporter")
     assert [r.signal for r in rows] == ["implicit_success"]
+
+
+@pytest.mark.asyncio
+async def test_negative_candidate_carries_run_and_comment() -> None:
+    fx = _Fixture()
+    tenant, thread, run = uuid4(), uuid4(), uuid4()
+    await fx.seed_thread(tenant_id=tenant, thread_id=thread)
+    await fx.seed_trajectory(tenant_id=tenant, thread_id=thread, outcome="success")
+    await fx.seed_feedback(
+        tenant_id=tenant, thread_id=thread, rating="down", run_id=run, comment="太慢"
+    )
+    assert await fx.worker.run_once() == 1
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert rows[0].feedback_run_id == run and rows[0].feedback_comment == "太慢"
+
+
+@pytest.mark.asyncio
+async def test_existing_failed_candidate_is_upgraded_when_a_down_arrives_later() -> None:
+    fx = _Fixture()
+    tenant, thread, run = uuid4(), uuid4(), uuid4()
+    await fx.seed_thread(tenant_id=tenant, thread_id=thread)
+    await fx.seed_trajectory(tenant_id=tenant, thread_id=thread, outcome="failed")
+    assert await fx.worker.run_once() == 1  # failed_outcome
+    await fx.seed_feedback(
+        tenant_id=tenant, thread_id=thread, rating="down", run_id=run, comment="错了"
+    )
+    assert await fx.worker.run_once() == 1  # 升级计一次
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert len(rows) == 1
+    assert rows[0].signal == "negative_feedback" and rows[0].feedback_run_id == run
+    assert await fx.worker.run_once() == 0  # 已是 negative,第三次不再计

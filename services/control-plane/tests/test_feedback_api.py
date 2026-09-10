@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -12,8 +14,8 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.persistence.feedback_store import InMemoryFeedbackStore
-from expert_work.protocol import AuditQuery
+from expert_work.persistence.feedback_store import FeedbackRecord, InMemoryFeedbackStore
+from expert_work.protocol import AuditQuery, CurationCandidateRecord
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -39,10 +41,10 @@ def feedback_store() -> InMemoryFeedbackStore:
 
 
 @pytest.fixture
-async def client(
+def app(
     audit_store: InMemoryAuditLogStore,
     feedback_store: InMemoryFeedbackStore,
-) -> AsyncIterator[AsyncClient]:
+) -> Any:
     settings = Settings(
         env="dev",
         auth_mode="dev",
@@ -51,12 +53,16 @@ async def client(
         oidc_issuer=TEST_ISSUER,
         oidc_audience=[TEST_AUDIENCE],
     )
-    app = create_app(
+    return create_app(
         settings=settings,
         audit_logger=build_default_audit_logger(audit_store),
         feedback_repo=feedback_store,
         jwt_verifier=build_test_jwt_verifier(),
     )
+
+
+@pytest.fixture
+async def client(app: Any) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
     async with AsyncClient(
@@ -159,3 +165,85 @@ async def test_console_feedback_is_run_scoped_upsert(
     rows = await feedback_store.list_for_thread(thread_id=thread_id)
     assert len(rows) == 1
     assert rows[0].rating == "up" and rows[0].run_id == run_id and rows[0].source == "console"
+
+
+@pytest.mark.asyncio
+async def test_up_from_a_different_actor_does_not_mark_someone_elses_down_as_changed(
+    client: AsyncClient, app: Any, feedback_store: InMemoryFeedbackStore
+) -> None:
+    """改票标记按 run 命中候选行,所以「上一票」必须是**调用者自己**的那一票。
+
+    终端用户 👎 过这一轮(候选行已带 ``feedback_run_id``),员工随后在控制台给
+    同一轮打 👍 —— 员工自己从没打过 👎,候选行不该被标成「后改为 👍」。少了
+    ``previous`` 的 actor 谓词,员工这一票会读到别人的 👎 当作自己的上一票。
+    """
+    thread_id, run_id = uuid4(), uuid4()
+    at = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+    await feedback_store.insert(
+        FeedbackRecord(
+            tenant_id=_DEFAULT_TENANT,
+            thread_id=thread_id,
+            run_id=run_id,
+            rating="down",
+            actor_id="end-user-77",
+        )
+    )
+    candidates = app.state.curation_candidate_store
+    await candidates.upsert(
+        CurationCandidateRecord(
+            id=uuid4(),
+            tenant_id=_DEFAULT_TENANT,
+            agent_name="reporter",
+            agent_version="1.0.0",
+            thread_id=thread_id,
+            trajectory_key=f"trajectories/{_DEFAULT_TENANT}/failed/2026/09/09/{thread_id}.jsonl",
+            outcome="failed",
+            signal="negative_feedback",
+            feedback_rating="down",
+            feedback_run_id=run_id,
+            detected_at=at,
+        )
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{thread_id}/feedback",
+        json={"rating": "up", "run_id": str(run_id)},
+    )
+    assert resp.status_code == 201, resp.text
+    rows = await candidates.list_for_review(tenant_id=_DEFAULT_TENANT)
+    assert len(rows) == 1 and rows[0].feedback_changed_at is None
+
+
+@pytest.mark.asyncio
+async def test_candidate_sync_failure_never_loses_the_vote(
+    client: AsyncClient,
+    feedback_store: InMemoryFeedbackStore,
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """控制台侧同一条不变式:进池炸了,员工那一票照样落库、照样 201。
+
+    与对外端点是两条独立的写路径 —— 两边各留一条,改坏一边不会被另一边遮住。
+    """
+
+    async def _boom(**_kwargs: Any) -> str:
+        raise RuntimeError("candidate sync is down")
+
+    monkeypatch.setattr("control_plane.api.feedback.sync_candidate_for_feedback", _boom)
+    thread_id, run_id = uuid4(), uuid4()
+
+    resp = await client.post(
+        f"/v1/sessions/{thread_id}/feedback",
+        json={"rating": "down", "comment": "bad", "run_id": str(run_id)},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["rating"] == "down"
+
+    rows = await feedback_store.list_for_thread(thread_id=thread_id)
+    assert len(rows) == 1
+    assert rows[0].rating == "down" and rows[0].comment == "bad" and rows[0].run_id == run_id
+
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT, limit=100))
+    entries = [e for e in page.entries if e.action.value == "feedback:create"]
+    assert len(entries) == 1
+    assert entries[0].details["candidate"] == "failed"

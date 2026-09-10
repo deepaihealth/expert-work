@@ -300,6 +300,10 @@ async def test_list_candidates_and_filter_by_signal(ctx: _Ctx) -> None:
 
     all_resp = await ctx.client.get("/v1/curation/candidates")
     assert all_resp.json()["total"] == 2
+    # P-2 — 反馈快照三列进候选投影(审阅员不用翻 trajectory 就知道哪一轮被踩)。
+    assert {"feedback_run_id", "feedback_comment", "feedback_changed_at"} <= set(
+        all_resp.json()["items"][0]
+    )
     filtered = await ctx.client.get(
         "/v1/curation/candidates", params={"signal": "negative_feedback"}
     )

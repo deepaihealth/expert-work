@@ -109,11 +109,14 @@ const candidateRow = {
   trajectory_key: "obj/c1.json",
   outcome: "negative",
   signal: "negative_feedback",
-  feedback_rating: 2,
+  feedback_rating: "down",
   status: "pending",
   eval_dataset_id: null,
   detected_at: "2026-05-26T10:00:00Z",
   reviewed_at: null,
+  feedback_run_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  feedback_comment: "太慢",
+  feedback_changed_at: null,
 };
 
 const datasetRow = {
@@ -273,6 +276,64 @@ describe("CandidatesPanel", () => {
     await waitFor(() => expect(screen.getByTestId("curation-promote-btn")).toBeInTheDocument());
     await user.click(screen.getByTestId("curation-promote-btn"));
     await waitFor(() => expect(screen.getByTestId("curation-promote-name-input")).toBeInTheDocument());
+  });
+
+  it("promote posts a backend-valid source and the reviewer's expected for a negative candidate", async () => {
+    const posted: unknown[] = [];
+    installAdapter([
+      {
+        match: (u, m) => u.startsWith("/v1/curation/candidates") && m === "get" && !u.includes("/c1"),
+        respond: () => ({ items: [candidateRow], total: 1, cross_tenant: false }),
+      },
+      {
+        match: (u, m) => u === "/v1/curation/candidates/c1" && m === "get",
+        respond: () => ({ ...candidateRow, trajectory: null }),
+      },
+      {
+        match: (u, m) => u === "/v1/curation/candidates/c1/promote" && m === "post",
+        respond: () => datasetRow,
+      },
+    ]);
+    const realAdapter = apiClient.defaults.adapter;
+    apiClient.defaults.adapter = (config) => {
+      if (config.method === "post") posted.push(JSON.parse(String(config.data)));
+      return (realAdapter as (c: typeof config) => Promise<unknown>)(config) as never;
+    };
+    const user = userEvent.setup();
+    renderCuration();
+    await waitFor(() => expect(screen.getByText("research")).toBeInTheDocument());
+    await user.click(screen.getByText("research"));
+    await waitFor(() => expect(screen.getByTestId("curation-promote-btn")).toBeInTheDocument());
+    await user.click(screen.getByTestId("curation-promote-btn"));
+    await user.type(screen.getByTestId("curation-promote-name-input"), "neg-set");
+    await user.type(screen.getByTestId("curation-promote-expected-input"), '{{"answer": "corrected"}');
+    // 抽屉里的「Promote」按钮和弹窗 OK 按钮同文案,只点弹窗那颗。
+    // 抽屉里的「Promote」按钮和弹窗 OK 按钮同文案,只点弹窗那颗。
+    await user.click(
+      document.querySelector(".ant-modal-footer .ant-btn-primary") as HTMLElement,
+    );
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toEqual({ name: "neg-set", source: "regression", expected: { answer: "corrected" } });
+    expect(["golden", "trajectory", "regression"]).toContain((posted[0] as { source: string }).source);
+  });
+
+  it("signal filter only offers backend-known signals", async () => {
+    installAdapter([
+      { match: (u) => u.startsWith("/v1/curation/candidates"), respond: () => ({ items: [], total: 0, cross_tenant: false }) },
+    ]);
+    const user = userEvent.setup();
+    renderCuration();
+    await waitFor(() => expect(screen.getByTestId("curation-signal-filter")).toBeInTheDocument());
+    await user.click(screen.getByTestId("curation-signal-filter").querySelector(".ant-select-selector") as HTMLElement);
+    // rc-select 的 ``role="option"`` 是给读屏用的 a11y 影子列表(只渲染 activeIndex
+    // 附近两条、文本是 value 不是 label),真正的选项节点是 ``.ant-select-item-option``。
+    await waitFor(() =>
+      expect(document.querySelectorAll(".ant-select-item-option").length).toBeGreaterThan(0),
+    );
+    const labels = Array.from(document.querySelectorAll(".ant-select-item-option")).map(
+      (o) => o.textContent,
+    );
+    expect(labels).toEqual(["All signals", "negative_feedback", "failed_outcome", "positive_feedback", "implicit_success"]);
   });
 });
 

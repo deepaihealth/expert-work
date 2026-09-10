@@ -17,14 +17,15 @@ import { apiClient, withTenantScope, type TenantScope } from "./client";
 
 export type CandidateStatus = "pending" | "promoted" | "dismissed";
 
+/** 与后端 ``protocol/eval_dataset.py`` 的 ``CurationSignal`` 逐字一致(P-2 修漂移)。 */
 export type CurationSignal =
-  | "manual"
   | "negative_feedback"
-  | "tool_failure"
-  | "timeout"
-  | "policy_block";
+  | "failed_outcome"
+  | "positive_feedback"
+  | "implicit_success";
 
-export type EvalDatasetSource = "golden" | "promoted_candidate";
+/** 与后端 ``EvalDatasetSource`` 逐字一致;``golden`` / ``regression`` 必须带非空 ``expected``。 */
+export type EvalDatasetSource = "golden" | "trajectory" | "regression";
 
 export interface CurationCandidate {
   id: string;
@@ -36,11 +37,15 @@ export interface CurationCandidate {
   trajectory_key: string;
   outcome: string;
   signal: string;
-  feedback_rating: number | null;
+  feedback_rating: "up" | "down" | null;
   status: CandidateStatus;
   eval_dataset_id: string | null;
   detected_at: string;
   reviewed_at: string | null;
+  /** P-2 §5 — 反馈快照:哪一轮被踩 / 用户原话 / 是否后改成 👍。 */
+  feedback_run_id: string | null;
+  feedback_comment: string | null;
+  feedback_changed_at: string | null;
 }
 
 export interface CandidateTrajectory {

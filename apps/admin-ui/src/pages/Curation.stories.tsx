@@ -73,11 +73,14 @@ const candidate = {
   trajectory_key: "obj/c1.json",
   outcome: "Agent gave incorrect answer about Q3 revenue",
   signal: "negative_feedback",
-  feedback_rating: 2,
+  feedback_rating: "down",
   status: "pending",
   eval_dataset_id: null,
   detected_at: "2026-05-26T10:00:00Z",
   reviewed_at: null,
+  feedback_run_id: null,
+  feedback_comment: null,
+  feedback_changed_at: null,
 };
 
 const dataset = {

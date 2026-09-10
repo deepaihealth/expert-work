@@ -106,6 +106,11 @@ class CurationCandidateRecord(BaseModel):
     #: connection) bumps this instead of burning the candidate via
     #: ``evolved_at``; the worker gives up (marks evolved) at 3.
     retry_count: int = 0
+    #: P-2 — 被踩的那一轮 / 用户原话:审阅员打开候选直接看到,不用翻整条 trajectory。
+    feedback_run_id: UUID | None = None
+    feedback_comment: str | None = None
+    #: P-2 — 👎→👍 改票时间;None = 没改过(升级为 negative_feedback 时清空)。
+    feedback_changed_at: datetime | None = None
 
     @model_validator(mode="after")
     def _check_review_state(self) -> CurationCandidateRecord:

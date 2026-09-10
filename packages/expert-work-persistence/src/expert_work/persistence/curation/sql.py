@@ -214,6 +214,9 @@ def _candidate_row_to_dto(row: CurationCandidateRow) -> CurationCandidateRecord:
         reviewed_at=row.reviewed_at,
         evolved_at=row.evolved_at,
         retry_count=row.retry_count,
+        feedback_run_id=row.feedback_run_id,
+        feedback_comment=row.feedback_comment,
+        feedback_changed_at=row.feedback_changed_at,
     )
 
 
@@ -242,6 +245,9 @@ class SqlCurationCandidateStore(CurationCandidateStore):
                     eval_dataset_id=record.eval_dataset_id,
                     detected_at=record.detected_at,
                     reviewed_at=record.reviewed_at,
+                    feedback_run_id=record.feedback_run_id,
+                    feedback_comment=record.feedback_comment,
+                    feedback_changed_at=record.feedback_changed_at,
                 )
                 .on_conflict_do_nothing(constraint="curation_candidate_trajectory_uniq")
             )
@@ -376,10 +382,55 @@ class SqlCurationCandidateStore(CurationCandidateStore):
                     status=record.status.value,
                     eval_dataset_id=record.eval_dataset_id,
                     reviewed_at=record.reviewed_at,
+                    feedback_run_id=record.feedback_run_id,
+                    feedback_comment=record.feedback_comment,
+                    feedback_changed_at=record.feedback_changed_at,
                 )
             )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def upgrade_to_negative(
+        self,
+        *,
+        tenant_id: UUID,
+        trajectory_key: str,
+        feedback_run_id: UUID,
+        feedback_comment: str | None,
+    ) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                sa_update(CurationCandidateRow)
+                .where(
+                    CurationCandidateRow.tenant_id == tenant_id,
+                    CurationCandidateRow.trajectory_key == trajectory_key,
+                )
+                .values(
+                    signal="negative_feedback",
+                    feedback_rating="down",
+                    feedback_run_id=feedback_run_id,
+                    feedback_comment=feedback_comment,
+                    feedback_changed_at=None,
+                )
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def mark_feedback_changed(
+        self, *, tenant_id: UUID, feedback_run_id: UUID, at: datetime
+    ) -> int:
+        async with self._sf() as session:
+            result = await session.execute(
+                sa_update(CurationCandidateRow)
+                .where(
+                    CurationCandidateRow.tenant_id == tenant_id,
+                    CurationCandidateRow.feedback_run_id == feedback_run_id,
+                    CurationCandidateRow.feedback_changed_at.is_(None),
+                )
+                .values(feedback_changed_at=at)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)
 
     async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID) -> int:
         stmt = (

@@ -1619,6 +1619,9 @@ export interface TranslationKeys {
     promote_hint: string;
     promoted: string;
     dismissed: string;
+    promote_expected: string;
+    promote_expected_required: string;
+    promote_expected_invalid: string;
   };
   audit: {
     page_title: string;
@@ -4888,6 +4891,9 @@ const en: TranslationKeys = {
       "Trajectory input + expected output are copied from the candidate. Edit later via the Eval Datasets tab.",
     promoted: "Candidate promoted to eval dataset.",
     dismissed: "Candidate dismissed.",
+    promote_expected: "Expected output (JSON)",
+    promote_expected_required: "A negative candidate needs a corrected expected output",
+    promote_expected_invalid: "Expected output must be valid JSON",
   },
   audit: {
     page_title: "Audit",

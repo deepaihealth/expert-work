@@ -106,3 +106,65 @@ async def test_read_object_missing_required_field_returns_none() -> None:
     )
     reader = TrajectoryReader(object_store=store)
     assert await reader.read("trajectories/partial.jsonl") is None
+
+
+@pytest.mark.asyncio
+async def test_find_by_thread_returns_newest_by_finished_at_not_by_key_order() -> None:
+    """旧 ``success``、新 ``failed``:key 字典序里 ``success/…`` 排在 ``failed/…`` 后面
+    (outcome 段在日期段前面),按 key 取最大会拿到旧的 —— 必须按 ``finished_at``。"""
+    store = InMemoryObjectStore()
+    recorder = TrajectoryRecorder(object_store=store)
+    tenant, thread = uuid4(), uuid4()
+    old = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
+    new = datetime(2026, 9, 9, 8, 0, tzinfo=UTC)
+    await recorder.record(
+        TrajectoryRecord(
+            thread_id=thread,
+            tenant_id=tenant,
+            outcome="success",
+            messages=[HumanMessage(content="a")],
+            finished_at=old,
+        )
+    )
+    await recorder.record(
+        TrajectoryRecord(
+            thread_id=thread,
+            tenant_id=tenant,
+            outcome="failed",
+            messages=[HumanMessage(content="b")],
+            run_id=uuid4(),
+            finished_at=new,
+        )
+    )
+    reader = TrajectoryReader(object_store=store)
+    keys = sorted(
+        k for k in await reader.list_keys(tenant_id=tenant) if k.endswith(f"/{thread}.jsonl")
+    )
+    assert keys[-1].split("/")[2] == "success"  # 钉住前提:字典序最大的 key 是旧的那个
+    found = await reader.find_by_thread(tenant_id=tenant, thread_id=thread)
+    assert found is not None
+    assert found.outcome == "failed" and found.finished_at == new
+    assert await reader.find_by_thread(tenant_id=tenant, thread_id=uuid4()) is None
+    assert await reader.find_by_thread(tenant_id=uuid4(), thread_id=thread) is None
+
+
+@pytest.mark.asyncio
+async def test_find_by_thread_breaks_finished_at_ties_by_key() -> None:
+    store = InMemoryObjectStore()
+    recorder = TrajectoryRecorder(object_store=store)
+    tenant, thread = uuid4(), uuid4()
+    at = datetime(2026, 9, 9, 8, 0, tzinfo=UTC)
+    for outcome in ("failed", "success"):
+        await recorder.record(
+            TrajectoryRecord(
+                thread_id=thread,
+                tenant_id=tenant,
+                outcome=outcome,  # type: ignore[arg-type]
+                messages=[HumanMessage(content=outcome)],
+                finished_at=at,
+            )
+        )
+    found = await TrajectoryReader(object_store=store).find_by_thread(
+        tenant_id=tenant, thread_id=thread
+    )
+    assert found is not None and found.outcome == "success"  # 同 finished_at → key 大者(确定性)

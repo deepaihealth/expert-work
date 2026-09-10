@@ -37,6 +37,7 @@ import {
   type CurationCandidateDetail,
   type CurationCandidateList,
   type CurationSignal,
+  type EvalDatasetSource,
 } from "../../api/curation";
 import { ApiError } from "../../api/client";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
@@ -53,12 +54,16 @@ const STATUS_COLOR: Record<CandidateStatus, string> = {
 
 const STATUS_OPTIONS: CandidateStatus[] = ["pending", "promoted", "dismissed"];
 const SIGNAL_OPTIONS: CurationSignal[] = [
-  "manual",
   "negative_feedback",
-  "tool_failure",
-  "timeout",
-  "policy_block",
+  "failed_outcome",
+  "positive_feedback",
+  "implicit_success",
 ];
+
+/** P-2 — promote 的 source 按候选信号推导:负例 → regression(需人工写 expected),正例 → trajectory。 */
+export function promoteSourceOf(signal: string): EvalDatasetSource {
+  return signal === "negative_feedback" || signal === "failed_outcome" ? "regression" : "trajectory";
+}
 
 export function CandidatesPanel() {
   const { t } = useTranslation();
@@ -77,7 +82,7 @@ export function CandidatesPanel() {
 
   const [promoteOpen, setPromoteOpen] = useState(false);
   const [promoteSubmitting, setPromoteSubmitting] = useState(false);
-  const [promoteForm] = Form.useForm<{ name: string }>();
+  const [promoteForm] = Form.useForm<{ name: string; expected?: string }>();
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -134,11 +139,22 @@ export function CandidatesPanel() {
   const onPromote = useCallback(async () => {
     if (selected === null) return;
     const values = await promoteForm.validateFields();
+    const source = promoteSourceOf(selected.signal);
+    let expected: Record<string, unknown> | undefined;
+    if (values.expected && values.expected.trim()) {
+      try {
+        expected = JSON.parse(values.expected) as Record<string, unknown>;
+      } catch {
+        message.error(t("curation.promote_expected_invalid"));
+        return;
+      }
+    }
     setPromoteSubmitting(true);
     try {
       await promoteCandidate(selected.id, {
         name: values.name,
-        source: "promoted_candidate",
+        source,
+        ...(expected ? { expected } : {}),
       });
       message.success(t("curation.promoted"));
       setPromoteOpen(false);
@@ -345,6 +361,18 @@ export function CandidatesPanel() {
             rules={[{ required: true, message: t("curation.promote_name_required") }]}
           >
             <Input data-testid="curation-promote-name-input" maxLength={128} placeholder="e.g. golden_v2_negative_cases" />
+          </Form.Item>
+          <Form.Item
+            name="expected"
+            label={t("curation.promote_expected")}
+            rules={[
+              {
+                required: selected !== null && promoteSourceOf(selected.signal) === "regression",
+                message: t("curation.promote_expected_required"),
+              },
+            ]}
+          >
+            <Input.TextArea data-testid="curation-promote-expected-input" rows={4} placeholder='{"answer": "..."}' />
           </Form.Item>
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("curation.promote_hint")}
