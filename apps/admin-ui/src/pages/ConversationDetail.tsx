@@ -732,6 +732,7 @@ export function ConversationDetail() {
                     isSystemAdmin={isSystemAdmin}
                     readOnly
                     allowDecide={canOperate}
+                    allowRate={canOperate}
                     isTenantSwitched={false}
                     onDecide={handleDecide}
                     deciding={deciding}

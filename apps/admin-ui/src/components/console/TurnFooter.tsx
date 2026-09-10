@@ -35,6 +35,9 @@ export interface TurnFooterProps {
   /** ≈CNY for the turn (null when no usage or no rate). */
   costCny: number | null;
   readOnly: boolean;
+  /** PR4 — 打分单独放行:``readOnly`` 页(对话详情页)上 operator+ 仍可打分。
+   *  ``readOnly`` 保持原义(继续挡重跑 / 审批默认态),二者互不替代。 */
+  allowRate?: boolean;
   isTenantSwitched: boolean;
   /** Omitted → the retry button doesn't render (read-only conversation page). */
   onRetry?: (turn: Turn) => void;
@@ -65,6 +68,7 @@ export function TurnFooter({
   summary,
   costCny,
   readOnly,
+  allowRate = false,
   isTenantSwitched,
   onRetry,
   onExport,
@@ -163,7 +167,10 @@ export function TurnFooter({
         {/* 终审 F4 — interrupted turns keep the feedback bar: a run that
             broke off midway is exactly the turn worth a 👎. */}
         {/* P-2 — 打分按 run 走,没有 run id 就没有打分对象,整条不渲染。 */}
-        {!readOnly &&
+        {/* PR4 — ``allowRate`` 是只读页上单独放行打分的口子(对话详情页
+            operator+),照 ``TurnBlock.allowDecide`` 的形状;``readOnly``
+            本身不变,继续挡住重跑与审批默认态。 */}
+        {(!readOnly || allowRate) &&
           (status === "done" || status === "interrupted") &&
           threadId &&
           turn.runId !== null && (
