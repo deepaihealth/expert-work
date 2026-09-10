@@ -1,20 +1,27 @@
 """External run control for third-party apps — ``/v1/agents/{agent_code}/runs/...``.
 
-Only run-level cancel lives here. Session-level cancel (``POST
-/v1/sessions/{id}:cancel``) is an irreversible close — it flips the thread to
-CANCELLED so every later run is refused — and stays a console-only operation.
-An end user's "stop" button wants this endpoint: it aborts the current
-execution and leaves the conversation usable.
+Run-level cancel plus P-1's ``:regenerate`` / ``:edit`` live here. Session-level
+cancel (``POST /v1/sessions/{id}:cancel``) is an irreversible close — it flips
+the thread to CANCELLED so every later run is refused — and stays a console-only
+operation. An end user's "stop" button wants the cancel endpoint here: it aborts
+the current execution and leaves the conversation usable.
+
+``:regenerate`` / ``:edit``(P-1)—— 对会话的**最后一轮**重来一次:旧轮原地标
+「已被取代」(读面仍可见、agent 的上下文里看不见、计划回退到轮前),新一轮照常
+跑。两条路由共用 :func:`_supersede_and_run`,只差输入从哪来:``:regenerate``
+用旧轮的原件重放,``:edit`` 用调用方给的新 ``input``。旧轮不删、副作用不撤销、
+两轮都计费(spec §6)。
 """
 
 from __future__ import annotations
 
-from typing import Annotated
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
@@ -23,15 +30,37 @@ from control_plane.api._external import (
     load_owned_run,
     load_owned_session,
     lookup_external_user_id,
+    reject_nul,
+    reject_nul_deep,
     reject_nul_path_params,
 )
+from control_plane.api._idempotency import (
+    IDEMPOTENCY_HEADER,
+    MAX_IDEMPOTENCY_KEY_LEN,
+    request_digest,
+)
+from control_plane.api._quota_admission import check_admission
+from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
 from control_plane.api._user_scope import get_user_repo
+from control_plane.api.agents import (
+    ExternalFileRef,
+    _envelope_error,
+    _idempotent_run_response,
+    external_run_bounds_error,
+    resolve_external_files,
+)
+from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, SupersedeRequest, spawn_run
 from control_plane.run_cancel import cancel_run_two_level
+from control_plane.supersede import SupersedeError
+from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.protocol import Principal
-from expert_work.runtime.runs import InterruptReason, RunStatus, RunStore
+from expert_work.protocol import AgentSpecStatus, Principal
+from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunStatus, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
+from expert_work.runtime.runs.store import RunIdempotencyConflict
+from orchestrator import AgentFactoryError
+from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
 
 
 class ExternalCancelRequest(BaseModel):
@@ -46,12 +75,280 @@ class ExternalCancelRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=255)
 
 
+class ExternalRegenerateRequest(BaseModel):
+    """Body for ``POST /v1/agents/{agent_code}/runs/{run_id}:regenerate`` —— 同一输入
+    再跑一次。
+
+    ``input`` / ``files`` / ``inputs`` **一个都不接受**(``extra="forbid"``):这个端点
+    的输入就是被取代那一轮的原件,含它当时的附件引用;要改输入用 ``:edit``。塞一个
+    ``input`` 进来会是 422,而不是悄悄被忽略。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=255)
+    mode: Literal["stream", "queue"] = "stream"
+    stream_format: Literal[STREAM_FORMAT_LEGACY, STREAM_FORMAT_ITEMS] = STREAM_FORMAT_LEGACY
+
+
+class ExternalEditRequest(BaseModel):
+    """Body for ``…:edit`` —— 改输入后再跑一次。
+
+    每个字段的语义与 ``POST …/runs``(``agents.ExternalRunRequest``)的同名字段完全
+    一致,只有 ``input`` 从选填变必填 —— 「编辑重发」没有新输入就没有意义,漏传是
+    422,不是回退成 ``:regenerate``。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=255)
+    input: str = Field(min_length=1, max_length=MAX_RUN_INPUT_CHARS)
+    mode: Literal["stream", "queue"] = "stream"
+    stream_format: Literal[STREAM_FORMAT_LEGACY, STREAM_FORMAT_ITEMS] = STREAM_FORMAT_LEGACY
+    untrusted_content: list[str] = Field(default_factory=list, max_length=16)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    files: list[ExternalFileRef] = Field(default_factory=list, max_length=64)
+
+    # NUL 加固与 ``ExternalRunRequest`` 同一条路:这三个字段原样进
+    # ``agent_run.enqueued_input``(jsonb),一个 NUL 就是裸 asyncpg
+    # ``CharacterNotInRepertoireError`` → 500。``user_id`` 在
+    # ``external_subject_id`` 里已经守过一次,不重复。
+    @field_validator("input")
+    @classmethod
+    def _no_nul_input(cls, value: str) -> str:
+        return reject_nul(value, field="input")
+
+    @field_validator("untrusted_content")
+    @classmethod
+    def _no_nul_untrusted_content(cls, value: list[str]) -> list[str]:
+        return reject_nul_deep(value, field="untrusted_content")  # type: ignore[no-any-return]
+
+    @field_validator("inputs")
+    @classmethod
+    def _no_nul_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return reject_nul_deep(value, field="inputs")  # type: ignore[no-any-return]
+
+
 def _get_thread_repo(request: Request) -> ThreadMetaStore:
     return request.app.state.thread_meta_repo  # type: ignore[no-any-return]
 
 
 def _get_run_store(request: Request) -> RunStore:
     return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+async def _supersede_and_run(
+    *,
+    op: Literal["regenerate", "edit"],
+    agent_code: str,
+    run_id: UUID,
+    payload: ExternalRegenerateRequest | ExternalEditRequest,
+    request: Request,
+    runs: RunStore,
+    threads: ThreadMetaStore,
+    users: TenantUserStore,
+    idempotency_key: str | None,
+) -> StreamingResponse | JSONResponse:
+    """``:regenerate`` / ``:edit`` 共用的主体。
+
+    顺序照 ``agents.run_agent_for_user``:幂等命中在任何副作用之前返回 → 归属校验
+    (404 不泄露存在性)→ agent 停用 / 有没有 active 版本 → 配额 → 构建 →
+    (``:edit`` 才有的附件分流与上限预检)→ ``spawn_run(supersede=…)``。
+
+    取代本身在 ``spawn_run`` 的 per-thread 锁里由 ``supersede_run`` 完成,它抛的
+    :class:`SupersedeError`(``THREAD_BUSY`` / ``RUN_NOT_LAST`` / ``RUN_AWAITING_APPROVAL``
+    / ``RUN_ALREADY_SUPERSEDED`` / ``RUN_INPUT_UNAVAILABLE``)在这里渲染成对外信封,
+    code 与 HTTP 码原样搬过去。
+
+    ``on_disconnect=CONTINUE`` 与 ``POST …/runs`` 一致:断线在对外场景是意外而不是
+    「我不要了」,而这一轮的旧轮已经标成被取代,取消会把一次网络抖动放大成整段
+    会话没有活着的最后一轮。
+    """
+    state = request.app.state
+    tenant_id: UUID = request.state.tenant_id
+    actor_id: str = request.state.actor_id
+    trace_id = current_trace_id_hex()
+    runtime = state.agent_runtime
+    mode = payload.mode
+    stream_format = payload.stream_format
+
+    key: str | None = None
+    digest: str | None = None
+    if idempotency_key is not None:
+        key = idempotency_key.strip()
+        if not key or len(key) > MAX_IDEMPOTENCY_KEY_LEN:
+            return _envelope_error(
+                "INVALID_IDEMPOTENCY_KEY",
+                f"Idempotency-Key must be 1-{MAX_IDEMPOTENCY_KEY_LEN} non-blank characters",
+                422,
+            )
+        try:
+            reject_nul(key, field="Idempotency-Key")
+        except ValueError as exc:
+            return _envelope_error("INVALID_IDEMPOTENCY_KEY", str(exc), 422)
+        # 指纹里折进 ``run_id`` 与操作名:同一个 key 对同一 agent 的不同目标轮、
+        # 或对同一轮的不同操作,都是**不同的请求**,必须是 IDEMPOTENCY_KEY_REUSED
+        # 而不是幂等命中 —— 与 ``request_digest`` 自己折进 agent_code 同理。分隔符
+        # 用 NUL,它永远不可能出现在 agent_code / uuid / 操作名里面。
+        digest = request_digest(payload, agent_code=f"{agent_code}\x00{run_id}\x00{op}")
+        existing = await runs.find_by_idempotency_key(tenant_id=tenant_id, key=key)
+        if existing is not None:
+            if existing.request_digest != digest:
+                return _envelope_error(
+                    "IDEMPOTENCY_KEY_REUSED",
+                    "this Idempotency-Key was already used with a different request",
+                    422,
+                )
+            return await _idempotent_run_response(
+                existing,
+                mode=mode,
+                event_store=getattr(state, "run_event_store", None),
+                stream_bridge=runtime.stream_bridge,
+                run_store=runs,
+                tenant_id=tenant_id,
+                stream_format=stream_format,
+            )
+
+    try:
+        target, meta = await load_owned_run(
+            tenant_id=tenant_id,
+            agent_code=agent_code,
+            user_id=payload.user_id,
+            run_id=run_id,
+            runs=runs,
+            threads=threads,
+            users=users,
+        )
+    except ExternalScopeError as exc:
+        return external_error(exc)
+    end_user_id = meta.user_id
+    if end_user_id is None:
+        # J.14 之前建的 thread 没有 owner 列。``load_owned_run`` 拿它做过归属校验,
+        # 但 run 要绑一个 end-user 才能跑(长期记忆 / 工作区 / 计费都键在它上面),
+        # 所以这里只能拒 —— 且用同一个 404,不透露「这一段会话是老数据」。
+        return _envelope_error("RUN_NOT_FOUND", "run not found", 404)
+
+    if await state.agent_disable_service.is_disabled(tenant_id, agent_code):
+        return _envelope_error("AGENT_DISABLED", f"agent {agent_code!r} is disabled", 403)
+    active = await state.agent_spec_repo.list_by_tenant(
+        tenant_id=tenant_id, status=AgentSpecStatus.ACTIVE, name=agent_code, limit=1
+    )
+    if not active:
+        return _envelope_error(
+            "AGENT_NOT_FOUND", f"no active agent {agent_code!r} for this tenant", 404
+        )
+    record = active[0]
+
+    denial = await check_admission(
+        quota=state.quota_service,
+        audit=state.audit_logger,
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        agent=agent_code,
+        resource_kind="run",
+    )
+    if denial is not None:
+        return denial
+    try:
+        built = await runtime.get_agent(
+            tenant_id=tenant_id,
+            name=agent_code,
+            version=record.version,
+            spec=record.spec,
+            user_id=str(end_user_id),
+        )
+    except AgentFactoryError as exc:
+        return _envelope_error("AGENT_BUILD_FAILED", f"agent cannot be built: {exc}", 422)
+
+    if isinstance(payload, ExternalEditRequest):
+        try:
+            image_refs, document_names = await resolve_external_files(
+                files=payload.files,
+                tenant_id=tenant_id,
+                end_user_id=end_user_id,
+                thread_id=meta.thread_id,
+                uploads_store=state.user_upload_store,
+            )
+        except ExternalScopeError as exc:
+            return external_error(exc)
+        except HTTPException as exc:
+            detail: Mapping[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
+            return _envelope_error(
+                detail.get("code", "INVALID_FILE_REF"),
+                detail.get("message", "invalid file reference"),
+                exc.status_code,
+            )
+        bounds = external_run_bounds_error(
+            untrusted_content=payload.untrusted_content, inputs=payload.inputs
+        )
+        if bounds is not None:
+            return bounds
+        run_payload = RunRequest(
+            input=payload.input,
+            mode=mode,
+            image_refs=image_refs,
+            untrusted_content=payload.untrusted_content,
+            inputs=payload.inputs,
+            document_names=document_names,
+        )
+    else:
+        # ``:regenerate`` —— 图输入由 ``spawn_run`` 从 ``supersede_run`` 交回的
+        # ``replay_messages`` 拼(``replay_graph_input``),这里的 ``RunRequest``
+        # 只承载 ``mode``。
+        run_payload = RunRequest(input=None, mode=mode)
+
+    try:
+        return await spawn_run(
+            runtime=runtime,
+            audit=state.audit_logger,
+            approvals=state.approval_store,
+            request=request,
+            settings=state.settings,
+            built=built,
+            record_spec=record.spec,
+            thread_id=meta.thread_id,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            effective_user_id=end_user_id,
+            oauth_subject=str(end_user_id),
+            payload=run_payload,
+            trace_id=trace_id,
+            extra_headers={"X-Expert-Work-Session-Id": str(meta.thread_id)},
+            on_behalf_of=str(end_user_id),
+            idempotency_key=key,
+            request_digest=digest,
+            envelope=True,
+            hide_events=EXTERNAL_HIDDEN_EVENTS,
+            stream_format=stream_format,
+            on_disconnect=DisconnectMode.CONTINUE,
+            supersede=SupersedeRequest(target_run_id=target.run_id, replay=(op == "regenerate")),
+        )
+    except SupersedeError as exc:
+        return _envelope_error(exc.code, exc.message, exc.status_code)
+    except RunIdempotencyConflict:
+        # 并发同 key 的败者:赢者那一条已经 INSERT 成功,把它的响应交回去。数字摘要
+        # 不一致说明这个 key 被拿去发了另一个请求,那是 422 而不是重放(与
+        # ``run_agent_for_user`` 里同一处的安全修复同形)。
+        if key is None:  # pragma: no cover - spawn_run 只在带 key 时抛这个
+            raise
+        winner = await runs.find_by_idempotency_key(tenant_id=tenant_id, key=key)
+        if winner is None:  # pragma: no cover - 冲突触发的那一刻赢者行必然存在
+            raise
+        if winner.request_digest != digest:
+            return _envelope_error(
+                "IDEMPOTENCY_KEY_REUSED",
+                "this Idempotency-Key was already used with a different request",
+                422,
+            )
+        return await _idempotent_run_response(
+            winner,
+            mode=mode,
+            event_store=getattr(state, "run_event_store", None),
+            stream_bridge=runtime.stream_bridge,
+            run_store=runs,
+            tenant_id=tenant_id,
+            stream_format=stream_format,
+        )
 
 
 def build_external_runs_router() -> APIRouter:
@@ -231,6 +528,58 @@ def build_external_runs_router() -> APIRouter:
                 "data": {"run_id": str(run.run_id), "stopped": bool(stopped)},
                 "error": None,
             }
+        )
+
+    @router.post("/{agent_code}/runs/{run_id}:regenerate", response_model=None)
+    async def regenerate_run(
+        agent_code: str,
+        run_id: UUID,
+        payload: ExternalRegenerateRequest,
+        request: Request,
+        principal: Annotated[Principal, Depends(require("session", "write"))],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        runs: Annotated[RunStore, Depends(_get_run_store)],
+        idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
+    ) -> StreamingResponse | JSONResponse:
+        """P-1 —— 同一输入再跑一次(旧轮标「已被取代」,agent 后续看不见它)。"""
+        del principal
+        return await _supersede_and_run(
+            op="regenerate",
+            agent_code=agent_code,
+            run_id=run_id,
+            payload=payload,
+            request=request,
+            runs=runs,
+            threads=threads,
+            users=users,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.post("/{agent_code}/runs/{run_id}:edit", response_model=None)
+    async def edit_run(
+        agent_code: str,
+        run_id: UUID,
+        payload: ExternalEditRequest,
+        request: Request,
+        principal: Annotated[Principal, Depends(require("session", "write"))],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        runs: Annotated[RunStore, Depends(_get_run_store)],
+        idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
+    ) -> StreamingResponse | JSONResponse:
+        """P-1 —— 改输入后再跑一次(旧轮标「已被取代」)。"""
+        del principal
+        return await _supersede_and_run(
+            op="edit",
+            agent_code=agent_code,
+            run_id=run_id,
+            payload=payload,
+            request=request,
+            runs=runs,
+            threads=threads,
+            users=users,
+            idempotency_key=idempotency_key,
         )
 
     return router
