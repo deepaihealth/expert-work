@@ -170,6 +170,42 @@ class InMemoryCurationCandidateStore(CurationCandidateStore):
         self._rows[record.id] = record
         return True
 
+    async def upgrade_to_negative(
+        self,
+        *,
+        tenant_id: UUID,
+        trajectory_key: str,
+        feedback_run_id: UUID,
+        feedback_comment: str | None,
+    ) -> bool:
+        for cid, r in list(self._rows.items()):
+            if r.tenant_id == tenant_id and r.trajectory_key == trajectory_key:
+                self._rows[cid] = r.model_copy(
+                    update={
+                        "signal": "negative_feedback",
+                        "feedback_rating": "down",
+                        "feedback_run_id": feedback_run_id,
+                        "feedback_comment": feedback_comment,
+                        "feedback_changed_at": None,
+                    }
+                )
+                return True
+        return False
+
+    async def mark_feedback_changed(
+        self, *, tenant_id: UUID, feedback_run_id: UUID, at: datetime
+    ) -> int:
+        changed = 0
+        for cid, r in list(self._rows.items()):
+            if (
+                r.tenant_id == tenant_id
+                and r.feedback_run_id == feedback_run_id
+                and r.feedback_changed_at is None
+            ):
+                self._rows[cid] = r.model_copy(update={"feedback_changed_at": at})
+                changed += 1
+        return changed
+
     async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID) -> int:
         reverted = 0
         for cid, r in list(self._rows.items()):

@@ -78,6 +78,16 @@ def _candidate_dict(record: CurationCandidateRecord) -> dict[str, Any]:
         ),
         "detected_at": record.detected_at.isoformat(),
         "reviewed_at": record.reviewed_at.isoformat() if record.reviewed_at is not None else None,
+        # P-2 §5 — 反馈快照:哪一轮被踩 / 用户原话 / 是否后改成 👍。
+        "feedback_run_id": (
+            str(record.feedback_run_id) if record.feedback_run_id is not None else None
+        ),
+        "feedback_comment": record.feedback_comment,
+        "feedback_changed_at": (
+            record.feedback_changed_at.isoformat()
+            if record.feedback_changed_at is not None
+            else None
+        ),
     }
 
 

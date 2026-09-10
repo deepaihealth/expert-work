@@ -179,6 +179,40 @@ class CurationCandidateStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def upgrade_to_negative(
+        self,
+        *,
+        tenant_id: UUID,
+        trajectory_key: str,
+        feedback_run_id: UUID,
+        feedback_comment: str | None,
+    ) -> bool:
+        """P-2 §5 — an existing candidate becomes ``negative_feedback`` once a 👎
+        lands on its thread.
+
+        Matched by ``(tenant_id, trajectory_key)`` — the same key the
+        insert-once ``upsert`` uses, so the synchronous 👎 path and the
+        curation worker can race freely. Writes
+        ``signal='negative_feedback', feedback_rating='down',
+        feedback_run_id, feedback_comment`` and CLEARS
+        ``feedback_changed_at`` (a fresh 👎 undoes an earlier 👎→👍 change
+        marker). ``status`` — the human review verdict — is left alone.
+        Returns whether a row was matched; never inserts.
+        """
+
+    @abc.abstractmethod
+    async def mark_feedback_changed(
+        self, *, tenant_id: UUID, feedback_run_id: UUID, at: datetime
+    ) -> int:
+        """P-2 §5 — stamp ``feedback_changed_at`` when the rater flips 👎 → 👍.
+
+        The candidate is KEPT (never downgraded); the review list just shows
+        "later changed to 👍". Predicate ``tenant_id`` + ``feedback_run_id``
+        + ``feedback_changed_at IS NULL``, so re-flipping is idempotent (a
+        second call returns 0). Returns the count stamped.
+        """
+
+    @abc.abstractmethod
     async def revert_promoted_for_dataset(self, *, dataset_id: UUID, tenant_id: UUID) -> int:
         """Deletion hygiene PR3 — revert PROMOTED candidates pointing at a
         deleted ``eval_dataset`` row back to PENDING.

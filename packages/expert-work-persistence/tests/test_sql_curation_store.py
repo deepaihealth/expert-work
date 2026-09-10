@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -395,3 +396,101 @@ async def test_implicit_success_signal_round_trips_sql(
     )
     rec = await candidates.get(candidate_id=cid, tenant_id=tenant)
     assert rec is not None and rec.signal == "implicit_success"
+
+
+@pytest.mark.asyncio
+async def test_candidate_upgrade_to_negative_rewrites_signal_and_feedback_columns(
+    curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
+) -> None:
+    _, store = curation_stores
+    tenant, key, run = uuid4(), "trajectories/t/x.jsonl", uuid4()
+    await store.upsert(_candidate(tenant_id=tenant, trajectory_key=key, signal="failed_outcome"))
+
+    hit = await store.upgrade_to_negative(
+        tenant_id=tenant, trajectory_key=key, feedback_run_id=run, feedback_comment="太慢"
+    )
+    assert hit is True
+    row = await store.get_by_trajectory_key(tenant_id=tenant, trajectory_key=key)
+    assert row is not None
+    assert row.signal == "negative_feedback" and row.feedback_rating == "down"
+    assert row.feedback_run_id == run and row.feedback_comment == "太慢"
+    assert row.feedback_changed_at is None
+    assert row.status is CandidateStatus.PENDING
+
+    # 别的租户 / 不存在的 key → 不命中,不建行。
+    assert (
+        await store.upgrade_to_negative(
+            tenant_id=uuid4(), trajectory_key=key, feedback_run_id=run, feedback_comment=None
+        )
+        is False
+    )
+    assert len(await store.list_for_review(tenant_id=tenant)) == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_mark_feedback_changed_is_keyed_by_run_and_idempotent(
+    curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
+) -> None:
+    _, store = curation_stores
+    tenant, key, run = uuid4(), "trajectories/t/y.jsonl", uuid4()
+    await store.upsert(
+        _candidate(
+            tenant_id=tenant,
+            trajectory_key=key,
+            signal="negative_feedback",
+            feedback_rating="down",
+        )
+    )
+    await store.upgrade_to_negative(
+        tenant_id=tenant, trajectory_key=key, feedback_run_id=run, feedback_comment=None
+    )
+    at = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+    assert await store.mark_feedback_changed(tenant_id=tenant, feedback_run_id=run, at=at) == 1
+    assert await store.mark_feedback_changed(tenant_id=tenant, feedback_run_id=run, at=at) == 0
+    assert await store.mark_feedback_changed(tenant_id=tenant, feedback_run_id=uuid4(), at=at) == 0
+    row = await store.get_by_trajectory_key(tenant_id=tenant, trajectory_key=key)
+    assert row is not None and row.feedback_changed_at == at
+    # 👍→👎 再来一次:升级清掉改票标记。
+    await store.upgrade_to_negative(
+        tenant_id=tenant, trajectory_key=key, feedback_run_id=run, feedback_comment="again"
+    )
+    row = await store.get_by_trajectory_key(tenant_id=tenant, trajectory_key=key)
+    assert row is not None and row.feedback_changed_at is None and row.feedback_comment == "again"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_upsert_and_upgrade_stay_single_row(
+    curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
+) -> None:
+    """P-2 §7-3 — ``curation_worker`` runs on EVERY replica (no leader election,
+    no advisory lock) and P-2 adds a synchronous upsert on the request path.
+    The only thing keeping that from double-inserting is the
+    ``curation_candidate_trajectory_uniq`` unique index + ``on_conflict_do_nothing``;
+    the upgrade UPDATE is idempotent by construction. Both invariants are pinned
+    here so a later "just INSERT" / "read-then-write" refactor fails loudly.
+    """
+    _, store = curation_stores
+    tenant, key = uuid4(), "trajectories/t/race.jsonl"
+
+    results = await asyncio.gather(
+        store.upsert(_candidate(tenant_id=tenant, trajectory_key=key, signal="failed_outcome")),
+        store.upsert(_candidate(tenant_id=tenant, trajectory_key=key, signal="failed_outcome")),
+    )
+    assert sum(results) == 1
+    assert len(await store.list_for_review(tenant_id=tenant)) == 1
+
+    run_a, run_b = uuid4(), uuid4()
+    upgrades = await asyncio.gather(
+        store.upgrade_to_negative(
+            tenant_id=tenant, trajectory_key=key, feedback_run_id=run_a, feedback_comment="a"
+        ),
+        store.upgrade_to_negative(
+            tenant_id=tenant, trajectory_key=key, feedback_run_id=run_b, feedback_comment="b"
+        ),
+    )
+    assert upgrades == [True, True]
+    rows = await store.list_for_review(tenant_id=tenant)
+    assert len(rows) == 1
+    assert rows[0].signal == "negative_feedback"
+    assert rows[0].feedback_comment in ("a", "b")
+    assert rows[0].feedback_run_id in (run_a, run_b)
