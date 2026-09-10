@@ -1706,6 +1706,9 @@ const zhCN: TranslationKeys = {
       "轨迹的输入 + 期望输出会从候选自动复制。后续可在「评测数据集」标签页修改。",
     promoted: "候选已提升为评测数据集。",
     dismissed: "候选已忽略。",
+    promote_expected: "期望输出（JSON）",
+    promote_expected_required: "负例候选必须填写修正后的期望输出",
+    promote_expected_invalid: "期望输出必须是合法 JSON",
   },
   audit: {
     page_title: "审计",
