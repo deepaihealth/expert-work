@@ -106,7 +106,6 @@ async def _run_save_basic() -> tuple[bool, str]:
         tenant_id=_TENANT,
         user_id=_USER,
         name="report.md",
-        kind="document",
         path_in_workspace="report.md",
         created_in_thread="t-1",
     )
@@ -124,7 +123,6 @@ async def _run_save_version_increment() -> tuple[bool, str]:
         tenant_id=_TENANT,
         user_id=_USER,
         name="x",
-        kind="code",
         path_in_workspace="x.py",
         created_in_thread="t",
     )
@@ -197,7 +195,6 @@ async def _run_resave_undeletes() -> tuple[bool, str]:
         tenant_id=_TENANT,
         user_id=_USER,
         name="r.md",
-        kind="document",
         path_in_workspace="v2.md",
         created_in_thread="t",
     )
@@ -248,10 +245,8 @@ async def _run_list_versions_unknown_returns_none() -> tuple[bool, str]:
     return True, ""
 
 
-def _check_mime(
-    path: str, *, kind: str, expected_ct_prefix: str, expected_disp: str
-) -> tuple[bool, str]:
-    inferred = infer_content_type(kind=kind, path=path)  # type: ignore[arg-type]
+def _check_mime(path: str, *, expected_ct_prefix: str, expected_disp: str) -> tuple[bool, str]:
+    inferred = infer_content_type(path=path)
     if not inferred.content_type.startswith(expected_ct_prefix):
         return False, (
             f"{path}: expected content_type startswith {expected_ct_prefix!r}, "
@@ -267,7 +262,6 @@ def _check_mime(
 async def _run_mime_md_inline_text() -> tuple[bool, str]:
     return _check_mime(
         "report.md",
-        kind="document",
         expected_ct_prefix="text/plain",
         expected_disp="inline",
     )
@@ -276,7 +270,6 @@ async def _run_mime_md_inline_text() -> tuple[bool, str]:
 async def _run_mime_html_forces_attachment() -> tuple[bool, str]:
     return _check_mime(
         "page.html",
-        kind="document",
         expected_ct_prefix="text/html",
         expected_disp="attachment",
     )
@@ -285,7 +278,6 @@ async def _run_mime_html_forces_attachment() -> tuple[bool, str]:
 async def _run_mime_svg_forces_attachment() -> tuple[bool, str]:
     return _check_mime(
         "logo.svg",
-        kind="data",
         expected_ct_prefix="image/svg+xml",
         expected_disp="attachment",
     )
@@ -294,7 +286,6 @@ async def _run_mime_svg_forces_attachment() -> tuple[bool, str]:
 async def _run_mime_png_inline_image() -> tuple[bool, str]:
     return _check_mime(
         "photo.png",
-        kind="data",
         expected_ct_prefix="image/png",
         expected_disp="inline",
     )
@@ -303,7 +294,6 @@ async def _run_mime_png_inline_image() -> tuple[bool, str]:
 async def _run_mime_unknown_octet_attachment() -> tuple[bool, str]:
     return _check_mime(
         "dump.bin",
-        kind="data",
         expected_ct_prefix="application/octet-stream",
         expected_disp="attachment",
     )

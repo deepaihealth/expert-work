@@ -261,7 +261,7 @@ def build_artifacts_router() -> APIRouter:
         # always sent ``attachment`` regardless of how the kind / path
         # are spelled; unknown extensions fall through to
         # ``application/octet-stream`` + attachment.
-        inferred = infer_content_type(kind=artifact.kind, path=version.path_in_workspace)
+        inferred = infer_content_type(path=version.path_in_workspace)
         headers = {
             "Content-Disposition": content_disposition_header(
                 artifact.name, disposition=inferred.disposition
