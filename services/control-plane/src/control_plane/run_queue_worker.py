@@ -29,10 +29,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from langchain_core.messages import messages_from_dict
 from langchain_core.runnables import RunnableConfig
 
 from control_plane.agent_disable_status import AgentDisableService
-from control_plane.api.runs import build_run_graph_input
+from control_plane.api.runs import build_run_graph_input, replay_graph_input
 from control_plane.run_trace import bind_exec_spec, bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
@@ -311,21 +312,29 @@ class RunQueueWorker:
             )
 
             payload = run.enqueued_input or {}
-            document_names = list(payload.get("document_names") or [])
-            image_refs = list(payload.get("image_refs") or [])
-            graph_input = build_run_graph_input(
-                built,
-                input_text=payload.get("input"),
-                image_refs=image_refs,
-                untrusted_content=payload.get("untrusted_content"),
-                inputs=payload.get("inputs") or {},
-                run_id=run.run_id,
-                # 修复轮 1(原顾虑 2)—— P2 块 1(Task 11)加了 document_names,
-                # 但漏了这一处回读:enqueued_input 里存了它,重放时却没读
-                # 回来,queue 模式下的文档附件会静默消失。image_refs / inputs
-                # 都在这儿回读,document_names 补齐同一模式。
-                document_names=document_names,
-            )
+            replay = payload.get("replay_messages")
+            if replay:
+                # P-1 ``:regenerate`` queue 模式:spawn_run 把旧轮的 [System, Human]
+                # 原件序列化进来;这里反序列化后走同一个 replay_graph_input。
+                graph_input = replay_graph_input(
+                    built, messages_from_dict(replay), run_id=run.run_id
+                )
+            else:
+                document_names = list(payload.get("document_names") or [])
+                image_refs = list(payload.get("image_refs") or [])
+                graph_input = build_run_graph_input(
+                    built,
+                    input_text=payload.get("input"),
+                    image_refs=image_refs,
+                    untrusted_content=payload.get("untrusted_content"),
+                    inputs=payload.get("inputs") or {},
+                    run_id=run.run_id,
+                    # 修复轮 1(原顾虑 2)—— P2 块 1(Task 11)加了 document_names,
+                    # 但漏了这一处回读:enqueued_input 里存了它,重放时却没读
+                    # 回来,queue 模式下的文档附件会静默消失。image_refs / inputs
+                    # 都在这儿回读,document_names 补齐同一模式。
+                    document_names=document_names,
+                )
 
             # Adopt the durable run into THIS instance's registry (no new
             # agent_run row — claim_queued already flipped it to running).

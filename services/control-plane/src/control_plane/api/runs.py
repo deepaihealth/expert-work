@@ -26,6 +26,8 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Literal
@@ -33,7 +35,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, message_to_dict
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -66,6 +68,7 @@ from control_plane.run_cancel import cancel_run_two_level
 from control_plane.run_trace import bind_exec_spec
 from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
+from control_plane.supersede import supersede_run, supersede_thread_lock
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -75,6 +78,7 @@ from control_plane.tenant_scope import (
 )
 from control_plane.tenant_status import TenantStatusService
 from control_plane.transcript import read_turns
+from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY
 from expert_work.common.message_stamp import stamp_message
 from expert_work.common.observability import (
     current_trace_id_hex,
@@ -501,6 +505,50 @@ def build_run_graph_input(
         # 保留检查点里的旧值,上一轮的附件会漏进这一轮的子代。
         "turn_documents": list(document_names or []),
         "turn_image_refs": list(image_refs),
+    }
+
+
+@dataclass(frozen=True)
+class SupersedeRequest:
+    """P-1 —— 让 ``spawn_run`` 先把 ``target_run_id`` 这一轮标成被本次新 run 取代。
+
+    ``replay=True``(``:regenerate``)= 新一轮的输入就是旧轮的 System + Human
+    两条原件;``False``(``:edit``)= 调用方给了新 ``payload.input``。
+    """
+
+    target_run_id: UUID
+    replay: bool
+
+
+def replay_graph_input(
+    built: Any, replay: Sequence[BaseMessage], *, run_id: UUID
+) -> dict[str, Any]:
+    """``:regenerate`` 的图输入:旧轮的 [System, Human] 原件换**新 id**、Human 重新盖戳。
+
+    id 必须换:``add_messages`` 同 id 是原地替换(supersede 正是靠这一点),不换
+    id 这两条会顶掉旧轮的位置而不是追加成新轮。``expert_work_created_at`` /
+    ``expert_work_run_id`` 由 ``stamp_message`` 覆盖为本轮;被取代标记(调用方
+    传进来的若是打标后的副本)一并剥掉。
+
+    **故意不写** ``turn_documents`` / ``turn_image_refs``:``build_run_graph_input``
+    每轮都写这两个键是为了不让上一轮附件漏进这一轮;重新生成要的恰恰是「同一批
+    附件」,而检查点里此刻的值就是被取代轮自己写的那一份 —— 省略键 = 沿用。
+    """
+    now = datetime.now(UTC)
+    fresh: list[BaseMessage] = []
+    for msg in replay:
+        kwargs = {
+            k: v
+            for k, v in msg.additional_kwargs.items()
+            if k not in (SUPERSEDED_BY, SUPERSEDED_AT)
+        }
+        fresh.append(msg.model_copy(update={"id": str(uuid4()), "additional_kwargs": kwargs}))
+    system, human = fresh
+    return {
+        "messages": [system, stamp_message(human, run_id=str(run_id), now=now)],
+        "step_count": 0,
+        "max_steps": built.max_steps,
+        "max_no_progress": built.max_no_progress,
     }
 
 
@@ -974,6 +1022,7 @@ async def spawn_run(
     hide_events: frozenset[str] = frozenset(),
     stream_format: str = STREAM_FORMAT_LEGACY,
     on_disconnect: DisconnectMode = DisconnectMode.CANCEL,
+    supersede: SupersedeRequest | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Register + spawn one run, returning the SSE stream (or 202 for queue mode).
 
@@ -1032,7 +1081,13 @@ async def spawn_run(
 
     queue 模式不走这里 —— ``RunManager.enqueue`` 自己写死 ``CONTINUE``。
     两个平面各自的断言见 ``test_runs_api.py`` 与 ``test_external_idempotency.py``
-    里那对 ``*_when_the_connection_drops`` 测试。"""
+    里那对 ``*_when_the_connection_drops`` 测试。
+
+    ``supersede``(P-1 ``:regenerate`` / ``:edit``)—— 非空时,本次新 run 先把
+    目标那一轮标成「已被本 run 取代」,再照常建行。取代与建行同处一把
+    per-thread 锁内(理由见下面那段注释);``SupersedeError``(THREAD_BUSY /
+    RUN_NOT_LAST / …)原样抛给调用方渲染成对外信封。``None``(默认)时这里
+    连锁都不取,原路径一字节不变。"""
     # Stream J.6 — enforce image-ref invariants before any side effects.
     _validate_image_refs(
         payload.image_refs,
@@ -1070,6 +1125,14 @@ async def spawn_run(
                 if built.prompt_jinja
                 else {}
             ),
+            **(
+                {
+                    "supersedes_run_id": str(supersede.target_run_id),
+                    "replay": supersede.replay,
+                }
+                if supersede is not None
+                else {}
+            ),
         },
         on_behalf_of=on_behalf_of,
     )
@@ -1077,46 +1140,82 @@ async def spawn_run(
     run_id = uuid4()
     prior_runs = await runtime.run_manager.list_by_thread(thread_id, tenant_id=tenant_id)
 
-    # Stream 9.5 — queue mode: persist as ``queued`` + return 202.
-    if payload.mode == "queue":
-        await runtime.run_manager.enqueue(
-            run_id=run_id,
-            thread_id=thread_id,
-            tenant_id=tenant_id,
-            user_id=effective_user_id,
-            enqueued_input={
+    # P-1 —— supersede 与建行必须在同一把 per-thread 锁里(spec §8-4):queue worker
+    # 只认已存在的 QUEUED 行,行在 supersede 全部写完之后才 INSERT,worker 抢不到
+    # 「标记未落、run 已跑」的窗口;两副本并发 supersede 同一轮,后进的锁内看到
+    # 已链接的后继 → 409。没有 supersede 时 nullcontext,原路径一字节不变。
+    state = request.app.state
+    lock = (
+        supersede_thread_lock(state.session_factory, thread_id)
+        if supersede is not None
+        else nullcontext()
+    )
+    async with lock:
+        replay_messages: tuple[BaseMessage, BaseMessage] | None = None
+        regenerated_from: UUID | None = None
+        if supersede is not None:
+            result = await supersede_run(
+                graph=built.graph,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                target_run_id=supersede.target_run_id,
+                new_run_id=run_id,
+                runs=runtime.run_manager.store,
+                approvals=approvals,
+                thread_messages=state.thread_message_store,
+                threads=state.thread_meta_repo,
+                require_replay=supersede.replay,
+            )
+            replay_messages = result.replay_messages
+            regenerated_from = supersede.target_run_id
+
+        # Stream 9.5 — queue mode: persist as ``queued`` + return 202.
+        if payload.mode == "queue":
+            enqueued_input: dict[str, Any] = {
                 "input": payload.input,
                 "image_refs": payload.image_refs,
                 "untrusted_content": payload.untrusted_content,
                 "inputs": payload.inputs,
                 "document_names": payload.document_names,
-            },
+            }
+            if replay_messages is not None:
+                # ``:regenerate`` —— 旧轮原件序列化过 JSONB 列,worker 那边
+                # ``messages_from_dict`` 还原后走同一个 ``replay_graph_input``。
+                enqueued_input = {"replay_messages": [message_to_dict(m) for m in replay_messages]}
+            await runtime.run_manager.enqueue(
+                run_id=run_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                user_id=effective_user_id,
+                enqueued_input=enqueued_input,
+                is_resume=bool(prior_runs),
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                regenerated_from_run_id=regenerated_from,
+            )
+            logger.info("control_plane.run.enqueued run_id=%s", run_id)
+            content: dict[str, Any] = {
+                "run_id": str(run_id),
+                "thread_id": str(thread_id),
+                "status": "queued",
+            }
+            if envelope:
+                content = {"success": True, "data": content, "error": None}
+            return JSONResponse(status_code=202, content=content)
+
+        run_record = await runtime.run_manager.create(
+            run_id=run_id,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            user_id=effective_user_id,
+            on_disconnect=on_disconnect,
             is_resume=bool(prior_runs),
             trace_id=trace_id,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            regenerated_from_run_id=regenerated_from,
         )
-        logger.info("control_plane.run.enqueued run_id=%s", run_id)
-        content: dict[str, Any] = {
-            "run_id": str(run_id),
-            "thread_id": str(thread_id),
-            "status": "queued",
-        }
-        if envelope:
-            content = {"success": True, "data": content, "error": None}
-        return JSONResponse(status_code=202, content=content)
-
-    run_record = await runtime.run_manager.create(
-        run_id=run_id,
-        thread_id=thread_id,
-        tenant_id=tenant_id,
-        user_id=effective_user_id,
-        on_disconnect=on_disconnect,
-        is_resume=bool(prior_runs),
-        trace_id=trace_id,
-        idempotency_key=idempotency_key,
-        request_digest=request_digest,
-    )
     # 只有 stream 分支记:上面的 queue 分支入队就返回,``built`` 直接丢掉,
     # 真正的构建晚一步发生在 RunQueueWorker 里(那边自己记)。
     await bind_exec_spec(
@@ -1127,15 +1226,18 @@ async def spawn_run(
         source="spawn_run",
     )
     run_record.bound_distilled_skills = built.bound_distilled_skills
-    graph_input = build_run_graph_input(
-        built,
-        input_text=payload.input,
-        image_refs=payload.image_refs,
-        untrusted_content=payload.untrusted_content,
-        inputs=payload.inputs,
-        run_id=run_id,
-        document_names=payload.document_names,
-    )
+    if replay_messages is not None:
+        graph_input = replay_graph_input(built, replay_messages, run_id=run_id)
+    else:
+        graph_input = build_run_graph_input(
+            built,
+            input_text=payload.input,
+            image_refs=payload.image_refs,
+            untrusted_content=payload.untrusted_content,
+            inputs=payload.inputs,
+            run_id=run_id,
+            document_names=payload.document_names,
+        )
     configurable: dict[str, Any] = {
         "thread_id": str(thread_id),
         "tenant_id": str(tenant_id),
