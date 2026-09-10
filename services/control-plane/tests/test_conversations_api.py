@@ -24,6 +24,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.feedback_store import FeedbackRecord
 from expert_work.persistence.token_usage_store import TokenUsageRecord
 from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
 from tests.auth_fixtures import (
@@ -387,6 +388,93 @@ async def test_list_filters_by_has_pending(
     )
     assert both.json()["data"]["items"] == []
     assert both.json()["data"]["total"] == 0
+
+
+async def _rate(
+    client: AsyncClient,
+    thread_id: UUID,
+    rating: str,
+    *,
+    tenant_id: UUID = _TENANT,
+    actor_id: str = "ext-b",
+) -> None:
+    store = client.app_state.feedback_store  # type: ignore[attr-defined]
+    await store.upsert(
+        FeedbackRecord(
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            run_id=uuid4(),
+            rating=rating,
+            source="external",
+            actor_id=actor_id,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_has_down_rated(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """P-2 — has_down_rated 只剩有 ≥1 条 👎 的会话;👍 不算。"""
+    client, ids = client_and_threads
+    await _rate(client, ids["other_user"], "down")
+    await _rate(client, ids["convo"], "up", actor_id="emp")
+    resp = await client.get("/v1/conversations", params={"has_down_rated": "true"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert {i["thread_id"] for i in data["items"]} == {str(ids["other_user"])}
+    assert data["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_has_down_rated_composes_with_has_error(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """交集,不是并集:other_user 有 👎 没失败 run,convo 有失败 run 没 👎 → 空。"""
+    client, ids = client_and_threads
+    await _rate(client, ids["other_user"], "down")
+    resp = await client.get(
+        "/v1/conversations", params={"has_down_rated": "true", "has_error": "true"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["items"] == []
+
+    # 阳性对照:同一把筛子单独用各自有货,所以上面的空不是「筛子根本没生效」。
+    only_down = await client.get("/v1/conversations", params={"has_down_rated": "true"})
+    assert {i["thread_id"] for i in only_down.json()["data"]["items"]} == {str(ids["other_user"])}
+    only_err = await client.get("/v1/conversations", params={"has_error": "true"})
+    assert {i["thread_id"] for i in only_err.json()["data"]["items"]} == {str(ids["convo"])}
+
+
+@pytest.mark.asyncio
+async def test_has_down_rated_ignores_another_tenants_thumbs_down(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """跨租户:别的租户在**同一个 thread id** 上打的 👎 不能把本租户的会话拉进筛选结果。
+
+    列表本身是租户内的,所以 thread id 不撞车时这条筛子看不出问题;撞车才逼出
+    ``down_rated_thread_ids`` 自己那道租户谓词。运行期以 BYPASSRLS 角色连库,
+    RLS 兜底是空的 —— 这道谓词就是唯一的过滤。
+    """
+    client, ids = client_and_threads
+    await _rate(client, ids["convo"], "down", tenant_id=uuid4(), actor_id="ext-foreign")
+    resp = await client.get("/v1/conversations", params={"has_down_rated": "true"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_has_down_rated_off_by_default_returns_every_conversation(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """不勾就不筛:一条 👎 都没有时,列表照旧给全部三条(不会被空集清零)。"""
+    client, ids = client_and_threads
+    resp = await client.get("/v1/conversations")
+    assert resp.status_code == 200, resp.text
+    assert {i["thread_id"] for i in resp.json()["data"]["items"]} == {str(v) for v in ids.values()}
+    # 勾上而库里一条 👎 都没有 → 空,而不是「筛子被忽略、原样返回三条」。
+    none_down = await client.get("/v1/conversations", params={"has_down_rated": "true"})
+    assert none_down.json()["data"]["items"] == []
 
 
 @pytest.mark.asyncio
