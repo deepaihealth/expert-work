@@ -345,8 +345,14 @@ async def test_get_feedback_does_not_leak_another_threads_rows(
 async def test_get_feedback_is_readable_by_a_viewer_including_comments(
     feedback_store: InMemoryFeedbackStore, audit_store: InMemoryAuditLogStore
 ) -> None:
-    """用户拍板:评论原文全员可见 —— viewer 也读得到 ``comment``,与会话原文的
-    operator+ 门槛**有意不一致**。"""
+    """用户拍板:评论原文全员可见,与会话原文的门槛**有意不一致**。
+
+    这条用例同时钉住两条轴 —— ``viewer-1`` 既**不是 admin**、也**不是这条会话的
+    owner**(``_seed_thread`` 给的 ``user_id`` 是另一个 uuid):
+    * 角色轴:``session:read`` 就够,不要求 ``write``;
+    * 归属轴:没有 ``caller_owns_thread``(``GET /v1/sessions/{tid}`` 与
+      ``.../messages`` 都挂着它,这条运营审阅面刻意不挂)。
+    """
     settings = Settings(
         env="dev",
         auth_mode="dev",

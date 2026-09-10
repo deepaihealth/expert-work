@@ -191,8 +191,17 @@ def build_feedback_router() -> APIRouter:
         """这段会话的**全部**反馈(含评论原文)。
 
         评论原文对全员可见(``session:read``,viewer 也读得到),与会话原文的
-        operator+ 门槛**有意不一致** —— 2026-09-09 用户拍板:评论是用户对 Agent
-        的评价,不是会话内容。
+        门槛**有意不一致** —— 2026-09-09 用户拍板:评论是用户对 Agent 的评价,
+        不是会话内容。**两条轴都刻意放开,别照着姊妹端点"修正"回去**:
+
+        * 角色轴:``session:read`` 而不是 ``session:write`` —— viewer 也能读到
+          ``comment`` 原文。这一条由 ``test_feedback_api.py`` 的 viewer 用例钉住。
+        * 归属轴:**没有** ``caller_owns_thread``。``GET /v1/sessions/{tid}``
+          与 ``.../messages``(``api/runs.py``)都挂着它(= admin 或 thread 的
+          owner),那两条交出的是会话内容;这一条是运营审阅面,和
+          ``GET /v1/conversations`` / ``api/curation.py`` 的候选列表同族 ——
+          2026-08-14 裁决:会话是运营对象(QA 审阅、评测策展),读对每个员工开放。
+          加 owner 过滤会让这条端点对审阅员恒空,等于废掉这个功能。
 
         与对外 ``/items`` / ``/messages`` 的「只回显本人」也**刻意不同**:那边是
         终端用户看自己的分,这边是员工审阅整段会话上所有人打的分。
