@@ -17,7 +17,8 @@ is agent-level, not per-instance (Mini-ADR J-43).
 The worker is best-effort: a malformed trajectory / missing thread is
 skipped, never fatal. ``curation_candidate`` is unique per
 ``(tenant, trajectory_key)`` so re-scanning a trajectory is a cheap
-no-op — a pre-check skips even the ObjectStore read.
+no-op unless a 👎 has since landed on the thread (P-2: the pre-check then
+upgrades the signal in place, still without an ObjectStore read).
 
 Wiring: started from the FastAPI ``lifespan``, stopped from its
 ``finally`` — the same shape as :class:`TriggerScheduler`.
@@ -215,7 +216,7 @@ class CurationWorker:
                 tenant_id=tenant_id, trajectory_key=key
             )
         if existing is not None:
-            return False
+            return await self._maybe_upgrade(existing)
         stored = await self._reader.read(key)
         if stored is None:
             return False
@@ -227,6 +228,28 @@ class CurationWorker:
         if inserted:
             _candidates_detected.inc()
         return inserted
+
+    async def _maybe_upgrade(self, existing: CurationCandidateRecord) -> bool:
+        """P-2 §5 — a candidate flagged on an earlier sweep for a weaker signal
+        becomes ``negative_feedback`` once a 👎 lands on its thread. Only the
+        signal / feedback columns change; ``status`` (the human verdict) is
+        left alone. Already-negative candidates are the cheap no-op the
+        pre-check used to be."""
+        if existing.signal == "negative_feedback":
+            return False
+        with _tenant_scope(existing.tenant_id):
+            feedback = await self._feedback.list_for_thread(thread_id=existing.thread_id)
+        newest_down = next((f for f in feedback if f.rating == "down"), None)
+        if newest_down is None or newest_down.run_id is None:
+            return False
+        with _tenant_scope(existing.tenant_id):
+            upgraded = await self._candidates.upgrade_to_negative(
+                tenant_id=existing.tenant_id,
+                trajectory_key=existing.trajectory_key,
+                feedback_run_id=newest_down.run_id,
+                feedback_comment=newest_down.comment,
+            )
+        return upgraded
 
     async def _evaluate(self, stored: StoredTrajectory) -> CurationCandidateRecord | None:
         """Join a trajectory with thread / feedback, apply the candidate rule."""
@@ -240,6 +263,8 @@ class CurationWorker:
             feedback = await self._feedback.list_for_thread(thread_id=stored.thread_id)
         has_down = any(f.rating == "down" for f in feedback)
         has_up = any(f.rating == "up" for f in feedback)
+        # ``list_for_thread`` is ``id`` DESC — the first 👎 is the newest one.
+        newest_down = next((f for f in feedback if f.rating == "down"), None)
         signal, rating = _classify(stored.outcome, has_down=has_down, has_up=has_up)
         # SE-16 (SE-A38) — implicit positive: an unlabeled success whose
         # thread settled quietly. Design originally proposed a 5-minute
@@ -264,6 +289,8 @@ class CurationWorker:
             signal=signal,
             feedback_rating=rating,
             detected_at=datetime.now(UTC),
+            feedback_run_id=newest_down.run_id if newest_down is not None else None,
+            feedback_comment=newest_down.comment if newest_down is not None else None,
         )
 
     async def _settled_quietly(self, stored: StoredTrajectory) -> bool:
