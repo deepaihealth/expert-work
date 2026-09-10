@@ -155,3 +155,8 @@ async def test_up_never_creates_and_marks_change_only_after_a_down() -> None:
     assert await fx.sync(tenant, thread, run, rating="down", previous="up") == "upgraded"
     rows = await fx.candidates.list_for_review(tenant_id=tenant)
     assert rows[0].feedback_changed_at is None
+    # 另一个人自己从没打过 👎,他的 👍 不该把别人的 👎 标成「后改为 👍」——
+    # 改票标记按 run 命中候选行,守卫只能是「上一票是 👎」这一条。
+    assert await fx.sync(tenant, thread, run, rating="up", previous=None) == "noop"
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert rows[0].feedback_changed_at is None
