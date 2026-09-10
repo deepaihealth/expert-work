@@ -89,6 +89,7 @@ from expert_work.common.observability import (
 )
 from expert_work.common.output_screen import REFUSAL_TEXT, screen_output
 from expert_work.common.spotlight import spotlight_untrusted
+from expert_work.common.supersede import filter_superseded_turns
 from expert_work.common.uplift_metrics import record_memory_inject_mode
 from expert_work.protocol import (
     AuditAction,
@@ -643,6 +644,10 @@ def build_react_graph(
             trigger_origin=bool((config.get("configurable") or {}).get("trigger_origin", False)),
         )
         messages = list(state["messages"])
+        # P-1 —— 被取代的轮整段剔除,放在一切上下文闸(pruner / working_window /
+        # compressor)之前:它们不占窗口预算、不进摘要。只改 prompt 视图,检查点
+        # 不动(CM-C4 同一契约);读面照常看到这些消息。
+        messages = filter_superseded_turns(messages)
         # Stream CM-12 — mechanical tool-result prune: the cheapest, least-lossy
         # gate, run FIRST. When over threshold it collapses OLD tool results
         # (beyond the most-recent N) to 1-line references — lossless for
