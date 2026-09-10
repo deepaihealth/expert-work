@@ -488,7 +488,7 @@ async def test_concurrent_upsert_and_upgrade_stay_single_row(
             tenant_id=tenant, trajectory_key=key, feedback_run_id=run_b, feedback_comment="b"
         ),
     )
-    assert upgrades == [True, True]
+    assert list(upgrades) == [True, True]
     rows = await store.list_for_review(tenant_id=tenant)
     assert len(rows) == 1
     assert rows[0].signal == "negative_feedback"
