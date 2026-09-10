@@ -361,7 +361,12 @@ async def locate_turn(
     last = await graph.aget_state(_at(config, bounds.newest_id))
     end = len(last.values.get("messages") or [])
     if not (0 <= start <= end <= current_len):
-        raise SupersedeError("RUN_NOT_LAST", "run boundary is outside the current history", 422)
+        # 边界算出来了,却和当前历史对不上。与上面那一支同一个失败类 —— 拒绝理由
+        # 是「这一轮的区间不可用」,与「目标是不是最后一轮」无关,所以用同一个
+        # ``RUN_BOUNDARY_UNRESOLVED``,不借 ``RUN_NOT_LAST``(理由见上面那段)。
+        raise SupersedeError(
+            "RUN_BOUNDARY_UNRESOLVED", "run boundary is outside the current history", 422
+        )
     return TurnLocation(start=start, end=end, plan_before=plan_before, chain_run_ids=tuple(run_ids))
 
 

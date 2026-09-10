@@ -38,7 +38,7 @@
 | [`RUN_ALREADY_SUPERSEDED`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 目标那一轮已经被重新生成过。改对最新的那一轮操作 |
 | [`RUN_NOT_LAST`](#_8-10-422-请求参数不合法) | 422 | 重新生成 / 编辑重发 | 目标不是这段会话的最后一轮。这两个接口只对最后一轮有效 |
 | [`RUN_INPUT_UNAVAILABLE`](#_8-10-422-请求参数不合法) | 422 | 重新生成 | 目标那一轮在开始执行前就失败了，没有可以复用的输入。改用编辑重发并给出 `input` |
-| [`RUN_BOUNDARY_UNRESOLVED`](#_8-10-422-请求参数不合法) | 422 | 重新生成 / 编辑重发 | 服务端保存的这一轮的历史记录不完整，认不出它从哪里开始。换一段新会话继续，或联系我们排查 |
+| [`RUN_BOUNDARY_UNRESOLVED`](#_8-10-422-请求参数不合法) | 422 | 重新生成 / 编辑重发 | 服务端保存的这一轮的历史记录不完整，认不出它的起止范围。换一段新会话继续，或联系我们排查 |
 | [`APPROVAL_NOT_FOUND`](./run-control#_4-2-审批决策) | 404 | 审批决策 | 这个 run 没有待审批记录。确认该 run 处于等待审批的状态 |
 | [`ARTIFACT_NOT_FOUND`](./query#_5-7-产物) | 404 | 产物下载 / 产物删除 | 产物不存在、已删除，或不属于这个 `user_id`。核对 `user_id` 与产物 `name` |
 | [`APPROVAL_CONFLICT`](./run-control#_4-2-审批决策) | 409 | 审批决策 | 这条审批已经被决定过。不要重复决策；需要取回上次结果时，带上当时用的 `idempotency_key` |
@@ -310,10 +310,14 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 
 处理方式：原样重试无效。改用编辑重发，并在请求体里给出 `input`。
 
-这一轮的历史记录不完整：重新生成与编辑重发都可能返回 `RUN_BOUNDARY_UNRESOLVED`，标准格式。服务端要先认出这一轮从哪里开始、到哪里结束，才能把它标成「已被取代」；这段会话保存下来的历史记录不完整时（例如中间的审批记录已被清理），这个范围认不出来，两个接口都不会继续：
+这一轮的历史记录不完整：重新生成与编辑重发都可能返回 `RUN_BOUNDARY_UNRESOLVED`，标准格式。服务端要先认出这一轮从哪里开始、到哪里结束，才能把它标成「已被取代」；这段会话保存下来的历史记录不完整时，这个范围认不出来，两个接口都不会继续。两种情况都是这个错误码，靠 `message` 区分，处理方式相同：
 
-```json [响应 422]
+```json [响应 422：认不出这一轮的起点，例如中间的审批记录已被清理]
 { "success": false, "data": null, "error": { "code": "RUN_BOUNDARY_UNRESOLVED", "message": "run boundary could not be established from checkpoint history" } }
+```
+
+```json [响应 422：认出来的范围与这段会话现有的历史对不上]
+{ "success": false, "data": null, "error": { "code": "RUN_BOUNDARY_UNRESOLVED", "message": "run boundary is outside the current history" } }
 ```
 
 处理方式：原样重试无效，换一个 `run_id` 也无效——这与目标是哪一轮无关，所以它和 `RUN_NOT_LAST` 是两个不同的错误码，不要把它当成后者去查 run 列表重试。这段会话不能再用这两个接口改写，正常发起对话仍然可用；需要一段干净的历史就新开一段会话，或者带上 `session_id` 与 `run_id` 联系我们排查。

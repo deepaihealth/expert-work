@@ -54,8 +54,9 @@
   - 权限 `external_only()` + `require("session","write")`;`load_owned_run` 404 不泄露存在性。
   - body:`{ user_id, mode: "stream"|"queue", stream_format?, input? (仅 :edit 必填), files?: [{upload_id}] }`;支持 `Idempotency-Key`(重发不产生第二条 run);`on_disconnect=CONTINUE` 与普通 run 一致。
   - 响应与 `POST …/runs` 完全一致(stream 模式直接是 SSE;queue 模式 202 + run_id)。
-  - 错误:`RUN_NOT_LAST`(422,目标不是最后一轮)/ `THREAD_BUSY`(409,有 run 在跑)/ `RUN_AWAITING_APPROVAL`(409,目标轮等审批)/ `RUN_ALREADY_SUPERSEDED`(409)/ `RUN_INPUT_UNAVAILABLE`(422,仅 `:regenerate`,目标轮没留下可重放的输入 —— 计划新增,PR3 落地)/ `RUN_BOUNDARY_UNRESOLVED`(422,这一轮的下标区间划不出来:链首 checkpoint 不是 `source="input"`,历史损坏或审批链没串全 —— **2026-09-10 拍板新增**,PR3 落地)。进 `docs-site/guide/errors.md`。
-  - `RUN_BOUNDARY_UNRESOLVED` 为什么不能并进 `RUN_NOT_LAST`:那一支里目标**就是**最后一轮,而 `RUN_NOT_LAST` 给对接方的处置是「去 run 列表取最新的 `run_id` 再试」,照做会拿回同一个 id、同一个 422,反复查列表反复重试也绕不出去;真实原因与「哪一轮」无关,处置是换一段新会话或联系排查。
+  - 错误:`RUN_NOT_LAST`(422,目标不是最后一轮)/ `THREAD_BUSY`(409,有 run 在跑)/ `RUN_AWAITING_APPROVAL`(409,目标轮等审批)/ `RUN_ALREADY_SUPERSEDED`(409)/ `RUN_INPUT_UNAVAILABLE`(422,仅 `:regenerate`,目标轮没留下可重放的输入 —— 计划新增,PR3 落地)/ `RUN_BOUNDARY_UNRESOLVED`(422,这一轮的下标区间不可用 —— **2026-09-10 拍板新增**,PR3 落地)。进 `docs-site/guide/errors.md`。
+  - `RUN_BOUNDARY_UNRESOLVED` 覆盖 `locate_turn` 的**两支**,同一个失败类、同一种处置,共用一个码:① 链首 checkpoint 不是 `source="input"`(历史损坏,或审批链没串全 —— 审批单被清掉、PAUSED 前驱串不回去),message `run boundary could not be established from checkpoint history`;② 区间算出来了但 `not (0 <= start <= end <= current_len)`(与当前历史对不上),message `run boundary is outside the current history`。
+  - 为什么不能并进 `RUN_NOT_LAST`:这两支里目标**就是**最后一轮,而 `RUN_NOT_LAST` 给对接方的处置是「去 run 列表取最新的 `run_id` 再试」,照做会拿回同一个 id、同一个 422,反复查列表反复重试也绕不出去;真实原因与「哪一轮」无关,处置是换一段新会话或联系排查。`RUN_NOT_LAST` 从此**只**用于 `supersede_run` 里 `rows[-1].run_id != target_run_id` 那一处真正的「不是最后一轮」。
 - 读面:`/messages` 每条、`/items` 每个条目与 `runs[]` 加 `superseded_by: run_id | null`;`runs[]` 加 `regenerated_from: run_id | null`;墓碑条目 `tombstone: true` 且无 content。**字段始终出现,缺省 `null` / `false`**(与 P-2 的 `feedback: null` 同一约定;对接方已确认无 strict 解析 —— 09-09 计划评审改口,原写「缺省不出现」)。
 - SSE **无新帧**;新一轮的帧序与普通 run 相同。
 - 三张手工路由表登记(`test_external_only_gate.py:66` / `test_console_lockdown.py:251` / `test_external_path_param_nul_guard.py:502`)。
