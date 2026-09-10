@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -28,13 +29,22 @@ from control_plane.api._external import (
 )
 from control_plane.api._user_scope import get_user_repo
 from control_plane.audit import emit
+from control_plane.feedback_candidates import (
+    CandidateSyncDeps,
+    CandidateSyncResult,
+    sync_candidate_for_feedback,
+)
 from expert_work.common.observability import current_trace_id_hex
+from expert_work.persistence.curation import CurationCandidateStore
 from expert_work.persistence.feedback_store import FeedbackRecord, FeedbackStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
+from orchestrator.trajectory import TrajectoryReader
+
+logger = logging.getLogger("expert_work.control_plane.api.external_feedback")
 
 
 class ExternalFeedbackRequest(BaseModel):
@@ -75,6 +85,21 @@ def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
 
 
+def _get_candidate_sync_deps(request: Request) -> CandidateSyncDeps:
+    """👎 同步进池要的三样:thread_meta(agent 身份)、候选表、trajectory 读面。
+
+    没有 ObjectStore(注入 runtime 的装配)时 ``reader=None`` —— 同步进池整条
+    退化成 ``deferred``,300s 的 curation worker 兜底。
+    """
+    object_store = getattr(request.app.state, "object_store", None)
+    candidates: CurationCandidateStore = request.app.state.curation_candidate_store
+    return CandidateSyncDeps(
+        threads=request.app.state.thread_meta_repo,
+        candidates=candidates,
+        reader=TrajectoryReader(object_store=object_store) if object_store is not None else None,
+    )
+
+
 def build_external_feedback_router() -> APIRouter:
     """Mount the external per-run feedback endpoint."""
     router = APIRouter(
@@ -98,6 +123,7 @@ def build_external_feedback_router() -> APIRouter:
         runs: Annotated[RunStore, Depends(_get_run_store)],
         store: Annotated[FeedbackStore, Depends(_get_feedback_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        sync_deps: Annotated[CandidateSyncDeps, Depends(_get_candidate_sync_deps)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         try:
@@ -115,6 +141,17 @@ def build_external_feedback_router() -> APIRouter:
 
         trace_id = current_trace_id_hex()
         actor_id = str(meta.user_id)
+        # 覆盖前的旧票 —— 👎→👍 的改票标记只认「上一票是 👎」。
+        previous = next(
+            (
+                r.rating
+                for r in await store.list_for_thread_scoped(
+                    tenant_id=tenant_id, thread_id=run.thread_id
+                )
+                if r.run_id == run.run_id and r.actor_id == actor_id
+            ),
+            None,
+        )
         stored, updated = await store.upsert(
             FeedbackRecord(
                 tenant_id=tenant_id,
@@ -128,6 +165,21 @@ def build_external_feedback_router() -> APIRouter:
                 actor_id=actor_id,
             )
         )
+        candidate: CandidateSyncResult = "noop"
+        try:
+            candidate = await sync_candidate_for_feedback(
+                deps=sync_deps,
+                tenant_id=tenant_id,
+                thread_id=run.thread_id,
+                run_id=run.run_id,
+                rating=payload.rating,
+                previous_rating=previous,
+                comment=payload.comment,
+            )
+        except Exception:
+            # 进池是反馈的副产品:它失败不能让用户那一票丢掉;worker 300s 后兜底。
+            logger.warning("feedback.candidate_sync_failed", exc_info=True)
+
         # 审计只记动作,永不记评论原文(评论住在 feedback 表里,控制台全员可见是
         # 另一回事;审计流不该复制一份用户散文)。
         await emit(
@@ -144,6 +196,7 @@ def build_external_feedback_router() -> APIRouter:
                 "rating": payload.rating,
                 "updated": updated,
                 "source": "external",
+                "candidate": candidate,
             },
             on_behalf_of=actor_id,
         )

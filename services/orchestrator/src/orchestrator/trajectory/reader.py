@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, get_args
 from uuid import UUID
 
@@ -83,6 +83,32 @@ class TrajectoryReader:
             scan = f"{scan}/{outcome}"
         return await self.object_store.list_prefix(f"{scan}/")
 
+    async def find_by_thread(self, *, tenant_id: UUID, thread_id: UUID) -> StoredTrajectory | None:
+        """The newest stored trajectory for ``thread_id`` under ``tenant_id``, or ``None``.
+
+        P-2 — the synchronous 👎 → candidate path needs "is this thread's
+        trajectory on disk yet" without waiting for the curation worker's
+        300 s sweep. Keys are ``{prefix}/{tenant}/{outcome}/{YYYY}/{MM}/{DD}/
+        {thread}.jsonl`` — the OUTCOME segment comes BEFORE the date, so key
+        order is NOT time order (``…/success/2026/09/01/…`` sorts after
+        ``…/failed/2026/09/09/…``). A thread matches at most one key per
+        ``(outcome, day)`` partition, i.e. a handful, so every match is read
+        and the one with the greatest ``finished_at`` wins; ties (same
+        instant, or no ``finished_at`` on a legacy envelope) fall back to the
+        greater key so the choice is deterministic. Same list-prefix call the
+        worker already issues per sweep, scoped to one tenant.
+        """
+        suffix = f"/{thread_id}.jsonl"
+        keys = [k for k in await self.list_keys(tenant_id=tenant_id) if k.endswith(suffix)]
+        newest: StoredTrajectory | None = None
+        for key in keys:
+            stored = await self.read(key)
+            if stored is None:
+                continue
+            if newest is None or _recency(stored) > _recency(newest):
+                newest = stored
+        return newest
+
     async def read(self, key: str) -> StoredTrajectory | None:
         """Read + parse one trajectory object.
 
@@ -126,6 +152,15 @@ def _parse(key: str, raw: bytes) -> StoredTrajectory | None:
     except (ValueError, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning("trajectory_reader.malformed key=%s err=%s", key, exc)
         return None
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _recency(stored: StoredTrajectory) -> tuple[datetime, str]:
+    """Sort key for :meth:`TrajectoryReader.find_by_thread` — ``finished_at``
+    first (legacy envelopes without one sort oldest), key string second."""
+    return (stored.finished_at or _EPOCH, stored.key)
 
 
 def _opt_uuid(value: object) -> UUID | None:
