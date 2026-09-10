@@ -318,7 +318,7 @@ async def test_fire_now_forbidden_for_non_owner(triggers_client: AsyncClient) ->
     created = await _create_cron(triggers_client, name="owned-by-admin")
     trigger_id = created["id"]
 
-    other = _client_as(triggers_client, subject="user-b", roles=("viewer",))
+    other = _client_as(triggers_client, subject="user-b", roles=("operator",))
     async with other:
         resp = await other.post(f"/v1/triggers/{trigger_id}:fire")
     assert resp.status_code == 403
@@ -637,3 +637,76 @@ async def test_fire_now_failure_reports_actual_status_when_claim_reconcile_loses
         )
     )
     assert page.entries == []  # CAS lost on this call — no audit from it
+
+
+# --- B-49 — role gate on :fire --------------------------------------------
+#
+# Found by the B-49 live scan: ``:fire`` carried only ``console_only()`` plus
+# the ownership gate, so a ``viewer`` could really start a run. Ruling:
+# operator+ via ``session:write`` (same gate as ``POST
+# /v1/agents/{code}/runs`` — it is the same act). Ownership gate untouched.
+# ``viewer`` proves the 403 — asserted on ``code == "FORBIDDEN"``, not
+# ``USER_SCOPE_FORBIDDEN``, so the test cannot pass on the ownership gate
+# alone; ``operator`` proves the gate isn't over-tightened.
+
+
+@pytest.mark.asyncio
+async def test_fire_now_403_for_viewer(triggers_client: AsyncClient) -> None:
+    created = await _create_cron(triggers_client, name="b49-viewer-fire")
+    trigger_id = created["id"]
+
+    viewer = _client_as(triggers_client, subject="user-viewer", roles=("viewer",))
+    async with viewer:
+        resp = await viewer.post(f"/v1/triggers/{trigger_id}:fire")
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"] == {
+        "code": "FORBIDDEN",
+        "message": "principal lacks required role",
+    }
+
+    app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    runs = await app.state.trigger_run_store.list_by_trigger(
+        trigger_id=UUID(trigger_id), tenant_id=_DEFAULT_TENANT
+    )
+    assert runs == []  # no run was fired
+
+
+@pytest.mark.asyncio
+async def test_fire_now_operator_passes(
+    triggers_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator creates its own trigger and fires it — through both the
+    role gate and the ownership gate (200). ``fire_trigger`` is faked the
+    same way as the failure-path test above (seed a terminal ERROR run, so
+    the poll loop's first read is terminal and the test never sleeps); the
+    outcome doesn't matter here, only that it is not a 403."""
+    app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    run_store = app.state.run_store
+
+    async def _fake_fire_trigger(record: TriggerRecord, *, now: datetime, **_kwargs: Any) -> UUID:
+        run_id = uuid4()
+        await run_store.create(
+            RunInfo(
+                run_id=run_id,
+                tenant_id=record.tenant_id,
+                thread_id=uuid4(),
+                user_id=None,
+                status=RunStatus.ERROR,
+                on_disconnect=DisconnectMode.CANCEL,
+                is_resume=False,
+                error="boom",
+                created_at=now,
+                updated_at=now,
+                finished_at=now,
+            )
+        )
+        return run_id
+
+    monkeypatch.setattr("control_plane.api.triggers.fire_trigger", _fake_fire_trigger)
+
+    operator = _client_as(triggers_client, subject="user-operator", roles=("operator",))
+    async with operator:
+        created = await _create_cron(operator, name="b49-operator-fire")  # asserts 201
+        resp = await operator.post(f"/v1/triggers/{created['id']}:fire")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["trigger_run_status"] == "failed"

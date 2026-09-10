@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
@@ -682,7 +682,7 @@ async def test_non_owner_cannot_delete_others_trigger(triggers_client: AsyncClie
     created = await _create_cron(triggers_client, name="a-owned")
     trigger_id = created["id"]
 
-    other = _client_as(triggers_client, subject="user-b", roles=("viewer",))
+    other = _client_as(triggers_client, subject="user-b", roles=("operator",))
     async with other:
         resp = await other.delete(f"/v1/triggers/{trigger_id}")
     assert resp.status_code == 403
@@ -708,7 +708,7 @@ async def test_non_owner_cannot_patch_others_trigger(triggers_client: AsyncClien
     created = await _create_cron(triggers_client, name="a-owned-patch")
     trigger_id = created["id"]
 
-    other = _client_as(triggers_client, subject="user-b", roles=("viewer",))
+    other = _client_as(triggers_client, subject="user-b", roles=("operator",))
     async with other:
         resp = await other.patch(f"/v1/triggers/{trigger_id}", json={"enabled": False})
     assert resp.status_code == 403
@@ -723,7 +723,7 @@ async def test_admin_can_delete_others_trigger(triggers_client: AsyncClient) -> 
     与 admin 是两个不同的 subject,而不是同一 caller 删自己建的(那个分支
     已由 self 路径覆盖,见 ``test_owner_non_admin_can_get_patch_delete_own_trigger``)。
     """
-    owner = _client_as(triggers_client, subject="user-owner", roles=("viewer",))
+    owner = _client_as(triggers_client, subject="user-owner", roles=("operator",))
     async with owner:
         created = await _create_cron(owner, name="admin-target")
     trigger_id = created["id"]
@@ -739,7 +739,7 @@ async def test_owner_non_admin_can_get_patch_delete_own_trigger(
     triggers_client: AsyncClient,
 ) -> None:
     """非 admin 的 owner 仍可读/改/删自己建的触发器 —— ownership 闸的 self 分支不看角色。"""
-    owner = _client_as(triggers_client, subject="user-c", roles=("viewer",))
+    owner = _client_as(triggers_client, subject="user-c", roles=("operator",))
     async with owner:
         created = await _create_cron(owner, name="c-owned")
         trigger_id = created["id"]
@@ -759,7 +759,7 @@ async def test_list_triggers_non_admin_sees_only_own(triggers_client: AsyncClien
     """非 admin LIST 只见自己建的,看不到租户内其他 user 建的(同一 agent 下)。"""
     await _create_cron(triggers_client, name="admin-owned")  # a different owner
 
-    user_b = _client_as(triggers_client, subject="user-b", roles=("viewer",))
+    user_b = _client_as(triggers_client, subject="user-b", roles=("operator",))
     async with user_b:
         await _create_cron(user_b, name="b-owned")
         listed = await user_b.get("/v1/triggers", params={"agent_name": "reporter"})
@@ -862,7 +862,7 @@ async def test_null_owner_trigger_delete_requires_admin(triggers_client: AsyncCl
     app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
     trigger_id = await _seed_unowned_trigger(app, name="unowned")
 
-    attacker = _client_as(triggers_client, subject="user-attacker", roles=("viewer",))
+    attacker = _client_as(triggers_client, subject="user-attacker", roles=("operator",))
     async with attacker:
         resp = await attacker.delete(f"/v1/triggers/{trigger_id}")
     assert resp.status_code == 403
@@ -960,7 +960,7 @@ async def test_403_delete_leaves_trigger_run_rows_intact(
     await _seed_trigger_run(app, trigger_id=trigger_id)
     await _seed_trigger_run(app, trigger_id=trigger_id)
 
-    attacker = _client_as(triggers_client, subject="user-attacker", roles=("viewer",))
+    attacker = _client_as(triggers_client, subject="user-attacker", roles=("operator",))
     async with attacker:
         resp = await attacker.delete(f"/v1/triggers/{trigger_id}")
     assert resp.status_code == 403
@@ -1012,3 +1012,82 @@ async def test_get_trigger_tenant_id_star_400(triggers_client: AsyncClient) -> N
     resp = await triggers_client.get(f"/v1/triggers/{created['id']}", params={"tenant_id": "*"})
     assert resp.status_code == 400, resp.text
     assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
+
+
+# ---------------------------------------------------------------------------
+# B-49 — role gate on the four trigger writes
+#
+# Found by the B-49 live scan: ``POST`` / ``PATCH`` / ``DELETE`` / ``:fire``
+# carried only ``console_only()`` plus the ownership gate (``record.user_id
+# is None`` → admin only; otherwise the owner). The role axis was empty — a
+# ``viewer`` could create, edit, delete, and ``:fire`` (really starting a
+# run). Ruling: the four writes are operator+, reusing ``session:write`` — a
+# trigger schedules runs, and ``:fire`` is the same act as
+# ``POST /v1/agents/{code}/runs``, which is gated by ``session:write``. The
+# ownership gate is untouched and still runs after the role gate.
+#
+# What proves the gate: ``viewer`` is the prover for the 403, and the
+# assertion is on ``code == "FORBIDDEN"``, NOT ``USER_SCOPE_FORBIDDEN`` —
+# without that, removing the gate would let PATCH / DELETE fall through to
+# the ownership gate's 403 and the test would certify the old behaviour.
+# ``operator`` proves it isn't over-tightened. (The ownership tests above
+# that used to build their non-admin caller as ``viewer`` now use
+# ``operator`` for the same reason: a viewer no longer reaches the
+# ownership gate on a write.)
+# ---------------------------------------------------------------------------
+
+_B49_CRON_BODY: dict[str, object] = {
+    "agent_name": "reporter",
+    "agent_version": "1.0.0",
+    "name": "b49",
+    "kind": "cron",
+    "config": {"expr": "0 9 * * *"},
+}
+
+
+def _assert_role_denied(resp: Response) -> None:
+    """The 403 must come from the RBAC gate, not from the ownership gate."""
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert detail == {"code": "FORBIDDEN", "message": "principal lacks required role"}, detail
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_create_trigger(triggers_client: AsyncClient) -> None:
+    viewer = _client_as(triggers_client, subject="user-viewer", roles=("viewer",))
+    async with viewer:
+        resp = await viewer.post("/v1/triggers", json=_B49_CRON_BODY)
+    _assert_role_denied(resp)
+    listed = await triggers_client.get("/v1/triggers", params={"agent_name": "reporter"})
+    assert listed.json()["total"] == 0  # nothing was created
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["PATCH", "DELETE"])
+async def test_viewer_cannot_patch_or_delete_trigger(
+    triggers_client: AsyncClient, method: str
+) -> None:
+    created = await _create_cron(triggers_client, name=f"b49-{method.lower()}")
+    trigger_id = created["id"]
+    viewer = _client_as(triggers_client, subject="user-viewer", roles=("viewer",))
+    async with viewer:
+        resp = await viewer.request(
+            method,
+            f"/v1/triggers/{trigger_id}",
+            json={"enabled": False} if method == "PATCH" else None,
+        )
+    _assert_role_denied(resp)
+    got = await triggers_client.get(f"/v1/triggers/{trigger_id}")
+    assert got.status_code == 200 and got.json()["enabled"] is True  # untouched
+
+
+@pytest.mark.asyncio
+async def test_operator_can_create_patch_delete_own_trigger(triggers_client: AsyncClient) -> None:
+    operator = _client_as(triggers_client, subject="user-operator", roles=("operator",))
+    async with operator:
+        created = await _create_cron(operator, name="b49-operator")  # asserts 201
+        trigger_id = created["id"]
+        patched = await operator.patch(f"/v1/triggers/{trigger_id}", json={"enabled": False})
+        assert patched.status_code == 200, patched.text
+        deleted = await operator.delete(f"/v1/triggers/{trigger_id}")
+        assert deleted.status_code == 200, deleted.text
