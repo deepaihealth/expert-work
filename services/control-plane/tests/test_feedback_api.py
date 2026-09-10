@@ -412,3 +412,33 @@ async def test_get_feedback_404s_for_a_thread_of_another_tenant(
 async def test_get_feedback_404s_for_an_unknown_thread(client: AsyncClient) -> None:
     resp = await client.get(f"/v1/sessions/{uuid4()}/feedback")
     assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_get_feedback_read_carries_its_own_tenant_predicate(
+    client: AsyncClient, app: Any, feedback_store: InMemoryFeedbackStore
+) -> None:
+    """第二道门单独自证:thread **在**本租户(404 那道门放行),同 id 上挂着另一
+    租户的反馈行 → 读行本身必须再滤一次租户。
+
+    没有这一条,把 ``list_for_thread_scoped`` 换回无租户谓词的 ``list_for_thread``
+    整套用例照样全绿 —— 因为跨租户那条被 404 先挡住了,两道门里只有一道被测到。
+    运行期以 BYPASSRLS 角色连库,RLS 兜底是空的,这道谓词就是唯一的过滤。
+    """
+    other_tenant, thread_id = uuid4(), uuid4()
+    await _seed_thread(app, thread_id)  # 本租户有这条会话 → 404 那道门放行
+    await feedback_store.upsert(
+        FeedbackRecord(
+            tenant_id=other_tenant,
+            thread_id=thread_id,
+            run_id=uuid4(),
+            rating="down",
+            comment="OTHER-TENANT-ROW",
+            source="external",
+            actor_id="ext-9",
+        )
+    )
+    resp = await client.get(f"/v1/sessions/{thread_id}/feedback")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+    assert "OTHER-TENANT-ROW" not in resp.text
