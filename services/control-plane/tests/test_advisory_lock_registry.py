@@ -15,7 +15,6 @@ import ast
 from collections import Counter
 from pathlib import Path
 
-import control_plane
 from control_plane import advisory_locks
 
 #: Keys the advisory-lock SQL binds its classid to.
@@ -23,9 +22,26 @@ _CLASSID_BIND_KEYS = frozenset({"cid", "classid"})
 
 
 def _control_plane_sources() -> list[Path]:
-    root = Path(control_plane.__file__).parent
-    registry = Path(advisory_locks.__file__)
-    return sorted(p for p in root.rglob("*.py") if p != registry)
+    registry = Path(advisory_locks.__file__).resolve()
+    root = registry.parent
+    # The scan's scope is "every module in the control plane", derived from
+    # where the registry sits. If the registry ever moves into a subpackage
+    # that derivation would silently shrink the scan instead of failing, so
+    # pin the expectation rather than trusting the path.
+    assert root.name == "control_plane", (
+        f"expected the registry at the package root, found it in {root} — "
+        "the literal scan below would only cover that subpackage"
+    )
+    sources = sorted(p for p in root.rglob("*.py") if p != registry)
+    # An empty (or badly shrunk) enumeration makes the literal scan below pass
+    # vacuously — the failure mode where the audit is blind but green. The
+    # package holds ~225 modules; anything near zero is a broken scan, not a
+    # clean codebase.
+    assert len(sources) > 100, (
+        f"only {len(sources)} modules found under {root} — the enumeration is "
+        "broken, not the codebase"
+    )
+    return sources
 
 
 def test_no_two_locks_share_a_classid() -> None:
