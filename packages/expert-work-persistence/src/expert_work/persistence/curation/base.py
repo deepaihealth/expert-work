@@ -186,6 +186,7 @@ class CurationCandidateStore(abc.ABC):
         trajectory_key: str,
         feedback_run_id: UUID,
         feedback_comment: str | None,
+        feedback_source: str | None = None,
     ) -> bool:
         """P-2 §5 — an existing candidate becomes ``negative_feedback`` once a 👎
         lands on its thread.
@@ -194,10 +195,14 @@ class CurationCandidateStore(abc.ABC):
         insert-once ``upsert`` uses, so the synchronous 👎 path and the
         curation worker can race freely. Writes
         ``signal='negative_feedback', feedback_rating='down',
-        feedback_run_id, feedback_comment`` and CLEARS
+        feedback_run_id, feedback_comment, feedback_source`` and CLEARS
         ``feedback_changed_at`` (a fresh 👎 undoes an earlier 👎→👍 change
         marker). ``status`` — the human review verdict — is left alone.
         Returns whether a row was matched; never inserts.
+
+        PR4 — ``feedback_source`` 是这一踩的来源(``console`` = 员工 /
+        ``external`` = 终端用户)。默认 ``None``:curation worker 是按 thread
+        聚合出来的,归因不到具体某一条 feedback,那一列留空(spec §3)。
         """
 
     @abc.abstractmethod

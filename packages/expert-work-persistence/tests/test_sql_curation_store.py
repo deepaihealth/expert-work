@@ -428,6 +428,42 @@ async def test_candidate_upgrade_to_negative_rewrites_signal_and_feedback_column
 
 
 @pytest.mark.asyncio
+async def test_candidate_upgrade_records_who_rated_it_down(
+    curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
+) -> None:
+    """PR4 —— SQL 侧与内存侧同谓词:来源写得进、读得出,worker 兜底行是 NULL。
+
+    这一条同时压 0152 的 ``candidate_feedback_source_valid`` CHECK —— 只有
+    ``console`` / ``external`` / NULL 三种取值。
+    """
+    _, store = curation_stores
+    tenant, key, run = uuid4(), "trajectories/t/src.jsonl", uuid4()
+    await store.upsert(_candidate(tenant_id=tenant, trajectory_key=key, signal="failed_outcome"))
+    row = await store.get_by_trajectory_key(tenant_id=tenant, trajectory_key=key)
+    assert row is not None and row.feedback_source is None
+
+    await store.upgrade_to_negative(
+        tenant_id=tenant,
+        trajectory_key=key,
+        feedback_run_id=run,
+        feedback_comment="太慢",
+        feedback_source="console",
+    )
+    row = await store.get_by_trajectory_key(tenant_id=tenant, trajectory_key=key)
+    assert row is not None and row.feedback_source == "console"
+
+    await store.upgrade_to_negative(
+        tenant_id=tenant,
+        trajectory_key=key,
+        feedback_run_id=run,
+        feedback_comment="still bad",
+        feedback_source="external",
+    )
+    row = await store.get_by_trajectory_key(tenant_id=tenant, trajectory_key=key)
+    assert row is not None and row.feedback_source == "external"
+
+
+@pytest.mark.asyncio
 async def test_candidate_mark_feedback_changed_is_keyed_by_run_and_idempotent(
     curation_stores: tuple[SqlEvalDatasetStore, SqlCurationCandidateStore],
 ) -> None:

@@ -228,6 +228,18 @@ export function CandidatesPanel() {
               <Text style={{ fontSize: 12 }}>{record.feedback_comment}</Text>
             </Tooltip>
           )}
+          {/* PR4 — 审阅员不能把员工打的踩和终端用户打的踩当一回事。措辞复用
+              轮脚展示的那两个键(``console.feedback_source_*``),两处同一套
+              说法,不另起一份免得漂。 */}
+          {record.feedback_source !== null && (
+            <Tag bordered={false} data-testid="curation-feedback-source-tag">
+              {t(
+                record.feedback_source === "external"
+                  ? "console.feedback_source_external"
+                  : "console.feedback_source_console",
+              )}
+            </Tag>
+          )}
           {record.feedback_changed_at !== null && (
             <Tag color="gold" data-testid="curation-feedback-changed-tag">
               {t("curation.feedback_changed_tag")}

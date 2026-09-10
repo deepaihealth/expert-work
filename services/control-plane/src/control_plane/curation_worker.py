@@ -261,6 +261,9 @@ class CurationWorker:
             return None
         with _tenant_scope(stored.tenant_id):
             feedback = await self._feedback.list_for_thread(thread_id=stored.thread_id)
+        # PR4 — 反馈来源(console/external)在这里**刻意不参与判断**:负反馈就是
+        # 负反馈,员工与终端用户的 👎 同等有效(spec §6)。展示面要区分来源,判断
+        # 面不区分 —— 不要在这里补一个 source 过滤。
         has_down = any(f.rating == "down" for f in feedback)
         has_up = any(f.rating == "up" for f in feedback)
         # ``list_for_thread`` is ``id`` DESC — the first 👎 is the newest one.

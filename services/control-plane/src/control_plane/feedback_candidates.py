@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from expert_work.persistence import CurationCandidateStore, ThreadMetaStore
-from expert_work.protocol import CurationCandidateRecord
+from expert_work.protocol import CurationCandidateRecord, FeedbackSource
 from orchestrator.trajectory import TrajectoryReader
 
 #: ``failed`` 不是本模块的返回值 —— 它是**调用方**在同步抛异常时写进审计的那一格。
@@ -40,7 +40,13 @@ async def sync_candidate_for_feedback(
     rating: str,
     previous_rating: str | None,
     comment: str | None,
+    source: str,
 ) -> CandidateSyncResult:
+    """``source`` = 这一票是谁打的(``console`` 员工 / ``external`` 终端用户)。
+
+    PR4 —— 只写进候选行给审阅员看,**不参与任何判断**:两边的 👎 同等有效
+    (spec §6)。
+    """
     if rating == "up":
         if previous_rating != "down":
             return "noop"
@@ -74,17 +80,19 @@ async def sync_candidate_for_feedback(
                 feedback_rating="down",
                 feedback_run_id=run_id,
                 feedback_comment=comment,
+                feedback_source=cast(FeedbackSource, source),
                 detected_at=datetime.now(UTC),
             )
         )
         if inserted:
             return "inserted"
-    # 已有候选(或刚被 worker / 另一副本抢先插入)→ 升级为 negative_feedback 并补两列。
+    # 已有候选(或刚被 worker / 另一副本抢先插入)→ 升级为 negative_feedback 并补三列。
     await deps.candidates.upgrade_to_negative(
         tenant_id=tenant_id,
         trajectory_key=stored.key,
         feedback_run_id=run_id,
         feedback_comment=comment,
+        feedback_source=source,
     )
     return "upgraded"
 

@@ -46,6 +46,9 @@ export interface CurationCandidate {
   feedback_run_id: string | null;
   feedback_comment: string | null;
   feedback_changed_at: string | null;
+  /** PR4 — 这一踩是谁打的:``console`` 员工 / ``external`` 终端用户;
+   *  ``null`` = worker 兜底建的候选,归因不到某一条 feedback。 */
+  feedback_source: "console" | "external" | null;
 }
 
 export interface CandidateTrajectory {

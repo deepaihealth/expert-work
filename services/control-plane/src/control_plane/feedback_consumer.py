@@ -145,6 +145,9 @@ class FeedbackConsumerWorker:
 
     async def run_once(self) -> FeedbackConsumeTally:
         """One sweep. Idempotent — processed rows carry the stamp."""
+        # PR4 — 反馈来源(console/external)在这里**刻意不参与判断**:这里问的是
+        # 「这条记忆是不是该复核」,员工与终端用户的 👎 同等有效(spec §6)。展示
+        # 面要区分来源,判断面不区分 —— 不要在这里补一个 source 过滤。
         with _bypass_rls():
             rows = await self.feedback_store.list_unprocessed_down_all_tenants(
                 limit=self.batch_size

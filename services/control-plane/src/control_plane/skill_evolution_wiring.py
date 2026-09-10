@@ -480,6 +480,10 @@ class _TrajectoryEvidenceProvider:
                 continue
             text = render_trajectory(traj.messages)
             if self.feedback_store is not None:
+                # PR4 — 反馈来源(console/external)在这里**刻意不参与判断**:蒸馏
+                # 证据要的是「哪里不对」,而员工比终端用户更懂哪里不对 —— 专家的
+                # 负反馈只会更值钱,按来源打折是反的(spec §6)。展示面要区分来源,
+                # 判断面不区分 —— 不要在这里补一个 source 过滤。
                 feedback = await self.feedback_store.list_for_thread(thread_id=neg.thread_id)
                 comments = [f.comment for f in feedback if f.rating == "down" and f.comment]
                 if comments:
