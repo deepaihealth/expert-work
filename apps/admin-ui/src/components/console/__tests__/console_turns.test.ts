@@ -192,3 +192,22 @@ describe("approval synthesis opt-in (终审 C-2)", () => {
     expect(out[0].turn.approval).toBeNull();
   });
 });
+
+describe("P-1 被取代 / 墓碑标记的投影", () => {
+  it("history 轮原样带上 HistoryTurn 的两个标记,live 轮恒 null / false", () => {
+    const out = buildConsoleTurns({
+      historyTurns: [
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null, supersededBy: "r2", tombstone: true },
+        { key: "h2", input: "q2", fallbackLines: [], runId: "r2", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null, supersededBy: null, tombstone: false },
+      ],
+      historyLoads: {},
+      liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [], status: "running", error: null, approval: null }],
+      timings: {},
+    });
+    expect(out.map((t) => [t.key, t.supersededBy, t.tombstone])).toEqual([
+      ["h1", "r2", true],
+      ["h2", null, false],
+      ["L1", null, false],
+    ]);
+  });
+});
