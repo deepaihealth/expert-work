@@ -1133,58 +1133,275 @@ async def test_exec_cwd_without_agent_key_stays_workspace_root(runtime) -> None:
 
 ---
 
-## Task 9: 对外产物端点按 agent 过滤
+## Task 9: 对外平面按 agent 收口(六个 handler,不是三个)
 
 **Files:**
-- Modify: `services/control-plane/src/control_plane/api/external_artifacts.py:12-15,147,157,198,207,225,322,332`
-- Test: `services/control-plane/tests/test_external_artifacts.py`
+- Modify: `services/control-plane/src/control_plane/api/external_artifacts.py:12-15,147,198,322`
+- Modify: `services/control-plane/src/control_plane/api/external_workspace.py:11-15,77,140`
+- Modify: `services/control-plane/src/control_plane/api/external_uploads.py:418`
+- Modify: `services/control-plane/src/control_plane/api/_workspace_shared.py:77-105`(`_workspace_files_payload` 加前缀参数)
+- Test: `services/control-plane/tests/test_external_artifacts.py`、`tests/test_external_workspace.py`、`tests/test_external_uploads.py`
 
 **Interfaces:**
 - Consumes: Task 4 的 `list_for_user(agent_key=...)` / `get_latest_version(agent_key=...)` / `soft_delete(agent_key=...)`
+- Produces: `_agent_key_for_code(tenant_id, agent_code, repo) -> str` —— 对外三个模块共用的一处解析
 
-> **这是对外行为变更。** 对接方今天用 A agent 的 key 能列到 B agent 的产物,改后列不到。
-> 模块 docstring `:12-15` 那句「产物是 (tenant_id, user_id) 维度的,不按 agent 分……
-> 不参与过滤,也不参与权限判定」**要整段改写**,不要留着说谎。
+> **全仓 `del agent_code` 有六处,不是三处。** 立项时只点了 `external_artifacts` 那三个:
+>
+> | 端点 | 文件:行 | 今天 |
+> |---|---|---|
+> | `GET /{code}/artifacts` | `external_artifacts.py:147` | 列该用户全部 |
+> | `GET /{code}/artifacts/download`(按 `name`) | `external_artifacts.py:198` | 跨 agent 也给 |
+> | `DELETE /{code}/artifacts` | `external_artifacts.py:322` | 跨 agent 也删 |
+> | `GET /{code}/workspace/files` | `external_workspace.py:77` | **`os.walk` 用户根全量平铺** |
+> | `GET /{code}/workspace/file`(按 `path`) | `external_workspace.py:140` | 跨 agent 也给 |
+> | `GET /{code}/uploads/{upload_id}` | `external_uploads.py:418` | 跨 agent 也给 |
+>
+> `POST /{code}/uploads` 不在此列 —— 它**已经在用** `agent_code`(过 kill-switch 闸、进 `_resolve_session`)。
+
+### 9.1 工作区两条要做**路径投影**,不是加过滤条件
+
+产物按 `name` 取、上传按 `upload_id` 取,这两种标识搬迁后都不变,加个 `agent_key` 谓词就够。
+**工作区按 `path` 取,而 `path` 是搬迁会改的东西** —— `客户案例/x.md` 变成
+`agents/<agent_key>/客户案例/x.md`。如果对外原样透出新路径,对接方**缓存过的 path 会永久失效**
+(不是发布窗口的事,是永久),而且内部命名 `<agent_key>`(带 sha256 后缀)也漏到了第三方面前。
+
+对外平面**本来就已经按 `agent_code` 分区**,所以对外的 path 应当相对**该 agent 的根**:
+
+```
+存储层        {tenant}/{user}/agents/ai-health-plan-1a2b3c4d/客户案例/x.md
+对外返回      客户案例/x.md                     ← 与搬迁前逐字节相同
+对外收到      客户案例/x.md
+服务端拼      agents/<该 code 的 agent_key>/客户案例/x.md
+```
+
+于是:对接方**契约零变更、代码零改动**;跨 agent 仍然 404(A 的 code 拼出 A 的根,B 的文件不在那儿);
+`agent_key` 挡在对外面之外。
+
+> **投影必须双向且共用一处**。只做出口剥前缀、忘了入口加前缀,下载会全线 404;
+> 两边各写一份拼接,将来改一处就静默分叉(仓库里 `workspace_user_root()` 的 docstring
+> 记着同一类事故:两处各自拼 `root/tenant/user` 差点漂开)。
+
+### 9.2 `shared/` 对外不可见
+
+`shared/` 装的是搬迁时反推不出归属的 legacy。**对外列表与下载都不投影它** ——
+第三方按 `agent_code` 提问,答案里混进「不知道谁的历史文件」没有意义,
+而且那批文件正是归属不明的那批。控制台看得见(Task 13 的浏览面分组),对外不给。
 
 - [ ] **Step 1: 写失败的测试**
 
 ```python
-async def test_list_only_returns_this_agents_artifacts(client) -> None:
-    """A agent 的 key 列不到 B agent 的产物。"""
-    r = await client.get("/v1/agents/agent-a/artifacts", params={"user_id": ext_uid})
-    assert [a["name"] for a in r.json()["data"]["artifacts"]] == ["a-only.docx"]
+# tests/test_external_workspace.py
+async def test_list_files_paths_are_relative_to_agent_root(client, seeded) -> None:
+    """对外 path 不带 agents/<key>/ 前缀 —— 与搬迁前逐字节相同。
+
+    这条是「对接方不用改代码」的唯一保证:他们缓存过的 path 必须继续能用。
+    """
+    r = await client.get("/v1/agents/agent-a/workspace/files", params={"user_id": EXT_UID})
+    paths = [f["path"] for f in r.json()["data"]["files"]]
+    assert paths == ["客户案例/x.md"]
+    assert not any(p.startswith("agents/") for p in paths)
 
 
-async def test_download_across_agents_is_404(client) -> None:
-    """跨 agent 下载 = 不存在,与跨用户同一个不透明 404。"""
-    r = await client.get("/v1/agents/agent-a/artifacts/b-only.docx", params={"user_id": ext_uid})
+async def test_list_files_excludes_other_agents_and_shared(client, seeded) -> None:
+    """B agent 的文件、以及 shared/ 的 legacy,都不出现在 A 的列表里。"""
+    r = await client.get("/v1/agents/agent-a/workspace/files", params={"user_id": EXT_UID})
+    paths = [f["path"] for f in r.json()["data"]["files"]]
+    assert "b-only.md" not in paths
+    assert not any("MEMORY.md" in p for p in paths)  # shared/MEMORY.md
+
+
+async def test_download_accepts_the_path_it_handed_out(client, seeded) -> None:
+    """出口剥前缀、入口加前缀 —— 双向必须闭合。
+
+    只做出口忘了入口,这一条会 404;这就是那种「列表看着对、下载全挂」的形态。
+    """
+    listed = (await client.get(
+        "/v1/agents/agent-a/workspace/files", params={"user_id": EXT_UID}
+    )).json()["data"]["files"][0]["path"]
+    r = await client.get(
+        "/v1/agents/agent-a/workspace/file", params={"user_id": EXT_UID, "path": listed}
+    )
+    assert r.status_code == 200
+    assert r.content == b"x-body"
+
+
+async def test_download_across_agents_is_404(client, seeded) -> None:
+    """A 的 code 拿 B 的文件路径 → 与「不存在」同一个不透明 404。"""
+    r = await client.get(
+        "/v1/agents/agent-a/workspace/file", params={"user_id": EXT_UID, "path": "b-only.md"}
+    )
     assert r.status_code == 404
 
 
-async def test_delete_across_agents_is_404(client) -> None:
-    r = await client.delete("/v1/agents/agent-a/artifacts/b-only.docx", params={"user_id": ext_uid})
+async def test_download_cannot_climb_into_another_agent(client, seeded) -> None:
+    """投影不是绕过 .. 校验的后门:显式往上爬也要被 _safe_workspace_relpath 挡。"""
+    r = await client.get(
+        "/v1/agents/agent-a/workspace/file",
+        params={"user_id": EXT_UID, "path": "../agent-b-key/b-only.md"},
+    )
+    assert r.status_code in (400, 404, 422)
+
+
+async def test_download_cannot_reach_shared_by_path(client, seeded) -> None:
+    """shared/ 对外不可见——直接拼路径也不行。"""
+    r = await client.get(
+        "/v1/agents/agent-a/workspace/file",
+        params={"user_id": EXT_UID, "path": "MEMORY.md"},
+    )
+    assert r.status_code == 404
+```
+
+```python
+# tests/test_external_artifacts.py
+async def test_list_only_returns_this_agents_artifacts(client, seeded) -> None:
+    r = await client.get("/v1/agents/agent-a/artifacts", params={"user_id": EXT_UID})
+    assert [a["name"] for a in r.json()["data"]["artifacts"]] == ["a-only.docx"]
+
+
+async def test_download_across_agents_is_404(client, seeded) -> None:
+    r = await client.get(
+        "/v1/agents/agent-a/artifacts/download",
+        params={"user_id": EXT_UID, "name": "b-only.docx"},
+    )
+    assert r.status_code == 404
+
+
+async def test_delete_across_agents_is_404_and_leaves_the_row(client, seeded, store) -> None:
+    """404 不能是「删了但假装没有」——B 的行必须还在。"""
+    r = await client.delete(
+        "/v1/agents/agent-a/artifacts", params={"user_id": EXT_UID, "name": "b-only.docx"}
+    )
+    assert r.status_code == 404
+    assert await store.get_latest_version(
+        tenant_id=TENANT, user_id=INT_UID, agent_key="agent-b-key", name="b-only.docx"
+    ) is not None
+
+
+async def test_same_name_under_two_agents_resolves_per_code(client, seeded) -> None:
+    """两个 agent 各有 报告.docx —— 各自的 code 取到各自那份。"""
+    a = await client.get("/v1/agents/agent-a/artifacts/download",
+                         params={"user_id": EXT_UID, "name": "报告.docx"})
+    b = await client.get("/v1/agents/agent-b/artifacts/download",
+                         params={"user_id": EXT_UID, "name": "报告.docx"})
+    assert a.content == b"from-a"
+    assert b.content == b"from-b"
+```
+
+```python
+# tests/test_external_uploads.py
+async def test_upload_download_across_agents_is_404(client, seeded) -> None:
+    r = await client.get(
+        f"/v1/agents/agent-a/uploads/{upload_id_from_agent_b}", params={"user_id": EXT_UID}
+    )
     assert r.status_code == 404
 ```
 
 - [ ] **Step 2: 跑,确认红**
 
-- [ ] **Step 3: 实现** —— 三处 `del agent_code` 换成解析 agent_key:
+Run:
+```
+cd services/control-plane && uv run --no-sync pytest \
+  tests/test_external_workspace.py tests/test_external_artifacts.py tests/test_external_uploads.py -v
+```
+Expected: FAIL —— 今天六个 handler 都 `del agent_code`,跨 agent 一律给
+
+- [ ] **Step 3: 实现**
+
+三个模块共用一处解析(**不要各写一份**):
 
 ```python
-        # 工作区分层 —— 产物按 agent 分,URL 里的 agent_code 参与过滤。
-        # 用 spec 的 metadata.name 过 sanitize_agent_key,与 agent 自己写入时
-        # 用的是同一个值(configurable → ToolContext → SaveArtifactTool)。
-        record = await _resolve_agent(tenant_id=tenant_id, agent_code=agent_code, repo=repo)
-        agent_key = sanitize_agent_key(record.spec.metadata.name)
+# _workspace_shared.py
+async def agent_key_for_code(*, tenant_id: UUID, agent_code: str, repo: AgentSpecStore) -> str:
+    """对外 URL 里的 ``agent_code`` → 该 agent 写工作区时用的 ``agent_key``。
+
+    必须与 agent 自己写入时用的是同一个值(``configurable`` → ``ToolContext``
+    → ``SaveArtifactTool`` / 文件工具),否则读写两侧看的是两棵树。
+    """
+    record = await repo.get_latest(tenant_id=tenant_id, code=agent_code)
+    ...
+    return sanitize_agent_key(record.spec.metadata.name)
 ```
+
+工作区双向投影(**一处实现,出入口共用**):
+
+```python
+def _external_to_storage(rel: str, *, agent_key: str) -> str:
+    """对外相对路径 → 存储层相对路径。入口用。"""
+    return f"agents/{agent_key}/{rel}" if agent_key else rel
+
+
+def _storage_to_external(rel: str, *, agent_key: str) -> str | None:
+    """存储层相对路径 → 对外相对路径;不属于该 agent 的返回 None(列表里剔掉)。出口用。"""
+    prefix = f"agents/{agent_key}/"
+    return rel[len(prefix):] if rel.startswith(prefix) else None
+```
+
+顺序上**先过 `_safe_workspace_relpath` 再加前缀** —— 校验必须作用在对接方给的原串上,
+否则 `../` 会被前缀拼接掩盖成一个看起来合法的路径。
+
+三个模块的 docstring 整段改写。`external_workspace.py:11-15` 现在写着:
+
+> 工作区本身是 `(tenant_id, user_id)` 维度的,不按 agent 分——`agent_code` 只是外部平面
+> URL 结构的一部分……**不参与过滤**,和控制台侧 `/v1/workspace/files`(压根没有 agent_code)语义一致
+
+**这句从此不成立**,要改成「按 `(tenant, user, agent)` 分,对外 path 相对 agent 根,
+`shared/` 不对外投影」,并写明与控制台侧的差异(控制台看全量并按 agent 分组,对外只看本 agent)。
 
 - [ ] **Step 4: 跑,确认绿**
 
-- [ ] **Step 5: 变异自证** —— 把 `agent_key=agent_key` 从 `list_for_user` 拿掉 → 第一条必须红;
-  从 `get_latest_version` 拿掉 → 第二条必须红。**两处要分别验**(同一个洞两个断点,
-  仓库既有教训:P-2 那次就是只预判了一个断点)。
+- [ ] **Step 5: 变异自证**
+
+**六个 handler 逐个验,不要只验一个** —— 同一个洞的六个断点,仓库里踩过「只预判了一个断点」的亏
+(P-2 那次 store 层与端点层两处只补了一处)。
+
+| 变异 | 必须红的用例 |
+|---|---|
+| `list_for_user` 去掉 `agent_key=` | `test_list_only_returns_this_agents_artifacts` |
+| `get_latest_version` 去掉 `agent_key=` | 产物 `test_download_across_agents_is_404` |
+| `soft_delete` 去掉 `agent_key=` | `test_delete_across_agents_is_404_and_leaves_the_row` |
+| 列表出口不剥前缀 | `test_list_files_paths_are_relative_to_agent_root` |
+| **只剥出口、入口不加前缀** | `test_download_accepts_the_path_it_handed_out` ——**这条是双向闭合的唯一证人** |
+| `_storage_to_external` 对不匹配的返回 `rel` 而非 `None` | `test_list_files_excludes_other_agents_and_shared` |
+| 前缀拼接挪到 `_safe_workspace_relpath` 之前 | `test_download_cannot_climb_into_another_agent` |
+| uploads GET 去掉 agent 谓词 | `test_upload_download_across_agents_is_404` |
 
 - [ ] **Step 6: 提交**
+
+```bash
+git add services/control-plane/src/control_plane/api/external_artifacts.py \
+        services/control-plane/src/control_plane/api/external_workspace.py \
+        services/control-plane/src/control_plane/api/external_uploads.py \
+        services/control-plane/src/control_plane/api/_workspace_shared.py \
+        services/control-plane/tests/test_external_artifacts.py \
+        services/control-plane/tests/test_external_workspace.py \
+        services/control-plane/tests/test_external_uploads.py
+git commit -m "feat(workspace): 对外六个 handler 按 agent 收口,工作区路径做双向投影"
+```
+
+### 9.3 对接方影响 —— 一句话:不用改代码,但会少看见东西
+
+实测(2026-09-10 测试环境):对接方**自己就在同一批终端用户身上跑两个 agent** ——
+同一个 project 下 `ai-health-plan` 与 `sop2-designer` 共用终端用户,分别 112 / 35 / 15 / 14 / 2 个会话。
+所以下面第 2 条大概率会碰上。
+
+| | 影响 | 要不要改代码 |
+|---|---|---|
+| 请求签名 / 响应信封 / 字段名 | **零变更**(`agent_code` 本来就在路径里) | 不用 |
+| 工作区 path | **零变更**(§9.1 的投影保证) | 不用 |
+| 列表返回条数 | 变少 —— 只剩本 agent 的 | 不用,但界面上会少东西 |
+| **跨 agent 的下载 / 删除** | **404**,永久 | **要么改成按 agent 分别请求,要么接受看不到** |
+
+**最后一条是有意的收窄,不是 bug**,但因为 404 被刻意做成不透明的
+(docstring:第三方不能分辨「用户不存在」「文件不存在」「supervisor 没配」),
+他们**分不出「归另一个 agent」和「压根没有」**,排查会很难受。
+
+**这条要在 PR4 合并前告知对接方**,不能等他们踩。Task 10 的文档要写清变更前后对照。
+
+**一个待拍板的产品问题**(不在本计划范围,但要摆出来):他们的 app 是**一个** app 同时编排两个 agent。
+「agent 之间不互读」(用户 09-10 拍板)和「他们的后端要不要一次拿到某员工的全部产物」
+**是两件事,不冲突**。如果要,给一个显式的并集入口(例如 `?scope=user`)即可;
+不给,他们发两次请求自己合并也能用,只是要改代码。**这条得问对接方,不是我们内部拍。**
 
 ---
 
@@ -1196,8 +1413,14 @@ async def test_delete_across_agents_is_404(client) -> None:
 - Modify: `apps/admin-ui/docs-site/guide/examples.md`(若有产物示例)
 
 - [ ] **Step 1:** 先按 `docs/superpowers/specs/2026-08-17-external-docs-style-guide.md` 自检语气与体例
-- [ ] **Step 2:** 写清三件事:① 产物按 agent 分,`GET /v1/agents/{code}/artifacts` 只返回该 agent 的;
-  ② 这是**行为变更**,给出变更前后对照;③ 上传同理(经哪个 agent 的会话上传就归哪个)
+- [ ] **Step 2:** 写清四件事:
+  ① **六个端点**按 agent 收口(产物 list/download/delete、工作区 files/file、上传 download),
+  给出变更前后对照;
+  ② **工作区 path 契约不变** —— 对外 path 相对该 agent 根,他们缓存过的 path 继续有效,
+  **明说这一点**,否则对接方看到「工作区分层」会以为要改;
+  ③ 上传归属:经哪个 agent 的会话传的就归哪个;
+  ④ **跨 agent 的下载/删除返回 404,且与「不存在」不可区分** —— 这条最要紧,
+  他们排查时分不出来,文档里必须明写这是有意的收窄
 - [ ] **Step 3:** 跑 docs-site 构建 + 死链脚本,确认零死链;侧栏若新增小节要登记
   (既有教训:`examples.md` 侧栏漏登记过)
 - [ ] **Step 4: 提交** —— **Task 9+10 合成 PR4**
