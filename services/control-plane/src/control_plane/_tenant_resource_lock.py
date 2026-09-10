@@ -14,10 +14,10 @@ per ``(tenant_id, resource_kind)`` across every replica — same primitive
 :class:`~control_plane.quality_drift_worker.QualityDriftWorker` /
 :class:`~control_plane.memory_consolidator.MemoryConsolidator` /
 :class:`~control_plane.skill_curator.SkillCurator` use for their
-single-flight worker cycles (classids 8615 / 8616 / 8617 respectively;
-``workspace_lock.py`` uses 1, ``mcp_oauth_refresh_lock.py`` uses 2 — this
-module's classid is a new, distinct value so none of these ever share a
-key). Unlike those worker locks — which skip the cycle entirely on a miss
+single-flight worker cycles (this module's ``classid`` is its own value; the
+registry and the no-duplicates rule live in
+:mod:`control_plane.advisory_locks`). Unlike those worker locks — which skip
+the cycle entirely on a miss
 — this is a request-serving critical section: a request that can't get the
 lock retries once after a short delay, then fails the request with 429
 rather than blocking indefinitely.
@@ -35,13 +35,9 @@ from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-logger = logging.getLogger("expert_work.control_plane.tenant_resource_lock")
+from control_plane.advisory_locks import TENANT_RESOURCE_LOCK_CLASSID
 
-#: Advisory-lock classid for per-tenant quota-check critical sections.
-#: Distinct from the sibling single-flight-worker classids (workspace_lock.py
-#: uses 1, mcp_oauth_refresh_lock.py uses 2, quality_drift_worker.py uses
-#: 8615, memory_consolidator.py uses 8616, skill_curator.py uses 8617).
-_TENANT_RESOURCE_LOCK_CLASSID = 8618
+logger = logging.getLogger("expert_work.control_plane.tenant_resource_lock")
 
 #: One short retry before giving up — a losing request fails fast with 429
 #: (the caller retries), it doesn't queue behind an unbounded wait.
@@ -100,6 +96,6 @@ async def tenant_resource_lock(
 async def _try_acquire(session: AsyncSession, key: str) -> bool:
     result = await session.execute(
         text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-        {"cid": _TENANT_RESOURCE_LOCK_CLASSID, "k": key},
+        {"cid": TENANT_RESOURCE_LOCK_CLASSID, "k": key},
     )
     return bool(result.scalar_one())

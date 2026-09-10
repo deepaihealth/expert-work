@@ -456,10 +456,7 @@ def build_external_uploads_router() -> APIRouter:
                     "external_upload.content_unavailable upload_id=%s reason=%s", parsed_id, exc
                 )
                 return _upload_download_error("UPLOAD_NOT_FOUND", "upload content not found", 404)
-            # ArtifactKind = Literal["document", "code", "data", "other"]
-            # (expert_work.protocol.artifact) — "document" is an exact match
-            # for this branch, no substitution needed.
-            inferred = infer_content_type(kind="document", path=row.filename)
+            inferred = infer_content_type(path=row.filename)
         else:
             # row.kind == "image". ``row.ref`` is always a well-formed
             # ``expert_work://image/...`` URI here — the only writer is this
@@ -501,17 +498,10 @@ def build_external_uploads_router() -> APIRouter:
                 return _upload_download_error(
                     "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
                 )
-            # ArtifactKind (expert_work.protocol.artifact) has no "image"
-            # value — Literal["document", "code", "data", "other"] — so
-            # "other" is the closest fit (not "document"/"code"/"data").
-            # This has no behavioral effect either way: infer_content_type's
-            # dispatch is purely extension-based in every branch (`kind` is
-            # `del`eted, unused, even in its own fallback branch — verified by
-            # reading its body) — "other" is chosen for readability, not
-            # because it changes the inferred disposition (the only field of
-            # ``inferred`` this endpoint still reads — see the Content-Type
-            # comment below).
-            inferred = infer_content_type(kind="other", path=row.filename)
+            # Extension-based, like the document branch above: only the
+            # DISPOSITION side is read here (see the Content-Type comment
+            # below), and that verdict does not depend on the upload's kind.
+            inferred = infer_content_type(path=row.filename)
 
         headers = {
             "Content-Disposition": content_disposition_header(

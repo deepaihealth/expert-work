@@ -36,6 +36,7 @@ from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import TRIGGER_DELIVERY_LOCK_CLASSID
 from control_plane.runtime import AgentRuntime
 from control_plane.transcript import read_turns
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
@@ -47,11 +48,6 @@ from expert_work.runtime.runs import RunInfo
 from orchestrator.sse import ThreadStatsRecorder
 
 logger = logging.getLogger(__name__)
-
-#: PROD-9(多副本)—— 投递关窗锁的 advisory classid。既有取值:workspace_lock 1、
-#: mcp_oauth_refresh_lock 2、quality_drift 8615、memory_consolidator 8616、
-#: skill_curator 8617、tenant_resource_lock 8618 —— 本模块取新的 8619,永不共键。
-_DELIVERY_LOCK_CLASSID = 8619
 
 
 @asynccontextmanager
@@ -78,7 +74,7 @@ async def delivery_thread_lock(
     async with session_factory() as lock_session:
         await lock_session.execute(
             text("SELECT pg_advisory_xact_lock(:cid, hashtext(:k))"),
-            {"cid": _DELIVERY_LOCK_CLASSID, "k": str(thread_id)},
+            {"cid": TRIGGER_DELIVERY_LOCK_CLASSID, "k": str(thread_id)},
         )
         try:
             yield

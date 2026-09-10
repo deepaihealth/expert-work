@@ -45,11 +45,10 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import WORKSPACE_LOCK_CLASSID
+
 logger = logging.getLogger(__name__)
 
-#: ``classid`` for the two-arg advisory key space, namespacing workspace locks
-#: away from any other advisory user (event_log uses the single-arg space).
-_WORKSPACE_LOCK_CLASSID = 1
 #: Cap the lock transaction's idle / statement time above the max write exec
 #: (bash 300 s) so the per-DB short-DML defaults can't terminate the txn
 #: mid-write (which would release the advisory lock early). ``SET LOCAL`` only.
@@ -85,7 +84,7 @@ class PgWorkspaceLock:
             await session.execute(text(f"SET LOCAL statement_timeout = {_LOCK_TXN_TIMEOUT_MS}"))
             await session.execute(
                 text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
-                {"classid": _WORKSPACE_LOCK_CLASSID, "k": key},
+                {"classid": WORKSPACE_LOCK_CLASSID, "k": key},
             )
             yield
         # RT-6 Tier B (RT-ADR-20) — a write-capable tool completed under the lock

@@ -35,8 +35,6 @@ from collections.abc import Mapping
 from pathlib import PurePosixPath
 from typing import Literal
 
-from expert_work.protocol import ArtifactKind
-
 __all__ = [
     "ContentDisposition",
     "InferredContentType",
@@ -187,8 +185,8 @@ def _extension(path: str) -> str:
     return PurePosixPath(path).suffix.lower()
 
 
-def infer_content_type(*, kind: ArtifactKind, path: str) -> InferredContentType:
-    """Map an artifact's ``kind`` + workspace path to a safe response triple.
+def infer_content_type(*, path: str) -> InferredContentType:
+    """Map a workspace path to a safe response triple.
 
     Mapping rules (whitelist-first, unknown fallthrough is always safe):
 
@@ -198,8 +196,15 @@ def infer_content_type(*, kind: ArtifactKind, path: str) -> InferredContentType:
     * Structured text (``.json`` / ``.yaml`` / ``.toml`` / ``.ndjson``)
       → canonical MIME + inline.
     * Text / code extensions → ``text/plain; charset=utf-8`` + inline.
-    * Anything else, including ``kind=data`` + unknown extensions →
-      ``application/octet-stream`` + attachment.
+    * Any unknown extension → ``application/octet-stream`` + attachment.
+
+    B-13 — this used to take the artifact's ``kind`` as well and never read it
+    (the fallback branch deleted it unused). Narrowing by ``kind`` was
+    considered and rejected: the extension is the discriminator that matters
+    for browser behaviour, most callers (workspace-file and upload downloads)
+    have no artifact ``kind`` to give and were passing a placeholder, and a
+    ``kind``-driven inline verdict on an extension-less path would be exactly
+    the sniff-by-metadata the whitelist design exists to avoid.
     """
     ext = _extension(path)
     if ext in _ACTIVE_CONTENT_EXTS:
@@ -229,9 +234,8 @@ def infer_content_type(*, kind: ArtifactKind, path: str) -> InferredContentType:
             disposition="inline",
             is_text=True,
         )
-    # ``kind=document`` with no extension is still treated as opaque
-    # bytes — better a needless download than a wrong inline.
-    del kind
+    # An unrecognised (or absent) extension is treated as opaque bytes —
+    # better a needless download than a wrong inline.
     return InferredContentType(
         content_type="application/octet-stream",
         disposition="attachment",

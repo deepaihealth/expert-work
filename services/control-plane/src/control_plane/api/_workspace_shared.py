@@ -149,7 +149,7 @@ async def _workspace_file_response(
         logger.warning("workspace.read_failed", exc_info=True)
         raise HTTPException(status_code=404, detail="file not found") from exc
     filename = PurePosixPath(safe_path).name or "download"
-    inferred = infer_content_type(kind="other", path=safe_path)
+    inferred = infer_content_type(path=safe_path)
     headers = {
         "Content-Disposition": content_disposition_header(
             filename, disposition=inferred.disposition

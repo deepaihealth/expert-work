@@ -21,8 +21,8 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import text
 
+from control_plane.advisory_locks import WORKSPACE_JANITOR_LOCK_CLASSID
 from control_plane.workspace_janitor import (
-    _JANITOR_LOCK_CLASSID,
     _SCRATCH_MAX_AGE_S,
     JanitorRunStats,
     WorkspaceJanitorWorker,
@@ -102,7 +102,7 @@ async def test_lock_loser_skips_cycle(tmp_path: Path) -> None:
     got = (
         await holder.execute(
             text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-            {"cid": _JANITOR_LOCK_CLASSID, "k": "workspace_janitor"},
+            {"cid": WORKSPACE_JANITOR_LOCK_CLASSID, "k": "workspace_janitor"},
         )
     ).scalar_one()
     assert got, "test setup: holder must win the lock first"

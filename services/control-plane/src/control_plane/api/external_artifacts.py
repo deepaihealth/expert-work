@@ -282,7 +282,7 @@ def build_external_artifacts_router() -> APIRouter:
             )
         # MIME 推断 + XSS 安全 disposition:可执行内容(HTML / SVG 等)一律
         # attachment,未识别扩展名回退 application/octet-stream + attachment。
-        inferred = infer_content_type(kind=artifact.kind, path=version.path_in_workspace)
+        inferred = infer_content_type(path=version.path_in_workspace)
         headers = {
             "Content-Disposition": content_disposition_header(
                 artifact.name, disposition=inferred.disposition

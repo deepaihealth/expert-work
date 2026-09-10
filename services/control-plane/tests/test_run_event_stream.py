@@ -39,7 +39,7 @@ import pytest
 from httpx import AsyncClient
 
 import control_plane.api.runs as runs_module
-from control_plane.api._run_event_stream import build_event_producer
+from control_plane.api._run_event_stream import EVENT_PAGE_LIMIT, build_event_producer
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunEventStore,
@@ -1179,3 +1179,14 @@ async def test_make_run_probe_reads_row_and_survives_vanish() -> None:
     vanished = _FakeRunStore(None)
     probe2 = make_run_probe(runs=vanished, run_id=run_id, tenant_id=tenant_id)  # type: ignore[arg-type]
     assert await probe2() == (RunStatus.INTERRUPTED, None)
+
+
+def test_event_page_limit_stays_within_the_store_clamp() -> None:
+    """B-17 ② —— 事件流的页大小不得超过 ``RunEventStore.list`` 的夹取上限。
+
+    补库循环拿「读回来的行数 < ``EVENT_PAGE_LIMIT``」当「这是最后一页」的信号。
+    页大小一旦大过 store 的 ``MAX_LIST_LIMIT``,store 会把 limit 夹小,循环就在
+    第一页误判收尾,把后面的事件静默丢掉。名字解耦之后这两个数可以各自变动,
+    所以这条关系必须有人看着。
+    """
+    assert EVENT_PAGE_LIMIT <= MAX_LIST_LIMIT

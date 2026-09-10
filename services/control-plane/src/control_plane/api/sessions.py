@@ -559,7 +559,7 @@ def build_sessions_router() -> APIRouter:
             logger.warning("session_workspace.read_failed", exc_info=True)
             raise HTTPException(status_code=404, detail="file not found") from exc
         filename = PurePosixPath(safe_path).name or "download"
-        inferred = infer_content_type(kind="other", path=safe_path)
+        inferred = infer_content_type(path=safe_path)
         headers = {
             "Content-Disposition": content_disposition_header(
                 filename, disposition=inferred.disposition
@@ -687,7 +687,7 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="artifact content not found") from exc
         # Path-based MIME + XSS-safe disposition (active content → attachment),
         # same as the workspace-file download; filename is the logical name.
-        inferred = infer_content_type(kind="other", path=version.path_in_workspace)
+        inferred = infer_content_type(path=version.path_in_workspace)
         headers = {
             "Content-Disposition": content_disposition_header(
                 name, disposition=inferred.disposition

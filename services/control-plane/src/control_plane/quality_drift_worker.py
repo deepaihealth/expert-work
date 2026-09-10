@@ -31,6 +31,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import QUALITY_DRIFT_LOCK_CLASSID
 from control_plane.platform_quality_config import (
     EffectiveQualityConfig,
     PlatformQualityConfigService,
@@ -51,10 +52,6 @@ logger = logging.getLogger("expert_work.control_plane.quality_drift")
 #: Default cadence — drift is a slow signal; an hourly check is ample.
 _DEFAULT_INTERVAL_S = 3600.0
 
-#: Advisory-lock classid for the single-flight drift cycle. Distinct from
-#: PgWorkspaceLock's classid so the two never share a key. Uses the two-arg
-#: ``(int4, int4)`` space (separate from the one-arg ``bigint`` space).
-_DRIFT_LOCK_CLASSID = 8615
 #: The lock txn is held open for the whole cycle; keep it off any idle reaper.
 _LOCK_TXN_TIMEOUT_MS = 5 * 60 * 1000
 
@@ -190,7 +187,7 @@ class QualityDriftWorker:
             got = (
                 await lock_session.execute(
                     text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-                    {"cid": _DRIFT_LOCK_CLASSID, "k": "quality_drift"},
+                    {"cid": QUALITY_DRIFT_LOCK_CLASSID, "k": "quality_drift"},
                 )
             ).scalar_one()
             if not got:
