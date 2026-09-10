@@ -327,6 +327,70 @@ async def test_decide_idempotency_key_body_field_with_nul_is_422(ctx: _Ctx) -> N
 
 
 @pytest.mark.asyncio
+async def test_edit_input_with_nul_is_422(ctx: _Ctx) -> None:
+    """P-1 —— ``:edit`` 的 ``input`` / ``untrusted_content`` / ``inputs`` 是三个
+    **新的**外部字段,和 ``POST …/runs`` 的同名字段落进同一列
+    (``agent_run.enqueued_input``,jsonb),所以各自都得自己挂
+    ``field_validator``:守卫是按字段挂的,不会因为「另一个端点的同名字段守过」
+    而自动生效。
+
+    与路径参数那一族(``test_external_path_param_nul_guard.py``)是两条不同的
+    路:那边守的是 URL 里 percent-encode 过的 ``%00``,这边守的是请求体里真正的
+    ``\\x00``。字段校验在 handler 查 run 之前就跑,所以 ``run_id`` 指不指向真实
+    的一轮都是同一个 422。
+    """
+    await ctx.seed_agent()
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{uuid4()}:edit",
+        json={"user_id": "cust-77", "input": "hi\x00there"},
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp, code="INVALID_REQUEST")
+
+
+@pytest.mark.asyncio
+async def test_edit_untrusted_content_with_nul_is_422(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{uuid4()}:edit",
+        json={
+            "user_id": "cust-77",
+            "input": "hi",
+            "untrusted_content": ["clean block", "dirty\x00block"],
+        },
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp, code="INVALID_REQUEST")
+
+
+@pytest.mark.asyncio
+async def test_edit_inputs_key_and_value_with_nul_are_422(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    for inputs in ({"lang": "en\x00us"}, {"la\x00ng": "en"}):
+        resp = await ctx.client.post(
+            f"/v1/agents/support-bot/runs/{uuid4()}:edit",
+            json={"user_id": "cust-77", "input": "hi", "inputs": inputs},
+            headers=ctx.headers,
+        )
+        _assert_envelope_422(resp, code="INVALID_REQUEST")
+
+
+@pytest.mark.asyncio
+async def test_regenerate_idempotency_key_header_with_nul_is_422(ctx: _Ctx) -> None:
+    """``Idempotency-Key`` 是 header 不是 pydantic 字段,没有 ``field_validator``
+    可挂 —— ``:regenerate`` / ``:edit`` 的处理函数必须像 ``POST …/runs`` 那样自己
+    调一次 ``reject_nul``,否则这个 key 会带着 NUL 进 ``agent_run.idempotency_key``。
+    """
+    await ctx.seed_agent()
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{uuid4()}:regenerate",
+        json={"user_id": "cust-77"},
+        headers={**ctx.headers, "Idempotency-Key": "key-\x00-1"},
+    )
+    _assert_envelope_422(resp, code="INVALID_IDEMPOTENCY_KEY")
+
+
+@pytest.mark.asyncio
 async def test_disable_reason_with_nul_is_422(ctx: _Ctx) -> None:
     """Bonus finding, not in the original field list. ``reason`` lands in
     ``agent_disable.reason`` (``Text``) verbatim, so a NUL byte reaches the
