@@ -53,9 +53,15 @@
 | `feedback_run_id` | `UUID NULL` | 哪一轮被踩 | §5 |
 | `feedback_comment` | `TEXT NULL` | 用户原话 | §5 |
 | `feedback_changed_at` | `TIMESTAMPTZ NULL` | 👎→👍 改票时间;NULL = 没改过 | §5「改票:候选行加 `feedback_changed_at`」 |
-| `feedback_source` | `TEXT NULL` | 这一踩是谁打的:`console` = 员工、`external` = 终端用户;**NULL = worker 兜底建的候选**,归因不到某一条 feedback。CHECK `feedback_source IS NULL OR feedback_source IN ('console','external')` | §6(2026-09-09 拍板)「凡是人看的地方显示来源」 |
+| `feedback_source` | `TEXT NULL` | 这一踩是谁打的:`console` = 员工、`external` = 终端用户;**NULL = 这条候选没有采纳任何一条 👎**(`failed_outcome` / `implicit_success` / `positive_feedback` 这几类),此时 `feedback_run_id` / `feedback_comment` 也一并为空。CHECK `feedback_source IS NULL OR feedback_source IN ('console','external')` | §6(2026-09-09 拍板)「凡是人看的地方显示来源」 |
 
 四列**同进同出,都在 `0152` 一次加完**:它们是同一形状的东西(把那条 feedback 的快照 denormalize 到候选行上),拆成多次迁移会让这组列分散在不同版本里。其中 `feedback_source` 的**消费方**在 PR4(候选行显示来源),但列本身仍由 0152 建 —— 在 PR4 合入前它是一列没人写也没人读的空列,这是预期状态。
+
+> **勘误(2026-09-10 拍板,PR4 之后补)。** 本节原写「NULL = worker 兜底建的候选,归因不到某一条 feedback」,**理由不成立**:`curation_worker` 建候选时本来就从它采纳的那条 👎(`newest_down`)取了 `feedback_run_id` 与 `feedback_comment`,同一处当然也拿得到 `source`。照原文实现的后果是 worker 建的负例候选「有原话、有被踩的轮,却没有来源标签」,前端那个来源 Tag 在这批候选上恒空。
+>
+> 实际行为改为:**四列同源同去留** —— 只要这条候选采纳了某条 👎(worker 的建行与升级两条路径、以及 §5 的同步进池路径),来源就跟那条 👎 自己的 `source` 走;没有采纳任何 👎 时四列一起为空。`NULL` 从此只剩「这条候选不是由某条 👎 定的」这一个含义,不再兼指「是 worker 建的」。
+>
+> **历史行不迁移**:0152 之后、本次修复之前由 worker 建的负例候选,这一列仍是 `NULL`。展示面按「空就不渲染标签」处理(不是渲染成空标签),所以这批行读起来是「没记来源」,不会变成一个说谎的标签。
 
 ## 4. 对外 API
 

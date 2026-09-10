@@ -116,9 +116,10 @@ class CurationCandidateRecord(BaseModel):
     #: P-2 — 👎→👍 改票时间;None = 没改过(升级为 negative_feedback 时清空)。
     feedback_changed_at: datetime | None = None
     #: PR4 — 这一踩是谁打的:``console`` = 员工(控制台),``external`` = 终端
-    #: 用户(对接方应用)。None = worker 兜底建的候选,归因不到具体某一条
-    #: feedback。**展示面要区分来源,判断面不区分**(spec §6:四个下游消费者
-    #: 一律不按来源过滤)。
+    #: 用户(对接方应用)。None = 这条候选没有采纳任何一条 👎(此时上面两格也
+    #: 一并为空)—— 与 ``feedback_run_id`` / ``feedback_comment`` 同源同去留。
+    #: **展示面要区分来源,判断面不区分**(spec §6:四个下游消费者一律不按来源
+    #: 过滤)。
     feedback_source: FeedbackSource | None = None
 
     @model_validator(mode="after")

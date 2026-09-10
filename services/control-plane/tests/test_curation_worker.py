@@ -111,14 +111,18 @@ class _Fixture:
         rating: str,
         run_id: UUID | None = None,
         comment: str | None = None,
-    ) -> None:
-        await self.feedback.insert(
+        source: str = "console",
+    ) -> FeedbackRecord:
+        """Returns the stored row so a test can assert against **its own**
+        ``source`` instead of re-stating a literal."""
+        return await self.feedback.insert(
             FeedbackRecord(
                 tenant_id=tenant_id,
                 thread_id=thread_id,
                 run_id=run_id,
                 rating=rating,
                 comment=comment,
+                source=source,
                 actor_id="user@example.com",
             )
         )
@@ -367,6 +371,76 @@ async def test_negative_candidate_carries_run_and_comment() -> None:
     assert await fx.worker.run_once() == 1
     rows = await fx.candidates.list_for_review(tenant_id=tenant)
     assert rows[0].feedback_run_id == run and rows[0].feedback_comment == "太慢"
+
+
+@pytest.mark.asyncio
+async def test_worker_built_negative_candidate_carries_the_rating_source() -> None:
+    """worker 兜底建的负例候选也带来源 —— 取自它**采纳的那条 👎** 自己。
+
+    此前这里恒 NULL,于是这批候选在审阅列表上「有原话、有被踩的轮,却没有来源
+    标签」。理由(「按 thread 聚合归因不到某一条 feedback」)不成立:同一处的
+    ``feedback_run_id`` / ``feedback_comment`` 本来就取自 ``newest_down``。
+
+    断言比对的是那条 feedback 行自己的 ``source``,不是写死的字面量;种子用
+    ``external``(非默认值),所以「默认值恰好蒙对」通不过这一条。
+    """
+    fx = _Fixture()
+    tenant, thread, run = uuid4(), uuid4(), uuid4()
+    await fx.seed_thread(tenant_id=tenant, thread_id=thread)
+    await fx.seed_trajectory(tenant_id=tenant, thread_id=thread, outcome="success")
+    seeded = await fx.seed_feedback(
+        tenant_id=tenant,
+        thread_id=thread,
+        rating="down",
+        run_id=run,
+        comment="太慢",
+        source="external",
+    )
+    assert await fx.worker.run_once() == 1
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert rows[0].signal == "negative_feedback"
+    assert rows[0].feedback_source == seeded.source
+
+
+@pytest.mark.asyncio
+async def test_worker_upgrade_carries_the_rating_source() -> None:
+    """升级路径同理:它手上也握着那条 ``newest_down``。"""
+    fx = _Fixture()
+    tenant, thread, run = uuid4(), uuid4(), uuid4()
+    await fx.seed_thread(tenant_id=tenant, thread_id=thread)
+    await fx.seed_trajectory(tenant_id=tenant, thread_id=thread, outcome="failed")
+    assert await fx.worker.run_once() == 1  # failed_outcome,还没有 👎 → 无来源
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert rows[0].feedback_source is None
+    seeded = await fx.seed_feedback(
+        tenant_id=tenant,
+        thread_id=thread,
+        rating="down",
+        run_id=run,
+        comment="错了",
+        source="external",
+    )
+    assert await fx.worker.run_once() == 1  # 升级
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert rows[0].signal == "negative_feedback"
+    assert rows[0].feedback_source == seeded.source
+
+
+@pytest.mark.asyncio
+async def test_candidate_without_any_down_keeps_a_null_source() -> None:
+    """阴性对照:真正归因不到某一条 👎 的候选,来源仍然是 NULL。
+
+    这是 ``NULL`` 剩下的唯一含义 —— 别为了「让那一列别空着」给它塞默认值。
+    """
+    fx = _Fixture(with_run_store=True)
+    tenant, thread = uuid4(), uuid4()
+    await fx.seed_thread(tenant_id=tenant, thread_id=thread)
+    await fx.seed_trajectory(tenant_id=tenant, thread_id=thread, outcome="failed")
+    assert await fx.worker.run_once() == 1
+    rows = await fx.candidates.list_for_review(tenant_id=tenant)
+    assert rows[0].signal == "failed_outcome"
+    assert rows[0].feedback_source is None
+    assert rows[0].feedback_run_id is None and rows[0].feedback_comment is None
 
 
 @pytest.mark.asyncio

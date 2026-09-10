@@ -47,7 +47,7 @@ export interface CurationCandidate {
   feedback_comment: string | null;
   feedback_changed_at: string | null;
   /** PR4 — 这一踩是谁打的:``console`` 员工 / ``external`` 终端用户;
-   *  ``null`` = worker 兜底建的候选,归因不到某一条 feedback。 */
+   *  ``null`` = 这条候选没有采纳任何一条 👎(上面两格也一并为空)。 */
   feedback_source: "console" | "external" | null;
 }
 
