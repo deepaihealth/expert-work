@@ -15,7 +15,7 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
@@ -365,6 +365,109 @@ def _safe_document_name_or_422(name: str) -> str:
             },
         )
     return cleaned
+
+
+async def resolve_external_files(
+    *,
+    files: Sequence[ExternalFileRef],
+    tenant_id: UUID,
+    end_user_id: UUID,
+    thread_id: UUID,
+    uploads_store: UserUploadStore,
+) -> tuple[list[str], list[str]]:
+    """``files[]`` → 内部 ``(image_refs, document_names)``(对外附件模型统一)。
+
+    对外附件模型统一(spec 2026-08-17,Task 3)—— ``files[]`` 的每一条只带一个
+    ``upload_id``,按 :class:`UserUploadStore` 查表分流成内部 ``image_refs`` /
+    ``document_names``。格式不对 → 422 ``INVALID_UPLOAD_ID``;查不到 / 不属于这个
+    ``end_user_id`` / 已软删 → 统一 404 ``UPLOAD_NOT_FOUND``(不透露存在与否,与既
+    有 ``SESSION_NOT_FOUND`` / ``RUN_NOT_FOUND`` 同一模式);image 行还必须绑定本次
+    会话的 ``thread_id``(既有 ADR-0004 规则,原来由 ``_validate_image_refs`` 在
+    ``spawn_run`` 内部对 URI 里编码的 thread 做,这里对登记表里的 ``thread_id``
+    提前做同一件事,给出更精确的错误码);document 行的 ``ref`` 经
+    ``_safe_document_name_or_422`` 净化(防御纵深 —— 上传时已净化过一次,run 是独立
+    请求,不信任登记表之外的输入路径)。
+
+    图片条数上限在这里预检:``RunRequest`` 是手工构造的(不走 FastAPI 的请求体校验
+    路径),超了不会变成 ``RequestValidationError`` → 422,而是裸
+    ``pydantic.ValidationError`` = 500。``files[]`` 自己的 ``max_length`` 今天正好等于
+    ``MAX_RUN_IMAGE_REFS``,这条预检是那个绑定将来漂移时的兜底。
+
+    P-1:从 ``run_agent_for_user`` 抽出,``:edit`` 端点复用同一份查表分流;语义一字
+    不改。抛 :class:`ExternalScopeError` 或 :class:`HTTPException`,由端点各自渲染成
+    对外信封。
+    """
+    image_refs: list[str] = []
+    document_names: list[str] = []
+    for item in files:
+        uid = parse_upload_id(item.upload_id)
+        if uid is None:
+            raise ExternalScopeError(
+                "INVALID_UPLOAD_ID",
+                "upload_id must be the value returned by POST "
+                "/v1/agents/{agent_code}/uploads",
+                422,
+            )
+        row = await uploads_store.get(upload_id=uid, tenant_id=tenant_id)
+        if row is None or row.user_id != end_user_id or row.deleted_at is not None:
+            raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
+        if row.kind == "image":
+            if row.thread_id != thread_id:
+                raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
+            image_refs.append(row.ref)
+        else:
+            document_names.append(_safe_document_name_or_422(row.ref))
+    if len(image_refs) > MAX_RUN_IMAGE_REFS:
+        raise ExternalScopeError(
+            "TOO_MANY_IMAGE_REFS",
+            f"files[] 里的图片不能超过 {MAX_RUN_IMAGE_REFS} 张",
+            422,
+        )
+    return image_refs, document_names
+
+
+def external_run_bounds_error(
+    *, untrusted_content: Sequence[str], inputs: Mapping[str, Any]
+) -> JSONResponse | None:
+    """手工构造 ``RunRequest`` 之前的上限预检;超限返回 422 信封,否则 ``None``。
+
+    P2-a 安全修复(Critical)—— 同一根因:内部 ``RunRequest``
+    (``_bound_untrusted_blocks`` / ``_bound_inputs``,``runs.py``)的上限在手工构造
+    时不会变成 ``RequestValidationError`` → 422,而是裸 ``pydantic.ValidationError``
+    = 500。文档站主动推荐 ``untrusted_content`` 装一封邮件正文 / 一段工单描述,8KB
+    是日常量级,第三方按文档使用就会撞上这个洞,必须在构造之前拦下来。
+
+    ``inputs`` 的三条(键数 / 单值字符数 / 序列化后总字节数 —— 第三条是对外平面专有,
+    P2-a 安全修复 Important,单值长度检查只认 ``str``,包一层 list/dict 就绕过)与
+    ``RunRequest._bound_inputs`` 共用 ``check_run_inputs_bound``,只有错误码与中文
+    文案是端点这一侧的。``validate_prompt_inputs``(在 ``spawn_run`` 内部)管的是
+    未声明键 / 必填缺失,不是这里这几条上限。
+
+    P-1:从 ``run_agent_for_user`` 抽出,``:edit`` 端点复用;语义一字不改。
+    """
+    for idx, block in enumerate(untrusted_content):
+        if len(block) > MAX_UNTRUSTED_CONTENT_BLOCK_CHARS:
+            return _envelope_error(
+                "UNTRUSTED_CONTENT_BLOCK_TOO_LONG",
+                f"untrusted_content[{idx}] 超过 {MAX_UNTRUSTED_CONTENT_BLOCK_CHARS} 字符",
+                422,
+            )
+    violation = check_run_inputs_bound(dict(inputs), check_total_bytes=True)
+    if violation is None:
+        return None
+    if violation.kind == "too_many_keys":
+        return _envelope_error("TOO_MANY_INPUT_KEYS", f"inputs 最多 {MAX_RUN_INPUT_KEYS} 个键", 422)
+    if violation.kind == "value_too_long":
+        return _envelope_error(
+            "INPUT_VALUE_TOO_LONG",
+            f"inputs['{violation.key}'] 超过 {MAX_RUN_INPUT_VALUE_CHARS} 字符",
+            422,
+        )
+    return _envelope_error(
+        "TOO_MANY_INPUT_BYTES",
+        f"inputs 序列化后总大小不能超过 {MAX_RUN_INPUT_TOTAL_BYTES} 字节",
+        422,
+    )
 
 
 def _spec_sha256(spec_json: Mapping[str, Any]) -> str:
@@ -1528,52 +1631,18 @@ def build_agents_router() -> APIRouter:
         except AgentFactoryError as exc:
             return _envelope_error("AGENT_BUILD_FAILED", f"agent cannot be built: {exc}", 422)
 
-        # 对外附件模型统一(spec 2026-08-17,Task 3)—— files[] 的每一条只带
-        # 一个 upload_id,按 UserUploadStore 查表分流成内部 image_refs /
-        # document_names。格式不对 → 422 INVALID_UPLOAD_ID;查不到 / 不属于
-        # 这个 end_user_id / 已软删 → 统一 404 UPLOAD_NOT_FOUND(不透露存在
-        # 与否,与既有 SESSION_NOT_FOUND / RUN_NOT_FOUND 同一模式);image 行
-        # 还必须绑定本次会话的 thread_id(既有 ADR-0004 规则,原来由
-        # _validate_image_refs 在 spawn_run 内部对 URI 里编码的 thread 做,
-        # 这里对登记表里的 thread_id 提前做同一件事,给出更精确的错误码)。
-        # document 行的 ref 经 _safe_document_name_or_422 净化(防御纵深 ——
-        # 上传时已净化过一次,run 是独立请求,不信任登记表之外的输入路径)。
+        # 附件分流与上限预检的完整理由见 ``resolve_external_files`` /
+        # ``external_run_bounds_error`` 的 docstring —— 两段都被 P-1 的
+        # ``:edit`` 端点复用,所以住在模块级而不是这个函数体里。
         uploads_store: UserUploadStore = request.app.state.user_upload_store
-        image_refs: list[str] = []
-        document_names: list[str] = []
         try:
-            for item in payload.files:
-                uid = parse_upload_id(item.upload_id)
-                if uid is None:
-                    raise ExternalScopeError(
-                        "INVALID_UPLOAD_ID",
-                        "upload_id must be the value returned by POST "
-                        "/v1/agents/{agent_code}/uploads",
-                        422,
-                    )
-                row = await uploads_store.get(upload_id=uid, tenant_id=tenant_id)
-                if row is None or row.user_id != end_user_id or row.deleted_at is not None:
-                    raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
-                if row.kind == "image":
-                    if row.thread_id != thread_id:
-                        raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
-                    image_refs.append(row.ref)
-                else:
-                    document_names.append(_safe_document_name_or_422(row.ref))
-            # RunRequest is hand-constructed below (not the FastAPI request
-            # body), so a count past its own image_refs max_length never
-            # reaches the RequestValidationError → 422 path — it would raise
-            # an uncaught pydantic ValidationError (500) instead. files[]'s
-            # own max_length already ties to MAX_RUN_IMAGE_REFS today, but
-            # this pre-check is the defense-in-depth backstop if that ever
-            # drifts (same root cause as the untrusted_content / inputs
-            # pre-checks below).
-            if len(image_refs) > MAX_RUN_IMAGE_REFS:
-                raise ExternalScopeError(
-                    "TOO_MANY_IMAGE_REFS",
-                    f"files[] 里的图片不能超过 {MAX_RUN_IMAGE_REFS} 张",
-                    422,
-                )
+            image_refs, document_names = await resolve_external_files(
+                files=payload.files,
+                tenant_id=tenant_id,
+                end_user_id=end_user_id,
+                thread_id=thread_id,
+                uploads_store=uploads_store,
+            )
         except ExternalScopeError as exc:
             return _envelope_error(exc.code, exc.message, exc.status_code)
         except HTTPException as exc:
@@ -1584,52 +1653,11 @@ def build_agents_router() -> APIRouter:
                 exc.status_code,
             )
 
-        # P2-a 安全修复(Critical)—— 同一根因:内部 ``RunRequest.
-        # _bound_untrusted_blocks``(runs.py)对每块查 <= 8192 字符,超了同样
-        # 是裸 ``pydantic.ValidationError``(500)。文档站主动推荐这个字段装
-        # 一封邮件正文 / 一段工单描述,8KB 是日常量级,第三方按文档使用就会
-        # 撞上这个洞,必须在手工构造 ``RunRequest`` 之前拦下来。
-        for _idx, _block in enumerate(payload.untrusted_content):
-            if len(_block) > MAX_UNTRUSTED_CONTENT_BLOCK_CHARS:
-                return _envelope_error(
-                    "UNTRUSTED_CONTENT_BLOCK_TOO_LONG",
-                    f"untrusted_content[{_idx}] 超过 {MAX_UNTRUSTED_CONTENT_BLOCK_CHARS} 字符",
-                    422,
-                )
-
-        # RunRequest is hand-constructed below (not the FastAPI request
-        # body), so ``inputs`` past ``RunRequest._bound_inputs``'s own
-        # bounds never reaches the RequestValidationError → 422 path — it
-        # would raise an uncaught pydantic ValidationError (500) instead.
-        # Pre-check explicitly, same pattern as the ``image_refs`` check
-        # above. ``validate_prompt_inputs`` (called inside ``spawn_run``)
-        # covers unknown/missing-required keys but not these bounds.
-        #
-        # The three checks themselves (key count / per-value str length /
-        # total serialized bytes — the third is external-plane-only, P2-a
-        # security fix, Important) are shared with ``RunRequest._bound_inputs``
-        # via ``check_run_inputs_bound`` — see its docstring for the full
-        # rationale. Only the error code / Chinese message text below is
-        # local to this endpoint.
-        _inputs_violation = check_run_inputs_bound(payload.inputs, check_total_bytes=True)
-        if _inputs_violation is not None:
-            if _inputs_violation.kind == "too_many_keys":
-                return _envelope_error(
-                    "TOO_MANY_INPUT_KEYS",
-                    f"inputs 最多 {MAX_RUN_INPUT_KEYS} 个键",
-                    422,
-                )
-            if _inputs_violation.kind == "value_too_long":
-                return _envelope_error(
-                    "INPUT_VALUE_TOO_LONG",
-                    f"inputs['{_inputs_violation.key}'] 超过 {MAX_RUN_INPUT_VALUE_CHARS} 字符",
-                    422,
-                )
-            return _envelope_error(
-                "TOO_MANY_INPUT_BYTES",
-                f"inputs 序列化后总大小不能超过 {MAX_RUN_INPUT_TOTAL_BYTES} 字节",
-                422,
-            )
+        bounds = external_run_bounds_error(
+            untrusted_content=payload.untrusted_content, inputs=payload.inputs
+        )
+        if bounds is not None:
+            return bounds
 
         run_payload = RunRequest(
             input=payload.input,
