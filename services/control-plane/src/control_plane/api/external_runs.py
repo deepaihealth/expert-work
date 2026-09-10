@@ -190,6 +190,15 @@ async def _supersede_and_run(
         # 或对同一轮的不同操作,都是**不同的请求**,必须是 IDEMPOTENCY_KEY_REUSED
         # 而不是幂等命中 —— 与 ``request_digest`` 自己折进 agent_code 同理。分隔符
         # 用 NUL,它永远不可能出现在 agent_code / uuid / 操作名里面。
+        #
+        # 两个成分的可观测性不一样,别把它们当成同一件事:``run_id`` 是**独立
+        # 生效**的(变异去掉它,``test_idempotency_key_is_scoped_to_the_target_run``
+        # 立刻红);``op`` 今天**测不出来** —— ``:regenerate`` 的请求体
+        # (``extra="forbid"``、无 ``input``)与 ``:edit`` 的(``input`` 必填)
+        # 结构上不可能 dump 成同一份 JSON,body 自己就已经把两个操作分开了。
+        # 留着它是因为它是「这是哪个请求」的正确定义:哪天 ``:edit`` 的
+        # ``input`` 变成选填、或者多出第三个操作,少了它就会把两个操作合并到
+        # 同一个 key 上,而那时没有任何测试会红。
         digest = request_digest(payload, agent_code=f"{agent_code}\x00{run_id}\x00{op}")
         existing = await runs.find_by_idempotency_key(tenant_id=tenant_id, key=key)
         if existing is not None:
