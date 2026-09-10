@@ -14,6 +14,8 @@
 - 事件接口：`GET /v1/agents/{agent_code}/runs/{run_id}/events`，断线后的续传也走它，见 [3.6 断线重连](./sse-events#_3-6-断线重连与续传)
 - 产物删除：`DELETE /v1/agents/{agent_code}/artifacts`
 - 打分：`POST /v1/agents/{agent_code}/runs/{run_id}/feedback`
+- 重新生成：`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate`，用同一条输入再跑一次
+- 编辑重发：`POST /v1/agents/{agent_code}/runs/{run_id}:edit`，改掉输入再跑一次
 
 | 错误码 | HTTP 状态 | 端点 | 含义与处理 |
 |---|---|---|---|
@@ -30,7 +32,13 @@
 | [`SESSION_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 提前获取 session_id / 上传附件 / 历史消息 / 重命名会话 / 归档会话 / run 列表 | `session_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配 |
 | [`UPLOAD_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 附件下载 | 附件不存在、不属于这个 `user_id`、已被删除，或内容已被回收。核对 `upload_id` 与 `user_id`，图片还要核对 `session_id` |
 | [`WORKSPACE_FILE_FAILED`](#_8-6-404-目标不存在) | 404 | 工作区文件下载 | `user_id` 未被识别，或该路径下没有文件。核对 `user_id` 与 `path` |
-| [`RUN_NOT_FOUND`](./run-control#_4-1-取消-run) | 404 | 取消 run / 审批决策 / 事件接口 / 打分 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配，不要当作「run 尚未创建」重试 |
+| [`RUN_NOT_FOUND`](./run-control#_4-1-取消-run) | 404 | 取消 run / 审批决策 / 事件接口 / 打分 / 重新生成 / 编辑重发 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配，不要当作「run 尚未创建」重试 |
+| [`THREAD_BUSY`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 这段会话有一轮正在执行或排队。等它结束，或先取消它 |
+| [`RUN_AWAITING_APPROVAL`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 目标那一轮正等待审批决策。先做决策，再对续跑后的那一轮操作 |
+| [`RUN_ALREADY_SUPERSEDED`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 目标那一轮已经被重新生成过。改对最新的那一轮操作 |
+| [`RUN_NOT_LAST`](#_8-10-422-请求参数不合法) | 422 | 重新生成 / 编辑重发 | 目标不是这段会话的最后一轮。这两个接口只对最后一轮有效 |
+| [`RUN_INPUT_UNAVAILABLE`](#_8-10-422-请求参数不合法) | 422 | 重新生成 | 目标那一轮在开始执行前就失败了，没有可以复用的输入。改用编辑重发并给出 `input` |
+| [`RUN_BOUNDARY_UNRESOLVED`](#_8-10-422-请求参数不合法) | 422 | 重新生成 / 编辑重发 | 服务端保存的这一轮的历史记录不完整，认不出它的起止范围。换一段新会话继续，或联系我们排查 |
 | [`APPROVAL_NOT_FOUND`](./run-control#_4-2-审批决策) | 404 | 审批决策 | 这个 run 没有待审批记录。确认该 run 处于等待审批的状态 |
 | [`ARTIFACT_NOT_FOUND`](./query#_5-7-产物) | 404 | 产物下载 / 产物删除 | 产物不存在、已删除，或不属于这个 `user_id`。核对 `user_id` 与产物 `name` |
 | [`APPROVAL_CONFLICT`](./run-control#_4-2-审批决策) | 409 | 审批决策 | 这条审批已经被决定过。不要重复决策；需要取回上次结果时，带上当时用的 `idempotency_key` |
@@ -190,11 +198,15 @@
 
 ## 8.7 409 冲突
 
-两个端点会返回 409，都是标准格式。
+四个端点会返回 409，都是标准格式。
 
 **审批决策**（`POST /v1/agents/{agent_code}/runs/{run_id}:decide`）：`APPROVAL_CONFLICT` 表示这条审批已经被决定过，包括重复提交和并发提交中落败的一方，不要重复提交决策；`SESSION_NOT_BOUND` 表示这个 run 所在的会话没有绑定 Agent，联系租户管理员。两个错误码的完整触发条件见 [4.2 审批决策](./run-control#_4-2-审批决策)。
 
 **产物下载**（`GET /v1/agents/{agent_code}/artifacts/download`）：`ARTIFACT_VERSION_MISMATCH` 表示请求带的 `version` 与服务端最新版本不一致——这个名字在你的清单之后又被登记过新版本，被覆盖的旧版本内容不再保留。重试无效；改用最新版重新下载，或按业务异常处理。见 [5.7 下载产物](./query#_5-7-产物)。
+
+**重新生成与编辑重发**（`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate` 与 `…:edit`）：`THREAD_BUSY` 表示这段会话有一轮正在执行或排队，等它结束、或先用取消 run 停掉它再试；`RUN_AWAITING_APPROVAL` 表示目标那一轮正等待审批决策，先做决策（[4.2 审批决策](./run-control#_4-2-审批决策)），再对续跑后的那一轮操作；`RUN_ALREADY_SUPERSEDED` 表示目标那一轮已经被重新生成过，改对最新的那一轮操作。三个错误码原样重试都无效。
+
+这两个接口只对一段会话的最后一轮有效，目标不是最后一轮时返回 422 `RUN_NOT_LAST`。旧的那一轮不会被删除，它在历史消息与条目里仍然可以读到，只是带上了「已被取代」的标记；它已经产生的副作用不会撤销，两轮各自计费。
 
 ## 8.8 410 Agent 已被删除
 
@@ -251,7 +263,7 @@
 
 - `inputs` 的三条上限（键数量、单值长度、序列化后总字节数）互相独立，不能互相替代。把一个长字符串包进数组或对象可以绕开单值长度检查，但总字节数上限仍然会拦下它。
 - `untrusted_content` 的单块字符数上限与最多 16 项的条数上限，同样是两条互相独立的限制。
-- `INVALID_USER_ID` 不止发起对话会触发，凡是要求 `user_id` 的端点都会：提前获取 session_id、会话列表与历史消息、重命名会话、归档会话、上传附件、附件下载、工作区文件读取。取消 run、审批决策与打分是例外，空 `user_id` 在这三个端点上不会走到这条校验，而是被 `run_id` 的归属校验统一处理成 404 `RUN_NOT_FOUND`，见 [4 对话过程中的控制](./run-control)。
+- `INVALID_USER_ID` 不止发起对话会触发，凡是要求 `user_id` 的端点都会：提前获取 session_id、会话列表与历史消息、重命名会话、归档会话、上传附件、附件下载、工作区文件读取。取消 run、审批决策、打分、重新生成与编辑重发是例外，空 `user_id` 在这五个端点上不会走到这条校验，而是被 `run_id` 的归属校验统一处理成 404 `RUN_NOT_FOUND`，见 [4 对话过程中的控制](./run-control)。
 
 ### 模板变量与 Agent 的声明不匹配
 
@@ -265,7 +277,7 @@
 
 `inputs` 本身的三条上限不属于这一类，它们和上一小节一样能读到 `error.code`。模板变量的细节见 [2.7 外部内容与模板变量](./chat#_2-7-外部内容与模板变量)。
 
-### 另外三种独立的 422
+### 另外六种独立的 422
 
 Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。命中的已发布 Agent 因服务端配置问题（例如引用了不存在的模型或工具）无法构建，发起对话、以及审批决策后继续执行 run 时都可能遇到。处理方式：联系租户管理员。
 
@@ -281,6 +293,34 @@ Agent 配置构建失败：错误码为 `AGENT_BUILD_FAILED`，标准格式。�
 ```
 
 `title` 完全不传、或者传字面上的空字符串 `""`，走的是请求体字段校验（`title` 要求至少 1 个字符），返回 422 `INVALID_REQUEST`，不是这个错误码。区别在于有没有先经过服务端的空白裁剪。
+
+目标不是最后一轮：重新生成（`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate`）与编辑重发（`…:edit`）在 `run_id` 指向的那一轮不是这段会话最后一轮时返回 `RUN_NOT_LAST`，标准格式：
+
+```json [响应 422]
+{ "success": false, "data": null, "error": { "code": "RUN_NOT_LAST", "message": "only the last run of a session can be regenerated" } }
+```
+
+处理方式：原样重试无效。先用 run 列表（`GET /v1/agents/{agent_code}/runs`，带 `session_id`）取到这段会话最新的那一个 `run_id`，再对它操作。
+
+没有可以复用的输入：只有重新生成会返回 `RUN_INPUT_UNAVAILABLE`，标准格式。目标那一轮在开始执行前就失败了，服务端没有留下它当时的输入，因此无从重放：
+
+```json [响应 422]
+{ "success": false, "data": null, "error": { "code": "RUN_INPUT_UNAVAILABLE", "message": "this run left no reusable input; send :edit with a new input" } }
+```
+
+处理方式：原样重试无效。改用编辑重发，并在请求体里给出 `input`。
+
+这一轮的历史记录不完整：重新生成与编辑重发都可能返回 `RUN_BOUNDARY_UNRESOLVED`，标准格式。服务端要先认出这一轮从哪里开始、到哪里结束，才能把它标成「已被取代」；这段会话保存下来的历史记录不完整时，这个范围认不出来，两个接口都不会继续。两种情况都是这个错误码，靠 `message` 区分，处理方式相同：
+
+```json [响应 422：认不出这一轮的起点，例如中间的审批记录已被清理]
+{ "success": false, "data": null, "error": { "code": "RUN_BOUNDARY_UNRESOLVED", "message": "run boundary could not be established from checkpoint history" } }
+```
+
+```json [响应 422：认出来的范围与这段会话现有的历史对不上]
+{ "success": false, "data": null, "error": { "code": "RUN_BOUNDARY_UNRESOLVED", "message": "run boundary is outside the current history" } }
+```
+
+处理方式：原样重试无效，换一个 `run_id` 也无效——这与目标是哪一轮无关，所以它和 `RUN_NOT_LAST` 是两个不同的错误码，不要把它当成后者去查 run 列表重试。这段会话不能再用这两个接口改写，正常发起对话仍然可用；需要一段干净的历史就新开一段会话，或者带上 `session_id` 与 `run_id` 联系我们排查。
 
 ## 8.11 429 请求过于频繁或配额用尽
 

@@ -342,11 +342,15 @@ async def locate_turn(
     if bounds.oldest_source != "input":
         # 链首不是入口写入 —— 只可能是历史损坏或链没串全(例如审批单被清掉、
         # PAUSED 前驱串不回去);宁可拒绝也别乱标。
-        # TODO(Task 8):这里借用 ``RUN_NOT_LAST`` 会误导对接方 —— 目标**就是**
-        # 最后一轮,拒绝的真实原因是「这一轮的边界划不出来」。接对外端点时给它
-        # 一个独立错误码,别让调用方按「换一轮重试」去理解。
+        #
+        # 独立错误码,**不是** ``RUN_NOT_LAST``:这一支里目标就是最后一轮,
+        # ``RUN_NOT_LAST`` 教对接方「去 run 列表取最新的那个 run_id 再试」,而那
+        # 会拿回同一个 id、同一个 422,反复查列表反复重试也绕不出去。真实原因跟
+        # 「哪一轮」无关。
         raise SupersedeError(
-            "RUN_NOT_LAST", "run boundary could not be established from checkpoint history", 422
+            "RUN_BOUNDARY_UNRESOLVED",
+            "run boundary could not be established from checkpoint history",
+            422,
         )
     if bounds.oldest_parent_id is None:
         start, plan_before = 0, None
@@ -357,7 +361,12 @@ async def locate_turn(
     last = await graph.aget_state(_at(config, bounds.newest_id))
     end = len(last.values.get("messages") or [])
     if not (0 <= start <= end <= current_len):
-        raise SupersedeError("RUN_NOT_LAST", "run boundary is outside the current history", 422)
+        # 边界算出来了,却和当前历史对不上。与上面那一支同一个失败类 —— 拒绝理由
+        # 是「这一轮的区间不可用」,与「目标是不是最后一轮」无关,所以用同一个
+        # ``RUN_BOUNDARY_UNRESOLVED``,不借 ``RUN_NOT_LAST``(理由见上面那段)。
+        raise SupersedeError(
+            "RUN_BOUNDARY_UNRESOLVED", "run boundary is outside the current history", 422
+        )
     return TurnLocation(start=start, end=end, plan_before=plan_before, chain_run_ids=tuple(run_ids))
 
 

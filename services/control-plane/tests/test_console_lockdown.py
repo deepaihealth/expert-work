@@ -253,6 +253,11 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/agents/{agent_code}/runs"),
         ("GET", "/v1/agents/{agent_code}/runs"),
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:cancel"),
+        # P-1 —— 重新生成 / 编辑重发(external_runs.py),与 ``:cancel`` 同族:同一个
+        # ``APIRouter(prefix="/v1/agents", tags=["external"])``,闸是
+        # ``require("session", "write")`` 而非 ``console_only()``。
+        ("POST", "/v1/agents/{agent_code}/runs/{run_id}:regenerate"),
+        ("POST", "/v1/agents/{agent_code}/runs/{run_id}:edit"),
         ("GET", "/v1/agents/{agent_code}/runs/{run_id}/events"),
         ("GET", "/v1/agents/{agent_code}/sessions"),
         ("POST", "/v1/agents/{agent_code}/sessions"),

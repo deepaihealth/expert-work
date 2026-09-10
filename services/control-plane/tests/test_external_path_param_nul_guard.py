@@ -267,6 +267,35 @@ async def test_cancel_run_nul_agent_code_is_422(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_regenerate_run_nul_agent_code_is_422(ctx: _Ctx) -> None:
+    """P-1 —— ``:regenerate`` / ``:edit`` 挂在 ``external_runs.py`` 那个
+    ``tags=["external"]`` router 上,守卫由它的构造器一次挂给全部路由,再由
+    ``test_every_external_agents_route_carries_the_nul_path_guard`` 按 tag 自动
+    发现。这两条是同一形状的逐端点活证:静态审计只查依赖挂没挂上,查不出
+    「挂上了但请求走到别处去了」。**不要**把这两条路由登记进本文件下方的
+    ``_AGENTS_ROUTER_EXTERNAL_ROUTES`` —— 那张表只列 ``agents.py`` 自己 router 上
+    的非 external 路由,它的 live 集合(``_agents_router_own_candidate_routes``)
+    第一件事就是跳过 ``tags=["external"]``,断言又是严格相等,加进去必红。
+    """
+    resp = await ctx.client.post(
+        f"/v1/agents/support{_NUL}bot/runs/{uuid4()}:regenerate",
+        json={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp)
+
+
+@pytest.mark.asyncio
+async def test_edit_run_nul_agent_code_is_422(ctx: _Ctx) -> None:
+    resp = await ctx.client.post(
+        f"/v1/agents/support{_NUL}bot/runs/{uuid4()}:edit",
+        json={"user_id": "cust-77", "input": "x"},
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp)
+
+
+@pytest.mark.asyncio
 async def test_rate_run_nul_agent_code_is_422(ctx: _Ctx) -> None:
     """P-2 — 对外打分挂在自己的 ``tags=["external"]`` router 上,由
     ``test_every_external_agents_route_carries_the_nul_path_guard`` 按 tag
@@ -373,6 +402,26 @@ async def test_rate_run_nul_run_id_is_422(ctx: _Ctx) -> None:
     resp = await ctx.client.post(
         f"/v1/agents/support-bot/runs/run{_NUL}id/feedback",
         json={"user_id": "cust-77", "rating": "up"},
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp)
+
+
+@pytest.mark.asyncio
+async def test_regenerate_run_nul_run_id_is_422(ctx: _Ctx) -> None:
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/run{_NUL}id:regenerate",
+        json={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    _assert_envelope_422(resp)
+
+
+@pytest.mark.asyncio
+async def test_edit_run_nul_run_id_is_422(ctx: _Ctx) -> None:
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/run{_NUL}id:edit",
+        json={"user_id": "cust-77", "input": "x"},
         headers=ctx.headers,
     )
     _assert_envelope_422(resp)
