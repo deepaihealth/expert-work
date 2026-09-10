@@ -404,8 +404,7 @@ async def resolve_external_files(
         if uid is None:
             raise ExternalScopeError(
                 "INVALID_UPLOAD_ID",
-                "upload_id must be the value returned by POST "
-                "/v1/agents/{agent_code}/uploads",
+                "upload_id must be the value returned by POST /v1/agents/{agent_code}/uploads",
                 422,
             )
         row = await uploads_store.get(upload_id=uid, tenant_id=tenant_id)
