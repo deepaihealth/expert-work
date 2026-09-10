@@ -31,17 +31,6 @@ match = '"mcp>=1.28.1,<2"'
 reason = "mcp 2.x 换 httpx2 依赖、streamable_http_client 签名变更(3 元组),整条 MCP 客户端层要迁"
 roadmap = "X-11(迁移要真栈测 streamable-http + OAuth 路径)"
 
-[[pin]]
-file = "services/control-plane/pyproject.toml"
-match = '"fastapi>=0.115,<0.137"'
-reason = "fastapi 0.137 起 include_router 懒挂载,app.routes 不再摊平 APIRoute —— 路由自审(安全闸族)集体失明"
-roadmap = "X-12(迁移改用 iter_route_contexts 并变异自证)"
-
-[[pin]]
-file = "services/sandbox-supervisor/pyproject.toml"
-match = '"fastapi>=0.115,<0.137"'
-reason = "同 control-plane:0.137 懒挂载破坏路由自审"
-roadmap = "X-12"
 
 [[pin]]
 file = "services/orchestrator/pyproject.toml"
