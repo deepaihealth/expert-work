@@ -13,7 +13,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.api._authz import console_only
@@ -38,6 +37,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.route_audit import mounted_api_routes
 
 # Fixed, NOT ``uuid4()`` — these ids get interpolated into the endpoint paths
 # below, which become the ``parametrize`` ids. A fresh random value per
@@ -322,13 +322,12 @@ def _concretize(path_template: str) -> str:
 def _agents_routes(app: Any) -> set[tuple[str, str]]:
     """Every ``(method, path)`` the real app mounts under ``/v1/agents``."""
     found: set[tuple[str, str]] = set()
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or not route.path.startswith("/v1/agents"):
+    for route in mounted_api_routes(app):
+        if not route.path.startswith("/v1/agents"):
             continue
-        for method in route.methods or ():
-            if method in ("HEAD", "OPTIONS"):
-                continue
+        for method in route.verbs:
             found.add((method, route.path))
+    assert found, "no /v1/agents routes found — the enumeration is broken, not the app"
     return found
 
 
@@ -513,10 +512,8 @@ def test_every_console_route_carries_the_lockdown_dependency() -> None:
     checked_paths: list[str] = []
     seen_console_routes: set[tuple[str, str]] = set()
     missing: list[str] = []
-    for route in app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        methods = {m for m in (route.methods or ()) if m not in ("HEAD", "OPTIONS")}
+    for route in mounted_api_routes(app):
+        methods = set(route.verbs)
         # Fix wave (P1 final review, C2) — the audit is no longer purely
         # prefix-driven. ``/v1/agents`` hosts the console AND the third-party
         # plane, so its console routes are enumerated one by one in

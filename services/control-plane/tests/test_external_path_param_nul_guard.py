@@ -48,7 +48,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.api._external import reject_nul_path_params
@@ -66,6 +65,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.route_audit import MountedRoute, mounted_api_routes
 
 _SPEC: dict[str, Any] = {
     "apiVersion": "expert_work.io/v1",
@@ -496,7 +496,7 @@ def _build_audit_app() -> Any:
     )
 
 
-def _external_agents_routes(app: Any) -> list[APIRoute]:
+def _external_agents_routes(app: Any) -> list[MountedRoute]:
     """Every route tagged ``external`` — discovered from the live app, not a
     hand-maintained list, so a new route mounted on any of the seven
     ``external_*.py`` routers is picked up automatically.
@@ -510,14 +510,14 @@ def _external_agents_routes(app: Any) -> list[APIRoute]:
     precise, and dropping the prefix means any future new prefix is covered
     automatically instead of silently falling outside this audit.
     """
-    return [
-        route
-        for route in app.routes
-        if isinstance(route, APIRoute) and "external" in (route.tags or [])
-    ]
+    routes = [route for route in mounted_api_routes(app) if "external" in route.tags]
+    assert routes, "no tags=['external'] route found — the enumeration is broken, not the app"
+    return routes
 
 
-def _carries_nul_path_guard(route: APIRoute) -> bool:
+def _carries_nul_path_guard(route: MountedRoute) -> bool:
+    """Reads the COMPOSED dependency graph — router-level ``dependencies=[...]``
+    included, which is where the seven ``external_*.py`` routers put the guard."""
     return any(dep.call is reject_nul_path_params for dep in route.dependant.dependencies)
 
 
@@ -550,9 +550,7 @@ def test_every_external_agents_route_carries_the_nul_path_guard() -> None:
     # blind and must fail loudly rather than vacuously pass.
     assert external_routes, "expected at least one tags=['external'] route"
     missing = [
-        f"{sorted(m for m in (r.methods or ()) if m not in ('HEAD', 'OPTIONS'))} {r.path}"
-        for r in external_routes
-        if not _carries_nul_path_guard(r)
+        f"{sorted(r.verbs)} {r.path}" for r in external_routes if not _carries_nul_path_guard(r)
     ]
     assert not missing, f"external routes missing reject_nul_path_params: {missing}"
 
@@ -605,25 +603,24 @@ _AGENTS_ROUTER_EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
 _AGENTS_ROUTER_CANDIDATE_SHAPE = re.compile(r"^/v1/agents/\{[^{}/]+\}/[^{}/]+$")
 
 
-def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], APIRoute]:
+def _agents_router_own_candidate_routes(app: Any) -> dict[tuple[str, str], MountedRoute]:
     """Every ``(method, path)`` matching ``_AGENTS_ROUTER_CANDIDATE_SHAPE`` on
     agents.py's OWN router (excludes ``tags=["external"]`` routes — those live
     on the seven ``external_*.py`` routers, already covered by the tag-driven
     audit above). A TRUE full enumeration of the live app — see the docstring
     on ``test_agents_router_external_routes_carry_the_nul_path_guard`` for why
     this replaced the previous, table-membership-filtered construction."""
-    live: dict[tuple[str, str], APIRoute] = {}
-    for route in app.routes:
-        if not isinstance(route, APIRoute) or not route.path.startswith("/v1/agents/"):
+    live: dict[tuple[str, str], MountedRoute] = {}
+    for route in mounted_api_routes(app):
+        if not route.path.startswith("/v1/agents/"):
             continue
-        if "external" in (route.tags or []):
+        if "external" in route.tags:
             continue
         if not _AGENTS_ROUTER_CANDIDATE_SHAPE.match(route.path):
             continue
-        for method in route.methods or ():
-            if method in ("HEAD", "OPTIONS"):
-                continue
+        for method in route.verbs:
             live[(method, route.path)] = route
+    assert live, "no agents.py-owned candidate route found — the enumeration is broken"
     return live
 
 
@@ -642,7 +639,7 @@ def test_agents_router_external_routes_carry_the_nul_path_guard() -> None:
     equivalent bug in ``test_external_only_gate.py``): despite the docstring
     above already claiming ``live == table, not just table ⊆ live``, the
     ORIGINAL ``live`` here was built by keeping only routes ALREADY present
-    in ``_AGENTS_ROUTER_EXTERNAL_ROUTES`` while walking ``app.routes`` — i.e.
+    in ``_AGENTS_ROUTER_EXTERNAL_ROUTES`` while walking the live route table — i.e.
     exactly the same filtered-during-construction bug, just under a docstring
     that asserted the opposite. That makes ``set(live)`` a subset of the
     table by construction, so the "app has a route the table doesn't" branch
