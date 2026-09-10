@@ -134,9 +134,36 @@ CSI 的 `subPath` 在 create 时钉死(`agent_sandbox.py:1172-1190`),一个沙�
 
 | 层 | 内容 | 寿命 |
 |---|---|---|
-| **纯缓存** | `.tool_results/<run_id>/` | 可清。**今天完全没有清理**,实测单用户堆了 40 个 run 目录 |
+| **纯缓存** | `.tool_results/<run_id>/` | 随对话生死 + 无主宽限,与 `threads/` 同一套(见 4.2) |
 | **会话投影** | `threads/<thread_id>/` | 已随对话生死 + 无主 24h 宽限(B-27,`orphan_threads.py:36`) |
 | **agent 持久工作态** | `MEMORY.md` / `style/` / `客户案例/` / `artifacts/` / `uploads/` | **无 TTL**。它是 agent 跨轮一致性的载体,按时间删不合理(用户 09-10 拍板) |
+
+### 4.2 `.tool_results/` 今天无人清理,而注释说有
+
+`orchestrator/tools/overflow.py:44-47` 写着:
+
+```python
+#: Workspace-relative directory all overflow files live under. Lifecycle
+#: is owned by the existing workspace retention machinery (J.15 daily
+#: backup / 90-day archive) — no bespoke cleanup (Mini-ADR CM-F6).
+OVERFLOW_DIR = ".tool_results"
+```
+
+**这条注释不成立。** 留存 job 碰文件的入口只有两个 —— 按登记路径 unlink 单个文件、
+删孤儿 `threads/<uuid>/`(`retention-cleanup-job/workspace_files.py:137-177`),
+其不变式明写「根目录其它文件永不触碰」(`job.py:33-37`)。
+`.tool_results/` 没有任何登记行,不在这两条路径上;它引的「90 天归档」是
+**已删工作区**的归档(`workspace_archive_retention_days`),不是活工作区。
+实测单用户堆了 40 个 run 目录,一次都没被清过。
+
+**它也不是纯垃圾**:externalize 之后会往 `ToolMessage` 追加一条 footer 指向
+`.tool_results/<run_id>/<call_id>-<tool>.txt`(`overflow.py:7-9`),删掉即意味着
+老对话恢复不出被截断的工具输出。所以不能按时间一刀切。
+
+**定案**:`.tool_results/<run_id>/` 与 `threads/<thread_id>/` 走同一套规则 ——
+会话 purge 时连同该会话的 run 目录一起删(`run_id → agent_run → thread_id` 可解),
+外加对「查无 `agent_run` 行」的孤儿目录做同样的宽限期扫描。复用 B-27 已有的机器形状,
+不新造 TTL 旋钮。同时把 `overflow.py` 那段注释改成实话。
 
 > 立项时曾提「中间文件按 TTL 清」,用户指出 `MEMORY.md` / `style/*` 是多轮一致性的保证,
 > 按时间删不成立。核实后确认:该 TTL 只对 `.tool_results/` 成立,对第三层不成立。已按此定稿。
@@ -266,7 +293,8 @@ CSI 的 `subPath` 在 create 时钉死(`agent_sandbox.py:1172-1190`),一个沙�
 
 ## 十、开放项(实施计划阶段定)
 
-- `.tool_results/` 的清理规则(纳入留存 job 哪个阶段、宽限多久)。今天零清理。
 - `agents` / `shared` 是否进 `WORKSPACE_RESERVED_PREFIXES`(决定浏览面可见性)。
-- 迁移是在线搬还是停机搬;失败回滚姿势。
+- 迁移期的过渡读回落:工具先读 `agents/<agent_key>/`,读不到时回落用户根,
+  搬完再摘掉回落。这样滚动发布窗口里新旧 pod 都能读到文件。
+  代价:回落窗口内读串问题**仍是今天的样子**(不是新增回归,是尚未修复)。
 - `agent_key` 进 ToolContext 的传递链路(`configurable` → `_tool_context()`)具体改法。
