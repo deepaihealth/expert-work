@@ -18,7 +18,7 @@ import { useTranslation } from "react-i18next";
 
 import type { ApprovalItem } from "../../api/approvals";
 import type { RateBook } from "../../api/cost";
-import type { HistoryMessage } from "../../api/sessions";
+import type { HistoryMessage, SessionFeedbackItem } from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import { MarkdownView } from "../MarkdownView";
@@ -80,6 +80,9 @@ export interface TranscriptProps {
   /** BUG-13(修订)— 每轮取该轮产出的计划快照,透传 ``TurnBlock.plan``。
    *  Omitted → 零变化(轮内不渲染计划卡)。 */
   planOf?: (turn: ConsoleTurn) => ThreadPlan | null;
+  /** P-2 — 每轮取该轮已记录的 👍/👎,透传 ``TurnBlock.feedbackOf``。
+   *  Omitted → 零变化(轮脚不渲染反馈)。 */
+  feedbackOf?: (turn: ConsoleTurn) => readonly SessionFeedbackItem[] | undefined;
 }
 
 /** How close to the bottom (px) still counts as "hasn't scrolled up" —
@@ -116,6 +119,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     onFireResult,
     runHrefOf,
     planOf,
+    feedbackOf,
   } = props;
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -232,6 +236,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onDownloadArtifact={onDownloadArtifact}
           onFireResult={onFireResult}
           runHrefOf={runHrefOf}
+          feedbackOf={feedbackOf}
           plan={planOf ? planOf(turn) : undefined}
           rowRef={
             turn.runId !== null
@@ -266,6 +271,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onDownloadArtifact={onDownloadArtifact}
           onFireResult={onFireResult}
           runHrefOf={runHrefOf}
+          feedbackOf={feedbackOf}
           plan={planOf ? planOf(turn) : undefined}
         />
       ))}

@@ -41,7 +41,13 @@ import { cancelRun, streamRunEvents } from "../api/runs";
 import { configChangePoints } from "./conversation_detail/configChanges";
 import { reducePlan } from "../api/plan_reducer";
 import { computeSessionStats } from "../api/session_stats";
-import { getSessionMessages, type HistoryMessage, type SseEvent } from "../api/sessions";
+import {
+  getSessionFeedback,
+  getSessionMessages,
+  type HistoryMessage,
+  type SessionFeedbackItem,
+  type SseEvent,
+} from "../api/sessions";
 import type { FireNowResult } from "../api/triggers";
 import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
@@ -103,6 +109,11 @@ export function ConversationDetail() {
   // thread the messages endpoint can't scope to): hide the panel rather
   // than erroring the page. ``[]`` renders an explicit empty state.
   const [messages, setMessages] = useState<HistoryMessage[] | null>(null);
+  // P-2 — 这段会话已记录的 👍/👎,按 run 分组挂到各自那一轮的脚部。
+  // 读失败 → 空 Map(轮脚没有标记),不影响页面。
+  const [feedbackByRun, setFeedbackByRun] = useState<
+    ReadonlyMap<string, SessionFeedbackItem[]>
+  >(new Map());
 
   // D-5 — a live-attached tail run just went terminal: silently re-read the
   // summary + run list (statuses/tokens patch in below; a NEW run — someone
@@ -172,6 +183,19 @@ export function ConversationDetail() {
       setMessages(Array.isArray(msgs) ? msgs : null);
     } catch {
       setMessages(null);
+    }
+    // P-2 — 反馈同样 best-effort:读不到就没有轮脚标记,不影响页面。
+    try {
+      const items = await getSessionFeedback(threadId, loaded?.tenant_id);
+      const grouped = new Map<string, SessionFeedbackItem[]>();
+      for (const item of items) {
+        // 0152 之前的历史行没有 run_id,归不到任何一轮 —— 丢掉,别乱挂。
+        if (item.run_id === null) continue;
+        grouped.set(item.run_id, [...(grouped.get(item.run_id) ?? []), item]);
+      }
+      setFeedbackByRun(grouped);
+    } catch {
+      setFeedbackByRun(new Map());
     }
   }, [threadId, apiTenantScope]);
 
@@ -314,6 +338,13 @@ export function ConversationDetail() {
   const planOf = useCallback(
     (turn: ConsoleTurn) => reducePlan(turn.turn.events)?.plan ?? null,
     [],
+  );
+
+  // P-2 — 每轮取该轮 run 上记录的 👍/👎(``planOf`` 同款 opt-in 形状)。
+  // 还没拿到 run id 的轮 → undefined,轮脚什么都不渲染。
+  const feedbackOf = useCallback(
+    (turn: ConsoleTurn) => (turn.runId !== null ? feedbackByRun.get(turn.runId) : undefined),
+    [feedbackByRun],
   );
 
   // D-6 — operations gate: operator/admin, home tenant only (the
@@ -709,6 +740,7 @@ export function ConversationDetail() {
                     onDownloadArtifact={handleDownloadArtifact}
                     runHrefOf={runHrefOf}
                     planOf={planOf}
+                    feedbackOf={feedbackOf}
                   />
                 </ViewPane>
                 <ViewPane view="trajectory" active={view === "trajectory"}>

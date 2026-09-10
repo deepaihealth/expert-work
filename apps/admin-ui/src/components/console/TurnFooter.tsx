@@ -18,11 +18,13 @@ import { Download, Route, RotateCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
+import type { SessionFeedbackItem } from "../../api/sessions";
 import type { TurnSummary } from "../../api/turn_summary";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { ReadonlyTooltip } from "../ReadonlyTooltip";
 import { FeedbackBar } from "../turn/FeedbackBar";
 import type { Turn } from "../turn/types";
+import { FeedbackSummary } from "./FeedbackSummary";
 import type { ConsoleTurn } from "./types";
 import "./turn_footer.css";
 
@@ -43,6 +45,10 @@ export interface TurnFooterProps {
    *  ``/runs/{threadId}/{runId}``. Omitted → the link doesn't render (the
    *  playground has no run-detail page to link to). */
   runHref?: string;
+  /** P-2 — 这一轮已记录的 👍/👎(``runHrefOf`` 同款 opt-in:不传 / 空数组
+   *  → 什么都不渲染,调试台零变化)。与 ``FeedbackBar`` 互不排斥:一个是
+   *  「已经打过的分」,一个是「现在去打分」。 */
+  feedback?: readonly SessionFeedbackItem[];
 }
 
 const STATUS_TAG_COLOR: Record<Turn["status"], string> = {
@@ -65,6 +71,7 @@ export function TurnFooter({
   exporting,
   onInspect,
   runHref,
+  feedback,
 }: TurnFooterProps) {
   const { t } = useTranslation();
   const status = turn.turn.status;
@@ -148,6 +155,9 @@ export function TurnFooter({
         </Tooltip>
       )}
       <span className="ew-turn-footer__acts">
+        {/* P-2 — 这一轮已记录的 👍/👎(只读展示)。对话详情页只有这个,调试
+            台只有下面的打分条;两者不互斥,谁传谁渲染。 */}
+        {feedback !== undefined && feedback.length > 0 && <FeedbackSummary items={feedback} />}
         {/* SE-16 — per-turn 👍/👎 quality signal. Settled, non-read-only turns
             only. Track C W2: 切入态只读——反馈是写操作,置灰 + Tooltip。 */}
         {/* 终审 F4 — interrupted turns keep the feedback bar: a run that

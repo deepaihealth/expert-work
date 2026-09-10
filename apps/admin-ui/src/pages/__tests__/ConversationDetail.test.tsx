@@ -300,6 +300,8 @@ beforeEach(() => {
   // pairing, so a test that doesn't opt in keeps today's flat transcript.
   vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([]);
   vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() => makeStream([]));
+  // P-2 — 反馈是每次 refresh 都会打的一条独立读;默认给空,单条用例自己覆盖。
+  vi.spyOn(sessionsSdk, "getSessionFeedback").mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -585,6 +587,63 @@ describe("ConversationDetail", () => {
       // (console_turns.ts buildConsoleTurns), so `playground-approval-*`
       // can never render off this page's own data regardless of readOnly;
       // ApprovalGate's own readOnly gating is TurnBlock.test.tsx's job.
+    });
+
+    it("P-2 — 把记录在案的 👎 摆在它自己那一轮的脚部", async () => {
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+      vi.spyOn(sessionsSdk, "getSessionFeedback").mockResolvedValue([
+        {
+          id: 1,
+          run_id: RUN_2,
+          rating: "down",
+          comment: "太慢",
+          item_id: null,
+          source: "external",
+          actor_id: "u",
+          created_at: null,
+          updated_at: null,
+        },
+      ]);
+
+      renderPage();
+
+      await waitFor(() => expect(screen.getAllByTestId("console-turn")).toHaveLength(2));
+      // 只有 RUN_2 那一轮挂上 —— 按 run_id 归位,不是全轮都挂。
+      const summaries = await screen.findAllByTestId("console-turn-feedback-summary");
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0]).toHaveTextContent("太慢");
+      // 本文件不钉 locale(TurnFooter.test.tsx 才钉 zh-CN),两种语言都收。
+      expect(summaries[0].textContent).toMatch(/点踩|Rated bad/);
+      expect(summaries[0].textContent).toMatch(/终端用户|end user/);
+      // 页面仍然只读:摆出来的是记录,不是可点的打分条。
+      expect(screen.queryByTestId("playground-turn-feedback")).not.toBeInTheDocument();
+    });
+
+    it("P-2 — 反馈读失败不影响页面(best-effort,轮脚只是没有标记)", async () => {
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+      vi.spyOn(sessionsSdk, "getSessionFeedback").mockRejectedValue(new Error("403"));
+
+      renderPage();
+
+      await waitFor(() => expect(screen.getAllByTestId("console-turn")).toHaveLength(2));
+      expect(screen.queryByTestId("console-turn-feedback-summary")).not.toBeInTheDocument();
+    });
+
+    it("P-2 — 反馈读带上会话自己的 tenant_id(system_admin 跨租户钻取)", async () => {
+      vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+      vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);
+      vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(TWO_RUNS);
+      const feedbackSpy = vi.spyOn(sessionsSdk, "getSessionFeedback").mockResolvedValue([]);
+
+      renderPage();
+
+      await waitFor(() =>
+        expect(feedbackSpy).toHaveBeenCalledWith(THREAD_ID, CONVO.tenant_id),
+      );
     });
 
     // Fix round 1 — a manage_task/create/success/triggerId call is the only

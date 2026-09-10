@@ -1205,6 +1205,10 @@ export interface TranslationKeys {
     no_turns: string;
     row_think: string;
     row_think_live: string;
+    feedback_up_label: string;
+    feedback_down_label: string;
+    feedback_source_external: string;
+    feedback_source_console: string;
     row_plan_update: string;
     row_plan_create: string;
     row_memory_recall: string;
@@ -4470,6 +4474,10 @@ const en: TranslationKeys = {
     no_turns: "No conversation yet — type below, or open a session on the left.",
     row_think: "Thinking",
     row_think_live: "Thinking…",
+    feedback_up_label: "Rated good",
+    feedback_down_label: "Rated bad",
+    feedback_source_external: "end user",
+    feedback_source_console: "employee",
     row_plan_update: "Plan · updated to {{n}} steps",
     row_plan_create: "Plan drafted · {{n}} steps",
     row_memory_recall: "Memory recall · {{n}}",
