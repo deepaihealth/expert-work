@@ -22,12 +22,12 @@ describe("listThreadRuns", () => {
             {
               run_id: "r1",
               status: "interrupted",
-              is_resume: false,
+              is_resume: false, superseded_by: null, regenerated_from: null,
               created_at: "2026-01-01T00:00:00Z",
               finished_at: "2026-01-01T00:00:30Z",
               error: "user_cancel",
             },
-            { run_id: "r2", status: "paused", is_resume: true, created_at: "2026-01-01T00:01:00Z" },
+            { run_id: "r2", status: "paused", is_resume: true, superseded_by: null, regenerated_from: null, created_at: "2026-01-01T00:01:00Z" },
           ],
         },
         error: null,
@@ -41,7 +41,7 @@ describe("listThreadRuns", () => {
       {
         runId: "r1",
         status: "interrupted",
-        isResume: false,
+        isResume: false, supersededBy: null, regeneratedFrom: null,
         createdAt: "2026-01-01T00:00:00Z",
         finishedAt: "2026-01-01T00:00:30Z",
         error: "user_cancel",
@@ -50,7 +50,7 @@ describe("listThreadRuns", () => {
       {
         runId: "r2",
         status: "paused",
-        isResume: true,
+        isResume: true, supersededBy: null, regeneratedFrom: null,
         createdAt: "2026-01-01T00:01:00Z",
         finishedAt: null,
         error: null,

@@ -40,7 +40,7 @@ function makeConsoleTurn(
     timing: null,
     createdAt: null,
     finishedAt: null,
-    runError: null,
+    runError: null, supersededBy: null, tombstone: false,
   };
 }
 
@@ -168,7 +168,7 @@ describe("TurnFooter", () => {
     // 值落回通用「已中断」。
     const cancelled = {
       ...makeConsoleTurn({ status: "interrupted" }),
-      runError: "user_cancel",
+      runError: "user_cancel", supersededBy: null, tombstone: false,
     };
     const { rerender } = render(
       <MemoryRouter>
