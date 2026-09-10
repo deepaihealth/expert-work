@@ -16,7 +16,7 @@ the current execution and leaves the conversation usable.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -230,12 +230,12 @@ async def _supersede_and_run(
         )
     except ExternalScopeError as exc:
         return external_error(exc)
-    end_user_id = meta.user_id
-    if end_user_id is None:
-        # J.14 之前建的 thread 没有 owner 列。``load_owned_run`` 拿它做过归属校验,
-        # 但 run 要绑一个 end-user 才能跑(长期记忆 / 工作区 / 计费都键在它上面),
-        # 所以这里只能拒 —— 且用同一个 404,不透露「这一段会话是老数据」。
-        return _envelope_error("RUN_NOT_FOUND", "run not found", 404)
+    # ``meta.user_id`` 声明成 ``UUID | None``,但走到这里必然非空:
+    # ``load_owned_session(mint=False)`` 先把 ``user_id`` 查成一个真实的
+    # ``tenant_user.id``(查不到就 404),再要求 ``meta.user_id`` 与它相等。所以这里
+    # 是 ``cast`` 而不是运行时判空 —— 判空会是一条永远走不到的死分支
+    # (``external_approvals`` 那边同样直接用 ``meta.user_id``,不判)。
+    end_user_id = cast(UUID, meta.user_id)
 
     if await state.agent_disable_service.is_disabled(tenant_id, agent_code):
         return _envelope_error("AGENT_DISABLED", f"agent {agent_code!r} is disabled", 403)
@@ -552,7 +552,6 @@ def build_external_runs_router() -> APIRouter:
         idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
     ) -> StreamingResponse | JSONResponse:
         """P-1 —— 同一输入再跑一次(旧轮标「已被取代」,agent 后续看不见它)。"""
-        del principal
         return await _supersede_and_run(
             op="regenerate",
             agent_code=agent_code,
@@ -578,7 +577,6 @@ def build_external_runs_router() -> APIRouter:
         idempotency_key: Annotated[str | None, Header(alias=IDEMPOTENCY_HEADER)] = None,
     ) -> StreamingResponse | JSONResponse:
         """P-1 —— 改输入后再跑一次(旧轮标「已被取代」)。"""
-        del principal
         return await _supersede_and_run(
             op="edit",
             agent_code=agent_code,
