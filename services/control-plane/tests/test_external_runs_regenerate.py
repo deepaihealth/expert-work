@@ -361,17 +361,20 @@ async def test_thread_busy_is_409(ctx: _Ctx) -> None:
         ("RUN_ALREADY_SUPERSEDED", 409),
         ("RUN_INPUT_UNAVAILABLE", 422),
         ("RUN_NOT_LAST", 422),
+        ("RUN_BOUNDARY_UNRESOLVED", 422),
     ],
 )
 async def test_kernel_errors_map_to_envelopes(
     ctx: _Ctx, monkeypatch: pytest.MonkeyPatch, code: str, status: int
 ) -> None:
-    """五个错误码的信封渲染 —— 端点必须把 ``SupersedeError`` 的 code / message /
+    """六个错误码的信封渲染 —— 端点必须把 ``SupersedeError`` 的 code / message /
     status_code 原样搬进对外信封,不能自己改写成别的码或别的 HTTP 状态。
 
-    内核抛这五个码的真条件里有两个(PAUSED 目标轮、检查点缺失)在内存栈里搭不
-    出来,所以这条用替身盖住渲染这一层;``THREAD_BUSY`` /
-    ``RUN_ALREADY_SUPERSEDED`` / ``RUN_NOT_LAST`` 另有走真内核的用例。
+    内核抛这六个码的真条件里有三个(PAUSED 目标轮、检查点缺失、轮边界划不出来)
+    在这套内存夹具里搭不出来,所以这条用替身盖住渲染这一层;``THREAD_BUSY`` /
+    ``RUN_ALREADY_SUPERSEDED`` / ``RUN_NOT_LAST`` 另有走真内核的用例,
+    ``RUN_BOUNDARY_UNRESOLVED`` 由 ``test_supersede_boundary_error.py`` 直接对
+    ``locate_turn`` 钉住。
     """
     await ctx.seed_agent()
     _thread_id, r1 = await _turn(ctx, text="hello")
