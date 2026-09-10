@@ -106,6 +106,7 @@ async def _run_save_basic() -> tuple[bool, str]:
         tenant_id=_TENANT,
         user_id=_USER,
         name="report.md",
+        kind="document",
         path_in_workspace="report.md",
         created_in_thread="t-1",
     )
@@ -123,6 +124,7 @@ async def _run_save_version_increment() -> tuple[bool, str]:
         tenant_id=_TENANT,
         user_id=_USER,
         name="x",
+        kind="code",
         path_in_workspace="x.py",
         created_in_thread="t",
     )
@@ -195,6 +197,7 @@ async def _run_resave_undeletes() -> tuple[bool, str]:
         tenant_id=_TENANT,
         user_id=_USER,
         name="r.md",
+        kind="document",
         path_in_workspace="v2.md",
         created_in_thread="t",
     )
