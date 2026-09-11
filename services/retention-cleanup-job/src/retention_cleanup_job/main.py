@@ -12,9 +12,11 @@ import contextlib
 import logging
 import os
 from collections.abc import Mapping
+from typing import IO
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from expert_work.common.observability import init_logging
 from expert_work.persistence import (
     DatabaseConfig,
     SqlArtifactStore,
@@ -92,9 +94,23 @@ def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessio
     return build_rls_sessionmaker(create_async_session_factory(engine))
 
 
+def configure_logging(settings: RetentionCleanupSettings, *, stream: IO[str] | None = None) -> None:
+    """B-45 —— 装平台的 JSON formatter,而不是 ``logging.basicConfig``。
+
+    Detect 信号的归因(``rls_caller`` / ``rls_caller_outer`` / ``rls_suppressed``)
+    是 ``extra=`` 结构化字段。``basicConfig`` 的默认 format 只渲染 message,这些
+    字段一个都不落盘 —— 于是「信号打了」而「归因看不见」。#1493 在另外两个进程
+    修的是同一处失效;这个 job 是三个里**唯一真部署的**(test overlay CronJob
+    已起),所以在它修好之前,今天落 Loki 的就是无归因那条。
+    """
+    init_logging(
+        service=settings.service_name, env=settings.env, level=settings.log_level, stream=stream
+    )
+
+
 async def _amain() -> None:
     settings = RetentionCleanupSettings()
-    logging.basicConfig(level=settings.log_level)
+    configure_logging(settings)
     # 连库之前先定工作区根:不合格就退出,一条 DELETE 都不发。
     workspace_root = resolve_workspace_root(settings, environ=os.environ)
 
