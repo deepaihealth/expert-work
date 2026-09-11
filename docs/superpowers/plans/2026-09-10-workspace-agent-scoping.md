@@ -1398,10 +1398,99 @@ git commit -m "feat(workspace): 对外六个 handler 按 agent 收口,工作区�
 
 **这条要在 PR4 合并前告知对接方**,不能等他们踩。Task 10 的文档要写清变更前后对照。
 
-**一个待拍板的产品问题**(不在本计划范围,但要摆出来):他们的 app 是**一个** app 同时编排两个 agent。
-「agent 之间不互读」(用户 09-10 拍板)和「他们的后端要不要一次拿到某员工的全部产物」
-**是两件事,不冲突**。如果要,给一个显式的并集入口(例如 `?scope=user`)即可;
-不给,他们发两次请求自己合并也能用,只是要改代码。**这条得问对接方,不是我们内部拍。**
+### 9.4 `?scope=user` 并集参数(**已拍板要做**)
+
+**2026-09-11:已告知对接方,确认要做并集入口。**
+
+他们的 app 是**一个** app 同时编排两个 agent、服务同一批终端用户。
+「agent 之间不互读」(09-10 拍板,治的是 agent 把别人的客户档案当成自己的事实)
+和「他们的后端要不要一次拿到某员工的全部产物」**是两件事,不冲突**。
+
+**契约**:三个列表端点加可选 query 参数 `scope`,取值 `agent`(默认)| `user`。
+
+| 端点 | `scope=agent`(默认) | `scope=user` |
+|---|---|---|
+| `GET /{code}/artifacts` | 仅该 agent | 该终端用户全部 agent 的 |
+| `GET /{code}/workspace/files` | 仅该 agent | 全部 agent,条目带归属标识 |
+
+**下载类端点不加 `scope`。** 理由:下载按 `name` / `path` / `upload_id` 取,
+放开 scope 等于让 A 的 code 取到 B 的字节,那正是本设计要挡的。
+对接方要下另一个 agent 的东西,**用那个 agent 的 code 去下** —— 列表里已经告诉他们归属了。
+
+**`scope=user` 时工作区 path 怎么给**:`path` 始终相对**它自己那个 agent** 的根
+(与 `scope=agent` 语义一致,不撞名),另用 `agent_code` 字段标明归属:
+
+```json
+{"path": "客户案例/x.md", "agent_code": "sop2-designer", "size": 1024}
+```
+
+对接方拿 `(agent_code, path)` 就能直接去下载。
+
+> **不要用 `agent_key` 做这个标识** —— 那是内部命名(带 sha256 后缀),
+> 对外只出现 `agent_code`,映射在服务端做。
+
+**`shared/` 在两种 scope 下都不对外投影**(§9.2)。
+
+- [ ] **补充测试**
+
+```python
+async def test_scope_user_returns_all_agents(client, seeded) -> None:
+    r = await client.get(
+        "/v1/agents/agent-a/artifacts", params={"user_id": EXT_UID, "scope": "user"}
+    )
+    names = {a["name"] for a in r.json()["data"]["artifacts"]}
+    assert names == {"a-only.docx", "b-only.docx", "报告.docx"}
+
+
+async def test_scope_defaults_to_agent(client, seeded) -> None:
+    # 不传 scope = 只看本 agent。默认值错了会静默把隔离整个放开。
+    r = await client.get("/v1/agents/agent-a/artifacts", params={"user_id": EXT_UID})
+    assert {a["name"] for a in r.json()["data"]["artifacts"]} == {"a-only.docx", "报告.docx"}
+
+
+async def test_scope_user_files_carry_agent_code_not_agent_key(client, seeded) -> None:
+    # 归属标识对外只能是 agent_code —— agent_key 是内部命名,不许漏出去。
+    r = await client.get(
+        "/v1/agents/agent-a/workspace/files", params={"user_id": EXT_UID, "scope": "user"}
+    )
+    files = r.json()["data"]["files"]
+    assert {f["agent_code"] for f in files} == {"agent-a", "agent-b"}
+    assert not any("agent_key" in f for f in files)
+    # path 仍相对各自 agent 根,不带 agents/<key>/ 前缀
+    assert not any(f["path"].startswith("agents/") for f in files)
+
+
+async def test_scope_user_does_not_open_downloads(client, seeded) -> None:
+    # 下载端点不认 scope —— 传了也不放开跨 agent。
+    r = await client.get(
+        "/v1/agents/agent-a/artifacts/download",
+        params={"user_id": EXT_UID, "name": "b-only.docx", "scope": "user"},
+    )
+    assert r.status_code == 404
+
+
+async def test_scope_user_still_excludes_shared(client, seeded) -> None:
+    r = await client.get(
+        "/v1/agents/agent-a/workspace/files", params={"user_id": EXT_UID, "scope": "user"}
+    )
+    assert not any("MEMORY.md" in f["path"] for f in r.json()["data"]["files"])
+
+
+async def test_invalid_scope_is_422(client) -> None:
+    r = await client.get(
+        "/v1/agents/agent-a/artifacts", params={"user_id": EXT_UID, "scope": "tenant"}
+    )
+    assert r.status_code == 422
+```
+
+- [ ] **补充变异自证**
+
+| 变异 | 必须红 |
+|---|---|
+| `scope` 默认值改成 `user` | `test_scope_defaults_to_agent` |
+| 下载端点也读 `scope` 并放开 | `test_scope_user_does_not_open_downloads` |
+| 条目里回 `agent_key` 而不是 `agent_code` | `test_scope_user_files_carry_agent_code_not_agent_key` |
+| `scope=user` 时把 `shared/` 也投影出去 | `test_scope_user_still_excludes_shared` |
 
 ---
 
@@ -1420,7 +1509,10 @@ git commit -m "feat(workspace): 对外六个 handler 按 agent 收口,工作区�
   **明说这一点**,否则对接方看到「工作区分层」会以为要改;
   ③ 上传归属:经哪个 agent 的会话传的就归哪个;
   ④ **跨 agent 的下载/删除返回 404,且与「不存在」不可区分** —— 这条最要紧,
-  他们排查时分不出来,文档里必须明写这是有意的收窄
+  他们排查时分不出来,文档里必须明写这是有意的收窄;
+  ⑤ **`?scope=user` 并集参数**(§9.4):三个列表端点支持、默认 `agent`;
+  下载端点**不支持**,要下别的 agent 的东西就用那个 agent 的 code;
+  `scope=user` 的条目带 `agent_code` 字段标明归属
 - [ ] **Step 3:** 跑 docs-site 构建 + 死链脚本,确认零死链;侧栏若新增小节要登记
   (既有教训:`examples.md` 侧栏漏登记过)
 - [ ] **Step 4: 提交** —— **Task 9+10 合成 PR4**
