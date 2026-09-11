@@ -46,7 +46,7 @@
 
 ---
 
-## Task 1: `agent_key` 进 `ToolContext`
+## Task 1: `agent_key` 进 `ToolContext` —— ✅ 已交付(#1507)
 
 **Files:**
 - Modify: `services/orchestrator/src/orchestrator/tools/registry.py:173-275`
@@ -137,7 +137,39 @@ git commit -m "feat(workspace): ToolContext 带上 agent_key —— 工作区分
 
 ---
 
-## Task 2: 四个 `configurable` 写入点都塞 `agent_key`
+## Task 2: `configurable` 写入点都塞 `agent_key` —— ✅ 已交付(#1507)
+
+> ### ⚠️ 勘误(09-11,实施时实测)—— 本节原文写的「四个入口」是错的
+>
+> 实测是**九个**「起 agent 图」的调用点、**七个** `configurable` 构造点,
+> 而且原文登记的四个里**三个函数名也是错的**:
+> `_run_one` / `trigger_run` / `_revive` 实际叫 `_execute` / `spawn_run` / `_respawn`。
+>
+> **实际的七个构造点**(以 `test_agent_key_plumbing.py` 的登记表为准,不要再照下方原文):
+>
+> | 构造点 | 取值 | 漏了会怎样 |
+> |---|---|---|
+> | `control-plane/run_queue_worker.py::_execute` | `record.spec.metadata.name` | 队列路径全落用户根 |
+> | `control-plane/api/runs.py::spawn_run` | `record_spec.metadata.name` | SSE 建 run 全落用户根 |
+> | `control-plane/api/runs.py::resolve_approval_decision` | `spec_record.spec.metadata.name` | **审批续跑后半程**写用户根、前半程写 agent 子树,同一轮活分两处 |
+> | `control-plane/trigger_firing.py::fire_trigger` | `record.spec.metadata.name` | 触发器路径全落用户根 |
+> | `control-plane/orphan_sweep.py::_respawn` | `record.spec.metadata.name` | 孤儿复活后半程落用户根 |
+> | `control-plane/skill_evolution_wiring.py::_make_replay_config_factory` | `candidate.agent_name` | replay 跑完整 agent 图且带**真实** tenant/user,看不见被 replay 那个 agent 自己的文件,held-out 判定失真 |
+> | `orchestrator/tools/_child_run.py::_child_config` | **透传** `ctx.agent_key` | 委派子代干的是父 agent 的活,产物不落父子树 = 父读不到自己 worker 刚写的文件 |
+>
+> **两处确认不需要**:`control-plane/eval_engine_live.py::_run`(内联 spec,连 `tenant_id` 都不给)、
+> `orchestrator/sse.py::run_agent`(merge 点不是构造点,`**` 展开时 `agent_key` 原样穿过;
+> `RunRecord` 里也没有 agent 身份)。
+>
+> **本节下方的原始步骤(测试代码、四处实现片段)按上表理解,不要照抄。**
+> 实际落地的测试是三条 AST 不变式(清单穷举 / 每处都填 / 现算必调 `sanitize_agent_key` 且透传必不调),
+> 比原文的两条多一条 —— agent name 无字符集约束,未净化的值直接进路径是真汇点。
+>
+> **踩到的坑(后续 task 照着躲)**:`resolve_approval_decision` 改成读 `spec.metadata.name` 之后,
+> `test_approval_timeout_sweep.py` / `test_resume_idempotency_flow.py` 里两处
+> `SimpleNamespace(spec=SimpleNamespace())` 的桩比真实类型少一层,CI 红 9 条。
+> **改了哪个函数,就 grep 出全部触到它的测试文件再跑**,别只跑自己想到的那几个。
+
 
 **Files:**
 - Modify: `services/control-plane/src/control_plane/run_queue_worker.py:353`
@@ -1887,7 +1919,7 @@ git commit -m "feat(workspace): 保留段认 agent 容器层 + 浏览面按 agen
 
 | PR | Tasks | 上哪班车 |
 |---|---|---|
-| PR1 agent_key 地基 | 1, 2 | 零行为变更,可赶最近一班 |
+| PR1 agent_key 地基 | 1, 2 | ✅ **已合 #1507(09-11)**,零行为变更 |
 | PR2 产物按 agent 分 | 3, 4, 5 | **带迁移,单独一班** |
 | PR3 工具层分层 | 6, 7, 8 | 合后泡测试 |
 | PR4 对外端点 + 文档 | 9, 10 | **对外行为变更**,要提前告知对接方 |
