@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -310,6 +311,7 @@ async def _collect_live(
     bridge: StreamBridge,
     since_seq: int | None,
     scope: Callable[[], Any] | None = None,
+    load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
 ) -> list[tuple[str | None, str, Any]]:
     plan = await build_event_producer(
         run_id=run_id,
@@ -318,6 +320,7 @@ async def _collect_live(
         stream_bridge=bridge,
         since_seq=since_seq,
         scope=scope,
+        load_usage=load_usage,
     )
     assert plan.next_seq is None  # live 分支不截断
     return _parse_sse([chunk async for chunk in plan.producer])
@@ -458,6 +461,7 @@ async def _collect_replay(
     since_seq: int | None = None,
     run_status: RunStatus = RunStatus.SUCCESS,
     run_artifacts: list[dict[str, Any]] | None = None,
+    load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
 ) -> tuple[list[tuple[str | None, str, Any]], int | None]:
     plan = await build_event_producer(
         run_id=run_id,
@@ -467,6 +471,7 @@ async def _collect_replay(
         stream_bridge=InMemoryStreamBridge(),
         since_seq=since_seq,
         scope=None,
+        load_usage=load_usage,
     )
     return _parse_sse([chunk async for chunk in plan.producer]), plan.next_seq
 
@@ -1048,6 +1053,7 @@ async def _collect_poll(
     bridge: StreamBridge,
     probe: _ScriptedProbe,
     since_seq: int | None = None,
+    load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
 ) -> list[tuple[str | None, str, Any]]:
     plan = await build_event_producer(
         run_id=run_id,
@@ -1057,6 +1063,7 @@ async def _collect_poll(
         run_probe=probe,
         since_seq=since_seq,
         scope=None,
+        load_usage=load_usage,
     )
     assert plan.next_seq is None
     chunks = await asyncio.wait_for(_aiter_to_list(plan.producer), 10)
@@ -1190,3 +1197,178 @@ def test_event_page_limit_stays_within_the_store_clamp() -> None:
     所以这条关系必须有人看着。
     """
     assert EVENT_PAGE_LIMIT <= MAX_LIST_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# B-52 —— ``end`` 帧带按 run 的用量
+#
+# ``end_frame_data`` 有**四个**调用点,分散在两个服务里(``orchestrator.sse`` 的
+# ``sse_consumer`` 与本模块的 replay / live-join probe / live 实时三条分支)。
+# 只测其中一条是本仓库反复犯的错——「执行入口三个,规矩只写一处就漏两个」。所以
+# 这里四条各走一个分支入口,再加一条 AST 穷举钉防将来新增第五个分支时漏掉。
+# ---------------------------------------------------------------------------
+
+_USAGE_BUCKET = {
+    "provider": "glm",
+    "model": "glm-5.3",
+    "input_tokens": 100,
+    "output_tokens": 20,
+    "cache_read_tokens": 80,
+    "cache_creation_tokens": 0,
+}
+
+
+def _stub_usage_loader() -> Callable[[], Awaitable[list[dict[str, Any]] | None]]:
+    async def _load() -> list[dict[str, Any]] | None:
+        return [dict(_USAGE_BUCKET)]
+
+    return _load
+
+
+def _end_data(frames: Sequence[tuple[str | None, str, Any]]) -> Any:
+    ends = [data for _fid, name, data in frames if name == "end"]
+    assert ends, f"没有 end 帧:{frames}"
+    return ends[-1]
+
+
+@pytest.mark.asyncio
+async def test_replay_end_frame_carries_usage() -> None:
+    """分支 1/4 —— replay(run 已终态,从 run_event 表重放)。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0])
+
+    frames, _ = await _collect_replay(
+        run_id=run_id, store=store, load_usage=_stub_usage_loader()
+    )
+    assert _end_data(frames)["usage_by_model"] == [_USAGE_BUCKET]
+
+
+@pytest.mark.asyncio
+async def test_live_end_frame_carries_usage() -> None:
+    """分支 2/4 —— live 实时(订阅 bridge,收 bridge 自己的 end)。"""
+    run_id = uuid4()
+    bridge = InMemoryStreamBridge()
+    await bridge.publish_end(run_id, status="success")
+
+    frames = await _collect_live(
+        run_id=run_id,
+        event_store=InMemoryRunEventStore(),
+        bridge=bridge,
+        since_seq=None,
+        load_usage=_stub_usage_loader(),
+    )
+    assert _end_data(frames)["usage_by_model"] == [_USAGE_BUCKET]
+
+
+@pytest.mark.asyncio
+async def test_poll_end_frame_carries_usage(_fast_poll: None) -> None:
+    """分支 3/4 —— live-join probe(bridge 里没有该 run 的发布者,走轮询 run 行)。"""
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    probe = _ScriptedProbe([(None, RunStatus.SUCCESS, [])])
+
+    frames = await _collect_poll(
+        run_id=run_id,
+        event_store=store,
+        bridge=InMemoryStreamBridge(),  # unfed → 落到 probe 分支
+        probe=probe,
+        load_usage=_stub_usage_loader(),
+    )
+    assert _end_data(frames)["usage_by_model"] == [_USAGE_BUCKET]
+
+
+@pytest.mark.asyncio
+async def test_sse_consumer_end_frame_carries_usage() -> None:
+    """分支 4/4 —— ``sse_consumer``,**第三方的主路径**(``POST .../runs`` 的
+    ``mode:"stream"``)。这条在另一个服务里,最容易被漏掉。"""
+    from expert_work.runtime.runs import RunManager
+    from orchestrator.sse import sse_consumer
+
+    rm = RunManager()
+    record = await rm.create(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        on_disconnect=DisconnectMode.CANCEL,
+    )
+    bridge = InMemoryStreamBridge()
+    await bridge.publish_end(record.run_id, status="success")
+
+    async def _never_disconnected() -> bool:
+        return False
+
+    frames = _parse_sse(
+        [
+            chunk
+            async for chunk in sse_consumer(
+                bridge=bridge,
+                record=record,
+                run_manager=rm,
+                is_disconnected=_never_disconnected,
+                heartbeat_interval=5.0,
+                load_usage=_stub_usage_loader(),
+            )
+        ]
+    )
+    assert _end_data(frames)["usage_by_model"] == [_USAGE_BUCKET]
+
+
+@pytest.mark.asyncio
+async def test_end_frame_omits_usage_when_loader_absent() -> None:
+    """没有 loader → 字段**缺席**,不是 null 也不是 ``[]``。
+
+    缺席 = 无记录,空数组 = 确有其事的零用量 —— ``artifacts`` 立下的既有口径。
+    """
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0])
+
+    frames, _ = await _collect_replay(run_id=run_id, store=store)
+    assert "usage_by_model" not in _end_data(frames)
+
+
+@pytest.mark.asyncio
+async def test_end_frame_keeps_an_empty_usage_list() -> None:
+    """loader 返回 ``[]``(确有其事的零用量)→ 字段必须**出现**且为空数组。"""
+
+    async def _empty() -> list[dict[str, Any]] | None:
+        return []
+
+    run_id = uuid4()
+    store = InMemoryRunEventStore()
+    await _seed_rows(store, run_id, [0])
+
+    frames, _ = await _collect_replay(run_id=run_id, store=store, load_usage=_empty)
+    assert _end_data(frames)["usage_by_model"] == []
+
+
+def test_every_end_frame_data_call_site_passes_usage() -> None:
+    """AST 穷举:``end_frame_data(...)`` 的每个调用点都必须传 ``usage_by_model``。
+
+    这个函数有四个调用点,分散在两个服务里。漏一个的后果是那条流的 ``end`` 帧少
+    一个字段——**静默**,且只有走到那条分支的消费者才会发现。上面四条行为测试各钉
+    一条分支,这条钉的是「将来有人加第五个分支」。
+    """
+    import ast
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    sources = [
+        root / "services/orchestrator/src/orchestrator/sse.py",
+        root / "services/control-plane/src/control_plane/api/_run_event_stream.py",
+    ]
+    missing: list[str] = []
+    seen = 0
+    for path in sources:
+        assert path.is_file(), f"源文件不在了,这条测试的前提要重核:{path}"
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "end_frame_data"
+            ):
+                seen += 1
+                if not any(kw.arg == "usage_by_model" for kw in node.keywords):
+                    missing.append(f"{path.name}:{node.lineno}")
+    assert seen == 4, f"调用点数从 4 变成了 {seen} —— 这条测试的前提要重新核"
+    assert missing == [], f"这些 end_frame_data 调用点漏传 usage_by_model: {missing}"

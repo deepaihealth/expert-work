@@ -1522,6 +1522,10 @@ async def sse_consumer(
     heartbeat_interval: float = 15.0,
     hide_events: frozenset[str] = frozenset(),
     stream_format: str = STREAM_FORMAT_LEGACY,
+    # B-52 —— 取本 run 的用量,只在 ``end`` 帧之前调一次。``None`` = 不带这个
+    # 字段(调用方没接线)。装配与口径都在
+    # ``control_plane.api._run_usage.make_usage_loader``,这里只认这个形状。
+    load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield SSE wire frames for ``record``'s run.
 
@@ -1592,7 +1596,12 @@ async def sse_consumer(
                         yield format_sse(name, payload)
                 yield format_sse(
                     "end",
-                    end_frame_data(run_id=record.run_id, status=status, artifacts=arts),
+                    end_frame_data(
+                        run_id=record.run_id,
+                        status=status,
+                        artifacts=arts,
+                        usage_by_model=(await load_usage()) if load_usage else None,
+                    ),
                 )
                 return
 
@@ -1641,6 +1650,7 @@ def end_frame_data(
     run_id: UUID,
     status: str | None,
     artifacts: list[dict[str, Any]] | None = None,
+    usage_by_model: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """``end`` 帧的 ``data`` —— **两条 SSE 路径共用的唯一构造口**。
 
@@ -1656,6 +1666,11 @@ def end_frame_data(
     ``artifacts``(产物清单契约)—— 本 run 的产物登记快照,列表本身可为空
     (追问轮显式零交付);``None``(迁移前的历史 run 无记录)时**字段缺席**
     而不是放 null,文档口径:缺席 = 老 run 无记录,别当零交付。
+
+    ``usage_by_model``(B-52)—— 本 run 的 token 用量,按 ``(provider, model)``
+    分桶,**含整棵调用树**(worker 与父 run 共用同一个 trace)。与 ``artifacts``
+    同一口径:``None``(无记录 / 未绑 trace / 取数失败)时**字段缺席**,空列表则是
+    「确有其事的零用量」——两者不可混同。桶里恒含四档 token;``llm_calls`` 不对外。
     """
     data: dict[str, Any] = {
         "status": status if status in EXTERNAL_END_STATUSES else "error",
@@ -1663,6 +1678,8 @@ def end_frame_data(
     }
     if artifacts is not None:
         data["artifacts"] = artifacts
+    if usage_by_model is not None:
+        data["usage_by_model"] = usage_by_model
     return data
 
 

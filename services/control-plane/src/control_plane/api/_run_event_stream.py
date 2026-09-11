@@ -175,6 +175,11 @@ async def build_event_producer(
     # 产物清单从这个探针取。``None`` = 保持旧行为(恒订阅 bridge),兼容未接线
     # 的调用方;两个真实调用方(console / external)都必须传。
     run_probe: Callable[[], Awaitable[tuple[RunStatus, list[dict[str, Any]] | None]]] | None = None,
+    # B-52 —— 取本 run 的用量,三条分支的 ``end`` 帧之前各调一次。``None`` = 不带
+    # 这个字段(调用方没接线)。**统一走 loader 现查**,不像 ``artifacts`` 那样
+    # 分「行上快照 / probe 重读 / bridge 透传」三条来源:用量本就在 ``token_usage``
+    # 里、按 trace 聚合幂等,多一条取数路径只会让两条流再分叉一次。
+    load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
     since_seq: int | None,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
     hide_events: frozenset[str] = frozenset(),
@@ -300,6 +305,7 @@ async def build_event_producer(
                 run_id=run_id,
                 status=_RUN_STATUS_END_STATUS.get(run_status),
                 artifacts=run_artifacts,
+                usage_by_model=(await load_usage()) if load_usage else None,
             ),
         )
 
@@ -479,6 +485,7 @@ async def build_event_producer(
                                 run_id=run_id,
                                 status=_RUN_STATUS_END_STATUS.get(status),
                                 artifacts=live_artifacts,
+                                usage_by_model=(await load_usage()) if load_usage else None,
                             ),
                         )
                         return
@@ -507,7 +514,13 @@ async def build_event_producer(
                 status = entry.data.get("status") if isinstance(entry.data, dict) else None
                 arts = entry.data.get("artifacts") if isinstance(entry.data, dict) else None
                 yield format_sse(
-                    "end", end_frame_data(run_id=run_id, status=status, artifacts=arts)
+                    "end",
+                    end_frame_data(
+                        run_id=run_id,
+                        status=status,
+                        artifacts=arts,
+                        usage_by_model=(await load_usage()) if load_usage else None,
+                    ),
                 )
                 return
 
