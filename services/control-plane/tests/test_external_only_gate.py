@@ -80,6 +80,8 @@ _EXTERNAL_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:edit"),
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:decide"),
         ("GET", "/v1/agents/{agent_code}/runs/{run_id}/events"),
+        # B-52 —— 按 run 的用量(对账兜底;日常扣账走 end 帧)。
+        ("GET", "/v1/agents/{agent_code}/runs/{run_id}/usage"),
         ("POST", "/v1/agents/{agent_code}/uploads"),
         ("GET", "/v1/agents/{agent_code}/workspace/files"),
         ("GET", "/v1/agents/{agent_code}/workspace/file"),

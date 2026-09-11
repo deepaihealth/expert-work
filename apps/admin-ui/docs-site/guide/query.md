@@ -1022,3 +1022,74 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
 - 一段会话很长时，服务端会丢弃中段的对话内容以便继续执行。被丢弃的那几轮在这个接口里只剩 `runs` 里的一行，没有条目。这是正常返回，不是错误。
 - `tool_result` 的 `created_at` 恒为 `null`：工具结果不带产生时间。它的 `run_id` 与发起调用的那一轮一致。
 - 服务端没有配置会话历史存储时，`items` 为空数组，`runs` 仍然正常返回。客户端无法从响应上区分这种情况；大面积出现空对话时，联系租户管理员确认。
+
+## 5.9 run 用量
+
+查这次 run 消耗了多少 token，按模型分项。
+
+日常计费不必调这个接口：同一份数据已经随 [3.4 的 `end`](./sse-events#end) 事件发出，客户端在收流时就能拿到。这个接口用于事后对账、补齐没有接住 `end` 事件的记录，或者按 `run_id` 重新核对。
+
+### 请求
+
+``` [端点]
+GET /v1/agents/{agent_code}/runs/{run_id}/usage
+```
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `agent_code` | 是 | 这次 run 所属的 Agent 标识 |
+| `run_id` | 是 | 这次 run 的标识，UUID |
+| `user_id` | 是 | 发起这次 run 的终端用户，长度 1–255 字符。缺失时返回 422 `INVALID_REQUEST` |
+
+`run_id` 不属于该 `user_id` 与 `agent_code` 时返回 404 `RUN_NOT_FOUND`，不是空结果。
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `run_id` | string（UUID） | 这次 run 的标识 |
+| `run_status` | string | run 当前的状态，取值与 [5.4 run 列表](#_5-4-run-列表) 的 `status` 完全一致（八个取值）。注意它比 `end` 事件的 `status` 分得细，两处对同一次 run 给出不同字样是正常的 |
+| `usage_by_model` | array | 按 `{provider, model}` 分项的 token 消耗，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同。`[]` 表示这次 run 确实没有消耗；字段**缺席**表示没有记录，两者含义不同 |
+
+### 示例
+
+```bash [请求]
+curl "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/usage?user_id=u-123" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json [响应 200]
+{
+  "run_id": "67262572-5470-41a4-800d-592762ec679d",
+  "run_status": "success",
+  "usage_by_model": [
+    {
+      "provider": "glm",
+      "model": "glm-5.3",
+      "input_tokens": 146024,
+      "output_tokens": 2819,
+      "cache_read_tokens": 129315,
+      "cache_creation_tokens": 0
+    },
+    {
+      "provider": "kimi",
+      "model": "kimi-k3",
+      "input_tokens": 23548,
+      "output_tokens": 230,
+      "cache_read_tokens": 17916,
+      "cache_creation_tokens": 0
+    }
+  ]
+}
+```
+
+上面这次 run 的主 Agent 与它派出的子任务用了不同模型，所以是两项。
+
+### 其它规则
+
+- **已经包含子任务**。子任务与主 Agent 共用同一次 run 的计量，各项相加就是整次 run 的总量。不要再去累加 `worker` 事件里的 `usage`，那会重复计算。
+- **`input_tokens` 已经包含 `cache_read_tokens` 与 `cache_creation_tokens`**，不是与它们并列的第三项。未命中缓存的输入量是 `input_tokens - cache_read_tokens - cache_creation_tokens`。直接用 `input_tokens` 乘普通输入单价，会把已经享受缓存折扣的部分按全价计算一遍。
+- **run 没有结束也可以查**，返回的是到目前为止的量。`run_status` 还不是最终状态时，这个数还会继续增长，不要据此落账。
+- **`usage_by_model` 缺席不等于零**。缺席表示没有记录：平台升级前的历史 run、还没开始执行的 run、或者平台取数失败。确实没有消耗时返回的是空数组。
+- 平台自身的后台处理（例如质量抽样）不计入这里，只统计这次 run 的对话消耗。
+- 某个厂商没有上报用量时，对应的项不会出现，也不会用 `0` 补位。

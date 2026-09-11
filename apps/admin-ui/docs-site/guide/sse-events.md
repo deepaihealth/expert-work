@@ -710,7 +710,7 @@ data: {"worker_id":"wk-7c31","parent_worker_id":null,"parent_tool_call_id":"call
 
 id: 1755229372881-9
 event: worker
-data: {"worker_id":"wk-7c31","parent_worker_id":null,"parent_tool_call_id":"call_de58e676916d442d925bff27","label":"spawn_worker","agent_ref":"dynamic:researcher","depth":1,"kind":"end","wseq":2,"data":{"outcome":"success","iteration_used":2,"llm_call_count":2,"wall_clock_ms":14779,"usage":{"input_tokens":18432,"output_tokens":626,"total_tokens":19058,"input_token_details":{"cache_read":12288,"cache_creation":0},"output_token_details":{"reasoning":184}},"usage_by_model":[{"provider":"zhipu","model":"glm-5.3","input_tokens":18432,"output_tokens":626,"total_tokens":19058,"input_token_details":{"cache_read":12288,"cache_creation":0},"output_token_details":{"reasoning":184}}]}}
+data: {"worker_id":"wk-7c31","parent_worker_id":null,"parent_tool_call_id":"call_de58e676916d442d925bff27","label":"spawn_worker","agent_ref":"dynamic:researcher","depth":1,"kind":"end","wseq":2,"data":{"outcome":"success","iteration_used":2,"llm_call_count":2,"wall_clock_ms":14779,"usage":{"input_tokens":18432,"output_tokens":626,"total_tokens":19058,"input_token_details":{"cache_read":12288,"cache_creation":0},"output_token_details":{"reasoning":184}},"usage_by_model":[{"provider":"glm","model":"glm-5.3","input_tokens":18432,"output_tokens":626,"total_tokens":19058,"input_token_details":{"cache_read":12288,"cache_creation":0},"output_token_details":{"reasoning":184}}]}}
 ```
 
 #### 客户端怎么处理
@@ -1053,6 +1053,7 @@ HTTP 层的错误码（4xx / 5xx、限流、配额）是另一回事，见 [8 �
 | `status` | string | 这次 run 的最终状态。四个取值见下表，这是全集：平台在发这个事件之前，会把任何不在这四个取值里的内部状态强制归为 `error` |
 | `run_id` | string | 这次 run 的 id，格式是 UUID |
 | `artifacts` | array | **这次 run 登记过的产物清单**。每个元素是 `{name, kind, version, created_at}`；`[]` 表示这轮明确零交付（典型场景：助手在向用户追问信息，还没到产出环节）。字段**缺席**只发生在读平台升级前的历史 run——缺席表示「当时没有记录」，不要当成零交付。清单是登记时刻的快照：产物之后被删除或同名覆盖，不会回头改这份清单 |
+| `usage_by_model` | array | **这次 run 消耗的 token**，按 `{provider, model}` 分项，字段说明见下表。**已经包含子任务**：子任务与主 Agent 共用同一次 run 的计量，各项相加就是整次 run 的总量，不要再去累加 `worker` 事件里的 `usage`，那会重复计算。`[]` 表示这次 run 确实没有消耗；字段**缺席**表示没有记录（平台升级前的历史 run、run 尚未开始执行、或平台取数失败），不要当成零消耗。同一份数据也可以用 [5.9 run 用量](./query#_5-9-run-用量) 取回 |
 
 `artifacts` 每个元素的字段：
 
@@ -1062,6 +1063,21 @@ HTTP 层的错误码（4xx / 5xx、限流、配额）是另一回事，见 [8 �
 | `kind` | string | 内容类别，登记时由助手声明，如 `document` / `data` / `image` / `other` |
 | `version` | number | 该产物名下的版本号，从 1 起。同名重新登记会产生新版本，清单里保留的是这次 run 登记到的最新一条。下载时把它作为 `version` 参数带上可以防止拿错内容，见 5.7 |
 | `created_at` | string | 登记时刻，ISO 8601 |
+
+`usage_by_model` 每个元素的字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `provider` | string \| null | 模型厂商标识，折算费用时与 `model` 一起作为单价的查找键。`null` 只出现在平台升级前的历史记录上 |
+| `model` | string | 模型标识 |
+| `input_tokens` | number | 输入 token 总数。**已经包含 `cache_read_tokens` 与 `cache_creation_tokens`**，不是与它们并列的第三项 |
+| `output_tokens` | number | 输出 token 数 |
+| `cache_read_tokens` | number | `input_tokens` 之中命中提示词缓存的部分。多数厂商对这部分按低于普通输入的价格计费 |
+| `cache_creation_tokens` | number | `input_tokens` 之中写入提示词缓存的部分。目前只有部分厂商上报这一项，其余厂商恒为 `0` |
+
+折算费用时，未命中缓存的输入量是 `input_tokens - cache_read_tokens - cache_creation_tokens`。直接用 `input_tokens` 乘普通输入单价会把已经享受缓存折扣的部分按全价计算一遍。
+
+一次 run 跨多个模型是常见情况：主 Agent 与它派出的子任务可以用不同模型，所以要逐项按各自的 `provider` 与 `model` 查单价再相加，不能整次 run 按主 Agent 的单价折算。
 
 `status` 的四个取值：
 

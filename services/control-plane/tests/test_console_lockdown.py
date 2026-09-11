@@ -259,6 +259,8 @@ _EXTERNAL_AGENT_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:regenerate"),
         ("POST", "/v1/agents/{agent_code}/runs/{run_id}:edit"),
         ("GET", "/v1/agents/{agent_code}/runs/{run_id}/events"),
+        # B-52 —— 按 run 的用量,与 events 同族(对外只读)。
+        ("GET", "/v1/agents/{agent_code}/runs/{run_id}/usage"),
         ("GET", "/v1/agents/{agent_code}/sessions"),
         ("POST", "/v1/agents/{agent_code}/sessions"),
         ("GET", "/v1/agents/{agent_code}/sessions/{session_id}/messages"),
