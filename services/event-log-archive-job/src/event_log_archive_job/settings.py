@@ -24,6 +24,8 @@ class EventLogArchiveSettings(BaseSettings):
 
     service_name: str = "event_log_archive_job"
     log_level: str = "INFO"
+    #: B-45 —— 平台 JSON formatter 的 ``env`` 标签(control-plane 同名字段)。
+    env: Literal["dev", "staging", "prod"] = "dev"
 
     # ------------------------------------------------------------------ db
     db_dsn: str = "postgresql+asyncpg://expert_work:expert_work_dev@localhost:5432/expert_work_dev"

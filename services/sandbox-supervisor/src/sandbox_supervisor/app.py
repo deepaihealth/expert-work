@@ -13,13 +13,14 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import IO, Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from expert_work.common.observability import metrics_text
+from expert_work.common.observability import init_logging, metrics_text
 from expert_work.persistence import (
     DatabaseConfig,
     SqlAuditLogStore,
@@ -28,6 +29,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.rls import build_rls_sessionmaker
 from expert_work.runtime.audit.fallback import InMemoryAuditFallbackQueue
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.audit.redactor import DefaultSecretRedactor
@@ -67,6 +69,36 @@ from sandbox_supervisor.trace_middleware import TraceContextMiddleware
 logger = logging.getLogger(__name__)
 
 
+def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    """B-45 —— 与 control-plane / retention-cleanup-job / event-log-archive-job
+    同款:session factory 必须经过 ``build_rls_sessionmaker``,``after_begin``
+    listener 才在本进程存在。此前 supervisor 从不调它,RLS Detect 信号在这个
+    进程里根本不会出现,生产 enforce 之前也就没人知道它哪条路径会 fail-closed。
+
+    这里**只装 listener,不代替任何路径声明作用域**:supervisor 的会话形状是
+    三分的(见 PR 描述)—— 带租户的前门请求、只拿到 ``sandbox_id`` 的
+    release/destroy/exec、以及 reaper / 池补货 / 每日备份这些跨租户常驻循环。
+    逐条定作用域是 RLS 第二轮判定的事;先让信号出得来,再按信号定。
+    """
+    return build_rls_sessionmaker(create_async_session_factory(engine))
+
+
+def configure_logging(
+    settings: SandboxSupervisorSettings, *, stream: IO[str] | None = None
+) -> None:
+    """B-45 —— 装平台的 JSON formatter。
+
+    Detect 信号的归因(``rls_caller`` / ``rls_caller_outer`` / ``rls_suppressed``)
+    是 ``extra=`` 结构化字段。uvicorn 只给自己的 ``uvicorn.*`` logger 配 handler,
+    root 上没有,``expert_work.*`` 的 WARNING 落到 ``logging.lastResort`` —— 它
+    只打 message,归因字段一个都不落盘。接上 listener 而日志渲染不出归因等于
+    没接(与 #1443 里 JSON formatter 把 ``stack_info`` 丢掉同一类失效)。
+    """
+    init_logging(
+        service=settings.service_name, env=settings.env, level=settings.log_level, stream=stream
+    )
+
+
 def get_supervisor(request: Request) -> SandboxSupervisor:
     """FastAPI dependency — the live supervisor held on ``app.state``."""
     supervisor: SandboxSupervisor = request.app.state.supervisor
@@ -98,10 +130,11 @@ def create_app(
             yield
             return
 
+        configure_logging(resolved_settings)
         engine = create_async_engine_from_config(
             DatabaseConfig(dsn=resolved_settings.db_dsn, echo_sql=resolved_settings.db_echo)
         )
-        session_factory = create_async_session_factory(engine)
+        session_factory = build_session_factory(engine)
         store = DbSandboxStore(session_factory)
         audit = AuditLogger(
             store=SqlAuditLogStore(session_factory),

@@ -21,16 +21,59 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.runtime.storage.base import ObjectStore
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _bypass_rls() -> Iterator[None]:
+    """B-45 —— 「哪些 ``(租户, 线程, 月份)`` 够老了」这一问本身是跨租户的
+    (``SELECT DISTINCT tenant_id … FROM event_log``),没有单一租户可作用到。
+
+    ``main.py`` 把 session factory 包进 ``build_rls_sessionmaker`` 之后,没有
+    tenant 上下文又没声明 bypass 的会话会被 listener 记成
+    ``rls.would_fail_closed``(Detect 信号)。这条扫描是有意跨租户的,显式声明
+    bypass 就不去占那个信号 —— 与 ``retention_cleanup_job`` 同一形状。
+    """
+    bypass = bypass_rls_var.set(True)
+    tenant = current_tenant_id_var.set(None)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(tenant)
+        bypass_rls_var.reset(bypass)
+
+
+@contextmanager
+def _tenant_scope(tenant_id: str) -> Iterator[None]:
+    """一组 ``(租户, 线程, 月份)`` 的读与删只碰这一个租户的行 —— 作用到它,不用
+    bypass。``event_log`` 带 ``FORCE ROW LEVEL SECURITY`` 的 ``tenant_id`` 策略
+    (迁移 0005),作用到本组的租户之后,enforce 之后 fetch / delete 仍然只命中
+    本组的行,不依赖连接角色恰好是 ``BYPASSRLS``。
+
+    bypass 一并按下:在 bypass 作用域里设 tenant 是无声无效的(listener 见
+    bypass 就直接返回,GUC 根本不发),那种「设了却没生效」正是这条 backlog
+    要消灭的形状。
+    """
+    tenant = current_tenant_id_var.set(UUID(tenant_id))
+    bypass = bypass_rls_var.set(False)
+    try:
+        yield
+    finally:
+        bypass_rls_var.reset(bypass)
+        current_tenant_id_var.reset(tenant)
 
 
 @dataclass(frozen=True)
@@ -69,16 +112,18 @@ class EventLogArchiveJob:
         started = time.monotonic()
         cutoff = datetime.now(UTC) - timedelta(days=self._age_days)
 
-        groups = await self._archivable_groups(cutoff)
+        with _bypass_rls():
+            groups = await self._archivable_groups(cutoff)
         objects = 0
         rows_total = 0
         for tenant_id, thread_id, month in groups:
-            rows = await self._fetch_group(thread_id, month, cutoff)
-            if not rows:
-                continue
-            key = _object_key(tenant_id, thread_id, month)
-            await self._store.put(key, _to_jsonl(rows), content_type="application/x-ndjson")
-            deleted = await self._delete_group(thread_id, month, cutoff)
+            with _tenant_scope(tenant_id):
+                rows = await self._fetch_group(thread_id, month, cutoff)
+                if not rows:
+                    continue
+                key = _object_key(tenant_id, thread_id, month)
+                await self._store.put(key, _to_jsonl(rows), content_type="application/x-ndjson")
+                deleted = await self._delete_group(thread_id, month, cutoff)
             objects += 1
             rows_total += deleted
             logger.info("event_log_archive.group key=%s rows=%d", key, deleted)
