@@ -231,7 +231,15 @@ def build_skill_evolution_router() -> APIRouter:
 
     # ------------------------------------------------ open a request (write)
 
-    @router.post("/skills/{skill_id}/promote-requests", response_model=None)
+    # B-49 —— 提名侧此前零角色闸,而审批侧(``approve`` / ``reject``)是
+    # ``manifest:write``:一个 viewer 决定不了晋升,却能不断往晋升队列里塞候选。
+    # 两侧对齐成 ``manifest:write``。SE-8 归属闸(``_require_skill_owner_scope``)
+    # 不动 —— 它管的是「能不能碰这个 skill」,不是「什么角色能提名」。
+    @router.post(
+        "/skills/{skill_id}/promote-requests",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
     async def request_promote(
         skill_id: UUID,
         body: _RequestPromoteBody,

@@ -1314,7 +1314,15 @@ def build_runs_router() -> APIRouter:
     @router.post(
         "/{thread_id}/runs",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        # B-49 —— 起一个 run 是写操作。非 ``use_draft`` 路径此前零角色闸(草稿分支
+        # 有 ``manifest:write``),viewer 在自己的会话里能真起 run。与同一动作的
+        # 其它入口对齐:``POST /v1/agents/{agent_code}/runs``、``:resume``、
+        # ``:cancel`` 都是 ``session:write``。归属闸不动。
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def trigger_run(
         thread_id: UUID,

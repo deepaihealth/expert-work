@@ -22,7 +22,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
@@ -231,7 +231,14 @@ def build_workspace_router() -> APIRouter:
             workspace_store, tenant_id=scope.tenant_id, user_id=target_user_id, path=path
         )
 
-    @router.delete("/file", response_model=None, dependencies=[Depends(console_only())])
+    # B-49 —— 删工作区文件是写,此前只有 ``console_only()`` + user-scope 闸。
+    # 与 ``DELETE /v1/sessions/{thread_id}/workspace/file`` 同档 ``session:write``;
+    # user-scope 闸(``resolve_target_user_id``)不动。
+    @router.delete(
+        "/file",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(require("session", "write"))],
+    )
     async def delete_workspace_file(
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],

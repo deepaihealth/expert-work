@@ -27,7 +27,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from control_plane.api._authz import console_only, require_key_scope
+from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._image_sanitize import ImageSanitizeError, strip_exif
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import (
@@ -470,11 +470,18 @@ def build_uploads_router() -> APIRouter:
     """
     router = APIRouter()
 
+    # B-49 —— 上传附件、删除附件都是写(都落存储),此前两条只有 ``console_only()``
+    # + 归属闸,角色轴是空的。与会话工作区其它写同档 ``session:write``;归属闸
+    # (``caller_owns_thread`` / ``resolve_caller_user_id``)不动。
     @router.post(
         "/v1/sessions/{thread_id}/uploads",
         response_model=None,
         tags=["sessions"],
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def upload_image(
         thread_id: UUID,
@@ -572,7 +579,11 @@ def build_uploads_router() -> APIRouter:
         "/v1/uploads/{image_id}",
         response_model=None,
         tags=["uploads"],
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def delete_image(
         image_id: UUID,

@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
-from control_plane.api._authz import console_only, require_key_scope
+from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._session_title import backfill_titles
 from control_plane.api._user_scope import (
@@ -225,10 +225,25 @@ def _conflict(message: str) -> JSONResponse:
 def build_sessions_router() -> APIRouter:
     router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
+    # B-49 —— 用户拍板「viewer = 只读旁观者」(2026-09-11)。这个 router 的九条写
+    # 操作(create / rename / archive / :purge / :cancel / :pause / :resume /
+    # 删工作区文件 / 删会话产物)此前只有 ``console_only()`` + 归属闸,角色轴是
+    # 空的:实证扫描里一个 viewer JWT 建了会话、改了名、归档、:purge、:pause、
+    # :cancel 全部 200。九条统一挂 ``require("session", "write")``(OPERATOR /
+    # ADMIN 有,VIEWER 没有);归属闸(``_load_owned_session`` / ``_transition``
+    # / ``caller_owns_thread``)一行不动 —— 那一轴本来就是好的。
+    #
+    # archive / :purge 的 key scope 是 ``delete``,角色档仍取 ``write``:矩阵里
+    # ``session:delete`` 只有 ADMIN 持有,挂 delete 会把 operator 一并关在门外,
+    # 那是收过头 —— 本次的判据是「写 → operator+」,不是「删 → admin」。
     @router.post(
         "",
         status_code=201,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def create_session(
         payload: CreateSessionPayload,
@@ -571,7 +586,11 @@ def build_sessions_router() -> APIRouter:
     @router.delete(
         "/{thread_id}/workspace/file",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def delete_session_workspace_file(
         thread_id: UUID,
@@ -699,7 +718,11 @@ def build_sessions_router() -> APIRouter:
     @router.delete(
         "/{thread_id}/workspace/artifacts/{name:path}",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def delete_session_artifact(
         thread_id: UUID,
@@ -859,7 +882,12 @@ def build_sessions_router() -> APIRouter:
         return meta
 
     @router.patch(
-        "/{thread_id}", dependencies=[Depends(require_key_scope("write")), Depends(console_only())]
+        "/{thread_id}",
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def rename_session(
         thread_id: UUID,
@@ -894,7 +922,12 @@ def build_sessions_router() -> APIRouter:
         return JSONResponse({"success": True, "data": fresh.model_dump(mode="json")})
 
     @router.delete(
-        "/{thread_id}", dependencies=[Depends(require_key_scope("delete")), Depends(console_only())]
+        "/{thread_id}",
+        dependencies=[
+            Depends(require_key_scope("delete")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def archive_session(
         thread_id: UUID,
@@ -925,7 +958,11 @@ def build_sessions_router() -> APIRouter:
 
     @router.post(
         "/{thread_id}:purge",
-        dependencies=[Depends(require_key_scope("delete")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("delete")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def purge_session(
         thread_id: UUID,
@@ -1076,7 +1113,11 @@ def build_sessions_router() -> APIRouter:
 
     @router.post(
         "/{thread_id}:pause",
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def pause_session(
         thread_id: UUID,
@@ -1100,7 +1141,11 @@ def build_sessions_router() -> APIRouter:
 
     @router.post(
         "/{thread_id}:resume",
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def resume_session(
         thread_id: UUID,
@@ -1124,7 +1169,11 @@ def build_sessions_router() -> APIRouter:
 
     @router.post(
         "/{thread_id}:cancel",
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def cancel_session(
         thread_id: UUID,

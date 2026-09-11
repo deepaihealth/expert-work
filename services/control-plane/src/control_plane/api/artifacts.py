@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
-from control_plane.api._authz import console_only
+from control_plane.api._authz import console_only, require
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo, resolve_target_user_id
 from control_plane.audit import emit as audit_emit
@@ -270,7 +270,16 @@ def build_artifacts_router() -> APIRouter:
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
-    @router.delete("/{name:path}", response_model=None, dependencies=[Depends(console_only())])
+    # B-49 —— ``/v1/artifacts`` 是 ``/v1/sessions/{id}/workspace/*`` 之外的第二个
+    # 入口,落在同一份每用户数据上。删除与改名(PATCH)都是写,此前只有
+    # ``console_only()`` + user-scope 闸,viewer 能删改自己名下的产物。与会话侧
+    # ``DELETE /v1/sessions/{id}/workspace/artifacts/{name}`` 同档 ``session:write``;
+    # user-scope 闸(``resolve_target_user_id``)不动。
+    @router.delete(
+        "/{name:path}",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(require("session", "write"))],
+    )
     async def delete_artifact(
         name: str,
         request: Request,
@@ -311,7 +320,11 @@ def build_artifacts_router() -> APIRouter:
         )
         return JSONResponse(status_code=200, content={"deleted": name})
 
-    @router.patch("/{name:path}", response_model=None, dependencies=[Depends(console_only())])
+    @router.patch(
+        "/{name:path}",
+        response_model=None,
+        dependencies=[Depends(console_only()), Depends(require("session", "write"))],
+    )
     async def patch_artifact(
         name: str,
         body: _ArtifactPatchBody,
