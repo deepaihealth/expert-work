@@ -18,6 +18,7 @@ import * as sdk from "../../api/platform_config";
 import * as tenantsSdk from "../../api/tenants";
 import type {
   PlatformCredentialsView,
+  PlatformProviderRow,
   TenantCredentialsView,
 } from "../../api/platform_config";
 import { AuthProvider } from "../../auth/AuthContext";
@@ -248,6 +249,146 @@ describe("SettingsPlatformConfig — per-provider multi-key (Y-MK)", () => {
         "acct-b",
         expect.objectContaining({ value: "sk-ant-REAL", priority: 100 }),
       ),
+    );
+  });
+});
+
+// ─── B-51 平台自身的依赖 + 警示 ────────────────────────────────────────
+
+function providerRow(
+  overrides: Partial<PlatformProviderRow> & { provider: string },
+): PlatformProviderRow {
+  return {
+    source: "unset",
+    secret_ref: null,
+    enabled: false,
+    keys: [],
+    used_by_agents: 0,
+    platform_uses: [],
+    tenant_override_count: 0,
+    ...overrides,
+  };
+}
+
+function renderWithProviders(providers: PlatformProviderRow[]) {
+  setStoredToken(
+    makeJwt({ sub: "u1", tenant_id: TENANT, roles: ["system_admin"] }),
+  );
+  vi.spyOn(sdk, "getPlatformCredentials").mockResolvedValue({
+    providers,
+    tools: [],
+  });
+  return render(
+    <MemoryRouter>
+      <AuthProvider>
+        <App>
+          <SettingsPlatformConfig />
+        </App>
+      </AuthProvider>
+    </MemoryRouter>,
+  );
+}
+
+describe("SettingsPlatformConfig — platform credential visibility (B-51)", () => {
+  it("unset + an ENABLED platform use warns on the row and raises the banner", async () => {
+    renderWithProviders([
+      providerRow({
+        provider: "anthropic",
+        platform_uses: [
+          {
+            feature: "memory_consolidation",
+            model: "claude-sonnet-4-6",
+            enabled: true,
+          },
+        ],
+      }),
+    ]);
+    const tag = await screen.findByTestId("pc-source-anthropic");
+    expect(tag).toHaveTextContent(/needed by the platform/i);
+    expect(tag.className).toContain("ant-tag-warning");
+    expect(
+      screen.getByTestId("pc-platform-uses-anthropic"),
+    ).toHaveTextContent("⚠");
+    const banner = screen.getByTestId("pc-platform-credentials-missing");
+    expect(banner).toHaveTextContent(/anthropic/);
+    expect(banner).toHaveTextContent(/Long-term memory consolidation/);
+  });
+
+  it("unset + a DISABLED-only platform use is tabled but never bannered", async () => {
+    renderWithProviders([
+      providerRow({
+        provider: "anthropic",
+        platform_uses: [
+          {
+            feature: "quality_judge",
+            model: "claude-haiku-4-5",
+            enabled: false,
+          },
+        ],
+      }),
+    ]);
+    const tag = await screen.findByTestId("pc-source-anthropic");
+    expect(tag).not.toHaveTextContent(/needed by the platform/i);
+    expect(tag.className).not.toContain("ant-tag-warning");
+    // 表格里照旧标出来 —— 只是不吵。
+    expect(screen.getByTestId("pc-platform-uses-anthropic")).toHaveTextContent(
+      "1 platform features",
+    );
+    expect(
+      screen.queryByTestId("pc-platform-credentials-missing"),
+    ).toBeNull();
+  });
+
+  it("unset with NO platform dependency stays plain — that is the normal state", async () => {
+    renderWithProviders([providerRow({ provider: "kimi" })]);
+    const tag = await screen.findByTestId("pc-source-kimi");
+    expect(tag).not.toHaveTextContent(/needed by the platform/i);
+    expect(tag.className).not.toContain("ant-tag-warning");
+    expect(screen.queryByTestId("pc-platform-uses-kimi")).toBeNull();
+    expect(
+      screen.queryByTestId("pc-platform-credentials-missing"),
+    ).toBeNull();
+  });
+
+  it("a configured credential with platform uses never warns", async () => {
+    renderWithProviders([
+      providerRow({
+        provider: "anthropic",
+        source: "db",
+        secret_ref: "kms://platform/anthropic",
+        enabled: true,
+        platform_uses: [
+          {
+            feature: "memory_consolidation",
+            model: "claude-sonnet-4-6",
+            enabled: true,
+          },
+        ],
+      }),
+    ]);
+    const tag = await screen.findByTestId("pc-source-anthropic");
+    expect(tag).not.toHaveTextContent(/needed by the platform/i);
+    expect(
+      screen.queryByTestId("pc-platform-credentials-missing"),
+    ).toBeNull();
+  });
+
+  it("shows the agent count and the platform count side by side", async () => {
+    renderWithProviders([
+      providerRow({
+        provider: "anthropic",
+        used_by_agents: 0,
+        platform_uses: [
+          { feature: "memory_consolidation", model: "m", enabled: true },
+          { feature: "quality_judge", model: "m2", enabled: false },
+        ],
+      }),
+    ]);
+    expect(await screen.findByTestId("pc-agent-uses-anthropic")).toHaveTextContent(
+      "0 agents",
+    );
+    expect(screen.getByTestId("pc-platform-uses-anthropic")).toHaveTextContent(
+      "2 platform features",
     );
   });
 });

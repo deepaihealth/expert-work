@@ -16,6 +16,7 @@ import userEvent from "@testing-library/user-event";
 import "../../i18n";
 
 import { MemoryAdmin } from "../MemoryAdmin";
+import * as memorySdk from "../../api/memory";
 import { TenantScopeProvider } from "../../tenant/TenantScopeContext";
 import { AuthProvider } from "../../auth/AuthContext";
 import { apiClient, setStoredToken } from "../../api/client";
@@ -253,5 +254,145 @@ describe("MemoryAdmin", () => {
     await waitFor(() =>
       expect(correctBody).toEqual({ action: "rewrite", content: "fixed" }),
     );
+  });
+});
+
+// ─── B-51 整合失败横幅 ─────────────────────────────────────────────────
+
+function renderMemoryAsSystemAdmin() {
+  setStoredToken(
+    makeJwt({ sub: "u1", tenant_id: "t1", roles: ["system_admin"] }),
+  );
+  return render(
+    <MemoryRouter>
+      <AuthProvider>
+        <TenantScopeProvider>
+          <App>
+            <MemoryAdmin />
+          </App>
+        </TenantScopeProvider>
+      </AuthProvider>
+    </MemoryRouter>,
+  );
+}
+
+function auditHandlers(details: Record<string, unknown>[]): RouteHandler[] {
+  return [
+    {
+      match: (u) => u.startsWith("/v1/audit"),
+      respond: () => ({
+        items: details.map((d, i) => ({
+          id: i + 1,
+          tenant_id: "00000000-0000-0000-0000-000000000000",
+          actor_type: "system",
+          actor_id: "memory_consolidator",
+          on_behalf_of: null,
+          action: "memory:consolidator_run",
+          resource_type: "memory_item",
+          resource_id: null,
+          result: "success",
+          reason: null,
+          ip: null,
+          user_agent: null,
+          request_id: null,
+          trace_id: null,
+          details: d,
+          occurred_at: "2026-09-11T00:00:00Z",
+        })),
+        next_cursor: null,
+        has_more: false,
+        applied_scope: "cross_tenant",
+      }),
+    },
+    {
+      match: (u) => u.startsWith("/v1/memory"),
+      respond: () => ({
+        success: true,
+        data: { items: [memRow], total: 1, cross_tenant: false },
+        error: null,
+      }),
+    },
+  ];
+}
+
+describe("MemoryAdmin — consolidator health (B-51)", () => {
+  it("names the reason when consolidation keeps failing on credentials", async () => {
+    installAdapter(
+      auditHandlers([
+        {
+          consolidated: 0,
+          errors: 2,
+          errors_by_reason: { credentials_missing: 2 },
+          missing_credential_providers: ["anthropic"],
+        },
+        {
+          consolidated: 0,
+          errors: 1,
+          errors_by_reason: { credentials_missing: 1 },
+          missing_credential_providers: ["anthropic"],
+        },
+      ]),
+    );
+    renderMemoryAsSystemAdmin();
+    const alert = await screen.findByTestId("memory-consolidator-alert");
+    expect(alert).toHaveTextContent(/2 sweep/);
+    expect(alert).toHaveTextContent(/platform credentials are not configured/i);
+    expect(alert).toHaveTextContent(/anthropic/);
+  });
+
+  it("stays quiet when the latest sweep did not fail on credentials", async () => {
+    installAdapter(
+      auditHandlers([
+        {
+          consolidated: 3,
+          errors: 0,
+          errors_by_reason: {},
+          missing_credential_providers: [],
+        },
+      ]),
+    );
+    renderMemoryAsSystemAdmin();
+    await waitFor(() =>
+      expect(screen.getByText(/User prefers/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("memory-consolidator-alert")).toBeNull();
+  });
+
+  it("a non-credential failure is not blamed on credentials", async () => {
+    installAdapter(
+      auditHandlers([
+        {
+          consolidated: 0,
+          errors: 4,
+          errors_by_reason: { other: 4 },
+          missing_credential_providers: [],
+        },
+      ]),
+    );
+    renderMemoryAsSystemAdmin();
+    await waitFor(() =>
+      expect(screen.getByText(/User prefers/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("memory-consolidator-alert")).toBeNull();
+  });
+
+  it("skips the platform-scoped read entirely for a non system_admin", async () => {
+    const spy = vi.spyOn(memorySdk, "getConsolidatorHealth");
+    installAdapter(
+      auditHandlers([
+        {
+          consolidated: 0,
+          errors: 1,
+          errors_by_reason: { credentials_missing: 1 },
+          missing_credential_providers: ["anthropic"],
+        },
+      ]),
+    );
+    renderMemory(); // roles: ["admin"] —— 读平台审计会 403,压根别发
+    await waitFor(() =>
+      expect(screen.getByText(/User prefers/)).toBeInTheDocument(),
+    );
+    expect(spy).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("memory-consolidator-alert")).toBeNull();
   });
 });

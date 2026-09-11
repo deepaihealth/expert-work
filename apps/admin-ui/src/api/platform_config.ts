@@ -20,6 +20,24 @@ export interface PlatformProviderKey {
   priority: number;
 }
 
+/**
+ * B-51 — one platform feature that needs this provider's credential.
+ *
+ * ``used_by_agents`` counts agent manifests only; the platform's own
+ * background features (embedding / rerank / eval agent / quality judge /
+ * memory consolidation) need the very same credential and used to count for
+ * nothing — which is how an "unset + used by 0 agents" row got read as
+ * "nobody needs this".
+ *
+ * ``feature`` is a stable machine id (i18n lives in the frontend);
+ * ``enabled`` is the feature's *effective* on/off, DB overlay included.
+ */
+export interface PlatformProviderUse {
+  feature: string;
+  model: string;
+  enabled: boolean;
+}
+
 export interface PlatformProviderRow {
   provider: string;
   source: PlatformSecretSource;
@@ -30,6 +48,8 @@ export interface PlatformProviderRow {
   /** Stream Y-MK — all keys, priority-sorted (best first). Empty for env/unset. */
   keys: PlatformProviderKey[];
   used_by_agents: number;
+  /** B-51 — platform-side dependencies. Absent on the write endpoints' rows. */
+  platform_uses?: PlatformProviderUse[];
   tenant_override_count: number;
 }
 

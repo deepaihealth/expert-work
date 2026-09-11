@@ -47,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from control_plane.advisory_locks import MEMORY_CONSOLIDATOR_LOCK_CLASSID
 from control_plane.audit import emit as audit_emit
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
+from expert_work.common.credentials import CredentialsResolverError
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.uplift_metrics import (
     record_consolidator_llm_tokens,
@@ -481,6 +482,42 @@ def _parse_due_reply(reply: ConsolidatorLLMReply) -> _DueVerdict | None:
 # ---------------------------------------------------------------------------
 
 
+#: B-51 —— 失败原因分类。裸计数器知道「错了 N 次」,不知道「为什么」,
+#: 于是日志里的 ``errors=1`` 和栈里那句 ``credentials missing`` 是两条互不
+#: 相连的东西,界面就算想显示也没有可显示的数据。
+ERROR_REASON_CREDENTIALS_MISSING = "credentials_missing"
+ERROR_REASON_OTHER = "other"
+
+
+def classify_sweep_error(exc: BaseException) -> str:
+    """把一次失败归到 :data:`ERROR_REASON_*` 之一。
+
+    顺着 ``__cause__`` 链找 :class:`CredentialsResolverError` —— aux 模型
+    适配器是原样 re-raise 的,但中间层若换成 ``raise ... from exc`` 也照样
+    认得出来。
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, CredentialsResolverError):
+            return ERROR_REASON_CREDENTIALS_MISSING
+        seen.add(id(current))
+        current = current.__cause__
+    return ERROR_REASON_OTHER
+
+
+def _credentials_missing_provider(exc: BaseException) -> str | None:
+    """凭据类失败缺的是哪个 provider(``CredentialsResolverError.key``)。"""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, CredentialsResolverError):
+            return current.key
+        seen.add(id(current))
+        current = current.__cause__
+    return None
+
+
 @dataclass
 class ConsolidatorRunSummary:
     """One full sweep's aggregate counters (returned + audited)."""
@@ -495,8 +532,21 @@ class ConsolidatorRunSummary:
     expired: int = 0
     renewed: int = 0
     errors: int = 0
+    #: B-51 —— ``reason → 次数``。``errors`` 保持为总数(向后兼容)。
+    errors_by_reason: dict[str, int] = field(default_factory=dict)
+    #: B-51 —— 凭据类失败缺的 provider(去重、有序),界面据此说出「配哪个」。
+    missing_credential_providers: list[str] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
+
+    def record_error(self, exc: BaseException) -> None:
+        """记一次失败,并按原因归类。**所有失败点都走这里**,别裸 ``+= 1``。"""
+        self.errors += 1
+        reason = classify_sweep_error(exc)
+        self.errors_by_reason[reason] = self.errors_by_reason.get(reason, 0) + 1
+        provider = _credentials_missing_provider(exc)
+        if provider is not None and provider not in self.missing_credential_providers:
+            self.missing_credential_providers.append(provider)
 
     def as_audit_details(self) -> dict[str, object]:
         return {
@@ -510,6 +560,11 @@ class ConsolidatorRunSummary:
             "expired": self.expired,
             "renewed": self.renewed,
             "errors": self.errors,
+            # B-51 —— sweep 结果本来就落审计日志,分类计数跟着进去即可:
+            # 不需要新表、不需要迁移,而审计日志是多副本下唯一跨副本可读的
+            # 现成来源(consolidator 靠 advisory lock 单飞,进程内存读不到)。
+            "errors_by_reason": dict(self.errors_by_reason),
+            "missing_credential_providers": list(self.missing_credential_providers),
             "started_at": self.started_at.isoformat(),
             "finished_at": (self.finished_at.isoformat() if self.finished_at else None),
         }
@@ -648,9 +703,9 @@ class MemoryConsolidator:
         for tenant_id in tenant_ids:
             try:
                 cfg = await self._resolve_thresholds(tenant_id)
-            except Exception:
+            except Exception as exc:
                 logger.exception("memory_consolidator.tenant_config_failed tenant_id=%s", tenant_id)
-                summary.errors += 1
+                summary.record_error(exc)
                 continue
             summary.tenant_count += 1
             users = (await self._memory.distinct_users(tenant_id=tenant_id))[:_MAX_USERS_PER_TICK]
@@ -663,13 +718,13 @@ class MemoryConsolidator:
                         cfg=cfg,
                         summary=summary,
                     )
-                except Exception:
+                except Exception as exc:
                     logger.exception(
                         "memory_consolidator.user_sweep_failed tenant_id=%s user_id=%s",
                         tenant_id,
                         user_id,
                     )
-                    summary.errors += 1
+                    summary.record_error(exc)
 
         summary.finished_at = datetime.now(UTC)
 
@@ -736,14 +791,14 @@ class MemoryConsolidator:
                     cluster=cluster,
                     summary=summary,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "memory_consolidator.cluster_failed tenant=%s user=%s size=%d",
                     tenant_id,
                     user_id,
                     len(cluster),
                 )
-                summary.errors += 1
+                summary.record_error(exc)
 
         # SUB-PASS 2a (Stream HX-2, Mini-ADR HX-B3): user-👎-flagged items
         # go through the same U-37 single-item review, regardless of age /
@@ -765,14 +820,14 @@ class MemoryConsolidator:
                     item=item,
                     summary=summary,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "memory_consolidator.flagged_review_failed tenant=%s user=%s id=%s",
                     tenant_id,
                     user_id,
                     item.id,
                 )
-                summary.errors += 1
+                summary.record_error(exc)
 
         # SUB-PASS 2: lone-item noise purge
         if cfg.purge_enabled:
@@ -790,14 +845,14 @@ class MemoryConsolidator:
                         item=item,
                         summary=summary,
                     )
-                except Exception:
+                except Exception as exc:
                     logger.exception(
                         "memory_consolidator.lone_review_failed tenant=%s user=%s id=%s",
                         tenant_id,
                         user_id,
                         item.id,
                     )
-                    summary.errors += 1
+                    summary.record_error(exc)
 
         # SUB-PASS 3 (P5b-2b ⑦): predictive review of facts whose validity
         # window came due. Opt-in per tenant (LLM cost per due fact); reuses
@@ -816,14 +871,14 @@ class MemoryConsolidator:
                         item=item,
                         summary=summary,
                     )
-                except Exception:
+                except Exception as exc:
                     logger.exception(
                         "memory_consolidator.due_review_failed tenant=%s user=%s id=%s",
                         tenant_id,
                         user_id,
                         item.id,
                     )
-                    summary.errors += 1
+                    summary.record_error(exc)
 
     async def _find_candidate_clusters(
         self,

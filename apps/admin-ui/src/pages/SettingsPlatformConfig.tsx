@@ -51,7 +51,7 @@ import {
   type PlatformCredentialsView,
   type PlatformProviderKey,
   type PlatformProviderRow,
-  type PlatformSecretSource,
+  type PlatformProviderUse,
   type PlatformSecretUpsertBody,
   type TenantCredentialsView,
   type TenantEffectiveSource,
@@ -96,10 +96,52 @@ const KEY_PLACEHOLDERS: Record<string, string> = {
   qwen: "sk-…",
 };
 
-function sourceTag(source: PlatformSecretSource, t: (k: string) => string) {
-  const color =
-    source === "db" ? "cyan" : source === "env" ? "default" : undefined;
-  return <Tag color={color}>{t(`settings_platform.source_${source}`)}</Tag>;
+// B-51 — 平台功能的人话名。后端只给稳定机器标识(feature),文案归前端;
+// 表里没有的新标识退回标识本身,不编造文案。
+const PLATFORM_FEATURE_LABEL_KEYS: Record<string, string> = {
+  embedding: "settings_platform.platform_feature_embedding",
+  rerank: "settings_platform.platform_feature_rerank",
+  eval_agent: "settings_platform.platform_feature_eval_agent",
+  quality_judge: "settings_platform.platform_feature_quality_judge",
+  memory_consolidation: "settings_platform.platform_feature_memory_consolidation",
+};
+
+function featureLabel(feature: string, t: (k: string) => string): string {
+  const key = PLATFORM_FEATURE_LABEL_KEYS[feature];
+  return key ? t(key) : feature;
+}
+
+/** 该行**已开启**的平台依赖。未开启的不参与任何警示判断。 */
+function enabledPlatformUses(row: PlatformProviderRow): PlatformProviderUse[] {
+  return (row.platform_uses ?? []).filter((use) => use.enabled);
+}
+
+/**
+ * B-51 警示判据:凭据未设置,**且**至少有一项已开启的平台功能在用它。
+ *
+ * 「未设置」本身是正常状态(整个 catalog 都列出来,大多数厂商本来就没配),
+ * 所以只有 unset 不足以警示 —— 那会一上来红一片,把真问题淹掉。
+ * 未开启的平台依赖也不警示:运维根本不用管它。
+ */
+function needsCredentialAttention(row: PlatformProviderRow): boolean {
+  return row.source === "unset" && enabledPlatformUses(row).length > 0;
+}
+
+function sourceTag(row: PlatformProviderRow, t: (k: string) => string) {
+  const warn = needsCredentialAttention(row);
+  const color = warn
+    ? "warning"
+    : row.source === "db"
+      ? "cyan"
+      : row.source === "env"
+        ? "default"
+        : undefined;
+  return (
+    <Tag color={color} data-testid={`pc-source-${row.provider}`}>
+      {t(`settings_platform.source_${row.source}`)}
+      {warn ? ` · ${t("settings_platform.source_unset_platform_warn")}` : ""}
+    </Tag>
+  );
 }
 
 export function SettingsPlatformConfig() {
@@ -414,8 +456,8 @@ export function SettingsPlatformConfig() {
         title: t("settings_platform.col_source"),
         dataIndex: "source",
         key: "source",
-        width: 110,
-        render: (s: PlatformSecretSource) => sourceTag(s, t),
+        width: 150,
+        render: (_v, row) => sourceTag(row, t),
       },
       {
         title: t("settings_platform.col_secret_ref"),
@@ -452,11 +494,58 @@ export function SettingsPlatformConfig() {
         },
       },
       {
+        // B-51 —— 两个来源并列。只报智能体数曾经把「平台在用」说成「没人用」。
         title: t("settings_platform.col_used_by"),
-        dataIndex: "used_by_agents",
         key: "used_by_agents",
-        width: 100,
-        render: (n: number) => <Text>{n}</Text>,
+        width: 200,
+        render: (_v, row) => {
+          const uses = row.platform_uses ?? [];
+          const warn = needsCredentialAttention(row);
+          return (
+            <Space size={4} wrap>
+              <Text data-testid={`pc-agent-uses-${row.provider}`}>
+                {t("settings_platform.used_by_agents_n", {
+                  count: row.used_by_agents,
+                })}
+              </Text>
+              {uses.length > 0 && (
+                <>
+                  <Text type="secondary">·</Text>
+                  <Tooltip
+                    title={
+                      <Space direction="vertical" size={2}>
+                        <Text strong style={{ color: "#fff", fontSize: 12 }}>
+                          {t("settings_platform.platform_uses_tooltip_title")}
+                        </Text>
+                        {uses.map((use) => (
+                          <Text
+                            key={use.feature}
+                            style={{ color: "#fff", fontSize: 12 }}
+                          >
+                            {featureLabel(use.feature, t)} · {use.model} ·{" "}
+                            {use.enabled
+                              ? t("settings_platform.platform_use_on")
+                              : t("settings_platform.platform_use_off")}
+                          </Text>
+                        ))}
+                      </Space>
+                    }
+                  >
+                    <Tag
+                      color={warn ? "warning" : "default"}
+                      data-testid={`pc-platform-uses-${row.provider}`}
+                    >
+                      {warn ? "⚠ " : ""}
+                      {t("settings_platform.platform_uses_n", {
+                        count: uses.length,
+                      })}
+                    </Tag>
+                  </Tooltip>
+                </>
+              )}
+            </Space>
+          );
+        },
       },
       {
         title: t("settings_platform.col_tenant_overrides"),
@@ -493,6 +582,14 @@ export function SettingsPlatformConfig() {
       },
     ],
     [t],
+  );
+
+  // B-51 —— 只有「凭据未设置 + 有已开启的平台功能在用」才上 banner。
+  // 未开启的依赖只在表格里标:生产一上来红三条、其中两条运维根本不用管,
+  // 噪音会淹掉真问题。
+  const credentialGaps = useMemo(
+    () => (view?.providers ?? []).filter(needsCredentialAttention),
+    [view],
   );
 
   const effectiveSourceTag = useCallback(
@@ -673,6 +770,37 @@ export function SettingsPlatformConfig() {
                 label: t("settings_platform.tab_credentials"),
                 children: (
                   <Space direction="vertical" size={16} style={{ display: "flex" }}>
+                    {credentialGaps.length > 0 && (
+                      <Alert
+                        type="warning"
+                        showIcon
+                        message={t(
+                          "settings_platform.platform_credentials_missing_title",
+                          { count: credentialGaps.length },
+                        )}
+                        description={
+                          <Space direction="vertical" size={2}>
+                            <Text>
+                              {t(
+                                "settings_platform.platform_credentials_missing_body",
+                              )}
+                            </Text>
+                            {credentialGaps.map((row) => (
+                              <Text key={row.provider}>
+                                <Text strong>{row.provider}</Text>
+                                {" — "}
+                                {enabledPlatformUses(row)
+                                  .map((use) => featureLabel(use.feature, t))
+                                  .join(
+                                    t("settings_platform.feature_list_separator"),
+                                  )}
+                              </Text>
+                            ))}
+                          </Space>
+                        }
+                        data-testid="pc-platform-credentials-missing"
+                      />
+                    )}
                     <Card
                       size="small"
                       title={t("settings_platform.providers_heading")}

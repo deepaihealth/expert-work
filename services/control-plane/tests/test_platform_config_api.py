@@ -878,3 +878,55 @@ async def test_tenant_override_put_broadcasts_platform_secrets_with_tenant(
     event = spy_bus.events[0]
     assert event.kind == "platform_secrets"  # type: ignore[attr-defined]
     assert event.tenant_id == str(tenant_id)  # type: ignore[attr-defined]
+
+
+# ─── B-51 平台自身的依赖(platform_uses) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_marks_platform_uses_on_the_provider_row(
+    admin_client: tuple[AsyncClient, UUID],
+) -> None:
+    """病理原点:anthropic 行「未设置 + 被智能体引用 0」,但长期记忆整合
+    一直在用它。``platform_uses`` 就是那条一直看不见的依赖。"""
+    client, admin = admin_client
+    resp = await client.get("/v1/platform/credentials", headers=_headers(admin))
+    assert resp.status_code == 200, resp.text
+    row = next(p for p in resp.json()["data"]["providers"] if p["provider"] == "anthropic")
+    assert row["source"] == "unset"
+    assert row["used_by_agents"] == 0  # agent 侧确实没人用
+    uses = {u["feature"]: u for u in row["platform_uses"]}
+    assert "memory_consolidation" in uses, "凭据页仍然不会说出平台自己在用 anthropic"
+    assert uses["memory_consolidation"]["enabled"] is True  # enable_scheduler 默认开
+    assert uses["memory_consolidation"]["model"]
+
+
+@pytest.mark.asyncio
+async def test_every_provider_row_carries_platform_uses(
+    admin_client: tuple[AsyncClient, UUID],
+) -> None:
+    """没有平台依赖的 provider 也要有这个字段(空列表),前端才不用判 undefined。"""
+    client, admin = admin_client
+    resp = await client.get("/v1/platform/credentials", headers=_headers(admin))
+    providers = resp.json()["data"]["providers"]
+    assert all(isinstance(p["platform_uses"], list) for p in providers)
+    assert any(p["platform_uses"] == [] for p in providers), "全都有依赖?登记表或 catalog 变了"
+
+
+@pytest.mark.asyncio
+async def test_quality_judge_use_follows_the_ui_toggle_not_just_the_deploy_gate(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> None:
+    """``enable_quality_monitor`` 默认 True,但 UI 开关(DB 行)默认关 ——
+    只看 settings 会把一个没开的功能报成开着,正是 banner 最该避免的噪音。"""
+    tuned = settings.model_copy(update={"enable_quality_monitor": True})
+    app = create_app(settings=tuned, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    admin = await _seed_admin(app)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        resp = await client.get("/v1/platform/credentials", headers=_headers(admin))
+    row = next(p for p in resp.json()["data"]["providers"] if p["provider"] == "anthropic")
+    judge = next(u for u in row["platform_uses"] if u["feature"] == "quality_judge")
+    assert judge["enabled"] is False

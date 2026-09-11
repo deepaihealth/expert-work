@@ -19,6 +19,7 @@ import {
   withTenantScope,
   type TenantScope,
 } from "./client";
+import { listAudit, type AuditEntry } from "./audit";
 
 export type MemoryKind = "fact" | "episodic";
 
@@ -115,4 +116,78 @@ export async function correctMemory(
     `/v1/memory/${encodeURIComponent(memoryId)}/correct`,
     body,
   );
+}
+
+/**
+ * B-51 — long-term memory consolidation health, read off the audit log.
+ *
+ * The consolidator single-flights across replicas behind an advisory lock, so
+ * only one replica ever has in-process state; the per-sweep
+ * ``memory:consolidator_run`` audit row is the one thing every replica (and
+ * the console) can read back. Reading it needs the platform-wide scope, so
+ * this is a system_admin-only read — callers skip it for everyone else.
+ */
+export interface ConsolidatorSweep {
+  occurred_at: string | null;
+  consolidated: number;
+  errors: number;
+  errors_by_reason: Record<string, number>;
+  missing_credential_providers: string[];
+}
+
+export interface ConsolidatorHealth {
+  /** 从最近一次往前数,连续几次 sweep 栽在「平台凭据未配置」上。0 = 最近一次没栽。 */
+  consecutiveCredentialFailures: number;
+  /** 那些 sweep 缺的 provider(去重)。 */
+  providers: string[];
+  lastSweepAt: string | null;
+}
+
+function toSweep(entry: AuditEntry): ConsolidatorSweep {
+  const details = entry.details as Record<string, unknown>;
+  const reasons = details.errors_by_reason;
+  const providers = details.missing_credential_providers;
+  return {
+    occurred_at: entry.occurred_at,
+    consolidated: typeof details.consolidated === "number" ? details.consolidated : 0,
+    errors: typeof details.errors === "number" ? details.errors : 0,
+    errors_by_reason:
+      reasons !== null && typeof reasons === "object"
+        ? (reasons as Record<string, number>)
+        : {},
+    missing_credential_providers: Array.isArray(providers)
+      ? providers.filter((p): p is string => typeof p === "string")
+      : [],
+  };
+}
+
+/** 纯函数,好单测:审计行(新→旧)→ 连续凭据失败次数。 */
+export function summariseConsolidatorHealth(
+  sweeps: ConsolidatorSweep[],
+): ConsolidatorHealth {
+  const providers: string[] = [];
+  let streak = 0;
+  for (const sweep of sweeps) {
+    if ((sweep.errors_by_reason.credentials_missing ?? 0) === 0) break;
+    streak += 1;
+    for (const provider of sweep.missing_credential_providers) {
+      if (!providers.includes(provider)) providers.push(provider);
+    }
+  }
+  return {
+    consecutiveCredentialFailures: streak,
+    providers,
+    lastSweepAt: sweeps[0]?.occurred_at ?? null,
+  };
+}
+
+export async function getConsolidatorHealth(
+  limit = 20,
+): Promise<ConsolidatorHealth> {
+  const page = await listAudit({
+    tenantScope: "*",
+    action: "memory:consolidator_run",
+    limit,
+  });
+  return summariseConsolidatorHealth(page.items.map(toSweep));
 }

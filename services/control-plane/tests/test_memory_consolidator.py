@@ -21,15 +21,19 @@ from uuid import UUID, uuid4
 import pytest
 
 from control_plane.memory_consolidator import (
+    ERROR_REASON_CREDENTIALS_MISSING,
+    ERROR_REASON_OTHER,
     ConsolidatorLLMReply,
     ConsolidatorRunSummary,
     MemoryConsolidator,
     _parse_cluster_reply,
     _parse_single_reply,
     _ResolvedThresholds,
+    classify_sweep_error,
     make_null_consolidator_aux_model,
 )
 from control_plane.tenancy import TenantConfigService
+from expert_work.common.credentials import CredentialsResolverError
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.memory.hash import hash_content
@@ -771,3 +775,132 @@ async def test_sweep_skips_predictive_review_when_disabled() -> None:
     assert aux.calls == []
     assert summary.expired == 0
     assert summary.renewed == 0
+
+
+# ─── B-51 失败原因分类 ──────────────────────────────────────────────────
+
+
+class _CredentialsMissingAuxModel:
+    """平台凭据没配时 aux 适配器的真实行为:原样 re-raise 解析错。"""
+
+    async def __call__(
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        tenant_id: UUID,
+        output_schema: StructuredOutputSpec | None = None,
+    ) -> ConsolidatorLLMReply:
+        raise CredentialsResolverError(
+            "platform credentials missing for provider=anthropic (tenant-effective view).",
+            mode="platform",
+            kind="provider",
+            key="anthropic",
+        )
+
+
+class _BoomAuxModel:
+    """任意非凭据类失败。"""
+
+    async def __call__(
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        tenant_id: UUID,
+        output_schema: StructuredOutputSpec | None = None,
+    ) -> ConsolidatorLLMReply:
+        raise RuntimeError("upstream 503")
+
+
+async def _build_worker_with_aux(
+    aux: object,
+) -> tuple[MemoryConsolidator, InMemoryMemoryStore, InMemoryAuditLogStore]:
+    store = InMemoryMemoryStore()
+    audit_logger, audit_store = _build_logger()
+    config_service = TenantConfigService(
+        store=InMemoryTenantConfigStore(), audit_logger=audit_logger
+    )
+    worker = MemoryConsolidator(
+        memory_store=store,
+        tenant_config_service=config_service,
+        audit_logger=audit_logger,
+        aux_model=aux,  # type: ignore[arg-type]
+        embedder=_FakeEmbedder(),
+        interval_s=60.0,
+    )
+    await _seed_tenant_config(config_service)
+    return worker, store, audit_store
+
+
+def test_classify_sweep_error_recognises_credentials_missing() -> None:
+    exc = CredentialsResolverError("nope", mode="platform", kind="provider", key="anthropic")
+    assert classify_sweep_error(exc) == ERROR_REASON_CREDENTIALS_MISSING
+    assert classify_sweep_error(RuntimeError("boom")) == ERROR_REASON_OTHER
+
+
+def test_classify_sweep_error_follows_the_cause_chain() -> None:
+    cause = CredentialsResolverError("nope", mode="platform", kind="provider", key="anthropic")
+    wrapped = RuntimeError("aux call failed")
+    wrapped.__cause__ = cause
+    assert classify_sweep_error(wrapped) == ERROR_REASON_CREDENTIALS_MISSING
+
+
+def test_summary_errors_only_incremented_via_record_error() -> None:
+    """裸 ``summary.errors += 1`` 只知道错了 N 次,不知道为什么 ——
+    所有失败点必须走 :meth:`ConsolidatorRunSummary.record_error`。"""
+    import ast
+    import inspect
+
+    from control_plane import memory_consolidator as module
+
+    tree = ast.parse(inspect.getsource(module))
+    record_error_ranges = [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "record_error"
+    ]
+    assert record_error_ranges, "record_error 不见了 —— 分类计数的唯一入口"
+    stray = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Attribute)
+        and node.target.attr == "errors"
+        and not any(lo <= node.lineno <= hi for lo, hi in record_error_ranges)
+    ]
+    assert not stray, f"这些行还在裸加 errors,失败原因会丢: {stray}"
+
+
+@pytest.mark.asyncio
+async def test_credentials_missing_is_counted_and_audited_separately() -> None:
+    worker, store, audit_store = await _build_worker_with_aux(_CredentialsMissingAuxModel())
+    _seed_transient(store, contents=["dark UI", "dark mode preference", "wants dark theme"])
+
+    summary = await worker.run_once()
+
+    assert summary.consolidated == 0
+    assert summary.errors == 1
+    assert summary.errors_by_reason == {ERROR_REASON_CREDENTIALS_MISSING: 1}
+    assert summary.missing_credential_providers == ["anthropic"]
+
+    page = await audit_store.query(AuditQuery(tenant_id="*", limit=100))
+    run_row = next(e for e in page.entries if e.action == AuditAction.MEMORY_CONSOLIDATOR_RUN)
+    assert run_row.details["errors_by_reason"] == {ERROR_REASON_CREDENTIALS_MISSING: 1}
+    assert run_row.details["missing_credential_providers"] == ["anthropic"]
+
+
+@pytest.mark.asyncio
+async def test_non_credentials_failure_counts_as_other() -> None:
+    worker, store, audit_store = await _build_worker_with_aux(_BoomAuxModel())
+    _seed_transient(store, contents=["dark UI", "dark mode preference", "wants dark theme"])
+
+    summary = await worker.run_once()
+
+    assert summary.errors == 1
+    assert summary.errors_by_reason == {ERROR_REASON_OTHER: 1}
+    assert summary.missing_credential_providers == []
+
+    page = await audit_store.query(AuditQuery(tenant_id="*", limit=100))
+    run_row = next(e for e in page.entries if e.action == AuditAction.MEMORY_CONSOLIDATOR_RUN)
+    assert run_row.details["errors_by_reason"] == {ERROR_REASON_OTHER: 1}
