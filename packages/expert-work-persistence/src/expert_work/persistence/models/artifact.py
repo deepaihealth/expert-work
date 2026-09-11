@@ -19,7 +19,7 @@ from expert_work.persistence.base import Base
 
 
 class ArtifactRow(Base):
-    """A logical artifact — a named file, tenant- and user-scoped (J.9).
+    """A logical artifact — a named file, scoped to ``(tenant, user, agent)`` (J.9).
 
     RLS (migration ``0019``) enforces both ``app.tenant_id`` and
     ``app.user_id``.
@@ -34,6 +34,11 @@ class ArtifactRow(Base):
     )
     tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    #: B-50 工作区分层 —— 这条产物属于哪个 agent。``sanitize_agent_key(spec.metadata.name)``,
+    #: 与沙箱的 ``/opt/skills/<agent_key>`` 同一个值。空串 = 归属不明的历史产物
+    #: (迁移 ``0154`` 回填时反推链断了的那批),与 ``ToolContext.agent_key`` 的
+    #: 「空串=没绑 agent」同一套语义。
+    agent_key: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     name: Mapped[str] = mapped_column(Text, nullable=False)
     #: document / code / data / other — declared by the agent.
     kind: Mapped[str] = mapped_column(Text, nullable=False)
@@ -55,7 +60,9 @@ class ArtifactRow(Base):
     archived_object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        UniqueConstraint("tenant_id", "user_id", "name", name="artifact_identity_uniq"),
+        UniqueConstraint(
+            "tenant_id", "user_id", "agent_key", "name", name="artifact_identity_uniq"
+        ),
     )
 
 
