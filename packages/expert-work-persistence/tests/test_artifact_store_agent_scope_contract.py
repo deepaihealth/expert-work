@@ -5,6 +5,12 @@
 agent B 的产物。所以这里参数化同一组用例跑两遍;内存档进单元 CI,
 SQL 档标 ``integration``。
 
+SQL 档在容器里**另建一个库**,不用那个 session 级共享的默认库:本文件的用例
+会造出「同一 (tenant, user, name)、不同 agent_key」的两行,而那正是迁移 0154
+的 ``downgrade()`` 重建三元组唯一索引时会撞的形状。共享库里留下这种行,别的
+测试做 downgrade 往返(``test_sql_app_user_role`` / ``test_sql_user_upload_store``)
+就会红 —— CI 上实际红过。
+
 本地跑 SQL 档前: export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock
 """
 
@@ -15,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -30,6 +37,8 @@ from expert_work.persistence import (
 from expert_work.persistence.artifact.base import ArtifactStore
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
+#: 本文件专用的库 —— 见模块 docstring 为什么不能用共享的那个。
+_DB = "artifact_agent_scope_contract"
 
 _PLAN = "ai-health-plan-1a2b3c4d"
 _SOP = "sop2-designer-5e6f7a8b"
@@ -47,24 +56,25 @@ async def store(request: pytest.FixtureRequest) -> AsyncIterator[ArtifactStore]:
         return
 
     container: PostgresContainer = request.getfixturevalue("postgres_container")
-    url = str(container.get_connection_url())
+    admin = str(container.get_connection_url()).replace("+psycopg2", "")
+    with psycopg.connect(admin, autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{_DB}" WITH (FORCE)')
+        conn.execute(f'CREATE DATABASE "{_DB}"')
+
+    base, _, _ = admin.rpartition("/")
+    dsn = f"{base}/{_DB}"
     cfg = Config(str(ALEMBIC_INI))
-    cfg.set_main_option(
-        "sqlalchemy.url",
-        url.replace("+psycopg2", "+psycopg").replace("postgresql://", "postgresql+psycopg://", 1),
-    )
+    cfg.set_main_option("sqlalchemy.url", dsn.replace("postgresql://", "postgresql+psycopg://", 1))
     command.upgrade(cfg, "head")
     engine = create_async_engine_from_config(
-        DatabaseConfig(
-            dsn=url.replace("+psycopg2", "+asyncpg").replace(
-                "postgresql://", "postgresql+asyncpg://", 1
-            )
-        )
+        DatabaseConfig(dsn=dsn.replace("postgresql://", "postgresql+asyncpg://", 1))
     )
     try:
         yield SqlArtifactStore(create_async_session_factory(engine))
     finally:
         await engine.dispose()
+        with psycopg.connect(admin, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{_DB}" WITH (FORCE)')
 
 
 async def _save(
