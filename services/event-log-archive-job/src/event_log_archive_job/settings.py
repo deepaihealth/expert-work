@@ -1,8 +1,9 @@
 """``EventLogArchiveSettings`` — env-driven knobs for the G.8 archive job.
 
 Defaults aim at the local docker-compose stack; the DB DSN connects
-directly to Postgres (not PgBouncer) — the sweep is cross-tenant and
-relies on the connecting role bypassing RLS.
+directly to Postgres (not PgBouncer). 「哪些分组够老了」那一问是跨租户的,靠
+连接角色 bypass RLS(``job._bypass_rls`` 显式声明);每组自己的读 / 删则作用到
+该组的租户(``job._tenant_scope``),不依赖角色是不是 ``BYPASSRLS``。
 """
 
 from __future__ import annotations
