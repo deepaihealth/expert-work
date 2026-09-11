@@ -207,13 +207,25 @@ async def test_unsubscribe_is_a_write_not_a_delete(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_knowledge_base_test_query_is_a_read(client: AsyncClient) -> None:
-    """``POST /v1/knowledge/bases/{name}/test`` runs a retrieval query. The
-    verb is POST only because the query travels in a body; nothing is
-    mutated, so it is gated at ``read`` and a viewer may run it."""
-    resp = await client.post(
+async def test_knowledge_base_test_query_is_operator_plus(client: AsyncClient) -> None:
+    """``POST /v1/knowledge/bases/{name}/test`` 是 ``manifest:write``,不是读。
+
+    B-49 翻掉了阶段 1.5 的判断。当时的理由是「POST 只是因为查询走 body,什么都
+    没改,所以挂 read,viewer 可以跑」—— 说的是**数据库**没改。但这条会真打一次
+    embedding + 向量检索:对外是笔花钱的调用,谁都能无限点就是一个计费面。抬到
+    ``write`` 与本 router 其它会触发 embedding 的写(``reindex`` / ``reingest``)
+    同档。``viewer`` 是这个闸的 prover,``operator`` 证没收过头。
+    """
+    denied = await client.post(
         "/v1/knowledge/bases/nonexistent/test",
         json={"query": "q"},
         headers=_headers("viewer"),
     )
-    assert resp.status_code != 403, resp.text
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"]["code"] == "FORBIDDEN", denied.text
+    allowed = await client.post(
+        "/v1/knowledge/bases/nonexistent/test",
+        json={"query": "q"},
+        headers=_headers("operator"),
+    )
+    assert allowed.status_code != 403, allowed.text

@@ -429,7 +429,11 @@ async def test_eval_results_tenant_visibility_unaffected(setup: Setup, role: str
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["viewer", "operator"])
+# B-49 —— ``viewer`` 去掉:提名侧现在也挂 ``require("manifest", "write")``
+# (与 approve/reject 对齐),viewer 在 SE-8 归属闸之前就被角色闸 403 成
+# ``FORBIDDEN``,而这条要证的是 ``SKILL_SCOPE_FORBIDDEN``。同 P-5 对
+# approve/reject 做过的处理。
+@pytest.mark.parametrize("role", ["operator"])
 async def test_request_promote_403_for_non_admin_employee_agent_private(
     setup: Setup, role: str
 ) -> None:
@@ -506,8 +510,10 @@ async def test_reject_promote_403_for_non_admin_employee_agent_private(
 
 
 @pytest.mark.asyncio
-# P-5 — ``viewer`` dropped: a viewer may still open a request but no longer
-# decides one (403 at approve, see the P-5 section below).
+# P-5 — ``viewer`` dropped: it could still open a request back then but no
+# longer decided one (403 at approve, see the P-5 section below). B-49 closed
+# the other half too — opening a request is now ``manifest:write`` as well —
+# so a viewer reaches neither step.
 @pytest.mark.parametrize("role", ["operator"])
 async def test_promote_flow_tenant_visibility_unaffected(setup: Setup, role: str) -> None:
     """Regression guard (biggest risk of this change) — the C-3 gate must not

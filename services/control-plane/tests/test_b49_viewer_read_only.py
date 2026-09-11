@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -96,8 +96,7 @@ _WRITES: list[tuple[str, str, dict[str, Any]]] = [
 ]
 
 _CASES = [
-    pytest.param(method, path, kwargs, id=f"{method} {path}")
-    for method, path, kwargs in _WRITES
+    pytest.param(method, path, kwargs, id=f"{method} {path}") for method, path, kwargs in _WRITES
 ]
 
 

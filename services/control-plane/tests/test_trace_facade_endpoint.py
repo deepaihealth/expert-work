@@ -211,9 +211,14 @@ async def test_trace_owner_with_client_returns_ok_and_spans(trace_client: AsyncC
 @pytest.mark.asyncio
 async def test_trace_plain_owner_not_admin_still_200(trace_client: AsyncClient) -> None:
     """No system_admin (or even tenant-admin) requirement — a plain
-    ``viewer`` who owns the thread gets the trace, same as ``get_run``."""
+    ``viewer`` who owns the thread gets the trace, same as ``get_run``.
+
+    B-49 —— 建会话现在要 ``session:write``,viewer 建不了。用同一个 subject
+    (``owner``)的 operator 身份建、再拿 viewer 身份读:归属关系不变,被证的还是
+    「一个只读的 viewer,只要是本人的会话,就能读到 trace」。
+    """
     headers = _owner_headers(roles=("viewer",))
-    thread_id = await _create_session(trace_client, headers)
+    thread_id = await _create_session(trace_client, _owner_headers(roles=("operator",)))
     run_id = await _seed_run(trace_client, thread_id=thread_id, trace_id="trace-1")
     app = trace_client._transport.app  # type: ignore[attr-defined,union-attr]
     app.state.langfuse_read_client = _FakeLangfuseClient(trace=_fake_trace())
@@ -230,9 +235,12 @@ async def test_trace_plain_owner_not_admin_still_200(trace_client: AsyncClient) 
 
 @pytest.mark.asyncio
 async def test_trace_non_owner_returns_404(trace_client: AsyncClient) -> None:
+    # B-49 —— owner 的角色从 viewer 改成 operator:它只用来**建**会话,而建会话
+    # 现在要 ``session:write``。入侵者仍是 viewer(GET /trace 没有角色闸),所以
+    # 拦住它的仍然是归属闸的 404,判据没动。
     owner_headers = {
         "Authorization": "Bearer "
-        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-a", roles=("viewer",))
+        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-a", roles=("operator",))
     }
     intruder_headers = {
         "Authorization": "Bearer "
@@ -499,9 +507,12 @@ async def test_trace_raw_owner_returns_full_content(trace_client: AsyncClient) -
 
 @pytest.mark.asyncio
 async def test_trace_raw_non_owner_returns_404(trace_client: AsyncClient) -> None:
+    # B-49 —— owner 的角色从 viewer 改成 operator:它只用来**建**会话,而建会话
+    # 现在要 ``session:write``。入侵者仍是 viewer(GET /trace 没有角色闸),所以
+    # 拦住它的仍然是归属闸的 404,判据没动。
     owner_headers = {
         "Authorization": "Bearer "
-        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-a", roles=("viewer",))
+        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-a", roles=("operator",))
     }
     intruder_headers = {
         "Authorization": "Bearer "

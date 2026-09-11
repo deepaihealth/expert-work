@@ -166,11 +166,17 @@ async def test_admin_deletes_another_users_artifact_via_user_id(
 async def test_non_admin_action_on_someone_else_is_403(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
+    """B-49 —— 身份原来是 ``viewer``。这条证的是 **user-scope 轴**
+    (``USER_SCOPE_FORBIDDEN``:非 admin 不能拿 ``?user_id=`` 指着别人)。
+    ``DELETE /v1/artifacts`` 收窄到 ``session:write`` 后 viewer 会先撞 RBAC 闸,
+    拿到的是 ``FORBIDDEN`` 而不是 ``USER_SCOPE_FORBIDDEN`` —— 判据被顶掉。改成
+    ``operator``:过了角色闸,仍非 admin,被证的还是 user-scope。
+    """
     client, _, user_id = setup
-    viewer_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("viewer",))
+    operator_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("operator",))
     resp = await client.delete(
         f"/v1/artifacts/report.md?user_id={user_id}",
-        headers={"Authorization": f"Bearer {viewer_jwt}"},
+        headers={"Authorization": f"Bearer {operator_jwt}"},
     )
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "USER_SCOPE_FORBIDDEN"
