@@ -23,6 +23,7 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import type { TableColumnsType } from "antd";
@@ -178,11 +179,26 @@ export function WebhooksList() {
       title: t("webhooks.col_url"),
       dataIndex: "url",
       key: "url",
-      render: (v: string) => (
-        <Text code style={{ fontSize: 11, wordBreak: "break-all" }}>
-          {v}
-        </Text>
-      ),
+      // B-49 —— 非 admin 拿到的是脱敏地址(后端 `_redact_url`:留 scheme+host,
+      // 路径与 query 打码)。不加解释的 `/***` 看起来像坏了,所以挂个 tooltip
+      // 说清楚是谁看不到、为什么。
+      render: (v: string, record: WebhookEndpoint) =>
+        record.url_redacted ? (
+          <Tooltip title={t("webhooks.url_redacted_hint")}>
+            <Text
+              code
+              data-testid="webhook-url-redacted"
+              style={{ fontSize: 11, wordBreak: "break-all" }}
+              type="secondary"
+            >
+              {v}
+            </Text>
+          </Tooltip>
+        ) : (
+          <Text code style={{ fontSize: 11, wordBreak: "break-all" }}>
+            {v}
+          </Text>
+        ),
     },
     {
       title: t("webhooks.col_events"),

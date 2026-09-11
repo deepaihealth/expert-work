@@ -2572,6 +2572,7 @@ const zhCN: TranslationKeys = {
     all_agents: "全部智能体",
     col_name: "名称",
     col_url: "URL",
+    url_redacted_hint: "完整地址仅管理员可见 —— 投递路径通常本身就是凭据。",
     col_events: "事件",
     col_agent: "智能体",
     col_enabled: "启用",

@@ -668,3 +668,77 @@ async def _create_as(client: AsyncClient, *, subject: str, name: str) -> dict[st
     )
     assert resp.status_code == 201, resp.text
     return resp.json()
+
+
+# --------------------------------------------------------------- B-49 读侧脱敏
+#
+# `GET /v1/webhook-endpoints[/…]` 对每个员工角色开放是刻意的(`_require_admin`
+# 的 docstring 记着理由:admin-ui 的 Webhooks 页面自己没有角色闸,收窄读侧会把
+# 非 admin 员工 403 在门外)。但返回体里的 `url` 常常自带路径 token —— Slack 式
+# 的 `hooks.../services/T0/B0/XXXX` 整条就是凭据,拿到即可直接投递。
+#
+# 所以收的不是路由而是字段:非 admin 拿到 scheme+host,路径与 query 打码。
+
+
+def _viewer_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT, roles=('viewer',))}"
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # 路径即凭据 —— Slack / 飞书 / 企微 都是这个形状
+        ("https://hooks.example.com/services/T0/B0/XXXX", "https://hooks.example.com/***"),
+        # query 里的 token 同样要掉
+        ("https://hooks.example.com/ingest?token=abc", "https://hooks.example.com/***"),
+        # 端口要留着 —— 它是「投给谁」的一部分,不是凭据
+        ("https://hooks.example.com:8443/x", "https://hooks.example.com:8443/***"),
+        # 没有路径就没有可打的码,原样返回(打成 /*** 反而是在无中生有)
+        ("https://hooks.example.com", "https://hooks.example.com"),
+        ("https://hooks.example.com/", "https://hooks.example.com/"),
+    ],
+)
+def test_redact_url_keeps_the_host_and_drops_everything_after_it(raw: str, expected: str) -> None:
+    from control_plane.api.webhook_endpoints import _redact_url
+
+    assert _redact_url(raw) == expected
+
+
+async def test_list_redacts_url_for_a_viewer_but_not_for_an_admin(
+    client: AsyncClient,
+) -> None:
+    await _create(client, name="slack", url="https://hooks.example.com/services/T0/B0/SECRET")
+
+    admin_items = (await client.get("/v1/webhook-endpoints")).json()["items"]
+    assert admin_items[0]["url"] == "https://hooks.example.com/services/T0/B0/SECRET"
+    assert admin_items[0]["url_redacted"] is False
+
+    resp = await client.get("/v1/webhook-endpoints", headers=_viewer_headers())
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    assert items[0]["url"] == "https://hooks.example.com/***"
+    assert items[0]["url_redacted"] is True
+    # 其余字段照旧可见 —— 收的是凭据,不是这个页面。
+    assert items[0]["name"] == "slack"
+    assert items[0]["event_types"] == ["run.completed"]
+    assert items[0]["enabled"] is True
+
+
+async def test_get_by_id_redacts_url_for_a_viewer(client: AsyncClient) -> None:
+    created = await _create(client, name="one", url="https://hooks.example.com/a/b/SECRET")
+    endpoint_id = created["id"]
+
+    resp = await client.get(f"/v1/webhook-endpoints/{endpoint_id}", headers=_viewer_headers())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["url"] == "https://hooks.example.com/***"
+    assert resp.json()["url_redacted"] is True
+
+
+async def test_creation_response_never_redacts(client: AsyncClient) -> None:
+    """Only an admin can POST, and the creator must see back what they sent —
+    redacting it would hide a typo in the one place it still matters."""
+    created = await _create(client, name="two", url="https://hooks.example.com/x/y/SECRET")
+    assert created["url"] == "https://hooks.example.com/x/y/SECRET"
+    assert created["url_redacted"] is False
