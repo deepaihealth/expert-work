@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -95,3 +96,32 @@ async def test_invoke_tool_threads_tool_call_id_into_ctx() -> None:
     tool = _make_tool(name="probe", call=_call)  # 按文件内现有工具构造惯例
     await _invoke_tool(tool, {}, "call-42", ToolContext())
     assert seen["tool_call_id"] == "call-42"
+
+
+# --- 工作区分层 agent_key ----------------------------------------------------
+
+
+def test_agent_key_lifts_from_configurable() -> None:
+    """``agent_key`` 从 ``configurable`` 抬进 ``ToolContext`` —— 工具层判归属的唯一来源。"""
+    ctx = _build_tool_context(
+        {"configurable": {"tenant_id": str(uuid4()), "agent_key": "ai-health-plan-1a2b3c4d"}}
+    )
+
+    assert ctx.agent_key == "ai-health-plan-1a2b3c4d"
+
+
+def test_agent_key_defaults_to_empty_when_absent() -> None:
+    """没绑 agent 的调用(合成 eval / 未升级的调用方)拿到空串,不是 ``None``。
+
+    与 ``agent_key_envs("")`` 的既有「空串=不注入」语义对齐,工具层据此走回落。
+    """
+    ctx = _build_tool_context({"configurable": {"tenant_id": str(uuid4())}})
+
+    assert ctx.agent_key == ""
+
+
+def test_agent_key_rejects_non_string() -> None:
+    """``configurable`` 是不可信输入(与 ``_string_list`` / ``_parse_uuid`` 同一姿态)。"""
+    ctx = _build_tool_context({"configurable": {"agent_key": 12345}})
+
+    assert ctx.agent_key == ""
