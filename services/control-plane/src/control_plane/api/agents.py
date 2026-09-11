@@ -1751,6 +1751,7 @@ def build_agents_router() -> APIRouter:
                 event_store=event_store,
                 stream_bridge=runtime.stream_bridge,
                 run_store=run_store,
+                usage_store=request.app.state.token_usage_store,
                 tenant_id=tenant_id,
                 stream_format=payload.stream_format,
             )
