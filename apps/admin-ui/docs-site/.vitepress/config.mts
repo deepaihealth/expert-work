@@ -85,6 +85,7 @@ export default withMermaid(
                 { text: "5.6 工作区文件", link: "/guide/query#_5-6-工作区文件" },
                 { text: "5.7 产物", link: "/guide/query#_5-7-产物" },
                 { text: "5.8 对话条目", link: "/guide/query#_5-8-对话条目" },
+                { text: "5.9 run 用量", link: "/guide/query#_5-9-run-用量" },
               ],
             },
           ],
