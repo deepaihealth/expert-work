@@ -42,6 +42,9 @@ export interface WebhookEndpoint {
   id: string;
   name: string;
   url: string;
+  /** B-49 —— true 时 ``url`` 只剩 scheme+host,路径与 query 已被后端打码
+   *  (投递路径通常本身就是凭据)。完整地址仅 admin 可见。 */
+  url_redacted: boolean;
   event_types: WebhookEventType[];
   agent_name: string | null;
   enabled: boolean;

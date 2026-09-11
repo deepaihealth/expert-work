@@ -130,6 +130,51 @@ describe("WebhooksList", () => {
     expect(screen.getByText("All agents")).toBeInTheDocument();
   });
 
+  // B-49 —— 非 admin 读者拿到的 url 被后端打了码(投递路径通常本身就是凭据)。
+  // 不加解释的 `/***` 看起来像坏了,所以要有个说明得清楚的挂件。
+  it("marks a redacted url so it does not read as broken", async () => {
+    installAdapter([
+      {
+        match: (u) => u === "/v1/webhook-endpoints",
+        respond: () => ({
+          items: [
+            {
+              ...endpointRow,
+              url: "https://hooks.example.com/***",
+              url_redacted: true,
+            },
+          ],
+          total: 1,
+          cross_tenant: false,
+        }),
+      },
+    ]);
+    renderWebhooks();
+    await waitFor(() =>
+      expect(screen.getByTestId("webhook-url-redacted")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("webhook-url-redacted")).toHaveTextContent(
+      "https://hooks.example.com/***",
+    );
+  });
+
+  it("leaves a full url unmarked for an admin", async () => {
+    installAdapter([
+      {
+        match: (u) => u === "/v1/webhook-endpoints",
+        respond: () => ({
+          items: [{ ...endpointRow, url_redacted: false }],
+          total: 1,
+          cross_tenant: false,
+        }),
+      },
+    ]);
+    renderWebhooks();
+    await waitFor(() => expect(screen.getByText("ops-notify")).toBeInTheDocument());
+    expect(screen.queryByTestId("webhook-url-redacted")).not.toBeInTheDocument();
+    expect(screen.getByText("https://hooks.example.com/ingest")).toBeInTheDocument();
+  });
+
   it("shows cross-tenant banner when backend says so", async () => {
     installAdapter([
       {

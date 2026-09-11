@@ -16,6 +16,7 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -68,13 +69,41 @@ def _secret_ref(endpoint_id: UUID) -> str:
     return f"webhook-endpoint/{endpoint_id}"
 
 
-def _endpoint_dict(record: WebhookEndpointRecord, *, secret: str | None = None) -> dict[str, Any]:
+def _redact_url(url: str) -> str:
+    """B-49 —— keep scheme + host + port, drop everything after it.
+
+    A webhook URL's path is routinely the credential itself: Slack, 飞书 and
+    企微 all hand out ``https://hooks…/services/T0/B0/XXXX`` where possession
+    of the path is possession of the delivery right. ``_validate_url`` only
+    rejects private / metadata targets, so every registered URL is a public
+    one somebody can POST to. The host stays because "who do we deliver to"
+    is the part a read-only bystander legitimately needs; the path and query
+    are the part they must not walk away with.
+
+    A URL with no path and no query has nothing to redact — returned as-is
+    rather than grown a ``/***`` that implies a secret it never had.
+    """
+    parsed = urlsplit(url)
+    if not parsed.path.strip("/") and not parsed.query and not parsed.fragment:
+        return url
+    return urlunsplit((parsed.scheme, parsed.netloc, "/***", "", ""))
+
+
+def _endpoint_dict(
+    record: WebhookEndpointRecord, *, secret: str | None = None, redact_url: bool = False
+) -> dict[str, Any]:
     """Serialise an endpoint row. ``secret`` (HMAC plaintext) is shown once
-    at creation and never again (Mini-ADR HX-J5)."""
+    at creation and never again (Mini-ADR HX-J5).
+
+    ``redact_url`` masks the delivery path for non-admin readers — see
+    :func:`_redact_url`. ``url_redacted`` is always present so the console
+    can say *why* an address is masked instead of leaving it looking broken.
+    """
     body: dict[str, Any] = {
         "id": str(record.id),
         "name": record.name,
-        "url": record.url,
+        "url": _redact_url(record.url) if redact_url else record.url,
+        "url_redacted": redact_url,
         "event_types": list(record.event_types),
         "agent_name": record.agent_name,
         "enabled": record.enabled,
@@ -116,6 +145,11 @@ def _require_admin(request: Request) -> None:
     (``apps/admin-ui/src/pages/WebhooksList.tsx``), so tightening reads too
     would 403 the page for non-admin employees who merely want to see
     already-registered endpoints.
+
+    B-49 —— 读侧开放不等于读侧无防护:一个非 admin 读者拿到的 ``url`` 是
+    脱敏过的(``_redact_url``:留 scheme+host+port,路径与 query 打码),因为
+    投递路径本身通常就是凭据。**收的是字段,不是路由** —— 这样页面对每个
+    员工角色照常可用,而 viewer 拿不到能直接 POST 的地址。
     """
     if not is_admin(request.state.principal):
         raise HTTPException(
@@ -299,9 +333,10 @@ def build_webhook_endpoints_router() -> APIRouter:
                 items = await store.list_all_tenants(agent_name=agent_name)
             else:
                 items = await store.list_by_tenant(tenant_id=scope.tenant_id, agent_name=agent_name)
+        redact = not is_admin(request.state.principal)
         return JSONResponse(
             content={
-                "items": [_endpoint_dict(e) for e in items],
+                "items": [_endpoint_dict(e, redact_url=redact) for e in items],
                 "total": len(items),
                 "cross_tenant": isinstance(scope, CrossTenant),
             }
@@ -329,7 +364,9 @@ def build_webhook_endpoints_router() -> APIRouter:
             record = await store.get(endpoint_id=endpoint_id, tenant_id=scope.tenant_id)
         if record is None:
             raise HTTPException(status_code=404, detail="webhook endpoint not found")
-        return JSONResponse(content=_endpoint_dict(record))
+        return JSONResponse(
+            content=_endpoint_dict(record, redact_url=not is_admin(request.state.principal))
+        )
 
     @router.patch(
         "/{endpoint_id}",

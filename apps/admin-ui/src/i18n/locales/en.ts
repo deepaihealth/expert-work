@@ -2418,6 +2418,7 @@ export interface TranslationKeys {
     all_agents: string;
     col_name: string;
     col_url: string;
+    url_redacted_hint: string;
     col_events: string;
     col_agent: string;
     col_enabled: string;
@@ -5829,6 +5830,8 @@ const en: TranslationKeys = {
     all_agents: "All agents",
     col_name: "Name",
     col_url: "URL",
+    url_redacted_hint:
+      "Full address is admin-only — the delivery path is usually the credential itself.",
     col_events: "Events",
     col_agent: "Agent",
     col_enabled: "Enabled",
