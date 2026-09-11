@@ -258,6 +258,7 @@ async def _usage(
     inp: int,
     out: int,
     cache_read: int = 0,
+    usage_kind: str = "conversation",
 ) -> None:
     await store.insert(
         TokenUsageRecord(
@@ -269,6 +270,7 @@ async def _usage(
             input_tokens=inp,
             output_tokens=out,
             cache_read_tokens=cache_read,
+            usage_kind=usage_kind,
         )
     )
 
@@ -309,6 +311,92 @@ async def test_totals_skips_null_trace_and_unrequested_ids(
 @pytest.mark.asyncio
 async def test_totals_empty_input_returns_empty(store: InMemoryTokenUsageStore) -> None:
     assert await store.totals_by_trace_ids([]) == {}
+
+
+# B-52 —— 对外的按-run 用量只能算对话开销。``quality_sampling``(质量抽检)与
+# ``skill_evolution``(技能进化)是平台自身的流程,算到调用方头上就是替我们的内部
+# 开销收钱。默认不过滤,保持控制台 Runs 列表/详情的现有行为。
+
+
+@pytest.mark.asyncio
+async def test_totals_default_counts_every_usage_kind(
+    store: InMemoryTokenUsageStore,
+) -> None:
+    """不传 ``usage_kinds`` = 现有行为,一个 kind 都不能少。"""
+    tenant = uuid4()
+    await _usage(store, tenant_id=tenant, trace_id="dddd", model="m1", inp=100, out=10)
+    await _usage(
+        store,
+        tenant_id=tenant,
+        trace_id="dddd",
+        model="m1",
+        inp=7,
+        out=1,
+        usage_kind="quality_sampling",
+    )
+    await _usage(
+        store,
+        tenant_id=tenant,
+        trace_id="dddd",
+        model="m1",
+        inp=3,
+        out=1,
+        usage_kind="skill_evolution",
+    )
+
+    totals = (await store.totals_by_trace_ids(["dddd"]))["dddd"]
+    assert totals.input_tokens == 110
+    assert totals.llm_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_totals_filters_to_the_requested_usage_kinds(
+    store: InMemoryTokenUsageStore,
+) -> None:
+    """传了就只算集合内的 —— 桶级与 trace 级都要跟着收窄。"""
+    tenant = uuid4()
+    await _usage(store, tenant_id=tenant, trace_id="eeee", model="m1", inp=100, out=10)
+    await _usage(
+        store,
+        tenant_id=tenant,
+        trace_id="eeee",
+        model="m2",
+        inp=7,
+        out=1,
+        usage_kind="quality_sampling",
+    )
+
+    totals = (await store.totals_by_trace_ids(["eeee"], usage_kinds=("conversation",)))["eeee"]
+    assert totals.input_tokens == 100
+    assert totals.output_tokens == 10
+    assert totals.llm_calls == 1
+    # 被过滤掉的那行是另一个模型 —— 分桶也必须跟着收窄,不能只收总数。
+    assert totals.models == ("m1",)
+    assert [b.model for b in totals.by_model] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_totals_filtered_trace_disappears_rather_than_returning_zero(
+    store: InMemoryTokenUsageStore,
+) -> None:
+    """一个 trace 的行全被过滤掉 → 该 id **缺席**,不是返回一个零值 totals。
+
+    缺席 = 无记录,零值 = 确有其事的零用量 —— 两者不可混同(``artifacts`` 立下的
+    既有口径,对外帧上的 ``usage_by_model`` 靠它区分)。
+    """
+    tenant = uuid4()
+    await _usage(
+        store,
+        tenant_id=tenant,
+        trace_id="ffff",
+        model="m1",
+        inp=7,
+        out=1,
+        usage_kind="quality_sampling",
+    )
+
+    totals = await store.totals_by_trace_ids(["ffff"], usage_kinds=("conversation",))
+    assert totals == {}
 
 
 @pytest.mark.asyncio
