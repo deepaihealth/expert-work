@@ -35,6 +35,11 @@ from control_plane.api.tenant_config import (
 )
 from control_plane.audit import emit
 from control_plane.invalidation_bus import InvalidationEvent
+from control_plane.platform_provider_uses import (
+    PlatformProviderUse,
+    PlatformProviderUseOverride,
+    resolve_platform_provider_uses,
+)
 from control_plane.platform_secrets import PlatformSecretsService
 from control_plane.tenancy import TenantConfigNotConfiguredError
 from control_plane.tenant_scope import bypass_rls_session
@@ -196,6 +201,49 @@ def _env_tool_refs(request: Request) -> dict[Tool, str]:
     return dict(settings.effective_platform_tool_credentials)
 
 
+async def _platform_provider_uses(request: Request) -> dict[str, list[PlatformProviderUse]]:
+    """B-51 —— provider → 平台自身依赖它的功能列表。
+
+    登记表(``platform_provider_uses.PLATFORM_PROVIDER_USES``)是 env 层的
+    声明;两个功能的实况还压着 DB 覆盖层,在这里修正:
+
+    * 向量化 / 重排 —— ``PlatformEmbeddingConfigService``(DB 行赢,行在
+      就不回落 env;重排整条 ``None`` 就是关着的);
+    * 质量裁判 —— ``PlatformQualityConfigService``,``enabled`` 是部署级
+      硬闸 **AND** UI 开关(后者默认关),只看 settings 会把一个没开的功能
+      报成开着,正是 banner 最该避免的噪音。
+
+    轻量测试 app 不挂 settings → 返回空表(与 ``_env_provider_refs`` 同款
+    降级),凭据页照旧只少这一列。
+    """
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None:
+        return {}
+    overrides: dict[str, PlatformProviderUseOverride] = {}
+    embedding_service = getattr(request.app.state, "platform_embedding_config_service", None)
+    if embedding_service is not None:
+        embedding = await embedding_service.effective_embedding_config()
+        if embedding is not None:
+            overrides["embedding"] = PlatformProviderUseOverride(
+                provider=embedding[0], model=embedding[1]
+            )
+        rerank = await embedding_service.effective_rerank_config()
+        overrides["rerank"] = (
+            PlatformProviderUseOverride(provider=rerank[0], model=rerank[1], enabled=True)
+            if rerank is not None
+            else PlatformProviderUseOverride(enabled=False)
+        )
+    quality_service = getattr(request.app.state, "quality_config_service", None)
+    if quality_service is not None:
+        quality = await quality_service.effective()
+        overrides["quality_judge"] = PlatformProviderUseOverride(
+            provider=quality.judge_provider,
+            model=quality.judge_model,
+            enabled=quality.enabled,
+        )
+    return resolve_platform_provider_uses(settings, overrides=overrides)
+
+
 def _canonical_secret_name(
     *,
     provider: str | None = None,
@@ -270,6 +318,7 @@ def build_platform_config_router() -> APIRouter:
         env_tools = _env_tool_refs(request)
         agent_store = _get_agent_spec_store(request)
         embedding_provider = _embedding_provider(request)
+        platform_uses = await _platform_provider_uses(request)
         async with bypass_rls_session():
             # Y-MK — group provider rows by provider (one per key_id).
             db_prov_keys: dict[str, list[PlatformProviderSecretRecord]] = {}
@@ -310,6 +359,9 @@ def build_platform_config_router() -> APIRouter:
                     for k in keys
                 ],
                 "used_by_agents": prov_counts.get(provider, 0),
+                # B-51 —— 平台自身的依赖。``used_by_agents`` 只数 agent,
+                # 一行「未设置 + 被引用 0」曾经把「平台在用」说成「没人用」。
+                "platform_uses": [use.as_dict() for use in platform_uses.get(provider, [])],
                 "tenant_override_count": tenant_prov_counts.get(provider, 0),
             }
 
