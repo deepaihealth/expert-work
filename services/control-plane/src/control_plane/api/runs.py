@@ -49,6 +49,7 @@ from control_plane.api._authz import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import build_event_producer, make_run_probe
+from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import (
     caller_owns_thread,
@@ -1302,6 +1303,13 @@ async def spawn_run(
             last_event_id=request.headers.get("Last-Event-ID"),
             hide_events=hide_events,
             stream_format=stream_format,
+            # B-52 —— end 帧带本 run 的用量;装配与口径在 ``_run_usage``。
+            load_usage=make_usage_loader(
+                usage=request.app.state.token_usage_store,
+                runs=request.app.state.run_store,
+                run_id=run_record.run_id,
+                tenant_id=tenant_id,
+            ),
         ),
         media_type="text/event-stream",
         headers=headers,
@@ -2050,6 +2058,14 @@ def build_runs_router() -> APIRouter:
                 tenant_id=target_tenant,
                 scope=lambda: applied_scope(scope),
             ),
+            # B-52 —— 与探针同款:跨租户读钉在目标租户的 scope 上。
+            load_usage=make_usage_loader(
+                usage=request.app.state.token_usage_store,
+                runs=runs,
+                run_id=run_id,
+                tenant_id=target_tenant,
+                scope=lambda: applied_scope(scope),
+            ),
             since_seq=since_seq,
             scope=lambda: applied_scope(scope),
         )
@@ -2140,6 +2156,12 @@ def build_runs_router() -> APIRouter:
                 run_manager=runtime.run_manager,
                 is_disconnected=request.is_disconnected,
                 last_event_id=request.headers.get("Last-Event-ID"),
+                load_usage=make_usage_loader(
+                    usage=request.app.state.token_usage_store,
+                    runs=request.app.state.run_store,
+                    run_id=run_record.run_id,
+                    tenant_id=request.state.tenant_id,
+                ),
             ),
             media_type="text/event-stream",
             headers={

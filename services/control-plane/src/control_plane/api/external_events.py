@@ -32,6 +32,7 @@ from control_plane.api._run_event_stream import (
     build_event_producer,
     make_run_probe,
 )
+from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._user_scope import get_user_repo
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -69,6 +70,9 @@ async def build_events_response(
     # 非属主副本时靠它轮询终态。两个调用方(本模块续传端点 / agents.py 幂等
     # 重放)都必须传;None 只为测试与旧行为兼容。
     run_probe: Callable[[], Awaitable[tuple[RunStatus, list[dict[str, Any]] | None]]] | None = None,
+    # B-52 —— 同样只是转发给 ``build_event_producer``;装配与口径在
+    # ``control_plane.api._run_usage``。
+    load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
     since_seq: int | None = None,
     stream_format: str = STREAM_FORMAT_LEGACY,
 ) -> StreamingResponse:
@@ -123,6 +127,7 @@ async def build_events_response(
         event_store=event_store,
         stream_bridge=stream_bridge,
         run_probe=run_probe,
+        load_usage=load_usage,
         since_seq=since_seq,
         scope=None,
         # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt 对第三方 API key
@@ -203,6 +208,12 @@ def build_external_events_router() -> APIRouter:
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             run_probe=make_run_probe(runs=runs, run_id=run_id, tenant_id=tenant_id),
+            load_usage=make_usage_loader(
+                usage=request.app.state.token_usage_store,
+                runs=runs,
+                run_id=run_id,
+                tenant_id=tenant_id,
+            ),
             since_seq=since_seq,
             stream_format=stream_format,
         )

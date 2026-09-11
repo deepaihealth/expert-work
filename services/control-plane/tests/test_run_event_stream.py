@@ -1238,9 +1238,7 @@ async def test_replay_end_frame_carries_usage() -> None:
     store = InMemoryRunEventStore()
     await _seed_rows(store, run_id, [0])
 
-    frames, _ = await _collect_replay(
-        run_id=run_id, store=store, load_usage=_stub_usage_loader()
-    )
+    frames, _ = await _collect_replay(run_id=run_id, store=store, load_usage=_stub_usage_loader())
     assert _end_data(frames)["usage_by_model"] == [_USAGE_BUCKET]
 
 
