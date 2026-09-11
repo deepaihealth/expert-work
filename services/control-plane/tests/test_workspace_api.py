@@ -406,12 +406,16 @@ async def test_admin_deletes_another_users_file_via_user_id(
 async def test_non_admin_delete_someone_else_is_403(
     setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
 ) -> None:
+    """B-49 —— 身份原来是 ``viewer``,同 ``test_artifacts_api.py`` 那条的理由:
+    ``DELETE /v1/workspace/file`` 收窄到 ``session:write`` 后 viewer 先撞 RBAC
+    闸,``USER_SCOPE_FORBIDDEN`` 这个判据就再也验不到了。改成 ``operator``。
+    """
     client, supervisor, user_id = setup
-    viewer_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("viewer",))
+    operator_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("operator",))
     resp = await client.delete(
         "/v1/workspace/file",
         params={"path": "out.txt", "user_id": str(user_id)},
-        headers={"Authorization": f"Bearer {viewer_jwt}"},
+        headers={"Authorization": f"Bearer {operator_jwt}"},
     )
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "USER_SCOPE_FORBIDDEN"

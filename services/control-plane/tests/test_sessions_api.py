@@ -677,8 +677,16 @@ async def test_other_tenant_cannot_see_session(session_client: AsyncClient) -> N
 
 
 def _user_headers(subject: str) -> dict[str, str]:
-    """Bearer headers for a non-admin user in the default tenant."""
-    jwt = make_test_jwt(tenant_id=_DEFAULT_TENANT, subject=subject, roles=("viewer",))
+    """Bearer headers for a non-admin user in the default tenant.
+
+    B-49 —— 原来是 ``viewer``。这些用例证的是**归属轴**(别人的会话拿 404、
+    自己的会话拿 200),viewer 只是随手取的「非 admin 身份」。收窄后
+    (create / :pause / PATCH / DELETE 都挂 ``session:write``)viewer 连门都进
+    不去,403 会把归属轴的判据整个盖掉 —— 那等于让测试替旧行为背书。改成
+    ``operator``:一样不是 admin(``is_admin()`` 仍为 False,归属闸照样生效),
+    但持有 ``session:write``,所以被证的仍然是归属而不是角色。
+    """
+    jwt = make_test_jwt(tenant_id=_DEFAULT_TENANT, subject=subject, roles=("operator",))
     return {"Authorization": f"Bearer {jwt}"}
 
 

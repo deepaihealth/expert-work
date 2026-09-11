@@ -648,14 +648,19 @@ async def test_full_acceptance_flow(runs_client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_user_cannot_run_another_users_session(runs_client: AsyncClient) -> None:
-    """A run trigger on another user's session is rejected (404)."""
+    """A run trigger on another user's session is rejected (404).
+
+    B-49 —— 两个身份原来是 ``viewer``;``POST /v1/sessions`` 与
+    ``POST /{tid}/runs`` 收窄到 ``session:write`` 后 viewer 进不了门,403 会盖掉
+    本用例要证的归属轴。改成 ``operator``(仍非 admin,归属闸照旧)。
+    """
     user_a = {
         "Authorization": "Bearer "
-        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-a", roles=("viewer",))
+        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-a", roles=("operator",))
     }
     user_b = {
         "Authorization": "Bearer "
-        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-b", roles=("viewer",))
+        + make_test_jwt(tenant_id=_DEFAULT_TENANT, subject="user-b", roles=("operator",))
     }
     create = await runs_client.post(
         "/v1/sessions",

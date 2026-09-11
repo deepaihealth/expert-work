@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from langchain_core.runnables import RunnableConfig
 
-from control_plane.api._authz import console_only, require_key_scope
+from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._user_scope import (
     caller_owns_thread,
     get_user_repo,
@@ -148,7 +148,13 @@ def build_plan_router() -> APIRouter:
     @router.put(
         "/{thread_id}/plan",
         response_model=None,
-        dependencies=[Depends(require_key_scope("write")), Depends(console_only())],
+        # B-49 —— create-or-replace 覆写会话的计划,是写操作;此前零角色闸,
+        # viewer 能整份替换掉自己会话的计划。同档 ``session:write``。
+        dependencies=[
+            Depends(require_key_scope("write")),
+            Depends(console_only()),
+            Depends(require("session", "write")),
+        ],
     )
     async def put_plan(
         thread_id: UUID,

@@ -245,9 +245,16 @@ async def test_admin_key_403_on_console_plane(
 
 @pytest.mark.asyncio
 async def test_user_jwt_never_hits_key_gate(client: AsyncClient) -> None:
-    """Human principals keep their pre-gate behavior on this plane."""
-    headers = _user_headers(("viewer",))
-    # A viewer member triggering a run on an unknown thread: 404 (lookup),
+    """Human principals keep their pre-gate behavior on this plane.
+
+    B-49 —— 身份原来是 ``viewer``。这条证的是 ``require_key_scope`` **只管
+    service_account**、人的 JWT 一律放过;``/runs`` 与 ``:purge`` 收窄到
+    ``session:write`` 后 viewer 会被那道 RBAC 闸 403,判据就再也不是 key gate
+    了。改成 ``operator``:一样是人的 JWT(``subject_type=user``,key gate 照样
+    不管它),所以被证的仍然是 key gate 不碰人。
+    """
+    headers = _user_headers(("operator",))
+    # An employee member triggering a run on an unknown thread: 404 (lookup),
     # never the key gate's 403.
     response = await client.post(f"/v1/sessions/{_TID}/runs", headers=headers, json={"input": "hi"})
     assert response.status_code == 404, response.text

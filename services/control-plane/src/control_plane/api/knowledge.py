@@ -624,7 +624,11 @@ def build_knowledge_router() -> APIRouter:
     @router.post(
         "/bases/{name}/test",
         response_model=None,
-        dependencies=[Depends(require("manifest", "read"))],
+        # B-49 —— 阶段 1.5 按「POST 只是因为查询走 body,什么都没改」判成
+        # ``manifest:read``。但这条会真打一次 embedding + 向量检索:对外是花钱的
+        # 调用,不是免费的读。抬到 ``manifest:write``(operator+),与本 router 里
+        # 其它会触发 embedding 的写(``reindex`` / ``reingest``)同档。
+        dependencies=[Depends(require("manifest", "write"))],
     )
     async def test_retrieval(
         name: str,
