@@ -19,6 +19,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import ApprovalRecord, AuditPage, AuditQuery
+from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunStore,
@@ -40,6 +41,9 @@ from tests.auth_fixtures import (
     grant_system_admin,
     make_test_jwt,
 )
+
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
 
 
 class _SeedState(TypedDict):
@@ -504,6 +508,9 @@ async def _seed_artifact_for_thread(
     await app.state.artifact_store.save_version(
         tenant_id=_DEFAULT_TENANT,
         user_id=meta.user_id,
+        # B-50 —— 会话面按会话自己的 agent 收口,所以产物必须存在**这个会话的**
+        # agent 名下;随便填一个 key 会让下载 404(而那正是收口在起作用)。
+        agent_key=sanitize_agent_key(meta.agent_name) if meta.agent_name else "",
         name=name,
         kind="document",
         path_in_workspace=name,
@@ -1294,6 +1301,9 @@ async def test_session_workspace_file_and_artifact_download_system_admin_200(
         await app.state.artifact_store.save_version(
             tenant_id=_DEFAULT_TENANT,
             user_id=meta.user_id,
+            # B-50 —— 会话面按会话自己的 agent 收口,所以产物必须存在**这个会话的**
+            # agent 名下;随便填一个 key 会让下载 404(而那正是收口在起作用)。
+            agent_key=sanitize_agent_key(meta.agent_name) if meta.agent_name else "",
             name="report.pdf",
             kind="document",
             path_in_workspace="report.pdf",

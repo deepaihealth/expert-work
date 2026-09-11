@@ -27,6 +27,9 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 _TENANT = DEFAULT_DEV_TENANT_ID
 _SUBJECT = "user-a"
 _CONTENT = b"report body"
@@ -55,12 +58,28 @@ async def _seed() -> tuple[InMemoryTenantUserStore, InMemoryArtifactStore, UUID]
     await artifacts.save_version(
         tenant_id=_TENANT,
         user_id=user.id,
+        agent_key=_AGENT_KEY,
         name="report.md",
         kind="document",
         path_in_workspace="report.md",
         created_in_thread="t-1",
     )
     return users, artifacts, user.id
+
+
+async def _artifact_id(client: AsyncClient, name: str, *, user_id: object = None) -> str:
+    """B-50 —— 控制台按 ``artifact_id`` 寻址(四元组唯一键之后 name 不是身份)。
+
+    测试从列表端点回读 id,与前端拿到的是同一份数据 —— 而不是伸手进 store
+    取内部状态,那样测不出「列表有没有把 id 返出来」。
+    """
+    params = {} if user_id is None else {"user_id": str(user_id)}
+    resp = await client.get("/v1/artifacts", params=params)
+    return str(next(a["id"] for a in resp.json()["artifacts"] if a["name"] == name))
+
+
+#: 不存在的产物 id —— 用来测 404(以前是 "missing.md")。
+_MISSING_ID = "00000000-0000-4000-8000-0000000000ff"
 
 
 @pytest.fixture
@@ -89,7 +108,16 @@ async def test_list_artifacts_returns_user_artifacts(
     resp = await client.get("/v1/artifacts")
     assert resp.status_code == 200
     artifacts = resp.json()["artifacts"]
-    assert artifacts == [{"name": "report.md", "kind": "document", "latest_version": 1}]
+    assert artifacts == [
+        {
+            # B-50 —— 列表带 id(寻址身份)与 agent_key(运维分得出两条同名产物)。
+            "id": artifacts[0]["id"],
+            "agent_key": _AGENT_KEY,
+            "name": "report.md",
+            "kind": "document",
+            "latest_version": 1,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -113,8 +141,15 @@ async def test_admin_lists_another_users_artifacts_via_user_id(
     client, _, user_id = setup
     resp = await client.get(f"/v1/artifacts?user_id={user_id}", headers=_headers("user-b"))
     assert resp.status_code == 200, resp.text
-    assert resp.json()["artifacts"] == [
-        {"name": "report.md", "kind": "document", "latest_version": 1}
+    listed = resp.json()["artifacts"]
+    assert listed == [
+        {
+            "id": listed[0]["id"],
+            "agent_key": _AGENT_KEY,
+            "name": "report.md",
+            "kind": "document",
+            "latest_version": 1,
+        }
     ]
 
 
@@ -142,7 +177,10 @@ async def test_admin_downloads_another_users_artifact_via_user_id(
     client, _, user_id = setup
     resp = await client.get(
         "/v1/artifacts/download",
-        params={"name": "report.md", "user_id": str(user_id)},
+        params={
+            "artifact_id": await _artifact_id(client, "report.md", user_id=user_id),
+            "user_id": str(user_id),
+        },
         headers=_headers("user-b"),
     )
     assert resp.status_code == 200, resp.text
@@ -154,11 +192,12 @@ async def test_admin_deletes_another_users_artifact_via_user_id(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, artifacts, user_id = setup
-    resp = await client.delete(
-        f"/v1/artifacts/report.md?user_id={user_id}", headers=_headers("user-b")
-    )
+    rid = await _artifact_id(client, "report.md", user_id=user_id)
+    resp = await client.delete(f"/v1/artifacts/{rid}?user_id={user_id}", headers=_headers("user-b"))
     assert resp.status_code == 200, resp.text
-    remaining = await artifacts.list_for_user(tenant_id=_TENANT, user_id=user_id)
+    remaining = await artifacts.list_for_user(
+        tenant_id=_TENANT, user_id=user_id, agent_key=_AGENT_KEY
+    )
     assert all(a.name != "report.md" for a in remaining)
 
 
@@ -174,8 +213,9 @@ async def test_non_admin_action_on_someone_else_is_403(
     """
     client, _, user_id = setup
     operator_jwt = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("operator",))
+    rid = await _artifact_id(client, "report.md", user_id=user_id)
     resp = await client.delete(
-        f"/v1/artifacts/report.md?user_id={user_id}",
+        f"/v1/artifacts/{rid}?user_id={user_id}",
         headers={"Authorization": f"Bearer {operator_jwt}"},
     )
     assert resp.status_code == 403
@@ -187,7 +227,9 @@ async def test_download_artifact_returns_content(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, _ = setup
-    resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "report.md")}
+    )
     assert resp.status_code == 200
     assert resp.content == _CONTENT
     # MIME-aware (Mini-ADR J-25 § 10.5) — ``.md`` is text-like, inline.
@@ -201,10 +243,12 @@ async def test_download_artifact_backfills_digest(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, artifacts, user_id = setup
-    await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "report.md")}
+    )
 
     latest = await artifacts.get_latest_version(
-        tenant_id=_TENANT, user_id=user_id, name="report.md"
+        tenant_id=_TENANT, user_id=user_id, agent_key=_AGENT_KEY, name="report.md"
     )
     assert latest is not None
     assert latest.size_bytes == len(_CONTENT)
@@ -216,7 +260,7 @@ async def test_download_unknown_artifact_returns_404(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, _ = setup
-    resp = await client.get("/v1/artifacts/download", params={"name": "missing.md"})
+    resp = await client.get("/v1/artifacts/download", params={"artifact_id": _MISSING_ID})
     assert resp.status_code == 404
 
 
@@ -237,7 +281,9 @@ async def test_download_reports_permission_denied_as_server_error(
         "PermissionError(13, 'Permission denied'): "
         "'/mnt/workspaces/t-1/u-1/report.md' uid=10002 mode=0o600"
     )
-    resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "report.md")}
+    )
     assert resp.status_code == 500, resp.text
     assert "/mnt/workspaces" not in resp.text
     assert "10002" not in resp.text
@@ -262,7 +308,9 @@ async def test_download_reports_too_large_as_413(
     store.workspace_file_error = WorkspaceFileTooLargeError(
         "workspace file 'report.md' exceeds the 67108864-byte download cap"
     )
-    resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "report.md")}
+    )
     assert resp.status_code == 413, resp.text
     assert "size limit" in resp.json()["detail"]
 
@@ -275,7 +323,9 @@ async def test_download_still_404s_on_a_generic_supervisor_error(
     client, _, _ = setup
     store = client._transport.app.state.workspace_store  # type: ignore[attr-defined,union-attr]
     store.workspace_file_error = SandboxSupervisorError("content gone")
-    resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "report.md")}
+    )
     assert resp.status_code == 404, resp.text
 
 
@@ -294,7 +344,10 @@ async def test_download_without_supervisor_returns_503() -> None:
     async with AsyncClient(
         transport=transport, base_url="http://cp.test", headers=_headers()
     ) as client:
-        resp = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+        resp = await client.get(
+            "/v1/artifacts/download",
+            params={"artifact_id": await _artifact_id(client, "report.md")},
+        )
     assert resp.status_code == 503
 
 
@@ -319,10 +372,15 @@ async def test_download_429_when_download_count_quota_exhausted(
 
     # 2 downloads within capacity (200 + 200).
     for _ in range(2):
-        ok = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+        ok = await client.get(
+            "/v1/artifacts/download",
+            params={"artifact_id": await _artifact_id(client, "report.md")},
+        )
         assert ok.status_code == 200
     # 3rd exceeds capacity; slow drip cannot refill in-time.
-    denied = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    denied = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "report.md")}
+    )
     assert denied.status_code == 429
     body = denied.json()
     assert body["error"]["code"] == "RATE_LIMIT_EXCEEDED"
@@ -347,6 +405,7 @@ async def _seed_artifact_with_path(
     await artifacts.save_version(
         tenant_id=_TENANT,
         user_id=user_id,
+        agent_key=_AGENT_KEY,
         name=name,
         kind=kind,  # type: ignore[arg-type]
         path_in_workspace=path,
@@ -363,7 +422,9 @@ async def test_download_html_artifact_is_forced_attachment(
     await _seed_artifact_with_path(
         artifacts, user_id, name="report.html", kind="document", path="report.html"
     )
-    resp = await client.get("/v1/artifacts/download", params={"name": "report.html"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "report.html")}
+    )
     assert resp.status_code == 200
     # Real MIME surfaces for logging, but disposition stops the browser.
     assert "text/html" in resp.headers["content-type"]
@@ -380,7 +441,9 @@ async def test_download_svg_artifact_is_forced_attachment(
     await _seed_artifact_with_path(
         artifacts, user_id, name="logo.svg", kind="data", path="logo.svg"
     )
-    resp = await client.get("/v1/artifacts/download", params={"name": "logo.svg"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "logo.svg")}
+    )
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("image/svg+xml")
     assert "attachment" in resp.headers["content-disposition"]
@@ -394,7 +457,9 @@ async def test_download_image_artifact_is_inline_with_image_mime(
     await _seed_artifact_with_path(
         artifacts, user_id, name="photo.png", kind="data", path="photo.png"
     )
-    resp = await client.get("/v1/artifacts/download", params={"name": "photo.png"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "photo.png")}
+    )
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "image/png"
     assert "inline" in resp.headers["content-disposition"]
@@ -409,7 +474,9 @@ async def test_download_unknown_extension_is_octet_stream(
     await _seed_artifact_with_path(
         artifacts, user_id, name="dump.bin", kind="data", path="dump.bin"
     )
-    resp = await client.get("/v1/artifacts/download", params={"name": "dump.bin"})
+    resp = await client.get(
+        "/v1/artifacts/download", params={"artifact_id": await _artifact_id(client, "dump.bin")}
+    )
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/octet-stream"
     assert "attachment" in resp.headers["content-disposition"]
@@ -425,17 +492,23 @@ async def test_delete_artifact_soft_deletes_and_audits(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, artifacts, user_id = setup
-    resp = await client.delete("/v1/artifacts/report.md")
+    rid = await _artifact_id(client, "report.md")
+    resp = await client.delete(f"/v1/artifacts/{rid}")
     assert resp.status_code == 200
-    assert resp.json() == {"deleted": "report.md"}
+    assert resp.json() == {"deleted": rid}
     # Default list hides; include_deleted=True reveals the soft-deleted row.
-    assert await artifacts.list_for_user(tenant_id=_TENANT, user_id=user_id) == []
+    assert (
+        await artifacts.list_for_user(tenant_id=_TENANT, user_id=user_id, agent_key=_AGENT_KEY)
+        == []
+    )
     deleted = await artifacts.list_for_user(
-        tenant_id=_TENANT, user_id=user_id, include_deleted=True
+        tenant_id=_TENANT, user_id=user_id, agent_key=_AGENT_KEY, include_deleted=True
     )
     assert len(deleted) == 1
-    # Subsequent download returns 404 (same hiding rule).
-    redownload = await client.get("/v1/artifacts/download", params={"name": "report.md"})
+    # Subsequent download returns 404 (same hiding rule) —— 用删之前拿到的那个
+    # id 重试:软删之后它从列表里消失了,但 id 还在调用方手里(真实场景:
+    # 页面没刷新就点了下载)。
+    redownload = await client.get("/v1/artifacts/download", params={"artifact_id": rid})
     assert redownload.status_code == 404
 
 
@@ -444,7 +517,7 @@ async def test_delete_unknown_returns_404(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, _ = setup
-    resp = await client.delete("/v1/artifacts/missing.md")
+    resp = await client.delete(f"/v1/artifacts/{_MISSING_ID}")
     assert resp.status_code == 404
 
 
@@ -454,7 +527,9 @@ async def test_delete_cross_user_returns_404(
 ) -> None:
     """Cross-user delete returns 404 (hides existence) — never 403."""
     client, _, _ = setup
-    resp = await client.delete("/v1/artifacts/report.md", headers=_headers("user-b"))
+    # id 是真的(所有者自己列出来的),但 user-b 不是它的主人。
+    rid = await _artifact_id(client, "report.md")
+    resp = await client.delete(f"/v1/artifacts/{rid}", headers=_headers("user-b"))
     assert resp.status_code == 404
 
 
@@ -463,7 +538,9 @@ async def test_patch_artifact_updates_kind_and_audits(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, _ = setup
-    resp = await client.patch("/v1/artifacts/report.md", json={"kind": "code"})
+    resp = await client.patch(
+        f"/v1/artifacts/{await _artifact_id(client, 'report.md')}", json={"kind": "code"}
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["name"] == "report.md"
@@ -478,7 +555,7 @@ async def test_patch_unknown_returns_404(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, _ = setup
-    resp = await client.patch("/v1/artifacts/missing.md", json={"kind": "code"})
+    resp = await client.patch(f"/v1/artifacts/{_MISSING_ID}", json={"kind": "code"})
     assert resp.status_code == 404
 
 
@@ -487,7 +564,9 @@ async def test_patch_invalid_kind_returns_422(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, _ = setup
-    resp = await client.patch("/v1/artifacts/report.md", json={"kind": "nonsense"})
+    resp = await client.patch(
+        f"/v1/artifacts/{await _artifact_id(client, 'report.md')}", json={"kind": "nonsense"}
+    )
     assert resp.status_code == 422
 
 
@@ -497,7 +576,10 @@ async def test_patch_extra_fields_rejected(
 ) -> None:
     """``extra='forbid'`` keeps the schema narrow."""
     client, _, _ = setup
-    resp = await client.patch("/v1/artifacts/report.md", json={"kind": "code", "rogue": "x"})
+    resp = await client.patch(
+        f"/v1/artifacts/{await _artifact_id(client, 'report.md')}",
+        json={"kind": "code", "rogue": "x"},
+    )
     assert resp.status_code == 422
 
 
@@ -510,15 +592,17 @@ async def test_list_versions_returns_versions_desc(
     await artifacts.save_version(
         tenant_id=_TENANT,
         user_id=user_id,
+        agent_key=_AGENT_KEY,
         name="report.md",
         kind="document",
         path_in_workspace="report.md",
         created_in_thread="t-2",
     )
-    resp = await client.get("/v1/artifacts/report.md/versions")
+    rid = await _artifact_id(client, "report.md")
+    resp = await client.get(f"/v1/artifacts/{rid}/versions")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["name"] == "report.md"
+    assert body["id"] == rid
     versions = body["versions"]
     assert len(versions) == 2
     assert [v["version"] for v in versions] == [2, 1]
@@ -531,7 +615,7 @@ async def test_list_versions_unknown_returns_404(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, _ = setup
-    resp = await client.get("/v1/artifacts/missing.md/versions")
+    resp = await client.get(f"/v1/artifacts/{_MISSING_ID}/versions")
     assert resp.status_code == 404
 
 
@@ -545,9 +629,11 @@ async def test_list_versions_unknown_returns_404(
 
 
 #: (name, path, extra query params) — the two artifact detail read endpoints.
+# scope 闸在产物查找**之前**触发,所以这里故意用一个不存在的 id —— 既够用,
+# 又顺带证明了 403 / 400 不是靠「产物不存在」得来的。
 _ARTIFACT_SCOPE_ENDPOINTS: list[tuple[str, str, dict[str, str]]] = [
-    ("download", "/v1/artifacts/download", {"name": "report.md"}),
-    ("versions", "/v1/artifacts/report.md/versions", {}),
+    ("download", "/v1/artifacts/download", {"artifact_id": _MISSING_ID}),
+    ("versions", f"/v1/artifacts/{_MISSING_ID}/versions", {}),
 ]
 
 
@@ -556,10 +642,11 @@ async def test_download_system_admin_target_tenant_200(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, user_id = setup
+    rid = await _artifact_id(client, "report.md")
     headers = await grant_system_admin(client)
     resp = await client.get(
         "/v1/artifacts/download",
-        params={"name": "report.md", "tenant_id": str(_TENANT), "user_id": str(user_id)},
+        params={"artifact_id": rid, "tenant_id": str(_TENANT), "user_id": str(user_id)},
         headers=headers,
     )
     assert resp.status_code == 200, resp.text
@@ -571,9 +658,10 @@ async def test_versions_system_admin_target_tenant_200(
     setup: tuple[AsyncClient, InMemoryArtifactStore, UUID],
 ) -> None:
     client, _, user_id = setup
+    rid = await _artifact_id(client, "report.md")
     headers = await grant_system_admin(client)
     resp = await client.get(
-        "/v1/artifacts/report.md/versions",
+        f"/v1/artifacts/{rid}/versions",
         params={"tenant_id": str(_TENANT), "user_id": str(user_id)},
         headers=headers,
     )

@@ -44,6 +44,9 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 _TENANT = DEFAULT_DEV_TENANT_ID
 _SUBJECT = "user-a"
 _CONTENT = b"report body"
@@ -78,6 +81,7 @@ async def _seed() -> tuple[InMemoryTenantUserStore, InMemoryArtifactStore, UUID]
     await artifacts.save_version(
         tenant_id=_TENANT,
         user_id=user.id,
+        agent_key=_AGENT_KEY,
         name="report.md",
         kind="document",
         path_in_workspace="report.md",

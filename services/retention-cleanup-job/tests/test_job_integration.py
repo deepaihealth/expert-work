@@ -44,6 +44,9 @@ from expert_work.protocol import (
 )
 from retention_cleanup_job.job import RetentionCleanupJob
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 pytestmark = pytest.mark.integration
 
 ALEMBIC_INI = Path(__file__).resolve().parents[3] / "packages/expert-work-persistence/alembic.ini"
@@ -571,6 +574,7 @@ async def test_workspace_rules_end_to_end_against_postgres(
         old_v = await artifacts.save_version(
             tenant_id=tenant,
             user_id=user,
+            agent_key=_AGENT_KEY,
             name="report.pptx",
             kind="document",
             path_in_workspace="report.pptx",
@@ -579,6 +583,7 @@ async def test_workspace_rules_end_to_end_against_postgres(
         fresh_v = await artifacts.save_version(
             tenant_id=tenant,
             user_id=user,
+            agent_key=_AGENT_KEY,
             name="plan.json",
             kind="data",
             path_in_workspace="plan.json",
@@ -634,6 +639,7 @@ async def test_workspace_rules_end_to_end_against_postgres(
         await artifacts.save_version(
             tenant_id=tenant,
             user_id=purged_user,
+            agent_key=_AGENT_KEY,
             name="left.md",
             kind="document",
             path_in_workspace="left.md",
@@ -692,7 +698,7 @@ async def test_workspace_rules_end_to_end_against_postgres(
         by_name = {
             a.name: a
             for a in await artifacts.list_for_user(
-                tenant_id=tenant, user_id=user, include_deleted=True
+                tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY, include_deleted=True
             )
         }
         assert by_name["report.pptx"].deleted_at is not None
@@ -704,7 +710,7 @@ async def test_workspace_rules_end_to_end_against_postgres(
         assert await workspaces.get(tenant_id=tenant, user_id=purged_user) is None
         assert (
             await artifacts.list_for_user(
-                tenant_id=tenant, user_id=purged_user, include_deleted=True
+                tenant_id=tenant, user_id=purged_user, agent_key=_AGENT_KEY, include_deleted=True
             )
             == []
         )

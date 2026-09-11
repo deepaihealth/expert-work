@@ -63,6 +63,9 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 
 def _mem(*, tenant: UUID, user: UUID, content: str) -> MemoryItem:
     return MemoryItem(
@@ -177,6 +180,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
     await artifacts.save_version(
         tenant_id=t1,
         user_id=a.id,
+        agent_key=_AGENT_KEY,
         name="doc",
         kind="document",
         path_in_workspace="/w",
@@ -271,7 +275,12 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
     assert summary.threads_purged == 1
     assert await threads.get(t_a, tenant_id=t1) is None
     assert await memory.list_for_user(tenant_id=t1, user_id=a.id) == []
-    assert await artifacts.list_for_user(tenant_id=t1, user_id=a.id, include_deleted=True) == []
+    assert (
+        await artifacts.list_for_user(
+            tenant_id=t1, user_id=a.id, agent_key=_AGENT_KEY, include_deleted=True
+        )
+        == []
+    )
     assert await agent_instances.list_by_user(tenant_id=t1, user_id=a.id) == []
     assert await mcp_oauth.list_for_user(tenant_id=t1, user_id="subj-a") == []
 

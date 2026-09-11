@@ -18,6 +18,9 @@ from expert_work.protocol import MemoryItem
 from expert_work.runtime.storage import InMemoryObjectStore
 from retention_cleanup_job.job import CleanupReport, RetentionCleanupJob
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 
 def test_cleanup_report_default_is_all_zero() -> None:
     report = CleanupReport()
@@ -254,13 +257,14 @@ async def test_sweep_artifacts_soft_deletes_stale_active_rows() -> None:
     await artifacts.save_version(
         tenant_id=tenant,
         user_id=user,
+        agent_key=_AGENT_KEY,
         name="stale.md",
         kind="document",
         path_in_workspace="stale.md",
         created_in_thread="t-1",
     )
     # Backdate ``updated_at`` to before the retention horizon.
-    stale = (await artifacts.list_for_user(tenant_id=tenant, user_id=user))[0]
+    stale = (await artifacts.list_for_user(tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY))[0]
     artifacts._artifacts[stale.id] = stale.model_copy(
         update={"updated_at": datetime.now(UTC) - timedelta(days=120)}
     )
@@ -268,6 +272,7 @@ async def test_sweep_artifacts_soft_deletes_stale_active_rows() -> None:
     await artifacts.save_version(
         tenant_id=tenant,
         user_id=user,
+        agent_key=_AGENT_KEY,
         name="fresh.md",
         kind="document",
         path_in_workspace="fresh.md",
@@ -282,7 +287,7 @@ async def test_sweep_artifacts_soft_deletes_stale_active_rows() -> None:
     soft, hard = await job._sweep_artifacts()
     assert (soft, hard) == (1, 0)
     # Only ``fresh.md`` remains in the default (non-deleted) listing.
-    active = await artifacts.list_for_user(tenant_id=tenant, user_id=user)
+    active = await artifacts.list_for_user(tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY)
     assert [a.name for a in active] == ["fresh.md"]
 
 
@@ -294,6 +299,7 @@ async def test_sweep_artifacts_hard_deletes_expired_soft_deleted_rows() -> None:
     await artifacts.save_version(
         tenant_id=tenant,
         user_id=user,
+        agent_key=_AGENT_KEY,
         name="old.md",
         kind="document",
         path_in_workspace="old.md",
@@ -301,7 +307,9 @@ async def test_sweep_artifacts_hard_deletes_expired_soft_deleted_rows() -> None:
     )
     # Soft-delete with a backdated timestamp past the grace window.
     long_ago = datetime.now(UTC) - timedelta(days=120)
-    await artifacts.soft_delete(tenant_id=tenant, user_id=user, name="old.md", now=long_ago)
+    await artifacts.soft_delete(
+        tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY, name="old.md", now=long_ago
+    )
 
     job = RetentionCleanupJob(
         db_session_factory=lambda: None,  # type: ignore[arg-type]
@@ -312,7 +320,12 @@ async def test_sweep_artifacts_hard_deletes_expired_soft_deleted_rows() -> None:
     # Active sweep finds nothing; hard sweep clears the soft-deleted row.
     assert (soft, hard) == (0, 1)
     # No row should remain even with include_deleted=True.
-    assert await artifacts.list_for_user(tenant_id=tenant, user_id=user, include_deleted=True) == []
+    assert (
+        await artifacts.list_for_user(
+            tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY, include_deleted=True
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -323,6 +336,7 @@ async def test_sweep_artifacts_skips_recent_soft_deleted_rows() -> None:
     await artifacts.save_version(
         tenant_id=tenant,
         user_id=user,
+        agent_key=_AGENT_KEY,
         name="recent.md",
         kind="document",
         path_in_workspace="recent.md",
@@ -330,7 +344,9 @@ async def test_sweep_artifacts_skips_recent_soft_deleted_rows() -> None:
     )
     # Soft-delete only 10 days ago — must stay.
     recent = datetime.now(UTC) - timedelta(days=10)
-    await artifacts.soft_delete(tenant_id=tenant, user_id=user, name="recent.md", now=recent)
+    await artifacts.soft_delete(
+        tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY, name="recent.md", now=recent
+    )
 
     job = RetentionCleanupJob(
         db_session_factory=lambda: None,  # type: ignore[arg-type]
@@ -340,7 +356,9 @@ async def test_sweep_artifacts_skips_recent_soft_deleted_rows() -> None:
     soft, hard = await job._sweep_artifacts()
     assert (soft, hard) == (0, 0)
     # Row still in include_deleted listing.
-    deleted = await artifacts.list_for_user(tenant_id=tenant, user_id=user, include_deleted=True)
+    deleted = await artifacts.list_for_user(
+        tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY, include_deleted=True
+    )
     assert len(deleted) == 1
 
 
@@ -498,6 +516,7 @@ async def test_sweep_workspaces_hard_deletes_row_and_dependents_without_touching
         await artifacts.save_version(
             tenant_id=tenant,
             user_id=owner,
+            agent_key=_AGENT_KEY,
             name="r.md",
             kind="document",
             path_in_workspace="r.md",
@@ -531,10 +550,18 @@ async def test_sweep_workspaces_hard_deletes_row_and_dependents_without_touching
     assert await job._sweep_workspaces() == (1, 0)
 
     assert await store.get(tenant_id=tenant, user_id=user) is None
-    assert await artifacts.list_for_user(tenant_id=tenant, user_id=user, include_deleted=True) == []
+    assert (
+        await artifacts.list_for_user(
+            tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY, include_deleted=True
+        )
+        == []
+    )
     assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=user) == 0
     # The other user's rows are untouched (tenant AND user scoped cascade).
-    assert len(await artifacts.list_for_user(tenant_id=tenant, user_id=other)) == 1
+    assert (
+        len(await artifacts.list_for_user(tenant_id=tenant, user_id=other, agent_key=_AGENT_KEY))
+        == 1
+    )
     assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=other) == 1
     # The archive object is still there — bucket lifecycle owns it, not this job.
     assert await object_store.get(ws.archived_object_key) == b"ARCHIVE"  # type: ignore[attr-defined]
@@ -621,6 +648,7 @@ async def test_sweep_workspaces_hard_delete_failure_leaves_dependents_untouched(
     await artifacts.save_version(
         tenant_id=tenant,
         user_id=user,
+        agent_key=_AGENT_KEY,
         name="r.md",
         kind="document",
         path_in_workspace="r.md",
@@ -656,6 +684,9 @@ async def test_sweep_workspaces_hard_delete_failure_leaves_dependents_untouched(
     else:
         assert await job._sweep_workspaces() == (0, 0)
 
-    assert len(await artifacts.list_for_user(tenant_id=tenant, user_id=user)) == 1
+    assert (
+        len(await artifacts.list_for_user(tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY))
+        == 1
+    )
     assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=user) == 1
     assert (await audit_store.query(AuditQuery(tenant_id=tenant))).entries == []
