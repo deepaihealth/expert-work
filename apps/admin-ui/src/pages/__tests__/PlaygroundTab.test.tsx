@@ -32,7 +32,6 @@ import * as rateCardSdk from "../../api/rate_card";
 import * as runsSdk from "../../api/runs";
 import * as sessionsSdk from "../../api/sessions";
 import * as workspaceSdk from "../../api/workspace";
-import * as artifactsSdk from "../../api/artifacts";
 import * as traceFacadeSdk from "../../api/trace_facade";
 import * as triggersSdk from "../../api/triggers";
 import * as uploadsSdk from "../../api/uploads";
@@ -108,7 +107,7 @@ const uploadImageMock = vi.spyOn(uploadsSdk, "uploadImage");
 const uploadDocumentMock = vi.spyOn(uploadsSdk, "uploadDocument");
 const getWorkspaceMock = vi.spyOn(workspaceSdk, "getUserWorkspace");
 const getWorkspaceFilesMock = vi.spyOn(workspaceSdk, "getUserWorkspaceFiles");
-const downloadArtifactMock = vi.spyOn(artifactsSdk, "downloadArtifact");
+const downloadSessionArtifactMock = vi.spyOn(sessionsSdk, "downloadSessionArtifact");
 const listSessionsMock = vi.spyOn(sessionsSdk, "listSessions");
 const getMessagesMock = vi.spyOn(sessionsSdk, "getSessionMessages");
 const listRateCardsMock = vi.spyOn(rateCardSdk, "listRateCards");
@@ -157,8 +156,8 @@ beforeEach(() => {
   getWorkspaceMock.mockResolvedValue({ workspace: null, artifacts: [] });
   getWorkspaceFilesMock.mockReset();
   getWorkspaceFilesMock.mockResolvedValue([]);
-  downloadArtifactMock.mockReset();
-  downloadArtifactMock.mockResolvedValue("report.md");
+  downloadSessionArtifactMock.mockReset();
+  downloadSessionArtifactMock.mockResolvedValue("report.md");
   listSessionsMock.mockReset();
   listSessionsMock.mockResolvedValue([]);
   getMessagesMock.mockReset();
@@ -588,7 +587,13 @@ describe("PlaygroundTab", () => {
     const btn = await screen.findByTestId("playground-turn-artifact-download");
     expect(btn).toHaveTextContent("report.pdf");
     await user.click(btn);
-    expect(downloadArtifactMock).toHaveBeenCalledWith("report.pdf", undefined, undefined);
+    // B-50 —— 对话面手里只有产物名(从 SSE 事件推出来的,没有行 id),所以走
+    // 会话作用域端点:后端按会话的 agent 收口,「这个会话的 report.pdf」唯一。
+    expect(downloadSessionArtifactMock).toHaveBeenCalledWith(
+      expect.any(String),
+      "report.pdf",
+      undefined,
+    );
   });
 
   it("exports the turn's authoritative event stream as JSON", async () => {

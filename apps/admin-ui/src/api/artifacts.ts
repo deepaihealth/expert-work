@@ -10,12 +10,20 @@
  * rows behind 404 — a tenant admin only ever operates on their own
  * artifacts. The cross-tenant ``"*"`` list aggregates every user but
  * carries no per-user context, so it is list-only.
+ *
+ * B-50 —— 单条寻址用 ``artifact_id``,不用 ``name``。产物的唯一键加了
+ * ``agent_key``(同一用户下两个 agent 可以各有一个「报告.docx」),``name``
+ * 不再是身份;列表行带 ``id`` 与 ``agent_key``,操作一律拿 ``id`` 走。
  */
 import { apiClient, withTenantScope, type TenantScope } from "./client";
 
 export type ArtifactKind = "document" | "code" | "data" | "other";
 
 export interface ArtifactListItem {
+  /** B-50 —— 寻址用的身份。``name`` 在 agent 维度下不再唯一。 */
+  id: string;
+  /** B-50 —— 这条产物属于哪个 agent;空串 = 归属不明的历史产物。 */
+  agent_key: string;
   name: string;
   kind: ArtifactKind;
   latest_version: number;
@@ -40,7 +48,7 @@ export interface ArtifactVersion {
 }
 
 export interface ArtifactVersionList {
-  name: string;
+  id: string;
   versions: ArtifactVersion[];
 }
 
@@ -75,24 +83,27 @@ export function filenameFromDisposition(header: string | undefined, fallback: st
   return quoted?.[1] ?? fallback;
 }
 
-/** GET /v1/artifacts/download?name=… — fetch the latest version as a
- *  blob (the Bearer header rides the axios instance; a bare
+/** GET /v1/artifacts/download?artifact_id=… — fetch the latest version as
+ *  a blob (the Bearer header rides the axios instance; a bare
  *  ``window.open`` would arrive unauthenticated) and hand it to the
- *  browser via an object URL. Returns the saved filename. ``userId``
- *  is the tenant-admin governance target (H.8-F1). */
+ *  browser via an object URL. Returns the saved filename.
+ *
+ *  ``fallbackName`` 只用于下载另存的文件名(``Content-Disposition`` 缺席时),
+ *  不参与寻址。``userId`` 是 tenant-admin 的治理目标(H.8-F1)。 */
 export async function downloadArtifact(
-  name: string,
+  artifactId: string,
+  fallbackName: string,
   userId?: string,
   tenantScope?: TenantScope,
 ): Promise<string> {
   const response = await apiClient.get<Blob>("/v1/artifacts/download", {
-    params: withTenantScope({ name, user_id: userId }, tenantScope),
+    params: withTenantScope({ artifact_id: artifactId, user_id: userId }, tenantScope),
     responseType: "blob",
   });
   const disposition = (response.headers as Record<string, string | undefined>)[
     "content-disposition"
   ];
-  const filename = filenameFromDisposition(disposition, name);
+  const filename = filenameFromDisposition(disposition, fallbackName);
   const url = URL.createObjectURL(response.data);
   try {
     const anchor = document.createElement("a");
@@ -107,37 +118,39 @@ export async function downloadArtifact(
   return filename;
 }
 
-/** DELETE /v1/artifacts/{name} — soft-delete (metadata only; bytes stay
- *  until the retention sweep, and re-saving the same name un-deletes). */
-export async function deleteArtifact(name: string, userId?: string): Promise<void> {
-  await apiClient.delete(`/v1/artifacts/${encodeURIComponent(name)}`, {
+/** DELETE /v1/artifacts/{artifact_id} — soft-delete (metadata only; bytes
+ *  stay until the retention sweep, and re-saving the same name un-deletes). */
+export async function deleteArtifact(artifactId: string, userId?: string): Promise<void> {
+  await apiClient.delete(`/v1/artifacts/${encodeURIComponent(artifactId)}`, {
     params: { user_id: userId },
   });
 }
 
-/** PATCH /v1/artifacts/{name} — re-classify ``kind``. The backend 409s
- *  on a no-op change; callers should skip the request when unchanged
+/** PATCH /v1/artifacts/{artifact_id} — re-classify ``kind``. The backend
+ *  409s on a no-op change; callers should skip the request when unchanged
  *  (Mini-ADR H-16). */
 export async function patchArtifactKind(
-  name: string,
+  artifactId: string,
   kind: ArtifactKind,
   userId?: string,
-): Promise<{ name: string; kind: ArtifactKind; latest_version: number }> {
+): Promise<{ id: string; agent_key: string; name: string; kind: ArtifactKind; latest_version: number }> {
   const response = await apiClient.patch<{
+    id: string;
+    agent_key: string;
     name: string;
     kind: ArtifactKind;
     latest_version: number;
-  }>(`/v1/artifacts/${encodeURIComponent(name)}`, { kind }, { params: { user_id: userId } });
+  }>(`/v1/artifacts/${encodeURIComponent(artifactId)}`, { kind }, { params: { user_id: userId } });
   return response.data;
 }
 
 export async function listArtifactVersions(
-  name: string,
+  artifactId: string,
   userId?: string,
   tenantScope?: TenantScope,
 ): Promise<ArtifactVersionList> {
   const response = await apiClient.get<ArtifactVersionList>(
-    `/v1/artifacts/${encodeURIComponent(name)}/versions`,
+    `/v1/artifacts/${encodeURIComponent(artifactId)}/versions`,
     { params: withTenantScope({ user_id: userId }, tenantScope) },
   );
   return response.data;

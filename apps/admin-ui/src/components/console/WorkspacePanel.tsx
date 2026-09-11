@@ -107,7 +107,7 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
           >
             {workspace.artifacts.map((a) => (
               <div
-                key={a.name}
+                key={a.id}
                 data-testid="playground-workspace-artifact"
                 style={{
                   display: "flex",
@@ -135,9 +135,9 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
                   size="small"
                   type="text"
                   icon={<Download size={11} strokeWidth={1.75} />}
-                  loading={busyKey === `download:artifact:${a.name}`}
+                  loading={busyKey === `download:artifact:${a.id}`}
                   disabled={busyKey !== null}
-                  onClick={() => void downloadArtifact(a.name)}
+                  onClick={() => void downloadArtifact(a.id, a.name)}
                   aria-label={t("playground.artifact_download", { name: a.name })}
                   data-testid="playground-workspace-artifact-download"
                 />
@@ -147,7 +147,7 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
                     okText={t("playground.delete_ok")}
                     cancelText={t("playground.delete_cancel")}
                     okButtonProps={{ danger: true }}
-                    onConfirm={() => void deleteArtifact(a.name)}
+                    onConfirm={() => void deleteArtifact(a.id)}
                     disabled={readOnly}
                   >
                     <Button
@@ -155,7 +155,7 @@ export function WorkspacePanel({ running, readOnly }: WorkspacePanelProps): JSX.
                       type="text"
                       danger
                       icon={<Trash2 size={11} strokeWidth={1.75} />}
-                      loading={busyKey === `delete:artifact:${a.name}`}
+                      loading={busyKey === `delete:artifact:${a.id}`}
                       disabled={busyKey !== null || readOnly}
                       aria-label={t("playground.artifact_delete", { name: a.name })}
                       data-testid="playground-workspace-artifact-delete"

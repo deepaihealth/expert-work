@@ -140,11 +140,13 @@ export function WorkspacePane({ userId }: { userId: string }) {
     void refresh();
   }, [refresh]);
 
+  // B-50 —— 按 ``artifact_id`` 寻址(``name`` 在 agent 维度下不再唯一);
+  // ``name`` 只用于下载另存的文件名。
   const handleDownloadArtifact = useCallback(
-    async (name: string) => {
-      setBusyKey(`artifact:${name}`);
+    async (artifactId: string, name: string) => {
+      setBusyKey(`artifact:${artifactId}`);
       try {
-        await downloadArtifact(name, userId, concreteTenantScope(apiTenantScope));
+        await downloadArtifact(artifactId, name, userId, concreteTenantScope(apiTenantScope));
       } catch (err) {
         message.error(errMessage(err));
       } finally {
@@ -155,10 +157,10 @@ export function WorkspacePane({ userId }: { userId: string }) {
   );
 
   const handleDeleteArtifact = useCallback(
-    async (name: string) => {
-      setBusyKey(`artifact:${name}`);
+    async (artifactId: string, name: string) => {
+      setBusyKey(`artifact:${artifactId}`);
       try {
-        await deleteArtifact(name, userId);
+        await deleteArtifact(artifactId, userId);
         message.success(t("user_profile.deleted", { name }));
         await refresh();
       } catch (err) {
@@ -230,8 +232,8 @@ export function WorkspacePane({ userId }: { userId: string }) {
           <Button
             size="small"
             icon={<Download size={13} strokeWidth={1.5} />}
-            loading={busyKey === `artifact:${record.name}`}
-            onClick={() => void handleDownloadArtifact(record.name)}
+            loading={busyKey === `artifact:${record.id}`}
+            onClick={() => void handleDownloadArtifact(record.id, record.name)}
             data-testid={`ws-artifact-download-${record.name}`}
           >
             {t("user_profile.download")}
@@ -239,7 +241,7 @@ export function WorkspacePane({ userId }: { userId: string }) {
           <ReadonlyTooltip on={isTenantSwitched}>
             <Popconfirm
               title={t("user_profile.delete_confirm", { name: record.name })}
-              onConfirm={() => void handleDeleteArtifact(record.name)}
+              onConfirm={() => void handleDeleteArtifact(record.id, record.name)}
               okText={t("user_profile.delete")}
               okButtonProps={{ danger: true }}
               disabled={isTenantSwitched}
@@ -249,7 +251,7 @@ export function WorkspacePane({ userId }: { userId: string }) {
                 danger
                 disabled={isTenantSwitched}
                 icon={<Trash2 size={13} strokeWidth={1.5} />}
-                loading={busyKey === `artifact:${record.name}`}
+                loading={busyKey === `artifact:${record.id}`}
                 data-testid={`ws-artifact-delete-${record.name}`}
               />
             </Popconfirm>

@@ -259,7 +259,15 @@ describe("UserProfile", () => {
       { path: "notes/report.md", size: 1024 } as never,
     ]);
     vi.spyOn(artifactsSdk, "listArtifacts").mockResolvedValue({
-      items: [{ name: "summary.pdf", kind: "document", latest_version: 1 }],
+      items: [
+        {
+          id: "b2222222-2222-4222-8222-222222222222",
+          agent_key: "test-agent-0badc0de",
+          name: "summary.pdf",
+          kind: "document",
+          latest_version: 1,
+        },
+      ],
       cross_tenant: false,
     });
     const user = userEvent.setup();

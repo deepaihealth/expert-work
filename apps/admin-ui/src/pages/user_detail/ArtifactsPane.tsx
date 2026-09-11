@@ -78,11 +78,13 @@ export function ArtifactsPane({ userId }: { userId: string }) {
     void refresh();
   }, [refresh]);
 
+  // B-50 —— 一律按 ``artifact_id`` 寻址;``name`` 在 agent 维度下不再唯一
+  // (同一用户下两个 agent 可以各有一个「报告.docx」),只用于文案与另存文件名。
   const handleDownload = useCallback(
-    async (name: string) => {
-      setBusyName(name);
+    async (artifactId: string, name: string) => {
+      setBusyName(artifactId);
       try {
-        await downloadArtifact(name, userId);
+        await downloadArtifact(artifactId, name, userId);
       } catch (err) {
         message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       } finally {
@@ -93,10 +95,10 @@ export function ArtifactsPane({ userId }: { userId: string }) {
   );
 
   const handleDelete = useCallback(
-    async (name: string) => {
-      setBusyName(name);
+    async (artifactId: string, name: string) => {
+      setBusyName(artifactId);
       try {
-        await deleteArtifact(name, userId);
+        await deleteArtifact(artifactId, userId);
         message.success(t("artifacts_page.deleted", { name }));
         await refresh();
       } catch (err) {
@@ -112,9 +114,9 @@ export function ArtifactsPane({ userId }: { userId: string }) {
     async (record: ArtifactListItem, kind: ArtifactKind) => {
       // Mini-ADR H-16 — the backend 409s a no-op; skip it client-side.
       if (kind === record.kind) return;
-      setBusyName(record.name);
+      setBusyName(record.id);
       try {
-        await patchArtifactKind(record.name, kind, userId);
+        await patchArtifactKind(record.id, kind, userId);
         await refresh();
       } catch (err) {
         message.error(errMessage(err));
@@ -126,11 +128,11 @@ export function ArtifactsPane({ userId }: { userId: string }) {
   );
 
   const openVersions = useCallback(
-    async (name: string) => {
+    async (artifactId: string, name: string) => {
       setVersionsFor(name);
       setVersionsLoading(true);
       try {
-        const result = await listArtifactVersions(name, userId);
+        const result = await listArtifactVersions(artifactId, userId);
         setVersions(result.versions);
       } catch (err) {
         message.error(errMessage(err));
@@ -161,7 +163,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
             size="small"
             style={{ width: 130 }}
             aria-label={t("artifacts_page.col_kind")}
-            disabled={busyName === record.name}
+            disabled={busyName === record.id}
             onChange={(next) => void handleKindChange(record, next)}
             options={KIND_OPTIONS.map((k) => ({ value: k, label: k }))}
             data-testid={`artifact-kind-${record.name}`}
@@ -184,8 +186,8 @@ export function ArtifactsPane({ userId }: { userId: string }) {
             <Button
               size="small"
               icon={<Download size={13} strokeWidth={1.5} />}
-              loading={busyName === record.name}
-              onClick={() => void handleDownload(record.name)}
+              loading={busyName === record.id}
+              onClick={() => void handleDownload(record.id, record.name)}
               data-testid={`artifact-download-${record.name}`}
             >
               {t("artifacts_page.download")}
@@ -193,7 +195,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
             <Button
               size="small"
               icon={<History size={13} strokeWidth={1.5} />}
-              onClick={() => void openVersions(record.name)}
+              onClick={() => void openVersions(record.id, record.name)}
               data-testid={`artifact-versions-${record.name}`}
             >
               {t("artifacts_page.versions")}
@@ -201,7 +203,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
             <Popconfirm
               title={t("artifacts_page.delete_confirm_title", { name: record.name })}
               description={t("artifacts_page.delete_confirm_body")}
-              onConfirm={() => void handleDelete(record.name)}
+              onConfirm={() => void handleDelete(record.id, record.name)}
               okText={t("artifacts_page.delete")}
               okButtonProps={{ danger: true }}
             >
@@ -209,7 +211,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
                 size="small"
                 danger
                 icon={<Trash2 size={13} strokeWidth={1.5} />}
-                loading={busyName === record.name}
+                loading={busyName === record.id}
                 data-testid={`artifact-delete-${record.name}`}
               >
                 {t("artifacts_page.delete")}

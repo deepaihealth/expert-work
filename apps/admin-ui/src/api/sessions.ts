@@ -23,6 +23,7 @@ import {
   type ApiEnvelope,
   type TenantScope,
 } from "./client";
+import { filenameFromDisposition } from "./artifacts";
 import { unwrap } from "./client";
 
 export interface ThreadMeta {
@@ -100,6 +101,10 @@ export interface WorkspaceMeta {
 }
 
 export interface WorkspaceArtifact {
+  /** B-50 —— 寻址用的身份;``name`` 在 agent 维度下不再唯一。 */
+  id: string;
+  /** B-50 —— 这条产物属于哪个 agent;空串 = 归属不明的历史产物。 */
+  agent_key: string;
   name: string;
   kind: string;
   latest_version: number;
@@ -247,6 +252,40 @@ export async function archiveSession(threadId: string): Promise<void> {
 /** Hard-delete a session — irreversibly purge the whole conversation
  *  (checkpoint messages + run rows + the thread). The user's shared
  *  workspace/artifacts are intentionally left intact. */
+/** GET /v1/sessions/{thread_id}/workspace/artifacts/{name}/download —
+ *  下载**这个会话所属 agent** 名下的同名产物。
+ *
+ *  B-50 —— 对话/试运行面手里只有产物名(它是从 SSE 事件里推出来的,没有行 id)。
+ *  但一个会话只属于一个 agent,所以「这个会话的 X」是唯一的:走会话作用域端点,
+ *  后端用 ``thread_meta.agent_name`` 收口。控制台的跨 agent 浏览面则相反 ——
+ *  它有列表行,走 ``downloadArtifact(artifactId, …)``。 */
+export async function downloadSessionArtifact(
+  threadId: string,
+  name: string,
+  tenantScope?: TenantScope,
+): Promise<string> {
+  const response = await apiClient.get<Blob>(
+    `/v1/sessions/${encodeURIComponent(threadId)}/workspace/artifacts/${encodeURIComponent(name)}/download`,
+    { params: withTenantScope({}, tenantScope), responseType: "blob" },
+  );
+  const disposition = (response.headers as Record<string, string | undefined>)[
+    "content-disposition"
+  ];
+  const filename = filenameFromDisposition(disposition, name);
+  const url = URL.createObjectURL(response.data);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return filename;
+}
+
 export async function purgeSession(threadId: string): Promise<void> {
   await apiClient.post(`/v1/sessions/${encodeURIComponent(threadId)}:purge`);
 }
