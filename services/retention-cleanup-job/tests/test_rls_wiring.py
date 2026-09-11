@@ -1,27 +1,42 @@
 """B-45 —— 这个 job 进程也要装 RLS listener,并显式声明跨租户 bypass。
 
 此前 ``main.py`` 从不调 ``build_rls_sessionmaker``:listener 在本进程根本不
-存在,RLS Detect 信号不会出现,生产 enforce 时也不会有任何征兆。两条钉子:
+存在,RLS Detect 信号不会出现,生产 enforce 时也不会有任何征兆。三条钉子:
 
 1. ``build_session_factory`` 必须经过 ``build_rls_sessionmaker``(用替身记录
    调用,而不是断言 listener 全局已装——同一 pytest 进程里别的测试早把
    listener 装上了,那种断言恒绿)。
 2. ``run_once`` 里每个 store 调用都在 bypass 作用域内,退出后两个 ContextVar
    复原。
+3. **归因必须真的落盘**:``rls_caller`` 是 ``extra=`` 结构化字段,
+   ``logging.basicConfig``(这个 job 此前用的)的默认 format 只渲染 message,
+   字段全丢 —— #1493 在另外两个进程修掉的第二层失效,这里是第三个。而这个
+   job 是三个里**唯一真部署的**(test overlay CronJob 已起),所以今天落
+   Loki 的就是无归因那条。
 """
 
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
-from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
+from expert_work.persistence import rls
+from expert_work.persistence.rls import (
+    _rls_after_begin,
+    bypass_rls_var,
+    current_tenant_id_var,
+)
 from retention_cleanup_job import main as main_module
 from retention_cleanup_job.job import RetentionCleanupJob, _bypass_rls
 from retention_cleanup_job.settings import RetentionCleanupSettings
+
+_RLS_LOGGER = "expert_work.persistence.rls"
 
 
 def test_build_session_factory_goes_through_build_rls_sessionmaker(
@@ -141,3 +156,58 @@ def test_resolve_workspace_root_refuses_symlink_or_missing_root(
         with caplog.at_level("ERROR"), pytest.raises(SystemExit):
             main_module.resolve_workspace_root(settings, environ={})
     assert sum("workspace_root_invalid" in r.message for r in caplog.records) == 2
+
+
+# --------------------------------------------------------------- 钉子 3
+
+
+@pytest.fixture
+def clean_rls_context() -> Iterator[None]:
+    token_b = bypass_rls_var.set(False)
+    token_t = current_tenant_id_var.set(None)
+    rls._reset_signal_state()
+    try:
+        yield
+    finally:
+        rls._reset_signal_state()
+        current_tenant_id_var.reset(token_t)
+        bypass_rls_var.reset(token_b)
+
+
+def test_configure_logging_renders_the_attribution_extras(
+    clean_rls_context: None,
+) -> None:
+    """The process's own logging setup must put ``rls_caller`` on the wire.
+
+    ``logging.basicConfig`` (what this job used before) renders only the
+    message, so the signal would land in Loki as a byte-identical
+    ``rls.would_fail_closed`` line with no attribution at all — the same
+    failure #1443 fixed one layer up and #1493 fixed in the other two
+    processes.
+    """
+    import io
+
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    stream = io.StringIO()
+    try:
+        main_module.configure_logging(
+            RetentionCleanupSettings(_env_file=None),  # type: ignore[call-arg]
+            stream=stream,
+        )
+        # Fire the real listener: the extras must come from rls.py, not the test.
+        _rls_after_begin(object(), object(), object())  # type: ignore[arg-type]
+    finally:
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+
+    lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+    assert lines, "nothing reached the configured stream"
+    payload = json.loads(lines[-1])
+    assert payload["message"] == "rls.would_fail_closed"
+    assert payload["logger"] == _RLS_LOGGER
+    assert payload["service"] == "retention_cleanup_job"
+    caller = payload["rls_caller"]
+    assert caller.endswith(" test_configure_logging_renders_the_attribution_extras"), caller
+    assert "expert_work.persistence.rls" not in caller
