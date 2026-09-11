@@ -2049,6 +2049,20 @@ export interface TranslationKeys {
     col_secret_ref: string;
     col_enabled: string;
     col_used_by: string;
+    used_by_agents_n: string;
+    platform_uses_n: string;
+    platform_uses_tooltip_title: string;
+    platform_use_on: string;
+    platform_use_off: string;
+    platform_feature_embedding: string;
+    platform_feature_rerank: string;
+    platform_feature_eval_agent: string;
+    platform_feature_quality_judge: string;
+    platform_feature_memory_consolidation: string;
+    feature_list_separator: string;
+    source_unset_platform_warn: string;
+    platform_credentials_missing_title: string;
+    platform_credentials_missing_body: string;
     col_actions: string;
     source_env: string;
     source_db: string;
@@ -2751,6 +2765,9 @@ export interface TranslationKeys {
     subtitle: string;
     cross_tenant_banner: string;
     failed_to_load: string;
+    consolidator_credentials_missing_title: string;
+    consolidator_credentials_missing_body: string;
+    provider_list_separator: string;
     empty_home: string;
     empty_cross: string;
     col_kind: string;
@@ -5381,7 +5398,23 @@ const en: TranslationKeys = {
     col_source: "Source",
     col_secret_ref: "Secret reference",
     col_enabled: "Enabled",
-    col_used_by: "Used by agents",
+    col_used_by: "Used by",
+    used_by_agents_n: "{{count}} agents",
+    platform_uses_n: "{{count}} platform features",
+    platform_uses_tooltip_title: "Platform's own dependencies",
+    platform_use_on: "on",
+    platform_use_off: "off",
+    platform_feature_embedding: "Embeddings",
+    platform_feature_rerank: "Rerank",
+    platform_feature_eval_agent: "Eval agent",
+    platform_feature_quality_judge: "Quality judge",
+    platform_feature_memory_consolidation: "Long-term memory consolidation",
+    feature_list_separator: ", ",
+    source_unset_platform_warn: "needed by the platform",
+    platform_credentials_missing_title:
+      "{{count}} provider credential(s) are unset but the platform itself is using them",
+    platform_credentials_missing_body:
+      "These platform features run on a platform credential, not an agent's — they fail on every run until the key is configured here.",
     col_actions: "Actions",
     source_env: "env",
     source_db: "db",
@@ -6184,6 +6217,11 @@ const en: TranslationKeys = {
       "Per-user long-term memories used for recall during agent runs. Edit / delete here is destructive; vector embeddings re-compute on PATCH.",
     cross_tenant_banner: "cross-tenant view",
     failed_to_load: "Failed to load memories",
+    consolidator_credentials_missing_title:
+      "Long-term memory consolidation has failed {{count}} sweep(s) in a row — platform credentials are not configured",
+    consolidator_credentials_missing_body:
+      "The consolidator resolves a platform credential for: {{providers}}. Configure it under Settings → Platform → Credentials; nothing consolidates until then.",
+    provider_list_separator: ", ",
     empty_home: "No memories in this tenant yet.",
     empty_cross: "No memories across all tenants yet.",
     col_kind: "Kind",

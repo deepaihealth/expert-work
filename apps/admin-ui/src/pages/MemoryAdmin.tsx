@@ -36,13 +36,16 @@ import { useTranslation } from "react-i18next";
 import {
   correctMemory,
   deleteMemory,
+  getConsolidatorHealth,
   listMemories,
   updateMemory,
+  type ConsolidatorHealth,
   type MemoryItem,
   type MemoryKind,
   type MemoryList,
 } from "../api/memory";
 import { ApiError } from "../api/client";
+import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
 import { PageHeader } from "../components/PageHeader";
 
@@ -59,6 +62,7 @@ export function MemoryAdmin() {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
+  const isSystemAdmin = useAuth().identity?.isSystemAdmin ?? false;
 
   const [data, setData] = useState<MemoryList | null>(null);
   const [loading, setLoading] = useState(false);
@@ -111,6 +115,29 @@ export function MemoryAdmin() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // B-51 —— 长期记忆整合的健康度。数据源是每次 sweep 的审计行(consolidator
+  // 靠 advisory lock 单飞,进程内存只有一个副本有,审计日志才是跨副本可读的
+  // 现成来源)。读它要平台级 scope,所以只有 system_admin 看得到这条;读失败
+  // 就当没有(整合健康度不该挡住记忆列表)。
+  const [consolidator, setConsolidator] = useState<ConsolidatorHealth | null>(null);
+  useEffect(() => {
+    if (!isSystemAdmin) {
+      setConsolidator(null);
+      return;
+    }
+    let cancelled = false;
+    getConsolidatorHealth()
+      .then((health) => {
+        if (!cancelled) setConsolidator(health);
+      })
+      .catch(() => {
+        if (!cancelled) setConsolidator(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isSystemAdmin]);
 
   const openEdit = useCallback((item: MemoryItem) => {
     setMode("edit");
@@ -315,6 +342,21 @@ export function MemoryAdmin() {
 
       {error !== null && (
         <Alert type="error" showIcon message={t("memory.failed_to_load")} description={error} style={{ marginBottom: 12 }} data-testid="memory-error" />
+      )}
+
+      {consolidator !== null && consolidator.consecutiveCredentialFailures > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          message={t("memory.consolidator_credentials_missing_title", {
+            count: consolidator.consecutiveCredentialFailures,
+          })}
+          description={t("memory.consolidator_credentials_missing_body", {
+            providers: consolidator.providers.join(t("memory.provider_list_separator")),
+          })}
+          style={{ marginBottom: 12 }}
+          data-testid="memory-consolidator-alert"
+        />
       )}
 
       <Table<MemoryItem>

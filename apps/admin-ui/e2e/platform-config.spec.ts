@@ -50,6 +50,11 @@ const VIEW = {
         enabled: false,
         keys: [],
         used_by_agents: 0,
+        // B-51 —— 未设置 + 平台自己在用 → 行上警示 + 顶部 banner(带进 axe)。
+        platform_uses: [
+          { feature: "embedding", model: "text-embedding-v4", enabled: true },
+          { feature: "rerank", model: "qwen-plus", enabled: false },
+        ],
         tenant_override_count: 0,
       },
     ],
@@ -90,6 +95,17 @@ test("system_admin sees platform credential tables + passes axe", async ({
   // The per-tool credential table is gone — keyless SearXNG web_search made
   // it dead config (see SettingsPlatformConfig).
   await expect(page.getByTestId("pc-tools-table")).not.toBeVisible();
+  // B-51 —— qwen 未设置但向量化在用它:行上警示 + 顶部 banner。已配好的
+  // anthropic 一行不许染色。
+  await expect(page.getByTestId("pc-source-qwen")).toContainText(
+    "needed by the platform",
+  );
+  await expect(
+    page.getByTestId("pc-platform-credentials-missing"),
+  ).toContainText("qwen");
+  await expect(page.getByTestId("pc-source-anthropic")).not.toContainText(
+    "needed by the platform",
+  );
   await expectNoA11yViolations(page, "/settings/platform");
 });
 
