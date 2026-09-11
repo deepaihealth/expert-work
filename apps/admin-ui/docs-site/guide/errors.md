@@ -32,7 +32,7 @@
 | [`SESSION_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 提前获取 session_id / 上传附件 / 历史消息 / 重命名会话 / 归档会话 / run 列表 | `session_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配 |
 | [`UPLOAD_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 附件下载 | 附件不存在、不属于这个 `user_id`、已被删除，或内容已被回收。核对 `upload_id` 与 `user_id`，图片还要核对 `session_id` |
 | [`WORKSPACE_FILE_FAILED`](#_8-6-404-目标不存在) | 404 | 工作区文件下载 | `user_id` 未被识别，或该路径下没有文件。核对 `user_id` 与 `path` |
-| [`RUN_NOT_FOUND`](./run-control#_4-1-取消-run) | 404 | 取消 run / 审批决策 / 事件接口 / 打分 / 重新生成 / 编辑重发 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配，不要当作「run 尚未创建」重试 |
+| [`RUN_NOT_FOUND`](./run-control#_4-1-取消-run) | 404 | 取消 run / 审批决策 / 事件接口 / 打分 / 重新生成 / 编辑重发 / run 用量 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配，不要当作「run 尚未创建」重试 |
 | [`THREAD_BUSY`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 这段会话有一轮正在执行或排队。等它结束，或先取消它 |
 | [`RUN_AWAITING_APPROVAL`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 目标那一轮正等待审批决策。先做决策，再对续跑后的那一轮操作 |
 | [`RUN_ALREADY_SUPERSEDED`](#_8-7-409-冲突) | 409 | 重新生成 / 编辑重发 | 目标那一轮已经被重新生成过。改对最新的那一轮操作 |
