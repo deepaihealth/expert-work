@@ -234,7 +234,9 @@ class TokenUsageStore(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def totals_by_trace_ids(self, trace_ids: Sequence[str]) -> dict[str, TokenTotals]:
+    async def totals_by_trace_ids(
+        self, trace_ids: Sequence[str], *, usage_kinds: Sequence[str] | None = None
+    ) -> dict[str, TokenTotals]:
         """Sum token usage grouped by ``trace_id`` for the given ids.
 
         Feeds the Runs list + detail — ``trace_id`` joins ``agent_run`` ↔
@@ -242,6 +244,18 @@ class TokenUsageStore(abc.ABC):
         context, like :meth:`list_for_tenant`. Ids with no recorded usage
         (legacy / auto-triggered runs) are simply absent from the result; the
         caller treats a missing id as zero.
+
+        B-52 —— ``usage_kinds`` narrows to those ``usage_kind`` values. ``None``
+        (the default) counts every kind, which is what the console's Runs list /
+        detail already shows. The external per-run usage endpoint passes
+        ``("conversation",)``: ``quality_sampling`` and ``skill_evolution`` are
+        the platform's own spend, and billing them to the caller would charge
+        for our internal pipelines.
+
+        A trace whose rows are *all* filtered out is **absent** from the result
+        rather than present with zeroes — absent means "no record", which the
+        external frame renders as a missing field, while an empty bucket list
+        would mean "genuinely zero usage". The two must not be conflated.
         """
 
     @abc.abstractmethod
@@ -336,13 +350,19 @@ class InMemoryTokenUsageStore(TokenUsageStore):
             and (user_id is None or r.user_id == user_id)
         ]
 
-    async def totals_by_trace_ids(self, trace_ids: Sequence[str]) -> dict[str, TokenTotals]:
+    async def totals_by_trace_ids(
+        self, trace_ids: Sequence[str], *, usage_kinds: Sequence[str] | None = None
+    ) -> dict[str, TokenTotals]:
         wanted = {t for t in trace_ids if t}
+        # B-52 — same predicate as the SQL store: empty / None means no filter.
+        kinds = set(usage_kinds) if usage_kinds else None
         # (trace_id, provider, model) → running bucket; folded per trace below.
         buckets: dict[tuple[str, str | None, str], ModelTokenTotals] = {}
         for r in self._rows:
             tid = r.trace_id
             if tid is None or tid not in wanted:
+                continue
+            if kinds is not None and r.usage_kind not in kinds:
                 continue
             key = (tid, r.provider, r.model)
             prev = buckets.get(key) or ModelTokenTotals(provider=r.provider, model=r.model)
@@ -554,7 +574,9 @@ class DbTokenUsageStore(TokenUsageStore):
                     break
         return out
 
-    async def totals_by_trace_ids(self, trace_ids: Sequence[str]) -> dict[str, TokenTotals]:
+    async def totals_by_trace_ids(
+        self, trace_ids: Sequence[str], *, usage_kinds: Sequence[str] | None = None
+    ) -> dict[str, TokenTotals]:
         ids = [t for t in dict.fromkeys(trace_ids) if t]  # dedup, drop empty
         if not ids:
             return {}
@@ -578,6 +600,9 @@ class DbTokenUsageStore(TokenUsageStore):
             .where(TokenUsageRow.trace_id.in_(ids))
             .group_by(TokenUsageRow.trace_id, TokenUsageRow.provider, TokenUsageRow.model)
         )
+        # B-52 — same predicate as the in-memory store: empty / None means no filter.
+        if usage_kinds:
+            stmt = stmt.where(TokenUsageRow.usage_kind.in_(list(usage_kinds)))
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
         per_trace: dict[str, list[ModelTokenTotals]] = {}

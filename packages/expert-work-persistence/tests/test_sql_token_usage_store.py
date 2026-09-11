@@ -178,3 +178,82 @@ async def test_totals_by_trace_ids_buckets_by_provider_and_model(
             assert sum(getattr(b, field) for b in totals.by_model) == getattr(totals, field), field
     finally:
         await engine.dispose()
+
+
+# B-52 —— usage_kind 过滤。SQL 与内存两版的谓词必须逐字同义:
+# ``usage_kinds`` 为空/None → 不过滤;否则只留集合内的。本仓库反复踩过
+# 「SQL ↔ in-memory 谓词分叉」,所以两边各有一套同形测试。
+
+
+@pytest.mark.asyncio
+async def test_totals_by_trace_ids_usage_kind_filter(
+    usage_store: SqlStoreFixture,
+) -> None:
+    """默认算全部 kind(控制台现有行为);传了就只算集合内的,分桶跟着收窄。"""
+    store, engine = usage_store
+    try:
+        tenant = uuid4()
+        trace = f"trace-{uuid4().hex}"
+
+        def _row(model: str, inp: int, out: int, kind: str) -> TokenUsageRecord:
+            return TokenUsageRecord(
+                tenant_id=tenant,
+                agent_name="agent",
+                agent_version="v1",
+                model=model,
+                provider="glm",
+                trace_id=trace,
+                input_tokens=inp,
+                output_tokens=out,
+                usage_kind=kind,
+            )
+
+        await store.insert(_row("glm-5.3", 100, 10, "conversation"))
+        await store.insert(_row("glm-5.3-flash", 7, 1, "quality_sampling"))
+        await store.insert(_row("glm-5.2", 3, 1, "skill_evolution"))
+
+        unfiltered = (await store.totals_by_trace_ids([trace]))[trace]
+        assert unfiltered.input_tokens == 110
+        assert unfiltered.llm_calls == 3
+
+        filtered = (await store.totals_by_trace_ids([trace], usage_kinds=("conversation",)))[trace]
+        assert filtered.input_tokens == 100
+        assert filtered.output_tokens == 10
+        assert filtered.llm_calls == 1
+        # 被过滤的两行是别的模型 —— 分桶必须跟着收窄,不能只收总数。
+        assert filtered.models == ("glm-5.3",)
+        assert [b.model for b in filtered.by_model] == ["glm-5.3"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_totals_by_trace_ids_filtered_trace_is_absent_not_zero(
+    usage_store: SqlStoreFixture,
+) -> None:
+    """一个 trace 的行全被过滤 → 该 id **缺席**,不是返回一个零值 totals。
+
+    缺席 = 无记录,零值 = 确有其事的零用量。对外帧上的 ``usage_by_model`` 靠这个
+    区分(``artifacts`` 立下的既有口径)。
+    """
+    store, engine = usage_store
+    try:
+        tenant = uuid4()
+        trace = f"trace-{uuid4().hex}"
+        await store.insert(
+            TokenUsageRecord(
+                tenant_id=tenant,
+                agent_name="agent",
+                agent_version="v1",
+                model="glm-5.3",
+                provider="glm",
+                trace_id=trace,
+                input_tokens=7,
+                output_tokens=1,
+                usage_kind="quality_sampling",
+            )
+        )
+
+        assert await store.totals_by_trace_ids([trace], usage_kinds=("conversation",)) == {}
+    finally:
+        await engine.dispose()
