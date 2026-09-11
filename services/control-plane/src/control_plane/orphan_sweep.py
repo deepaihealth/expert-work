@@ -59,6 +59,7 @@ from expert_work.protocol import AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStore
 from orchestrator import AgentFactoryError, run_agent
+from orchestrator.tools.skill_seed import sanitize_agent_key
 
 logger = logging.getLogger("expert_work.control_plane.orphan_sweep")
 
@@ -396,6 +397,8 @@ class OrphanSweep:
             }
             if orphan.user_id is not None:
                 configurable["user_id"] = str(orphan.user_id)
+            # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
+            configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
             if built.run_deadline_s > 0:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
             config: RunnableConfig = {"configurable": configurable}

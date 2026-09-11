@@ -688,6 +688,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # tool context resolves the same per-user OAuth pool as the parent.
     if ctx.oauth_user_id is not None:
         configurable["oauth_user_id"] = ctx.oauth_user_id
+    # 工作区分层 —— 透传**父的** agent_key,不是子代自己的。子代(worker / 静态
+    # 子 Agent)干的是父 agent 的活,产物必须落在父的子树里,否则父读不到自己
+    # worker 刚写的文件。与技能种子路径同一个取值口径(用父 key)。
+    if ctx.agent_key:
+        configurable["agent_key"] = ctx.agent_key
     if ctx.deadline_at is not None:
         configurable["deadline_at"] = ctx.deadline_at
     # B2 — 向下透传 worker 事件 sink,孙 worker 帧直达父 run bridge。

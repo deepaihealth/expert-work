@@ -115,6 +115,7 @@ from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
 from orchestrator.multimodal import image_ref_block
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
+from orchestrator.tools.skill_seed import sanitize_agent_key
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -966,6 +967,9 @@ async def resolve_approval_decision(
     # worker can resolve the same per-user OAuth pool (distinct from user_id).
     if oauth_user_id is not None:
         config["configurable"]["oauth_user_id"] = oauth_user_id  # type: ignore[index]
+    # 工作区分层 —— agent 身份。续跑段与被续的那一段是同一个 agent 的同一轮活,
+    # 漏了这里 = 审批通过之后的后半程写去了用户根,前半程写的在 agent 子树里。
+    config["configurable"]["agent_key"] = sanitize_agent_key(spec_record.spec.metadata.name)
     worker = asyncio.create_task(
         run_agent(
             bridge=runtime.stream_bridge,
@@ -1251,6 +1255,8 @@ async def spawn_run(
         current_user_id_var.set(effective_user_id)
     # MCP-OAUTH (OA-3b-后续) — the OAuth subject (per-user OAuth pool key).
     configurable["oauth_user_id"] = oauth_subject
+    # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
+    configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     # 本轮附件下传:委派出去的子代看不到本对话,``[file attached: …]`` 那行对它
