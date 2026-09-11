@@ -48,6 +48,9 @@ from expert_work.persistence.tenant_user import SqlTenantUserStore
 from expert_work.persistence.thread_meta import SqlThreadMetaStore
 from expert_work.protocol import MemoryItem
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 pytestmark = pytest.mark.integration
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
@@ -588,6 +591,7 @@ async def test_artifact_isolated_by_tenant_and_user(
         await store.save_version(
             tenant_id=tenant_a,
             user_id=user_a,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="report.md",

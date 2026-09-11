@@ -131,7 +131,12 @@ def build_workspace_router() -> APIRouter:
         current_user_id_var.set(target_user_id)
         async with applied_scope(scope):
             workspace = await workspaces.get(tenant_id=target_tenant, user_id=target_user_id)
-            arts = await artifacts.list_for_user(tenant_id=target_tenant, user_id=target_user_id)
+            # B-50 —— 控制台用户档案页是**跨 agent 的全量视图**(运维要看见这个
+            # 用户名下所有东西),所以 ``agent_key=None`` 不过滤。返回体里带上
+            # 每条的 ``agent_key``,运维才分得出哪份是谁的。
+            arts = await artifacts.list_for_user(
+                tenant_id=target_tenant, user_id=target_user_id, agent_key=None
+            )
         if target_user_id != caller_user_id:
             # Read auditing — an admin opened another user's workspace
             # ("who looked at whom", Phase 2 governance).

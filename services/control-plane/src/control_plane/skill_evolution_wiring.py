@@ -75,6 +75,7 @@ from expert_work.protocol import (
     EvalDatasetRecord,
     StructuredOutputSpec,
 )
+from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.protocol.skill import Skill, SkillStatus, SkillVersion
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.evolution.graph_runner import GraphReplayTaskRunner
@@ -83,7 +84,6 @@ from orchestrator.evolution.graph_runner import GraphReplayTaskRunner
 # module is only imported lazily from the lifespan.
 from orchestrator.evolution.grounding import SignalTier
 from orchestrator.evolution.replay import ReplayRequest, ReplayRunner, ReplayTask
-from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["build_evolution_worker"]

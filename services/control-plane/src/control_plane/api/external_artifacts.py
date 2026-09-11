@@ -154,7 +154,13 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return JSONResponse({"success": True, "data": {"artifacts": []}, "error": None})
-        artifacts = await store.list_for_user(tenant_id=tenant_id, user_id=end_user_id)
+        # B-50 —— 迁移期显式不按 agent 过滤,保持今天的行为。对外端点按 agent
+        # 收口是 PR4(**对外行为变更**,要提前告知对接方),不在这一批。
+        # 谁可以传 ``agent_key=None`` 有登记表盯着,见
+        # ``tests/test_artifact_agent_scope_callers.py``。
+        artifacts = await store.list_for_user(
+            tenant_id=tenant_id, user_id=end_user_id, agent_key=None
+        )
         items = [
             {
                 "name": a.name,
@@ -206,7 +212,10 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
-        latest = await store.get_latest_version(tenant_id=tenant_id, user_id=end_user_id, name=name)
+        # B-50 —— 同上:迁移期不按 agent 过滤,PR4 收口。
+        latest = await store.get_latest_version(
+            tenant_id=tenant_id, user_id=end_user_id, agent_key=None, name=name
+        )
         if latest is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
         # 产物清单契约 —— 可选 ``version`` 是**校验闸**不是取历史:旧版本
@@ -221,7 +230,10 @@ def build_external_artifacts_router() -> APIRouter:
                 409,
             )
         version = latest
-        artifacts = await store.list_for_user(tenant_id=tenant_id, user_id=end_user_id)
+        # B-50 —— 同上:迁移期不按 agent 过滤,PR4 收口。
+        artifacts = await store.list_for_user(
+            tenant_id=tenant_id, user_id=end_user_id, agent_key=None
+        )
         artifact = next((a for a in artifacts if a.name == name), None)
         if artifact is None:
             # Defensive — a version without its parent row violates a store
@@ -330,8 +342,13 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
+        # B-50 —— 同上:迁移期不按 agent 过滤,PR4 收口。
         hit = await store.soft_delete(
-            tenant_id=tenant_id, user_id=end_user_id, name=name, now=datetime.now(UTC)
+            tenant_id=tenant_id,
+            user_id=end_user_id,
+            agent_key=None,
+            name=name,
+            now=datetime.now(UTC),
         )
         if not hit:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)

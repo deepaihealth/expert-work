@@ -49,7 +49,11 @@ class Artifact(BaseModel):
     id: UUID
     tenant_id: UUID
     user_id: UUID
-    name: str = Field(description="logical name, unique per (tenant, user)")
+    #: B-50 工作区分层 —— 这条产物属于哪个 agent(``sanitize_agent_key(spec.metadata.name)``,
+    #: 与沙箱的 ``/opt/skills/<agent_key>`` 同一个值)。空串 = 归属不明的历史产物:
+    #: 迁移 ``0154`` 回填时反推链断了的那批,以及没绑 agent 的调用方存的。
+    agent_key: str = ""
+    name: str = Field(description="logical name, unique per (tenant, user, agent_key)")
     kind: ArtifactKind
     latest_version: int = Field(ge=1, description="version number of the newest revision")
     created_at: datetime | None = None
