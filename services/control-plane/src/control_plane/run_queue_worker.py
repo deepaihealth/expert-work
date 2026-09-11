@@ -53,6 +53,7 @@ from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
 from orchestrator import AgentFactoryError, run_agent
+from orchestrator.tools.skill_seed import sanitize_agent_key
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -357,6 +358,8 @@ class RunQueueWorker:
             }
             if run.user_id is not None:
                 configurable["user_id"] = str(run.user_id)
+            # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
+            configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
             if built.run_deadline_s > 0:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
             # 本轮附件下传 —— 和 ``spawn_run`` 同一份来源(``document_names``),

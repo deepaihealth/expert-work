@@ -47,6 +47,7 @@ from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.protocol import AgentSpecStatus, AuditAction, TriggerRecord
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator import AgentFactoryError, run_agent
+from orchestrator.tools.skill_seed import sanitize_agent_key
 
 logger = logging.getLogger("expert_work.control_plane.trigger_firing")
 
@@ -297,6 +298,8 @@ async def fire_trigger(
     # node's bind-time filter (manage_task withheld from the LLM) and the
     # tool's own call-time block (defense-in-depth).
     configurable["trigger_origin"] = True
+    # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
+    configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
     config: RunnableConfig = {"configurable": configurable}
 
     worker = asyncio.create_task(

@@ -273,6 +273,14 @@ class ToolContext:
     #: * 两者都不是 → 不列。子代既没有原生视觉也没有 ``ask_image``,列出来只是
     #:   给它一串用不上的字符串。
     turn_image_refs: tuple[str, ...] = ()
+    #: 工作区分层 —— 本次调用属于哪个 agent。值是 ``sanitize_agent_key(spec.metadata.name)``,
+    #: 与 ``/opt/skills/<agent_key>`` / ``PYTHONUSERBASE`` 用的是同一个,**不要新造第二种算法**。
+    #:
+    #: 空串 = 没绑 agent,与 ``agent_key_envs("")`` 的「空串=不注入」语义一致。真实会
+    #: 出现空串的只有合成执行路径(``eval_engine_live`` 的对抗评测建的是内联 spec、
+    #: 连 tenant_id 都没有),用户的每一条 run 入口都必须填上 —— 见
+    #: ``control-plane/tests/test_agent_key_plumbing.py`` 的入口穷举。
+    agent_key: str = ""
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``

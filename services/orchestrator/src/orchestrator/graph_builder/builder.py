@@ -3041,6 +3041,10 @@ def _build_tool_context(
     # 仍然逐项清洗:这两个通道的值一路从 HTTP 载荷传下来,不是进程内对象。
     docs = _string_list(turn_documents)
     images = _string_list(turn_image_refs)
+    # 工作区分层 —— 本次调用的 agent 身份。``configurable`` 是不可信输入
+    # (一路从 HTTP 载荷传下来),非字符串一律当没有,回落空串。
+    agent_key_raw = configurable.get("agent_key")
+    agent_key = agent_key_raw if isinstance(agent_key_raw, str) else ""
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -3059,6 +3063,7 @@ def _build_tool_context(
         artifact_recorder=artifact_recorder,
         turn_documents=docs,
         turn_image_refs=images,
+        agent_key=agent_key,
     )
 
 

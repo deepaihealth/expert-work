@@ -83,6 +83,7 @@ from orchestrator.evolution.graph_runner import GraphReplayTaskRunner
 # module is only imported lazily from the lifespan.
 from orchestrator.evolution.grounding import SignalTier
 from orchestrator.evolution.replay import ReplayRequest, ReplayRunner, ReplayTask
+from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["build_evolution_worker"]
@@ -616,6 +617,10 @@ def _make_replay_config_factory(
         }
         if candidate.user_id is not None:
             configurable["user_id"] = str(candidate.user_id)
+        # 工作区分层 —— replay 跑的是完整 agent 图(含文件工具),而且带着**真实的**
+        # tenant_id / user_id,所以它读写的是真实用户的工作区。漏了这一处,replay
+        # 看不见被 replay 的那个 agent 自己的文件,held-out 判定会失真。
+        configurable["agent_key"] = sanitize_agent_key(candidate.agent_name)
         return {"configurable": configurable}
 
     return factory
