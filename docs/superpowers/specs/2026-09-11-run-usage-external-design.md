@@ -238,15 +238,21 @@ def end_frame_data(
 **① 不返回金额。** 用户 2026-09-11 拍板走「只给 token + 模型」,由对接方按自己的价位表
 换算。代价已知:他们算出来的是自己口径的估算,与我方账单不必然一致。
 
-**② 不拆缓存折扣。** 用户 2026-09-11 明确「先不考虑缓存的问题」。
+**② 不替对接方决定计价口径。** 用户 2026-09-11 拍板:**四个 token 字段照常全给**
+(`input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens`),
+**怎么用是对接方的事**。我方职责是给出完整、准确的计量,不是规定对方的算法。
 
-**已知代价,记在这里以免日后当成遗漏**:`input_tokens` **已包含** `cache_read_tokens`
-(LangChain `usage_metadata` 约定:`input_tokens` 是所有输入类型之和,`input_token_details`
-是它的细分)。实测验死 —— 测试环境 4322 行中 `cache_read > input_tokens` **零行**,
-`cache_read < input_tokens` 3905 行。
+所以本条的"不做"是:**不为了迁就某种计价口径而裁剪字段,也不在端点里替对方做折算**
+(不提供等效单价、不提供金额、不提供"建议按哪几档算")。
 
-按 `input_tokens` 全量乘标准输入价,相对四档精算**高估 3~5 倍**(测试环境全库缓存占比
-86.5%,生产 92.0%)。这是明知的取舍,不是缺陷。
+**但告知义务要尽到**,已书面告知对接方并记在此:`input_tokens` **已包含**
+`cache_read_tokens`(LangChain `usage_metadata` 约定:`input_tokens` 是所有输入类型之和,
+`input_token_details` 是它的细分)。实测验死 —— 测试环境 4322 行中
+`cache_read > input_tokens` **零行**,`cache_read < input_tokens` 3905 行。
+
+若消费者选择只用前两档、按 `input_tokens` 全量乘标准输入价,相对四档精算会**高估
+3~5 倍**(测试环境全库缓存占比 86.5%,生产 92.0%)。**这是消费侧的选择,不是我方的
+数据缺陷** —— 四档数据我方一直都给。
 
 **③ 不加 `token_usage.run_id` 列,不加 `agent_run.usage_by_model` 列。** 理由见 §2.1 / §4.1。
 
