@@ -41,6 +41,7 @@ from control_plane.api._idempotency import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.agents import (
     ExternalFileRef,
@@ -55,6 +56,7 @@ from control_plane.supersede import SupersedeError
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.persistence.token_usage_store import TokenUsageStore
 from expert_work.protocol import AgentSpecStatus, Principal
 from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunStatus, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
@@ -135,6 +137,10 @@ def _get_thread_repo(request: Request) -> ThreadMetaStore:
 
 def _get_run_store(request: Request) -> RunStore:
     return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+def _get_token_usage_store(request: Request) -> TokenUsageStore:
+    return request.app.state.token_usage_store  # type: ignore[no-any-return]
 
 
 async def _supersede_and_run(
@@ -480,6 +486,78 @@ def build_external_runs_router() -> APIRouter:
                 "error": None,
             }
         )
+
+    @router.get(
+        "/{agent_code}/runs/{run_id}/usage",
+        response_model=None,
+        dependencies=[Depends(require("session", "read"))],
+    )
+    async def run_usage(
+        agent_code: str,
+        run_id: UUID,
+        request: Request,
+        runs: Annotated[RunStore, Depends(_get_run_store)],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
+        user_id: Annotated[str, Query(min_length=1, max_length=255)],
+    ) -> JSONResponse:
+        """这个 run 的 token 用量,按 ``(provider, model)`` 分桶。
+
+        **对账兜底** —— 日常扣账走 ``end`` 帧(它带同一份数据);这里给没接住
+        end 帧、要补数、或月底对账的场景。两处的 ``usage_by_model`` 逐字段同形,
+        因为共用 ``_run_usage`` 那一个装配口。
+
+        含**整棵调用树**:worker 与主线共用同一个 trace,其用量记在
+        ``{parent}-worker`` 名下、同一 trace 下,按 trace 聚合天然包含且不重复
+        (用量按每次 LLM 调用落一行,不是按 span 嵌套记)。
+
+        四档 token **恒全给** —— 计价口径是调用方的事,我方只负责计量完整准确。
+        ``llm_calls`` 不对外。平台自身开销(``quality_sampling`` /
+        ``skill_evolution``)不计入。
+
+        ``usage_by_model`` **缺席**表示无记录(run 尚未绑 trace / 历史 run 无用量
+        行 / 取数失败),**空数组**表示确有其事的零用量 —— 两者不可混同。
+
+        ``user_id`` 必填无默认:漏传是 422,不是「随便谁的 run 都能查」。run 不属于
+        该 ``(user, agent)`` 返 404 而不是空结果 —— 响应不能携带存在性信息。
+
+        run 未结束也可查,返回到目前为止的量;``run_status`` 让调用方自己判断要不要
+        落账。
+        """
+        tenant_id: UUID = request.state.tenant_id
+        try:
+            run, _meta = await load_owned_run(
+                tenant_id=tenant_id,
+                agent_code=agent_code,
+                user_id=user_id,
+                run_id=run_id,
+                runs=runs,
+                threads=threads,
+                users=users,
+            )
+        except ExternalScopeError as exc:
+            return external_error(exc)
+
+        buckets = await make_usage_loader(
+            usage=usage, runs=runs, run_id=run_id, tenant_id=tenant_id
+        )()
+        body: dict[str, Any] = {
+            "run_id": str(run_id),
+            # 终态用与 ``end`` 帧同一张映射表;非终态原样给它的小写名,调用方据此
+            # 知道「这个 run 还在跑,数还会变」。
+            # 与 ``GET .../runs`` 的 ``status`` 同一套词表(``RunStatus`` 原值),
+            # **不是** ``end`` 帧那套。对外平面这两套并存:``end`` 帧只认四个终态
+            # (``EXTERNAL_END_STATUSES``,``timeout`` 被折成 ``error``),而 run
+            # 列表给 ``RunStatus`` 原值。本端点是 run 资源的子资源、且能在 run
+            # 未结束时被调用(``queued`` / ``running`` 在帧词表里根本没有),所以
+            # 跟列表对齐 —— 否则同一个 run 在两个端点上会报出不同的状态串
+            # (``timeout`` vs ``error``)。
+            "run_status": run.status.value,
+        }
+        if buckets is not None:
+            body["usage_by_model"] = buckets
+        return JSONResponse(content=body)
 
     @router.post("/{agent_code}/runs/{run_id}:cancel", response_model=None)
     async def cancel_run(
