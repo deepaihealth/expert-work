@@ -1,8 +1,9 @@
 """``EventLogArchiveSettings`` — env-driven knobs for the G.8 archive job.
 
 Defaults aim at the local docker-compose stack; the DB DSN connects
-directly to Postgres (not PgBouncer) — the sweep is cross-tenant and
-relies on the connecting role bypassing RLS.
+directly to Postgres (not PgBouncer). 「哪些分组够老了」那一问是跨租户的,靠
+连接角色 bypass RLS(``job._bypass_rls`` 显式声明);每组自己的读 / 删则作用到
+该组的租户(``job._tenant_scope``),不依赖角色是不是 ``BYPASSRLS``。
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ class EventLogArchiveSettings(BaseSettings):
 
     service_name: str = "event_log_archive_job"
     log_level: str = "INFO"
+    #: B-45 —— 平台 JSON formatter 的 ``env`` 标签(control-plane 同名字段)。
+    env: Literal["dev", "staging", "prod"] = "dev"
 
     # ------------------------------------------------------------------ db
     db_dsn: str = "postgresql+asyncpg://expert_work:expert_work_dev@localhost:5432/expert_work_dev"

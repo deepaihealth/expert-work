@@ -10,7 +10,9 @@ object storage and deleted from Postgres while recent rows survive.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -21,15 +23,21 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
+from event_log_archive_job import main as main_module
 from event_log_archive_job.job import EventLogArchiveJob
+from expert_work.common.observability.log import ExpertWorkJsonFormatter
 from expert_work.persistence import (
     DatabaseConfig,
     create_async_engine_from_config,
     create_async_session_factory,
+    rls,
 )
+from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.runtime.storage.memory import InMemoryObjectStore
 
 pytestmark = pytest.mark.integration
+
+_RLS_LOGGER = "expert_work.persistence.rls"
 
 ALEMBIC_INI = Path(__file__).resolve().parents[3] / "packages/expert-work-persistence/alembic.ini"
 
@@ -167,3 +175,56 @@ async def test_archive_rerun_overwrites_and_is_idempotent(
         assert await _event_count(engine) == 0
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rls_detect_signal_is_attributable_in_this_process(
+    archive_db: tuple[AsyncEngine, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """B-45 —— listener 在本进程真的装上了,而且归因指向本 job 的应用帧。
+
+    production 的两条路径都在 ``_bypass_rls`` / ``_tenant_scope`` 里,所以这里
+    **故意不声明作用域**直接开会话 —— 这正是 enforce 之后会静默读空的形状,
+    Detect 信号必须打出来:
+
+    * 信号存在 = ``build_rls_sessionmaker`` 真的被这个进程调过(``main.py``
+      没接的时候 listener 在本进程不存在,一条都不会有);
+    * ``rls_caller`` 指向 ``event_log_archive_job.job`` = #1443 第二层还在。
+      真 ORM 调用里 ``after_begin`` 跑在 ``greenlet_spawn`` 的 greenlet 上,
+      普通帧链到 SQLAlchemy 就断了;不顺父 greenlet 的 ``gr_frame`` 走,这里
+      只会拿到 ``<unknown>``。
+    * 过一遍平台 JSON formatter 还带得出 ``rls_caller`` = #1443 第一层还在
+      (旧的 ``stack_info`` 被 formatter 列进跳过属性直接丢掉)。
+    """
+    engine, _ = archive_db
+    token_b = bypass_rls_var.set(False)
+    token_t = current_tenant_id_var.set(None)
+    rls._reset_signal_state()
+    try:
+        job = EventLogArchiveJob(
+            db_session_factory=main_module.build_session_factory(engine),
+            object_store=InMemoryObjectStore(),
+            archive_age_days=180,
+            batch_size=100,
+        )
+        with caplog.at_level(logging.WARNING, logger=_RLS_LOGGER):
+            await job._archivable_groups(datetime.now(UTC))
+    finally:
+        rls._reset_signal_state()
+        current_tenant_id_var.reset(token_t)
+        bypass_rls_var.reset(token_b)
+        await engine.dispose()
+
+    records = [
+        r for r in caplog.records if r.name == _RLS_LOGGER and r.message == "rls.would_fail_closed"
+    ]
+    assert records, "no Detect signal — build_rls_sessionmaker never ran in this process"
+    caller = records[0].__dict__["rls_caller"]
+    assert caller.startswith("event_log_archive_job.job:"), caller
+    assert caller.endswith(" _archivable_groups"), caller
+    assert "sqlalchemy" not in caller
+    # 第一层:平台 JSON formatter 必须把结构化归因带到 stdout,不是丢掉。
+    payload = json.loads(
+        ExpertWorkJsonFormatter(service="event_log_archive_job", env="dev").format(records[0])
+    )
+    assert payload["rls_caller"] == caller

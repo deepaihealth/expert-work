@@ -9,6 +9,8 @@ supervisor 的两个集合查询原先不分后端:``list_idle_sessions`` 会把
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,17 +21,23 @@ from alembic import command
 from alembic.config import Config
 from testcontainers.postgres import PostgresContainer
 
+from expert_work.common.observability.log import ExpertWorkJsonFormatter
 from expert_work.persistence import (
     DatabaseConfig,
     create_async_engine_from_config,
     create_async_session_factory,
+    rls,
 )
 from expert_work.persistence.models import SandboxInstanceRow
+from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.persistence.sandbox_instance_store import AGENT_SANDBOX_IMAGE_REF
+from sandbox_supervisor import app as app_module
 from sandbox_supervisor.domain import SandboxRecord, SandboxState
 from sandbox_supervisor.store import DbSandboxStore
 
 pytestmark = pytest.mark.integration
+
+_RLS_LOGGER = "expert_work.persistence.rls"
 
 ALEMBIC_INI = (
     Path(__file__).resolve().parent.parent.parent.parent
@@ -138,3 +146,62 @@ async def test_list_idle_sessions_excludes_agent_sandbox_rows(store: DbSandboxSt
     idle_ids = {r.id for r in idle}
     assert docker_id in idle_ids  # E2B 行不进 docker reaper
     assert agent_id not in idle_ids
+
+
+@pytest.fixture
+def rls_store(postgres_container: PostgresContainer) -> Iterator[DbSandboxStore]:
+    """Same store, but over the factory **the supervisor process itself builds**
+    (``app.build_session_factory``) — that is what B-45 is about."""
+    cfg = Config(str(ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", _sync_dsn(postgres_container))
+    command.upgrade(cfg, "head")
+
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
+    yield DbSandboxStore(app_module.build_session_factory(engine))
+
+
+@pytest.mark.asyncio
+async def test_rls_detect_signal_is_attributable_in_this_process(
+    rls_store: DbSandboxStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """B-45 —— listener 在 supervisor 进程真的装上了,归因指向 supervisor 自己
+    的帧。supervisor 目前不给任何路径声明作用域(三分形态见
+    ``test_rls_wiring.py`` 的模块注释),所以这是**生产真实形状**:
+
+    * 信号存在 = ``build_rls_sessionmaker`` 真的被这个进程调过(``app.py``
+      没接的时候 listener 在本进程不存在,一条都不会有);
+    * ``rls_caller`` 指向 ``sandbox_supervisor.store`` = #1443 第二层还在。
+      真 ORM 调用里 ``after_begin`` 跑在 ``greenlet_spawn`` 的 greenlet 上,
+      普通帧链到 SQLAlchemy 就断了;不顺父 greenlet 的 ``gr_frame`` 走,这里
+      只会拿到 ``<unknown>``;
+    * ``rls_caller_outer`` 指向调用方(本测试函数)= 归因不止一层,能顺到
+      是哪条 supervisor 路径开的会话;
+    * 过一遍平台 JSON formatter 还带得出 ``rls_caller`` = #1443 第一层还在。
+    """
+    token_b = bypass_rls_var.set(False)
+    token_t = current_tenant_id_var.set(None)
+    rls._reset_signal_state()
+    try:
+        with caplog.at_level(logging.WARNING, logger=_RLS_LOGGER):
+            await rls_store.count_active_for_tenant(uuid4())
+    finally:
+        rls._reset_signal_state()
+        current_tenant_id_var.reset(token_t)
+        bypass_rls_var.reset(token_b)
+
+    records = [
+        r for r in caplog.records if r.name == _RLS_LOGGER and r.message == "rls.would_fail_closed"
+    ]
+    assert records, "no Detect signal — build_rls_sessionmaker never ran in this process"
+    caller = records[0].__dict__["rls_caller"]
+    assert caller.startswith("sandbox_supervisor.store:"), caller
+    assert caller.endswith(" count_active_for_tenant"), caller
+    assert "sqlalchemy" not in caller
+    outer = records[0].__dict__["rls_caller_outer"]
+    assert outer is not None
+    assert outer.endswith(" test_rls_detect_signal_is_attributable_in_this_process"), outer
+    # 第一层:平台 JSON formatter 必须把结构化归因带到 stdout,不是丢掉。
+    payload = json.loads(
+        ExpertWorkJsonFormatter(service="sandbox_supervisor", env="dev").format(records[0])
+    )
+    assert payload["rls_caller"] == caller
