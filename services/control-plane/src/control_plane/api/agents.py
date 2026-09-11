@@ -48,6 +48,7 @@ from control_plane.api._idempotency import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS, make_run_probe
+from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.external_events import build_events_response
@@ -105,6 +106,7 @@ from expert_work.persistence.agent_instance import AgentInstanceStore
 from expert_work.persistence.agent_spec import AgentSpecStore, DuplicateAgentSpecError
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.persistence.token_usage_store import TokenUsageStore
 from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import (
     AgentSpec,
@@ -286,6 +288,7 @@ async def _idempotent_run_response(
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
     run_store: RunStore,
+    usage_store: TokenUsageStore,
     tenant_id: UUID,
     stream_format: str,
 ) -> StreamingResponse | JSONResponse:
@@ -317,6 +320,9 @@ async def _idempotent_run_response(
             # PROD-1 —— 幂等重放的 stream 分支就是「重连」:原 run 可能正在别的
             # 副本上执行(重试请求落到非首发副本),live attach 需要轮询兜底。
             run_probe=make_run_probe(runs=run_store, run_id=run.run_id, tenant_id=tenant_id),
+            load_usage=make_usage_loader(
+                usage=usage_store, runs=run_store, run_id=run.run_id, tenant_id=tenant_id
+            ),
             stream_format=stream_format,
         )
     return JSONResponse(
@@ -1583,6 +1589,7 @@ def build_agents_router() -> APIRouter:
                     event_store=event_store,
                     stream_bridge=runtime.stream_bridge,
                     run_store=run_store,
+                    usage_store=request.app.state.token_usage_store,
                     tenant_id=tenant_id,
                     stream_format=payload.stream_format,
                 )
@@ -1744,6 +1751,7 @@ def build_agents_router() -> APIRouter:
                 event_store=event_store,
                 stream_bridge=runtime.stream_bridge,
                 run_store=run_store,
+                usage_store=request.app.state.token_usage_store,
                 tenant_id=tenant_id,
                 stream_format=payload.stream_format,
             )

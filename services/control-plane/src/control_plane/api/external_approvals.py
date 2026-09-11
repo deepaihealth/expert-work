@@ -166,6 +166,9 @@ def _get_thread_repo(request: Request) -> ThreadMetaStore:
     return request.app.state.thread_meta_repo  # type: ignore[no-any-return]
 
 
+from control_plane.api._run_usage import make_usage_loader  # noqa: E402
+
+
 def _get_run_store(request: Request) -> RunStore:
     return request.app.state.run_store  # type: ignore[no-any-return]
 
@@ -327,6 +330,12 @@ def build_external_approvals_router() -> APIRouter:
                 # 同样是第三方 API key 直接消费,system_prompt 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
                 stream_format=payload.stream_format,
+                load_usage=make_usage_loader(
+                    usage=request.app.state.token_usage_store,
+                    runs=runs,
+                    run_id=run_record.run_id,
+                    tenant_id=tenant_id,
+                ),
             ),
             media_type="text/event-stream",
             headers={

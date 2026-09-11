@@ -214,6 +214,7 @@ async def _supersede_and_run(
                 event_store=getattr(state, "run_event_store", None),
                 stream_bridge=runtime.stream_bridge,
                 run_store=runs,
+                usage_store=state.token_usage_store,
                 tenant_id=tenant_id,
                 stream_format=stream_format,
             )
@@ -355,6 +356,7 @@ async def _supersede_and_run(
             event_store=getattr(state, "run_event_store", None),
             stream_bridge=runtime.stream_bridge,
             run_store=runs,
+            usage_store=state.token_usage_store,
             tenant_id=tenant_id,
             stream_format=stream_format,
         )
