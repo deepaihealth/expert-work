@@ -17,7 +17,6 @@ from typing import IO
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from expert_work.common.observability import init_logging
-
 from expert_work.persistence import (
     DatabaseConfig,
     SqlArtifactStore,
