@@ -273,6 +273,51 @@ canonical-agent-e2e-test.md 是全量 SOP,以下是最小闭环):
 
 ## 2. 日常发布
 
+### 2.0 发布前先清点「release.sh 不覆盖的动作」
+
+`release.sh prod` 只做四件事:**建推三个镜像 → 钉 overlay newTag →
+`apply -k`(含 migrate Job = `alembic upgrade head`)→ rollout + smoke**。
+
+它**不做**的事每一版都不一样,而那些恰恰是漏了最疼的 —— 手工 apply 的集群对象、
+NAS 上的数据搬迁、真栈验证探针。下面这节是本节的**唯一**入口:先清点,把结果写成
+一份带日子的执行单,发布当天照单打勾,发完归档。
+
+```sh
+PREV=$(grep -A2 'expert-work/control-plane$' infra/k8s/overlays/prod/kustomization.yaml \
+       | grep newTag | awk '{print $2}')    # 生产现在钉的 tag = 上一版 = 回滚目标
+echo "PREV=$PREV"
+
+git log --oneline "$PREV"..HEAD                                       # 装载了什么
+git diff --name-status "$PREV"..HEAD -- '*/migrations/versions/*'     # alembic(自动跑,但要知道有哪些)
+git diff --name-status "$PREV"..HEAD -- tools/persistence             # 要手工跑的一次性脚本
+git diff --name-status "$PREV"..HEAD -- infra/k8s/                    # overlay / base 结构变化
+git diff "$PREV"..HEAD -- infra/k8s/sandbox/sandboxset.yaml           # 手工 apply、不进 kustomize 的对象
+git diff "$PREV"..HEAD -- infra/k8s/base/ | grep -i secretKeyRef      # 新增 secret 引用
+```
+
+**光看 git 不够,还要跟集群的实际值对一遍** —— 手工维护的东西会悄悄漂
+(`hand-pinned-image-off-release-path`,已两犯):
+
+```sh
+export KUBECONFIG=~/.kube/expert-work-prod.yaml
+kubectl -n default get sandboxset expert-work-sandbox \
+  -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'   # 与仓库里钉的对得上吗
+```
+
+清点结果落成 `docs/runbooks/YYYY-MM-DD-prod-release-checklist.md`,每条写清
+**「release.sh 为什么不做」**和**「漏了会怎样」**——只写「要做 X」下次还是会被跳过。
+一并写清**回滚窗口**:这一版有没有单向门(数据搬迁、破坏性迁移),门在哪一步之前。
+
+已有样板:[`2026-09-16-prod-release-checklist.md`](./2026-09-16-prod-release-checklist.md)。
+
+> ⚠️ runbook 里写的命令,**在它真正要跑的地方跑一遍再交**。2026-09-12 清点时发现
+> 工作区搬迁 runbook 三条命令全跑不起来(模块不在镜像里 / 标签选择器选不中 /
+> NAS 根路径写错),根因是那份 runbook 照着仓库写、一条都没在真集群上执行过。
+> `tools/deploy/test_runbook_pod_commands.py` 现在拦前两类,第三类(路径、参数值)
+> 还得靠真跑。
+
+### 2.1 发版
+
 ```sh
 tools/deploy/release.sh prod            # 确认 'prod';或 --yes 走脚本
 ```

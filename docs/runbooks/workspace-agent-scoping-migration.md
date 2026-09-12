@@ -40,10 +40,23 @@
 ```sh
 export KUBECONFIG=~/.kube/expert-work-test.yaml   # 生产换 -prod.yaml
 export NS=expert-work
-POD=$(kubectl -n $NS get pod -l app=control-plane -o name | head -1)
+POD=$(kubectl -n $NS get pod -l app.kubernetes.io/name=control-plane -o name | head -1)
 ```
 
-工作区根在控制平面 pod 里挂着。用户清单从库里取（跑过 run 的用户）：
+> 选择器的键是 `app.kubernetes.io/name`(本仓库统一用它)。写成 `app` 那个短键会
+> 选不中任何 pod,而后面 `exec` 报的
+> `pod, type/name or --filename must be specified` 完全看不出是选择器的锅。
+> `tools/deploy/test_runbook_pod_commands.py` 会拦住这类漂移。
+
+工作区根在控制平面 pod 里挂着,**是 `/mnt/workspaces`**(NAS `:/workspaces` 的挂载点,
+`{tenant}/{user}` 就在它下面)。不确定时当场问 pod,别照记忆填:
+
+```sh
+kubectl -n $NS exec "$POD" -- sh -c 'mount | grep -i nas'
+# …:/workspaces on /mnt/workspaces type nfs (…)
+```
+
+用户清单从库里取（跑过 run 的用户）：
 
 ```sh
 kubectl -n $NS exec -i "$POD" -- python3 - <<'PY'
@@ -70,7 +83,7 @@ PY
 
 ```sh
 kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_agent_scoping \
-  --root /workspace-root --tenant "$TENANT" --user "$USER"
+  --root /mnt/workspaces --tenant "$TENANT" --user "$USER"
 ```
 
 输出形如：
@@ -106,7 +119,7 @@ DRY-RUN tenant=… user=…
 
 ```sh
 kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_agent_scoping \
-  --root /workspace-root --tenant "$TENANT" --user "$USER" --apply
+  --root /mnt/workspaces --tenant "$TENANT" --user "$USER" --apply
 ```
 
 脚本是**幂等**的：重跑一遍会重新 plan，已经在终态的东西进 `untouched`，
@@ -118,7 +131,7 @@ kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_
 
 ```sh
 kubectl -n $NS exec -i "$POD" -- sh -c '
-  R=/workspace-root/'"$TENANT/$USER"'
+  R=/mnt/workspaces/'"$TENANT/$USER"'
   echo "总数: $(find $R -type f | wc -l)"
   echo "--- 顶层 ---"; ls -1 $R
   echo "--- agent 子树 ---"; ls -1 $R/agents 2>/dev/null
