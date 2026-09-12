@@ -867,7 +867,7 @@ def _artifact_path(agent_key: str, path: str) -> str:
 
 ---
 
-## Task 6: 工作区路径解析单源模块
+## Task 6: 工作区路径解析单源模块 —— ✅ 已交付(#1512)
 
 **Files:**
 - Create: `services/orchestrator/src/orchestrator/tools/workspace_paths.py`
@@ -1020,7 +1020,7 @@ git commit -m "feat(workspace): 新增 workspace_paths —— agent 根与 share
 
 ---
 
-## Task 7: 四个文件工具用新作用域(带迁移期回落)
+## Task 7: 四个文件工具用新作用域(带迁移期回落) —— ✅ 已交付(#1512,**实测五个**)
 
 **Files:**
 - Modify: `services/orchestrator/src/orchestrator/tools/file_ops.py:499,563,631,715`(四个 `call()`)
@@ -1038,6 +1038,18 @@ git commit -m "feat(workspace): 新增 workspace_paths —— agent 根与 share
 >
 > **代价明说**:回落窗口内读串问题**还是今天的样子** —— 不是新增回归,是尚未修复。
 
+> **⚠️ 勘误(09-12,交付时实测)—— 本 task 登记的「四个文件工具」是错的,
+> 工作区调用点实测**七个**:漏了 `file_ops.SandboxWorkspaceWriter.write` /
+> `SandboxWorkspaceReader.read`(状态投影的写与读)和 `read_document.ReadDocumentTool.call`
+> (它自带一份 `_WORKSPACE_ROOT`)。**同一个 program 里「入口只写一处就漏两处」第三次**
+> (PR1 的 `configurable` 构造点是九个不是四个)。
+>
+> 投影那两处**有意不搬,顺延到 PR5**:`control_plane/api/sessions.py` 的 B-27 留存链按
+> **用户根下**的 `threads/<thread_id>/` 删目录,写入先搬走、删除侧要到 Task 12 才跟上,
+> 中间每个被清理的会话都会留下永远删不掉的投影文件;读侧与写侧必须同进同退。
+> 已配 `test_workspace_scope_callers.py`(AST 登记表):漏登记的新调用点直接红,
+> 留在用户根的每一条都要写明理由。
+>
 > **⚠️ 从 Task 5 顺延过来的一条(09-12)**:`SaveArtifactTool` 给 `path_in_workspace`
 > 加前缀**属于本 task**,不属于 PR2 —— 前缀必须与 `write_file` 的落盘位置同时改,
 > 早一步就是每次下载 404。形状取 **`agents/<agent_key>/<path>`**(不含 `artifacts/` 段,
@@ -1150,7 +1162,7 @@ async def test_write_to_shared_is_refused() -> None:
 
 ---
 
-## Task 8: exec `cwd` 按 agent
+## Task 8: exec `cwd` 按 agent —— ✅ 已交付(#1513,从 PR3 拆出单独一班车)
 
 **Files:**
 - Modify: `services/orchestrator/src/orchestrator/tools/agent_sandbox.py:1472`
@@ -1943,7 +1955,8 @@ git commit -m "feat(workspace): 保留段认 agent 容器层 + 浏览面按 agen
 |---|---|---|
 | PR1 agent_key 地基 | 1, 2 | ✅ **已合 #1507(09-11)**,零行为变更 |
 | PR2 产物按 agent 分 | 3, 4, 5(5 只做了一半) | ✅ **已合 #1509(09-12)**,带迁移 `0154`。**`0154` 尚未在任何真环境跑过 —— 发测试环境并核回填结果是 PR3 的前置** |
-| PR3 工具层分层 | 6, 7, 8 + Task 5 顺延的 `path_in_workspace` 前缀 | 合后泡测试 |
+| PR3 工具层分层 | 6, 7 + Task 5 顺延的 `path_in_workspace` 前缀 | ✅ **已合 #1512(09-12)**。`Contract suite`(真 E2B 集群)红了但**什么都没验到** —— 全部用例死在 `acquire()` 的 504,零断言失败(已入册 B-55);按六项必需合,**发版金丝雀当真栈闸门** |
+| PR3b exec cwd | 8 | **带沙箱镜像改动**,自己一班车(#1513)。从 PR3 拆出的理由:它跨服务且要出新 sandbox 镜像,而 spec §5.3 写明 bash / exec_python 不是边界 —— PR3 少了它强制力一分不少 |
 | PR4 对外端点 + 文档 | 9, 10 | **对外行为变更**,要提前告知对接方 |
 | PR5 搬迁 + 留存 + 浏览面 | 11, 12, 13 | 搬迁先在测试环境跑,验收后再上生产 |
 | PR6 摘回落 | 14 | 搬迁验收完之后 |
