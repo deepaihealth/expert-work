@@ -29,7 +29,7 @@
     "i18next": "^26.4.2",
     "i18next-browser-languagedetector": "^8.0.2",
     "js-yaml": "^5.4.1",
-    "lucide-react": "^1.40.0",
+    "lucide-react": "^1.43.0",
     "markdown-to-jsx": "9.10.2",
     "oidc-client-ts": "^3.1.0",
     "react": "^19.2.8",
@@ -39,7 +39,7 @@
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.13.0",
-    "@playwright/test": "^1.62.1",
+    "@playwright/test": "^1.63.0",
     "@storybook/addon-a11y": "^8.4.7",
     "@storybook/addon-essentials": "^8.4.7",
     "@storybook/react": "^8.4.7",
