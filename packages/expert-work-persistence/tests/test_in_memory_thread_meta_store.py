@@ -333,3 +333,82 @@ async def test_get_many_is_tenant_scoped() -> None:
 async def test_get_many_empty_input_returns_empty() -> None:
     store = InMemoryThreadMetaStore()
     assert await store.get_many([], tenant_id=uuid4()) == {}
+
+
+@pytest.mark.asyncio
+async def test_list_agent_names_for_user_is_distinct_and_sorted() -> None:
+    """B-50 PR4 —— 「这个用户用过哪些 agent」。
+
+    ``sanitize_agent_key`` 带 sha256 后缀、单向,所以对外要把工作区里的
+    ``agents/<key>/`` 和产物行的 ``agent_key`` 还原成 ``agent_code``,只能靠
+    这张反查表。取值域必须是**这个用户实际用过的**那些 agent —— 正好是 key
+    可能出现的那个集合。
+    """
+    store = InMemoryThreadMetaStore()
+    tenant, user = uuid4(), uuid4()
+    for agent in ("plan", "designer", "plan", "plan"):
+        await store.create(
+            thread_id=uuid4(), tenant_id=tenant, created_by="x", user_id=user, agent_name=agent
+        )
+
+    assert await store.list_agent_names_for_user(tenant_id=tenant, user_id=user) == [
+        "designer",
+        "plan",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_agent_names_for_user_excludes_other_users_and_tenants() -> None:
+    store = InMemoryThreadMetaStore()
+    tenant, other_tenant = uuid4(), uuid4()
+    user, other_user = uuid4(), uuid4()
+    await store.create(
+        thread_id=uuid4(), tenant_id=tenant, created_by="x", user_id=user, agent_name="mine"
+    )
+    await store.create(
+        thread_id=uuid4(),
+        tenant_id=tenant,
+        created_by="x",
+        user_id=other_user,
+        agent_name="other-user",
+    )
+    await store.create(
+        thread_id=uuid4(),
+        tenant_id=other_tenant,
+        created_by="x",
+        user_id=user,
+        agent_name="other-tenant",
+    )
+
+    assert await store.list_agent_names_for_user(tenant_id=tenant, user_id=user) == ["mine"]
+
+
+@pytest.mark.asyncio
+async def test_list_agent_names_for_user_skips_threads_with_no_agent() -> None:
+    """``agent_name`` 可空(``create`` 的默认值)—— 空的不进结果,也不变成 ``None`` 条目。"""
+    store = InMemoryThreadMetaStore()
+    tenant, user = uuid4(), uuid4()
+    await store.create(thread_id=uuid4(), tenant_id=tenant, created_by="x", user_id=user)
+    await store.create(
+        thread_id=uuid4(), tenant_id=tenant, created_by="x", user_id=user, agent_name="real"
+    )
+
+    assert await store.list_agent_names_for_user(tenant_id=tenant, user_id=user) == ["real"]
+
+
+@pytest.mark.asyncio
+async def test_list_agent_names_for_user_includes_archived_threads() -> None:
+    """归档不等于「这个 agent 没写过东西」—— 它的文件还在工作区里躺着。
+
+    ``list_by_tenant`` 默认排除 ARCHIVED,这个方法**不能**跟着排除:跟着排
+    会让归档会话那个 agent 的文件在 ``scope=user`` 里整片消失。
+    """
+    store = InMemoryThreadMetaStore()
+    tenant, user = uuid4(), uuid4()
+    thread_id = uuid4()
+    await store.create(
+        thread_id=thread_id, tenant_id=tenant, created_by="x", user_id=user, agent_name="archived"
+    )
+    await store.update_status(thread_id, ThreadStatus.ARCHIVED, tenant_id=tenant)
+
+    assert await store.list_agent_names_for_user(tenant_id=tenant, user_id=user) == ["archived"]
