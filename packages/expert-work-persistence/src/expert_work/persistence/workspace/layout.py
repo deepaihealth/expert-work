@@ -32,6 +32,18 @@ WORKSPACE_SKILLS_DIR = "skills"
 #: User-uploaded documents, landing at ``uploads/<name>`` for ``read_document``.
 WORKSPACE_UPLOADS_DIR = "uploads"
 
+#: Container for the per-agent subtrees — ``agents/<agent_key>/…`` (B-50).
+#: A user's volume is mounted per ``(tenant, user)`` and cannot be split by
+#: agent at the mount point (hot sandboxes are reused across agents, the CSI
+#: ``subPath`` is fixed at create time — spec § 三), so the split is done in
+#: the path and enforced at the tool boundary.
+WORKSPACE_AGENTS_DIR = "agents"
+
+#: Legacy whose owning agent could not be inferred at migration time (B-50
+#: § 7.1). Readable from any agent via the explicit ``shared:`` prefix,
+#: never writable — it is frozen on migration day and decays with time.
+WORKSPACE_SHARED_DIR = "shared"
+
 #: Sandbox-local seed root for an agent's activated skill files (sandbox
 #: migration wave 2, spec § 四 — "技能方案"). Materialized at
 #: ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<skill-name>/…`` on every sandbox

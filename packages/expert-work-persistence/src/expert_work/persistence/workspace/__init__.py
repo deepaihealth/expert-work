@@ -36,7 +36,13 @@ from expert_work.persistence.workspace.layout import (
     SANDBOX_SKILLS_ROOT as SANDBOX_SKILLS_ROOT,
 )
 from expert_work.persistence.workspace.layout import (
+    WORKSPACE_AGENTS_DIR as WORKSPACE_AGENTS_DIR,
+)
+from expert_work.persistence.workspace.layout import (
     WORKSPACE_RESERVED_PREFIXES as WORKSPACE_RESERVED_PREFIXES,
+)
+from expert_work.persistence.workspace.layout import (
+    WORKSPACE_SHARED_DIR as WORKSPACE_SHARED_DIR,
 )
 from expert_work.persistence.workspace.layout import (
     WORKSPACE_SKILLS_DIR as WORKSPACE_SKILLS_DIR,
@@ -57,7 +63,9 @@ from expert_work.persistence.workspace.sql import (
 __all__ = [
     "SANDBOX_AGENTS_ROOT",
     "SANDBOX_SKILLS_ROOT",
+    "WORKSPACE_AGENTS_DIR",
     "WORKSPACE_RESERVED_PREFIXES",
+    "WORKSPACE_SHARED_DIR",
     "WORKSPACE_SKILLS_DIR",
     "WORKSPACE_UPLOADS_DIR",
     "InMemoryUserWorkspaceStore",

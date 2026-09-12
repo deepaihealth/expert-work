@@ -18,8 +18,11 @@ from __future__ import annotations
 import re
 from pathlib import PurePosixPath
 
+from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
+
 #: 显式跨到用户级 ``shared/`` 区的前缀(照 ADK 的 ``user:`` 约定)。
-SHARED_PREFIX = "shared:"
+#: 由目录名拼出来,不写第二遍字面量 —— 前缀与它指向的目录必须永远同名。
+SHARED_PREFIX = f"{WORKSPACE_SHARED_DIR}:"
 
 #: 沙箱内的用户工作区根(挂载点)。**导出而非私有**:``file_ops`` 的迁移期
 #: 读回落要用它,而那个模块自己也有一个同名私有常量 —— 两处各改各的就会静默
@@ -29,8 +32,16 @@ USER_ROOT = "/workspace"
 #: 布局里的保留段。**导出**:``file_ops._require_path`` 要用它来拒绝以这一段
 #: 开头的相对路径 —— 迁移期读回落会把 ``agents/<别人的 key>/x`` 变成一次合法的
 #: 跨 agent 读(agent 根下找不到 → 回落用户根 → 正好命中别人的目录)。
-AGENTS_DIR = "agents"
-_SHARED_DIR = "shared"
+#:
+#: **别名,不是第二份定义。** 真源在 ``expert_work.persistence`` 的
+#: ``workspace/layout.py`` —— 那里是布局前缀的既有单源(``skills`` /
+#: ``uploads`` 也在那儿),而搬迁脚本、留存 job、控制台浏览面都够不着
+#: orchestrator。两处各写各的字面量,搬迁把文件放进 ``agents/`` 而沙箱去
+#: ``agent/`` 找,不会有任何测试红。``test_workspace_paths.py`` 钉了
+#: ``AGENTS_DIR is WORKSPACE_AGENTS_DIR``(同 PR2 给 ``sanitize_agent_key``
+#: 钉 ``reexported is`` 的先例)。
+AGENTS_DIR = WORKSPACE_AGENTS_DIR
+_SHARED_DIR = WORKSPACE_SHARED_DIR
 
 #: ``agent_key`` 来自 ``config["configurable"]`` —— 不可信。它会被拼进 ``ws``,
 #: 一个带 ``/`` 或 ``..`` 的值能把整个作用域撬到 ``/workspace`` 之外。形状与
