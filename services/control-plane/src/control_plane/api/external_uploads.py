@@ -59,6 +59,7 @@ from control_plane.api._external import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
+from control_plane.api._workspace_shared import thread_agent_key, workspace_agent_path
 from control_plane.api.agents import _resolve_session, _SessionError
 from control_plane.api.uploads import (
     _handle_document_upload,
@@ -300,6 +301,7 @@ def build_external_uploads_router() -> APIRouter:
                     tenant_id=tenant_id,
                     caller_user_id=end_user_id,
                     thread_id=thread_id,
+                    agent_key=thread_agent_key(meta),
                     settings=settings,
                     workspace_store=workspace_store,
                     audit=audit,
@@ -454,8 +456,16 @@ def build_external_uploads_router() -> APIRouter:
                     "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 503
                 )
             try:
+                # ``row.ref`` 是 agent 相对的 ``uploads/<name>``(它同时是回给
+                # 对接方的 ``upload_id``,**不能**改成带前缀的值:
+                # ``is_safe_document_upload_id`` 要求 ``uploads/`` 开头,而且
+                # 他们缓存过的 id 会全废)。投影只发生在调 store 这一刻。
                 data = await workspace_store.read_file(
-                    tenant_id=tenant_id, user_id=end_user_id, path=row.ref
+                    tenant_id=tenant_id,
+                    user_id=end_user_id,
+                    path=workspace_agent_path(
+                        row.ref, agent_key=thread_agent_key(owning_thread)
+                    ),
                 )
             except WorkspacePermissionError:
                 # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」

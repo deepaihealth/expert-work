@@ -43,7 +43,11 @@ from typing import Literal
 
 from fastapi import HTTPException
 
-from control_plane.api._workspace_shared import INVALID_WORKSPACE_PATH, _safe_workspace_relpath
+from control_plane.api._workspace_shared import (
+    INVALID_WORKSPACE_PATH,
+    _safe_workspace_relpath,
+    workspace_agent_path,
+)
 from expert_work.protocol.agent_key import sanitize_agent_key
 from orchestrator.tools.workspace_paths import AGENTS_DIR
 
@@ -91,10 +95,12 @@ def external_to_storage(rel: str, *, agent_key: str) -> str:
 
     ``agent_key`` 为空 → 原样返回(用户根),与工具层
     ``agent_workspace_root("")`` 的回落语义一致。
+
+    投影本身在 ``_workspace_shared.workspace_agent_path`` —— 控制台侧的
+    上传写入与会话内读写也要同一套投影,两份实现分叉的话对外能下到的文件
+    控制台下不到(反之亦然),而且两边各自的测试都不会红。
     """
-    if not agent_key:
-        return rel
-    return f"{AGENTS_DIR}/{agent_key}/{rel}"
+    return workspace_agent_path(rel, agent_key=agent_key)
 
 
 def storage_to_external(rel: str, *, agent_key: str) -> str | None:

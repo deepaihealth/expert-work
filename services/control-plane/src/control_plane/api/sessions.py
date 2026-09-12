@@ -40,7 +40,11 @@ from control_plane.api._user_scope import (
     resolve_caller_user_id,
     thread_list_filter,
 )
-from control_plane.api._workspace_shared import _safe_workspace_relpath
+from control_plane.api._workspace_shared import (
+    _safe_workspace_relpath,
+    thread_agent_key,
+    workspace_agent_path,
+)
 from control_plane.audit import emit
 from control_plane.quota.base import QuotaService
 from control_plane.runtime import AgentRuntime
@@ -571,8 +575,12 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
+            # B-50 —— 会话内的 path 相对**这个会话所属 agent 的**工作区根,
+            # 与沙箱里文件工具看到的路径一致。不投影的话搬迁后立刻 404。
             data = await workspace_store.read_file(
-                tenant_id=target_tenant, user_id=meta.user_id, path=safe_path
+                tenant_id=target_tenant,
+                user_id=meta.user_id,
+                path=workspace_agent_path(safe_path, agent_key=thread_agent_key(meta)),
             )
         except WorkspacePermissionError as exc:
             # 权限失败是服务端配置问题,不是"这个文件不存在"——404 的语义是
@@ -639,8 +647,12 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
+            # 同上 —— 不投影的话删的是用户根下的同名文件(多半不存在,于是
+            # 静默变成 no-op:界面显示删成功,文件还在)。
             await workspace_store.delete_file(
-                tenant_id=tenant_id, user_id=meta.user_id, path=safe_path
+                tenant_id=tenant_id,
+                user_id=meta.user_id,
+                path=workspace_agent_path(safe_path, agent_key=thread_agent_key(meta)),
             )
         except WorkspacePermissionError as exc:
             # 同上——权限失败不是"这个文件不存在",必须排在 SandboxSupervisorError
@@ -1033,7 +1045,7 @@ def build_sessions_router() -> APIRouter:
         # ``.tool_results/<run_id>/`` 的清理要按 id 拼路径(见下方工作区那段)。
         try:
             purged_run_ids = [
-                r.id
+                r.run_id
                 for r in await runtime.run_manager.list_by_thread(thread_id, tenant_id=tenant_id)
             ]
         except Exception:

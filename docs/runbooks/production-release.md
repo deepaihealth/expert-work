@@ -289,6 +289,15 @@ P-1(重新生成 / 编辑重发)上线那一次:`alembic upgrade head` 会带上
 都在(明确不回滚计费)—— 脚本形态见
 `docs/superpowers/plans/2026-09-09-regenerate-edit-resend.md` 的 Task 12。
 
+B-50(工作区按 agent 分层)上线那一次:**金丝雀绿之后立刻跑存量搬迁**,
+按 `docs/runbooks/workspace-agent-scoping-migration.md`。不是择日再跑 ——
+发版完成到搬迁完成之间,控制台工作区浏览面与对外两个 workspace 端点都会返回空
+(文件还在扁平根,新代码按 agent 目录去找)。agent 自己的 run 不受影响
+(PR3 的迁移期读回落兜着),产物与附件接口也不受影响(走数据库字段)。
+`alembic upgrade head` 里的 `0154_artifact_agent_key` 是搬迁的**前置**:
+它没跑或回填链断时,本可归属的产物会被**静默**扫进 `shared/` —— 不报错、
+文件数照样守恒,只有人工比对才看得出来(搬迁脚本自己也会断言这一条并拒绝开工)。
+
 ## 3. 回滚
 
 ```sh

@@ -35,6 +35,7 @@ from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
 )
+from control_plane.api._workspace_shared import thread_agent_key, workspace_agent_path
 from control_plane.audit import emit as audit_emit
 from control_plane.quota.base import QuotaService
 from control_plane.settings import Settings
@@ -176,6 +177,7 @@ async def _handle_document_upload(
     tenant_id: UUID,
     caller_user_id: UUID | None,
     thread_id: UUID,
+    agent_key: str,
     settings: Settings,
     workspace_store: WorkspaceStore | None,
     audit: AuditLogger,
@@ -230,12 +232,19 @@ async def _handle_document_upload(
                 detail="workspace is full — delete files to free space",
             ) from exc
 
+    # ``workspace_path`` 是**对 agent 相对**的 ``uploads/<name>``——它同时是
+    # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,
+    # 两处都在 agent 根下解析(PR3),所以这个值不带前缀。
+    #
+    # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
+    # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
+    # 迁移期读回落兜着,Task 14 摘掉回落就断(B-50 补漏)。
     workspace_path = _safe_workspace_name(filename, ext)
     try:
         await workspace_store.write_file(
             tenant_id=tenant_id,
             user_id=caller_user_id,
-            path=workspace_path,
+            path=workspace_agent_path(workspace_path, agent_key=agent_key),
             data=raw,
         )
     except WorkspacePermissionError as exc:
@@ -527,6 +536,7 @@ def build_uploads_router() -> APIRouter:
                 tenant_id=tenant_id,
                 caller_user_id=caller_user_id,
                 thread_id=thread_id,
+                agent_key=thread_agent_key(meta),
                 settings=settings,
                 workspace_store=workspace_store,
                 audit=audit,

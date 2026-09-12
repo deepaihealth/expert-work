@@ -37,6 +37,8 @@ from fastapi import HTTPException
 from fastapi.responses import Response
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
+from expert_work.protocol import ThreadMeta
+from expert_work.protocol.agent_key import sanitize_agent_key
 from orchestrator.tools import (
     SandboxSupervisorError,
     WorkspaceFileEntry,
@@ -44,6 +46,7 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
+from orchestrator.tools.workspace_paths import AGENTS_DIR
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
 
@@ -52,6 +55,37 @@ logger = logging.getLogger("expert_work.control_plane.workspace")
 #: 报同一句话 —— 不同的文案会让第三方能分辨「路径本身不合法」和「投影之后
 #: 不合法」,而那两件事对他们应当是同一个不透明的 400。
 INVALID_WORKSPACE_PATH = "invalid workspace path"
+
+
+def workspace_agent_path(rel: str, *, agent_key: str) -> str:
+    """把一个 agent 相对路径投影成用户根下的存储路径(B-50)。
+
+    ``agent_key`` 为空 = 这个会话没绑 agent(建表早于该列 / 机器线程),
+    保持搬迁前的扁平位置 —— 与 ``agent_workspace_root("")`` 同一个口径。
+
+    **控制平面直接调 ``workspace_store`` 的地方都要过这一道。** 沙箱里的
+    文件工具自己按 agent 根解析(PR3),但 ``workspace_store`` 是按
+    ``(tenant, user)`` 开的,它不知道 agent —— 上传写入、附件下载、会话内
+    的工作区读写都走它。漏掉一处的后果是不对称的:写侧漏了,新上传落回
+    扁平根,搬迁完第二天又堆起来;读侧漏了,搬迁后立刻 404。
+
+    这两种漏法今天都被 PR3 的迁移期读回落兜着(找不到就回落用户根一次),
+    所以**现在不会报错** —— 而 Task 14 摘掉回落的那一刻一起爆。
+    """
+    if not agent_key:
+        return rel
+    return f"{AGENTS_DIR}/{agent_key}/{rel}"
+
+
+def thread_agent_key(meta: ThreadMeta) -> str:
+    """这个会话的工作区子树名;``""`` = 没绑 agent,用扁平根。
+
+    与 ``sessions._session_agent_key`` 刻意不同名也不同返回类型:那个返回
+    ``None`` 表示「不要按 agent 过滤产物」,是查询谓词;这个返回空串表示
+    「就用用户根」,是路径前缀。两者取值同源但用途相反,合并成一个函数会让
+    「不过滤」和「根目录」这两件事变得无法区分。
+    """
+    return sanitize_agent_key(meta.agent_name) if meta.agent_name else ""
 
 
 def _safe_workspace_relpath(path: str) -> str | None:
