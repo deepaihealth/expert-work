@@ -364,7 +364,9 @@ async def test_list_returns_active_artifacts(external_client, seed_artifact) -> 
     ``a.latest_version`` 错写成 0 的实现改动,这条测试此前不会变红。
     """
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
-    resp = await external_client.get(f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"})
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"}
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
@@ -397,7 +399,9 @@ async def test_list_hides_soft_deleted(
     """软删的产物不出现在列表里。"""
     await seed_artifact(user_id="u-1", name="gone.docx", kind="document")
     await soft_delete_artifact(user_id="u-1", name="gone.docx")
-    resp = await external_client.get(f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"})
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"}
+    )
     assert [a["name"] for a in resp.json()["data"]["artifacts"]] == []
 
 

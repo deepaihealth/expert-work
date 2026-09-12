@@ -58,7 +58,9 @@ _ALLOWED_UNFILTERED: dict[str, str] = {
     # 表逐条贴 ``agent_code`` 并丢掉贴不上的**(agent 已删 → 第三方没有可用的
     # code 去下载它),所以「不过滤」在这里是入口宽、出口仍然逐条有归属。
     # 默认的 ``scope=agent`` 分支传的是算出来的 key,不走这条。
-    "control-plane/api/external_artifacts.py::list_artifacts": "?scope=user 并集入口,出口逐条贴 agent_code 并丢弃贴不上的",
+    "control-plane/api/external_artifacts.py::list_artifacts": (
+        "?scope=user 并集入口,出口逐条贴 agent_code 并丢弃贴不上的"
+    ),
 }
 
 

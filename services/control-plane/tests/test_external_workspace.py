@@ -648,9 +648,7 @@ async def test_download_accepts_the_path_it_handed_out(
 
 
 @pytest.mark.asyncio
-async def test_download_across_agents_is_404(
-    external_client, two_agents: _SeededTwoAgents
-) -> None:
+async def test_download_across_agents_is_404(external_client, two_agents: _SeededTwoAgents) -> None:
     """A 的 code 拿 B 的文件路径 → 与「不存在」同一个不透明 404。
 
     光断言 404 是**恒真**的:收口之前这条路径在桩里也不存在,照样 404。要能

@@ -706,9 +706,7 @@ async def test_image_download_across_agents_is_404(external_client, seed_image) 
 async def test_image_download_within_the_same_agent_still_works(
     external_client, seed_image
 ) -> None:
-    upload_id = await seed_image(
-        user_id="u-1", ext=".png", content=b"png-bytes", mime="image/png"
-    )
+    upload_id = await seed_image(user_id="u-1", ext=".png", content=b"png-bytes", mime="image/png")
     resp = await external_client.get(
         f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )

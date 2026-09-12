@@ -127,9 +127,7 @@ async def _workspace_files_payload(
     does **not** use this (see :func:`list_workspace_entries`): a third party
     asking by ``agent_code`` must never be handed another agent's paths.
     """
-    entries = await list_workspace_entries(
-        workspace_store, tenant_id=tenant_id, user_id=user_id
-    )
+    entries = await list_workspace_entries(workspace_store, tenant_id=tenant_id, user_id=user_id)
     return {"files": [{"path": e.path, "size": e.size} for e in entries]}
 
 
