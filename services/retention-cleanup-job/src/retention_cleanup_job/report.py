@@ -31,6 +31,10 @@ class CleanupReport:
     upload_files_removed: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
+    #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过
+    #: (overflow.py 的注释声称留存机制负责,实际不负责),所以首轮这个数
+    #: 会明显偏大,之后趋近 0。
+    tool_result_dirs_removed: int = 0
     # Deletion hygiene PR1 (Task 7) — 90-day physical hard-delete sweeps.
     memory_hard_deleted: int = 0
     # X-4 ② —— 已删工作区 90 天销账(行 + 从属行;不碰 OSS 归档对象)。

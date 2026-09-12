@@ -247,6 +247,23 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def existing_ids(self, run_ids: Sequence[UUID], *, tenant_id: UUID) -> set[UUID]:
+        """Which of ``run_ids`` still have a row in this tenant.
+
+        Added for B-50 Task 12: the retention job sweeps orphaned
+        ``.tool_results/<run_id>/`` directories and needs an existence check
+        per ``(tenant, user)`` batch — the same shape
+        ``ThreadMetaStore.get_many`` already serves for ``threads/<id>/``.
+        Returning ids rather than rows keeps the sweep from materialising
+        run payloads it has no use for.
+
+        Cross-tenant ids are simply absent from the result (never raising),
+        matching :meth:`get`'s posture — but note what that means for the
+        caller: "absent" is *not* proof the run never existed, so the sweep
+        must pair it with a grace period rather than deleting on sight.
+        """
+
+    @abc.abstractmethod
     async def find_by_idempotency_key(self, *, tenant_id: UUID, key: str) -> RunInfo | None:
         """Return the run claimed by ``(tenant_id, key)``, or ``None``.
 
@@ -713,6 +730,13 @@ class InMemoryRunStore(RunStore):
         if row is None or row.tenant_id != tenant_id:
             return None
         return row
+
+    async def existing_ids(self, run_ids: Sequence[UUID], *, tenant_id: UUID) -> set[UUID]:
+        return {
+            rid
+            for rid in run_ids
+            if (row := self._rows.get(rid)) is not None and row.tenant_id == tenant_id
+        }
 
     async def find_by_idempotency_key(self, *, tenant_id: UUID, key: str) -> RunInfo | None:
         for row in self._rows.values():
@@ -1246,6 +1270,25 @@ class SqlRunStore(RunStore):
                 )
             ).scalar_one_or_none()
         return _row_to_dto(row) if row is not None else None
+
+    async def existing_ids(self, run_ids: Sequence[UUID], *, tenant_id: UUID) -> set[UUID]:
+        if not run_ids:
+            # 空 IN () 在 PG 上是合法但恒假的谓词,白跑一次往返。
+            return set()
+        async with self._sf() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(AgentRunRow.id).where(
+                            AgentRunRow.id.in_(list(run_ids)),
+                            AgentRunRow.tenant_id == tenant_id,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return set(rows)
 
     async def list_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> list[RunInfo]:
         async with self._sf() as session:

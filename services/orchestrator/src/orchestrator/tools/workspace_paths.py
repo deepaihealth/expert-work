@@ -49,6 +49,12 @@ _SHARED_DIR = WORKSPACE_SHARED_DIR
 #: ``expert_work.protocol.agent_key``)。
 _AGENT_KEY_OK = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
+#: 单纯的 ``.`` / ``..`` **能过上面那条正则**(两个点都在字符集里),而
+#: ``{root}/agents/..`` 就是 ``{root}`` —— agent 作用域直接塌回用户根,正是
+#: 这道闸写来要挡的东西。正则管「有没有分隔符」,管不了「这一段是不是相对
+#: 路径的特殊名字」,必须单列。
+_DOTTED = frozenset({".", ".."})
+
 #: 会改字节的工具 —— 它们不许写进 ``shared/``。
 _WRITE_TOOLS = frozenset({"write_file", "edit_file"})
 
@@ -69,7 +75,7 @@ def agent_workspace_root(agent_key: str) -> str:
     """
     if not agent_key:
         return USER_ROOT
-    if not _AGENT_KEY_OK.match(agent_key):
+    if agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
         msg = f"agent_key is not a safe path segment: {agent_key!r}"
         raise ValueError(msg)
     return f"{USER_ROOT}/{AGENTS_DIR}/{agent_key}"

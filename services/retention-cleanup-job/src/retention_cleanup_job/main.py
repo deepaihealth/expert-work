@@ -36,6 +36,7 @@ from expert_work.runtime.audit import (
     DefaultSecretRedactor,
     InMemoryAuditFallbackQueue,
 )
+from expert_work.runtime.runs.store import SqlRunStore
 from expert_work.runtime.storage import make_object_store
 from expert_work.runtime.storage.factory import S3CompatibleConfig
 from retention_cleanup_job.job import RetentionCleanupJob
@@ -173,6 +174,7 @@ async def _amain() -> None:
         # 写不进库就只剩 error 日志,与 control-plane 的 best-effort 语义一致。
         user_upload_store = SqlUserUploadStore(session_factory)
         thread_store = SqlThreadMetaStore(session_factory)
+        run_store = SqlRunStore(session_factory)
         audit_logger = AuditLogger(
             store=SqlAuditLogStore(session_factory),
             redactor=DefaultSecretRedactor(),
@@ -197,6 +199,7 @@ async def _amain() -> None:
             user_upload_store=user_upload_store,
             upload_retention_days=settings.upload_retention_days,
             thread_store=thread_store,
+            run_store=run_store,
             workspace_root=workspace_root,
             audit_logger=audit_logger,
         )

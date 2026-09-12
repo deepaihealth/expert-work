@@ -70,7 +70,11 @@ def test_shared_prefix_rejects_empty_remainder() -> None:
         resolve_scope("shared:", agent_key="plan-aaaaaaaa", tool="read_file")
 
 
-@pytest.mark.parametrize("bad", ["../../etc", "a/b", "plan/", "", " "])
+# ``..`` / ``.`` **单独**列出来不是凑数:原来这张表里每一项都带分隔符或是
+# 空白,于是「一段裸的 ``..``」从来没被试过 —— 而它恰恰能过那条正则
+# (两个点都在字符集里),``{root}/agents/..`` 就是 ``{root}``,agent 作用域
+# 塌回用户根。穷举形状时漏掉的往往是最短的那个。
+@pytest.mark.parametrize("bad", ["../../etc", "a/b", "plan/", "", " ", "..", "."])
 def test_agent_key_that_is_not_one_path_segment_is_refused(bad: str) -> None:
     """``agent_key`` 会被拼进 ``ws``;不是单个安全路径段就必须拒。
 

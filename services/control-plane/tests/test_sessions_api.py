@@ -1364,8 +1364,15 @@ async def test_session_detail_tenant_id_star_400(
 async def test_purge_deletes_the_thread_projection_dir(
     session_client: AsyncClient, audit_store: InMemoryAuditLogStore
 ) -> None:
-    """Purge asks the workspace file store to rm -rf exactly ``threads/<thread_id>``
-    for the thread's owner — nothing else in the (user-shared) workspace."""
+    """Purge rm -rf's the thread's projection dir in **both** possible locations.
+
+    B-50: PR3 moved the projection write to ``agents/<agent_key>/threads/<id>/``,
+    but pre-migration trees still hold it at the user root. Deleting only one
+    strands the other as an orphan — and nothing reports it: to ``delete_tree``
+    a path that was never there is indistinguishable from one it just removed.
+
+    Everything else in the (user-shared) workspace stays untouched.
+    """
     tid = await _create(session_client)
     app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
     store = RecordingWorkspaceStore()
@@ -1377,7 +1384,12 @@ async def test_purge_deletes_the_thread_projection_dir(
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["threads_dir"] is True
 
-    assert store.workspace_tree_deletes == [(_DEFAULT_TENANT, meta.user_id, f"threads/{tid}")]
+    agent_key = sanitize_agent_key(meta.agent_name or "")
+    assert agent_key, "会话必须绑着 agent,否则这条用例验的是退化路径"
+    assert store.workspace_tree_deletes == [
+        (_DEFAULT_TENANT, meta.user_id, f"threads/{tid}"),
+        (_DEFAULT_TENANT, meta.user_id, f"agents/{agent_key}/threads/{tid}"),
+    ]
     assert store.workspace_deletes == []  # no single-file deletes, no mark_deleted
     assert store.workspace_deletions == []
     page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
