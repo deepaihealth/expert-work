@@ -1497,6 +1497,57 @@ git commit -m "feat(workspace): 对外六个 handler 按 agent 收口,工作区�
 
 **`shared/` 在两种 scope 下都不对外投影**(§9.2)。
 
+> **✅ 对接方评估回报(2026-09-12)—— PR4 对 project-service 基本零影响,三处据此定死:**
+>
+> 他们按自己仓库代码逐条核过(模块 `src/modules/expert-work/`),访问模式是
+> **run 结束那一瞬间按 end 帧 `data.artifacts` 清单一次性收割 → 落自己的 OSS →
+> 之后全走自己的直链**,凭据就是那一 run 的 `agent_code`。**天然就是 agent 收口的**。
+>
+> | 我们担心的 | 他们的实际情况 |
+> |---|---|
+> | 列表变短触发误删 | **不成立** —— 全仓无 reconcile/diff;两张表 append-only + 唯一键幂等;模块下无任何 Cron/Queue;`deleteArtifact()` **零调用方**(2026-08-26 停删改造后只剩 API 面封装,测试还断言它没被调用) |
+> | 缓存 `name`/`path`/`upload_id` 丢归属 | **不成立** —— `name` 存了但那张表**本来就有 `agent_code` 列**,且字节早在他们 OSS,永不按 name 回平台下载;`upload_id` 不落库,单轮临时值 |
+> | 34 个孤儿产物 | **不需要认领,不用出清单** —— 平台副本对他们只是「收割完不再读」的备份 |
+>
+> **① 默认值保持 `agent`,不改。** 他们明确要求。唯一的列表调用
+> `listArtifacts()` 只在 end 帧 `artifacts` 缺失时走(#1305 之前存量老 run 的回退),
+> 而那条回退是「扫工作区靠 json+成品同 stem 严格配对」——**默认 `scope=agent`
+> 反而让它更准**(跨 agent 残留不再进扫描面)。他们补充:即便将来 end 帧回归漏发
+> `artifacts` 字段、新 run 掉进这条回退,新产物有 `agent_key` 照样出现在 agent
+> 维度列表里,兜底仍然成立。
+>
+> **② `GET /{code}/workspace/files` / `file` 两条他们一次都没调过**
+> (`EW_ENDPOINTS` 里根本没有 workspace 条目)。于是「PR4 收口早于 PR5 搬迁 →
+> 工作区列表近乎空」那个窗口对**对外面零影响**,只剩控制台一个消费面 —— 顺序
+> 仍要定,但不是对外事故级别。
+>
+> **③ 他们的 P0(已验证成立,结构性保证不是约定)**:某个 run 通过
+> `save_artifact` 新写入的产物,必须能被同一个 `agent_code` 归属到并下载。
+> 404 会让他们 `harvest()` 抛 `HarvestError` → 前端「产物回收失败」卡片 → 该轮
+> 不计费。验证四环:
+>
+> 1. `POST /{code}/runs`(及 `:regenerate`/`:edit`)→ `external_runs.py:317` →
+>    `spawn_run` → `runs.py:1259` **无条件**
+>    `configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)`,没有分支;
+> 2. 值不可能为空 —— `AgentMetadata.name` 是 `Field(min_length=1)`,而
+>    `sanitize_agent_key` 结构上永不返回空串(`or "agent"` 兜底 + 强制 8 位 digest;
+>    退化输入实测:`""` → `agent-e3b0c442`,NUL / 全标点 / 纯中文都非空);
+> 3. **下载侧与写入侧同值** —— `external_runs.py:250` 按 `name=agent_code` 查 spec,
+>    `_external.py:344` 断言 `meta.agent_name != agent_code` → 404,所以
+>    `agent_code` **就是** `spec.metadata.name`;实测印证他们的产物行
+>    `agent_key = 'ai-health-plan-30817804'` = `sanitize_agent_key('ai-health-plan')`;
+> 4. 漏接新入口由 `test_agent_key_plumbing.py` 的 AST 登记表逮住。
+>
+> **概念澄清(他们原先把两者当成同一机制的轻重两档)**:`shared/` 是**迁移专用**
+> 去处 —— 存量行靠 `created_in_thread → agent_run → thread_meta.agent_name` 反推,
+> 链断了才进;**新写入根本不走这条反推路径**,落库那一刻就带 `agent_key`。
+> 两套机制,「历史 34 个推不出来」与「新数据会不会推不出来」无关。
+>
+> **④ PR4 必须钉的一条测试(P0 的可执行形式)**:同一个 run 写入的产物,
+> 必须能用该 run 的 `agent_code` 取回。并且 `agent_code → agent_key` 的推导
+> **就是** `sanitize_agent_key(agent_code)` —— 不许写成带回退的查库、不许做大小写
+> 归一:任何漂移都会让**正确归属**的产物也 404,正好砸中这条 P0。
+
 - [ ] **补充测试**
 
 ```python
