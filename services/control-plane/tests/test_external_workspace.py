@@ -16,13 +16,14 @@ rows before/after, the same technique ``test_external_hardening.py``'s
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.api._external import external_subject_id
+from control_plane.api._external_agent_scope import agent_key_for_code
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -149,6 +150,11 @@ async def seeded_workspace(_ctx: _Ctx, user_store: TenantUserStore) -> _SeededWo
     always returns ``workspace_file`` (a single fixture, not a per-path
     map) — so ``expected_bytes`` is what any successful download of this
     user's workspace returns, regardless of which path was asked for.
+
+    B-50 PR4 —— 存储层的条目现在落在 ``agents/<agent_key>/`` 下(搬迁后的布局),
+    对外投影会把这段前缀剥掉,所以响应里仍然是 ``报表.xlsx``。**这个 fixture
+    种扁平路径的话整个列表会是空的**,那是正确行为(搬迁前的顶层残留不对外
+    投影),但会让所有借这个 fixture 的用例变成在空列表上断言。
     """
     user_id = "报表用户"
     await user_store.resolve(
@@ -157,7 +163,9 @@ async def seeded_workspace(_ctx: _Ctx, user_store: TenantUserStore) -> _SeededWo
         subject_id=external_subject_id(user_id),
     )
     expected_bytes = b"report body"
-    _ctx.workspace_store.workspace_files = [WorkspaceFileEntry(path="报表.xlsx", size=42)]
+    _ctx.workspace_store.workspace_files = [
+        WorkspaceFileEntry(path=f"agents/{agent_key_for_code(_AGENT_CODE)}/报表.xlsx", size=42)
+    ]
     _ctx.workspace_store.workspace_file = expected_bytes
     return _SeededWorkspace(agent_code=_AGENT_CODE, user_id=user_id, expected_bytes=expected_bytes)
 
@@ -391,7 +399,13 @@ async def test_download_scopes_store_call_to_the_requested_user(
         params={"user_id": "cust-a", "path": "report.txt"},
     )
     assert resp.status_code == 200
-    assert _ctx.workspace_store.workspace_reads[-1] == (_TENANT_ID, user_a.id, "report.txt")
+    # B-50 PR4 —— 服务端问的是投影后的路径(对接方给的是相对 agent 根的
+    # ``report.txt``,存储层是 ``agents/<agent_key>/report.txt``)。
+    assert _ctx.workspace_store.workspace_reads[-1] == (
+        _TENANT_ID,
+        user_a.id,
+        f"agents/{agent_key_for_code(_AGENT_CODE)}/report.txt",
+    )
     assert _ctx.workspace_store.workspace_reads[-1][1] != user_b.id
 
 
@@ -497,3 +511,308 @@ async def test_download_path_at_max_length_is_not_rejected(
     )
     assert resp.status_code == 200, resp.text
     assert resp.content == seeded_workspace.expected_bytes
+
+
+# --------------------------------------------------------------------------
+# B-50 PR4 —— 按 agent 收口 + 双向路径投影
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _PathAwareWorkspaceStore(RecordingWorkspaceStore):
+    """按路径建模的工作区桩。
+
+    ``RecordingWorkspaceStore.read_file`` **不看 path**、恒回同一份
+    ``workspace_file`` —— 拿它验「跨 agent 下载 404」会得到一条恒真的断言
+    (它永远 200)。投影的判据必须能分辨「问的是哪条路径」,所以这里按一张
+    ``path → bytes`` 表回答,问不到就抛 ``SandboxSupervisorError``(真 NAS
+    store 在文件不存在时的形态)。
+    """
+
+    files: dict[str, bytes] = field(default_factory=dict)
+
+    async def read_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
+        self.workspace_reads.append((tenant_id, user_id, path))
+        if self.workspace_file_error is not None:
+            raise self.workspace_file_error
+        try:
+            return self.files[path]
+        except KeyError as exc:
+            raise SandboxSupervisorError(f"no such file: {path}") from exc
+
+    async def list_files(self, *, tenant_id: UUID, user_id: UUID) -> list[WorkspaceFileEntry]:
+        self.workspace_reads.append((tenant_id, user_id, ""))
+        if self.workspace_list_error is not None:
+            raise self.workspace_list_error
+        return [WorkspaceFileEntry(path=p, size=len(b)) for p, b in sorted(self.files.items())]
+
+
+_AGENT_A = "agent-a"
+_AGENT_B = "agent-b"
+_KEY_A = agent_key_for_code(_AGENT_A)
+_KEY_B = agent_key_for_code(_AGENT_B)
+
+
+@dataclass
+class _SeededTwoAgents:
+    user_id: str
+    internal_user_id: UUID
+    store: _PathAwareWorkspaceStore
+
+
+@pytest.fixture
+async def two_agents(_ctx: _Ctx, user_store: TenantUserStore) -> _SeededTwoAgents:
+    """搬迁后的布局:两个 agent 各有自己的子树,外加一份 ``shared/`` legacy
+    和一份没搬完的顶层扁平残留。"""
+    user_id = "双 agent 用户"
+    row = await user_store.resolve(
+        tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id(user_id)
+    )
+    store = _PathAwareWorkspaceStore(
+        files={
+            f"agents/{_KEY_A}/客户案例/x.md": b"a-body",
+            f"agents/{_KEY_B}/b-only.md": b"b-body",
+            "shared/MEMORY.md": b"legacy-shared",
+            "未搬迁.md": b"flat-legacy",
+        }
+    )
+    _ctx.app.state.workspace_store = store  # type: ignore[attr-defined]
+    # 两个 agent 都要能被 scope=user 反查成 agent_code —— 反查表来自
+    # thread_meta(这个用户跑过哪些 agent),所以得真建两条会话。
+    threads = _ctx.app.state.thread_meta_repo  # type: ignore[attr-defined]
+    for code in (_AGENT_A, _AGENT_B):
+        await threads.create(
+            thread_id=uuid4(),
+            tenant_id=_TENANT_ID,
+            created_by="x",
+            user_id=row.id,
+            agent_name=code,
+        )
+    return _SeededTwoAgents(user_id=user_id, internal_user_id=row.id, store=store)
+
+
+@pytest.mark.asyncio
+async def test_list_files_paths_are_relative_to_agent_root(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """对外 path 不带 ``agents/<key>/`` 前缀 —— 与搬迁前逐字节相同。
+
+    这条是「对接方不用改代码」的唯一保证:他们缓存过的 path 必须继续能用,
+    而且带 sha256 后缀的内部 ``agent_key`` 不能漏到第三方面前。
+    """
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files", params={"user_id": two_agents.user_id}
+    )
+    assert resp.status_code == 200
+    paths = [f["path"] for f in resp.json()["data"]["files"]]
+    assert paths == ["客户案例/x.md"]
+    assert not any(p.startswith("agents/") for p in paths)
+    assert not any(_KEY_A in p for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_list_files_excludes_other_agents_shared_and_flat_legacy(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """B 的文件、``shared/`` 的 legacy、搬迁前的顶层扁平残留,都不在 A 的列表里。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files", params={"user_id": two_agents.user_id}
+    )
+    paths = {f["path"] for f in resp.json()["data"]["files"]}
+    assert "b-only.md" not in paths
+    assert not any("MEMORY.md" in p for p in paths)
+    assert "未搬迁.md" not in paths
+
+
+@pytest.mark.asyncio
+async def test_download_accepts_the_path_it_handed_out(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """出口剥前缀、入口加前缀 —— 双向必须闭合。
+
+    只做出口忘了入口,这一条会 404;那就是「列表看着对、下载全挂」的形态。
+    """
+    listed = (
+        await external_client.get(
+            f"/v1/agents/{_AGENT_A}/workspace/files", params={"user_id": two_agents.user_id}
+        )
+    ).json()["data"]["files"][0]["path"]
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": listed},
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"a-body"
+    # 服务端真的去问了带前缀的那条路径,不是碰巧桩里有同名文件。
+    assert two_agents.store.workspace_reads[-1][2] == f"agents/{_KEY_A}/客户案例/x.md"
+
+
+@pytest.mark.asyncio
+async def test_download_across_agents_is_404(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """A 的 code 拿 B 的文件路径 → 与「不存在」同一个不透明 404。
+
+    光断言 404 是**恒真**的:收口之前这条路径在桩里也不存在,照样 404。要能
+    分开「没收口」和「收口了」两个假设,必须同时断言服务端**问的是哪条路径**
+    —— 收口后它问的是 ``agents/<A 的 key>/b-only.md``(A 的根下没这个文件),
+    而不是对接方给的裸 ``b-only.md``。
+    """
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": "b-only.md"},
+    )
+    assert resp.status_code == 404
+    assert two_agents.store.workspace_reads[-1][2] == f"agents/{_KEY_A}/b-only.md"
+
+
+@pytest.mark.asyncio
+async def test_download_cannot_climb_into_another_agent(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """投影不是绕过 ``..`` 校验的后门。
+
+    校验必须作用在对接方给的**原串**上、且早于拼前缀:反过来的话
+    ``../<B 的 key>/b-only.md`` 会被拼成
+    ``agents/<A 的 key>/../<B 的 key>/b-only.md`` —— ``..`` 还在,但已经爬不出
+    用户根,于是校验放行,实际读到的是 B 的目录。
+    """
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": f"../{_KEY_B}/b-only.md"},
+    )
+    assert resp.status_code in (400, 404, 422)
+    assert resp.content != b"b-body"
+
+
+@pytest.mark.asyncio
+async def test_download_cannot_reach_shared_by_path(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """``shared/`` 对外不可见 —— 直接拼路径也不行。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": "MEMORY.md"},
+    )
+    assert resp.status_code == 404
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": "shared/MEMORY.md"},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_scope_user_lists_every_agent_with_agent_code(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """``?scope=user`` 是对接方点名要的并集入口(一个 app 编排两个 agent)。
+
+    条目仍按各自 agent 根给 path(不撞名),另用 ``agent_code`` 标明归属 ——
+    下载端点不认 scope,所以不给归属就等于列出一堆下不动的东西。
+    """
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files",
+        params={"user_id": two_agents.user_id, "scope": "user"},
+    )
+    assert resp.status_code == 200
+    files = resp.json()["data"]["files"]
+    assert {(f["agent_code"], f["path"]) for f in files} == {
+        (_AGENT_A, "客户案例/x.md"),
+        (_AGENT_B, "b-only.md"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_scope_user_never_leaks_agent_key(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """归属标识对外只能是 ``agent_code``;``agent_key`` 是内部命名。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files",
+        params={"user_id": two_agents.user_id, "scope": "user"},
+    )
+    body = resp.text
+    assert _KEY_A not in body and _KEY_B not in body
+    assert not any("agent_key" in f for f in resp.json()["data"]["files"])
+
+
+@pytest.mark.asyncio
+async def test_scope_user_still_excludes_shared_and_flat_legacy(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """并集放开的是「别的 agent」,不是「归属不明」。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files",
+        params={"user_id": two_agents.user_id, "scope": "user"},
+    )
+    paths = {f["path"] for f in resp.json()["data"]["files"]}
+    assert not any("MEMORY.md" in p for p in paths)
+    assert "未搬迁.md" not in paths
+
+
+@pytest.mark.asyncio
+async def test_scope_user_does_not_open_downloads(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """下载端点不认 ``scope`` —— 传了也不放开跨 agent。
+
+    放开等于让 A 的 code 取到 B 的字节,那正是本设计要挡的。同上一条:只断言
+    404 是恒真的,要一并钉住「问的仍然是 A 的根」。
+    """
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": "b-only.md", "scope": "user"},
+    )
+    assert resp.status_code == 404
+    assert two_agents.store.workspace_reads[-1][2] == f"agents/{_KEY_A}/b-only.md"
+
+
+@pytest.mark.asyncio
+async def test_scope_defaults_to_agent(external_client, two_agents: _SeededTwoAgents) -> None:
+    """不传 ``scope`` = 只看本 agent。默认值错了会静默把隔离整个放开。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files", params={"user_id": two_agents.user_id}
+    )
+    assert [f["path"] for f in resp.json()["data"]["files"]] == ["客户案例/x.md"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_scope_is_422(external_client, two_agents: _SeededTwoAgents) -> None:
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files",
+        params={"user_id": two_agents.user_id, "scope": "tenant"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_scope_user_drops_agents_with_no_live_code(
+    external_client, _ctx: _Ctx, user_store: TenantUserStore
+) -> None:
+    """反查不到 ``agent_code`` 的子树不进 ``scope=user``。
+
+    agent 被删之后它的文件还在树里,但第三方**没有可用的 code 去下载它** ——
+    列出来就是又一个下不动的条目。与 ``shared/`` 不对外投影同一个理由。
+    """
+    row = await user_store.resolve(
+        tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id("孤儿树用户")
+    )
+    ghost = agent_key_for_code("已删除的 agent")
+    store = _PathAwareWorkspaceStore(
+        files={f"agents/{_KEY_A}/live.md": b"x", f"agents/{ghost}/ghost.md": b"y"}
+    )
+    _ctx.app.state.workspace_store = store  # type: ignore[attr-defined]
+    threads = _ctx.app.state.thread_meta_repo  # type: ignore[attr-defined]
+    await threads.create(
+        thread_id=uuid4(),
+        tenant_id=_TENANT_ID,
+        created_by="x",
+        user_id=row.id,
+        agent_name=_AGENT_A,
+    )
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files",
+        params={"user_id": "孤儿树用户", "scope": "user"},
+    )
+    assert [f["path"] for f in resp.json()["data"]["files"]] == ["live.md"]

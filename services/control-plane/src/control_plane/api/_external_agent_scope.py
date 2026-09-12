@@ -38,13 +38,26 @@ B 的文件不在那儿);``agent_key`` 挡在对外面之外。
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Literal
 
+from fastapi import HTTPException
+
+from control_plane.api._workspace_shared import INVALID_WORKSPACE_PATH, _safe_workspace_relpath
 from expert_work.protocol.agent_key import sanitize_agent_key
 from orchestrator.tools.workspace_paths import AGENTS_DIR
 
+#: 三个列表端点的 ``?scope``。``agent``(默认)= 只看本 agent;``user`` =
+#: 该终端用户全部 agent 的并集(对接方点名要的:他们一个 app 编排两个 agent、
+#: 服务同一批终端用户)。**下载端点不认这个参数** —— 放开 scope 等于让 A 的
+#: code 取到 B 的字节,那正是本设计要挡的。要下别的 agent 的东西,用那个
+#: agent 的 code。
+ExternalScope = Literal["agent", "user"]
+
 __all__ = [
+    "ExternalScope",
     "agent_code_by_key",
     "agent_key_for_code",
+    "external_storage_path",
     "external_to_storage",
     "storage_to_external",
 ]
@@ -102,3 +115,21 @@ def storage_to_external(rel: str, *, agent_key: str) -> str | None:
     if not rel.startswith(prefix):
         return None
     return rel[len(prefix) :] or None
+
+
+def external_storage_path(raw: str, *, agent_key: str) -> str:
+    """对接方给的 ``path`` → 存储层相对路径,**先校验再投影**。
+
+    顺序是这个函数存在的全部理由。反过来的话 ``../<B 的 key>/x`` 会先被拼成
+    ``agents/<A 的 key>/../<B 的 key>/x`` —— ``..`` 还在,但它已经爬不出用户
+    根,于是 :func:`_safe_workspace_relpath` 放行,而实际读到的是 B 的目录。
+    把两步锁在一个函数里,调用方就没有把顺序写反的机会。
+
+    抛 ``HTTPException(400)`` 而不是返回 ``None``:调用方的 ``except
+    HTTPException`` 已经在渲染对外信封,多一条返回值分支只会多一处要保持同步
+    的错误形状。
+    """
+    safe = _safe_workspace_relpath(raw)
+    if safe is None:
+        raise HTTPException(status_code=400, detail=INVALID_WORKSPACE_PATH)
+    return external_to_storage(safe, agent_key=agent_key)

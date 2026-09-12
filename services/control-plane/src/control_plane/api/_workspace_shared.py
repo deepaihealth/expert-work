@@ -39,12 +39,19 @@ from fastapi.responses import Response
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from orchestrator.tools import (
     SandboxSupervisorError,
+    WorkspaceFileEntry,
     WorkspaceFileTooLargeError,
     WorkspacePermissionError,
     WorkspaceStore,
 )
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
+
+#: 路径校验失败的固定文案。导出成常量是因为对外平面在**加 agent 前缀之前**
+#: 自己跑一次校验(``_external_agent_scope.external_storage_path``),两处必须
+#: 报同一句话 —— 不同的文案会让第三方能分辨「路径本身不合法」和「投影之后
+#: 不合法」,而那两件事对他们应当是同一个不透明的 400。
+INVALID_WORKSPACE_PATH = "invalid workspace path"
 
 
 def _safe_workspace_relpath(path: str) -> str | None:
@@ -74,20 +81,27 @@ def _safe_workspace_relpath(path: str) -> str | None:
     return cleaned
 
 
-async def _workspace_files_payload(
+async def list_workspace_entries(
     workspace_store: WorkspaceStore | None, *, tenant_id: UUID, user_id: UUID
-) -> dict[str, list[dict[str, object]]]:
-    """The ``{"files": [...]}`` payload for one already-resolved ``(tenant_id, user_id)``.
+) -> list[WorkspaceFileEntry]:
+    """The raw entries for one already-resolved ``(tenant_id, user_id)``.
 
     No store wired (``workspace_store is None`` — no supervisor configured)
     degrades to an empty list, same as a generic :class:`SandboxSupervisorError`.
     A :class:`WorkspacePermissionError` (its subclass) is the one case that must
     NOT degrade — see the module docstring.
+
+    Split out from :func:`_workspace_files_payload` for B-50 PR4: the external
+    plane projects each entry through its own agent scoping
+    (``_external_agent_scope``) and therefore needs the entries, not the
+    finished payload — but it must keep running the **same** error handling,
+    which is the whole reason this module exists. Console callers keep using
+    the payload wrapper below.
     """
     if workspace_store is None:
-        return {"files": []}
+        return []
     try:
-        entries = await workspace_store.list_files(tenant_id=tenant_id, user_id=user_id)
+        return await workspace_store.list_files(tenant_id=tenant_id, user_id=user_id)
     except WorkspacePermissionError as exc:
         # 权限失败(共享 uid 没配上/存量目录属主没迁移/mode 不对)是服务端配置
         # 问题,不是"这个用户没有文件"。这里如果和下面的 SandboxSupervisorError
@@ -101,7 +115,21 @@ async def _workspace_files_payload(
         raise HTTPException(status_code=500, detail="workspace listing unavailable") from exc
     except SandboxSupervisorError:
         logger.warning("workspace.list_failed", exc_info=True)
-        return {"files": []}
+        return []
+
+
+async def _workspace_files_payload(
+    workspace_store: WorkspaceStore | None, *, tenant_id: UUID, user_id: UUID
+) -> dict[str, list[dict[str, object]]]:
+    """The unscoped ``{"files": [...]}`` payload — the console plane's view.
+
+    Lists the whole user root, agent subtrees included. The external plane
+    does **not** use this (see :func:`list_workspace_entries`): a third party
+    asking by ``agent_code`` must never be handed another agent's paths.
+    """
+    entries = await list_workspace_entries(
+        workspace_store, tenant_id=tenant_id, user_id=user_id
+    )
     return {"files": [{"path": e.path, "size": e.size} for e in entries]}
 
 
@@ -128,7 +156,7 @@ async def _workspace_file_response(
     """
     safe_path = _safe_workspace_relpath(path)
     if safe_path is None:
-        raise HTTPException(status_code=400, detail="invalid workspace path")
+        raise HTTPException(status_code=400, detail=INVALID_WORKSPACE_PATH)
     if user_id is None or workspace_store is None:
         raise HTTPException(status_code=404, detail="file not found")
     try:
