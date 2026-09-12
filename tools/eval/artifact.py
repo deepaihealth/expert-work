@@ -155,7 +155,7 @@ async def _run_soft_delete_hides_from_list() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     await _seed_one(store, name="r.md", kind="document", path="r.md")
     hit = await store.soft_delete(
-        tenant_id=_TENANT, user_id=_USER, name="r.md", now=datetime.now(UTC)
+        tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, name="r.md", now=datetime.now(UTC)
     )
     if not hit:
         return False, "soft_delete reported miss on a known active row"
@@ -182,6 +182,7 @@ async def _run_soft_delete_cross_user_misses() -> tuple[bool, str]:
     hit = await store.soft_delete(
         tenant_id=_TENANT,
         user_id=_OTHER_USER,
+        agent_key=_AGENT_KEY,
         name="r.md",
         now=datetime.now(UTC),
     )
