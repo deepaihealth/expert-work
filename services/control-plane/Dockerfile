@@ -86,6 +86,20 @@ COPY --chown=expert_work:expert_work packages/expert-work-persistence/migrations
 # carry it), so ship it onto PYTHONPATH; the worker's lazy
 # ``from tools.eval...`` imports + dataset loads then resolve in-container.
 COPY --chown=expert_work:expert_work tools/eval /app/tools/eval
+
+# One-off persistence ops scripts (``tools/persistence``). These are run by
+# hand from inside a control-plane pod because they need BOTH halves of the
+# state at once: the DB (``Settings().db_dsn``) and the NAS workspace mount —
+# and this pod is the only place that has both. Same reason ``tools/eval``
+# ships above: outside the package ``src/`` tree, so the ``--no-editable``
+# wheel doesn't carry it.
+#
+# Not shipping it makes the runbooks that invoke it
+# (``docs/runbooks/workspace-agent-scoping-migration.md``, step 1/2) fail at
+# ``python3 -m tools.persistence...`` with ModuleNotFoundError — at release
+# time, in prod, which is exactly when nobody wants to be debugging a
+# ``kubectl cp`` workaround.
+COPY --chown=expert_work:expert_work tools/persistence /app/tools/persistence
 ENV PYTHONPATH=/app
 
 # MCP connector catalog seed template (Stream MCP-OAUTH OA-5). Lives outside
