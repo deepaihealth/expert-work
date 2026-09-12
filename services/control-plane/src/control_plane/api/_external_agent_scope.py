@@ -30,9 +30,10 @@
 B 的文件不在那儿);``agent_key`` 挡在对外面之外。
 
 **这三个函数都不做校验。** 调用方必须**先**把对接方给的原串过
-``_safe_workspace_relpath`` 再加前缀 —— 顺序反了的话 ``../x`` 会被拼成
-``agents/<key>/../x``,``..`` 还在但已经爬不出用户根,校验于是放行,而实际读到
-的是另一个 agent 的目录。
+``_safe_workspace_relpath`` 再加前缀 —— 加前缀会掩盖掉「绝对路径一律拒」和
+「空路径一律拒」两条判据(``/etc/passwd`` → ``agents/<key>//etc/passwd`` 不再
+以 ``/`` 开头;``""`` → ``agents/<key>/`` 不再是空的)。:func:`external_storage_path`
+把这两步锁在一起,调用方没有写反的机会。
 """
 
 from __future__ import annotations
@@ -120,9 +121,17 @@ def storage_to_external(rel: str, *, agent_key: str) -> str | None:
 def external_storage_path(raw: str, *, agent_key: str) -> str:
     """对接方给的 ``path`` → 存储层相对路径,**先校验再投影**。
 
-    顺序是这个函数存在的全部理由。反过来的话 ``../<B 的 key>/x`` 会先被拼成
-    ``agents/<A 的 key>/../<B 的 key>/x`` —— ``..`` 还在,但它已经爬不出用户
-    根,于是 :func:`_safe_workspace_relpath` 放行,而实际读到的是 B 的目录。
+    顺序是这个函数存在的全部理由,但**不是**因为 ``..`` —— 那条判据两种顺序
+    都拦得住::func:`_safe_workspace_relpath` 拒绝**任何** ``..`` 段,不只是
+    真能爬出用户根的那种(实测对照过,原先写在这里的理由是错的)。真正被前缀
+    掩盖掉的是另外两条判据:
+
+    * ``/etc/passwd`` 拼上前缀变成 ``agents/<key>//etc/passwd``,不再以 ``/``
+      开头 → 「绝对路径一律拒」那条判据失效,放行的是一条对接方从没指名过的
+      路径;
+    * ``""`` / ``"   "`` 拼上前缀变成 ``agents/<key>/``,不再是空的 → 「空路径
+      一律拒」失效,读到的是 agent 目录本身。
+
     把两步锁在一个函数里,调用方就没有把顺序写反的机会。
 
     抛 ``HTTPException(400)`` 而不是返回 ``None``:调用方的 ``except

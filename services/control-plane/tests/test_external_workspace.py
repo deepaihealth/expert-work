@@ -672,10 +672,11 @@ async def test_download_cannot_climb_into_another_agent(
 ) -> None:
     """投影不是绕过 ``..`` 校验的后门。
 
-    校验必须作用在对接方给的**原串**上、且早于拼前缀:反过来的话
-    ``../<B 的 key>/b-only.md`` 会被拼成
-    ``agents/<A 的 key>/../<B 的 key>/b-only.md`` —— ``..`` 还在,但已经爬不出
-    用户根,于是校验放行,实际读到的是 B 的目录。
+    **这条不是「校验早于投影」的证人** —— 实测过:``_safe_workspace_relpath``
+    拒绝任何 ``..`` 段,所以两种顺序都拦得住这个输入。顺序的证人是
+    ``test_download_path_traversal_rejected`` 里的 ``/etc/passwd`` 与空串:
+    它们被拼上前缀之后就不再是「绝对路径」/「空路径」,判据失效。
+    这条守的是另一件事:显式往上爬无论如何都不能落到别的 agent 身上。
     """
     resp = await external_client.get(
         f"/v1/agents/{_AGENT_A}/workspace/file",

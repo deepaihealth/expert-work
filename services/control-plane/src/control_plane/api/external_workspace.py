@@ -201,8 +201,8 @@ def build_external_workspace_router() -> APIRouter:
         except ExternalScopeError as exc:
             return external_error(exc)
         try:
-            # 校验 → 投影,顺序锁在 ``external_storage_path`` 里(见那个函数的
-            # docstring:反过来 ``..`` 会被前缀掩盖成一条看起来合法的路径)。
+            # 校验 → 投影,顺序锁在 ``external_storage_path`` 里(反过来会让
+            # 「绝对路径拒」「空路径拒」两条判据被前缀掩盖,见那个函数)。
             storage_path = external_storage_path(path, agent_key=agent_key_for_code(agent_code))
             return await _workspace_file_response(
                 workspace_store, tenant_id=tenant_id, user_id=end_user_id, path=storage_path
