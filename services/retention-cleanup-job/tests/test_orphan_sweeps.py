@@ -88,9 +88,7 @@ async def _thread_store(*thread_ids: UUID) -> InMemoryThreadMetaStore:
 # --------------------------------------------------------------- threads/
 
 
-async def test_thread_dir_removed_under_the_agent_subtree(
-    tmp_path: Path, user_root: Path
-) -> None:
+async def test_thread_dir_removed_under_the_agent_subtree(tmp_path: Path, user_root: Path) -> None:
     """搬迁后的位置也扫得到、也删得掉 —— 枚举与删除必须认同一个 agent_key。
 
     枚举认了而删除没带 agent_key,表现是「每天扫到、每天删不掉」,
@@ -147,9 +145,7 @@ async def test_tool_results_dir_swept_when_run_is_gone(tmp_path: Path, user_root
     assert not d.exists()
 
 
-async def test_tool_results_dir_kept_while_run_row_exists(
-    tmp_path: Path, user_root: Path
-) -> None:
+async def test_tool_results_dir_kept_while_run_row_exists(tmp_path: Path, user_root: Path) -> None:
     """run 行还在 → 一律不动,不管多老(与 threads/ 同一条规矩)。"""
     run_id = uuid4()
     d = _seed(user_root, f"agents/{_KEY}/.tool_results/{run_id}")

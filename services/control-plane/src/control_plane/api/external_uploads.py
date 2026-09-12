@@ -469,9 +469,7 @@ def build_external_uploads_router() -> APIRouter:
                 data = await workspace_store.read_file(
                     tenant_id=tenant_id,
                     user_id=end_user_id,
-                    path=workspace_agent_path(
-                        row.ref, agent_key=thread_agent_key(owning_thread)
-                    ),
+                    path=workspace_agent_path(row.ref, agent_key=thread_agent_key(owning_thread)),
                 )
             except WorkspacePermissionError:
                 # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」
