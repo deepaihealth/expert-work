@@ -308,7 +308,7 @@ kubectl -n default get sandboxset expert-work-sandbox \
 **「release.sh 为什么不做」**和**「漏了会怎样」**——只写「要做 X」下次还是会被跳过。
 一并写清**回滚窗口**:这一版有没有单向门(数据搬迁、破坏性迁移),门在哪一步之前。
 
-已有样板:[`2026-09-15-prod-release-checklist.md`](./2026-09-15-prod-release-checklist.md)。
+已有样板:[`2026-09-16-prod-release-checklist.md`](./2026-09-16-prod-release-checklist.md)。
 
 > ⚠️ runbook 里写的命令,**在它真正要跑的地方跑一遍再交**。2026-09-12 清点时发现
 > 工作区搬迁 runbook 三条命令全跑不起来(模块不在镜像里 / 标签选择器选不中 /
