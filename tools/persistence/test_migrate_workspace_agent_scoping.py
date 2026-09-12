@@ -344,3 +344,73 @@ def test_symlinks_are_not_followed(tmp_path: Path, ids: tuple[UUID, UUID]) -> No
 
     assert "link/secret.md" not in plan.moves
     assert all("secret" not in p for p in plan.moves)
+
+
+def test_registry_rows_present_but_this_file_has_none(
+    tmp_path: Path, ids: tuple[UUID, UUID]
+) -> None:
+    """多 agent 用户 + 有登记行 + 这个文件查不到 —— 仍然进 ``shared/``。
+
+    **这是生产上那 8 个多 agent 用户的真实形状**,不是构造出来的边角:
+    他们既有一堆 ``threads/<id>/`` 登记行,根级又躺着 ``MEMORY.md`` /
+    ``style/`` / ``客户案例/`` 这批无登记行的 legacy。
+
+    上面两条「进 shared/」的用例喂的都是**空** ``Attributions``,于是
+    「查不到就从已知 agent 里挑一个」这种猜法在它们身上根本触发不到 ——
+    变异自证时实测零杀。判据必须在「有得可猜」的条件下才有效
+    (同「在不可能失败的条件下验证等于没验证」)。
+    """
+    tenant_id, user_id = ids
+    thread_id = uuid4()
+    root = tmp_path / str(tenant_id) / str(user_id)
+    _write(root / "threads" / str(thread_id) / "PLAN.md", "p")
+    _write(root / "MEMORY.md", "m")
+    _write(root / "客户案例" / "秀域" / "x.md", "x")
+
+    plan = plan_migration(
+        str(tmp_path),
+        tenant_id,
+        user_id,
+        attributions=Attributions(
+            sole_agent_key=None,
+            uploads={"uploads/a.docx": _KEY_A},
+            artifacts={"报告.docx": _KEY_A},
+            threads={str(thread_id): _KEY_B},
+            runs={str(uuid4()): _KEY_A},
+        ),
+    )
+
+    assert set(plan.to_shared) == {"MEMORY.md", "客户案例/秀域/x.md"}
+    assert plan.moves["MEMORY.md"] == "shared/MEMORY.md"
+    assert plan.moves["客户案例/秀域/x.md"] == "shared/客户案例/秀域/x.md"
+    # 有登记行的那条照常各归其位 —— 收紧不能收成「什么都进 shared/」。
+    assert plan.moves[f"threads/{thread_id}/PLAN.md"] == (
+        f"agents/{_KEY_B}/threads/{thread_id}/PLAN.md"
+    )
+
+
+def test_apply_actually_moved_every_planned_file(tmp_path: Path, ids: tuple[UUID, UUID]) -> None:
+    """报告说搬了 N 个,盘上就得真有 N 个到位。
+
+    ``test_file_count_is_conserved`` 那条**单独逮不住「apply 漏搬」**:没搬的
+    文件还在原处,总数照样守恒;``report.moved`` 又是从计划算出来的,也照样
+    对得上 —— 变异自证实测(apply 循环改 ``[1:]``)它确实是绿的,红的是另外
+    三条。守恒是必要条件不是充分条件。
+
+    这条补的是它们都没管的那一半:把**报告里的数**与**盘上的终态**对起来。
+    前三条验的是「文件到位了」,这条验的是「到位的数量正是报告声称的数量」——
+    运维拿着报告对账,那个数错了比文件没搬更难发现。
+    """
+    tenant_id, user_id = ids
+    root = tmp_path / str(tenant_id) / str(user_id)
+    _write(root / "MEMORY.md", "m")
+    _write(root / "uploads" / "a.docx", "a")
+    _write(root / "客户案例" / "秀域" / "x.md", "x")
+
+    plan = plan_migration(str(tmp_path), tenant_id, user_id, attributions=_empty(sole=_KEY_A))
+    report = apply_migration(plan, root=str(tmp_path), dry_run=False)
+
+    landed = [dest for dest in plan.moves.values() if (root / dest).is_file()]
+    assert len(landed) == len(plan.moves)
+    assert report.moved + report.to_shared == len(landed)
+    assert not [old for old in plan.moves if (root / old).exists()]
