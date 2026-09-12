@@ -26,6 +26,7 @@ from uuid import UUID
 from expert_work.persistence import ArtifactStore
 from expert_work.protocol import ArtifactKind
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.workspace_paths import AGENTS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,27 @@ def _coerce_kind(raw: object) -> ArtifactKind:
     return raw  # type: ignore[return-value]  # membership-checked above
 
 
+def _artifact_path(agent_key: str, path: str) -> str:
+    """产物在工作区里的相对路径 —— 含 agent 前缀。
+
+    这一列是下载端点真去读的**物理**路径(control-plane 拿它 join 用户根),
+    所以它必须与 ``write_file`` 的落盘位置同一个口径:PR3 把文件工具的根改成
+    ``agents/<agent_key>/`` 的同一个 PR 里,这里也跟着加前缀。早一步加(PR2)
+    就是登记一个没有文件的路径 = 每次下载 404;晚一步就是反过来。
+
+    形状**不含** ``artifacts/`` 段:``save_artifact`` 不搬字节,它只写一行登记,
+    没有任何东西往那个目录写(spec §四 2026-09-12 勘误)。分类语义由
+    ``artifact.kind`` 列承担。
+
+    ``agent_key`` 为空(迁移期未升级的调用方 / 临时沙箱)时保持扁平路径,否则
+    会拼出 ``agents//x`` 这种既非旧位置也非新位置的第三形状 —— 搬迁脚本
+    (PR5 Task 11)两边都认不出来。
+    """
+    if not agent_key:
+        return path
+    return f"{AGENTS_DIR}/{agent_key}/{path}"
+
+
 @dataclass
 class SaveArtifactTool:
     """Registers a workspace file as a named artifact — ``save_artifact``."""
@@ -132,13 +154,12 @@ class SaveArtifactTool:
         name = _require_str(args, "name", "save_artifact")
         raw_path = args.get("path")
         path = raw_path if isinstance(raw_path, str) and raw_path.strip() else name
-        path_in_workspace = _validate_path(path)
+        path_in_workspace = _artifact_path(ctx.agent_key, _validate_path(path))
         kind = _coerce_kind(args.get("kind"))
         thread_id = str(ctx.run_id) if ctx.run_id is not None else _FALLBACK_THREAD_ID
 
-        # B-50 —— 产物归属到 agent。``path_in_workspace`` **不加前缀**:这一列是
-        # 下载时真去读的物理路径,而文件是 ``write_file`` 早先落的盘,它的根目录
-        # 要到 PR3(工具层分层)才改。PR2 就加前缀会让每次下载 404。
+        # B-50 PR3 —— ``path_in_workspace`` 带 agent 前缀,与 ``write_file`` 的
+        # 落盘位置同一个口径(PR2 时有意暂缓,见 ``_artifact_path``)。
         version = await self.store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,

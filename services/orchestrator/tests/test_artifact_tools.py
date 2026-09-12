@@ -238,11 +238,16 @@ async def test_list_artifacts_only_shows_the_calling_agents_own() -> None:
 
 
 @pytest.mark.asyncio
-async def test_path_in_workspace_keeps_the_agents_own_relative_path() -> None:
-    """``path_in_workspace`` 不加 agent 前缀 —— 它是下载时真去读的**物理**路径。
+async def test_path_in_workspace_carries_the_agent_prefix() -> None:
+    """``path_in_workspace`` 是下载时真去读的**物理**路径,必须跟着 ``write_file``
+    的落盘位置走。
 
-    文件是 ``write_file`` 早先落的盘,文件工具的根目录要到 PR3 才改。这一批就
-    加前缀 = 登记一个没有文件的路径 = 每次下载 404。
+    PR2 时这条断言是反的(钉「不加前缀」)—— 那是有意的暂缓:文件工具的根目录
+    要到 PR3 才改,早一步加前缀就是登记一个没有文件的路径 = 每次下载 404。
+    PR3 把根目录改了,前缀在同一个 PR 里补上,两边始终指同一个地方。
+
+    形状是 ``agents/<key>/<path>`` —— **没有** ``artifacts/`` 那一段:
+    ``save_artifact`` 不搬字节,没有任何东西往那个目录写(spec §四 09-12 勘误)。
     """
     store = InMemoryArtifactStore()
     ctx = _ctx(agent_key="plan-aaaaaaaa")
@@ -253,4 +258,37 @@ async def test_path_in_workspace_keeps_the_agents_own_relative_path() -> None:
     )
 
     assert version is not None
+    assert version.path_in_workspace == "agents/plan-aaaaaaaa/报告.docx"
+
+
+@pytest.mark.asyncio
+async def test_path_in_workspace_stays_flat_without_agent_key() -> None:
+    """未绑 agent(空串)保持扁平路径 —— 不能拼出 ``agents//x`` 这种第三形状,
+    它既不是旧位置也不是新位置,搬迁脚本两边都认不出来。"""
+    store = InMemoryArtifactStore()
+    ctx = _ctx(agent_key="")
+    await SaveArtifactTool(store=store).call({"name": "报告.docx"}, ctx=ctx)
+
+    version = await store.get_latest_version(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key="", name="报告.docx"
+    )
+
+    assert version is not None
     assert version.path_in_workspace == "报告.docx"
+
+
+@pytest.mark.asyncio
+async def test_explicit_path_arg_also_gets_the_prefix() -> None:
+    """``path`` 显式给了也一样要前缀 —— 它同样是相对 agent 根的。"""
+    store = InMemoryArtifactStore()
+    ctx = _ctx(agent_key="plan-aaaaaaaa")
+    await SaveArtifactTool(store=store).call(
+        {"name": "报告.docx", "path": "out/报告.docx"}, ctx=ctx
+    )
+
+    version = await store.get_latest_version(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key="plan-aaaaaaaa", name="报告.docx"
+    )
+
+    assert version is not None
+    assert version.path_in_workspace == "agents/plan-aaaaaaaa/out/报告.docx"

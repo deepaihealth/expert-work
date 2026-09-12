@@ -37,12 +37,14 @@ from orchestrator.tools import (
     WriteFileTool,
 )
 from orchestrator.tools.file_ops import (
+    SandboxWorkspaceWriter,
     build_edit_wrapper,
     build_list_wrapper,
     build_read_wrapper,
     build_write_wrapper,
 )
 from orchestrator.tools.sandbox import RecordingSandboxRuntime
+from orchestrator.tools.workspace_paths import WriteToSharedError
 
 # --------------------------------------------------------------------------
 # Layer 1 — in-sandbox snippet logic (run locally with ws = tmp_path)
@@ -398,11 +400,12 @@ def test_edit_fuzzy_new_with_trailing_newline(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def _ctx(*, tenant_id: UUID | None = None) -> ToolContext:
+def _ctx(*, tenant_id: UUID | None = None, agent_key: str = "") -> ToolContext:
     return ToolContext(
         tenant_id=tenant_id if tenant_id is not None else uuid4(),
         run_id=uuid4(),
         user_id=uuid4(),
+        agent_key=agent_key,
     )
 
 
@@ -663,3 +666,174 @@ def test_specs_metadata() -> None:
     listing = ListDirTool(client=_client()).spec
     assert listing.is_read_only is True
     assert listing.resolved_side_effect == "read_only"
+
+
+# ---------------------------------------------------------------------------
+# B-50 Task 7 —— 文件工具按 agent 分层(带迁移期读回落)
+#
+# ``ws`` 是内嵌在片段 ``_PARAMS`` 里的 JSON,所以断言直接查 exec 的源码文本:
+# 这正是沙箱真正会拿到的东西,比断言某个中间变量更接近事实。
+# ---------------------------------------------------------------------------
+
+# 带上尾随逗号:``_PARAMS`` 是 ``json.dumps`` 的产物,``"ws": "/workspace"``
+# 本身是 ``"ws": "/workspace/agents/…"`` 的**子串** —— 不钉逗号的话「断言落在
+# 用户根」这件事恒真,测试看着在咬其实没咬。
+_AGENT_WS = '"ws": "/workspace/agents/plan-aaaaaaaa",'
+_USER_WS = '"ws": "/workspace",'
+_SHARED_WS = '"ws": "/workspace/shared",'
+
+
+class _SequenceRuntime(RecordingSandboxRuntime):
+    """按顺序吐多个 outcome —— 回落要跑两次 exec,单 outcome 的桩测不出。"""
+
+    def __init__(self, stdouts: list[str]) -> None:
+        super().__init__()
+        self._stdouts = list(stdouts)
+
+    async def exec(  # type: ignore[override]
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
+        self.execs.append((sandbox_id, code))
+        self.exec_agent_keys.append(agent_key)
+        stdout = self._stdouts.pop(0) if self._stdouts else ""
+        return SandboxOutcome(stdout=stdout, stderr="", exit_code=0, timed_out=False)
+
+
+_NOT_FOUND = json.dumps({"ok": False, "error": "not_found"})
+
+
+async def test_read_file_resolves_under_agent_root() -> None:
+    client = _client(json.dumps({"ok": True, "content": "hi"}))
+    await ReadFileTool(client=client).call(
+        {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    )
+    assert _AGENT_WS in client.execs[-1][1]
+
+
+async def test_read_file_without_agent_key_stays_at_user_root() -> None:
+    """未绑 agent(空串)= B-50 之前的行为,一字不改。"""
+    client = _client(json.dumps({"ok": True, "content": "hi"}))
+    await ReadFileTool(client=client).call({"path": "MEMORY.md"}, ctx=_ctx())
+    assert _USER_WS in client.execs[-1][1]
+    assert len(client.execs) == 1
+
+
+async def test_write_file_never_falls_back() -> None:
+    """写永远落 agent 目录,即使那里还不存在(片段自己 makedirs)。"""
+    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "size": 2})])
+    # 第一次就 not_found → 照常抛;关键是**没有**第二次 exec。
+    with contextlib.suppress(FileOpError):
+        await WriteFileTool(client=client).call(
+            {"path": "MEMORY.md", "content": "hi"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+        )
+    assert len(client.execs) == 1
+    assert _AGENT_WS in client.execs[0][1]
+
+
+async def test_edit_file_never_falls_back() -> None:
+    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "size": 2})])
+    with contextlib.suppress(FileOpError):
+        await EditFileTool(client=client).call(
+            {"path": "MEMORY.md", "old_string": "a", "new_string": "b"},
+            ctx=_ctx(agent_key="plan-aaaaaaaa"),
+        )
+    assert len(client.execs) == 1
+    assert _AGENT_WS in client.execs[0][1]
+
+
+async def test_read_file_falls_back_to_user_root_once() -> None:
+    """迁移期:agent 根下没有 → 回落用户根再读一次,且只一次。"""
+    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "legacy"})])
+    out = await ReadFileTool(client=client).call(
+        {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    )
+    assert out.content == "legacy"
+    assert len(client.execs) == 2
+    assert _AGENT_WS in client.execs[0][1]
+    assert _USER_WS in client.execs[1][1]
+
+
+async def test_read_file_not_found_in_both_roots_still_raises() -> None:
+    """回落也没有 → 照旧报 not_found,不能把回落做成吞错。"""
+    client = _SequenceRuntime([_NOT_FOUND, _NOT_FOUND])
+    with pytest.raises(FileOpError):
+        await ReadFileTool(client=client).call(
+            {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+        )
+    assert len(client.execs) == 2
+
+
+async def test_list_dir_falls_back_to_user_root_once() -> None:
+    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "entries": []})])
+    await ListDirTool(client=client).call({"path": "."}, ctx=_ctx(agent_key="plan-aaaaaaaa"))
+    assert len(client.execs) == 2
+    assert _USER_WS in client.execs[1][1]
+
+
+async def test_read_file_without_agent_key_never_falls_back() -> None:
+    """ws 已经是用户根,回落无处可去 —— 不能白跑第二次 exec。"""
+    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "x"})])
+    with pytest.raises(FileOpError):
+        await ReadFileTool(client=client).call({"path": "MEMORY.md"}, ctx=_ctx())
+    assert len(client.execs) == 1
+
+
+async def test_shared_prefix_reads_shared_root() -> None:
+    client = _client(json.dumps({"ok": True, "content": "x"}))
+    await ReadFileTool(client=client).call(
+        {"path": "shared:style/PLAN_STYLE.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    )
+    assert _SHARED_WS in client.execs[-1][1]
+
+
+async def test_shared_prefix_does_not_fall_back() -> None:
+    """``shared:`` 是显式寻址;读不到就是读不到,回落用户根等于悄悄换了目标。"""
+    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "wrong"})])
+    with pytest.raises(FileOpError):
+        await ReadFileTool(client=client).call(
+            {"path": "shared:x.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+        )
+    assert len(client.execs) == 1
+
+
+async def test_write_to_shared_is_refused() -> None:
+    with pytest.raises(WriteToSharedError):
+        await WriteFileTool(client=_client()).call(
+            {"path": "shared:x.md", "content": "no"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+        )
+
+
+async def test_absolute_agent_path_folds_to_relative() -> None:
+    """模型会照抄 ``list_dir`` 的输出回传绝对路径 —— 折掉自己那一段,别退回去。"""
+    client = _client(json.dumps({"ok": True, "content": "hi"}))
+    await ReadFileTool(client=client).call(
+        {"path": "/workspace/agents/plan-aaaaaaaa/MEMORY.md"},
+        ctx=_ctx(agent_key="plan-aaaaaaaa"),
+    )
+    code = client.execs[-1][1]
+    assert _AGENT_WS in code
+    assert '"rel": "MEMORY.md"' in code
+
+
+async def test_another_agents_absolute_path_is_not_folded() -> None:
+    """只折自己那一段。别人的 key 折掉就等于把跨 agent 读装成了合法调用。"""
+    with pytest.raises(ValueError, match="relative"):
+        await ReadFileTool(client=_client()).call(
+            {"path": "/workspace/agents/sop-bbbbbbbb/MEMORY.md"},
+            ctx=_ctx(agent_key="plan-aaaaaaaa"),
+        )
+
+
+async def test_projection_writer_still_targets_the_user_root() -> None:
+    """**有意的暂缓** —— 状态投影(``threads/<tid>/PLAN.md``)本 PR 不搬。
+
+    ``control_plane/api/sessions.py`` 的 B-27 留存链按用户根下的
+    ``threads/<thread_id>/`` 删目录;投影写入先搬走、删除侧要到 PR5(Task 12)
+    才跟上,中间每个被清理的会话都会留下永远删不掉的投影文件。两边必须同一个
+    PR 改 —— 这条断言是那个约定的哨兵,PR5 落地时换成 agent 根,不是删掉。
+    """
+    client = _client(json.dumps({"ok": True, "size": 2}))
+    writer = SandboxWorkspaceWriter(client=client, ctx=_ctx(agent_key="plan-aaaaaaaa"))
+    await writer.write(rel="threads/t1/PLAN.md", content="x")
+    assert _USER_WS in client.execs[-1][1]
+    assert _AGENT_WS not in client.execs[-1][1]
