@@ -121,7 +121,7 @@ CSI 的 `subPath` 在 create 时钉死(`agent_sandbox.py:1172-1190`),一个沙�
   shared/                              ← 反推不出归属的 legacy;新用户为空
   agents/<agent_key>/
     MEMORY.md  style/  assets/  客户案例/  …   ← agent 持久工作态,无 TTL
-    artifacts/                         ← 该 agent 的交付物
+                                       ← 交付物就落在这一层(见下方 09-12 勘误)
     uploads/                           ← 经该 agent 的会话上传的文件
     threads/<thread_id>/               ← 会话投影 PLAN/TODO/MEMORY.md
     .tool_results/<run_id>/            ← 纯缓存
@@ -130,13 +130,37 @@ CSI 的 `subPath` 在 create 时钉死(`agent_sandbox.py:1172-1190`),一个沙�
 
 `<agent_key>` 复用 `sanitize_agent_key()`,与 `/opt/skills/<agent_key>` 同一个值。
 
+> **⚠️ 勘误(2026-09-12,PR2 交付之后、PR3 开工之前)—— 原布局里的 `agents/<agent_key>/artifacts/`
+> 已删除,交付物就落在 agent 根这一层。**
+>
+> 原文这一段与 §5.2 的 `save_version` 行互相印证,但两者都建立在一个错误前提上:
+> **`save_artifact` 从来不搬字节。** 它只往 `artifact_version` 写一行登记
+> (`tools/artifact.py`),`path` 缺省等于 `name`;真正把文件落盘的是更早的
+> `write_file`。而 §5.2 给 `write_file` 定的解析规则是「相对 agent 目录解析」,
+> 也就是 `write_file("报告.docx")` → `agents/<agent_key>/报告.docx`,**不经过
+> `artifacts/`**。
+>
+> 于是两边对不上:登记的 `path_in_workspace` 指向一个不存在的文件,下载端点拿这一列
+> join 用户根去读,**每一次下载 404**。而且这个目录今天没有任何写入者、PR3 之后也不会有,
+> 画在布局里只会永远是空的。
+>
+> **定论:`path_in_workspace` 取 `agents/<agent_key>/<path>`。** 另外两条路都更差:
+>
+> - 让 `save_artifact` 真去搬字节 —— 等于给一个纯写库的工具加沙箱文件操作:双份存储、
+>   「搬成功但登记失败」(或反过来)的一致性问题,而且这个工具跑在 control-plane 侧、
+>   字节在沙箱里。
+> - 要求模型自己先 `write_file("artifacts/报告.docx")` —— 把不变式交给提示词。它会忘,
+>   而失败形态是静默 404。
+>
+> 分类语义本来就由 `artifact.kind` 列承担,目录名是第二套说法,删掉不丢信息。
+
 ### 4.1 三层寿命
 
 | 层 | 内容 | 寿命 |
 |---|---|---|
 | **纯缓存** | `.tool_results/<run_id>/` | 随对话生死 + 无主宽限,与 `threads/` 同一套(见 4.2) |
 | **会话投影** | `threads/<thread_id>/` | 已随对话生死 + 无主 24h 宽限(B-27,`orphan_threads.py:36`) |
-| **agent 持久工作态** | `MEMORY.md` / `style/` / `客户案例/` / `artifacts/` / `uploads/` | **无 TTL**。它是 agent 跨轮一致性的载体,按时间删不合理(用户 09-10 拍板) |
+| **agent 持久工作态** | `MEMORY.md` / `style/` / `客户案例/` / 交付物文件 / `uploads/` | **无 TTL**。它是 agent 跨轮一致性的载体,按时间删不合理(用户 09-10 拍板) |
 
 ### 4.2 `.tool_results/` 今天无人清理,而注释说有
 
@@ -188,7 +212,7 @@ OVERFLOW_DIR = ".tool_results"
 |---|---|---|
 | exec `cwd` | `cwd=WORKSPACE_ROOT`(`agent_sandbox.py:1472`) | `WORKSPACE_ROOT/agents/<agent_key>` —— 相对路径天然落对 |
 | `read_file`/`write_file`/`list_dir`/`edit_file` | 相对 `/workspace` 解析 | 相对 agent 目录解析;`shared:` 前缀落 `shared/`(照 ADK 的 `user:` 前缀约定) |
-| `save_version` | `path` 缺省 = `name`,不加前缀(`tools/artifact.py:133`) | 落 `agents/<agent_key>/artifacts/` |
+| `save_version` | `path` 缺省 = `name`,不加前缀(`tools/artifact.py:133`) | `path_in_workspace` 取 `agents/<agent_key>/<path>`(**09-12 勘误**:原写「落 `agents/<agent_key>/artifacts/`」,那个目录没有写入者 —— `save_artifact` 不搬字节,见 §四勘误) |
 | `list_artifacts` | `list_for_user(tenant, user)` | 默认只列本 agent;描述改成实话 |
 | `list_dir` 描述 | "the agent's workspace" | 说明并集语义与 `shared:` 前缀 |
 
@@ -264,7 +288,7 @@ def _resolve(rel):
 > 反推链因此多一跳:`created_in_thread` → `agent_run.id` → `agent_run.thread_id`
 > → `thread_meta.agent_name`。回落常量那批推不出来,按规则进 `shared/`。
 
-> **简化:`path_in_workspace` 存含前缀的完整相对路径**(`agents/<agent_key>/artifacts/x.docx`),
+> **简化:`path_in_workspace` 存含前缀的完整相对路径**(`agents/<agent_key>/x.docx`,09-12 勘误后不含 `artifacts/` 段),
 > 于是 §7.3 列的七个下游消费点**全部不用改** —— 它们都是拿这一列去 join 用户根,
 > 前缀在值里就自然对了。迁移只需 `UPDATE` 这一列 + 物理搬文件。
 
