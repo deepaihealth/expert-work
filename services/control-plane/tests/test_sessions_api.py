@@ -42,9 +42,6 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 
-#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
-_AGENT_KEY = "test-agent-0badc0de"
-
 
 class _SeedState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
