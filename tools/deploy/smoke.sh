@@ -157,6 +157,41 @@ proxy_tag="$(kubectl -n expert-work get deploy credential-proxy \
     -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*://')"
 check "credential-proxy tag matches control-plane" "${proxy_tag}" "${cp_tag}"
 
+# B-57 —— 沙箱镜像的 tag 手工钉在 infra/k8s/sandbox/sandboxset.yaml,**不在
+# release.sh 的 apply 范围里**(SandboxSet 在 default namespace,不在 kustomize
+# overlay 内)。它有一条文档化的手工发布路径
+# (docs/runbooks/sandbox-image-release.md),但**没有任何东西在「镜像源码变了
+# 而钉子没动」时说一句话** —— 于是那条手工步骤静默烂掉:2026-09-12 实测钉子停
+# 在 63a3109f(2026-08-09),34 天里 infra/sandbox-image/ 改过 4 次,两次 pypdf
+# 升级和 #1402(基础镜像改从 ECR Public 拉)从没进过集群。
+#
+# 这里**只 WARN 不 FAIL**,是有意的:smoke 非零会让 release.sh 走 EXIT trap
+# 建议回滚,那等于拿一个好的 control-plane 发版去赔一个无关的镜像滞后 ——
+# B-56 记的正是这种「叫你回滚一个健康发布」的坏信号。镜像滞后要人去走 runbook,
+# 不是要人回滚。
+echo "== sandbox image pin (B-57, warn-only) =="
+sandboxset="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/infra/k8s/sandbox/sandboxset.yaml"
+pinned_tag="$(sed -n 's|.*expert-work/sandbox:\([A-Za-z0-9._-]*\).*|\1|p' "${sandboxset}" | head -1)"
+if [[ -z "${pinned_tag}" ]]; then
+    echo "WARN sandbox pin: 在 ${sandboxset} 里没解析出 tag(格式变了?)"
+elif ! git -C "$(dirname "${sandboxset}")" rev-parse --verify --quiet "${pinned_tag}^{commit}" >/dev/null; then
+    # 钉的 tag 不是本仓库的 commit(手动构建 / 已被 GC),无从比对提交数。
+    echo "WARN sandbox pin: ${pinned_tag} 不是本仓库的 commit,无法判断是否滞后"
+else
+    behind="$(git -C "$(dirname "${sandboxset}")" rev-list --count \
+        "${pinned_tag}..HEAD" -- ../../sandbox-image 2>/dev/null || echo "?")"
+    if [[ "${behind}" == "0" ]]; then
+        echo "OK   sandbox image pin is current (${pinned_tag})"
+    else
+        echo "WARN sandbox image pin ${pinned_tag} 落后 ${behind} 个提交 —— infra/sandbox-image/ 改过但钉子没动。"
+        echo "     受影响的提交:"
+        git -C "$(dirname "${sandboxset}")" log --oneline --no-decorate \
+            "${pinned_tag}..HEAD" -- ../../sandbox-image 2>/dev/null | sed 's/^/       /'
+        echo "     发布这些改动要走 docs/runbooks/sandbox-image-release.md(独立手动路径,"
+        echo "     release.sh 不碰它);不发也可以,但要知道集群跑的不是 main 上的镜像。"
+    fi
+fi
+
 # Same Ready+not-Terminating filter as the POD pick above — probing a
 # Terminating pod's IP is a phantom failure, not a finding.
 POD_ROWS="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
