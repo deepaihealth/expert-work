@@ -399,6 +399,7 @@ def build_external_uploads_router() -> APIRouter:
         upload_id: str,
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         uploads: Annotated[UserUploadStore, Depends(_get_user_upload_store)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
         store: Annotated[ObjectStore | None, Depends(_get_object_store)],
@@ -414,8 +415,10 @@ def build_external_uploads_router() -> APIRouter:
         unrecognized ``user_id`` must not create a ``tenant_user`` row just
         because a third party probed this GET (same P1 review T3 rule every
         other external read endpoint follows).
+
+        B-50 PR4 —— 按 agent 收口:经哪个 agent 的会话传上来的,就归哪个 agent。
+        跨 agent 落进同一个不透明 404(与「不存在」不可区分)。
         """
-        del agent_code  # uploads are (tenant, user)-scoped — mirrors external_artifacts.
         tenant_id: UUID = request.state.tenant_id
         try:
             parsed_id = _upload_id_or_422(upload_id)
@@ -428,6 +431,21 @@ def build_external_uploads_router() -> APIRouter:
             return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
         row = await uploads.get(upload_id=parsed_id, tenant_id=tenant_id)
         if row is None or row.user_id != end_user_id or row.deleted_at is not None:
+            return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
+        # B-50 PR4 —— 按 agent 收口。``user_upload`` 没有 ``agent_key`` 列,归属
+        # 沿 ``thread_id → thread_meta.agent_name`` 反查:这张表唯一的写入方是本
+        # 模块的 ``upload_for_user``,它走 ``_resolve_session``,那条路必然绑定
+        # agent,所以 ``agent_name`` 结构上总是有值(测试环境 51/51 实测可解)。
+        #
+        # 比的是 ``agent_name`` 与 ``agent_code`` 本身,不是两边各算一次
+        # ``sanitize_agent_key`` —— ``_external.load_owned_thread`` 判会话归属用
+        # 的就是这个谓词(``meta.agent_name != agent_code``),对外平面的归属判定
+        # 只应该有一种写法。
+        #
+        # **反查不出来就拒绝。** 反过来(查不到就放行)会让删掉一条会话变成绕过
+        # 收口的手段。
+        owning_thread = await threads.get(row.thread_id, tenant_id=tenant_id)
+        if owning_thread is None or owning_thread.agent_name != agent_code:
             return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
 
         if row.kind == "document":
