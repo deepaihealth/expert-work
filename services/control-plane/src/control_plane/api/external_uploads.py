@@ -57,6 +57,7 @@ from control_plane.api._external import (
     lookup_external_user_id,
     reject_nul_path_params,
 )
+from control_plane.api._external_agent_scope import agent_key_for_code
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api._workspace_shared import thread_agent_key, workspace_agent_path
@@ -301,7 +302,12 @@ def build_external_uploads_router() -> APIRouter:
                     tenant_id=tenant_id,
                     caller_user_id=end_user_id,
                     thread_id=thread_id,
-                    agent_key=thread_agent_key(meta),
+                    # 用 ``agent_code`` 算,不用 ``meta`` —— 上面两个分支里
+                    # 只有一个绑了 ``meta``(``session_id is None`` 那支是新建
+                    # 会话,压根没有)。两者在这里必然相等:``agent_code`` 就是
+                    # ``spec.metadata.name``,也就是新会话写进 ``agent_name``
+                    # 的值;另一支 ``load_owned_session`` 已经断言过相等。
+                    agent_key=agent_key_for_code(agent_code),
                     settings=settings,
                     workspace_store=workspace_store,
                     audit=audit,

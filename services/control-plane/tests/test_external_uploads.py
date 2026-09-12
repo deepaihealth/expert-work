@@ -25,6 +25,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from control_plane.api._external import external_subject_id
+from control_plane.api._external_agent_scope import agent_key_for_code
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -298,7 +299,14 @@ async def test_upload_document_succeeds_for_an_api_key_caller(ctx: _Ctx) -> None
     ]
     assert written_tenant_id == ctx.tenant_id
     assert written_user_id == end_user.id
-    assert written_path.startswith("uploads/")
+    # B-50 —— 落盘路径投影到这个 agent 的子树下。``workspace_store`` 是按
+    # (tenant, user) 开的,不知道 agent;不投影的话新上传永远落扁平根,而 run
+    # 里的 read_document 按 agent 根解析 —— 今天被 PR3 的迁移期读回落兜着,
+    # Task 14 摘掉回落就断。
+    #
+    # 登记行的 ``ref`` **不带前缀**(见下方断言):它是 agent 相对的
+    # ``uploads/<name>``,也是对接方 run 请求里回传的那个值。两者刻意不同。
+    assert written_path.startswith(f"agents/{agent_key_for_code('support-bot')}/uploads/")
 
     # The unified ``user_upload`` registry row (external附件模型统一, Task 2)
     # must also exist, opaque-id-addressable, pointing at the same workspace path.
@@ -308,6 +316,9 @@ async def test_upload_document_succeeds_for_an_api_key_caller(ctx: _Ctx) -> None
     assert user_upload_row is not None
     assert user_upload_row.kind == "document"
     assert user_upload_row.ref.startswith("uploads/")
+    # 登记行的 ref 与落盘路径差的正好是 agent 前缀 —— 下载端点就是靠这条
+    # 关系把 ref 还原成存储路径的,两边任何一侧漂了都会 404。
+    assert written_path == f"agents/{agent_key_for_code('support-bot')}/{user_upload_row.ref}"
     assert user_upload_row.user_id == end_user.id
 
 

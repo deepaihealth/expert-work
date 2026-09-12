@@ -343,14 +343,22 @@ async def test_workspace_files_and_download_with_supervisor(
         assert deleted.status_code == 200
         assert deleted.json()["data"]["deleted"] == "report.pdf"
         store = app.state.workspace_store
-        assert [d[2] for d in store.workspace_deletes] == ["report.pdf"]
+        # B-50 —— 会话内的 path 相对**这个会话所属 agent 的**根,调
+        # workspace_store 时补上前缀(那个 store 按 (tenant, user) 开,不知道
+        # agent)。不投影的话删的是用户根下的同名文件,多半不存在,于是静默
+        # 变成 no-op:界面显示删成功,文件还在。
+        meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+        agent_key = sanitize_agent_key(meta.agent_name or "")
+        assert agent_key, "会话必须绑着 agent,否则这条验的是退化路径"
+        assert [d[2] for d in store.workspace_deletes] == [f"agents/{agent_key}/report.pdf"]
 
         # A traversal path is rejected before reaching the supervisor.
         bad = await client.request(
             "DELETE", f"/v1/sessions/{thread_id}/workspace/file", params={"path": "../etc/passwd"}
         )
         assert bad.status_code == 400
-        assert [d[2] for d in store.workspace_deletes] == ["report.pdf"]
+        # 仍然只有上面那一次删除 —— 校验发生在投影之前,`..` 根本没到 store。
+        assert [d[2] for d in store.workspace_deletes] == [f"agents/{agent_key}/report.pdf"]
 
 
 # ---------------------------------------------------------------------------

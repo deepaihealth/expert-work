@@ -342,6 +342,8 @@ const zhCN: TranslationKeys = {
     workspace_none: "该用户暂无工作区。",
     workspace_files: "文件",
     workspace_files_empty: "暂无文件。",
+    workspace_group_agent: "Agent",
+    workspace_group_shared: "归属不明的历史文件",
     download: "下载",
     delete: "删除",
     delete_confirm: "删除 {{name}}？",

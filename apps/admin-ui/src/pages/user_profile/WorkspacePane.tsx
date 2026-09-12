@@ -5,7 +5,7 @@
  * target. Mirrors the playground workspace inspector, simplified.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Alert, App, Button, Empty, Popconfirm, Space, Table, Typography } from "antd";
+import { Alert, App, Button, Empty, Popconfirm, Space, Table, Tag, Typography } from "antd";
 import type { TableColumnsType } from "antd";
 import { Download, HardDrive, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -59,6 +59,8 @@ interface WsFileNode {
   /** 文件自身大小;目录为子树合计。 */
   size: number;
   children?: WsFileNode[];
+  /** 顶层分组的性质(B-50)。仅根节点有值,用来给这一级贴标签。 */
+  groupKind?: "agent" | "shared";
 }
 
 /** 平铺的 `qa/a.pdf` 列表 → 嵌套目录树,目录在前、同级按名排序。
@@ -93,6 +95,32 @@ export function buildFileTree(files: readonly WorkspaceFile[]): WsFileNode[] {
   };
   sortLevel(root);
   return root;
+}
+
+/** 把 `agents/<agent_key>/…` 提成顶层分组,并给 `shared/` 贴上标签(B-50)。
+ *
+ *  不加这一步树也能展开——只是多出 `agents` / `<agent_key>` 两级。问题是
+ *  **没有任何东西告诉看的人「这一级是 agent」**:`plan-aaaaaaaa` 这种名字
+ *  (业务名 + sha256 前 8 位)看起来只是个怪目录名;而 `shared/` 更会被当成
+ *  「共享目录」——它实际是搬迁时**反推不出归属**的历史文件,冻结、只读、
+ *  谁写的查不出来。那恰恰是看的人最需要知道的一件事。
+ */
+export function groupTreeByAgent(root: readonly WsFileNode[]): WsFileNode[] {
+  const out: WsFileNode[] = [];
+  for (const node of root) {
+    // 只有**目录**才是容器:一个恰好叫 agents 的文件没有 children,
+    // 提升它会让那一行从表里消失。
+    if (node.isDir && node.name === "agents" && node.children) {
+      // 提升一级:`agents` 这个容器段本身不承载信息,它的每个子目录才是一个 agent。
+      for (const agent of node.children) out.push({ ...agent, groupKind: "agent" });
+      continue;
+    }
+    out.push(node.isDir && node.name === "shared" ? { ...node, groupKind: "shared" } : node);
+  }
+  // agent 分组在前、shared 次之、其余(搬迁前的扁平残留)最后。
+  const rank = (n: WsFileNode): number =>
+    n.groupKind === "agent" ? 0 : n.groupKind === "shared" ? 1 : 2;
+  return out.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
 }
 
 function collectDirKeys(nodes: readonly WsFileNode[], out: string[] = []): string[] {
@@ -262,7 +290,7 @@ export function WorkspacePane({ userId }: { userId: string }) {
   ];
 
   const fileTree = useMemo(
-    () => buildFileTree(files.filter((f) => !isHiddenWorkspacePath(f.path))),
+    () => groupTreeByAgent(buildFileTree(files.filter((f) => !isHiddenWorkspacePath(f.path)))),
     [files],
   );
   // 目录默认全展开。antd 的 defaultExpandAllRows 只在首挂载时生效,而
@@ -280,9 +308,21 @@ export function WorkspacePane({ userId }: { userId: string }) {
       ellipsis: true,
       render: (_: unknown, record) =>
         record.isDir ? (
-          <Text strong style={{ fontSize: 12 }}>
-            {record.name}/
-          </Text>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <Text strong style={{ fontSize: 12 }}>
+              {record.name}/
+            </Text>
+            {record.groupKind === "agent" ? (
+              <Tag color="blue" style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: "16px" }}>
+                {t("user_profile.workspace_group_agent")}
+              </Tag>
+            ) : null}
+            {record.groupKind === "shared" ? (
+              <Tag style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: "16px" }}>
+                {t("user_profile.workspace_group_shared")}
+              </Tag>
+            ) : null}
+          </span>
         ) : (
           <Text code style={{ fontSize: 12 }}>
             {record.name}

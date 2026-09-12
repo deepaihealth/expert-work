@@ -414,3 +414,33 @@ def test_apply_actually_moved_every_planned_file(tmp_path: Path, ids: tuple[UUID
     assert len(landed) == len(plan.moves)
     assert report.moved + report.to_shared == len(landed)
     assert not [old for old in plan.moves if (root / old).exists()]
+
+
+def test_tool_results_and_uploads_are_moved_not_skipped(
+    tmp_path: Path, ids: tuple[UUID, UUID]
+) -> None:
+    """``.tool_results/`` 与 ``uploads/`` 都要搬 —— 它们在「浏览面隐藏」集合里,
+    但**搬迁不碰**的集合与那个集合不是一回事。
+
+    第一版把 ``_NEVER_MOVED`` 写成 ``WORKSPACE_RESERVED_PREFIXES - {uploads}``。
+    Task 13a 往 ``RESERVED`` 里加了 ``.tool_results``(为了让浏览面别列它),
+    搬迁**当场**静默不再搬它 —— 而那次改动完全在另一个包里,本文件一行没动,
+    只有跑全量才红。这条把两个集合钉开。
+
+    两者都可反推:``uploads/<name>`` 走 ``user_upload.thread_id``,
+    ``.tool_results/<run_id>/`` 走 ``agent_run`` → thread → agent。
+    """
+    tenant_id, user_id = ids
+    root = tmp_path / str(tenant_id) / str(user_id)
+    _write(root / "uploads" / "a.docx", "a")
+    _write(root / ".tool_results" / "r1" / "call_x.txt", "o")
+    _write(root / "skills" / "seeded.md", "s")
+
+    plan = plan_migration(str(tmp_path), tenant_id, user_id, attributions=_empty(sole=_KEY_A))
+
+    assert plan.moves["uploads/a.docx"] == f"agents/{_KEY_A}/uploads/a.docx"
+    assert plan.moves[".tool_results/r1/call_x.txt"] == (
+        f"agents/{_KEY_A}/.tool_results/r1/call_x.txt"
+    )
+    # skills/ 仍然不碰 —— 收窄不能把它一起放开。
+    assert plan.untouched == ("skills/seeded.md",)

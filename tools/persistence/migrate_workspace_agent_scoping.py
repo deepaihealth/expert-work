@@ -40,8 +40,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence import (
     WORKSPACE_AGENTS_DIR,
-    WORKSPACE_RESERVED_PREFIXES,
     WORKSPACE_SHARED_DIR,
+    WORKSPACE_SKILLS_DIR,
     WORKSPACE_UPLOADS_DIR,
 )
 from expert_work.protocol.agent_key import sanitize_agent_key
@@ -57,17 +57,20 @@ _TOOL_RESULTS_DIR = ".tool_results"
 
 #: 搬迁一个字节都不碰的顶层段。
 #:
-#: ``skills`` / ``uploads`` 来自 :data:`WORKSPACE_RESERVED_PREFIXES`,但两者
-#: **处置完全不同**:``skills/`` 是运行时播种的机器文件,留在用户根;
-#: ``uploads/`` 是用户输入,spec §7.1 明确要求跟着会话的 agent 走。所以这里
-#: 只取 ``skills``,不是整个保留段集合 —— 直接复用那个集合会让 ``uploads/``
-#: 悄悄留在原地,而它恰恰是本次要分的三类文件之一。
+#: * ``skills`` —— 运行时播种的机器文件,留在用户根。
+#: * ``agents`` / ``shared`` —— 搬迁的**终态目录**。重跑时它们已经在正确位置,
+#:   再当成待搬的源会搬成 ``agents/<key>/agents/<key>/x``。
 #:
-#: ``agents`` / ``shared`` 是搬迁的**终态目录**:重跑时它们已经在正确位置,
-#: 再当成待搬的源会搬成 ``agents/<key>/agents/<key>/x``。
+#: **逐个列出,不从 :data:`WORKSPACE_RESERVED_PREFIXES` 减出来。** 那个集合的
+#: 语义是「浏览面隐藏」,与「搬迁不碰」只是碰巧重叠过:``uploads/`` 在里头但
+#: spec §7.1 要求它跟着会话的 agent 走,``.tool_results/`` 在里头但它同样可
+#: 反推(run_id → thread → agent)。第一版就是写成 ``RESERVED - {uploads}``
+#: 的,Task 13a 往 ``RESERVED`` 里加了 ``.tool_results`` 之后,搬迁**当场**
+#: 静默不再搬它 —— 而那次改动完全在另一个包里,本文件一行没动。
+#:
+#: 两个集合此后各自演化,这里不再跟着走。
 _NEVER_MOVED: frozenset[str] = frozenset(
-    {WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR}
-    | (WORKSPACE_RESERVED_PREFIXES - {WORKSPACE_UPLOADS_DIR})
+    {WORKSPACE_SKILLS_DIR, WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR}
 )
 
 
