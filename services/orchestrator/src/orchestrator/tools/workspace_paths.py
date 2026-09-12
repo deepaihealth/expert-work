@@ -18,8 +18,11 @@ from __future__ import annotations
 import re
 from pathlib import PurePosixPath
 
+from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
+
 #: 显式跨到用户级 ``shared/`` 区的前缀(照 ADK 的 ``user:`` 约定)。
-SHARED_PREFIX = "shared:"
+#: 由目录名拼出来,不写第二遍字面量 —— 前缀与它指向的目录必须永远同名。
+SHARED_PREFIX = f"{WORKSPACE_SHARED_DIR}:"
 
 #: 沙箱内的用户工作区根(挂载点)。**导出而非私有**:``file_ops`` 的迁移期
 #: 读回落要用它,而那个模块自己也有一个同名私有常量 —— 两处各改各的就会静默
@@ -29,14 +32,28 @@ USER_ROOT = "/workspace"
 #: 布局里的保留段。**导出**:``file_ops._require_path`` 要用它来拒绝以这一段
 #: 开头的相对路径 —— 迁移期读回落会把 ``agents/<别人的 key>/x`` 变成一次合法的
 #: 跨 agent 读(agent 根下找不到 → 回落用户根 → 正好命中别人的目录)。
-AGENTS_DIR = "agents"
-_SHARED_DIR = "shared"
+#:
+#: **别名,不是第二份定义。** 真源在 ``expert_work.persistence`` 的
+#: ``workspace/layout.py`` —— 那里是布局前缀的既有单源(``skills`` /
+#: ``uploads`` 也在那儿),而搬迁脚本、留存 job、控制台浏览面都够不着
+#: orchestrator。两处各写各的字面量,搬迁把文件放进 ``agents/`` 而沙箱去
+#: ``agent/`` 找,不会有任何测试红。``test_workspace_paths.py`` 钉了
+#: ``AGENTS_DIR == WORKSPACE_AGENTS_DIR``(用 ``==`` 不是 ``is`` —— 字符串
+#: 会被 intern,同值的第二份字面量 ``is`` 照样为真,那条判据是摆设)。
+AGENTS_DIR = WORKSPACE_AGENTS_DIR
+_SHARED_DIR = WORKSPACE_SHARED_DIR
 
 #: ``agent_key`` 来自 ``config["configurable"]`` —— 不可信。它会被拼进 ``ws``,
 #: 一个带 ``/`` 或 ``..`` 的值能把整个作用域撬到 ``/workspace`` 之外。形状与
 #: ``sanitize_agent_key()`` 的产物一致:``[A-Za-z0-9._-]+``(见
 #: ``expert_work.protocol.agent_key``)。
 _AGENT_KEY_OK = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+#: 单纯的 ``.`` / ``..`` **能过上面那条正则**(两个点都在字符集里),而
+#: ``{root}/agents/..`` 就是 ``{root}`` —— agent 作用域直接塌回用户根,正是
+#: 这道闸写来要挡的东西。正则管「有没有分隔符」,管不了「这一段是不是相对
+#: 路径的特殊名字」,必须单列。
+_DOTTED = frozenset({".", ".."})
 
 #: 会改字节的工具 —— 它们不许写进 ``shared/``。
 _WRITE_TOOLS = frozenset({"write_file", "edit_file"})
@@ -58,7 +75,7 @@ def agent_workspace_root(agent_key: str) -> str:
     """
     if not agent_key:
         return USER_ROOT
-    if not _AGENT_KEY_OK.match(agent_key):
+    if agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
         msg = f"agent_key is not a safe path segment: {agent_key!r}"
         raise ValueError(msg)
     return f"{USER_ROOT}/{AGENTS_DIR}/{agent_key}"

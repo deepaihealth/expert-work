@@ -25,9 +25,12 @@ from retention_cleanup_job.workspace_files import (
     DELETED_DIR,
     THREADS_DIR,
     UnsafeWorkspacePathError,
+    agent_subtree,
     deleted_marker,
     iter_thread_dirs,
+    iter_tool_result_dirs,
     remove_thread_dir,
+    remove_tool_result_dir,
     unlink_registered_file,
     user_root,
     validate_workspace_root,
@@ -265,3 +268,102 @@ def test_validate_workspace_root_rejects_missing_file_and_symlink(
         root.symlink_to(real)
     with pytest.raises(ValueError, match="workspace_root"):
         validate_workspace_root(str(root))
+
+
+# ------------------------------------------------------- B-50 按 agent 分层之后
+
+
+def _seed_dir(root: Path, rel: str) -> Path:
+    d = root / rel
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "PLAN.md").write_bytes(b"p")
+    return d
+
+
+def test_iter_thread_dirs_finds_both_legacy_and_agent_scoped(tmp_path: Path) -> None:
+    """搬迁期两种位置同时存在 —— 只认一处的话另一处的孤儿永远清不掉。
+
+    而且不会有任何东西报错:漏掉的目录在扫描器眼里就是「不存在」。
+    """
+    tenant, user = uuid4(), uuid4()
+    legacy, scoped = uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user)
+    _seed_dir(base, f"{THREADS_DIR}/{legacy}")
+    _seed_dir(base, f"agents/plan-aaaaaaaa/{THREADS_DIR}/{scoped}")
+
+    found = {(d.thread_id, d.agent_key) for d in iter_thread_dirs(str(tmp_path))}
+
+    assert found == {(legacy, ""), (scoped, "plan-aaaaaaaa")}
+
+
+def test_iter_thread_dirs_never_descends_into_shared(tmp_path: Path) -> None:
+    """``shared/`` 是新的「不许碰」区 —— 装的是搬迁时反推不出归属的 legacy。
+
+    那批文件**按定义**查不到登记行,一旦被扫进来就会被当成孤儿按 mtime 删掉,
+    正是这个模块的不变式要挡的形状。这里造一个 ``shared/threads/<uuid>/``
+    (搬迁确实会造出这个形状)来钉住。
+    """
+    tenant, user = uuid4(), uuid4()
+    orphaned = uuid4()
+    base = tmp_path / str(tenant) / str(user)
+    _seed_dir(base, f"shared/{THREADS_DIR}/{orphaned}")
+
+    assert list(iter_thread_dirs(str(tmp_path))) == []
+
+
+def test_iter_tool_result_dirs_finds_both_locations(tmp_path: Path) -> None:
+    """``.tool_results/<run_id>/`` 与 threads 同一套枚举规矩。"""
+    tenant, user = uuid4(), uuid4()
+    legacy, scoped = uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user)
+    _seed_dir(base, f".tool_results/{legacy}")
+    _seed_dir(base, f"agents/sop-bbbbbbbb/.tool_results/{scoped}")
+
+    found = {(d.run_id, d.agent_key) for d in iter_tool_result_dirs(str(tmp_path))}
+
+    assert found == {(legacy, ""), (scoped, "sop-bbbbbbbb")}
+
+
+def test_iter_tool_result_dirs_never_descends_into_shared(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user)
+    _seed_dir(base, f"shared/.tool_results/{uuid4()}")
+
+    assert list(iter_tool_result_dirs(str(tmp_path))) == []
+
+
+def test_remove_dirs_honour_the_agent_key(tmp_path: Path) -> None:
+    """带 agent_key 删的是 agent 子树里那个,不带删的是用户根那个 —— 互不影响。"""
+    tenant, user = uuid4(), uuid4()
+    tid, run_id = uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user)
+    legacy_t = _seed_dir(base, f"{THREADS_DIR}/{tid}")
+    scoped_t = _seed_dir(base, f"agents/plan-aaaaaaaa/{THREADS_DIR}/{tid}")
+    legacy_r = _seed_dir(base, f".tool_results/{run_id}")
+    scoped_r = _seed_dir(base, f"agents/plan-aaaaaaaa/.tool_results/{run_id}")
+
+    assert remove_thread_dir(str(tmp_path), tenant, user, tid, agent_key="plan-aaaaaaaa")
+    assert remove_tool_result_dir(str(tmp_path), tenant, user, run_id, agent_key="plan-aaaaaaaa")
+
+    assert not scoped_t.exists()
+    assert not scoped_r.exists()
+    assert legacy_t.exists(), "同名的用户根目录不该被连带删掉"
+    assert legacy_r.exists()
+
+    assert remove_thread_dir(str(tmp_path), tenant, user, tid)
+    assert remove_tool_result_dir(str(tmp_path), tenant, user, run_id)
+    assert not legacy_t.exists()
+    assert not legacy_r.exists()
+
+
+@pytest.mark.parametrize("bad", ["../..", "a/b", "", "."])
+def test_agent_subtree_rejects_unsafe_keys(tmp_path: Path, bad: str) -> None:
+    """目录名从 scandir 读来,会被拼进一条要 rmtree 的路径 —— 自己校验形状。
+
+    空串是例外:它**不是**不安全的值,是「搬迁前的用户根位置」这个明确语义。
+    """
+    if bad == "":
+        assert agent_subtree(tmp_path, bad) == tmp_path
+        return
+    with pytest.raises(UnsafeWorkspacePathError):
+        agent_subtree(tmp_path, bad)

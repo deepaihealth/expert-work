@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from uuid import UUID
+
+from expert_work.persistence import WORKSPACE_AGENTS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,22 @@ THREADS_DIR = "threads"
 #: 与 ``orchestrator.tools.nas_workspace_store.DELETED_DIR`` 同值:租户目录下的
 #: 软删标记目录,``{root}/{tenant}/.deleted/{user}`` 一个空文件一个已软删用户。
 DELETED_DIR = ".deleted"
+
+#: 与 ``orchestrator.tools.overflow.OVERFLOW_DIR`` 同值 —— 工具结果溢出缓存
+#: ``.tool_results/<run_id>/``(不跨包 import,理由见模块头)。
+TOOL_RESULTS_DIR = ".tool_results"
+
+#: ``agent_key`` 目录名的合法形状,与 ``sanitize_agent_key`` 的产物一致
+#: (``expert_work.protocol.agent_key``)。目录名是从 ``scandir`` 读来的,
+#: 会被拼进一条要 ``rmtree`` 的路径 —— 带 ``/`` 或 ``..`` 的名字能把删除
+#: 撬到用户根之外,所以必须自己校验,不能因为「是我们自己写的目录」就信。
+_AGENT_KEY_OK = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+#: 单纯的 ``.`` / ``..`` **能过上面那条正则**(两个点都在字符集里),而
+#: ``{root}/agents/..`` 就是 ``{root}`` —— agent 作用域直接塌回用户根,正是
+#: 这道闸写来要挡的东西。正则管「有没有分隔符」,管不了「这一段是不是相对
+#: 路径的特殊名字」,必须单列。
+_DOTTED = frozenset({".", ".."})
 
 
 class UnsafeWorkspacePathError(ValueError):
@@ -56,6 +75,22 @@ class ThreadDir:
     #: 目录本身与它直接子项里最新的 mtime —— 孤儿宽限按这个算(投影落地时
     #: 写的是目录里的文件,目录 mtime 只在增删子项时变)。
     newest_mtime: float
+    #: 这个目录所在的 agent 子树;**空串 = 搬迁前的用户根位置**(B-50)。
+    #: 两种位置在搬迁期同时存在,删除时必须按这个值拼回原路径 —— 猜错一边
+    #: 就是「删不掉」(孤儿永远留着)或者更糟,删到另一个 agent 的同名目录。
+    agent_key: str = ""
+
+
+@dataclass(frozen=True)
+class ToolResultDir:
+    """一个 ``.tool_results/<run_id>/`` 目录 —— 工具结果溢出缓存(spec §4.2)。"""
+
+    tenant_id: UUID
+    user_id: UUID
+    run_id: UUID
+    path: Path
+    newest_mtime: float
+    agent_key: str = ""
 
 
 def user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
@@ -153,23 +188,75 @@ def unlink_registered_file(root: str, tenant_id: UUID, user_id: UUID, relpath: s
     return True
 
 
-def remove_thread_dir(root: str, tenant_id: UUID, user_id: UUID, thread_id: UUID) -> bool:
-    """``rm -rf {user_root}/threads/{thread_id}``。返回是否真的删了。
+def agent_subtree(user_dir: Path, agent_key: str) -> Path:
+    """``{user_dir}/agents/{agent_key}``;``agent_key`` 为空时就是 ``user_dir``。
 
-    只认 ``threads/<uuid>`` 这一种形状 —— ``thread_id`` 是 UUID 类型,拼不出别的
-    路径。tenant / user 目录或目录本身是 symlink → :class:`UnsafeWorkspacePathError`
-    (不顺着链接删)。
+    空串 = 搬迁前的用户根位置(同 ``agent_workspace_root("")`` 的口径)。
+    非空但不是单个安全路径段的一律拒 —— 它来自 ``scandir`` 读到的目录名,
+    会被拼进一条要 ``rmtree`` 的路径。
+    """
+    if not agent_key:
+        return user_dir
+    if agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
+        raise UnsafeWorkspacePathError(f"agent_key is not a safe path segment: {agent_key!r}")
+    return user_dir / WORKSPACE_AGENTS_DIR / agent_key
+
+
+def _remove_uuid_named_dir(
+    root: str,
+    tenant_id: UUID,
+    user_id: UUID,
+    *,
+    agent_key: str,
+    container: str,
+    name: UUID,
+) -> bool:
+    """``rm -rf {user_root}/[agents/<key>/]{container}/{name}``。返回是否真的删了。
+
+    ``name`` 是 UUID 类型、``container`` 是本模块的常量、``agent_key`` 过
+    :func:`agent_subtree` 的形状闸 —— 三段都拼不出别的路径。tenant / user 目录
+    或目标本身是 symlink → :class:`UnsafeWorkspacePathError`(不顺着链接删)。
     """
     _ensure_plain_dirs(root, tenant_id, user_id)
-    target = user_root(root, tenant_id, user_id) / THREADS_DIR / str(thread_id)
+    base = agent_subtree(user_root(root, tenant_id, user_id), agent_key)
+    target = base / container / str(name)
     try:
         st = os.lstat(target)
     except FileNotFoundError:
         return False
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        raise UnsafeWorkspacePathError(f"thread dir is not a directory: {thread_id}")
+        raise UnsafeWorkspacePathError(f"{container} entry is not a directory: {name}")
     shutil.rmtree(target)
     return True
+
+
+def remove_thread_dir(
+    root: str, tenant_id: UUID, user_id: UUID, thread_id: UUID, *, agent_key: str = ""
+) -> bool:
+    """``rm -rf {user_root}/[agents/<key>/]threads/{thread_id}``。返回是否真的删了。
+
+    ``agent_key`` 默认空串 = 搬迁前的用户根位置,于是既有调用点(purge 钩子的
+    存量路径)语义不变。
+    """
+    return _remove_uuid_named_dir(
+        root, tenant_id, user_id, agent_key=agent_key, container=THREADS_DIR, name=thread_id
+    )
+
+
+def remove_tool_result_dir(
+    root: str, tenant_id: UUID, user_id: UUID, run_id: UUID, *, agent_key: str = ""
+) -> bool:
+    """``rm -rf {user_root}/[agents/<key>/].tool_results/{run_id}``。
+
+    spec §4.2:``.tool_results/<run_id>/`` 与 ``threads/<id>/`` 同一套生命周期
+    (会话 purge 连带删 + 孤儿宽限扫描)。在此之前它**从没被清过** ——
+    ``overflow.py`` 的注释声称留存机制负责它的生命周期,而留存 job 的不变式
+    恰恰是「根目录其它文件永不触碰」,那条注释是假的(实测单用户堆了 40 个 run
+    目录)。
+    """
+    return _remove_uuid_named_dir(
+        root, tenant_id, user_id, agent_key=agent_key, container=TOOL_RESULTS_DIR, name=run_id
+    )
 
 
 def _uuid_dirs(path: Path) -> list[tuple[UUID, Path]]:
@@ -213,38 +300,110 @@ def _newest_mtime(path: Path) -> float:
     return newest
 
 
-def iter_thread_dirs(root: str) -> Iterator[ThreadDir]:
-    """枚举 ``{root}/<tenant>/<user>/threads/<thread_id>/`` —— 三层都必须是 UUID 名。
+def _agent_dirs(user_dir: Path) -> list[tuple[str, Path]]:
+    """``{user_dir}/agents/`` 下的 agent 子树 —— ``(agent_key, path)``。
 
-    已软删的用户(``.deleted/<user>`` 标记在)整体跳过:那棵树归 janitor 归档 +
-    rmtree,留存 job 不在归档前改动它的内容。
+    名字形状不合法的目录直接跳过(不报错、不删):枚举是为了删东西,遇到
+    一个看不懂的名字应该**放过它**而不是猜。symlink 不算目录。
+    """
+    out: list[tuple[str, Path]] = []
+    try:
+        with os.scandir(user_dir / WORKSPACE_AGENTS_DIR) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                if _AGENT_KEY_OK.match(entry.name):
+                    out.append((entry.name, Path(entry.path)))
+    except FileNotFoundError:
+        return []
+    except OSError:
+        logger.warning("retention.workspace_scan_failed path=%s", user_dir / WORKSPACE_AGENTS_DIR)
+    return sorted(out)
+
+
+def _scan_roots(root: str) -> Iterator[tuple[UUID, UUID, str, Path]]:
+    """枚举每个活着用户的每个「容器根」—— ``(tenant, user, agent_key, base)``。
+
+    两处:用户根本身(``agent_key=""``,搬迁前的位置 / 搬迁后没搬走的残留)
+    与每个 ``agents/<key>/``。
+
+    **``shared/`` 不在内,而且不能在。** 它装的是搬迁时反推不出归属的 legacy,
+    是新的「不许碰」区:那批文件按定义查不到登记行,扫进来就等于按 mtime 删
+    ——正是这个模块的不变式要挡的形状。``_uuid_dirs`` 只认 UUID 名,``shared``
+    天然落不进来,但这条注释要留着:有人日后把枚举改成「用户根下所有目录」时,
+    ``shared/threads/<uuid>/``(搬迁确实会造出这个形状)就会被扫到。
+
+    已软删的用户(``.deleted/<user>`` 标记在)整体跳过:那棵树归 janitor 归档
+    + rmtree,留存 job 不在归档前改动它的内容。
     """
     for tenant_id, tenant_dir in _uuid_dirs(Path(root)):
         for user_id, user_dir in _uuid_dirs(tenant_dir):
             if deleted_marker(root, tenant_id, user_id).exists():
                 continue
-            for thread_id, thread_dir in _uuid_dirs(user_dir / THREADS_DIR):
-                try:
-                    newest = _newest_mtime(thread_dir)
-                except OSError:
-                    continue
-                yield ThreadDir(
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    path=thread_dir,
-                    newest_mtime=newest,
-                )
+            yield tenant_id, user_id, "", user_dir
+            for agent_key, agent_dir in _agent_dirs(user_dir):
+                yield tenant_id, user_id, agent_key, agent_dir
+
+
+def iter_thread_dirs(root: str) -> Iterator[ThreadDir]:
+    """枚举 ``{root}/<tenant>/<user>/[agents/<key>/]threads/<thread_id>/``。
+
+    B-50:搬迁后投影目录在 ``agents/<agent_key>/threads/<id>/``,枚举器因此
+    多一层。**两处都枚举** —— 搬迁期两种位置同时存在,只认一处的话另一处的
+    孤儿永远清不掉(而且不会有任何东西报错)。
+    """
+    for tenant_id, user_id, agent_key, base in _scan_roots(root):
+        for thread_id, thread_dir in _uuid_dirs(base / THREADS_DIR):
+            try:
+                newest = _newest_mtime(thread_dir)
+            except OSError:
+                continue
+            yield ThreadDir(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                path=thread_dir,
+                newest_mtime=newest,
+                agent_key=agent_key,
+            )
+
+
+def iter_tool_result_dirs(root: str) -> Iterator[ToolResultDir]:
+    """枚举 ``{root}/<tenant>/<user>/[agents/<key>/].tool_results/<run_id>/``。
+
+    与 :func:`iter_thread_dirs` 同一套规矩,只是容器段和 id 的含义不同
+    (run_id 而非 thread_id)。
+    """
+    for tenant_id, user_id, agent_key, base in _scan_roots(root):
+        for run_id, run_dir in _uuid_dirs(base / TOOL_RESULTS_DIR):
+            try:
+                newest = _newest_mtime(run_dir)
+            except OSError:
+                continue
+            yield ToolResultDir(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                run_id=run_id,
+                path=run_dir,
+                newest_mtime=newest,
+                agent_key=agent_key,
+            )
 
 
 __all__ = [
     "DELETED_DIR",
     "THREADS_DIR",
     "ThreadDir",
+    "ToolResultDir",
     "UnsafeWorkspacePathError",
     "deleted_marker",
     "iter_thread_dirs",
+    "iter_tool_result_dirs",
     "remove_thread_dir",
+    "remove_tool_result_dir",
     "unlink_registered_file",
     "user_root",
     "validate_workspace_root",

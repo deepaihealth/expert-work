@@ -40,7 +40,11 @@ from control_plane.api._user_scope import (
     resolve_caller_user_id,
     thread_list_filter,
 )
-from control_plane.api._workspace_shared import _safe_workspace_relpath
+from control_plane.api._workspace_shared import (
+    _safe_workspace_relpath,
+    thread_agent_key,
+    workspace_agent_path,
+)
 from control_plane.audit import emit
 from control_plane.quota.base import QuotaService
 from control_plane.runtime import AgentRuntime
@@ -52,6 +56,7 @@ from control_plane.tenant_scope import (
     ensure_tenant_scope,
 )
 from expert_work.common.observability import current_trace_id_hex
+from expert_work.persistence import WORKSPACE_AGENTS_DIR
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.artifact import ArtifactStore
@@ -76,6 +81,7 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
+from orchestrator.tools.overflow import OVERFLOW_DIR
 
 logger = logging.getLogger("expert_work.control_plane.sessions")
 
@@ -569,8 +575,12 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
+            # B-50 —— 会话内的 path 相对**这个会话所属 agent 的**工作区根,
+            # 与沙箱里文件工具看到的路径一致。不投影的话搬迁后立刻 404。
             data = await workspace_store.read_file(
-                tenant_id=target_tenant, user_id=meta.user_id, path=safe_path
+                tenant_id=target_tenant,
+                user_id=meta.user_id,
+                path=workspace_agent_path(safe_path, agent_key=thread_agent_key(meta)),
             )
         except WorkspacePermissionError as exc:
             # 权限失败是服务端配置问题,不是"这个文件不存在"——404 的语义是
@@ -637,8 +647,12 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="file not found")
         try:
+            # 同上 —— 不投影的话删的是用户根下的同名文件(多半不存在,于是
+            # 静默变成 no-op:界面显示删成功,文件还在)。
             await workspace_store.delete_file(
-                tenant_id=tenant_id, user_id=meta.user_id, path=safe_path
+                tenant_id=tenant_id,
+                user_id=meta.user_id,
+                path=workspace_agent_path(safe_path, agent_key=thread_agent_key(meta)),
             )
         except WorkspacePermissionError as exc:
             # 同上——权限失败不是"这个文件不存在",必须排在 SandboxSupervisorError
@@ -1027,6 +1041,16 @@ def build_sessions_router() -> APIRouter:
                 deleted["checkpoint"] = True
             except Exception:
                 logger.warning("session_purge.checkpoint_failed", exc_info=True)
+        # run id 必须在删行之前拿 —— 删完就问不出来了,而
+        # ``.tool_results/<run_id>/`` 的清理要按 id 拼路径(见下方工作区那段)。
+        try:
+            purged_run_ids = [
+                r.run_id
+                for r in await runtime.run_manager.list_by_thread(thread_id, tenant_id=tenant_id)
+            ]
+        except Exception:
+            logger.warning("session_purge.run_listing_failed", exc_info=True)
+            purged_run_ids = []
         try:
             deleted["runs"] = await runtime.run_manager.delete_by_thread(
                 thread_id, tenant_id=tenant_id
@@ -1051,15 +1075,30 @@ def build_sessions_router() -> APIRouter:
         # strand the directory. No ``user_id`` (pre-J.14 thread) → no
         # workspace to clean.
         if meta.user_id is not None and workspace_store is not None:
-            try:
-                await workspace_store.delete_tree(
-                    tenant_id=tenant_id,
-                    user_id=meta.user_id,
-                    path=thread_projection_prefix(thread_id).rstrip("/"),
-                )
-                deleted["threads_dir"] = True
-            except Exception:
-                logger.warning("session_purge.threads_dir_failed", exc_info=True)
+            # B-50 —— 投影目录搬到了 ``agents/<agent_key>/threads/<id>/``(PR3
+            # 之后的写都落那儿),但搬迁前的存量还在用户根。**两处都删**:
+            # 只删一处的话另一处留成孤儿,而且这里什么都不会报错 —— 它在
+            # ``delete_tree`` 眼里就是「本来就没有」。
+            #
+            # ``.tool_results/<run_id>/`` 同理(spec §4.2 把它纳入同一套生命
+            # 周期)。run 行马上就要被上面的 ``delete_by_thread`` 删掉,所以
+            # 必须**在那之前**把 id 拿到手,否则孤儿扫描要等一天宽限期才兜得住。
+            agent_key = _session_agent_key(meta)
+            prefixes = [thread_projection_prefix(thread_id).rstrip("/")]
+            prefixes += [f"{OVERFLOW_DIR}/{run_id}" for run_id in purged_run_ids]
+            roots = ["", f"{WORKSPACE_AGENTS_DIR}/{agent_key}/"] if agent_key else [""]
+            failed = False
+            for root in roots:
+                for prefix in prefixes:
+                    try:
+                        await workspace_store.delete_tree(
+                            tenant_id=tenant_id, user_id=meta.user_id, path=f"{root}{prefix}"
+                        )
+                    except Exception:
+                        logger.warning("session_purge.threads_dir_failed", exc_info=True)
+                        failed = True
+            deleted["threads_dir"] = not failed
+            if failed:
                 deleted["threads_dir_delete_failed"] = True
         await emit(
             audit,

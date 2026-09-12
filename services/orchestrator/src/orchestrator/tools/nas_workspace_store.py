@@ -159,7 +159,10 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from expert_work.persistence import is_reserved_workspace_path
+from expert_work.persistence import (
+    is_delete_protected_workspace_path,
+    is_reserved_workspace_path,
+)
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
     WorkspaceFileTooLargeError,
@@ -787,7 +790,7 @@ class NasWorkspaceStore:
             # "./uploads/a.txt" used to slip past this check and delete
             # exactly the file the check exists to protect.
             relpath, _parts = _normalize_workspace_path(path)
-            if is_reserved_workspace_path(relpath):
+            if is_delete_protected_workspace_path(relpath):
                 raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be deleted")
             try:
                 dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=False)
@@ -827,7 +830,7 @@ class NasWorkspaceStore:
 
         def _rmtree() -> None:
             relpath, _parts = _normalize_workspace_path(path)
-            if is_reserved_workspace_path(relpath):
+            if is_delete_protected_workspace_path(relpath):
                 raise SandboxSupervisorError(f"path {path!r} is reserved and cannot be deleted")
             try:
                 dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=False)

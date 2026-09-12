@@ -65,8 +65,12 @@ from expert_work.protocol import (
     AuditResult,
 )
 from expert_work.runtime.audit import AuditLogger
+from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.storage import ObjectStore
-from retention_cleanup_job.orphan_threads import sweep_orphan_thread_dirs
+from retention_cleanup_job.orphan_threads import (
+    sweep_orphan_thread_dirs,
+    sweep_orphan_tool_results,
+)
 from retention_cleanup_job.report import CleanupReport
 from retention_cleanup_job.workspace_files import (
     UnsafeWorkspacePathError,
@@ -135,6 +139,7 @@ class RetentionCleanupJob:
         user_upload_store: UserUploadStore | None = None,
         upload_retention_days: int = 90,
         thread_store: ThreadMetaStore | None = None,
+        run_store: RunStore | None = None,
         workspace_root: str | None = None,
         audit_logger: AuditLogger | None = None,
     ) -> None:
@@ -183,6 +188,7 @@ class RetentionCleanupJob:
         self._user_upload_store = user_upload_store
         self._upload_retention_days = upload_retention_days
         self._thread_store = thread_store
+        self._run_store = run_store
         self._workspace_root = workspace_root
         self._audit_logger = audit_logger
 
@@ -220,6 +226,7 @@ class RetentionCleanupJob:
             artifact_soft, artifact_hard = await self._sweep_artifacts()
             uploads_expired, upload_files_removed = await self._sweep_uploads()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
+            tool_result_dirs_removed = await self._sweep_orphan_tool_results()
             memory_hard_deleted = await self._sweep_memory()
             tenant_users_hard_deleted = await self._sweep_tenant_users()
             workspaces_hard_deleted, workspaces_pending_archive = await self._sweep_workspaces()
@@ -241,6 +248,7 @@ class RetentionCleanupJob:
             uploads_expired=uploads_expired,
             upload_files_removed=upload_files_removed,
             thread_dirs_removed=thread_dirs_removed,
+            tool_result_dirs_removed=tool_result_dirs_removed,
             memory_hard_deleted=memory_hard_deleted,
             workspaces_hard_deleted=workspaces_hard_deleted,
             workspaces_pending_archive=workspaces_pending_archive,
@@ -536,6 +544,14 @@ class RetentionCleanupJob:
         if self._thread_store is None or self._workspace_root is None:
             return 0
         return await sweep_orphan_thread_dirs(self._workspace_root, self._thread_store)
+
+    async def _sweep_orphan_tool_results(self) -> int:
+        """B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/`` 目录;规则本体在
+        :func:`retention_cleanup_job.orphan_threads.sweep_orphan_tool_results`。
+        No-op when :class:`RunStore` or ``workspace_root`` is missing."""
+        if self._run_store is None or self._workspace_root is None:
+            return 0
+        return await sweep_orphan_tool_results(self._workspace_root, self._run_store)
 
     async def _unlink(self, version: ArtifactVersion) -> bool | None:
         """Unlink one registered artifact file. ``True`` removed, ``False`` was

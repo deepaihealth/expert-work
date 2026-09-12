@@ -26,6 +26,7 @@ from expert_work.common.egress_token import mint_egress_token
 from expert_work.common.observability import expert_work_histogram
 from expert_work.persistence import (
     UserWorkspaceStore,
+    is_delete_protected_workspace_path,
     is_reserved_workspace_path,
     workspace_volume_name,
 )
@@ -653,7 +654,7 @@ class SandboxSupervisor:
         / reserved path and :class:`SupervisorError` on a delete failure.
         """
         safe_path = _validate_workspace_path(path)
-        if is_reserved_workspace_path(safe_path):
+        if is_delete_protected_workspace_path(safe_path):
             raise WorkspaceFileNotFoundError(f"path {path!r} is reserved and cannot be deleted")
         volume = workspace_volume_name(tenant_id, user_id)
         try:

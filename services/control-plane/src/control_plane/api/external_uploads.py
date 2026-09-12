@@ -57,8 +57,10 @@ from control_plane.api._external import (
     lookup_external_user_id,
     reject_nul_path_params,
 )
+from control_plane.api._external_agent_scope import agent_key_for_code
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
+from control_plane.api._workspace_shared import thread_agent_key, workspace_agent_path
 from control_plane.api.agents import _resolve_session, _SessionError
 from control_plane.api.uploads import (
     _handle_document_upload,
@@ -300,6 +302,12 @@ def build_external_uploads_router() -> APIRouter:
                     tenant_id=tenant_id,
                     caller_user_id=end_user_id,
                     thread_id=thread_id,
+                    # 用 ``agent_code`` 算,不用 ``meta`` —— 上面两个分支里
+                    # 只有一个绑了 ``meta``(``session_id is None`` 那支是新建
+                    # 会话,压根没有)。两者在这里必然相等:``agent_code`` 就是
+                    # ``spec.metadata.name``,也就是新会话写进 ``agent_name``
+                    # 的值;另一支 ``load_owned_session`` 已经断言过相等。
+                    agent_key=agent_key_for_code(agent_code),
                     settings=settings,
                     workspace_store=workspace_store,
                     audit=audit,
@@ -454,8 +462,14 @@ def build_external_uploads_router() -> APIRouter:
                     "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 503
                 )
             try:
+                # ``row.ref`` 是 agent 相对的 ``uploads/<name>``(它同时是回给
+                # 对接方的 ``upload_id``,**不能**改成带前缀的值:
+                # ``is_safe_document_upload_id`` 要求 ``uploads/`` 开头,而且
+                # 他们缓存过的 id 会全废)。投影只发生在调 store 这一刻。
                 data = await workspace_store.read_file(
-                    tenant_id=tenant_id, user_id=end_user_id, path=row.ref
+                    tenant_id=tenant_id,
+                    user_id=end_user_id,
+                    path=workspace_agent_path(row.ref, agent_key=thread_agent_key(owning_thread)),
                 )
             except WorkspacePermissionError:
                 # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」

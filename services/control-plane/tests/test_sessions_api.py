@@ -343,14 +343,22 @@ async def test_workspace_files_and_download_with_supervisor(
         assert deleted.status_code == 200
         assert deleted.json()["data"]["deleted"] == "report.pdf"
         store = app.state.workspace_store
-        assert [d[2] for d in store.workspace_deletes] == ["report.pdf"]
+        # B-50 —— 会话内的 path 相对**这个会话所属 agent 的**根,调
+        # workspace_store 时补上前缀(那个 store 按 (tenant, user) 开,不知道
+        # agent)。不投影的话删的是用户根下的同名文件,多半不存在,于是静默
+        # 变成 no-op:界面显示删成功,文件还在。
+        meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+        agent_key = sanitize_agent_key(meta.agent_name or "")
+        assert agent_key, "会话必须绑着 agent,否则这条验的是退化路径"
+        assert [d[2] for d in store.workspace_deletes] == [f"agents/{agent_key}/report.pdf"]
 
         # A traversal path is rejected before reaching the supervisor.
         bad = await client.request(
             "DELETE", f"/v1/sessions/{thread_id}/workspace/file", params={"path": "../etc/passwd"}
         )
         assert bad.status_code == 400
-        assert [d[2] for d in store.workspace_deletes] == ["report.pdf"]
+        # 仍然只有上面那一次删除 —— 校验发生在投影之前,`..` 根本没到 store。
+        assert [d[2] for d in store.workspace_deletes] == [f"agents/{agent_key}/report.pdf"]
 
 
 # ---------------------------------------------------------------------------
@@ -1364,8 +1372,15 @@ async def test_session_detail_tenant_id_star_400(
 async def test_purge_deletes_the_thread_projection_dir(
     session_client: AsyncClient, audit_store: InMemoryAuditLogStore
 ) -> None:
-    """Purge asks the workspace file store to rm -rf exactly ``threads/<thread_id>``
-    for the thread's owner — nothing else in the (user-shared) workspace."""
+    """Purge rm -rf's the thread's projection dir in **both** possible locations.
+
+    B-50: PR3 moved the projection write to ``agents/<agent_key>/threads/<id>/``,
+    but pre-migration trees still hold it at the user root. Deleting only one
+    strands the other as an orphan — and nothing reports it: to ``delete_tree``
+    a path that was never there is indistinguishable from one it just removed.
+
+    Everything else in the (user-shared) workspace stays untouched.
+    """
     tid = await _create(session_client)
     app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
     store = RecordingWorkspaceStore()
@@ -1377,7 +1392,12 @@ async def test_purge_deletes_the_thread_projection_dir(
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["threads_dir"] is True
 
-    assert store.workspace_tree_deletes == [(_DEFAULT_TENANT, meta.user_id, f"threads/{tid}")]
+    agent_key = sanitize_agent_key(meta.agent_name or "")
+    assert agent_key, "会话必须绑着 agent,否则这条用例验的是退化路径"
+    assert store.workspace_tree_deletes == [
+        (_DEFAULT_TENANT, meta.user_id, f"threads/{tid}"),
+        (_DEFAULT_TENANT, meta.user_id, f"agents/{agent_key}/threads/{tid}"),
+    ]
     assert store.workspace_deletes == []  # no single-file deletes, no mark_deleted
     assert store.workspace_deletions == []
     page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))

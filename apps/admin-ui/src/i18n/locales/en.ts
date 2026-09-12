@@ -333,6 +333,8 @@ export interface TranslationKeys {
     workspace_none: string;
     workspace_files: string;
     workspace_files_empty: string;
+    workspace_group_agent: string;
+    workspace_group_shared: string;
     download: string;
     delete: string;
     delete_confirm: string;
@@ -3512,6 +3514,8 @@ const en: TranslationKeys = {
     workspace_none: "No workspace for this user yet.",
     workspace_files: "Files",
     workspace_files_empty: "No files.",
+    workspace_group_agent: "Agent",
+    workspace_group_shared: "Legacy, owner unknown",
     download: "Download",
     delete: "Delete",
     delete_confirm: "Delete {{name}}?",

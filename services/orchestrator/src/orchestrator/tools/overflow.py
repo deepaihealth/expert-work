@@ -19,6 +19,8 @@ import os
 import re
 from uuid import UUID
 
+from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
+
 #: ``EXPERT_WORK_TOOL_OUTPUT_BUDGET`` falsey values (mirrors ``run_retry._FALSEY``).
 _BUDGET_ENV = "EXPERT_WORK_TOOL_OUTPUT_BUDGET"
 _FALSEY = frozenset({"0", "false", "no", "off"})
@@ -41,10 +43,22 @@ def tool_output_budget_enabled() -> bool:
     return raw.strip().lower() not in _FALSEY
 
 
-#: Workspace-relative directory all overflow files live under. Lifecycle
-#: is owned by the existing workspace retention machinery (J.15 daily
-#: backup / 90-day archive) — no bespoke cleanup (Mini-ADR CM-F6).
-OVERFLOW_DIR = ".tool_results"
+#: Workspace-relative directory all overflow files live under, one
+#: ``<run_id>/`` per run.
+#:
+#: **勘误(B-50 spec §4.2)。** 这里原本写的是「生命周期由既有工作区留存机制
+#: 负责(J.15 日备 / 90 天归档),不需要专门的清理」—— 那句话是假的,而且假了
+#: 很久:留存 job 的不变式恰恰是「根目录其它文件永不触碰」,它只删**登记过**
+#: 的产物/上传和孤儿 ``threads/<id>/``,而这个目录没有任何登记行;它引的
+#: 「90 天归档」归的是**已软删工作区**整棵树,不是活着工作区里的目录。
+#: 实测单个用户堆了 40 个 run 目录,一次没被清过。
+#:
+#: 真正的清理从 B-50 Task 12 起才存在:会话 purge 连带删 + 留存 job 每日
+#: 孤儿扫描(``agent_run`` 行不在 + 超过宽限期),与 ``threads/<id>/`` 同一套。
+#: 别名,不是第二份定义 —— 真源在 ``expert_work.persistence`` 的
+#: ``workspace/layout.py``(浏览面的保留段过滤、留存 job 的孤儿扫描都从那儿
+#: 取,两边都够不着 orchestrator)。
+OVERFLOW_DIR = WORKSPACE_OVERFLOW_DIR
 
 #: Opening tag of the expert-work-owned reference footer appended after an
 #: externalized result (see :func:`render_overflow_footer`). The footer is
