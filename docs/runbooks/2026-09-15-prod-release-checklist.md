@@ -18,7 +18,7 @@
 migrate Job = `alembic upgrade head`）→ rollout + smoke**。
 
 它**不做**的事每一版都不一样，而那些事恰恰是漏了最疼的。本版清点结果见 §2 ——
-清点方法写在 [`production-release.md` §2](./production-release.md) 顶部，下次照做。
+清点方法在 [`production-release.md` §2.0](./production-release.md),下次照做。
 
 ---
 
