@@ -1269,3 +1269,42 @@ async def test_artifact_invalid_scope_is_422(external_client, two_agents) -> Non
         f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID, "scope": "tenant"}
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_pushes_the_agent_filter_down_to_the_store(
+    external_client, two_agents, _ctx: _Ctx, monkeypatch
+) -> None:
+    """``scope=agent`` 必须在 **store 层**就按 agent 过滤,不是查全量再用 Python 筛。
+
+    为什么单列一条:出口那句 ``if a.agent_key in by_key`` 是 ``scope=user`` 分支
+    需要的(丢掉反查不到 code 的行),它顺手也把 ``scope=agent`` 兜住了 —— 于是
+    把 ``list_for_user(agent_key=key)`` 改成 ``agent_key=None``,**响应完全不变,
+    全部用例照绿**(变异自证当场逮到的)。响应看不出来,就只能看调用参数。
+
+    这不只是效率问题:``agent_key=None`` 是 ``test_artifact_agent_scope_callers``
+    那张登记表盯着的逃生口,默认路径悄悄退回到它,等于把一条「入口就能看见全部」
+    的路径留在那儿,而登记表以为它已经关了。
+    """
+    calls: list[str | None] = []
+    original = _ctx.artifact_store.list_for_user
+
+    async def _spy(*, tenant_id, user_id, agent_key):  # type: ignore[no-untyped-def]
+        calls.append(agent_key)
+        return await original(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+
+    monkeypatch.setattr(_ctx.artifact_store, "list_for_user", _spy)
+
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID}
+    )
+    assert resp.status_code == 200
+    assert calls == [_KEY_A]
+
+    calls.clear()
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID, "scope": "user"}
+    )
+    assert resp.status_code == 200
+    # 并集分支才允许不过滤 —— 登记表里登记的就是这一条。
+    assert calls == [None]

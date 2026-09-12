@@ -48,11 +48,17 @@ _ALLOWED_UNFILTERED: dict[str, str] = {
     "control-plane/api/artifacts.py::list_artifacts": "控制台跨 agent 全量列表",
     "control-plane/api/artifacts.py::download_artifact": "回取父行判 MIME,身份已由 id 定死",
     "control-plane/api/workspace.py::get_workspace": "控制台工作区面板跨 agent 全量列表",
-    # 对外端点:按 agent 收口是 PR4 的**对外行为变更**,要提前告知对接方。
-    # PR4 落地时这四条从本表删除。
-    "control-plane/api/external_artifacts.py::list_artifacts": "迁移期,PR4 收口",
-    "control-plane/api/external_artifacts.py::download_artifact": "迁移期,PR4 收口",
-    "control-plane/api/external_artifacts.py::delete_artifact": "迁移期,PR4 收口",
+    # 对外端点 —— PR4 已收口。``download_artifact`` / ``delete_artifact`` 从本表
+    # **删除**:它们现在无条件按 URL 里那个 ``agent_code`` 算出的 key 过滤,
+    # 没有不过滤的分支。
+    #
+    # ``list_artifacts`` 留着,但理由换了:不再是「迁移期还没收口」,而是
+    # ``?scope=user`` 那条并集分支 —— 对接方一个 app 编排两个 agent、服务同一批
+    # 终端用户,他们点名要一次拿到某员工的全部产物。那条分支查全量之后**按反查
+    # 表逐条贴 ``agent_code`` 并丢掉贴不上的**(agent 已删 → 第三方没有可用的
+    # code 去下载它),所以「不过滤」在这里是入口宽、出口仍然逐条有归属。
+    # 默认的 ``scope=agent`` 分支传的是算出来的 key,不走这条。
+    "control-plane/api/external_artifacts.py::list_artifacts": "?scope=user 并集入口,出口逐条贴 agent_code 并丢弃贴不上的",
 }
 
 
