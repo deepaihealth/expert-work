@@ -94,6 +94,16 @@ class ExecRequest(BaseModel):
     #: no override, pre-feature behaviour. Not a general escape hatch: the
     #: orchestrator is the only caller and only ever sends this one key.
     envs: dict[str, str] = Field(default_factory=dict)
+    #: B-50 —— working directory for this one exec. The container's own
+    #: ``--workdir`` is set once at creation, but a warm sandbox is reused
+    #: across every agent of one ``(tenant, user)``, so the per-agent
+    #: directory has to travel with the call. Same shape the hosted sandboxes
+    #: expose (E2B / Daytona ``cwd``, OpenAI's per-command ``cwd``).
+    #: ``None`` → the runner's own cwd (pre-feature behaviour), which is what
+    #: an older orchestrator that never sends the field keeps getting.
+    #: It selects where relative paths resolve, **not** what the exec may
+    #: reach — confinement lives in the file tools (spec §5.3).
+    cwd: str | None = None
 
 
 class ExecResponse(BaseModel):

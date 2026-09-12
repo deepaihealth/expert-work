@@ -237,3 +237,71 @@ def test_child_processes_inherit_the_owner_only_umask(tmp_path: Path) -> None:
         assert leaf_mode == 0o600, f"file mode {oct(leaf_mode)} — umask was not inherited"
     finally:
         os.umask(saved)
+
+
+# ---------------------------------------------------------------------------
+# B-50 PR3b —— per-exec ``cwd``。
+#
+# 行业形状:E2B / Daytona / OpenAI 托管沙箱都把 ``cwd`` 做成**每次执行**的参数
+# (OpenAI:"Each command in setup_commands has its own optional cwd parameter")。
+# 我们的本地后端此前只有建容器时的 ``--workdir``,是 per-container —— 而热沙箱
+# 按 (tenant, user) 复用,一个容器里跑着这个用户所有 agent 的 exec,表达不了
+# per-agent。所以 ``cwd`` 走 exec 通道,与 ``envs`` 同一条路。
+#
+# ``cwd`` **不是隔离手段**,只决定相对路径从哪解析(OpenAI 的原话:"it does not
+# confine the run to cwd")。真边界是四个文件工具(spec §5.3)。
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_honours_cwd(tmp_path: Path) -> None:
+    target = tmp_path / "agents" / "plan-aaaaaaaa"
+    target.mkdir(parents=True)
+    out = runner.run_once("import os; print(os.getcwd())", 10, None, str(target))
+    assert out["exit_code"] == 0
+    assert out["stdout"].strip() == os.path.realpath(target)
+
+
+def test_run_once_without_cwd_keeps_the_runners_own(tmp_path: Path) -> None:
+    """不传 = 今天的行为一字不改(旧 orchestrator + 新镜像的偏斜方向)。"""
+    out = runner.run_once("import os; print(os.getcwd())", 10, None, None)
+    assert out["stdout"].strip() == os.getcwd()
+
+
+def test_run_once_creates_a_missing_cwd(tmp_path: Path) -> None:
+    """目录不存在就**建出来**,不是退回默认 cwd。
+
+    agent 目录在有人往里写之前根本不存在,而 ``acquire`` 建不了它 —— 温沙箱是
+    不带 agent 身份被认领的(池按 ``(tenant, user)`` 键),第一次 exec 才是最早
+    知道目录名的时刻。静默退回用户根 = 正是 B-50 要治的那个病,还没有信号。
+    """
+    target = tmp_path / "agents" / "plan-aaaaaaaa"
+    out = runner.run_once("import os; print(os.getcwd())", 10, None, str(target))
+
+    assert out["exit_code"] == 0
+    assert out["stdout"].strip() == os.path.realpath(target)
+    assert target.is_dir()
+
+
+def test_run_once_reports_a_cwd_it_cannot_create(tmp_path: Path) -> None:
+    """建不出来(路上挡着一个文件)要报错 —— 只有「不存在」才自动建。"""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    out = runner.run_once("print(1)", 10, None, str(blocker / "under"))
+
+    assert out["exit_code"] != 0
+    assert "cwd" in out["stderr"]
+
+
+def test_handle_request_passes_cwd_through(tmp_path: Path) -> None:
+    target = tmp_path / "w"
+    target.mkdir()
+    out = runner.handle_request(
+        {"code": "import os; print(os.getcwd())", "timeout_s": 10, "cwd": str(target)}
+    )
+    assert out["stdout"].strip() == os.path.realpath(target)
+
+
+def test_handle_request_rejects_non_string_cwd(tmp_path: Path) -> None:
+    """和 ``envs`` 同一个口径:类型不对就当没给,不要拿它去拼路径。"""
+    out = runner.handle_request({"code": "import os; print(os.getcwd())", "cwd": 42})
+    assert out["stdout"].strip() == os.getcwd()

@@ -102,6 +102,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -130,6 +131,7 @@ from orchestrator.tools.sandbox_image_contract import (
     WORKSPACE_ROOT,
 )
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
+from orchestrator.tools.workspace_paths import agent_workspace_root
 
 
 class WorkspaceQuotaGate(Protocol):
@@ -1465,8 +1467,32 @@ class AgentSandboxClient:
         envs = agent_key_envs(agent_key)
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
+            # B-50 —— 相对路径默认落自己的 agent 目录。取值与本地后端同一个
+            # 函数(``agent_workspace_root``),两边不可能漂;``agent_key`` 为空
+            # 时它返回 ``WORKSPACE_ROOT``,与改动前一字不差。
+            #
+            # ``mkdir -p`` + ``cd`` 而不是 ``cwd=`` 参数:agent 目录在有人往里写
+            # 之前不存在,而 ``cwd=`` 是**执行前**校验的 —— 目录还没建,exec 就
+            # 已经失败了,mkdir 塞不进这条命令里。``acquire`` 也补不上:温沙箱
+            # 是不带 agent 身份被认领的(池按 ``(tenant, user)`` 键)。本地后端
+            # 在 runner 里 ``os.makedirs`` 做同一件事 —— 机制不同、可观测结果
+            # 逐字一致,由 ``test_sandbox_runtime_contract.py`` 钉住。
+            #
+            # ``umask 077`` 必须排在 ``mkdir`` **前面**:它建出来的 agent 目录
+            # 也要落 ``0o700``。反过来写(先 mkdir)目录会拿到默认 umask 的
+            # ``0o755`` —— ``test_exec_sets_owner_only_umask_before_running_the_script``
+            # 正是钉这个顺序的。
+            agent_cwd = agent_workspace_root(agent_key)
+            # 未绑 agent 时 ``agent_cwd`` 就是 ``WORKSPACE_ROOT``,这段前缀是纯
+            # 噪音(而且 ``cwd=`` 已经把我们送到那儿了)—— 不加,让未绑路径的
+            # 命令串与改动前**逐字**一致。
+            enter = (
+                ""
+                if agent_cwd == WORKSPACE_ROOT
+                else (f"mkdir -p {shlex.quote(agent_cwd)} && cd {shlex.quote(agent_cwd)} && ")
+            )
             result = await sbx.commands.run(
-                f"umask 077 && python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
+                f"umask 077 && {enter}python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=WORKSPACE_ROOT,
