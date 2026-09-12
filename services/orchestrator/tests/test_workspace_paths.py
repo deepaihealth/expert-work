@@ -103,12 +103,16 @@ def test_layout_dirs_are_the_persistence_constants_not_a_second_copy() -> None:
     搬迁脚本、留存 job、控制台浏览面都够不着 orchestrator,它们从
     ``expert_work.persistence`` 拿这两个名字。如果本模块自己写一份字面量,
     有人把真源改成别的、沙箱仍去老名字下找,**没有任何功能测试会红** ——
-    文件明明搬过去了,agent 就是看不见。用 ``is`` 而不是 ``==``:相等只能
-    证明此刻碰巧一样,同一个对象才能证明它们是同一份定义(同 PR2 给
-    ``sanitize_agent_key`` 钉 ``reexported is`` 的先例)。
+    文件明明搬过去了,agent 就是看不见。
+
+    **用 ``==`` 而不是 ``is``。** PR2 给 ``sanitize_agent_key`` 钉的是
+    ``reexported is sanitize_agent_key``,那对函数成立;字符串不成立 ——
+    CPython 会 intern ``"agents"`` 这类标识符形状的短字面量,所以把右边换成
+    一份同值的第二字面量,``is`` 照样为真(已实测)。``is`` 在这里是摆设,
+    真正要咬住的是「两个名字对不上」,那正是 ``==`` 管的事。
     """
-    assert workspace_paths.AGENTS_DIR is WORKSPACE_AGENTS_DIR
-    assert workspace_paths._SHARED_DIR is WORKSPACE_SHARED_DIR
+    assert workspace_paths.AGENTS_DIR == WORKSPACE_AGENTS_DIR
+    assert workspace_paths._SHARED_DIR == WORKSPACE_SHARED_DIR
 
 
 def test_shared_prefix_always_names_the_shared_dir() -> None:

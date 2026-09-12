@@ -38,8 +38,8 @@ USER_ROOT = "/workspace"
 #: ``uploads`` 也在那儿),而搬迁脚本、留存 job、控制台浏览面都够不着
 #: orchestrator。两处各写各的字面量,搬迁把文件放进 ``agents/`` 而沙箱去
 #: ``agent/`` 找,不会有任何测试红。``test_workspace_paths.py`` 钉了
-#: ``AGENTS_DIR is WORKSPACE_AGENTS_DIR``(同 PR2 给 ``sanitize_agent_key``
-#: 钉 ``reexported is`` 的先例)。
+#: ``AGENTS_DIR == WORKSPACE_AGENTS_DIR``(用 ``==`` 不是 ``is`` —— 字符串
+#: 会被 intern,同值的第二份字面量 ``is`` 照样为真,那条判据是摆设)。
 AGENTS_DIR = WORKSPACE_AGENTS_DIR
 _SHARED_DIR = WORKSPACE_SHARED_DIR
 
