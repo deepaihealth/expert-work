@@ -1448,17 +1448,29 @@ def test_contract_fixture_accounts_for_every_mandated_env() -> None:
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_exec_cwd_is_agent_scoped(runtime: SandboxRuntime) -> None:
-    """绑了 agent 的 exec,相对路径从 ``/workspace/agents/<key>`` 解析。"""
+    """绑了 agent 的 exec,相对路径从 ``/workspace/agents/<key>`` 解析。
+
+    **比 ``(st_dev, st_ino)`` 不比路径字符串** —— 理由与
+    :func:`test_exec_cwd_is_workspace` 逐字相同:云后端的 ``/workspace`` 是平台
+    建的符号链接,指向 ``/run/csi/mount-root/nas/<hash>``,而 ``getcwd(2)`` 按
+    定义返回解析后的物理路径。那个 hash 由平台每次挂载现算,不是我们能承诺的
+    字符串。
+    """
     sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract")
     try:
         outcome = await runtime.exec(
             sandbox_id=sandbox_id,
-            code="import os; print(os.getcwd())",
+            code=(
+                "import os\n"
+                "here = os.stat('.')\n"
+                "want = os.stat('/workspace/agents/plan-aaaaaaaa')\n"
+                "print((here.st_dev, here.st_ino) == (want.st_dev, want.st_ino), os.getcwd())"
+            ),
             timeout_s=30,
             agent_key="plan-aaaaaaaa",
         )
         assert outcome.exit_code == 0, outcome.stderr
-        assert outcome.stdout.strip() == "/workspace/agents/plan-aaaaaaaa"
+        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
     finally:
         await runtime.release(sandbox_id=sandbox_id)
 
@@ -1468,17 +1480,24 @@ async def test_exec_cwd_is_agent_scoped(runtime: SandboxRuntime) -> None:
 async def test_exec_cwd_without_agent_key_stays_at_workspace_root(
     runtime: SandboxRuntime,
 ) -> None:
-    """未绑 agent = 改动前的行为,一字不差。"""
+    """未绑 agent = 改动前的行为,一字不差。
+
+    同上,比 inode 身份不比路径字符串。
+    """
     sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract-unbound")
     try:
         outcome = await runtime.exec(
             sandbox_id=sandbox_id,
-            code="import os; print(os.getcwd())",
+            code=(
+                "import os\n"
+                "here, ws = os.stat('.'), os.stat('/workspace')\n"
+                "print((here.st_dev, here.st_ino) == (ws.st_dev, ws.st_ino), os.getcwd())"
+            ),
             timeout_s=30,
             agent_key="",
         )
         assert outcome.exit_code == 0, outcome.stderr
-        assert outcome.stdout.strip() == "/workspace"
+        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
     finally:
         await runtime.release(sandbox_id=sandbox_id)
 
@@ -1490,18 +1509,26 @@ async def test_exec_cwd_is_created_when_missing(runtime: SandboxRuntime) -> None
 
     ``acquire`` 补不上这一步:温沙箱是**不带 agent 身份**被认领的(池按
     ``(tenant, user)`` 键,spec §三),第一次 exec 才是最早知道目录名的时刻。
+
+    同上,比 inode 身份不比路径字符串;``os.stat`` 取得到本身就是「目录建出来
+    了」的证据 —— 没建出来 ``mkdir -p && cd`` 这条前缀就先失败了,而退回用户根
+    的话这里会比出 ``False``。
     """
     key = f"fresh-{uuid4().hex[:8]}"
     sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract-fresh")
     try:
         outcome = await runtime.exec(
             sandbox_id=sandbox_id,
-            code="import os; print(os.path.isdir(os.getcwd()), os.getcwd())",
+            code=(
+                "import os\n"
+                f"here, want = os.stat('.'), os.stat('/workspace/agents/{key}')\n"
+                "print((here.st_dev, here.st_ino) == (want.st_dev, want.st_ino), os.getcwd())"
+            ),
             timeout_s=30,
             agent_key=key,
         )
         assert outcome.exit_code == 0, outcome.stderr
-        assert outcome.stdout.strip() == f"True /workspace/agents/{key}"
+        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
     finally:
         await runtime.release(sandbox_id=sandbox_id)
 
