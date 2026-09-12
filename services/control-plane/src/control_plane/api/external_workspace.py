@@ -8,10 +8,20 @@ agent 把产出物写进终端用户的持久工作区,第三方 app 得能列�
 nosniff / 路径校验 / 权限失败与不存在分开)全部复用,只把控制台的身份解析换成
 P1 的 ``_external`` 通路。
 
-工作区本身是 ``(tenant_id, user_id)`` 维度的,不按 agent 分——``agent_code``
-只是外部平面 URL 结构的一部分(与 ``/v1/agents/{agent_code}/sessions`` 等同款
-路径形状对齐),不参与过滤,和控制台侧 ``/v1/workspace/files``(压根没有
-agent_code)语义一致。
+工作区按 ``(tenant_id, user_id, agent)`` 分(B-50)。**这与本模块此前的
+说法相反** —— 原来写的是「工作区本身是 ``(tenant_id, user_id)`` 维度的,不按
+agent 分,``agent_code`` 不参与过滤」,那句话从 B-50 起不成立:同一用户的多个
+agent 此前在同一棵扁平树里互相读错写错,喂给模型的事实是错的。
+
+对外 ``path`` 相对**该 agent 的根**,不带 ``agents/<agent_key>/`` 前缀(投影见
+``_external_agent_scope``):对接方缓存过的 path 继续有效,带 sha256 后缀的内部
+``agent_key`` 也不漏给第三方。``shared/``(搬迁时反推不出归属的 legacy)与搬迁
+前的顶层扁平残留都**不对外投影** —— 第三方按 ``agent_code`` 提问,答案里混进
+「不知道谁的历史文件」没有意义,而那批正是归属不明的那批。
+
+与控制台侧的差异:控制台 ``/v1/workspace/files`` 看**全量**(Task 13 的浏览面
+按 agent 分组,``shared/`` 也看得见),对外只看本 agent —— 或 ``?scope=user``
+时看该终端用户全部 agent 的并集,条目带 ``agent_code`` 标明归属。
 
 下载端点的成功响应是文件字节流,不是 ``{success, data, error}`` 信封 ——
 信封只包裹错误响应(与「文件不是 JSON」这个事实本身冲突,业界惯例 + P2-a
@@ -35,14 +45,26 @@ from control_plane.api._external import (
     lookup_external_user_id,
     reject_nul_path_params,
 )
+from control_plane.api._external_agent_scope import (
+    ExternalScope,
+    agent_code_by_key,
+    agent_key_for_code,
+    external_storage_path,
+    storage_to_external,
+)
 from control_plane.api._user_scope import get_user_repo
-from control_plane.api._workspace_shared import _workspace_file_response, _workspace_files_payload
+from control_plane.api._workspace_shared import _workspace_file_response, list_workspace_entries
 from expert_work.persistence.tenant_user import TenantUserStore
+from expert_work.persistence.thread_meta import ThreadMetaStore
 from orchestrator.tools import WorkspaceStore
 
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return request.app.state.workspace_store  # type: ignore[no-any-return]
+
+
+def _get_thread_repo(request: Request) -> ThreadMetaStore:
+    return request.app.state.thread_meta_repo  # type: ignore[no-any-return]
 
 
 def build_external_workspace_router() -> APIRouter:
@@ -62,8 +84,10 @@ def build_external_workspace_router() -> APIRouter:
         agent_code: str,
         request: Request,
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
+        scope: Annotated[ExternalScope, Query()] = "agent",
     ) -> JSONResponse:
         """Browse the files in an end-user's persistent workspace volume.
 
@@ -73,8 +97,16 @@ def build_external_workspace_router() -> APIRouter:
         must not leave one ghost row per attempt. An unrecognized user simply
         has no files, so it returns an empty list, not 404 — same as
         ``GET .../sessions``.
+
+        Every entry carries ``agent_code`` (B-50 PR4). Under the default
+        ``scope=agent`` that is a constant echo of the path segment; under
+        ``scope=user`` it is the only way the caller can tell two same-named
+        files apart **and** the only way to download either, because the
+        download endpoint deliberately does not honour ``scope``. One
+        response shape for both scopes: a field that appears only sometimes
+        is harder to document and harder to consume than one that is always
+        there, and adding a field is backward-compatible.
         """
-        del agent_code  # workspace is (tenant, user)-scoped, not per-agent — see module docstring.
         tenant_id: UUID = request.state.tenant_id
         try:
             end_user_id = await lookup_external_user_id(
@@ -84,8 +116,17 @@ def build_external_workspace_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return JSONResponse({"success": True, "data": {"files": []}, "error": None})
+        if scope == "user":
+            # 反查表只在 scope=user 时才建 —— 默认路径不该为一个用不到的
+            # 映射多查一次库。
+            codes = await threads.list_agent_names_for_user(
+                tenant_id=tenant_id, user_id=end_user_id
+            )
+            by_key = agent_code_by_key(codes)
+        else:
+            by_key = {agent_key_for_code(agent_code): agent_code}
         try:
-            payload = await _workspace_files_payload(
+            entries = await list_workspace_entries(
                 workspace_store, tenant_id=tenant_id, user_id=end_user_id
             )
         except HTTPException as exc:
@@ -97,7 +138,14 @@ def build_external_workspace_router() -> APIRouter:
                     "error": {"code": "WORKSPACE_LIST_FAILED", "message": str(exc.detail)},
                 },
             )
-        return JSONResponse({"success": True, "data": payload, "error": None})
+        files: list[dict[str, object]] = []
+        for entry in entries:
+            for key, code in by_key.items():
+                external = storage_to_external(entry.path, agent_key=key)
+                if external is not None:
+                    files.append({"path": external, "size": entry.size, "agent_code": code})
+                    break
+        return JSONResponse({"success": True, "data": {"files": files}, "error": None})
 
     @router.get(
         "/{agent_code}/workspace/file",
@@ -133,11 +181,18 @@ def build_external_workspace_router() -> APIRouter:
         no-supervisor behind one opaque response — a third party must not be
         able to tell "that user doesn't exist" apart from "that user exists
         but has no such file" apart from "the sandbox supervisor isn't
-        configured". The success response is the raw file body, not the
-        ``{success, data, error}`` envelope (see module docstring); only the
-        error path renders that envelope.
+        configured". B-50 PR4 folds **cross-agent** into that same 404: ``path``
+        is resolved under this ``agent_code``'s own root, so another agent's
+        file is simply not there. The success response is the raw file body,
+        not the ``{success, data, error}`` envelope (see module docstring);
+        only the error path renders that envelope.
+
+        **No ``scope`` parameter here, on purpose.** The list endpoints take
+        one; letting a download take it would mean agent A's code fetches
+        agent B's bytes — exactly what this design exists to prevent. To
+        download another agent's file, use that agent's code; the
+        ``scope=user`` listing already names the owner.
         """
-        del agent_code  # workspace is (tenant, user)-scoped, not per-agent — see module docstring.
         tenant_id: UUID = request.state.tenant_id
         try:
             end_user_id = await lookup_external_user_id(
@@ -146,8 +201,11 @@ def build_external_workspace_router() -> APIRouter:
         except ExternalScopeError as exc:
             return external_error(exc)
         try:
+            # 校验 → 投影,顺序锁在 ``external_storage_path`` 里(反过来会让
+            # 「绝对路径拒」「空路径拒」两条判据被前缀掩盖,见那个函数)。
+            storage_path = external_storage_path(path, agent_key=agent_key_for_code(agent_code))
             return await _workspace_file_response(
-                workspace_store, tenant_id=tenant_id, user_id=end_user_id, path=path
+                workspace_store, tenant_id=tenant_id, user_id=end_user_id, path=storage_path
             )
         except HTTPException as exc:
             return JSONResponse(

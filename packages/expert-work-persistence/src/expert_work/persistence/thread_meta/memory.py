@@ -147,6 +147,18 @@ class InMemoryThreadMetaStore(ThreadMetaStore):
         )
         return rows[offset : offset + limit]
 
+    async def list_agent_names_for_user(self, *, tenant_id: UUID, user_id: UUID) -> list[str]:
+        # No status filter and no pagination — see the base class docstring for
+        # why both are deliberate (archived threads still own workspace files;
+        # a truncated result would be an undetectable subset).
+        return sorted(
+            {
+                row.agent_name
+                for row in self._rows.values()
+                if row.tenant_id == tenant_id and row.user_id == user_id and row.agent_name
+            }
+        )
+
     async def list_all_tenants(
         self,
         *,

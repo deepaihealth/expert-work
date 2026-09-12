@@ -458,13 +458,15 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_i
 
 工作区是每个终端用户的一块持久存储空间，Agent 执行 run 时把产出文件（报表、导出文件等）放在这里。本节的两个接口用来列出和下载这些文件。
 
-::: warning agent_code 不参与这两个接口的过滤
-工作区按租户与终端用户两个维度存储，不按 Agent 区分。路径里的 `{agent_code}` 只是为了与本组接口的其它路径保持相同形状，既不参与过滤，也不参与权限判定：同一个 `user_id` 配任意 `agent_code`（包括并不存在的 `agent_code`）取到的都是同一份文件列表，同样返回 200。
+工作区按租户、终端用户、Agent 三个维度存储。路径里的 `{agent_code}` 是真实的过滤维度：同一个 `user_id` 配不同的 `agent_code`，取到的是不同的文件列表。这与本组其它接口一致——会话列表、历史消息、事件接口、审批决策也都按 `agent_code` 过滤。
+
+::: warning 跨 Agent 的下载返回 404，与文件不存在无法区分
+用 A 的 `agent_code` 下载 B 产生的文件，返回的是 404 `WORKSPACE_FILE_FAILED`，与「这个文件不存在」完全相同。服务端刻意不区分这两种情况，所以客户端也无法从响应里分辨。
+
+排查时按这个顺序确认：文件当前归属哪个 `agent_code`（用 `scope=user` 列一次就能看到），再用那个 `agent_code` 去下载。
 :::
 
-这一点与本组其它接口不同：会话列表、历史消息、事件接口、审批决策都把 `agent_code` 当作真实的过滤或归属校验维度，工作区接口是唯一的例外。
-
-由此带来一个需要注意的后果：调用方如果为不同业务线注册了不同的 `agent_code`，而这些业务线复用同一批终端用户 `user_id`，那么一条业务线能看到另一条业务线在同一个 `user_id` 下产生的文件。**当前 API 不提供按 Agent 隔离工作区文件的能力。**
+`path` 的取值形态没有变化：列出文件返回的 `path` 相对该 Agent 自己的工作区根，不含 Agent 相关的前缀。客户端缓存过的 `path` 继续有效，下载时原样回传即可。
 
 ### 列出文件
 
@@ -479,6 +481,7 @@ GET /v1/agents/{agent_code}/workspace/files
 | 参数 | 必填 | 说明 |
 |---|---|---|
 | `user_id` | 是 | 要查看的终端用户，长度 1–255 字符 |
+| `scope` | 否 | string，取值：`agent`（默认，只列路径里这个 Agent 的文件）/ `user`（列这个终端用户名下全部 Agent 的文件）。传其它值返回 422 |
 
 这个接口不支持分页，一次返回全部文件（见本章开头的[分页](#分页)）。
 
@@ -488,8 +491,11 @@ GET /v1/agents/{agent_code}/workspace/files
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `path` | string | 文件在工作区里的相对路径，可能包含子目录。下载时原样回传给下载接口 |
+| `path` | string | 文件在这个 Agent 的工作区里的相对路径，可能包含子目录。下载时原样回传给下载接口 |
 | `size` | integer | 文件大小，单位是字节 |
+| `agent_code` | string | 这份文件归属的 Agent。`scope=agent` 时恒等于路径里的那个值 |
+
+`scope=user` 时，`path` 仍然相对各自 Agent 的工作区根，所以两个 Agent 可以有同名文件而不冲突，靠 `agent_code` 区分。下载时把这两个字段配成一对用：`agent_code` 放路径，`path` 放查询字符串。
 
 #### 示例
 
@@ -503,8 +509,28 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123
   "success": true,
   "data": {
     "files": [
-      { "path": "report.pdf", "size": 235112 },
-      { "path": "charts/q3.png", "size": 88213 }
+      { "path": "report.pdf", "size": 235112, "agent_code": "weekly-report" },
+      { "path": "charts/q3.png", "size": 88213, "agent_code": "weekly-report" }
+    ]
+  },
+  "error": null
+}
+```
+
+下面这个例子用 `scope=user` 列同一个终端用户名下两个 Agent 的文件。两份 `report.pdf` 同名而不冲突，因为它们在各自 Agent 的工作区根下。
+
+```bash [请求]
+curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123&scope=user" \
+  -H "Authorization: Bearer <key>"
+```
+
+```json [响应 200]
+{
+  "success": true,
+  "data": {
+    "files": [
+      { "path": "report.pdf", "size": 235112, "agent_code": "weekly-report" },
+      { "path": "report.pdf", "size": 41980, "agent_code": "sales-digest" }
     ]
   },
   "error": null
@@ -515,6 +541,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123
 
 - `user_id` 是这个租户从未出现过的值时返回空列表，不是 404。
 - 服务端的工作区存储配置有问题时返回 500 `WORKSPACE_LIST_FAILED`。重试无效，请联系租户管理员。
+- Agent 已经删除时，它名下的文件不出现在 `scope=user` 的列表里。这些文件没有可用的 `agent_code` 可以下载，列出来也取不回。
 
 ### 下载单个文件
 
@@ -576,12 +603,14 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
 
 避免这一类错误最直接的做法：**`path` 用列出文件接口返回的值原样回传，不要自己拼接字符串**。
 
+这个接口不接受 `scope` 参数。要取另一个 Agent 的文件，用那个 Agent 的 `agent_code` 请求——`scope=user` 的列表已经在 `agent_code` 字段里给出了归属。
+
 #### 错误
 
 | 状态码 | 错误码 | 触发条件 |
 |---|---|---|
 | 400 | `WORKSPACE_FILE_FAILED` | `path` 不合法，见上文「path 的合法形态」 |
-| 404 | `WORKSPACE_FILE_FAILED` | `user_id` 不存在，或者 `path` 指向的文件不存在。两种情况返回同一个 404，服务端刻意不区分 |
+| 404 | `WORKSPACE_FILE_FAILED` | `user_id` 不存在、`path` 指向的文件不存在，或者这份文件归属另一个 Agent。三种情况返回同一个 404，服务端刻意不区分 |
 | 500 | `WORKSPACE_FILE_FAILED` | 服务端的工作区存储配置有问题。重试无效，请联系租户管理员 |
 
 三种情况的 `error.code` 是同一个字符串，只能靠 HTTP 状态码区分：
@@ -607,7 +636,15 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/file?user_id=u-123&
 发生」。** 需要覆盖这种情形时，在 `artifacts` 为空的 run 上补查一次工作区文件。
 :::
 
-与 [5.6 工作区文件](#_5-6-工作区文件) 一样，这三个接口的 `agent_code` 不参与过滤：产物也按租户与终端用户两个维度存储。
+与 [5.6 工作区文件](#_5-6-工作区文件) 一样，产物按租户、终端用户、Agent 三个维度存储，路径里的 `agent_code` 是真实的过滤维度。
+
+::: warning 跨 Agent 的下载与删除返回 404，与产物不存在无法区分
+用 A 的 `agent_code` 下载或删除 B 登记的产物，返回的是 404 `ARTIFACT_NOT_FOUND`，与「这个名字不存在」完全相同。服务端刻意不区分这两种情况。
+
+删除接口在这种情况下不会删掉任何东西——返回 404 的同时，B 的那条产物原样保留。
+:::
+
+同一个终端用户名下，两个 Agent 可以各自登记同名产物（例如各有一份 `2026-08 周报.docx`），互不覆盖。用哪个 `agent_code` 请求，取到的就是哪个 Agent 的那一份。
 
 ### 列出产物
 
@@ -622,6 +659,7 @@ GET /v1/agents/{agent_code}/artifacts
 | 参数 | 必填 | 说明 |
 |---|---|---|
 | `user_id` | 是 | 要查看的终端用户，长度 1–255 字符 |
+| `scope` | 否 | string，取值：`agent`（默认，只列路径里这个 Agent 的产物）/ `user`（列这个终端用户名下全部 Agent 的产物）。传其它值返回 422 |
 
 这个接口不支持分页，一次返回全部产物（见本章开头的[分页](#分页)）。
 
@@ -631,11 +669,14 @@ GET /v1/agents/{agent_code}/artifacts
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `name` | string | 产物名，在同一个终端用户下唯一。下载和删除都用这个值 |
+| `name` | string | 产物名，在同一个终端用户的同一个 Agent 下唯一。下载和删除都用这个值 |
 | `kind` | string | 产物类别，由 Agent 保存时声明。取值：`document`（文稿或报表）/ `code`（源码）/ `data`（数据文件）/ `other`（其它） |
+| `agent_code` | string | 这条产物归属的 Agent。`scope=agent` 时恒等于路径里的那个值 |
 | `latest_version` | integer | 版本号。Agent 每用同一个 `name` 保存一次就加 1 |
 | `created_at` | string（ISO 8601） | 首次创建时间 |
 | `updated_at` | string（ISO 8601） | 最近一次更新时间 |
+
+`scope=user` 时同一个 `name` 可能出现多条，分属不同 Agent。下载和删除都不接受 `scope`，所以要取其中一条，把 `agent_code` 放进路径再请求。
 
 服务端不校验 `kind`，对外也没有修改它的接口。客户端解析时遇到上述四个取值之外的内容，按 `other` 处理。
 
@@ -658,6 +699,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
       {
         "name": "2026-08 周报.docx",
         "kind": "document",
+        "agent_code": "weekly-report",
         "latest_version": 3,
         "created_at": "2026-08-12T10:00:00+00:00",
         "updated_at": "2026-08-14T09:30:00+00:00"
@@ -671,6 +713,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
 #### 其它规则
 
 - `user_id` 是这个租户从未出现过的值时返回空列表，不是 404。
+- Agent 已经删除时，它名下的产物不出现在 `scope=user` 的列表里。这些产物没有可用的 `agent_code` 可以下载，列出来也取不回。
 
 ### 下载产物
 
@@ -706,7 +749,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts/download?user_id=u-
 
 | 状态码 | 错误码 | 触发条件 |
 |---|---|---|
-| 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除，或者不属于这个 `user_id`，三种情况不区分。服务端读取产物记录时的瞬时故障也落到这个 404，所以它不完全等价于「这份产物不存在」 |
+| 404 | `ARTIFACT_NOT_FOUND` | 产物不存在、已删除、不属于这个 `user_id`，或者归属另一个 Agent，四种情况不区分。服务端读取产物记录时的瞬时故障也落到这个 404，所以它不完全等价于「这份产物不存在」 |
 | 409 | `ARTIFACT_VERSION_MISMATCH` | 请求带了 `version` 且与服务端最新版本不一致。`message` 里给出服务端当前的版本号。重试无效——要么改用最新版重新下载，要么按业务异常处理 |
 | 413 | `ARTIFACT_TOO_LARGE` | 产物文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了。重试无效 |
 | 422 | `INVALID_ARTIFACT_NAME` | `name` 含 NUL 字节 |
@@ -731,7 +774,7 @@ DELETE /v1/agents/{agent_code}/artifacts
 | `user_id` | 是 | 产物所属的终端用户，长度 1–255 字符 |
 | `name` | 是 | 要删除的产物名，最长 512 字符。含 NUL 字节时返回 422 `INVALID_ARTIFACT_NAME` |
 
-成功时返回 200，`data.deleted` 是被删除的那个产物名。
+成功时返回 200，`data.deleted` 是被删除的那个产物名。名字归属另一个 Agent 时返回 404 `ARTIFACT_NOT_FOUND`，那条产物原样保留。
 
 #### 示例
 

@@ -134,6 +134,32 @@ class ThreadMetaStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def list_agent_names_for_user(self, *, tenant_id: UUID, user_id: UUID) -> list[str]:
+        """Distinct agent names this user has run, sorted — B-50 PR4.
+
+        ``sanitize_agent_key`` appends a sha256 digest, so it is one-way: the
+        external plane cannot turn a workspace ``agents/<agent_key>/`` segment
+        (or an ``artifact`` row's ``agent_key``) back into the ``agent_code``
+        a third party is allowed to see. This is the reverse lookup, and its
+        domain is deliberately "agents this user actually ran" — precisely the
+        set whose keys can appear in that user's tree.
+
+        Why not reuse :meth:`list_by_tenant` with ``user_id=``: it paginates
+        (default 100) and its unit is threads, so a user with more threads
+        than one page silently loses the agents that only appear later —
+        the result would be a *subset* with no way for the caller to tell.
+        Why not the agent catalog (``list_distinct_active_by_tenant``): that
+        is ACTIVE-only, while ``agents._resolve_session`` runs an agent
+        regardless of status, so a still-running non-ACTIVE agent's files
+        would drop out entirely.
+
+        Archived threads are **included**: archiving a session does not remove
+        what that agent wrote into the workspace, and excluding them (which is
+        ``list_by_tenant``'s default) would make those files unattributable.
+        Threads with no ``agent_name`` contribute nothing — no ``None`` entry.
+        """
+
+    @abc.abstractmethod
     async def list_all_tenants(
         self,
         *,

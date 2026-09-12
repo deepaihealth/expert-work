@@ -192,6 +192,26 @@ class SqlThreadMetaStore(ThreadMetaStore):
             offset=offset,
         )
 
+    async def list_agent_names_for_user(self, *, tenant_id: UUID, user_id: UUID) -> list[str]:
+        # No status filter and no pagination — see the base class docstring for
+        # why both are deliberate. ``agent_name`` is nullable, so NULL rows are
+        # excluded in SQL rather than filtered out afterwards (a NULL would
+        # otherwise sort into the result as a bogus entry).
+        stmt = (
+            select(ThreadMetaRow.agent_name)
+            .where(
+                ThreadMetaRow.tenant_id == tenant_id,
+                ThreadMetaRow.user_id == user_id,
+                ThreadMetaRow.agent_name.is_not(None),
+                ThreadMetaRow.agent_name != "",
+            )
+            .distinct()
+            .order_by(ThreadMetaRow.agent_name)
+        )
+        async with self._sf() as session:
+            rows = await session.execute(stmt)
+            return [name for name in rows.scalars().all() if name]
+
     async def list_all_tenants(
         self,
         *,

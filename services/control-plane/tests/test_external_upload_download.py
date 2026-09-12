@@ -155,6 +155,28 @@ def count_tenant_users(user_store: TenantUserStore) -> Callable[[], Awaitable[in
     return _count
 
 
+#: B-50 PR4 —— 附件的归属来自它所属会话的 agent(``user_upload`` 表没有
+#: ``agent_key`` 列,唯一的写入方 ``external_uploads.upload_for_user`` 走
+#: ``_resolve_session``,那条路必然绑定 agent)。所以每个种子都必须真的建一条
+#: ``thread_meta`` 行 —— 此前它们只写 ``thread_id=uuid4()`` 而不建会话,收口
+#: 之后归属查不到,全部会 404。
+_AGENT_CODE = "test-agent"
+_OTHER_AGENT_CODE = "other-agent"
+
+
+async def _seed_thread(_ctx: _Ctx, *, user_id: UUID, agent_code: str) -> UUID:
+    """建一条绑定 ``agent_code`` 的会话,返回 ``thread_id``。"""
+    thread_id = uuid4()
+    await _ctx.app.state.thread_meta_repo.create(
+        thread_id=thread_id,
+        tenant_id=_TENANT_ID,
+        created_by="seed",
+        user_id=user_id,
+        agent_name=agent_code,
+    )
+    return thread_id
+
+
 async def _resolve(user_store: TenantUserStore, user_id: str) -> UUID:
     row = await user_store.resolve(
         tenant_id=_TENANT_ID,
@@ -176,14 +198,21 @@ def seed_document(_ctx: _Ctx, user_store: TenantUserStore) -> Callable[..., Awai
     using this fixture seeds and downloads exactly one document.
     """
 
-    async def _seed(*, user_id: str, filename: str, content: bytes, mime: str) -> str:
+    async def _seed(
+        *,
+        user_id: str,
+        filename: str,
+        content: bytes,
+        mime: str,
+        agent_code: str = _AGENT_CODE,
+    ) -> str:
         owner = await _resolve(user_store, user_id)
         upload_id = uuid4()
         row = await _ctx.uploads.insert(
             upload_id=upload_id,
             tenant_id=_TENANT_ID,
             user_id=owner,
-            thread_id=uuid4(),
+            thread_id=await _seed_thread(_ctx, user_id=owner, agent_code=agent_code),
             kind="document",
             ref=f"uploads/{filename}",
             mime_type=mime,
@@ -201,9 +230,11 @@ def seed_image(_ctx: _Ctx, user_store: TenantUserStore) -> Callable[..., Awaitab
     """Register one image ``user_upload`` row backed by a real ``image_upload``
     row + object-store bytes. Returns the rendered ``upl_<uuid>`` id."""
 
-    async def _seed(*, user_id: str, ext: str, content: bytes, mime: str) -> str:
+    async def _seed(
+        *, user_id: str, ext: str, content: bytes, mime: str, agent_code: str = _AGENT_CODE
+    ) -> str:
         owner = await _resolve(user_store, user_id)
-        thread_id = uuid4()
+        thread_id = await _seed_thread(_ctx, user_id=owner, agent_code=agent_code)
         image_id = uuid4()
         image_ref = ImageRef(tenant_id=_TENANT_ID, thread_id=thread_id, image_id=image_id, ext=ext)
         await _ctx.images.insert(
@@ -242,9 +273,9 @@ def seed_image_upload_row_only(
     ``image_upload`` row — the "registry row exists, image_upload doesn't"
     404 case. Returns the rendered ``upl_<uuid>`` id."""
 
-    async def _seed(*, user_id: str) -> str:
+    async def _seed(*, user_id: str, agent_code: str = _AGENT_CODE) -> str:
         owner = await _resolve(user_store, user_id)
-        thread_id = uuid4()
+        thread_id = await _seed_thread(_ctx, user_id=owner, agent_code=agent_code)
         image_ref = ImageRef(
             tenant_id=_TENANT_ID, thread_id=thread_id, image_id=uuid4(), ext=".png"
         )
@@ -274,9 +305,11 @@ def seed_soft_deleted_image(
     "console deleted it, retention hasn't reaped the bytes yet" 404 case.
     Returns the rendered ``upl_<uuid>`` id."""
 
-    async def _seed(*, user_id: str, ext: str, content: bytes, mime: str) -> str:
+    async def _seed(
+        *, user_id: str, ext: str, content: bytes, mime: str, agent_code: str = _AGENT_CODE
+    ) -> str:
         owner = await _resolve(user_store, user_id)
-        thread_id = uuid4()
+        thread_id = await _seed_thread(_ctx, user_id=owner, agent_code=agent_code)
         image_id = uuid4()
         image_ref = ImageRef(tenant_id=_TENANT_ID, thread_id=thread_id, image_id=image_id, ext=ext)
         await _ctx.images.insert(
@@ -362,7 +395,7 @@ async def test_download_document_txt_is_inline_text_plain(external_client, seed_
         user_id="u-1", filename="notes.txt", content=b"hello world", mime="text/plain"
     )
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("text/plain")
@@ -380,7 +413,7 @@ async def test_download_document_html_forces_attachment(external_client, seed_do
         mime="text/html",
     )
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-disposition"].startswith("attachment")
@@ -398,7 +431,7 @@ async def test_download_document_pdf_content_type_is_upload_time_mime(
         user_id="u-1", filename="report.pdf", content=b"%PDF-1.4", mime="application/pdf"
     )
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("application/pdf")
@@ -415,7 +448,7 @@ async def test_download_document_csv_content_type_is_upload_time_mime(
         user_id="u-1", filename="data.csv", content=b"a,b\n1,2", mime="text/csv"
     )
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 200, resp.text
     # Starlette's ``Response`` appends ``; charset=utf-8`` to any ``text/*``
@@ -430,7 +463,7 @@ async def test_download_image_png_is_inline_with_nosniff(external_client, seed_i
         user_id="u-1", ext=".png", content=b"\x89PNG\r\n", mime="image/png"
     )
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"] == "image/png"
@@ -447,7 +480,7 @@ async def test_download_image_png_is_inline_with_nosniff(external_client, seed_i
 @pytest.mark.asyncio
 async def test_malformed_upload_id_is_422(external_client) -> None:
     resp = await external_client.get(
-        "/v1/agents/test-agent/uploads/not-a-real-upload-id", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/not-a-real-upload-id", params={"user_id": "u-1"}
     )
     assert resp.status_code == 422, resp.text
     body = resp.json()
@@ -459,7 +492,7 @@ async def test_malformed_upload_id_is_422(external_client) -> None:
 async def test_unknown_user_is_404_and_mints_nothing(external_client, count_tenant_users) -> None:
     before = await count_tenant_users()
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{render_upload_id(uuid4())}",
+        f"/v1/agents/{_AGENT_CODE}/uploads/{render_upload_id(uuid4())}",
         params={"user_id": "never-seen-before"},
     )
     assert resp.status_code == 404, resp.text
@@ -479,7 +512,7 @@ async def test_row_owned_by_a_different_known_user_is_404(external_client, seed_
         user_id="user-b", filename="other.txt", content=b"user-b stuff", mime="text/plain"
     )
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "user-b"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "user-b"}
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
@@ -492,7 +525,7 @@ async def test_image_row_present_but_image_upload_missing_is_404(
 ) -> None:
     upload_id = await seed_image_upload_row_only(user_id="u-1")
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
@@ -507,7 +540,7 @@ async def test_soft_deleted_image_upload_is_404(external_client, seed_soft_delet
         user_id="u-1", ext=".png", content=b"\x89PNG\r\n", mime="image/png"
     )
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
@@ -525,7 +558,7 @@ async def test_permission_error_is_500_not_404(
     )
     break_workspace_permission()
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 500, resp.text
     assert resp.json()["error"]["code"] == "UPLOAD_CONTENT_UNAVAILABLE"
@@ -540,7 +573,7 @@ async def test_sandbox_error_is_404(
     )
     break_workspace_sandbox()
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
@@ -549,7 +582,7 @@ async def test_sandbox_error_is_404(
 @pytest.mark.asyncio
 async def test_requires_read_scope(external_client_no_scope) -> None:
     resp = await external_client_no_scope.get(
-        f"/v1/agents/test-agent/uploads/{render_upload_id(uuid4())}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{render_upload_id(uuid4())}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 403
 
@@ -566,7 +599,7 @@ async def test_object_store_error_is_500_content_unavailable(
     )
     break_object_store()
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 500, resp.text
     assert resp.json() == {
@@ -587,7 +620,7 @@ async def test_document_workspace_store_none_is_503(
     )
     _ctx.app.state.workspace_store = None  # type: ignore[attr-defined]
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"]["code"] == "UPLOAD_CONTENT_UNAVAILABLE"
@@ -601,7 +634,105 @@ async def test_image_object_store_none_is_503(external_client, seed_image, _ctx:
     )
     _ctx.app.state.object_store = None  # type: ignore[attr-defined]
     resp = await external_client.get(
-        f"/v1/agents/test-agent/uploads/{upload_id}", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
     )
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"]["code"] == "UPLOAD_CONTENT_UNAVAILABLE"
+
+
+# --------------------------------------------------------------------------
+# B-50 PR4 —— 附件按 agent 收口
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_document_download_across_agents_is_404(
+    external_client, seed_document, _ctx: _Ctx
+) -> None:
+    """经 agent B 的会话传的文档,用 A 的 code 下不到。
+
+    ``user_upload`` 没有 ``agent_key`` 列,归属只能沿
+    ``thread_id → thread_meta.agent_name`` 反查(唯一写入方
+    ``upload_for_user`` 走 ``_resolve_session``,那条路必然绑定 agent)。
+    """
+    upload_id = await seed_document(
+        user_id="u-1",
+        filename="b.txt",
+        content=b"b-body",
+        mime="text/plain",
+        agent_code=_OTHER_AGENT_CODE,
+    )
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 404
+    # 非恒真:收口前这里会 200 并把字节读出来。断言「一次工作区读都没发生」才能
+    # 分开「404 是因为收口」和「404 是因为文件本来就不在」。
+    assert _ctx.workspace_store.workspace_reads == []
+
+
+@pytest.mark.asyncio
+async def test_document_download_within_the_same_agent_still_works(
+    external_client, seed_document
+) -> None:
+    """对照组 —— 收口不能把「下自己的」一并挡掉,否则上一条是恒真的。"""
+    upload_id = await seed_document(
+        user_id="u-1", filename="a.txt", content=b"a-body", mime="text/plain"
+    )
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"a-body"
+
+
+@pytest.mark.asyncio
+async def test_image_download_across_agents_is_404(external_client, seed_image) -> None:
+    """图片走对象存储那条分支,收口必须同样生效 —— 两条分支是同一个洞的两个断点。"""
+    upload_id = await seed_image(
+        user_id="u-1",
+        ext=".png",
+        content=b"png-bytes",
+        mime="image/png",
+        agent_code=_OTHER_AGENT_CODE,
+    )
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_image_download_within_the_same_agent_still_works(
+    external_client, seed_image
+) -> None:
+    upload_id = await seed_image(user_id="u-1", ext=".png", content=b"png-bytes", mime="image/png")
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"png-bytes"
+
+
+@pytest.mark.asyncio
+async def test_download_is_404_when_the_owning_thread_is_gone(
+    external_client, seed_document, _ctx: _Ctx
+) -> None:
+    """会话行没了 → 归属反查不出来 → 404,不是「放行」。
+
+    反查失败时**默认拒绝**。反过来写(查不到就不过滤)会让删掉一条会话变成
+    绕过收口的手段 —— 这类「查不到就放行」正是权限判定最常见的翻车形态。
+    """
+    upload_id = await seed_document(
+        user_id="u-1", filename="a.txt", content=b"a-body", mime="text/plain"
+    )
+    row_id = UUID(upload_id.removeprefix("upl_"))
+    row = await _ctx.uploads.get(upload_id=row_id, tenant_id=_TENANT_ID)
+    assert row is not None
+    await _ctx.app.state.thread_meta_repo.delete(row.thread_id, tenant_id=_TENANT_ID)
+
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/uploads/{upload_id}", params={"user_id": "u-1"}
+    )
+    assert resp.status_code == 404
+    assert _ctx.workspace_store.workspace_reads == []

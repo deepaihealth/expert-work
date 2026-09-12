@@ -417,3 +417,67 @@ async def test_order_by_last_activity_sql(sql_store: SqlStoreFixture) -> None:
         assert [m.thread_id for m in with_fresh][:1] == [fresh.thread_id]
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_agent_names_for_user_matches_the_in_memory_predicate(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-50 PR4 —— 与 ``InMemoryThreadMetaStore`` 同款判据,逐条对齐。
+
+    两个后端的谓词必须同义:去重、排序、跨用户/跨租户不串、``agent_name``
+    为空的不进结果、归档的**要**进结果。这四条在内存版有对应的四个用例
+    (``test_in_memory_thread_meta_store.py``),这里在真 Postgres 上重跑同一
+    组事实 —— 仓库里 SQL 与内存谓词悄悄漂开已经踩过不止一次。
+    """
+    store, engine = sql_store
+    try:
+        tenant, other_tenant = uuid4(), uuid4()
+        user, other_user = uuid4(), uuid4()
+        # 去重 + 排序
+        for agent in ("plan", "designer", "plan"):
+            await store.create(
+                thread_id=uuid4(),
+                tenant_id=tenant,
+                created_by="x",
+                user_id=user,
+                agent_name=agent,
+            )
+        # 不串用户 / 不串租户
+        await store.create(
+            thread_id=uuid4(),
+            tenant_id=tenant,
+            created_by="x",
+            user_id=other_user,
+            agent_name="other-user",
+        )
+        await store.create(
+            thread_id=uuid4(),
+            tenant_id=other_tenant,
+            created_by="x",
+            user_id=user,
+            agent_name="other-tenant",
+        )
+        # agent_name 为空的不进结果(create 的默认值)
+        await store.create(thread_id=uuid4(), tenant_id=tenant, created_by="x", user_id=user)
+        # 归档的要进结果
+        archived = uuid4()
+        await store.create(
+            thread_id=archived,
+            tenant_id=tenant,
+            created_by="x",
+            user_id=user,
+            agent_name="archived",
+        )
+        await store.update_status(archived, ThreadStatus.ARCHIVED, tenant_id=tenant)
+
+        assert await store.list_agent_names_for_user(tenant_id=tenant, user_id=user) == [
+            "archived",
+            "designer",
+            "plan",
+        ]
+        assert await store.list_agent_names_for_user(tenant_id=tenant, user_id=other_user) == [
+            "other-user"
+        ]
+    finally:
+        await engine.dispose()
