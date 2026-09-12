@@ -19,11 +19,14 @@ from orchestrator.tools import (
 )
 
 
-def _ctx(*, tenant_id: UUID | None = None, user_id: UUID | None = None) -> ToolContext:
+def _ctx(
+    *, tenant_id: UUID | None = None, user_id: UUID | None = None, agent_key: str = ""
+) -> ToolContext:
     return ToolContext(
         tenant_id=tenant_id if tenant_id is not None else uuid4(),
         run_id=uuid4(),
         user_id=user_id if user_id is not None else uuid4(),
+        agent_key=agent_key,
     )
 
 
@@ -45,7 +48,9 @@ async def test_save_artifact_records_version_one() -> None:
     # B — the result tells the model the user can download it (so it references
     # the artifact by name instead of fabricating a link the UI renders for it).
     assert "download" in result.content.lower()
-    artifacts = await store.list_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+    artifacts = await store.list_for_user(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=None
+    )
     assert len(artifacts) == 1
     assert artifacts[0].kind == "document"
 
@@ -181,3 +186,71 @@ async def test_save_artifact_without_recorder_is_unchanged() -> None:
         {"name": "a.md"}, ctx=_ctx()
     )
     assert result.meta == {"artifact": "a.md", "version": 1, "kind": "other"}
+
+
+# ---------------------------------------------------------------------------
+# B-50 —— 产物按 agent 分层
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_two_agents_same_artifact_name_do_not_overwrite() -> None:
+    """同一用户下两个 agent 各存一个同名产物 —— 两条独立行,各自 v1。
+
+    这是 B-50 的核心缺陷:旧唯一键 ``(tenant, user, name)`` 让第二次 save 走
+    ``ON CONFLICT DO UPDATE``,合并成一行、版本号累加、第一个 agent 的字节被
+    第二个覆盖。用户以为有两份报告,实际只剩一份。
+    """
+    store = InMemoryArtifactStore()
+    tenant_id, user_id = uuid4(), uuid4()
+    for agent_key in ("plan-aaaaaaaa", "sop-bbbbbbbb"):
+        await SaveArtifactTool(store=store).call(
+            {"name": "报告.docx"},
+            ctx=_ctx(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key),
+        )
+
+    rows = await store.list_for_user(tenant_id=tenant_id, user_id=user_id, agent_key=None)
+
+    assert len(rows) == 2, "两个 agent 的同名产物合并成一行了"
+    assert {r.agent_key for r in rows} == {"plan-aaaaaaaa", "sop-bbbbbbbb"}
+    assert [r.latest_version for r in rows] == [1, 1], "版本号累加 = 走了合并分支"
+
+
+@pytest.mark.asyncio
+async def test_list_artifacts_only_shows_the_calling_agents_own() -> None:
+    """``list_artifacts`` 的描述写着「你存的」—— 现在它说的是实话。
+
+    改之前它返回该用户名下**全部** agent 的产物:喂给模型的事实是错的。
+    """
+    store = InMemoryArtifactStore()
+    tenant_id, user_id = uuid4(), uuid4()
+    for agent_key, name in (("plan-aaaaaaaa", "计划.docx"), ("sop-bbbbbbbb", "评审.docx")):
+        await SaveArtifactTool(store=store).call(
+            {"name": name}, ctx=_ctx(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+        )
+
+    out = await ListArtifactsTool(store=store).call(
+        {}, ctx=_ctx(tenant_id=tenant_id, user_id=user_id, agent_key="sop-bbbbbbbb")
+    )
+
+    assert "评审.docx" in out.content
+    assert "计划.docx" not in out.content, "列到了另一个 agent 的产物"
+
+
+@pytest.mark.asyncio
+async def test_path_in_workspace_keeps_the_agents_own_relative_path() -> None:
+    """``path_in_workspace`` 不加 agent 前缀 —— 它是下载时真去读的**物理**路径。
+
+    文件是 ``write_file`` 早先落的盘,文件工具的根目录要到 PR3 才改。这一批就
+    加前缀 = 登记一个没有文件的路径 = 每次下载 404。
+    """
+    store = InMemoryArtifactStore()
+    ctx = _ctx(agent_key="plan-aaaaaaaa")
+    await SaveArtifactTool(store=store).call({"name": "报告.docx"}, ctx=ctx)
+
+    version = await store.get_latest_version(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key="plan-aaaaaaaa", name="报告.docx"
+    )
+
+    assert version is not None
+    assert version.path_in_workspace == "报告.docx"

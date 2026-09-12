@@ -56,6 +56,9 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 #: Fixed (not per-test ``uuid4()``) so fixtures and test bodies can both
 #: address it — mirrors ``test_external_workspace.py``'s module-level
 #: ``_TENANT_ID``.
@@ -173,6 +176,7 @@ def seed_artifact(_ctx: _Ctx, user_store: TenantUserStore) -> Callable[..., Awai
         await _ctx.artifact_store.save_version(
             tenant_id=_TENANT_ID,
             user_id=row.id,
+            agent_key=_AGENT_KEY,
             name=name,
             kind=kind,  # type: ignore[arg-type]
             path_in_workspace=name,
@@ -191,7 +195,11 @@ def soft_delete_artifact(_ctx: _Ctx, user_store: TenantUserStore) -> Callable[..
             subject_id=external_subject_id(user_id),
         )
         hit = await _ctx.artifact_store.soft_delete(
-            tenant_id=_TENANT_ID, user_id=row.id, name=name, now=datetime.now(UTC)
+            tenant_id=_TENANT_ID,
+            user_id=row.id,
+            agent_key=_AGENT_KEY,
+            name=name,
+            now=datetime.now(UTC),
         )
         assert hit, f"soft_delete_artifact: no active artifact named {name!r} for {user_id!r}"
 
@@ -240,6 +248,7 @@ def seed_artifact_with_content(
         await _ctx.artifact_store.save_version(
             tenant_id=_TENANT_ID,
             user_id=row.id,
+            agent_key=_AGENT_KEY,
             name=name,
             kind=kind,  # type: ignore[arg-type]
             path_in_workspace=name,
@@ -277,7 +286,7 @@ def get_latest_version(
             subject_id=external_subject_id(user_id),
         )
         return await _ctx.artifact_store.get_latest_version(
-            tenant_id=_TENANT_ID, user_id=row.id, name=name
+            tenant_id=_TENANT_ID, user_id=row.id, agent_key=_AGENT_KEY, name=name
         )
 
     return _get

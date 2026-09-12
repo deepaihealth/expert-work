@@ -136,9 +136,13 @@ class SaveArtifactTool:
         kind = _coerce_kind(args.get("kind"))
         thread_id = str(ctx.run_id) if ctx.run_id is not None else _FALLBACK_THREAD_ID
 
+        # B-50 —— 产物归属到 agent。``path_in_workspace`` **不加前缀**:这一列是
+        # 下载时真去读的物理路径,而文件是 ``write_file`` 早先落的盘,它的根目录
+        # 要到 PR3(工具层分层)才改。PR2 就加前缀会让每次下载 404。
         version = await self.store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=ctx.agent_key,
             name=name,
             kind=kind,
             path_in_workspace=path_in_workspace,
@@ -178,7 +182,9 @@ class ListArtifactsTool:
         return ToolSpec(
             name="list_artifacts",
             description=(
-                "List the named artifacts you have saved, with each one's kind and latest version."
+                "List the named artifacts you have saved, with each one's kind and latest "
+                "version. Scoped to you: artifacts saved by other agents working for the "
+                "same user are not listed."
             ),
             parameters={"type": "object", "properties": {}},
             # Stream L.L6 — pure read.
@@ -188,7 +194,12 @@ class ListArtifactsTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         del args  # list_artifacts takes no arguments
         tenant_id, user_id = _require_user_scope(ctx, "list_artifacts")
-        artifacts = await self.store.list_for_user(tenant_id=tenant_id, user_id=user_id)
+        # B-50 —— 只列本 agent 的。``agent_key`` 为空串(没绑 agent 的合成执行
+        # 路径)时传 ``None`` 不过滤 —— 那条路径连 user_id 都没有,不存在跨 agent
+        # 泄露;拼一个空串去过滤反而只会捞到归属不明的历史行。
+        artifacts = await self.store.list_for_user(
+            tenant_id=tenant_id, user_id=user_id, agent_key=ctx.agent_key or None
+        )
         if not artifacts:
             return ToolResult(content="(no artifacts saved yet)", meta={"n_artifacts": 0})
         lines = [f"- {a.name} ({a.kind}, v{a.latest_version})" for a in artifacts]

@@ -454,6 +454,10 @@ class RetentionCleanupJob:
             ok = await self._artifact_store.soft_delete(
                 tenant_id=row.tenant_id,
                 user_id=row.user_id,
+                # B-50 —— 用这一行自己的归属,不是 None。留存是逐行处理的,
+                # 传 None 会在同名多行时删到「updated_at 最新」的那条,
+                # 也就是删了另一个 agent 还没到期的产物。
+                agent_key=row.agent_key,
                 name=row.name,
                 now=now,
             )

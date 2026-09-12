@@ -16,7 +16,21 @@ from expert_work.protocol import Artifact, ArtifactKind, ArtifactVersion
 
 
 class ArtifactStore(abc.ABC):
-    """Agent-artifact registry, scoped to ``(tenant_id, user_id)``.
+    """Agent-artifact registry, scoped to ``(tenant_id, user_id, agent_key)``.
+
+    B-50 —— ``agent_key`` 进身份键之前,同一用户下两个 agent 存同名产物会合并
+    成一行、旧字节被覆盖。现在它们是两条独立行,各自版本序列。
+
+    **``agent_key`` 一律必传,没有默认值。** 传 ``None`` 表示「不按 agent 过滤」
+    (控制台全量视图、留存 job 的运维视角、以及对外端点在 PR4 收口之前的迁移期)。
+    不给默认值是刻意的:新调用方必须**明确写出来**自己要不要按 agent 过滤,
+    而不是继承一个静默的「看全部」。谁可以传 ``None`` 有登记表盯着,见
+    ``control-plane/tests/test_artifact_agent_scope_callers.py``。
+
+    按 **name** 寻址的方法都带 ``agent_key`` —— 四元组键下 name 不再是身份。
+    控制台浏览全量、手里只有列表行,所以它走 ``*_by_id`` 那组(``artifact_id``
+    永远无歧义);``update_kind`` / ``list_versions`` 只有控制台在用,直接就是
+    按 id 的。
 
     Lifecycle (Mini-ADR J-25): ``deleted_at IS NULL`` is the active
     state. :meth:`soft_delete` flips ``deleted_at`` on a per-name row
@@ -32,12 +46,16 @@ class ArtifactStore(abc.ABC):
         *,
         tenant_id: UUID,
         user_id: UUID,
+        agent_key: str,
         name: str,
         kind: ArtifactKind,
         path_in_workspace: str,
         created_in_thread: str,
     ) -> ArtifactVersion:
-        """Register a new version of artifact ``name``.
+        """Register a new version of ``(agent_key, name)``.
+
+        ``agent_key`` 空串 = 没绑 agent 的调用方(合成执行路径)。它与任何
+        非空 key 都是不同的身份,不会跟谁合并。
 
         Creates the logical artifact at version 1 on first save, else
         appends the next version and bumps ``latest_version``. ``kind``
@@ -54,9 +72,12 @@ class ArtifactStore(abc.ABC):
         *,
         tenant_id: UUID,
         user_id: UUID,
+        agent_key: str | None,
         include_deleted: bool = False,
     ) -> list[Artifact]:
         """The user's logical artifacts, most-recently-updated first.
+
+        ``agent_key`` 给值则只列该 agent 的;``None`` 不过滤(全量)。
 
         Soft-deleted rows are hidden by default; ``include_deleted=True``
         returns them too (admin / audit use).
@@ -78,14 +99,40 @@ class ArtifactStore(abc.ABC):
 
     @abc.abstractmethod
     async def get_latest_version(
-        self, *, tenant_id: UUID, user_id: UUID, name: str
+        self, *, tenant_id: UUID, user_id: UUID, agent_key: str | None, name: str
     ) -> ArtifactVersion | None:
-        """Return the newest version of artifact ``name``, or ``None``.
+        """Return the newest version of ``(agent_key, name)``, or ``None``.
+
+        ``agent_key=None`` 不按 agent 过滤 —— 同名多行时取 ``updated_at``
+        最新的那条。只有对外端点在 PR4 收口之前这么用;控制台走
+        :meth:`get_latest_version_by_id`。
 
         ``None`` when the user has no *active* artifact under that name
         — soft-deleted rows are hidden here too (callers turn that into
         404, identical to the cross-user case). Never reveals a
         cross-user artifact.
+        """
+
+    @abc.abstractmethod
+    async def get_latest_version_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID
+    ) -> ArtifactVersion | None:
+        """B-50 —— 按 ``artifact_id`` 取最新版本,给控制台全量视图用。
+
+        四元组键之后 name 不再是身份,而控制台是跨 agent 浏览的:它手里有
+        列表行(带 id),用 id 寻址永远无歧义。仍受 ``(tenant_id, user_id)``
+        约束 —— id 是 UUID 不等于可以跨用户取。``None`` = 未知 / 已软删 /
+        跨用户(调用方一律转 404,与 :meth:`get_latest_version` 同一套隐藏规则)。
+        """
+
+    @abc.abstractmethod
+    async def soft_delete_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, now: datetime
+    ) -> bool:
+        """B-50 —— 按 ``artifact_id`` 软删,给控制台全量视图用。
+
+        理由与返回语义同 :meth:`get_latest_version_by_id`;幂等性同
+        :meth:`soft_delete`(第二次是 no-op miss)。
         """
 
     @abc.abstractmethod
@@ -103,10 +150,14 @@ class ArtifactStore(abc.ABC):
         *,
         tenant_id: UUID,
         user_id: UUID,
+        agent_key: str | None,
         name: str,
         now: datetime,
     ) -> bool:
         """Flip ``deleted_at`` on an active artifact; return ``True`` on hit.
+
+        ``agent_key=None`` 不按 agent 过滤 —— 同名多行时删 ``updated_at``
+        最新的那条。同 :meth:`get_latest_version` 的口径。
 
         Returns ``False`` when the name is unknown for this user, or
         already soft-deleted (callers turn both into 404 — same
@@ -149,13 +200,16 @@ class ArtifactStore(abc.ABC):
         *,
         tenant_id: UUID,
         user_id: UUID,
-        name: str,
+        artifact_id: UUID,
         kind: ArtifactKind,
     ) -> Artifact | None:
         """Mini-ADR J-25 — change the artifact's ``kind``.
 
+        B-50 —— 按 ``artifact_id`` 而不是 name:四元组键下 name 不是身份,
+        而这个方法只有控制台全量视图在用,它手里就是列表行。
+
         Returns the updated row on success. Returns ``None`` when the
-        name is unknown / soft-deleted / cross-user (callers turn that
+        id is unknown / soft-deleted / cross-user (callers turn that
         into 404 — same hiding rule as :meth:`get_latest_version`).
         Idempotent: passing the current ``kind`` is a successful no-op
         that still returns the row.
@@ -167,9 +221,11 @@ class ArtifactStore(abc.ABC):
         *,
         tenant_id: UUID,
         user_id: UUID,
-        name: str,
+        artifact_id: UUID,
     ) -> list[ArtifactVersion] | None:
         """Mini-ADR J-25 — every version of one logical artifact, newest first.
+
+        B-50 —— 按 ``artifact_id`` 而不是 name,理由同 :meth:`update_kind`。
 
         Returns ``None`` when the parent artifact is unknown / soft-deleted
         / cross-user (callers turn that into 404 — same hiding rule).

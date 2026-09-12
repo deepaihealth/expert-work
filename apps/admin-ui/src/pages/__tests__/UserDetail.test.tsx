@@ -91,7 +91,15 @@ function stubAll() {
     cross_tenant: false,
   });
   vi.spyOn(artifactsSdk, "listArtifacts").mockResolvedValue({
-    items: [{ name: "report.md", kind: "document", latest_version: 2 }],
+    items: [
+      {
+        id: "b1111111-1111-4111-8111-111111111111",
+        agent_key: "test-agent-0badc0de",
+        name: "report.md",
+        kind: "document",
+        latest_version: 2,
+      },
+    ],
     cross_tenant: false,
   });
   vi.spyOn(usageSdk, "getUsageTokens").mockResolvedValue({

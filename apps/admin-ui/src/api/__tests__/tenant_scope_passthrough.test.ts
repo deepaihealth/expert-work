@@ -148,30 +148,32 @@ describe("trace facade SDK — tenantScope passthrough", () => {
 });
 
 describe("artifacts SDK — tenantScope passthrough", () => {
-  it("downloadArtifact threads tenant_id alongside name/user_id", async () => {
+  it("downloadArtifact threads tenant_id alongside artifact_id/user_id", async () => {
     vi.stubGlobal("URL", {
       ...URL,
       createObjectURL: vi.fn(() => "blob:x"),
       revokeObjectURL: vi.fn(),
     });
     const calls = captureAdapter(new Blob(["x"]));
-    await downloadArtifact("report.md", "user-1", TENANT);
+    // B-50 —— 寻址用 artifact_id;第二个参数只是另存文件名的兜底,不上线。
+    await downloadArtifact("art-1", "report.md", "user-1", TENANT);
     expect(calls[0].url).toBe("/v1/artifacts/download");
     expect(calls[0].params).toMatchObject({
-      name: "report.md",
+      artifact_id: "art-1",
       user_id: "user-1",
       tenant_id: TENANT,
     });
+    expect(calls[0].params).not.toHaveProperty("name");
   });
 
   it("listArtifactVersions threads tenant_id and omits it when undefined", async () => {
-    let calls = captureAdapter({ name: "report.md", versions: [] });
-    await listArtifactVersions("report.md", "user-1", TENANT);
-    expect(calls[0].url).toBe("/v1/artifacts/report.md/versions");
+    let calls = captureAdapter({ id: "art-1", versions: [] });
+    await listArtifactVersions("art-1", "user-1", TENANT);
+    expect(calls[0].url).toBe("/v1/artifacts/art-1/versions");
     expect(calls[0].params?.tenant_id).toBe(TENANT);
 
-    calls = captureAdapter({ name: "report.md", versions: [] });
-    await listArtifactVersions("report.md");
+    calls = captureAdapter({ id: "art-1", versions: [] });
+    await listArtifactVersions("art-1");
     expect(calls[0].params?.tenant_id).toBeUndefined();
   });
 });

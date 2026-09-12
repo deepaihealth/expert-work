@@ -107,6 +107,7 @@ from expert_work.protocol import (
     ThreadStatus,
     canonical_args_digest,
 )
+from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunEventStore, RunStore
@@ -115,7 +116,6 @@ from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
 from orchestrator.multimodal import image_ref_block
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
-from orchestrator.tools.skill_seed import sanitize_agent_key
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 

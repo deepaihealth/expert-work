@@ -46,8 +46,9 @@ export interface UseUserWorkspace {
   reload: () => Promise<void>;
   downloadFile: (path: string) => Promise<void>;
   deleteFile: (path: string) => Promise<void>;
-  downloadArtifact: (name: string) => Promise<void>;
-  deleteArtifact: (name: string) => Promise<void>;
+  /** B-50 —— 按 ``artifact_id`` 寻址;``name`` 只用于下载另存的文件名与 busyKey。 */
+  downloadArtifact: (artifactId: string, name: string) => Promise<void>;
+  deleteArtifact: (artifactId: string) => Promise<void>;
   /** ``download:<key>`` / ``delete:<key>`` for the action + path/`artifact:<name>`
    *  currently in flight, or ``null`` when idle. */
   busyKey: string | null;
@@ -121,10 +122,10 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
   );
 
   const downloadArtifact = useCallback(
-    async (name: string) => {
-      setBusyKey(`download:artifact:${name}`);
+    async (artifactId: string, name: string) => {
+      setBusyKey(`download:artifact:${artifactId}`);
       try {
-        await downloadArtifactApi(name, undefined, concreteTenantScope(apiTenantScope));
+        await downloadArtifactApi(artifactId, name, undefined, concreteTenantScope(apiTenantScope));
       } catch (err) {
         // 同 downloadFile —— 失败要说出来,带后端 detail(不存在 / 太大)。
         message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
@@ -136,10 +137,10 @@ export function useUserWorkspace({ running }: { running: boolean }): UseUserWork
   );
 
   const deleteArtifact = useCallback(
-    async (name: string) => {
-      setBusyKey(`delete:artifact:${name}`);
+    async (artifactId: string) => {
+      setBusyKey(`delete:artifact:${artifactId}`);
       try {
-        await deleteArtifactApi(name);
+        await deleteArtifactApi(artifactId);
         await reload();
       } catch {
         // Swallow — refresh re-syncs.

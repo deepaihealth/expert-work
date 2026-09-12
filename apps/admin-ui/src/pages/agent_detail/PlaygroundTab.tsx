@@ -25,11 +25,15 @@ import { Alert, App, Badge, Checkbox, Drawer, Segmented, Tooltip, Typography } f
 import { SlidersHorizontal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { downloadArtifact } from "../../api/artifacts";
 import { ApiError, errMessage } from "../../api/client";
 import { streamRunEvents } from "../../api/runs";
 import { attributedModelsOf, computeSessionStats } from "../../api/session_stats";
-import { createSession, type SseEvent, type ThreadMeta } from "../../api/sessions";
+import {
+  createSession,
+  downloadSessionArtifact,
+  type SseEvent,
+  type ThreadMeta,
+} from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
 import { uploadDocument, uploadImage } from "../../api/uploads";
 import { AttachmentChips } from "../../components/console/AttachmentChips";
@@ -498,14 +502,17 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   // copy) — the only surviving use of the old workspace handlers.
   const handleDownloadArtifact = useCallback(
     async (name: string) => {
+      const threadId = thread?.thread_id ?? null;
+      if (threadId === null) return;
       try {
-        await downloadArtifact(name, undefined, concreteTenantScope(apiTenantScope));
+        // B-50 —— 同 ConversationDetail:走会话作用域端点,后端按会话的 agent 收口。
+        await downloadSessionArtifact(threadId, name, concreteTenantScope(apiTenantScope));
       } catch (err) {
         // 静默吞错让「下载失败」表现成「点了没反应」(2026-08-26 用户反馈)。
         message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       }
     },
-    [apiTenantScope, message, t],
+    [thread, apiTenantScope, message, t],
   );
 
   const handleFireResult = useCallback((result: FireNowResult) => {

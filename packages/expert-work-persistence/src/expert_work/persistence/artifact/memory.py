@@ -24,6 +24,7 @@ class InMemoryArtifactStore(ArtifactStore):
         *,
         tenant_id: UUID,
         user_id: UUID,
+        agent_key: str,
         name: str,
         kind: ArtifactKind,
         path_in_workspace: str,
@@ -34,7 +35,10 @@ class InMemoryArtifactStore(ArtifactStore):
             (
                 a
                 for a in self._artifacts.values()
-                if a.tenant_id == tenant_id and a.user_id == user_id and a.name == name
+                if a.tenant_id == tenant_id
+                and a.user_id == user_id
+                and a.agent_key == agent_key
+                and a.name == name
             ),
             None,
         )
@@ -43,6 +47,7 @@ class InMemoryArtifactStore(ArtifactStore):
                 id=uuid4(),
                 tenant_id=tenant_id,
                 user_id=user_id,
+                agent_key=agent_key,
                 name=name,
                 kind=kind,
                 latest_version=1,
@@ -78,6 +83,7 @@ class InMemoryArtifactStore(ArtifactStore):
         *,
         tenant_id: UUID,
         user_id: UUID,
+        agent_key: str | None,
         include_deleted: bool = False,
     ) -> list[Artifact]:
         rows = [
@@ -85,6 +91,8 @@ class InMemoryArtifactStore(ArtifactStore):
             for a in self._artifacts.values()
             if a.tenant_id == tenant_id
             and a.user_id == user_id
+            # ``None`` = 不按 agent 过滤。与 SQL 档的谓词必须同义。
+            and (agent_key is None or a.agent_key == agent_key)
             and (include_deleted or a.deleted_at is None)
         ]
         rows.sort(key=lambda a: a.updated_at or _MIN_AWARE, reverse=True)
@@ -100,21 +108,41 @@ class InMemoryArtifactStore(ArtifactStore):
         return rows
 
     async def get_latest_version(
-        self, *, tenant_id: UUID, user_id: UUID, name: str
+        self, *, tenant_id: UUID, user_id: UUID, agent_key: str | None, name: str
     ) -> ArtifactVersion | None:
-        artifact = next(
+        # ``agent_key=None`` 时同名可能多行 —— 取 updated_at 最新的那条,与
+        # SQL 档的 ``ORDER BY updated_at DESC LIMIT 1`` 同义。
+        candidates = sorted(
             (
                 a
                 for a in self._artifacts.values()
                 if a.tenant_id == tenant_id
                 and a.user_id == user_id
+                and (agent_key is None or a.agent_key == agent_key)
                 and a.name == name
                 and a.deleted_at is None
             ),
-            None,
+            key=lambda a: a.updated_at or _MIN_AWARE,
+            reverse=True,
         )
-        if artifact is None:
+        if not candidates:
             return None
+        return self._latest_of(candidates[0])
+
+    async def get_latest_version_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID
+    ) -> ArtifactVersion | None:
+        artifact = self._artifacts.get(artifact_id)
+        if (
+            artifact is None
+            or artifact.tenant_id != tenant_id
+            or artifact.user_id != user_id
+            or artifact.deleted_at is not None
+        ):
+            return None
+        return self._latest_of(artifact)
+
+    def _latest_of(self, artifact: Artifact) -> ArtifactVersion | None:
         return next(
             (
                 v
@@ -137,19 +165,42 @@ class InMemoryArtifactStore(ArtifactStore):
         *,
         tenant_id: UUID,
         user_id: UUID,
+        agent_key: str | None,
         name: str,
         now: datetime,
     ) -> bool:
-        for aid, a in list(self._artifacts.items()):
-            if (
-                a.tenant_id == tenant_id
+        # 同 get_latest_version:``agent_key=None`` 时取 updated_at 最新的那条。
+        candidates = sorted(
+            (
+                a
+                for a in self._artifacts.values()
+                if a.tenant_id == tenant_id
                 and a.user_id == user_id
+                and (agent_key is None or a.agent_key == agent_key)
                 and a.name == name
                 and a.deleted_at is None
-            ):
-                self._artifacts[aid] = a.model_copy(update={"deleted_at": now})
-                return True
-        return False
+            ),
+            key=lambda a: a.updated_at or _MIN_AWARE,
+            reverse=True,
+        )
+        if not candidates:
+            return False
+        self._artifacts[candidates[0].id] = candidates[0].model_copy(update={"deleted_at": now})
+        return True
+
+    async def soft_delete_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, now: datetime
+    ) -> bool:
+        artifact = self._artifacts.get(artifact_id)
+        if (
+            artifact is None
+            or artifact.tenant_id != tenant_id
+            or artifact.user_id != user_id
+            or artifact.deleted_at is not None
+        ):
+            return False
+        self._artifacts[artifact_id] = artifact.model_copy(update={"deleted_at": now})
+        return True
 
     async def list_expired(
         self,
@@ -184,40 +235,35 @@ class InMemoryArtifactStore(ArtifactStore):
         *,
         tenant_id: UUID,
         user_id: UUID,
-        name: str,
+        artifact_id: UUID,
         kind: ArtifactKind,
     ) -> Artifact | None:
-        for aid, a in self._artifacts.items():
-            if (
-                a.tenant_id == tenant_id
-                and a.user_id == user_id
-                and a.name == name
-                and a.deleted_at is None
-            ):
-                updated = a.model_copy(update={"kind": kind, "updated_at": datetime.now(UTC)})
-                self._artifacts[aid] = updated
-                return updated
-        return None
+        artifact = self._artifacts.get(artifact_id)
+        if (
+            artifact is None
+            or artifact.tenant_id != tenant_id
+            or artifact.user_id != user_id
+            or artifact.deleted_at is not None
+        ):
+            return None
+        updated = artifact.model_copy(update={"kind": kind, "updated_at": datetime.now(UTC)})
+        self._artifacts[artifact_id] = updated
+        return updated
 
     async def list_versions(
         self,
         *,
         tenant_id: UUID,
         user_id: UUID,
-        name: str,
+        artifact_id: UUID,
     ) -> list[ArtifactVersion] | None:
-        artifact = next(
-            (
-                a
-                for a in self._artifacts.values()
-                if a.tenant_id == tenant_id
-                and a.user_id == user_id
-                and a.name == name
-                and a.deleted_at is None
-            ),
-            None,
-        )
-        if artifact is None:
+        artifact = self._artifacts.get(artifact_id)
+        if (
+            artifact is None
+            or artifact.tenant_id != tenant_id
+            or artifact.user_id != user_id
+            or artifact.deleted_at is not None
+        ):
             return None
         rows = [v for v in self._versions if v.artifact_id == artifact.id]
         rows.sort(key=lambda v: v.version, reverse=True)

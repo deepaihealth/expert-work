@@ -34,7 +34,7 @@ import { useLocation, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
 import { decideApprovals, type ApprovalItem } from "../api/approvals";
-import { downloadArtifact } from "../api/artifacts";
+
 import { ApiError, errMessage } from "../api/client";
 import { getConversation, type ConversationDetail as ConversationDetailModel } from "../api/conversations";
 import { cancelRun, streamRunEvents } from "../api/runs";
@@ -47,6 +47,7 @@ import {
   type HistoryMessage,
   type SessionFeedbackItem,
   type SseEvent,
+  downloadSessionArtifact,
 } from "../api/sessions";
 import type { FireNowResult } from "../api/triggers";
 import { useAuth } from "../auth/AuthContext";
@@ -470,7 +471,10 @@ export function ConversationDetail() {
   const handleDownloadArtifact = useCallback(
     async (name: string) => {
       try {
-        await downloadArtifact(name, conversationUserId ?? undefined, concreteTenantScope(apiTenantScope));
+        // B-50 —— 走会话作用域端点:这一面手里只有产物名,而会话只属于一个
+        // agent,后端按 ``thread_meta.agent_name`` 收口,「这个会话的 X」唯一。
+        if (!threadId) return;
+        await downloadSessionArtifact(threadId, name, concreteTenantScope(apiTenantScope));
       } catch (err) {
         // 静默吞错让「下载 404 / 413」表现成「点了没反应」,用户以为产物丢了
         // (2026-08-26 反馈)。toast 带后端 detail(如「太大」「不存在」)。

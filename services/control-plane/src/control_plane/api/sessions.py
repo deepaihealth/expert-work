@@ -67,6 +67,7 @@ from expert_work.protocol import (
     ThreadMeta,
     ThreadStatus,
 )
+from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.context.workspace_projection import thread_projection_prefix
 from orchestrator.tools import (
@@ -87,6 +88,15 @@ logger = logging.getLogger("expert_work.control_plane.sessions")
 #: Platform fallback agent when a tenant has set no ``default_agent_name``
 #: and the caller didn't pick one (Stream R Mini-ADR R-9).
 _PLATFORM_FALLBACK_AGENT = "canonical-agent"
+
+
+def _session_agent_key(meta: ThreadMeta) -> str | None:
+    """B-50 —— 这个会话属于哪个 agent 的产物命名空间。
+
+    ``None`` = 不按 agent 过滤:``agent_name`` 为空的会话(建表早于该列,或
+    机器线程)没有可用归属,按它过滤只会一条都列不出来。
+    """
+    return sanitize_agent_key(meta.agent_name) if meta.agent_name else None
 
 
 class CreateSessionPayload(BaseModel):
@@ -437,7 +447,13 @@ def build_sessions_router() -> APIRouter:
             return JSONResponse({"success": True, "data": {"workspace": None, "artifacts": []}})
         async with applied_scope(scope):
             workspace = await workspaces.get(tenant_id=target_tenant, user_id=meta.user_id)
-            arts = await artifacts.list_for_user(tenant_id=target_tenant, user_id=meta.user_id)
+            arts = await artifacts.list_for_user(
+                tenant_id=target_tenant,
+                user_id=meta.user_id,
+                # B-50 —— 会话属于某一个 agent,这一面只该列它的产物。
+                # ``agent_name`` 为空的老会话(建表早于该列)回落不过滤。
+                agent_key=_session_agent_key(meta),
+            )
         return JSONResponse(
             {
                 "success": True,
@@ -680,7 +696,10 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="artifact not found")
         async with applied_scope(scope):
             version = await artifacts.get_latest_version(
-                tenant_id=target_tenant, user_id=meta.user_id, name=name
+                tenant_id=target_tenant,
+                user_id=meta.user_id,
+                agent_key=_session_agent_key(meta),
+                name=name,
             )
         if version is None:
             raise HTTPException(status_code=404, detail="artifact not found")
@@ -752,7 +771,11 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         hit = await artifacts.soft_delete(
-            tenant_id=tenant_id, user_id=meta.user_id, name=name, now=datetime.now(UTC)
+            tenant_id=tenant_id,
+            user_id=meta.user_id,
+            agent_key=_session_agent_key(meta),
+            name=name,
+            now=datetime.now(UTC),
         )
         if not hit:
             raise HTTPException(status_code=404, detail="artifact not found")

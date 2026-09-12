@@ -42,6 +42,9 @@ from expert_work.runtime.audit import (
 from retention_cleanup_job.job import RetentionCleanupJob
 from retention_cleanup_job.workspace_files import deleted_marker
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 _OLD = datetime.now(UTC) - timedelta(days=100)
 _FRESH = datetime.now(UTC) - timedelta(days=1)
 
@@ -88,6 +91,7 @@ async def _register_version(
     version = await artifacts.save_version(
         tenant_id=tenant,
         user_id=user,
+        agent_key=_AGENT_KEY,
         name=name,
         kind="document",
         path_in_workspace=path,
@@ -311,14 +315,18 @@ async def test_run_once_touches_only_the_three_registered_shapes(world: _World) 
     # Registry side.
     by_name = {
         a.name: a
-        for a in await w.artifacts.list_for_user(tenant_id=t, user_id=u, include_deleted=True)
+        for a in await w.artifacts.list_for_user(
+            tenant_id=t, user_id=u, agent_key=_AGENT_KEY, include_deleted=True
+        )
     }
     assert by_name["report.pptx"].deleted_at is not None
     assert by_name["高血压21天随访"].deleted_at is not None
     assert by_name["ghost.md"].deleted_at is not None
     assert by_name["summary.md"].deleted_at is None
     assert by_name["plan.json"].deleted_at is None
-    summary_versions = await w.artifacts.list_versions(tenant_id=t, user_id=u, name="summary.md")
+    summary_versions = await w.artifacts.list_versions(
+        tenant_id=t, user_id=u, artifact_id=by_name["summary.md"].id
+    )
     assert summary_versions is not None
     assert [v.path_in_workspace for v in summary_versions] == ["summary.md"]
     old_upload = await w.uploads.get(upload_id=w.ids["upload_old"], tenant_id=t)
@@ -385,7 +393,7 @@ async def test_file_rules_are_skipped_without_workspace_root(world: _World) -> N
     by_name = {
         a.name: a
         for a in await w.artifacts.list_for_user(
-            tenant_id=w.tenant, user_id=w.user, include_deleted=True
+            tenant_id=w.tenant, user_id=w.user, agent_key=_AGENT_KEY, include_deleted=True
         )
     }
     # Stage 1 of the pre-existing metadata sweep still soft-deletes by
@@ -411,7 +419,12 @@ async def test_unremovable_artifact_file_keeps_its_version_row(world: _World) ->
 
     report = await w.job().run_once()
 
-    versions = await w.artifacts.list_versions(tenant_id=t, user_id=u, name="report.pptx")
+    # B-50 —— ``list_versions`` 改按 ``artifact_id``(四元组键之后 name 不是身份)。
+    rows = await w.artifacts.list_for_user(
+        tenant_id=t, user_id=u, agent_key=_AGENT_KEY, include_deleted=True
+    )
+    artifact_id = next(a.id for a in rows if a.name == "report.pptx")
+    versions = await w.artifacts.list_versions(tenant_id=t, user_id=u, artifact_id=artifact_id)
     assert versions is not None and len(versions) == 1
     assert (w.root / str(t) / str(u) / "report.pptx").is_dir()
     assert report.artifact_versions_deleted == 3  # the other three still went
@@ -440,7 +453,11 @@ async def test_soft_deleted_artifact_files_are_unlinked_before_hard_delete(world
     w = world
     t, u = w.tenant, w.user
     await w.artifacts.soft_delete(
-        tenant_id=t, user_id=u, name="plan.json", now=datetime.now(UTC) - timedelta(days=70)
+        tenant_id=t,
+        user_id=u,
+        agent_key=_AGENT_KEY,
+        name="plan.json",
+        now=datetime.now(UTC) - timedelta(days=70),
     )
     target = w.root / str(t) / str(u) / "plan.json"
     assert target.exists()

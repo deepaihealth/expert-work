@@ -93,6 +93,8 @@ describe("WorkspacePanel", () => {
       },
       artifacts: [
         {
+          id: "a1111111-1111-4111-8111-111111111111",
+          agent_key: "test-agent-0badc0de",
           name: "report.pdf",
           kind: "document",
           latest_version: 1,
@@ -139,6 +141,8 @@ describe("WorkspacePanel", () => {
       },
       artifacts: [
         {
+          id: "a2222222-2222-4222-8222-222222222222",
+          agent_key: "test-agent-0badc0de",
           name: "report.md",
           kind: "document",
           latest_version: 2,
@@ -212,6 +216,8 @@ describe("WorkspacePanel", () => {
       },
       artifacts: [
         {
+          id: "a3333333-3333-4333-8333-333333333333",
+          agent_key: "test-agent-0badc0de",
           name: "report.pdf",
           kind: "document",
           latest_version: 1,

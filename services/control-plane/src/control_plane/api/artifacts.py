@@ -1,17 +1,20 @@
 """``/v1/artifacts`` — Stream J.9 artifact list / download / delete / patch / versions.
 
-Artifacts are per-``(tenant, user)`` (Mini-ADR J-1). The endpoints
-collectively expose:
+Artifacts are per-``(tenant, user, agent_key)`` —— B-50 起 ``agent_key`` 进了
+身份键,同一用户下两个 agent 可以各有一个 ``报告.docx``。**这一族是控制台的
+跨 agent 全量视图**(运维要看见这个用户名下所有东西),所以列表不按 agent
+过滤、每条带上 ``agent_key``;单条寻址一律用 ``artifact_id`` —— ``name``
+不再是身份,``?name=`` 会指向不确定的那一条。
 
-* ``GET /v1/artifacts`` — list the caller's artifacts.
-* ``GET /v1/artifacts/download?name=…`` — stream the latest version's
+* ``GET /v1/artifacts`` — list the caller's artifacts (每条带 ``id`` + ``agent_key``).
+* ``GET /v1/artifacts/download?artifact_id=…`` — stream the latest version's
   content (MIME-aware + XSS-safe Content-Disposition; J.9-step3,
   STREAM-J-DESIGN § 10.5).
-* ``DELETE /v1/artifacts/{name}`` — soft-delete (J.9-step3, Mini-ADR
+* ``DELETE /v1/artifacts/{artifact_id}`` — soft-delete (J.9-step3, Mini-ADR
   J-25). Lifecycle is metadata-only; the J.15 volume bytes stay until
   the retention sweep / volume lifecycle removes them.
-* ``PATCH /v1/artifacts/{name}`` — update ``kind`` (J.9-step3).
-* ``GET /v1/artifacts/{name}/versions`` — version history (J.9-step3).
+* ``PATCH /v1/artifacts/{artifact_id}`` — update ``kind`` (J.9-step3).
+* ``GET /v1/artifacts/{artifact_id}/versions`` — version history (J.9-step3).
 
 Content lives in the user's J.15 workspace volume — only the
 sandbox-supervisor can read a docker volume, so the download endpoint
@@ -121,6 +124,10 @@ def build_artifacts_router() -> APIRouter:
                 artifacts = await store.list_all_tenants()
                 items = [
                     {
+                        # B-50 —— ``id`` 是寻址用的身份:四元组键之后同一用户下
+                        # 两个 agent 可以有同名产物,``name`` 不再唯一。
+                        "id": str(a.id),
+                        "agent_key": a.agent_key,
                         "name": a.name,
                         "kind": a.kind,
                         "latest_version": a.latest_version,
@@ -138,11 +145,20 @@ def build_artifacts_router() -> APIRouter:
                         content={"artifacts": [], "items": [], "cross_tenant": False}
                     )
                 current_user_id_var.set(target_user_id)
+                # B-50 —— 控制台是**跨 agent 的全量视图**(运维要看见这个用户
+                # 名下所有东西),所以不按 agent 过滤;每条带上 ``agent_key``,
+                # 运维才分得出两条同名产物哪份是谁的。
                 artifacts = await store.list_for_user(
-                    tenant_id=scope.tenant_id, user_id=target_user_id
+                    tenant_id=scope.tenant_id, user_id=target_user_id, agent_key=None
                 )
                 items = [
-                    {"name": a.name, "kind": a.kind, "latest_version": a.latest_version}
+                    {
+                        "id": str(a.id),
+                        "agent_key": a.agent_key,
+                        "name": a.name,
+                        "kind": a.kind,
+                        "latest_version": a.latest_version,
+                    }
                     for a in artifacts
                 ]
         return JSONResponse(
@@ -153,9 +169,12 @@ def build_artifacts_router() -> APIRouter:
             }
         )
 
+    # B-50 —— 按 ``artifact_id`` 而不是 ``name``:四元组唯一键之后,同一用户下
+    # 两个 agent 可以各有一个 ``报告.docx``,``?name=`` 指谁不确定。控制台是从
+    # 列表行点进来的,行里就有 id —— 用它寻址永远无歧义。
     @router.get("/download", response_model=None, dependencies=[Depends(console_only())])
     async def download_artifact(
-        name: str,
+        artifact_id: Annotated[UUID, Query()],
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
@@ -186,14 +205,16 @@ def build_artifacts_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="artifact not found")
         current_user_id_var.set(target_user_id)
         async with applied_scope(scope):
-            version = await store.get_latest_version(
-                tenant_id=target_tenant, user_id=target_user_id, name=name
+            version = await store.get_latest_version_by_id(
+                tenant_id=target_tenant, user_id=target_user_id, artifact_id=artifact_id
             )
             if version is None:
                 raise HTTPException(status_code=404, detail="artifact not found")
             # Re-fetch the parent row to know the ``kind`` for MIME inference.
-            artifacts = await store.list_for_user(tenant_id=target_tenant, user_id=target_user_id)
-        artifact = next((a for a in artifacts if a.name == name), None)
+            artifacts = await store.list_for_user(
+                tenant_id=target_tenant, user_id=target_user_id, agent_key=None
+            )
+        artifact = next((a for a in artifacts if a.id == artifact_id), None)
         if artifact is None:
             # Defensive — would mean a version exists but its parent does
             # not, which the store invariants forbid.
@@ -275,13 +296,14 @@ def build_artifacts_router() -> APIRouter:
     # ``console_only()`` + user-scope 闸,viewer 能删改自己名下的产物。与会话侧
     # ``DELETE /v1/sessions/{id}/workspace/artifacts/{name}`` 同档 ``session:write``;
     # user-scope 闸(``resolve_target_user_id``)不动。
+    # B-50 —— 路径参数从 ``{name}`` 换成 ``{artifact_id}``,理由同 download。
     @router.delete(
-        "/{name:path}",
+        "/{artifact_id}",
         response_model=None,
         dependencies=[Depends(console_only()), Depends(require("session", "write"))],
     )
     async def delete_artifact(
-        name: str,
+        artifact_id: UUID,
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
@@ -300,8 +322,11 @@ def build_artifacts_router() -> APIRouter:
         if target_user_id is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         current_user_id_var.set(target_user_id)
-        hit = await store.soft_delete(
-            tenant_id=tenant_id, user_id=target_user_id, name=name, now=datetime.now(UTC)
+        hit = await store.soft_delete_by_id(
+            tenant_id=tenant_id,
+            user_id=target_user_id,
+            artifact_id=artifact_id,
+            now=datetime.now(UTC),
         )
         # Hides cross-user / already-deleted / unknown behind the same 404.
         if not hit:
@@ -313,20 +338,21 @@ def build_artifacts_router() -> APIRouter:
             actor_id=actor_id,
             action=AuditAction.ARTIFACT_DELETE,
             resource_type="artifact",
-            resource_id=name,
+            resource_id=str(artifact_id),
             result=AuditResult.SUCCESS,
             trace_id=current_trace_id_hex(),
             details={"user_id": str(target_user_id)},
         )
-        return JSONResponse(status_code=200, content={"deleted": name})
+        return JSONResponse(status_code=200, content={"deleted": str(artifact_id)})
 
+    # B-50 —— 路径参数从 ``{name}`` 换成 ``{artifact_id}``,理由同 download。
     @router.patch(
-        "/{name:path}",
+        "/{artifact_id}",
         response_model=None,
         dependencies=[Depends(console_only()), Depends(require("session", "write"))],
     )
     async def patch_artifact(
-        name: str,
+        artifact_id: UUID,
         body: _ArtifactPatchBody,
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
@@ -337,7 +363,7 @@ def build_artifacts_router() -> APIRouter:
     ) -> JSONResponse:
         """Mini-ADR J-25 — update an artifact's mutable fields (M0: ``kind``).
 
-        Returns 404 when the name is unknown / soft-deleted /
+        Returns 404 when the id is unknown / soft-deleted /
         cross-user (same hiding rule as the other endpoints). Returns
         409 when ``kind`` is unchanged so callers know the PATCH was a
         no-op and can stop retrying.
@@ -352,7 +378,7 @@ def build_artifacts_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="artifact not found")
         current_user_id_var.set(target_user_id)
         updated = await store.update_kind(
-            tenant_id=tenant_id, user_id=target_user_id, name=name, kind=body.kind
+            tenant_id=tenant_id, user_id=target_user_id, artifact_id=artifact_id, kind=body.kind
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="artifact not found")
@@ -363,7 +389,7 @@ def build_artifacts_router() -> APIRouter:
             actor_id=actor_id,
             action=AuditAction.ARTIFACT_UPDATE,
             resource_type="artifact",
-            resource_id=name,
+            resource_id=str(artifact_id),
             result=AuditResult.SUCCESS,
             trace_id=current_trace_id_hex(),
             details={"user_id": str(target_user_id), "kind": body.kind},
@@ -371,17 +397,20 @@ def build_artifacts_router() -> APIRouter:
         return JSONResponse(
             status_code=200,
             content={
+                "id": str(updated.id),
+                "agent_key": updated.agent_key,
                 "name": updated.name,
                 "kind": updated.kind,
                 "latest_version": updated.latest_version,
             },
         )
 
+    # B-50 —— 路径参数从 ``{name}`` 换成 ``{artifact_id}``,理由同 download。
     @router.get(
-        "/{name:path}/versions", response_model=None, dependencies=[Depends(console_only())]
+        "/{artifact_id}/versions", response_model=None, dependencies=[Depends(console_only())]
     )
     async def list_versions(
-        name: str,
+        artifact_id: UUID,
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
@@ -403,7 +432,7 @@ def build_artifacts_router() -> APIRouter:
             tenant_id,
             audit,
             trace_id=current_trace_id_hex(),
-            endpoint="GET /v1/artifacts/{name}/versions",
+            endpoint="GET /v1/artifacts/{artifact_id}/versions",
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
         target_user_id = await resolve_target_user_id(request, users, requested=user_id)
@@ -412,7 +441,7 @@ def build_artifacts_router() -> APIRouter:
         current_user_id_var.set(target_user_id)
         async with applied_scope(scope):
             versions = await store.list_versions(
-                tenant_id=scope.tenant_id, user_id=target_user_id, name=name
+                tenant_id=scope.tenant_id, user_id=target_user_id, artifact_id=artifact_id
             )
         if versions is None:
             raise HTTPException(status_code=404, detail="artifact not found")
@@ -427,6 +456,6 @@ def build_artifacts_router() -> APIRouter:
             }
             for v in versions
         ]
-        return JSONResponse(content={"name": name, "versions": items})
+        return JSONResponse(content={"id": str(artifact_id), "versions": items})
 
     return router

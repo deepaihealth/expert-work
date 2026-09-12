@@ -21,6 +21,19 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
+
+async def _only_id(store: object, tenant_id: UUID, user_id: UUID, name: str) -> UUID:
+    """B-50 —— ``update_kind`` / ``list_versions`` 改按 ``artifact_id`` 寻址
+    (四元组键之后 name 不是身份)。测试里先按 name 找到那一行的 id。"""
+    rows = await store.list_for_user(  # type: ignore[attr-defined]
+        tenant_id=tenant_id, user_id=user_id, agent_key=None, include_deleted=True
+    )
+    return UUID(str(next(a.id for a in rows if a.name == name)))
+
+
 pytestmark = pytest.mark.integration
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
@@ -57,6 +70,7 @@ async def test_save_version_round_trip_and_bump(sql_store: SqlStoreFixture) -> N
         v1 = await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="report.md",
@@ -68,6 +82,7 @@ async def test_save_version_round_trip_and_bump(sql_store: SqlStoreFixture) -> N
         v2 = await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="report.md",
@@ -76,7 +91,9 @@ async def test_save_version_round_trip_and_bump(sql_store: SqlStoreFixture) -> N
         assert v2.version == 2
         assert v2.artifact_id == v1.artifact_id
 
-        artifacts = await store.list_for_user(tenant_id=tenant_id, user_id=user_id)
+        artifacts = await store.list_for_user(
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY
+        )
         assert len(artifacts) == 1
         assert artifacts[0].latest_version == 2
         assert artifacts[0].kind == "document"
@@ -94,14 +111,23 @@ async def test_list_for_user_isolates_tenant_and_user(sql_store: SqlStoreFixture
             await store.save_version(
                 tenant_id=tenant_id,
                 user_id=user_id,
+                agent_key=_AGENT_KEY,
                 name="shared-name",
                 kind="data",
                 path_in_workspace="shared-name",
                 created_in_thread="t",
             )
-        assert len(await store.list_for_user(tenant_id=tenant_a, user_id=user_x)) == 1
-        assert len(await store.list_for_user(tenant_id=tenant_b, user_id=user_x)) == 1
-        assert await store.list_for_user(tenant_id=uuid4(), user_id=user_x) == []
+        assert (
+            len(await store.list_for_user(tenant_id=tenant_a, user_id=user_x, agent_key=_AGENT_KEY))
+            == 1
+        )
+        assert (
+            len(await store.list_for_user(tenant_id=tenant_b, user_id=user_x, agent_key=_AGENT_KEY))
+            == 1
+        )
+        assert (
+            await store.list_for_user(tenant_id=uuid4(), user_id=user_x, agent_key=_AGENT_KEY) == []
+        )
     finally:
         await engine.dispose()
 
@@ -114,6 +140,7 @@ async def test_get_latest_version_and_digest_backfill(sql_store: SqlStoreFixture
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="v1.md",
@@ -122,13 +149,14 @@ async def test_get_latest_version_and_digest_backfill(sql_store: SqlStoreFixture
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="v2.md",
             created_in_thread="t-2",
         )
         latest = await store.get_latest_version(
-            tenant_id=tenant_id, user_id=user_id, name="report.md"
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, name="report.md"
         )
         assert latest is not None
         assert latest.version == 2
@@ -137,14 +165,16 @@ async def test_get_latest_version_and_digest_backfill(sql_store: SqlStoreFixture
 
         await store.set_version_digest(version_id=latest.id, size_bytes=4096, sha256="deadbeef")
         refreshed = await store.get_latest_version(
-            tenant_id=tenant_id, user_id=user_id, name="report.md"
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, name="report.md"
         )
         assert refreshed is not None
         assert refreshed.size_bytes == 4096
         assert refreshed.sha256 == "deadbeef"
 
         assert (
-            await store.get_latest_version(tenant_id=tenant_id, user_id=user_id, name="nope")
+            await store.get_latest_version(
+                tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, name="nope"
+            )
             is None
         )
     finally:
@@ -164,6 +194,7 @@ async def test_soft_delete_hides_from_list_and_get(sql_store: SqlStoreFixture) -
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="report.md",
@@ -171,25 +202,30 @@ async def test_soft_delete_hides_from_list_and_get(sql_store: SqlStoreFixture) -
         )
         now = datetime.now(UTC)
         hit = await store.soft_delete(
-            tenant_id=tenant_id, user_id=user_id, name="report.md", now=now
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, name="report.md", now=now
         )
         assert hit is True
         # Default list hides; include_deleted=True reveals + ``deleted_at``
         # round-trips.
-        assert await store.list_for_user(tenant_id=tenant_id, user_id=user_id) == []
+        assert (
+            await store.list_for_user(tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY)
+            == []
+        )
         deleted = await store.list_for_user(
-            tenant_id=tenant_id, user_id=user_id, include_deleted=True
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, include_deleted=True
         )
         assert len(deleted) == 1
         assert deleted[0].deleted_at is not None
         # get_latest_version hides soft-deleted.
         assert (
-            await store.get_latest_version(tenant_id=tenant_id, user_id=user_id, name="report.md")
+            await store.get_latest_version(
+                tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, name="report.md"
+            )
             is None
         )
         # Second soft-delete is a no-op miss.
         assert not await store.soft_delete(
-            tenant_id=tenant_id, user_id=user_id, name="report.md", now=now
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, name="report.md", now=now
         )
     finally:
         await engine.dispose()
@@ -206,6 +242,7 @@ async def test_save_version_undeletes_soft_deleted_row(
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="v1.md",
@@ -214,19 +251,23 @@ async def test_save_version_undeletes_soft_deleted_row(
         await store.soft_delete(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             now=datetime.now(UTC),
         )
         v2 = await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="v2.md",
             created_in_thread="t-2",
         )
         assert v2.version == 2
-        active = await store.list_for_user(tenant_id=tenant_id, user_id=user_id)
+        active = await store.list_for_user(
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY
+        )
         assert len(active) == 1
         assert active[0].deleted_at is None
     finally:
@@ -244,6 +285,7 @@ async def test_list_expired_returns_soft_deleted_past_horizon(
             await store.save_version(
                 tenant_id=tenant_id,
                 user_id=user_id,
+                agent_key=_AGENT_KEY,
                 name=name,
                 kind="document",
                 path_in_workspace=name,
@@ -251,9 +293,15 @@ async def test_list_expired_returns_soft_deleted_past_horizon(
             )
         old_time = datetime.now(UTC) - timedelta(days=70)
         recent_time = datetime.now(UTC) - timedelta(days=10)
-        await store.soft_delete(tenant_id=tenant_id, user_id=user_id, name="old.md", now=old_time)
         await store.soft_delete(
-            tenant_id=tenant_id, user_id=user_id, name="recent.md", now=recent_time
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, name="old.md", now=old_time
+        )
+        await store.soft_delete(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_key=_AGENT_KEY,
+            name="recent.md",
+            now=recent_time,
         )
         cutoff = datetime.now(UTC) - timedelta(days=60)
         expired = await store.list_expired(before=cutoff)
@@ -272,6 +320,7 @@ async def test_list_active_past_retention_picks_stale_active_only(
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="stale.md",
             kind="document",
             path_in_workspace="stale.md",
@@ -292,6 +341,7 @@ async def test_list_active_past_retention_picks_stale_active_only(
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="fresh.md",
             kind="document",
             path_in_workspace="fresh.md",
@@ -314,13 +364,15 @@ async def test_update_kind_changes_kind_and_hides_when_soft_deleted(
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             kind="document",
             path_in_workspace="report.md",
             created_in_thread="t-1",
         )
+        artifact_id = await _only_id(store, tenant_id, user_id, "report.md")
         updated = await store.update_kind(
-            tenant_id=tenant_id, user_id=user_id, name="report.md", kind="code"
+            tenant_id=tenant_id, user_id=user_id, artifact_id=artifact_id, kind="code"
         )
         assert updated is not None
         assert updated.kind == "code"
@@ -328,12 +380,13 @@ async def test_update_kind_changes_kind_and_hides_when_soft_deleted(
         await store.soft_delete(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="report.md",
             now=datetime.now(UTC),
         )
         assert (
             await store.update_kind(
-                tenant_id=tenant_id, user_id=user_id, name="report.md", kind="data"
+                tenant_id=tenant_id, user_id=user_id, artifact_id=artifact_id, kind="data"
             )
             is None
         )
@@ -350,17 +403,22 @@ async def test_list_versions_desc_or_none(sql_store: SqlStoreFixture) -> None:
             await store.save_version(
                 tenant_id=tenant_id,
                 user_id=user_id,
+                agent_key=_AGENT_KEY,
                 name="report.md",
                 kind="document",
                 path_in_workspace=path,
                 created_in_thread="t",
             )
-        versions = await store.list_versions(tenant_id=tenant_id, user_id=user_id, name="report.md")
+        artifact_id = await _only_id(store, tenant_id, user_id, "report.md")
+        versions = await store.list_versions(
+            tenant_id=tenant_id, user_id=user_id, artifact_id=artifact_id
+        )
         assert versions is not None
         assert [v.version for v in versions] == [3, 2, 1]
-        # Unknown name → None.
+        # Unknown id → None.
         assert (
-            await store.list_versions(tenant_id=tenant_id, user_id=user_id, name="missing") is None
+            await store.list_versions(tenant_id=tenant_id, user_id=user_id, artifact_id=uuid4())
+            is None
         )
     finally:
         await engine.dispose()
@@ -376,6 +434,7 @@ async def test_hard_delete_removes_artifact_and_versions(
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="doomed.md",
             kind="document",
             path_in_workspace="v1.md",
@@ -384,19 +443,24 @@ async def test_hard_delete_removes_artifact_and_versions(
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
+            agent_key=_AGENT_KEY,
             name="doomed.md",
             kind="document",
             path_in_workspace="v2.md",
             created_in_thread="t-2",
         )
-        artifacts = await store.list_for_user(tenant_id=tenant_id, user_id=user_id)
+        artifacts = await store.list_for_user(
+            tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY
+        )
         assert len(artifacts) == 1
         artifact_id = artifacts[0].id
         removed = await store.hard_delete(artifact_ids=[artifact_id])
         assert removed == 1
         # Both artifact and version rows gone.
         assert (
-            await store.list_for_user(tenant_id=tenant_id, user_id=user_id, include_deleted=True)
+            await store.list_for_user(
+                tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT_KEY, include_deleted=True
+            )
             == []
         )
         # Empty list is a no-op.
@@ -423,6 +487,7 @@ async def test_version_retention_methods_round_trip(sql_store: SqlStoreFixture) 
             v = await store.save_version(
                 tenant_id=tenant_a,
                 user_id=user_a,
+                agent_key=_AGENT_KEY,
                 name="a.md",
                 kind="document",
                 path_in_workspace=path,
@@ -432,6 +497,7 @@ async def test_version_retention_methods_round_trip(sql_store: SqlStoreFixture) 
         vb = await store.save_version(
             tenant_id=tenant_b,
             user_id=user_b,
+            agent_key=_AGENT_KEY,
             name="b.md",
             kind="document",
             path_in_workspace="b.v1",
@@ -467,24 +533,36 @@ async def test_version_retention_methods_round_trip(sql_store: SqlStoreFixture) 
         assert await store.mark_expired_if_versionless(artifact_id=artifact_a, now=now) is False
         remaining = await store.list_versions_by_artifact(artifact_id=artifact_a)
         assert [x.version for x in remaining] == [3]
-        latest = await store.get_latest_version(tenant_id=tenant_a, user_id=user_a, name="a.md")
+        latest = await store.get_latest_version(
+            tenant_id=tenant_a, user_id=user_a, agent_key=_AGENT_KEY, name="a.md"
+        )
         assert latest is not None and latest.version == 3
 
         assert await store.delete_versions(version_ids=[vb.id]) == 1
         assert await store.mark_expired_if_versionless(artifact_id=vb.artifact_id, now=now) is True
         assert await store.mark_expired_if_versionless(artifact_id=vb.artifact_id, now=now) is False
         assert (
-            await store.get_latest_version(tenant_id=tenant_b, user_id=user_b, name="b.md") is None
+            await store.get_latest_version(
+                tenant_id=tenant_b, user_id=user_b, agent_key=_AGENT_KEY, name="b.md"
+            )
+            is None
         )
         deleted = await store.list_for_user(
-            tenant_id=tenant_b, user_id=user_b, include_deleted=True
+            tenant_id=tenant_b, user_id=user_b, agent_key=_AGENT_KEY, include_deleted=True
         )
         assert len(deleted) == 1 and deleted[0].deleted_at is not None
         # Soft-deleted parent: list_versions hides it, list_versions_by_artifact does not.
-        assert await store.list_versions(tenant_id=tenant_b, user_id=user_b, name="b.md") is None
+        assert (
+            await store.list_versions(
+                tenant_id=tenant_b, user_id=user_b, artifact_id=vb.artifact_id
+            )
+            is None
+        )
         assert await store.list_versions_by_artifact(artifact_id=vb.artifact_id) == []
         # A soft-deleted parent that still has versions is listable too.
-        await store.soft_delete(tenant_id=tenant_a, user_id=user_a, name="a.md", now=now)
+        await store.soft_delete(
+            tenant_id=tenant_a, user_id=user_a, agent_key=_AGENT_KEY, name="a.md", now=now
+        )
         still = await store.list_versions_by_artifact(artifact_id=artifact_a)
         assert [x.version for x in still] == [3]
     finally:
@@ -506,6 +584,7 @@ async def test_list_versions_expired_orders_same_timestamp_by_version(
             v = await store.save_version(
                 tenant_id=tenant_id,
                 user_id=user_id,
+                agent_key=_AGENT_KEY,
                 name="tie.md",
                 kind="document",
                 path_in_workspace=path,

@@ -52,6 +52,9 @@ from expert_work.protocol import (
 )
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -283,6 +286,7 @@ async def app_state() -> AsyncIterator[tuple[AsyncClient, UUID]]:
         await artifact_store.save_version(
             tenant_id=tenant,
             user_id=seeded_users[tenant],
+            agent_key=_AGENT_KEY,
             name=f"file-{tenant.hex[:6]}.md",
             kind="document",
             path_in_workspace="/workspace/file.md",

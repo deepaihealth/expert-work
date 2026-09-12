@@ -45,9 +45,9 @@ from expert_work.persistence import ApprovalStore, ThreadMetaStore, TriggerStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.protocol import AgentSpecStatus, AuditAction, TriggerRecord
+from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator import AgentFactoryError, run_agent
-from orchestrator.tools.skill_seed import sanitize_agent_key
 
 logger = logging.getLogger("expert_work.control_plane.trigger_firing")
 

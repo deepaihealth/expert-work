@@ -46,6 +46,9 @@ from expert_work.protocol import (
 )
 from expert_work.runtime.runs import DisconnectMode, InMemoryRunStore, RunInfo, RunStatus
 
+#: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
+_AGENT_KEY = "test-agent-0badc0de"
+
 _NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
 
 
@@ -296,6 +299,7 @@ async def test_artifact_delete_all_for_user_removes_only_target() -> None:
     await store.save_version(
         tenant_id=tenant,
         user_id=a,
+        agent_key=_AGENT_KEY,
         name="doc",
         kind="document",
         path_in_workspace="/w/doc",
@@ -304,14 +308,20 @@ async def test_artifact_delete_all_for_user_removes_only_target() -> None:
     await store.save_version(
         tenant_id=tenant,
         user_id=b,
+        agent_key=_AGENT_KEY,
         name="doc",
         kind="document",
         path_in_workspace="/w/doc",
         created_in_thread="t",
     )
     assert await store.delete_all_for_user(tenant_id=tenant, user_id=a) == 1
-    assert await store.list_for_user(tenant_id=tenant, user_id=a, include_deleted=True) == []
-    assert len(await store.list_for_user(tenant_id=tenant, user_id=b)) == 1
+    assert (
+        await store.list_for_user(
+            tenant_id=tenant, user_id=a, agent_key=_AGENT_KEY, include_deleted=True
+        )
+        == []
+    )
+    assert len(await store.list_for_user(tenant_id=tenant, user_id=b, agent_key=_AGENT_KEY)) == 1
     assert await store.delete_all_for_user(tenant_id=tenant, user_id=a) == 0
 
 

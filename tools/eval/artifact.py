@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from pathlib import Path as _Path
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import yaml
 
@@ -53,6 +53,8 @@ THRESHOLD = {"pass_rate": 0.90}
 _TENANT = UUID("00000000-0000-0000-0000-0000000000c9")
 _USER = UUID("00000000-0000-0000-0000-0000000000d9")
 _OTHER_USER = UUID("00000000-0000-0000-0000-0000000000e9")
+#: B-50 —— 这套用例是单 agent 场景,固定一个 key 即可(签名要求必传)。
+_AGENT_KEY = "eval-agent-00000000"
 
 
 Scenario = Literal[
@@ -93,6 +95,7 @@ async def _seed_one(store: InMemoryArtifactStore, *, name: str, kind: str, path:
     await store.save_version(
         tenant_id=_TENANT,
         user_id=_USER,
+        agent_key=_AGENT_KEY,
         name=name,
         kind=kind,  # type: ignore[arg-type]
         path_in_workspace=path,
@@ -105,6 +108,7 @@ async def _run_save_basic() -> tuple[bool, str]:
     version = await store.save_version(
         tenant_id=_TENANT,
         user_id=_USER,
+        agent_key=_AGENT_KEY,
         name="report.md",
         kind="document",
         path_in_workspace="report.md",
@@ -123,6 +127,7 @@ async def _run_save_version_increment() -> tuple[bool, str]:
     v2 = await store.save_version(
         tenant_id=_TENANT,
         user_id=_USER,
+        agent_key=_AGENT_KEY,
         name="x",
         kind="code",
         path_in_workspace="x.py",
@@ -130,7 +135,7 @@ async def _run_save_version_increment() -> tuple[bool, str]:
     )
     if v2.version != 2:
         return False, f"expected v2=2, got {v2.version}"
-    artifacts = await store.list_for_user(tenant_id=_TENANT, user_id=_USER)
+    artifacts = await store.list_for_user(tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY)
     if not artifacts or artifacts[0].latest_version != 2:
         return False, "latest_version not bumped"
     return True, ""
@@ -140,7 +145,7 @@ async def _run_save_keeps_kind() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     await _seed_one(store, name="x", kind="document", path="x.md")
     await _seed_one(store, name="x", kind="code", path="x.md")
-    artifacts = await store.list_for_user(tenant_id=_TENANT, user_id=_USER)
+    artifacts = await store.list_for_user(tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY)
     if artifacts[0].kind != "document":
         return False, f"kind changed to {artifacts[0].kind!r} on re-save"
     return True, ""
@@ -150,16 +155,23 @@ async def _run_soft_delete_hides_from_list() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     await _seed_one(store, name="r.md", kind="document", path="r.md")
     hit = await store.soft_delete(
-        tenant_id=_TENANT, user_id=_USER, name="r.md", now=datetime.now(UTC)
+        tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, name="r.md", now=datetime.now(UTC)
     )
     if not hit:
         return False, "soft_delete reported miss on a known active row"
-    if await store.list_for_user(tenant_id=_TENANT, user_id=_USER) != []:
+    if await store.list_for_user(tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY) != []:
         return False, "soft-deleted row leaked into default list"
-    revealed = await store.list_for_user(tenant_id=_TENANT, user_id=_USER, include_deleted=True)
+    revealed = await store.list_for_user(
+        tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, include_deleted=True
+    )
     if len(revealed) != 1 or revealed[0].deleted_at is None:
         return False, "include_deleted should reveal the soft-deleted row with deleted_at set"
-    if await store.get_latest_version(tenant_id=_TENANT, user_id=_USER, name="r.md") is not None:
+    if (
+        await store.get_latest_version(
+            tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, name="r.md"
+        )
+        is not None
+    ):
         return False, "get_latest_version should hide soft-deleted"
     return True, ""
 
@@ -170,6 +182,7 @@ async def _run_soft_delete_cross_user_misses() -> tuple[bool, str]:
     hit = await store.soft_delete(
         tenant_id=_TENANT,
         user_id=_OTHER_USER,
+        agent_key=_AGENT_KEY,
         name="r.md",
         now=datetime.now(UTC),
     )
@@ -182,8 +195,12 @@ async def _run_soft_delete_idempotent() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     await _seed_one(store, name="r.md", kind="document", path="r.md")
     now = datetime.now(UTC)
-    first = await store.soft_delete(tenant_id=_TENANT, user_id=_USER, name="r.md", now=now)
-    second = await store.soft_delete(tenant_id=_TENANT, user_id=_USER, name="r.md", now=now)
+    first = await store.soft_delete(
+        tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, name="r.md", now=now
+    )
+    second = await store.soft_delete(
+        tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, name="r.md", now=now
+    )
     if not first or second:
         return False, f"expected (True, False), got ({first}, {second})"
     return True, ""
@@ -192,10 +209,13 @@ async def _run_soft_delete_idempotent() -> tuple[bool, str]:
 async def _run_resave_undeletes() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     await _seed_one(store, name="r.md", kind="document", path="v1.md")
-    await store.soft_delete(tenant_id=_TENANT, user_id=_USER, name="r.md", now=datetime.now(UTC))
+    await store.soft_delete(
+        tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, name="r.md", now=datetime.now(UTC)
+    )
     v2 = await store.save_version(
         tenant_id=_TENANT,
         user_id=_USER,
+        agent_key=_AGENT_KEY,
         name="r.md",
         kind="document",
         path_in_workspace="v2.md",
@@ -203,7 +223,7 @@ async def _run_resave_undeletes() -> tuple[bool, str]:
     )
     if v2.version != 2:
         return False, f"re-save should bump version to 2, got {v2.version}"
-    active = await store.list_for_user(tenant_id=_TENANT, user_id=_USER)
+    active = await store.list_for_user(tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY)
     if not active or active[0].deleted_at is not None:
         return False, "re-save should have un-deleted the row"
     return True, ""
@@ -212,7 +232,10 @@ async def _run_resave_undeletes() -> tuple[bool, str]:
 async def _run_update_kind_round_trip() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     await _seed_one(store, name="r.md", kind="document", path="r.md")
-    updated = await store.update_kind(tenant_id=_TENANT, user_id=_USER, name="r.md", kind="code")
+    row = (await store.list_for_user(tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY))[0]
+    updated = await store.update_kind(
+        tenant_id=_TENANT, user_id=_USER, artifact_id=row.id, kind="code"
+    )
     if updated is None or updated.kind != "code":
         return False, f"update_kind round-trip failed: {updated!r}"
     return True, ""
@@ -221,9 +244,12 @@ async def _run_update_kind_round_trip() -> tuple[bool, str]:
 async def _run_update_kind_hides_soft_deleted() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     await _seed_one(store, name="r.md", kind="document", path="r.md")
-    await store.soft_delete(tenant_id=_TENANT, user_id=_USER, name="r.md", now=datetime.now(UTC))
+    row = (await store.list_for_user(tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY))[0]
+    await store.soft_delete(
+        tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY, name="r.md", now=datetime.now(UTC)
+    )
     if (
-        await store.update_kind(tenant_id=_TENANT, user_id=_USER, name="r.md", kind="code")
+        await store.update_kind(tenant_id=_TENANT, user_id=_USER, artifact_id=row.id, kind="code")
         is not None
     ):
         return False, "update_kind should hide soft-deleted rows (None)"
@@ -234,7 +260,8 @@ async def _run_list_versions_desc() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
     for path in ("v1.md", "v2.md", "v3.md"):
         await _seed_one(store, name="r.md", kind="document", path=path)
-    versions = await store.list_versions(tenant_id=_TENANT, user_id=_USER, name="r.md")
+    row = (await store.list_for_user(tenant_id=_TENANT, user_id=_USER, agent_key=_AGENT_KEY))[0]
+    versions = await store.list_versions(tenant_id=_TENANT, user_id=_USER, artifact_id=row.id)
     if versions is None or [v.version for v in versions] != [3, 2, 1]:
         return False, f"expected versions [3,2,1], got {versions}"
     return True, ""
@@ -242,7 +269,7 @@ async def _run_list_versions_desc() -> tuple[bool, str]:
 
 async def _run_list_versions_unknown_returns_none() -> tuple[bool, str]:
     store = InMemoryArtifactStore()
-    rows = await store.list_versions(tenant_id=_TENANT, user_id=_USER, name="missing")
+    rows = await store.list_versions(tenant_id=_TENANT, user_id=_USER, artifact_id=uuid4())
     if rows is not None:
         return False, "list_versions on unknown should return None"
     return True, ""

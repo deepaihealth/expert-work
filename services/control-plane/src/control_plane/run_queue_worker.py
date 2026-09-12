@@ -50,10 +50,10 @@ from expert_work.persistence.rls import (
     current_user_id_var,
 )
 from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
 from orchestrator import AgentFactoryError, run_agent
-from orchestrator.tools.skill_seed import sanitize_agent_key
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
