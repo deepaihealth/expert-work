@@ -5,7 +5,8 @@ The Sandbox Supervisor (Stream F.1) attaches to the container's stdio,
 writes one request object per line, and reads one response per line:
 
     → {"code": "<python source>", "timeout_s": 30}
-    → {"code": "...", "timeout_s": 30, "envs": {"PYTHONUSERBASE": "/opt/agents/a1"}}
+    → {"code": "...", "timeout_s": 30, "envs": {"PYTHONUSERBASE": "/opt/agents/a1"},
+       "cwd": "/workspace/agents/a1"}
     ← {"stdout": "...", "stderr": "...", "exit_code": 0, "timed_out": false}
 
 ``envs`` (sandbox migration wave 2, spec 决策 10) is optional and merged onto
@@ -48,7 +49,12 @@ MAX_OUTPUT_CHARS = 1_000_000
 Response = dict[str, str | int | bool]
 
 
-def run_once(code: str, timeout_s: int, envs: dict[str, str] | None = None) -> Response:
+def run_once(
+    code: str,
+    timeout_s: int,
+    envs: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> Response:
     """Run ``code`` in a child Python process; capture stdout / stderr / exit.
 
     ``timeout_s`` is clamped to ``[1, MAX_TIMEOUT_S]``. On timeout the
@@ -59,9 +65,34 @@ def run_once(code: str, timeout_s: int, envs: dict[str, str] | None = None) -> R
     process env (and every other sandbox this runner never sees) is
     untouched. ``None``/empty → the child inherits exactly what the runner
     itself has, unchanged (pre-feature behaviour).
+
+    ``cwd`` (B-50) is the child's working directory — the per-exec knob the
+    agent-scoped workspace layout needs. The container's own ``--workdir`` is
+    set once at creation, but a warm sandbox is reused across every agent of
+    one ``(tenant, user)``, so the directory has to travel with the call. Same
+    shape the hosted sandboxes expose (E2B / Daytona ``cwd``; OpenAI's
+    per-command ``cwd``). ``None`` → the runner's own cwd, unchanged.
+
+    It decides where **relative paths resolve**, not what the child may reach:
+    the child can still ``chdir`` or use absolute paths. Confinement lives in
+    the file tools (spec §5.3), and that is deliberate.
+
+    A missing directory is **created**, not fallen back from. The agent's
+    directory does not exist until something writes into it, and ``acquire``
+    cannot pre-create it: a warm sandbox is claimed without an agent identity
+    at all (the pool keys on ``(tenant, user)``), so the first exec is the
+    earliest moment the directory is even known. Falling back to the runner's
+    own cwd instead would drop the exec into the shared user root — precisely
+    the bug B-50 exists to fix — and do it silently. A ``mkdir`` that genuinely
+    fails (a file in the way, no permission) is still reported as an error.
     """
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
     child_env = {**os.environ, **envs} if envs else None
+    if cwd is not None:
+        try:
+            os.makedirs(cwd, exist_ok=True)
+        except OSError as exc:
+            return _error(f"cannot use cwd {cwd!r}: {exc}")
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
             # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
@@ -74,6 +105,7 @@ def run_once(code: str, timeout_s: int, envs: dict[str, str] | None = None) -> R
             timeout=timeout_s,
             check=False,
             env=child_env,
+            cwd=cwd,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -105,7 +137,9 @@ def handle_request(request: dict[str, object]) -> Response:
         if isinstance(raw_envs, dict)
         else None
     )
-    return run_once(code, timeout_s, envs)
+    raw_cwd = request.get("cwd")
+    cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
+    return run_once(code, timeout_s, envs, cwd)
 
 
 def handle_line(line: str) -> Response:

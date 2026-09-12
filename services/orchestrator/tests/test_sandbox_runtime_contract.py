@@ -1431,3 +1431,103 @@ def test_contract_fixture_accounts_for_every_mandated_env() -> None:
         " 每多一项都要在 _FIXTURE_ENV_DISPOSITION 里显式决定:契约档要它,还是"
         " 有理由不要(把理由写下来)。"
     )
+
+
+# ---------------------------------------------------------------------------
+# B-50 PR3b —— per-exec ``cwd``:两个后端的取值必须逐字一致。
+#
+# 机制注定不同,这是后端差异不是 bug:
+#   * supervisor 档 —— ``cwd`` 作为 ``ExecRequest`` 字段送到 runner,
+#     ``os.makedirs`` + ``subprocess.run(cwd=)``。
+#   * agent_sandbox 档 —— E2B 的 ``cwd=`` 是**执行前**校验的,目录还没建
+#     exec 就失败了,所以走 ``mkdir -p && cd`` 前缀。
+# 可观测结果(``os.getcwd()``)必须一样,这才是契约。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_cwd_is_agent_scoped(runtime: SandboxRuntime) -> None:
+    """绑了 agent 的 exec,相对路径从 ``/workspace/agents/<key>`` 解析。"""
+    sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sandbox_id,
+            code="import os; print(os.getcwd())",
+            timeout_s=30,
+            agent_key="plan-aaaaaaaa",
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        assert outcome.stdout.strip() == "/workspace/agents/plan-aaaaaaaa"
+    finally:
+        await runtime.release(sandbox_id=sandbox_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_cwd_without_agent_key_stays_at_workspace_root(
+    runtime: SandboxRuntime,
+) -> None:
+    """未绑 agent = 改动前的行为,一字不差。"""
+    sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract-unbound")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sandbox_id,
+            code="import os; print(os.getcwd())",
+            timeout_s=30,
+            agent_key="",
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        assert outcome.stdout.strip() == "/workspace"
+    finally:
+        await runtime.release(sandbox_id=sandbox_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_cwd_is_created_when_missing(runtime: SandboxRuntime) -> None:
+    """agent 目录第一次用时不存在 —— 必须自动建出来,而不是报错或退回用户根。
+
+    ``acquire`` 补不上这一步:温沙箱是**不带 agent 身份**被认领的(池按
+    ``(tenant, user)`` 键,spec §三),第一次 exec 才是最早知道目录名的时刻。
+    """
+    key = f"fresh-{uuid4().hex[:8]}"
+    sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract-fresh")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sandbox_id,
+            code="import os; print(os.path.isdir(os.getcwd()), os.getcwd())",
+            timeout_s=30,
+            agent_key=key,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        assert outcome.stdout.strip() == f"True /workspace/agents/{key}"
+    finally:
+        await runtime.release(sandbox_id=sandbox_id)
+
+
+def test_both_backends_derive_cwd_from_one_function() -> None:
+    """两个后端的 cwd **取值**必须来自同一个函数,不许各写各的字面量。
+
+    与本文件其它漂移断言同理,刻意**不**打 ``integration`` marker:它只读源码,
+    不连任何真实环境,所以每一次全仓扫描都跑得到 —— 上面那三条契约测试要真
+    集群才跑,平时是 skip 的,只靠它们的话「两边字面量漂了」没有任何东西会发现。
+    """
+    import ast
+    import pathlib
+
+    tools = pathlib.Path(__file__).resolve().parents[1] / "src" / "orchestrator" / "tools"
+    for module in ("sandbox.py", "agent_sandbox.py"):
+        source = (tools / module).read_text(encoding="utf-8")
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "agent_workspace_root"
+        ]
+        assert calls, f"{module} 没有调用 agent_workspace_root —— cwd 取值漂了"
+        assert "/workspace/agents" not in source, (
+            f"{module} 里出现了硬编码的 agent 路径字面量;取值只许来自 "
+            "workspace_paths.agent_workspace_root"
+        )

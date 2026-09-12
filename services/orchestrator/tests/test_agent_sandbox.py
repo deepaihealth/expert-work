@@ -2569,3 +2569,28 @@ async def test_release_survives_a_failing_refresh_soon() -> None:
     assert gate.refresh_calls == [(tenant_id, user_id)]
     assert sdk.sandbox.killed is True, "refresh_soon 抛异常不该阻止真正的销毁"
     assert store.mark_destroyed_calls == [(sandbox_id, "release")]
+
+
+@pytest.mark.asyncio
+async def test_exec_enters_the_agent_directory_after_tightening_umask() -> None:
+    """B-50 PR3b —— 绑了 agent 时 ``mkdir -p`` + ``cd`` 进自己的目录,
+    但**排在 ``umask 077`` 之后**。
+
+    顺序是有内容的:反过来写(先 mkdir)新建的 agent 目录会拿到默认 umask 的
+    ``0o755``,而这个工作区的目标状态是属主专用的 ``0o700``
+    (见 ``test_exec_sets_owner_only_umask_before_running_the_script``)。
+
+    用 ``mkdir -p`` + ``cd`` 而不是 ``cwd=`` 参数,是因为 E2B 在**执行前**校验
+    ``cwd``:agent 目录在有人往里写之前不存在,exec 会先失败,mkdir 根本轮不上。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="plan-aaaaaaaa")
+
+    cmd, *_ = sdk.sandbox.commands.calls[-1]
+    assert cmd.startswith(
+        "umask 077 && mkdir -p /workspace/agents/plan-aaaaaaaa && "
+        "cd /workspace/agents/plan-aaaaaaaa && python "
+    ), cmd

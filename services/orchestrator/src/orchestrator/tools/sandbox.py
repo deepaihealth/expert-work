@@ -37,6 +37,7 @@ from expert_work.common.observability import inject_context
 from expert_work.persistence import SANDBOX_AGENTS_ROOT
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.workspace_paths import USER_ROOT, agent_workspace_root
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +291,13 @@ class HTTPSupervisorRuntime:
         envs = agent_key_envs(agent_key)
         if envs:
             payload["envs"] = envs
+        # B-50 —— per-exec cwd,与 ``envs`` 同一条通道、同一个理由:温沙箱按
+        # ``(tenant, user)`` 复用,容器的 ``--workdir`` 是建容器时钉死的,表达
+        # 不了 per-agent。两个后端都调 ``agent_workspace_root`` 这一个函数,取值
+        # 逐字一致(``test_sandbox_runtime_contract.py`` 钉这件事)。
+        cwd = agent_workspace_root(agent_key)
+        if cwd != USER_ROOT:
+            payload["cwd"] = cwd
         # The sandbox enforces the exec wall-clock (it SIGKILLs + returns
         # ``timed_out``); the HTTP read timeout must OUTLAST that enforcement so
         # the orchestrator receives the real outcome instead of giving up early
@@ -710,7 +718,9 @@ class ExecPythonTool:
             description=(
                 "Execute a Python 3 snippet in an isolated sandbox and return "
                 "its stdout / stderr / exit code. Use for calculations, data "
-                "transforms, or anything better done by running code."
+                "transforms, or anything better done by running code. Starts in "
+                "your own workspace directory, so relative paths match the file "
+                "tools."
             ),
             parameters={
                 "type": "object",
