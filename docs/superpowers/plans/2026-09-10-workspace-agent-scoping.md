@@ -340,7 +340,7 @@ git commit -m "feat(workspace): 四条执行入口把 agent_key 送进 configura
 
 ---
 
-## Task 3: 迁移 —— `artifact` 加 `agent_key` 列、回填、换唯一约束
+## Task 3: 迁移 —— `artifact` 加 `agent_key` 列、回填、换唯一约束 —— ✅ 已交付(#1509)
 
 **Files:**
 - Create: `packages/expert-work-persistence/migrations/versions/0154_artifact_agent_key.py`
@@ -378,13 +378,13 @@ async def test_two_agents_same_artifact_name_are_two_rows(pg_store) -> None:
     a = await pg_store.save_version(
         tenant_id=tenant_id, user_id=user_id, agent_key="plan-aaaaaaaa",
         name="报告.docx", kind="document",
-        path_in_workspace="agents/plan-aaaaaaaa/artifacts/报告.docx",
+        path_in_workspace="agents/plan-aaaaaaaa/报告.docx",
         created_in_thread=str(uuid4()),
     )
     b = await pg_store.save_version(
         tenant_id=tenant_id, user_id=user_id, agent_key="sop-bbbbbbbb",
         name="报告.docx", kind="document",
-        path_in_workspace="agents/sop-bbbbbbbb/artifacts/报告.docx",
+        path_in_workspace="agents/sop-bbbbbbbb/报告.docx",
         created_in_thread=str(uuid4()),
     )
     assert a.artifact_id != b.artifact_id
@@ -397,7 +397,7 @@ async def test_same_agent_same_name_still_bumps_version(pg_store) -> None:
     kw = dict(
         tenant_id=tenant_id, user_id=user_id, agent_key="plan-aaaaaaaa",
         name="报告.docx", kind="document",
-        path_in_workspace="agents/plan-aaaaaaaa/artifacts/报告.docx",
+        path_in_workspace="agents/plan-aaaaaaaa/报告.docx",
     )
     v1 = await pg_store.save_version(**kw, created_in_thread=str(uuid4()))
     v2 = await pg_store.save_version(**kw, created_in_thread=str(uuid4()))
@@ -659,7 +659,7 @@ git commit -m "feat(workspace): artifact 加 agent_key 列 + 唯一键换四元�
 
 ---
 
-## Task 4: `ArtifactStore` 四个方法加 `agent_key`
+## Task 4: `ArtifactStore` 四个方法加 `agent_key` —— ✅ 已交付(#1509,实际动了七个方法)
 
 **Files:**
 - Modify: `packages/expert-work-persistence/src/expert_work/persistence/artifact/base.py:30,52,80,101`
@@ -689,12 +689,12 @@ async def test_list_for_user_filters_by_agent_key(store) -> None:
     t, u = uuid4(), uuid4()
     await store.save_version(
         tenant_id=t, user_id=u, agent_key="plan-aaaaaaaa", name="计划.docx",
-        kind="document", path_in_workspace="agents/plan-aaaaaaaa/artifacts/计划.docx",
+        kind="document", path_in_workspace="agents/plan-aaaaaaaa/计划.docx",
         created_in_thread=str(uuid4()),
     )
     await store.save_version(
         tenant_id=t, user_id=u, agent_key="sop-bbbbbbbb", name="评审.docx",
-        kind="document", path_in_workspace="agents/sop-bbbbbbbb/artifacts/评审.docx",
+        kind="document", path_in_workspace="agents/sop-bbbbbbbb/评审.docx",
         created_in_thread=str(uuid4()),
     )
 
@@ -743,7 +743,21 @@ git commit -m "feat(workspace): ArtifactStore 四个方法带 agent_key,两个�
 
 ---
 
-## Task 5: `SaveArtifactTool` / `ListArtifactsTool` 用 `agent_key`
+## Task 5: `SaveArtifactTool` / `ListArtifactsTool` 用 `agent_key` —— ⚠️ 部分交付(#1509)
+
+> **交付状态**:`save_version(agent_key=ctx.agent_key)` 与 `list_artifacts` 只列本 agent
+> **已随 PR2 交付**;`path_in_workspace` 加前缀这一半**没做,顺延到 PR3(Task 7)**。
+>
+> **勘误一(为什么 PR2 不能加前缀)**:`path_in_workspace` 是下载端点真去读的物理路径,
+> 而文件是 `write_file` 早先落的盘 —— 它的根目录要到 PR3(Task 6/7)才改。PR2 就加前缀
+> = 每一次下载 404。已钉 `test_path_in_workspace_keeps_the_agents_own_relative_path`。
+>
+> **勘误二(前缀的形状本身也是错的)**:下面写的 `agents/<agent_key>/artifacts/<path>`
+> 多了 `artifacts/` 这一段。`save_artifact` 不搬字节,没有任何东西往那个目录写;
+> Task 6 的 `resolve_scope` 把 `write_file("报告.docx")` 解析到
+> `/workspace/agents/<key>/报告.docx`。正确形状是 **`agents/<agent_key>/<path>`**。
+> 见 spec §四勘误(2026-09-12)。下面的代码与断言已按定论改过。
+
 
 **Files:**
 - Modify: `services/orchestrator/src/orchestrator/tools/artifact.py:46,130,188`
@@ -751,7 +765,7 @@ git commit -m "feat(workspace): ArtifactStore 四个方法带 agent_key,两个�
 
 **Interfaces:**
 - Consumes: `ToolContext.agent_key`(Task 1)、`ArtifactStore`(Task 4)
-- Produces: `path_in_workspace` 形如 `agents/<agent_key>/artifacts/<path>`
+- Produces: `path_in_workspace` 形如 `agents/<agent_key>/<path>`(**09-12 勘误后**,原写含 `artifacts/` 段)
 
 > **`path_in_workspace` 存含前缀的完整相对路径**,于是 spec §7.3 列的七个下游消费点
 > (控制台/对外/会话三处下载 + MIME + 留存 unlink)**一行都不用改** —— 它们都是拿这一列
@@ -769,7 +783,7 @@ async def test_save_artifact_lands_under_agent_dir() -> None:
         tenant_id=ctx.tenant_id, user_id=ctx.user_id,
         agent_key="plan-aaaaaaaa", name="报告.docx",
     )
-    assert v.path_in_workspace == "agents/plan-aaaaaaaa/artifacts/报告.docx"
+    assert v.path_in_workspace == "agents/plan-aaaaaaaa/报告.docx"
 
 
 async def test_list_artifacts_only_shows_own() -> None:
@@ -790,7 +804,7 @@ async def test_list_artifacts_only_shows_own() -> None:
 
 
 async def test_save_artifact_without_agent_key_keeps_flat_path() -> None:
-    """迁移期回落:没绑 agent 的调用仍写扁平路径,不造出 agents//artifacts/。"""
+    """迁移期回落:没绑 agent 的调用仍写扁平路径,不造出 agents// 这种第三形状。"""
     store = InMemoryArtifactStore()
     ctx = _ctx(agent_key="")
     await SaveArtifactTool(store=store).call({"name": "报告.docx"}, ctx=ctx)
@@ -809,11 +823,11 @@ def _artifact_path(agent_key: str, path: str) -> str:
     """产物在工作区里的相对路径 —— 含 agent 前缀。
 
     ``agent_key`` 为空(迁移期未升级的调用方 / 临时沙箱)时保持扁平路径,
-    否则会拼出 ``agents//artifacts/x`` 这种既非旧位置也非新位置的第三种形状。
+    否则会拼出 ``agents//x`` 这种既非旧位置也非新位置的第三种形状。
     """
     if not agent_key:
         return path
-    return f"agents/{agent_key}/artifacts/{path}"
+    return f"agents/{agent_key}/{path}"
 ```
 
 `SaveArtifactTool.call()` 里:
@@ -1023,6 +1037,14 @@ git commit -m "feat(workspace): 新增 workspace_paths —— agent 根与 share
 > 回落在 Task 13(PR6)摘掉。
 >
 > **代价明说**:回落窗口内读串问题**还是今天的样子** —— 不是新增回归,是尚未修复。
+
+> **⚠️ 从 Task 5 顺延过来的一条(09-12)**:`SaveArtifactTool` 给 `path_in_workspace`
+> 加前缀**属于本 task**,不属于 PR2 —— 前缀必须与 `write_file` 的落盘位置同时改,
+> 早一步就是每次下载 404。形状取 **`agents/<agent_key>/<path>`**(不含 `artifacts/` 段,
+> 见 spec §四勘误);`agent_key` 为空时保持扁平路径。Task 5 里的 `_artifact_path()`
+> 与那三条断言原样搬过来即可,顺手把 PR2 钉下的
+> `test_path_in_workspace_keeps_the_agents_own_relative_path` 改成新形状
+> ——**它是一条有意的「暂缓」哨兵,本 task 落地时必须换掉,不是删掉**。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1920,8 +1942,8 @@ git commit -m "feat(workspace): 保留段认 agent 容器层 + 浏览面按 agen
 | PR | Tasks | 上哪班车 |
 |---|---|---|
 | PR1 agent_key 地基 | 1, 2 | ✅ **已合 #1507(09-11)**,零行为变更 |
-| PR2 产物按 agent 分 | 3, 4, 5 | **带迁移,单独一班** |
-| PR3 工具层分层 | 6, 7, 8 | 合后泡测试 |
+| PR2 产物按 agent 分 | 3, 4, 5(5 只做了一半) | ✅ **已合 #1509(09-12)**,带迁移 `0154`。**`0154` 尚未在任何真环境跑过 —— 发测试环境并核回填结果是 PR3 的前置** |
+| PR3 工具层分层 | 6, 7, 8 + Task 5 顺延的 `path_in_workspace` 前缀 | 合后泡测试 |
 | PR4 对外端点 + 文档 | 9, 10 | **对外行为变更**,要提前告知对接方 |
 | PR5 搬迁 + 留存 + 浏览面 | 11, 12, 13 | 搬迁先在测试环境跑,验收后再上生产 |
 | PR6 摘回落 | 14 | 搬迁验收完之后 |
