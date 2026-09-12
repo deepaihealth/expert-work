@@ -19,6 +19,8 @@ import os
 import re
 from uuid import UUID
 
+from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
+
 #: ``EXPERT_WORK_TOOL_OUTPUT_BUDGET`` falsey values (mirrors ``run_retry._FALSEY``).
 _BUDGET_ENV = "EXPERT_WORK_TOOL_OUTPUT_BUDGET"
 _FALSEY = frozenset({"0", "false", "no", "off"})
@@ -53,7 +55,10 @@ def tool_output_budget_enabled() -> bool:
 #:
 #: 真正的清理从 B-50 Task 12 起才存在:会话 purge 连带删 + 留存 job 每日
 #: 孤儿扫描(``agent_run`` 行不在 + 超过宽限期),与 ``threads/<id>/`` 同一套。
-OVERFLOW_DIR = ".tool_results"
+#: 别名,不是第二份定义 —— 真源在 ``expert_work.persistence`` 的
+#: ``workspace/layout.py``(浏览面的保留段过滤、留存 job 的孤儿扫描都从那儿
+#: 取,两边都够不着 orchestrator)。
+OVERFLOW_DIR = WORKSPACE_OVERFLOW_DIR
 
 #: Opening tag of the expert-work-owned reference footer appended after an
 #: externalized result (see :func:`render_overflow_footer`). The footer is

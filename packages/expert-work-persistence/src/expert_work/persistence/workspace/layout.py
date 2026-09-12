@@ -64,19 +64,92 @@ SANDBOX_SKILLS_ROOT = "/opt/skills"
 #: the image-level ``/opt/agents`` (sandbox migration wave 2 Task 9).
 SANDBOX_AGENTS_ROOT = "/opt/agents"
 
-#: Top-level workspace prefixes that hold machinery / inputs rather than agent
-#: output — hidden from the "agent products" browse view. Add a new reserved
-#: namespace here (and use the matching constant where it is written) and every
-#: browse surface picks it up automatically.
+#: Tool-result overflow cache — ``.tool_results/<run_id>/…``. Pure machinery:
+#: a run externalises an over-long tool result here and references it back by
+#: path. Nothing a person browsing the workspace wants to see.
+#:
+#: Same value as ``orchestrator.tools.overflow.OVERFLOW_DIR``; that module
+#: imports this one rather than keeping a second literal.
+WORKSPACE_OVERFLOW_DIR = ".tool_results"
+
+#: Workspace prefixes that hold machinery / inputs rather than agent output —
+#: hidden from the "agent products" browse view. Add a new reserved namespace
+#: here (and use the matching constant where it is written) and every browse
+#: surface picks it up automatically.
 WORKSPACE_RESERVED_PREFIXES: frozenset[str] = frozenset(
+    {WORKSPACE_SKILLS_DIR, WORKSPACE_UPLOADS_DIR, WORKSPACE_OVERFLOW_DIR}
+)
+
+#: Prefixes a *client* may never delete — the browse-hidden set minus the
+#: overflow cache.
+#:
+#: Hiding and delete-protection used to be the same set, which was right while
+#: it held only ``skills`` (seeded machinery) and ``uploads`` (user input):
+#: both are written by the platform and must survive whatever a client asks
+#: for. ``.tool_results`` breaks that tie — it is equally uninteresting to a
+#: browsing human, but it is *garbage* the platform itself has to be able to
+#: collect: the session-purge hook rm -rf's ``.tool_results/<run_id>/`` through
+#: ``delete_tree``, and a single shared set would make that call raise
+#: "path is reserved and cannot be deleted".
+#:
+#: So the two concerns are now two constants. Reusing one for both is the
+#: kind of coupling that only shows up when a new member disagrees with the
+#: others — and then it shows up as a feature that silently cannot work.
+WORKSPACE_DELETE_PROTECTED_PREFIXES: frozenset[str] = frozenset(
     {WORKSPACE_SKILLS_DIR, WORKSPACE_UPLOADS_DIR}
 )
+
+#: Container prefixes that are *positional*, not reserved: they say **whose**
+#: subtree follows, not what kind of content it is. They are stripped before
+#: the reserved check so the check keeps meaning the same thing at every depth.
+#: ``agents`` takes a key segment after it, ``shared`` takes none.
+_CONTAINERS: dict[str, int] = {WORKSPACE_AGENTS_DIR: 2, WORKSPACE_SHARED_DIR: 1}
+
+
+def _head_after_container(relpath: str) -> str:
+    """The first path segment once a known container prefix is stripped.
+
+    ``""`` for an empty path. See :func:`is_reserved_workspace_path` for why
+    only known containers are stripped and only one segment is examined.
+    """
+    parts = tuple(p for p in relpath.strip().split("/") if p)
+    if not parts:
+        return ""
+    skip = _CONTAINERS.get(parts[0])
+    if skip is not None and len(parts) > skip:
+        parts = parts[skip:]
+    return parts[0]
 
 
 def is_reserved_workspace_path(relpath: str) -> bool:
     """Return whether ``relpath`` lives under a reserved (non-output) namespace.
 
-    Compares the first path segment against :data:`WORKSPACE_RESERVED_PREFIXES`;
-    a bare top-level file (no ``/``) is never reserved.
+    Historically this compared only the **top** segment, which was the whole
+    truth while the workspace was one flat tree. B-50 moved everything under
+    ``agents/<agent_key>/`` (and the un-attributable legacy under ``shared/``),
+    so a top-segment rule stops matching ``agents/<key>/uploads/x.docx`` —
+    and uploaded documents would suddenly appear in the browse view's
+    "products" list. That is a *silent* behaviour change introduced by the
+    migration: nothing errors, the list just grows files that were never
+    agent output.
+
+    So: strip a known container prefix, then look at the first segment of
+    what remains. Only **known** containers are stripped and only the first
+    segment is checked — deliberately not "any segment named uploads",
+    which would swallow an agent's own ``客户案例/uploads/`` directory.
+
+    A bare top-level file (no ``/``) is never reserved, and neither is a
+    bare container directory with nothing under it.
     """
-    return relpath.split("/", 1)[0] in WORKSPACE_RESERVED_PREFIXES
+    return _head_after_container(relpath) in WORKSPACE_RESERVED_PREFIXES
+
+
+def is_delete_protected_workspace_path(relpath: str) -> bool:
+    """Whether a client is forbidden from deleting ``relpath``.
+
+    A strict subset of :func:`is_reserved_workspace_path` — see
+    :data:`WORKSPACE_DELETE_PROTECTED_PREFIXES` for why the two are not the
+    same set. Callers guarding a delete endpoint want **this** one; callers
+    building a browse listing want the other.
+    """
+    return _head_after_container(relpath) in WORKSPACE_DELETE_PROTECTED_PREFIXES

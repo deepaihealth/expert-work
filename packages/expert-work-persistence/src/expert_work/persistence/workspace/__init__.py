@@ -39,6 +39,12 @@ from expert_work.persistence.workspace.layout import (
     WORKSPACE_AGENTS_DIR as WORKSPACE_AGENTS_DIR,
 )
 from expert_work.persistence.workspace.layout import (
+    WORKSPACE_DELETE_PROTECTED_PREFIXES as WORKSPACE_DELETE_PROTECTED_PREFIXES,
+)
+from expert_work.persistence.workspace.layout import (
+    WORKSPACE_OVERFLOW_DIR as WORKSPACE_OVERFLOW_DIR,
+)
+from expert_work.persistence.workspace.layout import (
     WORKSPACE_RESERVED_PREFIXES as WORKSPACE_RESERVED_PREFIXES,
 )
 from expert_work.persistence.workspace.layout import (
@@ -49,6 +55,9 @@ from expert_work.persistence.workspace.layout import (
 )
 from expert_work.persistence.workspace.layout import (
     WORKSPACE_UPLOADS_DIR as WORKSPACE_UPLOADS_DIR,
+)
+from expert_work.persistence.workspace.layout import (
+    is_delete_protected_workspace_path as is_delete_protected_workspace_path,
 )
 from expert_work.persistence.workspace.layout import (
     is_reserved_workspace_path as is_reserved_workspace_path,
@@ -64,6 +73,8 @@ __all__ = [
     "SANDBOX_AGENTS_ROOT",
     "SANDBOX_SKILLS_ROOT",
     "WORKSPACE_AGENTS_DIR",
+    "WORKSPACE_DELETE_PROTECTED_PREFIXES",
+    "WORKSPACE_OVERFLOW_DIR",
     "WORKSPACE_RESERVED_PREFIXES",
     "WORKSPACE_SHARED_DIR",
     "WORKSPACE_SKILLS_DIR",
@@ -77,6 +88,7 @@ __all__ = [
     "VolumeDLQRow",
     "VolumeOpKind",
     "WorkspaceNotFoundError",
+    "is_delete_protected_workspace_path",
     "is_reserved_workspace_path",
     "workspace_volume_name",
 ]

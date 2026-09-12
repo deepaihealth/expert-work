@@ -357,6 +357,12 @@ from expert_work.persistence.workspace import (
     WORKSPACE_AGENTS_DIR as WORKSPACE_AGENTS_DIR,
 )
 from expert_work.persistence.workspace import (
+    WORKSPACE_DELETE_PROTECTED_PREFIXES as WORKSPACE_DELETE_PROTECTED_PREFIXES,
+)
+from expert_work.persistence.workspace import (
+    WORKSPACE_OVERFLOW_DIR as WORKSPACE_OVERFLOW_DIR,
+)
+from expert_work.persistence.workspace import (
     WORKSPACE_RESERVED_PREFIXES as WORKSPACE_RESERVED_PREFIXES,
 )
 from expert_work.persistence.workspace import (
@@ -393,6 +399,9 @@ from expert_work.persistence.workspace import (
     WorkspaceNotFoundError as WorkspaceNotFoundError,
 )
 from expert_work.persistence.workspace import (
+    is_delete_protected_workspace_path as is_delete_protected_workspace_path,
+)
+from expert_work.persistence.workspace import (
     is_reserved_workspace_path as is_reserved_workspace_path,
 )
 from expert_work.persistence.workspace import (
@@ -405,6 +414,8 @@ __all__ = [
     "SANDBOX_AGENTS_ROOT",
     "SANDBOX_SKILLS_ROOT",
     "WORKSPACE_AGENTS_DIR",
+    "WORKSPACE_DELETE_PROTECTED_PREFIXES",
+    "WORKSPACE_OVERFLOW_DIR",
     "WORKSPACE_RESERVED_PREFIXES",
     "WORKSPACE_SHARED_DIR",
     "WORKSPACE_SKILLS_DIR",
@@ -561,6 +572,7 @@ __all__ = [
     "create_async_session_factory",
     "current_tenant_id_var",
     "current_user_id_var",
+    "is_delete_protected_workspace_path",
     "is_reserved_workspace_path",
     "workspace_volume_name",
 ]
