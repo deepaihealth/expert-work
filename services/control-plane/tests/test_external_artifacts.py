@@ -42,6 +42,7 @@ from httpx import ASGITransport, AsyncClient
 
 from control_plane.api import external_artifacts as _external_artifacts_module
 from control_plane.api._external import external_subject_id
+from control_plane.api._external_agent_scope import agent_key_for_code
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -57,7 +58,11 @@ from tests.auth_fixtures import (
 )
 
 #: B-50 —— 这些用例是单 agent 场景;``agent_key`` 现在是必传参数。
-_AGENT_KEY = "test-agent-0badc0de"
+#: PR4 起 URL 里的 ``agent_code`` **参与过滤**,``agent_key`` 必须与端点算出来的
+#: 那个逐字节相同 —— 此前这里写的是一个编出来的常量(``test-agent-0badc0de``),
+#: 与 ``sanitize_agent_key("test-agent")`` 对不上,收口之后所有种子都会查不到。
+_AGENT_CODE = "test-agent"
+_AGENT_KEY = agent_key_for_code(_AGENT_CODE)
 
 #: Fixed (not per-test ``uuid4()``) so fixtures and test bodies can both
 #: address it — mirrors ``test_external_workspace.py``'s module-level
@@ -130,6 +135,20 @@ async def external_client(_ctx: _Ctx) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=_ctx.app)
     async with AsyncClient(
         transport=transport, base_url="http://cp.test", headers=_headers(scopes=("read",))
+    ) as client:
+        yield client
+
+
+@pytest.fixture
+async def external_client_write(_ctx: _Ctx) -> AsyncIterator[AsyncClient]:
+    """``write`` scope —— DELETE 挂的是 ``require("session", "write")``。
+
+    既有的删除用例各自内联建同款 client;新增的收口用例复用这一个 fixture,
+    不再往下复制第七份。
+    """
+    transport = ASGITransport(app=_ctx.app)
+    async with AsyncClient(
+        transport=transport, base_url="http://cp.test", headers=_headers(scopes=("write",))
     ) as client:
         yield client
 
@@ -345,7 +364,7 @@ async def test_list_returns_active_artifacts(external_client, seed_artifact) -> 
     ``a.latest_version`` 错写成 0 的实现改动,这条测试此前不会变红。
     """
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
-    resp = await external_client.get("/v1/agents/test-agent/artifacts", params={"user_id": "u-1"})
+    resp = await external_client.get(f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
@@ -354,12 +373,18 @@ async def test_list_returns_active_artifacts(external_client, seed_artifact) -> 
     assert set(items[0]) == {
         "name",
         "kind",
+        # B-50 PR4 新增。``scope=user`` 下它是把两份同名产物分开、并且找到
+        # 正确 code 去下载的唯一依据(下载端点刻意不认 scope);``scope=agent``
+        # 下它恒等于 URL 里那个 code,当归属回执。一种响应形状而不是两种 ——
+        # 时有时无的字段更难写文档也更难接,而加字段是向后兼容的。
+        "agent_code",
         "latest_version",
         "created_at",
         "updated_at",
     }, "字段集必须精确 —— 多给 size_bytes 会误导(它只在首次下载后才有值)"
     assert items[0]["name"] == "report.docx"
     assert items[0]["kind"] == "document"
+    assert items[0]["agent_code"] == _AGENT_CODE
     assert items[0]["latest_version"] == 1
     assert items[0]["created_at"] is not None
     assert items[0]["updated_at"] is not None
@@ -372,7 +397,7 @@ async def test_list_hides_soft_deleted(
     """软删的产物不出现在列表里。"""
     await seed_artifact(user_id="u-1", name="gone.docx", kind="document")
     await soft_delete_artifact(user_id="u-1", name="gone.docx")
-    resp = await external_client.get("/v1/agents/test-agent/artifacts", params={"user_id": "u-1"})
+    resp = await external_client.get(f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"})
     assert [a["name"] for a in resp.json()["data"]["artifacts"]] == []
 
 
@@ -390,7 +415,7 @@ async def test_list_cross_user_isolation(external_client, seed_artifact) -> None
     await seed_artifact(user_id="user-a", name="user-a-report.docx", kind="document")
     await seed_artifact(user_id="user-b", name="user-b-secret.docx", kind="document")
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts", params={"user_id": "user-a"}
+        f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "user-a"}
     )
     assert resp.status_code == 200
     names = [a["name"] for a in resp.json()["data"]["artifacts"]]
@@ -409,7 +434,7 @@ async def test_unknown_user_gets_empty_list_and_mints_nothing(
     """
     before = await count_tenant_users()
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts", params={"user_id": "never-seen-before"}
+        f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "never-seen-before"}
     )
     assert resp.status_code == 200
     assert resp.json()["data"]["artifacts"] == []
@@ -417,15 +442,23 @@ async def test_unknown_user_gets_empty_list_and_mints_nothing(
 
 
 @pytest.mark.asyncio
-async def test_agent_code_does_not_filter(external_client, seed_artifact) -> None:
-    """agent_code 不参与过滤 —— 换一个(甚至不存在的)agent_code 拿到同一份列表。"""
+async def test_agent_code_filters(external_client, seed_artifact) -> None:
+    """``agent_code`` **参与过滤**(B-50 PR4 —— 本条此前断言的是相反的行为)。
+
+    换一个 agent_code 拿到的是那个 agent 自己的列表(这里是空的),不再是
+    该用户的全部产物。这是本 PR 对外最显眼的行为变更,也是必须提前告知对接方
+    的那一条。
+    """
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
-    a = await external_client.get("/v1/agents/test-agent/artifacts", params={"user_id": "u-1"})
-    b = await external_client.get(
+    mine = await external_client.get(
+        f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"}
+    )
+    other = await external_client.get(
         "/v1/agents/no-such-agent-at-all/artifacts", params={"user_id": "u-1"}
     )
-    assert a.status_code == b.status_code == 200
-    assert a.json()["data"] == b.json()["data"]
+    assert mine.status_code == other.status_code == 200
+    assert [a["name"] for a in mine.json()["data"]["artifacts"]] == ["report.docx"]
+    assert other.json()["data"]["artifacts"] == []
 
 
 @pytest.mark.asyncio
@@ -438,7 +471,7 @@ async def test_list_requires_read_scope(external_client_no_scope) -> None:
     ``test_external_workspace.py::test_list_files_requires_read_scope``。
     """
     resp = await external_client_no_scope.get(
-        "/v1/agents/test-agent/artifacts", params={"user_id": "u-1"}
+        f"/v1/agents/{_AGENT_CODE}/artifacts", params={"user_id": "u-1"}
     )
     assert resp.status_code == 403
 
@@ -457,7 +490,7 @@ async def test_download_returns_raw_bytes_not_envelope(
         user_id="u-1", name="report.txt", kind="document", content=b"hello"
     )
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "report.txt"},
     )
     assert resp.status_code == 200
@@ -474,7 +507,7 @@ async def test_download_forces_attachment_for_active_content(
         user_id="u-1", name="page.html", kind="document", content=b"<script>alert(1)</script>"
     )
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "page.html"},
     )
     assert resp.status_code == 200
@@ -495,7 +528,7 @@ async def test_download_unknown_user_is_404_enveloped(external_client) -> None:
     分支、以及跨用户隔离的覆盖(评审 Important A)。
     """
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "nope.txt"},
     )
     assert resp.status_code == 404
@@ -517,7 +550,7 @@ async def test_download_known_user_unknown_name_is_404_enveloped(
     """
     await seed_artifact_with_content(user_id="u-1", name="other.txt", kind="document", content=b"x")
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "nope.txt"},
     )
     assert resp.status_code == 404
@@ -545,7 +578,7 @@ async def test_download_cross_user_name_is_404_not_leaked(
         user_id="user-b", name="secret.txt", kind="document", content=b"user-b's secret"
     )
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "user-a", "name": "secret.txt"},
     )
     assert resp.status_code == 404
@@ -576,15 +609,15 @@ async def test_download_not_found_variants_return_byte_identical_response(
     )
 
     unknown_user_resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "never-seen-before", "name": "secret.txt"},
     )
     known_user_unknown_name_resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "user-a", "name": "nope.txt"},
     )
     cross_user_resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "user-a", "name": "secret.txt"},
     )
 
@@ -619,7 +652,7 @@ async def test_permission_error_is_500_not_404(
     )
     break_workspace_permission()
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "report.txt"},
     )
     assert resp.status_code == 500
@@ -642,7 +675,7 @@ async def test_too_large_is_413_not_404(external_client, seed_artifact_with_cont
         "workspace file 'huge.pptx' exceeds the 67108864-byte download cap"
     )
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "huge.pptx"},
     )
     assert resp.status_code == 413, resp.text
@@ -659,7 +692,7 @@ async def test_download_backfills_digest_on_first_read(
     )
     assert (await get_latest_version("u-1", "report.txt")).size_bytes is None
     await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "report.txt"},
     )
     version = await get_latest_version("u-1", "report.txt")
@@ -676,7 +709,7 @@ async def test_download_deducts_quota(
         user_id="u-1", name="report.txt", kind="document", content=b"x"
     )
     await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "report.txt"},
     )
     assert ("artifact_download", 1) in quota_calls
@@ -714,13 +747,13 @@ async def test_download_429_when_download_count_quota_exhausted(
 
     for _ in range(2):
         ok = await external_client.get(
-            "/v1/agents/test-agent/artifacts/download",
+            f"/v1/agents/{_AGENT_CODE}/artifacts/download",
             params={"user_id": "u-1", "name": "report.txt"},
         )
         assert ok.status_code == 200, ok.text
 
     denied = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "report.txt"},
     )
     assert denied.status_code == 429, denied.text
@@ -738,7 +771,7 @@ async def test_download_requires_read_scope(external_client_no_scope) -> None:
     / 改错不会被上一条测试捕获(评审 Important,见 Task 1 review 留下的经验)。
     """
     resp = await external_client_no_scope.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "report.txt"},
     )
     assert resp.status_code == 403
@@ -757,7 +790,7 @@ async def test_download_name_with_nul_is_422_enveloped(external_client) -> None:
     真正碰到 store 之前就拦下 —— 断言的是 422 信封,不是「没有 500」。
     """
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "report\x00.txt"},
     )
     assert resp.status_code == 422, resp.text
@@ -792,14 +825,14 @@ async def test_delete_soft_deletes_and_hides_from_list(external_client, seed_art
     """删除命中 → 200 {deleted: name};之后列表里不再出现。"""
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
     resp = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "report.docx"},
         headers=_headers(scopes=("write",)),
     )
     assert resp.status_code == 200
     assert resp.json()["data"] == {"deleted": "report.docx"}
     listing = await external_client.get(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1"},
         headers=_headers(scopes=("write",)),
     )
@@ -836,7 +869,7 @@ async def test_delete_is_idempotent_miss_404(external_client, seed_artifact) -> 
 
     # 跨用户尝试必须在 report.docx 仍然活跃的时候发起(见上面 docstring)。
     cross_user = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-2", "name": "report.docx"},
         headers=write_headers,
     )
@@ -847,19 +880,19 @@ async def test_delete_is_idempotent_miss_404(external_client, seed_artifact) -> 
     # 真正的 owner 现在还能成功删除 —— 反证上面那次跨用户请求没有把它删掉
     # (如果被跨用户请求偷偷删了,这里会意外变成 404)。
     first = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "report.docx"},
         headers=write_headers,
     )
     assert first.status_code == 200
 
     already_deleted = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "report.docx"},
         headers=write_headers,
     )
     unknown_name = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "never-existed.docx"},
         headers=write_headers,
     )
@@ -888,7 +921,7 @@ async def test_delete_requires_write_not_delete_scope(external_client, seed_arti
     """
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
     resp = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "report.docx"},
         headers=_headers(scopes=("write",)),
     )
@@ -906,7 +939,7 @@ async def test_delete_rejects_read_only_scope(external_client, seed_artifact) ->
     """
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
     resp = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "report.docx"},
         headers=_headers(scopes=("read",)),
     )
@@ -921,7 +954,7 @@ async def test_delete_emits_audit_with_on_behalf_of(
     带 ``on_behalf_of=`` 终端用户。"""
     await seed_artifact(user_id="u-1", name="report.docx", kind="document")
     resp = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "report.docx"},
         headers=_headers(scopes=("write",)),
     )
@@ -953,7 +986,7 @@ async def test_delete_miss_writes_no_audit(external_client, seed_artifact, audit
     """
     await seed_artifact(user_id="u-1", name="other.docx", kind="document")
     resp = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "never-existed.docx"},
         headers=_headers(scopes=("write",)),
     )
@@ -971,7 +1004,7 @@ async def test_delete_name_with_nul_is_422_enveloped(external_client) -> None:
     download 那条测试覆盖到。
     """
     resp = await external_client.delete(
-        "/v1/agents/test-agent/artifacts",
+        f"/v1/agents/{_AGENT_CODE}/artifacts",
         params={"user_id": "u-1", "name": "report\x00.txt"},
         headers=_headers(scopes=("write",)),
     )
@@ -993,7 +1026,7 @@ async def test_download_with_matching_version_serves_content(
         user_id="u-1", name="plan.txt", kind="document", content=b"v1-bytes"
     )
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "plan.txt", "version": 1},
     )
     assert resp.status_code == 200
@@ -1013,7 +1046,7 @@ async def test_download_with_stale_version_is_409_mismatch(
         user_id="u-1", name="plan.txt", kind="document", content=b"v2-bytes"
     )
     resp = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "plan.txt", "version": 1},
     )
     assert resp.status_code == 409
@@ -1022,8 +1055,217 @@ async def test_download_with_stale_version_is_409_mismatch(
     assert body["error"]["code"] == "ARTIFACT_VERSION_MISMATCH"
     # 新版照常可取(带对的 version 或不带都行)。
     ok = await external_client.get(
-        "/v1/agents/test-agent/artifacts/download",
+        f"/v1/agents/{_AGENT_CODE}/artifacts/download",
         params={"user_id": "u-1", "name": "plan.txt", "version": 2},
     )
     assert ok.status_code == 200
     assert ok.content == b"v2-bytes"
+
+
+# --------------------------------------------------------------------------
+# B-50 PR4 —— 产物三个 handler 按 agent 收口 + ?scope=user
+# --------------------------------------------------------------------------
+
+_AGENT_A = "agent-a"
+_AGENT_B = "agent-b"
+_KEY_A = agent_key_for_code(_AGENT_A)
+_KEY_B = agent_key_for_code(_AGENT_B)
+_EXT_UID = "双 agent 用户"
+
+
+@dataclass
+class _TwoAgents:
+    user_id: str
+    internal_user_id: object
+
+
+@pytest.fixture
+async def two_agents(_ctx: _Ctx, user_store: TenantUserStore) -> _TwoAgents:
+    """一个终端用户、两个 agent,含一个同名产物(``报告.docx``)。
+
+    同名那一对是整个 B-50 的原始症状:PR2 之前它们折进同一行、字节互相覆盖。
+    """
+    row = await user_store.resolve(
+        tenant_id=_TENANT_ID, subject_type="user", subject_id=external_subject_id(_EXT_UID)
+    )
+    seeds = [
+        (_KEY_A, "a-only.docx"),
+        (_KEY_B, "b-only.docx"),
+        (_KEY_A, "报告.docx"),
+        (_KEY_B, "报告.docx"),
+    ]
+    for key, name in seeds:
+        await _ctx.artifact_store.save_version(
+            tenant_id=_TENANT_ID,
+            user_id=row.id,
+            agent_key=key,
+            name=name,
+            kind="document",
+            path_in_workspace=f"agents/{key}/{name}",
+            created_in_thread="t-1",
+        )
+    threads = _ctx.app.state.thread_meta_repo  # type: ignore[attr-defined]
+    for code in (_AGENT_A, _AGENT_B):
+        await threads.create(
+            thread_id=uuid4(),
+            tenant_id=_TENANT_ID,
+            created_by="x",
+            user_id=row.id,
+            agent_name=code,
+        )
+    return _TwoAgents(user_id=_EXT_UID, internal_user_id=row.id)
+
+
+@pytest.mark.asyncio
+async def test_list_only_returns_this_agents_artifacts(external_client, two_agents) -> None:
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID}
+    )
+    assert resp.status_code == 200
+    assert {a["name"] for a in resp.json()["data"]["artifacts"]} == {"a-only.docx", "报告.docx"}
+
+
+@pytest.mark.asyncio
+async def test_list_items_carry_agent_code_never_agent_key(external_client, two_agents) -> None:
+    """归属标识对外只能是 ``agent_code``;``agent_key`` 是内部命名(带 sha256 后缀)。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID}
+    )
+    assert {a["agent_code"] for a in resp.json()["data"]["artifacts"]} == {_AGENT_A}
+    assert _KEY_A not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_artifact_download_across_agents_is_404(
+    external_client, two_agents, _ctx: _Ctx
+) -> None:
+    """A 的 code 下 B 的产物 → 与「不存在」同一个不透明 404,且没读过任何字节。"""
+    _ctx.workspace_store.workspace_file = b"b-body"
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts/download",
+        params={"user_id": _EXT_UID, "name": "b-only.docx"},
+    )
+    assert resp.status_code == 404
+    # 非恒真:收口前这里会 200 并把 B 的字节读出来。断言「一次工作区读都没发生」
+    # 才能分开「404 是因为收口」和「404 是因为别的什么」。
+    assert _ctx.workspace_store.workspace_reads == []
+
+
+@pytest.mark.asyncio
+async def test_same_name_under_two_agents_resolves_per_code(
+    external_client, two_agents, _ctx: _Ctx
+) -> None:
+    """两个 agent 各有 ``报告.docx`` —— 各自的 code 取到各自那份。
+
+    ``RecordingWorkspaceStore`` 不按路径分内容,所以判据取「服务端去读的是哪条
+    ``path_in_workspace``」:那正是两份字节的真正分岔点。
+    """
+    _ctx.workspace_store.workspace_file = b"whatever"
+    for code, key in ((_AGENT_A, _KEY_A), (_AGENT_B, _KEY_B)):
+        resp = await external_client.get(
+            f"/v1/agents/{code}/artifacts/download",
+            params={"user_id": _EXT_UID, "name": "报告.docx"},
+        )
+        assert resp.status_code == 200
+        assert _ctx.workspace_store.workspace_reads[-1][2] == f"agents/{key}/报告.docx"
+
+
+@pytest.mark.asyncio
+async def test_delete_across_agents_is_404_and_leaves_the_row(
+    external_client_write, two_agents, _ctx: _Ctx
+) -> None:
+    """404 不能是「删了但假装没有」—— B 的行必须还在。"""
+    resp = await external_client_write.delete(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID, "name": "b-only.docx"}
+    )
+    assert resp.status_code == 404
+    still_there = await _ctx.artifact_store.get_latest_version(
+        tenant_id=_TENANT_ID,
+        user_id=two_agents.internal_user_id,
+        agent_key=_KEY_B,
+        name="b-only.docx",
+    )
+    assert still_there is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_within_the_same_agent_still_works(
+    external_client_write, two_agents, _ctx: _Ctx
+) -> None:
+    """对照组 —— 收口不能把「删自己的」一并挡掉(否则上一条是恒真的)。"""
+    resp = await external_client_write.delete(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID, "name": "a-only.docx"}
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_user_returns_all_agents_with_agent_code(
+    external_client, two_agents
+) -> None:
+    """``?scope=user`` 并集 —— 两份同名 ``报告.docx`` 靠 ``agent_code`` 分得开。
+
+    分不开的话对接方看到两个同名条目、又没有可用的 code 去下,等于列了一堆
+    下不动的东西(下载端点刻意不认 scope)。
+    """
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID, "scope": "user"}
+    )
+    assert resp.status_code == 200
+    items = resp.json()["data"]["artifacts"]
+    assert {(a["agent_code"], a["name"]) for a in items} == {
+        (_AGENT_A, "a-only.docx"),
+        (_AGENT_A, "报告.docx"),
+        (_AGENT_B, "b-only.docx"),
+        (_AGENT_B, "报告.docx"),
+    }
+    assert _KEY_A not in resp.text and _KEY_B not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_defaults_to_agent(external_client, two_agents) -> None:
+    """默认值错了会静默把隔离整个放开。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID}
+    )
+    assert {a["name"] for a in resp.json()["data"]["artifacts"]} == {"a-only.docx", "报告.docx"}
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_user_does_not_open_downloads(
+    external_client, two_agents, _ctx: _Ctx
+) -> None:
+    """下载端点不认 ``scope`` —— 传了也不放开跨 agent。"""
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts/download",
+        params={"user_id": _EXT_UID, "name": "b-only.docx", "scope": "user"},
+    )
+    assert resp.status_code == 404
+    assert _ctx.workspace_store.workspace_reads == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_scope_user_does_not_open_deletes(
+    external_client_write, two_agents, _ctx: _Ctx
+) -> None:
+    """删除端点同理 —— 破坏性操作更不能靠一个 query 参数放开。"""
+    resp = await external_client_write.delete(
+        f"/v1/agents/{_AGENT_A}/artifacts",
+        params={"user_id": _EXT_UID, "name": "b-only.docx", "scope": "user"},
+    )
+    assert resp.status_code == 404
+    still_there = await _ctx.artifact_store.get_latest_version(
+        tenant_id=_TENANT_ID,
+        user_id=two_agents.internal_user_id,
+        agent_key=_KEY_B,
+        name="b-only.docx",
+    )
+    assert still_there is not None
+
+
+@pytest.mark.asyncio
+async def test_artifact_invalid_scope_is_422(external_client, two_agents) -> None:
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/artifacts", params={"user_id": _EXT_UID, "scope": "tenant"}
+    )
+    assert resp.status_code == 422

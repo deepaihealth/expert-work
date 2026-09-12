@@ -9,10 +9,20 @@ active content 强制 attachment / nosniff / 权限失败与不存在分开)全�
 只把控制台的身份解析(跨租户 scope + 管理员代操 ``resolve_target_user_id``)
 换成 P1 的 ``_external`` 通路。
 
-产物本身是 ``(tenant_id, user_id)`` 维度的,不按 agent 分 —— ``agent_code``
-只是外部平面 URL 结构的一部分(与 ``/v1/agents/{agent_code}/sessions`` 等同款
-路径形状对齐),**不参与过滤,也不参与权限判定**,和控制台侧 ``/v1/artifacts``
-(压根没有 agent_code)语义一致。
+产物按 ``(tenant_id, user_id, agent)`` 分(B-50)。**这与本模块此前的说法
+相反** —— 原来写的是「产物不按 agent 分,``agent_code`` 不参与过滤,也不参与
+权限判定」,那句话从 B-50 起不成立:同一用户的两个 agent 存同名产物会折进同一
+行、字节互相覆盖,而 ``list_artifacts`` 的描述写着「**你**存的」实际返回该用户
+全部 —— 喂给模型的事实是错的。
+
+三个端点都按 URL 里那个 ``agent_code`` 收口:列表只给本 agent 的,跨 agent 的
+下载与软删是**永久 404**(与「不存在」不可区分 —— 404 刻意不透明,所以对接方
+分不出「归另一个 agent」和「压根没有」,这是有意的收窄,文档里明写)。
+
+``?scope=user`` 是列表端点的并集入口(对接方一个 app 编排两个 agent、服务同一批
+终端用户)。**下载与删除不认这个参数**:放开等于让 A 的 code 取到/删掉 B 的东西。
+
+与控制台侧的差异:控制台 ``/v1/artifacts`` 看该用户全量,对外按 agent 收口。
 
 ``name`` 走 query 而非 path:控制台侧是 ``{name:path}``,对外用 query 参数,
 避免产物名含 ``/`` 时的路径穿越与编码歧义。DELETE 的 ``user_id`` / ``name``
@@ -43,6 +53,11 @@ from control_plane.api._external import (
     reject_nul,
     reject_nul_path_params,
 )
+from control_plane.api._external_agent_scope import (
+    ExternalScope,
+    agent_code_by_key,
+    agent_key_for_code,
+)
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.audit import emit as audit_emit
@@ -50,6 +65,7 @@ from control_plane.quota.base import QuotaService
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import ArtifactStore
 from expert_work.persistence.tenant_user import TenantUserStore
+from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.tools import (
@@ -76,6 +92,10 @@ def _get_quota(request: Request) -> QuotaService:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+def _get_thread_repo(request: Request) -> ThreadMetaStore:
+    return request.app.state.thread_meta_repo  # type: ignore[no-any-return]
 
 
 def _name_or_422(name: str) -> str:
@@ -130,7 +150,9 @@ def build_external_artifacts_router() -> APIRouter:
         request: Request,
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
+        scope: Annotated[ExternalScope, Query()] = "agent",
     ) -> JSONResponse:
         """List an end-user's agent artifacts, most-recently-updated first.
 
@@ -144,7 +166,6 @@ def build_external_artifacts_router() -> APIRouter:
         lookup (an N+1), and the digest is only backfilled on first
         download, so most rows would carry ``null`` anyway.
         """
-        del agent_code  # artifacts are (tenant, user)-scoped — see module docstring.
         tenant_id: UUID = request.state.tenant_id
         try:
             end_user_id = await lookup_external_user_id(
@@ -154,22 +175,33 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return JSONResponse({"success": True, "data": {"artifacts": []}, "error": None})
-        # B-50 —— 迁移期显式不按 agent 过滤,保持今天的行为。对外端点按 agent
-        # 收口是 PR4(**对外行为变更**,要提前告知对接方),不在这一批。
-        # 谁可以传 ``agent_key=None`` 有登记表盯着,见
-        # ``tests/test_artifact_agent_scope_callers.py``。
-        artifacts = await store.list_for_user(
-            tenant_id=tenant_id, user_id=end_user_id, agent_key=None
-        )
+        if scope == "user":
+            # 并集:一次查全量,再按反查表贴归属。反查不到 ``agent_code`` 的
+            # (agent 已删)丢掉 —— 第三方没有可用的 code 去下载它,列出来就是
+            # 又一个下不动的条目(同 ``shared/`` 不对外投影的理由)。
+            by_key = agent_code_by_key(
+                await threads.list_agent_names_for_user(tenant_id=tenant_id, user_id=end_user_id)
+            )
+            artifacts = await store.list_for_user(
+                tenant_id=tenant_id, user_id=end_user_id, agent_key=None
+            )
+        else:
+            key = agent_key_for_code(agent_code)
+            by_key = {key: agent_code}
+            artifacts = await store.list_for_user(
+                tenant_id=tenant_id, user_id=end_user_id, agent_key=key
+            )
         items = [
             {
                 "name": a.name,
                 "kind": a.kind,
+                "agent_code": by_key[a.agent_key],
                 "latest_version": a.latest_version,
                 "created_at": a.created_at.isoformat() if a.created_at else None,
                 "updated_at": a.updated_at.isoformat() if a.updated_at else None,
             }
             for a in artifacts
+            if a.agent_key in by_key
         ]
         return JSONResponse({"success": True, "data": {"artifacts": items}, "error": None})
 
@@ -201,8 +233,11 @@ def build_external_artifacts_router() -> APIRouter:
         "that user doesn't exist" apart from "that user has no such
         artifact".
         """
-        del agent_code  # artifacts are (tenant, user)-scoped — see module docstring.
         tenant_id: UUID = request.state.tenant_id
+        # B-50 PR4 —— 收口到 URL 里这个 agent_code 自己的那棵树。**没有
+        # ``scope`` 参数**:列表端点有,下载端点放开等于让 A 的 code 取到 B 的
+        # 字节,那正是本设计要挡的。
+        agent_key = agent_key_for_code(agent_code)
         try:
             name = _name_or_422(name)
             end_user_id = await lookup_external_user_id(
@@ -212,9 +247,8 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
-        # B-50 —— 同上:迁移期不按 agent 过滤,PR4 收口。
         latest = await store.get_latest_version(
-            tenant_id=tenant_id, user_id=end_user_id, agent_key=None, name=name
+            tenant_id=tenant_id, user_id=end_user_id, agent_key=agent_key, name=name
         )
         if latest is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
@@ -230,9 +264,8 @@ def build_external_artifacts_router() -> APIRouter:
                 409,
             )
         version = latest
-        # B-50 —— 同上:迁移期不按 agent 过滤,PR4 收口。
         artifacts = await store.list_for_user(
-            tenant_id=tenant_id, user_id=end_user_id, agent_key=None
+            tenant_id=tenant_id, user_id=end_user_id, agent_key=agent_key
         )
         artifact = next((a for a in artifacts if a.name == name), None)
         if artifact is None:
@@ -331,8 +364,11 @@ def build_external_artifacts_router() -> APIRouter:
         Unknown / already-deleted / cross-user all collapse to one 404 so the
         response never reveals whether the name exists.
         """
-        del agent_code  # artifacts are (tenant, user)-scoped — see module docstring.
         tenant_id: UUID = request.state.tenant_id
+        # B-50 PR4 —— 同 download:**没有 ``scope``**。破坏性操作更不能靠一个
+        # query 参数放开到别的 agent 身上。跨 agent 的删除落进同一个不透明 404,
+        # 而且**必须真的没删** —— 「删了但假装没有」比报错坏得多。
+        agent_key = agent_key_for_code(agent_code)
         try:
             name = _name_or_422(name)
             end_user_id = await lookup_external_user_id(
@@ -342,11 +378,10 @@ def build_external_artifacts_router() -> APIRouter:
             return external_error(exc)
         if end_user_id is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
-        # B-50 —— 同上:迁移期不按 agent 过滤,PR4 收口。
         hit = await store.soft_delete(
             tenant_id=tenant_id,
             user_id=end_user_id,
-            agent_key=None,
+            agent_key=agent_key,
             name=name,
             now=datetime.now(UTC),
         )
