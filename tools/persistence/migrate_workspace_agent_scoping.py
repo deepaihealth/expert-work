@@ -31,11 +31,9 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
 from uuid import UUID
 
 import sqlalchemy as sa
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence import (
@@ -346,10 +344,13 @@ async def _update_artifact_paths(
                 ),
                 {"new": new, "old": old, "tenant_id": tenant_id, "user_id": user_id},
             )
-            # ``CursorResult.rowcount`` —— ``session.execute`` 的静态返回类型是
-            # ``Result``,它上面没有这个属性;走 text() 的 UPDATE 实际拿到的
-            # 一定是 ``CursorResult``。报的是「改了几行」,给运维对账用。
-            updated += cast("CursorResult[Any]", result).rowcount or 0
+            # ``session.execute`` 的静态返回类型是 ``Result``,上面没有
+            # ``rowcount``;走 ``text()`` 的 UPDATE 实际拿到的一定是
+            # ``CursorResult``。用 ``getattr`` 而不是 ``cast`` —— 后者只能写成
+            # 字符串形式(``CursorResult`` 运行期不可下标),而字符串里的名字
+            # 静态分析看不见,CodeQL 会把那两个 import 报成未使用。
+            # 这也是留存 job 里既有的写法。报的是「改了几行」,给运维对账用。
+            updated += int(getattr(result, "rowcount", 0) or 0)
         await session.commit()
     return updated
 
