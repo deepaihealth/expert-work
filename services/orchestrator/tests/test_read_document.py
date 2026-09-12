@@ -139,8 +139,8 @@ def test_oversized_rejected_before_parse(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _ctx() -> ToolContext:
-    return ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=uuid4())
+def _ctx(*, agent_key: str = "") -> ToolContext:
+    return ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=uuid4(), agent_key=agent_key)
 
 
 def _client(stdout: str = "", *, exit_code: int = 0) -> RecordingSandboxRuntime:
@@ -178,3 +178,54 @@ async def test_tool_unsupported_raises_fileop() -> None:
     client = _client(json.dumps({"ok": False, "error": "unsupported_format", "format": "bin"}))
     with pytest.raises(FileOpError, match="unsupported_format"):
         await ReadDocumentTool(client=client).call({"path": "x.bin"}, ctx=_ctx())
+
+
+# ---------------------------------------------------------------------------
+# B-50 Task 7 —— ``read_document`` 也读用户工作区。PR3 的计划漏登记了它
+# (实测七个工作区调用点,计划只列了四个),所以补齐并钉住。
+# ---------------------------------------------------------------------------
+
+
+class _SequenceRuntime(RecordingSandboxRuntime):
+    def __init__(self, stdouts: list[str]) -> None:
+        super().__init__()
+        self._stdouts = list(stdouts)
+
+    async def exec(  # type: ignore[override]
+        self, *, sandbox_id: Any, code: str, timeout_s: int | None, agent_key: str = ""
+    ) -> SandboxOutcome:
+        self.execs.append((sandbox_id, code))
+        self.exec_agent_keys.append(agent_key)
+        stdout = self._stdouts.pop(0) if self._stdouts else ""
+        return SandboxOutcome(stdout=stdout, stderr="", exit_code=0, timed_out=False)
+
+
+async def test_read_document_resolves_under_agent_root() -> None:
+    client = _client(json.dumps({"ok": True, "content": "x", "format": "pdf"}))
+    await ReadDocumentTool(client=client).call(
+        {"path": "报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    )
+    assert '"ws": "/workspace/agents/plan-aaaaaaaa",' in client.execs[-1][1]
+
+
+async def test_read_document_falls_back_to_user_root_once() -> None:
+    """存量上传件还在用户根上,搬迁(PR5)之前必须读得到。"""
+    client = _SequenceRuntime(
+        [
+            json.dumps({"ok": False, "error": "not_found"}),
+            json.dumps({"ok": True, "content": "legacy", "format": "pdf"}),
+        ]
+    )
+    out = await ReadDocumentTool(client=client).call(
+        {"path": "报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    )
+    assert out.content == "legacy"
+    assert len(client.execs) == 2
+    assert '"ws": "/workspace",' in client.execs[1][1]
+
+
+async def test_read_document_refuses_another_agents_path() -> None:
+    with pytest.raises(ValueError, match="reserved layout segment"):
+        await ReadDocumentTool(client=_client()).call(
+            {"path": "agents/sop-bbbbbbbb/报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+        )

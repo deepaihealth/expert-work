@@ -33,15 +33,18 @@ from orchestrator.tools.file_ops import (
     _raise_for_error,
     _require_path,
     _snippet,
-    parse_envelope,
+    read_with_legacy_fallback,
 )
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
     SandboxRuntime,
-    run_in_sandbox,
 )
+from orchestrator.tools.workspace_paths import USER_ROOT, resolve_scope
 
-_WORKSPACE_ROOT = "/workspace"
+#: B-50 —— 与 ``file_ops`` 同一个真源。这个模块此前自己写了一份字面量;
+#: ``read_document`` 也读用户工作区,PR3 的计划里漏登记了它(实测七个工作区
+#: 调用点,计划只列了四个)。
+_WORKSPACE_ROOT = USER_ROOT
 #: Largest document the parse will pull in. Documents are zips (docx/xlsx/pptx)
 #: or page trees (pdf), so an oversized file is a decompression-bomb / OOM
 #: risk — reject before parsing rather than mid-stream.
@@ -189,10 +192,12 @@ class ReadDocumentTool:
         return ToolSpec(
             name="read_document",
             description=(
-                "Extract the text of a document in the agent's workspace — PDF, "
+                "Extract the text of a document in your own workspace — PDF, "
                 "Word (.docx), Excel (.xlsx), PowerPoint (.pptx), or a plain-text "
                 "format (.txt/.md/.csv/.json/...). Use this for binary documents "
-                "that read_file cannot decode. Path is relative to /workspace."
+                "that read_file cannot decode. Paths are relative to your own "
+                "workspace root. Prefix a path with 'shared:' to read the shared "
+                "legacy area (read-only)."
             ),
             parameters={
                 "type": "object",
@@ -211,17 +216,17 @@ class ReadDocumentTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        rel = _require_path(args, tool="read_document")
-        outcome = await run_in_sandbox(
+        raw = _require_path(args, tool="read_document", agent_key=ctx.agent_key)
+        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_document")
+        env = await read_with_legacy_fallback(
             self.client,
-            code=build_read_document_wrapper(rel, cap=self.output_char_cap),
-            timeout_s=None,
+            build=lambda w: build_read_document_wrapper(rel, cap=self.output_char_cap, ws=w),
+            ws=ws,
+            raw=raw,
             ctx=ctx,
-            tool_label="read_document",
-            fallback_thread_id="read_document",
+            tool="read_document",
             seed_files=self.skill_seed_files,
         )
-        env = parse_envelope(outcome, tool="read_document")
         _raise_for_error(env, tool="read_document")
         return ToolResult(
             content=str(env.get("content", "")),

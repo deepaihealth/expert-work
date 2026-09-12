@@ -40,7 +40,7 @@ attacker-influenced file from OOM-ing the (per-user) sandbox.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
@@ -58,9 +58,20 @@ from orchestrator.tools.sandbox import (
     SandboxRuntime,
     run_in_sandbox,
 )
+from orchestrator.tools.workspace_paths import (
+    AGENTS_DIR,
+    SHARED_PREFIX,
+    USER_ROOT,
+    agent_workspace_root,
+    resolve_scope,
+)
 
 #: Workspace mount inside the sandbox (see infra/sandbox-image).
-_WORKSPACE_ROOT = "/workspace"
+#:
+#: B-50 —— **不自己写字面量**:``workspace_paths.USER_ROOT`` 是唯一真源。迁移期
+#: 读回落的目标就是这个值,两处各写一份字面量时改一处漏一处是静默的(回落打去
+#: 一个不存在的根,只表现为「读不到」)。
+_WORKSPACE_ROOT = USER_ROOT
 #: Largest file ``read_file`` will pull into the sandbox (whole file is hashed
 #: for TE-9 CAS, so the read can't be capped to the returned slice). Bigger
 #: files should use the dedicated ``read_workspace_file`` download path.
@@ -80,7 +91,9 @@ class FileOpError(RuntimeError):
     sees the structured ``error`` kind and self-corrects (re-read, fix path)."""
 
 
-def _require_path(args: Mapping[str, Any], *, tool: str, default: str | None = None) -> str:
+def _require_path(
+    args: Mapping[str, Any], *, tool: str, default: str | None = None, agent_key: str = ""
+) -> str:
     """Validate the orchestrator-side ``path`` arg: a relative workspace
     path without ``..`` or NUL. Mirrors ``artifact.py:_validate_path`` for a
     consistent contract across file-touching tools; the in-sandbox snippet
@@ -102,6 +115,24 @@ def _require_path(args: Mapping[str, Any], *, tool: str, default: str | None = N
     # whole recovery round). Only this exact root folds; any other absolute
     # path (and any ``..`` that survives the fold) still rejects below, and the
     # in-sandbox realpath re-check remains the actual escape boundary.
+    # B-50 —— ``shared:`` 是显式作用域前缀,不是路径的一部分。剥掉再校验,
+    # 校验完由 ``resolve_scope`` 重新识别;剥掉之后的余部它自己也再查一遍 ``..``。
+    prefix = ""
+    if cleaned.startswith(SHARED_PREFIX):
+        prefix, cleaned = SHARED_PREFIX, cleaned[len(SHARED_PREFIX) :].strip()
+        if not cleaned:
+            msg = f"{tool} requires a non-empty 'path'"
+            raise ValueError(msg)
+    # B-50 —— 先折**自己**那一段。``list_dir`` 现在回给模型的是 agent 根下的
+    # 相对名,但模型也会照着工具描述回传 ``/workspace/agents/<自己>/x``;不先折
+    # 这一段,下面的通用 ``/workspace/`` 折叠会留下 ``agents/<自己>/x``,再拼一次
+    # agent 根就成了 ``agents/<自己>/agents/<自己>/x``。
+    if not prefix and agent_key:
+        own = f"{agent_workspace_root(agent_key)}/"
+        if cleaned == own.rstrip("/"):
+            cleaned = "."
+        elif cleaned.startswith(own):
+            cleaned = cleaned[len(own) :]
     if cleaned in ("/workspace", "/workspace/"):
         cleaned = "."
     elif cleaned.startswith("/workspace/"):
@@ -109,7 +140,17 @@ def _require_path(args: Mapping[str, Any], *, tool: str, default: str | None = N
     if cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
         msg = f"{tool} path must be a relative workspace path without '..': {raw!r}"
         raise ValueError(msg)
-    return cleaned
+    # B-50 —— ``agents/`` 是布局的保留段,绑了 agent 的调用一律不许拿它寻址。
+    # 不拒的话迁移期读回落正好把 ``agents/<别人的 key>/x`` 办成一次合法的跨 agent
+    # 读:自己根下找不到 → 回落用户根 → 不偏不倚命中别人的目录。这正是 B-50 要
+    # 关掉的那扇门,不能在开门的同一个 PR 里自己留一条缝。
+    if agent_key and PurePosixPath(cleaned).parts[:1] == (AGENTS_DIR,):
+        msg = (
+            f"{tool} path must be relative to your own workspace; "
+            f"{AGENTS_DIR!r} is a reserved layout segment: {raw!r}"
+        )
+        raise ValueError(msg)
+    return prefix + cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +486,61 @@ def parse_envelope(outcome: SandboxOutcome, *, tool: str) -> Mapping[str, Any]:
     return env
 
 
+def is_not_found(env: Mapping[str, Any]) -> bool:
+    """封装里的「目标不存在」—— 三个读片段(read / list / read_document)用的
+    是同一个错误码,所以迁移期读回落只认这一个判据。"""
+    return not env.get("ok") and env.get("error") == "not_found"
+
+
+async def read_with_legacy_fallback(
+    client: SandboxRuntime,
+    *,
+    build: Callable[[str], str],
+    ws: str,
+    raw: str,
+    ctx: ToolContext,
+    tool: str,
+    seed_files: tuple[tuple[str, bytes], ...],
+) -> Mapping[str, Any]:
+    """跑一次作用域内的读;agent 根下 ``not_found`` 时回落用户根**再读一次**。
+
+    B-50 迁移期专用(PR6 / Task 14 摘掉)。搬迁脚本(PR5)跑之前,存量文件还在
+    用户根上;没有这一跳,PR3 一上线所有历史文件当场读不到。
+
+    三个不回落的情形,每个都是有意的:
+
+    * ``ws`` 已经是用户根(未绑 agent)—— 回落无处可去,白跑一次 exec。
+    * ``shared:`` —— 显式寻址。读不到就是读不到;回落等于悄悄换了目标,而
+      ``shared/`` 恰恰是「归属不明」的那批,换过去拿到的东西**可能是别人的**。
+    * 写类工具 —— 根本不走这个函数。新内容一律落 agent 目录,从第一天起就分好。
+
+    **代价明说**:回落窗口内的读串问题还是今天的样子 —— 不是新增回归,是尚未
+    修复(spec §7.2 已接受的代价)。
+    """
+    outcome = await run_in_sandbox(
+        client,
+        code=build(ws),
+        timeout_s=None,
+        ctx=ctx,
+        tool_label=tool,
+        fallback_thread_id=tool,
+        seed_files=seed_files,
+    )
+    env = parse_envelope(outcome, tool=tool)
+    if not is_not_found(env) or ws == USER_ROOT or raw.startswith(SHARED_PREFIX):
+        return env
+    outcome = await run_in_sandbox(
+        client,
+        code=build(USER_ROOT),
+        timeout_s=None,
+        ctx=ctx,
+        tool_label=tool,
+        fallback_thread_id=tool,
+        seed_files=seed_files,
+    )
+    return parse_envelope(outcome, tool=tool)
+
+
 def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
     """Map a ``{"ok": False, ...}`` envelope to the right exception.
 
@@ -476,9 +572,12 @@ class ReadFileTool:
         return ToolSpec(
             name="read_file",
             description=(
-                "Read a UTF-8 text file from the agent's workspace and return "
+                "Read a UTF-8 text file from your own workspace and return "
                 "its contents plus a content hash (pass the hash to edit_file "
-                "for safe concurrent edits). Path is relative to /workspace."
+                "for safe concurrent edits). Paths are relative to your own "
+                "workspace root. Files belonging to other agents working for "
+                "the same user are not reachable. Prefix a path with 'shared:' "
+                "to read the shared legacy area (read-only)."
             ),
             parameters={
                 "type": "object",
@@ -497,17 +596,17 @@ class ReadFileTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        rel = _require_path(args, tool="read_file")
-        outcome = await run_in_sandbox(
+        raw = _require_path(args, tool="read_file", agent_key=ctx.agent_key)
+        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_file")
+        env = await read_with_legacy_fallback(
             self.client,
-            code=build_read_wrapper(rel, cap=self.output_char_cap),
-            timeout_s=None,
+            build=lambda w: build_read_wrapper(rel, cap=self.output_char_cap, ws=w),
+            ws=ws,
+            raw=raw,
             ctx=ctx,
-            tool_label="read_file",
-            fallback_thread_id="read_file",
+            tool="read_file",
             seed_files=self.skill_seed_files,
         )
-        env = parse_envelope(outcome, tool="read_file")
         _raise_for_error(env, tool="read_file")
         return ToolResult(
             content=str(env.get("content", "")),
@@ -536,9 +635,11 @@ class WriteFileTool:
         return ToolSpec(
             name="write_file",
             description=(
-                "Write (create or overwrite) a UTF-8 text file in the agent's "
+                "Write (create or overwrite) a UTF-8 text file in your own "
                 "workspace. The write is atomic. Returns the new content hash. "
-                "Path is relative to /workspace; parent directories are created."
+                "Paths are relative to your own workspace root; parent "
+                "directories are created. Writing to 'shared:' is refused — "
+                "that area is read-only."
             ),
             parameters={
                 "type": "object",
@@ -561,7 +662,9 @@ class WriteFileTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        rel = _require_path(args, tool="write_file")
+        raw = _require_path(args, tool="write_file", agent_key=ctx.agent_key)
+        # 写永不回落 —— 新内容一律落自己的目录,从第一天起就分好。
+        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="write_file")
         content = args.get("content")
         if not isinstance(content, str):
             msg = "write_file requires a 'content' string"
@@ -576,7 +679,7 @@ class WriteFileTool:
         async with self.workspace_lock.acquire(tenant_id=ctx.tenant_id, user_id=ctx.user_id):
             outcome = await run_in_sandbox(
                 self.client,
-                code=build_write_wrapper(rel, content),
+                code=build_write_wrapper(rel, content, ws=ws),
                 timeout_s=None,
                 ctx=ctx,
                 tool_label="write_file",
@@ -609,9 +712,11 @@ class ListDirTool:
         return ToolSpec(
             name="list_dir",
             description=(
-                "List the entries of a directory in the agent's workspace "
-                "(name, is_dir, size). Path is relative to /workspace; "
-                "defaults to the workspace root."
+                "List the entries of a directory in your own workspace "
+                "(name, is_dir, size). Paths are relative to your own workspace "
+                "root and default to it. Files belonging to other agents working "
+                "for the same user are not listed here. Prefix a path with "
+                "'shared:' to list the shared legacy area (read-only)."
             ),
             parameters={
                 "type": "object",
@@ -629,17 +734,17 @@ class ListDirTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        rel = _require_path(args, tool="list_dir", default=".")
-        outcome = await run_in_sandbox(
+        raw = _require_path(args, tool="list_dir", default=".", agent_key=ctx.agent_key)
+        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="list_dir")
+        env = await read_with_legacy_fallback(
             self.client,
-            code=build_list_wrapper(rel),
-            timeout_s=None,
+            build=lambda w: build_list_wrapper(rel, ws=w),
+            ws=ws,
+            raw=raw,
             ctx=ctx,
-            tool_label="list_dir",
-            fallback_thread_id="list_dir",
+            tool="list_dir",
             seed_files=self.skill_seed_files,
         )
-        env = parse_envelope(outcome, tool="list_dir")
         _raise_for_error(env, tool="list_dir")
         entries = env.get("entries")
         if not isinstance(entries, list):
@@ -680,8 +785,9 @@ class EditFileTool:
                 "trailing-space drift; that fallback normalizes line endings to LF "
                 "unless the file is uniformly CRLF). Optionally pass 'expected_hash' "
                 "(from read_file) for a safe compare-and-swap: the edit is rejected "
-                "as stale if the file changed since you read it. Path is relative to "
-                "/workspace."
+                "as stale if the file changed since you read it. Paths are relative "
+                "to your own workspace root; editing 'shared:' is refused — that "
+                "area is read-only."
             ),
             parameters={
                 "type": "object",
@@ -713,7 +819,10 @@ class EditFileTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        rel = _require_path(args, tool="edit_file")
+        raw = _require_path(args, tool="edit_file", agent_key=ctx.agent_key)
+        # 写永不回落(edit 也改字节)——「读得到 legacy」不等于「可以就地改它」:
+        # 那会把一份归属不明的文件悄悄变成本 agent 的既成事实。
+        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="edit_file")
         old = args.get("old_string")
         if not isinstance(old, str) or old == "":
             msg = "edit_file requires a non-empty 'old_string'"
@@ -734,7 +843,7 @@ class EditFileTool:
         async with self.workspace_lock.acquire(tenant_id=ctx.tenant_id, user_id=ctx.user_id):
             outcome = await run_in_sandbox(
                 self.client,
-                code=build_edit_wrapper(rel, old, new, expected_hash=expected),
+                code=build_edit_wrapper(rel, old, new, expected_hash=expected, ws=ws),
                 timeout_s=None,
                 ctx=ctx,
                 tool_label="edit_file",
