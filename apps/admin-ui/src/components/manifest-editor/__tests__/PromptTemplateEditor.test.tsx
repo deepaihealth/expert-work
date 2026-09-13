@@ -4,8 +4,17 @@ import userEvent from "@testing-library/user-event";
 
 /**
  * The Monaco stub drives ``beforeMount`` with a fake ``monaco`` so the Jinja
- * language + completion provider registration code runs under jsdom. The
- * registered completion provider is captured module-side for assertion.
+ * language + completion provider registration code runs under jsdom.
+ *
+ * Registration is global to Monaco, so the component guards it with a
+ * module-level ``languageRegistered`` flag and it happens exactly **once per
+ * test module** — the first ``render`` in this file consumes it. The
+ * registration facts are therefore captured into plain module-level variables
+ * instead of being read back out of ``vi.fn()`` call history: history belongs
+ * to the test that produced it and is wiped by a between-test mock clear
+ * (vitest's ``clearMocks``, on by default from vitest 5), which would leave
+ * the assertions below looking at an empty log of a registration that did
+ * happen.
  */
 let capturedProvider:
   | {
@@ -16,10 +25,18 @@ let capturedProvider:
     }
   | undefined;
 
+const registeredLanguages: string[] = [];
+const tokenizedLanguages: string[] = [];
+const definedThemes: string[] = [];
+
 const fakeMonaco = {
   languages: {
-    register: vi.fn(),
-    setMonarchTokensProvider: vi.fn(),
+    register: vi.fn(({ id }: { id: string }) => {
+      registeredLanguages.push(id);
+    }),
+    setMonarchTokensProvider: vi.fn((lang: string) => {
+      tokenizedLanguages.push(lang);
+    }),
     registerCompletionItemProvider: vi.fn(
       (_lang: string, provider: unknown) => {
         capturedProvider = provider as typeof capturedProvider;
@@ -27,7 +44,11 @@ const fakeMonaco = {
     ),
     CompletionItemKind: { Variable: 4 },
   },
-  editor: { defineTheme: vi.fn() },
+  editor: {
+    defineTheme: vi.fn((id: string) => {
+      definedThemes.push(id);
+    }),
+  },
 };
 
 vi.mock("@monaco-editor/react", () => {
@@ -75,8 +96,9 @@ describe("PromptTemplateEditor", () => {
 
   it("registers the Jinja language and a completion provider", () => {
     render(<PromptTemplateEditor value="" variables={[]} onChange={vi.fn()} />);
-    expect(fakeMonaco.languages.setMonarchTokensProvider).toHaveBeenCalled();
-    expect(fakeMonaco.editor.defineTheme).toHaveBeenCalled();
+    expect(registeredLanguages).toContain("jinja-prompt");
+    expect(tokenizedLanguages).toContain("jinja-prompt");
+    expect(definedThemes).toContain("jinja-dark");
     expect(capturedProvider).toBeDefined();
   });
 
