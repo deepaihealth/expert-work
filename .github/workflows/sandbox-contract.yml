@@ -103,7 +103,17 @@ jobs:
     # 网络不确定性,但这里选择让这份不确定性如实体现在 job 的红绿上,而不是
     # 用 continue-on-error 统一吞掉;真出现网络抖动导致的假红,人工重跑这个
     # job 即可。
-    timeout-minutes: 15
+    #
+    # 15 → 25(2026-09-13,B-55)。15 分钟盛不下这一档:池 replicas=1 时 22-24 条
+    # 用例抢一个温沙箱,抢不到的落到冷建,而冷建要等镜像拉取 ~1m50s、再撞 ALB
+    # 的 60s 网关超时报 504。结果是 job 在 15 分钟被 cancel,而 **pytest 的
+    # summary 与 traceback 一条都不输出** —— 只剩进度行。
+    #
+    # 对这个 job 来说这是最坏的失效形态:上面那段注释说得很清楚,它故意不加
+    # continue-on-error,因为它是防两套 SandboxRuntime 实现漂移的唯一手段。
+    # 一个**会红但说不出为什么**的门禁,比红本身更糟 —— 时间久了没人再看它。
+    # 调大预算不是修根因(根因见 B-55),是让它至少能给出结论。
+    timeout-minutes: 25
     services:
       postgres:
         # X-8 收官:mirror-images.yml 从 Docker Hub 原样复制到 GHCR。
@@ -176,6 +186,10 @@ jobs:
         env:
           EXPERT_WORK_SANDBOX_E2B_API_KEY: ${{ secrets.EXPERT_WORK_SANDBOX_E2B_API_KEY }}
           EXPERT_WORK_DB_DSN: postgresql+asyncpg://expert_work:expert_work_dev@localhost:5432/expert_work_dev
+        # --timeout 是第二道闸:单条用例挂住时自己报名字,而不是把整个 job 的
+        # 预算烧光换一句 "The operation was canceled"。300s 给足冷建的余量
+        # (实测镜像拉取 ~1m50s + 创建),同时远小于 job 预算。
         run: >-
           uv run pytest -v -m integration -k agent_sandbox
+          --timeout=300 --timeout-method=thread
           services/orchestrator/tests/test_sandbox_runtime_contract.py
