@@ -208,20 +208,25 @@ async def test_read_document_resolves_under_agent_root() -> None:
     assert '"ws": "/workspace/agents/plan-aaaaaaaa",' in client.execs[-1][1]
 
 
-async def test_read_document_falls_back_to_user_root_once() -> None:
-    """存量上传件还在用户根上,搬迁(PR5)之前必须读得到。"""
+async def test_read_document_never_reaches_the_user_root() -> None:
+    """PR6(Task 14)—— 搬迁跑完之后,读文档这条路也不许回落用户根。
+
+    桩里第二个 outcome 是「用户根上有这份文档」的诱饵:回落还在的话这条会拿到
+    ``legacy`` 而不是报错。这个工具在 PR3 的计划里**被漏登记过一次**(计划写四个
+    工作区调用点,实测七个),所以摘回落时也要单独钉一遍,不能只钉 file_ops。
+    """
     client = _SequenceRuntime(
         [
             json.dumps({"ok": False, "error": "not_found"}),
             json.dumps({"ok": True, "content": "legacy", "format": "pdf"}),
         ]
     )
-    out = await ReadDocumentTool(client=client).call(
-        {"path": "报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
-    )
-    assert out.content == "legacy"
-    assert len(client.execs) == 2
-    assert '"ws": "/workspace",' in client.execs[1][1]
+    with pytest.raises(FileOpError):
+        await ReadDocumentTool(client=client).call(
+            {"path": "报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+        )
+    assert len(client.execs) == 1, "回落被加回来了:多跑了一次 exec"
+    assert '"ws": "/workspace/agents/plan-aaaaaaaa",' in client.execs[0][1]
 
 
 async def test_read_document_refuses_another_agents_path() -> None:

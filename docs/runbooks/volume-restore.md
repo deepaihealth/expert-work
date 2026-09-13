@@ -101,6 +101,32 @@ Operator sanity checks:
 * Permissions / ownership match the original volume.
 * Total size is close to the source (`docker exec ... du -sb /ws`).
 
+## Step 3b — re-run the agent-scoping migration (B-50, required)
+
+Backups taken before the B-50 migration hold the **old flat layout**
+(`{tenant}/{user}/MEMORY.md`, `threads/`, `uploads/` …). Agents read only their
+own `agents/<key>/` subtree — the migration-period fallback that used to reach
+the user root was removed in Task 14 / PR6 — so a restored-but-unmigrated
+workspace is **invisible to the agent**, silently: no error, just an empty
+`list_dir`.
+
+```sh
+NS=expert-work
+POD=$(kubectl -n $NS get pod -l app.kubernetes.io/name=control-plane -o name | head -1)
+
+# 先空跑看报告,再 --apply。脚本是幂等的 —— 已经在终态的文件不会再搬,
+# 所以对「其实不需要搬」的备份跑一遍也安全。
+kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_agent_scoping \
+  --root /mnt/workspaces --tenant "$TENANT" --user "$USER"
+```
+
+Full procedure and acceptance predicates:
+[`workspace-agent-scoping-migration.md`](./workspace-agent-scoping-migration.md).
+
+The same applies to anything recovered by hand out of `{tenant}/.deleted/<user>/`
+(soft-deleted workspace archive — there is no product-level restore path for it,
+so that is a manual `mv` plus this step).
+
 ## Step 4 — promote the volume (operator decision)
 
 If the restored volume looks right, point the workspace row at it. **Do

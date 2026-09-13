@@ -33,7 +33,7 @@ from orchestrator.tools.file_ops import (
     _raise_for_error,
     _require_path,
     _snippet,
-    read_with_legacy_fallback,
+    run_scoped_read,
 )
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
@@ -218,11 +218,10 @@ class ReadDocumentTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         raw = _require_path(args, tool="read_document", agent_key=ctx.agent_key)
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_document")
-        env = await read_with_legacy_fallback(
+        env = await run_scoped_read(
             self.client,
             build=lambda w: build_read_document_wrapper(rel, cap=self.output_char_cap, ws=w),
             ws=ws,
-            raw=raw,
             ctx=ctx,
             tool="read_document",
             seed_files=self.skill_seed_files,
