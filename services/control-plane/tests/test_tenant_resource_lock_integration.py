@@ -56,15 +56,23 @@ async def test_second_racer_gets_429_when_held_past_retry_budget(engine: AsyncEn
     session_factory = create_async_session_factory(engine)
     tenant_id = uuid4()
     order: list[str] = []
+    holder_inside = asyncio.Event()
 
     async def holder() -> None:
         async with tenant_resource_lock(session_factory, tenant_id, "eval_dataset"):
             order.append("holder-enter")
+            holder_inside.set()
             await asyncio.sleep(0.3)  # well past 1 try + 1 retry (~50ms)
             order.append("holder-exit")
 
     async def racer() -> HTTPException:
-        await asyncio.sleep(0.02)  # let the holder acquire first
+        # Wait for the holder to be provably inside rather than giving it a
+        # head-start sleep: both coroutines have to check out their own pooled
+        # connection first, and on a loaded runner the racer can win that race.
+        # When it does, the ordering assertions here and in the next test fail
+        # even though the lock did its job — the contention just happened in the
+        # other direction (observed 2026-09-13 on CI).
+        await holder_inside.wait()
         with pytest.raises(HTTPException) as exc_info:
             async with tenant_resource_lock(session_factory, tenant_id, "eval_dataset"):
                 pass  # pragma: no cover - never reached
@@ -80,15 +88,27 @@ async def test_second_racer_succeeds_when_first_releases_quickly(engine: AsyncEn
     session_factory = create_async_session_factory(engine)
     tenant_id = uuid4()
     order: list[str] = []
+    holder_inside = asyncio.Event()
+    racer_attempting = asyncio.Event()
 
     async def holder() -> None:
         async with tenant_resource_lock(session_factory, tenant_id, "cron_trigger"):
             order.append("holder-enter")
-            await asyncio.sleep(0.01)  # released before the 50ms retry fires
+            holder_inside.set()
+            # Hold until the racer is attempting, then a further 30ms. Both waits
+            # earn their keep: the first makes the ordering deterministic, the
+            # second makes a *broken* lock observable — 30ms is far longer than a
+            # local acquire (connection checkout + one statement), so a racer that
+            # was let straight in would land between the two appends below and
+            # break the assertion. Still well under the 50ms retry delay, so a
+            # working lock lets the racer in on its retry.
+            await racer_attempting.wait()
+            await asyncio.sleep(0.03)
             order.append("holder-exit")
 
     async def racer() -> None:
-        await asyncio.sleep(0.005)
+        await holder_inside.wait()  # see the note in the 429 test above
+        racer_attempting.set()
         async with tenant_resource_lock(session_factory, tenant_id, "cron_trigger"):
             order.append("racer-enter")
 
