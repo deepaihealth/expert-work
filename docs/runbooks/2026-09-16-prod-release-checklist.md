@@ -7,7 +7,8 @@
 |---|---|
 | 上一版 tag（回滚用） | **`ad79ba28`** |
 | 本版 tag | `___________`（发布时填，= 发布那刻 main 的 short HEAD） |
-| 区间提交数 | 93（`git log --oneline ad79ba28..<本版>`） |
+| 区间提交数 | 93+（`git log --oneline ad79ba28..<本版>`） |
+| 生产实况已勘察 | **2026-09-13，只读**：1 个租户 / 8 个用户目录 / 152 文件 / 56 条产物版本行 / 唯一的多 agent 用户一个。逐个用户的预期结果写死在 §3 Step C.1 —— **发布当晚不需要临场查询或判断** |
 | 执行人 / 开始时间 | `___________` |
 
 ---
@@ -27,9 +28,10 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
 - [ ] **本机接线还在**：`~/.kube/expert-work-prod.yaml`、
       `~/.kube/expert-work-prod-secrets.env`、`~/.kube/expert-work-prod-params.env`
       三个文件都在且权限 600
-- [ ] **金丝雀已 seed**：`release-canary` agent + `canary:release` 用户存在于生产。
-      没有的话按 [`production-release.md` §1.6.7](./production-release.md) 补 ——
-      **未 seed 时 smoke 阶段 6 会 WARNING 跳过**，等于这次发布没有真栈闸门
+- [x] **金丝雀已 seed** —— 2026-09-13 在生产只读确认：`release-canary` 有会话行，
+      它的工作区里 `canary-check.txt` 在。
+      （**未 seed 时 smoke 阶段 6 会 WARNING 跳过**，等于这次发布没有真栈闸门；
+      真要补按 [`production-release.md` §1.6.7](./production-release.md)）
 - [ ] **确认本版装载**：`git log --oneline ad79ba28..HEAD`，与 ROADMAP 班车 1 条目对齐
 - [ ] **依赖 PR 的取舍已拍板**：#1520 / #1485 / #1519 / #1484 合不合进本版？
       （建议：本版**不带**，B-50 搬迁是这次的主要风险，混进依赖升级会让出问题时
@@ -81,9 +83,10 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
 ```sh
 export KUBECONFIG=~/.kube/expert-work-prod.yaml
 
-# 发前值（留档）：
+# 发前值（留档）。2026-09-13 只读实测就是 `…/sandbox:63a3109f`，`replicas=1`；
+# 对不上说明这中间有人动过，停下来先弄清楚再 apply。
 kubectl -n default get sandboxset expert-work-sandbox \
-  -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+  -o jsonpath='{.spec.template.spec.containers[*].image}{"  replicas="}{.spec.replicas}{"\n"}'
 
 kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
 
@@ -111,36 +114,150 @@ tools/deploy/release.sh prod          # 输入 'prod' 确认；或 --yes
 
 ### Step C — B-50 工作区存量搬迁（金丝雀绿之后**立刻**）
 
-完整步骤在 [`workspace-agent-scoping-migration.md`](./workspace-agent-scoping-migration.md)，
-这里只列骨架与闸门：
+完整步骤与验收判据在
+[`workspace-agent-scoping-migration.md`](./workspace-agent-scoping-migration.md)。
+下面这一节是**照抄即可执行**的版本：生产的规模、用户清单、每个用户的预期结果
+都已于 2026-09-13 在生产集群上**只读勘察过并写死在这里**，不需要临场查询或判断。
+**任何一格对不上就停下来，不要继续。**
+
+#### C.0 生产实况（2026-09-13 勘察，只读）
+
+| | |
+|---|---|
+| 租户 | **1 个**：`b0f0d29b-62ce-4326-ae92-e1c18631c935` |
+| NAS 根 | `/mnt/workspaces`（已确认挂载） |
+| 用户目录 | **8 个**，共 **152 个文件** |
+| 有会话行的用户 | 9 个（`502b89e5…` 有会话但**没有 NAS 目录**，会被跳过） |
+| 产物版本行（带 `path_in_workspace`） | **56** |
+| 多 agent 用户 | **只有 1 个**：`81066c49…` |
+
+> ⚠️ 这些工作区属于**对接方的真实生产用户**（agent 是 `ai-health-plan` /
+> `sop2-designer`）。搬迁只做同文件系统内的 `os.replace`，不读内容、不改权限位、
+> **目的地已有文件时绝不覆盖**（源改投 `shared/` 并单独报出来）。
+
+#### C.1 预期结果 —— 逐个用户写死
+
+| 用户（前 8 位） | 文件 | 产物行 | agent | 预期 |
+|---|---|---|---|---|
+| `81066c49` | 51 | 32 | `sop2-designer` + `ai-health-plan` | **唯一会产生 `shared/` 的用户** |
+| `4f85f3b0` | 58 | 6 | `sop2-designer` | 全树 → `agents/sop2-designer-c97db277/`，`shared 0` |
+| `1fef0d73` | 20 | 3 | `sop2-designer` | 同上 |
+| `91bdbc51` | 7 | 4 | `ai-health-plan` | 全树 → `agents/ai-health-plan-30817804/`，`shared 0` |
+| `5e949c8f` | 6 | 5 | `ai-health-plan` | 同上 |
+| `52d0f26f` | 5 | 2 | `ai-health-plan` | 同上 |
+| `05d882f5` | 4 | 2 | `ai-health-plan` | 同上 |
+| `01d73931` | 1 | 2 | `release-canary` | 全树 → `agents/release-canary-fd420deb/`（金丝雀自己） |
+| `502b89e5` | — | 0 | `ai-health-plan` | **无 NAS 目录，跳过**（脚本会报「无事可做」） |
+| **合计** | **152** | **56** | | |
+
+**判读规则**：
+- 单 agent 用户的 `shared` 必须是 **0**。非 0 → 停下来看报告里点名的文件。
+- `81066c49` 的 `shared` 会 > 0（根级共写文件 `MEMORY.md`/`PLAN.md`/`TODO.md`
+  + run 已清理的孤儿 `.tool_results/`），这是**设计要的形态**。
+- `artifact rows updated` **会 ≥** 空跑报的 path 条数（一个 path 挂多个版本行）。
+  只有 `⚠️ N 条更新在库里一行都没命中` 才是红旗。
+
+#### C.2 空跑（先全部跑一遍，看完再动手）
 
 ```sh
+export KUBECONFIG=~/.kube/expert-work-prod.yaml
 NS=expert-work
+TENANT=b0f0d29b-62ce-4326-ae92-e1c18631c935
 POD=$(kubectl -n $NS get pod -l app.kubernetes.io/name=control-plane -o name | head -1)
+echo "POD=$POD"   # 空的话停 —— 标签是 app.kubernetes.io/name，不是 app
 
-# 1) 空跑，逐个用户看报告
-kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_agent_scoping \
-  --root /mnt/workspaces --tenant "$TENANT" --user "$USER"
+USERS="81066c49-0f8e-4dc2-9acd-4c57e3be5973
+4f85f3b0-2f85-49a5-850f-daaec7b329a2
+1fef0d73-af6f-4e84-9ed8-fbdfad266837
+91bdbc51-3c23-423d-8031-7207dcdfa5d3
+5e949c8f-9834-4adf-b42d-4aaad364125c
+52d0f26f-535e-4d68-a159-9cf2cb02f86a
+05d882f5-243b-4b42-9b86-db9a4384ba15
+01d73931-55d0-4412-978e-e0a4f4dcf388"
 
-# 2) 报告看过了再真搬
-kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_agent_scoping \
-  --root /mnt/workspaces --tenant "$TENANT" --user "$USER" --apply
+for U in $USERS; do
+  echo "=== $U"
+  kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_agent_scoping \
+    --root /mnt/workspaces --tenant "$TENANT" --user "$U"
+done 2>&1 | tee ~/b50-prod-dryrun.txt
 ```
 
-- [ ] **每个用户先 dry-run**，报告里 `moved / to_shared / untouched` 三个数**互不重叠**
-      且**合计等于文件总数**
-- [ ] `conflicts` 里点名的文件逐个看过（目的地已存在 → 源进 `shared/`，这是单 agent
-      用户的常态，不是异常）
-- [ ] **每次 `--apply` 的输出留档** —— 没有自动回退，回退要靠报告里的 `moves` 反向 `mv`
-- [ ] 空跑报告里的 **`artifact rows to update N`** 记下来；真搬之后核对
-      `artifact rows updated` 是不是同一个数。不一致时脚本会单独告警，别忽略
-      —— 差额的那些登记行此刻正指向已被搬走的旧路径
-- [ ] **崩了就重跑同一条命令**（搬迁是幂等的，2026-09-13 加的）；别手工修数据
-- [ ] 按 runbook §Step 3 的 5+2 条判据验收
-- [ ] 搬完复看控制台工作区浏览面：按 agent 分组、`shared/` 单独一组
+- [ ] 八个用户的 `moved + to shared + untouched` 各自等于 C.1 表里的文件数
+- [ ] 单 agent 的七个 `to shared` 全是 **0**
+- [ ] `81066c49` 的 `shared` 清单看过（应是根级共写文件 + 孤儿 `.tool_results/`）
+- [ ] 报告**留档**（`~/b50-prod-dryrun.txt`）—— 没有自动回退，回退靠这份 `moves`
 
-> 脚本自己会断言 `0154` 已跑过并回填（`assert_backfill_ran`）。它没跑时，本可归属的
-> 产物会被**静默**扫进 `shared/` —— 不报错、文件数照样守恒，只有人工比对才看得出来。
+#### C.3 真搬
+
+```sh
+for U in $USERS; do
+  echo "=== $U"
+  kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_agent_scoping \
+    --root /mnt/workspaces --tenant "$TENANT" --user "$U" --apply
+done 2>&1 | tee ~/b50-prod-apply.txt
+```
+
+- [ ] 每个用户的 `moved`/`to shared`/`untouched` 与 C.2 空跑**逐个一致**
+- [ ] **一条 `⚠️` 都没有**
+- [ ] 输出留档（`~/b50-prod-apply.txt`）
+- [ ] **崩了就重跑同一条命令**（脚本幂等），别手工改数据
+
+#### C.4 验收（照抄，四个数全部要对）
+
+```sh
+kubectl -n $NS exec -i "$POD" -- python3 - <<'EOF'
+import os
+from control_plane.settings import Settings
+import psycopg
+R="/mnt/workspaces"
+tot=agents=shared=0
+for t in os.listdir(R):
+    tp=os.path.join(R,t)
+    if not os.path.isdir(tp): continue
+    for u in os.listdir(tp):
+        up=os.path.join(tp,u)
+        if not os.path.isdir(up) or u.startswith("."): continue
+        tot+=sum(len(fs) for _,_,fs in os.walk(up))
+        for name in ("agents","shared"):
+            d=os.path.join(up,name)
+            if os.path.isdir(d):
+                n=sum(len(fs) for _,_,fs in os.walk(d))
+                if name=="agents": agents+=n
+                else: shared+=n
+        extra=[e for e in os.listdir(up) if e not in {"agents","shared","skills"}]
+        if extra: print(f"  !! {u[:8]} 顶层还有 {extra[:4]}")
+print(f"① 文件总数 {tot}          (期望 152)")
+print(f"   agents/ {agents} + shared/ {shared} = {agents+shared}")
+with psycopg.connect(Settings().db_dsn.replace("+asyncpg","")) as c:
+    cur=c.cursor()
+    cur.execute("""SELECT a.tenant_id::text,a.user_id::text,av.path_in_workspace
+                     FROM artifact_version av JOIN artifact a ON a.id=av.artifact_id
+                    WHERE av.path_in_workspace IS NOT NULL AND av.path_in_workspace<>''""")
+    rows=cur.fetchall()
+stale=[r for r in rows if not r[2].startswith(("agents/","shared/"))]
+bad=[r for r in rows if r[2].startswith(("agents/","shared/"))
+     and not os.path.exists(f"{R}/{r[0]}/{r[1]}/{r[2]}")]
+print(f"② 产物版本行 {len(rows)}   (期望 56)")
+print(f"③ 仍是扁平旧路径 {len(stale)}   (期望 0)")
+print(f"④ 新路径但文件不在 {len(bad)}   (期望 0)")
+EOF
+```
+
+- [ ] ① `152`，且 `agents/ + shared/` 合计也是 `152`
+- [ ] ② `56`
+- [ ] ③ **`0`**
+- [ ] ④ **`0`** ← 这条排除「改对了格式但指错了地方」
+- [ ] 没有 `!!` 行（顶层只剩 `agents/` / `shared/`）
+
+#### C.5 真隔离（这才是本次改动的目的本身）
+
+控制台用 `sop2-designer` 起一轮，让它 `list_dir(".")`：
+
+- [ ] **看不到** `ai-health-plan` 的目录
+- [ ] `read_file("shared:MEMORY.md")` 读得到
+
+> 测试环境同一条已实证:`pf-probe` 的 `list_dir(".")` 只返回 `uploads/`,
+> 同一用户下另一个 agent 的 24 个文件零泄露。
 
 ### Step D — P-1 真栈验证
 
