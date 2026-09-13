@@ -142,6 +142,21 @@ kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_
 > 脚本自己会断言 `0154` 已跑过并回填（`assert_backfill_ran`）。它没跑时，本可归属的
 > 产物会被**静默**扫进 `shared/` —— 不报错、文件数照样守恒，只有人工比对才看得出来。
 
+**测试环境实测形态（2026-09-13，36 个用户 1080 文件），拿来当「正常长什么样」的参照：**
+
+- 单 agent 用户（56/65）走 `sole_agent_key` 捷径，整棵树进自己的 agent 目录，
+  `shared 0`。看到 `shared` 非 0 的单 agent 用户要看一眼。
+- 多 agent 用户的 `shared/` 比例**可以很高** —— 实测一个用户 111/180 = 62%。
+  构成是「根级共写文件」（`MEMORY.md`/`PLAN.md`/`style/`/`客户案例/`）+
+  「run 已被清理的孤儿 `.tool_results/<run_id>/`」。**这是设计要的形态，不是异常。**
+  判法：拿 `.tool_results` 进 shared 的那批，看它们的 `<run_id>` 还在不在
+  `agent_run` 表里 —— 全都不在就是真孤儿。
+- `artifact rows updated` **会大于**空跑报的 path 条数。一个 path 挂着同一产物的
+  多个版本行（实测金丝雀那个 `canary-check.txt` 一个路径 **27 个版本行**）。
+  只有 `⚠️ N 条更新在库里一行都没命中` 才是红旗。
+- `{tenant}/.deleted/<user>/` 不会被搬（软删归档，按 `{tenant}/{user}` 寻址碰不到），
+  这是对的。
+
 ### Step D — P-1 真栈验证
 
 用探针 user 对 `release-canary` 跑一次
