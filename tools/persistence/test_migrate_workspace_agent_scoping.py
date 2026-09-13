@@ -52,7 +52,14 @@ def _snapshot(root: Path) -> dict[str, str]:
 
 
 def _empty(sole: str | None = None) -> Attributions:
-    return Attributions(sole_agent_key=sole, uploads={}, artifacts={}, threads={}, runs={})
+    return Attributions(
+        sole_agent_key=sole,
+        uploads={},
+        artifacts={},
+        threads={},
+        runs={},
+        artifact_paths=frozenset(),
+    )
 
 
 @pytest.fixture
@@ -124,6 +131,7 @@ def test_multi_agent_user_splits_by_registry(tmp_path: Path, ids: tuple[UUID, UU
             artifacts={"报告.docx": _KEY_B},
             threads={str(thread_id): _KEY_B},
             runs={str(run_id): _KEY_A},
+            artifact_paths=frozenset(),
         ),
     )
 
@@ -258,6 +266,7 @@ def test_file_count_is_conserved(tmp_path: Path, ids: tuple[UUID, UUID]) -> None
             artifacts={},
             threads={str(thread_id): _KEY_B},
             runs={},
+            artifact_paths=frozenset(),
         ),
     )
     report = asyncio.run(apply_migration(plan, root=str(tmp_path), dry_run=False))
@@ -383,6 +392,7 @@ def test_registry_rows_present_but_this_file_has_none(
             artifacts={"报告.docx": _KEY_A},
             threads={str(thread_id): _KEY_B},
             runs={str(uuid4()): _KEY_A},
+            artifact_paths=frozenset(),
         ),
     )
 
@@ -481,68 +491,44 @@ def test_dry_run_reports_planned_artifact_rows_not_the_written_zero() -> None:
     assert "artifact rows updated 0" not in dry, dry
 
 
-def test_applied_report_flags_rows_that_did_not_match() -> None:
-    """真搬时实改行数少于计划 = 有登记行没匹配上,必须显式告警。
+def test_applied_report_flags_only_updates_that_matched_nothing(tmp_path: Path) -> None:
+    """红旗是「某条更新一行都没命中」,不是「行数 ≠ path 数」。
 
-    不告警的话它和「全改成了」一样安静,而那些行的 ``path_in_workspace``
-    此刻正指向已经被搬走的旧路径。
+    第一版我把判据写成 ``rows_updated != len(artifact_path_updates)``,真跑第一下
+    就误报:208 个 path 改到了 **223 行** —— 一个 path 挂着同一产物的多个版本行,
+    两个数**本来就不相等**。而且那条告警的措辞对 ``>`` 的情形完全说反了
+    (「差额的那些没匹配上」)。两个不同单位的数不能直接比。
     """
     plan = MigrationPlan(
         tenant_id=TENANT,
         user_id=USER,
-        moves={"a.pptx": "agents/k-11111111/a.pptx", "b.pptx": "agents/k-11111111/b.pptx"},
+        moves={},
         to_shared=(),
         conflicts=(),
         untouched=(),
-        artifact_path_updates={
-            "a.pptx": "agents/k-11111111/a.pptx",
-            "b.pptx": "agents/k-11111111/b.pptx",
-        },
+        artifact_path_updates={"a.pptx": f"agents/{_KEY_A}/a.pptx"},
     )
 
-    matched = _render(
+    more_rows_than_paths = _render(
         plan,
-        MigrationReport(moved=2, to_shared=0, untouched=0, artifact_rows_updated=2),
+        MigrationReport(
+            moved=0, to_shared=0, untouched=0, artifact_rows_updated=7, artifact_updates_unmatched=0
+        ),
         dry_run=False,
     )
-    assert "artifact rows updated 2" in matched
-    assert "⚠️" not in matched, matched
+    assert "artifact rows updated 7" in more_rows_than_paths
+    assert "⚠️" not in more_rows_than_paths, (
+        "7 行 vs 1 个 path 是正常的(多版本),不许告警:" + more_rows_than_paths
+    )
 
-    short = _render(
+    missed = _render(
         plan,
-        MigrationReport(moved=2, to_shared=0, untouched=0, artifact_rows_updated=1),
+        MigrationReport(
+            moved=0, to_shared=0, untouched=0, artifact_rows_updated=0, artifact_updates_unmatched=1
+        ),
         dry_run=False,
     )
-    assert "计划要改 2 行,实际改了 1 行" in short, short
-
-
-def test_conflict_files_are_not_also_listed_as_having_no_owner() -> None:
-    """``conflicts`` ⊂ ``to_shared``,但它们**反推得出归属** —— 别再以
-    「反推不出归属」的名义印第二遍。
-
-    2026-09-13 真栈搬迁实见:金丝雀用户那个 ``canary-check.txt`` 在两张清单里
-    各出现一次,两个理由互相矛盾(「agent 目录已有更新的一份」vs「反推不出
-    归属」)。运维照着第二张清单去判断「哪些文件失去了归属」会多算。
-    """
-    plan = MigrationPlan(
-        tenant_id=TENANT,
-        user_id=USER,
-        moves={"orphan.md": "shared/orphan.md", "taken.txt": "shared/taken.txt"},
-        to_shared=("orphan.md", "taken.txt"),
-        conflicts=("taken.txt",),
-        untouched=(),
-    )
-    out = _render(
-        plan,
-        MigrationReport(moved=0, to_shared=2, untouched=0, artifact_rows_updated=0),
-        dry_run=True,
-    )
-
-    unowned_block = out.split("files with no inferable owner")[1]
-    assert "orphan.md" in unowned_block, out
-    assert "taken.txt" not in unowned_block, out
-    # 冲突那条仍然要报,只是报在自己的标题下
-    assert "taken.txt" in out.split("files with no inferable owner")[0], out
+    assert "1 条更新在库里一行都没命中" in missed, missed
 
 
 class _FakeResult:
@@ -556,6 +542,8 @@ class _FakeSession:
     def __init__(self, sink: list[dict[str, object]]) -> None:
         self._sink = sink
         self.committed = False
+        #: 按顺序吐给每条 UPDATE 的 rowcount;用尽之后一律回 1。
+        self.rowcounts: list[int] = []
 
     async def __aenter__(self) -> _FakeSession:
         return self
@@ -565,7 +553,8 @@ class _FakeSession:
 
     async def execute(self, _stmt: object, params: dict[str, object]) -> _FakeResult:
         self._sink.append(params)
-        return _FakeResult(1)
+        n = self.rowcounts.pop(0) if self.rowcounts else 1
+        return _FakeResult(n)
 
     async def commit(self) -> None:
         self.committed = True
@@ -656,6 +645,7 @@ def test_plan_repairs_artifact_rows_whose_file_is_already_in_place(tmp_path: Pat
             artifacts={"done.pptx": _KEY_A, "orphan.pptx": _KEY_A},
             threads={},
             runs={},
+            artifact_paths=frozenset({"done.pptx", "orphan.pptx"}),
         ),
     )
 
@@ -681,7 +671,125 @@ def test_plan_leaves_alone_artifact_rows_whose_file_never_moved(tmp_path: Path) 
             artifacts={"still-here.pptx": _KEY_A},
             threads={},
             runs={},
+            artifact_paths=frozenset({"still-here.pptx"}),
         ),
     )
     # 它要搬,所以更新值来自搬迁表,而不是「已在终态」那条补丁
     assert plan.artifact_path_updates == {"still-here.pptx": f"agents/{_KEY_A}/still-here.pptx"}
+
+
+def test_artifact_rows_follow_the_file_into_shared_even_without_an_agent_key(
+    tmp_path: Path,
+) -> None:
+    """``agent_key`` 为空的产物照样要改登记行 —— 它的文件进了 ``shared/``。
+
+    2026-09-13 真栈实见:12 条空 key 的产物行没跟着改,指向不存在的旧路径。
+    根因是**一张表被当两件事用** —— ``artifacts`` 既是「归属判定表」(该过滤
+    空 key)又被拿去当「哪些路径是登记过的产物」(不该过滤)。拆成两个结构之后
+    这条才成立。
+    """
+    user_root = tmp_path / str(TENANT) / str(USER)
+    _write(user_root / "owned.pptx", "a")
+    _write(user_root / "unowned.md", "b")
+
+    plan = plan_migration(
+        str(tmp_path),
+        TENANT,
+        USER,
+        attributions=Attributions(
+            sole_agent_key=None,
+            uploads={},
+            # 只有 owned.pptx 判得出归属;unowned.md 的 agent_key 是空的
+            artifacts={"owned.pptx": _KEY_A},
+            threads={},
+            runs={},
+            artifact_paths=frozenset({"owned.pptx", "unowned.md"}),
+        ),
+    )
+
+    assert plan.moves == {
+        "owned.pptx": f"agents/{_KEY_A}/owned.pptx",
+        "unowned.md": "shared/unowned.md",
+    }
+    assert plan.artifact_path_updates == {
+        "owned.pptx": f"agents/{_KEY_A}/owned.pptx",
+        "unowned.md": "shared/unowned.md",
+    }, "空 key 的那条也必须安排更新,否则它的登记行会指向已被搬走的旧路径"
+
+
+def test_single_agent_shortcut_still_carries_the_registered_artifact_paths() -> None:
+    """单 agent 捷径跳过的是**归属映射**,不是 ``artifact_paths``。
+
+    捷径档占 65 个用户里的 56 个。曾经把 ``artifact_paths`` 和归属表合成一个,
+    于是捷径返回空表 —— **那 56 个用户的产物登记行从来不会被更新**,搬完集体
+    指向旧路径,而报告里的 ``artifact rows updated 0`` 看着完全正常。
+
+    这条只读源码,不连库:``collect_attributions`` 要真集群才跑得到,而捷径
+    分支正是最容易在重构时被顺手清空的那个。
+    """
+    import ast
+    import pathlib as _pathlib
+
+    src = (
+        _pathlib.Path(__file__).resolve().parent / "migrate_workspace_agent_scoping.py"
+    ).read_text()
+    tree = ast.parse(src)
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "collect_attributions"
+    )
+    returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None]
+    assert len(returns) == 2, f"期待捷径档 + 常规档两个 return,实际 {len(returns)}"
+    for ret in returns:
+        call = ret.value
+        assert isinstance(call, ast.Call)
+        kwargs = {k.arg for k in call.keywords}
+        assert "artifact_paths" in kwargs, (
+            "collect_attributions 的每一个 return 都必须带上 artifact_paths —— "
+            "少一个就是那一档的用户产物登记行集体不更新,而且不报错。"
+        )
+
+
+def test_updates_that_match_zero_rows_are_counted(tmp_path: Path) -> None:
+    """``rowcount == 0`` 的那条更新必须被数出来 —— 它是唯一的真红旗。
+
+    钉的是 ``_update_artifact_paths`` 里的计数本身。上一版只测了渲染
+    (直接构造 ``MigrationReport``),把计数那几行删掉一条测试都不红(变异零杀)。
+    """
+    user_root = tmp_path / str(TENANT) / str(USER)
+    _write(user_root / "hit.pptx", "a")
+    _write(user_root / "miss.pptx", "b")
+    plan = MigrationPlan(
+        tenant_id=TENANT,
+        user_id=USER,
+        moves={
+            "hit.pptx": f"agents/{_KEY_A}/hit.pptx",
+            "miss.pptx": f"agents/{_KEY_A}/miss.pptx",
+        },
+        to_shared=(),
+        conflicts=(),
+        untouched=(),
+        artifact_path_updates={
+            "hit.pptx": f"agents/{_KEY_A}/hit.pptx",
+            "miss.pptx": f"agents/{_KEY_A}/miss.pptx",
+        },
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def factory() -> _FakeSession:
+        s = _FakeSession(calls)
+        s.rowcounts = [3, 0]  # 第一条命中 3 行(多版本),第二条一行都没命中
+        return s
+
+    report = asyncio.run(
+        apply_migration(
+            plan,
+            root=str(tmp_path),
+            dry_run=False,
+            session_factory=factory,  # type: ignore[arg-type]
+        )
+    )
+    assert report.artifact_rows_updated == 3
+    assert report.artifact_updates_unmatched == 1, "rowcount=0 的那条必须被数出来"
