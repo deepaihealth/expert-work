@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -19,12 +20,17 @@ from uuid import UUID, uuid4
 import pytest
 from tools.persistence.migrate_workspace_agent_scoping import (
     Attributions,
+    MigrationPlan,
+    MigrationReport,
+    _render,
     apply_migration,
     plan_migration,
 )
 
 _KEY_A = "plan-aaaaaaaa"
 _KEY_B = "sop-bbbbbbbb"
+TENANT = UUID("dd068302-5364-4174-8c5c-11d46aa7caa0")
+USER = UUID("99d3c664-be10-4e9c-be03-4fcc81f12894")
 
 
 def _write(path: Path, body: str) -> None:
@@ -221,7 +227,7 @@ def test_destination_already_has_a_newer_copy_is_not_overwritten(
     assert plan.moves["MEMORY.md"] == "shared/MEMORY.md"
     assert plan.conflicts == ("MEMORY.md",)
 
-    apply_migration(plan, root=str(tmp_path), dry_run=False)
+    asyncio.run(apply_migration(plan, root=str(tmp_path), dry_run=False))
     assert (root / "agents" / _KEY_A / "MEMORY.md").read_text(encoding="utf-8") == "新的"
     assert (root / "shared" / "MEMORY.md").read_text(encoding="utf-8") == "老的"
 
@@ -254,7 +260,7 @@ def test_file_count_is_conserved(tmp_path: Path, ids: tuple[UUID, UUID]) -> None
             runs={},
         ),
     )
-    report = apply_migration(plan, root=str(tmp_path), dry_run=False)
+    report = asyncio.run(apply_migration(plan, root=str(tmp_path), dry_run=False))
 
     assert _count_files(tmp_path) == before
     assert report.moved + report.to_shared + report.untouched == before
@@ -271,7 +277,7 @@ def test_apply_lands_bytes_at_the_planned_paths(tmp_path: Path, ids: tuple[UUID,
     _write(root / "客户案例" / "秀域" / "x.md", "x")
 
     plan = plan_migration(str(tmp_path), tenant_id, user_id, attributions=_empty(sole=_KEY_A))
-    apply_migration(plan, root=str(tmp_path), dry_run=False)
+    asyncio.run(apply_migration(plan, root=str(tmp_path), dry_run=False))
 
     for old, new in plan.moves.items():
         assert not (root / old).exists()
@@ -291,7 +297,7 @@ def test_dry_run_changes_nothing(tmp_path: Path, ids: tuple[UUID, UUID]) -> None
     before = _snapshot(tmp_path)
 
     plan = plan_migration(str(tmp_path), tenant_id, user_id, attributions=_empty(sole=_KEY_A))
-    report = apply_migration(plan, root=str(tmp_path), dry_run=True)
+    report = asyncio.run(apply_migration(plan, root=str(tmp_path), dry_run=True))
 
     assert _snapshot(tmp_path) == before
     assert report.moved == len(plan.moves) - len(plan.to_shared)
@@ -304,11 +310,11 @@ def test_apply_is_idempotent(tmp_path: Path, ids: tuple[UUID, UUID]) -> None:
     _write(root / "MEMORY.md", "m")
 
     first = plan_migration(str(tmp_path), tenant_id, user_id, attributions=_empty(sole=_KEY_A))
-    apply_migration(first, root=str(tmp_path), dry_run=False)
+    asyncio.run(apply_migration(first, root=str(tmp_path), dry_run=False))
     after_first = _snapshot(tmp_path)
 
     second = plan_migration(str(tmp_path), tenant_id, user_id, attributions=_empty(sole=_KEY_A))
-    apply_migration(second, root=str(tmp_path), dry_run=False)
+    asyncio.run(apply_migration(second, root=str(tmp_path), dry_run=False))
 
     assert second.moves == {}
     assert _snapshot(tmp_path) == after_first
@@ -408,7 +414,7 @@ def test_apply_actually_moved_every_planned_file(tmp_path: Path, ids: tuple[UUID
     _write(root / "客户案例" / "秀域" / "x.md", "x")
 
     plan = plan_migration(str(tmp_path), tenant_id, user_id, attributions=_empty(sole=_KEY_A))
-    report = apply_migration(plan, root=str(tmp_path), dry_run=False)
+    report = asyncio.run(apply_migration(plan, root=str(tmp_path), dry_run=False))
 
     landed = [dest for dest in plan.moves.values() if (root / dest).is_file()]
     assert len(landed) == len(plan.moves)
@@ -444,3 +450,238 @@ def test_tool_results_and_uploads_are_moved_not_skipped(
     )
     # skills/ 仍然不碰 —— 收窄不能把它一起放开。
     assert plan.untouched == ("skills/seeded.md",)
+
+
+def test_dry_run_reports_planned_artifact_rows_not_the_written_zero() -> None:
+    """空跑必须报**计划要改多少行**,不能报恒为 0 的实改行数。
+
+    2026-09-12 真栈空跑实测踩到:某用户 208 条产物登记行的 ``path_in_workspace``
+    全都要改,而空跑报告印的是 ``artifact rows updated 0`` —— 因为空跑本来就
+    不写库。运维看到 0 分不清两件事:
+
+    * 空跑不计数(真相),还是
+    * 真的一行都不用改 —— 那是红旗,意味着这 208 行搬完之后全指向旧路径、静默断链。
+
+    两种归因下一步动作相反,而数字长得一模一样(同 [[same-observation-different-attribution]])。
+    """
+    plan = MigrationPlan(
+        tenant_id=TENANT,
+        user_id=USER,
+        moves={"a.pptx": "agents/k-11111111/a.pptx"},
+        to_shared=(),
+        conflicts=(),
+        untouched=(),
+        artifact_path_updates={"a.pptx": "agents/k-11111111/a.pptx"},
+    )
+    report = MigrationReport(moved=1, to_shared=0, untouched=0, artifact_rows_updated=0)
+
+    dry = _render(plan, report, dry_run=True)
+    assert "artifact rows to update 1" in dry, dry
+    assert "not written" in dry, dry
+    assert "artifact rows updated 0" not in dry, dry
+
+
+def test_applied_report_flags_rows_that_did_not_match() -> None:
+    """真搬时实改行数少于计划 = 有登记行没匹配上,必须显式告警。
+
+    不告警的话它和「全改成了」一样安静,而那些行的 ``path_in_workspace``
+    此刻正指向已经被搬走的旧路径。
+    """
+    plan = MigrationPlan(
+        tenant_id=TENANT,
+        user_id=USER,
+        moves={"a.pptx": "agents/k-11111111/a.pptx", "b.pptx": "agents/k-11111111/b.pptx"},
+        to_shared=(),
+        conflicts=(),
+        untouched=(),
+        artifact_path_updates={
+            "a.pptx": "agents/k-11111111/a.pptx",
+            "b.pptx": "agents/k-11111111/b.pptx",
+        },
+    )
+
+    matched = _render(
+        plan,
+        MigrationReport(moved=2, to_shared=0, untouched=0, artifact_rows_updated=2),
+        dry_run=False,
+    )
+    assert "artifact rows updated 2" in matched
+    assert "⚠️" not in matched, matched
+
+    short = _render(
+        plan,
+        MigrationReport(moved=2, to_shared=0, untouched=0, artifact_rows_updated=1),
+        dry_run=False,
+    )
+    assert "计划要改 2 行,实际改了 1 行" in short, short
+
+
+def test_conflict_files_are_not_also_listed_as_having_no_owner() -> None:
+    """``conflicts`` ⊂ ``to_shared``,但它们**反推得出归属** —— 别再以
+    「反推不出归属」的名义印第二遍。
+
+    2026-09-13 真栈搬迁实见:金丝雀用户那个 ``canary-check.txt`` 在两张清单里
+    各出现一次,两个理由互相矛盾(「agent 目录已有更新的一份」vs「反推不出
+    归属」)。运维照着第二张清单去判断「哪些文件失去了归属」会多算。
+    """
+    plan = MigrationPlan(
+        tenant_id=TENANT,
+        user_id=USER,
+        moves={"orphan.md": "shared/orphan.md", "taken.txt": "shared/taken.txt"},
+        to_shared=("orphan.md", "taken.txt"),
+        conflicts=("taken.txt",),
+        untouched=(),
+    )
+    out = _render(
+        plan,
+        MigrationReport(moved=0, to_shared=2, untouched=0, artifact_rows_updated=0),
+        dry_run=True,
+    )
+
+    unowned_block = out.split("files with no inferable owner")[1]
+    assert "orphan.md" in unowned_block, out
+    assert "taken.txt" not in unowned_block, out
+    # 冲突那条仍然要报,只是报在自己的标题下
+    assert "taken.txt" in out.split("files with no inferable owner")[0], out
+
+
+class _FakeResult:
+    def __init__(self, rowcount: int) -> None:
+        self.rowcount = rowcount
+
+
+class _FakeSession:
+    """够用的假会话 —— 只记下执行过什么,以及有没有 commit。"""
+
+    def __init__(self, sink: list[dict[str, object]]) -> None:
+        self._sink = sink
+        self.committed = False
+
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def execute(self, _stmt: object, params: dict[str, object]) -> _FakeResult:
+        self._sink.append(params)
+        return _FakeResult(1)
+
+    async def commit(self) -> None:
+        self.committed = True
+
+
+def test_apply_with_a_session_factory_actually_updates_artifact_rows(tmp_path: Path) -> None:
+    """带 ``session_factory`` 的那条分支 —— 在 2026-09-13 之前**一次都没被执行过**。
+
+    仓库里八处 ``apply_migration`` 调用全都不传 ``session_factory``,于是
+    ``asyncio.run(_update_artifact_paths(...))`` 这行里的嵌套 ``asyncio.run``
+    一直躺着:CLI 的 ``_main`` 本身就是 ``asyncio.run`` 起的,真跑必抛
+    ``RuntimeError: asyncio.run() cannot be called from a running event loop``。
+    第一个有产物登记行的真实用户就炸了,而且是**文件已经搬完之后**才炸 ——
+    235 条登记行当场断链。
+
+    这条测试的存在意义就是让这条分支真的被执行到。
+    """
+    _write(tmp_path / str(TENANT) / str(USER) / "a.pptx", "x")
+    plan = MigrationPlan(
+        tenant_id=TENANT,
+        user_id=USER,
+        moves={"a.pptx": f"agents/{_KEY_A}/a.pptx"},
+        to_shared=(),
+        conflicts=(),
+        untouched=(),
+        artifact_path_updates={"a.pptx": f"agents/{_KEY_A}/a.pptx"},
+    )
+    calls: list[dict[str, object]] = []
+    sessions: list[_FakeSession] = []
+
+    def factory() -> _FakeSession:
+        s = _FakeSession(calls)
+        sessions.append(s)
+        return s
+
+    # 假工厂只满足「调用一下拿到 async context manager」这一点协议,不是真的
+    # async_sessionmaker —— 那玩意儿要一个引擎,而这条测试的全部意义是验分支
+    # 被执行到、参数传对、commit 了,跟真库无关。
+    report = asyncio.run(
+        apply_migration(
+            plan,
+            root=str(tmp_path),
+            dry_run=True,
+            session_factory=factory,  # type: ignore[arg-type]
+        )
+    )
+    assert report.artifact_rows_updated == 0, "空跑不许写库"
+    assert calls == []
+
+    report = asyncio.run(
+        apply_migration(
+            plan,
+            root=str(tmp_path),
+            dry_run=False,
+            session_factory=factory,  # type: ignore[arg-type]
+        )
+    )
+    assert report.artifact_rows_updated == 1
+    assert calls == [
+        {
+            "new": f"agents/{_KEY_A}/a.pptx",
+            "old": "a.pptx",
+            "tenant_id": TENANT,
+            "user_id": USER,
+        }
+    ]
+    assert sessions[-1].committed, "改完必须 commit"
+
+
+def test_plan_repairs_artifact_rows_whose_file_is_already_in_place(tmp_path: Path) -> None:
+    """文件已经在终态、登记行还是旧路径 —— 计划必须把这一行补上。
+
+    这是「跑到一半崩了」的恢复路径:文件全搬完、更新登记行那步抛了异常。
+    重跑时 ``moves`` 是空的(没有文件需要搬),如果 ``artifact_path_updates``
+    只从 ``moves`` 推导,那 235 条断链的行永远补不回来。
+    """
+    user_root = tmp_path / str(TENANT) / str(USER)
+    _write(user_root / "agents" / _KEY_A / "done.pptx", "x")
+    _write(user_root / "shared" / "orphan.pptx", "y")
+
+    plan = plan_migration(
+        str(tmp_path),
+        TENANT,
+        USER,
+        attributions=Attributions(
+            sole_agent_key=None,
+            uploads={},
+            artifacts={"done.pptx": _KEY_A, "orphan.pptx": _KEY_A},
+            threads={},
+            runs={},
+        ),
+    )
+
+    assert plan.moves == {}, "文件都在终态,不该有搬迁"
+    assert plan.artifact_path_updates == {
+        "done.pptx": f"agents/{_KEY_A}/done.pptx",
+        "orphan.pptx": "shared/orphan.pptx",
+    }, plan.artifact_path_updates
+
+
+def test_plan_leaves_alone_artifact_rows_whose_file_never_moved(tmp_path: Path) -> None:
+    """还在扁平根上的登记行不许乱改 —— 上面那条恢复逻辑的反面。"""
+    user_root = tmp_path / str(TENANT) / str(USER)
+    _write(user_root / "still-here.pptx", "x")
+
+    plan = plan_migration(
+        str(tmp_path),
+        TENANT,
+        USER,
+        attributions=Attributions(
+            sole_agent_key=_KEY_A,
+            uploads={},
+            artifacts={"still-here.pptx": _KEY_A},
+            threads={},
+            runs={},
+        ),
+    )
+    # 它要搬,所以更新值来自搬迁表,而不是「已在终态」那条补丁
+    assert plan.artifact_path_updates == {"still-here.pptx": f"agents/{_KEY_A}/still-here.pptx"}

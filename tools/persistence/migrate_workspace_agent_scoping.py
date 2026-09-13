@@ -240,6 +240,21 @@ def plan_migration(
         if rel in attributions.artifacts:
             artifact_updates[rel] = dest
 
+    # 登记行指向的文件**已经在终态**时,``moves`` 里不会有它 —— 但那一行仍然
+    # 是旧的扁平路径。两种来路:上一次跑到一半崩了(2026-09-13 真栈实见:文件
+    # 全搬完了,更新登记行那步抛 RuntimeError,235 行全断链,而重跑算出的计划
+    # 是空的、永远补不回来),或 PR3 上线后新写入直接落 agents/。
+    #
+    # 从**盘上文件现在在哪**反推,而不是从本轮的搬迁表反推 —— 这让更新变成
+    # 幂等的:跑第二遍就能把第一遍没写成的补上。
+    for rel, key in attributions.artifacts.items():
+        if rel in artifact_updates or rel in existing:
+            continue
+        for cand in (f"{WORKSPACE_AGENTS_DIR}/{key}/{rel}", f"{WORKSPACE_SHARED_DIR}/{rel}"):
+            if cand in existing:
+                artifact_updates[rel] = cand
+                break
+
     return MigrationPlan(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -251,7 +266,7 @@ def plan_migration(
     )
 
 
-def apply_migration(
+async def apply_migration(
     plan: MigrationPlan,
     *,
     root: str,
@@ -278,13 +293,17 @@ def apply_migration(
 
     rows_updated = 0
     if plan.artifact_path_updates and session_factory is not None and not dry_run:
-        rows_updated = asyncio.run(
-            _update_artifact_paths(
-                session_factory,
-                tenant_id=plan.tenant_id,
-                user_id=plan.user_id,
-                updates=plan.artifact_path_updates,
-            )
+        # 直接 await —— 这里曾经写的是 ``asyncio.run(...)``,而 CLI 的 ``_main``
+        # 本身就是 ``asyncio.run`` 起的,嵌套一层直接
+        # ``RuntimeError: asyncio.run() cannot be called from a running event loop``。
+        # 没被任何测试逮到:八处 ``apply_migration`` 调用**全都不传
+        # session_factory**,这一整个分支从来没被执行过(2026-09-13 真栈第一次
+        # 碰到有产物登记行的用户才炸)。
+        rows_updated = await _update_artifact_paths(
+            session_factory,
+            tenant_id=plan.tenant_id,
+            user_id=plan.user_id,
+            updates=plan.artifact_path_updates,
         )
 
     return MigrationReport(
@@ -508,17 +527,38 @@ def _render(plan: MigrationPlan, report: MigrationReport, *, dry_run: bool) -> s
         f"  moved     {report.moved}",
         f"  to shared {report.to_shared}",
         f"  untouched {report.untouched}",
-        f"  artifact rows updated {report.artifact_rows_updated}",
     ]
+    # 空跑不写库,所以 ``report.artifact_rows_updated`` 恒为 0 —— 直接印它,
+    # 运维分不清「空跑不计数」和「真的一行都不用改」。后者是红旗:那意味着
+    # 208 条产物登记行会指向搬走之后的旧路径,静默断链。两种归因下一步动作
+    # 相反,而数字长得一模一样,所以空跑报**计划数**并标明没写。
+    if dry_run:
+        lines.append(
+            f"  artifact rows to update {len(plan.artifact_path_updates)} (not written — dry run)"
+        )
+    else:
+        lines.append(f"  artifact rows updated {report.artifact_rows_updated}")
+        if report.artifact_rows_updated != len(plan.artifact_path_updates):
+            lines.append(
+                f"  ⚠️ 计划要改 {len(plan.artifact_path_updates)} 行,实际改了 "
+                f"{report.artifact_rows_updated} 行 —— 差额的那些登记行没匹配上,"
+                "它们的 path_in_workspace 现在指向已被搬走的旧路径。别忽略。"
+            )
     if plan.conflicts:
         lines.append(
             f"  ⚠️ {len(plan.conflicts)} file(s) went to shared/ because the agent dir "
             "already holds a newer copy — review before deleting anything:"
         )
         lines.extend(f"      {p}" for p in plan.conflicts)
-    if plan.to_shared:
+    # ``conflicts`` 是 ``to_shared`` 的子集,而它们**反推得出归属** —— 进
+    # shared/ 的原因是目的地已有更新的一份。把它们从这张清单里剔掉:上面已经
+    # 单独报过一次,再以「反推不出归属」的名义印第二遍,等于给同一个文件挂了
+    # 两个互相矛盾的理由(2026-09-13 真栈搬迁时实见:金丝雀用户那个
+    # canary-check.txt 两张清单里各出现一次)。
+    unowned = tuple(p for p in plan.to_shared if p not in set(plan.conflicts))
+    if unowned:
         lines.append("  files with no inferable owner (→ shared/):")
-        lines.extend(f"      {p}" for p in plan.to_shared)
+        lines.extend(f"      {p}" for p in unowned)
     return "\n".join(lines) + "\n"
 
 
@@ -546,7 +586,7 @@ async def _main(argv: list[str]) -> int:
         plan = plan_migration(
             args.root, UUID(args.tenant), UUID(args.user), attributions=attributions
         )
-        report = apply_migration(
+        report = await apply_migration(
             plan,
             root=args.root,
             dry_run=not args.apply,

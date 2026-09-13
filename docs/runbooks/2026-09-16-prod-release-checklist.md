@@ -37,6 +37,17 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
 - [ ] **#1486 weasyprint 的 SSRF 告警（`#137 medium`）已单独处置或明确顺延** ——
       它在沙箱镜像里，与三个应用镜像正交，但别让它永远挂着
 - [ ] **测试环境已泡过同一版**，且 B-50 搬迁在测试环境跑通过一次
+- [ ] **发布前一天先把三个镜像建一遍**（缓存预热 + 腾盘位）。2026-09-12/13 发测试
+      环境连炸三次，三个不同原因，全部是本机环境而非代码：
+
+      | 症状 | 处置 |
+      |---|---|
+      | `Head .../nginx-unprivileged/manifests: EOF` | ECR Public 按 IP 限流。先 `docker pull` 预拉 base，再重跑 |
+      | `copy file range failed: no space left on device` | 本机 Docker 盘满。`docker builder prune -af` |
+      | apt 拉到 `1021 B/s` 后 `Connection failed` | 网络瞬时塌陷。先探源的速度，通了再重跑 |
+
+      后两条有因果：prune 清掉构建缓存 → 下一跑必须重建 apt 层 → 正好撞上网络。
+      提前一天建好镜像能一次性避开这三个。
 
 ---
 
@@ -121,6 +132,10 @@ kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_
 - [ ] `conflicts` 里点名的文件逐个看过（目的地已存在 → 源进 `shared/`，这是单 agent
       用户的常态，不是异常）
 - [ ] **每次 `--apply` 的输出留档** —— 没有自动回退，回退要靠报告里的 `moves` 反向 `mv`
+- [ ] 空跑报告里的 **`artifact rows to update N`** 记下来；真搬之后核对
+      `artifact rows updated` 是不是同一个数。不一致时脚本会单独告警，别忽略
+      —— 差额的那些登记行此刻正指向已被搬走的旧路径
+- [ ] **崩了就重跑同一条命令**（搬迁是幂等的，2026-09-13 加的）；别手工修数据
 - [ ] 按 runbook §Step 3 的 5+2 条判据验收
 - [ ] 搬完复看控制台工作区浏览面：按 agent 分组、`shared/` 单独一组
 
