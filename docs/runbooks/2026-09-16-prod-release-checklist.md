@@ -155,6 +155,17 @@ kubectl -n $NS exec -i "$POD" -- python3 -m tools.persistence.migrate_workspace_
 - [ ] `chore(deploy): prod newTag <本版>` PR，正文写上**上一版 tag `ad79ba28`**
 - [ ] ROADMAP 班车 1 销案
 
+### Step F — 合并 PR6(摘掉迁移期读回落)
+
+**闸门:Step C 的搬迁验收全部通过之后才合。** PR6 删掉 `read_with_legacy_fallback`
+——那一跳在搬迁完成前是安全网(agent 读不到自己目录里的历史文件时回落用户根),
+搬迁完成后就成了纯粹的跨 agent 读洞(用户根上剩下的恰恰是别人的历史文件)。
+
+- [ ] Step C 的 5+2 条判据全过,且 `shared/` 与 `agents/` 的分布可解释
+- [ ] 合并 PR6
+- [ ] **PR6 不在本次发布里** —— 它下一班车才上生产。本次发布的生产环境**仍带回落**,
+      这是有意的:万一搬迁中途卡住,历史文件还读得到
+
 ---
 
 ## 4. 回滚

@@ -669,7 +669,7 @@ def test_specs_metadata() -> None:
 
 
 # ---------------------------------------------------------------------------
-# B-50 Task 7 —— 文件工具按 agent 分层(带迁移期读回落)
+# B-50 Task 7 —— 文件工具按 agent 分层(Task 14 / PR6 已摘掉迁移期读回落)
 #
 # ``ws`` 是内嵌在片段 ``_PARAMS`` 里的 JSON,所以断言直接查 exec 的源码文本:
 # 这正是沙箱真正会拿到的东西,比断言某个中间变量更接近事实。
@@ -684,7 +684,10 @@ _SHARED_WS = '"ws": "/workspace/shared",'
 
 
 class _SequenceRuntime(RecordingSandboxRuntime):
-    """按顺序吐多个 outcome —— 回落要跑两次 exec,单 outcome 的桩测不出。"""
+    """按顺序吐多个 outcome。
+
+    PR6 摘掉回落之后仍然需要它:第二个 outcome 是「用户根上有这个文件」的诱饵,
+    单 outcome 的桩喂不出这个形状,也就证明不了「没去读第二次」。"""
 
     def __init__(self, stdouts: list[str]) -> None:
         super().__init__()
@@ -741,41 +744,45 @@ async def test_edit_file_never_falls_back() -> None:
     assert _AGENT_WS in client.execs[0][1]
 
 
-async def test_read_file_falls_back_to_user_root_once() -> None:
-    """迁移期:agent 根下没有 → 回落用户根再读一次,且只一次。"""
+async def test_read_file_never_reaches_the_user_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR6 —— agent 根下 ``not_found`` 就是 ``not_found``,**不许再去用户根捞一次**。
+
+    桩里第二个 outcome 是「用户根上有这个文件」。回落还在的话它会被读到并让这条
+    测试变绿 —— 所以这条同时钉住「只跑一次 exec」和「报错而不是拿到 legacy 内容」,
+    两个断言少一个都拦不住回落被悄悄加回来。
+
+    摘掉回落之后**用户根上剩下的恰恰是别的 agent 的历史文件**,那一跳就是纯粹的
+    跨 agent 读洞。
+    """
     client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "legacy"})])
-    out = await ReadFileTool(client=client).call(
-        {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
-    )
-    assert out.content == "legacy"
-    assert len(client.execs) == 2
-    assert _AGENT_WS in client.execs[0][1]
-    assert _USER_WS in client.execs[1][1]
-
-
-async def test_read_file_not_found_in_both_roots_still_raises() -> None:
-    """回落也没有 → 照旧报 not_found,不能把回落做成吞错。"""
-    client = _SequenceRuntime([_NOT_FOUND, _NOT_FOUND])
     with pytest.raises(FileOpError):
         await ReadFileTool(client=client).call(
             {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
         )
-    assert len(client.execs) == 2
+    assert len(client.execs) == 1, "回落被加回来了:多跑了一次 exec"
+    assert _AGENT_WS in client.execs[0][1]
+    assert _USER_WS not in client.execs[0][1]
 
 
-async def test_list_dir_falls_back_to_user_root_once() -> None:
-    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "entries": []})])
-    await ListDirTool(client=client).call({"path": "."}, ctx=_ctx(agent_key="plan-aaaaaaaa"))
-    assert len(client.execs) == 2
-    assert _USER_WS in client.execs[1][1]
+async def test_list_dir_never_reaches_the_user_root() -> None:
+    """同上,列目录这条路也不许回落。"""
+    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "entries": [{"name": "x"}]})])
+    with pytest.raises(FileOpError):
+        await ListDirTool(client=client).call({"path": "."}, ctx=_ctx(agent_key="plan-aaaaaaaa"))
+    assert len(client.execs) == 1, "回落被加回来了:多跑了一次 exec"
 
 
-async def test_read_file_without_agent_key_never_falls_back() -> None:
-    """ws 已经是用户根,回落无处可去 —— 不能白跑第二次 exec。"""
+async def test_read_file_without_agent_key_reads_the_user_root_directly() -> None:
+    """未绑 agent 的读**本来就**落用户根 —— 那是作用域本身,不是回落。
+
+    这条与上面两条的区别正是 PR6 要保住的边界:没有 agent 身份时用户根就是
+    唯一的根,一次 exec;有 agent 身份时用户根**不可达**。
+    """
     client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "x"})])
     with pytest.raises(FileOpError):
         await ReadFileTool(client=client).call({"path": "MEMORY.md"}, ctx=_ctx())
     assert len(client.execs) == 1
+    assert _USER_WS in client.execs[0][1]
 
 
 async def test_shared_prefix_reads_shared_root() -> None:
@@ -787,7 +794,10 @@ async def test_shared_prefix_reads_shared_root() -> None:
 
 
 async def test_shared_prefix_does_not_fall_back() -> None:
-    """``shared:`` 是显式寻址;读不到就是读不到,回落用户根等于悄悄换了目标。"""
+    """``shared:`` 是显式寻址;读不到就是读不到。
+
+    PR6 摘掉回落之后这条仍然保留 —— 它钉的是「显式寻址不许被改写」,与回落
+    在不在是两件事;而且回落一旦被加回来,第一个受害的就是这条路径。"""
     client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "wrong"})])
     with pytest.raises(FileOpError):
         await ReadFileTool(client=client).call(

@@ -486,52 +486,29 @@ def parse_envelope(outcome: SandboxOutcome, *, tool: str) -> Mapping[str, Any]:
     return env
 
 
-def is_not_found(env: Mapping[str, Any]) -> bool:
-    """封装里的「目标不存在」—— 三个读片段(read / list / read_document)用的
-    是同一个错误码,所以迁移期读回落只认这一个判据。"""
-    return not env.get("ok") and env.get("error") == "not_found"
-
-
-async def read_with_legacy_fallback(
+async def run_scoped_read(
     client: SandboxRuntime,
     *,
     build: Callable[[str], str],
     ws: str,
-    raw: str,
     ctx: ToolContext,
     tool: str,
     seed_files: tuple[tuple[str, bytes], ...],
 ) -> Mapping[str, Any]:
-    """跑一次作用域内的读;agent 根下 ``not_found`` 时回落用户根**再读一次**。
+    """在作用域根 ``ws`` 下跑一次读。**只跑一次,不回落。**
 
-    B-50 迁移期专用(PR6 / Task 14 摘掉)。搬迁脚本(PR5)跑之前,存量文件还在
-    用户根上;没有这一跳,PR3 一上线所有历史文件当场读不到。
+    B-50 PR6(Task 14)—— 这里曾经是 ``read_with_legacy_fallback``:agent 根下
+    ``not_found`` 时再拿用户根读一次,给存量文件在搬迁脚本跑之前续命。存量搬迁
+    跑完并验收通过之后那一跳就成了纯粹的隔离漏洞 —— 它让 agent 读得到用户根上
+    的东西,而用户根上剩下的恰恰是**别的 agent 的历史文件**。
 
-    三个不回落的情形,每个都是有意的:
-
-    * ``ws`` 已经是用户根(未绑 agent)—— 回落无处可去,白跑一次 exec。
-    * ``shared:`` —— 显式寻址。读不到就是读不到;回落等于悄悄换了目标,而
-      ``shared/`` 恰恰是「归属不明」的那批,换过去拿到的东西**可能是别人的**。
-    * 写类工具 —— 根本不走这个函数。新内容一律落 agent 目录,从第一天起就分好。
-
-    **代价明说**:回落窗口内的读串问题还是今天的样子 —— 不是新增回归,是尚未
-    修复(spec §7.2 已接受的代价)。
+    摘掉之后的后果明说:任何**回到旧扁平布局**的工作区(日备恢复,
+    ``docs/runbooks/volume-restore.md``)对 agent 直接不可见。处置是恢复完手工
+    跑一次搬迁脚本 —— 它是幂等的,随时重跑安全。
     """
     outcome = await run_in_sandbox(
         client,
         code=build(ws),
-        timeout_s=None,
-        ctx=ctx,
-        tool_label=tool,
-        fallback_thread_id=tool,
-        seed_files=seed_files,
-    )
-    env = parse_envelope(outcome, tool=tool)
-    if not is_not_found(env) or ws == USER_ROOT or raw.startswith(SHARED_PREFIX):
-        return env
-    outcome = await run_in_sandbox(
-        client,
-        code=build(USER_ROOT),
         timeout_s=None,
         ctx=ctx,
         tool_label=tool,
@@ -598,11 +575,10 @@ class ReadFileTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         raw = _require_path(args, tool="read_file", agent_key=ctx.agent_key)
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_file")
-        env = await read_with_legacy_fallback(
+        env = await run_scoped_read(
             self.client,
             build=lambda w: build_read_wrapper(rel, cap=self.output_char_cap, ws=w),
             ws=ws,
-            raw=raw,
             ctx=ctx,
             tool="read_file",
             seed_files=self.skill_seed_files,
@@ -736,11 +712,10 @@ class ListDirTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         raw = _require_path(args, tool="list_dir", default=".", agent_key=ctx.agent_key)
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="list_dir")
-        env = await read_with_legacy_fallback(
+        env = await run_scoped_read(
             self.client,
             build=lambda w: build_list_wrapper(rel, ws=w),
             ws=ws,
-            raw=raw,
             ctx=ctx,
             tool="list_dir",
             seed_files=self.skill_seed_files,

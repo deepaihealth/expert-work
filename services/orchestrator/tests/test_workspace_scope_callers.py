@@ -34,11 +34,11 @@ _BUILDERS = frozenset(
 #: ``(模块, 所在函数)`` → ``(是否 agent 作用域, 理由)``。
 #: ``理由`` 只在「有意留在用户根」时读,但两种都必须写 —— 逼着下一个人说清楚。
 _CALL_SITES: dict[tuple[str, str], tuple[bool, str]] = {
-    ("file_ops.py", "ReadFileTool.call"): (True, "读:agent 根 + 迁移期回落"),
+    ("file_ops.py", "ReadFileTool.call"): (True, "读:agent 根,不回落(PR6 摘掉)"),
     ("file_ops.py", "WriteFileTool.call"): (True, "写:agent 根,永不回落"),
-    ("file_ops.py", "ListDirTool.call"): (True, "读:agent 根 + 迁移期回落"),
+    ("file_ops.py", "ListDirTool.call"): (True, "读:agent 根,不回落(PR6 摘掉)"),
     ("file_ops.py", "EditFileTool.call"): (True, "写:agent 根,永不回落"),
-    ("read_document.py", "ReadDocumentTool.call"): (True, "读:agent 根 + 迁移期回落"),
+    ("read_document.py", "ReadDocumentTool.call"): (True, "读:agent 根,不回落(PR6 摘掉)"),
     ("file_ops.py", "SandboxWorkspaceWriter.write"): (
         False,
         "状态投影(threads/<tid>/PLAN.md)—— **有意暂缓到 PR5**。"
