@@ -33,6 +33,21 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
       （**未 seed 时 smoke 阶段 6 会 WARNING 跳过**，等于这次发布没有真栈闸门；
       真要补按 [`production-release.md` §1.6.7](./production-release.md)）
 - [ ] **确认本版装载**：`git log --oneline ad79ba28..HEAD`，与 ROADMAP 班车 1 条目对齐
+- [ ] **定发布时段 —— 建议早上 8:00–9:30**。2026-09-13 查过生产近一个月的非金丝雀
+      run 分布（北京时间）：
+
+      ```
+      10时:5  13时:1  14时:4  15时:1  │  20时:11  21时:16  22时:6  │  0–9时:0
+      ```
+
+      主峰在 20–22 时，次峰 10–15 时，**凌晨到上午 9 点历史上零 run**。
+      三段走完约 **1 小时**（B1 ~20min + C ~5min + B2 ~20min + 验证），
+      8 点开始能在流量回来之前收工。
+- [ ] **不需要通知对接方** —— 2026-09-12 跨会话对齐时已拍板三条：默认
+      `scope=agent` 不改、34 个孤儿产物不出清单不认领、「搬迁前工作区列表近乎空」
+      那个窗口**对外零影响**（他们是 run 结束按 end 帧清单一次性收割 → 落自己 OSS →
+      之后走自己直链，两个 workspace 端点一次都没调过）。
+      **写在这里是为了别临场再纠结一遍**（我自己重复起草过一次，两节还与已定结论相反）。
 - [ ] **依赖 PR 的取舍已拍板**：#1520 / #1485 / #1519 / #1484 合不合进本版？
       （建议：本版**不带**，B-50 搬迁是这次的主要风险，混进依赖升级会让出问题时
       分不清归因。依赖单独发一版。）
@@ -44,12 +59,24 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
 
       | 症状 | 处置 |
       |---|---|
-      | `Head .../nginx-unprivileged/manifests: EOF` | ECR Public 按 IP 限流。先 `docker pull` 预拉 base，再重跑 |
+      | `failed to fetch anonymous token … EOF` 或 `Head …/manifests: EOF` | ECR Public 按 IP 限流。**三个 base 全预拉**，见下 |
       | `copy file range failed: no space left on device` | 本机 Docker 盘满。`docker builder prune -af` |
       | apt 拉到 `1021 B/s` 后 `Connection failed` | 网络瞬时塌陷。先探源的速度，通了再重跑 |
 
       后两条有因果：prune 清掉构建缓存 → 下一跑必须重建 apt 层 → 正好撞上网络。
-      提前一天建好镜像能一次性避开这三个。
+
+      **预拉要拉全三个** —— 09-13 我只预拉了 nginx，结果下一跑撞在 `node` 上；
+      「上次炸的那个」不等于「会炸的那些」：
+
+      ```sh
+      for img in public.ecr.aws/docker/library/node:22-alpine \
+                 public.ecr.aws/nginx/nginx-unprivileged:1.27-alpine \
+                 public.ecr.aws/docker/library/python:3.12-slim-bookworm; do
+        for i in 1 2 3; do docker pull -q "$img" >/dev/null 2>&1 && { echo "OK  $img"; break; }; sleep 8; done
+      done
+      ```
+
+      提前一天建好镜像 + 拉全 base，能一次性避开这三条。
 
 ---
 
@@ -130,7 +157,7 @@ tools/deploy/release.sh prod     # 输入 'prod' 确认；或 --yes
 
 - [ ] 确认 checkout 的是 `ca225258`
 - [ ] 三个镜像建推成功（ECR Public 抽风是已知形态 —— 失败先
-      `docker pull public.ecr.aws/nginx/nginx-unprivileged:1.27-alpine` 再重跑）
+      按 §1 的预拉脚本把**三个 base 全拉一遍**再重跑）
 - [ ] migrate Job `condition met`（= `0152`/`0153`/`0154` 跑过）
 - [ ] 全部 Deployment rollout 完成
 - [ ] **smoke 全绿，且阶段 6 金丝雀是 PASS 不是 WARNING**
@@ -275,13 +302,50 @@ EOF
 
 #### C.5 真隔离（这才是本次改动的目的本身）
 
-控制台用 `sop2-designer` 起一轮，让它 `list_dir(".")`：
+> ⚠️ **不要在生产上跑对接方的 agent 去验这条。** 生产唯一的多 agent 用户
+> (`81066c49…`)两个 agent 都是对接方的(`sop2-designer` / `ai-health-plan`),
+> 照「用 A agent 起一轮看看能不能看到 B」去做,等于**拿他们的生产工作区做实验**。
+> 真栈探针只用**金丝雀**或探针 user —— 这条规矩不因为「只是读一下」而放宽。
 
-- [ ] **看不到** `ai-health-plan` 的目录
-- [ ] `read_file("shared:MEMORY.md")` 读得到
+**生产上验两件可验的**：
 
-> 测试环境同一条已实证:`pf-probe` 的 `list_dir(".")` 只返回 `uploads/`,
-> 同一用户下另一个 agent 的 24 个文件零泄露。
+```sh
+# ① 文件系统侧：两个 agent 的树是分开的，且都非空
+kubectl -n $NS exec -i "$POD" -- sh -c '
+  R=/mnt/workspaces/b0f0d29b-62ce-4326-ae92-e1c18631c935/81066c49-0f8e-4dc2-9acd-4c57e3be5973
+  for d in "$R"/agents/*/ "$R"/shared; do
+    [ -d "$d" ] && echo "$(basename "$d"): $(find "$d" -type f | wc -l) 文件"
+  done'
+```
+
+- [ ] ① `agents/sop2-designer-c97db277/` 与 `agents/ai-health-plan-30817804/` **各自非空且互相独立**，
+      `shared/` 单独一份
+- [ ] ② **金丝雀那一轮就是作用域的活证据** —— Step B1 的 smoke 阶段 6 里，
+      `release-canary` 真跑了一次 run、写文件、存产物、按 `agent_code` 取回、下载校验内容。
+      它全程只碰自己的 `agents/release-canary-fd420deb/`，PASS 就说明 agent 作用域在生产上是通的
+- [ ] ③ **控制台工作区浏览面**复看一眼：按 agent 分组、`shared/` 单独一组
+      （人眼一秒能看出搬迁有没有把树搞乱，比任何脚本都直观）
+
+> **「A agent 看不到 B agent 的目录」这条已在测试环境用真 run 实证**：
+> `pf-probe` 的 `list_dir(".")` 只返回 `uploads/`，同一用户下另一个 agent 的
+> 24 个文件零泄露。生产不重跑这一条，是**刻意的**——它需要拿对接方的 agent
+> 在对接方的工作区上做实验，代价大于收益。
+
+#### C.6 数字对不上怎么办
+
+**对不上 ≠ 紧急。** 搬迁是可以**不做**的 —— B1 那一版带着迁移期读回落，
+不搬也能正常跑，只是控制台工作区浏览面和对外两个 workspace 端点返回空。
+
+所以顺序是：
+
+1. **不要 `--apply`**（空跑阶段对不上时）；已经 apply 的**不要手工改数据**
+2. 把 `~/b50-prod-dryrun.txt` / `~/b50-prod-apply.txt` 留好
+3. **停在 B1**，别走 B2 —— 回落还在，用户侧照常
+4. 按 [`workspace-agent-scoping-migration.md` §出了问题怎么办](./workspace-agent-scoping-migration.md) 处理；
+   崩在半路的重跑同一条命令即可（脚本幂等）
+
+C.1 的表就是为这一刻准备的：对不上时你**立刻知道是哪个用户、差多少**，
+而不是从零开始查。
 
 ### Step B2 — 发版（contract：摘掉迁移期读回落，PR6）
 
@@ -385,3 +449,17 @@ tools/deploy/rollback.sh prod <上面那一列的 tag>
 金丝雀不绿就不要往下走。
 
 DB 侧不用担心：`0152`/`0153`/`0154` 都是 expand-only（加列/加约束，向后兼容一版）。
+
+⚠️ **已知未验**：`rollback.sh prod` **没有在生产上实跑过**。它是秒级 `set image`
+（`rollback.sh` 头注），逻辑简单，但「没跑过」就是没跑过。真要用的时候，先
+`kubectl -n expert-work get deploy -o wide` 记下当前镜像，跑完再比一次。
+
+---
+
+## 5. 收工确认
+
+- [ ] 三段都做完，且 `git status` 里 overlay 的 newTag 改动已进 Step E 的记录 PR
+- [ ] 生产 `kubectl -n expert-work get pods` 无 CrashLoop / 无重启计数异常
+- [ ] `~/b50-prod-dryrun.txt` 与 `~/b50-prod-apply.txt` 两份留档还在
+      （**唯一的回退依据**，别清）
+- [ ] 执行单本身归档（这是一次性文档，发完就该躺进历史，而不是被下一次误用）
