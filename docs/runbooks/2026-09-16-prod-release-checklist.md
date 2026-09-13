@@ -44,12 +44,24 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
 
       | 症状 | 处置 |
       |---|---|
-      | `Head .../nginx-unprivileged/manifests: EOF` | ECR Public 按 IP 限流。先 `docker pull` 预拉 base，再重跑 |
+      | `failed to fetch anonymous token … EOF` 或 `Head …/manifests: EOF` | ECR Public 按 IP 限流。**三个 base 全预拉**，见下 |
       | `copy file range failed: no space left on device` | 本机 Docker 盘满。`docker builder prune -af` |
       | apt 拉到 `1021 B/s` 后 `Connection failed` | 网络瞬时塌陷。先探源的速度，通了再重跑 |
 
       后两条有因果：prune 清掉构建缓存 → 下一跑必须重建 apt 层 → 正好撞上网络。
-      提前一天建好镜像能一次性避开这三个。
+
+      **预拉要拉全三个** —— 09-13 我只预拉了 nginx，结果下一跑撞在 `node` 上；
+      「上次炸的那个」不等于「会炸的那些」：
+
+      ```sh
+      for img in public.ecr.aws/docker/library/node:22-alpine \
+                 public.ecr.aws/nginx/nginx-unprivileged:1.27-alpine \
+                 public.ecr.aws/docker/library/python:3.12-slim-bookworm; do
+        for i in 1 2 3; do docker pull -q "$img" >/dev/null 2>&1 && { echo "OK  $img"; break; }; sleep 8; done
+      done
+      ```
+
+      提前一天建好镜像 + 拉全 base，能一次性避开这三条。
 
 ---
 
@@ -130,7 +142,7 @@ tools/deploy/release.sh prod     # 输入 'prod' 确认；或 --yes
 
 - [ ] 确认 checkout 的是 `ca225258`
 - [ ] 三个镜像建推成功（ECR Public 抽风是已知形态 —— 失败先
-      `docker pull public.ecr.aws/nginx/nginx-unprivileged:1.27-alpine` 再重跑）
+      按 §1 的预拉脚本把**三个 base 全拉一遍**再重跑）
 - [ ] migrate Job `condition met`（= `0152`/`0153`/`0154` 跑过）
 - [ ] 全部 Deployment rollout 完成
 - [ ] **smoke 全绿，且阶段 6 金丝雀是 PASS 不是 WARNING**
