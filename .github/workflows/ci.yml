@@ -211,7 +211,21 @@ jobs:
     # (credentialed quota, not the anonymous per-IP one). Docker Hub pull
     # still left: searxng/searxng. ECR Public official images stay anonymous,
     # so the pre-pull backoff stays.
-    timeout-minutes: 40
+    #
+    # 40 → 60(2026-09-13)。预算原本只给套件本身留余量(基线 9-15 分钟),
+    # 默认下面那步的沙箱镜像预构建是缓存命中的。改 `infra/sandbox-image/` 的
+    # **apt 层**时不是 —— 那一层的 RUN 命令串一变,它和它下面的全部重建,实测
+    # **34m06s**(#1540:apt 层补 `apt-get upgrade`),pytest 只剩 4m53s 就撞
+    # 40 分钟上限被 cancel。
+    #
+    # 注意这跟改 `requirements.txt` 不是一回事:那只让 **pip 层**失效,而 pip 层
+    # 在 apt 层之后,apt 层照旧命中缓存 —— 所以历次 dependabot 的沙箱依赖升级
+    # 都没撞过这个(#1484 就是绿的)。是 apt 层本身被改时才付这笔钱。
+    #
+    # 这笔钱一次性:合进 main 后那一跑的 `cache-to` 会把新层写进 gha 缓存,
+    # 之后的 PR 又回到命中。但它会随每一次 apt 层改动复发,所以留在预算里,
+    # 而不是靠"这次特殊"糊过去。
+    timeout-minutes: 60
     continue-on-error: true
     # ghcr.io needs packages:read (a private mirror package is a hard
     # requirement; a public one does not care). The read-only GITHUB_TOKEN of
