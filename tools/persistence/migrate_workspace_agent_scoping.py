@@ -86,12 +86,25 @@ class Attributions:
     #: ``uploads/<name>`` → agent_key(来自 ``user_upload.ref`` + ``thread_id``)。
     uploads: Mapping[str, str]
     #: ``artifact_version.path_in_workspace`` → agent_key(来自 ``artifact.agent_key``,
-    #: 迁移 ``0154`` 已回填)。
+    #: 迁移 ``0154`` 已回填)。**只含 agent_key 非空的** —— 它是**归属判定**表,
+    #: 空 key 意味着反推不出归属。
     artifacts: Mapping[str, str]
     #: thread_id(str)→ agent_key(来自 ``thread_meta.agent_name``)。
     threads: Mapping[str, str]
     #: run_id(str)→ agent_key(来自 ``agent_run`` → ``thread_meta``)。
     runs: Mapping[str, str]
+    #: 该用户**全部**登记过的 ``path_in_workspace``,**不过滤 agent_key**。
+    #:
+    #: 与上面那张表刻意分开:同一份数据被拿去干两件事,而两件事对「空 key」
+    #: 的要求相反 —— 判归属时空 key 要排除(排除 = 进 shared/),但「这条路径
+    #: 是登记过的产物、搬完要跟着改」跟 key 空不空没关系。合成一张表的后果
+    #: 2026-09-13 真栈实见:12 个空 key 的产物文件搬进了 ``shared/``,登记行
+    #: 却没跟着改,指向不存在的旧路径。同 PR5 里
+    #: ``WORKSPACE_RESERVED_PREFIXES`` 那次拆分,是同一个形状。
+    #:
+    #: **必填无默认** —— 留默认值就等于「漏传时静默不更新任何登记行」,
+    #: 而漏更新登记行正是本字段要修的那个 bug。
+    artifact_paths: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -131,8 +144,13 @@ class MigrationReport:
     to_shared: int
     #: 原地不动的文件数(保留段、已在终态、目的地冲突到无处可去)。
     untouched: int
-    #: 同步改掉的 ``artifact_version.path_in_workspace`` 行数。
+    #: 同步改掉的 ``artifact_version.path_in_workspace`` **行**数。
+    #: 它与计划里的 path 条数**本来就不相等** —— 一个 path 可以挂着同一产物的
+    #: 多个版本行(实见 208 个 path → 223 行)。别拿这两个数去比对账。
     artifact_rows_updated: int
+    #: 有几条更新**一行都没命中** —— 这才是红旗:那条登记行此刻指向的旧路径
+    #: 已经被搬走了。
+    artifact_updates_unmatched: int = 0
 
 
 def _user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
@@ -237,7 +255,7 @@ def plan_migration(
 
         claimed.add(dest)
         moves[rel] = dest
-        if rel in attributions.artifacts:
+        if rel in attributions.artifact_paths:
             artifact_updates[rel] = dest
 
     # 登记行指向的文件**已经在终态**时,``moves`` 里不会有它 —— 但那一行仍然
@@ -247,10 +265,14 @@ def plan_migration(
     #
     # 从**盘上文件现在在哪**反推,而不是从本轮的搬迁表反推 —— 这让更新变成
     # 幂等的:跑第二遍就能把第一遍没写成的补上。
-    for rel, key in attributions.artifacts.items():
+    for rel in attributions.artifact_paths:
         if rel in artifact_updates or rel in existing:
             continue
-        for cand in (f"{WORKSPACE_AGENTS_DIR}/{key}/{rel}", f"{WORKSPACE_SHARED_DIR}/{rel}"):
+        key = attributions.artifacts.get(rel)
+        candidates = [f"{WORKSPACE_SHARED_DIR}/{rel}"]
+        if key:
+            candidates.insert(0, f"{WORKSPACE_AGENTS_DIR}/{key}/{rel}")
+        for cand in candidates:
             if cand in existing:
                 artifact_updates[rel] = cand
                 break
@@ -292,6 +314,7 @@ async def apply_migration(
         _prune_empty_dirs(user_root, plan)
 
     rows_updated = 0
+    rows_unmatched = 0
     if plan.artifact_path_updates and session_factory is not None and not dry_run:
         # 直接 await —— 这里曾经写的是 ``asyncio.run(...)``,而 CLI 的 ``_main``
         # 本身就是 ``asyncio.run`` 起的,嵌套一层直接
@@ -299,7 +322,7 @@ async def apply_migration(
         # 没被任何测试逮到:八处 ``apply_migration`` 调用**全都不传
         # session_factory**,这一整个分支从来没被执行过(2026-09-13 真栈第一次
         # 碰到有产物登记行的用户才炸)。
-        rows_updated = await _update_artifact_paths(
+        rows_updated, rows_unmatched = await _update_artifact_paths(
             session_factory,
             tenant_id=plan.tenant_id,
             user_id=plan.user_id,
@@ -311,6 +334,7 @@ async def apply_migration(
         to_shared=len(plan.to_shared),
         untouched=len(plan.untouched),
         artifact_rows_updated=rows_updated,
+        artifact_updates_unmatched=rows_unmatched,
     )
 
 
@@ -340,13 +364,16 @@ async def _update_artifact_paths(
     tenant_id: UUID,
     user_id: UUID,
     updates: Mapping[str, str],
-) -> int:
+) -> tuple[int, int]:
     """把 ``artifact_version.path_in_workspace`` 的旧值改成新值。
+
+    返回 ``(改了几行, 有几条更新一行都没命中)``。
 
     按 ``(tenant_id, user_id)`` 收口 —— ``path_in_workspace`` 是相对路径,
     不同用户之间必然重名(人人都有 ``报告.docx``),不收口会把别人的行改掉。
     """
     updated = 0
+    unmatched = 0
     async with session_factory() as session:
         for old, new in updates.items():
             result = await session.execute(
@@ -369,9 +396,18 @@ async def _update_artifact_paths(
             # 字符串形式(``CursorResult`` 运行期不可下标),而字符串里的名字
             # 静态分析看不见,CodeQL 会把那两个 import 报成未使用。
             # 这也是留存 job 里既有的写法。报的是「改了几行」,给运维对账用。
-            updated += int(getattr(result, "rowcount", 0) or 0)
+            hit = int(getattr(result, "rowcount", 0) or 0)
+            updated += hit
+            if hit == 0:
+                # 这一条路径在库里一行都没命中 —— 它才是真正的红旗。
+                # **别拿 ``updated`` 和 ``len(updates)`` 去比**:前者数的是
+                # ``artifact_version`` 行,后者数的是不同的 path 值,而一个 path
+                # 可以挂着同一产物的多个版本。2026-09-13 真栈实见 208 个 path
+                # 改到了 223 行,那是正常的,当时的告警却报成「没匹配上」。
+                logger.warning("workspace_migration.artifact_path_unmatched old=%s", old)
+                unmatched += 1
         await session.commit()
-    return updated
+    return updated, unmatched
 
 
 async def collect_attributions(
@@ -383,9 +419,36 @@ async def collect_attributions(
     """查出一个用户的全部归属事实。**唯一碰库的读函数。**
 
     先看这个用户用过几个 agent:只有一个就走捷径(整棵树归它),剩下的
-    四张映射都不用查 —— 实测 64 个有会话的用户里 56 个属于这一档。
+    四张**归属映射**都不用查 —— 实测 64 个有会话的用户里 56 个属于这一档。
+
+    ``artifact_paths`` **不在捷径范围内**,两档都要查:它回答的是「哪些路径是
+    登记过的产物、搬完要跟着改」,跟这个用户用了几个 agent 毫无关系。曾经把它
+    和归属表合成一个,于是捷径档返回空表 —— 结果是**那 56 个用户的产物登记行
+    从来不会被更新**,搬完集体指向不存在的旧路径,而报告里的
+    ``artifact rows updated 0`` 看着完全正常(2026-09-13 真栈搬迁时发现)。
     """
     async with session_factory() as session:
+        artifact_rows = [
+            (row.path_in_workspace, row.agent_key)
+            for row in await session.execute(
+                sa.text(
+                    """
+                    SELECT DISTINCT av.path_in_workspace, a.agent_key
+                      FROM artifact AS a
+                      JOIN artifact_version AS av ON av.artifact_id = a.id
+                     WHERE a.tenant_id = :t AND a.user_id = :u
+                       AND av.path_in_workspace IS NOT NULL
+                       AND av.path_in_workspace <> ''
+                    """
+                ),
+                {"t": tenant_id, "u": user_id},
+            )
+        ]
+        # 归属表过滤空 key(空 = 反推不出归属);路径全集不过滤。两件事对空 key
+        # 的要求相反,所以刻意是两个结构 —— 见 ``Attributions.artifact_paths``。
+        artifacts = {path: key for path, key in artifact_rows if key}
+        artifact_paths = frozenset(path for path, _ in artifact_rows)
+
         names = (
             (
                 await session.execute(
@@ -409,6 +472,7 @@ async def collect_attributions(
                 artifacts={},
                 threads={},
                 runs={},
+                artifact_paths=artifact_paths,
             )
 
         threads = {
@@ -439,23 +503,6 @@ async def collect_attributions(
             )
             if str(row.thread_id) in threads
         }
-        artifacts = {
-            row.path_in_workspace: row.agent_key
-            for row in await session.execute(
-                sa.text(
-                    """
-                    SELECT DISTINCT av.path_in_workspace, a.agent_key
-                      FROM artifact AS a
-                      JOIN artifact_version AS av ON av.artifact_id = a.id
-                     WHERE a.tenant_id = :t AND a.user_id = :u
-                       AND a.agent_key <> ''
-                       AND av.path_in_workspace IS NOT NULL
-                       AND av.path_in_workspace <> ''
-                    """
-                ),
-                {"t": tenant_id, "u": user_id},
-            )
-        }
         runs = {
             str(row.id): threads[str(row.thread_id)]
             for row in await session.execute(
@@ -475,6 +522,7 @@ async def collect_attributions(
         sole_agent_key=None,
         uploads=uploads,
         artifacts=artifacts,
+        artifact_paths=artifact_paths,
         threads=threads,
         runs=runs,
     )
@@ -538,11 +586,10 @@ def _render(plan: MigrationPlan, report: MigrationReport, *, dry_run: bool) -> s
         )
     else:
         lines.append(f"  artifact rows updated {report.artifact_rows_updated}")
-        if report.artifact_rows_updated != len(plan.artifact_path_updates):
+        if report.artifact_updates_unmatched:
             lines.append(
-                f"  ⚠️ 计划要改 {len(plan.artifact_path_updates)} 行,实际改了 "
-                f"{report.artifact_rows_updated} 行 —— 差额的那些登记行没匹配上,"
-                "它们的 path_in_workspace 现在指向已被搬走的旧路径。别忽略。"
+                f"  ⚠️ {report.artifact_updates_unmatched} 条更新在库里一行都没命中 —— "
+                "那些登记行的 path_in_workspace 现在指向已被搬走的旧路径。别忽略。"
             )
     if plan.conflicts:
         lines.append(
