@@ -127,6 +127,15 @@ RUN test -x /bin/bash \
 # it runs in the same layer that populated it. Splitting the install into
 # several `RUN`s strands those lists in the lower layers, where a later
 # delete cannot reclaim them.
+#
+# `apt-get upgrade` is not redundant with `update` + `install`. `install` only
+# fetches current versions of the packages named below; everything the base
+# image already shipped stays frozen at whatever the base was built with, and
+# `python:3.12-slim` is a floating tag we do not rebuild on Debian's schedule.
+# On 2026-09-13 that gap turned the Trivy CRITICAL gate red on main: 8 fixed
+# CVEs in base-shipped packages (perl-base, libglib2.0-0t64, libmbedcrypto16,
+# node-lodash), every one of them already patched in trixie-security, which
+# the sources rewrite above points at. Dropping this line re-opens that gap.
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
     elif [ -f /etc/apt/sources.list ]; then \
@@ -135,6 +144,7 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         echo "no apt sources file found — base image layout changed" >&2; exit 1; \
     fi \
     && apt-get update -o Acquire::Retries=5 \
+    && apt-get upgrade -y -o Acquire::Retries=5 \
     && apt-get install -y -o Acquire::Retries=5 --no-install-recommends \
         fonts-noto-cjk \
         fontconfig \
