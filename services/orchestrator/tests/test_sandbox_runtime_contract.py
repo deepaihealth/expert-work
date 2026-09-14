@@ -72,26 +72,17 @@ clamp 在 HTTP 路径上够不着,拿它当闸就是拿一段死代码当闸:真
 (理由见其 ``exec`` docstring 契约点 2)。``test_exec_output_is_capped``
 因此断言的是"被截到了上限附近",不是某个精确长度。
 
-**其四:``/workspace`` 的物理路径。**(波 2 真栈复跑实测)supervisor 档的
-``/workspace`` 是容器里一个真目录,``os.getcwd()`` 就报 ``/workspace``;
-agent_sandbox 档的 ``/workspace`` 是**平台建的符号链接**,指向
-``/run/csi/mount-root/nas/<hash>``(hash 每次挂载现算),而 ``getcwd(2)``
-按定义返回解析后的物理路径。这条弥合不了——符号链接是平台注入 NAS 挂载的
-方式,不是我们能选的。功能上无影响:相对路径读写、``/workspace/...``
-绝对路径、跨 exec 持久化全部照常(各由自己的用例覆盖)。
-``test_exec_cwd_is_workspace`` 因此比 ``(st_dev, st_ino)`` 而不是路径字符串。
+**其四(B-60 起已消解,不再是差异):``/workspace`` 的物理路径。** 现在两个后端
+的 exec 都在自己的 mount 命名空间里跑,脚本以 ``cd /workspace`` 收尾,而
+``/workspace`` 是那个命名空间里的 **bind 挂载点**(agent 目录,或未绑时整个用户
+根)—— 不是符号链接。两边 ``getcwd(2)`` 因此都直接报 ``/workspace``。
 
-**B-60 之后**:云后端 exec 进了自己的命名空间,脚本以 ``cd /workspace`` 收尾——
-这发生在 ``unshare`` 出来的新 mount 命名空间里,bind 挂载(agent 目录或未绑时
-整个用户根)本身就落在 ``/workspace`` 这个真实路径上,不再经过 CSI 建的那个
-符号链接;两个后端的 ``getcwd(2)`` 因此都直接报 ``/workspace``——``/workspace``
-是 bind 挂载点,不是符号链接。比 inode 的写法保留,它更强。
-
-这也解决了下面这条顾虑——**B-60 前**:云后端上,agent 自己跑 ``os.getcwd()``
-(或任何打印绝对路径的报错)会看到 ``/run/csi/mount-root/nas/<hash>`` 而不是
-``/workspace``。纯观感,功能不受影响,但 LLM 读到自己的 cwd 长这样可能会困惑;
-当时的结论是真要治得在提示词或工具输出层做路径回写。B-60 之后这条顾虑本身就不
-再成立,不需要再做——留在这里是历史记录,不是当前行为。
+「**B-60 前**」的历史,记在这里是为了解释 ``test_exec_cwd_is_workspace`` 为什么比
+``(st_dev, st_ino)`` 而不是路径字符串(**当时**云后端的 ``/workspace`` 是平台建的
+符号链接,指向 ``/run/csi/mount-root/nas/<hash>``,hash 每次挂载现算,而
+``getcwd(2)`` 按定义返回解析后的物理路径;那时还顺带有一条纯观感顾虑:agent 自己
+打印绝对路径会看到那串 hash)。比 inode 的写法保留 —— 它比字符串相等更强,一个 cwd
+恰好叫 ``/workspace`` 但其实是另一棵树的实现骗不过它。
 """
 
 from __future__ import annotations
@@ -408,19 +399,18 @@ async def test_exec_cwd_is_workspace(runtime: SandboxRuntime) -> None:
     镜像 ``WORKDIR``(即便镜像声明了也一样),实测落在 ``/home/agent``。
     两条路子不同,观测结果必须相同。
 
-    **比 inode 身份,不比路径字符串**(波 2 收尾真栈复跑)。这条以前断言
-    ``os.getcwd() == "/workspace"``,在波 2 之前是对的:那时 ``/workspace``
-    两个后端都是真目录。云后端现在不是了 —— 平台把 ``/workspace`` 建成指向
-    ``/run/csi/mount-root/nas/<hash>`` 的**符号链接**,而 ``getcwd(2)`` 按定义
-    返回解析后的物理路径,于是这条用例报
-    ``assert '/run/csi/mount-root/nas/...' == '/workspace'``。
+    **比 inode 身份,不比路径字符串**(波 2 收尾真栈复跑)。这条最早断言
+    ``os.getcwd() == "/workspace"``。**B-60 前**云后端上那样断言是红的:平台把
+    ``/workspace`` 建成指向 ``/run/csi/mount-root/nas/<hash>`` 的符号链接,而
+    ``getcwd(2)`` 按定义返回解析后的物理路径,于是报
+    ``assert '/run/csi/mount-root/nas/...' == '/workspace'``;那个字符串也不是我们
+    能承诺的东西(hash 由平台每次挂载现算)。
 
-    那个字符串不是我们能承诺的东西(hash 由平台每次挂载现算),而这条用例
-    真正要问的是「这个进程是不是站在工作区里」。比 ``(st_dev, st_ino)`` 正好
-    回答那个问题:``os.stat`` 跟随符号链接,所以 supervisor 档(真目录)与
-    agent_sandbox 档(symlink)都成立,而且比字符串相等更强 —— 一个 cwd 恰好
-    叫 ``/workspace`` 但其实是另一棵树的实现骗不过它。顺带把 ``getcwd()``
-    一起打出来,失败时不用再猜它到底站在哪。
+    这条用例真正要问的是「这个进程是不是站在工作区里」,``(st_dev, st_ino)`` 正好
+    回答那个问题,而且比字符串相等更强 —— 一个 cwd 恰好叫 ``/workspace`` 但其实是
+    另一棵树的实现骗不过它。B-60 之后两个后端的 ``/workspace`` 都是命名空间里的
+    bind 挂载点、``getcwd()`` 都直接报 ``/workspace``,写法照旧保留就是为了这份额外
+    强度。顺带把 ``getcwd()`` 一起打出来,失败时不用再猜它到底站在哪。
     """
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c8")
     try:

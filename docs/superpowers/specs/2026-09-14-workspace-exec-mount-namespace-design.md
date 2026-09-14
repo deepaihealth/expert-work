@@ -245,9 +245,18 @@ exec 已经写不到用户根,留着就是一段带着洞形状的死代码。�
 - `bash` 持 per-workspace 写锁(`bash.py:55`),`exec_python` 不持 —— 与本方案无关,不改。
 - user ns 内的「root」对外仍是 uid 10000:写出的文件属主 10000(两处实测),NAS 上 `0o700`/`umask 077` 语义不变。
 - 能不能逃:ns 内能不能把 `/mnt/workspace` 上的 tmpfs 挪开露出用户根 —— **ACS 上能**(无 seccomp,`umount`/`mount --move` 都在);
-  本地后端 `umount2` 仍 cap 门控,但 `mount --move` 走 `mount(2)`,同样能。所以本方案对**故意**的代码仍不是绝对边界;
-  它保证的是**照平台教法写的代码**不可能越界,以及**默认视图**里别的 agent 不存在。与 `/opt/skills/<key>` 今天的强度一致。
-  写进工具描述与对外文档时按这个口径说,不说「隔离」。
+  本地后端 `umount2` 仍 cap 门控,但 `mount --move` 走 `mount(2)`,**已实测不是推论**:本地后端的
+  加固参数下,命名空间里 `mount --move /mnt/workspace <dir>` 成功,用户根当场露出来。所以本方案对**故意**的
+  代码仍不是绝对边界;它保证的是**照平台教法写的代码**不可能越界,以及**默认视图**里别的 agent 不存在。
+  与 `/opt/skills/<key>` 今天的强度一致。写进工具描述与对外文档时按这个口径说,不说「隔离」。
+- **命名空间之间也看不见:** 同一沙箱里另一个 exec 的 `/proc/<pid>/root`、`/proc/<pid>/cwd` 读不到 ——
+  内核在 `commoncap` 里按 `ptrace_may_access` 判,读者的 user ns 不是目标进程 user ns 的祖先就 EACCES。
+  本地后端实测如此;ACS 的 5.10 走同一处检查。也就是说 agent A 的 exec 没法拿 procfs 绕过去看 agent B 的视图。
+- **ns 里 `geteuid()==0` 是可观测的。** `unshare -U` 把当前 uid 映射成新 user ns 的 0,于是 `whoami` 报 root、
+  `pip install` 打出 "running as root" 警告、个别工具会因为「不要以 root 跑」而拒绝。**外面的属主仍是 10000**
+  (上一条),所以这是观感不是权限。`unshare --map-current-user`(util-linux ≥2.39,镜像是 2.41.5)把它映射成
+  当前 uid,看上去能消掉这份观感 —— 但换映射会不会影响 ns 里那几条 mount 还没量过,**本轮不动**,
+  记为后续 spike(ROADMAP B-60 残留 ⓪)。
 - 放行 `unshare(CLONE_NEWUSER)` 在 runc 上扩大了内核攻击面(user namespace 是历史上 CVE 高发区)。本地后端只用于 dev / CI;
   生产是 ACS microVM(内核边界在 microVM 上,沙箱里本来就没有 seccomp)。runsc 上 userns 在 sentry 里模拟,不触及宿主内核。
 - 绑了 agent 时裸 `shared/…` 相对路径在视图里撞只读 bind —— 做成保留首段(§4.2),不是静默 EROFS。
@@ -287,3 +296,15 @@ exec 已经写不到用户根,留着就是一段带着洞形状的死代码。�
 3. 生产按执行单三段 A / B1 / C / B2;B1、B2 钉子重定为含本 spec 的提交。
 4. 执行单 `docs/runbooks/2026-09-14-prod-release-checklist.md` 改期,原「今晚 18:00」作废。
 5. 沙箱镜像**不随本次改动**;B-59 刷钉子时镜像仍**不得**预建 `/workspace`(ACS 老代码 + 新镜像 = symlink 建不上)—— 运行期 `mkdir -p` 是规则,不是过渡。
+   闸(`test_image_leaves_both_mount_points_bare`)钉住这条,连两个挂载点**底下**的路径一起拒。
+   连带:`infra/sandbox-image/Dockerfile` 里两处注释已经过期 —— `:13` 说运行期 tmpfs 在
+   「`/workspace` + `/tmp`」(B-60 之后是 `/mnt/workspace` 卷 + `/workspace` 只读 tmpfs),
+   `:20-21` 说「dev 不设 profile,走宿主默认」(B-60 起 dev 也必须配仓内 profile)。
+   Dockerfile 本轮冻结,这两处**并进 B-59 的镜像刷新**一起改。
+6. **dev 侧必须重建 `expert-work-sandbox:dev`** —— `runner.py` 变了(exec 命令串在镜像里)。
+   只更新代码不重建镜像的话,本地 exec 仍走老 runner,`agent_root` 被忽略、写入侧一切照旧。
+   supervisor 与 orchestrator 要**一起**部署:compose 现在硬要求 seccomp profile(`None` = 启动失败),
+   而 orchestrator 送的 `agent_root` 只有新 supervisor 认。
+7. **部署后几分钟内预期出现一阵 `layout_mismatch` 销毁 + 约 31 s 冷启动**,每个有活跃热会话的用户各一次:
+   旧布局(`user-root`)的热会话全部作废重建。这是设计的换代路径,不是故障;观察 `sandbox_instance`
+   的新行 `layout='agent-ns'` 即可确认自愈。

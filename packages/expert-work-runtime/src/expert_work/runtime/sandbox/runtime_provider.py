@@ -320,9 +320,16 @@ class SandboxRuntimeProvider:
     def _seccomp_opt(self) -> list[str]:
         """The ``--security-opt seccomp=`` flag, or empty when unset.
 
-        ``None`` → no flag (host Docker default profile). A path → pin our
-        own profile. Applies under both runc and runsc: gVisor still honours
-        seccomp on the host-side sentry process, so the two layers stack.
+        ``None`` → no flag, which leaves the host Docker default profile in
+        force. That is not a supported posture since B-60 — the supervisor
+        refuses to start on ``None`` (``seccomp.validate_seccomp_profile``),
+        because the default profile keeps ``unshare``/``mount`` behind
+        CAP_SYS_ADMIN and every exec would fail closed on its first bind
+        mount. This provider stays pure and only forwards what it is given,
+        so the branch survives here; it is unreachable in the supervisor.
+        A path → pin our own profile. Applies under both runc and runsc:
+        gVisor still honours seccomp on the host-side sentry process, so the
+        two layers stack.
         """
         if self.seccomp_profile_path is None:
             return []

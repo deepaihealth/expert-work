@@ -300,7 +300,7 @@ jobs:
           cache-from: type=gha
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
-      - name: Allow unprivileged user namespaces for the sandbox exec view (B-60)
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04 AppArmor, B-60)
         # Ubuntu 24.04 restricts userns creation to AppArmor profiles that grant
         # ``userns``; the sandbox runs ``apparmor=unconfined`` (docker-default
         # carries ``deny mount,``), so lift the restriction on this runner only.

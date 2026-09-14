@@ -103,6 +103,9 @@ SANDBOX_AGENTS_ROOT = "/opt/agents"    # + <agent_key>
 > [`2026-09-14-workspace-exec-mount-namespace-design.md`](./2026-09-14-workspace-exec-mount-namespace-design.md)。
 > **补记(B-60 PR-C 落地后)**:§5.3 的「约定」自 B-60 起成为边界:`bash` / `exec_python` 的
 > `/workspace` 就是 agent 目录(每次 exec 一个私有 mount namespace)。
+> 连带的一处观感:用户根上还留着 `shared/` 的老用户,绑了 agent 的 `list_dir(".")` 会多出一个
+> `shared` 目录条目(那是只读 bind 的挂载点),而同一个工具读它底下的文件会被拒 ——
+> `shared/` 的读路径是 `shared:` 前缀,不是裸的相对路径。
 
 热沙箱按 `(tenant_id, user_id)` 复用 —— `sandbox_instance` 表**没有 agent 列**
 (`models/sandbox_instance.py:25-47`),`acquire()` 也不收 agent 参数

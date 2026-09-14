@@ -84,7 +84,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Allow unprivileged user namespaces (Ubuntu 24.04 AppArmor)
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04 AppArmor, B-60)
         run: |
           if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
