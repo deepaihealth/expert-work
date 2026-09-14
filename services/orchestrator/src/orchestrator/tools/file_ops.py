@@ -66,6 +66,9 @@ from orchestrator.tools.workspace_paths import (
     resolve_scope,
 )
 
+#: ``shared/`` 目录名 —— 由前缀反推,不写第二份字面量(前缀与目录必须永远同名)。
+_SHARED_DIR_NAME = SHARED_PREFIX.rstrip(":")
+
 #: Workspace mount inside the sandbox (see infra/sandbox-image).
 #:
 #: B-50 —— **不自己写字面量**:``workspace_paths.USER_ROOT`` 是唯一真源。迁移期
@@ -418,6 +421,48 @@ print(json.dumps(_main()))
 """
 
 
+_ARTIFACT_LOCATE_MAIN = """
+
+def _main():
+    agent_full = _resolve(_P["rel"])
+    if agent_full is None:
+        return {"ok": False, "error": "path_escapes_workspace"}
+    if os.path.isdir(agent_full):
+        return {"ok": False, "error": "not_a_file"}
+    if os.path.isfile(agent_full):
+        return {"ok": True, "size": os.path.getsize(agent_full), "location": "agent"}
+    user_ws = os.path.realpath(_P["user_ws"])
+    if user_ws == _WS:
+        return {"ok": False, "error": "not_found"}
+    # bash / exec_python 里的任意代码写绝对路径 /workspace/x 会落在用户根
+    # (spec §5.3:那两个工具是约定不是边界)。在这里把它认领回 agent 目录 ——
+    # 只认根一级的文件;agents/<别人>/ 与 shared/ 里的东西不是本 agent 的。
+    try:
+        user_full = os.path.realpath(os.path.join(user_ws, _P["rel"]))
+    except (ValueError, OSError):
+        return {"ok": False, "error": "not_found"}
+    if not user_full.startswith(user_ws + os.sep):
+        return {"ok": False, "error": "not_found"}
+    head = os.path.relpath(user_full, user_ws).split(os.sep, 1)[0]
+    if head in (_P["agents_dir"], _P["shared_dir"]):
+        return {"ok": False, "error": "forbidden_scope", "head": head}
+    if os.path.isdir(user_full):
+        return {"ok": False, "error": "not_a_file"}
+    if not os.path.isfile(user_full):
+        return {"ok": False, "error": "not_found"}
+    try:
+        os.makedirs(os.path.dirname(agent_full) or _WS, exist_ok=True)
+        os.replace(user_full, agent_full)
+        size = os.path.getsize(agent_full)
+    except OSError as exc:
+        return {"ok": False, "error": "io_error", "detail": str(exc)}
+    return {"ok": True, "size": size, "location": "claimed_from_user_root"}
+
+
+print(json.dumps(_main()))
+"""
+
+
 def _snippet(params: Mapping[str, Any], main: str) -> str:
     """Assemble a snippet: ``_PARAMS`` literal + shared prelude + op body."""
     return f"_PARAMS = {json.dumps(params)!r}\n" + _PRELUDE + main
@@ -440,6 +485,33 @@ def build_list_wrapper(
 ) -> str:
     """Snippet that lists directory ``ws/rel`` and prints a JSON envelope."""
     return _snippet({"ws": ws, "rel": rel, "max_entries": max_entries}, _LIST_MAIN)
+
+
+def build_artifact_locate_wrapper(rel: str, *, agent_ws: str, user_ws: str) -> str:
+    """Snippet ``save_artifact`` runs before registering ``rel``.
+
+    Looks under the agent root first; if the file is not there but sits at the
+    **user root** (the place ``bash`` / ``exec_python`` code lands when it
+    writes a literal ``/workspace/<name>`` — spec §5.3 calls those two tools a
+    convention, not a boundary) it is **moved** into the agent root with
+    ``os.replace`` (same filesystem — the migration script's primitive) and
+    then reported. Only root-level files are claimable: anything under
+    ``agents/`` or ``shared/`` belongs to someone else by construction.
+
+    Envelope: ``{"ok": True, "size": N, "location": "agent" |
+    "claimed_from_user_root"}`` or ``{"ok": False, "error": "not_found" |
+    "not_a_file" | "forbidden_scope" | "path_escapes_workspace" | "io_error"}``.
+    """
+    return _snippet(
+        {
+            "ws": agent_ws,
+            "user_ws": user_ws,
+            "rel": rel,
+            "agents_dir": AGENTS_DIR,
+            "shared_dir": _SHARED_DIR_NAME,
+        },
+        _ARTIFACT_LOCATE_MAIN,
+    )
 
 
 def build_edit_wrapper(

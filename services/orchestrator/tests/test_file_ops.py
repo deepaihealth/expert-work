@@ -38,6 +38,7 @@ from orchestrator.tools import (
 )
 from orchestrator.tools.file_ops import (
     SandboxWorkspaceWriter,
+    build_artifact_locate_wrapper,
     build_edit_wrapper,
     build_list_wrapper,
     build_read_wrapper,
@@ -847,3 +848,103 @@ async def test_projection_writer_still_targets_the_user_root() -> None:
     await writer.write(rel="threads/t1/PLAN.md", content="x")
     assert _USER_WS in client.execs[-1][1]
     assert _AGENT_WS not in client.execs[-1][1]
+
+
+# ---------------------------------------------------------------------------
+# save_artifact 的定位片段 —— 真跑在 tmp_path 上,证明「认领」真的把文件搬了
+# ---------------------------------------------------------------------------
+
+
+def _agent_layout(tmp_path: Path, key: str = "me-aaaaaaaa") -> tuple[str, str]:
+    user_ws = tmp_path
+    agent_ws = tmp_path / "agents" / key
+    agent_ws.mkdir(parents=True)
+    (tmp_path / "shared").mkdir()
+    return str(agent_ws), str(user_ws)
+
+
+def test_locate_finds_a_file_under_the_agent_root(tmp_path: Path) -> None:
+    agent_ws, user_ws = _agent_layout(tmp_path)
+    (Path(agent_ws) / "deck.pptx").write_bytes(b"x" * 7)
+
+    env = _run_snippet(
+        build_artifact_locate_wrapper("deck.pptx", agent_ws=agent_ws, user_ws=user_ws)
+    )
+
+    assert env == {"ok": True, "size": 7, "location": "agent"}
+
+
+def test_locate_claims_a_root_level_leak_by_moving_it(tmp_path: Path) -> None:
+    """exec_python 写了 /workspace/deck.pptx(用户根)。认领 = 搬进 agent 目录。"""
+    agent_ws, user_ws = _agent_layout(tmp_path)
+    leaked = Path(user_ws) / "deck.pptx"
+    leaked.write_bytes(b"y" * 11)
+
+    env = _run_snippet(
+        build_artifact_locate_wrapper("deck.pptx", agent_ws=agent_ws, user_ws=user_ws)
+    )
+
+    assert env == {"ok": True, "size": 11, "location": "claimed_from_user_root"}
+    assert not leaked.exists(), "源文件必须消失 —— 是搬不是拷,否则用户根上留一份跨 agent 可见的副本"
+    assert (Path(agent_ws) / "deck.pptx").read_bytes() == b"y" * 11
+
+
+def test_locate_claim_creates_missing_parent_dirs(tmp_path: Path) -> None:
+    agent_ws, user_ws = _agent_layout(tmp_path)
+    (Path(user_ws) / "out").mkdir()
+    (Path(user_ws) / "out" / "deck.pptx").write_bytes(b"z")
+
+    env = _run_snippet(
+        build_artifact_locate_wrapper("out/deck.pptx", agent_ws=agent_ws, user_ws=user_ws)
+    )
+
+    assert env["ok"] is True
+    assert (Path(agent_ws) / "out" / "deck.pptx").read_bytes() == b"z"
+
+
+@pytest.mark.parametrize("head", ["agents", "shared"])
+def test_locate_never_claims_from_agents_or_shared(tmp_path: Path, head: str) -> None:
+    """别的 agent 的目录与 shared/ 里的文件不是本 agent 的 —— 认领了就是 PR6 堵掉的那个洞。"""
+    agent_ws, user_ws = _agent_layout(tmp_path)
+    victim = Path(user_ws) / head / "other-bbbbbbbb" if head == "agents" else Path(user_ws) / head
+    victim.mkdir(parents=True, exist_ok=True)
+    (victim / "secret.md").write_text("theirs")
+    rel = f"{head}/other-bbbbbbbb/secret.md" if head == "agents" else f"{head}/secret.md"
+
+    env = _run_snippet(build_artifact_locate_wrapper(rel, agent_ws=agent_ws, user_ws=user_ws))
+
+    assert env["ok"] is False
+    assert env["error"] == "forbidden_scope"
+    assert env["head"] == head
+    assert (victim / "secret.md").read_text() == "theirs"
+
+
+def test_locate_reports_not_found_when_nowhere(tmp_path: Path) -> None:
+    agent_ws, user_ws = _agent_layout(tmp_path)
+    env = _run_snippet(
+        build_artifact_locate_wrapper("ghost.pptx", agent_ws=agent_ws, user_ws=user_ws)
+    )
+    assert env == {"ok": False, "error": "not_found"}
+
+
+def test_locate_rejects_a_directory(tmp_path: Path) -> None:
+    agent_ws, user_ws = _agent_layout(tmp_path)
+    (Path(user_ws) / "outputs").mkdir()
+    env = _run_snippet(build_artifact_locate_wrapper("outputs", agent_ws=agent_ws, user_ws=user_ws))
+    assert env == {"ok": False, "error": "not_a_file"}
+
+
+def test_locate_unbound_agent_never_claims(tmp_path: Path) -> None:
+    """未绑 agent 时 agent 根 == 用户根;根上的文件本来就在正确位置,不存在认领。"""
+    ws = str(tmp_path)
+    (tmp_path / "deck.pptx").write_bytes(b"q")
+    env = _run_snippet(build_artifact_locate_wrapper("deck.pptx", agent_ws=ws, user_ws=ws))
+    assert env == {"ok": True, "size": 1, "location": "agent"}
+
+
+def test_locate_escape_is_blocked(tmp_path: Path) -> None:
+    agent_ws, user_ws = _agent_layout(tmp_path)
+    env = _run_snippet(
+        build_artifact_locate_wrapper("../../etc/passwd", agent_ws=agent_ws, user_ws=user_ws)
+    )
+    assert env == {"ok": False, "error": "path_escapes_workspace"}

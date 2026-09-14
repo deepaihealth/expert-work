@@ -470,7 +470,15 @@ def _register_builtin(
     elif entry.name == "read_document":
         _register_read_document(registry, env, skill_seed_files)
     elif entry.name == "save_artifact":
-        registry.register(SaveArtifactTool(store=_require_artifact_store(env, "save_artifact")))
+        # 登记前要 stat 工作区里那个文件,所以和 read_file/write_file 一样需要
+        # 沙箱执行通道;没有它就没有「文件」这个概念,登记只会造出死产物。
+        artifact_store = _require_artifact_store(env, "save_artifact")
+        if env.sandbox_runtime is None:
+            raise AgentFactoryError(
+                "builtin 'save_artifact' declared but no sandbox runtime "
+                "is configured (ToolEnv.sandbox_runtime)"
+            )
+        registry.register(SaveArtifactTool(store=artifact_store, client=env.sandbox_runtime))
     elif entry.name == "list_artifacts":
         registry.register(ListArtifactsTool(store=_require_artifact_store(env, "list_artifacts")))
     elif entry.name == "ask_for_approval":
@@ -531,6 +539,11 @@ def _register_base_capabilities(
             continue  # explicit manifest entry already registered it
         if name in ("save_artifact", "list_artifacts"):
             if env.artifact_store is None:
+                continue
+            # ``save_artifact`` 现在多一条依赖:登记前要 stat 工作区里的文件,
+            # 所以没有沙箱通道它注册了也只会造出下载 404 的死产物。
+            # ``list_artifacts`` 只读库,不受影响。
+            if name == "save_artifact" and env.sandbox_runtime is None:
                 continue
         elif env.sandbox_runtime is None:
             continue
