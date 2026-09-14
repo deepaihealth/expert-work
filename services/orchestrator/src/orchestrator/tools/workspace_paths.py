@@ -1,12 +1,15 @@
 """工作区路径的作用域解析 —— agent 根 / ``shared/`` 的唯一真源(B-50)。
 
-沙箱里的 ``/workspace`` 挂的是**用户根**:热沙箱按 ``(tenant, user)`` 复用
-(``sandbox_instance`` 没有 agent 列、``acquire()`` 不收 agent),而 CSI 的
-``subPath`` 在 create 时就钉死了 —— 挂载点不可能按 agent 分(spec §三)。
-分层因此做在路径上:每个 agent 的默认根是 ``/workspace/agents/<agent_key>``,
-交给 ``build_*_wrapper(..., ws=...)`` 的 ``ws`` 参数,由沙箱内片段既有的
-``realpath`` + 前缀守卫强制(``file_ops.py`` 的 ``_PRELUDE``)—— 与它挡 ``..``
-是同一道闸,不是新加的一道。
+挂载仍按用户:热沙箱按 ``(tenant, user)`` 复用(``sandbox_instance`` 没有 agent 列、
+``acquire()`` 不收 agent),CSI 的 ``subPath`` 在 create 时就钉死了 —— 挂载点不可能
+按 agent 分(spec §三)。分层因此不再做在挂载点上,而是做在**每次 exec 自己的
+mount namespace** 里(B-60):绑了 agent 时,``/workspace`` 这个视图本身就是那个
+agent 在 NAS 上的目录(``agent_nas_root`` bind 成 ``EXEC_VIEW``);没绑时视图是
+整个用户根。``build_*_wrapper(..., ws=...)`` 的 ``ws`` 因此恒为 ``EXEC_VIEW`` ——
+不再需要 ``/workspace/agents/<agent_key>`` 这种子路径去分层,那个拼法现在只是
+``agent_view_alias`` 折叠模型照旧写法用的别名,不指向真实目录。沙箱内片段既有的
+``realpath`` + 前缀守卫(``file_ops.py`` 的 ``_PRELUDE``)—— 与它挡 ``..``
+是同一道闸,不是新加的一道 —— 仍然把 agent 关在 ``EXEC_VIEW`` 里。
 
 ``shared/`` 存迁移期反推不出归属的 legacy,**可读不可写**,而且**不与默认根
 合并**:要读必须显式写 ``shared:`` 前缀。不合并是有意的 —— 让归属不明的 legacy
@@ -24,11 +27,6 @@ from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 #: 显式跨到用户级 ``shared/`` 区的前缀(照 ADK 的 ``user:`` 约定)。
 #: 由目录名拼出来,不写第二遍字面量 —— 前缀与它指向的目录必须永远同名。
 SHARED_PREFIX = f"{WORKSPACE_SHARED_DIR}:"
-
-#: B-60 过渡别名 —— 调用点分批切到 EXEC_VIEW,Task 12 删除。**导出而非私有**:
-#: ``file_ops`` 的迁移期读回落要用它,而那个模块自己也有一个同名私有常量 ——
-#: 两处各改各的就会静默分叉,回落目标和挂载点对不上时没有任何测试会红。
-USER_ROOT = EXEC_VIEW
 
 #: 布局里的保留段。**导出**:``file_ops._require_path`` 要用它来拒绝以这一段
 #: 开头的相对路径 —— 迁移期读回落会把 ``agents/<别人的 key>/x`` 变成一次合法的
@@ -90,15 +88,6 @@ def agent_view_alias(agent_key: str) -> str:
     """
     _require_safe_key(agent_key)
     return f"{EXEC_VIEW}/{AGENTS_DIR}/{agent_key}"
-
-
-def agent_workspace_root(agent_key: str) -> str:
-    """B-60 过渡别名 —— 语义仍是 B-50 的(未绑 → 用户根;绑了 → 别名拼法)。
-    Task 6/7 把调用点换成 ``agent_nas_root`` / ``agent_view_alias`` / ``EXEC_VIEW``,
-    Task 12 删除。"""
-    if not agent_key:
-        return EXEC_VIEW
-    return agent_view_alias(agent_key)
 
 
 def resolve_scope(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:

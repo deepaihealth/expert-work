@@ -715,11 +715,11 @@ class ExecPythonTool:
         return ToolSpec(
             name="exec_python",
             description=(
-                "Execute a Python 3 snippet in an isolated sandbox and return "
+                "Execute a Python 3 snippet in the sandbox and return "
                 "its stdout / stderr / exit code. Use for calculations, data "
-                "transforms, or anything better done by running code. Starts in "
-                "your own workspace directory, so relative paths match the file "
-                "tools."
+                "transforms, or anything better done by running code. Runs in "
+                "/workspace, which is your agent's own directory; other "
+                "agents' files are not visible there."
             ),
             parameters={
                 "type": "object",

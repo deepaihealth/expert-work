@@ -90,9 +90,9 @@ class BashTool:
                 "Run a shell command in the agent's sandboxed workspace and "
                 "return its stdout / stderr / exit code. Use for git, grep, "
                 "file manipulation, format conversion, or anything not covered "
-                "by a dedicated tool. Starts in your own workspace directory "
-                "inside an isolated sandbox, so relative paths match the file "
-                "tools. NOTE: this is an irreversible action — it runs "
+                "by a dedicated tool. Runs in /workspace, which is your "
+                "agent's own directory; other agents' files are not visible "
+                "there. NOTE: this is an irreversible action — it runs "
                 "serially and may require human approval before executing."
             ),
             parameters={

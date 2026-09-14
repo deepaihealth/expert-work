@@ -620,7 +620,7 @@ async def test_claim_warm_not_ready_surfaces_as_sandbox_supervisor_error() -> No
 @pytest.mark.asyncio
 async def test_seed_files_written_before_first_exec() -> None:
     """sandbox migration wave 2 — seed lands under SANDBOX_SKILLS_ROOT
-    (sandbox-local), not WORKSPACE_ROOT; relpath already carries the
+    (sandbox-local), not NAS_MOUNT; relpath already carries the
     agent_key namespace prefix (the caller's job, build_skill_seed_files)."""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1025,10 +1025,12 @@ async def test_exec_sets_owner_only_umask_before_running_the_script() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_runs_in_workspace_cwd() -> None:
-    """不传 ``cwd`` 时 envd 把进程扔在 ``/home/agent``:``bash`` 工具对 LLM
-    宣称的 "Runs in /workspace" 是假的,LLM 写的相对路径文件会落到
-    ``file_ops``(只认绝对 ``/workspace/...``)看不见的地方。
+async def test_exec_passes_the_nas_mount_as_cwd() -> None:
+    """不传 ``cwd`` 时 envd 把进程扔在 ``/home/agent``:E2B 在真正跑命令前会校验
+    传入的 ``cwd`` 已经存在,``NAS_MOUNT`` 是唯一保证 create 时就已挂载的路径 ——
+    ``EXEC_VIEW``(``/workspace``)要等命名空间脚本自己 bind 出来,传它会被 SDK
+    拒绝。不传 ``cwd`` 的话,LLM 写的相对路径文件会落到 ``file_ops``(只认绝对
+    ``/workspace/...``)看不见的地方。
     """
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1057,7 +1059,7 @@ async def test_create_passes_the_image_environment() -> None:
     envs = sdk.created[-1]["envs"]
     for key, value in SANDBOX_IMAGE_ENV.items():
         assert envs[key] == value, f"镜像环境变量 {key} 没送进沙箱"
-    # 沙箱迁移 W2 Task 9:HOME 迁出 WORKSPACE_ROOT——/workspace 现在必须空着
+    # 沙箱迁移 W2 Task 9:HOME 迁出 NAS_MOUNT——NAS_MOUNT 现在必须空着
     # 让平台建 NAS 挂载 symlink,HOME 改落 useradd -m 建好的 /home/agent。
     assert envs["HOME"] == "/home/agent", "HOME 不是 /home/agent 则 PIP_USER 装到镜像预建目录之外"
     assert envs["PIP_USER"] == "1", "只读 rootfs 上没有 PIP_USER=1 则 pip install 必失败"
@@ -1201,7 +1203,7 @@ async def test_acquire_chowns_the_mount_from_inside_the_sandbox() -> None:
 
 @pytest.mark.asyncio
 async def test_acquire_skips_the_mount_chown_when_no_pv_is_configured() -> None:
-    """没配 ``workspace_pv_name`` 就根本没有挂载、``/workspace`` 也不存在
+    """没配 ``workspace_pv_name`` 就根本没有挂载、``/mnt/workspace`` 也不存在
     ——那一句 chown 只会在 envd 侧留一条无意义的失败,不发。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1561,7 +1563,7 @@ def test_image_env_matches_dockerfile() -> None:
     Dockerfile 的 ``ENV`` 是构建期声明,编排进程运行时读不到,所以
     :data:`SANDBOX_IMAGE_ENV` 只能是第二份副本。**双向**比对:少了一条 →
     云沙箱里那个变量是空的;多了一条 → 送进去一个镜像早就不再声明的值。
-    ``WORKDIR`` 同理钉住 :data:`WORKSPACE_ROOT`。
+    ``WORKDIR`` 同理钉住 :data:`NAS_MOUNT`。
 
     刻意不打 ``@pytest.mark.integration``、也刻意不 ``skip``:漂移闸在跳过
     时就等于不存在(见 sandbox-contract 工作流那次"结构性报绿"的教训),
@@ -1569,9 +1571,9 @@ def test_image_env_matches_dockerfile() -> None:
     那正该红。
 
     沙箱迁移 W2 Task 9:镜像不再声明 ``WORKDIR``(该指令本身会创建
-    ``WORKSPACE_ROOT``,与平台在这个路径建 NAS 挂载 symlink 冲突)——闸的
+    ``NAS_MOUNT``,与平台在这个路径建 NAS 挂载 symlink 冲突)——闸的
     期望改成"Dockerfile 里压根没有 WORKDIR",cwd 完全交给 exec 显式传
-    :data:`WORKSPACE_ROOT`(见 ``AgentSandboxClient.exec`` 的
+    :data:`NAS_MOUNT`(见 ``AgentSandboxClient.exec`` 的
     ``commands.run(cwd=...)``,W1 全分支终审 Important-2 已经在传)。
     """
     env, workdir = _parse_dockerfile_env_and_workdir(_dockerfile_text())
@@ -1583,19 +1585,20 @@ def test_image_env_matches_dockerfile() -> None:
     )
     assert workdir is None, (
         f"镜像不该再声明 WORKDIR(现为 {workdir!r})—— 该指令自带创建目录的"
-        f" 副作用,会跟平台在 {EXEC_VIEW} 建 NAS 挂载 symlink 冲突;"
-        " cwd 改由 exec 显式传 WORKSPACE_ROOT。"
+        f" 副作用,会跟平台在 {NAS_MOUNT} 建 NAS 挂载 symlink 冲突,也会抢先建出"
+        f" {EXEC_VIEW}(镜像不该预建它,建目录是 post-create mkdir 的职责,见"
+        " AgentSandboxClient._ensure_exec_view_dir);cwd 改由 exec 显式传 NAS_MOUNT。"
     )
 
 
-def test_image_starts_as_root_and_leaves_workspace_free() -> None:
-    """平台在 mountPath 建 symlink,且 envd 要 fork/exec 存储 helper —— 见
-    spec § 二之二(``docs/superpowers/specs/2026-08-07-sandbox-migration-w2-
-    design.md``)。"""
+def test_image_leaves_both_mount_points_bare() -> None:
+    """平台在 mountPath(B-60 起是 ``/mnt/workspace``)建 symlink,预建目录会挡住它;
+    ``/workspace`` 也不预建 —— ACS 老代码 + 预建目录同样建不上,运行期 ``mkdir -p``
+    是规则(``AgentSandboxClient._ensure_exec_view_dir``),不是过渡。"""
     text = _dockerfile_text()
     assert "\nUSER agent" not in text  # 容器必须 root 启动(agent 用户仍在,执行时降权)
-    assert "WORKDIR /workspace" not in text  # WORKDIR 指令本身会创建目录
-    assert "mkdir -p /workspace" not in text
+    assert "WORKDIR /workspace" not in text and "WORKDIR /mnt/workspace" not in text
+    assert "mkdir -p /workspace" not in text and "mkdir -p /mnt/workspace" not in text
     assert "HOME=/home/agent" in text
     assert "mkdir -p /opt/skills /opt/agents" in text
 

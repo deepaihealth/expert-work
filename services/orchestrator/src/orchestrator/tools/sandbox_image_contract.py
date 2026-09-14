@@ -16,7 +16,7 @@
 与 supervisor 的 HTTP 边界)。
 
 ``agent_sandbox`` 仍然 ``import`` 并使用它们全部,老的
-``from orchestrator.tools.agent_sandbox import WORKSPACE_ROOT`` 之类照常可用。
+``from orchestrator.tools.agent_sandbox import NAS_MOUNT`` 之类照常可用。
 """
 
 from __future__ import annotations
@@ -28,15 +28,13 @@ NAS_MOUNT = "/mnt/workspace"
 #: 每次 exec 的命名空间里看到的根(B-60):命令串里 bind 的目标、提示词与工具描述的
 #: 锚、文件工具的 ``ws``。绑了 agent 就是它自己的目录,没绑就是整个用户根。
 EXEC_VIEW = "/workspace"
-#: B-60 过渡别名 —— 调用点分批切到 NAS_MOUNT / EXEC_VIEW,Task 12 删除。
-WORKSPACE_ROOT = EXEC_VIEW
 
 #: 沙箱镜像里 ``HOME``/``MPLCONFIGDIR`` 的落点(沙箱迁移波 2 Task 9,
-#: 2026-08-07)。此前 ``HOME`` 就是 :data:`WORKSPACE_ROOT`;波 2 起该路径由
+#: 2026-08-07)。此前 ``HOME`` 就是 :data:`NAS_MOUNT`;波 2 起该路径由
 #: ACS 平台在沙箱启动时建 NAS 挂载 symlink,镜像里绝不能预先建出这个目录
 #: (``Dockerfile`` 的 ``WORKDIR``/``mkdir`` 两条都会创建目录,已删),``HOME``
 #: 因此挪到镜像里另一处早就存在、agent 用户自己拥有的路径——``useradd -m``
-#: 建的家目录。落在沙箱本地盘,不随沙箱重建持久(与 :data:`WORKSPACE_ROOT`
+#: 建的家目录。落在沙箱本地盘,不随沙箱重建持久(与 :data:`NAS_MOUNT`
 #: 的 NAS 语义不同),细节见 ``infra/sandbox-image/Dockerfile`` 头注释与
 #: ``docs/superpowers/specs/2026-08-07-sandbox-migration-w2-design.md`` § 二之二。
 SANDBOX_HOME = "/home/agent"

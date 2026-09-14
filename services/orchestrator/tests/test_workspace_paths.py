@@ -15,11 +15,9 @@ from orchestrator.tools import workspace_paths
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 from orchestrator.tools.workspace_paths import (
     SHARED_PREFIX,
-    USER_ROOT,
     WriteToSharedError,
     agent_nas_root,
     agent_view_alias,
-    agent_workspace_root,
     resolve_scope,
 )
 
@@ -80,25 +78,23 @@ def test_shared_prefix_rejects_empty_remainder() -> None:
 # 塌回用户根。穷举形状时漏掉的往往是最短的那个。
 @pytest.mark.parametrize("bad", ["../../etc", "a/b", "plan/", "", " ", "..", "."])
 def test_agent_key_that_is_not_one_path_segment_is_refused(bad: str) -> None:
-    """``agent_key`` 会被拼进 ``ws``;不是单个安全路径段就必须拒。
+    """``agent_key`` 会被拼进 ``ws``;不是单个安全路径段就必须拒 —— 空串也不例外:
 
-    空串是唯一的例外(=未绑定,走用户根),由
-    :func:`test_empty_agent_key_falls_back_to_user_root` 覆盖。
+    ``agent_nas_root`` 没有「未绑定」这个概念(那是调用方在 ``resolve_scope`` 里
+    分支的事,见 :func:`test_empty_agent_key_falls_back_to_user_root`),它的
+    契约就是「给我一个安全路径段,否则拒」。
     """
-    if bad == "":
-        assert agent_workspace_root(bad) == USER_ROOT
-        return
     with pytest.raises(ValueError):
-        agent_workspace_root(bad)
+        agent_nas_root(bad)
 
 
-def test_agent_workspace_root_accepts_sanitize_agent_key_output() -> None:
+def test_agent_nas_root_accepts_sanitize_agent_key_output() -> None:
     """真实取值必须过 —— 形状由 ``sanitize_agent_key`` 决定。"""
     from expert_work.protocol.agent_key import sanitize_agent_key
 
     for name in ("ai-health-plan", "sop2-designer", "方案 设计师", "a" * 200):
         key = sanitize_agent_key(name)
-        assert agent_workspace_root(key) == f"{USER_ROOT}/agents/{key}"
+        assert agent_nas_root(key) == f"{NAS_MOUNT}/agents/{key}"
 
 
 def test_shared_prefix_constant_is_the_documented_one() -> None:
