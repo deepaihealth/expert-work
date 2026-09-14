@@ -590,6 +590,61 @@ async def test_exec_view_shared_is_read_only(runtime: SandboxRuntime) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_exec_view_survives_a_non_directory_shared_in_the_agent_dir(
+    runtime: SandboxRuntime,
+) -> None:
+    """全分支终审 I1 —— agent 目录里已经有个叫 ``shared`` 的**普通文件**时,exec 不能死。
+
+    用户代码在视图里写 ``/workspace/shared`` 就建得出这个文件(平台工具只保留首段,
+    拦不住 ``exec_python``)。守卫加进来之前,``mkdir -p /workspace/shared`` 会撞上它、
+    ``set -eu`` 让**每一次** exec 非零退出 —— 文件工具的片段也走这条命令串,于是那个
+    agent 从产品面看彻底失能,而且用户没有任何手段删掉它。
+
+    正确行为:这一次不挂 ``shared/``,stderr 上说清楚,exec 照常跑完。隔离一字不变 ——
+    文件还是 agent 自己的,视图里读不到用户根的 ``shared/`` 内容。
+
+    顺序是刻意的:先在用户根**还没有** ``shared/`` 时用绑定 exec 把文件写出来(守卫
+    与挂载都不该发生),再造出用户根的 ``shared/``,第三次 exec 才撞上这个组合。
+    """
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c-shared-file", user_id=uuid4())
+    try:
+        planted = await runtime.exec(
+            sandbox_id=sid,
+            code="open('/workspace/shared', 'w').write('NOT_A_DIR')",
+            timeout_s=30,
+            agent_key=_KEY_A,
+        )
+        assert planted.exit_code == 0, planted.stderr
+        await runtime.exec(
+            sandbox_id=sid,
+            code="import os; os.makedirs('/workspace/shared', exist_ok=True); "
+            "open('/workspace/shared/legacy.md', 'w').write('LEGACY')",
+            timeout_s=30,
+        )
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                "import os\n"
+                "print(os.path.isfile('/workspace/shared'), open('/workspace/shared').read())\n"
+                "try:\n"
+                "    open('/workspace/shared/legacy.md').read()\n"
+                "    print('READABLE')\n"
+                "except NotADirectoryError:\n"
+                "    print('NOTDIR')\n"
+            ),
+            timeout_s=30,
+            agent_key=_KEY_A,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        assert "shared/ not mounted" in outcome.stderr, outcome.stderr
+        assert outcome.stdout.split() == ["True", "NOT_A_DIR", "NOTDIR"], outcome.stdout
+    finally:
+        await _cleanup(runtime, sid, "/workspace/shared", f"/workspace/agents/{_KEY_A}")
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_two_agents_exec_concurrently_and_see_only_themselves(
     runtime: SandboxRuntime,
 ) -> None:

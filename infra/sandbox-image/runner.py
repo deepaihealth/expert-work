@@ -60,9 +60,13 @@ if [ -n "$root" ]; then
   mkdir -p "$root"
   mount --bind "$root" /workspace
   if [ -d /mnt/workspace/shared ]; then
-    mkdir -p /workspace/shared
-    mount --bind /mnt/workspace/shared /workspace/shared
-    mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
+    if [ -L /workspace/shared ] || { [ -e /workspace/shared ] && [ ! -d /workspace/shared ]; }; then
+      echo "ew-exec-view: /workspace/shared is not a directory; shared/ not mounted" >&2
+    else
+      mkdir -p /workspace/shared
+      mount --bind /mnt/workspace/shared /workspace/shared
+      mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
+    fi
   fi
   mount -t tmpfs -o size=1k none /mnt/workspace
 else

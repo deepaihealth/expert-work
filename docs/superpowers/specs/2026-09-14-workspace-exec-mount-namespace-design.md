@@ -136,9 +136,13 @@ if [ -n "$root" ]; then
   mkdir -p "$root"
   mount --bind "$root" /workspace
   if [ -d /mnt/workspace/shared ]; then
-    mkdir -p /workspace/shared
-    mount --bind /mnt/workspace/shared /workspace/shared
-    mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
+    if [ -L /workspace/shared ] || { [ -e /workspace/shared ] && [ ! -d /workspace/shared ]; }; then
+      echo "ew-exec-view: /workspace/shared is not a directory; shared/ not mounted" >&2
+    else
+      mkdir -p /workspace/shared
+      mount --bind /mnt/workspace/shared /workspace/shared
+      mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
+    fi
   fi
   mount -t tmpfs -o size=1k none /mnt/workspace
 else
@@ -247,6 +251,14 @@ exec 已经写不到用户根,留着就是一段带着洞形状的死代码。�
 - 放行 `unshare(CLONE_NEWUSER)` 在 runc 上扩大了内核攻击面(user namespace 是历史上 CVE 高发区)。本地后端只用于 dev / CI;
   生产是 ACS microVM(内核边界在 microVM 上,沙箱里本来就没有 seccomp)。runsc 上 userns 在 sentry 里模拟,不触及宿主内核。
 - 绑了 agent 时裸 `shared/…` 相对路径在视图里撞只读 bind —— 做成保留首段(§4.2),不是静默 EROFS。
+- **残留:`agents/<key>/shared` 是非目录时,这一格没有 `shared/`。** 用户代码在视图里
+  `open('/workspace/shared','w')` 就能建出这么个普通文件(或符号链接),平台工具只保留首段、
+  拦不住 `exec_python`。脚本先查再挂:是非目录就往 stderr 写
+  `ew-exec-view: /workspace/shared is not a directory; shared/ not mounted`、跳过这三条挂载,
+  exec 照常跑完 —— 而不是让 `mkdir -p` 撞上它、`set -eu` 把这个 agent 的**每一次** exec
+  (文件工具也在内)都变成非零退出、且产品面无从恢复。隔离不变:agent 自己的文件/符号链接留在原地,
+  指向 `/mnt/workspace` 的符号链接解析进空 tmpfs,相对的那种出了视图就是断链。代价是这一格读不到
+  `shared/`,自愈手段 = 用户自己删掉那个文件。
 
 ## 六、测试
 

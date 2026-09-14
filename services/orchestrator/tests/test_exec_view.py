@@ -31,6 +31,20 @@ def test_shared_is_bound_read_only_with_locked_flags_kept() -> None:
     assert "mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared\n" in EXEC_VIEW_SCRIPT
 
 
+def test_non_directory_shared_skips_the_mount_loudly_instead_of_bricking_the_agent() -> None:
+    """全分支终审 I1 —— ``agents/<key>/shared`` 已经是普通文件或符号链接时(用户代码
+    建得出来,平台工具只保留首段),``mkdir -p`` 会失败,``set -eu`` 就把那个 agent 的
+    **每一次** exec —— 文件工具也在内 —— 整个炸掉,产品面无从恢复。守卫把这一格降级
+    成「这次不挂 shared/」,写到 stderr,exec 照常跑完。"""
+    assert (
+        "if [ -L /workspace/shared ] || "
+        "{ [ -e /workspace/shared ] && [ ! -d /workspace/shared ]; }; then\n"
+    ) in EXEC_VIEW_SCRIPT
+    assert (
+        'echo "ew-exec-view: /workspace/shared is not a directory; shared/ not mounted" >&2\n'
+    ) in EXEC_VIEW_SCRIPT
+
+
 def test_script_parses_as_posix_sh() -> None:
     proc = subprocess.run(
         ["sh", "-n"],
