@@ -81,13 +81,17 @@ agent_sandbox 档的 ``/workspace`` 是**平台建的符号链接**,指向
 绝对路径、跨 exec 持久化全部照常(各由自己的用例覆盖)。
 ``test_exec_cwd_is_workspace`` 因此比 ``(st_dev, st_ino)`` 而不是路径字符串。
 
-**B-60 之后**:云后端 exec 进了自己的命名空间,``/workspace`` 是 bind 挂载点不是
-符号链接,``getcwd()`` 报 ``/workspace``;比 inode 的写法保留,它更强。
+**B-60 之后**:云后端 exec 进了自己的命名空间,脚本以 ``cd /workspace`` 收尾——
+这发生在 ``unshare`` 出来的新 mount 命名空间里,bind 挂载(agent 目录或未绑时
+整个用户根)本身就落在 ``/workspace`` 这个真实路径上,不再经过 CSI 建的那个
+符号链接;两个后端的 ``getcwd(2)`` 因此都直接报 ``/workspace``——``/workspace``
+是 bind 挂载点,不是符号链接。比 inode 的写法保留,它更强。
 
-**留给上层的一条**:云后端上,agent 自己跑 ``os.getcwd()``(或任何打印绝对
-路径的报错)会看到 ``/run/csi/mount-root/nas/<hash>`` 而不是 ``/workspace``。
-纯观感,但 LLM 读到自己的 cwd 长这样可能会困惑;真要治得在提示词或工具输出
-层做路径回写,不在这一层。
+这也解决了下面这条顾虑——**B-60 前**:云后端上,agent 自己跑 ``os.getcwd()``
+(或任何打印绝对路径的报错)会看到 ``/run/csi/mount-root/nas/<hash>`` 而不是
+``/workspace``。纯观感,功能不受影响,但 LLM 读到自己的 cwd 长这样可能会困惑;
+当时的结论是真要治得在提示词或工具输出层做路径回写。B-60 之后这条顾虑本身就不
+再成立,不需要再做——留在这里是历史记录,不是当前行为。
 """
 
 from __future__ import annotations
