@@ -50,7 +50,7 @@ class RunnerLink(Protocol):
         timeout_s: int,
         *,
         envs: dict[str, str] | None = None,
-        cwd: str | None = None,
+        agent_root: str | None = None,
     ) -> ExecResult:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -58,10 +58,14 @@ class RunnerLink(Protocol):
         overrides merged onto the runner subprocess's environment; ``None``
         (default) → no override, pre-feature behaviour.
 
-        ``cwd`` (B-50) — per-call working directory; ``None`` (default) → the
-        runner's own cwd, pre-feature behaviour. Per-call rather than baked in
-        at acquire time for the same reason as ``envs``: one warm session is
-        reused by every agent of a ``(tenant, user)``.
+        ``agent_root`` (B-60) — the agent's directory on the NAS mount
+        (``/mnt/workspace/agents/<key>``), bind-mounted as ``/workspace``
+        inside the private mount namespace the runner creates for this one
+        exec. Per-call rather than baked in at acquire time for the same
+        reason as ``envs``: one warm session is reused by every agent of a
+        ``(tenant, user)``. ``None`` (default) → unbound: the whole user
+        root becomes the view, pre-feature behaviour. Not a cwd — the
+        child's cwd is always ``/workspace``.
         """
 
     async def close(self) -> None:
@@ -102,14 +106,14 @@ class PipeRunnerLink:
         timeout_s: int,
         *,
         envs: dict[str, str] | None = None,
-        cwd: str | None = None,
+        agent_root: str | None = None,
     ) -> ExecResult:
         async with self._lock:
             request: dict[str, object] = {"code": code, "timeout_s": timeout_s}
             if envs:
                 request["envs"] = envs
-            if cwd:
-                request["cwd"] = cwd
+            if agent_root:
+                request["agent_root"] = agent_root
             await self._write(request)
             # The supervisor's read deadline is the runner's own timeout
             # plus a grace window — a runner past it is itself hung.

@@ -86,8 +86,8 @@ class FakeRunnerLink:
         #: to each ``exec`` call, kept out of ``exec_calls`` so existing
         #: 2-tuple assertions stay unchanged.
         self.exec_envs_calls: list[dict[str, str] | None] = []
-        #: B-50 —— 每次 exec 的 cwd,与 envs 同一条通道。
-        self.exec_cwd_calls: list[str | None] = []
+        #: B-60 —— 每次 exec 的 agent_root,与 envs 同一条通道。
+        self.exec_agent_root_calls: list[str | None] = []
 
     async def wait_ready(self, timeout_s: float) -> None:
         if not self._ready:
@@ -100,11 +100,11 @@ class FakeRunnerLink:
         timeout_s: int,
         *,
         envs: dict[str, str] | None = None,
-        cwd: str | None = None,
+        agent_root: str | None = None,
     ) -> ExecResult:
         self.exec_calls.append((code, timeout_s))
         self.exec_envs_calls.append(envs)
-        self.exec_cwd_calls.append(cwd)
+        self.exec_agent_root_calls.append(agent_root)
         if self._exec_error is not None:
             raise self._exec_error
         return self._exec_result
@@ -1300,37 +1300,38 @@ async def test_exec_omits_envs_when_not_given() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_forwards_cwd_to_the_runner_link() -> None:
-    """B-50 —— ``cwd`` 走 exec 通道,理由与 ``envs`` 一字不差:一个温沙箱服务
+async def test_exec_forwards_agent_root_to_the_runner_link() -> None:
+    """B-60 —— ``agent_root`` 走 exec 通道,理由与 ``envs`` 一字不差:一个温沙箱服务
     一个 ``(tenant, user)`` 的**所有** agent,所以这个值必须能逐次变。
 
-    形状照抄托管沙箱(E2B / Daytona 的 ``cwd``、OpenAI 的 per-command ``cwd``);
-    它只决定相对路径从哪解析,不是隔离手段(spec §5.3)。
+    是 agent 在 NAS 挂载上的目录(``/mnt/workspace/agents/<key>``),runner 在自己
+    的私有 mount namespace 里把它 bind 成 ``/workspace``;不是 cwd —— 子进程的 cwd
+    永远是 ``/workspace``(spec §5.3)。
     """
     link = FakeRunnerLink()
     h = _harness(docker=RecordingDockerClient(link=link))
     response = await h.supervisor.acquire(_acquire_request())
 
     await h.supervisor.exec(
-        response.sandbox_id, code="print(1)", cwd="/workspace/agents/plan-aaaaaaaa"
+        response.sandbox_id, code="print(1)", agent_root="/mnt/workspace/agents/plan-aaaaaaaa"
     )
-    assert link.exec_cwd_calls == ["/workspace/agents/plan-aaaaaaaa"]
+    assert link.exec_agent_root_calls == ["/mnt/workspace/agents/plan-aaaaaaaa"]
 
 
 @pytest.mark.asyncio
-async def test_exec_omits_cwd_when_not_given() -> None:
+async def test_exec_omits_agent_root_when_not_given() -> None:
     """不给 = 今天的行为。旧 orchestrator 不发这个字段,必须原样跑。"""
     link = FakeRunnerLink()
     h = _harness(docker=RecordingDockerClient(link=link))
     response = await h.supervisor.acquire(_acquire_request())
 
     await h.supervisor.exec(response.sandbox_id, code="print(1)")
-    assert link.exec_cwd_calls == [None]
+    assert link.exec_agent_root_calls == [None]
 
 
 @pytest.mark.asyncio
-async def test_exec_cwd_can_differ_between_two_calls_on_one_warm_session() -> None:
-    """这条是整个改动存在的理由 —— 同一个温沙箱,两个 agent,两个 cwd。
+async def test_exec_agent_root_can_differ_between_two_calls_on_one_warm_session() -> None:
+    """这条是整个改动存在的理由 —— 同一个温沙箱,两个 agent,两个 agent_root。
 
     容器的 ``--workdir`` 建容器时就钉死了,表达不了这件事。
     """
@@ -1338,9 +1339,16 @@ async def test_exec_cwd_can_differ_between_two_calls_on_one_warm_session() -> No
     h = _harness(docker=RecordingDockerClient(link=link))
     response = await h.supervisor.acquire(_acquire_request())
 
-    await h.supervisor.exec(response.sandbox_id, code="print(1)", cwd="/workspace/agents/a")
-    await h.supervisor.exec(response.sandbox_id, code="print(2)", cwd="/workspace/agents/b")
-    assert link.exec_cwd_calls == ["/workspace/agents/a", "/workspace/agents/b"]
+    await h.supervisor.exec(
+        response.sandbox_id, code="print(1)", agent_root="/mnt/workspace/agents/a"
+    )
+    await h.supervisor.exec(
+        response.sandbox_id, code="print(2)", agent_root="/mnt/workspace/agents/b"
+    )
+    assert link.exec_agent_root_calls == [
+        "/mnt/workspace/agents/a",
+        "/mnt/workspace/agents/b",
+    ]
 
 
 @pytest.mark.asyncio

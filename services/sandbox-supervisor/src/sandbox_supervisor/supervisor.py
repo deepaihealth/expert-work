@@ -390,7 +390,7 @@ class SandboxSupervisor:
         code: str,
         timeout_s: int | None = None,
         envs: dict[str, str] | None = None,
-        cwd: str | None = None,
+        agent_root: str | None = None,
     ) -> ExecResult:
         """Run ``code`` in an acquired sandbox via its held runner link.
 
@@ -408,10 +408,12 @@ class SandboxSupervisor:
         than baked in at acquire time: two agents can share one already-warm
         session, so the value must be able to change call-to-call.
 
-        ``cwd`` (B-50) — same story, same reason: the agent-scoped workspace
-        directory is per-call because one warm session serves every agent of
-        a ``(tenant, user)``. A directory that does not exist is reported by
-        the runner as an error rather than silently ignored.
+        ``agent_root`` (B-60) — same story, same reason: the agent-scoped
+        NAS directory is per-call because one warm session serves every
+        agent of a ``(tenant, user)``. The runner binds it as ``/workspace``
+        inside a private mount namespace it creates for this one exec; a
+        mount failure is reported as an error rather than falling back to
+        the shared user root.
         """
         link = self._links.get(sandbox_id)
         if link is None:
@@ -421,7 +423,7 @@ class SandboxSupervisor:
         async with lock:
             await self._touch(sandbox_id)
             try:
-                return await link.exec(code, resolved_timeout, envs=envs, cwd=cwd)
+                return await link.exec(code, resolved_timeout, envs=envs, agent_root=agent_root)
             except RunnerLinkError as exc:
                 msg = f"sandbox exec failed: {exc}"
                 raise SupervisorError(msg) from exc
