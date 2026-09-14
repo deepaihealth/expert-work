@@ -282,7 +282,9 @@ def test_argv_mounts_a_tiny_read_only_tmpfs_as_the_exec_view_target() -> None:
     # tmpfs even on a read-only rootfs. Read-only: an exec that somehow skipped
     # its namespace hits EROFS instead of silently writing into the container.
     for vol in (None, "expert-work-ws-abc"):
-        argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1", workspace_volume=vol)
+        argv = _runc_provider().docker_run_argv(
+            image="img", container_name="sb-1", workspace_volume=vol
+        )
         tmpfs = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
         assert "/workspace:ro,size=4k" in tmpfs
 
