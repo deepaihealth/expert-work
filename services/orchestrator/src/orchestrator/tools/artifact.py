@@ -28,10 +28,10 @@ from uuid import UUID
 
 from expert_work.persistence import ArtifactStore
 from expert_work.protocol import ArtifactKind
-from orchestrator.tools.file_ops import FileOpError, build_stat_wrapper, parse_envelope
+from orchestrator.tools.file_ops import FileOpError, build_artifact_locate_wrapper, parse_envelope
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import SandboxRuntime, run_in_sandbox
-from orchestrator.tools.workspace_paths import AGENTS_DIR, agent_workspace_root
+from orchestrator.tools.workspace_paths import AGENTS_DIR, USER_ROOT, agent_workspace_root
 
 logger = logging.getLogger(__name__)
 
@@ -65,16 +65,30 @@ def _require_str(args: Mapping[str, Any], key: str, tool: str) -> str:
     return raw.strip()
 
 
-def _validate_path(path: str) -> str:
-    """Reject a non-relative or ``..``-bearing workspace path.
+def _validate_path(path: str, *, agent_key: str = "") -> str:
+    """Normalise ``path`` to an agent-relative workspace path, or reject it.
 
-    The path is later resolved against the user's workspace volume
-    (PR3 content download), so an absolute path or a ``..`` segment
-    must never reach the store.
+    Folds the two absolute spellings models produce from the tool
+    descriptions — ``/workspace/x`` and ``/workspace/agents/<own key>/x`` —
+    to ``x`` (same rule as ``file_ops._require_path``); any other absolute
+    path, a ``..`` segment, or an ``agents/`` first segment (someone else's
+    tree) is rejected. The result is later resolved against the user's
+    workspace volume by the download endpoint, so nothing unnormalised may
+    reach the store.
     """
     cleaned = path.strip()
-    if not cleaned or cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
+    if agent_key:
+        own = f"{agent_workspace_root(agent_key)}/"
+        if cleaned.startswith(own):
+            cleaned = cleaned[len(own) :]
+    if cleaned.startswith(f"{USER_ROOT}/"):
+        cleaned = cleaned[len(USER_ROOT) + 1 :]
+    parts = PurePosixPath(cleaned).parts
+    if not cleaned or cleaned.startswith("/") or ".." in parts:
         msg = f"artifact path must be a relative workspace path without '..': {path!r}"
+        raise ValueError(msg)
+    if agent_key and parts and parts[0] == AGENTS_DIR:
+        msg = f"artifact path must not address the reserved {AGENTS_DIR}/ tree: {path!r}"
         raise ValueError(msg)
     return cleaned
 
@@ -163,15 +177,17 @@ class SaveArtifactTool:
         name = _require_str(args, "name", "save_artifact")
         raw_path = args.get("path")
         path = raw_path if isinstance(raw_path, str) and raw_path.strip() else name
-        rel = _validate_path(path)
+        rel = _validate_path(path, agent_key=ctx.agent_key)
         path_in_workspace = _artifact_path(ctx.agent_key, rel)
         kind = _coerce_kind(args.get("kind"))
         thread_id = str(ctx.run_id) if ctx.run_id is not None else _FALLBACK_THREAD_ID
 
-        # 登记之前先确认文件真的在。没有这一步,agent 喊一声 save_artifact 就能
-        # 造出一条「列表里看得见、下载 404」的产物,而 run 照样报 success ——
-        # 测试环境 2026-09-14 实测到的正是这个形态(库里有行、NAS 上没文件)。
-        await self._require_file_exists(rel, ctx=ctx)
+        # 登记之前先确认文件真的在登记的那个位置。没有这一步,agent 喊一声
+        # save_artifact 就能造出一条「列表里看得见、下载 404」的产物,而 run
+        # 照样报 success —— 测试环境 2026-09-14 实测:exec_python 写了
+        # ``/workspace/x.pptx``(用户根),save_artifact 登记 ``agents/<key>/x.pptx``,
+        # 两边都「成功」,说的却不是同一个文件。落在用户根的会被认领进 agent 目录。
+        location = await self._locate_file(rel, ctx=ctx)
 
         # B-50 PR3 —— ``path_in_workspace`` 带 agent 前缀,与 ``write_file`` 的
         # 落盘位置同一个口径(PR2 时有意暂缓,见 ``_artifact_path``)。
@@ -196,28 +212,52 @@ class SaveArtifactTool:
                     "created_at": created.isoformat(),
                 }
             )
+        claimed = location == "claimed_from_user_root"
+        if claimed:
+            logger.info(
+                "save_artifact.claimed_from_user_root name=%r path=%s agent_key=%s",
+                name,
+                path_in_workspace,
+                ctx.agent_key,
+            )
+        note = (
+            " (the file was at the workspace root, outside your agent directory; it has "
+            "been moved into your agent workspace — write to relative paths next time)"
+            if claimed
+            else ""
+        )
         return ToolResult(
             content=(
-                f"Saved artifact {name!r} (kind={kind}) as version {version.version}. "
+                f"Saved artifact {name!r} (kind={kind}) as version {version.version}{note}. "
                 "The user can now download it directly from the conversation; tell them "
                 "it is ready and refer to it by name — do not fabricate a download link "
                 "or URL (the interface renders the download for them)."
             ),
-            meta={"artifact": name, "version": version.version, "kind": kind},
+            meta={
+                "artifact": name,
+                "version": version.version,
+                "kind": kind,
+                "location": location,
+            },
         )
 
-    async def _require_file_exists(self, rel: str, *, ctx: ToolContext) -> None:
-        """Stat ``rel`` under the agent's scope root; raise if it is not a file.
+    async def _locate_file(self, rel: str, *, ctx: ToolContext) -> str:
+        """Find ``rel`` where the registration row will point; claim or raise.
 
-        Same scope root the write tools use, so "the path I wrote" and "the
-        path I register" cannot diverge. The error goes back to the model as
-        a tool error it can act on — it means *you did not write that file*,
-        which is recoverable, unlike handing the user a dead artifact.
+        Looks under the agent's scope root (the same root the file tools
+        write to). A file that instead sits at the user root — where
+        ``bash`` / ``exec_python`` code lands when it writes a literal
+        ``/workspace/<name>`` — is moved into the agent root, so "the path I
+        wrote" and "the path I register" end up the same file. Anything
+        else raises a tool error the model can act on: *you did not write
+        that file*, which is recoverable, unlike handing the user a dead
+        artifact. Returns the envelope's ``location``.
         """
-        ws = agent_workspace_root(ctx.agent_key)
         outcome = await run_in_sandbox(
             self.client,
-            code=build_stat_wrapper(rel, ws=ws),
+            code=build_artifact_locate_wrapper(
+                rel, agent_ws=agent_workspace_root(ctx.agent_key), user_ws=USER_ROOT
+            ),
             timeout_s=None,
             ctx=ctx,
             tool_label="save_artifact",
@@ -225,7 +265,7 @@ class SaveArtifactTool:
         )
         env = parse_envelope(outcome, tool="save_artifact")
         if env.get("ok"):
-            return
+            return str(env.get("location", "agent"))
         error = env.get("error", "unknown")
         if error == "path_escapes_workspace":
             msg = f"save_artifact denied: {rel!r} escapes the workspace"
@@ -239,6 +279,13 @@ class SaveArtifactTool:
             raise FileOpError(msg)
         if error == "not_a_file":
             msg = f"save_artifact: {rel!r} is a directory, not a file — nothing was registered."
+            raise FileOpError(msg)
+        if error == "forbidden_scope":
+            msg = (
+                f"save_artifact: {rel!r} is not in your agent workspace and lives under "
+                f"{env.get('head', '?')}/, which belongs to another scope — nothing was "
+                "registered. Only files you wrote in your own workspace can be saved."
+            )
             raise FileOpError(msg)
         detail = env.get("detail", "")
         msg = f"save_artifact: could not stat {rel!r} ({error}{': ' + detail if detail else ''})"

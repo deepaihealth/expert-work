@@ -41,7 +41,9 @@ def _sandbox(envelope: dict[str, object] | None = None) -> RecordingSandboxRunti
     """
     client = RecordingSandboxRuntime()
     client.outcome = SandboxOutcome(
-        stdout=json.dumps(envelope if envelope is not None else {"ok": True, "size": 10}),
+        stdout=json.dumps(
+            envelope if envelope is not None else {"ok": True, "size": 10, "location": "agent"}
+        ),
         stderr="",
         exit_code=0,
         timed_out=False,
@@ -62,7 +64,12 @@ async def test_save_artifact_records_version_one() -> None:
 
     result = await tool.call({"name": "report.md", "kind": "document"}, ctx=ctx)
 
-    assert result.meta == {"artifact": "report.md", "version": 1, "kind": "document"}
+    assert result.meta == {
+        "artifact": "report.md",
+        "version": 1,
+        "kind": "document",
+        "location": "agent",
+    }
     assert "report.md" in result.content
     # B — the result tells the model the user can download it (so it references
     # the artifact by name instead of fabricating a link the UI renders for it).
@@ -219,7 +226,7 @@ async def test_save_artifact_without_recorder_is_unchanged() -> None:
     result = await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
         {"name": "a.md"}, ctx=_ctx()
     )
-    assert result.meta == {"artifact": "a.md", "version": 1, "kind": "other"}
+    assert result.meta == {"artifact": "a.md", "version": 1, "kind": "other", "location": "agent"}
 
 
 # ---------------------------------------------------------------------------
@@ -407,3 +414,87 @@ async def test_save_artifact_stats_the_explicit_path_not_the_name() -> None:
 
     code = client.execs[-1][1]
     assert "out/day10.pptx" in code
+
+
+# ---------------------------------------------------------------------------
+# 用户根上的泄漏文件要被认领进 agent 目录(exec_python 写绝对路径 /workspace/x 的形态)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_claims_a_file_left_at_the_user_root() -> None:
+    """图 1:exec_python 打出 ``OK /workspace/空白hyq….pptx``;图 2:save_artifact
+    登记 ``agents/<key>/空白hyq….pptx``。两个都「成功」,说的不是同一个文件。"""
+    store = InMemoryArtifactStore()
+    client = _sandbox({"ok": True, "size": 2468700, "location": "claimed_from_user_root"})
+    ctx = _ctx(agent_key="ai-health-plan-30817804")
+
+    result = await SaveArtifactTool(store=store, client=client).call(
+        {"name": "空白hyq.pptx", "kind": "document"}, ctx=ctx
+    )
+
+    assert result.meta["location"] == "claimed_from_user_root"
+    assert "moved into your agent workspace" in result.content
+    # 登记的路径仍是 agent 目录 —— 下载端就按这条去读,文件已经被搬到那里
+    latest = await store.get_latest_version(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=ctx.agent_key, name="空白hyq.pptx"
+    )
+    assert latest is not None
+    assert latest.path_in_workspace == "agents/ai-health-plan-30817804/空白hyq.pptx"
+    # 沙箱片段要同时拿到 agent 根与用户根,少一个就没法认领
+    code = client.execs[-1][1]
+    assert '"ws": "/workspace/agents/ai-health-plan-30817804"' in code
+    assert '"user_ws": "/workspace"' in code
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_refuses_to_claim_from_a_foreign_scope() -> None:
+    store = InMemoryArtifactStore()
+    client = _sandbox({"ok": False, "error": "forbidden_scope", "head": "agents"})
+    ctx = _ctx(agent_key="me-aaaaaaaa")
+
+    with pytest.raises(FileOpError, match="belongs to another scope"):
+        await SaveArtifactTool(store=store, client=client).call({"name": "x.md"}, ctx=ctx)
+
+    assert (
+        await store.list_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=None)
+        == []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("given", "expected_rel"),
+    [
+        ("/workspace/deck.pptx", "deck.pptx"),
+        ("/workspace/agents/me-aaaaaaaa/deck.pptx", "deck.pptx"),
+        ("/workspace/out/deck.pptx", "out/deck.pptx"),
+    ],
+)
+async def test_save_artifact_folds_absolute_paths_like_the_file_tools(
+    given: str, expected_rel: str
+) -> None:
+    """模型照着工具描述回传绝对路径 —— 与 file_ops._require_path 同一条折叠规则。"""
+    store = InMemoryArtifactStore()
+    client = _sandbox()
+    ctx = _ctx(agent_key="me-aaaaaaaa")
+
+    await SaveArtifactTool(store=store, client=client).call(
+        {"name": "deck.pptx", "path": given}, ctx=ctx
+    )
+
+    assert f'"rel": {json.dumps(expected_rel)}' in client.execs[-1][1]
+    latest = await store.get_latest_version(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=ctx.agent_key, name="deck.pptx"
+    )
+    assert latest is not None
+    assert latest.path_in_workspace == f"agents/me-aaaaaaaa/{expected_rel}"
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_rejects_another_agents_tree() -> None:
+    with pytest.raises(ValueError, match="reserved agents/ tree"):
+        await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
+            {"name": "x", "path": "agents/someone-else-bbbbbbbb/x.md"},
+            ctx=_ctx(agent_key="me-aaaaaaaa"),
+        )
