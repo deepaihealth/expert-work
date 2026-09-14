@@ -101,6 +101,8 @@ SANDBOX_AGENTS_ROOT = "/opt/agents"    # + <agent_key>
 > (exec 写 `/workspace/x.pptx` 落用户根,`save_artifact` 登记 `agents/<key>/x.pptx`,下载 404)。
 > 写入侧的边界改在**每个 exec 的挂载命名空间**里做,不改挂载点:见
 > [`2026-09-14-workspace-exec-mount-namespace-design.md`](./2026-09-14-workspace-exec-mount-namespace-design.md)。
+> **补记(B-60 PR-C 落地后)**:§5.3 的「约定」自 B-60 起成为边界:`bash` / `exec_python` 的
+> `/workspace` 就是 agent 目录(每次 exec 一个私有 mount namespace)。
 
 热沙箱按 `(tenant_id, user_id)` 复用 —— `sandbox_instance` 表**没有 agent 列**
 (`models/sandbox_instance.py:25-47`),`acquire()` 也不收 agent 参数

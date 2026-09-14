@@ -2072,6 +2072,10 @@ SELECT layout, destroy_reason, count(*)
 ```
 
 Expected: 存量 `user-root` 行带 `layout_mismatch`;新行全部 `agent-ns`;没有 `warm_reconnect_failed` 激增。
+**滚动窗口有界抖动是预期的,不是信号**(spec §零 第 11 条 / §7):2 副本默认 RollingUpdate,
+翻转 `layout` 默认值那段窗口(约 1-2 分钟)内新旧 pod 会互相把对方刚建的热会话判成
+`layout_mismatch` 重建,可能连带打断另一侧在跑的 exec —— 拍板「不改部署形状」,接受为有界抖动;
+`layout_mismatch` 计数在窗口内偏高、窗口过后(只剩一个版本)迅速回落属于正常,别当 bug 停下。
 
 - [ ] **Step 3: 探针用户复现 §一**(user `pc:proj_8f52dd4458d24ff4a3cc71af94a534c1:emp:probe-delegation`,API key 走 stdin heredoc、不进 argv、不落文件):一个 run,让 agent `exec_python` 写 `/workspace/probe-b60.pptx`,再 `save_artifact`,再下载。
   Expected:下载 200 且字节数 > 0;`save_artifact` 结果里**没有**「moved into your agent workspace」;NAS 上 `agents/<probe-key>/probe-b60.pptx` 在、用户根上**没有**同名文件(control-plane pod `ls /mnt/workspaces/<tenant>/<user>`)。
