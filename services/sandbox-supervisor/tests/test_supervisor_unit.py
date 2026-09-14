@@ -648,11 +648,12 @@ async def test_acquire_with_user_mounts_persistent_volume() -> None:
     response = await h.supervisor.acquire(_acquire_request(tenant, user_id=user))
 
     argv = h.docker.launches[0]
-    assert f"{workspace_volume_name(tenant, user)}:/workspace" in argv
+    assert f"{workspace_volume_name(tenant, user)}:/mnt/workspace" in argv
     # /workspace is a named volume (not a tmpfs); the scratch /tmp tmpfs plus
     # the W2 Task 6 skills/agents/home tmpfs (unconditional) stay.
     tmpfs_targets = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
     assert tmpfs_targets == [
+        "/workspace:ro,size=4k",
         "/tmp:rw,size=256m,mode=1777",  # noqa: S108 — mount spec literal
         "/opt/skills:rw,size=64m,uid=10000,gid=10000",
         "/opt/agents:rw,size=256m,uid=10000,gid=10000",
@@ -666,7 +667,7 @@ async def test_acquire_with_user_mounts_persistent_volume() -> None:
 
 # ---------------------------------------------------------------------------
 # W2 Task 6 follow-up — chown the persistent volume after every cold start
-# (docker resets --workdir /workspace's ownership to root:root on *every*
+# (docker resets --workdir /mnt/workspace's ownership to root:root on *every*
 # container creation, not just the volume's first mount — see
 # CliDockerClient.chown_volume's docstring for the full repro)
 # ---------------------------------------------------------------------------
