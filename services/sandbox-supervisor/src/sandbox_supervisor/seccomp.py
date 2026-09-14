@@ -22,13 +22,21 @@ class SeccompProfileError(RuntimeError):
 def validate_seccomp_profile(path: str | None) -> None:
     """Validate the pinned seccomp profile, fail-closed.
 
-    ``None`` is a no-op (the deployment opts into the host Docker default
-    profile). A non-``None`` path must point at an existing, readable file
-    whose contents parse as JSON with a ``defaultAction`` — otherwise
-    :class:`SeccompProfileError` is raised so startup aborts.
+    ``None`` is refused since B-60: every exec bind-mounts its own view inside an
+    unprivileged user namespace, and the host Docker default profile keeps
+    ``unshare``/``mount`` behind CAP_SYS_ADMIN (which the sandbox drops) — so a
+    supervisor without the pinned profile launches sandboxes whose every exec
+    fails closed on its first mount. A non-``None`` path must point at an
+    existing, readable file whose contents parse as JSON with a ``defaultAction``.
     """
     if path is None:
-        return
+        msg = (
+            "EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH is required (B-60): the host Docker "
+            "default seccomp profile denies unshare/mount without CAP_SYS_ADMIN, so every "
+            "exec would fail closed on its first bind mount. Point it at "
+            "infra/sandbox-image/seccomp-profile.json bind-mounted at the same host path."
+        )
+        raise SeccompProfileError(msg)
     profile = Path(path)
     if not profile.is_file():
         msg = f"seccomp profile not found: {path!r}"

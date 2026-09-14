@@ -20,9 +20,11 @@ _PINNED_PROFILE = _REPO_ROOT / "infra" / "sandbox-image" / "seccomp-profile.json
 # ---------- fail-closed validation ----------
 
 
-def test_none_is_noop() -> None:
-    # No configured profile → host Docker default; validation is a no-op.
-    validate_seccomp_profile(None)
+def test_none_fails_closed_since_b60() -> None:
+    # B-60:每次 exec 都要在自己的 user ns 里 mount;宿主 Docker 默认 profile 把 unshare /
+    # mount 都关在 CAP_SYS_ADMIN 后面(本机实测 EPERM),不配钉住的 profile 沙箱等于废的。
+    with pytest.raises(SeccompProfileError, match="B-60"):
+        validate_seccomp_profile(None)
 
 
 def test_valid_profile_passes(tmp_path: Path) -> None:
@@ -103,7 +105,7 @@ def test_high_risk_syscalls_not_in_allowlist(syscall: str) -> None:
     assert syscall not in _unconditional_allow(_load_pinned())
 
 
-@pytest.mark.parametrize("syscall", ["bpf", "perf_event_open", "mount", "unshare", "setns"])
+@pytest.mark.parametrize("syscall", ["bpf", "perf_event_open", "setns"])
 def test_privileged_syscalls_only_cap_gated(syscall: str) -> None:
     # Allowed only behind a CAP_* the sandbox drops (cap-drop ALL) → denied.
     profile = _load_pinned()
@@ -129,6 +131,51 @@ def test_pinned_profile_allows_core_runtime_syscalls() -> None:
     allow = _unconditional_allow(_load_pinned())
     for needed in ("read", "write", "openat", "mmap", "futex", "execve", "clone"):
         assert needed in allow, f"core syscall {needed} missing from allowlist"
+
+
+def _ungated_rules_for(profile: dict, name: str) -> list[dict]:
+    return [
+        grp
+        for grp in profile["syscalls"]
+        if name in grp["names"]
+        and grp["action"] == "SCMP_ACT_ALLOW"
+        and not grp.get("includes", {}).get("caps")
+    ]
+
+
+def test_unshare_is_allowed_only_for_user_and_mount_namespaces() -> None:
+    # B-60 —— 只放 CLONE_NEWUSER|CLONE_NEWNS(mask 掉这两位后其余必须为 0);pid/net/ipc/
+    # uts/cgroup namespace 仍然拒。
+    rules = _ungated_rules_for(_load_pinned(), "unshare")
+    assert len(rules) == 1
+    assert rules[0]["names"] == ["unshare"]
+    assert rules[0]["args"] == [
+        {"index": 0, "value": 4026400767, "valueTwo": 0, "op": "SCMP_CMP_MASKED_EQ"}
+    ]
+    assert 4026400767 == 0xFFFFFFFF & ~(0x00020000 | 0x10000000)  # ~(NEWNS | NEWUSER)
+
+
+def test_mount_and_the_new_mount_api_are_allowed_without_caps() -> None:
+    # util-linux 2.41 走 open_tree/move_mount/fsopen…;默认 ERRNO 回 EPERM 不是 ENOSYS,
+    # libmount 不回落经典 mount(2)(本机实测 "permission denied")。
+    allow = _unconditional_allow(_load_pinned())
+    for name in (
+        "mount",
+        "open_tree",
+        "move_mount",
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "fspick",
+        "mount_setattr",
+    ):
+        assert name in allow, name
+
+
+def test_umount_setns_pivot_root_stay_cap_gated() -> None:
+    allow = _unconditional_allow(_load_pinned())
+    for name in ("umount2", "setns", "pivot_root"):
+        assert name not in allow, name
 
 
 # ---------------------------------------------------------------------------

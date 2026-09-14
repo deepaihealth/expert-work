@@ -107,6 +107,13 @@ _STUB_PROXY = "expert-work-test-proxy"
 _STUB_IMAGE = "public.ecr.aws/docker/library/python:3.12-alpine"
 #: ``infra/sandbox-image/`` — the Dockerfile's build context.
 _IMAGE_CONTEXT = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image"
+#: B-60 — the pinned seccomp profile is a hard prerequisite for the local
+#: backend (``validate_seccomp_profile(None)`` now raises); the acceptance
+#: suite launches real sandboxes, so it must pin the same profile the
+#: supervisor requires in dev/prod.
+_SECCOMP_PROFILE = (
+    Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "seccomp-profile.json"
+)
 
 
 def _docker(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -268,6 +275,7 @@ def expert_work() -> _Harness:
         runtime_provider=SandboxRuntimeProvider(
             oci_runtime=_OCI_RUNTIME,
             egress_network=_NETWORK,
+            seccomp_profile_path=str(_SECCOMP_PROFILE),
             # HX-10-F1: resolve the proxy via /etc/hosts (the production
             # addressing path), not docker embedded DNS — works under both
             # runc and runsc (gVisor netstack has no embedded DNS).
@@ -716,7 +724,11 @@ async def test_warm_pool_claim_exec_release() -> None:
     settings = SandboxSupervisorSettings(
         sandbox_image=_IMAGE, oci_runtime=_OCI_RUNTIME, pool_size=1
     )
-    runtime = SandboxRuntimeProvider(oci_runtime=_OCI_RUNTIME, egress_network=_NETWORK)
+    runtime = SandboxRuntimeProvider(
+        oci_runtime=_OCI_RUNTIME,
+        egress_network=_NETWORK,
+        seccomp_profile_path=str(_SECCOMP_PROFILE),
+    )
     pool = SandboxPool()
     supervisor = SandboxSupervisor(
         store=store,  # type: ignore[arg-type]  # structural SandboxStore
