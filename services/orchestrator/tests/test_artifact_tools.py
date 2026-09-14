@@ -424,7 +424,7 @@ async def test_save_artifact_stats_the_explicit_path_not_the_name() -> None:
 
 @pytest.mark.asyncio
 async def test_save_artifact_refuses_the_reserved_shared_segment() -> None:
-    with pytest.raises(ValueError, match="shared"):
+    with pytest.raises(ValueError, match="reserved"):
         await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
             {"name": "x", "path": "shared/x.md"}, ctx=_ctx(agent_key="me-aaaaaaaa")
         )

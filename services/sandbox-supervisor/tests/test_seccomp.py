@@ -173,9 +173,19 @@ def test_mount_and_the_new_mount_api_are_allowed_without_caps() -> None:
 
 
 def test_umount_setns_pivot_root_stay_cap_gated() -> None:
-    allow = _unconditional_allow(_load_pinned())
+    profile = _load_pinned()
+    allow = _unconditional_allow(profile)
     for name in ("umount2", "setns", "pivot_root"):
         assert name not in allow, name
+    # 「不在无 cap 组里」本身两种情形都满足:确实门控着,或者整条规则被删光了 ——
+    # 后者也一样绿,而它意味着 profile 掉了一大块。所以正面钉住门控的那两条真在
+    # cap 组里,再钉 pivot_root 是第三种情形:任何组里都没有,靠默认 ERRNO 拒。
+    gated = _cap_gated_allow(profile)
+    for name in ("umount2", "setns"):
+        assert name in gated, name
+    assert not any("pivot_root" in grp["names"] for grp in profile["syscalls"]), (
+        "pivot_root 出现在了 profile 的某个组里 —— 它本该一条规则都没有"
+    )
 
 
 # ---------------------------------------------------------------------------

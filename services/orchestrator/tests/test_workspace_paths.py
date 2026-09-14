@@ -72,6 +72,14 @@ def test_shared_prefix_rejects_empty_remainder() -> None:
         resolve_scope("shared:", agent_key="plan-aaaaaaaa", tool="read_file")
 
 
+def test_bad_agent_key_is_refused_even_though_it_no_longer_shapes_the_path() -> None:
+    """B-60 之后 ``resolve_scope`` 的返回值不再含 ``agent_key`` —— 它只剩裸一句
+    ``agent_view_alias(agent_key)`` 在做校验。没有这条用例,把那一句删掉整个文件照样绿,
+    而坏 key 会一路走到下游(``_require_path`` 的折叠、``save_artifact``)才被发现。"""
+    with pytest.raises(ValueError):
+        resolve_scope("x", agent_key="..", tool="read_file")
+
+
 # ``..`` / ``.`` **单独**列出来不是凑数:原来这张表里每一项都带分隔符或是
 # 空白,于是「一段裸的 ``..``」从来没被试过 —— 而它恰恰能过那条正则
 # (两个点都在字符集里),``{root}/agents/..`` 就是 ``{root}``,agent 作用域

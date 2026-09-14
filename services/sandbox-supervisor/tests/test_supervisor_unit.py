@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from expert_work.common.egress_token import verify_egress_token
 from expert_work.persistence import InMemoryUserWorkspaceStore, workspace_volume_name
@@ -52,7 +53,7 @@ from sandbox_supervisor.pool import (
 from sandbox_supervisor.quota_enforcer import QuotaEnforcer
 from sandbox_supervisor.reaper import SandboxReaper
 from sandbox_supervisor.runner_link import ExecResult, RunnerLinkError
-from sandbox_supervisor.schemas import AcquireRequest, SeedFile
+from sandbox_supervisor.schemas import AcquireRequest, ExecRequest, SeedFile
 from sandbox_supervisor.settings import SandboxSupervisorSettings
 from sandbox_supervisor.supervisor import (
     _MAX_ARTIFACT_BYTES,
@@ -1349,6 +1350,35 @@ async def test_exec_agent_root_can_differ_between_two_calls_on_one_warm_session(
         "/mnt/workspace/agents/a",
         "/mnt/workspace/agents/b",
     ]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "/mnt/workspace",
+        "/mnt/workspace/",
+        "/mnt/workspace/shared",
+        "/mnt/workspace/agents/../../etc",
+        "/workspace/agents/a",
+        "/etc/passwd",
+    ],
+)
+def test_exec_request_refuses_an_agent_root_outside_the_agents_tree(bad: str) -> None:
+    """B-60 全分支终审 M2 —— ``agent_root`` 是 runner 直接拿去 bind 的**挂载源**,是这套
+    HTTP API 上唯一一个命名宿主可见路径的字段。`/mnt/workspace` 本身会把整个用户根交给一个
+    绑了 agent 的 exec(正是本特性要消灭的形态),带 `..` 的段直接走出挂载点。
+
+    今天唯一的调用方是 orchestrator 的 ``agent_nas_root()``,但「调用方很规矩」不是边界 ——
+    边界在这里,所以校验也写在这里,坏值 422。"""
+    with pytest.raises(ValidationError):
+        ExecRequest(code="print(1)", agent_root=bad)
+
+
+def test_exec_request_accepts_the_orchestrator_agent_root_and_omission() -> None:
+    root = "/mnt/workspace/agents/plan-aaaaaaaa"
+    assert ExecRequest(code="print(1)", agent_root=root).agent_root == root
+    assert ExecRequest(code="print(1)").agent_root is None
 
 
 @pytest.mark.asyncio

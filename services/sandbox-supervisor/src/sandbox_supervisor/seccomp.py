@@ -34,7 +34,8 @@ def validate_seccomp_profile(path: str | None) -> None:
             "EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH is required (B-60): the host Docker "
             "default seccomp profile denies unshare/mount without CAP_SYS_ADMIN, so every "
             "exec would fail closed on its first bind mount. Point it at "
-            "infra/sandbox-image/seccomp-profile.json bind-mounted at the same host path."
+            "infra/sandbox-image/seccomp-profile.json readable inside the supervisor "
+            "container (compose mounts it read-only at /etc/expert-work/seccomp-profile.json)."
         )
         raise SeccompProfileError(msg)
     profile = Path(path)

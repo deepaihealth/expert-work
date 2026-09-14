@@ -1614,10 +1614,17 @@ def test_image_leaves_both_mount_points_bare() -> None:
         if not statement.startswith("RUN "):
             continue
         tokens = shlex.split(statement[len("RUN ") :])
-        assert "/workspace" not in tokens and "/mnt/workspace" not in tokens, (
-            f"某条 RUN 指令预建了 /workspace 或 /mnt/workspace(会挡住平台的 NAS 挂载"
-            f" symlink 与 post-create mkdir):{statement!r}"
-        )
+        for token in tokens:
+            # 两个挂载点自身要拒,它们**底下**的任何路径同样要拒:`mkdir -p
+            # /workspace/sub` 会把 /workspace 一起建出来,而按精确相等比对的写法
+            # 放它过去 —— 挡住 symlink 的副作用一模一样(全分支终审 M6)。
+            assert token not in ("/workspace", "/mnt/workspace") and not token.startswith(
+                ("/workspace/", "/mnt/workspace/")
+            ), (
+                f"某条 RUN 指令预建了 /workspace 或 /mnt/workspace(或其下的路径,建子目录"
+                f" 会把父目录一起建出来,同样挡住平台的 NAS 挂载 symlink 与 post-create"
+                f" mkdir):{statement!r}"
+            )
     assert "HOME=/home/agent" in text
     assert "mkdir -p /opt/skills /opt/agents" in text
 

@@ -10,7 +10,12 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+#: B-60 —— ``ExecRequest.agent_root`` 唯一合法的前缀。与 orchestrator 的
+#: ``workspace_paths.agent_nas_root()`` 拼出来的形状同义,但这里刻意是自己的字面量:
+#: supervisor 不 import orchestrator,而这道闸要挡的正是「送进来的不是那个函数拼的」。
+_AGENT_ROOT_PREFIX = "/mnt/workspace/agents/"
 
 
 class SeedFile(BaseModel):
@@ -101,6 +106,28 @@ class ExecRequest(BaseModel):
     #: whole user root becomes ``/workspace`` (pre-feature view). Not a cwd — the
     #: child's cwd is always ``/workspace``.
     agent_root: str | None = None
+
+    @field_validator("agent_root")
+    @classmethod
+    def _agent_root_is_an_agent_dir_on_the_nas_mount(cls, value: str | None) -> str | None:
+        """422 anything that is not ``/mnt/workspace/agents/<…>`` without ``..``.
+
+        The value is a *mount source* the runner binds as ``/workspace`` inside the
+        exec's namespace — the one field on this API that names a host-visible path.
+        The orchestrator only ever sends ``agent_nas_root()`` output, but "the only
+        caller is well-behaved" is not a boundary: validate at the boundary
+        (``/`` or ``/mnt/workspace`` itself would hand a bound exec the whole user
+        root, and a ``..`` segment walks out of the mount entirely).
+        """
+        if value is None:
+            return None
+        if not value.startswith(_AGENT_ROOT_PREFIX):
+            msg = f"agent_root must start with {_AGENT_ROOT_PREFIX!r}: {value!r}"
+            raise ValueError(msg)
+        if ".." in value.split("/"):
+            msg = f"agent_root must not contain a '..' segment: {value!r}"
+            raise ValueError(msg)
+        return value
 
 
 class ExecResponse(BaseModel):
