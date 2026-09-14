@@ -2013,7 +2013,9 @@ async def test_acquire_reuses_a_warm_session_with_the_same_layout() -> None:
 
     assert new_id == old_id
     assert len(sdk.created) == 1
-    assert all(reason != _LAYOUT_MISMATCH_DESTROY_REASON for _, reason in store.mark_destroyed_calls)
+    assert all(
+        reason != _LAYOUT_MISMATCH_DESTROY_REASON for _, reason in store.mark_destroyed_calls
+    )
 
 
 @pytest.mark.asyncio

@@ -605,7 +605,8 @@ class AgentSandboxClient:
                 rebuild_reason = _WARM_AGE_DESTROY_REASON
             if rebuild_reason is not None:
                 logger.info(
-                    "warm sandbox %s not reusable (%s; layout=%s wanted=%s; age cap %ss), rebuilding",
+                    "warm sandbox %s not reusable (%s; layout=%s wanted=%s; age cap %ss),"
+                    " rebuilding",
                     winner_id,
                     rebuild_reason,
                     winner_layout,
