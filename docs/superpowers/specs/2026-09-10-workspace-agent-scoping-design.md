@@ -96,6 +96,12 @@ SANDBOX_AGENTS_ROOT = "/opt/agents"    # + <agent_key>
 
 ## 三、约束:挂载点不能按 agent 分
 
+> **2026-09-14 补记(B-60)**:本节结论仍成立 —— 挂载仍按 `(tenant, user)` 一整个用户根。
+> 但 §5.3「bash / exec_python 是约定」在 2026-09-14 被平台自己的主产物路径打穿
+> (exec 写 `/workspace/x.pptx` 落用户根,`save_artifact` 登记 `agents/<key>/x.pptx`,下载 404)。
+> 写入侧的边界改在**每个 exec 的挂载命名空间**里做,不改挂载点:见
+> [`2026-09-14-workspace-exec-mount-namespace-design.md`](./2026-09-14-workspace-exec-mount-namespace-design.md)。
+
 热沙箱按 `(tenant_id, user_id)` 复用 —— `sandbox_instance` 表**没有 agent 列**
 (`models/sandbox_instance.py:25-47`),`acquire()` 也不收 agent 参数
 (`agent_sandbox.py:545-553`,且 `del thread_id`)。**一个沙箱同时服务该用户的所有 agent**,
