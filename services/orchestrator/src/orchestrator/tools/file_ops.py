@@ -58,11 +58,11 @@ from orchestrator.tools.sandbox import (
     SandboxRuntime,
     run_in_sandbox,
 )
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.workspace_paths import (
     AGENTS_DIR,
     SHARED_PREFIX,
-    USER_ROOT,
-    agent_workspace_root,
+    agent_view_alias,
     resolve_scope,
 )
 
@@ -71,10 +71,10 @@ _SHARED_DIR_NAME = SHARED_PREFIX.rstrip(":")
 
 #: Workspace mount inside the sandbox (see infra/sandbox-image).
 #:
-#: B-50 —— **不自己写字面量**:``workspace_paths.USER_ROOT`` 是唯一真源。迁移期
-#: 读回落的目标就是这个值,两处各写一份字面量时改一处漏一处是静默的(回落打去
-#: 一个不存在的根,只表现为「读不到」)。
-_WORKSPACE_ROOT = USER_ROOT
+#: B-60 —— 视图根,唯一真源是 ``sandbox_image_contract.EXEC_VIEW``:绑了 agent 时
+#: ``/workspace`` 就是 agent 目录,没绑时是整个用户根 —— 两种情况片段的 ``ws``
+#: 参数都是这同一个值。
+_WORKSPACE_ROOT = EXEC_VIEW
 #: Largest file ``read_file`` will pull into the sandbox (whole file is hashed
 #: for TE-9 CAS, so the read can't be capped to the returned slice). Bigger
 #: files should use the dedicated ``read_workspace_file`` download path.
@@ -131,15 +131,15 @@ def _require_path(
     # 这一段,下面的通用 ``/workspace/`` 折叠会留下 ``agents/<自己>/x``,再拼一次
     # agent 根就成了 ``agents/<自己>/agents/<自己>/x``。
     if not prefix and agent_key:
-        own = f"{agent_workspace_root(agent_key)}/"
+        own = f"{agent_view_alias(agent_key)}/"
         if cleaned == own.rstrip("/"):
             cleaned = "."
         elif cleaned.startswith(own):
             cleaned = cleaned[len(own) :]
-    if cleaned in ("/workspace", "/workspace/"):
+    if cleaned in (EXEC_VIEW, EXEC_VIEW + "/"):
         cleaned = "."
-    elif cleaned.startswith("/workspace/"):
-        cleaned = cleaned[len("/workspace/") :]
+    elif cleaned.startswith(EXEC_VIEW + "/"):
+        cleaned = cleaned[len(EXEC_VIEW) + 1 :]
     if cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
         msg = f"{tool} path must be a relative workspace path without '..': {raw!r}"
         raise ValueError(msg)
@@ -147,12 +147,22 @@ def _require_path(
     # 不拒的话迁移期读回落正好把 ``agents/<别人的 key>/x`` 办成一次合法的跨 agent
     # 读:自己根下找不到 → 回落用户根 → 不偏不倚命中别人的目录。这正是 B-50 要
     # 关掉的那扇门,不能在开门的同一个 PR 里自己留一条缝。
-    if agent_key and PurePosixPath(cleaned).parts[:1] == (AGENTS_DIR,):
-        msg = (
-            f"{tool} path must be relative to your own workspace; "
-            f"{AGENTS_DIR!r} is a reserved layout segment: {raw!r}"
-        )
-        raise ValueError(msg)
+    # B-60 —— ``shared/`` 同样保留:视图里 /workspace/shared 是只读 bind(spec §4.3),裸
+    # 相对路径写进去是 EROFS、读则读到 legacy 区。要读就显式 ``shared:``,写一律不许。
+    if agent_key and not prefix:
+        head = PurePosixPath(cleaned).parts[:1]
+        if head == (AGENTS_DIR,):
+            msg = (
+                f"{tool} path must be relative to your own workspace; "
+                f"{AGENTS_DIR!r} is a reserved layout segment: {raw!r}"
+            )
+            raise ValueError(msg)
+        if head == (_SHARED_DIR_NAME,):
+            msg = (
+                f"{tool}: {_SHARED_DIR_NAME!r} is the read-only shared area — read it with "
+                f"the {SHARED_PREFIX!r} prefix; it is not a directory in your workspace: {raw!r}"
+            )
+            raise ValueError(msg)
     return prefix + cleaned
 
 
@@ -424,39 +434,14 @@ print(json.dumps(_main()))
 _ARTIFACT_LOCATE_MAIN = """
 
 def _main():
-    agent_full = _resolve(_P["rel"])
-    if agent_full is None:
+    full = _resolve(_P["rel"])
+    if full is None:
         return {"ok": False, "error": "path_escapes_workspace"}
-    if os.path.isdir(agent_full):
+    if os.path.isdir(full):
         return {"ok": False, "error": "not_a_file"}
-    if os.path.isfile(agent_full):
-        return {"ok": True, "size": os.path.getsize(agent_full), "location": "agent"}
-    user_ws = os.path.realpath(_P["user_ws"])
-    if user_ws == _WS:
+    if not os.path.isfile(full):
         return {"ok": False, "error": "not_found"}
-    # bash / exec_python 里的任意代码写绝对路径 /workspace/x 会落在用户根
-    # (spec §5.3:那两个工具是约定不是边界)。在这里把它认领回 agent 目录 ——
-    # 只认根一级的文件;agents/<别人>/ 与 shared/ 里的东西不是本 agent 的。
-    try:
-        user_full = os.path.realpath(os.path.join(user_ws, _P["rel"]))
-    except (ValueError, OSError):
-        return {"ok": False, "error": "not_found"}
-    if not user_full.startswith(user_ws + os.sep):
-        return {"ok": False, "error": "not_found"}
-    head = os.path.relpath(user_full, user_ws).split(os.sep, 1)[0]
-    if head in (_P["agents_dir"], _P["shared_dir"]):
-        return {"ok": False, "error": "forbidden_scope", "head": head}
-    if os.path.isdir(user_full):
-        return {"ok": False, "error": "not_a_file"}
-    if not os.path.isfile(user_full):
-        return {"ok": False, "error": "not_found"}
-    try:
-        os.makedirs(os.path.dirname(agent_full) or _WS, exist_ok=True)
-        os.replace(user_full, agent_full)
-        size = os.path.getsize(agent_full)
-    except OSError as exc:
-        return {"ok": False, "error": "io_error", "detail": str(exc)}
-    return {"ok": True, "size": size, "location": "claimed_from_user_root"}
+    return {"ok": True, "size": os.path.getsize(full)}
 
 
 print(json.dumps(_main()))
@@ -487,31 +472,15 @@ def build_list_wrapper(
     return _snippet({"ws": ws, "rel": rel, "max_entries": max_entries}, _LIST_MAIN)
 
 
-def build_artifact_locate_wrapper(rel: str, *, agent_ws: str, user_ws: str) -> str:
-    """Snippet ``save_artifact`` runs before registering ``rel``.
+def build_artifact_locate_wrapper(rel: str, *, ws: str = _WORKSPACE_ROOT) -> str:
+    """Snippet ``save_artifact`` runs before registering ``rel``: stat it under ``ws``.
 
-    Looks under the agent root first; if the file is not there but sits at the
-    **user root** (the place ``bash`` / ``exec_python`` code lands when it
-    writes a literal ``/workspace/<name>`` — spec §5.3 calls those two tools a
-    convention, not a boundary) it is **moved** into the agent root with
-    ``os.replace`` (same filesystem — the migration script's primitive) and
-    then reported. Only root-level files are claimable: anything under
-    ``agents/`` or ``shared/`` belongs to someone else by construction.
-
-    Envelope: ``{"ok": True, "size": N, "location": "agent" |
-    "claimed_from_user_root"}`` or ``{"ok": False, "error": "not_found" |
-    "not_a_file" | "forbidden_scope" | "path_escapes_workspace" | "io_error"}``.
+    B-60 —— only looks inside the exec view. The #1551 "claim from the user root"
+    branch is gone with the hole it papered over: exec code cannot write to the
+    user root any more (spec §4.8). Envelope: ``{"ok": True, "size": N}`` or
+    ``{"ok": False, "error": "not_found" | "not_a_file" | "path_escapes_workspace"}``.
     """
-    return _snippet(
-        {
-            "ws": agent_ws,
-            "user_ws": user_ws,
-            "rel": rel,
-            "agents_dir": AGENTS_DIR,
-            "shared_dir": _SHARED_DIR_NAME,
-        },
-        _ARTIFACT_LOCATE_MAIN,
-    )
+    return _snippet({"ws": ws, "rel": rel}, _ARTIFACT_LOCATE_MAIN)
 
 
 def build_edit_wrapper(

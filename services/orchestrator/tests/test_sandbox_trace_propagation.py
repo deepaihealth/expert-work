@@ -206,11 +206,12 @@ async def test_exec_omits_envs_when_agent_key_unset() -> None:
     assert "envs" not in body  # back-compat: no key when there's nothing to inject
 
 
-async def test_exec_sends_agent_scoped_cwd() -> None:
-    """B-50 —— ``cwd`` 与 ``envs`` 走同一条 exec 通道。
+async def test_exec_sends_agent_scoped_agent_root() -> None:
+    """B-60 —— ``agent_root`` 与 ``envs`` 走同一条 exec 通道。
 
-    容器的 ``--workdir`` 是建容器时钉死的,而温沙箱按 ``(tenant, user)`` 复用,
-    一个容器里跑着这个用户所有 agent 的 exec —— per-container 表达不了 per-agent。
+    温沙箱按 ``(tenant, user)`` 复用,一个容器里跑着这个用户所有 agent 的 exec ——
+    per-container 表达不了 per-agent。runner 在每次 exec 自己的 mount namespace
+    里把这个 NAS 路径 bind 成 /workspace(spec §4.3)。
     """
     import json as _json
 
@@ -227,11 +228,11 @@ async def test_exec_sends_agent_scoped_cwd() -> None:
     )
     await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5, agent_key="my-agent")
 
-    assert body["cwd"] == "/workspace/agents/my-agent"
+    assert body["agent_root"] == "/mnt/workspace/agents/my-agent"
 
 
-async def test_exec_omits_cwd_when_agent_key_unset() -> None:
-    """未绑 agent 不发这个字段 —— 旧 supervisor 收到也照常跑(向后兼容)。"""
+async def test_exec_omits_agent_root_when_agent_key_unset() -> None:
+    """未绑 agent 不发这个字段 —— runner 收不到就 bind 整个用户根。"""
     import json as _json
 
     body: dict[str, object] = {}
@@ -247,7 +248,7 @@ async def test_exec_omits_cwd_when_agent_key_unset() -> None:
     )
     await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5)
 
-    assert "cwd" not in body
+    assert "agent_root" not in body
 
 
 async def test_workspace_list_parses_files_and_traces(tracing_setup: None) -> None:

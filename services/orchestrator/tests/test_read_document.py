@@ -201,11 +201,13 @@ class _SequenceRuntime(RecordingSandboxRuntime):
 
 
 async def test_read_document_resolves_under_agent_root() -> None:
+    """B-60 —— 「agent 根」现在就是视图根:绑了 agent 时 ``ws`` 是 ``/workspace``,
+    不再拼 ``agents/<key>``。"""
     client = _client(json.dumps({"ok": True, "content": "x", "format": "pdf"}))
     await ReadDocumentTool(client=client).call(
         {"path": "报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
     )
-    assert '"ws": "/workspace/agents/plan-aaaaaaaa",' in client.execs[-1][1]
+    assert '"ws": "/workspace",' in client.execs[-1][1]
 
 
 async def test_read_document_never_reaches_the_user_root() -> None:
@@ -226,7 +228,7 @@ async def test_read_document_never_reaches_the_user_root() -> None:
             {"path": "报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
         )
     assert len(client.execs) == 1, "回落被加回来了:多跑了一次 exec"
-    assert '"ws": "/workspace/agents/plan-aaaaaaaa",' in client.execs[0][1]
+    assert '"ws": "/workspace",' in client.execs[0][1]
 
 
 async def test_read_document_refuses_another_agents_path() -> None:

@@ -41,9 +41,7 @@ def _sandbox(envelope: dict[str, object] | None = None) -> RecordingSandboxRunti
     """
     client = RecordingSandboxRuntime()
     client.outcome = SandboxOutcome(
-        stdout=json.dumps(
-            envelope if envelope is not None else {"ok": True, "size": 10, "location": "agent"}
-        ),
+        stdout=json.dumps(envelope if envelope is not None else {"ok": True, "size": 10}),
         stderr="",
         exit_code=0,
         timed_out=False,
@@ -68,7 +66,6 @@ async def test_save_artifact_records_version_one() -> None:
         "artifact": "report.md",
         "version": 1,
         "kind": "document",
-        "location": "agent",
     }
     assert "report.md" in result.content
     # B — the result tells the model the user can download it (so it references
@@ -226,7 +223,7 @@ async def test_save_artifact_without_recorder_is_unchanged() -> None:
     result = await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
         {"name": "a.md"}, ctx=_ctx()
     )
-    assert result.meta == {"artifact": "a.md", "version": 1, "kind": "other", "location": "agent"}
+    assert result.meta == {"artifact": "a.md", "version": 1, "kind": "other"}
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +397,7 @@ async def test_save_artifact_stats_under_the_agent_scope_root() -> None:
     )
 
     code = client.execs[-1][1]
-    assert "/workspace/agents/ai-health-plan-30817804" in code
+    assert '"ws": "/workspace"' in code
     assert "deck.pptx" in code
 
 
@@ -417,49 +414,26 @@ async def test_save_artifact_stats_the_explicit_path_not_the_name() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 用户根上的泄漏文件要被认领进 agent 目录(exec_python 写绝对路径 /workspace/x 的形态)
+# B-60 —— 拆 #1551 的认领分支:exec 已经写不到用户根,「认领」是带着洞形状的死代码
+# (spec §4.8)。save_artifact 现在只 stat 视图,不搬文件、结果也不再带 location。
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_save_artifact_claims_a_file_left_at_the_user_root() -> None:
-    """图 1:exec_python 打出 ``OK /workspace/空白hyq….pptx``;图 2:save_artifact
-    登记 ``agents/<key>/空白hyq….pptx``。两个都「成功」,说的不是同一个文件。"""
-    store = InMemoryArtifactStore()
-    client = _sandbox({"ok": True, "size": 2468700, "location": "claimed_from_user_root"})
-    ctx = _ctx(agent_key="ai-health-plan-30817804")
-
-    result = await SaveArtifactTool(store=store, client=client).call(
-        {"name": "空白hyq.pptx", "kind": "document"}, ctx=ctx
-    )
-
-    assert result.meta["location"] == "claimed_from_user_root"
-    assert "moved into your agent workspace" in result.content
-    # 登记的路径仍是 agent 目录 —— 下载端就按这条去读,文件已经被搬到那里
-    latest = await store.get_latest_version(
-        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=ctx.agent_key, name="空白hyq.pptx"
-    )
-    assert latest is not None
-    assert latest.path_in_workspace == "agents/ai-health-plan-30817804/空白hyq.pptx"
-    # 沙箱片段要同时拿到 agent 根与用户根,少一个就没法认领
-    code = client.execs[-1][1]
-    assert '"ws": "/workspace/agents/ai-health-plan-30817804"' in code
-    assert '"user_ws": "/workspace"' in code
+async def test_save_artifact_refuses_the_reserved_shared_segment() -> None:
+    with pytest.raises(ValueError, match="shared"):
+        await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
+            {"name": "x", "path": "shared/x.md"}, ctx=_ctx(agent_key="me-aaaaaaaa")
+        )
 
 
 @pytest.mark.asyncio
-async def test_save_artifact_refuses_to_claim_from_a_foreign_scope() -> None:
-    store = InMemoryArtifactStore()
-    client = _sandbox({"ok": False, "error": "forbidden_scope", "head": "agents"})
-    ctx = _ctx(agent_key="me-aaaaaaaa")
-
-    with pytest.raises(FileOpError, match="belongs to another scope"):
-        await SaveArtifactTool(store=store, client=client).call({"name": "x.md"}, ctx=ctx)
-
-    assert (
-        await store.list_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=None)
-        == []
+async def test_save_artifact_result_has_no_claim_note_or_location() -> None:
+    result = await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
+        {"name": "a.md"}, ctx=_ctx(agent_key="me-aaaaaaaa")
     )
+    assert "moved into your agent workspace" not in result.content
+    assert "location" not in result.meta
 
 
 @pytest.mark.asyncio

@@ -121,5 +121,9 @@ def resolve_scope(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:
         if not rel or rel.startswith("/") or ".." in PurePosixPath(rel).parts:
             msg = f"{tool} path must be relative and free of '..': {path!r}"
             raise ValueError(msg)
-        return f"{USER_ROOT}/{_SHARED_DIR}", rel
-    return agent_workspace_root(agent_key), raw
+        return f"{EXEC_VIEW}/{_SHARED_DIR}", rel
+    # B-60 —— 绑不绑都是视图根:文件工具的片段与用户代码在同一个命名空间里,绑了
+    # agent 时 /workspace 就是 agent 目录。agent_key 仍校验(不可信输入,坏 key 早点炸)。
+    if agent_key:
+        agent_view_alias(agent_key)
+    return EXEC_VIEW, raw

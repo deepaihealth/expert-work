@@ -24,10 +24,11 @@ from orchestrator.tools.workspace_paths import (
 )
 
 
-def test_bare_path_resolves_under_agent_root() -> None:
+def test_bare_path_resolves_to_the_exec_view() -> None:
+    """B-60 —— 文件工具的片段与用户代码在同一个命名空间里,看同一个视图:
+    绑了 agent 时 /workspace **就是** agent 目录,ws 不再拼 agents/<key>。"""
     ws, rel = resolve_scope("MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file")
-    assert ws == "/workspace/agents/plan-aaaaaaaa"
-    assert rel == "MEMORY.md"
+    assert (ws, rel) == (EXEC_VIEW, "MEMORY.md")
 
 
 def test_shared_prefix_resolves_to_shared_root() -> None:
@@ -41,7 +42,7 @@ def test_shared_prefix_resolves_to_shared_root() -> None:
 def test_empty_agent_key_falls_back_to_user_root() -> None:
     """迁移期回落:没绑 agent 时读写用户根,与今天行为一致。"""
     ws, rel = resolve_scope("MEMORY.md", agent_key="", tool="read_file")
-    assert ws == USER_ROOT == "/workspace"
+    assert ws == EXEC_VIEW
     assert rel == "MEMORY.md"
 
 
@@ -131,7 +132,7 @@ def test_shared_prefix_always_names_the_shared_dir() -> None:
     assert workspace_paths.SHARED_PREFIX == f"{WORKSPACE_SHARED_DIR}:"
     assert workspace_paths.resolve_scope(
         f"{WORKSPACE_SHARED_DIR}:MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file"
-    ) == (f"{workspace_paths.USER_ROOT}/{WORKSPACE_SHARED_DIR}", "MEMORY.md")
+    ) == (f"{EXEC_VIEW}/{WORKSPACE_SHARED_DIR}", "MEMORY.md")
 
 
 def test_agent_nas_root_points_under_the_nas_mount() -> None:

@@ -37,7 +37,7 @@ from expert_work.common.observability import inject_context
 from expert_work.persistence import SANDBOX_AGENTS_ROOT
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
-from orchestrator.tools.workspace_paths import USER_ROOT, agent_workspace_root
+from orchestrator.tools.workspace_paths import agent_nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -291,13 +291,12 @@ class HTTPSupervisorRuntime:
         envs = agent_key_envs(agent_key)
         if envs:
             payload["envs"] = envs
-        # B-50 —— per-exec cwd,与 ``envs`` 同一条通道、同一个理由:温沙箱按
-        # ``(tenant, user)`` 复用,容器的 ``--workdir`` 是建容器时钉死的,表达
-        # 不了 per-agent。两个后端都调 ``agent_workspace_root`` 这一个函数,取值
-        # 逐字一致(``test_sandbox_runtime_contract.py`` 钉这件事)。
-        cwd = agent_workspace_root(agent_key)
-        if cwd != USER_ROOT:
-            payload["cwd"] = cwd
+        # B-60 —— 绑了 agent 时把它在 NAS 上的真实目录发给 supervisor,runner 在每次 exec
+        # 自己的 mount ns 里把它 bind 成 /workspace(spec §4.3)。未绑不发:runner 收不到
+        # 就 bind 整个用户根。两个后端都调 agent_nas_root 这一个函数,取值逐字一致
+        # (``test_sandbox_runtime_contract.py`` 钉这件事)。
+        if agent_key:
+            payload["agent_root"] = agent_nas_root(agent_key)
         # The sandbox enforces the exec wall-clock (it SIGKILLs + returns
         # ``timed_out``); the HTTP read timeout must OUTLAST that enforcement so
         # the orchestrator receives the real outcome instead of giving up early
