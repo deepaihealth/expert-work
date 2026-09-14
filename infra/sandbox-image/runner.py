@@ -82,6 +82,39 @@ exec "$@"
 Response = dict[str, str | int | bool]
 
 
+def _exec_argv(code: str, agent_root: str | None) -> list[str]:
+    """The child process argv: the B-60 namespace wrapper around ``python -c code``.
+
+    Split out of :func:`run_once` so the runner's own unit tests can swap it for a
+    plain ``python -c`` argv — ``unshare -Urm`` needs user namespaces and the
+    script needs ``/mnt/workspace``, neither of which exists on a CI host or a
+    developer's macOS. The contract gate
+    ``test_sandbox_runtime_contract.test_exec_view_script_matches_the_sandbox_image``
+    finds this list literal by ``ast`` and pins it against the orchestrator's copy.
+    """
+    return [
+        "unshare",
+        "-Urm",
+        "--propagation",
+        "private",
+        "--",
+        "sh",
+        "-c",
+        _EXEC_VIEW_SCRIPT,
+        "ew-exec-view",
+        agent_root or "",
+        # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
+        # site out of sys.path and silently breaks `pip install --user`
+        # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
+        # isolation; -P keeps the script dir / cwd off sys.path.
+        sys.executable,
+        "-E",
+        "-P",
+        "-c",
+        code,
+    ]
+
+
 def run_once(
     code: str,
     timeout_s: int,
@@ -108,27 +141,7 @@ def run_once(
     """
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
     child_env = {**os.environ, **envs} if envs else None
-    argv = [
-        "unshare",
-        "-Urm",
-        "--propagation",
-        "private",
-        "--",
-        "sh",
-        "-c",
-        _EXEC_VIEW_SCRIPT,
-        "ew-exec-view",
-        agent_root or "",
-        # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
-        # site out of sys.path and silently breaks `pip install --user`
-        # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
-        # isolation; -P keeps the script dir / cwd off sys.path.
-        sys.executable,
-        "-E",
-        "-P",
-        "-c",
-        code,
-    ]
+    argv = _exec_argv(code, agent_root)
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
             argv,
