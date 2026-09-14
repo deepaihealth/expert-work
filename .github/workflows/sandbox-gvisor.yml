@@ -58,7 +58,15 @@ jobs:
     # ci.yml 里的同一段实证)，再加 16 条 gVisor 用例就一定撞线。
     # 实测:2026-09-10 / 09-12 main 自己两次撞 20 分钟被 cancel，09-13 #1486
     # 那次 16 条用例一条都没跑到(collected 之后 19m51s 全在 docker-buildx)。
-    timeout-minutes: 30
+    #
+    # 30 → 45(同日,补 30 分钟那次漏掉的一边)。30 分钟约等于**一次冷建本身**
+    # ——#1486 rebase 到含 #1540 的 main 之后实测 `Build sandbox image` 花
+    # **29m27s**，套件只剩 22 秒就被砍。冷建不是异常路径:**改完 apt 层之后
+    # 的第一批 PR 必然是冷的**(写这份新层缓存的是 main 的 push 那一跑，它还没
+    # 跑完时，PR 就只能全建)。给 30 分钟等于没有余量。
+    #
+    # 与 ci.yml 的 integration job 40→60 是同一条理由的两边，一起看。
+    timeout-minutes: 45
     # Shared-runner Docker is bursty and gVisor setup is new here; do not gate
     # PRs on it yet (mirrors the main integration job). Tighten once stable.
     continue-on-error: true
