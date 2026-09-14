@@ -37,9 +37,13 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
 
 ## 1. 前置（建议发布前一天做完）
 
-- [ ] **本机接线还在**：`~/.kube/expert-work-prod.yaml`、
-      `~/.kube/expert-work-prod-secrets.env`、`~/.kube/expert-work-prod-params.env`
-      三个文件都在且权限 600
+- [x] **本机接线还在**（2026-09-14 查过，只看存在与权限，没读内容）：
+
+      | 文件 | 权限 | 大小 |
+      |---|---|---|
+      | `~/.kube/expert-work-prod.yaml` | 600 | 6358 B |
+      | `~/.kube/expert-work-prod-secrets.env` | 600 | 2833 B |
+      | `~/.kube/expert-work-prod-params.env` | 600 | 1203 B |
 - [x] **金丝雀已 seed** —— 2026-09-13 在生产只读确认：`release-canary` 有会话行，
       它的工作区里 `canary-check.txt` 在。
       （**未 seed 时 smoke 阶段 6 会 WARNING 跳过**，等于这次发布没有真栈闸门；
@@ -72,7 +76,7 @@ migrate Job = `alembic upgrade head`）→ rollout + smoke**。
       > **所以 19:00 还卡在 C 与 B2 之间的话，不要硬推 B2**：
       > 停在 B1（回落还在，用户侧照常，见 §4），等第二天早上再走。
       > 「停在 B1」是设计好的安全位，不是失败。
-- [ ] **不需要通知对接方** —— 2026-09-12 跨会话对齐时已拍板三条：默认
+- [x] **不需要通知对接方** —— 2026-09-12 跨会话对齐时已拍板三条：默认
       `scope=agent` 不改、34 个孤儿产物不出清单不认领、「搬迁前工作区列表近乎空」
       那个窗口**对外零影响**（他们是 run 结束按 end 帧清单一次性收割 → 落自己 OSS →
       之后走自己直链，两个 workspace 端点一次都没调过）。
