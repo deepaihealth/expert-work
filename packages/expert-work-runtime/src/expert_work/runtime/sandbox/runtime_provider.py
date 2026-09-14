@@ -179,7 +179,10 @@ class SandboxRuntimeProvider:
 
     oci_runtime: SandboxOciRuntime
     egress_network: str = DEFAULT_EGRESS_NETWORK
-    #: Stream HX-10 — host-visible path to a pinned seccomp profile JSON.
+    #: Stream HX-10 — path to a pinned seccomp profile JSON, read **client-side**
+    #: by the docker CLI (inlined into HostConfig before the daemon ever sees
+    #: it, verified 2026-09-14) — the path only needs to exist inside the
+    #: supervisor container, not on the host.
     #: ``None`` emits no ``--security-opt seccomp`` flag (the container then
     #: rides the host Docker daemon's built-in default profile — fine for
     #: dev, but version-drifting). A path pins our own profile

@@ -679,7 +679,6 @@ def test_specs_metadata() -> None:
 # 带上尾随逗号:``_PARAMS`` 是 ``json.dumps`` 的产物,``"ws": "/workspace"``
 # 本身是 ``"ws": "/workspace/agents/…"`` 的**子串** —— 不钉逗号的话「断言落在
 # 用户根」这件事恒真,测试看着在咬其实没咬。
-_AGENT_WS = '"ws": "/workspace/agents/plan-aaaaaaaa",'
 _USER_WS = '"ws": "/workspace",'
 _SHARED_WS = '"ws": "/workspace/shared",'
 #: B-60 —— 绑了 agent 时 ``ws`` 不再拼 ``agents/<key>``,片段看的就是视图根。值与

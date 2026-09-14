@@ -247,7 +247,7 @@ def _workspace_subpath(
     ``{root}/{tenant_id}/{user_id}`` 布局同一份 subPath 语义(spec § 三)。
 
     ``user_id`` 为 None(临时沙箱,spec 决策 9)—— 镜像不再预建
-    ``/workspace``(Task 9),不挂就没有这个目录、cwd 与文件工具全踩空;
+    ``NAS_MOUNT``(Task 9),不挂就没有这个目录、cwd 与文件工具全踩空;
     落 ``{prefix}/_scratch/{sandbox_id}``,每次调用用一个全新的 ``sandbox_id``
     (``uuid4()``),天然不与任何用户或其它临时沙箱撞名。``_scratch`` 不需要
     是 ``WORKSPACE_RESERVED_PREFIXES`` 的成员——它在 NAS 数据根下与租户目录
@@ -333,7 +333,7 @@ class AgentSandboxClient:
     #: 沙箱迁移波 2 —— NAS 工作区挂载的三项配置,dataclass 层面全部默认
     #: None/"",让直接构造这个类的单测不必每次都摆全三项;**生产装配点
     #: ``build_sandbox_runtime`` 会强制要求前两项**(波 2 终审 Important-2:
-    #: Task 9 之后镜像不再预建 ``/workspace``,少配 ``workspace_pv_name`` 或
+    #: Task 9 之后镜像不再预建 ``NAS_MOUNT``,少配 ``workspace_pv_name`` 或
     #: ``workspace_root`` 不再等价于"波 1 行为",而是每次工具调用都炸在 envd
     #: 层 —— 见 ``runtime.py`` 那段 ``missing`` 列表的注释)。这里不重复那道
     #: 校验:三个 Settings 字段本就同源,拆成三个字段是为了每个职责单一。
@@ -366,8 +366,8 @@ class AgentSandboxClient:
     #: 的落点 ``{root}/{tenant}/.deleted/{user}`` —— **不在**用户子树里,
     #: 见该模块 docstring 与全分支终审 Critical-1)。这是
     #: control-plane 进程能直接 ``os.mkdir``/``os.chmod`` 到的本地路径,不是
-    #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
-    #: ``/workspace``)是两个不同维度的常量,不要混淆。
+    #: 沙箱内路径 —— 与 :data:`NAS_MOUNT`(沙箱内挂载点,恒为
+    #: ``/mnt/workspace``)是两个不同维度的常量,不要混淆。
     workspace_root: str | None = None
     #: B-60 —— 本进程给热会话铺的沙箱内布局;写进每一行,``acquire`` 拿到不同值的热会话
     #: 就 ``layout_mismatch`` 重建。PR-C 起本进程铺的就是 ``agent-ns``——exec 命令串
@@ -404,7 +404,7 @@ class AgentSandboxClient:
                 "when workspace_pv_name is configured — NasWorkspaceStore "
                 "has no concept of a subpath prefix (its layout is always "
                 "{root}/{tenant_id}/{user_id}), so a non-empty prefix here "
-                "would mount the sandbox's /workspace at a NAS path "
+                "would mount the sandbox's /mnt/workspace at a NAS path "
                 "NasWorkspaceStore never reads or writes: a silent, "
                 "hard-to-diagnose split between what the sandbox sees and "
                 "what the workspace-browse/upload/download endpoints see."
@@ -705,7 +705,7 @@ class AgentSandboxClient:
             for relpath, data in seed_files:
                 # sandbox migration wave 2 (spec § 四) — skills live on sandbox-
                 # local disk under SANDBOX_SKILLS_ROOT, not the user's NAS-backed
-                # WORKSPACE_ROOT; relpath is already namespaced under
+                # NAS_MOUNT; relpath is already namespaced under
                 # <agent_key>/ by the caller (build_skill_seed_files).
                 await sbx.files.write(
                     f"{SANDBOX_SKILLS_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER
@@ -832,9 +832,9 @@ class AgentSandboxClient:
         临时沙箱(``user_id`` 为 None)—— 没有软删概念(临时沙箱没有持久
         身份可被软删),只需要 mkdir + chmod 它自己的 scratch 子树
         (``_scratch/<sandbox_id>``)。**取舍**(brief 明确留给实现判断的
-        一点):镜像不再预建 ``/workspace``(Task 9)之后,scratch 子树跟用户
+        一点):镜像不再预建 ``NAS_MOUNT``(Task 9)之后,scratch 子树跟用户
         子树一样是 NAS 上全新的目录,权限跟用户子树同一套——不放开权限的话临时沙箱
-        的 ``/workspace`` 同样会撞 ``Permission denied``,这不是"要不要顺带
+        的 ``NAS_MOUNT`` 同样会撞 ``Permission denied``,这不是"要不要顺带
         修"的问题,是同一个真因(spec § 二之二)在另一个 subPath 下的必然
         重现。让两个分支共用同一个 :meth:`_ensure_workspace_dir`,而不是只
         给用户分支修,是本任务对这道取舍的结论。
@@ -877,7 +877,7 @@ class AgentSandboxClient:
         写/路径穿越防护机器。
 
         **marker 不在 ``{tenant}/{user}`` 子树里**(全分支终审 Critical-1):
-        那棵树整个经 ``subPath`` 挂进沙箱的 ``/workspace``,沙箱里的 agent
+        那棵树整个经 ``subPath`` 挂进沙箱的 ``NAS_MOUNT``,沙箱里的 agent
         直接写一个同名文件就能让这道闸永久拒掉该用户——这道闸读的是
         ``{root}/{tenant}/.deleted/{user}``,与用户目录平级,任何 subPath 都
         挂不到,见该函数与 ``nas_workspace_store`` 模块 docstring。
@@ -1441,13 +1441,18 @@ class AgentSandboxClient:
         (spec § 6.1),不是延续 runner.py 的写法——副作用是 ``-c`` 模式下
         ``__file__`` 不存在、文件模式下存在,测试钉住这条差异。
 
-        全分支终审 Important-2:``commands.run`` 显式传 ``cwd=NAS_MOUNT``(B-60 起
-        传的是 NAS 挂载点,不再是 ``/workspace`` 本身——见下方 exec_view 一段)。
-        envd 派生的进程不继承镜像的 ``WORKDIR``,不传则落在 ``/home/agent``
-        (2026-08-04 集群实测)—— ``bash`` 工具的 LLM 可见描述写着"Runs in
-        /workspace",而 LLM 代码里的 ``open('out.csv','w')`` 这类相对路径写
-        出的文件会落到 ``file_ops``(只认绝对 ``/workspace/...``)看不见的地
-        方。配套的镜像环境变量见 :data:`SANDBOX_IMAGE_ENV`。
+        全分支终审 Important-2:``commands.run`` 显式传 ``cwd=NAS_MOUNT`` ——
+        **不是**为了给 LLM 代码定 cwd(那件事由 ``build_exec_command`` 生成的
+        脚本自己 ``cd`` 到 ``EXEC_VIEW`` 完成,进的是它自己的 mount namespace,
+        见下方 exec_view 一段),而是因为 E2B SDK 在真正跑命令前会校验传入的
+        ``cwd`` 已经存在 —— ``NAS_MOUNT`` 在 create() 时就已经挂载好,
+        ``EXEC_VIEW``(``/workspace``)只在进了命名空间之后才由脚本自己 bind
+        出来,create 阶段传它会被 SDK 拒绝。envd 派生的进程不继承镜像的
+        ``WORKDIR``,``cwd`` 不传则落在 ``/home/agent``(2026-08-04 集群实测)。
+        ``bash`` 工具的 LLM 可见描述写着"Runs in /workspace"——这是脚本 ``cd``
+        之后 LLM 代码实际看到的目录,``open('out.csv','w')`` 这类相对路径写出
+        的文件落在这里才会被 ``file_ops``(只认绝对 ``/workspace/...``)看见。
+        配套的镜像环境变量见 :data:`SANDBOX_IMAGE_ENV`。
 
         独立审查 Important-2:``_attach(sandbox_id, touch_last_used=True)``
         在拿句柄的同一次往返里把这一行的 ``last_used_at`` 推进到当前
