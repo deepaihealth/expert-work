@@ -67,11 +67,13 @@ from e2b import CommandExitException, TimeoutException
 from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
+    SANDBOX_LAYOUT_USER_ROOT,
     InMemorySandboxInstanceStore,
     _missing_row_message,
 )
 from orchestrator.tools import agent_sandbox as agent_sandbox_module
 from orchestrator.tools.agent_sandbox import (
+    _LAYOUT_MISMATCH_DESTROY_REASON,
     _SANDBOX_TIMEOUT_S,
     _WARM_AGE_DESTROY_REASON,
     DEFAULT_TIMEOUT_S,
@@ -268,12 +270,12 @@ class FakeInstanceStore:
     quota_limit: int | None = None
 
     async def claim_warm(
-        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str, datetime | None] | None:
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID, layout: str
+    ) -> tuple[UUID, str, datetime | None, str] | None:
         """占坑成功返 None;已被别人占且赢家已就绪返
-        ``(赢家 sandbox_id, container_id, acquired_at)``;赢家还在创建中则
-        raise。``acquired_at`` 供 #1b 的年龄封顶测试直接改写
-        ``self.rows[winner_id]["acquired_at"]`` 摆前置状态。"""
+        ``(赢家 sandbox_id, container_id, acquired_at, layout)``;赢家还在创建中则
+        raise。``acquired_at`` / ``layout`` 供测试直接改写
+        ``self.rows[winner_id][...]`` 摆前置状态(年龄封顶 / 布局不合)。"""
         key = (tenant_id, user_id)
         winner_id = self.warm.get(key)
         if winner_id is None:
@@ -282,19 +284,21 @@ class FakeInstanceStore:
                 "tenant_id": tenant_id,
                 "user_id": user_id,
                 "acquired_at": datetime.now(UTC),
+                "layout": layout,
             }
             return None
-        container_id = self.rows[winner_id].get("container_id")
+        row = self.rows[winner_id]
+        container_id = row.get("container_id")
         if container_id:
-            return (winner_id, container_id, self.rows[winner_id].get("acquired_at"))
+            return (winner_id, container_id, row.get("acquired_at"), row["layout"])
         msg = f"a sandbox is already being created for tenant={tenant_id} user={user_id}"
         raise RuntimeError(msg)
 
-    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID, layout: str) -> None:
         """Task 10 契约测试实测发现的缺口(完整理由见生产代码
         ``SandboxInstanceStore.create_ephemeral`` 的 docstring)—— 给不带
         ``user_id`` 的 acquire 建一行,不进 ``warm`` 字典(不参与 CAS)。"""
-        self.rows[sandbox_id] = {"tenant_id": tenant_id, "user_id": None}
+        self.rows[sandbox_id] = {"tenant_id": tenant_id, "user_id": None, "layout": layout}
 
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         if self.set_container_id_fails:
@@ -602,7 +606,9 @@ async def test_claim_warm_not_ready_surfaces_as_sandbox_supervisor_error() -> No
 
     # 第一路直接对 store 占坑、不让它走到 set_container_id —— 精确模拟
     # "赢家还在创建中"这个状态,不依赖 acquire() 的完整流程凑巧卡在那。
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+    )
 
     with pytest.raises(SandboxSupervisorError, match="already being created"):
         await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
@@ -1423,9 +1429,11 @@ async def test_acquire_rejects_when_workspace_deleted_appears_after_claim_warm(
     real_claim_warm = store.claim_warm
 
     async def _claim_then_plant_marker(
-        *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str, object] | None:
-        result = await real_claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+        *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID, layout: str
+    ) -> tuple[UUID, str, object, str] | None:
+        result = await real_claim_warm(
+            tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=layout
+        )
         # 模拟并发 mark_deleted 恰好在 claim_warm 提交之后写下 marker。
         _plant_marker(tmp_path, tenant_id, user_id)
         return result
@@ -1713,9 +1721,11 @@ async def test_unwind_after_a_takeover_leaves_the_new_owners_row_alone() -> None
         "B 的行必须仍然出现在 list_active 里 —— 否则周期 reaper 永远收不走它那个还活着的 microVM"
     )
     # 槽位仍归 B:下一次 acquire 应当复用 B,而不是发现槽位空了又建一个。
-    claim_result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    claim_result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert claim_result is not None
-    b_winner_id, b_container_id, b_acquired_at = claim_result
+    b_winner_id, b_container_id, b_acquired_at, _b_layout = claim_result
     assert (b_winner_id, b_container_id) == (b_id, "sbx-B")
     assert b_acquired_at is not None
 
@@ -1964,6 +1974,61 @@ async def test_acquire_never_age_caps_null_acquired_at() -> None:
 
 
 # ---------------------------------------------------------------------------
+# B-60 —— acquire 的布局闸:热会话行的 sandbox_instance.layout 与本进程的
+# AgentSandboxClient.layout 不一致时必须重建,走与年龄封顶同一条路径。本 PR
+# 里 client.layout 恒为 SANDBOX_LAYOUT_USER_ROOT、所有行也都是这个值,闸永
+# 远不触发——这几条测试直接改写 store 行的 layout 来构造"不一致"这个此刻
+# 生产环境里还不可达的前置状态。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_a_warm_session_built_with_another_layout() -> None:
+    """B-60 spec §4.6 —— 旧布局的热会话(NAS 还挂在 /workspace)在新命令串下第一条
+    bind 就会失败;与其让每次 exec 都 fail-closed,不如在 acquire 就换代。走的是与
+    年龄封顶同一条重建路径,destroy_reason 不同。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[old_id]["layout"] = "some-older-layout"
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id, "布局不合必须重建,不能复用旧 sandbox_id"
+    assert (old_id, _LAYOUT_MISMATCH_DESTROY_REASON) in store.mark_destroyed_calls
+    assert len(sdk.created) == 2, "必须真的重建(第二次 sdk.create),不是复用"
+    assert store.rows[new_id]["layout"] == client.layout
+
+
+@pytest.mark.asyncio
+async def test_acquire_reuses_a_warm_session_with_the_same_layout() -> None:
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id == old_id
+    assert len(sdk.created) == 1
+    assert all(reason != _LAYOUT_MISMATCH_DESTROY_REASON for _, reason in store.mark_destroyed_calls)
+
+
+@pytest.mark.asyncio
+async def test_acquire_records_the_clients_layout_on_warm_and_ephemeral_rows() -> None:
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+
+    warm_id = await client.acquire(tenant_id=uuid4(), thread_id="t1", user_id=uuid4())
+    ephemeral_id = await client.acquire(tenant_id=uuid4(), thread_id="t2")
+
+    assert store.rows[warm_id]["layout"] == client.layout
+    assert store.rows[ephemeral_id]["layout"] == client.layout
+
+
+# ---------------------------------------------------------------------------
 # Task 9 —— AgentSandboxClient.reap:以 sandbox_instance 表为准,不问 SDK
 # 账号级的 list()(见类 docstring "Task 9 对 brief 草稿的偏离"一节)。
 # ---------------------------------------------------------------------------
@@ -2092,7 +2157,13 @@ async def test_reap_force_clears_orphaned_stuck_creating_row() -> None:
     # 直接对 store 占坑、不让它走到 set_container_id —— 精确模拟"死在两次
     # 写之间",不依赖 acquire() 的完整流程凑巧卡在那。
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
     store.stuck_creating_sandbox_ids.add(sandbox_id)
 
@@ -2114,7 +2185,13 @@ async def test_reap_without_force_ignores_stuck_creating_rows() -> None:
     client = make_client(sdk, store)
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
     store.stuck_creating_sandbox_ids.add(sandbox_id)
 
@@ -2292,7 +2369,9 @@ async def test_acquire_rejects_when_tenant_quota_exhausted() -> None:
     client = make_client(sdk, store)
     tenant_id = uuid4()
     for _ in range(client.default_max_sandboxes):
-        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+        await store.create_ephemeral(
+            tenant_id=tenant_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+        )
 
     with pytest.raises(SandboxSupervisorError, match="quota"):
         await client.acquire(tenant_id=tenant_id, thread_id="t1")
@@ -2315,7 +2394,9 @@ async def test_acquire_warm_reuse_skips_quota_check() -> None:
 
     first_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
     for _ in range(client.default_max_sandboxes + 5):
-        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+        await store.create_ephemeral(
+            tenant_id=tenant_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+        )
 
     second_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
 
@@ -2333,13 +2414,17 @@ async def test_acquire_respects_tenant_quota_row_over_default() -> None:
     store.quota_limit = 2
 
     tenant_id = uuid4()
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+    await store.create_ephemeral(
+        tenant_id=tenant_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t1")
     assert sandbox_id in store.rows
 
     other_tenant_id = uuid4()
     for _ in range(2):
-        await store.create_ephemeral(tenant_id=other_tenant_id, sandbox_id=uuid4())
+        await store.create_ephemeral(
+            tenant_id=other_tenant_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+        )
     with pytest.raises(SandboxSupervisorError, match="quota"):
         await client.acquire(tenant_id=other_tenant_id, thread_id="t2")
 
@@ -2362,7 +2447,9 @@ async def test_acquire_rebuilds_over_age_warm_session_at_quota_limit() -> None:
 
     old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
     for _ in range(client.default_max_sandboxes - 1):
-        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+        await store.create_ephemeral(
+            tenant_id=tenant_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+        )
     assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
     store.rows[old_id]["acquired_at"] = datetime.now(UTC) - timedelta(
         seconds=client._max_warm_age_s() + 60
@@ -2390,7 +2477,9 @@ async def test_acquire_rebuilds_reconnect_failed_warm_session_at_quota_limit() -
 
     old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
     for _ in range(client.default_max_sandboxes - 1):
-        await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=uuid4())
+        await store.create_ephemeral(
+            tenant_id=tenant_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+        )
     assert await store.count_active_for_tenant(tenant_id=tenant_id) == client.default_max_sandboxes
     sdk.connect_fails = True
 
