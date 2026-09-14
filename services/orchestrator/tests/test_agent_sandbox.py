@@ -1026,11 +1026,11 @@ async def test_exec_sets_owner_only_umask_before_running_the_script() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_passes_the_nas_mount_as_cwd() -> None:
-    """不传 ``cwd`` 时 envd 把进程扔在 ``/home/agent``:E2B 在真正跑命令前会校验
-    传入的 ``cwd`` 已经存在,``NAS_MOUNT`` 是唯一保证 create 时就已挂载的路径 ——
-    ``EXEC_VIEW``(``/workspace``)要等命名空间脚本自己 bind 出来,传它会被 SDK
-    拒绝。不传 ``cwd`` 的话,LLM 写的相对路径文件会落到 ``file_ops``(只认绝对
-    ``/workspace/...``)看不见的地方。
+    """不传 ``cwd`` 时 envd 把进程扔在 ``/home/agent``:E2B 在真正执行命令前会
+    校验传入的 ``cwd`` 已经存在,``NAS_MOUNT`` 在 create() 时就已经挂载好、不在
+    任何一次 exec 的私有命名空间之内,始终存在 —— ``EXEC_VIEW``(``/workspace``)
+    要等命名空间脚本自己 bind 出来,在那之前不存在。不传 ``cwd`` 的话,LLM 写的
+    相对路径文件会落到 ``file_ops``(只认绝对 ``/workspace/...``)看不见的地方。
     """
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1524,8 +1524,8 @@ def _dockerfile_text() -> str:
     return dockerfile.read_text(encoding="utf-8")
 
 
-def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | None]:
-    """从 Dockerfile 文本里抽出最终的 ``ENV`` 集合与最后一条 ``WORKDIR``。
+def _dockerfile_statements(text: str) -> list[str]:
+    """把 Dockerfile 文本拆成逻辑指令列表。
 
     处理反斜杠续行,以及续行块内部的注释行(``ENV`` 那段真的有一段
     ``# Read-only rootfs at runtime: ...`` 夹在中间)。
@@ -1543,10 +1543,14 @@ def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | 
             continue
         statements.append((pending + line).strip())
         pending = ""
+    return statements
 
+
+def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | None]:
+    """从 Dockerfile 文本里抽出最终的 ``ENV`` 集合与最后一条 ``WORKDIR``。"""
     env: dict[str, str] = {}
     workdir: str | None = None
-    for statement in statements:
+    for statement in _dockerfile_statements(text):
         if statement.startswith("ENV "):
             for token in shlex.split(statement[len("ENV ") :]):
                 key, _, value = token.partition("=")
@@ -1594,11 +1598,26 @@ def test_image_env_matches_dockerfile() -> None:
 def test_image_leaves_both_mount_points_bare() -> None:
     """平台在 mountPath(B-60 起是 ``/mnt/workspace``)建 symlink,预建目录会挡住它;
     ``/workspace`` 也不预建 —— ACS 老代码 + 预建目录同样建不上,运行期 ``mkdir -p``
-    是规则(``AgentSandboxClient._ensure_exec_view_dir``),不是过渡。"""
+    是规则(``AgentSandboxClient._ensure_exec_view_dir``),不是过渡。
+
+    ``mkdir`` 半边按 ``RUN`` 指令逐条 ``shlex`` 分词比对,不是子串匹配 ——
+    子串 ``"mkdir -p /workspace"`` 只咬得住恰好长这个形状的写法,``RUN mkdir -p
+    /opt/skills /opt/agents /workspace``、``RUN mkdir /workspace``、
+    ``RUN install -d /workspace`` 这几种同样会预建目录的写法都能从子串检查里
+    溜走(见 task-12 review round 1)。``WORKDIR`` 半边已经被
+    ``test_image_env_matches_dockerfile`` 的语句解析器双向钉住,这里维持原样。
+    """
     text = _dockerfile_text()
     assert "\nUSER agent" not in text  # 容器必须 root 启动(agent 用户仍在,执行时降权)
     assert "WORKDIR /workspace" not in text and "WORKDIR /mnt/workspace" not in text
-    assert "mkdir -p /workspace" not in text and "mkdir -p /mnt/workspace" not in text
+    for statement in _dockerfile_statements(text):
+        if not statement.startswith("RUN "):
+            continue
+        tokens = shlex.split(statement[len("RUN ") :])
+        assert "/workspace" not in tokens and "/mnt/workspace" not in tokens, (
+            f"某条 RUN 指令预建了 /workspace 或 /mnt/workspace(会挡住平台的 NAS 挂载"
+            f" symlink 与 post-create mkdir):{statement!r}"
+        )
     assert "HOME=/home/agent" in text
     assert "mkdir -p /opt/skills /opt/agents" in text
 

@@ -1444,11 +1444,12 @@ class AgentSandboxClient:
         全分支终审 Important-2:``commands.run`` 显式传 ``cwd=NAS_MOUNT`` ——
         **不是**为了给 LLM 代码定 cwd(那件事由 ``build_exec_command`` 生成的
         脚本自己 ``cd`` 到 ``EXEC_VIEW`` 完成,进的是它自己的 mount namespace,
-        见下方 exec_view 一段),而是因为 E2B SDK 在真正跑命令前会校验传入的
-        ``cwd`` 已经存在 —— ``NAS_MOUNT`` 在 create() 时就已经挂载好,
-        ``EXEC_VIEW``(``/workspace``)只在进了命名空间之后才由脚本自己 bind
-        出来,create 阶段传它会被 SDK 拒绝。envd 派生的进程不继承镜像的
-        ``WORKDIR``,``cwd`` 不传则落在 ``/home/agent``(2026-08-04 集群实测)。
+        见下方 exec_view 一段),而是因为 E2B 在真正执行命令前会校验传入的
+        ``cwd`` 已经存在 —— ``NAS_MOUNT`` 在 create() 时就已经挂载好、不在
+        任何一次 exec 的私有命名空间之内,始终存在;``EXEC_VIEW``
+        (``/workspace``)只在进了命名空间之后才由脚本自己 bind 出来,在那
+        之前不存在。envd 派生的进程不继承镜像的 ``WORKDIR``,``cwd`` 不传
+        则落在 ``/home/agent``(2026-08-04 集群实测)。
         ``bash`` 工具的 LLM 可见描述写着"Runs in /workspace"——这是脚本 ``cd``
         之后 LLM 代码实际看到的目录,``open('out.csv','w')`` 这类相对路径写出
         的文件落在这里才会被 ``file_ops``(只认绝对 ``/workspace/...``)看见。
