@@ -212,15 +212,18 @@ class SandboxRuntimeProvider:
         """Return the full ``docker run`` argv for the sandbox.
 
         The argv carries the Mini-ADR F-5 runtime hardening: read-only
-        rootfs, a writable ``/workspace`` mount + an ephemeral scratch
-        ``/tmp`` tmpfs, all capabilities dropped, ``no-new-privileges``,
-        and PID / memory / CPU caps.
+        rootfs, a writable ``SANDBOX_NAS_MOUNT`` (``/mnt/workspace``) mount
+        + an ephemeral scratch ``/tmp`` tmpfs, all capabilities dropped,
+        ``no-new-privileges``, and PID / memory / CPU caps. ``SANDBOX_EXEC_VIEW``
+        (``/workspace``) is a separate, unconditional, read-only 4k tmpfs —
+        the bind target a later per-exec mount namespace binds over — present
+        regardless of ``workspace_volume``.
         ``--interactive`` keeps stdin open for the runner's line-JSON
         protocol; the image is the final argument.
 
-        ``workspace_volume`` selects the ``/workspace`` backing: ``None``
-        → an ephemeral tmpfs (destroyed with the container); a volume
-        name → a docker named volume that persists across containers
+        ``workspace_volume`` selects the ``SANDBOX_NAS_MOUNT`` backing:
+        ``None`` → an ephemeral tmpfs (destroyed with the container); a
+        volume name → a docker named volume that persists across containers
         (Stream J.15 — the per-user persistent workspace).
 
         ``env`` emits ``-e KEY=VALUE`` flags (sandbox-egress §3.3 injects
