@@ -183,13 +183,15 @@ class SandboxRuntimeProvider:
     #: by the docker CLI (inlined into HostConfig before the daemon ever sees
     #: it, verified 2026-09-14) — the path only needs to exist inside the
     #: supervisor container, not on the host.
-    #: ``None`` emits no ``--security-opt seccomp`` flag (the container then
-    #: rides the host Docker daemon's built-in default profile — fine for
-    #: dev, but version-drifting). A path pins our own profile
+    #: ``None`` emits no ``--security-opt seccomp`` flag. The supervisor
+    #: refuses to start with ``None`` since B-60 (see ``settings.py`` and
+    #: ``seccomp.validate_seccomp_profile``), so that branch is unreachable
+    #: in the supervisor process — this provider stays pure / Docker-free and
+    #: does not itself enforce that, it only forwards whatever path it is
+    #: given. A path pins our own profile
     #: (``infra/sandbox-image/seccomp-profile.json``) so the syscall floor is
-    #: decided by our repo, not the host's Docker version. The provider only
-    #: forwards the path; existence / JSON validity is validated fail-closed
-    #: at supervisor startup (it stays pure / Docker-free).
+    #: decided by our repo, not the host's Docker version; existence / JSON
+    #: validity is validated fail-closed at supervisor startup.
     seccomp_profile_path: str | None = None
     #: Stream HX-10-F1 — static ``(hostname, ip)`` pairs emitted as
     #: ``--add-host`` flags. gVisor's netstack does not implement Docker's

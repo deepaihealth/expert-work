@@ -435,7 +435,7 @@ class CliDockerClient:
 
             docker volume create v
             docker run --rm --cap-add CHOWN -v v:/w --entrypoint chown IMAGE 10000:10000 /w
-            docker run --rm --user 10000:10000 --workdir /mnt/workspace \
+            docker run --rm --user 10000:10000 --workdir /mnt/workspace \\
                 -v v:/mnt/workspace IMAGE ...
             # /mnt/workspace is root:root again inside this container, even
             # though the volume was just chowned to 10000:10000.
