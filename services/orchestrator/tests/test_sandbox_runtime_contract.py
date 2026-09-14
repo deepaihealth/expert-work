@@ -81,6 +81,9 @@ agent_sandbox 档的 ``/workspace`` 是**平台建的符号链接**,指向
 绝对路径、跨 exec 持久化全部照常(各由自己的用例覆盖)。
 ``test_exec_cwd_is_workspace`` 因此比 ``(st_dev, st_ino)`` 而不是路径字符串。
 
+**B-60 之后**:云后端 exec 进了自己的命名空间,``/workspace`` 是 bind 挂载点不是
+符号链接,``getcwd()`` 报 ``/workspace``;比 inode 的写法保留,它更强。
+
 **留给上层的一条**:云后端上,agent 自己跑 ``os.getcwd()``(或任何打印绝对
 路径的报错)会看到 ``/run/csi/mount-root/nas/<hash>`` 而不是 ``/workspace``。
 纯观感,但 LLM 读到自己的 cwd 长这样可能会困惑;真要治得在提示词或工具输出
@@ -93,7 +96,7 @@ import ast
 import os
 import re
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -449,6 +452,192 @@ async def test_exec_relative_write_lands_in_workspace(runtime: SandboxRuntime) -
         )
         assert "REL_OK" in outcome.stdout
     finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+# ---------------------------------------------------------------------------
+# B-60 —— 每次 exec 一个私有 /workspace(spec §4.3):绑了 agent 的 exec 只看
+# 得到自己的目录,未绑一字不改。两个后端同一套 exec_view 命令串
+# (orchestrator.tools.exec_view / infra/sandbox-image/runner.py 的
+# _EXEC_VIEW_SCRIPT),漂移由文件末尾的 test_exec_view_script_matches_the_sandbox_image
+# 钉住。
+# ---------------------------------------------------------------------------
+
+_KEY_A, _KEY_B = "plan-aaaaaaaa", "sop-bbbbbbbb"
+
+
+async def _cleanup(runtime: SandboxRuntime, sid: UUID, *paths: str) -> None:
+    """探针残留写在共享测试集群 NAS 上;经未绑 exec 删(CI runner 无 NFS 路由)。"""
+    code = "import os, shutil\n" + "".join(
+        f"shutil.rmtree({p!r}, ignore_errors=True) if os.path.isdir({p!r}) else "
+        f"(os.remove({p!r}) if os.path.exists({p!r}) else None)\n"
+        for p in paths
+    )
+    await runtime.exec(sandbox_id=sid, code=code, timeout_s=30)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_view_is_the_agents_own_directory(runtime: SandboxRuntime) -> None:
+    """B-60 spec 目标 1:绑了 agent 的 exec 里 /workspace **就是** agents/<key>。
+    比 (st_dev, st_ino):绑定 exec 里 stat('/workspace') 与未绑 exec 里
+    stat('/workspace/agents/<key>') 必须是同一个 inode,且写进去的文件从另一边读得到。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c-view", user_id=uuid4())
+    try:
+        bound = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                "import os\n"
+                "st = os.stat('/workspace')\n"
+                "open('/workspace/probe.txt', 'w').write('VIEW_OK')\n"
+                "print(st.st_dev, st.st_ino, os.getcwd())"
+            ),
+            timeout_s=30,
+            agent_key=_KEY_A,
+        )
+        assert bound.exit_code == 0, bound.stderr
+        dev, ino, cwd = bound.stdout.split()
+        assert cwd == "/workspace"
+        unbound = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                f"import os\n"
+                f"st = os.stat('/workspace/agents/{_KEY_A}')\n"
+                f"print(st.st_dev, st.st_ino, open('/workspace/agents/{_KEY_A}/probe.txt').read())"
+            ),
+            timeout_s=30,
+        )
+        assert unbound.stdout.split() == [dev, ino, "VIEW_OK"], unbound.stdout
+    finally:
+        await _cleanup(runtime, sid, f"/workspace/agents/{_KEY_A}")
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_view_hides_the_user_root_and_other_agents(runtime: SandboxRuntime) -> None:
+    """目标 2:视图里没有别的 agent,挂载点被空 tmpfs 盖住。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c-hide", user_id=uuid4())
+    try:
+        await runtime.exec(
+            sandbox_id=sid,
+            code=f"import os; os.makedirs('/workspace/agents/{_KEY_B}', exist_ok=True); "
+            f"open('/workspace/agents/{_KEY_B}/secret.txt', 'w').write('theirs'); "
+            "open('/workspace/root-level.txt', 'w').write('root')",
+            timeout_s=30,
+        )
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                "import os\n"
+                "print(sorted(os.listdir('/workspace')))\n"
+                "print(os.listdir('/mnt/workspace'))\n"
+                f"print(os.path.exists('/workspace/agents/{_KEY_B}/secret.txt'))"
+            ),
+            timeout_s=30,
+            agent_key=_KEY_A,
+        )
+        assert outcome.exit_code == 0, outcome.stderr
+        lines = outcome.stdout.splitlines()
+        assert "agents" not in lines[0] and "root-level.txt" not in lines[0], lines[0]
+        assert lines[1] == "[]", "挂载点必须被空 tmpfs 盖住"
+        assert lines[2] == "False"
+    finally:
+        await _cleanup(
+            runtime,
+            sid,
+            f"/workspace/agents/{_KEY_A}",
+            f"/workspace/agents/{_KEY_B}",
+            "/workspace/root-level.txt",
+        )
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_exec_view_shared_is_read_only(runtime: SandboxRuntime) -> None:
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c-shared", user_id=uuid4())
+    try:
+        await runtime.exec(
+            sandbox_id=sid,
+            code="import os; os.makedirs('/workspace/shared', exist_ok=True); "
+            "open('/workspace/shared/legacy.md', 'w').write('LEGACY')",
+            timeout_s=30,
+        )
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                "import errno\n"
+                "print(open('/workspace/shared/legacy.md').read())\n"
+                "try:\n"
+                "    open('/workspace/shared/x', 'w')\n"
+                "    print('WRITABLE')\n"
+                "except OSError as e:\n"
+                "    print('EROFS' if e.errno == errno.EROFS else e.errno)\n"
+            ),
+            timeout_s=30,
+            agent_key=_KEY_A,
+        )
+        assert outcome.stdout.split() == ["LEGACY", "EROFS"], outcome.stdout
+    finally:
+        await _cleanup(runtime, sid, "/workspace/shared", f"/workspace/agents/{_KEY_A}")
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_two_agents_exec_concurrently_and_see_only_themselves(
+    runtime: SandboxRuntime,
+) -> None:
+    """目标 3:同一沙箱、两个 agent、真并发(asyncio.gather)。命名空间按进程树,互不串。"""
+    import asyncio
+
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c-conc", user_id=uuid4())
+    try:
+
+        def probe(tag: str) -> str:
+            return (
+                "import os, time\n"
+                f"open('/workspace/{tag}.txt', 'w').write({tag!r})\n"
+                "time.sleep(1.0)\n"
+                "print(sorted(os.listdir('/workspace')))"
+            )
+
+        a, b = await asyncio.gather(
+            runtime.exec(sandbox_id=sid, code=probe("A"), timeout_s=30, agent_key=_KEY_A),
+            runtime.exec(sandbox_id=sid, code=probe("B"), timeout_s=30, agent_key=_KEY_B),
+        )
+        assert a.exit_code == 0 and b.exit_code == 0, (a.stderr, b.stderr)
+        assert "A.txt" in a.stdout and "B.txt" not in a.stdout, a.stdout
+        assert "B.txt" in b.stdout and "A.txt" not in b.stdout, b.stdout
+    finally:
+        await _cleanup(runtime, sid, f"/workspace/agents/{_KEY_A}", f"/workspace/agents/{_KEY_B}")
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unbound_exec_sees_the_whole_user_root(runtime: SandboxRuntime) -> None:
+    """目标 4:未绑 agent 一字不改 —— 视图 = 整个用户根,agents/ 与 shared/ 都在。"""
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c-unbound", user_id=uuid4())
+    try:
+        await runtime.exec(
+            sandbox_id=sid,
+            code="open('/workspace/mine.txt','w').write('x')",
+            timeout_s=30,
+            agent_key=_KEY_A,
+        )
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code=(
+                f"import os; print(os.path.exists('/workspace/agents/{_KEY_A}/mine.txt'), "
+                "os.getcwd())"
+            ),
+            timeout_s=30,
+        )
+        assert outcome.stdout.split() == ["True", "/workspace"], outcome.stdout
+    finally:
+        await _cleanup(runtime, sid, f"/workspace/agents/{_KEY_A}")
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
 
@@ -991,23 +1180,46 @@ def _runner_py_constants() -> dict[str, int]:
     return values
 
 
-def _runner_py_exec_flags() -> list[str]:
-    """ast 抠 runner.py subprocess argv 里 sys.executable 与 "-c" 之间的旗标。"""
+def _runner_py_exec_argv() -> list[str | None]:
+    """ast 抠 runner.py 的子进程 argv:字符串常量原样,``_EXEC_VIEW_SCRIPT`` 名字替换成
+    它的字面量,``sys.executable`` 记成 ``"<sys.executable>"``,其它表达式记 ``None``。"""
     runner = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "runner.py"
     tree = ast.parse(runner.read_text(encoding="utf-8"))
+    script = _runner_py_string_constant("_EXEC_VIEW_SCRIPT")
     for node in ast.walk(tree):
-        if not isinstance(node, ast.List) or not node.elts:
+        if not isinstance(node, ast.List) or not any(
+            isinstance(e, ast.Attribute) and e.attr == "executable" for e in node.elts
+        ):
             continue
-        head = node.elts[0]
-        if isinstance(head, ast.Attribute) and head.attr == "executable":
-            flags = []
-            for elt in node.elts[1:]:
-                if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
-                    break
-                if elt.value == "-c":
-                    return flags
-                flags.append(elt.value)
-    raise AssertionError("runner.py 的 subprocess argv([sys.executable, ..., '-c', code])没找到")
+        out: list[str | None] = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                out.append(elt.value)
+            elif isinstance(elt, ast.Name) and elt.id == "_EXEC_VIEW_SCRIPT":
+                out.append(script)
+            elif isinstance(elt, ast.Attribute) and elt.attr == "executable":
+                out.append("<sys.executable>")
+            else:
+                out.append(None)
+        return out
+    raise AssertionError("runner.py 的子进程 argv(含 sys.executable 的列表)没找到")
+
+
+def _runner_py_string_constant(name: str) -> str:
+    runner = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "runner.py"
+    for node in ast.parse(runner.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            assert isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+            return node.value.value
+    raise AssertionError(f"runner.py 没有模块级字符串常量 {name}")
+
+
+def _runner_py_exec_flags() -> list[str]:
+    argv = _runner_py_exec_argv()
+    start = argv.index("<sys.executable>") + 1
+    return list(argv[start : argv.index("-c", start)])  # type: ignore[arg-type]
 
 
 def _supervisor_max_timeout_s() -> int:
@@ -1056,8 +1268,8 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
         DEFAULT_TIMEOUT_S,
         MAX_OUTPUT_CHARS,
         MAX_TIMEOUT_S,
-        SANDBOX_PYTHON_FLAGS,
     )
+    from orchestrator.tools.sandbox_image_contract import SANDBOX_PYTHON_FLAGS
     from sandbox_supervisor.settings import SandboxSupervisorSettings
 
     runner = _runner_py_constants()
@@ -1087,6 +1299,39 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
     assert _runner_py_exec_flags() == list(SANDBOX_PYTHON_FLAGS), (
         f"exec 旗标漂移:runner.py={_runner_py_exec_flags()} contract={list(SANDBOX_PYTHON_FLAGS)}"
     )
+
+
+def test_exec_view_script_matches_the_sandbox_image() -> None:
+    """B-60 —— 两个后端同一段 sh:orchestrator ``exec_view.EXEC_VIEW_SCRIPT`` 与镜像
+    ``runner.py`` 的 ``_EXEC_VIEW_SCRIPT`` 逐字相等;argv 前缀也相等,前缀之后紧跟
+    ``agent_root``(非常量)再 ``sys.executable``。"""
+    from orchestrator.tools.exec_view import EXEC_VIEW_ARGV_PREFIX, EXEC_VIEW_SCRIPT
+
+    assert _runner_py_string_constant("_EXEC_VIEW_SCRIPT") == EXEC_VIEW_SCRIPT
+    argv = _runner_py_exec_argv()
+    n = len(EXEC_VIEW_ARGV_PREFIX)
+    assert argv[:n] == list(EXEC_VIEW_ARGV_PREFIX), argv[:n]
+    assert argv[n] is None, "前缀之后必须是 agent_root(表达式),不是常量"
+    assert argv[n + 1] == "<sys.executable>"
+
+
+def test_workspace_roots_match_across_packages() -> None:
+    """B-60 —— runtime 包(本地 docker argv)与 orchestrator(命令串、工具)对挂载点与
+    视图根各有一份字面量;这里钉它们相等,且脚本体确实用的是这两个路径。"""
+    from expert_work.runtime.sandbox.runtime_provider import SANDBOX_EXEC_VIEW, SANDBOX_NAS_MOUNT
+    from orchestrator.tools.exec_view import EXEC_VIEW_SCRIPT
+    from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
+
+    assert (SANDBOX_NAS_MOUNT, SANDBOX_EXEC_VIEW) == (NAS_MOUNT, EXEC_VIEW)
+    assert f'mount --bind "$root" {EXEC_VIEW}\n' in EXEC_VIEW_SCRIPT
+    assert f"mount -t tmpfs -o size=1k none {NAS_MOUNT}\n" in EXEC_VIEW_SCRIPT
+    # 共享 bind 必须排在 tmpfs 覆盖之前 —— 反过来会静默 fail OPEN:把 cover 提前到
+    # bind 之上,[ -d /mnt/workspace/shared ] 守卫读到的是空 tmpfs,悄悄判假,
+    # shared/ 从此再也没被 bind 过,而 test_exec_view_shared_is_read_only 之外没
+    # 有任何东西会发现——那条用例连的是真集群,不是每次全仓扫描都跑。
+    assert EXEC_VIEW_SCRIPT.index(
+        f"mount --bind {NAS_MOUNT}/shared {EXEC_VIEW}/shared"
+    ) < EXEC_VIEW_SCRIPT.index(f"mount -t tmpfs -o size=1k none {NAS_MOUNT}")
 
 
 def test_egress_token_ttl_matches_supervisor_default() -> None:
@@ -1431,130 +1676,3 @@ def test_contract_fixture_accounts_for_every_mandated_env() -> None:
         " 每多一项都要在 _FIXTURE_ENV_DISPOSITION 里显式决定:契约档要它,还是"
         " 有理由不要(把理由写下来)。"
     )
-
-
-# ---------------------------------------------------------------------------
-# B-50 PR3b —— per-exec ``cwd``:两个后端的取值必须逐字一致。
-#
-# 机制注定不同,这是后端差异不是 bug:
-#   * supervisor 档 —— ``cwd`` 作为 ``ExecRequest`` 字段送到 runner,
-#     ``os.makedirs`` + ``subprocess.run(cwd=)``。
-#   * agent_sandbox 档 —— E2B 的 ``cwd=`` 是**执行前**校验的,目录还没建
-#     exec 就失败了,所以走 ``mkdir -p && cd`` 前缀。
-# 可观测结果(``os.getcwd()``)必须一样,这才是契约。
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_exec_cwd_is_agent_scoped(runtime: SandboxRuntime) -> None:
-    """绑了 agent 的 exec,相对路径从 ``/workspace/agents/<key>`` 解析。
-
-    **比 ``(st_dev, st_ino)`` 不比路径字符串** —— 理由与
-    :func:`test_exec_cwd_is_workspace` 逐字相同:云后端的 ``/workspace`` 是平台
-    建的符号链接,指向 ``/run/csi/mount-root/nas/<hash>``,而 ``getcwd(2)`` 按
-    定义返回解析后的物理路径。那个 hash 由平台每次挂载现算,不是我们能承诺的
-    字符串。
-    """
-    sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract")
-    try:
-        outcome = await runtime.exec(
-            sandbox_id=sandbox_id,
-            code=(
-                "import os\n"
-                "here = os.stat('.')\n"
-                "want = os.stat('/workspace/agents/plan-aaaaaaaa')\n"
-                "print((here.st_dev, here.st_ino) == (want.st_dev, want.st_ino), os.getcwd())"
-            ),
-            timeout_s=30,
-            agent_key="plan-aaaaaaaa",
-        )
-        assert outcome.exit_code == 0, outcome.stderr
-        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
-    finally:
-        await runtime.release(sandbox_id=sandbox_id)
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_exec_cwd_without_agent_key_stays_at_workspace_root(
-    runtime: SandboxRuntime,
-) -> None:
-    """未绑 agent = 改动前的行为,一字不差。
-
-    同上,比 inode 身份不比路径字符串。
-    """
-    sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract-unbound")
-    try:
-        outcome = await runtime.exec(
-            sandbox_id=sandbox_id,
-            code=(
-                "import os\n"
-                "here, ws = os.stat('.'), os.stat('/workspace')\n"
-                "print((here.st_dev, here.st_ino) == (ws.st_dev, ws.st_ino), os.getcwd())"
-            ),
-            timeout_s=30,
-            agent_key="",
-        )
-        assert outcome.exit_code == 0, outcome.stderr
-        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
-    finally:
-        await runtime.release(sandbox_id=sandbox_id)
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_exec_cwd_is_created_when_missing(runtime: SandboxRuntime) -> None:
-    """agent 目录第一次用时不存在 —— 必须自动建出来,而不是报错或退回用户根。
-
-    ``acquire`` 补不上这一步:温沙箱是**不带 agent 身份**被认领的(池按
-    ``(tenant, user)`` 键,spec §三),第一次 exec 才是最早知道目录名的时刻。
-
-    同上,比 inode 身份不比路径字符串;``os.stat`` 取得到本身就是「目录建出来
-    了」的证据 —— 没建出来 ``mkdir -p && cd`` 这条前缀就先失败了,而退回用户根
-    的话这里会比出 ``False``。
-    """
-    key = f"fresh-{uuid4().hex[:8]}"
-    sandbox_id = await runtime.acquire(tenant_id=uuid4(), thread_id="cwd-contract-fresh")
-    try:
-        outcome = await runtime.exec(
-            sandbox_id=sandbox_id,
-            code=(
-                "import os\n"
-                f"here, want = os.stat('.'), os.stat('/workspace/agents/{key}')\n"
-                "print((here.st_dev, here.st_ino) == (want.st_dev, want.st_ino), os.getcwd())"
-            ),
-            timeout_s=30,
-            agent_key=key,
-        )
-        assert outcome.exit_code == 0, outcome.stderr
-        assert outcome.stdout.split()[:1] == ["True"], outcome.stdout
-    finally:
-        await runtime.release(sandbox_id=sandbox_id)
-
-
-def test_both_backends_derive_cwd_from_one_function() -> None:
-    """两个后端的 cwd **取值**必须来自同一个函数,不许各写各的字面量。
-
-    与本文件其它漂移断言同理,刻意**不**打 ``integration`` marker:它只读源码,
-    不连任何真实环境,所以每一次全仓扫描都跑得到 —— 上面那三条契约测试要真
-    集群才跑,平时是 skip 的,只靠它们的话「两边字面量漂了」没有任何东西会发现。
-    """
-    import ast
-    import pathlib
-
-    tools = pathlib.Path(__file__).resolve().parents[1] / "src" / "orchestrator" / "tools"
-    for module in ("sandbox.py", "agent_sandbox.py"):
-        source = (tools / module).read_text(encoding="utf-8")
-        calls = [
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "agent_workspace_root"
-        ]
-        assert calls, f"{module} 没有调用 agent_workspace_root —— cwd 取值漂了"
-        assert "/workspace/agents" not in source, (
-            f"{module} 里出现了硬编码的 agent 路径字面量;取值只许来自 "
-            "workspace_paths.agent_workspace_root"
-        )
