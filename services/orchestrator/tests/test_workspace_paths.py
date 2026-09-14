@@ -12,10 +12,13 @@ import pytest
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
 from orchestrator.tools import workspace_paths
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 from orchestrator.tools.workspace_paths import (
     SHARED_PREFIX,
     USER_ROOT,
     WriteToSharedError,
+    agent_nas_root,
+    agent_view_alias,
     agent_workspace_root,
     resolve_scope,
 )
@@ -129,3 +132,29 @@ def test_shared_prefix_always_names_the_shared_dir() -> None:
     assert workspace_paths.resolve_scope(
         f"{WORKSPACE_SHARED_DIR}:MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file"
     ) == (f"{workspace_paths.USER_ROOT}/{WORKSPACE_SHARED_DIR}", "MEMORY.md")
+
+
+def test_agent_nas_root_points_under_the_nas_mount() -> None:
+    """B-60 —— 后端拼 exec 用的 bind 源:NAS 挂载点下的真实目录。"""
+    assert agent_nas_root("plan-aaaaaaaa") == "/mnt/workspace/agents/plan-aaaaaaaa"
+
+
+def test_agent_view_alias_is_the_legacy_absolute_spelling() -> None:
+    """只用于折叠模型照旧写的 ``/workspace/agents/<key>/x``;视图里没有这个目录。"""
+    assert agent_view_alias("plan-aaaaaaaa") == "/workspace/agents/plan-aaaaaaaa"
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "a b", "../x", "a\x00b"])
+def test_nas_root_and_alias_refuse_unsafe_or_empty_keys(bad: str) -> None:
+    """空 key 也拒:未绑 agent 没有「自己的目录」,调用方自己分支,别让它拿到用户根。"""
+    with pytest.raises(ValueError):
+        agent_nas_root(bad)
+    with pytest.raises(ValueError):
+        agent_view_alias(bad)
+
+
+def test_view_and_mount_are_distinct_roots() -> None:
+    """视图根与挂载点互不包含 —— tmpfs 盖挂载点时不能把视图也盖掉。"""
+    assert (NAS_MOUNT, EXEC_VIEW) == ("/mnt/workspace", "/workspace")
+    assert not NAS_MOUNT.startswith(EXEC_VIEW + "/")
+    assert not EXEC_VIEW.startswith(NAS_MOUNT + "/")

@@ -19,15 +19,16 @@ import re
 from pathlib import PurePosixPath
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 
 #: 显式跨到用户级 ``shared/`` 区的前缀(照 ADK 的 ``user:`` 约定)。
 #: 由目录名拼出来,不写第二遍字面量 —— 前缀与它指向的目录必须永远同名。
 SHARED_PREFIX = f"{WORKSPACE_SHARED_DIR}:"
 
-#: 沙箱内的用户工作区根(挂载点)。**导出而非私有**:``file_ops`` 的迁移期
-#: 读回落要用它,而那个模块自己也有一个同名私有常量 —— 两处各改各的就会静默
-#: 分叉,回落目标和挂载点对不上时没有任何测试会红。
-USER_ROOT = "/workspace"
+#: B-60 过渡别名 —— 调用点分批切到 EXEC_VIEW,Task 12 删除。**导出而非私有**:
+#: ``file_ops`` 的迁移期读回落要用它,而那个模块自己也有一个同名私有常量 ——
+#: 两处各改各的就会静默分叉,回落目标和挂载点对不上时没有任何测试会红。
+USER_ROOT = EXEC_VIEW
 
 #: 布局里的保留段。**导出**:``file_ops._require_path`` 要用它来拒绝以这一段
 #: 开头的相对路径 —— 迁移期读回落会把 ``agents/<别人的 key>/x`` 变成一次合法的
@@ -67,18 +68,37 @@ class WriteToSharedError(ValueError):
     """
 
 
-def agent_workspace_root(agent_key: str) -> str:
-    """该 agent 在沙箱内的默认根;``agent_key`` 为空时回落用户根。
-
-    空串 = 未绑定 agent(与 ``agent_key_envs("")`` 同一个口径),行为与 B-50
-    之前一致。任何非空但不是单个安全路径段的取值一律拒 —— 它是不可信输入。
-    """
-    if not agent_key:
-        return USER_ROOT
-    if agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
+def _require_safe_key(agent_key: str) -> None:
+    if not agent_key or agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
         msg = f"agent_key is not a safe path segment: {agent_key!r}"
         raise ValueError(msg)
-    return f"{USER_ROOT}/{AGENTS_DIR}/{agent_key}"
+
+
+def agent_nas_root(agent_key: str) -> str:
+    """NAS 挂载下该 agent 的真实目录 —— **只给两个后端拼 exec 用**(命名空间里 bind
+    到 ``EXEC_VIEW`` 上的源;B-60 spec §4.3)。空 key 拒绝:未绑 agent 没有「自己的
+    目录」,调用方自己分支(未绑 → bind 整个用户根),别让它悄悄拿到 ``NAS_MOUNT``。
+    """
+    _require_safe_key(agent_key)
+    return f"{NAS_MOUNT}/{AGENTS_DIR}/{agent_key}"
+
+
+def agent_view_alias(agent_key: str) -> str:
+    """模型照旧可能写的 ``/workspace/agents/<key>`` 拼法 —— **只用于折叠**
+    (``file_ops._require_path`` / ``artifact._validate_path``),不指向任何真实目录:
+    视图里没有 ``agents/``。空 key 拒绝,同上。
+    """
+    _require_safe_key(agent_key)
+    return f"{EXEC_VIEW}/{AGENTS_DIR}/{agent_key}"
+
+
+def agent_workspace_root(agent_key: str) -> str:
+    """B-60 过渡别名 —— 语义仍是 B-50 的(未绑 → 用户根;绑了 → 别名拼法)。
+    Task 6/7 把调用点换成 ``agent_nas_root`` / ``agent_view_alias`` / ``EXEC_VIEW``,
+    Task 12 删除。"""
+    if not agent_key:
+        return EXEC_VIEW
+    return agent_view_alias(agent_key)
 
 
 def resolve_scope(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:

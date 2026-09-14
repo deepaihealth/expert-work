@@ -21,8 +21,15 @@
 
 from __future__ import annotations
 
-#: 沙箱内工作区挂载点 —— 与 supervisor 实现一致。
-WORKSPACE_ROOT = "/workspace"
+#: 沙箱内用户根的**挂载点**(B-60):建沙箱 ``metadata.mountPath`` / 兜底 ``chown`` /
+#: 本地 ``--volume``、``--workdir``。沙箱内的代码(工具片段、用户代码、提示词)**永远
+#: 不该**出现这个字符串 —— exec 进了命名空间之后它被 tmpfs 盖住,不存在。
+NAS_MOUNT = "/mnt/workspace"
+#: 每次 exec 的命名空间里看到的根(B-60):命令串里 bind 的目标、提示词与工具描述的
+#: 锚、文件工具的 ``ws``。绑了 agent 就是它自己的目录,没绑就是整个用户根。
+EXEC_VIEW = "/workspace"
+#: B-60 过渡别名 —— 调用点分批切到 NAS_MOUNT / EXEC_VIEW,Task 12 删除。
+WORKSPACE_ROOT = EXEC_VIEW
 
 #: 沙箱镜像里 ``HOME``/``MPLCONFIGDIR`` 的落点(沙箱迁移波 2 Task 9,
 #: 2026-08-07)。此前 ``HOME`` 就是 :data:`WORKSPACE_ROOT`;波 2 起该路径由
