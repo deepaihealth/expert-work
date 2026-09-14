@@ -418,6 +418,27 @@ print(json.dumps(_main()))
 """
 
 
+_STAT_MAIN = """
+
+def _main():
+    full = _resolve(_P["rel"])
+    if full is None:
+        return {"ok": False, "error": "path_escapes_workspace"}
+    try:
+        st = os.stat(full)
+    except FileNotFoundError:
+        return {"ok": False, "error": "not_found"}
+    except OSError as exc:
+        return {"ok": False, "error": "io_error", "detail": str(exc)}
+    if not os.path.isfile(full):
+        return {"ok": False, "error": "not_a_file"}
+    return {"ok": True, "size": st.st_size}
+
+
+print(json.dumps(_main()))
+"""
+
+
 def _snippet(params: Mapping[str, Any], main: str) -> str:
     """Assemble a snippet: ``_PARAMS`` literal + shared prelude + op body."""
     return f"_PARAMS = {json.dumps(params)!r}\n" + _PRELUDE + main
@@ -440,6 +461,16 @@ def build_list_wrapper(
 ) -> str:
     """Snippet that lists directory ``ws/rel`` and prints a JSON envelope."""
     return _snippet({"ws": ws, "rel": rel, "max_entries": max_entries}, _LIST_MAIN)
+
+
+def build_stat_wrapper(rel: str, *, ws: str = _WORKSPACE_ROOT) -> str:
+    """Snippet that stats ``ws/rel`` and prints ``{"ok": True, "size": N}``.
+
+    Used by ``save_artifact`` to refuse registering an artifact whose file
+    was never written — the registration row is only a *description* of the
+    file, and nothing else on this path ever checks it against the real one.
+    """
+    return _snippet({"ws": ws, "rel": rel}, _STAT_MAIN)
 
 
 def build_edit_wrapper(

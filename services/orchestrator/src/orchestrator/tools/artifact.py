@@ -8,8 +8,11 @@ artifacts back. Both are tenant- *and* user-scoped — an artifact
 belongs to a ``(tenant, user)`` pair, so a run with no user binding
 cannot use them.
 
-The file *content* stays in the J.15 workspace volume; these tools
-only touch metadata. Content download is a control-plane endpoint
+The file *content* stays in the J.15 workspace volume. ``save_artifact``
+**stats the file before registering it** — the row it writes is only a
+*description* of the file, and the download endpoint is the only other
+place that ever touches the real one, so an unverified row surfaces as a
+listed-but-404 artifact. Content download is a control-plane endpoint
 (STREAM-J-DESIGN § 10).
 """
 
@@ -25,8 +28,10 @@ from uuid import UUID
 
 from expert_work.persistence import ArtifactStore
 from expert_work.protocol import ArtifactKind
+from orchestrator.tools.file_ops import FileOpError, build_stat_wrapper, parse_envelope
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
-from orchestrator.tools.workspace_paths import AGENTS_DIR
+from orchestrator.tools.sandbox import SandboxRuntime, run_in_sandbox
+from orchestrator.tools.workspace_paths import AGENTS_DIR, agent_workspace_root
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +114,10 @@ class SaveArtifactTool:
     """Registers a workspace file as a named artifact — ``save_artifact``."""
 
     store: ArtifactStore
+    #: 沙箱执行通道 —— 登记前 stat 那个文件要用。**必填,没有默认值**:做成
+    #: 可选开关的话,漏传的调用点会静默退回「不校验」,而那正是这条修复要堵的
+    #: 洞(平台缺口改默认,不要设计成让人去配)。
+    client: SandboxRuntime
 
     @property
     def spec(self) -> ToolSpec:
@@ -154,9 +163,15 @@ class SaveArtifactTool:
         name = _require_str(args, "name", "save_artifact")
         raw_path = args.get("path")
         path = raw_path if isinstance(raw_path, str) and raw_path.strip() else name
-        path_in_workspace = _artifact_path(ctx.agent_key, _validate_path(path))
+        rel = _validate_path(path)
+        path_in_workspace = _artifact_path(ctx.agent_key, rel)
         kind = _coerce_kind(args.get("kind"))
         thread_id = str(ctx.run_id) if ctx.run_id is not None else _FALLBACK_THREAD_ID
+
+        # 登记之前先确认文件真的在。没有这一步,agent 喊一声 save_artifact 就能
+        # 造出一条「列表里看得见、下载 404」的产物,而 run 照样报 success ——
+        # 测试环境 2026-09-14 实测到的正是这个形态(库里有行、NAS 上没文件)。
+        await self._require_file_exists(rel, ctx=ctx)
 
         # B-50 PR3 —— ``path_in_workspace`` 带 agent 前缀,与 ``write_file`` 的
         # 落盘位置同一个口径(PR2 时有意暂缓,见 ``_artifact_path``)。
@@ -190,6 +205,44 @@ class SaveArtifactTool:
             ),
             meta={"artifact": name, "version": version.version, "kind": kind},
         )
+
+    async def _require_file_exists(self, rel: str, *, ctx: ToolContext) -> None:
+        """Stat ``rel`` under the agent's scope root; raise if it is not a file.
+
+        Same scope root the write tools use, so "the path I wrote" and "the
+        path I register" cannot diverge. The error goes back to the model as
+        a tool error it can act on — it means *you did not write that file*,
+        which is recoverable, unlike handing the user a dead artifact.
+        """
+        ws = agent_workspace_root(ctx.agent_key)
+        outcome = await run_in_sandbox(
+            self.client,
+            code=build_stat_wrapper(rel, ws=ws),
+            timeout_s=None,
+            ctx=ctx,
+            tool_label="save_artifact",
+            fallback_thread_id="save_artifact",
+        )
+        env = parse_envelope(outcome, tool="save_artifact")
+        if env.get("ok"):
+            return
+        error = env.get("error", "unknown")
+        if error == "path_escapes_workspace":
+            msg = f"save_artifact denied: {rel!r} escapes the workspace"
+            raise ToolBlockedError(msg)
+        if error == "not_found":
+            msg = (
+                f"save_artifact: no file at {rel!r} in your workspace — nothing was "
+                "registered. Write the file first (and check the path you passed), "
+                "then call save_artifact again."
+            )
+            raise FileOpError(msg)
+        if error == "not_a_file":
+            msg = f"save_artifact: {rel!r} is a directory, not a file — nothing was registered."
+            raise FileOpError(msg)
+        detail = env.get("detail", "")
+        msg = f"save_artifact: could not stat {rel!r} ({error}{': ' + detail if detail else ''})"
+        raise FileOpError(msg)
 
 
 @dataclass

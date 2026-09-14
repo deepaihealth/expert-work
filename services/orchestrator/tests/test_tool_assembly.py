@@ -791,10 +791,23 @@ async def test_base_capabilities_absent_without_deps_no_raise() -> None:
 async def test_base_capabilities_gated_per_dependency() -> None:
     # Each base tool registers only when ITS dependency is wired: an
     # artifact store but no supervisor yields artifacts, not exec/bash/files.
+    #
+    # ``save_artifact`` is the exception — it needs BOTH. It stats the file in
+    # the workspace before registering it, and without a sandbox there is no
+    # file to stat, so registering it would only let an agent mint artifacts
+    # that are listed but 404 on download.
     env = ToolEnv(artifact_store=InMemoryArtifactStore())
     registry = await build_tool_registry([], tool_env=env)
     for name in _BASE_SANDBOX_TOOLS:
         assert registry.get(name) is None, name
+    assert registry.get("list_artifacts") is not None
+    assert registry.get("save_artifact") is None
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_base_capability_needs_both_deps() -> None:
+    env = ToolEnv(artifact_store=InMemoryArtifactStore(), sandbox_runtime=RecordingSandboxRuntime())
+    registry = await build_tool_registry([], tool_env=env)
     for name in _BASE_ARTIFACT_TOOLS:
         assert registry.get(name) is not None, name
 
