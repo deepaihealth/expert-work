@@ -20,29 +20,50 @@ import sys
 from pathlib import Path
 
 _PAYLOAD = Path(__file__).with_name("smoke_payload.py")
+# .resolve(): --security-opt seccomp= needs an absolute path — the workflow
+# invokes this script as `python infra/sandbox-image/smoke_test.py <tag>`
+# from the repo root, where plain __file__ is relative.
+_SECCOMP_PROFILE = Path(__file__).resolve().with_name("seccomp-profile.json")
 
 
 def main(image: str) -> int:
     code = _PAYLOAD.read_text(encoding="utf-8")
-    request = json.dumps({"code": code, "timeout_s": 30}) + "\n"
+    request = (
+        json.dumps({"code": code, "timeout_s": 30, "agent_root": "/mnt/workspace/agents/smoke"})
+        + "\n"
+    )
     proc = subprocess.run(  # noqa: S603
         [  # noqa: S607
             "docker",
             "run",
             "--rm",
             "-i",
-            # W2 Task 9: the image no longer pre-creates /workspace (the
-            # platform builds a NAS-mount symlink there in prod; the local
-            # supervisor mounts a tmpfs there in dev) — smoke_payload.py's
-            # /workspace/... paths are the real production path, so the
-            # smoke test supplies the same kind of writable mount itself
-            # rather than changing those paths to something that wouldn't
-            # exercise the real thing. uid/gid 10000 match the image's
-            # `agent` user for parity, though this container still runs as
-            # root (Task 6 hasn't wired up --user for the local backend
-            # yet), so it isn't load-bearing for write access here.
+            # B-60 T10 (fix round 1) — the runner now execs every request
+            # inside its own user+mount namespace (`unshare -Urm`) that binds
+            # an agent directory onto /workspace; mirror the pieces of the
+            # local backend's own hardening
+            # (packages/expert-work-runtime/.../runtime_provider.py) that
+            # path needs, same as a real sandbox container gets:
+            #   * a writable /mnt/workspace tmpfs — the NAS-mount stand-in
+            #     the runner's namespace binds *from* (agent_root below
+            #     points inside it).
+            #   * a **read-only** 4k /workspace tmpfs — the bind target. The
+            #     image has no writable /workspace of its own (W2 Task 9);
+            #     a request that skipped the namespace now fails loudly
+            #     (EROFS) instead of silently writing into the container.
+            #   * the pinned seccomp profile — docker's default profile
+            #     blocks `unshare`/`mount`.
+            #   * `apparmor=unconfined` — docker-default AppArmor carries
+            #     `deny mount,`, which blocks the namespace's own mount(2)
+            #     calls too.
             "--tmpfs",
-            "/workspace:rw,size=64m,uid=10000,gid=10000",
+            "/mnt/workspace:rw,size=64m,mode=1777",
+            "--tmpfs",
+            "/workspace:ro,size=4k",
+            "--security-opt",
+            f"seccomp={_SECCOMP_PROFILE}",
+            "--security-opt",
+            "apparmor=unconfined",
             image,
         ],
         input=request,
