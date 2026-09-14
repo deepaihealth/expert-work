@@ -487,6 +487,46 @@ async def test_gate_48_filesystem_and_process_isolation(expert_work: _Harness) -
 
 
 # ---------------------------------------------------------------------------
+# B-60 — per-exec /workspace view (spec §4.3), acceptance under the real OCI
+# runtime (runc / runsc — see _OCI_RUNTIME at module top).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_agent_root_is_bound_as_workspace_and_hides_the_rest(
+    expert_work: _Harness,
+) -> None:
+    """B-60 —— 真容器(runc / runsc 各跑一次):agent_root 被 bind 成 /workspace,
+    /mnt/workspace 被盖,另一个 agent_root 看不到前者的文件,未绑看到全部。"""
+    tenant, user = uuid4(), uuid4()
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=tenant, thread_id="b60", user_id=user)
+    )
+    sid = response.sandbox_id
+    try:
+        a = await expert_work.supervisor.exec(
+            sid,
+            code="import os; open('/workspace/a.txt','w').write('A'); "
+            "print(os.getcwd(), os.listdir('/mnt/workspace'))",
+            agent_root="/mnt/workspace/agents/a",
+        )
+        assert a.exit_code == 0, a.stderr
+        assert a.stdout.strip() == "/workspace []"
+        b = await expert_work.supervisor.exec(
+            sid,
+            code="import os; print(sorted(os.listdir('/workspace')))",
+            agent_root="/mnt/workspace/agents/b",
+        )
+        assert "a.txt" not in b.stdout, b.stdout
+        root = await expert_work.supervisor.exec(
+            sid, code="print(open('/workspace/agents/a/a.txt').read())"
+        )
+        assert root.stdout.strip() == "A"
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b60-acceptance")
+
+
+# ---------------------------------------------------------------------------
 # #49 — egress network isolation (gate #3)
 # ---------------------------------------------------------------------------
 
