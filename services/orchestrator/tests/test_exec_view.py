@@ -32,19 +32,36 @@ def test_shared_is_bound_read_only_with_locked_flags_kept() -> None:
 
 
 def test_script_parses_as_posix_sh() -> None:
-    assert subprocess.run(["sh", "-n"], input=EXEC_VIEW_SCRIPT, text=True, check=False).returncode == 0
+    proc = subprocess.run(
+        ["sh", "-n"],
+        input=EXEC_VIEW_SCRIPT,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_argv_prefix_is_unshare_user_and_mount_namespaces() -> None:
     assert EXEC_VIEW_ARGV_PREFIX == (
-        "unshare", "-Urm", "--propagation", "private", "--",
-        "sh", "-c", EXEC_VIEW_SCRIPT, "ew-exec-view",
+        "unshare",
+        "-Urm",
+        "--propagation",
+        "private",
+        "--",
+        "sh",
+        "-c",
+        EXEC_VIEW_SCRIPT,
+        "ew-exec-view",
     )
 
 
 def test_argv_bound_passes_the_nas_root_as_first_positional() -> None:
     assert exec_view_argv("plan-aaaaaaaa", _PY) == [
-        *EXEC_VIEW_ARGV_PREFIX, "/mnt/workspace/agents/plan-aaaaaaaa", *_PY,
+        *EXEC_VIEW_ARGV_PREFIX,
+        "/mnt/workspace/agents/plan-aaaaaaaa",
+        *_PY,
     ]
 
 
@@ -53,9 +70,12 @@ def test_argv_unbound_passes_an_empty_root() -> None:
 
 
 def test_build_exec_command_bound_and_unbound_verbatim() -> None:
-    prefix = "umask 077 && unshare -Urm --propagation private -- sh -c " + shlex.quote(EXEC_VIEW_SCRIPT)
+    prefix = "umask 077 && unshare -Urm --propagation private -- sh -c " + shlex.quote(
+        EXEC_VIEW_SCRIPT
+    )
     assert build_exec_command("plan-aaaaaaaa", "/tmp/ew-exec-abc.py") == (  # noqa: S108
-        prefix + " ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa python -E -P /tmp/ew-exec-abc.py"
+        prefix
+        + " ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa python -E -P /tmp/ew-exec-abc.py"
     )
     assert build_exec_command("", "/tmp/ew-exec-abc.py") == (  # noqa: S108
         prefix + " ew-exec-view '' python -E -P /tmp/ew-exec-abc.py"
