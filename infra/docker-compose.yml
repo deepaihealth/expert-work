@@ -571,17 +571,17 @@ services:
       # sets EXPERT_WORK_SANDBOX_OCI_RUNTIME=runsc (gVisor) to close the shared-kernel
       # cross-tenant escape residual; the sandbox-gvisor CI workflow runs the
       # acceptance suite under runsc so that switch stays verified.
-      # Stream HX-10 — pinned seccomp profile. B-60 起必配;dev 也走仓内 profile。
-      # Pre-place infra/sandbox-image/seccomp-profile.json at a host path,
-      # bind-mount it into THIS container at the SAME path (docker-out-of-docker: the host
-      # daemon resolves the --security-opt seccomp= path, while startup
-      # validates the same path inside this container — they must match), and
-      # set EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH to it. A configured-but-missing
-      # profile fails startup closed (HX-K2).
-      #
-      # B-60 —— 钉住的 profile 是本地后端的硬前提(见 seccomp.py):从仓库根目录
-      # `docker compose -f infra/docker-compose.yml …` 起,宿主与容器内同一路径。
-      EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH: ${PWD}/infra/sandbox-image/seccomp-profile.json
+      # Stream HX-10 — pinned seccomp profile. B-60 起必配;dev 也走仓内 profile,
+      # 不再是可选项。The profile is bind-mounted read-only into THIS container
+      # at a fixed path (see volumes: below) and EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH
+      # points at that same fixed path. An unconfigured OR missing profile
+      # aborts supervisor startup fail-closed (HX-K2 / B-60). The path is
+      # container-internal only: docker-out-of-docker means the supervisor
+      # runs the `docker` CLI *inside* this container against the host
+      # daemon's socket, and the CLI reads --security-opt seccomp=<path>
+      # client-side and inlines the JSON into the request — the daemon never
+      # sees the path, so it does not need to resolve on the host.
+      EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH: /etc/expert-work/seccomp-profile.json
       #
       # HX-10-F1 (gVisor prod prerequisite): runsc's netstack has no Docker
       # embedded DNS (google/gvisor#7469), so under runsc the sandbox cannot
@@ -605,7 +605,7 @@ services:
       EXPERT_WORK_SANDBOX_EGRESS_TOKEN_SECRET: ${EXPERT_WORK_EGRESS_TOKEN_SECRET:-dev-egress-token-secret-rotate-me}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${PWD}/infra/sandbox-image/seccomp-profile.json:${PWD}/infra/sandbox-image/seccomp-profile.json:ro
+      - ./sandbox-image/seccomp-profile.json:/etc/expert-work/seccomp-profile.json:ro
     depends_on:
       postgres:
         condition: service_healthy
