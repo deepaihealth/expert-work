@@ -35,6 +35,7 @@ from expert_work.persistence.sandbox_instance_store import (
     _REASON_STUCK_CREATE_TAKEOVER,
     _STUCK_CREATE_TTL_S,
     AGENT_SANDBOX_IMAGE_REF,
+    SANDBOX_LAYOUT_USER_ROOT,
     SqlSandboxInstanceStore,
 )
 from expert_work.protocol.quota import QuotaDimension
@@ -69,7 +70,9 @@ def store(postgres_container: PostgresContainer) -> Iterator[SqlSandboxInstanceS
 async def test_claim_warm_first_caller_wins(store: SqlSandboxInstanceStore) -> None:
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
 
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
 
     assert result is None
     assert await store.get_container_id(sandbox_id=sandbox_id) is None
@@ -81,17 +84,27 @@ async def test_claim_warm_second_caller_sees_ready_container(
 ) -> None:
     tenant_id, user_id = uuid4(), uuid4()
     first_id = uuid4()
-    assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=first_id) is None
+    assert (
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=first_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
+    )
     await store.set_container_id(sandbox_id=first_id, container_id="sbx-ready")
 
     second_id = uuid4()
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
 
     # Review fix (Important-3): the loser gets back the WINNER's real row
     # id (first_id), not its own second_id — acquire() needs a persisted id
     # to hand its caller, and second_id was never inserted anywhere.
     assert result is not None
-    winner_id, container_id, winner_acquired_at = result
+    winner_id, container_id, winner_acquired_at, _ = result
     assert (winner_id, container_id) == (first_id, "sbx-ready")
     # #1b: the third element is the winner row's acquired_at, consumed by
     # AgentSandboxClient.acquire's warm-session age cap.
@@ -112,11 +125,24 @@ async def test_claim_warm_second_caller_raises_when_winner_not_ready(
     """
     tenant_id, user_id = uuid4(), uuid4()
     first_id = uuid4()
-    assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=first_id) is None
+    assert (
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=first_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
+    )
     # Deliberately do NOT call set_container_id — simulates "still creating".
 
     with pytest.raises(RuntimeError, match="already being created"):
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=uuid4(),
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
 
 
 @pytest.mark.asyncio
@@ -133,8 +159,18 @@ async def test_concurrent_claim_warm_exactly_one_winner(store: SqlSandboxInstanc
     sandbox_a, sandbox_b = uuid4(), uuid4()
 
     results = await asyncio.gather(
-        store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_a),
-        store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_b),
+        store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_a,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        ),
+        store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_b,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        ),
         return_exceptions=True,
     )
 
@@ -157,13 +193,20 @@ async def test_concurrent_claim_warm_after_ready_all_see_same_winner(
     all resolve to the SAME container_id — no duplicate row, no crash."""
     tenant_id, user_id = uuid4(), uuid4()
     winner_id = uuid4()
-    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=winner_id)
+    won = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=winner_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert won is None
     await store.set_container_id(sandbox_id=winner_id, container_id="sbx-warm")
 
     results = await asyncio.gather(
         *(
-            store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+            store.claim_warm(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                sandbox_id=uuid4(),
+                layout=SANDBOX_LAYOUT_USER_ROOT,
+            )
             for _ in range(5)
         )
     )
@@ -171,7 +214,7 @@ async def test_concurrent_claim_warm_after_ready_all_see_same_winner(
     assert len(results) == 5
     for result in results:
         assert result is not None
-        winner_seen, container_id, winner_acquired_at = result
+        winner_seen, container_id, winner_acquired_at, _ = result
         assert (winner_seen, container_id) == (winner_id, "sbx-warm")
         assert winner_acquired_at is not None
 
@@ -190,12 +233,22 @@ async def test_mark_destroyed_frees_the_slot_of_a_row_that_never_got_a_container
     """
     tenant_id, user_id = uuid4(), uuid4()
     first_id = uuid4()
-    assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=first_id) is None
+    assert (
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=first_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
+    )
 
     await store.mark_destroyed(sandbox_id=first_id, reason="warm_reconnect_failed")
 
     second_id = uuid4()
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert result is None, "clearing the dead row by id must free the 0141 partial-index slot"
 
 
@@ -205,7 +258,15 @@ async def test_mark_destroyed_frees_slot_for_new_claim(
 ) -> None:
     tenant_id, user_id = uuid4(), uuid4()
     first_id = uuid4()
-    assert await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=first_id) is None
+    assert (
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=first_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
+    )
     await store.set_container_id(sandbox_id=first_id, container_id="sbx-1")
 
     await store.mark_destroyed(sandbox_id=first_id, reason="ops")
@@ -228,7 +289,9 @@ async def test_mark_destroyed_frees_slot_for_new_claim(
     assert container_id == "sbx-1", "mark_destroyed keeps the historical container_id in the row"
 
     second_id = uuid4()
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert result is None, "destroying the old session must free the slot for a fresh claim"
 
 
@@ -264,7 +327,9 @@ async def test_create_ephemeral_row_is_then_updatable(store: SqlSandboxInstanceS
     """
     tenant_id, sandbox_id = uuid4(), uuid4()
 
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+    await store.create_ephemeral(
+        tenant_id=tenant_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-ephemeral")
 
     assert await store.get_container_id(sandbox_id=sandbox_id) == "sbx-ephemeral"
@@ -279,8 +344,12 @@ async def test_create_ephemeral_rows_do_not_conflict_across_calls(
     tenant_id = uuid4()
     first_id, second_id = uuid4(), uuid4()
 
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=first_id)
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=second_id)
+    await store.create_ephemeral(
+        tenant_id=tenant_id, sandbox_id=first_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
+    await store.create_ephemeral(
+        tenant_id=tenant_id, sandbox_id=second_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=first_id, container_id="sbx-a")
     await store.set_container_id(sandbox_id=second_id, container_id="sbx-b")
 
@@ -296,7 +365,9 @@ async def test_ephemeral_row_is_visible_to_list_active_once_ready(
     ``list_active()`` 里,``reap(force=True)`` 找不到它们——资源永久泄漏
     (沙箱在 E2B 那边继续跑,``sandbox_instance`` 里却没有任何记录)。"""
     tenant_id, sandbox_id = uuid4(), uuid4()
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+    await store.create_ephemeral(
+        tenant_id=tenant_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-reapable")
 
     force_ids = {sid for sid, _ in await store.list_active(only_idle=False)}
@@ -312,7 +383,9 @@ async def test_ephemeral_row_still_creating_is_excluded_from_list_active(
     时,两种 ``only_idle`` 模式都不该把它算进"活跃"——语义与热会话行完全
     一致,``list_active`` 的 WHERE 子句本就不区分 ``user_id`` 是否为空。"""
     tenant_id, sandbox_id = uuid4(), uuid4()
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+    await store.create_ephemeral(
+        tenant_id=tenant_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     # 不调用 set_container_id —— 模拟"还在创建中"。
 
     force_ids = {sid for sid, _ in await store.list_active(only_idle=False)}
@@ -346,7 +419,12 @@ async def test_list_active_excludes_still_creating_and_destroyed_rows(
     tenant_id, user_id = uuid4(), uuid4()
     still_creating = uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=still_creating)
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=still_creating,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
         is None
     )
     # 不调用 set_container_id —— 模拟"还在创建中"。
@@ -354,7 +432,12 @@ async def test_list_active_excludes_still_creating_and_destroyed_rows(
     other_tenant, other_user = uuid4(), uuid4()
     destroyed = uuid4()
     assert (
-        await store.claim_warm(tenant_id=other_tenant, user_id=other_user, sandbox_id=destroyed)
+        await store.claim_warm(
+            tenant_id=other_tenant,
+            user_id=other_user,
+            sandbox_id=destroyed,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
         is None
     )
     await store.set_container_id(sandbox_id=destroyed, container_id="sbx-destroyed")
@@ -381,7 +464,9 @@ async def test_list_active_force_mode_returns_every_ready_active_row(
     """
     tenant_id, user_id = uuid4(), uuid4()
     sandbox_id = uuid4()
-    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    won = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert won is None
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-1")
 
@@ -416,7 +501,12 @@ async def test_list_active_only_idle_uses_last_used_at_falling_back_to_acquired_
     for name in names:
         tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
         assert (
-            await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+            await store.claim_warm(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                sandbox_id=sandbox_id,
+                layout=SANDBOX_LAYOUT_USER_ROOT,
+            )
             is None
         )
         await store.set_container_id(sandbox_id=sandbox_id, container_id=f"sbx-{name}")
@@ -458,7 +548,9 @@ async def test_touch_and_get_container_id_returns_container_id(
     store: SqlSandboxInstanceStore,
 ) -> None:
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    won = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert won is None
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-touch")
 
@@ -486,7 +578,9 @@ async def test_touch_and_get_container_id_makes_row_no_longer_idle(
     误杀,Important-2 就白修了)。
     """
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    won = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert won is None
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-touch-idle")
 
@@ -520,7 +614,9 @@ async def test_list_stuck_creating_ignores_fresh_still_creating_row(
     还在合法的 35-40s E2B 冷启窗口内,不该被判定成"孤儿"——只有远超这个
     窗口(``_STUCK_CREATE_TTL_S``,数分钟量级)的行才算。"""
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    won = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert won is None
     # 不调用 set_container_id —— 模拟正常、还在冷启窗口内的创建过程。
 
@@ -539,7 +635,9 @@ async def test_list_stuck_creating_returns_old_null_container_row(
     远超合法冷启窗口来识别,直接造一行"死在两步之间"的状态验证。
     """
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    won = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert won is None
     # 不调用 set_container_id —— 模拟"死在两次写之间"。
 
@@ -562,7 +660,9 @@ async def test_list_stuck_creating_returns_old_null_container_row(
     # 没有容器可连,直接 mark_destroyed —— 验证清完之后槽位真的放出来了。
     await store.mark_destroyed(sandbox_id=sandbox_id, reason="reap_orphaned_create")
     second_id = uuid4()
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id)
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=second_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert result is None, "清掉孤儿行之后,这个 (tenant, user) 必须能重新正常 claim"
 
 
@@ -578,7 +678,9 @@ async def test_list_stuck_creating_excludes_ready_row(
     container_id 过滤条件,不 backdate 的版本三条全绿,咬不住)。
     """
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    won = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    won = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert won is None
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-ready-not-stuck")
 
@@ -624,7 +726,13 @@ async def test_claim_warm_takes_over_a_stale_mid_create_row(
     tenant_id, user_id = uuid4(), uuid4()
     orphan_id = uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=orphan_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=orphan_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
     # 不调用 set_container_id —— 模拟"死在两次写之间";再 backdate
     # acquired_at 到远超阈值,公开 API 造不出"很久以前"这个前置状态。
@@ -641,7 +749,12 @@ async def test_claim_warm_takes_over_a_stale_mid_create_row(
         await engine.dispose()
 
     newcomer_id = uuid4()
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=newcomer_id)
+    result = await store.claim_warm(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        sandbox_id=newcomer_id,
+        layout=SANDBOX_LAYOUT_USER_ROOT,
+    )
 
     assert result is None, "过期的孤儿行必须被接管,这次调用应当成为新赢家"
     # 新行真的插进去了(不是"raise 没发生"这种弱断言):它现在是这个
@@ -663,7 +776,13 @@ async def test_claim_warm_takeover_marks_the_orphan_with_its_own_reason(
     """
     tenant_id, user_id, orphan_id = uuid4(), uuid4(), uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=orphan_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=orphan_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
     long_ago = datetime.now(UTC) - timedelta(seconds=_STUCK_CREATE_TTL_S * 2)
     engine = create_async_engine_from_config(DatabaseConfig(dsn=_async_dsn(postgres_container)))
@@ -676,7 +795,13 @@ async def test_claim_warm_takeover_marks_the_orphan_with_its_own_reason(
             )
 
         assert (
-            await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4()) is None
+            await store.claim_warm(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                sandbox_id=uuid4(),
+                layout=SANDBOX_LAYOUT_USER_ROOT,
+            )
+            is None
         )
 
         async with engine.begin() as conn:
@@ -737,7 +862,13 @@ async def test_set_container_id_rejects_an_already_destroyed_row(
     """
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
     await store.mark_destroyed(sandbox_id=sandbox_id, reason=_REASON_STUCK_CREATE_TAKEOVER)
 
@@ -777,7 +908,13 @@ async def test_mark_destroyed_does_not_restamp_a_terminal_row(
     """
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
     await store.mark_destroyed(sandbox_id=sandbox_id, reason=_REASON_STUCK_CREATE_TAKEOVER)
 
@@ -828,7 +965,13 @@ async def test_touch_and_get_container_id_ignores_a_destroyed_row(
     """
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-live")
     assert await store.touch_and_get_container_id(sandbox_id=sandbox_id) == "sbx-live"
@@ -868,7 +1011,13 @@ async def test_set_container_id_still_backfills_a_live_row(
     """收紧后的 WHERE 不能误伤正常路径 —— 这是唯一真正跑在热路径上的那条。"""
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id) is None
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=sandbox_id,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
+        is None
     )
 
     await store.set_container_id(sandbox_id=sandbox_id, container_id="sbx-live")
@@ -923,7 +1072,9 @@ async def test_docker_warm_row_does_not_block_agent_claim(
     tenant_id, user_id = uuid4(), uuid4()
     await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)
 
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+    )
 
     assert result is None  # agent 侧照常赢得自己的槽位
     async with store._sf() as session:
@@ -946,7 +1097,9 @@ async def test_agent_rows_still_unique_per_tenant_user(
 ) -> None:
     """0142 没放松 agent 行自己的唯一性:直插第二行 agent IN_USE 必炸。"""
     tenant_id, user_id = uuid4(), uuid4()
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+    )
 
     with pytest.raises(IntegrityError):
         async with store._sf() as session:
@@ -1004,12 +1157,19 @@ async def test_collection_queries_exclude_docker_rows(
     # agent claim 拿到的必须是 agent 赢家的 (id, container),不是 docker 的。
     agent_winner = uuid4()
     assert (
-        await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=agent_winner)
+        await store.claim_warm(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            sandbox_id=agent_winner,
+            layout=SANDBOX_LAYOUT_USER_ROOT,
+        )
     ) is None
     await store.set_container_id(sandbox_id=agent_winner, container_id="e2b-123")
-    result = await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4())
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     assert result is not None
-    winner_id, container_id, winner_acquired_at = result
+    winner_id, container_id, winner_acquired_at, _ = result
     assert (winner_id, container_id) == (agent_winner, "e2b-123")
     assert winner_acquired_at is not None
 
@@ -1025,7 +1185,9 @@ async def test_get_container_id_returns_none_for_destroyed_row(
     平台 20 分钟超时是确定性兜底(_SANDBOX_TIMEOUT_S 的既有职责)。
     """
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-dead")
     await store.mark_destroyed(sandbox_id=sandbox_id, reason="test")
 
@@ -1042,11 +1204,15 @@ async def test_count_active_for_tenant_counts_only_agent_backend_live_rows(
     tenant_id, user_id = uuid4(), uuid4()
     await _insert_docker_row(store, tenant_id=tenant_id, user_id=user_id)  # docker 行不算
     a = uuid4()
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=a)  # 建行中:算
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=a, layout=SANDBOX_LAYOUT_USER_ROOT
+    )  # 建行中:算
     b = uuid4()
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=b)  # 临时:算
+    await store.create_ephemeral(
+        tenant_id=tenant_id, sandbox_id=b, layout=SANDBOX_LAYOUT_USER_ROOT
+    )  # 临时:算
     c = uuid4()
-    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=c)
+    await store.create_ephemeral(tenant_id=tenant_id, sandbox_id=c, layout=SANDBOX_LAYOUT_USER_ROOT)
     await store.mark_destroyed(sandbox_id=c, reason="test")  # 已销毁:不算
 
     assert await store.count_active_for_tenant(tenant_id=tenant_id) == 2
@@ -1093,7 +1259,9 @@ async def test_get_warm_returns_none_while_still_creating(
     ``None`` 的 container_id 塞进返回的元组里(签名是 ``tuple[UUID, str]``,
     不是 ``tuple[UUID, str | None]``)。"""
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
 
     assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) is None
 
@@ -1101,7 +1269,9 @@ async def test_get_warm_returns_none_while_still_creating(
 @pytest.mark.asyncio
 async def test_get_warm_returns_the_ready_session(store: SqlSandboxInstanceStore) -> None:
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-live")
 
     assert await store.get_warm(tenant_id=tenant_id, user_id=user_id) == (sandbox_id, "e2b-live")
@@ -1110,7 +1280,9 @@ async def test_get_warm_returns_the_ready_session(store: SqlSandboxInstanceStore
 @pytest.mark.asyncio
 async def test_get_warm_ignores_a_destroyed_row(store: SqlSandboxInstanceStore) -> None:
     tenant_id, user_id, sandbox_id = uuid4(), uuid4(), uuid4()
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id)
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_id, container_id="e2b-dead")
     await store.mark_destroyed(sandbox_id=sandbox_id, reason="test")
 
@@ -1137,9 +1309,13 @@ async def test_get_warm_is_scoped_to_the_given_tenant(store: SqlSandboxInstanceS
     user_id = uuid4()
     tenant_a, tenant_b = uuid4(), uuid4()
     sandbox_a, sandbox_b = uuid4(), uuid4()
-    await store.claim_warm(tenant_id=tenant_a, user_id=user_id, sandbox_id=sandbox_a)
+    await store.claim_warm(
+        tenant_id=tenant_a, user_id=user_id, sandbox_id=sandbox_a, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_a, container_id="tenant-a-live")
-    await store.claim_warm(tenant_id=tenant_b, user_id=user_id, sandbox_id=sandbox_b)
+    await store.claim_warm(
+        tenant_id=tenant_b, user_id=user_id, sandbox_id=sandbox_b, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_b, container_id="tenant-b-live")
 
     assert await store.get_warm(tenant_id=tenant_a, user_id=user_id) == (
@@ -1160,10 +1336,35 @@ async def test_get_warm_is_scoped_to_the_given_user(store: SqlSandboxInstanceSto
     tenant_id = uuid4()
     user_a, user_b = uuid4(), uuid4()
     sandbox_a, sandbox_b = uuid4(), uuid4()
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_a, sandbox_id=sandbox_a)
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_a, sandbox_id=sandbox_a, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_a, container_id="user-a-live")
-    await store.claim_warm(tenant_id=tenant_id, user_id=user_b, sandbox_id=sandbox_b)
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_b, sandbox_id=sandbox_b, layout=SANDBOX_LAYOUT_USER_ROOT
+    )
     await store.set_container_id(sandbox_id=sandbox_b, container_id="user-b-live")
 
     assert await store.get_warm(tenant_id=tenant_id, user_id=user_a) == (sandbox_a, "user-a-live")
     assert await store.get_warm(tenant_id=tenant_id, user_id=user_b) == (sandbox_b, "user-b-live")
+
+
+@pytest.mark.asyncio
+async def test_claim_warm_returns_the_winners_layout_not_the_callers(
+    store: SqlSandboxInstanceStore,
+) -> None:
+    tenant_id, user_id, winner_id = uuid4(), uuid4(), uuid4()
+    assert (
+        await store.claim_warm(
+            tenant_id=tenant_id, user_id=user_id, sandbox_id=winner_id, layout="user-root"
+        )
+        is None
+    )
+    await store.set_container_id(sandbox_id=winner_id, container_id="sbx-warm")
+
+    result = await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4(), layout="agent-ns"
+    )
+
+    assert result is not None
+    assert (result[0], result[3]) == (winner_id, "user-root")

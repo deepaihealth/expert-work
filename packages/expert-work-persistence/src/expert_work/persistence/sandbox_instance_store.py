@@ -116,6 +116,14 @@ _STUCK_CREATE_TTL_S = 5 * 60
 #: operator action and no reaper cycle.
 _REASON_STUCK_CREATE_TAKEOVER = "stuck_create_takeover"
 
+#: B-60 —— 沙箱内布局版本(``sandbox_instance.layout``,迁移 0155)。由**调用方**
+#: (``AgentSandboxClient``)传进 :meth:`claim_warm` / :meth:`create_ephemeral` 写进
+#: INSERT;``claim_warm`` 把赢家行的 layout 随同一次 SELECT 返回。字面量只在这里:
+#: 迁移的 server_default 是 ``'user-root'`` 的第二份副本,``test_sandbox_instance_layout``
+#: 钉它俩相等。
+SANDBOX_LAYOUT_USER_ROOT = "user-root"
+SANDBOX_LAYOUT_AGENT_NS = "agent-ns"
+
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
@@ -162,8 +170,8 @@ class SqlSandboxInstanceStore:
         self._sf = session_factory
 
     async def claim_warm(
-        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str, datetime | None] | None:
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID, layout: str
+    ) -> tuple[UUID, str, datetime | None, str] | None:
         """spec § 6.2 CAS: ``INSERT ... ON CONFLICT DO NOTHING RETURNING``.
 
         The bare (no explicit conflict target) ``ON CONFLICT DO NOTHING``
@@ -258,6 +266,7 @@ class SqlSandboxInstanceStore:
                             pids_limit=0,
                             timeout_s=0,
                             acquired_at=now,
+                            layout=layout,
                         )
                         .on_conflict_do_nothing()
                         .returning(SandboxInstanceRow.id)
@@ -284,6 +293,7 @@ class SqlSandboxInstanceStore:
                             SandboxInstanceRow.id,
                             SandboxInstanceRow.container_id,
                             SandboxInstanceRow.acquired_at,
+                            SandboxInstanceRow.layout,
                         ).where(
                             SandboxInstanceRow.tenant_id == tenant_id,
                             SandboxInstanceRow.user_id == user_id,
@@ -299,9 +309,14 @@ class SqlSandboxInstanceStore:
                 # and this read (its owner dropped/destroyed it) — the slot
                 # may be free now, retry the claim.
                 continue
-            winner_id, existing_container_id, winner_acquired_at = found
+            winner_id, existing_container_id, winner_acquired_at, winner_layout = found
             if existing_container_id:
-                return (winner_id, str(existing_container_id), winner_acquired_at)
+                return (
+                    winner_id,
+                    str(existing_container_id),
+                    winner_acquired_at,
+                    str(winner_layout),
+                )
             if winner_acquired_at is not None and winner_acquired_at < _stuck_create_cutoff(now):
                 # Critical-1: an orphan of a process death between this
                 # method's commit and set_container_id. Clear it and let the
@@ -321,7 +336,7 @@ class SqlSandboxInstanceStore:
         )
         raise RuntimeError(msg)
 
-    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID, layout: str) -> None:
         """Task 10 契约测试实测发现的缺口——完整理由见
         ``orchestrator.tools.sandbox_instance_store.SandboxInstanceStore.create_ephemeral``
         的 docstring。``user_id=None`` 显式排除在迁移 0141 的部分唯一索引
@@ -349,6 +364,7 @@ class SqlSandboxInstanceStore:
                     pids_limit=0,
                     timeout_s=0,
                     acquired_at=_utc_now(),
+                    layout=layout,
                 )
                 .on_conflict_do_nothing()
             )
@@ -675,6 +691,8 @@ class _MemRow:
     #: for a row created via :meth:`InMemorySandboxInstanceStore.claim_warm`.
     user_id: UUID | None
     container_id: str | None = None
+    #: Mirrors ``SandboxInstanceRow.layout``(B-60)。
+    layout: str = SANDBOX_LAYOUT_USER_ROOT
     #: Mirrors ``SandboxInstanceRow.acquired_at`` — set at ``claim_warm``
     #: time so :meth:`InMemorySandboxInstanceStore.list_active` has the
     #: same idleness anchor as :meth:`SqlSandboxInstanceStore.list_active`.
@@ -721,14 +739,16 @@ class InMemorySandboxInstanceStore:
         self._quota_limits: dict[UUID, int] = {}
 
     async def claim_warm(
-        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str, datetime | None] | None:
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID, layout: str
+    ) -> tuple[UUID, str, datetime | None, str] | None:
         key = (tenant_id, user_id)
         for _ in range(_CLAIM_WARM_MAX_ATTEMPTS):
             existing_id = self._warm.get(key)
             if existing_id is None:
                 self._warm[key] = sandbox_id
-                self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=user_id)
+                self._rows[sandbox_id] = _MemRow(
+                    tenant_id=tenant_id, user_id=user_id, layout=layout
+                )
                 return None
             existing = self._rows[existing_id]
             if existing.container_id:
@@ -736,7 +756,7 @@ class InMemorySandboxInstanceStore:
                 # sandbox_id (never inserted on this path) — see
                 # SqlSandboxInstanceStore.claim_warm's docstring for why.
                 # #1b: acquired_at rides along too, same reason.
-                return (existing_id, existing.container_id, existing.acquired_at)
+                return (existing_id, existing.container_id, existing.acquired_at, existing.layout)
             if existing.acquired_at < _stuck_create_cutoff(_utc_now()):
                 # Whole-branch review Critical-1 — mirror of the SQL store's
                 # stale-mid-create takeover, same predicate (shared
@@ -759,7 +779,7 @@ class InMemorySandboxInstanceStore:
         )
         raise RuntimeError(msg)
 
-    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID, layout: str) -> None:
         """Mirrors :meth:`SqlSandboxInstanceStore.create_ephemeral` — a plain
         insert, no ``_warm`` bookkeeping (ephemeral rows never participate in
         the warm-session CAS). First writer wins, same as the SQL side's
@@ -768,7 +788,7 @@ class InMemorySandboxInstanceStore:
         ``_warm`` 指针悬空(指向一行不再是 warm 的行)。"""
         if sandbox_id in self._rows:
             return
-        self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=None)
+        self._rows[sandbox_id] = _MemRow(tenant_id=tenant_id, user_id=None, layout=layout)
 
     async def set_container_id(self, *, sandbox_id: UUID, container_id: str) -> None:
         """Mirrors :meth:`SqlSandboxInstanceStore.set_container_id` — raises
