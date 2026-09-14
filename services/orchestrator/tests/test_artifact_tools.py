@@ -397,7 +397,10 @@ async def test_save_artifact_stats_under_the_agent_scope_root() -> None:
     )
 
     code = client.execs[-1][1]
-    assert '"ws": "/workspace"' in code
+    # 带上尾随逗号 —— ``"ws": "/workspace"`` 本身是 ``"ws": "/workspace/agents/…"``
+    # 的子串,不钉逗号的话「stat 用视图根而不是 agent 专属路径」这条会恒真
+    # (同 test_file_ops.py 的 _VIEW_WS 一样的坑)。
+    assert '"ws": "/workspace",' in code
     assert "deck.pptx" in code
 
 
