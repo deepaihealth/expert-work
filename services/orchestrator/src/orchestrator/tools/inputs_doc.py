@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from expert_work.persistence.workspace.layout import WORKSPACE_INPUTS_DIR
 from expert_work.protocol import PromptVariableSpec
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 
@@ -29,8 +30,14 @@ INPUTS_FILENAME = "inputs.json"
 
 
 def inputs_rel_dir(run_id: UUID) -> str:
-    """本轮 inputs 目录,相对 exec 视图根。"""
-    return f"inputs/{run_id}"
+    """本轮 inputs 目录,相对 exec 视图根。
+
+    目录名取共享包的 ``WORKSPACE_INPUTS_DIR``,不写字面量:同一个名字还被浏览面的保留
+    前缀(``WORKSPACE_RESERVED_PREFIXES``)与 control-plane 的回收闸用着,抄三份就是留
+    两条会静默走散的缝。沙箱侧的 ``prefetch_script`` 是唯一的例外 —— 它要能在没有本仓库
+    的沙箱里独立运行,只能用 stdlib、只能写字面量(那边有注释指回这里)。
+    """
+    return f"{WORKSPACE_INPUTS_DIR}/{run_id}"
 
 
 def inputs_rel_path(run_id: UUID) -> str:

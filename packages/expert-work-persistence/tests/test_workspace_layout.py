@@ -6,6 +6,7 @@ from expert_work.persistence import (
     SANDBOX_AGENTS_ROOT,
     SANDBOX_SKILLS_ROOT,
     WORKSPACE_DELETE_PROTECTED_PREFIXES,
+    WORKSPACE_INPUTS_DIR,
     WORKSPACE_OVERFLOW_DIR,
     WORKSPACE_RESERVED_PREFIXES,
     WORKSPACE_SKILLS_DIR,
@@ -19,6 +20,7 @@ def test_reserved_prefixes_cover_skills_uploads_and_overflow() -> None:
     assert WORKSPACE_SKILLS_DIR in WORKSPACE_RESERVED_PREFIXES
     assert WORKSPACE_UPLOADS_DIR in WORKSPACE_RESERVED_PREFIXES
     assert WORKSPACE_OVERFLOW_DIR in WORKSPACE_RESERVED_PREFIXES
+    assert WORKSPACE_INPUTS_DIR in WORKSPACE_RESERVED_PREFIXES
 
 
 def test_seeded_skill_and_upload_paths_are_reserved() -> None:
@@ -124,3 +126,30 @@ def test_delete_protection_is_a_strict_subset_of_hiding() -> None:
     没有任何界面能解释那是为什么。
     """
     assert WORKSPACE_DELETE_PROTECTED_PREFIXES < WORKSPACE_RESERVED_PREFIXES
+
+
+# ------------------------------------------------------------ B-61 注入变量
+
+
+def test_injected_variable_paths_are_reserved_but_not_delete_protected() -> None:
+    """``inputs/`` 两半都是平台派生的机械产物:浏览面要藏,但平台自己要能回收。
+
+    藏:不藏的话用户的「产物」列表里会混进每一个不透明的
+    ``inputs/cache/<32 位 hex><ext>``(内容寻址的预拉缓存,跨轮长期驻留)与每一轮的
+    ``inputs/<run_id>/inputs.json`` —— 一个都不是 agent 产出的东西。
+
+    **不**加删除保护:与 ``.tool_results`` 同一个理由 —— 这是平台要能自己收的垃圾
+    (control-plane 的 workspace janitor 按 TTL 收它),删除保护挡的是另一个方向的事。
+    """
+    assert is_reserved_workspace_path("agents/plan-aaaaaaaa/inputs/cache/" + "a" * 32 + ".png")
+    assert is_reserved_workspace_path(
+        "agents/plan-aaaaaaaa/inputs/9f2a0000-0000-0000-0000-000000000000/inputs.json"
+    )
+    assert is_reserved_workspace_path("inputs/cache/a.png")  # 未绑 agent 的扁平位置
+    assert not is_delete_protected_workspace_path("agents/plan-aaaaaaaa/inputs/cache/a.png")
+
+
+def test_a_file_named_like_the_inputs_prefix_is_still_agent_output() -> None:
+    """收窄不能收过头:叫 ``inputs.md`` 的文件是产物,不是保留目录。"""
+    assert not is_reserved_workspace_path("agents/plan-aaaaaaaa/inputs.md")
+    assert not is_reserved_workspace_path("agents/plan-aaaaaaaa/客户inputs/x.md")
