@@ -192,3 +192,63 @@ def test_default_is_empty_so_existing_manifests_are_untouched() -> None:
     entry = spec.spec.tools[0]
     assert isinstance(entry, MCPToolSpec)
     assert entry.arg_bindings == []
+
+
+# ---------------------------------------------------------------------------
+# Task 5b —— 落库形态(空绑定不写出去),spec §七
+# ---------------------------------------------------------------------------
+
+
+def test_an_unconfigured_mcp_entry_does_not_serialize_arg_bindings() -> None:
+    """空绑定不落库 —— 旧版本读回来才不会撞 ``extra="forbid"``。
+
+    存库走 ``model_dump()``,**默认值会被物化**:不拦这一下,字段一上线,
+    每个带 MCP 的 agent 只要被保存过就带上 ``arg_bindings: []``,与有没有配
+    绑定无关,回滚时那些 agent 全起不来(spec §七)。
+    """
+    doc = _manifest(variables=[], bindings=[])
+    # 存量 manifest 根本没有这个 key —— 用真实的存量形状。
+    del doc["spec"]["tools"][0]["arg_bindings"]
+    spec = AgentSpec.model_validate(doc)
+    entry = spec.model_dump(by_alias=True, mode="json")["spec"]["tools"][0]
+    assert entry["type"] == "mcp"
+    assert "arg_bindings" not in entry
+    # 只掉这一个键:同样默认为空的 ``allow_tools`` 必须照旧落库。它要是也没了,
+    # 说明改的是全局 ``exclude_defaults`` 口径,那会动到每个字段的落库形态。
+    assert entry["allow_tools"] == []
+
+
+def test_a_configured_binding_still_serializes() -> None:
+    spec = AgentSpec.model_validate(
+        _manifest(
+            variables=[{"name": "a"}],
+            bindings=[{"server": "deepcare", "tool": "t", "args": {"p": "a"}}],
+        )
+    )
+    entry = spec.model_dump(by_alias=True, mode="json")["spec"]["tools"][0]
+    assert entry["arg_bindings"] == [{"server": "deepcare", "tool": "t", "args": {"p": "a"}}]
+
+
+def test_a_configured_manifest_round_trips_through_serialization() -> None:
+    """存进去再读回来必须是同一份配置 —— serializer 改的只是「空的时候不写」。"""
+    spec = AgentSpec.model_validate(
+        _manifest(
+            variables=[{"name": "a"}],
+            bindings=[{"server": "deepcare", "tool": "t", "args": {"p": "a"}}],
+        )
+    )
+    reloaded = AgentSpec.model_validate(spec.model_dump(by_alias=True, mode="json"))
+    assert reloaded == spec
+
+
+def test_input_validation_is_still_strict() -> None:
+    """YAML / 接口这条路不受影响 —— 严格该管的是**人写的输入**。"""
+    doc = _manifest(variables=[], bindings=[])
+    doc["spec"]["tools"][0]["bogus_key"] = 1
+    with pytest.raises(ValidationError) as excinfo:
+        AgentSpec.model_validate(doc)
+    # 钉到具体那一条:裸 ``pytest.raises(ValidationError)`` 在 fixture 将来任何
+    # 字段变非法时都照样绿,验不出「多的键被拒了」这件事。
+    assert [(e["type"], e["loc"]) for e in excinfo.value.errors()] == [
+        ("extra_forbidden", ("spec", "tools", 0, "mcp", "bogus_key"))
+    ]

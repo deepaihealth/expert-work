@@ -28,7 +28,14 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from expert_work.protocol.reflection import ReflectionSpec
 from expert_work.protocol.trigger import TriggerSpec
@@ -1129,6 +1136,29 @@ class MCPToolSpec(BaseModel):
     allow_tools: list[str] = Field(default_factory=list)
     #: B-61 —— 逐工具的参数绑定,默认空(存量 manifest 零影响)。
     arg_bindings: list[ArgBindingSpec] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_arg_bindings(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Leave ``arg_bindings`` out of the output when nothing is bound.
+
+        存库走 ``spec.model_dump(by_alias=True, mode="json")``,**默认值会被
+        物化** —— 不拦这一下,字段一上线,每个带 MCP 的 agent 只要被保存过就
+        带上 ``arg_bindings: []``,与有没有配绑定无关;回滚到旧版本后,它的
+        ``extra="forbid"`` 会把这些 manifest 全拒掉,那些 agent 直接起不来
+        (spec §七)。空就不写,于是「会坏」的范围缩到真正人工配过绑定的那
+        几个,回滚前在配置页清掉即可,不用扫数据库。
+
+        连带:存量 manifest 的 ``compute_spec_sha256`` 不变,
+        ``run.agent_spec_sha256`` 与 ``agent_spec_revision.spec_sha256`` 的等值
+        join(``run_trace.py`` 记为契约)保持成立。
+
+        只管这一个字段:动 ``model_dump`` 的全局口径(``exclude_defaults``)
+        会改掉每个字段的落库形态,影响面比要修的问题大得多。
+        """
+        data: dict[str, Any] = handler(self)
+        if not self.arg_bindings:
+            data.pop("arg_bindings", None)
+        return data
 
 
 #: Discriminated union of the M0-supported tool declarations. ``python``
