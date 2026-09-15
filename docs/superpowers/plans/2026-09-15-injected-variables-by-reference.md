@@ -1873,14 +1873,38 @@ git commit -m "feat(inputs): 预拉改内容寻址缓存——同 URL 跨轮只�
 **Interfaces:**
 - Produces:`JanitorRunStats` 增加 `inputs_files_removed` / `inputs_dirs_removed`;新 phase `_sweep_agent_inputs`,
   接在既有三个 phase 之后(`run_once` 里那个 `for phase in (...)`)。
-- 阈值:`_INPUTS_TTL_S = 7 * 24 * 3600`,按 **mtime** 判定。
+- **策略表驱动,不要把 `inputs/` 写死在循环里**:
+
+```python
+@dataclass(frozen=True)
+class _ReclaimPolicy:
+    """一条回收策略。``enabled=False`` 的条目本批不生效,代码路径仍然走到。"""
+
+    label: str            # 指标与日志用
+    ttl_s: float
+    enabled: bool
+
+
+#: B-61 T12 本批只启用 inputs 两条;uploads 与产物的条目**先放在这里但关着**——
+#: 它们删的是用户数据,需要产品定 N、需要发布前告知、还要对外删除端点(B-62)当自救
+#: 出口,那是 B-63 的事。机制一次写好,B-63 落地时是把开关拨开 + 接 touch 点,不是重写。
+_POLICIES = (
+    _ReclaimPolicy(label="inputs_cache", ttl_s=7 * 24 * 3600, enabled=True),
+    _ReclaimPolicy(label="inputs_run_dir", ttl_s=7 * 24 * 3600, enabled=True),
+    _ReclaimPolicy(label="uploads", ttl_s=90 * 24 * 3600, enabled=False),
+    _ReclaimPolicy(label="artifacts", ttl_s=90 * 24 * 3600, enabled=False),
+)
+```
 
 **只做一条 TTL,不做水位驱逐**(2026-09-15 用户拍板):按最后引用时间过期这一条规则就够,先例都是这个形状
 (OpenAI vector store「最后活跃后 7 天」、Codespaces「30 天,连一次重置」、浏览器 LRU)。水位 + LRU + 归档分层
 先不做 —— 等真观测到「窗口内就把配额爆掉」再说。
 
 **「最后引用」必须真能观测到**:NFS 上 `atime` 基本不可信(多半 `noatime`/`relatime`),**不要拿 atime 当判据**。
-预拉命中缓存时由脚本显式 touch 该文件(`os.utime`),让 mtime 真正代表「最近被用到」。
+预拉命中缓存时由脚本显式 touch 该文件(`os.utime`),让 mtime 真正代表「最近被用到」。`uploads`/产物的 touch 点
+(`read_document`、下载端点)属 B-63,本批不接。
+
+**清理范围要含 `inputs.json.tmp`**:T11 的增量重写会在同目录留临时文件,被 kill 时可能遗留。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1902,6 +1926,17 @@ async def test_sweep_ignores_dirs_that_are_not_uuid_shaped(tmp_workspace) -> Non
 
 async def test_size_accounting_refreshes_after_reclaim(tmp_workspace) -> None:
     ...
+
+
+async def test_disabled_policies_delete_nothing(tmp_workspace) -> None:
+    # uploads / 产物的条目本批是关着的: 造出超期的 uploads 文件, 扫完必须还在
+    # 这条挡的是「以后有人顺手把 enabled 改成 True 就上线了」
+    ...
+
+
+async def test_a_leftover_tmp_file_is_reclaimed(tmp_workspace) -> None:
+    # T11 增量重写留下的 inputs.json.tmp, 被 kill 时会遗留
+    ...
 ```
 
 - [ ] **Step 2: 跑测试确认它红**
@@ -1911,12 +1946,14 @@ Expected: FAIL —— `JanitorRunStats` 没有 `inputs_files_removed`
 
 - [ ] **Step 3: 写实现**
 
-遍历 `<user_root>/agents/*/inputs/`:`cache/` 下按 mtime 删过期文件;UUID 形状的子目录按 mtime 删整个目录。
+按 `_POLICIES` 逐条执行(`enabled=False` 的跳过但**要走到判定**,别用 if 把整条路径短路掉,否则 B-63 开关拨开那天等于全新代码)。
+启用的两条:遍历 `<user_root>/agents/*/inputs/`,`cache/` 下按 mtime 删过期文件(含 `inputs.json.tmp` 残留);UUID 形状的子目录按 mtime 删整个目录。
 **只认 UUID 形状的目录名与 `cache`**,其它一律跳过(别把别人建的目录当垃圾)。删完刷一次体积记账,让配额看到回收。
 
 - [ ] **Step 4: 跑测试确认它绿 + 变异自证**
 
 把 mtime 判定改成无条件删 → `test_sweep_never_touches_a_recently_written_run_dir` 必须红;还原变绿。
+把 `uploads` 那条的 `enabled` 改成 `True` → `test_disabled_policies_delete_nothing` 必须红;还原变绿。
 
 - [ ] **Step 5: 提交**
 
