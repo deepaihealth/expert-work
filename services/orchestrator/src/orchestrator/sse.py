@@ -113,6 +113,13 @@ from orchestrator.trajectory import (
 
 logger = logging.getLogger(__name__)
 
+#: B-61 —— ``config["configurable"]`` 里本轮 Dynamic-Prompt 原始 k/v 的键,
+#: 与 ``CANCELLATION_TOKEN_KEY`` / ``AUDIT_LOGGER_KEY`` 等并列。run-start 的
+#: ``inputs`` 节点据此写 ``inputs.json``;``tools_node`` 据此填绑定的工具参数
+#: (Task 7)。只在 ``run_agent`` 里写一处 —— 四个 run 入口都调 ``run_agent``,
+#: 这一处就是全部(见 test_every_run_entry_reaches_the_configurable_key)。
+PROMPT_INPUTS_KEY: Final = "prompt_inputs"
+
 
 # Stream K.K10 — Session TTFT (Time-To-First-Token). Measured from the
 # moment ``run_agent`` flips the run to ``RUNNING`` to the first real
@@ -394,6 +401,10 @@ async def run_agent(
             # (a process-level singleton, unlike worker_spawn_budget above).
             # ``None`` when unwired (no delegation_config_service).
             DELEGATION_GATE_KEY: delegation_gate,
+            # B-61 —— 本轮 Dynamic-Prompt 的原始 k/v。inputs 节点据此写
+            # inputs.json;tools_node 据此填绑定的工具参数。四个 run 入口都
+            # 汇到这里,所以这一处就是全部。
+            PROMPT_INPUTS_KEY: dict(prompt_inputs or {}),
         },
     }
     # Stream M Gate — session E2E duration. Started before ``set_status``

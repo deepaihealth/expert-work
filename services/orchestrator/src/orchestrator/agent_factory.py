@@ -106,6 +106,7 @@ from orchestrator.graph_builder import (
     MemoryNode,
     PreCompactionFlush,
     build_react_graph,
+    make_inputs_node,
     make_memory_recall_node,
     make_memory_writeback_node,
     make_planner_node,
@@ -1084,6 +1085,15 @@ async def build_agent(
         # Stream CM-0 PR2b — the file→DB counterpart: ingest a human-edited
         # PLAN.md at run start. Same gate as the projection writer.
         workspace_ingest_node = make_workspace_ingest_node(client=env.sandbox_runtime)
+    # B-61 —— 本轮声明变量落成 inputs.json + 沙箱内预拉。门:agent 声明了变量
+    # 且 sandbox runtime 已接。没有声明变量的 agent 完全不装这个节点(零副作用、
+    # 零额外 acquire)。
+    inputs_node = None
+    if spec.spec.system_prompt.variables and env.sandbox_runtime is not None:
+        inputs_node = make_inputs_node(
+            client=env.sandbox_runtime,
+            variables=tuple(spec.spec.system_prompt.variables),
+        )
     # Stream PI-1b — one unguessable nonce per build (stable across the
     # session so the spotlighted memory block stays prompt-cache friendly;
     # the untrusted content's author never sees it, so it can't forge the
@@ -1131,6 +1141,7 @@ async def build_agent(
         pre_compaction_flush=pre_compaction_flush,
         workspace_writer_factory=workspace_writer_factory,
         workspace_ingest_node=workspace_ingest_node,
+        inputs_node=inputs_node,
         # Stream J.8 (Mini-ADR J-24) — declarative approval gate.
         approval_required_tools=frozenset(spec.spec.policies.approval_required_tools),
         approval_timeout_s=spec.spec.policies.approval_timeout_s,
