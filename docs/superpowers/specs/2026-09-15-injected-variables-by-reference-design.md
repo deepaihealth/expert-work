@@ -222,6 +222,21 @@ tools:
 | 绑定指向未声明的变量名 | **manifest 校验期拒**(保存草稿 / 发布 dry-run 都会跑) | 下拉框只管住表单那一条路;YAML 直编、`PUT …/draft`、模板复制都绕得过(§零 #8) |
 | 删除一个被绑定引用的声明变量 | **拒删**,并列出哪几个工具在用 | 跟删技能 / 删子 Agent 同一口径;不留悬空引用 |
 | 绑定的参数在该工具 schema 里不存在(对方改了接口) | 建目录时记一条告警,该条按未命中处理,**不阻断 run** | 上游接口漂移不该让整个 agent 起不来 |
+| **绑定的 `server` / `tool` 一个都没匹配上**(名字写错) | **保存时试建那一步给警告**(`_check_buildable` 的 `warning` 档,保存照做),运行期另有一条兜底告警 | 见下面「为什么闸在保存时」 |
+
+**为什么这道闸在保存时,不在 manifest 校验里(2026-09-15 修正)**:manifest 层**查不出来**这件事 ——
+`MCPToolSpec.servers` 为空是**默认值**且表示「所有服务器」,而「这个租户到底有哪些服务器、每个上面有哪些工具」
+对 protocol 包不可见。于是名字写错时:绑定匹配不到任何工具 → 那个参数**重新回到模型手里** → 模型继续手抄长串,
+**正是本设计要消灭的那个病,而且一声不吭**。
+
+真正知道答案的地方是**保存时的试建** —— `api/agents.py:_check_buildable` 用**真正的 builder** 组装一遍,
+注释明写「包括挂上 MCP 的连接池」。也就是说保存那一刻平台确切知道工具目录长什么样,当场就能比对。
+
+**必须走 `warning` 档不能走 `422` 档**:同一段注释写着「任何 MCP 路径都不抛 `AgentFactoryError`
+(连不上的服务器只是跳过,从不致命),所以第三方 MCP 抖动不会拒掉一次保存」—— 把「绑定没匹配上」做成拒绝,
+等于让对方服务临时不可达就卡死保存。警告则两全:配错的人当场看见,服务抖动只是多一句话。
+
+---
 
 ### 5.5 配置页
 
@@ -252,7 +267,26 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
 
 **收益要等对接方改提示词**(第二步,他们自己挑时间):`ai-health-plan` 模板 5 处——L7/L10 不再内联 `{{ org_logo }}`/`{{ materials }}`、新增「输入文件(硬规则)」段、L63/L65 封面 LOGO 改用 `local_path` 且失败判据改「为空或本地不存在」、L85-87 素材每项用 `local_path`、超链接 URL 必须代码从 inputs.json 读。落进 Agent 配置书 #1235 addendum。
 
-**回滚的坑(必须写进发布清单)**:`MCPToolSpec` 是 `extra="forbid"`,**旧版本读到带 `arg_bindings` 的 manifest 会校验失败**——不是行为退化,是那些 agent 直接起不来。处置:回滚窗口内先别配绑定;或回滚前先清掉绑定配置。与 B-50 那次「回滚窗口在数据搬迁之前」同类。
+**回滚(2026-09-15 重定 —— 原方案靠人工,用户否)**。原记:`MCPToolSpec` 是 `extra="forbid"`,旧版本读到带
+`arg_bindings` 的 manifest 会校验失败,那些 agent 直接起不来;原缓解是「回滚窗口内先别配绑定」。
+
+**那条缓解不成立**:存库走 `spec.model_dump(by_alias=True, mode="json")`(`persistence/agent_spec/sql.py:94,237,325`),
+**默认值会被物化** —— 实测存出来是 `{"type":"mcp","servers":["deepcare"],"allow_tools":[],"arg_bindings":[]}`。
+于是字段一上线,**每个带 MCP 的 agent 只要被保存过就带上它**,跟有没有配绑定无关。「别配绑定」挡不住,
+只能靠回滚时扫一遍 JSONB —— 而**要人工跑 SQL 的回滚不算回滚**(用户 2026-09-16 拍板)。
+
+两条一起做:
+
+1. **空就不写**。`arg_bindings` 为空时不出现在序列化结果里(`MCPToolSpec` 上一个 `model_serializer`,不动全局
+   `model_dump` 口径)。于是「会坏」的范围从**所有 MCP agent**缩到**真正人工配过的那几个**,回滚前在配置页清掉即可,
+   不碰数据库。**连带修掉一个问题**:`compute_spec_sha256` 对存量 manifest 不再变化,
+   `run.agent_spec_sha256` 与 `agent_spec_revision.spec_sha256` 的等值 join(`run_trace.py:120` 记为契约)保持成立。
+2. **写入严格、读回宽容**。YAML / 接口进来的配置照旧 `extra="forbid"` 挡错字;**从我们自己库里读回来的
+   `spec_json` 遇到不认识的键就忽略并打日志**(三处读回点:`sql.py:34,58,72`)。严格该管的是**人写的输入**,
+   不是**我们自己写出去又读回来的数据**。这条一次性根治整类问题 —— 此后任何新增 spec 字段都不再有回滚坑
+   (`servers` 当年同病)。
+
+无 DB 迁移:绑定仍存在 `spec_json`(JSONB)里。
 
 **无 DB 迁移**:绑定存在 `spec_json`(JSONB)里。`inputs/` 的清理见 §4.6 勘误 —— 现有 janitor **不**管它,由 PR-A2(计划 T11/T12)补上,与本程序同批发测试环境。
 
@@ -262,6 +296,8 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
 
 - **预拉**:每个变量一条——命中/未命中、字节数、耗时、未命中原因(404 / 超时 / 超限 / content-type / 被出网策略挡)。不记值、不记 URL 全文。
 - **绑定**:`TOOL_CALL` 审计行加一列「本次调用有哪些参数是平台绑定填的」(参数名)。
+- **绑定配错**:保存时试建比对绑定与真实工具目录,对不上当场给警告(§5.4);运行期填值时若某条绑定一个工具都没匹配上,
+  再记一条兜底告警。**两条都只记名字,不记值。**
 - 两者都要能回答同一个问题:**这个值是平台给的,还是模型打的。** 这正是本轮排查 `org_logo` 时缺的东西。
 
 ---
