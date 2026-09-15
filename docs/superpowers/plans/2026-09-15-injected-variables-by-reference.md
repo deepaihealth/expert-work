@@ -1971,7 +1971,7 @@ cache 条目的 mtime 由 T11 维持成「最近一次下载时间」——24h �
 所以它就是「最近引用时间」的 24h 粒度近似。**T11 不会 touch,这里也不需要任何 touch 配合**(台账 Ruling A)。
 `uploads`/产物的 touch 点(`read_document`、下载端点)属 B-63,本批不接。
 
-**清理范围要含 `inputs.json.tmp`**:T11 的增量重写会在同目录留临时文件,被 kill 时可能遗留。
+**勘误(2026-09-15,T12 执行时核出)**:本条原写「清理范围要含 `inputs.json.tmp`」,依据是错的 —— `prefetch_script._rewrite` 写的是 `<inputs_path>.tmp`,即 `inputs/<run_id>/inputs.json.tmp`,**在 run 目录里面**,本来就随整个 run 目录一起回收,`inputs/` 这一层打不到它。子句保留但属防御性、今天不可达;**保留的理由是机制不是名字** —— `file_names` 非 None 这条规则是 `inputs/README.md` 这类文件不被误删的依据。真正会攒在 `cache/` 里的残留是 `mkstemp` 的 `tmpXXXXXXXX`,由缓存策略「该层所有文件」那条覆盖。
 
 - [ ] **Step 1: 写失败的测试**
 
