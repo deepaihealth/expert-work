@@ -97,7 +97,10 @@ async def test_binds_the_stored_column_not_the_recomputed_hash() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_stored_sha256_falls_back_to_the_recomputed_hash() -> None:
-    """草稿试跑那一路 ``draft_sha256`` 列可能是空串 —— 空则回退现算,不是留空。"""
+    """空串回退这条分支在本仓库里今天到不了(``AgentSpecDraft`` /
+    ``AgentSpecRecord`` 的 ``spec_sha256`` 都钉了 ``min_length=64``,调用方拿到的
+    永远要么是合法 64 位值要么在读回那一步就先抛了)。这里钉的是它的**契约**:
+    真出现空串,必须回退现算,不能把空串写进 ``run.agent_spec_sha256``。"""
     tenant_id = uuid4()
     runs = InMemoryRunStore()
     run_id = await _seed_run(runs, tenant_id=tenant_id)
@@ -178,3 +181,40 @@ async def test_runs_none_is_a_no_op() -> None:
         stored_sha256="3" * 64,
         source=_SOURCE,
     )
+
+
+class _BoomSpec:
+    """一个 ``model_dump`` 会抛的 spec 桩 —— 只为钉住 ``try`` 的覆盖范围。"""
+
+    def model_dump(self, **_kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+
+@pytest.mark.asyncio
+async def test_hashing_failure_is_swallowed_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """修复轮 2(N-3)—— ``compute_spec_sha256`` 必须在 ``try`` 里面。
+
+    这个函数的契约是「绑不上只记日志,不影响 run」(见模块 docstring:「软
+    失败:两个回写都只记日志」)。``compute_spec_sha256`` 现实中不会抛
+    (对一个已校验模型做 ``json.dumps(model_dump(...))``),但它曾经被挪到过
+    ``try`` 外面,一旦真的抛出就会一路窜到调用方,弄死一条本来能跑的 run。
+    这里用一个 ``model_dump`` 会抛的桩钉住这条边界:算哈希失败也必须落进
+    ``spec_bind_failed``,不能让异常逃出 ``bind_exec_spec``。"""
+    tenant_id = uuid4()
+    runs = InMemoryRunStore()
+    run_id = await _seed_run(runs, tenant_id=tenant_id)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        await bind_exec_spec(
+            runs=runs,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            spec=_BoomSpec(),  # type: ignore[arg-type]
+            stored_sha256="4" * 64,
+            source=_SOURCE,
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("spec_bind_failed" in m for m in messages), messages

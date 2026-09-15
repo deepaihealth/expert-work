@@ -128,8 +128,13 @@ async def bind_exec_spec(
     ``spec_sha256_diverged``,``stored`` / ``computed`` 两个哈希都进日志;内容
     哈希不是秘密,只有 ``spec_json`` 里的值才需要避)。
 
-    ``stored_sha256`` 为空串时回退用现算值,且不打日志:那不是分叉,是这一行
-    从来就没有过存量哈希(草稿试跑那一路,``draft_sha256`` 列本身可能是空)。
+    ``stored_sha256`` 为空串时回退用现算值,且不打日志:这条分支在本仓库里
+    **今天到不了**——``AgentSpecDraft.spec_sha256`` 与 ``AgentSpecRecord.spec_sha256``
+    都钉了 ``Field(min_length=64, max_length=64)``,调用方手里的
+    ``record.spec_sha256`` / ``record.draft.spec_sha256`` 要么是合法的 64 位值,
+    要么在读回那一步就已经 ``ValidationError`` 了,轮不到传空串进这里。留着
+    这条回退,是为了给「调用方以后手里压根没有那一列」这个假想形态一个确定
+    语义——退回重算,而不是往 ``run.agent_spec_sha256`` 里写一个空串。
 
     ``runs`` 为 ``None`` 时直接返回:那是没接持久化的 :class:`RunManager`
     (纯内存注册表),压根没有一行可以标注 —— 与「有行但写失败」是两回事,
@@ -140,17 +145,17 @@ async def bind_exec_spec(
     logger = logging.getLogger(f"expert_work.control_plane.{source}")
     if runs is None:
         return
-    computed = compute_spec_sha256(spec)
-    bound = stored_sha256 or computed
-    if stored_sha256 and stored_sha256 != computed:
-        logger.warning(
-            "%s.spec_sha256_diverged run_id=%s stored=%s computed=%s",
-            source,
-            run_id,
-            stored_sha256,
-            computed,
-        )
     try:
+        computed = compute_spec_sha256(spec)
+        bound = stored_sha256 or computed
+        if stored_sha256 and stored_sha256 != computed:
+            logger.warning(
+                "%s.spec_sha256_diverged run_id=%s stored=%s computed=%s",
+                source,
+                run_id,
+                stored_sha256,
+                computed,
+            )
         ok = await runs.set_agent_spec_sha256(
             run_id=run_id,
             tenant_id=tenant_id,

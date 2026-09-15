@@ -23,7 +23,6 @@ from control_plane.orphan_sweep import OrphanSweep
 from control_plane.tenant_status import TenantStatusService
 from expert_work.persistence import InMemoryAgentDisableStore, InMemoryTenantConfigStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunStore, RunInfo, RunManager, RunStatus
 from expert_work.runtime.runs.schemas import DisconnectMode
@@ -76,15 +75,19 @@ _SPEC = AgentSpec.model_validate(
 )
 
 
+_SPEC_SHA256 = "b" * 64
+
+
 class _FakeAgents:
     async def get(self, *, tenant_id, name, version):
         del tenant_id, name, version
         # A real AgentSpec, not a stand-in: the sweep now hashes what it
         # rebuilt from, and a stand-in would make that hashing untestable here.
-        # ``spec_sha256``(B-61 T5b 修复轮 1,I-1)—— ``bind_exec_spec`` 绑的是
-        # 这一列,不是重算值;这里就是「库里那一列」,等于 ``_SPEC`` 自己的
-        # 哈希,与下面的期望值同源。
-        return SimpleNamespace(spec=_SPEC, spec_sha256=compute_spec_sha256(_SPEC))
+        # ``spec_sha256``(B-61 T5b 修复轮 2,N-2)—— ``bind_exec_spec`` 绑的是
+        # 这一列,不是重算值;这里用一个与 ``_SPEC`` 内容哈希不同的合成值,
+        # 断言才能分辨绑的到底是这一列还是现算值(用真实哈希会让两者恰好
+        # 相等,断言测不出方向)。
+        return SimpleNamespace(spec=_SPEC, spec_sha256=_SPEC_SHA256)
 
 
 class _FakeRuntime:
@@ -607,4 +610,4 @@ async def test_respawn_records_the_manifest_version_it_rebuilt_from(
 
     row = await store.get(run_id=run_id, tenant_id=tenant)
     assert row is not None
-    assert row.agent_spec_sha256 == compute_spec_sha256(_SPEC)
+    assert row.agent_spec_sha256 == _SPEC_SHA256

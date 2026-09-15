@@ -204,6 +204,31 @@ async def test_stream_run_hides_system_prompt_frame(ctx: _Ctx) -> None:
     assert "event: system_prompt" not in resp.text
 
 
+@pytest.mark.asyncio
+async def test_stream_run_records_the_manifest_version_it_built(ctx: _Ctx) -> None:
+    """N-2 追加(修复轮 2)—— 对外「按用户跑 run」这个入口此前没有任何测试
+    盯着 ``agent_spec_sha256`` 绑的是哪一列。
+
+    这条路径把 ``record.spec_sha256`` 转手交给 ``spawn_run(record_spec_sha256=…)``
+    再到 ``bind_exec_spec``;复评把控制面五处 sha 实参全变异成错值,3884 条
+    测试里没有一条在这条路径上红过。``seed_agent`` 存的是合成哈希
+    ``"a" * 64``,与 ``_SPEC`` 的真实内容哈希不同,断言才能分辨绑的到底是
+    库里那一列还是现算值 —— 两者用真实哈希会恰好相等,测不出方向。
+    """
+    await ctx.seed_agent()
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "u", "input": "hi"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    run_id = UUID(resp.headers["X-Expert-Work-Run-Id"])
+
+    row = await ctx.run_store.get(run_id=run_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    assert row.agent_spec_sha256 == "a" * 64
+
+
 def test_external_run_request_input_cap_matches_run_request() -> None:
     # ExternalRunRequest.input shares the same free-text cap as RunRequest.
     from pydantic import ValidationError
