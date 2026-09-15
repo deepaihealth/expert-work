@@ -9,7 +9,8 @@
   给的结构。统一形状让沙箱代码不用先判类型。
 * **``local_path`` 就地挂在 URL 旁边** —— 顶层 URL 变量挂在变量对象上,嵌套的挂在
   那一项上(``materials[0].local_path``)。路径**相对 ``/workspace``**:B-60 之后
-  exec 的 cwd 就是 ``/workspace``,相对路径与 ``Path("/workspace") / rel`` 都成立。
+  exec 的 cwd 就是 ``/workspace``(即 :data:`sandbox_image_contract.EXEC_VIEW`),
+  相对路径与 ``Path("/workspace") / rel`` 都成立。
 """
 
 from __future__ import annotations
@@ -21,12 +22,10 @@ from typing import Any
 from uuid import UUID
 
 from expert_work.protocol import PromptVariableSpec
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 
 #: 文件名。目录按 run 分(spec §十二:同用户同 agent 并发 run 彻底隔离)。
 INPUTS_FILENAME = "inputs.json"
-
-#: exec 视图根。B-60 之后 ``/workspace`` 就是 ``agents/<key>``。
-_EXEC_VIEW = "/workspace"
 
 
 def inputs_rel_dir(run_id: UUID) -> str:
@@ -41,7 +40,7 @@ def inputs_rel_path(run_id: UUID) -> str:
 
 def inputs_abs_path(run_id: UUID) -> str:
     """本轮 ``inputs.json`` 在沙箱里的绝对路径(``EXPERT_WORK_INPUTS`` 的值)。"""
-    return f"{_EXEC_VIEW}/{inputs_rel_path(run_id)}"
+    return f"{EXEC_VIEW}/{inputs_rel_path(run_id)}"
 
 
 @dataclass(frozen=True)

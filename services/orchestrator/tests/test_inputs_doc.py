@@ -108,6 +108,8 @@ def test_with_local_path_none_writes_an_explicit_null() -> None:
     site = iter_url_sites(doc)[0]
     updated = with_local_path(doc, site, None)
     assert updated["variables"]["org_logo"]["local_path"] is None
+    # 原文档没被改(不可变,顶层分支)
+    assert "local_path" not in doc["variables"]["org_logo"]
 
 
 def test_top_level_url_variable_keeps_value_as_the_url_string() -> None:
