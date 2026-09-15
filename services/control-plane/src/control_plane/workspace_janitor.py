@@ -1,17 +1,19 @@
 """``WorkspaceJanitorWorker`` —— 沙箱迁移波 3 PR-2(spec § 五)。
 
-Periodic background worker driving the three NAS-workspace housekeeping
+Periodic background worker driving the NAS-workspace housekeeping
 phases: archiving soft-deleted user workspaces to the object store
-(``_sweep_archives``), refreshing per-user size accounting
+(``_sweep_archives``), reclaiming expired ``agents/<key>/inputs/`` entries
+(``_sweep_agent_inputs``, B-61 T12), refreshing per-user size accounting
 (``_sweep_sizes``), and reaping stale ``_scratch`` sandbox-tmp directories
 (``_sweep_scratch``). One cycle every ``interval_s`` (default 1800s = 30
 minutes, spec § 五).
 
-All three phases are implemented: ``_sweep_archives`` uploads soft-deleted
+All phases are implemented: ``_sweep_archives`` uploads soft-deleted
 users' workspaces then ``rm -rf``s the NAS directory (marking the row
-archived), ``_sweep_sizes`` walks every tenant/user directory and refreshes
-its size accounting, and ``_sweep_scratch`` reaps stale ``_scratch``
-sandbox-tmp directories. Structure mirrors
+archived), ``_sweep_agent_inputs`` expires injected-variable caches and
+per-run directories by TTL, ``_sweep_sizes`` walks every tenant/user
+directory and refreshes its size accounting, and ``_sweep_scratch`` reaps
+stale ``_scratch`` sandbox-tmp directories. Structure mirrors
 :class:`~control_plane.sandbox_reap_worker.SandboxReapWorker` (start/stop/
 loop) and :class:`~control_plane.skill_curator.SkillCurator` (advisory-lock
 wrapper around the cycle body).
@@ -46,6 +48,10 @@ from control_plane.workspace_archive import (
 )
 from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.persistence.workspace import UserWorkspaceStore
+from expert_work.persistence.workspace.layout import (
+    WORKSPACE_AGENTS_DIR,
+    WORKSPACE_UPLOADS_DIR,
+)
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools.nas_workspace_store import DELETED_DIR, workspace_user_root
 
@@ -79,6 +85,166 @@ _SCRATCH_MAX_AGE_S = 24 * 3600.0
 
 #: 与 orchestrator ``agent_sandbox._SCRATCH_DIR`` 同值(私名不跨包 import)。
 _SCRATCH_DIR = "_scratch"
+
+#: 与 orchestrator ``tools/inputs_doc.inputs_rel_dir`` 里的 ``inputs`` 同值
+#: (私名不跨包 import,照上面 ``_SCRATCH_DIR`` 的先例)。
+_INPUTS_DIR = "inputs"
+
+#: 与 orchestrator ``tools/prefetch_script.CACHE_DIRNAME`` 同值 —— 内容寻址的
+#: 共享缓存,挂在 ``inputs/`` 下、与 ``<run_id>/`` 平级。
+_INPUTS_CACHE_DIR = "cache"
+
+#: ``tools/prefetch_script._rewrite`` 的临时文件(``inputs.json`` + ``.tmp``)。
+#: 它正常会被 ``os.replace`` 消费掉,预拉被 SIGKILL 时才遗留。
+_INPUTS_TMP_NAME = "inputs.json.tmp"
+
+
+@dataclass(frozen=True)
+class _ReclaimPolicy:
+    """一条回收策略。``enabled=False`` 的条目本批不生效,代码路径仍然走到。"""
+
+    label: str  # 指标与日志用
+    ttl_s: float
+    enabled: bool
+
+    def expired(self, mtime: float, now: float) -> bool:
+        """这个条目该收了吗。
+
+        ``enabled`` 判在**这里**、而不是在调用方用 ``if`` 跳掉整条策略:关着的
+        策略照样被扫、照样逐条走到判定,只是答案恒为「不收」。B-63 要开 uploads
+        与产物那两条时拨的是这个开关,不是补一段从没跑过的新代码。
+        """
+        return self.enabled and now - mtime >= self.ttl_s
+
+
+#: B-61 T12 本批只启用 inputs 两条;uploads 与产物的条目**先放在这里但关着**——
+#: 它们删的是用户数据,需要产品定 N、需要发布前告知、还要对外删除端点(B-62)当自救
+#: 出口,那是 B-63 的事。机制一次写好,B-63 落地时是把开关拨开 + 接 touch 点,不是重写。
+_POLICIES = (
+    _ReclaimPolicy(label="inputs_cache", ttl_s=7 * 24 * 3600, enabled=True),
+    _ReclaimPolicy(label="inputs_run_dir", ttl_s=7 * 24 * 3600, enabled=True),
+    _ReclaimPolicy(label="uploads", ttl_s=90 * 24 * 3600, enabled=False),
+    _ReclaimPolicy(label="artifacts", ttl_s=90 * 24 * 3600, enabled=False),
+)
+
+
+@dataclass(frozen=True)
+class _ReclaimTarget:
+    """一条策略在 agent 子树里的落点:``agents/<key>/<subdir>/`` 下收什么。
+
+    只看这一层的直接子项(不递归):收的东西要么是一整棵 per-run 目录、要么是一个
+    条目文件,再往下就是它们自己的内容。
+    """
+
+    subdir: str
+    #: 收目录:只收名字是 UUID 的(per-run 目录)。``False`` = 这一层的目录一律不碰。
+    uuid_dirs: bool
+    #: 收文件:``None`` = 这一层的文件全收;否则只收名字在集合里的。
+    file_names: frozenset[str] | None
+
+
+#: 每条策略去哪儿收,键是 :attr:`_ReclaimPolicy.label`。
+#:
+#: ``artifacts`` **故意没有条目**:产物没有保留前缀 —— ``save_artifact`` 只是把
+#: agent 子树里任意位置的一个文件**登记成一行**(``tools/artifact.py``),纯文件系统
+#: 的清扫器认不出哪个文件是产物,``layout.py`` 的 ``WORKSPACE_RESERVED_PREFIXES``
+#: 正是为此只列 machinery 与 uploads。所以「产物在哪」要等 B-63 先定义(它的方案是
+#: 让目录自描述)。策略行留着是为了 TTL 与开关已经在位;**开关拨开之前还得先在这里
+#: 补上落点**,否则它拨开也不收东西。
+_TARGETS: dict[str, _ReclaimTarget] = {
+    "inputs_cache": _ReclaimTarget(
+        subdir=f"{_INPUTS_DIR}/{_INPUTS_CACHE_DIR}", uuid_dirs=False, file_names=None
+    ),
+    "inputs_run_dir": _ReclaimTarget(
+        subdir=_INPUTS_DIR, uuid_dirs=True, file_names=frozenset({_INPUTS_TMP_NAME})
+    ),
+    "uploads": _ReclaimTarget(subdir=WORKSPACE_UPLOADS_DIR, uuid_dirs=False, file_names=None),
+}
+
+
+def _is_uuid_name(name: str) -> bool:
+    try:
+        UUID(name)
+    except ValueError:
+        return False
+    return True
+
+
+def _list_agent_dirs(user_dir: Path) -> list[Path]:
+    """``<user_dir>/agents/`` 下的每棵 agent 子树。
+
+    这一层的名字是 agent key(**不是 UUID**),所以复用不了 ``_list_uuid_dirs``。
+    名字不做形状校验:路径是从 ``entry.path`` 直接拿的,不是拼字符串,``scandir``
+    给的名字里不可能有 ``/``。symlink 不算目录(``follow_symlinks=False``):不顺
+    着链接删。单目录扫描失败 log + 返回已收集的部分,照本文件既有口径。
+    """
+    agents_root = user_dir / WORKSPACE_AGENTS_DIR
+    out: list[Path] = []
+    try:
+        with os.scandir(agents_root) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        out.append(Path(entry.path))
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        return []
+    except OSError:
+        logger.warning("workspace_janitor.agents_scan_failed path=%s", agents_root)
+        return out
+    return sorted(out)
+
+
+def _reclaim(agent_dir: Path, policy: _ReclaimPolicy, now: float) -> tuple[int, int]:
+    """按一条策略收一棵 agent 子树,返回 ``(删掉的文件数, 删掉的目录数)``。
+
+    判据只有 mtime 一条(见 :meth:`WorkspaceJanitorWorker._sweep_agent_inputs`)。
+    单条目失败 log + 继续:NAS 上并发写删是常态,一个 ESTALE 不该带走这一轮的其余
+    条目。日志只记策略名与**目录**路径,不记条目名 —— uploads 的文件名是租户上传时
+    带的,属于租户内容(spec §八)。
+    """
+    target = _TARGETS.get(policy.label)
+    if target is None:
+        return 0, 0
+    base = agent_dir / target.subdir
+    files = dirs = 0
+    try:
+        with os.scandir(base) as it:
+            for entry in it:
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    if is_dir:
+                        # 只认 UUID 形状的目录名:别人建的目录不是垃圾。
+                        if not target.uuid_dirs or not _is_uuid_name(entry.name):
+                            continue
+                    elif entry.is_file(follow_symlinks=False):
+                        if target.file_names is not None and entry.name not in target.file_names:
+                            continue
+                    else:
+                        continue  # symlink / 特殊文件:不是本平台造的,不碰
+                    if not policy.expired(entry.stat(follow_symlinks=False).st_mtime, now):
+                        continue
+                except OSError:
+                    continue
+                try:
+                    if is_dir:
+                        shutil.rmtree(entry.path)
+                        dirs += 1
+                    else:
+                        os.unlink(entry.path)
+                        files += 1
+                except OSError:
+                    logger.warning(
+                        "workspace_janitor.reclaim_failed policy=%s path=%s", policy.label, base
+                    )
+    except FileNotFoundError:
+        return 0, 0  # 绝大多数 agent 根本没有这一层目录
+    except OSError:
+        logger.warning(
+            "workspace_janitor.reclaim_scan_failed policy=%s path=%s", policy.label, base
+        )
+    return files, dirs
 
 
 def _list_uuid_dirs(path: Path) -> list[tuple[UUID, Path]]:
@@ -117,6 +283,9 @@ class JanitorRunStats:
     reharvested: int = 0
     refreshed: int = 0
     scratch_removed: int = 0
+    #: ``_sweep_agent_inputs`` 这一轮收掉的条目数(按 :data:`_POLICIES` 全部策略合计)。
+    inputs_files_removed: int = 0
+    inputs_dirs_removed: int = 0
     skipped: bool = False
 
 
@@ -223,7 +392,15 @@ class WorkspaceJanitorWorker:
                 await lock_session.rollback()
 
     async def _run_cycle(self, stats: JanitorRunStats) -> None:
-        for phase in (self._sweep_archives, self._sweep_sizes, self._sweep_scratch):
+        # 回收排在 ``_sweep_sizes`` **之前**:那一步本来就逐用户跑全树 du,
+        # 排在它前面回收,同一轮的体积记账天然反映回收量,零额外开销;排到最后
+        # 就得再 du 一遍全树(见 test_reclaim_lands_in_the_same_cycle_size_accounting)。
+        for phase in (
+            self._sweep_archives,
+            self._sweep_agent_inputs,
+            self._sweep_sizes,
+            self._sweep_scratch,
+        ):
             try:
                 await phase(stats)
             except Exception:  # 单阶段炸不拖累后续阶段;下轮自然重试
@@ -297,6 +474,31 @@ class WorkspaceJanitorWorker:
             await self._object_store.put(key, empty_tar_gz_bytes(), content_type="application/gzip")
         await self._user_workspaces.mark_archived(workspace_id=ws.id, archived_object_key=key)
         stats.archived += 1
+
+    async def _sweep_agent_inputs(self, stats: JanitorRunStats) -> None:
+        """按 :data:`_POLICIES` 回收 ``agents/<agent_key>/`` 下的过期条目。
+
+        发现源与 :meth:`_sweep_sizes` 同:tenant / user 两层 UUID 目录;再往下
+        ``agents/`` 里是 agent key(**不是 UUID**),走 :func:`_list_agent_dirs`。
+
+        **判据只看 mtime,不碰 atime**:NAS 多半挂成 ``noatime``/``relatime``,
+        atime 不可信。cache 条目的 mtime 由预拉脚本维持成「最近一次下载时间」——
+        24h 内命中不重下(mtime 不动)、超期命中会重下刷新 mtime —— 于是它就是
+        「最近引用时间」的 24h 粒度近似;per-run 目录的 mtime 则被每次改写
+        ``inputs.json`` 顶新,**活跃 run 的目录因此总是新鲜的**(删错它就打断了
+        正在跑的那一轮,见 ``test_sweep_never_touches_a_recently_written_run_dir``)。
+
+        ``now`` 取一次、整轮共用:同一轮里先后扫到的条目按同一条时间线判定。
+        """
+        root = Path(self._workspace_root)
+        now = time.time()
+        for _tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
+            for _user_id, user_dir in await asyncio.to_thread(_list_uuid_dirs, tenant_dir):
+                for agent_dir in await asyncio.to_thread(_list_agent_dirs, user_dir):
+                    for policy in _POLICIES:
+                        files, dirs = await asyncio.to_thread(_reclaim, agent_dir, policy, now)
+                        stats.inputs_files_removed += files
+                        stats.inputs_dirs_removed += dirs
 
     async def _sweep_sizes(self, stats: JanitorRunStats) -> None:
         """文件系统为发现源:按 tenant/user 两层 UUID 目录全量扫,逐用户调
