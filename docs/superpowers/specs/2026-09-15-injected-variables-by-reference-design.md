@@ -72,8 +72,15 @@ https://deep-ai-health-test.oss-cn-hangzhou.aliyuncs.com/plan-generator/brand-lo
 
 ```
 agents/<agent_key>/inputs/<run_id>/inputs.json
-agents/<agent_key>/inputs/<run_id>/files/<变量名>.<ext>
+agents/<agent_key>/inputs/cache/<sha256(url)[:32]><ext>
 ```
+
+**勘误(2026-09-15,T11)**:预拉文件原设计写在 `<run_id>/files/<变量名>.<ext>`,按 run 一份。
+改为**内容寻址、按 agent 共享**的 `inputs/cache/`:同一个 URL 跨轮只下一次。理由是同一个病的两面 ——
+每用户工作区配额 10 GiB 挂在 `AgentSandboxClient.acquire` 的闸上,20 MB 素材 × 500 轮就到顶,
+而按 run 复制既浪费带宽又是这条增长曲线的分子。文件名只由 URL 的 sha256 决定,租户字符串不进路径。
+缓存条目 24 小时算新鲜(命中不重下),超期重下 —— 于是 mtime 天然是「最近引用时间」的 24h 粒度近似,
+§4.6 的回收闸按它过期。
 
 `inputs.json`:
 
@@ -85,11 +92,11 @@ agents/<agent_key>/inputs/<run_id>/files/<变量名>.<ext>
     "org_logo": {
       "value": "https://deep-ai-health-test.oss-cn-hangzhou.aliyuncs.com/plan-generator/brand-logo/1789382970142-logo11.jpg",
       "trusted": true,
-      "local_path": "inputs/382f6f5a-55c4-49be-ac05-32fa143f010d/files/org_logo.jpg"
+      "local_path": "inputs/cache/9f2a4c1b7e0d3856a1f4c920b7d5e386.jpg"
     },
     "materials": {
       "value": [
-        {"description": "示范视频", "url": "https://…/a.mp4", "local_path": "inputs/382f6f5a…/files/materials.0.mp4"},
+        {"description": "示范视频", "url": "https://…/a.mp4", "local_path": "inputs/cache/4d17b0e93c5a2f68d0b14e7a92c3f581.mp4"},
         {"description": "参考文章", "url": "https://…/post", "local_path": null}
       ],
       "trusted": false
@@ -133,7 +140,7 @@ agents/<agent_key>/inputs/<run_id>/files/<变量名>.<ext>
 
 | content-type | 处置 |
 |---|---|
-| `image/*`、`video/*`、`audio/*`、`application/pdf`、Office 那几类(`application/vnd.openxmlformats-officedocument.*`、`application/msword`、`application/vnd.ms-*`) | 存进 `files/`,写 `local_path` |
+| `image/*`、`video/*`、`audio/*`、`application/pdf`、Office 那几类(`application/vnd.openxmlformats-officedocument.*`、`application/msword`、`application/vnd.ms-*`) | 存进 `inputs/cache/`,写 `local_path` |
 | 其它(含 `text/html`) | 丢弃,`local_path` 保持 `null`——它是个要点开的地址,不是素材 |
 
 **上限**:单文件 32 MiB,单 run 预拉总量 128 MiB。超限即停止该文件,`local_path` 保持 `null`。
@@ -274,7 +281,7 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
 
 **绑定(四条)**:模型拿到的 tool catalog 里**确实没有**被绑定的参数(含 `required`);填值发生在**审批之前**(审批请求里看得到真值);悬空引用被 manifest 校验拒;参数不在工具 schema 里时告警且不阻断。
 
-**真栈**:探针 agent 跑一次带 URL 变量 + 一个绑定参数的 run,验 `local_path` 落地在 `agents/<key>/inputs/<run_id>/files/`、MCP 调用的参数由平台填、模型的 catalog 里没有该参数。**不碰对接方的两个 agent。**
+**真栈**:探针 agent 跑一次带 URL 变量 + 一个绑定参数的 run,验 `local_path` 落地在 `agents/<key>/inputs/cache/`、MCP 调用的参数由平台填、模型的 catalog 里没有该参数。**不碰对接方的两个 agent。**
 
 **变异自证**:每条新断言必须 break → red → restore → green(修复自带的测试会给坏版本发合格证)。
 
@@ -307,4 +314,4 @@ A 与 B 都要动 `sse.py` 的 `configurable` 字面量(A 不需要、B 需要 �
 
 - **服务端把值绑定到内置宿主工具**(`http` 等):v1 不做,URL 类的值已经走数据面。
 - **同用户同 agent 并发 run**:本设计按 `inputs/<run_id>/` 分目录 + 环境变量指路,已彻底隔离;工作区里**其它**文件的并发覆盖是老问题,不在本设计范围。
-- **预拉的缓存**:同一 URL 在多轮里重复下载。先不做——按 run 隔离比省流量重要。注意这条原先的理由(「7 天保留期内 NAS 占用可观测」)建立在 §4.6 那条被证伪的 janitor 说法上;清理任务落地、占用真能观测之后再定。
+- ~~**预拉的缓存**:同一 URL 在多轮里重复下载。先不做——按 run 隔离比省流量重要。~~ **已改做(2026-09-15,T11)**:按 run 复制既是浪费也是配额增长曲线的分子,两者本是同一个病的两面;现为按 agent 共享的内容寻址缓存 `inputs/cache/<sha256(url)[:32]><ext>`,详见 §4.1 勘误。原先「先不做」的理由(「7 天保留期内 NAS 占用可观测」)本就建立在 §4.6 那条被证伪的 janitor 说法上 —— 那条说法证伪后,这个否决也就没了依据 —— **spec 里「不做什么」的理由同样要核对**,它决定方向却很少有人回头审。

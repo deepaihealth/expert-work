@@ -360,6 +360,9 @@ from expert_work.persistence.workspace import (
     WORKSPACE_DELETE_PROTECTED_PREFIXES as WORKSPACE_DELETE_PROTECTED_PREFIXES,
 )
 from expert_work.persistence.workspace import (
+    WORKSPACE_INPUTS_DIR as WORKSPACE_INPUTS_DIR,
+)
+from expert_work.persistence.workspace import (
     WORKSPACE_OVERFLOW_DIR as WORKSPACE_OVERFLOW_DIR,
 )
 from expert_work.persistence.workspace import (
@@ -415,6 +418,7 @@ __all__ = [
     "SANDBOX_SKILLS_ROOT",
     "WORKSPACE_AGENTS_DIR",
     "WORKSPACE_DELETE_PROTECTED_PREFIXES",
+    "WORKSPACE_INPUTS_DIR",
     "WORKSPACE_OVERFLOW_DIR",
     "WORKSPACE_RESERVED_PREFIXES",
     "WORKSPACE_SHARED_DIR",

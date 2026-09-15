@@ -4,12 +4,20 @@ harness 造树布局(照 nas_workspace_store.workspace_user_root 口径):
     {root}/{tenant}/{user}/...      用户目录
     {root}/{tenant}/.deleted/{user} 软删标记(Task 5 用)
     {root}/_scratch/{sandbox_id}    临时沙箱目录
+
+B-61 T12 的回收面再往下一层(``_agent_dir`` 造):
+
+    {root}/{tenant}/{user}/agents/{agent_key}/inputs/cache/{hash}{ext}  预拉缓存条目
+    {root}/{tenant}/{user}/agents/{agent_key}/inputs/{run_id}/inputs.json  本轮注入变量
+    {root}/{tenant}/{user}/agents/{agent_key}/uploads/{name}            用户上传(本批不收)
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
+import logging
 import os
 import tarfile
 import time
@@ -23,7 +31,9 @@ from sqlalchemy import text
 
 from control_plane.advisory_locks import WORKSPACE_JANITOR_LOCK_CLASSID
 from control_plane.workspace_janitor import (
+    _POLICIES,
     _SCRATCH_MAX_AGE_S,
+    _TARGETS,
     JanitorRunStats,
     WorkspaceJanitorWorker,
 )
@@ -35,7 +45,7 @@ from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 
 def _build(
-    tmp_path: Path,
+    tmp_path: Path, *, archive_enabled: bool = True
 ) -> tuple[WorkspaceJanitorWorker, InMemoryUserWorkspaceStore, InMemoryObjectStore]:
     workspaces = InMemoryUserWorkspaceStore()
     quotas = InMemoryTenantQuotaStore()
@@ -48,6 +58,7 @@ def _build(
         quota_service=service,
         object_store=store,
         workspace_root=str(tmp_path),
+        archive_enabled=archive_enabled,
     )
     return worker, workspaces, store
 
@@ -113,6 +124,7 @@ async def test_lock_loser_skips_cycle(tmp_path: Path) -> None:
         object_store=InMemoryObjectStore(),
         workspace_root=str(tmp_path),
         session_factory=factory,
+        archive_enabled=True,
     )
     stats = await worker.run_once()
     assert stats.skipped
@@ -274,6 +286,7 @@ def _build_counting(
         quota_service=service,
         object_store=store,
         workspace_root=str(tmp_path),
+        archive_enabled=True,
     )
     return worker, workspaces, store
 
@@ -458,3 +471,399 @@ async def test_archive_marker_scan_failure_does_not_stop_other_tenants(
     assert stats.archived == 1
     row_good = await workspaces.get(tenant_id=good_tenant, user_id=good_user)
     assert row_good is not None and row_good.archived_object_key is not None
+
+
+# --- B-61 T12:agents/<agent_key>/inputs/ 的 TTL 回收 -------------------------
+
+#: 按 label 取 TTL —— 测试跟着策略表走,改表不用同步改这一堆魔数。
+_TTL_S = {policy.label: policy.ttl_s for policy in _POLICIES}
+
+
+def _agent_dir(tmp_path: Path, tenant: UUID, user: UUID, *, key: str = "demo-agent") -> Path:
+    """造并返回 ``{root}/{tenant}/{user}/agents/{key}`` —— 沙箱里 ``/workspace``
+    在 NAS 上对应的那一层(B-50 起每个 agent 一棵子树)。"""
+    path = tmp_path / str(tenant) / str(user) / "agents" / key
+    path.mkdir(parents=True)
+    return path
+
+
+@pytest.mark.asyncio
+async def test_sweep_removes_expired_cache_files_and_run_dirs(tmp_path: Path) -> None:
+    """超期的缓存条目按文件收、超期的 per-run 目录整棵收;新鲜的一律留着。"""
+    tenant, user = uuid4(), uuid4()
+    inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
+    cache = inputs / "cache"
+    cache.mkdir(parents=True)
+    stale_entry = cache / f"{'a' * 32}.png"
+    fresh_entry = cache / f"{'b' * 32}.png"
+    stale_entry.write_bytes(b"x" * 10)
+    fresh_entry.write_bytes(b"y" * 10)
+    _age(stale_entry, seconds=_TTL_S["inputs_cache"] + 60)
+    _age(fresh_entry, seconds=_TTL_S["inputs_cache"] - 3600)
+
+    stale_run, fresh_run = inputs / str(uuid4()), inputs / str(uuid4())
+    for run_dir in (stale_run, fresh_run):
+        run_dir.mkdir()
+        (run_dir / "inputs.json").write_text("{}")
+    # 先写内容再改目录 mtime:往目录里写文件会把父目录的 mtime 顶成「现在」。
+    _age(stale_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+    _age(fresh_run, seconds=_TTL_S["inputs_run_dir"] - 3600)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (1, 1)
+    assert not stale_entry.exists() and fresh_entry.exists()
+    assert not stale_run.exists() and fresh_run.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_never_touches_a_recently_written_run_dir(tmp_path: Path) -> None:
+    """活跃 run 的目录 mtime 是新的,必须留下 —— 删错它就打断了正在跑的那一轮。
+
+    目录里的 ``inputs.json`` 故意造得比 TTL 还老:判据必须是**目录自己**的
+    mtime(T11 每拉完一个 URL 就 ``os.replace`` 改写一次 inputs.json,目录项因此
+    被顶新),拿内容里最老的文件当判据会把活跃 run 的目录收掉。
+    这条是「删错会打断执行」的反向实证,不是锦上添花。
+    """
+    tenant, user = uuid4(), uuid4()
+    inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
+    live = inputs / str(uuid4())
+    live.mkdir(parents=True)
+    doc = live / "inputs.json"
+    doc.write_text("{}")
+    _age(doc, seconds=_TTL_S["inputs_run_dir"] * 4)
+    _age(live, seconds=60)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.reclaim_dirs_removed == 0
+    assert doc.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_ignores_dirs_that_are_not_uuid_shaped(tmp_path: Path) -> None:
+    """只认 ``inputs/<uuid>/`` 与 ``inputs/cache/``,其它一律不碰 —— 包括空着
+    的 ``cache/`` 自己(它是目录但名字不是 UUID,不该被当成过期的 run 目录)。
+
+    ``hexish`` 是 32 位无横杠 hex:``UUID(name)`` **接受**它,而生产者只会写
+    ``str(run_id)``。判据松一位,别人建的目录就被整棵 rmtree 掉。
+    """
+    tenant, user = uuid4(), uuid4()
+    inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
+    stranger = inputs / "notes"
+    stranger.mkdir(parents=True)
+    kept = stranger / "keep.md"
+    kept.write_text("x")
+    hexish = inputs / ("a" * 32)
+    hexish.mkdir()
+    loose = inputs / "README.md"
+    loose.write_text("x")
+    cache = inputs / "cache"
+    cache.mkdir()
+    for path in (kept, stranger, hexish, loose, cache, inputs):
+        _age(path, seconds=_TTL_S["inputs_run_dir"] * 4)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 0)
+    assert stranger.is_dir() and kept.exists() and loose.exists() and cache.is_dir()
+    assert hexish.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_reclaim_lands_in_the_same_cycle_size_accounting(tmp_path: Path) -> None:
+    """回收发生在 ``_sweep_sizes`` 之前:同一轮 ``run_once`` 之后记下的体积必须
+    已经是回收后的。这条是 phase 顺序的实证 —— 把新 phase 挪到 ``_sweep_sizes``
+    之后它就会红(那一轮记的是回收前的体积,要等下一轮才追平)。"""
+    tenant, user = uuid4(), uuid4()
+    agent = _agent_dir(tmp_path, tenant, user)
+    (agent / "out.pdf").write_bytes(b"k" * 100)
+    stale_run = agent / "inputs" / str(uuid4())
+    stale_run.mkdir(parents=True)
+    (stale_run / "inputs.json").write_bytes(b"x" * 5000)
+    _age(stale_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    worker, workspaces, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.reclaim_dirs_removed == 1
+    row = await workspaces.get(tenant_id=tenant, user_id=user)
+    assert row is not None and row.size_bytes == 100  # 那 5000 字节同一轮里就没了
+
+
+@pytest.mark.asyncio
+async def test_disabled_policies_delete_nothing(tmp_path: Path) -> None:
+    """uploads / 产物的条目本批是关着的:造出超期的 uploads 文件,扫完必须还在。
+
+    这条挡的是「以后有人顺手把 enabled 改成 True 就上线了」—— 那两条删的是用户
+    数据,需要产品定 N、需要发布前告知、还要有对外删除端点当自救出口(B-63)。
+    """
+    tenant, user = uuid4(), uuid4()
+    upload = _agent_dir(tmp_path, tenant, user) / "uploads" / "合同.docx"
+    upload.parent.mkdir(parents=True)
+    upload.write_bytes(b"x" * 10)
+    _age(upload, seconds=_TTL_S["uploads"] + 86400)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 0)
+    assert upload.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_leftover_tmp_file_is_reclaimed(tmp_path: Path) -> None:
+    """``inputs/`` 这一层的 ``inputs.json.tmp`` 残留按同一条 TTL 收掉。
+
+    **这个名字今天打不到东西**,测试造的是一个不会自然出现的形状:预拉的
+    ``_rewrite`` 写的是 ``inputs/<run_id>/inputs.json.tmp``(在 run 目录里,随整棵目录被
+    收),不是这一层 —— brief 当初给的理由是错的,实现注释(``_INPUTS_TMP_NAME``)已经
+    如实纠正,这条 docstring 跟上,免得读代码的人先信了测试。
+    留着的是**机制**:``file_names`` 非 ``None`` = 「只收名单里的」,正是它让
+    ``inputs/README.md`` 这类别人的文件活下来(见上一条测试)。
+    """
+    tenant, user = uuid4(), uuid4()
+    inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
+    inputs.mkdir(parents=True)
+    leftover = inputs / "inputs.json.tmp"
+    leftover.write_bytes(b"{}")
+    _age(leftover, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.reclaim_files_removed == 1
+    assert not leftover.exists()
+
+
+@pytest.mark.asyncio
+async def test_inputs_scan_failure_does_not_stop_other_users(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个 agent 子树打不开(权限 / NFS ESTALE)不该带走整个 phase。
+
+    注入点是 ``os.open``(不是 ``os.scandir``):回收链路整条走 fd —— 先
+    ``_open_dir`` 拿目录 fd、再 ``os.scandir(fd)``,``scandir`` 拿到的是 int,按路径
+    打桩根本打不中(改成 fd 版之后,旧写法会静默变成一条空测试)。按**唯一的 agent
+    key** 拦,不会误伤别处的 ``os.open``。
+
+    隔离要求是**逐 agent**,所以坏 agent 必须有个**同一用户下的兄弟 agent**:少了它,
+    异常被用户那一层的兜底接住也看不出区别(实测:第一版没有兄弟,去掉 per-agent 的
+    catch 一条测试都不红)。``agents/`` 下按名字排序遍历,``bad-agent`` 必在
+    ``sibling-agent`` 之前。坏租户同理钉 ``UUID(int=0)``(``_list_uuid_dirs`` 按 UUID
+    字符串排序),保证它排在随机的好租户之前 —— 否则好租户恰好先被处理完的话,
+    ``_run_cycle`` 那层按阶段的粗粒度 catch 也会让断言巧合通过。
+    """
+    bad_tenant, good_tenant, bad_user = UUID(int=0), uuid4(), uuid4()
+    bad_run = _agent_dir(tmp_path, bad_tenant, bad_user, key="bad-agent") / "inputs" / str(uuid4())
+    bad_run.mkdir(parents=True)
+    sibling_run = (
+        tmp_path / str(bad_tenant) / str(bad_user) / "agents" / "sibling-agent" / "inputs"
+    ) / str(uuid4())
+    sibling_run.mkdir(parents=True)
+    good_run = (
+        _agent_dir(tmp_path, good_tenant, uuid4(), key="good-agent") / "inputs" / str(uuid4())
+    )
+    good_run.mkdir(parents=True)
+    for path in (bad_run, sibling_run, good_run):
+        _age(path, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    real_open = os.open
+
+    def _flaky_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if path == "bad-agent":
+            raise PermissionError("denied")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _flaky_open)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert stats.reclaim_dirs_removed == 2  # 同用户的兄弟 agent + 另一个租户的用户
+    assert not sibling_run.exists() and not good_run.exists()
+    assert bad_run.exists()  # 打不开的那棵原样留着,不是「删不掉就当没有」
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_follow_a_symlinked_scan_base(tmp_path: Path) -> None:
+    """``inputs`` / ``inputs/cache`` 被换成软链时,janitor 不许跟过去删。
+
+    不是理论风险:B-60 之后每次 exec 把 ``agents/<key>/`` bind 成 ``/workspace``,
+    沙箱里由模型驱动的代码可以 ``rm -rf inputs && ln -s <任意目标> inputs``;而这个
+    phase 以控制面身份跑、对整棵 NAS 有写权限。跟过去一次就是删别人的目录(评审
+    PoC:``inputs`` 指向租户目录时,另一个用户的整棵工作区被 rmtree)。
+
+    两条策略各覆盖一个落点:``inputs_run_dir`` 的落点是 ``inputs/``(软链换掉它),
+    ``inputs_cache`` 的落点是 ``inputs/cache/``(第二级也要挡,而且它
+    ``file_names=None`` —— 跟过去就是「这一层文件全收」)。
+    """
+    tenant = uuid4()
+    victim_dir = tmp_path / "victim" / str(uuid4())  # UUID 形状 + 超期 = 跟过去必被收
+    victim_dir.mkdir(parents=True)
+    victim_file = tmp_path / "victim-cache" / "old.png"
+    victim_file.parent.mkdir(parents=True)
+    victim_file.write_bytes(b"x" * 10)
+    for path in (victim_dir, victim_file):
+        _age(path, seconds=_TTL_S["inputs_run_dir"] * 4)
+
+    swapped = _agent_dir(tmp_path, tenant, uuid4()) / "inputs"
+    swapped.symlink_to(victim_dir.parent)
+
+    cache_swapped = _agent_dir(tmp_path, tenant, uuid4()) / "inputs"
+    cache_swapped.mkdir()
+    (cache_swapped / "cache").symlink_to(victim_file.parent)
+
+    innocent_run = _agent_dir(tmp_path, tenant, uuid4()) / "inputs" / str(uuid4())
+    innocent_run.mkdir(parents=True)
+    _age(innocent_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert victim_dir.is_dir() and victim_file.exists()  # 一个都没少
+    assert swapped.is_symlink() and (cache_swapped / "cache").is_symlink()  # 软链自己也不删
+    # phase 没被这两条带走:同一轮里正常用户的过期目录照收(且只收了它)
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 1)
+    assert not innocent_run.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_traverse_a_symlinked_intermediate_segment(tmp_path: Path) -> None:
+    """两级落点(``inputs/cache``)的**中间那一段**也必须自己挡住软链。
+
+    ``O_NOFOLLOW`` 只管**最后**一段。把逐段下降折成一次
+    ``openat(agent_fd, "inputs/cache", O_NOFOLLOW)``,``inputs`` 就成了中间段、照样被
+    跟随 —— 于是「``inputs`` 是软链,而它指向的目录里恰好有个**真的** ``cache/``」时,
+    别人的过期缓存条目就被删了。这里造的正是那个形状 —— 受害目录**故意放在 janitor
+    正常遍历够不到的地方**(``tmp_path`` 下,不是 ``<tenant>/<user>/`` 那两层 UUID):
+    否则它会被自己那条合法路径正常收掉,断言就分不清「没被跟过去」与「被自己收了」。
+    第一版就踩了这个,测试当场红。
+
+    上一条软链测试打不到这里:它的软链指向的目录里**没有 ``cache/`` 这一层**,
+    ``inputs/cache`` 直接 ENOENT,折不折成一次看不出区别。
+    """
+    tenant = uuid4()
+    victim_inputs = tmp_path / "victim" / "inputs"  # 形状像 agent 子树,但不在遍历面上
+    victim_cache = victim_inputs / "cache"
+    victim_cache.mkdir(parents=True)
+    victim_entry = victim_cache / f"{'c' * 32}.png"
+    victim_entry.write_bytes(b"x" * 10)
+    _age(victim_entry, seconds=_TTL_S["inputs_cache"] + 60)
+
+    evil = _agent_dir(tmp_path, tenant, uuid4(), key="evil-agent") / "inputs"
+    evil.symlink_to(victim_inputs)  # inputs -> <别人的 inputs>(里面有真的 cache/)
+
+    sibling_cache = _agent_dir(tmp_path, tenant, uuid4(), key="sibling") / "inputs" / "cache"
+    sibling_cache.mkdir(parents=True)
+    sibling_entry = sibling_cache / f"{'d' * 32}.png"
+    sibling_entry.write_bytes(b"y" * 10)
+    _age(sibling_entry, seconds=_TTL_S["inputs_cache"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert victim_entry.exists()  # 中间段是软链 → 一步都不许进去
+    assert evil.is_symlink()  # 软链自己也不删
+    assert not sibling_entry.exists()  # 同一轮里正常 agent 照收 —— phase 没被带走
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (1, 0)
+
+
+def test_every_policy_has_an_explicit_target_entry() -> None:
+    """策略表与落点表必须逐条对上 —— 「暂时没有落点」要显式写 ``None``。
+
+    漏配不会报错,只会让那条策略拨开 ``enabled`` 之后一声不吭地什么都不收
+    (实现里另有一条导入期的硬检查,这条测试是它的可读版本)。
+    """
+    assert {policy.label for policy in _POLICIES} == set(_TARGETS)
+    assert _TARGETS["artifacts"] is None  # 产物还没有落点,B-63 定义完再补
+
+
+@pytest.mark.asyncio
+async def test_reclaim_logs_counts_but_never_names(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """不可逆的删除要留得下痕迹:逐 ``(tenant, user, agent, policy)`` 记计数,外加每轮
+    一条汇总 —— 事后要答得出「谁的哪个 agent、按哪条策略、丢了几个」。
+
+    但**只记标识与计数**:条目名是租户内容(上传件的文件名、产物名可能是客户的人名),
+    一个字都不许进日志。空轮不产生明细行,只有汇总。
+    """
+    tenant, user = uuid4(), uuid4()
+    cache = _agent_dir(tmp_path, tenant, user, key="demo-agent") / "inputs" / "cache"
+    cache.mkdir(parents=True)
+    named = cache / "张三的体检报告.pdf"
+    named.write_bytes(b"x")
+    _age(named, seconds=_TTL_S["inputs_cache"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    with caplog.at_level(logging.INFO, logger="control_plane.workspace_janitor"):
+        await worker.run_once()
+
+    messages = [record.getMessage() for record in caplog.records]
+    detail = [m for m in messages if m.startswith("workspace_janitor.reclaimed ")]
+    summary = [m for m in messages if m.startswith("workspace_janitor.reclaim_summary ")]
+    assert len(detail) == 1 and len(summary) == 1
+    assert f"tenant={tenant}" in detail[0] and f"user={user}" in detail[0]
+    assert "agent=demo-agent" in detail[0] and "policy=inputs_cache" in detail[0]
+    assert "files=1 dirs=0" in detail[0]
+    assert "files=1 dirs=0" in summary[0] and "inputs_cache:1/0" in summary[0]
+    assert not any("张三" in m for m in messages)  # 租户内容一个字都不进日志
+
+
+@pytest.mark.asyncio
+async def test_archiving_is_skipped_on_a_non_durable_object_store_but_reclaim_still_runs(
+    tmp_path: Path,
+) -> None:
+    """``archive_enabled=False`` 只关归档那一个 phase,回收照跑。
+
+    「对象存储必须是持久后端」是**归档自己的**前提(归档会 rm -rf 用户目录,内存
+    object store 重启即丢 = 数据删了却没有档案)。回收一个字节都不碰对象存储,跟着
+    一起关掉的后果是:配了 NAS + 配额、对象存储走内存后端的部署完全没有垃圾回收,
+    一路涨到配额闸把沙箱类工具全挡掉 —— 正是 T11/T12 存在的理由。
+    """
+    tenant, user = uuid4(), uuid4()
+    doomed = tmp_path / str(tenant) / str(user)
+    doomed.mkdir(parents=True)
+    (doomed / "keep.txt").write_bytes(b"data")
+    _mark_deleted(tmp_path, tenant, user)
+
+    stale_run = _agent_dir(tmp_path, uuid4(), uuid4()) / "inputs" / str(uuid4())
+    stale_run.mkdir(parents=True)
+    _age(stale_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    worker, workspaces, _ = _build(tmp_path, archive_enabled=False)
+    stats = await worker.run_once()
+
+    assert stats.archived == 0 and stats.reharvested == 0
+    assert doomed.exists() and (doomed / "keep.txt").exists()  # 没档案就别删数据
+    row = await workspaces.get(tenant_id=tenant, user_id=user)
+    assert row is None or row.archived_object_key is None
+    assert stats.reclaim_dirs_removed == 1 and not stale_run.exists()  # 回收照跑
+
+
+def test_cache_ttl_is_shorter_than_the_run_dir_ttl() -> None:
+    """方向不变式:**缓存 TTL 必须严格短于 run 目录 TTL**。
+
+    两半是刻意不对称的,别「调成一致」:
+
+    * **缓存是会涨的那一半**。``cache_digest`` 哈希整个 URL(含 query),而这些值来自调用方
+      每轮传进来的 ``inputs`` —— 预签名 URL 每轮都是新 digest,去重率是零;每轮上限
+      128 MiB,配额之外没有任何按体积的驱逐。留太久 = 一个每天跑的 agent 压着几 GiB 死缓存,
+      撞上每用户 10 GiB 的闸之后那个用户的沙箱类工具被整片挡住。
+    * **run 目录是不涨的那一半**(几 KB 的 JSON),留得久才救得了「挂了很久的审批续跑」。
+
+    于是续跑可能拿到一个指向已回收文件的 ``local_path`` —— **这是被接受的降级**:
+    ``inputs.json`` 的 ``value`` 里永远留着原始 URL,沙箱代码重下即可;反过来删掉 run 目录
+    才是灾难(模型一无所有,退回从提示词手抄长串,正是 B-61 要治的病)。
+
+    这条测试原来钉的是反方向的不等式(缓存活得比 run 目录久),那版裁定已被推翻 —— 理由见
+    ``_CACHE_TTL_S`` 的注释。
+    """
+    ttl = {policy.label: policy.ttl_s for policy in _POLICIES}
+    assert ttl["inputs_cache"] < ttl["inputs_run_dir"]
+
+
+def test_archive_enabled_is_a_required_kwarg() -> None:
+    """``archive_enabled`` **不许有默认值**。
+
+    它唯一的用途就是安全:给它默认 ``True``,「装配点忘了传」这件事就静默地选中了危险的
+    那一侧 —— 往非持久对象存储归档 = 打包上传之后 ``rm -rf`` 用户目录,而那个档案重启即丢。
+    漏传必须当场 ``TypeError``,不是安静地跑起来。
+    """
+    param = inspect.signature(WorkspaceJanitorWorker.__init__).parameters["archive_enabled"]
+    assert param.default is inspect.Parameter.empty

@@ -32,6 +32,19 @@ WORKSPACE_SKILLS_DIR = "skills"
 #: User-uploaded documents, landing at ``uploads/<name>`` for ``read_document``.
 WORKSPACE_UPLOADS_DIR = "uploads"
 
+#: 注入变量的落点(B-61):``inputs/<run_id>/inputs.json`` 是本轮声明变量的文档,
+#: ``inputs/cache/<sha256(url)[:32]><ext>`` 是按 agent 共享的内容寻址预拉缓存。
+#:
+#: 两者都是**平台自己派生的机械产物**,不是 agent 产出:文档由 run 启动时的 inputs
+#: 节点写,缓存条目是平台代模型下载的副本(重下即得)。所以它和 ``uploads`` /
+#: ``skills`` / ``.tool_results`` 一样进保留前缀 —— 不进的话,用户的「产物」列表里
+#: 会混进每一个不透明的 ``<32 位 hex>.png`` 和每一轮的 ``inputs.json``。
+#:
+#: **不进** :data:`WORKSPACE_DELETE_PROTECTED_PREFIXES`:与 ``.tool_results`` 同一个
+#: 理由 —— 它是平台**要能自己回收**的垃圾(control-plane 的 workspace janitor 按 TTL
+#: 收它),而删除保护挡的是「客户端不许删平台写的东西」。这里两件事不同向。
+WORKSPACE_INPUTS_DIR = "inputs"
+
 #: Container for the per-agent subtrees — ``agents/<agent_key>/…`` (B-50).
 #: A user's volume is mounted per ``(tenant, user)`` and cannot be split by
 #: agent at the mount point (hot sandboxes are reused across agents, the CSI
@@ -77,7 +90,7 @@ WORKSPACE_OVERFLOW_DIR = ".tool_results"
 #: here (and use the matching constant where it is written) and every browse
 #: surface picks it up automatically.
 WORKSPACE_RESERVED_PREFIXES: frozenset[str] = frozenset(
-    {WORKSPACE_SKILLS_DIR, WORKSPACE_UPLOADS_DIR, WORKSPACE_OVERFLOW_DIR}
+    {WORKSPACE_SKILLS_DIR, WORKSPACE_UPLOADS_DIR, WORKSPACE_OVERFLOW_DIR, WORKSPACE_INPUTS_DIR}
 )
 
 #: Prefixes a *client* may never delete — the browse-hidden set minus the

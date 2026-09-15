@@ -5,8 +5,11 @@ from __future__ import annotations
 import ast
 import http.server
 import json
+import os
 import socket
+import stat
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, ClassVar
@@ -15,13 +18,14 @@ import pytest
 
 from orchestrator.tools import prefetch_script
 from orchestrator.tools.prefetch_script import (
+    CACHE_TTL_S,
     MAX_FILE_BYTES,
     MAX_TOTAL_BYTES,
+    cache_digest,
     content_type_ok,
     main,
     pick_suffix,
     script_source,
-    target_name,
 )
 
 
@@ -61,16 +65,6 @@ def test_suffix_falls_back_to_the_url_extension() -> None:
 
 def test_suffix_is_empty_when_neither_says_anything() -> None:
     assert pick_suffix("application/octet-stream", "https://x/y") == ""
-
-
-def test_target_name_encodes_the_site_so_two_urls_never_collide() -> None:
-    assert target_name("org_logo", [], ".jpg") == "org_logo.jpg"
-    assert target_name("materials", [0, "url"], ".mp4") == "materials.0.url.mp4"
-
-
-def test_target_name_rejects_traversal_in_the_variable_name() -> None:
-    with pytest.raises(ValueError, match="unsafe"):
-        target_name("../../etc/passwd", [], ".jpg")
 
 
 def test_limits_are_the_spec_numbers() -> None:
@@ -214,8 +208,9 @@ def test_fetch_hit_writes_file_and_relative_local_path(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/files/org_logo.jpg"
-    saved = tmp_path / "inputs" / "run1" / "files" / "org_logo.jpg"
+    name = cache_digest(f"{base}/ok.jpg") + ".jpg"
+    assert doc["variables"]["org_logo"]["local_path"] == f"inputs/cache/{name}"
+    saved = tmp_path / "inputs" / "cache" / name
     assert saved.read_bytes() == body
 
 
@@ -229,7 +224,7 @@ def test_fetch_404_is_a_miss(tmp_path: Path, http_server: _HttpServer) -> None:
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     assert doc["variables"]["org_logo"]["local_path"] is None
-    assert not (tmp_path / "inputs" / "run1" / "files").exists()
+    assert not (tmp_path / "inputs" / "cache").exists()
 
 
 def test_fetch_html_content_type_is_a_miss(tmp_path: Path, http_server: _HttpServer) -> None:
@@ -250,7 +245,7 @@ def test_fetch_html_content_type_is_a_miss(tmp_path: Path, http_server: _HttpSer
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     assert doc["variables"]["link"]["local_path"] is None
-    assert not (tmp_path / "inputs" / "run1" / "files").exists()
+    assert not (tmp_path / "inputs" / "cache").exists()
 
 
 def test_fetch_oversize_without_content_length_is_a_miss(
@@ -274,7 +269,7 @@ def test_fetch_oversize_without_content_length_is_a_miss(
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     assert doc["variables"]["org_logo"]["local_path"] is None
-    assert not (tmp_path / "inputs" / "run1" / "files").exists()
+    assert not (tmp_path / "inputs" / "cache").exists()
 
 
 def test_fetch_declared_length_mismatch_is_a_miss(tmp_path: Path, http_server: _HttpServer) -> None:
@@ -297,7 +292,7 @@ def test_fetch_declared_length_mismatch_is_a_miss(tmp_path: Path, http_server: _
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     assert doc["variables"]["org_logo"]["local_path"] is None
-    assert not (tmp_path / "inputs" / "run1" / "files").exists()
+    assert not (tmp_path / "inputs" / "cache").exists()
 
 
 def test_fetch_malformed_status_line_is_a_miss_and_does_not_crash(tmp_path: Path) -> None:
@@ -369,7 +364,8 @@ def test_budget_exhausted_by_first_file_refuses_second(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    assert doc["variables"]["a"]["local_path"] == "inputs/run1/files/a.jpg"
+    first_name = cache_digest(f"{base}/first") + ".jpg"
+    assert doc["variables"]["a"]["local_path"] == f"inputs/cache/{first_name}"
     assert doc["variables"]["b"]["local_path"] is None
 
 
@@ -390,10 +386,20 @@ def test_main_survives_missing_inputs_json(tmp_path: Path) -> None:
     assert main(["prefetch_script.py", str(missing)]) == 0
 
 
-def _jpeg_route(body: bytes) -> Callable[[_RoutedHandler], None]:
+def _route(
+    body: bytes, content_type: str = "image/jpeg", served: list[str] | None = None
+) -> Callable[[_RoutedHandler], None]:
+    """一条回固定 body 的 200 路由。
+
+    ``served`` 给了就记下每一次**真正打到 server** 的请求 —— 「命中缓存」的判据就是
+    这里没有被叫到。
+    """
+
     def route(handler: _RoutedHandler) -> None:
+        if served is not None:
+            served.append(handler.path)
         handler.send_response(200)
-        handler.send_header("Content-Type", "image/jpeg")
+        handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
         handler.wfile.write(body)
@@ -407,10 +413,11 @@ def test_a_bare_url_in_a_list_does_not_lose_the_other_variables(
     """终审 finding 1 —— ``{"images": ["https://a"]}`` 以前会让 ``_assign`` 抛
     ``TypeError``:``main`` 的 per-site 循环没有任何处理,脚本非 0 退出,结尾那次
     ``json.dump`` 根本不跑 —— **每个**变量的 ``local_path`` 全丢,已经下载好的文件
-    成了 ``files/`` 里的孤儿。列表里的裸 URL 现在不算 site,后面的变量照常回填。"""
+    躺在 ``inputs/cache/`` 里却没有一条记录指向它们。列表里的裸 URL 现在不算 site,
+    后面的变量照常回填。"""
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 16
-    routes["/ok.jpg"] = _jpeg_route(body)
+    routes["/ok.jpg"] = _route(body)
     inputs_path = _write_inputs(
         tmp_path,
         {
@@ -422,8 +429,9 @@ def test_a_bare_url_in_a_list_does_not_lose_the_other_variables(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/files/org_logo.jpg"
-    assert (tmp_path / "inputs" / "run1" / "files" / "org_logo.jpg").read_bytes() == body
+    name = cache_digest(f"{base}/ok.jpg") + ".jpg"
+    assert doc["variables"]["org_logo"]["local_path"] == f"inputs/cache/{name}"
+    assert (tmp_path / "inputs" / "cache" / name).read_bytes() == body
     # 列表里的裸 URL 原样留着(没被回填、也没把结构改成别的形状)。
     assert doc["variables"]["images"]["value"] == [f"{base}/ok.jpg"]
 
@@ -450,8 +458,8 @@ def test_each_site_is_persisted_before_the_next_one(
     """
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 16
-    routes["/a.jpg"] = _jpeg_route(body)
-    routes["/b.jpg"] = _jpeg_route(body)
+    routes["/a.jpg"] = _route(body)
+    routes["/b.jpg"] = _route(body)
     inputs_path = _write_inputs(
         tmp_path,
         {
@@ -474,7 +482,8 @@ def test_each_site_is_persisted_before_the_next_one(
         main(["prefetch_script.py", str(inputs_path)])
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    assert doc["variables"]["a"]["local_path"] == "inputs/run1/files/a.jpg"
+    name = cache_digest(f"{base}/a.jpg") + ".jpg"
+    assert doc["variables"]["a"]["local_path"] == f"inputs/cache/{name}"
 
 
 def test_one_failing_site_does_not_lose_the_others(
@@ -484,8 +493,8 @@ def test_one_failing_site_does_not_lose_the_others(
     只让它自己算 miss,不能带走其它 site 已经拿到的结果。"""
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 16
-    routes["/a.jpg"] = _jpeg_route(body)
-    routes["/b.jpg"] = _jpeg_route(body)
+    routes["/a.jpg"] = _route(body)
+    routes["/b.jpg"] = _route(body)
     inputs_path = _write_inputs(
         tmp_path,
         {
@@ -508,4 +517,186 @@ def test_one_failing_site_does_not_lose_the_others(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    assert doc["variables"]["b"]["local_path"] == "inputs/run1/files/b.jpg"
+    name = cache_digest(f"{base}/b.jpg") + ".jpg"
+    assert doc["variables"]["b"]["local_path"] == f"inputs/cache/{name}"
+
+
+# ---------------------------------------------------------------------------
+# T11 —— 内容寻址的共享缓存:同一个 URL 跨轮只下一次,文件名只由 URL 的 sha256 定。
+# ---------------------------------------------------------------------------
+
+
+def test_cache_digest_is_stable_and_url_keyed() -> None:
+    first = cache_digest("https://x/a.jpg")
+
+    assert first == cache_digest("https://x/a.jpg")
+    assert first != cache_digest("https://x/b.jpg")
+    assert len(first) == 32
+    assert "/" not in first and "." not in first
+
+
+def test_second_fetch_of_the_same_url_reuses_the_cache_without_a_request(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """同一个 URL 第二次:命中缓存,server 不该再收到请求,预算也不该被扣。"""
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 32
+    served: list[str] = []
+    routes["/ok.jpg"] = _route(body, served=served)
+    url = f"{base}/ok.jpg"
+    cache_dir = str(tmp_path / "cache")
+
+    first_name, first_used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+    hits = [len(served)]
+    second_name, second_used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+    hits.append(len(served))
+
+    assert first_name == cache_digest(url) + ".jpg"
+    assert second_name == first_name
+    assert first_used == len(body)
+    assert hits == [1, 1]  # server 端计数:第二次没有新请求
+    assert second_used == 0  # 命中不扣预算
+
+
+def test_a_url_without_an_extension_still_hits_on_the_second_fetch(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """探针必须按 digest 前缀扫目录, 不能拼 URL 扩展名。
+
+    ``/logo`` 这种没有扩展名的 URL, 响应 ``image/png`` 会落成 ``<digest>.png``;
+    按 URL 扩展名去探就是探 ``<digest>``(空后缀)——永久不命中且每轮重下,
+    这个任务等于白做。这条是该错法的实证。
+    """
+    base, routes = http_server
+    body = b"\x89PNG\r\n\x1a\n" + b"A" * 16
+    served: list[str] = []
+    routes["/logo"] = _route(body, "image/png", served)
+    url = f"{base}/logo"
+    cache_dir = str(tmp_path / "cache")
+
+    first_name, _first_used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+    second_name, second_used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+
+    # 后缀只能来自 content-type:URL 自己一个扩展名都没有。
+    assert first_name == cache_digest(url) + ".png"
+    assert second_name == first_name
+    assert len(served) == 1
+    assert second_used == 0
+
+
+def test_an_expired_cache_entry_is_refetched(tmp_path: Path, http_server: _HttpServer) -> None:
+    """条目超过 ``CACHE_TTL_S`` 就重下 —— 换掉的 logo 最迟一天后会被拿到新版本。"""
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 32
+    served: list[str] = []
+    routes["/ok.jpg"] = _route(body, served=served)
+    url = f"{base}/ok.jpg"
+    cache_dir = str(tmp_path / "cache")
+
+    name, _used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+    assert name is not None
+    cached = os.path.join(cache_dir, name)
+    stale = time.time() - CACHE_TTL_S - 60
+    os.utime(cached, (stale, stale))
+
+    again, used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+
+    assert again == name  # 内容寻址:重下盖回同一个条目,不是再添一个
+    assert len(served) == 2  # 真的又发了一次请求
+    assert used == len(body)  # 重下的字节照扣预算
+    # mtime 只在下载时刷新(命中不 touch),所以它就是「最近一次下载时间」。
+    assert os.stat(cached).st_mtime > stale
+
+
+def test_a_cached_file_is_group_and_world_readable(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """落盘权限位必须是 0644。
+
+    并发 run 撞同一 URL 要用唯一临时文件(``mkstemp``), 而 ``mkstemp`` 恒 0600、
+    ``os.replace`` 保权限位 —— 不显式 chmod 就会把今天 ``open()`` 写出来的 0644
+    静默降成 0600, 跨 uid 的读方(W2-BUG-1 的原病)再次读不到。
+    """
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 32
+    routes["/ok.jpg"] = _route(body)
+    cache_dir = str(tmp_path / "cache")
+
+    name, _used = prefetch_script._fetch(f"{base}/ok.jpg", cache_dir, MAX_TOTAL_BYTES)
+    assert name is not None
+    cached = os.path.join(cache_dir, name)
+
+    assert stat.S_IMODE(os.stat(cached).st_mode) == 0o644
+
+
+def test_an_interrupted_write_never_leaves_a_partial_cache_entry(tmp_path: Path) -> None:
+    """落盘走「同目录临时文件 + ``os.replace``」:目标路径上要么是完整文件,要么是上一版。
+
+    直接 ``open(目标, "wb")`` 写的话,``open`` 自己就先把已有条目截成 0 字节 ——
+    随后写入被打断(盘满 / 进程被抬走)就留下一个半截文件,而它下一轮会被当成
+    命中,直接喂给模型。这里把失败精确地卡在「``open`` 之后、内容落盘之前」
+    (body 不是 bytes),看的就是目标路径有没有被动过。
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    entry = cache_dir / ("a" * 32 + ".jpg")
+    entry.write_bytes(b"COMPLETE-OLD-ENTRY")
+
+    with pytest.raises(TypeError):
+        prefetch_script._store(str(cache_dir), entry.name, "not-bytes")  # type: ignore[arg-type]
+
+    assert entry.read_bytes() == b"COMPLETE-OLD-ENTRY"
+    assert list(cache_dir.iterdir()) == [entry]  # 也没把临时文件留在配额目录里
+
+
+@pytest.mark.parametrize("stale_first", [True, False])
+def test_a_stale_sibling_never_shadows_the_fresh_entry(tmp_path: Path, stale_first: bool) -> None:
+    """同一个 digest 的超期兄弟条目必须被跳过并删掉,不能把新鲜的那个遮住。
+
+    同一个 URL 的后缀会随响应变(``/logo`` 今天 ``image/png``、明天 ``image/jpeg``;
+    CDN 偶尔回 ``application/octet-stream`` 就回落到 URL 扩展名),而 ``os.replace``
+    只盖同名的那个 —— 目录里于是同时躺着一个超期的和一个新鲜的。探针一碰到超期的就
+    ``None`` 返回的话,``os.scandir`` 的文件系统顺序说了算:超期那个先被扫到就永远
+    命不中,每轮重下、每轮再写一份,正好退回本任务要治的病。
+
+    两条断言合起来与扫描顺序无关:先扫到超期的 → 返回值错;先扫到新鲜的 → 超期的
+    没被删掉。创建顺序两种都跑一遍只是再加一层。
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    digest = cache_digest("https://x/logo")
+    stale = cache_dir / f"{digest}.png"
+    fresh = cache_dir / f"{digest}.jpg"
+    for path in [stale, fresh] if stale_first else [fresh, stale]:
+        path.write_bytes(b"x")
+    old = time.time() - CACHE_TTL_S - 60
+    os.utime(stale, (old, old))
+
+    assert prefetch_script._cached_name(str(cache_dir), digest) == fresh.name
+    assert not stale.exists()  # 顺手清掉,不然孤儿要等回收闸
+
+
+def test_a_cache_hit_never_touches_the_entry(tmp_path: Path, http_server: _HttpServer) -> None:
+    """命中缓存**不动 mtime** —— 这条不变式此前只有注释在守。
+
+    mtime 的语义是「最近一次下载时间」,T12 的回收闸按它过期。命中时 touch 一下,
+    热条目就永远不会超过 ``CACHE_TTL_S``、也就永远不重下,一个被换掉的 logo 会被
+    无限期地喂给模型 —— B-61 的起因正是这个。
+    """
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 32
+    served: list[str] = []
+    routes["/ok.jpg"] = _route(body, served=served)
+    url = f"{base}/ok.jpg"
+    cache_dir = str(tmp_path / "cache")
+
+    name, _used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+    assert name is not None
+    cached = os.path.join(cache_dir, name)
+    before = os.stat(cached).st_mtime_ns
+
+    hit_name, hit_used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+
+    assert (hit_name, hit_used) == (name, 0)  # 先确认这一次真的走的是命中路径
+    assert len(served) == 1
+    assert os.stat(cached).st_mtime_ns == before

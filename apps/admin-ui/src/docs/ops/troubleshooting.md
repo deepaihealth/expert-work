@@ -11,11 +11,21 @@ order: 5
 
 - **完全没有日志**——janitor 用一把跨副本的互斥锁保证同一时刻只有一个副本在真正干活，没抢到锁的副本这一轮什么都不做、也不打日志，直接跳过。这是**常态，不是故障**——只有当连续好几轮、所有副本都没有任何一条 `workspace_janitor.` 日志时，才值得怀疑 janitor 是不是整体挂了。
 - `workspace_janitor.cycle_failed`——整轮跑崩了（比较少见，正常情况下单个阶段/单个用户出错不会拖累整轮）。这条日志会带完整堆栈。如果同时观察到上一轮跑得异常久（比如发布/上线当天有一大批积压的归档任务、外加第一次全量扫描），先看看是不是那一轮本身时长就远超日常水平——持锁时长的上限设得很宽（12 小时），专门为了扛住这种一次性的大批量轮次，真撞上限只会发生在异常久的那种轮次上，不是随便就触发。
-- `workspace_janitor.phase_failed phase=<阶段名>`——三个阶段（归档扫、用量扫、临时目录清扫）里某一个整体失败，其余阶段这一轮照常跑完。三个阶段都是幂等的，没有死信队列，失败了下一轮自动重来，不需要人工重跑。
+- `workspace_janitor.phase_failed phase=<阶段名>`——四个阶段（归档扫、注入变量回收、用量扫、临时目录清扫）里某一个整体失败，其余阶段这一轮照常跑完。四个阶段都是幂等的，没有死信队列，失败了下一轮自动重来，不需要人工重跑。
 - `workspace_janitor.archive_failed tenant=... user=...`——某一个用户的归档失败，同一轮里其他用户不受影响。幂等重试，下一轮自动重来；如果同一个用户连续好几轮都报这条，查堆栈定位根因，必要时按《备份与恢复》里的恢复步骤手工核对/补救。
 - `workspace_janitor.refresh_failed tenant=... user=...`——某个用户的用量重算失败，不影响别的用户，只是这个用户的“已用空间”显示可能会滞后到下一轮才追平。
 - `workspace_janitor.reharvested tenant=... user=...`——不是错误（info 级别）：这个用户已经有过一次归档，这一轮又重新打包上传了一次，覆盖了旧的归档内容。通常是因为目录在归档之后又有新写入进来（“复活”）。这条日志正是《备份与恢复》里“下载归档前先核对内容”那条提醒的来源。
 - `workspace_janitor.scan_failed` / `workspace_janitor.marker_scan_failed` / `workspace_janitor.scratch_remove_failed`——分别对应扫描租户/用户目录、扫描某个租户的墓碑标记目录、清理某个过期临时目录时失败，同样是单点失败不拖累整体，下一轮重来。
+- `workspace_janitor.archive_disabled_non_durable_object_store`——**不是错误**（info 级别，非持久对象存储后端上每轮都会打一条）：这套部署的对象存储不是持久后端（比如本地 compose、单机演示），归档阶段整体跳过，**其余三个阶段照常跑**。设计如此：归档会在打包上传后删掉 NAS 上的用户目录，而内存后端重启即丢，那等于数据删了却没有档案。生产集群不该出现这条——看到就说明对象存储配置掉回了内存后端，按《一次性配置》核对。（这条取代了早先的 `workspace_janitor.not_started_memory_object_store`：那时候整个 janitor 都不上岗，连垃圾回收也一起停了，日志却只说对象存储。）
+
+### 注入变量的回收（inputs）
+
+Agent 的注入变量会在工作区里落两样东西：每轮一份 `inputs.json`（几 KB 的小文件，按 run 分目录，**保留 30 天**），以及平台代模型下载的素材缓存（按 URL 内容寻址，**保留 7 天**）。janitor 每轮按这两条保留期回收，日志都带 `tenant=` / `user=` / `agent=` / `policy=`，**只有标识和计数，永远不会出现文件名**（文件名属于租户内容）。
+
+- `workspace_janitor.reclaim_summary files=N dirs=N by_policy=...`——每轮一条汇总（info；没删东西也会打，用来确认这一轮真的跑过）。`by_policy=` 按策略分开计数：`inputs_cache` 是素材缓存、`inputs_run_dir` 是按轮的目录，另外两条（`uploads`/`artifacts`）当前是关着的，永远是 `0/0`。
+- `workspace_janitor.reclaimed tenant=... user=... agent=... policy=... files=N dirs=N`——真删掉东西时才打（info）。追查「某个用户的文件是不是被清扫任务删的」就看这条：能定位到哪个用户的哪个 agent、按哪条保留期、删了几个。
+- `workspace_janitor.reclaim_base_unusable` / `reclaim_agent_failed` / `reclaim_failed` / `reclaim_scan_failed` / `agents_scan_failed`——回收过程中某个目录打不开、某个 agent 子树扫不动、某次删除失败。都是单点失败不拖累整体，下一轮重来。其中 `reclaim_base_unusable` 还有一种**非故障**的来源：Agent 自己的代码把 `inputs` 或 `inputs/cache` 换成了软链接，清扫任务拒绝跟着软链接走（防止删到别人的目录），于是跳过这一条策略。
+- **续跑很久以后的 run 可能报「文件找不到」**——一个挂起审批超过 7 天再续跑的 run，素材缓存可能已经被回收（`inputs.json` 本身保留 30 天还在）。这是设计内的：`inputs.json` 里始终留着原始 URL，Agent 代码重新下载即可，不是故障。
 
 ## 沙箱申领（acquire）失败的常见原因
 
