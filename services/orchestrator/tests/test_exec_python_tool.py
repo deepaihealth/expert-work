@@ -348,3 +348,36 @@ async def test_exec_python_builtin_durability_is_automatic() -> None:
     client = env.sandbox_runtime
     assert isinstance(client, RecordingSandboxRuntime)
     assert client.acquired[0][2] == user_id
+
+
+def _inputs_clause(description: str) -> str:
+    """工具描述里 B-61 那一段(从「本轮如果有输入变量」起到结尾)。"""
+    marker = "本轮如果有输入变量"
+    assert marker in description, "B-61 注入变量那段不见了"
+    return description[description.index(marker) :]
+
+
+def test_both_sandbox_tool_descriptions_state_the_local_path_fallback() -> None:
+    """``exec_python`` 与 ``bash`` 的描述都要带上 ``local_path`` 失效时的回退。
+
+    描述就是模型据以行动的东西,所以它必须与保留期契约一致:缓存 7 天、run 目录 30 天
+    (见 ``control_plane.workspace_janitor``),于是一个挂起很久才续跑的轮次**可能**看到
+    一个非空但指向已回收文件的 ``local_path``。描述如果还硬说「非空 = 文件在,直接用」,
+    模型就会在这个功能本该救场的那一刻做错事。
+
+    **常见情形必须排在前面**:绝大多数时候文件就在,直接用、不要联网 —— 一段让每次读取
+    都听起来有风险的描述会把模型推回「自己下载」,而那正是本项目消灭掉的行为。
+
+    三条断言各有分工:① 常见路径还在(没被改写成防御性措辞);② 回退子句在;
+    ③ **两个文件的这一段逐字节相同** —— 只改一个文件就红,这是本条最主要的防漂移作用
+    (在此之前这段措辞没有任何测试覆盖,所以它才会悄悄过期)。
+    """
+    from orchestrator.tools.bash import BashTool
+
+    exec_clause = _inputs_clause(ExecPythonTool(client=RecordingSandboxRuntime()).spec.description)
+    bash_clause = _inputs_clause(BashTool(client=RecordingSandboxRuntime()).spec.description)
+
+    for clause in (exec_clause, bash_clause):
+        assert "local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载" in clause  # noqa: RUF001
+        assert "该文件已被清理，这时改用同一项里的原始 URL 自己下载" in clause  # noqa: RUF001
+    assert exec_clause == bash_clause, "两个工具的 B-61 段落必须逐字节相同"
