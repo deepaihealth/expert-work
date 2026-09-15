@@ -1703,6 +1703,14 @@ git commit -m "feat(tools): 绑定接线——建目录剥 schema,tools_node 在
 
 ## Task 8: 配置页 —— 逐工具逐参数「自动 / 绑定」
 
+**追加要求(2026-09-16,T5 复评带出)——关掉 MCP 时要告诉用户绑定会一起没**:
+
+`form_model.ts` 的 `setMcp` 在 `servers` 变空时**整条删掉**该工具条目,绑定一起消失。那个语义本身没错
+(用户就是在关掉 MCP,与选择器「没有单独开关」的既有语义一致),错在**今天的界面里 `arg_bindings` 根本不可见** ——
+用户能在毫不知情的情况下走到那一步。T8 要补一个确认:告诉他这会同时删掉 N 条绑定。
+挡的不是误操作,是**看不见的东西被无声删掉**。
+
+
 **Files:**
 - Modify: `apps/admin-ui/src/components/manifest-editor/widgets/McpToolPicker.tsx`
 - Modify: `apps/admin-ui/src/components/manifest-editor/FormView.tsx`(`:509` 一带,把 `promptVariables` 与 `argBindings` 传进去)
