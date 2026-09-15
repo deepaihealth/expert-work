@@ -59,8 +59,10 @@ _PREFETCH_SCRIPT_BODY = script_source().split('if __name__ == "__main__":', 1)[0
 #: * 下限 —— 覆盖 8 个 URL 各自跑满 30 秒的最坏情况(声明变量里的 URL 是个位数,
 #:   8 个是留了余量的估法);
 #: * 上限 —— 低于 supervisor 侧 ``_MAX_EXEC_TIMEOUT_S`` = 300 的硬顶,所以这个值
-#:   真的会被沙箱侧执行(而不是被截成 300),orchestrator 的 HTTP 读超时
-#:   (exec 截止 + ``_EXEC_HTTP_BUFFER_S``)也仍在硬顶之内;
+#:   真的会被沙箱侧执行(``sandbox_supervisor/schemas.py`` 的
+#:   ``timeout_s: Field(gt=0, le=300)`` —— 高于硬顶会被 supervisor 以 422 拒掉,
+#:   不是被截断),orchestrator 的 HTTP 读超时(exec 截止 +
+#:   ``_EXEC_HTTP_BUFFER_S``)也仍在硬顶之内;
 #: * 不取满 300 —— 本节点跑在 run 启动路径上,用户在等,不该把整个上限都押进去。
 #:
 #: 被杀也不再是全丢:脚本每拉完一个 site 就原子改写一次 ``inputs.json``

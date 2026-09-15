@@ -9,15 +9,24 @@
 
 **永不让 run 失败**:任何一个 URL 的任何一种失败都只是把它的 ``local_path`` 写成
 ``null``,脚本自己始终以 0 退出。
+
+**内容寻址的共享缓存**(T11):文件落在 ``inputs/cache/<sha256(url)[:32]><ext>``,
+与 ``inputs/<run_id>/`` **平级**,按 agent 共享。同一个 URL 跨轮只下一次
+(``CACHE_TTL_S`` 内),既省带宽也止住工作区配额的无限增长 —— 两者本是同一个病的
+两面(按 run 复制既是浪费也是增长曲线的分子)。
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import http.client
 import json
 import os
 import posixpath
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -26,6 +35,17 @@ from urllib.parse import urlparse
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
 TIMEOUT_S = 30
+
+#: 共享缓存目录名,挂在 ``inputs/`` 下、与 ``<run_id>/`` 平级。
+CACHE_DIRNAME = "cache"
+
+#: 缓存条目的新鲜期:窗口内命中就不重下,超期命中会重下并刷新 mtime。
+#:
+#: **命中时不 touch**(不调 ``os.utime``):于是 mtime 恒等于「最近一次下载时间」,
+#: 也就是「最近引用时间」的 24 小时粒度近似 —— 回收闸按它过期只会打到真没人引用的
+#: 条目。反过来加一次 touch,热条目就永远不会超期、也就永远不刷新内容,而 B-61 的
+#: 起因恰恰是一个被换掉的 logo。
+CACHE_TTL_S = 24 * 3600
 
 #: 按 content-type 决定「是不是素材」。前缀族 + 精确名两张表。
 _TYPE_PREFIXES = ("image/", "video/", "audio/")
@@ -77,14 +97,14 @@ def pick_suffix(content_type: str, url: str) -> str:
     return ext if 1 < len(ext) <= 6 and ext.isascii() else ""
 
 
-def target_name(var_name: str, path: list[str | int], suffix: str) -> str:
-    """文件名 = 变量名 + 位置 + 扩展名。位置进名字,两个 URL 永不撞。"""
-    parts = [str(var_name), *[str(p) for p in path]]
-    for part in parts:
-        if not part or "/" in part or part in {".", ".."}:
-            msg = f"unsafe path component: {part!r}"
-            raise ValueError(msg)
-    return ".".join(parts) + suffix
+def cache_digest(url: str) -> str:
+    """缓存条目的文件名主干:URL 的 sha256 取前 32 位 hex。
+
+    只由 URL 决定:同一个地址跨轮、跨 run 落在同一个条目上(复用点),而租户给的
+    字符串(变量名、结构里的键)一个字都不进文件名 —— 路径穿越这件事结构上就不
+    存在了。用 sha256 是取它的抗碰撞性,不是当口令哈希用。
+    """
+    return hashlib.sha256(url.encode()).hexdigest()[:32]
 
 
 def script_source() -> str:
@@ -93,10 +113,63 @@ def script_source() -> str:
         return handle.read()
 
 
-def _fetch(
-    url: str, dest_dir: str, var_name: str, path: list[str | int], budget: int
-) -> tuple[str | None, int]:
-    """拉一个 URL。返回 ``(文件名 or None, 消耗字节数)``;任何失败都返回 ``(None, 0)``。"""
+def _cached_name(cache_dir: str, digest: str) -> str | None:
+    """找这个 digest 的新鲜缓存条目;没有(或已超期)就 ``None``。
+
+    **按 digest 前缀扫目录**,不是拿 URL 的扩展名去拼文件名再探:后缀由响应的
+    content-type 定,``/logo`` 回 ``image/png`` 就落成 ``<digest>.png``,照 URL 猜
+    探的是空后缀的 ``<digest>`` —— 永远探不到、每轮重下一份,整个缓存等于白做。
+
+    目录不存在 / 读不了都只算「没命中」:这条路上的任何异常都不该冒出去(预拉永不
+    让 run 失败),最坏结果是多下一次。
+    """
+    try:
+        with os.scandir(cache_dir) as entries:
+            for entry in entries:
+                if entry.name.startswith(digest):
+                    fresh = time.time() - entry.stat().st_mtime < CACHE_TTL_S
+                    return entry.name if fresh else None
+    except OSError:
+        return None
+    return None
+
+
+def _store(cache_dir: str, name: str, body: bytes) -> None:
+    """把内容落成 ``cache_dir/name``:同目录唯一临时文件 → chmod → ``os.replace``。
+
+    * 唯一临时文件(``mkstemp``):两个并发 run 撞同一个 URL 时各写各的,不会互相
+      踩到半截内容;
+    * ``os.chmod(tmp, 0o644)``:``mkstemp`` 恒建 0600 而 ``os.replace`` 保权限位,
+      不显式改就把条目静默降成 0600,跨 uid 的读方再次读不到(W2-BUG-1 的原病);
+    * ``os.replace`` 而不是直接写目标:目标路径上要么是完整文件、要么还是上一版,
+      不会出现半截 —— 半截条目下一轮会被当成命中直接喂给模型。超期重下时这一步
+      直接盖掉旧条目,不用先删。
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=cache_dir)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(cache_dir, name))
+    except BaseException:
+        # 失败不把临时文件留在 cache/ 里:这是个计工作区配额的共享目录,本任务
+        # 治的就是它的无限增长。清理本身再失败也不能盖掉真正的原因。
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _fetch(url: str, cache_dir: str, budget: int) -> tuple[str | None, int]:
+    """拉一个 URL 进共享缓存。返回 ``(缓存文件名 or None, 真正下载的字节数)``。
+
+    命中缓存返回 ``(文件名, 0)`` —— 一个请求都不发,预算也不扣;任何失败都返回
+    ``(None, 0)``。
+    """
+    digest = cache_digest(url)
+    cached = _cached_name(cache_dir, digest)
+    if cached is not None:
+        return cached, 0
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "expert-work-prefetch/1"})  # noqa: S310
         with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:  # noqa: S310
@@ -115,10 +188,8 @@ def _fetch(
         # 不比对就会把半张图片当命中存下——比不上不存,同其它失败一样降级。
         if declared_len is not None and len(body) != declared_len:
             return None, 0
-        name = target_name(var_name, path, pick_suffix(content_type, url))
-        os.makedirs(dest_dir, exist_ok=True)
-        with open(os.path.join(dest_dir, name), "wb") as handle:
-            handle.write(body)
+        name = digest + pick_suffix(content_type, url)
+        _store(cache_dir, name, body)
         return name, len(body)
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError, TimeoutError):
         return None, 0
@@ -156,8 +227,10 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"prefetch": []}, ensure_ascii=False))
         return 0
     run_dir = os.path.dirname(inputs_path)
-    files_dir = os.path.join(run_dir, "files")
-    rel_prefix = posixpath.join("inputs", os.path.basename(run_dir), "files")
+    # cache/ 挂在 run 目录的**父目录**下(``inputs/cache/``),与 ``<run_id>/`` 平级:
+    # 内容寻址的条目按 agent 共享、跨轮复用,放进 run 目录就退回「每轮重下一份」。
+    cache_dir = os.path.join(os.path.dirname(run_dir), CACHE_DIRNAME)
+    rel_prefix = posixpath.join("inputs", CACHE_DIRNAME)
     budget = MAX_TOTAL_BYTES
     report: list[dict[str, object]] = []
 
@@ -168,7 +241,7 @@ def main(argv: list[str]) -> int:
             hit = False
             used = 0
             try:
-                filename, used = _fetch(url, files_dir, name, path, budget)
+                filename, used = _fetch(url, cache_dir, budget)
                 hit = filename is not None
                 _assign(entry, path, posixpath.join(rel_prefix, filename) if filename else None)
                 _rewrite(inputs_path, doc)
