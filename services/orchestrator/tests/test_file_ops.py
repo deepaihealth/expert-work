@@ -679,9 +679,13 @@ def test_specs_metadata() -> None:
 # 带上尾随逗号:``_PARAMS`` 是 ``json.dumps`` 的产物,``"ws": "/workspace"``
 # 本身是 ``"ws": "/workspace/agents/…"`` 的**子串** —— 不钉逗号的话「断言落在
 # 用户根」这件事恒真,测试看着在咬其实没咬。
-_AGENT_WS = '"ws": "/workspace/agents/plan-aaaaaaaa",'
 _USER_WS = '"ws": "/workspace",'
 _SHARED_WS = '"ws": "/workspace/shared",'
+#: B-60 —— 绑了 agent 时 ``ws`` 不再拼 ``agents/<key>``,片段看的就是视图根。值与
+#: ``_USER_WS`` 恰好相同(视图对绑没绑都是 ``/workspace``),但断言意图不同 ——
+#: 这个名字标的是「绑了 agent 的调用现在也落在这里」,别跟「未绑 agent 走用户根」
+#: 混为一谈。
+_VIEW_WS = '"ws": "/workspace",'
 
 
 class _SequenceRuntime(RecordingSandboxRuntime):
@@ -707,11 +711,13 @@ _NOT_FOUND = json.dumps({"ok": False, "error": "not_found"})
 
 
 async def test_read_file_resolves_under_agent_root() -> None:
+    """B-60 —— 「agent 根」现在就是视图根:绑了 agent 时 ``ws`` 是 ``/workspace``,
+    不再拼 ``agents/<key>``(默认视图里只有你自己的目录,靠命名空间实现)。"""
     client = _client(json.dumps({"ok": True, "content": "hi"}))
     await ReadFileTool(client=client).call(
         {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
     )
-    assert _AGENT_WS in client.execs[-1][1]
+    assert _VIEW_WS in client.execs[-1][1]
 
 
 async def test_read_file_without_agent_key_stays_at_user_root() -> None:
@@ -731,7 +737,7 @@ async def test_write_file_never_falls_back() -> None:
             {"path": "MEMORY.md", "content": "hi"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
         )
     assert len(client.execs) == 1
-    assert _AGENT_WS in client.execs[0][1]
+    assert _VIEW_WS in client.execs[0][1]
 
 
 async def test_edit_file_never_falls_back() -> None:
@@ -742,7 +748,7 @@ async def test_edit_file_never_falls_back() -> None:
             ctx=_ctx(agent_key="plan-aaaaaaaa"),
         )
     assert len(client.execs) == 1
-    assert _AGENT_WS in client.execs[0][1]
+    assert _VIEW_WS in client.execs[0][1]
 
 
 async def test_read_file_never_reaches_the_user_root(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -761,8 +767,7 @@ async def test_read_file_never_reaches_the_user_root(monkeypatch: pytest.MonkeyP
             {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
         )
     assert len(client.execs) == 1, "回落被加回来了:多跑了一次 exec"
-    assert _AGENT_WS in client.execs[0][1]
-    assert _USER_WS not in client.execs[0][1]
+    assert _VIEW_WS in client.execs[0][1]
 
 
 async def test_list_dir_never_reaches_the_user_root() -> None:
@@ -822,7 +827,7 @@ async def test_absolute_agent_path_folds_to_relative() -> None:
         ctx=_ctx(agent_key="plan-aaaaaaaa"),
     )
     code = client.execs[-1][1]
-    assert _AGENT_WS in code
+    assert _VIEW_WS in code
     assert '"rel": "MEMORY.md"' in code
 
 
@@ -835,116 +840,60 @@ async def test_another_agents_absolute_path_is_not_folded() -> None:
         )
 
 
-async def test_projection_writer_still_targets_the_user_root() -> None:
-    """**有意的暂缓** —— 状态投影(``threads/<tid>/PLAN.md``)本 PR 不搬。
+@pytest.mark.parametrize("path", ["shared/x.md", "shared", "/workspace/shared/x.md"])
+async def test_bare_shared_segment_is_reserved_when_bound(path: str) -> None:
+    """视图里 /workspace/shared 是只读 bind;裸 shared/… 写会 EROFS、读会读到别的东西。
+    拒掉并指向 shared: 前缀,而不是静默 io_error。"""
+    with pytest.raises(ValueError, match="shared:"):
+        await ReadFileTool(client=_client()).call(
+            {"path": path}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+        )
 
-    ``control_plane/api/sessions.py`` 的 B-27 留存链按用户根下的
-    ``threads/<thread_id>/`` 删目录;投影写入先搬走、删除侧要到 PR5(Task 12)
-    才跟上,中间每个被清理的会话都会留下永远删不掉的投影文件。两边必须同一个
-    PR 改 —— 这条断言是那个约定的哨兵,PR5 落地时换成 agent 根,不是删掉。
-    """
+
+async def test_bare_shared_segment_is_plain_when_unbound() -> None:
+    client = _client(json.dumps({"ok": True, "content": "", "content_hash": "x", "size": 0}))
+    await ReadFileTool(client=client).call({"path": "shared/x.md"}, ctx=_ctx())
+    assert '"rel": "shared/x.md"' in client.execs[-1][1]
+
+
+async def test_projection_writer_targets_the_exec_view() -> None:
+    """B-60 —— 投影(``threads/<tid>/PLAN.md``)随视图落进 agent 目录:绑了 agent 的进程
+    里根本没有用户根可写。删除侧 ``sessions.py`` 与留存 job 早已两处都删
+    (``agents/<key>/threads/…`` 与用户根 ``threads/…``),不需要跟着改。"""
     client = _client(json.dumps({"ok": True, "size": 2}))
     writer = SandboxWorkspaceWriter(client=client, ctx=_ctx(agent_key="plan-aaaaaaaa"))
     await writer.write(rel="threads/t1/PLAN.md", content="x")
-    assert _USER_WS in client.execs[-1][1]
-    assert _AGENT_WS not in client.execs[-1][1]
+    assert _VIEW_WS in client.execs[-1][1]
 
 
 # ---------------------------------------------------------------------------
-# save_artifact 的定位片段 —— 真跑在 tmp_path 上,证明「认领」真的把文件搬了
+# save_artifact 的定位片段 —— 真跑在 tmp_path 上。B-60 之后只在视图里 stat,不认领:
+# exec 已经写不到用户根,认领分支是带着洞形状的死代码(spec §4.8)。
 # ---------------------------------------------------------------------------
 
 
-def _agent_layout(tmp_path: Path, key: str = "me-aaaaaaaa") -> tuple[str, str]:
-    user_ws = tmp_path
-    agent_ws = tmp_path / "agents" / key
-    agent_ws.mkdir(parents=True)
-    (tmp_path / "shared").mkdir()
-    return str(agent_ws), str(user_ws)
+def test_locate_finds_a_file_under_ws(tmp_path: Path) -> None:
+    (tmp_path / "deck.pptx").write_bytes(b"x" * 7)
+    env = _run_snippet(build_artifact_locate_wrapper("deck.pptx", ws=str(tmp_path)))
+    assert env == {"ok": True, "size": 7}
 
 
-def test_locate_finds_a_file_under_the_agent_root(tmp_path: Path) -> None:
-    agent_ws, user_ws = _agent_layout(tmp_path)
-    (Path(agent_ws) / "deck.pptx").write_bytes(b"x" * 7)
-
-    env = _run_snippet(
-        build_artifact_locate_wrapper("deck.pptx", agent_ws=agent_ws, user_ws=user_ws)
-    )
-
-    assert env == {"ok": True, "size": 7, "location": "agent"}
-
-
-def test_locate_claims_a_root_level_leak_by_moving_it(tmp_path: Path) -> None:
-    """exec_python 写了 /workspace/deck.pptx(用户根)。认领 = 搬进 agent 目录。"""
-    agent_ws, user_ws = _agent_layout(tmp_path)
-    leaked = Path(user_ws) / "deck.pptx"
-    leaked.write_bytes(b"y" * 11)
-
-    env = _run_snippet(
-        build_artifact_locate_wrapper("deck.pptx", agent_ws=agent_ws, user_ws=user_ws)
-    )
-
-    assert env == {"ok": True, "size": 11, "location": "claimed_from_user_root"}
-    assert not leaked.exists(), "源文件必须消失 —— 是搬不是拷,否则用户根上留一份跨 agent 可见的副本"
-    assert (Path(agent_ws) / "deck.pptx").read_bytes() == b"y" * 11
-
-
-def test_locate_claim_creates_missing_parent_dirs(tmp_path: Path) -> None:
-    agent_ws, user_ws = _agent_layout(tmp_path)
-    (Path(user_ws) / "out").mkdir()
-    (Path(user_ws) / "out" / "deck.pptx").write_bytes(b"z")
-
-    env = _run_snippet(
-        build_artifact_locate_wrapper("out/deck.pptx", agent_ws=agent_ws, user_ws=user_ws)
-    )
-
-    assert env["ok"] is True
-    assert (Path(agent_ws) / "out" / "deck.pptx").read_bytes() == b"z"
-
-
-@pytest.mark.parametrize("head", ["agents", "shared"])
-def test_locate_never_claims_from_agents_or_shared(tmp_path: Path, head: str) -> None:
-    """别的 agent 的目录与 shared/ 里的文件不是本 agent 的 —— 认领了就是 PR6 堵掉的那个洞。"""
-    agent_ws, user_ws = _agent_layout(tmp_path)
-    victim = Path(user_ws) / head / "other-bbbbbbbb" if head == "agents" else Path(user_ws) / head
-    victim.mkdir(parents=True, exist_ok=True)
-    (victim / "secret.md").write_text("theirs")
-    rel = f"{head}/other-bbbbbbbb/secret.md" if head == "agents" else f"{head}/secret.md"
-
-    env = _run_snippet(build_artifact_locate_wrapper(rel, agent_ws=agent_ws, user_ws=user_ws))
-
-    assert env["ok"] is False
-    assert env["error"] == "forbidden_scope"
-    assert env["head"] == head
-    assert (victim / "secret.md").read_text() == "theirs"
-
-
-def test_locate_reports_not_found_when_nowhere(tmp_path: Path) -> None:
-    agent_ws, user_ws = _agent_layout(tmp_path)
-    env = _run_snippet(
-        build_artifact_locate_wrapper("ghost.pptx", agent_ws=agent_ws, user_ws=user_ws)
-    )
+def test_locate_reports_not_found_and_never_looks_outside_ws(tmp_path: Path) -> None:
+    """用户根上有同名文件、ws 是它的子目录 —— 必须 not_found,不能「找到」。"""
+    ws = tmp_path / "agents" / "me-aaaaaaaa"
+    ws.mkdir(parents=True)
+    (tmp_path / "deck.pptx").write_bytes(b"y")
+    env = _run_snippet(build_artifact_locate_wrapper("deck.pptx", ws=str(ws)))
     assert env == {"ok": False, "error": "not_found"}
+    assert (tmp_path / "deck.pptx").exists(), "不认领:源文件必须原地不动"
 
 
 def test_locate_rejects_a_directory(tmp_path: Path) -> None:
-    agent_ws, user_ws = _agent_layout(tmp_path)
-    (Path(user_ws) / "outputs").mkdir()
-    env = _run_snippet(build_artifact_locate_wrapper("outputs", agent_ws=agent_ws, user_ws=user_ws))
+    (tmp_path / "outputs").mkdir()
+    env = _run_snippet(build_artifact_locate_wrapper("outputs", ws=str(tmp_path)))
     assert env == {"ok": False, "error": "not_a_file"}
 
 
-def test_locate_unbound_agent_never_claims(tmp_path: Path) -> None:
-    """未绑 agent 时 agent 根 == 用户根;根上的文件本来就在正确位置,不存在认领。"""
-    ws = str(tmp_path)
-    (tmp_path / "deck.pptx").write_bytes(b"q")
-    env = _run_snippet(build_artifact_locate_wrapper("deck.pptx", agent_ws=ws, user_ws=ws))
-    assert env == {"ok": True, "size": 1, "location": "agent"}
-
-
 def test_locate_escape_is_blocked(tmp_path: Path) -> None:
-    agent_ws, user_ws = _agent_layout(tmp_path)
-    env = _run_snippet(
-        build_artifact_locate_wrapper("../../etc/passwd", agent_ws=agent_ws, user_ws=user_ws)
-    )
+    env = _run_snippet(build_artifact_locate_wrapper("../../etc/passwd", ws=str(tmp_path)))
     assert env == {"ok": False, "error": "path_escapes_workspace"}

@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -67,6 +68,7 @@ from e2b import CommandExitException, TimeoutException
 from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
+    SANDBOX_LAYOUT_AGENT_NS,
     SANDBOX_LAYOUT_USER_ROOT,
     InMemorySandboxInstanceStore,
     _missing_row_message,
@@ -77,11 +79,12 @@ from orchestrator.tools.agent_sandbox import (
     _SANDBOX_TIMEOUT_S,
     _WARM_AGE_DESTROY_REASON,
     DEFAULT_TIMEOUT_S,
+    EXEC_VIEW,
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_S,
+    NAS_MOUNT,
     SANDBOX_EXEC_USER,
     SANDBOX_IMAGE_ENV,
-    WORKSPACE_ROOT,
     AgentSandboxClient,
 )
 from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
@@ -617,7 +620,7 @@ async def test_claim_warm_not_ready_surfaces_as_sandbox_supervisor_error() -> No
 @pytest.mark.asyncio
 async def test_seed_files_written_before_first_exec() -> None:
     """sandbox migration wave 2 — seed lands under SANDBOX_SKILLS_ROOT
-    (sandbox-local), not WORKSPACE_ROOT; relpath already carries the
+    (sandbox-local), not NAS_MOUNT; relpath already carries the
     agent_key namespace prefix (the caller's job, build_skill_seed_files)."""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1011,7 +1014,7 @@ async def test_exec_sets_owner_only_umask_before_running_the_script() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
 
     cmd, *_ = sdk.sandbox.commands.calls[-1]
-    assert cmd.startswith("umask 077 && python "), cmd
+    assert cmd.startswith("umask 077 && unshare -Urm --propagation private -- sh -c "), cmd
 
 
 # ---------------------------------------------------------------------------
@@ -1022,10 +1025,12 @@ async def test_exec_sets_owner_only_umask_before_running_the_script() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_runs_in_workspace_cwd() -> None:
-    """不传 ``cwd`` 时 envd 把进程扔在 ``/home/agent``:``bash`` 工具对 LLM
-    宣称的 "Runs in /workspace" 是假的,LLM 写的相对路径文件会落到
-    ``file_ops``(只认绝对 ``/workspace/...``)看不见的地方。
+async def test_exec_passes_the_nas_mount_as_cwd() -> None:
+    """不传 ``cwd`` 时 envd 把进程扔在 ``/home/agent``:E2B 在真正执行命令前会
+    校验传入的 ``cwd`` 已经存在,``NAS_MOUNT`` 在 create() 时就已经挂载好、不在
+    任何一次 exec 的私有命名空间之内,始终存在 —— ``EXEC_VIEW``(``/workspace``)
+    要等命名空间脚本自己 bind 出来,在那之前不存在。不传 ``cwd`` 的话,LLM 写的
+    相对路径文件会落到 ``file_ops``(只认绝对 ``/workspace/...``)看不见的地方。
     """
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1034,7 +1039,7 @@ async def test_exec_runs_in_workspace_cwd() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
 
     _, _, _, cwd = sdk.sandbox.commands.calls[-1]
-    assert cwd == WORKSPACE_ROOT == "/workspace"
+    assert cwd == NAS_MOUNT == "/mnt/workspace"
 
 
 @pytest.mark.asyncio
@@ -1054,7 +1059,7 @@ async def test_create_passes_the_image_environment() -> None:
     envs = sdk.created[-1]["envs"]
     for key, value in SANDBOX_IMAGE_ENV.items():
         assert envs[key] == value, f"镜像环境变量 {key} 没送进沙箱"
-    # 沙箱迁移 W2 Task 9:HOME 迁出 WORKSPACE_ROOT——/workspace 现在必须空着
+    # 沙箱迁移 W2 Task 9:HOME 迁出 NAS_MOUNT——NAS_MOUNT 现在必须空着
     # 让平台建 NAS 挂载 symlink,HOME 改落 useradd -m 建好的 /home/agent。
     assert envs["HOME"] == "/home/agent", "HOME 不是 /home/agent 则 PIP_USER 装到镜像预建目录之外"
     assert envs["PIP_USER"] == "1", "只读 rootfs 上没有 PIP_USER=1 则 pip install 必失败"
@@ -1082,7 +1087,7 @@ async def test_create_injects_csi_volume_config() -> None:
     assert volumes == [
         {
             "pvName": "workspace-nas",
-            "mountPath": WORKSPACE_ROOT,
+            "mountPath": NAS_MOUNT,
             "subPath": f"{tenant_id}/{user_id}",
         }
     ]
@@ -1141,7 +1146,7 @@ async def test_ephemeral_create_mounts_scratch_subpath() -> None:
     assert volumes == [
         {
             "pvName": "workspace-nas",
-            "mountPath": WORKSPACE_ROOT,
+            "mountPath": NAS_MOUNT,
             "subPath": f"_scratch/{sandbox_id}",
         }
     ]
@@ -1179,10 +1184,10 @@ async def test_acquire_mkdirs_ephemeral_scratch_dir(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_acquire_chowns_the_mount_from_inside_the_sandbox() -> None:
     """波 2 收尾(集群实测坐实)—— 挂载点目录若由**平台**建,是 ``root:root
-    0755``,沙箱里的 agent(uid 10000)第一次写 ``/workspace`` 就
+    0755``,沙箱里的 agent(uid 10000)第一次写 ``/mnt/workspace`` 就
     ``PermissionError``。权威修法是 control-plane 在 ``create()`` 之前
     mkdir 好(``_prepare_workspace_mount``),这里钉的是够不到那半边时的
-    兜底:沙箱建好后以 **root** 跑一句 ``chown 10000:10000 /workspace``。
+    兜底:沙箱建好后以 **root** 跑一句 ``chown 10000:10000 /mnt/workspace``。
 
     断言 ``user="root"`` 而不是 ``SANDBOX_EXEC_USER``:agent 不是属主,以
     agent 身份 chown 一个 root 属主的目录必然 EPERM,这一句就白跑了。
@@ -1193,12 +1198,12 @@ async def test_acquire_chowns_the_mount_from_inside_the_sandbox() -> None:
     await client.acquire(tenant_id=uuid4(), thread_id="t")
 
     chowns = [c for c in sdk.sandbox.commands.calls if c[0].startswith("chown ")]
-    assert chowns == [(f"chown 10000:10000 {WORKSPACE_ROOT}", None, "root", None)]
+    assert chowns == [(f"chown 10000:10000 {NAS_MOUNT}", None, "root", None)]
 
 
 @pytest.mark.asyncio
 async def test_acquire_skips_the_mount_chown_when_no_pv_is_configured() -> None:
-    """没配 ``workspace_pv_name`` 就根本没有挂载、``/workspace`` 也不存在
+    """没配 ``workspace_pv_name`` 就根本没有挂载、``/mnt/workspace`` 也不存在
     ——那一句 chown 只会在 envd 侧留一条无意义的失败,不发。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1213,10 +1218,29 @@ async def test_acquire_survives_a_failing_mount_chown() -> None:
     """刻意 best-effort —— 生产路径上目录早已是 control-plane 建的、属主
     已经是 10000,而这一句以 root 跑;NAS 若开 ``root_squash``,root 被映射
     成 nobody,对别人属主的目录 chown 必然 EPERM。那种失败是无害的(目录本来
-    就是对的),把它抬成 ``create`` 失败会判死一个完全可用的沙箱。"""
+    就是对的),把它抬成 ``create`` 失败会判死一个完全可用的沙箱。
+
+    B-60 起 post-create 在 chown 之前先跑一句 mkdir(``_ensure_exec_view_dir``,
+    fail-closed),``FakeCommands.run_error`` 是不分命令的全局开关,不能直接复
+    用来只炸 chown 那一句——这里换成只对 ``chown `` 开头的命令失败的假件,让
+    mkdir 照常成功,精确复现"只有 chown 失败"这一个场景。
+    """
     sdk, store = FakeSdk(), FakeInstanceStore()
-    sdk.sandbox.commands.run_error = RuntimeError("chown: Operation not permitted")
     client = make_client(sdk, store, workspace_pv_name="workspace-nas")
+
+    async def run(
+        cmd: str,
+        timeout: int | None = None,
+        *,
+        user: str | None = None,
+        cwd: str | None = None,
+        envs: dict[str, str] | None = None,
+    ) -> None:
+        sdk.sandbox.commands.calls.append((cmd, timeout, user, cwd))
+        if cmd.startswith("chown "):
+            raise RuntimeError("chown: Operation not permitted")
+
+    sdk.sandbox.commands.run = run
 
     sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t")
 
@@ -1500,8 +1524,8 @@ def _dockerfile_text() -> str:
     return dockerfile.read_text(encoding="utf-8")
 
 
-def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | None]:
-    """从 Dockerfile 文本里抽出最终的 ``ENV`` 集合与最后一条 ``WORKDIR``。
+def _dockerfile_statements(text: str) -> list[str]:
+    """把 Dockerfile 文本拆成逻辑指令列表。
 
     处理反斜杠续行,以及续行块内部的注释行(``ENV`` 那段真的有一段
     ``# Read-only rootfs at runtime: ...`` 夹在中间)。
@@ -1519,10 +1543,14 @@ def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | 
             continue
         statements.append((pending + line).strip())
         pending = ""
+    return statements
 
+
+def _parse_dockerfile_env_and_workdir(text: str) -> tuple[dict[str, str], str | None]:
+    """从 Dockerfile 文本里抽出最终的 ``ENV`` 集合与最后一条 ``WORKDIR``。"""
     env: dict[str, str] = {}
     workdir: str | None = None
-    for statement in statements:
+    for statement in _dockerfile_statements(text):
         if statement.startswith("ENV "):
             for token in shlex.split(statement[len("ENV ") :]):
                 key, _, value = token.partition("=")
@@ -1539,7 +1567,7 @@ def test_image_env_matches_dockerfile() -> None:
     Dockerfile 的 ``ENV`` 是构建期声明,编排进程运行时读不到,所以
     :data:`SANDBOX_IMAGE_ENV` 只能是第二份副本。**双向**比对:少了一条 →
     云沙箱里那个变量是空的;多了一条 → 送进去一个镜像早就不再声明的值。
-    ``WORKDIR`` 同理钉住 :data:`WORKSPACE_ROOT`。
+    ``WORKDIR`` 同理钉住 :data:`NAS_MOUNT`。
 
     刻意不打 ``@pytest.mark.integration``、也刻意不 ``skip``:漂移闸在跳过
     时就等于不存在(见 sandbox-contract 工作流那次"结构性报绿"的教训),
@@ -1547,9 +1575,9 @@ def test_image_env_matches_dockerfile() -> None:
     那正该红。
 
     沙箱迁移 W2 Task 9:镜像不再声明 ``WORKDIR``(该指令本身会创建
-    ``WORKSPACE_ROOT``,与平台在这个路径建 NAS 挂载 symlink 冲突)——闸的
+    ``NAS_MOUNT``,与平台在这个路径建 NAS 挂载 symlink 冲突)——闸的
     期望改成"Dockerfile 里压根没有 WORKDIR",cwd 完全交给 exec 显式传
-    :data:`WORKSPACE_ROOT`(见 ``AgentSandboxClient.exec`` 的
+    :data:`NAS_MOUNT`(见 ``AgentSandboxClient.exec`` 的
     ``commands.run(cwd=...)``,W1 全分支终审 Important-2 已经在传)。
     """
     env, workdir = _parse_dockerfile_env_and_workdir(_dockerfile_text())
@@ -1561,19 +1589,42 @@ def test_image_env_matches_dockerfile() -> None:
     )
     assert workdir is None, (
         f"镜像不该再声明 WORKDIR(现为 {workdir!r})—— 该指令自带创建目录的"
-        f" 副作用,会跟平台在 {WORKSPACE_ROOT} 建 NAS 挂载 symlink 冲突;"
-        " cwd 改由 exec 显式传 WORKSPACE_ROOT。"
+        f" 副作用,会跟平台在 {NAS_MOUNT} 建 NAS 挂载 symlink 冲突,也会抢先建出"
+        f" {EXEC_VIEW}(镜像不该预建它,建目录是 post-create mkdir 的职责,见"
+        " AgentSandboxClient._ensure_exec_view_dir);cwd 改由 exec 显式传 NAS_MOUNT。"
     )
 
 
-def test_image_starts_as_root_and_leaves_workspace_free() -> None:
-    """平台在 mountPath 建 symlink,且 envd 要 fork/exec 存储 helper —— 见
-    spec § 二之二(``docs/superpowers/specs/2026-08-07-sandbox-migration-w2-
-    design.md``)。"""
+def test_image_leaves_both_mount_points_bare() -> None:
+    """平台在 mountPath(B-60 起是 ``/mnt/workspace``)建 symlink,预建目录会挡住它;
+    ``/workspace`` 也不预建 —— ACS 老代码 + 预建目录同样建不上,运行期 ``mkdir -p``
+    是规则(``AgentSandboxClient._ensure_exec_view_dir``),不是过渡。
+
+    ``mkdir`` 半边按 ``RUN`` 指令逐条 ``shlex`` 分词比对,不是子串匹配 ——
+    子串 ``"mkdir -p /workspace"`` 只咬得住恰好长这个形状的写法,``RUN mkdir -p
+    /opt/skills /opt/agents /workspace``、``RUN mkdir /workspace``、
+    ``RUN install -d /workspace`` 这几种同样会预建目录的写法都能从子串检查里
+    溜走(见 task-12 review round 1)。``WORKDIR`` 半边已经被
+    ``test_image_env_matches_dockerfile`` 的语句解析器双向钉住,这里维持原样。
+    """
     text = _dockerfile_text()
     assert "\nUSER agent" not in text  # 容器必须 root 启动(agent 用户仍在,执行时降权)
-    assert "WORKDIR /workspace" not in text  # WORKDIR 指令本身会创建目录
-    assert "mkdir -p /workspace" not in text
+    assert "WORKDIR /workspace" not in text and "WORKDIR /mnt/workspace" not in text
+    for statement in _dockerfile_statements(text):
+        if not statement.startswith("RUN "):
+            continue
+        tokens = shlex.split(statement[len("RUN ") :])
+        for token in tokens:
+            # 两个挂载点自身要拒,它们**底下**的任何路径同样要拒:`mkdir -p
+            # /workspace/sub` 会把 /workspace 一起建出来,而按精确相等比对的写法
+            # 放它过去 —— 挡住 symlink 的副作用一模一样(全分支终审 M6)。
+            assert token not in ("/workspace", "/mnt/workspace") and not token.startswith(
+                ("/workspace/", "/mnt/workspace/")
+            ), (
+                f"某条 RUN 指令预建了 /workspace 或 /mnt/workspace(或其下的路径,建子目录"
+                f" 会把父目录一起建出来,同样挡住平台的 NAS 挂载 symlink 与 post-create"
+                f" mkdir):{statement!r}"
+            )
     assert "HOME=/home/agent" in text
     assert "mkdir -p /opt/skills /opt/agents" in text
 
@@ -2663,25 +2714,59 @@ async def test_release_survives_a_failing_refresh_soon() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_enters_the_agent_directory_after_tightening_umask() -> None:
-    """B-50 PR3b —— 绑了 agent 时 ``mkdir -p`` + ``cd`` 进自己的目录,
-    但**排在 ``umask 077`` 之后**。
-
-    顺序是有内容的:反过来写(先 mkdir)新建的 agent 目录会拿到默认 umask 的
-    ``0o755``,而这个工作区的目标状态是属主专用的 ``0o700``
-    (见 ``test_exec_sets_owner_only_umask_before_running_the_script``)。
-
-    用 ``mkdir -p`` + ``cd`` 而不是 ``cwd=`` 参数,是因为 E2B 在**执行前**校验
-    ``cwd``:agent 目录在有人往里写之前不存在,exec 会先失败,mkdir 根本轮不上。
-    """
+async def test_exec_command_is_the_shared_exec_view_command() -> None:
+    """B-60 —— 命令串由 ``exec_view.build_exec_command`` 生成,与本地 runner 同一段
+    脚本;绑了 agent 时 ``$1`` 是 NAS 上的真实目录,未绑是空串。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
     sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
 
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="plan-aaaaaaaa")
+    bound, *_ = sdk.sandbox.commands.calls[-1]
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
+    unbound, *_ = sdk.sandbox.commands.calls[-1]
 
-    cmd, *_ = sdk.sandbox.commands.calls[-1]
-    assert cmd.startswith(
-        "umask 077 && mkdir -p /workspace/agents/plan-aaaaaaaa && "
-        "cd /workspace/agents/plan-aaaaaaaa && python "
-    ), cmd
+    assert re.fullmatch(
+        re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
+        r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa python -E -P "
+        r"/tmp/ew-exec-[0-9a-f]{32}\.py",
+        bound,
+        re.DOTALL,
+    ), bound
+    assert re.fullmatch(
+        re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
+        r"ew-exec-view '' python -E -P /tmp/ew-exec-[0-9a-f]{32}\.py",
+        unbound,
+        re.DOTALL,
+    ), unbound
+
+
+@pytest.mark.asyncio
+async def test_post_create_creates_the_exec_view_dir_as_root_before_chown() -> None:
+    """镜像里没有 /workspace(池 pod 实测),bind 目标由 post-create 以 root 建。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store, workspace_pv_name="pv-nas")
+    await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    root_cmds = [cmd for cmd, _, user, _ in sdk.sandbox.commands.calls if user == "root"]
+    assert root_cmds[:2] == ["mkdir -p /workspace", "chown 10000:10000 /mnt/workspace"]
+
+
+@pytest.mark.asyncio
+async def test_post_create_mkdir_failure_discards_the_sandbox() -> None:
+    """与 chown 相反,这句不是 best-effort:没有它每次 exec 都在第一条 bind 上 fail-closed。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    sdk.sandbox.commands.run_error = RuntimeError("mkdir: read-only file system")
+    client = make_client(sdk, store)
+
+    with pytest.raises(SandboxSupervisorError, match="post-create setup failed"):
+        await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    assert sdk.sandbox.killed is True, (
+        "mkdir 失败必须让 post-create 失败并把这次自己建的沙箱 kill 掉——不是"
+        "留一个 /workspace 永远建不出来的活 microVM"
+    )
+
+
+def test_client_lays_out_agent_ns_by_default() -> None:
+    assert make_client(FakeSdk(), FakeInstanceStore()).layout == SANDBOX_LAYOUT_AGENT_NS

@@ -12,19 +12,21 @@ import pytest
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
 from orchestrator.tools import workspace_paths
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 from orchestrator.tools.workspace_paths import (
     SHARED_PREFIX,
-    USER_ROOT,
     WriteToSharedError,
-    agent_workspace_root,
+    agent_nas_root,
+    agent_view_alias,
     resolve_scope,
 )
 
 
-def test_bare_path_resolves_under_agent_root() -> None:
+def test_bare_path_resolves_to_the_exec_view() -> None:
+    """B-60 —— 文件工具的片段与用户代码在同一个命名空间里,看同一个视图:
+    绑了 agent 时 /workspace **就是** agent 目录,ws 不再拼 agents/<key>。"""
     ws, rel = resolve_scope("MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file")
-    assert ws == "/workspace/agents/plan-aaaaaaaa"
-    assert rel == "MEMORY.md"
+    assert (ws, rel) == (EXEC_VIEW, "MEMORY.md")
 
 
 def test_shared_prefix_resolves_to_shared_root() -> None:
@@ -38,7 +40,7 @@ def test_shared_prefix_resolves_to_shared_root() -> None:
 def test_empty_agent_key_falls_back_to_user_root() -> None:
     """迁移期回落:没绑 agent 时读写用户根,与今天行为一致。"""
     ws, rel = resolve_scope("MEMORY.md", agent_key="", tool="read_file")
-    assert ws == USER_ROOT == "/workspace"
+    assert ws == EXEC_VIEW
     assert rel == "MEMORY.md"
 
 
@@ -70,31 +72,37 @@ def test_shared_prefix_rejects_empty_remainder() -> None:
         resolve_scope("shared:", agent_key="plan-aaaaaaaa", tool="read_file")
 
 
+def test_bad_agent_key_is_refused_even_though_it_no_longer_shapes_the_path() -> None:
+    """B-60 之后 ``resolve_scope`` 的返回值不再含 ``agent_key`` —— 它只剩裸一句
+    ``agent_view_alias(agent_key)`` 在做校验。没有这条用例,把那一句删掉整个文件照样绿,
+    而坏 key 会一路走到下游(``_require_path`` 的折叠、``save_artifact``)才被发现。"""
+    with pytest.raises(ValueError):
+        resolve_scope("x", agent_key="..", tool="read_file")
+
+
 # ``..`` / ``.`` **单独**列出来不是凑数:原来这张表里每一项都带分隔符或是
 # 空白,于是「一段裸的 ``..``」从来没被试过 —— 而它恰恰能过那条正则
 # (两个点都在字符集里),``{root}/agents/..`` 就是 ``{root}``,agent 作用域
 # 塌回用户根。穷举形状时漏掉的往往是最短的那个。
 @pytest.mark.parametrize("bad", ["../../etc", "a/b", "plan/", "", " ", "..", "."])
 def test_agent_key_that_is_not_one_path_segment_is_refused(bad: str) -> None:
-    """``agent_key`` 会被拼进 ``ws``;不是单个安全路径段就必须拒。
+    """``agent_key`` 会被拼进 ``ws``;不是单个安全路径段就必须拒 —— 空串也不例外:
 
-    空串是唯一的例外(=未绑定,走用户根),由
-    :func:`test_empty_agent_key_falls_back_to_user_root` 覆盖。
+    ``agent_nas_root`` 没有「未绑定」这个概念(那是调用方在 ``resolve_scope`` 里
+    分支的事,见 :func:`test_empty_agent_key_falls_back_to_user_root`),它的
+    契约就是「给我一个安全路径段,否则拒」。
     """
-    if bad == "":
-        assert agent_workspace_root(bad) == USER_ROOT
-        return
     with pytest.raises(ValueError):
-        agent_workspace_root(bad)
+        agent_nas_root(bad)
 
 
-def test_agent_workspace_root_accepts_sanitize_agent_key_output() -> None:
+def test_agent_nas_root_accepts_sanitize_agent_key_output() -> None:
     """真实取值必须过 —— 形状由 ``sanitize_agent_key`` 决定。"""
     from expert_work.protocol.agent_key import sanitize_agent_key
 
     for name in ("ai-health-plan", "sop2-designer", "方案 设计师", "a" * 200):
         key = sanitize_agent_key(name)
-        assert agent_workspace_root(key) == f"{USER_ROOT}/agents/{key}"
+        assert agent_nas_root(key) == f"{NAS_MOUNT}/agents/{key}"
 
 
 def test_shared_prefix_constant_is_the_documented_one() -> None:
@@ -128,4 +136,30 @@ def test_shared_prefix_always_names_the_shared_dir() -> None:
     assert workspace_paths.SHARED_PREFIX == f"{WORKSPACE_SHARED_DIR}:"
     assert workspace_paths.resolve_scope(
         f"{WORKSPACE_SHARED_DIR}:MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file"
-    ) == (f"{workspace_paths.USER_ROOT}/{WORKSPACE_SHARED_DIR}", "MEMORY.md")
+    ) == (f"{EXEC_VIEW}/{WORKSPACE_SHARED_DIR}", "MEMORY.md")
+
+
+def test_agent_nas_root_points_under_the_nas_mount() -> None:
+    """B-60 —— 后端拼 exec 用的 bind 源:NAS 挂载点下的真实目录。"""
+    assert agent_nas_root("plan-aaaaaaaa") == "/mnt/workspace/agents/plan-aaaaaaaa"
+
+
+def test_agent_view_alias_is_the_legacy_absolute_spelling() -> None:
+    """只用于折叠模型照旧写的 ``/workspace/agents/<key>/x``;视图里没有这个目录。"""
+    assert agent_view_alias("plan-aaaaaaaa") == "/workspace/agents/plan-aaaaaaaa"
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "a b", "../x", "a\x00b"])
+def test_nas_root_and_alias_refuse_unsafe_or_empty_keys(bad: str) -> None:
+    """空 key 也拒:未绑 agent 没有「自己的目录」,调用方自己分支,别让它拿到用户根。"""
+    with pytest.raises(ValueError):
+        agent_nas_root(bad)
+    with pytest.raises(ValueError):
+        agent_view_alias(bad)
+
+
+def test_view_and_mount_are_distinct_roots() -> None:
+    """视图根与挂载点互不包含 —— tmpfs 盖挂载点时不能把视图也盖掉。"""
+    assert (NAS_MOUNT, EXEC_VIEW) == ("/mnt/workspace", "/workspace")
+    assert not NAS_MOUNT.startswith(EXEC_VIEW + "/")
+    assert not EXEC_VIEW.startswith(NAS_MOUNT + "/")

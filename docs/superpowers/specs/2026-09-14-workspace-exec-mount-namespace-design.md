@@ -20,6 +20,8 @@
 | 7 | supervisor 线协议沿用 `cwd` 字段 | 它不再是 cwd(子进程 cwd 恒为 `/workspace`),它是「bind 到 `/workspace` 上的那个目录」 | 改名 `agent_root`。§4.5 |
 | 8 | (未提) | 视图里 `/workspace/shared` 是只读 bind;绑了 agent 的调用写相对路径 `shared/x` 会撞 EROFS | `shared/` 与 `agents/` 一样成为绑了 agent 时的**保留首段**,`_require_path` 直接拒并指向 `shared:` 前缀。§4.2 |
 | 9 | `claim_warm` 复用条件加 `layout='agent-ns'` | 常量写死在 store 里,列与闸就没法先于 exec 改动单独上线(闸会把好好的 `user-root` 会话全重建成名不副实的 `agent-ns`) | `layout` 由调用方传入,`claim_warm` 把赢家行的 layout 随同一次 SELECT 返回;先落列+闸(传 `user-root`,零行为变化),再随 exec 改动翻成 `agent-ns`。§4.6 |
+| 10 | compose 用 `${PWD}` 把 profile 挂到宿主同路径 | docker CLI 是**客户端**读这个文件、把 JSON 内联进发给 daemon 的 HostConfig(实测 2026-09-14:`docker run --security-opt seccomp=/nonexistent/x.json` 客户端直接报错;`docker inspect` 能看到 `seccomp={…json…}`),路径只需要在 **supervisor 容器里**能读到,不是宿主路径 | 实际形状(Task 8):volume `./sandbox-image/seccomp-profile.json:/etc/expert-work/seccomp-profile.json:ro`,env `EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH=/etc/expert-work/seccomp-profile.json`。§4.5 |
+| 11 | (未提部署滚动窗口) | control-plane 生产跑 2 副本、默认 RollingUpdate;PR-C 翻转 `layout` 默认值那一刻起,滚动窗口(约 1-2 分钟)内新旧 pod 对同一批热会话的期望布局不一致,双方都可能把对方刚建的热会话判成 `layout_mismatch` 销毁重建,可能连带打断另一侧正在跑的 exec | **拍板(2026-09-14,「不改部署形状」)**:接受为有界抖动,不改 Recreate / 不缩容到零 / 不改发布策略;写进 §7 与 Task 13 验收要点(滚动窗口内预期看到 `layout_mismatch` 销毁,只剩一个版本后自愈)。 |
 
 ## 一、问题
 
@@ -134,9 +136,13 @@ if [ -n "$root" ]; then
   mkdir -p "$root"
   mount --bind "$root" /workspace
   if [ -d /mnt/workspace/shared ]; then
-    mkdir -p /workspace/shared
-    mount --bind /mnt/workspace/shared /workspace/shared
-    mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
+    if [ -L /workspace/shared ] || { [ -e /workspace/shared ] && [ ! -d /workspace/shared ]; }; then
+      echo "ew-exec-view: /workspace/shared is not a directory; shared/ not mounted" >&2
+    else
+      mkdir -p /workspace/shared
+      mount --bind /mnt/workspace/shared /workspace/shared
+      mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
+    fi
   fi
   mount -t tmpfs -o size=1k none /mnt/workspace
 else
@@ -185,8 +191,16 @@ unshare -Urm --propagation private -- sh -c '<脚本体>' ew-exec-view <agent_na
   `mount` + `open_tree` `move_mount` `fsopen` `fsconfig` `fsmount` `fspick` `mount_setattr`。
   **不放** `umount2` / `setns` / `pivot_root`(仍 cap 门控)。`test_seccomp.py` 的 `test_privileged_syscalls_only_cap_gated` 去掉 `mount`/`unshare`,加三条新闸。
 - **钉住的 profile 成为本地后端的硬前提**:`app.py:164` 启动时 `seccomp_profile_path is None` → 拒绝启动(信息写明 B-60 与原因)。
-  compose 把 `infra/sandbox-image/seccomp-profile.json` 以**宿主同路径**挂进 supervisor 容器并设 `EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH`;
-  验收套件 fixture 显式传仓内 profile 路径。
+  compose 把 `infra/sandbox-image/seccomp-profile.json` 挂进 supervisor 容器固定路径
+  `./sandbox-image/seccomp-profile.json:/etc/expert-work/seccomp-profile.json:ro`,并设
+  `EXPERT_WORK_SANDBOX_SECCOMP_PROFILE_PATH=/etc/expert-work/seccomp-profile.json`(见 §零 第 10 条修订——
+  docker CLI 是**客户端**读这个文件、把 JSON 内联进发给 daemon 的 HostConfig,路径只需要在
+  **supervisor 容器里**能读到,不是宿主路径);验收套件 fixture 显式传仓内 profile 路径。
+- supervisor 线协议 `ExecRequest` 是 pydantic 默认的 `extra="ignore"`:老 orchestrator 发不带
+  `agent_root` 的旧请求给新 supervisor 时,新字段静默不存在,exec 悄悄退回未绑定行为、不报错 ——
+  只影响本地 supervisor 后端(dev/CI);ACS 路径不经这层 HTTP schema,走 `build_exec_command`
+  直接拼命令串,不受影响。**发布注记**:dev 环境 orchestrator 与 supervisor 必须同批部署,
+  不能只升级一边。
 - **AppArmor**:`docker-default` 有 `deny mount,`,所以 `apparmor=unconfined`;Ubuntu 24.04 的
   `kernel.apparmor_restrict_unprivileged_userns=1` 会让 unconfined 建不了 userns → `ci.yml` 集成 job 与 `sandbox-gvisor.yml`
   各加一步 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`(有这个键才设)。**未实测,CI 是判据**。
@@ -231,12 +245,29 @@ exec 已经写不到用户根,留着就是一段带着洞形状的死代码。�
 - `bash` 持 per-workspace 写锁(`bash.py:55`),`exec_python` 不持 —— 与本方案无关,不改。
 - user ns 内的「root」对外仍是 uid 10000:写出的文件属主 10000(两处实测),NAS 上 `0o700`/`umask 077` 语义不变。
 - 能不能逃:ns 内能不能把 `/mnt/workspace` 上的 tmpfs 挪开露出用户根 —— **ACS 上能**(无 seccomp,`umount`/`mount --move` 都在);
-  本地后端 `umount2` 仍 cap 门控,但 `mount --move` 走 `mount(2)`,同样能。所以本方案对**故意**的代码仍不是绝对边界;
-  它保证的是**照平台教法写的代码**不可能越界,以及**默认视图**里别的 agent 不存在。与 `/opt/skills/<key>` 今天的强度一致。
-  写进工具描述与对外文档时按这个口径说,不说「隔离」。
+  本地后端 `umount2` 仍 cap 门控,但 `mount --move` 走 `mount(2)`,**已实测不是推论**:本地后端的
+  加固参数下,命名空间里 `mount --move /mnt/workspace <dir>` 成功,用户根当场露出来。所以本方案对**故意**的
+  代码仍不是绝对边界;它保证的是**照平台教法写的代码**不可能越界,以及**默认视图**里别的 agent 不存在。
+  与 `/opt/skills/<key>` 今天的强度一致。写进工具描述与对外文档时按这个口径说,不说「隔离」。
+- **命名空间之间也看不见:** 同一沙箱里另一个 exec 的 `/proc/<pid>/root`、`/proc/<pid>/cwd` 读不到 ——
+  内核在 `commoncap` 里按 `ptrace_may_access` 判,读者的 user ns 不是目标进程 user ns 的祖先就 EACCES。
+  本地后端实测如此;ACS 的 5.10 走同一处检查。也就是说 agent A 的 exec 没法拿 procfs 绕过去看 agent B 的视图。
+- **ns 里 `geteuid()==0` 是可观测的。** `unshare -U` 把当前 uid 映射成新 user ns 的 0,于是 `whoami` 报 root、
+  `pip install` 打出 "running as root" 警告、个别工具会因为「不要以 root 跑」而拒绝。**外面的属主仍是 10000**
+  (上一条),所以这是观感不是权限。`unshare --map-current-user`(util-linux ≥2.39,镜像是 2.41.5)把它映射成
+  当前 uid,看上去能消掉这份观感 —— 但换映射会不会影响 ns 里那几条 mount 还没量过,**本轮不动**,
+  记为后续 spike(ROADMAP B-60 残留 ⓪)。
 - 放行 `unshare(CLONE_NEWUSER)` 在 runc 上扩大了内核攻击面(user namespace 是历史上 CVE 高发区)。本地后端只用于 dev / CI;
   生产是 ACS microVM(内核边界在 microVM 上,沙箱里本来就没有 seccomp)。runsc 上 userns 在 sentry 里模拟,不触及宿主内核。
 - 绑了 agent 时裸 `shared/…` 相对路径在视图里撞只读 bind —— 做成保留首段(§4.2),不是静默 EROFS。
+- **残留:`agents/<key>/shared` 是非目录时,这一格没有 `shared/`。** 用户代码在视图里
+  `open('/workspace/shared','w')` 就能建出这么个普通文件(或符号链接),平台工具只保留首段、
+  拦不住 `exec_python`。脚本先查再挂:是非目录就往 stderr 写
+  `ew-exec-view: /workspace/shared is not a directory; shared/ not mounted`、跳过这三条挂载,
+  exec 照常跑完 —— 而不是让 `mkdir -p` 撞上它、`set -eu` 把这个 agent 的**每一次** exec
+  (文件工具也在内)都变成非零退出、且产品面无从恢复。隔离不变:agent 自己的文件/符号链接留在原地,
+  指向 `/mnt/workspace` 的符号链接解析进空 tmpfs,相对的那种出了视图就是断链。代价是这一格读不到
+  `shared/`,自愈手段 = 用户自己删掉那个文件。
 
 ## 六、测试
 
@@ -257,7 +288,23 @@ exec 已经写不到用户根,留着就是一段带着洞形状的死代码。�
 ## 七、发布
 
 1. PR 顺序:docs(本 spec + 计划)→ 持久层列+闸(零行为变化)→ 写入侧全量(一次合)。
-2. 合并 → `release.sh test` → 热会话自动换代 → 探针 + 测试人员。
+2. 合并 → `release.sh test` → 热会话自动换代 → 探针 + 测试人员。**滚动窗口有界抖动**(§零 第 11 条):
+   control-plane 生产 2 副本、默认 RollingUpdate,写入侧全量那次合并翻转 `layout` 默认值之后,
+   窗口期(约 1-2 分钟)内新旧 pod 对同一批热会话的期望布局不一致,双方都可能把对方刚建的热会话
+   判成 `layout_mismatch` 销毁重建,可能连带打断另一侧正在跑的 exec。**拍板(2026-09-14)**:
+   不改部署形状 —— 不上 Recreate、不缩容到零、不改发布策略,接受为有界抖动,只剩一个版本后自愈。
 3. 生产按执行单三段 A / B1 / C / B2;B1、B2 钉子重定为含本 spec 的提交。
 4. 执行单 `docs/runbooks/2026-09-14-prod-release-checklist.md` 改期,原「今晚 18:00」作废。
 5. 沙箱镜像**不随本次改动**;B-59 刷钉子时镜像仍**不得**预建 `/workspace`(ACS 老代码 + 新镜像 = symlink 建不上)—— 运行期 `mkdir -p` 是规则,不是过渡。
+   闸(`test_image_leaves_both_mount_points_bare`)钉住这条,连两个挂载点**底下**的路径一起拒。
+   连带:`infra/sandbox-image/Dockerfile` 里两处注释已经过期 —— `:13` 说运行期 tmpfs 在
+   「`/workspace` + `/tmp`」(B-60 之后是 `/mnt/workspace` 卷 + `/workspace` 只读 tmpfs),
+   `:20-21` 说「dev 不设 profile,走宿主默认」(B-60 起 dev 也必须配仓内 profile)。
+   Dockerfile 本轮冻结,这两处**并进 B-59 的镜像刷新**一起改。
+6. **dev 侧必须重建 `expert-work-sandbox:dev`** —— `runner.py` 变了(exec 命令串在镜像里)。
+   只更新代码不重建镜像的话,本地 exec 仍走老 runner,`agent_root` 被忽略、写入侧一切照旧。
+   supervisor 与 orchestrator 要**一起**部署:compose 现在硬要求 seccomp profile(`None` = 启动失败),
+   而 orchestrator 送的 `agent_root` 只有新 supervisor 认。
+7. **部署后几分钟内预期出现一阵 `layout_mismatch` 销毁 + 约 31 s 冷启动**,每个有活跃热会话的用户各一次:
+   旧布局(`user-root`)的热会话全部作废重建。这是设计的换代路径,不是故障;观察 `sandbox_instance`
+   的新行 `layout='agent-ns'` 即可确认自愈。

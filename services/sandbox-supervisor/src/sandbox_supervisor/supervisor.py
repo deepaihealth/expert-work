@@ -274,7 +274,7 @@ class SandboxSupervisor:
                 # supervisor-freeze exception #3 (same source as the other
                 # two Task 6 exceptions — a necessary companion to this
                 # wave's image rework, not a scope-creep addition). The
-                # sandbox's own docker run always sets --workdir /workspace
+                # sandbox's own docker run always sets --workdir /mnt/workspace
                 # (F.3 SandboxRuntimeProvider) to restore cwd now that the
                 # image no longer declares one; empirically, when --workdir
                 # names a path that's also a volume mount target, docker
@@ -282,7 +282,7 @@ class SandboxSupervisor:
                 # container creation (not just the volume's first mount —
                 # see CliDockerClient.chown_volume's docstring for the full
                 # repro). A non-root --user sandbox can then never write its
-                # own /workspace. Fixing it here (after the container is up,
+                # own /mnt/workspace. Fixing it here (after the container is up,
                 # not before the launch) is the only place the chown sticks
                 # for *this* container's view — see the docstring for why.
                 await self._docker.chown_volume(volume=workspace_volume, image=record.image_ref)
@@ -390,7 +390,7 @@ class SandboxSupervisor:
         code: str,
         timeout_s: int | None = None,
         envs: dict[str, str] | None = None,
-        cwd: str | None = None,
+        agent_root: str | None = None,
     ) -> ExecResult:
         """Run ``code`` in an acquired sandbox via its held runner link.
 
@@ -408,10 +408,12 @@ class SandboxSupervisor:
         than baked in at acquire time: two agents can share one already-warm
         session, so the value must be able to change call-to-call.
 
-        ``cwd`` (B-50) — same story, same reason: the agent-scoped workspace
-        directory is per-call because one warm session serves every agent of
-        a ``(tenant, user)``. A directory that does not exist is reported by
-        the runner as an error rather than silently ignored.
+        ``agent_root`` (B-60) — same story, same reason: the agent-scoped
+        NAS directory is per-call because one warm session serves every
+        agent of a ``(tenant, user)``. The runner binds it as ``/workspace``
+        inside a private mount namespace it creates for this one exec; a
+        mount failure is reported as an error rather than falling back to
+        the shared user root.
         """
         link = self._links.get(sandbox_id)
         if link is None:
@@ -421,7 +423,7 @@ class SandboxSupervisor:
         async with lock:
             await self._touch(sandbox_id)
             try:
-                return await link.exec(code, resolved_timeout, envs=envs, cwd=cwd)
+                return await link.exec(code, resolved_timeout, envs=envs, agent_root=agent_root)
             except RunnerLinkError as exc:
                 msg = f"sandbox exec failed: {exc}"
                 raise SupervisorError(msg) from exc

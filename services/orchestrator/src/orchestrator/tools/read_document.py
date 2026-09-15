@@ -39,12 +39,13 @@ from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
     SandboxRuntime,
 )
-from orchestrator.tools.workspace_paths import USER_ROOT, resolve_scope
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
+from orchestrator.tools.workspace_paths import resolve_scope
 
-#: B-50 —— 与 ``file_ops`` 同一个真源。这个模块此前自己写了一份字面量;
-#: ``read_document`` 也读用户工作区,PR3 的计划里漏登记了它(实测七个工作区
-#: 调用点,计划只列了四个)。
-_WORKSPACE_ROOT = USER_ROOT
+#: B-60 —— 与 ``file_ops`` 同一个真源(``sandbox_image_contract.EXEC_VIEW``)。
+#: 这个模块此前自己写了一份字面量;``read_document`` 也读用户工作区,PR3 的计划里
+#: 漏登记了它(实测七个工作区调用点,计划只列了四个)。
+_WORKSPACE_ROOT = EXEC_VIEW
 #: Largest document the parse will pull in. Documents are zips (docx/xlsx/pptx)
 #: or page trees (pdf), so an oversized file is a decompression-bomb / OOM
 #: risk — reject before parsing rather than mid-stream.

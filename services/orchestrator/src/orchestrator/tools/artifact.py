@@ -18,7 +18,6 @@ listed-but-404 artifact. Content download is a control-plane endpoint
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,15 +30,16 @@ from expert_work.protocol import ArtifactKind
 from orchestrator.tools.file_ops import FileOpError, build_artifact_locate_wrapper, parse_envelope
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import SandboxRuntime, run_in_sandbox
-from orchestrator.tools.workspace_paths import AGENTS_DIR, USER_ROOT, agent_workspace_root
-
-logger = logging.getLogger(__name__)
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
+from orchestrator.tools.workspace_paths import AGENTS_DIR, SHARED_PREFIX, agent_view_alias
 
 #: The artifact kinds the manifest's ``ArtifactKind`` literal allows.
 _ARTIFACT_KINDS: tuple[str, ...] = get_args(ArtifactKind)
 _DEFAULT_KIND: ArtifactKind = "other"
 #: Thread label for the ``created_in_thread`` column when a run has no id.
 _FALLBACK_THREAD_ID = "save-artifact"
+#: ``shared/`` 目录名 —— 由前缀反推,不写第二份字面量(前缀与目录必须永远同名)。
+_SHARED_DIR_NAME = SHARED_PREFIX.rstrip(":")
 
 #: 产物清单契约 —— per-run 产物记录器的 ``config["configurable"]`` 键。
 #: ``sse.run_agent`` 每 run 注入一个同步 append 回调(镜像
@@ -71,24 +71,24 @@ def _validate_path(path: str, *, agent_key: str = "") -> str:
     Folds the two absolute spellings models produce from the tool
     descriptions — ``/workspace/x`` and ``/workspace/agents/<own key>/x`` —
     to ``x`` (same rule as ``file_ops._require_path``); any other absolute
-    path, a ``..`` segment, or an ``agents/`` first segment (someone else's
-    tree) is rejected. The result is later resolved against the user's
-    workspace volume by the download endpoint, so nothing unnormalised may
-    reach the store.
+    path, a ``..`` segment, or an ``agents/`` / ``shared/`` first segment
+    (someone else's tree, or the read-only shared area) is rejected. The
+    result is later resolved against the user's workspace volume by the
+    download endpoint, so nothing unnormalised may reach the store.
     """
     cleaned = path.strip()
     if agent_key:
-        own = f"{agent_workspace_root(agent_key)}/"
+        own = f"{agent_view_alias(agent_key)}/"
         if cleaned.startswith(own):
             cleaned = cleaned[len(own) :]
-    if cleaned.startswith(f"{USER_ROOT}/"):
-        cleaned = cleaned[len(USER_ROOT) + 1 :]
+    if cleaned.startswith(f"{EXEC_VIEW}/"):
+        cleaned = cleaned[len(EXEC_VIEW) + 1 :]
     parts = PurePosixPath(cleaned).parts
     if not cleaned or cleaned.startswith("/") or ".." in parts:
         msg = f"artifact path must be a relative workspace path without '..': {path!r}"
         raise ValueError(msg)
-    if agent_key and parts and parts[0] == AGENTS_DIR:
-        msg = f"artifact path must not address the reserved {AGENTS_DIR}/ tree: {path!r}"
+    if agent_key and parts and parts[0] in (AGENTS_DIR, _SHARED_DIR_NAME):
+        msg = f"artifact path must not address the reserved {parts[0]}/ tree: {path!r}"
         raise ValueError(msg)
     return cleaned
 
@@ -185,9 +185,10 @@ class SaveArtifactTool:
         # 登记之前先确认文件真的在登记的那个位置。没有这一步,agent 喊一声
         # save_artifact 就能造出一条「列表里看得见、下载 404」的产物,而 run
         # 照样报 success —— 测试环境 2026-09-14 实测:exec_python 写了
-        # ``/workspace/x.pptx``(用户根),save_artifact 登记 ``agents/<key>/x.pptx``,
-        # 两边都「成功」,说的却不是同一个文件。落在用户根的会被认领进 agent 目录。
-        location = await self._locate_file(rel, ctx=ctx)
+        # ``/workspace/x.pptx``,save_artifact 登记 ``agents/<key>/x.pptx``,两边都
+        # 「成功」,说的却不是同一个文件。B-60 之后 ``/workspace`` 就是 agent 自己的
+        # 视图,这条 stat 只确认文件真的在那儿 —— 不在就是没写,不再去别处找。
+        await self._locate_file(rel, ctx=ctx)
 
         # B-50 PR3 —— ``path_in_workspace`` 带 agent 前缀,与 ``write_file`` 的
         # 落盘位置同一个口径(PR2 时有意暂缓,见 ``_artifact_path``)。
@@ -212,52 +213,29 @@ class SaveArtifactTool:
                     "created_at": created.isoformat(),
                 }
             )
-        claimed = location == "claimed_from_user_root"
-        if claimed:
-            logger.info(
-                "save_artifact.claimed_from_user_root name=%r path=%s agent_key=%s",
-                name,
-                path_in_workspace,
-                ctx.agent_key,
-            )
-        note = (
-            " (the file was at the workspace root, outside your agent directory; it has "
-            "been moved into your agent workspace — write to relative paths next time)"
-            if claimed
-            else ""
-        )
         return ToolResult(
             content=(
-                f"Saved artifact {name!r} (kind={kind}) as version {version.version}{note}. "
+                f"Saved artifact {name!r} (kind={kind}) as version {version.version}. "
                 "The user can now download it directly from the conversation; tell them "
                 "it is ready and refer to it by name — do not fabricate a download link "
                 "or URL (the interface renders the download for them)."
             ),
-            meta={
-                "artifact": name,
-                "version": version.version,
-                "kind": kind,
-                "location": location,
-            },
+            meta={"artifact": name, "version": version.version, "kind": kind},
         )
 
-    async def _locate_file(self, rel: str, *, ctx: ToolContext) -> str:
-        """Find ``rel`` where the registration row will point; claim or raise.
+    async def _locate_file(self, rel: str, *, ctx: ToolContext) -> None:
+        """Confirm ``rel`` exists where the registration row will point, or raise.
 
-        Looks under the agent's scope root (the same root the file tools
-        write to). A file that instead sits at the user root — where
-        ``bash`` / ``exec_python`` code lands when it writes a literal
-        ``/workspace/<name>`` — is moved into the agent root, so "the path I
-        wrote" and "the path I register" end up the same file. Anything
-        else raises a tool error the model can act on: *you did not write
-        that file*, which is recoverable, unlike handing the user a dead
-        artifact. Returns the envelope's ``location``.
+        B-60 —— only stats inside the exec view (the agent's own directory once
+        bound). Not found there means the file was never written — a tool error
+        the model can act on: *you did not write that file*, which is
+        recoverable, unlike handing the user a dead artifact. The #1551 "claim
+        from the user root" branch is gone with the hole it papered over: exec
+        code cannot reach a separate user root any more (spec §4.8).
         """
         outcome = await run_in_sandbox(
             self.client,
-            code=build_artifact_locate_wrapper(
-                rel, agent_ws=agent_workspace_root(ctx.agent_key), user_ws=USER_ROOT
-            ),
+            code=build_artifact_locate_wrapper(rel),
             timeout_s=None,
             ctx=ctx,
             tool_label="save_artifact",
@@ -265,7 +243,7 @@ class SaveArtifactTool:
         )
         env = parse_envelope(outcome, tool="save_artifact")
         if env.get("ok"):
-            return str(env.get("location", "agent"))
+            return
         error = env.get("error", "unknown")
         if error == "path_escapes_workspace":
             msg = f"save_artifact denied: {rel!r} escapes the workspace"
@@ -279,13 +257,6 @@ class SaveArtifactTool:
             raise FileOpError(msg)
         if error == "not_a_file":
             msg = f"save_artifact: {rel!r} is a directory, not a file — nothing was registered."
-            raise FileOpError(msg)
-        if error == "forbidden_scope":
-            msg = (
-                f"save_artifact: {rel!r} is not in your agent workspace and lives under "
-                f"{env.get('head', '?')}/, which belongs to another scope — nothing was "
-                "registered. Only files you wrote in your own workspace can be saved."
-            )
             raise FileOpError(msg)
         detail = env.get("detail", "")
         msg = f"save_artifact: could not stat {rel!r} ({error}{': ' + detail if detail else ''})"

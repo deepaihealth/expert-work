@@ -42,7 +42,7 @@ def test_argv_carries_all_hardening_flags() -> None:
     assert _flag_value(argv, "--memory") == "512m"
     assert _flag_value(argv, "--cpus") == "1.0"
     assert _flag_value(argv, "--network") == DEFAULT_EGRESS_NETWORK
-    assert _flag_value(argv, "--tmpfs") == "/workspace:rw,size=64m,mode=1777"
+    assert _flag_value(argv, "--tmpfs") == "/mnt/workspace:rw,size=64m,mode=1777"
 
 
 # ---------- W2 Task 6 — local-docker non-root/cwd posture + skill/pip/home tmpfs ----------
@@ -63,7 +63,7 @@ def test_argv_sets_workdir_to_workspace() -> None:
     # WORKDIR (that would pre-create /workspace and block ACS's NAS-mount
     # symlink), so the local backend sets cwd itself.
     argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
-    assert _flag_value(argv, "--workdir") == "/workspace"
+    assert _flag_value(argv, "--workdir") == "/mnt/workspace"
 
 
 def test_argv_mounts_skills_agents_home_as_owned_tmpfs() -> None:
@@ -92,7 +92,7 @@ def test_argv_user_workdir_and_extra_tmpfs_present_under_persistent_workspace_to
         image="img", container_name="sb-1", workspace_volume="expert-work-ws-abc"
     )
     assert _flag_value(argv, "--user") == "10000:10000"
-    assert _flag_value(argv, "--workdir") == "/workspace"
+    assert _flag_value(argv, "--workdir") == "/mnt/workspace"
     tmpfs_targets = [argv[i + 1].split(":")[0] for i, t in enumerate(argv) if t == "--tmpfs"]
     assert "/opt/skills" in tmpfs_targets
     assert "/opt/agents" in tmpfs_targets
@@ -134,7 +134,7 @@ def test_custom_limits_reflected_in_argv() -> None:
     assert _flag_value(argv, "--cpus") == "2.5"
     assert _flag_value(argv, "--memory") == "1024m"
     assert _flag_value(argv, "--pids-limit") == "64"
-    assert _flag_value(argv, "--tmpfs") == "/workspace:rw,size=128m,mode=1777"
+    assert _flag_value(argv, "--tmpfs") == "/mnt/workspace:rw,size=128m,mode=1777"
 
 
 def test_custom_egress_network_reflected() -> None:
@@ -149,7 +149,7 @@ def test_custom_egress_network_reflected() -> None:
 def test_default_workspace_is_ephemeral_tmpfs() -> None:
     # No workspace_volume → the pre-J.15 ephemeral tmpfs.
     argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
-    assert _flag_value(argv, "--tmpfs") == "/workspace:rw,size=64m,mode=1777"
+    assert _flag_value(argv, "--tmpfs") == "/mnt/workspace:rw,size=64m,mode=1777"
     assert "--volume" not in argv
 
 
@@ -161,10 +161,11 @@ def test_persistent_workspace_mounts_named_volume() -> None:
     argv = _runc_provider().docker_run_argv(
         image="img", container_name="sb-1", workspace_volume="expert-work-ws-abc"
     )
-    assert _flag_value(argv, "--volume") == "expert-work-ws-abc:/workspace"
+    assert _flag_value(argv, "--volume") == "expert-work-ws-abc:/mnt/workspace"
     # /workspace is a volume, not a tmpfs.
     tmpfs_targets = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
     assert tmpfs_targets == [
+        "/workspace:ro,size=4k",
         "/tmp:rw,size=256m,mode=1777",  # noqa: S108 — mount spec literal
         "/opt/skills:rw,size=64m,uid=10000,gid=10000",
         "/opt/agents:rw,size=256m,uid=10000,gid=10000",
@@ -269,6 +270,32 @@ def test_argv_keeps_core_hardening_under_all_shapes() -> None:
         assert "no-new-privileges" in [
             argv[i + 1] for i, tok in enumerate(argv) if tok == "--security-opt"
         ]
+
+
+# ---------------------------------------------------------------------------
+# B-60 — per-exec mount namespace exec view
+# ---------------------------------------------------------------------------
+
+
+def test_argv_mounts_a_tiny_read_only_tmpfs_as_the_exec_view_target() -> None:
+    # B-60 — the image has no /workspace; docker creates the mount point for a
+    # tmpfs even on a read-only rootfs. Read-only: an exec that somehow skipped
+    # its namespace hits EROFS instead of silently writing into the container.
+    for vol in (None, "expert-work-ws-abc"):
+        argv = _runc_provider().docker_run_argv(
+            image="img", container_name="sb-1", workspace_volume=vol
+        )
+        tmpfs = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
+        assert "/workspace:ro,size=4k" in tmpfs
+
+
+def test_argv_disables_apparmor_confinement_for_userns_mounts() -> None:
+    # B-60 — docker-default AppArmor carries ``deny mount,``; cap-drop ALL + our
+    # seccomp profile stay, mount is only reachable inside the exec's own userns.
+    argv = _runc_provider().docker_run_argv(image="img", container_name="sb-1")
+    opts = [argv[i + 1] for i, tok in enumerate(argv) if tok == "--security-opt"]
+    assert "apparmor=unconfined" in opts
+    assert "no-new-privileges" in opts
 
 
 # ---------------------------------------------------------------------------

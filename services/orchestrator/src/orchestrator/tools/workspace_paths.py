@@ -1,12 +1,15 @@
 """工作区路径的作用域解析 —— agent 根 / ``shared/`` 的唯一真源(B-50)。
 
-沙箱里的 ``/workspace`` 挂的是**用户根**:热沙箱按 ``(tenant, user)`` 复用
-(``sandbox_instance`` 没有 agent 列、``acquire()`` 不收 agent),而 CSI 的
-``subPath`` 在 create 时就钉死了 —— 挂载点不可能按 agent 分(spec §三)。
-分层因此做在路径上:每个 agent 的默认根是 ``/workspace/agents/<agent_key>``,
-交给 ``build_*_wrapper(..., ws=...)`` 的 ``ws`` 参数,由沙箱内片段既有的
-``realpath`` + 前缀守卫强制(``file_ops.py`` 的 ``_PRELUDE``)—— 与它挡 ``..``
-是同一道闸,不是新加的一道。
+挂载仍按用户:热沙箱按 ``(tenant, user)`` 复用(``sandbox_instance`` 没有 agent 列、
+``acquire()`` 不收 agent),CSI 的 ``subPath`` 在 create 时就钉死了 —— 挂载点不可能
+按 agent 分(spec §三)。分层因此不再做在挂载点上,而是做在**每次 exec 自己的
+mount namespace** 里(B-60):绑了 agent 时,``/workspace`` 这个视图本身就是那个
+agent 在 NAS 上的目录(``agent_nas_root`` bind 成 ``EXEC_VIEW``);没绑时视图是
+整个用户根。``build_*_wrapper(..., ws=...)`` 的 ``ws`` 因此恒为 ``EXEC_VIEW`` ——
+不再需要 ``/workspace/agents/<agent_key>`` 这种子路径去分层,那个拼法现在只是
+``agent_view_alias`` 折叠模型照旧写法用的别名,不指向真实目录。沙箱内片段既有的
+``realpath`` + 前缀守卫(``file_ops.py`` 的 ``_PRELUDE``)—— 与它挡 ``..``
+是同一道闸,不是新加的一道 —— 仍然把 agent 关在 ``EXEC_VIEW`` 里。
 
 ``shared/`` 存迁移期反推不出归属的 legacy,**可读不可写**,而且**不与默认根
 合并**:要读必须显式写 ``shared:`` 前缀。不合并是有意的 —— 让归属不明的 legacy
@@ -19,15 +22,11 @@ import re
 from pathlib import PurePosixPath
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 
 #: 显式跨到用户级 ``shared/`` 区的前缀(照 ADK 的 ``user:`` 约定)。
 #: 由目录名拼出来,不写第二遍字面量 —— 前缀与它指向的目录必须永远同名。
 SHARED_PREFIX = f"{WORKSPACE_SHARED_DIR}:"
-
-#: 沙箱内的用户工作区根(挂载点)。**导出而非私有**:``file_ops`` 的迁移期
-#: 读回落要用它,而那个模块自己也有一个同名私有常量 —— 两处各改各的就会静默
-#: 分叉,回落目标和挂载点对不上时没有任何测试会红。
-USER_ROOT = "/workspace"
 
 #: 布局里的保留段。**导出**:``file_ops._require_path`` 要用它来拒绝以这一段
 #: 开头的相对路径 —— 迁移期读回落会把 ``agents/<别人的 key>/x`` 变成一次合法的
@@ -67,18 +66,28 @@ class WriteToSharedError(ValueError):
     """
 
 
-def agent_workspace_root(agent_key: str) -> str:
-    """该 agent 在沙箱内的默认根;``agent_key`` 为空时回落用户根。
-
-    空串 = 未绑定 agent(与 ``agent_key_envs("")`` 同一个口径),行为与 B-50
-    之前一致。任何非空但不是单个安全路径段的取值一律拒 —— 它是不可信输入。
-    """
-    if not agent_key:
-        return USER_ROOT
-    if agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
+def _require_safe_key(agent_key: str) -> None:
+    if not agent_key or agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
         msg = f"agent_key is not a safe path segment: {agent_key!r}"
         raise ValueError(msg)
-    return f"{USER_ROOT}/{AGENTS_DIR}/{agent_key}"
+
+
+def agent_nas_root(agent_key: str) -> str:
+    """NAS 挂载下该 agent 的真实目录 —— **只给两个后端拼 exec 用**(命名空间里 bind
+    到 ``EXEC_VIEW`` 上的源;B-60 spec §4.3)。空 key 拒绝:未绑 agent 没有「自己的
+    目录」,调用方自己分支(未绑 → bind 整个用户根),别让它悄悄拿到 ``NAS_MOUNT``。
+    """
+    _require_safe_key(agent_key)
+    return f"{NAS_MOUNT}/{AGENTS_DIR}/{agent_key}"
+
+
+def agent_view_alias(agent_key: str) -> str:
+    """模型照旧可能写的 ``/workspace/agents/<key>`` 拼法 —— **只用于折叠**
+    (``file_ops._require_path`` / ``artifact._validate_path``),不指向任何真实目录:
+    视图里没有 ``agents/``。空 key 拒绝,同上。
+    """
+    _require_safe_key(agent_key)
+    return f"{EXEC_VIEW}/{AGENTS_DIR}/{agent_key}"
 
 
 def resolve_scope(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:
@@ -101,5 +110,9 @@ def resolve_scope(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:
         if not rel or rel.startswith("/") or ".." in PurePosixPath(rel).parts:
             msg = f"{tool} path must be relative and free of '..': {path!r}"
             raise ValueError(msg)
-        return f"{USER_ROOT}/{_SHARED_DIR}", rel
-    return agent_workspace_root(agent_key), raw
+        return f"{EXEC_VIEW}/{_SHARED_DIR}", rel
+    # B-60 —— 绑不绑都是视图根:文件工具的片段与用户代码在同一个命名空间里,绑了
+    # agent 时 /workspace 就是 agent 目录。agent_key 仍校验(不可信输入,坏 key 早点炸)。
+    if agent_key:
+        agent_view_alias(agent_key)
+    return EXEC_VIEW, raw

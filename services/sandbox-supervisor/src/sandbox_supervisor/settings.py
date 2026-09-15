@@ -39,9 +39,13 @@ class SandboxSupervisorSettings(BaseSettings):
     sandbox_image: str = "expert-work-sandbox:dev"
     #: OCI runtime — `runc` for dev / macOS, `runsc` (gVisor) for Linux prod.
     oci_runtime: Literal["runc", "runsc"] = "runc"
-    #: Stream HX-10 — host-visible path to a pinned seccomp profile JSON
-    #: (``infra/sandbox-image/seccomp-profile.json``, mounted into the host
-    #: at deploy time). ``None`` rides the host Docker default profile (dev).
+    #: Stream HX-10 — path to a pinned seccomp profile JSON
+    #: (``infra/sandbox-image/seccomp-profile.json``), read **client-side** by
+    #: the docker CLI and inlined into HostConfig — the path only needs to
+    #: exist inside the supervisor container, not on the host. ``None`` is a
+    #: startup error since B-60: every exec bind-mounts its own view inside an
+    #: unprivileged user namespace, and the host Docker default profile blocks
+    #: that without a pinned profile (see :func:`seccomp.validate_seccomp_profile`).
     #: When set, startup validates the file fail-closed (exists + valid JSON)
     #: — a configured-but-unloadable profile is a security misconfig, not a
     #: transient fault, so the supervisor refuses to start.

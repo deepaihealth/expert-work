@@ -49,6 +49,13 @@ SANDBOX_AGENT_GID = 10000
 #: for it, mirroring the image's own path.
 SANDBOX_AGENT_HOME = "/home/agent"
 
+#: B-60 —— 与 orchestrator ``sandbox_image_contract.NAS_MOUNT`` / ``EXEC_VIEW`` 同值。这个
+#: 包不能 import orchestrator,契约文件末尾的 ``test_workspace_roots_match_across_packages``
+#: 钉住相等。NAS 卷 / 临时 tmpfs 挂在 ``SANDBOX_NAS_MOUNT``;``SANDBOX_EXEC_VIEW`` 只是每次
+#: exec 在自己的命名空间里 bind 的目标,容器层面给它一个只读的空 tmpfs 当挂载点。
+SANDBOX_NAS_MOUNT = "/mnt/workspace"
+SANDBOX_EXEC_VIEW = "/workspace"
+
 #: Hardening flags shared by every throwaway aux container that touches a
 #: workspace volume — network-isolated, read-only rootfs, capabilities
 #: dropped down to the one this whole class of container needs back, no
@@ -172,14 +179,19 @@ class SandboxRuntimeProvider:
 
     oci_runtime: SandboxOciRuntime
     egress_network: str = DEFAULT_EGRESS_NETWORK
-    #: Stream HX-10 — host-visible path to a pinned seccomp profile JSON.
-    #: ``None`` emits no ``--security-opt seccomp`` flag (the container then
-    #: rides the host Docker daemon's built-in default profile — fine for
-    #: dev, but version-drifting). A path pins our own profile
+    #: Stream HX-10 — path to a pinned seccomp profile JSON, read **client-side**
+    #: by the docker CLI (inlined into HostConfig before the daemon ever sees
+    #: it, verified 2026-09-14) — the path only needs to exist inside the
+    #: supervisor container, not on the host.
+    #: ``None`` emits no ``--security-opt seccomp`` flag. The supervisor
+    #: refuses to start with ``None`` since B-60 (see ``settings.py`` and
+    #: ``seccomp.validate_seccomp_profile``), so that branch is unreachable
+    #: in the supervisor process — this provider stays pure / Docker-free and
+    #: does not itself enforce that, it only forwards whatever path it is
+    #: given. A path pins our own profile
     #: (``infra/sandbox-image/seccomp-profile.json``) so the syscall floor is
-    #: decided by our repo, not the host's Docker version. The provider only
-    #: forwards the path; existence / JSON validity is validated fail-closed
-    #: at supervisor startup (it stays pure / Docker-free).
+    #: decided by our repo, not the host's Docker version; existence / JSON
+    #: validity is validated fail-closed at supervisor startup.
     seccomp_profile_path: str | None = None
     #: Stream HX-10-F1 — static ``(hostname, ip)`` pairs emitted as
     #: ``--add-host`` flags. gVisor's netstack does not implement Docker's
@@ -205,15 +217,18 @@ class SandboxRuntimeProvider:
         """Return the full ``docker run`` argv for the sandbox.
 
         The argv carries the Mini-ADR F-5 runtime hardening: read-only
-        rootfs, a writable ``/workspace`` mount + an ephemeral scratch
-        ``/tmp`` tmpfs, all capabilities dropped, ``no-new-privileges``,
-        and PID / memory / CPU caps.
+        rootfs, a writable ``SANDBOX_NAS_MOUNT`` (``/mnt/workspace``) mount
+        + an ephemeral scratch ``/tmp`` tmpfs, all capabilities dropped,
+        ``no-new-privileges``, and PID / memory / CPU caps. ``SANDBOX_EXEC_VIEW``
+        (``/workspace``) is a separate, unconditional, read-only 4k tmpfs —
+        the bind target a later per-exec mount namespace binds over — present
+        regardless of ``workspace_volume``.
         ``--interactive`` keeps stdin open for the runner's line-JSON
         protocol; the image is the final argument.
 
-        ``workspace_volume`` selects the ``/workspace`` backing: ``None``
-        → an ephemeral tmpfs (destroyed with the container); a volume
-        name → a docker named volume that persists across containers
+        ``workspace_volume`` selects the ``SANDBOX_NAS_MOUNT`` backing:
+        ``None`` → an ephemeral tmpfs (destroyed with the container); a
+        volume name → a docker named volume that persists across containers
         (Stream J.15 — the per-user persistent workspace).
 
         ``env`` emits ``-e KEY=VALUE`` flags (sandbox-egress §3.3 injects
@@ -233,8 +248,15 @@ class SandboxRuntimeProvider:
             "--user",
             f"{SANDBOX_AGENT_UID}:{SANDBOX_AGENT_GID}",
             "--workdir",
-            "/workspace",
+            SANDBOX_NAS_MOUNT,
             *self._workspace_mount(limits, workspace_volume),
+            # B-60 — the bind target for the per-exec view (spec §4.3). A tiny
+            # read-only tmpfs: docker creates the mount point on the read-only
+            # rootfs (the image deliberately has no /workspace), and read-only
+            # means an exec that somehow skipped the namespace fails loudly
+            # (EROFS) instead of silently writing into the container.
+            "--tmpfs",
+            f"{SANDBOX_EXEC_VIEW}:ro,size=4k",
             # Scratch /tmp — always an ephemeral tmpfs. The rootfs is read-only,
             # and many tools (soffice/poppler, tempfile-heavy libs) need a
             # writable /tmp; mode=1777 so the non-root agent user can write.
@@ -269,6 +291,13 @@ class SandboxRuntimeProvider:
             "ALL",
             "--security-opt",
             "no-new-privileges",
+            # B-60 — docker-default AppArmor carries ``deny mount,``; the per-exec
+            # view needs mount(2) inside the unprivileged user namespace each exec
+            # creates for itself. --cap-drop ALL and the pinned seccomp profile
+            # stay; on Ubuntu 24.04 hosts the CI workflows also lift
+            # kernel.apparmor_restrict_unprivileged_userns (see ci.yml).
+            "--security-opt",
+            "apparmor=unconfined",
             *self._seccomp_opt(),
             "--pids-limit",
             str(limits.pids_limit),
@@ -291,9 +320,16 @@ class SandboxRuntimeProvider:
     def _seccomp_opt(self) -> list[str]:
         """The ``--security-opt seccomp=`` flag, or empty when unset.
 
-        ``None`` → no flag (host Docker default profile). A path → pin our
-        own profile. Applies under both runc and runsc: gVisor still honours
-        seccomp on the host-side sentry process, so the two layers stack.
+        ``None`` → no flag, which leaves the host Docker default profile in
+        force. That is not a supported posture since B-60 — the supervisor
+        refuses to start on ``None`` (``seccomp.validate_seccomp_profile``),
+        because the default profile keeps ``unshare``/``mount`` behind
+        CAP_SYS_ADMIN and every exec would fail closed on its first bind
+        mount. This provider stays pure and only forwards what it is given,
+        so the branch survives here; it is unreachable in the supervisor.
+        A path → pin our own profile. Applies under both runc and runsc:
+        gVisor still honours seccomp on the host-side sentry process, so the
+        two layers stack.
         """
         if self.seccomp_profile_path is None:
             return []
@@ -301,23 +337,23 @@ class SandboxRuntimeProvider:
 
     @staticmethod
     def _workspace_mount(limits: SandboxResourceLimits, workspace_volume: str | None) -> list[str]:
-        """The ``/workspace`` mount flags — tmpfs or a persistent volume."""
+        """The ``/mnt/workspace`` mount flags — tmpfs or a persistent volume."""
         if workspace_volume is None:
             # Ephemeral tmpfs. mode=1777: the tmpfs root mounts root-owned,
             # so without it the image's non-root ``agent`` user cannot
             # create files (F.8 gate #1).
             return [
                 "--tmpfs",
-                f"/workspace:rw,size={limits.workspace_size_mb}m,mode=1777",
+                f"{SANDBOX_NAS_MOUNT}:rw,size={limits.workspace_size_mb}m,mode=1777",
             ]
         # Stream J.15 — a per-user docker named volume. This comment
         # previously claimed a fresh volume inherits the image's
-        # ``/workspace`` ownership (``agent:agent``); that relied on the
-        # image baking a ``WORKDIR /workspace`` + chown, which W2 Task 9
+        # ``/mnt/workspace`` ownership (``agent:agent``); that relied on the
+        # image baking a ``WORKDIR /mnt/workspace`` + chown, which W2 Task 9
         # removed (the run root must stay bare for ACS's NAS-mount
         # symlink). Worse than a first-mount-only gap: since ``--workdir``
         # (below, in ``docker_run_argv``) always targets this same
-        # ``/workspace`` path, docker resets its ownership to root:root on
+        # ``/mnt/workspace`` path, docker resets its ownership to root:root on
         # *every* container creation, not just the volume's first mount —
         # so no mount-option fix exists here at all (unlike the tmpfs
         # branch's ``uid=``/``gid=``/``mode=``, ``--volume`` has no such
@@ -325,7 +361,7 @@ class SandboxRuntimeProvider:
         # ``CliDockerClient.chown_volume`` + its ``supervisor.py`` call
         # site (its docstring has the full repro + why it must run after
         # the container starts, not before).
-        return ["--volume", f"{workspace_volume}:/workspace"]
+        return ["--volume", f"{workspace_volume}:{SANDBOX_NAS_MOUNT}"]
 
 
 def make_sandbox_runtime_provider(

@@ -107,6 +107,13 @@ _STUB_PROXY = "expert-work-test-proxy"
 _STUB_IMAGE = "public.ecr.aws/docker/library/python:3.12-alpine"
 #: ``infra/sandbox-image/`` — the Dockerfile's build context.
 _IMAGE_CONTEXT = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image"
+#: B-60 — the pinned seccomp profile is a hard prerequisite for the local
+#: backend (``validate_seccomp_profile(None)`` now raises); the acceptance
+#: suite launches real sandboxes, so it must pin the same profile the
+#: supervisor requires in dev/prod.
+_SECCOMP_PROFILE = (
+    Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "seccomp-profile.json"
+)
 
 
 def _docker(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -268,6 +275,7 @@ def expert_work() -> _Harness:
         runtime_provider=SandboxRuntimeProvider(
             oci_runtime=_OCI_RUNTIME,
             egress_network=_NETWORK,
+            seccomp_profile_path=str(_SECCOMP_PROFILE),
             # HX-10-F1: resolve the proxy via /etc/hosts (the production
             # addressing path), not docker embedded DNS — works under both
             # runc and runsc (gVisor netstack has no embedded DNS).
@@ -476,6 +484,46 @@ async def test_gate_48_filesystem_and_process_isolation(expert_work: _Harness) -
     )
     await expert_work.supervisor.release(box_b.sandbox_id)
     assert int(pids.stdout.strip()) < 100
+
+
+# ---------------------------------------------------------------------------
+# B-60 — per-exec /workspace view (spec §4.3), acceptance under the real OCI
+# runtime (runc / runsc — see _OCI_RUNTIME at module top).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_agent_root_is_bound_as_workspace_and_hides_the_rest(
+    expert_work: _Harness,
+) -> None:
+    """B-60 —— 真容器(runc / runsc 各跑一次):agent_root 被 bind 成 /workspace,
+    /mnt/workspace 被盖,另一个 agent_root 看不到前者的文件,未绑看到全部。"""
+    tenant, user = uuid4(), uuid4()
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=tenant, thread_id="b60", user_id=user)
+    )
+    sid = response.sandbox_id
+    try:
+        a = await expert_work.supervisor.exec(
+            sid,
+            code="import os; open('/workspace/a.txt','w').write('A'); "
+            "print(os.getcwd(), os.listdir('/mnt/workspace'))",
+            agent_root="/mnt/workspace/agents/a",
+        )
+        assert a.exit_code == 0, a.stderr
+        assert a.stdout.strip() == "/workspace []"
+        b = await expert_work.supervisor.exec(
+            sid,
+            code="import os; print(sorted(os.listdir('/workspace')))",
+            agent_root="/mnt/workspace/agents/b",
+        )
+        assert "a.txt" not in b.stdout, b.stdout
+        root = await expert_work.supervisor.exec(
+            sid, code="print(open('/workspace/agents/a/a.txt').read())"
+        )
+        assert root.stdout.strip() == "A"
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b60-acceptance")
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +764,11 @@ async def test_warm_pool_claim_exec_release() -> None:
     settings = SandboxSupervisorSettings(
         sandbox_image=_IMAGE, oci_runtime=_OCI_RUNTIME, pool_size=1
     )
-    runtime = SandboxRuntimeProvider(oci_runtime=_OCI_RUNTIME, egress_network=_NETWORK)
+    runtime = SandboxRuntimeProvider(
+        oci_runtime=_OCI_RUNTIME,
+        egress_network=_NETWORK,
+        seccomp_profile_path=str(_SECCOMP_PROFILE),
+    )
     pool = SandboxPool()
     supervisor = SandboxSupervisor(
         store=store,  # type: ignore[arg-type]  # structural SandboxStore

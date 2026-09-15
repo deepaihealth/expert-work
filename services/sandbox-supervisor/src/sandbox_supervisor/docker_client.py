@@ -421,7 +421,7 @@ class CliDockerClient:
         workspace, W2 Task 6 follow-up).
 
         **Why this exists.** The image (W2 Task 9) no longer bakes / chowns
-        a ``/workspace`` directory (the run root must stay bare for ACS's
+        a ``/mnt/workspace`` directory (the run root must stay bare for ACS's
         NAS-mount symlink — spec § 二之二), so a docker named volume no
         longer inherits agent ownership on first mount the way it used to.
         Worse, empirically confirmed against this repo's sandbox image
@@ -435,18 +435,19 @@ class CliDockerClient:
 
             docker volume create v
             docker run --rm --cap-add CHOWN -v v:/w --entrypoint chown IMAGE 10000:10000 /w
-            docker run --rm --user 10000:10000 --workdir /workspace -v v:/workspace IMAGE ...
-            # /workspace is root:root again inside this container, even
+            docker run --rm --user 10000:10000 --workdir /mnt/workspace \\
+                -v v:/mnt/workspace IMAGE ...
+            # /mnt/workspace is root:root again inside this container, even
             # though the volume was just chowned to 10000:10000.
 
         Since the sandbox's own ``docker run`` always sets ``--workdir
-        /workspace`` (W2 Task 6, ``runtime_provider.py``) to restore cwd, a
+        /mnt/workspace`` (W2 Task 6, ``runtime_provider.py``) to restore cwd, a
         chown *before* that ``docker run`` is undone by the very same
         invocation. The fix instead chowns *after* the sandbox container is
         already up (supervisor.py's acquire path) — the reset already
         happened during that container's own setup, and chowning the same
         volume from a separate throwaway container (this method, mounted at
-        ``/ws``, not ``/workspace`` — matching the other five volume aux
+        ``/ws``, not ``/mnt/workspace`` — matching the other five volume aux
         ops) takes effect immediately for the already-running sandbox too,
         since it's the same underlying volume. This has to run after every
         cold-start launch of a workspace-volume-backed sandbox, not only

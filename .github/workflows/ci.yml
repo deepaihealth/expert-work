@@ -300,6 +300,16 @@ jobs:
           cache-from: type=gha
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04 AppArmor, B-60)
+        # Ubuntu 24.04 restricts userns creation to AppArmor profiles that grant
+        # ``userns``; the sandbox runs ``apparmor=unconfined`` (docker-default
+        # carries ``deny mount,``), so lift the restriction on this runner only.
+        # Production is ACS (no AppArmor at all); this is a CI-host setting.
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Run pytest (integration)
         # --timeout: second gate behind the per-command docker timeouts in
         # test_fullstack_egress_e2e. A hung test names itself and fails fast

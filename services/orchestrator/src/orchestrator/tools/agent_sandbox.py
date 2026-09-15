@@ -112,8 +112,9 @@ from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
-from expert_work.persistence.sandbox_instance_store import SANDBOX_LAYOUT_USER_ROOT
+from expert_work.persistence.sandbox_instance_store import SANDBOX_LAYOUT_AGENT_NS
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
+from orchestrator.tools.exec_view import build_exec_command
 from orchestrator.tools.nas_workspace_store import workspace_deleted_marker, workspace_user_root
 from orchestrator.tools.sandbox import (
     EgressContext,
@@ -123,16 +124,15 @@ from orchestrator.tools.sandbox import (
 )
 from orchestrator.tools.sandbox_image_contract import (
     DEFAULT_TIMEOUT_S,
+    EXEC_VIEW,
     MAX_OUTPUT_CHARS,
     MAX_TIMEOUT_S,
+    NAS_MOUNT,
     SANDBOX_EXEC_UID,
     SANDBOX_EXEC_USER,
     SANDBOX_IMAGE_ENV,
-    SANDBOX_PYTHON_FLAGS,
-    WORKSPACE_ROOT,
 )
 from orchestrator.tools.sandbox_instance_store import SandboxInstanceStore
-from orchestrator.tools.workspace_paths import agent_workspace_root
 
 
 class WorkspaceQuotaGate(Protocol):
@@ -247,7 +247,7 @@ def _workspace_subpath(
     ``{root}/{tenant_id}/{user_id}`` 布局同一份 subPath 语义(spec § 三)。
 
     ``user_id`` 为 None(临时沙箱,spec 决策 9)—— 镜像不再预建
-    ``/workspace``(Task 9),不挂就没有这个目录、cwd 与文件工具全踩空;
+    ``NAS_MOUNT``(Task 9),不挂就没有这个目录、cwd 与文件工具全踩空;
     落 ``{prefix}/_scratch/{sandbox_id}``,每次调用用一个全新的 ``sandbox_id``
     (``uuid4()``),天然不与任何用户或其它临时沙箱撞名。``_scratch`` 不需要
     是 ``WORKSPACE_RESERVED_PREFIXES`` 的成员——它在 NAS 数据根下与租户目录
@@ -333,7 +333,7 @@ class AgentSandboxClient:
     #: 沙箱迁移波 2 —— NAS 工作区挂载的三项配置,dataclass 层面全部默认
     #: None/"",让直接构造这个类的单测不必每次都摆全三项;**生产装配点
     #: ``build_sandbox_runtime`` 会强制要求前两项**(波 2 终审 Important-2:
-    #: Task 9 之后镜像不再预建 ``/workspace``,少配 ``workspace_pv_name`` 或
+    #: Task 9 之后镜像不再预建 ``NAS_MOUNT``,少配 ``workspace_pv_name`` 或
     #: ``workspace_root`` 不再等价于"波 1 行为",而是每次工具调用都炸在 envd
     #: 层 —— 见 ``runtime.py`` 那段 ``missing`` 列表的注释)。这里不重复那道
     #: 校验:三个 Settings 字段本就同源,拆成三个字段是为了每个职责单一。
@@ -366,13 +366,13 @@ class AgentSandboxClient:
     #: 的落点 ``{root}/{tenant}/.deleted/{user}`` —— **不在**用户子树里,
     #: 见该模块 docstring 与全分支终审 Critical-1)。这是
     #: control-plane 进程能直接 ``os.mkdir``/``os.chmod`` 到的本地路径,不是
-    #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
-    #: ``/workspace``)是两个不同维度的常量,不要混淆。
+    #: 沙箱内路径 —— 与 :data:`NAS_MOUNT`(沙箱内挂载点,恒为
+    #: ``/mnt/workspace``)是两个不同维度的常量,不要混淆。
     workspace_root: str | None = None
     #: B-60 —— 本进程给热会话铺的沙箱内布局;写进每一行,``acquire`` 拿到不同值的热会话
-    #: 就 ``layout_mismatch`` 重建。PR-B 先落 ``user-root``(零行为变化),PR-C 随 exec
-    #: 命令串一起翻成 ``SANDBOX_LAYOUT_AGENT_NS``。
-    layout: str = SANDBOX_LAYOUT_USER_ROOT
+    #: 就 ``layout_mismatch`` 重建。PR-C 起本进程铺的就是 ``agent-ns``——exec 命令串
+    #: 已经翻成命名空间版本(见 :meth:`exec`),``user-root`` 是 PR-B 的过渡值。
+    layout: str = SANDBOX_LAYOUT_AGENT_NS
     #: 沙箱迁移波 3 —— 可选工作区配额闸。None(默认)= 无闸,行为与波 2
     #: 完全一致(本地 compose / 未配 NAS 的部署)。control-plane 在 app.py
     #: 里 post-assign(照 resolved_workspace_store.http 的先例),不走
@@ -404,7 +404,7 @@ class AgentSandboxClient:
                 "when workspace_pv_name is configured — NasWorkspaceStore "
                 "has no concept of a subpath prefix (its layout is always "
                 "{root}/{tenant_id}/{user_id}), so a non-empty prefix here "
-                "would mount the sandbox's /workspace at a NAS path "
+                "would mount the sandbox's /mnt/workspace at a NAS path "
                 "NasWorkspaceStore never reads or writes: a silent, "
                 "hard-to-diagnose split between what the sandbox sees and "
                 "what the workspace-browse/upload/download endpoints see."
@@ -700,11 +700,12 @@ class AgentSandboxClient:
         # § 6.5 的统一错误契约:files.write 原样抛的是 e2b 自己的异常类型。
         try:
             if just_created:
+                await self._ensure_exec_view_dir(sbx, sandbox_id=sandbox_id)
                 await self._chown_workspace_mount(sbx, sandbox_id=sandbox_id)
             for relpath, data in seed_files:
                 # sandbox migration wave 2 (spec § 四) — skills live on sandbox-
                 # local disk under SANDBOX_SKILLS_ROOT, not the user's NAS-backed
-                # WORKSPACE_ROOT; relpath is already namespaced under
+                # NAS_MOUNT; relpath is already namespaced under
                 # <agent_key>/ by the caller (build_skill_seed_files).
                 await sbx.files.write(
                     f"{SANDBOX_SKILLS_ROOT}/{relpath}", data, user=SANDBOX_EXEC_USER
@@ -730,14 +731,26 @@ class AgentSandboxClient:
             self._session_identity[sandbox_id] = (tenant_id, user_id)
         return sandbox_id
 
+    async def _ensure_exec_view_dir(self, sbx: Any, *, sandbox_id: UUID) -> None:
+        """B-60 —— 以 root 建 ``EXEC_VIEW`` 空目录,当每次 exec 的 bind 目标。
+
+        镜像里**没有** ``/workspace``(W2 Task 9 删的,且 B-59 刷镜像时也不许加回:
+        ACS 老代码 + 预建目录 = NAS symlink 建不上);rootfs 是可写 overlay(2026-09-14
+        池 pod 实测),建沙箱后补一个即可。**不是 best-effort**:没有它每一次 exec 都会在
+        第一条 bind 上 fail-closed,整个沙箱等于废的 —— 与 :meth:`_chown_workspace_mount`
+        的取舍相反(那句失败无害),这句失败必须让 post-create 失败、把沙箱拆掉。
+        """
+        del sandbox_id  # 只为日志/对称;失败由调用方统一包成 post-create 失败
+        await sbx.commands.run(f"mkdir -p {shlex.quote(EXEC_VIEW)}", user="root")
+
     async def _chown_workspace_mount(self, sbx: Any, *, sandbox_id: UUID) -> None:
-        """沙箱侧兜底:把自己刚挂上的 ``/workspace`` 属主改成 uid 10000。
+        """沙箱侧兜底:把自己刚挂上的 ``/mnt/workspace`` 属主改成 uid 10000。
 
         **为什么需要第二道**(集群实测,2026-08-07)。挂载点的 subPath 目录
         如果在 ``create()`` 时还不存在,**平台会替你建**——建成 ``root:root
         0755``(实测:``/workspaces/<tenant>/<user>`` 就是这个 mode)。沙箱里
         的 agent 以 uid 10000 跑,属主是 root 的目录它写不进去,于是第一次
-        往 ``/workspace`` 写就是 ``PermissionError``。权威的修法是
+        往 ``/mnt/workspace`` 写就是 ``PermissionError``。权威的修法是
         :meth:`_prepare_workspace_mount` —— control-plane 在 ``create()``
         **之前** 就把目录 mkdir 好(control-plane 与沙箱 agent 现在是同一个
         uid,谁先建都是它的属主),平台因此只会看到一个已存在的目录、不会
@@ -763,16 +776,16 @@ class AgentSandboxClient:
         过来,在这一句是唯一权限来源的场合它失败了,下一次 ``exec`` 会以
         ``PermissionError`` 大声报出来——不会静默变成"能跑但写不进去"。
 
-        ``/workspace`` 是平台建的 **符号链接**(指向
+        ``/mnt/workspace`` 是平台建的 **符号链接**(指向
         ``/run/csi/mount-root/nas/<hash>``),``chown`` 默认跟随符号链接,所以
         改到的是挂载点真身,不是链接本身。``workspace_pv_name`` 没配时根本没有
-        挂载、``/workspace`` 也不存在,直接跳过。
+        挂载、``/mnt/workspace`` 也不存在,直接跳过。
         """
         if not self.workspace_pv_name:
             return
         try:
             await sbx.commands.run(
-                f"chown {SANDBOX_EXEC_UID}:{SANDBOX_EXEC_UID} {WORKSPACE_ROOT}", user="root"
+                f"chown {SANDBOX_EXEC_UID}:{SANDBOX_EXEC_UID} {NAS_MOUNT}", user="root"
             )
         except Exception:
             logger.info(
@@ -819,9 +832,9 @@ class AgentSandboxClient:
         临时沙箱(``user_id`` 为 None)—— 没有软删概念(临时沙箱没有持久
         身份可被软删),只需要 mkdir + chmod 它自己的 scratch 子树
         (``_scratch/<sandbox_id>``)。**取舍**(brief 明确留给实现判断的
-        一点):镜像不再预建 ``/workspace``(Task 9)之后,scratch 子树跟用户
+        一点):镜像不再预建 ``NAS_MOUNT``(Task 9)之后,scratch 子树跟用户
         子树一样是 NAS 上全新的目录,权限跟用户子树同一套——不放开权限的话临时沙箱
-        的 ``/workspace`` 同样会撞 ``Permission denied``,这不是"要不要顺带
+        的 ``NAS_MOUNT`` 同样会撞 ``Permission denied``,这不是"要不要顺带
         修"的问题,是同一个真因(spec § 二之二)在另一个 subPath 下的必然
         重现。让两个分支共用同一个 :meth:`_ensure_workspace_dir`,而不是只
         给用户分支修,是本任务对这道取舍的结论。
@@ -864,7 +877,7 @@ class AgentSandboxClient:
         写/路径穿越防护机器。
 
         **marker 不在 ``{tenant}/{user}`` 子树里**(全分支终审 Critical-1):
-        那棵树整个经 ``subPath`` 挂进沙箱的 ``/workspace``,沙箱里的 agent
+        那棵树整个经 ``subPath`` 挂进沙箱的 ``NAS_MOUNT``,沙箱里的 agent
         直接写一个同名文件就能让这道闸永久拒掉该用户——这道闸读的是
         ``{root}/{tenant}/.deleted/{user}``,与用户目录平级,任何 subPath 都
         挂不到,见该函数与 ``nas_workspace_store`` 模块 docstring。
@@ -1207,7 +1220,7 @@ class AgentSandboxClient:
                     [
                         {
                             "pvName": self.workspace_pv_name,
-                            "mountPath": WORKSPACE_ROOT,
+                            "mountPath": NAS_MOUNT,
                             "subPath": subpath,
                         }
                     ]
@@ -1428,12 +1441,19 @@ class AgentSandboxClient:
         (spec § 6.1),不是延续 runner.py 的写法——副作用是 ``-c`` 模式下
         ``__file__`` 不存在、文件模式下存在,测试钉住这条差异。
 
-        全分支终审 Important-2:``commands.run`` 显式传 ``cwd=WORKSPACE_ROOT``。
-        envd 派生的进程不继承镜像的 ``WORKDIR``,不传则落在 ``/home/agent``
-        (2026-08-04 集群实测)—— ``bash`` 工具的 LLM 可见描述写着"Runs in
-        /workspace",而 LLM 代码里的 ``open('out.csv','w')`` 这类相对路径写
-        出的文件会落到 ``file_ops``(只认绝对 ``/workspace/...``)看不见的地
-        方。配套的镜像环境变量见 :data:`SANDBOX_IMAGE_ENV`。
+        全分支终审 Important-2:``commands.run`` 显式传 ``cwd=NAS_MOUNT`` ——
+        **不是**为了给 LLM 代码定 cwd(那件事由 ``build_exec_command`` 生成的
+        脚本自己 ``cd`` 到 ``EXEC_VIEW`` 完成,进的是它自己的 mount namespace,
+        见下方 exec_view 一段),而是因为 E2B 在真正执行命令前会校验传入的
+        ``cwd`` 已经存在 —— ``NAS_MOUNT`` 在 create() 时就已经挂载好、不在
+        任何一次 exec 的私有命名空间之内,始终存在;``EXEC_VIEW``
+        (``/workspace``)只在进了命名空间之后才由脚本自己 bind 出来,在那
+        之前不存在。envd 派生的进程不继承镜像的 ``WORKDIR``,``cwd`` 不传
+        则落在 ``/home/agent``(2026-08-04 集群实测)。
+        ``bash`` 工具的 LLM 可见描述写着"Runs in /workspace"——这是脚本 ``cd``
+        之后 LLM 代码实际看到的目录,``open('out.csv','w')`` 这类相对路径写出
+        的文件落在这里才会被 ``file_ops``(只认绝对 ``/workspace/...``)看见。
+        配套的镜像环境变量见 :data:`SANDBOX_IMAGE_ENV`。
 
         独立审查 Important-2:``_attach(sandbox_id, touch_last_used=True)``
         在拿句柄的同一次往返里把这一行的 ``last_used_at`` 推进到当前
@@ -1492,35 +1512,14 @@ class AgentSandboxClient:
         envs = agent_key_envs(agent_key)
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
-            # B-50 —— 相对路径默认落自己的 agent 目录。取值与本地后端同一个
-            # 函数(``agent_workspace_root``),两边不可能漂;``agent_key`` 为空
-            # 时它返回 ``WORKSPACE_ROOT``,与改动前一字不差。
-            #
-            # ``mkdir -p`` + ``cd`` 而不是 ``cwd=`` 参数:agent 目录在有人往里写
-            # 之前不存在,而 ``cwd=`` 是**执行前**校验的 —— 目录还没建,exec 就
-            # 已经失败了,mkdir 塞不进这条命令里。``acquire`` 也补不上:温沙箱
-            # 是不带 agent 身份被认领的(池按 ``(tenant, user)`` 键)。本地后端
-            # 在 runner 里 ``os.makedirs`` 做同一件事 —— 机制不同、可观测结果
-            # 逐字一致,由 ``test_sandbox_runtime_contract.py`` 钉住。
-            #
-            # ``umask 077`` 必须排在 ``mkdir`` **前面**:它建出来的 agent 目录
-            # 也要落 ``0o700``。反过来写(先 mkdir)目录会拿到默认 umask 的
-            # ``0o755`` —— ``test_exec_sets_owner_only_umask_before_running_the_script``
-            # 正是钉这个顺序的。
-            agent_cwd = agent_workspace_root(agent_key)
-            # 未绑 agent 时 ``agent_cwd`` 就是 ``WORKSPACE_ROOT``,这段前缀是纯
-            # 噪音(而且 ``cwd=`` 已经把我们送到那儿了)—— 不加,让未绑路径的
-            # 命令串与改动前**逐字**一致。
-            enter = (
-                ""
-                if agent_cwd == WORKSPACE_ROOT
-                else (f"mkdir -p {shlex.quote(agent_cwd)} && cd {shlex.quote(agent_cwd)} && ")
-            )
+            # B-60 —— 命令串由 exec_view.build_exec_command 生成:umask 077,再在自己的
+            # user+mount ns 里把 agent 目录 bind 成 /workspace(spec §4.3)。cwd= 传挂载点
+            # 只是因为 E2B 执行前校验它存在;进 ns 之后脚本自己 cd /workspace。
             result = await sbx.commands.run(
-                f"umask 077 && {enter}python {' '.join(SANDBOX_PYTHON_FLAGS)} {script}",
+                build_exec_command(agent_key, script),
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
-                cwd=WORKSPACE_ROOT,
+                cwd=NAS_MOUNT,
                 envs=envs or None,
             )
         except timeout_exc:

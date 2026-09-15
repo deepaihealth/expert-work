@@ -138,6 +138,8 @@ ignore = []
 # pre-commit ruff flags every subprocess.run — ignore both rules by config so
 # inline noqa doesn't drift between the two versions.
 "infra/sandbox-image/smoke_payload.py" = ["S603", "S607"]
+# exec_view 的 sh -n 语法闸:故意用 PATH 上的 sh(镜像里就是它),不是可疑子进程。
+"services/orchestrator/tests/test_exec_view.py" = ["S603", "S607"]
 
 [tool.ruff.format]
 quote-style = "double"

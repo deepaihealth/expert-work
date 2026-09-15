@@ -6,12 +6,17 @@ writes one request object per line, and reads one response per line:
 
     → {"code": "<python source>", "timeout_s": 30}
     → {"code": "...", "timeout_s": 30, "envs": {"PYTHONUSERBASE": "/opt/agents/a1"},
-       "cwd": "/workspace/agents/a1"}
+       "agent_root": "/mnt/workspace/agents/a1"}
     ← {"stdout": "...", "stderr": "...", "exit_code": 0, "timed_out": false}
 
 ``envs`` (sandbox migration wave 2, spec 决策 10) is optional and merged onto
 the child process's environment — currently just ``PYTHONUSERBASE`` per-agent
 isolation, sent by the supervisor's own ``ExecRequest.envs`` field.
+
+``agent_root`` (B-60) is optional too — the agent's directory on the NAS
+mount. The runner binds it as ``/workspace`` inside a private mount
+namespace it creates for this one exec, so the child's ``/workspace`` is
+that agent's directory and no other agent's directory is even there.
 
 The submitted code runs in a *child* ``python -c`` process rather than in
 this interpreter. A child is killable on timeout and isolates a crashing
@@ -43,69 +48,108 @@ MAX_TIMEOUT_S = 300
 #: tool applies its own (smaller, LLM-budget) truncation on top.
 MAX_OUTPUT_CHARS = 1_000_000
 
+#: B-60 —— 每次 exec 自己的 user+mount namespace 里把 agent 目录 bind 成 /workspace、
+#: shared/ 只读挂入、tmpfs 盖掉 /mnt/workspace。**与 orchestrator
+#: ``exec_view.EXEC_VIEW_SCRIPT`` 逐字相同**(这个文件是镜像代码,不能 import 仓库;
+#: 契约测试 ``test_exec_view_script_matches_the_sandbox_image`` 用 ast 比对两份字面量,
+#: 改一边必红)。参数走位置参数:``$1`` = bind 源(空串 = 未绑,bind 整个用户根)。
+_EXEC_VIEW_SCRIPT = """\
+set -eu
+root="$1"; shift
+if [ -n "$root" ]; then
+  mkdir -p "$root"
+  mount --bind "$root" /workspace
+  if [ -d /mnt/workspace/shared ]; then
+    if [ -L /workspace/shared ] || { [ -e /workspace/shared ] && [ ! -d /workspace/shared ]; }; then
+      echo "ew-exec-view: /workspace/shared is not a directory; shared/ not mounted" >&2
+    else
+      mkdir -p /workspace/shared
+      mount --bind /mnt/workspace/shared /workspace/shared
+      mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
+    fi
+  fi
+  mount -t tmpfs -o size=1k none /mnt/workspace
+else
+  mount --bind /mnt/workspace /workspace
+fi
+cd /workspace
+exec "$@"
+"""
+
 #: A response is always this 4-key shape, so the supervisor parses one
 #: schema whether the run succeeded, failed, timed out, or the request
 #: itself was malformed.
 Response = dict[str, str | int | bool]
 
 
+def _exec_argv(code: str, agent_root: str | None) -> list[str]:
+    """The child process argv: the B-60 namespace wrapper around ``python -c code``.
+
+    Split out of :func:`run_once` so the runner's own unit tests can swap it for a
+    plain ``python -c`` argv — ``unshare -Urm`` needs user namespaces and the
+    script needs ``/mnt/workspace``, neither of which exists on a CI host or a
+    developer's macOS. The contract gate
+    ``test_sandbox_runtime_contract.test_exec_view_script_matches_the_sandbox_image``
+    finds this list literal by ``ast`` and pins it against the orchestrator's copy.
+    """
+    return [
+        "unshare",
+        "-Urm",
+        "--propagation",
+        "private",
+        "--",
+        "sh",
+        "-c",
+        _EXEC_VIEW_SCRIPT,
+        "ew-exec-view",
+        agent_root or "",
+        # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
+        # site out of sys.path and silently breaks `pip install --user`
+        # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
+        # isolation; -P keeps the script dir / cwd off sys.path.
+        sys.executable,
+        "-E",
+        "-P",
+        "-c",
+        code,
+    ]
+
+
 def run_once(
     code: str,
     timeout_s: int,
     envs: dict[str, str] | None = None,
-    cwd: str | None = None,
+    agent_root: str | None = None,
 ) -> Response:
     """Run ``code`` in a child Python process; capture stdout / stderr / exit.
 
-    ``timeout_s`` is clamped to ``[1, MAX_TIMEOUT_S]``. On timeout the
-    child is killed and ``timed_out`` is ``True`` with ``exit_code`` -1.
+    ``timeout_s`` is clamped to ``[1, MAX_TIMEOUT_S]``. On timeout the child is
+    killed and ``timed_out`` is ``True`` with ``exit_code`` -1.
 
-    ``envs`` (sandbox migration wave 2, spec 决策 10) is merged onto this
-    runner process's own environment for the child only — the runner's own
-    process env (and every other sandbox this runner never sees) is
-    untouched. ``None``/empty → the child inherits exactly what the runner
-    itself has, unchanged (pre-feature behaviour).
+    ``envs`` (sandbox migration wave 2, spec 决策 10) is merged onto this runner
+    process's own environment for the child only.
 
-    ``cwd`` (B-50) is the child's working directory — the per-exec knob the
-    agent-scoped workspace layout needs. The container's own ``--workdir`` is
-    set once at creation, but a warm sandbox is reused across every agent of
-    one ``(tenant, user)``, so the directory has to travel with the call. Same
-    shape the hosted sandboxes expose (E2B / Daytona ``cwd``; OpenAI's
-    per-command ``cwd``). ``None`` → the runner's own cwd, unchanged.
-
-    It decides where **relative paths resolve**, not what the child may reach:
-    the child can still ``chdir`` or use absolute paths. Confinement lives in
-    the file tools (spec §5.3), and that is deliberate.
-
-    A missing directory is **created**, not fallen back from. The agent's
-    directory does not exist until something writes into it, and ``acquire``
-    cannot pre-create it: a warm sandbox is claimed without an agent identity
-    at all (the pool keys on ``(tenant, user)``), so the first exec is the
-    earliest moment the directory is even known. Falling back to the runner's
-    own cwd instead would drop the exec into the shared user root — precisely
-    the bug B-50 exists to fix — and do it silently. A ``mkdir`` that genuinely
-    fails (a file in the way, no permission) is still reported as an error.
+    ``agent_root`` (B-60) is the agent's directory on the NAS mount. The child
+    runs inside its own user + mount namespace (``unshare -Urm``) where that
+    directory is bind-mounted as ``/workspace``, ``shared/`` is bound read-only
+    and the NAS mount itself is covered by an empty tmpfs — so absolute
+    ``/workspace/x`` lands in the agent's directory and other agents' directories
+    are simply not there. ``None`` → the whole user root is ``/workspace``.
+    The directory is created inside the namespace (``mkdir -p``, umask 0o077
+    inherited from this process). Any mount failure exits non-zero before the
+    code runs: fail closed, never fall back to the shared root.
     """
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
     child_env = {**os.environ, **envs} if envs else None
-    if cwd is not None:
-        try:
-            os.makedirs(cwd, exist_ok=True)
-        except OSError as exc:
-            return _error(f"cannot use cwd {cwd!r}: {exc}")
+    argv = _exec_argv(code, agent_root)
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
-            # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
-            # site out of sys.path and silently breaks `pip install --user`
-            # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
-            # isolation; -P keeps the script dir / cwd off sys.path.
-            [sys.executable, "-E", "-P", "-c", code],
+            argv,
             capture_output=True,
             text=True,
             timeout=timeout_s,
             check=False,
             env=child_env,
-            cwd=cwd,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -137,9 +181,9 @@ def handle_request(request: dict[str, object]) -> Response:
         if isinstance(raw_envs, dict)
         else None
     )
-    raw_cwd = request.get("cwd")
-    cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
-    return run_once(code, timeout_s, envs, cwd)
+    raw_root = request.get("agent_root")
+    agent_root = raw_root if isinstance(raw_root, str) and raw_root else None
+    return run_once(code, timeout_s, envs, agent_root)
 
 
 def handle_line(line: str) -> Response:
