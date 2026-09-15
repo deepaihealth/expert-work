@@ -166,7 +166,15 @@ EXPERT_WORK_INPUTS=/workspace/inputs/<run_id>/inputs.json
 
 ### 4.6 清理
 
-`inputs/<run_id>/` 由现有工作区 janitor 按 **7 天**保留期清理,不新增组件。会话 purge 时随 agent 目录一起删。
+**勘误(2026-09-15 终审实证)**:本节原先写「由现有工作区 janitor 按 7 天保留期清理,不新增组件」——**这是假的**。
+`services/control-plane/src/control_plane/workspace_janitor.py:318` 的 `_sweep_scratch` 只回收 `_scratch/`(24 小时),
+外加用户目录在删除时的归档;**没有任何东西碰 `agents/<key>/inputs/<run_id>/`**。
+
+实际后果:每一轮对话都是新的 `run_id` → 重新物化 + 重新下载,单 run 最多 128 MiB,一直堆到用户工作区被 purge。
+
+**处置**:清理是**独立任务**,并且是**生产前置闸**(测试环境可以先跑,涨了看得见)。判据:按 mtime 扫
+`agents/*/inputs/<uuid>/`,或给每个 agent 的 `inputs/` 定个上限;**必须避开正在跑的 run 的目录**。
+这条不塞进 PR-A —— janitor 在 control-plane,属另一个服务面,而且误删正在跑的 run 目录会当场打断执行。
 
 ---
 
@@ -245,7 +253,7 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
 
 **回滚的坑(必须写进发布清单)**:`MCPToolSpec` 是 `extra="forbid"`,**旧版本读到带 `arg_bindings` 的 manifest 会校验失败**——不是行为退化,是那些 agent 直接起不来。处置:回滚窗口内先别配绑定;或回滚前先清掉绑定配置。与 B-50 那次「回滚窗口在数据搬迁之前」同类。
 
-**无 DB 迁移**:绑定存在 `spec_json`(JSONB)里;`inputs/` 靠现有 janitor。
+**无 DB 迁移**:绑定存在 `spec_json`(JSONB)里。`inputs/` 的清理见 §4.6 勘误 —— 现有 janitor **不**管它,需要单开任务,生产前必须落地。
 
 ---
 
@@ -298,4 +306,4 @@ A 与 B 都要动 `sse.py` 的 `configurable` 字面量(A 不需要、B 需要 �
 
 - **服务端把值绑定到内置宿主工具**(`http` 等):v1 不做,URL 类的值已经走数据面。
 - **同用户同 agent 并发 run**:本设计按 `inputs/<run_id>/` 分目录 + 环境变量指路,已彻底隔离;工作区里**其它**文件的并发覆盖是老问题,不在本设计范围。
-- **预拉的缓存**:同一 URL 在多轮里重复下载。先不做——按 run 隔离比省流量重要,7 天保留期内 NAS 占用可观测后再定。
+- **预拉的缓存**:同一 URL 在多轮里重复下载。先不做——按 run 隔离比省流量重要。注意这条原先的理由(「7 天保留期内 NAS 占用可观测」)建立在 §4.6 那条被证伪的 janitor 说法上;清理任务落地、占用真能观测之后再定。
