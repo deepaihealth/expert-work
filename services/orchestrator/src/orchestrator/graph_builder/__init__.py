@@ -1,6 +1,7 @@
 """Graph builder — ReAct loop (Stream E.6) + plan-execute planner (J.1)."""
 
 from orchestrator.graph_builder.builder import build_react_graph as build_react_graph
+from orchestrator.graph_builder.inputs_node import make_inputs_node as make_inputs_node
 from orchestrator.graph_builder.memory import MemoryNode as MemoryNode
 from orchestrator.graph_builder.memory import (
     PreCompactionFlush as PreCompactionFlush,
@@ -30,6 +31,7 @@ __all__ = [
     "PreCompactionFlush",
     "ReflectNode",
     "build_react_graph",
+    "make_inputs_node",
     "make_memory_recall_node",
     "make_memory_writeback_node",
     "make_planner_node",

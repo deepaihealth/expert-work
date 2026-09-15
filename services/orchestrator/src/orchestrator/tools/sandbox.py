@@ -36,6 +36,7 @@ import httpx
 from expert_work.common.observability import inject_context
 from expert_work.persistence import SANDBOX_AGENTS_ROOT
 from orchestrator.llm.providers._http import client_for
+from orchestrator.tools.inputs_doc import inputs_abs_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.workspace_paths import agent_nas_root
 
@@ -93,8 +94,8 @@ class EgressContext:
     denylist: tuple[str, ...] = ()
 
 
-def agent_key_envs(agent_key: str) -> dict[str, str]:
-    """Per-agent env overrides for an ``exec`` call (spec 决策 10).
+def agent_key_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, str]:
+    """Per-agent env overrides for an ``exec`` call (spec 决策 10 + B-61 §4.4).
 
     Currently just ``PYTHONUSERBASE`` isolation: two agents sharing one warm
     sandbox otherwise share ``$HOME/.local``, so a ``pip install --user`` from
@@ -103,10 +104,19 @@ def agent_key_envs(agent_key: str) -> dict[str, str]:
     and ``AgentSandboxClient``) so the injected env is byte-identical —
     contract-tested in ``test_sandbox_runtime_contract.py``. Empty
     ``agent_key`` (a caller that never bound one) → no override.
+
+    ``run_id`` 非 ``None`` 时再加一项 ``EXPERT_WORK_INPUTS`` —— 本轮
+    ``inputs.json`` 在沙箱里的绝对路径(:func:`orchestrator.tools.inputs_doc.inputs_abs_path`)。
+    选环境变量而不是把路径写进提示词:``os.environ["EXPERT_WORK_INPUTS"]``
+    是固定写法,而路径里的 run_id 仍然是一个要模型手抄的串,那与 B-61 的
+    目的自相矛盾。
     """
-    if not agent_key:
-        return {}
-    return {"PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/{agent_key}"}
+    envs: dict[str, str] = {}
+    if agent_key:
+        envs["PYTHONUSERBASE"] = f"{SANDBOX_AGENTS_ROOT}/{agent_key}"
+    if run_id is not None:
+        envs["EXPERT_WORK_INPUTS"] = inputs_abs_path(run_id)
+    return envs
 
 
 def _traced_headers() -> dict[str, str]:
@@ -196,7 +206,13 @@ class SandboxRuntime(Protocol):
         """
 
     async def exec(
-        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
     ) -> SandboxOutcome:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -206,6 +222,11 @@ class SandboxRuntime(Protocol):
         sandbox; see :func:`agent_key_envs`. Normally injected by
         :class:`_AgentKeyBindingClient`, so callers (``run_in_sandbox``) leave
         it unset (``""`` → no override).
+
+        ``run_id``(B-61 §4.4)非 ``None`` 时同样经 :func:`agent_key_envs` 注入
+        ``EXPERT_WORK_INPUTS``。与 ``agent_key`` 不同,它不经过任何 binding
+        wrapper 预绑定 —— ``run_in_sandbox`` 每次调用直接把 ``ctx.run_id``
+        原样带下来(run 是一次性的,没有"跨多次 exec 复用"这回事)。
         """
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -279,16 +300,23 @@ class HTTPSupervisorRuntime:
         return UUID(str(body["sandbox_id"]))
 
     async def exec(
-        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
     ) -> SandboxOutcome:
         payload: dict[str, Any] = {"code": code}
         if timeout_s is not None:
             payload["timeout_s"] = timeout_s
-        # spec 决策 10 — PYTHONUSERBASE per agent. Same env dict the cloud
-        # backend builds for commands.run(envs=...) (agent_key_envs is the
-        # single source both backends call), sent over the supervisor's own
-        # exec envs channel (ExecRequest.envs, sandbox_supervisor/schemas.py).
-        envs = agent_key_envs(agent_key)
+        # spec 决策 10 + B-61 §4.4 — PYTHONUSERBASE per agent / EXPERT_WORK_INPUTS
+        # per run. Same env dict the cloud backend builds for commands.run(envs=...)
+        # (agent_key_envs is the single source both backends call), sent over
+        # the supervisor's own exec envs channel (ExecRequest.envs,
+        # sandbox_supervisor/schemas.py).
+        envs = agent_key_envs(agent_key, run_id=run_id)
         if envs:
             payload["envs"] = envs
         # B-60 —— 绑了 agent 时把它在 NAS 上的真实目录发给 supervisor,runner 在每次 exec
@@ -403,6 +431,9 @@ class RecordingSandboxRuntime:
     #: ``acquired``: existing tests asserting that tuple's shape stay
     #: unchanged.
     exec_agent_keys: list[str] = field(default_factory=list)
+    #: B-61 §4.4 — the ``run_id`` passed to each exec, kept out of ``execs``
+    #: for the same reason ``exec_agent_keys`` is kept separate.
+    exec_run_ids: list[UUID | None] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
     reaped: list[bool] = field(default_factory=list)
@@ -424,11 +455,18 @@ class RecordingSandboxRuntime:
         return UUID(int=self._next_id)
 
     async def exec(
-        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
     ) -> SandboxOutcome:
         del timeout_s
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)
+        self.exec_run_ids.append(run_id)
         if self.exec_error is not None:
             raise self.exec_error
         return self.outcome
@@ -479,13 +517,23 @@ class _EgressBindingClient:
         )
 
     async def exec(
-        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
     ) -> SandboxOutcome:
-        # This wrapper doesn't own agent_key — it's a pure passthrough here so
-        # a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
-        # still reaches the real backend (spec 决策 10; see bind_agent_key).
+        # This wrapper doesn't own agent_key or run_id — it's a pure passthrough
+        # here so a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
+        # still reaches the real backend (spec 决策 10 + B-61 §4.4; see bind_agent_key).
         return await self.inner.exec(
-            sandbox_id=sandbox_id, code=code, timeout_s=timeout_s, agent_key=agent_key
+            sandbox_id=sandbox_id,
+            code=code,
+            timeout_s=timeout_s,
+            agent_key=agent_key,
+            run_id=run_id,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -542,11 +590,23 @@ class _AgentKeyBindingClient:
         )
 
     async def exec(
-        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
     ) -> SandboxOutcome:
         # The bound key wins — callers (run_in_sandbox) don't supply their own.
+        # run_id isn't owned by this wrapper (it's per-call, not per-agent-build) —
+        # passthrough, same reasoning as _EgressBindingClient (B-61 §4.4).
         return await self.inner.exec(
-            sandbox_id=sandbox_id, code=code, timeout_s=timeout_s, agent_key=self.agent_key
+            sandbox_id=sandbox_id,
+            code=code,
+            timeout_s=timeout_s,
+            agent_key=self.agent_key,
+            run_id=run_id,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -590,6 +650,13 @@ async def run_in_sandbox(
     set) acquires against that user's persistent workspace volume, so files
     survive idle-reclaim and restore on the next acquire — no manifest opt-in.
     A run with no ``user_id`` falls back to an ephemeral tmpfs.
+
+    ``ctx.inputs_run_id or ctx.run_id`` 传给 ``client.exec``(B-61 §4.4)—— 非
+    ``None`` 时两个后端都会经 :func:`agent_key_envs` 注入 ``EXPERT_WORK_INPUTS``。
+    取 ``inputs_run_id`` 优先是为了委派:子代自己的 ``run_id`` 下**没有**
+    ``inputs.json``(inputs 节点故意跳过子 run),指向它等于给模型一条悬空路径;
+    子代与父共用同一个 ``/workspace``,所以指父的那份(见
+    ``ToolContext.inputs_run_id``)。
     """
     if ctx.tenant_id is None:
         msg = f"{tool_label} requires a tenant binding (ctx.tenant_id)"
@@ -615,7 +682,12 @@ async def run_in_sandbox(
         raise ToolBlockedError(msg) from exc
     cancelled = False
     try:
-        return await client.exec(sandbox_id=sandbox_id, code=code, timeout_s=timeout_s)
+        return await client.exec(
+            sandbox_id=sandbox_id,
+            code=code,
+            timeout_s=timeout_s,
+            run_id=ctx.inputs_run_id or ctx.run_id,
+        )
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -719,7 +791,12 @@ class ExecPythonTool:
                 "its stdout / stderr / exit code. Use for calculations, data "
                 "transforms, or anything better done by running code. Runs in "
                 "/workspace, which is your agent's own directory; other "
-                "agents' files are not visible there."
+                "agents' files are not visible there. "
+                "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
+                "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
+                "读不到就照上文办，不必重试。"  # noqa: RUF001
+                "需要用到某个输入值时，用代码读这个文件，不要从上文手抄——长串抄错一位就是 404。"  # noqa: RUF001
+                "文件里 local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载。"  # noqa: RUF001
             ),
             parameters={
                 "type": "object",

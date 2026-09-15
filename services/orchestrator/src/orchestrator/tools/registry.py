@@ -281,6 +281,16 @@ class ToolContext:
     #: 连 tenant_id 都没有),用户的每一条 run 入口都必须填上 —— 见
     #: ``control-plane/tests/test_agent_key_plumbing.py`` 的入口穷举。
     agent_key: str = ""
+    #: B-61 §4.4 —— ``EXPERT_WORK_INPUTS`` 该指向**哪个 run** 的 ``inputs.json``。
+    #:
+    #: 主 run 留 ``None``(用 ``run_id`` 自己)。委派出的子代(worker / 静态子
+    #: Agent)每次都会新铸一个 ``sub_run_id``,而 inputs 节点**故意不为子 run 写
+    #: 文件**——于是子代的 exec 会拿到一个 ``inputs/<sub_run_id>/inputs.json``
+    #: 的悬空路径,工具描述又告诉模型那个文件在,模型读不到就退回手抄 URL:正是
+    #: B-61 要消灭的那个失败。子代与父共用同一个 agent_key、同一个
+    #: ``/workspace``,所以把**父的** run id 传下来,指针就落在父那份真文件上
+    #: (与 agent_key / 技能种子路径同一个取值口径:用父的)。
+    inputs_run_id: UUID | None = None
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``

@@ -93,7 +93,12 @@ class BashTool:
                 "by a dedicated tool. Runs in /workspace, which is your "
                 "agent's own directory; other agents' files are not visible "
                 "there. NOTE: this is an irreversible action — it runs "
-                "serially and may require human approval before executing."
+                "serially and may require human approval before executing. "
+                "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
+                "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
+                "读不到就照上文办，不必重试。"  # noqa: RUF001
+                "需要用到某个输入值时，用代码读这个文件，不要从上文手抄——长串抄错一位就是 404。"  # noqa: RUF001
+                "文件里 local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载。"  # noqa: RUF001
             ),
             parameters={
                 "type": "object",
