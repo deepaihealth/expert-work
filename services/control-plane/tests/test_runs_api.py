@@ -1279,12 +1279,16 @@ async def test_resume_cross_tenant_returns_404(runs_client: AsyncClient) -> None
 # ---------------------------------------------------------------------------
 
 
-async def _seed_completed_run(runs_client: AsyncClient) -> tuple[str, str]:
+async def _seed_completed_run(
+    runs_client: AsyncClient, *, thread_id: str | None = None
+) -> tuple[str, str]:
     """Trigger one happy-path SSE run and return ``(thread_id, run_id)``.
 
     Drains the stream so the run hits a terminal status before listing.
+    ``thread_id`` lets a caller create the session first and do something to
+    the agent before the run starts (see :func:`_desync_stored_sha`).
     """
-    thread_id = await _create_session(runs_client)
+    thread_id = thread_id or await _create_session(runs_client)
     async with runs_client.stream(
         "POST",
         f"/v1/sessions/{thread_id}/runs",
@@ -2269,13 +2273,49 @@ async def test_cancel_run_requires_operator_role(runs_client: AsyncClient) -> No
 
 
 async def _stored_spec_sha(runs_client: AsyncClient, thread_id: str) -> str:
-    """The content hash of the manifest this thread's agent currently has."""
+    """``agent_spec`` 行上 ``spec_sha256`` 那一列的值 —— **读列,不重算**。
+
+    原先这里 ``return compute_spec_sha256(record.spec)``,看着等价,实际把依赖它
+    的断言变成「重算 == 重算」:``bind_exec_spec`` 绑列还是现算都给出同一个值,
+    两种实现分辨不出(B-61 T5b 修复轮 2 复评 N-4)。判别力来自
+    :func:`_desync_stored_sha` 先把列与内容哈希拆开,这里就必须读列才接得住。
+    """
     app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
     meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
     record = await app.state.agent_spec_repo.get(
         tenant_id=_DEFAULT_TENANT, name=meta.agent_name, version=meta.agent_version
     )
-    return compute_spec_sha256(record.spec)
+    assert record is not None
+    return record.spec_sha256
+
+
+async def _desync_stored_sha(runs_client: AsyncClient, thread_id: str, sha: str = "e" * 64) -> str:
+    """把库里那一列改成一个与内容哈希**不相等**的合成值,返回它。
+
+    夹具里 agent 是走 API 建的,``spec_sha256`` 列天然等于
+    ``compute_spec_sha256(spec)`` —— 两者相等时,「绑列」与「现算」给出同一个
+    结果,断言对这两种实现一视同仁。先把它们拆开,后面的断言才真的在验
+    「绑的是库里那一版」。同一手法在 ``test_run_with_use_draft_builds_from_the_draft``
+    里用的是草稿列(``"d" * 64``)。
+    """
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=_DEFAULT_TENANT)
+    repo = app.state.agent_spec_repo
+    record = await repo.get(
+        tenant_id=_DEFAULT_TENANT, name=meta.agent_name, version=meta.agent_version
+    )
+    assert record is not None
+    assert sha != compute_spec_sha256(record.spec), "合成值与内容哈希相等就等于没拆"
+    result = await repo.update_spec(
+        tenant_id=_DEFAULT_TENANT,
+        name=meta.agent_name,
+        version=meta.agent_version,
+        spec=record.spec,
+        spec_sha256=sha,
+        updated_by="tester",
+    )
+    assert result is not None
+    return sha
 
 
 @pytest.mark.asyncio
@@ -2288,11 +2328,16 @@ async def test_stream_run_records_the_manifest_version_it_built(
     ``agent_version`` 编辑前后一模一样 —— 没有这一列,事后无法判断某条 run
     跑的是编辑前还是编辑后的配置。
     """
-    thread_id, run_id = await _seed_completed_run(runs_client)
+    thread_id = await _create_session(runs_client)
+    # 列与内容哈希先拆开 —— 否则「绑列」和「现算」给出同一个值,下面那条断言
+    # 对两种实现一视同仁(复评 N-4)。
+    stored = await _desync_stored_sha(runs_client, thread_id)
+    _, run_id = await _seed_completed_run(runs_client, thread_id=thread_id)
     app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
 
     row = await app.state.run_store.get(run_id=UUID(run_id), tenant_id=_DEFAULT_TENANT)
     assert row is not None
+    assert row.agent_spec_sha256 == stored
     assert row.agent_spec_sha256 == await _stored_spec_sha(runs_client, thread_id)
 
 
@@ -2331,7 +2376,9 @@ async def test_approval_resume_records_the_manifest_version_it_rebuilt_from(
     """
     # 先跑完整一轮,让这个 thread 有真的 checkpoint —— 续跑要在它之上写审批
     # 结论,空状态过不去(与本用例要验的东西无关,只是前置条件)。
-    thread_id, _ = await _seed_completed_run(runs_client)
+    thread_id = await _create_session(runs_client)
+    stored = await _desync_stored_sha(runs_client, thread_id)
+    await _seed_completed_run(runs_client, thread_id=thread_id)
     run_id = await _seed_pending_approval(runs_client, thread_id)
 
     resp = await runs_client.post(
@@ -2345,6 +2392,7 @@ async def test_approval_resume_records_the_manifest_version_it_rebuilt_from(
     row = await app.state.run_store.get(run_id=continuation, tenant_id=_DEFAULT_TENANT)
     assert row is not None
     assert row.is_resume is True
+    assert row.agent_spec_sha256 == stored
     assert row.agent_spec_sha256 == await _stored_spec_sha(runs_client, thread_id)
 
 
@@ -2352,22 +2400,25 @@ async def test_approval_resume_records_the_manifest_version_it_rebuilt_from(
 async def test_get_run_exposes_the_manifest_version(runs_client: AsyncClient) -> None:
     """Run 详情把配置版本露出来 —— ``agent_version`` 回答不了这个问题
     (原地编辑前后版本号一样),控制台只能靠这个哈希去 revisions 里反查。"""
-    thread_id, run_id = await _seed_completed_run(runs_client)
+    thread_id = await _create_session(runs_client)
+    stored = await _desync_stored_sha(runs_client, thread_id)
+    _, run_id = await _seed_completed_run(runs_client, thread_id=thread_id)
     resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")
     assert resp.status_code == 200
     # 这个端点直接返回扁平对象,不套 {success, data, error}(与 trace_id 同处)。
-    assert resp.json()["agent_spec_sha256"] == await _stored_spec_sha(runs_client, thread_id)
+    assert resp.json()["agent_spec_sha256"] == stored
 
 
 @pytest.mark.asyncio
 async def test_thread_runs_expose_the_manifest_version(runs_client: AsyncClient) -> None:
     """会话页的每轮列表也带上,好标出「第 N 轮之后配置变更过」。"""
-    thread_id, _ = await _seed_completed_run(runs_client)
+    thread_id = await _create_session(runs_client)
+    expected = await _desync_stored_sha(runs_client, thread_id)
+    await _seed_completed_run(runs_client, thread_id=thread_id)
     resp = await runs_client.get(f"/v1/sessions/{thread_id}/runs")
     assert resp.status_code == 200
     runs = resp.json()["data"]["runs"]
     assert runs
-    expected = await _stored_spec_sha(runs_client, thread_id)
     assert all(r["agent_spec_sha256"] == expected for r in runs)
 
 
