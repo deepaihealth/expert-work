@@ -112,6 +112,7 @@ async def test_workspace_janitor_run_once_single_flights_across_sessions(
             workspace_root=str(tmp_path),
             interval_s=60.0,
             session_factory=session_factory,
+            archive_enabled=True,
         )
         _slow_down_cycle(worker)
         return worker

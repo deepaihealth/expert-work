@@ -11,6 +11,14 @@
   那一项上(``materials[0].local_path``)。路径**相对 ``/workspace``**:B-60 之后
   exec 的 cwd 就是 ``/workspace``(即 :data:`sandbox_image_contract.EXEC_VIEW`),
   相对路径与 ``Path("/workspace") / rel`` 都成立。
+
+**``local_path`` 可能指向一个已经不在的文件 —— 这是被接受的契约,不是 bug。**
+预拉缓存由 control-plane 的 workspace janitor 按 7 天回收,而本文档所在的 run 目录保留
+30 天(两条保留期刻意不同:缓存是会随轮数涨的那一半,必须有界;文档是几 KB 的 JSON,留久
+了才救得了「挂起很久的审批续跑」)。所以一个挂得够久的 run 续跑时,可能拿到一个指向已回收
+文件的 ``local_path``。**``value`` 里永远留着原始 URL**,沙箱代码照着重下即可;反过来为了
+保住 ``local_path`` 去删 run 目录,模型手里就什么都没有了,只能回去从提示词手抄长串 ——
+那正是本项目要消灭的失败。
 """
 
 from __future__ import annotations

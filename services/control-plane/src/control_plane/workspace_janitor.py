@@ -57,7 +57,7 @@ from expert_work.persistence.workspace.layout import (
 )
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools.nas_workspace_store import DELETED_DIR, workspace_user_root
-from orchestrator.tools.prefetch_script import CACHE_DIRNAME, CACHE_TTL_S
+from orchestrator.tools.prefetch_script import CACHE_DIRNAME
 
 logger = logging.getLogger(__name__)
 
@@ -126,28 +126,48 @@ class _ReclaimPolicy:
         return self.enabled and now - mtime >= self.ttl_s
 
 
-#: per-run 目录的 TTL。**判据是「距最后一次预拉写入」,不是「run 还活不活着」**:
-#: 写 ``inputs/<run_id>/`` 的只有 START 侧的 inputs 节点,**续跑不重新经过它**,所以一个
-#: 等审批的 run 挂得比 TTL 久,回来时 ``inputs.json`` 已经没了 —— 模型退回从提示词手抄
-#: 长串,正是 B-61 要治的病。30 天覆盖现实中的长审批挂起(与 Codespaces「30 天」同一条
-#: 先例)。**敢从 7 天抬到 30 天是因为 T11**:内容寻址之后同一个 URL 跨轮只存一份,占用
-#: 不再随轮数相乘,真正吃配额的是缓存条目不是这些几 KB 的 JSON。
+#: per-run 目录的 TTL —— **长而便宜的那一半**。
+#:
+#: 判据是这个目录的 mtime,而它的含义是「最后一次**有人往里写东西**」:正常情况下是预拉
+#: 的增量改写(每拉完一个 URL 就 ``os.replace`` 一次 ``inputs.json``),但沙箱代码往
+#: ``/workspace/inputs/<run_id>/`` 里写任何文件同样会把它顶新 —— 所以别把它读成「最后一次
+#: 引用」,它只是「最后一次写入」。**关键是它不等于「run 还活着」**:写 ``inputs.json`` 的
+#: 只有 START 侧的 inputs 节点,**续跑不重新经过它**,于是一个等审批的 run 挂得比 TTL 久,
+#: 回来时目录已经没了 —— 模型退回从提示词手抄长串,正是 B-61 要治的那个病。
+#:
+#: 30 天覆盖现实中的长审批挂起(Codespaces 的 30 天是同一条先例)。**抬它是安全的,理由不是
+#: 「T11 去掉了乘数」**(那条只对逐字节相同的 URL 成立,见下),而是这里躺的是几 KB 的 JSON:
+#: 它**不是**会涨的那一半。
 _RUN_DIR_TTL_S = 30 * 24 * 3600
 
-#: 缓存条目的 TTL。**不变式:``_CACHE_TTL_S > _RUN_DIR_TTL_S + CACHE_TTL_S``**
-#: (``CACHE_TTL_S`` = 预拉侧的新鲜期 24h,从那边 import,不抄)。
+#: 缓存条目的 TTL —— **短而有界的那一半**。与 :data:`_RUN_DIR_TTL_S` **相互独立**,
+#: 不再由它推导(上一版把两者绑成不等式,已撤销)。
 #:
-#: 为什么必须严格大于:命中**不 touch**(T11 裁定 A),所以条目的 mtime 最多比「最近一次
-#: 被引用」早 24 小时,而 run 目录的 mtime 就是那次引用的时刻。两条 TTL 相等时,缓存条目
-#: 会比引用它的 ``inputs.json`` **先死最多 24 小时** —— 那段时间里 ``inputs.json`` 的
-#: ``local_path`` 非空却指向一个已被删掉的文件,而工具描述对模型的承诺是「非空 = 平台已经
-#: 下好了,直接用,不用再联网」。
+#: 为什么必须短:``cache_digest`` 哈希的是**整个 URL(含 query)**,而这些值来自调用方每轮
+#: 传进来的 ``inputs`` —— 预签名的对象存储 URL **每轮都是一个新 digest**,去重率恰好是零。
+#: 这一半会随轮数线性涨(每轮上限 ``MAX_TOTAL_BYTES`` = 128 MiB),而每用户 10 GiB 的配额闸
+#: 之外**没有任何按体积的驱逐**:一个每天跑一轮的 agent 按 30 天算能压着约 4 GiB 的死缓存,
+#: 撞闸之后那个用户的沙箱类工具会被整片挡住。用一次罕见的优雅降级去换一次可能发生的硬失败,
+#: 方向是反的。
 #:
-#: 所以这里**不写字面量,直接把不等式写成代码**:滞后项取预拉侧的 ``CACHE_TTL_S`` 本人
-#: (它哪天改了这里跟着走),再加 2 天余量 —— 30 + 1 + 2 = **33 天**。要改成写死的数字,
-#: 先读上面这段;``test_cache_ttl_outlives_the_run_dir_that_names_it`` 钉着这条不等式。
-_CACHE_TTL_S = _RUN_DIR_TTL_S + CACHE_TTL_S + 2 * 24 * 3600
+#: **被接受的降级(契约,别当成 bug 去"修")**:一个挂得比缓存 TTL 久的 run 续跑时,可能
+#: 拿到一个 ``local_path`` 指向已被回收的文件。**这是安全的** —— ``inputs.json`` 的
+#: ``value`` 里**永远留着原始 URL**,沙箱代码照着重下即可。反过来为了保住 ``local_path``
+#: 去删 run 目录,模型手里就什么都没有了,只能回去从提示词手抄 —— 那正是本项目要消灭的失败。
+#: 所以:**run 目录长而便宜,缓存短而有界**,而且缓存 TTL 必须**严格短于** run 目录 TTL
+#: (``test_cache_ttl_is_shorter_than_the_run_dir_ttl`` 钉着这个方向,谁想「把两个数调一致」
+#: 会先撞红,然后被迫读这段)。
+#:
+#: 也因此**不再 import 预拉侧的 ``CACHE_TTL_S``**:那是个**带宽**旋钮(调它是为了「同一个
+#: URL 多久之内不重下」),让 NAS 的保留期跟着它走,等于让改下载行为的人顺手改了存储保留期。
+#: 两者现在各管各的。
+_CACHE_TTL_S = 7 * 24 * 3600
 
+#: 两条 inputs 策略的形状是刻意不对称的:**run 目录长而便宜(30 天),缓存短而有界
+#: (7 天)**。续跑撞上「``local_path`` 指向已回收文件」是**被接受的**降级 ——
+#: ``inputs.json`` 的 ``value`` 里永远留着原始 URL,重下即可;而删掉 run 目录会让模型
+#: 一无所有,退回手抄长串。理由写在 :data:`_RUN_DIR_TTL_S` / :data:`_CACHE_TTL_S` 上。
+#:
 #: B-61 T12 本批只启用 inputs 两条;uploads 与产物的条目**先放在这里但关着**——
 #: 它们删的是用户数据,需要产品定 N、需要发布前告知、还要对外删除端点(B-62)当自救
 #: 出口,那是 B-63 的事。机制一次写好,B-63 落地时是把开关拨开 + 接 touch 点,不是重写。
@@ -507,7 +527,7 @@ class WorkspaceJanitorWorker:
         workspace_root: str,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         interval_s: float = _INTERVAL_S,
-        archive_enabled: bool = True,
+        archive_enabled: bool,
     ) -> None:
         self._user_workspaces = user_workspaces
         self._quota_service = quota_service
@@ -518,6 +538,9 @@ class WorkspaceJanitorWorker:
         # 归档 phase **自己**的前提:对象存储得是持久后端。内存后端重启即丢,
         # 90 天恢复承诺会悄悄落空。其余 phase(回收 / 记账 / scratch)与对象
         # 存储无关,不跟着一起关 —— 见 :meth:`_sweep_archives` 与 app.py 的装配点。
+        # **没有默认值是刻意的**:这个参数唯一的用途就是安全,给它默认 ``True`` 等于让
+        # 「忘了传」这件事静默地选中危险的那一侧(往非持久后端归档 = 删了数据没有档案)。
+        # 装配点漏传要当场炸,而不是安静地跑。
         self._archive_enabled = archive_enabled
 
         self._task: asyncio.Task[None] | None = None
@@ -722,7 +745,7 @@ class WorkspaceJanitorWorker:
         # 少」本身就是要能在日志里查到的事实。逐 (tenant, user, agent, policy) 的明细
         # 由 _reclaim_user 在真删掉东西时记,空轮不产生任何明细行。
         #
-        # 三个字段**同一个口径**:全部取本 phase 的 ``totals``。别拿 ``stats.inputs_*``
+        # 三个字段**同一个口径**:全部取本 phase 的 ``totals``。别拿 ``stats.reclaim_*``
         # 去填 files/dirs —— 那是**整轮累计**的,今天与 phase 局部相等只是因为这个 phase
         # 每轮跑一次,而这条巧合没人会记得;哪天 phase 被调用两次,同一行里的
         # files/dirs 与 by_policy 就会自相矛盾。

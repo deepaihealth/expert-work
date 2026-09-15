@@ -15,6 +15,7 @@ B-61 T12 的回收面再往下一层(``_agent_dir`` 造):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import logging
 import os
@@ -40,7 +41,6 @@ from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.persistence import InMemoryTenantQuotaStore
 from expert_work.persistence.workspace.memory import InMemoryUserWorkspaceStore
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectStoreError
-from orchestrator.tools.prefetch_script import CACHE_TTL_S
 from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 
@@ -124,6 +124,7 @@ async def test_lock_loser_skips_cycle(tmp_path: Path) -> None:
         object_store=InMemoryObjectStore(),
         workspace_root=str(tmp_path),
         session_factory=factory,
+        archive_enabled=True,
     )
     stats = await worker.run_once()
     assert stats.skipped
@@ -285,6 +286,7 @@ def _build_counting(
         quota_service=service,
         object_store=store,
         workspace_root=str(tmp_path),
+        archive_enabled=True,
     )
     return worker, workspaces, store
 
@@ -834,17 +836,34 @@ async def test_archiving_is_skipped_on_a_non_durable_object_store_but_reclaim_st
     assert stats.reclaim_dirs_removed == 1 and not stale_run.exists()  # 回收照跑
 
 
-def test_cache_ttl_outlives_the_run_dir_that_names_it() -> None:
-    """不变式:``inputs_cache.ttl > inputs_run_dir.ttl + CACHE_TTL_S``。
+def test_cache_ttl_is_shorter_than_the_run_dir_ttl() -> None:
+    """方向不变式:**缓存 TTL 必须严格短于 run 目录 TTL**。
 
-    命中**不 touch**(T11 裁定 A),所以缓存条目的 mtime 最多比「最近一次被引用」早
-    ``CACHE_TTL_S``(24h),而 run 目录的 mtime 就是那次引用的时刻。两条 TTL 相等时,
-    缓存条目会比引用它的 ``inputs.json`` **先死最多 24 小时** —— 那段时间里
-    ``local_path`` 非空却指向一个已被删掉的文件,而工具描述对模型的承诺是「非空 = 平台
-    已经下好了,直接用,不用再联网」。
+    两半是刻意不对称的,别「调成一致」:
 
-    把不等式本身钉在这里,而不是钉两个具体天数:谁把缓存 TTL 往 run 目录那边调,
-    这条就红。
+    * **缓存是会涨的那一半**。``cache_digest`` 哈希整个 URL(含 query),而这些值来自调用方
+      每轮传进来的 ``inputs`` —— 预签名 URL 每轮都是新 digest,去重率是零;每轮上限
+      128 MiB,配额之外没有任何按体积的驱逐。留太久 = 一个每天跑的 agent 压着几 GiB 死缓存,
+      撞上每用户 10 GiB 的闸之后那个用户的沙箱类工具被整片挡住。
+    * **run 目录是不涨的那一半**(几 KB 的 JSON),留得久才救得了「挂了很久的审批续跑」。
+
+    于是续跑可能拿到一个指向已回收文件的 ``local_path`` —— **这是被接受的降级**:
+    ``inputs.json`` 的 ``value`` 里永远留着原始 URL,沙箱代码重下即可;反过来删掉 run 目录
+    才是灾难(模型一无所有,退回从提示词手抄长串,正是 B-61 要治的病)。
+
+    这条测试原来钉的是反方向的不等式(缓存活得比 run 目录久),那版裁定已被推翻 —— 理由见
+    ``_CACHE_TTL_S`` 的注释。
     """
     ttl = {policy.label: policy.ttl_s for policy in _POLICIES}
-    assert ttl["inputs_cache"] > ttl["inputs_run_dir"] + CACHE_TTL_S
+    assert ttl["inputs_cache"] < ttl["inputs_run_dir"]
+
+
+def test_archive_enabled_is_a_required_kwarg() -> None:
+    """``archive_enabled`` **不许有默认值**。
+
+    它唯一的用途就是安全:给它默认 ``True``,「装配点忘了传」这件事就静默地选中了危险的
+    那一侧 —— 往非持久对象存储归档 = 打包上传之后 ``rm -rf`` 用户目录,而那个档案重启即丢。
+    漏传必须当场 ``TypeError``,不是安静地跑起来。
+    """
+    param = inspect.signature(WorkspaceJanitorWorker.__init__).parameters["archive_enabled"]
+    assert param.default is inspect.Parameter.empty
