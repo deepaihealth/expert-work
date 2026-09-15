@@ -386,10 +386,20 @@ def test_main_survives_missing_inputs_json(tmp_path: Path) -> None:
     assert main(["prefetch_script.py", str(missing)]) == 0
 
 
-def _jpeg_route(body: bytes) -> Callable[[_RoutedHandler], None]:
+def _route(
+    body: bytes, content_type: str = "image/jpeg", served: list[str] | None = None
+) -> Callable[[_RoutedHandler], None]:
+    """一条回固定 body 的 200 路由。
+
+    ``served`` 给了就记下每一次**真正打到 server** 的请求 —— 「命中缓存」的判据就是
+    这里没有被叫到。
+    """
+
     def route(handler: _RoutedHandler) -> None:
+        if served is not None:
+            served.append(handler.path)
         handler.send_response(200)
-        handler.send_header("Content-Type", "image/jpeg")
+        handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
         handler.wfile.write(body)
@@ -403,10 +413,11 @@ def test_a_bare_url_in_a_list_does_not_lose_the_other_variables(
     """终审 finding 1 —— ``{"images": ["https://a"]}`` 以前会让 ``_assign`` 抛
     ``TypeError``:``main`` 的 per-site 循环没有任何处理,脚本非 0 退出,结尾那次
     ``json.dump`` 根本不跑 —— **每个**变量的 ``local_path`` 全丢,已经下载好的文件
-    成了 ``files/`` 里的孤儿。列表里的裸 URL 现在不算 site,后面的变量照常回填。"""
+    躺在 ``inputs/cache/`` 里却没有一条记录指向它们。列表里的裸 URL 现在不算 site,
+    后面的变量照常回填。"""
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 16
-    routes["/ok.jpg"] = _jpeg_route(body)
+    routes["/ok.jpg"] = _route(body)
     inputs_path = _write_inputs(
         tmp_path,
         {
@@ -447,8 +458,8 @@ def test_each_site_is_persisted_before_the_next_one(
     """
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 16
-    routes["/a.jpg"] = _jpeg_route(body)
-    routes["/b.jpg"] = _jpeg_route(body)
+    routes["/a.jpg"] = _route(body)
+    routes["/b.jpg"] = _route(body)
     inputs_path = _write_inputs(
         tmp_path,
         {
@@ -482,8 +493,8 @@ def test_one_failing_site_does_not_lose_the_others(
     只让它自己算 miss,不能带走其它 site 已经拿到的结果。"""
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 16
-    routes["/a.jpg"] = _jpeg_route(body)
-    routes["/b.jpg"] = _jpeg_route(body)
+    routes["/a.jpg"] = _route(body)
+    routes["/b.jpg"] = _route(body)
     inputs_path = _write_inputs(
         tmp_path,
         {
@@ -515,22 +526,6 @@ def test_one_failing_site_does_not_lose_the_others(
 # ---------------------------------------------------------------------------
 
 
-def _counting_route(
-    body: bytes, content_type: str, served: list[str]
-) -> Callable[[_RoutedHandler], None]:
-    """记下每一次真正打到 server 的请求 —— 「命中缓存」的判据就是这里没被叫到。"""
-
-    def route(handler: _RoutedHandler) -> None:
-        served.append(handler.path)
-        handler.send_response(200)
-        handler.send_header("Content-Type", content_type)
-        handler.send_header("Content-Length", str(len(body)))
-        handler.end_headers()
-        handler.wfile.write(body)
-
-    return route
-
-
 def test_cache_digest_is_stable_and_url_keyed() -> None:
     first = cache_digest("https://x/a.jpg")
 
@@ -547,7 +542,7 @@ def test_second_fetch_of_the_same_url_reuses_the_cache_without_a_request(
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 32
     served: list[str] = []
-    routes["/ok.jpg"] = _counting_route(body, "image/jpeg", served)
+    routes["/ok.jpg"] = _route(body, served=served)
     url = f"{base}/ok.jpg"
     cache_dir = str(tmp_path / "cache")
 
@@ -575,7 +570,7 @@ def test_a_url_without_an_extension_still_hits_on_the_second_fetch(
     base, routes = http_server
     body = b"\x89PNG\r\n\x1a\n" + b"A" * 16
     served: list[str] = []
-    routes["/logo"] = _counting_route(body, "image/png", served)
+    routes["/logo"] = _route(body, "image/png", served)
     url = f"{base}/logo"
     cache_dir = str(tmp_path / "cache")
 
@@ -594,7 +589,7 @@ def test_an_expired_cache_entry_is_refetched(tmp_path: Path, http_server: _HttpS
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 32
     served: list[str] = []
-    routes["/ok.jpg"] = _counting_route(body, "image/jpeg", served)
+    routes["/ok.jpg"] = _route(body, served=served)
     url = f"{base}/ok.jpg"
     cache_dir = str(tmp_path / "cache")
 
@@ -624,7 +619,7 @@ def test_a_cached_file_is_group_and_world_readable(
     """
     base, routes = http_server
     body = b"\xff\xd8\xff" + b"A" * 32
-    routes["/ok.jpg"] = _jpeg_route(body)
+    routes["/ok.jpg"] = _route(body)
     cache_dir = str(tmp_path / "cache")
 
     name, _used = prefetch_script._fetch(f"{base}/ok.jpg", cache_dir, MAX_TOTAL_BYTES)
@@ -652,3 +647,56 @@ def test_an_interrupted_write_never_leaves_a_partial_cache_entry(tmp_path: Path)
 
     assert entry.read_bytes() == b"COMPLETE-OLD-ENTRY"
     assert list(cache_dir.iterdir()) == [entry]  # 也没把临时文件留在配额目录里
+
+
+@pytest.mark.parametrize("stale_first", [True, False])
+def test_a_stale_sibling_never_shadows_the_fresh_entry(tmp_path: Path, stale_first: bool) -> None:
+    """同一个 digest 的超期兄弟条目必须被跳过并删掉,不能把新鲜的那个遮住。
+
+    同一个 URL 的后缀会随响应变(``/logo`` 今天 ``image/png``、明天 ``image/jpeg``;
+    CDN 偶尔回 ``application/octet-stream`` 就回落到 URL 扩展名),而 ``os.replace``
+    只盖同名的那个 —— 目录里于是同时躺着一个超期的和一个新鲜的。探针一碰到超期的就
+    ``None`` 返回的话,``os.scandir`` 的文件系统顺序说了算:超期那个先被扫到就永远
+    命不中,每轮重下、每轮再写一份,正好退回本任务要治的病。
+
+    两条断言合起来与扫描顺序无关:先扫到超期的 → 返回值错;先扫到新鲜的 → 超期的
+    没被删掉。创建顺序两种都跑一遍只是再加一层。
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    digest = cache_digest("https://x/logo")
+    stale = cache_dir / f"{digest}.png"
+    fresh = cache_dir / f"{digest}.jpg"
+    for path in [stale, fresh] if stale_first else [fresh, stale]:
+        path.write_bytes(b"x")
+    old = time.time() - CACHE_TTL_S - 60
+    os.utime(stale, (old, old))
+
+    assert prefetch_script._cached_name(str(cache_dir), digest) == fresh.name
+    assert not stale.exists()  # 顺手清掉,不然孤儿要等回收闸
+
+
+def test_a_cache_hit_never_touches_the_entry(tmp_path: Path, http_server: _HttpServer) -> None:
+    """命中缓存**不动 mtime** —— 这条不变式此前只有注释在守。
+
+    mtime 的语义是「最近一次下载时间」,T12 的回收闸按它过期。命中时 touch 一下,
+    热条目就永远不会超过 ``CACHE_TTL_S``、也就永远不重下,一个被换掉的 logo 会被
+    无限期地喂给模型 —— B-61 的起因正是这个。
+    """
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 32
+    served: list[str] = []
+    routes["/ok.jpg"] = _route(body, served=served)
+    url = f"{base}/ok.jpg"
+    cache_dir = str(tmp_path / "cache")
+
+    name, _used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+    assert name is not None
+    cached = os.path.join(cache_dir, name)
+    before = os.stat(cached).st_mtime_ns
+
+    hit_name, hit_used = prefetch_script._fetch(url, cache_dir, MAX_TOTAL_BYTES)
+
+    assert (hit_name, hit_used) == (name, 0)  # 先确认这一次真的走的是命中路径
+    assert len(served) == 1
+    assert os.stat(cached).st_mtime_ns == before

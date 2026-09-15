@@ -114,24 +114,46 @@ def script_source() -> str:
 
 
 def _cached_name(cache_dir: str, digest: str) -> str | None:
-    """找这个 digest 的新鲜缓存条目;没有(或已超期)就 ``None``。
+    """找这个 digest 的新鲜缓存条目;没有(或只剩超期的)就 ``None``。
 
     **按 digest 前缀扫目录**,不是拿 URL 的扩展名去拼文件名再探:后缀由响应的
     content-type 定,``/logo`` 回 ``image/png`` 就落成 ``<digest>.png``,照 URL 猜
     探的是空后缀的 ``<digest>`` —— 永远探不到、每轮重下一份,整个缓存等于白做。
 
+    **同一个 URL 可能留下多个兄弟条目**:后缀随响应变(同一个 ``/logo`` 今天回
+    ``image/png``、明天回 ``image/jpeg``,或 CDN 偶尔回 ``application/octet-stream``
+    而回落到 URL 扩展名),而 ``os.replace`` 只盖同名的那个。所以超期条目必须**跳过
+    并顺手删掉**,不能一碰到就 ``None`` 返回:``os.scandir`` 是文件系统顺序(不是字典
+    序),只要超期的那个先被扫到,旁边新鲜的就被永久遮住 —— 每轮重下、每轮再写一份,
+    正好退回本任务要治的那个病,而且是不确定的、自己不会好的形态。
+
+    同样的理由,找到新鲜条目也**不提前返回**:剩下的兄弟条目要扫完才删得干净,否则
+    「删不删得掉」又取决于扫描顺序。
+
     目录不存在 / 读不了都只算「没命中」:这条路上的任何异常都不该冒出去(预拉永不
     让 run 失败),最坏结果是多下一次。
     """
+    found: str | None = None
     try:
         with os.scandir(cache_dir) as entries:
             for entry in entries:
-                if entry.name.startswith(digest):
+                if not entry.name.startswith(digest):
+                    continue
+                try:
                     fresh = time.time() - entry.stat().st_mtime < CACHE_TTL_S
-                    return entry.name if fresh else None
+                except OSError:
+                    # 并发的另一个 run 正好把这个超期条目删掉了(就是下面这段干的)
+                    # ——当它不存在,接着扫,别让一个消失的条目把已经找到的命中作废。
+                    continue
+                if fresh:
+                    if found is None:
+                        found = entry.name
+                    continue
+                with contextlib.suppress(OSError):
+                    os.unlink(entry.path)
     except OSError:
         return None
-    return None
+    return found
 
 
 def _store(cache_dir: str, name: str, body: bytes) -> None:
@@ -199,8 +221,9 @@ def _rewrite(inputs_path: str, doc: dict[str, Any]) -> None:
     """把当前文档原子地盖回 ``inputs.json``(同目录临时文件 + ``os.replace``)。
 
     每拉完一个 site 就调一次:整段 exec 有墙钟上限,超了会被 SIGKILL,而写在
-    最后一步的「一次性改写」在那种情况下等于**一个 local_path 都没落下**——已经
-    下载好的文件全成了 files/ 里的孤儿。逐个落盘后,被杀只损失还没拉完的那些。
+    最后一步的「一次性改写」在那种情况下等于**一个 local_path 都没落下**——文件明明
+    已经躺在 ``inputs/cache/`` 里,却没有一条记录指向它们,模型这一轮只能自己重下。
+    逐个落盘后,被杀只损失还没拉完的那些。
     同目录 + ``os.replace`` 保证读的人要么看到上一版、要么看到新版,不会读到半份。
     """
     tmp_path = inputs_path + ".tmp"
