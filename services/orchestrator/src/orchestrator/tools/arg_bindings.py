@@ -64,9 +64,12 @@ def _copy_json(value: Any) -> Any:
 def strip_bound_params(input_schema: Mapping[str, Any], bound: Collection[str]) -> dict[str, Any]:
     """返回一份新 schema:删掉被绑定的参数,并从 ``required`` 里移除。
 
-    返回值与入参**不共享任何可变对象**(见 :func:`_copy_json`),每条返回路径都如此 ——
-    同一个 ``inputSchema`` 对象由 MCP 目录持有、被多个 agent 的注册项共享,谁改一下我们
-    交回去的东西,原件就跟着变,别人看到的工具也跟着变。
+    可变的 **JSON 结构**(``dict`` / ``list``)每条返回路径都逐层复制过,入参与返回值之间
+    没有共享的这类容器 —— 同一个 ``inputSchema`` 对象由 MCP 目录持有、被多个 agent 的注册项
+    共享,谁改一下我们交回去的东西,原件就跟着变,别人看到的工具也跟着变。
+    JSON 之外的可变值(``set``、包在 ``tuple`` 里的 list、对象属性……)**不复制、仍然共享**:
+    :func:`_copy_json` 有意只穿 dict/list。schema 是 ``mcp.py`` 从 wire 上解析出来的,产不出
+    那些东西;手工构造的入参不在这条保证里。
 
     只认**顶层**的 ``properties`` / ``required``。``allOf`` / ``anyOf`` / ``$ref`` 拼出来的
     schema 里参数可能压根不在顶层,那种剥不掉 —— 解析 JSON-Schema 组合是另一个特性、有它
@@ -77,8 +80,12 @@ def strip_bound_params(input_schema: Mapping[str, Any], bound: Collection[str]) 
     required = input_schema.get("required")
     # 缺键与显式 null 都按「这一侧没有」算:没有就没什么可剥的,不构成剥了一半。
     props_ok = properties is None or isinstance(properties, Mapping)
-    # str 自己也是 Sequence,当成列表迭代会逐字符拆成垃圾,必须单独排除。
-    req_ok = required is None or (isinstance(required, Sequence) and not isinstance(required, str))
+    # 只认 list(JSON 唯一产得出的形状)与 tuple(行为等价,返回成 list)。别的 Sequence
+    # 一律按「形状不对」走下面整份退回那条路:``str`` 逐字符、``bytes`` / ``bytearray``
+    # 逐字节(``required=b"pc"`` 会剥成 ``[112, 99]``)、``range`` 逐整数,拆出来全是垃圾;
+    # 更糟的是 ``name in req`` 拿 str 去比 bytes 会抛 ``TypeError`` —— 而下面那句注释
+    # 承诺的是「降级,不抛」。用白名单不用黑名单,免得下一个 Sequence 类型又漏进来。
+    req_ok = required is None or isinstance(required, list | tuple)
     out: dict[str, Any] = {k: _copy_json(v) for k, v in input_schema.items()}
     # 一侧「在,但形状不对」(第三方给的畸形 schema)→ 整份原样退回,**绝不剥一半**。
     # 半剥的产物 —— 参数从 properties 没了却还留在 required —— 会让一部分厂商判定整个
@@ -117,10 +124,11 @@ def apply_arg_bindings(
     第二项只有**参数名**,绝不含值:它是给审计看的,而这些值就是客户的真实资料
     (项目号、姓名)。
 
-    返回的每一个 call 与入参**不共享任何可变对象**(见 :func:`_copy_json`),未绑定的那条
-    路也一样 —— 入参里的 ``args`` 是 AIMessage 身上活的那个 dict,递回去等于把图状态交给
-    下游随便改(``before_tool_dispatch`` 那一层本来就允许改写 ``tool_args``),改到的却是
-    checkpoint 里的那条消息。从 ``inputs`` 取来的值同理,复制一份再填。
+    返回的每一个 call 与入参之间没有共享的可变 **JSON 结构**(``dict`` / ``list``,见
+    :func:`_copy_json`),未绑定的那条路也一样 —— 入参里的 ``args`` 是 AIMessage 身上活的
+    那个 dict,递回去等于把图状态交给下游随便改(``before_tool_dispatch`` 那一层本来就允许
+    改写 ``tool_args``),改到的却是 checkpoint 里的那条消息。从 ``inputs`` 取来的值同理,
+    复制一份再填。JSON 之外的可变值(``set`` 等)不复制、仍然共享,同 :func:`_copy_json`。
     """
     filled: list[dict[str, Any]] = []
     names: list[str] = []

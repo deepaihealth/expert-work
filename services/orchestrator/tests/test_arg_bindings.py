@@ -184,11 +184,23 @@ def test_a_malformed_required_makes_the_whole_strip_a_no_op() -> None:
     半剥的产物(properties 里没了、required 里还在)正是让一部分厂商拒掉**整个工具**的
     那个形态,该 agent 的 MCP 工具会整片失踪。没剥掉只是模型多看见一个参数,值仍由
     ``apply_arg_bindings`` 用平台的覆盖 —— 两害相权,退回原样。降级,不抛。
+
+    非 list/tuple 的形状一个都不许放行:``str`` 逐字符、``bytes`` / ``bytearray`` 逐字节
+    (``b"pc"`` 会剥成 ``[112, 99]``)、``range`` 逐整数,而 bytes 那条还会在 ``name in req``
+    处直接抛 ``TypeError`` —— 「降级,不抛」这句承诺要经得起它们。
     """
-    schema = {"properties": {"project_code": {"type": "string"}}, "required": "project_code"}
-    out = strip_bound_params(schema, {"project_code"})
-    assert out == schema
-    assert out is not schema
+    bad_shapes: list[Any] = [
+        "project_code",
+        b"project_code",
+        bytearray(b"project_code"),
+        range(3),
+        {"project_code"},
+    ]
+    for bad in bad_shapes:
+        schema = {"properties": {"project_code": {"type": "string"}}, "required": bad}
+        out = strip_bound_params(schema, {"project_code"})
+        assert out == schema, f"{type(bad).__name__} 应该整份原样退回"
+        assert out is not schema
 
 
 def test_a_malformed_properties_makes_the_whole_strip_a_no_op() -> None:
