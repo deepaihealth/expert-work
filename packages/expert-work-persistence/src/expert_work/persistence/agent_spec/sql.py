@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import logging
-from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Any
 from uuid import UUID
 
-from pydantic import ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -20,6 +16,7 @@ from expert_work.persistence.agent_spec.base import (
     DuplicateAgentSpecError,
 )
 from expert_work.persistence.models import AgentSpecRevisionRow, AgentSpecRow
+from expert_work.persistence.stored_spec import load_stored_spec
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecDraft,
@@ -28,69 +25,6 @@ from expert_work.protocol import (
     AgentSpecStatus,
 )
 
-logger = logging.getLogger("expert_work.persistence.agent_spec")
-
-
-def _drop_key_at(payload: dict[str, Any], loc: tuple[int | str, ...]) -> str | None:
-    """Delete the key ``loc`` points at; return the path deleted, or ``None``.
-
-    ``loc`` 来自 pydantic 的错误项。判别式联合会在里面多插一段标签
-    (``('spec','tools',0,'mcp','future_key')`` 的那个 ``'mcp'``),原始 JSON 里
-    没有这一层,所以走不通的路径段直接跳过。
-    """
-    cursor: Any = payload
-    walked: list[str] = []
-    for part in loc[:-1]:
-        if isinstance(cursor, dict) and part in cursor:
-            cursor = cursor[part]
-        elif (
-            isinstance(cursor, list)
-            and isinstance(part, int)
-            and -len(cursor) <= part < len(cursor)
-        ):
-            cursor = cursor[part]
-        else:
-            continue  # 联合标签那一段,不是真实路径。
-        walked.append(str(part))
-    key = loc[-1]
-    if not isinstance(cursor, dict) or key not in cursor:
-        return None
-    del cursor[key]
-    walked.append(str(key))
-    return ".".join(walked)
-
-
-def _load_stored_spec(payload: dict[str, Any]) -> AgentSpec:
-    """Validate a manifest **we wrote ourselves**, ignoring keys we don't know.
-
-    写入严格、读回宽容(spec §七):YAML / 接口进来的配置照旧
-    ``extra="forbid"`` 挡错字,而从我们自己库里读回来的 ``spec_json`` 多一个
-    不认识的键 —— 新版本写的、回滚后的旧版本读的 —— 不该让整个 agent 起不来。
-    严格该管的是**人写的输入**,不是**我们自己写出去又读回来的数据**。这一条
-    一次性根治整类问题:此后任何新增 spec 字段都不再有回滚坑。
-
-    只在 ``extra_forbidden`` 这一种失败上剔键重试:无条件剔键会把真正的数据
-    损坏一起吞掉,那比要修的问题更糟。夹杂了别的错误也原样抛 —— 那一行并没有
-    被救回来,报的必须是完整的原因。
-    """
-    try:
-        return AgentSpec.model_validate(payload)
-    except ValidationError as exc:
-        errors = exc.errors()
-        if not all(e["type"] == "extra_forbidden" for e in errors):
-            raise
-        cleaned = deepcopy(payload)
-        dropped = [path for e in errors if (path := _drop_key_at(cleaned, tuple(e["loc"])))]
-        if not dropped:
-            raise
-        # 只记键名 —— 值里出现过客户的真实姓名,不进日志。
-        logger.warning(
-            "ignoring %d unknown key(s) in stored agent spec_json: %s",
-            len(dropped),
-            ", ".join(sorted(dropped)),
-        )
-        return AgentSpec.model_validate(cleaned)
-
 
 def _row_to_record(row: AgentSpecRow) -> AgentSpecRecord:
     return AgentSpecRecord(
@@ -98,7 +32,7 @@ def _row_to_record(row: AgentSpecRow) -> AgentSpecRecord:
         tenant_id=row.tenant_id,
         name=row.name,
         version=row.version,
-        spec=_load_stored_spec(row.spec_json),
+        spec=load_stored_spec(row.spec_json),
         spec_sha256=row.spec_sha256,
         status=AgentSpecStatus(row.status),
         created_by=row.created_by,
@@ -122,7 +56,7 @@ def _row_to_draft(row: AgentSpecRow) -> AgentSpecDraft | None:
     # read path, so trust the writers and let Pydantic reject a genuinely
     # malformed row.
     return AgentSpecDraft(
-        spec=_load_stored_spec(row.draft_spec_json),
+        spec=load_stored_spec(row.draft_spec_json),
         spec_sha256=row.draft_sha256 or "",
         updated_by=row.draft_updated_by or "",
         updated_at=row.draft_updated_at,  # type: ignore[arg-type]
@@ -136,7 +70,7 @@ def _revision_to_record(row: AgentSpecRevisionRow) -> AgentSpecRevisionRecord:
         agent_name=row.agent_name,
         agent_version=row.agent_version,
         revision=row.revision,
-        spec=_load_stored_spec(row.spec_json),
+        spec=load_stored_spec(row.spec_json),
         spec_sha256=row.spec_sha256,
         actor_id=row.actor_id,
         created_at=row.created_at,

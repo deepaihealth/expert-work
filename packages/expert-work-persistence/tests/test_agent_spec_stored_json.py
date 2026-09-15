@@ -16,16 +16,20 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from expert_work.persistence.agent_spec.sql import (
-    _load_stored_spec,
-    _revision_to_record,
-    _row_to_record,
+from expert_work.persistence.agent_spec.sql import _revision_to_record, _row_to_record
+from expert_work.persistence.models import (
+    AgentSpecRevisionRow,
+    AgentSpecRow,
+    PlatformAgentTemplateRow,
 )
-from expert_work.persistence.models import AgentSpecRevisionRow, AgentSpecRow
 from expert_work.persistence.platform_agent_template import compute_spec_sha256
+from expert_work.persistence.platform_agent_template.sql import (
+    _row_to_record as _template_row_to_record,
+)
+from expert_work.persistence.stored_spec import load_stored_spec
 from expert_work.protocol import AgentSpec, AgentSpecStatus, MCPToolSpec
 
-_LOGGER_NAME = "expert_work.persistence.agent_spec"
+_LOGGER_NAME = "expert_work.persistence.stored_spec"
 
 _SHA = "0" * 64
 
@@ -130,7 +134,7 @@ def test_reading_back_a_row_with_an_unknown_field_ignores_it() -> None:
     agent 起不来。"""
     row_json = _stored()
     row_json["spec"]["tools"][0]["from_a_future_version"] = ["x"]
-    loaded = _load_stored_spec(row_json)
+    loaded = load_stored_spec(row_json)
     assert loaded.spec.model.name == "glm-5.3"
     entry = loaded.spec.tools[0]
     assert isinstance(entry, MCPToolSpec)
@@ -139,7 +143,7 @@ def test_reading_back_a_row_with_an_unknown_field_ignores_it() -> None:
 
 
 def test_reading_back_an_intact_row_returns_it_unchanged() -> None:
-    loaded = _load_stored_spec(_stored())
+    loaded = load_stored_spec(_stored())
     assert loaded.metadata.name == "planner"
 
 
@@ -151,7 +155,7 @@ def test_reading_back_logs_the_key_it_ignored_but_never_the_value(
     row_json = _stored()
     row_json["spec"]["tools"][0]["from_a_future_version"] = "Zhang-San-lives-here"
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-        _load_stored_spec(row_json)
+        load_stored_spec(row_json)
     messages = [r.getMessage() for r in caplog.records]
     assert any("from_a_future_version" in m for m in messages), messages
     assert not any("Zhang-San-lives-here" in m for m in messages), messages
@@ -163,7 +167,7 @@ def test_reading_back_does_not_mutate_the_stored_payload() -> None:
     row_json = _stored()
     row_json["spec"]["tools"][0]["from_a_future_version"] = 1
     before = deepcopy(row_json)
-    _load_stored_spec(row_json)
+    load_stored_spec(row_json)
     assert row_json == before
 
 
@@ -173,7 +177,7 @@ def test_reading_back_a_row_broken_for_another_reason_still_raises() -> None:
     row_json = _stored()
     del row_json["spec"]["model"]["name"]
     with pytest.raises(ValidationError) as excinfo:
-        _load_stored_spec(row_json)
+        load_stored_spec(row_json)
     assert [(e["type"], e["loc"]) for e in excinfo.value.errors()] == [
         ("missing", ("spec", "model", "name"))
     ]
@@ -190,7 +194,7 @@ def test_a_broken_row_that_also_has_an_unknown_key_propagates_the_original_error
     row_json["spec"]["tools"][0]["from_a_future_version"] = 1
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
         with pytest.raises(ValidationError) as excinfo:
-            _load_stored_spec(row_json)
+            load_stored_spec(row_json)
     assert {e["type"] for e in excinfo.value.errors()} == {"missing", "extra_forbidden"}
     assert caplog.records == []
 
@@ -231,4 +235,33 @@ def test_the_revision_read_back_is_lenient() -> None:
     row_json = _stored()
     row_json["spec"]["tools"][0]["from_a_future_version"] = 1
     record = _revision_to_record(_revision_row(spec_json=row_json))
+    assert record.spec.metadata.name == "planner"
+
+
+def test_the_platform_template_read_back_is_lenient() -> None:
+    """平台模板目录是**第四处**读回点:同样是我们自己写进 JSONB 的 manifest,
+    同样按 ``AgentSpec`` 读回来。漏掉它,回滚就沿这条没人记得检查的路径继续坏
+    —— 模板目录整个起不来,又回到手改 JSONB。"""
+    row_json = _stored()
+    row_json["spec"]["tools"][0]["from_a_future_version"] = 1
+    now = datetime.now(UTC)
+    row = PlatformAgentTemplateRow(
+        id=uuid4(),
+        tenant_id=None,
+        name="planner",
+        version="1.0.0",
+        spec_json=row_json,
+        spec_sha256=_SHA,
+        display_name="Planner",
+        description="",
+        category="general",
+        icon=None,
+        required_tier="free",
+        status="draft",
+        enabled=True,
+        created_by="someone",
+        created_at=now,
+        updated_at=now,
+    )
+    record = _template_row_to_record(row)
     assert record.spec.metadata.name == "planner"
