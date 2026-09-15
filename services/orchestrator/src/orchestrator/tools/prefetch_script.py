@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import posixpath
@@ -103,25 +104,36 @@ def _fetch(
             if not content_type_ok(content_type):
                 return None, 0
             declared = response.headers.get("Content-Length")
-            if declared is not None and declared.isdigit() and int(declared) > MAX_FILE_BYTES:
+            declared_len = int(declared) if declared is not None and declared.isdigit() else None
+            if declared_len is not None and declared_len > MAX_FILE_BYTES:
                 return None, 0
             cap = min(MAX_FILE_BYTES, budget)
             body = response.read(cap + 1)
         if len(body) > cap:
+            return None, 0
+        # 服务端声明了长度却没发够(连接提前关闭):body 会被静默截断而不抛异常,
+        # 不比对就会把半张图片当命中存下——比不上不存,同其它失败一样降级。
+        if declared_len is not None and len(body) != declared_len:
             return None, 0
         name = target_name(var_name, path, pick_suffix(content_type, url))
         os.makedirs(dest_dir, exist_ok=True)
         with open(os.path.join(dest_dir, name), "wb") as handle:
             handle.write(body)
         return name, len(body)
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError, TimeoutError):
         return None, 0
 
 
 def main(argv: list[str]) -> int:
     inputs_path = argv[1]
-    with open(inputs_path, encoding="utf-8") as handle:
-        doc = json.load(handle)
+    try:
+        with open(inputs_path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        # 读不到 / 解不了 inputs.json(比如续跑时文件已被沙箱代码弄坏)——没有
+        # 文档就没有东西可预拉,同样不让 run 失败。
+        print(json.dumps({"prefetch": []}, ensure_ascii=False))
+        return 0
     run_dir = os.path.dirname(inputs_path)
     files_dir = os.path.join(run_dir, "files")
     rel_prefix = posixpath.join("inputs", os.path.basename(run_dir), "files")
