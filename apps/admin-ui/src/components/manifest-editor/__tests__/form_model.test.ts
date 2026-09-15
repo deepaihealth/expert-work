@@ -513,6 +513,22 @@ test("setMcpAllowTools preserves arg_bindings", () => {
   expect(bindingsOf(m)).toEqual(BINDINGS);
 });
 
+// The fourth writer of an mcp entry. Only stories / test seeding reach it today,
+// but it used to rebuild the entry from scratch — dropping ``servers`` as well as
+// ``arg_bindings`` when MCP was already on.
+test("setTool(mcp, on) leaves an already-present entry alone", () => {
+  const m = setTool(seedBindings(withBindings()), "mcp", true);
+  expect(bindingsOf(m)).toEqual(BINDINGS);
+  expect(readTools(m).mcpServers).toEqual(["deepcare"]);
+  expect(readTools(m).mcpAllowTools).toEqual(["customer_search"]);
+});
+
+test("setTool(mcp, off) still drops the entry", () => {
+  const m = setTool(seedBindings(withBindings()), "mcp", false);
+  expect(readTools(m).mcp).toBe(false);
+  expect(bindingsOf(m)).toBeUndefined();
+});
+
 describe("form_model preserve chain + immutability", () => {
   it("preserves apiVersion/kind/sandbox through a chain of edits", () => {
     let m = setName(seed, "renamed");

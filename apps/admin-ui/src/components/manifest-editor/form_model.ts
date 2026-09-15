@@ -751,11 +751,21 @@ export function setTool(
       tools: on ? [...without(isHttp), { type: "http" }] : without(isHttp),
     });
   }
+  // Like ``setBuiltinTool``, never rebuild an already-present entry: switching
+  // MCP "on" while it is already on must leave the entry alone. Rebuilding
+  // dropped ``servers`` and (since B-61) ``arg_bindings`` — neither is visible
+  // to this toggle, so both went silently. Only stories / test seeding reach
+  // this branch today (the MCP section writes through ``setMcp``), but it is
+  // exported production code and the next generic tool toggle wired to it
+  // would inherit the data loss.
   const isMcp = (t: ToolEntry): boolean => t.type === "mcp";
+  if (!on) {
+    return patchSpec(m, { tools: without(isMcp) });
+  }
   return patchSpec(m, {
-    tools: on
-      ? [...without(isMcp), { type: "mcp", allow_tools: [] }]
-      : without(isMcp),
+    tools: tools.some(isMcp)
+      ? tools
+      : [...tools, { type: "mcp", allow_tools: [] }],
   });
 }
 
