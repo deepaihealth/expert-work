@@ -1875,6 +1875,13 @@ git commit -m "feat(inputs): 预拉改内容寻址缓存——同 URL 跨轮只�
   接在既有三个 phase 之后(`run_once` 里那个 `for phase in (...)`)。
 - 阈值:`_INPUTS_TTL_S = 7 * 24 * 3600`,按 **mtime** 判定。
 
+**只做一条 TTL,不做水位驱逐**(2026-09-15 用户拍板):按最后引用时间过期这一条规则就够,先例都是这个形状
+(OpenAI vector store「最后活跃后 7 天」、Codespaces「30 天,连一次重置」、浏览器 LRU)。水位 + LRU + 归档分层
+先不做 —— 等真观测到「窗口内就把配额爆掉」再说。
+
+**「最后引用」必须真能观测到**:NFS 上 `atime` 基本不可信(多半 `noatime`/`relatime`),**不要拿 atime 当判据**。
+预拉命中缓存时由脚本显式 touch 该文件(`os.utime`),让 mtime 真正代表「最近被用到」。
+
 - [ ] **Step 1: 写失败的测试**
 
 ```python
