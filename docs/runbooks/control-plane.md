@@ -43,9 +43,10 @@ control-plane 是 M0 的 API 入口 + in-process orchestrator 宿主（STREAM-E 
      `acquire()` 时强制重建，见不到这类行。
    - 若查到了，说明年龄封顶没生效（`acquire()` 里 `_max_warm_age_s()`
      的年龄检查没跑到——比如复用路径被绕过、或该沙箱走的是不含此检查
-     的后端/路径）；orchestrator 日志查
-     `"warm sandbox %s past age cap"`（`agent_sandbox.py`）确认重建是否
-     真的触发过。
+     的后端/路径）；orchestrator 日志查 `"warm sandbox"` +
+     `"not reusable"`（`agent_sandbox.py`）确认重建是否真的触发
+     过——括号里的 reason 字面量区分是哪种重建：`warm_age_expired` 才是
+     年龄封顶，`layout_mismatch` 是 B-60 布局换代，与本节诊断无关。
 
 ## 处置
 

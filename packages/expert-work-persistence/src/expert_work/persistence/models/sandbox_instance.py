@@ -57,6 +57,12 @@ class SandboxInstanceRow(Base):
     destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     #: release / idle_timeout / cancelled / oom — ``None`` until terminal.
     destroy_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: B-60 —— 沙箱内布局版本(迁移 0155)。``'user-root'`` = NAS 直接挂 ``/workspace``
+    #: 的旧布局;``'agent-ns'`` = NAS 挂 ``/mnt/workspace``、每次 exec 在自己的命名空间
+    #: 里把 agent 目录 bind 成 ``/workspace``。``AgentSandboxClient.acquire`` 拿到与本
+    #: 进程不同布局的热会话就销毁重建(``destroy_reason='layout_mismatch'``)。字面量
+    #: 的单源在 ``sandbox_instance_store.SANDBOX_LAYOUT_*``,这里只是 server_default。
+    layout: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'user-root'"))
 
     __table_args__ = (
         Index("sandbox_instance_tenant_state_idx", "tenant_id", "state"),

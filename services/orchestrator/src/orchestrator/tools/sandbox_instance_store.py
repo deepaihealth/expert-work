@@ -36,27 +36,29 @@ class SandboxInstanceStore(Protocol):
     """
 
     async def claim_warm(
-        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str, datetime | None] | None:
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID, layout: str
+    ) -> tuple[UUID, str, datetime | None, str] | None:
         """占 ``(tenant, user)`` 的热会话坑(spec § 6.2 CAS)。
 
         ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` 的封装:
 
         * 占到 → 返回 ``None``,调用方负责建沙箱并回填 :meth:`set_container_id`。
         * 没占到、赢家已就绪(``container_id`` 非空)→ 返回
-          ``(赢家那一行的 sandbox_id, container_id, acquired_at)`` 三元组
-          —— **不是**只返回 container_id。调用方(``acquire``)本次调用开头
-          自己铸的 ``uuid4()`` 从未插入任何行;如果 ``acquire`` 复用热会话
-          成功后仍返回那个自铸 id,后续任何 ``destroy(sandbox_id=<那个
-          id>)`` 都会静默 no-op(``get_container_id`` 查不到、
-          ``mark_destroyed`` 的 ``WHERE id=...`` 影响 0 行,两处都不报错)
-          ——沙箱杀不掉,热会话槽位也放不出来。返回赢家的真实行 id 让
-          ``acquire`` 能直接复用它,不需要再多打一次库。第三元
-          ``acquired_at`` 是赢家那一行的 ``acquired_at``(可能为
-          ``None``)——供 ``AgentSandboxClient.acquire`` 做热会话年龄封顶
-          (#1b:超过 ``egress_token_ttl_s // 2`` 强制重建,``None`` 时年龄
-          不可知、不封顶),两个实现都是同一次 SELECT 顺带取出,零额外
-          往返。
+          ``(赢家那一行的 sandbox_id, container_id, acquired_at, layout)``
+          四元组 —— **不是**只返回 container_id。调用方(``acquire``)本次
+          调用开头自己铸的 ``uuid4()`` 从未插入任何行;如果 ``acquire``
+          复用热会话成功后仍返回那个自铸 id,后续任何
+          ``destroy(sandbox_id=<那个 id>)`` 都会静默 no-op
+          (``get_container_id`` 查不到、``mark_destroyed`` 的
+          ``WHERE id=...`` 影响 0 行,两处都不报错)——沙箱杀不掉,热会话
+          槽位也放不出来。返回赢家的真实行 id 让 ``acquire`` 能直接复用它,
+          不需要再多打一次库。第三元 ``acquired_at`` 是赢家那一行的
+          ``acquired_at``(可能为 ``None``)——供
+          ``AgentSandboxClient.acquire`` 做热会话年龄封顶(#1b:超过
+          ``egress_token_ttl_s // 2`` 强制重建,``None`` 时年龄不可知、不
+          封顶),两个实现都是同一次 SELECT 顺带取出,零额外往返。第四元
+          ``layout`` 是赢家那一行建时写的布局(B-60),供 ``acquire`` 判是否
+          需要 ``layout_mismatch`` 重建;同样是同一次 SELECT 顺带取出。
         * 没占到、赢家还在创建中(``container_id`` 仍是 NULL)且这行**还没
           超过** ``_STUCK_CREATE_TTL_S`` → 允许实现 raise(两个生产实现都
           如此)。E2B 冷启实测 35-40s(见探针报告),这不是罕见边界窗口,
@@ -78,7 +80,7 @@ class SandboxInstanceStore(Protocol):
           ``acquire`` 抢行。行的年龄无从判断时(时间戳缺失)不接管。
         """
 
-    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
+    async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID, layout: str) -> None:
         """Task 10 实测发现的缺口(task-10-report.md):不带 ``user_id`` 的
         临时沙箱从不经过 :meth:`claim_warm`,过去没有方法给它做初始
         INSERT——``acquire`` 结尾的 :meth:`set_container_id` 因此是对从未

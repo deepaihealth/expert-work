@@ -112,6 +112,7 @@ from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
+from expert_work.persistence.sandbox_instance_store import SANDBOX_LAYOUT_USER_ROOT
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
 from orchestrator.tools.nas_workspace_store import workspace_deleted_marker, workspace_user_root
 from orchestrator.tools.sandbox import (
@@ -206,6 +207,12 @@ _WARM_AGE_DESTROY_REASON = "warm_age_expired"
 #: 一个字面量,方便运维在 ``destroy_reason`` 列里按根因区分这条与
 #: ``"create_failed"``/``"post_create_failed"``。
 _WORKSPACE_DELETED_RACE_REASON = "workspace_deleted_race"
+
+#: ``destroy_reason`` written when :meth:`AgentSandboxClient.acquire` finds a warm
+#: session whose ``sandbox_instance.layout`` is not the one this build lays out
+#: (B-60 spec §4.6). Rebuilt through the same path as ``_WARM_AGE_DESTROY_REASON``;
+#: a distinct literal so an operator can tell "换代" from "token 快到期" in the column.
+_LAYOUT_MISMATCH_DESTROY_REASON = "layout_mismatch"
 
 #: :meth:`AgentSandboxClient.exec` 兜底分支判"这是超时"的时长门槛,按
 #: ``effective`` 的比例算。envd 掐断一条跑满时限的命令时,SDK 抛的**不总是**
@@ -362,6 +369,10 @@ class AgentSandboxClient:
     #: 沙箱内路径 —— 与 :data:`WORKSPACE_ROOT`(沙箱内挂载点,恒为
     #: ``/workspace``)是两个不同维度的常量,不要混淆。
     workspace_root: str | None = None
+    #: B-60 —— 本进程给热会话铺的沙箱内布局;写进每一行,``acquire`` 拿到不同值的热会话
+    #: 就 ``layout_mismatch`` 重建。PR-B 先落 ``user-root``(零行为变化),PR-C 随 exec
+    #: 命令串一起翻成 ``SANDBOX_LAYOUT_AGENT_NS``。
+    layout: str = SANDBOX_LAYOUT_USER_ROOT
     #: 沙箱迁移波 3 —— 可选工作区配额闸。None(默认)= 无闸,行为与波 2
     #: 完全一致(本地 compose / 未配 NAS 的部署)。control-plane 在 app.py
     #: 里 post-assign(照 resolved_workspace_store.http 的先例),不走
@@ -565,7 +576,7 @@ class AgentSandboxClient:
             # 闸 A(spec § 3.3):已超才拦(>=)。放在 claim_warm 之前——
             # 拦下时不留任何 store 行。
             await self.quota_gate.check(tenant_id=tenant_id, user_id=user_id)
-        existing: tuple[UUID, str, datetime | None] | None = None
+        existing: tuple[UUID, str, datetime | None, str] | None = None
         if user_id is not None:
             existing = await self._claim_warm(
                 tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
@@ -573,8 +584,14 @@ class AgentSandboxClient:
 
         just_created = False
         if existing is not None:
-            winner_id, winner_container_id, winner_acquired_at = existing
-            if (
+            winner_id, winner_container_id, winner_acquired_at, winner_layout = existing
+            # B-60 —— 两种「不能复用,必须重建」走同一条路:destroy 真 kill + 清行,重占坑,
+            # 往下落进重建分支。布局不合先判、更硬:年龄只是「快到期」,布局是「跑不了」
+            # (旧热会话的 NAS 还挂在 /workspace,新命令串第一条 bind 就失败)。
+            rebuild_reason: str | None = None
+            if winner_layout != self.layout:
+                rebuild_reason = _LAYOUT_MISMATCH_DESTROY_REASON
+            elif (
                 winner_acquired_at is not None
                 and (_utc_now() - winner_acquired_at).total_seconds() > self._max_warm_age_s()
             ):
@@ -585,12 +602,18 @@ class AgentSandboxClient:
                 # destroy 与重占坑之间输给第三方竞争者时的安全性,与下面
                 # connect-失败分支同一套推理(重占坑返回值同样弃用,输了则
                 # set_container_id 按契约抛错、Important-6 守卫拆新沙箱)。
+                rebuild_reason = _WARM_AGE_DESTROY_REASON
+            if rebuild_reason is not None:
                 logger.info(
-                    "warm sandbox %s past age cap (%ss), rebuilding for a fresh egress token",
+                    "warm sandbox %s not reusable (%s; layout=%s wanted=%s; age cap %ss),"
+                    " rebuilding",
                     winner_id,
+                    rebuild_reason,
+                    winner_layout,
+                    self.layout,
                     self._max_warm_age_s(),
                 )
-                await self.destroy(sandbox_id=winner_id, reason=_WARM_AGE_DESTROY_REASON)
+                await self.destroy(sandbox_id=winner_id, reason=rebuild_reason)
                 if user_id is not None:
                     await self._claim_warm(
                         tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
@@ -989,11 +1012,11 @@ class AgentSandboxClient:
 
     async def _claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
-    ) -> tuple[UUID, str, datetime | None] | None:
+    ) -> tuple[UUID, str, datetime | None, str] | None:
         """``store.claim_warm`` 套上 § 6.5 的统一错误契约。"""
         try:
             return await self.store.claim_warm(
-                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id, layout=self.layout
             )
         except Exception as exc:
             raise SandboxSupervisorError(f"sandbox warm-session claim failed: {exc}") from exc
@@ -1001,7 +1024,9 @@ class AgentSandboxClient:
     async def _create_ephemeral_row(self, *, tenant_id: UUID, sandbox_id: UUID) -> None:
         """``store.create_ephemeral`` 套上 § 6.5 的统一错误契约(同 :meth:`_claim_warm`)。"""
         try:
-            await self.store.create_ephemeral(tenant_id=tenant_id, sandbox_id=sandbox_id)
+            await self.store.create_ephemeral(
+                tenant_id=tenant_id, sandbox_id=sandbox_id, layout=self.layout
+            )
         except Exception as exc:
             raise SandboxSupervisorError(f"sandbox row creation failed: {exc}") from exc
 
