@@ -38,29 +38,66 @@ def bindings_by_tool(
     return {e.tool: dict(e.args) for e in entries if e.server == server}
 
 
+def _copy_json(value: Any) -> Any:
+    """递归复制 JSON 容器:``dict`` / ``list`` 各造一份新的,别的原样返回。
+
+    **复制到什么深度、为什么够**:一路到底,但只穿 ``dict`` 与 ``list``。JSON 里除这
+    两样之外(``str`` / 数字 / ``bool`` / ``None``)全不可变,共享它们改不坏谁;能改坏
+    人的只有这两种容器,所以穿完它们就没有残留的共享可变对象了。
+
+    **为什么不是 ``copy.deepcopy``**:它要按 ``__deepcopy__`` / pickle 协议去复制**任意**
+    对象,而这里的 schema 是第三方 MCP 服务的 ``inputSchema``、``json.loads`` 出来的纯
+    容器,根本没有那种东西;显式只认 dict/list,行为可预期,也不会顺手把谁的对象克隆出
+    副作用来。
+
+    **深度不封顶会不会爆栈**:不会。这份结构本来就是 ``json.loads`` 解析出来的,解析时
+    已经受同一套递归上限约束 —— 能进得来的深度,再走一遍同样深的递归就还在限内。封一个
+    深度上限反而更糟:超过上限的那截又变成共享,就是另一种「拷贝了一半」。
+    """
+    if isinstance(value, Mapping):
+        return {k: _copy_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_json(v) for v in value]
+    return value
+
+
 def strip_bound_params(input_schema: Mapping[str, Any], bound: Collection[str]) -> dict[str, Any]:
     """返回一份新 schema:删掉被绑定的参数,并从 ``required`` 里移除。
 
-    输入原样不动 —— 同一个 schema 对象来自 MCP 目录、多个 agent 共享,就地改会串味。
+    返回值与入参**不共享任何可变对象**(见 :func:`_copy_json`),每条返回路径都如此 ——
+    同一个 ``inputSchema`` 对象由 MCP 目录持有、被多个 agent 的注册项共享,谁改一下我们
+    交回去的东西,原件就跟着变,别人看到的工具也跟着变。
+
+    只认**顶层**的 ``properties`` / ``required``。``allOf`` / ``anyOf`` / ``$ref`` 拼出来的
+    schema 里参数可能压根不在顶层,那种剥不掉 —— 解析 JSON-Schema 组合是另一个特性、有它
+    自己的正确性负担,这里不做。退化行为与下面「形状不对」一致:参数仍被模型看见,但值照旧
+    由 :func:`apply_arg_bindings` 用平台的覆盖,事故不会复发。
     """
     properties = input_schema.get("properties")
-    props: Mapping[str, Any] = properties if isinstance(properties, Mapping) else {}
     required = input_schema.get("required")
+    # 缺键与显式 null 都按「这一侧没有」算:没有就没什么可剥的,不构成剥了一半。
+    props_ok = properties is None or isinstance(properties, Mapping)
     # str 自己也是 Sequence,当成列表迭代会逐字符拆成垃圾,必须单独排除。
-    req: Sequence[Any] | None = (
-        required if isinstance(required, Sequence) and not isinstance(required, str) else None
-    )
+    req_ok = required is None or (isinstance(required, Sequence) and not isinstance(required, str))
+    out: dict[str, Any] = {k: _copy_json(v) for k, v in input_schema.items()}
+    # 一侧「在,但形状不对」(第三方给的畸形 schema)→ 整份原样退回,**绝不剥一半**。
+    # 半剥的产物 —— 参数从 properties 没了却还留在 required —— 会让一部分厂商判定整个
+    # 工具非法,该 agent 的 MCP 工具于是整片失踪,比一个参数没剥掉严重得多。降级,不抛:
+    # spec §5.4 要的是别阻断 run。而没剥掉还有第二道闸:填值那步照样覆盖模型给的值。
+    if not (props_ok and req_ok):
+        return out
+    props: Mapping[str, Any] = properties if isinstance(properties, Mapping) else {}
+    req: Sequence[Any] = required if required is not None else ()
     # properties 与 required 两边都算。只看 properties 的话,一个只写在 required 里的
-    # 被绑参数会留在 required 而 properties 里没有 —— 部分厂商据此判定整个工具非法,
-    # 该 agent 的 MCP 工具会整片失踪,比漏剥一个参数严重得多。
-    removed = {name for name in bound if name in props or (req is not None and name in req)}
+    # 被绑参数会留在 required 而 properties 里没有 —— 同样是上面那个 dangling-required。
+    removed = {name for name in bound if name in props or name in req}
     if not removed:
-        return dict(input_schema)
-    out = dict(input_schema)
-    if isinstance(properties, Mapping):
-        out["properties"] = {k: v for k, v in props.items() if k not in removed}
-    if req is not None:
-        out["required"] = [name for name in req if name not in removed]
+        return out
+    # out 里这两个已经是独立副本,直接筛出新的即可。
+    if properties is not None:
+        out["properties"] = {k: v for k, v in out["properties"].items() if k not in removed}
+    if required is not None:
+        out["required"] = [name for name in out["required"] if name not in removed]
     return out
 
 
@@ -79,20 +116,27 @@ def apply_arg_bindings(
 
     第二项只有**参数名**,绝不含值:它是给审计看的,而这些值就是客户的真实资料
     (项目号、姓名)。
+
+    返回的每一个 call 与入参**不共享任何可变对象**(见 :func:`_copy_json`),未绑定的那条
+    路也一样 —— 入参里的 ``args`` 是 AIMessage 身上活的那个 dict,递回去等于把图状态交给
+    下游随便改(``before_tool_dispatch`` 那一层本来就允许改写 ``tool_args``),改到的却是
+    checkpoint 里的那条消息。从 ``inputs`` 取来的值同理,复制一份再填。
     """
     filled: list[dict[str, Any]] = []
     names: list[str] = []
     for call in tool_calls:
         bound = bindings.get(str(call.get("name", "")))
+        new_call: dict[str, Any] = {k: _copy_json(v) for k, v in call.items()}
         if not bound:
-            filled.append(dict(call))
+            filled.append(new_call)
             continue
-        args = dict(call.get("args") or {})
+        args = dict(new_call.get("args") or {})
         for param, var_name in bound.items():
             if var_name in inputs:
-                args[param] = inputs[var_name]
+                args[param] = _copy_json(inputs[var_name])
                 names.append(param)
             else:
                 args.pop(param, None)
-        filled.append({**call, "args": args})
+        new_call["args"] = args
+        filled.append(new_call)
     return filled, names

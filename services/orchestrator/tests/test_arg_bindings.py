@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from expert_work.protocol import ArgBindingSpec
 from orchestrator.tools.arg_bindings import (
     apply_arg_bindings,
@@ -35,8 +37,44 @@ def test_stripping_removes_the_property_and_the_required_entry() -> None:
     assert set(SCHEMA["properties"]) == {"project_code", "keyword"}
 
 
+def _nested_schema() -> dict[str, Any]:
+    """带一层嵌套的 schema,每次现造一份 —— 纯度用例要改返回值,共享常量会被改花。"""
+    return {
+        "type": "object",
+        "properties": {
+            "project_code": {"type": "string"},
+            "keyword": {"type": "string", "enum": ["a", "b"]},
+        },
+        "required": ["project_code", "keyword"],
+    }
+
+
 def test_stripping_an_absent_param_is_a_no_op() -> None:
     assert strip_bound_params(SCHEMA, {"nope"}) == SCHEMA
+    # 上面那行单独在这儿证不了「不碰入参」:`==` 分不开「拷贝」和「就是入参那个对象」。
+    # 什么都不用剥的这条路最容易漏 —— 直接把入参递回去,`==` 照样绿。
+    schema = _nested_schema()
+    out = strip_bound_params(schema, {"nope"})
+    assert out is not schema
+    assert out["properties"] is not schema["properties"]
+    assert out["required"] is not schema["required"]
+    assert out["properties"]["keyword"] is not schema["properties"]["keyword"]
+    assert out["properties"]["keyword"]["enum"] is not schema["properties"]["keyword"]["enum"]
+    out["properties"]["keyword"]["enum"].append("z")
+    out["properties"]["injected"] = {"type": "string"}
+    out["required"].append("injected")
+    assert schema == _nested_schema(), "改返回值不能改到入参"
+
+
+def test_the_stripped_schema_shares_no_mutable_object_with_its_input() -> None:
+    """剥过的那条路同样要独立 —— 留下来的参数的子 schema 最容易被共享着递出去。"""
+    schema = _nested_schema()
+    out = strip_bound_params(schema, {"project_code"})
+    assert out["properties"]["keyword"] is not schema["properties"]["keyword"]
+    assert out["properties"]["keyword"]["enum"] is not schema["properties"]["keyword"]["enum"]
+    out["properties"]["keyword"]["enum"].append("z")
+    out["required"].append("injected")
+    assert schema == _nested_schema(), "改返回值不能改到入参"
 
 
 def test_apply_fills_the_bound_arg_from_this_runs_inputs() -> None:
@@ -70,10 +108,37 @@ def test_a_model_supplied_value_never_wins_over_the_binding() -> None:
 
 
 def test_unbound_tools_pass_through_untouched() -> None:
-    calls = [{"name": "exec_python", "args": {"code": "print(1)"}, "id": "c1"}]
+    calls: list[dict[str, Any]] = [
+        {"name": "exec_python", "args": {"code": "print(1)", "env": {"K": "v"}}, "id": "c1"}
+    ]
     filled, names = apply_arg_bindings(calls, bindings={}, inputs={"pc": "x"})
     assert filled == calls
     assert names == []
+    # 「原样透传」不等于「把原对象递回去」:入参里的 args 是 AIMessage 身上活的那个
+    # dict,递回去等于把图状态交给下游随便改。`==` 分不开这两件事,身份断言才分得开。
+    assert filled[0] is not calls[0]
+    assert filled[0]["args"] is not calls[0]["args"]
+    assert filled[0]["args"]["env"] is not calls[0]["args"]["env"]
+    filled[0]["args"]["env"]["K"] = "改了"
+    filled[0]["args"]["injected"] = 1
+    assert calls[0]["args"] == {"code": "print(1)", "env": {"K": "v"}}
+
+
+def test_the_filled_call_shares_no_mutable_object_with_call_or_inputs() -> None:
+    """绑定过的那条路同样要独立,而且从 ``inputs`` 取来的值也得复制一份再填。"""
+    calls: list[dict[str, Any]] = [
+        {"name": "mcp__deepcare__t1", "args": {"filters": {"age": [1, 2]}}, "id": "c1"}
+    ]
+    inputs: dict[str, Any] = {"pc": {"code": "PRJ001", "tags": ["a"]}}
+    filled, _ = apply_arg_bindings(
+        calls, bindings={"mcp__deepcare__t1": {"project_code": "pc"}}, inputs=inputs
+    )
+    assert filled[0]["args"]["filters"] is not calls[0]["args"]["filters"]
+    assert filled[0]["args"]["project_code"] is not inputs["pc"]
+    filled[0]["args"]["filters"]["age"].append(3)
+    filled[0]["args"]["project_code"]["tags"].append("b")
+    assert calls[0]["args"] == {"filters": {"age": [1, 2]}}
+    assert inputs == {"pc": {"code": "PRJ001", "tags": ["a"]}}
 
 
 # --------------------------------------------------------------------------
@@ -111,6 +176,27 @@ def test_a_bound_param_listed_only_in_required_is_still_dropped_from_required() 
     """
     schema = {"type": "object", "properties": {}, "required": ["project_code"]}
     assert strip_bound_params(schema, {"project_code"})["required"] == []
+
+
+def test_a_malformed_required_makes_the_whole_strip_a_no_op() -> None:
+    """``required`` 在、但不是列表形状 → 一个参数都不剥,而不是只剥 properties 那半边。
+
+    半剥的产物(properties 里没了、required 里还在)正是让一部分厂商拒掉**整个工具**的
+    那个形态,该 agent 的 MCP 工具会整片失踪。没剥掉只是模型多看见一个参数,值仍由
+    ``apply_arg_bindings`` 用平台的覆盖 —— 两害相权,退回原样。降级,不抛。
+    """
+    schema = {"properties": {"project_code": {"type": "string"}}, "required": "project_code"}
+    out = strip_bound_params(schema, {"project_code"})
+    assert out == schema
+    assert out is not schema
+
+
+def test_a_malformed_properties_makes_the_whole_strip_a_no_op() -> None:
+    """``properties`` 那一侧的镜像情形,同样不许剥出半成品。"""
+    schema = {"properties": ["project_code"], "required": ["project_code"]}
+    out = strip_bound_params(schema, {"project_code"})
+    assert out == schema
+    assert out["required"] == ["project_code"]
 
 
 def test_a_forged_value_is_dropped_when_the_variable_is_absent() -> None:
