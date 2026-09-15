@@ -509,7 +509,7 @@ async def test_sweep_removes_expired_cache_files_and_run_dirs(tmp_path: Path) ->
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (1, 1)
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (1, 1)
     assert not stale_entry.exists() and fresh_entry.exists()
     assert not stale_run.exists() and fresh_run.exists()
 
@@ -534,7 +534,7 @@ async def test_sweep_never_touches_a_recently_written_run_dir(tmp_path: Path) ->
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert stats.inputs_dirs_removed == 0
+    assert stats.reclaim_dirs_removed == 0
     assert doc.exists()
 
 
@@ -563,7 +563,7 @@ async def test_sweep_ignores_dirs_that_are_not_uuid_shaped(tmp_path: Path) -> No
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (0, 0)
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 0)
     assert stranger.is_dir() and kept.exists() and loose.exists() and cache.is_dir()
     assert hexish.is_dir()
 
@@ -583,7 +583,7 @@ async def test_reclaim_lands_in_the_same_cycle_size_accounting(tmp_path: Path) -
 
     worker, workspaces, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert stats.inputs_dirs_removed == 1
+    assert stats.reclaim_dirs_removed == 1
     row = await workspaces.get(tenant_id=tenant, user_id=user)
     assert row is not None and row.size_bytes == 100  # 那 5000 字节同一轮里就没了
 
@@ -603,7 +603,7 @@ async def test_disabled_policies_delete_nothing(tmp_path: Path) -> None:
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (0, 0)
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 0)
     assert upload.exists()
 
 
@@ -627,7 +627,7 @@ async def test_a_leftover_tmp_file_is_reclaimed(tmp_path: Path) -> None:
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert stats.inputs_files_removed == 1
+    assert stats.reclaim_files_removed == 1
     assert not leftover.exists()
 
 
@@ -674,7 +674,7 @@ async def test_inputs_scan_failure_does_not_stop_other_users(
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert stats.inputs_dirs_removed == 2  # 同用户的兄弟 agent + 另一个租户的用户
+    assert stats.reclaim_dirs_removed == 2  # 同用户的兄弟 agent + 另一个租户的用户
     assert not sibling_run.exists() and not good_run.exists()
     assert bad_run.exists()  # 打不开的那棵原样留着,不是「删不掉就当没有」
 
@@ -717,7 +717,7 @@ async def test_sweep_does_not_follow_a_symlinked_scan_base(tmp_path: Path) -> No
     assert victim_dir.is_dir() and victim_file.exists()  # 一个都没少
     assert swapped.is_symlink() and (cache_swapped / "cache").is_symlink()  # 软链自己也不删
     # phase 没被这两条带走:同一轮里正常用户的过期目录照收(且只收了它)
-    assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (0, 1)
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 1)
     assert not innocent_run.exists()
 
 
@@ -758,7 +758,7 @@ async def test_sweep_does_not_traverse_a_symlinked_intermediate_segment(tmp_path
     assert victim_entry.exists()  # 中间段是软链 → 一步都不许进去
     assert evil.is_symlink()  # 软链自己也不删
     assert not sibling_entry.exists()  # 同一轮里正常 agent 照收 —— phase 没被带走
-    assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (1, 0)
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (1, 0)
 
 
 def test_every_policy_has_an_explicit_target_entry() -> None:
@@ -831,7 +831,7 @@ async def test_archiving_is_skipped_on_a_non_durable_object_store_but_reclaim_st
     assert doomed.exists() and (doomed / "keep.txt").exists()  # 没档案就别删数据
     row = await workspaces.get(tenant_id=tenant, user_id=user)
     assert row is None or row.archived_object_key is None
-    assert stats.inputs_dirs_removed == 1 and not stale_run.exists()  # 回收照跑
+    assert stats.reclaim_dirs_removed == 1 and not stale_run.exists()  # 回收照跑
 
 
 def test_cache_ttl_outlives_the_run_dir_that_names_it() -> None:

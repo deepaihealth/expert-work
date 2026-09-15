@@ -152,10 +152,11 @@ _CACHE_TTL_S = _RUN_DIR_TTL_S + CACHE_TTL_S + 2 * 24 * 3600
 #: 它们删的是用户数据,需要产品定 N、需要发布前告知、还要对外删除端点(B-62)当自救
 #: 出口,那是 B-63 的事。机制一次写好,B-63 落地时是把开关拨开 + 接 touch 点,不是重写。
 #:
-#: **B-63 拨开关前要先处理的两件事**(不然拨开当天就说谎):① ``JanitorRunStats`` 的
-#: ``inputs_files_removed`` / ``inputs_dirs_removed`` 是**所有策略合计**,uploads 的删除会
-#: 计进名字里写着 inputs 的字段 —— 先拆开或改名;② ``uploads`` 的落点只覆盖三处之一
-#: (见 :data:`_TARGETS`)。
+#: **B-63 拨开关前还欠一笔**:``uploads`` 的落点只覆盖三处之一(见 :data:`_TARGETS`),
+#: 拨开关之前得先补第二条遍历,否则它只收三分之一还不会说话。
+#: (另一笔已经清掉:``JanitorRunStats`` 的两个计数器原名 ``inputs_*``,拨开关那天会把
+#: 上传件的删除计进名字里写着 inputs 的字段,已改名成 ``reclaim_*``;它们仍是**所有策略
+#: 合计**,要按策略分开看的是 ``reclaim_summary`` 日志里的 ``by_policy=``。)
 _POLICIES = (
     _ReclaimPolicy(label="inputs_cache", ttl_s=_CACHE_TTL_S, enabled=True),
     _ReclaimPolicy(label="inputs_run_dir", ttl_s=_RUN_DIR_TTL_S, enabled=True),
@@ -480,8 +481,8 @@ class JanitorRunStats:
     refreshed: int = 0
     scratch_removed: int = 0
     #: ``_sweep_agent_inputs`` 这一轮收掉的条目数(按 :data:`_POLICIES` 全部策略合计)。
-    inputs_files_removed: int = 0
-    inputs_dirs_removed: int = 0
+    reclaim_files_removed: int = 0
+    reclaim_dirs_removed: int = 0
     skipped: bool = False
 
 
@@ -715,8 +716,8 @@ class WorkspaceJanitorWorker:
                 for label, (files, dirs) in tally.items():
                     had_files, had_dirs = totals[label]
                     totals[label] = (had_files + files, had_dirs + dirs)
-                    stats.inputs_files_removed += files
-                    stats.inputs_dirs_removed += dirs
+                    stats.reclaim_files_removed += files
+                    stats.reclaim_dirs_removed += dirs
         # 每轮一条汇总(即使是 0):这是一条不可逆的删除 phase,「这一轮跑过、收了多
         # 少」本身就是要能在日志里查到的事实。逐 (tenant, user, agent, policy) 的明细
         # 由 _reclaim_user 在真删掉东西时记,空轮不产生任何明细行。
