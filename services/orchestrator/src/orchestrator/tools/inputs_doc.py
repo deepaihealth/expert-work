@@ -92,6 +92,12 @@ def _walk(value: Any, prefix: tuple[str | int, ...]) -> list[tuple[tuple[str | i
     if isinstance(value, Mapping):
         found: list[tuple[tuple[str | int, ...], str]] = []
         for key, item in value.items():
+            # inputs 是第三方调用方直接传的 JSON,调用方可能自己就塞了一个叫
+            # local_path 的字段(值可以是任意字符串,包括 URL);不挡住它会被
+            # 当成待预拉的 site,预拉后又被平台自己的 local_path 覆盖——等于把
+            # 调用方指定的地址喂给沙箱的出网请求。这里挡的是租户输入,不是只挡
+            # 本模块自己回填的值,删掉前先看
+            # test_local_path_key_supplied_by_caller_is_not_a_url_site。
             if key == "local_path":
                 continue
             found.extend(_walk(item, (*prefix, str(key))))

@@ -146,3 +146,25 @@ def test_iter_url_sites_is_stable_across_backfill() -> None:
         backfilled = with_local_path(backfilled, site, f"inputs/{RUN}/files/{site.var_name}")
 
     assert iter_url_sites(backfilled) == sites_before
+
+
+def test_local_path_key_supplied_by_caller_is_not_a_url_site() -> None:
+    """``inputs`` 是租户直接传的 JSON,调用方可能自己就带了一个叫 ``local_path``
+    的字段(值是 URL)。这个字段不该被当成预拉目标——只有 ``url`` 才算。"""
+    doc = build_inputs_doc(
+        run_id=RUN,
+        variables=[_var("materials")],
+        inputs={
+            "materials": [
+                {
+                    "description": "x",
+                    "url": "https://ok/a.mp4",
+                    "local_path": "https://attacker/b.mp4",
+                }
+            ]
+        },
+    )
+    assert doc is not None
+    assert iter_url_sites(doc) == [
+        UrlSite(var_name="materials", path=(0, "url"), url="https://ok/a.mp4"),
+    ]
