@@ -172,9 +172,10 @@ EXPERT_WORK_INPUTS=/workspace/inputs/<run_id>/inputs.json
 
 实际后果:每一轮对话都是新的 `run_id` → 重新物化 + 重新下载,单 run 最多 128 MiB,一直堆到用户工作区被 purge。
 
-**处置**:清理是**独立任务**,并且是**生产前置闸**(测试环境可以先跑,涨了看得见)。判据:按 mtime 扫
+**处置**:清理是**独立任务**,与本程序**同一批发测试环境**(2026-09-15 用户拍板:不是生产前置——清扫是删文件的,不在测试环境演练过就上生产,等于第一次删是在生产删)。判据:按 mtime 扫
 `agents/*/inputs/<uuid>/`,或给每个 agent 的 `inputs/` 定个上限;**必须避开正在跑的 run 的目录**。
-这条不塞进 PR-A —— janitor 在 control-plane,属另一个服务面,而且误删正在跑的 run 目录会当场打断执行。
+这条不塞进 PR-A(janitor 在 control-plane,属另一个服务面,而且误删正在跑的 run 目录会当场打断执行),而是单开 PR-A2,
+与 A/B 同批发布;计划里的 T11(内容寻址缓存)+ T12(janitor 回收)就是它。
 
 ---
 
@@ -253,7 +254,7 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
 
 **回滚的坑(必须写进发布清单)**:`MCPToolSpec` 是 `extra="forbid"`,**旧版本读到带 `arg_bindings` 的 manifest 会校验失败**——不是行为退化,是那些 agent 直接起不来。处置:回滚窗口内先别配绑定;或回滚前先清掉绑定配置。与 B-50 那次「回滚窗口在数据搬迁之前」同类。
 
-**无 DB 迁移**:绑定存在 `spec_json`(JSONB)里。`inputs/` 的清理见 §4.6 勘误 —— 现有 janitor **不**管它,需要单开任务,生产前必须落地。
+**无 DB 迁移**:绑定存在 `spec_json`(JSONB)里。`inputs/` 的清理见 §4.6 勘误 —— 现有 janitor **不**管它,由 PR-A2(计划 T11/T12)补上,与本程序同批发测试环境。
 
 ---
 

@@ -1751,7 +1751,7 @@ git commit -m "docs: B-61 对外文档 + #1235 addendum + ROADMAP 销案"
 
 ---
 
-## Task 10: 真栈验收
+## Task 10: 真栈验收(最后跑 —— 在 T11/T12 之后)
 
 **不是代码任务。** 逐条打勾,任一条不过就停。**不碰对接方的两个 agent**。
 
@@ -1769,9 +1769,154 @@ git commit -m "docs: B-61 对外文档 + #1235 addendum + ROADMAP 销案"
 - [ ] **Step 4: 绑定面** —— 给探针 agent 配一个 MCP 工具的参数绑定,跑一次。
   Expected:模型的 tool catalog 里没有该参数(查 run_event 的工具 schema 快照);`TOOL_CALL` 审计行的 `bound_args` 列出该参数名且不含值;MCP 服务端收到的就是 inputs 里的值。
 
+- [ ] **Step 4.5: 缓存与清扫(T11/T12 的验收,与本批同一次发布一起验)**
+  - **缓存真命中**:同一 agent 连跑两轮同样的变量 —— 第二轮预拉报告里该 URL `hit=true` 且 `bytes=0`;
+    NAS 上 `agents/<key>/inputs/cache/` 只有一份文件。
+  - **清扫删对了**:control-plane pod 里手动跑一次 janitor 的 `run_once()`,确认超期的 `cache/` 文件与 per-run 目录消失、
+    体积记账跟着刷新。
+  - **清扫没误删**(关键):起一个正在跑的 run,同时触发 janitor,确认它的 `inputs/<run_id>/inputs.json` **没被动**。
+    前两条只证明它删了该删的,这条才证明它没删不该删的 —— 而删错会当场打断执行。
+
 - [ ] **Step 5: 回滚演练的前置确认** —— 确认发布清单里写了 `MCPToolSpec` 是 `extra="forbid"`、回滚窗口内先别配绑定(spec §七)。
 
 - [ ] **Step 6: 通过后** —— ROADMAP B-61 销案;通知对接方可以按 addendum 改提示词。
+
+---
+
+## Task 11: 预拉改为内容寻址缓存
+
+**Files:**
+- Modify: `services/orchestrator/src/orchestrator/tools/prefetch_script.py`
+- Test: `services/orchestrator/tests/test_prefetch_script.py`
+
+**为什么**:今天按 run 复制,同一个 logo/视频**每轮重下一份**。每用户工作区配额默认 10 GiB
+(`DEFAULT_WORKSPACE_BYTES_PER_USER`)且挂在 `AgentSandboxClient.acquire` 的闸上(`agent_sandbox.py:575-578`)——
+超了直接 `WorkspaceQuotaExceededError`,**那个用户的 agent 彻底跑不了**。20 MB 素材 × 500 轮就到顶。
+「重复下载」与「无限增长」是同一个病的两面,改址一起治。
+
+**Interfaces:**
+- Produces:`CACHE_DIRNAME = "cache"`;`CACHE_TTL_S = 24 * 3600`;
+  `def cache_name(url: str, suffix: str) -> str` → `sha256(url).hexdigest()[:32] + suffix`。
+- 目录形状:`agents/<key>/inputs/cache/<hash>.<ext>` 与 `agents/<key>/inputs/<run_id>/inputs.json`;
+  `local_path` 指向 `inputs/cache/<hash>.<ext>`(仍相对 `/workspace`)。
+
+- [ ] **Step 1: 写失败的测试**
+
+```python
+def test_cache_name_is_stable_and_url_keyed() -> None:
+    from orchestrator.tools.prefetch_script import cache_name
+
+    first = cache_name("https://x/a.jpg", ".jpg")
+    assert first == cache_name("https://x/a.jpg", ".jpg")
+    assert first != cache_name("https://x/b.jpg", ".jpg")
+    assert first.endswith(".jpg")
+    assert "/" not in first
+
+
+def test_second_run_reuses_the_cached_file_without_downloading(tmp_path, media_server) -> None:
+    # 同一 URL 第二次: 命中缓存, server 不该再收到请求
+    run_prefetch(tmp_path, {"logo": media_server.url("a.jpg")}, run="run-1")
+    assert media_server.request_count == 1
+    report = run_prefetch(tmp_path, {"logo": media_server.url("a.jpg")}, run="run-2")
+    assert media_server.request_count == 1
+    assert report[0]["hit"] is True
+    assert report[0]["bytes"] == 0
+
+
+def test_expired_cache_entry_is_refetched(tmp_path, media_server, monkeypatch) -> None:
+    run_prefetch(tmp_path, {"logo": media_server.url("a.jpg")}, run="run-1")
+    monkeypatch.setattr(prefetch_script, "CACHE_TTL_S", 0)
+    run_prefetch(tmp_path, {"logo": media_server.url("a.jpg")}, run="run-2")
+    assert media_server.request_count == 2
+
+
+def test_a_killed_write_never_leaves_a_partial_cache_entry(tmp_path) -> None:
+    # 同目录 tmp + os.replace: 读到的要么是完整文件, 要么没有
+    ...
+```
+
+- [ ] **Step 2: 跑测试确认它红**
+
+Run: `uv run --no-sync pytest services/orchestrator/tests/test_prefetch_script.py -k cache -v`
+Expected: FAIL —— `cannot import name 'cache_name'`
+
+- [ ] **Step 3: 写实现**
+
+`_fetch` 改三段:① 按 URL 扩展名先探一次 `cache/<hash><ext>`,存在且 `time.time() - mtime < CACHE_TTL_S`
+就直接返回它的相对路径、`used=0`、命中(**不发任何请求**);② 未命中才下载;③ 下载后按响应 content-type
+定最终后缀,写同目录临时文件再 `os.replace` 进 `cache/`(同目录原子替换,并发 run 撞同一 URL 也安全)。
+预算只扣真正下载的字节;命中不扣。
+
+- [ ] **Step 4: 跑测试确认它绿 + 变异自证**
+
+删掉命中分支 → `test_second_run_reuses_the_cached_file_without_downloading` 必须红(`request_count == 2`);
+还原变绿。把 `os.replace` 换成直接写目标文件 → 分块写入被打断时能读到半截文件,对应测试必须红。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add services/orchestrator/src/orchestrator/tools/prefetch_script.py services/orchestrator/tests/test_prefetch_script.py
+git commit -m "feat(inputs): 预拉改内容寻址缓存——同 URL 跨轮只下一次(B-61 T11)"
+```
+
+---
+
+## Task 12: janitor 回收 agent 的 inputs 目录
+
+**Files:**
+- Modify: `services/control-plane/src/control_plane/workspace_janitor.py`
+- Test: `services/control-plane/tests/test_workspace_janitor_inputs.py`
+
+**为什么**:现有 janitor 只扫 `_scratch/`(24h)、归档与体积记账,**没有任何东西碰 `agents/<key>/inputs/`**
+(spec §4.6 勘误)。不回收就是只写不收的池子,最终撞配额闸。
+
+**Interfaces:**
+- Produces:`JanitorRunStats` 增加 `inputs_files_removed` / `inputs_dirs_removed`;新 phase `_sweep_agent_inputs`,
+  接在既有三个 phase 之后(`run_once` 里那个 `for phase in (...)`)。
+- 阈值:`_INPUTS_TTL_S = 7 * 24 * 3600`,按 **mtime** 判定。
+
+- [ ] **Step 1: 写失败的测试**
+
+```python
+async def test_sweep_removes_expired_cache_files_and_run_dirs(tmp_workspace) -> None:
+    ...
+
+
+async def test_sweep_never_touches_a_recently_written_run_dir(tmp_workspace) -> None:
+    # 活跃 run 的目录 mtime 是新的, 必须留下
+    # 这条是「删错会打断执行」的反向实证, 不是锦上添花
+    ...
+
+
+async def test_sweep_ignores_dirs_that_are_not_uuid_shaped(tmp_workspace) -> None:
+    # 只认 inputs/<uuid>/ 与 inputs/cache/, 其它一律不碰
+    ...
+
+
+async def test_size_accounting_refreshes_after_reclaim(tmp_workspace) -> None:
+    ...
+```
+
+- [ ] **Step 2: 跑测试确认它红**
+
+Run: `uv run --no-sync pytest services/control-plane/tests/test_workspace_janitor_inputs.py -v`
+Expected: FAIL —— `JanitorRunStats` 没有 `inputs_files_removed`
+
+- [ ] **Step 3: 写实现**
+
+遍历 `<user_root>/agents/*/inputs/`:`cache/` 下按 mtime 删过期文件;UUID 形状的子目录按 mtime 删整个目录。
+**只认 UUID 形状的目录名与 `cache`**,其它一律跳过(别把别人建的目录当垃圾)。删完刷一次体积记账,让配额看到回收。
+
+- [ ] **Step 4: 跑测试确认它绿 + 变异自证**
+
+把 mtime 判定改成无条件删 → `test_sweep_never_touches_a_recently_written_run_dir` 必须红;还原变绿。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add services/control-plane/src/control_plane/workspace_janitor.py services/control-plane/tests/test_workspace_janitor_inputs.py
+git commit -m "feat(janitor): 回收 agents/<key>/inputs 的过期缓存与 run 目录(B-61 T12)"
+```
 
 ---
 
