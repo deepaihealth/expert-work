@@ -1416,39 +1416,50 @@ class AgentSpecBody(BaseModel):
         并继续抄错 —— 正是本特性要消灭的故障,却披着一份校验全绿的 manifest。
         """
         declared = {v.name for v in self.system_prompt.variables}
-        seen: set[tuple[str, str]] = set()
-        for entry in self.tools:
+        # (server, tool) → 第一次出现的位置,重复时报得出「先前那条绑在哪」。
+        # 唯一性守的是**原始**名字,而运行期 registry 的键是 ``mcp_tool_name()``
+        # 折叠过的 wire 名(非 ``[a-zA-Z0-9_-]`` 折成 ``_``、截断 64 字符),
+        # 两者不是一一对应:原始上不同、折叠后相同的两条绑定在这里过得去,
+        # 到 registry 才撞。协议层不做折叠(那是运行期的命名规则,本包不该知道),
+        # 这条边界留给接线那一侧兜。
+        seen: dict[tuple[str, str], str] = {}
+        for tool_index, entry in enumerate(self.tools):
             if not isinstance(entry, MCPToolSpec):
                 continue
-            for binding in entry.arg_bindings:
+            for binding_index, binding in enumerate(entry.arg_bindings):
+                # 校验器挂在 ``AgentSpecBody`` 上,pydantic 给的 ``loc`` 只到
+                # ``spec`` 一级 —— 手编 YAML 的人拿不到定位,所以把下标写进正文。
+                where = f"spec.tools[{tool_index}].arg_bindings[{binding_index}]"
                 key = (binding.server, binding.tool)
-                if key in seen:
+                first_seen_at = seen.get(key)
+                if first_seen_at is not None:
                     msg = (
-                        f"duplicate arg_bindings for server={binding.server!r} "
-                        f"tool={binding.tool!r}"
+                        f"{where}: duplicate arg_bindings for "
+                        f"server={binding.server!r} tool={binding.tool!r} "
+                        f"(already bound at {first_seen_at})"
                     )
                     raise ValueError(msg)
-                seen.add(key)
+                seen[key] = where
                 if entry.servers and binding.server not in entry.servers:
                     msg = (
-                        f"arg_bindings[{binding.server}/{binding.tool}].server → "
-                        f"{binding.server!r} is not among this mcp entry's servers "
-                        f"{entry.servers} — the binding would match nothing"
+                        f"{where}.server → {binding.server!r} is not among this "
+                        f"mcp entry's servers {entry.servers} — the binding "
+                        f"would match nothing"
                     )
                     raise ValueError(msg)
                 if entry.allow_tools and binding.tool not in entry.allow_tools:
                     msg = (
-                        f"arg_bindings[{binding.server}/{binding.tool}].tool → "
-                        f"{binding.tool!r} is not among this mcp entry's allow_tools "
-                        f"{entry.allow_tools} — the binding would match nothing"
+                        f"{where}.tool → {binding.tool!r} is not among this mcp "
+                        f"entry's allow_tools {entry.allow_tools} — the binding "
+                        f"would match nothing"
                     )
                     raise ValueError(msg)
                 for param, var_name in binding.args.items():
                     if var_name not in declared:
                         msg = (
-                            f"arg_bindings[{binding.server}/{binding.tool}].{param} → "
-                            f"{var_name!r} is not a declared prompt variable "
-                            f"(system_prompt.variables)"
+                            f"{where} ({binding.server}/{binding.tool})"
+                            f".args[{param}] → {var_name!r} is not a declared "
+                            f"prompt variable (system_prompt.variables)"
                         )
                         raise ValueError(msg)
         return self

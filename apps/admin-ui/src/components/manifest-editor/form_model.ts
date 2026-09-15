@@ -804,17 +804,30 @@ const readMcpAllowTools = (m: unknown): string[] =>
 // Single writer for the whole ``mcp`` tool entry — both ``servers`` and
 // ``allow_tools`` in one patch, so the picker can update them together without
 // a stale-read double-patch. Empty ``servers`` ⇒ MCP off (entry dropped).
+//
+// Like ``setBuiltinTool``, this NEVER rebuilds an already-present entry from
+// scratch: it spreads the existing one and overwrites only the two keys the
+// picker owns. The form shows neither ``arg_bindings`` (B-61 — parameters bound
+// to declared prompt variables, YAML-only until the binding UI lands) nor any
+// future sibling key, and rebuilding would drop them silently on the next
+// server/tool pick — turning a supported YAML-authored config into data loss
+// with no signal.
 export function setMcp(
   m: unknown,
   servers: string[],
   allowTools: string[],
 ): AgentManifest {
-  const withoutMcp = (specOf(m).tools ?? []).filter((t) => t.type !== "mcp");
+  const tools = specOf(m).tools ?? [];
+  const withoutMcp = tools.filter((t) => t.type !== "mcp");
   if (servers.length === 0) {
     return patchSpec(m, { tools: withoutMcp });
   }
+  const existing = tools.find((t) => t.type === "mcp");
   return patchSpec(m, {
-    tools: [...withoutMcp, { type: "mcp", servers, allow_tools: allowTools }],
+    tools: [
+      ...withoutMcp,
+      { ...existing, type: "mcp", servers, allow_tools: allowTools },
+    ],
   });
 }
 

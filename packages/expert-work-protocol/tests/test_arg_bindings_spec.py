@@ -139,11 +139,47 @@ def test_empty_servers_and_allow_tools_mean_all_so_any_binding_is_accepted() -> 
 
 
 def test_empty_args_is_rejected() -> None:
-    with pytest.raises(ValidationError):
+    # 必须钉住 loc + 原因:裸 ``pytest.raises(ValidationError)`` 在 fixture 将来
+    # 任何一个字段变非法时都照样绿,等于验不出 ``args`` 的 min_length。
+    with pytest.raises(
+        ValidationError,
+        match=r"arg_bindings\.0\.args\n\s+Dictionary should have at least 1 item",
+    ):
         AgentSpec.model_validate(
             _manifest(
                 variables=[{"name": "a"}],
                 bindings=[{"server": "deepcare", "tool": "t", "args": {}}],
+            )
+        )
+
+
+def test_error_locates_the_offending_tool_entry_and_binding() -> None:
+    """校验器挂在 ``AgentSpecBody`` 上,pydantic 的 loc 只到 ``spec`` —— 手编
+    YAML 的人得从消息正文里拿到 ``tools[i].arg_bindings[j]`` 才有地方可去。"""
+    doc = _manifest(
+        variables=[{"name": "a"}],
+        bindings=[
+            {"server": "deepcare", "tool": "ok", "args": {"x": "a"}},
+            {"server": "deepcare", "tool": "bad", "args": {"y": "nope"}},
+        ],
+    )
+    # 前面再插一个非 mcp 条目,确认下标数的是 ``tools`` 的位置而不是 mcp 的序号。
+    doc["spec"]["tools"].insert(0, {"type": "http"})
+    with pytest.raises(ValidationError, match=r"spec\.tools\[1\]\.arg_bindings\[1\]"):
+        AgentSpec.model_validate(doc)
+
+
+def test_duplicate_error_points_at_the_first_binding_too() -> None:
+    with pytest.raises(
+        ValidationError, match=r"already bound at spec\.tools\[0\]\.arg_bindings\[0\]"
+    ):
+        AgentSpec.model_validate(
+            _manifest(
+                variables=[{"name": "a"}],
+                bindings=[
+                    {"server": "deepcare", "tool": "t", "args": {"x": "a"}},
+                    {"server": "deepcare", "tool": "t", "args": {"y": "a"}},
+                ],
             )
         )
 
