@@ -1086,6 +1086,30 @@ class HTTPToolSpec(BaseModel):
     type: Literal["http"] = "http"
 
 
+class ArgBindingSpec(BaseModel):
+    """B-61 — bind some of one MCP tool's parameters to this agent's declared
+    prompt variables.
+
+    Once bound, the parameter is **stripped from the JSON schema the model
+    sees** and filled in by the platform at call time from this turn's
+    ``inputs`` (in ``tools_node``). The model never sees the value, so it
+    never gets the chance to retype it wrong (spec §五).
+
+    ``server`` is mandatory: the wire name is ``mcp__<server>__<tool>``, so
+    same-named tools on different servers collide — and a same-named parameter
+    on a different server is very likely not the same thing (``project_code``
+    is the archetype). Hence there is **no** global by-parameter-name rule;
+    every binding is listed one by one, explicitly (spec §十一 之二).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server: str = Field(min_length=1)
+    tool: str = Field(min_length=1)
+    #: Tool parameter name → declared prompt variable name. At least one entry.
+    args: dict[str, str] = Field(min_length=1)
+
+
 class MCPToolSpec(BaseModel):
     """Enable MCP tools for this agent.
 
@@ -1093,13 +1117,18 @@ class MCPToolSpec(BaseModel):
     (from the platform pool the tenant is allowed to use + the tenant's own
     registered remote servers); empty means every available server. Stream V.
     ``allow_tools`` optionally filters which advertised tools the agent sees
-    (by bare tool name, across the selected servers); empty means all."""
+    (by bare tool name, across the selected servers); empty means all.
+    ``arg_bindings`` (B-61) binds individual tool parameters to declared
+    prompt variables; it is validated in ``AgentSpecBody._check_arg_bindings``
+    because the declared set lives in a sibling block."""
 
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["mcp"] = "mcp"
     servers: list[str] = Field(default_factory=list)
     allow_tools: list[str] = Field(default_factory=list)
+    #: B-61 —— 逐工具的参数绑定,默认空(存量 manifest 零影响)。
+    arg_bindings: list[ArgBindingSpec] = Field(default_factory=list)
 
 
 #: Discriminated union of the M0-supported tool declarations. ``python``
@@ -1366,6 +1395,63 @@ class AgentSpecBody(BaseModel):
     code: CodePackageSpec | None = None
     hooks: dict[str, str] = Field(default_factory=dict)
     observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
+
+    @model_validator(mode="after")
+    def _check_arg_bindings(self) -> AgentSpecBody:
+        """B-61 — validate ``tools[].arg_bindings`` against its siblings.
+
+        Four manifest-local errors: (1) two bindings for the same
+        ``(server, tool)``; (2) a binding whose ``server`` is not in this
+        entry's ``servers``; (3) a binding whose ``tool`` is not in this
+        entry's ``allow_tools``; (4) a binding pointing at a name that
+        ``system_prompt.variables`` does not declare. Empty ``servers`` /
+        ``allow_tools`` mean "all", so (2) / (3) do not apply there.
+
+        这道闸必须在 manifest 层,不在前端:配置页有 YAML 直编、后端有
+        ``PUT …/draft``、模板复制会把绑定带到变量集不同的 agent 上,下拉框
+        一个都挡不住;再加上时间 —— 先绑好、之后把变量删了。
+
+        (2)/(3) 和「变量没声明」是同一类,不是用户手误:名字打错的绑定谁都
+        匹配不上,参数于是原样回到给模型的 schema 里,模型继续抄那串长字符串
+        并继续抄错 —— 正是本特性要消灭的故障,却披着一份校验全绿的 manifest。
+        """
+        declared = {v.name for v in self.system_prompt.variables}
+        seen: set[tuple[str, str]] = set()
+        for entry in self.tools:
+            if not isinstance(entry, MCPToolSpec):
+                continue
+            for binding in entry.arg_bindings:
+                key = (binding.server, binding.tool)
+                if key in seen:
+                    msg = (
+                        f"duplicate arg_bindings for server={binding.server!r} "
+                        f"tool={binding.tool!r}"
+                    )
+                    raise ValueError(msg)
+                seen.add(key)
+                if entry.servers and binding.server not in entry.servers:
+                    msg = (
+                        f"arg_bindings[{binding.server}/{binding.tool}].server → "
+                        f"{binding.server!r} is not among this mcp entry's servers "
+                        f"{entry.servers} — the binding would match nothing"
+                    )
+                    raise ValueError(msg)
+                if entry.allow_tools and binding.tool not in entry.allow_tools:
+                    msg = (
+                        f"arg_bindings[{binding.server}/{binding.tool}].tool → "
+                        f"{binding.tool!r} is not among this mcp entry's allow_tools "
+                        f"{entry.allow_tools} — the binding would match nothing"
+                    )
+                    raise ValueError(msg)
+                for param, var_name in binding.args.items():
+                    if var_name not in declared:
+                        msg = (
+                            f"arg_bindings[{binding.server}/{binding.tool}].{param} → "
+                            f"{var_name!r} is not a declared prompt variable "
+                            f"(system_prompt.variables)"
+                        )
+                        raise ValueError(msg)
+        return self
 
 
 class AgentSpec(BaseModel):
