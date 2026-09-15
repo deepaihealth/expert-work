@@ -1597,14 +1597,15 @@ def create_app(
                 # 沙箱迁移波 3 (spec § 五):janitor 只在云工作区路径
                 # (quota gate 已组装)时上岗——条件跟随实际组装物,
                 # 照 SandboxReapWorker 的 isinstance 先例,不另开开关。
-                # 另需 object_store_backend == "s3-compatible":janitor 归档
-                # 删的是真数据(purge 后 rm -rf NAS 目录),内存 object store
-                # 重启即丢——90 天恢复承诺会悄悄落空,内存后端不算数。
-                if (
-                    resolved_workspace_quota is not None
-                    and resolved_settings.workspace_nas_root
-                    and resolved_settings.object_store_backend == "s3-compatible"
-                ):
+                #
+                # ``object_store_backend == "s3-compatible"`` 这个条件是**归档 phase
+                # 自己的**,不是整个 worker 的:归档删的是真数据(purge 后 rm -rf NAS
+                # 目录),内存 object store 重启即丢——90 天恢复承诺会悄悄落空,内存
+                # 后端不算数。但回收 phase(B-61 T12,收 agents/<key>/inputs/)一个
+                # 字节都不碰对象存储,把它一起关掉的后果是:配了 NAS + 配额但对象存储
+                # 走内存后端的部署完全没有垃圾回收,一路涨到每用户配额闸,而唯一的信号
+                # 是一行说「对象存储」的日志。所以条件下沉到 _sweep_archives 自己。
+                if resolved_workspace_quota is not None and resolved_settings.workspace_nas_root:
                     workspace_janitor_worker = WorkspaceJanitorWorker(
                         user_workspaces=resolved_user_workspace_store,
                         quota_service=resolved_workspace_quota,
@@ -1612,11 +1613,10 @@ def create_app(
                         workspace_root=resolved_settings.workspace_nas_root,
                         session_factory=sql_stores.session_factory if sql_stores else None,
                         interval_s=float(resolved_settings.workspace_janitor_interval_s),
+                        archive_enabled=resolved_settings.object_store_backend == "s3-compatible",
                     )
                     workspace_janitor_worker.start()
                     _app.state.workspace_janitor_worker = workspace_janitor_worker
-                elif resolved_workspace_quota is not None and resolved_settings.workspace_nas_root:
-                    logger.info("control_plane.workspace_janitor.not_started_memory_object_store")
                 # skill-asset-store — only a DURABLE backend may hold skill
                 # supporting-file bytes (memory loses them on restart).
                 skill_asset_store = (

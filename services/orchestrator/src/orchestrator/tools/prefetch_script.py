@@ -164,8 +164,12 @@ def _store(cache_dir: str, name: str, body: bytes) -> None:
     * ``os.chmod(tmp, 0o644)``:``mkstemp`` 恒建 0600 而 ``os.replace`` 保权限位,
       不显式改就把条目静默降成 0600,跨 uid 的读方再次读不到(W2-BUG-1 的原病);
     * ``os.replace`` 而不是直接写目标:目标路径上要么是完整文件、要么还是上一版,
-      不会出现半截 —— 半截条目下一轮会被当成命中直接喂给模型。超期重下时这一步
-      直接盖掉旧条目,不用先删。
+      不会出现半截 —— 半截条目下一轮会被当成命中直接喂给模型。
+
+    **一条勘误**:这里原来写着「超期重下时这一步直接盖掉旧条目,不用先删」,那条路径
+    今天基本不发生 —— 走到 ``_store`` 之前 ``_cached_name`` 已经把同 digest 的超期条目
+    (含同名那个)``unlink`` 掉了,所以目标通常根本不存在。``os.replace`` 真正还在守的
+    是**原子性**,以及并发的另一个 run 恰好刚写完同名条目时的覆盖语义。
     """
     os.makedirs(cache_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=cache_dir)

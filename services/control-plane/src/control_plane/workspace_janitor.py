@@ -52,10 +52,12 @@ from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.persistence.workspace.layout import (
     WORKSPACE_AGENTS_DIR,
+    WORKSPACE_INPUTS_DIR,
     WORKSPACE_UPLOADS_DIR,
 )
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools.nas_workspace_store import DELETED_DIR, workspace_user_root
+from orchestrator.tools.prefetch_script import CACHE_DIRNAME, CACHE_TTL_S
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +90,12 @@ _SCRATCH_MAX_AGE_S = 24 * 3600.0
 #: 与 orchestrator ``agent_sandbox._SCRATCH_DIR`` 同值(私名不跨包 import)。
 _SCRATCH_DIR = "_scratch"
 
-#: 与 orchestrator ``tools/inputs_doc.inputs_rel_dir`` 里的 ``inputs`` 同值
-#: (私名不跨包 import,照上面 ``_SCRATCH_DIR`` 的先例)。
-_INPUTS_DIR = "inputs"
-
-#: 与 orchestrator ``tools/prefetch_script.CACHE_DIRNAME`` 同值 —— 内容寻址的
-#: 共享缓存,挂在 ``inputs/`` 下、与 ``<run_id>/`` 平级。
-_INPUTS_CACHE_DIR = "cache"
+#: 这两层目录名**从生产者那边 import,不抄字面量**:``WORKSPACE_INPUTS_DIR`` 是共享包
+#: 的公开名(``inputs_doc.inputs_rel_dir`` 与浏览面的保留前缀都用它),``CACHE_DIRNAME``
+#: 是 ``tools/prefetch_script`` 的公开名。上面 ``_SCRATCH_DIR`` 之所以只能抄,是因为对面
+#: 那个是私名;这两个不是,抄了就是留一条会静默走散的缝。
+_INPUTS_DIR = WORKSPACE_INPUTS_DIR
+_INPUTS_CACHE_DIR = CACHE_DIRNAME
 
 #: ``tools/prefetch_script._rewrite`` 的临时文件名(``inputs.json`` + ``.tmp``)。
 #:
@@ -125,12 +126,39 @@ class _ReclaimPolicy:
         return self.enabled and now - mtime >= self.ttl_s
 
 
+#: per-run 目录的 TTL。**判据是「距最后一次预拉写入」,不是「run 还活不活着」**:
+#: 写 ``inputs/<run_id>/`` 的只有 START 侧的 inputs 节点,**续跑不重新经过它**,所以一个
+#: 等审批的 run 挂得比 TTL 久,回来时 ``inputs.json`` 已经没了 —— 模型退回从提示词手抄
+#: 长串,正是 B-61 要治的病。30 天覆盖现实中的长审批挂起(与 Codespaces「30 天」同一条
+#: 先例)。**敢从 7 天抬到 30 天是因为 T11**:内容寻址之后同一个 URL 跨轮只存一份,占用
+#: 不再随轮数相乘,真正吃配额的是缓存条目不是这些几 KB 的 JSON。
+_RUN_DIR_TTL_S = 30 * 24 * 3600
+
+#: 缓存条目的 TTL。**不变式:``_CACHE_TTL_S > _RUN_DIR_TTL_S + CACHE_TTL_S``**
+#: (``CACHE_TTL_S`` = 预拉侧的新鲜期 24h,从那边 import,不抄)。
+#:
+#: 为什么必须严格大于:命中**不 touch**(T11 裁定 A),所以条目的 mtime 最多比「最近一次
+#: 被引用」早 24 小时,而 run 目录的 mtime 就是那次引用的时刻。两条 TTL 相等时,缓存条目
+#: 会比引用它的 ``inputs.json`` **先死最多 24 小时** —— 那段时间里 ``inputs.json`` 的
+#: ``local_path`` 非空却指向一个已被删掉的文件,而工具描述对模型的承诺是「非空 = 平台已经
+#: 下好了,直接用,不用再联网」。
+#:
+#: 所以这里**不写字面量,直接把不等式写成代码**:滞后项取预拉侧的 ``CACHE_TTL_S`` 本人
+#: (它哪天改了这里跟着走),再加 2 天余量 —— 30 + 1 + 2 = **33 天**。要改成写死的数字,
+#: 先读上面这段;``test_cache_ttl_outlives_the_run_dir_that_names_it`` 钉着这条不等式。
+_CACHE_TTL_S = _RUN_DIR_TTL_S + CACHE_TTL_S + 2 * 24 * 3600
+
 #: B-61 T12 本批只启用 inputs 两条;uploads 与产物的条目**先放在这里但关着**——
 #: 它们删的是用户数据,需要产品定 N、需要发布前告知、还要对外删除端点(B-62)当自救
 #: 出口,那是 B-63 的事。机制一次写好,B-63 落地时是把开关拨开 + 接 touch 点,不是重写。
+#:
+#: **B-63 拨开关前要先处理的两件事**(不然拨开当天就说谎):① ``JanitorRunStats`` 的
+#: ``inputs_files_removed`` / ``inputs_dirs_removed`` 是**所有策略合计**,uploads 的删除会
+#: 计进名字里写着 inputs 的字段 —— 先拆开或改名;② ``uploads`` 的落点只覆盖三处之一
+#: (见 :data:`_TARGETS`)。
 _POLICIES = (
-    _ReclaimPolicy(label="inputs_cache", ttl_s=7 * 24 * 3600, enabled=True),
-    _ReclaimPolicy(label="inputs_run_dir", ttl_s=7 * 24 * 3600, enabled=True),
+    _ReclaimPolicy(label="inputs_cache", ttl_s=_CACHE_TTL_S, enabled=True),
+    _ReclaimPolicy(label="inputs_run_dir", ttl_s=_RUN_DIR_TTL_S, enabled=True),
     _ReclaimPolicy(label="uploads", ttl_s=90 * 24 * 3600, enabled=False),
     _ReclaimPolicy(label="artifacts", ttl_s=90 * 24 * 3600, enabled=False),
 )
@@ -146,6 +174,14 @@ class _ReclaimTarget:
 
     subdir: str
     #: 收目录:只收名字是 UUID 的(per-run 目录)。``False`` = 这一层的目录一律不碰。
+    #:
+    #: ``cache/`` 取 ``False`` 是**刻意与 ``inputs/`` 那一层相反**的:``inputs/`` 下别人
+    #: 建的目录不是垃圾(不碰),而 ``cache/`` 整个命名空间是平台的,里面本不该有目录
+    #: (生产侧只写文件:``_store`` 的 ``mkstemp`` + ``os.replace``)。代价写在这里:
+    #: agent 代码能在自己的 ``/workspace/inputs/cache/`` 里 ``mkdir``,那种目录**两侧都
+    #: 不回收**(生产侧 ``_cached_name`` 对目录 ``os.unlink`` 必然失败并被 suppress),
+    #: 于是它是一处**不会自愈、也没有信号**的配额泄漏。要收它得先决定「平台该不该删
+    #: agent 在平台目录里建的东西」—— 那是个产品决定,不在本批里(已上报)。
     uuid_dirs: bool
     #: 收文件:``None`` = 这一层的文件全收;否则只收名字在集合里的。
     file_names: frozenset[str] | None
@@ -357,7 +393,14 @@ def _reclaim_user(
                         for policy in _POLICIES:
                             target = _TARGETS[policy.label]
                             if target is None:
-                                continue  # 还没有落点的策略,见 _TARGETS 上方注释
+                                # 还没有落点的策略(``artifacts``),见 _TARGETS 上方注释。
+                                # 注意这与 ``enabled=False`` 的 ``uploads`` **不对称**:
+                                # uploads 有落点,于是照样逐 agent 下降 + 全量 scandir,
+                                # 只为对每个条目求一个恒假的谓词(「关着的策略也要走到判
+                                # 定」是 brief 的明确要求,B-63 拨开关那天才不是新代码);
+                                # 而没有落点的这条连下降都做不了。代价:上传件多的用户,
+                                # 每轮白扫一遍 uploads/。拨开关时这笔开销就变成了实际工作。
+                                continue
                             try:
                                 files, dirs = _reclaim_target(agent_fd, policy, target, now, scope)
                             except FileNotFoundError:
@@ -463,6 +506,7 @@ class WorkspaceJanitorWorker:
         workspace_root: str,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         interval_s: float = _INTERVAL_S,
+        archive_enabled: bool = True,
     ) -> None:
         self._user_workspaces = user_workspaces
         self._quota_service = quota_service
@@ -470,6 +514,10 @@ class WorkspaceJanitorWorker:
         self._workspace_root = workspace_root
         self._session_factory = session_factory
         self.interval_s = interval_s
+        # 归档 phase **自己**的前提:对象存储得是持久后端。内存后端重启即丢,
+        # 90 天恢复承诺会悄悄落空。其余 phase(回收 / 记账 / scratch)与对象
+        # 存储无关,不跟着一起关 —— 见 :meth:`_sweep_archives` 与 app.py 的装配点。
+        self._archive_enabled = archive_enabled
 
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -564,7 +612,14 @@ class WorkspaceJanitorWorker:
         落标记不碰 DB 行)——按 tenant 目录下 ``DELETED_DIR`` 里能解析成
         UUID 的条目逐用户归档。单用户失败 log + 继续,不拖累其余用户;标
         记文件本身永不删除(墓碑,见 :meth:`_archive_one`)。
+
+        ``archive_enabled=False``(对象存储不是持久后端)时整个 phase 跳过:归档
+        会 ``rm -rf`` 用户目录,而内存 object store 重启即丢 —— 那等于把数据删了
+        却没有档案。**只跳这一个 phase**,回收 / 记账 / scratch 照跑。
         """
+        if not self._archive_enabled:
+            logger.info("workspace_janitor.archive_disabled_non_durable_object_store")
+            return
         root = Path(self._workspace_root)
 
         def _markers(tenant_dir: Path) -> list[UUID]:
@@ -638,9 +693,14 @@ class WorkspaceJanitorWorker:
         **判据只看 mtime,不碰 atime**:NAS 多半挂成 ``noatime``/``relatime``,
         atime 不可信。cache 条目的 mtime 由预拉脚本维持成「最近一次下载时间」——
         24h 内命中不重下(mtime 不动)、超期命中会重下刷新 mtime —— 于是它就是
-        「最近引用时间」的 24h 粒度近似;per-run 目录的 mtime 则被每次改写
-        ``inputs.json`` 顶新,**活跃 run 的目录因此总是新鲜的**(删错它就打断了
+        「最近引用时间」的 24h 粒度近似;per-run 目录的 mtime 则被预拉每写一次
+        ``inputs.json`` 顶新,所以**预拉刚写过的目录一定是新鲜的**(删错它就打断了
         正在跑的那一轮,见 ``test_sweep_never_touches_a_recently_written_run_dir``)。
+
+        这句话**只在「预拉写过之后 TTL 之内」成立,不等于「run 还活着就安全」**:写
+        ``inputs/<run_id>/`` 的只有 START 侧的 inputs 节点,续跑不重新经过它,于是一个
+        等审批等了超过 :data:`_RUN_DIR_TTL_S` 的 run 回来时文件已经没了。TTL 取 30 天
+        就是为了让这个窗口盖住现实中的长审批挂起 —— 见 :data:`_RUN_DIR_TTL_S`。
 
         ``now`` 取一次、整轮共用:同一轮里先后扫到的条目按同一条时间线判定。
         """

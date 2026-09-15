@@ -40,11 +40,12 @@ from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.persistence import InMemoryTenantQuotaStore
 from expert_work.persistence.workspace.memory import InMemoryUserWorkspaceStore
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectStoreError
+from orchestrator.tools.prefetch_script import CACHE_TTL_S
 from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 
 def _build(
-    tmp_path: Path,
+    tmp_path: Path, *, archive_enabled: bool = True
 ) -> tuple[WorkspaceJanitorWorker, InMemoryUserWorkspaceStore, InMemoryObjectStore]:
     workspaces = InMemoryUserWorkspaceStore()
     quotas = InMemoryTenantQuotaStore()
@@ -57,6 +58,7 @@ def _build(
         quota_service=service,
         object_store=store,
         workspace_root=str(tmp_path),
+        archive_enabled=archive_enabled,
     )
     return worker, workspaces, store
 
@@ -607,7 +609,15 @@ async def test_disabled_policies_delete_nothing(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_a_leftover_tmp_file_is_reclaimed(tmp_path: Path) -> None:
-    """T11 增量重写留下的 ``inputs.json.tmp``,被 kill 时会遗留。"""
+    """``inputs/`` 这一层的 ``inputs.json.tmp`` 残留按同一条 TTL 收掉。
+
+    **这个名字今天打不到东西**,测试造的是一个不会自然出现的形状:预拉的
+    ``_rewrite`` 写的是 ``inputs/<run_id>/inputs.json.tmp``(在 run 目录里,随整棵目录被
+    收),不是这一层 —— brief 当初给的理由是错的,实现注释(``_INPUTS_TMP_NAME``)已经
+    如实纠正,这条 docstring 跟上,免得读代码的人先信了测试。
+    留着的是**机制**:``file_names`` 非 ``None`` = 「只收名单里的」,正是它让
+    ``inputs/README.md`` 这类别人的文件活下来(见上一条测试)。
+    """
     tenant, user = uuid4(), uuid4()
     inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
     inputs.mkdir(parents=True)
@@ -791,3 +801,50 @@ async def test_reclaim_logs_counts_but_never_names(
     assert "files=1 dirs=0" in detail[0]
     assert "files=1 dirs=0" in summary[0] and "inputs_cache:1/0" in summary[0]
     assert not any("张三" in m for m in messages)  # 租户内容一个字都不进日志
+
+
+@pytest.mark.asyncio
+async def test_archiving_is_skipped_on_a_non_durable_object_store_but_reclaim_still_runs(
+    tmp_path: Path,
+) -> None:
+    """``archive_enabled=False`` 只关归档那一个 phase,回收照跑。
+
+    「对象存储必须是持久后端」是**归档自己的**前提(归档会 rm -rf 用户目录,内存
+    object store 重启即丢 = 数据删了却没有档案)。回收一个字节都不碰对象存储,跟着
+    一起关掉的后果是:配了 NAS + 配额、对象存储走内存后端的部署完全没有垃圾回收,
+    一路涨到配额闸把沙箱类工具全挡掉 —— 正是 T11/T12 存在的理由。
+    """
+    tenant, user = uuid4(), uuid4()
+    doomed = tmp_path / str(tenant) / str(user)
+    doomed.mkdir(parents=True)
+    (doomed / "keep.txt").write_bytes(b"data")
+    _mark_deleted(tmp_path, tenant, user)
+
+    stale_run = _agent_dir(tmp_path, uuid4(), uuid4()) / "inputs" / str(uuid4())
+    stale_run.mkdir(parents=True)
+    _age(stale_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    worker, workspaces, _ = _build(tmp_path, archive_enabled=False)
+    stats = await worker.run_once()
+
+    assert stats.archived == 0 and stats.reharvested == 0
+    assert doomed.exists() and (doomed / "keep.txt").exists()  # 没档案就别删数据
+    row = await workspaces.get(tenant_id=tenant, user_id=user)
+    assert row is None or row.archived_object_key is None
+    assert stats.inputs_dirs_removed == 1 and not stale_run.exists()  # 回收照跑
+
+
+def test_cache_ttl_outlives_the_run_dir_that_names_it() -> None:
+    """不变式:``inputs_cache.ttl > inputs_run_dir.ttl + CACHE_TTL_S``。
+
+    命中**不 touch**(T11 裁定 A),所以缓存条目的 mtime 最多比「最近一次被引用」早
+    ``CACHE_TTL_S``(24h),而 run 目录的 mtime 就是那次引用的时刻。两条 TTL 相等时,
+    缓存条目会比引用它的 ``inputs.json`` **先死最多 24 小时** —— 那段时间里
+    ``local_path`` 非空却指向一个已被删掉的文件,而工具描述对模型的承诺是「非空 = 平台
+    已经下好了,直接用,不用再联网」。
+
+    把不等式本身钉在这里,而不是钉两个具体天数:谁把缓存 TTL 往 run 目录那边调,
+    这条就红。
+    """
+    ttl = {policy.label: policy.ttl_s for policy in _POLICIES}
+    assert ttl["inputs_cache"] > ttl["inputs_run_dir"] + CACHE_TTL_S
