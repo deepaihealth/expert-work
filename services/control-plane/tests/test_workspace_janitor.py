@@ -711,6 +711,46 @@ async def test_sweep_does_not_follow_a_symlinked_scan_base(tmp_path: Path) -> No
     assert not innocent_run.exists()
 
 
+@pytest.mark.asyncio
+async def test_sweep_does_not_traverse_a_symlinked_intermediate_segment(tmp_path: Path) -> None:
+    """两级落点(``inputs/cache``)的**中间那一段**也必须自己挡住软链。
+
+    ``O_NOFOLLOW`` 只管**最后**一段。把逐段下降折成一次
+    ``openat(agent_fd, "inputs/cache", O_NOFOLLOW)``,``inputs`` 就成了中间段、照样被
+    跟随 —— 于是「``inputs`` 是软链,而它指向的目录里恰好有个**真的** ``cache/``」时,
+    别人的过期缓存条目就被删了。这里造的正是那个形状 —— 受害目录**故意放在 janitor
+    正常遍历够不到的地方**(``tmp_path`` 下,不是 ``<tenant>/<user>/`` 那两层 UUID):
+    否则它会被自己那条合法路径正常收掉,断言就分不清「没被跟过去」与「被自己收了」。
+    第一版就踩了这个,测试当场红。
+
+    上一条软链测试打不到这里:它的软链指向的目录里**没有 ``cache/`` 这一层**,
+    ``inputs/cache`` 直接 ENOENT,折不折成一次看不出区别。
+    """
+    tenant = uuid4()
+    victim_inputs = tmp_path / "victim" / "inputs"  # 形状像 agent 子树,但不在遍历面上
+    victim_cache = victim_inputs / "cache"
+    victim_cache.mkdir(parents=True)
+    victim_entry = victim_cache / f"{'c' * 32}.png"
+    victim_entry.write_bytes(b"x" * 10)
+    _age(victim_entry, seconds=_TTL_S["inputs_cache"] + 60)
+
+    evil = _agent_dir(tmp_path, tenant, uuid4(), key="evil-agent") / "inputs"
+    evil.symlink_to(victim_inputs)  # inputs -> <别人的 inputs>(里面有真的 cache/)
+
+    sibling_cache = _agent_dir(tmp_path, tenant, uuid4(), key="sibling") / "inputs" / "cache"
+    sibling_cache.mkdir(parents=True)
+    sibling_entry = sibling_cache / f"{'d' * 32}.png"
+    sibling_entry.write_bytes(b"y" * 10)
+    _age(sibling_entry, seconds=_TTL_S["inputs_cache"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert victim_entry.exists()  # 中间段是软链 → 一步都不许进去
+    assert evil.is_symlink()  # 软链自己也不删
+    assert not sibling_entry.exists()  # 同一轮里正常 agent 照收 —— phase 没被带走
+    assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (1, 0)
+
+
 def test_every_policy_has_an_explicit_target_entry() -> None:
     """策略表与落点表必须逐条对上 —— 「暂时没有落点」要显式写 ``None``。
 

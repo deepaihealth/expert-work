@@ -238,8 +238,23 @@ def _is_plain_dir(entry: os.DirEntry[str]) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class _ReclaimScope:
+    """一次回收的坐标 —— **只为日志存在**:谁的、哪个 agent。
+
+    fd 化之后底层只拿得到一个裸 fd,失败日志就没法再打 ``path=``(那本来也只是这三个
+    标识拼成的字符串)。所以把标识显式带下来:失败路径与成功路径(``reclaimed``)、
+    兄弟告警(``reclaim_base_unusable`` / ``reclaim_agent_failed``)口径一致 ——
+    **永远只有标识,永远没有条目名**(条目名是租户内容)。
+    """
+
+    tenant_id: UUID
+    user_id: UUID
+    agent_key: str
+
+
 def _reclaim_entries(
-    fd: int, policy: _ReclaimPolicy, target: _ReclaimTarget, now: float
+    fd: int, policy: _ReclaimPolicy, target: _ReclaimTarget, now: float, scope: _ReclaimScope
 ) -> tuple[int, int]:
     """在**已经打开**的这一层目录里按策略收条目,返回 ``(文件数, 目录数)``。
 
@@ -275,26 +290,44 @@ def _reclaim_entries(
                         os.unlink(entry.name, dir_fd=fd)
                         files += 1
                 except OSError:
-                    logger.warning("workspace_janitor.reclaim_failed policy=%s", policy.label)
+                    logger.warning(
+                        "workspace_janitor.reclaim_failed tenant=%s user=%s agent=%s policy=%s",
+                        scope.tenant_id,
+                        scope.user_id,
+                        scope.agent_key,
+                        policy.label,
+                    )
     except OSError:
-        logger.warning("workspace_janitor.reclaim_scan_failed policy=%s", policy.label)
+        logger.warning(
+            "workspace_janitor.reclaim_scan_failed tenant=%s user=%s agent=%s policy=%s",
+            scope.tenant_id,
+            scope.user_id,
+            scope.agent_key,
+            policy.label,
+        )
     return files, dirs
 
 
 def _reclaim_target(
-    agent_fd: int, policy: _ReclaimPolicy, target: _ReclaimTarget, now: float
+    agent_fd: int, policy: _ReclaimPolicy, target: _ReclaimTarget, now: float, scope: _ReclaimScope
 ) -> tuple[int, int]:
     """下降到 ``target.subdir`` 再收 —— **每一段**都相对上一级的 fd 打开。
 
-    逐段而不是一次 ``agent_dir / subdir``:``inputs`` 与 ``inputs/cache`` 都在 agent
-    手里,任何一段是软链都必须当场失败(见 :func:`_open_dir`)。目录不存在
-    (绝大多数 agent 没有 ``inputs/``)与软链都从这里抛 ``OSError`` 给调用方分流。
+    **逐段是承重墙,不是写法偏好**:``O_NOFOLLOW`` 只管**最后**一段。折成一次
+    ``openat(agent_fd, "inputs/cache", O_NOFOLLOW)`` 的话,``inputs`` 就成了中间段、
+    照样被跟随 —— ``inputs`` 是软链且指向的目录里恰好有个真的 ``cache/`` 时,里面的
+    过期文件就被删了(评审 PoC 实测 ``(1,0)``)。而 ``inputs`` 与 ``inputs/cache`` 两段
+    都在 agent 自己写得了的目录里。钉住这条的是
+    ``test_sweep_does_not_traverse_a_symlinked_intermediate_segment``。
+
+    目录不存在(绝大多数 agent 没有 ``inputs/``)与软链都从这里抛 ``OSError``
+    给调用方分流。
     """
     with contextlib.ExitStack() as stack:
         fd = agent_fd
         for part in target.subdir.split("/"):
             fd = stack.enter_context(_open_dir(part, parent=fd))
-        files, dirs = _reclaim_entries(fd, policy, target, now)
+        files, dirs = _reclaim_entries(fd, policy, target, now, scope)
     return files, dirs
 
 
@@ -318,6 +351,7 @@ def _reclaim_user(
             with os.scandir(agents_fd) as entries:
                 agent_keys = sorted(entry.name for entry in entries if _is_plain_dir(entry))
             for agent_key in agent_keys:
+                scope = _ReclaimScope(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
                 try:
                     with _open_dir(agent_key, parent=agents_fd) as agent_fd:
                         for policy in _POLICIES:
@@ -325,7 +359,7 @@ def _reclaim_user(
                             if target is None:
                                 continue  # 还没有落点的策略,见 _TARGETS 上方注释
                             try:
-                                files, dirs = _reclaim_target(agent_fd, policy, target, now)
+                                files, dirs = _reclaim_target(agent_fd, policy, target, now, scope)
                             except FileNotFoundError:
                                 continue  # 这个 agent 没有这一层目录(常态)
                             except OSError:
@@ -597,8 +631,9 @@ class WorkspaceJanitorWorker:
     async def _sweep_agent_inputs(self, stats: JanitorRunStats) -> None:
         """按 :data:`_POLICIES` 回收 ``agents/<agent_key>/`` 下的过期条目。
 
-        发现源与 :meth:`_sweep_sizes` 同:tenant / user 两层 UUID 目录;再往下
-        ``agents/`` 里是 agent key(**不是 UUID**),走 :func:`_list_agent_dirs`。
+        发现源与 :meth:`_sweep_sizes` 同:tenant / user 两层 UUID 目录;再往下由
+        :func:`_reclaim_user` 接手 —— ``agents/`` 里是 agent key(**不是 UUID**),
+        而且从那一层起整条下降链都走 :func:`_open_dir`(fd 相对、不跟随软链)。
 
         **判据只看 mtime,不碰 atime**:NAS 多半挂成 ``noatime``/``relatime``,
         atime 不可信。cache 条目的 mtime 由预拉脚本维持成「最近一次下载时间」——
@@ -625,10 +660,15 @@ class WorkspaceJanitorWorker:
         # 每轮一条汇总(即使是 0):这是一条不可逆的删除 phase,「这一轮跑过、收了多
         # 少」本身就是要能在日志里查到的事实。逐 (tenant, user, agent, policy) 的明细
         # 由 _reclaim_user 在真删掉东西时记,空轮不产生任何明细行。
+        #
+        # 三个字段**同一个口径**:全部取本 phase 的 ``totals``。别拿 ``stats.inputs_*``
+        # 去填 files/dirs —— 那是**整轮累计**的,今天与 phase 局部相等只是因为这个 phase
+        # 每轮跑一次,而这条巧合没人会记得;哪天 phase 被调用两次,同一行里的
+        # files/dirs 与 by_policy 就会自相矛盾。
         logger.info(
             "workspace_janitor.reclaim_summary files=%d dirs=%d by_policy=%s",
-            stats.inputs_files_removed,
-            stats.inputs_dirs_removed,
+            sum(files for files, _ in totals.values()),
+            sum(dirs for _, dirs in totals.values()),
             ",".join(f"{label}:{files}/{dirs}" for label, (files, dirs) in totals.items()),
         )
 
