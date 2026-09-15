@@ -1515,6 +1515,17 @@ git commit -m "feat(tools): 绑定的纯函数——剥 schema 与填值(B-61 T6
 
 ## Task 7: 接线 —— 建目录时剥 schema,`tools_node` 填值
 
+**追加要求之二(2026-09-16,T6 评审 I-2)——「绑定的参数不在工具 schema 里」今天没有落点**:
+
+spec §5.4 承诺「绑定的参数在该工具 schema 里不存在(对方改了接口)→ 建目录时记一条告警,**该条按未命中处理**,不阻断 run」。
+实际情况:`strip_bound_params` 遇到不存在的参数是正确的空操作,但 `apply_arg_bindings` **照样会把它注入进 args**
+(T6 的签名里没有 schema,查不了),而 T7 原计划只打一条 `mcp.binding_param_absent` 日志、**没把它从绑定表里摘掉**。
+
+后果:对 `additionalProperties: false` 的 MCP 服务端,上游接口一漂移,**一次本来能跑的调用变成硬拒绝** ——
+比承诺的降级更糟。T7 是唯一同时握着绑定表和真实 schema 的地方:**建目录剥 schema 那一步就要把「schema 里没有
+这个参数」的绑定项从下发给 `tools_node` 的表里删掉**,不是只记日志。加一条测试:工具 schema 不含被绑参数时,
+最终发给 MCP 的 args 里**不得出现**该参数。
+
 **追加要求(2026-09-16 用户拍板,spec §5.4)——「绑定一个工具都没匹配上」必须在保存时就说**:
 
 manifest 层查不出这件事(`servers` 为空是默认值且表示「所有服务器」,租户实际有哪些服务器/工具对 protocol 包不可见),
