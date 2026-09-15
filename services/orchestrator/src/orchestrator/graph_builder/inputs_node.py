@@ -89,14 +89,28 @@ def make_inputs_node(
         if run_id is None or tenant_id is None:
             return {}
         raw_inputs = configurable.get(PROMPT_INPUTS_KEY) or {}
-        doc = build_inputs_doc(run_id=run_id, variables=variables, inputs=raw_inputs)
-        # 声明了变量但本轮一个都没传值(全是可选变量且未给)——没有内容可写,
-        # 零副作用地跳过(与「没有声明变量的 agent 不装节点」同一原则,只是
-        # 判定时机不同:那一层在 build 期,这一层在 run 期)。
-        if doc is None or not doc["variables"]:
+        try:
+            doc = build_inputs_doc(run_id=run_id, variables=variables, inputs=raw_inputs)
+            # 声明了变量但本轮一个都没传值(全是可选变量且未给)——没有内容可写,
+            # 零副作用地跳过(与「没有声明变量的 agent 不装节点」同一原则,只是
+            # 判定时机不同:那一层在 build 期,这一层在 run 期)。
+            if doc is None or not doc["variables"]:
+                return {}
+            variable_names = sorted(doc["variables"])
+        except (TypeError, ValueError):
+            # build_inputs_doc 对每个声明变量的 value 提前 json.dumps 一次
+            # (task-1「早失败」设计:不可序列化的值不该等到写文件那一步再炸),
+            # 这条异常因此是真会发生的分支,不是理论上的。永不让 run 失败:与
+            # 写文件/预拉失败同一口径降级。不记值——用声明的变量名(不是 doc
+            # 里的,构造半途失败时 doc 拿不到;不知道具体是哪个变量的值不可
+            # 序列化,所以报全部声明名而不是猜)。
+            logger.warning(
+                "inputs.build_failed",
+                extra={"variable_names": sorted(v.name for v in variables)},
+                exc_info=True,
+            )
             return {}
         rel = inputs_rel_path(run_id)
-        variable_names = sorted(doc["variables"])
         # B-61 §4.1 —— local_path 的落地约定是相对 /workspace;task-1 评审指出
         # 纯函数层(with_local_path)验不出这条,enforcement 落在这里:inputs.json
         # 自己的写入目标必须是相对路径,绝不把绝对路径喂给 SandboxWorkspaceWriter

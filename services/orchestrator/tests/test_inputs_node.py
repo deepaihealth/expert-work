@@ -88,6 +88,20 @@ async def test_no_url_means_no_prefetch_exec() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_non_serializable_value_never_fails_the_run() -> None:
+    """fix round 1 —— ``build_inputs_doc`` 对每个声明变量的 value 提前
+    ``json.dumps`` 一次(task-1 的「早失败」设计);``validate_prompt_inputs``
+    (control_plane/prompt_render.py)只查名字和 required,从不查可序列化性,
+    所以一个不是纯 JSON 的值(如 ``set``)真的能走到这里。这条异常原先漏在
+    每个 try/except 之外,会直接冒穿节点、杀掉整个 run。"""
+    runtime = _FakeRuntime()
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="a"),))
+    result = await node({}, _config(uuid4(), uuid4(), uuid4(), {"a": {1, 2, 3}}))
+    assert result == {}
+    assert runtime.execs == [], "构造 doc 都没成功,不该有任何 exec"
+
+
+@pytest.mark.asyncio
 async def test_a_failing_sandbox_never_fails_the_run() -> None:
     class _Boom(_FakeRuntime):
         async def exec(self, *, code: str, **kwargs: Any) -> Any:
