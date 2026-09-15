@@ -1377,7 +1377,13 @@ class AgentSandboxClient:
         self._forget_session_identity(sandbox_id)
 
     async def exec(
-        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
     ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
         ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
@@ -1470,7 +1476,10 @@ class AgentSandboxClient:
         token 走 ``create(envs=...)``(§ 模块 docstring "Important-3")只送一
         次;这里不同 —— SDK 的 ``commands.run`` 本就支持逐次传 envs,同用户
         双 agent 共享一个已建好的热会话时,才需要"每次 exec 都能换一个不同
-        的 agent_key"。
+        的 agent_key"。``run_id`` 非 ``None`` 时同一个 :func:`agent_key_envs`
+        再加一项 ``EXPERT_WORK_INPUTS``(B-61 §4.4);它不像 ``agent_key`` 那样
+        经 binding wrapper 预绑定,是调用方(``run_in_sandbox``)每次直接把
+        ``ctx.run_id`` 带下来的。
 
         ``umask 077 && `` 前缀:``commands.run`` 走 ``/bin/bash -l -c cmd``
         (见上方 docstring),所以能在同一个 shell 里先设 umask 再 exec
@@ -1509,7 +1518,7 @@ class AgentSandboxClient:
 
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
         started = _monotonic()
-        envs = agent_key_envs(agent_key)
+        envs = agent_key_envs(agent_key, run_id=run_id)
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             # B-60 —— 命令串由 exec_view.build_exec_command 生成:umask 077,再在自己的

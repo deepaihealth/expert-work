@@ -93,6 +93,7 @@ import re
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 
 from orchestrator.tools.agent_sandbox import MAX_OUTPUT_CHARS
@@ -941,6 +942,81 @@ async def test_exec_injects_per_agent_pythonuserbase(runtime: SandboxRuntime) ->
             agent_key="contract-agent",
         )
         assert outcome.stdout.strip() == f"{SANDBOX_AGENTS_ROOT}/contract-agent"
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+def test_exec_envs_carry_the_inputs_path_when_a_run_is_bound() -> None:
+    """B-61 §4.4 —— ``agent_key_envs`` 单源:``run_id`` 非 ``None`` 时两个
+    后端都会经由它拿到同一个 ``EXPERT_WORK_INPUTS`` 值。这条不连任何真实
+    环境(同 ``test_exec_contract_constants_match_the_sandbox_image`` 的
+    手法),每一次 ``pytest -m "not integration"`` 全仓扫描都跑得到。"""
+    from orchestrator.tools.inputs_doc import inputs_abs_path
+    from orchestrator.tools.sandbox import agent_key_envs
+
+    run_id = UUID("382f6f5a-55c4-49be-ac05-32fa143f010d")
+    envs = agent_key_envs("ai-health-plan-30817804", run_id=run_id)
+    assert envs["EXPERT_WORK_INPUTS"] == inputs_abs_path(run_id)
+    assert envs["PYTHONUSERBASE"].endswith("ai-health-plan-30817804"), "原有隔离不能丢"
+
+
+def test_exec_envs_without_a_run_are_unchanged() -> None:
+    """未绑 run(``run_id=None``,``agent_key_envs`` 的默认值)时不该多出
+    ``EXPERT_WORK_INPUTS`` —— 沙箱内没有 run_id 就没有对应的 ``inputs.json``。"""
+    from orchestrator.tools.sandbox import agent_key_envs
+
+    assert set(agent_key_envs("k")) == {"PYTHONUSERBASE"}
+
+
+@pytest.mark.asyncio
+async def test_supervisor_exec_forwards_run_id_to_agent_key_envs() -> None:
+    """B-61 §4.4 —— 钉住 ``HTTPSupervisorRuntime.exec`` 这一个生产调用点:
+    它改成不把 ``run_id`` 转手给 ``agent_key_envs`` 时,这里必须红。不连真实
+    supervisor(``httpx.MockTransport`` 截住请求体,同
+    ``test_sandbox_trace_propagation.py`` 的手法),每一次
+    ``pytest -m "not integration"`` 全仓扫描都跑得到。"""
+    from orchestrator.tools.inputs_doc import inputs_abs_path
+    from orchestrator.tools.sandbox import HTTPSupervisorRuntime
+
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"stdout": "", "stderr": "", "exit_code": 0})
+
+    client = HTTPSupervisorRuntime(
+        base_url="http://supervisor", transport=httpx.MockTransport(handler)
+    )
+    run_id = uuid4()
+
+    await client.exec(sandbox_id=uuid4(), code="print(1)", timeout_s=5, run_id=run_id)
+
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["envs"]["EXPERT_WORK_INPUTS"] == inputs_abs_path(run_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_both_backends_send_byte_identical_inputs_env(runtime: SandboxRuntime) -> None:
+    """B-61 §4.4 —— 沿用本文件既有的两后端对拍夹具(``runtime`` fixture,同
+    ``test_exec_injects_per_agent_pythonuserbase`` 的手法):两个后端各自跑
+    同一段探针代码,分别断言等于同一个由 ``agent_key_envs`` 计算出的黄金值
+    ——两者都等于它,即两者彼此相等(byte-identical)。"""
+    from orchestrator.tools.inputs_doc import inputs_abs_path
+
+    run_id = uuid4()
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c17")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="import os; print(os.environ.get('EXPERT_WORK_INPUTS'))",
+            timeout_s=30,
+            run_id=run_id,
+        )
+        assert outcome.stdout.strip() == inputs_abs_path(run_id)
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 

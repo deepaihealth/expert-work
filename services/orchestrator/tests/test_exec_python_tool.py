@@ -60,6 +60,20 @@ async def test_exec_python_runs_code_and_returns_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exec_python_passes_run_id_to_exec() -> None:
+    """B-61 §4.4 —— ``run_in_sandbox`` 把 ``ctx.run_id`` 原样带给
+    ``client.exec``,这是唯一的生产调用点(``exec_python``/``bash``/
+    ``read_file``/``write_file`` 等共用)。忘了传的话两个真实后端都拿不到
+    ``EXPERT_WORK_INPUTS`` 该有的 ``run_id`` —— 这条钉住这一层不被静默丢掉。"""
+    client = RecordingSandboxRuntime()
+    ctx = _ctx()
+
+    await ExecPythonTool(client=client).call({"code": "print(1)"}, ctx=ctx)
+
+    assert client.exec_run_ids == [ctx.run_id]
+
+
+@pytest.mark.asyncio
 async def test_exec_python_passes_skill_seed_files_to_acquire() -> None:
     # skill-runtime §5.1 — the build-bound skill seed set reaches acquire so the
     # supervisor materializes /opt/skills/<agent_key>/<name>/ before the code

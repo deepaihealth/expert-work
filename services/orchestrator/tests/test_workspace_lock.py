@@ -55,7 +55,9 @@ class _LockProbeClient:
     ) -> UUID:
         return uuid4()
 
-    async def exec(self, *, sandbox_id: UUID, code: str, timeout_s: int | None) -> SandboxOutcome:
+    async def exec(
+        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, run_id: UUID | None = None
+    ) -> SandboxOutcome:
         self.active_at_exec = self.lock.active
         return SandboxOutcome(stdout=self.envelope, stderr="", exit_code=0, timed_out=False)
 

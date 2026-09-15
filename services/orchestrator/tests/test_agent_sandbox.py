@@ -1518,6 +1518,25 @@ async def test_exec_omits_pythonuserbase_when_agent_key_unset() -> None:
     assert sdk.sandbox.commands.envs_calls[-1] is None
 
 
+@pytest.mark.asyncio
+async def test_exec_injects_expert_work_inputs_when_run_id_set() -> None:
+    """B-61 §4.4 —— ``run_id`` 非空时随 ``commands.run(envs=)`` 注入
+    ``EXPERT_WORK_INPUTS``,与本地 supervisor 后端同一份值(``agent_key_envs``
+    单源,两后端契约见 ``test_sandbox_runtime_contract.py``)。这条钉住的正是
+    ``AgentSandboxClient.exec`` 这一个生产调用点 —— 它改成不把 ``run_id``
+    转手给 ``agent_key_envs`` 时,这里必须红。"""
+    from orchestrator.tools.inputs_doc import inputs_abs_path
+
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+    run_id = uuid4()
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, run_id=run_id)
+
+    assert sdk.sandbox.commands.envs_calls[-1] == {"EXPERT_WORK_INPUTS": inputs_abs_path(run_id)}
+
+
 def _dockerfile_text() -> str:
     dockerfile = Path(__file__).resolve().parents[3] / "infra" / "sandbox-image" / "Dockerfile"
     assert dockerfile.is_file(), f"沙箱镜像 Dockerfile 不在预期位置:{dockerfile}"

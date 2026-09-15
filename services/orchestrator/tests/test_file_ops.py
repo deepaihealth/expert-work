@@ -699,10 +699,17 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         self._stdouts = list(stdouts)
 
     async def exec(  # type: ignore[override]
-        self, *, sandbox_id: UUID, code: str, timeout_s: int | None, agent_key: str = ""
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)
+        self.exec_run_ids.append(run_id)
         stdout = self._stdouts.pop(0) if self._stdouts else ""
         return SandboxOutcome(stdout=stdout, stderr="", exit_code=0, timed_out=False)
 
