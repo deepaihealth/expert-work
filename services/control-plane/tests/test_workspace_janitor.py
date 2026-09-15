@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import os
 import tarfile
 import time
@@ -31,6 +32,7 @@ from control_plane.advisory_locks import WORKSPACE_JANITOR_LOCK_CLASSID
 from control_plane.workspace_janitor import (
     _POLICIES,
     _SCRATCH_MAX_AGE_S,
+    _TARGETS,
     JanitorRunStats,
     WorkspaceJanitorWorker,
 )
@@ -537,24 +539,31 @@ async def test_sweep_never_touches_a_recently_written_run_dir(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_sweep_ignores_dirs_that_are_not_uuid_shaped(tmp_path: Path) -> None:
     """只认 ``inputs/<uuid>/`` 与 ``inputs/cache/``,其它一律不碰 —— 包括空着
-    的 ``cache/`` 自己(它是目录但名字不是 UUID,不该被当成过期的 run 目录)。"""
+    的 ``cache/`` 自己(它是目录但名字不是 UUID,不该被当成过期的 run 目录)。
+
+    ``hexish`` 是 32 位无横杠 hex:``UUID(name)`` **接受**它,而生产者只会写
+    ``str(run_id)``。判据松一位,别人建的目录就被整棵 rmtree 掉。
+    """
     tenant, user = uuid4(), uuid4()
     inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
     stranger = inputs / "notes"
     stranger.mkdir(parents=True)
     kept = stranger / "keep.md"
     kept.write_text("x")
+    hexish = inputs / ("a" * 32)
+    hexish.mkdir()
     loose = inputs / "README.md"
     loose.write_text("x")
     cache = inputs / "cache"
     cache.mkdir()
-    for path in (kept, stranger, loose, cache, inputs):
+    for path in (kept, stranger, hexish, loose, cache, inputs):
         _age(path, seconds=_TTL_S["inputs_run_dir"] * 4)
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
     assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (0, 0)
     assert stranger.is_dir() and kept.exists() and loose.exists() and cache.is_dir()
+    assert hexish.is_dir()
 
 
 @pytest.mark.asyncio
@@ -616,34 +625,129 @@ async def test_a_leftover_tmp_file_is_reclaimed(tmp_path: Path) -> None:
 async def test_inputs_scan_failure_does_not_stop_other_users(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """一个 ``inputs/`` 扫描失败(NFS ESTALE / 权限)不该带走整个 phase。
+    """一个 agent 子树打不开(权限 / NFS ESTALE)不该带走整个 phase。
 
-    照 ``test_full_scan_tenant_listing_failure_does_not_stop_other_tenants`` 的
-    配方:坏租户钉成全零 UUID,``_list_uuid_dirs`` 按 UUID 字符串排序,它必然排
-    在随机的好租户之前 —— 否则好租户恰好先被处理完的话,即使少了要测的
-    ``except OSError`` 兜底,``_run_cycle`` 那层按阶段的粗粒度 catch 也会让断言
-    巧合通过。
+    注入点是 ``os.open``(不是 ``os.scandir``):回收链路整条走 fd —— 先
+    ``_open_dir`` 拿目录 fd、再 ``os.scandir(fd)``,``scandir`` 拿到的是 int,按路径
+    打桩根本打不中(改成 fd 版之后,旧写法会静默变成一条空测试)。按**唯一的 agent
+    key** 拦,不会误伤别处的 ``os.open``。
+
+    隔离要求是**逐 agent**,所以坏 agent 必须有个**同一用户下的兄弟 agent**:少了它,
+    异常被用户那一层的兜底接住也看不出区别(实测:第一版没有兄弟,去掉 per-agent 的
+    catch 一条测试都不红)。``agents/`` 下按名字排序遍历,``bad-agent`` 必在
+    ``sibling-agent`` 之前。坏租户同理钉 ``UUID(int=0)``(``_list_uuid_dirs`` 按 UUID
+    字符串排序),保证它排在随机的好租户之前 —— 否则好租户恰好先被处理完的话,
+    ``_run_cycle`` 那层按阶段的粗粒度 catch 也会让断言巧合通过。
     """
-    bad_tenant, good_tenant = UUID(int=0), uuid4()
-    bad_inputs = _agent_dir(tmp_path, bad_tenant, uuid4()) / "inputs"
-    bad_inputs.mkdir(parents=True)
-    good_inputs = _agent_dir(tmp_path, good_tenant, uuid4()) / "inputs"
-    stale_run = good_inputs / str(uuid4())
-    stale_run.mkdir(parents=True)
-    _age(stale_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+    bad_tenant, good_tenant, bad_user = UUID(int=0), uuid4(), uuid4()
+    bad_run = _agent_dir(tmp_path, bad_tenant, bad_user, key="bad-agent") / "inputs" / str(uuid4())
+    bad_run.mkdir(parents=True)
+    sibling_run = (
+        tmp_path / str(bad_tenant) / str(bad_user) / "agents" / "sibling-agent" / "inputs"
+    ) / str(uuid4())
+    sibling_run.mkdir(parents=True)
+    good_run = (
+        _agent_dir(tmp_path, good_tenant, uuid4(), key="good-agent") / "inputs" / str(uuid4())
+    )
+    good_run.mkdir(parents=True)
+    for path in (bad_run, sibling_run, good_run):
+        _age(path, seconds=_TTL_S["inputs_run_dir"] + 60)
 
-    real_scandir = os.scandir
+    real_open = os.open
 
-    def _flaky_scandir(path: Any) -> Any:
-        # 只在 path 真是路径时比对:``shutil.rmtree`` 内部会拿裸 fd 再进
-        # ``os.scandir``(安全 fd 变体),拿它去 ``Path()`` 会 TypeError。
-        if isinstance(path, str | os.PathLike) and Path(path) == bad_inputs:
+    def _flaky_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if path == "bad-agent":
             raise PermissionError("denied")
-        return real_scandir(path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(os, "scandir", _flaky_scandir)
+    monkeypatch.setattr(os, "open", _flaky_open)
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
-    assert stats.inputs_dirs_removed == 1
-    assert not stale_run.exists()
+    assert stats.inputs_dirs_removed == 2  # 同用户的兄弟 agent + 另一个租户的用户
+    assert not sibling_run.exists() and not good_run.exists()
+    assert bad_run.exists()  # 打不开的那棵原样留着,不是「删不掉就当没有」
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_follow_a_symlinked_scan_base(tmp_path: Path) -> None:
+    """``inputs`` / ``inputs/cache`` 被换成软链时,janitor 不许跟过去删。
+
+    不是理论风险:B-60 之后每次 exec 把 ``agents/<key>/`` bind 成 ``/workspace``,
+    沙箱里由模型驱动的代码可以 ``rm -rf inputs && ln -s <任意目标> inputs``;而这个
+    phase 以控制面身份跑、对整棵 NAS 有写权限。跟过去一次就是删别人的目录(评审
+    PoC:``inputs`` 指向租户目录时,另一个用户的整棵工作区被 rmtree)。
+
+    两条策略各覆盖一个落点:``inputs_run_dir`` 的落点是 ``inputs/``(软链换掉它),
+    ``inputs_cache`` 的落点是 ``inputs/cache/``(第二级也要挡,而且它
+    ``file_names=None`` —— 跟过去就是「这一层文件全收」)。
+    """
+    tenant = uuid4()
+    victim_dir = tmp_path / "victim" / str(uuid4())  # UUID 形状 + 超期 = 跟过去必被收
+    victim_dir.mkdir(parents=True)
+    victim_file = tmp_path / "victim-cache" / "old.png"
+    victim_file.parent.mkdir(parents=True)
+    victim_file.write_bytes(b"x" * 10)
+    for path in (victim_dir, victim_file):
+        _age(path, seconds=_TTL_S["inputs_run_dir"] * 4)
+
+    swapped = _agent_dir(tmp_path, tenant, uuid4()) / "inputs"
+    swapped.symlink_to(victim_dir.parent)
+
+    cache_swapped = _agent_dir(tmp_path, tenant, uuid4()) / "inputs"
+    cache_swapped.mkdir()
+    (cache_swapped / "cache").symlink_to(victim_file.parent)
+
+    innocent_run = _agent_dir(tmp_path, tenant, uuid4()) / "inputs" / str(uuid4())
+    innocent_run.mkdir(parents=True)
+    _age(innocent_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert victim_dir.is_dir() and victim_file.exists()  # 一个都没少
+    assert swapped.is_symlink() and (cache_swapped / "cache").is_symlink()  # 软链自己也不删
+    # phase 没被这两条带走:同一轮里正常用户的过期目录照收(且只收了它)
+    assert (stats.inputs_files_removed, stats.inputs_dirs_removed) == (0, 1)
+    assert not innocent_run.exists()
+
+
+def test_every_policy_has_an_explicit_target_entry() -> None:
+    """策略表与落点表必须逐条对上 —— 「暂时没有落点」要显式写 ``None``。
+
+    漏配不会报错,只会让那条策略拨开 ``enabled`` 之后一声不吭地什么都不收
+    (实现里另有一条导入期的硬检查,这条测试是它的可读版本)。
+    """
+    assert {policy.label for policy in _POLICIES} == set(_TARGETS)
+    assert _TARGETS["artifacts"] is None  # 产物还没有落点,B-63 定义完再补
+
+
+@pytest.mark.asyncio
+async def test_reclaim_logs_counts_but_never_names(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """不可逆的删除要留得下痕迹:逐 ``(tenant, user, agent, policy)`` 记计数,外加每轮
+    一条汇总 —— 事后要答得出「谁的哪个 agent、按哪条策略、丢了几个」。
+
+    但**只记标识与计数**:条目名是租户内容(上传件的文件名、产物名可能是客户的人名),
+    一个字都不许进日志。空轮不产生明细行,只有汇总。
+    """
+    tenant, user = uuid4(), uuid4()
+    cache = _agent_dir(tmp_path, tenant, user, key="demo-agent") / "inputs" / "cache"
+    cache.mkdir(parents=True)
+    named = cache / "张三的体检报告.pdf"
+    named.write_bytes(b"x")
+    _age(named, seconds=_TTL_S["inputs_cache"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    with caplog.at_level(logging.INFO, logger="control_plane.workspace_janitor"):
+        await worker.run_once()
+
+    messages = [record.getMessage() for record in caplog.records]
+    detail = [m for m in messages if m.startswith("workspace_janitor.reclaimed ")]
+    summary = [m for m in messages if m.startswith("workspace_janitor.reclaim_summary ")]
+    assert len(detail) == 1 and len(summary) == 1
+    assert f"tenant={tenant}" in detail[0] and f"user={user}" in detail[0]
+    assert "agent=demo-agent" in detail[0] and "policy=inputs_cache" in detail[0]
+    assert "files=1 dirs=0" in detail[0]
+    assert "files=1 dirs=0" in summary[0] and "inputs_cache:1/0" in summary[0]
+    assert not any("张三" in m for m in messages)  # 租户内容一个字都不进日志

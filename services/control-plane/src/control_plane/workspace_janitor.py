@@ -28,10 +28,12 @@ failing phase logs and lets the remaining phases run (``_run_cycle``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -94,8 +96,14 @@ _INPUTS_DIR = "inputs"
 #: 共享缓存,挂在 ``inputs/`` 下、与 ``<run_id>/`` 平级。
 _INPUTS_CACHE_DIR = "cache"
 
-#: ``tools/prefetch_script._rewrite`` 的临时文件(``inputs.json`` + ``.tmp``)。
-#: 它正常会被 ``os.replace`` 消费掉,预拉被 SIGKILL 时才遗留。
+#: ``tools/prefetch_script._rewrite`` 的临时文件名(``inputs.json`` + ``.tmp``)。
+#:
+#: **这个名字今天在 ``inputs/`` 这一层打不到东西**:`_rewrite` 写的是
+#: ``inputs_path + ".tmp"``,而 ``inputs_path`` 是 ``inputs/<run_id>/inputs.json``,
+#: 残留只会落在 run 目录里、随整棵目录被收(brief 给的理由有误,已回报)。留着是
+#: 防御性的 —— 生产者哪天把改写挪上一层,这里不用再想起来。
+#: **但承载它的机制不是死的**:``file_names`` 非 ``None`` = 「只收名单里的文件」,
+#: 正是这道闸让 ``inputs/README.md`` 这类别人的文件活下来(变异 M6 实证)。
 _INPUTS_TMP_NAME = "inputs.json.tmp"
 
 
@@ -143,15 +151,26 @@ class _ReclaimTarget:
     file_names: frozenset[str] | None
 
 
-#: 每条策略去哪儿收,键是 :attr:`_ReclaimPolicy.label`。
+#: 每条策略去哪儿收,键是 :attr:`_ReclaimPolicy.label`;``None`` = **还没有落点**。
+#: 两条关着的策略各自欠着一笔,拨开关之前都得先还:
 #:
-#: ``artifacts`` **故意没有条目**:产物没有保留前缀 —— ``save_artifact`` 只是把
-#: agent 子树里任意位置的一个文件**登记成一行**(``tools/artifact.py``),纯文件系统
-#: 的清扫器认不出哪个文件是产物,``layout.py`` 的 ``WORKSPACE_RESERVED_PREFIXES``
-#: 正是为此只列 machinery 与 uploads。所以「产物在哪」要等 B-63 先定义(它的方案是
-#: 让目录自描述)。策略行留着是为了 TTL 与开关已经在位;**开关拨开之前还得先在这里
-#: 补上落点**,否则它拨开也不收东西。
-_TARGETS: dict[str, _ReclaimTarget] = {
+#: * ``uploads`` 这一条**只覆盖 ``agents/<key>/uploads/``**(B-50 搬迁之后的位置),
+#:   而上传件一共落在三处:① 这里;② **用户根的 ``uploads/``** —— ``api/
+#:   _workspace_shared.workspace_agent_path`` 在 ``agent_key`` 为空(会话没绑 agent /
+#:   机器线程)时**原样返回** ``rel``,是**今天仍在写**的路径;③ ``shared/uploads/``
+#:   —— 搬迁留下的 legacy(只读、不再写入),被
+#:   ``test_legacy_toplevel_and_shared_uploads_are_still_reserved`` 钉成合法位置。
+#:   ②③ **不在 ``agents/`` 下**,本 phase 的遍历(用户根 → ``agents/`` → agent key)
+#:   结构上就到不了 —— B-63 拨开这个开关要补的是**第二条遍历**,不是在这张表上多加
+#:   一行;不补就是个只收三分之一、自己不会说话的开关。
+#: * ``artifacts`` **显式写 None**(不是漏配):产物没有保留前缀 —— ``save_artifact``
+#:   只是把 agent 子树里任意位置的一个文件**登记成一行**(``tools/artifact.py``),
+#:   纯文件系统的清扫器认不出哪个文件是产物,``layout.py`` 的
+#:   ``WORKSPACE_RESERVED_PREFIXES`` 正是为此只列 machinery 与 uploads。「产物在哪」
+#:   要等 B-63 先定义(它的方案是让目录自描述)。
+#:
+#: 两条都一样:**开关拨开 ≠ 立刻生效**,先补落点/遍历,否则拨开也收不到东西。
+_TARGETS: dict[str, _ReclaimTarget | None] = {
     "inputs_cache": _ReclaimTarget(
         subdir=f"{_INPUTS_DIR}/{_INPUTS_CACHE_DIR}", uuid_dirs=False, file_names=None
     ),
@@ -159,59 +178,80 @@ _TARGETS: dict[str, _ReclaimTarget] = {
         subdir=_INPUTS_DIR, uuid_dirs=True, file_names=frozenset({_INPUTS_TMP_NAME})
     ),
     "uploads": _ReclaimTarget(subdir=WORKSPACE_UPLOADS_DIR, uuid_dirs=False, file_names=None),
+    "artifacts": None,
 }
+
+if {policy.label for policy in _POLICIES} != _TARGETS.keys():
+    # 导入期就炸,不给「静默什么都不收」留位置:两张按 label 索引的表一旦对不上,
+    # 漏配的那条策略拨开 enabled 也是个哑开关,而没有任何运行期信号会提到它。
+    # 用显式 raise 不用 assert —— assert 在 ``-O`` 下会被整段裁掉。
+    raise RuntimeError("workspace_janitor: _POLICIES 与 _TARGETS 的 label 必须一一对应")
 
 
 def _is_uuid_name(name: str) -> bool:
+    """名字是不是 ``str(run_id)`` 的规范形状。
+
+    比「``UUID(name)`` 解析得了」严:后者还接受 32 位无横杠 hex、``{...}``、
+    ``urn:uuid:…`` 与横杠乱放的写法。生产者写进去的只有 ``str(run_id)``,而这是一条
+    **删除**路径、兄弟目录是 agent 自己造的 —— 宽松的代价是别人的
+    ``inputs/aaaa…aaaa/`` 被整棵 rmtree。既有 ``_list_uuid_dirs`` 也是宽的那种写法,
+    但它枚举的是平台自己造的目录,代价不一样。
+    """
     try:
-        UUID(name)
+        return str(UUID(name)) == name
     except ValueError:
         return False
-    return True
 
 
-def _list_agent_dirs(user_dir: Path) -> list[Path]:
-    """``<user_dir>/agents/`` 下的每棵 agent 子树。
+#: 打开目录用的 flags。``O_NOFOLLOW`` = 不跟随**末段**软链,``O_DIRECTORY`` = 打开
+#: 的必须真是目录。这两个位是本 phase 安全性的本体,见 :func:`_open_dir`。
+_OPEN_DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
 
-    这一层的名字是 agent key(**不是 UUID**),所以复用不了 ``_list_uuid_dirs``。
-    名字不做形状校验:路径是从 ``entry.path`` 直接拿的,不是拼字符串,``scandir``
-    给的名字里不可能有 ``/``。symlink 不算目录(``follow_symlinks=False``):不顺
-    着链接删。单目录扫描失败 log + 返回已收集的部分,照本文件既有口径。
+
+@contextlib.contextmanager
+def _open_dir(name: str, *, parent: int | None = None) -> Iterator[int]:
+    """相对 ``parent`` 打开一个目录拿 fd,**绝不跟随软链**;用完即关。
+
+    这是本 phase 唯一的下降方式,理由是它删的东西在 **agent 自己写得了的目录**里:
+    B-60 之后每次 exec 把 ``agents/<key>/`` bind 成 ``/workspace``,沙箱里由模型驱动
+    的代码可以 ``rm -rf inputs && ln -s <任意目标> inputs``。而 ``os.scandir(路径)``
+    会跟随末段软链 —— 跟过去一次,这个以控制面身份、对整棵 NAS 有写权限的后台任务
+    就成了越界删除器(评审 PoC:``inputs`` 指向租户目录时,另一个用户的整棵工作区被
+    ``rmtree``;``inputs/cache`` 指向绝对路径时连容器自己的文件都进射程)。
+
+    ``O_NOFOLLOW`` 让这一步在**打开的那一刻**就失败(Linux ELOOP / macOS ENOTDIR),
+    之后的 ``scandir`` / ``unlink`` / ``rmtree`` 全部相对 fd 做:路径字符串再也进不了
+    删除调用,check 与 use 之间也就没有可以插一条软链的窗口。
     """
-    agents_root = user_dir / WORKSPACE_AGENTS_DIR
-    out: list[Path] = []
+    fd = os.open(name, _OPEN_DIR_FLAGS, dir_fd=parent)
     try:
-        with os.scandir(agents_root) as it:
-            for entry in it:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        out.append(Path(entry.path))
-                except OSError:
-                    continue
-    except FileNotFoundError:
-        return []
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _is_plain_dir(entry: os.DirEntry[str]) -> bool:
+    """是不是一个**不经软链**的真目录;stat 失败(并发删 / ESTALE)当作不是。"""
+    try:
+        return entry.is_dir(follow_symlinks=False)
     except OSError:
-        logger.warning("workspace_janitor.agents_scan_failed path=%s", agents_root)
-        return out
-    return sorted(out)
+        return False
 
 
-def _reclaim(agent_dir: Path, policy: _ReclaimPolicy, now: float) -> tuple[int, int]:
-    """按一条策略收一棵 agent 子树,返回 ``(删掉的文件数, 删掉的目录数)``。
+def _reclaim_entries(
+    fd: int, policy: _ReclaimPolicy, target: _ReclaimTarget, now: float
+) -> tuple[int, int]:
+    """在**已经打开**的这一层目录里按策略收条目,返回 ``(文件数, 目录数)``。
 
-    判据只有 mtime 一条(见 :meth:`WorkspaceJanitorWorker._sweep_agent_inputs`)。
-    单条目失败 log + 继续:NAS 上并发写删是常态,一个 ESTALE 不该带走这一轮的其余
-    条目。日志只记策略名与**目录**路径,不记条目名 —— uploads 的文件名是租户上传时
-    带的,属于租户内容(spec §八)。
+    删除一律走 ``dir_fd``(``os.unlink(name, dir_fd=fd)`` /
+    ``shutil.rmtree(name, dir_fd=fd)`` —— 后者 ``avoids_symlink_attacks`` 为真,内部
+    也是 ``O_NOFOLLOW`` 逐级下降),不拼路径字符串。单条目失败 log + 继续,扫描中途
+    失败(ESTALE)也只是提前收尾:**已经删掉的照样记数**,不然 stats 会少报。
     """
-    target = _TARGETS.get(policy.label)
-    if target is None:
-        return 0, 0
-    base = agent_dir / target.subdir
     files = dirs = 0
     try:
-        with os.scandir(base) as it:
-            for entry in it:
+        with os.scandir(fd) as entries:  # fd 归调用方所有,scandir 不会关掉它
+            for entry in entries:
                 try:
                     is_dir = entry.is_dir(follow_symlinks=False)
                     if is_dir:
@@ -222,29 +262,108 @@ def _reclaim(agent_dir: Path, policy: _ReclaimPolicy, now: float) -> tuple[int, 
                         if target.file_names is not None and entry.name not in target.file_names:
                             continue
                     else:
-                        continue  # symlink / 特殊文件:不是本平台造的,不碰
+                        continue  # 软链 / 特殊文件:不是本平台造的,不碰
                     if not policy.expired(entry.stat(follow_symlinks=False).st_mtime, now):
                         continue
                 except OSError:
                     continue
                 try:
                     if is_dir:
-                        shutil.rmtree(entry.path)
+                        shutil.rmtree(entry.name, dir_fd=fd)
                         dirs += 1
                     else:
-                        os.unlink(entry.path)
+                        os.unlink(entry.name, dir_fd=fd)
                         files += 1
                 except OSError:
+                    logger.warning("workspace_janitor.reclaim_failed policy=%s", policy.label)
+    except OSError:
+        logger.warning("workspace_janitor.reclaim_scan_failed policy=%s", policy.label)
+    return files, dirs
+
+
+def _reclaim_target(
+    agent_fd: int, policy: _ReclaimPolicy, target: _ReclaimTarget, now: float
+) -> tuple[int, int]:
+    """下降到 ``target.subdir`` 再收 —— **每一段**都相对上一级的 fd 打开。
+
+    逐段而不是一次 ``agent_dir / subdir``:``inputs`` 与 ``inputs/cache`` 都在 agent
+    手里,任何一段是软链都必须当场失败(见 :func:`_open_dir`)。目录不存在
+    (绝大多数 agent 没有 ``inputs/``)与软链都从这里抛 ``OSError`` 给调用方分流。
+    """
+    with contextlib.ExitStack() as stack:
+        fd = agent_fd
+        for part in target.subdir.split("/"):
+            fd = stack.enter_context(_open_dir(part, parent=fd))
+        files, dirs = _reclaim_entries(fd, policy, target, now)
+    return files, dirs
+
+
+def _reclaim_user(
+    user_dir: Path, *, tenant_id: UUID, user_id: UUID, now: float
+) -> dict[str, tuple[int, int]]:
+    """一个用户工作区里按 :data:`_POLICIES` 逐条回收,返回 ``{label: (文件数, 目录数)}``。
+
+    ``agents/`` 下是 agent key(**不是 UUID**),复用不了 ``_list_uuid_dirs``;而且整条
+    下降链必须走 :func:`_open_dir`,不能把路径字符串交给 ``scandir``。单个 agent 失败
+    log + 继续 —— 一个 ESTALE 不该带走这一轮其余的 agent。
+
+    删成功就地记一条 ``(tenant, user, agent, policy)`` 粒度的日志:这是一条**不可逆**
+    的删除路径,事后要答得出「谁的哪个 agent、按哪条策略、丢了几个」。**只记标识与计
+    数,永不记条目名** —— 名字是租户内容(上传件的文件名、产物名可能是客户的人名)。
+    """
+    tally = {policy.label: (0, 0) for policy in _POLICIES}
+    agents_root = user_dir / WORKSPACE_AGENTS_DIR
+    try:
+        with _open_dir(str(agents_root)) as agents_fd:
+            with os.scandir(agents_fd) as entries:
+                agent_keys = sorted(entry.name for entry in entries if _is_plain_dir(entry))
+            for agent_key in agent_keys:
+                try:
+                    with _open_dir(agent_key, parent=agents_fd) as agent_fd:
+                        for policy in _POLICIES:
+                            target = _TARGETS[policy.label]
+                            if target is None:
+                                continue  # 还没有落点的策略,见 _TARGETS 上方注释
+                            try:
+                                files, dirs = _reclaim_target(agent_fd, policy, target, now)
+                            except FileNotFoundError:
+                                continue  # 这个 agent 没有这一层目录(常态)
+                            except OSError:
+                                # 软链(ELOOP/ENOTDIR)、权限、ESTALE —— 都只跳过这一条
+                                logger.warning(
+                                    "workspace_janitor.reclaim_base_unusable "
+                                    "tenant=%s user=%s agent=%s policy=%s",
+                                    tenant_id,
+                                    user_id,
+                                    agent_key,
+                                    policy.label,
+                                )
+                                continue
+                            if files or dirs:
+                                logger.info(
+                                    "workspace_janitor.reclaimed "
+                                    "tenant=%s user=%s agent=%s policy=%s files=%d dirs=%d",
+                                    tenant_id,
+                                    user_id,
+                                    agent_key,
+                                    policy.label,
+                                    files,
+                                    dirs,
+                                )
+                            had_files, had_dirs = tally[policy.label]
+                            tally[policy.label] = (had_files + files, had_dirs + dirs)
+                except OSError:
                     logger.warning(
-                        "workspace_janitor.reclaim_failed policy=%s path=%s", policy.label, base
+                        "workspace_janitor.reclaim_agent_failed tenant=%s user=%s agent=%s",
+                        tenant_id,
+                        user_id,
+                        agent_key,
                     )
     except FileNotFoundError:
-        return 0, 0  # 绝大多数 agent 根本没有这一层目录
+        return tally  # 用户根下还没有 agents/(没跑过任何 agent)
     except OSError:
-        logger.warning(
-            "workspace_janitor.reclaim_scan_failed policy=%s path=%s", policy.label, base
-        )
-    return files, dirs
+        logger.warning("workspace_janitor.agents_scan_failed path=%s", agents_root)
+    return tally
 
 
 def _list_uuid_dirs(path: Path) -> list[tuple[UUID, Path]]:
@@ -290,7 +409,7 @@ class JanitorRunStats:
 
 
 class WorkspaceJanitorWorker:
-    """Runs the three-phase sweep on a timer, single-flight across replicas.
+    """Runs the four-phase sweep on a timer, single-flight across replicas.
 
     Safe to deploy on every replica: a losing replica's
     ``pg_try_advisory_xact_lock`` attempt returns immediately with
@@ -492,13 +611,26 @@ class WorkspaceJanitorWorker:
         """
         root = Path(self._workspace_root)
         now = time.time()
-        for _tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
-            for _user_id, user_dir in await asyncio.to_thread(_list_uuid_dirs, tenant_dir):
-                for agent_dir in await asyncio.to_thread(_list_agent_dirs, user_dir):
-                    for policy in _POLICIES:
-                        files, dirs = await asyncio.to_thread(_reclaim, agent_dir, policy, now)
-                        stats.inputs_files_removed += files
-                        stats.inputs_dirs_removed += dirs
+        totals = {policy.label: (0, 0) for policy in _POLICIES}
+        for tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
+            for user_id, user_dir in await asyncio.to_thread(_list_uuid_dirs, tenant_dir):
+                tally = await asyncio.to_thread(
+                    _reclaim_user, user_dir, tenant_id=tenant_id, user_id=user_id, now=now
+                )
+                for label, (files, dirs) in tally.items():
+                    had_files, had_dirs = totals[label]
+                    totals[label] = (had_files + files, had_dirs + dirs)
+                    stats.inputs_files_removed += files
+                    stats.inputs_dirs_removed += dirs
+        # 每轮一条汇总(即使是 0):这是一条不可逆的删除 phase,「这一轮跑过、收了多
+        # 少」本身就是要能在日志里查到的事实。逐 (tenant, user, agent, policy) 的明细
+        # 由 _reclaim_user 在真删掉东西时记,空轮不产生任何明细行。
+        logger.info(
+            "workspace_janitor.reclaim_summary files=%d dirs=%d by_policy=%s",
+            stats.inputs_files_removed,
+            stats.inputs_dirs_removed,
+            ",".join(f"{label}:{files}/{dirs}" for label, (files, dirs) in totals.items()),
+        )
 
     async def _sweep_sizes(self, stats: JanitorRunStats) -> None:
         """文件系统为发现源:按 tenant/user 两层 UUID 目录全量扫,逐用户调
