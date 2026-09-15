@@ -12,7 +12,7 @@
 3. **值已经到执行层,不需要新管道**。`prompt_inputs` 从两条路都汇进 orchestrator 的 run 入口(`api/runs.py:1290` 直跑、`run_queue_worker.py:397` 队列)→ `orchestrator/sse.py:334`;而 sse.py `:376-383` 正是组装 `config["configurable"]` 的地方。
 4. **`MCPToolSpec` 今天只有 `servers` + `allow_tools`**(`agent_spec.py:1089-1102`),没有逐参数配置;且 `model_config = ConfigDict(extra="forbid")` —— **旧版本代码读到新增字段会校验失败**(见 §七回滚)。
 5. **沙箱出网策略是活的,不是死字段**。`NetworkSpec`(`agent_spec.py:268-290`):`allowlist` 空 → 任何**公网**主机放行,私网/SSRF 静态闸仍挡,`denylist` 优先级最高,全程审计;策略经 `agent_factory.py:796-800` 签进 egress token,由 credential-proxy 强制。**默认姿态是 allow-all-public,不是「只许列出的域名」**。
-6. **宿主侧有现成的 NAS 写通道**:`WorkspaceStore.write_file(tenant_id, user_id, path, data)`(`tools/workspace_store.py:63`),NAS 实现是 `tools/nas_workspace_store.py`。不需要沙箱。
+6. **run 启动的 config 组装有四处**:`api/runs.py:1246`、`run_queue_worker.py:354`、`trigger_firing.py:286`、`orphan_sweep.py:393`——任何「run 开始时做一件事」的规矩写在那一层必漏(历史上 run trace 绑定就漏过两处)。四条路都必经的单一入口是**图本身**。
 7. **平台给沙箱下发自己的代码是现成做法**:CM-0 投影写 `PLAN.md` 就是这么干的(`tools/file_ops.py:885-910` `SandboxWorkspaceWriter`)。
 8. **配置页不是 manifest 的唯一入口**:`apps/admin-ui/src/components/manifest-editor/YamlView.tsx` 是 YAML 直编,后端 `api/agents.py:1994` 的 `PUT /{name}/{version}/draft` 直收 manifest。**下拉框挡不住非法值**。
 9. **run inputs 已有大小闸**:64 个键、单值 8192 字节(`api/agents.py:789` 一带)。本设计不放宽。
@@ -105,14 +105,21 @@ agents/<agent_key>/inputs/<run_id>/files/<变量名>.<ext>
 - 嵌套结构里的 URL,`local_path` 就地挂在那一项上(见 `materials`)。
 - 预拉没命中的,`local_path` 为 `null`(键一定在,不要求代码判 `KeyError`)。
 
-### 4.2 写入时序(两阶段,故意拆开)
+### 4.2 写入时序(单阶段,在图的 run-start 节点里)
 
-1. **run 启动、acquire 沙箱之前**:平台宿主侧用 `WorkspaceStore.write_file` 写第一版 `inputs.json`——纯文本、不出网、不需要沙箱,所有 `local_path` 为 `null`。
-2. **沙箱就绪后**:平台下发一段**固定的预拉脚本**(平台自己的代码,不是模型写的)在沙箱里执行,下载命中的文件写进 `files/`,回填 `local_path`。
+`inputs.json` 的写入、预拉、回填**一次做完**,位置是图里的一个 run-start 节点,与现有
+`workspace_ingest_node`(CM-0 把人改过的 PLAN.md 读回来)同一层,由 `agent_factory` 在
+「agent 声明了变量 **且** sandbox runtime 已接」时装上。
 
-拆开的理由:**沙箱起不来时(ACS 网关 504 是常态,见 B-55),防抄错那道闸仍然在**;只有出网那部分依赖沙箱。
+两个理由:
 
-**没有声明变量的 agent 不写任何文件**——零副作用。
+1. **宿主侧先写一份是纯冗余**。沙箱起不来时,没有任何代码会去读 `inputs.json` —— 读它的只有
+   `exec_python` / `bash`。所以「沙箱失败也要有文件」这个诉求本身不成立。
+2. **run 启动的 config 组装有四处**(`api/runs.py:1246`、`run_queue_worker.py:354`、
+   `trigger_firing.py:286`、`orphan_sweep.py:393`),在那一层做就是「规矩写一处漏三处」;
+   图里的节点是四条路都必经的单一入口。
+
+**没有声明变量的 agent 不装这个节点**——零副作用、零额外 acquire。
 
 ### 4.3 预拉规则
 
@@ -147,7 +154,7 @@ EXPERT_WORK_INPUTS=/workspace/inputs/<run_id>/inputs.json
 
 选环境变量而不是把路径写进提示词,是因为 `os.environ["EXPERT_WORK_INPUTS"]` 是固定写法,而 `inputs/<run_id>/` 里的 run_id 仍然是一个要抄的串——原则上自相矛盾。
 
-**这条要动 B-60 的 exec 命令串**(`orchestrator/tools/exec_view.py` 的 `EXEC_VIEW_SCRIPT` 与 `infra/sandbox-image/runner.py` 的 `_EXEC_VIEW_SCRIPT` 是逐字相同的字面量,由 `ast` 门钉住),改一边必红——实施时两边一起改,门自然会咬。
+**这条不动 B-60 的 exec 命令串**:两个后端已经有一条共用的 per-exec env 通道 —— `tools/sandbox.py:96` 的 `agent_key_envs()`(今天只注 `PYTHONUSERBASE`),`HTTPSupervisorRuntime` 走 `ExecRequest.envs`、`AgentSandboxClient` 走 `commands.run(envs=...)`,且已被 `test_sandbox_runtime_contract.py` 钉成逐字节相同。`EXPERT_WORK_INPUTS` 加在这里即可,`EXEC_VIEW_SCRIPT` 那对字面量一个字都不用动。
 
 ### 4.5 `trusted: false` 的变量
 
@@ -268,12 +275,12 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
 
 | 波 | PR | 内容 | 依赖 |
 |---|---|---|---|
-| 1 | A | 数据面:`inputs.json` 两阶段写入 + 沙箱内预拉脚本 + `EXPERT_WORK_INPUTS` 注入(动 B-60 的两处字面量)+ 工具描述 | — |
-| 1 | B | 绑定面后端:`arg_bindings` 字段 + manifest 校验 + schema 剥字段 + `apply_arg_bindings` + 审计 | — |
-| 2 | C | 配置页:逐工具逐参数「自动/绑定」+ 删变量的引用检查 | B |
-| 2 | D | 文档:对外文档 + Agent 配置书 #1235 addendum(`ai-health-plan` 5 处) | A、B |
+| 1 | A | 数据面:run-start 节点(写 `inputs.json` + 沙箱内预拉 + 回填)+ `EXPERT_WORK_INPUTS` 走现有 `agent_key_envs` 通道 + 工具描述 | — |
+| 2 | B | 绑定面后端:`arg_bindings` 字段 + manifest 校验 + schema 剥字段 + `apply_arg_bindings` + 审计 | A(两者都动 `sse.py` 的 `configurable` 字面量) |
+| 3 | C | 配置页:逐工具逐参数「自动/绑定」 | B |
+| 3 | D | 文档:对外文档 + Agent 配置书 #1235 addendum(`ai-health-plan` 5 处) | A、B |
 
-A 与 B 文件不重叠(A 动 `sse.py`/workspace/exec 命令串;B 动 protocol/`assembly.py`/`builder.py`),可并行。
+A 与 B 都要动 `sse.py` 的 `configurable` 字面量(A 不需要、B 需要 —— 但 A 先落可以顺手把键加上),所以串行:A → B → (C ∥ D)。
 
 ---
 
