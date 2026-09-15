@@ -66,6 +66,11 @@
   - `def iter_url_sites(doc: Mapping[str, Any]) -> list[UrlSite]`
   - `def with_local_path(doc: Mapping[str, Any], site: UrlSite, rel: str | None) -> dict[str, Any]`
 
+> **T1 的历史文本(已交付,#1557)**:本任务正文里的 `inputs/<run_id>/files/<变量名>.<ext>` 路径样例已被 T11 的
+> 内容寻址缓存取代(现为 `inputs/cache/<digest><ext>`,见 spec §4.1 勘误),`with_local_path` 在实现收敛时
+> 并入 `build_inputs_doc` / `_walk` 一族、未独立留存。保留原文作为当时的决策记录,**不要照它写新代码**。
+
+
 - [ ] **Step 1: 写失败的测试**
 
 ```python
@@ -1876,15 +1881,21 @@ Expected: FAIL —— `cannot import name 'cache_digest'`
 
 `_fetch` 改三段:
 
-① **先探缓存,一个请求都不发**。`cache_dir` 用 `os.scandir` 扫,取**文件名以 `<digest>` 开头**的第一个条目
+① **先探缓存,一个请求都不发**。`cache_dir` 用 `os.scandir` 扫**文件名以 `<digest>` 开头**的条目
 (digest 是 32 位 hex,不含 glob 元字符;不要拼 URL 扩展名去猜后缀,见 Step 1 的那条测试)。
-命中且 `time.time() - st_mtime < CACHE_TTL_S` → 直接返回它的相对路径、`used=0`。
+新鲜(`time.time() - st_mtime < CACHE_TTL_S`)就返回它的相对路径、`used=0`。
+
+**勘误(T11 评审 I-1)**:本段原写「取第一个条目,超期就算未命中」——**那是个 bug**。同一 URL 的后缀跨
+24h 变了(`image/png`→`image/jpeg`;CDN 回 `octet-stream` 落到 URL 扩展名)会同时存在两个条目,而
+`os.replace` 只覆盖同名,于是超期的兄弟条目**永久遮住**新鲜的那个:每轮重下、每轮多一份,正是本任务要治的病,
+还因 scandir 是 FS 哈希序而不确定。正确写法:**超期条目跳过并顺手 `unlink`(失败不外抛),不要提前返回**,
+扫完整个前缀集合 —— 这样清理与命中都与扫描顺序无关。
 
 ② 未命中(或已超期)才下载,判定顺序与今天完全一致(content-type → 声明长度 → 预算 → 实际长度比对)。
 
 ③ 落盘:`tempfile.mkstemp(dir=cache_dir)` 拿唯一临时文件(并发 run 撞同一 URL 也不会互相踩),写完
 **`os.chmod(tmp, 0o644)`** 再 `os.replace` 到 `<digest><ext>`。后缀仍由响应的 content-type 定(回落 URL 扩展名)。
-超期重下时 `os.replace` 直接覆盖旧条目,不用先删。
+超期条目已在①被删掉,这里 `os.replace` 落的是新条目。
 
 预算只扣真正下载的字节;命中不扣。`_fetch` 的签名去掉 `var_name` / `path`(内容寻址后文件名与变量无关),
 `main` 里的 `rel_prefix` 改成 `posixpath.join("inputs", CACHE_DIRNAME)`,`files_dir` 改成
