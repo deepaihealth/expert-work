@@ -943,6 +943,7 @@ async def resolve_approval_decision(
         run_id=continuation_run_id,
         tenant_id=tenant_id,
         spec=spec_record.spec,
+        stored_sha256=spec_record.spec_sha256,
         source="approval_resume",
     )
     # SE-7d-3b-ii — carry build-time distilled skills to the terminal hook.
@@ -1012,6 +1013,7 @@ async def spawn_run(
     settings: Settings,
     built: BuiltAgent,
     record_spec: AgentSpec,
+    record_spec_sha256: str,
     thread_id: UUID,
     tenant_id: UUID,
     actor_id: str,
@@ -1228,6 +1230,7 @@ async def spawn_run(
         run_id=run_id,
         tenant_id=tenant_id,
         spec=record_spec,
+        stored_sha256=record_spec_sha256,
         source="spawn_run",
     )
     run_record.bound_distilled_skills = built.bound_distilled_skills
@@ -1455,6 +1458,7 @@ def build_runs_router() -> APIRouter:
         # 用草稿跑(配置页发布前的试跑)。三条约束,缺一不可 —— 见
         # ``RunRequest.use_draft``。
         run_spec = record.spec
+        run_spec_sha256 = record.spec_sha256
         if payload.use_draft:
             if payload.mode == "queue":
                 # 排队的 run 由 worker 稍后执行,而 worker 读的是线上那一版。
@@ -1493,6 +1497,7 @@ def build_runs_router() -> APIRouter:
                 request, resource="manifest", action="write", attrs=manifest_record_attrs(record)
             )
             run_spec = record.draft.spec
+            run_spec_sha256 = record.draft.spec_sha256
 
         try:
             built = await runtime.get_agent(
@@ -1533,6 +1538,7 @@ def build_runs_router() -> APIRouter:
             settings=settings,
             built=built,
             record_spec=run_spec,
+            record_spec_sha256=run_spec_sha256,
             thread_id=thread_id,
             tenant_id=tenant_id,
             actor_id=actor_id,

@@ -2429,7 +2429,11 @@ async def test_run_with_use_draft_builds_from_the_draft(runs_client: AsyncClient
         run_id=UUID(str(metadata["run_id"])), tenant_id=_DEFAULT_TENANT
     )
     assert row is not None
-    assert row.agent_spec_sha256 == compute_spec_sha256(drafted)
+    # B-61 T5b 修复轮 1(I-1)—— 绑的是草稿那一列的 ``spec_sha256``(库里的
+    # 值),不是现算的:草稿的 ``updated_by="tester"`` save_draft 存的哈希是
+    # 测试自己给的合成值 ``"d" * 64``,与 ``drafted`` 的真实内容哈希不同,这
+    # 正好钉住「绑列不绑重算」。
+    assert row.agent_spec_sha256 == "d" * 64
     assert row.agent_spec_sha256 != live.spec_sha256
 
     # 线上那一版没被动过。

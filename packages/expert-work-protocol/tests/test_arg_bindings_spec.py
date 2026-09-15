@@ -241,6 +241,19 @@ def test_a_configured_manifest_round_trips_through_serialization() -> None:
     assert reloaded == spec
 
 
+def test_the_serialization_schema_is_not_collapsed_by_the_wrap_serializer() -> None:
+    """review M-1 —— ``_omit_empty_arg_bindings`` 的返回值标注(``-> dict[str,
+    Any]``)会让 pydantic 把它当序列化 schema 用,把 ``MCPToolSpec`` 的
+    serialization-mode JSON Schema 塌成 ``{"type": "object",
+    "additionalProperties": true}``。今天没有消费方(``api/agent_schema.py``
+    走的是 validation mode),但哪天有端点给 ``AgentSpec`` 加
+    ``response_model=``,这条要能在 CI 里红。自证:把返回值标注加回去,这条
+    必须变红。"""
+    schema = MCPToolSpec.model_json_schema(mode="serialization")
+    assert schema.get("additionalProperties") is not True
+    assert {"servers", "allow_tools", "arg_bindings"} <= schema.get("properties", {}).keys()
+
+
 def test_input_validation_is_still_strict() -> None:
     """YAML / 接口这条路不受影响 —— 严格该管的是**人写的输入**。"""
     doc = _manifest(variables=[], bindings=[])

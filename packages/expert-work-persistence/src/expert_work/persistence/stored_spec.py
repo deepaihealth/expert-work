@@ -58,6 +58,12 @@ def load_stored_spec(payload: dict[str, Any]) -> AgentSpec:
     只在 ``extra_forbidden`` 这一种失败上剔键重试:无条件剔键会把真正的数据
     损坏一起吞掉,那比要修的问题更糟。夹杂了别的错误也原样抛 —— 那一行并没有
     被救回来,报的必须是完整的原因。
+
+    代价(review M-4):回滚窗口里读回来的是**剔完键**的 ``AgentSpec``;如果这
+    期间又编辑并保存了这个 agent(``update_spec``),写回去的是这个剔过键的
+    对象,被剔掉的那个键就永久从线上行里消失了 —— 再升回新版本也拿不回来,
+    只能翻 ``agent_spec_revision`` 历史。``publish_draft``(``agent_spec/sql.py``)
+    搬的是 ``row.draft_spec_json`` 原始 JSON,不经过这里,不受影响。
     """
     try:
         return AgentSpec.model_validate(payload)

@@ -377,6 +377,7 @@ class OrphanSweep:
                 run_id=orphan.run_id,
                 tenant_id=orphan.tenant_id,
                 spec=record.spec,
+                stored_sha256=record.spec_sha256,
                 source="orphan_sweep",
             )
 

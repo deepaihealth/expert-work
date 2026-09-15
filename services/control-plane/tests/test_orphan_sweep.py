@@ -81,7 +81,10 @@ class _FakeAgents:
         del tenant_id, name, version
         # A real AgentSpec, not a stand-in: the sweep now hashes what it
         # rebuilt from, and a stand-in would make that hashing untestable here.
-        return SimpleNamespace(spec=_SPEC)
+        # ``spec_sha256``(B-61 T5b 修复轮 1,I-1)—— ``bind_exec_spec`` 绑的是
+        # 这一列,不是重算值;这里就是「库里那一列」,等于 ``_SPEC`` 自己的
+        # 哈希,与下面的期望值同源。
+        return SimpleNamespace(spec=_SPEC, spec_sha256=compute_spec_sha256(_SPEC))
 
 
 class _FakeRuntime:

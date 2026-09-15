@@ -250,6 +250,7 @@ async def fire_trigger(
         run_id=run_id,
         tenant_id=trigger.tenant_id,
         spec=record.spec,
+        stored_sha256=record.spec_sha256,
         source="trigger_firing",
     )
     # SE-7d-3b-ii — carry build-time distilled skills to the terminal hook.

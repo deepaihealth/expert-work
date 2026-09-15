@@ -111,14 +111,25 @@ async def bind_exec_spec(
     run_id: UUID,
     tenant_id: UUID,
     spec: AgentSpec,
+    stored_sha256: str,
     source: str,
 ) -> None:
     """把这一轮实际构建所用 manifest 的内容哈希写进 ``run_id`` 那行。
 
-    传的是 **spec 本身**而不是算好的哈希:调用方手里必然有它(``get_agent``
-    的必填参数就是它),让这里去算,调用方就没有「记了另一版的哈希」这个错法。
-    哈希与 ``agent_spec.spec_sha256`` 同一种规范化形式,可直接等值 join 回
-    ``agent_spec_revision`` 拿到那一版的 ``spec_json``。
+    绑的是 **``stored_sha256``**——调用方从同一个 record 里带出来的
+    ``agent_spec.spec_sha256`` / ``agent_spec_revision.spec_sha256`` 那一列,
+    不是这里现算的。**列才是真源,重算只用于比对**:T5b 的读回宽容
+    (:mod:`expert_work.persistence.stored_spec`)会在存量 manifest 多出未知键时
+    剔掉它们,``compute_spec_sha256(spec)`` 算出来的是**剔完键之后**的哈希 ——
+    回滚窗口里这个值不再等于库里那一列(N+1 写的、含那个键)。而
+    ``run.agent_spec_sha256`` 与 ``agent_spec_revision.spec_sha256`` 的等值
+    join 正是靠那一列撑住的契约(见模块 docstring)。两者一旦分叉,说明宽容
+    在这次执行路径上真的生效了——这是唯一的信号,所以要打 warning(键名带
+    ``spec_sha256_diverged``,``stored`` / ``computed`` 两个哈希都进日志;内容
+    哈希不是秘密,只有 ``spec_json`` 里的值才需要避)。
+
+    ``stored_sha256`` 为空串时回退用现算值,且不打日志:那不是分叉,是这一行
+    从来就没有过存量哈希(草稿试跑那一路,``draft_sha256`` 列本身可能是空)。
 
     ``runs`` 为 ``None`` 时直接返回:那是没接持久化的 :class:`RunManager`
     (纯内存注册表),压根没有一行可以标注 —— 与「有行但写失败」是两回事,
@@ -129,11 +140,21 @@ async def bind_exec_spec(
     logger = logging.getLogger(f"expert_work.control_plane.{source}")
     if runs is None:
         return
+    computed = compute_spec_sha256(spec)
+    bound = stored_sha256 or computed
+    if stored_sha256 and stored_sha256 != computed:
+        logger.warning(
+            "%s.spec_sha256_diverged run_id=%s stored=%s computed=%s",
+            source,
+            run_id,
+            stored_sha256,
+            computed,
+        )
     try:
         ok = await runs.set_agent_spec_sha256(
             run_id=run_id,
             tenant_id=tenant_id,
-            agent_spec_sha256=compute_spec_sha256(spec),
+            agent_spec_sha256=bound,
         )
     except Exception:
         logger.warning("%s.spec_bind_failed run_id=%s", source, run_id, exc_info=True)

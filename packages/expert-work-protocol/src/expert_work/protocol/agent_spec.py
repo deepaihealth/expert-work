@@ -1138,7 +1138,14 @@ class MCPToolSpec(BaseModel):
     arg_bindings: list[ArgBindingSpec] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
-    def _omit_empty_arg_bindings(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+    # 故意不标注返回类型:标注(``-> dict[str, Any]`` 甚至 ``-> Any``)会让 pydantic
+    # 把它当序列化 schema 用,把整个 ``MCPToolSpec`` 的 serialization-mode
+    # JSON Schema 塌成 ``{"type": "object", "additionalProperties": true}``
+    # ——三种写法实测过,唯独不标注 schema 才完整;三者的 ``model_dump()`` 结果
+    # 一模一样,纯粹是 schema 问题(review M-1)。
+    def _omit_empty_arg_bindings(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
         """Leave ``arg_bindings`` out of the output when nothing is bound.
 
         存库走 ``spec.model_dump(by_alias=True, mode="json")``,**默认值会被

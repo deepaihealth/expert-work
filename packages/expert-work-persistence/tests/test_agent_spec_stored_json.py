@@ -16,6 +16,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from expert_work.persistence import stored_spec as stored_spec_module
 from expert_work.persistence.agent_spec.sql import _revision_to_record, _row_to_record
 from expert_work.persistence.models import (
     AgentSpecRevisionRow,
@@ -196,6 +197,28 @@ def test_a_broken_row_that_also_has_an_unknown_key_propagates_the_original_error
         with pytest.raises(ValidationError) as excinfo:
             load_stored_spec(row_json)
     assert {e["type"] for e in excinfo.value.errors()} == {"missing", "extra_forbidden"}
+    assert caplog.records == []
+
+
+def test_a_key_that_cannot_be_located_still_raises_without_a_fake_ignore_log(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """review M-2 —— ``if not dropped: raise`` 这条护栏没有天然触发路径:pydantic
+    的 ``extra_forbidden`` 错误项的 ``loc`` 从不指向一个已经不存在的键或越界下标,
+    构造不出真实 payload 去撞它。用 seam(monkeypatch 掉 ``_drop_key_at`` 让它恒
+    返回 ``None``,模拟「有 extra_forbidden 错误,但一个键都剔不掉」)直接测
+    护栏本身:必须**直接**抛出 ``ValidationError``、且不打「忽略了 0 个键」的假
+    日志。光断言 ``pytest.raises(ValidationError)`` 不够 —— 去掉这道护栏后,
+    ``cleaned`` 里的键并没有真被剔掉,重试的 ``model_validate`` 一样会因为同一个
+    ``extra_forbidden`` 再抛一次同类错误,两条路径都「抛了 ValidationError」;
+    唯一能分开两条路径的信号是护栏被跳过时会先打一条虚假的
+    ``ignoring 0 unknown key(s)`` warning——这道护栏就是防这条假日志的。"""
+    monkeypatch.setattr(stored_spec_module, "_drop_key_at", lambda payload, loc: None)
+    row_json = _stored()
+    row_json["spec"]["tools"][0]["from_a_future_version"] = 1
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        with pytest.raises(ValidationError):
+            load_stored_spec(row_json)
     assert caplog.records == []
 
 

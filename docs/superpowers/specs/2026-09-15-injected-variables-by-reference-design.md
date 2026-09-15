@@ -282,9 +282,11 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
    不碰数据库。**连带修掉一个问题**:`compute_spec_sha256` 对存量 manifest 不再变化,
    `run.agent_spec_sha256` 与 `agent_spec_revision.spec_sha256` 的等值 join(`run_trace.py:120` 记为契约)保持成立。
 2. **写入严格、读回宽容**。YAML / 接口进来的配置照旧 `extra="forbid"` 挡错字;**从我们自己库里读回来的
-   `spec_json` 遇到不认识的键就忽略并打日志**(**每一个**读回回点,不是某几处 —— 见下)。严格该管的是**人写的输入**,
+   `spec_json` 遇到不认识的键就忽略并打日志**(**每一个**读回点,不是某几处 —— 见下)。严格该管的是**人写的输入**,
    不是**我们自己写出去又读回来的数据**。这条一次性根治整类问题 —— 此后任何新增 spec 字段都不再有回滚坑
-   (`servers` 当年同病)。
+   (`servers` 当年同病)。**代价(review M-4)**:回滚窗口里读回来的是剔完键的对象;这期间如果又编辑并保存了
+   这个 agent,写回去的就是剔过键的版本,被剔掉的键永久从线上行消失(只能翻 `agent_spec_revision` 历史找回)。
+   `publish_draft` 搬的是草稿列的原始 JSON,不经过读回宽容这一步,不受影响。
 
 **「每一个读回点」是字面意思(2026-09-16 勘误)**:本节原先枚举了 `agent_spec/sql.py` 的三处,执行时发现**第四处**
 —— `persistence/platform_agent_template/sql.py` 也在对我们自己存的 manifest 做同样的 `AgentSpec.model_validate`。

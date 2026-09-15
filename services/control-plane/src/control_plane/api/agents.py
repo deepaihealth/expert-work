@@ -1682,6 +1682,7 @@ def build_agents_router() -> APIRouter:
                 settings=request.app.state.settings,
                 built=built,
                 record_spec=record.spec,
+                record_spec_sha256=record.spec_sha256,
                 thread_id=thread_id,
                 tenant_id=tenant_id,
                 actor_id=actor_id,
