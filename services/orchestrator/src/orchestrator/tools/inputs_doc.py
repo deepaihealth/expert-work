@@ -81,13 +81,44 @@ def build_inputs_doc(
         value = inputs[spec.name]
         # 早失败:不可 JSON 序列化的值不该走到写文件那一步再炸。
         json.dumps(value, ensure_ascii=False)
-        doc_vars[spec.name] = {"value": value, "trusted": spec.trusted}
+        doc_vars[spec.name] = {"value": _null_local_paths(value), "trusted": spec.trusted}
     return {"run_id": str(run_id), "variables": doc_vars}
 
 
-def _walk(value: Any, prefix: tuple[str | int, ...]) -> list[tuple[tuple[str | int, ...], str]]:
+def _null_local_paths(value: Any) -> Any:
+    """把调用方自带的 ``local_path`` 一律清成 ``null``(不可变:返回新对象)。
+
+    工具描述对模型的承诺是「``local_path`` 非空 = 平台已经把文件下载到本地」。
+    调用方可以在自己的 JSON 里塞一个 ``local_path``(值可以是任意字符串,包括一个
+    URL),两个 walker 都拒绝去**预拉**这个键,但值仍然留在文档里,于是那句承诺就
+    成了谎话。构造文档时就抹平:键保留(形状不变)、值清空,真命中时由沙箱里的预拉
+    脚本写回真实的相对路径。
+    """
+    if isinstance(value, Mapping):
+        return {
+            key: (None if key == "local_path" else _null_local_paths(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_null_local_paths(item) for item in value]
+    return value
+
+
+def _walk(
+    value: Any, prefix: tuple[str | int, ...], *, assignable: bool
+) -> list[tuple[tuple[str | int, ...], str]]:
+    """``assignable`` = 这一层的 URL 旁边有没有地方记 ``local_path``。
+
+    只有两种位置记得下:变量**整个** ``value``(记在变量对象上),或某个 Mapping 的
+    一个键(记成同级的 ``local_path``)。列表里的**裸字符串**没有 ——
+    ``{"images": ["https://a"]}`` 的第 0 项要挂 ``local_path`` 只能改写字符串自己,
+    那既不是文档的形状、也没法表达。这类 URL 因此不算 site:平台不预拉,模型照旧自
+    己下载(降级,不是坏掉)。沙箱侧 ``prefetch_script._sites`` 必须同义 —— 那边的
+    ``_assign`` 会直接 ``TypeError``,一条这样的 URL 足以把整轮预拉的结果全带走
+    (见 ``test_site_walk_matches_the_host_side_implementation``)。
+    """
     if _is_http_url(value):
-        return [(prefix, value)]
+        return [(prefix, value)] if assignable else []
     if isinstance(value, Mapping):
         found: list[tuple[tuple[str | int, ...], str]] = []
         for key, item in value.items():
@@ -99,12 +130,12 @@ def _walk(value: Any, prefix: tuple[str | int, ...]) -> list[tuple[tuple[str | i
             # test_local_path_key_supplied_by_caller_is_not_a_url_site。
             if key == "local_path":
                 continue
-            found.extend(_walk(item, (*prefix, str(key))))
+            found.extend(_walk(item, (*prefix, str(key)), assignable=True))
         return found
     if isinstance(value, list):
         found = []
         for index, item in enumerate(value):
-            found.extend(_walk(item, (*prefix, index)))
+            found.extend(_walk(item, (*prefix, index), assignable=False))
         return found
     return []
 
@@ -113,40 +144,6 @@ def iter_url_sites(doc: Mapping[str, Any]) -> list[UrlSite]:
     """文档里所有 http(s) URL 的位置,按变量声明顺序、深度优先。"""
     sites: list[UrlSite] = []
     for name, entry in doc.get("variables", {}).items():
-        for path, url in _walk(entry.get("value"), ()):
+        for path, url in _walk(entry.get("value"), (), assignable=True):
             sites.append(UrlSite(var_name=name, path=path, url=url))
     return sites
-
-
-def _set_in(container: Any, path: tuple[str | int, ...], key: str, value: Any) -> Any:
-    """沿 ``path`` 深拷贝并在末端容器上写 ``key``(不可变:返回新对象)。"""
-    if not path:
-        if isinstance(container, Mapping):
-            return {**container, key: value}
-        msg = f"cannot set {key!r} on {type(container).__name__}"
-        raise TypeError(msg)
-    head, rest = path[0], path[1:]
-    if isinstance(head, int) and isinstance(container, list):
-        copied = list(container)
-        copied[head] = _set_in(copied[head], rest, key, value)
-        return copied
-    if isinstance(container, Mapping):
-        return {**container, head: _set_in(container[head], rest, key, value)}
-    msg = f"path segment {head!r} does not match {type(container).__name__}"
-    raise TypeError(msg)
-
-
-def with_local_path(doc: Mapping[str, Any], site: UrlSite, rel: str | None) -> dict[str, Any]:
-    """返回一份新文档,在 ``site`` 旁边写上 ``local_path``(``None`` 写成显式 null)。
-
-    顶层 URL(``site.path`` 为空)挂在变量对象上,嵌套的挂在那一项上。
-    """
-    variables = doc["variables"]
-    entry = variables[site.var_name]
-    if not site.path:
-        new_entry = {**entry, "local_path": rel}
-    else:
-        parent = site.path[:-1]
-        new_value = _set_in(entry["value"], parent, "local_path", rel)
-        new_entry = {**entry, "value": new_value}
-    return {**doc, "variables": {**variables, site.var_name: new_entry}}

@@ -124,6 +124,20 @@ def _fetch(
         return None, 0
 
 
+def _rewrite(inputs_path: str, doc: dict[str, Any]) -> None:
+    """把当前文档原子地盖回 ``inputs.json``(同目录临时文件 + ``os.replace``)。
+
+    每拉完一个 site 就调一次:整段 exec 有墙钟上限,超了会被 SIGKILL,而写在
+    最后一步的「一次性改写」在那种情况下等于**一个 local_path 都没落下**——已经
+    下载好的文件全成了 files/ 里的孤儿。逐个落盘后,被杀只损失还没拉完的那些。
+    同目录 + ``os.replace`` 保证读的人要么看到上一版、要么看到新版,不会读到半份。
+    """
+    tmp_path = inputs_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle, ensure_ascii=False)
+    os.replace(tmp_path, inputs_path)
+
+
 def main(argv: list[str]) -> int:
     inputs_path = argv[1]
     try:
@@ -134,30 +148,58 @@ def main(argv: list[str]) -> int:
         # 文档就没有东西可预拉,同样不让 run 失败。
         print(json.dumps({"prefetch": []}, ensure_ascii=False))
         return 0
+    # 文档的形状不可信:它是上一次运行/沙箱代码碰过的文件,可能是一个 list、
+    # variables 可能不是对象。JSON 解析成功 != 形状对,不判就是一个 AttributeError
+    # 冒到 main 外面,预拉整轮丢掉。形状不对就当没有东西可拉,不改文件。
+    variables = doc.get("variables") if isinstance(doc, dict) else None
+    if not isinstance(variables, dict):
+        print(json.dumps({"prefetch": []}, ensure_ascii=False))
+        return 0
     run_dir = os.path.dirname(inputs_path)
     files_dir = os.path.join(run_dir, "files")
     rel_prefix = posixpath.join("inputs", os.path.basename(run_dir), "files")
     budget = MAX_TOTAL_BYTES
     report: list[dict[str, object]] = []
 
-    for name, entry in doc.get("variables", {}).items():
+    for name, entry in variables.items():
+        if not isinstance(entry, dict):
+            continue
         for path, url in _sites(entry.get("value"), []):
-            filename, used = _fetch(url, files_dir, name, path, budget)
+            hit = False
+            used = 0
+            try:
+                filename, used = _fetch(url, files_dir, name, path, budget)
+                hit = filename is not None
+                _assign(entry, path, posixpath.join(rel_prefix, filename) if filename else None)
+                _rewrite(inputs_path, doc)
+            except Exception:
+                # 一个 site 的任何意外(文档结构与 _sites 的判定不一致、落盘失败
+                # ……)都不该带走其它 site 已经拿到的结果:记一条 miss,继续下一个。
+                # 不打异常内容——里面可能带着 URL(spec §八)。
+                hit = False
             budget -= used
-            rel = posixpath.join(rel_prefix, filename) if filename else None
-            _assign(entry, path, rel)
-            report.append({"variable": name, "hit": filename is not None, "bytes": used})
+            report.append({"variable": name, "hit": hit, "bytes": used})
 
-    with open(inputs_path, "w", encoding="utf-8") as handle:
-        json.dump(doc, handle, ensure_ascii=False)
     # 只打名字/命中/字节数,不打值也不打 URL(spec §八)。
     print(json.dumps({"prefetch": report}, ensure_ascii=False))
     return 0
 
 
-def _sites(value: Any, prefix: list[str | int]) -> list[tuple[list[str | int], str]]:
+def _sites(
+    value: Any, prefix: list[str | int], assignable: bool = True
+) -> list[tuple[list[str | int], str]]:
+    """``assignable`` = 这一层的 URL 旁边有没有地方记 ``local_path``。
+
+    只有变量整个 ``value``(记在变量对象上)和 dict 的某个键(记成同级的
+    ``local_path``)两种位置记得下。列表里的裸字符串没有:``["https://a"]`` 的第 0
+    项要挂 ``local_path`` 只能改写字符串自己——``_assign`` 走到那里会
+    ``cursor["local_path"] = rel`` 打在一个 list 上直接 ``TypeError``,一条这样的
+    URL 就能让整轮预拉的结果全丢。这类 URL 不算 site:平台不预拉,模型照旧自己下
+    载。与宿主侧 ``inputs_doc._walk`` 是同一条规则,必须同义(见
+    ``test_site_walk_matches_the_host_side_implementation``)。
+    """
     if isinstance(value, str) and (value.startswith("http://") or value.startswith("https://")):
-        return [(list(prefix), value)]
+        return [(list(prefix), value)] if assignable else []
     if isinstance(value, dict):
         found: list[tuple[list[str | int], str]] = []
         for key, item in value.items():
@@ -168,12 +210,12 @@ def _sites(value: Any, prefix: list[str | int]) -> list[tuple[list[str | int], s
             # 侧 inputs_doc._walk 的同一道闸保持同义(见
             # test_site_walk_matches_the_host_side_implementation)。
             if key != "local_path":
-                found.extend(_sites(item, [*prefix, key]))
+                found.extend(_sites(item, [*prefix, key], True))
         return found
     if isinstance(value, list):
         found = []
         for index, item in enumerate(value):
-            found.extend(_sites(item, [*prefix, index]))
+            found.extend(_sites(item, [*prefix, index], False))
         return found
     return []
 

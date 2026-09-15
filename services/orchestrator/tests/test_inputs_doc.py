@@ -13,7 +13,6 @@ from orchestrator.tools.inputs_doc import (
     inputs_abs_path,
     inputs_rel_path,
     iter_url_sites,
-    with_local_path,
 )
 
 RUN = UUID("382f6f5a-55c4-49be-ac05-32fa143f010d")
@@ -84,34 +83,6 @@ def test_non_http_strings_are_not_url_sites() -> None:
     assert iter_url_sites(doc) == []
 
 
-def test_with_local_path_is_immutable_and_lands_beside_the_url() -> None:
-    doc = build_inputs_doc(
-        run_id=RUN,
-        variables=[_var("materials")],
-        inputs={"materials": [{"description": "视频", "url": "https://example.com/b.mp4"}]},
-    )
-    assert doc is not None
-    site = iter_url_sites(doc)[0]
-    updated = with_local_path(doc, site, f"inputs/{RUN}/files/materials.0.mp4")
-    assert updated["variables"]["materials"]["value"][0]["local_path"] == (
-        f"inputs/{RUN}/files/materials.0.mp4"
-    )
-    # 原文档没被改(不可变)
-    assert "local_path" not in doc["variables"]["materials"]["value"][0]
-
-
-def test_with_local_path_none_writes_an_explicit_null() -> None:
-    doc = build_inputs_doc(
-        run_id=RUN, variables=[_var("org_logo")], inputs={"org_logo": "https://example.com/a.jpg"}
-    )
-    assert doc is not None
-    site = iter_url_sites(doc)[0]
-    updated = with_local_path(doc, site, None)
-    assert updated["variables"]["org_logo"]["local_path"] is None
-    # 原文档没被改(不可变,顶层分支)
-    assert "local_path" not in doc["variables"]["org_logo"]
-
-
 def test_top_level_url_variable_keeps_value_as_the_url_string() -> None:
     doc = build_inputs_doc(
         run_id=RUN, variables=[_var("org_logo")], inputs={"org_logo": "https://example.com/a.jpg"}
@@ -124,30 +95,6 @@ def test_top_level_url_variable_keeps_value_as_the_url_string() -> None:
 def test_non_json_values_are_rejected_loudly(bad: dict[str, object]) -> None:
     with pytest.raises(TypeError):
         build_inputs_doc(run_id=RUN, variables=[_var("a")], inputs=bad)
-
-
-def test_iter_url_sites_is_stable_across_backfill() -> None:
-    """已回填过 local_path 的文档再扫一遍,URL 位置不应变化(``local_path`` 本身
-    不是 URL,也不该被当成新的一层容器递归进去)。"""
-    doc = build_inputs_doc(
-        run_id=RUN,
-        variables=[_var("org_logo"), _var("materials")],
-        inputs={
-            "org_logo": "https://example.com/a.jpg",
-            "materials": [
-                {"description": "视频", "url": "https://example.com/b.mp4"},
-                {"description": "无链接"},
-            ],
-        },
-    )
-    assert doc is not None
-    sites_before = iter_url_sites(doc)
-
-    backfilled = doc
-    for site in sites_before:
-        backfilled = with_local_path(backfilled, site, f"inputs/{RUN}/files/{site.var_name}")
-
-    assert iter_url_sites(backfilled) == sites_before
 
 
 def test_local_path_key_supplied_by_caller_is_not_a_url_site() -> None:
@@ -170,3 +117,42 @@ def test_local_path_key_supplied_by_caller_is_not_a_url_site() -> None:
     assert iter_url_sites(doc) == [
         UrlSite(var_name="materials", path=(0, "url"), url="https://ok/a.mp4"),
     ]
+
+
+def test_a_bare_url_inside_a_list_is_not_a_fetchable_site() -> None:
+    """终审 finding 1 —— ``{"images": ["https://a"]}`` 里那条 URL 旁边**没有**地方
+    记 ``local_path``(要记只能改写字符串自己),所以它不算 site:平台不预拉,模型
+    照旧自己下载。沙箱侧在这个位置会 ``cursor["local_path"] = rel`` 打在一个 list
+    上直接 ``TypeError``,一条这样的 URL 曾足以让整轮预拉的结果全丢,所以两侧的
+    walker 必须同时守这条规则(沙箱侧见
+    ``test_prefetch_script.test_site_walk_matches_the_host_side_implementation``)。
+    """
+    doc = build_inputs_doc(
+        run_id=RUN,
+        variables=[_var("images"), _var("nested")],
+        inputs={
+            "images": ["https://example.com/a.jpg", "https://example.com/b.jpg"],
+            "nested": [["https://example.com/c.jpg"]],
+        },
+    )
+    assert doc is not None
+    assert iter_url_sites(doc) == []
+
+
+def test_caller_supplied_local_path_is_nulled_in_the_document() -> None:
+    """终审 finding 6 —— 两个 walker 都拒绝去**预拉**调用方自带的 ``local_path``,
+    但值留在文档里就让工具描述那句「``local_path`` 非空 = 平台已经下载到本地」变成
+    谎话(模型会拿着 ``https://attacker/…`` 当本地文件用)。构造文档时就清成 null。
+    """
+    inputs = {
+        "materials": [{"url": "https://ok/a.mp4", "local_path": "https://attacker/b.mp4"}],
+        "logo": {"url": "https://ok/c.jpg", "local_path": "../../etc/passwd"},
+    }
+    doc = build_inputs_doc(run_id=RUN, variables=[_var("materials"), _var("logo")], inputs=inputs)
+    assert doc is not None
+    assert doc["variables"]["materials"]["value"][0]["local_path"] is None
+    assert doc["variables"]["logo"]["value"]["local_path"] is None
+    # 键保留(形状不变)、只清值;预拉命中时由沙箱脚本写回真实相对路径。
+    assert "local_path" in doc["variables"]["logo"]["value"]
+    # 调用方给的那份 inputs 没被改(不可变)。
+    assert inputs["logo"]["local_path"] == "../../etc/passwd"

@@ -35,7 +35,7 @@ from orchestrator.tools.inputs_doc import (
 )
 from orchestrator.tools.prefetch_script import script_source
 from orchestrator.tools.registry import ToolContext
-from orchestrator.tools.sandbox import SandboxRuntime, run_in_sandbox
+from orchestrator.tools.sandbox import SandboxOutcome, SandboxRuntime, run_in_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,23 @@ logger = logging.getLogger(__name__)
 #: (``content_type_ok`` 等)不受影响。
 _PREFETCH_SCRIPT_BODY = script_source().split('if __name__ == "__main__":', 1)[0]
 
+#: 预拉这一次 exec 的墙钟上限(秒)。
+#:
+#: **必须显式给**:不给的话两个后端各自套自己的 30 秒默认,而脚本对**单个** URL
+#: 就允许 ``prefetch_script.TIMEOUT_S`` = 30 秒、总字节预算 128 MiB —— 两个慢文件
+#: 就到顶,exec 被杀。240 秒的取法:
+#:
+#: * 下限 —— 覆盖 8 个 URL 各自跑满 30 秒的最坏情况(声明变量里的 URL 是个位数,
+#:   8 个是留了余量的估法);
+#: * 上限 —— 低于 supervisor 侧 ``_MAX_EXEC_TIMEOUT_S`` = 300 的硬顶,所以这个值
+#:   真的会被沙箱侧执行(而不是被截成 300),orchestrator 的 HTTP 读超时
+#:   (exec 截止 + ``_EXEC_HTTP_BUFFER_S``)也仍在硬顶之内;
+#: * 不取满 300 —— 本节点跑在 run 启动路径上,用户在等,不该把整个上限都押进去。
+#:
+#: 被杀也不再是全丢:脚本每拉完一个 site 就原子改写一次 ``inputs.json``
+#: (``prefetch_script._rewrite``),超时只损失还没拉到的那些。
+_PREFETCH_TIMEOUT_S = 240
+
 
 def _prefetch_code(path: str) -> str:
     """把预拉脚本的源码与调用入口拼成一段送进沙箱执行的 code 串。
@@ -63,6 +80,60 @@ def _prefetch_code(path: str) -> str:
     行短字符串做插值,不碰脚本正文。
     """
     return f"{_PREFETCH_SCRIPT_BODY}\nraise SystemExit(main(['prefetch', {path!r}]))\n"
+
+
+def _parse_prefetch_report(stdout: str) -> list[dict[str, Any]]:
+    """从脚本 stdout 里取出 ``{"prefetch": [...]}`` 报告;取不出就当没有报告。
+
+    这里**必须**宽容:脚本可能被超时 SIGKILL(stdout 半截)、可能一个字都没来得及
+    打、也可能是后端在前面多插了别的行。解析失败绝不能变成异常 —— 它在
+    「永不让 run 失败」的那条链上,而且一条日志比整轮预拉重要得多的反面正是
+    我们要避免的。
+    """
+    try:
+        parsed = json.loads(stdout.strip() or "{}")
+    except ValueError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    report = parsed.get("prefetch")
+    if not isinstance(report, list):
+        return []
+    return [item for item in report if isinstance(item, dict)]
+
+
+def _log_prefetch_outcome(outcome: SandboxOutcome, *, variable_names: list[str]) -> None:
+    """把预拉结果落成一行日志。名字 / 命中 / 字节数,**不记值也不记 URL**。
+
+    原事故(spec §一)最缺的就是这一行:事后没有任何办法区分「平台拉到了、模型
+    没用」和「平台没拉到、模型只能手抄」。stderr 一律不记 —— 里面可能带着 URL。
+    """
+    report = _parse_prefetch_report(outcome.stdout)
+    hit_names = sorted({str(item.get("variable")) for item in report if item.get("hit")})
+    total_bytes = sum(int(item["bytes"]) for item in report if isinstance(item.get("bytes"), int))
+    if outcome.exit_code != 0 or outcome.timed_out:
+        # 脚本自己任何失败都以 0 退出,所以非 0 / 超时来自 exec 这一层(被杀、
+        # 解释器起不来)——预拉这轮不完整,但 run 照跑。
+        logger.warning(
+            "inputs.prefetch_exec_failed",
+            extra={
+                "variable_names": variable_names,
+                "prefetch_exit_code": outcome.exit_code,
+                "prefetch_timed_out": outcome.timed_out,
+                "prefetch_hit_names": hit_names,
+            },
+        )
+        return
+    logger.info(
+        "inputs.prefetch_done",
+        extra={
+            "variable_names": variable_names,
+            "prefetch_site_count": len(report),
+            "prefetch_hit_count": len(hit_names),
+            "prefetch_hit_names": hit_names,
+            "prefetch_total_bytes": total_bytes,
+        },
+    )
 
 
 def make_inputs_node(
@@ -112,7 +183,7 @@ def make_inputs_node(
             return {}
         rel = inputs_rel_path(run_id)
         # B-61 §4.1 —— local_path 的落地约定是相对 /workspace;task-1 评审指出
-        # 纯函数层(with_local_path)验不出这条,enforcement 落在这里:inputs.json
+        # 纯函数层验不出这条,enforcement 落在这里:inputs.json
         # 自己的写入目标必须是相对路径,绝不把绝对路径喂给 SandboxWorkspaceWriter
         # (它的 ``rel`` 参数按约定就是 workspace-relative)。用显式 if 而不是
         # ``assert``——``assert`` 在 ``-O`` 下会被整段裁掉,那样这条闸就形同
@@ -144,14 +215,15 @@ def make_inputs_node(
             if not iter_url_sites(doc):
                 return {}
             try:
-                await run_in_sandbox(
+                outcome = await run_in_sandbox(
                     client,
                     code=_prefetch_code(inputs_abs_path(run_id)),
-                    timeout_s=None,
+                    timeout_s=_PREFETCH_TIMEOUT_S,
                     ctx=ctx,
                     tool_label="inputs_prefetch",
                     fallback_thread_id="inputs_prefetch",
                 )
+                _log_prefetch_outcome(outcome, variable_names=variable_names)
             except Exception:
                 # 同上:预拉失败只降级,不让 run 失败。
                 logger.warning(

@@ -3051,6 +3051,9 @@ def _build_tool_context(
     # (一路从 HTTP 载荷传下来),非字符串一律当没有,回落空串。
     agent_key_raw = configurable.get("agent_key")
     agent_key = agent_key_raw if isinstance(agent_key_raw, str) else ""
+    # B-61 §4.4 —— 子代要指向**父** run 的 inputs.json(``_child_config`` 写进来
+    # 的;主 run 的 config 里没有这一项,回落 ``None`` = 用自己的 run_id)。
+    inputs_run_id = _parse_uuid(configurable.get("inputs_run_id"))
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -3070,6 +3073,7 @@ def _build_tool_context(
         turn_documents=docs,
         turn_image_refs=images,
         agent_key=agent_key,
+        inputs_run_id=inputs_run_id,
     )
 
 

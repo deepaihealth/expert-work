@@ -115,6 +115,10 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
                 },
                 "trusted": True,
             },
+            # 终审 finding 1 —— 列表里的裸 URL(一层 / 两层):旁边没有地方记
+            # local_path,两侧都必须判它不是 site。
+            "d": {"value": ["https://a"], "trusted": True},
+            "e": {"value": [["https://a"]], "trusted": True},
         }
     }
     host = [(s.var_name, list(s.path), s.url) for s in iter_url_sites(doc)]
@@ -127,6 +131,9 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
     # 显式钉住攻击场景本身:c 只应该命中 url 那条,local_path 绝不能被当成待预拉的地址。
     assert ("c", ["url"], "https://ok/a.mp4") in sandbox
     assert not any(name == "c" and url == "https://attacker/b.mp4" for name, _, url in sandbox)
+    # 同样显式钉住 finding 1:d/e 一条 site 都不该有——沙箱侧 _assign 走到那里会
+    # TypeError,而 main 的 per-site 兜底之外,首先靠的就是这条判定。
+    assert not any(name in {"d", "e"} for name, _, _ in sandbox)
 
 
 # ---------------------------------------------------------------------------
@@ -381,3 +388,124 @@ def test_main_survives_unparseable_inputs_json(tmp_path: Path) -> None:
 def test_main_survives_missing_inputs_json(tmp_path: Path) -> None:
     missing = tmp_path / "inputs" / "run1" / "inputs.json"
     assert main(["prefetch_script.py", str(missing)]) == 0
+
+
+def _jpeg_route(body: bytes) -> Callable[[_RoutedHandler], None]:
+    def route(handler: _RoutedHandler) -> None:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "image/jpeg")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    return route
+
+
+def test_a_bare_url_in_a_list_does_not_lose_the_other_variables(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """终审 finding 1 —— ``{"images": ["https://a"]}`` 以前会让 ``_assign`` 抛
+    ``TypeError``:``main`` 的 per-site 循环没有任何处理,脚本非 0 退出,结尾那次
+    ``json.dump`` 根本不跑 —— **每个**变量的 ``local_path`` 全丢,已经下载好的文件
+    成了 ``files/`` 里的孤儿。列表里的裸 URL 现在不算 site,后面的变量照常回填。"""
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 16
+    routes["/ok.jpg"] = _jpeg_route(body)
+    inputs_path = _write_inputs(
+        tmp_path,
+        {
+            "images": {"value": [f"{base}/ok.jpg"], "trusted": True},
+            "org_logo": {"value": f"{base}/ok.jpg", "trusted": True},
+        },
+    )
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/files/org_logo.jpg"
+    assert (tmp_path / "inputs" / "run1" / "files" / "org_logo.jpg").read_bytes() == body
+    # 列表里的裸 URL 原样留着(没被回填、也没把结构改成别的形状)。
+    assert doc["variables"]["images"]["value"] == [f"{base}/ok.jpg"]
+
+
+def test_main_survives_a_document_that_is_not_an_object(tmp_path: Path) -> None:
+    """终审 finding 1 —— ``inputs.json`` 里躺着一个 list(沙箱代码写坏 / 续跑)时
+    ``doc.get`` 直接 ``AttributeError``,整轮预拉丢掉。形状不对就当没东西可拉。"""
+    run_dir = tmp_path / "inputs" / "run1"
+    run_dir.mkdir(parents=True)
+    path = run_dir / "inputs.json"
+    path.write_text('["not", "a", "document"]', encoding="utf-8")
+
+    assert main(["prefetch_script.py", str(path)]) == 0
+    assert path.read_text(encoding="utf-8") == '["not", "a", "document"]'
+
+
+def test_each_site_is_persisted_before_the_next_one(
+    tmp_path: Path, http_server: _HttpServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终审 finding 3 —— 整段 exec 有墙钟上限,超了被 SIGKILL;文档只在最后写一次
+    的话,被杀等于**一个** ``local_path`` 都没落下。逐 site 原子改写后,已经拉完的
+    那些在文件里。这里用「第二个 site 上抛 ``KeyboardInterrupt``」模拟进程被抬走
+    (``BaseException``,per-site 的 ``except Exception`` 抓不住,等价于没有兜底)。
+    """
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 16
+    routes["/a.jpg"] = _jpeg_route(body)
+    routes["/b.jpg"] = _jpeg_route(body)
+    inputs_path = _write_inputs(
+        tmp_path,
+        {
+            "a": {"value": f"{base}/a.jpg", "trusted": True},
+            "b": {"value": f"{base}/b.jpg", "trusted": True},
+        },
+    )
+    real_fetch = prefetch_script._fetch
+    calls: list[int] = []
+
+    def fetch(*args: Any, **kwargs: Any) -> tuple[str | None, int]:
+        calls.append(1)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(prefetch_script, "_fetch", fetch)
+
+    with pytest.raises(KeyboardInterrupt):
+        main(["prefetch_script.py", str(inputs_path)])
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["a"]["local_path"] == "inputs/run1/files/a.jpg"
+
+
+def test_one_failing_site_does_not_lose_the_others(
+    tmp_path: Path, http_server: _HttpServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终审 finding 1 —— per-site 兜底:一个 site 的任何意外(这里用落盘失败模拟)
+    只让它自己算 miss,不能带走其它 site 已经拿到的结果。"""
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 16
+    routes["/a.jpg"] = _jpeg_route(body)
+    routes["/b.jpg"] = _jpeg_route(body)
+    inputs_path = _write_inputs(
+        tmp_path,
+        {
+            "a": {"value": f"{base}/a.jpg", "trusted": True},
+            "b": {"value": f"{base}/b.jpg", "trusted": True},
+        },
+    )
+    real_rewrite = prefetch_script._rewrite
+    calls: list[int] = []
+
+    def rewrite(path: str, doc: dict[str, Any]) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            msg = "no space left on device"
+            raise OSError(msg)
+        real_rewrite(path, doc)
+
+    monkeypatch.setattr(prefetch_script, "_rewrite", rewrite)
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["b"]["local_path"] == "inputs/run1/files/b.jpg"

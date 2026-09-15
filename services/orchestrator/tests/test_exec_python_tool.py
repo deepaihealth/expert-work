@@ -74,6 +74,54 @@ async def test_exec_python_passes_run_id_to_exec() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_child_exec_points_at_the_parents_inputs_file() -> None:
+    """终审 finding 4 —— 委派出的子代每次都新铸一个 ``sub_run_id``,而 inputs 节点
+    **故意不为子 run 写文件**:不把父的 run id 带下去,子代的 ``EXPERT_WORK_INPUTS``
+    就是 ``inputs/<sub_run_id>/inputs.json`` 这条悬空路径,而工具描述告诉模型文件在
+    —— 模型读不到就退回从上文手抄 URL,正是 B-61 要消灭的那个失败(委派型 agent
+    如 ai-health-plan 把写 PPT 的活交给 worker,真实场景踩的就是这条)。
+
+    钉的是整条链:``_child_config`` → ``_build_tool_context`` → ``run_in_sandbox``
+    → ``agent_key_envs``,任一环丢掉都红。
+    """
+    from orchestrator.graph_builder.builder import _build_tool_context
+    from orchestrator.tools._child_run import _child_config
+    from orchestrator.tools.inputs_doc import inputs_abs_path
+    from orchestrator.tools.sandbox import agent_key_envs
+
+    parent_ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4(), agent_key="ai-health-plan-3081")
+    sub_run_id = uuid4()
+    child_ctx = _build_tool_context(
+        _child_config(parent_ctx, sub_thread_id=uuid4(), sub_run_id=sub_run_id)
+    )
+    assert child_ctx.run_id == sub_run_id, "子 run 仍有自己的 run_id(审计/检查点靠它)"
+
+    client = RecordingSandboxRuntime()
+    await ExecPythonTool(client=client).call({"code": "print(1)"}, ctx=child_ctx)
+
+    assert client.exec_run_ids == [parent_ctx.run_id]
+    envs = agent_key_envs(child_ctx.agent_key, run_id=client.exec_run_ids[0])
+    assert envs["EXPERT_WORK_INPUTS"] == inputs_abs_path(parent_ctx.run_id)
+
+
+def test_a_grandchild_still_points_at_the_top_run() -> None:
+    """再深一层(worker 又派 worker)不能指回中间那个子 run —— 文件只有最上面那个
+    run 有。``_child_config`` 取的是 ``ctx.inputs_run_id or ctx.run_id``。"""
+    from orchestrator.graph_builder.builder import _build_tool_context
+    from orchestrator.tools._child_run import _child_config
+
+    parent_ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4())
+    child_ctx = _build_tool_context(
+        _child_config(parent_ctx, sub_thread_id=uuid4(), sub_run_id=uuid4())
+    )
+    grandchild_ctx = _build_tool_context(
+        _child_config(child_ctx, sub_thread_id=uuid4(), sub_run_id=uuid4())
+    )
+
+    assert grandchild_ctx.inputs_run_id == parent_ctx.run_id
+
+
+@pytest.mark.asyncio
 async def test_exec_python_passes_skill_seed_files_to_acquire() -> None:
     # skill-runtime §5.1 — the build-bound skill seed set reaches acquire so the
     # supervisor materializes /opt/skills/<agent_key>/<name>/ before the code

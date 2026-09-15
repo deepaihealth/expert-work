@@ -693,6 +693,15 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # worker 刚写的文件。与技能种子路径同一个取值口径(用父 key)。
     if ctx.agent_key:
         configurable["agent_key"] = ctx.agent_key
+    # B-61 §4.4 —— 同理透传**父的** run id 作为 inputs 指针:子代的 exec 里
+    # ``EXPERT_WORK_INPUTS`` 必须指到父那份真的 inputs.json。沿用父自己已经带着的
+    # 指针(孙代 → 还是最上面那个 run),没有才用父的 run_id。漏了这一项,子代拿到
+    # 的是 ``inputs/<sub_run_id>/inputs.json`` 这条不存在的路径,而工具描述说它在
+    # —— 模型于是退回手抄 URL,正是 B-61 要消灭的那个失败(委派型 agent 如
+    # ai-health-plan 把写 PPT 的活交给 worker,真实场景里踩的就是这条)。
+    inputs_run_id = ctx.inputs_run_id or ctx.run_id
+    if inputs_run_id is not None:
+        configurable["inputs_run_id"] = str(inputs_run_id)
     if ctx.deadline_at is not None:
         configurable["deadline_at"] = ctx.deadline_at
     # B2 — 向下透传 worker 事件 sink,孙 worker 帧直达父 run bridge。

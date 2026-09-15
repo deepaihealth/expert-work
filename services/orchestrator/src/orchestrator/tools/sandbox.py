@@ -651,8 +651,12 @@ async def run_in_sandbox(
     survive idle-reclaim and restore on the next acquire — no manifest opt-in.
     A run with no ``user_id`` falls back to an ephemeral tmpfs.
 
-    ``ctx.run_id`` 原样传给 ``client.exec``(B-61 §4.4)—— 非 ``None`` 时两个
-    后端都会经 :func:`agent_key_envs` 注入 ``EXPERT_WORK_INPUTS``。
+    ``ctx.inputs_run_id or ctx.run_id`` 传给 ``client.exec``(B-61 §4.4)—— 非
+    ``None`` 时两个后端都会经 :func:`agent_key_envs` 注入 ``EXPERT_WORK_INPUTS``。
+    取 ``inputs_run_id`` 优先是为了委派:子代自己的 ``run_id`` 下**没有**
+    ``inputs.json``(inputs 节点故意跳过子 run),指向它等于给模型一条悬空路径;
+    子代与父共用同一个 ``/workspace``,所以指父的那份(见
+    ``ToolContext.inputs_run_id``)。
     """
     if ctx.tenant_id is None:
         msg = f"{tool_label} requires a tenant binding (ctx.tenant_id)"
@@ -679,7 +683,10 @@ async def run_in_sandbox(
     cancelled = False
     try:
         return await client.exec(
-            sandbox_id=sandbox_id, code=code, timeout_s=timeout_s, run_id=ctx.run_id
+            sandbox_id=sandbox_id,
+            code=code,
+            timeout_s=timeout_s,
+            run_id=ctx.inputs_run_id or ctx.run_id,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -785,8 +792,9 @@ class ExecPythonTool:
                 "transforms, or anything better done by running code. Runs in "
                 "/workspace, which is your agent's own directory; other "
                 "agents' files are not visible there. "
-                "本轮的输入变量在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"
-                "（含 URL、编码、本地文件路径）。"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
+                "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
+                "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
+                "读不到就照上文办，不必重试。"  # noqa: RUF001
                 "需要用到某个输入值时，用代码读这个文件，不要从上文手抄——长串抄错一位就是 404。"  # noqa: RUF001
                 "文件里 local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载。"  # noqa: RUF001
             ),

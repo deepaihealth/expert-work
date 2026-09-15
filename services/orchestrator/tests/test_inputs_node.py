@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,11 @@ from uuid import UUID, uuid4
 import pytest
 
 from expert_work.protocol import PromptVariableSpec
-from orchestrator.graph_builder.inputs_node import _prefetch_code, make_inputs_node
+from orchestrator.graph_builder.inputs_node import (
+    _PREFETCH_TIMEOUT_S,
+    _prefetch_code,
+    make_inputs_node,
+)
 
 
 class _FakeRuntime:
@@ -43,6 +48,40 @@ class _FakeRuntime:
 
     async def release(self, **kwargs: Any) -> None:
         return None
+
+
+class _ReportingRuntime(_FakeRuntime):
+    """记下每次 exec 的 ``timeout_s``,并让**预拉那次**(第二次)回一份可控 outcome。
+
+    ``_FakeRuntime`` 对两次 exec 一律回同一个「成功」envelope,验不出节点怎么处理
+    预拉报告;这里只替换第二次的返回值,写文件那次仍走父类(它的 stdout 要能被
+    ``SandboxWorkspaceWriter`` 解析)。``stderr`` 刻意放一条带 URL 的假报错:节点
+    绝不能把它写进日志(spec §八)。
+    """
+
+    def __init__(self, *, stdout: str, exit_code: int = 0, timed_out: bool = False) -> None:
+        super().__init__()
+        self.timeouts: list[Any] = []
+        self._stdout = stdout
+        self._exit_code = exit_code
+        self._timed_out = timed_out
+
+    async def exec(self, *, code: str, **kwargs: Any) -> Any:
+        self.timeouts.append(kwargs.get("timeout_s"))
+        is_write = len(self.execs) == 0
+        outcome = await super().exec(code=code, **kwargs)
+        if is_write:
+            return outcome
+        return type(
+            "R",
+            (),
+            {
+                "stdout": self._stdout,
+                "stderr": "boom while fetching https://leak.example.com/1789382970142-x.jpg",
+                "exit_code": self._exit_code,
+                "timed_out": self._timed_out,
+            },
+        )()
 
 
 def _config(run_id: Any, tenant_id: Any, user_id: Any, inputs: dict[str, Any]) -> dict[str, Any]:
@@ -157,8 +196,8 @@ async def test_a_failing_acquire_never_fails_the_run() -> None:
 async def test_local_path_write_target_is_never_absolute(monkeypatch: pytest.MonkeyPatch) -> None:
     """B-61 §4.1:``local_path``/inputs.json 自身的落盘路径永远相对 ``/workspace``。
 
-    task-1 评审已指出纯函数层验不出这条(``with_local_path`` 只是照抄调用方给的
-    字符串);enforcement 落在这一层——万一 ``inputs_rel_path`` 哪天被改坏返回了
+    task-1 评审已指出纯函数层验不出这条(纯函数只是照抄调用方给的字符串);
+    enforcement 落在这一层——万一 ``inputs_rel_path`` 哪天被改坏返回了
     绝对路径,节点必须整体放弃,不能把绝对路径喂给 ``SandboxWorkspaceWriter``。
     """
     import orchestrator.graph_builder.inputs_node as inputs_node_module
@@ -223,3 +262,98 @@ def test_every_run_entry_reaches_the_configurable_key() -> None:
 
     source = inspect.getsource(sse.run_agent)
     assert source.count("PROMPT_INPUTS_KEY") == 1
+
+
+# ---------------------------------------------------------------------------
+# 终审 finding 2 / 3 —— 预拉结果必须被消费;墙钟必须显式给。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prefetch_exec_carries_an_explicit_timeout() -> None:
+    """``timeout_s=None`` 时两个后端各自套自己的 30 秒默认,而脚本对**单个** URL 就
+    允许 30 秒、总预算 128 MiB —— 两个慢文件就到顶被杀。必须显式给一个按预算来的值。
+    """
+    from orchestrator.tools.prefetch_script import TIMEOUT_S
+    from orchestrator.tools.sandbox import _MAX_EXEC_TIMEOUT_S
+
+    runtime = _ReportingRuntime(stdout='{"prefetch": []}')
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="org_logo"),))
+
+    await node({}, _config(uuid4(), uuid4(), uuid4(), {"org_logo": "https://x/a.jpg"}))
+
+    assert runtime.timeouts[-1] == _PREFETCH_TIMEOUT_S
+    # 取值规则本身(不是抄一遍字面量):要真的比单个 URL 的超时宽出一截,又要留在
+    # supervisor 的硬顶之内 —— 越过硬顶会被截成 300,那这个数就不是真生效的值。
+    assert TIMEOUT_S * 2 < _PREFETCH_TIMEOUT_S <= _MAX_EXEC_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_prefetch_report_is_logged_without_values_or_urls(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """原事故最缺的一行:事后没法区分「平台拉到了、模型没用」和「平台没拉到」。
+    报告里的每个变量记命中/字节数,**不记值、不记 URL、不记 stderr**。"""
+    runtime = _ReportingRuntime(
+        stdout=json.dumps(
+            {
+                "prefetch": [
+                    {"variable": "org_logo", "hit": True, "bytes": 1234},
+                    {"variable": "brief", "hit": False, "bytes": 0},
+                ]
+            }
+        )
+    )
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="org_logo"),))
+
+    with caplog.at_level(logging.INFO, logger="orchestrator.graph_builder.inputs_node"):
+        await node({}, _config(uuid4(), uuid4(), uuid4(), {"org_logo": "https://x/a.jpg"}))
+
+    done = [r for r in caplog.records if r.getMessage() == "inputs.prefetch_done"]
+    assert len(done) == 1
+    assert done[0].prefetch_hit_names == ["org_logo"]
+    assert done[0].prefetch_hit_count == 1
+    assert done[0].prefetch_site_count == 2
+    assert done[0].prefetch_total_bytes == 1234
+    assert "https://" not in caplog.text, "日志里不能出现任何 URL(值/URL 一律不记)"
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_prefetch_report_never_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """报告解析在「永不让 run 失败」那条链上:stdout 可能是空的、被超时截断的、或
+    根本不是 JSON(后端多插了行)。解析失败只是「没有报告」,不能变成异常。"""
+    runtime = _ReportingRuntime(stdout="Traceback (most recent call last): ...")
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="org_logo"),))
+
+    with caplog.at_level(logging.INFO, logger="orchestrator.graph_builder.inputs_node"):
+        result = await node({}, _config(uuid4(), uuid4(), uuid4(), {"org_logo": "https://x/a.jpg"}))
+
+    assert result == {}
+    messages = [r.getMessage() for r in caplog.records]
+    assert "inputs.prefetch_failed" not in messages, "解析不出报告不等于预拉失败"
+    done = [r for r in caplog.records if r.getMessage() == "inputs.prefetch_done"]
+    assert len(done) == 1
+    assert done[0].prefetch_site_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_killed_prefetch_exec_is_logged_as_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """脚本自己任何失败都以 0 退出,所以非 0 / 超时来自 exec 这一层(被杀、解释器
+    起不来)—— 那是「预拉这轮不完整」的唯一信号,必须是 warning 而不是 info。"""
+    runtime = _ReportingRuntime(stdout="", exit_code=137, timed_out=True)
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="org_logo"),))
+
+    with caplog.at_level(logging.INFO, logger="orchestrator.graph_builder.inputs_node"):
+        result = await node({}, _config(uuid4(), uuid4(), uuid4(), {"org_logo": "https://x/a.jpg"}))
+
+    assert result == {}
+    warned = [r for r in caplog.records if r.getMessage() == "inputs.prefetch_exec_failed"]
+    assert len(warned) == 1
+    assert warned[0].levelno == logging.WARNING
+    assert warned[0].prefetch_exit_code == 137
+    assert warned[0].prefetch_timed_out is True
+    assert "https://" not in caplog.text
