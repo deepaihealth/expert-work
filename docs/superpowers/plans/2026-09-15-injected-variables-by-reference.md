@@ -1939,7 +1939,7 @@ git commit -m "feat(inputs): 预拉改内容寻址缓存——同 URL 跨轮只�
 (spec §4.6 勘误)。不回收就是只写不收的池子,最终撞配额闸。
 
 **Interfaces:**
-- Produces:`JanitorRunStats` 增加 `inputs_files_removed: int = 0` / `inputs_dirs_removed: int = 0`;
+- Produces:`JanitorRunStats` 增加 `reclaim_files_removed: int = 0` / `reclaim_dirs_removed: int = 0`(**终审 M-9 改名**:原拟 `inputs_*`,但它们是**所有策略合计** —— B-63 把 uploads 那条拨开后,uploads 的删除也落进同两个计数器,叫 `inputs_*` 就是名字在说谎。逐策略计数看 `reclaim_summary` 的 `by_policy=`);
   新 phase `_sweep_agent_inputs`,在 `_run_cycle` 的 `for phase in (...)` 里插在 **`_sweep_sizes` 之前**
   (顺序:`_sweep_archives` → `_sweep_agent_inputs` → `_sweep_sizes` → `_sweep_scratch`)。
   —— 台账 Ruling F:`_sweep_sizes` 本来就逐用户 `refresh()` 跑全树 du,排在它前面回收,**同一轮记账天然反映回收量**;
