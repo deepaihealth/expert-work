@@ -269,6 +269,25 @@ def test_every_run_entry_reaches_the_configurable_key() -> None:
 # ---------------------------------------------------------------------------
 
 
+_STANDARD_RECORD_KEYS = set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {
+    "message",
+    "asctime",
+    "taskName",
+}
+
+
+def _record_payload(record: logging.LogRecord) -> str:
+    """一条日志真正带出去的全部内容:消息 + 所有 ``extra`` 字段。
+
+    **不能只看 ``caplog.text``** —— 它只渲染格式串,``extra`` 一个字都不进去,而
+    本模块恰恰全靠 ``extra`` 记东西(真正会漏 URL 的地方就是那里)。实测过:往
+    ``extra`` 里塞一条带 URL 的 stderr,``"https://" not in caplog.text`` 照样绿
+    ——那种断言在能失败的地方根本没被执行到。
+    """
+    extras = {k: v for k, v in record.__dict__.items() if k not in _STANDARD_RECORD_KEYS}
+    return f"{record.getMessage()} {extras!r}"
+
+
 @pytest.mark.asyncio
 async def test_prefetch_exec_carries_an_explicit_timeout() -> None:
     """``timeout_s=None`` 时两个后端各自套自己的 30 秒默认,而脚本对**单个** URL 就
@@ -315,7 +334,9 @@ async def test_prefetch_report_is_logged_without_values_or_urls(
     assert done[0].prefetch_hit_count == 1
     assert done[0].prefetch_site_count == 2
     assert done[0].prefetch_total_bytes == 1234
-    assert "https://" not in caplog.text, "日志里不能出现任何 URL(值/URL 一律不记)"
+    payloads = [_record_payload(r) for r in caplog.records]
+    assert not any("https://" in p for p in payloads), "日志里不能出现任何 URL"
+    assert not any("leak.example.com" in p for p in payloads), "stderr 也不能记(里面有 URL)"
 
 
 @pytest.mark.asyncio
@@ -356,4 +377,4 @@ async def test_a_killed_prefetch_exec_is_logged_as_a_warning(
     assert warned[0].levelno == logging.WARNING
     assert warned[0].prefetch_exit_code == 137
     assert warned[0].prefetch_timed_out is True
-    assert "https://" not in caplog.text
+    assert "https://" not in _record_payload(warned[0])
