@@ -279,6 +279,15 @@ export function McpToolPicker({
   // SHOULD take its bindings with it. It is there because bindings had no
   // representation on this page until now, so "it deleted something I could
   // not see" was the only way that could read.
+  //
+  // DO NOT narrow this to ``nextServers.length === 0`` ("only when MCP is being
+  // turned off"). That is the literal wording of the requirement but not its
+  // reason: the reason is that something invisible was about to go silently,
+  // and that is equally true of unchecking one bound tool, or of checking the
+  // first tool while the agent was on "all tools" (which pushes every OTHER
+  // tool's bindings out of scope — the least obvious path of the three).
+  // Narrowing it puts back exactly the silence the requirement exists to
+  // remove. Reviewed and kept deliberately (2026-09-16).
   const emit = (
     nextServers: string[],
     nextAllow: string[],
@@ -294,8 +303,14 @@ export function McpToolPicker({
       onChange(nextServers, nextAllow, kept);
       return;
     }
+    // 数的是**参数**,不是 arg_bindings 条目 —— 一个条目可以绑好几个参数,而用户
+    // 要衡量的是「有几个参数要回到模型自己填」。下面列表也是一行一个参数,标题
+    // 的 N 与用户能数到的行数对得上。
+    const droppedParams = dropped.flatMap((b) => Object.entries(b.args));
     modal.confirm({
-      title: t("agent_form.mcp_bind_drop_title"),
+      title: t("agent_form.mcp_bind_drop_title", {
+        count: droppedParams.length,
+      }),
       okText: t("agent_form.mcp_bind_drop_ok"),
       cancelText: t("agent_form.mcp_bind_drop_cancel"),
       content: (
@@ -312,6 +327,8 @@ export function McpToolPicker({
                 </li>
               )),
             )}
+            {/* 上面这串摊平的结果就是 droppedParams,标题里的 N 取的是它的长度
+                —— 一个来源,数不出「说 3 条、列 4 行」这种事。 */}
           </ul>
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("agent_form.mcp_bind_drop_hint")}

@@ -1050,8 +1050,9 @@ const zhCN: TranslationKeys = {
       "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。不绑定的参数仍由模型自己填。",
     mcp_bind_required: "这个参数是必填的",
     mcp_bind_no_variables:
-      "先在「提示词变量」里声明变量（左侧「提示词与输出」→「动态 Prompt(Jinja)」），再回来把参数绑到变量上。",
-    mcp_bind_drop_title: "这些参数绑定会一起被删掉",
+      "先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量，再回来把参数绑到变量上。",
+    mcp_bind_drop_title_one: "这会同时删掉 1 条参数绑定",
+    mcp_bind_drop_title_other: "这会同时删掉 {{count}} 条参数绑定",
     mcp_bind_drop_item: "{{tool}} 的 {{param}} ← 变量 {{variable}}",
     mcp_bind_drop_hint:
       "删掉之后，这些参数改回由模型自己填。要保留绑定，请取消本次改动。",

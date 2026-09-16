@@ -23,6 +23,7 @@ import { McpToolPicker } from "../McpToolPicker";
 import { FormView } from "../../FormView";
 import { readTools, type AgentManifest, type ArgBindingFields } from "../../form_model";
 import * as serversSdk from "../../../../api/mcp-servers";
+import * as catalogSdk from "../../../../api/mcp-catalog";
 import * as modelCatalog from "../../catalog";
 
 // Cross-tenant W3 — the picker reads the ambient tenant scope; these tests
@@ -38,10 +39,14 @@ vi.mock("../../../../tenant/TenantScopeContext", async (importOriginal) => {
 
 const availableMock = vi.spyOn(serversSdk, "listAvailableMcpServers");
 const toolsMock = vi.spyOn(serversSdk, "listMcpServerTools");
+const platformCatalogMock = vi.spyOn(catalogSdk, "listPlatformCatalog");
+const catalogToolsMock = vi.spyOn(catalogSdk, "listCatalogTools");
 
 beforeEach(async () => {
   availableMock.mockReset();
   toolsMock.mockReset();
+  platformCatalogMock.mockReset();
+  catalogToolsMock.mockReset();
   scopeRef.current = undefined;
   // 断言里写的是中文文案(「自动（模型填）」等),语言不钉住就随 jsdom 的
   // navigator.language 漂 —— 本机与 CI 解析成 en 时整片假红。
@@ -213,7 +218,12 @@ describe("McpToolPicker 参数绑定", () => {
 
   it("声明变量为空时给出提示而不是一个空下拉", async () => {
     await openBindings(renderPicker({ promptVariables: [] }));
-    expect(screen.getByText(/先在「提示词变量」里声明变量/)).toBeInTheDocument();
+    const hint = screen.getByTestId("af-mcp-bind-no-vars-t1");
+    expect(hint.textContent).toContain("声明变量");
+    // 提示必须指得着**页面上真实存在的**那一节。直接取那两个 i18n 键:谁把分组
+    // 或小节改了名,这条就红 —— 这正是我们想要的信号,而不是让提示悄悄过期。
+    expect(hint.textContent).toContain(i18n.t("manifest_editor.group_prompt"));
+    expect(hint.textContent).toContain(i18n.t("agent_form.section_prompt_vars"));
     expect(screen.queryByLabelText("project_code")).not.toBeInTheDocument();
   });
 
@@ -234,13 +244,39 @@ describe("McpToolPicker 参数绑定", () => {
     expect(onChange).not.toHaveBeenCalled();
 
     const dialog = await screen.findByRole("dialog");
+    // 追加要求原文:「告诉他这会同时删掉 N 条绑定」——标题必须报出条数。
+    expect(dialog.textContent).toContain("这会同时删掉 1 条参数绑定");
     // 逐条摆出来:哪个工具的哪个参数、绑的是哪个变量。
     expect(dialog.textContent).toContain("t1");
     expect(dialog.textContent).toContain("project_code");
+    // N 与用户能数到的行数同源:1 条 → 1 行。
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(1);
 
     await user.click(within(dialog).getByRole("button", { name: /删除/ }));
     await waitFor(() => expect(onChange).toHaveBeenCalledTimes(1));
     expect(onChange).toHaveBeenLastCalledWith([], [], []);
+  });
+
+  it("要删多条时条数跟着变,行数与条数对得上", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({
+      onChange,
+      tools: [T1, T2],
+      promptVariables: ["project_code", "employee_code"],
+      argBindings: [
+        {
+          server: "deepcare",
+          tool: "t1",
+          args: { project_code: "project_code", keyword: "employee_code" },
+        },
+        { server: "deepcare", tool: "t2", args: { note: "employee_code" } },
+      ],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    const dialog = await screen.findByRole("dialog");
+    // 两个条目一共绑了三个参数 —— 报的是参数数,和下面三行对得上。
+    expect(dialog.textContent).toContain("这会同时删掉 3 条参数绑定");
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(3);
   });
 
   it("取消确认则什么都不写", async () => {
@@ -332,6 +368,52 @@ describe("McpToolPicker 参数绑定", () => {
     expect(
       screen.getByTestId("af-mcp-bind-toggle-t1").textContent,
     ).toContain("2");
+  });
+});
+
+// ── 平台连接器(source="catalog")也得能绑 ───────────────────────────────────
+//
+// catalog 分支 map 工具时曾经只带 name/description,把 input_schema 丢了 ——
+// 这个 bug 在租户自己注册的服务器上完全看不出来,只有用平台连接器的人会撞上
+// 「展开了却一个参数都没有」。
+describe("McpToolPicker 参数绑定(平台连接器)", () => {
+  it("catalog 探针的 input_schema 要透传,参数才列得出来", async () => {
+    platformCatalogMock.mockResolvedValue([
+      {
+        id: "c1",
+        name: "deepcare",
+        display_name: "DeepCare",
+        enabled: true,
+      },
+    ] as never);
+    catalogToolsMock.mockResolvedValue({
+      status: "ok",
+      tool_count: 1,
+      error: null,
+      tools: [
+        {
+          name: "t1",
+          description: "",
+          input_schema: { properties: { project_code: {}, keyword: {} } },
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    render(
+      <App>
+        <McpToolPicker
+          source="catalog"
+          servers={["deepcare"]}
+          allowTools={[]}
+          argBindings={[]}
+          promptVariables={["project_code"]}
+          onChange={() => {}}
+        />
+      </App>,
+    );
+    await openBindings(user);
+    expect(screen.getByLabelText("project_code")).toBeInTheDocument();
+    expect(screen.getByLabelText("keyword")).toBeInTheDocument();
   });
 });
 

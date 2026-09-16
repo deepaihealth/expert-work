@@ -1021,7 +1021,8 @@ export interface TranslationKeys {
     mcp_bind_hint: string;
     mcp_bind_required: string;
     mcp_bind_no_variables: string;
-    mcp_bind_drop_title: string;
+    mcp_bind_drop_title_one: string;
+    mcp_bind_drop_title_other: string;
     mcp_bind_drop_item: string;
     mcp_bind_drop_hint: string;
     mcp_bind_drop_ok: string;
@@ -4261,8 +4262,9 @@ const en: TranslationKeys = {
       "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. Unbound parameters are still filled in by the model.",
     mcp_bind_required: "This parameter is required",
     mcp_bind_no_variables:
-      "Declare a variable first (Prompt & output → Dynamic prompt (Jinja)), then come back and bind parameters to it.",
-    mcp_bind_drop_title: "These bound parameters will be deleted too",
+      "Declare a variable under Prompt & Output → Dynamic prompt (Jinja) first, then come back and bind parameters to it.",
+    mcp_bind_drop_title_one: "This will also delete 1 bound parameter",
+    mcp_bind_drop_title_other: "This will also delete {{count}} bound parameters",
     mcp_bind_drop_item: "{{param}} on {{tool}} ← variable {{variable}}",
     mcp_bind_drop_hint:
       "Once deleted, the model fills these parameters in again. Cancel to keep them.",
