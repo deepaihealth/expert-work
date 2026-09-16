@@ -415,38 +415,52 @@ test("(e) the bound-variable row stays readable — the note gets its own line",
 
   const nameBox = (await nameInput.boundingBox())!;
   const noteBox = (await note.boundingBox())!;
+  // 参照物是**行容器**,不是名字输入框 —— 输入框自己就是会被挤扁的那一个,
+  // 拿它当基准的话断言是循环的:挤坏之后 "比名字栏宽两倍" 这种条件反而更容易满足。
+  // 实测(healthy / 完全还原成缺陷态):
+  //   row   438,628 / 438,628      ← 不动,可以当尺子
+  //   name  w=160   / w=83.7
+  //   note  x=438 w=628 / x=736.8 w=329.2
+  const rowBox = (await page.getByTestId("af-prompt-var-row-0").boundingBox())!;
   const trustedLabel = page
     .getByTestId("af-prompt-var-row-0")
     .locator("span", { hasText: /^(可信|Trusted)$/ })
     .first();
 
-  // 1) 变量名那一栏没有被压缩(声明宽度 160)。挤坏的那一版量到的是 ~70。
-  expect(nameBox.width).toBeGreaterThanOrEqual(150);
+  // 这一组几何断言用 expect.soft:布局坏掉时往往同时踩中好几条,硬断言会停在
+  // 第一条,剩下的到底是"也坏了"还是"其实拦不住"就看不出来了 —— 而"看起来像
+  // 守卫、其实永远不会失败的断言"正是本轮要清掉的东西。soft 让每次跑都把所有
+  // 违反项一次报全。
+  // 1) 变量名那一栏没有被压缩(声明宽度 160)。挤坏的那一版量到的是 83.7。
+  expect.soft(nameBox.width).toBeGreaterThanOrEqual(150);
 
-  // 2) 说明在控件**下面**自己一行,不是挤在行内:它的上沿低于输入框的下沿。
-  expect(noteBox.y).toBeGreaterThanOrEqual(nameBox.y + nameBox.height - 1);
+  // 2) 说明从**行的左边缘**起头 —— 也就是它真的另起了一行,而不是排在五个控件
+  //    后面。缺陷态量到 x=736.8(排在删除按钮右边),healthy 是 438 = 行左边缘。
+  expect.soft(noteBox.x).toBeLessThanOrEqual(rowBox.x + 1);
 
-  // 3) 说明确实占满整行宽(flexBasis:100%),而不是缩在角落。
-  expect(noteBox.width).toBeGreaterThan(nameBox.width * 2);
+  // 3) 说明横跨整行。缺陷态量到 329.2 / 628(被挤成一个窄高列),healthy 是 628。
+  expect.soft(noteBox.width).toBeGreaterThanOrEqual(rowBox.width - 1);
 
   // 4) 标签没有被压成一列一个字母的竖排 —— 竖排时高度会是行高的好几倍。
   const trustedBox = (await trustedLabel.boundingBox())!;
-  expect(trustedBox.height).toBeLessThan(40);
+  expect.soft(trustedBox.height).toBeLessThan(40);
 
   // 5) 那句说明必须真的把「怎么解锁」讲出来,不只是一个数字。
   const noteText = (await note.textContent()) ?? "";
-  expect(noteText).toContain("MCP");
+  expect.soft(noteText).toContain("MCP");
 
-  // 6) 「独占一行」不许靠「文案碰巧够长」。把它临时改成一个字符再量一次 ——
-  //    这一条钉的是 flexBasis:100%:只有 flexWrap 的话,短文案会滑回行内,
-  //    于是下一次文案一改短,这一行又开始和五个控件抢地方。
+  // 6) 「独占一行」不许靠「文案碰巧够长」。把它临时改成一个字符再量一次。
+  //    这一条是**唯一**杀得死 flexBasis:100% 的断言:只去掉 flexBasis(留着
+  //    flexWrap)时,长文案照样会换行,上面 1~5 量到的几何与 healthy 逐个数字
+  //    相同 —— 实测过。短文案下它才会滑回行内,于是下一次文案一改短,这一行
+  //    又开始和五个控件抢地方。
   // e2e 的 tsconfig 不带 dom lib,所以这里显式窄化到「有 textContent 的东西」。
   await note.evaluate((el) => {
     (el as unknown as { textContent: string }).textContent = "x";
   });
   const shortNoteBox = (await note.boundingBox())!;
   const nameBoxAfter = (await nameInput.boundingBox())!;
-  expect(shortNoteBox.y).toBeGreaterThanOrEqual(
+  expect.soft(shortNoteBox.y).toBeGreaterThanOrEqual(
     nameBoxAfter.y + nameBoxAfter.height - 1,
   );
 });

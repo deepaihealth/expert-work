@@ -445,6 +445,97 @@ describe("PromptVariablesEditor 绑定守卫(B-61)", () => {
     },
   );
 
+  // NEW-7 —— 上面每个夹具都绑**两个**参数,于是单数那一档(en 的 _one)以及
+  // 拒删框的「知道了」按钮从来没渲染过,挖空它们照样全绿。这两条专门只绑一个。
+  const ONE_BINDING: ArgBindingFields[] = [
+    {
+      server: "deepcare",
+      tool: "customer_search",
+      args: { project_code: "project_code" },
+    },
+  ];
+  const SINGULAR_COPY = {
+    "zh-CN": {
+      // zh 的复数规则只有 other,count=1 也走 _other。
+      jinjaTitle: "关掉后会同时删掉 1 条参数绑定",
+      removeTitle: "这个变量还有 1 个工具参数绑着,不能删",
+      removeOk: "知道了",
+      // zh 走 _other,把 count 代进去就是「1 个…它们…」。
+      boundNote:
+        "1 个工具参数绑着它,不能改名或删除 —— 先到「工具」→「MCP」里把它们改回「自动（模型填）」。",
+    },
+    en: {
+      jinjaTitle: "Turning this off also deletes 1 bound parameter",
+      removeTitle:
+        "1 tool parameter is still bound to this variable, so it cannot be removed",
+      removeOk: "Got it",
+      // en 有 one 这一档,单数句式不一样(it / is / set it back)。
+      boundNote:
+        '1 tool parameter is bound to it, so it cannot be renamed or removed — set it back to "Auto (model fills it in)" under Tools → MCP first.',
+    },
+  } as const;
+
+  it.each(["zh-CN", "en"] as const)(
+    "只绑一个参数时,关 Jinja 的标题走单数那一档(%s)",
+    async (lang) => {
+      const before = i18n.language;
+      await i18n.changeLanguage(lang);
+      try {
+        const user = userEvent.setup();
+        render(
+          <App>
+            <PromptVariablesEditor
+              formData={boundSeed([{ name: "project_code" }], ONE_BINDING)}
+              onChange={vi.fn()}
+            />
+          </App>,
+        );
+        await user.click(screen.getByTestId("af-prompt-jinja"));
+        const dialog = await screen.findByRole("dialog");
+        expect(dialog.textContent).toContain(SINGULAR_COPY[lang].jinjaTitle);
+        expect(within(dialog).getAllByRole("listitem")).toHaveLength(1);
+      } finally {
+        await i18n.changeLanguage(before);
+      }
+    },
+  );
+
+  it.each(["zh-CN", "en"] as const)(
+    "只绑一个参数时,拒删框走单数那一档,且「知道了」按钮按本 locale 渲染(%s)",
+    async (lang) => {
+      const before = i18n.language;
+      await i18n.changeLanguage(lang);
+      try {
+        const user = userEvent.setup();
+        const onChange = vi.fn();
+        render(
+          <App>
+            <PromptVariablesEditor
+              formData={boundSeed([{ name: "project_code" }], ONE_BINDING)}
+              onChange={onChange}
+            />
+          </App>,
+        );
+        await user.click(screen.getByTestId("af-prompt-var-remove-0"));
+        const dialog = await screen.findByRole("dialog");
+        expect(dialog.textContent).toContain(SINGULAR_COPY[lang].removeTitle);
+        expect(within(dialog).getAllByRole("listitem")).toHaveLength(1);
+        // 拒删框只有一个按钮(info 档,没有「继续」那一档)—— 它的文案也要钉住。
+        const buttons = within(dialog)
+          .getAllByRole("button")
+          .map((b) => (b.textContent ?? "").replace(/\s+/g, ""));
+        expect(buttons).toContain(SINGULAR_COPY[lang].removeOk.replace(/\s+/g, ""));
+        expect(onChange).not.toHaveBeenCalled();
+        // 只绑一个时旁边那行小字也走单数那一档(en 的 _one 分支)。
+        expect(screen.getByTestId("af-prompt-var-bound-0").textContent).toBe(
+          SINGULAR_COPY[lang].boundNote,
+        );
+      } finally {
+        await i18n.changeLanguage(before);
+      }
+    },
+  );
+
   it.each(["zh-CN", "en"] as const)(
     "关 Jinja:取消确认则一个字都不写(%s)",
     async (lang) => {
