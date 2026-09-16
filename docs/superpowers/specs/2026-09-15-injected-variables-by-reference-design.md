@@ -266,7 +266,15 @@ manifest-editor 的 mcp tab(`components/manifest-editor/groups/CapabilitiesSecti
 | 有声明变量的 | 工作区多一个 `inputs/<run_id>/`;提示词一个字不改,照常跑(值仍在提示词里) |
 | 配了 `arg_bindings` 的 | 只有人工配过才有 |
 
-**收益要等对接方改提示词**(第二步,他们自己挑时间):`ai-health-plan` 模板 5 处——L7/L10 不再内联 `{{ org_logo }}`/`{{ materials }}`(去掉 `materials` 的内联连带去掉它的围栏,且不能改用真值判空,见 §4.5)、新增「输入文件(硬规则)」段、L63/L65 封面 LOGO 改用 `local_path` 且失败判据改「为空或本地不存在」、L85-87 素材每项用 `local_path`、超链接 URL 必须代码从 inputs.json 读。落进 Agent 配置书 #1235 addendum。
+**收益要等对接方改提示词**(第二步,他们自己挑时间):`ai-health-plan` 模板 5 处。位置**按原文锚定,不写行号**——那份模板在本 spec 之外、还会继续变,行号一移就指向一个谁都没有的副本(上一版写的 L7/L10/L63/L65/L85-87 已经对不上任何一份现存文件,别再「顺手」改回行号);下面每个引号里的串在 `docs/agents/ai-health-plan.md` 里都唯一。
+
+1. 「机构 LOGO 下载地址」那行:不再内联 `{{ org_logo }}`。
+2. 「可用素材」那行:不再内联 `{{ materials }}`。去掉内联连带去掉它的围栏,且不能改用真值判空,见 §4.5。
+3. 新增「输入文件(硬规则)」段。
+4. 「封面:左上放机构 LOGO」与「LOGO 下载失败不中断」这两行:封面 LOGO 改用 `local_path`,失败判据改「为空**或**本地不存在」。
+5. 「每项素材只有两样东西」起的三行:素材每项用 `local_path`、超链接 URL 必须代码从 `inputs.json` 读。**前提是 `materials` 发成真 JSON 数组** —— 按 #1235 今天的「JSON 数组字符串」契约,两侧遍历器都看不见字符串**里面**的 URL,素材上永远不会出现 `local_path`;请求形状未定,登记在 ROADMAP B-61。
+
+落进 Agent 配置书 #1235 addendum。
 
 **回滚的坑(必须写进发布清单)**:`MCPToolSpec` 是 `extra="forbid"`,**旧版本读到带 `arg_bindings` 的 manifest 会校验失败**——不是行为退化,是那些 agent 直接起不来。处置:回滚窗口内先别配绑定;或回滚前先清掉绑定配置。与 B-50 那次「回滚窗口在数据搬迁之前」同类。
 
