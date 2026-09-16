@@ -600,8 +600,37 @@ DB 侧不用担心：`0152`/`0153`/`0154`/`0155` 都是 expand-only（加列/加
 
 ## 5. 收工确认
 
-- [ ] 三段都做完，且 `git status` 里 overlay 的 newTag 改动已进 Step E 的记录 PR
-- [ ] 生产 `kubectl -n expert-work get pods` 无 CrashLoop / 无重启计数异常
-- [ ] `~/b50-prod-dryrun.txt` 与 `~/b50-prod-apply.txt` 两份留档还在
-      （**唯一的回退依据**，别清）
-- [ ] 执行单本身归档（这是一次性文档，发完就该躺进历史，而不是被下一次误用）
+- [x] 三段都做完，且 `git status` 里 overlay 的 newTag 改动已进 Step E 的记录 PR
+- [x] 生产 `kubectl -n expert-work get pods` 无 CrashLoop / 无重启计数异常（18:52 实测：全 Running、零重启）
+- [x] `~/b50-prod-dryrun.txt` / `~/b50-prod-apply.txt` / `~/b50-prod-dryrun-2.txt` / `~/b50-prod-apply-2.txt`
+      四份留档都在（**唯一的回退依据**，别清；`-2` 是补搬的三个新用户）
+- [x] 执行单本身归档（这是一次性文档，发完就该躺进历史，而不是被下一次误用）
+
+---
+
+## 6. 执行记录（2026-09-16，发完当晚写）
+
+| 时刻 | 段 | 结果 |
+|---|---|---|
+| 18:20 | Step A 沙箱钉子 `63a3109f → e8aac104` | 发前值与 §3 记的一致；池 pod 约 2 分钟 4/4 |
+| 18:22~18:28 | B1 `ca225258` | 镜像层缓存全命中，8 分钟；迁移 0152~0155 过；SMOKE PASS；金丝雀 5/5 |
+| 18:29 | C.2 空跑（首次） | **没跑起来**：单子的 `for U in $USERS` 是 bash 写法，zsh 不给变量分词，8 个 UUID 粘成一个参数 → `badly formed hexadecimal UUID string`，参数解析阶段退出，零副作用 |
+| 18:31 | C.2 空跑（单行 `for U in a b c…`） | 8 个用户跑通；**两处与 C.1 不符**：`5e949c8f` 6→8（09-15 对接方一轮 json+pptx，`find -newermt` 坐实）、金丝雀 1→2（B1 金丝雀刚在 agent 目录写了新副本，脚本按「不覆盖」把根上老的改投 `shared/` 并 ⚠️ 报出 —— 单子自己的步骤顺序决定的） |
+| 18:35 | C.3 真搬 8 个 | 与空跑逐个一致；产物行 58 = 56 + 2 |
+| 18:37 | C.4 验收 | **③ = 20，停**。多出 3 个 09-13 勘察后新开的用户（`16391d9b` / `880813f0` / `b834eecf`，67 文件 / 20 产物行），搬迁按用户跑、单子只列了 8 个 |
+| 18:38 | C.2/C.3 补跑 3 个 | 空跑干净（`880813f0` shared 5 = 根级共写文件，代码 `len(names)==1` 才走捷径 ⇒ 它是第二个双 agent 用户）；真搬与空跑一致 |
+| 18:40 | C.4 复验 | ① 222 = agents 206 + shared 16；② 79；**③ 0；④ 0**；无 `!!` |
+| 18:44~18:51 | B2 `5775fbf3` | 迁移 Job 空跑；12 个 rollout；SMOKE PASS（`WARN 沙箱钉子落后 4` 预期）；金丝雀 5/5 |
+| 18:52 | §5 收工 | 全 pod Running 零重启；三个应用 `5775fbf3`；沙箱池自动补充中 |
+| 18:56 | B2 回落复验 | **PASS**：用户根放 `legacy-probe.txt`，金丝雀 `read_file` → `not_found`，`PROD_LEGACY_PROBE` 未出现在流里（run 21.4s success）；探针已删 |
+| 18:59 | Step D P-1 | **取代逻辑 PASS**（queue 建 run → `:regenerate` → 旧轮 2 条消息全带 `superseded_by`、新轮不带）。**tokens 那条本次验不了**：探针用了确定性 prompt + 金丝雀 `temperature 0.0` + 1 小时内重复，run1/run2 都命中 **E.13 响应缓存**（0.40s / 0.49s、`token_usage` 0 行；同 prompt 的对照 run 6.95s、1 行 2966 tokens）。不是 P-1 计费回归；带出 **B-66**（regenerate 命中缓存返回旧答案 + 命中时对外用量 `None`）。第一次跑探针我解析错了对外信封（`data.runs[]`），重跑一次 |
+
+**下一班要改的三条（不是本单的错，是它没预见到的）**：
+
+1. **C.2/C.3 的用户清单不要写死** —— 勘察是快照，发布日之前对接方会新开账号。改成在 pod 里
+   `ls /mnt/workspaces/<tenant>/` 枚举全部用户目录再逐个跑；C.1 那张表只用来核对**已知**用户，
+   多出来的按同一套判据（单 agent `shared` 必须 0、⚠️ 只许「目的地已有更新副本」那一种）临场判。
+2. **shell 差异**：单子里的多行 `USERS="…"` + `for U in $USERS` 只在 bash 下分词。写成单行
+   `for U in <uuid> <uuid> …` 两种 shell 都对；或者干脆走上一条的枚举。
+3. **金丝雀那一行的预期本来就不可能成立** —— 单子写 B1 金丝雀在 C 之前，金丝雀一跑就在 agent
+   目录写新副本，C 必然报「目的地已有更新副本」。这条 ⚠️ 应当**预先写成预期**，而不是留给现场判。
