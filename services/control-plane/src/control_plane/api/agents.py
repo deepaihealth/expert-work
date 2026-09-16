@@ -134,6 +134,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
+from orchestrator.tools.registry import UnmatchedArgBinding
 
 logger = logging.getLogger("expert_work.control_plane.agents")
 
@@ -1000,7 +1001,7 @@ async def _check_buildable(
         return _BuildCheck()
     started = time.monotonic()
     try:
-        await runtime.agent_builder(spec, tenant_id=tenant_id, user_id=None)
+        built = await runtime.agent_builder(spec, tenant_id=tenant_id, user_id=None)
     except PlatformNotConfiguredError as exc:
         record_manifest_build_check(outcome="platform_gap")
         logger.warning(
@@ -1027,7 +1028,47 @@ async def _check_buildable(
         )
     record_manifest_build_check(outcome="ok")
     logger.info("manifest.build_check_ok ms=%.0f", (time.monotonic() - started) * 1000)
-    return _BuildCheck()
+    return _BuildCheck(warning=_unmatched_binding_warning(built))
+
+
+def _unmatched_binding_warning(built: Any) -> str | None:
+    """B-61 §5.4 —— 「这条参数绑定一个工具都没匹配上」的人话告警。
+
+    这件事 manifest 层查不出来:``servers`` 为空是默认值、且表示「所有服务器」,
+    而「这个租户到底有哪些服务器、每台上面有哪些工具」对 protocol 包不可见。
+    名字写错时绑定静默失效 —— 参数回到模型手里,模型继续手抄那串长字符串,正是
+    本特性要消灭的故障,却披着一份校验全绿的 manifest。真正知道答案的是上面这次
+    试建(它按真正的 builder 组装,连 MCP 池一起挂),所以判在这里。
+
+    **警告,不是 422**:同一函数的 docstring 记着「任何 MCP 路径都不抛
+    ``AgentFactoryError``,连不上的服务器只是跳过」—— 做成拒绝,等于对方服务临时
+    不可达就卡死保存。
+
+    ``getattr`` 兜底:注入 builder 的测试替身返回的不是 ``BuiltAgent``,这条闸不能
+    因此炸掉保存。
+    """
+    unmatched = getattr(built, "unmatched_arg_bindings", ()) or ()
+    if not unmatched:
+        return None
+    # 两类落空的改法完全不同,所以分开说:名字写错 / 服务器没挂上,是「这个工具
+    # 压根不在目录里」;上游改了接口,是「工具在,但它不再声明这个参数」。
+    no_tool = [_binding_label(u) for u in unmatched if not u.tool_found]
+    no_param = [_binding_label(u) for u in unmatched if u.tool_found]
+    chunks: list[str] = []
+    if no_tool:
+        chunks.append("no such tool in the assembled catalog: " + "; ".join(no_tool))
+    if no_param:
+        chunks.append("the tool no longer declares: " + "; ".join(no_param))
+    return (
+        "some arg_bindings did not land, so their parameters stay in the model's "
+        "hands — " + " | ".join(chunks) + ". Check the server / tool / parameter "
+        "spelling, and that the server is reachable and enabled for this tenant."
+    )
+
+
+def _binding_label(unmatched: UnmatchedArgBinding) -> str:
+    """``server/tool (param, param)`` —— 只有名字,一个值都不带。"""
+    return f"{unmatched.server}/{unmatched.tool} ({', '.join(unmatched.params)})"
 
 
 async def _load_manifest(
@@ -1682,6 +1723,7 @@ def build_agents_router() -> APIRouter:
                 settings=request.app.state.settings,
                 built=built,
                 record_spec=record.spec,
+                record_spec_sha256=record.spec_sha256,
                 thread_id=thread_id,
                 tenant_id=tenant_id,
                 actor_id=actor_id,

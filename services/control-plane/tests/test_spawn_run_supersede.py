@@ -130,6 +130,7 @@ class _SpawnCtx:
             settings=self.app.state.settings,
             built=built,
             record_spec=record.spec,
+            record_spec_sha256=record.spec_sha256,
             thread_id=self.thread_id,
             tenant_id=self.tenant_id,
             actor_id="sa-test",

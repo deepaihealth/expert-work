@@ -34,7 +34,6 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.protocol import (
     AgentSpec,
     AuditQuery,
@@ -378,4 +377,8 @@ async def test_fire_records_the_manifest_version_it_built() -> None:
 
     row = await run_store.get(run_id=run_id, tenant_id=_TENANT)
     assert row is not None
-    assert row.agent_spec_sha256 == compute_spec_sha256(AgentSpec.model_validate(_MANIFEST))
+    # B-61 T5b 修复轮 1(I-1)—— 绑的是 ``agent_spec.spec_sha256`` 那一列(库里
+    # 的值),不是现算的:``_build_ctx`` 里 ``agents.create`` 存的哈希是合成值
+    # ``"a" * 64``,与 ``_MANIFEST`` 的真实内容哈希不同,这正好钉住「绑列不绑
+    # 重算」。
+    assert row.agent_spec_sha256 == "a" * 64

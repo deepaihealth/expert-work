@@ -16,6 +16,7 @@ from expert_work.persistence.platform_agent_template.base import (
     PlatformAgentTemplateStore,
     compute_spec_sha256,
 )
+from expert_work.persistence.stored_spec import load_stored_spec
 from expert_work.protocol import (
     PlatformAgentTemplatePatch,
     PlatformAgentTemplateRecord,
@@ -32,7 +33,7 @@ def _row_to_record(row: PlatformAgentTemplateRow) -> PlatformAgentTemplateRecord
         tenant_id=row.tenant_id,
         name=row.name,
         version=row.version,
-        spec=AgentSpec.model_validate(row.spec_json),
+        spec=load_stored_spec(row.spec_json),
         spec_sha256=row.spec_sha256,
         display_name=row.display_name,
         description=row.description,

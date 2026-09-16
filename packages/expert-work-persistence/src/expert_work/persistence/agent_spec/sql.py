@@ -16,6 +16,7 @@ from expert_work.persistence.agent_spec.base import (
     DuplicateAgentSpecError,
 )
 from expert_work.persistence.models import AgentSpecRevisionRow, AgentSpecRow
+from expert_work.persistence.stored_spec import load_stored_spec
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecDraft,
@@ -31,7 +32,7 @@ def _row_to_record(row: AgentSpecRow) -> AgentSpecRecord:
         tenant_id=row.tenant_id,
         name=row.name,
         version=row.version,
-        spec=AgentSpec.model_validate(row.spec_json),
+        spec=load_stored_spec(row.spec_json),
         spec_sha256=row.spec_sha256,
         status=AgentSpecStatus(row.status),
         created_by=row.created_by,
@@ -55,7 +56,7 @@ def _row_to_draft(row: AgentSpecRow) -> AgentSpecDraft | None:
     # read path, so trust the writers and let Pydantic reject a genuinely
     # malformed row.
     return AgentSpecDraft(
-        spec=AgentSpec.model_validate(row.draft_spec_json),
+        spec=load_stored_spec(row.draft_spec_json),
         spec_sha256=row.draft_sha256 or "",
         updated_by=row.draft_updated_by or "",
         updated_at=row.draft_updated_at,  # type: ignore[arg-type]
@@ -69,7 +70,7 @@ def _revision_to_record(row: AgentSpecRevisionRow) -> AgentSpecRevisionRecord:
         agent_name=row.agent_name,
         agent_version=row.agent_version,
         revision=row.revision,
-        spec=AgentSpec.model_validate(row.spec_json),
+        spec=load_stored_spec(row.spec_json),
         spec_sha256=row.spec_sha256,
         actor_id=row.actor_id,
         created_at=row.created_at,

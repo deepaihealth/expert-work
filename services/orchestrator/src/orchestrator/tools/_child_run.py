@@ -702,6 +702,19 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     inputs_run_id = ctx.inputs_run_id or ctx.run_id
     if inputs_run_id is not None:
         configurable["inputs_run_id"] = str(inputs_run_id)
+    # B-61 §5.3 —— 同一个理由,绑定面:透传**父的** ``prompt_inputs``。子代跑的是
+    # 同一个 ``tools_node``,config 里没有这一项时 ``apply_arg_bindings`` 对每个被绑
+    # 参数走「本轮没给值 → 把它删掉」那条分支;而该参数已经从子代的 schema 里剥掉、
+    # 模型也补不上 —— 那个 MCP 工具在子代身上就永远缺一个必填参数,
+    # ``additionalProperties: false`` 的服务端更是直接硬拒。绑定属于**父**的 spec,
+    # 子代干的也是父 agent 的活,取值口径与 agent_key / inputs_run_id 一致:用父的。
+    if ctx.prompt_inputs:
+        # 键写成字面量,与上面 ``inputs_run_id`` / ``agent_key`` 同一写法:本模块在
+        # ``tools`` 早于 ``sse`` 被导入(tools → assembly → spawn_worker → 本模块),
+        # ``from orchestrator.sse import PROMPT_INPUTS_KEY`` 会绕回半初始化的
+        # ``orchestrator.context`` 上死掉(实测 ImportError)。字面量与常量的一致性
+        # 由 ``test_mcp_arg_bindings_wiring`` 里那条断言钉住,不靠人记得。
+        configurable["prompt_inputs"] = dict(ctx.prompt_inputs)
     if ctx.deadline_at is not None:
         configurable["deadline_at"] = ctx.deadline_at
     # B2 — 向下透传 worker 事件 sink,孙 worker 帧直达父 run bridge。

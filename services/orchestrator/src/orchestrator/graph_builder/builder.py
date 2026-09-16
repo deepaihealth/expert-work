@@ -142,6 +142,7 @@ from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
 from orchestrator.output_judge import ActionJudge, OutputJudge
+from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import (
@@ -153,6 +154,7 @@ from orchestrator.tools._guards import (
     usage_total,
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
+from orchestrator.tools.arg_bindings import apply_arg_bindings
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
@@ -1278,6 +1280,57 @@ def build_react_graph(
         if not tool_calls:
             return {}
 
+        # B-61 §5.3 —— 平台绑定的参数在这里填,早于审批门与 action screening:
+        # 两者都在 dispatch 之前读 args,填在这里,人审批时看到的是真值、judge
+        # 也是对真参数判对齐。填在 before_tool_dispatch 那层就都看不到了。
+        #
+        # 也早于下面的审批**续跑**分支,这是必须的:审批请求记的是填完的 args,
+        # 而续跑是从检查点里的原始 AIMessage 重新取 tool_calls —— 不在这里重填
+        # 一遍,RT-6 的 binding digest 就会对不上,一次正常的批准变成完整性否决。
+        #
+        # 逐个 call 各调一次:审计行是 per-call 的,一次把整批填完只拿得到全轮
+        # 汇总的参数名,会把 A 调用填的参数记到 B 调用头上。
+        registry_bindings = tool_registry.arg_bindings()
+
+        def _fill_bound_args(
+            calls: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], dict[int, list[str]]]:
+            """填上平台绑定的参数,并返回每个调用各填了哪几个(只有名字)。
+
+            没有绑定就原样退回:存量 agent 的 tool_calls 仍是 AIMessage 身上那几个
+            对象本身,零行为变化。
+            """
+            if not registry_bindings:
+                return calls, {}
+            configurable_now = config.get("configurable") or {}
+            prompt_inputs = configurable_now.get(PROMPT_INPUTS_KEY) or {}
+            filled: list[dict[str, Any]] = []
+            names_by_index: dict[int, list[str]] = {}
+            # 变量名不叫 ``call``:函数下面的 ``for call, result in zip(stage, ...)``
+            # 绑的是 ``_ScheduledCall``,同名会让类型检查把两者并成一个。
+            for index, raw_call in enumerate(calls):
+                (one_call,), names = apply_arg_bindings(
+                    [raw_call], bindings=registry_bindings, inputs=prompt_inputs
+                )
+                filled.append(one_call)
+                if names:
+                    names_by_index[index] = names
+            return filled, names_by_index
+
+        tool_calls, bound_arg_names = _fill_bound_args(tool_calls)
+        # B-61 §5.4 / §8 —— 运行期兜底告警。保存时的试建早就过去了,对方服务器
+        # 是**保存之后**下线 / 改名的那条路上,这里是唯一还能说话的地方 —— 不说
+        # 就是静默失效:参数回到模型手里,模型继续手抄那串长字符串。
+        # 只记 server / 工具名 / 参数名,一个值都不记(这些值就是客户的真实资料)。
+        for unmatched in tool_registry.unmatched_arg_bindings():
+            logger.warning(
+                "mcp.arg_binding_unmatched server=%s tool=%r params=%s tool_found=%s",
+                unmatched.server,
+                unmatched.tool,
+                list(unmatched.params),
+                unmatched.tool_found,
+            )
+
         # Stream J.8 (Mini-ADR J-24) — approval gate. Two re-entrant paths:
         #
         # 1. RESUME — ``approval_resume`` set: a human verdict came back
@@ -1326,7 +1379,14 @@ def build_react_graph(
                 return rejected
             # approve / modify — fall through to dispatch the (possibly
             # arg-rewritten) calls; clear the resume channel on return.
-            tool_calls = resume_outcome.tool_calls
+            #
+            # B-61 §5.3 —— 再套一遍绑定。``modify`` 拿人工给的 ``modified_args``
+            # **整份替换**那条 call 的 args,于是(a)被绑参数会被人在审批面上静默
+            # 覆盖,而 spec 写的是「平台的值永远覆盖同名参数」——被绑参数根本不是
+            # 模型选的,也就不归人在这里改;(b)不重填的话 ``bound_arg_names`` 还
+            # 声称那个参数是平台填的,审计行就说了假话。``approve``(没改写)时这
+            # 一遍是幂等的,填进去的还是同样的值。
+            tool_calls, bound_arg_names = _fill_bound_args(resume_outcome.tool_calls)
         elif not state.get("pending_approval"):
             # Stream PI-3b — action screening: judge each proposed tool call
             # against the user's request before dispatch. A misaligned turn is
@@ -1428,6 +1488,7 @@ def build_react_graph(
 
         async def _run_call(
             tc: dict[str, Any],
+            bound_args: Sequence[str],
         ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
             # Per-call cancel check + ``run_cancellable`` mirror the M0
             # sequential path so cancellation semantics stay identical:
@@ -1444,6 +1505,7 @@ def build_react_graph(
                     overflow_writer=overflow_writer,
                     spotlight_nonce=spotlight_nonce,
                     budget_enabled=tool_output_budget_enabled,
+                    bound_args=bound_args,
                 )
             )
 
@@ -1451,9 +1513,10 @@ def build_react_graph(
 
         async def _bounded(
             tc: dict[str, Any],
+            bound_args: Sequence[str],
         ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
             async with semaphore:
-                return await _run_call(tc)
+                return await _run_call(tc, bound_args)
 
         for stage in stages:
             _tools_stages_total.inc()
@@ -1464,7 +1527,10 @@ def build_react_graph(
             # would be ``RunCancelledError`` (cancellation) or a
             # programmer error, both of which should propagate.
             stage_results = await asyncio.gather(
-                *(_bounded(tool_calls[call.index]) for call in stage)
+                *(
+                    _bounded(tool_calls[call.index], bound_arg_names.get(call.index, ()))
+                    for call in stage
+                )
             )
             for call, result in zip(stage, stage_results, strict=True):
                 results[call.index] = result
@@ -2497,6 +2563,7 @@ async def _dispatch_tool(
     overflow_writer: WorkspaceFileWriter | None = None,
     spotlight_nonce: str | None = None,
     budget_enabled: bool = True,
+    bound_args: Sequence[str] = (),
 ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
     """Dispatch one tool call.
 
@@ -2517,6 +2584,12 @@ async def _dispatch_tool(
     The emit is best-effort: a missing ``audit_logger`` / ``tenant_id``
     is skipped and an audit-write failure is swallowed, so auditing never
     changes the dispatch result (mirrors ``sse._emit_run_end_audit``).
+
+    B-61 — ``bound_args`` names the parameters ``tools_node`` filled in from
+    the run's declared variables, so the audit row shows which values came
+    from the platform rather than from the model. Names only, never values:
+    a bound value IS the customer record this feature exists to stop the
+    model from retyping.
     """
     name = str(tool_call.get("name", ""))
     call_id = str(tool_call.get("id", ""))
@@ -2583,8 +2656,9 @@ async def _dispatch_tool(
             reason=None if ok else "tool_error",
             duration_ms=duration_ms,
             # Stream 14.4 — MCP traffic audit: server + response volume.
-            extra_details=_mcp_audit_details(
-                name, content=str(outcome[0].content), is_error=not ok
+            extra_details=_with_bound_args(
+                _mcp_audit_details(name, content=str(outcome[0].content), is_error=not ok),
+                bound_args,
             ),
         )
         return outcome
@@ -2604,7 +2678,7 @@ async def _dispatch_tool(
             result=AuditResult.ERROR,
             reason="unknown_tool",
             duration_ms=duration_ms,
-            extra_details=_mcp_audit_details(name, is_error=True),
+            extra_details=_with_bound_args(_mcp_audit_details(name, is_error=True), bound_args),
         )
         # Stream HX-12 — a truly unknown name gets ranked suggestions from
         # the deferred pool instead of a dead-end error (fail-open: worst
@@ -2655,7 +2729,7 @@ async def _dispatch_tool(
             result=AuditResult.DENIED,
             reason=type(exc).__name__,
             duration_ms=duration_ms,
-            extra_details=_mcp_audit_details(name, is_error=True),
+            extra_details=_with_bound_args(_mcp_audit_details(name, is_error=True), bound_args),
         )
         return (
             ToolMessage(
@@ -2729,6 +2803,19 @@ def _mcp_audit_details(
     if content is not None:
         details["response_chars"] = len(content)
     return details
+
+
+def _with_bound_args(
+    details: dict[str, Any] | None, bound_args: Sequence[str]
+) -> dict[str, Any] | None:
+    """B-61 —— 把本次调用里由平台填入的参数**名**并进审计 details。
+
+    没有绑定就原样返回(包括非 MCP 工具的 ``None``):这个键只在真填过东西时
+    出现,免得每一行都挂一个空列表、反而看不出哪次是平台填的。
+    """
+    if not bound_args:
+        return details
+    return {**(details or {}), "bound_args": list(bound_args)}
 
 
 #: Sandbox executors whose submitted code/command IS recorded into the audit
@@ -3054,6 +3141,10 @@ def _build_tool_context(
     # B-61 §4.4 —— 子代要指向**父** run 的 inputs.json(``_child_config`` 写进来
     # 的;主 run 的 config 里没有这一项,回落 ``None`` = 用自己的 run_id)。
     inputs_run_id = _parse_uuid(configurable.get("inputs_run_id"))
+    # B-61 §5.3 —— 本轮声明变量的值,只为 ``_child_config`` 往子代传(子代的
+    # config 里没有这一项,它的被绑参数就会被静默摘掉)。主 run 的填值不走这里。
+    raw_prompt_inputs = configurable.get(PROMPT_INPUTS_KEY)
+    prompt_inputs = raw_prompt_inputs if isinstance(raw_prompt_inputs, Mapping) else None
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -3074,6 +3165,7 @@ def _build_tool_context(
         turn_image_refs=images,
         agent_key=agent_key,
         inputs_run_id=inputs_run_id,
+        prompt_inputs=prompt_inputs,
     )
 
 
@@ -3104,8 +3196,18 @@ def _validate_tool_args(tool: Tool, args: Mapping[str, Any]) -> str | None:
     catching them here gives the model a grounded fix-it signal instead of an
     opaque downstream crash. A malformed *schema* (the tool's own bug) is not
     allowed to block dispatch — we skip validation in that case.
+
+    B-61 §5.2 — validates against ``dispatch_parameters`` when the tool has one.
+    A tool with bound parameters publishes TWO schemas: ``parameters`` is the
+    narrowed view handed to the model (bound parameters deleted so it cannot
+    fill them), while ``dispatch_parameters`` is the contract the callee
+    actually enforces. The args reaching here are the FILLED ones, so they must
+    be judged against the callee's contract: judging them against the narrowed
+    view means the parameter the platform just injected is an unknown property,
+    and on any ``additionalProperties: false`` server (the zod / MCP TS SDK
+    default) a correctly configured binding could never dispatch at all.
     """
-    schema = tool.spec.parameters
+    schema = tool.spec.dispatch_parameters or tool.spec.parameters
     if not schema:
         return None
     validator_cls = Draft202012Validator

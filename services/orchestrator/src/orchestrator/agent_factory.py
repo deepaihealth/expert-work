@@ -1187,6 +1187,8 @@ async def build_agent(
         tool_replay_safe=_tool_replay_safe(registry),
         # PR-A.3 — full registry projection for the console's Schema tab.
         tool_catalog=registry.catalog(),
+        # B-61 §5.4 —— 落空的参数绑定,给保存时的试建当 warning 用。
+        unmatched_arg_bindings=registry.unmatched_arg_bindings(),
         # Stream PI-1c — expose the build nonce so the control-plane seed
         # assembler can fence structured untrusted_content with it.
         spotlight_nonce=spotlight_nonce,

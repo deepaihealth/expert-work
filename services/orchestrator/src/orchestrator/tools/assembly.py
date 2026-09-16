@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from expert_work.persistence import ArtifactStore
 from expert_work.protocol import (
     AgentSpec,
+    ArgBindingSpec,
     BuiltinToolSpec,
     DynamicWorkersSpec,
     HTTPToolSpec,
@@ -37,6 +38,7 @@ from expert_work.runtime.tokens import default_estimator
 from orchestrator.errors import AgentFactoryError
 from orchestrator.multimodal import ImageResolver
 from orchestrator.tools.approval import AskForApprovalTool
+from orchestrator.tools.arg_bindings import bindings_by_tool
 from orchestrator.tools.artifact import ListArtifactsTool, SaveArtifactTool
 from orchestrator.tools.bash import BashTool
 from orchestrator.tools.file_ops import (
@@ -232,13 +234,39 @@ async def build_tool_registry(
         ``vision`` with no ``ToolEnv.image_resolver`` / ``vl_caller``.
     """
     registry = ToolRegistry()
+    # B-61 §5.4(评审 I-3)—— 参数绑定先**跨条目**并成一张表,再发给每一条 mcp
+    # 条目。一份 manifest 可以有多个 ``mcp`` 条目(协议层合法、也有测试),而每一条
+    # 都会把它选中的服务器整个再注册一遍。按条目各发各的,后注册那一条就会用「我
+    # 这条没有绑定」去覆盖兄弟条目刚剥好的 schema 和刚记下的绑定 —— 参数于是悄悄
+    # 回到模型手里,连保存时的告警都看不见(它只知道「没匹配上」,这属于「匹配上
+    # 了又被顶掉」)。``(server, tool)`` 在整份 manifest 里唯一由协议层保证
+    # (``AgentSpecBody._check_arg_bindings``),所以并表不会有谁静默覆盖谁。
+    all_arg_bindings = [
+        binding
+        for entry in tool_specs
+        if isinstance(entry, MCPToolSpec)
+        for binding in entry.arg_bindings
+    ]
     for entry in tool_specs:
         if isinstance(entry, BuiltinToolSpec):
             _register_builtin(registry, entry, tool_env, skill_seed_files)
         elif isinstance(entry, HTTPToolSpec):
             _register_http(registry, tool_env)
         elif isinstance(entry, MCPToolSpec):
-            await _register_mcp(registry, entry, tool_env)
+            await _register_mcp(registry, entry, tool_env, all_arg_bindings)
+    # B-61 §5.4 —— 「这条绑定一个工具都没落上」只能在**所有** mcp 条目都注册完之后
+    # 回答,而且只能照 registry 的真实状态回答(复评 N-1)。单次注册答不了:
+    #   * 它只看得见交给它的那一台服务器的工具表,答不了「这台服务器在不在」;
+    #   * 兄弟条目的 ``allow_tools`` 会把别人绑的工具挡在它那一次循环之外,那条绑定
+    #     在它眼里像是「目录里没有」,其实另一条目刚把它绑得好好的。
+    # 谎报比不报更糟:保存时的告警是这套机制加进来的全部价值,配置的人会照着它去
+    # 「修」一条从来没坏的绑定。所以判据是「有没有落地」,不是「这一遍有没有剩下」。
+    landed = registry.landed_arg_bindings()
+    for binding in all_arg_bindings:
+        if (binding.server, binding.tool) not in landed:
+            registry.note_unmatched_arg_binding(
+                binding.server, binding.tool, tuple(binding.args), tool_found=False
+            )
     _register_base_capabilities(registry, tool_env, skill_seed_files)
     _register_subagents(registry, subagents, tool_env, subagent_depth)
     _register_spawn_worker(registry, tool_env, parent_spec, dynamic_workers, subagent_depth)
@@ -685,7 +713,25 @@ def _register_http(registry: ToolRegistry, env: ToolEnv) -> None:
     )
 
 
-async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv) -> None:
+async def _register_mcp(
+    registry: ToolRegistry,
+    entry: MCPToolSpec,
+    env: ToolEnv,
+    arg_bindings: Sequence[ArgBindingSpec] = (),
+) -> None:
+    """Register this ``mcp`` entry's tools.
+
+    ``arg_bindings`` is the **whole manifest's** binding table, not just this
+    entry's (review I-3): every ``mcp`` entry re-registers the servers it
+    selects, so an entry that carries no bindings of its own must still strip
+    and re-bind the ones a sibling entry declared — otherwise it silently
+    restores the un-narrowed schema and drops the binding.
+
+    Which bindings fell through is NOT decided here (review N-1): registration
+    only records the ones that landed, and the caller answers the question once
+    every entry is done. This pass cannot answer it — a tool it filters out via
+    ``allow_tools`` may be bound perfectly well by the next one.
+    """
     if (
         env.mcp_pool is None
         and env.platform_mcp_pool is None
@@ -700,6 +746,10 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
     allow = set(entry.allow_tools) or None
     server_select = set(entry.servers) or None  # None = no per-agent restriction
     registered_servers: set[str] = set()
+    bindings_for = {
+        server: bindings_by_tool(arg_bindings, server=server)
+        for server in {binding.server for binding in arg_bindings}
+    }
 
     # Platform pool — gated by the per-tenant allowlist (Mini-ADR O-14).
     if env.mcp_pool is not None:
@@ -718,6 +768,7 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_for.get(server_name),
             )
             # Platform reserves the server NAME unconditionally — even if
             # allow_tools filtered out all its tools this build — so a tenant
@@ -751,6 +802,7 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_for.get(server_name),
             )
             registered_servers.add(server_name)
 
@@ -774,6 +826,7 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_for.get(server_name),
             )
             registered_servers.add(server_name)
 
@@ -796,5 +849,6 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_for.get(server_name),
             )
             registered_servers.add(server_name)

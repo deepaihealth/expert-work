@@ -28,7 +28,14 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from expert_work.protocol.reflection import ReflectionSpec
 from expert_work.protocol.trigger import TriggerSpec
@@ -1086,6 +1093,30 @@ class HTTPToolSpec(BaseModel):
     type: Literal["http"] = "http"
 
 
+class ArgBindingSpec(BaseModel):
+    """B-61 — bind some of one MCP tool's parameters to this agent's declared
+    prompt variables.
+
+    Once bound, the parameter is **stripped from the JSON schema the model
+    sees** and filled in by the platform at call time from this turn's
+    ``inputs`` (in ``tools_node``). The model never sees the value, so it
+    never gets the chance to retype it wrong (spec §五).
+
+    ``server`` is mandatory: the wire name is ``mcp__<server>__<tool>``, so
+    same-named tools on different servers collide — and a same-named parameter
+    on a different server is very likely not the same thing (``project_code``
+    is the archetype). Hence there is **no** global by-parameter-name rule;
+    every binding is listed one by one, explicitly (spec §十一 之二).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server: str = Field(min_length=1)
+    tool: str = Field(min_length=1)
+    #: Tool parameter name → declared prompt variable name. At least one entry.
+    args: dict[str, str] = Field(min_length=1)
+
+
 class MCPToolSpec(BaseModel):
     """Enable MCP tools for this agent.
 
@@ -1093,13 +1124,48 @@ class MCPToolSpec(BaseModel):
     (from the platform pool the tenant is allowed to use + the tenant's own
     registered remote servers); empty means every available server. Stream V.
     ``allow_tools`` optionally filters which advertised tools the agent sees
-    (by bare tool name, across the selected servers); empty means all."""
+    (by bare tool name, across the selected servers); empty means all.
+    ``arg_bindings`` (B-61) binds individual tool parameters to declared
+    prompt variables; it is validated in ``AgentSpecBody._check_arg_bindings``
+    because the declared set lives in a sibling block."""
 
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["mcp"] = "mcp"
     servers: list[str] = Field(default_factory=list)
     allow_tools: list[str] = Field(default_factory=list)
+    #: B-61 —— 逐工具的参数绑定,默认空(存量 manifest 零影响)。
+    arg_bindings: list[ArgBindingSpec] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    # 故意不标注返回类型:标注(``-> dict[str, Any]`` 甚至 ``-> Any``)会让 pydantic
+    # 把它当序列化 schema 用,把整个 ``MCPToolSpec`` 的 serialization-mode
+    # JSON Schema 塌成 ``{"type": "object", "additionalProperties": true}``
+    # ——三种写法实测过,唯独不标注 schema 才完整;三者的 ``model_dump()`` 结果
+    # 一模一样,纯粹是 schema 问题(review M-1)。
+    def _omit_empty_arg_bindings(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """Leave ``arg_bindings`` out of the output when nothing is bound.
+
+        存库走 ``spec.model_dump(by_alias=True, mode="json")``,**默认值会被
+        物化** —— 不拦这一下,字段一上线,每个带 MCP 的 agent 只要被保存过就
+        带上 ``arg_bindings: []``,与有没有配绑定无关;回滚到旧版本后,它的
+        ``extra="forbid"`` 会把这些 manifest 全拒掉,那些 agent 直接起不来
+        (spec §七)。空就不写,于是「会坏」的范围缩到真正人工配过绑定的那
+        几个,回滚前在配置页清掉即可,不用扫数据库。
+
+        连带:存量 manifest 的 ``compute_spec_sha256`` 不变,
+        ``run.agent_spec_sha256`` 与 ``agent_spec_revision.spec_sha256`` 的等值
+        join(``run_trace.py`` 记为契约)保持成立。
+
+        只管这一个字段:动 ``model_dump`` 的全局口径(``exclude_defaults``)
+        会改掉每个字段的落库形态,影响面比要修的问题大得多。
+        """
+        data: dict[str, Any] = handler(self)
+        if not self.arg_bindings:
+            data.pop("arg_bindings", None)
+        return data
 
 
 #: Discriminated union of the M0-supported tool declarations. ``python``
@@ -1366,6 +1432,74 @@ class AgentSpecBody(BaseModel):
     code: CodePackageSpec | None = None
     hooks: dict[str, str] = Field(default_factory=dict)
     observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
+
+    @model_validator(mode="after")
+    def _check_arg_bindings(self) -> AgentSpecBody:
+        """B-61 — validate ``tools[].arg_bindings`` against its siblings.
+
+        Four manifest-local errors: (1) two bindings for the same
+        ``(server, tool)``; (2) a binding whose ``server`` is not in this
+        entry's ``servers``; (3) a binding whose ``tool`` is not in this
+        entry's ``allow_tools``; (4) a binding pointing at a name that
+        ``system_prompt.variables`` does not declare. Empty ``servers`` /
+        ``allow_tools`` mean "all", so (2) / (3) do not apply there.
+
+        这道闸必须在 manifest 层,不在前端:配置页有 YAML 直编、后端有
+        ``PUT …/draft``、模板复制会把绑定带到变量集不同的 agent 上,下拉框
+        一个都挡不住;再加上时间 —— 先绑好、之后把变量删了。
+
+        (2)/(3) 和「变量没声明」是同一类,不是用户手误:名字打错的绑定谁都
+        匹配不上,参数于是原样回到给模型的 schema 里,模型继续抄那串长字符串
+        并继续抄错 —— 正是本特性要消灭的故障,却披着一份校验全绿的 manifest。
+        """
+        declared = {v.name for v in self.system_prompt.variables}
+        # (server, tool) → 第一次出现的位置,重复时报得出「先前那条绑在哪」。
+        # 唯一性守的是**原始**名字,而运行期 registry 的键是 ``mcp_tool_name()``
+        # 折叠过的 wire 名(非 ``[a-zA-Z0-9_-]`` 折成 ``_``、截断 64 字符),
+        # 两者不是一一对应:原始上不同、折叠后相同的两条绑定在这里过得去,
+        # 到 registry 才撞。协议层不做折叠(那是运行期的命名规则,本包不该知道),
+        # 这条边界留给接线那一侧兜。
+        seen: dict[tuple[str, str], str] = {}
+        for tool_index, entry in enumerate(self.tools):
+            if not isinstance(entry, MCPToolSpec):
+                continue
+            for binding_index, binding in enumerate(entry.arg_bindings):
+                # 校验器挂在 ``AgentSpecBody`` 上,pydantic 给的 ``loc`` 只到
+                # ``spec`` 一级 —— 手编 YAML 的人拿不到定位,所以把下标写进正文。
+                where = f"spec.tools[{tool_index}].arg_bindings[{binding_index}]"
+                key = (binding.server, binding.tool)
+                first_seen_at = seen.get(key)
+                if first_seen_at is not None:
+                    msg = (
+                        f"{where}: duplicate arg_bindings for "
+                        f"server={binding.server!r} tool={binding.tool!r} "
+                        f"(already bound at {first_seen_at})"
+                    )
+                    raise ValueError(msg)
+                seen[key] = where
+                if entry.servers and binding.server not in entry.servers:
+                    msg = (
+                        f"{where}.server → {binding.server!r} is not among this "
+                        f"mcp entry's servers {entry.servers} — the binding "
+                        f"would match nothing"
+                    )
+                    raise ValueError(msg)
+                if entry.allow_tools and binding.tool not in entry.allow_tools:
+                    msg = (
+                        f"{where}.tool → {binding.tool!r} is not among this mcp "
+                        f"entry's allow_tools {entry.allow_tools} — the binding "
+                        f"would match nothing"
+                    )
+                    raise ValueError(msg)
+                for param, var_name in binding.args.items():
+                    if var_name not in declared:
+                        msg = (
+                            f"{where} ({binding.server}/{binding.tool})"
+                            f".args[{param}] → {var_name!r} is not a declared "
+                            f"prompt variable (system_prompt.variables)"
+                        )
+                        raise ValueError(msg)
+        return self
 
 
 class AgentSpec(BaseModel):

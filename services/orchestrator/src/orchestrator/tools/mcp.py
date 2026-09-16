@@ -44,7 +44,7 @@ import logging
 import re
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import anyio
@@ -53,6 +53,7 @@ from expert_work.common.uplift_metrics import (
     record_mcp_call,
     record_mcp_circuit_state,
 )
+from orchestrator.tools.arg_bindings import strip_bound_params, unbindable_params
 from orchestrator.tools.registry import (
     ToolContext,
     ToolNotFoundError,
@@ -826,6 +827,13 @@ class MCPTool:
     tool_def: MCPToolDef
     server_name: str
     content_char_cap: int = DEFAULT_MCP_CHAR_CAP
+    #: B-61 §5.2 — the server's own schema, when ``tool_def.input_schema`` has
+    #: been narrowed for the model (bound parameters stripped). Carried onto
+    #: ``spec.dispatch_parameters`` so pre-dispatch validation runs against the
+    #: contract the server published rather than the narrowed view; see that
+    #: field's docstring for why validating against the narrowed one breaks a
+    #: correctly configured binding. ``None`` when nothing was stripped.
+    dispatch_schema: Mapping[str, Any] | None = None
     spec: ToolSpec = field(init=False)
 
     def __post_init__(self) -> None:
@@ -839,6 +847,7 @@ class MCPTool:
                 name=mcp_tool_name(self.server_name, self.tool_def.name),
                 description=self.tool_def.description,
                 parameters=self.tool_def.input_schema,
+                dispatch_parameters=self.dispatch_schema,
             ),
         )
 
@@ -949,6 +958,7 @@ async def register_mcp_tools(
     content_char_cap: int = DEFAULT_MCP_CHAR_CAP,
     allow_tools: Collection[str] | None = None,
     deferred: bool = False,
+    arg_bindings: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[str]:
     """List tools from ``client`` and register each as :class:`MCPTool`.
 
@@ -962,21 +972,87 @@ async def register_mcp_tools(
     server can advertise dozens of verbose tool schemas), so the assembler
     passes ``deferred=True`` (deer-flow's always-defer-MCP policy).
 
+    ``arg_bindings`` (B-61 §5.2) maps this server's **bare** tool names to
+    ``{parameter: declared-variable}``. Each bound parameter is stripped from
+    the schema the model sees and recorded on the ``registry`` under the
+    **wire** name, so ``tools_node`` can fill it in from the run's inputs.
+    This is the one place that translation happens: the protocol stores raw
+    ``server`` / ``tool`` names while the registry is keyed by
+    :func:`mcp_tool_name`, and duplicating that folding rule is how the two
+    sides drift apart.
+
+    Two kinds of miss can happen here; neither is ever raised — an upstream
+    interface drift must degrade, never block the run (spec §5.4). Only the
+    first is *reported* from this function:
+
+    * a bound parameter this tool's advertised schema does not have → dropped
+      from the binding (so the platform never injects a parameter the server
+      would reject) plus an ``mcp.binding_param_absent`` warning;
+    * a binding naming a tool this server does not advertise → simply never
+      lands. This function only records the bindings that DID land
+      (``ToolRegistry.note_landed_arg_binding``); which ones fell through is
+      decided once, after every ``mcp`` entry has registered, by
+      ``build_tool_registry`` — a sibling entry's ``allow_tools`` can hide a
+      tool from THIS pass while another pass binds it just fine, so a single
+      pass's leftovers are not evidence of anything (review N-1).
+
     Returns the namespaced names registered, useful for audit
     attribution at orchestrator startup.
     """
     tools = await client.list_tools()
+    # 边注册边从这份副本里划掉匹配上的。**剩下的什么也不是** —— 兄弟 ``mcp``
+    # 条目的 ``allow_tools`` 能把一个别处绑得好好的工具挡在这一趟之外,所以
+    # 单趟的剩余项不构成「这台服务器没有这个工具」的证据(评审 N-1:按剩余项
+    # 判就是那条会对配置的人说假话的规则)。落空的判定统一在
+    # ``build_tool_registry`` 里,等所有条目都注册完之后做一次。
+    pending_bindings = {tool: dict(bound) for tool, bound in (arg_bindings or {}).items()}
     registered: list[str] = []
     for tool_def in tools:
         if allow_tools is not None and tool_def.name not in allow_tools:
             continue
+        bound = pending_bindings.pop(tool_def.name, None) or {}
+        dispatch_schema: Mapping[str, Any] | None = None
+        if bound:
+            # 这条绑定确实落在一个真实工具上。只登记「落了」,不在这里判「没落」——
+            # 一份 manifest 可以有多个 mcp 条目,绑定表是跨条目并起来的,兄弟条目的
+            # ``allow_tools`` 会把别人绑的工具挡在它那一次循环之外。拿单次注册的剩余
+            # 项当「目录里没这个工具」的证据,就会对一条好好落了的绑定谎报(复评 N-1)。
+            # 答案只有在所有条目都轮完之后才成立,判在 ``build_tool_registry`` 里。
+            registry.note_landed_arg_binding(server_name, tool_def.name)
+            absent = unbindable_params(tool_def.input_schema, bound)
+            if absent:
+                # 上游改了接口,绑定指向一个不存在的参数。不阻断 run:这个 agent
+                # 的其它工具照常可用,该条按未命中处理(spec §5.4)。工具名来自
+                # 第三方的 list_tools,用 %r 免得换行把日志劈成两行。
+                logger.warning(
+                    "mcp.binding_param_absent server=%s tool=%r params=%s",
+                    server_name,
+                    tool_def.name,
+                    absent,
+                )
+                # 与「整条没匹配上」走同一条通道:只有一行 orchestrator 日志的话,
+                # 配置的人在保存面上什么也看不到(spec §5.4 说这条「按未命中处理」)。
+                registry.note_unmatched_arg_binding(
+                    server_name, tool_def.name, tuple(absent), tool_found=True
+                )
+                for param in absent:
+                    del bound[param]
+        if bound:
+            # 剥之前的那份是服务端的合同,dispatch 前的校验要对着它。
+            dispatch_schema = tool_def.input_schema
+            tool_def = replace(
+                tool_def, input_schema=strip_bound_params(tool_def.input_schema, bound)
+            )
         expert_work_tool = MCPTool(
             client=client,
             tool_def=tool_def,
             server_name=server_name,
             content_char_cap=content_char_cap,
+            dispatch_schema=dispatch_schema,
         )
         registry.register(expert_work_tool, deferred=deferred, source=f"mcp:{server_name}")
+        # 无条件调:空 ``bound`` 会清掉同名旧表项(见 ``bind_tool_args``)。
+        registry.bind_tool_args(expert_work_tool.spec.name, bound)
         registered.append(expert_work_tool.spec.name)
     logger.info("mcp.registered server=%s tools=%s", server_name, registered)
     return registered

@@ -1246,6 +1246,85 @@ git commit -m "feat(protocol): MCPToolSpec.arg_bindings + 绑定只能指向声�
 
 ---
 
+## Task 5b: 回滚安全 —— 空字段不落库 + 读回宽容
+
+**Files:**
+- Modify: `packages/expert-work-protocol/src/expert_work/protocol/agent_spec.py`(`MCPToolSpec` 加 serializer)
+- Modify: `packages/expert-work-persistence/src/expert_work/persistence/agent_spec/sql.py`(三处读回点 `:34`/`:58`/`:72`,按符号定位)
+- Test: `packages/expert-work-protocol/tests/test_arg_bindings_spec.py`(补序列化用例)、`packages/expert-work-persistence/tests/`(读回宽容用例)
+
+**为什么**(spec §七 重定,用户 2026-09-16 拍板):存库走 `model_dump()`,**默认值会被物化** —— 字段一上线,
+每个带 MCP 的 agent 只要被保存过就带上 `arg_bindings: []`,与有没有配绑定无关。旧版本 `extra="forbid"` 读到它
+直接拒,那些 agent 起不来。**原缓解「回滚窗口内别配绑定」因此不成立**,而靠人工扫 JSONB 的回滚不算回滚。
+
+**Interfaces:**
+- `MCPToolSpec` 上一个 `@model_serializer(mode="wrap")`:`arg_bindings` 为空时从输出里去掉;非空原样。
+  **不动 `AgentSpec.model_dump` 的全局口径**(别加 `exclude_defaults`,那会改掉所有字段的落库形态)。
+- `sql.py` 三处 `AgentSpec.model_validate(row.spec_json)` 换成一个共用的宽容读回 helper。
+
+- [ ] **Step 1: 写失败的测试**
+
+```python
+def test_an_unconfigured_mcp_entry_does_not_serialize_arg_bindings() -> None:
+    """空绑定不落库 —— 旧版本读回来才不会撞 extra='forbid'。"""
+    spec = AgentSpec.model_validate(_manifest(variables=[], bindings=None))
+    dumped = spec.model_dump(by_alias=True, mode="json")
+    entry = dumped["spec"]["tools"][0]
+    assert entry["type"] == "mcp"
+    assert "arg_bindings" not in entry
+
+
+def test_a_configured_binding_still_serializes() -> None:
+    ...
+    assert entry["arg_bindings"] == [{"server": "deepcare", "tool": "t", "args": {"p": "a"}}]
+
+
+def test_the_spec_digest_of_an_unconfigured_manifest_is_unchanged() -> None:
+    """存量 manifest 的指纹不能因为加了个字段就变 —— run_trace 的等值 join 是契约。"""
+    ...
+
+
+def test_reading_back_a_row_with_an_unknown_field_ignores_it() -> None:
+    """写入严格、读回宽容:自己写出去又读回来的数据,多一个不认识的键不该让 agent 起不来。"""
+    row_json = {...}          # 合法 manifest + 一个未来版本才有的键
+    loaded = _load_stored_spec(row_json)
+    assert loaded.spec.model.name == "glm-5.3"
+
+
+def test_reading_back_logs_what_it_ignored() -> None:
+    """忽略必须留痕,否则就是把「数据真坏了」也一起吞掉。只记键名,不记值。"""
+    ...
+
+
+def test_input_validation_is_still_strict() -> None:
+    """YAML / 接口这条路不受影响 —— 严格该管的是人写的输入。"""
+    with pytest.raises(ValidationError):
+        AgentSpec.model_validate({... "spec": {... "bogus_key": 1}})
+```
+
+- [ ] **Step 2: 跑测试确认它红**
+
+- [ ] **Step 3: 写实现**
+
+serializer 只做一件事,别顺手改别的字段。读回 helper 的形状:先严格试一次,**只在 `extra_forbidden` 这一种
+错误上**递归剔掉未知键再试一次,并按键名打一条 warning;其它 ValidationError 原样抛(那才是数据真坏了)。
+**不要无条件剔键** —— 那会把真正的损坏一起吞掉。
+
+- [ ] **Step 4: 跑测试确认它绿 + 变异自证**
+
+serializer 改成无条件输出 → 第 1、3 条必须红;还原变绿。
+宽容读回改成无条件剔未知键 → `test_input_validation_is_still_strict` 不受影响(它走的是另一条路),
+所以**另加**一条:构造一个**非** `extra_forbidden` 的坏数据(如 `model` 缺 `name`),断言读回**照样抛**;
+把「只在 extra_forbidden 上重试」改成「任何 ValidationError 都剔键重试」→ 这条必须红。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git commit -m "fix(protocol+persistence): 空 arg_bindings 不落库 + spec_json 读回宽容(B-61 T5b,回滚安全)"
+```
+
+---
+
 ## Task 6: `arg_bindings.py` —— 剥 schema 与填值的纯函数
 
 **Files:**
@@ -1443,6 +1522,29 @@ git commit -m "feat(tools): 绑定的纯函数——剥 schema 与填值(B-61 T6
 
 ## Task 7: 接线 —— 建目录时剥 schema,`tools_node` 填值
 
+**追加要求之二(2026-09-16,T6 评审 I-2)——「绑定的参数不在工具 schema 里」今天没有落点**:
+
+spec §5.4 承诺「绑定的参数在该工具 schema 里不存在(对方改了接口)→ 建目录时记一条告警,**该条按未命中处理**,不阻断 run」。
+实际情况:`strip_bound_params` 遇到不存在的参数是正确的空操作,但 `apply_arg_bindings` **照样会把它注入进 args**
+(T6 的签名里没有 schema,查不了),而 T7 原计划只打一条 `mcp.binding_param_absent` 日志、**没把它从绑定表里摘掉**。
+
+后果:对 `additionalProperties: false` 的 MCP 服务端,上游接口一漂移,**一次本来能跑的调用变成硬拒绝** ——
+比承诺的降级更糟。T7 是唯一同时握着绑定表和真实 schema 的地方:**建目录剥 schema 那一步就要把「schema 里没有
+这个参数」的绑定项从下发给 `tools_node` 的表里删掉**,不是只记日志。加一条测试:工具 schema 不含被绑参数时,
+最终发给 MCP 的 args 里**不得出现**该参数。
+
+**追加要求(2026-09-16 用户拍板,spec §5.4)——「绑定一个工具都没匹配上」必须在保存时就说**:
+
+manifest 层查不出这件事(`servers` 为空是默认值且表示「所有服务器」,租户实际有哪些服务器/工具对 protocol 包不可见),
+所以名字写错时绑定静默失效、参数回到模型手里、模型继续手抄 —— 本设计要消灭的病原样复发且无声。
+真正知道答案的是**保存时的试建**:`api/agents.py:_check_buildable` 用真正的 builder 组装一遍,**包含 MCP 连接池**。
+
+- 在那一步比对绑定与真实工具目录,对不上的走 **`_BuildCheck.warning` 档**(保存照做,把原因带回给配置的人)。
+- **不许走 422 档** —— 同处注释写明「MCP 路径从不抛 `AgentFactoryError`,连不上的服务器只是跳过」,
+  做成拒绝就等于第三方抖动卡死保存。
+- 运行期填值时若某条绑定一个工具都没匹配上,再记一条**兜底**告警(只记名字,不记值)。
+
+
 **Files:**
 - Modify: `services/orchestrator/src/orchestrator/tools/mcp.py`(`register_mcp_tools` 在 `:944`)
 - Modify: `services/orchestrator/src/orchestrator/tools/assembly.py`(`_register_mcp` 在 `:688`,四个 `register_mcp_tools(...)` 调用点全要传)
@@ -1618,6 +1720,14 @@ git commit -m "feat(tools): 绑定接线——建目录剥 schema,tools_node 在
 ---
 
 ## Task 8: 配置页 —— 逐工具逐参数「自动 / 绑定」
+
+**追加要求(2026-09-16,T5 复评带出)——关掉 MCP 时要告诉用户绑定会一起没**:
+
+`form_model.ts` 的 `setMcp` 在 `servers` 变空时**整条删掉**该工具条目,绑定一起消失。那个语义本身没错
+(用户就是在关掉 MCP,与选择器「没有单独开关」的既有语义一致),错在**今天的界面里 `arg_bindings` 根本不可见** ——
+用户能在毫不知情的情况下走到那一步。T8 要补一个确认:告诉他这会同时删掉 N 条绑定。
+挡的不是误操作,是**看不见的东西被无声删掉**。
+
 
 **Files:**
 - Modify: `apps/admin-ui/src/components/manifest-editor/widgets/McpToolPicker.tsx`

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     # Type-only so this module stays a leaf (no runtime edge into
     # orchestrator.tools). The dataclass field annotation stays a string
     # (``from __future__ import annotations``) and is never resolved.
-    from orchestrator.tools.registry import ToolCatalogEntry
+    from orchestrator.tools.registry import ToolCatalogEntry, UnmatchedArgBinding
 
 
 @dataclass(frozen=True)
@@ -111,3 +111,10 @@ class BuiltAgent:
     #: bucket list and consumers fall back to the parent's rate.
     model_provider: str | None = None
     model_name: str | None = None
+    #: B-61 §5.4 —— 本次构建里落空的 MCP 参数绑定(整条没匹配上的,以及工具在、
+    #: 参数已经不声明的)。存在的理由是保存时的试建 —— 那一刻平台才同时握着绑定
+    #: 表和真实工具目录,当场就能告诉配置的人「这条绑定落空了」。落空不报出来就是
+    #: 静默失效:参数回到模型手里,模型继续手抄长串,正是本特性要消灭的故障。
+    #: 运行期另有一条兜底告警,读的是 registry 上的同一份(spec §5.4)。
+    #: 带默认值,存量构造点一处都不用改。
+    unmatched_arg_bindings: tuple[UnmatchedArgBinding, ...] = ()

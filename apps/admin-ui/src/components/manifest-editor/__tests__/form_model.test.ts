@@ -463,6 +463,72 @@ test("setMcp writes servers + allow_tools in one patch", () => {
   expect(readTools(m).mcpAllowTools).toEqual(["create_issue"]);
 });
 
+// B-61 — ``arg_bindings`` is authored in YAML (the binding UI is a later PR),
+// so the MCP picker must not rebuild the entry from scratch the way it used to:
+// that dropped the bindings on the next save with no signal, and the parameter
+// went straight back to being retyped by the model.
+const withBindings = () =>
+  setMcp(
+    { apiVersion: "v1", kind: "Agent", spec: {} },
+    ["deepcare"],
+    ["customer_search"],
+  );
+
+const bindingsOf = (m: AgentManifest): unknown =>
+  (m.spec?.tools ?? []).find((t) => t.type === "mcp")?.arg_bindings;
+
+const BINDINGS = [
+  {
+    server: "deepcare",
+    tool: "customer_search",
+    args: { project_code: "project_code" },
+  },
+];
+
+const seedBindings = (m: AgentManifest): AgentManifest => ({
+  ...m,
+  spec: {
+    ...m.spec,
+    tools: (m.spec?.tools ?? []).map((t) =>
+      t.type === "mcp" ? { ...t, arg_bindings: BINDINGS } : t,
+    ),
+  },
+});
+
+test("setMcp preserves arg_bindings across a picker save", () => {
+  const m = setMcp(seedBindings(withBindings()), ["deepcare", "github"], [
+    "customer_search",
+  ]);
+  expect(bindingsOf(m)).toEqual(BINDINGS);
+  expect(readTools(m).mcpServers).toEqual(["deepcare", "github"]);
+});
+
+test("setMcpServers preserves arg_bindings (same write path as the picker)", () => {
+  const m = setMcpServers(seedBindings(withBindings()), ["deepcare", "linear"]);
+  expect(bindingsOf(m)).toEqual(BINDINGS);
+});
+
+test("setMcpAllowTools preserves arg_bindings", () => {
+  const m = setMcpAllowTools(seedBindings(withBindings()), ["customer_search", "note_add"]);
+  expect(bindingsOf(m)).toEqual(BINDINGS);
+});
+
+// The fourth writer of an mcp entry. Only stories / test seeding reach it today,
+// but it used to rebuild the entry from scratch — dropping ``servers`` as well as
+// ``arg_bindings`` when MCP was already on.
+test("setTool(mcp, on) leaves an already-present entry alone", () => {
+  const m = setTool(seedBindings(withBindings()), "mcp", true);
+  expect(bindingsOf(m)).toEqual(BINDINGS);
+  expect(readTools(m).mcpServers).toEqual(["deepcare"]);
+  expect(readTools(m).mcpAllowTools).toEqual(["customer_search"]);
+});
+
+test("setTool(mcp, off) still drops the entry", () => {
+  const m = setTool(seedBindings(withBindings()), "mcp", false);
+  expect(readTools(m).mcp).toBe(false);
+  expect(bindingsOf(m)).toBeUndefined();
+});
+
 describe("form_model preserve chain + immutability", () => {
   it("preserves apiVersion/kind/sandbox through a chain of edits", () => {
     let m = setName(seed, "renamed");

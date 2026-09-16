@@ -309,6 +309,7 @@ class RunQueueWorker:
                 run_id=run.run_id,
                 tenant_id=run.tenant_id,
                 spec=record.spec,
+                stored_sha256=record.spec_sha256,
                 source="run_queue_worker",
             )
 

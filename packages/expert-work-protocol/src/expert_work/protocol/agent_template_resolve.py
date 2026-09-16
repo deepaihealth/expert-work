@@ -183,6 +183,11 @@ def resolve_extends(base: AgentSpec, instance: AgentSpec) -> AgentSpec:
 
     M2 will additionally pull tier-② capability deltas and un-overridden tier-③
     fields from the live base for ``@latest`` propagation."""
+    # 注意:这里全程走 ``model_copy(update=…)``,**不重跑校验器**。M1 语义下
+    # ``tools``(tier ②)不从 base 合并,所以构不出「base 的 arg_bindings + instance
+    # 的变量集」这种组合,``AgentSpecBody._check_arg_bindings`` 今天绕不过去
+    # (fork 走 ``AgentSpec.model_validate`` 兜住)。M2 一旦真做 tier-② 增量传播,
+    # 合出来的 ``tools`` 必须重新 ``model_validate``,否则那道闸就从这里漏过去。
     floored = enforce_security_floor(base, instance)
     cleared = floored.spec.model_copy(update={"extends": None})
     return floored.model_copy(update={"spec": cleared})

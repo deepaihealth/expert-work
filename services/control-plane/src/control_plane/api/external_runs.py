@@ -322,6 +322,7 @@ async def _supersede_and_run(
             settings=state.settings,
             built=built,
             record_spec=record.spec,
+            record_spec_sha256=record.spec_sha256,
             thread_id=meta.thread_id,
             tenant_id=tenant_id,
             actor_id=actor_id,

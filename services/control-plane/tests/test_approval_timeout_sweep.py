@@ -98,8 +98,11 @@ class _FakeAgentRepo:
         del tenant_id, name, version, include_deleted
         # ``metadata.name`` 是 ``AgentSpec`` 的必填字段,续跑段拿它算 agent_key
         # (工作区分层)。桩以前缺这一层,与真实类型对不上。
+        # ``spec_sha256``(B-61 T5b 修复轮 1,I-1)—— ``bind_exec_spec`` 现在绑
+        # 的是这一列而不是现算值,桩必须带上它。
         return SimpleNamespace(
             spec=SimpleNamespace(metadata=SimpleNamespace(name="agent")),
+            spec_sha256="0" * 64,
             status=AgentSpecStatus.ACTIVE,
         )
 
