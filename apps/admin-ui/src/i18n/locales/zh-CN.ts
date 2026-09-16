@@ -1041,6 +1041,23 @@ const zhCN: TranslationKeys = {
     mcp_done: "完成",
     mcp_all_tools: "全部工具",
     mcp_tools_count: "已选择工具 {{count}} 个",
+    // B-61 —— 逐工具逐参数的「自动 / 绑定变量」。
+    mcp_bind_label: "参数绑定",
+    mcp_bind_open: "{{tool}} 的参数绑定",
+    mcp_bind_count: "已绑 {{count}} 个",
+    mcp_bind_auto: "自动（模型填）",
+    mcp_bind_hint:
+      "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。不绑定的参数仍由模型自己填。",
+    mcp_bind_required: "这个参数是必填的",
+    mcp_bind_no_variables:
+      "先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量，再回来把参数绑到变量上。",
+    mcp_bind_drop_title_one: "这会同时删掉 1 条参数绑定",
+    mcp_bind_drop_title_other: "这会同时删掉 {{count}} 条参数绑定",
+    mcp_bind_drop_item: "{{tool}} 的 {{param}} ← 变量 {{variable}}",
+    mcp_bind_drop_hint:
+      "删掉之后，这些参数改回由模型自己填。要保留绑定，请取消本次改动。",
+    mcp_bind_drop_ok: "删除并继续",
+    mcp_bind_drop_cancel: "取消",
     mcp_servers_hint: "全不选 = 允许所有可用服务器",
     mcp_no_servers_available:
       "暂无可用 MCP 服务器。到 设置 → MCP 服务器 → 添加 → 从目录启用",
@@ -1239,6 +1256,24 @@ const zhCN: TranslationKeys = {
     prompt_var_required: "必填",
     prompt_var_description: "说明",
     prompt_var_remove: "删除",
+    // B-61 —— 变量被工具参数绑着时,删不得也改不得名(会留下一条指向不存在
+    // 变量的绑定,保存被协议层直接拒)。
+    prompt_var_bound_note_one:
+      "1 个工具参数绑着它,不能改名或删除 —— 先到「工具」→「MCP」里把它改回「自动（模型填）」。",
+    prompt_var_bound_note_other:
+      "{{count}} 个工具参数绑着它,不能改名或删除 —— 先到「工具」→「MCP」里把它们改回「自动（模型填）」。",
+    prompt_var_remove_blocked_one: "这个变量还有 1 个工具参数绑着,不能删",
+    prompt_var_remove_blocked_other: "这个变量还有 {{count}} 个工具参数绑着,不能删",
+    prompt_var_remove_blocked_item: "{{server}} / {{tool}} 的 {{param}}",
+    prompt_var_remove_blocked_hint:
+      "到「工具」→「MCP」里把这些参数改回「自动（模型填）」,再回来删这个变量。",
+    prompt_var_remove_blocked_ok: "知道了",
+    prompt_jinja_off_title_one: "关掉后会同时删掉 1 条参数绑定",
+    prompt_jinja_off_title_other: "关掉后会同时删掉 {{count}} 条参数绑定",
+    prompt_jinja_off_hint:
+      "关掉动态提示词会把声明的变量整块删掉,绑在这些变量上的工具参数也就没了着落,只能一起删。删掉之后,这些参数改回由模型自己填。",
+    prompt_jinja_off_ok: "关掉并删除",
+    prompt_jinja_off_cancel: "取消",
     prompt_var_add: "添加变量",
     prompt_expand: "全屏编辑",
     prompt_expand_title: "系统提示词 —— 全屏编辑",

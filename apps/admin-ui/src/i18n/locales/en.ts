@@ -1014,6 +1014,19 @@ export interface TranslationKeys {
     mcp_done: string;
     mcp_all_tools: string;
     mcp_tools_count: string;
+    mcp_bind_label: string;
+    mcp_bind_open: string;
+    mcp_bind_count: string;
+    mcp_bind_auto: string;
+    mcp_bind_hint: string;
+    mcp_bind_required: string;
+    mcp_bind_no_variables: string;
+    mcp_bind_drop_title_one: string;
+    mcp_bind_drop_title_other: string;
+    mcp_bind_drop_item: string;
+    mcp_bind_drop_hint: string;
+    mcp_bind_drop_ok: string;
+    mcp_bind_drop_cancel: string;
     mcp_servers_hint: string;
     mcp_no_servers_available: string;
     mcp_no_servers_catalog: string;
@@ -1162,6 +1175,18 @@ export interface TranslationKeys {
     prompt_var_required: string;
     prompt_var_description: string;
     prompt_var_remove: string;
+    prompt_var_bound_note_one: string;
+    prompt_var_bound_note_other: string;
+    prompt_var_remove_blocked_one: string;
+    prompt_var_remove_blocked_other: string;
+    prompt_var_remove_blocked_item: string;
+    prompt_var_remove_blocked_hint: string;
+    prompt_var_remove_blocked_ok: string;
+    prompt_jinja_off_title_one: string;
+    prompt_jinja_off_title_other: string;
+    prompt_jinja_off_hint: string;
+    prompt_jinja_off_ok: string;
+    prompt_jinja_off_cancel: string;
     prompt_var_add: string;
     prompt_expand: string;
     prompt_expand_title: string;
@@ -4241,6 +4266,22 @@ const en: TranslationKeys = {
     mcp_done: "Done",
     mcp_all_tools: "All tools",
     mcp_tools_count: "{{count}} tools selected",
+    mcp_bind_label: "Bound parameters",
+    mcp_bind_open: "Bound parameters for {{tool}}",
+    mcp_bind_count: "{{count}} bound",
+    mcp_bind_auto: "Auto (model fills it in)",
+    mcp_bind_hint:
+      "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. Unbound parameters are still filled in by the model.",
+    mcp_bind_required: "This parameter is required",
+    mcp_bind_no_variables:
+      "Declare a variable under Prompt & Output → Dynamic prompt (Jinja) first, then come back and bind parameters to it.",
+    mcp_bind_drop_title_one: "This will also delete 1 bound parameter",
+    mcp_bind_drop_title_other: "This will also delete {{count}} bound parameters",
+    mcp_bind_drop_item: "{{param}} on {{tool}} ← variable {{variable}}",
+    mcp_bind_drop_hint:
+      "Once deleted, the model fills these parameters in again. Cancel to keep them.",
+    mcp_bind_drop_ok: "Delete and continue",
+    mcp_bind_drop_cancel: "Cancel",
     mcp_servers_hint: "Leave all unchecked to allow every available server",
     mcp_no_servers_available:
       "No MCP servers available yet. Enable one under Settings → MCP Servers → Add → enable from the catalog.",
@@ -4449,6 +4490,25 @@ const en: TranslationKeys = {
     prompt_var_required: "Required",
     prompt_var_description: "Description",
     prompt_var_remove: "Remove",
+    prompt_var_bound_note_one:
+      "1 tool parameter is bound to it, so it cannot be renamed or removed — set it back to \"Auto (model fills it in)\" under Tools → MCP first.",
+    prompt_var_bound_note_other:
+      "{{count}} tool parameters are bound to it, so it cannot be renamed or removed — set them back to \"Auto (model fills it in)\" under Tools → MCP first.",
+    prompt_var_remove_blocked_one:
+      "1 tool parameter is still bound to this variable, so it cannot be removed",
+    prompt_var_remove_blocked_other:
+      "{{count}} tool parameters are still bound to this variable, so it cannot be removed",
+    prompt_var_remove_blocked_item: "{{param}} on {{server}} / {{tool}}",
+    prompt_var_remove_blocked_hint:
+      "Set those parameters back to \"Auto (model fills it in)\" under Tools → MCP, then come back and remove the variable.",
+    prompt_var_remove_blocked_ok: "Got it",
+    prompt_jinja_off_title_one: "Turning this off also deletes 1 bound parameter",
+    prompt_jinja_off_title_other:
+      "Turning this off also deletes {{count}} bound parameters",
+    prompt_jinja_off_hint:
+      "Turning off the dynamic prompt removes the declared variables entirely, so tool parameters bound to them have nothing left to point at and go too. Afterwards the model fills those parameters in itself.",
+    prompt_jinja_off_ok: "Turn off and delete",
+    prompt_jinja_off_cancel: "Cancel",
     prompt_var_add: "Add variable",
     prompt_expand: "Expand",
     prompt_expand_title: "System prompt — fullscreen editor",

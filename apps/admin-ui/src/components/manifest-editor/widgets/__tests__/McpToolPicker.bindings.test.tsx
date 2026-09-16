@@ -1,0 +1,750 @@
+/**
+ * B-61 Task 8 —— 逐参数绑定的配置 UI。
+ *
+ * 绑定住在「选择工具」弹窗里:每个在范围内的工具行下面一个「参数绑定」展开区,
+ * 按工具自己的 ``input_schema.properties`` 逐参数一行,右边是「自动（模型填）+
+ * 本 agent 声明过的变量」。选中即写进 ``arg_bindings``,选回「自动」就删掉该参数,
+ * 该工具的 ``args`` 空了就整条删除。
+ *
+ * 另外钉住两件事:
+ *  - 下拉只列**声明过**的变量(自由文本变量名 = 悄悄谁也匹配不上);
+ *  - 任何会把已有绑定删掉的动作(取消勾选服务器 = 关掉 MCP 首当其冲)先弹确认,
+ *    并把要删的那几条逐条列出来 —— 绑定在今天之前是看不见的,看不见的东西被
+ *    静默删掉才是问题所在。
+ */
+import { useState } from "react";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { App } from "antd";
+import i18n from "../../../../i18n";
+
+import { McpToolPicker } from "../McpToolPicker";
+import { FormView } from "../../FormView";
+import { readTools, type AgentManifest, type ArgBindingFields } from "../../form_model";
+import * as serversSdk from "../../../../api/mcp-servers";
+import * as catalogSdk from "../../../../api/mcp-catalog";
+import * as modelCatalog from "../../catalog";
+
+// Cross-tenant W3 — the picker reads the ambient tenant scope; these tests
+// don't mount a TenantScopeProvider, so mock it (home state: no scope).
+const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
+vi.mock("../../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../../tenant/TenantScopeContext")>(),
+    scopeRef,
+  );
+});
+
+const availableMock = vi.spyOn(serversSdk, "listAvailableMcpServers");
+const toolsMock = vi.spyOn(serversSdk, "listMcpServerTools");
+const platformCatalogMock = vi.spyOn(catalogSdk, "listPlatformCatalog");
+const catalogToolsMock = vi.spyOn(catalogSdk, "listCatalogTools");
+
+// 本文件改的是**全局** i18n 实例的语言,所以必须还原 —— 今天不还原也没事只是
+// 因为 vitest 的 isolate 默认开着,而那正是 runner 一直在劝人关掉的开关
+// (它自己打印「~12.79s faster with isolate: false」)。谁哪天为了提速关掉,
+// 这就变成跨文件的随机红。
+let langBefore = i18n.language;
+
+beforeEach(async () => {
+  availableMock.mockReset();
+  toolsMock.mockReset();
+  platformCatalogMock.mockReset();
+  catalogToolsMock.mockReset();
+  scopeRef.current = undefined;
+  // 断言里写的是中文文案(「自动（模型填）」等),语言不钉住就随 jsdom 的
+  // navigator.language 漂 —— 本机与 CI 解析成 en 时整片假红。
+  langBefore = i18n.language;
+  await i18n.changeLanguage("zh-CN");
+});
+
+afterEach(async () => {
+  await i18n.changeLanguage(langBefore);
+  // 不再手动清 document.body:那会把 RTL 自己的容器一起端掉。弹窗与下拉都走
+  // React portal,在 RTL 的 auto-cleanup 卸载组件树时一并消失。
+});
+
+const T1: serversSdk.McpTool = {
+  name: "t1",
+  description: "",
+  input_schema: {
+    properties: { project_code: {}, keyword: {} },
+    required: ["project_code"],
+  },
+};
+
+const T2: serversSdk.McpTool = {
+  name: "t2",
+  description: "",
+  input_schema: { properties: { note: {} } },
+};
+
+const BINDING: ArgBindingFields = {
+  server: "deepcare",
+  tool: "t1",
+  args: { project_code: "project_code" },
+};
+
+interface PickerOpts {
+  tools?: serversSdk.McpTool[];
+  promptVariables?: string[];
+  argBindings?: ArgBindingFields[];
+  allowTools?: string[];
+  onChange?: (
+    servers: string[],
+    allowTools: string[],
+    argBindings: ArgBindingFields[],
+  ) => void;
+}
+
+function renderPicker(opts: PickerOpts = {}) {
+  availableMock.mockResolvedValue([{ name: "deepcare", source: "tenant" }]);
+  toolsMock.mockResolvedValue(opts.tools ?? [T1]);
+  const user = userEvent.setup();
+  render(
+    <App>
+      <McpToolPicker
+        servers={["deepcare"]}
+        allowTools={opts.allowTools ?? []}
+        argBindings={opts.argBindings ?? []}
+        promptVariables={opts.promptVariables ?? ["project_code"]}
+        onChange={opts.onChange ?? (() => {})}
+      />
+    </App>,
+  );
+  return user;
+}
+
+/**
+ * antd 的 Select 在 jsdom 里把每个选项渲染两遍:可见可点的
+ * ``.ant-select-item-option`` div,和一个只装「当前+下一个」两条的隐藏 ARIA
+ * 镜像 —— 所以 ``getAllByRole("option")`` 既数不全也点不动。整个仓库统一按
+ * ``.ant-select-item-option-content`` 取真选项(同 ModelSelect/SettingsSearch
+ * 的测试)。
+ */
+/** 关掉的下拉仍然留在 DOM 里(只是加了 ``-hidden``),所以两次开不同的下拉后
+ *  全局按 class 找会撞上一堆旧选项 —— 一律只认当前展开的那一个。 */
+const openDropdown = (): HTMLElement => {
+  const all = Array.from(
+    document.querySelectorAll<HTMLElement>(".ant-select-dropdown"),
+  ).filter((el) => !el.classList.contains("ant-select-dropdown-hidden"));
+  if (all.length !== 1) {
+    throw new Error(`expected exactly one open Select dropdown, got ${all.length}`);
+  }
+  return all[0];
+};
+
+const optionLabels = (): (string | null)[] =>
+  Array.from(
+    openDropdown().querySelectorAll(".ant-select-item-option-content"),
+  ).map((el) => el.textContent);
+
+async function pickOption(
+  user: ReturnType<typeof userEvent.setup>,
+  label: string,
+): Promise<void> {
+  const item = await within(openDropdown()).findByText(
+    (_content, el) =>
+      el?.classList.contains("ant-select-item-option-content") === true &&
+      el.textContent === label,
+  );
+  await user.click(item);
+}
+
+/** 确认框。工具子弹窗本身也是 role="dialog",所以开着弹窗时按 role 取会撞上两个
+ *  —— 认 antd 给 confirm 专用的那个 class。 */
+async function findConfirm(): Promise<HTMLElement> {
+  return waitFor(() => {
+    const el = document.querySelector<HTMLElement>(".ant-modal-confirm");
+    if (el === null) throw new Error("confirm dialog not open");
+    return el;
+  });
+}
+
+/** 只开到「选择工具」弹窗(有些用例压根不该有展开按钮可点)。 */
+async function openToolModal(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByTestId("af-mcp-choose-deepcare"));
+  await screen.findByTestId("af-mcp-tool-t1");
+  return user;
+}
+
+/** 绑定 UI 住在「选择工具」弹窗里 —— 先开到那儿,再展开 t1 的参数绑定。 */
+async function openBindings(user: ReturnType<typeof userEvent.setup>) {
+  await openToolModal(user);
+  await user.click(await screen.findByRole("button", { name: /t1/ }));
+}
+
+describe("McpToolPicker 参数绑定", () => {
+  it("展开的工具按 input_schema 逐参数给出「自动 / 绑定变量」", async () => {
+    await openBindings(renderPicker({ tools: [T1] }));
+    expect(screen.getByLabelText("project_code")).toBeInTheDocument();
+    expect(screen.getByLabelText("keyword")).toBeInTheDocument();
+  });
+
+  it("必填参数带星号,选填的不带", async () => {
+    await openBindings(renderPicker({ tools: [T1] }));
+    // T1 的 required 只有 project_code。星号挂在参数名旁边,不进 label 文本
+    // (进了 ``getByLabelText("project_code")`` 就找不到了)。
+    expect(screen.getByTestId("af-mcp-bind-row-t1-project_code").textContent)
+      .toContain("project_code*");
+    expect(
+      screen.getByTestId("af-mcp-bind-row-t1-keyword").textContent,
+    ).not.toContain("*");
+  });
+
+  it("下拉只列本 agent 声明过的变量", async () => {
+    const user = renderPicker({
+      promptVariables: ["project_code", "employee_code"],
+    });
+    await openBindings(user);
+    await user.click(screen.getByLabelText("project_code"));
+    await waitFor(() => expect(optionLabels().length).toBeGreaterThan(0));
+    expect(optionLabels()).toEqual([
+      "自动（模型填）",
+      "project_code",
+      "employee_code",
+    ]);
+  });
+
+  it("选中变量后 onChange 带出 manifest 形状的 arg_bindings", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({ onChange, promptVariables: ["project_code"] });
+    await openBindings(user);
+    await user.click(screen.getByLabelText("project_code"));
+    await pickOption(user, "project_code");
+    await waitFor(() =>
+      expect(onChange).toHaveBeenLastCalledWith(["deepcare"], expect.anything(), [
+        { server: "deepcare", tool: "t1", args: { project_code: "project_code" } },
+      ]),
+    );
+  });
+
+  it("取消绑定会把该条从 arg_bindings 里移掉,空了整条删除", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({
+      onChange,
+      promptVariables: ["project_code"],
+      argBindings: [BINDING],
+    });
+    await openBindings(user);
+    await user.click(screen.getByLabelText("project_code"));
+    await pickOption(user, "自动（模型填）");
+    await waitFor(() =>
+      expect(onChange).toHaveBeenLastCalledWith(
+        ["deepcare"],
+        expect.anything(),
+        [],
+      ),
+    );
+  });
+
+  it("声明变量为空时给出提示而不是一个空下拉", async () => {
+    await openBindings(renderPicker({ promptVariables: [] }));
+    const hint = screen.getByTestId("af-mcp-bind-no-vars-t1");
+    expect(hint.textContent).toContain("声明变量");
+    // 提示必须指得着**页面上真实存在的**那一节。直接取那两个 i18n 键:谁把分组
+    // 或小节改了名,这条就红 —— 这正是我们想要的信号,而不是让提示悄悄过期。
+    // 这两条**故意**用 i18n.t,而且故意用的是**别的** key:被断言的文案是
+    // mcp_bind_no_variables,期望值来自 group_prompt / section_prompt_vars。
+    // 两边不同源,所以不是重言式;耦合本身就是目的 —— 谁给那个分组或小节改了名,
+    // 这条就红,提示不会悄悄指向一个不存在的入口。文案本身的字面量在下面
+    // 「绑定文案」那个 describe 里按 locale 各钉了一遍。别把这两行"顺手"改掉。
+    expect(hint.textContent).toContain(i18n.t("manifest_editor.group_prompt"));
+    expect(hint.textContent).toContain(i18n.t("agent_form.section_prompt_vars"));
+    expect(screen.queryByLabelText("project_code")).not.toBeInTheDocument();
+  });
+
+  // ── 追加要求:删绑定前先说清楚删的是哪几条 ───────────────────────────────
+  //
+  // 取消勾选服务器 = 关掉 MCP,工具条目连同 arg_bindings 一起没了 —— 这个语义
+  // 是对的(用户就是要关 MCP),问题在于绑定在配置页上一直是看不见的,用户不知道
+  // 自己刚丢了什么。所以确认框不是拦误操作,是把「即将被静默删掉的东西」摆出来。
+
+  it("取消勾选服务器会先列出要删的绑定再确认;确认后才真的写回去", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({
+      onChange,
+      promptVariables: ["project_code"],
+      argBindings: [BINDING],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    expect(onChange).not.toHaveBeenCalled();
+
+    const dialog = await screen.findByRole("dialog");
+    // 追加要求原文:「告诉他这会同时删掉 N 条绑定」——标题必须报出条数。
+    expect(dialog.textContent).toContain("这会同时删掉 1 条参数绑定");
+    // 逐条摆出来:哪个工具的哪个参数、绑的是哪个变量。
+    expect(dialog.textContent).toContain("t1");
+    expect(dialog.textContent).toContain("project_code");
+    // N 与用户能数到的行数同源:1 条 → 1 行。
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(1);
+
+    await user.click(within(dialog).getByRole("button", { name: /删除/ }));
+    await waitFor(() => expect(onChange).toHaveBeenCalledTimes(1));
+    expect(onChange).toHaveBeenLastCalledWith([], [], []);
+  });
+
+  it("要删多条时条数跟着变,行数与条数对得上", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({
+      onChange,
+      tools: [T1, T2],
+      promptVariables: ["project_code", "employee_code"],
+      argBindings: [
+        {
+          server: "deepcare",
+          tool: "t1",
+          args: { project_code: "project_code", keyword: "employee_code" },
+        },
+        { server: "deepcare", tool: "t2", args: { note: "employee_code" } },
+      ],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    const dialog = await screen.findByRole("dialog");
+    // 两个条目一共绑了三个参数 —— 报的是参数数,和下面三行对得上。
+    expect(dialog.textContent).toContain("这会同时删掉 3 条参数绑定");
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(3);
+  });
+
+  // emit() 的注释点名说这是三条路里最不直观的一条:agent 处在「全部工具」
+  // (allow_tools 空 = 全放行)时,勾上第一个工具会把 allow_tools 收成 [它],
+  // 于是**其它**工具上的绑定全部落到范围外。注释点了名却没有测试,就是下一次
+  // 回归的入口。
+  it("「全部工具」下勾第一个工具,会挤掉别的工具的绑定 —— 也要先问", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({
+      onChange,
+      tools: [T1, T2],
+      allowTools: [],
+      promptVariables: ["project_code", "employee_code"],
+      argBindings: [
+        { server: "deepcare", tool: "t2", args: { note: "employee_code" } },
+      ],
+    });
+    await user.click(await screen.findByTestId("af-mcp-choose-deepcare"));
+    await user.click(await screen.findByTestId("af-mcp-tool-t1"));
+    expect(onChange).not.toHaveBeenCalled();
+
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain("这会同时删掉 1 条参数绑定");
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(1);
+    expect(dialog.textContent).toContain("t2");
+    expect(dialog.textContent).toContain("note");
+
+    await user.click(within(dialog).getByRole("button", { name: /删除/ }));
+    await waitFor(() => expect(onChange).toHaveBeenCalledTimes(1));
+    expect(onChange).toHaveBeenLastCalledWith(["deepcare"], ["t1"], []);
+  });
+
+  // ── L5:input_schema 是第三方自报的,形状不对就当没有,别硬拆也别抛 ───────
+  it("properties 是数组时当没有参数处理,不会把 0/1 当参数名", async () => {
+    await openToolModal(
+      renderPicker({
+        tools: [
+          {
+            name: "t1",
+            description: "",
+            input_schema: { properties: ["project_code", "keyword"] },
+          },
+        ],
+      }),
+    );
+    expect(screen.queryByTestId("af-mcp-bind-toggle-t1")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("0")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("project_code")).not.toBeInTheDocument();
+  });
+
+  it("required 形状不对只是没有星号,参数照列(两侧判据各管各的)", async () => {
+    await openBindings(
+      renderPicker({
+        tools: [
+          {
+            name: "t1",
+            description: "",
+            // 第三方把 required 写成了字符串而不是数组。
+            input_schema: {
+              properties: { project_code: {}, keyword: {} },
+              required: "project_code",
+            },
+          },
+        ],
+      }),
+    );
+    expect(screen.getByLabelText("project_code")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("af-mcp-bind-row-t1-project_code").textContent,
+    ).not.toContain("*");
+  });
+
+  // ── L8:aria-expanded 得配一个指得着东西的 aria-controls ────────────────
+  it("展开按钮的 aria-controls 指向真实存在的展开区", async () => {
+    const user = renderPicker();
+    await openBindings(user);
+    const toggle = screen.getByTestId("af-mcp-bind-toggle-t1");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const panelId = toggle.getAttribute("aria-controls");
+    expect(panelId).toBeTruthy();
+    expect(document.getElementById(panelId as string)).toBeInTheDocument();
+  });
+
+  it("取消确认则什么都不写", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({
+      onChange,
+      promptVariables: ["project_code"],
+      argBindings: [BINDING],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /取\s*消/ }));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("没有绑定时取消勾选服务器不弹确认,直接写回去", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({ onChange, argBindings: [] });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    await waitFor(() => expect(onChange).toHaveBeenLastCalledWith([], [], []));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("绑一个参数不会碰到别的工具上的绑定", async () => {
+    const onChange = vi.fn();
+    const other: ArgBindingFields = {
+      server: "deepcare",
+      tool: "t2",
+      args: { note: "employee_code" },
+    };
+    const user = renderPicker({
+      onChange,
+      tools: [T1, T2],
+      promptVariables: ["project_code", "employee_code"],
+      argBindings: [other],
+    });
+    await openBindings(user);
+    await user.click(screen.getByLabelText("project_code"));
+    await pickOption(user, "project_code");
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    const written = onChange.mock.calls.at(-1)?.[2] as ArgBindingFields[];
+    expect(written).toContainEqual(other);
+    expect(written).toContainEqual({
+      server: "deepcare",
+      tool: "t1",
+      args: { project_code: "project_code" },
+    });
+  });
+
+  // 受控回灌:父组件把 onChange 的结果喂回 props。绑第二个参数时第一个必须还在
+  // —— 「受控控件 resync 把用户输入吃掉」在本仓库是高发 bug,只用 spy 断言
+  // onChange 是验不出来的(spy 从不回灌)。
+  it("受控回灌下连绑两个参数,先绑的那个不会被后绑的冲掉", async () => {
+    availableMock.mockResolvedValue([{ name: "deepcare", source: "tenant" }]);
+    toolsMock.mockResolvedValue([T1]);
+    const user = userEvent.setup();
+    function Harness() {
+      const [bindings, setBindings] = useState<ArgBindingFields[]>([]);
+      return (
+        <App>
+          <McpToolPicker
+            servers={["deepcare"]}
+            allowTools={[]}
+            argBindings={bindings}
+            promptVariables={["project_code", "employee_code"]}
+            onChange={(_s, _a, next) => setBindings(next)}
+          />
+        </App>
+      );
+    }
+    render(<Harness />);
+    await openBindings(user);
+
+    await user.click(screen.getByLabelText("project_code"));
+    await pickOption(user, "project_code");
+    await user.click(screen.getByLabelText("keyword"));
+    await pickOption(user, "employee_code");
+
+    // 两个下拉都停在各自绑的变量上(不是一个被冲成「自动」)。
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("af-mcp-bind-row-t1-project_code").textContent,
+      ).toContain("project_code"),
+    );
+    expect(
+      screen.getByTestId("af-mcp-bind-row-t1-keyword").textContent,
+    ).toContain("employee_code");
+    // 计数徽标也认得两条。
+    expect(
+      screen.getByTestId("af-mcp-bind-toggle-t1").textContent,
+    ).toContain("2");
+  });
+});
+
+// ── 文案契约:每个 mcp_bind_* 键、每个 locale,期望值都是**字面量** ──────────
+//
+// NEW-2 —— 上面那一整个 describe 把语言钉死在 zh-CN,于是 en 那一半的 mcp_bind_*
+// 文案一条都没人验:复评把 8 条英文文案挖空跑全套,只红了 1 条。
+//
+// 这里的断言两边**不同源**:左边是组件渲染出来的东西,右边是写死在测试里的字面量。
+// 用 i18n.t(同一个 key) 当期望值是重言式 —— 文案改小两边一起改小,永远不会红。
+const BIND_COPY = {
+  "zh-CN": {
+    label: "参数绑定",
+    open: "t1 的参数绑定",
+    count: "已绑 1 个",
+    auto: "自动（模型填）",
+    hint: "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。不绑定的参数仍由模型自己填。",
+    required: "这个参数是必填的",
+    noVariables:
+      "先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量，再回来把参数绑到变量上。",
+    dropTitle: "这会同时删掉 1 条参数绑定",
+    dropTitleMany: "这会同时删掉 2 条参数绑定",
+    dropItem: "t1 的 project_code ← 变量 project_code",
+    dropHint: "删掉之后，这些参数改回由模型自己填。要保留绑定，请取消本次改动。",
+    dropOk: "删除并继续",
+    dropCancel: "取消",
+  },
+  en: {
+    label: "Bound parameters",
+    open: "Bound parameters for t1",
+    count: "1 bound",
+    auto: "Auto (model fills it in)",
+    hint: "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. Unbound parameters are still filled in by the model.",
+    required: "This parameter is required",
+    noVariables:
+      "Declare a variable under Prompt & Output → Dynamic prompt (Jinja) first, then come back and bind parameters to it.",
+    dropTitle: "This will also delete 1 bound parameter",
+    dropTitleMany: "This will also delete 2 bound parameters",
+    dropItem: "project_code on t1 ← variable project_code",
+    dropHint:
+      "Once deleted, the model fills these parameters in again. Cancel to keep them.",
+    dropOk: "Delete and continue",
+    dropCancel: "Cancel",
+  },
+} as const;
+
+describe.each(["zh-CN", "en"] as const)("McpToolPicker 绑定文案 (%s)", (lang) => {
+  const copy = BIND_COPY[lang];
+  let langBefore = i18n.language;
+
+  beforeEach(async () => {
+    availableMock.mockReset();
+    toolsMock.mockReset();
+    scopeRef.current = undefined;
+    langBefore = i18n.language;
+    await i18n.changeLanguage(lang);
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage(langBefore);
+  });
+
+  it("展开区里的每一句都按本 locale 的文案渲染", async () => {
+    const user = renderPicker({
+      argBindings: [BINDING],
+      promptVariables: ["project_code"],
+    });
+    await openToolModal(user);
+
+    const toggle = screen.getByTestId("af-mcp-bind-toggle-t1");
+    expect(toggle.textContent).toContain(copy.label);
+    expect(toggle.textContent).toContain(copy.count);
+    expect(toggle).toHaveAttribute("aria-label", copy.open);
+
+    await user.click(toggle);
+    const panel = document.getElementById(
+      toggle.getAttribute("aria-controls") as string,
+    ) as HTMLElement;
+    expect(panel.textContent).toContain(copy.hint);
+    // 必填星号的说明挂在星号的 title 上。
+    const star = screen
+      .getByTestId("af-mcp-bind-row-t1-project_code")
+      .querySelector("[title]");
+    expect(star).toHaveAttribute("title", copy.required);
+    // 下拉里的「自动」那一档。
+    await user.click(screen.getByLabelText("keyword"));
+    expect(optionLabels()).toContain(copy.auto);
+  });
+
+  it("一条变量都没声明时的提示按本 locale 渲染", async () => {
+    await openBindings(renderPicker({ promptVariables: [] }));
+    expect(screen.getByTestId("af-mcp-bind-no-vars-t1").textContent).toBe(
+      copy.noVariables,
+    );
+  });
+
+  // 复数那一档单独钉:count=1 走 _one(en)/_other(zh),count>1 两边都走 _other,
+  // 只测 count=1 的话 en 的 _other 没人验(它确实活过了第一轮变异)。
+  // 注:zh 的复数规则只有 other,所以 zh 的 _one 键在运行期永远取不到 ——
+  // 它存在只是为了让两个 locale 的键集相等(i18n.test.tsx 的断言)。
+  it("要删多条时标题走复数那一档", async () => {
+    const user = renderPicker({
+      argBindings: [
+        {
+          server: "deepcare",
+          tool: "t1",
+          args: { project_code: "project_code", keyword: "project_code" },
+        },
+      ],
+      promptVariables: ["project_code"],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain(copy.dropTitleMany);
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(2);
+  });
+
+  it("删绑定的确认框按本 locale 渲染(标题/条目/说明/两个按钮)", async () => {
+    const user = renderPicker({
+      argBindings: [BINDING],
+      promptVariables: ["project_code"],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain(copy.dropTitle);
+    expect(dialog.textContent).toContain(copy.dropItem);
+    expect(dialog.textContent).toContain(copy.dropHint);
+    // antd 会在两个汉字的按钮中间插空格(「取 消」),所以按去空白后比。
+    const buttons = within(dialog)
+      .getAllByRole("button")
+      .map((b) => (b.textContent ?? "").replace(/\s+/g, ""));
+    expect(buttons).toContain(copy.dropOk.replace(/\s+/g, ""));
+    expect(buttons).toContain(copy.dropCancel.replace(/\s+/g, ""));
+  });
+});
+
+// ── 平台连接器(source="catalog")也得能绑 ───────────────────────────────────
+//
+// catalog 分支 map 工具时曾经只带 name/description,把 input_schema 丢了 ——
+// 这个 bug 在租户自己注册的服务器上完全看不出来,只有用平台连接器的人会撞上
+// 「展开了却一个参数都没有」。
+describe("McpToolPicker 参数绑定(平台连接器)", () => {
+  it("catalog 探针的 input_schema 要透传,参数才列得出来", async () => {
+    platformCatalogMock.mockResolvedValue([
+      {
+        id: "c1",
+        name: "deepcare",
+        display_name: "DeepCare",
+        enabled: true,
+      },
+    ] as never);
+    catalogToolsMock.mockResolvedValue({
+      status: "ok",
+      tool_count: 1,
+      error: null,
+      tools: [
+        {
+          name: "t1",
+          description: "",
+          input_schema: { properties: { project_code: {}, keyword: {} } },
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    render(
+      <App>
+        <McpToolPicker
+          source="catalog"
+          servers={["deepcare"]}
+          allowTools={[]}
+          argBindings={[]}
+          promptVariables={["project_code"]}
+          onChange={() => {}}
+        />
+      </App>,
+    );
+    await openBindings(user);
+    expect(screen.getByLabelText("project_code")).toBeInTheDocument();
+    expect(screen.getByLabelText("keyword")).toBeInTheDocument();
+  });
+});
+
+// ── 调用点:FormView 真的把声明变量和绑定接上了吗 ────────────────────────────
+//
+// 组件本身跑通不代表页面跑通 —— 这一段走真的 FormView,变量取自 manifest 自己的
+// system_prompt.variables,写回去的也是真的 manifest。
+describe("FormView 把 MCP 绑定接到 manifest 上", () => {
+  const SEED: AgentManifest = {
+    apiVersion: "expert_work/v1",
+    kind: "Agent",
+    metadata: { name: "bot" },
+    spec: {
+      model: { provider: "openai", name: "gpt-4o" },
+      system_prompt: {
+        template: "hi {{ project_code }}",
+        jinja: true,
+        variables: [{ name: "project_code" }, { name: "" }],
+      },
+      tools: [{ type: "mcp", servers: ["deepcare"], allow_tools: [] }],
+    },
+  };
+
+  it("下拉列的是 manifest 声明的变量,选中后写进 tools[].arg_bindings", async () => {
+    vi.spyOn(modelCatalog, "loadModelCatalog").mockResolvedValue({
+      providers: [],
+    });
+    availableMock.mockResolvedValue([{ name: "deepcare", source: "tenant" }]);
+    toolsMock.mockResolvedValue([T1]);
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <App>
+        <FormView section="mcp" formData={SEED} onChange={onChange} />
+      </App>,
+    );
+    await openBindings(user);
+
+    await user.click(screen.getByLabelText("project_code"));
+    await waitFor(() => expect(optionLabels().length).toBeGreaterThan(0));
+    // 没起名字的变量行不是一个可绑的变量,不该进下拉。
+    expect(optionLabels()).toEqual(["自动（模型填）", "project_code"]);
+
+    await pickOption(user, "project_code");
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    const next = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(readTools(next).mcpArgBindings).toEqual([
+      { server: "deepcare", tool: "t1", args: { project_code: "project_code" } },
+    ]);
+    // 兄弟字段原样保留。
+    expect(readTools(next).mcpServers).toEqual(["deepcare"]);
+  });
+
+  it("manifest 里已有的绑定,一打开就显示在对应参数上", async () => {
+    vi.spyOn(modelCatalog, "loadModelCatalog").mockResolvedValue({
+      providers: [],
+    });
+    availableMock.mockResolvedValue([{ name: "deepcare", source: "tenant" }]);
+    toolsMock.mockResolvedValue([T1]);
+    const user = userEvent.setup();
+    const seeded: AgentManifest = {
+      ...SEED,
+      spec: {
+        ...SEED.spec,
+        tools: [
+          {
+            type: "mcp",
+            servers: ["deepcare"],
+            allow_tools: [],
+            arg_bindings: [BINDING],
+          },
+        ],
+      },
+    };
+    render(
+      <App>
+        <FormView section="mcp" formData={seeded} onChange={vi.fn()} />
+      </App>,
+    );
+    await openBindings(user);
+    // 已绑的那一行停在变量上,没绑的那一行停在「自动」。
+    expect(
+      screen.getByTestId("af-mcp-bind-row-t1-project_code").textContent,
+    ).toContain("project_code");
+    expect(
+      screen.getByTestId("af-mcp-bind-row-t1-keyword").textContent,
+    ).toContain("自动（模型填）");
+    // 收起状态下也看得出「这个工具配过绑定」。
+    expect(screen.getByTestId("af-mcp-bind-toggle-t1").textContent).toContain("1");
+  });
+});

@@ -509,8 +509,14 @@ export function FormView({
           source={mcpSource}
           servers={tools.mcpServers}
           allowTools={tools.mcpAllowTools}
-          onChange={(nextServers, nextAllow) =>
-            onChange(setMcp(formData, nextServers, nextAllow))
+          // B-61 — a parameter may only be bound to a name this agent actually
+          // declares; an unnamed row in the variables editor is not one yet.
+          argBindings={tools.mcpArgBindings}
+          promptVariables={readPromptVariables(formData)
+            .map((v) => v.name)
+            .filter((name): name is string => (name ?? "") !== "")}
+          onChange={(nextServers, nextAllow, nextBindings) =>
+            onChange(setMcp(formData, nextServers, nextAllow, nextBindings))
           }
         />
       </section>

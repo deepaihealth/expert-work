@@ -140,6 +140,7 @@ describe("form_model readers", () => {
       mcp: false,
       mcpAllowTools: [],
       mcpServers: [],
+      mcpArgBindings: [],
     });
   });
 });
@@ -523,6 +524,32 @@ test("setTool(mcp, on) leaves an already-present entry alone", () => {
   expect(readTools(m).mcpAllowTools).toEqual(["customer_search"]);
 });
 
+// Task 8 —— 配置页现在**读**得到绑定,不只是保住它。
+test("readTools surfaces arg_bindings for the picker", () => {
+  expect(readTools(seedBindings(withBindings())).mcpArgBindings).toEqual(BINDINGS);
+});
+
+// 第四参的两分法。undefined 与 [] 必须不同:前者是「本调用方不懂绑定」,
+// 后者是「看过了,确实一条都没有」。
+test("setMcp with an explicit binding list replaces it", () => {
+  const next = [
+    { server: "deepcare", tool: "note_add", args: { employee_code: "employee_code" } },
+  ];
+  const m = setMcp(seedBindings(withBindings()), ["deepcare"], ["customer_search", "note_add"], next);
+  expect(bindingsOf(m)).toEqual(next);
+});
+
+// 空数组把 key 删掉,而不是写成 ``arg_bindings: []`` —— 与后端
+// ``_omit_empty_arg_bindings`` 同口径。写成 [] 的话,每个带 MCP 的 agent 只要
+// 在配置页存过一次就多出这个键:spec sha 变了,回滚到旧版本还会被 extra=forbid
+// 全数拒掉。
+test("setMcp with an empty binding list drops the key entirely", () => {
+  const m = setMcp(seedBindings(withBindings()), ["deepcare"], ["customer_search"], []);
+  expect(bindingsOf(m)).toBeUndefined();
+  const entry = (m.spec?.tools ?? []).find((t) => t.type === "mcp");
+  expect(entry !== undefined && "arg_bindings" in entry).toBe(false);
+});
+
 test("setTool(mcp, off) still drops the entry", () => {
   const m = setTool(seedBindings(withBindings()), "mcp", false);
   expect(readTools(m).mcp).toBe(false);
@@ -892,6 +919,42 @@ describe("form_model — dynamic prompt (jinja + variables)", () => {
     expect(off.spec?.system_prompt?.jinja).toBeUndefined();
     expect(off.spec?.system_prompt?.variables).toBeUndefined();
     expect(off.spec?.system_prompt?.template).toBe("You are helpful.");
+  });
+
+  // B-61 修复轮 2 / N1 —— off 丢掉 variables 整块,于是每一条 arg_bindings 都成了
+  // 孤儿(规则 4:绑定必须指向已声明的变量),协议层直接拒收。清理必须在写入器里,
+  // 不能靠某个调用点记得先问:任何调用方关掉 jinja,拿到的都得是一份还能过校验的
+  // manifest。断言判的是「有没有产出孤儿」,不是「弹没弹框」。
+  it("disabling jinja also clears arg_bindings — no orphan can survive it", () => {
+    const on = setMcp(
+      setPromptVariables(setPromptJinja(seed, true), [{ name: "project_code" }]),
+      ["deepcare"],
+      ["customer_search"],
+      [
+        {
+          server: "deepcare",
+          tool: "customer_search",
+          args: { project_code: "project_code" },
+        },
+      ],
+    );
+    expect(readTools(on).mcpArgBindings).toHaveLength(1);
+
+    const off = setPromptJinja(on, false);
+    expect(off.spec?.system_prompt?.variables).toBeUndefined();
+    expect(readTools(off).mcpArgBindings).toEqual([]);
+    // 清的是绑定,不是整条 mcp 条目 —— 服务器/工具选择照旧。
+    expect(readTools(off).mcpServers).toEqual(["deepcare"]);
+    expect(readTools(off).mcpAllowTools).toEqual(["customer_search"]);
+    // key 删掉而不是留个空数组(与后端 _omit_empty_arg_bindings 同口径)。
+    const entry = (off.spec?.tools ?? []).find((t) => t.type === "mcp");
+    expect(entry !== undefined && "arg_bindings" in entry).toBe(false);
+  });
+
+  it("disabling jinja on a manifest with no tools does not grow an empty tools list", () => {
+    const on = setPromptVariables(setPromptJinja(seed, true), [{ name: "a" }]);
+    const off = setPromptJinja(on, false);
+    expect(off.spec?.tools).toBeUndefined();
   });
 
   it("writes variable rows verbatim and reads them back", () => {
