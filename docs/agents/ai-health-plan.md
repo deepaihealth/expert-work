@@ -2,6 +2,7 @@
 
 > 日期:2026-08-21(r6:MCP 七工具契约落地——inputs 增 project_code、档案获取写成工具链剧本、allow_tools 只读七件套;r4+r5:视频恢复下载嵌入 pptx(播放端/体积用户拍板);inputs 按用户设计重构——身份四字段供深护智康 MCP 调用/品牌四字段拆平/素材简化为文案+链接/文件名=客户名称_时间戳,plan_ref 退役为后端内部单号)
 > 对端设计:deep-ai-health-project-service `docs/superpowers/specs/2026-08-20-expert-work-plan-agent-design.md`(其 Agent 契约由本文落实;r4 契约变更见 §5,需回传)
+> 补充(2026-09-16,B-61):注入变量改为按引用给沙箱,模板要改的 5 处与「不要打印 inputs.json 再手打进工具参数」硬规则见 [`docs/design/agent-config-1235-addendum-b61.md`](../design/agent-config-1235-addendum-b61.md);本文正文尚未按它改,改完后这一条随之收掉。
 > 平台字段名均按仓库代码核对(agent_spec.py / prompt_render.py / tools/assembly.py / sandbox-image),非猜测。
 
 ## 1. 一句话

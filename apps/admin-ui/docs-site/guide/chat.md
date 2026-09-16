@@ -477,6 +477,103 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 { "success": false, "data": null, "error": { "code": "TOO_MANY_INPUT_KEYS", "message": "inputs 最多 64 个键" } }
 ```
 
+### 输入是怎么到达 Agent 的
+
+`inputs` 里的值除了渲染进系统提示词，还会在这次 run 开始时被写成一份 JSON 文件，放进这个终端用户的工作区。Agent 执行时用代码读这份文件取值，不必把提示词里的长字符串重新输入一遍。调用方不需要为此改动请求。
+
+这一节说明这份文件的结构，以及它对传值方式的影响。文件的内容由平台生成，读取它的代码由租户管理员在 Agent 的提示词里安排。
+
+#### 文件的位置与结构
+
+文件路径由环境变量 `EXPERT_WORK_INPUTS` 给出。每次 run 一个独立目录，同一个终端用户的多次 run 互不覆盖。Agent 没有声明模板变量，或者本次 `inputs` 里没有任何声明过的值时，这个文件不存在。
+
+这份 JSON 与平台预先下载的文件都由平台管理，不出现在 [5.6 工作区文件](./query#_5-6-工作区文件) 的列表里，也不能用工作区文件下载接口取回。
+
+```json [inputs.json 的结构]
+{
+  "run_id": "3f2c9a1e-2b60-4f3a-9a11-0c5d7e4b81aa",
+  "variables": {
+    "report_month": { "value": "2026-09", "trusted": true },
+    "cover_image": {
+      "value": "https://files.example.com/brand/cover-1726394851207.png",
+      "trusted": true,
+      "local_path": "inputs/cache/9f2a4c1b7e0d3856a1f4c920b7d5e386.png"
+    },
+    "materials": {
+      "value": [
+        {
+          "description": "示范视频",
+          "url": "https://files.example.com/demo-a.mp4",
+          "local_path": "inputs/cache/4d17b0e93c5a2f68d0b14e7a92c3f581.mp4"
+        },
+        { "description": "参考文章", "url": "https://example.com/post", "local_path": null }
+      ],
+      "trusted": false
+    }
+  }
+}
+```
+
+`variables` 下每个键是一个声明过的变量名，对应的值固定是一个对象，有下面三个字段。本次没有传的可选变量不出现在这里。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `value` | 与传入时相同 | 原样保留 `inputs` 里这个键的值。字符串、数字、数组、对象都不改写 |
+| `trusted` | boolean | 取值：`true`（管理员把这个变量声明为可信）/ `false`（声明为不可信，其中的内容按数据处理，不作为指令执行） |
+| `local_path` | string 或 null | 取值：相对路径（平台已经把这个地址的文件下载到工作区）/ `null`（没有下载，按同一项里的地址自行获取）。不含 `http` 或 `https` 地址的值没有这个键，读取时按「没有下载」处理 |
+
+`local_path` 相对工作区的根目录，Agent 执行代码时的当前目录就是这个根目录，按相对路径直接打开即可。嵌套结构里的地址，`local_path` 出现在它所在的那一项里，例如上面 `materials` 数组的每个元素。
+
+`local_path` 由平台写入，`inputs` 里自带的同名字段会被清空，所以不要用它传自己的路径。
+
+#### 哪些地址会被预先下载
+
+平台在 run 开始时尝试取回 `inputs` 里的 `http` 与 `https` 地址，按响应的 `Content-Type` 决定保存还是丢弃。
+
+| 内容类型 | 处理 |
+|---|---|
+| 图片、音频、视频 | 保存到工作区，`local_path` 指向保存后的文件 |
+| PDF、Word、Excel、PowerPoint | 保存到工作区，`local_path` 指向保存后的文件 |
+| 其它类型，含网页 `text/html` | 不保存，`local_path` 为 `null` |
+
+两条容量上限：单个文件 32 MiB，单次 run 合计 128 MiB。超过上限的文件不保存。
+
+同一个终端用户的多次 run 之间，同一个地址在 24 小时内只下载一次，后面的 run 复用上一次的副本。因此在这段时间内替换了地址背后的文件时，Agent 可能仍然拿到替换前的那一份；需要 Agent 立刻用上新文件时，换一个新地址传进来。
+
+地址要放在对象的某个字段里才会被下载。直接作为数组元素的地址字符串（例如 `["https://files.example.com/demo-a.mp4"]`）旁边没有位置记录 `local_path`，平台不下载它；需要平台预先下载时，把地址包成对象的一个字段，与上面 `materials` 的形态一致。
+
+**下载失败不影响 run 的执行。** 地址取不到、超时、超过上限、内容类型不在上表、被这个 Agent 的出网限制拦下，结果都一样：`local_path` 为 `null`，run 照常执行，Agent 仍然可以按 `value` 里的地址自行获取。
+
+::: warning local_path 指向的文件可能已经被清理
+这份 JSON 保留 30 天，预先下载的文件保留 7 天，到期由后台清理作业回收。搁置很久之后继续的会话因此可能读到一个 `local_path`，却打不开它指向的文件。`value` 里始终保留原地址，Agent 的代码在文件不存在时应当回到原地址重新获取。
+:::
+
+::: tip 传有时效的签名地址时留出余量
+签名地址过期之后，Agent 无法再按它取回文件。需要 Agent 在较长时间之后仍能取到原文件时，签发有效期足够长的地址。
+:::
+
+#### 示例代码
+
+下面这段代码运行在 Agent 一侧，调用方不需要实现它。
+
+```python [示例代码]
+import json
+import os
+
+with open(os.environ["EXPERT_WORK_INPUTS"], encoding="utf-8") as handle:
+    variables = json.load(handle)["variables"]
+
+cover = variables["cover_image"]
+local_path = cover.get("local_path")
+if local_path and os.path.exists(local_path):
+    # 平台已经下载好,直接读本地文件
+    with open(local_path, "rb") as handle:
+        image = handle.read()
+else:
+    # 没有下载或已被清理,按 value 里的原地址自行获取
+    image = download(cover["value"])
+```
+
 ## 2.8 防重复下发 Idempotency-Key
 
 同一次业务操作（例如终端用户点了一次下单按钮）在网络重试时，不应该在服务端执行成两次 run。在请求里带上 `Idempotency-Key` 请求头即可，`stream` 与 `queue` 两种模式都支持。
