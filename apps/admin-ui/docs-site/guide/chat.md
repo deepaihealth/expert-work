@@ -487,7 +487,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 文件路径由环境变量 `EXPERT_WORK_INPUTS` 给出。每次 run 一个独立目录，同一个终端用户的多次 run 互不覆盖。Agent 没有声明模板变量，或者本次 `inputs` 里没有任何声明过的值时，这个文件不存在。
 
-这份 JSON 与平台预先下载的文件都由平台管理，不出现在 [5.6 工作区文件](./query#_5-6-工作区文件) 的列表里，也不能用工作区文件下载接口取回。
+这份 JSON 与平台预先下载的文件都由平台管理，不出现在 [5.6 工作区文件](./query#_5-6-工作区文件) 的列表里；知道路径时，下载接口仍然取得回它们。
 
 ```json [inputs.json 的结构]
 {
@@ -520,7 +520,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 |---|---|---|
 | `value` | 与传入时相同 | 原样保留 `inputs` 里这个键的值。字符串、数字、数组、对象都不改写 |
 | `trusted` | boolean | 取值：`true`（管理员把这个变量声明为可信）/ `false`（声明为不可信，其中的内容按数据处理，不作为指令执行） |
-| `local_path` | string 或 null | 取值：相对路径（平台已经把这个地址的文件下载到工作区）/ `null`（没有下载，按同一项里的地址自行获取）。不含 `http` 或 `https` 地址的值没有这个键，读取时按「没有下载」处理 |
+| `local_path` | string 或 null | 取值：相对路径（平台已经把这个地址的文件下载到工作区）/ `null`（没有下载，按同一项里的地址自行获取）。只有整个值是一个地址、或地址是某个对象的一个字段时才有这个键，其余位置没有，读取时按「没有下载」处理 |
 
 `local_path` 相对工作区的根目录，Agent 执行代码时的当前目录就是这个根目录，按相对路径直接打开即可。嵌套结构里的地址，`local_path` 出现在它所在的那一项里，例如上面 `materials` 数组的每个元素。
 
@@ -532,13 +532,12 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 | 内容类型 | 处理 |
 |---|---|
-| 图片、音频、视频 | 保存到工作区，`local_path` 指向保存后的文件 |
-| PDF、Word、Excel、PowerPoint | 保存到工作区，`local_path` 指向保存后的文件 |
+| 图片、音频、视频、PDF、Word、Excel、PowerPoint | 保存到工作区，`local_path` 指向保存后的文件 |
 | 其它类型，含网页 `text/html` | 不保存，`local_path` 为 `null` |
 
 两条容量上限：单个文件 32 MiB，单次 run 合计 128 MiB。超过上限的文件不保存。
 
-同一个终端用户的多次 run 之间，同一个地址在 24 小时内只下载一次，后面的 run 复用上一次的副本。因此在这段时间内替换了地址背后的文件时，Agent 可能仍然拿到替换前的那一份；需要 Agent 立刻用上新文件时，换一个新地址传进来。
+同一个终端用户在同一个 Agent 名下的多次 run 之间，同一个地址在 24 小时内只下载一次，后面的 run 复用上一次的副本。因此在这段时间内替换了地址背后的文件时，Agent 可能仍然拿到替换前的那一份；需要 Agent 立刻用上新文件时，换一个新地址传进来。
 
 地址要放在对象的某个字段里才会被下载。直接作为数组元素的地址字符串（例如 `["https://files.example.com/demo-a.mp4"]`）旁边没有位置记录 `local_path`，平台不下载它；需要平台预先下载时，把地址包成对象的一个字段，与上面 `materials` 的形态一致。
 
@@ -559,6 +558,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 ```python [示例代码]
 import json
 import os
+import urllib.request
 
 with open(os.environ["EXPERT_WORK_INPUTS"], encoding="utf-8") as handle:
     variables = json.load(handle)["variables"]
@@ -571,7 +571,8 @@ if local_path and os.path.exists(local_path):
         image = handle.read()
 else:
     # 没有下载或已被清理,按 value 里的原地址自行获取
-    image = download(cover["value"])
+    with urllib.request.urlopen(cover["value"], timeout=30) as response:
+        image = response.read()
 ```
 
 ## 2.8 防重复下发 Idempotency-Key
