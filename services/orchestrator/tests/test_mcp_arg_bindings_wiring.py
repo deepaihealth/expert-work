@@ -658,6 +658,25 @@ async def test_a_wire_name_collision_still_clears_the_loser_binding() -> None:
     assert "p" in registry.get_required("mcp__a__x__t").spec.parameters["properties"]
 
 
+async def test_arg_bindings_is_a_copy(mcp_registry_factory) -> None:
+    """m-1 —— 交出去的是拷贝,不是活字典。
+
+    这张表活在 ``BuiltAgent`` 缓存里:谁就地改一下,之后每一个 run 拿到的都是被
+    污染的绑定。与 ``catalog()`` 同一口径,别把「下游只读」留成一条靠约定成立的
+    不变式 —— T6 已经为同一类问题吃过一次亏。
+    """
+    registry, _ = await mcp_registry_factory(
+        tools=[
+            {"name": "t1", "input_schema": {"type": "object", "properties": {"project_code": {}}}}
+        ],
+        arg_bindings={"t1": {"project_code": "pc"}},
+    )
+    handed_out = registry.arg_bindings()
+    handed_out[_WIRE]["project_code"] = "TAMPERED"
+    handed_out["mcp__deepcare__injected"] = {"x": "y"}
+    assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}
+
+
 async def test_a_human_modify_cannot_overwrite_a_platform_binding(graph_harness) -> None:
     """裁定 AC —— ``modify`` 整份替换 args,绑定必须再套一遍。
 
