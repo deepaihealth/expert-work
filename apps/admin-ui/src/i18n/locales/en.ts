@@ -1014,6 +1014,18 @@ export interface TranslationKeys {
     mcp_done: string;
     mcp_all_tools: string;
     mcp_tools_count: string;
+    mcp_bind_label: string;
+    mcp_bind_open: string;
+    mcp_bind_count: string;
+    mcp_bind_auto: string;
+    mcp_bind_hint: string;
+    mcp_bind_required: string;
+    mcp_bind_no_variables: string;
+    mcp_bind_drop_title: string;
+    mcp_bind_drop_item: string;
+    mcp_bind_drop_hint: string;
+    mcp_bind_drop_ok: string;
+    mcp_bind_drop_cancel: string;
     mcp_servers_hint: string;
     mcp_no_servers_available: string;
     mcp_no_servers_catalog: string;
@@ -4241,6 +4253,21 @@ const en: TranslationKeys = {
     mcp_done: "Done",
     mcp_all_tools: "All tools",
     mcp_tools_count: "{{count}} tools selected",
+    mcp_bind_label: "Bound parameters",
+    mcp_bind_open: "Bound parameters for {{tool}}",
+    mcp_bind_count: "{{count}} bound",
+    mcp_bind_auto: "Auto (model fills it in)",
+    mcp_bind_hint:
+      "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. Unbound parameters are still filled in by the model.",
+    mcp_bind_required: "This parameter is required",
+    mcp_bind_no_variables:
+      "Declare a variable first (Prompt & output → Dynamic prompt (Jinja)), then come back and bind parameters to it.",
+    mcp_bind_drop_title: "These bound parameters will be deleted too",
+    mcp_bind_drop_item: "{{param}} on {{tool}} ← variable {{variable}}",
+    mcp_bind_drop_hint:
+      "Once deleted, the model fills these parameters in again. Cancel to keep them.",
+    mcp_bind_drop_ok: "Delete and continue",
+    mcp_bind_drop_cancel: "Cancel",
     mcp_servers_hint: "Leave all unchecked to allow every available server",
     mcp_no_servers_available:
       "No MCP servers available yet. Enable one under Settings → MCP Servers → Add → enable from the catalog.",

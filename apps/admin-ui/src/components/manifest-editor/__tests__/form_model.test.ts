@@ -140,6 +140,7 @@ describe("form_model readers", () => {
       mcp: false,
       mcpAllowTools: [],
       mcpServers: [],
+      mcpArgBindings: [],
     });
   });
 });
@@ -521,6 +522,32 @@ test("setTool(mcp, on) leaves an already-present entry alone", () => {
   expect(bindingsOf(m)).toEqual(BINDINGS);
   expect(readTools(m).mcpServers).toEqual(["deepcare"]);
   expect(readTools(m).mcpAllowTools).toEqual(["customer_search"]);
+});
+
+// Task 8 —— 配置页现在**读**得到绑定,不只是保住它。
+test("readTools surfaces arg_bindings for the picker", () => {
+  expect(readTools(seedBindings(withBindings())).mcpArgBindings).toEqual(BINDINGS);
+});
+
+// 第四参的两分法。undefined 与 [] 必须不同:前者是「本调用方不懂绑定」,
+// 后者是「看过了,确实一条都没有」。
+test("setMcp with an explicit binding list replaces it", () => {
+  const next = [
+    { server: "deepcare", tool: "note_add", args: { employee_code: "employee_code" } },
+  ];
+  const m = setMcp(seedBindings(withBindings()), ["deepcare"], ["customer_search", "note_add"], next);
+  expect(bindingsOf(m)).toEqual(next);
+});
+
+// 空数组把 key 删掉,而不是写成 ``arg_bindings: []`` —— 与后端
+// ``_omit_empty_arg_bindings`` 同口径。写成 [] 的话,每个带 MCP 的 agent 只要
+// 在配置页存过一次就多出这个键:spec sha 变了,回滚到旧版本还会被 extra=forbid
+// 全数拒掉。
+test("setMcp with an empty binding list drops the key entirely", () => {
+  const m = setMcp(seedBindings(withBindings()), ["deepcare"], ["customer_search"], []);
+  expect(bindingsOf(m)).toBeUndefined();
+  const entry = (m.spec?.tools ?? []).find((t) => t.type === "mcp");
+  expect(entry !== undefined && "arg_bindings" in entry).toBe(false);
 });
 
 test("setTool(mcp, off) still drops the entry", () => {

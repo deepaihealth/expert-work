@@ -6,19 +6,29 @@
  * (then pick tools). Built for scale: a server search box, and per server a
  * tool search + select-all/clear + a height-capped scroll list.
  *
- * Controlled via a single ``onChange(servers, allowTools)`` so server and tool
- * edits land in one manifest patch (no stale-read double write).
+ * Controlled via a single ``onChange(servers, allowTools, argBindings)`` so
+ * server, tool and binding edits land in one manifest patch (no stale-read
+ * double write).
  *
  *   source = "available" (default) — the tenant's opted-in/custom servers.
  *   source = "catalog"             — published platform connectors (templates).
+ *
+ * B-61 — per-parameter bindings. Inside the tool sub-modal, every tool that is
+ * currently in the agent's scope gets a "bound parameters" disclosure: one row
+ * per parameter of the tool's own ``input_schema``, each a choice between
+ * "auto (model fills it in)" and one of the agent's DECLARED prompt variables.
+ * Free-text variable names are deliberately impossible here — a name nothing
+ * declares is exactly how a binding silently matches nothing.
  */
 import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
+  App,
   Button,
   Checkbox,
   Input,
   Modal,
+  Select,
   Space,
   Spin,
   Tag,
@@ -27,6 +37,8 @@ import {
 } from "antd";
 import { Settings } from "lucide-react";
 import { useTranslation } from "react-i18next";
+
+import type { ArgBindingFields } from "../form_model";
 
 import {
   listAvailableMcpServers,
@@ -43,12 +55,75 @@ const { Text } = Typography;
 
 export type McpPickerSource = "available" | "catalog";
 
+/** The "model fills this in" choice. Empty string, so it can never collide
+ *  with a declared variable name (those are non-empty by construction). */
+const AUTO = "";
+
 interface McpToolPickerProps {
   servers: string[];
   allowTools: string[];
-  onChange: (servers: string[], allowTools: string[]) => void;
+  /** B-61 — the manifest's ``tools[].arg_bindings``, verbatim. */
+  argBindings?: ArgBindingFields[];
+  /** Names declared in ``system_prompt.variables`` — the ONLY things a
+   *  parameter may be bound to. */
+  promptVariables?: string[];
+  onChange: (
+    servers: string[],
+    allowTools: string[],
+    argBindings: ArgBindingFields[],
+  ) => void;
   source?: McpPickerSource;
 }
+
+/** One row of the binding editor: a parameter of the tool's input schema. */
+interface ToolParam {
+  name: string;
+  required: boolean;
+}
+
+/** Read a tool's parameters out of its JSON Schema. ``input_schema`` is
+ *  ``Record<string, unknown>`` (whatever the server advertised), so every
+ *  step narrows rather than assumes. No schema ⇒ nothing to bind. */
+function paramsOf(tool: McpTool): ToolParam[] {
+  const schema = tool.input_schema;
+  if (schema === undefined) return [];
+  const props = schema.properties;
+  if (props === null || typeof props !== "object") return [];
+  const rawRequired = schema.required;
+  const required = new Set(
+    Array.isArray(rawRequired) ? rawRequired.filter((x) => typeof x === "string") : [],
+  );
+  return Object.keys(props as Record<string, unknown>).map((name) => ({
+    name,
+    required: required.has(name),
+  }));
+}
+
+/**
+ * Whether ``server``/``tool`` is inside the agent's current MCP scope — the
+ * single place this rule is written down, for both "may this tool be bound at
+ * all" and "is this existing binding still legal".
+ *
+ * It is not a nicety: ``AgentSpecBody._check_arg_bindings`` REJECTS the save
+ * outright when a binding's server is not among ``servers``, or its tool not
+ * among a non-empty ``allow_tools`` (empty ``allow_tools`` means "all tools",
+ * so the tool check does not apply then). A picker that let those drift would
+ * hand the operator an unsaveable manifest with a protocol-level error.
+ */
+const toolInScope = (
+  server: string,
+  tool: string,
+  servers: string[],
+  allowTools: string[],
+): boolean =>
+  servers.includes(server) &&
+  (allowTools.length === 0 || allowTools.includes(tool));
+
+const bindingInScope = (
+  binding: ArgBindingFields,
+  servers: string[],
+  allowTools: string[],
+): boolean => toolInScope(binding.server, binding.tool, servers, allowTools);
 
 interface ServerRow {
   name: string;
@@ -67,10 +142,16 @@ type ToolState =
 export function McpToolPicker({
   servers,
   allowTools,
+  argBindings = [],
+  promptVariables = [],
   onChange,
   source = "available",
 }: McpToolPickerProps) {
   const { t } = useTranslation();
+  // The drop-a-binding confirm rides App.useApp()'s modal, not the static
+  // ``Modal.confirm`` (project convention — the static one does not render
+  // under test).
+  const { modal } = App.useApp();
   // Cross-tenant W3 — tenant-server list rides the ambient scope; the
   // per-server tools probe is a detail read (concrete UUID only).
   const { apiTenantScope } = useTenantScope();
@@ -85,6 +166,9 @@ export function McpToolPicker({
   const [modalServer, setModalServer] = useState<ServerRow | null>(null);
   // "only selected" filter inside the tool sub-modal; reset on every open.
   const [onlySelected, setOnlySelected] = useState(false);
+  // Tool names whose binding editor is expanded; reset on every modal open.
+  // Pure presentation — the bindings themselves live in props.
+  const [expandedBindings, setExpandedBindings] = useState<string[]>([]);
 
   // ── Load selectable servers (source-dependent) ───────────────────────────
   useEffect(() => {
@@ -146,7 +230,13 @@ export function McpToolPicker({
               res.status === "ok"
                 ? res.tools
                     .filter((x) => !x.disabled)
-                    .map((x) => ({ name: x.name, description: x.description }))
+                    .map((x) => ({
+                      name: x.name,
+                      description: x.description,
+                      // B-61 — carry the schema through; without it the binding
+                      // editor has no parameters to offer for catalog servers.
+                      input_schema: x.input_schema,
+                    }))
                 : Promise.reject(new Error(res.error ?? "unreachable")),
             )
           : listMcpServerTools(row.toolKey, concreteTenantScope(apiTenantScope));
@@ -179,15 +269,69 @@ export function McpToolPicker({
   };
 
   // ── Mutations (always one combined onChange) ─────────────────────────────
+  //
+  // Every edit funnels through ``emit``: it drops the bindings the new
+  // server/tool selection has put out of scope (see ``bindingInScope`` — the
+  // manifest validator rejects those outright) and, when that drops anything,
+  // asks first and names what is going.
+  //
+  // That confirm is not there to second-guess the operator: turning MCP off
+  // SHOULD take its bindings with it. It is there because bindings had no
+  // representation on this page until now, so "it deleted something I could
+  // not see" was the only way that could read.
+  const emit = (
+    nextServers: string[],
+    nextAllow: string[],
+    nextBindings: ArgBindingFields[],
+  ): void => {
+    const kept = nextBindings.filter((b) =>
+      bindingInScope(b, nextServers, nextAllow),
+    );
+    const dropped = nextBindings.filter(
+      (b) => !bindingInScope(b, nextServers, nextAllow),
+    );
+    if (dropped.length === 0) {
+      onChange(nextServers, nextAllow, kept);
+      return;
+    }
+    modal.confirm({
+      title: t("agent_form.mcp_bind_drop_title"),
+      okText: t("agent_form.mcp_bind_drop_ok"),
+      cancelText: t("agent_form.mcp_bind_drop_cancel"),
+      content: (
+        <div>
+          <ul style={{ margin: "0 0 8px", paddingLeft: 18 }}>
+            {dropped.flatMap((b) =>
+              Object.entries(b.args).map(([param, variable]) => (
+                <li key={`${b.server}/${b.tool}/${param}`}>
+                  {t("agent_form.mcp_bind_drop_item", {
+                    tool: b.tool,
+                    param,
+                    variable,
+                  })}
+                </li>
+              )),
+            )}
+          </ul>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {t("agent_form.mcp_bind_drop_hint")}
+          </Text>
+        </div>
+      ),
+      onOk: () => onChange(nextServers, nextAllow, kept),
+    });
+  };
+
   const toggleServer = (row: ServerRow, on: boolean): void => {
     if (on) {
-      onChange([...servers, row.name], allowTools);
+      emit([...servers, row.name], allowTools, argBindings);
       fetchTools(row);
     } else {
       const names = new Set(toolNamesOf(row.name));
-      onChange(
+      emit(
         servers.filter((s) => s !== row.name),
         allowTools.filter((a) => !names.has(a)),
+        argBindings,
       );
     }
   };
@@ -198,22 +342,57 @@ export function McpToolPicker({
   };
 
   const toggleTool = (toolName: string, on: boolean): void =>
-    onChange(
+    emit(
       servers,
       on ? [...allowTools, toolName] : allowTools.filter((a) => a !== toolName),
+      argBindings,
     );
 
   const selectAllTools = (toolList: McpTool[]): void =>
-    onChange(
+    emit(
       servers,
       Array.from(new Set([...allowTools, ...toolList.map((x) => x.name)])),
+      argBindings,
     );
 
   const clearTools = (toolList: McpTool[]): void => {
     const names = new Set(toolList.map((x) => x.name));
-    onChange(
+    emit(
       servers,
       allowTools.filter((a) => !names.has(a)),
+      argBindings,
+    );
+  };
+
+  // ── B-61: per-parameter bindings ─────────────────────────────────────────
+  const argsOf = (server: string, tool: string): Record<string, string> =>
+    argBindings.find((b) => b.server === server && b.tool === tool)?.args ?? {};
+
+  /** Bind ``param`` to ``variable``, or unbind it when ``variable`` is null.
+   *  A tool whose last parameter is unbound loses its whole entry — the
+   *  manifest requires ``args`` to be non-empty. */
+  const setBinding = (
+    server: string,
+    tool: string,
+    param: string,
+    variable: string | null,
+  ): void => {
+    const current = argsOf(server, tool);
+    const nextArgs =
+      variable === null
+        ? Object.fromEntries(
+            Object.entries(current).filter(([key]) => key !== param),
+          )
+        : { ...current, [param]: variable };
+    const others = argBindings.filter(
+      (b) => !(b.server === server && b.tool === tool),
+    );
+    emit(
+      servers,
+      allowTools,
+      Object.keys(nextArgs).length === 0
+        ? others
+        : [...others, { server, tool, args: nextArgs }],
     );
   };
 
@@ -310,6 +489,7 @@ export function McpToolPicker({
                         onClick={() => {
                           fetchTools(row);
                           setOnlySelected(false);
+                          setExpandedBindings([]);
                           setModalServer(row);
                         }}
                       />
@@ -445,40 +625,146 @@ export function McpToolPicker({
             </Text>
           ) : (
             shown.map((tool) => (
-              // BUG-15 — 描述从 hover Tooltip 改为行内单行截断:窄弹窗里
-              // Tooltip 会翻转盖住相邻工具名;hover title 仍可看全文。
-              <Checkbox
-                key={tool.name}
-                data-testid={`af-mcp-tool-${tool.name}`}
-                checked={allowTools.includes(tool.name)}
-                onChange={(e) => toggleTool(tool.name, e.target.checked)}
-                style={{ display: "flex", alignItems: "flex-start" }}
-              >
-                <span style={{ minWidth: 0, display: "block" }}>
-                  <Text style={{ fontSize: 13 }}>{tool.name}</Text>
-                  {tool.description && (
-                    <Text
-                      type="secondary"
-                      title={tool.description}
-                      // 两行 clamp(SkillPicker BUG-6 同款):比单行截断少
-                      // 依赖 hover;title 兜长文。不用 antd ellipsis prop——
-                      // 它的多行形态要 tooltip 配置,正是 BUG-15 摘掉的遮挡层。
-                      style={{
-                        display: "-webkit-box",
-                        WebkitLineClamp: 2,
-                        WebkitBoxOrient: "vertical",
-                        fontSize: 12,
-                        overflow: "hidden",
-                      }}
-                    >
-                      {tool.description}
-                    </Text>
-                  )}
-                </span>
-              </Checkbox>
+              <div key={tool.name}>
+                {/* BUG-15 — 描述从 hover Tooltip 改为行内单行截断:窄弹窗里
+                    Tooltip 会翻转盖住相邻工具名;hover title 仍可看全文。 */}
+                <Checkbox
+                  data-testid={`af-mcp-tool-${tool.name}`}
+                  checked={allowTools.includes(tool.name)}
+                  onChange={(e) => toggleTool(tool.name, e.target.checked)}
+                  style={{ display: "flex", alignItems: "flex-start" }}
+                >
+                  <span style={{ minWidth: 0, display: "block" }}>
+                    <Text style={{ fontSize: 13 }}>{tool.name}</Text>
+                    {tool.description && (
+                      <Text
+                        type="secondary"
+                        title={tool.description}
+                        // 两行 clamp(SkillPicker BUG-6 同款):比单行截断少
+                        // 依赖 hover;title 兜长文。不用 antd ellipsis prop——
+                        // 它的多行形态要 tooltip 配置,正是 BUG-15 摘掉的遮挡层。
+                        style={{
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                          fontSize: 12,
+                          overflow: "hidden",
+                        }}
+                      >
+                        {tool.description}
+                      </Text>
+                    )}
+                  </span>
+                </Checkbox>
+                {/* 绑定编辑器是 Checkbox 的兄弟,不是它的 label 内容 ——
+                    下拉框放进 label 里点一下就会连带勾掉工具。 */}
+                {renderBindings(row, tool)}
+              </div>
             ))
           )}
         </div>
+      </div>
+    );
+  }
+
+  // ── B-61: the per-parameter binding editor for one tool ──────────────────
+  function renderBindings(row: ServerRow, tool: McpTool) {
+    const params = paramsOf(tool);
+    // 没有 schema 就没有参数可绑;不在范围内的工具绑了也会被 manifest 校验拒掉。
+    if (params.length === 0) return null;
+    if (!toolInScope(row.name, tool.name, servers, allowTools)) return null;
+    const bound = argsOf(row.name, tool.name);
+    const boundCount = Object.keys(bound).length;
+    const open = expandedBindings.includes(tool.name);
+    return (
+      <div style={{ marginLeft: 24 }}>
+        <Button
+          type="link"
+          size="small"
+          style={{ paddingLeft: 0 }}
+          data-testid={`af-mcp-bind-toggle-${tool.name}`}
+          aria-label={t("agent_form.mcp_bind_open", { tool: tool.name })}
+          aria-expanded={open}
+          onClick={() =>
+            setExpandedBindings((prev) =>
+              prev.includes(tool.name)
+                ? prev.filter((x) => x !== tool.name)
+                : [...prev, tool.name],
+            )
+          }
+        >
+          {t("agent_form.mcp_bind_label")}
+          {boundCount > 0 && ` · ${t("agent_form.mcp_bind_count", { count: boundCount })}`}
+        </Button>
+        {open &&
+          (promptVariables.length === 0 ? (
+            <Text
+              type="secondary"
+              data-testid={`af-mcp-bind-no-vars-${tool.name}`}
+              style={{ display: "block", fontSize: 12, paddingBottom: 4 }}
+            >
+              {t("agent_form.mcp_bind_no_variables")}
+            </Text>
+          ) : (
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+                paddingBottom: 6,
+              }}
+            >
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {t("agent_form.mcp_bind_hint")}
+              </Text>
+              {params.map((param) => {
+                const id = `af-mcp-bind-${row.name}-${tool.name}-${param.name}`;
+                return (
+                  <div
+                    key={param.name}
+                    data-testid={`af-mcp-bind-row-${tool.name}-${param.name}`}
+                    style={{ display: "flex", alignItems: "center", gap: 8 }}
+                  >
+                    <span style={{ fontSize: 12, minWidth: 180 }}>
+                      <label htmlFor={id}>{param.name}</label>
+                      {param.required && (
+                        // antd 自己的必填星号同款:视觉标记,读屏不念。
+                        <Text
+                          type="danger"
+                          aria-hidden="true"
+                          title={t("agent_form.mcp_bind_required")}
+                          style={{ marginLeft: 2 }}
+                        >
+                          *
+                        </Text>
+                      )}
+                    </span>
+                    <Select
+                      id={id}
+                      size="small"
+                      style={{ minWidth: 220 }}
+                      value={bound[param.name] ?? AUTO}
+                      onChange={(value: string) =>
+                        setBinding(
+                          row.name,
+                          tool.name,
+                          param.name,
+                          value === AUTO ? null : value,
+                        )
+                      }
+                      options={[
+                        { value: AUTO, label: t("agent_form.mcp_bind_auto") },
+                        ...promptVariables.map((name) => ({
+                          value: name,
+                          label: name,
+                        })),
+                      ]}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          ))}
       </div>
     );
   }

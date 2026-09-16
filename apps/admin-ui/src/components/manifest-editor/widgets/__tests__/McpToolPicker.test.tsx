@@ -130,8 +130,9 @@ describe("McpToolPicker", () => {
     ]);
     render(<McpToolPicker servers={[]} allowTools={[]} onChange={onChange} />);
     await user.click(await screen.findByTestId("af-mcp-server-amap-maps"));
+    // B-61 Task 8 —— onChange 的第三个参数是 arg_bindings(这里没有,空数组)。
     await waitFor(() =>
-      expect(onChange).toHaveBeenCalledWith(["amap-maps"], []),
+      expect(onChange).toHaveBeenCalledWith(["amap-maps"], [], []),
     );
     // There is no separate MCP enable checkbox.
     expect(screen.queryByTestId("af-tool-mcp")).not.toBeInTheDocument();
@@ -212,6 +213,7 @@ describe("McpToolPicker", () => {
       expect(onChange).toHaveBeenCalledWith(
         ["amap-maps"],
         expect.arrayContaining(["maps_geo", "maps_weather"]),
+        [],
       ),
     );
   });

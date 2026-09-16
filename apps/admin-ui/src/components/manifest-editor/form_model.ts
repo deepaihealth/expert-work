@@ -58,11 +58,20 @@ export interface RoutingFields {
   rules?: RouteRuleFields[];
   [k: string]: unknown;
 }
+/** B-61 — one MCP tool's parameter bindings: tool parameter → declared
+ *  prompt variable. Mirrors the manifest's ``ArgBindingSpec`` exactly;
+ *  ``(server, tool)`` is unique across the whole entry. */
+export interface ArgBindingFields {
+  server: string;
+  tool: string;
+  args: Record<string, string>;
+}
 export type ToolEntry = {
   type: string;
   name?: string;
   allow_tools?: string[];
   servers?: string[];
+  arg_bindings?: ArgBindingFields[];
   config?: Record<string, unknown>;
   [k: string]: unknown;
 };
@@ -509,6 +518,7 @@ export interface ToolFlags {
   mcp: boolean;
   mcpAllowTools: string[];
   mcpServers: string[];
+  mcpArgBindings: ArgBindingFields[];
 }
 export function readTools(m: unknown): ToolFlags {
   const tools = specOf(m).tools ?? [];
@@ -521,6 +531,7 @@ export function readTools(m: unknown): ToolFlags {
     mcp: mcp !== undefined,
     mcpAllowTools: mcp?.allow_tools ?? [],
     mcpServers: mcp?.servers ?? [],
+    mcpArgBindings: mcp?.arg_bindings ?? [],
   };
 }
 
@@ -816,16 +827,23 @@ const readMcpAllowTools = (m: unknown): string[] =>
 // a stale-read double-patch. Empty ``servers`` ⇒ MCP off (entry dropped).
 //
 // Like ``setBuiltinTool``, this NEVER rebuilds an already-present entry from
-// scratch: it spreads the existing one and overwrites only the two keys the
-// picker owns. The form shows neither ``arg_bindings`` (B-61 — parameters bound
-// to declared prompt variables, YAML-only until the binding UI lands) nor any
-// future sibling key, and rebuilding would drop them silently on the next
-// server/tool pick — turning a supported YAML-authored config into data loss
-// with no signal.
+// scratch: it spreads the existing one and overwrites only the keys the picker
+// owns. Any other sibling key the form does not show (hand-authored in YAML)
+// would otherwise be dropped silently on the next server/tool pick — turning a
+// supported config into data loss with no signal.
+//
+// ``argBindings`` (B-61) is the picker's third owned key since Task 8. It is
+// OPTIONAL on purpose: ``undefined`` means "this caller does not know about
+// bindings, leave whatever is there alone" (that is what ``setMcpServers`` /
+// ``setMcpAllowTools`` want). An empty array means "the picker looked and there
+// are none" — the key is then removed rather than written as ``[]``, matching
+// the backend's own ``_omit_empty_arg_bindings`` serializer, so a manifest with
+// no bindings keeps its pre-B-61 bytes (and its spec sha).
 export function setMcp(
   m: unknown,
   servers: string[],
   allowTools: string[],
+  argBindings?: ArgBindingFields[],
 ): AgentManifest {
   const tools = specOf(m).tools ?? [];
   const withoutMcp = tools.filter((t) => t.type !== "mcp");
@@ -833,10 +851,20 @@ export function setMcp(
     return patchSpec(m, { tools: withoutMcp });
   }
   const existing = tools.find((t) => t.type === "mcp");
+  const merged: ToolEntry = {
+    ...existing,
+    type: "mcp",
+    servers,
+    allow_tools: allowTools,
+  };
+  const { arg_bindings: current, ...rest } = merged;
+  const bindings = argBindings ?? current;
   return patchSpec(m, {
     tools: [
       ...withoutMcp,
-      { ...existing, type: "mcp", servers, allow_tools: allowTools },
+      bindings !== undefined && bindings.length > 0
+        ? { ...rest, arg_bindings: bindings }
+        : rest,
     ],
   });
 }
