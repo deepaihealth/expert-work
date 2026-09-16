@@ -541,6 +541,8 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 地址要放在对象的某个字段里才会被下载。直接作为数组元素的地址字符串（例如 `["https://files.example.com/demo-a.mp4"]`）旁边没有位置记录 `local_path`，平台不下载它；需要平台预先下载时，把地址包成对象的一个字段，与上面 `materials` 的形态一致。
 
+识别的对象是**值本身**：只有整个值是一个 `http` 或 `https` 开头的字符串时，才算一个地址。把结构先 JSON 编码成字符串再传（整个值变成一个 `[{...}]` 形状的字符串），字符串里面的地址平台看不见，也就不会预先下载；这类值仍然原样出现在文件里，Agent 解析之后照常使用。
+
 **下载失败不影响 run 的执行。** 地址取不到、超时、超过上限、内容类型不在上表、被这个 Agent 的出网限制拦下，结果都一样：`local_path` 为 `null`，run 照常执行，Agent 仍然可以按 `value` 里的地址自行获取。
 
 ::: warning local_path 指向的文件可能已经被清理
