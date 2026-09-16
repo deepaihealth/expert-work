@@ -981,8 +981,9 @@ async def register_mcp_tools(
     :func:`mcp_tool_name`, and duplicating that folding rule is how the two
     sides drift apart.
 
-    Two kinds of miss are reported rather than raised — an upstream interface
-    drift must degrade, never block the run (spec §5.4):
+    Two kinds of miss can happen here; neither is ever raised — an upstream
+    interface drift must degrade, never block the run (spec §5.4). Only the
+    first is *reported* from this function:
 
     * a bound parameter this tool's advertised schema does not have → dropped
       from the binding (so the platform never injects a parameter the server
@@ -999,7 +1000,11 @@ async def register_mcp_tools(
     attribution at orchestrator startup.
     """
     tools = await client.list_tools()
-    # 边注册边从这份副本里划掉匹配上的;剩下的就是「这台服务器没有这个工具」。
+    # 边注册边从这份副本里划掉匹配上的。**剩下的什么也不是** —— 兄弟 ``mcp``
+    # 条目的 ``allow_tools`` 能把一个别处绑得好好的工具挡在这一趟之外,所以
+    # 单趟的剩余项不构成「这台服务器没有这个工具」的证据(评审 N-1:按剩余项
+    # 判就是那条会对配置的人说假话的规则)。落空的判定统一在
+    # ``build_tool_registry`` 里,等所有条目都注册完之后做一次。
     pending_bindings = {tool: dict(bound) for tool, bound in (arg_bindings or {}).items()}
     registered: list[str] = []
     for tool_def in tools:
