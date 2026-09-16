@@ -145,7 +145,7 @@ class _Harness:
         assert self.judge is not None, "harness built without a judge"
         return self.judge.calls
 
-    async def run_turn_with_tool_call(self, name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    def _compiled(self, name: str, args: Mapping[str, Any], cp: Any) -> Any:
         llm = _ScriptedLLM(
             responses=[
                 AIMessage(
@@ -157,37 +157,58 @@ class _Harness:
                 AIMessage(content="done"),
             ]
         )
+        return GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm,
+                tool_registry=self.registry,
+                approval_required_tools=self.approval_required_tools,
+                action_judge=self.judge,  # type: ignore[arg-type]
+                action_screen=self.action_screen,
+            )
+        )
+
+    def _config(self) -> RunnableConfig:
         audit_logger = AuditLogger(
             self.audit_store, DefaultSecretRedactor(), InMemoryAuditFallbackQueue()
         )
-        async with make_checkpointer("memory") as cp:
-            runner = GraphRunner(checkpointer=cp)
-            compiled = runner.compile(
-                build_react_graph(
-                    llm_caller=llm,
-                    tool_registry=self.registry,
-                    approval_required_tools=self.approval_required_tools,
-                    action_judge=self.judge,  # type: ignore[arg-type]
-                    action_screen=self.action_screen,
-                )
-            )
-            cfg: RunnableConfig = {
-                "configurable": {
-                    "thread_id": str(uuid4()),
-                    "run_id": str(uuid4()),
-                    "tenant_id": str(uuid4()),
-                    AUDIT_LOGGER_KEY: audit_logger,
-                    PROMPT_INPUTS_KEY: dict(self.prompt_inputs),
-                }
+        return {
+            "configurable": {
+                "thread_id": str(uuid4()),
+                "run_id": str(uuid4()),
+                "tenant_id": str(uuid4()),
+                AUDIT_LOGGER_KEY: audit_logger,
+                PROMPT_INPUTS_KEY: dict(self.prompt_inputs),
             }
-            return await compiled.ainvoke(
+        }
+
+    @staticmethod
+    def _seed() -> dict[str, Any]:
+        return {"messages": [HumanMessage(content="查一下")], "step_count": 0, "max_steps": 5}
+
+    async def run_turn_with_tool_call(self, name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        async with make_checkpointer("memory") as cp:
+            compiled = self._compiled(name, args, cp)
+            return await compiled.ainvoke(self._seed(), config=self._config())
+
+    async def approve_and_continue(self, name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        """跑到审批暂停,照审批端点的做法批准,再续跑。"""
+        async with make_checkpointer("memory") as cp:
+            compiled = self._compiled(name, args, cp)
+            cfg = self._config()
+            paused = await compiled.ainvoke(self._seed(), config=cfg)
+            request = paused["pending_approval"]
+            await compiled.aupdate_state(
+                cfg,
                 {
-                    "messages": [HumanMessage(content="查一下")],
-                    "step_count": 0,
-                    "max_steps": 5,
+                    "pending_approval": None,
+                    "approval_resume": {
+                        "decision": "approve",
+                        "binding_digest": request.binding_digest,
+                    },
                 },
-                config=cfg,
+                as_node="agent",
             )
+            return await compiled.ainvoke(None, config=cfg)
 
 
 @pytest.fixture
@@ -326,6 +347,26 @@ async def test_a_param_absent_from_the_schema_is_never_injected_into_the_call(
     _, sent_args = harness.client.calls[-1]
     assert "project_code" not in sent_args
     assert sent_args["keyword"] == "王"
+
+
+async def test_approving_a_paused_call_dispatches_the_bound_value(graph_harness) -> None:
+    """续跑那一遍也必须重填 —— 这是填在 ``tools_node`` **最前面**的第二个理由。
+
+    填值不落进检查点:续跑是从检查点里那条原始 AIMessage 重新取 tool_calls 的。
+    要紧的不是「填得早」而是**两遍都填**:审批请求的 binding_digest 是按填完的
+    args 记的,续跑那遍要是漏了填,重新算出来的摘要就对不上,RT-6 会把一次正常
+    的批准判成完整性否决 —— 工具一次都跑不成。填在分支上方,两遍自然都经过。
+    """
+    harness = await graph_harness(
+        approval_required_tools={_WIRE},
+        bindings={_WIRE: {"project_code": "pc"}},
+        prompt_inputs={"pc": "PRJ001"},
+    )
+    state = await harness.approve_and_continue(_WIRE, {"keyword": "王"})
+    assert harness.client.calls, "批准之后工具应当真的跑起来(没被判成 binding drift)"
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args["project_code"] == "PRJ001"
+    assert state.get("approval_outcome") != "rejected"
 
 
 # ---------------------------------------------------------------------------
