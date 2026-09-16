@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -1031,6 +1032,37 @@ async def test_a_clean_build_carries_no_warning(
     resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
     assert resp.status_code == 201, resp.text
     assert resp.json()["data"]["build_warning"] is None
+
+
+@pytest.mark.asyncio
+async def test_unmatched_arg_bindings_save_with_a_warning_not_a_refusal(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """B-61 §5.4 —— 参数绑定一个工具都没匹配上(名字写错 / 服务器连不上)。
+
+    manifest 层查不出这件事:``servers`` 为空是默认值且表示「所有服务器」,租户
+    到底有哪些服务器、每台上有哪些工具,protocol 包看不见。不说出来就是静默失效
+    —— 参数回到模型手里,模型继续手抄那串长字符串。
+
+    **不能拒**:MCP 路径从不抛 ``AgentFactoryError``(连不上的服务器只是跳过),
+    做成 422 等于第三方一抖动就卡死保存。
+    """
+    app, client = b5_app_client
+
+    async def _built_with_unmatched(spec, *, tenant_id=None, user_id=None):
+        return SimpleNamespace(unmatched_arg_bindings=(("deepcare", "customer_serach"),))
+
+    app.state.agent_runtime.agent_builder = _built_with_unmatched  # type: ignore[attr-defined]
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    warning = resp.json()["data"]["build_warning"]
+    assert warning is not None
+    assert "deepcare/customer_serach" in warning
+
+    # 保存真的发生了 —— 警告档的全部意义就在这。
+    listed = await client.get("/v1/agents")
+    assert any(i["name"] == "code-reviewer" for i in listed.json()["data"]["items"])
 
 
 @pytest.mark.asyncio

@@ -1000,7 +1000,7 @@ async def _check_buildable(
         return _BuildCheck()
     started = time.monotonic()
     try:
-        await runtime.agent_builder(spec, tenant_id=tenant_id, user_id=None)
+        built = await runtime.agent_builder(spec, tenant_id=tenant_id, user_id=None)
     except PlatformNotConfiguredError as exc:
         record_manifest_build_check(outcome="platform_gap")
         logger.warning(
@@ -1027,7 +1027,34 @@ async def _check_buildable(
         )
     record_manifest_build_check(outcome="ok")
     logger.info("manifest.build_check_ok ms=%.0f", (time.monotonic() - started) * 1000)
-    return _BuildCheck()
+    return _BuildCheck(warning=_unmatched_binding_warning(built))
+
+
+def _unmatched_binding_warning(built: Any) -> str | None:
+    """B-61 §5.4 —— 「这条参数绑定一个工具都没匹配上」的人话告警。
+
+    这件事 manifest 层查不出来:``servers`` 为空是默认值、且表示「所有服务器」,
+    而「这个租户到底有哪些服务器、每台上面有哪些工具」对 protocol 包不可见。
+    名字写错时绑定静默失效 —— 参数回到模型手里,模型继续手抄那串长字符串,正是
+    本特性要消灭的故障,却披着一份校验全绿的 manifest。真正知道答案的是上面这次
+    试建(它按真正的 builder 组装,连 MCP 池一起挂),所以判在这里。
+
+    **警告,不是 422**:同一函数的 docstring 记着「任何 MCP 路径都不抛
+    ``AgentFactoryError``,连不上的服务器只是跳过」—— 做成拒绝,等于对方服务临时
+    不可达就卡死保存。
+
+    ``getattr`` 兜底:注入 builder 的测试替身返回的不是 ``BuiltAgent``,这条闸不能
+    因此炸掉保存。
+    """
+    unmatched = getattr(built, "unmatched_arg_bindings", ()) or ()
+    if not unmatched:
+        return None
+    listed = ", ".join(f"{server}/{tool}" for server, tool in unmatched)
+    return (
+        "these arg_bindings matched no tool in the assembled catalog, so their "
+        f"parameters stay in the model's hands: {listed} — check the server / "
+        "tool spelling, or that the server is reachable and enabled for this tenant"
+    )
 
 
 async def _load_manifest(

@@ -142,6 +142,7 @@ from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
 from orchestrator.output_judge import ActionJudge, OutputJudge
+from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import (
@@ -153,6 +154,7 @@ from orchestrator.tools._guards import (
     usage_total,
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
+from orchestrator.tools.arg_bindings import apply_arg_bindings
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
@@ -1278,6 +1280,33 @@ def build_react_graph(
         if not tool_calls:
             return {}
 
+        # B-61 §5.3 —— 平台绑定的参数在这里填,早于审批门与 action screening:
+        # 两者都在 dispatch 之前读 args,填在这里,人审批时看到的是真值、judge
+        # 也是对真参数判对齐。填在 before_tool_dispatch 那层就都看不到了。
+        #
+        # 也早于下面的审批**续跑**分支,这是必须的:审批请求记的是填完的 args,
+        # 而续跑是从检查点里的原始 AIMessage 重新取 tool_calls —— 不在这里重填
+        # 一遍,RT-6 的 binding digest 就会对不上,一次正常的批准变成完整性否决。
+        #
+        # 逐个 call 各调一次:审计行是 per-call 的,一次把整批填完只拿得到全轮
+        # 汇总的参数名,会把 A 调用填的参数记到 B 调用头上。
+        registry_bindings = tool_registry.arg_bindings()
+        # 没有绑定就整条路径不走:存量 agent 的 tool_calls 仍是 AIMessage 身上
+        # 那几个对象本身,零行为变化。
+        bound_arg_names: dict[int, list[str]] = {}
+        if registry_bindings:
+            configurable_now = config.get("configurable") or {}
+            prompt_inputs = configurable_now.get(PROMPT_INPUTS_KEY) or {}
+            filled: list[dict[str, Any]] = []
+            for index, call in enumerate(tool_calls):
+                (one_call,), names = apply_arg_bindings(
+                    [call], bindings=registry_bindings, inputs=prompt_inputs
+                )
+                filled.append(one_call)
+                if names:
+                    bound_arg_names[index] = names
+            tool_calls = filled
+
         # Stream J.8 (Mini-ADR J-24) — approval gate. Two re-entrant paths:
         #
         # 1. RESUME — ``approval_resume`` set: a human verdict came back
@@ -1428,6 +1457,7 @@ def build_react_graph(
 
         async def _run_call(
             tc: dict[str, Any],
+            bound_args: Sequence[str],
         ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
             # Per-call cancel check + ``run_cancellable`` mirror the M0
             # sequential path so cancellation semantics stay identical:
@@ -1444,6 +1474,7 @@ def build_react_graph(
                     overflow_writer=overflow_writer,
                     spotlight_nonce=spotlight_nonce,
                     budget_enabled=tool_output_budget_enabled,
+                    bound_args=bound_args,
                 )
             )
 
@@ -1451,9 +1482,10 @@ def build_react_graph(
 
         async def _bounded(
             tc: dict[str, Any],
+            bound_args: Sequence[str],
         ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
             async with semaphore:
-                return await _run_call(tc)
+                return await _run_call(tc, bound_args)
 
         for stage in stages:
             _tools_stages_total.inc()
@@ -1464,7 +1496,10 @@ def build_react_graph(
             # would be ``RunCancelledError`` (cancellation) or a
             # programmer error, both of which should propagate.
             stage_results = await asyncio.gather(
-                *(_bounded(tool_calls[call.index]) for call in stage)
+                *(
+                    _bounded(tool_calls[call.index], bound_arg_names.get(call.index, ()))
+                    for call in stage
+                )
             )
             for call, result in zip(stage, stage_results, strict=True):
                 results[call.index] = result
@@ -2497,6 +2532,7 @@ async def _dispatch_tool(
     overflow_writer: WorkspaceFileWriter | None = None,
     spotlight_nonce: str | None = None,
     budget_enabled: bool = True,
+    bound_args: Sequence[str] = (),
 ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
     """Dispatch one tool call.
 
@@ -2517,6 +2553,12 @@ async def _dispatch_tool(
     The emit is best-effort: a missing ``audit_logger`` / ``tenant_id``
     is skipped and an audit-write failure is swallowed, so auditing never
     changes the dispatch result (mirrors ``sse._emit_run_end_audit``).
+
+    B-61 — ``bound_args`` names the parameters ``tools_node`` filled in from
+    the run's declared variables, so the audit row shows which values came
+    from the platform rather than from the model. Names only, never values:
+    a bound value IS the customer record this feature exists to stop the
+    model from retyping.
     """
     name = str(tool_call.get("name", ""))
     call_id = str(tool_call.get("id", ""))
@@ -2583,8 +2625,9 @@ async def _dispatch_tool(
             reason=None if ok else "tool_error",
             duration_ms=duration_ms,
             # Stream 14.4 — MCP traffic audit: server + response volume.
-            extra_details=_mcp_audit_details(
-                name, content=str(outcome[0].content), is_error=not ok
+            extra_details=_with_bound_args(
+                _mcp_audit_details(name, content=str(outcome[0].content), is_error=not ok),
+                bound_args,
             ),
         )
         return outcome
@@ -2604,7 +2647,7 @@ async def _dispatch_tool(
             result=AuditResult.ERROR,
             reason="unknown_tool",
             duration_ms=duration_ms,
-            extra_details=_mcp_audit_details(name, is_error=True),
+            extra_details=_with_bound_args(_mcp_audit_details(name, is_error=True), bound_args),
         )
         # Stream HX-12 — a truly unknown name gets ranked suggestions from
         # the deferred pool instead of a dead-end error (fail-open: worst
@@ -2655,7 +2698,7 @@ async def _dispatch_tool(
             result=AuditResult.DENIED,
             reason=type(exc).__name__,
             duration_ms=duration_ms,
-            extra_details=_mcp_audit_details(name, is_error=True),
+            extra_details=_with_bound_args(_mcp_audit_details(name, is_error=True), bound_args),
         )
         return (
             ToolMessage(
@@ -2729,6 +2772,19 @@ def _mcp_audit_details(
     if content is not None:
         details["response_chars"] = len(content)
     return details
+
+
+def _with_bound_args(
+    details: dict[str, Any] | None, bound_args: Sequence[str]
+) -> dict[str, Any] | None:
+    """B-61 —— 把本次调用里由平台填入的参数**名**并进审计 details。
+
+    没有绑定就原样返回(包括非 MCP 工具的 ``None``):这个键只在真填过东西时
+    出现,免得每一行都挂一个空列表、反而看不出哪次是平台填的。
+    """
+    if not bound_args:
+        return details
+    return {**(details or {}), "bound_args": list(bound_args)}
 
 
 #: Sandbox executors whose submitted code/command IS recorded into the audit

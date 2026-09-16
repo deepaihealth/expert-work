@@ -44,7 +44,7 @@ import logging
 import re
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import anyio
@@ -53,6 +53,7 @@ from expert_work.common.uplift_metrics import (
     record_mcp_call,
     record_mcp_circuit_state,
 )
+from orchestrator.tools.arg_bindings import strip_bound_params, unbindable_params
 from orchestrator.tools.registry import (
     ToolContext,
     ToolNotFoundError,
@@ -949,6 +950,7 @@ async def register_mcp_tools(
     content_char_cap: int = DEFAULT_MCP_CHAR_CAP,
     allow_tools: Collection[str] | None = None,
     deferred: bool = False,
+    arg_bindings: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[str]:
     """List tools from ``client`` and register each as :class:`MCPTool`.
 
@@ -962,14 +964,53 @@ async def register_mcp_tools(
     server can advertise dozens of verbose tool schemas), so the assembler
     passes ``deferred=True`` (deer-flow's always-defer-MCP policy).
 
+    ``arg_bindings`` (B-61 §5.2) maps this server's **bare** tool names to
+    ``{parameter: declared-variable}``. Each bound parameter is stripped from
+    the schema the model sees and recorded on the ``registry`` under the
+    **wire** name, so ``tools_node`` can fill it in from the run's inputs.
+    This is the one place that translation happens: the protocol stores raw
+    ``server`` / ``tool`` names while the registry is keyed by
+    :func:`mcp_tool_name`, and duplicating that folding rule is how the two
+    sides drift apart.
+
+    Two kinds of miss are reported rather than raised — an upstream interface
+    drift must degrade, never block the run (spec §5.4):
+
+    * a bound parameter this tool's advertised schema does not have → dropped
+      from the binding (so the platform never injects a parameter the server
+      would reject) plus an ``mcp.binding_param_absent`` warning;
+    * a binding naming a tool this server does not advertise → recorded via
+      ``ToolRegistry.note_unmatched_arg_binding``, which the save-time dry-run
+      build turns into a warning for whoever configured it.
+
     Returns the namespaced names registered, useful for audit
     attribution at orchestrator startup.
     """
     tools = await client.list_tools()
+    # 边注册边从这份副本里划掉匹配上的;剩下的就是「这台服务器没有这个工具」。
+    pending_bindings = {tool: dict(bound) for tool, bound in (arg_bindings or {}).items()}
     registered: list[str] = []
     for tool_def in tools:
         if allow_tools is not None and tool_def.name not in allow_tools:
             continue
+        bound = pending_bindings.pop(tool_def.name, None) or {}
+        if bound:
+            absent = unbindable_params(tool_def.input_schema, bound)
+            if absent:
+                # 上游改了接口,绑定指向一个不存在的参数。不阻断 run:这个 agent
+                # 的其它工具照常可用,该条按未命中处理(spec §5.4)。工具名来自
+                # 第三方的 list_tools,用 %r 免得换行把日志劈成两行。
+                logger.warning(
+                    "mcp.binding_param_absent server=%s tool=%r params=%s",
+                    server_name,
+                    tool_def.name,
+                    absent,
+                )
+                for param in absent:
+                    del bound[param]
+            tool_def = replace(
+                tool_def, input_schema=strip_bound_params(tool_def.input_schema, bound)
+            )
         expert_work_tool = MCPTool(
             client=client,
             tool_def=tool_def,
@@ -977,7 +1018,11 @@ async def register_mcp_tools(
             content_char_cap=content_char_cap,
         )
         registry.register(expert_work_tool, deferred=deferred, source=f"mcp:{server_name}")
+        # 无条件调:空 ``bound`` 会清掉同名旧表项(见 ``bind_tool_args``)。
+        registry.bind_tool_args(expert_work_tool.spec.name, bound)
         registered.append(expert_work_tool.spec.name)
+    for tool_name in pending_bindings:
+        registry.note_unmatched_arg_binding(server_name, tool_name)
     logger.info("mcp.registered server=%s tools=%s", server_name, registered)
     return registered
 

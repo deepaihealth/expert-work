@@ -111,3 +111,9 @@ class BuiltAgent:
     #: bucket list and consumers fall back to the parent's rate.
     model_provider: str | None = None
     model_name: str | None = None
+    #: B-61 §5.4 —— 本次构建里一个工具都没匹配上的 MCP 参数绑定,
+    #: ``(server, 裸工具名)``。运行期没有消费者:它存在的唯一理由是保存时的试建
+    #: ——那一刻平台才同时握着绑定表和真实工具目录,当场就能告诉配置的人「这条
+    #: 绑定落空了」。落空的绑定不报出来就是静默失效:参数回到模型手里,模型继续
+    #: 手抄长串,正是本特性要消灭的故障。带默认值,存量构造点一处都不用改。
+    unmatched_arg_bindings: tuple[tuple[str, str], ...] = ()

@@ -37,6 +37,7 @@ from expert_work.runtime.tokens import default_estimator
 from orchestrator.errors import AgentFactoryError
 from orchestrator.multimodal import ImageResolver
 from orchestrator.tools.approval import AskForApprovalTool
+from orchestrator.tools.arg_bindings import bindings_by_tool
 from orchestrator.tools.artifact import ListArtifactsTool, SaveArtifactTool
 from orchestrator.tools.bash import BashTool
 from orchestrator.tools.file_ops import (
@@ -718,6 +719,7 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_by_tool(entry.arg_bindings, server=server_name),
             )
             # Platform reserves the server NAME unconditionally — even if
             # allow_tools filtered out all its tools this build — so a tenant
@@ -751,6 +753,7 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_by_tool(entry.arg_bindings, server=server_name),
             )
             registered_servers.add(server_name)
 
@@ -774,6 +777,7 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_by_tool(entry.arg_bindings, server=server_name),
             )
             registered_servers.add(server_name)
 
@@ -796,5 +800,14 @@ async def _register_mcp(registry: ToolRegistry, entry: MCPToolSpec, env: ToolEnv
                 registry=registry,
                 allow_tools=allow,
                 deferred=True,
+                arg_bindings=bindings_by_tool(entry.arg_bindings, server=server_name),
             )
             registered_servers.add(server_name)
+
+    # B-61 §5.4 —— 绑定指名的服务器这次一台都没挂上(名字写错,或对方暂时连不上)。
+    # 判在这里是因为四个池全轮完才知道答案:``register_mcp_tools`` 只看得见交给它
+    # 的那一台服务器的工具表,答不了「这台服务器在不在」。保存时的试建把它报成
+    # warning —— spec §5.4 明写不能做成拒绝,否则第三方一抖动就卡死保存。
+    for binding in entry.arg_bindings:
+        if binding.server not in registered_servers:
+            registry.note_unmatched_arg_binding(binding.server, binding.tool)

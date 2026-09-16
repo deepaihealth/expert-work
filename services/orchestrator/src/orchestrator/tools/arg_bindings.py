@@ -76,36 +76,74 @@ def strip_bound_params(input_schema: Mapping[str, Any], bound: Collection[str]) 
     自己的正确性负担,这里不做。退化行为与下面「形状不对」一致:参数仍被模型看见,但值照旧
     由 :func:`apply_arg_bindings` 用平台的覆盖,事故不会复发。
     """
-    properties = input_schema.get("properties")
-    required = input_schema.get("required")
-    # 缺键与显式 null 都按「这一侧没有」算:没有就没什么可剥的,不构成剥了一半。
-    props_ok = properties is None or isinstance(properties, Mapping)
-    # 只认 list(JSON 唯一产得出的形状)与 tuple(行为等价,返回成 list)。别的 Sequence
-    # 一律按「形状不对」走下面整份退回那条路:``str`` 逐字符、``bytes`` / ``bytearray``
-    # 逐字节(``required=b"pc"`` 会剥成 ``[112, 99]``)、``range`` 逐整数,拆出来全是垃圾;
-    # 更糟的是 ``name in req`` 拿 str 去比 bytes 会抛 ``TypeError`` —— 而下面那句注释
-    # 承诺的是「降级,不抛」。用白名单不用黑名单,免得下一个 Sequence 类型又漏进来。
-    req_ok = required is None or isinstance(required, list | tuple)
     out: dict[str, Any] = {k: _copy_json(v) for k, v in input_schema.items()}
+    sides = _top_level_params(input_schema)
     # 一侧「在,但形状不对」(第三方给的畸形 schema)→ 整份原样退回,**绝不剥一半**。
     # 半剥的产物 —— 参数从 properties 没了却还留在 required —— 会让一部分厂商判定整个
     # 工具非法,该 agent 的 MCP 工具于是整片失踪,比一个参数没剥掉严重得多。降级,不抛:
     # spec §5.4 要的是别阻断 run。而没剥掉还有第二道闸:填值那步照样覆盖模型给的值。
-    if not (props_ok and req_ok):
+    if sides is None:
         return out
-    props: Mapping[str, Any] = properties if isinstance(properties, Mapping) else {}
-    req: Sequence[Any] = required if required is not None else ()
+    props, req = sides
     # properties 与 required 两边都算。只看 properties 的话,一个只写在 required 里的
     # 被绑参数会留在 required 而 properties 里没有 —— 同样是上面那个 dangling-required。
     removed = {name for name in bound if name in props or name in req}
     if not removed:
         return out
     # out 里这两个已经是独立副本,直接筛出新的即可。
-    if properties is not None:
+    if input_schema.get("properties") is not None:
         out["properties"] = {k: v for k, v in out["properties"].items() if k not in removed}
-    if required is not None:
+    if input_schema.get("required") is not None:
         out["required"] = [name for name in out["required"] if name not in removed]
     return out
+
+
+def unbindable_params(input_schema: Mapping[str, Any], bound: Collection[str]) -> list[str]:
+    """``bound`` 里这份 schema **认不出**的参数名,按输入顺序。
+
+    接线层(``register_mcp_tools``)拿它把「上游改了接口、绑的参数已经没了」的
+    绑定项从下发给 ``tools_node`` 的表里摘掉。只记一条日志是不够的:留着的话填值
+    那步照样把它注入 args,而 ``additionalProperties: false`` 的服务端会把这次
+    **本来能跑的**调用整个硬拒 —— 比 spec §5.4 承诺的「按未命中处理」更糟。
+
+    判据与 :func:`strip_bound_params` 共用 :func:`_top_level_params`,必须逐字同义:
+    两边一旦分岔就会出现「剥掉了却还当它不存在」(参数已从模型的 schema 消失、绑定
+    却被摘掉 → 谁都填不了这个必填参数)或反过来的裂缝。
+
+    schema 形状不对时返回**空**(一个都不报缺):那时 :func:`strip_bound_params`
+    也是整份退回、绑定留着,值仍由 :func:`apply_arg_bindings` 用平台的覆盖。既然
+    不可判,就不拿它当「上游删了这个参数」的证据。
+    """
+    sides = _top_level_params(input_schema)
+    if sides is None:
+        return []
+    props, req = sides
+    return [name for name in bound if name not in props and name not in req]
+
+
+def _top_level_params(
+    input_schema: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Sequence[Any]] | None:
+    """顶层 ``properties`` / ``required`` 两侧,规整成 ``(props, req)``。
+
+    ``None`` 表示「这份 schema 不可判」(至少一侧在、但形状不对),与「一个参数都
+    没有」是两回事 —— 两个调用方对 ``None`` 的处置不同,各自有注释。
+    """
+    properties = input_schema.get("properties")
+    required = input_schema.get("required")
+    # 缺键与显式 null 都按「这一侧没有」算:没有就没什么可剥的,不构成剥了一半。
+    props_ok = properties is None or isinstance(properties, Mapping)
+    # 只认 list(JSON 唯一产得出的形状)与 tuple(行为等价,返回成 list)。别的 Sequence
+    # 一律按「形状不对」走整份退回那条路:``str`` 逐字符、``bytes`` / ``bytearray``
+    # 逐字节(``required=b"pc"`` 会剥成 ``[112, 99]``)、``range`` 逐整数,拆出来全是垃圾;
+    # 更糟的是 ``name in req`` 拿 str 去比 bytes 会抛 ``TypeError`` —— 而调用方那句注释
+    # 承诺的是「降级,不抛」。用白名单不用黑名单,免得下一个 Sequence 类型又漏进来。
+    req_ok = required is None or isinstance(required, list | tuple)
+    if not (props_ok and req_ok):
+        return None
+    props: Mapping[str, Any] = properties if isinstance(properties, Mapping) else {}
+    req: Sequence[Any] = required if required is not None else ()
+    return props, req
 
 
 def apply_arg_bindings(

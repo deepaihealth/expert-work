@@ -428,6 +428,15 @@ class ToolRegistry:
         #: Stream HX-12 — lazily-built BM25 corpus over the deferred pool;
         #: invalidated on every register (cheap: rebuilt on next search).
         self._ranking_corpus: list[tuple[str, list[str]]] | None = None
+        #: B-61 §5.3 — 平台接管的 MCP 工具参数:wire 名(``mcp__<server>__<tool>``)
+        #: → ``{参数名: 声明变量名}``。``tools_node`` 按 tool_call 里出现的那个名
+        #: 直接查这张表,所以键必须是折叠后的 wire 名(折叠规则只有
+        #: ``register_mcp_tools`` 那一处知道)。
+        self._arg_bindings: dict[str, dict[str, str]] = {}
+        #: B-61 §5.4 — 一个工具都没匹配上的绑定 ``(server, 裸工具名)``。运行期
+        #: 没有消费者:它只是随 ``BuiltAgent`` 走到保存时的试建,当场告诉配置的
+        #: 人「这条绑定没落到任何工具上」。
+        self._unmatched_arg_bindings: list[tuple[str, str]] = []
 
     def register(self, tool: Tool, *, deferred: bool = False, source: str | None = None) -> None:
         """Register a tool by its spec ``name``. Re-registering replaces.
@@ -501,6 +510,30 @@ class ToolRegistry:
             )
             for name, tool in self._tools.items()
         )
+
+    def bind_tool_args(self, name: str, bound: Mapping[str, str]) -> None:
+        """B-61 — 记下 ``name`` 这个工具被平台接管的参数(参数名 → 声明变量名)。
+
+        ``bound`` 为空表示「这个名字没有绑定」,连带**清掉**之前可能存在的那条:
+        ``register`` 按名字覆盖注册,wire 名又会被截断到 64 字符,两台服务器的
+        工具折叠成同一个名是可能的。留着旧表项就会让后来者顶着前者的绑定跑。
+        """
+        if bound:
+            self._arg_bindings[name] = dict(bound)
+        else:
+            self._arg_bindings.pop(name, None)
+
+    def arg_bindings(self) -> Mapping[str, Mapping[str, str]]:
+        """B-61 §5.3 — ``tools_node`` 填值时查的那张表。只读,别就地改。"""
+        return self._arg_bindings
+
+    def note_unmatched_arg_binding(self, server: str, tool: str) -> None:
+        """B-61 §5.4 — 这条绑定一个工具都没匹配上(名字写错 / 上游下线)。"""
+        self._unmatched_arg_bindings.append((server, tool))
+
+    def unmatched_arg_bindings(self) -> tuple[tuple[str, str], ...]:
+        """本次构建里没匹配上任何工具的绑定,``(server, 裸工具名)``。"""
+        return tuple(self._unmatched_arg_bindings)
 
     def deferred_specs(self, names: Iterable[str]) -> list[ToolSpec]:
         """Specs for the given ``names`` that are actually deferred.
