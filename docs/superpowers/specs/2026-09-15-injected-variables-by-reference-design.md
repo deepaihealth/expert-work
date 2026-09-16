@@ -90,7 +90,7 @@ agents/<agent_key>/inputs/cache/<sha256(url)[:32]><ext>
   "variables": {
     "project_code": {"value": "PRJ001", "trusted": true},
     "org_logo": {
-      "value": "https://deep-ai-health-test.oss-cn-hangzhou.aliyuncs.com/plan-generator/brand-logo/1789382970142-logo11.jpg",
+      "value": "https://files.example.com/brand/logo-1726394851207.jpg",
       "trusted": true,
       "local_path": "inputs/cache/9f2a4c1b7e0d3856a1f4c920b7d5e386.jpg"
     },
