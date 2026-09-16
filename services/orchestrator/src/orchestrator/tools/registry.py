@@ -487,6 +487,12 @@ class ToolRegistry:
         #: 试建(当场告诉配置的人),以及 ``tools_node`` 的运行期兜底告警 ——
         #: 保存之后对方才下线 / 改名的那条路上,运行期是唯一还能说话的地方。
         self._unmatched_arg_bindings: list[UnmatchedArgBinding] = []
+        #: B-61 §5.4(复评 N-1)— 真落在了某个已注册工具上的绑定,``(server, 裸
+        #: 工具名)``。「落没落地」只能等**所有** mcp 条目都注册完再回答:一份
+        #: manifest 可以有多个条目,绑定表是跨条目并起来的,而某个兄弟条目的
+        #: ``allow_tools`` 会把别人绑的那个工具挡在它那一次循环之外 —— 拿单次注册
+        #: 的剩余项当答案,就会对一条**好好落了**的绑定谎报「目录里没这个工具」。
+        self._landed_arg_bindings: set[tuple[str, str]] = set()
 
     def register(self, tool: Tool, *, deferred: bool = False, source: str | None = None) -> None:
         """Register a tool by its spec ``name``. Re-registering replaces.
@@ -598,6 +604,18 @@ class ToolRegistry:
     def unmatched_arg_bindings(self) -> tuple[UnmatchedArgBinding, ...]:
         """本次构建里落空的绑定(整条没匹配上的 + 参数漂移的)。"""
         return tuple(self._unmatched_arg_bindings)
+
+    def note_landed_arg_binding(self, server: str, tool: str) -> None:
+        """B-61 §5.4 — 这条绑定落在了一个真实注册的工具上。裸名,不折叠。"""
+        self._landed_arg_bindings.add((server, tool))
+
+    def landed_arg_bindings(self) -> frozenset[tuple[str, str]]:
+        """真落了地的绑定 ``(server, 裸工具名)``。
+
+        名字是**原始**的:折叠成 wire 名的规则只有 ``register_mcp_tools`` 一处知道
+        (裁定 X),判「落没落地」的那一侧不该学第二遍。
+        """
+        return frozenset(self._landed_arg_bindings)
 
     def deferred_specs(self, names: Iterable[str]) -> list[ToolSpec]:
         """Specs for the given ``names`` that are actually deferred.

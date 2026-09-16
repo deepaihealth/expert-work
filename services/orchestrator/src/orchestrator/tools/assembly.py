@@ -247,23 +247,23 @@ async def build_tool_registry(
         if isinstance(entry, MCPToolSpec)
         for binding in entry.arg_bindings
     ]
-    registered_mcp_servers: set[str] = set()
     for entry in tool_specs:
         if isinstance(entry, BuiltinToolSpec):
             _register_builtin(registry, entry, tool_env, skill_seed_files)
         elif isinstance(entry, HTTPToolSpec):
             _register_http(registry, tool_env)
         elif isinstance(entry, MCPToolSpec):
-            registered_mcp_servers |= await _register_mcp(
-                registry, entry, tool_env, all_arg_bindings
-            )
-    # B-61 §5.4 —— 绑定指名的服务器一台都没挂上(名字写错,或对方暂时连不上)。
-    # 判在**所有** mcp 条目都轮完之后:``register_mcp_tools`` 只看得见交给它的那
-    # 一台服务器的工具表,答不了「这台服务器在不在」;而单个条目也答不了 —— 另一
-    # 条目可能正好挂上了它。保存时的试建把它报成 warning,spec §5.4 明写不能做成
-    # 拒绝,否则第三方一抖动就卡死保存。
+            await _register_mcp(registry, entry, tool_env, all_arg_bindings)
+    # B-61 §5.4 —— 「这条绑定一个工具都没落上」只能在**所有** mcp 条目都注册完之后
+    # 回答,而且只能照 registry 的真实状态回答(复评 N-1)。单次注册答不了:
+    #   * 它只看得见交给它的那一台服务器的工具表,答不了「这台服务器在不在」;
+    #   * 兄弟条目的 ``allow_tools`` 会把别人绑的工具挡在它那一次循环之外,那条绑定
+    #     在它眼里像是「目录里没有」,其实另一条目刚把它绑得好好的。
+    # 谎报比不报更糟:保存时的告警是这套机制加进来的全部价值,配置的人会照着它去
+    # 「修」一条从来没坏的绑定。所以判据是「有没有落地」,不是「这一遍有没有剩下」。
+    landed = registry.landed_arg_bindings()
     for binding in all_arg_bindings:
-        if binding.server not in registered_mcp_servers:
+        if (binding.server, binding.tool) not in landed:
             registry.note_unmatched_arg_binding(
                 binding.server, binding.tool, tuple(binding.args), tool_found=False
             )
@@ -718,8 +718,8 @@ async def _register_mcp(
     entry: MCPToolSpec,
     env: ToolEnv,
     arg_bindings: Sequence[ArgBindingSpec] = (),
-) -> set[str]:
-    """Register this ``mcp`` entry's tools; return the server names it reached.
+) -> None:
+    """Register this ``mcp`` entry's tools.
 
     ``arg_bindings`` is the **whole manifest's** binding table, not just this
     entry's (review I-3): every ``mcp`` entry re-registers the servers it
@@ -727,8 +727,10 @@ async def _register_mcp(
     and re-bind the ones a sibling entry declared — otherwise it silently
     restores the un-narrowed schema and drops the binding.
 
-    The returned set is what the caller needs to decide, once all entries are
-    done, which bindings named a server that never showed up at all.
+    Which bindings fell through is NOT decided here (review N-1): registration
+    only records the ones that landed, and the caller answers the question once
+    every entry is done. This pass cannot answer it — a tool it filters out via
+    ``allow_tools`` may be bound perfectly well by the next one.
     """
     if (
         env.mcp_pool is None
@@ -850,5 +852,3 @@ async def _register_mcp(
                 arg_bindings=bindings_for.get(server_name),
             )
             registered_servers.add(server_name)
-
-    return registered_servers

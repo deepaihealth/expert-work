@@ -44,7 +44,6 @@ from orchestrator.tools import (
     RecordingMCPClient,
     ToolEnv,
     build_tool_registry,
-    register_mcp_tools,
 )
 from orchestrator.tools._child_run import _child_config
 from orchestrator.tools.registry import UnmatchedArgBinding
@@ -69,19 +68,27 @@ async def _build_registry(
     tools: Sequence[Mapping[str, Any]],
     arg_bindings: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[ToolRegistry, RecordingMCPClient]:
-    """按真正的注册路径建目录 —— wire 名折叠、schema 剥离都走生产代码。"""
+    """走**整条装配路径** —— wire 名折叠、剥 schema、落地判定全是生产代码。
+
+    不直接调 ``register_mcp_tools``:「这条绑定落空了没有」自复评 N-1 起就不在单次
+    注册里判了(单次注册答不了 —— 兄弟条目的 ``allow_tools`` 会把别人绑的工具挡在
+    它那一遍之外)。绕过 ``build_tool_registry`` 的夹具于是验不到真正的判定点。
+    """
     defs = tuple(_tool_def(t["name"], t["input_schema"]) for t in tools)
     client = RecordingMCPClient(
         tools=defs,
         responses={d.name: f"result of {d.name}" for d in defs},
     )
-    registry = ToolRegistry()
-    await register_mcp_tools(
-        server_name=_SERVER,
-        client=client,
-        registry=registry,
-        arg_bindings=arg_bindings,
+    pool = MCPServerPool()
+    await pool.add(_SERVER, client)
+    entry = MCPToolSpec(
+        servers=[_SERVER],
+        arg_bindings=[
+            ArgBindingSpec(server=_SERVER, tool=tool, args=dict(args))
+            for tool, args in (arg_bindings or {}).items()
+        ],
     )
+    registry = await build_tool_registry([entry], tool_env=ToolEnv(mcp_pool=pool))
     return registry, client
 
 
@@ -633,6 +640,68 @@ async def test_a_second_mcp_entry_does_not_wipe_the_first_ones_binding() -> None
         schema = registry.get_required(_WIRE).spec.parameters
         assert "project_code" not in (schema.get("properties") or {}), order
         assert registry.unmatched_arg_bindings() == (), order
+
+
+def _bound_entry(allow_tools: list[str]) -> MCPToolSpec:
+    return MCPToolSpec(
+        servers=[_SERVER],
+        allow_tools=allow_tools,
+        arg_bindings=[ArgBindingSpec(server=_SERVER, tool="t1", args={"project_code": "pc"})],
+    )
+
+
+async def _split_pool(*tool_names: str) -> MCPServerPool:
+    return await _pool(
+        **{
+            _SERVER: [
+                MCPToolDef(
+                    name=n, description="", input_schema={"properties": {"project_code": {}}}
+                )
+                for n in tool_names
+            ]
+        }
+    )
+
+
+async def test_a_sibling_entrys_allow_tools_does_not_fake_an_unmatched_binding() -> None:
+    """复评 N-1 —— 并表之后,「落没落地」不能再按单次注册的剩余项判。
+
+    条目 A 绑 ``t1`` 且 ``allow_tools`` 只要 ``t1``;兄弟条目 B 只要 ``t2``。
+    B 那一遍里 ``t1`` 被 ``allow_tools`` 挡在循环之外、从没被 pop —— 按那一遍的
+    剩余项判就成了「目录里没有 t1」。而 ``t1`` 的绑定和剥过的 schema 其实都好好的。
+
+    这条假警报会让保存时的告警对配置的人说谎、运行期每轮喊一次狼来了。这套机制
+    加进来的全部价值就是那一条信号:会说假话的信号比没有信号更糟 —— 人会去「修」
+    一条从来没坏的绑定。
+    """
+    other = MCPToolSpec(servers=[_SERVER], allow_tools=["t2"])
+    for order in ([_bound_entry(["t1"]), other], [other, _bound_entry(["t1"])]):
+        registry = await build_tool_registry(
+            list(order), tool_env=ToolEnv(mcp_pool=await _split_pool("t1", "t2"))
+        )
+        assert registry.unmatched_arg_bindings() == (), order
+        assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}, order
+        schema = registry.get_required(_WIRE).spec.parameters
+        assert "project_code" not in (schema.get("properties") or {}), order
+
+
+async def test_a_genuine_miss_is_still_reported_when_entries_are_split() -> None:
+    """反向 —— 别把「狼来了」修成「狼来了不报」。
+
+    同一份分家 manifest,只是服务器**真的**没有 ``t1``(名字写错 / 上游下线)。
+    两种条目顺序都必须照报。
+    """
+    other = MCPToolSpec(servers=[_SERVER], allow_tools=["t2"])
+    for order in ([_bound_entry(["t1"]), other], [other, _bound_entry(["t1"])]):
+        registry = await build_tool_registry(
+            list(order), tool_env=ToolEnv(mcp_pool=await _split_pool("t2"))
+        )
+        assert registry.unmatched_arg_bindings() == (
+            UnmatchedArgBinding(
+                server=_SERVER, tool="t1", params=("project_code",), tool_found=False
+            ),
+        ), order
+        assert registry.arg_bindings() == {}, order
 
 
 async def test_a_wire_name_collision_still_clears_the_loser_binding() -> None:

@@ -134,6 +134,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
+from orchestrator.tools.registry import UnmatchedArgBinding
 
 logger = logging.getLogger("expert_work.control_plane.agents")
 
@@ -1065,7 +1066,7 @@ def _unmatched_binding_warning(built: Any) -> str | None:
     )
 
 
-def _binding_label(unmatched: Any) -> str:
+def _binding_label(unmatched: UnmatchedArgBinding) -> str:
     """``server/tool (param, param)`` —— 只有名字,一个值都不带。"""
     return f"{unmatched.server}/{unmatched.tool} ({', '.join(unmatched.params)})"
 

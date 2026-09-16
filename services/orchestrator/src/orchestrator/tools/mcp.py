@@ -987,9 +987,13 @@ async def register_mcp_tools(
     * a bound parameter this tool's advertised schema does not have → dropped
       from the binding (so the platform never injects a parameter the server
       would reject) plus an ``mcp.binding_param_absent`` warning;
-    * a binding naming a tool this server does not advertise → recorded via
-      ``ToolRegistry.note_unmatched_arg_binding``, which the save-time dry-run
-      build turns into a warning for whoever configured it.
+    * a binding naming a tool this server does not advertise → simply never
+      lands. This function only records the bindings that DID land
+      (``ToolRegistry.note_landed_arg_binding``); which ones fell through is
+      decided once, after every ``mcp`` entry has registered, by
+      ``build_tool_registry`` — a sibling entry's ``allow_tools`` can hide a
+      tool from THIS pass while another pass binds it just fine, so a single
+      pass's leftovers are not evidence of anything (review N-1).
 
     Returns the namespaced names registered, useful for audit
     attribution at orchestrator startup.
@@ -1004,6 +1008,12 @@ async def register_mcp_tools(
         bound = pending_bindings.pop(tool_def.name, None) or {}
         dispatch_schema: Mapping[str, Any] | None = None
         if bound:
+            # 这条绑定确实落在一个真实工具上。只登记「落了」,不在这里判「没落」——
+            # 一份 manifest 可以有多个 mcp 条目,绑定表是跨条目并起来的,兄弟条目的
+            # ``allow_tools`` 会把别人绑的工具挡在它那一次循环之外。拿单次注册的剩余
+            # 项当「目录里没这个工具」的证据,就会对一条好好落了的绑定谎报(复评 N-1)。
+            # 答案只有在所有条目都轮完之后才成立,判在 ``build_tool_registry`` 里。
+            registry.note_landed_arg_binding(server_name, tool_def.name)
             absent = unbindable_params(tool_def.input_schema, bound)
             if absent:
                 # 上游改了接口,绑定指向一个不存在的参数。不阻断 run:这个 agent
@@ -1039,10 +1049,6 @@ async def register_mcp_tools(
         # 无条件调:空 ``bound`` 会清掉同名旧表项(见 ``bind_tool_args``)。
         registry.bind_tool_args(expert_work_tool.spec.name, bound)
         registered.append(expert_work_tool.spec.name)
-    for tool_name, unmatched_args in pending_bindings.items():
-        registry.note_unmatched_arg_binding(
-            server_name, tool_name, tuple(unmatched_args), tool_found=False
-        )
     logger.info("mcp.registered server=%s tools=%s", server_name, registered)
     return registered
 
