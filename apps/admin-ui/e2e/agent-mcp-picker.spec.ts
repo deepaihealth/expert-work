@@ -294,3 +294,76 @@ test("(c) MCP per-parameter binding editor passes axe (serious + critical)", asy
 
   await expectNoA11yViolations(page, "create-agent-modal-mcp-bindings");
 });
+
+// B-61 修复轮 2 / N1 —— 复评是在真浏览器里逮到这条的:声明变量 → 绑参数 →
+// 点一下 Jinja 开关,提交的 manifest_yaml 就带着 arg_bindings 却没有 variables,
+// 喂给真的协议层校验器直接 REJECTED。jsdom 那几条钉的是写入器,这一条钉的是
+// **真的提交出去的那份 YAML**,也就是复评当时的原始复现路径。
+test("(d) turning Jinja off never submits bindings without variables", async ({
+  page,
+}) => {
+  await page.getByTestId("agents-create").click();
+  await expect(page.getByTestId("manifest-form-view")).toBeVisible();
+
+  const nameInput = page.getByTestId("af-name").locator("input");
+  await nameInput.clear();
+  await nameInput.fill("jinja-off-agent");
+
+  // 声明变量。
+  await page.getByTestId("cfg-nav-prompt").click();
+  await page.getByTestId("af-prompt-jinja").click();
+  await page.getByTestId("af-prompt-var-add").click();
+  await page.getByTestId("af-prompt-var-name-0").fill("project_code");
+
+  // 把 create_issue.repo 绑到它。
+  await page.getByTestId("cfg-nav-capabilities").click();
+  await page.getByRole("tab", { name: "MCP" }).click();
+  await page.getByTestId("af-mcp-server-github").click();
+  await page.getByTestId("af-mcp-choose-github").click();
+  // 勾上工具本身,这样下面还能验「allow_tools 也没被牵连」。
+  await expect(page.getByTestId("af-mcp-tool-create_issue")).toBeVisible();
+  await page.getByTestId("af-mcp-tool-create_issue").click();
+  await page.getByTestId("af-mcp-bind-toggle-create_issue").click();
+  // 真浏览器里带 id 的是 antd Select 内部那个 readonly input,点不动 ——
+  // 点外面的 .ant-select 容器(jsdom 里事件会冒泡,真浏览器里不会)。
+  await page
+    .getByTestId("af-mcp-bind-row-create_issue-repo")
+    .locator(".ant-select")
+    .click();
+  // 选项在 DOM 里出现两遍(可点的 item + 隐藏的 ARIA 镜像)—— 认可点的那个,
+  // 与仓库里 vitest 侧同一个判据(.ant-select-item-option-content)。
+  await page
+    .locator(".ant-select-dropdown:not(.ant-select-dropdown-hidden)")
+    .locator(".ant-select-item-option-content", { hasText: /^project_code$/ })
+    .click();
+  await page
+    .getByTestId("af-mcp-tool-modal")
+    .getByRole("button", { name: /完成|Done/ })
+    .click();
+
+  // 回提示词页关掉 Jinja —— 复评当时这一下零提示就产出了孤儿。
+  await page.getByTestId("cfg-nav-prompt").click();
+  await page.getByTestId("af-prompt-jinja").click();
+  // 现在必须先问,而且说清会删掉几条。
+  const confirm = page.locator(".ant-modal-confirm");
+  await expect(confirm).toBeVisible();
+  await expect(confirm.getByRole("listitem")).toHaveCount(1);
+  await confirm.getByRole("button", { name: /关掉并删除|Turn off and delete/ }).click();
+  await expect(confirm).toBeHidden();
+
+  const postPromise = page.waitForRequest(
+    (req) => req.method() === "POST" && req.url().includes("/v1/agents"),
+  );
+  await page.getByTestId("create-agent-submit").click();
+  const yaml = (
+    (await postPromise).postDataJSON() as { manifest_yaml: string }
+  ).manifest_yaml;
+
+  // 这就是复评喂给 AgentSpec.model_validate 的那份东西:不能再出现
+  // 「有 arg_bindings、没有 variables」。
+  expect(yaml).not.toContain("arg_bindings");
+  expect(yaml).not.toContain("project_code");
+  // MCP 那一侧的选择本身不受牵连。
+  expect(yaml).toContain("type: mcp");
+  expect(yaml).toContain("create_issue");
+});

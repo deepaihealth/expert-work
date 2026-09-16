@@ -632,11 +632,50 @@ export function bindingsUsingVariable(m: unknown, name: string): BindingUse[] {
 export const readPromptVariables = (m: unknown): PromptVariableFields[] =>
   specOf(m).system_prompt?.variables ?? [];
 
+/**
+ * Drop every MCP ``arg_bindings`` entry. Only used when the declared-variable
+ * block itself goes away — see ``setPromptJinja``.
+ *
+ * Returns the manifest untouched when there is nothing bound, so a manifest
+ * with no ``tools`` never grows an empty ``tools: []``.
+ */
+function dropAllArgBindings(m: unknown): AgentManifest {
+  const tools = specOf(m).tools ?? [];
+  const bound = tools.some(
+    (t) => t.type === "mcp" && (t.arg_bindings?.length ?? 0) > 0,
+  );
+  if (!bound) return patchSpec(m, {});
+  return patchSpec(m, {
+    tools: tools.map((t) => {
+      if (t.type !== "mcp") return t;
+      const { arg_bindings: _dropped, ...rest } = t;
+      return rest;
+    }),
+  });
+}
+
+/**
+ * Turn Jinja mode on/off.
+ *
+ * ``off`` drops ``jinja`` AND the whole ``variables`` block — and therefore has
+ * to drop ``arg_bindings`` with it (B-61). Every binding names a declared
+ * variable; with the declarations gone, every single one of them is an orphan,
+ * and ``AgentSpecBody._check_arg_bindings`` rule (4) REJECTS the save outright:
+ * "'x' is not a declared prompt variable". Keeping the bindings would not be
+ * "preserving the operator's config", it would be handing them a manifest the
+ * API refuses, with nothing on screen explaining why.
+ *
+ * The clearing lives HERE, in the writer, not in the editor that happens to own
+ * the switch: a disabled control is an affordance, not an invariant. Any caller
+ * that turns Jinja off — this editor, a future one, a story — gets a manifest
+ * that still validates. Warning the operator first is the editor's job (it is
+ * the only layer that can ask); making the result correct is this one's.
+ */
 export function setPromptJinja(m: unknown, on: boolean): AgentManifest {
   const sp = specOf(m).system_prompt ?? {};
   if (on) return patchSpec(m, { system_prompt: { ...sp, jinja: true } });
   const { jinja: _j, variables: _v, ...rest } = sp;
-  return patchSpec(m, { system_prompt: rest });
+  return dropAllArgBindings(patchSpec(m, { system_prompt: rest }));
 }
 
 export function setPromptVariables(

@@ -921,6 +921,42 @@ describe("form_model — dynamic prompt (jinja + variables)", () => {
     expect(off.spec?.system_prompt?.template).toBe("You are helpful.");
   });
 
+  // B-61 修复轮 2 / N1 —— off 丢掉 variables 整块,于是每一条 arg_bindings 都成了
+  // 孤儿(规则 4:绑定必须指向已声明的变量),协议层直接拒收。清理必须在写入器里,
+  // 不能靠某个调用点记得先问:任何调用方关掉 jinja,拿到的都得是一份还能过校验的
+  // manifest。断言判的是「有没有产出孤儿」,不是「弹没弹框」。
+  it("disabling jinja also clears arg_bindings — no orphan can survive it", () => {
+    const on = setMcp(
+      setPromptVariables(setPromptJinja(seed, true), [{ name: "project_code" }]),
+      ["deepcare"],
+      ["customer_search"],
+      [
+        {
+          server: "deepcare",
+          tool: "customer_search",
+          args: { project_code: "project_code" },
+        },
+      ],
+    );
+    expect(readTools(on).mcpArgBindings).toHaveLength(1);
+
+    const off = setPromptJinja(on, false);
+    expect(off.spec?.system_prompt?.variables).toBeUndefined();
+    expect(readTools(off).mcpArgBindings).toEqual([]);
+    // 清的是绑定,不是整条 mcp 条目 —— 服务器/工具选择照旧。
+    expect(readTools(off).mcpServers).toEqual(["deepcare"]);
+    expect(readTools(off).mcpAllowTools).toEqual(["customer_search"]);
+    // key 删掉而不是留个空数组(与后端 _omit_empty_arg_bindings 同口径)。
+    const entry = (off.spec?.tools ?? []).find((t) => t.type === "mcp");
+    expect(entry !== undefined && "arg_bindings" in entry).toBe(false);
+  });
+
+  it("disabling jinja on a manifest with no tools does not grow an empty tools list", () => {
+    const on = setPromptVariables(setPromptJinja(seed, true), [{ name: "a" }]);
+    const off = setPromptJinja(on, false);
+    expect(off.spec?.tools).toBeUndefined();
+  });
+
   it("writes variable rows verbatim and reads them back", () => {
     const m = setPromptVariables(setPromptJinja(seed, true), [
       { name: "persona", trusted: true, required: true },

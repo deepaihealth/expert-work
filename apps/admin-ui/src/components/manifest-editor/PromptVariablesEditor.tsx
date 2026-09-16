@@ -6,13 +6,22 @@
  * or is spotlight-fenced as DATA (default trusted — an owner-set posture).
  * Every control emits the FULL merged manifest via the form_model writers.
  *
- * B-61 — a variable an MCP tool parameter is BOUND to may be neither removed
- * nor renamed here. Either one leaves the binding pointing at a name
- * ``system_prompt.variables`` no longer declares, which the protocol layer
- * REJECTS (``_check_arg_bindings`` rule 4) — so the operator gets a 422 they
- * cannot explain from anything on screen, while the MCP tab happily renders the
- * orphaned name as if it were a real choice. Renaming is the worse of the two
- * because it does not feel destructive at all.
+ * B-61 — three ways out of this editor can orphan an MCP ``arg_bindings``
+ * entry, i.e. leave it naming something ``system_prompt.variables`` no longer
+ * declares. ``_check_arg_bindings`` rule (4) REJECTS such a manifest outright,
+ * so the operator gets a 422 nothing on screen explains, while the MCP tab
+ * happily renders the orphaned name as if it were a real choice:
+ *
+ *   removeVar  — delete the variable          → refuse, and say who uses it
+ *   patchVar   — RENAME it (feels harmless)   → refuse the name change
+ *   jinja off  — drops the whole block at once → confirm, then clear with it
+ *
+ * Each guard sits on the WRITE PATH, never on the control. ``disabled`` is an
+ * affordance — it tells a person not to bother — and it only suppresses events
+ * the browser itself dispatches; a programmatic value set still reaches React's
+ * onChange. When an affordance fails the worst outcome should be an ugly UI,
+ * never an invalid manifest, so the invariant is held one layer down: by these
+ * handlers, and for the Jinja switch by ``setPromptJinja`` itself.
  *
  * This is prevention, not validation: the backend stays the authority (YAML,
  * ``PUT …/draft`` and template copies all bypass this editor). The job here is
@@ -20,12 +29,13 @@
  * picker's drop-confirm, and the same shape of message (a count plus the list).
  */
 import { useRef, type CSSProperties, type ReactNode } from "react";
-import { App, Button, Input, Switch, Tooltip, Typography } from "antd";
+import { App, Button, Input, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { FieldHelp } from "../FieldHelp";
 import {
   bindingsUsingVariable,
+  type BindingUse,
   readPromptJinja,
   readPromptVariables,
   setPromptJinja,
@@ -61,11 +71,65 @@ export function PromptVariablesEditor({
   const boundUses = (row: PromptVariableFields) =>
     bindingsUsingVariable(formData, row.name ?? "");
 
+  /** 列出「哪个服务器的哪个工具的哪个参数」—— 两台服务器上的同名工具不能渲染
+   *  成一模一样的两行。 */
+  const renderUses = (uses: BindingUse[]) => (
+    <ul style={{ margin: "0 0 8px", paddingLeft: 18 }}>
+      {uses.map((use) => (
+        <li key={`${use.server}/${use.tool}/${use.param}`}>
+          {t("agent_form.prompt_var_remove_blocked_item", {
+            server: use.server,
+            tool: use.tool,
+            param: use.param,
+          })}
+        </li>
+      ))}
+    </ul>
+  );
+
   const patchVar = (i: number, patch: Partial<PromptVariableFields>): void => {
+    // 改名要在**写入口**拦,不能只靠输入框的 disabled:disabled 只压住浏览器
+    // 自己派发的交互事件,程序化赋值(扩展、密码管理器、devtools:native setter
+    // + dispatchEvent("input"))照样走到 React 的 onChange。trusted / required /
+    // 说明这些字段动了不会造成孤儿,照常放行 —— 只挡 name。
+    if (patch.name !== undefined && boundUses(variables[i]).length > 0) return;
     const next = variables.map((row, idx) =>
       idx === i ? { ...row, ...patch } : row,
     );
     onChange(setPromptVariables(formData, next));
+  };
+
+  /**
+   * 关掉 Jinja = 把整个 variables 块删掉,于是**每一条**绑定都成孤儿。
+   *
+   * 这里是确认不是拒绝:关掉动态提示词是用户的真实意图(和「取消勾最后一个 MCP
+   * 服务器 = 关掉 MCP」完全同构),连带清掉绑定是符合预期的语义。要挡的不是这个
+   * 决定,而是「看不见的东西被无声删掉」—— 所以照 T8 那条追加要求的口径:报出
+   * 会同时删掉几条、逐条列出来。
+   *
+   * 清理本身在 ``setPromptJinja`` 里做,不在这个回调里:走到这一步的不只这一个
+   * 开关,而不变式不该由某个调用点的自觉来守。
+   */
+  const toggleJinja = (on: boolean): void => {
+    const uses = variables.flatMap(boundUses);
+    if (on || uses.length === 0) {
+      onChange(setPromptJinja(formData, on));
+      return;
+    }
+    modal.confirm({
+      title: t("agent_form.prompt_jinja_off_title", { count: uses.length }),
+      okText: t("agent_form.prompt_jinja_off_ok"),
+      cancelText: t("agent_form.prompt_jinja_off_cancel"),
+      content: (
+        <div>
+          {renderUses(uses)}
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {t("agent_form.prompt_jinja_off_hint")}
+          </Text>
+        </div>
+      ),
+      onOk: () => onChange(setPromptJinja(formData, false)),
+    });
   };
   const addVar = (): void => {
     const nextIndex = variables.length;
@@ -100,16 +164,7 @@ export function PromptVariablesEditor({
         okText: t("agent_form.prompt_var_remove_blocked_ok"),
         content: (
           <div>
-            <ul style={{ margin: "0 0 8px", paddingLeft: 18 }}>
-              {uses.map((use) => (
-                <li key={`${use.server}/${use.tool}/${use.param}`}>
-                  {t("agent_form.prompt_var_remove_blocked_item", {
-                    tool: use.tool,
-                    param: use.param,
-                  })}
-                </li>
-              ))}
-            </ul>
+            {renderUses(uses)}
             <Text type="secondary" style={{ fontSize: 12 }}>
               {t("agent_form.prompt_var_remove_blocked_hint")}
             </Text>
@@ -147,7 +202,7 @@ export function PromptVariablesEditor({
           checked={jinja}
           data-testid="af-prompt-jinja"
           aria-label={t("agent_form.prompt_jinja_label")}
-          onChange={(on) => onChange(setPromptJinja(formData, on))}
+          onChange={toggleJinja}
         />
         <Text>{t("agent_form.prompt_jinja_label")}</Text>
       </div>
@@ -186,25 +241,25 @@ export function PromptVariablesEditor({
                 alignItems: "center",
               }}
             >
-              {/* 改名会把绑定指到一个不存在的名字上,而删除至少还有个按钮可以
-                  当场答复 —— 输入框没法「答复」一次击键,只能不让它改。锁上的
-                  理由就在旁边那行小字里,不是一个没有解释的灰框。 */}
-              <Tooltip title={uses.length > 0 ? t("agent_form.prompt_var_bound_locked") : ""}>
-                <Input
-                  style={{ width: 160 }}
-                  value={row.name ?? ""}
-                  disabled={uses.length > 0}
-                  data-testid={`af-prompt-var-name-${i}`}
-                  aria-label={t("agent_form.prompt_var_name")}
-                  placeholder={t("agent_form.prompt_var_name")}
-                  onChange={(e) => patchVar(i, { name: e.target.value })}
-                />
-              </Tooltip>
+              {/* 真正拦住改名的是 patchVar;这里的 disabled 只是告诉人别白费劲。 */}
+              <Input
+                style={{ width: 160 }}
+                value={row.name ?? ""}
+                disabled={uses.length > 0}
+                data-testid={`af-prompt-var-name-${i}`}
+                aria-label={t("agent_form.prompt_var_name")}
+                placeholder={t("agent_form.prompt_var_name")}
+                onChange={(e) => patchVar(i, { name: e.target.value })}
+              />
               {uses.length > 0 && (
+                // 「为什么锁着」和「怎么解锁」都写在这行常驻小字里,不放 Tooltip:
+                // 这个 Input 渲染出来是裸 <input disabled>,而 Chromium 不给
+                // disabled 表单控件派 mouseenter、antd v5 也没有 v4 那个
+                // disabled 子元素兼容层 —— 挂上去的提示一辈子不出现。
                 <Text
                   type="secondary"
                   data-testid={`af-prompt-var-bound-${i}`}
-                  style={{ fontSize: 12, whiteSpace: "nowrap" }}
+                  style={{ fontSize: 12 }}
                 >
                   {t("agent_form.prompt_var_bound_note", { count: uses.length })}
                 </Text>

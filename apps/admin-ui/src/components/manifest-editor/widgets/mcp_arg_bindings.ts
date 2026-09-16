@@ -65,8 +65,12 @@ export function paramsOf(tool: McpTool): ToolParam[] {
  *
  * It is not a nicety: ``AgentSpecBody._check_arg_bindings`` REJECTS the save
  * outright (``raise ValueError``, not a warning) when a binding falls outside
- * the entry it lives in. The backend's two clauses, verbatim
- * (``agent_spec.py:1481`` / ``:1488``):
+ * the entry it lives in. The backend's two clauses, verbatim — quoted rather
+ * than cited by line number on purpose: the previous revision of this comment
+ * said :1481/:1488 and the real lines had already moved to :1480/:1487, so the
+ * pointer was wrong within one review cycle. Grep the text instead; it is
+ * inside ``AgentSpecBody._check_arg_bindings`` in
+ * ``packages/expert-work-protocol/.../protocol/agent_spec.py``:
  *
  *     if entry.servers and binding.server not in entry.servers: ...
  *     if entry.allow_tools and binding.tool not in entry.allow_tools: ...

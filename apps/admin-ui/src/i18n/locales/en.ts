@@ -1177,12 +1177,16 @@ export interface TranslationKeys {
     prompt_var_remove: string;
     prompt_var_bound_note_one: string;
     prompt_var_bound_note_other: string;
-    prompt_var_bound_locked: string;
     prompt_var_remove_blocked_one: string;
     prompt_var_remove_blocked_other: string;
     prompt_var_remove_blocked_item: string;
     prompt_var_remove_blocked_hint: string;
     prompt_var_remove_blocked_ok: string;
+    prompt_jinja_off_title_one: string;
+    prompt_jinja_off_title_other: string;
+    prompt_jinja_off_hint: string;
+    prompt_jinja_off_ok: string;
+    prompt_jinja_off_cancel: string;
     prompt_var_add: string;
     prompt_expand: string;
     prompt_expand_title: string;
@@ -4486,18 +4490,25 @@ const en: TranslationKeys = {
     prompt_var_required: "Required",
     prompt_var_description: "Description",
     prompt_var_remove: "Remove",
-    prompt_var_bound_note_one: "1 tool parameter is bound to it",
-    prompt_var_bound_note_other: "{{count}} tool parameters are bound to it",
-    prompt_var_bound_locked:
-      "A variable that tool parameters are bound to cannot be renamed. Set those parameters back to \"Auto (model fills it in)\" under Tools → MCP first.",
+    prompt_var_bound_note_one:
+      "1 tool parameter is bound to it, so it cannot be renamed or removed — set it back to \"Auto (model fills it in)\" under Tools → MCP first.",
+    prompt_var_bound_note_other:
+      "{{count}} tool parameters are bound to it, so it cannot be renamed or removed — set them back to \"Auto (model fills it in)\" under Tools → MCP first.",
     prompt_var_remove_blocked_one:
       "1 tool parameter is still bound to this variable, so it cannot be removed",
     prompt_var_remove_blocked_other:
       "{{count}} tool parameters are still bound to this variable, so it cannot be removed",
-    prompt_var_remove_blocked_item: "{{param}} on {{tool}}",
+    prompt_var_remove_blocked_item: "{{param}} on {{server}} / {{tool}}",
     prompt_var_remove_blocked_hint:
       "Set those parameters back to \"Auto (model fills it in)\" under Tools → MCP, then come back and remove the variable.",
     prompt_var_remove_blocked_ok: "Got it",
+    prompt_jinja_off_title_one: "Turning this off also deletes 1 bound parameter",
+    prompt_jinja_off_title_other:
+      "Turning this off also deletes {{count}} bound parameters",
+    prompt_jinja_off_hint:
+      "Turning off the dynamic prompt removes the declared variables entirely, so tool parameters bound to them have nothing left to point at and go too. Afterwards the model fills those parameters in itself.",
+    prompt_jinja_off_ok: "Turn off and delete",
+    prompt_jinja_off_cancel: "Cancel",
     prompt_var_add: "Add variable",
     prompt_expand: "Expand",
     prompt_expand_title: "System prompt — fullscreen editor",

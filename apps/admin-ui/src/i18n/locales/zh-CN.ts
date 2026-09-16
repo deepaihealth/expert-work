@@ -1258,15 +1258,22 @@ const zhCN: TranslationKeys = {
     prompt_var_remove: "删除",
     // B-61 —— 变量被工具参数绑着时,删不得也改不得名(会留下一条指向不存在
     // 变量的绑定,保存被协议层直接拒)。
-    prompt_var_bound_note_one: "1 个工具参数绑着它",
-    prompt_var_bound_note_other: "{{count}} 个工具参数绑着它",
-    prompt_var_bound_locked: "被工具参数绑着的变量不能改名。先到「工具」→「MCP」里把这些参数改回「自动（模型填）」。",
+    prompt_var_bound_note_one:
+      "1 个工具参数绑着它,不能改名或删除 —— 先到「工具」→「MCP」里把它改回「自动（模型填）」。",
+    prompt_var_bound_note_other:
+      "{{count}} 个工具参数绑着它,不能改名或删除 —— 先到「工具」→「MCP」里把它们改回「自动（模型填）」。",
     prompt_var_remove_blocked_one: "这个变量还有 1 个工具参数绑着,不能删",
     prompt_var_remove_blocked_other: "这个变量还有 {{count}} 个工具参数绑着,不能删",
-    prompt_var_remove_blocked_item: "{{tool}} 的 {{param}}",
+    prompt_var_remove_blocked_item: "{{server}} / {{tool}} 的 {{param}}",
     prompt_var_remove_blocked_hint:
       "到「工具」→「MCP」里把这些参数改回「自动（模型填）」,再回来删这个变量。",
     prompt_var_remove_blocked_ok: "知道了",
+    prompt_jinja_off_title_one: "关掉后会同时删掉 1 条参数绑定",
+    prompt_jinja_off_title_other: "关掉后会同时删掉 {{count}} 条参数绑定",
+    prompt_jinja_off_hint:
+      "关掉动态提示词会把声明的变量整块删掉,绑在这些变量上的工具参数也就没了着落,只能一起删。删掉之后,这些参数改回由模型自己填。",
+    prompt_jinja_off_ok: "关掉并删除",
+    prompt_jinja_off_cancel: "取消",
     prompt_var_add: "添加变量",
     prompt_expand: "全屏编辑",
     prompt_expand_title: "系统提示词 —— 全屏编辑",
