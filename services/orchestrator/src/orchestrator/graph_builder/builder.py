@@ -1298,9 +1298,11 @@ def build_react_graph(
             configurable_now = config.get("configurable") or {}
             prompt_inputs = configurable_now.get(PROMPT_INPUTS_KEY) or {}
             filled: list[dict[str, Any]] = []
-            for index, call in enumerate(tool_calls):
+            # 变量名不叫 ``call``:函数下面的 ``for call, result in zip(stage, ...)``
+            # 绑的是 ``_ScheduledCall``,同名会让类型检查把两者并成一个。
+            for index, raw_call in enumerate(tool_calls):
                 (one_call,), names = apply_arg_bindings(
-                    [call], bindings=registry_bindings, inputs=prompt_inputs
+                    [raw_call], bindings=registry_bindings, inputs=prompt_inputs
                 )
                 filled.append(one_call)
                 if names:
