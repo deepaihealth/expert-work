@@ -1175,6 +1175,14 @@ export interface TranslationKeys {
     prompt_var_required: string;
     prompt_var_description: string;
     prompt_var_remove: string;
+    prompt_var_bound_note_one: string;
+    prompt_var_bound_note_other: string;
+    prompt_var_bound_locked: string;
+    prompt_var_remove_blocked_one: string;
+    prompt_var_remove_blocked_other: string;
+    prompt_var_remove_blocked_item: string;
+    prompt_var_remove_blocked_hint: string;
+    prompt_var_remove_blocked_ok: string;
     prompt_var_add: string;
     prompt_expand: string;
     prompt_expand_title: string;
@@ -4478,6 +4486,18 @@ const en: TranslationKeys = {
     prompt_var_required: "Required",
     prompt_var_description: "Description",
     prompt_var_remove: "Remove",
+    prompt_var_bound_note_one: "1 tool parameter is bound to it",
+    prompt_var_bound_note_other: "{{count}} tool parameters are bound to it",
+    prompt_var_bound_locked:
+      "A variable that tool parameters are bound to cannot be renamed. Set those parameters back to \"Auto (model fills it in)\" under Tools → MCP first.",
+    prompt_var_remove_blocked_one:
+      "1 tool parameter is still bound to this variable, so it cannot be removed",
+    prompt_var_remove_blocked_other:
+      "{{count}} tool parameters are still bound to this variable, so it cannot be removed",
+    prompt_var_remove_blocked_item: "{{param}} on {{tool}}",
+    prompt_var_remove_blocked_hint:
+      "Set those parameters back to \"Auto (model fills it in)\" under Tools → MCP, then come back and remove the variable.",
+    prompt_var_remove_blocked_ok: "Got it",
     prompt_var_add: "Add variable",
     prompt_expand: "Expand",
     prompt_expand_title: "System prompt — fullscreen editor",

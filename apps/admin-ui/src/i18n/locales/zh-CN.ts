@@ -1256,6 +1256,17 @@ const zhCN: TranslationKeys = {
     prompt_var_required: "必填",
     prompt_var_description: "说明",
     prompt_var_remove: "删除",
+    // B-61 —— 变量被工具参数绑着时,删不得也改不得名(会留下一条指向不存在
+    // 变量的绑定,保存被协议层直接拒)。
+    prompt_var_bound_note_one: "1 个工具参数绑着它",
+    prompt_var_bound_note_other: "{{count}} 个工具参数绑着它",
+    prompt_var_bound_locked: "被工具参数绑着的变量不能改名。先到「工具」→「MCP」里把这些参数改回「自动（模型填）」。",
+    prompt_var_remove_blocked_one: "这个变量还有 1 个工具参数绑着,不能删",
+    prompt_var_remove_blocked_other: "这个变量还有 {{count}} 个工具参数绑着,不能删",
+    prompt_var_remove_blocked_item: "{{tool}} 的 {{param}}",
+    prompt_var_remove_blocked_hint:
+      "到「工具」→「MCP」里把这些参数改回「自动（模型填）」,再回来删这个变量。",
+    prompt_var_remove_blocked_ok: "知道了",
     prompt_var_add: "添加变量",
     prompt_expand: "全屏编辑",
     prompt_expand_title: "系统提示词 —— 全屏编辑",

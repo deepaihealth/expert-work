@@ -599,6 +599,36 @@ export function setSystemPrompt(m: unknown, template: string): AgentManifest {
 export const readPromptJinja = (m: unknown): boolean =>
   specOf(m).system_prompt?.jinja === true;
 
+/** One tool parameter that is bound to a declared prompt variable. */
+export interface BindingUse {
+  server: string;
+  tool: string;
+  param: string;
+}
+
+/**
+ * Which tool parameters are bound to the declared variable ``name`` (B-61).
+ *
+ * The variables editor needs this to stop the operator deleting or renaming a
+ * variable out from under a binding: the binding would then point at a name
+ * ``system_prompt.variables`` no longer declares, which
+ * ``AgentSpecBody._check_arg_bindings`` rule (4) REJECTS — the save comes back
+ * 422 with nothing on screen explaining why (antd renders a Select value that
+ * is not among its options as the label, so the orphan looks perfectly fine).
+ *
+ * Deliberately lives here, next to the writers, rather than inside either
+ * editor: the MCP tab owns the bindings and the prompt tab owns the variables,
+ * and neither can see the other's state except through the manifest.
+ */
+export function bindingsUsingVariable(m: unknown, name: string): BindingUse[] {
+  if (name === "") return [];
+  return readTools(m).mcpArgBindings.flatMap((binding) =>
+    Object.entries(binding.args)
+      .filter(([, variable]) => variable === name)
+      .map(([param]) => ({ server: binding.server, tool: binding.tool, param })),
+  );
+}
+
 export const readPromptVariables = (m: unknown): PromptVariableFields[] =>
   specOf(m).system_prompt?.variables ?? [];
 

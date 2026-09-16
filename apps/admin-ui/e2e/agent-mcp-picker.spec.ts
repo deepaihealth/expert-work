@@ -80,11 +80,26 @@ const AVAILABLE_SERVERS = {
   error: null,
 };
 
+// B-61 —— 这两个桩工具带上 input_schema,子弹窗里的「参数绑定」界面才会渲染。
+// 不带的话,新增的 <label htmlFor> + Select id + 展开按钮那一层在 e2e / axe 里
+// 从来不会出现,等于裸着上船(复评 L3)。
 const GITHUB_TOOLS = {
   success: true,
   data: [
-    { name: "create_issue", description: "Create a new GitHub issue" },
-    { name: "list_repos", description: "List repositories" },
+    {
+      name: "create_issue",
+      description: "Create a new GitHub issue",
+      input_schema: {
+        type: "object",
+        properties: { repo: {}, title: {}, body: {} },
+        required: ["repo", "title"],
+      },
+    },
+    {
+      name: "list_repos",
+      description: "List repositories",
+      input_schema: { type: "object", properties: { owner: {} } },
+    },
   ],
   error: null,
 };
@@ -241,4 +256,41 @@ test("(b) create modal with MCP picker passes axe (serious + critical)", async (
   await expect(page.getByTestId("af-mcp-server-github")).toBeVisible();
 
   await expectNoA11yViolations(page, "create-agent-modal-mcp");
+});
+
+// B-61 —— 绑定编辑器(参数名 <label htmlFor> + antd Select 的 id + 展开按钮的
+// aria-expanded/aria-controls)是这次新增的一层 markup,而唯一会打开工具子弹窗的
+// 用例 (a) 之前用的桩工具没有 input_schema,所以这层在 Playwright / axe 里从没被
+// 渲染过。本仓库有过「vitest 绿而 Playwright/axe 红」的先例,所以让 axe 真扫一遍。
+test("(c) MCP per-parameter binding editor passes axe (serious + critical)", async ({
+  page,
+}) => {
+  await page.getByTestId("agents-create").click();
+  await expect(page.getByTestId("manifest-form-view")).toBeVisible();
+
+  // 先声明一个提示词变量 —— 没有声明变量时绑定区只给一句提示,下拉根本不渲染。
+  await page.getByTestId("cfg-nav-prompt").click();
+  await page.getByTestId("af-prompt-jinja").click();
+  await page.getByTestId("af-prompt-var-add").click();
+  await page.getByTestId("af-prompt-var-name-0").fill("project_code");
+
+  // 再到 MCP:勾服务器 → 开工具子弹窗 → 展开 create_issue 的参数绑定。
+  await page.getByTestId("cfg-nav-capabilities").click();
+  await page.getByRole("tab", { name: "MCP" }).click();
+  await page.getByTestId("af-mcp-server-github").click();
+  await page.getByTestId("af-mcp-choose-github").click();
+  await expect(page.getByTestId("af-mcp-tool-create_issue")).toBeVisible();
+  await page.getByTestId("af-mcp-bind-toggle-create_issue").click();
+
+  // 逐参数一行都在(必填的 repo/title + 选填的 body)。
+  await expect(page.getByTestId("af-mcp-bind-row-create_issue-repo")).toBeVisible();
+  await expect(page.getByTestId("af-mcp-bind-row-create_issue-body")).toBeVisible();
+  // aria-controls 指得着真实的展开区。
+  const panelId = await page
+    .getByTestId("af-mcp-bind-toggle-create_issue")
+    .getAttribute("aria-controls");
+  expect(panelId).toBeTruthy();
+  await expect(page.locator(`#${panelId}`)).toBeVisible();
+
+  await expectNoA11yViolations(page, "create-agent-modal-mcp-bindings");
 });

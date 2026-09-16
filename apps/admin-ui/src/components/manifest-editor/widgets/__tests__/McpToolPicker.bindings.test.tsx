@@ -42,6 +42,12 @@ const toolsMock = vi.spyOn(serversSdk, "listMcpServerTools");
 const platformCatalogMock = vi.spyOn(catalogSdk, "listPlatformCatalog");
 const catalogToolsMock = vi.spyOn(catalogSdk, "listCatalogTools");
 
+// 本文件改的是**全局** i18n 实例的语言,所以必须还原 —— 今天不还原也没事只是
+// 因为 vitest 的 isolate 默认开着,而那正是 runner 一直在劝人关掉的开关
+// (它自己打印「~12.79s faster with isolate: false」)。谁哪天为了提速关掉,
+// 这就变成跨文件的随机红。
+let langBefore = i18n.language;
+
 beforeEach(async () => {
   availableMock.mockReset();
   toolsMock.mockReset();
@@ -50,12 +56,14 @@ beforeEach(async () => {
   scopeRef.current = undefined;
   // 断言里写的是中文文案(「自动（模型填）」等),语言不钉住就随 jsdom 的
   // navigator.language 漂 —— 本机与 CI 解析成 en 时整片假红。
+  langBefore = i18n.language;
   await i18n.changeLanguage("zh-CN");
 });
 
-afterEach(() => {
-  // 确认框 portal 到 RTL 容器外面。
-  document.body.innerHTML = "";
+afterEach(async () => {
+  await i18n.changeLanguage(langBefore);
+  // 不再手动清 document.body:那会把 RTL 自己的容器一起端掉。弹窗与下拉都走
+  // React portal,在 RTL 的 auto-cleanup 卸载组件树时一并消失。
 });
 
 const T1: serversSdk.McpTool = {
@@ -145,10 +153,26 @@ async function pickOption(
   await user.click(item);
 }
 
-/** 绑定 UI 住在「选择工具」弹窗里 —— 先开到那儿,再展开 t1 的参数绑定。 */
-async function openBindings(user: ReturnType<typeof userEvent.setup>) {
+/** 确认框。工具子弹窗本身也是 role="dialog",所以开着弹窗时按 role 取会撞上两个
+ *  —— 认 antd 给 confirm 专用的那个 class。 */
+async function findConfirm(): Promise<HTMLElement> {
+  return waitFor(() => {
+    const el = document.querySelector<HTMLElement>(".ant-modal-confirm");
+    if (el === null) throw new Error("confirm dialog not open");
+    return el;
+  });
+}
+
+/** 只开到「选择工具」弹窗(有些用例压根不该有展开按钮可点)。 */
+async function openToolModal(user: ReturnType<typeof userEvent.setup>) {
   await user.click(await screen.findByTestId("af-mcp-choose-deepcare"));
   await screen.findByTestId("af-mcp-tool-t1");
+  return user;
+}
+
+/** 绑定 UI 住在「选择工具」弹窗里 —— 先开到那儿,再展开 t1 的参数绑定。 */
+async function openBindings(user: ReturnType<typeof userEvent.setup>) {
+  await openToolModal(user);
   await user.click(await screen.findByRole("button", { name: /t1/ }));
 }
 
@@ -277,6 +301,87 @@ describe("McpToolPicker 参数绑定", () => {
     // 两个条目一共绑了三个参数 —— 报的是参数数,和下面三行对得上。
     expect(dialog.textContent).toContain("这会同时删掉 3 条参数绑定");
     expect(within(dialog).getAllByRole("listitem")).toHaveLength(3);
+  });
+
+  // emit() 的注释点名说这是三条路里最不直观的一条:agent 处在「全部工具」
+  // (allow_tools 空 = 全放行)时,勾上第一个工具会把 allow_tools 收成 [它],
+  // 于是**其它**工具上的绑定全部落到范围外。注释点了名却没有测试,就是下一次
+  // 回归的入口。
+  it("「全部工具」下勾第一个工具,会挤掉别的工具的绑定 —— 也要先问", async () => {
+    const onChange = vi.fn();
+    const user = renderPicker({
+      onChange,
+      tools: [T1, T2],
+      allowTools: [],
+      promptVariables: ["project_code", "employee_code"],
+      argBindings: [
+        { server: "deepcare", tool: "t2", args: { note: "employee_code" } },
+      ],
+    });
+    await user.click(await screen.findByTestId("af-mcp-choose-deepcare"));
+    await user.click(await screen.findByTestId("af-mcp-tool-t1"));
+    expect(onChange).not.toHaveBeenCalled();
+
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain("这会同时删掉 1 条参数绑定");
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(1);
+    expect(dialog.textContent).toContain("t2");
+    expect(dialog.textContent).toContain("note");
+
+    await user.click(within(dialog).getByRole("button", { name: /删除/ }));
+    await waitFor(() => expect(onChange).toHaveBeenCalledTimes(1));
+    expect(onChange).toHaveBeenLastCalledWith(["deepcare"], ["t1"], []);
+  });
+
+  // ── L5:input_schema 是第三方自报的,形状不对就当没有,别硬拆也别抛 ───────
+  it("properties 是数组时当没有参数处理,不会把 0/1 当参数名", async () => {
+    await openToolModal(
+      renderPicker({
+        tools: [
+          {
+            name: "t1",
+            description: "",
+            input_schema: { properties: ["project_code", "keyword"] },
+          },
+        ],
+      }),
+    );
+    expect(screen.queryByTestId("af-mcp-bind-toggle-t1")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("0")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("project_code")).not.toBeInTheDocument();
+  });
+
+  it("required 形状不对只是没有星号,参数照列(两侧判据各管各的)", async () => {
+    await openBindings(
+      renderPicker({
+        tools: [
+          {
+            name: "t1",
+            description: "",
+            // 第三方把 required 写成了字符串而不是数组。
+            input_schema: {
+              properties: { project_code: {}, keyword: {} },
+              required: "project_code",
+            },
+          },
+        ],
+      }),
+    );
+    expect(screen.getByLabelText("project_code")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("af-mcp-bind-row-t1-project_code").textContent,
+    ).not.toContain("*");
+  });
+
+  // ── L8:aria-expanded 得配一个指得着东西的 aria-controls ────────────────
+  it("展开按钮的 aria-controls 指向真实存在的展开区", async () => {
+    const user = renderPicker();
+    await openBindings(user);
+    const toggle = screen.getByTestId("af-mcp-bind-toggle-t1");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const panelId = toggle.getAttribute("aria-controls");
+    expect(panelId).toBeTruthy();
+    expect(document.getElementById(panelId as string)).toBeInTheDocument();
   });
 
   it("取消确认则什么都不写", async () => {

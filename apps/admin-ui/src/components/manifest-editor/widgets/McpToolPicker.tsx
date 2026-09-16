@@ -39,6 +39,13 @@ import { Settings } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import type { ArgBindingFields } from "../form_model";
+import {
+  AUTO,
+  bindingInScope,
+  paramsOf,
+  toolInScope,
+  type ToolParam,
+} from "./mcp_arg_bindings";
 
 import {
   listAvailableMcpServers,
@@ -55,10 +62,6 @@ const { Text } = Typography;
 
 export type McpPickerSource = "available" | "catalog";
 
-/** The "model fills this in" choice. Empty string, so it can never collide
- *  with a declared variable name (those are non-empty by construction). */
-const AUTO = "";
-
 interface McpToolPickerProps {
   servers: string[];
   allowTools: string[];
@@ -74,56 +77,6 @@ interface McpToolPickerProps {
   ) => void;
   source?: McpPickerSource;
 }
-
-/** One row of the binding editor: a parameter of the tool's input schema. */
-interface ToolParam {
-  name: string;
-  required: boolean;
-}
-
-/** Read a tool's parameters out of its JSON Schema. ``input_schema`` is
- *  ``Record<string, unknown>`` (whatever the server advertised), so every
- *  step narrows rather than assumes. No schema ⇒ nothing to bind. */
-function paramsOf(tool: McpTool): ToolParam[] {
-  const schema = tool.input_schema;
-  if (schema === undefined) return [];
-  const props = schema.properties;
-  if (props === null || typeof props !== "object") return [];
-  const rawRequired = schema.required;
-  const required = new Set(
-    Array.isArray(rawRequired) ? rawRequired.filter((x) => typeof x === "string") : [],
-  );
-  return Object.keys(props as Record<string, unknown>).map((name) => ({
-    name,
-    required: required.has(name),
-  }));
-}
-
-/**
- * Whether ``server``/``tool`` is inside the agent's current MCP scope — the
- * single place this rule is written down, for both "may this tool be bound at
- * all" and "is this existing binding still legal".
- *
- * It is not a nicety: ``AgentSpecBody._check_arg_bindings`` REJECTS the save
- * outright when a binding's server is not among ``servers``, or its tool not
- * among a non-empty ``allow_tools`` (empty ``allow_tools`` means "all tools",
- * so the tool check does not apply then). A picker that let those drift would
- * hand the operator an unsaveable manifest with a protocol-level error.
- */
-const toolInScope = (
-  server: string,
-  tool: string,
-  servers: string[],
-  allowTools: string[],
-): boolean =>
-  servers.includes(server) &&
-  (allowTools.length === 0 || allowTools.includes(tool));
-
-const bindingInScope = (
-  binding: ArgBindingFields,
-  servers: string[],
-  allowTools: string[],
-): boolean => toolInScope(binding.server, binding.tool, servers, allowTools);
 
 interface ServerRow {
   name: string;
@@ -304,9 +257,17 @@ export function McpToolPicker({
       return;
     }
     // 数的是**参数**,不是 arg_bindings 条目 —— 一个条目可以绑好几个参数,而用户
-    // 要衡量的是「有几个参数要回到模型自己填」。下面列表也是一行一个参数,标题
-    // 的 N 与用户能数到的行数对得上。
-    const droppedParams = dropped.flatMap((b) => Object.entries(b.args));
+    // 要衡量的是「有几个参数要回到模型自己填」。标题的 N 与下面的列表都从这一份
+    // 摊平结果来(带上 tool/server,列表才用得上它),所以「说 3 条、列 4 行」不是
+    // 靠两段代码碰巧一样,而是结构上产生不出来。
+    const droppedParams = dropped.flatMap((b) =>
+      Object.entries(b.args).map(([param, variable]) => ({
+        server: b.server,
+        tool: b.tool,
+        param,
+        variable,
+      })),
+    );
     modal.confirm({
       title: t("agent_form.mcp_bind_drop_title", {
         count: droppedParams.length,
@@ -316,19 +277,15 @@ export function McpToolPicker({
       content: (
         <div>
           <ul style={{ margin: "0 0 8px", paddingLeft: 18 }}>
-            {dropped.flatMap((b) =>
-              Object.entries(b.args).map(([param, variable]) => (
-                <li key={`${b.server}/${b.tool}/${param}`}>
-                  {t("agent_form.mcp_bind_drop_item", {
-                    tool: b.tool,
-                    param,
-                    variable,
-                  })}
-                </li>
-              )),
-            )}
-            {/* 上面这串摊平的结果就是 droppedParams,标题里的 N 取的是它的长度
-                —— 一个来源,数不出「说 3 条、列 4 行」这种事。 */}
+            {droppedParams.map((row) => (
+              <li key={`${row.server}/${row.tool}/${row.param}`}>
+                {t("agent_form.mcp_bind_drop_item", {
+                  tool: row.tool,
+                  param: row.param,
+                  variable: row.variable,
+                })}
+              </li>
+            ))}
           </ul>
           <Text type="secondary" style={{ fontSize: 12 }}>
             {t("agent_form.mcp_bind_drop_hint")}
@@ -693,6 +650,9 @@ export function McpToolPicker({
     const bound = argsOf(row.name, tool.name);
     const boundCount = Object.keys(bound).length;
     const open = expandedBindings.includes(tool.name);
+    // 读屏要能答「展开的是哪一块」,所以 aria-expanded 必须配一个 aria-controls
+    // 指向真实存在的 id。
+    const panelId = `af-mcp-bind-panel-${row.name}-${tool.name}`;
     return (
       <div style={{ marginLeft: 24 }}>
         <Button
@@ -702,6 +662,7 @@ export function McpToolPicker({
           data-testid={`af-mcp-bind-toggle-${tool.name}`}
           aria-label={t("agent_form.mcp_bind_open", { tool: tool.name })}
           aria-expanded={open}
+          aria-controls={panelId}
           onClick={() =>
             setExpandedBindings((prev) =>
               prev.includes(tool.name)
@@ -717,6 +678,7 @@ export function McpToolPicker({
           (promptVariables.length === 0 ? (
             <Text
               type="secondary"
+              id={panelId}
               data-testid={`af-mcp-bind-no-vars-${tool.name}`}
               style={{ display: "block", fontSize: 12, paddingBottom: 4 }}
             >
@@ -724,6 +686,7 @@ export function McpToolPicker({
             </Text>
           ) : (
             <div
+              id={panelId}
               style={{
                 display: "flex",
                 flexDirection: "column",
@@ -734,7 +697,7 @@ export function McpToolPicker({
               <Text type="secondary" style={{ fontSize: 12 }}>
                 {t("agent_form.mcp_bind_hint")}
               </Text>
-              {params.map((param) => {
+              {params.map((param: ToolParam) => {
                 const id = `af-mcp-bind-${row.name}-${tool.name}-${param.name}`;
                 return (
                   <div
