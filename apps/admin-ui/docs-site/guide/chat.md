@@ -499,7 +499,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
       "trusted": true,
       "local_path": "inputs/cache/9f2a4c1b7e0d3856a1f4c920b7d5e386.png"
     },
-    "materials": {
+    "resources": {
       "value": [
         {
           "description": "示范视频",
@@ -522,7 +522,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 | `trusted` | boolean | 取值：`true`（管理员把这个变量声明为可信）/ `false`（声明为不可信，其中的内容按数据处理，不作为指令执行） |
 | `local_path` | string 或 null | 取值：相对路径（平台已经把这个地址的文件下载到工作区）/ `null`（没有下载，按同一项里的地址自行获取）。只有整个值是一个地址、或地址是某个对象的一个字段时才有这个键，其余位置没有，读取时按「没有下载」处理 |
 
-`local_path` 相对工作区的根目录，Agent 执行代码时的当前目录就是这个根目录，按相对路径直接打开即可。嵌套结构里的地址，`local_path` 出现在它所在的那一项里，例如上面 `materials` 数组的每个元素。
+`local_path` 相对工作区的根目录，Agent 执行代码时的当前目录就是这个根目录，按相对路径直接打开即可。嵌套结构里的地址，`local_path` 出现在它所在的那一项里，例如上面 `resources` 数组的每个元素。
 
 `local_path` 由平台写入，`inputs` 里自带的同名字段会被清空，所以不要用它传自己的路径。
 
@@ -539,7 +539,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 同一个终端用户在同一个 Agent 名下的多次 run 之间，同一个地址在 24 小时内只下载一次，后面的 run 复用上一次的副本。因此在这段时间内替换了地址背后的文件时，Agent 可能仍然拿到替换前的那一份；需要 Agent 立刻用上新文件时，换一个新地址传进来。
 
-地址要放在对象的某个字段里才会被下载。直接作为数组元素的地址字符串（例如 `["https://files.example.com/demo-a.mp4"]`）旁边没有位置记录 `local_path`，平台不下载它；需要平台预先下载时，把地址包成对象的一个字段，与上面 `materials` 的形态一致。
+地址要放在对象的某个字段里才会被下载。直接作为数组元素的地址字符串（例如 `["https://files.example.com/demo-a.mp4"]`）旁边没有位置记录 `local_path`，平台不下载它；需要平台预先下载时，把地址包成对象的一个字段，与上面 `resources` 的形态一致。
 
 识别的对象是**值本身**：只有整个值是一个 `http` 或 `https` 开头的字符串时，才算一个地址。把结构先 JSON 编码成字符串再传（整个值变成一个 `[{...}]` 形状的字符串），字符串里面的地址平台看不见，也就不会预先下载；这类值仍然原样出现在文件里，Agent 解析之后照常使用。
 
