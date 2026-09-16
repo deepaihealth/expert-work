@@ -541,7 +541,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123
 
 - `user_id` 是这个租户从未出现过的值时返回空列表，不是 404。
 - 服务端的工作区存储配置有问题时返回 500 `WORKSPACE_LIST_FAILED`。重试无效，请联系租户管理员。
-- Agent 已经删除时，它名下的文件不出现在 `scope=user` 的列表里。这些文件没有可用的 `agent_code` 可以下载，列出来也取不回。
+- 删除 Agent 不影响它名下的文件。这些文件仍然留在这个终端用户的工作区里，`scope=user` 仍然列出它们，用同一个 `agent_code` 仍然可以下载。
 
 ### 下载单个文件
 
@@ -713,7 +713,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/artifacts?user_id=u-123" \
 #### 其它规则
 
 - `user_id` 是这个租户从未出现过的值时返回空列表，不是 404。
-- Agent 已经删除时，它名下的产物不出现在 `scope=user` 的列表里。这些产物没有可用的 `agent_code` 可以下载，列出来也取不回。
+- 删除 Agent 不影响它名下的产物。这些产物仍然出现在 `scope=user` 的列表里，用同一个 `agent_code` 仍然可以下载。
 
 ### 下载产物
 
