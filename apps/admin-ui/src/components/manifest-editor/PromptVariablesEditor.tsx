@@ -92,7 +92,11 @@ export function PromptVariablesEditor({
     // 自己派发的交互事件,程序化赋值(扩展、密码管理器、devtools:native setter
     // + dispatchEvent("input"))照样走到 React 的 onChange。trusted / required /
     // 说明这些字段动了不会造成孤儿,照常放行 —— 只挡 name。
-    if (patch.name !== undefined && boundUses(variables[i]).length > 0) return;
+    // 用 ``"name" in patch`` 而不是 ``patch.name !== undefined``:展开一个带
+    // ``name: undefined`` 的对象会把这个键拷进来,而 exactOptionalPropertyTypes
+    // 是关的,所以那种 patch 类型上合法、语义上是「把名字清空」。今天四个调用点
+    // 都构不出它,但闸的判据不该依赖调用点的自觉。
+    if ("name" in patch && boundUses(variables[i]).length > 0) return;
     const next = variables.map((row, idx) =>
       idx === i ? { ...row, ...patch } : row,
     );
@@ -236,6 +240,9 @@ export function PromptVariablesEditor({
               data-testid={`af-prompt-var-row-${i}`}
               style={{
                 display: "flex",
+                // 说明那行小字换到下面独占一行(它 flexBasis:100%)——
+                // 140 字符的一句话本来就不该和五个控件抢同一行。见下。
+                flexWrap: "wrap",
                 gap: 8,
                 marginBottom: 8,
                 alignItems: "center",
@@ -251,19 +258,6 @@ export function PromptVariablesEditor({
                 placeholder={t("agent_form.prompt_var_name")}
                 onChange={(e) => patchVar(i, { name: e.target.value })}
               />
-              {uses.length > 0 && (
-                // 「为什么锁着」和「怎么解锁」都写在这行常驻小字里,不放 Tooltip:
-                // 这个 Input 渲染出来是裸 <input disabled>,而 Chromium 不给
-                // disabled 表单控件派 mouseenter、antd v5 也没有 v4 那个
-                // disabled 子元素兼容层 —— 挂上去的提示一辈子不出现。
-                <Text
-                  type="secondary"
-                  data-testid={`af-prompt-var-bound-${i}`}
-                  style={{ fontSize: 12 }}
-                >
-                  {t("agent_form.prompt_var_bound_note", { count: uses.length })}
-                </Text>
-              )}
               <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 <Switch
                   size="small"
@@ -306,6 +300,24 @@ export function PromptVariablesEditor({
               >
                 {t("agent_form.prompt_var_remove")}
               </Button>
+              {uses.length > 0 && (
+                // 「为什么锁着」和「怎么解锁」都写在这行常驻小字里,不放 Tooltip:
+                // 这个 Input 渲染出来是裸 <input disabled>,而 Chromium 不给
+                // disabled 表单控件派 mouseenter、antd v5 也没有 v4 那个
+                // disabled 子元素兼容层 —— 挂上去的提示一辈子不出现。
+                //
+                // flexBasis:100% 让它换到控件下面**独占一行**。上一版把这句
+                // ~140 字符的说明塞进同一行、又去掉了 nowrap,结果把它本想讲清楚
+                // 的那一行挤垮了:变量名只剩 "project_c"、Trusted/Required 塌成
+                // 一列一个字母。e2e (e) 量着这一行的几何,别再把它挪回行内。
+                <Text
+                  type="secondary"
+                  data-testid={`af-prompt-var-bound-${i}`}
+                  style={{ fontSize: 12, flexBasis: "100%" }}
+                >
+                  {t("agent_form.prompt_var_bound_note", { count: uses.length })}
+                </Text>
+              )}
             </div>
             );
           })}

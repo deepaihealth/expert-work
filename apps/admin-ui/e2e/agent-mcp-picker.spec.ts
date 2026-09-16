@@ -367,3 +367,86 @@ test("(d) turning Jinja off never submits bindings without variables", async ({
   expect(yaml).toContain("type: mcp");
   expect(yaml).toContain("create_issue");
 });
+
+// B-61 修复轮 3 / NEW-1 —— 被绑变量那一行的**几何**。
+//
+// 上一轮为了讲清楚「为什么锁着 / 怎么解锁」,把一句 ~140 字符的常驻说明塞进了
+// 和五个控件同一个 flex 行、又去掉了 nowrap:变量名被挤成 "project_c"(这一行
+// 最该读出来的东西反而看不见了),Trusted/Required 塌成一列一个字母的竖排。
+// 纯 CSS 回归 vitest 一点都看不见 —— jsdom 不做布局,盒子全是 0×0。所以这条
+// 在真浏览器里**量尺寸**:名字输入框不许被压缩、说明必须换到控件下面自己一行、
+// 两个标签不许竖排。肉眼看一眼不算数。
+test("(e) the bound-variable row stays readable — the note gets its own line", async ({
+  page,
+}) => {
+  await page.getByTestId("agents-create").click();
+  await expect(page.getByTestId("manifest-form-view")).toBeVisible();
+
+  await page.getByTestId("cfg-nav-prompt").click();
+  await page.getByTestId("af-prompt-jinja").click();
+  await page.getByTestId("af-prompt-var-add").click();
+  await page.getByTestId("af-prompt-var-name-0").fill("project_code");
+
+  await page.getByTestId("cfg-nav-capabilities").click();
+  await page.getByRole("tab", { name: "MCP" }).click();
+  await page.getByTestId("af-mcp-server-github").click();
+  await page.getByTestId("af-mcp-choose-github").click();
+  await expect(page.getByTestId("af-mcp-tool-create_issue")).toBeVisible();
+  await page.getByTestId("af-mcp-tool-create_issue").click();
+  await page.getByTestId("af-mcp-bind-toggle-create_issue").click();
+  await page
+    .getByTestId("af-mcp-bind-row-create_issue-repo")
+    .locator(".ant-select")
+    .click();
+  await page
+    .locator(".ant-select-dropdown:not(.ant-select-dropdown-hidden)")
+    .locator(".ant-select-item-option-content", { hasText: /^project_code$/ })
+    .click();
+  await page
+    .getByTestId("af-mcp-tool-modal")
+    .getByRole("button", { name: /完成|Done/ })
+    .click();
+
+  // 回到提示词页:这一行现在是「被绑」状态,常驻说明出现。
+  await page.getByTestId("cfg-nav-prompt").click();
+  const nameInput = page.getByTestId("af-prompt-var-name-0");
+  const note = page.getByTestId("af-prompt-var-bound-0");
+  await expect(note).toBeVisible();
+
+  const nameBox = (await nameInput.boundingBox())!;
+  const noteBox = (await note.boundingBox())!;
+  const trustedLabel = page
+    .getByTestId("af-prompt-var-row-0")
+    .locator("span", { hasText: /^(可信|Trusted)$/ })
+    .first();
+
+  // 1) 变量名那一栏没有被压缩(声明宽度 160)。挤坏的那一版量到的是 ~70。
+  expect(nameBox.width).toBeGreaterThanOrEqual(150);
+
+  // 2) 说明在控件**下面**自己一行,不是挤在行内:它的上沿低于输入框的下沿。
+  expect(noteBox.y).toBeGreaterThanOrEqual(nameBox.y + nameBox.height - 1);
+
+  // 3) 说明确实占满整行宽(flexBasis:100%),而不是缩在角落。
+  expect(noteBox.width).toBeGreaterThan(nameBox.width * 2);
+
+  // 4) 标签没有被压成一列一个字母的竖排 —— 竖排时高度会是行高的好几倍。
+  const trustedBox = (await trustedLabel.boundingBox())!;
+  expect(trustedBox.height).toBeLessThan(40);
+
+  // 5) 那句说明必须真的把「怎么解锁」讲出来,不只是一个数字。
+  const noteText = (await note.textContent()) ?? "";
+  expect(noteText).toContain("MCP");
+
+  // 6) 「独占一行」不许靠「文案碰巧够长」。把它临时改成一个字符再量一次 ——
+  //    这一条钉的是 flexBasis:100%:只有 flexWrap 的话,短文案会滑回行内,
+  //    于是下一次文案一改短,这一行又开始和五个控件抢地方。
+  // e2e 的 tsconfig 不带 dom lib,所以这里显式窄化到「有 textContent 的东西」。
+  await note.evaluate((el) => {
+    (el as unknown as { textContent: string }).textContent = "x";
+  });
+  const shortNoteBox = (await note.boundingBox())!;
+  const nameBoxAfter = (await nameInput.boundingBox())!;
+  expect(shortNoteBox.y).toBeGreaterThanOrEqual(
+    nameBoxAfter.y + nameBoxAfter.height - 1,
+  );
+});

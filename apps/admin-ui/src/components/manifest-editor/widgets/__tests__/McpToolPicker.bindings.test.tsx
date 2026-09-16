@@ -246,6 +246,11 @@ describe("McpToolPicker 参数绑定", () => {
     expect(hint.textContent).toContain("声明变量");
     // 提示必须指得着**页面上真实存在的**那一节。直接取那两个 i18n 键:谁把分组
     // 或小节改了名,这条就红 —— 这正是我们想要的信号,而不是让提示悄悄过期。
+    // 这两条**故意**用 i18n.t,而且故意用的是**别的** key:被断言的文案是
+    // mcp_bind_no_variables,期望值来自 group_prompt / section_prompt_vars。
+    // 两边不同源,所以不是重言式;耦合本身就是目的 —— 谁给那个分组或小节改了名,
+    // 这条就红,提示不会悄悄指向一个不存在的入口。文案本身的字面量在下面
+    // 「绑定文案」那个 describe 里按 locale 各钉了一遍。别把这两行"顺手"改掉。
     expect(hint.textContent).toContain(i18n.t("manifest_editor.group_prompt"));
     expect(hint.textContent).toContain(i18n.t("agent_form.section_prompt_vars"));
     expect(screen.queryByLabelText("project_code")).not.toBeInTheDocument();
@@ -473,6 +478,139 @@ describe("McpToolPicker 参数绑定", () => {
     expect(
       screen.getByTestId("af-mcp-bind-toggle-t1").textContent,
     ).toContain("2");
+  });
+});
+
+// ── 文案契约:每个 mcp_bind_* 键、每个 locale,期望值都是**字面量** ──────────
+//
+// NEW-2 —— 上面那一整个 describe 把语言钉死在 zh-CN,于是 en 那一半的 mcp_bind_*
+// 文案一条都没人验:复评把 8 条英文文案挖空跑全套,只红了 1 条。
+//
+// 这里的断言两边**不同源**:左边是组件渲染出来的东西,右边是写死在测试里的字面量。
+// 用 i18n.t(同一个 key) 当期望值是重言式 —— 文案改小两边一起改小,永远不会红。
+const BIND_COPY = {
+  "zh-CN": {
+    label: "参数绑定",
+    open: "t1 的参数绑定",
+    count: "已绑 1 个",
+    auto: "自动（模型填）",
+    hint: "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。不绑定的参数仍由模型自己填。",
+    required: "这个参数是必填的",
+    noVariables:
+      "先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量，再回来把参数绑到变量上。",
+    dropTitle: "这会同时删掉 1 条参数绑定",
+    dropTitleMany: "这会同时删掉 2 条参数绑定",
+    dropItem: "t1 的 project_code ← 变量 project_code",
+    dropHint: "删掉之后，这些参数改回由模型自己填。要保留绑定，请取消本次改动。",
+    dropOk: "删除并继续",
+    dropCancel: "取消",
+  },
+  en: {
+    label: "Bound parameters",
+    open: "Bound parameters for t1",
+    count: "1 bound",
+    auto: "Auto (model fills it in)",
+    hint: "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. Unbound parameters are still filled in by the model.",
+    required: "This parameter is required",
+    noVariables:
+      "Declare a variable under Prompt & Output → Dynamic prompt (Jinja) first, then come back and bind parameters to it.",
+    dropTitle: "This will also delete 1 bound parameter",
+    dropTitleMany: "This will also delete 2 bound parameters",
+    dropItem: "project_code on t1 ← variable project_code",
+    dropHint:
+      "Once deleted, the model fills these parameters in again. Cancel to keep them.",
+    dropOk: "Delete and continue",
+    dropCancel: "Cancel",
+  },
+} as const;
+
+describe.each(["zh-CN", "en"] as const)("McpToolPicker 绑定文案 (%s)", (lang) => {
+  const copy = BIND_COPY[lang];
+  let langBefore = i18n.language;
+
+  beforeEach(async () => {
+    availableMock.mockReset();
+    toolsMock.mockReset();
+    scopeRef.current = undefined;
+    langBefore = i18n.language;
+    await i18n.changeLanguage(lang);
+  });
+
+  afterEach(async () => {
+    await i18n.changeLanguage(langBefore);
+  });
+
+  it("展开区里的每一句都按本 locale 的文案渲染", async () => {
+    const user = renderPicker({
+      argBindings: [BINDING],
+      promptVariables: ["project_code"],
+    });
+    await openToolModal(user);
+
+    const toggle = screen.getByTestId("af-mcp-bind-toggle-t1");
+    expect(toggle.textContent).toContain(copy.label);
+    expect(toggle.textContent).toContain(copy.count);
+    expect(toggle).toHaveAttribute("aria-label", copy.open);
+
+    await user.click(toggle);
+    const panel = document.getElementById(
+      toggle.getAttribute("aria-controls") as string,
+    ) as HTMLElement;
+    expect(panel.textContent).toContain(copy.hint);
+    // 必填星号的说明挂在星号的 title 上。
+    const star = screen
+      .getByTestId("af-mcp-bind-row-t1-project_code")
+      .querySelector("[title]");
+    expect(star).toHaveAttribute("title", copy.required);
+    // 下拉里的「自动」那一档。
+    await user.click(screen.getByLabelText("keyword"));
+    expect(optionLabels()).toContain(copy.auto);
+  });
+
+  it("一条变量都没声明时的提示按本 locale 渲染", async () => {
+    await openBindings(renderPicker({ promptVariables: [] }));
+    expect(screen.getByTestId("af-mcp-bind-no-vars-t1").textContent).toBe(
+      copy.noVariables,
+    );
+  });
+
+  // 复数那一档单独钉:count=1 走 _one(en)/_other(zh),count>1 两边都走 _other,
+  // 只测 count=1 的话 en 的 _other 没人验(它确实活过了第一轮变异)。
+  // 注:zh 的复数规则只有 other,所以 zh 的 _one 键在运行期永远取不到 ——
+  // 它存在只是为了让两个 locale 的键集相等(i18n.test.tsx 的断言)。
+  it("要删多条时标题走复数那一档", async () => {
+    const user = renderPicker({
+      argBindings: [
+        {
+          server: "deepcare",
+          tool: "t1",
+          args: { project_code: "project_code", keyword: "project_code" },
+        },
+      ],
+      promptVariables: ["project_code"],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain(copy.dropTitleMany);
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(2);
+  });
+
+  it("删绑定的确认框按本 locale 渲染(标题/条目/说明/两个按钮)", async () => {
+    const user = renderPicker({
+      argBindings: [BINDING],
+      promptVariables: ["project_code"],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-deepcare"));
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain(copy.dropTitle);
+    expect(dialog.textContent).toContain(copy.dropItem);
+    expect(dialog.textContent).toContain(copy.dropHint);
+    // antd 会在两个汉字的按钮中间插空格(「取 消」),所以按去空白后比。
+    const buttons = within(dialog)
+      .getAllByRole("button")
+      .map((b) => (b.textContent ?? "").replace(/\s+/g, ""));
+    expect(buttons).toContain(copy.dropOk.replace(/\s+/g, ""));
+    expect(buttons).toContain(copy.dropCancel.replace(/\s+/g, ""));
   });
 });
 
