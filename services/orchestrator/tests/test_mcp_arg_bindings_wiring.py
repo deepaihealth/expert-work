@@ -19,7 +19,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import ArgBindingSpec, AuditEntry, MCPToolSpec
+from expert_work.protocol import (
+    ArgBindingSpec,
+    AuditEntry,
+    MCPToolSpec,
+    canonical_args_digest,
+)
 from expert_work.runtime.audit.fallback import InMemoryAuditFallbackQueue
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.audit.redactor import DefaultSecretRedactor
@@ -31,6 +36,7 @@ from orchestrator import (
     build_react_graph,
 )
 from orchestrator.graph_builder._config import AUDIT_LOGGER_KEY
+from orchestrator.graph_builder.builder import _build_tool_context
 from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.tools import (
     MCPServerPool,
@@ -40,6 +46,8 @@ from orchestrator.tools import (
     build_tool_registry,
     register_mcp_tools,
 )
+from orchestrator.tools._child_run import _child_config
+from orchestrator.tools.registry import UnmatchedArgBinding
 
 pytestmark = pytest.mark.asyncio
 
@@ -185,27 +193,45 @@ class _Harness:
     def _seed() -> dict[str, Any]:
         return {"messages": [HumanMessage(content="查一下")], "step_count": 0, "max_steps": 5}
 
-    async def run_turn_with_tool_call(self, name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    async def run_turn_with_tool_call(
+        self, name: str, args: Mapping[str, Any], *, config: RunnableConfig | None = None
+    ) -> dict[str, Any]:
         async with make_checkpointer("memory") as cp:
             compiled = self._compiled(name, args, cp)
-            return await compiled.ainvoke(self._seed(), config=self._config())
+            return await compiled.ainvoke(self._seed(), config=config or self._config())
 
-    async def approve_and_continue(self, name: str, args: Mapping[str, Any]) -> dict[str, Any]:
-        """跑到审批暂停,照审批端点的做法批准,再续跑。"""
+    async def resume_and_continue(
+        self,
+        name: str,
+        args: Mapping[str, Any],
+        *,
+        modified_args: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """跑到审批暂停,照审批端点的做法给出裁决,再续跑。
+
+        ``modified_args`` 非空 = 走 ``modify`` 档(人在审批面上改写了 args),
+        摘要按改写后的那份重算 —— 与审批端点的做法一致(它把裁决与摘要原子地
+        一起写下)。
+        """
         async with make_checkpointer("memory") as cp:
             compiled = self._compiled(name, args, cp)
             cfg = self._config()
             paused = await compiled.ainvoke(self._seed(), config=cfg)
             request = paused["pending_approval"]
+            if modified_args is None:
+                resume: dict[str, Any] = {
+                    "decision": "approve",
+                    "binding_digest": request.binding_digest,
+                }
+            else:
+                resume = {
+                    "decision": "modify",
+                    "modified_args": dict(modified_args),
+                    "binding_digest": canonical_args_digest(dict(modified_args)),
+                }
             await compiled.aupdate_state(
                 cfg,
-                {
-                    "pending_approval": None,
-                    "approval_resume": {
-                        "decision": "approve",
-                        "binding_digest": request.binding_digest,
-                    },
-                },
+                {"pending_approval": None, "approval_resume": resume},
                 as_node="agent",
             )
             return await compiled.ainvoke(None, config=cfg)
@@ -220,11 +246,14 @@ def graph_harness():  # type: ignore[no-untyped-def]
         approval_required_tools: frozenset[str] | set[str] = frozenset(),
         action_screen: Literal["off", "block", "approval"] = "off",
         tool_schema: Mapping[str, Any] | None = None,
+        extra_bindings: Mapping[str, Mapping[str, str]] | None = None,
     ) -> _Harness:
         # ``bindings`` 用 wire 名(与测试正文一致),注册那一侧收的是**裸**名。
+        # ``extra_bindings`` 已经是裸名,用来造「这个工具服务器没有」的落空项。
         bare = {
             name.removeprefix(f"mcp__{_SERVER}__"): dict(bound) for name, bound in bindings.items()
         }
+        bare.update({name: dict(bound) for name, bound in (extra_bindings or {}).items()})
         schema = tool_schema or {
             "type": "object",
             "properties": {"project_code": {"type": "string"}, "keyword": {"type": "string"}},
@@ -329,8 +358,11 @@ async def test_a_param_absent_from_the_schema_is_never_injected_into_the_call(
 ) -> None:
     """追加要求之二 —— 上游改了接口:这条绑定按未命中处理,args 里不得出现该参数。
 
-    ``additionalProperties: false`` 的服务端会把多出来的参数当硬错拒掉,
-    那比「降级成模型自己填」更糟。
+    夹具**故意不带** ``additionalProperties: false``(复评 m-3):带上的话,多注入
+    的参数会先被平台自己的入参校验拦下,这条用例就红在「工具压根没跑」上 —— 说的
+    是另一件事。要钉住的是「服务端收到的 args 里没有这个参数」,所以让调用一路跑到
+    ``RecordingMCPClient``,断言落在它真正收到的那份 args 上。
+    ``additionalProperties: false`` 自己那条路由 C-1 那条用例覆盖。
     """
     harness = await graph_harness(
         bindings={_WIRE: {"project_code": "pc"}},
@@ -339,7 +371,6 @@ async def test_a_param_absent_from_the_schema_is_never_injected_into_the_call(
             "type": "object",
             "properties": {"keyword": {"type": "string"}},
             "required": ["keyword"],
-            "additionalProperties": False,
         },
     )
     await harness.run_turn_with_tool_call(_WIRE, {"keyword": "王"})
@@ -347,6 +378,66 @@ async def test_a_param_absent_from_the_schema_is_never_injected_into_the_call(
     _, sent_args = harness.client.calls[-1]
     assert "project_code" not in sent_args
     assert sent_args["keyword"] == "王"
+
+
+async def test_a_bound_param_dispatches_on_a_strict_additional_properties_tool(
+    graph_harness,
+) -> None:
+    """C-1 —— 被绑参数**在** schema 里、且 ``additionalProperties: false``。
+
+    剥 schema 是为了让**模型**看不见这个参数;服务端那边什么都没变 —— 它照旧声明
+    这个参数、照旧把它列进 ``required``,而 ``additionalProperties: false``
+    (zod / MCP TS SDK 默认、pydantic ``extra="forbid"``)会把任何它不认识的属性判
+    成非法。dispatch 前的入参校验要是对着**剥过的**那份 schema 判,平台自己刚注入的
+    那个参数就成了「多余属性」,一条**配置完全正确**的绑定于是一次也发不出去,
+    而保存时的闸对此一无所知(``unmatched_arg_bindings`` 是空的)。
+    """
+    harness = await graph_harness(
+        bindings={_WIRE: {"project_code": "pc"}},
+        prompt_inputs={"pc": "PRJ001"},
+        tool_schema={
+            "type": "object",
+            "properties": {
+                "project_code": {"type": "string"},
+                "keyword": {"type": "string"},
+            },
+            "required": ["project_code", "keyword"],
+            "additionalProperties": False,
+        },
+    )
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "王"})
+    assert harness.client.calls, "调用必须真的发出去 —— 绑定配得完全正确"
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args["project_code"] == "PRJ001"
+    assert sent_args["keyword"] == "王"
+    # 模型那一侧仍然看不见它 —— 修 C-1 不能靠「别剥了」。
+    model_schema = harness.registry.get_required(_WIRE).spec.parameters
+    assert "project_code" not in model_schema["properties"]
+
+
+async def test_the_platform_validator_still_judges_the_value_it_injected(
+    graph_harness,
+) -> None:
+    """C-1 的反面:对着服务端合同判,不等于把被绑参数从校验里豁免掉。
+
+    平台注入的值如果不合服务端声明的类型,照样要在 dispatch 前被拦下 —— 豁免的话
+    这个值就没人看着了。
+    """
+    harness = await graph_harness(
+        bindings={_WIRE: {"project_code": "pc"}},
+        prompt_inputs={"pc": 12345},  # 声明的是 string
+        tool_schema={
+            "type": "object",
+            "properties": {
+                "project_code": {"type": "string"},
+                "keyword": {"type": "string"},
+            },
+            "required": ["project_code", "keyword"],
+            "additionalProperties": False,
+        },
+    )
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "王"})
+    assert harness.client.calls == [], "类型不对的值不该发给服务端"
 
 
 async def test_approving_a_paused_call_dispatches_the_bound_value(graph_harness) -> None:
@@ -362,7 +453,7 @@ async def test_approving_a_paused_call_dispatches_the_bound_value(graph_harness)
         bindings={_WIRE: {"project_code": "pc"}},
         prompt_inputs={"pc": "PRJ001"},
     )
-    state = await harness.approve_and_continue(_WIRE, {"keyword": "王"})
+    state = await harness.resume_and_continue(_WIRE, {"keyword": "王"})
     assert harness.client.calls, "批准之后工具应当真的跑起来(没被判成 binding drift)"
     _, sent_args = harness.client.calls[-1]
     assert sent_args["project_code"] == "PRJ001"
@@ -400,7 +491,9 @@ async def test_a_binding_for_an_unadvertised_tool_is_reported_as_unmatched(
         arg_bindings={"t9": {"project_code": "pc"}},
     )
     assert registry.get(_WIRE) is not None
-    assert registry.unmatched_arg_bindings() == ((_SERVER, "t9"),)
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(server=_SERVER, tool="t9", params=("project_code",), tool_found=False),
+    )
 
 
 async def test_a_binding_for_a_server_that_never_registered_is_reported_as_unmatched() -> None:
@@ -415,7 +508,11 @@ async def test_a_binding_for_a_server_that_never_registered_is_reported_as_unmat
         ],
         tool_env=ToolEnv(mcp_pool=await _pool_with_t1()),
     )
-    assert registry.unmatched_arg_bindings() == (("nosuchserver", "t1"),)
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(
+            server="nosuchserver", tool="t1", params=("project_code",), tool_found=False
+        ),
+    )
 
 
 async def test_a_binding_that_matches_reports_nothing() -> None:
@@ -432,3 +529,154 @@ async def test_a_binding_that_matches_reports_nothing() -> None:
     )
     assert registry.unmatched_arg_bindings() == ()
     assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}
+
+
+# ---------------------------------------------------------------------------
+# 复评修复轮 1
+# ---------------------------------------------------------------------------
+
+
+async def test_the_run_warns_when_a_binding_matched_nothing(graph_harness, caplog) -> None:
+    """裁定 Z —— 运行期兜底告警(spec §5.4 / §8)。
+
+    保存时的那道闸只在保存那一刻说话。对方服务器是**保存之后**下线 / 改名的那条路
+    上,运行期是唯一还能说话的地方 —— 不说就是静默失效。
+    """
+    caplog.set_level(logging.WARNING, logger="orchestrator.graph_builder.builder")
+    harness = await graph_harness(
+        bindings={_WIRE: {"project_code": "pc"}},
+        prompt_inputs={"pc": "PRJ001"},
+        extra_bindings={"t9": {"employee_code": "emp"}},
+    )
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "王"})
+    assert "mcp.arg_binding_unmatched" in caplog.text
+    assert "t9" in caplog.text
+    assert "employee_code" in caplog.text
+    assert "PRJ001" not in caplog.text, "只记名字,不记值"
+
+
+async def test_a_drifted_param_also_reaches_the_save_time_gate(mcp_registry_factory) -> None:
+    """m-4 —— 「参数不在 schema 里」也走未命中那条通道,别只留一行日志。
+
+    ``tool_found=True`` 把它与「这个工具压根不存在」分开:后果一样(参数回到模型
+    手里),但配置的人要做的事完全不同。
+    """
+    registry, _ = await mcp_registry_factory(
+        tools=[{"name": "t1", "input_schema": {"type": "object", "properties": {"keyword": {}}}}],
+        arg_bindings={"t1": {"gone": "pc"}},
+    )
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(server=_SERVER, tool="t1", params=("gone",), tool_found=True),
+    )
+
+
+async def test_a_delegated_child_still_gets_the_bound_value(graph_harness) -> None:
+    """裁定 AA —— 子 Agent / worker 的 config 必须带上父的 ``prompt_inputs``。
+
+    子代跑的是同一个 ``tools_node``。config 里没有这一项时,``apply_arg_bindings``
+    对每个被绑参数走「本轮没给值 → 删掉」那条分支,而该参数已经从子代的 schema 里
+    剥掉、模型也补不上 —— 那个工具在子代身上永远缺一个必填参数。
+
+    走的是真链条:父的 configurable → ``_build_tool_context`` → ``_child_config``
+    → 子代 configurable → ``tools_node`` 填值 → ``RecordingMCPClient``。
+    """
+    parent_cfg: RunnableConfig = {
+        "configurable": {
+            "tenant_id": str(uuid4()),
+            "run_id": str(uuid4()),
+            PROMPT_INPUTS_KEY: {"pc": "PRJ001"},
+        }
+    }
+    ctx = _build_tool_context(parent_cfg)
+    assert ctx.prompt_inputs == {"pc": "PRJ001"}, "父侧要先把它捧上 ToolContext"
+
+    child_cfg = _child_config(ctx, sub_thread_id=uuid4(), sub_run_id=uuid4())
+    child_configurable = child_cfg["configurable"]
+    # 字面量与常量的一致性钉在这里 —— ``_child_run`` 不能 import ``orchestrator.sse``
+    # (会撞上半初始化的 orchestrator.context,实测 ImportError),所以键写的是字面量。
+    assert child_configurable[PROMPT_INPUTS_KEY] == {"pc": "PRJ001"}
+
+    harness = await graph_harness(
+        bindings={_WIRE: {"project_code": "pc"}},
+        prompt_inputs={},  # 子代自己的 config 里什么都没有,值只能来自透传
+    )
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "王"}, config=child_cfg)
+    assert harness.client.calls, "子代那次调用必须真发出去"
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args["project_code"] == "PRJ001"
+
+
+async def _pool(**servers: Sequence[MCPToolDef]) -> MCPServerPool:
+    pool = MCPServerPool()
+    for name, defs in servers.items():
+        await pool.add(name, RecordingMCPClient(tools=tuple(defs)))
+    return pool
+
+
+async def test_a_second_mcp_entry_does_not_wipe_the_first_ones_binding() -> None:
+    """裁定 AB —— 一份 manifest 两个 ``mcp`` 条目(协议层合法)。
+
+    每个条目都会把它选中的服务器整个再注册一遍。按条目各发各的绑定表,后注册的那
+    一条就会用「我这条没有绑定」把兄弟条目刚剥好的 schema 和刚记下的绑定一起抹掉,
+    而 ``unmatched_arg_bindings()`` 是空的 —— 保存时的告警一声不吭。
+    """
+    bound = MCPToolSpec(
+        servers=[_SERVER],
+        arg_bindings=[ArgBindingSpec(server=_SERVER, tool="t1", args={"project_code": "pc"})],
+    )
+    catch_all = MCPToolSpec()  # servers 为空 = 所有服务器
+    for order in ([bound, catch_all], [catch_all, bound]):
+        registry = await build_tool_registry(
+            list(order), tool_env=ToolEnv(mcp_pool=await _pool_with_t1())
+        )
+        assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}, order
+        schema = registry.get_required(_WIRE).spec.parameters
+        assert "project_code" not in (schema.get("properties") or {}), order
+        assert registry.unmatched_arg_bindings() == (), order
+
+
+async def test_a_wire_name_collision_still_clears_the_loser_binding() -> None:
+    """撞名清除那条语义仍然成立,而且只在**真的发生替换注册**时成立。
+
+    wire 名把非 ``[a-zA-Z0-9_-]`` 折成 ``_``,所以 ``(a, x__t)`` 与 ``(a__x, t)``
+    折出同一个名字。后注册的那个工具占住这个名字,绑定表就必须跟着换人 —— 否则
+    平台会拿着给 ``a`` 那个工具配的绑定去填 ``a__x`` 的工具。
+    """
+    registry = await build_tool_registry(
+        [MCPToolSpec(arg_bindings=[ArgBindingSpec(server="a", tool="x__t", args={"p": "pc"})])],
+        tool_env=ToolEnv(
+            mcp_pool=await _pool(
+                a=[MCPToolDef(name="x__t", description="", input_schema={"properties": {"p": {}}})],
+                a__x=[MCPToolDef(name="t", description="", input_schema={"properties": {"p": {}}})],
+            )
+        ),
+    )
+    # 后注册的 ``a__x/t`` 占住了 ``mcp__a__x__t``,它自己没有绑定。
+    assert registry.get_required("mcp__a__x__t").tool_def.name == "t"
+    assert registry.arg_bindings() == {}
+    # 它的 schema 也没被别人的绑定剥过。
+    assert "p" in registry.get_required("mcp__a__x__t").spec.parameters["properties"]
+
+
+async def test_a_human_modify_cannot_overwrite_a_platform_binding(graph_harness) -> None:
+    """裁定 AC —— ``modify`` 整份替换 args,绑定必须再套一遍。
+
+    两件事:平台的值永远赢(被绑参数不是模型选的,也就不归人在审批面上改);
+    审计行说的是真话(不重填的话它还声称那个参数是平台填的)。
+    """
+    harness = await graph_harness(
+        approval_required_tools={_WIRE},
+        bindings={_WIRE: {"project_code": "pc"}},
+        prompt_inputs={"pc": "PRJ001"},
+    )
+    await harness.resume_and_continue(
+        _WIRE,
+        {"keyword": "王"},
+        modified_args={"keyword": "李", "project_code": "PRJ-HAND-EDITED"},
+    )
+    assert harness.client.calls, "批准(改写)之后工具应当真的跑起来"
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args["project_code"] == "PRJ001", "平台的值赢"
+    assert sent_args["keyword"] == "李", "没被绑的参数,人改了就算数"
+    row = harness.audit_rows[-1]
+    assert row.details["bound_args"] == ["project_code"]

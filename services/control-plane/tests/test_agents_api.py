@@ -20,6 +20,7 @@ from expert_work.protocol import AuditAction, AuditQuery, Role, TriggerRecord
 from expert_work.runtime.runs import InMemoryRunEventStore, InMemoryRunStore, RunStatus
 from orchestrator import AgentFactoryError
 from orchestrator.errors import SkillNotFoundError
+from orchestrator.tools.registry import UnmatchedArgBinding
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -1050,7 +1051,22 @@ async def test_unmatched_arg_bindings_save_with_a_warning_not_a_refusal(
     app, client = b5_app_client
 
     async def _built_with_unmatched(spec, *, tenant_id=None, user_id=None):
-        return SimpleNamespace(unmatched_arg_bindings=(("deepcare", "customer_serach"),))
+        return SimpleNamespace(
+            unmatched_arg_bindings=(
+                UnmatchedArgBinding(
+                    server="deepcare",
+                    tool="customer_serach",
+                    params=("project_code",),
+                    tool_found=False,
+                ),
+                UnmatchedArgBinding(
+                    server="deepcare",
+                    tool="customer_search",
+                    params=("employee_code",),
+                    tool_found=True,
+                ),
+            )
+        )
 
     app.state.agent_runtime.agent_builder = _built_with_unmatched  # type: ignore[attr-defined]
 
@@ -1058,7 +1074,9 @@ async def test_unmatched_arg_bindings_save_with_a_warning_not_a_refusal(
     assert resp.status_code == 201, resp.text
     warning = resp.json()["data"]["build_warning"]
     assert warning is not None
-    assert "deepcare/customer_serach" in warning
+    # 两类落空的改法不同,话也要分开说。
+    assert "no such tool in the assembled catalog: deepcare/customer_serach" in warning
+    assert "the tool no longer declares: deepcare/customer_search (employee_code)" in warning
 
     # 保存真的发生了 —— 警告档的全部意义就在这。
     listed = await client.get("/v1/agents")

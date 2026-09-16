@@ -1291,23 +1291,45 @@ def build_react_graph(
         # 逐个 call 各调一次:审计行是 per-call 的,一次把整批填完只拿得到全轮
         # 汇总的参数名,会把 A 调用填的参数记到 B 调用头上。
         registry_bindings = tool_registry.arg_bindings()
-        # 没有绑定就整条路径不走:存量 agent 的 tool_calls 仍是 AIMessage 身上
-        # 那几个对象本身,零行为变化。
-        bound_arg_names: dict[int, list[str]] = {}
-        if registry_bindings:
+
+        def _fill_bound_args(
+            calls: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], dict[int, list[str]]]:
+            """填上平台绑定的参数,并返回每个调用各填了哪几个(只有名字)。
+
+            没有绑定就原样退回:存量 agent 的 tool_calls 仍是 AIMessage 身上那几个
+            对象本身,零行为变化。
+            """
+            if not registry_bindings:
+                return calls, {}
             configurable_now = config.get("configurable") or {}
             prompt_inputs = configurable_now.get(PROMPT_INPUTS_KEY) or {}
             filled: list[dict[str, Any]] = []
+            names_by_index: dict[int, list[str]] = {}
             # 变量名不叫 ``call``:函数下面的 ``for call, result in zip(stage, ...)``
             # 绑的是 ``_ScheduledCall``,同名会让类型检查把两者并成一个。
-            for index, raw_call in enumerate(tool_calls):
+            for index, raw_call in enumerate(calls):
                 (one_call,), names = apply_arg_bindings(
                     [raw_call], bindings=registry_bindings, inputs=prompt_inputs
                 )
                 filled.append(one_call)
                 if names:
-                    bound_arg_names[index] = names
-            tool_calls = filled
+                    names_by_index[index] = names
+            return filled, names_by_index
+
+        tool_calls, bound_arg_names = _fill_bound_args(tool_calls)
+        # B-61 §5.4 / §8 —— 运行期兜底告警。保存时的试建早就过去了,对方服务器
+        # 是**保存之后**下线 / 改名的那条路上,这里是唯一还能说话的地方 —— 不说
+        # 就是静默失效:参数回到模型手里,模型继续手抄那串长字符串。
+        # 只记 server / 工具名 / 参数名,一个值都不记(这些值就是客户的真实资料)。
+        for unmatched in tool_registry.unmatched_arg_bindings():
+            logger.warning(
+                "mcp.arg_binding_unmatched server=%s tool=%r params=%s tool_found=%s",
+                unmatched.server,
+                unmatched.tool,
+                list(unmatched.params),
+                unmatched.tool_found,
+            )
 
         # Stream J.8 (Mini-ADR J-24) — approval gate. Two re-entrant paths:
         #
@@ -1357,7 +1379,14 @@ def build_react_graph(
                 return rejected
             # approve / modify — fall through to dispatch the (possibly
             # arg-rewritten) calls; clear the resume channel on return.
-            tool_calls = resume_outcome.tool_calls
+            #
+            # B-61 §5.3 —— 再套一遍绑定。``modify`` 拿人工给的 ``modified_args``
+            # **整份替换**那条 call 的 args,于是(a)被绑参数会被人在审批面上静默
+            # 覆盖,而 spec 写的是「平台的值永远覆盖同名参数」——被绑参数根本不是
+            # 模型选的,也就不归人在这里改;(b)不重填的话 ``bound_arg_names`` 还
+            # 声称那个参数是平台填的,审计行就说了假话。``approve``(没改写)时这
+            # 一遍是幂等的,填进去的还是同样的值。
+            tool_calls, bound_arg_names = _fill_bound_args(resume_outcome.tool_calls)
         elif not state.get("pending_approval"):
             # Stream PI-3b — action screening: judge each proposed tool call
             # against the user's request before dispatch. A misaligned turn is
@@ -3112,6 +3141,10 @@ def _build_tool_context(
     # B-61 §4.4 —— 子代要指向**父** run 的 inputs.json(``_child_config`` 写进来
     # 的;主 run 的 config 里没有这一项,回落 ``None`` = 用自己的 run_id)。
     inputs_run_id = _parse_uuid(configurable.get("inputs_run_id"))
+    # B-61 §5.3 —— 本轮声明变量的值,只为 ``_child_config`` 往子代传(子代的
+    # config 里没有这一项,它的被绑参数就会被静默摘掉)。主 run 的填值不走这里。
+    raw_prompt_inputs = configurable.get(PROMPT_INPUTS_KEY)
+    prompt_inputs = raw_prompt_inputs if isinstance(raw_prompt_inputs, Mapping) else None
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -3132,6 +3165,7 @@ def _build_tool_context(
         turn_image_refs=images,
         agent_key=agent_key,
         inputs_run_id=inputs_run_id,
+        prompt_inputs=prompt_inputs,
     )
 
 
@@ -3162,8 +3196,18 @@ def _validate_tool_args(tool: Tool, args: Mapping[str, Any]) -> str | None:
     catching them here gives the model a grounded fix-it signal instead of an
     opaque downstream crash. A malformed *schema* (the tool's own bug) is not
     allowed to block dispatch — we skip validation in that case.
+
+    B-61 §5.2 — validates against ``dispatch_parameters`` when the tool has one.
+    A tool with bound parameters publishes TWO schemas: ``parameters`` is the
+    narrowed view handed to the model (bound parameters deleted so it cannot
+    fill them), while ``dispatch_parameters`` is the contract the callee
+    actually enforces. The args reaching here are the FILLED ones, so they must
+    be judged against the callee's contract: judging them against the narrowed
+    view means the parameter the platform just injected is an unknown property,
+    and on any ``additionalProperties: false`` server (the zod / MCP TS SDK
+    default) a correctly configured binding could never dispatch at all.
     """
-    schema = tool.spec.parameters
+    schema = tool.spec.dispatch_parameters or tool.spec.parameters
     if not schema:
         return None
     validator_cls = Draft202012Validator

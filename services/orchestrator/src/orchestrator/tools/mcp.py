@@ -827,6 +827,13 @@ class MCPTool:
     tool_def: MCPToolDef
     server_name: str
     content_char_cap: int = DEFAULT_MCP_CHAR_CAP
+    #: B-61 §5.2 — the server's own schema, when ``tool_def.input_schema`` has
+    #: been narrowed for the model (bound parameters stripped). Carried onto
+    #: ``spec.dispatch_parameters`` so pre-dispatch validation runs against the
+    #: contract the server published rather than the narrowed view; see that
+    #: field's docstring for why validating against the narrowed one breaks a
+    #: correctly configured binding. ``None`` when nothing was stripped.
+    dispatch_schema: Mapping[str, Any] | None = None
     spec: ToolSpec = field(init=False)
 
     def __post_init__(self) -> None:
@@ -840,6 +847,7 @@ class MCPTool:
                 name=mcp_tool_name(self.server_name, self.tool_def.name),
                 description=self.tool_def.description,
                 parameters=self.tool_def.input_schema,
+                dispatch_parameters=self.dispatch_schema,
             ),
         )
 
@@ -994,6 +1002,7 @@ async def register_mcp_tools(
         if allow_tools is not None and tool_def.name not in allow_tools:
             continue
         bound = pending_bindings.pop(tool_def.name, None) or {}
+        dispatch_schema: Mapping[str, Any] | None = None
         if bound:
             absent = unbindable_params(tool_def.input_schema, bound)
             if absent:
@@ -1006,8 +1015,16 @@ async def register_mcp_tools(
                     tool_def.name,
                     absent,
                 )
+                # 与「整条没匹配上」走同一条通道:只有一行 orchestrator 日志的话,
+                # 配置的人在保存面上什么也看不到(spec §5.4 说这条「按未命中处理」)。
+                registry.note_unmatched_arg_binding(
+                    server_name, tool_def.name, tuple(absent), tool_found=True
+                )
                 for param in absent:
                     del bound[param]
+        if bound:
+            # 剥之前的那份是服务端的合同,dispatch 前的校验要对着它。
+            dispatch_schema = tool_def.input_schema
             tool_def = replace(
                 tool_def, input_schema=strip_bound_params(tool_def.input_schema, bound)
             )
@@ -1016,13 +1033,16 @@ async def register_mcp_tools(
             tool_def=tool_def,
             server_name=server_name,
             content_char_cap=content_char_cap,
+            dispatch_schema=dispatch_schema,
         )
         registry.register(expert_work_tool, deferred=deferred, source=f"mcp:{server_name}")
         # 无条件调:空 ``bound`` 会清掉同名旧表项(见 ``bind_tool_args``)。
         registry.bind_tool_args(expert_work_tool.spec.name, bound)
         registered.append(expert_work_tool.spec.name)
-    for tool_name in pending_bindings:
-        registry.note_unmatched_arg_binding(server_name, tool_name)
+    for tool_name, unmatched_args in pending_bindings.items():
+        registry.note_unmatched_arg_binding(
+            server_name, tool_name, tuple(unmatched_args), tool_found=False
+        )
     logger.info("mcp.registered server=%s tools=%s", server_name, registered)
     return registered
 

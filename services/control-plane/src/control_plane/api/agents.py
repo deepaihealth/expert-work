@@ -1049,12 +1049,25 @@ def _unmatched_binding_warning(built: Any) -> str | None:
     unmatched = getattr(built, "unmatched_arg_bindings", ()) or ()
     if not unmatched:
         return None
-    listed = ", ".join(f"{server}/{tool}" for server, tool in unmatched)
+    # 两类落空的改法完全不同,所以分开说:名字写错 / 服务器没挂上,是「这个工具
+    # 压根不在目录里」;上游改了接口,是「工具在,但它不再声明这个参数」。
+    no_tool = [_binding_label(u) for u in unmatched if not u.tool_found]
+    no_param = [_binding_label(u) for u in unmatched if u.tool_found]
+    chunks: list[str] = []
+    if no_tool:
+        chunks.append("no such tool in the assembled catalog: " + "; ".join(no_tool))
+    if no_param:
+        chunks.append("the tool no longer declares: " + "; ".join(no_param))
     return (
-        "these arg_bindings matched no tool in the assembled catalog, so their "
-        f"parameters stay in the model's hands: {listed} — check the server / "
-        "tool spelling, or that the server is reachable and enabled for this tenant"
+        "some arg_bindings did not land, so their parameters stay in the model's "
+        "hands — " + " | ".join(chunks) + ". Check the server / tool / parameter "
+        "spelling, and that the server is reachable and enabled for this tenant."
     )
+
+
+def _binding_label(unmatched: Any) -> str:
+    """``server/tool (param, param)`` —— 只有名字,一个值都不带。"""
+    return f"{unmatched.server}/{unmatched.tool} ({', '.join(unmatched.params)})"
 
 
 async def _load_manifest(

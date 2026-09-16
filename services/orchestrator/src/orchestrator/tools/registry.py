@@ -135,6 +135,24 @@ class ToolSpec:
     #: ``tool_choice.allowed_tools`` subset (full schema stays on the wire).
     #: Default ``False`` — the application tier (HX-12) never sets it.
     defer_loading: bool = False
+    #: B-61 §5.2 — the JSON Schema the **callee** enforces, when that differs
+    #: from the one the model is shown. ``None`` (every tool but a bound MCP
+    #: one) means ``parameters`` IS the whole contract.
+    #:
+    #: Why two: binding a parameter deletes it from ``parameters`` so the model
+    #: cannot fill it (and cannot retype it wrong) — but the server on the other
+    #: end never agreed to that narrowing. It still declares the parameter, still
+    #: lists it in ``required``, and with ``additionalProperties: false`` (the zod
+    #: / MCP TS SDK default, and pydantic ``extra="forbid"``) it would reject the
+    #: platform-filled value as an unknown property. Pre-dispatch validation must
+    #: therefore run against THIS schema, not the narrowed one; validating against
+    #: the narrowed one makes a correctly configured binding undispatchable.
+    #:
+    #: Note what this is NOT: an exemption. The bound parameter is still validated
+    #: — type, enum, pattern and all — it is just validated against the contract
+    #: the callee published. Skipping it instead would leave the platform-injected
+    #: value unchecked by anyone.
+    dispatch_parameters: Mapping[str, Any] | None = None
 
     @property
     def resolved_side_effect(self) -> SideEffectLevel:
@@ -150,6 +168,26 @@ class ToolSpec:
         if self.side_effect is not None:
             return self.side_effect
         return "read_only" if self.is_read_only else "reversible"
+
+
+@dataclass(frozen=True)
+class UnmatchedArgBinding:
+    """B-61 §5.4 —— 一条参数绑定没能落到真实工具上,以及落空到什么程度。
+
+    只带**名字**:server、裸工具名、参数名。绑定的值是客户的真实资料(项目号、
+    姓名),这条记录会走进保存响应和运行期日志,一个值都不能带。
+
+    ``tool_found`` 分开两种落空,因为给配置的人的话不一样:
+    ``False`` = 这个工具在组装出来的目录里根本不存在(server / tool 名字写错,
+    或那台服务器这次没挂上);``True`` = 工具在,只是它已经不声明这几个参数了
+    (上游改了接口)。两种的后果相同 —— 参数回到模型手里 —— 但改法完全不同。
+    """
+
+    server: str
+    tool: str
+    #: 落空的参数名。``tool_found=False`` 时是这条绑定的全部参数。
+    params: tuple[str, ...]
+    tool_found: bool
 
 
 @dataclass(frozen=True)
@@ -291,6 +329,18 @@ class ToolContext:
     #: ``/workspace``,所以把**父的** run id 传下来,指针就落在父那份真文件上
     #: (与 agent_key / 技能种子路径同一个取值口径:用父的)。
     inputs_run_id: UUID | None = None
+    #: B-61 §5.3 —— 本轮声明变量的值(变量名 → 值)。
+    #:
+    #: 唯一用途是 ``_child_config`` 把它往子代传:委派出去的 worker / 静态子
+    #: Agent 跑的是同一个 ``tools_node``,子代的 config 里没有 ``prompt_inputs``
+    #: 时,``apply_arg_bindings`` 对每个被绑参数走「本轮没给值 → 删掉」那条分支,
+    #: 而该参数已经从子代的 schema 里剥掉、模型也补不上 —— 那个工具在子代身上
+    #: 就永远缺一个必填参数。绑定属于**父**的 spec,子代干的也是父 agent 的活,
+    #: 所以取值口径与 ``agent_key`` / ``inputs_run_id`` 一致:用父的。
+    #:
+    #: 主 run 的填值不读这里,它直接读 ``config["configurable"]``(那是这些值的
+    #: 出处);``None`` = 这条 run 没有声明变量。
+    prompt_inputs: Mapping[str, Any] | None = None
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``
@@ -433,10 +483,10 @@ class ToolRegistry:
         #: 直接查这张表,所以键必须是折叠后的 wire 名(折叠规则只有
         #: ``register_mcp_tools`` 那一处知道)。
         self._arg_bindings: dict[str, dict[str, str]] = {}
-        #: B-61 §5.4 — 一个工具都没匹配上的绑定 ``(server, 裸工具名)``。运行期
-        #: 没有消费者:它只是随 ``BuiltAgent`` 走到保存时的试建,当场告诉配置的
-        #: 人「这条绑定没落到任何工具上」。
-        self._unmatched_arg_bindings: list[tuple[str, str]] = []
+        #: B-61 §5.4 — 落空的绑定。两个消费者:随 ``BuiltAgent`` 走到保存时的
+        #: 试建(当场告诉配置的人),以及 ``tools_node`` 的运行期兜底告警 ——
+        #: 保存之后对方才下线 / 改名的那条路上,运行期是唯一还能说话的地方。
+        self._unmatched_arg_bindings: list[UnmatchedArgBinding] = []
 
     def register(self, tool: Tool, *, deferred: bool = False, source: str | None = None) -> None:
         """Register a tool by its spec ``name``. Re-registering replaces.
@@ -523,16 +573,30 @@ class ToolRegistry:
         else:
             self._arg_bindings.pop(name, None)
 
-    def arg_bindings(self) -> Mapping[str, Mapping[str, str]]:
-        """B-61 §5.3 — ``tools_node`` 填值时查的那张表。只读,别就地改。"""
-        return self._arg_bindings
+    def arg_bindings(self) -> dict[str, dict[str, str]]:
+        """B-61 §5.3 — ``tools_node`` 填值时查的那张表,每次一份新的拷贝。
 
-    def note_unmatched_arg_binding(self, server: str, tool: str) -> None:
-        """B-61 §5.4 — 这条绑定一个工具都没匹配上(名字写错 / 上游下线)。"""
-        self._unmatched_arg_bindings.append((server, tool))
+        与 :meth:`catalog` 同一口径。交出活字典等于把「下游只读」写成一条靠
+        约定成立的不变式,而这张表活在 ``BuiltAgent`` 缓存里 —— 谁就地改一下,
+        之后每一个 run 拿到的都是被污染的绑定。
+        """
+        return {name: dict(bound) for name, bound in self._arg_bindings.items()}
 
-    def unmatched_arg_bindings(self) -> tuple[tuple[str, str], ...]:
-        """本次构建里没匹配上任何工具的绑定,``(server, 裸工具名)``。"""
+    def note_unmatched_arg_binding(
+        self, server: str, tool: str, params: tuple[str, ...], *, tool_found: bool
+    ) -> None:
+        """B-61 §5.4 — 记一条落空的绑定。``params`` 只有名字,绝不含值。
+
+        同一条记两次就丢掉后一条:一份 manifest 可以有多个 ``mcp`` 条目,
+        每一条都会把同一台服务器再注册一遍,于是同一条落空的绑定会被发现
+        多次 —— 那是同一个事实,说一次就够(说两次只会让告警看起来像两个问题)。
+        """
+        record = UnmatchedArgBinding(server=server, tool=tool, params=params, tool_found=tool_found)
+        if record not in self._unmatched_arg_bindings:
+            self._unmatched_arg_bindings.append(record)
+
+    def unmatched_arg_bindings(self) -> tuple[UnmatchedArgBinding, ...]:
+        """本次构建里落空的绑定(整条没匹配上的 + 参数漂移的)。"""
         return tuple(self._unmatched_arg_bindings)
 
     def deferred_specs(self, names: Iterable[str]) -> list[ToolSpec]:
