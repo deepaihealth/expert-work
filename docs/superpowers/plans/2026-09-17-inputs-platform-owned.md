@@ -1150,6 +1150,8 @@ git commit -m "feat(orchestrator): B-67 B —— BuiltAgent.arg_bindings 带 man
 
 ## Task 6: `render_value` —— `{{ var }}` 按值的形态渲染
 
+> **已被终审修复波的裁定取代(以 spec §五 为准)**:被绑定的变量同样按形态渲染(`render_value` 无 `bindings` 参数,下面的「绑定 → 平台自动填」分支与对应用例 / 变异作废);未传的变量不进 `render_value`;trusted 的真 list / dict 保留结构;untrusted 整段一个围栏(P8)。
+
 **Files:**
 - Modify: `services/control-plane/src/control_plane/prompt_render.py`
 - Test: `services/control-plane/tests/test_prompt_render.py`

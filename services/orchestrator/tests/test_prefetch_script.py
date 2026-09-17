@@ -796,7 +796,7 @@ _AT_DEPTH_BOUND = _wrapped({"url": "https://x/b.png"}, prefetch_script.MAX_PARSE
 #: 深度闸),两侧任何一侧改了这些,至少一行会红。
 _NAME_CORPUS: list[tuple[str, Any, list[str]]] = [
     ("org_logo", "https://x/cover-1726394851207.png", ["org_logo.png"]),
-    ("brand", {"logo": "https://x/l.jpg", "name": "深护"}, ["brand.logo.jpg"]),
+    ("brand", {"logo": "https://x/l.jpg", "name": "示例机构"}, ["brand.logo.jpg"]),
     (
         "materials",
         '[{"description": "示范 视频", "url": "https://x/a.mp4"}, {"description": "无链接"},'

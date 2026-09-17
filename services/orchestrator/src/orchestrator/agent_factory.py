@@ -141,6 +141,7 @@ from orchestrator.multimodal import ImageResolver
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.runner import GraphRunner
 from orchestrator.tools import ToolEnv, build_tool_registry
+from orchestrator.tools.arg_bindings import manifest_bindings
 from orchestrator.tools.file_ops import SandboxWorkspaceWriter
 from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.manage_task import ManageTaskTool
@@ -1193,6 +1194,8 @@ async def build_agent(
         tool_catalog=registry.catalog(),
         # B-61 §5.4 —— 落空的参数绑定,给保存时的试建当 warning 用。
         unmatched_arg_bindings=registry.unmatched_arg_bindings(),
+        # B-67 §五 —— manifest 原件的绑定表,「本轮输入」段报告绑定状态用。
+        arg_bindings=manifest_bindings(spec.spec.tools),
         # Stream PI-1c — expose the build nonce so the control-plane seed
         # assembler can fence structured untrusted_content with it.
         spotlight_nonce=spotlight_nonce,

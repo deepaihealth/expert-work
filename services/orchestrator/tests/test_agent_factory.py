@@ -10,7 +10,13 @@ import pytest
 from langgraph.graph.state import CompiledStateGraph
 
 from expert_work.persistence import InMemoryKnowledgeStore, InMemoryMemoryStore
-from expert_work.protocol import AgentSpec, BuiltinToolSpec, ModelSpec, StructuredOutputSpec
+from expert_work.protocol import (
+    AgentSpec,
+    ArgBindingSpec,
+    BuiltinToolSpec,
+    ModelSpec,
+    StructuredOutputSpec,
+)
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.middleware import RecordingLangfuseClient
 from expert_work.runtime.secret_store import LocalDevSecretStore
@@ -30,7 +36,13 @@ from orchestrator import (
 from orchestrator.agent_factory import _build_provider, _chat_stream_deadline_s
 from orchestrator.llm import FakeEmbedder, RateLimitedProvider
 from orchestrator.llm.providers.openai_compatible import OpenAICompatibleProvider
-from orchestrator.tools import KnowledgeRetriever, RecordingTavilyClient
+from orchestrator.tools import (
+    KnowledgeRetriever,
+    MCPServerPool,
+    MCPToolDef,
+    RecordingMCPClient,
+    RecordingTavilyClient,
+)
 from orchestrator.tools.registry import ToolRegistry
 
 # ---------------------------------------------------------------------------
@@ -420,6 +432,45 @@ async def test_build_agent_returns_built_agent() -> None:
     assert "## Untrusted content" in built.system_prompt
     # Default WorkflowSpec.max_iterations.
     assert built.max_steps == 30
+
+
+@pytest.mark.asyncio
+async def test_build_agent_carries_the_manifest_arg_bindings() -> None:
+    """B-67 §五 —— ``BuiltAgent.arg_bindings`` 是 manifest 原件的绑定表(「本轮输入」段据此
+    报告绑定状态);参数名与变量名故意不同。"""
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["system_prompt"] = {
+        "template": "项目 {{ project_code }}",
+        "jinja": True,
+        "variables": [{"name": "project_code"}],
+    }
+    doc["spec"]["tools"] = [
+        {
+            "type": "mcp",
+            "servers": ["deepcare"],
+            "arg_bindings": [
+                {"server": "deepcare", "tool": "t1", "args": {"project": "project_code"}}
+            ],
+        }
+    ]
+    spec = AgentSpec.model_validate(doc)
+    schema = {"type": "object", "properties": {"project": {"type": "string"}}}
+    pool = MCPServerPool()
+    await pool.add(
+        "deepcare",
+        RecordingMCPClient(
+            tools=(MCPToolDef(name="t1", description="t1", input_schema=schema),),
+            responses={"t1": "ok"},
+        ),
+    )
+    async with make_checkpointer("memory") as cp:
+        built = await _build(
+            spec, secret_store=_secret_store(), checkpointer=cp, tool_env=ToolEnv(mcp_pool=pool)
+        )
+    assert built.arg_bindings == (
+        ArgBindingSpec(server="deepcare", tool="t1", args={"project": "project_code"}),
+    )
+    assert built.unmatched_arg_bindings == ()
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from langgraph.graph.state import CompiledStateGraph
 
 from expert_work.common.skill_run_usage import BoundDistilledSkill
-from expert_work.protocol import PromptVariableSpec
+from expert_work.protocol import ArgBindingSpec, PromptVariableSpec
 
 if TYPE_CHECKING:
     # Type-only so this module stays a leaf (no runtime edge into
@@ -118,3 +118,7 @@ class BuiltAgent:
     #: 运行期另有一条兜底告警,读的是 registry 上的同一份(spec §5.4)。
     #: 带默认值,存量构造点一处都不用改。
     unmatched_arg_bindings: tuple[UnmatchedArgBinding, ...] = ()
+    #: B-67 §五 —— manifest 原件的参数绑定表(``arg_bindings.manifest_bindings``)。
+    #: control-plane 的「本轮输入」段据此报告哪些变量已绑定(模板里的值照常按形态渲染)。
+    #: 带默认值,存量构造点一处都不用改。
+    arg_bindings: tuple[ArgBindingSpec, ...] = ()

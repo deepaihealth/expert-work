@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
-from expert_work.protocol import ArgBindingSpec
+from expert_work.protocol import ArgBindingSpec, BuiltinToolSpec, MCPToolSpec
 from orchestrator.tools.arg_bindings import (
     apply_arg_bindings,
     bindings_by_tool,
+    manifest_bindings,
     strip_bound_params,
 )
 
@@ -224,3 +226,37 @@ def test_a_forged_value_is_dropped_when_the_variable_is_absent() -> None:
     assert filled[0]["args"] == {"k": "1"}
     assert names == []
     assert calls[0]["args"] == {"project_code": "伪造", "k": "1"}, "原 tool_calls 不可变"
+
+
+def test_manifest_bindings_flatten_every_mcp_entry_verbatim() -> None:
+    """B-67 §五 —— 渲染层从 ``BuiltAgent.arg_bindings`` 判断哪些变量已绑定;取 manifest
+    原件(server / tool 原名、变量名原样),不取 registry 折叠后的 wire 名。"""
+    tools = [
+        BuiltinToolSpec(name="exec_python"),
+        MCPToolSpec(
+            servers=["deep-care"],
+            arg_bindings=[
+                ArgBindingSpec(server="deep-care", tool="t1", args={"pc": "project_code"})
+            ],
+        ),
+        MCPToolSpec(
+            servers=["other"],
+            arg_bindings=[ArgBindingSpec(server="other", tool="t2", args={"cc": "customer_code"})],
+        ),
+    ]
+    out = manifest_bindings(tools)
+    assert [(b.server, b.tool, b.args) for b in out] == [
+        ("deep-care", "t1", {"pc": "project_code"}),
+        ("other", "t2", {"cc": "customer_code"}),
+    ]
+    assert manifest_bindings([BuiltinToolSpec(name="bash")]) == ()
+
+
+def test_built_agent_defaults_to_no_bindings() -> None:
+    """存量构造点一处都不传 ``arg_bindings`` —— 字段必须有默认值,且默认就是空。"""
+    from orchestrator.built_agent import BuiltAgent
+
+    (field,) = [f for f in dataclasses.fields(BuiltAgent) if f.name == "arg_bindings"]
+    factory = field.default_factory
+    default = field.default if factory is dataclasses.MISSING else factory()
+    assert default == ()
