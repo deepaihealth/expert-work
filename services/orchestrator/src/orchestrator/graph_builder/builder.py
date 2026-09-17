@@ -137,6 +137,13 @@ from orchestrator.graph_builder._config import (
     current_run_id,
     token_sink_from_config,
 )
+from orchestrator.graph_builder.input_url_guard import (
+    GuardHit,
+    UrlCandidate,
+    candidates_from_inputs,
+    find_retyped_url,
+    guard_message,
+)
 from orchestrator.graph_builder.memory import MemoryNode, PreCompactionFlush
 from orchestrator.graph_builder.planner import PlannerNode, render_plan
 from orchestrator.graph_builder.reflect import ReflectNode
@@ -436,6 +443,9 @@ def build_react_graph(
     workspace_ingest_node: MemoryNode | None = None,
     # B-61 — run-start inputs.json materialize + in-sandbox prefetch.
     inputs_node: MemoryNode | None = None,
+    # B-67 §七 —— 本 agent 声明为 ``trusted`` 的变量名。手抄守卫的提示只对这些变量写出
+    # 链接名与模型抄的那串(那条合成消息不过 spotlight 围栏);默认空 = 一律不写。
+    trusted_input_names: frozenset[str] = frozenset(),
     escalated_llm_caller: LLMCaller | None = None,
     before_llm_chain: MiddlewareChain | None = None,
     after_llm_chain: MiddlewareChain | None = None,
@@ -1457,6 +1467,19 @@ def build_react_graph(
                     )
                 }
 
+        # B-67 §七 —— 手抄守卫:沙箱代码里出现本轮输入 URL 的原文或近似 → 那一条不派发。
+        # 放在填参之后、派发之前;只影响派发(下面 ``_bounded``),不改审批门与 action
+        # screening 的判定和下标语义(裁定 5)。审批续跑路径重新算一遍,判定是确定的。
+        guard_hits = _guard_sandbox_calls(tool_calls, config)
+        # 子代(``child_run``,只有 ``_child_config`` 会写)的 inputs 是父 run 的,本图的
+        # 声明管不到它们 → 守卫提示一律按 untrusted。不看 ``inputs_run_id``:主 run 的审批
+        # 续跑与复活续跑也会带它。
+        guard_trusted_names = (
+            frozenset()
+            if (config.get("configurable") or {}).get("child_run")
+            else trusted_input_names
+        )
+
         ctx_obj = _build_tool_context(
             config,
             plan=state.get("plan"),
@@ -1522,9 +1545,15 @@ def build_react_graph(
         semaphore = asyncio.Semaphore(MAX_TOOL_WORKERS)
 
         async def _bounded(
+            index: int,
             tc: dict[str, Any],
             bound_args: Sequence[str],
         ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
+            hit = guard_hits.get(index)
+            if hit is not None:
+                return await _reject_retyped_url(
+                    tc, hit, ctx_obj, audit_logger, trusted_input_names=guard_trusted_names
+                )
             async with semaphore:
                 return await _run_call(tc, bound_args)
 
@@ -1538,7 +1567,11 @@ def build_react_graph(
             # programmer error, both of which should propagate.
             stage_results = await asyncio.gather(
                 *(
-                    _bounded(tool_calls[call.index], bound_arg_names.get(call.index, ()))
+                    _bounded(
+                        call.index,
+                        tool_calls[call.index],
+                        bound_arg_names.get(call.index, ()),
+                    )
                     for call in stage
                 )
             )
@@ -2831,6 +2864,103 @@ def _with_bound_args(
     if not bound_args:
         return details
     return {**(details or {}), "bound_args": list(bound_args)}
+
+
+def _guard_sandbox_calls(
+    calls: Sequence[Mapping[str, Any]], config: RunnableConfig
+) -> dict[int, GuardHit]:
+    """B-67 §七 —— 对本批里的 exec_python / bash 调用做一次手抄比对,返回 ``{下标: 命中}``。
+
+    候选集只在本批真有沙箱调用且本轮有 inputs 时才算一次(``linked_sites`` 是纯函数,
+    但每批重算没必要);没有 inputs 的 run(存量非 jinja agent)零开销直接返回。
+    """
+    configurable = config.get("configurable") or {}
+    raw_inputs = configurable.get(PROMPT_INPUTS_KEY)
+    if not isinstance(raw_inputs, Mapping) or not raw_inputs:
+        return {}
+    candidates: tuple[UrlCandidate, ...] | None = None
+    hits: dict[int, GuardHit] = {}
+    # 守卫永不让 run 失败(C1):输入值与模型代码都是任意字符串,候选构建或比对出任何意外
+    # 都放行整批,只记异常类型 —— 异常文本里可能带着 URL。续跑重放同一条消息,抛出去就是
+    # 每次都挂。
+    try:
+        for index, call in enumerate(calls):
+            code_keys = _SANDBOX_CODE_ARGS.get(str(call.get("name", "")))
+            if code_keys is None:
+                continue
+            args = call.get("args") or {}
+            code = next((args[key] for key in code_keys if isinstance(args.get(key), str)), None)
+            if code is None:
+                continue
+            if candidates is None:
+                candidates = candidates_from_inputs(raw_inputs)
+                if not candidates:
+                    return {}
+            hit = find_retyped_url(code, candidates)
+            if hit is not None:
+                hits[index] = hit
+    except Exception as exc:
+        logger.warning("tools.input_url_guard_skipped err=%s", type(exc).__name__)
+        return {}
+    return hits
+
+
+async def _reject_retyped_url(
+    tool_call: Mapping[str, Any],
+    hit: GuardHit,
+    ctx: ToolContext,
+    audit_logger: AuditLogger | None,
+    *,
+    trusted_input_names: frozenset[str],
+) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
+    """B-67 §七 —— 守卫命中:不派发,合成错误 ToolMessage(形状同 action screening 的 block)。
+
+    一行 ``tool:blocked`` / ``reason=input_url_retyped`` 审计,记变量名与编辑距离。
+    ``args`` 去掉代码键(裁定 6):``_emit_tool_audit`` 对沙箱工具会记代码预览,那里面就是
+    那串手抄 URL;spec §八 说了不记。
+
+    这条消息不经 ``_invoke_tool``,也就不过 spotlight 围栏;链接名与模型抄的那串都带租户
+    数据,所以只对 ``trusted_input_names`` 里的变量写出来(子代由调用方传空集)。
+
+    分类用 ``invalid_arguments``(改参数、别原样重发),不用 ``blocked_by_policy``:后者的
+    恢复提示是「等审批 / 报给用户、别绕过」,正好与守卫要模型做的事(改成从清单读)相反。
+    """
+    name = str(tool_call.get("name", ""))
+    call_id = str(tool_call.get("id", ""))
+    code_keys = _SANDBOX_CODE_ARGS.get(name, ())
+    args = {k: v for k, v in (tool_call.get("args") or {}).items() if k not in code_keys}
+    trusted = hit.var_name in trusted_input_names
+    logger.warning(
+        "tools.input_url_retyped tool=%s variable=%s distance=%d",
+        name,
+        hit.var_name,
+        hit.distance,
+    )
+    # 只记 blocked 计数,不记延迟样本:没有派发就没有耗时,记一个 0 秒会拉低工具延迟分布。
+    _tool_call_total.labels(tool=_metric_tool_label(name), outcome="blocked").inc()
+    await _emit_tool_audit(
+        audit_logger,
+        ctx,
+        name=name,
+        call_id=call_id,
+        args=args,
+        path_args=(),
+        from_skill=None,
+        action=AuditAction.TOOL_BLOCKED,
+        result=AuditResult.DENIED,
+        reason="input_url_retyped",
+        duration_ms=0,
+        extra_details={"input_variable": hit.var_name, "edit_distance": hit.distance},
+    )
+    message = ToolMessage(
+        content=guard_message(hit, trusted=trusted),
+        tool_call_id=call_id,
+        status="error",
+        name=name,
+        additional_kwargs={"duration_ms": 0},
+    )
+    classified = classified_invalid_arguments(tool_name=name, summary="input_url_retyped")
+    return message, {}, 0, classified
 
 
 #: Sandbox executors whose submitted code/command IS recorded into the audit

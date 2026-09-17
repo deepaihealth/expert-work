@@ -258,6 +258,96 @@ def test_url_without_a_usable_suffix_gets_none() -> None:
     assert link_names("page", [((), "https://x/post", None)]) == ["page"]
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[oops/logo.png",  # urlparse: Invalid IPv6 URL
+        "https://例子／路径＠x/a.png",  # noqa: RUF001 — urlparse: NFKC 校验
+        "http://[v1.x/a.jpg",
+    ],
+)
+def test_url_suffix_never_raises_on_malformed_urls(url: str) -> None:
+    assert url_suffix(url) == ""
+
+
+_ODD_PIECES = [
+    "[",
+    "]",
+    "[::1]",
+    "／",  # noqa: RUF001
+    "＠",  # noqa: RUF001
+    "：",  # noqa: RUF001
+    "%",
+    "%zz",
+    " ",
+    "\t",
+    "\x00",
+    "\x7f",
+    "\ud800",
+    "?",
+    "#",
+    "@",
+    ":",
+    "..",
+    "/",
+    "图片",
+    ".png",
+    "\\",
+    '"',
+    "{",
+    "}",
+]
+
+
+def _odd_strings() -> list[str]:
+    """确定的一小组 + 固定种子的随机组合(括号、全角、%、空白、控制字符、超长)。"""
+    fixed = [
+        "https://[oops/logo.png",
+        "https://h/x.png]",
+        "http://[::1]:99999/x",
+        "https://[v1.x]/a",
+        "https://例子／路径＠x/a.png",  # noqa: RUF001
+        "https://h/\ud800.png",
+        "https://" + "[" * 5000,
+        "https://h/" + "a" * 100_000 + ".png",
+        "https://",
+        "http://",
+    ]
+    import random
+
+    rng = random.Random(20260917)  # noqa: S311 — 固定种子造测试数据
+    generated = [
+        rng.choice(["https://", "http://"])
+        + "".join(rng.choice(_ODD_PIECES) for _ in range(rng.randint(1, 12)))
+        for _ in range(400)
+    ]
+    return fixed + generated
+
+
+def _shapes(url: str) -> list[Any]:
+    return [
+        url,
+        {"logo": url},
+        [{"url": url, "description": url}],
+        '[{"url": ' + '"' + url.replace("\\", "\\\\").replace('"', '\\"') + '"}]',
+        {url: {"url": url}},
+    ]
+
+
+def test_linked_sites_never_raises_on_odd_strings() -> None:
+    """C1b:渲染层 / 「本轮输入」段 / 守卫 / 沙箱预拉都经这里,一个畸形值不能让它抛。"""
+    from orchestrator.tools import prefetch_script
+
+    for url in _odd_strings():
+        for value in _shapes(url):
+            sites = linked_sites("v", value)
+            assert isinstance(sites, list)
+            parsed = parse_json_value(value)
+            root = parsed if parsed is not None else value
+            sandbox = prefetch_script._linked_sites("v", root)
+            assert [s.link for s in sites] == [link for _p, _u, link in sandbox]
+
+
 def test_colliding_link_names_are_numbered_in_order() -> None:
     sites = [((0, "url"), "https://x/a.png", "封面"), ((0, "thumb"), "https://x/t.png", "封面")]
     assert link_names("m", sites) == ["m/0-封面.png", "m/0-封面-2.png"]

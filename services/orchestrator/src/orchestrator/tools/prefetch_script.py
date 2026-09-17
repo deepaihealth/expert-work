@@ -61,7 +61,10 @@ _RESERVED_NAMES = frozenset({_MANIFEST_NAME, _MANIFEST_NAME + _REWRITE_SUFFIX})
 
 
 def _url_suffix(url: str) -> str:
-    ext = posixpath.splitext(urlparse(url).path)[1]
+    try:
+        ext = posixpath.splitext(urlparse(url).path)[1]
+    except ValueError:
+        return ""
     return ext if _EXT_RE.match(ext) else ""
 
 
@@ -424,7 +427,13 @@ def main(argv: list[str]) -> int:
             continue
         root = _root_key(entry)
         # B-67 §4.1 —— 链接名在拉之前就定(与渲染层同一算法),拉到一个建一个。
-        for path, url, link in _linked_sites(name, entry.get(root)):
+        # 这一步在下面逐 site 的兜底之外:出任何意外只丢这一个变量,不带走整轮(C1)。
+        try:
+            sites = _linked_sites(name, entry.get(root))
+        except Exception:
+            report.append({"variable": name, "hit": False, "bytes": 0})
+            continue
+        for path, url, link in sites:
             hit = False
             used = 0
             try:

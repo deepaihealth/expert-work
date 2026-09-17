@@ -1142,6 +1142,10 @@ async def build_agent(
         workspace_writer_factory=workspace_writer_factory,
         workspace_ingest_node=workspace_ingest_node,
         inputs_node=inputs_node,
+        # B-67 §七 —— 手抄守卫的提示只对 trusted 变量写链接名。
+        trusted_input_names=frozenset(
+            var.name for var in spec.spec.system_prompt.variables if var.trusted
+        ),
         # Stream J.8 (Mini-ADR J-24) — declarative approval gate.
         approval_required_tools=frozenset(spec.spec.policies.approval_required_tools),
         approval_timeout_s=spec.spec.policies.approval_timeout_s,
