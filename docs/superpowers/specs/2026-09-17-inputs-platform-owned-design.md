@@ -76,7 +76,7 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 - **符号链接,不是硬链接**:缓存 7 天回收的账不能被 30 天的 run 目录拖住(硬链接会让字节活到最后一个链接消失)。链接失效 = 今天已接受的降级(B-61 §4.5),消费方判据「为空或本地不存在」不变。
 - 相对目标(`../cache/…`):NAS 视角与沙箱 `/workspace` 视角下都成立(B-60 的 exec view 是 agent 目录的 bind)。
 - 命名:顶层 URL 变量 → `<name><ext>`;dict 字段 → `<name>.<field><ext>`;列表项 → `<name>/<i>-<slug><ext>`,`slug` 取该项 `description` 前 40 字符,只保留 `[\w一-鿿.-]`,空则省略 `-<slug>`。同名撞车加 `-2`。
-- **`ext` 只取 URL 路径后缀**(`pick_suffix` 的 URL 分支),**不看 Content-Type**:渲染层(§五)在预拉之前就要说出这个名字,它只有 URL。URL 没有后缀就没有后缀。Content-Type 只继续决定 cache 文件名,不变。链接名的计算函数与渲染层**共用同一个**(`inputs_doc.link_name(var, path, url)`),用测试钉住两边同义。
+- **`ext` 只取 URL 路径后缀**(`pick_suffix` 的 URL 分支),**不看 Content-Type**:渲染层(§五)在预拉之前就要说出这个名字,它只有 URL。URL 没有后缀就没有后缀。Content-Type 只继续决定 cache 文件名,不变。链接名的计算函数与渲染层**共用同一个**(`inputs_doc.link_names(var, sites)`,`sites` 每项 `(path, url, description)`,撞名顺延要看同一变量的全部 site,所以按变量整批算),沙箱脚本里的逐字复制用测试钉住两边同义。
 - 建链接的时机:预拉脚本每拉完(或命中)一个 site 就建,和 `_rewrite` 同一节奏;链接**先删后建**(`os.symlink` 到已存在路径会 `FileExistsError`)。
 - `inputs.json` 里 `local_path` **改指链接**(`inputs/<run_id>/org_logo.png`),不再指 cache。老消费方按路径打开,两种都能打开;新消费方拿到的是可读的名字。
 
@@ -105,7 +105,7 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 | 其它(短文本、枚举、多行规则) | 原值(今天行为) | `trusted: false` 仍走 spotlight 围栏 |
 
 - **为什么 URL 渲染不需要知道预拉结果**:路径由名字决定,不由下载决定。渲染层只做字符串替换,不发网络请求,不查文件系统。
-- 名字用 §4.1 的同一个 `link_name`,所以提示词里说的名字与预拉建出来的链接**逐字相同**。
+- 名字用 §4.1 的同一个 `link_names`,所以提示词里说的名字与预拉建出来的链接**逐字相同**。
 - **被绑定的变量同样按形态渲染**(不再是「平台自动填」):绑定是逐工具的,有绑定的工具 schema 里已经没有这个参数,藏值换不来什么;漏绑的工具(部分绑定是常态)却会静默拿不到值。绑定状态由 §六「本轮输入」段报告。
 - `trusted: false`(裁定 P8):从值推出来的**整段**(说明、dict 键、路径 —— 路径里带着 slug)合成**一个**围栏;只有尾注是平台文本,在围栏外。带路径的行以「；」收尾,datamarking 的 `▁` 不会贴在路径上。
 - 已知代价:模板里对被改写的值做**内容比较**(`{{ 'x' if org_logo == '…' }}`)会失真;`| default('')` 这类**存在性**判断照旧成立(改写后的值非空)。写进文档。
