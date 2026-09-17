@@ -23,6 +23,12 @@ from orchestrator.agent_factory import (
 from orchestrator.agent_factory import (
     build_step_routers as build_step_routers,
 )
+from orchestrator.approval_turn import (
+    APPROVAL_TURN_RESET as APPROVAL_TURN_RESET,
+)
+from orchestrator.approval_turn import (
+    close_voided_turn as close_voided_turn,
+)
 from orchestrator.errors import (
     AgentFactoryError as AgentFactoryError,
 )
@@ -154,6 +160,7 @@ from orchestrator.tools import (
 )
 
 __all__ = [
+    "APPROVAL_TURN_RESET",
     "DEFAULT_MAX_STEPS",
     "DEFAULT_STREAM_MODE",
     "LLM_CACHE_BYPASS_KEY",
@@ -199,6 +206,7 @@ __all__ = [
     "build_react_graph",
     "build_step_routers",
     "build_tool_registry",
+    "close_voided_turn",
     "format_sse",
     "make_memory_recall_node",
     "make_memory_writeback_node",

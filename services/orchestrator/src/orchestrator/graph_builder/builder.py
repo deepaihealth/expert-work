@@ -1356,6 +1356,17 @@ def build_react_graph(
         #    end-and-resume model (vs LangGraph ``interrupt()``) keeps
         #    the parallel L.L6 staging below untouched.
         approval_resume = state.get("approval_resume")
+        # 审批三件套只属于一轮。本轮写下 ``pending_approval`` / ``approval_outcome``
+        # 的路都会经 ``_after_tools`` 直接收场、不会再进这个节点,所以这里读到的
+        # 非空值只可能是上一轮留下的。本节点的每个出口都把它们清掉 —— 不清,
+        # ``_after_tools`` 会读着陈旧值把这一轮提前结束(或带着上一轮的审批请求
+        # 以 PAUSED 收场)。图输入每轮也会清零(``APPROVAL_TURN_RESET``),这里是
+        # 不依赖入口的那道防线(班车 2 安全修复)。
+        stale_approval: dict[str, Any] = {
+            key: None
+            for key in ("pending_approval", "approval_outcome")
+            if state.get(key) is not None
+        }
         ingest_update: dict[str, Any] = {}
         if approval_resume is not None:
             # Stream CM-8 (Mini-ADR CM-I4) — the resume re-entry skips the
@@ -1380,6 +1391,7 @@ def build_react_graph(
                 )
             if resume_outcome.reject_messages:
                 rejected: dict[str, Any] = {
+                    **stale_approval,
                     **ingest_update,
                     "messages": list(resume_outcome.reject_messages),
                     "approval_resume": None,
@@ -1397,7 +1409,11 @@ def build_react_graph(
             # 声称那个参数是平台填的,审计行就说了假话。``approve``(没改写)时这
             # 一遍是幂等的,填进去的还是同样的值。
             tool_calls, bound_arg_names = _fill_bound_args(resume_outcome.tool_calls)
-        elif not state.get("pending_approval"):
+        else:
+            # 没有续跑在途时**无条件**走检测。这里原来是
+            # ``elif not state.get("pending_approval")`` —— 带着上一轮的陈旧值
+            # (见上面 ``stale_approval``)跳过检测,新一轮的门控调用就不经审批
+            # 直接执行了。
             # Stream PI-3b — action screening: judge each proposed tool call
             # against the user's request before dispatch. A misaligned turn is
             # denied (block) or routed to the approval gate (approval).
@@ -1414,6 +1430,7 @@ def build_react_graph(
                         configurable = config.get("configurable") or {}
                         thread_id = str(configurable.get("run_id") or "run")
                         return {
+                            **stale_approval,
                             "pending_approval": build_approval_request(
                                 ApprovalTarget(
                                     index=bad_idx,
@@ -1427,11 +1444,12 @@ def build_react_graph(
                                 # re-scan cannot reproduce it, so mint unbound to
                                 # avoid verifying the wrong call (RT-ADR-19).
                                 bind=False,
-                            )
+                            ),
                         }
                     # block — deny the whole turn (one error ToolMessage per
                     # call so no tool_call is left orphaned); the agent re-plans.
                     return {
+                        **stale_approval,
                         "messages": [
                             ToolMessage(
                                 content=(
@@ -1442,19 +1460,20 @@ def build_react_graph(
                                 status="error",
                             )
                             for call in tool_calls
-                        ]
+                        ],
                     }
             target = find_approval_target(tool_calls, _gated_tools)
             if target is not None:
                 configurable = config.get("configurable") or {}
                 thread_id = str(configurable.get("run_id") or "run")
                 return {
+                    **stale_approval,
                     "pending_approval": build_approval_request(
                         target,
                         thread_id=thread_id,
                         timeout_s=approval_timeout_s,
                         clarification_timeout_s=clarification_timeout_s,
-                    )
+                    ),
                 }
 
         ctx_obj = _build_tool_context(
@@ -1652,6 +1671,8 @@ def build_react_graph(
         # turn does not re-apply the stale verdict.
         if approval_resume is not None:
             result_dict["approval_resume"] = None
+        # 上一轮留下的审批通道(见 ``stale_approval``)。
+        result_dict.update(stale_approval)
         # Stream CM-0 — turn-end DB→/workspace projection (best-effort).
         # Only-if-changed: an unchanged turn skips the sandbox round-trip and
         # leaves ``last_projection_hash`` untouched.
