@@ -9,8 +9,8 @@
      一跑完就结束,agent 看不到工具结果。
    这里故意用**不带清零键**的图输入驱动(模拟漏写清零的入口),证的是
    ``tools_node`` 自己这道防线;入口清零由 control-plane 的测试证。
-2. ``close_voided_turn`` —— 作废一次待审批时收口那一轮:悬空的工具调用逐个补
-   结果、审批通道清零、检查点不再有待执行的节点。
+2. ``repair_unanswered_tail`` —— 新一轮开跑前按历史的形状收口上一轮:悬空的工具
+   调用逐个补结果、审批通道清零、检查点不再有待执行的节点;那一轮还在进行时不动。
 """
 
 from __future__ import annotations
@@ -34,10 +34,15 @@ from orchestrator import (
     ToolResult,
     ToolSpec,
     build_react_graph,
-    close_voided_turn,
+    pending_request_id,
+    repair_unanswered_tail,
     sanitize_dangling_tool_calls,
 )
-from orchestrator.approval_turn import VOIDED_APPROVAL_CONTENT, voided_turn_update
+from orchestrator.approval_turn import (
+    UNRUN_TOOL_CALL_CONTENT,
+    VOIDED_APPROVAL_CONTENT,
+    voided_turn_update,
+)
 from orchestrator.tools.approval import ASK_FOR_APPROVAL_TOOL, AskForApprovalTool
 
 _GATED = "lookup"
@@ -83,6 +88,12 @@ class _RecordingTool:
 
 def _cfg(run_id: str) -> RunnableConfig:
     return {"configurable": {"thread_id": _THREAD, "run_id": run_id}}
+
+
+def _thread_cfg() -> RunnableConfig:
+    """收口用的配置只带会话 —— 与控制面一致。带上新一轮的 ``run_id`` 的话,LangGraph
+    会把紧随其后、同 ``run_id`` 的图输入当成重入同一次运行而丢掉。"""
+    return {"configurable": {"thread_id": _THREAD}}
 
 
 def _bare_input(text: str) -> dict[str, Any]:
@@ -302,12 +313,24 @@ def test_turn_reset_covers_all_three_approval_channels() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. close_voided_turn —— 收口被作废的那一轮
+# 2. repair_unanswered_tail —— 按历史的形状收口上一轮
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _ContentFor:
+    """记下被问到的 run;``answers`` 里没有的 run 视为还在进行。"""
+
+    answers: dict[str, str]
+    asked: list[str] = field(default_factory=list)
+
+    async def __call__(self, run_id: str) -> str | None:
+        self.asked.append(run_id)
+        return self.answers.get(run_id)
+
+
 @pytest.mark.asyncio
-async def test_close_voided_turn_answers_every_dangling_call_and_ends_the_turn() -> None:
+async def test_repair_answers_every_dangling_call_and_ends_the_turn() -> None:
     async with make_checkpointer("memory") as cp:
         two_calls = AIMessage(
             content="",
@@ -318,10 +341,12 @@ async def test_close_voided_turn_answers_every_dangling_call_and_ends_the_turn()
         )
         g = _build(cp, [two_calls, _gated_turn("B", "tc-b")])
         await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
+        content_for = _ContentFor({"run-a": VOIDED_APPROVAL_CONTENT})
 
-        closed = await close_voided_turn(g.compiled, _cfg("run-a"), run_id="run-a")
+        closed = await repair_unanswered_tail(g.compiled, _thread_cfg(), content_for=content_for)
 
         assert closed == 2
+        assert content_for.asked == ["run-a"]
         snap = await g.compiled.aget_state(_cfg("run-a"))
         assert snap.next == ()
         values = snap.values
@@ -344,32 +369,86 @@ async def test_close_voided_turn_answers_every_dangling_call_and_ends_the_turn()
 
 
 @pytest.mark.asyncio
-async def test_close_voided_turn_is_idempotent() -> None:
+async def test_repair_is_idempotent() -> None:
     async with make_checkpointer("memory") as cp:
         g = _build(cp, [_gated_turn("A", "tc-a")])
         await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
-        assert await close_voided_turn(g.compiled, _cfg("run-a"), run_id="run-a") == 1
+        content_for = _ContentFor({"run-a": VOIDED_APPROVAL_CONTENT})
+        assert await repair_unanswered_tail(g.compiled, _thread_cfg(), content_for=content_for) == 1
         before = await g.compiled.aget_state(_cfg("run-a"))
 
-        assert await close_voided_turn(g.compiled, _cfg("run-a"), run_id="run-a") == 0
+        assert await repair_unanswered_tail(g.compiled, _thread_cfg(), content_for=content_for) == 0
 
         after = await g.compiled.aget_state(_cfg("run-a"))
         assert after.config == before.config, "第二次收口不该再写检查点"
+        assert content_for.asked == ["run-a"], "尾巴已经不是助手消息,不该再去问"
 
 
 @pytest.mark.asyncio
-async def test_close_voided_turn_leaves_a_thread_whose_tail_belongs_to_another_run() -> None:
-    """尾巴不是被作废那一轮的助手消息(已经有更新的一轮)—— 一个字节都不写。"""
+async def test_repair_leaves_a_turn_that_is_still_going() -> None:
+    """调用方说这一轮还没结束(``None``)—— 一个字节都不写。"""
     async with make_checkpointer("memory") as cp:
-        g = _build(cp, [_gated_turn("A", "tc-a"), _gated_turn("B", "tc-b")])
+        g = _build(cp, [_gated_turn("A", "tc-a")])
         await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
-        await g.compiled.ainvoke({**_bare_input("b"), **APPROVAL_TURN_RESET}, config=_cfg("run-b"))
-        before = await g.compiled.aget_state(_cfg("run-b"))
+        before = await g.compiled.aget_state(_cfg("run-a"))
+        content_for = _ContentFor({})
 
-        assert await close_voided_turn(g.compiled, _cfg("run-b"), run_id="run-a") == 0
+        assert await repair_unanswered_tail(g.compiled, _thread_cfg(), content_for=content_for) == 0
 
-        after = await g.compiled.aget_state(_cfg("run-b"))
-        assert after.config == before.config
+        assert content_for.asked == ["run-a"]
+        assert (await g.compiled.aget_state(_cfg("run-a"))).config == before.config
+
+
+@pytest.mark.asyncio
+async def test_repair_never_touches_a_verdict_waiting_to_be_applied() -> None:
+    """裁定已经写进检查点、续跑还没用掉它:不补、不问,续跑照常执行批准的调用。"""
+    async with make_checkpointer("memory") as cp:
+        g = _build(cp, [_gated_turn("A", "tc-a")])
+        paused = await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
+        await g.compiled.aupdate_state(
+            _cfg("run-a"),
+            {
+                "pending_approval": None,
+                "approval_resume": {
+                    "decision": "approve",
+                    "binding_digest": paused["pending_approval"].binding_digest,
+                },
+            },
+            as_node="agent",
+        )
+        content_for = _ContentFor({"run-a": VOIDED_APPROVAL_CONTENT})
+
+        assert await repair_unanswered_tail(g.compiled, _thread_cfg(), content_for=content_for) == 0
+
+        assert content_for.asked == []
+        await g.compiled.ainvoke(None, config=_cfg("run-a-cont"))
+        assert g.gated.seen == [{"key": "A"}]
+
+
+@pytest.mark.asyncio
+async def test_repair_closes_a_turn_that_ended_before_its_tools_ran() -> None:
+    """取消落在「模型给出调用」与「工具执行」之间:检查点里没有待审批,尾巴照样悬空。"""
+    async with make_checkpointer("memory") as cp:
+        g = _build(cp, [AIMessage(content="a-done")])
+        await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
+        cancelled = AIMessage(
+            content="",
+            tool_calls=[_call(_FREE, {"x": 5}, "tc-x")],
+            additional_kwargs={STAMP_RUN_ID: "run-x"},
+        )
+        await g.compiled.aupdate_state(_cfg("run-x"), {"messages": [cancelled]}, as_node="agent")
+        content_for = _ContentFor({"run-x": UNRUN_TOOL_CALL_CONTENT})
+
+        assert await repair_unanswered_tail(g.compiled, _thread_cfg(), content_for=content_for) == 1
+
+        next_turn = {**_bare_input("b"), **APPROVAL_TURN_RESET}
+        state = await g.compiled.ainvoke(next_turn, config=_cfg("run-b"))
+        assert sanitize_dangling_tool_calls(g.llm.prompts[-1]) == []
+        assert [m.content for m in g.llm.prompts[-1] if isinstance(m, ToolMessage)] == [
+            UNRUN_TOOL_CALL_CONTENT
+        ]
+        assert state["messages"][-1].content == "done"
+        assert g.free.seen == []
 
 
 def test_voided_turn_update_matches_only_the_voided_runs_tool_calls() -> None:
@@ -385,3 +464,20 @@ def test_voided_turn_update_matches_only_the_voided_runs_tool_calls() -> None:
     assert update is not None
     assert update["approval_outcome"] == "rejected"
     assert [m.tool_call_id for m in update["messages"]] == ["tc-a"]
+    assert [m.content for m in update["messages"]] == [VOIDED_APPROVAL_CONTENT]
+    custom = voided_turn_update([stamped], run_id="run-a", content=UNRUN_TOOL_CALL_CONTENT)
+    assert custom is not None
+    assert [m.content for m in custom["messages"]] == [UNRUN_TOOL_CALL_CONTENT]
+
+
+@pytest.mark.asyncio
+async def test_pending_request_id_reads_the_waiting_request() -> None:
+    async with make_checkpointer("memory") as cp:
+        g = _build(cp, [_gated_turn("A", "tc-a")])
+        paused = await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
+        values = (await g.compiled.aget_state(_cfg("run-a"))).values
+        request_id = paused["pending_approval"].request_id
+        assert pending_request_id(values) == request_id
+        assert pending_request_id({"pending_approval": {"request_id": request_id}}) == request_id
+        assert pending_request_id({"pending_approval": None}) is None
+        assert pending_request_id({}) is None

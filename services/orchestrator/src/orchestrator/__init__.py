@@ -27,7 +27,10 @@ from orchestrator.approval_turn import (
     APPROVAL_TURN_RESET as APPROVAL_TURN_RESET,
 )
 from orchestrator.approval_turn import (
-    close_voided_turn as close_voided_turn,
+    pending_request_id as pending_request_id,
+)
+from orchestrator.approval_turn import (
+    repair_unanswered_tail as repair_unanswered_tail,
 )
 from orchestrator.errors import (
     AgentFactoryError as AgentFactoryError,
@@ -206,12 +209,13 @@ __all__ = [
     "build_react_graph",
     "build_step_routers",
     "build_tool_registry",
-    "close_voided_turn",
     "format_sse",
     "make_memory_recall_node",
     "make_memory_writeback_node",
     "make_planner_node",
     "make_reflect_node",
+    "pending_request_id",
+    "repair_unanswered_tail",
     "run_agent",
     "sanitize_dangling_tool_calls",
     "sse_consumer",

@@ -69,11 +69,16 @@ def _request(
 
 
 class _FakeGraph:
+    async def aget_state(self, *_a: object, **_k: object) -> SimpleNamespace:
+        # 班车 2 终审 C1 —— 续跑写检查点前核对「检查点里等着的还是这条审批」;
+        # 桩的检查点停在 ``_pending`` 那条请求上。
+        return SimpleNamespace(values={"pending_approval": {"request_id": "approval:flow"}})
+
     async def aupdate_state(self, *_a: object, **_k: object) -> None:
         return None
 
 
-class _CapturingGraph:
+class _CapturingGraph(_FakeGraph):
     """Records the ``approval_resume`` payload written into the checkpoint."""
 
     def __init__(self) -> None:

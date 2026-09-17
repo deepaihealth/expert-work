@@ -1154,6 +1154,44 @@ async def _seed_pending_approval(
     return run_id
 
 
+async def _checkpoint_waits_on_seeded_approval(client: AsyncClient, thread_id: str) -> None:
+    """让会话检查点停在 :func:`_seed_pending_approval` 那条请求上。
+
+    班车 2 终审 C1 —— 续跑写检查点前核对「检查点里等着的还是这条审批」;只落审批行、
+    检查点里没有对应请求的会话,会被当成已经被新一轮占用。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from expert_work.protocol import ApprovalRequest
+
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    meta = await app.state.thread_meta_repo.get(UUID(thread_id), tenant_id=DEFAULT_DEV_TENANT_ID)
+    record = await app.state.agent_spec_repo.get(
+        tenant_id=DEFAULT_DEV_TENANT_ID, name=meta.agent_name, version=meta.agent_version
+    )
+    built = await app.state.agent_runtime.get_agent(
+        tenant_id=DEFAULT_DEV_TENANT_ID,
+        name=meta.agent_name,
+        version=meta.agent_version,
+        spec=record.spec,
+    )
+    now = datetime.now(UTC)
+    await built.graph.aupdate_state(
+        {"configurable": {"thread_id": thread_id, "tenant_id": str(DEFAULT_DEV_TENANT_ID)}},
+        {
+            "pending_approval": ApprovalRequest(
+                request_id="approval:seed",
+                node="tools",
+                reason_kind="policy_gate",
+                action_summary="approval-gated tool 'send_email'",
+                requested_at=now,
+                timeout_at=now + timedelta(hours=24),
+            )
+        },
+        as_node="tools",
+    )
+
+
 @pytest.mark.asyncio
 async def test_resume_unknown_run_returns_404(runs_client: AsyncClient) -> None:
     from uuid import uuid4
@@ -2380,6 +2418,7 @@ async def test_approval_resume_records_the_manifest_version_it_rebuilt_from(
     stored = await _desync_stored_sha(runs_client, thread_id)
     await _seed_completed_run(runs_client, thread_id=thread_id)
     run_id = await _seed_pending_approval(runs_client, thread_id)
+    await _checkpoint_waits_on_seeded_approval(runs_client, thread_id)
 
     resp = await runs_client.post(
         f"/v1/sessions/{thread_id}/runs/{run_id}/resume",

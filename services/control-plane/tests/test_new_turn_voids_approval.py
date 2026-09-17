@@ -31,16 +31,23 @@ from langgraph.checkpoint.memory import InMemorySaver
 from control_plane.api.runs import build_run_graph_input, replay_graph_input
 from control_plane.app import create_app
 from control_plane.approval_timeout_sweep import ApprovalTimeoutSweep
-from control_plane.approval_void import VOID_AUDIT_REASON, VOIDED_BY, void_pending_approvals
+from control_plane.approval_void import (
+    VOID_AUDIT_REASON,
+    VOIDED_BY,
+    repair_turn_tail,
+    void_pending_approvals,
+)
 from control_plane.audit import build_default_audit_logger
 from control_plane.run_queue_worker import RunQueueWorker
 from control_plane.runtime import AgentRuntime
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
+from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence import InMemoryApprovalStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import (
     AgentSpec,
+    AgentSpecStatus,
     ApprovalRecord,
     ApprovalStatus,
     AuditEntry,
@@ -57,6 +64,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge
 from orchestrator import (
     APPROVAL_TURN_RESET,
+    AgentFactoryError,
     BuiltAgent,
     GraphRunner,
     ToolContext,
@@ -66,7 +74,7 @@ from orchestrator import (
     build_react_graph,
     sanitize_dangling_tool_calls,
 )
-from orchestrator.approval_turn import VOIDED_APPROVAL_CONTENT
+from orchestrator.approval_turn import UNRUN_TOOL_CALL_CONTENT, VOIDED_APPROVAL_CONTENT
 from orchestrator.sse import _BACKGROUND_PERSIST_WRITERS
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
@@ -139,13 +147,20 @@ class _HookedApprovals(InMemoryApprovalStore):
     def __init__(self) -> None:
         super().__init__()
         self.hooks: dict[ApprovalStatus, _Hook] = {}
+        #: 人工裁定赢下 CAS 之后、续跑写检查点之前跑一次(终审 C1 的竞态窗口)。
+        self.after_human_win: _Hook | None = None
         self.all_expired = False
 
     async def mark_decided(self, **kwargs: Any) -> bool:
         hook = self.hooks.pop(kwargs["status"], None)
         if hook is not None:
             await hook()
-        return await super().mark_decided(**kwargs)
+        won = await super().mark_decided(**kwargs)
+        after, human = self.after_human_win, kwargs["decided_by"] != VOIDED_BY
+        if won and human and after is not None:
+            self.after_human_win = None
+            await after()
+        return won
 
     async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[ApprovalRecord]:
         if self.all_expired:
@@ -551,10 +566,35 @@ async def test_timeout_sweep_voids_instead_of_resuming_a_superseded_approval(s: 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("script", [[_gated("A"), AIMessage(content="a-done"), _gated("B")]])
 @pytest.mark.asyncio
-async def test_a_decision_that_lands_first_wins_and_the_new_turn_does_not_void(
+async def test_a_decision_that_completed_first_runs_once_and_the_new_turn_is_gated(
     s: _Stack,
 ) -> None:
+    """裁定先完成(续跑已跑完):批准的调用执行一次;之后的新一轮各过各的审批门。"""
+    thread, run_a, _ = await s.start()
+    ok = await s.decide(run_a, "approve")
+    assert ok.status_code == 202, ok.text
+    await s.settle(UUID(ok.json()["data"]["run_id"]))
+    assert s.tool.seen == [{"key": "A"}]
+
+    _, run_b, _ = await s.start(thread)
+
+    assert s.tool.seen == [{"key": "A"}]
+    assert (await s.approval(run_a)).status is ApprovalStatus.APPROVED
+    assert await s.void_audits() == []
+    approval_b = await s.approval(run_b)
+    assert approval_b.status is ApprovalStatus.PENDING
+    assert approval_b.proposed_args == {"key": "B"}
+    assert sanitize_dangling_tool_calls(s.llm.prompts[-1]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_decision_that_only_won_the_cas_does_not_let_the_new_turn_void_it(
+    s: _Stack,
+) -> None:
+    """人工裁定先赢下审批行的 CAS:新一轮的作废输掉,不写审计、不动这条裁定;
+    新一轮照常跑,审批门照样生效,历史照样收口。"""
     thread, run_a, _ = await s.start()
 
     async def human_decides_first() -> None:
@@ -574,13 +614,120 @@ async def test_a_decision_that_lands_first_wins_and_the_new_turn_does_not_void(
     approval_a = await s.approval(run_a)
     assert approval_a.status is ApprovalStatus.APPROVED
     assert approval_a.decided_by == "human"
-    assert (await s.row(run_a)).status is RunStatus.PAUSED
     assert await s.void_audits() == []
-    # 作废没赢,就不收口检查点;新一轮照常跑,审批门照样生效。
-    messages = (await s.snapshot(thread)).values["messages"]
-    assert all(getattr(m, "content", None) != VOIDED_APPROVAL_CONTENT for m in messages)
     assert s.tool.seen == []
     assert (await s.approval(run_b)).proposed_args == {"key": "B"}
+    assert sanitize_dangling_tool_calls(s.llm.prompts[-1]) == []
+
+
+def _modify_to_x() -> dict[str, Any]:
+    return {"decision": "modify", "modified_args": {"key": "X"}}
+
+
+def _approve() -> dict[str, Any]:
+    return {"decision": "approve"}
+
+
+@pytest.mark.parametrize(
+    ("script", "decision"),
+    [
+        ([_gated("A"), _gated("B")], _modify_to_x()),
+        # 新一轮的调用与 A 参数相同(只是 call id 不同),摘要核对拦不住。
+        (
+            [
+                _gated("A"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": _GATED, "args": {"key": "A"}, "id": "tc-A2", "type": "tool_call"}
+                    ],
+                ),
+            ],
+            _approve(),
+        ),
+    ],
+    ids=["modify", "approve-same-args"],
+)
+@pytest.mark.asyncio
+async def test_a_new_turn_inside_the_decision_window_is_never_resumed_by_that_decision(
+    s: _Stack, decision: dict[str, Any]
+) -> None:
+    """终审 C1:裁定赢下 CAS 之后、写检查点之前,新一轮跑到了自己的审批门。
+    这次裁定不能写进已经属于新一轮的检查点、更不能执行新一轮的调用。"""
+    thread, run_a, _ = await s.start()
+    box: dict[str, UUID] = {}
+
+    async def new_turn_runs_in_the_window() -> None:
+        _, box["run_b"], _ = await s.start(thread)
+
+    s.approvals.after_human_win = new_turn_runs_in_the_window
+    body = {"user_id": _USER, "mode": "queue", "idempotency_key": "decide-1", **decision}
+
+    resp = await s.client.post(f"/v1/agents/{_AGENT}/runs/{run_a}:decide", json=body)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "APPROVAL_CONFLICT"
+    run_b = box["run_b"]
+    assert s.tool.seen == [], "裁定被套到了新一轮的调用上"
+    approval_b = await s.approval(run_b)
+    assert approval_b.status is ApprovalStatus.PENDING
+    assert (await s.row(run_b)).status is RunStatus.PAUSED
+    assert sanitize_dangling_tool_calls(s.llm.prompts[-1]) == []
+    approval_a = await s.approval(run_a)
+    assert approval_a.status is ApprovalStatus.REJECTED
+    assert approval_a.decided_by == VOIDED_BY
+    assert approval_a.continuation_run_id is None
+    row_a = await s.row(run_a)
+    assert (row_a.status, row_a.error) == (RunStatus.INTERRUPTED, "new_turn")
+    assert await s.run_ids(thread) == [run_a, run_b], "不该建续跑行"
+    audits = [e for e in await s.void_audits() if e.resource_id == str(run_a)]
+    assert [a.details["voided_by_run_id"] for a in audits] == [str(run_b)]
+    before = await s.snapshot(thread)
+
+    # 同一个请求重放:同一个 409,不会拿到一个从未创建过的 run id。
+    replay = await s.client.post(f"/v1/agents/{_AGENT}/runs/{run_a}:decide", json=body)
+
+    assert replay.status_code == 409, replay.text
+    assert (await s.snapshot(thread)).config == before.config
+    assert s.tool.seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_build_failure_leaves_the_approval_pending(
+    s: _Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """构建在 CAS 之前:构建失败时这条审批仍可裁定,修好之后照常续跑。"""
+    _, run_a, _ = await s.start()
+    real_get_agent = s.runtime.get_agent
+
+    async def broken(**_: Any) -> BuiltAgent:
+        raise AgentFactoryError("boom")
+
+    monkeypatch.setattr(s.runtime, "get_agent", broken)
+    failed = await s.decide(run_a, "approve")
+    assert failed.status_code == 422, failed.text
+    assert (await s.approval(run_a)).status is ApprovalStatus.PENDING
+
+    monkeypatch.setattr(s.runtime, "get_agent", real_get_agent)
+    ok = await s.decide(run_a, "approve")
+    assert ok.status_code == 202, ok.text
+    await s.settle(UUID(ok.json()["data"]["run_id"]))
+    assert s.tool.seen == [{"key": "A"}]
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_agent_still_consumes_the_decision(s: _Stack) -> None:
+    """agent 已删除是永久失败:沿用原语义先消费裁定再 410,超时扫描不会反复捡回它。"""
+    _, run_a, _ = await s.start()
+    await s.app.state.agent_spec_repo.update_status(
+        tenant_id=s.tenant_id, name=_AGENT, version="1.0.0", status=AgentSpecStatus.DELETED
+    )
+
+    resp = await s.decide(run_a, "approve")
+
+    assert resp.status_code == 410, resp.text
+    assert (await s.approval(run_a)).status is ApprovalStatus.APPROVED
+    assert s.tool.seen == []
 
 
 @pytest.mark.asyncio
@@ -590,7 +737,6 @@ async def test_a_new_turn_that_voids_first_makes_the_decision_a_conflict(s: _Sta
 
     async def new_turn_voids_first() -> None:
         voided = await void_pending_approvals(
-            graph=s.graph,
             thread_id=thread,
             tenant_id=s.tenant_id,
             new_run_id=new_run,
@@ -611,6 +757,165 @@ async def test_a_new_turn_that_voids_first_makes_the_decision_a_conflict(s: _Sta
     await _assert_voided(s, run_a, by=new_run)
     values = (await s.snapshot(thread)).values
     assert values.get("approval_resume") is None
+
+
+# ---------------------------------------------------------------------------
+# 终审 I1 —— 按历史的形状收口:作废主路径之外留下的没有结果的工具调用
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "script", [[_gated("A"), AIMessage(content="b-done"), AIMessage(content="c-done")]]
+)
+@pytest.mark.asyncio
+async def test_a_new_turn_inside_the_registration_window_leaves_no_unanswered_call(
+    s: _Stack,
+) -> None:
+    """A 已经 PAUSED、审批行还没落库时 B 开跑:B 与之后的 C 的历史都完整。"""
+    real_create = s.approvals.create
+    box: dict[str, UUID] = {}
+
+    async def create(record: ApprovalRecord) -> ApprovalRecord:
+        if "run_b" not in box:
+            _, box["run_b"], _ = await s.start(record.thread_id)
+        return await real_create(record)
+
+    s.approvals.create = create  # type: ignore[method-assign]
+    thread, run_a, _ = await s.start()
+    run_b = box["run_b"]
+
+    assert (await s.row(run_b)).status is RunStatus.SUCCESS
+    assert sanitize_dangling_tool_calls(s.llm.prompts[1]) == []
+    assert (await s.approval(run_a)).status is ApprovalStatus.PENDING
+
+    _, run_c, _ = await s.start(thread)
+
+    assert sanitize_dangling_tool_calls(s.llm.prompts[2]) == []
+    await _assert_voided(s, run_a, by=run_c)
+    assert s.tool.seen == []
+    resp = await s.decide(run_a, "approve")
+    assert resp.status_code == 409, resp.text
+    assert s.tool.seen == []
+
+
+@pytest.mark.parametrize("script", [[_gated("A"), AIMessage(content="b-done")]])
+@pytest.mark.asyncio
+async def test_a_void_that_failed_halfway_is_finished_by_the_next_turn(
+    s: _Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """作废赢下 CAS 之后收 run 行失败:这次请求报错;下一轮补收 run 行、收口历史。"""
+    thread, run_a, _ = await s.start()
+    manager = s.runtime.run_manager
+    real_close = manager.close_paused
+    calls: list[UUID] = []
+
+    async def flaky_close(run_id: UUID, **kwargs: Any) -> bool:
+        calls.append(run_id)
+        if len(calls) == 1:
+            raise RuntimeError("store down")
+        return await real_close(run_id, **kwargs)
+
+    monkeypatch.setattr(manager, "close_paused", flaky_close)
+    with pytest.raises(RuntimeError, match="store down"):
+        await s.start(thread)
+    assert (await s.approval(run_a)).status is ApprovalStatus.REJECTED
+    assert (await s.row(run_a)).status is RunStatus.PAUSED
+    assert await s.run_ids(thread) == [run_a]
+
+    _, run_b, _ = await s.start(thread)
+
+    assert sanitize_dangling_tool_calls(s.llm.prompts[-1]) == []
+    row_a = await s.row(run_a)
+    assert (row_a.status, row_a.error) == (RunStatus.INTERRUPTED, "new_turn")
+    assert len([e for e in await s.void_audits() if e.resource_id == str(run_a)]) == 1
+    assert (await s.row(run_b)).status is RunStatus.SUCCESS
+    assert s.tool.seen == []
+
+
+@pytest.mark.parametrize("script", [[AIMessage(content="a-done"), AIMessage(content="b-done")]])
+@pytest.mark.asyncio
+async def test_a_turn_cancelled_before_its_tools_ran_is_closed_by_the_next_turn(
+    s: _Stack,
+) -> None:
+    """取消落在「模型给出调用」与「工具执行」之间:没有审批,尾巴照样悬空,下一轮收口。"""
+    thread, _, _ = await s.start()
+    cancelled = uuid4()
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    await s.run_store.create(
+        RunInfo(
+            run_id=cancelled,
+            tenant_id=s.tenant_id,
+            thread_id=thread,
+            user_id=None,
+            status=RunStatus.INTERRUPTED,
+            on_disconnect=DisconnectMode.CONTINUE,
+            is_resume=True,
+            error="user_cancel",
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+        )
+    )
+    dangling = AIMessage(
+        content="",
+        tool_calls=[{"name": _GATED, "args": {"key": "Z"}, "id": "tc-Z", "type": "tool_call"}],
+        additional_kwargs={STAMP_RUN_ID: str(cancelled)},
+    )
+    await s.graph.aupdate_state(
+        {"configurable": {"thread_id": str(thread), "tenant_id": str(s.tenant_id)}},
+        {"messages": [dangling]},
+        as_node="agent",
+    )
+
+    _, run_b, _ = await s.start(thread)
+
+    prompt = s.llm.prompts[-1]
+    assert sanitize_dangling_tool_calls(prompt) == []
+    results = [m.content for m in prompt if getattr(m, "tool_call_id", None) == "tc-Z"]
+    assert results == [UNRUN_TOOL_CALL_CONTENT]
+    assert (await s.row(run_b)).status is RunStatus.SUCCESS
+    assert s.tool.seen == []
+    assert await s.void_audits() == []
+
+
+@pytest.mark.asyncio
+async def test_after_a_successful_turn_the_checkpoint_is_not_read() -> None:
+    """最近一轮成功结束:不去读检查点(绝大多数新一轮的开销只有一条查询)。"""
+    run_store = InMemoryRunStore()
+    manager = RunManager(store=run_store)
+    thread, tenant, done = uuid4(), uuid4(), uuid4()
+    now = datetime.now(UTC)
+    await run_store.create(
+        RunInfo(
+            run_id=done,
+            tenant_id=tenant,
+            thread_id=thread,
+            user_id=None,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CONTINUE,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+        )
+    )
+
+    class _Unreadable:
+        async def aget_state(self, *_: Any, **__: Any) -> Any:
+            raise AssertionError("不该读检查点")
+
+    closed = await repair_turn_tail(
+        graph=_Unreadable(),
+        thread_id=thread,
+        tenant_id=tenant,
+        new_run_id=uuid4(),
+        approvals=InMemoryApprovalStore(),
+        run_manager=manager,
+        audit=build_default_audit_logger(InMemoryAuditLogStore()),
+        actor_id="t",
+    )
+    assert closed == 0
 
 
 # ---------------------------------------------------------------------------

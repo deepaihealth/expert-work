@@ -22,7 +22,7 @@ from expert_work.common.conversation_channel import SUPERSEDED_BY
 from expert_work.persistence.database import DatabaseConfig, create_async_engine_from_config
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.runs import RunStatus
-from orchestrator import close_voided_turn, sanitize_dangling_tool_calls
+from orchestrator import repair_unanswered_tail, sanitize_dangling_tool_calls
 from orchestrator.approval_turn import VOIDED_APPROVAL_CONTENT
 from tests.test_supersede_kernel_integration import (
     TENANT,
@@ -64,7 +64,10 @@ async def test_voided_turn_closes_on_postgres_and_the_next_turn_supersedes_clean
         cfg = _cfg(st.thread_id)
         assert (await st.compiled.aget_state(cfg)).values["pending_approval"] is not None
 
-        assert await close_voided_turn(st.compiled, cfg, run_id=str(run_a)) == 1
+        async def content_for(run_id: str) -> str | None:
+            return VOIDED_APPROVAL_CONTENT if run_id == str(run_a) else None
+
+        assert await repair_unanswered_tail(st.compiled, cfg, content_for=content_for) == 1
 
         snap = await st.compiled.aget_state(cfg)
         assert snap.next == ()
