@@ -35,6 +35,12 @@ CompactionEventSink = Callable[[dict[str, Any]], Awaitable[None]]
 #: ``token_sink_from_config`` and feeds it to a TokenSink.
 TOKEN_SINK_KEY = "token_event_sink"  # noqa: S105 — a config dict key name, not a credential
 
+#: B-66 — ``config["configurable"][LLM_CACHE_BYPASS_KEY] is True`` 时,本 run 的每次 LLM
+#: 调用都跳过 E.13 响应缓存的**查找**(写入照常)。``:regenerate`` 的 run 带它:重放的
+#: [System, Human] 与原轮字节相同,不跳过就必然命中、把旧答案原样端回来。设置方是
+#: control-plane 的两个 regenerate 入口(``spawn_run`` / ``RunQueueWorker``)。
+LLM_CACHE_BYPASS_KEY = "llm_cache_bypass"
+
 #: An async callable that ships one token frame ``{step, channel, text}`` to the
 #: SSE bridge.
 TokenEventSink = Callable[[dict[str, Any]], Awaitable[None]]

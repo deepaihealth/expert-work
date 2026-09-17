@@ -85,6 +85,8 @@ class LLMCacheLookupMiddleware:
       fingerprint so structured and unstructured calls never collide.
       Set by the RT-1 PR-3 agent-loop wiring; see
       :func:`_coerce_output_schema` for the activation contract.
+    - ``llm_cache_bypass`` — ``True`` skips the lookup (B-66, a
+      ``:regenerate`` run). The store middleware is unaffected.
 
     ``model`` / ``temperature`` / ``max_tokens`` are per-agent
     constants supplied at construction (from the manifest ``ModelSpec``)
@@ -106,8 +108,11 @@ class LLMCacheLookupMiddleware:
     async def __call__(self, ctx: MiddlewareContext, call_next: CallNext) -> None:
         tenant_id = ctx.payload.get("tenant_id")
         messages = _coerce_messages(ctx.payload.get("messages"))
+        # B-66 — ``:regenerate`` 重放的 prompt 与原轮字节相同;查了就必然命中旧答案。
+        # 只跳过查找,store 侧照常写,之后同样的普通调用拿到的是新答案。
+        bypass = ctx.payload.get("llm_cache_bypass") is True
 
-        if isinstance(tenant_id, UUID) and is_cacheable(messages, self.temperature):
+        if not bypass and isinstance(tenant_id, UUID) and is_cacheable(messages, self.temperature):
             key = self.cache.make_key(
                 tenant_id=tenant_id,
                 model=self.model,

@@ -207,6 +207,44 @@ async def test_no_persist_when_response_missing_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cache_hit_records_a_zero_row_even_though_the_cached_message_has_no_usage() -> None:
+    """B-66 —— E.13 缓存条目只存 content / tool_calls / id,读回来的 AIMessage **没有**
+    ``usage_metadata``(这里走真缓存往返钉住这个前提)。命中时仍要落一行全 0:否则
+    对外用量把「命中缓存、零上游开销」报成「无记录」(``_run_usage``:``[]`` vs ``None``)。
+    未命中且没有用量的调用仍然不落行(上一条用例)。"""
+    from expert_work.runtime.llm import InMemoryRedisCache, LLMResponseCache
+
+    cache = LLMResponseCache(redis=InMemoryRedisCache())
+    await cache.put(
+        "k",
+        AIMessage(
+            content="cached",
+            usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110},
+        ),
+    )
+    cached = await cache.get("k")
+    assert cached is not None
+    assert cached.usage_metadata is None
+
+    store = InMemoryTokenUsageStore()
+    mw = TokenUsageMiddleware(
+        store=store,
+        agent_name="b66-cache-hit",
+        agent_version="1.0.0",
+        model="claude-sonnet-4-6",
+    )
+    tenant_id = uuid4()
+    ctx = MiddlewareContext(payload={"tenant_id": tenant_id, "response": cached, "cache_hit": True})
+    await mw(ctx, _noop)
+    rows = list(await store.list_for_tenant(tenant_id=tenant_id))
+    assert [
+        (r.input_tokens, r.output_tokens, r.cache_creation_tokens, r.cache_read_tokens)
+        for r in rows
+    ] == [(0, 0, 0, 0)]
+    assert rows[0].usage_kind == "conversation"
+
+
+@pytest.mark.asyncio
 async def test_no_persist_when_tenant_missing() -> None:
     store = InMemoryTokenUsageStore()
     mw = TokenUsageMiddleware(

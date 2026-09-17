@@ -44,6 +44,9 @@ from orchestrator.graph_builder import (
 )
 from orchestrator.graph_builder import make_planner_node as make_planner_node
 from orchestrator.graph_builder import make_reflect_node as make_reflect_node
+from orchestrator.graph_builder._config import (
+    LLM_CACHE_BYPASS_KEY as LLM_CACHE_BYPASS_KEY,
+)
 from orchestrator.llm import (
     AllProvidersExhaustedError as AllProvidersExhaustedError,
 )
@@ -153,6 +156,7 @@ from orchestrator.tools import (
 __all__ = [
     "DEFAULT_MAX_STEPS",
     "DEFAULT_STREAM_MODE",
+    "LLM_CACHE_BYPASS_KEY",
     "PLACEHOLDER_CONTENT",
     "ActionJudge",
     "ActionVerdict",

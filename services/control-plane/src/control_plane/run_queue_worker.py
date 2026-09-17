@@ -53,7 +53,7 @@ from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
-from orchestrator import AgentFactoryError, run_agent
+from orchestrator import LLM_CACHE_BYPASS_KEY, AgentFactoryError, run_agent
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -363,6 +363,9 @@ class RunQueueWorker:
             configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
             if built.run_deadline_s > 0:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+            if replay:
+                # B-66 —— 与 ``spawn_run`` 同一条:重放轮不查响应缓存。
+                configurable[LLM_CACHE_BYPASS_KEY] = True
             # 本轮附件下传 —— 和 ``spawn_run`` 同一份来源(``document_names``),
             # 从 enqueued_input 回读。queue 路径的附件此前有过一次静默消失的前科
             # (见上方 build_run_graph_input 处的注释),这一处漏了同样是静默的:

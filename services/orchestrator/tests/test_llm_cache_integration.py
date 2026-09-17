@@ -25,6 +25,7 @@ from expert_work.runtime.middleware import (
     MiddlewareChain,
 )
 from orchestrator import (
+    LLM_CACHE_BYPASS_KEY,
     GraphRunner,
     LLMRouter,
     ProviderHandle,
@@ -74,6 +75,7 @@ async def _run_once(
     cache: LLMResponseCache,
     tenant_id: str,
     prompt: str,
+    bypass: bool = False,
 ) -> AIMessage:
     before, after = _chains(cache)
     router = LLMRouter(providers=[ProviderHandle(provider=provider, key="anthropic:primary")])
@@ -87,9 +89,10 @@ async def _run_once(
                 after_llm_chain=after,
             )
         )
-        config: RunnableConfig = {
-            "configurable": {"thread_id": uuid4().hex, "tenant_id": tenant_id}
-        }
+        configurable: dict[str, object] = {"thread_id": uuid4().hex, "tenant_id": tenant_id}
+        if bypass:
+            configurable[LLM_CACHE_BYPASS_KEY] = True
+        config: RunnableConfig = {"configurable": configurable}
         final = await compiled.ainvoke(
             {
                 "messages": [HumanMessage(content=prompt)],
@@ -123,6 +126,32 @@ async def test_identical_second_run_served_from_cache() -> None:
     assert second.content == "42 is the answer"
     # The LLM provider was NOT called again — served from cache.
     assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bypass_run_calls_the_llm_and_its_answer_replaces_the_cached_one() -> None:
+    """B-66 —— ``:regenerate`` 的 run 带 ``LLM_CACHE_BYPASS_KEY``:同一 prompt 也必须真调
+    模型(用户按「重新生成」就是要一个新回答);新回答照常写回缓存,之后同样的普通
+    run 命中的是它,不是旧的。"""
+    provider = _CountingProvider(reply="first draft")
+    cache = LLMResponseCache(redis=InMemoryRedisCache())
+    tenant = str(uuid4())
+
+    await _run_once(provider=provider, cache=cache, tenant_id=tenant, prompt="write a haiku")
+    assert provider.calls == 1
+
+    provider.reply = "second draft"
+    regenerated = await _run_once(
+        provider=provider, cache=cache, tenant_id=tenant, prompt="write a haiku", bypass=True
+    )
+    assert provider.calls == 2
+    assert regenerated.content == "second draft"
+
+    again = await _run_once(
+        provider=provider, cache=cache, tenant_id=tenant, prompt="write a haiku"
+    )
+    assert provider.calls == 2
+    assert again.content == "second draft"
 
 
 @pytest.mark.asyncio
