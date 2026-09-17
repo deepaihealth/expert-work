@@ -14,6 +14,7 @@ produces exactly one SQL UPDATE; bumps for different skills both fire.
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -325,3 +326,110 @@ async def test_curator_sweep_idempotent() -> None:
     assert first.active_to_stale == 1
     assert second.active_to_stale == 0
     assert second.stale_to_archived == 0
+
+
+# ─── RLS 上下文(班车 2,09-17 读代码判定) ─────────────────────────────
+
+
+def _rls_ctx() -> tuple[UUID | None, UUID | None, bool]:
+    from expert_work.persistence.rls import (
+        bypass_rls_var,
+        current_tenant_id_var,
+        current_user_id_var,
+    )
+
+    return current_tenant_id_var.get(), current_user_id_var.get(), bypass_rls_var.get()
+
+
+class _CtxRecorder:
+    """包一层 store:每个 async 方法调用连同当时的 RLS 上下文、位置参数记进 ``log``。"""
+
+    def __init__(
+        self, inner: object, log: list[tuple[str, object, tuple[object, ...]]], label: str
+    ):
+        self._inner = inner
+        self._log = log
+        self._label = label
+
+    def __getattr__(self, name: str) -> object:
+        attr = getattr(self._inner, name)
+        if not inspect.iscoroutinefunction(attr):
+            return attr
+
+        async def call(*args: object, **kwargs: object) -> object:
+            self._log.append((f"{self._label}.{name}", _rls_ctx(), args))
+            return await attr(*args, **kwargs)
+
+        return call
+
+
+@pytest.mark.asyncio
+async def test_sweep_runs_every_store_call_under_an_explicit_rls_context() -> None:
+    """``skill`` 表的策略是 ``tenant_id = current_setting('app.tenant_id')::uuid``(没有
+    ``NULLIF``):enforce 下不带租户的会话直接报错,不只是读不到。所以:单飞锁、跨租户
+    枚举、跨租户 ``count_pinned`` → 显式 bypass;读配置与两次状态推进 → 该租户;
+    扫完一轮的审计 → 平台租户。"""
+    from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
+
+    log: list[tuple[str, object, tuple[object, ...]]] = []
+    store = InMemorySkillStore()
+    long_ago = datetime.now(UTC) - timedelta(days=DEFAULT_STALE_DAYS + 1)
+    await _seed_skill(
+        store=store,
+        tenant_id=_TENANT_A,
+        name="cold",
+        status=SkillStatus.ACTIVE,
+        last_used_at=long_ago,
+    )
+    audit_store = InMemoryAuditLogStore()
+    audit_logger = AuditLogger(
+        store=_CtxRecorder(audit_store, log, "audit"),  # type: ignore[arg-type]
+        redactor=DefaultSecretRedactor(),
+        fallback=InMemoryAuditFallbackQueue(),
+    )
+    config_service = TenantConfigService(
+        store=_CtxRecorder(InMemoryTenantConfigStore(), log, "tenant_config"),  # type: ignore[arg-type]
+        audit_logger=audit_logger,
+    )
+    lock_ctx: list[object] = []
+    factory = FakeAdvisoryLockSessionFactory()
+
+    def recording_factory() -> object:
+        session = factory()
+        real = session.execute
+
+        async def execute(stmt: object, params: dict[str, object] | None = None) -> object:
+            lock_ctx.append(_rls_ctx())
+            return await real(stmt, params)
+
+        session.execute = execute  # type: ignore[method-assign]
+        return session
+
+    curator = SkillCurator(
+        skill_store=_CtxRecorder(store, log, "skill"),  # type: ignore[arg-type]
+        tenant_config_service=config_service,
+        audit_logger=audit_logger,
+        interval_s=60.0,
+        session_factory=recording_factory,  # type: ignore[arg-type]
+    )
+    summary = await curator.run_once()
+    assert summary.active_to_stale == 1
+
+    assert lock_ctx and set(lock_ctx) == {(None, None, True)}
+    bypass_calls = {"skill.curator_distinct_tenant_ids", "skill.count_pinned"}
+    tenant_calls = {
+        "tenant_config.get",
+        "skill.curator_promote_active_to_stale",
+        "skill.curator_promote_stale_to_archived",
+    }
+    seen = {name for name, _, _ in log}
+    assert bypass_calls | tenant_calls | {"audit.append"} <= seen
+    for name, ctx, args in log:
+        if name in bypass_calls:
+            assert ctx == (None, None, True), name
+        elif name in tenant_calls:
+            assert ctx == (_TENANT_A, None, False), name
+        elif name == "audit.append":
+            assert ctx == (args[0].tenant_id, None, False), name  # type: ignore[attr-defined]
+            assert args[0].tenant_id == UUID(int=0)  # type: ignore[attr-defined]
+    assert _rls_ctx() == (None, None, False), "上下文必须复原,不能漏给调用方"

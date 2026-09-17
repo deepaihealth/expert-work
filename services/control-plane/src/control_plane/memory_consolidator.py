@@ -34,7 +34,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
@@ -58,6 +59,11 @@ from expert_work.common.uplift_metrics import (
     record_memory_predictive_review,
     record_memory_purged,
     record_memory_reviewed_durable,
+)
+from expert_work.persistence.rls import (
+    bypass_rls_var,
+    current_tenant_id_var,
+    current_user_id_var,
 )
 from expert_work.persistence.token_usage_store import TokenUsageRecord, TokenUsageStore
 from expert_work.protocol import AuditAction, AuditResult, MemoryItem, StructuredOutputSpec
@@ -672,18 +678,21 @@ class MemoryConsolidator:
         if self._session_factory is None:
             return await self._run_sweep()
         async with self._session_factory() as lock_session:
-            # Long-hold guard: the lock txn stays open for the sweep; keep it
-            # off any idle-in-transaction reaper (same posture as
-            # PgWorkspaceLock / QualityDriftWorker).
-            await lock_session.execute(
-                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
-            )
-            got = (
+            # 单飞锁是平台级动作:事务在第一条语句时开始,RLS 上下文就在那一刻读
+            # (``after_begin``)。bypass 只罩这两条,``_run_sweep`` 在它外面跑。
+            with _bypass_rls():
+                # Long-hold guard: the lock txn stays open for the sweep; keep it
+                # off any idle-in-transaction reaper (same posture as
+                # PgWorkspaceLock / QualityDriftWorker).
                 await lock_session.execute(
-                    text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-                    {"cid": MEMORY_CONSOLIDATOR_LOCK_CLASSID, "k": "memory_consolidator"},
+                    text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
                 )
-            ).scalar_one()
+                got = (
+                    await lock_session.execute(
+                        text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
+                        {"cid": MEMORY_CONSOLIDATOR_LOCK_CLASSID, "k": "memory_consolidator"},
+                    )
+                ).scalar_one()
             if not got:
                 await lock_session.rollback()
                 return ConsolidatorRunSummary()
@@ -699,25 +708,34 @@ class MemoryConsolidator:
         Returns the summary so tests can assert on transition counts.
         """
         summary = ConsolidatorRunSummary()
-        tenant_ids = await self._list_tenants()
+        # RLS 上下文(班车 2):跨租户、跨用户的两次枚举显式 bypass —— ``memory_item``
+        # 的策略要求 ``app.user_id``,只带租户会一行都读不到;两条 SQL 自己带
+        # ``tenant_id`` 过滤。其余每次库访问跑在该租户(+ 该用户)下。
+        with _bypass_rls():
+            tenant_ids = await self._list_tenants()
         for tenant_id in tenant_ids:
             try:
-                cfg = await self._resolve_thresholds(tenant_id)
+                with _scope(tenant_id):
+                    cfg = await self._resolve_thresholds(tenant_id)
             except Exception as exc:
                 logger.exception("memory_consolidator.tenant_config_failed tenant_id=%s", tenant_id)
                 summary.record_error(exc)
                 continue
             summary.tenant_count += 1
-            users = (await self._memory.distinct_users(tenant_id=tenant_id))[:_MAX_USERS_PER_TICK]
+            with _bypass_rls():
+                users = (await self._memory.distinct_users(tenant_id=tenant_id))[
+                    :_MAX_USERS_PER_TICK
+                ]
             for user_id in users:
                 summary.user_count += 1
                 try:
-                    await self._sweep_user(
-                        tenant_id=tenant_id,
-                        user_id=user_id,
-                        cfg=cfg,
-                        summary=summary,
-                    )
+                    with _scope(tenant_id, user_id):
+                        await self._sweep_user(
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            cfg=cfg,
+                            summary=summary,
+                        )
                 except Exception as exc:
                     logger.exception(
                         "memory_consolidator.user_sweep_failed tenant_id=%s user_id=%s",
@@ -730,17 +748,18 @@ class MemoryConsolidator:
 
         # One audit row per sweep — bounded volume.
         try:
-            await audit_emit(
-                self._audit,
-                tenant_id=_PLATFORM_TENANT_ID,
-                actor_id=self._actor_id,
-                action=AuditAction.MEMORY_CONSOLIDATOR_RUN,
-                resource_type="memory_item",
-                resource_id=None,
-                result=AuditResult.SUCCESS,
-                trace_id=current_trace_id_hex(),
-                details=summary.as_audit_details(),
-            )
+            with _scope(_PLATFORM_TENANT_ID):
+                await audit_emit(
+                    self._audit,
+                    tenant_id=_PLATFORM_TENANT_ID,
+                    actor_id=self._actor_id,
+                    action=AuditAction.MEMORY_CONSOLIDATOR_RUN,
+                    resource_type="memory_item",
+                    resource_id=None,
+                    result=AuditResult.SUCCESS,
+                    trace_id=current_trace_id_hex(),
+                    details=summary.as_audit_details(),
+                )
         except Exception:
             logger.exception("memory_consolidator.audit_emit_failed")
 
@@ -1256,6 +1275,36 @@ class _ResolvedThresholds:
 
 # Use the all-zero UUID for platform-owned audit rows.
 _PLATFORM_TENANT_ID: UUID = UUID("00000000-0000-0000-0000-000000000000")
+
+
+@contextmanager
+def _bypass_rls() -> Iterator[None]:
+    """跨租户 / 跨用户枚举与单飞锁的 RLS 上下文(显式 bypass)。"""
+    bypass = bypass_rls_var.set(True)
+    tenant = current_tenant_id_var.set(None)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(tenant)
+        bypass_rls_var.reset(bypass)
+
+
+@contextmanager
+def _scope(tenant_id: UUID, user_id: UUID | None = None) -> Iterator[None]:
+    """逐租户(逐用户)的库访问跑在该租户(+ 该用户)下,且不是 bypass。
+
+    两样都不带的会话在 RLS enforce 下 fail-closed 成零行 —— 测试环境这里每天
+    ~640 条 ``rls.would_fail_closed``(09-17)。
+    """
+    tenant = current_tenant_id_var.set(tenant_id)
+    bypass = bypass_rls_var.set(False)
+    user = current_user_id_var.set(user_id)
+    try:
+        yield
+    finally:
+        current_user_id_var.reset(user)
+        bypass_rls_var.reset(bypass)
+        current_tenant_id_var.reset(tenant)
 
 
 def make_consolidator_embedder(embedder: object) -> ConsolidatorEmbedder:

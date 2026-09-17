@@ -867,3 +867,97 @@ def test_archive_enabled_is_a_required_kwarg() -> None:
     """
     param = inspect.signature(WorkspaceJanitorWorker.__init__).parameters["archive_enabled"]
     assert param.default is inspect.Parameter.empty
+
+
+# ---------------------------------------------------------------------------
+# RLS 上下文(班车 2,09-17 拍板):真 enforce 之前,这个任务的每一次 DB 访问都必须
+# 要么带着租户(+ 用户)、要么显式 bypass —— 两样都没有的会话在 enforce 下 fail-closed
+# 成零行,今天在测试环境每天 ~660 条 ``rls.would_fail_closed``。
+# ---------------------------------------------------------------------------
+
+
+def _rls_ctx() -> tuple[UUID | None, UUID | None, bool]:
+    from expert_work.persistence.rls import (
+        bypass_rls_var,
+        current_tenant_id_var,
+        current_user_id_var,
+    )
+
+    return current_tenant_id_var.get(), current_user_id_var.get(), bypass_rls_var.get()
+
+
+class _CtxRecordingWorkspaces(InMemoryUserWorkspaceStore):
+    """记下每次库访问发生时的 RLS 上下文。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[tuple[str, tuple[UUID | None, UUID | None, bool]]] = []
+
+    async def resolve(self, **kwargs: Any) -> Any:
+        self.seen.append(("resolve", _rls_ctx()))
+        return await super().resolve(**kwargs)
+
+    async def update_size(self, **kwargs: Any) -> None:
+        self.seen.append(("update_size", _rls_ctx()))
+        await super().update_size(**kwargs)
+
+    async def soft_delete(self, **kwargs: Any) -> None:
+        self.seen.append(("soft_delete", _rls_ctx()))
+        await super().soft_delete(**kwargs)
+
+    async def mark_archived(self, **kwargs: Any) -> None:
+        self.seen.append(("mark_archived", _rls_ctx()))
+        await super().mark_archived(**kwargs)
+
+
+class _CtxRecordingLockFactory(FakeAdvisoryLockSessionFactory):
+    """锁会话的每条语句都记下 RLS 上下文(``after_begin`` 在第一条语句时读它)。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[tuple[UUID | None, UUID | None, bool]] = []
+
+    def __call__(self) -> Any:
+        session = super().__call__()
+        real = session.execute
+
+        async def execute(stmt: object, params: dict[str, Any] | None = None) -> Any:
+            self.seen.append(_rls_ctx())
+            return await real(stmt, params)
+
+        session.execute = execute  # type: ignore[method-assign]
+        return session
+
+
+@pytest.mark.asyncio
+async def test_every_db_touch_runs_under_an_explicit_rls_context(tmp_path: Path) -> None:
+    """单飞锁是平台级动作 → 显式 bypass;逐用户的归档与体积记账 → 该用户的租户 + 用户,
+    **不是** bypass(bypass 只给真正跨租户的那一步,不外溢到每个阶段)。"""
+    tenant, live, gone = uuid4(), uuid4(), uuid4()
+    (tmp_path / str(tenant) / str(live)).mkdir(parents=True)
+    (tmp_path / str(tenant) / str(gone) / "f.txt").parent.mkdir(parents=True)
+    (tmp_path / str(tenant) / str(gone) / "f.txt").write_bytes(b"x")
+    _mark_deleted(tmp_path, tenant, gone)
+
+    workspaces = _CtxRecordingWorkspaces()
+    factory = _CtxRecordingLockFactory()
+    worker = WorkspaceJanitorWorker(
+        user_workspaces=workspaces,
+        quota_service=WorkspaceQuotaService(
+            user_workspaces=workspaces,
+            tenant_quotas=InMemoryTenantQuotaStore(),
+            workspace_root=str(tmp_path),
+        ),
+        object_store=InMemoryObjectStore(),
+        workspace_root=str(tmp_path),
+        session_factory=factory,
+        archive_enabled=True,
+    )
+    stats = await worker.run_once()
+
+    assert (stats.archived, stats.refreshed) == (1, 1)
+    assert factory.seen and set(factory.seen) == {(None, None, True)}
+    ops = {op for op, _ in workspaces.seen}
+    assert {"resolve", "update_size", "soft_delete", "mark_archived"} <= ops
+    assert {ctx for _, ctx in workspaces.seen} == {(tenant, live, False), (tenant, gone, False)}
+    assert _rls_ctx() == (None, None, False), "上下文必须复原,不能漏给调用方"

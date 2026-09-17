@@ -49,6 +49,11 @@ from control_plane.workspace_archive import (
     workspace_archive_key,
 )
 from control_plane.workspace_quota import WorkspaceQuotaService
+from expert_work.persistence.rls import (
+    bypass_rls_var,
+    current_tenant_id_var,
+    current_user_id_var,
+)
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.persistence.workspace.layout import (
     WORKSPACE_AGENTS_DIR,
@@ -263,6 +268,36 @@ def _is_uuid_name(name: str) -> bool:
 #: 打开目录用的 flags。``O_NOFOLLOW`` = 不跟随**末段**软链,``O_DIRECTORY`` = 打开
 #: 的必须真是目录。这两个位是本 phase 安全性的本体,见 :func:`_open_dir`。
 _OPEN_DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+
+
+@contextlib.contextmanager
+def _bypass_rls() -> Iterator[None]:
+    """平台级动作的 RLS 上下文:只给单飞锁这一步(不跨进任何逐用户的库访问)。"""
+    bypass = bypass_rls_var.set(True)
+    tenant = current_tenant_id_var.set(None)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(tenant)
+        bypass_rls_var.reset(bypass)
+
+
+@contextlib.contextmanager
+def _user_scope(tenant_id: UUID, user_id: UUID) -> Iterator[None]:
+    """逐用户的库访问(归档标记、体积记账)跑在该用户自己的租户 + 用户上下文里。
+
+    两样都不带的会话在 RLS enforce 下 fail-closed 成零行 —— 测试环境这里每天
+    ~660 条 ``rls.would_fail_closed``(09-17)。
+    """
+    tenant = current_tenant_id_var.set(tenant_id)
+    bypass = bypass_rls_var.set(False)
+    user = current_user_id_var.set(user_id)
+    try:
+        yield
+    finally:
+        current_user_id_var.reset(user)
+        bypass_rls_var.reset(bypass)
+        current_tenant_id_var.reset(tenant)
 
 
 @contextlib.contextmanager
@@ -594,17 +629,20 @@ class WorkspaceJanitorWorker:
             await self._run_cycle(stats)
             return stats
         async with self._session_factory() as lock_session:
-            # Long-hold guard: the lock txn stays open for the whole cycle;
-            # keep it off any idle-in-transaction reaper.
-            await lock_session.execute(
-                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
-            )
-            got = (
+            # 单飞锁是平台级动作:事务在第一条语句时开始,RLS 上下文就在那一刻读
+            # (``after_begin``)。bypass 只罩这两条,``_run_cycle`` 在它外面跑。
+            with _bypass_rls():
+                # Long-hold guard: the lock txn stays open for the whole cycle;
+                # keep it off any idle-in-transaction reaper.
                 await lock_session.execute(
-                    text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-                    {"cid": WORKSPACE_JANITOR_LOCK_CLASSID, "k": "workspace_janitor"},
+                    text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
                 )
-            ).scalar_one()
+                got = (
+                    await lock_session.execute(
+                        text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
+                        {"cid": WORKSPACE_JANITOR_LOCK_CLASSID, "k": "workspace_janitor"},
+                    )
+                ).scalar_one()
             if not got:
                 await lock_session.rollback()
                 return JanitorRunStats(skipped=True)
@@ -665,7 +703,8 @@ class WorkspaceJanitorWorker:
         for tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
             for user_id in await asyncio.to_thread(_markers, tenant_dir):
                 try:
-                    await self._archive_one(tenant_id, user_id, stats)
+                    with _user_scope(tenant_id, user_id):
+                        await self._archive_one(tenant_id, user_id, stats)
                 except Exception:
                     logger.exception(
                         "workspace_janitor.archive_failed tenant=%s user=%s", tenant_id, user_id
@@ -766,7 +805,8 @@ class WorkspaceJanitorWorker:
         for tenant_id, tenant_dir in await asyncio.to_thread(_list_uuid_dirs, root):
             for user_id, _user_dir in await asyncio.to_thread(_list_uuid_dirs, tenant_dir):
                 try:
-                    await self._quota_service.refresh(tenant_id=tenant_id, user_id=user_id)
+                    with _user_scope(tenant_id, user_id):
+                        await self._quota_service.refresh(tenant_id=tenant_id, user_id=user_id)
                     stats.refreshed += 1
                 except Exception:
                     logger.exception(
