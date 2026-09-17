@@ -27,6 +27,7 @@ from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import (
     APPROVAL_TURN_RESET,
+    ActionVerdict,
     GraphRunner,
     ToolContext,
     ToolRegistry,
@@ -37,6 +38,7 @@ from orchestrator import (
     sanitize_dangling_tool_calls,
 )
 from orchestrator.approval_turn import VOIDED_APPROVAL_CONTENT, voided_turn_update
+from orchestrator.tools.approval import ASK_FOR_APPROVAL_TOOL, AskForApprovalTool
 
 _GATED = "lookup"
 _FREE = "echo"
@@ -96,17 +98,19 @@ class _Graph:
     free: _RecordingTool
 
 
-def _build(cp: Any, script: list[AIMessage]) -> _Graph:
+def _build(cp: Any, script: list[AIMessage], **graph_kwargs: Any) -> _Graph:
     llm = _ScriptedLLM(script=script)
     gated, free = _RecordingTool(_GATED), _RecordingTool(_FREE)
     registry = ToolRegistry()
     registry.register(gated)
     registry.register(free)
+    registry.register(AskForApprovalTool())
     compiled = GraphRunner(checkpointer=cp).compile(
         build_react_graph(
             llm_caller=llm,
             tool_registry=registry,
             approval_required_tools=frozenset({_GATED}),
+            **graph_kwargs,
         )
     )
     return _Graph(compiled=compiled, llm=llm, gated=gated, free=free)
@@ -186,6 +190,81 @@ async def test_turn_after_a_declarative_reject_is_not_cut_short() -> None:
 
         assert g.free.seen == [{"x": 2}]
         assert len(g.llm.prompts) - calls_before_b == 2
+        assert state["messages"][-1].content == "done"
+        assert state.get("approval_outcome") is None
+
+
+@dataclass
+class _BlockEcho:
+    """action screening 替身:只判 ``echo`` 调用不对齐。"""
+
+    async def judge_action(
+        self, *, user_request: str, tool_name: str, tool_args: Mapping[str, Any]
+    ) -> ActionVerdict:
+        del user_request, tool_args
+        return ActionVerdict(aligned=tool_name != _FREE, reason="test")
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_approval_does_not_end_a_blocked_turn() -> None:
+    """B 的调用被 action screening 阻断:照常回到 agent 重新规划,不带着 A 的请求收场。"""
+    async with make_checkpointer("memory") as cp:
+        g = _build(
+            cp,
+            [
+                _gated_turn("A", "tc-a"),
+                AIMessage(content="", tool_calls=[_call(_FREE, {"x": 4}, "tc-free")]),
+            ],
+            action_judge=_BlockEcho(),
+            action_screen="block",
+        )
+        await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
+        calls_before_b = len(g.llm.prompts)
+
+        state = await g.compiled.ainvoke(_bare_input("b"), config=_cfg("run-b"))
+
+        assert g.free.seen == []
+        assert state.get("pending_approval") is None
+        assert len(g.llm.prompts) - calls_before_b == 2
+        assert state["messages"][-1].content == "done"
+
+
+@pytest.mark.asyncio
+async def test_agent_question_rejected_after_an_earlier_veto_loops_back_to_the_agent() -> None:
+    """上一轮声明式拒绝留下 ``approval_outcome``;本轮 agent 自己发起的确认被拒,应回到 agent。"""
+    ask = AIMessage(
+        content="",
+        tool_calls=[
+            _call(
+                ASK_FOR_APPROVAL_TOOL,
+                {"reason_kind": "approach_choice", "action_summary": "which one?"},
+                "tc-ask",
+            )
+        ],
+    )
+    async with make_checkpointer("memory") as cp:
+        g = _build(cp, [_gated_turn("A", "tc-a"), ask])
+        await g.compiled.ainvoke(_bare_input("a"), config=_cfg("run-a"))
+        await g.compiled.aupdate_state(
+            _cfg("run-a"),
+            {"pending_approval": None, "approval_resume": {"decision": "reject"}},
+            as_node="agent",
+        )
+        assert (await g.compiled.ainvoke(None, config=_cfg("run-a-cont")))[
+            "approval_outcome"
+        ] == "rejected"
+        paused = await g.compiled.ainvoke(_bare_input("b"), config=_cfg("run-b"))
+        assert paused["pending_approval"].reason_kind == "approach_choice"
+        await g.compiled.aupdate_state(
+            _cfg("run-b"),
+            {"pending_approval": None, "approval_resume": {"decision": "reject"}},
+            as_node="agent",
+        )
+        calls_before = len(g.llm.prompts)
+
+        state = await g.compiled.ainvoke(None, config=_cfg("run-b-cont"))
+
+        assert len(g.llm.prompts) - calls_before == 1
         assert state["messages"][-1].content == "done"
         assert state.get("approval_outcome") is None
 

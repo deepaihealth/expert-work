@@ -1358,10 +1358,11 @@ def build_react_graph(
         approval_resume = state.get("approval_resume")
         # 审批三件套只属于一轮。本轮写下 ``pending_approval`` / ``approval_outcome``
         # 的路都会经 ``_after_tools`` 直接收场、不会再进这个节点,所以这里读到的
-        # 非空值只可能是上一轮留下的。本节点的每个出口都把它们清掉 —— 不清,
-        # ``_after_tools`` 会读着陈旧值把这一轮提前结束(或带着上一轮的审批请求
-        # 以 PAUSED 收场)。图输入每轮也会清零(``APPROVAL_TURN_RESET``),这里是
-        # 不依赖入口的那道防线(班车 2 安全修复)。
+        # 非空值只可能是上一轮留下的。本节点让这一轮继续往下走的出口(派发、
+        # 拒绝结果、阻断)都把它们清掉 —— 不清,``_after_tools`` 会读着陈旧值把
+        # 这一轮提前结束(或带着上一轮的审批请求以 PAUSED 收场)。停在审批上的
+        # 出口本来就收场,``pending_approval`` 由新请求覆盖。图输入每轮也会清零
+        # (``APPROVAL_TURN_RESET``),这里是不依赖入口的那道防线(班车 2 安全修复)。
         stale_approval: dict[str, Any] = {
             key: None
             for key in ("pending_approval", "approval_outcome")
@@ -1430,7 +1431,6 @@ def build_react_graph(
                         configurable = config.get("configurable") or {}
                         thread_id = str(configurable.get("run_id") or "run")
                         return {
-                            **stale_approval,
                             "pending_approval": build_approval_request(
                                 ApprovalTarget(
                                     index=bad_idx,
@@ -1444,7 +1444,7 @@ def build_react_graph(
                                 # re-scan cannot reproduce it, so mint unbound to
                                 # avoid verifying the wrong call (RT-ADR-19).
                                 bind=False,
-                            ),
+                            )
                         }
                     # block — deny the whole turn (one error ToolMessage per
                     # call so no tool_call is left orphaned); the agent re-plans.
@@ -1467,13 +1467,12 @@ def build_react_graph(
                 configurable = config.get("configurable") or {}
                 thread_id = str(configurable.get("run_id") or "run")
                 return {
-                    **stale_approval,
                     "pending_approval": build_approval_request(
                         target,
                         thread_id=thread_id,
                         timeout_s=approval_timeout_s,
                         clarification_timeout_s=clarification_timeout_s,
-                    ),
+                    )
                 }
 
         ctx_obj = _build_tool_context(
