@@ -288,7 +288,7 @@ export interface ThreadRunSummary {
    *  ``receivedAt`` 全挤在回放一瞬间,不能当耗时。老后端无此字段 → null。 */
   finishedAt: string | null;
   /** INTERRUPTED 放 InterruptReason 短码(user_cancel / client_disconnect /
-   *  tenant_suspended / agent_disabled),ERROR 放异常文本;其余 null。 */
+   *  tenant_suspended / agent_disabled / new_turn),ERROR 放异常文本;其余 null。 */
   error: string | null;
   /** PR-A — persisted per-run token rollup (``null`` when the run has no
    *  recorded usage; absent on old backends → treated as null). */

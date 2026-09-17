@@ -1349,6 +1349,7 @@ export interface TranslationKeys {
     interrupt_reason_client_disconnect: string;
     interrupt_reason_tenant_suspended: string;
     interrupt_reason_agent_disabled: string;
+    interrupt_reason_new_turn: string;
     footer_export: string;
     turn_view_run: string;
     toolbar_duration: string;
@@ -4676,6 +4677,7 @@ const en: TranslationKeys = {
     interrupt_reason_client_disconnect: "Interrupted (connection lost)",
     interrupt_reason_tenant_suspended: "Interrupted (tenant suspended)",
     interrupt_reason_agent_disabled: "Interrupted (agent disabled)",
+    interrupt_reason_new_turn: "Interrupted (new message sent; pending approval voided)",
     footer_export: "Export",
     turn_view_run: "View run",
     toolbar_duration: "Duration",
