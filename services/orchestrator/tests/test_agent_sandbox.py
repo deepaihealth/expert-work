@@ -1520,12 +1520,13 @@ async def test_exec_omits_pythonuserbase_when_agent_key_unset() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_injects_expert_work_inputs_when_run_id_set() -> None:
-    """B-61 §4.4 —— ``run_id`` 非空时随 ``commands.run(envs=)`` 注入
-    ``EXPERT_WORK_INPUTS``,与本地 supervisor 后端同一份值(``agent_key_envs``
-    单源,两后端契约见 ``test_sandbox_runtime_contract.py``)。这条钉住的正是
-    ``AgentSandboxClient.exec`` 这一个生产调用点 —— 它改成不把 ``run_id``
-    转手给 ``agent_key_envs`` 时,这里必须红。"""
-    from orchestrator.tools.inputs_doc import inputs_abs_path
+    """B-61 §4.4 / B-67 §4.2 —— ``run_id`` 非空时随 ``commands.run(envs=)`` 注入
+    ``EXPERT_WORK_INPUTS`` 与 ``EXPERT_WORK_INPUTS_DIR``(本轮 inputs 目录,按变量名的
+    链接就建在这里),与本地 supervisor 后端同一份值(``agent_key_envs`` 单源,两后端
+    契约见 ``test_sandbox_runtime_contract.py``)。这条钉住的正是
+    ``AgentSandboxClient.exec`` 这一个生产调用点 —— 它改成不把 ``run_id`` 转手给
+    ``agent_key_envs`` 时,这里必须红;精确比对整个 dict,多注入 / 少注入一项都红。"""
+    from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
 
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -1534,7 +1535,10 @@ async def test_exec_injects_expert_work_inputs_when_run_id_set() -> None:
 
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, run_id=run_id)
 
-    assert sdk.sandbox.commands.envs_calls[-1] == {"EXPERT_WORK_INPUTS": inputs_abs_path(run_id)}
+    assert sdk.sandbox.commands.envs_calls[-1] == {
+        "EXPERT_WORK_INPUTS": inputs_abs_path(run_id),
+        "EXPERT_WORK_INPUTS_DIR": inputs_abs_dir(run_id),
+    }
 
 
 def _dockerfile_text() -> str:
