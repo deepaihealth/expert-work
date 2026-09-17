@@ -55,7 +55,9 @@ def test_block_lists_every_declared_variable_with_status_and_never_a_value() -> 
     assert "$EXPERT_WORK_INPUTS_DIR" in text and "$EXPERT_WORK_INPUTS" in text
     assert "- employee_name（当前员工姓名）：已提供，短文本" in text
     assert "- customer_code（目标客户编码）：本轮未提供" in text
-    assert "- project_code（项目唯一标识码）：已绑定到工具参数，调用时平台自动填" in text
+    assert (
+        "- project_code（项目唯一标识码）：已提供，短文本；绑定了它的工具由平台自动填，不用手抄"
+    ) in text
     assert (
         "- org_logo（机构 LOGO）：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；"
         "不在则按清单里的原地址下载"
@@ -73,6 +75,35 @@ def test_block_lists_every_declared_variable_with_status_and_never_a_value() -> 
         assert value not in text
     # 顶层 URL 的名字与预拉 / 渲染同源。
     assert linked_sites("org_logo", LOGO)[0].link == "org_logo.png"
+
+
+def test_bound_variable_reports_its_shape_then_the_binding() -> None:
+    """裁定 P10 —— 模板里被绑定的变量照形态渲染,绑定只在这里说一次:形态状态照常,
+    后面接一句「绑定了它的工具由平台自动填」。"""
+    variables = (_Var("org_logo", description="机构 LOGO"), _Var("secret", trusted=False))
+    text = build_inputs_block(
+        variables, {"org_logo": LOGO, "secret": "v"}, bindings={"org_logo", "secret"}
+    )
+    assert text is not None
+    assert (
+        "- org_logo（机构 LOGO）：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；"
+        "不在则按清单里的原地址下载；绑定了它的工具由平台自动填，不用手抄"
+    ) in text
+    assert (
+        "- secret：已提供，外部数据，需逐字使用时从清单读；绑定了它的工具由平台自动填，不用手抄"
+    ) in text
+
+
+def test_bound_optional_variable_not_passed_reports_unset_only() -> None:
+    """裁定 P12 —— 先判「本轮未提供」:可选变量被绑定但本轮没传,只说没提供。"""
+    text = build_inputs_block(
+        (_Var("customer_code", required=False, description="目标客户编码"),),
+        {},
+        bindings={"customer_code"},
+    )
+    assert text is not None
+    lines = [ln for ln in text.splitlines() if ln.startswith("- customer_code")]
+    assert lines == ["- customer_code（目标客户编码）：本轮未提供"]
 
 
 def test_variable_without_description_shows_the_name_only() -> None:

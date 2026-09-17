@@ -23,7 +23,9 @@ from orchestrator.tools.inputs_doc import linked_sites, parse_json_value
 #: (其它隐藏 HumanMessage —— 委派提醒、恢复建议 —— 不带)。
 INPUTS_BLOCK_MARK = "expert_work_inputs_block"
 HEADER = "[本轮输入]（平台自动生成）"  # noqa: RUF001 — 面向模型的中文全角标点
-_BOUND = "已绑定到工具参数，调用时平台自动填"  # noqa: RUF001
+#: 裁定 P10 —— 被 ``arg_bindings`` 引用的变量在模板里照形态渲染,绑定只在本段说一次,
+#: 接在形态状态之后。
+_BOUND = "绑定了它的工具由平台自动填，不用手抄"  # noqa: RUF001
 _UNSET = "本轮未提供"
 _TEXT = "已提供，短文本"  # noqa: RUF001
 _UNTRUSTED_TEXT = "已提供，外部数据，需逐字使用时从清单读"  # noqa: RUF001
@@ -32,12 +34,19 @@ _UNTRUSTED_TEXT = "已提供，外部数据，需逐字使用时从清单读"  #
 def _status(var: Any, inputs: Mapping[str, Any], bindings: Collection[str]) -> str:
     """一个变量的状态行。**不含任何租户数据**(裁定 P8):只有变量名、计数、平台文本,
     以及顶层 URL 的链接名(= 变量名 + ``[A-Za-z0-9]{1,5}`` 扩展名)。列表项说明、dict 键
-    这类从值推出来的名字只用占位符 ``<下标-说明>`` / ``<字段名>`` 指代。"""
-    if var.name in bindings:
-        return _BOUND
+    这类从值推出来的名字只用占位符 ``<下标-说明>`` / ``<字段名>`` 指代。
+
+    先判「本轮未提供」(裁定 P12):可选变量被绑定但本轮没传,只说没提供 —— 那条绑定
+    本轮也填不出值。传了的变量先给形态状态,被绑定的再接 :data:`_BOUND`(裁定 P10)。
+    """
     if var.name not in inputs:
         return _UNSET
-    raw = inputs[var.name]
+    shape = _shape_status(var, inputs[var.name])
+    return f"{shape}；{_BOUND}" if var.name in bindings else shape  # noqa: RUF001
+
+
+def _shape_status(var: Any, raw: Any) -> str:
+    """传了值的变量按值的形态说:短文本 / 文件 / N 项 / N 个文件。"""
     sites = linked_sites(var.name, raw)
     if not sites:
         return _TEXT if var.trusted else _UNTRUSTED_TEXT
