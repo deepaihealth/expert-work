@@ -360,9 +360,11 @@ tools/deploy/rollback.sh prod <上一版 tag>     # 秒级 set image,无确认�
   #1317)、配额维度混扣
   (B-19,给第三方配配额前必修)、RPM 静态除法非全局桶(Redis 令牌桶=发布后,
   弹性扩容需与 `EXPERT_WORK_REPLICA_COUNT` 同步改)。触发器投递 CAS 已修(#1314)。
-- ~~retention-cleanup-job~~ **波 3 线 R PR1 起 test 已部署**(CronJob
-  `retention-cleanup`,每日 03:23 北京时间,只在 overlays/test 引用;X-15①
-  第二套审批超时已删、B-45 RLS sessionmaker 已接);**prod 待 test 观察一周**
-  后另开 PR 在 overlays/prod 引用同一目录。billing-rollup-job /
+- ~~retention-cleanup-job~~ **test 波 3 线 R PR1 起部署,prod 班车 2(2026-09-24)起部署**
+  (CronJob `retention-cleanup`,`timeZone: Asia/Shanghai` 每日 03:23;X-15①
+  第二套审批超时已删、B-45 RLS sessionmaker 已接)。放行依据是 09-17 测试环境
+  造数据实删 37/37(test 一周的日志删除数全 0,验不出东西),记录在
+  `base/retention-cleanup-job/kustomization.yaml` 头注。image_upload 那条 pass
+  两环境都是 no-op(job 不持有 OSS 凭据)。billing-rollup-job /
   event-log-archive-job / audit-backup-worker 仍是**只有代码没有部署物**
   (infra/k8s 零 CronJob),test 也没跑,首发保持一致。

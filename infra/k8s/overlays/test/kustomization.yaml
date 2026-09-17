@@ -6,8 +6,8 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# 留存清理 CronJob —— 先只在 test 跑(波 3 线 R PR1);prod overlay 不引用,
-# 观察一周后另开 PR 接。见 base/retention-cleanup-job/kustomization.yaml 头注。
+# 留存清理 CronJob —— 波 3 线 R PR1 起在 test 跑;班车 2 起 prod 也引用。
+# 见 base/retention-cleanup-job/kustomization.yaml 头注。
 resources:
 - ../../base
 - ../../base/retention-cleanup-job

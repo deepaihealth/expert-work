@@ -11,8 +11,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# 留存清理 CronJob —— 班车 2(2026-09-24)起接入。test 从 09-09 跑到 09-16 每天成功但
+# 每项删除数都是 0(测试环境不到 90 天,无物可删),所以放行依据不是「泡一周无事故」,
+# 而是 09-17 在测试环境用合成探针租户造「刚过期 / 差一点才过期」两份数据、手动跑一次、
+# 逐行核对 37/37 通过(见 base/retention-cleanup-job/kustomization.yaml 头注)。
 resources:
 - ../../base
+- ../../base/retention-cleanup-job
 
 # Deployed image tags — same release conventions as overlays/test/
 # (fresh tag every release, `-rN` for same-source rebuilds, ACS caches

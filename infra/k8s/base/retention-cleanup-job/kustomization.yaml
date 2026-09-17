@@ -1,10 +1,16 @@
 # retention-cleanup-job —— 留存清理 CronJob(波 3 线 R,PR1 首部署)。
 #
 # 刻意做成 base/ 下的一个**独立** kustomization,而不是挂进 base/kustomization.yaml
-# 的 resources:base 是 test 与 prod 共用的,而这个 job 先只在 test 跑一周观察
-# (runbook production-release.md § 4)。overlays/test/kustomization.yaml 引用
-# 本目录;overlays/prod 不引用 —— prod 什么时候接,是看过 test 一周的
-# 日志之后另开 PR 改一行 overlay 的事,不是这里的默认值。
+# 的 resources:它先只在 test 跑,prod 是另开 PR 显式接的(两个 overlay 各自一行
+# 引用,谁接了一眼可见)。
+#
+# prod 放行记录(班车 2,2026-09-24):test 09-09 ~ 09-16 每天成功,但**每项删除数
+# 都是 0** —— 测试环境不到 90 天,各规则无物可删,「泡一周无事故」验不出删对删错。
+# 09-17 改为造数据实删:合成探针租户(不碰任何真实租户)下,每类规则造「刚过期」与
+# 「差一点才过期」两份(审计 / 事件 / 出网审计 / jwt / 产物五形态 / 上传三形态 /
+# 孤儿 threads 与 .tool_results / 记忆 / 成员 / 已删工作区三形态 + 从属行),手动
+# 触发一次,计数与逐行核对 37/37 全过,之后清理干净。图片那条 pass 两环境都不跑
+# (job 不持有 OSS 凭据,见 cronjob.yaml 头注)。
 #
 # 同 base 的 namespace / part-of 标签:kustomize 的 namespace 与 commonLabels
 # 不会跨 kustomization 继承,所以在这里重申一遍。
