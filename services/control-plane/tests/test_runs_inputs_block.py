@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from control_plane.api.runs import build_run_graph_input, replay_graph_input
@@ -77,6 +78,17 @@ def test_non_jinja_run_is_byte_identical_two_messages() -> None:
     assert [m.content for m in gi["messages"]] == ["sys", "hi"]
 
 
+def test_non_jinja_agent_with_declared_variables_gets_no_block() -> None:
+    """裁定 8 —— 段落只在 ``prompt_jinja`` 为真时生成;声明了变量也不行。"""
+    built = _jinja_built()
+    built.prompt_jinja = False
+    built.system_prompt = "sys"
+    gi = build_run_graph_input(
+        built, input_text="hi", image_refs=[], untrusted_content=None, run_id=uuid4()
+    )
+    assert [m.content for m in gi["messages"]] == ["sys", "hi"]
+
+
 def test_replay_keeps_the_inputs_block_with_fresh_id_and_new_stamp() -> None:
     old, new = uuid4(), uuid4()
     gi = build_run_graph_input(
@@ -105,6 +117,13 @@ def test_replay_of_a_two_message_turn_is_unchanged() -> None:
         run_id=uuid4(),
     )
     assert len(out["messages"]) == 2
+
+
+@pytest.mark.parametrize("count", [1, 4])
+def test_replay_rejects_a_turn_that_is_not_two_or_three_messages(count: int) -> None:
+    msgs = [SystemMessage(content="s"), *[HumanMessage(content="u") for _ in range(count - 1)]]
+    with pytest.raises(ValueError, match="2 or 3"):
+        replay_graph_input(SimpleNamespace(max_steps=5, max_no_progress=0), msgs, run_id=uuid4())
 
 
 def test_replay_originals_take_the_inputs_block_but_not_other_hidden_messages() -> None:

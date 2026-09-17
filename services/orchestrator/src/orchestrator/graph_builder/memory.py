@@ -144,8 +144,9 @@ def _render_trajectory(messages: list[BaseMessage]) -> str:
         # Skip the agent's own system prompt — it is an instruction to the
         # agent, not signal for memory extraction, and it otherwise dominated
         # the extraction input (the confusing ``[system] ...`` line surfaced in
-        # the debug console).
-        if isinstance(message, SystemMessage):
+        # the debug console). Hidden HumanMessages (B-67 inputs block, advisories)
+        # are platform scaffolding for the same reason.
+        if isinstance(message, SystemMessage) or is_hidden(message):
             continue
         text = _message_text(message).strip()
         if len(text) > _TRAJECTORY_CHAR_CAP:

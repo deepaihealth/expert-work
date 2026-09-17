@@ -33,8 +33,9 @@ _UNTRUSTED_TEXT = "已提供，外部数据，需逐字使用时从清单读"  #
 
 def _status(var: Any, inputs: Mapping[str, Any], bindings: Collection[str]) -> str:
     """一个变量的状态行。**不含任何租户数据**(裁定 P8):只有变量名、计数、平台文本,
-    以及顶层 URL 的链接名(= 变量名 + ``[A-Za-z0-9]{1,5}`` 扩展名)。列表项说明、dict 键
-    这类从值推出来的名字只用占位符 ``<下标-说明>`` / ``<字段名>`` 指代。
+    以及 trusted 变量顶层 URL 的链接名(= 变量名 + ``[A-Za-z0-9]{1,5}`` 扩展名)。untrusted
+    的顶层 URL(裁定 P16)、列表项说明、dict 键这类从值推出来的名字只用占位符
+    ``<变量名>.<扩展名>`` / ``<下标-说明>`` / ``<字段名>`` 指代。
 
     先判「本轮未提供」(裁定 P12):可选变量被绑定但本轮没传,只说没提供 —— 那条绑定
     本轮也填不出值。传了的变量先给形态状态,被绑定的再接 :data:`_BOUND`(裁定 P10)。
@@ -51,7 +52,9 @@ def _shape_status(var: Any, raw: Any) -> str:
     if not sites:
         return _TEXT if var.trusted else _UNTRUSTED_TEXT
     if isinstance(raw, str) and sites[0].site.path == ():
-        return f"文件 ${INPUTS_DIR_ENV}/{sites[0].link}；不在则按清单里的原地址下载"  # noqa: RUF001
+        # 裁定 P16 —— 真名里的扩展名取自租户 URL;untrusted 时只写占位符,不写真名。
+        link = sites[0].link if var.trusted else f"{var.name}.<扩展名>"
+        return f"文件 ${INPUTS_DIR_ENV}/{link}；不在则按清单里的原地址下载"  # noqa: RUF001
     parsed = parse_json_value(raw)
     root = parsed if parsed is not None else raw
     if isinstance(root, list):

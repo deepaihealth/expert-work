@@ -52,7 +52,8 @@ def test_block_lists_every_declared_variable_with_status_and_never_a_value() -> 
     text = build_inputs_block(VARS, INPUTS, bindings={"project_code"})
     assert text is not None
     assert text.startswith(HEADER)
-    assert "$EXPERT_WORK_INPUTS_DIR" in text and "$EXPERT_WORK_INPUTS" in text
+    assert "输入文件目录 $EXPERT_WORK_INPUTS_DIR，" in text
+    assert "清单 $EXPERT_WORK_INPUTS（" in text
     assert "- employee_name（当前员工姓名）：已提供，短文本" in text
     assert "- customer_code（目标客户编码）：本轮未提供" in text
     assert (
@@ -92,6 +93,19 @@ def test_bound_variable_reports_its_shape_then_the_binding() -> None:
     assert (
         "- secret：已提供，外部数据，需逐字使用时从清单读；绑定了它的工具由平台自动填，不用手抄"
     ) in text
+
+
+def test_untrusted_top_level_url_prints_a_placeholder_not_the_real_link_name() -> None:
+    """裁定 P16 —— 顶层 URL 的链接名带着租户 URL 的扩展名;``trusted: false`` 时不原样
+    写出(PR2 在提示词里把同一串放进围栏),换成占位符。trusted 仍给真名。"""
+    variables = (_Var("cover", trusted=False), _Var("org_logo"))
+    text = build_inputs_block(variables, {"cover": LOGO, "org_logo": LOGO}, bindings=())
+    assert text is not None
+    assert (
+        "- cover：文件 $EXPERT_WORK_INPUTS_DIR/cover.<扩展名>；不在则按清单里的原地址下载"
+    ) in text
+    assert "cover.png" not in text
+    assert "- org_logo：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；" in text
 
 
 def test_bound_optional_variable_not_passed_reports_unset_only() -> None:
