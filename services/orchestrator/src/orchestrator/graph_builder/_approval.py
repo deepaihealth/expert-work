@@ -63,6 +63,10 @@ WITHHELD_CALL_CONTENT = (
 #: reviewer's arguments (:data:`_APPROVED_WITH_ARGS`).
 APPROVED_QUESTION_CONTENT = "[approved] a human approved this request."
 _APPROVED_WITH_ARGS = " The human set these arguments: {}"
+#: 审核人填的参数拼进提示词前的上限(与裁定 ``reason`` 的 2048 同量级)。它不经工具输出
+#: 预算,端点对 ``modified_args`` 也没有长度上限。
+APPROVED_ARGS_MAX_CHARS = 2048
+_TRUNCATED_SUFFIX = "…(truncated)"
 
 #: ``reason_kind`` values an ``ask_for_approval`` call may carry. A call
 #: with anything else (or nothing) falls back to ``risk_confirmation``.
@@ -531,7 +535,10 @@ def _approved_question(
     """
     content = APPROVED_QUESTION_CONTENT
     if decision == "modify":
-        dumped = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        # ``default=str`` 与 ``canonical_args_digest`` 同口径:这里抛错会让续跑卡在这一步。
+        dumped = json.dumps(args, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(dumped) > APPROVED_ARGS_MAX_CHARS:
+            dumped = dumped[:APPROVED_ARGS_MAX_CHARS] + _TRUNCATED_SUFFIX
         content += _APPROVED_WITH_ARGS.format(dumped)
     return ToolMessage(
         content=content,

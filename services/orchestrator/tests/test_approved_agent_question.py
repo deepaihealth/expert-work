@@ -103,3 +103,30 @@ def test_answer_is_separate_from_withheld() -> None:
     assert gated.answered == {} and set(gated.withheld) == {0}
     rejected = apply_resume_decision(calls, frozenset(), {**verdict, "decision": "reject"})
     assert rejected.answered == {} and rejected.withheld == {}
+
+
+def test_modified_arguments_that_are_not_plain_json_do_not_break_the_answer() -> None:
+    # 终审复核 N1 —— 序列化抛错会让续跑卡死在这一步(每次复活都重抛)。
+    from datetime import date
+
+    from orchestrator.graph_builder._approval import _approved_question
+
+    message = _approved_question(
+        _question_calls()[0], "modify", {"due": date(2026, 9, 24), "tags": {"a"}}
+    )
+    assert isinstance(message.content, str)
+    assert '"due":"2026-09-24"' in message.content
+
+
+def test_modified_arguments_are_capped_in_the_answer() -> None:
+    # 终审复核 N2 —— 审核人填的参数没有长度上限,原样拼进提示词会绕过工具输出预算。
+    from orchestrator.graph_builder._approval import (
+        APPROVED_ARGS_MAX_CHARS,
+        _approved_question,
+    )
+
+    message = _approved_question(_question_calls()[0], "modify", {"note": "x" * 2_000_000})
+    assert isinstance(message.content, str)
+    assert message.content.startswith(APPROVED_QUESTION_CONTENT)
+    assert len(message.content) < len(APPROVED_QUESTION_CONTENT) + APPROVED_ARGS_MAX_CHARS + 100
+    assert message.content.endswith("…(truncated)")
