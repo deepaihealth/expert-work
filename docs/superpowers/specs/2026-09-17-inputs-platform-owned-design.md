@@ -165,16 +165,17 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 `tools_node` 里 `_fill_bound_args` 之后,对 `exec_python` / `bash` 的代码参数(`_SANDBOX_CODE_ARGS`)做一次扫描;命中只在派发处(`_bounded`)生效,不改审批门与 action screening 的判定和下标语义(裁定 5):
 
 - 候选集 = 本轮 `PROMPT_INPUTS_KEY` 里所有 URL site(`inputs_doc.linked_sites`,与预拉 / 渲染同一个 walker 与命名,含 §4.3 的解析形态),记 `(变量名, URL, 链接名)`。
-- 从代码里抽所有 URL 字面量(`https?://` 不分大小写,到空白 / 引号 / 反引号 / 尖括号 / 右括号 / 右方括号 / 常见全角标点为止);逐个与候选集比:
-  - **完全一致** → 命中(第一处完全一致优先);
-  - **同 scheme+host(不分大小写),host 之后的全部(路径 + query + fragment,裁定 4)编辑距离 ≤ 3** → 命中,取最小距离(带状 Levenshtein,裁定 P19;host 之后超过 8192 字符不比)。事故里距离是 1;阈值 3 覆盖「多一位/少一位/改一字」。
-- 命中即拦:该调用不执行,合成 `ToolMessage(status="error")`。trusted 变量回显写法与链接名:
+- **完全一致**(裁定 P25):按子串在代码里找候选 URL 的原文,原文后面不是 URL 的延续(只隔着 ASCII 句读 `.,;:!?)` 也算)→ 命中。不依赖字面量抽取,所以路径里带全角标点或括号的 URL 也认得出。代码里抽出的 URL 字面量(见下)与候选只差 scheme / host 大小写,同样算完全一致。
+- **近似**:从代码里抽 URL 字面量(`https?://` 不分大小写,到空白 / 引号 / 反引号 / 尖括号 / 右括号 / 右方括号 / 常见全角标点为止,去掉尾随的 ASCII 句读),与同 scheme+host(不分大小写)的候选比 host 之后的全部(路径 + query + fragment,裁定 4)。允许的编辑距离随**候选**尾串长度走:`min(3, 尾串长度 // 16)`(裁定 P25)—— 尾串短于 16 字符只拦完全一致(`/v1` 与 `/v2`、`img_0.png` 与 `img_7.png` 本来就是不同的地址)。事故里的尾串约 30 字符、距离 1,在界内。进 DP 前先过长度差与字符多重集差两道下界;DP 是带状 Levenshtein(裁定 P19),host 之后超过 8192 字符不比。
+- 归属:先找完全一致;否则按字面量在代码里的顺序,**第一个**有近似命中的字面量即返回(它对多个候选取最小距离)。
+- **失败放行**(裁定 P26):候选构建或比对抛任何异常 → 整批放行,记 `tools.input_url_guard_skipped`(只带异常类型,异常文本里可能有 URL);每次调用的近似比较预算约 200 万个 DP 格子(尾串长度 × 带宽累计),用完就停、已找到的照常返回,记 `tools.input_url_guard_budget_exhausted`(只有计数)。A 的链接命名(`url_suffix`,宿主与沙箱两份)遇到畸形 URL 不再抛;沙箱预拉里一个变量出错只丢那一个变量。
+- 命中即拦:该调用不执行,合成 `ToolMessage(status="error")`。trusted 变量回显写法与链接名;近似命中另给出路(真是别的地址就从它自己的来源取):
 
   ```
-  [blocked] 代码里的地址 https://files.example.com/brand/cover-17263948851207.png 是输入 org_logo 的手抄件（平台比对：疑似抄错 1 处）。这个文件应在 $EXPERT_WORK_INPUTS_DIR/org_logo.png（不在则按清单里的原地址下载）；请改用它，或用代码从 $EXPERT_WORK_INPUTS 清单里读 org_logo 的原地址，不要手抄。
+  [blocked] 代码里的地址 https://files.example.com/brand/cover-17263948851207.png 像是输入 org_logo 的地址手抄出来的（平台比对：疑似抄错 1 处）。若是它：这个文件应在 $EXPERT_WORK_INPUTS_DIR/org_logo.png（不在则按清单里的原地址下载）；请改用它，或用代码从 $EXPERT_WORK_INPUTS 清单里读 org_logo 的原地址，不要手抄。如果它确实是另一个地址，请让代码从它自己的来源取得（读文件、接口返回或上一步的输出），不要在代码里手写这串地址。
   ```
 
-  untrusted 变量与委派子 run(按 `configurable["child_run"]` 判,裁定 P24)的提示不写链接名、不回显那串 —— 这条合成消息不过 spotlight 围栏:
+  untrusted 变量与委派子 run(按 `configurable["child_run"]` 判,裁定 P24)的提示不写链接名、不回显那串 —— 这条合成消息不过 spotlight 围栏(下例为完全一致;近似时同样带上面那句出路):
 
   ```
   [blocked] 代码里有一处地址是输入 materials 的手抄件（平台比对：与输入一致）。这个文件应在 $EXPERT_WORK_INPUTS_DIR 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里 materials 对应条目的 local_path（不在则按清单里的原地址下载）；请用代码从清单里读路径或原地址，不要手抄。
@@ -190,8 +191,11 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 - 只看 `exec_python` / `bash`;MCP 参数走绑定面。
 - 只比 URL 候选;非 URL 值不比。
 - 模型代码里**读清单再拼 URL**(`d["variables"]["org_logo"]["value"]`)不含字面量,不会命中 —— 这正是想要的用法。
-- 不同输入之间近似(`…-1.png` 与 `…-2.png` 都是输入)→ 完全一致优先;都不一致时按最小距离归属,消息里写「疑似」。
+- `render: raw` 的变量同样在守卫范围内(守卫不看渲染方式)。
+- 归属:完全一致优先;否则取代码里**第一个**有近似命中的字面量,再对它取距离最小的候选(`…-1.png` 与 `…-2.png` 都是输入时,抄错的那串归给更近的那个);消息里写「疑似」并给出路。
 - 误拦代价:模型多一轮改道;漏拦代价:404。取拦。
+- 已知误拦(裁定 P25):尾串较长、与某个输入只差一两位的**非输入**地址(同目录编号相邻的公开素材、`/openapi/v1/…` 输入旁边调 `/openapi/v2/…`)仍会被拦一次,靠近似提示里的出路换路;上线后看 KPI 的命中明细,有真实误拦再收紧。
+- 接受的漏拦:字符串拼接 / f-string / 变量间接引用 / 编码、`http` ↔ `https`、percent-encoding 过的 host、先写文件再执行、非沙箱工具;短尾串原文紧跟 shell 字符(`|`、`\`、`&&`);被全角标点截断后的**近似**抄错(完全一致的仍认得出)。
 - 已知代价(裁定 5):`bash` 同时在 `approval_required_tools` 里且抄错时,会先走一轮审批,批准后仍被拦;审批面板里人改过的代码同样受守卫约束。
 
 ### 7.3 为什么放 tools_node 不放中间件
@@ -203,13 +207,13 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 - 提示词里**少了** URL,没有新增任何值进上下文;C 段零值。
 - `value_parsed` 与 `value` 同受 `_null_local_paths` 闸(调用方自带的 `local_path` 清空)。
 - 符号链接只由平台预拉脚本在 run 目录内创建、目标限定 `../cache/`;janitor 不跟随链接(§4.4)。
-- 守卫消息里出现的是模型自己写的那串,不是输入值;`tool:blocked` 审计不记 URL。
+- 守卫消息里回显的是模型自己写的那串(完全一致时与输入值相同),只对 trusted 变量回显;`tool:blocked` 审计与守卫日志不记 URL、不记代码。
 - `render_value` 只做字符串替换,不发网、不读盘。
 
 ## 九、存量、迁移、回滚
 
 - 存量 Agent:唯一变化是 URL 值的渲染(§五)。发布清单写明;对接方 addendum 状态改为「模板不必改;§4 的 5 处降为可选」。
-- 回滚:四件事各自独立。A 回滚 = 预拉脚本不建链接、`local_path` 指回 cache(老消费方无感);B 回滚 = `render_value` 直通;C 回滚 = 不追加隐藏消息;D 回滚 = 守卫不拦只记日志。**没有 schema 迁移**;`PromptVariableSpec.render` 是可选字段带默认值,旧版本读到带 `render:` 的 manifest 会 `extra="forbid"` 报错 —— 与 B-61 的 `arg_bindings` 同一个坑,同一条纪律:回滚窗口内别配 `render`。
+- 回滚:四件事各自独立。A 回滚 = 预拉脚本不建链接、`local_path` 指回 cache(老消费方无感);B 回滚 = `render_value` 直通;C 回滚 = 不追加隐藏消息;D 回滚 = revert 该 PR(不加「只记日志不拦」的运行期开关,裁定 7)。**没有 schema 迁移**;`PromptVariableSpec.render` 是可选字段带默认值,旧版本读到带 `render:` 的 manifest 会 `extra="forbid"` 报错 —— 与 B-61 的 `arg_bindings` 同一个坑,同一条纪律:回滚窗口内别配 `render`。
 
 ## 十、可观测性
 
@@ -251,6 +255,6 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 ## 十四、待定 / 后续
 
 - `materials` 这类 JSON 字符串契约,长期应改成真 JSON 数组(对接方侧改动);`value_parsed` 是过渡。
-- 守卫的编辑距离阈值 3 是按事故取的;真栈验收的读数出来后再定。
+- 守卫的近似阈值 `min(3, 尾串长度 // 16)` 是按事故与终审误拦分析取的(裁定 P25);真栈验收与上线后命中明细出来后再定。
 - 非 URL 长 ID 若出现真实用例,再议是否加 `kind: id` 一类声明(倾向不加,优先走绑定)。
 - spotlight nonce 是「每次构建一个、构建跨 run 缓存」(`agent_factory.py:1101`),`spotlight.py` 模块注释写的 per-run 不准;顺手改注释,不开票。
