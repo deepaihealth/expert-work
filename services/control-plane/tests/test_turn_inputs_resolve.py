@@ -156,7 +156,7 @@ async def test_a_missing_prompt_frame_is_logged_by_id_only(
 ) -> None:
     """帧丢了(H-7 落库失败)或审批链没串上:空 inputs,且留一条只有 id 的 warning。"""
     t = _Thread()
-    r0 = await t.run(RunStatus.PAUSED, inputs={"pc": "SECRET-VALUE"})
+    await t.run(RunStatus.PAUSED, inputs={"pc": "A"})
     orphaned = await t.run(RunStatus.RUNNING, fresh=False)  # 没有审批单指向它
 
     with caplog.at_level(logging.WARNING, logger="control_plane.turn_inputs"):
@@ -164,10 +164,10 @@ async def test_a_missing_prompt_frame_is_logged_by_id_only(
 
     assert got == TurnInputs(root_run_id=orphaned, inputs={})
     (record,) = caplog.records
-    assert record.getMessage().startswith("turn_inputs.prompt_frame_missing")
-    assert str(orphaned) in record.getMessage()
-    assert "SECRET-VALUE" not in record.getMessage()
-    assert r0 != orphaned
+    # 整条消息逐字比对:除了两个 id 什么都没有(没有值、没有变量名)。
+    assert record.getMessage() == (
+        f"turn_inputs.prompt_frame_missing run_id={orphaned} root_run_id={orphaned}"
+    )
 
 
 @pytest.mark.asyncio

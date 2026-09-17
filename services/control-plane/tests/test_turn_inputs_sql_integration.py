@@ -1,7 +1,9 @@
 """``resolve_turn_inputs`` 在生产那一套 SQL store 上 —— 真 Postgres + Alembic schema。
 
-内存版的行为由 ``test_turn_inputs_resolve.py`` 钉住;这里只证三件只有真库才答得了的事:
-``run_event`` 的 JSONB 帧原样读回、``list_by_thread`` 的定序撑得住审批链回溯、
+三个 store 都是生产用的 SQL 实现(``SqlRunStore`` / ``SqlRunEventStore`` /
+``SqlApprovalStore``)。内存版的行为由 ``test_turn_inputs_resolve.py`` 钉住;这里只证
+只有真库才答得了的事:``run_event`` 的 JSONB 帧原样读回、``list_by_thread`` 的定序撑得住
+审批链回溯、审批单经 ``mark_decided`` 落下的 ``continuation_run_id`` 读得回来、
 ``event_names`` 过滤在 SQL 上取得到 ``system_prompt`` 帧。
 
 跑法::
@@ -25,7 +27,7 @@ from testcontainers.postgres import PostgresContainer
 from control_plane.turn_inputs import TurnInputs, resolve_turn_inputs
 from expert_work.persistence import (
     DatabaseConfig,
-    InMemoryApprovalStore,
+    SqlApprovalStore,
     create_async_engine_from_config,
     create_async_session_factory,
 )
@@ -83,7 +85,7 @@ async def test_a_continuation_resolves_its_turns_inputs_from_postgres(
     try:
         factory = create_async_session_factory(engine)
         runs, events = SqlRunStore(factory), SqlRunEventStore(factory)
-        approvals = InMemoryApprovalStore()
+        approvals = SqlApprovalStore(factory)
         tenant, thread = uuid4(), uuid4()
         r0, c1 = uuid4(), uuid4()
         inputs = {"pc": "PRJ-7f3a-0192", "materials": [{"url": "https://x.example/a.png"}]}
@@ -116,9 +118,18 @@ async def test_a_continuation_resolves_its_turns_inputs_from_postgres(
                 action_summary="gated",
                 requested_at=_T0,
                 timeout_at=_T0 + timedelta(hours=24),
-                status=ApprovalStatus.APPROVED,
-                continuation_run_id=c1,
+                status=ApprovalStatus.PENDING,
             )
+        )
+        # 与审批端点同一条写法:CAS 决策时原子地落下续跑 run_id。
+        assert await approvals.mark_decided(
+            run_id=r0,
+            tenant_id=tenant,
+            status=ApprovalStatus.APPROVED,
+            decided_by="tester",
+            decided_at=_T0,
+            modified_args=None,
+            continuation_run_id=c1,
         )
 
         got = await resolve_turn_inputs(
