@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -320,3 +321,17 @@ def test_plain_text_only_prompt_logs_nothing(caplog: pytest.LogCaptureFixture) -
     with caplog.at_level(logging.INFO, logger="control_plane.prompt_render"):
         render_system_prompt(built, {"name": "张三"})
     assert not [r for r in caplog.records if r.getMessage() == "prompt.rendered_by_reference"]
+
+
+def test_a_long_url_list_renders_in_linear_time() -> None:
+    """逐项渲染按项分组一次;逐项扫全部 site 是平方级 —— 一万项时旧写法要两秒多,
+    新写法几十毫秒。界放得很宽(1 秒),只拦平方级,不拦机器快慢。"""
+    n = 10_000
+    materials = [{"description": f"d{i}", "url": f"https://x/{i}.mp4"} for i in range(n)]
+    built = _jinja_built("{{ materials }}", (_Var("materials"),))
+    started = time.perf_counter()
+    out = render_system_prompt(built, {"materials": materials})
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, elapsed
+    assert "https://x/" not in out
+    assert f"{n - 1}. d{n - 1} → $EXPERT_WORK_INPUTS_DIR/materials/{n - 1}-d{n - 1}.mp4" in out

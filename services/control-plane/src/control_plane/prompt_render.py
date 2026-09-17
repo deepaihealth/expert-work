@@ -100,8 +100,12 @@ def _render_items(var: Any, root: Any, sites: list[LinkedSite], *, nonce: str | 
     members: list[tuple[str | int, Any]] = (
         list(enumerate(root)) if is_list else [(str(k), v) for k, v in root.items()]
     )
+    # 按项分组一次(保持 site 顺序);逐项去扫全部 site 是平方级,几千项的列表就慢到秒级。
+    by_head: dict[str | int, list[str]] = {}
+    for s in sites:
+        by_head.setdefault(s.site.path[0], []).append(s.link)
     for head, item in members:
-        links = [s.link for s in sites if s.site.path and s.site.path[0] == head]
+        links = by_head.get(head)
         if links:
             paths = "、".join(f"${INPUTS_DIR_ENV}/{link}" for link in links)
             if is_list:
