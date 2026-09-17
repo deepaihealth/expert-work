@@ -75,8 +75,8 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 
 - **符号链接,不是硬链接**:缓存 7 天回收的账不能被 30 天的 run 目录拖住(硬链接会让字节活到最后一个链接消失)。链接失效 = 今天已接受的降级(B-61 §4.5),消费方判据「为空或本地不存在」不变。
 - 相对目标(`../cache/…`):NAS 视角与沙箱 `/workspace` 视角下都成立(B-60 的 exec view 是 agent 目录的 bind)。
-- 命名:顶层 URL 变量 → `<name><ext>`;dict 字段 → `<name>.<field><ext>`;列表项 → `<name>/<i>-<slug><ext>`,`slug` 取该项 `description` 前 40 字符,只保留 `[\w一-鿿.-]`,空则省略 `-<slug>`。同名撞车加 `-2`。
-- **`ext` 只取 URL 路径后缀**(`pick_suffix` 的 URL 分支),**不看 Content-Type**:渲染层(§五)在预拉之前就要说出这个名字,它只有 URL。URL 没有后缀就没有后缀。Content-Type 只继续决定 cache 文件名,不变。链接名的计算函数与渲染层**共用同一个**(`inputs_doc.link_name(var, path, url)`),用测试钉住两边同义。
+- 命名:顶层 URL 变量 → `<name><ext>`;dict 字段 → `<name>.<field><ext>`;列表项 → `<name>/<i>-<slug><ext>`,`slug` 取该项 `description` 前 40 字符,只保留 `[\w-]`(`\w` 已含中文;`.` 不留,撞名后缀才能可靠地插在扩展名之前 —— 裁定 2),空则省略 `-<slug>`;dict 字段名同样净化,空则用 `_`。同名撞车加 `-2`。
+- **`ext` 只取 URL 路径后缀**(且须匹配 `^\.[A-Za-z0-9]{1,5}$`,比 `pick_suffix` 的 URL 分支更严 —— 裁定 3),**不看 Content-Type**:渲染层(§五)在预拉之前就要说出这个名字,它只有 URL。URL 没有后缀就没有后缀。Content-Type 只继续决定 cache 文件名,不变。链接名的计算函数与渲染层**共用同一个**(`inputs_doc.link_names(var, sites)`:一个变量的全部 site 一起算,撞名看同变量已发出的名字;渲染层、「本轮输入」段、守卫都经 `linked_sites` 调它),沙箱脚本逐字复制,用测试钉住两边同义。
 - 建链接的时机:预拉脚本每拉完(或命中)一个 site 就建,和 `_rewrite` 同一节奏;链接**先删后建**(`os.symlink` 到已存在路径会 `FileExistsError`)。
 - `inputs.json` 里 `local_path` **改指链接**(`inputs/<run_id>/org_logo.png`),不再指 cache。老消费方按路径打开,两种都能打开;新消费方拿到的是可读的名字。
 
@@ -166,7 +166,7 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 
 - 候选集 = 本轮 `PROMPT_INPUTS_KEY` 里所有 URL site(`inputs_doc.linked_sites`,与预拉 / 渲染同一个 walker 与命名,含 §4.3 的解析形态),记 `(变量名, URL, 链接名)`。
 - **完全一致**(裁定 P25):按子串在代码里找候选 URL 的原文,原文后面不是 URL 的延续(只隔着 ASCII 句读 `.,;:!?)` 也算)→ 命中。不依赖字面量抽取,所以路径里带全角标点或括号的 URL 也认得出。代码里抽出的 URL 字面量(见下)与候选只差 scheme / host 大小写,同样算完全一致。
-- **近似**:从代码里抽 URL 字面量(`https?://` 不分大小写,到空白 / 引号 / 反引号 / 尖括号 / 右括号 / 右方括号 / 常见全角标点为止,去掉尾随的 ASCII 句读),与同 scheme+host(不分大小写)的候选比 host 之后的全部(路径 + query + fragment,裁定 4)。允许的编辑距离随**候选**尾串长度走:`min(3, 尾串长度 // 16)`(裁定 P25)—— 尾串短于 16 字符只拦完全一致(`/v1` 与 `/v2`、`img_0.png` 与 `img_7.png` 本来就是不同的地址)。事故里的尾串约 30 字符、距离 1,在界内。进 DP 前先过长度差与字符多重集差两道下界;DP 是带状 Levenshtein(裁定 P19),host 之后超过 8192 字符不比。
+- **近似**:从代码里抽 URL 字面量(`https?://` 不分大小写,到空白 / 引号 / 反引号 / 尖括号 / 右括号 / 右方括号 / 常见全角标点为止,去掉尾随的 ASCII 句读),与同 scheme+host(不分大小写)的候选比 host 之后的全部(路径 + query + fragment,裁定 4)。允许的编辑距离随**候选**尾串长度走:`min(3, 尾串长度 // 16)`(裁定 P25)—— 尾串短于 16 字符只拦完全一致(`/v1` 与 `/v2`、`img_0.png` 与 `img_7.png` 本来就是不同的地址)。事故里的尾串 `/plan-generator/brand-logo/1789382970142-logo11.jpg` 是 51 字符、允许 3,抄错的距离是 1,在界内。进 DP 前先过长度差与字符多重集差两道下界;DP 是带状 Levenshtein(裁定 P19),host 之后超过 8192 字符不比。
 - 归属:先找完全一致;否则按字面量在代码里的顺序,**第一个**有近似命中的字面量即返回(它对多个候选取最小距离)。
 - **失败放行**(裁定 P26):候选构建或比对抛任何异常 → 整批放行,记 `tools.input_url_guard_skipped`(只带异常类型,异常文本里可能有 URL);每次调用的近似比较预算约 200 万个 DP 格子(尾串长度 × 带宽累计),用完就停、已找到的照常返回,记 `tools.input_url_guard_budget_exhausted`(只有计数)。A 的链接命名(`url_suffix`,宿主与沙箱两份)遇到畸形 URL 不再抛;沙箱预拉里一个变量出错只丢那一个变量。
 - 命中即拦:该调用不执行,合成 `ToolMessage(status="error")`。trusted 变量回显写法与链接名;近似命中另给出路(真是别的地址就从它自己的来源取):
