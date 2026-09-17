@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import http.server
+import inspect
 import json
 import os
 import socket
 import stat
+import textwrap
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -96,7 +98,11 @@ def test_script_source_matches_the_file_on_disk() -> None:
 
 def test_site_walk_matches_the_host_side_implementation() -> None:
     from orchestrator.tools.inputs_doc import iter_url_sites, root_key
-    from orchestrator.tools.prefetch_script import _root_key, _sites
+    from orchestrator.tools.prefetch_script import _linked_sites, _root_key
+
+    too_deep: Any = {"url": "https://x/g.png"}
+    for _ in range(prefetch_script.MAX_PARSE_DEPTH):
+        too_deep = [too_deep]
 
     doc = {
         "variables": {
@@ -119,13 +125,17 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
                 "value_parsed": [{"url": "https://x/f.pdf"}],
                 "trusted": False,
             },
+            # B-67 终审 F2 —— 嵌套超过 MAX_PARSE_DEPTH 层:两侧都不扫;恰好在上限上的照扫。
+            "g": {"value": too_deep, "trusted": True},
+            "h": {"value": too_deep[0], "trusted": True},
         }
     }
     host = [(s.var_name, list(s.path), s.url) for s in iter_url_sites(doc)]
+    # 沙箱侧走 main 真正用的那条路(_linked_sites:深度闸 + _sites)。
     sandbox = [
         (name, path, url)
         for name, entry in doc["variables"].items()
-        for path, url in _sites(entry[_root_key(entry)], [])
+        for path, url, _link in _linked_sites(name, entry[_root_key(entry)])
     ]
     assert host == sandbox
     assert all(_root_key(e) == root_key(e) for e in doc["variables"].values())
@@ -136,6 +146,8 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
     # TypeError,而 main 的 per-site 兜底之外,首先靠的就是这条判定。
     assert not any(name in {"d", "e"} for name, _, _ in sandbox)
     assert ("f", [0, "url"], "https://x/f.pdf") in sandbox
+    assert not any(name == "g" for name, _, _ in sandbox)
+    assert [url for name, _, url in sandbox if name == "h"] == ["https://x/g.png"]
 
 
 # ---------------------------------------------------------------------------
@@ -712,54 +724,151 @@ def test_a_cache_hit_never_touches_the_entry(tmp_path: Path, http_server: _HttpS
 # ---------------------------------------------------------------------------
 
 
-def test_link_names_match_the_host_side_implementation() -> None:
-    """链接名三处同义的钉子:宿主 ``inputs_doc.linked_sites`` 与沙箱 ``_link_names`` 对同一份
-    inputs 必须逐字相同 —— 提示词里说的名字就是预拉建出来的名字。"""
+def _wrapped(inner: Any, levels: int) -> Any:
+    for _ in range(levels):
+        inner = [inner]
+    return inner
+
+
+_LONG_DESCRIPTION = "长" * 30 + "abcdefghijklmnopqrstuvwxyz"  # 56 字,slug 只取前 40
+_AT_DEPTH_BOUND = _wrapped({"url": "https://x/b.png"}, prefetch_script.MAX_PARSE_DEPTH - 1)
+
+#: ``(变量名, 调用方给的原始值, 期望的链接名)``。前六行是基本形状;其余每行专门照出一种
+#: 现实的漂移(slug 截断长度、扩展名的大小写 / 长度、按整条 URL 取后缀、保留名、顺延撞名、
+#: 深度闸),两侧任何一侧改了这些,至少一行会红。
+_NAME_CORPUS: list[tuple[str, Any, list[str]]] = [
+    ("org_logo", "https://x/cover-1726394851207.png", ["org_logo.png"]),
+    ("brand", {"logo": "https://x/l.jpg", "name": "深护"}, ["brand.logo.jpg"]),
+    (
+        "materials",
+        '[{"description": "示范 视频", "url": "https://x/a.mp4"}, {"description": "无链接"},'
+        ' {"url": "https://x/c.pdf", "thumb": "https://x/c.pdf"}]',
+        ["materials/0-示范视频.mp4", "materials/2.pdf", "materials/2-2.pdf"],
+    ),
+    ("page", "https://x/post", ["page"]),
+    ("nested", {"a": [{"url": "https://x/n.png", "description": "..x"}]}, ["nested.a/0-x.png"]),
+    ("note", "短文本", []),
+    (
+        "long_desc",
+        [{"description": _LONG_DESCRIPTION, "url": "https://x/l.png"}],
+        [f"long_desc/0-{_LONG_DESCRIPTION[:40]}.png"],
+    ),
+    ("empty_key", {"": "https://x/e.png"}, ["empty_key._.png"]),
+    ("upper_ext", "https://x/A.PNG", ["upper_ext.PNG"]),
+    ("ext4", "https://x/deck.pptx", ["ext4.pptx"]),
+    ("ext5", "https://x/page.xhtml", ["ext5.xhtml"]),
+    ("ext6", "https://x/a.abcdef", ["ext6"]),
+    ("signed", "https://x/a.png?sig=abc.def&e=1#frag.x", ["signed.png"]),
+    ("desc_not_str", [{"description": 42, "url": "https://x/d.png"}], ["desc_not_str/0.png"]),
+    ("inputs", "https://x/i.json", ["inputs-2.json"]),
+    ("inputs", {"json": "https://x/i.tmp"}, ["inputs.json-2.tmp"]),
+    (
+        "dup",
+        {"a": "https://x/1.png", "a!": "https://x/2.png", "a-2": "https://x/3.png"},
+        ["dup.a.png", "dup.a-2.png", "dup.a-2-2.png"],
+    ),
+    ("at_bound", _AT_DEPTH_BOUND, ["at_bound/0.png"]),
+    ("too_deep", [_AT_DEPTH_BOUND], []),
+    ("too_deep_json", json.dumps([_AT_DEPTH_BOUND]), []),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    _NAME_CORPUS,
+    ids=[f"{i}-{row[0]}" for i, row in enumerate(_NAME_CORPUS)],
+)
+def test_link_names_match_the_host_side_implementation(
+    name: str, value: Any, expected: list[str]
+) -> None:
+    """链接名三处同义的钉子(行为面):宿主 ``inputs_doc.linked_sites``(对原始值)与沙箱
+    ``_linked_sites``(对清单里的那一份,main 真正走的路)必须给出同一组 site 与名字 ——
+    提示词里说的名字就是预拉建出来的名字。算法本身逐字同义另由
+    ``test_copied_helpers_are_the_host_algorithm`` 钉。"""
     from uuid import UUID
 
     from expert_work.protocol import PromptVariableSpec
     from orchestrator.tools.inputs_doc import build_inputs_doc, linked_sites
-    from orchestrator.tools.prefetch_script import (
-        _link_names,
-        _root_key,
-        _site_description,
-        _sites,
+    from orchestrator.tools.prefetch_script import _linked_sites, _root_key
+
+    doc = build_inputs_doc(
+        run_id=UUID(int=1),
+        variables=[PromptVariableSpec(name=name, required=False)],
+        inputs={name: value},
     )
-
-    inputs: dict[str, Any] = {
-        "org_logo": "https://x/cover-1726394851207.png",
-        "brand": {"logo": "https://x/l.jpg", "name": "深护"},
-        "materials": (
-            '[{"description": "示范 视频", "url": "https://x/a.mp4"}, {"description": "无链接"},'
-            ' {"url": "https://x/c.pdf", "thumb": "https://x/c.pdf"}]'
-        ),
-        "page": "https://x/post",
-        "nested": {"a": [{"url": "https://x/n.png", "description": "..x"}]},
-        "note": "短文本",
-    }
-    variables = [PromptVariableSpec(name=name, required=False) for name in inputs]
-    doc = build_inputs_doc(run_id=UUID(int=1), variables=variables, inputs=inputs)
     assert doc is not None
+    entry = doc["variables"][name]
 
-    host = {name: [s.link for s in linked_sites(name, value)] for name, value in inputs.items()}
-    sandbox: dict[str, list[str]] = {}
-    for name, entry in doc["variables"].items():
-        root = entry[_root_key(entry)]
-        found = _sites(root, [])
-        sandbox[name] = _link_names(
-            name, [(path, url, _site_description(root, path)) for path, url in found]
-        )
+    host = [(list(s.site.path), s.site.url, s.link) for s in linked_sites(name, value)]
+    sandbox = _linked_sites(name, entry[_root_key(entry)])
     assert host == sandbox
-    assert sandbox["org_logo"] == ["org_logo.png"]
-    assert sandbox["brand"] == ["brand.logo.jpg"]
-    assert sandbox["materials"] == [
-        "materials/0-示范视频.mp4",
-        "materials/2.pdf",
-        "materials/2-2.pdf",
-    ]
-    assert sandbox["page"] == ["page"]
-    assert sandbox["nested"] == ["nested.a/0-x.png"]
-    assert sandbox["note"] == []
+    assert [link for _path, _url, link in sandbox] == expected
+
+
+#: 宿主 → 沙箱的**刻意**改名:宿主的公开 helper 在沙箱里带下划线;沙箱不 import
+#: ``collections.abc``,isinstance 用具体类型。除此之外一个字都不许不同。
+_HOST_HELPER_RENAMES = {"url_suffix": "_url_suffix", "slugify": "_slugify"}
+_HOST_ISINSTANCE_RENAMES = {"Mapping": "dict", "Sequence": "list"}
+
+#: ``(宿主函数名, 沙箱函数名)``:沙箱里逐字复制的全部 helper。
+_COPIED_HELPERS = [
+    ("url_suffix", "_url_suffix"),
+    ("slugify", "_slugify"),
+    ("site_description", "_site_description"),
+    ("_link_stem", "_link_stem"),
+    ("link_names", "_link_names"),
+    ("root_key", "_root_key"),
+    ("_too_deep", "_too_deep"),
+]
+
+
+def _algorithm_dump(fn: Callable[..., Any], *, host: bool) -> str:
+    """函数的语法树:去掉 docstring、函数名、参数 / 返回注解;宿主侧再套上面两张改名表
+    (isinstance 那张只改 isinstance 的第二个参数)。函数体里其余的一切都留着比。"""
+    func = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+    assert isinstance(func, ast.FunctionDef)
+    if ast.get_docstring(func) is not None:
+        func.body = func.body[1:]
+    func.name = "_"
+    func.returns = None
+    for arg in (*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs):
+        arg.annotation = None
+    if host:
+        for node in ast.walk(func):
+            if isinstance(node, ast.Name) and node.id in _HOST_HELPER_RENAMES:
+                node.id = _HOST_HELPER_RENAMES[node.id]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "isinstance"
+                and len(node.args) == 2
+                and isinstance(node.args[1], ast.Name)
+                and node.args[1].id in _HOST_ISINSTANCE_RENAMES
+            ):
+                node.args[1].id = _HOST_ISINSTANCE_RENAMES[node.args[1].id]
+    return ast.dump(func)
+
+
+@pytest.mark.parametrize(("host_name", "sandbox_name"), _COPIED_HELPERS)
+def test_copied_helpers_are_the_host_algorithm(host_name: str, sandbox_name: str) -> None:
+    """链接名三处同义的钉子(算法面):行为语料只能覆盖它想到的输入,改一个常量或把
+    ``urlparse(url).path`` 换成 ``url`` 这类漂移可以在语料上恰好不露。这里逐个比函数的
+    语法树。"""
+    from orchestrator.tools import inputs_doc
+
+    host = _algorithm_dump(getattr(inputs_doc, host_name), host=True)
+    sandbox = _algorithm_dump(getattr(prefetch_script, sandbox_name), host=False)
+    assert sandbox == host
+
+
+def test_copied_constants_match_the_host_side() -> None:
+    from orchestrator.tools import inputs_doc
+
+    for name in ("PARSED_KEY", "SLUG_MAX_CHARS", "MAX_PARSE_DEPTH", "_RESERVED_NAMES"):
+        assert getattr(prefetch_script, name) == getattr(inputs_doc, name), name
+    for name in ("_SLUG_DROP", "_EXT_RE"):
+        host_re, sandbox_re = getattr(inputs_doc, name), getattr(prefetch_script, name)
+        assert (sandbox_re.pattern, sandbox_re.flags) == (host_re.pattern, host_re.flags), name
 
 
 def test_hit_links_the_file_under_its_variable_name_and_points_local_path_at_the_link(
