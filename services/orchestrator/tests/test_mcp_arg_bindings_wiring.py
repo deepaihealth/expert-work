@@ -34,6 +34,7 @@ from orchestrator import (
     GraphRunner,
     ToolRegistry,
     build_react_graph,
+    pending_request_binding,
 )
 from orchestrator.graph_builder._config import AUDIT_LOGGER_KEY
 from orchestrator.graph_builder.builder import _build_tool_context
@@ -236,9 +237,12 @@ class _Harness:
                     "modified_args": dict(modified_args),
                     "binding_digest": canonical_args_digest(dict(modified_args)),
                 }
+            # 与审批端点一样带上被批请求的身份。
+            binding = pending_request_binding((await compiled.aget_state(cfg)).values)
+            assert binding is not None
             await compiled.aupdate_state(
                 cfg,
-                {"pending_approval": None, "approval_resume": resume},
+                {"pending_approval": None, "approval_resume": {**resume, **binding}},
                 as_node="agent",
             )
             return await compiled.ainvoke(None, config=cfg)

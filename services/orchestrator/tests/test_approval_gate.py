@@ -29,6 +29,7 @@ from orchestrator import (
     ToolResult,
     ToolSpec,
     build_react_graph,
+    pending_request_binding,
 )
 from orchestrator.graph_builder._approval import (
     apply_resume_decision,
@@ -111,7 +112,11 @@ async def _run_pause_then_resume(
     resume: dict[str, Any],
 ) -> AgentState:
     """Drive a run to its approval pause, apply ``resume`` via
-    ``aupdate_state`` (as the resume endpoint does), then continue."""
+    ``aupdate_state`` (as the resume endpoint does), then continue.
+
+    Like the resume endpoint, the verdict carries the binding digest (the
+    mint's, or the re-hash of a modify's args) and the request's identity;
+    keys in ``resume`` override them."""
     async with make_checkpointer("memory") as cp:
         runner = GraphRunner(checkpointer=cp)
         compiled = runner.compile(
@@ -130,11 +135,21 @@ async def _run_pause_then_resume(
             },
             config=cfg,
         )
-        assert paused.get("pending_approval") is not None
+        request = paused.get("pending_approval")
+        assert request is not None
+        binding = pending_request_binding((await compiled.aget_state(cfg)).values)
+        assert binding is not None
+        modified = resume.get("modified_args")
+        digest = (
+            canonical_args_digest(modified)
+            if resume.get("decision") == "modify" and modified is not None
+            else request.binding_digest
+        )
+        verdict = {"binding_digest": digest, **binding, **resume}
         # Resume endpoint's move: write the verdict, re-position as_node="agent".
         await compiled.aupdate_state(
             cfg,
-            {"pending_approval": None, "approval_resume": resume},
+            {"pending_approval": None, "approval_resume": verdict},
             as_node="agent",
         )
         return await compiled.ainvoke(None, config=cfg)
@@ -344,6 +359,8 @@ def test_resume_modify_binds_to_modified_args() -> None:
             "decision": "modify",
             "modified_args": modified,
             "binding_digest": canonical_args_digest(modified),
+            "tool_call_id": "tc-1",
+            "tool_call_index": 0,
         },
     )
     assert not outcome.binding_drift
@@ -360,6 +377,8 @@ def test_resume_modify_digest_mismatch_is_drift() -> None:
             "decision": "modify",
             "modified_args": {"to": "safe@example.com"},
             "binding_digest": canonical_args_digest({"to": "different@example.com"}),
+            "tool_call_id": "tc-1",
+            "tool_call_index": 0,
         },
     )
     assert outcome.binding_drift is True
@@ -367,11 +386,18 @@ def test_resume_modify_digest_mismatch_is_drift() -> None:
 
 
 def test_resume_empty_digest_skips_verification() -> None:
-    """A legacy / pre-feature row (empty digest) is dispatched unverified."""
+    """An unbound request (empty digest) is dispatched unverified.
+
+    B-76 — only when the verdict names the call; without ``tool_call_index`` an
+    empty digest cannot tell a declarative request from an action-screen one,
+    so nothing is released (``test_approval_only_approved_call``).
+    """
     calls = [_tool_call("send_email", {"to": "whatever"}, "tc-1")]
-    outcome = apply_resume_decision(calls, _GATED, {"decision": "approve", "binding_digest": ""})
+    verdict = {"decision": "approve", "binding_digest": "", "tool_call_index": 0}
+    outcome = apply_resume_decision(calls, _GATED, verdict)
     assert not outcome.binding_drift
     assert outcome.tool_calls[0]["args"] == {"to": "whatever"}
+    assert outcome.withheld == {}
 
 
 def test_resume_agent_initiated_is_not_verified() -> None:

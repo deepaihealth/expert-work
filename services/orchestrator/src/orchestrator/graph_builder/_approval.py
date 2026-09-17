@@ -135,6 +135,20 @@ def _coerce_reason_kind(raw: object) -> ApprovalReasonKind:
     return "risk_confirmation"
 
 
+def _action_summary(target: ApprovalTarget) -> str:
+    """The ``action_summary`` an :class:`ApprovalRequest` for ``target`` shows.
+
+    Declarative-gate hits get an auto-built summary; ``ask_for_approval``
+    calls carry the agent's own. Shared by :func:`build_approval_request` and
+    the legacy-verdict check in :func:`_approved_target`.
+    """
+    call = target.tool_call
+    if target.is_agent_initiated:
+        args = call.get("args") or {}
+        return str(args.get("action_summary") or "agent requested human approval")
+    return f"approval-gated tool '{call.get('name') or 'tool'}'"
+
+
 def build_approval_request(
     target: ApprovalTarget,
     *,
@@ -163,14 +177,12 @@ def build_approval_request(
     moment = now or datetime.now(UTC)
     call = target.tool_call
     args = call.get("args") or {}
+    action_summary = _action_summary(target)
     if target.is_agent_initiated:
         reason_kind: ApprovalReasonKind = _coerce_reason_kind(args.get("reason_kind"))
-        action_summary = str(args.get("action_summary") or "agent requested human approval")
         proposed_args = dict(args.get("proposed_args") or {})
     else:
         reason_kind = "policy_gate"
-        tool_name = str(call.get("name") or "tool")
-        action_summary = f"approval-gated tool '{tool_name}'"
         proposed_args = dict(args)
     # B-20 approval triage — a clarification question (missing_info /
     # ambiguous_requirement / approach_choice) gets its own, typically much
@@ -323,14 +335,15 @@ def _approved_target(
     A verdict carries the request's ``tool_call_index`` (班车 2; when the call
     id is known, :func:`_verdict_is_for_this_turn` has already matched it
     against this turn) → that call. This matters for action screening, whose
-    request targets the judge's pick, not the declarative scan's. A verdict
-    without it (an older replica wrote it during a rolling deploy) → the
-    declarative scan, which is how the gate built its request. An index that
-    points at no call of this turn → ``None``: nothing is released.
+    request targets the judge's pick, not the declarative scan's. An index
+    that points at no call of this turn → ``None``: nothing is released.
+
+    A verdict without it answers a request minted before 班车 2 (still pending
+    across the deploy) → :func:`_legacy_target`.
     """
     index = resume.get("tool_call_index")
     if index is None:
-        return find_approval_target(tool_calls, approval_required_tools)
+        return _legacy_target(tool_calls, approval_required_tools, resume)
     if not isinstance(index, int) or not 0 <= index < len(tool_calls):
         return None
     call = tool_calls[index]
@@ -339,6 +352,42 @@ def _approved_target(
         tool_call=call,
         is_agent_initiated=call.get("name") == ASK_FOR_APPROVAL_TOOL,
     )
+
+
+def _legacy_target(
+    tool_calls: list[dict[str, Any]],
+    approval_required_tools: frozenset[str],
+    resume: Mapping[str, Any],
+) -> ApprovalTarget | None:
+    """The approved call for a verdict with no ``tool_call_index`` — or ``None``.
+
+    The declarative scan re-finds the call only when the request was built from
+    that scan; an action-screen request (judge's pick) looks the same apart from
+    its binding. So the scan's target is trusted only when:
+
+    * it is ``ask_for_approval`` — the request showed that very call; or
+    * it is a gated call and the verdict proves a bound mint: an ``approve``
+      carries the mint's ``binding_digest``, and only the declarative gate
+      mints bound (action screening mints ``bind=False``; pre-RT-6 rows are
+      empty too). A ``modify`` carries the digest of the reviewer's args
+      whatever the mint was, so it proves nothing — there the carried
+      ``action_summary`` must be present;
+
+    and, whenever the verdict carries the request's ``action_summary``, it must
+    be the summary a request for that target shows. Anything else releases
+    nothing.
+    """
+    target = find_approval_target(tool_calls, approval_required_tools)
+    if target is None:
+        return None
+    summary = resume.get("action_summary")
+    if summary is not None and summary != _action_summary(target):
+        return None
+    if target.is_agent_initiated:
+        return target
+    if str(resume.get("decision", "approve")) == "modify":
+        return target if summary is not None else None
+    return target if resume.get("binding_digest") else None
 
 
 def _withhold_all_but(
