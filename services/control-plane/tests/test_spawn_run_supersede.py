@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -11,16 +12,17 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, messages_from_dict
 from starlette.requests import Request
 
 from control_plane.api import runs as runs_mod
 from control_plane.api.runs import RunRequest, SupersedeRequest, replay_graph_input, spawn_run
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
+from control_plane.inputs_block import inputs_block_message, is_inputs_block
 from control_plane.settings import Settings
 from control_plane.supersede import SupersedeError, SupersedeResult, TurnLocation
-from expert_work.common.conversation_channel import SUPERSEDED_BY
+from expert_work.common.conversation_channel import SUPERSEDED_BY, is_hidden
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.common.message_stamp import STAMP_RUN_ID, stamp_message
 from expert_work.common.supersede import mark_superseded
@@ -301,3 +303,60 @@ async def test_stream_regenerate_bypasses_the_response_cache_and_edit_does_not(
     assert (LLM_CACHE_BYPASS_KEY in captured["configurable"]) is bypass
     if bypass:
         assert captured["configurable"][LLM_CACHE_BYPASS_KEY] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["stream", "queue"])
+async def test_regenerate_carries_the_inputs_block_through_both_spawn_modes(
+    monkeypatch: pytest.MonkeyPatch, spawn_ctx: _SpawnCtx, mode: str
+) -> None:
+    """B-67 §六 —— jinja 轮的原件是 [System, Human, 隐藏「本轮输入」段] 三条;
+    ``:regenerate`` 两种模式都要把第三条带上。stream 直接进图(新 run 戳 + B-66 绕缓存
+    不受影响);queue 序列化进 ``enqueued_input``,经 JSON 往返后仍认得出是输入段。"""
+    target = uuid4()
+    old_block = stamp_message(
+        inputs_block_message("[本轮输入]"),
+        run_id=str(target),
+        now=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    async def fake_supersede_run(**kwargs: Any) -> SupersedeResult:
+        del kwargs
+        return SupersedeResult(
+            location=TurnLocation(start=0, end=3, plan_before=None, chain_run_ids=(target,)),
+            replay_messages=(
+                SystemMessage(content="sys"),
+                HumanMessage(content="U-old"),
+                old_block,
+            ),
+            superseded_run_ids=(target,),
+        )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent(**kwargs: Any) -> None:
+        captured["graph_input"] = kwargs["graph_input"]
+        captured["configurable"] = kwargs["config"]["configurable"]
+
+    monkeypatch.setattr(runs_mod, "supersede_run", fake_supersede_run)
+    monkeypatch.setattr(runs_mod, "run_agent", fake_run_agent)
+    await spawn_ctx.spawn(mode=mode, supersede=SupersedeRequest(target_run_id=target, replay=True))
+    await asyncio.sleep(0)  # let the spawned run task body run
+
+    if mode == "stream":
+        system, human, block = captured["graph_input"]["messages"]
+        new_run = captured["configurable"]["run_id"]
+        assert (system.content, human.content) == ("sys", "U-old")
+        assert is_inputs_block(block) and block.content == "[本轮输入]"
+        assert block.additional_kwargs[STAMP_RUN_ID] == new_run != str(target)
+        assert captured["configurable"][LLM_CACHE_BYPASS_KEY] is True
+        return
+
+    rows = await spawn_ctx.run_store.list_by_thread(
+        thread_id=spawn_ctx.thread_id, tenant_id=spawn_ctx.tenant_id
+    )
+    wire = json.loads(json.dumps(rows[-1].enqueued_input))
+    back = messages_from_dict(wire["replay_messages"])
+    assert [type(m).__name__ for m in back] == ["SystemMessage", "HumanMessage", "HumanMessage"]
+    assert is_inputs_block(back[2]) and is_hidden(back[2])
+    assert back[2].additional_kwargs == old_block.additional_kwargs

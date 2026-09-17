@@ -317,8 +317,8 @@ class RunQueueWorker:
             payload = run.enqueued_input or {}
             replay = payload.get("replay_messages")
             if replay:
-                # P-1 ``:regenerate`` queue 模式:spawn_run 把旧轮的 [System, Human]
-                # 原件序列化进来;这里反序列化后走同一个 replay_graph_input。
+                # P-1 ``:regenerate`` queue 模式:spawn_run 把旧轮的 [System, Human,
+                # (B-67 本轮输入段)?] 原件序列化进来;这里反序列化后走同一个 replay_graph_input。
                 graph_input = replay_graph_input(
                     built, messages_from_dict(replay), run_id=run.run_id
                 )
