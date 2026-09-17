@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunStore,
+    InterruptReason,
     RunManager,
     RunStatus,
 )
@@ -368,3 +369,97 @@ async def test_terminal_write_on_never_claimed_run_still_lands() -> None:
     assert await mgr.set_status(run_id, RunStatus.ERROR, error="boom") is True
     row = await store.get(run_id=run_id, tenant_id=tenant_id)
     assert row is not None and row.status is RunStatus.ERROR
+
+
+# --- 班车 2 —— 审批被新一轮作废:PAUSED → INTERRUPTED ------------------------
+
+
+async def _paused(mgr: RunManager) -> tuple[UUID, UUID]:
+    run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
+    await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
+    await mgr.set_status(run_id, RunStatus.PAUSED)
+    return run_id, tenant_id
+
+
+@pytest.mark.asyncio
+async def test_close_paused_flips_durable_row_and_local_record() -> None:
+    store = InMemoryRunStore()
+    mgr = RunManager(store=store)
+    run_id, tenant_id = await _paused(mgr)
+    paused_row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert paused_row is not None
+
+    closed = await mgr.close_paused(
+        run_id,
+        tenant_id=tenant_id,
+        reason=InterruptReason.NEW_TURN,
+    )
+
+    assert closed is True
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None
+    assert row.status is RunStatus.INTERRUPTED
+    assert row.error == "new_turn"
+    # 暂停那一刻就是这个 run 停止执行的时刻,作废不改它。
+    assert row.finished_at == paused_row.finished_at
+    record = mgr.get(run_id)
+    assert record is not None
+    assert record.status is RunStatus.INTERRUPTED
+    assert not record.abort_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_close_paused_leaves_any_other_status_alone() -> None:
+    store = InMemoryRunStore()
+    mgr = RunManager(store=store)
+    run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
+    await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
+    await mgr.set_status(run_id, RunStatus.SUCCESS)
+
+    assert (
+        await mgr.close_paused(run_id, tenant_id=tenant_id, reason=InterruptReason.NEW_TURN)
+        is False
+    )
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None
+    assert row.status is RunStatus.SUCCESS
+    assert row.error is None
+    record = mgr.get(run_id)
+    assert record is not None
+    assert record.status is RunStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_close_paused_reaches_a_row_this_replica_no_longer_holds() -> None:
+    """record 已过 TTL / 在别的副本 —— durable 行照样收。"""
+    store = InMemoryRunStore()
+    mgr = RunManager(store=store)
+    run_id, tenant_id = await _paused(mgr)
+    await mgr.cleanup(run_id, delay=0)
+
+    assert await mgr.close_paused(
+        run_id,
+        tenant_id=tenant_id,
+        reason=InterruptReason.NEW_TURN,
+    )
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None
+    assert row.status is RunStatus.INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_close_paused_without_store_uses_the_local_record() -> None:
+    mgr = RunManager()
+    run_id, tenant_id = await _paused(mgr)
+
+    assert await mgr.close_paused(
+        run_id,
+        tenant_id=tenant_id,
+        reason=InterruptReason.NEW_TURN,
+    )
+    record = mgr.get(run_id)
+    assert record is not None
+    assert record.status is RunStatus.INTERRUPTED
+    assert (
+        await mgr.close_paused(uuid4(), tenant_id=uuid4(), reason=InterruptReason.NEW_TURN) is False
+    )

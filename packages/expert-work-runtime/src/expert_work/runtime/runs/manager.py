@@ -527,6 +527,38 @@ class RunManager:
             logger.info("run.cancel id=%s prev_status=%s reason=%s", run_id, record.status, reason)
             return True
 
+    async def close_paused(self, run_id: UUID, *, tenant_id: UUID, reason: str) -> bool:
+        """把停在审批上的 run 收成 INTERRUPTED —— 它的待审批被新一轮作废了(班车 2)。
+
+        只动 PAUSED(durable 行上的 CAS),其余状态一概不碰;返回是否真的收了。
+        与 :meth:`cancel` 不同,不置 ``abort_event``:PAUSED 的 run 早已不在执行。
+        本副本若还留着它的 record(结束后 TTL 内),一并镜像,读实时状态的端点
+        才不会继续报 paused。``finished_at`` 保留暂停那一刻。
+        """
+        now = datetime.now(UTC)
+        async with self._lock:
+            record = self._runs.get(run_id)
+            if self._store is not None:
+                closed = await self._store.set_status(
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    status=RunStatus.INTERRUPTED,
+                    updated_at=now,
+                    error=reason,
+                    expected_statuses=(RunStatus.PAUSED,),
+                )
+            else:
+                closed = (
+                    record is not None
+                    and record.tenant_id == tenant_id
+                    and record.status is RunStatus.PAUSED
+                )
+            if closed and record is not None and record.status is RunStatus.PAUSED:
+                record.status = RunStatus.INTERRUPTED
+                record.updated_at = now
+        logger.info("run.close_paused id=%s closed=%s reason=%s", run_id, closed, reason)
+        return closed
+
     async def has_inflight(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
         """Return True if there is any PENDING/RUNNING run for the thread."""
         async with self._lock:

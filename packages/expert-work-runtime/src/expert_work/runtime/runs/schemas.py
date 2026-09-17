@@ -66,6 +66,8 @@ class InterruptReason(StrEnum):
     CLIENT_DISCONNECT = "client_disconnect"  # SSE 消费者断线 + on_disconnect=CANCEL
     TENANT_SUSPENDED = "tenant_suspended"  # 租户被停用,连带取消
     AGENT_DISABLED = "agent_disabled"  # Agent 被停用 / 删除,连带取消
+    #: 停在审批上的 run,裁定之前会话里开了新一轮 —— 它的待审批被作废(班车 2)。
+    NEW_TURN = "new_turn"
 
 
 #: Run statuses that mark a run as finished — ``RunManager`` stamps
