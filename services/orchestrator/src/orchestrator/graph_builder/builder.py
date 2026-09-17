@@ -90,7 +90,7 @@ from expert_work.common.observability import (
 )
 from expert_work.common.output_screen import REFUSAL_TEXT, screen_output
 from expert_work.common.spotlight import spotlight_untrusted
-from expert_work.common.supersede import filter_superseded_turns
+from expert_work.common.supersede import filter_superseded_turns, stamped_run_id
 from expert_work.common.uplift_metrics import record_memory_inject_mode
 from expert_work.protocol import (
     AuditAction,
@@ -1378,7 +1378,13 @@ def build_react_graph(
             # inside the node (CM-0, unchanged).
             if workspace_ingest_node is not None:
                 ingest_update = await workspace_ingest_node(state, config)
-            resume_outcome = apply_resume_decision(tool_calls, _gated_tools, approval_resume)
+            resume_outcome = apply_resume_decision(
+                tool_calls,
+                _gated_tools,
+                approval_resume,
+                # 班车 2 —— 这一轮是谁的:尾巴那条助手消息的 run 戳。
+                turn_run_id=stamped_run_id(last),
+            )
             if resume_outcome.binding_drift:
                 # RT-6 Tier A (RT-ADR-19) — the checkpointed tool_call drifted
                 # from what the human approved (tamper / replay / bug). Record

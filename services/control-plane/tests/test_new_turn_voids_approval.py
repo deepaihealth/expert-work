@@ -29,6 +29,7 @@ from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from control_plane.api import runs as runs_module
 from control_plane.api.runs import build_run_graph_input, replay_graph_input
 from control_plane.app import create_app
 from control_plane.approval_timeout_sweep import ApprovalTimeoutSweep
@@ -73,9 +74,10 @@ from orchestrator import (
     ToolResult,
     ToolSpec,
     build_react_graph,
+    run_agent,
     sanitize_dangling_tool_calls,
 )
-from orchestrator.approval_turn import UNRUN_TOOL_CALL_CONTENT, VOIDED_APPROVAL_CONTENT
+from orchestrator.approval_turn import UNRECORDED_TOOL_CALL_CONTENT, VOIDED_APPROVAL_CONTENT
 from orchestrator.sse import _BACKGROUND_PERSIST_WRITERS
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
@@ -407,6 +409,11 @@ async def test_new_turn_runs_behind_the_gate_and_voids_the_paused_turn(s: _Stack
     assert approval_b.proposed_args == {"key": "B"}
     assert (await s.row(run_b)).status is RunStatus.PAUSED
     assert "event: approval" in resp_b.text
+    # 对外 approval 事件的字段表不变:平台内部核对用的调用身份不上线。
+    approval_frames = [b for b in resp_b.text.split("\n\n") if "event: approval" in b.splitlines()]
+    approval_data = json.loads(approval_frames[0].rsplit("data: ", 1)[1])
+    assert "tool_call_id" not in approval_data and "tool_call_index" not in approval_data
+    assert approval_data["request_id"] == approval_b.request_id
     await _assert_voided(s, run_a, by=run_b)
     end_user = await s.app.state.tenant_user_repo.resolve(
         tenant_id=s.tenant_id, subject_type="user", subject_id=f"ext:{_USER}"
@@ -492,6 +499,12 @@ async def test_queued_turn_voids_an_approval_that_appeared_after_it_was_enqueued
     await s.settle(run_b)
 
     await _assert_voided(s, run_a, by=run_b)
+    end_user = await s.app.state.tenant_user_repo.resolve(
+        tenant_id=s.tenant_id, subject_type="user", subject_id=f"ext:{_USER}"
+    )
+    (audit,) = await s.void_audits()
+    assert audit.actor_id == "run_queue_worker"
+    assert audit.on_behalf_of == str(end_user.id)
     assert s.tool.seen == []
     assert (await s.approval(run_b)).proposed_args == {"key": "B"}
     resp = await s.decide(run_a, "approve")
@@ -699,6 +712,85 @@ async def test_a_new_turn_inside_the_decision_window_is_never_resumed_by_that_de
 
 
 @pytest.mark.asyncio
+async def test_a_new_turn_between_the_check_and_the_write_is_never_resumed(
+    s: _Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终审复审:控制面的核对与写入之间不是原子的 —— B 恰好在两者之间跑到自己的审批门。
+    这次裁定照样写进了检查点,图里的第二道核对必须让续跑什么都不执行。"""
+    thread, run_a, _ = await s.start()
+    graph = s.graph
+    real_aget_state = graph.aget_state
+    box: dict[str, Any] = {}
+
+    async def aget_state(config: Any, *args: Any, **kwargs: Any) -> Any:
+        snapshot = await real_aget_state(config, *args, **kwargs)
+        if box.pop("armed", False):
+            _, box["run_b"], _ = await s.start(thread)
+        return snapshot
+
+    monkeypatch.setattr(graph, "aget_state", aget_state)
+
+    async def arm() -> None:
+        box["armed"] = True
+
+    s.approvals.after_human_win = arm
+    resp = await s.client.post(
+        f"/v1/agents/{_AGENT}/runs/{run_a}:decide",
+        json={
+            "user_id": _USER,
+            "mode": "queue",
+            "decision": "modify",
+            "modified_args": {"key": "X"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    await s.settle(UUID(resp.json()["data"]["run_id"]))
+    run_b = box["run_b"]
+    assert s.tool.seen == [], "裁定被套到了新一轮的调用上"
+    assert (await s.approval(run_b)).status is ApprovalStatus.PENDING
+    assert (await s.row(run_b)).status is RunStatus.PAUSED
+    page = await s.audit_store.query(AuditQuery(tenant_id=s.tenant_id))
+    drift = [e for e in page.entries if e.action.value == "approval:binding_drift"]
+    assert len(drift) == 1
+
+
+@pytest.mark.parametrize(
+    "script", [[_gated("A"), AIMessage(content="b-done"), AIMessage(content="c-done")]]
+)
+@pytest.mark.asyncio
+async def test_a_continuation_that_ended_before_using_the_verdict_is_closed_by_the_next_turn(
+    s: _Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """终审复审:续跑在跑第一步之前就被取消,检查点里留着没用掉的裁定;下一轮照样收口。"""
+    thread, run_a, _ = await s.start()
+    real_run_agent = run_agent  # runs.py 用的就是 orchestrator 这一个
+
+    async def cancelled_before_first_step(**kwargs: Any) -> None:
+        await kwargs["run_manager"].cancel(kwargs["record"].run_id, reason="user_cancel")
+        await real_run_agent(**kwargs)
+
+    monkeypatch.setattr(runs_module, "run_agent", cancelled_before_first_step)
+    ok = await s.decide(run_a, "approve")
+    assert ok.status_code == 202, ok.text
+    continuation = UUID(ok.json()["data"]["run_id"])
+    await s.settle(continuation)
+    assert (await s.row(continuation)).status is RunStatus.INTERRUPTED
+    assert (await s.snapshot(thread)).values.get("approval_resume") is not None
+    monkeypatch.setattr(runs_module, "run_agent", real_run_agent)
+
+    await s.start(thread)
+
+    prompt = s.llm.prompts[-1]
+    assert sanitize_dangling_tool_calls(prompt) == []
+    results = [m.content for m in prompt if getattr(m, "tool_call_id", None) == "tc-A"]
+    assert results == [UNRECORDED_TOOL_CALL_CONTENT]
+    await s.start(thread)
+    assert sanitize_dangling_tool_calls(s.llm.prompts[-1]) == []
+    assert s.tool.seen == []
+
+
+@pytest.mark.asyncio
 async def test_a_build_failure_leaves_the_approval_pending(
     s: _Stack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -880,7 +972,7 @@ async def test_a_turn_cancelled_before_its_tools_ran_is_closed_by_the_next_turn(
     prompt = s.llm.prompts[-1]
     assert sanitize_dangling_tool_calls(prompt) == []
     results = [m.content for m in prompt if getattr(m, "tool_call_id", None) == "tc-Z"]
-    assert results == [UNRUN_TOOL_CALL_CONTENT]
+    assert results == [UNRECORDED_TOOL_CALL_CONTENT]
     assert (await s.row(run_b)).status is RunStatus.SUCCESS
     assert s.tool.seen == []
     assert await s.void_audits() == []
@@ -948,6 +1040,88 @@ async def test_a_tail_whose_run_is_still_running_is_left_alone() -> None:
         tenant_id=tenant,
         new_run_id=uuid4(),
         approvals=InMemoryApprovalStore(),
+        run_manager=manager,
+        audit=build_default_audit_logger(InMemoryAuditLogStore()),
+        actor_id="t",
+    )
+    assert closed == 0
+
+
+@pytest.mark.parametrize(
+    "continuation_status", [RunStatus.PENDING, RunStatus.RUNNING, None], ids=str
+)
+@pytest.mark.asyncio
+async def test_a_verdict_whose_continuation_is_live_is_left_alone(
+    continuation_status: RunStatus | None,
+) -> None:
+    """检查点里有没用掉的裁定、本该用掉它的续跑还在(或还没建行):不补。"""
+    run_store = InMemoryRunStore()
+    approvals = InMemoryApprovalStore()
+    manager = RunManager(store=run_store)
+    thread, tenant, paused, continuation = uuid4(), uuid4(), uuid4(), uuid4()
+    now = datetime.now(UTC)
+
+    def _row(run_id: UUID, status: RunStatus, at: datetime) -> RunInfo:
+        return RunInfo(
+            run_id=run_id,
+            tenant_id=tenant,
+            thread_id=thread,
+            user_id=None,
+            status=status,
+            on_disconnect=DisconnectMode.CONTINUE,
+            is_resume=False,
+            error=None,
+            created_at=at,
+            updated_at=at,
+            finished_at=None,
+        )
+
+    await run_store.create(_row(paused, RunStatus.PAUSED, now))
+    if continuation_status is not None:
+        await run_store.create(_row(continuation, continuation_status, now + timedelta(seconds=1)))
+    await approvals.create(
+        ApprovalRecord(
+            id=uuid4(),
+            tenant_id=tenant,
+            run_id=paused,
+            thread_id=thread,
+            request_id="approval:x",
+            node="tools",
+            reason_kind="policy_gate",
+            action_summary="approval-gated tool 'lookup'",
+            requested_at=now,
+            timeout_at=now + timedelta(hours=1),
+        )
+    )
+    assert await approvals.mark_decided(
+        run_id=paused,
+        tenant_id=tenant,
+        status=ApprovalStatus.APPROVED,
+        decided_by="human",
+        decided_at=now,
+        continuation_run_id=continuation,
+    )
+    tail = AIMessage(
+        content="",
+        tool_calls=[{"name": _GATED, "args": {}, "id": "tc-x", "type": "tool_call"}],
+        additional_kwargs={STAMP_RUN_ID: str(paused)},
+    )
+
+    class _VerdictWaiting:
+        async def aget_state(self, *_: Any, **__: Any) -> Any:
+            return SimpleNamespace(
+                values={"messages": [tail], "approval_resume": {"decision": "approve"}}
+            )
+
+        async def aupdate_state(self, *_: Any, **__: Any) -> None:
+            raise AssertionError("续跑还在,不能收口")
+
+    closed = await repair_turn_tail(
+        graph=_VerdictWaiting(),
+        thread_id=thread,
+        tenant_id=tenant,
+        new_run_id=uuid4(),
+        approvals=approvals,
         run_manager=manager,
         audit=build_default_audit_logger(InMemoryAuditLogStore()),
         actor_id="t",

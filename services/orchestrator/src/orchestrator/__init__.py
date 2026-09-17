@@ -27,7 +27,7 @@ from orchestrator.approval_turn import (
     APPROVAL_TURN_RESET as APPROVAL_TURN_RESET,
 )
 from orchestrator.approval_turn import (
-    pending_request_id as pending_request_id,
+    pending_request_binding as pending_request_binding,
 )
 from orchestrator.approval_turn import (
     repair_unanswered_tail as repair_unanswered_tail,
@@ -214,7 +214,7 @@ __all__ = [
     "make_memory_writeback_node",
     "make_planner_node",
     "make_reflect_node",
-    "pending_request_id",
+    "pending_request_binding",
     "repair_unanswered_tail",
     "run_agent",
     "sanitize_dangling_tool_calls",

@@ -321,6 +321,11 @@ async def test_approve_threads_mint_digest_into_resume(
             "modified_args": None,
             "reason": None,
             "binding_digest": "mint-digest",
+            # 班车 2 —— 被批请求的身份,原样抄自检查点(桩的检查点只有 request_id)。
+            "request_id": "approval:flow",
+            "action_summary": None,
+            "tool_call_id": "",
+            "tool_call_index": None,
         }
     ]
     # approve keeps the mint digest (no re-bind).

@@ -64,7 +64,8 @@ async def test_voided_turn_closes_on_postgres_and_the_next_turn_supersedes_clean
         cfg = _cfg(st.thread_id)
         assert (await st.compiled.aget_state(cfg)).values["pending_approval"] is not None
 
-        async def content_for(run_id: str) -> str | None:
+        async def content_for(run_id: str, /, *, verdict_waiting: bool) -> str | None:
+            del verdict_waiting
             return VOIDED_APPROVAL_CONTENT if run_id == str(run_a) else None
 
         assert await repair_unanswered_tail(st.compiled, cfg, content_for=content_for) == 1

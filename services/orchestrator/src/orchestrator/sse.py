@@ -798,7 +798,11 @@ async def run_agent(
             approval_payload = {
                 "run_id": str(run_id),
                 "thread_id": str(record.thread_id),
-                **pending_request.model_dump(mode="json"),
+                # 调用 id / 下标是平台内部核对裁定归属用的(班车 2),不进对外的
+                # ``approval`` 事件 —— 那张字段表是对接契约。
+                **pending_request.model_dump(
+                    mode="json", exclude={"tool_call_id", "tool_call_index"}
+                ),
             }
             await _publish_frame("approval", approval_payload)
             # PAUSED is itself a terminal branch here (no further set_status

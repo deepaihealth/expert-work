@@ -354,6 +354,8 @@ class RunQueueWorker:
                     audit=self._audit,
                     actor_id="run_queue_worker",
                     trace_id=current_trace_id_hex(),
+                    # 与 spawn_run 同一口径:这一轮是替谁跑的。
+                    on_behalf_of=str(run.user_id) if run.user_id is not None else None,
                 )
             except Exception:
                 logger.exception(

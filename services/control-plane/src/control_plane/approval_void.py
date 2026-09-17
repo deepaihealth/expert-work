@@ -47,7 +47,7 @@ from expert_work.protocol import ApprovalRecord, ApprovalStatus, AuditAction
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import InterruptReason, RunManager, RunStatus
 from orchestrator import repair_unanswered_tail
-from orchestrator.approval_turn import UNRUN_TOOL_CALL_CONTENT, VOIDED_APPROVAL_CONTENT
+from orchestrator.approval_turn import UNRECORDED_TOOL_CALL_CONTENT, VOIDED_APPROVAL_CONTENT
 
 __all__ = [
     "VOIDED_BY",
@@ -166,7 +166,7 @@ async def repair_turn_tail(
     if latest is None or latest.status is RunStatus.SUCCESS:
         return 0
 
-    async def content_for(raw_run_id: str) -> str | None:
+    async def content_for(raw_run_id: str, *, verdict_waiting: bool) -> str | None:
         try:
             tail_run_id = UUID(raw_run_id)
         except ValueError:
@@ -174,6 +174,18 @@ async def repair_turn_tail(
         row = await store.get(run_id=tail_run_id, tenant_id=tenant_id)
         if row is None or row.status in _LIVE_RUN_STATUSES:
             return None
+        if verdict_waiting:
+            # 一条裁定写进来了、还没被用掉:本该用掉它的续跑还在(或还没建行)就不动;
+            # 它已经结束了(取消在第一步之前、被判孤儿……)才补。批准的调用可能根本
+            # 没执行,也可能执行了一半 —— 用不下结论的措辞。
+            approval = await approvals.get_by_run(run_id=tail_run_id, tenant_id=tenant_id)
+            continuation = approval.continuation_run_id if approval is not None else None
+            if continuation is None:
+                return None
+            continuation_row = await store.get(run_id=continuation, tenant_id=tenant_id)
+            if continuation_row is None or continuation_row.status in _LIVE_RUN_STATUSES:
+                return None
+            return UNRECORDED_TOOL_CALL_CONTENT
         if row.status is RunStatus.PAUSED:
             await _settle_paused(
                 tail_run_id,
@@ -189,7 +201,7 @@ async def repair_turn_tail(
             return VOIDED_APPROVAL_CONTENT
         if row.status is RunStatus.INTERRUPTED and row.error == InterruptReason.NEW_TURN:
             return VOIDED_APPROVAL_CONTENT
-        return UNRUN_TOOL_CALL_CONTENT
+        return UNRECORDED_TOOL_CALL_CONTENT
 
     # 只带会话,不带新一轮的 run_id(理由见 ``repair_unanswered_tail``)。
     config: RunnableConfig = {

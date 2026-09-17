@@ -125,7 +125,7 @@ from orchestrator import (
     LLM_CACHE_BYPASS_KEY,
     AgentFactoryError,
     BuiltAgent,
-    pending_request_id,
+    pending_request_binding,
     run_agent,
     sse_consumer,
 )
@@ -973,7 +973,8 @@ async def resolve_approval_decision(
     # 新一轮的检查点,套到新一轮自己的工具调用上执行。核对失败:不写、不开续跑,
     # 这次裁定改记为作废,与「已被裁定」同一个 409。
     snapshot = await built.graph.aget_state(checkpoint_config)
-    if pending_request_id(snapshot.values or {}) != approval.request_id:
+    waiting_on = pending_request_binding(snapshot.values or {})
+    if waiting_on is None or waiting_on["request_id"] != approval.request_id:
         await void_decided_approval(
             approval,
             continuation_run_id=continuation_run_id,
@@ -1001,6 +1002,10 @@ async def resolve_approval_decision(
                 # RT-6 Tier A (RT-ADR-19) — the graph re-hashes the dispatched
                 # args and matches them against this; drift → integrity veto.
                 "binding_digest": expected_digest,
+                # 班车 2 —— 被批请求的身份(request_id / 摘要 / 调用 id 与下标)。
+                # 上面的核对与这次写入之间不是原子的:图里据此再核对一次,裁定
+                # 不属于检查点里那一轮就按绑定漂移处理,什么都不执行。
+                **waiting_on,
             },
         },
         as_node="agent",
