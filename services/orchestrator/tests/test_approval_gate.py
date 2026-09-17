@@ -330,6 +330,8 @@ def test_resume_approve_matching_digest_dispatches() -> None:
     assert not outcome.binding_drift
     assert outcome.reject_messages == []
     assert outcome.tool_calls[0]["args"] == {"to": "ops@x.com"}
+    # B-76 — ``tool_calls`` is always the whole step; only ``withheld`` says what runs.
+    assert outcome.withheld == {}
 
 
 def test_resume_approve_tampered_args_is_binding_drift() -> None:
