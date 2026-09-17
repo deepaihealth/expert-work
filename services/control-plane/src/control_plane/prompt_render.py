@@ -195,7 +195,7 @@ def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
     返回字符串。``trusted: false`` 时路径也在围栏里(它由租户数据推出),尾注是平台文本,
     不围栏(裁定 P8)。
     已知代价:模板对被改写的值做**内容比较**(``{{ 'x' if org_logo == '…' }}``)会失真;
-    ``| default('')`` 这类**存在性**判断照旧成立(改写后的字符串非空)。
+    ``| default('')`` 这类**存在性**判断照旧成立(改写后的值非空)。
     """
     if getattr(var, "render", "auto") == "raw":
         return _raw_or_fenced(var, raw, nonce=nonce), False
