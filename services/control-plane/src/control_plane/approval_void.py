@@ -209,9 +209,10 @@ async def repair_turn_tail(
     }
     closed = await repair_unanswered_tail(graph, config, content_for=content_for)
     if closed:
+        # 不记 ``thread_id``:它来自请求路径(CodeQL py/log-injection);新一轮的 run id
+        # 能反查到会话。
         logger.info(
-            "approval.turn_tail_repaired thread_id=%s new_run_id=%s tool_results=%d",
-            thread_id,
+            "approval.turn_tail_repaired new_run_id=%s tool_results=%d",
             new_run_id,
             closed,
         )

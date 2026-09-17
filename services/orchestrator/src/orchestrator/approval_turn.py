@@ -75,13 +75,12 @@ _VOIDED_ID_PREFIX = "approval-voided-"
 
 
 class ContentFor(Protocol):
-    """给定尾巴所属 run 的 id,返回结果正文;``None`` = 那一轮还没结束,不补。
+    def __call__(self, run_id: str, /, *, verdict_waiting: bool) -> Awaitable[str | None]:
+        """给定尾巴所属 run 的 id,返回结果正文;``None`` = 那一轮还没结束,不补。
 
-    ``verdict_waiting``:检查点里还有一条没被用掉的裁定(``approval_resume``)。
-    这时只有「本该用掉它的那个续跑已经结束」才能补。
-    """
-
-    def __call__(self, run_id: str, /, *, verdict_waiting: bool) -> Awaitable[str | None]: ...
+        ``verdict_waiting``:检查点里还有一条没被用掉的裁定(``approval_resume``)。
+        这时只有「本该用掉它的那个续跑已经结束」才能补。
+        """
 
 
 def unanswered_tail_run_id(messages: Sequence[BaseMessage]) -> str | None:
