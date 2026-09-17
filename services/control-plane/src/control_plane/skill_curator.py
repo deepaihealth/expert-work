@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -48,6 +50,7 @@ from expert_work.common.uplift_metrics import (
     record_curator_transition,
     set_curator_pinned_skills,
 )
+from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.protocol import AuditAction, AuditResult, TenantConfigRecord
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -196,18 +199,21 @@ class SkillCurator:
         if self._session_factory is None:
             return await self._run_sweep()
         async with self._session_factory() as lock_session:
-            # Long-hold guard: the lock txn stays open for the sweep; keep it
-            # off any idle-in-transaction reaper (same posture as
-            # PgWorkspaceLock / QualityDriftWorker).
-            await lock_session.execute(
-                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
-            )
-            got = (
+            # 单飞锁是平台级动作:事务在第一条语句时开始,RLS 上下文就在那一刻读
+            # (``after_begin``)。bypass 只罩这两条,``_run_sweep`` 在它外面跑。
+            with _bypass_rls():
+                # Long-hold guard: the lock txn stays open for the sweep; keep it
+                # off any idle-in-transaction reaper (same posture as
+                # PgWorkspaceLock / QualityDriftWorker).
                 await lock_session.execute(
-                    text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
-                    {"cid": SKILL_CURATOR_LOCK_CLASSID, "k": "skill_curator"},
+                    text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
                 )
-            ).scalar_one()
+                got = (
+                    await lock_session.execute(
+                        text("SELECT pg_try_advisory_xact_lock(:cid, hashtext(:k))"),
+                        {"cid": SKILL_CURATOR_LOCK_CLASSID, "k": "skill_curator"},
+                    )
+                ).scalar_one()
             if not got:
                 await lock_session.rollback()
                 return CuratorRunSummary()
@@ -225,10 +231,14 @@ class SkillCurator:
         assert on the transition counts in tests.
         """
         summary = CuratorRunSummary()
-        tenant_ids = await self._skills.curator_distinct_tenant_ids()
+        # RLS 上下文(班车 2):跨租户的枚举与计数显式 bypass,逐租户的推进跑在该租户下。
+        # ``skill`` 表的策略没有 ``NULLIF``,enforce 下两样都不带的会话直接报错。
+        with _bypass_rls():
+            tenant_ids = await self._skills.curator_distinct_tenant_ids()
         for tenant_id in tenant_ids:
             try:
-                tenant_result = await self._sweep_tenant(tenant_id)
+                with _tenant_scope(tenant_id):
+                    tenant_result = await self._sweep_tenant(tenant_id)
             except Exception:
                 logger.exception("skill_curator.tenant_sweep_failed tenant_id=%s", tenant_id)
                 continue
@@ -237,7 +247,8 @@ class SkillCurator:
             summary.stale_to_archived += tenant_result.stale_to_archived
             summary.per_tenant.append(tenant_result)
 
-        summary.pinned_count = await self._skills.count_pinned()
+        with _bypass_rls():
+            summary.pinned_count = await self._skills.count_pinned()
         summary.finished_at = datetime.now(UTC)
 
         # Refresh the gauge once per sweep — bounded write rate.
@@ -262,19 +273,20 @@ class SkillCurator:
 
         # One audit row per sweep — bounded volume even on a busy day.
         try:
-            await audit_emit(
-                self._audit,
-                # The summary is platform-scope (no single tenant
-                # owns it); use the platform-tenant zero UUID.
-                tenant_id=_PLATFORM_TENANT_ID,
-                actor_id=self._actor_id,
-                action=AuditAction.SKILL_CURATOR_RUN,
-                resource_type="skill",
-                resource_id=None,
-                result=AuditResult.SUCCESS,
-                trace_id=current_trace_id_hex(),
-                details=summary.as_audit_details(),
-            )
+            with _tenant_scope(_PLATFORM_TENANT_ID):
+                await audit_emit(
+                    self._audit,
+                    # The summary is platform-scope (no single tenant
+                    # owns it); use the platform-tenant zero UUID.
+                    tenant_id=_PLATFORM_TENANT_ID,
+                    actor_id=self._actor_id,
+                    action=AuditAction.SKILL_CURATOR_RUN,
+                    resource_type="skill",
+                    resource_id=None,
+                    result=AuditResult.SUCCESS,
+                    trace_id=current_trace_id_hex(),
+                    details=summary.as_audit_details(),
+                )
         except Exception:
             logger.exception("skill_curator.audit_emit_failed")
 
@@ -316,6 +328,31 @@ class SkillCurator:
 # Matches the convention from H.4 ops audits in
 # ``control_plane.audit.emit`` callers that operate on no specific tenant.
 _PLATFORM_TENANT_ID: UUID = UUID("00000000-0000-0000-0000-000000000000")
+
+
+@contextmanager
+def _bypass_rls() -> Iterator[None]:
+    """跨租户枚举 / 计数与单飞锁的 RLS 上下文(显式 bypass)。"""
+    bypass = bypass_rls_var.set(True)
+    tenant = current_tenant_id_var.set(None)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(tenant)
+        bypass_rls_var.reset(bypass)
+
+
+@contextmanager
+def _tenant_scope(tenant_id: UUID) -> Iterator[None]:
+    """逐租户的库访问跑在该租户下,且不是 bypass。"""
+    tenant = current_tenant_id_var.set(tenant_id)
+    bypass = bypass_rls_var.set(False)
+    try:
+        yield
+    finally:
+        bypass_rls_var.reset(bypass)
+        current_tenant_id_var.reset(tenant)
+
 
 # Re-export the defaults so other modules + tests can reference the
 # canonical values rather than duplicating literals.
