@@ -1380,6 +1380,8 @@ def build_react_graph(
             if state.get(key) is not None
         }
         ingest_update: dict[str, Any] = {}
+        # B-76 —— 续跑时审批单上那一条之外的调用:下标 → 代替执行的那条工具结果。
+        withheld: Mapping[int, ToolMessage] = {}
         if approval_resume is not None:
             # Stream CM-8 (Mini-ADR CM-I4) — the resume re-entry skips the
             # entry chain (``aupdate_state(as_node="agent")`` lands the
@@ -1417,8 +1419,15 @@ def build_react_graph(
                 if resume_outcome.terminal:
                     rejected["approval_outcome"] = "rejected"
                 return rejected
-            # approve / modify — fall through to dispatch the (possibly
-            # arg-rewritten) calls; clear the resume channel on return.
+            # approve / modify — fall through to dispatch the approved (possibly
+            # arg-rewritten) call; clear the resume channel on return.
+            #
+            # B-76 — every other call of the turn is answered from ``withheld``
+            # and never dispatched (``_bounded`` below). This path skips action
+            # screening and the gate — the verdict is for this exact call — but a
+            # withheld call the model issues again lands on a fresh step, where
+            # screening and the gate judge it like any other call.
+            withheld = resume_outcome.withheld
             #
             # B-61 §5.3 —— 再套一遍绑定。``modify`` 拿人工给的 ``modified_args``
             # **整份替换**那条 call 的 args,于是(a)被绑参数会被人在审批面上静默
@@ -1574,6 +1583,11 @@ def build_react_graph(
             tc: dict[str, Any],
             bound_args: Sequence[str],
         ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
+            # B-76 — not released by the verdict: answered, never dispatched. Ahead
+            # of the retype guard — a call that does not run is not a blocked one.
+            not_run = withheld.get(index)
+            if not_run is not None:
+                return not_run, {}, 0, None
             hit = guard_hits.get(index)
             if hit is not None:
                 return await _reject_retyped_url(
@@ -1638,6 +1652,11 @@ def build_react_graph(
                 else:
                     accumulated_state[key] = value
             refund_total += refund_inc
+            if idx in withheld:
+                # B-76 — not run is not failed. Its ``status="error"`` must not
+                # reach the classifier (a withheld ``save_artifact`` would read as
+                # "the write did not land") → no advisory, no error count.
+                continue
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
             if failure is not None:
                 tool_failures.append(failure)

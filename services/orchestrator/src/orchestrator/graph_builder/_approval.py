@@ -39,12 +39,21 @@ from expert_work.protocol import (
 from orchestrator.tools.approval import ASK_FOR_APPROVAL_TOOL
 
 __all__ = [
+    "WITHHELD_CALL_CONTENT",
     "ApprovalTarget",
     "ResumeOutcome",
     "apply_resume_decision",
     "build_approval_request",
     "find_approval_target",
 ]
+
+#: B-76 — the result every call of an approved turn gets, except the one the
+#: approval showed: it was not run, and the model may issue it again (a gated
+#: call then asks for its own approval).
+WITHHELD_CALL_CONTENT = (
+    "[not run] this turn paused for human approval of another call; only the "
+    "approved call ran. Call this tool again if it is still needed."
+)
 
 #: ``reason_kind`` values an ``ask_for_approval`` call may carry. A call
 #: with anything else (or nothing) falls back to ``risk_confirmation``.
@@ -193,13 +202,19 @@ class ResumeOutcome:
 
     Exactly one of two shapes:
 
-    * **dispatch** — ``reject_messages`` empty, ``tool_calls`` carries
-      the (possibly arg-rewritten) calls to run normally.
+    * **dispatch** — ``reject_messages`` empty. ``tool_calls`` is the whole
+      turn, same length and order as the checkpointed calls (the approved
+      one possibly arg-rewritten), so an index still means the same call.
+      B-76 — only the approved call (the one the approval showed) may run:
+      ``withheld`` maps the index of every *other* call to the synthetic
+      ``ToolMessage`` that answers it instead of dispatching. So at most one
+      index is absent from ``withheld``; none when no call of this turn is
+      the approved one.
     * **reject** — ``reject_messages`` carries one synthetic
       ``ToolMessage`` per call (so no orphan tool_call is left), and
-      ``tool_calls`` is empty (nothing runs). ``terminal`` is ``True``
-      for a declarative-gate reject (the platform vetoed the run →
-      route to END) and ``False`` for an ``ask_for_approval`` reject
+      ``tool_calls`` / ``withheld`` are empty (nothing runs). ``terminal``
+      is ``True`` for a declarative-gate reject (the platform vetoed the
+      run → route to END) and ``False`` for an ``ask_for_approval`` reject
       (the agent just loops back, sees the rejection, re-plans).
 
     ``binding_drift`` (RT-6 Tier A, RT-ADR-19) marks the reject as an
@@ -208,7 +223,7 @@ class ResumeOutcome:
     and lets the caller emit the ``APPROVAL_BINDING_DRIFT`` audit.
     """
 
-    __slots__ = ("binding_drift", "reject_messages", "terminal", "tool_calls")
+    __slots__ = ("binding_drift", "reject_messages", "terminal", "tool_calls", "withheld")
 
     def __init__(
         self,
@@ -217,11 +232,13 @@ class ResumeOutcome:
         reject_messages: list[ToolMessage],
         terminal: bool,
         binding_drift: bool = False,
+        withheld: dict[int, ToolMessage] | None = None,
     ) -> None:
         self.tool_calls = tool_calls
         self.reject_messages = reject_messages
         self.terminal = terminal
         self.binding_drift = binding_drift
+        self.withheld: dict[int, ToolMessage] = withheld or {}
 
 
 def _binding_drift_reject(tool_calls: list[dict[str, Any]]) -> ResumeOutcome:
@@ -296,6 +313,57 @@ def _verdict_is_for_this_turn(
     return True
 
 
+def _approved_target(
+    tool_calls: list[dict[str, Any]],
+    approval_required_tools: frozenset[str],
+    resume: Mapping[str, Any],
+) -> ApprovalTarget | None:
+    """B-76 — the call the approval showed: the only one a verdict may release.
+
+    A verdict carries the request's ``tool_call_index`` (班车 2; when the call
+    id is known, :func:`_verdict_is_for_this_turn` has already matched it
+    against this turn) → that call. This matters for action screening, whose
+    request targets the judge's pick, not the declarative scan's. A verdict
+    without it (an older replica wrote it during a rolling deploy) → the
+    declarative scan, which is how the gate built its request. An index that
+    points at no call of this turn → ``None``: nothing is released.
+    """
+    index = resume.get("tool_call_index")
+    if index is None:
+        return find_approval_target(tool_calls, approval_required_tools)
+    if not isinstance(index, int) or not 0 <= index < len(tool_calls):
+        return None
+    call = tool_calls[index]
+    return ApprovalTarget(
+        index=index,
+        tool_call=call,
+        is_agent_initiated=call.get("name") == ASK_FOR_APPROVAL_TOOL,
+    )
+
+
+def _withhold_all_but(
+    tool_calls: list[dict[str, Any]], released: int | None
+) -> dict[int, ToolMessage]:
+    """B-76 — one "not run" answer per call except ``released``, keyed by index.
+
+    ``status="error"`` like every other synthetic "was not run" answer (reject,
+    block, retype guard): the call produced no result, and neither the model
+    (a provider's ``is_error``) nor an API client (``tool_result.status``)
+    should read it as a success. ``tools_node`` keeps it out of the failure
+    classification — not running is not a tool failure.
+    """
+    return {
+        index: ToolMessage(
+            content=WITHHELD_CALL_CONTENT,
+            tool_call_id=str(call.get("id") or ""),
+            status="error",
+            name=call.get("name"),
+        )
+        for index, call in enumerate(tool_calls)
+        if index != released
+    }
+
+
 def apply_resume_decision(
     tool_calls: list[dict[str, Any]],
     approval_required_tools: frozenset[str],
@@ -309,21 +377,25 @@ def apply_resume_decision(
     是这一轮尾巴那条助手消息的 run 戳)时,不论批的是什么都按绑定漂移处理:什么都
     不执行,整轮终止。
 
-    ``approve`` → dispatch every call unchanged. ``modify`` → rewrite
-    the gated call's args with ``modified_args``, then dispatch.
-    ``reject`` → dispatch nothing; return a rejection ``ToolMessage``
-    per call. ``terminal`` is set for a declarative-gate reject.
+    ``approve`` → run only the approved call (:func:`_approved_target`),
+    unchanged. ``modify`` → run only the approved call, with its args
+    replaced by ``modified_args``. Either way every other call of the turn is
+    withheld (B-76): the approval showed one call, so it releases one call;
+    the model is told to issue the others again if still needed. No approved
+    call on this turn → nothing runs. ``reject`` → dispatch nothing; return a
+    rejection ``ToolMessage`` per call. ``terminal`` is set for a
+    declarative-gate reject.
 
     RT-6 Tier A (RT-ADR-19) — before an approve / modify dispatches, the
-    gated call's args are re-hashed and matched against the approved
+    approved call's args are re-hashed and matched against the approved
     ``binding_digest``. A mismatch (the checkpointed tool_call drifted from
     what was approved) is a terminal integrity veto: nothing runs.
     """
     if not _verdict_is_for_this_turn(tool_calls, resume, turn_run_id):
         return _binding_drift_reject(tool_calls)
     decision = str(resume.get("decision", "approve"))
-    target = find_approval_target(tool_calls, approval_required_tools)
     if decision == "reject":
+        target = find_approval_target(tool_calls, approval_required_tools)
         reason = str(resume.get("reason") or "approval rejected by reviewer")
         messages = [
             ToolMessage(
@@ -338,23 +410,28 @@ def apply_resume_decision(
         # agent-initiated ask_for_approval reject just informs the agent.
         terminal = target is not None and not target.is_agent_initiated
         return ResumeOutcome(tool_calls=[], reject_messages=messages, terminal=terminal)
-    if decision == "modify" and target is not None:
-        modified = dict(resume.get("modified_args") or {})
+    # approve / modify (any other decision value reads as approve, as before).
+    target = _approved_target(tool_calls, approval_required_tools, resume)
+    dispatched = [dict(call) for call in tool_calls]
+    if target is None:
+        return ResumeOutcome(
+            tool_calls=dispatched,
+            reject_messages=[],
+            terminal=False,
+            withheld=_withhold_all_but(tool_calls, None),
+        )
+    args: Mapping[str, Any] = target.tool_call.get("args") or {}
+    if decision == "modify":
         # The bound reference for a modify is the modified args (the resume
         # endpoint re-hashes them into ``binding_digest`` atomically with the
         # decision), so verify the rewritten args against it.
-        if _has_binding_drift(target, modified, resume):
-            return _binding_drift_reject(tool_calls)
-        rewritten = [dict(call) for call in tool_calls]
-        rewritten[target.index] = {**rewritten[target.index], "args": modified}
-        return ResumeOutcome(tool_calls=rewritten, reject_messages=[], terminal=False)
-    # approve (or modify with no target — defensive: dispatch unchanged).
-    if target is not None and _has_binding_drift(
-        target, target.tool_call.get("args") or {}, resume
-    ):
+        args = dict(resume.get("modified_args") or {})
+        dispatched[target.index] = {**dispatched[target.index], "args": args}
+    if _has_binding_drift(target, args, resume):
         return _binding_drift_reject(tool_calls)
     return ResumeOutcome(
-        tool_calls=[dict(call) for call in tool_calls],
+        tool_calls=dispatched,
         reject_messages=[],
         terminal=False,
+        withheld=_withhold_all_but(tool_calls, target.index),
     )
