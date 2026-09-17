@@ -35,6 +35,7 @@ from typing import Any, Literal, cast
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.protocol import Plan, PlanStep, Reflection
 from orchestrator.graph_builder._config import cancellation_token, current_run_id
@@ -88,6 +89,10 @@ def _original_task(messages: list[BaseMessage]) -> str:
 def _render_trajectory(messages: list[BaseMessage]) -> str:
     lines: list[str] = []
     for message in messages:
+        # Hidden HumanMessages (B-67 inputs block, advisories, earlier reflect
+        # feedback) are platform scaffolding, not part of what the agent did.
+        if is_hidden(message):
+            continue
         text = _message_text(message).strip()
         if len(text) > _TRAJECTORY_CHAR_CAP:
             text = text[:_TRAJECTORY_CHAR_CAP] + "...[truncated]"

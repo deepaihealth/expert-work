@@ -70,6 +70,7 @@ from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import (
     ExpertWorkComponent,
     expert_work_counter,
@@ -385,6 +386,10 @@ def _format_middle_for_summary(
     """
     lines: list[str] = []
     for msg in middle:
+        # B-67 — hidden HumanMessages (inputs block, advisories) are platform
+        # scaffolding; the summary is durable text, so they stay out of it.
+        if is_hidden(msg):
+            continue
         role = _role_label(msg)
         # RT-2 PR-3 (RT-ADR-7) — a successful lazy-skill read is fed to the
         # summariser as its one-line reference (name + path, no tool-call

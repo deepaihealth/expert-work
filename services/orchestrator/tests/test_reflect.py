@@ -16,6 +16,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.protocol import Plan, Reflection
 from expert_work.runtime.cancellation import (
     CANCELLATION_TOKEN_KEY,
@@ -164,6 +165,31 @@ async def test_reflect_node_revise_feedback_hidden_from_ui() -> None:
     )
     injected = out["messages"][0]
     assert injected.additional_kwargs.get("expert_work_hide_from_ui") is True
+
+
+@pytest.mark.asyncio
+async def test_reflect_trajectory_omits_hidden_scaffolding() -> None:
+    """B-67 —— 隐藏 HumanMessage(「本轮输入」段、恢复建议)是平台脚手架,不进反思看的
+    轨迹;用户任务与助手回答照留。"""
+    llm = _RecordingLLM(responses=[AIMessage(content='{"verdict": "accept", "critique": "ok"}')])
+    node = make_reflect_node(llm, budget=2)
+
+    await node(  # type: ignore[arg-type]
+        _state(
+            [
+                HumanMessage(content="task"),
+                HumanMessage(
+                    content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}
+                ),
+                AIMessage(content="answer"),
+            ]
+        ),
+        {"configurable": {}},
+    )
+    prompt = "\n".join(str(m.content) for m in llm.calls[0])
+    assert "PLATFORM-INPUTS-BLOCK" not in prompt
+    assert "[human] task" in prompt
+    assert "[ai] answer" in prompt
 
 
 @pytest.mark.asyncio

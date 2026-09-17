@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from orchestrator.context import (
     CompactionStats,
     ContextCompressor,
@@ -502,6 +503,19 @@ def test_format_middle_caps_single_oversized_message() -> None:
     # Small slack for the role prefix + elision marker.
     assert len(out) <= _SUMMARY_PER_MESSAGE_CHAR_CAP + 100
     assert "truncated" in out
+
+
+def test_format_middle_skips_hidden_scaffolding() -> None:
+    """B-67 —— 隐藏 HumanMessage(「本轮输入」段、恢复建议)不进摘要输入:摘要是持久文本,
+    平台脚手架不该被写进去。"""
+    out = _format_middle_for_summary(
+        [
+            HumanMessage(content="user ask"),
+            HumanMessage(content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}),
+            AIMessage(content="reply"),
+        ]
+    )
+    assert out == "user: user ask\n\nassistant: reply"
 
 
 def test_format_middle_enforces_total_budget() -> None:
