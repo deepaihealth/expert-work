@@ -11,7 +11,6 @@ from dataclasses import dataclass
 import pytest
 
 from control_plane.prompt_render import (
-    BOUND_TEXT,
     URL_NOTE,
     PromptRenderError,
     bound_variable_names,
@@ -19,6 +18,9 @@ from control_plane.prompt_render import (
     validate_prompt_inputs,
 )
 from orchestrator.tools.inputs_doc import linked_sites
+
+#: 旧设计里绑定变量被替换成的文案;现在绑定不影响模板里的值(裁定 P10),它不该再出现。
+_OLD_BOUND_TEXT = "已绑定到工具参数"
 
 
 @dataclass
@@ -204,7 +206,7 @@ def test_a_bound_variable_renders_by_shape_exactly_like_an_unbound_one() -> None
     bound = render_system_prompt(_jinja_built(template, variables, arg_bindings=bindings), inputs)
     assert bound == unbound
     assert bound == f"LOGO:$EXPERT_WORK_INPUTS_DIR/org_logo.png{URL_NOTE} 项目:PRJ001"
-    assert BOUND_TEXT not in bound
+    assert _OLD_BOUND_TEXT not in bound
 
 
 def test_render_raw_keeps_a_bound_url_verbatim() -> None:
@@ -486,7 +488,7 @@ def test_an_unset_untrusted_variable_keeps_todays_empty_fence(bound: bool) -> No
     不改它(裁定 9);这里钉的是「绑定与否都不改变它」。"""
     out = render_system_prompt(_unset_built(trusted=False, bound=bound), {})
     assert out == f"{_FENCE_OPEN}\n\n{_FENCE_CLOSE};有"
-    assert BOUND_TEXT not in out
+    assert _OLD_BOUND_TEXT not in out
 
 
 def test_render_raw_keeps_the_url_verbatim() -> None:

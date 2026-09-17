@@ -39,8 +39,6 @@ logger = logging.getLogger(__name__)
 #: 模型在 exec_python / bash 里直接用,不用手抄任何路径。
 INPUTS_ENV = "EXPERT_WORK_INPUTS"
 INPUTS_DIR_ENV = "EXPERT_WORK_INPUTS_DIR"
-#: 被绑定变量的状态文本。PR3 本轮输入段用(模板里的值不再替换成它)。
-BOUND_TEXT = "（已绑定到工具参数，调用时平台自动填）"  # noqa: RUF001 — 全角标点,面向模型的中文
 #: URL / 逐项渲染的尾注:不断言「已下载」(渲染早于预拉),只说名字与回落办法。
 URL_NOTE = "（已就位；不在则按输入清单里的原地址下载）"  # noqa: RUF001
 #: 带路径的行以它收尾:untrusted 的 datamarking 把空白换成 ``▁``,不能直接贴在路径上。
