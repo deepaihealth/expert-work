@@ -34,7 +34,8 @@ Stream E.12.5 wires the middleware chain into both nodes. Anchor calls
   middlewares (E.3 dynamic_context, E.5 pii_redact) may rewrite the
   messages, and E.13 ``cache_lookup`` may set ``llm_cache_hit`` to a
   cached :class:`AIMessage` — when present, ``agent_node`` skips the
-  LLM call entirely.
+  LLM call entirely. ``llm_cache_bypass`` (bool, B-66 — from
+  ``configurable[LLM_CACHE_BYPASS_KEY]``) tells ``cache_lookup`` not to look.
 - ``around_llm_call`` chain → handed to :class:`LLMRouter` which
   invokes the chain **per provider** (Mini-ADR E-13), so each
   fallback attempt gets its own E.4 breaker + E.5 langfuse span.
@@ -128,6 +129,7 @@ from orchestrator.graph_builder._approval import (
     find_approval_target,
 )
 from orchestrator.graph_builder._config import (
+    LLM_CACHE_BYPASS_KEY,
     audit_logger_from_config,
     cancellation_token,
     compaction_sink_from_config,
@@ -866,11 +868,18 @@ def build_react_graph(
         # Stream Agent-Templates (M1-5a) — the end-user this run is for, threaded
         # to the token-usage middleware for per-user cost attribution.
         user_id = _parse_uuid(configurable.get("user_id"))
+        # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
+        cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 
         cache_hit_response: AIMessage | None = None
         if before_llm_chain is not None:
             ctx = MiddlewareContext(
-                payload={"messages": messages, "tools": tools, "tenant_id": tenant_id}
+                payload={
+                    "messages": messages,
+                    "tools": tools,
+                    "tenant_id": tenant_id,
+                    "llm_cache_bypass": cache_bypass,
+                }
             )
             await before_llm_chain.invoke(ctx, _noop)
             messages = list(ctx.payload.get("messages", messages))
@@ -1106,6 +1115,7 @@ def build_react_graph(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 primary_cache_hit=cache_hit_response is not None,
+                cache_bypass=cache_bypass,
                 token_budget=token_budget,
             )
             response = finalize.response
@@ -2205,6 +2215,7 @@ async def _finalize_structured_response(
     tenant_id: UUID | None,
     user_id: UUID | None,
     primary_cache_hit: bool,
+    cache_bypass: bool = False,
     token_budget: TokenBudget | None = None,
 ) -> _StructuredFinalize:
     """RT-ADR-4 two-stage finalization (mechanism: ``agent_node`` comment).
@@ -2266,6 +2277,10 @@ async def _finalize_structured_response(
                 # § 7.4 hard requirement — the spec INSTANCE, so the E.13
                 # lookup keys with the schema fingerprint.
                 "output_schema": spec,
+                # B-66 — a regenerate run skips this lookup too: a deterministic
+                # model re-producing the same candidate yields a byte-identical
+                # resend prompt, which would otherwise hit the old structured entry.
+                "llm_cache_bypass": cache_bypass,
             }
         )
         await before_llm_chain.invoke(before_ctx, _noop)

@@ -113,7 +113,13 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunEventStore, RunStore
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
-from orchestrator import AgentFactoryError, BuiltAgent, run_agent, sse_consumer
+from orchestrator import (
+    LLM_CACHE_BYPASS_KEY,
+    AgentFactoryError,
+    BuiltAgent,
+    run_agent,
+    sse_consumer,
+)
 from orchestrator.multimodal import image_ref_block
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
 
@@ -1262,6 +1268,10 @@ async def spawn_run(
     configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+    if replay_messages is not None:
+        # B-66 —— ``:regenerate`` 重放的 [System, Human] 与原轮字节相同,不绕开响应
+        # 缓存就必然命中、把旧答案原样端回来。``:edit`` 输入是新的,不需要。
+        configurable[LLM_CACHE_BYPASS_KEY] = True
     # 本轮附件下传:委派出去的子代看不到本对话,``[file attached: …]`` 那行对它
     # 不存在。同一份清单既进用户消息也进子代种子,来源是这一个 payload 字段。
     config: RunnableConfig = {"configurable": configurable}

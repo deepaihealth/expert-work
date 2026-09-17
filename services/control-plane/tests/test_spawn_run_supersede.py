@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ from expert_work.common.supersede import mark_superseded
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunStore
+from orchestrator import LLM_CACHE_BYPASS_KEY
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier
 
@@ -261,3 +263,41 @@ async def test_spawn_run_without_supersede_keeps_the_original_enqueued_input(
         "inputs",
         "document_names",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("replay", "bypass"), [(True, True), (False, False)])
+async def test_stream_regenerate_bypasses_the_response_cache_and_edit_does_not(
+    monkeypatch: pytest.MonkeyPatch, spawn_ctx: _SpawnCtx, replay: bool, bypass: bool
+) -> None:
+    """B-66 —— ``:regenerate``(``replay=True``)重放的 [System, Human] 与原轮字节相同,
+    run 必须带 ``LLM_CACHE_BYPASS_KEY``,否则 E.13 响应缓存必然命中、把旧答案原样端回来。
+    ``:edit``(``replay=False``)的输入是新的,缓存照常用。"""
+    target = uuid4()
+
+    async def fake_supersede_run(**kwargs: Any) -> SupersedeResult:
+        return SupersedeResult(
+            location=TurnLocation(start=0, end=2, plan_before=None, chain_run_ids=(target,)),
+            replay_messages=(
+                (SystemMessage(content="sys"), HumanMessage(content="U-old"))
+                if kwargs["require_replay"]
+                else None
+            ),
+            superseded_run_ids=(target,),
+        )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent(**kwargs: Any) -> None:
+        captured["configurable"] = kwargs["config"]["configurable"]
+
+    monkeypatch.setattr(runs_mod, "supersede_run", fake_supersede_run)
+    monkeypatch.setattr(runs_mod, "run_agent", fake_run_agent)
+    await spawn_ctx.spawn(
+        mode="stream", supersede=SupersedeRequest(target_run_id=target, replay=replay)
+    )
+    await asyncio.sleep(0)  # let the spawned run task body run
+
+    assert (LLM_CACHE_BYPASS_KEY in captured["configurable"]) is bypass
+    if bypass:
+        assert captured["configurable"][LLM_CACHE_BYPASS_KEY] is True

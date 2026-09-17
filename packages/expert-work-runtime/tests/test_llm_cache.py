@@ -500,6 +500,51 @@ async def test_store_then_lookup_round_trip() -> None:
     assert hit.content == "the answer"
 
 
+@pytest.mark.asyncio
+async def test_lookup_bypass_skips_a_real_hit_and_the_fresh_answer_wins_next_time() -> None:
+    """B-66 —— ``:regenerate`` 重放的 prompt 与原轮字节相同,带 ``llm_cache_bypass`` 的
+    调用必须**不查**缓存(否则必然命中、把旧答案原样端回来);store 照常写,于是之后
+    同样的普通调用拿到的是重新生成出来的新答案。"""
+    cache = _cache()
+    messages = [HumanMessage(content="regenerate me")]
+    tenant = uuid4()
+
+    async def store(answer: str) -> None:
+        await _store_mw(cache)(
+            MiddlewareContext(
+                payload={
+                    "prompt_messages": messages,
+                    "response": AIMessage(content=answer),
+                    "tenant_id": tenant,
+                    "cache_hit": False,
+                }
+            ),
+            _terminal,
+        )
+
+    await store("old answer")
+
+    bypassed = MiddlewareContext(
+        payload={"messages": messages, "tenant_id": tenant, "llm_cache_bypass": True}
+    )
+    await _lookup_mw(cache)(bypassed, _terminal)
+    assert "llm_cache_hit" not in bypassed.payload
+
+    # 显式 False 与缺省同义:照常命中。
+    not_bypassed = MiddlewareContext(
+        payload={"messages": messages, "tenant_id": tenant, "llm_cache_bypass": False}
+    )
+    await _lookup_mw(cache)(not_bypassed, _terminal)
+    hit = not_bypassed.payload.get("llm_cache_hit")
+    assert isinstance(hit, AIMessage) and hit.content == "old answer"
+
+    await store("fresh answer")
+    ctx = MiddlewareContext(payload={"messages": messages, "tenant_id": tenant})
+    await _lookup_mw(cache)(ctx, _terminal)
+    latest = ctx.payload.get("llm_cache_hit")
+    assert isinstance(latest, AIMessage) and latest.content == "fresh answer"
+
+
 # ---------------------------------------------------------------------------
 # output_schema keying at the middleware layer (Stream RT-1 PR-2)
 # ---------------------------------------------------------------------------

@@ -44,6 +44,7 @@ from expert_work.runtime.middleware.llm_cache import (
     LLMCacheStoreMiddleware,
 )
 from orchestrator import (
+    LLM_CACHE_BYPASS_KEY,
     AgentState,
     GraphRunner,
     ToolRegistry,
@@ -439,6 +440,42 @@ async def test_structured_cache_write_then_read_roundtrip() -> None:
     assert isinstance(last, AIMessage)
     assert last.content == _VALID
     assert last.additional_kwargs["parsed"] == {"score": 4}
+
+
+@pytest.mark.asyncio
+async def test_bypass_run_skips_the_structured_resend_lookup_too() -> None:
+    """B-66 —— ``:regenerate`` 带 ``LLM_CACHE_BYPASS_KEY`` 时,结构化重发那一次查找也要跳过。
+    确定性模型重跑出同一个不合规候选时,重发的 prompt 与原轮字节相同 —— 只绕开主调用
+    的话,重发会命中结构化条目,把旧的结构化答案原样端回来。"""
+    cache = LLMResponseCache(redis=InMemoryRedisCache())
+    tenant = str(uuid4())
+
+    before, after = _cache_chains(cache)
+    caller_1 = _RecordingCaller(responses=[AIMessage(content=_INVALID), AIMessage(content=_VALID)])
+    await _run(
+        caller_1,
+        output_schema=_SPEC,
+        before_llm_chain=before,
+        after_llm_chain=after,
+        config=_config(tenant=tenant),
+    )
+    assert len(caller_1.calls) == 2
+
+    before, after = _cache_chains(cache)
+    caller_2 = _RecordingCaller(
+        responses=[AIMessage(content=_INVALID), AIMessage(content='{"score": 5}')]
+    )
+    config = _config(tenant=tenant)
+    config["configurable"][LLM_CACHE_BYPASS_KEY] = True
+    final_2 = await _run(
+        caller_2,
+        output_schema=_SPEC,
+        before_llm_chain=before,
+        after_llm_chain=after,
+        config=config,
+    )
+    assert len(caller_2.calls) == 2
+    assert final_2["messages"][-1].additional_kwargs["parsed"] == {"score": 5}
 
 
 @pytest.mark.asyncio

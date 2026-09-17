@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, message_to_dict
 from control_plane import run_queue_worker as worker_mod
 from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.runtime.runs import InMemoryRunStore, RunManager
+from orchestrator import LLM_CACHE_BYPASS_KEY
 from tests.test_run_queue_worker import _FakeRuntime, _worker
 
 
@@ -45,6 +46,7 @@ async def test_worker_uses_replay_graph_input_when_present(
 
     async def fake_run_agent(**kwargs: Any) -> None:
         captured["graph_input"] = kwargs["graph_input"]
+        captured["configurable"] = kwargs["config"]["configurable"]
 
     monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
     store = InMemoryRunStore()
@@ -60,6 +62,33 @@ async def test_worker_uses_replay_graph_input_when_present(
     assert msgs[1].content == "U-old"
     assert msgs[1].additional_kwargs[STAMP_RUN_ID] == str(run_id)
     assert "turn_documents" not in captured["graph_input"]
+    # B-66 —— 重放的 prompt 与原轮字节相同,不绕开响应缓存就必然命中旧答案。
+    assert captured["configurable"][LLM_CACHE_BYPASS_KEY] is True
+
+
+@pytest.mark.asyncio
+async def test_worker_leaves_the_response_cache_on_for_a_plain_queued_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent(**kwargs: Any) -> None:
+        captured["configurable"] = kwargs["config"]["configurable"]
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    await runtime.run_manager.enqueue(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        enqueued_input={"input": "hello", "image_refs": [], "untrusted_content": []},
+    )
+
+    assert await _worker(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+
+    assert LLM_CACHE_BYPASS_KEY not in captured["configurable"]
 
 
 def test_replay_messages_survive_the_jsonb_round_trip() -> None:

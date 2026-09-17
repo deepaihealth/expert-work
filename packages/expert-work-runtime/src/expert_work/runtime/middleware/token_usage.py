@@ -127,7 +127,12 @@ class TokenUsageMiddleware:
 
         counts = _extract_token_counts(response.usage_metadata)
         if counts is None:
-            return
+            # B-66 — E.13 缓存条目不存 ``usage_metadata``,命中时读回来的消息没有用量。
+            # 仍落一行全 0(见模块 docstring 的 ``cache_hit`` 条):否则对外用量把
+            # 「命中缓存、零上游开销」报成「无记录」。未命中又没有用量的调用照旧不落。
+            if ctx.payload.get("cache_hit") is not True:
+                return
+            counts = (0, 0, 0, 0)
         input_t, output_t, cache_creation_t, cache_read_t = counts
 
         # Counter — even when cache_hit=True we increment so dashboards
