@@ -14,6 +14,10 @@
 与 ``inputs/<run_id>/`` **平级**,按 agent 共享。同一个 URL 跨轮只下一次
 (``CACHE_TTL_S`` 内),既省带宽也止住工作区配额的无限增长 —— 两者本是同一个病的
 两面(按 run 复制既是浪费也是增长曲线的分子)。
+
+**按变量名的符号链接**(B-67 §4.1):每拉到(或命中)一个 site,就在 run 目录里建
+``<链接名> -> ../cache/<digest><ext>``,``local_path`` 指链接。名字由变量名 + 路径 +
+URL 后缀决定,与 control-plane 渲染层说的名字逐字相同。链接失效 = 已接受的降级。
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import http.client
 import json
 import os
 import posixpath
+import re
 import sys
 import tempfile
 import time
@@ -35,6 +40,87 @@ from urllib.parse import urlparse
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
 TIMEOUT_S = 30
+
+#: B-67 —— 下面四个常量 + 六个函数与宿主侧 ``orchestrator.tools.inputs_doc`` **逐字同义**
+#: (``PARSED_KEY`` / ``SLUG_MAX_CHARS`` / ``_SLUG_DROP`` / ``_EXT_RE`` / ``_url_suffix`` /
+#: ``_slugify`` / ``_site_description`` / ``_link_stem`` / ``_link_names`` / ``_root_key``)。
+#: 这里不能 import 那边,只能复制;``test_link_names_match_the_host_side_implementation``
+#: 钉住两边同义 —— 提示词里说的名字必须就是这里建出来的链接名。
+PARSED_KEY = "value_parsed"
+SLUG_MAX_CHARS = 40
+_SLUG_DROP = re.compile(r"[^\w-]")
+_EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
+
+
+def _url_suffix(url: str) -> str:
+    ext = posixpath.splitext(urlparse(url).path)[1]
+    return ext if _EXT_RE.match(ext) else ""
+
+
+def _slugify(text: str | None) -> str:
+    if not text:
+        return ""
+    return _SLUG_DROP.sub("", text[:SLUG_MAX_CHARS])
+
+
+def _site_description(root: Any, path: list[str | int]) -> str | None:
+    cursor = root
+    for step in path:
+        if isinstance(step, int):
+            item = cursor[step] if isinstance(cursor, list) and 0 <= step < len(cursor) else None
+            desc = item.get("description") if isinstance(item, dict) else None
+            return desc if isinstance(desc, str) else None
+        if not isinstance(cursor, dict):
+            return None
+        cursor = cursor.get(step)
+    return None
+
+
+def _link_stem(var_name: str, path: list[str | int], description: str | None) -> str:
+    keys: list[str] = []
+    for step in path:
+        if isinstance(step, int):
+            head = ".".join([var_name, *keys])
+            slug = _slugify(description)
+            return f"{head}/{step}-{slug}" if slug else f"{head}/{step}"
+        keys.append(_slugify(str(step)) or "_")
+    return ".".join([var_name, *keys])
+
+
+def _link_names(var_name: str, sites: list[tuple[list[str | int], str, str | None]]) -> list[str]:
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for path, url, description in sites:
+        stem, ext = _link_stem(var_name, path, description), _url_suffix(url)
+        count = seen.get(stem + ext, 0) + 1
+        seen[stem + ext] = count
+        out.append(f"{stem}{ext}" if count == 1 else f"{stem}-{count}{ext}")
+    return out
+
+
+def _root_key(entry: dict[str, Any]) -> str:
+    return PARSED_KEY if PARSED_KEY in entry else "value"
+
+
+def _link(run_dir: str, name: str, cache_dir: str, filename: str) -> str | None:
+    """在 run 目录里建 ``name -> ../cache/<filename>`` 的**相对**符号链接;失败返回 ``None``。
+
+    相对目标:NAS 视角与沙箱 ``/workspace`` 视角下都成立(exec view 是 agent 目录的 bind)。
+    先删后建:``os.symlink`` 到已存在路径会 ``FileExistsError``(续跑 / 同 run 再预拉)。
+    ``name`` 可能带子目录(``materials/0-x.mp4``),父目录顺手建。任何 OSError 都只是
+    「没建成」—— 调用方回落到 cache 路径,预拉不让 run 失败。
+    """
+    link_path = os.path.join(run_dir, name)
+    target = os.path.relpath(os.path.join(cache_dir, filename), start=os.path.dirname(link_path))
+    try:
+        os.makedirs(os.path.dirname(link_path), exist_ok=True)
+        if os.path.lexists(link_path):
+            os.unlink(link_path)
+        os.symlink(target, link_path)
+    except OSError:
+        return None
+    return name
+
 
 #: 共享缓存目录名,挂在 ``inputs/`` 下、与 ``<run_id>/`` 平级。
 CACHE_DIRNAME = "cache"
@@ -258,23 +344,39 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"prefetch": []}, ensure_ascii=False))
         return 0
     run_dir = os.path.dirname(inputs_path)
+    run_dirname = os.path.basename(run_dir)
     # cache/ 挂在 run 目录的**父目录**下(``inputs/cache/``),与 ``<run_id>/`` 平级:
     # 内容寻址的条目按 agent 共享、跨轮复用,放进 run 目录就退回「每轮重下一份」。
     cache_dir = os.path.join(os.path.dirname(run_dir), CACHE_DIRNAME)
-    rel_prefix = posixpath.join("inputs", CACHE_DIRNAME)
+    cache_prefix = posixpath.join("inputs", CACHE_DIRNAME)
     budget = MAX_TOTAL_BYTES
     report: list[dict[str, object]] = []
 
     for name, entry in variables.items():
         if not isinstance(entry, dict):
             continue
-        for path, url in _sites(entry.get("value"), []):
+        root = _root_key(entry)
+        found = _sites(entry.get(root), [])
+        # B-67 §4.1 —— 链接名在拉之前就定(与渲染层同一算法),拉到一个建一个。
+        links = _link_names(
+            name, [(path, url, _site_description(entry.get(root), path)) for path, url in found]
+        )
+        for (path, url), link in zip(found, links, strict=True):
             hit = False
             used = 0
             try:
                 filename, used = _fetch(url, cache_dir, budget)
                 hit = filename is not None
-                _assign(entry, path, posixpath.join(rel_prefix, filename) if filename else None)
+                rel = None
+                if filename is not None:
+                    linked = _link(run_dir, link, cache_dir, filename)
+                    # 链接建成 → local_path 指链接(可读的名字);建不成 → 指 cache(老形态)。
+                    rel = (
+                        posixpath.join("inputs", run_dirname, linked)
+                        if linked is not None
+                        else posixpath.join(cache_prefix, filename)
+                    )
+                _assign(entry, root, path, rel)
                 _rewrite(inputs_path, doc)
             except Exception:
                 # 一个 site 的任何意外(文档结构与 _sites 的判定不一致、落盘失败
@@ -324,11 +426,11 @@ def _sites(
     return []
 
 
-def _assign(entry: dict[str, Any], path: list[str | int], rel: str | None) -> None:
+def _assign(entry: dict[str, Any], root: str, path: list[str | int], rel: str | None) -> None:
     if not path:
         entry["local_path"] = rel
         return
-    cursor = entry["value"]
+    cursor = entry[root]
     for step in path[:-1]:
         cursor = cursor[step]
     cursor["local_path"] = rel

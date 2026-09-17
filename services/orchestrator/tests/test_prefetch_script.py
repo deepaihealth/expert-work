@@ -95,8 +95,8 @@ def test_script_source_matches_the_file_on_disk() -> None:
 
 
 def test_site_walk_matches_the_host_side_implementation() -> None:
-    from orchestrator.tools.inputs_doc import iter_url_sites
-    from orchestrator.tools.prefetch_script import _sites
+    from orchestrator.tools.inputs_doc import iter_url_sites, root_key
+    from orchestrator.tools.prefetch_script import _root_key, _sites
 
     doc = {
         "variables": {
@@ -113,21 +113,29 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
             # local_path,两侧都必须判它不是 site。
             "d": {"value": ["https://a"], "trusted": True},
             "e": {"value": [["https://a"]], "trusted": True},
+            # B-67 §4.3 —— JSON 字符串:两侧都看 value_parsed,不看 value。
+            "f": {
+                "value": '[{"url": "https://x/f.pdf"}]',
+                "value_parsed": [{"url": "https://x/f.pdf"}],
+                "trusted": False,
+            },
         }
     }
     host = [(s.var_name, list(s.path), s.url) for s in iter_url_sites(doc)]
     sandbox = [
         (name, path, url)
         for name, entry in doc["variables"].items()
-        for path, url in _sites(entry["value"], [])
+        for path, url in _sites(entry[_root_key(entry)], [])
     ]
     assert host == sandbox
+    assert all(_root_key(e) == root_key(e) for e in doc["variables"].values())
     # 显式钉住攻击场景本身:c 只应该命中 url 那条,local_path 绝不能被当成待预拉的地址。
     assert ("c", ["url"], "https://ok/a.mp4") in sandbox
     assert not any(name == "c" and url == "https://attacker/b.mp4" for name, _, url in sandbox)
     # 同样显式钉住 finding 1:d/e 一条 site 都不该有——沙箱侧 _assign 走到那里会
     # TypeError,而 main 的 per-site 兜底之外,首先靠的就是这条判定。
     assert not any(name in {"d", "e"} for name, _, _ in sandbox)
+    assert ("f", [0, "url"], "https://x/f.pdf") in sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +217,7 @@ def test_fetch_hit_writes_file_and_relative_local_path(
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     name = cache_digest(f"{base}/ok.jpg") + ".jpg"
-    assert doc["variables"]["org_logo"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/org_logo.jpg"
     saved = tmp_path / "inputs" / "cache" / name
     assert saved.read_bytes() == body
 
@@ -364,8 +372,7 @@ def test_budget_exhausted_by_first_file_refuses_second(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    first_name = cache_digest(f"{base}/first") + ".jpg"
-    assert doc["variables"]["a"]["local_path"] == f"inputs/cache/{first_name}"
+    assert doc["variables"]["a"]["local_path"] == "inputs/run1/a"
     assert doc["variables"]["b"]["local_path"] is None
 
 
@@ -430,7 +437,7 @@ def test_a_bare_url_in_a_list_does_not_lose_the_other_variables(
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     name = cache_digest(f"{base}/ok.jpg") + ".jpg"
-    assert doc["variables"]["org_logo"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/org_logo.jpg"
     assert (tmp_path / "inputs" / "cache" / name).read_bytes() == body
     # 列表里的裸 URL 原样留着(没被回填、也没把结构改成别的形状)。
     assert doc["variables"]["images"]["value"] == [f"{base}/ok.jpg"]
@@ -482,8 +489,7 @@ def test_each_site_is_persisted_before_the_next_one(
         main(["prefetch_script.py", str(inputs_path)])
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    name = cache_digest(f"{base}/a.jpg") + ".jpg"
-    assert doc["variables"]["a"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["a"]["local_path"] == "inputs/run1/a.jpg"
 
 
 def test_one_failing_site_does_not_lose_the_others(
@@ -517,8 +523,7 @@ def test_one_failing_site_does_not_lose_the_others(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    name = cache_digest(f"{base}/b.jpg") + ".jpg"
-    assert doc["variables"]["b"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["b"]["local_path"] == "inputs/run1/b.jpg"
 
 
 # ---------------------------------------------------------------------------
@@ -700,3 +705,139 @@ def test_a_cache_hit_never_touches_the_entry(tmp_path: Path, http_server: _HttpS
     assert (hit_name, hit_used) == (name, 0)  # 先确认这一次真的走的是命中路径
     assert len(served) == 1
     assert os.stat(cached).st_mtime_ns == before
+
+
+# ---------------------------------------------------------------------------
+# B-67 Task 2 —— §4.1 按变量名建符号链接
+# ---------------------------------------------------------------------------
+
+
+def test_link_names_match_the_host_side_implementation() -> None:
+    """链接名三处同义的钉子:宿主 ``inputs_doc.linked_sites`` 与沙箱 ``_link_names`` 对同一份
+    inputs 必须逐字相同 —— 提示词里说的名字就是预拉建出来的名字。"""
+    from uuid import UUID
+
+    from expert_work.protocol import PromptVariableSpec
+    from orchestrator.tools.inputs_doc import build_inputs_doc, linked_sites
+    from orchestrator.tools.prefetch_script import (
+        _link_names,
+        _root_key,
+        _site_description,
+        _sites,
+    )
+
+    inputs: dict[str, Any] = {
+        "org_logo": "https://x/cover-1726394851207.png",
+        "brand": {"logo": "https://x/l.jpg", "name": "深护"},
+        "materials": (
+            '[{"description": "示范 视频", "url": "https://x/a.mp4"}, {"description": "无链接"},'
+            ' {"url": "https://x/c.pdf", "thumb": "https://x/c.pdf"}]'
+        ),
+        "page": "https://x/post",
+        "nested": {"a": [{"url": "https://x/n.png", "description": "..x"}]},
+        "note": "短文本",
+    }
+    variables = [PromptVariableSpec(name=name, required=False) for name in inputs]
+    doc = build_inputs_doc(run_id=UUID(int=1), variables=variables, inputs=inputs)
+    assert doc is not None
+
+    host = {name: [s.link for s in linked_sites(name, value)] for name, value in inputs.items()}
+    sandbox: dict[str, list[str]] = {}
+    for name, entry in doc["variables"].items():
+        root = entry[_root_key(entry)]
+        found = _sites(root, [])
+        sandbox[name] = _link_names(
+            name, [(path, url, _site_description(root, path)) for path, url in found]
+        )
+    assert host == sandbox
+    assert sandbox["org_logo"] == ["org_logo.png"]
+    assert sandbox["brand"] == ["brand.logo.jpg"]
+    assert sandbox["materials"] == [
+        "materials/0-示范视频.mp4",
+        "materials/2.pdf",
+        "materials/2-2.pdf",
+    ]
+    assert sandbox["page"] == ["page"]
+    assert sandbox["nested"] == ["nested.a/0-x.png"]
+    assert sandbox["note"] == []
+
+
+def test_hit_links_the_file_under_its_variable_name_and_points_local_path_at_the_link(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 32
+    url = f"{base}/cover-1726394851207.jpg"
+    routes["/cover-1726394851207.jpg"] = _route(body)
+    inputs_path = _write_inputs(tmp_path, {"org_logo": {"value": url, "trusted": True}})
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/org_logo.jpg"
+    link = tmp_path / "inputs" / "run1" / "org_logo.jpg"
+    assert link.is_symlink()
+    assert os.readlink(link) == f"../cache/{cache_digest(url)}.jpg"  # 相对目标,不跨出 inputs/
+    assert link.read_bytes() == body  # 从 run 目录出发能解析
+    assert (tmp_path / "inputs" / "cache" / f"{cache_digest(url)}.jpg").read_bytes() == body
+
+
+def test_list_items_link_under_a_variable_directory_using_value_parsed(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    base, routes = http_server
+    body = b"\x00\x00\x00\x18ftypmp42" + b"B" * 16
+    routes["/a.mp4"] = _route(body, content_type="video/mp4")
+    items = [{"description": "示范视频", "url": f"{base}/a.mp4"}, {"description": "无链接"}]
+    raw = json.dumps(items, ensure_ascii=False)
+    inputs_path = _write_inputs(
+        tmp_path, {"materials": {"value": raw, "value_parsed": items, "trusted": False}}
+    )
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    entry = json.loads(inputs_path.read_text(encoding="utf-8"))["variables"]["materials"]
+    assert entry["value"] == raw  # 字符串一个字不动
+    assert entry["value_parsed"][0]["local_path"] == "inputs/run1/materials/0-示范视频.mp4"
+    assert "local_path" not in entry["value_parsed"][1]
+    link = tmp_path / "inputs" / "run1" / "materials" / "0-示范视频.mp4"
+    assert link.is_symlink()
+    assert os.readlink(link).startswith("../../cache/")
+    assert link.read_bytes() == body
+
+
+def test_rerun_replaces_the_link_instead_of_failing_on_file_exists(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """续跑 / 同一 run 再预拉:``os.symlink`` 到已存在路径会 ``FileExistsError``,先删后建。"""
+    base, routes = http_server
+    routes["/l.png"] = _route(b"\x89PNG" + b"C" * 16, content_type="image/png")
+    inputs_path = _write_inputs(tmp_path, {"logo": {"value": f"{base}/l.png", "trusted": True}})
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    link = tmp_path / "inputs" / "run1" / "logo.png"
+    assert link.is_symlink()
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["logo"]["local_path"] == "inputs/run1/logo.png"
+
+
+def test_symlink_failure_falls_back_to_the_cache_path(
+    tmp_path: Path, http_server: _HttpServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """建不了链接(文件系统不支持)→ ``local_path`` 退回 cache 路径,老消费方无感;不让 run 失败。"""
+    base, routes = http_server
+    routes["/l.png"] = _route(b"\x89PNG" + b"C" * 16, content_type="image/png")
+    inputs_path = _write_inputs(tmp_path, {"logo": {"value": f"{base}/l.png", "trusted": True}})
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("symlinks not supported")
+
+    monkeypatch.setattr(os, "symlink", refuse)
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    name = cache_digest(f"{base}/l.png") + ".png"
+    assert doc["variables"]["logo"]["local_path"] == f"inputs/cache/{name}"
+    assert not (tmp_path / "inputs" / "run1" / "logo.png").exists()
