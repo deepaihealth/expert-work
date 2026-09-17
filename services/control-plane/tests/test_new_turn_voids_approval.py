@@ -13,6 +13,8 @@ A 的审批不可再裁定,B 照常跑、审批门完整生效。
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -65,6 +67,7 @@ from orchestrator import (
     sanitize_dangling_tool_calls,
 )
 from orchestrator.approval_turn import VOIDED_APPROVAL_CONTENT
+from orchestrator.sse import _BACKGROUND_PERSIST_WRITERS
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
 _AGENT = "support-bot"
@@ -394,6 +397,15 @@ async def test_new_turn_runs_behind_the_gate_and_voids_the_paused_turn(s: _Stack
     assert sanitize_dangling_tool_calls(s.llm.prompts[-1]) == []
     voided = [m for m in s.llm.prompts[-1] if getattr(m, "tool_call_id", None) == "tc-A"]
     assert [m.content for m in voided] == [VOIDED_APPROVAL_CONTENT]
+
+    # 已经结束的 A 不会再推送事件;事后回放 A 的事件流,收尾的 end 跟着 run 行走。
+    if _BACKGROUND_PERSIST_WRITERS:
+        await asyncio.gather(*_BACKGROUND_PERSIST_WRITERS, return_exceptions=True)
+    replay = await s.client.get(f"/v1/agents/{_AGENT}/runs/{run_a}/events?user_id={_USER}")
+    assert replay.status_code == 200, replay.text
+    ends = [b for b in replay.text.split("\n\n") if "event: end" in b.splitlines()]
+    assert len(ends) == 1
+    assert json.loads(ends[0].rsplit("data: ", 1)[1])["status"] == "interrupted"
 
 
 # ---------------------------------------------------------------------------
