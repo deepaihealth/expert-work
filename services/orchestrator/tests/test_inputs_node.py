@@ -251,10 +251,12 @@ def test_prefetch_code_actually_runs_under_a_real_interpreter() -> None:
 
 
 def test_every_run_entry_reaches_the_configurable_key() -> None:
-    """四个 run 入口都调 run_agent,而 PROMPT_INPUTS_KEY 只在 run_agent 里加一次。
+    """每个 run 入口都调 run_agent,而 PROMPT_INPUTS_KEY 只在 run_agent 里加一次。
 
     这条挡的是「规矩写一处漏三处」:哪天有人把 configurable 的组装挪回入口层,
-    这条测试会红。
+    这条测试会红。它只钉**键**;每个入口传进来的**值**是不是这一轮的,由
+    control-plane 的 ``test_every_run_agent_call_passes_the_turn_inputs`` 钉 ——
+    「键只写一处」曾被当成「值处处都对」,审批续跑 / 孤儿复活 / 重新生成传的都是空的。
     """
     import inspect
 

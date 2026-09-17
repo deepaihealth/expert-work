@@ -321,7 +321,8 @@ class ToolContext:
     agent_key: str = ""
     #: B-61 §4.4 —— ``EXPERT_WORK_INPUTS`` 该指向**哪个 run** 的 ``inputs.json``。
     #:
-    #: 主 run 留 ``None``(用 ``run_id`` 自己)。委派出的子代(worker / 静态子
+    #: 新开一轮的主 run 留 ``None``(用 ``run_id`` 自己);审批续跑段是新 run_id,
+    #: 入口经 ``run_agent(inputs_run_id=…)`` 指回这一轮首段。委派出的子代(worker / 静态子
     #: Agent)每次都会新铸一个 ``sub_run_id``,而 inputs 节点**故意不为子 run 写
     #: 文件**——于是子代的 exec 会拿到一个 ``inputs/<sub_run_id>/inputs.json``
     #: 的悬空路径,工具描述又告诉模型那个文件在,模型读不到就退回手抄 URL:正是

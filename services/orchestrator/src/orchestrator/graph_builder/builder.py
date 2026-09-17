@@ -3154,7 +3154,8 @@ def _build_tool_context(
     agent_key_raw = configurable.get("agent_key")
     agent_key = agent_key_raw if isinstance(agent_key_raw, str) else ""
     # B-61 §4.4 —— 子代要指向**父** run 的 inputs.json(``_child_config`` 写进来
-    # 的;主 run 的 config 里没有这一项,回落 ``None`` = 用自己的 run_id)。
+    # 的);审批续跑段要指向这一轮首段的(``run_agent`` 写进来的)。新开一轮的
+    # 主 run 没有这一项,回落 ``None`` = 用自己的 run_id。
     inputs_run_id = _parse_uuid(configurable.get("inputs_run_id"))
     # B-61 §5.3 —— 本轮声明变量的值,只为 ``_child_config`` 往子代传(子代的
     # config 里没有这一项,它的被绑参数就会被静默摘掉)。主 run 的填值不走这里。

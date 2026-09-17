@@ -42,6 +42,7 @@ from control_plane.kill_switch import run_block_reason
 from control_plane.run_trace import bind_exec_spec, bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
+from control_plane.turn_inputs import resolve_turn_inputs
 from expert_work.common.observability import (
     ExpertWorkComponent,
     current_trace_id_hex,
@@ -381,6 +382,17 @@ class OrphanSweep:
                 source="orphan_sweep",
             )
 
+            # B-61 续跑 —— 复活段没有请求体;这一轮的 inputs 从这一轮第一个 run 取回
+            # (被复活的可能是审批续跑段,那样 inputs.json 在更早那个 run 名下)。
+            turn = await resolve_turn_inputs(
+                run_id=orphan.run_id,
+                thread_id=orphan.thread_id,
+                tenant_id=orphan.tenant_id,
+                runs=self._runs,
+                approvals=self._approvals,
+                event_store=self._runtime.run_event_store,
+            )
+
             # Adopt the existing durable run into THIS instance's registry (no
             # new agent_run row — the reclaim CAS already took ownership).
             run_record = await self._runtime.run_manager.adopt(
@@ -428,6 +440,8 @@ class OrphanSweep:
                     # perf phase2 PR3 T3 — process-wide delegation concurrency gate.
                     delegation_gate=self._runtime.delegation_gate(),
                     tool_replay_safe=built.tool_replay_safe,
+                    prompt_inputs=turn.inputs,
+                    inputs_run_id=turn.root_run_id,
                 )
             )
             await self._runtime.run_manager.attach_task(orphan.run_id, worker)
