@@ -118,21 +118,24 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 
 ### 6.1 内容
 
-从声明 + 本轮实际传值 + 绑定表生成,**只有名字、说明、状态、路径,没有值**:
+从声明 + 本轮实际传值 + 绑定表生成(`control_plane/inputs_block.py`),**只有名字、说明、状态、路径,没有值**。下例是代码实跑的输出(`project_code` 被 `arg_bindings` 引用,本轮没传 `customer_code`):
 
 ```
 [本轮输入]（平台自动生成）
 输入文件目录 $EXPERT_WORK_INPUTS_DIR，清单 $EXPERT_WORK_INPUTS（exec_python / bash 里直接用）。
-要用到下面任何值时用代码从目录或清单读；不要从上文手抄，长串抄错一位就是 404。
-- employee_name（当前员工姓名）：已提供，短文本
-- customer_code（目标客户编码…）：本轮未提供
-- project_code（深护智康项目唯一标识码…）：已绑定到工具参数，调用时平台自动填
-- org_logo（机构 LOGO…）：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；不在则按清单里的原地址下载
-- materials（员工勾选素材…）：3 项，每项的文件在 $EXPERT_WORK_INPUTS_DIR/materials/<序号-说明>；不在则按清单 materials[i].url 下载
-- disclaimer（免责声明…）：已提供，外部数据，需逐字使用时从清单读
+代码里要用到下面任何值时，从目录或清单读；不要从上文手抄，长串抄错一位就是 404。
+- employee_name（当前员工姓名）：已提供（非文件）
+- customer_code（目标客户编码(已有客户),新客户对话描述场景可省略）：本轮未提供
+- project_code（示例机构项目唯一标识码,一切 MCP 调用的必带参数）：已提供（非文件）；绑定了它的工具由平台自动填，不用手抄
+- org_logo（机构 LOGO 的 OSS 签名 URL,仅封面左上使用）：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；不在则按清单里的原地址下载
+- materials（员工勾选素材 JSON 数组字符串,每项 {description, url},…）：3 项，每项的文件在 $EXPERT_WORK_INPUTS_DIR/materials/<下标-说明>；不在则按清单里该项的原地址下载
+- disclaimer（免责声明(每份方案页脚,合规必须有)）：已提供（非文件，外部数据，需逐字使用时从清单读）
 ```
 
-- 说明文字来自 `PromptVariableSpec.description`;没写就只有名字。
+- 说明文字来自 `PromptVariableSpec.description`,压成一行、超过 40 字截断加「…」;没写就只有名字。
+- 状态先判「本轮未提供」(裁定 P12:被绑定也一样,那条绑定本轮填不出值);传了的按形态:无 URL → `已提供（非文件）`(untrusted 为 `已提供（非文件，外部数据，需逐字使用时从清单读）`);顶层 URL → `文件 …；不在则按清单里的原地址下载`;列表 → `N 项，每项的文件在 …/<变量名>/<下标-说明>；…`;对象 → `N 个文件在 …/<变量名>.<字段名>；…`。被绑定的变量在形态之后接 `；绑定了它的工具由平台自动填，不用手抄`(裁定 P10)。
+- 段落不带租户数据(裁定 P8 / P16):untrusted 的顶层 URL 只写「`$EXPERT_WORK_INPUTS_DIR` 下以 <变量名> 开头的文件」(真名里的扩展名取自租户 URL;不写成 `<变量名>.<扩展名>`,无扩展名与撞名时会说错);列表项说明、dict 键一律只用占位 `<下标-说明>` / `<字段名>`,确切名字在清单的 `local_path`。
+- 段头第二句只约束**代码**(「代码里要用到…」):回复里引用短文案不受它限制。
 - 「已下载」不能断言(渲染早于预拉),统一写「文件 …;不在则按清单原地址下载」—— 顶层与列表项同一口径。
 - 模板里**已经引用**的变量也列(去重不做):C 的职责是兜底与位置,B 的职责是原地渲染,两者内容一致、口径一致,重复一行不造成歧义。
 
@@ -146,8 +149,10 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 
 - 在用户轮之后 = 首轮时它是上下文**最后一条**,注意力最好的位置;两家参考仓库放用户消息最前面,我们放后面,理由是不污染对接方看得到的用户消息(它经 `/messages` 原样回给对方)。
 - 不进对外会话消息、控制台气泡、对话条目(§零 第 2 条已核);进 durable 记录与审计镜像。
-- 续跑(审批后 `Command`)与 `:regenerate` 重放原件:重放拿的是 System + Human 两条原件(`SupersedeRequest.replay`),要把隐藏消息一起带上 —— 实现时 `replay_graph_input` 与 `build_run_graph_input` 同源。
-- 委派的子 run 不生成(它们没有自己的 inputs.json,B-61 §4.2 同一道闸)。
+- 只在 `prompt_jinja` 且声明了变量时生成(本轮一个值都没传也生成,全是「本轮未提供」);与用户消息盖同一个 run 戳,取代 / 墓碑按区间罩住它;消息带 `HIDE_FROM_UI` 与 `INPUTS_BLOCK_MARK`。
+- `:regenerate` 重放 [System, Human, 本轮输入段] 三条原件(`replay_graph_input` 接受 2 或 3 条,靠 `INPUTS_BLOCK_MARK` 认出这一段);审批续跑与孤儿复活不重建消息(检查点里已有)。三条路径要的**原始 inputs**(填绑定参数、`EXPERT_WORK_INPUTS` 指向首段目录)由 #1577 从本轮首段的 `system_prompt` 帧取回;`:regenerate` 时变量声明已改则 422(改用 `:edit`)。
+- 委派的子 run 与触发器路径不生成(它们不经过 `build_run_graph_input`;子 run 没有自己的 inputs.json,B-61 §4.2 同一道闸)。
+- 读「最后一条 HumanMessage」的地方都跳过隐藏消息(裁定 P14:judge / screening 对齐、planner、记忆召回与抽取、窗口轮数、会话标题、技能演化重放、压缩摘要);反思轨迹保留隐藏消息(裁定 P22:revise 反馈本身就是隐藏消息)。
 
 ### 6.3 不做每轮提醒
 
@@ -157,22 +162,28 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 
 ### 7.1 判定
 
-`tools_node` 里 `_fill_bound_args` 之后、审批门之前,对 `exec_python` / `bash` 的代码参数(`_SANDBOX_CODE_ARGS`)做一次扫描:
+`tools_node` 里 `_fill_bound_args` 之后,对 `exec_python` / `bash` 的代码参数(`_SANDBOX_CODE_ARGS`)做一次扫描;命中只在派发处(`_bounded`)生效,不改审批门与 action screening 的判定和下标语义(裁定 5):
 
-- 候选集 = 本轮 `PROMPT_INPUTS_KEY` 里所有 URL site(与 `_sites` 同一函数,含 §4.3 的解析形态),记 `(变量名, URL)`。
-- 从代码里抽所有 `https?://[^\s'"`<>)\]]+` 字面量;逐个与候选集比:
-  - **完全一致** → 命中;
-  - **同 scheme+host,路径的编辑距离 ≤ 3**(Levenshtein,按字符)→ 命中(事故里距离是 1;阈值 3 覆盖「多一位/少一位/改一字」)。
-- 命中即拦:该调用不执行,合成 `ToolMessage(status="error")`:
+- 候选集 = 本轮 `PROMPT_INPUTS_KEY` 里所有 URL site(`inputs_doc.linked_sites`,与预拉 / 渲染同一个 walker 与命名,含 §4.3 的解析形态),记 `(变量名, URL, 链接名)`。
+- 从代码里抽所有 URL 字面量(`https?://` 不分大小写,到空白 / 引号 / 反引号 / 尖括号 / 右括号 / 右方括号 / 常见全角标点为止);逐个与候选集比:
+  - **完全一致** → 命中(第一处完全一致优先);
+  - **同 scheme+host(不分大小写),host 之后的全部(路径 + query + fragment,裁定 4)编辑距离 ≤ 3** → 命中,取最小距离(带状 Levenshtein,裁定 P19;host 之后超过 8192 字符不比)。事故里距离是 1;阈值 3 覆盖「多一位/少一位/改一字」。
+- 命中即拦:该调用不执行,合成 `ToolMessage(status="error")`。trusted 变量回显写法与链接名:
 
   ```
-  [blocked] 代码里的地址 https://…/cover-17263…png 是输入 org_logo 的手抄件（平台比对：疑似抄错 1 处）。
-  这个文件已在 $EXPERT_WORK_INPUTS_DIR/org_logo.png；请改用它，或用代码从 $EXPERT_WORK_INPUTS 读 org_logo.value。
+  [blocked] 代码里的地址 https://files.example.com/brand/cover-17263948851207.png 是输入 org_logo 的手抄件（平台比对：疑似抄错 1 处）。这个文件应在 $EXPERT_WORK_INPUTS_DIR/org_logo.png（不在则按清单里的原地址下载）；请改用它，或用代码从 $EXPERT_WORK_INPUTS 清单里读 org_logo 的原地址，不要手抄。
+  ```
+
+  untrusted 变量与委派子 run(按 `configurable["child_run"]` 判,裁定 P24)的提示不写链接名、不回显那串 —— 这条合成消息不过 spotlight 围栏:
+
+  ```
+  [blocked] 代码里有一处地址是输入 materials 的手抄件（平台比对：与输入一致）。这个文件应在 $EXPERT_WORK_INPUTS_DIR 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里 materials 对应条目的 local_path（不在则按清单里的原地址下载）；请用代码从清单里读路径或原地址，不要手抄。
   ```
 
   抄对了也拦:这次对不代表下次对;拦一次模型这一轮就改道。
+- 错误分类记 `invalid_arguments`(改参数、别原样重发),**不**用 `blocked_by_policy`(裁定 P23):后者的恢复提示是「等审批 / 报给用户、别绕过」,与守卫要模型做的事相反。工具计数只加 `blocked`,不记 0 秒延迟样本。
 - 同批其它调用照常执行(不同于 action screening 的整批拒绝):被拦的只是那一条。
-- 写一条 `tool:blocked` 审计(现成动作),`details.reason = "input_url_retyped"`,记变量名与编辑距离,**不记 URL**。
+- 写一条 `tool:blocked` 审计(现成动作),审计行 `reason = "input_url_retyped"`,`details` 只多记 `input_variable` 与 `edit_distance`;`args` 去掉代码键(裁定 6),**不记 URL、不记代码**。
 
 ### 7.2 边界
 
@@ -181,6 +192,7 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 - 模型代码里**读清单再拼 URL**(`d["variables"]["org_logo"]["value"]`)不含字面量,不会命中 —— 这正是想要的用法。
 - 不同输入之间近似(`…-1.png` 与 `…-2.png` 都是输入)→ 完全一致优先;都不一致时按最小距离归属,消息里写「疑似」。
 - 误拦代价:模型多一轮改道;漏拦代价:404。取拦。
+- 已知代价(裁定 5):`bash` 同时在 `approval_required_tools` 里且抄错时,会先走一轮审批,批准后仍被拦;审批面板里人改过的代码同样受守卫约束。
 
 ### 7.3 为什么放 tools_node 不放中间件
 
