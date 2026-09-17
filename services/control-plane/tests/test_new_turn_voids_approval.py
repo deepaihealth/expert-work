@@ -1048,13 +1048,21 @@ async def test_a_tail_whose_run_is_still_running_is_left_alone() -> None:
 
 
 @pytest.mark.parametrize(
-    "continuation_status", [RunStatus.PENDING, RunStatus.RUNNING, None], ids=str
+    ("continuation_status", "has_approval"),
+    [
+        (RunStatus.PENDING, True),
+        (RunStatus.RUNNING, True),
+        (None, True),
+        (RunStatus.INTERRUPTED, False),
+    ],
+    ids=["pending", "running", "row-not-created-yet", "no-approval-row"],
 )
 @pytest.mark.asyncio
 async def test_a_verdict_whose_continuation_is_live_is_left_alone(
-    continuation_status: RunStatus | None,
+    continuation_status: RunStatus | None, has_approval: bool
 ) -> None:
-    """检查点里有没用掉的裁定、本该用掉它的续跑还在(或还没建行):不补。"""
+    """检查点里有没用掉的裁定、本该用掉它的续跑还在(或还没建行、或根本找不到是哪个
+    续跑):不补。"""
     run_store = InMemoryRunStore()
     approvals = InMemoryApprovalStore()
     manager = RunManager(store=run_store)
@@ -1079,28 +1087,29 @@ async def test_a_verdict_whose_continuation_is_live_is_left_alone(
     await run_store.create(_row(paused, RunStatus.PAUSED, now))
     if continuation_status is not None:
         await run_store.create(_row(continuation, continuation_status, now + timedelta(seconds=1)))
-    await approvals.create(
-        ApprovalRecord(
-            id=uuid4(),
-            tenant_id=tenant,
-            run_id=paused,
-            thread_id=thread,
-            request_id="approval:x",
-            node="tools",
-            reason_kind="policy_gate",
-            action_summary="approval-gated tool 'lookup'",
-            requested_at=now,
-            timeout_at=now + timedelta(hours=1),
+    if has_approval:
+        await approvals.create(
+            ApprovalRecord(
+                id=uuid4(),
+                tenant_id=tenant,
+                run_id=paused,
+                thread_id=thread,
+                request_id="approval:x",
+                node="tools",
+                reason_kind="policy_gate",
+                action_summary="approval-gated tool 'lookup'",
+                requested_at=now,
+                timeout_at=now + timedelta(hours=1),
+            )
         )
-    )
-    assert await approvals.mark_decided(
-        run_id=paused,
-        tenant_id=tenant,
-        status=ApprovalStatus.APPROVED,
-        decided_by="human",
-        decided_at=now,
-        continuation_run_id=continuation,
-    )
+        assert await approvals.mark_decided(
+            run_id=paused,
+            tenant_id=tenant,
+            status=ApprovalStatus.APPROVED,
+            decided_by="human",
+            decided_at=now,
+            continuation_run_id=continuation,
+        )
     tail = AIMessage(
         content="",
         tool_calls=[{"name": _GATED, "args": {}, "id": "tc-x", "type": "tool_call"}],
