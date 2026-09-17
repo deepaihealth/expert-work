@@ -43,6 +43,16 @@ class ApprovalStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def list_pending_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID
+    ) -> list[ApprovalRecord]:
+        """一个会话里仍在等裁定的行,``requested_at`` 升序(班车 2)。
+
+        新一轮开跑前据此把上一轮的待审批作废。租户 + 会话双谓词;正常情况下
+        至多一行,多行只可能是修复前遗留的数据。
+        """
+
+    @abc.abstractmethod
     async def list_expired(
         self,
         *,

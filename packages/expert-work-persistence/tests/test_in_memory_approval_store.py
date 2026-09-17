@@ -397,3 +397,37 @@ async def test_list_filters_by_reason_kinds() -> None:
         tenant_id=tenant, status=ApprovalStatus.PENDING
     )
     assert unfiltered_total == 3
+
+
+# ---------------------------------------------------------------------------
+# 班车 2 —— 新一轮作废上一轮的待审批:按会话取待审批
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_pending_by_thread_scopes_tenant_thread_and_status() -> None:
+    store = InMemoryApprovalStore()
+    tenant, thread = uuid4(), uuid4()
+
+    def _on(tenant_id: object, thread_id: object, *, minutes: int) -> ApprovalRecord:
+        return _record_at(tenant_id, minutes=minutes).model_copy(update={"thread_id": thread_id})
+
+    newer = _on(tenant, thread, minutes=2)
+    older = _on(tenant, thread, minutes=1)
+    decided = _on(tenant, thread, minutes=0)
+    for rec in (newer, older, decided):
+        await store.create(rec)
+    await store.create(_on(tenant, uuid4(), minutes=0))  # 同租户别的会话
+    await store.create(_on(uuid4(), thread, minutes=0))  # 别的租户同一个会话 id
+    assert await store.mark_decided(
+        run_id=decided.run_id,
+        tenant_id=tenant,
+        status=ApprovalStatus.APPROVED,
+        decided_by="u",
+        decided_at=datetime.now(UTC),
+    )
+
+    rows = await store.list_pending_by_thread(thread_id=thread, tenant_id=tenant)
+
+    assert [r.run_id for r in rows] == [older.run_id, newer.run_id]
+    assert await store.list_pending_by_thread(thread_id=uuid4(), tenant_id=tenant) == []

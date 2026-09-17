@@ -83,6 +83,28 @@ class SqlApprovalStore(ApprovalStore):
             ).scalar_one_or_none()
         return _row_to_dto(row) if row is not None else None
 
+    async def list_pending_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID
+    ) -> list[ApprovalRecord]:
+        # 谓词与内存店同义:租户 + 会话 + pending,requested_at 升序。
+        async with self._sf() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(AgentApprovalRow)
+                        .where(
+                            AgentApprovalRow.tenant_id == tenant_id,
+                            AgentApprovalRow.thread_id == thread_id,
+                            AgentApprovalRow.status == ApprovalStatus.PENDING.value,
+                        )
+                        .order_by(AgentApprovalRow.requested_at.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_row_to_dto(r) for r in rows]
+
     async def list_expired(
         self,
         *,

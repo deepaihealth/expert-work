@@ -254,3 +254,78 @@ async def test_list_filters_by_reason_kinds(
         assert all_total >= 3
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_pending_by_thread_scopes_tenant_thread_and_status(
+    approval_store: ApprovalStoreFixture,
+) -> None:
+    """班车 2 —— 与内存店同一份谓词:同租户 + 同会话 + pending,``requested_at`` 升序。"""
+    store, engine = approval_store
+    try:
+        tenant, thread = uuid4(), uuid4()
+        base = datetime.now(UTC)
+
+        def _on(tenant_id: UUID, thread_id: UUID, *, minutes: int) -> ApprovalRecord:
+            return _record(tenant_id=tenant_id, run_id=uuid4()).model_copy(
+                update={"thread_id": thread_id, "requested_at": base + timedelta(minutes=minutes)}
+            )
+
+        newer = _on(tenant, thread, minutes=2)
+        older = _on(tenant, thread, minutes=1)
+        decided = _on(tenant, thread, minutes=0)
+        for rec in (newer, older, decided):
+            await store.create(rec)
+        await store.create(_on(tenant, uuid4(), minutes=0))
+        await store.create(_on(uuid4(), thread, minutes=0))
+        assert await store.mark_decided(
+            run_id=decided.run_id,
+            tenant_id=tenant,
+            status=ApprovalStatus.APPROVED,
+            decided_by="u",
+            decided_at=base,
+        )
+
+        rows = await store.list_pending_by_thread(thread_id=thread, tenant_id=tenant)
+
+        assert [r.run_id for r in rows] == [older.run_id, newer.run_id]
+        assert await store.list_pending_by_thread(thread_id=uuid4(), tenant_id=tenant) == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_void_and_decide_race_has_exactly_one_winner(
+    approval_store: ApprovalStoreFixture,
+) -> None:
+    """班车 2 —— 新一轮的作废(REJECTED)与人工裁定(APPROVED)真并发抢同一行,只有一个赢。"""
+    store, engine = approval_store
+    try:
+        for _ in range(8):
+            tenant_id, run_id = uuid4(), uuid4()
+            await store.create(_record(tenant_id=tenant_id, run_id=run_id))
+            now = datetime.now(UTC)
+            void, decide = await asyncio.gather(
+                store.mark_decided(
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    status=ApprovalStatus.REJECTED,
+                    decided_by="system:new_turn",
+                    decided_at=now,
+                ),
+                store.mark_decided(
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    status=ApprovalStatus.APPROVED,
+                    decided_by="human",
+                    decided_at=now,
+                    continuation_run_id=uuid4(),
+                ),
+            )
+            assert void != decide
+            row = await store.get_by_run(run_id=run_id, tenant_id=tenant_id)
+            assert row is not None
+            expected = ApprovalStatus.REJECTED if void else ApprovalStatus.APPROVED
+            assert row.status is expected
+    finally:
+        await engine.dispose()

@@ -28,6 +28,20 @@ class InMemoryApprovalStore(ApprovalStore):
             return None
         return row
 
+    async def list_pending_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID
+    ) -> list[ApprovalRecord]:
+        # 谓词与 SQL 店同义:租户 + 会话 + pending,requested_at 升序。
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.thread_id == thread_id
+            and r.status == ApprovalStatus.PENDING
+        ]
+        rows.sort(key=lambda r: r.requested_at)
+        return rows
+
     async def list_expired(
         self,
         *,
