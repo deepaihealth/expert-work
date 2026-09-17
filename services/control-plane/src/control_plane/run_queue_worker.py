@@ -34,6 +34,7 @@ from langchain_core.runnables import RunnableConfig
 
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api.runs import build_run_graph_input, replay_graph_input
+from control_plane.approval_void import void_pending_approvals
 from control_plane.run_trace import bind_exec_spec, bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
@@ -337,6 +338,20 @@ class RunQueueWorker:
                     # 都在这儿回读,document_names 补齐同一模式。
                     document_names=document_names,
                 )
+
+            # 班车 2 —— 出队这一侧再作废一次:入队时会话可能还没停在审批上,
+            # 入队与出队之间停下的那条审批只有这里能作废。
+            await void_pending_approvals(
+                graph=built.graph,
+                thread_id=run.thread_id,
+                tenant_id=run.tenant_id,
+                new_run_id=run.run_id,
+                approvals=self._approvals,
+                run_manager=self._runtime.run_manager,
+                audit=self._audit,
+                actor_id="run_queue_worker",
+                trace_id=current_trace_id_hex(),
+            )
 
             # Adopt the durable run into THIS instance's registry (no new
             # agent_run row — claim_queued already flipped it to running).

@@ -57,6 +57,7 @@ from control_plane.api._user_scope import (
     resolve_caller_user_id,
 )
 from control_plane.api.trace_facade import fetch_and_normalize, fetch_span_raw
+from control_plane.approval_void import void_if_superseded, void_pending_approvals
 from control_plane.audit import emit
 from control_plane.kill_switch import run_block_reason
 from control_plane.prompt_render import (
@@ -115,6 +116,7 @@ from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunEventSt
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import (
+    APPROVAL_TURN_RESET,
     LLM_CACHE_BYPASS_KEY,
     AgentFactoryError,
     BuiltAgent,
@@ -514,6 +516,9 @@ def build_run_graph_input(
         # 保留检查点里的旧值,上一轮的附件会漏进这一轮的子代。
         "turn_documents": list(document_names or []),
         "turn_image_refs": list(image_refs),
+        # 审批三件套只属于一轮,每一轮都清零(班车 2)—— 省略时检查点里上一轮
+        # 停在审批上留下的 pending_approval 会让本轮的门控调用跳过审批门。
+        **APPROVAL_TURN_RESET,
     }
 
 
@@ -558,6 +563,8 @@ def replay_graph_input(
         "step_count": 0,
         "max_steps": built.max_steps,
         "max_no_progress": built.max_no_progress,
+        # 与 ``build_run_graph_input`` 同一条:审批三件套每一轮清零(班车 2)。
+        **APPROVAL_TURN_RESET,
     }
 
 
@@ -787,6 +794,21 @@ async def resolve_approval_decision(
             status_code=409,
             detail=f"approval already decided ({approval.status.value})",
         )
+    # 班车 2 —— 这条审批所在的 run 之后会话里已经有更新的 run:检查点已经属于
+    # 新一轮,绝不能拿它续跑。就地作废,与「已被裁定」同一个 409(超时扫描也走这里)。
+    if await void_if_superseded(
+        approval,
+        approvals=approvals,
+        run_manager=runtime.run_manager,
+        audit=audit,
+        actor_id=actor_id,
+        trace_id=trace_id,
+    ):
+        loser = await approvals.get_by_run(run_id=run_id, tenant_id=tenant_id)
+        replay = _idempotent_continuation(loser, idempotency_key)
+        if replay is not None:
+            return None, replay, True
+        raise HTTPException(status_code=409, detail="approval already decided (rejected)")
 
     meta = await threads.get(thread_id, tenant_id=tenant_id)
     if meta is None or meta.agent_name is None or meta.agent_version is None:
@@ -1214,6 +1236,21 @@ async def spawn_run(
             )
             replay_messages = result.replay_messages
             regenerated_from = supersede.target_run_id
+
+        # 班车 2 —— 新一轮作废会话里还在等裁定的审批(用户拍板:不 409)。必须早于
+        # 建行 / 入队:queue worker 只认已存在的行,作废与检查点收口都落定之后
+        # 新一轮才可能开跑。queue 模式出队时还会再作废一次(见 RunQueueWorker)。
+        await void_pending_approvals(
+            graph=built.graph,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            new_run_id=run_id,
+            approvals=approvals,
+            run_manager=runtime.run_manager,
+            audit=audit,
+            actor_id=actor_id,
+            trace_id=trace_id,
+        )
 
         # Stream 9.5 — queue mode: persist as ``queued`` + return 202.
         if payload.mode == "queue":

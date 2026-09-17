@@ -21,7 +21,11 @@ from control_plane.agent_disable_status import AgentDisableService
 from control_plane.audit import build_default_audit_logger
 from control_plane.run_queue_worker import RunQueueWorker
 from control_plane.tenant_status import TenantStatusService
-from expert_work.persistence import InMemoryAgentDisableStore, InMemoryTenantConfigStore
+from expert_work.persistence import (
+    InMemoryAgentDisableStore,
+    InMemoryApprovalStore,
+    InMemoryTenantConfigStore,
+)
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunStore, RunManager, RunStatus
@@ -112,7 +116,8 @@ def _worker(store, runtime, **kw) -> RunQueueWorker:
         agent_spec_store=_FakeAgents(),
         runtime=runtime,
         audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
-        approval_store=object(),
+        # 出队前要按会话查待审批(班车 2),占位对象不够用了。
+        approval_store=InMemoryApprovalStore(),
         **kw,
     )
 
