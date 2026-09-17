@@ -11,7 +11,7 @@ from collections.abc import Iterator
 
 import pytest
 
-import orchestrator.graph_builder.input_url_guard as guard
+from orchestrator.graph_builder import input_url_guard as guard
 from orchestrator.graph_builder.input_url_guard import (
     MAX_COMPARE_CHARS,
     MAX_EDIT_DISTANCE,
@@ -360,7 +360,7 @@ def test_comparison_budget_fails_open_and_logs_counts_only(
         assert find_retyped_url(f"open('{written}')", SIGNED_CAND) is None
     lines = [r.getMessage() for r in caplog.records]
     assert any(line.startswith("tools.input_url_guard_budget_exhausted") for line in lines)
-    assert not any("files.example.com" in line or "LTAI" in line for line in lines)
+    assert not any("://" in line or "LTAI" in line for line in lines)
     # 完全一致不走 DP,预算用完也照拦。
     assert find_retyped_url(f"open('{SIGNED}')", SIGNED_CAND) is not None
 

@@ -289,7 +289,7 @@ async def test_a_guard_failure_fails_open_and_logs_the_type_only(
     assert tool.calls == [f"get('{RETYPED}')"]
     lines = [r.getMessage() for r in caplog.records]
     assert "tools.input_url_guard_skipped err=ValueError" in lines
-    assert not any("files.example.com" in line for line in lines)
+    assert not any("://" in line for line in lines)
 
 
 # --- 信任口径:这条合成消息不过 spotlight 围栏(只有真工具输出过),链接名里的列表项
