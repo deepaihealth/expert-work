@@ -9,8 +9,9 @@ Two techniques from Microsoft's Spotlighting paper (arXiv 2403.14720),
 combined:
 
 - **delimiting** — wrap the content in randomized, unguessable markers
-  (``«UNTRUSTED nonce=…» … «/UNTRUSTED nonce=…»``). The nonce is per-run so
-  untrusted content cannot forge the closing marker to "escape" the region.
+  (``«UNTRUSTED nonce=…» … «/UNTRUSTED nonce=…»``). The nonce is minted per
+  agent build and unguessable, so untrusted content cannot forge the closing
+  marker to "escape" the region.
 - **datamarking** — interleave a marker glyph (``▁``) into the content's
   whitespace so an injected instruction loses its natural token boundaries,
   making it read as data rather than a command.
@@ -22,7 +23,8 @@ regional models parse encoded text poorly, hurting utility.
 
 This module is pure + deterministic (the caller supplies the nonce), so it
 unit-tests without a model and the wrapped output is prompt-cache stable
-within a run.
+for as long as the caller reuses the same nonce (across runs that reuse the
+cached build).
 """
 
 from __future__ import annotations
@@ -48,7 +50,7 @@ _FENCE_END = "»"
 # inserted, so stripping it restores the content's own line structure instead
 # of leaving a blank line where the fence stood. ``[^»]*`` for the nonce: the
 # marker syntax forbids ``»`` inside it, and matching any nonce (not just one
-# known value) is what lets a reader un-wrap content whose per-run nonce it
+# known value) is what lets a reader un-wrap content whose per-build nonce it
 # never saw.
 _FENCE_OPEN_RE = re.compile(
     re.escape(_FENCE_OPEN_PREFIX) + r"[^»]*" + re.escape(_FENCE_END) + "\n?"
@@ -92,8 +94,8 @@ def spotlight_untrusted(content: str, *, nonce: str) -> str:
     ``nonce`` MUST be unguessable to the content's author and is reused for the
     matching open/close marker so embedded text cannot forge an early close.
     Callers pass a per-**build** random nonce (``agent_factory`` mints one per
-    build and the build is cached across runs, so it is stable across a session
-    for prompt-cache).
+    build; the build cache is per replica with a TTL, so the nonce is stable
+    across runs that reuse the cached build, which keeps the prompt cache warm).
     """
     if not nonce:
         msg = "nonce must be a non-empty unguessable string"
