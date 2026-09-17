@@ -189,7 +189,6 @@ from orchestrator.tools.overflow import (
 from orchestrator.tools.registry import (
     TOOL_ALLOWED_STATE_KEYS,
     Tool,
-    ToolBlockedError,
     ToolContext,
     ToolNotFoundError,
     ToolRegistry,
@@ -1472,6 +1471,14 @@ def build_react_graph(
         # 放在填参之后、派发之前;只影响派发(下面 ``_bounded``),不改审批门与 action
         # screening 的判定和下标语义(裁定 5)。审批续跑路径重新算一遍,判定是确定的。
         guard_hits = _guard_sandbox_calls(tool_calls, config)
+        # 子代(``child_run``,只有 ``_child_config`` 会写)的 inputs 是父 run 的,本图的
+        # 声明管不到它们 → 守卫提示一律按 untrusted。不看 ``inputs_run_id``:主 run 的审批
+        # 续跑与复活续跑也会带它。
+        guard_trusted_names = (
+            frozenset()
+            if (config.get("configurable") or {}).get("child_run")
+            else trusted_input_names
+        )
 
         ctx_obj = _build_tool_context(
             config,
@@ -1545,7 +1552,7 @@ def build_react_graph(
             hit = guard_hits.get(index)
             if hit is not None:
                 return await _reject_retyped_url(
-                    tc, hit, ctx_obj, audit_logger, trusted_input_names=trusted_input_names
+                    tc, hit, ctx_obj, audit_logger, trusted_input_names=guard_trusted_names
                 )
             async with semaphore:
                 return await _run_call(tc, bound_args)
@@ -2906,21 +2913,24 @@ async def _reject_retyped_url(
     那串手抄 URL;spec §八 说了不记。
 
     这条消息不经 ``_invoke_tool``,也就不过 spotlight 围栏;链接名与模型抄的那串都带租户
-    数据,所以只对本 agent 声明为 trusted 的变量写出来。子代(``ctx.inputs_run_id`` 非空)
-    的 inputs 是父 run 的,本图的声明管不到它们,一律按 untrusted。
+    数据,所以只对 ``trusted_input_names`` 里的变量写出来(子代由调用方传空集)。
+
+    分类用 ``invalid_arguments``(改参数、别原样重发),不用 ``blocked_by_policy``:后者的
+    恢复提示是「等审批 / 报给用户、别绕过」,正好与守卫要模型做的事(改成从清单读)相反。
     """
     name = str(tool_call.get("name", ""))
     call_id = str(tool_call.get("id", ""))
     code_keys = _SANDBOX_CODE_ARGS.get(name, ())
     args = {k: v for k, v in (tool_call.get("args") or {}).items() if k not in code_keys}
-    trusted = ctx.inputs_run_id is None and hit.var_name in trusted_input_names
+    trusted = hit.var_name in trusted_input_names
     logger.warning(
         "tools.input_url_retyped tool=%s variable=%s distance=%d",
         name,
         hit.var_name,
         hit.distance,
     )
-    _record_tool_metrics(name, time.monotonic(), "blocked")
+    # 只记 blocked 计数,不记延迟样本:没有派发就没有耗时,记一个 0 秒会拉低工具延迟分布。
+    _tool_call_total.labels(tool=_metric_tool_label(name), outcome="blocked").inc()
     await _emit_tool_audit(
         audit_logger,
         ctx,
@@ -2942,9 +2952,7 @@ async def _reject_retyped_url(
         name=name,
         additional_kwargs={"duration_ms": 0},
     )
-    classified = classify_tool_error(
-        tool_name=name, error=ToolBlockedError("input_url_retyped"), blocked=True
-    )
+    classified = classified_invalid_arguments(tool_name=name, summary="input_url_retyped")
     return message, {}, 0, classified
 
 

@@ -149,7 +149,7 @@ def guard_message(hit: GuardHit, *, trusted: bool = True) -> str:
             f"[blocked] 代码里有一处地址是输入 {hit.var_name} 的手抄件"
             f"（平台比对：{verdict}）。"  # noqa: RUF001 — 面向模型的中文全角标点
             "这个文件应在 $EXPERT_WORK_INPUTS_DIR 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里"  # noqa: RUF001
-            f"{hit.var_name} 对应条目的 local_path（不在则按清单里的原地址下载）；"  # noqa: RUF001
+            f" {hit.var_name} 对应条目的 local_path（不在则按清单里的原地址下载）；"  # noqa: RUF001
             "请用代码从清单里读路径或原地址，不要手抄。"  # noqa: RUF001
         )
     return (

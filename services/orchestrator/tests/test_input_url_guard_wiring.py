@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from prometheus_client import REGISTRY
 
 from expert_work.protocol import AgentSpec, AuditEntry
 from expert_work.runtime.audit.logger import AuditLogger
@@ -91,10 +92,13 @@ def _tc(name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
 class _ScriptedLLM:
     responses: list[AIMessage]
     calls: int = 0
+    #: 每一步模型看到的消息(断言下一步的恢复提示用)。
+    seen: list[list[BaseMessage]] = field(default_factory=list)
 
     async def __call__(
         self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
     ) -> AIMessage:
+        self.seen.append(list(messages))
         idx = self.calls
         self.calls += 1
         return self.responses[idx]
@@ -202,9 +206,13 @@ async def test_bash_command_is_guarded_too_and_exact_copy_is_blocked() -> None:
     state = await _run(llm, registry, inputs={"org_logo": LOGO}, audit=audit)
     assert tool.calls == []
     assert "与输入一致" in _tool_messages(state)["tc-1"].content
-    assert [e.reason for e in audit.entries if e.action.value == "tool:blocked"] == [
-        "input_url_retyped"
-    ]
+    rows = [e for e in audit.entries if e.action.value == "tool:blocked"]
+    assert [e.reason for e in rows] == ["input_url_retyped"]
+    details = rows[0].details
+    assert "code" not in details and "code_sha256" not in details
+    assert "command" not in details["arg_keys"]
+    assert details["arg_keys"] == []
+    assert "1726394851207" not in json.dumps(details)
 
 
 async def test_without_inputs_nothing_is_guarded() -> None:
@@ -251,7 +259,7 @@ async def test_untrusted_variable_message_names_neither_the_link_nor_the_written
     assert "materials" in content
     assert "疑似抄错 1 处" in content
     assert "$EXPERT_WORK_INPUTS_DIR 下" in content
-    assert "$EXPERT_WORK_INPUTS 清单" in content
+    assert "$EXPERT_WORK_INPUTS 清单里 materials 对应条目的 local_path" in content
     assert "示范视频" not in content
     assert "materials/0" not in content
     assert "1726394851208" not in content and "files.example.com" not in content
@@ -276,7 +284,28 @@ async def test_trusted_variable_message_names_the_link() -> None:
 
 
 async def test_inherited_inputs_in_a_child_run_are_treated_as_untrusted() -> None:
-    """子代(config 带 ``inputs_run_id``)的 inputs 是父 run 的,本图的声明管不到它们。"""
+    """子代(``_child_config`` 写 ``child_run`` 与 ``inputs_run_id``)的 inputs 是父 run 的,
+    本图的声明管不到它们。"""
+    tool, registry, llm = _one_exec_python_call(f"get('{RETYPED}')")
+    audit = _RecordingAuditLogger()
+    state = await _run(
+        llm,
+        registry,
+        inputs={"org_logo": LOGO},
+        audit=audit,
+        trusted=TRUSTED_LOGO,
+        extra_configurable={"child_run": True, "inputs_run_id": str(uuid4())},
+    )
+
+    assert tool.calls == []
+    content = _tool_messages(state)["tc-1"].content
+    assert content.startswith("[blocked]")
+    assert "org_logo.png" not in content
+    assert RETYPED not in content
+
+
+async def test_main_run_continuation_with_inputs_run_id_keeps_the_link_name() -> None:
+    """主 run 的审批续跑 / 复活续跑也带 ``inputs_run_id``,但不是子代:照常写链接名。"""
     tool, registry, llm = _one_exec_python_call(f"get('{RETYPED}')")
     audit = _RecordingAuditLogger()
     state = await _run(
@@ -289,10 +318,107 @@ async def test_inherited_inputs_in_a_child_run_are_treated_as_untrusted() -> Non
     )
 
     assert tool.calls == []
-    content = _tool_messages(state)["tc-1"].content
-    assert content.startswith("[blocked]")
-    assert "org_logo.png" not in content
-    assert RETYPED not in content
+    assert "$EXPERT_WORK_INPUTS_DIR/org_logo.png" in _tool_messages(state)["tc-1"].content
+
+
+# --- 下一步模型看到的恢复提示:要它改调用,不是等审批。
+
+
+async def test_next_step_advisory_tells_the_model_to_fix_the_call() -> None:
+    tool, registry, llm = _one_exec_python_call(f"get('{RETYPED}')")
+    await _run(
+        llm,
+        registry,
+        inputs={"org_logo": LOGO},
+        audit=_RecordingAuditLogger(),
+        trusted=TRUSTED_LOGO,
+    )
+
+    assert tool.calls == []
+    advisories = [
+        str(m.content)
+        for m in llm.seen[1]
+        if isinstance(m, HumanMessage) and "<recovery-advisory>" in str(m.content)
+    ]
+    assert len(advisories) == 1
+    advisory = advisories[0]
+    assert "- exec_python [invalid_arguments]: input_url_retyped" in advisory
+    assert "do not repeat the identical call" in advisory
+    lowered = advisory.lower()
+    for wrong in ("approval", "wait", "bypass", "blocked_by_policy"):
+        assert wrong not in lowered
+
+
+def _blocked_count(tool: str) -> float:
+    return (
+        REGISTRY.get_sample_value(
+            "expert_work_tool_call_total", labels={"tool": tool, "outcome": "blocked"}
+        )
+        or 0.0
+    )
+
+
+def _latency_count(tool: str) -> float:
+    return (
+        REGISTRY.get_sample_value("expert_work_tool_latency_seconds_count", labels={"tool": tool})
+        or 0.0
+    )
+
+
+async def test_guard_hit_counts_as_blocked_without_a_latency_sample() -> None:
+    """没有派发就没有耗时:只记 blocked 计数,不往延迟直方图里塞 0 秒样本。"""
+    tool, registry, llm = _one_exec_python_call(f"get('{RETYPED}')")
+    blocked_before = _blocked_count("exec_python")
+    latency_before = _latency_count("exec_python")
+    await _run(llm, registry, inputs={"org_logo": LOGO}, audit=_RecordingAuditLogger())
+
+    assert tool.calls == []
+    assert _blocked_count("exec_python") == blocked_before + 1
+    assert _latency_count("exec_python") == latency_before
+
+
+# --- 既要审批又被守卫命中:批准后续跑仍然拦下(裁定 5 的已知代价)。
+
+
+async def test_approved_call_is_still_blocked_on_resume() -> None:
+    tool, registry, llm = _one_exec_python_call(f"get('{RETYPED}')")
+    audit = _RecordingAuditLogger()
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm,
+                tool_registry=registry,
+                approval_required_tools=frozenset({"exec_python"}),
+                trusted_input_names=TRUSTED_LOGO,
+            )
+        )
+        cfg: RunnableConfig = {
+            "configurable": {
+                "thread_id": str(uuid4()),
+                "tenant_id": str(uuid4()),
+                "run_id": str(uuid4()),
+                PROMPT_INPUTS_KEY: {"org_logo": LOGO},
+                AUDIT_LOGGER_KEY: audit,
+            }
+        }
+        paused = await compiled.ainvoke(
+            {"messages": [HumanMessage(content="start")], "step_count": 0, "max_steps": 5},
+            config=cfg,
+        )
+        assert paused.get("pending_approval") is not None
+        assert tool.calls == [] and audit.entries == []
+        await compiled.aupdate_state(
+            cfg,
+            {"pending_approval": None, "approval_resume": {"decision": "approve"}},
+            as_node="agent",
+        )
+        state = await compiled.ainvoke(None, config=cfg)
+
+    assert tool.calls == []
+    assert _tool_messages(state)["tc-1"].content.startswith("[blocked]")
+    actions = [e.action.value for e in audit.entries]
+    assert actions.count("tool:blocked") == 1
+    assert "tool:call" not in actions
 
 
 # --- 构建层:agent_factory 只把声明为 trusted 的变量名交给图。
