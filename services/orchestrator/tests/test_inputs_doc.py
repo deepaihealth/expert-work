@@ -312,9 +312,10 @@ def test_link_names_never_take_the_platform_manifest_names() -> None:
 
 def test_numbering_never_lands_on_a_name_already_taken() -> None:
     """键 ``a`` / ``a!`` / ``a-2``:第二个顺延成 ``v.a-2.png``,第三个自己就叫这个名字 ——
-    按「同 stem 计数」顺延会让两个 site 共用一个链接。"""
-    sites = [((key,), f"https://x/{i}.png", None) for i, key in enumerate(["a", "a!", "a-2"])]
-    assert link_names("v", sites) == ["v.a.png", "v.a-2.png", "v.a-2-2.png"]
+    按「同 stem 计数」顺延会让两个 site 共用一个链接。第四个 ``a?`` 要连跳两次才落到空位。"""
+    keys = ["a", "a!", "a-2", "a?"]
+    sites = [((key,), f"https://x/{i}.png", None) for i, key in enumerate(keys)]
+    assert link_names("v", sites) == ["v.a.png", "v.a-2.png", "v.a-2-2.png", "v.a-3.png"]
 
 
 def _nested(inner: Any, levels: int) -> Any:

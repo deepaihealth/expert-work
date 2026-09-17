@@ -764,8 +764,13 @@ _NAME_CORPUS: list[tuple[str, Any, list[str]]] = [
     ("inputs", {"json": "https://x/i.tmp"}, ["inputs.json-2.tmp"]),
     (
         "dup",
-        {"a": "https://x/1.png", "a!": "https://x/2.png", "a-2": "https://x/3.png"},
-        ["dup.a.png", "dup.a-2.png", "dup.a-2-2.png"],
+        {
+            "a": "https://x/1.png",
+            "a!": "https://x/2.png",
+            "a-2": "https://x/3.png",
+            "a?": "https://x/4.png",
+        },
+        ["dup.a.png", "dup.a-2.png", "dup.a-2-2.png", "dup.a-3.png"],
     ),
     ("at_bound", _AT_DEPTH_BOUND, ["at_bound/0.png"]),
     ("too_deep", [_AT_DEPTH_BOUND], []),
@@ -967,8 +972,9 @@ def test_sandbox_link_names_skip_the_manifest_names_and_names_already_taken() ->
         (["a"], "https://x/1.png", None),
         (["a!"], "https://x/2.png", None),
         (["a-2"], "https://x/3.png", None),
+        (["a?"], "https://x/4.png", None),
     ]
-    assert _link_names("v", sites) == ["v.a.png", "v.a-2.png", "v.a-2-2.png"]
+    assert _link_names("v", sites) == ["v.a.png", "v.a-2.png", "v.a-2-2.png", "v.a-3.png"]
 
 
 def test_reserved_names_are_the_files_the_script_writes_and_match_the_host(
