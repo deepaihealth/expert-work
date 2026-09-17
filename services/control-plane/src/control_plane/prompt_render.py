@@ -13,10 +13,11 @@ substitution (shared nonce with the model-side tool/RAG channels);
 
 B-67 §五 —— 本轮传了的变量,值先过 :func:`render_value`,**按值的形态**决定放什么进
 模板:``render: raw`` → 原值;URL → 本地链接路径;列表 / 对象 / 可解析的 JSON 字符串里有
-URL → 逐项「说明 → 路径」;其它 → 原值(今天行为)。被绑定的变量同样按形态渲染 —— 绑定
-是逐工具的,漏绑的工具还要从提示词里拿值;绑定状态由「本轮输入」段报告。没传的变量取
-今天的值,不走形态渲染。渲染早于预拉,所以这里只做字符串替换 —— 不发网、不读盘、不等
-下载结果;名字由 ``inputs_doc.link_names`` 决定,与预拉建出来的链接逐字相同。
+URL → 逐项「说明 → 路径」(trusted 的真 list / dict 保留结构,URL 换成路径);其它 → 原值
+(今天行为)。被绑定的变量同样按形态渲染 —— 绑定是逐工具的,漏绑的工具还要从提示词里
+拿值;绑定状态由「本轮输入」段报告。没传的变量取今天的值,不走形态渲染。渲染早于预拉,
+所以这里只做字符串替换 —— 不发网、不读盘、不等下载结果;名字由 ``inputs_doc.link_names``
+决定,与预拉建出来的链接逐字相同。
 """
 
 from __future__ import annotations
@@ -127,6 +128,47 @@ def _render_items(var: Any, root: Any, sites: list[LinkedSite], *, nonce: str | 
     return f"\n{body}\n{URL_NOTE}"
 
 
+class _ReferencedList(list[Any]):
+    """trusted 的真 list 里有 URL:下标 / 遍历 / ``length`` / ``tojson`` 看到的是 URL 已换成
+    路径的副本,``{{ x }}`` 直接输出时是逐项块(与 :func:`_render_items` 逐字相同)。"""
+
+    __slots__ = ("_block_text",)
+
+    def __init__(self, items: list[Any], block_text: str) -> None:
+        super().__init__(items)
+        self._block_text = block_text
+
+    def __str__(self) -> str:
+        return self._block_text
+
+
+class _ReferencedDict(dict[Any, Any]):
+    """:class:`_ReferencedList` 的对象版(``{{ x.name }}`` / ``x['logo']`` 照常取)。"""
+
+    __slots__ = ("_block_text",)
+
+    def __init__(self, items: dict[Any, Any], block_text: str) -> None:
+        super().__init__(items)
+        self._block_text = block_text
+
+    def __str__(self) -> str:
+        return self._block_text
+
+
+def _with_paths(
+    value: Any, prefix: tuple[str | int, ...], paths: Mapping[tuple[str | int, ...], str]
+) -> Any:
+    """``value`` 的新副本(不改原值),``paths`` 里每个位置换成对应的链接路径。位置写法与
+    ``inputs_doc._walk`` 相同:对象键取 ``str``,列表取下标。深度已由 ``linked_sites`` 限住。"""
+    if prefix in paths:
+        return paths[prefix]
+    if isinstance(value, Mapping):
+        return {k: _with_paths(v, (*prefix, str(k)), paths) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_with_paths(v, (*prefix, i), paths) for i, v in enumerate(value)]
+    return value
+
+
 def _render_url(var: Any, raw: str, link: str, *, nonce: str | None) -> str:
     """以 URL 开头的字符串:URL(第一段非空白)换成链接路径,后面的说明文字照留。
 
@@ -149,7 +191,9 @@ def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
     返回 ``(值, 是否走了引用渲染)``,第二项只给日志用。
 
     只做字符串替换:不发网、不读盘、不等预拉 —— 路径由名字决定,不由下载决定。
-    ``trusted: false`` 时路径也在围栏里(它由租户数据推出),尾注是平台文本,不围栏(裁定 P8)。
+    trusted 的真 list / dict 返回保留结构的副本(:class:`_ReferencedList`),其它引用渲染
+    返回字符串。``trusted: false`` 时路径也在围栏里(它由租户数据推出),尾注是平台文本,
+    不围栏(裁定 P8)。
     已知代价:模板对被改写的值做**内容比较**(``{{ 'x' if org_logo == '…' }}``)会失真;
     ``| default('')`` 这类**存在性**判断照旧成立(改写后的字符串非空)。
     """
@@ -162,7 +206,16 @@ def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
         # 值以 URL 开头:名字确定,不等预拉。
         return _render_url(var, raw, sites[0].link, nonce=nonce), True
     parsed = parse_json_value(raw)
-    return _render_items(var, parsed if parsed is not None else raw, sites, nonce=nonce), True
+    block = _render_items(var, parsed if parsed is not None else raw, sites, nonce=nonce)
+    if not var.trusted or isinstance(raw, str):
+        # untrusted 与 JSON 字符串:改动前模板拿到的就是字符串,取不到结构 —— 给逐项块。
+        return block, True
+    # trusted 的真 list / dict:模板可能 ``{{ brand.name }}`` / ``{% for m in materials %}``,
+    # 给字符串会在建 run 之后渲染失败、``length`` 变成字数。结构照旧,URL 换成路径。
+    replaced = _with_paths(raw, (), {s.site.path: f"${INPUTS_DIR_ENV}/{s.link}" for s in sites})
+    if isinstance(raw, list):
+        return _ReferencedList(replaced, block), True
+    return _ReferencedDict(replaced, block), True
 
 
 def render_system_prompt(built: Any, inputs: dict[str, Any]) -> str:

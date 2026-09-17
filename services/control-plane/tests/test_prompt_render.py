@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 
 import pytest
@@ -390,6 +392,66 @@ def test_a_list_item_that_is_not_an_object_renders_index_and_paths_only() -> Non
     assert f"\n0. $EXPERT_WORK_INPUTS_DIR/m/0.png{_END}\n" in out
     assert f"1. d → $EXPERT_WORK_INPUTS_DIR/m/1-d.png{_END}\n" in out
     assert "0. 0 →" not in out
+
+
+_BRAND = {"name": "深护", "logo": "https://x/l.jpg", "extra": {"banner": "https://x/b.png"}}
+_BRAND_LOGO = "$EXPERT_WORK_INPUTS_DIR/brand.logo.jpg"
+_BRAND_BANNER = "$EXPERT_WORK_INPUTS_DIR/brand.extra.banner.png"
+_MATERIALS = [
+    {"description": "demo", "url": "https://x/a.mp4"},
+    {"description": "text only"},
+    {"description": "cover", "url": "https://x/c.png"},
+]
+_MATERIAL_0 = "$EXPERT_WORK_INPUTS_DIR/materials/0-demo.mp4"
+
+
+def _render_one(template: str, name: str, value: object, *, trusted: bool = True) -> str:
+    built = _jinja_built(template, (_Var(name, trusted=trusted),))
+    return render_system_prompt(built, {name: value})
+
+
+def test_a_trusted_dict_keeps_its_structure_with_paths_in_place_of_urls() -> None:
+    brand = deepcopy(_BRAND)
+    block = _render_one("{{ brand }}", "brand", brand)
+    assert block.startswith(f"\n- name: 深护\n- logo → {_BRAND_LOGO}{_END}\n")
+    assert block.endswith(URL_NOTE)
+    fields = "{{ brand.name }}|{{ brand.logo }}|{{ brand['logo'] }}|{{ brand.extra.banner }}"
+    expected = f"深护|{_BRAND_LOGO}|{_BRAND_LOGO}|{_BRAND_BANNER}"
+    assert _render_one(fields, "brand", brand) == expected
+    assert _render_one("{{ brand | length }}", "brand", brand) == str(len(_BRAND))
+    assert _render_one("{{ brand is mapping }}", "brand", brand) == "True"
+    as_json = _render_one("{{ brand | tojson }}", "brand", brand)
+    assert json.loads(as_json)["extra"] == {"banner": _BRAND_BANNER}
+    assert _BRAND_LOGO in as_json
+    assert "https://" not in as_json
+    assert brand == _BRAND, "调用方的值不可变"
+
+
+def test_a_trusted_list_keeps_its_structure_with_paths_in_place_of_urls() -> None:
+    materials = deepcopy(_MATERIALS)
+    block = _render_one("{{ materials }}", "materials", materials)
+    assert block.startswith(f"\n0. demo → {_MATERIAL_0}{_END}\n")
+    assert block.endswith(URL_NOTE)
+    indexed = "{{ materials[0].description }}|{{ materials[0].url }}"
+    assert _render_one(indexed, "materials", materials) == f"demo|{_MATERIAL_0}"
+    loop = "{% for m in materials %}[{{ m.description }}]{% endfor %}"
+    assert _render_one(loop, "materials", materials) == "[demo][text only][cover]"
+    assert _render_one("{{ materials | length }}", "materials", materials) == str(len(_MATERIALS))
+    as_json = _render_one("{{ materials | tojson }}", "materials", materials)
+    assert json.loads(as_json)[0] == {"description": "demo", "url": _MATERIAL_0}
+    assert _MATERIAL_0 in as_json
+    assert "https://" not in as_json
+    assert materials == _MATERIALS, "调用方的值不可变"
+
+
+def test_untrusted_and_json_string_containers_stay_a_string_block() -> None:
+    """这两种改动前在模板里就是字符串,取不到结构;保持逐项块(untrusted 整段围栏)。"""
+    as_string = json.dumps(_MATERIALS)
+    assert _render_one("{{ materials is string }}", "materials", as_string) == "True"
+    untrusted = _render_one("{{ brand is string }}", "brand", _BRAND, trusted=False)
+    assert untrusted == "True"
+    with pytest.raises(PromptRenderError):
+        _render_one("{{ brand.name }}", "brand", _BRAND, trusted=False)
 
 
 def test_short_text_and_unset_values_render_exactly_as_before() -> None:
