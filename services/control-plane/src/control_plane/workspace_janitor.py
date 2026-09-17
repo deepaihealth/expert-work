@@ -144,8 +144,12 @@ class _ReclaimPolicy:
 #: ``control_plane.turn_inputs`` 把 ``inputs_run_id`` 指回首段(孤儿复活是同一个 run)。
 #: 这条接线 2026-09-17 之前是缺的 —— 续跑段的 ``EXPERT_WORK_INPUTS`` 指向它自己的
 #: run_id,那里从来没有文件,这 30 天当时什么也没救下;现在由
-#: ``test_turn_inputs_carry.py`` 钉着。审批挂起的上限是 ``approval_timeout_s``(manifest
-#: 校验 ≤ 7 天,到点由超时 sweep 续跑),30 天盖得住(Codespaces 的 30 天是同一条先例)。
+#: ``test_turn_inputs_carry.py`` 钉着。**单次**审批挂起的上限是 ``approval_timeout_s``
+#: (manifest 校验 ≤ 7 天,到点由超时 sweep 续跑),30 天盖得住单次挂起(Codespaces 的 30 天
+#: 是同一条先例)。**但一轮里连着多次审批时时间是累加的**:每次挂起各自 ≤ 7 天,续跑都不刷新
+#: 首段目录的 mtime,几次挂起加上中间的执行时间超过 30 天,目录就被回收了 —— 之后的续跑段
+#: 读不到 ``inputs.json``,模型只能照提示词里的值办;被绑的工具参数不受影响(它们取自首段的
+#: ``system_prompt`` 帧,不读这个文件)。
 #: **抬它是安全的,理由不是「T11 去掉了乘数」**(那条只对逐字节相同的 URL 成立,见下),
 #: 而是这里躺的是几 KB 的 JSON:它**不是**会涨的那一半。
 _RUN_DIR_TTL_S = 30 * 24 * 3600
@@ -768,8 +772,8 @@ class WorkspaceJanitorWorker:
         这句话**只在「预拉写过之后 TTL 之内」成立,不等于「run 还活着就安全」**:写
         ``inputs/<run_id>/`` 的只有 START 侧的 inputs 节点,续跑不重新经过它(续跑段读的是
         这一轮首段的目录),于是一个等审批等了超过 :data:`_RUN_DIR_TTL_S` 的 run 回来时
-        文件已经没了。TTL 取 30 天就是为了让这个窗口盖住审批挂起的上限 —— 见
-        :data:`_RUN_DIR_TTL_S`。
+        文件已经没了。TTL 取 30 天盖得住单次审批挂起的上限(7 天);一轮里多次挂起是累加的,
+        可能超出 —— 见 :data:`_RUN_DIR_TTL_S`。
 
         ``now`` 取一次、整轮共用:同一轮里先后扫到的条目按同一条时间线判定。
         """
