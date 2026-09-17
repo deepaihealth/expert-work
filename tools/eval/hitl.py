@@ -35,7 +35,12 @@ import yaml
 from pydantic import ValidationError
 
 from expert_work.persistence import InMemoryApprovalStore
-from expert_work.protocol import ApprovalDecision, ApprovalRecord, ApprovalStatus
+from expert_work.protocol import (
+    ApprovalDecision,
+    ApprovalRecord,
+    ApprovalStatus,
+    canonical_args_digest,
+)
 from orchestrator.graph_builder._approval import (
     apply_resume_decision,
     build_approval_request,
@@ -153,23 +158,57 @@ async def _run_request_bogus_reason_kind_falls_back() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def _verdict(
+    calls: list[dict[str, Any]],
+    gated: frozenset[str],
+    decision: str,
+    modified_args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ``approval_resume`` the decide endpoint writes for this paused turn.
+
+    B-76 —— 续跑只放行裁定里那一条调用(``tool_call_index``);控制面总会把被批请求的
+    身份抄进来,``modify`` 的绑定摘要是改后参数的哈希。缺这些项的裁定按「无法证明来源」
+    什么都不放行,所以评测必须用端点实际写出的形状。
+    """
+    target = find_approval_target(calls, gated)
+    if target is None:
+        raise ValueError("the scripted turn has no gated call")
+    request = build_approval_request(target, thread_id="run-eval", timeout_s=60)
+    return {
+        "decision": decision,
+        "modified_args": modified_args,
+        "reason": None,
+        "binding_digest": (
+            canonical_args_digest(modified_args or {})
+            if decision == "modify"
+            else request.binding_digest
+        ),
+        "request_id": request.request_id,
+        "action_summary": request.action_summary,
+        "tool_call_id": request.tool_call_id,
+        "tool_call_index": request.tool_call_index,
+    }
+
+
 async def _run_resume_approve_dispatches() -> tuple[bool, str]:
     calls = [_tc("send_email", {"to": "x"})]
-    outcome = apply_resume_decision(
-        calls, frozenset({"send_email"}), {"decision": "approve", "modified_args": None}
-    )
-    if outcome.reject_messages or len(outcome.tool_calls) != 1:
-        return False, "approve should dispatch the call, no rejection"
+    gated = frozenset({"send_email"})
+    outcome = apply_resume_decision(calls, gated, _verdict(calls, gated, "approve"))
+    if outcome.reject_messages or outcome.withheld or outcome.answered:
+        return False, "approve should release the approved call, nothing withheld"
+    if [call["args"] for call in outcome.tool_calls] != [{"to": "x"}]:
+        return False, f"approve should dispatch the call unchanged: {outcome.tool_calls}"
     return True, ""
 
 
 async def _run_resume_modify_rewrites_args() -> tuple[bool, str]:
     calls = [_tc("send_email", {"to": "danger@evil.com"})]
+    gated = frozenset({"send_email"})
     outcome = apply_resume_decision(
-        calls,
-        frozenset({"send_email"}),
-        {"decision": "modify", "modified_args": {"to": "safe@example.com"}},
+        calls, gated, _verdict(calls, gated, "modify", {"to": "safe@example.com"})
     )
+    if outcome.reject_messages or outcome.withheld:
+        return False, "modify should release the approved call, nothing withheld"
     if outcome.tool_calls[0]["args"] != {"to": "safe@example.com"}:
         return False, f"modify did not rewrite args: {outcome.tool_calls[0]['args']}"
     return True, ""

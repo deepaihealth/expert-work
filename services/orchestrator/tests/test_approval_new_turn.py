@@ -613,9 +613,10 @@ def test_verdict_identity_checks_each_part() -> None:
     ):
         outcome = apply_resume_decision(calls, gated, bad, turn_run_id=run_id)
         assert outcome.binding_drift and outcome.terminal and outcome.tool_calls == []
-    # 旧裁定(没有身份)与没有 run 戳的旧消息:跳过核对,行为不变。
-    legacy = {"decision": "approve"}
-    assert apply_resume_decision(calls, gated, legacy, turn_run_id="run-b").tool_calls
+    # 旧裁定(没有身份)与没有 run 戳的旧消息:跳过身份核对,不按漂移处理。旧裁定还
+    # 没有绑定摘要,证明不了请求是声明式的,所以什么都不放行(B-76)。
+    legacy = apply_resume_decision(calls, gated, {"decision": "approve"}, turn_run_id="run-b")
+    assert not legacy.binding_drift and set(legacy.withheld) == {0}
     no_stamp = {k: v for k, v in good.items() if k not in ("tool_call_id", "tool_call_index")}
     assert not apply_resume_decision(calls, gated, no_stamp, turn_run_id=None).binding_drift
 

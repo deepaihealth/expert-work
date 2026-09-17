@@ -28,6 +28,7 @@ from orchestrator import (
     ToolResult,
     ToolSpec,
     build_react_graph,
+    pending_request_binding,
 )
 from orchestrator.context import render_plan_md
 from orchestrator.graph_builder import make_workspace_ingest_node
@@ -143,10 +144,14 @@ async def _pause_edit_resume(
         assert paused.get("pending_approval") is not None
         # The human edits PLAN.md while the run is paused.
         client.outcome = _read_envelope(render_plan_md(_edited_plan()))
-        # The resume endpoint's move: verdict in, re-positioned at agent.
+        # The resume endpoint's move: verdict in (with the mint's digest and the
+        # request's identity), re-positioned at agent.
+        binding = pending_request_binding((await compiled.aget_state(cfg)).values)
+        assert binding is not None
+        verdict = {"binding_digest": paused["pending_approval"].binding_digest, **binding, **resume}
         await compiled.aupdate_state(
             cfg,
-            {"pending_approval": None, "approval_resume": resume},
+            {"pending_approval": None, "approval_resume": verdict},
             as_node="agent",
         )
         final = await compiled.ainvoke(None, config=cfg)

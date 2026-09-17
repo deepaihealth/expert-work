@@ -27,6 +27,7 @@ from orchestrator import (
     ToolSpec,
     build_agent,
     build_react_graph,
+    pending_request_binding,
 )
 from orchestrator.graph_builder._config import AUDIT_LOGGER_KEY
 from orchestrator.sse import PROMPT_INPUTS_KEY
@@ -459,9 +460,16 @@ async def test_approved_call_is_still_blocked_on_resume() -> None:
         )
         assert paused.get("pending_approval") is not None
         assert tool.calls == [] and audit.entries == []
+        binding = pending_request_binding((await compiled.aget_state(cfg)).values)
+        assert binding is not None
+        verdict = {
+            "decision": "approve",
+            "binding_digest": paused["pending_approval"].binding_digest,
+            **binding,
+        }
         await compiled.aupdate_state(
             cfg,
-            {"pending_approval": None, "approval_resume": {"decision": "approve"}},
+            {"pending_approval": None, "approval_resume": verdict},
             as_node="agent",
         )
         state = await compiled.ainvoke(None, config=cfg)
