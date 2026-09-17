@@ -24,7 +24,8 @@ from langchain_core.runnables import RunnableConfig
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
-from control_plane.api.runs import build_run_graph_input
+from control_plane.api.runs import build_run_graph_input, replay_graph_input
+from control_plane.inputs_block import is_inputs_block
 from control_plane.supersede import (
     MAX_SUPERSEDED_VERSIONS,
     SupersedeError,
@@ -36,6 +37,7 @@ from control_plane.supersede import (
 )
 from control_plane.transcript import extract_turns, read_messages
 from expert_work.common.conversation_channel import SUPERSEDED_BY, TOMBSTONE
+from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.approval import InMemoryApprovalStore
 from expert_work.persistence.database import (
     DatabaseConfig,
@@ -44,6 +46,7 @@ from expert_work.persistence.database import (
 )
 from expert_work.persistence.thread_message import InMemoryThreadMessageStore
 from expert_work.persistence.thread_meta import InMemoryThreadMetaStore
+from expert_work.protocol import PromptVariableSpec
 from expert_work.protocol.approval import ApprovalRecord, ApprovalStatus
 from expert_work.protocol.plan import Plan, PlanStep
 from expert_work.runtime.checkpointer import make_checkpointer
@@ -339,6 +342,80 @@ async def test_plan_reverts_to_none_when_first_turn_had_no_plan(
         assert (loc.start, loc.end) == (3, 8)
         assert loc.plan_before is None
         assert (await st.compiled.aget_state(_cfg(st.thread_id))).values.get("plan") is None
+
+
+@pytest.mark.asyncio
+async def test_regenerate_replays_the_inputs_block_of_a_jinja_turn(
+    postgres_container: PostgresContainer, engine: AsyncEngine
+) -> None:
+    """B-67 §六 —— jinja 轮的输入是 [System, Human, 隐藏「本轮输入」段]。真 checkpointer 上
+    取代它:隐藏段在被取代区间里、同样打标,``replay_messages`` 按下标 2 认出并带上它;
+    重放出来的新轮同形、隐藏段换成新 run 戳;对外视图里始终看不到它。"""
+    built = SimpleNamespace(
+        supports_vision=False,
+        spotlight_nonce=None,
+        max_steps=8,
+        max_no_progress=0,
+        system_prompt="unused",
+        prompt_jinja=True,
+        prompt_base="You are {{ who }}.",
+        prompt_suffix="",
+        prompt_variables=(PromptVariableSpec(name="who"),),
+        arg_bindings=(),
+    )
+    async with make_checkpointer("postgres", _sync_dsn(postgres_container)) as cp:
+        st = await _stack(
+            cp,
+            engine,
+            [*_turn_script(None, "A1"), *_turn_script(None, "A2"), *_turn_script(None, "A3")],
+        )
+        r1, r2, r3 = uuid4(), uuid4(), uuid4()
+
+        async def run(run_id: UUID, graph_input: dict[str, Any]) -> None:
+            cfg: RunnableConfig = {
+                "configurable": {**dict(_cfg(st.thread_id)["configurable"]), "run_id": str(run_id)}
+            }
+            async for _ in st.compiled.astream(graph_input, cfg, stream_mode="updates"):
+                pass
+
+        for rid, text in ((r1, "U1"), (r2, "U2")):
+            gi = build_run_graph_input(
+                built,
+                input_text=text,
+                image_refs=[],
+                untrusted_content=None,
+                inputs={"who": "tester"},
+                run_id=rid,
+            )
+            await run(rid, gi)
+            await st.add_run_row(rid, status=RunStatus.SUCCESS)
+        assert len(await st.messages()) == 8  # 每轮 System / Human / 隐藏段 / AI
+
+        result = await st.supersede(r2, r3)
+
+        assert (result.location.start, result.location.end) == (4, 8)
+        assert _marks(await st.messages()) == [None] * 4 + [str(r3)] * 4
+        replay = result.replay_messages
+        assert replay is not None and len(replay) == 3
+        assert is_inputs_block(replay[2])
+        assert replay[2].additional_kwargs[STAMP_RUN_ID] == str(r2)
+        assert SUPERSEDED_BY not in replay[2].additional_kwargs  # 打标之前的原件
+
+        await run(r3, replay_graph_input(built, replay, run_id=r3))
+        await st.add_run_row(r3, status=RunStatus.SUCCESS, regenerated_from=r2)
+        after = await st.messages()
+        new = after[8:]
+        assert [type(m).__name__ for m in new] == [
+            "SystemMessage",
+            "HumanMessage",
+            "HumanMessage",
+            "AIMessage",
+        ]
+        assert is_inputs_block(new[2]) and new[2].content == replay[2].content
+        assert new[2].additional_kwargs[STAMP_RUN_ID] == str(r3)
+        assert new[2].id != replay[2].id
+        visible = extract_turns(after, include_hidden=False, include_superseded=False)
+        assert [t.content for t in visible] == ["U1", "A1", "U2", "A3"]
 
 
 # ---------------------------------------------------------------------------
