@@ -210,6 +210,44 @@ async def test_sweep_does_not_resume_a_disabled_agent() -> None:
     assert row is not None and row.status is ApprovalStatus.PENDING
 
 
+class _FlakyBuildRuntime(_FakeRuntime):
+    """第一次构建抛一个不是 ``AgentFactoryError`` 的异常(连接断、配置读坏之类)。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.builds = 0
+
+    async def get_agent(self, **kw: object) -> SimpleNamespace:
+        self.builds += 1
+        if self.builds == 1:
+            raise RuntimeError("upstream connection reset")
+        return await super().get_agent(**kw)
+
+
+@pytest.mark.asyncio
+async def test_one_row_failing_to_build_does_not_stop_the_rest() -> None:
+    # B-77 —— 构建挪到 CAS 之前以后,构建失败的那行保持 PENDING;若异常冲出逐行处理,
+    # 每一轮都停在这同一行(按过期时间排第一),后面的过期审批永远得不到处理。
+    approvals = InMemoryApprovalStore()
+    stuck_run, next_run = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    await approvals.create(_approval(stuck_run, uuid4(), timeout_at=now - timedelta(minutes=2)))
+    await approvals.create(_approval(next_run, uuid4(), timeout_at=now - timedelta(minutes=1)))
+
+    runtime = _FlakyBuildRuntime()
+    swept = await _sweep(approvals, runtime).run_once()
+
+    assert swept == 1
+    stuck = await approvals.get_by_run(run_id=stuck_run, tenant_id=_TENANT)
+    done = await approvals.get_by_run(run_id=next_run, tenant_id=_TENANT)
+    assert stuck is not None and stuck.status is ApprovalStatus.PENDING
+    assert done is not None and done.status is ApprovalStatus.TIMEOUT
+    # 失败那行下一轮照常重试。
+    assert await _sweep(approvals, runtime).run_once() == 1
+    stuck = await approvals.get_by_run(run_id=stuck_run, tenant_id=_TENANT)
+    assert stuck is not None and stuck.status is ApprovalStatus.TIMEOUT
+
+
 @pytest.mark.asyncio
 async def test_sweep_skips_not_yet_expired() -> None:
     approvals = InMemoryApprovalStore()
