@@ -44,6 +44,10 @@ INPUTS_FILENAME = "inputs.json"
 #: B-67 §4.3 —— 字符串值尝试当 JSON 解析的上限(UTF-8 字节),与 read_document 的
 #: 内联上限同数量级,防 CPU。
 MAX_PARSE_BYTES = 64 * 1024
+#: 容器嵌套层数上限(最外层算第 1 层)。更深的值不解析、不扫 URL、不命名:递归的 walker
+#: 在几 KB 的 ``[[[…]]]`` 上就会 ``RecursionError``,而正常契约(列表套对象)只有两三层。
+#: 检查本身是迭代的(:func:`_too_deep`)。沙箱侧 ``prefetch_script.MAX_PARSE_DEPTH`` 同值。
+MAX_PARSE_DEPTH = 32
 #: 文档里存解析结果的键;``value`` 原样保留(契约不变)。
 PARSED_KEY = "value_parsed"
 #: 链接名里 slug 取 description 的前多少个字。
@@ -54,6 +58,12 @@ SLUG_MAX_CHARS = 40
 _SLUG_DROP = re.compile(r"[^\w-]")
 #: 链接名的扩展名:只认 URL 路径后缀,且形状受限。cache 文件名照旧走 ``pick_suffix``。
 _EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
+#: 链接名不许占用的名字 —— run 目录里平台自己的文件:清单本身,与沙箱预拉脚本原子改写
+#: 清单时用的临时文件(``prefetch_script._rewrite`` 的 ``.tmp``)。变量叫 ``inputs`` 就拼
+#: 得出这两个名字;占了,建链接会删掉清单,或 ``_rewrite`` 顺着链接把整份清单写进按 agent
+#: 共享的缓存条目,下一个 run 命中缓存就读到它。沙箱侧 ``prefetch_script._RESERVED_NAMES``
+#: 同值(等价测试钉住)。
+_RESERVED_NAMES = frozenset({INPUTS_FILENAME, f"{INPUTS_FILENAME}.tmp"})
 
 
 def inputs_rel_dir(run_id: UUID) -> str:
@@ -111,9 +121,28 @@ def parse_json_value(value: Any) -> list[Any] | dict[str, Any] | None:
         return None
     try:
         parsed = json.loads(value)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # 足够深的 ``[[[…]]]`` 让 json.loads 自己抛 RecursionError(不是 ValueError)。
         return None
-    return parsed if isinstance(parsed, list | dict) else None
+    if not isinstance(parsed, list | dict) or _too_deep(parsed):
+        return None
+    return parsed
+
+
+def _too_deep(value: Any) -> bool:
+    """容器嵌套超过 :data:`MAX_PARSE_DEPTH` 层吗?**迭代**实现:要挡的正是会让递归炸掉的
+    输入,检查本身不能再递归。"""
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, Mapping):
+            item = list(item.values())
+        if not isinstance(item, list):
+            continue
+        if depth >= MAX_PARSE_DEPTH:
+            return True
+        stack.extend((child, depth + 1) for child in item)
+    return False
 
 
 def root_key(entry: Mapping[str, Any]) -> str:
@@ -169,16 +198,23 @@ def link_names(
     """一个变量全部 site 的链接名,按 site 顺序;撞名按出现顺序加 ``-2`` / ``-3``(插在
     扩展名之前)。``sites`` 每项 ``(path, url, description)``。
 
+    撞名看的是**已经发出去的全部名字**加 :data:`_RESERVED_NAMES`,不是「同 stem 出现过
+    几次」:键 ``a`` / ``a!`` / ``a-2`` 下,顺延出来的 ``a-2`` 会与第三个键自己的名字相撞。
+
     **这是链接名的唯一算法**:渲染层(control-plane)、「本轮输入」段、守卫提示、宿主侧
     site 枚举都调它;沙箱脚本 ``prefetch_script._link_names`` 是逐字复制,等价测试钉住。
     """
-    seen: dict[str, int] = {}
+    taken = set(_RESERVED_NAMES)
     out: list[str] = []
     for path, url, description in sites:
         stem, ext = _link_stem(var_name, path, description), url_suffix(url)
-        count = seen.get(stem + ext, 0) + 1
-        seen[stem + ext] = count
-        out.append(f"{stem}{ext}" if count == 1 else f"{stem}-{count}{ext}")
+        name = stem + ext
+        n = 1
+        while name in taken:
+            n += 1
+            name = f"{stem}-{n}{ext}"
+        taken.add(name)
+        out.append(name)
     return out
 
 
@@ -194,10 +230,13 @@ def linked_sites(var_name: str, value: Any) -> list[LinkedSite]:
     """一个变量**原始值**的全部 URL site 及链接名(含 §4.3 的 JSON 字符串形态)。
 
     渲染层、「本轮输入」段、手抄守卫都从这里取候选 —— 与 inputs.json 里预拉脚本看到的
-    site 一字不差(同一个 walker、同一个命名)。
+    site 一字不差(同一个 walker、同一个命名)。嵌套超过 :data:`MAX_PARSE_DEPTH` 层的值
+    没有 site(不递归进去;沙箱脚本同样跳过它)。
     """
     parsed = parse_json_value(value)
     root = parsed if parsed is not None else value
+    if _too_deep(root):
+        return []
     found = _walk(root, (), assignable=True)
     names = link_names(var_name, [(path, url, site_description(root, path)) for path, url in found])
     return [
@@ -292,9 +331,16 @@ def _walk(
 
 
 def iter_url_sites(doc: Mapping[str, Any]) -> list[UrlSite]:
-    """文档里所有 http(s) URL 的位置,按变量声明顺序、深度优先。"""
+    """文档里所有 http(s) URL 的位置,按变量声明顺序、深度优先。
+
+    嵌套超过 :data:`MAX_PARSE_DEPTH` 层的变量跳过 —— 与 :func:`linked_sites`、沙箱脚本
+    同一道闸(调用方给的真 list 不经过 :func:`parse_json_value` 的深度检查)。
+    """
     sites: list[UrlSite] = []
     for name, entry in doc.get("variables", {}).items():
-        for path, url in _walk(entry.get(root_key(entry)), (), assignable=True):
+        root = entry.get(root_key(entry))
+        if _too_deep(root):
+            continue
+        for path, url in _walk(root, (), assignable=True):
             sites.append(UrlSite(var_name=name, path=path, url=url))
     return sites

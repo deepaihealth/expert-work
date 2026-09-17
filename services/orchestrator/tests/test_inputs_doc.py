@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 import pytest
 
 from expert_work.protocol import PromptVariableSpec
+from orchestrator.tools import inputs_doc
 from orchestrator.tools.inputs_doc import (
+    INPUTS_FILENAME,
     MAX_PARSE_BYTES,
+    MAX_PARSE_DEPTH,
     UrlSite,
     build_inputs_doc,
     inputs_abs_dir,
@@ -288,3 +292,76 @@ def test_linked_sites_from_a_raw_json_string_use_the_same_names() -> None:
 def test_inputs_abs_dir_is_the_run_dir_under_the_exec_view() -> None:
     assert inputs_abs_dir(RUN) == f"/workspace/inputs/{RUN}"
     assert inputs_abs_path(RUN).startswith(inputs_abs_dir(RUN) + "/")
+
+
+# ---------------------------------------------------------------------------
+# B-67 PR1 终审 —— 链接名不占平台文件名(F1)/ 顺延不撞名(F5)/ 深嵌套不炸 run(F2)
+# ---------------------------------------------------------------------------
+
+
+def test_link_names_never_take_the_platform_manifest_names() -> None:
+    """变量叫 ``inputs`` 是合法的。``inputs`` + ``.json``、``inputs.json`` + ``.tmp`` 恰好是
+    run 目录里的清单本身、和沙箱脚本原子改写清单用的临时文件:占了,建链接会删掉清单,或
+    ``_rewrite`` 顺着链接把整份清单写进按 agent 共享的缓存条目(跨 run 泄漏)。这两个名字
+    预先算「已占用」,撞上就按 ``-2`` 顺延。"""
+    assert inputs_doc._RESERVED_NAMES == {INPUTS_FILENAME, f"{INPUTS_FILENAME}.tmp"}
+    assert link_names("inputs", [((), "https://x/a.json", None)]) == ["inputs-2.json"]
+    assert link_names("inputs", [(("json",), "https://x/b.tmp", None)]) == ["inputs.json-2.tmp"]
+    assert [s.link for s in linked_sites("inputs", "https://x/a.json")] == ["inputs-2.json"]
+
+
+def test_numbering_never_lands_on_a_name_already_taken() -> None:
+    """键 ``a`` / ``a!`` / ``a-2``:第二个顺延成 ``v.a-2.png``,第三个自己就叫这个名字 ——
+    按「同 stem 计数」顺延会让两个 site 共用一个链接。"""
+    sites = [((key,), f"https://x/{i}.png", None) for i, key in enumerate(["a", "a!", "a-2"])]
+    assert link_names("v", sites) == ["v.a.png", "v.a-2.png", "v.a-2-2.png"]
+
+
+def _nested(inner: Any, levels: int) -> Any:
+    """把 ``inner`` 再包 ``levels`` 层列表。"""
+    for _ in range(levels):
+        inner = [inner]
+    return inner
+
+
+@pytest.mark.parametrize("depth", [MAX_PARSE_DEPTH + 1, 1200, 32_000])
+def test_a_json_string_nested_too_deep_is_not_parsed(depth: int) -> None:
+    """几 KB 的 ``[[[…]]]`` 在 64 KiB 解析上限之内,解析出来的值却让递归的
+    ``_null_local_paths`` / ``_walk`` ``RecursionError``(再深些 ``json.loads`` 自己就抛)
+    —— 整轮 run 跟着失败。超过 :data:`MAX_PARSE_DEPTH` 层一律不算 JSON 容器。"""
+    raw = "[" * depth + "]" * depth
+    assert len(raw.encode("utf-8")) <= MAX_PARSE_BYTES
+    assert parse_json_value(raw) is None
+    doc = build_inputs_doc(run_id=RUN, variables=[_var("a")], inputs={"a": raw})
+    assert doc is not None
+    assert "value_parsed" not in doc["variables"]["a"]
+    assert linked_sites("a", raw) == []
+
+
+def test_json_string_nesting_up_to_the_bound_is_still_parsed() -> None:
+    """边界:恰好 :data:`MAX_PARSE_DEPTH` 层容器(最里层的对象也算一层)照常解析、照常命名。"""
+    raw = "[" * (MAX_PARSE_DEPTH - 1) + '{"url": "https://x/a.png"}' + "]" * (MAX_PARSE_DEPTH - 1)
+    assert parse_json_value(raw) is not None
+    assert [s.link for s in linked_sites("a", raw)] == ["a/0.png"]
+    deeper = "[" + raw + "]"
+    assert parse_json_value(deeper) is None
+    assert linked_sites("a", deeper) == []
+
+
+def test_a_real_value_nested_too_deep_yields_no_sites() -> None:
+    """同一道闸对调用方直接给的 list / dict 也成立:渲染层与守卫会在 run 创建 / 每次
+    exec 对**原始值**调 ``linked_sites``,那里不能递归爆栈;清单侧的 ``iter_url_sites``
+    与沙箱脚本同样不扫它(两边说的站点必须是同一组)。"""
+    shallow = _nested({"url": "https://x/a.png"}, MAX_PARSE_DEPTH - 1)
+    deep = [shallow]
+    assert [s.link for s in linked_sites("a", shallow)] == ["a/0.png"]
+    assert linked_sites("a", deep) == []
+    assert linked_sites("a", _nested({"url": "https://x/a.png"}, 1200)) == []
+    doc = {
+        "variables": {
+            "deep": {"value": deep, "trusted": True},
+            "very_deep": {"value": _nested([], 1200), "trusted": True},
+            "ok": {"value": shallow, "trusted": True},
+        }
+    }
+    assert [site.var_name for site in iter_url_sites(doc)] == ["ok"]

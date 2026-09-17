@@ -41,15 +41,23 @@ MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
 TIMEOUT_S = 30
 
-#: B-67 —— 下面四个常量 + 六个函数与宿主侧 ``orchestrator.tools.inputs_doc`` **逐字同义**
-#: (``PARSED_KEY`` / ``SLUG_MAX_CHARS`` / ``_SLUG_DROP`` / ``_EXT_RE`` / ``_url_suffix`` /
-#: ``_slugify`` / ``_site_description`` / ``_link_stem`` / ``_link_names`` / ``_root_key``)。
-#: 这里不能 import 那边,只能复制;``test_link_names_match_the_host_side_implementation``
-#: 钉住两边同义 —— 提示词里说的名字必须就是这里建出来的链接名。
+#: B-67 —— 下面这组常量与函数与宿主侧 ``orchestrator.tools.inputs_doc`` **逐字同义**
+#: (常量 ``PARSED_KEY`` / ``SLUG_MAX_CHARS`` / ``MAX_PARSE_DEPTH`` / ``_SLUG_DROP`` /
+#: ``_EXT_RE`` / ``_RESERVED_NAMES``;函数 ``_url_suffix`` / ``_slugify`` /
+#: ``_site_description`` / ``_link_stem`` / ``_link_names`` / ``_root_key`` / ``_too_deep``)。
+#: 这里不能 import 那边,只能复制;``test_copied_helpers_are_the_host_algorithm``(语法树逐个
+#: 比对)与 ``test_link_names_match_the_host_side_implementation``(行为语料)钉住两边同义
+#: —— 提示词里说的名字必须就是这里建出来的链接名。
 PARSED_KEY = "value_parsed"
 SLUG_MAX_CHARS = 40
+MAX_PARSE_DEPTH = 32
 _SLUG_DROP = re.compile(r"[^\w-]")
 _EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
+#: 本脚本在 run 目录里自己写的两个文件:清单(宿主给的路径,文件名恒为 ``inputs.json``)
+#: 与 :func:`_rewrite` 的临时文件。链接名绝不能占用它们。
+_MANIFEST_NAME = "inputs.json"
+_REWRITE_SUFFIX = ".tmp"
+_RESERVED_NAMES = frozenset({_MANIFEST_NAME, _MANIFEST_NAME + _REWRITE_SUFFIX})
 
 
 def _url_suffix(url: str) -> str:
@@ -88,13 +96,17 @@ def _link_stem(var_name: str, path: list[str | int], description: str | None) ->
 
 
 def _link_names(var_name: str, sites: list[tuple[list[str | int], str, str | None]]) -> list[str]:
-    seen: dict[str, int] = {}
+    taken = set(_RESERVED_NAMES)
     out: list[str] = []
     for path, url, description in sites:
         stem, ext = _link_stem(var_name, path, description), _url_suffix(url)
-        count = seen.get(stem + ext, 0) + 1
-        seen[stem + ext] = count
-        out.append(f"{stem}{ext}" if count == 1 else f"{stem}-{count}{ext}")
+        name = stem + ext
+        n = 1
+        while name in taken:
+            n += 1
+            name = f"{stem}-{n}{ext}"
+        taken.add(name)
+        out.append(name)
     return out
 
 
@@ -102,24 +114,79 @@ def _root_key(entry: dict[str, Any]) -> str:
     return PARSED_KEY if PARSED_KEY in entry else "value"
 
 
+def _too_deep(value: Any) -> bool:
+    stack = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, dict):
+            item = list(item.values())
+        if not isinstance(item, list):
+            continue
+        if depth >= MAX_PARSE_DEPTH:
+            return True
+        stack.extend((child, depth + 1) for child in item)
+    return False
+
+
+def _linked_sites(var_name: str, value: Any) -> list[tuple[list[str | int], str, str]]:
+    """一个变量(``value`` 是 ``_root_key`` 选中的那一份)的 site 与链接名 ——
+    宿主 ``inputs_doc.linked_sites`` 在沙箱里的对应物。嵌套过深的值没有 site,与宿主同一道闸。
+    """
+    if _too_deep(value):
+        return []
+    found = _sites(value, [])
+    names = _link_names(
+        var_name, [(path, url, _site_description(value, path)) for path, url in found]
+    )
+    return [(path, url, name) for (path, url), name in zip(found, names, strict=True)]
+
+
+def _inside_run_dir(run_dir: str, link_path: str) -> bool:
+    """``link_path`` 所在目录解析后仍在 run 目录里吗?
+
+    沙箱代码能把 ``run/m`` 换成指向别处的目录链接;跟着它删 / 建,就是在 run 目录之外
+    删文件、放链接。只有解析后仍在 run 目录里,本脚本才动那个位置。
+    """
+    real_run = os.path.realpath(run_dir)
+    real_parent = os.path.realpath(os.path.dirname(link_path))
+    return os.path.commonpath([real_run, real_parent]) == real_run
+
+
 def _link(run_dir: str, name: str, cache_dir: str, filename: str) -> str | None:
     """在 run 目录里建 ``name -> ../cache/<filename>`` 的**相对**符号链接;失败返回 ``None``。
 
     相对目标:NAS 视角与沙箱 ``/workspace`` 视角下都成立(exec view 是 agent 目录的 bind)。
-    先删后建:``os.symlink`` 到已存在路径会 ``FileExistsError``(续跑 / 同 run 再预拉)。
-    ``name`` 可能带子目录(``materials/0-x.mp4``),父目录顺手建。任何 OSError 都只是
-    「没建成」—— 调用方回落到 cache 路径,预拉不让 run 失败。
+    ``name`` 可能带子目录(``materials/0-x.mp4``),父目录顺手建。
+
+    **只替换符号链接**:``os.symlink`` 到已存在路径会 ``FileExistsError``,所以同名的旧
+    链接(续跑 / 同 run 再预拉)先删后建;同名的普通文件 / 目录不是本脚本建的,不删,返回
+    ``None``。父目录解析后跑出 run 目录(沙箱代码种的目录链接)同样返回 ``None``。任何
+    OSError 都只是「没建成」—— 调用方回落到 cache 路径,预拉不让 run 失败。
     """
     link_path = os.path.join(run_dir, name)
     target = os.path.relpath(os.path.join(cache_dir, filename), start=os.path.dirname(link_path))
     try:
         os.makedirs(os.path.dirname(link_path), exist_ok=True)
+        if not _inside_run_dir(run_dir, link_path):
+            return None
         if os.path.lexists(link_path):
+            if not os.path.islink(link_path):
+                return None
             os.unlink(link_path)
         os.symlink(target, link_path)
     except OSError:
         return None
     return name
+
+
+def _unlink_stale(run_dir: str, name: str) -> None:
+    """这次没拉到:删掉更早一次预拉在 ``name`` 上留下的链接,别让它与 null 的
+    ``local_path`` 并存。只删 run 目录里的符号链接;失败不外抛(``local_path`` 照样要写 null)。
+    """
+    link_path = os.path.join(run_dir, name)
+    with contextlib.suppress(OSError):
+        if _inside_run_dir(run_dir, link_path) and os.path.islink(link_path):
+            os.unlink(link_path)
 
 
 #: 共享缓存目录名,挂在 ``inputs/`` 下、与 ``<run_id>/`` 平级。
@@ -320,7 +387,7 @@ def _rewrite(inputs_path: str, doc: dict[str, Any]) -> None:
     逐个落盘后,被杀只损失还没拉完的那些。
     同目录 + ``os.replace`` 保证读的人要么看到上一版、要么看到新版,不会读到半份。
     """
-    tmp_path = inputs_path + ".tmp"
+    tmp_path = inputs_path + _REWRITE_SUFFIX
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(doc, handle, ensure_ascii=False)
     os.replace(tmp_path, inputs_path)
@@ -331,9 +398,9 @@ def main(argv: list[str]) -> int:
     try:
         with open(inputs_path, encoding="utf-8") as handle:
             doc = json.load(handle)
-    except (OSError, ValueError):
-        # 读不到 / 解不了 inputs.json(比如续跑时文件已被沙箱代码弄坏)——没有
-        # 文档就没有东西可预拉,同样不让 run 失败。
+    except (OSError, ValueError, RecursionError):
+        # 读不到 / 解不了 inputs.json(比如续跑时文件已被沙箱代码弄坏;嵌套极深时
+        # json.load 抛的是 RecursionError)——没有文档就没有东西可预拉,同样不让 run 失败。
         print(json.dumps({"prefetch": []}, ensure_ascii=False))
         return 0
     # 文档的形状不可信:它是上一次运行/沙箱代码碰过的文件,可能是一个 list、
@@ -356,19 +423,17 @@ def main(argv: list[str]) -> int:
         if not isinstance(entry, dict):
             continue
         root = _root_key(entry)
-        found = _sites(entry.get(root), [])
         # B-67 §4.1 —— 链接名在拉之前就定(与渲染层同一算法),拉到一个建一个。
-        links = _link_names(
-            name, [(path, url, _site_description(entry.get(root), path)) for path, url in found]
-        )
-        for (path, url), link in zip(found, links, strict=True):
+        for path, url, link in _linked_sites(name, entry.get(root)):
             hit = False
             used = 0
             try:
                 filename, used = _fetch(url, cache_dir, budget)
                 hit = filename is not None
                 rel = None
-                if filename is not None:
+                if filename is None:
+                    _unlink_stale(run_dir, link)
+                else:
                     linked = _link(run_dir, link, cache_dir, filename)
                     # 链接建成 → local_path 指链接(可读的名字);建不成 → 指 cache(老形态)。
                     rel = (
