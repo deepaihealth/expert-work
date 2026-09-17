@@ -1190,7 +1190,7 @@ async def build_agent(
         tool_catalog=registry.catalog(),
         # B-61 §5.4 —— 落空的参数绑定,给保存时的试建当 warning 用。
         unmatched_arg_bindings=registry.unmatched_arg_bindings(),
-        # B-67 §五 —— manifest 原件的绑定表,渲染层用。
+        # B-67 §五 —— manifest 原件的绑定表,「本轮输入」段报告绑定状态用。
         arg_bindings=manifest_bindings(spec.spec.tools),
         # Stream PI-1c — expose the build nonce so the control-plane seed
         # assembler can fence structured untrusted_content with it.

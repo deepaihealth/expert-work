@@ -175,16 +175,41 @@ def _split_fence(out: str) -> tuple[str, str, str]:
     return out[:start], out[start + len(_FENCE_OPEN) : end], out[end + len(_FENCE_CLOSE) :]
 
 
-def test_bound_variable_renders_as_platform_filled_and_hides_the_value() -> None:
+def test_bound_variable_names_are_the_variable_side_of_each_binding() -> None:
+    """``args`` 是「参数名 → 变量名」,要的是变量名 —— 夹具里参数名与变量名故意不同。"""
     built = _jinja_built(
-        "项目:{{ project_code }}",
-        (_Var("project_code"),),
-        arg_bindings=(_Binding({"project_code": "project_code"}),),
+        "",
+        (_Var("project_code"), _Var("customer_code"), _Var("org_logo")),
+        arg_bindings=(
+            _Binding({"project": "project_code"}),
+            _Binding({"cc": "customer_code", "logo": "org_logo"}),
+        ),
     )
-    assert bound_variable_names(built) == frozenset({"project_code"})
-    out = render_system_prompt(built, {"project_code": "PRJ001"})
-    assert out == f"项目:{BOUND_TEXT}"
-    assert "PRJ001" not in out
+    assert bound_variable_names(built) == frozenset({"project_code", "customer_code", "org_logo"})
+
+
+def test_a_bound_variable_renders_by_shape_exactly_like_an_unbound_one() -> None:
+    """绑定是逐工具的:有绑定的工具 schema 里已经没有这个参数,藏值换不来什么;漏绑的
+    工具还要从提示词里拿值。所以被绑定的变量与没绑定的渲染逐字相同(URL → 路径,短文本
+    → 原值);绑定状态由「本轮输入」段报告,不占模板里的值。"""
+    variables = (_Var("org_logo"), _Var("project_code"))
+    template = "LOGO:{{ org_logo }} 项目:{{ project_code }}"
+    inputs = {"org_logo": LOGO, "project_code": "PRJ001"}
+    bindings = (_Binding({"logo": "org_logo", "project": "project_code"}),)
+    unbound = render_system_prompt(_jinja_built(template, variables), inputs)
+    bound = render_system_prompt(_jinja_built(template, variables, arg_bindings=bindings), inputs)
+    assert bound == unbound
+    assert bound == f"LOGO:$EXPERT_WORK_INPUTS_DIR/org_logo.png{URL_NOTE} 项目:PRJ001"
+    assert BOUND_TEXT not in bound
+
+
+def test_render_raw_keeps_a_bound_url_verbatim() -> None:
+    built = _jinja_built(
+        "{{ org_logo }}",
+        (_Var("org_logo", render="raw"),),
+        arg_bindings=(_Binding({"logo": "org_logo"}),),
+    )
+    assert render_system_prompt(built, {"org_logo": LOGO}) == LOGO
 
 
 def test_url_value_renders_as_the_link_path_not_the_url() -> None:

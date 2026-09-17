@@ -119,6 +119,6 @@ class BuiltAgent:
     #: 带默认值,存量构造点一处都不用改。
     unmatched_arg_bindings: tuple[UnmatchedArgBinding, ...] = ()
     #: B-67 §五 —— manifest 原件的参数绑定表(``arg_bindings.manifest_bindings``)。
-    #: control-plane 渲染层 / 「本轮输入」段据此把被绑定变量渲染成「平台自动填」而不放值。
+    #: control-plane 的「本轮输入」段据此报告哪些变量已绑定(模板里的值照常按形态渲染)。
     #: 带默认值,存量构造点一处都不用改。
     arg_bindings: tuple[ArgBindingSpec, ...] = ()

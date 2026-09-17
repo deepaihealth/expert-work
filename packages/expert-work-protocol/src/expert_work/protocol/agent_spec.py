@@ -214,8 +214,8 @@ class PromptVariableSpec(BaseModel):
     #: ``False`` → a missing input renders as the empty string.
     required: bool = True
     description: str | None = None
-    #: B-67 §五 —— 渲染方式。``auto``(默认)按值的形态渲染:被绑定 → 「平台自动填」、
-    #: URL → 本地路径、列表 / 对象里的 URL 逐项、其它原值;``raw`` = 永远原值。只用于
+    #: B-67 §五 —— 渲染方式。``auto``(默认)按值的形态渲染:URL → 本地路径、列表 /
+    #: 对象里的 URL 逐项、其它原值(被绑定的变量也一样);``raw`` = 永远原值。只用于
     #: 收窄(模板要对值做内容比较之类),不是启用基础能力。
     render: Literal["auto", "raw"] = "auto"
 

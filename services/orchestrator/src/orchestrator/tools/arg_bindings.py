@@ -191,9 +191,9 @@ def apply_arg_bindings(
 def manifest_bindings(tools: Sequence[Any]) -> tuple[ArgBindingSpec, ...]:
     """B-67 §五 —— manifest 里全部 ``arg_bindings`` 原样拼平(按 tools 顺序)。
 
-    给 ``BuiltAgent.arg_bindings`` 用:control-plane 渲染层与「本轮输入」段据此判断
-    「这个变量已被绑定,值不进提示词」。取 spec 不取 registry —— registry 的键是折叠后
-    的 wire 名,B-65 的撞名问题不该传染到渲染层。
+    给 ``BuiltAgent.arg_bindings`` 用:control-plane 的「本轮输入」段据此报告「这个变量
+    已绑定到工具参数」。取 spec 不取 registry —— registry 的键是折叠后的 wire 名,B-65 的
+    撞名问题不该传染到 control-plane。
     """
     return tuple(
         binding

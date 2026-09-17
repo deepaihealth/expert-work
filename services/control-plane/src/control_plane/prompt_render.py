@@ -11,18 +11,19 @@ SSTI primitive. See ``docs/design/jinja-dynamic-prompt.md`` §3.
 substitution (shared nonce with the model-side tool/RAG channels);
 ``trusted=True`` (the owner-set default, §4) renders verbatim.
 
-B-67 §五 —— 每个变量的值先过 :func:`render_value`,**按值的形态**决定放什么进模板:
-被绑定 → 「平台自动填」;URL → 本地链接路径;列表 / 对象 / 可解析的 JSON 字符串里有
-URL → 逐项「说明 → 路径」;其它 → 原值(今天行为)。渲染早于预拉,所以这里只做字符串
-替换 —— 不发网、不读盘、不等下载结果;名字由 ``inputs_doc.link_names`` 决定,与预拉建
-出来的链接逐字相同。
+B-67 §五 —— 本轮传了的变量,值先过 :func:`render_value`,**按值的形态**决定放什么进
+模板:``render: raw`` → 原值;URL → 本地链接路径;列表 / 对象 / 可解析的 JSON 字符串里有
+URL → 逐项「说明 → 路径」;其它 → 原值(今天行为)。被绑定的变量同样按形态渲染 —— 绑定
+是逐工具的,漏绑的工具还要从提示词里拿值;绑定状态由「本轮输入」段报告。没传的变量取
+今天的值,不走形态渲染。渲染早于预拉,所以这里只做字符串替换 —— 不发网、不读盘、不等
+下载结果;名字由 ``inputs_doc.link_names`` 决定,与预拉建出来的链接逐字相同。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 from jinja2 import TemplateError
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 #: 模型在 exec_python / bash 里直接用,不用手抄任何路径。
 INPUTS_ENV = "EXPERT_WORK_INPUTS"
 INPUTS_DIR_ENV = "EXPERT_WORK_INPUTS_DIR"
-#: 被绑定变量的渲染文本:值不出现。
+#: 被绑定变量的状态文本。PR3 本轮输入段用(模板里的值不再替换成它)。
 BOUND_TEXT = "（已绑定到工具参数，调用时平台自动填）"  # noqa: RUF001 — 全角标点,面向模型的中文
 #: URL / 逐项渲染的尾注:不断言「已下载」(渲染早于预拉),只说名字与回落办法。
 URL_NOTE = "（已就位；不在则按输入清单里的原地址下载）"  # noqa: RUF001
@@ -45,8 +46,8 @@ URL_NOTE = "（已就位；不在则按输入清单里的原地址下载）"  # 
 # ``built`` is the orchestrator ``BuiltAgent`` (typed ``Any`` here, matching
 # ``build_run_graph_input``); the renderer reads ``system_prompt``,
 # ``prompt_jinja``, ``prompt_variables`` (each with ``.name``/``.trusted``/
-# ``.render``), ``prompt_base``, ``prompt_suffix``, ``spotlight_nonce``,
-# ``arg_bindings`` (each with ``.args``).
+# ``.render``), ``prompt_base``, ``prompt_suffix``, ``spotlight_nonce``;
+# :func:`bound_variable_names` reads ``arg_bindings`` (each with ``.args``).
 
 
 class PromptRenderError(ValueError):
@@ -119,23 +120,19 @@ def _render_items(var: Any, root: Any, sites: list[LinkedSite], *, nonce: str | 
     return f"{body}\n{URL_NOTE}"
 
 
-def render_value(
-    var: Any, raw: Any, *, bindings: Collection[str], nonce: str | None
-) -> tuple[Any, bool]:
-    """一个声明变量在模板上下文里的值,按形态定(spec §五的表,判定顺序即代码顺序)。
+def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
+    """一个本轮传了值的声明变量在模板上下文里的值,按形态定(spec §五的表,判定顺序即
+    代码顺序)。被绑定与否不影响这里:绑定是逐工具的,漏绑的工具仍要从提示词里拿值。
 
     返回 ``(值, 是否走了引用渲染)``,第二项只给日志用。
 
     只做字符串替换:不发网、不读盘、不等预拉 —— 路径由名字决定,不由下载决定。
-    ``trusted: false`` 时路径也在围栏里(它由租户数据推出),尾注与「平台自动填」是平台
-    文本,不围栏(裁定 P8)。
+    ``trusted: false`` 时路径也在围栏里(它由租户数据推出),尾注是平台文本,不围栏(裁定 P8)。
     已知代价:模板对被改写的值做**内容比较**(``{{ 'x' if org_logo == '…' }}``)会失真;
     ``| default('')`` 这类**存在性**判断照旧成立(改写后的字符串非空)。
     """
     if getattr(var, "render", "auto") == "raw":
         return _raw_or_fenced(var, raw, nonce=nonce), False
-    if var.name in bindings:
-        return BOUND_TEXT, True
     sites = linked_sites(var.name, raw)
     if not sites:
         return _raw_or_fenced(var, raw, nonce=nonce), False
@@ -165,7 +162,6 @@ def render_system_prompt(built: Any, inputs: dict[str, Any]) -> str:
         verbatim: str = built.system_prompt
         return verbatim
 
-    bindings = bound_variable_names(built)
     context: dict[str, Any] = {}
     by_reference: list[str] = []
     for var in built.prompt_variables:
@@ -174,9 +170,7 @@ def render_system_prompt(built: Any, inputs: dict[str, Any]) -> str:
             # (``apply_arg_bindings`` 会丢掉该参数),模板里的 ``if`` / ``default`` 不能被翻过来。
             context[var.name] = _raw_or_fenced(var, "", nonce=built.spotlight_nonce)
             continue
-        value, referenced = render_value(
-            var, inputs[var.name], bindings=bindings, nonce=built.spotlight_nonce
-        )
+        value, referenced = render_value(var, inputs[var.name], nonce=built.spotlight_nonce)
         context[var.name] = value
         if referenced:
             by_reference.append(var.name)
