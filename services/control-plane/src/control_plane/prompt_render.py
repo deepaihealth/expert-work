@@ -169,8 +169,14 @@ def render_system_prompt(built: Any, inputs: dict[str, Any]) -> str:
     context: dict[str, Any] = {}
     by_reference: list[str] = []
     for var in built.prompt_variables:
-        raw = inputs.get(var.name, "")
-        value, referenced = render_value(var, raw, bindings=bindings, nonce=built.spotlight_nonce)
+        if var.name not in inputs:
+            # 本轮没传:今天的值(裁定 9),不走形态渲染 —— 平台此时什么都不填
+            # (``apply_arg_bindings`` 会丢掉该参数),模板里的 ``if`` / ``default`` 不能被翻过来。
+            context[var.name] = _raw_or_fenced(var, "", nonce=built.spotlight_nonce)
+            continue
+        value, referenced = render_value(
+            var, inputs[var.name], bindings=bindings, nonce=built.spotlight_nonce
+        )
         context[var.name] = value
         if referenced:
             by_reference.append(var.name)

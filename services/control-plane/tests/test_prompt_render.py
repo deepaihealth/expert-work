@@ -291,6 +291,35 @@ def test_short_text_and_unset_values_render_exactly_as_before() -> None:
     assert render_system_prompt(built, {"a": "张三"}) == "张三|"
 
 
+_UNSET_TEMPLATE = (
+    "{{ customer_code | default('') }};{% if customer_code %}有{% else %}无{% endif %}"
+)
+
+
+def _unset_built(*, trusted: bool, bound: bool) -> _Built:
+    return _jinja_built(
+        _UNSET_TEMPLATE,
+        (_Var("customer_code", trusted=trusted, required=False),),
+        arg_bindings=(_Binding({"customer": "customer_code"}),) if bound else (),
+    )
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_an_unset_optional_variable_stays_unset(bound: bool) -> None:
+    """本轮没传的变量渲染成今天的值,不走形态渲染 —— 被绑定也一样:平台此时什么都
+    不填(``apply_arg_bindings`` 丢掉该参数),模板里的 ``if`` / ``default`` 不能被翻过来。"""
+    assert render_system_prompt(_unset_built(trusted=True, bound=bound), {}) == ";无"
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_an_unset_untrusted_variable_keeps_todays_empty_fence(bound: bool) -> None:
+    """untrusted 未传,今天(main)的值就是一段空围栏 —— 非空,所以 ``if`` 为真。本项目
+    不改它(裁定 9);这里钉的是「绑定与否都不改变它」。"""
+    out = render_system_prompt(_unset_built(trusted=False, bound=bound), {})
+    assert out == f"{_FENCE_OPEN}\n\n{_FENCE_CLOSE};有"
+    assert BOUND_TEXT not in out
+
+
 def test_render_raw_keeps_the_url_verbatim() -> None:
     built = _jinja_built("{{ org_logo }}", (_Var("org_logo", render="raw"),))
     assert render_system_prompt(built, {"org_logo": LOGO}) == LOGO
