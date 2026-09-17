@@ -1145,5 +1145,6 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs/{run_id}/usage?user_id=u
 - **`input_tokens` 已经包含 `cache_read_tokens` 与 `cache_creation_tokens`**，不是与它们并列的第三项。未命中缓存的输入量是 `input_tokens - cache_read_tokens - cache_creation_tokens`。直接用 `input_tokens` 乘普通输入单价，会把已经享受缓存折扣的部分按全价计算一遍。
 - **run 没有结束也可以查**，返回的是到目前为止的量。`run_status` 还不是最终状态时，这个数还会继续增长，不要据此落账。
 - **`usage_by_model` 缺席不等于零**。缺席表示没有记录：平台升级前的历史 run、还没开始执行的 run、或者平台取数失败。确实没有消耗时返回的是空数组。
+- **各项全为 `0` 的元素表示这次调用由平台的回答缓存直接给出**，没有调用模型，也就没有消耗。温度很低的 Agent 在短时间内收到完全相同的对话时会出现这种情况；[重新生成](./chat#_2-10-重新生成与编辑重发)不走缓存，一定会重新调用模型。
 - 平台自身的后台处理（例如质量抽样）不计入这里，只统计这次 run 的对话消耗。
 - 某个厂商没有上报用量时，对应的项不会出现，也不会用 `0` 补位。
