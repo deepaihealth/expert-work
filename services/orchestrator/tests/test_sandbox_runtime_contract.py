@@ -947,16 +947,16 @@ async def test_exec_injects_per_agent_pythonuserbase(runtime: SandboxRuntime) ->
 
 
 def test_exec_envs_carry_the_inputs_path_when_a_run_is_bound() -> None:
-    """B-61 §4.4 —— ``agent_key_envs`` 单源:``run_id`` 非 ``None`` 时两个
-    后端都会经由它拿到同一个 ``EXPERT_WORK_INPUTS`` 值。这条不连任何真实
-    环境(同 ``test_exec_contract_constants_match_the_sandbox_image`` 的
-    手法),每一次 ``pytest -m "not integration"`` 全仓扫描都跑得到。"""
-    from orchestrator.tools.inputs_doc import inputs_abs_path
+    """B-61 §4.4 + B-67 §4.2 —— ``agent_key_envs`` 单源:``run_id`` 非 ``None`` 时两个
+    后端都会经由它拿到同一对 ``EXPERT_WORK_INPUTS`` / ``EXPERT_WORK_INPUTS_DIR``。"""
+    from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
     from orchestrator.tools.sandbox import agent_key_envs
 
     run_id = UUID("382f6f5a-55c4-49be-ac05-32fa143f010d")
     envs = agent_key_envs("ai-health-plan-30817804", run_id=run_id)
     assert envs["EXPERT_WORK_INPUTS"] == inputs_abs_path(run_id)
+    assert envs["EXPERT_WORK_INPUTS_DIR"] == inputs_abs_dir(run_id)
+    assert envs["EXPERT_WORK_INPUTS"].startswith(envs["EXPERT_WORK_INPUTS_DIR"] + "/")
     assert envs["PYTHONUSERBASE"].endswith("ai-health-plan-30817804"), "原有隔离不能丢"
 
 
@@ -997,6 +997,10 @@ async def test_supervisor_exec_forwards_run_id_to_agent_key_envs() -> None:
     assert isinstance(body, dict)
     assert body["envs"]["EXPERT_WORK_INPUTS"] == inputs_abs_path(run_id)
 
+    from orchestrator.tools.inputs_doc import inputs_abs_dir
+
+    assert body["envs"]["EXPERT_WORK_INPUTS_DIR"] == inputs_abs_dir(run_id)
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio
@@ -1005,18 +1009,21 @@ async def test_both_backends_send_byte_identical_inputs_env(runtime: SandboxRunt
     ``test_exec_injects_per_agent_pythonuserbase`` 的手法):两个后端各自跑
     同一段探针代码,分别断言等于同一个由 ``agent_key_envs`` 计算出的黄金值
     ——两者都等于它,即两者彼此相等(byte-identical)。"""
-    from orchestrator.tools.inputs_doc import inputs_abs_path
+    from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
 
     run_id = uuid4()
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c17")
     try:
         outcome = await runtime.exec(
             sandbox_id=sid,
-            code="import os; print(os.environ.get('EXPERT_WORK_INPUTS'))",
+            code=(
+                "import os; print(os.environ.get('EXPERT_WORK_INPUTS'));"
+                " print(os.environ.get('EXPERT_WORK_INPUTS_DIR'))"
+            ),
             timeout_s=30,
             run_id=run_id,
         )
-        assert outcome.stdout.strip() == inputs_abs_path(run_id)
+        assert outcome.stdout.split() == [inputs_abs_path(run_id), inputs_abs_dir(run_id)]
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
