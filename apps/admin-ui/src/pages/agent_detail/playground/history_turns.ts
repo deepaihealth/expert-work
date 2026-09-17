@@ -63,6 +63,15 @@ export interface HistoryTurn {
   tombstone: boolean;
 }
 
+/** A row that can be a turn's input: a user row that is not platform
+ *  scaffolding. Hidden rows (B-67 inputs block, advisories) are neither an
+ *  input nor part of the reply, so the turn views leave them out — the
+ *  assistant's fallback lines would otherwise show platform text as if the
+ *  agent had said it. */
+function isInputRow(m: HistoryMessage): boolean {
+  return m.role === "user" && m.hidden !== true;
+}
+
 /** Group the messages by their owning run, or ``null`` if grouping them is
  *  not unambiguous — in which case the caller must stay on the ORDER path.
  *
@@ -84,15 +93,6 @@ export interface HistoryTurn {
  *  backend's transcript read is best-effort and degrades to ``[]`` — and
  *  switching strategy there would turn a "no history" page into one empty
  *  input card per run. */
-/** A row that can be a turn's input: a user row that is not platform
- *  scaffolding. Hidden rows (B-67 inputs block, advisories) are neither an
- *  input nor part of the reply, so the turn views leave them out — the
- *  assistant's fallback lines would otherwise show platform text as if the
- *  agent had said it. */
-function isInputRow(m: HistoryMessage): boolean {
-  return m.role === "user" && m.hidden !== true;
-}
-
 function groupMessagesByRun(
   messages: readonly HistoryMessage[],
 ): Map<string, HistoryMessage[]> | null {
