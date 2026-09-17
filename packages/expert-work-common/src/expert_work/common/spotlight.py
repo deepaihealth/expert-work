@@ -91,7 +91,9 @@ def spotlight_untrusted(content: str, *, nonce: str) -> str:
 
     ``nonce`` MUST be unguessable to the content's author and is reused for the
     matching open/close marker so embedded text cannot forge an early close.
-    Callers pass a per-run random nonce (stable within a run for prompt-cache).
+    Callers pass a per-**build** random nonce (``agent_factory`` mints one per
+    build and the build is cached across runs, so it is stable across a session
+    for prompt-cache).
     """
     if not nonce:
         msg = "nonce must be a non-empty unguessable string"
