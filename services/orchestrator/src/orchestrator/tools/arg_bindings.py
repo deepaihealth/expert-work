@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
-from expert_work.protocol import ArgBindingSpec
+from expert_work.protocol import ArgBindingSpec, MCPToolSpec
 
 
 def bindings_by_tool(
@@ -186,3 +186,18 @@ def apply_arg_bindings(
         new_call["args"] = args
         filled.append(new_call)
     return filled, names
+
+
+def manifest_bindings(tools: Sequence[Any]) -> tuple[ArgBindingSpec, ...]:
+    """B-67 §五 —— manifest 里全部 ``arg_bindings`` 原样拼平(按 tools 顺序)。
+
+    给 ``BuiltAgent.arg_bindings`` 用:control-plane 渲染层与「本轮输入」段据此判断
+    「这个变量已被绑定,值不进提示词」。取 spec 不取 registry —— registry 的键是折叠后
+    的 wire 名,B-65 的撞名问题不该传染到渲染层。
+    """
+    return tuple(
+        binding
+        for entry in tools
+        if isinstance(entry, MCPToolSpec)
+        for binding in entry.arg_bindings
+    )
