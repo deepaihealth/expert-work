@@ -168,28 +168,35 @@ async def test_reflect_node_revise_feedback_hidden_from_ui() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reflect_trajectory_omits_hidden_scaffolding() -> None:
-    """B-67 —— 隐藏 HumanMessage(「本轮输入」段、恢复建议)是平台脚手架,不进反思看的
-    轨迹;用户任务与助手回答照留。"""
-    llm = _RecordingLLM(responses=[AIMessage(content='{"verdict": "accept", "critique": "ok"}')])
-    node = make_reflect_node(llm, budget=2)
+async def test_reflect_trajectory_keeps_earlier_hidden_revise_feedback() -> None:
+    """裁定 P22 —— revise 注入的反馈是隐藏消息,下一轮反思必须看得到它(才能判断改没改到);
+    反思输出不落持久文本,轨迹里带着隐藏消息(包括「本轮输入」段)无害。"""
+    first = _RecordingLLM(
+        responses=[AIMessage(content='{"verdict": "revise", "critique": "MISSING-UNITS"}')]
+    )
+    out = await make_reflect_node(first, budget=3)(  # type: ignore[arg-type]
+        _state([HumanMessage(content="task"), AIMessage(content="weak answer")]),
+        {"configurable": {}},
+    )
+    feedback = out["messages"][0]
+    assert feedback.additional_kwargs.get(HIDE_FROM_UI) is True
 
-    await node(  # type: ignore[arg-type]
+    second = _RecordingLLM(responses=[AIMessage(content='{"verdict": "accept", "critique": "ok"}')])
+    await make_reflect_node(second, budget=3)(  # type: ignore[arg-type]
         _state(
             [
                 HumanMessage(content="task"),
-                HumanMessage(
-                    content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}
-                ),
-                AIMessage(content="answer"),
-            ]
+                AIMessage(content="weak answer"),
+                feedback,
+                AIMessage(content="better answer"),
+            ],
+            reflections=out["reflections"],
         ),
         {"configurable": {}},
     )
-    prompt = "\n".join(str(m.content) for m in llm.calls[0])
-    assert "PLATFORM-INPUTS-BLOCK" not in prompt
-    assert "[human] task" in prompt
-    assert "[ai] answer" in prompt
+    prompt = "\n".join(str(m.content) for m in second.calls[0])
+    assert "MISSING-UNITS" in prompt
+    assert "[ai] better answer" in prompt
 
 
 @pytest.mark.asyncio
