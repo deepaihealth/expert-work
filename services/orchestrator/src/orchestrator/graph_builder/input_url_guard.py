@@ -1,39 +1,66 @@
 """B-67 §七 —— 手抄守卫:沙箱代码里出现本轮输入 URL 的原文或近似,拦下并告知正确用法。
 
-全是纯函数,不碰 IO;接线在 ``builder.tools_node``(派发前)。为什么不放
-``before_tool_dispatch`` 中间件:它的 payload 只有 ``tool_name / tool_args``,拿不到本轮
-inputs;``tools_node`` 里 ``_fill_bound_args`` 已经在读 ``configurable[PROMPT_INPUTS_KEY]``,
-守卫放同一处。
+判定是纯函数;唯一的副作用是比较预算用完时的一行日志(只有计数)。接线在
+``builder.tools_node``(派发前)。为什么不放 ``before_tool_dispatch`` 中间件:它的 payload
+只有 ``tool_name / tool_args``,拿不到本轮 inputs;``tools_node`` 里 ``_fill_bound_args``
+已经在读 ``configurable[PROMPT_INPUTS_KEY]``,守卫放同一处。
 
-判定(spec §7.1):从代码里抽 URL 字面量;与候选集比 —— 完全一致命中;同 scheme+host 且
-host 之后的部分编辑距离 ≤ 3 命中(事故里距离是 1)。抄对了也拦:这次对不代表下次对。
-候选集与预拉 / 渲染同一个 walker(``inputs_doc.linked_sites``),所以提示里说的链接名
-就是真实存在的那个。
+判定(spec §7.1,P25 收窄):
+
+* **完全一致**:代码里出现候选 URL 的原文,且原文后面紧跟的不是 URL 的延续(只隔着
+  ASCII 句读 ``.,;:!?)`` 也算)→ 命中。按子串找,不依赖字面量抽取 —— 路径里带全角标点
+  或括号的 URL 会被 :data:`URL_RE` 截断。scheme / host 只差大小写也算完全一致。
+* **近似**:从代码里抽 URL 字面量(去掉尾随的 ASCII 句读),与同 scheme+host 的候选比
+  host 之后的全部(裁定 4:含 query / fragment)。允许的编辑距离随**候选**尾串长度走:
+  ``min(3, 尾串长度 // 16)`` —— 短于 16 字符的尾串只拦完全一致(``/v1`` 与 ``/v2``、
+  ``img_0.png`` 与 ``img_7.png`` 本来就是不同的地址)。
+* 先找完全一致;近似按字面量顺序,**第一个**有命中的字面量就返回(同一字面量里取最小
+  距离)。进 DP 之前先过两道便宜的下界(长度差、字符多重集差);DP 按格子数计预算,
+  用完就停、已找到的照常返回(失败放行)。
+
+抄对了也拦:这次对不代表下次对。候选集与预拉 / 渲染同一个 walker
+(``inputs_doc.linked_sites``),所以提示里说的链接名就是真实存在的那个。
 """
 
 from __future__ import annotations
 
+import logging
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
 
 from orchestrator.tools.inputs_doc import linked_sites
 
-#: 代码里的 URL 字面量:到空白 / 引号 / 反引号 / 尖括号 / 右括号 / 右方括号 / 中文全角
-#: 标点(常跟在裸 URL 后面的句读)为止;scheme 不区分大小写(``HTTPS://`` 一样抽得出来)。
-#: 不排除 CJK 字:URL 路径里未编码的中文文件名是真实存在的输入。
-URL_RE = re.compile(
-    r"""https?://[^\s'"`<>)\]，。；：！？、）】」』]+""",  # noqa: RUF001 — 面向中文文本的全角标点
-    re.IGNORECASE,
-)
+logger = logging.getLogger(__name__)
+
+#: URL 字面量的终止字符:空白 / 引号 / 反引号 / 尖括号 / 右括号 / 右方括号 / 中文全角标点
+#: (常跟在裸 URL 后面的句读)。不排除 CJK 字:URL 路径里未编码的中文文件名是真实存在的输入。
+_URL_STOP = r"""\s'"`<>)\]，。；：！？、）】」』"""  # noqa: RUF001 — 面向中文文本的全角标点
+#: 代码里的 URL 字面量;scheme 不区分大小写(``HTTPS://`` 一样抽得出来)。
+URL_RE = re.compile(rf"https?://[^{_URL_STOP}]+", re.IGNORECASE)
+#: 字面量尾随的 ASCII 句读(``curl URL;``、``[URL, x]``、句末的 ``.``)不是地址的一部分。
+#: ``/`` 不在里面:它是路径的一部分。
+_TRAILING_PUNCT = ".,;:!?"
+#: 候选原文在代码里出现之后,「这一串到此为止」的判定:跳过 ASCII 句读与右括号后,
+#: 是字面量终止字符或代码结尾。``https://x/a`` 出现在 ``https://x/a.png`` 里不算完全一致。
+_EXACT_END_RE = re.compile(rf"[.,;:!?)]*(?:[{_URL_STOP}]|\Z)")
+#: ``(scheme://host, host 之后的全部)``;不用 ``urlparse``:它对 ``https://[^/`` 这类正则
+#: 片段、host 里的全角斜杠 / 全角 at 符号会抛 ``ValueError``(C1)。
+_SPLIT_RE = re.compile(r"([^:/?#]+://[^/?#]*)(.*)", re.DOTALL)
 #: 「多一位 / 少一位 / 改一字」都在 3 以内;真栈验收的读数出来后再定(spec §十四)。
 MAX_EDIT_DISTANCE = 3
+#: P25 —— 候选尾串每这么多字符允许 1 处编辑(上限 :data:`MAX_EDIT_DISTANCE`)。
+CHARS_PER_EDIT = 16
 #: 只比 host 之后不超过这么长的串:两个 run API 都把字符串输入截到 8192 字符,更长的
 #: URL 不会是真实输入。编辑距离按 Ukkonen 对角线带宽裁剪(见 :func:`levenshtein`),
 #: 不再是 O(n·m) 的全矩阵,所以这个上限只挡「不可能是真输入」的串,不是 CPU 顾虑。
 MAX_COMPARE_CHARS = 8192
+#: 每次调用近似比较的预算,按 DP 格子数的上界(尾串长度乘带宽)累计。实测带宽 DP 每秒
+#: 几百万格,这个数把一次调用的最坏耗时压在亚秒级;按次数计不行 —— 一次 8000 字符的
+#: 比较与一次 100 字符的比较差两个数量级。
+MAX_DP_CELLS = 2_000_000
 
 
 @dataclass(frozen=True)
@@ -104,58 +131,144 @@ def levenshtein(a: str, b: str, *, cap: int) -> int:
 
 
 def _split(url: str) -> tuple[str, str]:
-    """``(scheme://host 小写, host 之后的全部)`` —— 裁定 4:query 也在比较范围内。"""
-    parsed = urlparse(url)
-    head_len = len(parsed.scheme) + 3 + len(parsed.netloc)
-    return f"{parsed.scheme}://{parsed.netloc}".lower(), url[head_len:]
+    """``(scheme://host 小写, host 之后的全部)`` —— 裁定 4:query 也在比较范围内。永不抛。"""
+    match = _SPLIT_RE.match(url)
+    if match is None:
+        return "", url
+    return match.group(1).lower(), match.group(2)
+
+
+def _allowed_distance(tail: str) -> int:
+    """P25 —— 候选尾串允许的编辑距离:``min(3, 长度 // 16)``;0 表示只认完全一致。"""
+    return min(MAX_EDIT_DISTANCE, len(tail) // CHARS_PER_EDIT)
+
+
+def _bag_bound(a: Counter[str], b: Counter[str]) -> int:
+    """编辑距离的下界:两边字符多重集之差。一次替换让两个方向各差 1,插入 / 删除只让一个
+    方向差 1,所以任一方向的差都不超过编辑距离。"""
+    return max(sum((a - b).values()), sum((b - a).values()))
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    cand: UrlCandidate
+    host: str
+    tail: str
+    cap: int
+    bag: Counter[str]
+
+
+def _prepare(cand: UrlCandidate) -> _Prepared:
+    host, tail = _split(cand.url)
+    cap = _allowed_distance(tail)
+    return _Prepared(cand, host, tail, cap, Counter(tail) if cap else Counter())
+
+
+def _exact_copy(code: str, candidates: Sequence[UrlCandidate]) -> GuardHit | None:
+    """候选原文在代码里出现、且后面不是 URL 的延续 → 完全一致。按子串找,见模块说明。"""
+    for cand in candidates:
+        start = code.find(cand.url)
+        while start != -1:
+            if _EXACT_END_RE.match(code, start + len(cand.url)):
+                return GuardHit(
+                    var_name=cand.var_name, link=cand.link, distance=0, written=cand.url
+                )
+            start = code.find(cand.url, start + 1)
+    return None
 
 
 def find_retyped_url(code: str, candidates: Sequence[UrlCandidate]) -> GuardHit | None:
-    """代码里第一处「完全一致」的命中优先;都不一致时取最小编辑距离的那一处;没有则 ``None``。"""
+    """完全一致优先;否则第一个有近似命中的字面量(取其最小距离);没有则 ``None``。"""
     if not candidates:
         return None
-    # 每个候选的 (host, tail) 只算一次:同一批候选要跟代码里每一处 URL 字面量比,搬到
-    # 外层省掉重复 urlparse。
-    cand_splits = [(cand, *_split(cand.url)) for cand in candidates]
-    best: GuardHit | None = None
-    for written in URL_RE.findall(code):
-        exact = next((c for c in candidates if c.url == written), None)
-        if exact is not None:
-            return GuardHit(var_name=exact.var_name, link=exact.link, distance=0, written=written)
-        host, tail = _split(written)
+    exact = _exact_copy(code, candidates)
+    if exact is not None:
+        return exact
+    literals: list[tuple[str, str, str]] = []
+    for raw in URL_RE.findall(code):
+        written = raw.rstrip(_TRAILING_PUNCT)
+        literals.append((written, *_split(written)))
+    prepared = [_prepare(cand) for cand in candidates]
+    keyed = {(p.host, p.tail): p.cand for p in reversed(prepared)}
+    for written, host, tail in literals:
+        # scheme / host 只差大小写:仍是原文照抄。
+        same = keyed.get((host, tail))
+        if same is not None:
+            return GuardHit(var_name=same.var_name, link=same.link, distance=0, written=written)
+    return _near_copy(literals, [p for p in prepared if p.cap > 0])
+
+
+def _near_copy(
+    literals: Sequence[tuple[str, str, str]], prepared: Sequence[_Prepared]
+) -> GuardHit | None:
+    cells = 0
+    dp_runs = 0
+    for written, host, tail in literals:
         if len(tail) > MAX_COMPARE_CHARS:
             continue
-        for cand, cand_host, cand_tail in cand_splits:
-            if cand_host != host:
+        best: GuardHit | None = None
+        bag: Counter[str] | None = None
+        for p in prepared:
+            if p.host != host or abs(len(tail) - len(p.tail)) > p.cap:
                 continue
-            distance = levenshtein(tail, cand_tail, cap=MAX_EDIT_DISTANCE)
-            if distance <= MAX_EDIT_DISTANCE and (best is None or distance < best.distance):
-                best = GuardHit(
-                    var_name=cand.var_name, link=cand.link, distance=distance, written=written
+            if bag is None:
+                bag = Counter(tail)
+            if _bag_bound(bag, p.bag) > p.cap:
+                continue
+            cells += len(tail) * (2 * p.cap + 1)
+            if cells > MAX_DP_CELLS:
+                logger.warning(
+                    "tools.input_url_guard_budget_exhausted literals=%d candidates=%d dp_runs=%d",
+                    len(literals),
+                    len(prepared),
+                    dp_runs,
                 )
-    return best
+                return best
+            dp_runs += 1
+            distance = levenshtein(tail, p.tail, cap=p.cap)
+            if distance <= p.cap and (best is None or distance < best.distance):
+                best = GuardHit(
+                    var_name=p.cand.var_name, link=p.cand.link, distance=distance, written=written
+                )
+                if distance == 1:
+                    break
+        if best is not None:
+            return best
+    return None
 
 
-def guard_message(hit: GuardHit, *, trusted: bool = True) -> str:
+def guard_message(hit: GuardHit, *, trusted: bool) -> str:
     """回给模型的那句话 —— 它就是最准时的提醒(spec §6.3 否决每轮提醒的理由)。
 
     ``trusted=False``:这条消息是平台合成的,不过 spotlight 围栏(只有真工具输出过);而
     链接名(列表项说明 / dict 键的 slug、URL 后缀)与模型抄的那串都带租户数据 —— 两样都
     不写,只说目录与清单。
+
+    近似命中(P25)可能真是另一个地址:给出路 —— 那就让代码从它自己的来源取得。
     """
-    verdict = "与输入一致" if hit.distance == 0 else f"疑似抄错 {hit.distance} 处"
-    if not trusted:
-        return (
-            f"[blocked] 代码里有一处地址是输入 {hit.var_name} 的手抄件"
-            f"（平台比对：{verdict}）。"  # noqa: RUF001 — 面向模型的中文全角标点
+    near = hit.distance > 0
+    if trusted:
+        subject = f"代码里的地址 {hit.written} "
+        where = (
+            f"这个文件应在 $EXPERT_WORK_INPUTS_DIR/{hit.link}（不在则按清单里的原地址下载）；"  # noqa: RUF001
+            f"请改用它，或用代码从 $EXPERT_WORK_INPUTS 清单里读 {hit.var_name} 的原地址，"  # noqa: RUF001
+            "不要手抄。"
+        )
+    else:
+        subject = "代码里有一处地址"
+        where = (
             "这个文件应在 $EXPERT_WORK_INPUTS_DIR 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里"  # noqa: RUF001
             f" {hit.var_name} 对应条目的 local_path（不在则按清单里的原地址下载）；"  # noqa: RUF001
             "请用代码从清单里读路径或原地址，不要手抄。"  # noqa: RUF001
         )
+    if not near:
+        return (
+            f"[blocked] {subject}是输入 {hit.var_name} 的手抄件"
+            f"（平台比对：与输入一致）。{where}"  # noqa: RUF001
+        )
     return (
-        f"[blocked] 代码里的地址 {hit.written} 是输入 {hit.var_name} 的手抄件"
-        f"（平台比对：{verdict}）。"  # noqa: RUF001 — 面向模型的中文全角标点
-        f"这个文件应在 $EXPERT_WORK_INPUTS_DIR/{hit.link}（不在则按清单里的原地址下载）；"  # noqa: RUF001
-        f"请改用它，或用代码从 $EXPERT_WORK_INPUTS 清单里读 {hit.var_name} 的原地址，"  # noqa: RUF001
-        "不要手抄。"
+        f"[blocked] {subject}像是输入 {hit.var_name} 的地址手抄出来的"
+        f"（平台比对：疑似抄错 {hit.distance} 处）。若是它：{where}"  # noqa: RUF001
+        "如果它确实是另一个地址，请让代码从它自己的来源取得（读文件、接口返回或上一步的输出），"  # noqa: RUF001
+        "不要在代码里手写这串地址。"
     )

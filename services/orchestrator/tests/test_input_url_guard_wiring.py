@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -238,6 +239,57 @@ async def test_non_sandbox_tool_args_are_not_guarded() -> None:
     await _run(llm, registry, inputs={"org_logo": LOGO}, audit=audit)
     assert tool.calls == [RETYPED]
     assert not [e for e in audit.entries if e.action.value == "tool:blocked"]
+
+
+# --- C1:守卫永不让 run 失败。
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'import re\nm = re.match(r"https://([^/]+)/(.*)", u)\nprint(m)',
+        "import subprocess\nsubprocess.run(['sed', '-E', 's#https://[^/]+/##', 'urls.txt'])",
+    ],
+)
+async def test_regex_like_literals_in_code_do_not_crash_the_run(code: str) -> None:
+    tool, registry, llm = _one_exec_python_call(code)
+    audit = _RecordingAuditLogger()
+    state = await _run(llm, registry, inputs={"org_logo": LOGO}, audit=audit, trusted=TRUSTED_LOGO)
+    assert tool.calls == [code]
+    assert _tool_messages(state)["tc-1"].content == "ran"
+    assert not [e for e in audit.entries if e.action.value == "tool:blocked"]
+
+
+async def test_a_malformed_input_url_does_not_crash_the_run() -> None:
+    tool, registry, llm = _one_exec_python_call("print(1)")
+    await _run(
+        llm,
+        registry,
+        inputs={"org_logo": "https://[oops/logo.png"},
+        audit=_RecordingAuditLogger(),
+        trusted=TRUSTED_LOGO,
+    )
+    assert tool.calls == ["print(1)"]
+
+
+async def test_a_guard_failure_fails_open_and_logs_the_type_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from orchestrator.graph_builder import builder
+
+    def boom(code: str, candidates: Any) -> None:
+        del code, candidates
+        msg = f"cannot parse {LOGO}"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(builder, "find_retyped_url", boom)
+    tool, registry, llm = _one_exec_python_call(f"get('{RETYPED}')")
+    with caplog.at_level(logging.WARNING, logger=builder.__name__):
+        await _run(llm, registry, inputs={"org_logo": LOGO}, audit=_RecordingAuditLogger())
+    assert tool.calls == [f"get('{RETYPED}')"]
+    lines = [r.getMessage() for r in caplog.records]
+    assert "tools.input_url_guard_skipped err=ValueError" in lines
+    assert not any("files.example.com" in line for line in lines)
 
 
 # --- 信任口径:这条合成消息不过 spotlight 围栏(只有真工具输出过),链接名里的列表项

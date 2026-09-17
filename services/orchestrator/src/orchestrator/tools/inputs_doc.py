@@ -117,7 +117,10 @@ def parse_json_value(value: Any) -> list[Any] | dict[str, Any] | None:
     """
     if not isinstance(value, str):
         return None
-    if value.lstrip()[:1] not in ("[", "{") or len(value.encode("utf-8")) > MAX_PARSE_BYTES:
+    if value.lstrip()[:1] not in ("[", "{"):
+        return None
+    # ``surrogatepass``:JSON 里的 ``"\ud800"`` 解出来是孤立代理,严格编码会抛(C1)。
+    if len(value.encode("utf-8", "surrogatepass")) > MAX_PARSE_BYTES:
         return None
     try:
         parsed = json.loads(value)
@@ -153,7 +156,10 @@ def root_key(entry: Mapping[str, Any]) -> str:
 def url_suffix(url: str) -> str:
     """链接名的扩展名:URL 路径后缀,匹配 ``_EXT_RE`` 才要。渲染层在预拉之前就要说出
     名字,它手里只有 URL —— 所以这里**不看** Content-Type。"""
-    ext = posixpath.splitext(urlparse(url).path)[1]
+    try:
+        ext = posixpath.splitext(urlparse(url).path)[1]
+    except ValueError:
+        return ""
     return ext if _EXT_RE.match(ext) else ""
 
 

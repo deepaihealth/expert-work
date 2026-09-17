@@ -538,6 +538,64 @@ def test_one_failing_site_does_not_lose_the_others(
     assert doc["variables"]["b"]["local_path"] == "inputs/run1/b.jpg"
 
 
+def test_a_malformed_url_does_not_stop_the_good_ones(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """C1b:``urlparse`` 对 ``https://[oops`` 这类值会抛;链接命名不能因此带走整轮预拉。"""
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 16
+    routes["/b.jpg"] = _route(body)
+    routes["/c.jpg"] = _route(body)
+    inputs_path = _write_inputs(
+        tmp_path,
+        {
+            "a": {"value": "https://[oops/a.jpg", "trusted": True},
+            "b": {"value": f"{base}/b.jpg", "trusted": True},
+            "c": {
+                "value": [{"url": "https://[oops/x.jpg"}, {"url": f"{base}/c.jpg"}],
+                "trusted": True,
+            },
+        },
+    )
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    variables = json.loads(inputs_path.read_text(encoding="utf-8"))["variables"]
+    assert variables["a"]["local_path"] is None
+    assert variables["b"]["local_path"] == "inputs/run1/b.jpg"
+    assert variables["c"]["value"][0]["local_path"] is None
+    assert variables["c"]["value"][1]["local_path"] == "inputs/run1/c/1.jpg"
+
+
+def test_a_variable_whose_sites_cannot_be_listed_is_skipped_not_fatal(
+    tmp_path: Path, http_server: _HttpServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_linked_sites`` 在逐 site 的兜底之外调用;它再出任何意外也只丢那一个变量。"""
+    base, routes = http_server
+    routes["/b.jpg"] = _route(b"\xff\xd8\xff" + b"B" * 16)
+    inputs_path = _write_inputs(
+        tmp_path,
+        {
+            "a": {"value": f"{base}/a.jpg", "trusted": True},
+            "b": {"value": f"{base}/b.jpg", "trusted": True},
+        },
+    )
+    real = prefetch_script._linked_sites
+
+    def flaky(var_name: str, value: Any) -> list[tuple[list[str | int], str, str]]:
+        if var_name == "a":
+            msg = "unexpected"
+            raise RuntimeError(msg)
+        return real(var_name, value)
+
+    monkeypatch.setattr(prefetch_script, "_linked_sites", flaky)
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    variables = json.loads(inputs_path.read_text(encoding="utf-8"))["variables"]
+    assert variables["b"]["local_path"] == "inputs/run1/b.jpg"
+
+
 # ---------------------------------------------------------------------------
 # T11 —— 内容寻址的共享缓存:同一个 URL 跨轮只下一次,文件名只由 URL 的 sha256 定。
 # ---------------------------------------------------------------------------

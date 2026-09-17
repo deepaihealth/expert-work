@@ -2880,21 +2880,28 @@ def _guard_sandbox_calls(
         return {}
     candidates: tuple[UrlCandidate, ...] | None = None
     hits: dict[int, GuardHit] = {}
-    for index, call in enumerate(calls):
-        code_keys = _SANDBOX_CODE_ARGS.get(str(call.get("name", "")))
-        if code_keys is None:
-            continue
-        args = call.get("args") or {}
-        code = next((args[key] for key in code_keys if isinstance(args.get(key), str)), None)
-        if code is None:
-            continue
-        if candidates is None:
-            candidates = candidates_from_inputs(raw_inputs)
-            if not candidates:
-                return {}
-        hit = find_retyped_url(code, candidates)
-        if hit is not None:
-            hits[index] = hit
+    # 守卫永不让 run 失败(C1):输入值与模型代码都是任意字符串,候选构建或比对出任何意外
+    # 都放行整批,只记异常类型 —— 异常文本里可能带着 URL。续跑重放同一条消息,抛出去就是
+    # 每次都挂。
+    try:
+        for index, call in enumerate(calls):
+            code_keys = _SANDBOX_CODE_ARGS.get(str(call.get("name", "")))
+            if code_keys is None:
+                continue
+            args = call.get("args") or {}
+            code = next((args[key] for key in code_keys if isinstance(args.get(key), str)), None)
+            if code is None:
+                continue
+            if candidates is None:
+                candidates = candidates_from_inputs(raw_inputs)
+                if not candidates:
+                    return {}
+            hit = find_retyped_url(code, candidates)
+            if hit is not None:
+                hits[index] = hit
+    except Exception as exc:
+        logger.warning("tools.input_url_guard_skipped err=%s", type(exc).__name__)
+        return {}
     return hits
 
 
