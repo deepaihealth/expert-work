@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from expert_work.protocol import ArgBindingSpec, BuiltinToolSpec, MCPToolSpec
@@ -252,8 +253,10 @@ def test_manifest_bindings_flatten_every_mcp_entry_verbatim() -> None:
 
 
 def test_built_agent_defaults_to_no_bindings() -> None:
+    """存量构造点一处都不传 ``arg_bindings`` —— 字段必须有默认值,且默认就是空。"""
     from orchestrator.built_agent import BuiltAgent
 
-    assert BuiltAgent.__dataclass_fields__["arg_bindings"].default_factory is not None or (
-        BuiltAgent.__dataclass_fields__["arg_bindings"].default == ()
-    )
+    (field,) = [f for f in dataclasses.fields(BuiltAgent) if f.name == "arg_bindings"]
+    factory = field.default_factory
+    default = field.default if factory is dataclasses.MISSING else factory()
+    assert default == ()
