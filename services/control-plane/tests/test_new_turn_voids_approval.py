@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -407,6 +408,11 @@ async def test_new_turn_runs_behind_the_gate_and_voids_the_paused_turn(s: _Stack
     assert (await s.row(run_b)).status is RunStatus.PAUSED
     assert "event: approval" in resp_b.text
     await _assert_voided(s, run_a, by=run_b)
+    end_user = await s.app.state.tenant_user_repo.resolve(
+        tenant_id=s.tenant_id, subject_type="user", subject_id=f"ext:{_USER}"
+    )
+    (audit,) = await s.void_audits()
+    assert audit.on_behalf_of == str(end_user.id)
 
     # B 的模型请求里每个工具调用都有结果 —— A 那条被作废的调用补上了「已作废」。
     assert sanitize_dangling_tool_calls(s.llm.prompts[-1]) == []
@@ -787,6 +793,8 @@ async def test_a_new_turn_inside_the_registration_window_leaves_no_unanswered_ca
     assert (await s.row(run_b)).status is RunStatus.SUCCESS
     assert sanitize_dangling_tool_calls(s.llm.prompts[1]) == []
     assert (await s.approval(run_a)).status is ApprovalStatus.PENDING
+    row_a = await s.row(run_a)
+    assert (row_a.status, row_a.error) == (RunStatus.INTERRUPTED, "new_turn")
 
     _, run_c, _ = await s.start(thread)
 
@@ -876,6 +884,75 @@ async def test_a_turn_cancelled_before_its_tools_ran_is_closed_by_the_next_turn(
     assert (await s.row(run_b)).status is RunStatus.SUCCESS
     assert s.tool.seen == []
     assert await s.void_audits() == []
+
+
+@pytest.mark.asyncio
+async def test_an_approval_registered_after_the_void_is_voided_by_the_repair(s: _Stack) -> None:
+    """待审批在新一轮的作废查询之后才登记:收口尾巴时照常作废它。"""
+    thread, run_a, _ = await s.start()
+    new_run = uuid4()
+
+    closed = await repair_turn_tail(
+        graph=s.graph,
+        thread_id=thread,
+        tenant_id=s.tenant_id,
+        new_run_id=new_run,
+        approvals=s.approvals,
+        run_manager=s.runtime.run_manager,
+        audit=s.app.state.audit_logger,
+        actor_id="sa-integrator",
+    )
+
+    assert closed == 1
+    await _assert_voided(s, run_a, by=new_run)
+
+
+@pytest.mark.asyncio
+async def test_a_tail_whose_run_is_still_running_is_left_alone() -> None:
+    """尾巴所属的 run 还在跑(并发的一轮):不补、不写检查点。"""
+    run_store = InMemoryRunStore()
+    manager = RunManager(store=run_store)
+    thread, tenant, live = uuid4(), uuid4(), uuid4()
+    now = datetime.now(UTC)
+    await run_store.create(
+        RunInfo(
+            run_id=live,
+            tenant_id=tenant,
+            thread_id=thread,
+            user_id=None,
+            status=RunStatus.RUNNING,
+            on_disconnect=DisconnectMode.CONTINUE,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=None,
+        )
+    )
+    tail = AIMessage(
+        content="",
+        tool_calls=[{"name": _GATED, "args": {}, "id": "tc-live", "type": "tool_call"}],
+        additional_kwargs={STAMP_RUN_ID: str(live)},
+    )
+
+    class _LiveTail:
+        async def aget_state(self, *_: Any, **__: Any) -> Any:
+            return SimpleNamespace(values={"messages": [tail]})
+
+        async def aupdate_state(self, *_: Any, **__: Any) -> None:
+            raise AssertionError("还在跑的一轮不能被收口")
+
+    closed = await repair_turn_tail(
+        graph=_LiveTail(),
+        thread_id=thread,
+        tenant_id=tenant,
+        new_run_id=uuid4(),
+        approvals=InMemoryApprovalStore(),
+        run_manager=manager,
+        audit=build_default_audit_logger(InMemoryAuditLogStore()),
+        actor_id="t",
+    )
+    assert closed == 0
 
 
 @pytest.mark.asyncio
