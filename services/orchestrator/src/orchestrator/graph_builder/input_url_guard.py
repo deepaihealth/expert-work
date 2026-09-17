@@ -136,9 +136,22 @@ def find_retyped_url(code: str, candidates: Sequence[UrlCandidate]) -> GuardHit 
     return best
 
 
-def guard_message(hit: GuardHit) -> str:
-    """回给模型的那句话 —— 它就是最准时的提醒(spec §6.3 否决每轮提醒的理由)。"""
+def guard_message(hit: GuardHit, *, trusted: bool = True) -> str:
+    """回给模型的那句话 —— 它就是最准时的提醒(spec §6.3 否决每轮提醒的理由)。
+
+    ``trusted=False``:这条消息是平台合成的,不过 spotlight 围栏(只有真工具输出过);而
+    链接名(列表项说明 / dict 键的 slug、URL 后缀)与模型抄的那串都带租户数据 —— 两样都
+    不写,只说目录与清单。
+    """
     verdict = "与输入一致" if hit.distance == 0 else f"疑似抄错 {hit.distance} 处"
+    if not trusted:
+        return (
+            f"[blocked] 代码里有一处地址是输入 {hit.var_name} 的手抄件"
+            f"（平台比对：{verdict}）。"  # noqa: RUF001 — 面向模型的中文全角标点
+            "这个文件应在 $EXPERT_WORK_INPUTS_DIR 下，确切文件名见 $EXPERT_WORK_INPUTS 清单里"  # noqa: RUF001
+            f"{hit.var_name} 对应条目的 local_path（不在则按清单里的原地址下载）；"  # noqa: RUF001
+            "请用代码从清单里读路径或原地址，不要手抄。"  # noqa: RUF001
+        )
     return (
         f"[blocked] 代码里的地址 {hit.written} 是输入 {hit.var_name} 的手抄件"
         f"（平台比对：{verdict}）。"  # noqa: RUF001 — 面向模型的中文全角标点
