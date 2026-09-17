@@ -329,3 +329,53 @@ async def test_void_and_decide_race_has_exactly_one_winner(
             assert row.status is expected
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_void_continuation_only_for_the_cas_winners_continuation(
+    approval_store: ApprovalStoreFixture,
+) -> None:
+    """班车 2 终审 C1 —— 与内存店同一份谓词:租户 + run + 续跑 id 三者都对才改。"""
+    store, engine = approval_store
+    try:
+        tenant, run_id, cont = uuid4(), uuid4(), uuid4()
+        await store.create(_record(tenant_id=tenant, run_id=run_id))
+        now = datetime.now(UTC)
+        assert await store.mark_decided(
+            run_id=run_id,
+            tenant_id=tenant,
+            status=ApprovalStatus.MODIFIED,
+            decided_by="human",
+            decided_at=now,
+            modified_args={"url": "https://example.org"},
+            idempotency_key="k",
+            continuation_run_id=cont,
+        )
+        pending_run = uuid4()
+        await store.create(_record(tenant_id=tenant, run_id=pending_run))
+
+        async def void(run: UUID, tenant_id: UUID, continuation: UUID) -> bool:
+            return await store.void_continuation(
+                run_id=run,
+                tenant_id=tenant_id,
+                continuation_run_id=continuation,
+                decided_by="system:new_turn",
+                decided_at=now,
+            )
+
+        assert not await void(run_id, tenant, uuid4())
+        assert not await void(run_id, uuid4(), cont)
+        assert not await void(pending_run, tenant, cont)
+        assert await void(run_id, tenant, cont)
+        assert not await void(run_id, tenant, cont)
+
+        row = await store.get_by_run(run_id=run_id, tenant_id=tenant)
+        assert row is not None
+        assert row.status is ApprovalStatus.REJECTED
+        assert row.decided_by == "system:new_turn"
+        assert row.continuation_run_id is None
+        assert row.idempotency_key == "k"
+        untouched = await store.get_by_run(run_id=pending_run, tenant_id=tenant)
+        assert untouched is not None and untouched.status is ApprovalStatus.PENDING
+    finally:
+        await engine.dispose()

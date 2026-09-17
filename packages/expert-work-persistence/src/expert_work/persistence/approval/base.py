@@ -143,6 +143,25 @@ class ApprovalStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def void_continuation(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        continuation_run_id: UUID,
+        decided_by: str,
+        decided_at: datetime,
+    ) -> bool:
+        """裁定 CAS 的赢家发现续跑已经开不了(会话已被新一轮占用),把这次裁定改记为作废。
+
+        班车 2 终审 C1。条件 UPDATE:行上的 ``continuation_run_id`` 必须正是调用方
+        在 CAS 里写下的那个 —— 只有赢家知道它,别人改不动;``pending`` 行的续跑 id
+        为空,永远不匹配。命中后 ``status=rejected``、``decided_by`` / ``decided_at``
+        改写、``continuation_run_id`` 清空(同 key 的幂等重放于是拿不到一个从未创建
+        过的 run id,只会得到 409);``idempotency_key`` 保留。返回是否命中。
+        """
+
+    @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         """Phase 3a (purge_user) — hard-delete EVERY approval row for a user.
 

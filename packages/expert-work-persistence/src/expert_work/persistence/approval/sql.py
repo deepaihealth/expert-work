@@ -242,6 +242,34 @@ class SqlApprovalStore(ApprovalStore):
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
 
+    async def void_continuation(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        continuation_run_id: UUID,
+        decided_by: str,
+        decided_at: datetime,
+    ) -> bool:
+        # 谓词与内存店同义:run + 租户 + 续跑 id 三者都对才改。
+        async with self._sf() as session:
+            result = await session.execute(
+                update(AgentApprovalRow)
+                .where(
+                    AgentApprovalRow.run_id == run_id,
+                    AgentApprovalRow.tenant_id == tenant_id,
+                    AgentApprovalRow.continuation_run_id == continuation_run_id,
+                )
+                .values(
+                    status=ApprovalStatus.REJECTED.value,
+                    decided_by=decided_by,
+                    decided_at=decided_at,
+                    continuation_run_id=None,
+                )
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         stmt = delete(AgentApprovalRow).where(
             AgentApprovalRow.tenant_id == tenant_id,

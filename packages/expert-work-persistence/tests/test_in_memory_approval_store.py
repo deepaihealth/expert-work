@@ -431,3 +431,74 @@ async def test_list_pending_by_thread_scopes_tenant_thread_and_status() -> None:
 
     assert [r.run_id for r in rows] == [older.run_id, newer.run_id]
     assert await store.list_pending_by_thread(thread_id=uuid4(), tenant_id=tenant) == []
+
+
+@pytest.mark.asyncio
+async def test_void_continuation_only_for_the_cas_winners_continuation() -> None:
+    """班车 2 终审 C1 —— 裁定赢了 CAS、续跑却开不了:只有带着自己续跑 id 的调用方改得动。"""
+    store = InMemoryApprovalStore()
+    tenant, run_id, cont = uuid4(), uuid4(), uuid4()
+    await store.create(_record(tenant_id=tenant, run_id=run_id))
+    decided_at = datetime.now(UTC)
+    assert await store.mark_decided(
+        run_id=run_id,
+        tenant_id=tenant,
+        status=ApprovalStatus.APPROVED,
+        decided_by="human",
+        decided_at=decided_at,
+        idempotency_key="k",
+        continuation_run_id=cont,
+    )
+
+    assert not await store.void_continuation(
+        run_id=run_id,
+        tenant_id=tenant,
+        continuation_run_id=uuid4(),
+        decided_by="system:new_turn",
+        decided_at=decided_at,
+    )
+    assert not await store.void_continuation(
+        run_id=run_id,
+        tenant_id=uuid4(),
+        continuation_run_id=cont,
+        decided_by="system:new_turn",
+        decided_at=decided_at,
+    )
+    assert await store.void_continuation(
+        run_id=run_id,
+        tenant_id=tenant,
+        continuation_run_id=cont,
+        decided_by="system:new_turn",
+        decided_at=decided_at,
+    )
+
+    row = await store.get_by_run(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is ApprovalStatus.REJECTED
+    assert row.decided_by == "system:new_turn"
+    assert row.continuation_run_id is None
+    assert row.idempotency_key == "k"
+    # 第二次:续跑 id 已经清掉,条件不再成立。
+    assert not await store.void_continuation(
+        run_id=run_id,
+        tenant_id=tenant,
+        continuation_run_id=cont,
+        decided_by="system:new_turn",
+        decided_at=decided_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_void_continuation_never_touches_a_pending_row() -> None:
+    store = InMemoryApprovalStore()
+    tenant, run_id = uuid4(), uuid4()
+    await store.create(_record(tenant_id=tenant, run_id=run_id))
+    assert not await store.void_continuation(
+        run_id=run_id,
+        tenant_id=tenant,
+        continuation_run_id=uuid4(),
+        decided_by="system:new_turn",
+        decided_at=datetime.now(UTC),
+    )
+    row = await store.get_by_run(run_id=run_id, tenant_id=tenant)
+    assert row is not None and row.status is ApprovalStatus.PENDING
