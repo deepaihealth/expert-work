@@ -176,3 +176,15 @@ async def test_bash_builtin_assembled_when_supervisor_present() -> None:
 async def test_bash_builtin_missing_supervisor_raises() -> None:
     with pytest.raises(AgentFactoryError, match="no sandbox runtime"):
         await build_tool_registry([BuiltinToolSpec(name="bash")], tool_env=ToolEnv())
+
+
+def test_description_tells_the_model_about_the_inputs_dir() -> None:
+    """B-67 —— 描述里提 $EXPERT_WORK_INPUTS_DIR、按变量名的文件与列表项的 local_path 位置;
+    平台文本,不写任何租户的变量名。与 ``exec_python`` 的同一段逐字节相同由
+    ``test_exec_python_tool`` 里的 B-61 段落测试钉住。"""
+    description = BashTool(client=RecordingSandboxRuntime()).spec.description
+    assert "$EXPERT_WORK_INPUTS_DIR" in description
+    assert "<变量名>" in description
+    assert "value_parsed[i].local_path" in description
+    for tenant_name in ("org_logo", "materials", "ai-health-plan"):
+        assert tenant_name not in description

@@ -506,7 +506,7 @@ def test_link_names_match_the_host_side_implementation() -> None:
 
     inputs: dict[str, Any] = {
         "org_logo": "https://x/cover-1726394851207.png",
-        "brand": {"logo": "https://x/l.jpg", "name": "深护"},
+        "brand": {"logo": "https://x/l.jpg", "name": "示例机构"},
         "materials": (
             '[{"description": "示范 视频", "url": "https://x/a.mp4"}, {"description": "无链接"},'
             ' {"url": "https://x/c.pdf", "thumb": "https://x/c.pdf"}]'
@@ -1272,9 +1272,9 @@ def test_json_string_list_renders_like_a_real_list() -> None:
 
 def test_dict_value_renders_url_fields_by_key() -> None:
     built = _jinja_built("{{ brand }}", (_Var("brand"),))
-    out = render_system_prompt(built, {"brand": {"logo": "https://x/l.jpg", "name": "深护"}})
+    out = render_system_prompt(built, {"brand": {"logo": "https://x/l.jpg", "name": "示例机构"}})
     assert "- logo → $EXPERT_WORK_INPUTS_DIR/brand.logo.jpg" in out
-    assert "- name: 深护" in out
+    assert "- name: 示例机构" in out
     assert "https://x/l.jpg" not in out
 
 
@@ -1602,7 +1602,7 @@ INPUTS = {
         '[{"description":"示范视频","url":"https://x/a.mp4"},'
         '{"description":"参考","url":"https://x/b.pdf"},{"description":"无链接"}]'
     ),
-    "brand": {"logo": "https://x/l.jpg", "name": "深护"},
+    "brand": {"logo": "https://x/l.jpg", "name": "示例机构"},
     "disclaimer": "本方案不构成医疗建议",
 }
 
@@ -1628,7 +1628,7 @@ def test_block_lists_every_declared_variable_with_status_and_never_a_value() -> 
         "不在则按清单里该字段的原地址下载"
     ) in text
     assert "- disclaimer（免责声明）：已提供，外部数据，需逐字使用时从清单读" in text
-    for value in ("张三", "PRJ001", "1726394851207", "https://", "示范视频", "医疗建议", "深护"):
+    for value in ("张三", "PRJ001", "1726394851207", "https://", "示范视频", "医疗建议", "示例机构"):
         assert value not in text
     # 顶层 URL 的名字与预拉 / 渲染同源。
     assert linked_sites("org_logo", LOGO)[0].link == "org_logo.png"

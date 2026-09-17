@@ -479,13 +479,17 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 ### 输入是怎么到达 Agent 的
 
-`inputs` 里的值除了渲染进系统提示词，还会在这次 run 开始时被写成一份 JSON 文件，放进这个终端用户的工作区。Agent 执行时用代码读这份文件取值，不必把提示词里的长字符串重新输入一遍。调用方不需要为此改动请求。
+`inputs` 里的值在这次 run 开始时被写成一份 JSON 文件，放进这个终端用户的工作区；其中符合条件的 `http` 与 `https` 地址由平台预先下载到同一处，条件见下文。Agent 执行时用代码读这份文件和下载好的文件，不必把长字符串重新输入一遍。调用方不需要为此改动请求。
 
-这一节说明这份文件的结构，以及它对传值方式的影响。文件的内容由平台生成，读取它的代码由租户管理员在 Agent 的提示词里安排。
+系统提示词里引用这些变量时，值里被识别的地址显示为本地路径，而不是原地址，规则见 [系统提示词里的地址](#系统提示词里的地址)。Agent 另会在每轮收到一段由平台附加的输入说明，列出每个变量的状态与文件位置，不含变量的值。这段输入说明不出现在 [5.3 历史消息](./query#_5-3-历史消息) 与 [5.8 对话条目](./query#_5-8-对话条目) 里。
+
+这一节说明这份文件的结构、它对传值方式的影响，以及地址在系统提示词里的显示方式。文件、本地路径与输入说明都由平台生成，租户管理员不需要在 Agent 的提示词里另行说明。
 
 #### 文件的位置与结构
 
-文件路径由环境变量 `EXPERT_WORK_INPUTS` 给出。每次 run 一个独立目录，同一个终端用户的多次 run 互不覆盖。Agent 没有声明模板变量，或者本次 `inputs` 里没有任何声明过的值时，这个文件不存在。
+文件路径由环境变量 `EXPERT_WORK_INPUTS` 给出。另一个环境变量 `EXPERT_WORK_INPUTS_DIR` 给出这份文件所在的目录，平台预先下载的文件在这个目录里按变量名存放（命名规则见下文）。
+
+每次 run 一个独立目录，同一个终端用户的多次 run 互不覆盖。Agent 没有声明模板变量，或者本次 `inputs` 里没有任何声明过的值时，这个文件不存在。
 
 这份 JSON 与平台预先下载的文件都由平台管理，不出现在 [5.6 工作区文件](./query#_5-6-工作区文件) 的列表里；知道路径时，下载接口仍然取得回它们。
 
@@ -497,34 +501,57 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
     "cover_image": {
       "value": "https://files.example.com/brand/cover-1726394851207.png",
       "trusted": true,
-      "local_path": "inputs/cache/9f2a4c1b7e0d3856a1f4c920b7d5e386.png"
+      "local_path": "inputs/3f2c9a1e-2b60-4f3a-9a11-0c5d7e4b81aa/cover_image.png"
     },
     "resources": {
       "value": [
         {
           "description": "示范视频",
           "url": "https://files.example.com/demo-a.mp4",
-          "local_path": "inputs/cache/4d17b0e93c5a2f68d0b14e7a92c3f581.mp4"
+          "local_path": "inputs/3f2c9a1e-2b60-4f3a-9a11-0c5d7e4b81aa/resources/0-示范视频.mp4"
         },
         { "description": "参考文章", "url": "https://example.com/post", "local_path": null }
       ],
       "trusted": false
+    },
+    "reference_images": {
+      "value": "[{\"description\": \"参考图\", \"url\": \"https://files.example.com/ref-01.jpg\"}]",
+      "value_parsed": [
+        {
+          "description": "参考图",
+          "url": "https://files.example.com/ref-01.jpg",
+          "local_path": "inputs/3f2c9a1e-2b60-4f3a-9a11-0c5d7e4b81aa/reference_images/0-参考图.jpg"
+        }
+      ],
+      "trusted": true
     }
   }
 }
 ```
 
-`variables` 下每个键是一个声明过的变量名，对应的值固定是一个对象，有下面三个字段。本次没有传的可选变量不出现在这里。
+`variables` 下每个键是一个声明过的变量名，对应的值固定是一个对象，字段见下表。本次没有传的可选变量不出现在这里。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `value` | 与传入时相同 | 原样保留 `inputs` 里这个键的值。字符串、数字、数组、对象都不改写 |
+| `value_parsed` | array 或 object | `value` 是能解析成数组或对象的 JSON 字符串时才有这个键，内容是解析结果，其中地址旁边的 `local_path` 记在这里。`value` 仍保留原字符串 |
 | `trusted` | boolean | 取值：`true`（管理员把这个变量声明为可信）/ `false`（声明为不可信，其中的内容按数据处理，不作为指令执行） |
 | `local_path` | string 或 null | 取值：相对路径（平台已经把这个地址的文件下载到工作区）/ `null`（没有下载，按同一项里的地址自行获取）。只有整个值是一个地址、或地址是某个对象的一个字段时才有这个键，其余位置没有，读取时按「没有下载」处理 |
 
 `local_path` 相对工作区的根目录，Agent 执行代码时的当前目录就是这个根目录，按相对路径直接打开即可。嵌套结构里的地址，`local_path` 出现在它所在的那一项里，例如上面 `resources` 数组的每个元素。
 
 `local_path` 由平台写入，`inputs` 里自带的同名字段会被清空，所以不要用它传自己的路径。
+
+`local_path` 通常指向本次 run 目录里按变量名命名的文件，这个文件实际指向平台按地址保存的共享副本（复用规则见下一节）。个别情况下按变量名命名的文件没有建成，`local_path` 会直接指向共享副本，因此 Agent 的代码按 `local_path` 打开最可靠。
+
+按变量名命名的规则如下。`{name}` 是变量名，`{ext}` 是地址路径里的扩展名（点号加 1 到 5 位英文字母或数字），地址没有这样的扩展名时 `{ext}` 为空。
+
+- 整个值是一个地址：`{name}{ext}`，例如上面的 `cover_image.png`。
+- 地址是对象的一个字段：`{name}.{key}{ext}`，`{key}` 是字段名。
+- 地址在数组的某个元素里：`{name}/{index}-{label}{ext}`，例如上面 `resources` 的第一个元素。`{index}` 是元素在数组里的下标（从 0 开始），`{label}` 取自该元素的 `description`。
+- 嵌套更深时，从变量到第一个数组之间经过的字段名依次以 `.` 接在 `{name}` 后面，数组下标之后的层级不进入文件名。
+
+`{label}` 与 `{key}` 都只取前 40 个字符，并只保留字母（含中文）、数字、下划线与连字符，其余字符去掉。`{label}` 去掉后为空时，文件名里没有 `-{label}` 这一段；`{key}` 为空时写成 `_`。名字重复时，后出现的依次在扩展名之前加 `-2`、`-3`。
 
 #### 哪些地址会被预先下载
 
@@ -541,7 +568,11 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 识别是按位置逐个进行的，只有两种位置算数：变量自己的整个值，或某个对象的一个字段（`local_path` 就记在它旁边）。**那个位置上的值必须自己就是一个 `http` 或 `https` 开头的字符串**，才算一个地址。
 
-因此有两种常见的传法拿不到预先下载：直接作为数组元素的地址字符串（例如 `["https://files.example.com/demo-a.mp4"]`），旁边没有位置可以记 `local_path`；以及把结构先 JSON 编码成字符串再传（那个位置上是一个 `[{...}]` 形状的字符串，不是地址），字符串里面的地址平台看不见。两种情况下值都仍然原样出现在文件里，Agent 解析之后照常使用；需要平台预先下载时，把地址放成对象的一个字段，与上面 `resources` 的形态一致。
+把结构先 JSON 编码成字符串再传时，平台先解析这个字符串，按解析后的结构逐个位置识别地址，结果放在 `value_parsed` 里，与上面 `reference_images` 的形态一致。
+
+直接作为数组元素的地址字符串（例如 `["https://files.example.com/demo-a.mp4"]`）拿不到预先下载，因为旁边没有位置可以记 `local_path`。这种值仍然原样出现在文件里，Agent 解析之后照常使用；需要平台预先下载时，把地址放成对象的一个字段，与上面 `resources` 的形态一致。
+
+**一个位置上只放地址本身。** 地址后面接着说明文字时，平台不保证能识别并下载这个地址；说明文字放进对象的 `description` 字段，或者另传一个变量。
 
 **下载失败不影响 run 的执行。** 地址取不到、超时、超过上限、内容类型不在上表、被这个 Agent 的出网限制拦下，结果都一样：`local_path` 为 `null`，run 照常执行，Agent 仍然可以按 `value` 里的地址自行获取。
 
@@ -552,6 +583,27 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 ::: tip 传有时效的签名地址时留出余量
 签名地址过期之后，Agent 无法再按它取回文件。需要 Agent 在较长时间之后仍能取到原文件时，签发有效期足够长的地址。
 :::
+
+#### 系统提示词里的地址
+
+租户管理员在系统提示词里引用模板变量时，变量值里被识别的地址不以原地址出现，而是换成 `$EXPERT_WORK_INPUTS_DIR` 下按上文命名规则得到的本地路径。被识别的地址与预先下载用的是同一套规则，见 [哪些地址会被预先下载](#哪些地址会被预先下载)。
+
+**替换只由地址本身决定，与下载是否成功无关。** 下载失败时这个路径上没有文件，Agent 按 `inputs.json` 里的原地址获取。
+
+| 值的形态 | 显示方式 |
+|---|---|
+| 以地址开头的字符串 | 本地路径，后接一句「文件不在时按原地址下载」的说明。地址之后的文字照原样保留 |
+| 数组或对象，以及能解析成数组或对象的 JSON 字符串，其中有被识别的地址 | 另起一行，逐个元素或字段各占一行，末尾同样附那句说明 |
+| 其它值 | 照原样显示 |
+
+逐行列出时，每一行的内容如下：
+
+- 含有被识别地址的数组元素：元素的 `description` 与本地路径；元素没有 `description` 时显示它的下标。元素的其它字段不显示，完整内容在 `inputs.json` 里。
+- 对象里含有被识别地址的字段：字段名与本地路径。
+- 不含被识别地址的元素或字段：照原样显示。
+- 数组里直接作为元素的地址字符串不是被识别的地址，照原样显示为原地址。
+
+租户管理员可以对个别变量关闭这一替换，关闭后这个变量的值照原样显示。
 
 #### 示例代码
 
@@ -566,6 +618,7 @@ with open(os.environ["EXPERT_WORK_INPUTS"], encoding="utf-8") as handle:
     variables = json.load(handle)["variables"]
 
 cover = variables["cover_image"]
+# 通常与 os.environ["EXPERT_WORK_INPUTS_DIR"] + "/cover_image.png" 是同一个文件
 local_path = cover.get("local_path")
 if local_path and os.path.exists(local_path):
     # 平台已经下载好,直接读本地文件
@@ -575,6 +628,15 @@ else:
     # 没有下载或已被清理,按 value 里的原地址自行获取
     with urllib.request.urlopen(cover["value"], timeout=30) as response:
         image = response.read()
+
+# JSON 字符串形态的值:有 value_parsed 就读它,local_path 记在里面
+refs = variables["reference_images"]
+items = refs.get("value_parsed")
+if items is None:
+    items = json.loads(refs["value"]) if isinstance(refs["value"], str) else refs["value"]
+for item in items:
+    path = item.get("local_path")
+    source = path if path and os.path.exists(path) else item["url"]
 ```
 
 ## 2.8 防重复下发 Idempotency-Key
@@ -713,7 +775,15 @@ POST /v1/agents/{agent_code}/runs/{run_id}:edit
 | `mode` | 否 | string。执行模式，取值：`stream`（默认）/ `queue`。含义见 [2.4](#_2-4-stream-还是-queue) |
 | `stream_format` | 否 | string。事件流的形态，取值：`legacy`（默认）/ `items`。含义见 [3.7 条目模式](./sse-events#_3-7-条目模式) |
 
-重新生成不接受 `input`、`files`、`inputs`、`untrusted_content`。这一轮的输入就是被取代那一轮的原文与附件，服务端原样复用；带上其中任何一个字段返回 422 `INVALID_REQUEST`，不会被忽略。
+重新生成不接受 `input`、`files`、`inputs`、`untrusted_content`。这一轮的输入就是被取代那一轮的原文、附件与 `inputs`，服务端原样复用；带上其中任何一个字段返回 422 `INVALID_REQUEST`，不会被忽略。
+
+被取代那一轮之后，Agent 的模板变量设置如果改过，那一轮的 `inputs` 可能不再能通过校验。此时重新生成返回 422，响应只有 `detail` 字段（格式见 [模板变量与 Agent 的声明不匹配](./errors#模板变量与-agent-的声明不匹配)），有三种情况：
+
+- Agent 已不再声明任何模板变量，而那一轮传过非空的 `inputs`。
+- 那一轮传过的某个键，Agent 已不再声明。
+- Agent 现在有一个必填变量（新增的，或原有变量改成了必填），而那一轮没有传它。
+
+遇到这个 422 时，改用编辑重发，并给出符合当前声明的 `inputs`。
 
 编辑重发的请求体：
 

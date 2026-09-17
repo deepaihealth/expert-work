@@ -101,6 +101,12 @@ class BashTool:
                 "文件里 local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载；"  # noqa: RUF001
                 "极少数情况下（挂起很久之后续跑）该文件已被清理，"  # noqa: RUF001
                 "这时改用同一项里的原始 URL 自己下载。"
+                "平台预先下载的文件在 $EXPERT_WORK_INPUTS_DIR 目录里按变量名放着："  # noqa: RUF001 — B-67 §4.1
+                "整个值是地址的变量叫 <变量名><扩展名>，对象字段里的叫 <变量名>.<字段名><扩展名>，"  # noqa: RUF001
+                "列表项叫 <变量名>/<下标-说明><扩展名>；"  # noqa: RUF001
+                "列表项的确切路径在清单里该项的 local_path"
+                "（值是 JSON 字符串时在 value_parsed[i].local_path）。"  # noqa: RUF001
+                "文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
             ),
             parameters={
                 "type": "object",
