@@ -45,6 +45,18 @@ def test_first_user_message() -> None:
     assert first_user_message(messages) == "summarise this"
 
 
+def test_first_user_message_skips_hidden_entries() -> None:
+    """B-67 —— 只带 inputs 的 run 用户消息正文为空,下一条 user 是隐藏「本轮输入」段;
+    重放任务不能拿它当 prompt。"""
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": ""},
+        {"role": "user", "content": "[inputs block]", "hidden": True},
+        {"role": "assistant", "content": "ok"},
+    ]
+    assert first_user_message(messages) is None
+    assert first_user_message([*messages, {"role": "user", "content": "real ask"}]) == "real ask"
+
+
 def test_first_user_message_none_when_absent() -> None:
     assert first_user_message([{"role": "assistant", "content": "hi"}]) is None
 

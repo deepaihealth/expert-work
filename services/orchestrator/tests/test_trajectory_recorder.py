@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectStoreError
 from orchestrator.trajectory import (
     TrajectoryRecord,
@@ -46,6 +47,21 @@ def test_serialize_maps_message_classes_to_sharegpt_roles() -> None:
     # tool_call_id round-trips for ToolMessage so the trajectory is a
     # faithful replay.
     assert out[3]["tool_call_id"] == "tc-1"
+
+
+def test_serialize_flags_hidden_messages_only() -> None:
+    """B-67 —— 隐藏 human(「本轮输入」段、恢复建议)在 ShareGPT 里也是 ``user``;带上
+    ``hidden`` 让下游取「用户请求」时能跳过它。普通消息的形状不变。"""
+    out = serialize_messages_sharegpt(
+        [
+            HumanMessage(content=""),
+            HumanMessage(content="[inputs block]", additional_kwargs={HIDE_FROM_UI: True}),
+        ]
+    )
+    assert out == [
+        {"role": "user", "content": ""},
+        {"role": "user", "content": "[inputs block]", "hidden": True},
+    ]
 
 
 def test_serialize_carries_tool_calls_on_ai_message() -> None:
