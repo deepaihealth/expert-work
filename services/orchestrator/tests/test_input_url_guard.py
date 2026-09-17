@@ -163,7 +163,9 @@ def test_near_match_perf_on_long_tails_is_fast() -> None:
     """P19:20 写法 x 20 候选、~8000 字符的尾串。每个写法只跟同下标的候选「差一点」
     (要跑满整段带宽),跟其余 19 个候选在前几个字符就能判定 > cap(现实里 20 个兄弟
     输入各有自己的签名串,不会跟别的候选撞出一段相同前缀)。全矩阵版本单次比较这个
-    长度就要 10+ 秒(见 report 里的旧实现实测),带宽裁剪必须整体在 1 秒内跑完。"""
+    长度就要 10+ 秒(见 report 里的旧实现实测),带宽裁剪要能整体在 2 秒内跑完 ——
+    实测约 0.23 秒,界定在 2 秒是为了在 CI ``-n auto``(多个 worker 抢 CPU)下留够
+    余量,不是算法本身需要这么久(fix round 2:1 秒的界在这种环境下偶发抖动)。"""
     base = "d" * 7990
     candidates = tuple(
         UrlCandidate(var_name=f"v{i}", url=f"https://p/{_salt(i)}{base}{i:04d}", link=f"v{i}.bin")
@@ -176,7 +178,7 @@ def test_near_match_perf_on_long_tails_is_fast() -> None:
     started = time.perf_counter()
     find_retyped_url(code, candidates)
     elapsed = time.perf_counter() - started
-    assert elapsed < 1.0, f"took {elapsed:.3f}s"
+    assert elapsed < 2.0, f"took {elapsed:.3f}s"
 
 
 def test_url_literal_extraction_stops_at_chinese_punctuation() -> None:
@@ -196,3 +198,18 @@ def test_scheme_match_is_case_insensitive() -> None:
     assert URL_RE.findall(f"open('{written}')") == [written]
     hit = find_retyped_url(f"open('{written}')", CAND)
     assert hit == GuardHit(var_name="org_logo", link="org_logo.png", distance=0, written=written)
+
+
+def test_host_match_is_case_insensitive() -> None:
+    """review fix round 2 #1:候选的 host 与代码里写法的 host 只是大小写不同,也要判定
+    同 host —— 与 #4(scheme 大小写不敏感)是两件事:那条测的是 URL_RE 抽不抽得出来
+    大写 scheme,这条测的是 ``_split`` 里 host 比较本身。"""
+    cand = (
+        UrlCandidate(
+            var_name="org_logo",
+            url=LOGO.replace("files.example.com", "Files.Example.COM"),
+            link="org_logo.png",
+        ),
+    )
+    hit = find_retyped_url(f"open('{LOGO}')", cand)
+    assert hit == GuardHit(var_name="org_logo", link="org_logo.png", distance=0, written=LOGO)
