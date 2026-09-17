@@ -22,7 +22,7 @@ import ast
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -451,8 +451,7 @@ async def _cancel_leftover_tasks(runtime: AgentRuntime) -> None:
         task = record.task
         if task is not None and not task.done():
             task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await task
+            await asyncio.gather(task, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------

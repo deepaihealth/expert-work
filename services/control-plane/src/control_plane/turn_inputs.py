@@ -92,7 +92,12 @@ async def resolve_turn_inputs(
     if not frames:
         # 一轮的第一个 run 必然发过这一帧(``run_agent`` 在第一个业务帧之前发)。
         # 没有 = 落库丢了,或审批链没串上(root 其实是个续跑段)。两种都要看得见。
-        logger.warning("turn_inputs.prompt_frame_missing run_id=%s root_run_id=%s", run_id, root)
+        # 两个都是 UUID 对象,承载不了换行 —— 与 ``_run_usage`` 同一条 log-injection 抑制论证。
+        logger.warning(  # codeql[py/log-injection]
+            "turn_inputs.prompt_frame_missing run_id=%s root_run_id=%s",
+            run_id,  # codeql[py/log-injection]
+            root,  # codeql[py/log-injection]
+        )
         return TurnInputs(root_run_id=root)
     return TurnInputs(root_run_id=root, inputs=_inputs_of(frames[0].data))
 
