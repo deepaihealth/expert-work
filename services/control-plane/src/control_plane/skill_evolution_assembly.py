@@ -70,9 +70,13 @@ def extract_task_prompt(input_obj: Mapping[str, object]) -> str | None:
 
 
 def first_user_message(messages: Sequence[Mapping[str, Any]]) -> str | None:
-    """Return the first user-role message content of a ShareGPT trajectory."""
+    """Return the first user-role message content of a ShareGPT trajectory.
+
+    Entries flagged ``hidden`` (B-67 inputs block, advisories — platform
+    scaffolding serialised as ``user``) are not the user's request.
+    """
     for message in messages:
-        if message.get("role") == "user":
+        if message.get("role") == "user" and not message.get("hidden"):
             content = str(message.get("content", "")).strip()
             if content:
                 return content

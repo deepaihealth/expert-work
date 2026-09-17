@@ -42,6 +42,7 @@ from dataclasses import dataclass
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.runtime.tokens import TokenEstimator
 from orchestrator.context.compressor import estimate_tokens
 
@@ -79,17 +80,25 @@ def trim_to_recent_turns(
     """Trim ``messages`` to the first turn plus the most-recent N turns.
 
     Token-unaware: callers gate on size via :meth:`WorkingWindow.should_trim`.
-    A "turn" is the span a ``HumanMessage`` opens. Cutting only on
+    A "turn" is the span a non-hidden ``HumanMessage`` opens. Cutting only on
     ``HumanMessage`` indices preserves every ToolCall↔ToolResult pair
     (CM-C2). Returns a new list — never mutates the input.
 
+    Hidden ``HumanMessage`` s (B-67 inputs block right after the user message,
+    recovery advisories, delegation nudges) are scaffolding inside the turn
+    they sit in: they never open a turn, so a cut never separates a user
+    message from the block after it, and only user turns count toward
+    ``max_recent_turns`` / ``dropped_turns``.
+
     No-ops (``dropped_turns == 0``, original list returned) when there is no
-    turn boundary to cut on (no ``HumanMessage``) or the conversation already
-    fits within the budget.
+    turn boundary to cut on (no non-hidden ``HumanMessage``) or the
+    conversation already fits within the budget.
     """
     msgs = list(messages)
     leading, remainder = _split_leading_systems(msgs)
-    human_idxs = [i for i, m in enumerate(remainder) if isinstance(m, HumanMessage)]
+    human_idxs = [
+        i for i, m in enumerate(remainder) if isinstance(m, HumanMessage) and not is_hidden(m)
+    ]
     total_turns = len(human_idxs)
     # No turn boundary, or already within budget → nothing safe/needed to cut.
     if total_turns <= max_recent_turns:

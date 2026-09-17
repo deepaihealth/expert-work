@@ -16,6 +16,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.protocol import Plan, Reflection
 from expert_work.runtime.cancellation import (
     CANCELLATION_TOKEN_KEY,
@@ -164,6 +165,38 @@ async def test_reflect_node_revise_feedback_hidden_from_ui() -> None:
     )
     injected = out["messages"][0]
     assert injected.additional_kwargs.get("expert_work_hide_from_ui") is True
+
+
+@pytest.mark.asyncio
+async def test_reflect_trajectory_keeps_earlier_hidden_revise_feedback() -> None:
+    """裁定 P22 —— revise 注入的反馈是隐藏消息,下一轮反思必须看得到它(才能判断改没改到);
+    反思输出不落持久文本,轨迹里带着隐藏消息(包括「本轮输入」段)无害。"""
+    first = _RecordingLLM(
+        responses=[AIMessage(content='{"verdict": "revise", "critique": "MISSING-UNITS"}')]
+    )
+    out = await make_reflect_node(first, budget=3)(  # type: ignore[arg-type]
+        _state([HumanMessage(content="task"), AIMessage(content="weak answer")]),
+        {"configurable": {}},
+    )
+    feedback = out["messages"][0]
+    assert feedback.additional_kwargs.get(HIDE_FROM_UI) is True
+
+    second = _RecordingLLM(responses=[AIMessage(content='{"verdict": "accept", "critique": "ok"}')])
+    await make_reflect_node(second, budget=3)(  # type: ignore[arg-type]
+        _state(
+            [
+                HumanMessage(content="task"),
+                AIMessage(content="weak answer"),
+                feedback,
+                AIMessage(content="better answer"),
+            ],
+            reflections=out["reflections"],
+        ),
+        {"configurable": {}},
+    )
+    prompt = "\n".join(str(m.content) for m in second.calls[0])
+    assert "MISSING-UNITS" in prompt
+    assert "[ai] better answer" in prompt
 
 
 @pytest.mark.asyncio

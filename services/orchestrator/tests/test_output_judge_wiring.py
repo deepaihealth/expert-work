@@ -8,9 +8,10 @@ from typing import Literal
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.common.output_screen import REFUSAL_TEXT
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import (
@@ -166,3 +167,43 @@ async def test_judge_runs_once_on_terminal_only() -> None:
         )
     assert str(final["messages"][-1].content) == "final answer"
     assert judge.calls == 1  # only the terminal step, not the tool-calling step
+
+
+@dataclass
+class _RequestRecordingJudge:
+    requests: list[str] = field(default_factory=list)
+
+    async def judge(
+        self, *, user_request: str, response: str, context_hint: str | None
+    ) -> OutputJudgeVerdict:
+        del response, context_hint
+        self.requests.append(user_request)
+        return _ALIGNED
+
+
+@pytest.mark.asyncio
+async def test_judge_baseline_is_the_user_message_not_a_hidden_block_after_it() -> None:
+    """B-67 —— jinja 轮的输入是 [System, 用户消息, 隐藏「本轮输入」段];对齐基准必须是
+    用户消息,不是排在它后面的平台隐藏段。"""
+    judge = _RequestRecordingJudge()
+    llm = _ScriptedLLM(responses=[AIMessage(content="Ticket summary.")])
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=ToolRegistry(), output_judge=judge)
+        )
+        cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
+        await compiled.ainvoke(
+            {
+                "messages": [
+                    SystemMessage(content="sys"),
+                    HumanMessage(content="summarise the ticket"),
+                    HumanMessage(
+                        content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}
+                    ),
+                ],
+                "step_count": 0,
+                "max_steps": 5,
+            },
+            config=cfg,
+        )
+    assert judge.requests == ["summarise the ticket"]

@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.search import mmr_select
 from expert_work.common.threat_patterns import scan_for_threats
@@ -129,8 +130,10 @@ def _message_text(message: BaseMessage) -> str:
 
 
 def _last_human_text(messages: list[BaseMessage]) -> str:
+    """The recall query — the latest *user* message. Hidden ``HumanMessage`` s
+    (B-67 inputs block, advisories) are platform scaffolding, not a query."""
     for message in reversed(messages):
-        if isinstance(message, HumanMessage):
+        if isinstance(message, HumanMessage) and not is_hidden(message):
             return _message_text(message)
     return ""
 
@@ -141,8 +144,9 @@ def _render_trajectory(messages: list[BaseMessage]) -> str:
         # Skip the agent's own system prompt — it is an instruction to the
         # agent, not signal for memory extraction, and it otherwise dominated
         # the extraction input (the confusing ``[system] ...`` line surfaced in
-        # the debug console).
-        if isinstance(message, SystemMessage):
+        # the debug console). Hidden HumanMessages (B-67 inputs block, advisories)
+        # are platform scaffolding for the same reason.
+        if isinstance(message, SystemMessage) or is_hidden(message):
             continue
         text = _message_text(message).strip()
         if len(text) > _TRAJECTORY_CHAR_CAP:

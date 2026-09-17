@@ -45,6 +45,7 @@ from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import expert_work_counter
 from expert_work.runtime.storage import ObjectStore, ObjectStoreError
 
@@ -105,6 +106,12 @@ def serialize_messages_sharegpt(messages: Sequence[BaseMessage]) -> list[dict[st
     for msg in messages:
         role = _message_role(msg)
         entry: dict[str, Any] = {"role": role, "content": _message_content_text(msg)}
+        if is_hidden(msg):
+            # B-67 — hidden HumanMessages (inputs block, advisories) serialise as
+            # ``user`` too; the flag lets readers skip them when they want the
+            # user's actual request (``first_user_message``). Plain entries keep
+            # their shape.
+            entry["hidden"] = True
         if isinstance(msg, AIMessage):
             tool_calls = list(getattr(msg, "tool_calls", None) or [])
             if tool_calls:

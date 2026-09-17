@@ -18,6 +18,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 # 拍平消息正文的定义住在 common —— 会话标题、对外消息列表、对话条目三处读的
 # 必须是同一段文本,否则「标题里有的字」和「气泡里有的字」会对不上。这里保留
 # 转出名,老调用点不受影响。
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.conversation_channel import message_text as message_text
 
 logger = logging.getLogger("expert_work.control_plane.session_title")
@@ -55,7 +56,9 @@ async def first_message_title(
         return None
     raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
     for m in raw:
-        if getattr(m, "type", None) != "human":
+        # 隐藏 human 是平台脚手架(B-67「本轮输入」段、恢复建议),不是用户说的话;
+        # 只带 inputs 的 run 用户消息正文为空,不跳过就会拿隐藏段当标题。
+        if getattr(m, "type", None) != "human" or is_hidden(m):
             continue
         title = title_from_text(message_text(getattr(m, "content", "")), limit=limit)
         if title:

@@ -56,6 +56,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.advisory_locks import SUPERSEDE_LOCK_CLASSID
+from control_plane.inputs_block import is_inputs_block
 from control_plane.transcript import extract_turns
 from expert_work.common.conversation_channel import is_hidden, is_tombstone
 from expert_work.common.supersede import mark_superseded, tombstone_message
@@ -139,10 +140,10 @@ class TurnLocation:
 @dataclass(frozen=True)
 class SupersedeResult:
     location: TurnLocation
-    #: ``:regenerate`` 要重放的两条原始消息(该轮的 SystemMessage + 用户
-    #: HumanMessage,**打标之前**的原件);``require_replay=False`` 或该轮没有
-    #: 这个形状时为 ``None``。
-    replay_messages: tuple[BaseMessage, BaseMessage] | None
+    #: ``:regenerate`` 要重放的原始消息(该轮的 SystemMessage + 用户 HumanMessage
+    #: (+ B-67 的隐藏「本轮输入」段,若有),**打标之前**的原件);
+    #: ``require_replay=False`` 或该轮没有这个形状时为 ``None``。
+    replay_messages: tuple[BaseMessage, ...] | None
     superseded_run_ids: tuple[UUID, ...]
 
 
@@ -403,10 +404,11 @@ async def _version_chain(target: RunInfo, *, runs: RunStore, tenant_id: UUID) ->
     return out
 
 
-def _replay_pair(turn: Sequence[BaseMessage]) -> tuple[BaseMessage, BaseMessage] | None:
-    """``build_run_graph_input`` 的形状:[System, 非隐藏 Human, …]。
+def _replay_originals(turn: Sequence[BaseMessage]) -> tuple[BaseMessage, ...] | None:
+    """``build_run_graph_input`` 的形状:[System, 非隐藏 Human, (隐藏「本轮输入」段)?, …]。
 
-    不是这个形状就没有可重放的输入(``:regenerate`` 因此 422)。
+    不是这个形状就没有可重放的输入(``:regenerate`` 因此 422)。第三条只认带
+    ``INPUTS_BLOCK_MARK`` 的 —— 别的隐藏 HumanMessage(委派提醒、恢复建议)不是输入。
     """
     if len(turn) < 2:
         return None
@@ -415,6 +417,8 @@ def _replay_pair(turn: Sequence[BaseMessage]) -> tuple[BaseMessage, BaseMessage]
         return None
     if is_hidden(human):
         return None
+    if len(turn) > 2 and is_inputs_block(turn[2]):
+        return system, human, turn[2]
     return system, human
 
 
@@ -469,7 +473,7 @@ async def supersede_run(
         current_plan=(snapshot.values or {}).get("plan"),
     )
     turn = messages[location.start : location.end]
-    replay = _replay_pair(turn)
+    replay = _replay_originals(turn)
     if require_replay and replay is None:
         raise SupersedeError(
             "RUN_INPUT_UNAVAILABLE",

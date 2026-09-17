@@ -63,9 +63,11 @@ from control_plane.approval_void import (
     void_if_superseded,
 )
 from control_plane.audit import emit
+from control_plane.inputs_block import block_stats, build_inputs_block, inputs_block_message
 from control_plane.kill_switch import run_block_reason
 from control_plane.prompt_render import (
     PromptRenderError,
+    bound_variable_names,
     render_system_prompt,
     validate_prompt_inputs,
 )
@@ -83,9 +85,9 @@ from control_plane.tenant_scope import (
     ensure_tenant_scope,
 )
 from control_plane.tenant_status import TenantStatusService
-from control_plane.transcript import read_turns
+from control_plane.transcript import extract_turns, read_messages
 from control_plane.turn_inputs import resolve_turn_inputs
-from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY
+from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY, is_hidden
 from expert_work.common.message_stamp import stamp_message
 from expert_work.common.observability import (
     current_trace_id_hex,
@@ -498,6 +500,8 @@ def build_run_graph_input(
     with ``created_at`` / ``run_id`` so the external messages endpoint can
     surface them (LangGraph checkpoints don't store either). The system
     message is never stamped — ``extract_turns`` filters it out anyway.
+
+    B-67 §六 — jinja agent 多一条隐藏「本轮输入」HumanMessage,与用户消息同戳。
     """
     human = _build_human_message(
         input_text=input_text,
@@ -507,13 +511,30 @@ def build_run_graph_input(
         spotlight_nonce=built.spotlight_nonce,
         document_names=document_names,
     )
+    now = datetime.now(UTC)
     if run_id is not None:
-        human = stamp_message(human, run_id=str(run_id), now=datetime.now(UTC))
+        human = stamp_message(human, run_id=str(run_id), now=now)
+    messages: list[BaseMessage] = [
+        SystemMessage(content=render_system_prompt(built, inputs or {})),
+        human,
+    ]
+    # B-67 §六 —— 「本轮输入」段:隐藏 HumanMessage 贴在用户消息之后(首轮时它是上下文
+    # 最后一条)。只在 jinja agent 上生成;触发器路径与委派子 run 不经过这里。与用户
+    # 消息同一 run 戳,取代 / 墓碑按区间照旧罩住它。
+    if getattr(built, "prompt_jinja", False):
+        bindings = bound_variable_names(built)
+        block = build_inputs_block(built.prompt_variables, inputs or {}, bindings=bindings)
+        if block is not None:
+            hidden = inputs_block_message(block)
+            if run_id is not None:
+                hidden = stamp_message(hidden, run_id=str(run_id), now=now)
+            messages.append(hidden)
+            logger.info(
+                "inputs.block_injected",
+                extra=block_stats(built.prompt_variables, inputs or {}, bindings=bindings),
+            )
     return {
-        "messages": [
-            SystemMessage(content=render_system_prompt(built, inputs or {})),
-            human,
-        ],
+        "messages": messages,
         "step_count": 0,
         "max_steps": built.max_steps,
         "max_no_progress": built.max_no_progress,
@@ -533,7 +554,8 @@ class SupersedeRequest:
     """P-1 —— 让 ``spawn_run`` 先把 ``target_run_id`` 这一轮标成被本次新 run 取代。
 
     ``replay=True``(``:regenerate``)= 新一轮的输入就是旧轮的 System + Human
-    两条原件;``False``(``:edit``)= 调用方给了新 ``payload.input``。
+    原件(jinja 轮再加 B-67 的隐藏「本轮输入」段);``False``(``:edit``)= 调用方
+    给了新 ``payload.input``。
     """
 
     target_run_id: UUID
@@ -543,10 +565,11 @@ class SupersedeRequest:
 def replay_graph_input(
     built: Any, replay: Sequence[BaseMessage], *, run_id: UUID
 ) -> dict[str, Any]:
-    """``:regenerate`` 的图输入:旧轮的 [System, Human] 原件换**新 id**、Human 重新盖戳。
+    """``:regenerate`` 的图输入:旧轮的 [System, Human, (隐藏本轮输入段)?] 原件换**新 id**、
+    Human 与隐藏段重新盖戳。
 
     id 必须换:``add_messages`` 同 id 是原地替换(supersede 正是靠这一点),不换
-    id 这两条会顶掉旧轮的位置而不是追加成新轮。``expert_work_created_at`` /
+    id 这几条会顶掉旧轮的位置而不是追加成新轮。``expert_work_created_at`` /
     ``expert_work_run_id`` 由 ``stamp_message`` 覆盖为本轮;被取代标记(调用方
     传进来的若是打标后的副本)一并剥掉。
 
@@ -563,9 +586,16 @@ def replay_graph_input(
             if k not in (SUPERSEDED_BY, SUPERSEDED_AT)
         }
         fresh.append(msg.model_copy(update={"id": str(uuid4()), "additional_kwargs": kwargs}))
-    system, human = fresh
+    if len(fresh) not in (2, 3):
+        # 损坏的原件照旧报错,不静默跑一个缺输入的轮。
+        detail = f"replay expects 2 or 3 messages, got {len(fresh)}"
+        raise ValueError(detail)
+    system, *stamped = fresh
     return {
-        "messages": [system, stamp_message(human, run_id=str(run_id), now=now)],
+        "messages": [
+            system,
+            *(stamp_message(m, run_id=str(run_id), now=now) for m in stamped),
+        ],
         "step_count": 0,
         "max_steps": built.max_steps,
         "max_no_progress": built.max_no_progress,
@@ -1265,7 +1295,7 @@ async def spawn_run(
         else nullcontext()
     )
     async with lock:
-        replay_messages: tuple[BaseMessage, BaseMessage] | None = None
+        replay_messages: tuple[BaseMessage, ...] | None = None
         regenerated_from: UUID | None = None
         if supersede is not None:
             result = await supersede_run(
@@ -1391,8 +1421,9 @@ async def spawn_run(
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     if replay_messages is not None:
-        # B-66 —— ``:regenerate`` 重放的 [System, Human] 与原轮字节相同,不绕开响应
-        # 缓存就必然命中、把旧答案原样端回来。``:edit`` 输入是新的,不需要。
+        # B-66 —— ``:regenerate`` 重放的 [System, Human, (本轮输入段)?] 与原轮字节
+        # 相同,不绕开响应缓存就必然命中、把旧答案原样端回来。``:edit`` 输入是新的,
+        # 不需要。
         configurable[LLM_CACHE_BYPASS_KEY] = True
     # 本轮附件下传:委派出去的子代看不到本对话,``[file attached: …]`` 那行对它
     # 不存在。同一份清单既进用户消息也进子代种子,来源是这一个 payload 字段。
@@ -1997,7 +2028,8 @@ def build_runs_router() -> APIRouter:
             # signal that emits the SESSION_READ audit row above) sees the
             # faithful transcript. The durable record + search mirror always do.
             is_cross_tenant_audit = target_tenant != request.state.tenant_id
-            turns = await read_turns(checkpointer, thread_id, include_hidden=is_cross_tenant_audit)
+            raw = await read_messages(checkpointer, thread_id)
+            turns = extract_turns(raw, include_hidden=is_cross_tenant_audit)
         except Exception:
             logger.warning("thread_messages.read_failed", exc_info=True)
             return empty
@@ -2016,6 +2048,10 @@ def build_runs_router() -> APIRouter:
                 # P-1 —— 与对外 ``/messages`` 同一投影:被取代 / 墓碑标记。
                 "superseded_by": str(t.superseded_by) if t.superseded_by else None,
                 "tombstone": t.tombstone,
+                # B-67 —— 只有跨租户审计视图带得出隐藏行(「本轮输入」段、恢复建议);
+                # 标上 ``hidden`` 让调试台按 run 分组时不把它当这一轮的输入。只在为真时
+                # 出现,同租户视图与非隐藏行的形状一字不变。
+                **({"hidden": True} if is_hidden(raw[t.seq]) else {}),
             }
             for t in turns
         ]

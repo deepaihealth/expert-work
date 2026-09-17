@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken
@@ -692,6 +693,35 @@ async def test_writeback_trajectory_omits_agent_system_prompt() -> None:
     assert "[system]" not in trajectory  # no agent system-role line
     assert "help" not in trajectory  # agent system-prompt body gone
     assert "[human] what timezone am I in" in trajectory  # real turn kept
+
+
+@pytest.mark.asyncio
+async def test_writeback_trajectory_omits_hidden_scaffolding() -> None:
+    """B-67 —— 隐藏 HumanMessage(「本轮输入」段、恢复建议)是平台脚手架,与系统提示词
+    同理不进抽取输入;用户的话照留。"""
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[AIMessage(content='{"memories": []}')])
+    node = make_memory_writeback_node(
+        memory_store=store, embedder=FakeEmbedder(dim=_DIM), llm_caller=llm
+    )
+    state = {
+        "messages": [
+            SystemMessage(content="help"),
+            HumanMessage(content="what timezone am I in"),
+            HumanMessage(content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}),
+            AIMessage(content="UTC+8"),
+        ],
+        "step_count": 0,
+        "max_steps": 5,
+    }
+    await node(  # type: ignore[arg-type]
+        state, {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}}
+    )
+    trajectory = str(llm.calls[0][1].content)
+    assert "PLATFORM-INPUTS-BLOCK" not in trajectory
+    assert "[human] what timezone am I in" in trajectory
+    assert "[ai] UTC+8" in trajectory
 
 
 @pytest.mark.asyncio

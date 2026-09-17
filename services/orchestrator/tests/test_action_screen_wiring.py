@@ -8,9 +8,16 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.runtime.cancellation import CancellationToken
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import (
@@ -193,3 +200,33 @@ async def test_first_misaligned_action_all_aligned_returns_none() -> None:
         token=CancellationToken(),
     )
     assert idx is None
+
+
+@dataclass
+class _RequestRecordingActionJudge:
+    requests: list[str] = field(default_factory=list)
+
+    async def judge_action(
+        self, *, user_request: str, tool_name: str, tool_args: Mapping[str, Any]
+    ) -> ActionVerdict:
+        del tool_name, tool_args
+        self.requests.append(user_request)
+        return _ALIGNED
+
+
+@pytest.mark.asyncio
+async def test_screening_baseline_is_the_user_message_not_a_hidden_block_after_it() -> None:
+    """B-67 —— 同一个取基准的 helper 的第二个消费方:工具调用按用户消息判对齐。"""
+    judge = _RequestRecordingActionJudge()
+    await _first_misaligned_action(
+        [{"name": "a", "args": {}}],
+        [
+            SystemMessage(content="sys"),
+            HumanMessage(content="summarise the ticket"),
+            HumanMessage(content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}),
+        ],
+        judge=judge,
+        on_error="open",
+        token=CancellationToken(),
+    )
+    assert judge.requests == ["summarise the ticket"]

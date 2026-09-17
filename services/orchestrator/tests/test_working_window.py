@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from orchestrator.context import TrimResult, WorkingWindow, trim_to_recent_turns
 
 # ---------------------------------------------------------------------------
@@ -192,3 +193,68 @@ def test_should_trim_respects_injected_estimator() -> None:
     msgs = [HumanMessage(content="x" * 1000)]
     assert _window().should_trim(msgs) is False
     assert _window(estimator=_OnePerCharEstimator()).should_trim(msgs) is True
+
+
+# ---------------------------------------------------------------------------
+# B-67 — hidden HumanMessages (inputs block / advisories) never open a turn
+# ---------------------------------------------------------------------------
+
+
+def _hidden(text: str) -> HumanMessage:
+    return HumanMessage(content=text, additional_kwargs={HIDE_FROM_UI: True})
+
+
+def _jinja_conversation(n_turns: int) -> list[BaseMessage]:
+    """Each turn = user message, hidden inputs block, a tool round, a hidden
+    mid-turn advisory, the reply — the shapes ``build_run_graph_input`` and the
+    recovery advisory actually produce."""
+    msgs: list[BaseMessage] = [SystemMessage(content="system prompt")]
+    for i in range(n_turns):
+        call_id = f"call-{i}"
+        msgs.extend(
+            [
+                HumanMessage(content=f"user-{i}"),
+                _hidden(f"block-{i}"),
+                AIMessage(
+                    content="",
+                    tool_calls=[{"id": call_id, "name": "search", "args": {"q": str(i)}}],
+                ),
+                ToolMessage(content=f"result-{i}", tool_call_id=call_id),
+                _hidden(f"advisory-{i}"),
+                AIMessage(content=f"assistant-{i}"),
+            ]
+        )
+    return msgs
+
+
+def _texts(messages: list[BaseMessage]) -> list[str]:
+    return [str(m.content) for m in messages if isinstance(m, HumanMessage)]
+
+
+def test_hidden_human_messages_stay_inside_the_turn_they_sit_in() -> None:
+    result = trim_to_recent_turns(_jinja_conversation(3), max_recent_turns=1, keep_first_turn=False)
+    # N=1 keeps the current user message together with its block and advisory.
+    assert _texts(result.messages) == ["user-2", "block-2", "advisory-2"]
+    assert result.dropped_turns == 2
+    assert isinstance(result.messages[0], SystemMessage)
+    _assert_tool_pairs_intact(result.messages)
+
+
+def test_keep_first_turn_keeps_the_first_user_message_with_its_block() -> None:
+    result = trim_to_recent_turns(_jinja_conversation(4), max_recent_turns=1, keep_first_turn=True)
+    assert _texts(result.messages) == [
+        "user-0",
+        "block-0",
+        "advisory-0",
+        "user-3",
+        "block-3",
+        "advisory-3",
+    ]
+    assert result.dropped_turns == 2
+    _assert_tool_pairs_intact(result.messages)
+
+
+def test_only_user_messages_count_toward_the_turn_budget() -> None:
+    msgs = _jinja_conversation(2)  # two user turns, six HumanMessages
+    result = trim_to_recent_turns(msgs, max_recent_turns=2, keep_first_turn=False)
+    assert result == TrimResult(messages=msgs, dropped_turns=0)

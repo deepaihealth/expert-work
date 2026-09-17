@@ -33,6 +33,7 @@ from langgraph.graph.message import add_messages
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
+from control_plane.inputs_block import inputs_block_message
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
@@ -431,6 +432,73 @@ async def test_thread_messages_self_read_hides_scaffolding_but_record_keeps_it()
             "<recovery-advisory>internal</recovery-advisory>",
             "今天是 2026年6月30日",
         ]
+
+
+@pytest.mark.asyncio
+async def test_thread_messages_cross_tenant_audit_marks_hidden_rows() -> None:
+    """B-67 —— 跨租户审计视图忠实带出隐藏消息(「本轮输入」段、恢复建议),隐藏行带
+    ``hidden: true``:调试台按 run 分组时据此不把它当这一轮的输入。非隐藏行不带这个键;
+    同租户视图不变(隐藏行照旧不出,也没有 ``hidden`` 键)。"""
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    run_store = InMemoryRunStore()
+    checkpointer = InMemorySaver()
+    runtime = stub_agent_runtime(run_store=run_store)
+    runtime.durable_checkpointer = checkpointer
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=runtime,
+        run_repo=run_store,
+    )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as client:
+        await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
+        thread_id = await _create_session(client)
+        run_id = str(uuid4())
+        block = inputs_block_message("[inputs block]")
+        await _seed_thread_messages(
+            checkpointer,
+            thread_id,
+            [
+                HumanMessage(content="make a plan", additional_kwargs={STAMP_RUN_ID: run_id}),
+                block.model_copy(
+                    update={"additional_kwargs": {**block.additional_kwargs, STAMP_RUN_ID: run_id}}
+                ),
+                AIMessage(content="done", additional_kwargs={STAMP_RUN_ID: run_id}),
+            ],
+        )
+
+        own = await client.get(f"/v1/sessions/{thread_id}/messages")
+        assert own.status_code == 200
+        own_rows = own.json()["data"]["messages"]
+        assert [m["content"] for m in own_rows] == ["make a plan", "done"]
+        assert all("hidden" not in m for m in own_rows)
+
+        sys_headers = await grant_system_admin(client)
+        audit = await client.get(
+            f"/v1/sessions/{thread_id}/messages",
+            params={"tenant_id": str(_DEFAULT_TENANT)},
+            headers=sys_headers,
+        )
+        assert audit.status_code == 200
+        rows = audit.json()["data"]["messages"]
+        assert [(m["content"], m["run_id"], m.get("hidden")) for m in rows] == [
+            ("make a plan", run_id, None),
+            ("[inputs block]", run_id, True),
+            ("done", run_id, None),
+        ]
+        assert "hidden" not in rows[0] and "hidden" not in rows[2]
 
 
 # ---------------------------------------------------------------------------

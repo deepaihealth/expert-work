@@ -79,6 +79,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from opentelemetry.trace import Status, StatusCode
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.dlp import scan_and_redact
 from expert_work.common.message_stamp import stamp_messages
 from expert_work.common.observability import (
@@ -2452,9 +2453,13 @@ def _stamp_agent_messages(messages: list[BaseMessage], config: RunnableConfig) -
 
 
 def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
-    """The most recent user-message text — the judge's alignment baseline."""
+    """The most recent user-message text — the judge's alignment baseline.
+
+    Hidden ``HumanMessage`` s (B-67 inputs block, recovery advisory, delegation
+    nudges) are platform scaffolding, not the user's request — skipped.
+    """
     for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
+        if isinstance(msg, HumanMessage) and not is_hidden(msg):
             return str(msg.content)
     return ""
 
