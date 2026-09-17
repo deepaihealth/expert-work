@@ -237,6 +237,9 @@ def test_short_tail_exact_copy_is_still_blocked() -> None:
     cands = candidates_from_inputs({"api_base": "https://api.partner.com/v1"})
     hit = find_retyped_url('get("https://api.partner.com/v1")', cands)
     assert hit is not None and hit.distance == 0
+    # scheme / host 只差大小写也是原文照抄 —— 短尾串走不到近似分支,这条只能靠完全一致判出来。
+    upper = find_retyped_url('get("HTTPS://API.partner.com/v1")', cands)
+    assert upper is not None and upper.distance == 0
 
 
 def test_a_twenty_to_thirty_one_char_tail_allows_exactly_one_edit() -> None:
