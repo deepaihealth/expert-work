@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.search import mmr_select
 from expert_work.common.threat_patterns import scan_for_threats
@@ -129,8 +130,10 @@ def _message_text(message: BaseMessage) -> str:
 
 
 def _last_human_text(messages: list[BaseMessage]) -> str:
+    """The recall query — the latest *user* message. Hidden ``HumanMessage`` s
+    (B-67 inputs block, advisories) are platform scaffolding, not a query."""
     for message in reversed(messages):
-        if isinstance(message, HumanMessage):
+        if isinstance(message, HumanMessage) and not is_hidden(message):
             return _message_text(message)
     return ""
 

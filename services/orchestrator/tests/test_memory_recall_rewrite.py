@@ -19,6 +19,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from prometheus_client import REGISTRY
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator.graph_builder.memory import _rewrite_query, make_memory_recall_node
@@ -285,3 +286,32 @@ async def test_rewrite_query_records_degraded_on_error() -> None:
     before = _rewrite_count("degraded")
     await _rewrite_query(llm_caller=_BoomRewriter(), task="x", token=CancellationToken())
     assert _rewrite_count("degraded") - before == 1.0
+
+
+@pytest.mark.asyncio
+async def test_recall_query_is_the_user_message_not_a_hidden_block_after_it() -> None:
+    """B-67 —— jinja 轮的输入是 [System, 用户消息, 隐藏「本轮输入」段];召回查询必须是
+    用户消息,不是排在它后面的平台隐藏段。"""
+    store = _SpyMemoryStore()
+    embedder = _SpyEmbedder(inner=FakeEmbedder(dim=_DIM))
+    node = make_memory_recall_node(
+        memory_store=store,  # type: ignore[arg-type]
+        embedder=embedder,  # type: ignore[arg-type]
+        top_k=5,
+        rewrite_query=False,
+    )
+    state = {
+        "messages": [
+            SystemMessage(content="help"),
+            HumanMessage(content="what's the distance"),
+            HumanMessage(content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}),
+        ],
+        "step_count": 0,
+        "max_steps": 5,
+    }
+    tenant, user = uuid4(), uuid4()
+    await node(  # type: ignore[arg-type]
+        state, {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}}
+    )
+    assert embedder.calls == [["what's the distance"]]
+    assert store.calls[0]["query_text"] == "what's the distance"

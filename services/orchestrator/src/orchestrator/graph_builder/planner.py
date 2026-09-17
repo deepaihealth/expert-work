@@ -33,6 +33,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.protocol import Plan, PlanStep
 from orchestrator.graph_builder._config import cancellation_token
@@ -85,9 +86,12 @@ def _message_text(message: BaseMessage) -> str:
 
 
 def _extract_task(messages: list[BaseMessage]) -> str:
-    """The user's task — the most recent ``HumanMessage`` in the history."""
+    """The user's task — the most recent non-hidden ``HumanMessage`` in the history.
+
+    Hidden ones (B-67 inputs block, advisories) are platform scaffolding.
+    """
     for message in reversed(messages):
-        if isinstance(message, HumanMessage):
+        if isinstance(message, HumanMessage) and not is_hidden(message):
             return _message_text(message)
     return _message_text(messages[-1]) if messages else ""
 

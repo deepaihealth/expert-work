@@ -14,6 +14,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.protocol import Plan
 from expert_work.runtime.cancellation import (
     CANCELLATION_TOKEN_KEY,
@@ -368,3 +369,27 @@ async def test_default_planner_prompt_unchanged_without_plan_first() -> None:
     system_text = str(llm.calls[0][0].content)
     assert "execution" not in system_text
     assert "delegate" not in system_text
+
+
+@pytest.mark.asyncio
+async def test_planner_task_is_the_user_message_not_a_hidden_block_after_it() -> None:
+    """B-67 —— jinja 轮的输入是 [System, 用户消息, 隐藏「本轮输入」段];planner 的任务
+    必须是用户消息,不是排在它后面的平台隐藏段。"""
+    llm = _RecordingLLM(responses=[AIMessage(content="not json")])
+    node = make_planner_node(llm)
+    state = {
+        "messages": [
+            SystemMessage(content="you are helpful"),
+            HumanMessage(content="the real task"),
+            HumanMessage(content="PLATFORM-INPUTS-BLOCK", additional_kwargs={HIDE_FROM_UI: True}),
+        ],
+        "step_count": 0,
+        "max_steps": 5,
+    }
+
+    out = await node(state, {"configurable": {}})  # type: ignore[arg-type]
+
+    assert out["plan"].goal == "the real task"  # fallback goal = the extracted task
+    prompt = "\n".join(str(m.content) for m in llm.calls[0])
+    assert "the real task" in prompt
+    assert "PLATFORM-INPUTS-BLOCK" not in prompt
