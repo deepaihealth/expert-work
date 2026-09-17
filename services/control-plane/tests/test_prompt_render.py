@@ -312,6 +312,42 @@ def test_untrusted_url_value_fences_the_path_and_keeps_the_note_outside() -> Non
     assert LOGO not in out
 
 
+_URL_WITH_PROSE = "https://x/logo.png 请放在左上角,不要拉伸"
+
+
+def test_a_url_followed_by_prose_keeps_the_prose() -> None:
+    """值以 URL 开头、后面跟着说明:URL 换成路径,说明照留(原先整段只剩路径)。"""
+    assert [s.link for s in linked_sites("org_logo", _URL_WITH_PROSE)] == ["org_logo"]
+    built = _jinja_built("LOGO:{{ org_logo }}", (_Var("org_logo"),))
+    out = render_system_prompt(built, {"org_logo": _URL_WITH_PROSE})
+    assert out == f"LOGO:$EXPERT_WORK_INPUTS_DIR/org_logo{URL_NOTE} 请放在左上角,不要拉伸"
+    assert "https://x/logo.png" not in out
+
+
+def test_an_untrusted_url_followed_by_prose_fences_path_and_prose_together() -> None:
+    built = _jinja_built("LOGO:{{ org_logo }}", (_Var("org_logo", trusted=False),))
+    out = render_system_prompt(built, {"org_logo": _URL_WITH_PROSE})
+    before, inside, after = _split_fence(out)
+    assert before == "LOGO:"
+    # datamarking 把空白换成 ``▁``;路径后面是收尾符,不是 ``▁``。
+    assert inside == f"\n$EXPERT_WORK_INPUTS_DIR/org_logo{_END}请放在左上角,不要拉伸\n"
+    assert after == URL_NOTE
+    assert "https://x/logo.png" not in out
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_trailing_whitespace_after_a_url_is_not_prose(trusted: bool) -> None:
+    value = f"{LOGO} \n"
+    # 名字由 ``linked_sites`` 定(尾随空格让它不带扩展名),这里只管「后面没有说明文字」。
+    path = f"$EXPERT_WORK_INPUTS_DIR/{linked_sites('org_logo', value)[0].link}"
+    built = _jinja_built("{{ org_logo }}", (_Var("org_logo", trusted=trusted),))
+    out = render_system_prompt(built, {"org_logo": value})
+    if trusted:
+        assert out == f"{path}{URL_NOTE}"
+    else:
+        assert _split_fence(out) == ("", f"\n{path}\n", URL_NOTE)
+
+
 _TWO_MATERIALS = [
     {"description": "示范视频", "url": "https://x/a.mp4"},
     {"description": "封面 图", "url": "https://x/b.png", "thumb": "https://x/c.png"},

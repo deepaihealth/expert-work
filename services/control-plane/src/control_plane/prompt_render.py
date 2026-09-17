@@ -127,6 +127,21 @@ def _render_items(var: Any, root: Any, sites: list[LinkedSite], *, nonce: str | 
     return f"\n{body}\n{URL_NOTE}"
 
 
+def _render_url(var: Any, raw: str, link: str, *, nonce: str | None) -> str:
+    """以 URL 开头的字符串:URL(第一段非空白)换成链接路径,后面的说明文字照留。
+
+    ``linked_sites`` 把整串当成一个 URL(``_is_http_url`` 只看开头),名字照它给的用。
+    trusted:路径紧跟尾注,说明文字原样接在后面;untrusted:路径与说明文字同在一个围栏里
+    (以 :data:`_PATH_END` 隔开,datamarking 不会贴在路径上),尾注在围栏外。
+    """
+    path = f"${INPUTS_DIR_ENV}/{link}"
+    rest = raw[len(raw.split(maxsplit=1)[0]) :]
+    if var.trusted:
+        return f"{path}{URL_NOTE}{rest}" if rest.strip() else f"{path}{URL_NOTE}"
+    data = f"{path}{_PATH_END}{rest.strip()}" if rest.strip() else path
+    return f"{_fence_value(data, nonce=nonce)}{URL_NOTE}"
+
+
 def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
     """一个本轮传了值的声明变量在模板上下文里的值,按形态定(spec §五的表,判定顺序即
     代码顺序)。被绑定与否不影响这里:绑定是逐工具的,漏绑的工具仍要从提示词里拿值。
@@ -144,9 +159,8 @@ def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
     if not sites:
         return _raw_or_fenced(var, raw, nonce=nonce), False
     if isinstance(raw, str) and sites[0].site.path == ():
-        # 整个值就是一个 URL:名字确定,不等预拉。
-        path = _fence_if_untrusted(var, f"${INPUTS_DIR_ENV}/{sites[0].link}", nonce=nonce)
-        return f"{path}{URL_NOTE}", True
+        # 值以 URL 开头:名字确定,不等预拉。
+        return _render_url(var, raw, sites[0].link, nonce=nonce), True
     parsed = parse_json_value(raw)
     return _render_items(var, parsed if parsed is not None else raw, sites, nonce=nonce), True
 
