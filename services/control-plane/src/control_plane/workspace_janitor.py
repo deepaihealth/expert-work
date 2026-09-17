@@ -140,9 +140,14 @@ class _ReclaimPolicy:
 #: 只有 START 侧的 inputs 节点,**续跑不重新经过它**,于是一个等审批的 run 挂得比 TTL 久,
 #: 回来时目录已经没了 —— 模型退回从提示词手抄长串,正是 B-61 要治的那个病。
 #:
-#: 30 天覆盖现实中的长审批挂起(Codespaces 的 30 天是同一条先例)。**抬它是安全的,理由不是
-#: 「T11 去掉了乘数」**(那条只对逐字节相同的 URL 成立,见下),而是这里躺的是几 KB 的 JSON:
-#: 它**不是**会涨的那一半。
+#: 续跑读的是**这一轮第一个 run** 的目录:审批续跑是新 run_id,由入口经
+#: ``control_plane.turn_inputs`` 把 ``inputs_run_id`` 指回首段(孤儿复活是同一个 run)。
+#: 这条接线 2026-09-17 之前是缺的 —— 续跑段的 ``EXPERT_WORK_INPUTS`` 指向它自己的
+#: run_id,那里从来没有文件,这 30 天当时什么也没救下;现在由
+#: ``test_turn_inputs_carry.py`` 钉着。审批挂起的上限是 ``approval_timeout_s``(manifest
+#: 校验 ≤ 7 天,到点由超时 sweep 续跑),30 天盖得住(Codespaces 的 30 天是同一条先例)。
+#: **抬它是安全的,理由不是「T11 去掉了乘数」**(那条只对逐字节相同的 URL 成立,见下),
+#: 而是这里躺的是几 KB 的 JSON:它**不是**会涨的那一半。
 _RUN_DIR_TTL_S = 30 * 24 * 3600
 
 #: 缓存条目的 TTL —— **短而有界的那一半**。与 :data:`_RUN_DIR_TTL_S` **相互独立**,
@@ -761,9 +766,10 @@ class WorkspaceJanitorWorker:
         正在跑的那一轮,见 ``test_sweep_never_touches_a_recently_written_run_dir``)。
 
         这句话**只在「预拉写过之后 TTL 之内」成立,不等于「run 还活着就安全」**:写
-        ``inputs/<run_id>/`` 的只有 START 侧的 inputs 节点,续跑不重新经过它,于是一个
-        等审批等了超过 :data:`_RUN_DIR_TTL_S` 的 run 回来时文件已经没了。TTL 取 30 天
-        就是为了让这个窗口盖住现实中的长审批挂起 —— 见 :data:`_RUN_DIR_TTL_S`。
+        ``inputs/<run_id>/`` 的只有 START 侧的 inputs 节点,续跑不重新经过它(续跑段读的是
+        这一轮首段的目录),于是一个等审批等了超过 :data:`_RUN_DIR_TTL_S` 的 run 回来时
+        文件已经没了。TTL 取 30 天就是为了让这个窗口盖住审批挂起的上限 —— 见
+        :data:`_RUN_DIR_TTL_S`。
 
         ``now`` 取一次、整轮共用:同一轮里先后扫到的条目按同一条时间线判定。
         """
