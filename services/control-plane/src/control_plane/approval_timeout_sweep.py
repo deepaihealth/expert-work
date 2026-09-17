@@ -233,6 +233,16 @@ class ApprovalTimeoutSweep:
                 extra={"run_id": str(run_id), "status_code": exc.status_code},
             )
             return False
+        except Exception as exc:
+            # B-77 —— 构建在 CAS 之前(班车 2),构建失败的行保持 PENDING。异常若冲出
+            # 这里,``run_once`` 整轮中止,而下一轮排第一的还是这行 —— 后面所有过期审批
+            # 都卡住。逐行兜住,下一轮重试。只记 id 与异常类型(消息里可能带配置内容)。
+            _cycle_errors.inc()
+            logger.warning(
+                "approval_timeout_sweep.row_failed",
+                extra={"run_id": str(run_id), "error_type": type(exc).__name__},
+            )
+            return False
         if run_record is None or replayed:
             return False
         _timed_out_total.inc()

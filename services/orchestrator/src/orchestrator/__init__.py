@@ -23,6 +23,15 @@ from orchestrator.agent_factory import (
 from orchestrator.agent_factory import (
     build_step_routers as build_step_routers,
 )
+from orchestrator.approval_turn import (
+    APPROVAL_TURN_RESET as APPROVAL_TURN_RESET,
+)
+from orchestrator.approval_turn import (
+    pending_request_binding as pending_request_binding,
+)
+from orchestrator.approval_turn import (
+    repair_unanswered_tail as repair_unanswered_tail,
+)
 from orchestrator.errors import (
     AgentFactoryError as AgentFactoryError,
 )
@@ -154,6 +163,7 @@ from orchestrator.tools import (
 )
 
 __all__ = [
+    "APPROVAL_TURN_RESET",
     "DEFAULT_MAX_STEPS",
     "DEFAULT_STREAM_MODE",
     "LLM_CACHE_BYPASS_KEY",
@@ -204,6 +214,8 @@ __all__ = [
     "make_memory_writeback_node",
     "make_planner_node",
     "make_reflect_node",
+    "pending_request_binding",
+    "repair_unanswered_tail",
     "run_agent",
     "sanitize_dangling_tool_calls",
     "sse_consumer",

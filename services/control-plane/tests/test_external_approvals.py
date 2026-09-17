@@ -24,7 +24,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, ApprovalRecord, ApprovalStatus
+from expert_work.protocol import AgentSpec, ApprovalRecord, ApprovalRequest, ApprovalStatus
 from expert_work.runtime.runs import DisconnectMode, InMemoryRunEventStore, InMemoryRunStore
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
@@ -258,6 +258,17 @@ async def _seed_pending_decision(ctx: _Ctx) -> tuple[UUID, UUID, UUID]:
     checkpoint_config: RunnableConfig = {
         "configurable": {"thread_id": str(thread_id), "tenant_id": str(ctx.tenant_id)}
     }
+    now = datetime.now(UTC)
+    request = ApprovalRequest(
+        request_id="approval:seed",
+        node="tools",
+        reason_kind="risk_confirmation",
+        action_summary="approval-gated tool 'send_email'",
+        proposed_args={"to": "ops@example.com"},
+        requested_at=now,
+        timeout_at=now + timedelta(hours=24),
+    )
+    # 班车 2 终审 C1 —— 检查点也要停在这条请求上:续跑写检查点前会核对它。
     await built.graph.aupdate_state(
         checkpoint_config,
         {
@@ -268,12 +279,12 @@ async def _seed_pending_decision(ctx: _Ctx) -> tuple[UUID, UUID, UUID]:
                         {"id": "call-1", "name": "send_email", "args": {"to": "ops@example.com"}}
                     ],
                 )
-            ]
+            ],
+            "pending_approval": request,
         },
         as_node="agent",
     )
 
-    now = datetime.now(UTC)
     await ctx.app.state.approval_store.create(
         ApprovalRecord(
             id=uuid4(),
@@ -281,13 +292,13 @@ async def _seed_pending_decision(ctx: _Ctx) -> tuple[UUID, UUID, UUID]:
             user_id=end_user.id,
             run_id=run_id,
             thread_id=thread_id,
-            request_id="approval:seed",
-            node="tools",
-            reason_kind="risk_confirmation",
-            action_summary="approval-gated tool 'send_email'",
-            proposed_args={"to": "ops@example.com"},
-            requested_at=now,
-            timeout_at=now + timedelta(hours=24),
+            request_id=request.request_id,
+            node=request.node,
+            reason_kind=request.reason_kind,
+            action_summary=request.action_summary,
+            proposed_args=request.proposed_args,
+            requested_at=request.requested_at,
+            timeout_at=request.timeout_at,
         )
     )
     return run_id, thread_id, end_user.id

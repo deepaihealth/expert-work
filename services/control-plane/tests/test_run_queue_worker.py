@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -21,9 +21,13 @@ from control_plane.agent_disable_status import AgentDisableService
 from control_plane.audit import build_default_audit_logger
 from control_plane.run_queue_worker import RunQueueWorker
 from control_plane.tenant_status import TenantStatusService
-from expert_work.persistence import InMemoryAgentDisableStore, InMemoryTenantConfigStore
+from expert_work.persistence import (
+    InMemoryAgentDisableStore,
+    InMemoryApprovalStore,
+    InMemoryTenantConfigStore,
+)
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec
+from expert_work.protocol import AgentSpec, ApprovalRecord
 from expert_work.runtime.runs import InMemoryRunStore, RunManager, RunStatus
 
 
@@ -112,7 +116,8 @@ def _worker(store, runtime, **kw) -> RunQueueWorker:
         agent_spec_store=_FakeAgents(),
         runtime=runtime,
         audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
-        approval_store=object(),
+        # 出队前要按会话查待审批(班车 2),占位对象不够用了。
+        approval_store=kw.pop("approvals", InMemoryApprovalStore()),
         **kw,
     )
 
@@ -588,3 +593,33 @@ async def test_claimed_run_carries_image_refs_into_delegation_context(
     await asyncio.sleep(0)
 
     assert spawns[0]["graph_input"]["turn_image_refs"] == ["expert_work://image/x"]
+
+
+class _UnreachableApprovals(InMemoryApprovalStore):
+    async def list_pending_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID
+    ) -> list[ApprovalRecord]:
+        del thread_id, tenant_id
+        raise RuntimeError("approval store down")
+
+
+@pytest.mark.asyncio
+async def test_unsettled_previous_turn_fails_the_claimed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """班车 2 终审 —— 出队前收口上一轮失败:已认领的行收成 error、不开跑,
+    不留一行没有执行者的 running。"""
+    spawns: list[dict] = []
+    monkeypatch.setattr(worker_module, "run_agent", lambda **kw: spawns.append(kw))
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _enqueue(runtime.run_manager)
+
+    assert await _worker(store, runtime, approvals=_UnreachableApprovals()).run_once() == 1
+
+    assert spawns == []
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.ERROR
+    assert row.error is not None and "previous_turn_unsettled" in row.error
+    assert runtime.run_manager.get(run_id) is None

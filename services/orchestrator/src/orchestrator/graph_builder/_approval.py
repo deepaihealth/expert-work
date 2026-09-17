@@ -183,6 +183,8 @@ def build_approval_request(
         # ``ask_for_approval`` gets a digest but verification skips it (no
         # downstream execution).
         binding_digest=canonical_args_digest(proposed_args) if bind else "",
+        tool_call_id=str(call.get("id") or ""),
+        tool_call_index=target.index,
     )
 
 
@@ -262,12 +264,50 @@ def _has_binding_drift(
     return canonical_args_digest(dispatched_args) != expected
 
 
+def _verdict_is_for_this_turn(
+    tool_calls: list[dict[str, Any]], resume: Mapping[str, Any], turn_run_id: str | None
+) -> bool:
+    """班车 2 —— 这条裁定是不是批给**这一轮**的。
+
+    续跑写检查点之前控制面已经核对过一次,但「核对 → 写入」不是原子的:两者之间
+    新一轮可以跑到自己的审批门,裁定随后落在新一轮的检查点上。所以图里再核对一次,
+    两项都用写裁定时从被批请求上抄来的身份:
+
+    * **请求**:``request_id`` 是按「暂停时的 run id + 摘要」算的;这一轮尾巴那条
+      助手消息盖的 run 戳,换算出来必须是同一个 ``request_id``。模型给的调用 id
+      可能不唯一(有的兼容厂商每轮都从 ``call_0`` 数起),这一项不依赖它。
+    * **调用**:``tool_call_index`` 处的调用 id 必须是 ``tool_call_id``。
+
+    裁定里缺某一项(滚动发布期间旧副本写的裁定、旧请求、没有 run 戳的旧消息、模型
+    没给 id)就跳过那一项,行为与以前一致。
+    """
+    request_id = resume.get("request_id")
+    summary = resume.get("action_summary")
+    if request_id and isinstance(summary, str) and turn_run_id is not None:
+        if _stable_request_id(turn_run_id, "tools", summary) != request_id:
+            return False
+    call_id = resume.get("tool_call_id")
+    if call_id:
+        index = resume.get("tool_call_index")
+        if not isinstance(index, int) or not 0 <= index < len(tool_calls):
+            return False
+        if str(tool_calls[index].get("id") or "") != call_id:
+            return False
+    return True
+
+
 def apply_resume_decision(
     tool_calls: list[dict[str, Any]],
     approval_required_tools: frozenset[str],
     resume: Mapping[str, Any],
+    *,
+    turn_run_id: str | None = None,
 ) -> ResumeOutcome:
     """Apply a resume ``{decision, modified_args, binding_digest}`` to a paused turn.
+
+    班车 2 —— 裁定不属于这一轮(见 :func:`_verdict_is_for_this_turn`,``turn_run_id``
+    是这一轮尾巴那条助手消息的 run 戳)时,不论批的是什么都按绑定漂移处理:什么都
+    不执行,整轮终止。
 
     ``approve`` → dispatch every call unchanged. ``modify`` → rewrite
     the gated call's args with ``modified_args``, then dispatch.
@@ -279,6 +319,8 @@ def apply_resume_decision(
     ``binding_digest``. A mismatch (the checkpointed tool_call drifted from
     what was approved) is a terminal integrity veto: nothing runs.
     """
+    if not _verdict_is_for_this_turn(tool_calls, resume, turn_run_id):
+        return _binding_drift_reject(tool_calls)
     decision = str(resume.get("decision", "approve"))
     target = find_approval_target(tool_calls, approval_required_tools)
     if decision == "reject":

@@ -27,6 +27,11 @@ _TENANT = uuid4()
 
 
 class _FakeGraph:
+    async def aget_state(self, *_a: object, **_k: object) -> SimpleNamespace:
+        # 班车 2 终审 C1 —— 续跑写检查点前核对「检查点里等着的还是这条审批」;
+        # 桩的检查点停在 ``_approval`` 那条请求上。
+        return SimpleNamespace(values={"pending_approval": {"request_id": "approval:sweep"}})
+
     async def aupdate_state(self, *_a: object, **_k: object) -> None:
         return None
 
@@ -203,6 +208,44 @@ async def test_sweep_does_not_resume_a_disabled_agent() -> None:
     assert len(runtime.run_manager.created) == 0
     row = await approvals.get_by_run(run_id=run_id, tenant_id=_TENANT)
     assert row is not None and row.status is ApprovalStatus.PENDING
+
+
+class _FlakyBuildRuntime(_FakeRuntime):
+    """第一次构建抛一个不是 ``AgentFactoryError`` 的异常(连接断、配置读坏之类)。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.builds = 0
+
+    async def get_agent(self, **kw: object) -> SimpleNamespace:
+        self.builds += 1
+        if self.builds == 1:
+            raise RuntimeError("upstream connection reset")
+        return await super().get_agent(**kw)
+
+
+@pytest.mark.asyncio
+async def test_one_row_failing_to_build_does_not_stop_the_rest() -> None:
+    # B-77 —— 构建挪到 CAS 之前以后,构建失败的那行保持 PENDING;若异常冲出逐行处理,
+    # 每一轮都停在这同一行(按过期时间排第一),后面的过期审批永远得不到处理。
+    approvals = InMemoryApprovalStore()
+    stuck_run, next_run = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    await approvals.create(_approval(stuck_run, uuid4(), timeout_at=now - timedelta(minutes=2)))
+    await approvals.create(_approval(next_run, uuid4(), timeout_at=now - timedelta(minutes=1)))
+
+    runtime = _FlakyBuildRuntime()
+    swept = await _sweep(approvals, runtime).run_once()
+
+    assert swept == 1
+    stuck = await approvals.get_by_run(run_id=stuck_run, tenant_id=_TENANT)
+    done = await approvals.get_by_run(run_id=next_run, tenant_id=_TENANT)
+    assert stuck is not None and stuck.status is ApprovalStatus.PENDING
+    assert done is not None and done.status is ApprovalStatus.TIMEOUT
+    # 失败那行下一轮照常重试。
+    assert await _sweep(approvals, runtime).run_once() == 1
+    stuck = await approvals.get_by_run(run_id=stuck_run, tenant_id=_TENANT)
+    assert stuck is not None and stuck.status is ApprovalStatus.TIMEOUT
 
 
 @pytest.mark.asyncio

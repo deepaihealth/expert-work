@@ -482,6 +482,17 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def latest_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID, exclude_run_id: UUID | None = None
+    ) -> RunInfo | None:
+        """会话里 ``created_at`` 最新的那一轮(可排除一个 run),没有就 ``None``。
+
+        班车 2 —— 新一轮开跑前据此判断上一轮是否可能留下没有结果的工具调用
+        (只有非 SUCCESS 的一轮才值得去读检查点)。``exclude_run_id`` 用于出队侧:
+        新一轮自己的行已经在表里。
+        """
+
+    @abc.abstractmethod
     async def mark_superseded(
         self,
         *,
@@ -927,6 +938,17 @@ class InMemoryRunStore(RunStore):
             return False
         self._rows[run_id] = replace(row, agent_spec_sha256=agent_spec_sha256)
         return True
+
+    async def latest_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID, exclude_run_id: UUID | None = None
+    ) -> RunInfo | None:
+        # 谓词与 SQL 店同义:租户 + 会话 + 排除项,created_at 最新的一行。
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.thread_id == thread_id and r.tenant_id == tenant_id and r.run_id != exclude_run_id
+        ]
+        return max(rows, key=lambda r: r.created_at) if rows else None
 
     async def mark_superseded(
         self,
@@ -1567,6 +1589,24 @@ class SqlRunStore(RunStore):
             )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def latest_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID, exclude_run_id: UUID | None = None
+    ) -> RunInfo | None:
+        # 谓词与内存店同义:租户 + 会话 + 排除项,created_at 最新的一行。
+        conditions = [AgentRunRow.thread_id == thread_id, AgentRunRow.tenant_id == tenant_id]
+        if exclude_run_id is not None:
+            conditions.append(AgentRunRow.id != exclude_run_id)
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(AgentRunRow)
+                    .where(*conditions)
+                    .order_by(AgentRunRow.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        return _row_to_dto(row) if row is not None else None
 
     async def mark_superseded(
         self,

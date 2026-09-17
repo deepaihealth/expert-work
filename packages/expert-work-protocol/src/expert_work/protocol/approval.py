@@ -153,6 +153,18 @@ class ApprovalRequest(BaseModel):
             "row), verification skipped."
         ),
     )
+    tool_call_id: str = Field(
+        default="",
+        description=(
+            "班车 2 —— 这次审批针对的那个工具调用的 id(模型给的)。续跑时核对:"
+            "当前这一轮 ``tool_calls`` 在 ``tool_call_index`` 处的调用必须正是它,"
+            "否则这条裁定不属于这一轮。空 = 旧请求 / 模型没给 id,不核对这一项。"
+        ),
+    )
+    tool_call_index: int | None = Field(
+        default=None,
+        description="这次审批针对的调用在那一轮 ``tool_calls`` 里的下标;``None`` = 旧请求。",
+    )
 
 
 class ApprovalDecision(BaseModel):

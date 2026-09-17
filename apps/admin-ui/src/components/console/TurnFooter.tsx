@@ -130,6 +130,7 @@ export function TurnFooter({
     "client_disconnect",
     "tenant_suspended",
     "agent_disabled",
+    "new_turn",
   ]);
   const interruptReason =
     status === "interrupted" && turn.runError !== null && INTERRUPT_REASONS.has(turn.runError)

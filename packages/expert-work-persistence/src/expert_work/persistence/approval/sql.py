@@ -83,6 +83,28 @@ class SqlApprovalStore(ApprovalStore):
             ).scalar_one_or_none()
         return _row_to_dto(row) if row is not None else None
 
+    async def list_pending_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID
+    ) -> list[ApprovalRecord]:
+        # 谓词与内存店同义:租户 + 会话 + pending,requested_at 升序。
+        async with self._sf() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(AgentApprovalRow)
+                        .where(
+                            AgentApprovalRow.tenant_id == tenant_id,
+                            AgentApprovalRow.thread_id == thread_id,
+                            AgentApprovalRow.status == ApprovalStatus.PENDING.value,
+                        )
+                        .order_by(AgentApprovalRow.requested_at.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [_row_to_dto(r) for r in rows]
+
     async def list_expired(
         self,
         *,
@@ -216,6 +238,34 @@ class SqlApprovalStore(ApprovalStore):
                     AgentApprovalRow.status == ApprovalStatus.PENDING.value,
                 )
                 .values(**values)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def void_continuation(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        continuation_run_id: UUID,
+        decided_by: str,
+        decided_at: datetime,
+    ) -> bool:
+        # 谓词与内存店同义:run + 租户 + 续跑 id 三者都对才改。
+        async with self._sf() as session:
+            result = await session.execute(
+                update(AgentApprovalRow)
+                .where(
+                    AgentApprovalRow.run_id == run_id,
+                    AgentApprovalRow.tenant_id == tenant_id,
+                    AgentApprovalRow.continuation_run_id == continuation_run_id,
+                )
+                .values(
+                    status=ApprovalStatus.REJECTED.value,
+                    decided_by=decided_by,
+                    decided_at=decided_at,
+                    continuation_run_id=None,
+                )
             )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0

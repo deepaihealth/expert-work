@@ -57,6 +57,11 @@ from control_plane.api._user_scope import (
     resolve_caller_user_id,
 )
 from control_plane.api.trace_facade import fetch_and_normalize, fetch_span_raw
+from control_plane.approval_void import (
+    close_previous_turn,
+    void_decided_approval,
+    void_if_superseded,
+)
 from control_plane.audit import emit
 from control_plane.kill_switch import run_block_reason
 from control_plane.prompt_render import (
@@ -101,6 +106,7 @@ from expert_work.persistence.token_usage_store import (
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.protocol import (
     AgentSpec,
+    AgentSpecRecord,
     AgentSpecStatus,
     ApprovalStatus,
     AuditAction,
@@ -115,9 +121,11 @@ from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunEventSt
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import (
+    APPROVAL_TURN_RESET,
     LLM_CACHE_BYPASS_KEY,
     AgentFactoryError,
     BuiltAgent,
+    pending_request_binding,
     run_agent,
     sse_consumer,
 )
@@ -514,6 +522,9 @@ def build_run_graph_input(
         # 保留检查点里的旧值,上一轮的附件会漏进这一轮的子代。
         "turn_documents": list(document_names or []),
         "turn_image_refs": list(image_refs),
+        # 审批三件套只属于一轮,每一轮都清零(班车 2)—— 省略时检查点里上一轮
+        # 停在审批上留下的 pending_approval 会让本轮的门控调用跳过审批门。
+        **APPROVAL_TURN_RESET,
     }
 
 
@@ -558,6 +569,8 @@ def replay_graph_input(
         "step_count": 0,
         "max_steps": built.max_steps,
         "max_no_progress": built.max_no_progress,
+        # 与 ``build_run_graph_input`` 同一条:审批三件套每一轮清零(班车 2)。
+        **APPROVAL_TURN_RESET,
     }
 
 
@@ -787,6 +800,21 @@ async def resolve_approval_decision(
             status_code=409,
             detail=f"approval already decided ({approval.status.value})",
         )
+    # 班车 2 —— 这条审批所在的 run 之后会话里已经有更新的 run:检查点已经属于
+    # 新一轮,绝不能拿它续跑。就地作废,与「已被裁定」同一个 409(超时扫描也走这里)。
+    if await void_if_superseded(
+        approval,
+        approvals=approvals,
+        run_manager=runtime.run_manager,
+        audit=audit,
+        actor_id=actor_id,
+        trace_id=trace_id,
+    ):
+        loser = await approvals.get_by_run(run_id=run_id, tenant_id=tenant_id)
+        replay = _idempotent_continuation(loser, idempotency_key)
+        if replay is not None:
+            return None, replay, True
+        raise HTTPException(status_code=409, detail="approval already decided (rejected)")
 
     meta = await threads.get(thread_id, tenant_id=tenant_id)
     if meta is None or meta.agent_name is None or meta.agent_version is None:
@@ -829,6 +857,52 @@ async def resolve_approval_decision(
         approvals=approvals,
         event_store=runtime.run_event_store,
     )
+
+    # 班车 2 终审 C1 —— 取配置、构建 agent 挪到 CAS 之前。构建可能要几秒(副本本地
+    # 缓存、冷启动没有单飞),放在 CAS 之后就是一段「裁定已消费、检查点还没写」的长
+    # 窗口。构建失败(422)时审批单仍是 PENDING,可以重试 —— 与上面 kill-switch、
+    # B-61 取 inputs 同一个理由。agent 已删除 / 从未注册是**永久**失败,沿用原语义:
+    # 先消费裁定、再报错 —— 否则超时扫描每个周期都会捡回同一批行,把排在后面的
+    # 过期审批饿死。
+    # Deletion hygiene PR4 — same 410-over-404 split as the run-start path: a
+    # soft-DELETED agent's approval continuation is refused with a precise 410.
+    spec_record = await agent_repo.get(
+        tenant_id=tenant_id,
+        name=meta.agent_name,
+        version=meta.agent_version,
+        include_deleted=True,
+    )
+    agent_gone: HTTPException | None = None
+    prepared: tuple[AgentSpecRecord, BuiltAgent] | None = None
+    if spec_record is None:
+        agent_gone = HTTPException(
+            status_code=404,
+            detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
+        )
+    elif spec_record.status is AgentSpecStatus.DELETED:
+        agent_gone = HTTPException(
+            status_code=410,
+            detail={
+                "code": "AGENT_DELETED",
+                "message": f"agent {meta.agent_name}@{meta.agent_version} has been deleted",
+            },
+        )
+    else:
+        try:
+            prepared = (
+                spec_record,
+                await runtime.get_agent(
+                    tenant_id=tenant_id,
+                    name=meta.agent_name,
+                    version=meta.agent_version,
+                    spec=spec_record.spec,
+                    user_id=oauth_user_id,
+                ),
+            )
+        except AgentFactoryError as exc:
+            raise HTTPException(
+                status_code=422, detail=f"agent manifest cannot be built: {exc}"
+            ) from exc
 
     # Stream 13.2 — generate the continuation id BEFORE the CAS so it is bound
     # atomically to the winning decision; a retry / lost-race caller reads it
@@ -885,48 +959,38 @@ async def resolve_approval_decision(
         },
     )
 
-    # Deletion hygiene PR4 — same 410-over-404 split as the run-start path: a
-    # soft-DELETED agent's approval continuation is refused with a precise 410.
-    spec_record = await agent_repo.get(
-        tenant_id=tenant_id,
-        name=meta.agent_name,
-        version=meta.agent_version,
-        include_deleted=True,
-    )
-    if spec_record is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
+    if prepared is None:
+        # 只剩 agent 已删除 / 从未注册这一种(构建失败在 CAS 之前就抛了)。
+        raise agent_gone or HTTPException(status_code=404, detail="agent not found")
+    spec_record, built = prepared
+
+    checkpoint_config: RunnableConfig = {
+        "configurable": {"thread_id": str(thread_id), "tenant_id": str(tenant_id)}
+    }
+    # 班车 2 终审 C1 —— 写检查点前的最后一道核对:检查点里等着的必须还是这条审批。
+    # 新一轮的图输入总会清掉 ``pending_approval``(新一轮开跑前的收口也会),所以
+    # CAS 之后才到的任何新一轮都过不了这里;不核对的话,这次裁定会被写进已经属于
+    # 新一轮的检查点,套到新一轮自己的工具调用上执行。核对失败:不写、不开续跑,
+    # 这次裁定改记为作废,与「已被裁定」同一个 409。
+    snapshot = await built.graph.aget_state(checkpoint_config)
+    waiting_on = pending_request_binding(snapshot.values or {})
+    if waiting_on is None or waiting_on["request_id"] != approval.request_id:
+        await void_decided_approval(
+            approval,
+            continuation_run_id=continuation_run_id,
+            approvals=approvals,
+            run_manager=runtime.run_manager,
+            audit=audit,
+            actor_id=actor_id,
+            trace_id=trace_id,
         )
-    if spec_record.status is AgentSpecStatus.DELETED:
-        raise HTTPException(
-            status_code=410,
-            detail={
-                "code": "AGENT_DELETED",
-                "message": f"agent {meta.agent_name}@{meta.agent_version} has been deleted",
-            },
-        )
-    try:
-        built = await runtime.get_agent(
-            tenant_id=tenant_id,
-            name=meta.agent_name,
-            version=meta.agent_version,
-            spec=spec_record.spec,
-            user_id=oauth_user_id,
-        )
-    except AgentFactoryError as exc:
-        raise HTTPException(
-            status_code=422, detail=f"agent manifest cannot be built: {exc}"
-        ) from exc
+        raise HTTPException(status_code=409, detail="approval already decided (rejected)")
 
     # Write the verdict into the paused thread's checkpoint. ``as_node=
     # "agent"`` re-positions the graph as if the agent had just run,
     # so the next step evaluates the agent's conditional edge — the
     # last message still carries the gated tool_calls → routes to
     # ``tools``, where ``approval_resume`` is applied.
-    checkpoint_config: RunnableConfig = {
-        "configurable": {"thread_id": str(thread_id), "tenant_id": str(tenant_id)}
-    }
     await built.graph.aupdate_state(  # type: ignore[attr-defined]
         checkpoint_config,
         {
@@ -938,6 +1002,10 @@ async def resolve_approval_decision(
                 # RT-6 Tier A (RT-ADR-19) — the graph re-hashes the dispatched
                 # args and matches them against this; drift → integrity veto.
                 "binding_digest": expected_digest,
+                # 班车 2 —— 被批请求的身份(request_id / 摘要 / 调用 id 与下标)。
+                # 上面的核对与这次写入之间不是原子的:图里据此再核对一次,裁定
+                # 不属于检查点里那一轮就按绑定漂移处理,什么都不执行。
+                **waiting_on,
             },
         },
         as_node="agent",
@@ -1214,6 +1282,23 @@ async def spawn_run(
             )
             replay_messages = result.replay_messages
             regenerated_from = supersede.target_run_id
+
+        # 班车 2 —— 新一轮作废会话里还在等裁定的审批(用户拍板:不 409),并按历史
+        # 的形状收口上一轮。必须早于建行 / 入队:queue worker 只认已存在的行,作废与
+        # 检查点收口都落定之后新一轮才可能开跑。queue 模式出队时还会再做一次
+        # (见 RunQueueWorker)。
+        await close_previous_turn(
+            graph=built.graph,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            new_run_id=run_id,
+            approvals=approvals,
+            run_manager=runtime.run_manager,
+            audit=audit,
+            actor_id=actor_id,
+            trace_id=trace_id,
+            on_behalf_of=on_behalf_of,
+        )
 
         # Stream 9.5 — queue mode: persist as ``queued`` + return 202.
         if payload.mode == "queue":

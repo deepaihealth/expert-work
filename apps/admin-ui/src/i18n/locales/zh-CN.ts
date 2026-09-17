@@ -1440,6 +1440,7 @@ const zhCN: TranslationKeys = {
     interrupt_reason_client_disconnect: "已中断（连接断开）",
     interrupt_reason_tenant_suspended: "已中断（租户停用）",
     interrupt_reason_agent_disabled: "已中断（智能体下线）",
+    interrupt_reason_new_turn: "已中断（发了新消息，待审批已作废）",
     footer_export: "导出",
     turn_view_run: "查看运行",
     toolbar_duration: "时长",

@@ -1278,3 +1278,40 @@ async def test_set_status_guard_claimed_by() -> None:
         )
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_latest_by_thread_picks_newest_scoped_and_can_skip_one() -> None:
+    """班车 2 终审 I1 —— 新一轮开头只看会话里最近的那一轮(可排除新一轮自己)。"""
+    store = InMemoryRunStore()
+    thread_id, tenant_a, tenant_b = uuid4(), uuid4(), uuid4()
+    oldest, middle, newest = uuid4(), uuid4(), uuid4()
+    for run_id, minutes in ((middle, 1), (oldest, 0), (newest, 2)):
+        await store.create(
+            _info(
+                run_id=run_id,
+                tenant_id=tenant_a,
+                thread_id=thread_id,
+                created_at=_BASE + timedelta(minutes=minutes),
+            )
+        )
+    # 别的租户同一会话 id、同租户别的会话,都更新 —— 一个都不能漏进来。
+    await store.create(
+        _info(
+            run_id=uuid4(),
+            tenant_id=tenant_b,
+            thread_id=thread_id,
+            created_at=_BASE + timedelta(minutes=9),
+        )
+    )
+    await store.create(
+        _info(run_id=uuid4(), tenant_id=tenant_a, created_at=_BASE + timedelta(minutes=9))
+    )
+
+    latest = await store.latest_by_thread(thread_id=thread_id, tenant_id=tenant_a)
+    assert latest is not None and latest.run_id == newest
+    skipped = await store.latest_by_thread(
+        thread_id=thread_id, tenant_id=tenant_a, exclude_run_id=newest
+    )
+    assert skipped is not None and skipped.run_id == middle
+    assert await store.latest_by_thread(thread_id=uuid4(), tenant_id=tenant_a) is None

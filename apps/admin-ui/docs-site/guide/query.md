@@ -348,8 +348,10 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
 | `success` | 正常执行完毕 | 是 | 按正常结果处理 |
 | `error` | 执行失败，包含步数预算耗尽的情况 | 是 | 读 `error` 字段，见下文 |
 | `timeout` | 保留取值，当前不会出现 | 是 | 不需要为它单独写处理分支 |
-| `interrupted` | 被调用方取消 | 是 | 视为调用方自己中止的结果 |
+| `interrupted` | 被调用方取消，或者等待审批期间同一会话里发起了新一轮（见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)） | 是 | 视为调用方自己中止的结果 |
 | `paused` | 暂停等待人工审批，可以续跑 | 是 | 去 [4.2 审批决策](./run-control#_4-2-审批决策) 下达决策，这个 run 才会继续 |
+
+`paused` 有一个例外：决策之前同一会话里发起了新一轮时，它会变为 `interrupted`，之后不再变化，见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)。
 
 `finished_at` 只在 run 进入最终状态之后才有值。
 

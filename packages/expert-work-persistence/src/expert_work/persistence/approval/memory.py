@@ -28,6 +28,20 @@ class InMemoryApprovalStore(ApprovalStore):
             return None
         return row
 
+    async def list_pending_by_thread(
+        self, *, thread_id: UUID, tenant_id: UUID
+    ) -> list[ApprovalRecord]:
+        # 谓词与 SQL 店同义:租户 + 会话 + pending,requested_at 升序。
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.thread_id == thread_id
+            and r.status == ApprovalStatus.PENDING
+        ]
+        rows.sort(key=lambda r: r.requested_at)
+        return rows
+
     async def list_expired(
         self,
         *,
@@ -110,6 +124,33 @@ class InMemoryApprovalStore(ApprovalStore):
         if binding_digest is not None:
             update["binding_digest"] = binding_digest
         self._rows[run_id] = row.model_copy(update=update)
+        return True
+
+    async def void_continuation(
+        self,
+        *,
+        run_id: UUID,
+        tenant_id: UUID,
+        continuation_run_id: UUID,
+        decided_by: str,
+        decided_at: datetime,
+    ) -> bool:
+        # 谓词与 SQL 店同义:run + 租户 + 续跑 id 三者都对才改。
+        row = self._rows.get(run_id)
+        if (
+            row is None
+            or row.tenant_id != tenant_id
+            or row.continuation_run_id != continuation_run_id
+        ):
+            return False
+        self._rows[run_id] = row.model_copy(
+            update={
+                "status": ApprovalStatus.REJECTED,
+                "decided_by": decided_by,
+                "decided_at": decided_at,
+                "continuation_run_id": None,
+            }
+        )
         return True
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:

@@ -204,6 +204,27 @@ describe("TurnFooter", () => {
       </MemoryRouter>,
     );
     expect(screen.getByTestId("console-turn-status")).toHaveTextContent("已中断");
+
+    // 班车 2 —— 停在审批上的一轮被新消息作废,要和「用户点了取消」分得开。
+    const voided = { ...cancelled, runError: "new_turn" };
+    rerender(
+      <MemoryRouter>
+        <TurnFooter
+          turn={voided}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("console-turn-status")).toHaveTextContent(
+      "已中断（发了新消息，待审批已作废）",
+    );
   });
 
   it("does not render a view-run link any more", () => {
