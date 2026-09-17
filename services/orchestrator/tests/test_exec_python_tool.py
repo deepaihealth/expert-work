@@ -381,3 +381,14 @@ def test_both_sandbox_tool_descriptions_state_the_local_path_fallback() -> None:
         assert "local_path 非空表示平台已把该文件下载到本地，直接用它，不必再联网下载" in clause  # noqa: RUF001
         assert "该文件已被清理，这时改用同一项里的原始 URL 自己下载" in clause  # noqa: RUF001
     assert exec_clause == bash_clause, "两个工具的 B-61 段落必须逐字节相同"
+
+
+def test_description_tells_the_model_about_the_inputs_dir() -> None:
+    """B-67 —— 描述里提 $EXPERT_WORK_INPUTS_DIR、按变量名的文件与列表项的 local_path 位置;
+    平台文本,不写任何租户的变量名。"""
+    description = ExecPythonTool(client=RecordingSandboxRuntime()).spec.description
+    assert "$EXPERT_WORK_INPUTS_DIR" in description
+    assert "<变量名>" in description
+    assert "value_parsed[i].local_path" in description
+    for tenant_name in ("org_logo", "materials", "ai-health-plan"):
+        assert tenant_name not in description
