@@ -406,3 +406,45 @@ async def test_a_killed_prefetch_exec_is_logged_as_a_warning(
     assert warned[0].prefetch_exit_code == 137
     assert warned[0].prefetch_timed_out is True
     assert "https://" not in _record_payload(warned[0])
+
+
+# ---------------------------------------------------------------------------
+# B-67 PR1 终审 F2 —— 深嵌套的输入不能让 run 失败。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_deeply_nested_json_string_never_fails_the_run() -> None:
+    """2.4 KB 的 ``[[[…]]]`` 在 JSON 字符串解析上限之内;解析出来的值曾让构造清单时的
+    递归 ``RecursionError``,冒穿节点杀掉整个 run。现在它不算 JSON 容器:照普通字符串
+    写进清单,没有 URL 也就不起预拉。"""
+    runtime = _FakeRuntime()
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="materials"),))
+    raw = "[" * 1200 + "]" * 1200
+
+    result = await node({}, _config(uuid4(), uuid4(), uuid4(), {"materials": raw}))
+
+    assert result == {}
+    assert len(runtime.execs) == 1, "清单照写;没有 URL 不起预拉"
+    assert "value_parsed" not in runtime.execs[0]
+
+
+@pytest.mark.asyncio
+async def test_a_deeply_nested_real_list_never_fails_the_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """调用方直接给的 list 嵌套过深(存量问题):构造清单时的递归 ``RecursionError`` 与
+    不可序列化的值同一口径降级 —— 记一条 warning、一次 exec 都不起,run 照跑。"""
+    runtime = _FakeRuntime()
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="materials"),))
+    deep: Any = []
+    for _ in range(1200):
+        deep = [deep]
+
+    with caplog.at_level(logging.WARNING, logger="orchestrator.graph_builder.inputs_node"):
+        result = await node({}, _config(uuid4(), uuid4(), uuid4(), {"materials": deep}))
+
+    assert result == {}
+    assert runtime.execs == []
+    own = [r for r in caplog.records if r.name == "orchestrator.graph_builder.inputs_node"]
+    assert [r.getMessage() for r in own] == ["inputs.build_failed"]

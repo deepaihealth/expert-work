@@ -170,10 +170,11 @@ def make_inputs_node(
             if doc is None or not doc["variables"]:
                 return {}
             variable_names = sorted(doc["variables"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             # build_inputs_doc 对每个声明变量的 value 提前 json.dumps 一次
             # (task-1「早失败」设计:不可序列化的值不该等到写文件那一步再炸),
-            # 这条异常因此是真会发生的分支,不是理论上的。永不让 run 失败:与
+            # 这条异常因此是真会发生的分支,不是理论上的。RecursionError 同理:
+            # 调用方直接给的 list 嵌套够深,构造时的递归就会炸。永不让 run 失败:与
             # 写文件/预拉失败同一口径降级。不记值——用声明的变量名(不是 doc
             # 里的,构造半途失败时 doc 拿不到;不知道具体是哪个变量的值不可
             # 序列化,所以报全部声明名而不是猜)。

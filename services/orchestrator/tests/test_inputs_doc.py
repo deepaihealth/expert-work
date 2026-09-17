@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 import pytest
 
 from expert_work.protocol import PromptVariableSpec
+from orchestrator.tools import inputs_doc
 from orchestrator.tools.inputs_doc import (
+    INPUTS_FILENAME,
+    MAX_PARSE_BYTES,
+    MAX_PARSE_DEPTH,
     UrlSite,
     build_inputs_doc,
+    inputs_abs_dir,
     inputs_abs_path,
     inputs_rel_path,
     iter_url_sites,
+    link_names,
+    linked_sites,
+    parse_json_value,
+    root_key,
+    slugify,
+    url_suffix,
 )
 
 RUN = UUID("382f6f5a-55c4-49be-ac05-32fa143f010d")
@@ -156,3 +168,201 @@ def test_caller_supplied_local_path_is_nulled_in_the_document() -> None:
     assert "local_path" in doc["variables"]["logo"]["value"]
     # 调用方给的那份 inputs 没被改(不可变)。
     assert inputs["logo"]["local_path"] == "../../etc/passwd"
+
+
+# ---------------------------------------------------------------------------
+# B-67 Task 1 —— §4.3 JSON 字符串值 / §4.1 链接命名 / §4.2 目录路径
+# ---------------------------------------------------------------------------
+
+
+def test_json_string_value_is_parsed_into_value_parsed_and_scanned() -> None:
+    """`materials` 这类契约传的是 JSON **数组字符串**;`value` 一个字不动(契约不变),
+    解析结果写到同级 `value_parsed`,URL 扫描与回填都看它。"""
+    raw = '[{"description": "示范视频", "url": "https://x/a.mp4"}]'
+    doc = build_inputs_doc(run_id=RUN, variables=[_var("materials")], inputs={"materials": raw})
+    assert doc is not None
+    entry = doc["variables"]["materials"]
+    assert entry["value"] == raw
+    assert entry["value_parsed"] == [{"description": "示范视频", "url": "https://x/a.mp4"}]
+    assert root_key(entry) == "value_parsed"
+    assert iter_url_sites(doc) == [
+        UrlSite(var_name="materials", path=(0, "url"), url="https://x/a.mp4")
+    ]
+
+
+@pytest.mark.parametrize("raw", ['"x"', "42", "not json", "[1", "", "  {oops", "null"])
+def test_strings_that_are_not_json_containers_get_no_value_parsed(raw: str) -> None:
+    doc = build_inputs_doc(run_id=RUN, variables=[_var("a")], inputs={"a": raw})
+    assert doc is not None
+    assert "value_parsed" not in doc["variables"]["a"]
+    assert root_key(doc["variables"]["a"]) == "value"
+    assert parse_json_value(raw) is None
+
+
+def test_a_real_list_is_not_parsed_twice() -> None:
+    doc = build_inputs_doc(
+        run_id=RUN, variables=[_var("a")], inputs={"a": [{"url": "https://x/1.png"}]}
+    )
+    assert doc is not None
+    assert "value_parsed" not in doc["variables"]["a"]
+    assert parse_json_value([1]) is None
+
+
+def test_oversized_json_string_is_not_parsed() -> None:
+    raw = "[" + ",".join(["1"] * 40_000) + "]"
+    assert len(raw.encode("utf-8")) > MAX_PARSE_BYTES
+    assert parse_json_value(raw) is None
+
+
+def test_caller_local_path_inside_a_json_string_is_nulled_too() -> None:
+    """`value_parsed` 与 `value` 同受 `_null_local_paths` 闸(spec §八)。"""
+    raw = '[{"url": "https://ok/a.mp4", "local_path": "https://attacker/b.mp4"}]'
+    doc = build_inputs_doc(run_id=RUN, variables=[_var("m")], inputs={"m": raw})
+    assert doc is not None
+    assert doc["variables"]["m"]["value_parsed"][0]["local_path"] is None
+    assert doc["variables"]["m"]["value"] == raw
+    assert iter_url_sites(doc) == [UrlSite(var_name="m", path=(0, "url"), url="https://ok/a.mp4")]
+
+
+def test_link_names_by_shape() -> None:
+    """顶层 → `<var><ext>`;dict 字段 → `<var>.<key><ext>`;列表项 → `<var>/<下标>-<slug><ext>`。"""
+    assert link_names("org_logo", [((), "https://x/cover-1726394851207.png", None)]) == [
+        "org_logo.png"
+    ]
+    assert link_names("brand", [(("logo",), "https://x/l.jpg", None)]) == ["brand.logo.jpg"]
+    assert link_names(
+        "materials",
+        [
+            ((0, "url"), "https://x/a.mp4", "示范视频"),
+            ((2, "url"), "https://x/b.pdf", "饮食指南"),
+        ],
+    ) == ["materials/0-示范视频.mp4", "materials/2-饮食指南.pdf"]
+    # dict 里套列表:下标之前的键进名字,下标之后的不进。
+    assert link_names("nested", [(("a", 0, "url"), "https://x/n.png", "x")]) == ["nested.a/0-x.png"]
+
+
+def test_slug_keeps_word_chars_and_drops_everything_else() -> None:
+    assert slugify("示范 视频/../x.mp4") == "示范视频xmp4"
+    assert slugify("x" * 50) == "x" * 40
+    assert slugify(None) == ""
+    assert slugify("") == ""
+    assert link_names("m", [((0, "url"), "https://x/a.mp4", "!!!")]) == ["m/0.mp4"]
+
+
+def test_url_without_a_usable_suffix_gets_none() -> None:
+    assert url_suffix("https://x/post") == ""
+    assert url_suffix("https://x/a.tar.gz") == ".gz"
+    assert url_suffix("https://x/a.toolong7") == ""
+    assert url_suffix("https://x/a.p%20") == ""
+    assert url_suffix("https://x/a.PNG?sig=1") == ".PNG"
+    assert link_names("page", [((), "https://x/post", None)]) == ["page"]
+
+
+def test_colliding_link_names_are_numbered_in_order() -> None:
+    sites = [((0, "url"), "https://x/a.png", "封面"), ((0, "thumb"), "https://x/t.png", "封面")]
+    assert link_names("m", sites) == ["m/0-封面.png", "m/0-封面-2.png"]
+
+
+def test_tenant_segments_cannot_escape_the_run_dir() -> None:
+    """dict 键与 description 都是租户数据;进文件名前必须净化到只剩 `[\\w-]`。"""
+    names = link_names(
+        "v",
+        [
+            (("../../etc", "passwd"), "https://x/p", None),
+            ((0, "url"), "https://x/a.png", "../../../root"),
+            (("",), "https://x/e.png", None),
+        ],
+    )
+    for name in names:
+        assert ".." not in name
+        assert not name.startswith("/")
+    assert names == ["v.etc.passwd", "v/0-root.png", "v._.png"]
+
+
+def test_linked_sites_from_a_raw_json_string_use_the_same_names() -> None:
+    raw = '[{"description": "示范视频", "url": "https://x/a.mp4"}, {"description": "无链接"}]'
+    out = linked_sites("materials", raw)
+    assert [(s.site.path, s.site.url, s.link) for s in out] == [
+        ((0, "url"), "https://x/a.mp4", "materials/0-示范视频.mp4")
+    ]
+    assert linked_sites("note", "hi") == []
+    assert [s.link for s in linked_sites("org_logo", "https://x/l.png")] == ["org_logo.png"]
+
+
+def test_inputs_abs_dir_is_the_run_dir_under_the_exec_view() -> None:
+    assert inputs_abs_dir(RUN) == f"/workspace/inputs/{RUN}"
+    assert inputs_abs_path(RUN).startswith(inputs_abs_dir(RUN) + "/")
+
+
+# ---------------------------------------------------------------------------
+# B-67 PR1 终审 —— 链接名不占平台文件名(F1)/ 顺延不撞名(F5)/ 深嵌套不炸 run(F2)
+# ---------------------------------------------------------------------------
+
+
+def test_link_names_never_take_the_platform_manifest_names() -> None:
+    """变量叫 ``inputs`` 是合法的。``inputs`` + ``.json``、``inputs.json`` + ``.tmp`` 恰好是
+    run 目录里的清单本身、和沙箱脚本原子改写清单用的临时文件:占了,建链接会删掉清单,或
+    ``_rewrite`` 顺着链接把整份清单写进按 agent 共享的缓存条目(跨 run 泄漏)。这两个名字
+    预先算「已占用」,撞上就按 ``-2`` 顺延。"""
+    assert inputs_doc._RESERVED_NAMES == {INPUTS_FILENAME, f"{INPUTS_FILENAME}.tmp"}
+    assert link_names("inputs", [((), "https://x/a.json", None)]) == ["inputs-2.json"]
+    assert link_names("inputs", [(("json",), "https://x/b.tmp", None)]) == ["inputs.json-2.tmp"]
+    assert [s.link for s in linked_sites("inputs", "https://x/a.json")] == ["inputs-2.json"]
+
+
+def test_numbering_never_lands_on_a_name_already_taken() -> None:
+    """键 ``a`` / ``a!`` / ``a-2``:第二个顺延成 ``v.a-2.png``,第三个自己就叫这个名字 ——
+    按「同 stem 计数」顺延会让两个 site 共用一个链接。第四个 ``a?`` 要连跳两次才落到空位。"""
+    keys = ["a", "a!", "a-2", "a?"]
+    sites = [((key,), f"https://x/{i}.png", None) for i, key in enumerate(keys)]
+    assert link_names("v", sites) == ["v.a.png", "v.a-2.png", "v.a-2-2.png", "v.a-3.png"]
+
+
+def _nested(inner: Any, levels: int) -> Any:
+    """把 ``inner`` 再包 ``levels`` 层列表。"""
+    for _ in range(levels):
+        inner = [inner]
+    return inner
+
+
+@pytest.mark.parametrize("depth", [MAX_PARSE_DEPTH + 1, 1200, 32_000])
+def test_a_json_string_nested_too_deep_is_not_parsed(depth: int) -> None:
+    """几 KB 的 ``[[[…]]]`` 在 64 KiB 解析上限之内,解析出来的值却让递归的
+    ``_null_local_paths`` / ``_walk`` ``RecursionError``(再深些 ``json.loads`` 自己就抛)
+    —— 整轮 run 跟着失败。超过 :data:`MAX_PARSE_DEPTH` 层一律不算 JSON 容器。"""
+    raw = "[" * depth + "]" * depth
+    assert len(raw.encode("utf-8")) <= MAX_PARSE_BYTES
+    assert parse_json_value(raw) is None
+    doc = build_inputs_doc(run_id=RUN, variables=[_var("a")], inputs={"a": raw})
+    assert doc is not None
+    assert "value_parsed" not in doc["variables"]["a"]
+    assert linked_sites("a", raw) == []
+
+
+def test_json_string_nesting_up_to_the_bound_is_still_parsed() -> None:
+    """边界:恰好 :data:`MAX_PARSE_DEPTH` 层容器(最里层的对象也算一层)照常解析、照常命名。"""
+    raw = "[" * (MAX_PARSE_DEPTH - 1) + '{"url": "https://x/a.png"}' + "]" * (MAX_PARSE_DEPTH - 1)
+    assert parse_json_value(raw) is not None
+    assert [s.link for s in linked_sites("a", raw)] == ["a/0.png"]
+    deeper = "[" + raw + "]"
+    assert parse_json_value(deeper) is None
+    assert linked_sites("a", deeper) == []
+
+
+def test_a_real_value_nested_too_deep_yields_no_sites() -> None:
+    """同一道闸对调用方直接给的 list / dict 也成立:渲染层与守卫会在 run 创建 / 每次
+    exec 对**原始值**调 ``linked_sites``,那里不能递归爆栈;清单侧的 ``iter_url_sites``
+    与沙箱脚本同样不扫它(两边说的站点必须是同一组)。"""
+    shallow = _nested({"url": "https://x/a.png"}, MAX_PARSE_DEPTH - 1)
+    deep = [shallow]
+    assert [s.link for s in linked_sites("a", shallow)] == ["a/0.png"]
+    assert linked_sites("a", deep) == []
+    assert linked_sites("a", _nested({"url": "https://x/a.png"}, 1200)) == []
+    doc = {
+        "variables": {
+            "deep": {"value": deep, "trusted": True},
+            "very_deep": {"value": _nested([], 1200), "trusted": True},
+            "ok": {"value": shallow, "trusted": True},
+        }
+    }
+    assert [site.var_name for site in iter_url_sites(doc)] == ["ok"]

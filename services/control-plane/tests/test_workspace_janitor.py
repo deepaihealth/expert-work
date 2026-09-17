@@ -961,3 +961,58 @@ async def test_every_db_touch_runs_under_an_explicit_rls_context(tmp_path: Path)
     assert {"resolve", "update_size", "soft_delete", "mark_archived"} <= ops
     assert {ctx for _, ctx in workspaces.seen} == {(tenant, live, False), (tenant, gone, False)}
     assert _rls_ctx() == (None, None, False), "上下文必须复原,不能漏给调用方"
+
+
+@pytest.mark.asyncio
+async def test_reclaiming_a_run_dir_removes_its_links_but_not_the_cache_they_point_at(
+    tmp_path: Path,
+) -> None:
+    """B-67 §4.4 —— run 目录里现在有指向 ``../cache/`` 的符号链接(顶层 + 子目录两种深度)。
+    整棵 ``rmtree(dir_fd=…)`` 只删链接本身,**不跟随**:目标条目一个字节不少。"""
+    tenant, user = uuid4(), uuid4()
+    inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
+    cache = inputs / "cache"
+    cache.mkdir(parents=True)
+    fresh_entry = cache / f"{'a' * 32}.png"
+    fresh_entry.write_bytes(b"x" * 10)
+
+    stale_run = inputs / str(uuid4())
+    (stale_run / "materials").mkdir(parents=True)
+    (stale_run / "inputs.json").write_text("{}")
+    (stale_run / "org_logo.png").symlink_to(f"../cache/{fresh_entry.name}")
+    (stale_run / "materials" / "0-x.png").symlink_to(f"../../cache/{fresh_entry.name}")
+    assert (stale_run / "materials" / "0-x.png").read_bytes() == b"x" * 10  # 链接本身有效
+    _age(stale_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert not stale_run.exists()
+    assert fresh_entry.read_bytes() == b"x" * 10
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 1)
+
+
+@pytest.mark.asyncio
+async def test_reclaiming_a_cache_entry_leaves_a_dangling_link_in_a_live_run_dir(
+    tmp_path: Path,
+) -> None:
+    """反向:缓存 7 天到期、run 目录 30 天还在 → 链接悬空。这是已接受的降级(B-61 §4.5):
+    消费方判据「本地不存在」不变,清单 ``value`` 里永远有原 URL。链接本身不删、run 目录不动。"""
+    tenant, user = uuid4(), uuid4()
+    inputs = _agent_dir(tmp_path, tenant, user) / "inputs"
+    cache = inputs / "cache"
+    cache.mkdir(parents=True)
+    stale_entry = cache / f"{'b' * 32}.png"
+    stale_entry.write_bytes(b"y" * 10)
+    _age(stale_entry, seconds=_TTL_S["inputs_cache"] + 60)
+
+    live_run = inputs / str(uuid4())
+    live_run.mkdir()
+    (live_run / "inputs.json").write_text("{}")
+    link = live_run / "org_logo.png"
+    link.symlink_to(f"../cache/{stale_entry.name}")
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert not stale_entry.exists()
+    assert live_run.exists() and link.is_symlink() and not link.exists()  # 悬空,但还在
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (1, 0)

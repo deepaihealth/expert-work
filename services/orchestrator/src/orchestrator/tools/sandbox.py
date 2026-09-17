@@ -36,7 +36,7 @@ import httpx
 from expert_work.common.observability import inject_context
 from expert_work.persistence import SANDBOX_AGENTS_ROOT
 from orchestrator.llm.providers._http import client_for
-from orchestrator.tools.inputs_doc import inputs_abs_path
+from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.workspace_paths import agent_nas_root
 
@@ -105,17 +105,20 @@ def agent_key_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, s
     contract-tested in ``test_sandbox_runtime_contract.py``. Empty
     ``agent_key`` (a caller that never bound one) → no override.
 
-    ``run_id`` 非 ``None`` 时再加一项 ``EXPERT_WORK_INPUTS`` —— 本轮
-    ``inputs.json`` 在沙箱里的绝对路径(:func:`orchestrator.tools.inputs_doc.inputs_abs_path`)。
-    选环境变量而不是把路径写进提示词:``os.environ["EXPERT_WORK_INPUTS"]``
-    是固定写法,而路径里的 run_id 仍然是一个要模型手抄的串,那与 B-61 的
-    目的自相矛盾。
+    ``run_id`` 非 ``None`` 时再加两项 ``EXPERT_WORK_INPUTS`` / ``EXPERT_WORK_INPUTS_DIR``
+    —— 本轮 ``inputs.json`` 及其所在目录在沙箱里的绝对路径
+    (:func:`orchestrator.tools.inputs_doc.inputs_abs_path` /
+    :func:`orchestrator.tools.inputs_doc.inputs_abs_dir`)。选环境变量而不是把路径写进
+    提示词:``os.environ["EXPERT_WORK_INPUTS"]`` 是固定写法,而路径里的 run_id 仍然是
+    一个要模型手抄的串,那与 B-61 的目的自相矛盾。
     """
     envs: dict[str, str] = {}
     if agent_key:
         envs["PYTHONUSERBASE"] = f"{SANDBOX_AGENTS_ROOT}/{agent_key}"
     if run_id is not None:
         envs["EXPERT_WORK_INPUTS"] = inputs_abs_path(run_id)
+        # B-67 §4.2 —— 本轮 inputs 目录:按变量名命名的链接都在这里。同一条通道,两后端同值。
+        envs["EXPERT_WORK_INPUTS_DIR"] = inputs_abs_dir(run_id)
     return envs
 
 

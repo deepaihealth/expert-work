@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import http.server
+import inspect
 import json
 import os
 import socket
 import stat
+import textwrap
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -95,8 +97,12 @@ def test_script_source_matches_the_file_on_disk() -> None:
 
 
 def test_site_walk_matches_the_host_side_implementation() -> None:
-    from orchestrator.tools.inputs_doc import iter_url_sites
-    from orchestrator.tools.prefetch_script import _sites
+    from orchestrator.tools.inputs_doc import iter_url_sites, root_key
+    from orchestrator.tools.prefetch_script import _linked_sites, _root_key
+
+    too_deep: Any = {"url": "https://x/g.png"}
+    for _ in range(prefetch_script.MAX_PARSE_DEPTH):
+        too_deep = [too_deep]
 
     doc = {
         "variables": {
@@ -113,21 +119,35 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
             # local_path,两侧都必须判它不是 site。
             "d": {"value": ["https://a"], "trusted": True},
             "e": {"value": [["https://a"]], "trusted": True},
+            # B-67 §4.3 —— JSON 字符串:两侧都看 value_parsed,不看 value。
+            "f": {
+                "value": '[{"url": "https://x/f.pdf"}]',
+                "value_parsed": [{"url": "https://x/f.pdf"}],
+                "trusted": False,
+            },
+            # B-67 终审 F2 —— 嵌套超过 MAX_PARSE_DEPTH 层:两侧都不扫;恰好在上限上的照扫。
+            "g": {"value": too_deep, "trusted": True},
+            "h": {"value": too_deep[0], "trusted": True},
         }
     }
     host = [(s.var_name, list(s.path), s.url) for s in iter_url_sites(doc)]
+    # 沙箱侧走 main 真正用的那条路(_linked_sites:深度闸 + _sites)。
     sandbox = [
         (name, path, url)
         for name, entry in doc["variables"].items()
-        for path, url in _sites(entry["value"], [])
+        for path, url, _link in _linked_sites(name, entry[_root_key(entry)])
     ]
     assert host == sandbox
+    assert all(_root_key(e) == root_key(e) for e in doc["variables"].values())
     # 显式钉住攻击场景本身:c 只应该命中 url 那条,local_path 绝不能被当成待预拉的地址。
     assert ("c", ["url"], "https://ok/a.mp4") in sandbox
     assert not any(name == "c" and url == "https://attacker/b.mp4" for name, _, url in sandbox)
     # 同样显式钉住 finding 1:d/e 一条 site 都不该有——沙箱侧 _assign 走到那里会
     # TypeError,而 main 的 per-site 兜底之外,首先靠的就是这条判定。
     assert not any(name in {"d", "e"} for name, _, _ in sandbox)
+    assert ("f", [0, "url"], "https://x/f.pdf") in sandbox
+    assert not any(name == "g" for name, _, _ in sandbox)
+    assert [url for name, _, url in sandbox if name == "h"] == ["https://x/g.png"]
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +229,7 @@ def test_fetch_hit_writes_file_and_relative_local_path(
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     name = cache_digest(f"{base}/ok.jpg") + ".jpg"
-    assert doc["variables"]["org_logo"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/org_logo.jpg"
     saved = tmp_path / "inputs" / "cache" / name
     assert saved.read_bytes() == body
 
@@ -364,8 +384,7 @@ def test_budget_exhausted_by_first_file_refuses_second(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    first_name = cache_digest(f"{base}/first") + ".jpg"
-    assert doc["variables"]["a"]["local_path"] == f"inputs/cache/{first_name}"
+    assert doc["variables"]["a"]["local_path"] == "inputs/run1/a"
     assert doc["variables"]["b"]["local_path"] is None
 
 
@@ -430,7 +449,7 @@ def test_a_bare_url_in_a_list_does_not_lose_the_other_variables(
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
     name = cache_digest(f"{base}/ok.jpg") + ".jpg"
-    assert doc["variables"]["org_logo"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/org_logo.jpg"
     assert (tmp_path / "inputs" / "cache" / name).read_bytes() == body
     # 列表里的裸 URL 原样留着(没被回填、也没把结构改成别的形状)。
     assert doc["variables"]["images"]["value"] == [f"{base}/ok.jpg"]
@@ -482,8 +501,7 @@ def test_each_site_is_persisted_before_the_next_one(
         main(["prefetch_script.py", str(inputs_path)])
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    name = cache_digest(f"{base}/a.jpg") + ".jpg"
-    assert doc["variables"]["a"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["a"]["local_path"] == "inputs/run1/a.jpg"
 
 
 def test_one_failing_site_does_not_lose_the_others(
@@ -517,8 +535,7 @@ def test_one_failing_site_does_not_lose_the_others(
     assert main(["prefetch_script.py", str(inputs_path)]) == 0
 
     doc = json.loads(inputs_path.read_text(encoding="utf-8"))
-    name = cache_digest(f"{base}/b.jpg") + ".jpg"
-    assert doc["variables"]["b"]["local_path"] == f"inputs/cache/{name}"
+    assert doc["variables"]["b"]["local_path"] == "inputs/run1/b.jpg"
 
 
 # ---------------------------------------------------------------------------
@@ -700,3 +717,489 @@ def test_a_cache_hit_never_touches_the_entry(tmp_path: Path, http_server: _HttpS
     assert (hit_name, hit_used) == (name, 0)  # 先确认这一次真的走的是命中路径
     assert len(served) == 1
     assert os.stat(cached).st_mtime_ns == before
+
+
+# ---------------------------------------------------------------------------
+# B-67 Task 2 —— §4.1 按变量名建符号链接
+# ---------------------------------------------------------------------------
+
+
+def _wrapped(inner: Any, levels: int) -> Any:
+    for _ in range(levels):
+        inner = [inner]
+    return inner
+
+
+_LONG_DESCRIPTION = "长" * 30 + "abcdefghijklmnopqrstuvwxyz"  # 56 字,slug 只取前 40
+_AT_DEPTH_BOUND = _wrapped({"url": "https://x/b.png"}, prefetch_script.MAX_PARSE_DEPTH - 1)
+
+#: ``(变量名, 调用方给的原始值, 期望的链接名)``。前六行是基本形状;其余每行专门照出一种
+#: 现实的漂移(slug 截断长度、扩展名的大小写 / 长度、按整条 URL 取后缀、保留名、顺延撞名、
+#: 深度闸),两侧任何一侧改了这些,至少一行会红。
+_NAME_CORPUS: list[tuple[str, Any, list[str]]] = [
+    ("org_logo", "https://x/cover-1726394851207.png", ["org_logo.png"]),
+    ("brand", {"logo": "https://x/l.jpg", "name": "深护"}, ["brand.logo.jpg"]),
+    (
+        "materials",
+        '[{"description": "示范 视频", "url": "https://x/a.mp4"}, {"description": "无链接"},'
+        ' {"url": "https://x/c.pdf", "thumb": "https://x/c.pdf"}]',
+        ["materials/0-示范视频.mp4", "materials/2.pdf", "materials/2-2.pdf"],
+    ),
+    ("page", "https://x/post", ["page"]),
+    ("nested", {"a": [{"url": "https://x/n.png", "description": "..x"}]}, ["nested.a/0-x.png"]),
+    ("note", "短文本", []),
+    (
+        "long_desc",
+        [{"description": _LONG_DESCRIPTION, "url": "https://x/l.png"}],
+        [f"long_desc/0-{_LONG_DESCRIPTION[:40]}.png"],
+    ),
+    ("empty_key", {"": "https://x/e.png"}, ["empty_key._.png"]),
+    ("upper_ext", "https://x/A.PNG", ["upper_ext.PNG"]),
+    ("ext4", "https://x/deck.pptx", ["ext4.pptx"]),
+    ("ext5", "https://x/page.xhtml", ["ext5.xhtml"]),
+    ("ext6", "https://x/a.abcdef", ["ext6"]),
+    ("signed", "https://x/a.png?sig=abc.def&e=1#frag.x", ["signed.png"]),
+    ("desc_not_str", [{"description": 42, "url": "https://x/d.png"}], ["desc_not_str/0.png"]),
+    ("inputs", "https://x/i.json", ["inputs-2.json"]),
+    ("inputs", {"json": "https://x/i.tmp"}, ["inputs.json-2.tmp"]),
+    (
+        "dup",
+        {
+            "a": "https://x/1.png",
+            "a!": "https://x/2.png",
+            "a-2": "https://x/3.png",
+            "a?": "https://x/4.png",
+        },
+        ["dup.a.png", "dup.a-2.png", "dup.a-2-2.png", "dup.a-3.png"],
+    ),
+    ("at_bound", _AT_DEPTH_BOUND, ["at_bound/0.png"]),
+    ("too_deep", [_AT_DEPTH_BOUND], []),
+    ("too_deep_json", json.dumps([_AT_DEPTH_BOUND]), []),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected"),
+    _NAME_CORPUS,
+    ids=[f"{i}-{row[0]}" for i, row in enumerate(_NAME_CORPUS)],
+)
+def test_link_names_match_the_host_side_implementation(
+    name: str, value: Any, expected: list[str]
+) -> None:
+    """链接名三处同义的钉子(行为面):宿主 ``inputs_doc.linked_sites``(对原始值)与沙箱
+    ``_linked_sites``(对清单里的那一份,main 真正走的路)必须给出同一组 site 与名字 ——
+    提示词里说的名字就是预拉建出来的名字。算法本身逐字同义另由
+    ``test_copied_helpers_are_the_host_algorithm`` 钉。"""
+    from uuid import UUID
+
+    from expert_work.protocol import PromptVariableSpec
+    from orchestrator.tools.inputs_doc import build_inputs_doc, linked_sites
+    from orchestrator.tools.prefetch_script import _linked_sites, _root_key
+
+    doc = build_inputs_doc(
+        run_id=UUID(int=1),
+        variables=[PromptVariableSpec(name=name, required=False)],
+        inputs={name: value},
+    )
+    assert doc is not None
+    entry = doc["variables"][name]
+
+    host = [(list(s.site.path), s.site.url, s.link) for s in linked_sites(name, value)]
+    sandbox = _linked_sites(name, entry[_root_key(entry)])
+    assert host == sandbox
+    assert [link for _path, _url, link in sandbox] == expected
+
+
+#: 宿主 → 沙箱的**刻意**改名:宿主的公开 helper 在沙箱里带下划线;沙箱不 import
+#: ``collections.abc``,isinstance 用具体类型。除此之外一个字都不许不同。
+_HOST_HELPER_RENAMES = {"url_suffix": "_url_suffix", "slugify": "_slugify"}
+_HOST_ISINSTANCE_RENAMES = {"Mapping": "dict", "Sequence": "list"}
+
+#: ``(宿主函数名, 沙箱函数名)``:沙箱里逐字复制的全部 helper。
+_COPIED_HELPERS = [
+    ("url_suffix", "_url_suffix"),
+    ("slugify", "_slugify"),
+    ("site_description", "_site_description"),
+    ("_link_stem", "_link_stem"),
+    ("link_names", "_link_names"),
+    ("root_key", "_root_key"),
+    ("_too_deep", "_too_deep"),
+]
+
+
+def _algorithm_dump(fn: Callable[..., Any], *, host: bool) -> str:
+    """函数的语法树:去掉 docstring、函数名、参数 / 返回注解;宿主侧再套上面两张改名表
+    (isinstance 那张只改 isinstance 的第二个参数)。函数体里其余的一切都留着比。"""
+    func = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+    assert isinstance(func, ast.FunctionDef)
+    if ast.get_docstring(func) is not None:
+        func.body = func.body[1:]
+    func.name = "_"
+    func.returns = None
+    for arg in (*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs):
+        arg.annotation = None
+    if host:
+        for node in ast.walk(func):
+            if isinstance(node, ast.Name) and node.id in _HOST_HELPER_RENAMES:
+                node.id = _HOST_HELPER_RENAMES[node.id]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "isinstance"
+                and len(node.args) == 2
+                and isinstance(node.args[1], ast.Name)
+                and node.args[1].id in _HOST_ISINSTANCE_RENAMES
+            ):
+                node.args[1].id = _HOST_ISINSTANCE_RENAMES[node.args[1].id]
+    return ast.dump(func)
+
+
+@pytest.mark.parametrize(("host_name", "sandbox_name"), _COPIED_HELPERS)
+def test_copied_helpers_are_the_host_algorithm(host_name: str, sandbox_name: str) -> None:
+    """链接名三处同义的钉子(算法面):行为语料只能覆盖它想到的输入,改一个常量或把
+    ``urlparse(url).path`` 换成 ``url`` 这类漂移可以在语料上恰好不露。这里逐个比函数的
+    语法树。"""
+    from orchestrator.tools import inputs_doc
+
+    host = _algorithm_dump(getattr(inputs_doc, host_name), host=True)
+    sandbox = _algorithm_dump(getattr(prefetch_script, sandbox_name), host=False)
+    assert sandbox == host
+
+
+def test_copied_constants_match_the_host_side() -> None:
+    from orchestrator.tools import inputs_doc
+
+    for name in ("PARSED_KEY", "SLUG_MAX_CHARS", "MAX_PARSE_DEPTH", "_RESERVED_NAMES"):
+        assert getattr(prefetch_script, name) == getattr(inputs_doc, name), name
+    for name in ("_SLUG_DROP", "_EXT_RE"):
+        host_re, sandbox_re = getattr(inputs_doc, name), getattr(prefetch_script, name)
+        assert (sandbox_re.pattern, sandbox_re.flags) == (host_re.pattern, host_re.flags), name
+
+
+def test_hit_links_the_file_under_its_variable_name_and_points_local_path_at_the_link(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    base, routes = http_server
+    body = b"\xff\xd8\xff" + b"A" * 32
+    url = f"{base}/cover-1726394851207.jpg"
+    routes["/cover-1726394851207.jpg"] = _route(body)
+    inputs_path = _write_inputs(tmp_path, {"org_logo": {"value": url, "trusted": True}})
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["org_logo"]["local_path"] == "inputs/run1/org_logo.jpg"
+    link = tmp_path / "inputs" / "run1" / "org_logo.jpg"
+    assert link.is_symlink()
+    assert os.readlink(link) == f"../cache/{cache_digest(url)}.jpg"  # 相对目标,不跨出 inputs/
+    assert link.read_bytes() == body  # 从 run 目录出发能解析
+    assert (tmp_path / "inputs" / "cache" / f"{cache_digest(url)}.jpg").read_bytes() == body
+
+
+def test_list_items_link_under_a_variable_directory_using_value_parsed(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    base, routes = http_server
+    body = b"\x00\x00\x00\x18ftypmp42" + b"B" * 16
+    routes["/a.mp4"] = _route(body, content_type="video/mp4")
+    items = [{"description": "示范视频", "url": f"{base}/a.mp4"}, {"description": "无链接"}]
+    raw = json.dumps(items, ensure_ascii=False)
+    inputs_path = _write_inputs(
+        tmp_path, {"materials": {"value": raw, "value_parsed": items, "trusted": False}}
+    )
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    entry = json.loads(inputs_path.read_text(encoding="utf-8"))["variables"]["materials"]
+    assert entry["value"] == raw  # 字符串一个字不动
+    assert entry["value_parsed"][0]["local_path"] == "inputs/run1/materials/0-示范视频.mp4"
+    assert "local_path" not in entry["value_parsed"][1]
+    link = tmp_path / "inputs" / "run1" / "materials" / "0-示范视频.mp4"
+    assert link.is_symlink()
+    assert os.readlink(link).startswith("../../cache/")
+    assert link.read_bytes() == body
+
+
+def test_rerun_replaces_the_link_instead_of_failing_on_file_exists(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """续跑 / 同一 run 再预拉:``os.symlink`` 到已存在路径会 ``FileExistsError``,先删后建。"""
+    base, routes = http_server
+    routes["/l.png"] = _route(b"\x89PNG" + b"C" * 16, content_type="image/png")
+    inputs_path = _write_inputs(tmp_path, {"logo": {"value": f"{base}/l.png", "trusted": True}})
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    link = tmp_path / "inputs" / "run1" / "logo.png"
+    assert link.is_symlink()
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["logo"]["local_path"] == "inputs/run1/logo.png"
+
+
+def test_symlink_failure_falls_back_to_the_cache_path(
+    tmp_path: Path, http_server: _HttpServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """建不了链接(文件系统不支持)→ ``local_path`` 退回 cache 路径,老消费方无感;不让 run 失败。"""
+    base, routes = http_server
+    routes["/l.png"] = _route(b"\x89PNG" + b"C" * 16, content_type="image/png")
+    inputs_path = _write_inputs(tmp_path, {"logo": {"value": f"{base}/l.png", "trusted": True}})
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("symlinks not supported")
+
+    monkeypatch.setattr(os, "symlink", refuse)
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    name = cache_digest(f"{base}/l.png") + ".png"
+    assert doc["variables"]["logo"]["local_path"] == f"inputs/cache/{name}"
+    assert not (tmp_path / "inputs" / "run1" / "logo.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# B-67 PR1 终审 —— 链接名不占平台文件名(F1)/ 不越出 run 目录(F6)/ miss 清旧链接(F4)
+# / 顺延不撞名(F5)/ 深嵌套(F2)
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_link_names_skip_the_manifest_names_and_names_already_taken() -> None:
+    from orchestrator.tools.prefetch_script import _link_names
+
+    assert _link_names("inputs", [([], "https://x/a.json", None)]) == ["inputs-2.json"]
+    assert _link_names("inputs", [(["json"], "https://x/b.tmp", None)]) == ["inputs.json-2.tmp"]
+    sites: list[tuple[list[str | int], str, str | None]] = [
+        (["a"], "https://x/1.png", None),
+        (["a!"], "https://x/2.png", None),
+        (["a-2"], "https://x/3.png", None),
+        (["a?"], "https://x/4.png", None),
+    ]
+    assert _link_names("v", sites) == ["v.a.png", "v.a-2.png", "v.a-2-2.png", "v.a-3.png"]
+
+
+def test_reserved_names_are_the_files_the_script_writes_and_match_the_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """保留名必须恰好是脚本在 run 目录里自己写的文件:清单(宿主给的路径,文件名来自
+    ``inputs_abs_path``)与 ``_rewrite`` 的临时文件。改了临时文件后缀却没改保留名,
+    链接就又能占到它。"""
+    from uuid import uuid4
+
+    from orchestrator.tools import inputs_doc
+
+    written: list[str] = []
+    real_replace = os.replace
+
+    def spy(src: str, dst: str) -> None:
+        written.extend([os.path.basename(src), os.path.basename(dst)])
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    manifest = tmp_path / os.path.basename(inputs_doc.inputs_abs_path(uuid4()))
+    prefetch_script._rewrite(str(manifest), {"variables": {}})
+
+    assert set(written) == prefetch_script._RESERVED_NAMES
+    assert prefetch_script._RESERVED_NAMES == inputs_doc._RESERVED_NAMES
+
+
+@pytest.mark.parametrize("shape", ["top_level_json", "dict_key_json_tmp"])
+def test_a_variable_named_inputs_never_touches_the_manifest(
+    tmp_path: Path, http_server: _HttpServer, shape: str
+) -> None:
+    """变量名 ``inputs`` 合法。``inputs`` + ``.json`` 曾让 ``_link`` 删掉清单、``local_path``
+    指回清单;``inputs.json`` + ``.tmp`` 曾让 ``_rewrite`` 顺着链接把**整份清单**(所有变量
+    的值)写进按 agent 共享的缓存条目 —— 同 agent 下一个 run 引用同一 URL 就命中缓存、
+    拿到上一个 run 的清单(7 天内),跨客户泄漏。"""
+    base, routes = http_server
+    body = b"\x89PNG" + b"D" * 16
+    routes["/a.json"] = _route(body, content_type="image/png")
+    routes["/b.tmp"] = _route(body, content_type="image/png")
+    if shape == "top_level_json":
+        url = f"{base}/a.json"
+        value: Any = url
+        link = "inputs-2.json"
+    else:
+        url = f"{base}/b.tmp"
+        value = {"json": url}
+        link = "inputs.json-2.tmp"
+    inputs_path = _write_inputs(
+        tmp_path,
+        {
+            "inputs": {"value": value, "trusted": True},
+            "other": {"value": "other var value", "trusted": False},
+        },
+    )
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    run_dir = tmp_path / "inputs" / "run1"
+    # 清单仍是普通文件,内容是完整文档。
+    assert not inputs_path.is_symlink()
+    assert inputs_path.is_file()
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["run_id"] == "run1"
+    assert doc["variables"]["other"] == {"value": "other var value", "trusted": False}
+    assert not os.path.lexists(run_dir / "inputs.json.tmp")
+    # 共享缓存条目是下载下来的内容,不是清单。
+    assert (tmp_path / "inputs" / "cache" / f"{cache_digest(url)}.png").read_bytes() == body
+    # 本变量链到顺延后的名字上,local_path 指向它。
+    entry = doc["variables"]["inputs"]
+    holder = entry if shape == "top_level_json" else entry["value"]
+    assert holder["local_path"] == f"inputs/run1/{link}"
+    assert (run_dir / link).is_symlink()
+    assert (run_dir / link).read_bytes() == body
+
+
+def test_an_existing_regular_file_at_the_link_name_is_never_deleted(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """链接名上已经躺着一个普通文件(沙箱代码写的):那不是我们建的链接,不删;
+    ``local_path`` 退回 cache 路径。"""
+    base, routes = http_server
+    url = f"{base}/l.png"
+    routes["/l.png"] = _route(b"\x89PNG" + b"E" * 16, content_type="image/png")
+    inputs_path = _write_inputs(tmp_path, {"logo": {"value": url, "trusted": True}})
+    squatter = tmp_path / "inputs" / "run1" / "logo.png"
+    squatter.write_bytes(b"agent-owned")
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    assert not squatter.is_symlink()
+    assert squatter.read_bytes() == b"agent-owned"
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["logo"]["local_path"] == f"inputs/cache/{cache_digest(url)}.png"
+
+
+def _plant_outside_dir(tmp_path: Path, victim_kind: str) -> Path:
+    """沙箱代码把 ``run1/m`` 换成指向 run 目录之外的目录链接;按 ``victim_kind`` 在那边
+    的 ``0-x.png`` 位置放一个普通文件 / 一个链接 / 什么都不放。返回那个位置。"""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "real.txt").write_text("agent-owned", encoding="utf-8")
+    victim = outside / "0-x.png"
+    if victim_kind == "file":
+        victim.write_bytes(b"agent-owned, outside the run dir")
+    elif victim_kind == "symlink":
+        victim.symlink_to("real.txt")
+    (tmp_path / "inputs" / "run1" / "m").symlink_to(outside, target_is_directory=True)
+    return victim
+
+
+def _assert_victim_untouched(victim: Path, victim_kind: str) -> None:
+    if victim_kind == "file":
+        assert not victim.is_symlink()
+        assert victim.read_bytes() == b"agent-owned, outside the run dir"
+    elif victim_kind == "symlink":
+        assert os.readlink(victim) == "real.txt"
+    else:
+        assert not os.path.lexists(victim)
+
+
+@pytest.mark.parametrize("victim_kind", ["absent", "file", "symlink"])
+def test_a_planted_directory_link_never_leads_the_script_out_of_the_run_dir(
+    tmp_path: Path, http_server: _HttpServer, victim_kind: str
+) -> None:
+    """跟着沙箱代码种下的目录链接去删 / 建,就是在 run 目录之外删文件、放链接。链接所在
+    目录解析后不在 run 目录里 → 不碰,``local_path`` 退回 cache 路径。"""
+    base, routes = http_server
+    url = f"{base}/e.png"
+    routes["/e.png"] = _route(b"\x89PNG" + b"F" * 16, content_type="image/png")
+    inputs_path = _write_inputs(
+        tmp_path, {"m": {"value": [{"description": "x", "url": url}], "trusted": True}}
+    )
+    victim = _plant_outside_dir(tmp_path, victim_kind)
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    _assert_victim_untouched(victim, victim_kind)
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["m"]["value"][0]["local_path"] == (
+        f"inputs/cache/{cache_digest(url)}.png"
+    )
+
+
+def test_a_miss_removes_the_stale_link_an_earlier_prefetch_left(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """同一 run 再预拉(续跑)、这次没拉到:更早那次建的链接要删掉,不能与 null 的
+    ``local_path`` 并存 —— 模型按名字找过去,拿到的是上一次的文件。"""
+    base, routes = http_server
+    url = f"{base}/l.png"
+    routes["/l.png"] = _route(b"\x89PNG" + b"G" * 16, content_type="image/png")
+    inputs_path = _write_inputs(tmp_path, {"logo": {"value": url, "trusted": True}})
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+    link = tmp_path / "inputs" / "run1" / "logo.png"
+    assert link.is_symlink()
+
+    # 下一次:缓存条目没了、源站也 404 → miss。
+    (tmp_path / "inputs" / "cache" / f"{cache_digest(url)}.png").unlink()
+    del routes["/l.png"]
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    doc = json.loads(inputs_path.read_text(encoding="utf-8"))
+    assert doc["variables"]["logo"]["local_path"] is None
+    assert not os.path.lexists(link)
+
+
+def test_a_miss_never_deletes_a_regular_file_at_the_link_name(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    base, _routes = http_server
+    inputs_path = _write_inputs(
+        tmp_path, {"logo": {"value": f"{base}/missing.png", "trusted": True}}
+    )
+    squatter = tmp_path / "inputs" / "run1" / "logo.png"
+    squatter.write_bytes(b"agent-owned")
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    assert not squatter.is_symlink()
+    assert squatter.read_bytes() == b"agent-owned"
+
+
+@pytest.mark.parametrize("victim_kind", ["file", "symlink"])
+def test_a_miss_never_follows_a_planted_directory_link(
+    tmp_path: Path, http_server: _HttpServer, victim_kind: str
+) -> None:
+    base, _routes = http_server
+    inputs_path = _write_inputs(
+        tmp_path,
+        {"m": {"value": [{"description": "x", "url": f"{base}/missing.png"}], "trusted": True}},
+    )
+    victim = _plant_outside_dir(tmp_path, victim_kind)
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    _assert_victim_untouched(victim, victim_kind)
+
+
+def test_a_value_nested_too_deep_is_not_prefetched(
+    tmp_path: Path, http_server: _HttpServer
+) -> None:
+    """宿主 ``linked_sites`` 对嵌套过深的值不给名字(渲染层就不会提它);沙箱这边也不能
+    去拉、去建链接 —— 两边说的站点必须是同一组。"""
+    base, routes = http_server
+    served: list[str] = []
+    routes["/deep.png"] = _route(b"\x89PNG" + b"H" * 16, content_type="image/png", served=served)
+    deep: Any = {"description": "x", "url": f"{base}/deep.png"}
+    for _ in range(40):
+        deep = [deep]
+    inputs_path = _write_inputs(tmp_path, {"deep": {"value": deep, "trusted": True}})
+
+    assert main(["prefetch_script.py", str(inputs_path)]) == 0
+
+    assert served == []
+    assert not os.path.lexists(tmp_path / "inputs" / "run1" / "deep")
+
+
+def test_a_manifest_nested_too_deep_to_load_still_exits_zero(tmp_path: Path) -> None:
+    """清单是沙箱代码碰得到的文件;``json.load`` 在极深的嵌套上抛的是 ``RecursionError``
+    (不是 ``ValueError``)—— 同样当「读不了」:以 0 退出、不改文件。"""
+    run_dir = tmp_path / "inputs" / "run1"
+    run_dir.mkdir(parents=True)
+    path = run_dir / "inputs.json"
+    text = "[" * 50_000 + "]" * 50_000
+    path.write_text(text, encoding="utf-8")
+
+    assert main(["prefetch_script.py", str(path)]) == 0
+    assert path.read_text(encoding="utf-8") == text
