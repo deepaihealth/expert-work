@@ -32,10 +32,14 @@ metadata:
   labels:
     app.kubernetes.io/name: retention-cleanup
 spec:
-  # 每日一次。CronJob 的 schedule 按 kube-controller-manager 的时区(UTC)算,
-  # 不用 spec.timeZone(集群版本不一定认这个字段,认不出会整条 apply 失败)。
-  # 19:23 UTC = 次日 03:23 北京时间,避开业务高峰与 janitor 的整点周期。
-  schedule: "23 19 * * *"
+  # 每日 03:23 北京时间,避开业务高峰与 janitor 的整点周期。
+  #
+  # 显式钉 timeZone(K8s 1.27 GA,两个 ACS 集群都是 1.36)。此前这里不钉、按「controller
+  # 用 UTC」写成 "23 19 * * *",注释说是次日 03:23 北京时间 —— 实测 test 每天
+  # 11:23 UTC(= 19:23 北京时间,晚高峰)跑:ACS 的 controller 时区不是 UTC。
+  # 不钉时区,同一行 schedule 在两个集群上的真实时刻取决于各自 controller 的设置。
+  timeZone: "Asia/Shanghai"
+  schedule: "23 3 * * *"
   concurrencyPolicy: Forbid
   # 错过调度(controller 重启、节点抖动)一小时内补跑,再晚就等下一天。
   startingDeadlineSeconds: 3600
