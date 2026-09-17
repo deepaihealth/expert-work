@@ -214,6 +214,27 @@ class PromptVariableSpec(BaseModel):
     #: ``False`` → a missing input renders as the empty string.
     required: bool = True
     description: str | None = None
+    #: B-67 §五 —— 渲染方式。``auto``(默认)按值的形态渲染:被绑定 → 「平台自动填」、
+    #: URL → 本地路径、列表 / 对象里的 URL 逐项、其它原值;``raw`` = 永远原值。只用于
+    #: 收窄(模板要对值做内容比较之类),不是启用基础能力。
+    render: Literal["auto", "raw"] = "auto"
+
+    @model_serializer(mode="wrap")
+    # 与 ``MCPToolSpec._omit_empty_arg_bindings`` 同一条理由、同一种写法(不标注返回类型,
+    # 否则 serialization-mode JSON Schema 塌成 additionalProperties)。
+    def _omit_default_render(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """默认值不落库。存库走 ``model_dump(mode="json")``,默认值会被物化 —— 不拦这一下,
+        字段一上线每个带变量的 agent 只要保存过就带 ``render: auto``;回滚到旧版本后
+        ``extra="forbid"`` 会把这些 manifest 全拒掉。省略默认值,「会坏」的范围缩到真配了
+        ``raw`` 的那几个,回滚前在配置页清掉即可。连带存量 manifest 的
+        ``compute_spec_sha256`` 不变。
+        """
+        data: dict[str, Any] = handler(self)
+        if self.render == "auto":
+            data.pop("render", None)
+        return data
 
 
 class SystemPromptSpec(BaseModel):
