@@ -79,6 +79,7 @@ from control_plane.tenant_scope import (
 )
 from control_plane.tenant_status import TenantStatusService
 from control_plane.transcript import read_turns
+from control_plane.turn_inputs import resolve_turn_inputs
 from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY
 from expert_work.common.message_stamp import stamp_message
 from expert_work.common.observability import (
@@ -816,6 +817,19 @@ async def resolve_approval_decision(
         expected_digest = approval.binding_digest
         rebind_digest = None
 
+    # B-61 续跑 —— 续跑段是新 run_id、没有请求体,这一轮的 inputs 要从这一轮第一个
+    # run 那儿取回(被绑参数要重填、沙箱要指向那份 inputs.json)。放在 CAS 之前:
+    # 读失败时审批单仍是 PENDING,可以重试;放在之后,一次读失败就把已经批准的
+    # 决定消费掉、却没有续跑(与上面 kill-switch 同一个理由)。
+    turn = await resolve_turn_inputs(
+        run_id=run_id,
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        runs=runtime.run_manager.store,
+        approvals=approvals,
+        event_store=runtime.run_event_store,
+    )
+
     # Stream 13.2 — generate the continuation id BEFORE the CAS so it is bound
     # atomically to the winning decision; a retry / lost-race caller reads it
     # back to replay the same continuation.
@@ -1004,6 +1018,8 @@ async def resolve_approval_decision(
             delegation_gate=runtime.delegation_gate(),
             # Stream HX-3 — replay-safety resolver for transient retry.
             tool_replay_safe=built.tool_replay_safe,
+            prompt_inputs=turn.inputs,
+            inputs_run_id=turn.root_run_id,
         )
     )
     await runtime.run_manager.attach_task(continuation_run_id, worker)
@@ -1111,10 +1127,27 @@ async def spawn_run(
         max_per_run=settings.multimodal_max_images_per_run,
     )
 
+    # B-61 —— 本轮 inputs。``:regenerate`` 的请求体里没有(``extra="forbid"``),
+    # 它重放的是被取代那一轮,inputs 也用那一轮的:否则必填变量 422、
+    # inputs.json 写空、被绑参数被摘掉,而重放的提示词还描述着原来的值。
+    # ``:edit`` 与普通 run 用请求自己的。读在锁外、校验之前:目标轮的帧不会变,
+    # 而锁内的 ``supersede_run`` 会重新确认它仍是最后一轮、会话不忙。
+    inputs = payload.inputs
+    if supersede is not None and supersede.replay:
+        superseded = await resolve_turn_inputs(
+            run_id=supersede.target_run_id,
+            thread_id=thread_id,
+            tenant_id=tenant_id,
+            runs=runtime.run_manager.store,
+            approvals=approvals,
+            event_store=runtime.run_event_store,
+        )
+        inputs = superseded.inputs
+
     # Stream Dynamic-Prompt — validate run inputs against the agent's declared
     # variables BEFORE any side effect (queue mode rejects synchronously too).
     try:
-        validate_prompt_inputs(built, payload.inputs)
+        validate_prompt_inputs(built, inputs)
     except PromptRenderError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
@@ -1194,7 +1227,11 @@ async def spawn_run(
             if replay_messages is not None:
                 # ``:regenerate`` —— 旧轮原件序列化过 JSONB 列,worker 那边
                 # ``messages_from_dict`` 还原后走同一个 ``replay_graph_input``。
+                # 带过来的 inputs 用普通排队 run 同一个键,worker 原样读回;
+                # 没有就不写,没有 inputs 的 agent 这一列一个字节不变。
                 enqueued_input = {"replay_messages": [message_to_dict(m) for m in replay_messages]}
+                if inputs:
+                    enqueued_input["inputs"] = inputs
             await runtime.run_manager.enqueue(
                 run_id=run_id,
                 thread_id=thread_id,
@@ -1300,7 +1337,7 @@ async def spawn_run(
             delegation_gate=runtime.delegation_gate(),
             tool_replay_safe=built.tool_replay_safe,
             # BUG-16 — persist the raw Jinja k/v on the system_prompt frame.
-            prompt_inputs=payload.inputs,
+            prompt_inputs=inputs,
         )
     )
     await runtime.run_manager.attach_task(run_id, worker)

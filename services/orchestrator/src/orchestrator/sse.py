@@ -116,8 +116,10 @@ logger = logging.getLogger(__name__)
 #: B-61 —— ``config["configurable"]`` 里本轮 Dynamic-Prompt 原始 k/v 的键,
 #: 与 ``CANCELLATION_TOKEN_KEY`` / ``AUDIT_LOGGER_KEY`` 等并列。run-start 的
 #: ``inputs`` 节点据此写 ``inputs.json``;``tools_node`` 据此填绑定的工具参数
-#: (Task 7)。只在 ``run_agent`` 里写一处 —— 四个 run 入口都调 ``run_agent``,
-#: 这一处就是全部(见 test_every_run_entry_reaches_the_configurable_key)。
+#: (Task 7)。键只在 ``run_agent`` 里写一处(见
+#: test_every_run_entry_reaches_the_configurable_key);值由各入口经
+#: ``prompt_inputs`` 传入,每个入口传的是不是「这一轮」的值由
+#: control-plane 的 ``test_every_run_agent_call_passes_the_turn_inputs`` 盯着。
 PROMPT_INPUTS_KEY: Final = "prompt_inputs"
 
 
@@ -339,6 +341,7 @@ async def run_agent(
     delegation_gate: DelegationGate | None = None,
     token_budget: int = 0,
     prompt_inputs: Mapping[str, Any] | None = None,
+    inputs_run_id: UUID | None = None,
 ) -> None:
     """Drive ``graph`` to completion, publishing events to ``bridge``.
 
@@ -370,6 +373,12 @@ async def run_agent(
     ``system_prompt`` frame's data (``inputs`` key) so replay shows the
     original k/v, not just the rendered prompt. Empty / ``None`` keeps
     the frame's legacy shape (no ``inputs`` key).
+
+    B-61 续跑 —— ``prompt_inputs`` 必须是**这一轮**的 inputs,不只是「这次请求带来的」:
+    审批续跑、孤儿复活、``:regenerate`` 手里没有请求体,由入口从
+    ``control_plane.turn_inputs`` 取回再传进来。``inputs_run_id`` 是这一轮第一个 run
+    (``inputs.json`` 写在它名下);与本 run 不同、且确有 inputs 时才写进
+    ``configurable``,沙箱与委派子代据此指向那份文件。其余情况 config 一个字节不变。
     """
     if not trajectory_enabled:
         trajectory_recorder = None
@@ -402,9 +411,16 @@ async def run_agent(
             # ``None`` when unwired (no delegation_config_service).
             DELEGATION_GATE_KEY: delegation_gate,
             # B-61 —— 本轮 Dynamic-Prompt 的原始 k/v。inputs 节点据此写
-            # inputs.json;tools_node 据此填绑定的工具参数。四个 run 入口都
-            # 汇到这里,所以这一处就是全部。
+            # inputs.json;tools_node 据此填绑定的工具参数。键只在这里写,
+            # 但**值**来自入口:不是新开一轮的入口(审批续跑 / 孤儿复活 /
+            # 重新生成)必须把这一轮的 inputs 取回来传进来,不传就是空的
+            # —— 「键只写一处」曾被误当成「值处处都对」(见 docstring)。
             PROMPT_INPUTS_KEY: dict(prompt_inputs or {}),
+            **(
+                {"inputs_run_id": str(inputs_run_id)}
+                if prompt_inputs and inputs_run_id is not None and inputs_run_id != run_id
+                else {}
+            ),
         },
     }
     # Stream M Gate — session E2E duration. Started before ``set_status``

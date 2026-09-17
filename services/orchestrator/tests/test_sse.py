@@ -27,6 +27,7 @@ from expert_work.protocol import AuditAction, AuditEntry, AuditResult
 from expert_work.runtime.runs import DisconnectMode, RunManager, RunRecord, RunStatus
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
 from orchestrator.sse import (
+    PROMPT_INPUTS_KEY,
     _to_jsonable,
     format_sse,
     run_agent,
@@ -1466,6 +1467,60 @@ async def test_run_agent_skips_system_prompt_frame_without_system_message() -> N
         )
         events = await _drain(bridge, record.run_id)
         assert "system_prompt" not in [e.event for e in events], graph_input
+
+
+@dataclass
+class _ConfigCapturingGraph(_ScriptedGraph):
+    """记下 ``astream`` 拿到的 ``configurable``(图真正看到的那一份)。"""
+
+    seen: list[dict[str, Any]] = field(default_factory=list)
+
+    async def astream(
+        self,
+        input: Any,
+        config: Any = None,
+        *,
+        stream_mode: Any = None,
+    ) -> AsyncIterator[Any]:
+        self.seen.append(dict((config or {}).get("configurable") or {}))
+        async for chunk in super().astream(input, config, stream_mode=stream_mode):
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_run_agent_points_a_continuation_at_its_turns_inputs_dir() -> None:
+    """B-61 续跑 —— ``inputs_run_id`` 只在「确有 inputs、且不是本 run 自己」时进
+    ``configurable``;其余情况(没有 inputs 的 run、新开一轮、孤儿复活同一个 run)
+    config 与之前一个字节不差。"""
+    root = uuid4()
+    cases: list[tuple[dict[str, Any] | None, str, bool]] = [
+        ({"pc": "A"}, "root", True),
+        ({"pc": "A"}, "none", False),
+        ({"pc": "A"}, "self", False),
+        ({}, "root", False),
+        (None, "root", False),
+    ]
+    for inputs, which, expected in cases:
+        rm = RunManager()
+        record = await _new_record(rm)
+        graph = _ConfigCapturingGraph(chunks=[{"agent": {"step_count": 1}}])
+        inputs_run_id = {"root": root, "none": None, "self": record.run_id}[which]
+        await run_agent(
+            bridge=InMemoryStreamBridge(),
+            run_manager=rm,
+            record=record,
+            graph=graph,
+            graph_input=None,
+            config={},
+            prompt_inputs=inputs,
+            inputs_run_id=inputs_run_id,
+        )
+        (configurable,) = graph.seen
+        assert configurable[PROMPT_INPUTS_KEY] == dict(inputs or {}), (inputs, which)
+        if expected:
+            assert configurable["inputs_run_id"] == str(root)
+        else:
+            assert "inputs_run_id" not in configurable, (inputs, which)
 
 
 @pytest.mark.asyncio
