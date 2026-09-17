@@ -42,6 +42,8 @@ INPUTS_DIR_ENV = "EXPERT_WORK_INPUTS_DIR"
 BOUND_TEXT = "（已绑定到工具参数，调用时平台自动填）"  # noqa: RUF001 — 全角标点,面向模型的中文
 #: URL / 逐项渲染的尾注:不断言「已下载」(渲染早于预拉),只说名字与回落办法。
 URL_NOTE = "（已就位；不在则按输入清单里的原地址下载）"  # noqa: RUF001
+#: 带路径的行以它收尾:untrusted 的 datamarking 把空白换成 ``▁``,不能直接贴在路径上。
+_PATH_END = "；"  # noqa: RUF001
 
 # ``built`` is the orchestrator ``BuiltAgent`` (typed ``Any`` here, matching
 # ``build_run_graph_input``); the renderer reads ``system_prompt``,
@@ -95,6 +97,9 @@ def _render_items(var: Any, root: Any, sites: list[LinkedSite], *, nonce: str | 
 
     ``trusted: false`` 时,从值推出来的**全部**行(说明、dict 键、路径 —— 路径里带着
     description 的 slug)合成一段、围栏一次;只有尾注是纯平台文本,留在围栏外(裁定 P8)。
+
+    整块另起一行(``素材:{{ materials }}`` 不能把第 0 项粘在标签上);带路径的行以
+    :data:`_PATH_END` 收尾;不是对象的列表项(列表套列表等)只给序号与路径。
     """
     lines: list[str] = []
     is_list = isinstance(root, list)
@@ -109,15 +114,17 @@ def _render_items(var: Any, root: Any, sites: list[LinkedSite], *, nonce: str | 
         links = by_head.get(head)
         if links:
             paths = "、".join(f"${INPUTS_DIR_ENV}/{link}" for link in links)
-            if is_list:
-                lines.append(f"{head}. {_label(item, str(head))} → {paths}")
+            if not is_list:
+                lines.append(f"- {head} → {paths}{_PATH_END}")
+            elif isinstance(item, Mapping):
+                lines.append(f"{head}. {_label(item, str(head))} → {paths}{_PATH_END}")
             else:
-                lines.append(f"- {head} → {paths}")
+                lines.append(f"{head}. {paths}{_PATH_END}")
         else:
             plain = _plain(item)
             lines.append(f"{head}. {plain}" if is_list else f"- {head}: {plain}")
     body = _fence_if_untrusted(var, "\n".join(lines), nonce=nonce)
-    return f"{body}\n{URL_NOTE}"
+    return f"\n{body}\n{URL_NOTE}"
 
 
 def render_value(var: Any, raw: Any, *, nonce: str | None) -> tuple[Any, bool]:
