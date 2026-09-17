@@ -41,6 +41,7 @@ from orchestrator import (
     pending_request_binding,
 )
 from orchestrator.graph_builder._approval import (
+    APPROVED_QUESTION_CONTENT,
     WITHHELD_CALL_CONTENT,
     apply_resume_decision,
 )
@@ -260,7 +261,8 @@ async def test_agent_question_does_not_release_a_gated_call(legacy: str | None) 
 
     assert out.tools["delete_records"].seen == [], "门控调用搭着模型自己的确认执行了"
     asked, held = out.tool_messages()
-    assert asked.tool_call_id == "tc-1"
+    assert (asked.tool_call_id, asked.status) == ("tc-1", "success")
+    assert asked.content == APPROVED_QUESTION_CONTENT
     _assert_withheld(held, call_id="tc-2", name="delete_records")
     assert out.state["messages"][-1].content == "done"
 
@@ -367,6 +369,58 @@ async def test_legacy_declarative_modify(legacy: str) -> None:
     else:
         assert out.tools["send_email"].seen == []
         _assert_withheld(out.tool_messages()[1], call_id="tc-1", name="send_email")
+
+
+@pytest.mark.parametrize("legacy", [None, "old-writer"], ids=["verdict", "old-writer"])
+async def test_gate_set_edited_during_the_pause(legacy: str | None) -> None:
+    """暂停期间改了配置,续跑按新配置重建:门控集合从 ``{send_email}`` 变成
+    ``{archive, send_email}``,扫描会先找到 ``archive``,而两条调用参数相同、绑定摘要
+    两条都对得上。带下标的裁定照常放行审批单上的 ``send_email``;旧副本写的裁定
+    证明不了是哪一条,什么都不执行。"""
+    turn = AIMessage(
+        content="",
+        tool_calls=[
+            _call("archive", {"to": "x"}, "tc-0"),
+            _call("send_email", {"to": "x"}, "tc-1"),
+        ],
+    )
+    tools = {name: _Tool(name) for name in ("archive", "send_email")}
+    registry = ToolRegistry()
+    for tool in tools.values():
+        registry.register(tool)
+    base: dict[str, Any] = {"thread_id": str(uuid4())}
+    cfg: RunnableConfig = {"configurable": {**base, "run_id": "run-a"}}
+
+    def graph(gated: frozenset[str], script: list[AIMessage]) -> Any:
+        return build_react_graph(
+            llm_caller=_LLM(script=script), tool_registry=registry, approval_required_tools=gated
+        )
+
+    async with make_checkpointer("memory") as cp:
+        minted = GraphRunner(checkpointer=cp).compile(graph(frozenset({"send_email"}), [turn]))
+        paused = await minted.ainvoke(
+            {"messages": [HumanMessage(content="start")], "step_count": 0, "max_steps": 6},
+            config=cfg,
+        )
+        request = paused["pending_approval"]
+        assert request.tool_call_index == 1
+        binding = pending_request_binding((await minted.aget_state(cfg)).values)
+        assert binding is not None
+        verdict = {
+            "decision": "approve",
+            "binding_digest": request.binding_digest,
+            **({} if legacy else binding),
+        }
+        resumed = GraphRunner(checkpointer=cp).compile(
+            graph(frozenset({"archive", "send_email"}), [])
+        )
+        await resumed.aupdate_state(
+            cfg, {"pending_approval": None, "approval_resume": verdict}, as_node="agent"
+        )
+        await resumed.ainvoke(None, config={"configurable": {**base, "run_id": "run-a-cont"}})
+
+    assert tools["archive"].seen == [], "没送审的调用执行了"
+    assert tools["send_email"].seen == ([] if legacy else [{"to": "x"}])
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +601,23 @@ def test_legacy_verdict_that_cannot_prove_a_declarative_request_releases_nothing
     assert not outcome.binding_drift and not outcome.terminal
 
 
+@pytest.mark.parametrize("summary", [None, _SEND_SUMMARY], ids=["old-writer", "old-request"])
+def test_legacy_digest_matching_two_calls_releases_nothing(summary: str | None) -> None:
+    """绑定摘要对得上这一步里不止一条调用:扫描选中的未必是审批单上那条。"""
+    same_args = [_call("lookup", {"to": "x"}, "tc-0"), _call("send_email", {"to": "x"}, "tc-1")]
+    verdict: dict[str, Any] = {
+        "decision": "approve",
+        "binding_digest": canonical_args_digest({"to": "x"}),
+    }
+    if summary is not None:
+        verdict["action_summary"] = summary
+    outcome = apply_resume_decision(same_args, _GATED, verdict)
+    assert set(outcome.withheld) == {0, 1}
+    assert not outcome.binding_drift
+    unique = apply_resume_decision(_two_calls(), _GATED, verdict)
+    assert set(unique.withheld) == {0}
+
+
 @pytest.mark.parametrize(
     "summary",
     ["approval-gated tool 'echo'", "Continue?", ""],
@@ -577,11 +648,11 @@ def test_legacy_agent_question_is_the_released_call() -> None:
         {"decision": "approve", "action_summary": "go on?"},
     ):
         outcome = apply_resume_decision(calls, _GATED, verdict)
-        assert set(outcome.withheld) == {1}
+        assert set(outcome.withheld) == {1} and set(outcome.answered) == {0}
     mismatch = apply_resume_decision(
         calls, _GATED, {"decision": "approve", "action_summary": "something else"}
     )
-    assert set(mismatch.withheld) == {0, 1}
+    assert set(mismatch.withheld) == {0, 1} and mismatch.answered == {}
     # 没给摘要时请求用的默认文案。
     bare = [_call(ASK_FOR_APPROVAL_TOOL, {}, "tc-0")]
     default = apply_resume_decision(
@@ -589,7 +660,7 @@ def test_legacy_agent_question_is_the_released_call() -> None:
         frozenset(),
         {"decision": "approve", "action_summary": "agent requested human approval"},
     )
-    assert default.withheld == {}
+    assert default.withheld == {} and set(default.answered) == {0}
 
 
 @pytest.mark.parametrize("decision", ["approve", "modify"])

@@ -1380,8 +1380,9 @@ def build_react_graph(
             if state.get(key) is not None
         }
         ingest_update: dict[str, Any] = {}
-        # B-76 —— 续跑时审批单上那一条之外的调用:下标 → 代替执行的那条工具结果。
-        withheld: Mapping[int, ToolMessage] = {}
+        # B-76 / B-79 —— 续跑时由平台直接作答、不派发的调用:下标 → 那条工具结果。
+        # 审批单上那一条之外的调用(没有执行),以及被批准的 ``ask_for_approval``。
+        answered: Mapping[int, ToolMessage] = {}
         if approval_resume is not None:
             # Stream CM-8 (Mini-ADR CM-I4) — the resume re-entry skips the
             # entry chain (``aupdate_state(as_node="agent")`` lands the
@@ -1423,11 +1424,12 @@ def build_react_graph(
             # arg-rewritten) call; clear the resume channel on return.
             #
             # B-76 — every other call of the turn is answered from ``withheld``
-            # and never dispatched (``_bounded`` below). This path skips action
+            # and never dispatched (``_bounded`` below); so is an approved
+            # ``ask_for_approval`` (B-79, ``answered``). This path skips action
             # screening and the gate — the verdict is for this exact call — but a
             # withheld call the model issues again lands on a fresh step, where
             # screening and the gate judge it like any other call.
-            withheld = resume_outcome.withheld
+            answered = {**resume_outcome.withheld, **resume_outcome.answered}
             #
             # B-61 §5.3 —— 再套一遍绑定。``modify`` 拿人工给的 ``modified_args``
             # **整份替换**那条 call 的 args,于是(a)被绑参数会被人在审批面上静默
@@ -1583,9 +1585,9 @@ def build_react_graph(
             tc: dict[str, Any],
             bound_args: Sequence[str],
         ) -> tuple[ToolMessage, Mapping[str, Any], int, ClassifiedToolError | None]:
-            # B-76 — not released by the verdict: answered, never dispatched. Ahead
-            # of the retype guard — a call that does not run is not a blocked one.
-            not_run = withheld.get(index)
+            # B-76 / B-79 — answered by the platform, never dispatched. Ahead of
+            # the retype guard — a call that does not run is not a blocked one.
+            not_run = answered.get(index)
             if not_run is not None:
                 return not_run, {}, 0, None
             hit = guard_hits.get(index)
@@ -1652,10 +1654,10 @@ def build_react_graph(
                 else:
                     accumulated_state[key] = value
             refund_total += refund_inc
-            if idx in withheld:
-                # B-76 — not run is not failed. Its ``status="error"`` must not
-                # reach the classifier (a withheld ``save_artifact`` would read as
-                # "the write did not land") → no advisory, no error count.
+            if idx in answered:
+                # B-76 — not run is not failed. A withheld call's ``status="error"``
+                # must not reach the classifier (a withheld ``save_artifact`` would
+                # read as "the write did not land") → no advisory, no error count.
                 continue
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
             if failure is not None:
