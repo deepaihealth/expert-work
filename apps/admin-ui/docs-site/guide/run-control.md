@@ -146,6 +146,8 @@ Content-Type: application/json
 
 `approve` 与 `modify` 只放行 `approval` 事件里展示的那一次工具调用。Agent 在同一步里提出的其它工具调用这次都不执行：每次调用各对应一条以 `[not run]` 开头、状态为 `error` 的结果消息，Agent 可据此在仍然需要时重新提出。重新提出的调用照常处理，其中需要审批的会再次停下，等待新的决策。
 
+`reason_kind` 不是 `policy_gate` 时，`approval` 事件展示的是 Agent 自己的提问。批准后 Agent 收到一条以 `[approved]` 开头的结果（决策为 `modify` 时附带 `modified_args`），同一步里提出的其它操作同样不执行，Agent 可据此在仍然需要时重新提出。
+
 `reject` 之后 run 是否终止，取决于这次审批是怎么触发的。`approval` 事件里的 `reason_kind` 字段说明这次审批的来源，客户端在下达决策之前就能据此区分两条路径（五个取值见 [3.4 的 `approval`](./sse-events#approval)；条目模式下这个字段在 `approval` 条目上，取值相同）：
 
 - `reason_kind` 为 `policy_gate`：这是 Agent 配置里声明的强制审批点，常见于高风险工具，拒绝会终止整个 run。
