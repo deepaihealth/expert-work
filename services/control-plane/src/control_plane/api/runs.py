@@ -85,9 +85,9 @@ from control_plane.tenant_scope import (
     ensure_tenant_scope,
 )
 from control_plane.tenant_status import TenantStatusService
-from control_plane.transcript import read_turns
+from control_plane.transcript import extract_turns, read_messages
 from control_plane.turn_inputs import resolve_turn_inputs
-from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY
+from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY, is_hidden
 from expert_work.common.message_stamp import stamp_message
 from expert_work.common.observability import (
     current_trace_id_hex,
@@ -2028,7 +2028,8 @@ def build_runs_router() -> APIRouter:
             # signal that emits the SESSION_READ audit row above) sees the
             # faithful transcript. The durable record + search mirror always do.
             is_cross_tenant_audit = target_tenant != request.state.tenant_id
-            turns = await read_turns(checkpointer, thread_id, include_hidden=is_cross_tenant_audit)
+            raw = await read_messages(checkpointer, thread_id)
+            turns = extract_turns(raw, include_hidden=is_cross_tenant_audit)
         except Exception:
             logger.warning("thread_messages.read_failed", exc_info=True)
             return empty
@@ -2047,6 +2048,10 @@ def build_runs_router() -> APIRouter:
                 # P-1 —— 与对外 ``/messages`` 同一投影:被取代 / 墓碑标记。
                 "superseded_by": str(t.superseded_by) if t.superseded_by else None,
                 "tombstone": t.tombstone,
+                # B-67 —— 只有跨租户审计视图带得出隐藏行(「本轮输入」段、恢复建议);
+                # 标上 ``hidden`` 让调试台按 run 分组时不把它当这一轮的输入。只在为真时
+                # 出现,同租户视图与非隐藏行的形状一字不变。
+                **({"hidden": True} if is_hidden(raw[t.seq]) else {}),
             }
             for t in turns
         ]

@@ -419,11 +419,11 @@ describe("buildHistoryTurns falls back to order pairing", () => {
     expect(buildHistoryTurns(mixed, [run("r1"), run("r2")])).toBeNull();
   });
 
-  it("falls back when one run owns two user rows (faithful cross-tenant audit view)", () => {
+  it("falls back when one run owns two unmarked user rows (backend without ``hidden``)", () => {
     // ``include_hidden=True`` keeps the orchestrator's ``<recovery-advisory>``
-    // HumanMessage, which is stamped with the SAME run as the real input —
-    // "the run's user message" is then ambiguous. Order pairing degrades to
-    // flat text, which shows both rows; grouping would have to drop one.
+    // HumanMessage, which is stamped with the SAME run as the real input. A
+    // backend that predates the ``hidden`` flag gives no way to tell them
+    // apart — "the run's user message" is ambiguous, so degrade to flat text.
     const turns = buildHistoryTurns(
       [Ur("q1", "r1"), Ur("<recovery-advisory>internal</recovery-advisory>", "r1"), Ar("a1", "r1")],
       [run("r1")],
@@ -436,5 +436,61 @@ describe("buildHistoryTurns falls back to order pairing", () => {
     // switch strategy and render an empty-input card per run.
     expect(buildHistoryTurns([], [run("r1")])).toBeNull();
     expect(buildHistoryTurns([], [])).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-67 — hidden user rows (inputs block / advisories) are never a turn's input
+// ---------------------------------------------------------------------------
+
+const Uh = (content: string, runId?: string): HistoryMessage => ({
+  role: "user",
+  content,
+  channel: null,
+  hidden: true,
+  ...(runId === undefined ? {} : { run_id: runId }),
+});
+
+describe("buildHistoryTurns hidden user rows", () => {
+  it("groups by run when each run owns its user message plus a hidden block", () => {
+    const turns = buildHistoryTurns(
+      [
+        Ur("q1", "r1"),
+        Uh("[inputs block]", "r1"),
+        Ar("a1", "r1", "final"),
+        Ur("q2", "r2"),
+        Uh("[inputs block]", "r2"),
+        Ar("a2", "r2", "final"),
+      ],
+      [run("r1"), run("r2")],
+    );
+    expect(turns?.map((t) => [t.runId, t.input, t.fallbackLines])).toEqual([
+      ["r1", "q1", [{ text: "a1", channel: "final" }]],
+      ["r2", "q2", [{ text: "a2", channel: "final" }]],
+    ]);
+  });
+
+  it("never uses the hidden block as the input of an inputs-only run", () => {
+    // ``input`` is optional: a run carrying only ``inputs`` has no visible user
+    // row of its own — the block is the only user-role row it owns.
+    const turns = buildHistoryTurns(
+      [Uh("[inputs block]", "r1"), Ar("a1", "r1", "final")],
+      [run("r1")],
+    );
+    expect(turns).not.toBeNull();
+    expect(turns![0].input).toBe("");
+    expect(turns![0].fallbackLines).toEqual([{ text: "a1", channel: "final" }]);
+  });
+
+  it("order pairing skips hidden user rows as inputs and as answers", () => {
+    // One unstamped (pre-stamp) row keeps the thread on the order path.
+    const turns = buildHistoryTurns(
+      [U("q1"), Uh("[inputs block]", "r1"), A("a1"), Ur("q2", "r2"), Uh("[inputs block]", "r2"), Ar("a2", "r2")],
+      [run("r1"), run("r2")],
+    );
+    expect(turns?.map((t) => [t.input, t.fallbackLines.map((l) => l.text)])).toEqual([
+      ["q1", ["a1"]],
+      ["q2", ["a2"]],
+    ]);
   });
 });

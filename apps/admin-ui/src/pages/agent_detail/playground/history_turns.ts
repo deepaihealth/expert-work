@@ -71,18 +71,28 @@ export interface HistoryTurn {
  *  - ANY message without a ``run_id`` (written before the stamp shipped, never
  *    backfilled): it cannot be placed in a group at all, while order pairing
  *    does have a place for it. One such row disqualifies the whole thread.
- *  - A run owning MORE THAN ONE user row: the faithful cross-tenant audit view
- *    (``include_hidden=true``) keeps the orchestrator's ``<recovery-advisory>``
- *    HumanMessage, which is stamped with the same run as the real input, so
- *    "the run's user message" no longer has one answer. Order pairing degrades
- *    to flat text there, which at least shows both rows; grouping would have
- *    to silently drop one — in the view whose whole point is faithfulness.
+ *  - A run owning MORE THAN ONE non-hidden user row. The faithful cross-tenant
+ *    audit view (``include_hidden=true``) also carries platform scaffolding —
+ *    the B-67 inputs block, the ``<recovery-advisory>`` — stamped with the same
+ *    run as the real input. The backend marks those ``hidden: true`` and they
+ *    are never a turn's input (see :func:`isInputRow`), so they don't count
+ *    here. Rows from a backend that predates the flag can't be told apart:
+ *    "the run's user message" has no single answer, so degrade to flat text.
  *
  *  An empty message list is NOT grouped either: there is nothing to group, so
  *  it is no evidence that this thread is stamped. It happens for real — the
  *  backend's transcript read is best-effort and degrades to ``[]`` — and
  *  switching strategy there would turn a "no history" page into one empty
  *  input card per run. */
+/** A row that can be a turn's input: a user row that is not platform
+ *  scaffolding. Hidden rows (B-67 inputs block, advisories) are neither an
+ *  input nor part of the reply, so the turn views leave them out — the
+ *  assistant's fallback lines would otherwise show platform text as if the
+ *  agent had said it. */
+function isInputRow(m: HistoryMessage): boolean {
+  return m.role === "user" && m.hidden !== true;
+}
+
 function groupMessagesByRun(
   messages: readonly HistoryMessage[],
 ): Map<string, HistoryMessage[]> | null {
@@ -93,7 +103,7 @@ function groupMessagesByRun(
     if (!runId) return null;
     const own = byRun.get(runId);
     if (own) {
-      if (m.role === "user" && own.some((o) => o.role === "user")) return null;
+      if (isInputRow(m) && own.some(isInputRow)) return null;
       own.push(m);
     } else {
       byRun.set(runId, [m]);
@@ -116,7 +126,7 @@ export function buildHistoryTurns(
       const own = byRun.get(r.runId) ?? [];
       return {
         key: r.runId,
-        input: own.find((m) => m.role === "user")?.content ?? "",
+        input: own.find(isInputRow)?.content ?? "",
         fallbackLines: own
           .filter((m) => m.role !== "user")
           .map((m) => ({ text: m.content, channel: m.channel ?? null })),
@@ -135,9 +145,10 @@ export function buildHistoryTurns(
   const pairs: { input: string; answers: FallbackLine[] }[] = [];
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i];
-    if (m.role !== "user") continue;
+    if (!isInputRow(m)) continue;
     const answers: FallbackLine[] = [];
-    for (let j = i + 1; j < messages.length && messages[j].role !== "user"; j += 1) {
+    for (let j = i + 1; j < messages.length && !isInputRow(messages[j]); j += 1) {
+      if (messages[j].role === "user") continue; // hidden scaffolding
       answers.push({ text: messages[j].content, channel: messages[j].channel ?? null });
     }
     pairs.push({ input: m.content, answers });

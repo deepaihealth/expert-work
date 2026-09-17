@@ -144,6 +144,9 @@ export interface HistoryMessage {
   /** P-1 —— 正文已清理(此时 ``content`` 是空串);只出现在被取代且超出保留
    *  份数的老版本上。老后端不带这个键。 */
   tombstone?: boolean;
+  /** B-67 —— 平台脚手架(「本轮输入」段、恢复建议)。只有跨租户审计视图带得出这类
+   *  行,且只在为真时出现;这类 user 行永远不是某一轮的输入。老后端不带这个键。 */
+  hidden?: boolean;
 }
 
 export async function getSessionMessages(
