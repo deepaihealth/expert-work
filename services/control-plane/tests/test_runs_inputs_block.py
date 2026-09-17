@@ -14,7 +14,7 @@ from control_plane.inputs_block import inputs_block_message, is_inputs_block
 from control_plane.supersede import _replay_originals
 from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.message_stamp import STAMP_RUN_ID
-from expert_work.protocol import PromptVariableSpec
+from expert_work.protocol import ArgBindingSpec, PromptVariableSpec
 
 LOGO = "https://x/l.png"
 
@@ -53,6 +53,25 @@ def test_jinja_run_gets_a_hidden_stamped_inputs_block_after_the_user_message() -
     assert LOGO not in block.content
     assert LOGO not in system.content  # B:URL 不进提示词
     assert gi["turn_documents"] == [] and gi["turn_image_refs"] == []
+
+
+def test_bound_variable_line_carries_the_binding_note() -> None:
+    """``build_run_graph_input`` 把 ``bound_variable_names(built)`` 接进段落:被某条
+    ``arg_bindings`` 引用的变量,行尾带绑定说明。"""
+    built = _jinja_built()
+    built.arg_bindings = (
+        ArgBindingSpec(server="crm", tool="upload", args={"logo_url": "org_logo"}),
+    )
+    gi = build_run_graph_input(
+        built,
+        input_text="x",
+        image_refs=[],
+        untrusted_content=None,
+        inputs={"org_logo": LOGO},
+        run_id=uuid4(),
+    )
+    line = next(ln for ln in gi["messages"][2].content.splitlines() if ln.startswith("- org_logo"))
+    assert line.endswith("；绑定了它的工具由平台自动填，不用手抄")  # noqa: RUF001
 
 
 def test_jinja_run_without_run_id_still_appends_the_block_unstamped() -> None:

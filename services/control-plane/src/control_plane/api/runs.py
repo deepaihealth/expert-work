@@ -588,8 +588,8 @@ def replay_graph_input(
         fresh.append(msg.model_copy(update={"id": str(uuid4()), "additional_kwargs": kwargs}))
     if len(fresh) not in (2, 3):
         # 损坏的原件照旧报错,不静默跑一个缺输入的轮。
-        msg = f"replay expects 2 or 3 messages, got {len(fresh)}"
-        raise ValueError(msg)
+        detail = f"replay expects 2 or 3 messages, got {len(fresh)}"
+        raise ValueError(detail)
     system, *stamped = fresh
     return {
         "messages": [

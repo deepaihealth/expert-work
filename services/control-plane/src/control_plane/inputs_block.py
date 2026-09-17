@@ -27,15 +27,17 @@ HEADER = "[本轮输入]（平台自动生成）"  # noqa: RUF001 — 面向模�
 #: 接在形态状态之后。
 _BOUND = "绑定了它的工具由平台自动填，不用手抄"  # noqa: RUF001
 _UNSET = "本轮未提供"
-_TEXT = "已提供，短文本"  # noqa: RUF001
-_UNTRUSTED_TEXT = "已提供，外部数据，需逐字使用时从清单读"  # noqa: RUF001
+_TEXT = "已提供（非文件）"  # noqa: RUF001
+_UNTRUSTED_TEXT = "已提供（非文件，外部数据，需逐字使用时从清单读）"  # noqa: RUF001
+#: 说明是 manifest 里的自由文本:压成一行、最多这么多字,超出加「…」。
+_DESC_MAX_CHARS = 40
 
 
 def _status(var: Any, inputs: Mapping[str, Any], bindings: Collection[str]) -> str:
     """一个变量的状态行。**不含任何租户数据**(裁定 P8):只有变量名、计数、平台文本,
     以及 trusted 变量顶层 URL 的链接名(= 变量名 + ``[A-Za-z0-9]{1,5}`` 扩展名)。untrusted
-    的顶层 URL(裁定 P16)、列表项说明、dict 键这类从值推出来的名字只用占位符
-    ``<变量名>.<扩展名>`` / ``<下标-说明>`` / ``<字段名>`` 指代。
+    的顶层 URL(裁定 P16)只说「以变量名开头的文件」;列表项说明、dict 键这类从值推出来的
+    名字只用占位符 ``<下标-说明>`` / ``<字段名>`` 指代。
 
     先判「本轮未提供」(裁定 P12):可选变量被绑定但本轮没传,只说没提供 —— 那条绑定
     本轮也填不出值。传了的变量先给形态状态,被绑定的再接 :data:`_BOUND`(裁定 P10)。
@@ -47,14 +49,19 @@ def _status(var: Any, inputs: Mapping[str, Any], bindings: Collection[str]) -> s
 
 
 def _shape_status(var: Any, raw: Any) -> str:
-    """传了值的变量按值的形态说:短文本 / 文件 / N 项 / N 个文件。"""
+    """传了值的变量按值的形态说:非文件 / 文件 / N 项 / N 个文件。"""
     sites = linked_sites(var.name, raw)
     if not sites:
         return _TEXT if var.trusted else _UNTRUSTED_TEXT
     if isinstance(raw, str) and sites[0].site.path == ():
-        # 裁定 P16 —— 真名里的扩展名取自租户 URL;untrusted 时只写占位符,不写真名。
-        link = sites[0].link if var.trusted else f"{var.name}.<扩展名>"
-        return f"文件 ${INPUTS_DIR_ENV}/{link}；不在则按清单里的原地址下载"  # noqa: RUF001
+        # 裁定 P16 —— 真名里的扩展名取自租户 URL;untrusted 时不写真名。只说前缀:无扩展名、
+        # 撞名加 ``-2`` 时「<变量名>.<扩展名>」这种占位都会说错。
+        where = (
+            f"文件 ${INPUTS_DIR_ENV}/{sites[0].link}"
+            if var.trusted
+            else f"${INPUTS_DIR_ENV} 下以 {var.name} 开头的文件"
+        )
+        return f"{where}；不在则按清单里的原地址下载"  # noqa: RUF001
     parsed = parse_json_value(raw)
     root = parsed if parsed is not None else raw
     if isinstance(root, list):
@@ -68,24 +75,32 @@ def _shape_status(var: Any, raw: Any) -> str:
     )
 
 
+def _one_line(desc: str) -> str:
+    """manifest 说明压成一行(连续空白含换行 → 一个空格),超过 :data:`_DESC_MAX_CHARS`
+    截断加「…」。"""
+    text = " ".join(desc.split())
+    return text if len(text) <= _DESC_MAX_CHARS else f"{text[:_DESC_MAX_CHARS]}…"
+
+
 def build_inputs_block(
     variables: Sequence[Any], inputs: Mapping[str, Any], *, bindings: Collection[str]
 ) -> str | None:
     """从声明 + 本轮实际传值 + 绑定表生成;没有声明变量返回 ``None``。
 
     说明文字来自 ``PromptVariableSpec.description``(租户管理员写的 manifest,与系统提示词
-    同一信任级),没写就只有名字。模板里已经引用的变量也列(去重不做):C 的职责是兜底与
-    位置,B 的职责是原地渲染,两者口径一致,重复一行不造成歧义。
+    同一信任级),压成一行并限长;没写(或只有空白)就只有名字。模板里已经引用的变量也列
+    (去重不做):C 的职责是兜底与位置,B 的职责是原地渲染,两者口径一致,重复一行不造成
+    歧义。
     """
     if not variables:
         return None
     lines = [
         HEADER,
         f"输入文件目录 ${INPUTS_DIR_ENV}，清单 ${INPUTS_ENV}（exec_python / bash 里直接用）。",  # noqa: RUF001
-        "要用到下面任何值时用代码从目录或清单读；不要从上文手抄，长串抄错一位就是 404。",  # noqa: RUF001
+        "代码里要用到下面任何值时，从目录或清单读；不要从上文手抄，长串抄错一位就是 404。",  # noqa: RUF001
     ]
     for var in variables:
-        desc = getattr(var, "description", None)
+        desc = _one_line(getattr(var, "description", None) or "")
         label = f"{var.name}（{desc}）" if desc else var.name  # noqa: RUF001
         lines.append(f"- {label}：{_status(var, inputs, bindings)}")  # noqa: RUF001
     return "\n".join(lines)

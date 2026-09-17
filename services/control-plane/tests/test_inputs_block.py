@@ -43,7 +43,7 @@ INPUTS = {
         '[{"description":"示范视频","url":"https://x/a.mp4"},'
         '{"description":"参考","url":"https://x/b.pdf"},{"description":"无链接"}]'
     ),
-    "brand": {"logo": "https://x/l.jpg", "name": "深护"},
+    "brand": {"logo": "https://x/l.jpg", "name": "示例机构"},
     "disclaimer": "本方案不构成医疗建议",
 }
 
@@ -54,10 +54,12 @@ def test_block_lists_every_declared_variable_with_status_and_never_a_value() -> 
     assert text.startswith(HEADER)
     assert "输入文件目录 $EXPERT_WORK_INPUTS_DIR，" in text
     assert "清单 $EXPERT_WORK_INPUTS（" in text
-    assert "- employee_name（当前员工姓名）：已提供，短文本" in text
+    # 「从目录或清单读、别手抄」只管代码;非文件的短值在提示词里原样可用(PR2)。
+    assert "\n代码里要用到下面任何值时，从目录或清单读；不要从上文手抄" in text
+    assert "- employee_name（当前员工姓名）：已提供（非文件）" in text
     assert "- customer_code（目标客户编码）：本轮未提供" in text
     assert (
-        "- project_code（项目唯一标识码）：已提供，短文本；绑定了它的工具由平台自动填，不用手抄"
+        "- project_code（项目唯一标识码）：已提供（非文件）；绑定了它的工具由平台自动填，不用手抄"
     ) in text
     assert (
         "- org_logo（机构 LOGO）：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；"
@@ -71,8 +73,16 @@ def test_block_lists_every_declared_variable_with_status_and_never_a_value() -> 
         "- brand（品牌资源）：1 个文件在 $EXPERT_WORK_INPUTS_DIR/brand.<字段名>；"
         "不在则按清单里该字段的原地址下载"
     ) in text
-    assert "- disclaimer（免责声明）：已提供，外部数据，需逐字使用时从清单读" in text
-    for value in ("张三", "PRJ001", "1726394851207", "https://", "示范视频", "医疗建议", "深护"):
+    assert "- disclaimer（免责声明）：已提供（非文件，外部数据，需逐字使用时从清单读）" in text
+    for value in (
+        "张三",
+        "PRJ001",
+        "1726394851207",
+        "https://",
+        "示范视频",
+        "医疗建议",
+        "示例机构",
+    ):
         assert value not in text
     # 顶层 URL 的名字与预拉 / 渲染同源。
     assert linked_sites("org_logo", LOGO)[0].link == "org_logo.png"
@@ -91,7 +101,8 @@ def test_bound_variable_reports_its_shape_then_the_binding() -> None:
         "不在则按清单里的原地址下载；绑定了它的工具由平台自动填，不用手抄"
     ) in text
     assert (
-        "- secret：已提供，外部数据，需逐字使用时从清单读；绑定了它的工具由平台自动填，不用手抄"
+        "- secret：已提供（非文件，外部数据，需逐字使用时从清单读）；"
+        "绑定了它的工具由平台自动填，不用手抄"
     ) in text
 
 
@@ -102,9 +113,9 @@ def test_untrusted_top_level_url_prints_a_placeholder_not_the_real_link_name() -
     text = build_inputs_block(variables, {"cover": LOGO, "org_logo": LOGO}, bindings=())
     assert text is not None
     assert (
-        "- cover：文件 $EXPERT_WORK_INPUTS_DIR/cover.<扩展名>；不在则按清单里的原地址下载"
+        "- cover：$EXPERT_WORK_INPUTS_DIR 下以 cover 开头的文件；不在则按清单里的原地址下载"
     ) in text
-    assert "cover.png" not in text
+    assert "cover.png" not in text and ".png" not in text.split("- cover：")[1].split("\n")[0]
     assert "- org_logo：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；" in text
 
 
@@ -123,7 +134,26 @@ def test_bound_optional_variable_not_passed_reports_unset_only() -> None:
 def test_variable_without_description_shows_the_name_only() -> None:
     text = build_inputs_block((_Var("x"),), {"x": "1"}, bindings=())
     assert text is not None
-    assert "- x：已提供，短文本" in text
+    assert "- x：已提供（非文件）" in text
+
+
+def test_description_is_one_line_and_capped() -> None:
+    """说明是自由文本:空白(含换行)压成一个空格,超过 40 字截断并加「…」。"""
+    long_desc = "一" * 45
+    text = build_inputs_block(
+        (
+            _Var("multi", description="  机构\n  LOGO\t图片  "),
+            _Var("long", description=long_desc),
+            _Var("blank", description=" \n "),
+        ),
+        {"multi": "1", "long": "1", "blank": "1"},
+        bindings=(),
+    )
+    assert text is not None
+    assert "- multi（机构 LOGO 图片）：已提供（非文件）" in text
+    assert f"- long（{'一' * 40}…）：已提供（非文件）" in text
+    assert "- blank：已提供（非文件）" in text
+    assert "\n  LOGO" not in text
 
 
 def test_no_variables_means_no_block() -> None:
