@@ -14,6 +14,7 @@ for both prompt families.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -904,3 +905,119 @@ async def test_non_credentials_failure_counts_as_other() -> None:
     page = await audit_store.query(AuditQuery(tenant_id="*", limit=100))
     run_row = next(e for e in page.entries if e.action == AuditAction.MEMORY_CONSOLIDATOR_RUN)
     assert run_row.details["errors_by_reason"] == {ERROR_REASON_OTHER: 1}
+
+
+# ─── RLS 上下文(班车 2,09-17 拍板) ──────────────────────────────────
+
+
+def _rls_ctx() -> tuple[UUID | None, UUID | None, bool]:
+    from expert_work.persistence.rls import (
+        bypass_rls_var,
+        current_tenant_id_var,
+        current_user_id_var,
+    )
+
+    return current_tenant_id_var.get(), current_user_id_var.get(), bypass_rls_var.get()
+
+
+_CtxLog = list[tuple[str, tuple[UUID | None, UUID | None, bool], tuple[object, ...]]]
+
+
+class _CtxRecorder:
+    """包一层 store:每个 async 方法调用连同当时的 RLS 上下文、位置参数记进 ``log``。"""
+
+    def __init__(self, inner: object, log: _CtxLog, label: str) -> None:
+        self._inner = inner
+        self._log = log
+        self._label = label
+
+    def __getattr__(self, name: str) -> object:
+        attr = getattr(self._inner, name)
+        if not inspect.iscoroutinefunction(attr):
+            return attr
+
+        async def call(*args: object, **kwargs: object) -> object:
+            self._log.append((f"{self._label}.{name}", _rls_ctx(), args))
+            return await attr(*args, **kwargs)
+
+        return call
+
+
+@pytest.mark.asyncio
+async def test_sweep_runs_every_store_call_under_an_explicit_rls_context() -> None:
+    """真 enforce 之前,每次库访问都必须要么带租户(+ 用户)、要么显式 bypass(测试环境今天
+    每天 ~640 条 ``rls.would_fail_closed`` 来自这里)。
+
+    * 单飞锁、``consolidator_distinct_tenant_ids``(跨租户)、``distinct_users``(跨用户:
+      ``memory_item`` 的策略要求 ``app.user_id``,只带租户会一行都读不到;SQL 自己按
+      ``tenant_id`` 过滤)→ 显式 bypass;
+    * 读租户配置 → 该租户;逐用户整理 → 该租户 + 该用户;
+    * 审计:每一行都在它自己的 ``tenant_id`` 下写(扫完一轮那行是平台租户)。
+    """
+    from control_plane.memory_consolidator import _PLATFORM_TENANT_ID
+    from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
+
+    log: _CtxLog = []
+    audit_inner = InMemoryAuditLogStore()
+    audit_logger = AuditLogger(
+        store=_CtxRecorder(audit_inner, log, "audit"),  # type: ignore[arg-type]
+        redactor=DefaultSecretRedactor(),
+        fallback=InMemoryAuditFallbackQueue(),
+    )
+    config_store = InMemoryTenantConfigStore()
+    await _seed_tenant_config(TenantConfigService(store=config_store, audit_logger=audit_logger))
+    # 另起一个 service:种子那次 upsert 会把记录留在前一个实例的缓存里,读就不下库了。
+    config_service = TenantConfigService(
+        store=_CtxRecorder(config_store, log, "tenant_config"),  # type: ignore[arg-type]
+        audit_logger=audit_logger,
+    )
+    memory = InMemoryMemoryStore()
+    _seed_transient(memory, contents=["dark UI", "dark mode preference", "wants dark theme"])
+
+    lock_ctx: list[tuple[UUID | None, UUID | None, bool]] = []
+    factory = FakeAdvisoryLockSessionFactory()
+
+    def recording_factory() -> object:
+        session = factory()
+        real = session.execute
+
+        async def execute(stmt: object, params: dict[str, object] | None = None) -> object:
+            lock_ctx.append(_rls_ctx())
+            return await real(stmt, params)
+
+        session.execute = execute  # type: ignore[method-assign]
+        return session
+
+    worker = MemoryConsolidator(
+        memory_store=_CtxRecorder(memory, log, "memory"),  # type: ignore[arg-type]
+        tenant_config_service=config_service,
+        audit_logger=audit_logger,
+        aux_model=_ScriptedAuxModel(
+            ['{"keep": true, "summary": "user prefers dark mode", "reject_reason": null}']
+        ),
+        embedder=_FakeEmbedder(),
+        session_factory=recording_factory,  # type: ignore[arg-type]
+    )
+    log.clear()  # 种子阶段的调用不算
+    summary = await worker.run_once()
+    assert summary.consolidated == 1
+
+    assert lock_ctx and set(lock_ctx) == {(None, None, True)}
+    bypass_calls = {"memory.consolidator_distinct_tenant_ids", "memory.distinct_users"}
+    seen = {name for name, _, _ in log}
+    assert bypass_calls <= seen
+    assert "tenant_config.get" in seen
+    audit_tenants = set()
+    for name, ctx, args in log:
+        if name in bypass_calls:
+            assert ctx == (None, None, True), name
+        elif name == "tenant_config.get":
+            assert ctx == (_TENANT, None, False), name
+        elif name == "audit.append":
+            entry = args[0]
+            audit_tenants.add(entry.tenant_id)  # type: ignore[attr-defined]
+            assert ctx[0] == entry.tenant_id and ctx[2] is False, (name, entry.action)  # type: ignore[attr-defined]
+        elif name.startswith("memory."):
+            assert ctx == (_TENANT, _USER, False), name
+    assert audit_tenants == {_TENANT, _PLATFORM_TENANT_ID}
+    assert _rls_ctx() == (None, None, False), "上下文必须复原,不能漏给调用方"
