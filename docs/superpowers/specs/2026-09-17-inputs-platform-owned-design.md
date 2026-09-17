@@ -94,22 +94,23 @@ agents/<key>/inputs/cache/<digest><ext>                     (不变,内容寻址
 
 ## 五、B —— `{{ var }}` 按值的形态渲染
 
-`render_system_prompt`(`prompt_render.py:42`)构造 `context` 时,每个变量的值经 `render_value(var, raw, *, bindings, nonce)`:
+`render_system_prompt`(`prompt_render.py:42`)构造 `context` 时,本轮**传了**的变量经 `render_value(var, raw, *, nonce)`:
 
 | 值的形态(判定顺序) | 渲染成 | 备注 |
 |---|---|---|
-| 变量被某个绑定引用(`bindings` 里出现) | `（已绑定到工具参数，调用时平台自动填）` | 值不出现 |
-| `str` 且 `http(s)://` 开头 | `$EXPERT_WORK_INPUTS_DIR/<name><ext>` + `（已就位；不在则按输入清单里的原地址下载）` | **不等预拉结果**:名字是确定的;失败时文件不存在,清单 `value` 里永远有原 URL |
-| `list` / `dict` / 可解析 JSON 字符串,且内部有 URL | 逐项:`<i>. <description或键名> → $EXPERT_WORK_INPUTS_DIR/<name>/<i>-<slug><ext>`;无 URL 的项照原样 | 用 §4.3 的 `value_parsed` |
+| 本轮未传(不进 `render_value`) | 今天的值(trusted `""`,untrusted 空围栏) | 被绑定也一样 —— 平台此时什么都不填,`if` / `default()` 不能被翻过来 |
+| `render: raw` | 原值(今天行为) | 收窄开关 |
+| `str` 且 `http(s)://` 开头 | `$EXPERT_WORK_INPUTS_DIR/<name><ext>` + `（已就位；不在则按输入清单里的原地址下载）`;URL 后面跟着的说明文字照留 | **不等预拉结果**:名字是确定的;失败时文件不存在,清单 `value` 里永远有原 URL |
+| `list` / `dict` / 可解析 JSON 字符串,且内部有 URL | 另起一行逐项:`<i>. <description或序号> → $EXPERT_WORK_INPUTS_DIR/<name>/<i>-<slug><ext>；`(dict 是 `- <键> → <路径>；`,不是对象的列表项是 `<i>. <路径>；`);无 URL 的项照原样;块尾是同一句尾注 | 用 §4.3 的 `value_parsed`;**trusted 的真 list / dict 保留结构**(下标、属性、遍历、`length`、`tojson` 看到的是 URL 换成路径的副本,直接 `{{ x }}` 输出的是逐项块);untrusted 与 JSON 字符串仍是逐项块(改动前它们在模板里就是字符串) |
 | 其它(短文本、枚举、多行规则) | 原值(今天行为) | `trusted: false` 仍走 spotlight 围栏 |
-| 本轮未传 | `default()`(今天行为) | |
 
 - **为什么 URL 渲染不需要知道预拉结果**:路径由名字决定,不由下载决定。渲染层只做字符串替换,不发网络请求,不查文件系统。
 - 名字用 §4.1 的同一个 `link_name`,所以提示词里说的名字与预拉建出来的链接**逐字相同**。
-- `trusted: false` 的变量:走引用渲染时输出的是平台文本,不围栏;逐项渲染里的 `description` 是租户数据,**每条单独过 spotlight 围栏**,与今天原值渲染同一口径。
-- 已知代价:模板里对被改写的值做**内容比较**(`{{ 'x' if org_logo == '…' }}`)会失真;`| default('')` 这类**存在性**判断照旧成立(改写后的字符串非空)。写进文档。
+- **被绑定的变量同样按形态渲染**(不再是「平台自动填」):绑定是逐工具的,有绑定的工具 schema 里已经没有这个参数,藏值换不来什么;漏绑的工具(部分绑定是常态)却会静默拿不到值。绑定状态由 §六「本轮输入」段报告。
+- `trusted: false`(裁定 P8):从值推出来的**整段**(说明、dict 键、路径 —— 路径里带着 slug)合成**一个**围栏;只有尾注是平台文本,在围栏外。带路径的行以「；」收尾,datamarking 的 `▁` 不会贴在路径上。
+- 已知代价:模板里对被改写的值做**内容比较**(`{{ 'x' if org_logo == '…' }}`)会失真;`| default('')` 这类**存在性**判断照旧成立(改写后的值非空)。写进文档。
 - 收窄开关:`PromptVariableSpec.render: Literal["auto", "raw"] = "auto"`。`raw` = 永远原值。只用于收窄,不是启用基础能力(同 [[platform-defaults-over-configuration]])。
-- `bindings` 来源:`BuiltAgent` 新增 `arg_bindings: tuple[ArgBindingSpec, ...]`(agent_factory 从 `registry.arg_bindings()` 反推,或直接从 spec 取 —— 取 spec,`registry` 里的是折叠后的 wire 名,B-65 那条撞名问题不该传染到这里)。
+- 绑定表:`BuiltAgent` 新增 `arg_bindings: tuple[ArgBindingSpec, ...]`,agent_factory 直接从 spec 取(`registry` 里的是折叠后的 wire 名,B-65 那条撞名问题不该传染到这里);给 §六 报告绑定状态用,渲染层不读。
 
 **存量影响(唯一的行为变化)**:已经写着 `{{ org_logo }}` 的模板,渲染结果从 URL 变成本地路径 + 一句说明。这正是修复本身;记一条 `prompt.rendered_by_reference` 日志(变量名,不记值)供事后核对。
 
