@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
 from orchestrator.graph_builder.input_url_guard import (
+    MAX_COMPARE_CHARS,
     MAX_EDIT_DISTANCE,
     URL_RE,
     GuardHit,
@@ -120,3 +123,76 @@ def test_message_names_the_variable_the_link_and_the_distance() -> None:
     assert "$EXPERT_WORK_INPUTS" in text
     exact = guard_message(GuardHit(var_name="v", link="v.png", distance=0, written="u"))
     assert "与输入一致" in exact
+
+
+def test_exact_branch_catches_urls_longer_than_the_near_match_bound() -> None:
+    """review fix round 1 #1:近似分支的长度闸挡住的串,完全一致分支不受它限制。"""
+    long_tail = "a" * (MAX_COMPARE_CHARS + 10)
+    long_url = f"https://z/{long_tail}"
+    cand = (UrlCandidate(var_name="big", url=long_url, link="big.bin"),)
+    hit = find_retyped_url(f"open('{long_url}')", cand)
+    assert hit == GuardHit(var_name="big", link="big.bin", distance=0, written=long_url)
+
+
+LONG_TAIL = "b" * 2100
+LONG_URL = "https://y/" + LONG_TAIL
+LONG_CAND = (UrlCandidate(var_name="v", url=LONG_URL, link="v.bin"),)
+
+
+def test_one_character_slip_on_a_long_tail_is_still_a_hit() -> None:
+    """P19:签名 URL 常见的长度(> 旧上限 2048),一处改动仍要抓到。"""
+    written = "https://y/" + LONG_TAIL[:-1] + "c"
+    hit = find_retyped_url(f"open('{written}')", LONG_CAND)
+    assert hit is not None and hit.distance == 1
+
+
+def test_four_edits_on_a_long_tail_is_not_a_hit() -> None:
+    mutated = "c" * 4 + LONG_TAIL[4:]
+    written = "https://y/" + mutated
+    assert find_retyped_url(written, LONG_CAND) is None
+
+
+def _salt(i: int) -> str:
+    """每个候选独有的 4 字符前缀,字母互不相同 —— 保证跨候选比较在几行内就能算出
+    编辑距离 > cap 提前退出;真正对得上的那一对(同下标)只在尾部差 1~2 个字符,
+    要跑满整段带宽,是这条尾串量级下真正的最坏情形。"""
+    return chr(ord("A") + i) * 4
+
+
+def test_near_match_perf_on_long_tails_is_fast() -> None:
+    """P19:20 写法 x 20 候选、~8000 字符的尾串。每个写法只跟同下标的候选「差一点」
+    (要跑满整段带宽),跟其余 19 个候选在前几个字符就能判定 > cap(现实里 20 个兄弟
+    输入各有自己的签名串,不会跟别的候选撞出一段相同前缀)。全矩阵版本单次比较这个
+    长度就要 10+ 秒(见 report 里的旧实现实测),带宽裁剪必须整体在 1 秒内跑完。"""
+    base = "d" * 7990
+    candidates = tuple(
+        UrlCandidate(var_name=f"v{i}", url=f"https://p/{_salt(i)}{base}{i:04d}", link=f"v{i}.bin")
+        for i in range(20)
+    )
+    code = "\n".join(
+        f"open('https://p/{_salt(i)}{base}{i:03d}x')"  # 尾部一处改动:'0005' → '005x'
+        for i in range(20)
+    )
+    started = time.perf_counter()
+    find_retyped_url(code, candidates)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, f"took {elapsed:.3f}s"
+
+
+def test_url_literal_extraction_stops_at_chinese_punctuation() -> None:
+    """review fix round 1 #3:裸 URL 后面常跟中文句读,不是 URL 的一部分。"""
+    code = "见 https://h/a.png，然后再看 https://h/b.png。完"  # noqa: RUF001 — 测的就是全角标点
+    assert URL_RE.findall(code) == ["https://h/a.png", "https://h/b.png"]
+
+
+def test_url_literal_extraction_keeps_cjk_in_the_path() -> None:
+    """中文文件名是真实输入,不能被当成「跟在 URL 后面的文字」剔除。"""
+    assert URL_RE.findall("open('https://h/图片.png')") == ["https://h/图片.png"]
+
+
+def test_scheme_match_is_case_insensitive() -> None:
+    """review fix round 1 #4:``HTTPS://`` 一样要抽出来,host 比较本就不分大小写。"""
+    written = LOGO.replace("https://", "HTTPS://")
+    assert URL_RE.findall(f"open('{written}')") == [written]
+    hit = find_retyped_url(f"open('{written}')", CAND)
+    assert hit == GuardHit(var_name="org_logo", link="org_logo.png", distance=0, written=written)
