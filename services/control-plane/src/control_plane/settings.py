@@ -543,6 +543,19 @@ class Settings(BaseSettings):
     #: stops a run that crashes its owner every time (OOM) from looping forever.
     orphan_max_reclaims: int = Field(default=3, gt=0)
 
+    # --- B-80 (滚动发布不打断在跑的对话) — 关机收口 ---------------------------
+    #: 优雅关机等在跑的 run 收尾的**上限**秒数。不是固定等待:可安全重放的那些
+    #: run 在关机标志置起后会自己交出所有权(见 ``run_agent`` 的关机哨兵),典型
+    #: 情形几秒就收完;只有悬空着不可重放工具的那几轮才会占到上限 —— 它们不能
+    #: 交接(续跑会把那个工具重发一次),只能等它们自己跑完。
+    #:
+    #: 与两个外部数字强耦合,一起改:
+    #: * k8s ``terminationGracePeriodSeconds`` 必须显著大于它,否则 pod 先被
+    #:   SIGKILL,收口白做;
+    #: * ``tools/deploy`` 的 ``rollout status --timeout`` 必须大于它 —— 否则最坏
+    #:   情形下发布/回滚脚本会在滚动真正完成前先超时报失败。
+    run_drain_timeout_s: float = Field(default=300.0, ge=0)
+
     # --- Stream 9.5 (distributed run queue) ---------------------------------
     #: Master switch for the run-queue worker (drains ``status='queued'`` runs
     #: submitted via ``POST /runs mode=queue``). Every instance runs it; the

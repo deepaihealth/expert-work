@@ -155,6 +155,10 @@ class RunManager:
         #: ``lease_ttl_s / 3`` via :meth:`heartbeat`, so two missed heartbeats
         #: still leave margin before a peer reclaims.
         self._lease_ttl_s = lease_ttl_s
+        #: B-80 —— 本进程是否已进入优雅关机。``run_agent`` 的
+        #: ``asyncio.CancelledError`` 兜底分支据此分辨「关机取消」(交接)与
+        #: 「用户取消 / 断流」(照旧收成 INTERRUPTED)。单向,不回退。
+        self._shutting_down = False
 
     @property
     def store(self) -> RunStore | None:
@@ -171,6 +175,20 @@ class RunManager:
     @property
     def instance_id(self) -> str:
         return self._instance_id
+
+    @property
+    def shutting_down(self) -> bool:
+        """B-80 —— 本进程是否已进入优雅关机。见 :meth:`mark_shutting_down`。"""
+        return self._shutting_down
+
+    def mark_shutting_down(self) -> None:
+        """进入优雅关机。**在取消任何 run 任务之前**由 app lifespan 调用一次。
+
+        顺序是这条的全部意义:标志必须先于取消置起,否则被取消的 run 在兜底
+        分支里读到的还是 ``False``,会照老路收成 INTERRUPTED —— 正是 B-80。
+        同步方法(不抢 :attr:`_lock`):关机路径上拿不到锁就形同没置。
+        """
+        self._shutting_down = True
 
     @property
     def lease_ttl_s(self) -> float:
@@ -487,6 +505,63 @@ class RunManager:
             lease_until=now + timedelta(seconds=self._lease_ttl_s),
             heartbeat_at=now,
         )
+
+    async def drain_runs(self, *, timeout_s: float) -> int:
+        """B-80 —— 优雅关机收口:等在跑的 run 收尾,到点还没收的硬停。返回硬停几个。
+
+        调用顺序是这条的全部意义,**必须**是:先 :meth:`mark_shutting_down`,
+        再停队列 worker(不再认领新的),最后调这里。
+
+        等待期间可安全交接的那些 run 会**自己**退出 —— ``run_agent`` 的关机哨兵
+        发现它此刻可安全重放,就走协作取消把所有权交出去。所以 ``timeout_s`` 是
+        **上限**不是固定等待:典型情形下几秒就回,只有悬空着不可重放工具的那几轮
+        才会一直占到上限。
+
+        到点仍在跑的一律 ``cancel()`` 并**等它跑完收口** —— ``run_agent`` 的
+        ``asyncio.CancelledError`` 分支要在那里决定交接还是收成 INTERRUPTED,
+        cancel 完就走会把这些写丢在半路(这正是「事件循环拆解期间 await 不可靠」
+        那条注释说的情形;显式收口就是为了把这些写挪回循环还健康的时候)。
+        """
+        live = [
+            r.task for r in list(self._runs.values()) if r.task is not None and not r.task.done()
+        ]
+        if not live:
+            return 0
+        logger.info("run.drain_started in_flight=%d timeout_s=%.1f", len(live), timeout_s)
+        await asyncio.wait(live, timeout=max(0.0, timeout_s))
+        stragglers = [t for t in live if not t.done()]
+        for task in stragglers:
+            task.cancel()
+        if stragglers:
+            # ``return_exceptions=True`` 把每个任务的 ``CancelledError`` 吞掉,
+            # 同时保证等到它们各自的收口分支真的跑完。
+            await asyncio.gather(*stragglers, return_exceptions=True)
+        logger.info("run.drain_done hard_stopped=%d", len(stragglers))
+        return len(stragglers)
+
+    async def hand_off(self, run_id: UUID) -> bool:
+        """B-80 —— 交出所有权:租约作废、行留在 ``running``,等别的副本接管。
+
+        优雅关机时本副本不再执行这一行,但 run 并没有失败 —— 它的 durable
+        checkpoint 还在,活着的副本的 ``OrphanSweep`` 会从那里接着跑。所以这里
+        **不是终局写**:不碰 ``status``、不写 ``error``、不写 ``finished_at``。
+
+        返回 ``True`` iff 真的交接出去了。三种落空都返回 ``False``,调用方据此
+        退回原来的 INTERRUPTED 路径:
+
+        * 没有 durable 行(``store is None``)—— 没有别的副本能看见它;
+        * 本进程没有这个 record;
+        * store 侧 CAS 输了 —— run 已自己跑完(终局),或已被别的副本 reclaim。
+        """
+        async with self._lock:
+            record = self._runs.get(run_id)
+            if record is None or self._store is None:
+                return False
+            handed = await self._store.abandon_lease(
+                run_id=run_id, claimed_by=self._instance_id, now=datetime.now(UTC)
+            )
+        logger.info("run.hand_off id=%s handed=%s by=%s", run_id, handed, self._instance_id)
+        return handed
 
     async def attach_task(self, run_id: UUID, task: asyncio.Task[None]) -> bool:
         """Bind the live orchestrator task to its run record."""

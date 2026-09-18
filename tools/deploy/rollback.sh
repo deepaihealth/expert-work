@@ -106,10 +106,20 @@ if [[ ",${images}," == *",credential-proxy,"* ]]; then
         "credential-proxy=${ACR}/credential-proxy:${tag}"
 fi
 
+# B-80 —— 同 release.sh:等待上限必须大于 pod 收口上限,否则一次正常回滚会被
+# 报成失败。**回滚要更快**时(事故中 5 分钟很难受),用:
+#
+#   kubectl -n expert-work delete pod -l app.kubernetes.io/name=control-plane \
+#       --grace-period=0 --force
+#
+# 被 SIGKILL 的副本来不及写终局,它手上的 run 留在 ``running`` + 租约过期 ——
+# 正是孤儿扫描的接管形态,新副本会从 checkpoint 把它们接着跑完。
+readonly ROLLOUT_TIMEOUT="${EXPERT_WORK_ROLLOUT_TIMEOUT:-600s}"
+
 if [[ "${dry_run}" -eq 0 ]]; then
     IFS=',' read -ra selected <<<"${images}"
     for d in "${selected[@]}"; do
-        kubectl -n expert-work rollout status "deploy/${d}" --timeout=300s
+        kubectl -n expert-work rollout status "deploy/${d}" --timeout="${ROLLOUT_TIMEOUT}"
     done
 else
     echo "DRY-RUN> rollout status (${images})"

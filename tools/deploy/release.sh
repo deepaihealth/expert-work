@@ -193,6 +193,13 @@ run() {
 
 readonly ACR="crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work"
 
+# B-80 —— 等滚动完成的上限。必须大于 pod 的收口时间
+# (``EXPERT_WORK_RUN_DRAIN_TIMEOUT_S``,默认 300s):最坏情形下一个旧 pod 会一直
+# 占到收口上限才退出,300s 的等待会在滚动真正完成前先超时,把一次正常发布报成失败。
+# 600 = 300 收口 + 起新 pod、拉镜像、readiness 的余量。三个数字(这里 / 收口上限 /
+# ``terminationGracePeriodSeconds``)改一个就要一起核对。
+readonly ROLLOUT_TIMEOUT="${EXPERT_WORK_ROLLOUT_TIMEOUT:-600s}"
+
 # ------------------------------------------- previous tags + failure trap
 # X-14 P5 — the tag the overlay pinned BEFORE step 2 overwrites it. The
 # record PR must name it (a rollback is then one paste), and a red stage
@@ -334,7 +341,7 @@ if [[ "${dry_run}" -eq 0 ]]; then
         exit 1
     fi
     for d in ${deployments}; do
-        kubectl -n expert-work rollout status "${d}" --timeout=300s
+        kubectl -n expert-work rollout status "${d}" --timeout="${ROLLOUT_TIMEOUT}"
     done
 else
     echo "DRY-RUN> wait job/migrate + rollout status (all deployments)"
