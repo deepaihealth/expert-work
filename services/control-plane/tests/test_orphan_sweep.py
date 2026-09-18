@@ -611,3 +611,37 @@ async def test_respawn_records_the_manifest_version_it_rebuilt_from(
     row = await store.get(run_id=run_id, tenant_id=tenant)
     assert row is not None
     assert row.agent_spec_sha256 == _SPEC_SHA256
+
+
+@pytest.mark.asyncio
+async def test_a_draining_replica_does_not_reclaim_orphans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-80 —— 正在关机的副本不接管孤儿。
+
+    它马上就不在了:接过来只会在自己的收口里再交接一次,白烧一次
+    ``reclaim_count``(上限 3 次撑不住一轮滚动发布),而这一行本可以直接被
+    活着的副本捡走。
+    """
+    spawns: list[object] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+    runtime.run_manager.mark_shutting_down()
+
+    handled = await _sweep(store, runtime).run_once()
+    await asyncio.sleep(0)
+
+    assert handled == 0
+    assert spawns == []
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.RUNNING, "别动它 —— 让活着的副本接"
+    assert row.claimed_by == "dead-instance"
+    assert row.reclaim_count == 0

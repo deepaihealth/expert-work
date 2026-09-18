@@ -539,6 +539,20 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def abandon_lease(self, *, run_id: UUID, claimed_by: str, now: datetime) -> bool:
+        """B-80 —— 放弃所有权:租约立即到期,状态留在 ``running``。
+
+        优雅关机时本副本不再执行这一行,但这**不是**终局写 —— run 没有失败,
+        只是换个副本从 durable checkpoint 接着跑。把 ``lease_until`` 置成
+        ``now`` 让 :meth:`list_orphans` 下一个 tick 就看见它,由 :meth:`reclaim`
+        的 CAS 选出唯一接手人。
+
+        CAS on ``(status='running' AND claimed_by=<owner>)``,与 :meth:`heartbeat`
+        同一个守卫:run 已被别的副本 reclaim、或已经自己跑完(终局),这次放弃
+        必须 no-op,否则会把终局行拽回孤儿池重跑一遍。返回 ``True`` iff 放弃成功。
+        """
+
+    @abc.abstractmethod
     async def list_orphans(self, *, now: datetime, limit: int) -> list[RunInfo]:
         """Cross-tenant running runs whose lease expired — the orphan candidates.
 
@@ -992,6 +1006,13 @@ class InMemoryRunStore(RunStore):
         if row is None or row.status is not RunStatus.RUNNING or row.claimed_by != claimed_by:
             return False
         self._rows[run_id] = replace(row, lease_until=lease_until, heartbeat_at=heartbeat_at)
+        return True
+
+    async def abandon_lease(self, *, run_id: UUID, claimed_by: str, now: datetime) -> bool:
+        row = self._rows.get(run_id)
+        if row is None or row.status is not RunStatus.RUNNING or row.claimed_by != claimed_by:
+            return False
+        self._rows[run_id] = replace(row, lease_until=now, heartbeat_at=now)
         return True
 
     async def list_orphans(self, *, now: datetime, limit: int) -> list[RunInfo]:
@@ -1659,6 +1680,20 @@ class SqlRunStore(RunStore):
                     AgentRunRow.status == RunStatus.RUNNING.value,
                 )
                 .values(lease_until=lease_until, heartbeat_at=heartbeat_at)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def abandon_lease(self, *, run_id: UUID, claimed_by: str, now: datetime) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(AgentRunRow)
+                .where(
+                    AgentRunRow.id == run_id,
+                    AgentRunRow.claimed_by == claimed_by,
+                    AgentRunRow.status == RunStatus.RUNNING.value,
+                )
+                .values(lease_until=now, heartbeat_at=now)
             )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0

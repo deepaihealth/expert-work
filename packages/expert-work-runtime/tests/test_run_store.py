@@ -715,6 +715,76 @@ async def test_heartbeat_fails_for_non_owner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_abandon_lease_makes_the_run_an_orphan_candidate() -> None:
+    """B-80 —— 关机交接:主动把租约作废,行留在 RUNNING。
+
+    优雅关机里本副本不再执行这一行,但它并没有失败 —— 把租约置为 ``now``
+    就让 :meth:`list_orphans` 立刻看见它,由活着的副本从 checkpoint 接管。
+    这是「本进程放弃所有权」,不是终局写。
+    """
+    store = InMemoryRunStore()
+    run_id, tenant = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant, status=RunStatus.RUNNING))
+    await store.claim(
+        run_id=run_id,
+        tenant_id=tenant,
+        claimed_by="inst-a",
+        lease_until=_BASE + timedelta(seconds=30),
+        heartbeat_at=_BASE,
+    )
+    now = _BASE + timedelta(seconds=5)
+    assert await store.abandon_lease(run_id=run_id, claimed_by="inst-a", now=now)
+
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.RUNNING, "交接不是终局写 —— 状态必须留在 RUNNING"
+    assert row.lease_until == now
+    # 扫描用的是严格小于,所以在 now 这一刻还不算过期;下一个 tick 就算。
+    assert [r.run_id for r in await store.list_orphans(now=now, limit=10)] == []
+    assert [
+        r.run_id for r in await store.list_orphans(now=now + timedelta(milliseconds=1), limit=10)
+    ] == [run_id]
+
+
+@pytest.mark.asyncio
+async def test_abandon_lease_fails_for_non_owner() -> None:
+    """已经被别的副本 reclaim 走的行,迟到的放弃不能动它的租约。"""
+    store = InMemoryRunStore()
+    run_id, tenant = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant, status=RunStatus.RUNNING))
+    await store.claim(
+        run_id=run_id,
+        tenant_id=tenant,
+        claimed_by="inst-b",
+        lease_until=_BASE + timedelta(seconds=30),
+        heartbeat_at=_BASE,
+    )
+    assert not await store.abandon_lease(
+        run_id=run_id, claimed_by="inst-a", now=_BASE + timedelta(seconds=5)
+    )
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None and row.lease_until == _BASE + timedelta(seconds=30)
+
+
+@pytest.mark.asyncio
+async def test_abandon_lease_fails_when_already_terminal() -> None:
+    """竞态:run 在关机收口与放弃租约之间自己跑完了 —— 别把终局行拽回孤儿池。"""
+    store = InMemoryRunStore()
+    run_id, tenant = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant, status=RunStatus.SUCCESS))
+    await store.claim(
+        run_id=run_id,
+        tenant_id=tenant,
+        claimed_by="inst-a",
+        lease_until=_BASE + timedelta(seconds=30),
+        heartbeat_at=_BASE,
+    )
+    assert not await store.abandon_lease(
+        run_id=run_id, claimed_by="inst-a", now=_BASE + timedelta(seconds=5)
+    )
+
+
+@pytest.mark.asyncio
 async def test_list_orphans_only_expired_running() -> None:
     store = InMemoryRunStore()
     tenant = uuid4()

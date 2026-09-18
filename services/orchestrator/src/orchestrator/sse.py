@@ -278,6 +278,13 @@ class ThreadStatsRecorder(Protocol):
 # ---------------------------------------------------------------------------
 
 
+#: B-80 —— 优雅关机时,「这一轮现在能不能安全交接」的复查间隔。只在
+#: ``run_manager.shutting_down`` 之后才真去查(一次 checkpoint 读),所以平时零开销;
+#: 关机窗口内要够密 —— 一个原本不可交接的 run 在它那个工具跑完的瞬间就变成可交接,
+#: 越早发现,越少的对话需要等到收口上限才被硬停。
+_HANDOFF_POLL_S: Final = 1.0
+
+
 async def _heartbeat_loop(run_manager: RunManager, run_id: UUID, record: Any) -> None:
     """Stream 9.4 — renew the run's ownership lease until cancelled.
 
@@ -594,6 +601,65 @@ async def run_agent(
     # peer's orphan sweep can tell this live run from a crashed owner's. Spawned
     # after the → RUNNING claim; cancelled in ``finally``.
     heartbeat_task: asyncio.Task[None] | None = None
+    # B-80 —— 优雅关机把这一轮交给别的副本时置 True:run 没有结束,所以
+    # ``finally`` 里不能发 end 帧,也不记终局审计 / 轨迹。
+    handed_off = False
+    handoff_task: asyncio.Task[None] | None = None
+
+    async def _handoff_watch() -> None:
+        """B-80 —— 关机期间,一旦这一轮可以安全交接就把它停下来。
+
+        本进程在优雅关机里不再执行这一轮,但 run 并没有失败。判据用的是重试那条
+        同款守卫 :func:`replay_is_safe`:checkpoint 尾部没有悬空的工具批次(续跑
+        只会重放一次纯 LLM 调用),或者悬空的每一个工具都标了可重放 —— 只有这样
+        才轮得到别的副本从 checkpoint 接着跑。不满足就什么都不做:让这一轮继续跑,
+        由关机流程的收口上限兜底(到点硬停,照旧收成 INTERRUPTED)。
+
+        走 ``abort_event`` 这条既有的协作取消通道(与 :func:`_heartbeat_loop`
+        判出租约丢失时同款),在**步骤边界**停下来,不会把某个工具腰斩。
+        """
+        try:
+            while True:
+                await asyncio.sleep(_HANDOFF_POLL_S)
+                if record.abort_event.is_set():
+                    return
+                if not run_manager.shutting_down:
+                    continue
+                if await replay_is_safe(graph, effective_config, tool_replay_safe):
+                    logger.info("run_agent.handoff_requested run_id=%s", run_id)
+                    record.abort_event.set()
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _try_hand_off() -> bool:
+        """B-80 —— 三道闸都过才算把这一轮交出去,任何一道不过都返回 ``False``
+        (调用方退回原来的 INTERRUPTED 路径,fail-closed):
+
+        1. 本进程确实在优雅关机 —— 用户取消 / 断流 / 租约丢失都不该交接;
+        2. checkpoint 尾部可安全重放(``replay_is_safe``,自身读不到 state 也
+           fail-closed)—— 这是「只交接安全的」那一条;
+        3. ``hand_off`` 的 CAS 赢了 —— run 没在这中间自己跑完,也没被别的副本
+           抢走。这一道同时是**用户取消**的防线:``RunManager.cancel`` 已把
+           durable 行写成 INTERRUPTED,CAS 必然落空,关机窗口里被用户取消的
+           一轮不会被复活。
+        """
+        if not run_manager.shutting_down:
+            return False
+        if not await replay_is_safe(graph, effective_config, tool_replay_safe):
+            return False
+        if not await run_manager.hand_off(run_id):
+            return False
+        logger.info("run_agent.handed_off run_id=%s", run_id)
+        return True
+
+    async def _finish_cancelled() -> bool:
+        """取消收口:能交接就交接,否则照旧收成 INTERRUPTED。返回是否交接出去了。"""
+        if await _try_hand_off():
+            return True
+        await run_manager.set_status(run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot())
+        return False
+
     try:
         started = await run_manager.set_status(run_id, RunStatus.RUNNING)
         if not started:
@@ -607,6 +673,7 @@ async def run_agent(
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(run_manager, run_id, record), name=f"run-heartbeat-{run_id}"
         )
+        handoff_task = asyncio.create_task(_handoff_watch(), name=f"run-handoff-watch-{run_id}")
         metadata_payload = {"run_id": str(run_id), "thread_id": str(record.thread_id)}
         await _publish_frame("metadata", metadata_payload)
 
@@ -745,6 +812,15 @@ async def run_agent(
         # run end after a resume. A failing ``aget_state`` degrades to
         # "not paused" (same graceful-degradation contract as the
         # trajectory recorder) rather than failing the run.
+        # B-80 —— 协作中止不抛异常,走的是这条正常终局路径,所以交接必须在这里
+        # 也拦一道。``abort_event`` 有三个来源(用户取消 / 租约丢失 / 关机哨兵),
+        # 只有关机那一路能交接 —— 三道闸在 ``_try_hand_off`` 内自检。
+        if record.abort_event.is_set() and await _try_hand_off():
+            handed_off = True
+            session_outcome = "handoff"
+            logger.info("run_agent.cancelled_for_handoff run_id=%s", run_id)
+            return
+
         pending_request: ApprovalRequest | None = None
         if not record.abort_event.is_set():
             try:
@@ -841,7 +917,13 @@ async def run_agent(
         # normal interrupted finish, not a failure.
         session_outcome = "interrupted"
         await _drain_persist_queue()
-        await run_manager.set_status(run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot())
+        # B-80 —— 这条也是关机交接的正路:``_handoff_watch`` 置 abort_event,
+        # 图在步骤边界抛 ``RunCancelledError``,在这里交出所有权。
+        handed_off = await _finish_cancelled()
+        if handed_off:
+            session_outcome = "handoff"
+            logger.info("run_agent.cancelled_for_handoff run_id=%s", run_id)
+            return
         logger.info("run_agent.cancelled_cooperatively run_id=%s", run_id)
         await _emit_run_end_audit(
             audit_logger,
@@ -868,8 +950,13 @@ async def run_agent(
         # loop teardown is unreliable (same reason
         # ``_emit_run_end_audit`` is skipped on this path).
         session_outcome = "cancelled"
-        await run_manager.set_status(run_id, RunStatus.INTERRUPTED, artifacts=_manifest_snapshot())
-        logger.info("run_agent.cancelled run_id=%s", run_id)
+        # B-80 —— 关机收口到点硬停走这里。``_finish_cancelled`` 里的三道闸
+        # 决定是交接还是照旧 INTERRUPTED;不可交接(悬空批次里有不可重放的
+        # 工具)就退回原行为,这正是「只交接安全的」。
+        handed_off = await _finish_cancelled()
+        if handed_off:
+            session_outcome = "handoff"
+        logger.info("run_agent.cancelled run_id=%s handed_off=%s", run_id, handed_off)
         raise
     except MaxStepsExceededError as exc:
         # Distinct from a generic failure — the agent hit its iteration
@@ -954,6 +1041,9 @@ async def run_agent(
         # Stream 9.4 — stop renewing the lease; the terminal status write
         # already moved the run out of ``running`` so it's no longer an orphan
         # candidate regardless of the now-stale lease.
+        if handoff_task is not None:
+            handoff_task.cancel()
+            await asyncio.gather(handoff_task, return_exceptions=True)
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             # ``gather(return_exceptions=True)`` awaits the cancelled task to
@@ -967,11 +1057,14 @@ async def run_agent(
         _session_duration_seconds.labels(outcome=session_outcome).observe(
             time.monotonic() - session_started
         )
-        await bridge.publish_end(
-            run_id,
-            status=_external_end_status(session_outcome),
-            artifacts=_manifest_snapshot(),
-        )
+        # B-80 —— 交接出去的一轮**没有结束**:别的副本正从 checkpoint 接着跑,
+        # 会自己发终局 end 帧。这里再发一个,重连的客户端会看到一次假终局。
+        if not handed_off:
+            await bridge.publish_end(
+                run_id,
+                status=_external_end_status(session_outcome),
+                artifacts=_manifest_snapshot(),
+            )
         # P2 块 2 —— 会话对外可见消息条数在这里重算。挂 ``finally`` 而不是挂
         # 控制面的 6 个 ``run_agent`` 启动点:一处覆盖全部调用方 + 全部终局
         # 分支(正常结束 / RunCancelledError / CancelledError / MaxSteps /

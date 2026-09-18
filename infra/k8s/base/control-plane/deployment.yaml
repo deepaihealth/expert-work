@@ -6,6 +6,17 @@ metadata:
     app.kubernetes.io/name: control-plane
 spec:
   replicas: 2
+  # B-80 —— 滚动发布不打断在跑的对话。旧 pod 收口最长要 run_drain_timeout_s
+  # (默认 300s),默认的 maxSurge=25%/maxUnavailable=25% 在 2 副本上化成
+  # surge=1 / unavailable=0,于是两个旧 pod 只能一个接一个地腾位子,整轮滚动
+  # 变成 2×收口 = 10 分钟以上,发布脚本的 rollout 等待必然先超时。
+  # maxSurge=2 让两个新 pod 一次起齐,两个旧 pod 并行收口 —— 整轮 ≈ 一次收口。
+  # maxUnavailable 保持 0:收口期间旧 pod 仍在服务,容量不掉。
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: control-plane
@@ -74,6 +85,11 @@ spec:
             preStop:
               exec:
                 command: ["sleep", "5"]
+      # B-80 —— 必须显著大于 ``EXPERT_WORK_RUN_DRAIN_TIMEOUT_S``(默认 300s):
+      # 到点 k8s 就 SIGKILL,收口没做完就被砍等于白做。360 = 300 收口 + 60 给
+      # preStop(5s)、HTTP drain、各 worker stop 与连接池释放。改其中一个必须
+      # 一起改另一个 —— 还有 ``tools/deploy`` 里 rollout 等待的超时。
+      terminationGracePeriodSeconds: 360
       # `optional: false` (the default, spelled out here) — a missing
       # Secret must fail pod scheduling loudly, not silently start
       # control-plane with an empty secret-store vault.

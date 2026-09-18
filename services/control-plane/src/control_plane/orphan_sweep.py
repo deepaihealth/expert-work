@@ -230,6 +230,11 @@ class OrphanSweep:
         return handled
 
     async def _handle_orphan(self, orphan: RunInfo, *, now: datetime) -> bool:
+        # B-80 —— 正在关机的副本不接管孤儿:它马上就不在了,接过来只会在自己的
+        # 收口里再交接一次(白白多烧一次 ``reclaim_count``,上限 3 次撑不住一轮
+        # 滚动发布),而这一行本来可以直接被活着的副本捡走。
+        if self._runtime.run_manager.shutting_down:
+            return False
         # Conservative path: auto-reclaim off, or the run already burned its
         # reclaim budget (it crashes its owner every time) → mark it errored.
         if not self._auto_reclaim or orphan.reclaim_count >= self._max_reclaims:

@@ -2318,6 +2318,18 @@ def create_app(
             try:
                 yield
             finally:
+                # B-80 —— 顺序有讲究,三步不能换位:
+                # 1) 先立关机标志。``run_agent`` 的兜底分支据此分辨「关机取消」
+                #    与「用户取消」;晚立一步,被取消的 run 读到的还是 False,
+                #    照老路收成 INTERRUPTED —— 那就是 B-80 本身。
+                # 2) 再停各个 worker(队列 worker 不再认领新的、孤儿扫描不再
+                #    接管 —— 正在关机的副本接管了也是白接)。
+                # 3) 最后收口在跑的 run:可安全交接的这时已经自己交出去了,
+                #    剩下的等到上限再硬停。这一步必须在 lifespan 里显式做,
+                #    不能等 lifespan 返回后事件循环拆解时的隐式取消 —— 那时候
+                #    收口分支里的库写不可靠。
+                run_manager_for_drain = resolved_agent_runtime.run_manager
+                run_manager_for_drain.mark_shutting_down()
                 # PR-E3a — stop the subscriber before its Redis client is
                 # closed by the exit stack (LIFO callbacks run after this).
                 await invalidation_bus.stop()
@@ -2363,6 +2375,11 @@ def create_app(
                     await sandbox_egress_metrics_worker.stop()
                 if workspace_janitor_worker is not None:
                     await workspace_janitor_worker.stop()
+                # B-80 步骤 3 —— worker 都停了(不会再有新的 run 起来),
+                # 现在等在跑的收尾。见上方顺序说明。
+                await run_manager_for_drain.drain_runs(
+                    timeout_s=resolved_settings.run_drain_timeout_s
+                )
                 # Stream HX-7 — drain the Langfuse SDK's background queue
                 # before the process exits; the recording stub has no
                 # shutdown, hence the duck-typed lookup.

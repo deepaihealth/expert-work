@@ -463,3 +463,128 @@ async def test_close_paused_without_store_uses_the_local_record() -> None:
     assert (
         await mgr.close_paused(uuid4(), tenant_id=uuid4(), reason=InterruptReason.NEW_TURN) is False
     )
+
+
+# --- B-80 关机交接 -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_shutting_down_defaults_false_and_latches_on() -> None:
+    """标志是给 ``run_agent`` 的兜底分支分辨「关机取消」与「用户取消」用的。"""
+    mgr = RunManager()
+    # 取成局部再断言:直接 assert 属性会让 mypy 把它收窄成字面量,后面的
+    # 断言被判成不可达。
+    before = mgr.shutting_down
+    mgr.mark_shutting_down()
+    after = mgr.shutting_down
+    # 单向:关机状态不回退(与 Lifecycle 的状态机同口径)。
+    mgr.mark_shutting_down()
+    again = mgr.shutting_down
+    assert (before, after, again) == (False, True, True)
+
+
+@pytest.mark.asyncio
+async def test_hand_off_abandons_the_lease_and_leaves_the_row_running() -> None:
+    store = InMemoryRunStore()
+    mgr = RunManager(store, instance_id="inst-a", lease_ttl_s=30.0)
+    run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
+    await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
+    await mgr.set_status(run_id, RunStatus.RUNNING)
+
+    assert await mgr.hand_off(run_id)
+
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None
+    assert row.status is RunStatus.RUNNING, "交接不是终局写"
+    assert row.error is None
+    # 本进程的 record 也不该被写成终局 —— 这一行的归属已经交出去了。
+    record = mgr.get(run_id)
+    assert record is not None and record.status is RunStatus.RUNNING
+    # 租约已作废 → 下一个 tick 就是孤儿候选。
+    assert row.lease_until is not None
+    orphans = await store.list_orphans(now=row.lease_until + timedelta(seconds=1), limit=10)
+    assert [r.run_id for r in orphans] == [run_id]
+
+
+@pytest.mark.asyncio
+async def test_hand_off_is_a_noop_once_the_run_finished_on_its_own() -> None:
+    """竞态:收口与交接之间 run 自己跑完了。CAS 必须让这次交接落空。"""
+    store = InMemoryRunStore()
+    mgr = RunManager(store, instance_id="inst-a")
+    run_id, thread_id, tenant_id = uuid4(), uuid4(), uuid4()
+    await mgr.create(run_id=run_id, thread_id=thread_id, tenant_id=tenant_id)
+    await mgr.set_status(run_id, RunStatus.RUNNING)
+    await mgr.set_status(run_id, RunStatus.SUCCESS)
+
+    assert not await mgr.hand_off(run_id)
+    row = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert row is not None and row.status is RunStatus.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_hand_off_without_a_store_reports_failure() -> None:
+    """没有 durable 行就没有别的副本能接管 —— 不能谎报交接成功。"""
+    mgr = RunManager()
+    run_id = uuid4()
+    await mgr.create(run_id=run_id, thread_id=uuid4(), tenant_id=uuid4())
+    await mgr.set_status(run_id, RunStatus.RUNNING)
+    assert not await mgr.hand_off(run_id)
+
+
+@pytest.mark.asyncio
+async def test_drain_runs_waits_for_a_run_that_finishes_on_its_own() -> None:
+    import asyncio
+
+    mgr = RunManager()
+    run_id = uuid4()
+    await mgr.create(run_id=run_id, thread_id=uuid4(), tenant_id=uuid4())
+    await mgr.set_status(run_id, RunStatus.RUNNING)
+    finished = asyncio.Event()
+
+    async def _work() -> None:
+        await asyncio.sleep(0.05)
+        finished.set()
+
+    task = asyncio.create_task(_work())
+    await mgr.attach_task(run_id, task)
+
+    hard_stopped = await mgr.drain_runs(timeout_s=5.0)
+
+    assert finished.is_set()
+    assert hard_stopped == 0, "自己跑完的不该被硬停"
+    assert task.done() and not task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_drain_runs_hard_stops_whatever_is_still_running_at_the_deadline() -> None:
+    import asyncio
+
+    mgr = RunManager()
+    run_id = uuid4()
+    await mgr.create(run_id=run_id, thread_id=uuid4(), tenant_id=uuid4())
+    await mgr.set_status(run_id, RunStatus.RUNNING)
+    cleaned_up = asyncio.Event()
+
+    async def _never_ends() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # run_agent 的兜底分支就在这里决定交接还是收成 INTERRUPTED ——
+            # 收口必须等它跑完,不能 cancel 完就走。
+            cleaned_up.set()
+            raise
+
+    task = asyncio.create_task(_never_ends())
+    await mgr.attach_task(run_id, task)
+
+    hard_stopped = await mgr.drain_runs(timeout_s=0.1)
+
+    assert hard_stopped == 1
+    assert cleaned_up.is_set(), "硬停后必须等收口写完"
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_drain_runs_returns_immediately_with_nothing_in_flight() -> None:
+    mgr = RunManager()
+    assert await mgr.drain_runs(timeout_s=30.0) == 0
