@@ -257,6 +257,10 @@ rollback_commands() {
 # hang), and from stage 3 on — when the cluster may already run the new
 # images — the rollback command is printed with it.
 stage="0 preflight"
+# B-56 — set to 1 by a stage that already printed its own, better advice
+# (today only the slow rollout). The generic "roll back with:" block then
+# stays quiet instead of contradicting it two lines later.
+advice_printed=0
 on_exit() {
     local status=$?
     if [[ "${status}" -eq 0 ]]; then
@@ -264,6 +268,9 @@ on_exit() {
     fi
     echo >&2
     echo "RELEASE FAILED at stage ${stage} (exit ${status})." >&2
+    if [[ "${advice_printed}" -eq 1 ]]; then
+        return
+    fi
     case "${stage}" in
         3* | 4* | 5* | 6*)
             echo "The cluster may already run the new images — roll back with:" >&2
@@ -277,6 +284,53 @@ prev_cp_tag="$(current_new_tag "${ACR}/control-plane")"
 prev_ui_tag="$(current_new_tag "${ACR}/admin-ui")"
 prev_proxy_tag="$(current_new_tag "${ACR}/credential-proxy")"
 readonly prev_cp_tag prev_ui_tag prev_proxy_tag
+
+# B-56 — a rollout that runs out of time is not the same thing as a failed
+# release, and the script used to print only "roll back with:" for both.
+# What actually happened once: an ACS serverless node cold-started slowly
+# enough that control-plane's startup probe budget ran out, the kubelet
+# restarted the new pod 5 times, and ~13 minutes in it came up healthy on
+# its own — smoke and canary (the two things that can actually judge the
+# release) were skipped, and following the printed advice would have rolled
+# back a good release. The old ReplicaSet serves the whole time
+# (``maxUnavailable: 0``), so the honest output is the evidence plus how to
+# read it, not a verdict.
+rollout_diagnostics() {
+    local d="$1" name="${1##*/}"
+    echo >&2
+    echo "---- ${d}: rollout did not finish within ${ROLLOUT_TIMEOUT} ----" >&2
+    kubectl -n expert-work get "${d}" -o wide >&2 || true
+    # Pods of a Deployment are named "<deploy>-<rs hash>-<pod hash>", so a
+    # name-prefix filter needs no label lookup and works for every workload
+    # this script rolls.
+    kubectl -n expert-work get pods -o wide 2>/dev/null | grep -E "^(NAME|${name}-)" >&2 || true
+    kubectl -n expert-work get events --sort-by=.lastTimestamp 2>/dev/null |
+        grep -F "${name}-" | tail -15 >&2 || true
+}
+
+rollout_verdict_help() {
+    cat >&2 <<'EOF'
+
+A rollout did not finish in time. That alone does NOT mean the release is bad:
+with maxUnavailable: 0 the previous pods keep serving until the new ones are
+Ready, and a cold ACS node can blow the startup-probe budget and restart a new
+pod several times before it settles (B-56).
+
+Read the block above, then decide:
+  * new pod Running/ContainerCreating, RESTARTS climbing, old pods still Ready
+      -> still coming up. Wait it out, then finish the release by hand:
+EOF
+    printf '           kubectl -n expert-work rollout status deploy/control-plane --timeout=%s\n' \
+        "${ROLLOUT_TIMEOUT}" >&2
+    cat >&2 <<EOF
+           ${SCRIPT_DIR}/smoke.sh ${env_name}
+         (smoke and canary were skipped — the release is unverified until they run)
+  * new pod CrashLoopBackOff / ImagePullBackOff / Error, or events show the
+    image or a mount failing
+      -> real failure. Roll back:
+EOF
+    rollback_commands >&2
+}
 
 # ------------------------------------------------------------- 1. build+push
 stage="1 build-push"
@@ -340,9 +394,20 @@ if [[ "${dry_run}" -eq 0 ]]; then
         echo "kubectl listed no Deployments in expert-work — nothing to wait for is not a rollout." >&2
         exit 1
     fi
+    slow=()
     for d in ${deployments}; do
-        kubectl -n expert-work rollout status "${d}" --timeout="${ROLLOUT_TIMEOUT}"
+        if ! kubectl -n expert-work rollout status "${d}" --timeout="${ROLLOUT_TIMEOUT}"; then
+            slow+=("${d}")
+        fi
     done
+    if [[ ${#slow[@]} -gt 0 ]]; then
+        for d in "${slow[@]}"; do
+            rollout_diagnostics "${d}"
+        done
+        rollout_verdict_help
+        advice_printed=1
+        exit 1
+    fi
 else
     echo "DRY-RUN> wait job/migrate + rollout status (all deployments)"
 fi

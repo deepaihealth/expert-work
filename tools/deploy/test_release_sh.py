@@ -47,6 +47,25 @@ case " $* " in
         ;;
     *"jsonpath={.data.api-key}"*) printf 'c2VjcmV0' ;;              # base64 "secret"
     *"jsonpath={.data.agent-code}"*) printf 'cmVsZWFzZS1jYW5hcnk=' ;;  # base64 "release-canary"
+    *" get deployment.apps/"*" -o wide "*)
+        printf 'NAME            READY   UP-TO-DATE   AVAILABLE\n'
+        printf 'control-plane   2/3     1            2\n'
+        ;;
+    *" get pods -o wide "*)
+        # One old pod still serving, one new pod restarting — the shape
+        # B-56 is about (slow, not broken).
+        printf 'NAME                           READY   STATUS    RESTARTS\n'
+        printf 'control-plane-old11111-aaaaa   1/1     Running   0\n'
+        printf 'control-plane-new22222-bbbbb   0/1     Running   4\n'
+        printf 'unrelated-pod-zzzzz            1/1     Running   0\n'
+        ;;
+    *" get events "*)
+        printf 'TYPE      REASON      OBJECT                         MESSAGE\n'
+        printf 'Warning   Unhealthy   control-plane-new22222-bbbbb   %s\n' \
+            'Startup probe failed: connection refused'
+        printf 'Warning   Unhealthy   unrelated-pod-zzzzz            %s\n' \
+            'noise that must not be shown'
+        ;;
     *" get pods "*) printf 'True||control-plane-stub\n' ;;
     *" exec -i "*)
         cat >/dev/null
@@ -223,6 +242,51 @@ def test_rollout_failure_names_stage_and_skips_smoke(harness: Harness) -> None:
     assert r.returncode != 0
     assert "RELEASE FAILED at stage 4 rollout" in r.stderr
     assert "smoke.sh" not in harness.calls()
+    assert "exec -i" not in harness.calls(), "canary must not run after a timed-out rollout"
+
+
+def test_slow_rollout_prints_the_evidence_not_just_a_rollback_command(
+    harness: Harness,
+) -> None:
+    """B-56 — the one time this fired for real, the rollout was slow and the
+    release was good: old pods kept serving, the new pod settled ~13min in.
+    The script printed only "roll back with:", and following it would have
+    rolled back a healthy release. Now it must print what it saw."""
+    r = harness.run(STUB_FAIL="rollout")
+    assert r.returncode != 0
+    assert "rollout did not finish within 600s" in r.stderr
+    # The evidence: deployment line, both pods of that deployment, its events.
+    assert "control-plane-old11111-aaaaa" in r.stderr
+    assert "control-plane-new22222-bbbbb" in r.stderr
+    assert "Startup probe failed: connection refused" in r.stderr
+    # ...and only that deployment's — a name-prefix filter, not the whole cluster.
+    assert "unrelated-pod-zzzzz" not in r.stderr
+    assert "noise that must not be shown" not in r.stderr
+    # The verdict is the operator's, and both branches are spelled out.
+    assert "does NOT mean the release is bad" in r.stderr
+    assert "still coming up" in r.stderr
+    assert "CrashLoopBackOff" in r.stderr
+    assert "the release is unverified until they run" in r.stderr
+    assert f"tools/deploy/rollback.sh test {PREV_TAG}" in r.stderr
+
+
+def test_slow_rollout_suppresses_the_generic_roll_back_advice(harness: Harness) -> None:
+    """Otherwise the EXIT trap contradicts the tailored block two lines
+    later: "read the evidence and decide" followed by "roll back with:"."""
+    r = harness.run(STUB_FAIL="rollout")
+    assert "The cluster may already run the new images" not in r.stderr
+    # Exactly one rollback block, the one inside the tailored advice.
+    assert r.stderr.count(f"tools/deploy/rollback.sh test {PREV_TAG}") == 1
+
+
+def test_every_deployment_is_probed_before_giving_up(harness: Harness) -> None:
+    """``set -e`` used to kill the loop on the first timed-out rollout, so a
+    release where two deployments were slow reported only the first one."""
+    r = harness.run(STUB_FAIL="rollout")
+    assert r.returncode != 0
+    assert harness.calls().count("rollout status") == 2
+    assert "deployment.apps/control-plane: rollout did not finish" in r.stderr
+    assert "deployment.apps/admin-ui: rollout did not finish" in r.stderr
 
 
 def test_deploy_listing_failure_is_not_swallowed(harness: Harness) -> None:

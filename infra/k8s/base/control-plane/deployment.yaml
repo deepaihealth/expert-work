@@ -61,12 +61,20 @@ spec:
           # lifecycle state, startup is true only once Lifecycle.mark_ready
           # fires (gates live/ready until the app has actually finished
           # boot, per subsystems/28 § 3.1).
+          # B-56 — 90 x 2s = 180s, was 30 x 2s = 60s. On a cold ACS
+          # serverless node the app has taken longer than 60s just to bind
+          # (probe failures were all `connection refused`, not crashes), so
+          # the kubelet restarted a perfectly good pod 5 times before it
+          # settled ~13 minutes in — and `rollout status` gave up first.
+          # Raising this only delays how fast a genuinely broken image
+          # reaches CrashLoopBackOff; liveness (3 x 10s) still owns the
+          # post-startup window.
           startupProbe:
             httpGet:
               path: /healthz/startup
               port: http
             periodSeconds: 2
-            failureThreshold: 30
+            failureThreshold: 90
           livenessProbe:
             httpGet:
               path: /healthz/live
