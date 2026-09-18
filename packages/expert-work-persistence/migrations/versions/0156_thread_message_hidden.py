@@ -13,6 +13,12 @@
 段,而 B-67 还没上过生产。测试环境有这样的行,它们会在 sweep 下次重扫该线程时
 被改写成真值(``sync_thread`` 按 ``(thread_id, seq)`` 幂等覆盖)。
 
+**⛔ 勘误(2026-09-18,同日):上面那段划线的理由是错的,别照它推理。** 写隐藏消息
+的源头有三个,除 B-67 外还有 CM-1 的 ``<recovery-advisory>``(#497)与循环检测的
+``<system-reminder>``(#1072),**两者早就在生产上跑**,所以生产上确实有存量脚手架
+行。而且「下次重扫」对**一直没有新活动的老线程不会发生**(sweep 的队列是「没有水位
+行 or 有新活动」)。修法见 ``0157_thread_mirror_resweep``。
+
 Revision ID: 0156_thread_message_hidden
 Revises: 0155_sandbox_instance_layout
 """
