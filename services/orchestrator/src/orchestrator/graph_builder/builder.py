@@ -1349,11 +1349,11 @@ def build_react_graph(
         # 只记 server / 工具名 / 参数名,一个值都不记(这些值就是客户的真实资料)。
         for unmatched in tool_registry.unmatched_arg_bindings():
             logger.warning(
-                "mcp.arg_binding_unmatched server=%s tool=%r params=%s tool_found=%s",
+                "mcp.arg_binding_unmatched server=%s tool=%r params=%s reason=%s",
                 unmatched.server,
                 unmatched.tool,
                 list(unmatched.params),
-                unmatched.tool_found,
+                unmatched.reason,
             )
 
         # Stream J.8 (Mini-ADR J-24) — approval gate. Two re-entrant paths:

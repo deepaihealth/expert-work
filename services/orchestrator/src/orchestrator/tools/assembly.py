@@ -261,11 +261,34 @@ async def build_tool_registry(
     #     在它眼里像是「目录里没有」,其实另一条目刚把它绑得好好的。
     # 谎报比不报更糟:保存时的告警是这套机制加进来的全部价值,配置的人会照着它去
     # 「修」一条从来没坏的绑定。所以判据是「有没有落地」,不是「这一遍有没有剩下」。
+    # B-65 —— 「落过地」还不等于「现在还活着」。``mcp_tool_name`` 把非法字符折成 ``_``
+    # 并截断到 64 字符,``register`` / ``bind_tool_args`` 又按那个名字覆盖 —— 两个工具
+    # 折成同一个 wire 名时,后注册的会把前者的绑定从表里清掉。所以判定分两步:先看落没
+    # 落过地(``tool_missing``),再拿落地时的那个 wire 名回查活着的绑定表(``name_collision``)。
+    # 把撞名报成「目录里没有这个工具」是假话:工具明明在。
     landed = registry.landed_arg_bindings()
+    live = registry.arg_bindings()
+    # 一条绑定的参数**全部**漂没了时,``bind_tool_args`` 收到空表、同样会清掉那一项 ——
+    # 那不是撞名,而且上面已经报过 ``params_absent`` 了。同一条绑定只说一次。
+    configured_args: dict[tuple[str, str], set[str]] = {}
+    for b in all_arg_bindings:
+        configured_args.setdefault((b.server, b.tool), set()).update(b.args)
+    fully_drifted = {
+        (u.server, u.tool)
+        for u in registry.unmatched_arg_bindings()
+        if u.reason == "params_absent"
+        and set(u.params) == configured_args.get((u.server, u.tool), set())
+    }
     for binding in all_arg_bindings:
-        if (binding.server, binding.tool) not in landed:
+        key = (binding.server, binding.tool)
+        wire_name = landed.get(key)
+        if wire_name is None:
             registry.note_unmatched_arg_binding(
-                binding.server, binding.tool, tuple(binding.args), tool_found=False
+                binding.server, binding.tool, tuple(binding.args), reason="tool_missing"
+            )
+        elif wire_name not in live and key not in fully_drifted:
+            registry.note_unmatched_arg_binding(
+                binding.server, binding.tool, tuple(binding.args), reason="name_collision"
             )
     _register_base_capabilities(registry, tool_env, skill_seed_files)
     _register_subagents(registry, subagents, tool_env, subagent_depth)

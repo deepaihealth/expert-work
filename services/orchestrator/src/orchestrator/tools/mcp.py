@@ -1011,14 +1011,10 @@ async def register_mcp_tools(
         if allow_tools is not None and tool_def.name not in allow_tools:
             continue
         bound = pending_bindings.pop(tool_def.name, None) or {}
+        # B-65 —— 这条绑定有没有落在一个真实工具上,要在 ``absent`` 把参数删空之前定。
+        binding_landed = bool(bound)
         dispatch_schema: Mapping[str, Any] | None = None
         if bound:
-            # 这条绑定确实落在一个真实工具上。只登记「落了」,不在这里判「没落」——
-            # 一份 manifest 可以有多个 mcp 条目,绑定表是跨条目并起来的,兄弟条目的
-            # ``allow_tools`` 会把别人绑的工具挡在它那一次循环之外。拿单次注册的剩余
-            # 项当「目录里没这个工具」的证据,就会对一条好好落了的绑定谎报(复评 N-1)。
-            # 答案只有在所有条目都轮完之后才成立,判在 ``build_tool_registry`` 里。
-            registry.note_landed_arg_binding(server_name, tool_def.name)
             absent = unbindable_params(tool_def.input_schema, bound)
             if absent:
                 # 上游改了接口,绑定指向一个不存在的参数。不阻断 run:这个 agent
@@ -1033,7 +1029,7 @@ async def register_mcp_tools(
                 # 与「整条没匹配上」走同一条通道:只有一行 orchestrator 日志的话,
                 # 配置的人在保存面上什么也看不到(spec §5.4 说这条「按未命中处理」)。
                 registry.note_unmatched_arg_binding(
-                    server_name, tool_def.name, tuple(absent), tool_found=True
+                    server_name, tool_def.name, tuple(absent), reason="params_absent"
                 )
                 for param in absent:
                     del bound[param]
@@ -1053,6 +1049,17 @@ async def register_mcp_tools(
         registry.register(expert_work_tool, deferred=deferred, source=f"mcp:{server_name}")
         # 无条件调:空 ``bound`` 会清掉同名旧表项(见 ``bind_tool_args``)。
         registry.bind_tool_args(expert_work_tool.spec.name, bound)
+        if binding_landed:
+            # 只登记「落了」,不在这里判「没落」—— 一份 manifest 可以有多个 mcp 条目,
+            # 绑定表是跨条目并起来的,兄弟条目的 ``allow_tools`` 会把别人绑的工具挡在
+            # 它那一次循环之外。拿单次注册的剩余项当「目录里没这个工具」的证据,就会
+            # 对一条好好落了的绑定谎报(复评 N-1)。答案只有在所有条目都轮完之后才
+            # 成立,判在 ``build_tool_registry`` 里。
+            #
+            # B-65 —— 记的是**注册用的那个键**(``spec.name``),不是在这里重算一遍
+            # 折叠规则:两个工具折成同一个 wire 名时,后注册的会把前者的绑定清掉,
+            # 判定侧拿这个名回查 ``arg_bindings()`` 才看得见那次顶替。
+            registry.note_landed_arg_binding(server_name, tool_def.name, expert_work_tool.spec.name)
         registered.append(expert_work_tool.spec.name)
     logger.info("mcp.registered server=%s tools=%s", server_name, registered)
     return registered
