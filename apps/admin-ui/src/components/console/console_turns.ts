@@ -123,6 +123,7 @@ export function buildConsoleTurns(args: {
       runId: h.runId,
       loadState: load.state === "live" ? "done" : load.state,
       fallbackLines: h.fallbackLines,
+      platformLines: h.platformLines,
       tokens: h.tokens,
       timing: null,
       createdAt: h.createdAt,
@@ -143,6 +144,8 @@ export function buildConsoleTurns(args: {
       runId: runIdOf(turn.events),
       loadState: "done",
       fallbackLines: [],
+      // B-73 ② —— 本会话刚跑出来的一轮走 SSE,拿不到也不需要审计视图的隐藏行。
+      platformLines: [],
       tokens: null,
       timing: args.timings[turn.id] ?? null,
       createdAt: null,

@@ -30,6 +30,7 @@ function makeTurn(over: Partial<ConsoleTurn> = {}): ConsoleTurn {
     runId: key,
     loadState: "done",
     fallbackLines: [],
+  platformLines: [],
     tokens: null,
     timing: null,
     createdAt: null,

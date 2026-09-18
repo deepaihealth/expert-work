@@ -26,7 +26,16 @@ class InMemoryThreadMessageStore(ThreadMessageStore):
         synced_at: datetime,
     ) -> None:
         for turn in turns:
-            self._turns.setdefault((thread_id, turn.seq), (tenant_id, turn))
+            # ``setdefault`` 保住 SQL 侧 DO NOTHING 的语义;``hidden`` 与 SQL 侧的
+            # DO UPDATE 对齐 —— 存量行上它是默认值而不是真值,重扫时要覆盖回来。
+            existing = self._turns.get((thread_id, turn.seq))
+            if existing is None:
+                self._turns[thread_id, turn.seq] = (tenant_id, turn)
+            elif existing[1].hidden != turn.hidden:
+                self._turns[thread_id, turn.seq] = (
+                    existing[0],
+                    replace(existing[1], hidden=turn.hidden),
+                )
         self._sync[thread_id] = (tenant_id, synced_at, len(turns))
 
     async def mark_superseded(
@@ -57,6 +66,9 @@ class InMemoryThreadMessageStore(ThreadMessageStore):
         out: set[UUID] = set()
         for (thread_id, _seq), (row_tenant, turn) in self._turns.items():
             if tenant_id is not None and row_tenant != tenant_id:
+                continue
+            # B-73 ① —— 平台脚手架不参与匹配,与 SQL 侧同一道谓词。
+            if turn.hidden:
                 continue
             if needle in turn.content.lower():
                 out.add(thread_id)

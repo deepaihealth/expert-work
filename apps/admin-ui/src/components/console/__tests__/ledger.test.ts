@@ -49,6 +49,7 @@ function turnOf(over: Partial<ConsoleTurn> & Pick<ConsoleTurn, "key" | "seq">): 
     runId: `run-${over.seq}`,
     loadState: "done",
     fallbackLines: [],
+    platformLines: [],
     tokens: null,
     timing: null,
     createdAt: null,

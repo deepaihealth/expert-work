@@ -48,6 +48,7 @@ function makeConsoleTurn(
     runId: "run-1",
     loadState: "done",
     fallbackLines: [],
+  platformLines: [],
     tokens: null,
     timing: null,
     createdAt: null,

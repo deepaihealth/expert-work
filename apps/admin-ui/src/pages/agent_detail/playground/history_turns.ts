@@ -46,6 +46,12 @@ export interface HistoryTurn {
   key: string;
   input: string;
   fallbackLines: FallbackLine[];
+  /** B-73 ② —— 这一轮里平台自己贴的隐藏行(B-67「本轮输入」段、恢复建议)。
+   *  **只有跨租户审计视图拿得到**(后端只在那一路带 ``hidden: true``);同租户
+   *  视图恒为空数组。它们既不是这一轮的输入、也不是回复的一部分,所以单独一份,
+   *  由 ``TurnBlock`` 渲染成一段标了「平台自动生成」的折叠块 —— 此前是直接丢掉,
+   *  于是审计视图特意要来的忠实记录在界面上又不见了。 */
+  platformLines: string[];
   runId: string;
   status: string;
   tokens: RunTokens | null;
@@ -70,6 +76,12 @@ export interface HistoryTurn {
  *  agent had said it. */
 function isInputRow(m: HistoryMessage): boolean {
   return m.role === "user" && m.hidden !== true;
+}
+
+/** 平台自己贴进检查点的行。只有 user 角色会被标 ``hidden``(B-67 的「本轮输入」
+ *  段、CM-1 的恢复建议都是 HumanMessage),助手行不在其列。 */
+function isPlatformRow(m: HistoryMessage): boolean {
+  return m.role === "user" && m.hidden === true;
 }
 
 /** Group the messages by their owning run, or ``null`` if grouping them is
@@ -130,6 +142,7 @@ export function buildHistoryTurns(
         fallbackLines: own
           .filter((m) => m.role !== "user")
           .map((m) => ({ text: m.content, channel: m.channel ?? null })),
+        platformLines: own.filter(isPlatformRow).map((m) => m.content),
         runId: r.runId,
         status: r.status,
         tokens: r.tokens,
@@ -142,16 +155,21 @@ export function buildHistoryTurns(
     });
   }
 
-  const pairs: { input: string; answers: FallbackLine[] }[] = [];
+  const pairs: { input: string; answers: FallbackLine[]; platform: string[] }[] = [];
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i];
     if (!isInputRow(m)) continue;
     const answers: FallbackLine[] = [];
+    const platform: string[] = [];
     for (let j = i + 1; j < messages.length && !isInputRow(messages[j]); j += 1) {
-      if (messages[j].role === "user") continue; // hidden scaffolding
+      if (isPlatformRow(messages[j])) {
+        platform.push(messages[j].content);
+        continue;
+      }
+      if (messages[j].role === "user") continue; // 不认识的 user 行,照旧跳过
       answers.push({ text: messages[j].content, channel: messages[j].channel ?? null });
     }
-    pairs.push({ input: m.content, answers });
+    pairs.push({ input: m.content, answers, platform });
   }
   // D-5 — tolerate a TRAILING contiguous block of non-terminal runs (a
   // running new turn, a paused approval, or paused + its just-spawned
@@ -174,6 +192,7 @@ export function buildHistoryTurns(
     key: r.runId,
     input: i < pairs.length ? pairs[i].input : "",
     fallbackLines: i < pairs.length ? pairs[i].answers : [],
+    platformLines: i < pairs.length ? pairs[i].platform : [],
     runId: r.runId,
     status: r.status,
     tokens: r.tokens,

@@ -234,3 +234,31 @@ def test_extract_turns_projects_superseded_by_and_tombstone() -> None:
             [stone, marked, HumanMessage(content="U2")], include_superseded=False
         )
     ] == [2]
+
+
+# --------------------------------------------------------------------- B-73 ①
+
+
+def test_hidden_is_carried_onto_the_turn_so_the_mirror_can_filter_search() -> None:
+    """B-73 ① —— 镜像抄的就是这个 ``MessageTurn``,搜索按 ``hidden`` 过滤。
+
+    这一位在这里填错(恒 False / 恒 True),下游两个 store 的谓词照样绿 —— 它们
+    收到的输入本来就是测试自己造的。所以判据必须在**这一层**:从真实的
+    ``additional_kwargs`` 认出脚手架。
+    """
+    raw = [
+        HumanMessage(content="做一版海报"),
+        HumanMessage(
+            content="[本轮输入] org_logo",
+            additional_kwargs={"expert_work_hide_from_ui": True},
+        ),
+        AIMessage(content="好的"),
+    ]
+    turns = extract_turns(raw, include_hidden=True)
+    assert [(t.seq, t.hidden) for t in turns] == [(0, False), (1, True), (2, False)]
+
+
+def test_hidden_is_false_when_nothing_is_hidden() -> None:
+    """反向:这一位不能恒为真,否则整条会话都从搜索里消失。"""
+    raw = [HumanMessage(content="做一版海报"), AIMessage(content="好的")]
+    assert [t.hidden for t in extract_turns(raw, include_hidden=True)] == [False, False]

@@ -46,12 +46,20 @@ class SqlThreadMessageStore(ThreadMessageStore):
                             "tenant_id": tenant_id,
                             "role": t.role,
                             "content": t.content,
+                            "hidden": t.hidden,
                         }
                         for t in turns
                     ]
                 )
+                # ``hidden`` 是**唯一**在冲突时也写的列。其余列在给定 ``seq`` 上
+                # 永不变(检查点的 ``messages`` 通道只追加),所以照旧 DO NOTHING;
+                # 而 ``hidden`` 是 B-73 ① 新加的一列,存量行上是默认的 false 而不是
+                # 真值,只有重扫时覆盖才收敛得回来。
                 await session.execute(
-                    stmt.on_conflict_do_nothing(index_elements=["thread_id", "seq"])
+                    stmt.on_conflict_do_update(
+                        index_elements=["thread_id", "seq"],
+                        set_={"hidden": stmt.excluded.hidden},
+                    )
                 )
             mark = pg_insert(ThreadMessageSyncRow).values(
                 thread_id=thread_id,
@@ -99,7 +107,11 @@ class SqlThreadMessageStore(ThreadMessageStore):
     ) -> set[UUID]:
         stmt = (
             select(ThreadMessageRow.thread_id)
-            .where(ThreadMessageRow.content.ilike(like_contains(q), escape="\\"))
+            .where(
+                ThreadMessageRow.content.ilike(like_contains(q), escape="\\"),
+                # B-73 ① —— 平台脚手架不参与匹配(见 ``ThreadMessageStore.search_thread_ids``)。
+                ThreadMessageRow.hidden.is_(False),
+            )
             .distinct()
             .limit(limit)
         )

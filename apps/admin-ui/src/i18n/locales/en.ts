@@ -417,6 +417,8 @@ export interface TranslationKeys {
     superseded_tag: string;
     superseded_link: string;
     tombstone_label: string;
+    platform_rows_tag: string;
+    platform_rows_hint: string;
   };
   skills_tab: {
     title: string;
@@ -3629,6 +3631,8 @@ const en: TranslationKeys = {
     superseded_tag: "Superseded",
     superseded_link: "→ replaced by run {{runId}}",
     tombstone_label: "content cleared",
+    platform_rows_tag: "platform-generated",
+    platform_rows_hint: "{{count}} platform block(s) — sent to the model, not said by the user",
   },
   skills_tab: {
     title: "Skills authored by this agent",
