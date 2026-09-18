@@ -170,6 +170,33 @@ async def test_safe_run_is_handed_off_instead_of_interrupted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handoff_counter_counts_only_real_handoffs() -> None:
+    """``expert_work_run_handed_off_total`` 是滚动发布期间唯一的正向信号。
+
+    刻意做成独立计数器而不是 ``session_outcome`` 的新标签值:那个词表必须闭合在
+    对外四值里(`test_end_status_vocabulary_round_trip` 是那道闸),而「交接」不是
+    终局 —— 这一轮没结束,它在别的副本上继续。
+    """
+    from orchestrator.sse import _run_handed_off_total
+
+    def _value() -> float:
+        return _run_handed_off_total._value.get()  # type: ignore[attr-defined]
+
+    before = _value()
+    await _run_until_shutdown(store=InMemoryRunStore(), graph=_SlowGraph(state_values=_clean_tail()))
+    after_safe = _value()
+    assert after_safe == before + 1
+
+    # 不可交接的那一轮不该记数。
+    await _run_until_shutdown(
+        store=InMemoryRunStore(),
+        graph=_SlowGraph(state_values=_dangling_tail("send_email")),
+        tool_replay_safe=lambda name: name != "send_email",
+    )
+    assert _value() == after_safe
+
+
+@pytest.mark.asyncio
 async def test_run_with_unsafe_dangling_tool_is_not_handed_off() -> None:
     """「只交接安全的」:悬空批次里有不可重放的工具 → 照旧收成 INTERRUPTED。"""
     store = InMemoryRunStore()

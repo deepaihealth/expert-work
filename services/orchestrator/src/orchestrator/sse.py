@@ -178,6 +178,15 @@ _session_duration_seconds = expert_work_histogram(
 # A failure to mirror a frame is logged + counted; the SSE stream is
 # NOT blocked (graceful degradation — better miss-an-event than fail the
 # user-visible run).
+#: B-80 —— 优雅关机把这一轮交给别的副本的次数。滚动发布期间应当 > 0;
+#: 平时恒 0(只在 ``run_manager.shutting_down`` 之后才可能自增)。
+#: 刻意做成独立计数器而不是 ``session_outcome`` 上的新标签值:那个词表必须闭合在
+#: 对外四值里(``test_end_status_vocabulary_round_trip`` 是那道闸),而「交接」根本
+#: 不是终局 —— 这一轮没有结束,它在别的副本上继续。
+_run_handed_off_total = expert_work_counter(
+    "expert_work_run_handed_off_total",
+    "Runs whose ownership this replica handed off at graceful shutdown (B-80).",
+)
 _run_event_persist_errors = expert_work_counter(
     "expert_work_run_event_persist_errors_total",
     "RunEventStore.append failures during run_agent dual-write.",
@@ -650,6 +659,7 @@ async def run_agent(
             return False
         if not await run_manager.hand_off(run_id):
             return False
+        _run_handed_off_total.inc()
         logger.info("run_agent.handed_off run_id=%s", run_id)
         return True
 
@@ -817,7 +827,6 @@ async def run_agent(
         # 只有关机那一路能交接 —— 三道闸在 ``_try_hand_off`` 内自检。
         if record.abort_event.is_set() and await _try_hand_off():
             handed_off = True
-            session_outcome = "handoff"
             logger.info("run_agent.cancelled_for_handoff run_id=%s", run_id)
             return
 
@@ -921,7 +930,6 @@ async def run_agent(
         # 图在步骤边界抛 ``RunCancelledError``,在这里交出所有权。
         handed_off = await _finish_cancelled()
         if handed_off:
-            session_outcome = "handoff"
             logger.info("run_agent.cancelled_for_handoff run_id=%s", run_id)
             return
         logger.info("run_agent.cancelled_cooperatively run_id=%s", run_id)
@@ -954,8 +962,6 @@ async def run_agent(
         # 决定是交接还是照旧 INTERRUPTED;不可交接(悬空批次里有不可重放的
         # 工具)就退回原行为,这正是「只交接安全的」。
         handed_off = await _finish_cancelled()
-        if handed_off:
-            session_outcome = "handoff"
         logger.info("run_agent.cancelled run_id=%s handed_off=%s", run_id, handed_off)
         raise
     except MaxStepsExceededError as exc:
