@@ -206,12 +206,17 @@ async def test_pending_selection_backfill_and_activity_sql(sql_stores: Fixture) 
         # empty thread: no run at all — never enters the queue.
         await threads.create(thread_id=uuid4(), tenant_id=tenant, created_by="u")
 
-        pending = await messages.pending_thread_ids(limit=10)
-        ids = [t for t, _ in pending]
+        # ``pending_thread_ids`` 是**全局**的(sweep 按设计要扫所有租户),而这是那个
+        # session 级共享库 —— 别的测试文件留下的线程也在里面。只对本用例自己的租户
+        # 下断言,否则断的是别人的数据:原来写成全局精确集合,一直绿只是因为碰巧没人
+        # 留下待扫线程,迁移 0157 在共享库上清了一次水位就把它打红了。
+        pending = await messages.pending_thread_ids(limit=100)
+        mine = [(t, owner) for t, owner in pending if owner == tenant]
+        ids = [t for t, _ in mine]
         assert set(ids) == {backfill, fresh}
         # Fresh activity is ordered before backfill so it can't be starved.
         assert ids[0] == fresh
-        assert dict(pending)[backfill] == tenant
+        assert dict(mine)[backfill] == tenant
 
         # Mirroring the backfill thread removes it from the queue.
         await messages.sync_thread(thread_id=backfill, tenant_id=tenant, turns=[], synced_at=now)

@@ -22,6 +22,12 @@
 代价可量:sweep 每 60 秒一批 200 个线程,一万个线程约 50 分钟收敛;窗口期内镜像行
 一行不少(只删水位表),搜索照常工作。
 
+**这是本仓库少见的「有数据副作用」的迁移**,和加列不一样,重跑一次就再清一次水位
+(``downgrade`` 是空转,所以 ``downgrade -1 && upgrade head`` 会把 ``upgrade`` 再执行
+一遍)。后果只是多触发一次全量重扫,不丢数据;但 CI 里那条通用的往返用例
+(``test_sql_user_upload_store.py::test_migration_downgrade_then_upgrade``)跑在
+**session 级共享库**上,于是本迁移在测试期间确实会在共享库上执行两次。
+
 Revision ID: 0157_thread_mirror_resweep
 Revises: 0156_thread_message_hidden
 """
