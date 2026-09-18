@@ -519,9 +519,11 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.middleware import make_langfuse_client
 from expert_work.runtime.runs import (
+    DrainObserver,
     InMemoryRunEventStore,
     InMemoryRunStore,
     RunEventStore,
+    RunRecord,
     RunStore,
     SqlRunEventStore,
     SqlRunStore,
@@ -2378,7 +2380,10 @@ def create_app(
                 # B-80 步骤 3 —— worker 都停了(不会再有新的 run 起来),
                 # 现在等在跑的收尾。见上方顺序说明。
                 await run_manager_for_drain.drain_runs(
-                    timeout_s=resolved_settings.run_drain_timeout_s
+                    timeout_s=resolved_settings.run_drain_timeout_s,
+                    on_event=_drain_audit_observer(
+                        resolved_audit, run_manager_for_drain.instance_id
+                    ),
                 )
                 # Stream HX-7 — drain the Langfuse SDK's background queue
                 # before the process exits; the recording stub has no
@@ -3072,6 +3077,46 @@ def _build_default_jwt_verifier(settings: Settings) -> JWTVerifier:
         audience=settings.oidc_audience,
         leeway_s=settings.oidc_jwt_leeway_s,
     )
+
+
+def _drain_audit_observer(audit: AuditLogger, instance_id: str) -> DrainObserver:
+    """B-80 —— 把优雅关机的排空落进审计。**与交接 / 接手两侧同形**。
+
+    三条记录用的是同一组键(``action=run:failover``、``resource_type="run"``、
+    ``resource_id=<run_id>``),只有 ``reason`` 不同,所以按 run 查一次就能看到
+    整条时间线:
+
+    * ``drain_waiting``  —— 本副本开始等它收尾(这里)
+    * ``handed_off``     —— 它可安全重放,所有权交出去了(``sse._emit_handoff_audit``)
+    * ``reclaimed``      —— 别的副本接手了(``OrphanSweep._emit_audit``)
+    * ``drain_hard_stopped`` —— 到点还没收,被硬停(这里)
+
+    **为什么非落库不可**:关机期间 Prometheus 结构性采不到(pod 一进入 terminating
+    就从 Endpoints 摘除,而排空发生在那之后),pod 日志随 pod 回收。2026-09-18 测试
+    环境实况:一条对话在跑,旧 pod 一直 Terminating 把 smoke 判红、金丝雀因此被跳过,
+    而事后**没有任何持久记录**能回答「它当时在等谁」。
+    """
+
+    async def observe(event: str, records: list[RunRecord], timeout_s: float) -> None:
+        for record in records:
+            await audit_emit(
+                audit,
+                tenant_id=record.tenant_id,
+                actor_id="system",
+                action=AuditAction.RUN_FAILOVER,
+                resource_type="run",
+                resource_id=str(record.run_id),
+                result=AuditResult.SUCCESS,
+                reason=event,
+                details={
+                    "thread_id": str(record.thread_id),
+                    "instance": instance_id,
+                    "in_flight": len(records),
+                    "drain_timeout_s": timeout_s,
+                },
+            )
+
+    return observe
 
 
 def _build_default_mtls_verifier(settings: Settings) -> MTLSVerifier | None:
