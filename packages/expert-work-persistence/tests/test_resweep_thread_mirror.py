@@ -32,6 +32,7 @@ pytestmark = pytest.mark.integration
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _DB = "thread_mirror_resweep_test"
 _BEFORE = "0156_thread_message_hidden"
+_ADVISORY = "<recovery-advisory>工具失败了</recovery-advisory>"
 
 
 def _sync_dsn(container: PostgresContainer, database: str | None = None) -> str:
@@ -74,9 +75,11 @@ def _seed_mirrored_thread(conn: psycopg.Connection, *, tenant: UUID) -> UUID:
         """,
         (thread_id, tenant, now, now),
     )
-    for seq, (role, content) in enumerate(
-        [("user", "帮我排一下这周的随访"), ("assistant", "<recovery-advisory>工具失败了</recovery-advisory>")]
-    ):
+    rows = [
+        ("user", "帮我排一下这周的随访"),
+        ("assistant", _ADVISORY),
+    ]
+    for seq, (role, content) in enumerate(rows):
         conn.execute(
             """
             INSERT INTO thread_message (thread_id, seq, tenant_id, role, content, created_at)
@@ -124,6 +127,4 @@ def test_resweep_drops_watermarks_and_keeps_the_mirror(fresh_db: str) -> None:
     assert watermarks is not None
     assert watermarks[0] == 0, "水位行还在 —— 这两条线程不会被 sweep 重选,hidden 永远停在默认值"
     assert len(mirrored) == 4, "镜像行被删了 —— 审计要看的忠实记录不能拿来换一个干净的搜索"
-    assert [row[2] for row in mirrored].count(
-        "<recovery-advisory>工具失败了</recovery-advisory>"
-    ) == 2, "镜像内容被改写了"
+    assert [row[2] for row in mirrored].count(_ADVISORY) == 2, "镜像内容被改写了"
