@@ -37,6 +37,9 @@ export interface ConsoleTurn {
   loadState: LoadState;
   /** Live turns are always ``[]``. */
   fallbackLines: FallbackLine[];
+  /** B-73 ② —— 这一轮里平台自己贴的隐藏行(B-67「本轮输入」段、恢复建议)。
+   *  只有跨租户审计视图拿得到;同租户视图与 live turns 恒 ``[]``。 */
+  platformLines: string[];
   /** History turns' persisted rollup; live turns are always ``null``. */
   tokens: RunTokens | null;
   /** Set only for turns this session actually streamed live. */

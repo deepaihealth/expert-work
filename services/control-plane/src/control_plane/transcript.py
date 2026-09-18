@@ -30,7 +30,7 @@ from uuid import UUID
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from expert_work.common.conversation_channel import visible_turns
+from expert_work.common.conversation_channel import is_hidden, visible_turns
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import MessageTurn
 
@@ -113,6 +113,10 @@ def extract_turns(
                 run_id=_parse_stamp_run_id(ak),
                 superseded_by=_parse_uuid_or_none(turn.superseded_by),
                 tombstone=turn.tombstone,
+                # B-73 ① —— 镜像照抄脚手架(审计要看得见),但内容搜索按这一位过滤。
+                # 只有 ``include_hidden=True`` 的调用方拿得到这类轮次,所以这里取到
+                # 的 ``True`` 一定来自忠实读。
+                hidden=is_hidden(raw_messages[turn.seq]),
             )
         )
     return out

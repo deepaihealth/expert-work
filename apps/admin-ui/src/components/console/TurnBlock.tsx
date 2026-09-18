@@ -28,6 +28,7 @@ import { ApprovalGate } from "../turn/ApprovalGate";
 import type { Turn } from "../turn/types";
 import { AnswerBubble } from "./AnswerBubble";
 import { liveSyntheticRows, settledStepsOf } from "./live_rows";
+import { PlatformRows } from "./PlatformRows";
 import { ProcessStrip } from "./ProcessStrip";
 import { TurnFooter } from "./TurnFooter";
 import { TurnPlanCard } from "./TurnPlanCard";
@@ -211,6 +212,10 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
           inputOrder={inputOrder}
         />
       )}
+
+      {/* B-73 ② —— 平台自己贴的隐藏行,紧跟用户气泡之后(检查点里就是这个位置),
+          单独折叠、标「平台自动生成」。只有跨租户审计视图非空。 */}
+      <PlatformRows lines={turn.platformLines} />
 
       <ProcessStrip
         rows={rows}

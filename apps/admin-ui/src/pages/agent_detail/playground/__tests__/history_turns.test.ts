@@ -33,7 +33,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
       {
         key: "r2",
@@ -44,7 +44,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
     ]);
   });
@@ -67,7 +67,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
     ]);
   });
@@ -90,7 +90,7 @@ describe("buildHistoryTurns", () => {
       tokens: null,
       createdAt: "2026-01-01",
       finishedAt: null,
-      runError: null, supersededBy: null, tombstone: false,
+      runError: null, supersededBy: null, tombstone: false, platformLines: [],
     });
   });
 
@@ -119,7 +119,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
       {
         key: "r2",
@@ -130,7 +130,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
     ]);
   });
@@ -263,7 +263,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
       {
         key: "r2",
@@ -274,7 +274,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
     ]);
   });
@@ -299,7 +299,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
       {
         key: "r2",
@@ -310,7 +310,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
     ]);
   });
@@ -329,7 +329,7 @@ describe("buildHistoryTurns run_id grouping", () => {
       tokens: null,
       createdAt: "2026-01-01",
       finishedAt: null,
-      runError: null, supersededBy: null, tombstone: false,
+      runError: null, supersededBy: null, tombstone: false, platformLines: [],
     });
   });
 
@@ -348,7 +348,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
     ]);
   });
@@ -365,7 +365,7 @@ describe("buildHistoryTurns run_id grouping", () => {
     expect(turns?.[0]).toMatchObject({
       key: "r1", runId: "r1", status: "running", tokens, createdAt: "2026-02-02",
  finishedAt: null,
- runError: null, supersededBy: null, tombstone: false,
+ runError: null, supersededBy: null, tombstone: false, platformLines: [],
     });
   });
 
@@ -492,5 +492,37 @@ describe("buildHistoryTurns hidden user rows", () => {
       ["q1", ["a1"]],
       ["q2", ["a2"]],
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-73 ② —— 隐藏行不再被丢掉,单独挂在它所属的那一轮上
+// ---------------------------------------------------------------------------
+
+describe("buildHistoryTurns platform rows", () => {
+  it("keeps the hidden rows of a run as platformLines (run-grouped path)", () => {
+    // 跨租户审计视图特意要来的忠实记录:此前这些行在界面上直接消失了。
+    const turns = buildHistoryTurns(
+      [Ur("q1", "r1"), Uh("[本轮输入] org_logo", "r1"), Ar("a1", "r1", "final")],
+      [run("r1")],
+    );
+    expect(turns![0].input).toBe("q1");
+    expect(turns![0].platformLines).toEqual(["[本轮输入] org_logo"]);
+    // 既不混进用户气泡,也不混进回复。
+    expect(turns![0].fallbackLines).toEqual([{ text: "a1", channel: "final" }]);
+  });
+
+  it("keeps them on the order path too", () => {
+    const turns = buildHistoryTurns(
+      [U("q1"), Uh("[本轮输入] a", "r1"), A("a1"), Ur("q2", "r2"), Uh("[本轮输入] b", "r2"), Ar("a2", "r2")],
+      [run("r1"), run("r2")],
+    );
+    expect(turns?.map((t) => t.platformLines)).toEqual([["[本轮输入] a"], ["[本轮输入] b"]]);
+  });
+
+  it("is empty when the backend sent no hidden rows (same-tenant view)", () => {
+    // 反向:这个字段不能恒非空,否则同租户视图会平白多出一段折叠块。
+    const turns = buildHistoryTurns([Ur("q1", "r1"), Ar("a1", "r1", "final")], [run("r1")]);
+    expect(turns![0].platformLines).toEqual([]);
   });
 });

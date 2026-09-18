@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Text, false, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -36,6 +36,10 @@ class ThreadMessageRow(Base):
     # P-1 —— 镜像上的「已被取代」标记(值 = 新 run_id)。检查点是真相,这一列
     # 由 supersede 显式 UPDATE 同步(DO NOTHING 学不到)。
     superseded_by: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    # B-73 ① —— 这一行是编排层自己写进检查点的脚手架(B-67「本轮输入」段、CM-1
+    # ``<recovery-advisory>``)。镜像照抄它们(审计要看得见),**内容搜索**过滤掉
+    # (否则每一个 jinja 线程都被平台文案命中,假阳性)。
+    hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

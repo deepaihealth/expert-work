@@ -427,6 +427,9 @@ const zhCN: TranslationKeys = {
     superseded_tag: "已被取代",
     superseded_link: "→ 新一轮 {{runId}}",
     tombstone_label: "内容已清理",
+    // B-73 ② —— 跨租户审计视图里平台自己贴的隐藏行(「本轮输入」段、恢复建议)。
+    platform_rows_tag: "平台自动生成",
+    platform_rows_hint: "{{count}} 段平台文本（进模型，不是用户说的话）",
   },
   skills_tab: {
     title: "该智能体创作的技能",

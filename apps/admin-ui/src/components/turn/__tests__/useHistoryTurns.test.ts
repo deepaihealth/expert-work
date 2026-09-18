@@ -123,7 +123,7 @@ describe("useHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-05-25T00:00:00Z",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false,
+        runError: null, supersededBy: null, tombstone: false, platformLines: [],
       },
     ]);
     expect(result.current.loads).toEqual({

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001 —— 断言里是平台贴给模型的中文全角标点
 """Integration tests for SqlThreadMessageStore against a real Postgres.
 
 Covers what the in-memory double can't: the pg_trgm ILIKE search with
@@ -122,6 +123,57 @@ async def test_sync_search_and_escape_sql(sql_stores: Fixture) -> None:
         )
         assert await messages.search_thread_ids(tenant_id=tenant, q="MUTATED") == set()
         assert await messages.search_thread_ids(tenant_id=tenant, q="退款") == {thread}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_hidden_rows_are_mirrored_but_not_searchable_sql(sql_stores: Fixture) -> None:
+    """B-73 ① —— 与内存后端**同一道谓词**(``test_platform_scaffolding_is_...``)。
+
+    两套实现的谓词漂了,就是「本地全绿、生产另一个答案」。这里还多验一件内存后端
+    验不了的事:``hidden`` 是唯一在 ON CONFLICT 时也写的列 —— 0156 之前的存量行上
+    它是默认的 false 而不是真值,只有重扫覆盖才收敛得回来,而其余列照旧 DO NOTHING。
+    """
+    messages, threads, engine = sql_stores
+    try:
+        tenant = uuid4()
+        thread = (
+            await threads.create(thread_id=uuid4(), tenant_id=tenant, created_by="u")
+        ).thread_id
+        now = datetime.now(UTC)
+        block = "[本轮输入]（平台自动生成）输入文件目录 $EXPERT_WORK_INPUTS_DIR"
+
+        # 存量形态:0156 之前写下的行,没有 hidden 的信息。
+        await messages.sync_thread(
+            thread_id=thread,
+            tenant_id=tenant,
+            turns=[
+                MessageTurn(seq=0, role="user", content="做一版随访方案"),
+                MessageTurn(seq=1, role="user", content=block),
+            ],
+            synced_at=now,
+        )
+        assert await messages.search_thread_ids(tenant_id=tenant, q="本轮输入") == {thread}
+
+        # sweep 重扫同一线程:hidden 被覆盖回真值,content 照旧不动。
+        await messages.sync_thread(
+            thread_id=thread,
+            tenant_id=tenant,
+            turns=[
+                MessageTurn(seq=0, role="user", content="做一版随访方案"),
+                MessageTurn(seq=1, role="user", content="MUTATED", hidden=True),
+            ],
+            synced_at=now,
+        )
+        assert await messages.search_thread_ids(tenant_id=tenant, q="本轮输入") == set()
+        assert (
+            await messages.search_thread_ids(tenant_id=tenant, q="EXPERT_WORK_INPUTS_DIR") == set()
+        )
+        # 正文没被改写(DO NOTHING 仍然管着其余列)。
+        assert await messages.search_thread_ids(tenant_id=tenant, q="MUTATED") == set()
+        # 真正的用户话照常搜得到 —— 这道谓词不是把整个线程从搜索里摘出去。
+        assert await messages.search_thread_ids(tenant_id=tenant, q="随访") == {thread}
     finally:
         await engine.dispose()
 

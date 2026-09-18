@@ -47,6 +47,9 @@ class MessageTurn:
     superseded_by: UUID | None = None
     #: P-1 —— 墓碑(正文已清理),此时 ``content == ""``。
     tombstone: bool = False
+    #: B-73 ① —— 编排层自己写进检查点的脚手架(B-67「本轮输入」段、CM-1
+    #: ``<recovery-advisory>``)。镜像照抄(审计要看得见),**内容搜索**过滤掉。
+    hidden: bool = False
 
 
 class ThreadMessageStore(abc.ABC):
@@ -102,6 +105,11 @@ class ThreadMessageStore(abc.ABC):
         ``tenant_id=None`` is the cross-tenant aggregate — the caller MUST
         wrap it in ``bypass_rls_session()`` (Stream N contract). ``limit``
         caps the set (surfaced via ``X-Limit-Capped``).
+
+        B-73 ① —— ``hidden`` 的行不参与匹配。镜像本身是忠实的(审计要看得见平台
+        脚手架),但搜索是另一回事:B-67 给每个 jinja 线程都贴了一段平台文案,拿它
+        当可搜内容的话,搜「清单」「输入」或任意一个变量名会命中所有这类线程 ——
+        假阳性,不泄任何租户文本,但把搜索淹掉。
         """
 
     @abc.abstractmethod
