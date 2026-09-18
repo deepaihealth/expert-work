@@ -16,12 +16,21 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from control_plane.prompt_render import INPUTS_DIR_ENV, INPUTS_ENV
-from expert_work.common.conversation_channel import HIDE_FROM_UI
+from expert_work.common.conversation_channel import HIDE_FROM_UI, INPUTS_BLOCK_MARK
 from orchestrator.tools.inputs_doc import linked_sites, parse_json_value
 
 #: 标在隐藏消息 ``additional_kwargs`` 上:``:regenerate`` 重放原件时据此认出它并一起带走
-#: (其它隐藏 HumanMessage —— 委派提醒、恢复建议 —— 不带)。
-INPUTS_BLOCK_MARK = "expert_work_inputs_block"
+#: (其它隐藏 HumanMessage —— 委派提醒、恢复建议 —— 不带);``graph_builder`` 压缩之后
+#: 也靠它把最新一段放回去。常量住在 common(orchestrator 不能 import control-plane),
+#: 这里再导出一次,原有调用点不动。
+__all__ = [
+    "HEADER",
+    "INPUTS_BLOCK_MARK",
+    "block_stats",
+    "build_inputs_block",
+    "inputs_block_message",
+    "is_inputs_block",
+]
 HEADER = "[本轮输入]（平台自动生成）"  # noqa: RUF001 — 面向模型的中文全角标点
 #: 裁定 P10 —— 被 ``arg_bindings`` 引用的变量在模板里照形态渲染,绑定只在本段说一次,
 #: 接在形态状态之后。
@@ -56,10 +65,17 @@ def _shape_status(var: Any, raw: Any) -> str:
     if isinstance(raw, str) and sites[0].site.path == ():
         # 裁定 P16 —— 真名里的扩展名取自租户 URL;untrusted 时不写真名。只说前缀:无扩展名、
         # 撞名加 ``-2`` 时「<变量名>.<扩展名>」这种占位都会说错。
+        # B-73 ④ —— 前缀本身有歧义:声明了 ``org`` 与 ``org_logo`` 两个变量时,
+        # 「以 org 开头的文件」把两个都框进去了。精确名平台知道(``sites[0].link``)
+        # 但 untrusted 不能写进提示词,所以指向清单 —— 预拉写回的 ``local_path``
+        # 就是那个精确的相对路径,而清单是沙箱读的文件、不是提示词。
         where = (
             f"文件 ${INPUTS_DIR_ENV}/{sites[0].link}"
             if var.trusted
-            else f"${INPUTS_DIR_ENV} 下以 {var.name} 开头的文件"
+            else (
+                f"${INPUTS_DIR_ENV} 下以 {var.name} 开头的文件"
+                f"（精确文件名读清单里 {var.name} 的 local_path）"  # noqa: RUF001
+            )
         )
         return f"{where}；不在则按清单里的原地址下载"  # noqa: RUF001
     parsed = parse_json_value(raw)

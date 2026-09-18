@@ -321,11 +321,23 @@ _URL_WITH_PROSE = "https://x/logo.png 请放在左上角,不要拉伸"
 
 def test_a_url_followed_by_prose_keeps_the_prose() -> None:
     """值以 URL 开头、后面跟着说明:URL 换成路径,说明照留(原先整段只剩路径)。"""
-    assert [s.link for s in linked_sites("org_logo", _URL_WITH_PROSE)] == ["org_logo"]
+    assert [s.link for s in linked_sites("org_logo", _URL_WITH_PROSE)] == ["org_logo.png"]
     built = _jinja_built("LOGO:{{ org_logo }}", (_Var("org_logo"),))
     out = render_system_prompt(built, {"org_logo": _URL_WITH_PROSE})
-    assert out == f"LOGO:$EXPERT_WORK_INPUTS_DIR/org_logo{URL_NOTE} 请放在左上角,不要拉伸"
+    assert out == f"LOGO:$EXPERT_WORK_INPUTS_DIR/org_logo.png{URL_NOTE} 请放在左上角,不要拉伸"
     assert "https://x/logo.png" not in out
+
+
+def test_a_url_followed_by_prose_is_prefetched_as_the_url_alone() -> None:
+    """B-72 —— 说明文字不属于地址。
+
+    整串当地址时两处一起坏:预拉去请求 ``https://x/logo.png 请放在…``(必然失败,
+    文件建不出来,路径指向不存在的东西),``url_suffix`` 也从
+    ``/logo.png 请放在左上角,不要拉伸`` 上切不出 ``.png``。判据因此是两条:site 的
+    ``url`` 只到第一段,链接名带回了扩展名。"""
+    [site] = linked_sites("org_logo", _URL_WITH_PROSE)
+    assert site.site.url == "https://x/logo.png"
+    assert site.link.endswith(".png")
 
 
 def test_an_untrusted_url_followed_by_prose_fences_path_and_prose_together() -> None:
@@ -334,7 +346,7 @@ def test_an_untrusted_url_followed_by_prose_fences_path_and_prose_together() -> 
     before, inside, after = _split_fence(out)
     assert before == "LOGO:"
     # datamarking 把空白换成 ``▁``;路径后面是收尾符,不是 ``▁``。
-    assert inside == f"\n$EXPERT_WORK_INPUTS_DIR/org_logo{_END}请放在左上角,不要拉伸\n"
+    assert inside == f"\n$EXPERT_WORK_INPUTS_DIR/org_logo.png{_END}请放在左上角,不要拉伸\n"
     assert after == URL_NOTE
     assert "https://x/logo.png" not in out
 
@@ -342,7 +354,8 @@ def test_an_untrusted_url_followed_by_prose_fences_path_and_prose_together() -> 
 @pytest.mark.parametrize("trusted", [True, False])
 def test_trailing_whitespace_after_a_url_is_not_prose(trusted: bool) -> None:
     value = f"{LOGO} \n"
-    # 名字由 ``linked_sites`` 定(尾随空格让它不带扩展名),这里只管「后面没有说明文字」。
+    # 名字由 ``linked_sites`` 定(B-72 之后尾随空格被切掉,扩展名照旧),这里只管
+    # 「后面没有说明文字」。
     path = f"$EXPERT_WORK_INPUTS_DIR/{linked_sites('org_logo', value)[0].link}"
     built = _jinja_built("{{ org_logo }}", (_Var("org_logo", trusted=trusted),))
     out = render_system_prompt(built, {"org_logo": value})

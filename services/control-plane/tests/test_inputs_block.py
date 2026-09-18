@@ -113,10 +113,25 @@ def test_untrusted_top_level_url_prints_a_placeholder_not_the_real_link_name() -
     text = build_inputs_block(variables, {"cover": LOGO, "org_logo": LOGO}, bindings=())
     assert text is not None
     assert (
-        "- cover：$EXPERT_WORK_INPUTS_DIR 下以 cover 开头的文件；不在则按清单里的原地址下载"
+        "- cover：$EXPERT_WORK_INPUTS_DIR 下以 cover 开头的文件"
+        "（精确文件名读清单里 cover 的 local_path）；不在则按清单里的原地址下载"
     ) in text
     assert "cover.png" not in text and ".png" not in text.split("- cover：")[1].split("\n")[0]
     assert "- org_logo：文件 $EXPERT_WORK_INPUTS_DIR/org_logo.png；" in text
+
+
+def test_an_untrusted_prefix_points_at_the_manifest_because_prefixes_collide() -> None:
+    """B-73 ④ —— ``org`` 与 ``org_logo`` 都声明时,「以 org 开头的文件」把两个文件
+    都框了进去。精确名平台知道但 untrusted 不能写进提示词,所以指向清单里那个变量
+    自己的 ``local_path``(清单是沙箱读的文件,不是提示词)。"""
+    variables = (_Var("org", trusted=False), _Var("org_logo", trusted=False))
+    text = build_inputs_block(variables, {"org": LOGO, "org_logo": LOGO}, bindings=())
+    assert text is not None
+    org_line = text.split("- org：")[1].split("\n")[0]
+    # 歧义还在(前缀就是会撞),但每一行都说了怎么从歧义里解出精确名。
+    assert "以 org 开头的文件" in org_line
+    assert "读清单里 org 的 local_path" in org_line
+    assert "读清单里 org_logo 的 local_path" in text.split("- org_logo：")[1].split("\n")[0]
 
 
 def test_bound_optional_variable_not_passed_reports_unset_only() -> None:

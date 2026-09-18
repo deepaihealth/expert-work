@@ -170,7 +170,8 @@ def _with_paths(
 def _render_url(var: Any, raw: str, link: str, *, nonce: str | None) -> str:
     """以 URL 开头的字符串:URL(第一段非空白)换成链接路径,后面的说明文字照留。
 
-    ``linked_sites`` 把整串当成一个 URL(``_is_http_url`` 只看开头),名字照它给的用。
+    ``linked_sites`` 给的 ``url`` 就是第一段(``inputs_doc.http_url_in``,B-72),名字照它
+    给的用 —— 两边切法必须同义,否则名字里带着说明文字、也拿不到扩展名。
     trusted:路径紧跟尾注,说明文字原样接在后面;untrusted:路径与说明文字同在一个围栏里
     (以 :data:`_PATH_END` 隔开,datamarking 不会贴在路径上),尾注在围栏外。
     """

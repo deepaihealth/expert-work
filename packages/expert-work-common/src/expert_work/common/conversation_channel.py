@@ -25,6 +25,13 @@ from typing import Any
 #: 任何面向用户或第三方的视图。
 HIDE_FROM_UI = "expert_work_hide_from_ui"
 
+#: B-67 §六 —— 平台生成的「本轮输入」段(``control_plane.inputs_block``)。
+#: 它同时带 :data:`HIDE_FROM_UI`;这个标记是**更窄**的一层,用来把它与别的隐藏
+#: HumanMessage(委派提醒、恢复建议)分开。两处消费者靠它认出这一段:
+#: ``supersede`` 重放原件时一起带走,``graph_builder`` 在压缩之后把最新一段放回
+#: 去。住在 common 是因为 orchestrator 不能 import control-plane。
+INPUTS_BLOCK_MARK = "expert_work_inputs_block"
+
 #: 定时任务投递的助手消息标记(``trigger_delivery.inject_delivery``)。它
 #: **自己开一个段落** —— 否则它会被接到用户上一个真实提问的段尾,把那一段
 #: 的 ``final`` 抢走。
@@ -210,6 +217,7 @@ __all__ = [
     "CHANNEL_COMMENTARY",
     "CHANNEL_FINAL",
     "HIDE_FROM_UI",
+    "INPUTS_BLOCK_MARK",
     "SCHEDULED_DELIVERY",
     "SUPERSEDED_AT",
     "SUPERSEDED_BY",

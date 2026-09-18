@@ -106,8 +106,21 @@ class UrlSite:
     url: str
 
 
-def _is_http_url(value: Any) -> bool:
-    return isinstance(value, str) and (value.startswith("http://") or value.startswith("https://"))
+def http_url_in(value: Any) -> str | None:
+    """以 ``http(s)://`` 开头的字符串里的那个 URL —— **第一段非空白**,不是整串;
+    不以它开头就是 ``None``。
+
+    B-72:``"https://…/logo.png 公司 LOGO"`` 这种「地址后面跟一句说明」的值,整串
+    当 URL 会连错两处 —— 预拉请求的是一个带空格的地址,必然失败、文件建不出来;
+    ``url_suffix`` 从 ``/logo.png 公司 LOGO`` 上也切不出 ``.png``,链接名没有扩展名。
+    渲染层 ``prompt_render._render_url`` 本来就按第一段切、把说明文字照留,这里与它
+    同义。沙箱侧 ``prefetch_script._sites`` 必须逐字同义(等价测试钉住)。
+    """
+    if not isinstance(value, str):
+        return None
+    if not (value.startswith("http://") or value.startswith("https://")):
+        return None
+    return value.split(maxsplit=1)[0]
 
 
 def parse_json_value(value: Any) -> list[Any] | dict[str, Any] | None:
@@ -314,8 +327,9 @@ def _walk(
     ``_assign`` 会直接 ``TypeError``,一条这样的 URL 足以把整轮预拉的结果全带走
     (见 ``test_site_walk_matches_the_host_side_implementation``)。
     """
-    if _is_http_url(value):
-        return [(prefix, value)] if assignable else []
+    url = http_url_in(value)
+    if url is not None:
+        return [(prefix, url)] if assignable else []
     if isinstance(value, Mapping):
         found: list[tuple[tuple[str | int, ...], str]] = []
         for key, item in value.items():

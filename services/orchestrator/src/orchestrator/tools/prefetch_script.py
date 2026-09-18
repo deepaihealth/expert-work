@@ -478,8 +478,11 @@ def _sites(
     载。与宿主侧 ``inputs_doc._walk`` 是同一条规则,必须同义(见
     ``test_site_walk_matches_the_host_side_implementation``)。
     """
+    # B-72 —— URL 是**第一段非空白**,不是整串:``"https://…/logo.png 公司 LOGO"``
+    # 这种「地址后跟说明」的值整串当地址,请求必失败、链接名也拿不到扩展名。宿主侧
+    # ``inputs_doc.http_url_in`` 逐字同义。
     if isinstance(value, str) and (value.startswith("http://") or value.startswith("https://")):
-        return [(list(prefix), value)] if assignable else []
+        return [(list(prefix), value.split(maxsplit=1)[0])] if assignable else []
     if isinstance(value, dict):
         found: list[tuple[list[str | int], str]] = []
         for key, item in value.items():
