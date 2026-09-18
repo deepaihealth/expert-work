@@ -128,6 +128,10 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
             # B-67 终审 F2 —— 嵌套超过 MAX_PARSE_DEPTH 层:两侧都不扫;恰好在上限上的照扫。
             "g": {"value": too_deep, "trusted": True},
             "h": {"value": too_deep[0], "trusted": True},
+            # B-72 —— 「地址后跟说明」:两侧都只取第一段。整个值一条、dict 键下一条,
+            # 因为两侧的切法各写在自己那一支里,只测一处另一支漂了照样绿。
+            "i": {"value": "https://x/i.png 公司 LOGO,放左上角", "trusted": True},
+            "j": {"value": {"url": "https://x/j.mp4  两个空格 + 说明"}, "trusted": True},
         }
     }
     host = [(s.var_name, list(s.path), s.url) for s in iter_url_sites(doc)]
@@ -148,6 +152,9 @@ def test_site_walk_matches_the_host_side_implementation() -> None:
     assert ("f", [0, "url"], "https://x/f.pdf") in sandbox
     assert not any(name == "g" for name, _, _ in sandbox)
     assert [url for name, _, url in sandbox if name == "h"] == ["https://x/g.png"]
+    # B-72 —— 说明文字不进地址,两个位置各钉一条。
+    assert ("i", [], "https://x/i.png") in sandbox
+    assert ("j", ["url"], "https://x/j.mp4") in sandbox
 
 
 # ---------------------------------------------------------------------------

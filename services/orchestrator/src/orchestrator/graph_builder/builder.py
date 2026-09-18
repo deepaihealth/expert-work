@@ -79,7 +79,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from opentelemetry.trace import Status, StatusCode
 
-from expert_work.common.conversation_channel import is_hidden
+from expert_work.common.conversation_channel import INPUTS_BLOCK_MARK, is_hidden
 from expert_work.common.dlp import scan_and_redact
 from expert_work.common.message_stamp import stamp_messages
 from expert_work.common.observability import (
@@ -848,12 +848,16 @@ def build_react_graph(
             # (tenant, agent, version) and shared across every thread /
             # user of the agent, so the streak must key on thread_id.
             compress_thread_id = (config.get("configurable") or {}).get("thread_id")
+            before_compress = messages
             messages = await context_compressor.compress(
                 messages,
                 on_pre_compaction=on_pre_compaction,
                 on_compacted=on_compacted,
                 streak_key=str(compress_thread_id) if compress_thread_id else None,
             )
+            # B-73 ③ —— 这一轮的「本轮输入」段被摘要掉的话,模型就没有输入文件的
+            # 路径了,只能退回去手抄上文里的长串。放回最新一段(见函数 docstring)。
+            messages = _keep_latest_inputs_block(before_compress, messages)
             # Stream HX-12 (Mini-ADR HX-I5) — promotion demotion rides the
             # same pressure signal: the context is being squeezed, so
             # promoted tools unused for N turns leave the next turn's bind.
@@ -1846,6 +1850,35 @@ def _append_tail_human_message(messages: list[BaseMessage], block: str) -> list[
     the pre-L1 ``_merge_into_system`` helper.
     """
     return [*messages, HumanMessage(content=block)]
+
+
+def _latest_inputs_block(messages: Sequence[BaseMessage]) -> BaseMessage | None:
+    """最后一段「本轮输入」(B-67 §六),没有就是 ``None``。"""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage) and (msg.additional_kwargs or {}).get(INPUTS_BLOCK_MARK):
+            return msg
+    return None
+
+
+def _keep_latest_inputs_block(
+    before: Sequence[BaseMessage], after: Sequence[BaseMessage]
+) -> list[BaseMessage]:
+    """B-73 ③ —— 压缩之后把最新那段「本轮输入」放回提示词。
+
+    压缩器按**消息条数**留头尾(``tail_keep``),而一轮里用户消息之后可以堆很多工具
+    消息,所以长的一轮里这段隐藏 HumanMessage 会落进被摘要掉的中段。它恰恰是模型
+    找输入文件用的那张地图 —— 变量名、状态、``$EXPERT_WORK_INPUTS_DIR`` 下的路径;
+    摘要过的版本没有路径,模型只能退回去手抄上文里的长串(正是 B-61/B-67 要消灭的病)。
+
+    只放回**最新**一段:更早轮次的段说的是已经过期的路径(那些 run 目录会被 janitor
+    回收),压掉是对的。位置放在末尾 —— 它是隐藏 HumanMessage,不开新轮
+    (``trim_to_recent_turns`` 的口径),也不会插进任何 tool_call ↔ tool_result 之间。
+    只改这一次的提示词视图,检查点不动(CM-C4)。
+    """
+    block = _latest_inputs_block(before)
+    if block is None or any(m is block for m in after):
+        return list(after)
+    return [*after, block]
 
 
 def _inject_plan(messages: list[BaseMessage], plan: Plan) -> list[BaseMessage]:
