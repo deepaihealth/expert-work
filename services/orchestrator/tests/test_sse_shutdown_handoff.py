@@ -183,7 +183,9 @@ async def test_handoff_counter_counts_only_real_handoffs() -> None:
         return _run_handed_off_total._value.get()  # type: ignore[attr-defined]
 
     before = _value()
-    await _run_until_shutdown(store=InMemoryRunStore(), graph=_SlowGraph(state_values=_clean_tail()))
+    await _run_until_shutdown(
+        store=InMemoryRunStore(), graph=_SlowGraph(state_values=_clean_tail())
+    )
     after_safe = _value()
     assert after_safe == before + 1
 
