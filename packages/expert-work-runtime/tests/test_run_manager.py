@@ -12,6 +12,7 @@ from expert_work.runtime.runs import (
     InMemoryRunStore,
     InterruptReason,
     RunManager,
+    RunRecord,
     RunStatus,
 )
 
@@ -588,3 +589,86 @@ async def test_drain_runs_hard_stops_whatever_is_still_running_at_the_deadline()
 async def test_drain_runs_returns_immediately_with_nothing_in_flight() -> None:
     mgr = RunManager()
     assert await mgr.drain_runs(timeout_s=30.0) == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_reports_what_it_is_waiting_for_and_what_it_hard_stopped() -> None:
+    """B-80 观测 —— 排空必须留下可查的记录。
+
+    关机期间 Prometheus 结构性采不到(pod 一 terminating 就从 Endpoints 摘除),
+    pod 日志随 pod 回收 —— 所以「这个 pod 在等谁」只能靠这条回调落库。
+    2026-09-18 实况:旧 pod 一直 Terminating,事后没有任何持久记录说明原因。
+
+    两个事件必须**都**发,而且带得出 run 身份:只发开头就不知道最后有没有硬停,
+    只发结尾就不知道它中途在等什么。
+    """
+    import asyncio
+
+    mgr = RunManager()
+    tenant = uuid4()
+    quick, stuck = uuid4(), uuid4()
+    for run_id in (quick, stuck):
+        await mgr.create(run_id=run_id, thread_id=uuid4(), tenant_id=tenant)
+        await mgr.set_status(run_id, RunStatus.RUNNING)
+
+    async def _quick() -> None:
+        await asyncio.sleep(0.01)
+
+    async def _never_ends() -> None:
+        await asyncio.sleep(3600)
+
+    await mgr.attach_task(quick, asyncio.create_task(_quick()))
+    await mgr.attach_task(stuck, asyncio.create_task(_never_ends()))
+
+    seen: list[tuple[str, set[UUID], float]] = []
+
+    async def _observe(event: str, records: list[RunRecord], timeout_s: float) -> None:
+        seen.append((event, {r.run_id for r in records}, timeout_s))
+
+    hard_stopped = await mgr.drain_runs(timeout_s=0.05, on_event=_observe)
+
+    assert hard_stopped == 1
+    assert [e for e, _, _ in seen] == ["drain_waiting", "drain_hard_stopped"]
+    assert seen[0][1] == {quick, stuck}, "开始等的时候两个都在飞"
+    assert seen[1][1] == {stuck}, "硬停的只有那个不肯收的"
+    assert seen[0][2] == 0.05, "收口上限要带出去 —— 运维才知道它还会等多久"
+
+
+@pytest.mark.asyncio
+async def test_drain_emits_nothing_when_there_is_nothing_in_flight() -> None:
+    """没在跑就不该有记录 —— 否则每次滚动发布都刷一堆噪音行。"""
+    mgr = RunManager()
+    seen: list[str] = []
+
+    async def _observe(event: str, records: list[RunRecord], timeout_s: float) -> None:
+        seen.append(event)
+
+    assert await mgr.drain_runs(timeout_s=1.0, on_event=_observe) == 0
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_broken_observer_does_not_stop_the_drain() -> None:
+    """观测不能拖垮关机 —— 审计写失败也得把 run 收完。"""
+    import asyncio
+
+    mgr = RunManager()
+    run_id = uuid4()
+    await mgr.create(run_id=run_id, thread_id=uuid4(), tenant_id=uuid4())
+    await mgr.set_status(run_id, RunStatus.RUNNING)
+    cleaned_up = asyncio.Event()
+
+    async def _never_ends() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cleaned_up.set()
+            raise
+
+    await mgr.attach_task(run_id, asyncio.create_task(_never_ends()))
+
+    async def _explode(event: str, records: list[RunRecord], timeout_s: float) -> None:
+        raise RuntimeError("audit store is down")
+
+    assert await mgr.drain_runs(timeout_s=0.05, on_event=_explode) == 1
+    assert cleaned_up.is_set(), "观察者炸了 —— 收口分支还是要跑完"

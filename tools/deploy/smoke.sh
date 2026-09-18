@@ -85,10 +85,62 @@ settle() {
     check "${name}" "${got}" "${want}"
 }
 
+# A pod that is Terminating is not, by itself, a failure. B-80 keeps the old
+# control-plane pod alive until its in-flight runs drain, so a *healthy*
+# release routinely shows one for as long as that pod's own
+# ``terminationGracePeriodSeconds`` — 6 minutes, far past the 120s settle.
+#
+# 2026-09-18: this check failed a good release exactly that way (one
+# conversation was mid-run when the rollout started), and because release.sh
+# aborts at stage 5, the canary never ran — the one check that starts a real
+# run, writes a file and downloads the artifact. That is the B-56 shape:
+# call normal convergence a breakage, then skip the thing that could have
+# judged it.
+#
+# The drain budget is deliberately NOT re-declared here. It would be a fifth
+# copy of a number that already has to agree in four places (see
+# test_rollout_budgets.py); instead it is read off the pod that is actually
+# draining, so the two can never disagree.
+GRACE_SLACK_S=60   # kubelet does not SIGKILL exactly on the boundary.
+
+# "now minus N seconds" as an RFC3339 UTC stamp. BSD (macOS) and GNU date
+# spell the offset differently and this runs from operator laptops and CI
+# alike, so try both.
+utc_minus() {
+    date -u -v-"$1"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || date -u -d "-$1 seconds" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# Pods that are Terminating but still inside their own grace budget.
+draining_within_grace() {
+    local name ts grace cutoff
+    kubectl -n expert-work get pods \
+        -o jsonpath='{range .items[*]}{.metadata.name}|{.metadata.deletionTimestamp}|{.spec.terminationGracePeriodSeconds}{"\n"}{end}' \
+        | while IFS='|' read -r name ts grace; do
+            [[ -z "${ts}" ]] && continue
+            cutoff="$(utc_minus "$(( ${grace:-30} + GRACE_SLACK_S ))")"
+            # Same format, same length, ASCII — RFC3339 UTC stamps sort
+            # chronologically, so a string compare answers "did this deletion
+            # start before the cutoff?" without any date parsing.
+            #
+            # An ``if``, not ``[[ … ]] && echo``: a false ``&&`` is the loop
+            # body's last command, so the whole loop would exit 1 and errexit
+            # would kill the caller — i.e. the overdue case, the one this
+            # function exists to detect, would take the script down with it.
+            if [[ "${ts}" > "${cutoff}" ]]; then
+                echo "${name}"
+            fi
+        done
+}
+
 pods_not_ready() {
-    local out
+    local out excused
+    excused="$(draining_within_grace)"
     out="$(kubectl -n expert-work get pods --no-headers \
-        | awk '$3 != "Running" && $3 != "Completed" {print $1"("$3")"}' | paste -sd, - || true)"
+        | awk -v ex="${excused}" '
+            BEGIN { n = split(ex, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") skip[a[i]] = 1 }
+            $3 != "Running" && $3 != "Completed" && !($1 in skip) { print $1"("$3")" }
+          ' | paste -sd, - || true)"
     echo "${out:-none}"
 }
 

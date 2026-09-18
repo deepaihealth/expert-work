@@ -14,6 +14,7 @@ from expert_work.runtime.runs.event_store import RunEventRecord as RunEventRecor
 from expert_work.runtime.runs.event_store import RunEventStore as RunEventStore
 from expert_work.runtime.runs.event_store import SqlRunEventStore as SqlRunEventStore
 from expert_work.runtime.runs.event_store import make_event_record as make_event_record
+from expert_work.runtime.runs.manager import DrainObserver as DrainObserver
 from expert_work.runtime.runs.manager import RunManager as RunManager
 from expert_work.runtime.runs.manager import RunRecord as RunRecord
 from expert_work.runtime.runs.schemas import DisconnectMode as DisconnectMode
@@ -27,6 +28,7 @@ from expert_work.runtime.runs.store import SqlRunStore as SqlRunStore
 
 __all__ = [
     "DisconnectMode",
+    "DrainObserver",
     "InMemoryRunEventStore",
     "InMemoryRunStore",
     "InterruptReason",

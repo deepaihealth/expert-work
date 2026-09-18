@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import socket
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -37,6 +38,10 @@ from expert_work.runtime.runs.schemas import (
 from expert_work.runtime.runs.store import RunStore
 
 logger = logging.getLogger(__name__)
+
+#: B-80 观测钩子 —— ``(事件名, 受影响的 run 记录, 收口上限秒)``。
+#: 事件名只有两个:``drain_waiting``(开始等)与 ``drain_hard_stopped``(到点硬停)。
+type DrainObserver = Callable[[str, list[RunRecord], float], Awaitable[None]]
 
 
 @dataclass
@@ -506,7 +511,7 @@ class RunManager:
             heartbeat_at=now,
         )
 
-    async def drain_runs(self, *, timeout_s: float) -> int:
+    async def drain_runs(self, *, timeout_s: float, on_event: DrainObserver | None = None) -> int:
         """B-80 —— 优雅关机收口:等在跑的 run 收尾,到点还没收的硬停。返回硬停几个。
 
         调用顺序是这条的全部意义,**必须**是:先 :meth:`mark_shutting_down`,
@@ -521,23 +526,50 @@ class RunManager:
         ``asyncio.CancelledError`` 分支要在那里决定交接还是收成 INTERRUPTED,
         cancel 完就走会把这些写丢在半路(这正是「事件循环拆解期间 await 不可靠」
         那条注释说的情形;显式收口就是为了把这些写挪回循环还健康的时候)。
+
+        ``on_event`` 是**观测**通道,不是控制通道:调用方拿它把「这个 pod 正等着
+        N 个 run」落进审计。为什么必须落库 —— 关机期间 Prometheus 抓不到(pod 一
+        进入 terminating 就从 Endpoints 摘除),pod 日志随 pod 回收,于是事后没有
+        任何办法回答「它当时在等谁」。2026-09-18 实况:一条对话在跑,旧 pod 一直
+        Terminating,smoke 报红、金丝雀被跳过,而**没有任何持久记录**说明它在等什么。
+        观察者自己抛异常一律吞掉:观测不能拖垮关机。
         """
-        live = [
-            r.task for r in list(self._runs.values()) if r.task is not None and not r.task.done()
-        ]
-        if not live:
+        waiting = [r for r in list(self._runs.values()) if r.task is not None and not r.task.done()]
+        if not waiting:
             return 0
-        logger.info("run.drain_started in_flight=%d timeout_s=%.1f", len(live), timeout_s)
+        logger.info("run.drain_started in_flight=%d timeout_s=%.1f", len(waiting), timeout_s)
+        await self._notify_drain(on_event, "drain_waiting", waiting, timeout_s=timeout_s)
+        live = [r.task for r in waiting if r.task is not None]
         await asyncio.wait(live, timeout=max(0.0, timeout_s))
-        stragglers = [t for t in live if not t.done()]
-        for task in stragglers:
-            task.cancel()
-        if stragglers:
+        stalled = [r for r in waiting if r.task is not None and not r.task.done()]
+        for record in stalled:
+            if record.task is not None:
+                record.task.cancel()
+        if stalled:
             # ``return_exceptions=True`` 把每个任务的 ``CancelledError`` 吞掉,
             # 同时保证等到它们各自的收口分支真的跑完。
-            await asyncio.gather(*stragglers, return_exceptions=True)
-        logger.info("run.drain_done hard_stopped=%d", len(stragglers))
-        return len(stragglers)
+            await asyncio.gather(
+                *[r.task for r in stalled if r.task is not None], return_exceptions=True
+            )
+            await self._notify_drain(on_event, "drain_hard_stopped", stalled, timeout_s=timeout_s)
+        logger.info("run.drain_done hard_stopped=%d", len(stalled))
+        return len(stalled)
+
+    @staticmethod
+    async def _notify_drain(
+        on_event: DrainObserver | None,
+        event: str,
+        records: list[RunRecord],
+        *,
+        timeout_s: float,
+    ) -> None:
+        """把排空事件递给观察者。**吞掉它自己的异常** —— 观测不能拖垮关机。"""
+        if on_event is None:
+            return
+        try:
+            await on_event(event, list(records), timeout_s)
+        except Exception:
+            logger.exception("run.drain_observer_failed event=%s", event)
 
     async def hand_off(self, run_id: UUID) -> bool:
         """B-80 —— 交出所有权:租约作废、行留在 ``running``,等别的副本接管。
