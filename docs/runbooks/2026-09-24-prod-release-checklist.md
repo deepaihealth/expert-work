@@ -8,11 +8,11 @@
 |---|---|
 | 发布日 | **2026-09-24（周四）**，用户 2026-09-17 拍板（原 09-22） |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`dfd4e6de`** —— 测试环境 2026-09-18 实际发过的那一版 |
-| 区间提交数 | **40**（`git log --oneline 5775fbf3..dfd4e6de`） |
-| 数据库迁移 | **一条：`0156_thread_message_hidden`**（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）。migrate Job 自动跑，不需要额外动作 |
-| 段数 | **单段**。有迁移但不是三段式：`0156` 是纯加列、没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这张表上正常跑 |
-| 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来 |
+| 本版 tag | **`88a2b6c3`** —— 测试环境 2026-09-18 实际发过的那一版 |
+| 区间提交数 | **41**（`git log --oneline 5775fbf3..88a2b6c3`） |
+| 数据库迁移 | **两条**：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）。migrate Job 自动跑，不需要额外动作 |
+| 段数 | **单段**。有迁移但不是三段式：`0156` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这张表上正常跑 |
+| 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要） |
 | 沙箱镜像钉子 | `e8aac104` → **`621249f6`**（Step A） |
 | 新增集群对象 | **留存清理 CronJob `retention-cleanup`**（首次进 prod overlay，`apply -k` 会创建） |
 | 执行人 / 开始时间 | `___________` |
@@ -52,12 +52,17 @@
   隐藏段的文件名前缀歧义指向清单、**平台脚手架行不进控制台内容搜索**（带迁移 `0156`）、
   审计视图里这些行渲染成折叠的「平台自动生成」块。
 
-> **钉子纪律**：本单钉 `dfd4e6de`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `88a2b6c3`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
-> B-73 四条一起带上，重钉 `dfd4e6de`（本单）。形态从「无迁移」变成「一条 expand-only 迁移」，
-> 表头三行与上面的迁移预检随之改过。
+> B-73 四条一起带上，重钉 `dfd4e6de`（#1597）。当晚发现 B-73 ① 在生产上只能修一半
+> （写隐藏消息的源头有三个，另外两个早就在生产跑），补 `0157` 逼 sweep 重扫，重钉 `88a2b6c3`（本单）。
+> 形态：无迁移 → 一条 expand-only → **两条（`0156` 加列 + `0157` 数据迁移）**，全程仍是单段。
+>
+> **⛔ #1597 那次重钉漏了正文**：表头改成了 `dfd4e6de`，Step B 的 `git checkout` 和另外 4 处
+> 却仍停在 `42426d31`（落后两代）。这已经是同一形状的**第二次**（班车 1 的 B2 正文钉子漏改，#1566）。
+> 本次一并补齐，改钉子的判据定死为：**`grep -n '<旧 sha>' 这份文件` 必须零命中**才算改完。
 
 ---
 
@@ -81,8 +86,9 @@
       git fetch origin main
       TAG=<本版 tag>                                        # 见表头「本版 tag」
       git log --oneline 5775fbf3..$TAG | wc -l             # 与表头「区间提交数」对得上
-      git diff --name-only 5775fbf3..$TAG | grep -i alembic   # 期望**恰好一条**：
+      git diff --name-only 5775fbf3..$TAG | grep -i migrations/versions   # 期望**恰好两条**：
       #   packages/expert-work-persistence/migrations/versions/0156_thread_message_hidden.py
+      #   packages/expert-work-persistence/migrations/versions/0157_thread_mirror_resweep.py
       # 多出别的迁移 = 装载和这份单子对不上，停下来查，别往下发
       ```
 
@@ -243,15 +249,15 @@ kubectl -n default get sandboxset expert-work-sandbox \
 
 ```sh
 git fetch origin main
-git checkout 42426d31
+git checkout 88a2b6c3
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `42426d31`
+- [ ] 确认 checkout 的是 `88a2b6c3`
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
-- [ ] migrate Job `condition met`（**本版应当空跑**：没有新迁移）
+- [ ] migrate Job `condition met`，且日志里出现**两条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
 - [ ] **smoke 全绿，且阶段 6 金丝雀是 PASS 不是 WARNING**
 - [ ] smoke 里的沙箱钉子检查是 `OK`（Step A 做过了；显示 `WARN 落后 N` 说明 Step A 漏了）
@@ -265,7 +271,7 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `42426d31`（admin-ui 是 `42426d31-prod`）
+- [ ] 三个应用镜像都是 `88a2b6c3`（admin-ui 是 `88a2b6c3-prod`）
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -313,7 +319,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag 42426d31` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag 88a2b6c3` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 621249f6`、留存 CronJob 首次接入、回滚命令。
 - [ ] ROADMAP 班车 2 行销案；本执行单补 §6 执行记录。
 
@@ -373,7 +379,7 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 发布前在跑 / 排队 / 待审批 | `___` |
 | Step A 沙箱钉子 | 发前 `________` → 发后 `________` |
 | Step B smoke / 金丝雀 | `________` |
-| migrate Job | 期望空跑，实况 `________` |
+| migrate Job | 期望跑两条（`0156` + `0157`），实况 `________` |
 | CronJob 创建 | `________` |
 | 次日首跑删除计数 | `________` |
 | 与执行单不符之处 | `________` |
