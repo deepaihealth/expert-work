@@ -660,6 +660,13 @@ async def run_agent(
         if not await run_manager.hand_off(run_id):
             return False
         _run_handed_off_total.inc()
+        # 落一条审计行 —— 这是关机交接**唯一可靠**的对外信号。
+        # Prometheus 那个计数器在这条路径上结构性不可采:pod 一进入 terminating 就从
+        # Endpoints 摘除,抓取随即停止,而交接恰恰发生在那之后(09-18 测试环境实测:
+        # 交接确实发生了,四个实例的 max_over_time 全是 0)。审计写库,进程死了也还在,
+        # 而且与接手方 ``OrphanSweep`` 写的 ``reason="reclaimed"`` 同一个 action,
+        # 一次查询就能把「谁交出去的 → 谁接手的」连成一条时间线。
+        await _emit_handoff_audit(audit_logger, record)
         logger.info("run_agent.handed_off run_id=%s", run_id)
         return True
 
@@ -1527,6 +1534,42 @@ def _maybe_uuid(raw: object) -> UUID | None:
         except ValueError:
             return None
     return None
+
+
+async def _emit_handoff_audit(audit_logger: AuditLogger | None, record: RunRecord) -> None:
+    """B-80 —— 交出所有权时落一条审计行。**故意与接手方同形**。
+
+    ``OrphanSweep`` 接手时写的是 ``action=run:failover``、``resource_type="run"``、
+    ``resource_id=<run_id>``、``reason="reclaimed"``。这里用同一组键、只把 reason 换成
+    ``handed_off``,于是按 ``resource_id`` 查一次就能把「谁交出去的 → 谁接手的」连成
+    一条时间线。(用 :func:`_emit_run_end_audit` 不行 —— 它写的 ``resource_id`` 是
+    ``thread_id``,两端对不上。)
+
+    为什么非要审计不可:Prometheus 的 ``expert_work_run_handed_off_total`` 在这条路径上
+    **结构性不可采** —— pod 一进入 terminating 就从 Endpoints 摘除、抓取随即停止,而交接
+    恰恰发生在那之后(2026-09-18 测试环境实测:交接确实发生了,四个实例的
+    ``max_over_time(...[15m])`` 全是 0)。审计写库,进程死了也还在。
+
+    写失败只记日志:这一轮的所有权已经交出去了,补不回来,更不能因此让关机卡住。
+    """
+    if audit_logger is None:
+        return
+    try:
+        await audit_logger.write(
+            AuditEntry(
+                tenant_id=record.tenant_id,
+                actor_type="system",
+                actor_id="orchestrator",
+                action=AuditAction.RUN_FAILOVER,
+                resource_type="run",
+                resource_id=str(record.run_id),
+                result=AuditResult.SUCCESS,
+                reason="handed_off",
+                details={"thread_id": str(record.thread_id), "reason_detail": "graceful_shutdown"},
+            )
+        )
+    except Exception:
+        logger.exception("run_agent.handoff_audit_failed run_id=%s", record.run_id)
 
 
 async def _emit_run_end_audit(

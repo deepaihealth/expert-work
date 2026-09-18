@@ -23,6 +23,7 @@ from uuid import uuid4
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from expert_work.protocol import AuditAction, AuditResult
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunStore,
@@ -112,12 +113,23 @@ async def _end_was_published(bridge: InMemoryStreamBridge, run_id: Any) -> bool:
     return stream is not None and stream.ended
 
 
+@dataclass
+class _RecordingAuditLogger:
+    """只收 ``write`` 的审计桩(``run_agent`` 也只调这一个)。"""
+
+    entries: list[Any] = field(default_factory=list)
+
+    async def write(self, entry: Any) -> None:
+        self.entries.append(entry)
+
+
 async def _run_until_shutdown(
     *,
     store: InMemoryRunStore,
     graph: _SlowGraph,
     tool_replay_safe: Any = None,
     cancel_user_run: bool = False,
+    audit: Any = None,
 ) -> tuple[RunManager, RunRecord, InMemoryStreamBridge]:
     """跑起来 → 等它真的在跑 → 置关机标志 → 等 run_agent 自己收口。"""
     bridge = InMemoryStreamBridge()
@@ -132,6 +144,7 @@ async def _run_until_shutdown(
             graph_input={"messages": []},
             config={},
             tool_replay_safe=tool_replay_safe,
+            audit_logger=audit,
         )
     )
     await asyncio.wait_for(graph.started.wait(), timeout=5.0)
@@ -289,3 +302,47 @@ async def test_no_handoff_when_not_shutting_down() -> None:
 
     row = await store.get(run_id=record.run_id, tenant_id=record.tenant_id)
     assert row is not None and row.status is RunStatus.INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_handoff_writes_an_audit_row_shaped_like_the_reclaim_side() -> None:
+    """B-80 —— 交接必须落审计,而且要和接手方同形。
+
+    Prometheus 的计数器在这条路径上**结构性不可采**:pod 一进入 terminating 就从
+    Endpoints 摘除、抓取随即停止,而交接恰恰发生在那之后(2026-09-18 测试环境实测:
+    交接确实发生了,四个实例的 ``max_over_time(...[15m])`` 全是 0)。所以审计是唯一
+    可靠信号。
+
+    同形的意思:``OrphanSweep`` 接手时写 ``action=run:failover`` /
+    ``resource_type="run"`` / ``resource_id=<run_id>`` / ``reason="reclaimed"``。
+    这里只把 reason 换成 ``handed_off`` —— 按 ``resource_id`` 查一次就能把
+    「谁交出去的 → 谁接手的」连成一条时间线。写成 ``thread_id`` 就连不上了。
+    """
+    audit = _RecordingAuditLogger()
+    _rm, record, _bridge = await _run_until_shutdown(
+        store=InMemoryRunStore(),
+        graph=_SlowGraph(state_values=_clean_tail()),
+        audit=audit,
+    )
+
+    rows = [e for e in audit.entries if e.reason == "handed_off"]
+    assert len(rows) == 1, f"期望恰好一条交接审计,实得 {[e.reason for e in audit.entries]}"
+    row = rows[0]
+    assert row.action is AuditAction.RUN_FAILOVER
+    assert row.resource_type == "run", "必须与接手方同形,否则两端连不起来"
+    assert row.resource_id == str(record.run_id), "键必须是 run_id,不是 thread_id"
+    assert row.result is AuditResult.SUCCESS
+    assert row.tenant_id == record.tenant_id
+
+
+@pytest.mark.asyncio
+async def test_no_handoff_audit_when_the_run_is_not_handed_off() -> None:
+    """不可交接的那一轮不该留下交接审计 —— 否则这条信号会谎报。"""
+    audit = _RecordingAuditLogger()
+    await _run_until_shutdown(
+        store=InMemoryRunStore(),
+        graph=_SlowGraph(state_values=_dangling_tail("send_email")),
+        tool_replay_safe=lambda name: name != "send_email",
+        audit=audit,
+    )
+    assert [e for e in audit.entries if e.reason == "handed_off"] == []
