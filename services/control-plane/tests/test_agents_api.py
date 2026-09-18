@@ -1057,13 +1057,19 @@ async def test_unmatched_arg_bindings_save_with_a_warning_not_a_refusal(
                     server="deepcare",
                     tool="customer_serach",
                     params=("project_code",),
-                    tool_found=False,
+                    reason="tool_missing",
                 ),
                 UnmatchedArgBinding(
                     server="deepcare",
                     tool="customer_search",
                     params=("employee_code",),
-                    tool_found=True,
+                    reason="params_absent",
+                ),
+                UnmatchedArgBinding(
+                    server="deepcare",
+                    tool="followup_plan_v1",
+                    params=("project_code",),
+                    reason="name_collision",
                 ),
             )
         )
@@ -1077,6 +1083,11 @@ async def test_unmatched_arg_bindings_save_with_a_warning_not_a_refusal(
     # 两类落空的改法不同,话也要分开说。
     assert "no such tool in the assembled catalog: deepcare/customer_serach" in warning
     assert "the tool no longer declares: deepcare/customer_search (employee_code)" in warning
+    # B-65 —— 撞名是第三类。说成上面任何一句都是假话:工具明明在目录里、参数也在,
+    # 配置的人会去改一个没写错的名字。
+    assert "another tool took over its internal name" in warning
+    assert "deepcare/followup_plan_v1 (project_code)" in warning
+    assert "no such tool in the assembled catalog: deepcare/followup_plan_v1" not in warning
 
     # 保存真的发生了 —— 警告档的全部意义就在这。
     listed = await client.get("/v1/agents")

@@ -503,7 +503,9 @@ async def test_a_binding_for_an_unadvertised_tool_is_reported_as_unmatched(
     )
     assert registry.get(_WIRE) is not None
     assert registry.unmatched_arg_bindings() == (
-        UnmatchedArgBinding(server=_SERVER, tool="t9", params=("project_code",), tool_found=False),
+        UnmatchedArgBinding(
+            server=_SERVER, tool="t9", params=("project_code",), reason="tool_missing"
+        ),
     )
 
 
@@ -521,7 +523,7 @@ async def test_a_binding_for_a_server_that_never_registered_is_reported_as_unmat
     )
     assert registry.unmatched_arg_bindings() == (
         UnmatchedArgBinding(
-            server="nosuchserver", tool="t1", params=("project_code",), tool_found=False
+            server="nosuchserver", tool="t1", params=("project_code",), reason="tool_missing"
         ),
     )
 
@@ -569,7 +571,7 @@ async def test_the_run_warns_when_a_binding_matched_nothing(graph_harness, caplo
 async def test_a_drifted_param_also_reaches_the_save_time_gate(mcp_registry_factory) -> None:
     """m-4 —— 「参数不在 schema 里」也走未命中那条通道,别只留一行日志。
 
-    ``tool_found=True`` 把它与「这个工具压根不存在」分开:后果一样(参数回到模型
+    ``reason="params_absent"`` 把它与「这个工具压根不存在」分开:后果一样(参数回到模型
     手里),但配置的人要做的事完全不同。
     """
     registry, _ = await mcp_registry_factory(
@@ -577,7 +579,7 @@ async def test_a_drifted_param_also_reaches_the_save_time_gate(mcp_registry_fact
         arg_bindings={"t1": {"gone": "pc"}},
     )
     assert registry.unmatched_arg_bindings() == (
-        UnmatchedArgBinding(server=_SERVER, tool="t1", params=("gone",), tool_found=True),
+        UnmatchedArgBinding(server=_SERVER, tool="t1", params=("gone",), reason="params_absent"),
     )
 
 
@@ -702,7 +704,7 @@ async def test_a_genuine_miss_is_still_reported_when_entries_are_split() -> None
         )
         assert registry.unmatched_arg_bindings() == (
             UnmatchedArgBinding(
-                server=_SERVER, tool="t1", params=("project_code",), tool_found=False
+                server=_SERVER, tool="t1", params=("project_code",), reason="tool_missing"
             ),
         ), order
         assert registry.arg_bindings() == {}, order
@@ -772,3 +774,98 @@ async def test_a_human_modify_cannot_overwrite_a_platform_binding(graph_harness)
     assert sent_args["keyword"] == "李", "没被绑的参数,人改了就算数"
     row = harness.audit_rows[-1]
     assert row.details["bound_args"] == ["project_code"]
+
+
+# ---------------------------------------------------------------------------
+# B-65 —— 绑定被 wire 名撞掉
+# ---------------------------------------------------------------------------
+
+#: ``mcp__`` (5) + ``deepcare`` (8) + ``__`` (2) = 15,cap 64 → 工具名只剩 49 个字符。
+#: 两个长名在第 49 个字符之后才分叉,就折成同一个 wire 名。第三方工具名不受我们控制,
+#: 这是最可能先发生的一种撞名(B-65 可达形状 ①),不需要任何古怪命名。
+_LONG_STEM = "get_patient_followup_plan_for_the_selected_cust"
+_LONG_A = f"{_LONG_STEM}omer_v1"
+_LONG_B = f"{_LONG_STEM}omer_v2"
+
+
+def _schema(*params: str) -> dict[str, Any]:
+    return {"type": "object", "properties": {p: {} for p in params}}
+
+
+async def test_two_long_tool_names_fold_to_one_wire_name() -> None:
+    """判据本身先立住:这两个名字确实撞。不然下面两条测的是别的东西。"""
+    from orchestrator.tools.mcp import mcp_tool_name
+
+    assert mcp_tool_name(_SERVER, _LONG_A) == mcp_tool_name(_SERVER, _LONG_B)
+
+
+async def test_a_binding_displaced_by_a_name_collision_is_reported(
+    mcp_registry_factory,
+) -> None:
+    """B-65 —— 绑定确实落地了,随后同名的第二个工具把它顶掉:``bind_tool_args`` 收到
+    空表、清掉表项,参数就这么回到了模型手里。修复前这里一条记录都没有。"""
+    registry, _ = await mcp_registry_factory(
+        tools=[
+            {"name": _LONG_A, "input_schema": _schema("project_code")},
+            {"name": _LONG_B, "input_schema": _schema("keyword")},
+        ],
+        arg_bindings={_LONG_A: {"project_code": "pc"}},
+    )
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(
+            server=_SERVER, tool=_LONG_A, params=("project_code",), reason="name_collision"
+        ),
+    )
+
+
+async def test_a_collision_is_not_reported_as_a_missing_tool(
+    mcp_registry_factory,
+) -> None:
+    """诚实性判据:撞名报成「目录里没有这个工具」是假话 —— 工具明明在目录里,
+    配置的人会照着去改一个没写错的名字。"""
+    registry, _ = await mcp_registry_factory(
+        tools=[
+            {"name": _LONG_A, "input_schema": _schema("project_code")},
+            {"name": _LONG_B, "input_schema": _schema("keyword")},
+        ],
+        arg_bindings={_LONG_A: {"project_code": "pc"}},
+    )
+    reasons = [u.reason for u in registry.unmatched_arg_bindings()]
+    assert "tool_missing" not in reasons
+    # 工具在目录里 —— 折叠后的那个名字注册着(虽然指向的是后来的那个工具)。
+    from orchestrator.tools.mcp import mcp_tool_name
+
+    assert registry.get(mcp_tool_name(_SERVER, _LONG_A)) is not None
+
+
+async def test_the_surviving_binding_of_a_collision_is_not_reported(
+    mcp_registry_factory,
+) -> None:
+    """反向:绑在**后**注册的那个上时,绑定活着 —— 不能因为有撞名就一律报警。"""
+    registry, _ = await mcp_registry_factory(
+        tools=[
+            {"name": _LONG_A, "input_schema": _schema("project_code")},
+            {"name": _LONG_B, "input_schema": _schema("project_code")},
+        ],
+        arg_bindings={_LONG_B: {"project_code": "pc"}},
+    )
+    assert registry.unmatched_arg_bindings() == ()
+    from orchestrator.tools.mcp import mcp_tool_name
+
+    assert registry.arg_bindings()[mcp_tool_name(_SERVER, _LONG_B)] == {"project_code": "pc"}
+
+
+async def test_a_fully_drifted_binding_is_not_also_called_a_collision(
+    mcp_registry_factory,
+) -> None:
+    """一条绑定的参数全漂没了时,``bind_tool_args`` 同样收到空表、同样清掉表项 ——
+    但那不是撞名,而且已经报过 ``params_absent``。同一条绑定只说一次。"""
+    registry, _ = await mcp_registry_factory(
+        tools=[{"name": "t1", "input_schema": _schema("keyword")}],
+        arg_bindings={"t1": {"project_code": "pc"}},
+    )
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(
+            server=_SERVER, tool="t1", params=("project_code",), reason="params_absent"
+        ),
+    )

@@ -1050,15 +1050,27 @@ def _unmatched_binding_warning(built: Any) -> str | None:
     unmatched = getattr(built, "unmatched_arg_bindings", ()) or ()
     if not unmatched:
         return None
-    # 两类落空的改法完全不同,所以分开说:名字写错 / 服务器没挂上,是「这个工具
-    # 压根不在目录里」;上游改了接口,是「工具在,但它不再声明这个参数」。
-    no_tool = [_binding_label(u) for u in unmatched if not u.tool_found]
-    no_param = [_binding_label(u) for u in unmatched if u.tool_found]
+    # 三类落空的改法完全不同,所以分开说:名字写错 / 服务器没挂上,是「这个工具
+    # 压根不在目录里」;上游改了接口,是「工具在,但它不再声明这个参数」;B-65 撞名,
+    # 是「工具在、参数也在,但它的内部名被另一个工具占走了」—— 对最后一种说前两种
+    # 里的任何一句都是假话,配置的人会去改一个没错的名字。
+    by_reason = {
+        reason: [_binding_label(u) for u in unmatched if u.reason == reason]
+        for reason in ("tool_missing", "params_absent", "name_collision")
+    }
     chunks: list[str] = []
-    if no_tool:
-        chunks.append("no such tool in the assembled catalog: " + "; ".join(no_tool))
-    if no_param:
-        chunks.append("the tool no longer declares: " + "; ".join(no_param))
+    if by_reason["tool_missing"]:
+        chunks.append(
+            "no such tool in the assembled catalog: " + "; ".join(by_reason["tool_missing"])
+        )
+    if by_reason["params_absent"]:
+        chunks.append("the tool no longer declares: " + "; ".join(by_reason["params_absent"]))
+    if by_reason["name_collision"]:
+        chunks.append(
+            "the tool is in the catalog but another tool took over its internal name "
+            "(names are folded and capped at 64 chars, so two long or similar tool names "
+            "can collide): " + "; ".join(by_reason["name_collision"])
+        )
     return (
         "some arg_bindings did not land, so their parameters stay in the model's "
         "hands — " + " | ".join(chunks) + ". Check the server / tool / parameter "

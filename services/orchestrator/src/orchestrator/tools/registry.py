@@ -170,6 +170,10 @@ class ToolSpec:
         return "read_only" if self.is_read_only else "reversible"
 
 
+#: B-61 §5.4 + B-65 —— 一条绑定落空的三种原因,见 :class:`UnmatchedArgBinding`。
+UnmatchedReason = Literal["tool_missing", "params_absent", "name_collision"]
+
+
 @dataclass(frozen=True)
 class UnmatchedArgBinding:
     """B-61 §5.4 —— 一条参数绑定没能落到真实工具上,以及落空到什么程度。
@@ -177,17 +181,23 @@ class UnmatchedArgBinding:
     只带**名字**:server、裸工具名、参数名。绑定的值是客户的真实资料(项目号、
     姓名),这条记录会走进保存响应和运行期日志,一个值都不能带。
 
-    ``tool_found`` 分开两种落空,因为给配置的人的话不一样:
-    ``False`` = 这个工具在组装出来的目录里根本不存在(server / tool 名字写错,
-    或那台服务器这次没挂上);``True`` = 工具在,只是它已经不声明这几个参数了
-    (上游改了接口)。两种的后果相同 —— 参数回到模型手里 —— 但改法完全不同。
+    ``reason`` 分开三种落空。后果都一样 —— 参数回到模型手里,模型继续手抄长串 ——
+    但给配置的人的话完全不同:
+
+    * ``tool_missing``:这个工具在组装出来的目录里根本不存在(server / tool 名字
+      写错,或那台服务器这次没挂上)。
+    * ``params_absent``:工具在,只是它已经不声明这几个参数了(上游改了接口)。
+    * ``name_collision`` (B-65):工具在、参数也在、绑定当时确实落上了,但它折叠出来
+      的 wire 名被**另一个**工具占走了(``mcp_tool_name`` 非法字符折 ``_`` 且截断到
+      64 字符,``register`` 又按名字覆盖),后注册的那个把这条绑定顶掉了。对配置的人
+      说「目录里没有这个工具」是假话 —— 工具明明在,坏的是名字撞了。
     """
 
     server: str
     tool: str
-    #: 落空的参数名。``tool_found=False`` 时是这条绑定的全部参数。
+    #: 落空的参数名。``tool_missing`` / ``name_collision`` 时是这条绑定的全部参数。
     params: tuple[str, ...]
-    tool_found: bool
+    reason: UnmatchedReason
 
 
 @dataclass(frozen=True)
@@ -493,7 +503,7 @@ class ToolRegistry:
         #: manifest 可以有多个条目,绑定表是跨条目并起来的,而某个兄弟条目的
         #: ``allow_tools`` 会把别人绑的那个工具挡在它那一次循环之外 —— 拿单次注册
         #: 的剩余项当答案,就会对一条**好好落了**的绑定谎报「目录里没这个工具」。
-        self._landed_arg_bindings: set[tuple[str, str]] = set()
+        self._landed_arg_bindings: dict[tuple[str, str], str] = {}
 
     def register(self, tool: Tool, *, deferred: bool = False, source: str | None = None) -> None:
         """Register a tool by its spec ``name``. Re-registering replaces.
@@ -590,7 +600,7 @@ class ToolRegistry:
         return {name: dict(bound) for name, bound in self._arg_bindings.items()}
 
     def note_unmatched_arg_binding(
-        self, server: str, tool: str, params: tuple[str, ...], *, tool_found: bool
+        self, server: str, tool: str, params: tuple[str, ...], *, reason: UnmatchedReason
     ) -> None:
         """B-61 §5.4 — 记一条落空的绑定。``params`` 只有名字,绝不含值。
 
@@ -598,7 +608,7 @@ class ToolRegistry:
         每一条都会把同一台服务器再注册一遍,于是同一条落空的绑定会被发现
         多次 —— 那是同一个事实,说一次就够(说两次只会让告警看起来像两个问题)。
         """
-        record = UnmatchedArgBinding(server=server, tool=tool, params=params, tool_found=tool_found)
+        record = UnmatchedArgBinding(server=server, tool=tool, params=params, reason=reason)
         if record not in self._unmatched_arg_bindings:
             self._unmatched_arg_bindings.append(record)
 
@@ -606,17 +616,27 @@ class ToolRegistry:
         """本次构建里落空的绑定(整条没匹配上的 + 参数漂移的)。"""
         return tuple(self._unmatched_arg_bindings)
 
-    def note_landed_arg_binding(self, server: str, tool: str) -> None:
-        """B-61 §5.4 — 这条绑定落在了一个真实注册的工具上。裸名,不折叠。"""
-        self._landed_arg_bindings.add((server, tool))
+    def note_landed_arg_binding(self, server: str, tool: str, wire_name: str) -> None:
+        """B-61 §5.4 — 这条绑定落在了一个真实注册的工具上,落在 ``wire_name`` 这个键下。
 
-    def landed_arg_bindings(self) -> frozenset[tuple[str, str]]:
-        """真落了地的绑定 ``(server, 裸工具名)``。
+        ``server`` / ``tool`` 是**裸名**(配置的人写的那两个),``wire_name`` 是注册用的
+        折叠名。B-65 —— wire 名是**传下来**的、不是在这里重算的:折叠规则(非法字符折
+        ``_``、截断 64)只有 ``register_mcp_tools`` 一处知道(裁定 X),判定侧学第二遍
+        就是留一条会静默走散的缝。
 
-        名字是**原始**的:折叠成 wire 名的规则只有 ``register_mcp_tools`` 一处知道
-        (裁定 X),判「落没落地」的那一侧不该学第二遍。
+        同一 ``(server, tool)`` 再次落地会覆盖 —— 后一次注册的就是活着的那个。
         """
-        return frozenset(self._landed_arg_bindings)
+        self._landed_arg_bindings[server, tool] = wire_name
+
+    def landed_arg_bindings(self) -> dict[tuple[str, str], str]:
+        """真落了地的绑定:``(server, 裸工具名) → 注册用的 wire 名``。
+
+        B-65 —— 只有「落地时的 wire 名」还不够判它现在是否仍然有效:两个工具折成同一个
+        wire 名时,后注册的那个会把前者的绑定从 ``arg_bindings`` 里清掉(见
+        :meth:`bind_tool_args`),而这里的记录还在。判定侧拿这个名回查
+        :meth:`arg_bindings`,名字不在了就是被顶掉了。
+        """
+        return dict(self._landed_arg_bindings)
 
     def deferred_specs(self, names: Iterable[str]) -> list[ToolSpec]:
         """Specs for the given ``names`` that are actually deferred.
