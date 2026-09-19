@@ -71,6 +71,7 @@ from expert_work.persistence.sandbox_instance_store import (
     SANDBOX_LAYOUT_AGENT_NS,
     SANDBOX_LAYOUT_USER_ROOT,
     InMemorySandboxInstanceStore,
+    SandboxClaimContendedError,
     _missing_row_message,
 )
 from orchestrator.tools import agent_sandbox as agent_sandbox_module
@@ -91,6 +92,7 @@ from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.sandbox import (
     EgressContext,
+    SandboxClaimTimeoutError,
     SandboxSupervisorError,
     WorkspaceQuotaExceededError,
     run_in_sandbox,
@@ -271,6 +273,11 @@ class FakeInstanceStore:
     #: (默认)时调用方落回 ``AgentSandboxClient.default_max_sandboxes``,与两
     #: 个生产 store"未设行返 None"同义。
     quota_limit: int | None = None
+    #: B-85 测试缝 —— ``claim_warm`` 撞上"赢家还在建"的累计次数。
+    contended_claims: int = 0
+    #: B-85 测试缝 —— 撞上第 N 次时把赢家行的 ``container_id`` 填上(模拟
+    #: 赢家在等待期间建完了)。``None``(默认)= 永不就绪。
+    contended_claims_before_ready: int | None = None
 
     async def claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID, layout: str
@@ -294,8 +301,20 @@ class FakeInstanceStore:
         container_id = row.get("container_id")
         if container_id:
             return (winner_id, container_id, row.get("acquired_at"), row["layout"])
-        msg = f"a sandbox is already being created for tenant={tenant_id} user={user_id}"
-        raise RuntimeError(msg)
+        self.contended_claims += 1
+        if (
+            self.contended_claims_before_ready is not None
+            and self.contended_claims >= self.contended_claims_before_ready
+        ):
+            # B-85 测试缝 —— 模拟"赢家在我们等待期间建完了"。下一轮 claim
+            # 就走上面那个"已就绪"分支,与生产里赢家 set_container_id 之后
+            # 输家看到的状态完全一样。
+            row["container_id"] = "sbx-winner"
+        # 类型是契约的一部分(Protocol docstring):调用方按类型区分"并发竞争"
+        # 与"真故障",替身抛别的类型就测不到生产真正走的那条路。
+        raise SandboxClaimContendedError(
+            f"a sandbox is already being created for tenant={tenant_id} user={user_id}"
+        )
 
     async def create_ephemeral(self, *, tenant_id: UUID, sandbox_id: UUID, layout: str) -> None:
         """Task 10 契约测试实测发现的缺口(完整理由见生产代码
@@ -596,25 +615,112 @@ async def test_create_failure_rollback_does_not_mask_original_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claim_warm_not_ready_surfaces_as_sandbox_supervisor_error() -> None:
-    """审查 Important-4:两个生产 store(SQL/内存)在"赢家已占坑但还在创建
-    中(container_id 仍是 NULL)"时都会 raise —— 之前只有裸 store 层测过,
-    ``AgentSandboxClient._claim_warm`` 把这类异常包成 ``SandboxSupervisorError``
-    那段代码在 client 层零覆盖。这个窗口是探针报告实测的 35-40s E2B 冷启
-    宽窗口,是并发 acquire 最可能撞上的真实结果,不是理论边界。
+async def test_claim_warm_not_ready_waits_then_reuses_the_winner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-85 —— 撞上"赢家还在建"时平台自己等,等到了就复用赢家的沙箱。
+
+    这个窗口是探针报告实测的 35-40s E2B 冷启宽窗口,是并发 acquire 最可能
+    撞上的真实结果,不是理论边界。**它以前会原样冒给模型**:分类器判
+    ``unknown`` → advisory 劝"别重试" → 模型放弃 → 图正常收尾 → run 报
+    ``status=success`` 而产物为空。2026-09-19 的金丝雀就是这么红的。
+
+    正确行为是等:输家什么都做不了,模型更做不了,而赢家几十秒后就会把
+    ``container_id`` 填上,那一刻输家直接复用它(本仓库并发语义里输家本来
+    就共享赢家的沙箱)。
     """
-    sdk, store = FakeSdk(), FakeInstanceStore()
+    monkeypatch.setattr(agent_sandbox_module, "_CLAIM_CONTENDED_POLL_S", 0.0)
+    sdk, store = FakeSdk(), FakeInstanceStore(contended_claims_before_ready=2)
     client = make_client(sdk, store)
     tenant_id, user_id = uuid4(), uuid4()
 
     # 第一路直接对 store 占坑、不让它走到 set_container_id —— 精确模拟
     # "赢家还在创建中"这个状态,不依赖 acquire() 的完整流程凑巧卡在那。
+    winner_id = uuid4()
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=winner_id, layout=client.layout
+    )
+
+    sandbox_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert sandbox_id == winner_id, "等到之后要复用赢家那一行,不是自铸的 id"
+    assert store.contended_claims == 2, "第一次撞上就该等,而不是直接抛"
+    assert sdk.created == [], "复用赢家的沙箱,不该自己再建一个"
+
+
+@pytest.mark.asyncio
+async def test_claim_warm_contended_gives_up_after_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-85 —— 等满预算赢家还没好,才抛;抛的必须是 ``TimeoutError``。
+
+    两条断言缺一不可:
+
+    * 等**过**(``contended_claims > 1``)—— 否则这就是修复前的"立刻抛"。
+    * 抛的是 :class:`SandboxClaimTimeoutError`,而它**是** ``TimeoutError``
+      —— ``error_classifier._classify_by_signal`` 的第一条按这个类型判
+      ``transient``。这是 B-85 ① 的修法:不往关键词表里加词(词表追不上错误
+      文本),让类型说话。
+    """
+    monkeypatch.setattr(agent_sandbox_module, "_CLAIM_CONTENDED_POLL_S", 0.0)
+    monkeypatch.setattr(agent_sandbox_module, "_CLAIM_CONTENDED_WAIT_S", 0.05)
+    sdk, store = FakeSdk(), FakeInstanceStore()  # 永不就绪
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
     await store.claim_warm(
         tenant_id=tenant_id, user_id=user_id, sandbox_id=uuid4(), layout=SANDBOX_LAYOUT_USER_ROOT
     )
 
-    with pytest.raises(SandboxSupervisorError, match="already being created"):
+    with pytest.raises(SandboxClaimTimeoutError, match="already being created") as excinfo:
         await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert isinstance(excinfo.value, TimeoutError), "分类器按 TimeoutError 判 transient"
+    assert isinstance(excinfo.value, SandboxSupervisorError), "§ 6.5 统一错误契约不能破"
+    assert store.contended_claims > 1, "放弃之前必须真等过,不是原地抛一个新名字"
+
+
+@pytest.mark.asyncio
+async def test_claim_warm_rebuild_path_does_not_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-85 —— 等待只挂在**首次占坑**上,重建分支的重新占坑不等。
+
+    重建分支(布局不合 / 超龄 / 重连失败)刚刚自己 ``destroy`` 让出了槽位,
+    正常必赢;此时还撞上竞争者说明真出了事,原地抛比等满 120s 再抛既快又
+    诚实。这条测试钉住这个刻意的不对称 —— 否则"到处都等一下"会悄悄把一个
+    真故障拖成两分钟的挂起。
+    """
+    monkeypatch.setattr(agent_sandbox_module, "_CLAIM_CONTENDED_POLL_S", 0.0)
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    # 摆出"有一个已就绪但布局不合的热会话"——acquire 会 destroy 它再重新占坑。
+    winner_id = uuid4()
+    await store.claim_warm(
+        tenant_id=tenant_id, user_id=user_id, sandbox_id=winner_id, layout="some-old-layout"
+    )
+    store.rows[winner_id]["container_id"] = "sbx-old"
+
+    # destroy 让出槽位后,让第三方竞争者抢先占住 —— 重新占坑必然撞上"正在建"。
+    async def steal_the_slot(*, sandbox_id: UUID, reason: str) -> None:
+        await original_mark_destroyed(sandbox_id=sandbox_id, reason=reason)
+        store.warm[(tenant_id, user_id)] = thief_id
+        store.rows[thief_id] = {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "acquired_at": datetime.now(UTC),
+            "layout": SANDBOX_LAYOUT_USER_ROOT,
+        }
+
+    thief_id = uuid4()
+    original_mark_destroyed = store.mark_destroyed
+    store.mark_destroyed = steal_the_slot  # type: ignore[method-assign]
+
+    with pytest.raises(SandboxSupervisorError, match="already being created") as excinfo:
+        await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert not isinstance(excinfo.value, SandboxClaimTimeoutError), "重建分支不等,直接抛"
+    assert store.contended_claims == 1, "撞一次就抛,不进等待循环"
 
 
 @pytest.mark.asyncio

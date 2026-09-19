@@ -203,6 +203,23 @@ class SandboxSupervisorError(RuntimeError):
     """
 
 
+class SandboxClaimTimeoutError(SandboxSupervisorError, TimeoutError):
+    """等并发的赢家把沙箱建完,等满了预算它还没好(B-85)。
+
+    两个基类各承一件事,缺一不可:
+
+    * :class:`SandboxSupervisorError` —— 既有的宽 ``except`` 照常接住,沙箱
+      层 § 6.5 的统一错误契约不破。
+    * :class:`TimeoutError` —— ``error_classifier._classify_by_signal`` 的
+      第一条就是按这个类型判 ``transient``。**等待超时的本质就是超时**,
+      所以这里不需要往 ``_TRANSIENT_NEEDLES`` 加关键词:词表追不上错误文本
+      (B-85 ①),类型追得上。
+
+    走到这里说明 :meth:`AgentSandboxClient._claim_warm_waiting` 已经替模型等
+    过一整个预算了,此时冒给模型是对的——那不再是"正常竞争",是真出了事。
+    """
+
+
 class WorkspacePermissionError(SandboxSupervisorError):
     """工作区文件存在,但本进程的 uid/gid 读写不动它。
 

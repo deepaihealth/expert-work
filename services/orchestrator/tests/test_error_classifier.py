@@ -14,6 +14,7 @@ from orchestrator.tools.error_classifier import (
     render_recovery_advisory,
 )
 from orchestrator.tools.registry import ToolNotFoundError, ToolSpec
+from orchestrator.tools.sandbox import SandboxClaimTimeoutError
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -59,6 +60,25 @@ def test_blocked_takes_precedence_over_exception_type() -> None:
 
 def test_timeout_error_type_is_transient() -> None:
     err = classify_tool_error(tool_name="fetch", error=TimeoutError("boom"))
+    assert err.error_class == "transient"
+
+
+def test_sandbox_claim_timeout_is_transient() -> None:
+    """B-85 —— 等并发赢家建沙箱等超时,必须落进 ``transient``,不是 ``unknown``。
+
+    这条钉的是 :class:`SandboxClaimTimeoutError` 那个刻意的**双基类**:它同
+    时是 ``TimeoutError``,所以上面那条按类型判的规则直接接住它。修复前这个
+    失败走的是文本匹配,一条都不中 → ``unknown`` → advisory 劝模型「别重
+    试」→ 模型放弃 → run 报 ``status=success`` 而产物为空(2026-09-19 金丝
+    雀实况)。
+
+    刻意**不往** ``_TRANSIENT_NEEDLES`` 加关键词:词表追不上错误文本,而类型
+    追得上。有人把那两个基类改成一个,这条会红。
+    """
+    err = classify_tool_error(
+        tool_name="exec_python",
+        error=SandboxClaimTimeoutError("a sandbox is already being created — retry shortly"),
+    )
     assert err.error_class == "transient"
 
 
