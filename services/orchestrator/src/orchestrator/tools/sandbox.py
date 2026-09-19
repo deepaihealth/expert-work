@@ -39,6 +39,7 @@ from expert_work.persistence import SANDBOX_AGENTS_ROOT
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.sandbox_image_contract import preinstalled_note
 from orchestrator.tools.workspace_paths import agent_nas_root
 
 logger = logging.getLogger(__name__)
@@ -857,6 +858,9 @@ class ExecPythonTool:
                 "列表项的确切路径在清单里该项的 local_path"
                 "（值是 JSON 字符串时在 value_parsed[i].local_path）。"  # noqa: RUF001
                 "文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
+                # B-82 —— 预装清单。不说,模型就只能「先探测环境」或干脆先装一遍,
+                # 而在阿里云上装一遍是一两分钟(B-81)。渲染在 contract 模块一处。
+                + preinstalled_note()
             ),
             parameters={
                 "type": "object",

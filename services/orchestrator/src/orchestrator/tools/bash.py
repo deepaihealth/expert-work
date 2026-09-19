@@ -45,6 +45,7 @@ from orchestrator.tools.sandbox import (
     format_sandbox_outcome,
     run_in_sandbox,
 )
+from orchestrator.tools.sandbox_image_contract import preinstalled_note
 
 #: ``acquire`` thread label when the run has no id (ad-hoc call).
 _FALLBACK_THREAD_ID = "bash"
@@ -107,6 +108,9 @@ class BashTool:
                 "列表项的确切路径在清单里该项的 local_path"
                 "（值是 JSON 字符串时在 value_parsed[i].local_path）。"  # noqa: RUF001
                 "文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
+                # B-82 —— 预装清单。不说,模型就只能「先探测环境」或干脆先装一遍,
+                # 而在阿里云上装一遍是一两分钟(B-81)。渲染在 contract 模块一处。
+                + preinstalled_note()
             ),
             parameters={
                 "type": "object",
