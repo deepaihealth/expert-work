@@ -20,6 +20,28 @@
 # - idleTimeout 60 / requestTimeout 180 是产品上限(不提工单),SSE 靠心跳帧
 #   续命——同 test 文件头注。
 # - 后续改监听照旧用 merge patch 整段替换 listeners(必须带 80,那是沙箱网关的)。
+# 2026-09-19 (B-55) —— 80 端口的两条 timeout 是**新加的,不是抄来的**。
+#
+# 在此之前这个监听只有 `port` + `protocol`,于是吃阿里云 ALB 的默认值
+# (RequestTimeout 60s)。而**沙箱网关就在 80 上**(见上面那句「必须带 80」),
+# E2B SDK 也是明确走 HTTP 的(`patch_e2b(https=False)`,e2b_patch.py 有注释)。
+# 冷建一个沙箱要 66s(VPC)/112s(公网) —— 比 60s 长。结果:
+#
+#   e2b.exceptions.SandboxException: 504: '<h1>504 Gateway Time-out</h1>
+#                                          <hr><center>alb</center>'
+#   duration_ms: 60240
+#
+# 这不是"慢",是**建不出来**。去数 sandbox_instance 的 528 行:
+#   destroy_reason='create_failed'  99 行 = 18.8%
+#   2026-09-19 当天                 15 次里 13 次失败 = 87%
+#   每一条的存活时间都恰好 60 秒
+# CI 的 "Contract suite against the real E2B test cluster" 也是同一个受害者:
+# 19 个用例各卡满 60s 再红,错误正文就是上面那段 504。
+#
+# 为什么只提 requestTimeout 不动 idleTimeout 的上限:实测卡在 60.24s,正是
+# RequestTimeout 的默认值;idleTimeout 写 60 是与 443 对齐(也是不提工单的上限),
+# 它一直不是绑住这件事的那一个。180 给冷建留了约 1.6 倍余量 —— 即便 1a(VPC)
+# 与 1b(镜像瘦身)都上线,66s→46s 也只是把余量做厚,不是让这条可以不设。
 apiVersion: alibabacloud.com/v1
 kind: AlbConfig
 metadata:
@@ -35,6 +57,8 @@ spec:
   listeners:
     - port: 80
       protocol: HTTP
+      idleTimeout: 60
+      requestTimeout: 180
     - port: 443
       protocol: HTTPS
       idleTimeout: 60
