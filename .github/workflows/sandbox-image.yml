@@ -53,7 +53,25 @@ jobs:
     # debs on a cold cache); the multi-arch push also cross-builds linux/arm64
     # under QEMU emulation (slow for this heavy base). Generous headroom; the
     # gha cache warms it after the first push.
-    timeout-minutes: 90
+    # 90 → 180(2026-09-19)。B-55 砍 apt 层(#1623)那次**正好跑满 90 分钟被 kill**,
+    # 倒在 `Build + push to ACR (multi-arch)` 上,镜像没推上去。
+    #
+    # 原因是这个 job 实际建**三次**:`Build (load local)` 建一次 amd64 供 smoke 与
+    # Trivy 用(实测 26m51s),然后 `Build + push` 再建 amd64 + arm64 两个平台,
+    # 而 arm64 那半边走 QEMU 模拟 —— apt 层在模拟下是数倍时间。平时缓存命中所以
+    # 看不出来;**改了 apt 包列表的那一次必然全冷建**,也正是最需要它成功的那一次。
+    #
+    # 与 sandbox-gvisor.yml 的 30 → 45、ci.yml integration 的 40 → 60 是同一条理由:
+    # 冷建不是异常路径,是「改完那一层之后的第一批」的常态。
+    #
+    # 180 的依据:amd64 冷建实测 26m51s,arm64 在 QEMU 下按 3~4 倍估 ≈ 105 分钟,
+    # 加上两次构建与推送约 140 分钟,留 40 分钟余量。
+    #
+    # 真正的长期解法是**别建 arm64** —— 仓里没有任何路径从 ACR 拉沙箱镜像的 arm64:
+    # 本地开发走 `make build-sandbox` 本地构建 `expert-work-sandbox:dev`,
+    # ACR 那份唯一的消费者是 `infra/k8s/sandbox/sandboxset.yaml`,跑在 amd64 集群上。
+    # 那是一次「删掉一个已发布的平台」的改动,单独拍板,不在这条里顺手做。
+    timeout-minutes: 180
     steps:
       # Actions are SHA-pinned (a mutable tag could be re-pointed at malicious
       # code in this credential-holding workflow); the trailing comment tracks
