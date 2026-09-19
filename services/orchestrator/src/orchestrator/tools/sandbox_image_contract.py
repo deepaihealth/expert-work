@@ -138,3 +138,74 @@ MAX_OUTPUT_CHARS = 1_000_000
 #: sys.path"(防 /tmp、/workspace 落的文件遮蔽 stdlib)。对家是 ``runner.py``
 #: 的 subprocess argv,闸在 test_exec_contract_constants_match_the_sandbox_image。
 SANDBOX_PYTHON_FLAGS: tuple[str, ...] = ("-E", "-P")
+
+#: 沙箱镜像预装的 Python 库(``infra/sandbox-image/requirements.txt`` 的顶层钉版,
+#: 按该文件的声明顺序)。与 :data:`SANDBOX_IMAGE_ENV` 同一形态:事实源在镜像里、
+#: 编排进程运行时读不到,所以只能是第二份副本 + 一道漂移闸
+#: (``test_preinstalled_matches_requirements``)。
+#:
+#: **这份清单不是给代码用的,是给模型看的。** 2026-09-19 数测试环境 60 天的真实
+#: ``pip install``:模型两次装的是镜像里早就有的 ``python-docx``,另有两次在对话里
+#: 明说「让我先探测环境」「if it fails on import, I'll pip install」—— 它不知道
+#: 镜像里有什么,只能猜。而在阿里云上 pip 直连 pypi.org 是 16 KiB/s(B-81),猜错
+#: 一次就是一两分钟。把清单写进 ``exec_python`` / ``bash`` 的工具描述,比让它装
+#: 一次包便宜三个数量级。
+#:
+#: **口径**:它描述的是**部署中的镜像**,而这里比对的是 ``requirements.txt``——
+#: 两者只在镜像钉子跟得上源码时才等价。那道信号已经有了(B-57,``smoke.sh`` 的
+#: "sandbox image pin" 段,warn-only):``infra/sandbox-image/`` 改过而钉子没动时
+#: 会警告。所以往这份清单里加包 = 必须同时走
+#: ``docs/runbooks/sandbox-image-release.md`` 重烤并刷钉子,否则工具描述会开始说谎。
+SANDBOX_PREINSTALLED_PYTHON: tuple[str, ...] = (
+    "pandas",
+    "openpyxl",
+    "python-docx",
+    "python-pptx",
+    "pypdf",
+    "pdfplumber",
+    "markdown",
+    "weasyprint",
+    "pydyf",
+    "Pillow",
+    "matplotlib",
+    "pdf2image",
+    "imageio",
+    "imageio-ffmpeg",
+    "defusedxml",
+)
+
+#: 镜像预装的**命令行工具**(``infra/sandbox-image/Dockerfile`` 的 apt 段里值得
+#: 告诉模型的那几个;字体/locale/共享库这类它用不上的不列)。加进来的直接理由:
+#: 2026-09-19 的采集里模型写过「如需重算公式**再装 LibreOffice** 并运行技能目录下
+#: 的 recalc.py」—— LibreOffice 早就在镜像里,它不知道。
+#:
+#: 闸在 ``test_preinstalled_binaries_are_in_the_dockerfile``(单向:这里列的必须
+#: 真的 apt 装了。反向不钉 —— Dockerfile 里装的多数是共享库,不该也不必进工具描述)。
+SANDBOX_PREINSTALLED_BINARIES: tuple[tuple[str, str], ...] = (
+    ("soffice", "libreoffice-writer-nogui"),
+    ("pdftoppm", "poppler-utils"),
+    ("ffmpeg", "ffmpeg"),
+    ("node", "nodejs"),
+    ("npm", "npm"),
+)
+
+
+def preinstalled_note() -> str:
+    """一句话版的预装清单 —— 进 ``exec_python`` / ``bash`` 的工具描述。
+
+    做成函数而不是把句子抄两遍:这两个工具的描述尾部已经有一大段**逐字重复**的
+    输入变量说明,再添一段重复的就是第三份要同步的副本。渲染在一处,两个工具
+    共用同一份字节。
+
+    为什么值得占这点上下文:见 :data:`SANDBOX_PREINSTALLED_PYTHON` 的理由段。
+    一次白装的代价是一两分钟墙钟,这句话不到 200 字符,而且落在系统提示词的
+    稳定前缀里、每轮走缓存读。
+    """
+    libs = "、".join(SANDBOX_PREINSTALLED_PYTHON)
+    bins = "、".join(name for name, _pkg in SANDBOX_PREINSTALLED_BINARIES)
+    return (
+        f"沙箱已预装这些 Python 库，直接 import 即可：{libs}；"  # noqa: RUF001
+        f"命令行工具有 {bins}。"
+        "清单里的不要再 pip install / apt install —— 装一遍要一两分钟，而且它本来就在。"  # noqa: RUF001
+        "只有清单以外的包才需要装。"
+    )
