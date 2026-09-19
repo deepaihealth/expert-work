@@ -60,11 +60,19 @@ class SandboxInstanceStore(Protocol):
           ``layout`` 是赢家那一行建时写的布局(B-60),供 ``acquire`` 判是否
           需要 ``layout_mismatch`` 重建;同样是同一次 SELECT 顺带取出。
         * 没占到、赢家还在创建中(``container_id`` 仍是 NULL)且这行**还没
-          超过** ``_STUCK_CREATE_TTL_S`` → 允许实现 raise(两个生产实现都
-          如此)。E2B 冷启实测 35-40s(见探针报告),这不是罕见边界窗口,
-          调用方必须能收到一个明确错误,而不是悄悄再建一个沙箱(破坏"同时
-          只有一个热沙箱"的不变式)或者在后续 :meth:`set_container_id` 时
-          对着一个从未插入的行操作。
+          超过** ``_STUCK_CREATE_TTL_S`` → 实现必须抛
+          :class:`~expert_work.persistence.sandbox_instance_store.SandboxClaimContendedError`
+          (**这个类型是契约的一部分**,不是随便一个 ``RuntimeError``)。
+          E2B 冷启实测 35-40s(见探针报告),这不是罕见边界窗口,调用方必须
+          能收到一个明确信号,而不是悄悄再建一个沙箱(破坏"同时只有一个热
+          沙箱"的不变式)或者在后续 :meth:`set_container_id` 时对着一个从未
+          插入的行操作。
+
+          **类型而非措辞**:B-85 —— 调用方
+          (``AgentSandboxClient._claim_warm_waiting``)要按它区分"这是并发
+          竞争,该等"和"这是真故障,该抛",而按错误文本判会随措辞漂掉。这
+          一条同样约束测试替身:仓内每个 ``FakeInstanceStore`` 也必须抛这个
+          类型,否则它测的是一条生产走不到的路径。
         * 没占到、``container_id`` 仍是 NULL、但这行**已经超过**
           ``_STUCK_CREATE_TTL_S`` → 实现必须**接管**它(清掉那行、重试这次
           claim),不能 raise。全分支终审 Critical-1:上一条那个 raise 如果

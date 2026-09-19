@@ -112,12 +112,16 @@ from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
-from expert_work.persistence.sandbox_instance_store import SANDBOX_LAYOUT_AGENT_NS
+from expert_work.persistence.sandbox_instance_store import (
+    SANDBOX_LAYOUT_AGENT_NS,
+    SandboxClaimContendedError,
+)
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
 from orchestrator.tools.exec_view import build_exec_command
 from orchestrator.tools.nas_workspace_store import workspace_deleted_marker, workspace_user_root
 from orchestrator.tools.sandbox import (
     EgressContext,
+    SandboxClaimTimeoutError,
     SandboxOutcome,
     SandboxSupervisorError,
     exec_envs,
@@ -213,6 +217,22 @@ _WORKSPACE_DELETED_RACE_REASON = "workspace_deleted_race"
 #: (B-60 spec §4.6). Rebuilt through the same path as ``_WARM_AGE_DESTROY_REASON``;
 #: a distinct literal so an operator can tell "换代" from "token 快到期" in the column.
 _LAYOUT_MISMATCH_DESTROY_REASON = "layout_mismatch"
+
+#: B-85 —— 撞上"同一个 (tenant, user) 正在被另一个并发 acquire 建沙箱"时,
+#: :meth:`AgentSandboxClient._claim_warm_waiting` 自己最多等多久(秒)。
+#:
+#: 取值:实测 E2B 冷启动 35-40s;B-55 那条虚拟节点无层缓存的冷拉镜像最坏
+#: ~110s。120s 覆盖到最坏那档,又远小于 ``_STUCK_CREATE_TTL_S``(300s,陈旧
+#: 中间态的接管阈值)——两条规则不能交叉:还没到"这行卡死了"的判定线之前,
+#: 我们只应该等,不应该去接管别人正在用的槽位。
+#:
+#: **等待期间阻塞的是这一次 acquire,不是事件循环**(``asyncio.sleep``)。
+#: 一次金丝雀冷跑实测总时长 295s,120s 在同一量级的预算里。
+_CLAIM_CONTENDED_WAIT_S = 120.0
+
+#: 等待期间多久回头看一次赢家好没好(秒)。每轮是一次失败的 INSERT + 一次
+#: SELECT,轻量;2s 让赢家一就绪就几乎立刻被感知到,整个预算内最多 60 轮。
+_CLAIM_CONTENDED_POLL_S = 2.0
 
 #: :meth:`AgentSandboxClient.exec` 兜底分支判"这是超时"的时长门槛,按
 #: ``effective`` 的比例算。envd 掐断一条跑满时限的命令时,SDK 抛的**不总是**
@@ -578,7 +598,9 @@ class AgentSandboxClient:
             await self.quota_gate.check(tenant_id=tenant_id, user_id=user_id)
         existing: tuple[UUID, str, datetime | None, str] | None = None
         if user_id is not None:
-            existing = await self._claim_warm(
+            # B-85 —— 首次占坑走会等的那一版:撞上并发时平台自己等赢家建完再
+            # 复用,别把一个模型无从处置的内部竞争甩给它。
+            existing = await self._claim_warm_waiting(
                 tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
             )
 
@@ -1022,6 +1044,72 @@ class AgentSandboxClient:
             raise SandboxSupervisorError(
                 f"failed to prepare workspace directory {path}: {exc}"
             ) from exc
+
+    async def _claim_warm_waiting(
+        self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID
+    ) -> tuple[UUID, str, datetime | None, str] | None:
+        """B-85 —— 撞上并发时**平台自己等**,不把它甩给模型。
+
+        "同一个 ``(tenant, user)`` 正在建沙箱"是平台自己内部的竞争:两个
+        acquire 同时进来,CAS 只能有一个赢家。输家什么都做不了,模型更做不了
+        ——它既不知道有别人在建,也没有任何能改的参数。正确的动作是等赢家把
+        ``container_id`` 填上,然后**复用它**(``claim_warm`` 的
+        "已就绪"分支),这正是本仓库并发语义里输家该走的路。
+
+        2026-09-19 实况:这个错误原样冒到了模型面前,被分类器判 ``unknown``,
+        advisory 于是劝它"avoid retrying the identical call";模型照办放弃,
+        图正常收尾,run 报 ``status=success`` 而产物为空——一次静默假绿。
+        只补分类器是治标:错误文本会变,而这个错误**根本就不该走到那一层**。
+
+        等满 :data:`_CLAIM_CONTENDED_WAIT_S` 还没就绪才抛,且抛的是
+        :class:`SandboxClaimTimeoutError`(同时是 ``TimeoutError``,分类器按
+        类型判 ``transient``)——那时已经不是"正常竞争"了。
+
+        只挂在 :meth:`acquire` 的**首次占坑**上。重建/重连失败分支里的重新
+        占坑刻意**不等**:那两处刚刚自己让出槽位,正常必赢,撞上第三方竞争者
+        是真异常,原地抛比等 120s 再抛更快也更诚实。
+        """
+        deadline = time.monotonic() + _CLAIM_CONTENDED_WAIT_S
+        waited = False
+        while True:
+            try:
+                existing = await self._claim_warm(
+                    tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
+                )
+            except SandboxSupervisorError as exc:
+                # 按类型判,不按文本 —— 见 SandboxClaimContendedError 的 docstring。
+                # ``_claim_warm`` 用 ``from exc`` 包装,所以原异常一定在 __cause__ 上。
+                if not isinstance(exc.__cause__, SandboxClaimContendedError):
+                    raise
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "warm sandbox claim still contended after %ss, giving up "
+                        "(tenant=%s user=%s)",
+                        _CLAIM_CONTENDED_WAIT_S,
+                        tenant_id,
+                        user_id,
+                    )
+                    raise SandboxClaimTimeoutError(str(exc)) from exc
+                if not waited:
+                    # 只在进入等待时记一次 —— 每 2s 一行会把日志淹掉,而
+                    # "这次 acquire 等过"这一个事实就够运维把慢 run 归因到并发。
+                    logger.info(
+                        "warm sandbox is being created by a concurrent acquire, "
+                        "waiting up to %ss (tenant=%s user=%s)",
+                        _CLAIM_CONTENDED_WAIT_S,
+                        tenant_id,
+                        user_id,
+                    )
+                    waited = True
+                await asyncio.sleep(_CLAIM_CONTENDED_POLL_S)
+            else:
+                if waited:
+                    logger.info(
+                        "warm sandbox claim resolved after waiting (tenant=%s user=%s)",
+                        tenant_id,
+                        user_id,
+                    )
+                return existing
 
     async def _claim_warm(
         self, *, tenant_id: UUID, user_id: UUID, sandbox_id: UUID

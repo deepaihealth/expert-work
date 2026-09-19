@@ -24,6 +24,7 @@ from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
     SANDBOX_LAYOUT_USER_ROOT,
     InMemorySandboxInstanceStore,
+    SandboxClaimContendedError,
     _missing_row_message,
 )
 
@@ -44,7 +45,11 @@ async def test_claim_warm_raises_while_the_winner_is_still_creating() -> None:
         is None
     )
 
-    with pytest.raises(RuntimeError, match="already being created"):
+    # B-85 —— 断言的是**类型**不只是措辞:调用方
+    # (``AgentSandboxClient._claim_warm_waiting``)按这个类型区分「并发竞争,
+    # 该等」与「真故障,该抛」。降级成裸 ``RuntimeError`` 会让它当成真故障
+    # 直接冒给模型 —— 正是 B-85 那次静默假绿的形状。
+    with pytest.raises(SandboxClaimContendedError, match="already being created"):
         await store.claim_warm(
             tenant_id=tenant_id,
             user_id=user_id,

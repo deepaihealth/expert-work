@@ -125,6 +125,21 @@ SANDBOX_LAYOUT_USER_ROOT = "user-root"
 SANDBOX_LAYOUT_AGENT_NS = "agent-ns"
 
 
+class SandboxClaimContendedError(RuntimeError):
+    """另一个并发 ``acquire`` 正在为同一个 ``(tenant, user)`` 建沙箱。
+
+    B-85 —— 从 :meth:`claim_warm` 的其它失败里分出来**不是为了措辞**,是因为
+    它根本不是故障:两个 acquire 同时进来,CAS 只能有一个赢家,输家该**等**赢家
+    把 ``container_id`` 填上再复用它,而不是把一句模型无从处置的「有人正在建」
+    当成工具错误往上抛。2026-09-19 那次静默假绿正是这么来的——文本自己写着
+    ``retry shortly``,分类器却判 ``unknown``、劝模型「别重试」,模型照办,图正常
+    收尾,run 报 ``status=success`` 而产物为空。
+
+    调用方按**类型**判(``AgentSandboxClient._claim_warm_waiting``),不按文本:
+    它要区分的是「这是竞争还是真故障」,而关键词表追不上错误文本。
+    """
+
+
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -140,6 +155,17 @@ def _missing_row_message(sandbox_id: UUID) -> str:
     return (
         f"sandbox row {sandbox_id} is gone (destroyed, or never inserted) — "
         "cannot record its container id"
+    )
+
+
+def _claim_contended_message(tenant_id: UUID, user_id: UUID) -> str:
+    """两个 store 撞上"赢家已占坑、还在创建中"时共用的措辞。
+
+    共享的理由同 :func:`_missing_row_message`:两份实现必须在**含义**上一致,
+    而字面量各写一份就会漂。
+    """
+    return (
+        f"a sandbox is already being created for tenant={tenant_id} user={user_id} — retry shortly"
     )
 
 
@@ -325,11 +351,7 @@ class SqlSandboxInstanceStore:
                     sandbox_id=winner_id, reason=_REASON_STUCK_CREATE_TAKEOVER
                 )
                 continue
-            msg = (
-                f"a sandbox is already being created for tenant={tenant_id} "
-                f"user={user_id} — retry shortly"
-            )
-            raise RuntimeError(msg)
+            raise SandboxClaimContendedError(_claim_contended_message(tenant_id, user_id))
         msg = (
             f"could not claim a warm sandbox slot for tenant={tenant_id} "
             f"user={user_id} after {_CLAIM_WARM_MAX_ATTEMPTS} attempts"
@@ -768,11 +790,7 @@ class InMemorySandboxInstanceStore:
                     sandbox_id=existing_id, reason=_REASON_STUCK_CREATE_TAKEOVER
                 )
                 continue
-            msg = (
-                f"a sandbox is already being created for tenant={tenant_id} "
-                f"user={user_id} — retry shortly"
-            )
-            raise RuntimeError(msg)
+            raise SandboxClaimContendedError(_claim_contended_message(tenant_id, user_id))
         msg = (
             f"could not claim a warm sandbox slot for tenant={tenant_id} "
             f"user={user_id} after {_CLAIM_WARM_MAX_ATTEMPTS} attempts"

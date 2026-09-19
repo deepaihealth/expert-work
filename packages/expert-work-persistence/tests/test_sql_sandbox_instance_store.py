@@ -36,6 +36,7 @@ from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
     AGENT_SANDBOX_IMAGE_REF,
     SANDBOX_LAYOUT_USER_ROOT,
+    SandboxClaimContendedError,
     SqlSandboxInstanceStore,
 )
 from expert_work.protocol.quota import QuotaDimension
@@ -136,7 +137,9 @@ async def test_claim_warm_second_caller_raises_when_winner_not_ready(
     )
     # Deliberately do NOT call set_container_id — simulates "still creating".
 
-    with pytest.raises(RuntimeError, match="already being created"):
+    # B-85 —— 断言类型而不只是措辞,与内存侧同一条理由:调用方按这个类型区分
+    # 「并发竞争,该等」与「真故障,该抛」。
+    with pytest.raises(SandboxClaimContendedError, match="already being created"):
         await store.claim_warm(
             tenant_id=tenant_id,
             user_id=user_id,
