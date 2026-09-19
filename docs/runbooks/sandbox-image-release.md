@@ -22,6 +22,12 @@
 
 2. **换 tag**:改 `infra/k8s/sandbox/sandboxset.yaml` 中 `containers[main].image` 的 tag。
 
+   **只改 tag,别动 host。** 第 1 步的 `docker manifest inspect` 用的是**公网** host
+   (你的开发机不在 VPC 里,只能走公网),而 manifest 里钉的是 **`-vpc`** host
+   (B-55:同一个 619MB 镜像公网 112s / VPC 66s,理由写在 yaml 那一行上面)。
+   照着第 1 步的命令整段粘过去会把 host 一起换回公网 —— 不会报错,只是这次发布
+   悄悄把沙箱冷启退回慢的那条路。
+
    **永不复用已存在的 tag**:ACS 镜像缓存按 tag 解析、不回源比对 digest,
    重推同名 tag 集群可能继续用旧层。每次发布都用新 sha tag。
 

@@ -244,6 +244,33 @@ else
     fi
 fi
 
+# B-55 —— 同一个文件的第二件事:沙箱镜像必须引用 **-vpc** host。
+#
+# 这一条存在是因为它的失败形态是**无声的**:换 tag 的 runbook 第 1 步用公网 host
+# 跑 `docker manifest inspect`(开发机不在 VPC 里,只能走公网),第 2 步只该改 tag。
+# 把第 1 步那个引用整段粘进 yaml 就会连 host 一起换回公网 —— 镜像照样拉得到、
+# 池照样起得来、什么都不红,只是冷启从 66s 退回 112s,而那正是 B-55 要修的东西。
+# 一次手滑就把整个改动悄悄抹掉,且没有任何别的信号会提到它。
+#
+# 与上面同样 warn-only,同样的理由:这是性能回退,不是故障,不该叫人回滚一个健康发布。
+if [[ -n "${pinned_tag}" ]]; then
+    sandbox_host="$(sed -n 's|.*image: \([^/]*\)/expert-work/sandbox:.*|\1|p' "${sandboxset}" | head -1)"
+    case "${sandbox_host}" in
+        *-vpc.*.personal.cr.aliyuncs.com)
+            echo "OK   sandbox image pulls over the VPC endpoint (${sandbox_host})"
+            ;;
+        "")
+            echo "WARN sandbox host: 在 ${sandboxset} 里没解析出 host(格式变了?)"
+            ;;
+        *)
+            echo "WARN sandbox image host is ${sandbox_host} —— 不是 -vpc endpoint(B-55)。"
+            echo "     同一个镜像公网拉 112s、VPC 拉 66s,冷启沙箱的用户直接等这段时间。"
+            echo "     多半是换 tag 时把 runbook 第 1 步的公网引用整段粘过来了 ——"
+            echo "     只改 tag,host 保持 -vpc(凭据两个 host 都带,见 acr-pull-secret.sh)。"
+            ;;
+    esac
+fi
+
 # Same Ready+not-Terminating filter as the POD pick above — probing a
 # Terminating pod's IP is a phantom failure, not a finding.
 POD_ROWS="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
