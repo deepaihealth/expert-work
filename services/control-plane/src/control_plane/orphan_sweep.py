@@ -37,6 +37,7 @@ from uuid import UUID
 from langchain_core.runnables import RunnableConfig
 
 from control_plane.agent_disable_status import AgentDisableService
+from control_plane.api._enqueued_input import graph_input_from_enqueued
 from control_plane.audit import emit
 from control_plane.kill_switch import run_block_reason
 from control_plane.run_trace import bind_exec_spec, bind_exec_trace
@@ -398,16 +399,6 @@ class OrphanSweep:
                 event_store=self._runtime.run_event_store,
             )
 
-            # Adopt the existing durable run into THIS instance's registry (no
-            # new agent_run row — the reclaim CAS already took ownership).
-            run_record = await self._runtime.run_manager.adopt(
-                run_id=orphan.run_id,
-                thread_id=orphan.thread_id,
-                tenant_id=orphan.tenant_id,
-                user_id=orphan.user_id,
-            )
-            run_record.bound_distilled_skills = built.bound_distilled_skills
-
             configurable: dict[str, Any] = {
                 "thread_id": str(orphan.thread_id),
                 "tenant_id": str(orphan.tenant_id),
@@ -421,13 +412,68 @@ class OrphanSweep:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
             config: RunnableConfig = {"configurable": configurable}
 
+            # B-58 —— 先确认**有东西可续**,再决定怎么派。
+            #
+            # 此前这里无条件派 ``graph_input=None``,把「检查点存在」当成前提却
+            # 从不检查。owner 在写下第一个检查点之前就卡住/死掉时(线上实况:
+            # 事件循环被堵约 30 秒,心跳过期但检查点写入还排在队列里),重收方
+            # 读不到任何检查点,于是 LangGraph 的
+            # ``is_resuming = bool(checkpoint["channel_versions"]) and …`` 为假,
+            # 而 ``input`` 又是 ``None`` —— 抛
+            # ``EmptyInputError: Received no input for __start__``。
+            # **那句话与事实矛盾**:输入是真实存在的,只是这条路径拿不到;照着它
+            # 去查会查错方向(B-58 立票时正是这么记的)。代价还不止一条假错误:
+            # 白烧一次 spawn,并重发 ``run_event`` 的 seq 0 撞主键。
+            #
+            # 实测(测试环境全量):17 次重收里 13 次有检查点、续跑正常,4 次没有、
+            # 全部死在这条;那 4 次里 2 次带着完好的 ``enqueued_input``——
+            # 本来救得回来。
+            #
+            # 查询用的是**续跑同一份 config、同一个 checkpointer 对象**:换一份去问
+            # 「有没有检查点」,答案可以和续跑真正读到的不一样,那样这道闸只是摆设。
+            checkpointer = getattr(built.graph, "checkpointer", None)
+            has_checkpoint = False
+            if checkpointer is not None:
+                has_checkpoint = await checkpointer.aget_tuple(config) is not None
+
+            graph_input: Any = None
+            if not has_checkpoint:
+                graph_input = graph_input_from_enqueued(
+                    built, orphan.enqueued_input or {}, orphan.run_id
+                )
+                if graph_input is None:
+                    # 既没检查点也没入队输入(stream 模式没有请求体)—— 救不了。
+                    # 如实判死,别再派一次注定抛「没有输入」的空跑。
+                    logger.warning(
+                        "orphan_sweep.no_resumable_state run_id=%s thread=%s",
+                        orphan.run_id,
+                        orphan.thread_id,
+                    )
+                    await self._fail_orphan(orphan, now=datetime.now(UTC), reason="no_checkpoint")
+                    return
+
+            # Adopt the existing durable run into THIS instance's registry (no
+            # new agent_run row — the reclaim CAS already took ownership).
+            run_record = await self._runtime.run_manager.adopt(
+                run_id=orphan.run_id,
+                thread_id=orphan.thread_id,
+                tenant_id=orphan.tenant_id,
+                user_id=orphan.user_id,
+            )
+            run_record.bound_distilled_skills = built.bound_distilled_skills
+            if graph_input is not None:
+                # ``adopt`` 默认 is_resume=True(重收的常态是续检查点)。重放入队
+                # 输入是从头跑,不是耐久续跑 —— 与 ``run_queue_worker`` 同一口径,
+                # 让 resume 直方图说真话。
+                run_record.is_resume = False
+
             worker = asyncio.create_task(
                 run_agent(
                     bridge=self._runtime.stream_bridge,
                     run_manager=self._runtime.run_manager,
                     record=run_record,
                     graph=built.graph,  # type: ignore[arg-type]
-                    graph_input=None,  # resume from the durable checkpoint
+                    graph_input=graph_input,  # None = 续检查点;非 None = 重放入队输入
                     config=config,
                     audit_logger=self._audit,
                     approval_store=self._approvals,

@@ -28,7 +28,9 @@ from expert_work.runtime.runs import InMemoryRunStore, RunInfo, RunManager, RunS
 from expert_work.runtime.runs.schemas import DisconnectMode
 
 
-def _run_info(*, run_id, tenant, thread, status=RunStatus.RUNNING, created_at=None) -> RunInfo:
+def _run_info(
+    *, run_id, tenant, thread, status=RunStatus.RUNNING, created_at=None, enqueued_input=None
+) -> RunInfo:
     now = created_at or datetime.now(UTC)
     return RunInfo(
         run_id=run_id,
@@ -42,6 +44,7 @@ def _run_info(*, run_id, tenant, thread, status=RunStatus.RUNNING, created_at=No
         created_at=now,
         updated_at=now,
         finished_at=None,
+        enqueued_input=enqueued_input,
     )
 
 
@@ -93,8 +96,13 @@ class _FakeAgents:
 class _FakeRuntime:
     """Minimal AgentRuntime surface the sweep touches."""
 
-    def __init__(self, run_store: InMemoryRunStore) -> None:
+    def __init__(self, run_store: InMemoryRunStore, *, has_checkpoint: bool = True) -> None:
         self.run_manager = RunManager(run_store, instance_id="sweeper", lease_ttl_s=30.0)
+        #: B-58 —— 真图编译时带 checkpointer,续跑读的就是它。假图此前是
+        #: ``object()``,于是「没有检查点」这条分支在测试里**不可能被走到**,
+        #: 而线上正是它把 run 判死的。
+        self.has_checkpoint = has_checkpoint
+        self.checkpoint_lookups: list[object] = []
         self.stream_bridge = object()
         self.run_event_store = None
         self.skill_run_usage_recorder = None
@@ -102,8 +110,15 @@ class _FakeRuntime:
         self.thread_stats_recorder = None
 
     async def get_agent(self, **_kw):
+        runtime = self
+
+        class _FakeCheckpointer:
+            async def aget_tuple(self, config):
+                runtime.checkpoint_lookups.append(config)
+                return object() if runtime.has_checkpoint else None
+
         return SimpleNamespace(
-            graph=object(),
+            graph=SimpleNamespace(checkpointer=_FakeCheckpointer()),
             bound_distilled_skills=(),
             tool_replay_safe=None,
             run_deadline_s=0,
@@ -120,9 +135,11 @@ class _FakeRuntime:
         return None
 
 
-async def _seed_orphan(store: InMemoryRunStore, *, expired: bool):
+async def _seed_orphan(store: InMemoryRunStore, *, expired: bool, enqueued_input=None):
     run_id, tenant, thread = uuid4(), uuid4(), uuid4()
-    await store.create(_run_info(run_id=run_id, tenant=tenant, thread=thread))
+    await store.create(
+        _run_info(run_id=run_id, tenant=tenant, thread=thread, enqueued_input=enqueued_input)
+    )
     now = datetime.now(UTC)
     lease = now - timedelta(seconds=5) if expired else now + timedelta(seconds=60)
     await store.claim(
@@ -645,3 +662,134 @@ async def test_a_draining_replica_does_not_reclaim_orphans(
     assert row.status is RunStatus.RUNNING, "别动它 —— 让活着的副本接"
     assert row.claimed_by == "dead-instance"
     assert row.reclaim_count == 0
+
+
+# ─── B-58 —— 重收路径必须先确认「有东西可续」 ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_respawn_resumes_from_the_checkpoint_when_one_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有检查点 = 今天的行为,一个字节都不该变(17 次重收里的 13 次)。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store, has_checkpoint=True)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+
+    assert await _sweep(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+
+    assert len(spawns) == 1
+    assert spawns[0]["graph_input"] is None  # 续跑,不重放
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_respawn_replays_the_enqueued_input_when_there_is_no_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有检查点但有入队输入 —— 这是真能救回来的那一半。
+
+    实测 4 次死于本 bug 的重收里,2 次带着完好的 ``enqueued_input``
+    (117 / 170 字符),其中一个正是 B-58 立票时的原始个案(09-13 ``pf-probe``,
+    票上写着「``enqueued_input`` 里一字不差」)。今天的代码对它们也只会派
+    ``graph_input=None``,于是 LangGraph 抛一句与事实矛盾的「没有输入」。
+    """
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+    monkeypatch.setattr(
+        sweep_module,
+        "graph_input_from_enqueued",
+        lambda built, payload, run_id: {"replayed": payload},
+    )
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store, has_checkpoint=False)
+    run_id, tenant = await _seed_orphan(
+        store, expired=True, enqueued_input={"input": "算一下 6683*9109"}
+    )
+
+    assert await _sweep(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+
+    assert len(spawns) == 1, "有输入可重放时不该放弃这个 run"
+    assert spawns[0]["graph_input"] == {"replayed": {"input": "算一下 6683*9109"}}
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_respawn_fails_truthfully_with_neither_checkpoint_nor_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """既没检查点也没输入(stream 模式)—— 救不了,但必须**如实**判死。
+
+    今天的行为是照样派 ``graph_input=None``,让 LangGraph 抛
+    ``EmptyInputError: Received no input for __start__`` —— 一句与事实矛盾的话
+    (输入是真实存在的,只是这条路径拿不到),照着它去查会查错方向。顺带还白烧
+    一次 spawn 并重发 ``run_event`` 的 seq 0 撞主键。
+    """
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store, has_checkpoint=False)
+    run_id, tenant = await _seed_orphan(store, expired=True)
+
+    await _sweep(store, runtime).run_once()
+    await asyncio.sleep(0)
+
+    assert spawns == [], "没有任何可续之物时不该派 run_agent"
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.ERROR
+    assert row.error is not None
+    # 判据是「说了真话」,不是「报了错」:错误里必须出现真实原因,
+    # 且不能再是那句自相矛盾的 LangGraph 内部错。
+    assert "checkpoint" in row.error.lower()
+    assert "Received no input" not in row.error
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_lookup_uses_the_same_config_as_the_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """检查与续跑必须看同一份 config —— 否则就是「描述不是被描述之物」。
+
+    用另一份 config 去问「有没有检查点」,答案可以和续跑真正读到的不一样,
+    那样这道闸就只是个摆设。
+    """
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(sweep_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store, has_checkpoint=True)
+    await _seed_orphan(store, expired=True)
+
+    await _sweep(store, runtime).run_once()
+    await asyncio.sleep(0)
+
+    assert len(runtime.checkpoint_lookups) == 1
+    assert runtime.checkpoint_lookups[0] == spawns[0]["config"]
