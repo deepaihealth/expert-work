@@ -962,10 +962,33 @@ def test_exec_envs_carry_the_inputs_path_when_a_run_is_bound() -> None:
 
 def test_exec_envs_without_a_run_are_unchanged() -> None:
     """未绑 run(``run_id=None``,``agent_key_envs`` 的默认值)时不该多出
-    ``EXPERT_WORK_INPUTS`` —— 沙箱内没有 run_id 就没有对应的 ``inputs.json``。"""
+    ``EXPERT_WORK_INPUTS`` —— 沙箱内没有 run_id 就没有对应的 ``inputs.json``。
+
+    ``EXPERT_WORK_SKILLS_DIR``(B-84)与 run 无关、只跟 agent 绑,所以它**在**
+    这一档里 —— 技能文件在沙箱里的位置不随某一轮变化。"""
     from orchestrator.tools.sandbox import agent_key_envs
 
-    assert set(agent_key_envs("k")) == {"PYTHONUSERBASE"}
+    assert set(agent_key_envs("k")) == {"PYTHONUSERBASE", "EXPERT_WORK_SKILLS_DIR"}
+
+
+def test_skills_dir_env_matches_the_seed_root() -> None:
+    """路径拼法的漂移闸(B-84 从提示词文本挪到这里)。
+
+    ``EXPERT_WORK_SKILLS_DIR`` 是模型唯一能知道技能文件在哪的途径 —— 提示词
+    只说变量名,不再逐个写绝对路径。所以它必须与 seed 真正的落点一致:
+    ``AgentSandboxClient`` 往 ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<name>/…``
+    写(``agent_sandbox.py`` 的 seed 分支)。两边任一改了拼法,这条要红 ——
+    不红的话症状是模型照着变量去找、``No such file``,而那要到真跑才发现。
+
+    没绑 agent 就不该有这个变量:没有 ``agent_key`` 就没有 per-agent 的技能
+    目录,给一个指向整个 ``/opt/skills`` 的值等于让它看别的 agent 的技能。
+    """
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+    from orchestrator.tools.sandbox import agent_key_envs
+
+    envs = agent_key_envs("ag-0badf00d")
+    assert envs["EXPERT_WORK_SKILLS_DIR"] == f"{SANDBOX_SKILLS_ROOT}/ag-0badf00d"
+    assert "EXPERT_WORK_SKILLS_DIR" not in agent_key_envs("")
 
 
 @pytest.mark.asyncio

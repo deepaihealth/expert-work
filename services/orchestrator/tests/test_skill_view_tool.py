@@ -377,3 +377,63 @@ async def test_activity_recorder_not_invoked_on_archived() -> None:
         ctx=_ctx_for(version),
     )
     assert recorded == []
+
+
+@pytest.mark.asyncio
+async def test_skill_md_lists_the_supporting_files() -> None:
+    """B-84 —— 附属文件清单从系统提示词搬到了这里。
+
+    删掉 ``files=`` 之后,这是模型**唯一**能发现附属文件的途径:``skill_view``
+    只认精确 ``path``,没有列目录的能力(见 :class:`SkillViewTool.spec` 的
+    参数定义)。所以这条不是锦上添花的断言 —— 它没了,``reference/*.md`` 和
+    ``scripts/*.py`` 对模型就等于不存在。
+    """
+    version = _make_version(
+        prompt="# Body line",
+        supporting={
+            "scripts/diagnose.py": _supporting("print(1)"),
+            "reference/error_codes.md": _supporting("101 = Auth error"),
+        },
+    )
+    tool = _make_tool_for(version)
+    result = await tool.call({"skill_name": "api-debug", "path": "SKILL.md"}, ctx=_ctx_for(version))
+
+    assert "Body line" in result.content  # 正文还在
+    assert "Supporting files" in result.content
+    # 字典序,与旧 ``files=`` 属性同一个排法
+    idx_ref = result.content.index("reference/error_codes.md")
+    idx_scr = result.content.index("scripts/diagnose.py")
+    assert idx_ref < idx_scr
+    # 清单在正文之后 —— ``_middle_trim`` 砍中段,它跟着 tail 活下来
+    assert result.content.index("Body line") < idx_ref
+    # 沙箱里的落点也要说,否则模型拿到文件名也不知道去哪跑
+    assert "$EXPERT_WORK_SKILLS_DIR" in result.content
+
+
+@pytest.mark.asyncio
+async def test_skill_md_without_supporting_files_has_no_manifest() -> None:
+    """只有正文的技能不该为一段空清单付字符 —— 瘦身票加的东西不能自己变成肥肉。"""
+    version = _make_version(prompt="# Body line")
+    tool = _make_tool_for(version)
+    result = await tool.call({"skill_name": "api-debug", "path": "SKILL.md"}, ctx=_ctx_for(version))
+
+    assert "Body line" in result.content
+    assert "Supporting files" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_supporting_file_read_has_no_manifest() -> None:
+    """清单只贴在 ``SKILL.md`` 上。贴在每个附属文件上就是把刚省下的字符
+
+    按读取次数重新付一遍 —— 而模型读附属文件时早就有清单了。
+    """
+    version = _make_version(
+        supporting={"reference/foo.md": _supporting("# Error codes")},
+    )
+    tool = _make_tool_for(version)
+    result = await tool.call(
+        {"skill_name": "api-debug", "path": "reference/foo.md"}, ctx=_ctx_for(version)
+    )
+
+    assert "Error codes" in result.content
+    assert "Supporting files" not in result.content

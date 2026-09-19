@@ -66,36 +66,47 @@ def _make_version(
 # ─── _render_skill_summary ───────────────────────────────────────────────
 
 
-def test_summary_lists_skill_md_first_then_supporting_files() -> None:
+def test_summary_carries_only_what_choosing_a_skill_needs() -> None:
+    """B-84 —— 摘要只留 name + description,三个属性去掉。
+
+    去掉的是 ``files=``(最大的一块,对接方两个 Agent 分别列了 197 / 232 个
+    文件名)、``dir=``(改成块头说一次的 ``$EXPERT_WORK_SKILLS_DIR``)、
+    ``version=``(选技能不需要版本号,``skill_view`` 也只认 ``skill_name``)。
+    这一行每轮 prefill 都重付,所以只放**选**技能用得上的东西;**用**技能才
+    需要的文件清单挪到了 ``skill_view(name, "SKILL.md")`` 的返回里
+    (见 ``test_skill_view_tool.py`` 里的清单用例)。
+    """
     version = _make_version(
         name="api-debug",
         prompt="body",
         lazy_load=False,
         supporting_paths=["scripts/diagnose.py", "reference/error_codes.md"],
     )
-    summary = _render_skill_summary(name="api-debug", version=version, agent_key="ag-0badf00d")
+    summary = _render_skill_summary(name="api-debug", version=version)
     assert 'name="api-debug"' in summary
-    assert 'version="1"' in summary
-    # SKILL.md must come first; then alphabetical
-    assert 'files="SKILL.md, reference/error_codes.md, scripts/diagnose.py"' in summary
-    # 波 2 终审 Important-1 —— 提示词必须陈述技能文件在沙箱里的绝对目录:
-    # 搬到 /opt/skills/<agent_key>/ 之后,agent 既够不到(文件工具锁死在
-    # /workspace)、也猜不出(agent_key 带 8 位摘要后缀)。
-    assert 'dir="/opt/skills/ag-0badf00d/api-debug"' in summary
+    assert "description=" in summary
+    # 逐条钉死,别只断言整串相等 —— 哪天有人加回来,红的那条要直接说出是哪个
+    assert "files=" not in summary
+    assert "dir=" not in summary
+    assert "version=" not in summary
+    # 文件名一个都不许出现(``files=`` 换个写法回来也算回来)
+    assert "diagnose.py" not in summary
+    assert "error_codes.md" not in summary
 
 
 def test_summary_escapes_quotes_in_description() -> None:
     version = _make_version(name="x", prompt="body", lazy_load=False)
     v = version.model_copy(update={"description": 'has "quote" inside'})
-    summary = _render_skill_summary(name="x", version=v, agent_key="ag-0badf00d")
+    summary = _render_skill_summary(name="x", version=v)
     assert "&quot;quote&quot;" in summary
     assert '"quote"' not in summary  # raw " would break the attribute
 
 
-def test_summary_no_supporting_files_lists_only_skill_md() -> None:
+def test_summary_is_one_short_line() -> None:
+    """瘦身的收益全在这一行的长度上,所以直接钉住它。"""
     version = _make_version(name="x", prompt="body", lazy_load=False)
-    summary = _render_skill_summary(name="x", version=version, agent_key="ag-0badf00d")
-    assert 'files="SKILL.md"' in summary
+    summary = _render_skill_summary(name="x", version=version)
+    assert summary == '<skill name="x" description="x" />'
 
 
 # ─── _assemble_system_prompt — progressive disclosure ────────────────────
