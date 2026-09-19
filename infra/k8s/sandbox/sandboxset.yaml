@@ -69,25 +69,53 @@ spec:
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       # The PoC pulled public images (anolisos/busybox) so it never needed
-      # this. Our sandbox image is in the private ACR, and the `acr-pull`
-      # credential lives in the `expert-work` namespace — a Secret cannot be
-      # referenced across namespaces, so it was copied into `default`:
+      # this. Our sandbox image is in the private ACR, and a Secret cannot be
+      # referenced across namespaces, so `default` needs its own copy of the
+      # `acr-pull` credential. Both namespaces' copies are written by
+      # `tools/deploy/acr-pull-secret.sh` (one run does both).
       #
-      #   kubectl -n expert-work get secret acr-pull \
-      #     -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d > /tmp/acr-cfg.json
-      #   kubectl -n default create secret docker-registry acr-pull \
-      #     --from-file=.dockerconfigjson=/tmp/acr-cfg.json
+      # That Secret MUST carry the -vpc host below, not just the public one:
+      # a dockerconfigjson is keyed BY HOST and the kubelet uses only the
+      # entry matching the image reference it is pulling. Without a matching
+      # entry the pod reaches ImagePullBackOff with "insufficient_scope:
+      # authorization failed" — and the pool then silently sits at
+      # availableReplicas 0 rather than surfacing an error, which is how this
+      # failure mode stays invisible. The script writes both hosts for
+      # exactly this reason; check with:
       #
-      # Without it the pod reaches ImagePullBackOff with
-      # "insufficient_scope: authorization failed" — and the pool silently
-      # sits at availableReplicas 0 rather than surfacing an error. Folding
-      # this file into base/ under `expert-work` (see header) also removes
-      # the copy.
+      #   kubectl -n default get secret acr-pull \
+      #     -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d \
+      #     | python3 -c 'import json,sys; print(*sorted(json.load(sys.stdin)["auths"]))'
+      #
+      # Folding this file into base/ under `expert-work` (see header) would
+      # remove the second copy, not the two-host requirement.
       imagePullSecrets:
         - name: acr-pull
       containers:
         - name: main
-          image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:621249f6
+          # B-55 — the `-vpc` host, deliberately. This is the ONE image
+          # reference in the repo that does not use the public ACR endpoint.
+          #
+          # Cold sandbox creation is dominated by this pull, and the two
+          # endpoints are the same registry at very different speeds. Measured
+          # on this cluster, same image, same digest, repeated:
+          #
+          #   public  crpi-….personal.cr.aliyuncs.com        112s   5.8 MB/s
+          #   VPC     crpi-…-vpc.personal.cr.aliyuncs.com     66s   18-23 MB/s
+          #
+          # (Latest run 2026-09-19: kubelet reported "Successfully pulled …
+          # in 1m6.19s" for the 619MB image over the -vpc host.)
+          #
+          # Why only here: everything else in the repo is pulled at deploy
+          # time, once, by a rollout that is already waiting on other things.
+          # This one is pulled on the user-visible path — a cold sandbox is a
+          # user sitting in front of a run that has not started yet. The
+          # public host stays the default elsewhere so that a VPC/DNS problem
+          # cannot take out the whole platform, only the sandbox pool.
+          #
+          # Rolling back is a one-line edit to the public host, and it needs
+          # no credential change — the Secret carries both hosts (see above).
+          image: crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:621249f6
           imagePullPolicy: IfNotPresent
           # See the ENTRYPOINT note in this file's header.
           command:

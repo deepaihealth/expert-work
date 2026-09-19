@@ -88,18 +88,19 @@ kubectl apply -f infra/k8s/cluster/prod/albconfig.yaml
 # 生产已于 2026-09-07 建好(alb-39zoe38yejn3yljs7t),重复 apply 幂等。
 # 拉镜像凭据(2026-09-07 盘 test 集群补记:base 的 Deployment 没写 imagePullSecrets,
 # 靠 namespace 默认 ServiceAccount 挂的 acr-pull 拉私有 ACR;不建 = 全部 ImagePullBackOff)。
-# 用户名 = 阿里云账号全名,密码 = ACR 个人版「访问凭证 → 固定密码」(workstation-setup.md §2):
-kubectl -n expert-work create secret docker-registry acr-pull \
-  --docker-server=crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com \
-  --docker-username='<阿里云账号全名>' --docker-password='<ACR 固定密码>'
+# 交互式问用户名(阿里云账号全名)与密码(ACR 个人版「访问凭证 → 固定密码」,
+# workstation-setup.md §2),密码不回显、不进 argv、不落盘;expert-work 与 default
+# 两个 namespace 一次写好(SandboxSet 在 default,Secret 不能跨 namespace 引用)。
+#
+# **必须用这个脚本,不要用 `kubectl create secret docker-registry`** —— 后者只能
+# 写一个 --docker-server,而这份 Secret 要同时带公网和 VPC 两个 host:
+# dockerconfigjson 按 host 索引,B-55 之后沙箱镜像走 -vpc host(619MB 的镜像
+# 公网 112s / VPC 66s),平台其余组件仍走公网 host。少哪个 host,那一侧就变成匿名拉取,
+# 报 `insufficient_scope: authorization failed`,而 SandboxSet 只会停在
+# availableReplicas 0、不报错。
+tools/deploy/acr-pull-secret.sh
 kubectl -n expert-work patch serviceaccount default \
   -p '{"imagePullSecrets":[{"name":"acr-pull"}]}'
-# SandboxSet 在 default namespace,Secret 不能跨 namespace 引用,复制一份
-# (infra/k8s/sandbox/sandboxset.yaml 头注同一配方):
-kubectl -n expert-work get secret acr-pull -o jsonpath='{.data.\.dockerconfigjson}' \
-  | base64 -d > /tmp/acr-cfg.json
-kubectl -n default create secret docker-registry acr-pull \
-  --from-file=.dockerconfigjson=/tmp/acr-cfg.json && rm -f /tmp/acr-cfg.json
 # SandboxSet(namespace 语义见文件头注,by hand,不进 kustomize):
 kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
 # NAS 上建工作区根目录(PV path=/workspaces,目录不存在则挂载失败)。挂载点是
