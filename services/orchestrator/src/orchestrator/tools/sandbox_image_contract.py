@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+from typing import Literal, NamedTuple
+
 #: 沙箱内用户根的**挂载点**(B-60):建沙箱 ``metadata.mountPath`` / 兜底 ``chown`` /
 #: 本地 ``--volume``、``--workdir``。沙箱内的代码(工具片段、用户代码、提示词)**永远
 #: 不该**出现这个字符串 —— exec 进了命名空间之后它被 tmpfs 盖住,不存在。
@@ -174,19 +176,58 @@ SANDBOX_PREINSTALLED_PYTHON: tuple[str, ...] = (
     "defusedxml",
 )
 
-#: 镜像预装的**命令行工具**(``infra/sandbox-image/Dockerfile`` 的 apt 段里值得
-#: 告诉模型的那几个;字体/locale/共享库这类它用不上的不列)。加进来的直接理由:
+
+class PreinstalledBinary(NamedTuple):
+    """镜像里一个命令行工具,以及它**从哪来** —— 闸要按来源分开验。
+
+    B-55 之前这里是个 ``(命令, apt 包名)`` 二元组,因为当时每一个都来自 apt。
+    ``ffmpeg`` 改成从 wheel 里的静态二进制 symlink 进 PATH 之后,二元组就没法
+    再表达它了:第二项要么继续写 ``"ffmpeg"``(闸会去 Dockerfile 的 apt 段找,
+    找不到,红 —— 而实现是对的),要么填 ``None``(闸静默跳过 —— 等于这一条从此
+    没人看)。两个都坏,所以把**来源**显式化,让闸对每一条都必须做点什么。
+    """
+
+    #: 模型在沙箱里敲的名字。
+    command: str
+    #: ``"apt"`` —— Dockerfile 的 apt 段里必须有 :attr:`package` 那一行。
+    #: ``"wheel"`` —— :attr:`package` 必须在 ``requirements.txt`` 里,且
+    #: Dockerfile 必须把它的二进制 symlink 成 ``/usr/local/bin/<command>``。
+    source: Literal["apt", "wheel"]
+    #: apt 包名 / pip 包名,按 :attr:`source` 解释。
+    package: str
+
+
+#: 镜像预装的**命令行工具**(``infra/sandbox-image/Dockerfile`` 里值得告诉模型的
+#: 那几个;字体/locale/共享库这类它用不上的不列)。加进来的直接理由:
 #: 2026-09-19 的采集里模型写过「如需重算公式**再装 LibreOffice** 并运行技能目录下
 #: 的 recalc.py」—— LibreOffice 早就在镜像里,它不知道。
 #:
 #: 闸在 ``test_preinstalled_binaries_are_in_the_dockerfile``(单向:这里列的必须
-#: 真的 apt 装了。反向不钉 —— Dockerfile 里装的多数是共享库,不该也不必进工具描述)。
-SANDBOX_PREINSTALLED_BINARIES: tuple[tuple[str, str], ...] = (
-    ("soffice", "libreoffice-writer-nogui"),
-    ("pdftoppm", "poppler-utils"),
-    ("ffmpeg", "ffmpeg"),
-    ("node", "nodejs"),
-    ("npm", "npm"),
+#: 真的装了。反向不钉 —— Dockerfile 里装的多数是共享库,不该也不必进工具描述)。
+#:
+#: ``npm`` 曾经在这份清单里,B-55 摘掉了 —— 它不在镜像里了。摘掉**不等于**模型
+#: 就不会去试:``docx`` / ``pptx`` 两个平台技能的 SKILL.md 里写着
+#: ``npm install -g docx`` / ``npm install -g pptxgenjs``。所以否定句要显式说出来,
+#: 见 :data:`SANDBOX_UNAVAILABLE_NOTE`。
+SANDBOX_PREINSTALLED_BINARIES: tuple[PreinstalledBinary, ...] = (
+    PreinstalledBinary("soffice", "apt", "libreoffice-writer-nogui"),
+    PreinstalledBinary("pdftoppm", "apt", "poppler-utils"),
+    PreinstalledBinary("ffmpeg", "wheel", "imageio-ffmpeg"),
+    PreinstalledBinary("node", "apt", "nodejs"),
+)
+
+#: 一句**否定**断言,和上面那份肯定清单一起进工具描述。
+#:
+#: 为什么值得多占这些字符:B-55 去数过 832 个真实 run —— 13 个 run 执行过 npm
+#: 探测,5 个撞上 ``npm ERR! code E407``(出网代理要求 CONNECT 带鉴权,Python 侧有
+#: ``sitecustomize.py`` 补上,npm 没有),**0 个 run 成功装上过任何一个 npm 包**。
+#: 也就是说这条路在 npm 还在镜像里的时候就已经是死的,只是模型每次都要自己撞一遍
+#: 才知道。镜像里没有 npm 之后,报错会从「407 超时」变成「command not found」——
+#: 更快,但仍然是白跑一轮。技能正文改不动(它们是上游技能),平台这一处说得清。
+SANDBOX_UNAVAILABLE_NOTE = (
+    "沙箱里**没有 npm**（node 有）。技能文档里的 `npm install` / `npm install -g` "  # noqa: RUF001
+    "一律走不通，出网代理也挡 npm registry —— 遇到就直接改用 Python 等价物"  # noqa: RUF001
+    "（docx→python-docx，pptx→python-pptx，两者都已预装）。"  # noqa: RUF001
 )
 
 
@@ -202,10 +243,11 @@ def preinstalled_note() -> str:
     稳定前缀里、每轮走缓存读。
     """
     libs = "、".join(SANDBOX_PREINSTALLED_PYTHON)
-    bins = "、".join(name for name, _pkg in SANDBOX_PREINSTALLED_BINARIES)
+    bins = "、".join(entry.command for entry in SANDBOX_PREINSTALLED_BINARIES)
     return (
         f"沙箱已预装这些 Python 库，直接 import 即可：{libs}；"  # noqa: RUF001
         f"命令行工具有 {bins}。"
         "清单里的不要再 pip install / apt install —— 装一遍要一两分钟，而且它本来就在。"  # noqa: RUF001
         "只有清单以外的包才需要装。"
+        f"{SANDBOX_UNAVAILABLE_NOTE}"
     )
