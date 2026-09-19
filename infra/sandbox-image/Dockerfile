@@ -96,19 +96,77 @@ RUN test -x /bin/bash \
 #     locale; `fc-cache -f` bakes the font cache into the read-only rootfs.
 #   * The binaries office skills shell out to — the Python lib alone is not
 #     enough: xlsx recalc / pptx thumbnail / docx accept-changes call `soffice`
-#     (LibreOffice headless), pdf→image calls poppler, gif/video calls ffmpeg.
+#     (LibreOffice headless), pdf→image calls poppler.
 #     LibreOffice no-GUI components only (writer/calc/impress + core).
-#   * Node.js + npm (Debian apt — no NodeSource repo/key, keeps the install
-#     surface minimal) so skill-bundled `.js` runs via the `bash` tool. Browser
-#     automation (Chromium/Playwright) is intentionally NOT here — that belongs
-#     in an MCP server, not the sandbox image.
+#     ffmpeg is deliberately NOT apt-installed — see the B-55 note below.
+#   * Node.js, WITHOUT npm (Debian apt — no NodeSource repo/key, keeps the
+#     install surface minimal) so skill-bundled `.js` runs via the `bash` tool.
+#     Why npm is gone: B-55 note below. Browser automation
+#     (Chromium/Playwright) is intentionally NOT here — that belongs in an MCP
+#     server, not the sandbox image.
 #   * Pango / cairo / gdk-pixbuf — weasyprint's native rendering backend (the
 #     Python wheel alone can't rasterise HTML+CSS → PDF). Pairs with the baked
 #     noto-cjk fonts so generated PDF reports render Chinese.
 # No compiler toolchain — every Python dep still installs from a wheel.
 #
-# Mirror + retries (W1 Task 1, 2026-08-03): this layer fetches ~700 packages
-# / ~350MB. From this network, `deb.debian.org` returns 502s partway through
+# B-55 — WHAT IS NOT INSTALLED HERE, AND WHY (2026-09-19, measured on the
+# deployed 621249f6 image in the test cluster, `dpkg-query -W -f
+# '${Installed-Size}'` over the closure `apt-get -s remove --purge
+# --autoremove <pkg>` would take; `du -x` is useless on overlayfs):
+#
+#   apt total before      786 packages / 1263 MB unpacked / 445.9 MB compressed
+#   `ffmpeg` closure      145 packages /  387 MB   ← dropped, replaced (below)
+#   `npm` closure         359 packages /  133 MB   ← dropped, not replaced
+#   whole image before    619.4 MB compressed (amd64) — this is the pull
+#
+# Both are dropped because the pull is the problem B-55 is about: a cold
+# sandbox pull measured 112s over the public ACR endpoint. 520 MB unpacked is
+# ~184 MB of that compressed pull, i.e. roughly 30% of it, for two things
+# neither of which is load-bearing:
+#
+#   ffmpeg — the apt package's own binary is 367 KB; the 387 MB is the
+#     graphics stack it links (libllvm19 127 MB + mesa-libgallium 42 MB +
+#     libflite1 28 MB + libz3-4 27 MB + x265/codec2/svtav1/placebo…), i.e. an
+#     LLVM JIT, a Mesa GL driver and a speech synthesiser, in a container with
+#     no display and no audio. Meanwhile `imageio-ffmpeg` (already in
+#     requirements.txt, and already 79.8 MB of the pip layer) ships a FULLY
+#     STATIC ffmpeg 7.0.2 that was sitting there unused. So this is not a
+#     capability cut: the symlink below puts that binary on PATH under the
+#     same name. Real-run usage was 3 events / 2 runs out of 832 anyway.
+#     `ffprobe` does go away — it has no separate apt package and the static
+#     bundle has none. Checked before cutting: 0 hits across all 58 platform
+#     skill versions and 0 across 13825 run_event rows.
+#
+#   npm — it does not work in a real run and never has. The egress proxy
+#     (sandbox-egress §3.5) requires proxy auth on CONNECT; Python gets that
+#     from sitecustomize.py, npm has no such shim, so `npm install` dies with
+#     `npm ERR! code E407 / 407 Proxy Authentication Required - GET
+#     https://registry.npmjs.org/...`. Measured over 832 real runs: 13 runs
+#     executed npm probes, 5 reached the 407, and **0 runs ever installed an
+#     npm package**. `npm install -g` is doubly dead — the global prefix is
+#     /usr/local, root-owned, and agent code runs as uid 10000 (verified:
+#     EACCES). So this removes a capability that has never once been
+#     exercised, while the turns the model burns discovering that are real.
+#     NOTE the model is *told* about npm by two platform skills (`docx` says
+#     `npm install -g docx`, `pptx` says `npm install -g pptxgenjs`) — the
+#     counter-statement lives in one platform-owned place,
+#     `sandbox_image_contract.preinstalled_note()`, not in 2 edited skills.
+#     `node` itself STAYS: running a skill-bundled `.js` needs the runtime,
+#     not the package manager, and that is the case the runtime was added for.
+#
+# One collateral package leaves with them and it is fine: `libcairo-gobject2`
+# was here only because `librsvg2-2` (an ffmpeg *input format*) depended on
+# it. Flagged because the bullet above says "Pango / cairo / gdk-pixbuf" and
+# a reader seeing cairo shrink will reasonably suspect weasyprint just broke.
+# It did not: weasyprint has used its own PDF writer (pydyf) since v53 and we
+# are on 70.0. Verified rather than reasoned — hiding the .so in the deployed
+# image and re-running the markdown→HTML→PDF path still produced a 171KB PDF.
+# `smoke_payload.py` renders that same path on every build, so this stays
+# checked.
+#
+# Mirror + retries (W1 Task 1, 2026-08-03): this layer fetches ~280 packages
+# (was ~700 before the B-55 cut above). From this network, `deb.debian.org`
+# returns 502s partway through
 # and throughput collapses — three independent build attempts all died around
 # the ~17min mark with 20-48 unfetchable packages, and apt's default
 # `Acquire::Retries=0` makes any single one of those fatal for the whole
@@ -153,9 +211,7 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         libreoffice-calc-nogui \
         libreoffice-impress-nogui \
         poppler-utils \
-        ffmpeg \
         nodejs \
-        npm \
         libpango-1.0-0 \
         libpangocairo-1.0-0 \
         libpangoft2-1.0-0 \
@@ -177,6 +233,28 @@ ENV LANG=zh_CN.UTF-8 \
 COPY requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
+
+# B-55 — `ffmpeg` on PATH, from the wheel instead of from apt (rationale and
+# the measured numbers are in the apt-section header above).
+#
+# `imageio-ffmpeg` ships a fully static ffmpeg 7.0.2 at a versioned path under
+# its package dir. Two consumers need two different things and this one line
+# serves both:
+#   * imageio / our slack-gif-creator skill call
+#     `imageio_ffmpeg.get_ffmpeg_exe()` — they already found the binary
+#     without any help and are unaffected either way.
+#   * matplotlib's FFMpegWriter, and any skill that shells out to `ffmpeg`,
+#     look up the bare name on PATH. That is what the symlink is for.
+#
+# The path is resolved by asking the package, never hardcoded: the file name
+# carries the ffmpeg version (`ffmpeg-linux-x86_64-v7.0.2`) and the arch, so a
+# literal would silently break on the arm64 half of the multi-arch build and
+# on the next `imageio-ffmpeg` bump. `-version` right after is the build-time
+# gate: a symlink pointing at nothing still *creates* fine, and would then
+# fail for the first agent that used it instead of failing here.
+RUN ln -s "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" \
+        /usr/local/bin/ffmpeg \
+    && ffmpeg -version | head -1
 
 # Bake CJK-capable matplotlib defaults into the (read-only at runtime) rootfs so
 # agent charts render Chinese without per-call font config.

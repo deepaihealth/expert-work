@@ -25,6 +25,7 @@ from pathlib import Path
 import defusedxml
 import imageio
 import markdown
+import numpy as np
 import pandas as pd
 import pdfplumber
 import pypdf
@@ -151,8 +152,42 @@ _pages = convert_from_path(str(_pdf), dpi=50)
 if not _pages or _pages[0].size[0] <= 0:
     raise RuntimeError("pdf2image/poppler produced no page image")
 
+# ffmpeg — B-55 moved it off apt: the binary on PATH is now a symlink to the
+# fully static ffmpeg that `imageio-ffmpeg` ships. `shutil.which` above is not
+# enough for that shape, and was not enough before either — it was the one
+# binary in this file with no exercise. A dangling symlink resolves for
+# `which` and only fails when an agent runs it.
+#
+# Two assertions because they can fail apart:
+#   * `ffmpeg -version` — the PATH entry resolves AND executes. Also pins the
+#     provenance: the static build reports itself, so a silent slide back to
+#     an apt ffmpeg (which would undo the 387MB cut) is visible here.
+#   * a real encode through imageio — the path our slack-gif-creator skill and
+#     matplotlib's writers actually take. The symlink could be perfect and
+#     this still break if the wheel's bridge stops finding its own binary.
+_ffmpeg = subprocess.run(
+    ["ffmpeg", "-version"], capture_output=True, text=True, timeout=30, check=False
+)
+if _ffmpeg.returncode != 0 or not _ffmpeg.stdout.startswith("ffmpeg version"):
+    raise RuntimeError(
+        f"ffmpeg on PATH did not run rc={_ffmpeg.returncode} "
+        f"stdout={_ffmpeg.stdout[:200]!r} stderr={_ffmpeg.stderr[:200]!r}"
+    )
+_ffmpeg_banner = _ffmpeg.stdout.splitlines()[0]
+
+_mp4 = Path("/workspace/smoke.mp4")
+_frames = [
+    (np.linspace(0, 255, 64 * 64 * 3).reshape(64, 64, 3) + _i * 8).astype("uint8")
+    for _i in range(6)
+]
+imageio.mimwrite(str(_mp4), _frames, fps=6)
+if not _mp4.is_file() or _mp4.stat().st_size == 0:
+    raise RuntimeError("imageio → ffmpeg produced no mp4 (the wheel's bridge is broken)")
+
 # Node.js — skill-bundled .js runs via the `bash` tool (subprocess). Prove the
-# runtime executes, not just that the binary is on PATH.
+# runtime executes, not just that the binary is on PATH. npm is deliberately
+# NOT checked: B-55 removed it from the image (0 of 832 real runs ever
+# installed an npm package — the egress proxy 407s the registry).
 _node = subprocess.run(
     ["node", "-e", "process.stdout.write('node-ok')"],
     capture_output=True,
@@ -175,4 +210,5 @@ if not _md_pdf.is_file() or _md_pdf.stat().st_size == 0:
 
 print(f"font={cjk_font}")
 print(f"node={_node.stdout.strip()}")
+print(f"{_ffmpeg_banner}")
 print("OK")
