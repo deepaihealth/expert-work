@@ -268,15 +268,37 @@ done
 echo "== http (via ${POD}) =="
 # One python invocation, one line per probe: "<name> <status-or-error>".
 run_probes() { kubectl -n expert-work exec "${POD}" -- python -c "
-import json, urllib.request, urllib.error
+import json, sys, time, urllib.request, urllib.error
 
-def status(url):
-    try:
-        return str(urllib.request.urlopen(url, timeout=10).status)
-    except urllib.error.HTTPError as e:
-        return str(e.code)
-    except Exception as e:
-        return type(e).__name__
+def status(url, attempts=3):
+    '''HTTP 状态码；连接级失败重试,HTTP 状态码立刻返回。
+
+    这个不对称是要害。HTTPError 意味着**服务器答了话** —— 401 / 500 都是
+    真实结论,重试它只会把一次真实回归拖成三次一样的红,还把它伪装成抖动。
+    连接级失败(URLError / timeout / DNS)才是环境,值得重试。
+
+    2026-09-19 发测试环境时,这条闸门报
+    ``SMOKE FAIL: public /v1 auth gate: got 'URLError', want '401'``,
+    而同一批公网检查里 admin-ui / docs / keycloak / langfuse / grafana 全 200,
+    在 pod 里手打那个 URL 四次全是 401 亚秒。部署窗口是集群最不稳的十分钟
+    (旧 pod 排空 + 新 pod 冷启 + 后台 sweep 追赶),这类假阳性是**结构性的**,
+    而脚本打印的下一步是 rollback —— 照着做就是回滚一个健康的版本。
+
+    重试**打到 stderr**,不打到 stdout:调用方只捕获 stdout 按行解析,而
+    静默重试会把「环境确实抖过」这个事实一起藏掉。闸门可以变绿,但人得看见。
+    '''
+    last = None
+    for i in range(attempts):
+        try:
+            return str(urllib.request.urlopen(url, timeout=10).status)
+        except urllib.error.HTTPError as e:
+            return str(e.code)
+        except Exception as e:
+            last = type(e).__name__
+            if i + 1 < attempts:
+                print('  retry %d/%d %s: %s' % (i + 1, attempts - 1, url, last), file=sys.stderr)
+                time.sleep(i + 1)
+    return last
 
 print('healthz', status('http://localhost:8000/healthz/ready'))
 print('v1_auth', status('${PUBLIC_BASE}/v1/models'))
