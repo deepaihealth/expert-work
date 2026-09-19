@@ -168,14 +168,22 @@ async def test_build_agent_bare_skill_ref_resolves_and_wraps_prompt(
 async def test_available_skills_summary_states_the_sandbox_directory(
     cp: BaseCheckpointSaver[object],
 ) -> None:
-    """波 2 终审 Important-1 —— 技能文件搬到
-    ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<name>/`` 之后,提示词必须陈述这个
-    绝对目录:文件工具 realpath 锁死在 ``/workspace`` 够不到它,而
-    ``agent_key`` 带 8 位摘要后缀,agent 猜不出来。``dir=`` 用与 seed 落点
-    同一个 :func:`sanitize_agent_key` 算出,这条断言即是两者的漂移闸 ——
-    改任一侧的拼法都会在这里红。"""
+    """波 2 终审 Important-1 的诉求没变,说法变了(B-84)。
+
+    诉求:技能文件搬到 ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<name>/`` 之后,
+    提示词**必须**陈述它们在哪 —— 文件工具 realpath 锁死在 ``/workspace``
+    够不到,而 ``agent_key`` 带 8 位摘要后缀,agent 猜不出来。
+
+    变的是:原先每个 ``<skill>`` 摘要重复一个 ``dir=``(19 个技能就 19 遍同一个
+    前缀),现在块头说一次 ``$EXPERT_WORK_SKILLS_DIR``,真值由
+    :func:`orchestrator.tools.sandbox.agent_key_envs` 注进沙箱。
+
+    **闸也跟着挪了**:路径拼法的漂移闸现在在
+    ``test_sandbox_runtime_contract.py::test_skills_dir_env_matches_the_seed_root``
+    —— 那里比的是两个真值,比比对提示词文本更结实。这里只钉两件事:
+    提示词仍然说了去哪找,且**不再**把绝对路径逐个写进去。
+    """
     from expert_work.persistence import SANDBOX_SKILLS_ROOT
-    from orchestrator.tools.skill_seed import sanitize_agent_key
 
     spec = _spec_with_skills(["foo"])
     version = _make_version(name="foo", prompt_fragment="explain X to the user")
@@ -188,8 +196,11 @@ async def test_available_skills_summary_states_the_sandbox_directory(
         tenant_id=uuid4(),
     )
 
-    expected = f"{SANDBOX_SKILLS_ROOT}/{sanitize_agent_key(spec.metadata.name)}/foo"
-    assert f'dir="{expected}"' in built.system_prompt
+    assert "$EXPERT_WORK_SKILLS_DIR" in built.system_prompt
+    assert SANDBOX_SKILLS_ROOT not in built.system_prompt, (
+        f"提示词里又出现了绝对路径 {SANDBOX_SKILLS_ROOT} —— B-84 去掉的就是它:"
+        "每个技能重复一遍同一个前缀,而模型只需要知道一次。"
+    )
 
 
 @pytest.mark.asyncio

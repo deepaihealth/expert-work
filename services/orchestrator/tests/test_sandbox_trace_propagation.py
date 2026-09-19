@@ -169,7 +169,7 @@ async def test_exec_injects_agent_key_env_when_set() -> None:
     (contract-tested in ``test_sandbox_runtime_contract.py``)."""
     import json as _json
 
-    from expert_work.persistence import SANDBOX_AGENTS_ROOT
+    from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 
     body: dict[str, object] = {}
 
@@ -184,7 +184,12 @@ async def test_exec_injects_agent_key_env_when_set() -> None:
     )
     await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5, agent_key="my-agent")
 
-    assert body["envs"] == {"PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent"}
+    assert body["envs"] == {
+        "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
+        # B-84 —— 两个后端送同一份 per-agent env,这条与
+        # ``test_agent_sandbox.py`` 的云侧断言是一对
+        "EXPERT_WORK_SKILLS_DIR": f"{SANDBOX_SKILLS_ROOT}/my-agent",
+    }
 
 
 async def test_exec_omits_envs_when_agent_key_unset() -> None:

@@ -1501,7 +1501,9 @@ async def test_exec_injects_pythonuserbase_when_agent_key_set() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="my-agent")
 
     assert sdk.sandbox.commands.envs_calls[-1] == {
-        "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent"
+        "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
+        # B-84 —— 同一条 per-agent 通道里的第二个值(技能文件根)
+        "EXPERT_WORK_SKILLS_DIR": f"{SANDBOX_SKILLS_ROOT}/my-agent",
     }
 
 

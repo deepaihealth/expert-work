@@ -192,11 +192,12 @@ class SkillViewTool:
         return ToolSpec(
             name="skill_view",
             description=(
-                "Read a file from one of the available skills. Available "
-                "skills + their file lists are listed in the system prompt "
-                'under <available-skills>. Use `path="SKILL.md"` for the '
-                "main body, or the relative path under the skill for a "
-                "supporting file (e.g. `reference/error_codes.md`)."
+                "Read a file from one of the available skills. The skills you "
+                "can reach are listed in the system prompt under "
+                '<available-skills>. Start with `path="SKILL.md"`: it returns '
+                "the skill's main body and, at the end, the list of its "
+                "supporting files. Then pass one of those relative paths "
+                "(e.g. `reference/error_codes.md`) to read it."
             ),
             parameters={
                 "type": "object",
@@ -315,8 +316,16 @@ class SkillViewTool:
             )
 
         # ── Extract requested content ───────────────────────────────
+        manifest = ""
         if path == "SKILL.md":
             content = _repack_skill_md(version)
+            # B-84 —— 附属文件清单从系统提示词搬到这里。它过去是每个
+            # ``<skill>`` 摘要的 ``files=``,每轮 prefill 都重付:对接方两个
+            # Agent 分别列了 197 / 232 个文件名。可**选**技能靠 description,
+            # 文件清单是**用**技能时才需要的 —— 挪到这一跳,用到才付费。
+            # 没有它模型就发现不了附属文件:skill_view 只认精确 path,
+            # 没有列目录的能力。
+            manifest = _supporting_file_manifest(version)
         else:
             file_entry = version.supporting_files.get(path)
             if file_entry is None:
@@ -347,6 +356,13 @@ class SkillViewTool:
                 },
             )
 
+        # 清单拼在威胁扫描**之后**:这些字符串此前逐字出现在每一份系统提示词里、
+        # 从不过扫描,把它们挪到扫描前面等于顺手改了失败形态(一个文件名撞上模式,
+        # 整个技能就读不出来了)——那是另一件事,不该捆在一次瘦身里。
+        # 拼在末尾还有一个好处:``_middle_trim`` 砍的是中段,清单跟着 tail 活下来。
+        if manifest:
+            content = f"{content}\n\n{manifest}"
+
         # ── Truncate to LLM-friendly size ───────────────────────────
         rendered, truncated = _middle_trim(content, self.content_char_cap)
         record_skill_view(result="truncated" if truncated else "ok")
@@ -371,6 +387,23 @@ class SkillViewTool:
             msg = f"skill_view requires non-empty {key!r}"
             raise ToolBlockedError(msg)
         return value
+
+
+def _supporting_file_manifest(version: SkillVersion) -> str:
+    """技能附属文件清单,拼在 ``SKILL.md`` 正文末尾(B-84)。
+
+    没有附属文件就返回空串 —— 一个只有正文的技能不该为一段空清单付字符。
+    """
+    names = sorted(version.supporting_files)
+    if not names:
+        return ""
+    listed = "\n".join(f"- {name}" for name in names)
+    return (
+        "## Supporting files\n"
+        "Load any of these with skill_view(skill_name, path), or run them from "
+        "$EXPERT_WORK_SKILLS_DIR/<skill name>/ inside the sandbox.\n"
+        f"{listed}"
+    )
 
 
 def _repack_skill_md(version: SkillVersion) -> str:

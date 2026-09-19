@@ -58,7 +58,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import BoundDistilledSkill
 from expert_work.common.spotlight import SPOTLIGHT_SYSTEM_CLAUSE
-from expert_work.persistence import SANDBOX_SKILLS_ROOT, MemoryStore
+from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ
 from expert_work.persistence.skill.base import SkillStore
 from expert_work.persistence.tenant_config import TenantConfigStore
@@ -1365,7 +1365,7 @@ async def _load_skills(
         # in <available-skills>. Eager (lazy_load == False) skills also
         # get a <skill> body fragment per Mini-ADR U-15 (default preserves
         # existing behavior so deployed agents do not regress).
-        summaries.append(_render_skill_summary(name=ref.name, version=version, agent_key=agent_key))
+        summaries.append(_render_skill_summary(name=ref.name, version=version))
         if not version.lazy_load:
             fragments.append(_render_skill_fragment(name=ref.name, version=version))
         activated.append(ref.name)
@@ -1406,9 +1406,7 @@ async def _load_skills(
         for tool_name in evolved_version.tool_names:
             skill_tools[tool_name] = name
         resolved[name] = evolved_version
-        summaries.append(
-            _render_skill_summary(name=name, version=evolved_version, agent_key=agent_key)
-        )
+        summaries.append(_render_skill_summary(name=name, version=evolved_version))
         activated.append(name)
         await _record_skill_activity(activity_recorder, evolved_version)
 
@@ -1522,38 +1520,34 @@ def _render_memory_block(*, name: str, version: SkillVersion) -> str:
     )
 
 
-def _render_skill_summary(*, name: str, version: SkillVersion, agent_key: str) -> str:
+def _render_skill_summary(*, name: str, version: SkillVersion) -> str:
     """Capability Uplift Sprint #3 (Mini-ADR U-15) — render the
-    ``<skill name version description files=... dir=... />`` summary that
-    goes into ``<available-skills>``.
+    ``<skill name description />`` summary that goes into
+    ``<available-skills>``.
 
-    ``files`` lists ``SKILL.md`` first, then sorted supporting-file paths.
-    The agent reads this to decide which skill to load via ``skill_view``.
+    **B-84 —— 这一行是每轮都要重付的底盘,所以只放选技能用得上的东西。**
+    实测对接方两个 Agent:``# Available skills`` 段吃掉系统提示词的 53%
+    (ai-health-plan,14,855 字符)和 77%(sop2-designer,17,681 字符);
+    一个 run 50 次 LLM 调用、入出比 22.6:1 —— 慢的是 prefill 不是生成,
+    而这段在每一次 prefill 里都重付一遍。三个属性因此去掉:
 
-    ``dir`` (sandbox migration wave 2 final review, Important 1) is the
-    skill's **absolute directory inside the sandbox**. Before wave 2 the
-    files were seeded into the workspace at ``skills/<name>/``, so a
-    ``SKILL.md`` saying "run ``python scripts/gen.py``" worked as authored:
-    the sandbox's cwd was ``/workspace`` and the relative path resolved.
-    Wave 2 moved the seed destination to
-    ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<name>/`` — outside the workspace
-    (spec § 四), which the file tools cannot even reach (they realpath-clamp
-    to ``/workspace``) — and ``agent_key`` carries an 8-hex digest suffix
-    the agent has no way to guess. Without this attribute nothing in the
-    system prompt ever states where the files are, and skill-runtime §5.1's
-    "bundled scripts run as authored" promise silently breaks: the agent
-    bashes ``python scripts/gen.py`` and gets "No such file". Stating the
-    directory is the whole fix — one attribute the model can concatenate a
-    relative ``files`` entry onto.
+    * ``files=`` —— 最大的一块。ai-health-plan 的 19 个技能列了 **197 个文件名**,
+      sop2-designer 的 13 个列了 **232 个**(docx 61 / pptx 59 / xlsx 54 /
+      ui-ux-pro-max 36)。而**选**技能靠的是 ``description``,文件清单是**用**技能
+      时才需要的 —— 现在它挪到 ``skill_view(name, "SKILL.md")`` 的返回里,
+      用到才付费。openclaw 与 hermes-agent 的技能条目都不列文件。
+    * ``dir=`` —— 有用但不必每个技能重复一遍(它只差一个技能名)。改成沙箱里的
+      ``EXPERT_WORK_SKILLS_DIR`` 环境变量,块头说一次;照 ``EXPERT_WORK_INPUTS_DIR``
+      的先例(:func:`orchestrator.tools.sandbox.agent_key_envs`)。
+      **注意它不能直接删**:wave 2 之后技能落在
+      ``/opt/skills/<agent_key>/<name>/``,``agent_key`` 带 8 位十六进制后缀,
+      模型猜不到;没有它,``SKILL.md`` 里「run ``python scripts/gen.py``」直接
+      No such file(这正是当初加 ``dir=`` 的原因,理由仍然成立,变的只是说法)。
+    * ``version=`` —— 选技能不需要版本号,``skill_view`` 也只认 ``skill_name``。
+      两个开源实现都不给。
     """
-    file_list = ["SKILL.md", *sorted(version.supporting_files)]
-    files_attr = ", ".join(file_list)
     description = (version.description or name).replace('"', "&quot;")
-    return (
-        f'<skill name="{name}" version="{version.version}" '
-        f'description="{description}" files="{files_attr}" '
-        f'dir="{SANDBOX_SKILLS_ROOT}/{agent_key}/{name}" />'
-    )
+    return f'<skill name="{name}" description="{description}" />'
 
 
 #: Agent wall-clock timezone for the injected "current date" line. The injected
@@ -1747,14 +1741,18 @@ def _assemble_system_prompt(
         pieces.append(
             "\n\n# Available skills (use skill_view to load any file)\n"
             "The following skills are bound to this agent. Each <skill> "
-            "summary lists its name, version, description, and the files "
-            "you can load via the skill_view(skill_name, path) tool. "
-            'Use path="SKILL.md" for the main body, or any listed '
-            "relative path for a supporting file. The dir attribute is that "
-            "skill's absolute directory inside the sandbox: when a skill "
-            "tells you to run one of its bundled scripts, use "
-            "dir + '/' + the file path (the sandbox working directory is "
-            "/workspace, which is NOT where skill files live)."
+            "summary gives its name and description — enough to decide "
+            "whether you need it. "
+            'To use one, call skill_view(skill_name, path="SKILL.md"): that '
+            "returns the skill's main body and, at the end, the list of its "
+            "supporting files. Load a supporting file by passing its relative "
+            "path to the same tool. "
+            "A skill's files also exist on disk inside the sandbox, under "
+            "$EXPERT_WORK_SKILLS_DIR/<skill name>/ — so when a skill tells you "
+            "to run one of its bundled scripts, run it from there "
+            '(e.g. python "$EXPERT_WORK_SKILLS_DIR/<skill name>/scripts/gen.py"). '
+            "The sandbox working directory is /workspace, which is NOT where "
+            "skill files live."
             "\n\n<available-skills>\n  " + "\n  ".join(skill_summaries) + "\n</available-skills>"
         )
 

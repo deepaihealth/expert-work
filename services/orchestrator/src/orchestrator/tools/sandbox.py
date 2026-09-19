@@ -35,7 +35,7 @@ from uuid import UUID
 import httpx
 
 from expert_work.common.observability import inject_context
-from expert_work.persistence import SANDBOX_AGENTS_ROOT
+from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -117,6 +117,14 @@ def agent_key_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, s
     envs: dict[str, str] = {}
     if agent_key:
         envs["PYTHONUSERBASE"] = f"{SANDBOX_AGENTS_ROOT}/{agent_key}"
+        # B-84 —— 技能文件的根。此前每个 ``<skill>`` 摘要都带一个 ``dir=``,
+        # 19 个技能就重复 19 遍同一个前缀;换成一个环境变量,系统提示词里只说
+        # 一次。**不能直接删掉不说** —— wave 2 之后技能落在
+        # ``/opt/skills/<agent_key>/<name>/``,``agent_key`` 带 8 位十六进制
+        # 后缀,模型猜不到;没有它,SKILL.md 里「run ``python scripts/gen.py``」
+        # 就是 No such file。与 ``EXPERT_WORK_INPUTS_DIR`` 同一条通道、同一个
+        # 理由:固定写法给模型读,可变部分交给平台填。
+        envs["EXPERT_WORK_SKILLS_DIR"] = f"{SANDBOX_SKILLS_ROOT}/{agent_key}"
     if run_id is not None:
         envs["EXPERT_WORK_INPUTS"] = inputs_abs_path(run_id)
         # B-67 §4.2 —— 本轮 inputs 目录:按变量名命名的链接都在这里。同一条通道,两后端同值。

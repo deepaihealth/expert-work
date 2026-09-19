@@ -743,6 +743,16 @@ Expert Work:
 
 **System prompt 注入逻辑**(改 `agent_factory.py:521-549`):
 
+> ⛔ **勘误(2026-09-19,B-84)** —— 下面这段摘要格式是 Sprint #3 的原始设计,
+> **现已不是实现的样子**。`files=` / `dir=` / `version=` 三个属性都去掉了,摘要
+> 现在只有 `<skill name="…" description="…" />`。原因:这一行每轮 prefill 都要
+> 重付,而实测对接方两个 Agent 的 `# Available skills` 段吃掉系统提示词的
+> 53%~65%,其中最大的一块正是 `files=`(19 个技能列 178 个文件名 / 13 个技能列
+> 219 个)。选技能靠 `description`,文件清单是**用**技能时才需要的,已挪到
+> `skill_view(name, "SKILL.md")` 的返回里;`dir=` 换成块头说一次的
+> `$EXPERT_WORK_SKILLS_DIR`。以实现与 `test_agent_factory_lazy_skill.py` 为准。
+
+
 ```python
 # 所有 skill 都有 summary 块(注 name + description + 文件清单)
 <available-skills>
