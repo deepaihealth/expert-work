@@ -40,6 +40,24 @@ data:
   # TEMPLATE = prod 集群自己的 SandboxSet(infra/k8s/sandbox/ 需在 prod
   # 集群 by hand apply,见 production-release.md)。
   EXPERT_WORK_SANDBOX_BACKEND: "agent_sandbox"
+  # B-81 —— 沙箱里 pip 的索引源。**不配就是直连 pypi.org**,而在阿里云杭州那条链路
+  # 实测只有 16 KiB/s:2026-09-19 在沙箱 pod 里量,官方 CDN 首字节 1.46s / 16 KiB/s
+  # (24.6 MiB 的 pymupdf wheel 要约 26 分钟,pip 必然 ReadTimeout —— 09-18 真实对话
+  # fcc9d02e 四次 pip 全挂,累计 505s),阿里云内网镜像 3863 KiB/s,同一个 wheel 2 秒。
+  #
+  # 用**内网**地址(mirrors.cloud.aliyuncs.com,解析到 100.100.x.x):不走公网带宽,
+  # 且比公网镜像(143 KiB/s)再快 27 倍。代价是它**只有 http** —— https 证书验不过,
+  # 所以必须给 PIP_TRUSTED_HOST。放弃的是传输层校验,**兜底的是 pip 自己的 wheel
+  # 哈希校验**;链路在阿里云内网、不过公网,这个取舍是明写的、不是疏忽。
+  # 公网镜像做备源:内网地址只在 ECS/ACS 内可达,备源让同一份配置在别处也不至于全挂。
+  #
+  # 注入路径不是这里直接给沙箱 —— 是控制面读这三个变量,再由
+  # orchestrator.tools.sandbox.exec_envs 在每次 exec 注入(两个后端唯一来源)。
+  # 不写进 SandboxSet 的 pod env:agent 的 exec 走 ACS/envd,它是否继承 pod env
+  # 我们验不了(记忆里有「envd 不继承镜像 ENV」这条先例)。
+  EXPERT_WORK_SANDBOX_PIP_INDEX_URL: "http://mirrors.cloud.aliyuncs.com/pypi/simple/"
+  EXPERT_WORK_SANDBOX_PIP_EXTRA_INDEX_URL: "https://mirrors.aliyun.com/pypi/simple/"
+  EXPERT_WORK_SANDBOX_PIP_TRUSTED_HOST: "mirrors.cloud.aliyuncs.com mirrors.aliyun.com"
   EXPERT_WORK_SANDBOX_E2B_DOMAIN: "expert-work-sbx.deepaihealth.com"
   EXPERT_WORK_SANDBOX_E2B_TEMPLATE: "expert-work-sandbox"
   EXPERT_WORK_WORKSPACE_NAS_ROOT: "/mnt/workspaces"

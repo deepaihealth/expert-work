@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -119,6 +120,54 @@ def agent_key_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, s
         envs["EXPERT_WORK_INPUTS"] = inputs_abs_path(run_id)
         # B-67 §4.2 —— 本轮 inputs 目录:按变量名命名的链接都在这里。同一条通道,两后端同值。
         envs["EXPERT_WORK_INPUTS_DIR"] = inputs_abs_dir(run_id)
+    return envs
+
+
+#: B-81 —— 沙箱里 pip 的索引配置。键 = 注入进沙箱的变量名,值 = 读平台的哪个环境变量。
+#: **默认全空 = 一个都不注入**,行为与本条之前逐字节一致(pip 直连 pypi.org)。
+#:
+#: 为什么要有:2026-09-19 在阿里云杭州的沙箱 pod 里实测,PyPI 官方 CDN 首字节 1.46s、
+#: **16 KiB/s** —— 那个 24.6 MiB 的 pymupdf wheel 要约 26 分钟,``pip`` 必然
+#: ``ReadTimeoutError``(2026-09-18 真实对话 ``fcc9d02e`` 四次 pip 全挂,累计 505s);
+#: 阿里云内网镜像 **3863 KiB/s**,同一个 wheel **2 秒**下完。同一个沙箱镜像里 apt 早就
+#: 配了 ``mirrors.aliyun.com``,**只有 pip 漏了**。
+#:
+#: 为什么按部署给、而不是写进沙箱镜像的 ``ENV``:那个镜像也在 GitHub CI 上构建,内网地址
+#: ``mirrors.cloud.aliyuncs.com`` 在 runner 上解析不到,写进 Dockerfile 会把 CI 构建搞红。
+#:
+#: 为什么在这一层注入、而不是写进 SandboxSet 的 pod env:agent 的 exec 走 ACS/envd,
+#: **它是否继承 pod env 我们验不了**(记忆里有「envd 不继承镜像 ENV」这条先例)。这一层是
+#: 两个后端都必经、且被契约测试钉住的通道,注入到这里不依赖那个假设。
+_PIP_ENV_SOURCES = {
+    "PIP_INDEX_URL": "EXPERT_WORK_SANDBOX_PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL": "EXPERT_WORK_SANDBOX_PIP_EXTRA_INDEX_URL",
+    "PIP_TRUSTED_HOST": "EXPERT_WORK_SANDBOX_PIP_TRUSTED_HOST",
+}
+
+
+def platform_exec_envs() -> dict[str, str]:
+    """部署级、与 agent 无关的 exec 环境变量(B-81:目前只有 pip 索引)。
+
+    只收非空值:空串与纯空白都当作「没配」,否则一个手滑的空变量会把 pip 的
+    默认索引覆盖成空、比不配更糟。
+    """
+    out: dict[str, str] = {}
+    for name, source in _PIP_ENV_SOURCES.items():
+        value = os.environ.get(source, "").strip()
+        if value:
+            out[name] = value
+    return out
+
+
+def exec_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, str]:
+    """一次 exec 真正注入的全部环境变量 —— **两个后端唯一的来源**。
+
+    = 平台级(:func:`platform_exec_envs`)+ 每 agent / 每 run
+    (:func:`agent_key_envs`)。**后者最后写,平台配置盖不掉隔离用的那几个** ——
+    ``PYTHONUSERBASE`` 被一个部署配置覆盖掉,就是两个 agent 重新共享 ``.local``。
+    """
+    envs = platform_exec_envs()
+    envs.update(agent_key_envs(agent_key, run_id=run_id))
     return envs
 
 
@@ -319,7 +368,7 @@ class HTTPSupervisorRuntime:
         # (agent_key_envs is the single source both backends call), sent over
         # the supervisor's own exec envs channel (ExecRequest.envs,
         # sandbox_supervisor/schemas.py).
-        envs = agent_key_envs(agent_key, run_id=run_id)
+        envs = exec_envs(agent_key, run_id=run_id)
         if envs:
             payload["envs"] = envs
         # B-60 —— 绑了 agent 时把它在 NAS 上的真实目录发给 supervisor,runner 在每次 exec

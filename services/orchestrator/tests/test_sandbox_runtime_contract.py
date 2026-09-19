@@ -1808,3 +1808,64 @@ def test_contract_fixture_accounts_for_every_mandated_env() -> None:
         " 每多一项都要在 _FIXTURE_ENV_DISPOSITION 里显式决定:契约档要它,还是"
         " 有理由不要(把理由写下来)。"
     )
+
+
+def test_platform_pip_envs_are_off_unless_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-81 —— 不配就一个都不注入。
+
+    默认必须与本条之前**逐字节一致**:沙箱的 pip 索引是部署所在区域的属性,
+    本地开发和 GitHub CI 都不该被一个写死的内网地址影响。
+    """
+    from orchestrator.tools.sandbox import agent_key_envs, exec_envs
+
+    for name in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_TRUSTED_HOST"):
+        monkeypatch.delenv(f"EXPERT_WORK_SANDBOX_{name}", raising=False)
+    assert exec_envs("k") == agent_key_envs("k")
+
+
+def test_platform_pip_envs_reach_the_exec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """配了就注入,而且空白值当作没配。
+
+    空串会把 pip 的默认索引覆盖成空 —— 比不配更糟,所以必须被当成「没配」。
+    """
+    from orchestrator.tools.sandbox import exec_envs
+
+    monkeypatch.setenv("EXPERT_WORK_SANDBOX_PIP_INDEX_URL", "http://mirror.invalid/pypi/simple/")
+    monkeypatch.setenv("EXPERT_WORK_SANDBOX_PIP_TRUSTED_HOST", "mirror.invalid")
+    monkeypatch.setenv("EXPERT_WORK_SANDBOX_PIP_EXTRA_INDEX_URL", "   ")
+
+    envs = exec_envs("k")
+    assert envs["PIP_INDEX_URL"] == "http://mirror.invalid/pypi/simple/"
+    assert envs["PIP_TRUSTED_HOST"] == "mirror.invalid"
+    assert "PIP_EXTRA_INDEX_URL" not in envs, "纯空白必须当作没配"
+    assert envs["PYTHONUSERBASE"].endswith("/k"), "平台配置不能把隔离用的那几个挤掉"
+
+
+def test_platform_config_cannot_clobber_per_agent_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """部署配置**盖不掉** ``PYTHONUSERBASE`` —— 盖掉就是两个 agent 重新共享 ``.local``。
+
+    这条钉的是 :func:`exec_envs` 里 ``update`` 的方向。反过来写(平台最后写)时红。
+    """
+    from expert_work.persistence import SANDBOX_AGENTS_ROOT
+    from orchestrator.tools.sandbox import _PIP_ENV_SOURCES, exec_envs
+
+    monkeypatch.setitem(_PIP_ENV_SOURCES, "PYTHONUSERBASE", "EXPERT_WORK_SANDBOX_EVIL")
+    monkeypatch.setenv("EXPERT_WORK_SANDBOX_EVIL", "/shared-by-mistake")
+    try:
+        assert exec_envs("k")["PYTHONUSERBASE"] == f"{SANDBOX_AGENTS_ROOT}/k"
+    finally:
+        _PIP_ENV_SOURCES.pop("PYTHONUSERBASE", None)
+
+
+def test_both_backends_read_the_same_env_source() -> None:
+    """两个后端必须调**同一个**函数 —— 各写各的就会漂(本仓库反复出问题的形状)。"""
+    import inspect
+
+    from orchestrator.tools import agent_sandbox, sandbox
+
+    for module in (sandbox, agent_sandbox):
+        src = inspect.getsource(module)
+        assert "envs = exec_envs(agent_key, run_id=run_id)" in src, module.__name__
+        assert "envs = agent_key_envs(agent_key, run_id=run_id)" not in src, module.__name__
