@@ -8,7 +8,7 @@ pandas==3.0.5          # tabular data / xlsx+csv analysis
 openpyxl==3.1.5        # .xlsx read/write
 python-docx==1.2.0     # .docx read/write
 python-pptx==1.0.2     # .pptx read/write
-pypdf==6.18.0           # PDF read / merge / split
+pypdf==6.18.1           # PDF read / merge / split
 pdfplumber==0.11.10    # PDF text + table extraction
 # PDF *generation* (the read libs above can't author a PDF). markdown→HTML→PDF
 # is the de-facto report path; weasyprint renders HTML+CSS → PDF and picks up
@@ -25,7 +25,7 @@ weasyprint==70.0       # HTML+CSS → PDF (report generation)
 # 只升其中一个的 dependabot PR 一律不要单独合。
 pydyf==0.12.1          # weasyprint PDF backend (与 weasyprint 成对,见上)
 Pillow==12.3.0         # image read/write/convert
-matplotlib==3.11.1     # charts (CJK rendering via fonts-noto-cjk)
+matplotlib==3.11.2     # charts (CJK rendering via fonts-noto-cjk)
 # route ① §5.4 — Python bridges to the new apt binaries (soffice/poppler/ffmpeg).
 pdf2image==1.17.0      # PDF→image; wraps the poppler-utils binaries
 imageio==2.37.4        # gif/video frames (slack-gif-creator)
