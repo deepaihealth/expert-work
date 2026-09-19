@@ -7,6 +7,9 @@ bridge pattern for consistent lifespan management.
 
 from expert_work.runtime.storage.base import LockMode as LockMode
 from expert_work.runtime.storage.base import ObjectLockedError as ObjectLockedError
+from expert_work.runtime.storage.base import (
+    ObjectLockNotHonouredError as ObjectLockNotHonouredError,
+)
 from expert_work.runtime.storage.base import ObjectNotFoundError as ObjectNotFoundError
 from expert_work.runtime.storage.base import ObjectStore as ObjectStore
 from expert_work.runtime.storage.base import ObjectStoreError as ObjectStoreError
@@ -29,6 +32,7 @@ from expert_work.runtime.storage.s3_compatible import (
 __all__ = [
     "InMemoryObjectStore",
     "LockMode",
+    "ObjectLockNotHonouredError",
     "ObjectLockedError",
     "ObjectNotFoundError",
     "ObjectStore",

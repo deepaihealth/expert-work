@@ -15,6 +15,7 @@ from typing import Any, Literal
 
 from expert_work.runtime.storage.base import (
     LockMode,
+    ObjectLockNotHonouredError,
     ObjectNotFoundError,
     ObjectStoreError,
     validate_lock_args,
@@ -62,15 +63,13 @@ class S3CompatibleObjectStore:
             # S3 metadata keys must be ASCII; let the SDK validate. Pass
             # through verbatim — callers carry the contract.
             kwargs["Metadata"] = dict(metadata)
-        if retain_until is not None and lock_mode is not None:
+        locked = retain_until is not None and lock_mode is not None
+        if locked:
             # ``ObjectLockRetainUntilDate`` accepts a datetime; aiobotocore
-            # serializes to ISO 8601 with the offset. S3 / MinIO require
-            # the bucket itself to have Object Lock enabled at create-time;
-            # if it isn't, the put surfaces an InvalidRequest which we
-            # forward as ObjectStoreError (no clean way to anticipate
-            # without a HEAD trip). ``ObjectLockMode`` is upper-case.
+            # serializes to ISO 8601 with the offset. ``ObjectLockMode`` is
+            # upper-case.
             kwargs["ObjectLockRetainUntilDate"] = retain_until
-            kwargs["ObjectLockMode"] = lock_mode.upper()
+            kwargs["ObjectLockMode"] = lock_mode.upper()  # type: ignore[union-attr]
         try:
             await self._client.put_object(**kwargs)
         except self._client.exceptions.ClientError as exc:
@@ -80,6 +79,39 @@ class S3CompatibleObjectStore:
             # sites don't have to know about botocore exception shapes.
             msg = f"put_object failed for key={key!r}: {exc}"
             raise ObjectStoreError(msg) from exc
+        if locked:
+            await self._assert_lock_honoured(key, lock_mode)  # type: ignore[arg-type]
+
+    async def _assert_lock_honoured(self, key: str, lock_mode: LockMode) -> None:
+        """回读一次,确认后端**真的**加上了合规锁。
+
+        这一趟 HEAD 是必要的,不是防御性编程。这个文件此前的注释写着「桶没开
+        Object Lock 的话 put 会报 InvalidRequest」—— 那句话对 S3 / MinIO 成立,
+        对阿里云 OSS 的 S3 兼容层**不成立**:它接受锁参数、返回成功、然后一个字节
+        都不存(实测见 :class:`ObjectLockNotHonouredError` 的 docstring)。
+        「put 成功」是一句**描述**,不是「锁在那儿」这件事本身。
+
+        代价只落在真正要锁的那条路上(D.1c 审计 WORM 备份),普通 put 一趟都不多走。
+
+        **刻意不删掉那个没锁住的对象**:删除本身也会失败(网络/权限),再给这条路
+        加一个失败形态不值;而调用方拿到异常后不会 ack,重试会以同一个 key 覆写。
+        留一份没锁住的副本,不比现在「静默当成锁住了」更坏。
+        """
+        try:
+            head = await self._client.head_object(Bucket=self._bucket, Key=key)
+        except self._client.exceptions.ClientError as exc:
+            msg = f"could not verify object lock for key={key!r}: {exc}"
+            raise ObjectStoreError(msg) from exc
+        got_mode = head.get("ObjectLockMode")
+        got_until = head.get("ObjectLockRetainUntilDate")
+        if got_mode != lock_mode.upper() or got_until is None:
+            msg = (
+                f"backend accepted the put for key={key!r} but did not apply the "
+                f"requested {lock_mode} lock (read back ObjectLockMode={got_mode!r}, "
+                f"ObjectLockRetainUntilDate={got_until!r}). The object is NOT "
+                f"protected — treat this write as failed."
+            )
+            raise ObjectLockNotHonouredError(msg)
 
     async def put_stream(
         self,
