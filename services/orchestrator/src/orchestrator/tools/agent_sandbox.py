@@ -120,7 +120,7 @@ from orchestrator.tools.sandbox import (
     EgressContext,
     SandboxOutcome,
     SandboxSupervisorError,
-    agent_key_envs,
+    exec_envs,
 )
 from orchestrator.tools.sandbox_image_contract import (
     DEFAULT_TIMEOUT_S,
@@ -1518,7 +1518,7 @@ class AgentSandboxClient:
 
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
         started = _monotonic()
-        envs = agent_key_envs(agent_key, run_id=run_id)
+        envs = exec_envs(agent_key, run_id=run_id)
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             # B-60 —— 命令串由 exec_view.build_exec_command 生成:umask 077,再在自己的
