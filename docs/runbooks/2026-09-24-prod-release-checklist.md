@@ -70,6 +70,27 @@
 - **B-84 技能摘要瘦身**（#1608，2026-09-19 追加）：纯代码。技能块砍掉 63~65%（两个 agent 实测
   9,269 / 11,438 字节），整个系统提示词 −33~50%。**摊到每次调用的输入上约 −7%**
   （`ai-health-plan` 入均 48,376 token）—— 三个数都对，只有第三个是用户体感，报的时候别放大。
+- **B-55 冷建沙箱 —— 三条一起**（#1623 / #1624 / #1626，2026-09-19 追加）：
+  这批的根因不是「慢」，是**建不出来**。去数 `sandbox_instance` 528 行：`create_failed`
+  **99 行 = 18.8%**，09-19 当天 **15 次里 13 次失败 = 87%**，每一条的存活时间都恰好 **60 秒**，
+  报错正文是 `504 Gateway Time-out … <center>alb</center>`。CI 的
+  「Contract suite against the real E2B test cluster」是同一个受害者。三条各修一段：
+
+  | | 改什么 | 量到的 |
+  |---|---|---|
+  | #1626 | ALB **80 端口**监听补 `requestTimeout: 180`（原来没设，吃默认 60s） | 冷建要 66~112s > 60s，这是 504 的直接原因 |
+  | #1624 | 沙箱镜像引用改走 ACR 的 **`-vpc`** host | 同一个 619MB 镜像：公网 112s → VPC **66.19s** |
+  | #1623 | 镜像砍掉 apt `ffmpeg`（145 包/387MB）与 `npm`（359 包/133MB） | 解包 1263MB → 742MB，压缩 619MB → 预计 ~435MB |
+
+  **三条缺一不可**：只修 ALB，冷建仍要 112s；只改 VPC，66s 还是过不了 60s 的闸。
+  ALB 是把闸打开，另外两条是把余量做厚。
+
+  ⚠️ **#1626 是本批第三条改生产集群配置的改动**（前两条是 B-56 的 `startupProbe`、B-81 的
+  pip 镜像源），而且**不走 `apply -k`** —— AlbConfig 与 acr-pull Secret 都是手工对象，见 §2 第 7 条与 Step A0。
+
+  ⚠️ #1623 顺带改了 `sandbox_image_contract.py`（`npm` 从预装清单摘掉、`ffmpeg` 来源标成 wheel），
+  正是 B-82 那条注释预告的「下一次重烤镜像时必须同步改」。所以**沙箱镜像钉子这次必须动**。
+
 - **B-73 四条小尾巴**（#1593 + #1595，2026-09-18 追加）：压缩不再把「本轮输入」段摘要掉、
   隐藏段的文件名前缀歧义指向清单、**平台脚手架行不进控制台内容搜索**（带迁移 `0156`）、
   审计视图里这些行渲染成折叠的「平台自动生成」块。
@@ -102,6 +123,18 @@
 > （孤儿重收丢输入 / 沙箱认领撞并发被误判）。它们在 `233791e5` **之后**才合入 main，
 > 按钉子纪律没发过测试环境就不能进这班车。要带就得**先发一次测试环境验过再重钉** —— 拍板题。
 >
+> **🔲 2026-09-19 —— 本单还欠一次重钉（两个钉子都欠）。** 上面 §0 已经把 B-55 三条
+> （#1623 / #1624 / #1626）写进装载，Step A0 / Step A 的动作也写好了，但**钉子本身还没动**：
+>
+> | 钉子 | 现值 | 应该变成 | 为什么还没改 |
+> |---|---|---|---|
+> | 应用镜像 | `233791e5` | 带上 B-55 与 B-58 之后的新 sha | 按钉子纪律，**必须先发一次测试环境验过** |
+> | 沙箱镜像 | `621249f6` | `ef9e157a`（砍掉 ffmpeg/npm 的那次重烤） | 同上，且要等 CI 把镜像推上 ACR |
+>
+> 也就是说 **B-55 的三条目前只到「测试集群已验、仓库已合」**，进这班车还差「发一次测试环境 →
+> 重钉 → 按 §0 顶上那条判据 `grep -n '<旧 sha>' 这份文件` 零命中」。B-58（#1611）同理 ——
+> 用户 2026-09-19 已拍板「58 和 55 带上」，所以下面那条「刻意不带 B-58」的说法**只对 B-85 还成立**。
+
 > **⛔ #1597 那次重钉漏了正文**：表头改成了 `dfd4e6de`，Step B 的 `git checkout` 和另外 4 处
 > 却仍停在 `42426d31`（落后两代）。这已经是同一形状的**第二次**（班车 1 的 B2 正文钉子漏改，#1566）。
 > 本次一并补齐，改钉子的判据定死为：**`grep -n '<旧 sha>' 这份文件` 必须零命中**才算改完。
@@ -259,33 +292,112 @@
 5. **留存清理 CronJob 首跑**：`apply -k` 会创建它，但**第一次真正删数据是发布次日 03:23（北京时间）**
    → Step E 次日核对。
 6. **回滚前置清理**（§4）：生产上一旦配了 `arg_bindings` 或 `render:`，回滚会让 Agent 起不来。
+7. **ALB 监听超时 + `acr-pull` 凭据（B-55）—— 两个手工对象，`apply -k` 都不碰** → Step A0。
+   - **AlbConfig 不在 kustomize 树里**（它是装 ack-sandbox-manager 时建的、`sandbox-system`
+     的 Ingress 与我们共用同一个 ALB 实例，所有权是共享的），只能 `kubectl patch`。
+     merge patch 会**整段替换** `listeners`，所以那份文件必须永远带全部监听 —— 包括 80，
+     那正是沙箱网关用的那个。
+   - **`acr-pull` Secret 必须同时带公网与 `-vpc` 两个 host**。dockerconfigjson 按 host 索引，
+     kubelet 只查与镜像引用 host **完全相同**的那一条，没有通配也没有回退。少了 `-vpc` 那条，
+     Step A apply 完之后池会停在 `availableReplicas 0` 而**什么错都不报**
+     （事件里是 `insufficient_scope: authorization failed`）。
+   - 两件事都必须**先于 Step A** 做完：Step A 会重建温池 pod，那一刻就要拉 `-vpc` 的镜像。
 
 ---
 
 ## 3. 执行顺序
 
-顺序是约束：**A 在 B 之前**（金丝雀要在新沙箱镜像上验），**B 之后立刻做 C**。
+顺序是约束：**A0 在 A 之前**（B-55：凭据与 ALB 都要先就位，A 一 apply 就去拉 `-vpc` 的镜像）、
+**A 在 B 之前**（金丝雀要在新沙箱镜像上验）、**B 之后立刻做 C**。
 
-### Step A — 沙箱镜像钉子（`e8aac104` → `621249f6`）
+### Step A0 — `acr-pull` 两个 host + ALB 80 端口超时（B-55，本版新增）
+
+两件事都**必须在 Step A 之前做完**，理由见 §2 第 7 条。两件都不是 `apply -k` 的范围。
+
+**A0-1 —— 重建 `acr-pull`（两个 namespace、两个 host）**
 
 ```sh
 export KUBECONFIG=~/.kube/expert-work-prod.yaml
 
-# 发前值（留档）。期望 …/sandbox:e8aac104；对不上说明中间有人动过，停下来先弄清楚
+# 发前值（留档）：期望只有公网一个 host
+for ns in expert-work default; do
+  printf '%s: ' "$ns"
+  kubectl -n "$ns" get secret acr-pull -o jsonpath='{.data.\.dockerconfigjson}' \
+    | base64 -d \
+    | python3 -c 'import json,sys; print(*sorted(json.load(sys.stdin)["auths"]))'
+done
+
+tools/deploy/acr-pull-secret.sh   # 交互式问用户名 + ACR 固定密码，不回显、不进 argv、不落盘
+```
+
+- [ ] 两个 namespace 都打印出**两个** host（`crpi-….personal…` 与 `crpi-…-vpc.personal…`）
+
+脚本自己会在结尾回显每个 namespace 实际写进去的 host，对不上就停下来。
+用户名 = 阿里云账号全名，密码 = ACR 个人版「访问凭证 → 固定密码」
+（`docs/runbooks/workstation-setup.md` §2）。
+
+**A0-2 —— ALB 80 端口补 `requestTimeout`**
+
+```sh
+# 发前值（留档）：期望 80 只有 port/protocol，没有任何 timeout
+kubectl get albconfig alb -o jsonpath='{.spec.listeners}{"\n"}'
+
+kubectl apply -f infra/k8s/cluster/prod/albconfig.yaml
+```
+
+⚠️ **生产用 `apply -f prod/albconfig.yaml`**（它是完整对象，还带同文件里的 IngressClass），
+**不是** `kubectl patch --patch-file albconfig-listeners-patch.yaml` —— 那一份是**测试**集群的，
+带的是测试的证书 id；两份的 `listeners` 现在内容相同，但证书不同，用错会把生产 443 的证书
+换成测试的。这条 `apply -f` 与 `docs/runbooks/production-release.md` §1.3 里建集群时那条**是同一条**，
+重复执行幂等。
+
+```sh
+# 发后值：80 与 443 都应有 idleTimeout 60 / requestTimeout 180
+kubectl get albconfig alb -o jsonpath='{.spec.listeners}{"\n"}'
+```
+
+- [ ] 80 端口出现 `requestTimeout: 180`
+- [ ] 443 端口的 `CertificateId` **没变**（还是生产那张）
+
+> `listeners` 是整段替换的，所以那份文件必须带齐所有监听 —— 包括 80，那是沙箱网关用的。
+> 生效是秒级的，不重启任何 pod，不影响在途请求。
+
+### Step A — 沙箱镜像钉子（`e8aac104` → `<新 tag>`，且 host 改成 `-vpc`）
+
+⚠️ **本版这一步同时换两样东西**：tag（新镜像，砍掉了 ffmpeg / npm）和 **host**（公网 → `-vpc`）。
+`sandboxset.yaml` 里两样都改好了，照常 `apply -f` 即可，但发后核对要**两样都看**。
+
+```sh
+export KUBECONFIG=~/.kube/expert-work-prod.yaml
+
+# 发前值（留档）。期望 crpi-….personal.cr.aliyuncs.com/expert-work/sandbox:e8aac104
+# —— 公网 host + 老 tag。对不上说明中间有人动过，停下来先弄清楚
 kubectl -n default get sandboxset expert-work-sandbox \
   -o jsonpath='{.spec.template.spec.containers[*].image}{"  replicas="}{.spec.replicas}{"\n"}'
 
 kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
 
-# 发后值应为 …/sandbox:621249f6
+# 发后值应为 crpi-…-vpc.personal.cr.aliyuncs.com/expert-work/sandbox:<新 tag>
 kubectl -n default get sandboxset expert-work-sandbox \
   -o jsonpath='{.spec.template.spec.containers[*].image}{"  replicas="}{.spec.replicas}{"\n"}'
 ```
 
-- [ ] 已 apply，tag 变成 `621249f6`
-- [ ] 池 pod 重建完成（`kubectl -n default get pods | grep sandbox`，冷拉约 110s）
+- [ ] 已 apply，host 变成 **`-vpc`**、tag 变成新 tag（两样都要核）
+- [ ] 池 pod 重建完成（`kubectl -n default get pods | grep sandbox`）
+- [ ] `kubectl -n default get sandboxset expert-work-sandbox -o jsonpath='{.status.availableReplicas}'` 回到 `1`
 
 ⚠️ apply 会重建温池 pod，**在途沙箱会被打断** —— 所以放在窗口内、B 之前。
+
+**卡在 `availableReplicas 0` 怎么读**（B-55 的两个已知形态）：
+
+```sh
+kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i -E "Pull|Failed"
+```
+
+| 事件里看到 | 说明 | 修法 |
+|---|---|---|
+| `insufficient_scope: authorization failed` | A0-1 没做或只写了一个 host | 回去做 A0-1 |
+| `Pulling` 之后长时间没有 `Pulled` | 正常冷拉，VPC 实测 66s（公网 112s） | 等 |
 
 ### Step B — 发版（单段）
 
