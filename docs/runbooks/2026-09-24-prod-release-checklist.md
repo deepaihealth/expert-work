@@ -8,8 +8,8 @@
 |---|---|
 | 发布日 | **2026-09-24（周四）**，用户 2026-09-17 拍板（原 09-22） |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`88a2b6c3`** —— 测试环境 2026-09-18 实际发过的那一版 |
-| 区间提交数 | **41**（`git log --oneline 5775fbf3..88a2b6c3`） |
+| 本版 tag | **`233791e5`** —— 测试环境 2026-09-19 第二次发过的那一版（`SMOKE PASS` 一遍过，金丝雀两次连过） |
+| 区间提交数 | **52**（`git log --oneline 5775fbf3..233791e5`） |
 | 数据库迁移 | **两条**：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）。migrate Job 自动跑，不需要额外动作 |
 | 段数 | **单段**。有迁移但不是三段式：`0156` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这张表上正常跑 |
 | 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要） |
@@ -52,13 +52,33 @@
   隐藏段的文件名前缀歧义指向清单、**平台脚手架行不进控制台内容搜索**（带迁移 `0156`）、
   审计视图里这些行渲染成折叠的「平台自动生成」块。
 
-> **钉子纪律**：本单钉 `88a2b6c3`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `233791e5`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
 > B-73 四条一起带上，重钉 `dfd4e6de`（#1597）。当晚发现 B-73 ① 在生产上只能修一半
-> （写隐藏消息的源头有三个，另外两个早就在生产跑），补 `0157` 逼 sweep 重扫，重钉 `88a2b6c3`（本单）。
+> （写隐藏消息的源头有三个，另外两个早就在生产跑），补 `0157` 逼 sweep 重扫，重钉 `233791e5`（本单）。
 > 形态：无迁移 → 一条 expand-only → **两条（`0156` 加列 + `0157` 数据迁移）**，全程仍是单段。
+>
+> **2026-09-19 第四次重钉：`233791e5`（#1618）。** 这一版在测试环境**实际发过两次**
+> （上一个钉子 → `f5b78124` → `233791e5`），比上一个钉子多 10 个提交
+> （**这里刻意不写旧 sha 的字面量** —— 判据是 `grep '<旧 sha>'` 零命中，
+> 历史叙述里留一个反而让判据永远过不了）：
+>
+> - **`anyio` 4.13.0 → 4.14.2**（#1605）—— 两个 CVE 卡住了当时每一个 PR 的 `Security (pip-audit)`。
+>   只改 `uv.lock`；锁里出现两个 anyio 是预期的解析分叉，运行时镜像与 CI 都是 python 3.12，落地的是 4.14.2。
+> - **B-80 两个修**（#1599）—— 排空中的旧 pod 不再被算成发布失败 + 排空过程落审计。
+> - **B-81 沙箱 pip 镜像源**（#1602）—— 三个 `EXPERT_WORK_SANDBOX_PIP_*` 已经在
+>   `overlays/prod/configmap-patch.yaml` 里，随 `apply -k` 一起上，**不需要额外手工步骤**。
+>   阿里云杭州实测：官方 CDN 16 KiB/s → 内网镜像 3863 KiB/s，同一个 wheel 26 分钟 → 2 秒。
+> - **B-82 预装清单**（#1606）+ **B-84 技能摘要瘦身**（#1608）—— 都是纯代码（工具描述 / 系统提示词），
+>   **不重烤沙箱镜像**，沙箱镜像钉子仍是 `621249f6`。
+>
+> 迁移**仍是两条**（`0156` / `0157`），形态仍是单段，回滚纪律不变。
+>
+> **⚠️ 本单刻意不带 B-58（#1611）与 B-85（#1618）**，两条都是 09-19 当天修的发布闸门根因
+> （孤儿重收丢输入 / 沙箱认领撞并发被误判）。它们在 `233791e5` **之后**才合入 main，
+> 按钉子纪律没发过测试环境就不能进这班车。要带就得**先发一次测试环境验过再重钉** —— 拍板题。
 >
 > **⛔ #1597 那次重钉漏了正文**：表头改成了 `dfd4e6de`，Step B 的 `git checkout` 和另外 4 处
 > 却仍停在 `42426d31`（落后两代）。这已经是同一形状的**第二次**（班车 1 的 B2 正文钉子漏改，#1566）。
@@ -249,13 +269,13 @@ kubectl -n default get sandboxset expert-work-sandbox \
 
 ```sh
 git fetch origin main
-git checkout 88a2b6c3
+git checkout 233791e5
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `88a2b6c3`
+- [ ] 确认 checkout 的是 `233791e5`
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
 - [ ] migrate Job `condition met`，且日志里出现**两条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
@@ -271,7 +291,7 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `88a2b6c3`（admin-ui 是 `88a2b6c3-prod`）
+- [ ] 三个应用镜像都是 `233791e5`（admin-ui 是 `233791e5-prod`）
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -319,7 +339,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag 88a2b6c3` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag 233791e5` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 621249f6`、留存 CronJob 首次接入、回滚命令。
 - [ ] ROADMAP 班车 2 行销案；本执行单补 §6 执行记录。
 
