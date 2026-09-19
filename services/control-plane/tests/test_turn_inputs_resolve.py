@@ -200,6 +200,10 @@ _SRC = Path(__file__).resolve().parents[1] / "src" / "control_plane"
 #:   那一轮,所以 ``spawn_run`` 也要调 ``resolve_turn_inputs``)。
 #: * ``"resume"`` —— 接着跑某一轮:``graph_input=None``,``prompt_inputs`` 与
 #:   ``inputs_run_id`` 都必须是 ``resolve_turn_inputs`` 取回的。
+#: * ``"resume_or_replay"`` —— 同 ``resume``,但 ``graph_input`` 是**按状态算出来的**
+#:   (B-58):有耐久检查点就续(``None``),没有就拿 ``enqueued_input`` 重放。
+#:   所以它的 ``graph_input`` 不是字面 ``None``,断言改成两条:必须传变量,
+#:   且函数体里必须真有那条重放分支(见下面的 ``_calls_replay_builder``)。
 #: * ``None`` —— 不传 inputs,理由写在行上。
 _RUN_AGENT_SITES: dict[str, tuple[str | None, bool]] = {
     "api/runs.py::spawn_run": ("fresh", True),
@@ -207,7 +211,7 @@ _RUN_AGENT_SITES: dict[str, tuple[str | None, bool]] = {
     # 由 ``spawn_run`` 建行时写好。
     "run_queue_worker.py::_execute": ("fresh", False),
     "api/runs.py::resolve_approval_decision": ("resume", True),
-    "orphan_sweep.py::_respawn": ("resume", True),
+    "orphan_sweep.py::_respawn": ("resume_or_replay", True),
     # 触发器每次开新会话;触发配置里没有 inputs 这个概念(``seed_input`` 是文本),
     # 这一轮就是没有 inputs —— 它暂停后的续跑取回的也是空的,两段一致。
     "trigger_firing.py::fire_trigger": (None, False),
@@ -246,6 +250,20 @@ def _run_agent_calls() -> dict[str, tuple[ast.Call, ast.AST]]:
     return found
 
 
+def _calls_replay_builder(func: ast.AST) -> bool:
+    """函数体里有没有真的去构建重放输入(B-58 的那条分支)。
+
+    只断言 ``graph_input`` 是个变量太弱 —— 把它改成 ``graph_input = None`` 一行
+    也满足,而那正好是本 bug 的样子。
+    """
+    return any(
+        isinstance(sub, ast.Call)
+        and isinstance(sub.func, ast.Name)
+        and sub.func.id == "graph_input_from_enqueued"
+        for sub in ast.walk(func)
+    )
+
+
 def _calls_resolver(func: ast.AST) -> bool:
     return any(
         isinstance(sub, ast.Call)
@@ -267,12 +285,23 @@ def test_every_run_agent_call_passes_the_turn_inputs() -> None:
         kwargs = {kw.arg: kw.value for kw in call.keywords}
         graph_input = kwargs.get("graph_input")
         is_resume = isinstance(graph_input, ast.Constant) and graph_input.value is None
-        assert is_resume == (kind == "resume"), f"{site}: graph_input 与登记的类别对不上"
+        if kind == "resume_or_replay":
+            # B-58 —— 这一档的两条判据都要成立,少一条就是 bug 回来了。
+            assert not is_resume, (
+                f"{site}: graph_input 又写死成 None 了 —— 没有检查点时 LangGraph 会抛"
+                " EmptyInputError(与事实矛盾的「没有输入」),正是 B-58。"
+            )
+            assert _calls_replay_builder(func), (
+                f"{site}: 重放分支不见了 —— graph_input 是变量但没人从 enqueued_input"
+                " 构建它,等于只剩「续不了就死」。"
+            )
+        else:
+            assert is_resume == (kind == "resume"), f"{site}: graph_input 与登记的类别对不上"
         if kind is None:
             assert "prompt_inputs" not in kwargs, f"{site}: 开始传 inputs 了,改登记"
             continue
         assert "prompt_inputs" in kwargs, f"{site}: 没传 prompt_inputs"
-        assert ("inputs_run_id" in kwargs) == (kind == "resume"), (
+        assert ("inputs_run_id" in kwargs) == (kind in ("resume", "resume_or_replay")), (
             f"{site}: inputs_run_id 只有续跑类入口该传"
         )
         assert _calls_resolver(func) == resolves, f"{site}: resolve_turn_inputs 的调用与登记不符"
