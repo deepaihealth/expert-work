@@ -85,19 +85,24 @@ RUN_EXIT_REASONS: frozenset[str] = frozenset(
 )
 
 
-def compute_completed(*, exit_reason: str, last_batch_failures: Sequence[Any]) -> bool:
+def compute_completed(*, exit_reason: str, unresolved_failures: Sequence[Any]) -> bool:
     """B-85 ③ —— 这个 run 把事做成了没有。**只用客观事实,不推断模型意图**。
 
     ``True`` 要求两件都成立:
 
     * run 是因为**模型不再调工具**而结束的(``text_response``),不是被平台
       主动中止的(撞预算 / 挂审批 / 被否决);
-    * **最后一批**工具调用里没有未解决的非 transient 失败。
+    * **整个 run** 里没有还没被抵消掉的非 transient 工具失败。
 
     第二条就是 2026-09-19 抓到的那次形状:工具失败 → 模型不再动作 → 图正常
-    收尾 → ``status=success`` 而零产物。判的是「**结束得紧挨着一批失败**」这个
-    事实,不是「模型放弃了」这个意图 —— 后者猜不准(模型合理地换个方法也长这样),
+    收尾 → ``status=success`` 而零产物。判的是「**有一次工具失败自始至终没成功过**」
+    这个事实,不是「模型放弃了」这个意图 —— 后者猜不准(模型合理地换个方法也长这样),
     前者客观可判。
+
+    B-84 第 3 条把它从「最后一批」收窄成了「全 run 未抵消」:只看最后一批时,
+    批 1 调工具 A 失败、批 2 调工具 B 成功、然后文字收尾 —— 终局那一批是干净的,
+    于是判 ``completed=true``,而 A 从来没成功过。记账与抵消的口径见
+    ``AgentState["unresolved_failures"]``。
 
     **与 ``status`` 正交**:``status`` 说的是「图跑完了没抛异常」,这里说的是
     「事做成了」。``status="success"`` 且 ``completed=False`` 是合法且有意义的组合。
@@ -105,7 +110,7 @@ def compute_completed(*, exit_reason: str, last_batch_failures: Sequence[Any]) -
     没见过的 ``exit_reason`` 一律判 ``False``:判 ``True`` 等于替一个我们不认识的
     出口作保,而本条要修的正是「平台替一个它不了解的终局打包票」。
     """
-    return exit_reason == "text_response" and not last_batch_failures
+    return exit_reason == "text_response" and not unresolved_failures
 
 
 #: Run statuses that mark a run as finished — ``RunManager`` stamps

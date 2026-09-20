@@ -23,20 +23,20 @@ def _failures(n: int) -> list[Any]:
     return [_Failure() for _ in range(n)]
 
 
-def test_completed_is_false_when_the_last_tool_batch_still_had_failures() -> None:
+def test_completed_is_false_while_a_tool_failure_is_still_unresolved() -> None:
     """B-85 那次的逐字重放。
 
-    从 ``text_response`` 出口正常结束、``status`` 仍是 ``success``,但最后一批
-    工具调用里有未解决的非 transient 失败 → ``completed=False``。
+    从 ``text_response`` 出口正常结束、``status`` 仍是 ``success``,但整个 run 里
+    还有没被抵消掉的非 transient 工具失败 → ``completed=False``。
 
-    注意这里判的是「**结束得紧挨着一批失败**」这个事实,不是「模型放弃了」这个
-    意图 —— 后者猜不准(模型合理地换个方法也长这样),前者客观可判。
+    注意这里判的是「**有一次工具失败自始至终没成功过**」这个事实,不是「模型放弃了」
+    这个意图 —— 后者猜不准(模型合理地换个方法也长这样),前者客观可判。
     """
-    assert compute_completed(exit_reason="text_response", last_batch_failures=_failures(1)) is False
+    assert compute_completed(exit_reason="text_response", unresolved_failures=_failures(1)) is False
 
 
 def test_completed_is_true_on_a_clean_text_response_exit() -> None:
-    assert compute_completed(exit_reason="text_response", last_batch_failures=[]) is True
+    assert compute_completed(exit_reason="text_response", unresolved_failures=[]) is True
 
 
 def test_every_non_text_response_exit_is_not_completed() -> None:
@@ -48,7 +48,7 @@ def test_every_non_text_response_exit_is_not_completed() -> None:
         "approval_pending",
         "approval_rejected",
     ):
-        assert compute_completed(exit_reason=reason, last_batch_failures=[]) is False, reason
+        assert compute_completed(exit_reason=reason, unresolved_failures=[]) is False, reason
 
 
 def test_an_unknown_exit_reason_is_not_completed() -> None:
@@ -57,4 +57,4 @@ def test_an_unknown_exit_reason_is_not_completed() -> None:
     判 ``True`` 等于替一个我们不认识的出口作保,而本条要修的正是「平台替一个
     它不了解的终局打包票」。
     """
-    assert compute_completed(exit_reason="something_new", last_batch_failures=[]) is False
+    assert compute_completed(exit_reason="something_new", unresolved_failures=[]) is False
