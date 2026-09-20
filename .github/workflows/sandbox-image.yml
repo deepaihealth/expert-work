@@ -6,7 +6,7 @@ name: Sandbox Image
 # minimal/office variant split was collapsed into this one image
 # (sandbox-image-consolidation). On PRs it builds, smoke-tests and Trivy-scans
 # (no registry creds needed); on main / manual dispatch it also pushes a
-# multi-arch (amd64+arm64) manifest to Aliyun ACR when configured.
+# linux/amd64 image to Aliyun ACR when configured.
 #
 # The Trivy gate is CRITICAL-only (--ignore-unfixed): the LibreOffice + CJK +
 # Node Debian base carries a large user-space library surface that keeps a HIGH
@@ -47,45 +47,31 @@ permissions:
 
 jobs:
   build:
-    name: Build + smoke + Trivy (+ multi-arch push on main)
+    name: Build + smoke + Trivy (+ push on main)
     runs-on: ubuntu-latest
     # Full image: LibreOffice + ffmpeg + Node add a large apt layer (~1 GB of
-    # debs on a cold cache); the multi-arch push also cross-builds linux/arm64
-    # under QEMU emulation (slow for this heavy base). Generous headroom; the
-    # gha cache warms it after the first push.
-    # 90 → 180(2026-09-19)。B-55 砍 apt 层(#1623)那次**正好跑满 90 分钟被 kill**,
-    # 倒在 `Build + push to ACR (multi-arch)` 上,镜像没推上去。
+    # debs on a cold cache). Generous headroom; the gha cache warms it after
+    # the first push.
     #
-    # 原因是这个 job 实际建**三次**:`Build (load local)` 建一次 amd64 供 smoke 与
-    # Trivy 用(实测 26m51s),然后 `Build + push` 再建 amd64 + arm64 两个平台,
-    # 而 arm64 那半边走 QEMU 模拟 —— apt 层在模拟下是数倍时间。平时缓存命中所以
-    # 看不出来;**改了 apt 包列表的那一次必然全冷建**,也正是最需要它成功的那一次。
+    # 90 → 180 → 90(2026-09-19 / 09-20)。中间那次 180 是为了让 arm64 建得完;
+    # arm64 已经删掉(见下面 `platforms` 处的说明),所以退回 90。
+    #
+    # 这个 job 建**两次**:`Build (load local)` 建 amd64 供 smoke 与 Trivy 用
+    # (冷建实测 26m51s),然后 `Build + push` 再建一次同一个平台。冷建约 54 分钟,
+    # 90 留约 36 分钟余量。平时缓存命中在 15 分钟内;**改了 apt 包列表的那一次
+    # 必然全冷建**,也正是最需要它成功的那一次(B-55 #1623 就是这么被 kill 的)。
     #
     # 与 sandbox-gvisor.yml 的 30 → 45、ci.yml integration 的 40 → 60 是同一条理由:
     # 冷建不是异常路径,是「改完那一层之后的第一批」的常态。
-    #
-    # 180 的依据:amd64 冷建实测 26m51s,arm64 在 QEMU 下按 3~4 倍估 ≈ 105 分钟,
-    # 加上两次构建与推送约 140 分钟,留 40 分钟余量。
-    #
-    # 真正的长期解法是**别建 arm64** —— 仓里没有任何路径从 ACR 拉沙箱镜像的 arm64:
-    # 本地开发走 `make build-sandbox` 本地构建 `expert-work-sandbox:dev`,
-    # ACR 那份唯一的消费者是 `infra/k8s/sandbox/sandboxset.yaml`,跑在 amd64 集群上。
-    # 那是一次「删掉一个已发布的平台」的改动,单独拍板,不在这条里顺手做。
-    timeout-minutes: 180
+    timeout-minutes: 90
     steps:
       # Actions are SHA-pinned (a mutable tag could be re-pointed at malicious
       # code in this credential-holding workflow); the trailing comment tracks
       # the human-readable version.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # QEMU lets the amd64 runner cross-build the linux/arm64 image for the
-      # multi-arch push (Apple-silicon dev machines pull arm64). Only the push
-      # step is multi-arch — the local-load build below stays native amd64
-      # (docker load can't ingest a multi-platform image; the smoke/Trivy gate
-      # runs on the native arch, which is the standard pattern).
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
-
+      # 没有 QEMU 步骤:这个 workflow 只建 linux/amd64,runner 本身就是 amd64,
+      # 不需要跨架构模拟(见下面 `platforms` 处的说明)。
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
@@ -163,17 +149,31 @@ jobs:
         if: github.event_name != 'pull_request' && vars.ALIYUN_ACR_REGISTRY != ''
         run: echo "short=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
-      - name: Build + push to ACR (multi-arch)
+      - name: Build + push to ACR
         if: github.event_name != 'pull_request' && vars.ALIYUN_ACR_REGISTRY != ''
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: infra/sandbox-image
           file: infra/sandbox-image/Dockerfile
           push: true
-          # amd64 (Linux prod hosts) + arm64 (Apple-silicon dev). The Dockerfile
-          # has no arch-specific pins — apt/pip resolve per-arch — so one build
-          # yields a manifest list covering both.
-          platforms: linux/amd64,linux/arm64
+          # 2026-09-20:**只建 amd64**,arm64 已删。
+          #
+          # 删它的依据是「ACR 上这个镜像的 arm64 那半边没有任何消费者」,逐条去数过:
+          #   - 两个 ACS 集群的节点全是 amd64(测试 virtual-kubelet-cn-hangzhou-b/-g/-i,
+          #     生产 -b/-j),而 ACR 上这个镜像的唯一消费者就是
+          #     `infra/k8s/sandbox/sandboxset.yaml` 的那一行 image。
+          #   - 应用镜像 `control-plane` 早就是单 amd64 manifest,生产从 09-16 一直在跑,
+          #     `tools/deploy/build-push.sh` 里也明写 `--platform linux/amd64`
+          #     加一句「the ACS cluster nodes are linux/amd64」。
+          #   - 本地开发不从 ACR 拉这个镜像:`make build-sandbox` 在本机建
+          #     `expert-work-sandbox:dev`,Apple silicon 上建出来的自然就是本机架构。
+          #
+          # 代价:arm64 那半边走 QEMU 模拟,apt 层在模拟下是数倍时间 —— #1623 那次
+          # 冷建正是倒在它上面(90 分钟跑满被 kill,镜像没推上去)。
+          #
+          # 如果以后真需要 arm64(比如上了 arm 节点池),把它加回来的同时要把
+          # timeout 一起抬回 180。
+          platforms: linux/amd64
           # B-57 —— 关掉 provenance 证明。buildx 默认给推送附一份 attestation
           # 清单,它的配置 blob 用 `application/vnd.oci.empty.v1+json`;阿里云
           # ACR(个人版)不认这个 manifest class,推 manifest 时直接
