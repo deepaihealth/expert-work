@@ -126,7 +126,9 @@ async def test_update_plan_description_carries_complexity_guidance() -> None:
     spec = UpdatePlanTool().spec
     assert "3+ " in spec.description
     assert "goal" in spec.parameters["properties"]
-    assert spec.parameters["required"] == ["steps", "reason"]
+    # B-84 — ``reason`` is deliberately NOT required; see the two tests under
+    # "input validation" for why.
+    assert spec.parameters["required"] == ["steps"]
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +144,36 @@ async def test_update_plan_rejects_empty_steps_array() -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_plan_rejects_missing_reason() -> None:
+async def test_update_plan_accepts_the_shape_the_model_actually_sends() -> None:
+    """B-84 — ``{goal, steps}`` with no ``reason`` is the real-world call.
+
+    Sixty days of test-environment traffic: 50 rejections, every one of them
+    ``$ (required)`` on this exact shape. ``reason`` is trace-only and the
+    tool's own schema says it is "not fed back to the agent", so the model
+    never sees a consequence it could learn from — the rejection bought
+    nothing but a wasted round trip.
+    """
     tool = UpdatePlanTool()
-    with pytest.raises(ValueError, match="non-empty 'reason'"):
-        await tool.call({"steps": ["a"], "reason": "   "}, ctx=_ctx_with_plan())
+    result = await tool.call({"goal": "Ship the thing", "steps": ["a", "b"]}, ctx=_ctx_with_plan())
+    assert result.state_updates["plan"].goal == "Ship the thing"
+    assert result.meta["reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_update_plan_still_records_reason_when_given() -> None:
+    """Optional means optional — not ignored. Trace/audit still gets it."""
+    tool = UpdatePlanTool()
+    result = await tool.call(
+        {"steps": ["a"], "reason": "spec changed mid-run"}, ctx=_ctx_with_plan()
+    )
+    assert result.meta["reason"] == "spec changed mid-run"
+
+
+@pytest.mark.asyncio
+async def test_update_plan_blank_reason_is_not_an_error() -> None:
+    tool = UpdatePlanTool()
+    result = await tool.call({"steps": ["a"], "reason": "   "}, ctx=_ctx_with_plan())
+    assert result.meta["reason"] == ""
 
 
 @pytest.mark.asyncio

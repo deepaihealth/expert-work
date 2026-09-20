@@ -263,3 +263,62 @@ def test_render_single_failure_one_line() -> None:
     )
     body = [ln for ln in out.splitlines() if ln.startswith("- ")]
     assert len(body) == 1
+
+
+# ---------------------------------------------------------------------------
+# B-84 — "the call never got to look" must not read as "the thing is gone"
+# ---------------------------------------------------------------------------
+
+#: The literal supervisor error from run ``7fad305b`` (test environment,
+#: 2026-09-16). Kept verbatim: the hyphen in "Time-out" and the absence of
+#: 504 from the status list are exactly why this used to classify ``unknown``.
+_SANDBOX_504 = (
+    "sandbox create failed: 504: b'<html>\\r\\n<head><title>504 Gateway "
+    "Time-out</title></head>\\r\\n<body><center><h1>504 Gateway Time-out"
+    "</h1></center></body>\\r\\n</html>'"
+)
+
+
+def test_sandbox_504_is_transient_not_unknown() -> None:
+    c = classify_tool_error(tool_name="list_dir", error=Exception(_SANDBOX_504))
+    assert c.error_class == "transient"
+
+
+def test_bare_gateway_time_out_wording_is_transient() -> None:
+    """nginx spells it "Time-out"; the ``timeout`` needle alone misses it."""
+    c = classify_tool_error(tool_name="list_dir", error=Exception("Gateway Time-out"))
+    assert c.error_class == "transient"
+
+
+def test_transient_advice_denies_the_not_found_inference() -> None:
+    c = classify_tool_error(
+        tool_name="list_dir", error=Exception(_SANDBOX_504), spec=_spec(read_only=True)
+    )
+    assert "NOTHING about whether the target exists" in c.advice
+    assert "do not recreate it from scratch" in c.advice.lower()
+
+
+def test_unsafe_transient_advice_also_denies_it() -> None:
+    c = classify_tool_error(tool_name="write_file", error=Exception(_SANDBOX_504))
+    assert c.retryable is False
+    assert "NOTHING about whether the target exists" in c.advice
+
+
+def test_unknown_advice_denies_the_not_found_inference() -> None:
+    c = classify_tool_error(tool_name="t", error=Exception("something weird happened"))
+    assert c.error_class == "unknown"
+    assert "NOTHING about whether the target exists" in c.advice
+
+
+def test_permission_denied_advice_denies_it_too() -> None:
+    c = classify_tool_error(tool_name="t", error=PermissionError("nope"))
+    assert c.error_class == "permission_denied"
+    assert "NOTHING about whether the target exists" in c.advice
+
+
+def test_resource_not_found_does_not_carry_the_disclaimer() -> None:
+    """The one class that DOES license "it is not there" must stay clean —
+    otherwise the disclaimer is noise and the model learns to ignore it."""
+    c = classify_tool_error(tool_name="t", error=FileNotFoundError("gone"))
+    assert c.error_class == "resource_not_found"
+    assert "NOTHING about whether the target exists" not in c.advice
