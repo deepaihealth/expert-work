@@ -971,6 +971,10 @@ async def build_agent(
                 allowed_skill_names=frozenset(loaded_skills.activated_skill_names),
                 activity_recorder=skill_activity_recorder,
                 skill_asset_store=skill_asset_store,
+                # B-84 — 与 ``_bound_distilled_skills`` 用同一个口径
+                # (``spec.metadata.name``), 不是 ``agent_key``: 两者对不上
+                # 的话 skill_run_usage 里就连不成「这个 agent 读过什么」。
+                agent_name=spec.metadata.name,
             )
         )
 
@@ -1372,6 +1376,7 @@ async def _load_skills(
 
         # Capability Uplift Sprint #4 (Mini-ADR U-27) — bump last_used_at
         # so the Curator doesn't auto-stale a freshly-bound skill.
+        # B-84: bind only. ``last_viewed_at`` belongs to ``skill_view``.
         await _record_skill_activity(activity_recorder, version)
 
     # SE-16 (SE-A42) — auto-attach the agent's own distilled skills, lazily
@@ -1428,6 +1433,12 @@ async def _record_skill_activity(
     """Best-effort Curator last_used_at bump (Mini-ADR U-27). Swallows errors —
     never fail the build because bookkeeping hiccuped. Stream X (Mini-ADR X-3):
     platform (NULL-tenant) versions don't participate in the per-tenant Curator.
+
+    B-84 — this is the **bind** event and it stays bind-only: it must NOT
+    touch ``last_viewed_at``. Binding a skill says the manifest still lists
+    it, not that the model ever read it; conflating the two is what made
+    ``last_used_at`` unable to answer "is this skill actually used". The
+    ``kind`` argument is left at its ``"bind"`` default on purpose.
     """
     if activity_recorder is None or version.tenant_id is None:
         return

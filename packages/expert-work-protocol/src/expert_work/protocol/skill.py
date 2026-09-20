@@ -21,11 +21,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from expert_work.protocol.eval_dataset import TrajectoryOutcome
 from expert_work.protocol.tenant_config import TenantPlan
 
 __all__ = [
     "HIGH_RISK_TOOLS",
+    "SKILL_USAGE_VIEWED",
     "ComponentType",
     "EvalVerdict",
     "EvolutionOrigin",
@@ -44,7 +44,9 @@ __all__ = [
     "SkillRunUsage",
     "SkillStatus",
     "SkillSupportingFile",
+    "SkillUsageOutcome",
     "SkillVersion",
+    "SkillViewGap",
     "SkillVisibility",
     "canonicalize_skill_content",
     "compute_content_hash",
@@ -368,6 +370,53 @@ class SkillEvalResult(BaseModel):
     created_at: datetime
 
 
+#: ``skill_run_usage.outcome`` 的取值域 —— ``eval_dataset.TrajectoryOutcome``
+#: 的**超集**。
+#:
+#: 前四个是 run 的终局(SE-7d-1 原有语义,由 run 收尾时写入)。``viewed``(B-84)
+#: 不是终局,它记的是**过程中**发生的一件事: 模型真的调了 ``skill_view`` 打开了
+#: 这个技能。两者同表是因为问题同形 ——「这个租户的这个 agent 在这个 thread 里
+#: 碰过这个技能版本没有」—— 但它们**绝不能混进同一个样本**:
+#:
+#: :func:`control_plane.skill_rollback.decide_rollback` 算的是
+#: ``successes / len(非 cancelled)``。一条 ``viewed`` 落进那个列表就是一个
+#: 「非 success」样本,会凭空拉低成功率、把健康的技能版本自动 archive 掉。
+#: 所以 :meth:`SkillStore.skill_run_usage_window`(回滚判定唯一的读取口)
+#: **过滤掉** ``viewed``,回滚闸门本身再过滤一次 —— 两道,因为这条路的失败
+#: 后果是静默删技能。
+#:
+#: 刻意不扩 ``eval_dataset.TrajectoryOutcome`` 本身: 那个词表是 run/trajectory/curation
+#: 三个域共用的「一次运行怎么结束的」,``viewed`` 在那里没有意义。
+SkillUsageOutcome = Literal["success", "failed", "max_steps", "cancelled", "viewed"]
+
+#: 写 ``skill_run_usage`` 的 ``viewed`` 行时用的 outcome 字面量, 单点定义,
+#: 免得写入侧和过滤侧各自抄一遍字符串然后漂移。
+SKILL_USAGE_VIEWED: Final[Literal["viewed"]] = "viewed"
+
+
+class SkillViewGap(BaseModel):
+    """B-84 —— 「绑了但这个 agent 从没打开过」的只读盘点结果。
+
+    ``unviewed`` 是该 agent 绑定清单里, 在观测窗口内**没有**任何
+    ``skill_run_usage.outcome='viewed'`` 行的技能(租户自有与平台技能都算 ——
+    ``viewed`` 行的 ``tenant_id`` 是**消费方租户**, 所以平台技能对每个租户
+    各自可量)。``untracked_names`` 是压根解析不到技能行的名字: 拼错的、已删的。
+
+    两者分开摆是刻意的。``untracked_names`` 里的名字**不是**「没人读过」, 是
+    「这个名字根本没对应到东西」; 混进 ``unviewed`` 就是拿「没有观测对象」
+    冒充「观测到没人读」。
+
+    ``unviewed`` 命中要连着 B-84 的上线时间一起读: ``skill_run_usage`` 在本改动
+    之前从没为 ``skill_view`` 写过行, 所以「没有 viewed 行」的准确含义是
+    「上线之后没记到读取」, 不是「有史以来没读过」。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    unviewed: tuple[Skill, ...] = ()
+    untracked_names: tuple[str, ...] = ()
+
+
 class SkillRunUsage(BaseModel):
     """One row of ``skill_run_usage`` — Stream SE (Mini-ADR SE-A11, SE-7d-1).
 
@@ -383,6 +432,10 @@ class SkillRunUsage(BaseModel):
 
     ``tenant_id is None`` = 平台 skill 的使用记录(沿用 0057 NULL-tenant);
     ``agent_name`` 是熔断 scope key ``{tenant}:{agent}`` 的一半(SE-7c/d-3)。
+
+    B-84 给 ``outcome`` 加了第五个取值 ``viewed`` —— 见 :data:`SkillUsageOutcome`。
+    ``viewed`` 行由 ``skill_view`` 工具写, ``tenant_id`` 填**消费方租户**(平台
+    技能也一样, 所以不再出现「平台技能量不到」的盲区), 且**不参与**回滚判定。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -393,7 +446,7 @@ class SkillRunUsage(BaseModel):
     skill_version: int = Field(ge=1)
     thread_id: UUID
     agent_name: str
-    outcome: TrajectoryOutcome
+    outcome: SkillUsageOutcome
     created_at: datetime
 
 

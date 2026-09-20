@@ -42,7 +42,7 @@ from expert_work.persistence.rls import (
 )
 from expert_work.persistence.skill.base import SkillStore
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult, TrajectoryOutcome
-from expert_work.protocol.skill import SkillStatus
+from expert_work.protocol.skill import SKILL_USAGE_VIEWED, SkillStatus
 from expert_work.runtime.audit.logger import AuditLogger
 
 __all__ = ["RollbackGate"]
@@ -108,26 +108,43 @@ class RollbackGate:
             tenant_id=tenant_id,
             since=since,
         )
-        outcomes: list[TrajectoryOutcome] = [u.outcome for u in usages]
+        # B-84 —— 判定样本在这里成型, 而且**只在这里**过滤一次 ``viewed``。
+        #
+        # ``outcome='viewed'`` 是「模型打开过这个技能」, 不是一次 run 的终局。
+        # 它进了样本就是 ``decide_rollback`` 眼里的一个「非 success」, 会凭空
+        # 拉低成功率、把健康版本自动 archive 掉 —— 失败后果是**静默删技能**。
+        #
+        # 上游 ``skill_run_usage_window`` 也滤一道(第一层)。留着这一层是因为
+        # 第一层坏掉时它还成立; 真实路径上喂不到 ``viewed`` 行, 所以它由注入
+        # 桩 store 的测试钉住(见 ``test_skill_rollback_gate`` 的 leaky-store 用例)。
+        # 这个谓词同时把类型收窄到四个终局值 —— 删掉它 mypy 会先红。
+        #
+        # 下面一律用 ``scored`` 而不是 ``usages``: 不变式只有一个产地, 不写第二
+        # 遍同样的过滤。写两遍的那版看着像两层保护, 其实第二遍恒为真(死条件),
+        # 比没有冗余更坏。
+        scored: list[tuple[UUID, TrajectoryOutcome]] = [
+            (u.thread_id, u.outcome) for u in usages if u.outcome != SKILL_USAGE_VIEWED
+        ]
+        outcomes: list[TrajectoryOutcome] = [outcome for _, outcome in scored]
         disapproved = 0
-        if self.feedback_store is not None and usages:
+        if self.feedback_store is not None and scored:
             # PR4 — 反馈来源(console/external)在这里**刻意不参与判断**:这里问
             # 的是「这个技能版本是不是跑砸了」,员工与终端用户的 👎 同等有效
             # (spec §6)。展示面要区分来源,判断面不区分 —— 不要在这里补一个
             # source 过滤。
             with _tenant_scope(tenant_id):
                 down = await self.feedback_store.down_rated_threads(
-                    thread_ids=[u.thread_id for u in usages]
+                    thread_ids=[thread_id for thread_id, _ in scored]
                 )
             if down:
                 # A user 👎 overrides the machine verdict for that sample —
                 # the run "succeeded" but failed the user. ``cancelled``
                 # stays cancelled (still excluded by the judge).
                 outcomes = [
-                    "failed" if u.thread_id in down and u.outcome == "success" else u.outcome
-                    for u in usages
+                    "failed" if thread_id in down and outcome == "success" else outcome
+                    for thread_id, outcome in scored
                 ]
-                disapproved = sum(1 for u in usages if u.thread_id in down)
+                disapproved = sum(1 for thread_id, _ in scored if thread_id in down)
         decision = decide_rollback(outcomes, promote_baseline=promote_baseline, config=self.config)
         if should_rollback(decision):
             await self.skill_store.set_status(

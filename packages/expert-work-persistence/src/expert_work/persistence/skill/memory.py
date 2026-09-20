@@ -33,8 +33,10 @@ from expert_work.protocol import (
     SkillRunUsage,
     SkillStatus,
     SkillVersion,
+    SkillViewGap,
     SkillVisibility,
 )
+from expert_work.protocol.skill import SKILL_USAGE_VIEWED
 from expert_work.protocol.tenant_config import TenantPlan
 
 
@@ -461,6 +463,9 @@ class InMemorySkillStore(SkillStore):
             and r.skill_version == skill_version
             and r.tenant_id == tenant_id
             and r.created_at >= since
+            # B-84 — 与 SQL 谓词逐字同义: ``viewed`` 不是 run 终局, 进了
+            # 样本会把健康版本判成回归。见 base.py 的说明。
+            and r.outcome != SKILL_USAGE_VIEWED
         ]
         rows.sort(key=lambda r: r.created_at)
         return rows
@@ -1060,6 +1065,46 @@ class InMemorySkillStore(SkillStore):
 
     async def count_pinned(self) -> int:
         return sum(1 for row in self._skills.values() if row.pinned)
+
+    # ------------------------------------------- view-gap read-only (B-84)
+
+    async def skill_view_gap(
+        self,
+        *,
+        tenant_id: UUID,
+        agent_name: str,
+        names: Sequence[str],
+        viewed_before: datetime,
+    ) -> SkillViewGap:
+        wanted = list(dict.fromkeys(names))
+        if not wanted:
+            return SkillViewGap()
+        # 合并视图: 同名时租户自有遮蔽平台行, 与 build 期的名字解析同序。
+        resolved: dict[str, Skill] = {}
+        for row in self._skills.values():
+            if row.name not in set(wanted):
+                continue
+            if row.tenant_id not in (tenant_id, None):
+                continue
+            current = resolved.get(row.name)
+            if current is None or (current.tenant_id is None and row.tenant_id is not None):
+                resolved[row.name] = row
+        # 证据行是**消费方租户自有**的, 所以平台技能在这里一样可量。
+        resolved_ids = {row.id for row in resolved.values()}
+        viewed_ids = {
+            u.skill_id
+            for u in self._run_usage
+            if u.tenant_id == tenant_id
+            and u.agent_name == agent_name
+            and u.outcome == SKILL_USAGE_VIEWED
+            and u.created_at >= viewed_before
+            and u.skill_id in resolved_ids
+        }
+        unviewed = [row for _, row in sorted(resolved.items()) if row.id not in viewed_ids]
+        return SkillViewGap(
+            unviewed=tuple(unviewed),
+            untracked_names=tuple(sorted(n for n in wanted if n not in resolved)),
+        )
 
 
 def _new_id() -> UUID:

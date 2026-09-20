@@ -27,15 +27,18 @@ from control_plane.skill_curator import (
     SkillCurator,
 )
 from control_plane.tenancy import TenantConfigService
+from expert_work.common.skill_activity import SkillViewEvent
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.skill import InMemorySkillStore
 from expert_work.persistence.tenant_config import InMemoryTenantConfigStore
 from expert_work.protocol import (
     AuditAction,
     AuditQuery,
+    SkillRunUsage,
     SkillStatus,
     TenantConfigPatch,
 )
+from expert_work.protocol.skill import SKILL_USAGE_VIEWED
 from expert_work.runtime.audit.fallback import InMemoryAuditFallbackQueue
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.audit.redactor import DefaultSecretRedactor
@@ -300,6 +303,204 @@ async def test_activity_recorder_skips_archived() -> None:
     assert fired is False
     row = await store.get_skill(skill_id=skill_id, tenant_id=_TENANT_A)
     assert row is not None and row.status == SkillStatus.ARCHIVED
+
+
+# ─── B-84: 绑定 vs 打开是两件事, 证据落 skill_run_usage ────────────────
+
+
+def _view(*, version: int = 1, thread_id: UUID | None = None, agent: str = "ai-health-plan"):
+    return SkillViewEvent(
+        skill_version=version,
+        thread_id=thread_id or uuid4(),
+        agent_name=agent,
+    )
+
+
+async def _viewed_rows(store: InMemorySkillStore) -> list[SkillRunUsage]:
+    return [u for u in store._run_usage if u.outcome == SKILL_USAGE_VIEWED]
+
+
+@pytest.mark.asyncio
+async def test_bind_writes_no_viewed_row() -> None:
+    """绑定不是阅读 —— agent_factory 那条路只能 bump last_used_at。"""
+    store = InMemorySkillStore()
+    recorder = ThrottledActivityRecorder(store, ttl_seconds=3600)
+    skill_id = await _seed_skill(
+        store=store,
+        tenant_id=_TENANT_A,
+        name="bound-not-read",
+        status=SkillStatus.ACTIVE,
+        last_used_at=datetime.now(UTC) - timedelta(days=1),
+    )
+
+    fired = await recorder.maybe_record(skill_id=skill_id, tenant_id=_TENANT_A)
+    assert fired is True
+    row = await store.get_skill(skill_id=skill_id, tenant_id=_TENANT_A)
+    assert row is not None and row.last_used_at is not None, "bind 仍然要 bump last_used_at"
+    assert await _viewed_rows(store) == [], "bind 写了 viewed 行就等于没分开这两件事"
+
+
+@pytest.mark.asyncio
+async def test_view_writes_a_viewed_row_and_still_bumps_last_used_at() -> None:
+    """``skill_view`` 是唯一写 viewed 行的入口; 它同时也算一次 use。"""
+    store = InMemorySkillStore()
+    recorder = ThrottledActivityRecorder(store, ttl_seconds=3600)
+    skill_id = await _seed_skill(
+        store=store,
+        tenant_id=_TENANT_A,
+        name="actually-read",
+        status=SkillStatus.ACTIVE,
+        last_used_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    thread_id = uuid4()
+
+    fired = await recorder.maybe_record(
+        skill_id=skill_id,
+        tenant_id=_TENANT_A,
+        kind="view",
+        view=_view(version=3, thread_id=thread_id),
+    )
+    assert fired is True
+    row = await store.get_skill(skill_id=skill_id, tenant_id=_TENANT_A)
+    assert row is not None and row.last_used_at is not None
+
+    rows = await _viewed_rows(store)
+    assert len(rows) == 1
+    assert rows[0].tenant_id == _TENANT_A
+    assert rows[0].skill_id == skill_id
+    assert rows[0].skill_version == 3
+    assert rows[0].thread_id == thread_id
+    assert rows[0].agent_name == "ai-health-plan"
+
+
+@pytest.mark.asyncio
+async def test_platform_skill_view_is_recorded_under_the_consuming_tenant() -> None:
+    """**本次返工的全部意义**: 平台技能 (``skill.tenant_id IS NULL``) 必须量得到。
+
+    对接方 ai-health-plan 绑的 19 个技能 19/19 都是平台技能。证据行写在
+    ``skill_run_usage`` 而不是 ``skill`` 行上, 所以 ``tenant_id`` 填的是**消费方
+    租户** —— 既不需要 bypass RLS 去写 NULL-tenant 行, 也让同一个平台技能对每个
+    租户各自可量。
+    """
+    store = InMemorySkillStore()
+    recorder = ThrottledActivityRecorder(store, ttl_seconds=3600)
+    platform_id = uuid4()
+    await store.create_platform_skill(skill_id=platform_id, name="ui-ux-pro-max")
+
+    fired = await recorder.maybe_record(
+        skill_id=platform_id,
+        tenant_id=_TENANT_A,
+        kind="view",
+        view=_view(),
+    )
+    # 平台行的 last_used_at bump 本来就匹配不上 (按 tenant_id 过滤), 与本改动无关。
+    assert fired is False
+
+    rows = await _viewed_rows(store)
+    assert len(rows) == 1, "平台技能被打开过, 必须留下证据行"
+    assert rows[0].skill_id == platform_id
+    assert rows[0].tenant_id == _TENANT_A, "证据行归消费方租户, 不是 NULL"
+
+
+@pytest.mark.asyncio
+async def test_view_row_not_swallowed_by_a_prior_bind() -> None:
+    """两道门各算各的 —— 否则 bind 每次构建都占着窗口, 证据行永远写不进去。
+
+    这是本改动的核心失效模式: 共用一个节流窗口时, 每轮都发生的 bind 会把偶发
+    的 view 吃掉, 一个**正在被读**的技能照样留不下证据行。
+    """
+    store = InMemorySkillStore()
+    recorder = ThrottledActivityRecorder(store, ttl_seconds=3600)
+    skill_id = await _seed_skill(
+        store=store,
+        tenant_id=_TENANT_A,
+        name="bound-then-read",
+        status=SkillStatus.ACTIVE,
+        last_used_at=datetime.now(UTC) - timedelta(days=1),
+    )
+
+    assert await recorder.maybe_record(skill_id=skill_id, tenant_id=_TENANT_A) is True
+    # 同一个 TTL 窗口内紧跟一次真实阅读 —— last_used_at 的 bump 会被节流掉,
+    # 证据行不该跟着被吞。
+    await recorder.maybe_record(skill_id=skill_id, tenant_id=_TENANT_A, kind="view", view=_view())
+    assert len(await _viewed_rows(store)) == 1, "view 的去重门是独立的, 不该被 bind 关上"
+
+
+@pytest.mark.asyncio
+async def test_view_row_deduped_within_one_thread() -> None:
+    """一个 thread 内同一技能只记一次 —— 问的是「有没有」不是「几次」。"""
+    store = InMemorySkillStore()
+    recorder = ThrottledActivityRecorder(store, ttl_seconds=3600)
+    skill_id = await _seed_skill(
+        store=store,
+        tenant_id=_TENANT_A,
+        name="read-twice",
+        status=SkillStatus.ACTIVE,
+        last_used_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    thread_id = uuid4()
+
+    for _ in range(3):
+        await recorder.maybe_record(
+            skill_id=skill_id,
+            tenant_id=_TENANT_A,
+            kind="view",
+            view=_view(thread_id=thread_id),
+        )
+    assert len(await _viewed_rows(store)) == 1
+
+    # 换一个 thread 就是新的一次「打开过」, 必须再记一行。
+    await recorder.maybe_record(skill_id=skill_id, tenant_id=_TENANT_A, kind="view", view=_view())
+    assert len(await _viewed_rows(store)) == 2
+
+
+@pytest.mark.asyncio
+async def test_view_without_payload_degrades_to_a_plain_bump() -> None:
+    """``view=None``(没有 thread 绑定)不写证据行, 也不能炸掉热路径。"""
+    store = InMemorySkillStore()
+    recorder = ThrottledActivityRecorder(store, ttl_seconds=3600)
+    skill_id = await _seed_skill(
+        store=store,
+        tenant_id=_TENANT_A,
+        name="no-thread",
+        status=SkillStatus.ACTIVE,
+        last_used_at=datetime.now(UTC) - timedelta(days=1),
+    )
+
+    fired = await recorder.maybe_record(skill_id=skill_id, tenant_id=_TENANT_A, kind="view")
+    assert fired is True
+    assert await _viewed_rows(store) == []
+
+
+@pytest.mark.asyncio
+async def test_curator_ignores_viewed_rows() -> None:
+    """硬约束: 「没被打开过」不是归档理由 —— hermes 的 absence-of-evidence 判据。
+
+    一个刚被绑定 (``last_used_at`` 是现在) 但一条 viewed 行都没有的技能, 扫一遍
+    之后必须还是 ACTIVE。
+    """
+    store = InMemorySkillStore()
+    audit_logger, _ = _build_logger()
+    curator = _curator(
+        store,
+        TenantConfigService(store=InMemoryTenantConfigStore(), audit_logger=audit_logger),
+        audit_logger,
+    )
+    skill_id = await _seed_skill(
+        store=store,
+        tenant_id=_TENANT_A,
+        name="never-read-but-fresh",
+        status=SkillStatus.ACTIVE,
+        last_used_at=datetime.now(UTC),
+    )
+
+    summary = await curator.run_once()
+    assert summary.active_to_stale == 0
+    assert summary.stale_to_archived == 0
+    row = await store.get_skill(skill_id=skill_id, tenant_id=_TENANT_A)
+    assert row is not None
+    assert await _viewed_rows(store) == []
+    assert row.status == SkillStatus.ACTIVE
 
 
 @pytest.mark.asyncio

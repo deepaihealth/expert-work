@@ -14,11 +14,13 @@ See ``docs/streams/STREAM-UPLIFT-DESIGN.md`` § 4.3.5 + § 4.3.9.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from expert_work.common.skill_activity import SkillActivityKind, SkillViewEvent
 from expert_work.protocol import SkillVersion
 from expert_work.protocol.skill import (
     SkillSupportingFile,
@@ -79,6 +81,31 @@ def _make_tool_for(version: SkillVersion, *, skill_name: str = "api-debug") -> S
 
 def _ctx_for(version: SkillVersion) -> ToolContext:
     return ToolContext(tenant_id=version.tenant_id)
+
+
+@dataclass(frozen=True)
+class _ActivityCall:
+    skill_id: UUID
+    tenant_id: UUID
+    kind: SkillActivityKind
+    view: SkillViewEvent | None
+
+
+class _RecordingActivityRecorder:
+    """Captures每一次 ``record`` 调用, 含 B-84 的 ``kind`` 与证据载荷。"""
+
+    def __init__(self) -> None:
+        self.calls: list[_ActivityCall] = []
+
+    async def record(
+        self,
+        *,
+        skill_id: UUID,
+        tenant_id: UUID,
+        kind: SkillActivityKind = "bind",
+        view: SkillViewEvent | None = None,
+    ) -> None:
+        self.calls.append(_ActivityCall(skill_id, tenant_id, kind, view))
 
 
 # ─── happy path ──────────────────────────────────────────────────────────
@@ -315,34 +342,63 @@ async def test_draft_skill_returns_not_found() -> None:
 
 @pytest.mark.asyncio
 async def test_activity_recorder_invoked_on_successful_read() -> None:
-    """skill_view bumps last_used_at when the recorder is wired."""
-    from uuid import UUID
-
+    """skill_view 报 ``kind="view"`` 并带上写证据行所需的三个字段(B-84)。"""
     version = _make_version()
-    recorded: list[tuple[UUID, UUID]] = []
-
-    class _Recorder:
-        async def record(self, *, skill_id: UUID, tenant_id: UUID) -> None:
-            recorded.append((skill_id, tenant_id))
+    thread_id = uuid4()
+    recorded = _RecordingActivityRecorder()
 
     resolver = RecordingSkillResolver(versions={(version.tenant_id, "api-debug"): version})
     tool = SkillViewTool(
         resolver=resolver,
         allowed_skill_names=frozenset({"api-debug"}),
-        activity_recorder=_Recorder(),
+        activity_recorder=recorded,
+        agent_name="ai-health-plan",
     )
     await tool.call(
         {"skill_name": "api-debug", "path": "SKILL.md"},
-        ctx=_ctx_for(version),
+        ctx=ToolContext(tenant_id=version.tenant_id, thread_id=thread_id),
     )
-    assert recorded == [(version.skill_id, version.tenant_id)]
+    # 报 bind 的话 ``skill_run_usage`` 里不会出现 viewed 行,「绑着」和
+    # 「被打开过」就还是同一件事。
+    assert [c.kind for c in recorded.calls] == ["view"]
+    call = recorded.calls[0]
+    assert (call.skill_id, call.tenant_id) == (version.skill_id, version.tenant_id)
+    # 证据行的三个字段必须齐: 少一个就拼不出 skill_run_usage 行。
+    assert call.view is not None
+    assert call.view.skill_version == version.version
+    assert call.view.thread_id == thread_id
+    # agent_name 走 ``spec.metadata.name`` 口径, 不是 sanitize 过的 agent_key。
+    assert call.view.agent_name == "ai-health-plan"
+
+
+@pytest.mark.asyncio
+async def test_view_event_omitted_without_a_thread_binding() -> None:
+    """没有 thread 绑定就不带证据行 —— ``skill_run_usage.thread_id`` 是 NOT NULL。
+
+    拿 ``run_id`` 顶替会把两种 id 混进同一列, 而那一列还是回滚闸门 join 用户
+    反馈的键。真实会为空的只有 eval / 合成执行路径。
+    """
+    version = _make_version()
+    recorded = _RecordingActivityRecorder()
+
+    resolver = RecordingSkillResolver(versions={(version.tenant_id, "api-debug"): version})
+    tool = SkillViewTool(
+        resolver=resolver,
+        allowed_skill_names=frozenset({"api-debug"}),
+        activity_recorder=recorded,
+        agent_name="ai-health-plan",
+    )
+    await tool.call(
+        {"skill_name": "api-debug", "path": "SKILL.md"},
+        ctx=ToolContext(tenant_id=version.tenant_id),
+    )
+    assert [c.kind for c in recorded.calls] == ["view"]
+    assert recorded.calls[0].view is None
 
 
 @pytest.mark.asyncio
 async def test_activity_recorder_not_invoked_on_archived() -> None:
     """Archived skill is a hard stop — don't even bump activity."""
-    from uuid import UUID
-
     from expert_work.protocol import Skill, SkillStatus
 
     version = _make_version()
@@ -357,11 +413,7 @@ async def test_activity_recorder_not_invoked_on_archived() -> None:
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
-    recorded: list[tuple[UUID, UUID]] = []
-
-    class _Recorder:
-        async def record(self, *, skill_id: UUID, tenant_id: UUID) -> None:
-            recorded.append((skill_id, tenant_id))
+    recorded = _RecordingActivityRecorder()
 
     resolver = RecordingSkillResolver(
         versions={(version.tenant_id, "api-debug"): version},
@@ -370,13 +422,13 @@ async def test_activity_recorder_not_invoked_on_archived() -> None:
     tool = SkillViewTool(
         resolver=resolver,
         allowed_skill_names=frozenset({"api-debug"}),
-        activity_recorder=_Recorder(),
+        activity_recorder=recorded,
     )
     await tool.call(
         {"skill_name": "api-debug", "path": "SKILL.md"},
         ctx=_ctx_for(version),
     )
-    assert recorded == []
+    assert recorded.calls == []
 
 
 @pytest.mark.asyncio
