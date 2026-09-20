@@ -39,6 +39,7 @@ from pathlib import PurePosixPath
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
 from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePathEscapeError
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.workspace_paths import require_safe_key
 
 #: 整个用户根 —— 没绑 agent 时 ``/workspace`` 就是它。也是每个方法的默认值:
@@ -51,6 +52,10 @@ SCOPE_SHARED = WORKSPACE_SHARED_DIR
 
 #: ``agent:<agent_key>`` 的前缀。
 SCOPE_AGENT_PREFIX = "agent:"
+
+#: 沙箱视图里 ``shared/`` 的样子 —— 由 :data:`EXEC_VIEW` 与目录名拼出来, 与
+#: ``workspace_paths.resolve_scope`` 返回的那个字符串必须永远同形。
+_SHARED_VIEW = f"{EXEC_VIEW}/{WORKSPACE_SHARED_DIR}"
 
 #: 布局里的保留段。绑了 agent 的调用一律不许拿它们寻址 —— 与
 #: ``file_ops._require_path`` 的同款规矩逐字同义(那里是工具层的闸,这里是 store 层
@@ -192,3 +197,20 @@ def _reject_reserved_head(prefix: tuple[str, ...], parts: tuple[str, ...], path:
             f"workspace path must be relative to your own workspace; "
             f"{parts[0]!r} is a reserved layout segment: {path!r}"
         )
+
+
+def store_scope(ws: str, *, agent_key: str) -> str:
+    """``resolve_scope`` 的 ``ws`` → 宿主侧作用域 —— 沙箱与宿主之间唯一的翻译点。
+
+    ``ws`` 只有两种取值(见 :func:`~orchestrator.tools.workspace_paths.resolve_scope`):
+    ``EXEC_VIEW`` 本身, 或者 ``EXEC_VIEW/shared``。前者绑了 agent 就是那个 agent 的
+    目录、没绑就是整个用户根;后者是只读 bind 进来的 ``shared/``。
+
+    刻意不接受第三种写法:``ws`` 是本进程自己算出来的, 出现别的值意味着上游改了
+    而这里没跟上 —— 那种时候静默回落到用户根就是一次静默的越权扩大。
+    """
+    if ws == _SHARED_VIEW:
+        return SCOPE_SHARED
+    if ws != EXEC_VIEW:
+        raise SandboxSupervisorError(f"unknown workspace view: {ws!r}")
+    return agent_scope(agent_key) if agent_key else SCOPE_USER_ROOT

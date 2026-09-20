@@ -169,6 +169,8 @@ from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
     WorkspaceFileNotFoundError,
     WorkspaceFileTooLargeError,
+    WorkspaceNotADirectoryError,
+    WorkspaceNotAFileError,
     WorkspacePathEscapeError,
     WorkspacePermissionError,
 )
@@ -224,7 +226,7 @@ _MAX_WRITE_BYTES = 25 * 1024 * 1024
 _MAX_LIST_ENTRIES = 2000
 
 #: ``search_files`` 默认返回多少条 —— 超了带 ``truncated=True``。
-_DEFAULT_SEARCH_RESULTS = 50
+DEFAULT_SEARCH_RESULTS = 50
 
 #: ``search_files`` 按内容搜时的单文件读取上限(1 MiB)。超过这个大小的文件跳过
 #: 而不是读进来:一次搜索会打开一整棵子树, 没有这条闸一个大文件就能把 control
@@ -766,9 +768,13 @@ class NasWorkspaceStore:
                     raise WorkspaceFileTooLargeError(msg)
                 try:
                     return handle.read()
+                except IsADirectoryError as exc:
+                    # B-84 —— "它是个目录"不是"它不存在":模型的下一步动作不同
+                    # (换个路径 vs 改用 list_dir), 沙箱片段一直把这两件事分成
+                    # ``is_a_directory`` 与 ``not_found`` 两种 envelope。仍是
+                    # SandboxSupervisorError 的子类, 下载端点照旧 404。
+                    raise WorkspaceNotAFileError(f"workspace path is not a file: {path!r}") from exc
                 except OSError as exc:
-                    # e.g. IsADirectoryError — ``name`` resolved to a
-                    # directory, not a file.
                     raise WorkspaceFileNotFoundError(f"workspace file not found: {path!r}") from exc
 
         return await asyncio.to_thread(_read)
@@ -948,7 +954,7 @@ class NasWorkspaceStore:
                         )
                     )
             except NotADirectoryError as exc:
-                raise SandboxSupervisorError(
+                raise WorkspaceNotADirectoryError(
                     f"workspace path is not a directory: {path!r}"
                 ) from exc
             except PermissionError as exc:
@@ -971,7 +977,7 @@ class NasWorkspaceStore:
         scope: str = SCOPE_USER_ROOT,
         name_glob: str | None = None,
         content: str | None = None,
-        max_results: int = _DEFAULT_SEARCH_RESULTS,
+        max_results: int = DEFAULT_SEARCH_RESULTS,
     ) -> WorkspaceSearchResult:
         """Find files under one scope by name and/or content (B-84).
 

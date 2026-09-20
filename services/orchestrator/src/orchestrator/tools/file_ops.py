@@ -39,11 +39,13 @@ attacker-influenced file from OOM-ing the (per-user) sandbox.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, NoReturn
+from uuid import UUID
 
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.registry import (
@@ -56,6 +58,13 @@ from orchestrator.tools.sandbox import (
     DEFAULT_OUTPUT_CHAR_CAP,
     SandboxOutcome,
     SandboxRuntime,
+    SandboxSupervisorError,
+    WorkspaceFileNotFoundError,
+    WorkspaceFileTooLargeError,
+    WorkspaceNotADirectoryError,
+    WorkspaceNotAFileError,
+    WorkspacePathEscapeError,
+    WorkspacePermissionError,
     run_in_sandbox,
 )
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
@@ -64,6 +73,12 @@ from orchestrator.tools.workspace_paths import (
     SHARED_PREFIX,
     agent_view_alias,
     resolve_scope,
+)
+from orchestrator.tools.workspace_scope import store_scope
+from orchestrator.tools.workspace_store import (
+    DEFAULT_SEARCH_RESULTS,
+    WorkspaceSearchResult,
+    WorkspaceStore,
 )
 
 #: ``shared/`` 目录名 —— 由前缀反推,不写第二份字面量(前缀与目录必须永远同名)。
@@ -395,42 +410,6 @@ def _main():
 print(json.dumps(_main()))
 """
 
-_LIST_MAIN = """
-
-def _main():
-    full = _resolve(_P["rel"])
-    if full is None:
-        return {"ok": False, "error": "path_escapes_workspace"}
-    entries = []
-    truncated = False
-    try:
-        with os.scandir(full) as it:
-            for entry in it:
-                if len(entries) >= _P["max_entries"]:
-                    truncated = True
-                    break
-                try:
-                    is_dir = entry.is_dir()
-                    size = entry.stat().st_size if entry.is_file() else None
-                except OSError:
-                    # Broken symlink / racing unlink — degrade gracefully.
-                    is_dir = False
-                    size = None
-                entries.append({"name": entry.name, "is_dir": is_dir, "size": size})
-    except FileNotFoundError:
-        return {"ok": False, "error": "not_found"}
-    except NotADirectoryError:
-        return {"ok": False, "error": "not_a_directory"}
-    except OSError as exc:
-        return {"ok": False, "error": "io_error", "detail": str(exc)}
-    entries.sort(key=lambda e: e["name"])
-    return {"ok": True, "entries": entries, "truncated": truncated}
-
-
-print(json.dumps(_main()))
-"""
-
-
 _ARTIFACT_LOCATE_MAIN = """
 
 def _main():
@@ -463,13 +442,6 @@ def build_read_wrapper(
 def build_write_wrapper(rel: str, content: str, *, ws: str = _WORKSPACE_ROOT) -> str:
     """Snippet that atomically writes ``content`` to ``ws/rel``."""
     return _snippet({"ws": ws, "rel": rel, "content": content}, _WRITE_MAIN)
-
-
-def build_list_wrapper(
-    rel: str, *, ws: str = _WORKSPACE_ROOT, max_entries: int = _MAX_LIST_ENTRIES
-) -> str:
-    """Snippet that lists directory ``ws/rel`` and prints a JSON envelope."""
-    return _snippet({"ws": ws, "rel": rel, "max_entries": max_entries}, _LIST_MAIN)
 
 
 def build_artifact_locate_wrapper(rel: str, *, ws: str = _WORKSPACE_ROOT) -> str:
@@ -576,14 +548,90 @@ def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
     raise FileOpError(msg)
 
 
+def _require_workspace_binding(ctx: ToolContext, *, tool: str) -> tuple[UUID, UUID]:
+    """The ``(tenant_id, user_id)`` the host-side workspace lives under.
+
+    B-84 —— 宿主侧的工作区按 ``(tenant, user)`` 存(``{root}/{tenant}/{user}/``)。
+    一个**没有用户绑定**的 run 在 NAS 上根本没有工作区:它的 ``/workspace`` 是沙箱
+    里的一块临时 tmpfs, 随沙箱生灭。
+
+    所以这里**明着拒**, 不回落成"读到一棵空树"。后者会把"这个 run 没有持久工作
+    区"伪装成"你的文件不在了" —— 正是 B-84 这一波要消灭的那句误判。措辞照
+    ``run_in_sandbox`` 缺租户绑定时的同款写法。
+    """
+    if ctx.tenant_id is None:
+        msg = f"{tool} requires a tenant binding (ctx.tenant_id)"
+        raise ToolBlockedError(msg)
+    if ctx.user_id is None:
+        msg = (
+            f"{tool} requires a user binding (ctx.user_id): this run has no persistent "
+            "workspace, so there are no stored files to read"
+        )
+        raise ToolBlockedError(msg)
+    return ctx.tenant_id, ctx.user_id
+
+
+def _raise_for_store_error(exc: SandboxSupervisorError, *, tool: str) -> NoReturn:
+    """Map a :class:`WorkspaceStore` failure onto the envelope vocabulary the model knows.
+
+    B-84 —— 读路径挪到宿主之后, 失败不再是沙箱片段打印的 ``{"ok": false, "error":
+    ...}``, 而是 store 抛的异常。**模型看到的 kind 必须逐字不变**(``not_found`` /
+    ``is_a_directory`` / ``not_a_directory`` / ``file_too_large`` / ``io_error``, 越权
+    仍是 :class:`ToolBlockedError`), 所以这里按**类型**分叉, 不按消息文本 —— 文本
+    匹配是下一个人改一句文案就静默失效的那种判据。
+
+    窄类型必须排在基类前面:它们都是 :class:`SandboxSupervisorError` 的子类。
+    """
+    if isinstance(exc, WorkspacePathEscapeError):
+        msg = f"{tool}: path escapes the workspace"
+        raise ToolBlockedError(msg) from exc
+    if isinstance(exc, WorkspaceNotAFileError):
+        msg = f"{tool} failed: is_a_directory"
+        raise FileOpError(msg) from exc
+    if isinstance(exc, WorkspaceNotADirectoryError):
+        msg = f"{tool} failed: not_a_directory"
+        raise FileOpError(msg) from exc
+    if isinstance(exc, WorkspaceFileTooLargeError):
+        msg = f"{tool} failed: file_too_large"
+        raise FileOpError(msg) from exc
+    if isinstance(exc, WorkspaceFileNotFoundError):
+        msg = f"{tool} failed: not_found"
+        raise FileOpError(msg) from exc
+    if isinstance(exc, WorkspacePermissionError):
+        # 读不动 != 不存在(W2-BUG-1 的同一条教训)。归到 io_error 而不是
+        # not_found, 模型才不会据此断定文件没了。
+        msg = f"{tool} failed: io_error (workspace not readable)"
+        raise FileOpError(msg) from exc
+    msg = f"{tool} failed: io_error ({exc})"
+    raise FileOpError(msg) from exc
+
+
 @dataclass
 class ReadFileTool:
-    """Read a UTF-8 text file from the agent's workspace (exposed as ``read_file``)."""
+    """Read a UTF-8 text file from the agent's workspace (exposed as ``read_file``).
 
-    client: SandboxRuntime
+    **B-84 —— 读走宿主 NAS, 不再起沙箱。** control-plane 的 Pod 自己挂着同一卷
+    (``infra/k8s/base/control-plane/deployment.yaml`` 的 ``/mnt/workspaces``), 所以
+    列目录 / 读文件是一次本地目录操作, 零 sandbox acquire、零 exec。实测 60 天里
+    ``list_dir`` 有 **11%(22/207)** 失败, 而那 22 次里每一次都是沙箱创建失败 ——
+    一次失败的探测会让模型断定文件不存在, 然后把 21,173 个字符重打一遍。
+
+    **沙箱写 → 宿主读是即时可见的。** 2026-09-20 在测试集群上真测过, 测的就是真实
+    的那对客户端(沙箱 microVM 写, control-plane pod 读):新建文件 **8.3 ms** 宿主
+    ``listdir`` 就看得见, 改写已有文件 **15.2 ms** 读到新值;两轮都是目录属性缓存与
+    文件数据缓存全热的最坏情况。挂载参数里既没有 ``noac`` 也没有显式 ``actimeo``,
+    按 NFSv3 默认属性缓存 30~60 秒去推断会得出完全相反的结论。**这里的结论以实测
+    为准, 不以推断为准** —— 数据与测法见
+    ``docs/superpowers/specs/2026-09-20-workspace-visibility-design.md`` §7b。余量也
+    不是压着边跑:模型 ``write_file`` 之后要再调一次 ``read_file``, 中间隔着至少一个
+    LLM 往返(秒级), 判据是 8~16 ms 对上秒级。
+
+    **写仍然走沙箱**(``write_file`` / ``edit_file``)—— 它们与 B-60 的私有 ``/w``
+    挂载空间和工作区写锁绑着, 挪它是另一个量级的改动。
+    """
+
+    store: WorkspaceStore
     output_char_cap: int = DEFAULT_OUTPUT_CHAR_CAP
-    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
-    skill_seed_files: tuple[tuple[str, bytes], ...] = ()
 
     @property
     def spec(self) -> ToolSpec:
@@ -616,22 +664,39 @@ class ReadFileTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         raw = _require_path(args, tool="read_file", agent_key=ctx.agent_key)
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_file")
-        env = await run_scoped_read(
-            self.client,
-            build=lambda w: build_read_wrapper(rel, cap=self.output_char_cap, ws=w),
-            ws=ws,
-            ctx=ctx,
-            tool="read_file",
-            seed_files=self.skill_seed_files,
-        )
-        _raise_for_error(env, tool="read_file")
+        if not PurePosixPath(rel).parts:
+            # ``/workspace`` 折成 ``.`` —— 指的是作用域根, 一个目录。沙箱片段过去
+            # 在这里回 ``is_a_directory``, 保住同一个 kind:宿主侧的归一化会把 ``.``
+            # 当成"不是一条合法文件路径"拒掉, 而那会让模型读到 ToolBlockedError
+            # (越权)而不是"你要读的是个目录"。
+            msg = "read_file failed: is_a_directory"
+            raise FileOpError(msg)
+        tenant_id, user_id = _require_workspace_binding(ctx, tool="read_file")
+        try:
+            data = await self.store.read_file(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                path=rel,
+                scope=store_scope(ws, agent_key=ctx.agent_key),
+                max_bytes=_MAX_READ_BYTES,
+            )
+        except SandboxSupervisorError as exc:
+            _raise_for_store_error(exc, tool="read_file")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            msg = "read_file failed: binary_unsupported"
+            raise FileOpError(msg) from exc
+        cap = self.output_char_cap
         return ToolResult(
-            content=str(env.get("content", "")),
+            content=text[:cap],
             meta={
                 "path": rel,
-                "content_hash": env.get("content_hash"),
-                "size": env.get("size"),
-                "truncated": bool(env.get("truncated")),
+                # 整个文件的 sha256(不是返回给模型的那一截)—— edit_file 的
+                # expected_hash CAS 拿它做比对, 截断过的哈希对不上任何东西。
+                "content_hash": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+                "truncated": len(text) > cap,
             },
         )
 
@@ -718,11 +783,13 @@ class WriteFileTool:
 
 @dataclass
 class ListDirTool:
-    """List a workspace directory (exposed as ``list_dir``)."""
+    """List a workspace directory (exposed as ``list_dir``).
 
-    client: SandboxRuntime
-    #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
-    skill_seed_files: tuple[tuple[str, bytes], ...] = ()
+    B-84 —— 同 :class:`ReadFileTool`:走宿主 NAS, 不起沙箱。理由与那条 NFS 实测结论
+    都在那个类的 docstring 里, 不在这里重复一遍(重复的注释会各自漂移)。
+    """
+
+    store: WorkspaceStore
 
     @property
     def spec(self) -> ToolSpec:
@@ -753,27 +820,144 @@ class ListDirTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         raw = _require_path(args, tool="list_dir", default=".", agent_key=ctx.agent_key)
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="list_dir")
-        env = await run_scoped_read(
-            self.client,
-            build=lambda w: build_list_wrapper(rel, ws=w),
-            ws=ws,
-            ctx=ctx,
-            tool="list_dir",
-            seed_files=self.skill_seed_files,
-        )
-        _raise_for_error(env, tool="list_dir")
-        entries = env.get("entries")
-        if not isinstance(entries, list):
-            entries = []
+        tenant_id, user_id = _require_workspace_binding(ctx, tool="list_dir")
+        try:
+            listing = await self.store.list_dir(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                scope=store_scope(ws, agent_key=ctx.agent_key),
+                path=rel,
+                max_entries=_MAX_LIST_ENTRIES,
+            )
+        except SandboxSupervisorError as exc:
+            _raise_for_store_error(exc, tool="list_dir")
+        # 渲染与 meta 的形状与 B-84 之前逐字相同 —— 改的是实现与失败率,
+        # 对模型可见的语义(参数、返回形状、作用域)一个字不变。
+        entries: list[Mapping[str, Any]] = [
+            {"name": e.name, "is_dir": e.is_dir, "size": e.size} for e in listing.entries
+        ]
         return ToolResult(
-            content=_format_entries(rel, entries, truncated=bool(env.get("truncated"))),
+            content=_format_entries(rel, entries, truncated=listing.truncated),
             meta={
                 "path": rel,
                 "entries": entries,
                 "n_entries": len(entries),
-                "truncated": bool(env.get("truncated")),
+                "truncated": listing.truncated,
             },
         )
+
+
+@dataclass
+class SearchFilesTool:
+    """Find files in the agent's workspace by name and/or content (``search_files``).
+
+    B-84 —— 与 :class:`ListDirTool` 同一条宿主 NAS 读路径, 同一份 NFS 实测结论
+    (见 :class:`ReadFileTool` 的 docstring)。分工写进了工具描述里:先 ``list_dir``
+    看结构, 要找具体东西用 ``search_files``。
+    """
+
+    store: WorkspaceStore
+    #: 一次最多回多少条。超了在渲染里明说"还有多少没列出", 不静悄悄少几行。
+    max_results: int = DEFAULT_SEARCH_RESULTS
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="search_files",
+            description=(
+                "Search your own workspace for files by name pattern and/or by "
+                "text content. Use list_dir to see what a directory holds; use "
+                "this when you know roughly what you are looking for but not "
+                "where it is. 'name_glob' matches the file name or the "
+                "workspace-relative path (e.g. '*.py', 'style/*.md'); 'content' "
+                "is a plain substring searched inside text files (binary files "
+                "are skipped). Give at least one of them; giving both means "
+                "name matches AND content contains. Results are file paths "
+                "relative to your own workspace root - pass one straight to "
+                "read_file."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name_glob": {
+                        "type": "string",
+                        "description": "Glob for the file name or path, e.g. '*.py'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Plain substring to find inside text files.",
+                    },
+                },
+            },
+            is_read_only=True,
+            side_effect="read_only",
+            idempotent=True,
+        )
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        name_glob = _optional_str(args, "name_glob", tool="search_files")
+        content = _optional_str(args, "content", tool="search_files")
+        if name_glob is None and content is None:
+            msg = "search_files requires 'name_glob' and/or 'content'"
+            raise ValueError(msg)
+        # 作用域与 list_dir 完全一致 —— 同一个起点解析, 不另写一份。``.`` 是
+        # "本作用域根", search 没有 path 参数, 搜的就是整个作用域。
+        ws, _rel = resolve_scope(".", agent_key=ctx.agent_key, tool="search_files")
+        tenant_id, user_id = _require_workspace_binding(ctx, tool="search_files")
+        try:
+            found = await self.store.search_files(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                scope=store_scope(ws, agent_key=ctx.agent_key),
+                name_glob=name_glob,
+                content=content,
+                max_results=self.max_results,
+            )
+        except SandboxSupervisorError as exc:
+            _raise_for_store_error(exc, tool="search_files")
+        return ToolResult(
+            content=_format_search(found),
+            meta={
+                "name_glob": name_glob,
+                "content": content,
+                "paths": [entry.path for entry in found.entries],
+                "n_results": len(found.entries),
+                "truncated": found.truncated,
+            },
+        )
+
+
+def _optional_str(args: Mapping[str, Any], key: str, *, tool: str) -> str | None:
+    """``args[key]`` 当字符串取, 空串与缺失都算没给。
+
+    空串不当"给了"是有意的:``name_glob=""`` 谁也匹配不上, 把它当成一个真条件会
+    让一次手滑的调用静悄悄回零结果, 而模型读到的是"工作区里没有这种文件"。
+    """
+    raw = args.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        msg = f"{tool} requires {key!r} to be a string"
+        raise ValueError(msg)
+    cleaned = raw.strip()
+    if "\x00" in cleaned:
+        msg = f"{tool} {key!r} must not contain a NUL byte"
+        raise ValueError(msg)
+    return cleaned or None
+
+
+def _format_search(found: WorkspaceSearchResult) -> str:
+    """Human-readable search result for the LLM.
+
+    截断时**明说还有多少没列出**, 不静悄悄少几行 —— 一个被悄悄截断的列表会被读成
+    "就这些了", 而那正是 B-84 要治的误判形态。
+    """
+    if not found.entries:
+        return "(no matching files)"
+    lines = [f"{entry.path}  ({entry.size} bytes)" for entry in found.entries]
+    if found.truncated:
+        lines.append(f"... (more matches not listed; showing the first {len(found.entries)})")
+    return "\n".join(lines)
 
 
 @dataclass

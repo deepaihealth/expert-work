@@ -25,7 +25,6 @@ _BUILDERS = frozenset(
     {
         "build_read_wrapper",
         "build_write_wrapper",
-        "build_list_wrapper",
         "build_edit_wrapper",
         "build_read_document_wrapper",
     }
@@ -33,10 +32,14 @@ _BUILDERS = frozenset(
 
 #: ``(模块, 所在函数)`` → ``(是否 agent 作用域, 理由)``。
 #: ``理由`` 只在「有意留在用户根」时读,但两种都必须写 —— 逼着下一个人说清楚。
+#:
+#: B-84 —— ``ReadFileTool.call`` / ``ListDirTool.call`` 从这张表里**消失**了,不是
+#: 漏登记:它们不再构造沙箱片段,读走 control-plane 自己挂着的 NAS
+#: (``orchestrator.tools.workspace_scope``)。那条路径的作用域由
+#: ``test_workspace_scoped_reads.py`` 钉(三个实现一套用例 + 五类逃逸),不在这张
+#: 表的管辖范围内 —— 这张表管的是「谁把 ``ws`` 编进了沙箱片段」。
 _CALL_SITES: dict[tuple[str, str], tuple[bool, str]] = {
-    ("file_ops.py", "ReadFileTool.call"): (True, "读:agent 根,不回落(PR6 摘掉)"),
     ("file_ops.py", "WriteFileTool.call"): (True, "写:agent 根,永不回落"),
-    ("file_ops.py", "ListDirTool.call"): (True, "读:agent 根,不回落(PR6 摘掉)"),
     ("file_ops.py", "EditFileTool.call"): (True, "写:agent 根,永不回落"),
     ("read_document.py", "ReadDocumentTool.call"): (True, "读:agent 根,不回落(PR6 摘掉)"),
     ("file_ops.py", "SandboxWorkspaceWriter.write"): (

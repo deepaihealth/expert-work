@@ -273,6 +273,20 @@ class WorkspaceFileNotFoundError(SandboxSupervisorError):
     """
 
 
+class WorkspaceNotAFileError(SandboxSupervisorError):
+    """路径指到的是目录, 不是文件(B-84)。
+
+    与 :class:`WorkspaceFileNotFoundError` 分开, 因为模型的下一步动作不同:一个是
+    "换个路径", 另一个是"改用 ``list_dir``"。沙箱片段一直把这两件事分成
+    ``is_a_directory`` 与 ``not_found`` 两种 envelope, 宿主侧接管之后必须原样保住
+    —— 「对模型可见的语义一个字不变」。
+    """
+
+
+class WorkspaceNotADirectoryError(SandboxSupervisorError):
+    """路径指到的是文件, 不是目录(B-84)。:class:`WorkspaceNotAFileError` 的反面。"""
+
+
 class WorkspaceQuotaExceededError(SandboxSupervisorError):
     """用户工作区已到配额上限(沙箱迁移波 3 spec § 3.3 闸 A/B)。
 

@@ -41,7 +41,9 @@ from orchestrator.tools import (
     RecordingSandboxRuntime,
     RecordingTavilyClient,
     RecordingWorkspaceLock,
+    RecordingWorkspaceStore,
     SaveArtifactTool,
+    SearchFilesTool,
     SubAgentTool,
     ToolEnv,
     WebSearchTool,
@@ -703,14 +705,41 @@ async def test_platform_reserves_name_even_when_all_its_tools_filtered() -> None
         ("write_file", WriteFileTool),
         ("edit_file", EditFileTool),
         ("list_dir", ListDirTool),
+        ("search_files", SearchFilesTool),
     ],
 )
 async def test_file_op_builtin_assembles(name: str, cls: type) -> None:
     registry = await build_tool_registry(
         [BuiltinToolSpec(name=name)],
-        tool_env=ToolEnv(sandbox_runtime=RecordingSandboxRuntime()),
+        tool_env=ToolEnv(
+            sandbox_runtime=RecordingSandboxRuntime(),
+            workspace_store=RecordingWorkspaceStore(),
+        ),
     )
     assert isinstance(registry.get(name), cls)
+
+
+@pytest.mark.parametrize("name", ["read_file", "list_dir", "search_files"])
+async def test_host_read_builtins_need_the_workspace_store_not_the_sandbox(name: str) -> None:
+    """B-84 —— 只读那三件的依赖换了:沙箱有、工作区存储没有 = 报错。
+
+    显式声明才报错(基础能力静默跳过),与 ``sandbox_runtime`` 缺失时同一条纪律。
+    """
+    with pytest.raises(AgentFactoryError, match="workspace store"):
+        await build_tool_registry(
+            [BuiltinToolSpec(name=name)],
+            tool_env=ToolEnv(sandbox_runtime=RecordingSandboxRuntime()),
+        )
+
+
+@pytest.mark.parametrize("name", ["read_file", "list_dir", "search_files"])
+async def test_host_read_builtins_do_not_need_a_sandbox(name: str) -> None:
+    """反面:没有沙箱也能注册 —— 它们不起沙箱,这正是本波的收益来源。"""
+    registry = await build_tool_registry(
+        [BuiltinToolSpec(name=name)],
+        tool_env=ToolEnv(workspace_store=RecordingWorkspaceStore()),
+    )
+    assert registry.get(name) is not None
 
 
 async def test_file_op_write_tools_receive_workspace_lock() -> None:
@@ -744,12 +773,14 @@ async def test_file_op_without_supervisor_raises() -> None:
 _BASE_SANDBOX_TOOLS = (
     "exec_python",
     "bash",
-    "read_file",
     "write_file",
     "edit_file",
-    "list_dir",
     "read_document",
 )
+#: B-84 —— 只读那三件的依赖是 ``workspace_store``, 不是沙箱。从
+#: ``_BASE_SANDBOX_TOOLS`` 里拆出来, 否则"没有沙箱就一个都不注册"那条断言会在
+#: 它们**本来就不该受沙箱影响**的情况下继续为真 —— 测试看着在咬其实没咬。
+_BASE_HOST_READ_TOOLS = ("read_file", "list_dir", "search_files")
 _BASE_ARTIFACT_TOOLS = ("save_artifact", "list_artifacts")
 
 
@@ -764,6 +795,7 @@ async def test_base_capabilities_assembled_with_no_manifest_tools() -> None:
     env = ToolEnv(
         sandbox_runtime=RecordingSandboxRuntime(),
         artifact_store=InMemoryArtifactStore(),
+        workspace_store=RecordingWorkspaceStore(),
     )
     registry = await build_tool_registry([], tool_env=env)
     assert isinstance(registry.get("exec_python"), ExecPythonTool)
@@ -772,6 +804,7 @@ async def test_base_capabilities_assembled_with_no_manifest_tools() -> None:
     assert isinstance(registry.get("write_file"), WriteFileTool)
     assert isinstance(registry.get("edit_file"), EditFileTool)
     assert isinstance(registry.get("list_dir"), ListDirTool)
+    assert isinstance(registry.get("search_files"), SearchFilesTool)
     assert isinstance(registry.get("read_document"), ReadDocumentTool)
     assert isinstance(registry.get("save_artifact"), SaveArtifactTool)
     assert isinstance(registry.get("list_artifacts"), ListArtifactsTool)
@@ -798,10 +831,22 @@ async def test_base_capabilities_gated_per_dependency() -> None:
     # that are listed but 404 on download.
     env = ToolEnv(artifact_store=InMemoryArtifactStore())
     registry = await build_tool_registry([], tool_env=env)
-    for name in _BASE_SANDBOX_TOOLS:
+    for name in (*_BASE_SANDBOX_TOOLS, *_BASE_HOST_READ_TOOLS):
         assert registry.get(name) is None, name
     assert registry.get("list_artifacts") is not None
     assert registry.get("save_artifact") is None
+
+
+@pytest.mark.asyncio
+async def test_host_read_base_capabilities_need_only_the_workspace_store() -> None:
+    """B-84 —— 只接了工作区存储、没有沙箱的部署:只读那三件照样在, 其余都不在。"""
+    registry = await build_tool_registry(
+        [], tool_env=ToolEnv(workspace_store=RecordingWorkspaceStore())
+    )
+    for name in _BASE_HOST_READ_TOOLS:
+        assert registry.get(name) is not None, name
+    for name in _BASE_SANDBOX_TOOLS:
+        assert registry.get(name) is None, name
 
 
 @pytest.mark.asyncio
@@ -829,8 +874,9 @@ async def test_base_capabilities_coexist_with_opt_in_tools() -> None:
         web_search_client=RecordingTavilyClient(),
         sandbox_runtime=RecordingSandboxRuntime(),
         artifact_store=InMemoryArtifactStore(),
+        workspace_store=RecordingWorkspaceStore(),
     )
     registry = await build_tool_registry([BuiltinToolSpec(name="web_search")], tool_env=env)
     assert registry.get("web_search") is not None
-    for name in (*_BASE_SANDBOX_TOOLS, *_BASE_ARTIFACT_TOOLS):
+    for name in (*_BASE_SANDBOX_TOOLS, *_BASE_HOST_READ_TOOLS, *_BASE_ARTIFACT_TOOLS):
         assert registry.get(name) is not None, name

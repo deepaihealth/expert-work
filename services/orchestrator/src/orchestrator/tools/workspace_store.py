@@ -53,10 +53,10 @@ _DEFAULT_TIMEOUT_S = 60.0
 #: ``list_dir`` 的默认条目上限 —— 与 ``NasWorkspaceStore._MAX_LIST_ENTRIES`` 同值。
 #: 工具层自己传更小的那个(``file_ops._MAX_LIST_ENTRIES``), 模型看到的截断行因此
 #: 与 B-84 之前逐字相同。
-_DEFAULT_MAX_DIR_ENTRIES = 2000
+DEFAULT_MAX_DIR_ENTRIES = 2000
 
 #: ``search_files`` 的默认命中上限。
-_DEFAULT_SEARCH_RESULTS = 50
+DEFAULT_SEARCH_RESULTS = 50
 
 
 @dataclass(frozen=True)
@@ -247,7 +247,7 @@ class WorkspaceStore(Protocol):
         user_id: UUID,
         scope: str = SCOPE_USER_ROOT,
         path: str = ".",
-        max_entries: int = _DEFAULT_MAX_DIR_ENTRIES,
+        max_entries: int = DEFAULT_MAX_DIR_ENTRIES,
     ) -> WorkspaceDirListing:
         """List **one** directory, ``ls`` 语义(B-84)—— backs the ``list_dir`` tool.
 
@@ -263,7 +263,7 @@ class WorkspaceStore(Protocol):
         scope: str = SCOPE_USER_ROOT,
         name_glob: str | None = None,
         content: str | None = None,
-        max_results: int = _DEFAULT_SEARCH_RESULTS,
+        max_results: int = DEFAULT_SEARCH_RESULTS,
     ) -> WorkspaceSearchResult:
         """Find files under one scope by name and/or content (B-84).
 
@@ -387,13 +387,12 @@ class SupervisorWorkspaceStore:
         user_id: UUID,
         scope: str = SCOPE_USER_ROOT,
         path: str = ".",
-        max_entries: int = _DEFAULT_MAX_DIR_ENTRIES,
+        max_entries: int = DEFAULT_MAX_DIR_ENTRIES,
     ) -> WorkspaceDirListing:
         # 这个后端只有"整棵树的扁平清单"这一种原料 —— 两条已知偏差见
         # :func:`dir_listing_from_files`。
-        rel = scoped_dir(scope, path)
-        prefix = "/".join(scope_parts(scope))
-        under = f"{prefix}/{rel}" if prefix and rel else (prefix or rel)
+        # ``scoped_dir`` 回的已经是**用户根相对**路径(前缀在里面了), 别再拼一次。
+        under = scoped_dir(scope, path)
         entries = await self.list_files(tenant_id=tenant_id, user_id=user_id)
         return dir_listing_from_files(entries, rel=under, max_entries=max_entries)
 
@@ -405,7 +404,7 @@ class SupervisorWorkspaceStore:
         scope: str = SCOPE_USER_ROOT,
         name_glob: str | None = None,
         content: str | None = None,
-        max_results: int = _DEFAULT_SEARCH_RESULTS,
+        max_results: int = DEFAULT_SEARCH_RESULTS,
     ) -> WorkspaceSearchResult:
         require_search_terms(name_glob, content)
         candidates = [
@@ -584,7 +583,17 @@ class RecordingWorkspaceStore:
         self.workspace_reads.append((tenant_id, user_id, rel))
         if self.workspace_file_error is not None:
             raise self.workspace_file_error
-        data = self.workspace_file_contents.get(rel, self.workspace_file)
+        if self.workspace_file_contents:
+            # 配了内容表就当它是**权威的那棵树**:没有的路径 = 不存在。不这样的话
+            # 替身对任何路径都回 :attr:`workspace_file`, 于是「读别的 agent 的文件
+            # 读不到」这类测试会因为拿到一串空字节而变绿 —— 变绿的理由与它要验的
+            # 东西无关。内容表为空时保持老行为(一律回 :attr:`workspace_file`)。
+            if rel not in self.workspace_file_contents:
+                msg = f"workspace file not found: {path!r}"
+                raise WorkspaceFileNotFoundError(msg)
+            data = self.workspace_file_contents[rel]
+        else:
+            data = self.workspace_file
         if max_bytes is not None and len(data) > max_bytes:
             msg = f"workspace file {path!r} exceeds the {max_bytes}-byte read cap"
             raise WorkspaceFileTooLargeError(msg)
@@ -605,13 +614,12 @@ class RecordingWorkspaceStore:
         user_id: UUID,
         scope: str = SCOPE_USER_ROOT,
         path: str = ".",
-        max_entries: int = _DEFAULT_MAX_DIR_ENTRIES,
+        max_entries: int = DEFAULT_MAX_DIR_ENTRIES,
     ) -> WorkspaceDirListing:
         if self.workspace_list_error is not None:
             raise self.workspace_list_error
-        rel = scoped_dir(scope, path)
-        prefix = "/".join(scope_parts(scope))
-        under = f"{prefix}/{rel}" if prefix and rel else (prefix or rel)
+        # 同 SupervisorWorkspaceStore:``scoped_dir`` 已经含前缀。
+        under = scoped_dir(scope, path)
         self.workspace_reads.append((tenant_id, user_id, under))
         return dir_listing_from_files(self.workspace_files, rel=under, max_entries=max_entries)
 
@@ -623,7 +631,7 @@ class RecordingWorkspaceStore:
         scope: str = SCOPE_USER_ROOT,
         name_glob: str | None = None,
         content: str | None = None,
-        max_results: int = _DEFAULT_SEARCH_RESULTS,
+        max_results: int = DEFAULT_SEARCH_RESULTS,
     ) -> WorkspaceSearchResult:
         require_search_terms(name_glob, content)
         if self.workspace_list_error is not None:
