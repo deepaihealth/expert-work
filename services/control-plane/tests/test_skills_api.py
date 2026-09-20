@@ -221,6 +221,44 @@ async def test_add_version_rejects_oversize_prompt_fragment(setup: Setup) -> Non
     assert "byte limit" in response.json()["detail"]
 
 
+@pytest.mark.asyncio
+async def test_zip_import_eager_char_cap_follows_the_package_lazy_flag(setup: Setup) -> None:
+    """B-84 item 7 —— ZIP import 把 payload 自己的 ``lazy_load`` 传给 moderation。
+
+    同一段 8,001 字符的正文:``lazy: false`` 拒,``lazy: true`` 收。这条钉的是
+    **接线**(单元测试只钉函数本身),漏传 ``lazy_load=`` 时它会红。
+    """
+    from control_plane.api._skill_moderation import MAX_EAGER_PROMPT_FRAGMENT_CHARS
+    from control_plane.api._skill_zip import build_skill_zip
+
+    client, _ = setup
+    body = "x" * (MAX_EAGER_PROMPT_FRAGMENT_CHARS + 1)
+
+    def _pack(*, name: str, lazy: bool) -> bytes:
+        return build_skill_zip(
+            name=name,
+            description="eager size guard probe",
+            category=None,
+            required_models=(),
+            prompt_fragment=body,
+            tool_names=(),
+            lazy=lazy,
+        )
+
+    eager = await client.post(
+        "/v1/skills/import",
+        files={"file": ("eager.skill", _pack(name="eager-one", lazy=False), "application/zip")},
+    )
+    assert eager.status_code == 400
+    assert "eager (lazy_load=false)" in eager.json()["detail"]
+
+    lazy = await client.post(
+        "/v1/skills/import",
+        files={"file": ("lazy.skill", _pack(name="lazy-one", lazy=True), "application/zip")},
+    )
+    assert lazy.status_code == 201
+
+
 # ---------------------------------------------------------------------------
 # ZIP import / export
 # ---------------------------------------------------------------------------

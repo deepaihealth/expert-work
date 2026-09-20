@@ -75,6 +75,7 @@ from expert_work.persistence import (
     TenantSkillSubscriptionStore,
 )
 from expert_work.protocol import (
+    DEFAULT_SKILL_LAZY_LOAD,
     SKILL_REF_PATTERN,
     AuditAction,
     AuditResult,
@@ -431,7 +432,11 @@ def build_skills_router() -> APIRouter:
 
         # Mini-ADR J-23 § 15.6 admin moderation.
         try:
-            moderate_prompt_fragment(body.prompt_fragment)
+            # B-84 —— ``store.add_version`` below omits ``lazy_load``, so the row
+            # lands at ``DEFAULT_SKILL_LAZY_LOAD``; moderation must be told the
+            # same thing. If ``_AddVersionBody`` ever grows a ``lazy_load``
+            # field, thread it through here too.
+            moderate_prompt_fragment(body.prompt_fragment, lazy_load=DEFAULT_SKILL_LAZY_LOAD)
             moderate_tool_names(body.tool_names)
             moderate_required_models(body.required_models)
         except ModerationError as exc:
@@ -845,16 +850,20 @@ def build_skills_router() -> APIRouter:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = getattr(request.state, "actor_id", "anonymous")
 
-        try:
-            moderate_prompt_fragment(body.prompt_fragment)
-        except ModerationError as exc:
-            raise HTTPException(status_code=400, detail=exc.detail) from exc
-
         prior = await store.get_version_by_number(
             skill_id=skill_id, tenant_id=tenant_id, version=version
         )
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
+
+        # B-84 —— moderation 挪到 ``prior`` 之后:新版本继承 ``prior.lazy_load``
+        # (见下面的 ``store.add_version``),而 eager 字符上限只对 lazy_load=False
+        # 生效,不拿到 prior 就判不了。代价是不存在的版本先报 404 再报 400。
+        try:
+            moderate_prompt_fragment(body.prompt_fragment, lazy_load=prior.lazy_load)
+        except ModerationError as exc:
+            raise HTTPException(status_code=400, detail=exc.detail) from exc
+
         skill = await store.get_skill(skill_id=skill_id, tenant_id=tenant_id)
         # M-1 (backlog task 7) — fail-closed (see ``get_supporting_file`` above).
         if skill is None:
@@ -1457,7 +1466,7 @@ def build_skills_router() -> APIRouter:
 
         # Moderation gate before any DB write.
         try:
-            moderate_prompt_fragment(payload.prompt_fragment)
+            moderate_prompt_fragment(payload.prompt_fragment, lazy_load=payload.lazy_load)
             moderate_tool_names(payload.tool_names)
             moderate_required_models(payload.required_models)
         except ModerationError as exc:
