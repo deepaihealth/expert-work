@@ -271,7 +271,9 @@ def _run_moderation_case(case: SkillCase, expected_pattern: str) -> CapabilityCa
     if text == "@OVERSIZE":
         text = "x" * (64 * 1024 + 1)
     try:
-        moderate_prompt_fragment(text)
+        # B-84 —— 这个 case 验的是 deny-list + 字节上限,与 eager 字符上限无关;
+        # 用 lazy(平台默认)跑,免得 eager 上限抢在 deny-list 前面报错。
+        moderate_prompt_fragment(text, lazy_load=True)
         notes.append(
             f"expected ModerationError matching {expected_pattern!r} "
             f"but moderate_prompt_fragment returned cleanly"

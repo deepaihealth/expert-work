@@ -81,6 +81,7 @@ from expert_work.persistence import (
     SkillStore,
 )
 from expert_work.protocol import (
+    DEFAULT_SKILL_LAZY_LOAD,
     AuditAction,
     AuditResult,
     Principal,
@@ -371,7 +372,7 @@ async def _ingest_platform_skill_payload(
 
     # Moderation gate before any DB write.
     try:
-        moderate_prompt_fragment(payload.prompt_fragment)
+        moderate_prompt_fragment(payload.prompt_fragment, lazy_load=payload.lazy_load)
         moderate_tool_names(payload.tool_names)
         moderate_required_models(payload.required_models)
     except ModerationError as exc:
@@ -692,7 +693,10 @@ def build_platform_skills_router() -> APIRouter:
 
         # Same moderation gate as the tenant add-version path.
         try:
-            moderate_prompt_fragment(body.prompt_fragment)
+            # B-84 —— ``store.add_platform_version`` below omits ``lazy_load``,
+            # so the row lands at ``DEFAULT_SKILL_LAZY_LOAD``; moderation is told
+            # the same thing (mirrors ``skills.py`` ``add_version``).
+            moderate_prompt_fragment(body.prompt_fragment, lazy_load=DEFAULT_SKILL_LAZY_LOAD)
             moderate_tool_names(body.tool_names)
             moderate_required_models(body.required_models)
         except ModerationError as exc:
@@ -1696,15 +1700,19 @@ def build_platform_skills_router() -> APIRouter:
         store = _get_skill_store(request)
         audit = _get_audit(request)
 
-        try:
-            moderate_prompt_fragment(body.prompt_fragment)
-        except ModerationError as exc:
-            raise HTTPException(status_code=400, detail=exc.detail) from exc
-
         async with bypass_rls_session():
             prior = await store.get_platform_version_by_number(skill_id=skill_id, version=version)
         if prior is None:
             raise HTTPException(status_code=404, detail="skill version not found")
+
+        # B-84 —— moderation 挪到 ``prior`` 之后:新版本继承 ``prior.lazy_load``
+        # (见下面的 ``store.add_platform_version``),而 eager 字符上限只对
+        # lazy_load=False 生效,不拿到 prior 就判不了。同 ``skills.py`` 的
+        # ``put_prompt``。
+        try:
+            moderate_prompt_fragment(body.prompt_fragment, lazy_load=prior.lazy_load)
+        except ModerationError as exc:
+            raise HTTPException(status_code=400, detail=exc.detail) from exc
 
         findings = scan_for_threats(body.prompt_fragment, scope="strict")
         if findings:
