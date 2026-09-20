@@ -19,6 +19,7 @@ supervisor 上(``httpx.MockTransport``)—— 所以**故意不打 marker**,理�
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,7 +28,10 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
-from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+from expert_work.persistence import is_reserved_workspace_path
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore, scope_root
+from orchestrator.tools.sandbox import SandboxSupervisorError
+from orchestrator.tools.workspace_scope import SCOPE_SHARED, agent_scope
 from orchestrator.tools.workspace_store import (
     RecordingWorkspaceStore,
     SupervisorWorkspaceStore,
@@ -68,7 +72,9 @@ def _fake_supervisor(tree: dict[str, bytes]) -> httpx.MockTransport:
                 200,
                 json={
                     "files": [
-                        {"path": rel, "size": len(data)} for rel, data in sorted(tree.items())
+                        {"path": rel, "size": len(data)}
+                        for rel, data in sorted(tree.items())
+                        if not is_reserved_workspace_path(rel)
                     ]
                 },
             )
@@ -112,7 +118,9 @@ def seeded(
             workspace_files=[
                 WorkspaceFileEntry(path=rel, size=len(data), mtime=_FIXED_MTIME)
                 for rel, data in sorted(tree.items())
-            ]
+                if not is_reserved_workspace_path(rel)
+            ],
+            workspace_file_contents=dict(tree),
         )
         return store, tenant_id, user_id
 
@@ -184,3 +192,206 @@ async def test_supervisor_store_reads_mtime_when_the_wire_carries_it() -> None:
     files = await store.list_files(tenant_id=uuid4(), user_id=uuid4())
 
     assert files[0].mtime == datetime.fromtimestamp(1.5, tz=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Task 2 —— 作用域读
+# ---------------------------------------------------------------------------
+
+#: 一棵有代表性的用户树 —— 两个 agent、一个 shared、一个用户根散件、一个保留前缀。
+_TREE: dict[str, bytes] = {
+    f"agents/{AGENT_KEY}/style/render_plan.py": b"anchor",
+    f"agents/{AGENT_KEY}/uploads/in.docx": b"upload",
+    f"agents/{OTHER_AGENT_KEY}/secret.txt": b"not yours",
+    "shared/legacy.md": b"legacy",
+    "top.txt": b"root file",
+}
+
+#: 五类逃逸 —— 每一条都必须红得起来(spec §7b 硬要求 4)。
+_ESCAPES = [
+    "../other-agent/secret.txt",  # 相对穿越
+    "/etc/passwd",  # 绝对路径
+    "a/../../../../etc/passwd",  # 深度穿越
+    f"agents/{OTHER_AGENT_KEY}/secret.txt",  # 借布局保留段跨 agent
+    f"shared/../agents/{OTHER_AGENT_KEY}/secret.txt",  # 从 shared 绕回去
+]
+
+
+async def test_agent_scope_lists_only_its_own_files(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    """``agent:<agent_key>`` 只看得见自己那一层, 路径是**作用域相对**的。
+
+    这条同时咬住三件事: 别的 agent 的文件不出现、``shared/`` 不合并进来、
+    保留前缀(``uploads/``)照旧过滤。断言是「恰好这一条」而不是「不含别人的」
+    —— 后者在实现指错目录(拿 agent 名拼路径)时同样为真。
+    """
+    store, tenant_id, user_id = seeded(_TREE)
+
+    files = await store.list_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY)
+    )
+
+    assert [f.path for f in files] == ["style/render_plan.py"]
+
+
+async def test_agent_scope_reads_its_own_file(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    store, tenant_id, user_id = seeded(_TREE)
+
+    data = await store.read_file(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        path="style/render_plan.py",
+        scope=agent_scope(AGENT_KEY),
+    )
+
+    assert data == b"anchor"
+
+
+async def test_the_nas_directory_is_the_agent_key_not_the_agent_name(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    """``sanitize_agent_key()`` = 净化后的名字 + 原名 sha256 的前 8 位。
+
+    拿 agent **名**去拼 ``agents/<名>`` 指向一个不存在的目录, 而失败形态是
+    「目录是空的」不是报错 —— 所以这条与上面那条「恰好一条」必须成对读:
+    单看任何一条都分不出「实现对了」和「实现指错了目录」。
+    """
+    store, tenant_id, user_id = seeded(_TREE)
+
+    files = await store.list_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope("pf-probe")
+    )
+
+    assert [f.path for f in files] == []
+
+
+async def test_shared_scope_reads_the_legacy_area(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    store, tenant_id, user_id = seeded(_TREE)
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id, scope=SCOPE_SHARED)
+    data = await store.read_file(
+        tenant_id=tenant_id, user_id=user_id, path="legacy.md", scope=SCOPE_SHARED
+    )
+
+    assert [f.path for f in files] == ["legacy.md"]
+    assert data == b"legacy"
+
+
+async def test_user_root_scope_is_the_default_and_unchanged(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    """不传 ``scope`` = 整个用户根, 与 PR-2b 之前逐字相同 —— 浏览端点 / 产物下载
+    / 留存清扫全是这一档, 它们一个字都不改。"""
+    store, tenant_id, user_id = seeded(_TREE)
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert [f.path for f in files] == [
+        f"agents/{OTHER_AGENT_KEY}/secret.txt",
+        f"agents/{AGENT_KEY}/style/render_plan.py",
+        "shared/legacy.md",
+        "top.txt",
+    ]
+
+
+@pytest.mark.parametrize("bad", _ESCAPES)
+async def test_scoped_read_rejects_escape(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]], bad: str
+) -> None:
+    store, tenant_id, user_id = seeded(_TREE)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.read_file(
+            tenant_id=tenant_id, user_id=user_id, path=bad, scope=agent_scope(AGENT_KEY)
+        )
+
+
+@pytest.mark.parametrize("bad_key", ["..", ".", "../other", "a/b", "", "a\0b"])
+async def test_scoped_read_rejects_an_unsafe_agent_key(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]], bad_key: str
+) -> None:
+    """``agent_key`` 来自 ``config["configurable"]``, 不可信。``{root}/agents/..``
+    就是 ``{root}`` —— 单纯的 ``.`` / ``..`` 能过字符集正则, 必须单列拒掉。"""
+    store, tenant_id, user_id = seeded(_TREE)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.list_files(tenant_id=tenant_id, user_id=user_id, scope=agent_scope(bad_key))
+
+
+async def test_unknown_scope_is_refused(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    store, tenant_id, user_id = seeded(_TREE)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.list_files(tenant_id=tenant_id, user_id=user_id, scope="everything")
+
+
+# ------------------------------------------------------------------ symlink
+# 只在 NAS 档 —— 另外两个实现的树里没有 symlink 这个概念(一个是 HTTP 线协议,
+# 一个是内存 dict)。
+
+
+def _nas_with_symlinks(tmp_path: Path) -> tuple[NasWorkspaceStore, UUID, UUID, Path]:
+    tenant_id, user_id = uuid4(), uuid4()
+    user_root = tmp_path / str(tenant_id) / str(user_id)
+    agent_root = user_root / "agents" / AGENT_KEY
+    other_root = user_root / "agents" / OTHER_AGENT_KEY
+    agent_root.mkdir(parents=True)
+    other_root.mkdir(parents=True)
+    (other_root / "secret.txt").write_bytes(b"not yours")
+    (agent_root / "etc").symlink_to("/etc")
+    (agent_root / "peek").symlink_to(other_root)
+    return NasWorkspaceStore(root=str(tmp_path)), tenant_id, user_id, user_root
+
+
+async def test_symlink_out_of_the_scope_root_is_not_followed(tmp_path: Path) -> None:
+    """工作区里放一个指向 ``/etc`` 的 symlink, 读不到根外的内容。
+
+    ``O_NOFOLLOW`` 让中间任何一段是 symlink 的 ``openat`` 直接 ``ELOOP``;
+    判据不是路径字符串比较 —— ``getcwd(2)`` 回的是 realpath 而挂载点是
+    symlink, 拿字面量比在这个仓库里同一个文件栽过三次。
+    """
+    store, tenant_id, user_id, _root = _nas_with_symlinks(tmp_path)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.read_file(
+            tenant_id=tenant_id, user_id=user_id, path="etc/passwd", scope=agent_scope(AGENT_KEY)
+        )
+
+
+async def test_symlink_into_another_agent_is_not_followed(tmp_path: Path) -> None:
+    store, tenant_id, user_id, _root = _nas_with_symlinks(tmp_path)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.read_file(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            path="peek/secret.txt",
+            scope=agent_scope(AGENT_KEY),
+        )
+
+
+async def test_scope_root_resolves_to_the_agent_directory_by_identity(tmp_path: Path) -> None:
+    """判据比 ``(st_dev, st_ino)``, 不比路径字面量。
+
+    这条不测「读到了什么」, 测「作用域根到底是哪个 inode」—— 一个把
+    ``agents/<key>`` 拼成别的东西、但恰好也能读到同名文件的实现, 上面那些用例
+    分不出来, 这条分得出。
+    """
+    store, tenant_id, user_id, user_root = _nas_with_symlinks(tmp_path)
+    (user_root / "agents" / AGENT_KEY / "a.txt").write_bytes(b"x")
+
+    files = await store.list_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY)
+    )
+
+    assert [f.path for f in files] == ["a.txt"]
+    expected = (user_root / "agents" / AGENT_KEY).stat()
+    actual = os.stat(scope_root(store.root, tenant_id, user_id, agent_scope(AGENT_KEY)))
+    assert (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)

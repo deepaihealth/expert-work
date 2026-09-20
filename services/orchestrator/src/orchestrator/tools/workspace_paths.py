@@ -66,7 +66,12 @@ class WriteToSharedError(ValueError):
     """
 
 
-def _require_safe_key(agent_key: str) -> None:
+def require_safe_key(agent_key: str) -> None:
+    """``agent_key`` 当成路径段安全吗。坏 key 一律 ``ValueError``,别悄悄回落。
+
+    B-84 —— 从 ``_require_safe_key`` 改成公开名:宿主侧的作用域解析
+    (``workspace_scope.scope_parts``)要用同一道闸,而不是在旁边再写一条正则。
+    """
     if not agent_key or agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
         msg = f"agent_key is not a safe path segment: {agent_key!r}"
         raise ValueError(msg)
@@ -77,7 +82,7 @@ def agent_nas_root(agent_key: str) -> str:
     到 ``EXEC_VIEW`` 上的源;B-60 spec §4.3)。空 key 拒绝:未绑 agent 没有「自己的
     目录」,调用方自己分支(未绑 → bind 整个用户根),别让它悄悄拿到 ``NAS_MOUNT``。
     """
-    _require_safe_key(agent_key)
+    require_safe_key(agent_key)
     return f"{NAS_MOUNT}/{AGENTS_DIR}/{agent_key}"
 
 
@@ -86,7 +91,7 @@ def agent_view_alias(agent_key: str) -> str:
     (``file_ops._require_path`` / ``artifact._validate_path``),不指向任何真实目录:
     视图里没有 ``agents/``。空 key 拒绝,同上。
     """
-    _require_safe_key(agent_key)
+    require_safe_key(agent_key)
     return f"{EXEC_VIEW}/{AGENTS_DIR}/{agent_key}"
 
 
