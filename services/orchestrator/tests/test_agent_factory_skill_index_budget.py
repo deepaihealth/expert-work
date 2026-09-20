@@ -172,8 +172,17 @@ def test_name_only_still_over_budget_is_sent_whole_with_a_warning(
 # ─── 不变式 2:只看绑定集合的内容与顺序 ────────────────────────────────────
 
 
-def test_same_binding_set_renders_identically_across_tenants_and_users() -> None:
-    """同一绑定集合、不同租户/不同用户/不同写入时间 → 渲染结果逐字相同。"""
+@pytest.mark.parametrize(
+    "count",
+    [_MEASURED_MAX_BOUND_TODAY, _MEASURED_ALL_ACTIVE_SKILLS],
+    ids=["tier-1-full", "tier-2-name-only"],
+)
+def test_same_binding_set_renders_identically_across_tenants_and_users(count: int) -> None:
+    """同一绑定集合、不同租户/不同用户/不同写入时间 → 渲染结果逐字相同。
+
+    **两档都要验**:只验降级那一档会漏掉 bug —— 降级本来就把描述压掉了,
+    条目里混进租户/时间也会一并被压没,测试照绿。档 1 才是它藏身的地方。
+    """
 
     def build(*, tenant_id: UUID, created_at: datetime) -> list[str]:
         return [
@@ -183,7 +192,7 @@ def test_same_binding_set_renders_identically_across_tenants_and_users() -> None
                     description="d" * 300, tenant_id=tenant_id, created_at=created_at
                 ),
             )
-            for i in range(_MEASURED_ALL_ACTIVE_SKILLS)
+            for i in range(count)
         ]
 
     tenant_a = build(tenant_id=uuid4(), created_at=datetime(2024, 1, 1, tzinfo=UTC))
