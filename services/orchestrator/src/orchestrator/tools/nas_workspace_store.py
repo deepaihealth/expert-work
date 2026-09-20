@@ -154,11 +154,12 @@ import logging
 import os
 import shutil
 import stat
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from expert_work.persistence import (
@@ -189,6 +190,8 @@ from orchestrator.tools.workspace_store import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     # Only used for the ``runtime``/``instance_store`` fields' types — wave 2
     # Task 4 wires them up (mark_deleted tearing down a warm sandbox
     # session). Deferred behind TYPE_CHECKING so this module never needs a
@@ -366,30 +369,38 @@ def _walk_and_match(
 
     hits: list[WorkspaceFileEntry] = []
     truncated = False
-    for dirpath, _dirnames, filenames, walk_fd in os.fwalk(
-        ".", dir_fd=dfd, follow_symlinks=False, onerror=_on_error
-    ):
-        base = PurePosixPath(dirpath)
-        for name in sorted(filenames):
-            rel = str(base / name).removeprefix("./")
-            if is_reserved_workspace_path("/".join((*prefix, rel))):
-                continue
-            if name_glob is not None and not _name_matches(rel, name, name_glob):
-                continue
-            try:
-                info = os.lstat(name, dir_fd=walk_fd)
-            except OSError:
-                continue  # racing unlink — a miss, not a failure.
-            if not stat.S_ISREG(info.st_mode):
-                continue  # symlink / fifo / socket — never read through it.
-            if content is not None and not _content_matches(walk_fd, name, info, content):
-                continue
-            if len(hits) >= max_results:
-                truncated = True
+    # ``closing`` —— 命中上限时我们会 ``break`` 出去, 而 :func:`os.fwalk` 是个持有
+    # 目录 fd 的生成器:提前退出时必须显式关掉它, 不能指望引用计数顺手回收。一次
+    # 搜索泄一把 fd, 跑够多次就是 EMFILE。
+    # ``cast`` —— typeshed 把 ``os.fwalk`` 标成 ``Iterator``, 而 CPython 给的是
+    # 生成器(它有 ``close``, 这正是这里要的东西)。
+    walker = cast(
+        "Generator[tuple[str, list[str], list[str], int], None, None]",
+        os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_error),
+    )
+    with closing(walker):
+        for dirpath, _dirnames, filenames, walk_fd in walker:
+            base = PurePosixPath(dirpath)
+            for name in sorted(filenames):
+                rel = str(base / name).removeprefix("./")
+                if is_reserved_workspace_path("/".join((*prefix, rel))):
+                    continue
+                if name_glob is not None and not _name_matches(rel, name, name_glob):
+                    continue
+                try:
+                    info = os.lstat(name, dir_fd=walk_fd)
+                except OSError:
+                    continue  # racing unlink — a miss, not a failure.
+                if not stat.S_ISREG(info.st_mode):
+                    continue  # symlink / fifo / socket — never read through it.
+                if content is not None and not _content_matches(walk_fd, name, info, content):
+                    continue
+                if len(hits) >= max_results:
+                    truncated = True
+                    break
+                hits.append(_entry(rel, info))
+            if truncated:
                 break
-            hits.append(_entry(rel, info))
-        if truncated:
-            break
     hits.sort(key=lambda entry: entry.path)
     return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated)
 
