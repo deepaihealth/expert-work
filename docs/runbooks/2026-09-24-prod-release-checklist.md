@@ -8,11 +8,11 @@
 |---|---|
 | 发布日 | **2026-09-24（周四）**，用户 2026-09-17 拍板（原 09-22） |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`5a809aee`** —— 测试环境 2026-09-20 发过的那一版（`SMOKE PASS` 17 项全绿，金丝雀真跑 + 产物链 PASS，37.0s） |
-| 区间提交数 | **70**（`git log --oneline 5775fbf3..5a809aee`） |
-| 数据库迁移 | **两条**：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）。migrate Job 自动跑，不需要额外动作 |
-| 段数 | **单段**。有迁移但不是三段式：`0156` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这张表上正常跑 |
-| 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要） |
+| 本版 tag | **`139057c8`** —— 测试环境 2026-09-20 第二次发过的那一版（`SMOKE PASS` 17 项全绿，金丝雀真跑 + 产物链 PASS，B-85 ③ 真栈双向验过） |
+| 区间提交数 | **74**（`git log --oneline 5775fbf3..139057c8`） |
+| 数据库迁移 | **三条**：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
+| 段数 | **单段**。有迁移但不是三段式：`0156` / `0158` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这些表上正常跑 |
+| 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉 |
 | 沙箱镜像钉子 | `e8aac104` → **`7ac31957`**（Step A）。瘦身 + 只建 amd64，测试实测 619.4→433.7 MiB、拉取 66.19s→40.55s |
 | 新增集群对象 | **留存清理 CronJob `retention-cleanup`**（首次进 prod overlay，`apply -k` 会创建） |
 | 执行人 / 开始时间 | `___________` |
@@ -89,9 +89,22 @@
   金丝雀实况）。修法两层：平台自己等赢家把沙箱建好再复用它（上限 120s，每 2s 回看），
   等满才抛的异常是**双基类**（同时是 `TimeoutError`，让分类器按**类型**而不是按关键词判
   `transient`）。纯代码，无迁移、无配置。
-  ⚠️ **③ 不在本班**：`status=success` 只表示「图跑完没抛异常」，不表示「事做成了」。
-  要改的不是 `status` 语义（那是**对外契约变更**，对接方正在读它），而是另给一个
-  「本轮有工具失败且模型放弃了」的独立信号 —— 那是另一件事，还没做。
+- **B-85 ③ run 做没做成要有独立信号**（#1636，2026-09-20 追加，用户拍板带上）：
+  `status=success` 只表示「图跑完没抛异常」，**不表示「事做成了」**。①② 修的是一个
+  具体来源，而形态与来源无关 —— 任何工具失败之后模型不再动作，都会复现同一次静默假绿。
+  做法：图的每个出口由**知道答案的那一行代码**盖一个 `exit_reason`，`tools` 节点每批
+  记下未解决的工具失败，终局算出 `completed` 落库 + 落审计 + 随 `end` 帧发出去。
+  **`status` 的取值与语义一个字没动。**
+  ⚠️ **本条与本班其它条目形态不同，发布前必须知道三件**：
+  1. **带一条迁移** `0158_run_completion`（expand-only，`agent_run` 加 `completed` /
+     `exit_reason` 两列，**可空、不回填**）—— 本班迁移因此从两条变成**三条**。
+     不回填是刻意的：`NULL` = 这两列上线前的老 run，回填 `false` 会把跑得好好的历史 run
+     说成没做成，回填 `true` 会把当年真出过这个问题的那些洗白。
+  2. **是对外契约变更（追加字段）**：`end` 帧多 `completed` / `exit_reason`。对接方
+     非 strict 解析，不读也不会坏；但**判成功的口径要改**成
+     `status === "success" && completed !== false`。通知稿已备好，**等真栈验过再发**。
+  3. **不新增 SSE 事件类型** —— 对接方的流处理有事件白名单，新事件类型会被静默丢掉
+     （`item.*` 那轮的头号坑）。所以信号是挂在已有 `end` 帧上的字段。
 - **B-55 冷建沙箱 —— 三条一起**（#1623 / #1624 / #1625，2026-09-19 追加）：
   这批的根因不是「慢」，是**建不出来**。去数 `sandbox_instance` 528 行：`create_failed`
   **99 行 = 18.8%**，09-19 当天 **15 次里 13 次失败 = 87%**，每一条的存活时间都恰好 **60 秒**，
@@ -117,13 +130,13 @@
   隐藏段的文件名前缀歧义指向清单、**平台脚手架行不进控制台内容搜索**（带迁移 `0156`）、
   审计视图里这些行渲染成折叠的「平台自动生成」块。
 
-> **钉子纪律**：本单钉 `5a809aee`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `139057c8`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
 > B-73 四条一起带上，重钉 `dfd4e6de`（#1597）。当晚发现 B-73 ① 在生产上只能修一半
 > （写隐藏消息的源头有三个，另外两个早就在生产跑），补 `0157` 逼 sweep 重扫，又重钉一次。
-> 形态：无迁移 → 一条 expand-only → **两条（`0156` 加列 + `0157` 数据迁移）**，全程仍是单段。
+> 形态：无迁移 → 一条 expand-only → 两条（`0156` 加列 + `0157` 数据迁移）→ **三条（09-20 加装 B-85 ③ 的 `0158` 加列）**，全程仍是单段。
 >
 > **2026-09-19 第四次重钉（#1618）。** 那一版在测试环境**实际发过两次**，比上一个钉子多
 > 10 个提交（**这里刻意不写旧 sha 的字面量** —— 判据是 `grep '<旧 sha>'` 零命中，
@@ -144,7 +157,8 @@
 >   把超时抬到 180 之后重跑）推上去了，但那还是 amd64+arm64 的双架构 index。#1630 删掉 arm64
 >   之后重烤出的 **`7ac31957`** 才是本单要钉的那个（单 amd64 manifest）。
 >
-> 迁移**仍是两条**（`0156` / `0157`），形态仍是单段，回滚纪律不变。
+> 迁移在 09-20 加装 B-85 ③ 之后变成**三条**（`0156` / `0157` / `0158`），形态仍是单段，
+> 回滚纪律不变（三条都只回镜像，不 downgrade）。
 >
 > **✅ 2026-09-19 用户拍板：B-55 / B-58 / B-85 三条全部带上。** 此前本段写的「刻意不带 B-58
 > （#1611）与 B-85（#1618）」**整条作废** —— 那句话的前提是「它们在当时那个钉子之后才合入、
@@ -155,10 +169,10 @@
 >
 > | 钉子 | 新值 | 怎么验过的 |
 > |---|---|---|
-> | 应用镜像 | **`5a809aee`** | `release.sh test` 发过一遍：`SMOKE PASS` 17 项全绿、金丝雀真跑 + 产物链 PASS（37.0s） |
+> | 应用镜像 | **`139057c8`** | `release.sh test` 发过两遍（09-20 两次）：`SMOKE PASS` 17 项全绿、金丝雀真跑 + 产物链 PASS；B-85 ③ 另做了双向真栈验（见 §0 那条） |
 > | 沙箱镜像 | **`7ac31957`** | 测试集群 apply 过，池 `1/1`；拉取 66.19s → **40.55s**，压缩层 619.4 → **433.7 MiB**；pod 内复探 soffice / pdftoppm / ffmpeg（wheel 静态二进制）/ node 全在、npm 已删、weasyprint 渲 PDF + pypdf 读回命中 marker |
 >
-> 这一版比上一个钉子多 **18** 个提交：
+> 这一版比上一个钉子多 **22** 个提交：
 >
 > | 提交 | 是什么 | 进本班的理由 |
 > |---|---|---|
@@ -173,8 +187,16 @@
 > | `128e4194` #1628 / `0a44dab4` #1629 / `1cdbc495` #1631 | ROADMAP 记 B-88 / B-89、执行单改钉、B-88 单独立项 | 纯文档 |
 > | `7ac31957` #1630 | 沙箱镜像只建 amd64，删掉 arm64；构建超时退回 90 | 镜像重烤的那一版 |
 > | `5a809aee` #1632 | 沙箱镜像钉子推到 `7ac31957`，实测数据写进 yaml 注释 | 本单 Step A 就照这一行发 |
+> | `139057c8` #1636 | **B-85 ③** run 做没做成的独立信号（带迁移 `0158`） | 用户 09-20 拍板 |
+> | `f8436883` #1633 / `4775132d` #1634 / `cf7e0464` #1635 | test newTag 记录 + 第五次重钉、B-55 销案、B-85 ③ spec+计划 | 记账 / 纯文档 |
 >
-> 重钉之后按 §0 顶上那条判据自检过：**`grep -n '<旧 sha>' 这份文件` 零命中**（两个旧 sha 都验了）。
+> 重钉之后按 §0 顶上那条判据自检过。09-20 第六次重钉（应用镜像 → `139057c8`，带 B-85 ③）之后：
+> `233791e5` / `621249f6` / `5a809aee` 作为**钉子**的命中数都是 **0**。
+>
+> ⚠️ **判据的一条说明**：上面这张提交清单里会出现旧钉子的 sha —— 因为那一版**本身就是一个提交**
+> （`5a809aee` 是 #1632）。判据管的是**操作位**（表头、钉子表、Step B 的 `git checkout`、Step C 的
+> 核对、Step F 的记录 PR 标题），不是提交清单这种**记账位**。`grep` 之后逐条看一眼落在哪儿，
+> 落在清单里的放过，落在上面五处任何一处的都是漏改。
 
 > **⛔ #1597 那次重钉漏了正文**：表头改成了 `dfd4e6de`，Step B 的 `git checkout` 和另外 4 处
 > 却仍停在 `42426d31`（落后两代）。这已经是同一形状的**第二次**（班车 1 的 B2 正文钉子漏改，#1566）。
@@ -202,9 +224,10 @@
       git fetch origin main
       TAG=<本版 tag>                                        # 见表头「本版 tag」
       git log --oneline 5775fbf3..$TAG | wc -l             # 与表头「区间提交数」对得上
-      git diff --name-only 5775fbf3..$TAG | grep -i migrations/versions   # 期望**恰好两条**：
+      git diff --name-only 5775fbf3..$TAG | grep -i migrations/versions   # 期望**恰好三条**：
       #   packages/expert-work-persistence/migrations/versions/0156_thread_message_hidden.py
       #   packages/expert-work-persistence/migrations/versions/0157_thread_mirror_resweep.py
+      #   packages/expert-work-persistence/migrations/versions/0158_run_completion.py
       # 多出别的迁移 = 装载和这份单子对不上，停下来查，别往下发
       ```
 
@@ -444,13 +467,13 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 
 ```sh
 git fetch origin main
-git checkout 5a809aee
+git checkout 139057c8
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `5a809aee`
+- [ ] 确认 checkout 的是 `139057c8`
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
 - [ ] migrate Job `condition met`，且日志里出现**两条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
@@ -466,7 +489,7 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `5a809aee`（admin-ui 是 `5a809aee-prod`）
+- [ ] 三个应用镜像都是 `139057c8`（admin-ui 是 `139057c8-prod`）
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -514,7 +537,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag 5a809aee` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag 139057c8` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、回滚命令。
 - [ ] ROADMAP 班车 2 行销案；本执行单补 §6 执行记录。
 
