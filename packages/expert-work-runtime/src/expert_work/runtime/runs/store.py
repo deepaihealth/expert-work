@@ -164,17 +164,25 @@ class RunStore(abc.ABC):
         error: str | None = None,
         finished_at: datetime | None = None,
         artifacts: list[dict[str, Any]] | None = None,
+        completed: bool | None = None,
+        exit_reason: str | None = None,
         expected_statuses: Sequence[RunStatus] | None = None,
         guard_claimed_by: str | None = None,
     ) -> bool:
         """Update a run's status; return ``True`` iff the row exists
         (and, when a guard is given, the guard held).
 
-        ``error`` / ``finished_at`` / ``artifacts`` are written only when
-        not ``None`` so a non-terminal transition (e.g. → RUNNING) never
-        clears a verdict an earlier terminal write recorded. ``artifacts``
-        (产物清单契约) is the run's registration snapshot — terminal calls
-        pass ``[]`` for a zero-delivery run, never ``None``.
+        ``error`` / ``finished_at`` / ``artifacts`` / ``completed`` /
+        ``exit_reason`` are written only when not ``None`` so a non-terminal
+        transition (e.g. → RUNNING) never clears a verdict an earlier terminal
+        write recorded. ``artifacts``(产物清单契约) is the run's registration
+        snapshot — terminal calls pass ``[]`` for a zero-delivery run, never
+        ``None``.
+
+        ``completed`` / ``exit_reason``(B-85 ③)—— 「事做没做成」与「从哪个出口
+        结束的」,与 ``status`` **正交**:``status='success'` 只说「图跑完了、没抛
+        异常」。两列都是 ``NULL``-able 且**刻意不回填**,``None`` = 无记录(这两列
+        上线前的老 run,或 graph 状态读不到) —— **不是**「没做成」。
 
         多副本 CAS 守卫(两个都是可选,``None`` = 旧无守卫语义):
 
@@ -689,6 +697,8 @@ class InMemoryRunStore(RunStore):
         error: str | None = None,
         finished_at: datetime | None = None,
         artifacts: list[dict[str, Any]] | None = None,
+        completed: bool | None = None,
+        exit_reason: str | None = None,
         expected_statuses: Sequence[RunStatus] | None = None,
         guard_claimed_by: str | None = None,
     ) -> bool:
@@ -708,6 +718,9 @@ class InMemoryRunStore(RunStore):
             finished_at=finished_at if finished_at is not None else row.finished_at,
             # 谓词与 SQL 店 byte-同义:None 不碰既有清单(非终局转换)。
             artifacts=artifacts if artifacts is not None else row.artifacts,
+            # B-85 ③ —— 同一条谓词:None 不碰既有值。
+            completed=completed if completed is not None else row.completed,
+            exit_reason=exit_reason if exit_reason is not None else row.exit_reason,
         )
         return True
 
@@ -1146,6 +1159,9 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         idempotency_key=row.idempotency_key,
         request_digest=row.request_digest,
         artifacts=row.artifacts,
+        # B-85 ③ —— 两列都是 NULL-able 且不回填,老 run 读出来就是 None。
+        completed=row.completed,
+        exit_reason=row.exit_reason,
         agent_spec_sha256=row.agent_spec_sha256,
         superseded_by_run_id=row.superseded_by_run_id,
         regenerated_from_run_id=row.regenerated_from_run_id,
@@ -1209,6 +1225,8 @@ class SqlRunStore(RunStore):
         error: str | None = None,
         finished_at: datetime | None = None,
         artifacts: list[dict[str, Any]] | None = None,
+        completed: bool | None = None,
+        exit_reason: str | None = None,
         expected_statuses: Sequence[RunStatus] | None = None,
         guard_claimed_by: str | None = None,
     ) -> bool:
@@ -1220,6 +1238,11 @@ class SqlRunStore(RunStore):
         # 谓词与 in-memory 店 byte-同义:None 不碰既有清单(非终局转换)。
         if artifacts is not None:
             values["artifacts"] = artifacts
+        # B-85 ③ —— 同一条谓词。
+        if completed is not None:
+            values["completed"] = completed
+        if exit_reason is not None:
+            values["exit_reason"] = exit_reason
         conditions = [AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id]
         # 守卫谓词与 in-memory 店 byte-同义(见 Protocol docstring)。
         if expected_statuses is not None:

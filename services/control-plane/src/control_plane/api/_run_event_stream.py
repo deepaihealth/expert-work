@@ -18,7 +18,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 from control_plane.api._run_event_seq import _merge_ranges, _seq_of
@@ -104,13 +104,27 @@ _POLL_TERMINAL_GRACE_ROUNDS = 2
 #: 若将来这三条日志新增了**字符串**参数,必须重新评估并删掉对应的抑制注释。
 
 
+class RunTerminalProbe(NamedTuple):
+    """轮询分支从 run 行读到的终局快照。
+
+    原来是个 ``(status, artifacts)`` 二元组;B-85 ③ 要再带两个字段,四元组
+    靠位置取值太容易接错,改成具名的。字段与 ``end_frame_data`` 的同名参数
+    一一对应,``None`` 一律是**无记录**(帧上字段缺席),不是「值为 false」。
+    """
+
+    status: RunStatus
+    artifacts: list[dict[str, Any]] | None
+    completed: bool | None = None
+    exit_reason: str | None = None
+
+
 def make_run_probe(
     *,
     runs: RunStore,
     run_id: UUID,
     tenant_id: UUID,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-) -> Callable[[], Awaitable[tuple[RunStatus, list[dict[str, Any]] | None]]]:
+) -> Callable[[], Awaitable[RunTerminalProbe]]:
     """PROD-1 —— 轮询分支的 run 行探针,三个调用方(console / external 续传 /
     幂等重放)共用这一份,别各自手搓三个语义略有分歧的闭包。
 
@@ -121,7 +135,7 @@ def make_run_probe(
     轮询循环没有别的终止信号,挂死比错报一个「已中断」更坏。
     """
 
-    async def _probe() -> tuple[RunStatus, list[dict[str, Any]] | None]:
+    async def _probe() -> RunTerminalProbe:
         if scope is not None:
             async with scope():
                 row = await runs.get(run_id=run_id, tenant_id=tenant_id)
@@ -134,8 +148,8 @@ def make_run_probe(
                 "run_probe.row_vanished run_id=%s",
                 run_id,  # codeql[py/log-injection]
             )
-            return (RunStatus.INTERRUPTED, None)
-        return (row.status, row.artifacts)
+            return RunTerminalProbe(RunStatus.INTERRUPTED, None)
+        return RunTerminalProbe(row.status, row.artifacts, row.completed, row.exit_reason)
 
     return _probe
 
@@ -167,6 +181,11 @@ async def build_event_producer(
     # None(历史 run 无记录)= 帧上字段缺席。live-join 分支不用它 ——
     # 那条 end 的清单从 bridge end 帧 data 透传(与 sse_consumer 同源)。
     run_artifacts: list[dict[str, Any]] | None = None,
+    # B-85 ③ —— 与 ``run_artifacts`` 同款:run 行上的「做没做成 / 从哪个出口」,
+    # replay 分支的 end 帧带它们;``None``(老 run 无记录)= 帧上字段缺席,
+    # **不是 false**。live-join 分支同样不用它们(从 bridge end 帧 data 透传)。
+    run_completed: bool | None = None,
+    run_exit_reason: str | None = None,
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
     # PROD-1 跨副本兜底 —— 重读 run 行的探针,返回 ``(status, artifacts)``。
@@ -174,7 +193,7 @@ async def build_event_producer(
     # 认领 / 断线重连落到非属主副本),不订阅 bridge 而轮询 durable 表,终态与
     # 产物清单从这个探针取。``None`` = 保持旧行为(恒订阅 bridge),兼容未接线
     # 的调用方;两个真实调用方(console / external)都必须传。
-    run_probe: Callable[[], Awaitable[tuple[RunStatus, list[dict[str, Any]] | None]]] | None = None,
+    run_probe: Callable[[], Awaitable[RunTerminalProbe]] | None = None,
     # B-52 —— 取本 run 的用量,三条分支的 ``end`` 帧之前各调一次。``None`` = 不带
     # 这个字段(调用方没接线)。**统一走 loader 现查**,不像 ``artifacts`` 那样
     # 分「行上快照 / probe 重读 / bridge 透传」三条来源:用量本就在 ``token_usage``
@@ -306,6 +325,8 @@ async def build_event_producer(
                 status=_RUN_STATUS_END_STATUS.get(run_status),
                 artifacts=run_artifacts,
                 usage_by_model=(await load_usage()) if load_usage else None,
+                completed=run_completed,
+                exit_reason=run_exit_reason,
             ),
         )
 
@@ -464,7 +485,8 @@ async def build_event_producer(
         if run_probe is not None and not stream_bridge.has_live_stream(run_id):
             quiet_terminal_rounds = 0
             while True:
-                status, live_artifacts = await run_probe()
+                probed = await run_probe()
+                status = probed.status
                 drained_any = False
                 async for chunk in _drain_store():
                     yield chunk
@@ -484,8 +506,10 @@ async def build_event_producer(
                             end_frame_data(
                                 run_id=run_id,
                                 status=_RUN_STATUS_END_STATUS.get(status),
-                                artifacts=live_artifacts,
+                                artifacts=probed.artifacts,
                                 usage_by_model=(await load_usage()) if load_usage else None,
+                                completed=probed.completed,
+                                exit_reason=probed.exit_reason,
                             ),
                         )
                         return
@@ -511,15 +535,17 @@ async def build_event_producer(
                         yield format_sse(name, payload)
                 # P3 PR-1 Task 5 —— 终局状态从 bridge 的 end 帧 data 里取
                 # (``publish_end(status=...)`` 存的)。
-                status = entry.data.get("status") if isinstance(entry.data, dict) else None
-                arts = entry.data.get("artifacts") if isinstance(entry.data, dict) else None
+                _end_data = entry.data if isinstance(entry.data, dict) else {}
                 yield format_sse(
                     "end",
                     end_frame_data(
                         run_id=run_id,
-                        status=status,
-                        artifacts=arts,
+                        status=_end_data.get("status"),
+                        artifacts=_end_data.get("artifacts"),
                         usage_by_model=(await load_usage()) if load_usage else None,
+                        # B-85 ③ —— 与 status / artifacts 同源透传。
+                        completed=_end_data.get("completed"),
+                        exit_reason=_end_data.get("exit_reason"),
                     ),
                 )
                 return

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -68,6 +69,43 @@ class InterruptReason(StrEnum):
     AGENT_DISABLED = "agent_disabled"  # Agent 被停用 / 删除,连带取消
     #: 停在审批上的 run,裁定之前会话里开了新一轮 —— 它的待审批被作废(班车 2)。
     NEW_TURN = "new_turn"
+
+
+#: B-85 ③ —— ``exit_reason`` 的封闭取值。图里每个真实出口一个,由**知道答案的
+#: 那一行代码**盖章(``orchestrator.graph_builder.builder``),不是事后推断出来的。
+RUN_EXIT_REASONS: frozenset[str] = frozenset(
+    {
+        "text_response",  # 模型不再发 tool_calls,自然结束
+        "max_steps",  # 步数预算用尽
+        "no_progress",  # 循环检测连续 N 轮无进展
+        "token_budget",  # 全树共享 token 池耗尽
+        "approval_pending",  # 挂在审批门上(RunStatus.PAUSED)
+        "approval_rejected",  # 声明式门否决
+    }
+)
+
+
+def compute_completed(*, exit_reason: str, last_batch_failures: Sequence[Any]) -> bool:
+    """B-85 ③ —— 这个 run 把事做成了没有。**只用客观事实,不推断模型意图**。
+
+    ``True`` 要求两件都成立:
+
+    * run 是因为**模型不再调工具**而结束的(``text_response``),不是被平台
+      主动中止的(撞预算 / 挂审批 / 被否决);
+    * **最后一批**工具调用里没有未解决的非 transient 失败。
+
+    第二条就是 2026-09-19 抓到的那次形状:工具失败 → 模型不再动作 → 图正常
+    收尾 → ``status=success`` 而零产物。判的是「**结束得紧挨着一批失败**」这个
+    事实,不是「模型放弃了」这个意图 —— 后者猜不准(模型合理地换个方法也长这样),
+    前者客观可判。
+
+    **与 ``status`` 正交**:``status`` 说的是「图跑完了没抛异常」,这里说的是
+    「事做成了」。``status="success"`` 且 ``completed=False`` 是合法且有意义的组合。
+
+    没见过的 ``exit_reason`` 一律判 ``False``:判 ``True`` 等于替一个我们不认识的
+    出口作保,而本条要修的正是「平台替一个它不了解的终局打包票」。
+    """
+    return exit_reason == "text_response" and not last_batch_failures
 
 
 #: Run statuses that mark a run as finished — ``RunManager`` stamps
@@ -140,6 +178,12 @@ class RunInfo:
     #: 异常终局无记录;``[]`` = 零登记(追问轮);快照不随产物后续删除
     #: 回写。终局 ``set_status`` 与状态同一次写入。
     artifacts: list[dict[str, Any]] | None = None
+    #: B-85 ③ —— 这个 run 把事做成了没有,以及从哪个出口结束的。
+    #: 与 ``status`` **正交**:``status`` 说「图跑完了没抛异常」,这里说「事做成了」。
+    #: ``None`` = 这两列上线前的老 run(**不是**「没做成」)。
+    #: ``exit_reason`` 的取值见 :data:`RUN_EXIT_REASONS`。
+    completed: bool | None = None
+    exit_reason: str | None = None
     #: 这一轮**实际执行时**用的 manifest 内容哈希(``agent_spec.spec_sha256``
     #: 同一种规范化形式)。配置页对 manifest 是原地编辑,``thread_meta`` 上
     #: 记的 ``agent_name`` / ``agent_version`` 编辑前后完全一样,所以只有这一列

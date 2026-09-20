@@ -81,6 +81,20 @@ class AgentRunRow(Base):
     # ``[{name, kind, version, created_at}]``。NULL = 历史 run / 异常终局无
     # 记录;``[]`` = 零登记(追问轮);产物事后被删不回写(快照语义)。
     artifacts: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB, nullable=True)
+    # B-85 ③(migration 0158)—— run 做没做成,以及从哪个出口结束的。
+    #
+    # 与 ``status`` **正交**:``status='success'` 只表示「图跑完了、没抛异常」,
+    # ``completed=false`` 才是「事没做成」。两者同时出现是合法且有意义的组合 ——
+    # 工具失败之后模型不再动作,图照样正常收尾。
+    #
+    # NULL = 这两列上线前的老 run(**不是**「没做成」)。刻意不回填:回填 false
+    # 会把跑得好好的历史 run 说成没做成,回填 true 会把当年真出过这个问题的
+    # 那些洗白,两种都是在没有证据的地方造证据。
+    #
+    # ``exit_reason`` 封闭取值:text_response / max_steps / no_progress /
+    # token_budget / approval_pending / approval_rejected。
+    completed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # External-API-v1 P2 block 1-C (migration 0145) — third-party retry
     # dedup. ``idempotency_key`` is the caller's ``Idempotency-Key`` header;
     # ``request_digest`` is a hash of the request body so a *reused* key with

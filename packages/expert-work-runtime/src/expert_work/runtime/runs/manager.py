@@ -359,6 +359,8 @@ class RunManager:
         *,
         error: str | None = None,
         artifacts: list[dict[str, Any]] | None = None,
+        completed: bool | None = None,
+        exit_reason: str | None = None,
     ) -> bool:
         """Update a run's status. Returns ``True`` iff the run exists
         **and the durable transition landed**.
@@ -370,6 +372,10 @@ class RunManager:
         written with the terminal status in the same store UPDATE so any
         reader that sees the terminal status also sees the manifest;
         ``None`` leaves the stored value untouched.
+
+        ``completed`` / ``exit_reason``(B-85 ③)—— 与 ``artifacts`` 同一条
+        透传语义(``None`` 不碰既有值),也与 ``status`` **正交**:``status``
+        说「图跑完了没抛异常」,``completed`` 说「事做成了」。
 
         多副本 CAS 守卫(两个洞,一处修):
 
@@ -398,6 +404,8 @@ class RunManager:
                     error=error,
                     finished_at=now if is_terminal else None,
                     artifacts=artifacts,
+                    completed=completed,
+                    exit_reason=exit_reason,
                     expected_statuses=(
                         (RunStatus.PENDING, RunStatus.QUEUED, RunStatus.RUNNING)
                         if status is RunStatus.RUNNING

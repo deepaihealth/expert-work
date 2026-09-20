@@ -914,6 +914,49 @@ async def test_set_status_artifacts_round_trip_and_none_keeps(run_store: SqlRunS
     assert fetched3 is not None and fetched3.artifacts == []
 
 
+@pytest.mark.asyncio
+async def test_set_status_completion_signal_round_trip_and_none_keeps(
+    run_store: SqlRunStore,
+) -> None:
+    """B-85 ③ —— ``completed`` / ``exit_reason`` 与 ``artifacts`` 同一条谓词:
+    终局写、``None`` 不碰既有、``False`` 可写。
+
+    ``False`` 那一格是要害:如果实现写成 ``if completed:`` 而不是
+    ``if completed is not None:``,**恰好是本条要报的那种 run** 写不进去 ——
+    信号在最需要它的那一格静默失效。
+    """
+    run_id, tenant_id = uuid4(), uuid4()
+    await run_store.create(_info(run_id=run_id, tenant_id=tenant_id))
+
+    fresh = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fresh is not None
+    assert fresh.completed is None and fresh.exit_reason is None, "没写过 = 无记录"
+
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=5),
+        completed=False,
+        exit_reason="text_response",
+    )
+    fetched = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None
+    assert fetched.completed is False
+    assert fetched.exit_reason == "text_response"
+    assert fetched.status is RunStatus.SUCCESS, "status 与 completed 正交,互不影响"
+
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=6),
+    )
+    kept = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert kept is not None
+    assert kept.completed is False and kept.exit_reason == "text_response"
+
+
 # ---------------------------------------------------------------------------
 # 多副本 CAS 守卫 —— 与 in-memory 店谓词 byte-同义(test_run_store 有镜像用例)
 # ---------------------------------------------------------------------------

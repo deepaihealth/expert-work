@@ -17,16 +17,19 @@ from expert_work.runtime.runs.event_store import make_event_record as make_event
 from expert_work.runtime.runs.manager import DrainObserver as DrainObserver
 from expert_work.runtime.runs.manager import RunManager as RunManager
 from expert_work.runtime.runs.manager import RunRecord as RunRecord
+from expert_work.runtime.runs.schemas import RUN_EXIT_REASONS as RUN_EXIT_REASONS
 from expert_work.runtime.runs.schemas import DisconnectMode as DisconnectMode
 from expert_work.runtime.runs.schemas import InterruptReason as InterruptReason
 from expert_work.runtime.runs.schemas import RunInfo as RunInfo
 from expert_work.runtime.runs.schemas import RunStatus as RunStatus
+from expert_work.runtime.runs.schemas import compute_completed as compute_completed
 from expert_work.runtime.runs.store import InMemoryRunStore as InMemoryRunStore
 from expert_work.runtime.runs.store import RunIdempotencyConflict as RunIdempotencyConflict
 from expert_work.runtime.runs.store import RunStore as RunStore
 from expert_work.runtime.runs.store import SqlRunStore as SqlRunStore
 
 __all__ = [
+    "RUN_EXIT_REASONS",
     "DisconnectMode",
     "DrainObserver",
     "InMemoryRunEventStore",
@@ -42,5 +45,6 @@ __all__ = [
     "RunStore",
     "SqlRunEventStore",
     "SqlRunStore",
+    "compute_completed",
     "make_event_record",
 ]
