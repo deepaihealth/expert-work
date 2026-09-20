@@ -2228,6 +2228,8 @@ def build_runs_router() -> APIRouter:
             run_id=run_id,
             run_status=persisted.status,
             run_artifacts=persisted.artifacts,
+            run_completed=persisted.completed,
+            run_exit_reason=persisted.exit_reason,
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             # PROD-1 —— 对话页/调试台 live attach 落到非属主副本时轮询兜底;

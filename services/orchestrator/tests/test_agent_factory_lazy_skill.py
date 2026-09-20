@@ -155,8 +155,16 @@ def test_mixed_lazy_and_eager() -> None:
 
 def test_no_skills_returns_base_unchanged() -> None:
     base = "You are an agent."
-    assert _assemble_system_prompt(base=base, skill_fragments=[]) == base
-    assert _assemble_system_prompt(base=base, skill_fragments=[], skill_summaries=[]) == base
+    # B-85 ③ —— 原来这里断言的是 ``prompt == base``。那只是「自己那个块不出现」
+    # 的廉价代理,而平台从此恒追加一段 completion contract(无开关),代理失效。
+    # 改成断言真正在乎的那件事:base 原样在最前 + 自己那个块确实不在。
+    for prompt in (
+        _assemble_system_prompt(base=base, skill_fragments=[]),
+        _assemble_system_prompt(base=base, skill_fragments=[], skill_summaries=[]),
+    ):
+        assert prompt.startswith(base)
+        assert "<available-skills>" not in prompt
+        assert "<skill>" not in prompt
 
 
 def test_loaded_skills_default_fields_back_compat() -> None:

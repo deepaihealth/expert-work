@@ -40,7 +40,11 @@ import pytest
 from httpx import AsyncClient
 
 import control_plane.api.runs as runs_module
-from control_plane.api._run_event_stream import EVENT_PAGE_LIMIT, build_event_producer
+from control_plane.api._run_event_stream import (
+    EVENT_PAGE_LIMIT,
+    RunTerminalProbe,
+    build_event_producer,
+)
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunEventStore,
@@ -461,12 +465,16 @@ async def _collect_replay(
     since_seq: int | None = None,
     run_status: RunStatus = RunStatus.SUCCESS,
     run_artifacts: list[dict[str, Any]] | None = None,
+    run_completed: bool | None = None,
+    run_exit_reason: str | None = None,
     load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
 ) -> tuple[list[tuple[str | None, str, Any]], int | None]:
     plan = await build_event_producer(
         run_id=run_id,
         run_status=run_status,
         run_artifacts=run_artifacts,
+        run_completed=run_completed,
+        run_exit_reason=run_exit_reason,
         event_store=store,
         stream_bridge=InMemoryStreamBridge(),
         since_seq=since_seq,
@@ -760,6 +768,96 @@ async def test_both_sse_paths_emit_the_same_end_shape() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_both_sse_paths_carry_the_completion_signal() -> None:
+    """防分叉哨兵的**正向**对照 —— B-85 ③ 的两个字段真的存在时也必须两边都带。
+
+    上面那条哨兵跑的是一个 ``INTERRUPTED`` 的 run,图状态是空的,于是两个新字段
+    在**两条路径上都缺席** —— 缺席 == 缺席,那一格**在不可能失败的条件下成立**:
+    哪怕我只给其中一条路径接线,它照样绿。这一条把字段真的放进去再比一次。
+
+    同时钉住本条最要命的那个组合:``status="success"`` 而 ``completed=false`` ——
+    图跑完了没抛异常,但最后一批工具调用里还有未解决的失败,事没做成。
+    """
+    from expert_work.runtime.runs import RunManager
+    from orchestrator.sse import run_agent, sse_consumer
+
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await rm.create(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        on_disconnect=DisconnectMode.CANCEL,
+    )
+    store = InMemoryRunEventStore()
+
+    class _FailedBatch:
+        """``last_batch_failures`` 只看有没有,不看内容(见 compute_completed)。"""
+
+        error_class = "tool_error"
+
+    class _StoppedAfterAFailureGraph:
+        async def astream(
+            self, _input: Any, _config: Any = None, *, stream_mode: str = "updates"
+        ) -> AsyncIterator[Any]:
+            yield {"agent": {"step_count": 1}}
+
+        async def aget_state(self, _config: Any) -> Any:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                values={"exit_reason": "text_response", "last_batch_failures": [_FailedBatch()]}
+            )
+
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_StoppedAfterAFailureGraph(),
+        graph_input={"messages": []},
+        config={},
+        event_store=store,
+    )
+    assert rm.get(record.run_id).status is RunStatus.SUCCESS  # 前置条件:status 没被动过
+
+    async def _never_disconnected() -> bool:
+        return False
+
+    consumer_frames = _parse_sse(
+        [
+            chunk
+            async for chunk in sse_consumer(
+                bridge=bridge,
+                record=record,
+                run_manager=rm,
+                is_disconnected=_never_disconnected,
+                heartbeat_interval=5.0,
+            )
+        ]
+    )
+    # 重放路径从 run 行取值 —— 生产调用方(runs.py / external_events.py)传的就是
+    # 同一行上的三列,测试帮手镜像同一契约。
+    events_frames, _ = await _collect_replay(
+        run_id=record.run_id,
+        store=store,
+        run_status=RunStatus.SUCCESS,
+        run_artifacts=[],
+        run_completed=False,
+        run_exit_reason="text_response",
+    )
+
+    consumer_end = consumer_frames[-1][2]
+    events_end = events_frames[-1][2]
+    assert sorted(consumer_end) == sorted(events_end), (
+        f"两条流的 end 帧字段集合分叉了:sse_consumer={consumer_end!r} vs GET events={events_end!r}"
+    )
+    assert consumer_end == events_end
+    assert consumer_end["status"] == "success", "status 一个字都不许动"
+    assert consumer_end["completed"] is False
+    assert consumer_end["exit_reason"] == "text_response"
+
+
 # ---------------------------------------------------------------------------
 # P3 PR-1 / Task 3R-fix —— 落库真的会有洞(复审实测复现)
 #
@@ -1031,13 +1129,15 @@ class _ScriptedProbe:
         self._rounds = list(rounds)
         self.calls = 0
 
-    async def __call__(self) -> tuple[RunStatus, list[dict[str, Any]] | None]:
+    async def __call__(self) -> RunTerminalProbe:
         index = min(self.calls, len(self._rounds) - 1)
         self.calls += 1
         action, status, artifacts = self._rounds[index]
         if action is not None and self.calls - 1 == index:
             await action()
-        return (status, artifacts)
+        # B-85 ③ —— 返回生产那个具名元组,不是裸 ``(status, artifacts)``:
+        # 轮询分支按属性取值,替身回裸元组就等于没测到真正走的那条路。
+        return RunTerminalProbe(status, artifacts)
 
 
 @pytest.fixture
@@ -1177,15 +1277,34 @@ async def test_make_run_probe_reads_row_and_survives_vanish() -> None:
 
     run_id, tenant_id = uuid4(), uuid4()
     manifest = [{"name": "a.json", "kind": "data", "version": 1, "created_at": "t"}]
-    store = _FakeRunStore(SimpleNamespace(status=RunStatus.SUCCESS, artifacts=manifest))
+    # 替身行必须与生产 ``RunInfo`` 同形 —— B-85 ③ 之后探针也读这两列,
+    # 替身少给属性就只会红在 AttributeError,而不是红在被测行为上。
+    store = _FakeRunStore(
+        SimpleNamespace(
+            status=RunStatus.SUCCESS,
+            artifacts=manifest,
+            completed=False,
+            exit_reason="text_response",
+        )
+    )
     probe = make_run_probe(runs=store, run_id=run_id, tenant_id=tenant_id)  # type: ignore[arg-type]
-    assert await probe() == (RunStatus.SUCCESS, manifest)
+    probed = await probe()
+    assert probed.status is RunStatus.SUCCESS
+    assert probed.artifacts == manifest
+    # B-85 ③ —— 行上的「做没做成」必须被探针带出来,否则轮询分支(跨副本重连)
+    # 的 end 帧会比 live 分支少两个字段,正是这条流反复出过的分叉形态。
+    assert probed.completed is False
+    assert probed.exit_reason == "text_response"
     assert store.calls == [(run_id, tenant_id)]
 
     # run 行中途消失(purge 极端路径)—— 按 interrupted 收流,轮询不挂死。
+    # 这一路**没有**行可读,所以两个新字段是 ``None``(无记录),不是 ``False``。
     vanished = _FakeRunStore(None)
     probe2 = make_run_probe(runs=vanished, run_id=run_id, tenant_id=tenant_id)  # type: ignore[arg-type]
-    assert await probe2() == (RunStatus.INTERRUPTED, None)
+    gone = await probe2()
+    assert gone.status is RunStatus.INTERRUPTED
+    assert gone.artifacts is None
+    assert gone.completed is None and gone.exit_reason is None
 
 
 def test_event_page_limit_stays_within_the_store_clamp() -> None:

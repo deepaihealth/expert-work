@@ -157,6 +157,8 @@ class StreamBridge(abc.ABC):
         *,
         status: str,
         artifacts: list[dict[str, Any]] | None = None,
+        completed: bool | None = None,
+        exit_reason: str | None = None,
     ) -> None:
         """Signal that no more events will be produced for ``run_id``.
 
@@ -170,6 +172,10 @@ class StreamBridge(abc.ABC):
         snapshot, riding the same end-frame ``data`` so the live stream's
         ``end`` carries the manifest without a store read. ``None`` keeps
         the frame field absent (a caller that predates the contract).
+
+        ``completed`` / ``exit_reason``(B-85 ③)—— 同一条捎带语义:「事做没做成」
+        与「从哪个出口结束的」,与 ``status`` **正交**。``None`` 同样是**字段缺席**
+        而不是 ``false`` —— 缺席 = 无记录(老 run,或图状态读不到)。
         """
 
     @abc.abstractmethod

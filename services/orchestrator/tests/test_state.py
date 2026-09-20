@@ -18,7 +18,8 @@ def test_required_keys_present() -> None:
     CM-11 ``last_plan_goal``, 委派层 1 ``delegation_nudge_plan_hash``,
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
-    ``turn_image_refs``(last nineteen ``NotRequired``)。
+    ``turn_image_refs``,B-85 ③ ``last_batch_failures`` / ``exit_reason``
+    (last twenty-one ``NotRequired``)。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -38,6 +39,10 @@ def test_required_keys_present() -> None:
         "max_no_progress",
         "last_plan_goal",
         "tool_failures",
+        # B-85 ③ —— 见 state.py 上的注释:``tool_failures`` 按轮重置、终局
+        # 拿不到,这一条由 ``tools`` 节点每批无条件覆盖,留到 END。
+        "last_batch_failures",
+        "exit_reason",
         "subagent_invocations",
         "pending_approval",
         "approval_resume",

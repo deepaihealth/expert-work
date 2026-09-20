@@ -47,6 +47,10 @@ class _RunStream:
     #: 产物清单契约 —— publish_end 捎带的产物登记快照;end 帧 data 与
     #: ``end_status`` 同源同临界区,None 时帧上不出现该字段。
     end_artifacts: list[dict[str, Any]] | None = None
+    #: B-85 ③ —— publish_end 捎带的「做没做成 / 从哪个出口」,与 ``end_status``
+    #: 同源同临界区;None 时帧上不出现该字段(缺席 ≠ false)。
+    end_completed: bool | None = None
+    end_exit_reason: str | None = None
     #: 本 run 的发号器。**只允许在 ``condition`` 临界区内读写** —— 发号与入队
     #: 原子完成,订阅者看到的帧顺序因此恒等于 seq 顺序(见 ``StreamBridge.publish``)。
     next_seq: int = 0
@@ -141,6 +145,8 @@ class InMemoryStreamBridge(StreamBridge):
         *,
         status: str,
         artifacts: list[dict[str, Any]] | None = None,
+        completed: bool | None = None,
+        exit_reason: str | None = None,
     ) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
@@ -148,6 +154,8 @@ class InMemoryStreamBridge(StreamBridge):
             stream.ended = True
             stream.end_status = status
             stream.end_artifacts = artifacts
+            stream.end_completed = completed
+            stream.end_exit_reason = exit_reason
             stream.condition.notify_all()
 
     async def subscribe(
@@ -178,18 +186,17 @@ class InMemoryStreamBridge(StreamBridge):
                 elif stream.ended:
                     # Minted per subscription so it carries *this* run's
                     # terminal status; read under the lock with the flag.
-                    entry = StreamEvent(
-                        id=None,
-                        event=END_SENTINEL.event,
-                        data=(
-                            {"status": stream.end_status}
-                            if stream.end_artifacts is None
-                            else {
-                                "status": stream.end_status,
-                                "artifacts": stream.end_artifacts,
-                            }
-                        ),
-                    )
+                    # 逐个可选字段增量拼,别写成条件表达式的笛卡尔积:
+                    # 每加一个可选字段分支数就翻一倍,而「None = 字段缺席」
+                    # 这条语义是一样的。
+                    end_data: dict[str, Any] = {"status": stream.end_status}
+                    if stream.end_artifacts is not None:
+                        end_data["artifacts"] = stream.end_artifacts
+                    if stream.end_completed is not None:
+                        end_data["completed"] = stream.end_completed
+                    if stream.end_exit_reason is not None:
+                        end_data["exit_reason"] = stream.end_exit_reason
+                    entry = StreamEvent(id=None, event=END_SENTINEL.event, data=end_data)
                 else:
                     try:
                         await asyncio.wait_for(stream.condition.wait(), timeout=heartbeat_interval)

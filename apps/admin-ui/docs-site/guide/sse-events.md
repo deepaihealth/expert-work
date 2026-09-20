@@ -1056,6 +1056,8 @@ HTTP 层的错误码（4xx / 5xx、限流、配额）是另一回事，见 [8 �
 | `status` | string | 这次 run 的最终状态。四个取值见下表，这是全集：平台在发这个事件之前，会把任何不在这四个取值里的内部状态强制归为 `error` |
 | `run_id` | string | 这次 run 的 id，格式是 UUID |
 | `artifacts` | array | **这次 run 登记过的产物清单**。每个元素是 `{name, kind, version, created_at}`；`[]` 表示这轮没有登记产物——**注意这不等于「这轮没有产出文件」**，详见下方说明。字段**缺席**只发生在读平台升级前的历史 run——缺席表示「当时没有记录」，不要当成零交付。清单是登记时刻的快照：产物之后被删除或同名覆盖，不会回头改这份清单 |
+| `completed` | boolean | **这次 run 有没有把事做成**。与 `status` 是两件事，判成功要同时看，原因见下方说明。字段**缺席**表示没有记录（平台升级前的历史 run，或平台读不到执行状态），**不要当成 `false`** |
+| `exit_reason` | string | 这次 run 是从哪个出口结束的。取值见下表，这是全集；将来新增取值是向后兼容的追加，客户端把未知取值当作「非正常结束」处理即可。字段**缺席**与 `completed` 同义：没有记录 |
 | `usage_by_model` | array | **这次 run 消耗的 token**，按 `{provider, model}` 分项，字段说明见下表。**已经包含子任务**：子任务与主 Agent 共用同一次 run 的计量，各项相加就是整次 run 的总量，不要再去累加 `worker` 事件里的 `usage`，那会重复计算。`[]` 表示这次 run 确实没有消耗；字段**缺席**表示没有记录（平台升级前的历史 run、run 尚未开始执行、或平台取数失败），不要当成零消耗。某一项各数值全为 `0`，表示那次调用由平台的回答缓存直接给出、没有调用模型。同一份数据也可以用 [5.9 run 用量](./query#_5-9-run-用量) 取回 |
 
 `artifacts` 每个元素的字段：
@@ -1079,7 +1081,9 @@ Agent 产生的文件分两种去向：一种直接写进这个终端用户的**
 决定展示什么、或者是否计费，同时检查工作区文件更准确。
 :::
 
-另一个判断这轮做到哪一步的依据是 `plan` 事件：最后一个 `plan` 事件里若仍有
+判断这轮做到哪一步，**首选 `end` 事件的 `completed`**（见 3.4 的说明），它对每次 run 都有。
+
+`plan` 事件是另一个补充依据：最后一个 `plan` 事件里若仍有
 `pending` 或 `in_progress` 的步骤，说明 Agent 自己认为这一轮的计划没有走完。
 并非每次 run 都会产生 `plan` 事件——没有计划的简单轮次不产生，缺席时不能据此推断。
 
@@ -1107,15 +1111,57 @@ Agent 产生的文件分两种去向：一种直接写进这个终端用户的**
 | `interrupted` | run 被中断，例如调用方主动取消。取消不会另外发 `error` 事件 | 按「已取消」处理，不必重试 |
 | `error` | 执行失败。三种情况都归在这里：执行出错、超时，以及步数用尽 | 按失败处理，细节见 [8 错误码总表](./errors) |
 
-步数用尽这一路最容易误判：`guard` 那一节说 `tripped` 不是错误，指的是不要把那条 `guard` 当成崩溃报出来，用户仍会拿到一段完整回答；但这次 run 是被平台停下的、没有正常执行到底，所以在 `end` 里算 `error`。两句话不矛盾——**run 成功还是失败，以这里的 `status` 为准。**
+步数用尽这一路最容易误判：`guard` 那一节说 `tripped` 不是错误，指的是不要把那条 `guard` 当成崩溃报出来，用户仍会拿到一段完整回答；但这次 run 是被平台停下的、没有正常执行到底，所以在 `end` 里算 `error`。两句话不矛盾——**这一轮跑没跑完、是不是失败了，以这里的 `status` 为准**；至于「要做的事做成了没有」，那是另一个字段的事，见下一小节。
 
 `end` 的四个取值是由平台内部的结束原因收敛而来的：内部的「被取消」和「中断」都归为 `interrupted`，内部的「超时」和「步数用尽」都归为 `error`。run 记录里的状态（见 [5.4 run 列表](./query#_5-4-run-列表)）分得比这四个细，所以同一次 run 在两个地方看到不同的字样是正常的。
+
+#### `status` 说的是「跑完了」，`completed` 说的是「做成了」
+
+::: danger `status` 为 `success` 不代表这次 run 把事做成了
+`status` 回答的是「这一轮跑完了、没有出错」。它**不回答**「要做的事做成了没有」。
+
+两者会分开，而且是个真实发生过的形态：某个工具调用失败，助手据此停下不再动作，
+整轮**正常收尾** —— 于是 `status` 是 `success`，而这轮其实什么都没做成。
+
+所以判成功要**同时看两个字段**：
+
+```js
+const ok = data.status === "success" && data.completed !== false;
+```
+
+写 `completed !== false` 而不是 `completed === true`：平台升级前的历史 run 没有这个
+字段，`!== false` 让它们保持原来的判定，不会因为字段缺席被误判成失败。
+:::
+
+`exit_reason` 的取值：
+
+| 取值 | 含义 | 是否算做成 |
+|---|---|---|
+| `text_response` | 助手不再调用工具，自然说完了 | 要看 `completed`：同时为 `true` 才是真的做完 |
+| `max_steps` | 这一轮的步数预算用尽，平台让助手用现有结果收尾 | 否 |
+| `no_progress` | 助手连续多轮没有进展，平台判定卡住并收尾 | 否 |
+| `token_budget` | 这一轮的 token 预算用尽 | 否 |
+| `approval_pending` | 停在人工审批点（对应 `status` 的 `paused`） | 否 —— 批准之后这一轮会接着跑 |
+| `approval_rejected` | 审批被拒绝，这一轮就此终止 | 否 |
+
+除 `text_response` 之外的取值都表示这一轮是**被平台停下来的**，`completed` 恒为 `false`。
+
+`exit_reason` 是 `text_response` 而 `completed` 是 `false`，是最需要留意的那一格：
+助手自己停下了，但它停下之前有工具调用失败且没有恢复。这种情况值得给用户一个提示，
+或者进重试队列，不要当成正常完成。
 
 #### 示例
 
 ``` [事件流片段]
 event: end
-data: {"status":"success","run_id":"67262572-5470-41a4-800d-592762ec679d","artifacts":[{"name":"张女士_20260826142539.pptx","kind":"document","version":1,"created_at":"2026-08-26T06:31:37+00:00"}]}
+data: {"status":"success","run_id":"67262572-5470-41a4-800d-592762ec679d","artifacts":[{"name":"张女士_20260826142539.pptx","kind":"document","version":1,"created_at":"2026-08-26T06:31:37+00:00"}],"completed":true,"exit_reason":"text_response"}
+```
+
+某个工具失败之后助手停下不再动作 —— `status` 仍是 `success`，但事没做成：
+
+``` [事件流片段]
+event: end
+data: {"status":"success","run_id":"c0f6e1a2-8b33-4d70-9a11-6f2b7c94de05","artifacts":[],"completed":false,"exit_reason":"text_response"}
 ```
 
 追问轮（这轮没有产出、助手在等用户补信息）的 `artifacts` 是显式空数组：
@@ -1136,7 +1182,9 @@ function onEnd(data) {
   $("#cancel-btn").disabled = true;
   switch (data.status) {
     case "success":
-      $("#status").textContent = "已完成";
+      // `completed !== false` 而不是 `=== true`:平台升级前的历史 run 没有这个
+      // 字段,缺席要保持原来的判定,不能被误判成失败。
+      $("#status").textContent = data.completed !== false ? "已完成" : "未完成";
       break;
     case "paused":                       // 不是失败:等待审批,对话还会继续
       $("#status").textContent = "等待审批";

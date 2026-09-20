@@ -76,6 +76,7 @@ from expert_work.runtime.runs import (
     RunManager,
     RunRecord,
     RunStatus,
+    compute_completed,
     make_event_record,
 )
 from expert_work.runtime.stream_bridge import (
@@ -614,6 +615,13 @@ async def run_agent(
     # ``finally`` 里不能发 end 帧,也不记终局审计 / 轨迹。
     handed_off = False
     handoff_task: asyncio.Task[None] | None = None
+    # B-85 ③ —— 必须在**函数作用域**初始化:``finally`` 里的 ``publish_end``
+    # 在每条终局路径上都跑,包括那些从来没走到下面终局块的(LLM 全厂商耗尽、
+    # MaxSteps、兜底异常)。只在终局块里赋值的话,异常路径上是 UnboundLocalError
+    # —— 一个诚实性信号反过来把 run 炸掉,正是本条最不该发生的形态。
+    # ``None`` 在这两个字段上恒等于「无记录」,而异常路径确实没有记录。
+    completed: bool | None = None
+    exit_reason: str | None = None
 
     async def _handoff_watch() -> None:
         """B-80 —— 关机期间,一旦这一轮可以安全交接就把它停下来。
@@ -838,6 +846,11 @@ async def run_agent(
             return
 
         pending_request: ApprovalRequest | None = None
+        # B-85 ③ —— 出口原因与「做没做成」。和 ``pending_approval`` 读同一个
+        # snapshot(多读两个键,不多一次 IO),降级也照同一条契约:读不到就是
+        # **无记录**(两个值留 ``None``),绝不让 run 失败 —— 这两列是诚实性
+        # 信号,它自己失灵不该反过来把一次正常的 run 判死。
+        last_batch_failures: list[Any] = []
         if not record.abort_event.is_set():
             try:
                 snapshot = await graph.aget_state(effective_config)
@@ -848,6 +861,9 @@ async def run_agent(
                         if isinstance(raw_pending, ApprovalRequest)
                         else ApprovalRequest.model_validate(raw_pending)
                     )
+                raw_exit = snapshot.values.get("exit_reason")
+                exit_reason = raw_exit if isinstance(raw_exit, str) else None
+                last_batch_failures = list(snapshot.values.get("last_batch_failures") or [])
             except Exception:
                 logger.warning("run_agent.pause_check_failed run_id=%s", run_id, exc_info=True)
 
@@ -870,7 +886,19 @@ async def run_agent(
         # status write lands, so a client polling right after ``set_status``
         # sees a fully-persisted replay (bounded by _PERSIST_DRAIN_TIMEOUT_S).
         await _drain_persist_queue()
-        await run_manager.set_status(run_id, final, artifacts=_manifest_snapshot())
+        # B-85 ③ —— ``exit_reason`` 读不到时两个都传 ``None``(= 无记录),
+        # 不猜一个值填进去:造出来的「已完成」比没有信号更坏。
+        if exit_reason is not None:
+            completed = compute_completed(
+                exit_reason=exit_reason, last_batch_failures=last_batch_failures
+            )
+        await run_manager.set_status(
+            run_id,
+            final,
+            artifacts=_manifest_snapshot(),
+            completed=completed,
+            exit_reason=exit_reason,
+        )
         if final is RunStatus.PAUSED and pending_request is not None:
             # Register the paused run in the durable ``agent_approval``
             # table + emit APPROVAL_REQUESTED. The table — not the
@@ -911,6 +939,8 @@ async def run_agent(
                 result=AuditResult.SUCCESS,
                 reason=None,
                 status="interrupted" if final is RunStatus.INTERRUPTED else "success",
+                completed=completed,
+                exit_reason=exit_reason,
             )
             # Stream L.L7 — record the trajectory for the J.13 eval gate.
             # Fire-and-forget; failures are swallowed inside the recorder.
@@ -1077,6 +1107,8 @@ async def run_agent(
                 run_id,
                 status=_external_end_status(session_outcome),
                 artifacts=_manifest_snapshot(),
+                completed=completed,
+                exit_reason=exit_reason,
             )
         # P2 块 2 —— 会话对外可见消息条数在这里重算。挂 ``finally`` 而不是挂
         # 控制面的 6 个 ``run_agent`` 启动点:一处覆盖全部调用方 + 全部终局
@@ -1580,6 +1612,8 @@ async def _emit_run_end_audit(
     result: AuditResult,
     reason: str | None,
     status: str,
+    completed: bool | None = None,
+    exit_reason: str | None = None,
 ) -> None:
     """Write one run-lifecycle audit row.
 
@@ -1588,6 +1622,14 @@ async def _emit_run_end_audit(
     ``session:write`` row the control-plane emits at run start. An
     audit-write failure is logged and swallowed — it must never fail
     an otherwise-finished run.
+
+    ``completed`` / ``exit_reason``(B-85 ③)—— 让审计行**自己**能回答「这个 run
+    做成了没有」,不用回头 join ``agent_run``。``None`` 时**不放键**(与 ``end``
+    帧同一条「缺席 ≠ false」口径)。
+
+    四个调用点里**只有正常终局那一个**传得出值,其余三个(协作取消、MaxSteps、
+    兜底异常)图都是中途被打断的,**从来没盖过章** —— 那里缺席是对的,不是漏传:
+    把一个没跑到出口的 run 记成 ``completed=false`` 等于替它编一个它没到过的终局。
     """
     if audit_logger is None:
         return
@@ -1602,7 +1644,12 @@ async def _emit_run_end_audit(
                 resource_id=str(record.thread_id),
                 result=result,
                 reason=reason,
-                details={"run_id": str(record.run_id), "status": status},
+                details={
+                    "run_id": str(record.run_id),
+                    "status": status,
+                    **({"completed": completed} if completed is not None else {}),
+                    **({"exit_reason": exit_reason} if exit_reason else {}),
+                },
             )
         )
     except Exception:
@@ -1760,8 +1807,9 @@ async def sse_consumer(
                 # 合成一个 ``None``。这条流是第三方的主路径(POST 建 run 的
                 # stream 模式);只改 ``_run_event_stream.py`` 的话,两条流的
                 # ``end`` 帧字段集合会分叉。
-                status = entry.data.get("status") if isinstance(entry.data, dict) else None
-                arts = entry.data.get("artifacts") if isinstance(entry.data, dict) else None
+                _end_data = entry.data if isinstance(entry.data, dict) else {}
+                status = _end_data.get("status")
+                arts = _end_data.get("artifacts")
                 if converter is not None:
                     # ``channel="final"`` 的改判必须排在 ``end`` 之前 —— 判定要
                     # 向后看一条消息,只有到这里才知道后面没有了。
@@ -1774,6 +1822,10 @@ async def sse_consumer(
                         status=status,
                         artifacts=arts,
                         usage_by_model=(await load_usage()) if load_usage else None,
+                        # B-85 ③ —— 与 status / artifacts 同源:全部从 bridge 的
+                        # end 帧 data 透传,``publish_end`` 存的。
+                        completed=_end_data.get("completed"),
+                        exit_reason=_end_data.get("exit_reason"),
                     ),
                 )
                 return
@@ -1824,6 +1876,8 @@ def end_frame_data(
     status: str | None,
     artifacts: list[dict[str, Any]] | None = None,
     usage_by_model: list[dict[str, Any]] | None = None,
+    completed: bool | None = None,
+    exit_reason: str | None = None,
 ) -> dict[str, Any]:
     """``end`` 帧的 ``data`` —— **两条 SSE 路径共用的唯一构造口**。
 
@@ -1844,6 +1898,15 @@ def end_frame_data(
     分桶,**含整棵调用树**(worker 与父 run 共用同一个 trace)。与 ``artifacts``
     同一口径:``None``(无记录 / 未绑 trace / 取数失败)时**字段缺席**,空列表则是
     「确有其事的零用量」——两者不可混同。桶里恒含四档 token;``llm_calls`` 不对外。
+
+    ``completed`` / ``exit_reason``(B-85 ③)—— 「事做没做成」与「从哪个出口结束
+    的」。**与 ``status`` 正交**:``status`` 只说「图跑完了、没抛异常」,所以
+    ``status="success"`` 且 ``completed=false`` 是**合法且有意义**的组合 ——
+    工具失败之后模型不再动作,图照样正常收尾。判成功要同时看这两个。
+
+    ``None`` 时**字段缺席**,口径与上面两个一致:缺席 = 这两列上线前的老 run,
+    **别当成「没做成」**。``exit_reason`` 的取值见
+    :data:`expert_work.runtime.runs.RUN_EXIT_REASONS`,将来新增是向后兼容的新值。
     """
     data: dict[str, Any] = {
         "status": status if status in EXTERNAL_END_STATUSES else "error",
@@ -1853,6 +1916,10 @@ def end_frame_data(
         data["artifacts"] = artifacts
     if usage_by_model is not None:
         data["usage_by_model"] = usage_by_model
+    if completed is not None:
+        data["completed"] = completed
+    if exit_reason is not None:
+        data["exit_reason"] = exit_reason
     return data
 
 

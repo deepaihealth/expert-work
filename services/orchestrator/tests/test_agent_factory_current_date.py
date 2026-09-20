@@ -60,7 +60,10 @@ def test_assemble_includes_current_date_block() -> None:
 
 def test_assemble_without_current_date_leaves_base_unchanged() -> None:
     prompt = _assemble_system_prompt(base="BASE", skill_fragments=[], current_date=None)
-    assert prompt == "BASE"
+    # B-85 ③ —— 原来这里断言的是 ``prompt == base``。那只是「自己那个块不出现」
+    # 的廉价代理,而平台从此恒追加一段 completion contract(无开关),代理失效。
+    # 改成断言真正在乎的那件事:base 原样在最前 + 自己那个块确实不在。
+    assert prompt.startswith("BASE")
     assert "# Current date" not in prompt
 
 

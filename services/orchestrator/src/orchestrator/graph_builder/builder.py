@@ -611,6 +611,12 @@ def build_react_graph(
         guard_sink = guard_sink_raw if callable(guard_sink_raw) else None
         token_tripped = token_budget is not None and token_budget.exhausted
         budget_exhausted = (max_steps > 0 and step_count >= max_steps) or stuck or token_tripped
+        # B-85 ③ —— 盖章要盖在**知道答案的那一行**。下一行之后三个布尔就被
+        # 并成一个 ``budget_exhausted`` 了;再往后,撞预算走的「一次无工具的
+        # 收尾轮」在 ``_should_continue`` 眼里与「模型自然说完了」逐字相同。
+        budget_reason = budget_exit_reason(
+            max_steps=max_steps, step_count=step_count, stuck=stuck, token_tripped=token_tripped
+        )
 
         # Stream TE-6 — bind active specs plus any deferred tools the run has
         # promoted via ``find_tools`` (carried per-thread on AgentState, so the
@@ -1237,6 +1243,7 @@ def build_react_graph(
             # be silently overwritten on the happy path.
             persisted_messages = _stamp_agent_messages(persisted_messages, config)
             looped_this_turn = bool(ctx.payload.get("loop_detected")) or primary_loop_detected
+            mw_exit_reason = _exit_reason_for(persisted_messages, budget_reason=budget_reason)
             update_mw: dict[str, Any] = {
                 "messages": persisted_messages,
                 "step_count": step_count + 1,
@@ -1258,6 +1265,10 @@ def build_react_graph(
             }
             if demoted_tools:
                 update_mw["promoted_tools"] = {"remove": demoted_tools}
+            # B-85 ③ —— 只在真的走到出口时写;还要继续的轮次不盖章,
+            # 盖了会把中间态当终局读。
+            if mw_exit_reason is not None:
+                update_mw["exit_reason"] = mw_exit_reason
             # B-35 — only a plan_first build ever writes the dispatch
             # channels (off = state shape untouched).
             if plan_first:
@@ -1277,6 +1288,7 @@ def build_react_graph(
             emit_messages = [dispatch_message, *emit_messages]
         # P2 — same rationale as the middleware path above: stamp last.
         emit_messages = _stamp_agent_messages(emit_messages, config)
+        plain_exit_reason = _exit_reason_for(emit_messages, budget_reason=budget_reason)
         update_plain: dict[str, Any] = {
             "messages": emit_messages,
             "step_count": step_count + 1,
@@ -1288,6 +1300,9 @@ def build_react_graph(
         }
         if demoted_tools:
             update_plain["promoted_tools"] = {"remove": demoted_tools}
+        # B-85 ③ —— 同 ``update_mw`` 那一处:只在真的走到出口时写。
+        if plain_exit_reason is not None:
+            update_plain["exit_reason"] = plain_exit_reason
         # B-35 — only a plan_first build ever writes the dispatch channels.
         if plan_first:
             update_plain["plan_first_dispatch_active"] = dispatch_active
@@ -1423,6 +1438,9 @@ def build_react_graph(
                 }
                 if resume_outcome.terminal:
                     rejected["approval_outcome"] = "rejected"
+                    # B-85 ③ —— 出口就在这一行,盖在这里。``_after_tools``
+                    # 是路由函数,只返回路由、不写 state。
+                    rejected["exit_reason"] = "approval_rejected"
                 return rejected
             # approve / modify — fall through to dispatch the approved (possibly
             # arg-rewritten) call; clear the resume channel on return.
@@ -1463,6 +1481,8 @@ def build_react_graph(
                         configurable = config.get("configurable") or {}
                         thread_id = str(configurable.get("run_id") or "run")
                         return {
+                            # B-85 ③ —— 挂审批也是一个出口(RunStatus.PAUSED)。
+                            "exit_reason": "approval_pending",
                             "pending_approval": build_approval_request(
                                 ApprovalTarget(
                                     index=bad_idx,
@@ -1476,7 +1496,7 @@ def build_react_graph(
                                 # re-scan cannot reproduce it, so mint unbound to
                                 # avoid verifying the wrong call (RT-ADR-19).
                                 bind=False,
-                            )
+                            ),
                         }
                     # block — deny the whole turn (one error ToolMessage per
                     # call so no tool_call is left orphaned); the agent re-plans.
@@ -1499,12 +1519,14 @@ def build_react_graph(
                 configurable = config.get("configurable") or {}
                 thread_id = str(configurable.get("run_id") or "run")
                 return {
+                    # B-85 ③ —— 同上,审批门是出口。
+                    "exit_reason": "approval_pending",
                     "pending_approval": build_approval_request(
                         target,
                         thread_id=thread_id,
                         timeout_s=approval_timeout_s,
                         clarification_timeout_s=clarification_timeout_s,
-                    )
+                    ),
                 }
 
         # B-67 §七 —— 手抄守卫:沙箱代码里出现本轮输入 URL 的原文或近似 → 那一条不派发。
@@ -1730,6 +1752,14 @@ def build_react_graph(
         # default fast-path active.
         if tool_failures:
             result_dict["tool_failures"] = tool_failures
+        # B-85 ③ —— **无条件**写(全成功的批写 ``[]``)。只在非空时写的话,
+        # 「批 1 失败 → 批 2 全成功 → 结束」之后通道里还留着批 1 的失败,
+        # 一个已经自我恢复的 run 会被误判成没做成。
+        # 只留非 transient:与下面 ``error_signal`` 同一条谓词 —— transient 是
+        # 可重试的抖动,不是「没做成」的证据。
+        result_dict["last_batch_failures"] = [
+            f for f in tool_failures if f.error_class != "transient"
+        ]
         # Stream J.8 — when this batch ran on an approve / modify resume,
         # clear the transient ``approval_resume`` channel so a follow-on
         # turn does not re-apply the stale verdict.
@@ -2224,6 +2254,42 @@ def _build_delegation_nudge(pending_count: int) -> HumanMessage:
         ),
         additional_kwargs={"expert_work_hide_from_ui": True},
     )
+
+
+def _exit_reason_for(messages: Sequence[BaseMessage], *, budget_reason: str | None) -> str | None:
+    """B-85 ③ —— 这一轮是不是一个出口,是哪个出口。``None`` = 还没到出口。
+
+    ``budget_reason`` 优先:撞预算之后的收尾轮响应**天然没有 tool_calls**,
+    不优先就会被 ``text_response`` 盖掉 —— 那正好把「平台主动中止」伪装成
+    「模型自然说完了」,是本条要修的那种谎的同构版本。
+    """
+    if budget_reason is not None:
+        return budget_reason
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            return None if _extract_tool_calls(msg) else "text_response"
+    return None
+
+
+def budget_exit_reason(
+    *, max_steps: int, step_count: int, stuck: bool, token_tripped: bool
+) -> str | None:
+    """B-85 ③ —— 预算用尽时是**哪一种**用尽,没用尽返回 ``None``。
+
+    提成纯函数有两个理由:① 取值顺序是一条真规则(三者可以同时为真),
+    抽出来才测得到;② ``agent_node`` 里那一行算完 ``budget_exhausted``
+    之后,三个布尔再往下走就被合并成一个 bool 了 —— 分辨力只存在于这一刻。
+
+    ``max_steps=0`` 是**不设预算**,不是「预算为零、立刻用尽」(与
+    ``budget_exhausted`` 里的 ``max_steps > 0`` 前置条件同义)。
+    """
+    if max_steps > 0 and step_count >= max_steps:
+        return "max_steps"
+    if stuck:
+        return "no_progress"
+    if token_tripped:
+        return "token_budget"
+    return None
 
 
 def _should_continue(state: AgentState) -> Literal["tools", "agent", "__end__"]:
