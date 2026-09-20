@@ -615,6 +615,13 @@ async def run_agent(
     # ``finally`` 里不能发 end 帧,也不记终局审计 / 轨迹。
     handed_off = False
     handoff_task: asyncio.Task[None] | None = None
+    # B-85 ③ —— 必须在**函数作用域**初始化:``finally`` 里的 ``publish_end``
+    # 在每条终局路径上都跑,包括那些从来没走到下面终局块的(LLM 全厂商耗尽、
+    # MaxSteps、兜底异常)。只在终局块里赋值的话,异常路径上是 UnboundLocalError
+    # —— 一个诚实性信号反过来把 run 炸掉,正是本条最不该发生的形态。
+    # ``None`` 在这两个字段上恒等于「无记录」,而异常路径确实没有记录。
+    completed: bool | None = None
+    exit_reason: str | None = None
 
     async def _handoff_watch() -> None:
         """B-80 —— 关机期间,一旦这一轮可以安全交接就把它停下来。
@@ -843,7 +850,6 @@ async def run_agent(
         # snapshot(多读两个键,不多一次 IO),降级也照同一条契约:读不到就是
         # **无记录**(两个值留 ``None``),绝不让 run 失败 —— 这两列是诚实性
         # 信号,它自己失灵不该反过来把一次正常的 run 判死。
-        exit_reason: str | None = None
         last_batch_failures: list[Any] = []
         if not record.abort_event.is_set():
             try:
@@ -882,11 +888,10 @@ async def run_agent(
         await _drain_persist_queue()
         # B-85 ③ —— ``exit_reason`` 读不到时两个都传 ``None``(= 无记录),
         # 不猜一个值填进去:造出来的「已完成」比没有信号更坏。
-        completed = (
-            compute_completed(exit_reason=exit_reason, last_batch_failures=last_batch_failures)
-            if exit_reason is not None
-            else None
-        )
+        if exit_reason is not None:
+            completed = compute_completed(
+                exit_reason=exit_reason, last_batch_failures=last_batch_failures
+            )
         await run_manager.set_status(
             run_id,
             final,

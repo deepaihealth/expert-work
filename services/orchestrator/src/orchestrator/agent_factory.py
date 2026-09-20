@@ -1674,6 +1674,24 @@ def _tool_use_enforcement_active(*, mode: str, model: ModelSpec) -> bool:
     return not any(frag in name for frag in _TOOL_USE_ENFORCEMENT_EXEMPT_NAME_FRAGMENTS)
 
 
+#: B-85 ③ 第二条腿 —— completion contract。**平台级,无开关,恒在。**
+#:
+#: A 腿(``exit_reason`` / ``completed``)只看得见「run 结束得紧挨着一批失败」
+#: 这个外在形态。模型换了个方法绕过失败、最后交出一个其实没做成的东西时,
+#: ``last_batch_failures`` 是空的,A 腿会判它做成了 —— 那一格只有让模型自己说。
+#: 做法照 openclaw 的 ``<completion_contract>``(``gpt5-prompt-overlay.ts``)。
+#:
+#: **平台不解析正文里的 ``[blocked]``**:解析模型自由文本是脆的,而且一旦解析
+#: 就变成了另一种形式的猜。这一段产出的是**给人读的诚实文本**,不是机器信号。
+#:
+#: 不做成开关(与 ``spotlight`` / ``tool_use_enforcement`` 不同):开关有人会忘,
+#: 忘了之后「run 说做完了其实没做完」是**静默**的,比统一的坏更糟。
+COMPLETION_CONTRACT_CLAUSE = """<completion-contract>
+在每一项被要求的事都做完、或者被你显式标成 [blocked] 并说明缺什么之前,不要把任务当作已完成。
+工具失败导致做不下去时,明说是哪一步、缺什么,不要用一段看起来完整的话把它盖过去。
+</completion-contract>"""
+
+
 def _assemble_system_prompt(
     *,
     base: str,
@@ -1703,19 +1721,10 @@ def _assemble_system_prompt(
     behavior_patches = behavior_patches or []
     tool_notes = tool_notes or []
     memory_blocks = memory_blocks or []
-    if not (
-        skill_fragments
-        or skill_summaries
-        or behavior_patches
-        or tool_notes
-        or memory_blocks
-        or current_date
-        or tool_use_enforcement
-        or spotlight
-        or worker_delegation
-    ):
-        return base
-
+    # B-85 ③ —— 这里原本有一条「什么都没有就直接返回 ``base``」的短路。
+    # completion contract 是**无条件**追加的,短路留着的话,恰好是最朴素的那种
+    # agent(没有 skill / patch / memory)拿不到它 —— 而平台级的东西不该看
+    # agent 配置的脸色。短路本身也只是省几次字符串拼接,不是正确性要件。
     pieces: list[str] = [base]
 
     # Tool-call-rate uplift — enforcement block (``policies.tool_use_
@@ -1723,6 +1732,10 @@ def _assemble_system_prompt(
     # advisory skill / memory blocks below.
     if tool_use_enforcement:
         pieces.append("\n\n# Tool-use enforcement\n" + tool_use_enforcement)
+
+    # B-85 ③ —— 无条件。与 ``tool_use_enforcement`` 同一档(行为指令先于下面的
+    # 顾问性 skill / memory 块)。
+    pieces.append("\n\n" + COMPLETION_CONTRACT_CLAUSE)
 
     # Dynamic-context — day-granular current date (``dynamic_context.
     # inject_current_date``). Placed first after base so the model reads it as
