@@ -370,8 +370,20 @@ def _walk_and_match(
     hits: list[WorkspaceFileEntry] = []
     truncated = False
     # ``closing`` —— 命中上限时我们会 ``break`` 出去, 而 :func:`os.fwalk` 是个持有
-    # 目录 fd 的生成器:提前退出时必须显式关掉它, 不能指望引用计数顺手回收。一次
-    # 搜索泄一把 fd, 跑够多次就是 EMFILE。
+    # 目录 fd 的生成器。
+    #
+    # **勘误(09-20 实测)**:这里原本的注释写的是"不能指望引用计数顺手回收, 一次
+    # 搜索泄一把 fd, 跑够多次就是 EMFILE"。**那句话是错的** —— 照真实调用形状
+    # (``os.fwalk(".", dir_fd=...)``, 首轮就 ``break`` 抛弃 walker)跑 500 次, 进程
+    # 打开的 fd 数一个没涨:CPython 的引用计数在 ``break`` 那一刻就把生成器关了,
+    # ``fwalk`` 自己的 ``finally`` 照常跑。
+    #
+    # 那为什么还留着 ``closing``:它把"提前退出要关掉 walker"写成代码而不是赌一个
+    # 实现细节 —— 只要将来有人把 ``walker`` 多存一个引用(塞进 ``self``、包一层调试
+    # 迭代器、挪进 ``try`` 外面), 引用计数就不再在 ``break`` 时归零, 而那种改动不会
+    # 有任何测试变红。代价是零(热路径上一次 ``close``)。
+    #
+    # 别照着"修掉这个多余的 ``closing``"—— 它防的是未来的改动, 不是今天的泄漏。
     # ``cast`` —— typeshed 把 ``os.fwalk`` 标成 ``Iterator``, 而 CPython 给的是
     # 生成器(它有 ``close``, 这正是这里要的东西)。
     walker = cast(
