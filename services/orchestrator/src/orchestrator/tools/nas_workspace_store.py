@@ -155,6 +155,7 @@ import os
 import shutil
 import stat
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -340,6 +341,21 @@ def _normalize_workspace_path(path: str) -> tuple[str, tuple[str, ...]]:
     if not parts or ".." in parts:
         raise SandboxSupervisorError(f"workspace path must be relative and free of '..': {path!r}")
     return "/".join(parts), parts
+
+
+def _entry(rel: str, info: os.stat_result) -> WorkspaceFileEntry:
+    """One listing row out of a stat result already in hand.
+
+    B-84 —— ``mtime`` comes from the *same* ``lstat`` the size comes from, and
+    is normalised to a tz-aware UTC ``datetime``: a naive one cannot be
+    compared with anything else in this codebase without a silent local-time
+    assumption.
+    """
+    return WorkspaceFileEntry(
+        path=rel,
+        size=info.st_size,
+        mtime=datetime.fromtimestamp(info.st_mtime, tz=UTC),
+    )
 
 
 def workspace_deleted_marker(root: str, tenant_id: UUID, user_id: UUID) -> Path:
@@ -704,7 +720,10 @@ class NasWorkspaceStore:
                     # of whatever it points at outside the tree (see module
                     # docstring).
                     try:
-                        size = full.lstat().st_size
+                        # B-84 —— 一次 lstat 同时取大小与 mtime, 不为 mtime 多跑
+                        # 一次 stat: 这个循环在一棵几千文件的树上跑, 每多一次系
+                        # 统调用就是一次 NFS 往返。
+                        info = full.lstat()
                     except PermissionError as exc:
                         # 同 read_file:列不动 ≠ 不存在,不能被下面吞掉。
                         raise WorkspacePermissionError(
@@ -718,7 +737,7 @@ class NasWorkspaceStore:
                         raise SandboxSupervisorError(
                             f"workspace listing failed: {rel!r}: {exc.strerror}"
                         ) from exc
-                    entries.append(WorkspaceFileEntry(path=rel, size=size))
+                    entries.append(_entry(rel, info))
             entries.sort(key=lambda entry: entry.path)
             return entries[:_MAX_LIST_ENTRIES]
 

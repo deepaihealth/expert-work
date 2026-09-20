@@ -34,7 +34,7 @@ from orchestrator.tools.sandbox import (
     WorkspaceFileTooLargeError,
     WorkspacePermissionError,
 )
-from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
+from orchestrator.tools.workspace_store import WorkspaceStore
 
 
 def _store(root: Path) -> NasWorkspaceStore:
@@ -152,7 +152,7 @@ async def test_write_read_list_delete_roundtrip(tmp_path: Path) -> None:
     assert data == b"hello"
 
     files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
-    assert files == [WorkspaceFileEntry(path="out/report.txt", size=5)]
+    assert [(f.path, f.size) for f in files] == [("out/report.txt", 5)]
 
     await store.delete_file(tenant_id=tenant_id, user_id=user_id, path="out/report.txt")
     files_after = await store.list_files(tenant_id=tenant_id, user_id=user_id)
@@ -172,7 +172,7 @@ async def test_list_files_hides_reserved_prefixes(tmp_path: Path) -> None:
     await store.mark_deleted(tenant_id=tenant_id, user_id=user_id)
 
     files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
-    assert files == [WorkspaceFileEntry(path="out.txt", size=len(b"agent output"))]
+    assert [(f.path, f.size) for f in files] == [("out.txt", len(b"agent output"))]
 
 
 async def test_delete_file_rejects_reserved_path(tmp_path: Path) -> None:
@@ -629,7 +629,7 @@ async def test_dot_segments_resolve_to_the_same_file_as_the_plain_path(tmp_path:
 
     assert await store.read_file(tenant_id=tenant_id, user_id=user_id, path="x/y") == b"v"
     files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
-    assert files == [WorkspaceFileEntry(path="x/y", size=1)]
+    assert [(f.path, f.size) for f in files] == [("x/y", 1)]
 
 
 async def test_user_root_mkdir_failure_stays_inside_the_store_error_boundary(
@@ -1346,7 +1346,7 @@ async def test_list_files_does_not_use_path_is_dir(
 
     files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
 
-    assert files == [WorkspaceFileEntry(path="a.txt", size=1)]
+    assert [(f.path, f.size) for f in files] == [("a.txt", 1)]
 
 
 # --------------------------------------------- 留存链 B-27:delete_tree(会话 purge 钩子)

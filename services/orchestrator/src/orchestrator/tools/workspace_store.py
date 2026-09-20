@@ -25,6 +25,7 @@ import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -48,6 +49,35 @@ class WorkspaceFileEntry:
 
     path: str
     size: int
+    #: B-84 —— 最后修改时间, 带 tzinfo 的 UTC ``datetime``。它正是决定"复用还是
+    #: 重建"的那个字段: 模型要能分辨"这是我上一轮写的"和"很久以前的"。
+    #:
+    #: ``None`` 的唯一合法来源是 :class:`SupervisorWorkspaceStore` —— 它的 HTTP
+    #: 列表里没有这一项(supervisor 侧 ``list_volume_files`` 只回 ``(size,
+    #: relpath)``), 而那个后端在集群上已经退役, 只剩本地 dev / CI。宁可如实报
+    #: ``None`` 也不编一个假时间: 一个看起来像真的、实际是编的时间戳比没有更坏。
+    #: :class:`~orchestrator.tools.nas_workspace_store.NasWorkspaceStore`
+    #: (生产唯一在跑的实现)永远给真值。
+    mtime: datetime | None = None
+
+
+def _entry_from_wire(raw: Mapping[str, Any]) -> WorkspaceFileEntry:
+    """Parse one listing row from the supervisor's JSON body.
+
+    ``mtime`` is read **when present** (epoch seconds) and left ``None``
+    otherwise: today's supervisor does not send it (see
+    :attr:`WorkspaceFileEntry.mtime`), and the day it starts, this store needs
+    no second change. A non-numeric value degrades to ``None`` rather than
+    raising — a listing is a browse surface, not a place to fail a whole run
+    over one odd row.
+    """
+    raw_mtime = raw.get("mtime")
+    mtime = (
+        datetime.fromtimestamp(float(raw_mtime), tz=UTC)
+        if isinstance(raw_mtime, int | float)
+        else None
+    )
+    return WorkspaceFileEntry(path=str(raw["path"]), size=int(raw["size"]), mtime=mtime)
 
 
 @runtime_checkable
@@ -163,10 +193,7 @@ class SupervisorWorkspaceStore:
             )
             raise SandboxSupervisorError(msg)
         body = response.json()
-        return [
-            WorkspaceFileEntry(path=str(f["path"]), size=int(f["size"]))
-            for f in body.get("files", [])
-        ]
+        return [_entry_from_wire(f) for f in body.get("files", [])]
 
     async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
         url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
