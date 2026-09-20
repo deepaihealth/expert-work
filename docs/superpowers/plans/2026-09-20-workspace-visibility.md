@@ -6,7 +6,9 @@
 
 **目标:** 让模型知道工作区里已经有什么,并且查得到 —— 治掉「看不见就重打」这条实测每 60 天烧掉约 6,002 秒的路径。
 
-**架构:** 两个 PR。PR-2b 把只读文件操作从沙箱挪到宿主 NAS(顺带新增 `search_files`);PR-2 在系统提示词里加一个 run 起点的工作区树形摘要块,读路径复用 PR-2b。**PR-2b 必须先做** —— 它是 PR-2 的地基。
+**架构:** 两个 PR。PR-2b 把只读文件操作从沙箱挪到宿主 NAS(顺带新增 `search_files`);PR-2 加一个工作区树形摘要块,读路径复用 PR-2b。**PR-2b 必须先做** —— 它是 PR-2 的地基。
+
+> **勘误(2026-09-21,#1650 返工):PR-2 的接线点从「系统提示词 / run 起点取一次」改成「每轮在提示词尾部挂一条隐藏 `HumanMessage`」。** 理由与连带变化见 Task 7 开头那段勘误;真源以代码为准。
 
 **技术栈:** Python 3.12 / asyncio / `NasWorkspaceStore`(已有 `openat` 链 TOCTOU 安全原语)/ pytest。
 
@@ -221,9 +223,40 @@ async def test_scoped_read_rejects_escape(bad): ...
 
 ## Task 7:接进系统提示词
 
+> **勘误(2026-09-21,#1650 返工):这一节的接线点被推翻了,下面的「系统提示词」口径**
+> **已作废,块的形状也变了。** 照现在的实现读,别照这一节做。
+>
+> **改成:每轮在提示词尾部挂一条隐藏 `HumanMessage`**(走 `_inject_plan`(L1)与
+> B-67 §六「本轮输入」段同一条通道),接线点是
+> `services/orchestrator/src/orchestrator/graph_builder/builder.py::agent_node`,
+> 不是 `agent_factory.py`。三个理由:
+>
+> 1. **跨用户 PII 泄漏。** `AgentRuntime.get_agent` 的构建缓存键是
+>    `(tenant_id, name, version, compute_spec_sha256(spec), oauth_subject)`
+>    (`services/control-plane/src/control_plane/runtime.py:393`),`oauth_subject` 只在
+>    该用户接了 OAuth 连接器时才等于 user_id —— 没接 OAuth 的 agent 在用户之间共享
+>    同一份构建,快照进系统提示词就是把 A 的文件名发给 B。
+> 2. **每轮打掉 prompt 前缀缓存。** 快照每轮都变,而系统提示词是缓存前缀。这正是 L1
+>    当初把 plan 挪出 `SystemMessage` 的理由(`builder.py` 里 `_inject_plan` 的
+>    docstring)。
+> 3. **撞 B-70。** `api/runs.py` 每个 run 往线程追加一条完整系统提示词,而
+>    `llm/coalesce.py` 的 `coalesce_system_messages` 按原始顺序拼 —— 模型会同时读到
+>    N 份快照,最旧的排最前。
+>
+> 连带变的:块首不再说「这个 run 开始时」而是「这一轮开始时」(每轮重取);块首也
+> 不再说 `Files already in /workspace.` 这句**无条件全称声明** —— 取数走 `list_files`,
+> 它过滤掉四个保留命名空间(`uploads/` / `skills/` / `inputs/` / `.tool_results/`),
+> 说全称会让模型把「没列出来」读成「不存在」,正好把本 PR 要治的误判原样造一遍。
+> 现在的块首点名说清哪些被滤掉了、它们各自从哪条通道来、以及「不在此列 ≠ 不存在」。
+>
+> 真源以代码为准:`orchestrator/tools/workspace_tree.py` 的模块 docstring(含 2026-09-21
+> 实测的体积/成本/收益)与 `builder.py::_workspace_block_tail`。
+
 **Files:**
-- Modify: `services/orchestrator/src/orchestrator/agent_factory.py`(平台段组装,约 1700-1790 行)
-- Test: `services/orchestrator/tests/test_agent_factory_*.py` 里合适的那个
+- ~~Modify: `services/orchestrator/src/orchestrator/agent_factory.py`(平台段组装,约 1700-1790 行)~~
+  → Modify: `services/orchestrator/src/orchestrator/graph_builder/builder.py`(`agent_node` 尾部注入)
+- ~~Test: `services/orchestrator/tests/test_agent_factory_*.py` 里合适的那个~~
+  → Test: `services/orchestrator/tests/test_workspace_block_injection.py`
 
 **块的形状**(spec §5):
 
