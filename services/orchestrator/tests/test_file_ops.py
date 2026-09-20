@@ -32,6 +32,7 @@ from orchestrator.tools import (
     ListDirTool,
     ReadFileTool,
     SandboxOutcome,
+    SearchFilesTool,
     ToolBlockedError,
     ToolContext,
     WriteFileTool,
@@ -40,12 +41,21 @@ from orchestrator.tools.file_ops import (
     SandboxWorkspaceWriter,
     build_artifact_locate_wrapper,
     build_edit_wrapper,
-    build_list_wrapper,
     build_read_wrapper,
     build_write_wrapper,
 )
-from orchestrator.tools.sandbox import RecordingSandboxRuntime
+from orchestrator.tools.sandbox import (
+    RecordingSandboxRuntime,
+    SandboxSupervisorError,
+    WorkspaceFileNotFoundError,
+    WorkspaceFileTooLargeError,
+    WorkspaceNotADirectoryError,
+    WorkspaceNotAFileError,
+    WorkspacePathEscapeError,
+    WorkspacePermissionError,
+)
 from orchestrator.tools.workspace_paths import WriteToSharedError
+from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
 
 # --------------------------------------------------------------------------
 # Layer 1 — in-sandbox snippet logic (run locally with ws = tmp_path)
@@ -167,31 +177,6 @@ def test_symlink_dir_escape_on_write_rejected(tmp_path: Path) -> None:
     assert not (target / "pwn.txt").exists()
 
 
-def test_list_dir_sorted(tmp_path: Path) -> None:
-    ws = str(tmp_path)
-    (tmp_path / "b.txt").write_text("bb")
-    (tmp_path / "a.txt").write_text("a")
-    (tmp_path / "sub").mkdir()
-    out = _run_snippet(build_list_wrapper(".", ws=ws))
-    assert out["ok"] is True
-    names = [e["name"] for e in out["entries"]]
-    assert names == ["a.txt", "b.txt", "sub"]
-    by_name = {e["name"]: e for e in out["entries"]}
-    assert by_name["a.txt"] == {"name": "a.txt", "is_dir": False, "size": 1}
-    assert by_name["sub"]["is_dir"] is True
-
-
-def test_list_dir_not_found(tmp_path: Path) -> None:
-    out = _run_snippet(build_list_wrapper("nope", ws=str(tmp_path)))
-    assert out == {"ok": False, "error": "not_found"}
-
-
-def test_list_dir_not_a_directory(tmp_path: Path) -> None:
-    (tmp_path / "file.txt").write_text("x")
-    out = _run_snippet(build_list_wrapper("file.txt", ws=str(tmp_path)))
-    assert out == {"ok": False, "error": "not_a_directory"}
-
-
 def test_write_invalid_unicode(tmp_path: Path) -> None:
     # A lone surrogate is a valid str but not UTF-8 encodable (M-1).
     out = _run_snippet(build_write_wrapper("x.txt", "\ud800", ws=str(tmp_path)))
@@ -212,15 +197,6 @@ def test_read_file_too_large(tmp_path: Path) -> None:
     assert out["ok"] is False
     assert out["error"] == "file_too_large"
     assert out["size"] == 50
-
-
-def test_list_dir_truncates(tmp_path: Path) -> None:
-    for name in ("a", "b", "c"):
-        (tmp_path / name).write_text("x")
-    out = _run_snippet(build_list_wrapper(".", ws=str(tmp_path), max_entries=2))
-    assert out["ok"] is True
-    assert out["truncated"] is True
-    assert len(out["entries"]) == 2
 
 
 # --- edit_file snippet (TE-9a: exact match + hard CAS) ---
@@ -410,6 +386,26 @@ def _ctx(*, tenant_id: UUID | None = None, agent_key: str = "") -> ToolContext:
     )
 
 
+def _store(
+    files: dict[str, bytes] | None = None, *, error: Exception | None = None
+) -> RecordingWorkspaceStore:
+    """B-84 —— 读走宿主 NAS 之后, read_file / list_dir 的桩是 WorkspaceStore 不是沙箱。
+
+    ``files`` 按**用户根相对**路径给(``agents/<key>/x`` 这种), 因为作用域解析正是
+    被测的东西 —— 桩替它把前缀吃掉就什么都验不出来了。``workspace_reads`` 记的是
+    作用域拼完之后的那条路径, 断言直接查它:那是 store 真正会去 open 的东西。
+    """
+    tree = files or {}
+    return RecordingWorkspaceStore(
+        workspace_files=[
+            WorkspaceFileEntry(path=rel, size=len(data)) for rel, data in sorted(tree.items())
+        ],
+        workspace_file_contents=dict(tree),
+        workspace_file_error=error,
+        workspace_list_error=error,
+    )
+
+
 def _client(
     stdout: str = "", *, exit_code: int = 0, timed_out: bool = False
 ) -> RecordingSandboxRuntime:
@@ -420,17 +416,31 @@ def _client(
     return client
 
 
-async def test_read_file_parses_envelope() -> None:
-    env = {"ok": True, "content": "hi", "content_hash": "abc", "size": 2, "truncated": False}
-    client = _client(json.dumps(env))
-    result = await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+async def test_read_file_returns_content_and_hash() -> None:
+    store = _store({"a.txt": b"hi"})
+    result = await ReadFileTool(store=store).call({"path": "a.txt"}, ctx=_ctx())
     assert result.content == "hi"
-    assert result.meta["content_hash"] == "abc"
+    # 整个文件的 sha256 —— edit_file 的 expected_hash CAS 拿它比对。
+    assert result.meta["content_hash"] == hashlib.sha256(b"hi").hexdigest()
     assert result.meta["size"] == 2
     assert result.meta["path"] == "a.txt"
-    # Executed exactly one snippet, then released the sandbox.
-    assert len(client.execs) == 1
-    assert client.released
+    assert result.meta["truncated"] is False
+
+
+async def test_read_file_truncates_at_the_output_cap() -> None:
+    store = _store({"a.txt": b"x" * 50})
+    result = await ReadFileTool(store=store, output_char_cap=10).call({"path": "a.txt"}, ctx=_ctx())
+    assert result.content == "x" * 10
+    assert result.meta["truncated"] is True
+    # 哈希是**整个文件**的, 不是截断那一截的 —— 截断过的哈希对不上任何东西。
+    assert result.meta["content_hash"] == hashlib.sha256(b"x" * 50).hexdigest()
+    assert result.meta["size"] == 50
+
+
+async def test_read_file_rejects_binary() -> None:
+    store = _store({"a.bin": b"\xff\xfe\x00"})
+    with pytest.raises(FileOpError, match="binary_unsupported"):
+        await ReadFileTool(store=store).call({"path": "a.bin"}, ctx=_ctx())
 
 
 async def test_write_file_parses_envelope() -> None:
@@ -444,65 +454,76 @@ async def test_write_file_parses_envelope() -> None:
 
 
 async def test_list_dir_formats_entries() -> None:
-    env = {
-        "ok": True,
-        "entries": [
-            {"name": "a.txt", "is_dir": False, "size": 3},
-            {"name": "sub", "is_dir": True, "size": None},
-        ],
-    }
-    client = _client(json.dumps(env))
-    result = await ListDirTool(client=client).call({"path": "."}, ctx=_ctx())
+    store = _store({"a.txt": b"abc", "sub/b.txt": b"b"})
+    result = await ListDirTool(store=store).call({"path": "."}, ctx=_ctx())
+    # 渲染与 B-84 之前逐字相同。
     assert "a.txt  (3 bytes)" in result.content
     assert "sub/" in result.content
     assert result.meta["n_entries"] == 2
 
 
 async def test_path_escape_raises_blocked() -> None:
-    client = _client(json.dumps({"ok": False, "error": "path_escapes_workspace"}))
+    """越权是**安全拒绝**(审计记 tool:blocked), 不是模型自己纠得过来的失败。"""
+    store = _store(error=WorkspacePathEscapeError("nope"))
     with pytest.raises(ToolBlockedError):
-        await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+        await ReadFileTool(store=store).call({"path": "a.txt"}, ctx=_ctx())
 
 
-async def test_not_found_raises_fileop() -> None:
-    client = _client(json.dumps({"ok": False, "error": "not_found"}))
-    with pytest.raises(FileOpError, match="not_found"):
-        await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+@pytest.mark.parametrize(
+    ("raised", "kind"),
+    [
+        (WorkspaceFileNotFoundError("x"), "not_found"),
+        (WorkspaceNotAFileError("x"), "is_a_directory"),
+        (WorkspaceNotADirectoryError("x"), "not_a_directory"),
+        (WorkspaceFileTooLargeError("x"), "file_too_large"),
+        # 读不动 != 不存在(W2-BUG-1 的教训)—— 归 io_error, 模型才不会据此
+        # 断定文件没了, 然后把它重打一遍(这正是 B-84 要治的那条路径)。
+        (WorkspacePermissionError("x"), "io_error"),
+        (SandboxSupervisorError("boom"), "io_error"),
+    ],
+)
+async def test_store_errors_keep_the_envelope_vocabulary(raised: Exception, kind: str) -> None:
+    store = _store(error=raised)
+    with pytest.raises(FileOpError, match=kind):
+        await ReadFileTool(store=store).call({"path": "a.txt"}, ctx=_ctx())
 
 
+# 下面四条钉的是 envelope 解析本身。read_file 不再走那条路了(B-84), 但
+# write_file / edit_file / read_document 仍然走 —— 所以断言换到 write_file 上,
+# 覆盖不丢。
 async def test_nonzero_exit_raises_fileop() -> None:
     client = _client("boom", exit_code=1)
     with pytest.raises(FileOpError, match="exit 1"):
-        await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+        await WriteFileTool(client=client).call({"path": "a.txt", "content": "x"}, ctx=_ctx())
 
 
 async def test_timed_out_raises_fileop() -> None:
     client = _client("", timed_out=True)
     with pytest.raises(FileOpError, match="timed out"):
-        await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+        await WriteFileTool(client=client).call({"path": "a.txt", "content": "x"}, ctx=_ctx())
 
 
 async def test_unparseable_stdout_raises_fileop() -> None:
     client = _client("not json at all")
     with pytest.raises(FileOpError, match="unparseable"):
-        await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+        await WriteFileTool(client=client).call({"path": "a.txt", "content": "x"}, ctx=_ctx())
 
 
 async def test_io_error_detail_surfaced() -> None:
     client = _client(json.dumps({"ok": False, "error": "io_error", "detail": "disk full"}))
     with pytest.raises(FileOpError, match=r"io_error \(disk full\)"):
-        await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+        await WriteFileTool(client=client).call({"path": "a.txt", "content": "x"}, ctx=_ctx())
 
 
 async def test_non_object_envelope_raises_fileop() -> None:
     client = _client("42")
     with pytest.raises(FileOpError, match="non-object"):
-        await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=_ctx())
+        await WriteFileTool(client=client).call({"path": "a.txt", "content": "x"}, ctx=_ctx())
 
 
 async def test_empty_dir_formats_empty() -> None:
-    client = _client(json.dumps({"ok": True, "entries": []}))
-    result = await ListDirTool(client=client).call({"path": "sub"}, ctx=_ctx())
+    store = _store()
+    result = await ListDirTool(store=store).call({"path": "sub"}, ctx=_ctx())
     assert result.content == "sub: (empty)"
     assert result.meta["n_entries"] == 0
 
@@ -588,9 +609,8 @@ async def test_edit_expected_hash_threaded_into_snippet() -> None:
     ],
 )
 async def test_require_path_rejects_bad_paths(bad: str) -> None:
-    client = _client(json.dumps({"ok": True, "content": "", "content_hash": "x", "size": 0}))
     with pytest.raises(ValueError, match="path"):
-        await ReadFileTool(client=client).call({"path": bad}, ctx=_ctx())
+        await ReadFileTool(store=_store()).call({"path": bad}, ctx=_ctx())
 
 
 @pytest.mark.parametrize(
@@ -605,10 +625,14 @@ async def test_require_path_rejects_bad_paths(bad: str) -> None:
     ],
 )
 async def test_require_path_folds_workspace_root_prefix(raw: str, expected_rel: str) -> None:
-    client = _client(json.dumps({"ok": True, "content": "", "content_hash": "x", "size": 0}))
-    await ReadFileTool(client=client).call({"path": raw}, ctx=_ctx())
-    code = client.execs[0][1]
-    assert f'"rel": "{expected_rel}"' in code
+    store = _store()
+    if expected_rel == ".":
+        # 折成作用域根 = 一个目录。保住沙箱片段当年的那个 kind。
+        with pytest.raises(FileOpError, match="is_a_directory"):
+            await ReadFileTool(store=store).call({"path": raw}, ctx=_ctx())
+        return
+    await ReadFileTool(store=store).call({"path": raw}, ctx=_ctx())
+    assert store.workspace_reads[-1][2] == expected_rel
 
 
 async def test_write_requires_content_string() -> None:
@@ -618,39 +642,38 @@ async def test_write_requires_content_string() -> None:
 
 
 async def test_list_dir_defaults_to_dot() -> None:
-    client = _client(json.dumps({"ok": True, "entries": []}))
-    await ListDirTool(client=client).call({}, ctx=_ctx())
-    # The snippet's _PARAMS targets the workspace root by default.
-    code = client.execs[0][1]
-    assert '"rel": "."' in code
+    store = _store()
+    await ListDirTool(store=store).call({}, ctx=_ctx())
+    # 未绑 agent 时作用域根就是用户根 —— 记下的路径是空串。
+    assert store.workspace_reads[-1][2] == ""
 
 
 async def test_missing_tenant_blocked() -> None:
-    client = _client(json.dumps({"ok": True, "entries": []}))
     ctx = ToolContext(tenant_id=None, run_id=uuid4(), user_id=uuid4())
     with pytest.raises(ToolBlockedError, match="tenant"):
-        await ListDirTool(client=client).call({"path": "."}, ctx=ctx)
+        await ListDirTool(store=_store()).call({"path": "."}, ctx=ctx)
 
 
-async def test_user_run_passes_user_automatically() -> None:
-    # Durability is automatic: a user-scoped run mounts the user's persistent
-    # workspace volume — no manifest flag involved.
-    client = _client(json.dumps({"ok": True, "content": "", "content_hash": "x", "size": 0}))
+async def test_user_run_reads_that_users_workspace() -> None:
+    store = _store({"a.txt": b"x"})
     ctx = _ctx()
-    await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=ctx)
-    # acquire received the run's user_id (persistent workspace volume).
-    assert client.acquired[0][2] == ctx.user_id
+    await ReadFileTool(store=store).call({"path": "a.txt"}, ctx=ctx)
+    assert store.workspace_reads[-1][:2] == (ctx.tenant_id, ctx.user_id)
 
 
-async def test_user_less_run_omits_user() -> None:
-    client = _client(json.dumps({"ok": True, "content": "", "content_hash": "x", "size": 0}))
+async def test_user_less_run_is_blocked_not_silently_empty() -> None:
+    """B-84 —— 没有用户绑定的 run 在 NAS 上根本没有工作区(它的 /workspace 是沙箱里
+    的临时 tmpfs)。明着拒, 不回落成"读到一棵空树" —— 后者会把"这个 run 没有持久
+    工作区"伪装成"你的文件不在了", 正是这一波要消灭的那句误判。"""
     ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=None)
-    await ReadFileTool(client=client).call({"path": "a.txt"}, ctx=ctx)
-    assert client.acquired[0][2] is None
+    with pytest.raises(ToolBlockedError, match="user binding"):
+        await ReadFileTool(store=_store()).call({"path": "a.txt"}, ctx=ctx)
+    with pytest.raises(ToolBlockedError, match="user binding"):
+        await ListDirTool(store=_store()).call({"path": "."}, ctx=ctx)
 
 
 def test_specs_metadata() -> None:
-    read = ReadFileTool(client=_client()).spec
+    read = ReadFileTool(store=_store()).spec
     assert read.name == "read_file"
     assert read.is_read_only is True
     assert read.resolved_side_effect == "read_only"
@@ -664,7 +687,7 @@ def test_specs_metadata() -> None:
     assert write.idempotent is True
     assert write.path_args == ("path",)
 
-    listing = ListDirTool(client=_client()).spec
+    listing = ListDirTool(store=_store()).spec
     assert listing.is_read_only is True
     assert listing.resolved_side_effect == "read_only"
 
@@ -672,20 +695,25 @@ def test_specs_metadata() -> None:
 # ---------------------------------------------------------------------------
 # B-50 Task 7 —— 文件工具按 agent 分层(Task 14 / PR6 已摘掉迁移期读回落)
 #
-# ``ws`` 是内嵌在片段 ``_PARAMS`` 里的 JSON,所以断言直接查 exec 的源码文本:
-# 这正是沙箱真正会拿到的东西,比断言某个中间变量更接近事实。
+# B-84 —— 读挪到宿主 NAS 之后,断言的对象跟着变:写路径(write/edit)仍然查片段
+# 源码里内嵌的 ``ws``,读路径(read_file / list_dir)查 store 记下的那条**用户根
+# 相对**路径。后者是 store 真正会去 ``open`` 的东西,比任何中间变量都接近事实,
+# 而且它把「作用域前缀拼对了没有」直接摆在断言里 —— 这正是 agent_key 用错(拿
+# agent 名去拼)时唯一会露出来的地方,那种错的失败形态是「目录是空的」不是报错。
 # ---------------------------------------------------------------------------
 
 # 带上尾随逗号:``_PARAMS`` 是 ``json.dumps`` 的产物,``"ws": "/workspace"``
 # 本身是 ``"ws": "/workspace/agents/…"`` 的**子串** —— 不钉逗号的话「断言落在
 # 用户根」这件事恒真,测试看着在咬其实没咬。
 _USER_WS = '"ws": "/workspace",'
-_SHARED_WS = '"ws": "/workspace/shared",'
 #: B-60 —— 绑了 agent 时 ``ws`` 不再拼 ``agents/<key>``,片段看的就是视图根。值与
 #: ``_USER_WS`` 恰好相同(视图对绑没绑都是 ``/workspace``),但断言意图不同 ——
 #: 这个名字标的是「绑了 agent 的调用现在也落在这里」,别跟「未绑 agent 走用户根」
 #: 混为一谈。
 _VIEW_WS = '"ws": "/workspace",'
+#: 宿主侧作用域前缀 —— NAS 上的目录名是 ``agent_key``(净化后的名字 + 原名
+#: sha256 的前 8 位),**不是 agent 名**。
+_AGENT_KEY = "plan-aaaaaaaa"
 
 
 class _SequenceRuntime(RecordingSandboxRuntime):
@@ -718,21 +746,25 @@ _NOT_FOUND = json.dumps({"ok": False, "error": "not_found"})
 
 
 async def test_read_file_resolves_under_agent_root() -> None:
-    """B-60 —— 「agent 根」现在就是视图根:绑了 agent 时 ``ws`` 是 ``/workspace``,
-    不再拼 ``agents/<key>``(默认视图里只有你自己的目录,靠命名空间实现)。"""
-    client = _client(json.dumps({"ok": True, "content": "hi"}))
-    await ReadFileTool(client=client).call(
-        {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    """B-84 —— 宿主侧:绑了 agent 的读落在 ``agents/<agent_key>/`` 下。
+
+    断言写全路径而不是「以它开头」:后者在实现把前缀拼成 ``agents/agents/<key>``
+    之类的时候照样为真。
+    """
+    store = _store({f"agents/{_AGENT_KEY}/MEMORY.md": b"hi"})
+    result = await ReadFileTool(store=store).call(
+        {"path": "MEMORY.md"}, ctx=_ctx(agent_key=_AGENT_KEY)
     )
-    assert _VIEW_WS in client.execs[-1][1]
+    assert result.content == "hi"
+    assert store.workspace_reads[-1][2] == f"agents/{_AGENT_KEY}/MEMORY.md"
 
 
 async def test_read_file_without_agent_key_stays_at_user_root() -> None:
     """未绑 agent(空串)= B-50 之前的行为,一字不改。"""
-    client = _client(json.dumps({"ok": True, "content": "hi"}))
-    await ReadFileTool(client=client).call({"path": "MEMORY.md"}, ctx=_ctx())
-    assert _USER_WS in client.execs[-1][1]
-    assert len(client.execs) == 1
+    store = _store({"MEMORY.md": b"hi"})
+    result = await ReadFileTool(store=store).call({"path": "MEMORY.md"}, ctx=_ctx())
+    assert result.content == "hi"
+    assert store.workspace_reads[-1][2] == "MEMORY.md"
 
 
 async def test_write_file_never_falls_back() -> None:
@@ -758,65 +790,58 @@ async def test_edit_file_never_falls_back() -> None:
     assert _VIEW_WS in client.execs[0][1]
 
 
-async def test_read_file_never_reaches_the_user_root(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_read_file_never_reaches_the_user_root() -> None:
     """PR6 —— agent 根下 ``not_found`` 就是 ``not_found``,**不许再去用户根捞一次**。
 
-    桩里第二个 outcome 是「用户根上有这个文件」。回落还在的话它会被读到并让这条
-    测试变绿 —— 所以这条同时钉住「只跑一次 exec」和「报错而不是拿到 legacy 内容」,
-    两个断言少一个都拦不住回落被悄悄加回来。
+    桩里用户根上**有**同名文件(``MEMORY.md`` 那条),agent 根下没有。回落还在的
+    话这条会拿到 ``user root``、变绿 —— 所以断言是「抛错」而不是「内容不对」:
+    后者在实现返回空串时也为真。
 
     摘掉回落之后**用户根上剩下的恰恰是别的 agent 的历史文件**,那一跳就是纯粹的
     跨 agent 读洞。
     """
-    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "legacy"})])
-    with pytest.raises(FileOpError):
-        await ReadFileTool(client=client).call(
-            {"path": "MEMORY.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
-        )
-    assert len(client.execs) == 1, "回落被加回来了:多跑了一次 exec"
-    assert _VIEW_WS in client.execs[0][1]
+    store = _store({"MEMORY.md": b"user root"})
+    with pytest.raises(FileOpError, match="not_found"):
+        await ReadFileTool(store=store).call({"path": "MEMORY.md"}, ctx=_ctx(agent_key=_AGENT_KEY))
+    assert store.workspace_reads[-1][2] == f"agents/{_AGENT_KEY}/MEMORY.md"
 
 
 async def test_list_dir_never_reaches_the_user_root() -> None:
-    """同上,列目录这条路也不许回落。"""
-    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "entries": [{"name": "x"}]})])
-    with pytest.raises(FileOpError):
-        await ListDirTool(client=client).call({"path": "."}, ctx=_ctx(agent_key="plan-aaaaaaaa"))
-    assert len(client.execs) == 1, "回落被加回来了:多跑了一次 exec"
+    """同上,列目录这条路也不许回落:用户根上的 ``x.txt`` 不许出现在 agent 的列表里。"""
+    store = _store({"x.txt": b"user root"})
+    result = await ListDirTool(store=store).call({"path": "."}, ctx=_ctx(agent_key=_AGENT_KEY))
+    assert result.meta["n_entries"] == 0
+    assert store.workspace_reads[-1][2] == f"agents/{_AGENT_KEY}"
 
 
 async def test_read_file_without_agent_key_reads_the_user_root_directly() -> None:
     """未绑 agent 的读**本来就**落用户根 —— 那是作用域本身,不是回落。
 
     这条与上面两条的区别正是 PR6 要保住的边界:没有 agent 身份时用户根就是
-    唯一的根,一次 exec;有 agent 身份时用户根**不可达**。
+    唯一的根;有 agent 身份时用户根**不可达**。
     """
-    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "x"})])
-    with pytest.raises(FileOpError):
-        await ReadFileTool(client=client).call({"path": "MEMORY.md"}, ctx=_ctx())
-    assert len(client.execs) == 1
-    assert _USER_WS in client.execs[0][1]
+    store = _store({"MEMORY.md": b"user root"})
+    result = await ReadFileTool(store=store).call({"path": "MEMORY.md"}, ctx=_ctx())
+    assert result.content == "user root"
 
 
 async def test_shared_prefix_reads_shared_root() -> None:
-    client = _client(json.dumps({"ok": True, "content": "x"}))
-    await ReadFileTool(client=client).call(
-        {"path": "shared:style/PLAN_STYLE.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    store = _store({"shared/style/PLAN_STYLE.md": b"legacy"})
+    result = await ReadFileTool(store=store).call(
+        {"path": "shared:style/PLAN_STYLE.md"}, ctx=_ctx(agent_key=_AGENT_KEY)
     )
-    assert _SHARED_WS in client.execs[-1][1]
+    assert result.content == "legacy"
+    assert store.workspace_reads[-1][2] == "shared/style/PLAN_STYLE.md"
 
 
 async def test_shared_prefix_does_not_fall_back() -> None:
-    """``shared:`` 是显式寻址;读不到就是读不到。
-
-    PR6 摘掉回落之后这条仍然保留 —— 它钉的是「显式寻址不许被改写」,与回落
-    在不在是两件事;而且回落一旦被加回来,第一个受害的就是这条路径。"""
-    client = _SequenceRuntime([_NOT_FOUND, json.dumps({"ok": True, "content": "wrong"})])
-    with pytest.raises(FileOpError):
-        await ReadFileTool(client=client).call(
-            {"path": "shared:x.md"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
+    """``shared:`` 是显式寻址;读不到就是读不到 —— 不许改写成 agent 根下的同名文件。"""
+    store = _store({f"agents/{_AGENT_KEY}/x.md": b"wrong"})
+    with pytest.raises(FileOpError, match="not_found"):
+        await ReadFileTool(store=store).call(
+            {"path": "shared:x.md"}, ctx=_ctx(agent_key=_AGENT_KEY)
         )
-    assert len(client.execs) == 1
+    assert store.workspace_reads[-1][2] == "shared/x.md"
 
 
 async def test_write_to_shared_is_refused() -> None:
@@ -828,22 +853,22 @@ async def test_write_to_shared_is_refused() -> None:
 
 async def test_absolute_agent_path_folds_to_relative() -> None:
     """模型会照抄 ``list_dir`` 的输出回传绝对路径 —— 折掉自己那一段,别退回去。"""
-    client = _client(json.dumps({"ok": True, "content": "hi"}))
-    await ReadFileTool(client=client).call(
-        {"path": "/workspace/agents/plan-aaaaaaaa/MEMORY.md"},
-        ctx=_ctx(agent_key="plan-aaaaaaaa"),
+    store = _store({f"agents/{_AGENT_KEY}/MEMORY.md": b"hi"})
+    result = await ReadFileTool(store=store).call(
+        {"path": f"/workspace/agents/{_AGENT_KEY}/MEMORY.md"},
+        ctx=_ctx(agent_key=_AGENT_KEY),
     )
-    code = client.execs[-1][1]
-    assert _VIEW_WS in code
-    assert '"rel": "MEMORY.md"' in code
+    assert result.content == "hi"
+    # 折了一次就够 —— 没折的话会变成 agents/<key>/agents/<key>/MEMORY.md。
+    assert store.workspace_reads[-1][2] == f"agents/{_AGENT_KEY}/MEMORY.md"
 
 
 async def test_another_agents_absolute_path_is_not_folded() -> None:
     """只折自己那一段。别人的 key 折掉就等于把跨 agent 读装成了合法调用。"""
     with pytest.raises(ValueError, match="relative"):
-        await ReadFileTool(client=_client()).call(
+        await ReadFileTool(store=_store()).call(
             {"path": "/workspace/agents/sop-bbbbbbbb/MEMORY.md"},
-            ctx=_ctx(agent_key="plan-aaaaaaaa"),
+            ctx=_ctx(agent_key=_AGENT_KEY),
         )
 
 
@@ -852,15 +877,14 @@ async def test_bare_shared_segment_is_reserved_when_bound(path: str) -> None:
     """视图里 /workspace/shared 是只读 bind;裸 shared/… 写会 EROFS、读会读到别的东西。
     拒掉并指向 shared: 前缀,而不是静默 io_error。"""
     with pytest.raises(ValueError, match="shared:"):
-        await ReadFileTool(client=_client()).call(
-            {"path": path}, ctx=_ctx(agent_key="plan-aaaaaaaa")
-        )
+        await ReadFileTool(store=_store()).call({"path": path}, ctx=_ctx(agent_key=_AGENT_KEY))
 
 
 async def test_bare_shared_segment_is_plain_when_unbound() -> None:
-    client = _client(json.dumps({"ok": True, "content": "", "content_hash": "x", "size": 0}))
-    await ReadFileTool(client=client).call({"path": "shared/x.md"}, ctx=_ctx())
-    assert '"rel": "shared/x.md"' in client.execs[-1][1]
+    store = _store({"shared/x.md": b"plain"})
+    result = await ReadFileTool(store=store).call({"path": "shared/x.md"}, ctx=_ctx())
+    assert result.content == "plain"
+    assert store.workspace_reads[-1][2] == "shared/x.md"
 
 
 async def test_projection_writer_targets_the_exec_view() -> None:
@@ -904,3 +928,89 @@ def test_locate_rejects_a_directory(tmp_path: Path) -> None:
 def test_locate_escape_is_blocked(tmp_path: Path) -> None:
     env = _run_snippet(build_artifact_locate_wrapper("../../etc/passwd", ws=str(tmp_path)))
     assert env == {"ok": False, "error": "path_escapes_workspace"}
+
+
+# ---------------------------------------------------------------------------
+# B-84 Task 5 —— search_files 工具层
+# ---------------------------------------------------------------------------
+
+
+async def test_search_files_renders_hits() -> None:
+    store = _store(
+        {
+            f"agents/{_AGENT_KEY}/style/render_plan.py": b"def render(plan): ...",
+            f"agents/{_AGENT_KEY}/notes.md": b"nothing here",
+        }
+    )
+    result = await SearchFilesTool(store=store).call(
+        {"name_glob": "*.py"}, ctx=_ctx(agent_key=_AGENT_KEY)
+    )
+    assert "style/render_plan.py" in result.content
+    assert result.meta["paths"] == ["style/render_plan.py"]
+    assert result.meta["n_results"] == 1
+    assert result.meta["truncated"] is False
+
+
+async def test_search_files_says_so_when_nothing_matches() -> None:
+    """空结果要说人话 —— 一个空串会被模型读成"工具坏了"。"""
+    result = await SearchFilesTool(store=_store({"a.txt": b"x"})).call(
+        {"name_glob": "*.py"}, ctx=_ctx()
+    )
+    assert result.content == "(no matching files)"
+    assert result.meta["n_results"] == 0
+
+
+async def test_search_files_marks_truncation_in_the_text() -> None:
+    """截断时**明说还有**, 不静悄悄少几行:被悄悄截断的列表会被读成"就这些了"。"""
+    store = _store({f"f{i}.txt": b"needle" for i in range(5)})
+    result = await SearchFilesTool(store=store, max_results=2).call(
+        {"content": "needle"}, ctx=_ctx()
+    )
+    assert result.meta["truncated"] is True
+    assert "more matches not listed" in result.content
+
+
+async def test_search_files_requires_a_term() -> None:
+    with pytest.raises(ValueError, match="name_glob"):
+        await SearchFilesTool(store=_store()).call({}, ctx=_ctx())
+
+
+async def test_search_files_treats_an_empty_term_as_absent() -> None:
+    """``name_glob=""`` 谁也匹配不上 —— 当成真条件会让一次手滑静悄悄回零结果。"""
+    with pytest.raises(ValueError, match="name_glob"):
+        await SearchFilesTool(store=_store()).call({"name_glob": "  "}, ctx=_ctx())
+
+
+async def test_search_files_rejects_a_non_string_term() -> None:
+    with pytest.raises(ValueError, match="content"):
+        await SearchFilesTool(store=_store()).call({"content": 42}, ctx=_ctx())
+
+
+async def test_search_files_stays_in_the_agent_scope() -> None:
+    """别的 agent 与 shared 下的同名文件一条都不许出现。"""
+    store = _store(
+        {
+            f"agents/{_AGENT_KEY}/x.py": b"mine",
+            "agents/other-bbbbbbbb/x.py": b"theirs",
+            "shared/x.py": b"legacy",
+        }
+    )
+    result = await SearchFilesTool(store=store).call(
+        {"name_glob": "x.py"}, ctx=_ctx(agent_key=_AGENT_KEY)
+    )
+    assert result.meta["paths"] == ["x.py"]
+
+
+async def test_search_files_needs_a_user_binding() -> None:
+    ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=None)
+    with pytest.raises(ToolBlockedError, match="user binding"):
+        await SearchFilesTool(store=_store()).call({"name_glob": "*"}, ctx=ctx)
+
+
+def test_search_files_spec_tells_the_model_how_it_differs_from_list_dir() -> None:
+    spec = SearchFilesTool(store=_store()).spec
+    assert spec.name == "search_files"
+    assert spec.is_read_only is True
+    assert spec.resolved_side_effect == "read_only"
+    # 分工写进描述里 —— 描述是给模型读的, 不写清楚它就会拿 list_dir 当搜索用。
+    assert "list_dir" in spec.description

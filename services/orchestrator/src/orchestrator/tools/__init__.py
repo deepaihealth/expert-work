@@ -40,6 +40,9 @@ from orchestrator.tools.file_ops import (
     ReadFileTool as ReadFileTool,
 )
 from orchestrator.tools.file_ops import (
+    SearchFilesTool as SearchFilesTool,
+)
+from orchestrator.tools.file_ops import (
     WriteFileTool as WriteFileTool,
 )
 from orchestrator.tools.find_tools import (
@@ -291,6 +294,7 @@ __all__ = [
     "SandboxSupervisorError",
     "SaveArtifactTool",
     "SearXNGClient",
+    "SearchFilesTool",
     "StdioMCPClient",
     "SubAgentTool",
     "SupervisorWorkspaceStore",

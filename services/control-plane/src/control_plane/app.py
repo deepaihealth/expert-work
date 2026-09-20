@@ -1725,6 +1725,10 @@ def create_app(
                     artifact_store=resolved_artifact_store,
                     knowledge_retriever=knowledge_retriever,
                     image_resolver=image_resolver,
+                    # B-84 —— 只读文件工具(read_file / list_dir / search_files)
+                    # 直读 control-plane 自己挂着的 NAS,不起沙箱。与工作区端点
+                    # 共用同一个 store 实例,不另造一份。
+                    workspace_store=resolved_workspace_store,
                     # Stream TE-8 — cross-replica per-workspace write lock for
                     # write_file / bash. A raw (non-RLS) sessionmaker: the
                     # advisory lock touches no tenant tables.

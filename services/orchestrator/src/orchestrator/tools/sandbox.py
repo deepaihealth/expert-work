@@ -247,6 +247,46 @@ class WorkspaceFileTooLargeError(SandboxSupervisorError):
     """
 
 
+class WorkspacePathEscapeError(SandboxSupervisorError):
+    """路径本身不合法 —— 绝对路径、带 ``..``、带 NUL、或者踩了布局保留段(B-84)。
+
+    与"不存在"必须分开,理由和 :class:`WorkspacePermissionError` 同款,但方向相
+    反:这一类是**安全拒绝**,不是操作失败。``file_ops`` 把它翻成
+    :class:`~orchestrator.tools.registry.ToolBlockedError`(审计记 ``tool:blocked``),
+    而"文件不存在"翻成模型自己纠得过来的 ``FileOpError``。合并成一个之后,一次
+    真实的越权尝试会被记成一次普通的找不到文件。
+
+    仍是 :class:`SandboxSupervisorError` 的子类,既有的宽 ``except`` 不受影响。
+    """
+
+
+class WorkspaceFileNotFoundError(SandboxSupervisorError):
+    """工作区里确实没有这个文件或目录(B-84)。
+
+    存在的理由是它的**反面**:不打这个类型,调用方就只能拿消息文本去猜"这次失败
+    到底是不存在,还是读不动 / 越权 / 基础设施坏了"。B-84 PR-1 刚修完的正是同一
+    件事的另一半 —— 沙箱创建 504 被分类成 unknown,模型据此断定文件不存在,然后
+    把 21,173 个字符重打了一遍。
+
+    仍是 :class:`SandboxSupervisorError` 的子类:``/v1/workspace/file`` 一类只接基
+    类的端点照旧翻 404,不受影响。
+    """
+
+
+class WorkspaceNotAFileError(SandboxSupervisorError):
+    """路径指到的是目录, 不是文件(B-84)。
+
+    与 :class:`WorkspaceFileNotFoundError` 分开, 因为模型的下一步动作不同:一个是
+    "换个路径", 另一个是"改用 ``list_dir``"。沙箱片段一直把这两件事分成
+    ``is_a_directory`` 与 ``not_found`` 两种 envelope, 宿主侧接管之后必须原样保住
+    —— 「对模型可见的语义一个字不变」。
+    """
+
+
+class WorkspaceNotADirectoryError(SandboxSupervisorError):
+    """路径指到的是文件, 不是目录(B-84)。:class:`WorkspaceNotAFileError` 的反面。"""
+
+
 class WorkspaceQuotaExceededError(SandboxSupervisorError):
     """用户工作区已到配额上限(沙箱迁移波 3 spec § 3.3 闸 A/B)。
 

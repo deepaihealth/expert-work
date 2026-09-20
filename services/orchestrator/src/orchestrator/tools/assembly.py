@@ -45,6 +45,7 @@ from orchestrator.tools.file_ops import (
     EditFileTool,
     ListDirTool,
     ReadFileTool,
+    SearchFilesTool,
     WriteFileTool,
 )
 from orchestrator.tools.find_tools import FindToolsTool
@@ -60,6 +61,7 @@ from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerBuildFn
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH, ChildAgentBuilder, SubAgentTool
 from orchestrator.tools.vision import AskImageTool
 from orchestrator.tools.web_search import DEFAULT_MAX_RESULTS, TavilyClient, WebSearchTool
+from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.trajectory import TrajectoryRecorder
 
 if TYPE_CHECKING:
@@ -81,6 +83,7 @@ KNOWN_BUILTINS = frozenset(
         "write_file",
         "edit_file",
         "list_dir",
+        "search_files",
         "read_document",
         "save_artifact",
         "list_artifacts",
@@ -150,6 +153,12 @@ class ToolEnv:
     platform_mcp_pool: MCPServerPool | None = None
     #: Sandbox runtime backing the ``exec_python`` builtin (F.4).
     sandbox_runtime: SandboxRuntime | None = None
+    #: B-84 —— 只读文件工具(``read_file`` / ``list_dir`` / ``search_files``)的后端。
+    #: 它们走 control-plane 自己挂着的 NAS, **不起沙箱** —— 实测 60 天 ``list_dir``
+    #: 失败率 11%(22/207), 每一次都是沙箱创建失败, 而一次失败的探测会让模型断定
+    #: 文件不存在然后重打一遍。``None`` = 这个部署没接工作区存储:与
+    #: ``sandbox_runtime is None`` 同款处置(显式声明报错, 基础能力静默跳过)。
+    workspace_store: WorkspaceStore | None = None
     #: Artifact registry backing the ``save_artifact`` / ``list_artifacts``
     #: builtins (Stream J.9).
     artifact_store: ArtifactStore | None = None
@@ -516,7 +525,7 @@ def _register_builtin(
         _register_exec_python(registry, env, skill_seed_files)
     elif entry.name == "bash":
         _register_bash(registry, env, skill_seed_files)
-    elif entry.name in ("read_file", "write_file", "edit_file", "list_dir"):
+    elif entry.name in _FILE_OP_BUILTINS:
         _register_file_op(registry, entry.name, env, skill_seed_files)
     elif entry.name == "read_document":
         _register_read_document(registry, env, skill_seed_files)
@@ -561,10 +570,17 @@ BASE_CAPABILITY_BUILTINS: tuple[str, ...] = (
     "write_file",
     "edit_file",
     "list_dir",
+    "search_files",
     "read_document",
     "save_artifact",
     "list_artifacts",
 )
+
+#: B-84 —— 只读文件工具:走宿主 NAS(``ToolEnv.workspace_store``), 不起沙箱。
+_HOST_READ_TOOLS: frozenset[str] = frozenset({"read_file", "list_dir", "search_files"})
+
+#: 文件族全体 —— 读三件走 store, 写两件走沙箱。
+_FILE_OP_BUILTINS: frozenset[str] = _HOST_READ_TOOLS | {"write_file", "edit_file"}
 
 
 def _register_base_capabilities(
@@ -595,6 +611,10 @@ def _register_base_capabilities(
             # 所以没有沙箱通道它注册了也只会造出下载 404 的死产物。
             # ``list_artifacts`` 只读库,不受影响。
             if name == "save_artifact" and env.sandbox_runtime is None:
+                continue
+        elif name in _HOST_READ_TOOLS:
+            # B-84 —— 这三件的依赖是工作区存储, 不是沙箱。
+            if env.workspace_store is None:
                 continue
         elif env.sandbox_runtime is None:
             continue
@@ -654,21 +674,30 @@ def _register_file_op(
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
 ) -> None:
-    # Stream TE-7 — read_file / write_file / list_dir ride the same sandbox
-    # runtime exec channel as bash / exec_python (TE-ADR-2 exec-warm locus).
+    # Stream TE-7 — write_file / edit_file ride the sandbox runtime exec channel
+    # as bash / exec_python do (TE-ADR-2 exec-warm locus).
+    #
+    # B-84 —— 只读那三件(read_file / list_dir / search_files)**不再**走沙箱:它们
+    # 直读 control-plane 自己挂着的 NAS。依赖因此按工具分叉, 不是整族一个判据。
+    if name in _HOST_READ_TOOLS:
+        if env.workspace_store is None:
+            raise AgentFactoryError(
+                f"builtin {name!r} declared but no workspace store "
+                "is configured (ToolEnv.workspace_store)"
+            )
+        if name == "read_file":
+            registry.register(ReadFileTool(store=env.workspace_store))
+        elif name == "list_dir":
+            registry.register(ListDirTool(store=env.workspace_store))
+        else:
+            registry.register(SearchFilesTool(store=env.workspace_store))
+        return
     if env.sandbox_runtime is None:
         raise AgentFactoryError(
             f"builtin {name!r} declared but no sandbox runtime "
             "is configured (ToolEnv.sandbox_runtime)"
         )
-    if name == "read_file":
-        registry.register(
-            ReadFileTool(
-                client=env.sandbox_runtime,
-                skill_seed_files=skill_seed_files,
-            )
-        )
-    elif name == "write_file":
+    if name == "write_file":
         registry.register(
             WriteFileTool(
                 client=env.sandbox_runtime,
@@ -676,18 +705,11 @@ def _register_file_op(
                 skill_seed_files=skill_seed_files,
             )
         )
-    elif name == "edit_file":
+    else:  # edit_file
         registry.register(
             EditFileTool(
                 client=env.sandbox_runtime,
                 workspace_lock=env.workspace_lock,
-                skill_seed_files=skill_seed_files,
-            )
-        )
-    else:  # list_dir
-        registry.register(
-            ListDirTool(
-                client=env.sandbox_runtime,
                 skill_seed_files=skill_seed_files,
             )
         )

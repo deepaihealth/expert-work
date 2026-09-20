@@ -1759,6 +1759,7 @@ def build_tool_env(
     knowledge_retriever: KnowledgeRetriever | None = None,
     image_resolver: ImageResolver | None = None,
     workspace_lock: WorkspaceLock | None = None,
+    workspace_store: WorkspaceStore | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -1768,6 +1769,11 @@ def build_tool_env(
     backing ``save_artifact`` / ``list_artifacts``, the J.5 knowledge
     retriever backing ``knowledge_search``, and the J.6 image resolver
     backing multimodal input.
+
+    B-84 —— ``workspace_store`` 是只读文件工具(``read_file`` / ``list_dir`` /
+    ``search_files``)的后端:它们直读 control-plane 自己挂着的 NAS,不起沙箱。
+    传进来的必须是 ``build_workspace_store`` 给工作区端点的**同一个实例**,不另造
+    一份 —— 两份实例就是两份可能漂移的 root 配置。
     """
     return ToolEnv(
         allowlist_provider=_tenant_allowlist_provider(tenant_config_service),
@@ -1779,6 +1785,7 @@ def build_tool_env(
         knowledge_retriever=knowledge_retriever,
         image_resolver=image_resolver,
         workspace_lock=workspace_lock or NullWorkspaceLock(),
+        workspace_store=workspace_store,
     )
 
 
