@@ -103,8 +103,25 @@ spec:
           #   public  crpi-….personal.cr.aliyuncs.com        112s   5.8 MB/s
           #   VPC     crpi-…-vpc.personal.cr.aliyuncs.com     66s   18-23 MB/s
           #
-          # (Latest run 2026-09-19: kubelet reported "Successfully pulled …
-          # in 1m6.19s" for the 619MB image over the -vpc host.)
+          # (2026-09-19: kubelet reported "Successfully pulled … in 1m6.19s"
+          # for the 619MB image over the -vpc host.)
+          #
+          # 2026-09-20 重钉 `621249f6` → `7ac31957` 之后在同一个集群实测:
+          #
+          #   压缩层合计   619.4 MiB → 433.7 MiB   (−30.0%)
+          #   kubelet 拉取  66.19s    → 40.55s      (−38.7%,每次冷建省 25.6s)
+          #
+          # (kubelet 原文:`Successfully pulled … in 40.548s`,`Image size:
+          # 454814156 bytes` —— 与 manifest 的压缩层合计逐字节对上。)
+          #
+          # 瘦身来自两处,都在 `infra/sandbox-image/Dockerfile` 里:apt 装的
+          # ffmpeg 换成 `imageio-ffmpeg` wheel 里的静态二进制(它的依赖闭包
+          # 145 个包 / 387 MB,含 libllvm19 127 MB 和 mesa —— 在一个无显示
+          # 的容器里),以及删掉 npm(832 次真实 run 里 0 次成功安装,出网代理
+          # 挡 npm registry)。apt 包数 786 → 282,安装体积 1263 MB → 742 MiB。
+          #
+          # 上面那两行 MB/s 是**线速**;kubelet 报的秒数含解压落盘,所以端到端
+          # 折算下来只有 ~11 MB/s,别拿两者互相验算。
           #
           # Why only here: everything else in the repo is pulled at deploy
           # time, once, by a rollout that is already waiting on other things.
@@ -115,7 +132,7 @@ spec:
           #
           # Rolling back is a one-line edit to the public host, and it needs
           # no credential change — the Secret carries both hosts (see above).
-          image: crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:621249f6
+          image: crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:7ac31957
           imagePullPolicy: IfNotPresent
           # See the ENTRYPOINT note in this file's header.
           command:
