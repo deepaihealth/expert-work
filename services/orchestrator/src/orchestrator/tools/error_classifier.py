@@ -253,7 +253,12 @@ def _is_retryable(error_class: ToolErrorClass, spec: ToolSpec | None) -> bool:
 #: from scratch. Measured cost of exactly that inference on the test
 #: environment: 14 re-typings of a file the same user already had, 293,012
 #: characters, about 6,002 seconds of wall clock over 60 days.
-_EXISTENCE_UNKNOWN = (
+#:
+#: B-84 PR-2 —— 改成公开名。系统提示词里的工作区快照块
+#: (:mod:`orchestrator.tools.workspace_tree`)是这句话的**第二个落点**:模型在提示词
+#: 里和在错误消息里都该读到同一条规矩。两处引用同一个常量, 就结构上不可能各说各的 ——
+#: 抄一份措辞过去的话, 改其中一处时另一处不会跟着动。
+EXISTENCE_UNKNOWN = (
     "This says NOTHING about whether the target exists — the call never got "
     "far enough to look. Do not treat it as absent and do not recreate it "
     "from scratch; confirm with a separate read once the tool works again."
@@ -278,7 +283,7 @@ _ADVICE: dict[ToolErrorClass, str] = {
     ),
     "permission_denied": (
         "Permission was denied. Do not brute-force retry; surface this to "
-        "the user. " + _EXISTENCE_UNKNOWN
+        "the user. " + EXISTENCE_UNKNOWN
     ),
     "mutation_not_landed": (
         "This mutation did NOT land — do not assume the target has the "
@@ -286,18 +291,18 @@ _ADVICE: dict[ToolErrorClass, str] = {
     ),
     "unknown": (
         "This failed for an unclear reason. Inspect the error and consider "
-        "an alternative approach; avoid retrying the identical call. " + _EXISTENCE_UNKNOWN
+        "an alternative approach; avoid retrying the identical call. " + EXISTENCE_UNKNOWN
     ),
 }
 
 _TRANSIENT_RETRYABLE = (
     "A transient failure. This tool is safe to retry once; if it keeps "
-    "failing, surface the failure to the user. " + _EXISTENCE_UNKNOWN
+    "failing, surface the failure to the user. " + EXISTENCE_UNKNOWN
 )
 _TRANSIENT_UNSAFE = (
     "A transient failure, but this tool is not safe to blindly replay "
     "(not read-only or idempotent). Verify the current state before "
-    "retrying. " + _EXISTENCE_UNKNOWN
+    "retrying. " + EXISTENCE_UNKNOWN
 )
 
 

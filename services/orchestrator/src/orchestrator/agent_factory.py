@@ -1146,6 +1146,10 @@ async def build_agent(
         tool_output_budget_enabled=tool_budget_enabled,
         pre_compaction_flush=pre_compaction_flush,
         workspace_writer_factory=workspace_writer_factory,
+        # B-84 PR-2 —— 宿主侧工作区读。同一个 store 既是 read_file / list_dir /
+        # search_files 的依赖, 也是每轮那段工作区快照的取数口 —— 块里列的与模型
+        # ``list_dir .`` 看到的因此是同一棵树。``None``(没接 NAS 的单测)→ 不注入。
+        workspace_store=env.workspace_store,
         workspace_ingest_node=workspace_ingest_node,
         inputs_node=inputs_node,
         # B-67 §七 —— 手抄守卫的提示只对 trusted 变量写链接名。
