@@ -35,6 +35,29 @@ class ObjectNotFoundError(ObjectStoreError):
     """Raised by ``get`` / ``delete`` when the key does not exist."""
 
 
+class ObjectLockNotHonouredError(ObjectStoreError):
+    """PUT 成功了,但后端**没有**真的加上请求的合规锁。
+
+    2026-09-19 实测(阿里云 OSS 的 S3 兼容层,``expert-work-test`` 桶):
+
+    * ``put_object`` 带 ``ObjectLockMode=COMPLIANCE`` +
+      ``ObjectLockRetainUntilDate`` —— **返回成功**,而这个桶根本没开
+      Object Lock。真 S3 / MinIO 在这种情况下报 ``InvalidRequest``。
+    * 紧接着 ``head_object`` 回读:``ObjectLockMode=None``,
+      ``ObjectLockRetainUntilDate=None`` —— 参数没被存下来。
+    * 立刻 ``delete_object`` —— **删掉了**。锁不存在。
+
+    也就是说 OSS 把锁参数**静默吞掉**了。这比报错坏得多:D.1c 的审计 WORM
+    备份 worker 把「写进去了」当成「已受保护」,于是把 ``backup_acked`` 置 true,
+    而那正是留存清理 job 删掉库里审计行的**许可证**。一条静默失败的锁,换来的是
+    「照着一张假许可证删审计数据」。
+
+    所以这一条不是措辞问题,是**类型**:调用方要的是「这份数据从此不可删」这个
+    保证,后端给不了就必须说出来。:class:`ObjectStoreError` 的宽 except 照常接得住,
+    需要分辨的调用方按类型判。
+    """
+
+
 class ObjectLockedError(ObjectStoreError):
     """In-memory signal that a put hit a still-retained compliance lock.
 
