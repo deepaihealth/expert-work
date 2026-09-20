@@ -93,7 +93,8 @@ libraries on top and `COPY`d those same assets from here. So:
   `tools/bash.py`, `tools/file_ops.py`, `graph_builder/workspace_ingest.py`, and the
   recording fakes.
 - **CI**: `.github/workflows/sandbox-image-office.yml` deleted;
-  `sandbox-image.yml` becomes the single full-image build (multi-arch amd64+arm64,
+  `sandbox-image.yml` becomes the single full-image build (multi-arch amd64+arm64
+  at the time — arm64 was dropped 2026-09-20, see the workflow's `platforms` comment;
   CRITICAL-only Trivy gate since it now carries LibreOffice/ffmpeg/Node);
   `sandbox-image-cve-weekly.yml` reduced to the one image.
 - **Makefile**: `build-sandbox-office` removed; `build-sandbox` builds the one

@@ -7,10 +7,14 @@
 ## 镜像从哪来
 
 - CI 自动构建:push 到 main 且触及 `infra/sandbox-image/**`（或 workflow 文件本身）
-  → `.github/workflows/sandbox-image.yml` 构建多架构镜像推 ACR,
+  → `.github/workflows/sandbox-image.yml` 构建 **linux/amd64** 镜像推 ACR,
   tag = `<完整 sha>` / `<sha8>` / `latest`。
+  (2026-09-20 起只建 amd64,arm64 已删 —— 两个 ACS 集群的节点全是 amd64,
+  本地开发走 `make build-sandbox` 在本机建,ACR 上那半边从来没人拉。)
 - 手动兜底:workflow_dispatch 触发同一 workflow。
-- 构建约 30 分钟;workflow 有并发组,多次 push 串行排队。
+- 构建耗时:缓存命中约 15 分钟;**改了 `Dockerfile` 的 apt 包列表那一次必然全冷建**,
+  约 54 分钟(job 建两次 —— 一次 load 给 smoke/Trivy,一次 push)。workflow 有
+  并发组,多次 push 串行排队。
 
 ## 发布步骤
 
