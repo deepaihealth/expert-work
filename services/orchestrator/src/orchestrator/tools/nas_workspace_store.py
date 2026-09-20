@@ -154,6 +154,7 @@ import logging
 import os
 import shutil
 import stat
+from collections.abc import Generator
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -190,8 +191,6 @@ from orchestrator.tools.workspace_store import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
     # Only used for the ``runtime``/``instance_store`` fields' types — wave 2
     # Task 4 wires them up (mark_deleted tearing down a warm sandbox
     # session). Deferred behind TYPE_CHECKING so this module never needs a
@@ -387,7 +386,7 @@ def _walk_and_match(
     # ``cast`` —— typeshed 把 ``os.fwalk`` 标成 ``Iterator``, 而 CPython 给的是
     # 生成器(它有 ``close``, 这正是这里要的东西)。
     walker = cast(
-        "Generator[tuple[str, list[str], list[str], int], None, None]",
+        Generator[tuple[str, list[str], list[str], int], None, None],
         os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_error),
     )
     with closing(walker):
