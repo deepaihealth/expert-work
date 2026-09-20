@@ -222,6 +222,26 @@ class AgentState(TypedDict):
     #: decomposition (already deep-thought by the planner) never re-fires.
     last_plan_goal: NotRequired[str | None]
     tool_failures: NotRequired[list[ClassifiedToolError]]
+    #: B-85 ③ —— 最近一批工具调用里**未解决的**失败(只留非 transient)。
+    #:
+    #: 与 ``tool_failures`` 的区别是它**不按轮重置**:``tool_failures`` 被
+    #: ``agent_node`` 读完、发完 ``<recovery-advisory>`` 就清空,走到 END 时
+    #: 恒为空,拿不到。这一条由 ``tools`` 节点**每批无条件覆盖**(全成功的批
+    #: 写 ``[]``),所以终局读到的恒是「最后一批的情况」。
+    #:
+    #: 为什么写在 ``tools`` 节点而不是 ``agent_node``:后者看到空列表时分不清
+    #: 「这批工具全成功」与「这一轮压根没跑工具」,而 ``tools`` 节点只在真跑过
+    #: 一批时才执行 —— 它写下的值天然带着「确实跑过一批」这个前提。
+    last_batch_failures: NotRequired[list[ClassifiedToolError]]
+    #: B-85 ③ —— run 从哪个出口结束的,由**知道答案的那一行**盖章。
+    #:
+    #: 封闭取值:``text_response`` / ``max_steps`` / ``no_progress`` /
+    #: ``token_budget`` / ``approval_pending`` / ``approval_rejected``。
+    #:
+    #: 不在 ``_should_continue`` / ``_after_tools`` 里盖 —— 它们是 LangGraph 的
+    #: conditional-edge 函数,只返回路由、不写 state;而且撞预算的三种情况走的是
+    #: 「一次无工具的收尾轮」,到了路由那一步与自然结束**逐字相同**,分不出来。
+    exit_reason: NotRequired[str]
     subagent_invocations: NotRequired[Annotated[list[SubAgentInvocation], add]]
     pending_approval: NotRequired[ApprovalRequest | None]
     approval_resume: NotRequired[dict[str, Any] | None]
