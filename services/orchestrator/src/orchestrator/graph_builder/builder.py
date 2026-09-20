@@ -73,7 +73,7 @@ from typing import Any, Literal, cast
 from uuid import UUID
 
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError
+from jsonschema.exceptions import SchemaError, ValidationError
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
@@ -3516,8 +3516,28 @@ def _validate_tool_args(tool: Tool, args: Mapping[str, Any]) -> str | None:
     if not errors:
         return None
     # Name path + failed keyword only — never echo the offending value.
-    parts = [f"{e.json_path} ({e.validator})" for e in errors[:5]]
+    parts = [_describe_schema_error(e) for e in errors[:5]]
     return "arguments failed schema validation: " + "; ".join(parts)
+
+
+def _describe_schema_error(error: ValidationError) -> str:
+    """One schema violation as ``$.path (keyword)``, naming the missing keys.
+
+    B-84 — a bare ``$ (required)`` tells the model *that* something at the
+    root is missing but not *what*, so it has to guess; ``update_plan`` was
+    rejected 50 times in 60 days on exactly this shape. The absent property
+    NAMES come from the schema, not from the args, so naming them does not
+    violate this function's never-echo-the-value rule.
+    """
+    base = f"{error.json_path} ({error.validator})"
+    if error.validator != "required":
+        return base
+    expected = error.validator_value
+    if not isinstance(expected, list | tuple):
+        return base
+    present = error.instance if isinstance(error.instance, Mapping) else {}
+    missing = [name for name in expected if isinstance(name, str) and name not in present]
+    return f"{base}: missing {', '.join(missing)}" if missing else base
 
 
 async def _invoke_tool(

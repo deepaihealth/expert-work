@@ -53,13 +53,22 @@ _MAX_STEP_DESCRIPTION_CHARS: int = 500
 
 @dataclass(frozen=True)
 class UpdatePlanTool:
-    """``update_plan(steps, reason, goal=None)`` — agent-initiated create-or-replace.
+    """``update_plan(steps, reason=None, goal=None)`` — agent-initiated create-or-replace.
 
     Creates the run's :class:`Plan` if none exists yet, otherwise
     replaces it with a new ordered set of steps. The replacement is
     *complete* (not a patch) — modelling partial diffs would add a lot
     of surface for arguable gain. ``reason`` is captured for trace /
     audit only; it is not rendered back to the agent.
+
+    B-84 — ``reason`` is **optional**. It used to be required, and that
+    cost 50 rejected calls in 60 days on the test environment (every one
+    of them ``$ (required)``): the model routinely sends ``{goal, steps}``
+    and omits it. A field the tool's own docstring describes as "not fed
+    back to the agent" has no business failing the call — the model
+    cannot learn to supply something it never sees the effect of, so the
+    only outcome was a wasted round trip per omission. Absent ``reason``
+    logs and reports as the empty string.
     """
 
     @property
@@ -121,8 +130,9 @@ class UpdatePlanTool:
                     "reason": {
                         "type": "string",
                         "description": (
-                            "Why the plan is being revised — recorded for "
-                            "the trace, not fed back to the agent."
+                            "Optional. Why the plan is being revised — "
+                            "recorded for the trace, not fed back to the "
+                            "agent."
                         ),
                     },
                     "goal": {
@@ -135,7 +145,7 @@ class UpdatePlanTool:
                         ),
                     },
                 },
-                "required": ["steps", "reason"],
+                "required": ["steps"],
             },
         )
 
@@ -150,9 +160,6 @@ class UpdatePlanTool:
 
         if not isinstance(steps_raw, list) or not steps_raw:
             msg = "update_plan requires a non-empty 'steps' array"
-            raise ValueError(msg)
-        if not reason:
-            msg = "update_plan requires a non-empty 'reason' string"
             raise ValueError(msg)
 
         # Trim each step + drop empties. The schema's minItems=1 already

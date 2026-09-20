@@ -185,11 +185,20 @@ def _classify_by_signal(error: BaseException) -> ToolErrorClass:
 _TRANSIENT_NEEDLES = (
     "timed out",
     "timeout",
+    # B-84 — "504 Gateway Time-out" is what the sandbox supervisor returns
+    # when creation exceeds the ALB deadline, and it used to match nothing
+    # here: 504 was absent from the status list, and nginx spells it
+    # "Time-out" with a hyphen so "timeout" misses too. It classified as
+    # ``unknown``, whose advice invites the model to "consider an
+    # alternative approach" — in run 7fad305b the model took that to mean
+    # the directory was gone and re-typed a 21,173-character script.
+    "time-out",
     "connection",
     "unavailable",
     "overloaded",
     " 503",
     " 502",
+    " 504",
     " 500",
     " 529",
 )
@@ -236,6 +245,21 @@ def _is_retryable(error_class: ToolErrorClass, spec: ToolSpec | None) -> bool:
 # Recovery advice (templated, grounded)
 # ---------------------------------------------------------------------------
 
+#: B-84 — the sentence every "the call never got to look" class must carry.
+#: ``resource_not_found`` is the ONLY class that licenses "the target is not
+#: there"; a transient or unclassified failure says nothing either way. The
+#: distinction was invisible in the advisory text, and a model that cannot
+#: tell "absent" from "unreachable" does the expensive safe thing: it rebuilds
+#: from scratch. Measured cost of exactly that inference on the test
+#: environment: 14 re-typings of a file the same user already had, 293,012
+#: characters, about 6,002 seconds of wall clock over 60 days.
+_EXISTENCE_UNKNOWN = (
+    "This says NOTHING about whether the target exists — the call never got "
+    "far enough to look. Do not treat it as absent and do not recreate it "
+    "from scratch; confirm with a separate read once the tool works again."
+)
+
+
 _ADVICE: dict[ToolErrorClass, str] = {
     "unknown_tool": (
         "This tool does not exist. Pick a tool from the available set; do not retry this name."
@@ -253,7 +277,8 @@ _ADVICE: dict[ToolErrorClass, str] = {
         "The target (path or id) does not exist. Verify it exists before operating on it."
     ),
     "permission_denied": (
-        "Permission was denied. Do not brute-force retry; surface this to the user."
+        "Permission was denied. Do not brute-force retry; surface this to "
+        "the user. " + _EXISTENCE_UNKNOWN
     ),
     "mutation_not_landed": (
         "This mutation did NOT land — do not assume the target has the "
@@ -261,18 +286,18 @@ _ADVICE: dict[ToolErrorClass, str] = {
     ),
     "unknown": (
         "This failed for an unclear reason. Inspect the error and consider "
-        "an alternative approach; avoid retrying the identical call."
+        "an alternative approach; avoid retrying the identical call. " + _EXISTENCE_UNKNOWN
     ),
 }
 
 _TRANSIENT_RETRYABLE = (
     "A transient failure. This tool is safe to retry once; if it keeps "
-    "failing, surface the failure to the user."
+    "failing, surface the failure to the user. " + _EXISTENCE_UNKNOWN
 )
 _TRANSIENT_UNSAFE = (
     "A transient failure, but this tool is not safe to blindly replay "
     "(not read-only or idempotent). Verify the current state before "
-    "retrying."
+    "retrying. " + _EXISTENCE_UNKNOWN
 )
 
 

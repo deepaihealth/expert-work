@@ -51,6 +51,29 @@ def test_missing_required_field_rejected() -> None:
     assert msg is not None and "required" in msg
 
 
+def test_missing_required_field_is_named() -> None:
+    """B-84 — a bare ``$ (required)`` leaves the model guessing WHICH key.
+
+    Sixty days of test-environment traffic rejected ``update_plan`` 50 times
+    on exactly this message. The property name comes from the schema, not
+    from the args, so naming it keeps the never-echo-the-value rule intact.
+    """
+    msg = _validate_tool_args(_SchemaTool(), {"n": 1})
+    assert msg is not None
+    assert "missing url" in msg
+
+
+def test_missing_required_names_every_absent_key() -> None:
+    msg = _validate_tool_args(_SchemaTool(), {})
+    assert msg is not None and "missing url" in msg
+
+
+def test_non_required_keyword_keeps_the_bare_path_form() -> None:
+    """Only ``required`` gains the suffix — other keywords are unchanged."""
+    msg = _validate_tool_args(_SchemaTool(), {"url": 123})
+    assert msg is not None and "missing" not in msg
+
+
 def test_wrong_type_rejected_without_echoing_value() -> None:
     msg = _validate_tool_args(_SchemaTool(), {"url": 123})
     assert msg is not None and "type" in msg
