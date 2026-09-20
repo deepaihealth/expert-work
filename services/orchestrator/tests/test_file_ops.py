@@ -575,6 +575,126 @@ async def test_edit_stale_surfaces_current_hash() -> None:
         )
 
 
+async def _edit_failure_message(env: dict[str, Any]) -> str:
+    """跑一次注定失败的 edit_file, 把模型真正看得到的那条错误文本交回来。"""
+    client = _client(json.dumps(env))
+    with pytest.raises(FileOpError) as excinfo:
+        await EditFileTool(client=client).call(
+            {"path": "f.txt", "old_string": "a", "new_string": "b"}, ctx=_ctx()
+        )
+    return str(excinfo.value)
+
+
+# --- B-84 第 9 条 —— edit_file 失败之后的下一步动作 ------------------------
+#
+# 实测(测试环境 60 天):edit_file 124 次里失败 29 次(no_match 21 / stale 8)。
+# 失败之后退回 write_file 整份重写共 5 次, 拆开看是两种行为:连撞 1 次就重写 3
+# 次(该治), 连撞 2 次才重写 2 次(**对的行为**, 不劝阻)。所以措辞是一条阶梯
+# ——「先重读再试一次」在前,「连撞两次就改用 write_file 重写」在后。
+# no_match 的 near-line 提示是实测有效的那一半, 必须原样保住;stale 过去只丢一
+# 个裸哈希, 等于没说。
+
+
+async def test_edit_stale_tells_the_model_to_re_read() -> None:
+    msg = await _edit_failure_message(
+        {"ok": False, "error": "stale", "detail": "current_hash=abc", "current_hash": "abc"}
+    )
+    # 既有信息不能丢:哈希还在。
+    assert "current_hash=abc" in msg
+    # 阶梯第一级:重新读 -> 用读到的内容重建 old_string -> 带上新哈希再试。
+    assert "The file changed after you read it, so NOTHING was written" in msg
+    assert "Call read_file on this path again" in msg
+    assert "rebuild 'old_string' from what you just read" in msg
+    assert "pass the new hash as 'expected_hash'" in msg
+    # 阶梯第二级:连撞两次才升级成整份重写(不是禁令)。
+    assert "If this region has now failed twice" in msg
+    assert "rewrite the enclosing function or the whole file with write_file" in msg
+
+
+async def test_edit_no_match_keeps_near_line_hint_and_adds_next_step() -> None:
+    msg = await _edit_failure_message(
+        {"ok": False, "error": "no_match", "detail": "near line 18: FONT = 'Microsoft YaHei'"}
+    )
+    # 实测有效的那一半, 一个字都不能少。
+    assert "near line 18: FONT = 'Microsoft YaHei'" in msg
+    # 追加在它之后, 不是替换它。
+    assert msg.index("near line 18") < msg.index("'old_string' matched nothing")
+    assert "NOTHING was written and the file is unchanged" in msg
+    # 阶梯第一级。
+    assert "the closest line found, not the target" in msg
+    assert "Call read_file on this path and rebuild 'old_string' from the current content" in msg
+    # 阶梯第二级。
+    assert "If this region has now failed twice" in msg
+    assert "rewrite the enclosing function or the whole file with write_file" in msg
+
+
+async def test_edit_guidance_survives_the_tool_error_cap() -> None:
+    """引导接在消息尾巴上, 而 ``_format_error`` 对 ``str(exc)`` 有 500 字符硬截断。
+
+    超一个字符就正好把新加的这段截没 —— 看起来像"加了没生效"。这里按最坏情况
+    (no_match 带满长度的 near-line 提示)走一遍真正的渲染函数, 而不是自己复制
+    一份 500 去比大小。
+    """
+    from orchestrator.graph_builder.builder import _format_error
+
+    # 片段侧的 near-line 提示上限:"near line " + 行号 + ": " + 单行前 80 字符。
+    worst = "near line 99999999: " + "x" * 80
+    client = _client(json.dumps({"ok": False, "error": "no_match", "detail": worst}))
+    with pytest.raises(FileOpError) as excinfo:
+        await EditFileTool(client=client).call(
+            {"path": "f.txt", "old_string": "a", "new_string": "b"}, ctx=_ctx()
+        )
+    rendered = _format_error(excinfo.value)
+    assert "[truncated]" not in rendered
+    assert rendered.endswith(
+        "rewrite the enclosing function or the whole file with write_file instead."
+    )
+
+
+async def test_edit_guidance_does_not_flip_the_error_class() -> None:
+    """措辞里出现 "not found" 会把 edit_file 的分类翻成 ``resource_not_found``。
+
+    ``error_classifier._classify_by_signal`` 是拿子串扫整条错误文本的, 而
+    ``resource_not_found`` 的 advice 正是"这个路径不存在" —— 恰好是 B-84 要消灭
+    的那句误判。所以钉住:**加了引导之后的分类, 必须和没加时一模一样。**
+    """
+    from orchestrator.tools.error_classifier import classify_tool_error
+    from orchestrator.tools.file_ops import _EDIT_RECOVERY
+
+    spec = EditFileTool(client=_client()).spec
+    for kind, guidance in _EDIT_RECOVERY.items():
+        bare = FileOpError(f"edit_file failed: {kind}")
+        guided = FileOpError(f"edit_file failed: {kind} {guidance}")
+        before = classify_tool_error(tool_name="edit_file", error=bare, spec=spec)
+        after = classify_tool_error(tool_name="edit_file", error=guided, spec=spec)
+        assert after.error_class == before.error_class, kind
+        assert after.error_class != "resource_not_found", kind
+
+
+def test_edit_guidance_is_scoped_to_edit_file() -> None:
+    """同一个 ``_raise_for_error`` 还服务 write_file / read_document / projection。
+
+    那几条的同名 kind 语义不同, 不能共用措辞;``ambiguous`` 则是 60 天里一次都
+    没出现过的形态, 故意不写引导。
+    """
+    from orchestrator.tools.file_ops import _raise_for_error
+
+    with pytest.raises(FileOpError) as other_tool:
+        _raise_for_error({"ok": False, "error": "no_match"}, tool="write_file")
+    assert "write_file failed: no_match" == str(other_tool.value)
+
+    with pytest.raises(FileOpError) as ambiguous:
+        _raise_for_error({"ok": False, "error": "ambiguous", "detail": "count=3"}, tool="edit_file")
+    assert "edit_file failed: ambiguous (count=3)" == str(ambiguous.value)
+
+
+def test_edit_file_description_says_read_first() -> None:
+    """比报错更早一步:工具描述里就写清楚 old_string 从 read_file 的输出里抄。"""
+    description = EditFileTool(client=_client()).spec.description
+    assert "Read the file with read_file first" in description
+    assert "copy 'old_string' out of what it returns" in description
+
+
 async def test_edit_requires_non_empty_old_string() -> None:
     client = _client(json.dumps({"ok": True, "content_hash": "h", "size": 0, "path": "f"}))
     with pytest.raises(ValueError, match="old_string"):

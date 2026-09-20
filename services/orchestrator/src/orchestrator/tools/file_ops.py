@@ -531,12 +531,79 @@ async def run_scoped_read(
     return parse_envelope(outcome, tool=tool)
 
 
+#: Shared tail of every ``edit_file`` recovery line: **第二次之后才升级**。
+#:
+#: 这句话是个阶梯, 不是禁令。退回 ``write_file`` 重写本身不是错的 —— 错的是把它
+#: 当成第一反应。实测(测试环境 60 天, ``edit_file`` 失败 29 次)里退回重写共 5
+#: 次, 拆开看是两种完全不同的行为:
+#:
+#: * **连撞 1 次就重写 —— 3 次**。该治的是这个:一次没对上往往只是 ``old_string``
+#:   抄旧了, 重读一遍再改就行。
+#: * **连撞 2 次才重写 —— 2 次**。这是**对的行为**, 一个字都不该劝阻:同一块地方
+#:   连着两次对不上, 第三次 patch 才是真浪费。
+#:
+#: 口径与 hermes 的 ``CODING_AGENT_GUIDANCE`` 一致(edit 失败先重读再试, 同一块
+#: 连失败两次就改用 ``write_file`` 重写外层函数或整个文件)。
+_EDIT_ESCALATE_AFTER_TWO = (
+    "If this region has now failed twice, rewrite the enclosing function or the "
+    "whole file with write_file instead."
+)
+
+#: ``edit_file`` 失败之后的下一步动作, 按 envelope 的 ``error`` 分。
+#:
+#: 为什么只有这两个 kind:60 天里 ``edit_file`` 的失败只有 ``no_match``(21 次)
+#: 与 ``stale``(8 次)两种, ``ambiguous`` 一次都没出现过 —— 给没见过的形态写
+#: 措辞是凭空猜。
+#:
+#: **两条措辞对所有模型是同一份。** 票上原本的方向是「按模型家族分支」, 但分支要
+#: 先有「失败模式按 provider 聚集」的证据。而且我们只跑 glm-5.3 / kimi-k3, 两个
+#: 同属 str-replace 一类, 已经在对的编辑格式上了 —— 分支在这里是纯负担。
+#:
+#: 语气与 :mod:`orchestrator.tools.error_classifier` 的 ``_EXISTENCE_UNKNOWN``
+#: 对齐:先明说**什么没有发生**(一个字节都没写), 再给一条能直接执行的下一步。
+#:
+#: ``no_match`` 的 ``near line N: <内容>`` 提示是实测有效的那一半(21 次里有 10
+#: 次模型据此又试了一遍 edit_file, 那正是我们想要的行为), 所以只在它**之后**
+#: 追加, 不动它。
+#:
+#: ⚠ 两条措辞都**刻意避开 "not found" 这几个字**。``error_classifier`` 的
+#: ``_NOT_FOUND_NEEDLES`` 是拿子串扫整条错误文本的, 措辞里出现 "not found" 会把
+#: ``edit_file`` 的分类从 ``unknown`` 翻成 ``resource_not_found``, 而后者的 advice
+#: 正是"这个路径不存在" —— 恰好是 B-84 这一波要消灭的那句误判。措辞里说的也本来
+#: 就不是文件不在, 是 ``old_string`` 没对上。测试钉着这条不变式。
+#:
+#: ⚠ 这段文字接在 ``msg`` 尾巴上, 而 ``builder._format_error`` 对 ``str(exc)``
+#: 有 500 字符硬截断 —— 超了就正好把新加的引导截没, 看起来像没加。最坏情况
+#: (``no_match`` 带满 80 字符的 near-line 提示)测试里钉着。另外 advisory 通道
+#: (``_SUMMARY_MAX_CHARS`` = 300)会更早截一刀, 所以**可执行的第一步排在最前面**,
+#: 第二级升级排在最后:被截掉的永远是阶梯的第二级, 不是第一级。
+_EDIT_RECOVERY: dict[str, str] = {
+    "stale": (
+        "The file changed after you read it, so NOTHING was written. The hash above "
+        "is the file's current hash, not an error code. Call read_file on this path "
+        "again, rebuild 'old_string' from what you just read, and pass the new hash "
+        "as 'expected_hash'. " + _EDIT_ESCALATE_AFTER_TWO
+    ),
+    "no_match": (
+        "'old_string' matched nothing, so NOTHING was written and the file is "
+        "unchanged. Any 'near line' hint above is the closest line found, not the "
+        "target. Call read_file on this path and rebuild 'old_string' from the "
+        "current content. " + _EDIT_ESCALATE_AFTER_TWO
+    ),
+}
+
+
 def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
     """Map a ``{"ok": False, ...}`` envelope to the right exception.
 
     ``path_escapes_workspace`` is a security denial → :class:`ToolBlockedError`
     (audited as ``tool:blocked``); every other kind is an operational error
-    the model self-corrects on → :class:`FileOpError`."""
+    the model self-corrects on → :class:`FileOpError`.
+
+    B-84 第 9 条 —— ``edit_file`` 的失败额外带一句下一步动作(见
+    :data:`_EDIT_RECOVERY`)。只挂在 ``edit_file`` 上:同一个函数还服务
+    ``write_file`` / ``read_document`` / 两条 projection 通道, 那几条的同名 kind
+    语义不同, 措辞不能共用。"""
     if env.get("ok"):
         return
     kind = env.get("error", "unknown")
@@ -545,6 +612,10 @@ def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
         raise ToolBlockedError(msg)
     detail = env.get("detail")
     msg = f"{tool} failed: {kind}" + (f" ({detail})" if detail else "")
+    if tool == "edit_file":
+        guidance = _EDIT_RECOVERY.get(str(kind))
+        if guidance:
+            msg = f"{msg} {guidance}"
     raise FileOpError(msg)
 
 
@@ -979,8 +1050,9 @@ class EditFileTool:
         return ToolSpec(
             name="edit_file",
             description=(
-                "Replace an exact substring in a workspace text file. 'old_string' "
-                "must occur exactly once; if it isn't found exactly, a "
+                "Replace an exact substring in a workspace text file. Read the file "
+                "with read_file first and copy 'old_string' out of what it returns. "
+                "'old_string' must occur exactly once; if it isn't found exactly, a "
                 "whitespace-tolerant line-block match is attempted (ignores indent / "
                 "trailing-space drift; that fallback normalizes line endings to LF "
                 "unless the file is uniformly CRLF). Optionally pass 'expected_hash' "
