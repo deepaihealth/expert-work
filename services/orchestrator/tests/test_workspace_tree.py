@@ -1,4 +1,4 @@
-"""B-84 PR-2 —— run 起点工作区树形摘要的渲染与取数。
+"""B-84 PR-2 —— 每轮重取的工作区树形摘要, 渲染与取数。
 
 治的是实测里那条路径:模型看不见自己上一轮写进工作区的文件, 于是重打一遍
 (60 天 14 次 / 293,012 字符 / 约 6,002 秒墙钟)。这里钉住三件事 ——
@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import pytest
 
+from expert_work.persistence import WORKSPACE_RESERVED_PREFIXES
 from orchestrator.tools.error_classifier import EXISTENCE_UNKNOWN
 from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
@@ -155,6 +156,28 @@ def test_block_marks_names_as_data_not_instructions() -> None:
 def test_block_is_empty_for_an_empty_workspace() -> None:
     # 绝不出现"(无法读取)"或只有块首的半截块。
     assert render_workspace_block([]) == ""
+
+
+def test_block_never_claims_to_list_everything_in_the_workspace() -> None:
+    """块首不得出现无条件的全称声明。
+
+    取数走 ``list_files``, 它过滤掉四个保留命名空间(``uploads/`` / ``skills/`` /
+    ``inputs/`` / ``.tool_results/``)。块首要是说"/workspace 里的文件", 模型就会把
+    "没列出来"读成"不存在" —— 而这个块的全部意义就是治「看不见 → 当作没有」, 一句
+    全称声明等于把要治的那个误判原样造一遍, 只是换了个更可信的出处(平台自己说的)。
+
+    两条断言各钉一件事:
+
+    * **不再说全称。** 首版那句 ``Files already in /workspace.`` 是回归的样子。
+    * **被滤掉的每一个都点了名。** 直接对着
+      :data:`~expert_work.persistence.WORKSPACE_RESERVED_PREFIXES` 遍历, 不手抄四个
+      名字 —— 将来往那个 frozenset 里加第五个保留前缀而没改块首, 这条会红, 而不是
+      块首悄悄开始漏报。
+    """
+    block = render_workspace_block([_entry("style/render_plan.py")])
+    assert "Files already in /workspace." not in block
+    for prefix in WORKSPACE_RESERVED_PREFIXES:
+        assert f"{prefix}/" in block, f"块首没点名被过滤掉的 {prefix}/"
 
 
 # ---------------------------------------------------------------------------

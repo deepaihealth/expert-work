@@ -1987,6 +1987,14 @@ def _without_workspace_blocks(messages: Sequence[BaseMessage]) -> list[BaseMessa
     清空), 上一轮那段更不能留下来顶班:它会顶着「这一轮开始时」的块首去描述一个已经
     不存在的工作区, 那比没有块更坏。
 
+    **这是防御性的, 不是热路径 —— 别围着它做优化。** 块只进这一次的提示词视图, 从不
+    落检查点(见 :func:`_workspace_block_tail`), 所以正常路径下 ``state["messages"]``
+    里根本不可能有第二份:本函数每轮的真实工作量是"扫一遍、一条没剔"。它存在是为了把
+    不变式写死进代码而不是写在注释里 —— 哪天有人让块落了库, 或者某条重放路径把它带了
+    回来, 提示词里也不会同时出现两份互相矛盾的「现在」。
+    ``test_only_the_latest_snapshot_reaches_the_model`` 是**人为**造出两份来测的;
+    今天没有哪条产品路径能造出那个状态。
+
     只改这一次的提示词视图, 检查点不动(CM-C4)—— 被剔掉的消息在会话历史里原样还在。
     """
     return [m for m in messages if not _is_workspace_block(m)]
@@ -2003,6 +2011,16 @@ async def _workspace_block_tail(
     """B-84 PR-2 —— 重取一份工作区快照, 挂到提示词尾部;更早的那几段一并剔掉。
 
     出口不变式:提示词视图里**至多一段**工作区快照, 而且它一定是这一轮取的。
+
+    **只进这一次的提示词视图, 从不落检查点**(CM-C4, 与 :func:`_inject_plan` 同一口径)。
+    这条决定了前缀缓存的账:历史里永远只有一份、块恒在尾部, 所以 ``[system][history]``
+    这段前缀逐轮稳定, 不走缓存的只有块自己那 ~600 token(体积与这笔账的实测见
+    :mod:`orchestrator.tools.workspace_tree` 的模块 docstring)。反过来, 块要是落了库,
+    dedup 就会从**历史中段**摘掉旧块 —— 那等于每轮改写前缀, 从那一点往后的缓存全作废,
+    成本要重算。结构保证:本函数造出来的那条消息只进 ``agent_node`` 的局部 ``messages``,
+    两条返回路径(``persisted_messages`` 走 ``_extract_post_llm_messages`` 的"原列表之后
+    的后缀"、``emit_messages`` 只装 advisory / dispatch / response)都够不着它。
+    ``test_the_block_never_lands_in_the_checkpoint`` 钉住这一条。
 
     **挂尾部**, 与 :func:`_append_tail_human_message` 同一个位置口径:它是隐藏
     ``HumanMessage``, :func:`~expert_work.common.conversation_channel.opens_segment`
