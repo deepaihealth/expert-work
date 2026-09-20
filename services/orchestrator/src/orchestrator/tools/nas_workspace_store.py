@@ -169,6 +169,7 @@ from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
     WorkspaceFileNotFoundError,
     WorkspaceFileTooLargeError,
+    WorkspacePathEscapeError,
     WorkspacePermissionError,
 )
 from orchestrator.tools.workspace_scope import (
@@ -313,6 +314,25 @@ def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
         # 不可达。哪天再引入第二个写入身份,连同这里一起补 try/finally。
         os.fchmod(fd, _DIR_MODE)
         return fd
+
+
+def _is_symlink_at(dfd: int, name: str) -> bool:
+    """``name`` under ``dfd`` — is it a symlink? Asked once, only on the error path.
+
+    ``O_NOFOLLOW`` 撞 symlink 时的 errno **不跨平台**:Linux 回 ``ELOOP``, 而 macOS
+    对 ``O_DIRECTORY | O_NOFOLLOW`` 回 ``ENOTDIR``(2026-09-20 实测, 不是推断)。
+    ``ENOTDIR`` 同时也是"``a/b`` 里的 ``a`` 其实是个普通文件"这种正常笔误的 errno,
+    所以拿 errno 当判据只有两种错法:在 macOS 上把一次逃逸报成"不存在", 或者把笔误
+    报成逃逸。改成问一次 ``lstat``——"它是不是一条链接"这件事两个平台答案一样。
+
+    生产跑 Linux, 那里 ``ELOOP`` 本来就接住了;这条判据是为了让**本地与 CI 上的红
+    绿**说的是同一件事 —— 一个只在 Linux 上成立的判据, 在开发机上永远验不出它想验
+    的东西。
+    """
+    try:
+        return stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode)
+    except OSError:
+        return False
 
 
 def _walk_and_match(
@@ -659,9 +679,13 @@ class NasWorkspaceStore:
                 # 性,指错权限位比不指更坏。
                 raise WorkspacePermissionError(f"workspace path not accessible: {path!r}") from exc
             except OSError as exc:
+                # B-84 —— 窄类型:中间某一段是 symlink 是**安全拒绝**, 不是"文件不
+                # 存在"。``file_ops`` 据此翻 ToolBlockedError, 与沙箱片段的
+                # ``path_escapes_workspace`` 逐字同义。判据先问再关 fd。
+                escaped = exc.errno == errno.ELOOP or _is_symlink_at(dfd, component)
                 os.close(dfd)
-                if exc.errno == errno.ELOOP:
-                    raise SandboxSupervisorError(
+                if escaped:
+                    raise WorkspacePathEscapeError(
                         f"workspace path escapes the user root: {path!r}"
                     ) from exc
                 raise _WorkspacePathNotFoundError(f"workspace path not found: {path!r}") from exc
@@ -716,7 +740,11 @@ class NasWorkspaceStore:
                     ) from exc
                 except OSError as exc:
                     if exc.errno == errno.ELOOP:
-                        raise SandboxSupervisorError(
+                        # B-84 —— 窄类型:一段是 symlink 的 ``openat`` 撞 ELOOP 是
+                        # **安全拒绝**, 不是"文件不存在"。``file_ops`` 据此翻
+                        # ToolBlockedError, 与沙箱片段的 ``path_escapes_workspace``
+                        # 逐字同义。
+                        raise WorkspacePathEscapeError(
                             f"workspace path escapes the user root: {path!r}"
                         ) from exc
                     raise WorkspaceFileNotFoundError(f"workspace file not found: {path!r}") from exc
@@ -1003,7 +1031,11 @@ class NasWorkspaceStore:
                     ) from exc
                 except OSError as exc:
                     if exc.errno == errno.ELOOP:
-                        raise SandboxSupervisorError(
+                        # B-84 —— 窄类型:一段是 symlink 的 ``openat`` 撞 ELOOP 是
+                        # **安全拒绝**, 不是"文件不存在"。``file_ops`` 据此翻
+                        # ToolBlockedError, 与沙箱片段的 ``path_escapes_workspace``
+                        # 逐字同义。
+                        raise WorkspacePathEscapeError(
                             f"workspace path escapes the user root: {path!r}"
                         ) from exc
                     raise SandboxSupervisorError(

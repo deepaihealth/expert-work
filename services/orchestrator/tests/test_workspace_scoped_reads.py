@@ -30,7 +30,7 @@ import pytest
 
 from expert_work.persistence import is_reserved_workspace_path
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore, scope_root
-from orchestrator.tools.sandbox import SandboxSupervisorError
+from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePathEscapeError
 from orchestrator.tools.workspace_scope import SCOPE_SHARED, agent_scope
 from orchestrator.tools.workspace_store import (
     RecordingWorkspaceStore,
@@ -305,7 +305,11 @@ async def test_scoped_read_rejects_escape(
 ) -> None:
     store, tenant_id, user_id = seeded(_TREE)
 
-    with pytest.raises(SandboxSupervisorError):
+    # 判据是**窄类型**, 不是"抛了点什么"。``agents/<别人的 key>/x`` 在 NAS 与
+    # supervisor 两档上本来就找不到文件, 拿基类 ``SandboxSupervisorError`` 当判据
+    # 的话, 一个**完全没有**作用域守卫的实现照样全绿 —— 实测过:把
+    # ``_reject_reserved_head`` 注释掉, 宽判据下只有 recording 档红。
+    with pytest.raises(WorkspacePathEscapeError):
         await store.read_file(
             tenant_id=tenant_id, user_id=user_id, path=bad, scope=agent_scope(AGENT_KEY)
         )
@@ -319,7 +323,7 @@ async def test_scoped_read_rejects_an_unsafe_agent_key(
     就是 ``{root}`` —— 单纯的 ``.`` / ``..`` 能过字符集正则, 必须单列拒掉。"""
     store, tenant_id, user_id = seeded(_TREE)
 
-    with pytest.raises(SandboxSupervisorError):
+    with pytest.raises(WorkspacePathEscapeError):
         await store.list_files(tenant_id=tenant_id, user_id=user_id, scope=agent_scope(bad_key))
 
 
@@ -359,7 +363,7 @@ async def test_symlink_out_of_the_scope_root_is_not_followed(tmp_path: Path) -> 
     """
     store, tenant_id, user_id, _root = _nas_with_symlinks(tmp_path)
 
-    with pytest.raises(SandboxSupervisorError):
+    with pytest.raises(WorkspacePathEscapeError):
         await store.read_file(
             tenant_id=tenant_id, user_id=user_id, path="etc/passwd", scope=agent_scope(AGENT_KEY)
         )
@@ -368,7 +372,7 @@ async def test_symlink_out_of_the_scope_root_is_not_followed(tmp_path: Path) -> 
 async def test_symlink_into_another_agent_is_not_followed(tmp_path: Path) -> None:
     store, tenant_id, user_id, _root = _nas_with_symlinks(tmp_path)
 
-    with pytest.raises(SandboxSupervisorError):
+    with pytest.raises(WorkspacePathEscapeError):
         await store.read_file(
             tenant_id=tenant_id,
             user_id=user_id,
