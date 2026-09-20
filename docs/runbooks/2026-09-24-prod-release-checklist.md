@@ -8,8 +8,8 @@
 |---|---|
 | 发布日 | **2026-09-24（周四）**，用户 2026-09-17 拍板（原 09-22） |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`5a809aee`** —— 测试环境 2026-09-20 发过的那一版（`SMOKE PASS` 17 项全绿，金丝雀真跑 + 产物链 PASS，37.0s） |
-| 区间提交数 | **70**（`git log --oneline 5775fbf3..5a809aee`） |
+| 本版 tag | **`139057c8`** —— 测试环境 2026-09-20 第二次发过的那一版（`SMOKE PASS` 17 项全绿，金丝雀真跑 + 产物链 PASS，B-85 ③ 真栈双向验过） |
+| 区间提交数 | **74**（`git log --oneline 5775fbf3..139057c8`） |
 | 数据库迁移 | **三条**：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
 | 段数 | **单段**。有迁移但不是三段式：`0156` / `0158` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这些表上正常跑 |
 | 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉 |
@@ -130,7 +130,7 @@
   隐藏段的文件名前缀歧义指向清单、**平台脚手架行不进控制台内容搜索**（带迁移 `0156`）、
   审计视图里这些行渲染成折叠的「平台自动生成」块。
 
-> **钉子纪律**：本单钉 `5a809aee`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `139057c8`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
@@ -169,10 +169,10 @@
 >
 > | 钉子 | 新值 | 怎么验过的 |
 > |---|---|---|
-> | 应用镜像 | **`5a809aee`** | `release.sh test` 发过一遍：`SMOKE PASS` 17 项全绿、金丝雀真跑 + 产物链 PASS（37.0s） |
+> | 应用镜像 | **`139057c8`** | `release.sh test` 发过两遍（09-20 两次）：`SMOKE PASS` 17 项全绿、金丝雀真跑 + 产物链 PASS；B-85 ③ 另做了双向真栈验（见 §0 那条） |
 > | 沙箱镜像 | **`7ac31957`** | 测试集群 apply 过，池 `1/1`；拉取 66.19s → **40.55s**，压缩层 619.4 → **433.7 MiB**；pod 内复探 soffice / pdftoppm / ffmpeg（wheel 静态二进制）/ node 全在、npm 已删、weasyprint 渲 PDF + pypdf 读回命中 marker |
 >
-> 这一版比上一个钉子多 **18** 个提交：
+> 这一版比上一个钉子多 **22** 个提交：
 >
 > | 提交 | 是什么 | 进本班的理由 |
 > |---|---|---|
@@ -187,8 +187,16 @@
 > | `128e4194` #1628 / `0a44dab4` #1629 / `1cdbc495` #1631 | ROADMAP 记 B-88 / B-89、执行单改钉、B-88 单独立项 | 纯文档 |
 > | `7ac31957` #1630 | 沙箱镜像只建 amd64，删掉 arm64；构建超时退回 90 | 镜像重烤的那一版 |
 > | `5a809aee` #1632 | 沙箱镜像钉子推到 `7ac31957`，实测数据写进 yaml 注释 | 本单 Step A 就照这一行发 |
+> | `139057c8` #1636 | **B-85 ③** run 做没做成的独立信号（带迁移 `0158`） | 用户 09-20 拍板 |
+> | `f8436883` #1633 / `4775132d` #1634 / `cf7e0464` #1635 | test newTag 记录 + 第五次重钉、B-55 销案、B-85 ③ spec+计划 | 记账 / 纯文档 |
 >
-> 重钉之后按 §0 顶上那条判据自检过：**`grep -n '<旧 sha>' 这份文件` 零命中**（两个旧 sha 都验了）。
+> 重钉之后按 §0 顶上那条判据自检过。09-20 第六次重钉（应用镜像 → `139057c8`，带 B-85 ③）之后：
+> `233791e5` / `621249f6` / `5a809aee` 作为**钉子**的命中数都是 **0**。
+>
+> ⚠️ **判据的一条说明**：上面这张提交清单里会出现旧钉子的 sha —— 因为那一版**本身就是一个提交**
+> （`5a809aee` 是 #1632）。判据管的是**操作位**（表头、钉子表、Step B 的 `git checkout`、Step C 的
+> 核对、Step F 的记录 PR 标题），不是提交清单这种**记账位**。`grep` 之后逐条看一眼落在哪儿，
+> 落在清单里的放过，落在上面五处任何一处的都是漏改。
 
 > **⛔ #1597 那次重钉漏了正文**：表头改成了 `dfd4e6de`，Step B 的 `git checkout` 和另外 4 处
 > 却仍停在 `42426d31`（落后两代）。这已经是同一形状的**第二次**（班车 1 的 B2 正文钉子漏改，#1566）。
@@ -459,13 +467,13 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 
 ```sh
 git fetch origin main
-git checkout 5a809aee
+git checkout 139057c8
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `5a809aee`
+- [ ] 确认 checkout 的是 `139057c8`
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
 - [ ] migrate Job `condition met`，且日志里出现**两条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
@@ -481,7 +489,7 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `5a809aee`（admin-ui 是 `5a809aee-prod`）
+- [ ] 三个应用镜像都是 `139057c8`（admin-ui 是 `139057c8-prod`）
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -529,7 +537,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag 5a809aee` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag 139057c8` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、回滚命令。
 - [ ] ROADMAP 班车 2 行销案；本执行单补 §6 执行记录。
 
