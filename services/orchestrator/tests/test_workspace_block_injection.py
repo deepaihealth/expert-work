@@ -287,10 +287,11 @@ async def test_the_snapshot_never_enters_the_system_prompt() -> None:
         [SystemMessage(content="you are a test agent"), HumanMessage(content="做一版海报")],
     )
     prompt = llm.seen_prompts[0]
-    # 块确实注入了 —— 否则下面那条在"根本没有块"的条件下也绿。
-    assert len(_blocks(prompt)) == 1
     systems = [m for m in prompt if isinstance(m, SystemMessage)]
+    # 逐字不变 —— 不是"不含标题"那种弱判据:往系统提示词里拼任何东西都该红。
     assert [str(m.content) for m in systems] == ["you are a test agent"]
+    # 块确实注入了 —— 否则上面那条在"根本没有块"的条件下也绿。
+    assert len(_blocks(prompt)) == 1
     assert all(WORKSPACE_BLOCK_HEADING not in str(m.content) for m in systems)
     assert isinstance(_blocks(prompt)[0], HumanMessage)
 
