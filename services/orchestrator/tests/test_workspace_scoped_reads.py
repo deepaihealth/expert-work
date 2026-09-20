@@ -29,7 +29,11 @@ import httpx
 import pytest
 
 from expert_work.persistence import is_reserved_workspace_path
-from orchestrator.tools.nas_workspace_store import NasWorkspaceStore, scope_root
+from orchestrator.tools.nas_workspace_store import (
+    _MAX_SEARCH_FILE_BYTES,
+    NasWorkspaceStore,
+    scope_root,
+)
 from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePathEscapeError
 from orchestrator.tools.workspace_scope import SCOPE_SHARED, agent_scope
 from orchestrator.tools.workspace_store import (
@@ -399,3 +403,165 @@ async def test_scope_root_resolves_to_the_agent_directory_by_identity(tmp_path: 
     expected = (user_root / "agents" / AGENT_KEY).stat()
     actual = os.stat(scope_root(store.root, tenant_id, user_id, agent_scope(AGENT_KEY)))
     assert (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+# ---------------------------------------------------------------------------
+# Task 3 —— search_files
+# ---------------------------------------------------------------------------
+
+_SEARCH_TREE: dict[str, bytes] = {
+    f"agents/{AGENT_KEY}/style/render_plan.py": b"def render(plan):\n    return plan\n",
+    f"agents/{AGENT_KEY}/style/PLAN_STYLE.md": "# 排版约定\nrender 用等宽字体\n".encode(),
+    f"agents/{AGENT_KEY}/outputs/report.bin": b"\xff\xfe\x00\x01render\x00",
+    f"agents/{OTHER_AGENT_KEY}/render_plan.py": b"def render(plan): ...",
+    "shared/render_plan.py": b"legacy render",
+}
+
+
+async def test_search_by_name_glob(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    store, tenant_id, user_id = seeded(_SEARCH_TREE)
+
+    found = await store.search_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY), name_glob="*.py"
+    )
+
+    assert [e.path for e in found.entries] == ["style/render_plan.py"]
+    assert found.truncated is False
+
+
+async def test_search_by_content(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    """两个文本文件都含 ``render``, 另一个 agent 与 shared 的同名文件不算命中。"""
+    store, tenant_id, user_id = seeded(_SEARCH_TREE)
+
+    found = await store.search_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY), content="render"
+    )
+
+    assert [e.path for e in found.entries] == ["style/PLAN_STYLE.md", "style/render_plan.py"]
+
+
+async def test_search_with_both_terms_is_an_and(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    store, tenant_id, user_id = seeded(_SEARCH_TREE)
+
+    found = await store.search_files(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scope=agent_scope(AGENT_KEY),
+        name_glob="*.md",
+        content="render",
+    )
+
+    assert [e.path for e in found.entries] == ["style/PLAN_STYLE.md"]
+
+
+async def test_search_skips_binary_files(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    """``report.bin`` 的字节里**确实**有 ``render``, 但它不是文本 —— 不许试着解码。
+
+    ``errors="replace"`` 那种写法会造出根本不存在的命中, 而模型拿到一条假命中之后
+    的动作(去读它)比没命中更贵。
+    """
+    store, tenant_id, user_id = seeded(_SEARCH_TREE)
+
+    found = await store.search_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY), content="render"
+    )
+
+    assert "outputs/report.bin" not in [e.path for e in found.entries]
+
+
+async def test_search_marks_truncation(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    store, tenant_id, user_id = seeded(
+        {f"agents/{AGENT_KEY}/f{i}.txt": b"needle" for i in range(5)}
+    )
+
+    found = await store.search_files(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scope=agent_scope(AGENT_KEY),
+        name_glob="*.txt",
+        max_results=3,
+    )
+
+    assert len(found.entries) == 3
+    assert found.truncated is True
+
+
+async def test_search_never_leaves_its_scope(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    """同名文件在另一个 agent 与 shared 下都有, 一条都不许出现在结果里。"""
+    store, tenant_id, user_id = seeded(_SEARCH_TREE)
+
+    found = await store.search_files(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        scope=agent_scope(AGENT_KEY),
+        name_glob="render_plan.py",
+    )
+
+    assert [e.path for e in found.entries] == ["style/render_plan.py"]
+
+
+async def test_search_refuses_an_unsafe_scope(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    store, tenant_id, user_id = seeded(_SEARCH_TREE)
+
+    with pytest.raises(WorkspacePathEscapeError):
+        await store.search_files(
+            tenant_id=tenant_id, user_id=user_id, scope=agent_scope(".."), name_glob="*"
+        )
+
+
+async def test_search_needs_at_least_one_term(
+    seeded: Callable[[dict[str, bytes]], tuple[WorkspaceStore, UUID, UUID]],
+) -> None:
+    """一个都不给不是"列出全部" —— 一次写错的搜索不该悄悄变成一次全量列表。"""
+    store, tenant_id, user_id = seeded(_SEARCH_TREE)
+
+    with pytest.raises(SandboxSupervisorError):
+        await store.search_files(tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY))
+
+
+async def test_search_does_not_read_through_a_symlink(tmp_path: Path) -> None:
+    """作用域里放一条指向 ``/etc/passwd`` 的 symlink, 按内容搜不许读到它。
+
+    只在 NAS 档 —— 另外两个实现的树里没有 symlink 这个概念。
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    agent_root = tmp_path / str(tenant_id) / str(user_id) / "agents" / AGENT_KEY
+    agent_root.mkdir(parents=True)
+    (agent_root / "passwd").symlink_to("/etc/passwd")
+
+    found = await NasWorkspaceStore(root=str(tmp_path)).search_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY), content="root"
+    )
+
+    assert found.entries == ()
+
+
+async def test_search_skips_a_file_over_the_read_cap(tmp_path: Path) -> None:
+    """单文件读取上限 —— 超了跳过, 不把它整个拉进内存。"""
+    tenant_id, user_id = uuid4(), uuid4()
+    agent_root = tmp_path / str(tenant_id) / str(user_id) / "agents" / AGENT_KEY
+    agent_root.mkdir(parents=True)
+    big = agent_root / "big.txt"
+    with big.open("wb") as handle:
+        handle.seek(_MAX_SEARCH_FILE_BYTES)  # cap + 1 字节, 稀疏文件不真占磁盘
+        handle.write(b"needle")
+
+    found = await NasWorkspaceStore(root=str(tmp_path)).search_files(
+        tenant_id=tenant_id, user_id=user_id, scope=agent_scope(AGENT_KEY), content="needle"
+    )
+
+    assert found.entries == ()
