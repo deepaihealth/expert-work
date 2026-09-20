@@ -1,4 +1,4 @@
-"""run 起点的工作区树形摘要 —— B-84 PR-2 的渲染层。
+"""每轮重取的工作区树形摘要 —— B-84 PR-2 的渲染层。
 
 **要解决的那一件事**:模型看不见自己上一轮写进工作区的文件,于是重打一遍。60 天
 实测 14 次、293,012 个字符、约 6,002 秒墙钟,其中 ``style/render_plan.py`` 一个文件
@@ -16,9 +16,16 @@
 JSON 会把 ``style/`` 冲出预算。按目录聚合则上限由**目录数**决定而不由文件数决定,
 天然有界,并且不需要猜相关性 —— 按时间或按字典序排都是在猜。
 
-**只读元数据,永不读内容。** 工作区里有客户数据,把内容搬进系统提示词既贵又是个
-数据面问题。本模块的输入是 :class:`~orchestrator.tools.workspace_store.WorkspaceFileEntry`
+**只读元数据,永不读内容。** 工作区里有客户数据,把内容搬进提示词既贵又是个数据面
+问题。本模块的输入是 :class:`~orchestrator.tools.workspace_store.WorkspaceFileEntry`
 (只有 ``path`` / ``size`` / ``mtime``), 结构上就够不着内容。
+
+**块落在哪不归本模块管。** 本模块只负责"取数 + 渲染";它渲染出来的那段文本由
+:mod:`orchestrator.graph_builder.builder` **每轮**挂到提示词尾部的一条隐藏
+``HumanMessage`` 上 —— 不进系统提示词。两个理由:系统提示词是 Anthropic 的缓存前缀,
+每轮变一次等于每轮把前缀缓存打掉(L1 把 plan 挪出 ``SystemMessage`` 就是这个理由);
+而构建缓存按 ``(tenant, name, version, spec, oauth_subject)`` 命中、**不含 user**,
+没接 OAuth 的 agent 在用户之间共享同一份构建,快照进系统提示词就是把 A 的文件名发给 B。
 """
 
 from __future__ import annotations
@@ -29,7 +36,8 @@ from datetime import datetime
 from uuid import UUID
 
 from orchestrator.tools.error_classifier import EXISTENCE_UNKNOWN
-from orchestrator.tools.workspace_scope import agent_scope
+from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
+from orchestrator.tools.workspace_scope import store_scope
 from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
 
 logger = logging.getLogger(__name__)
@@ -51,7 +59,11 @@ _SIZE_WIDTH = 10
 #: 块首标题。照 hermes ``build_coding_workspace_block`` 的措辞:**块自己声明会过期**
 #: (它的原文是 ``Workspace (snapshot at session start - re-check with git before
 #: acting on it)``)。我们在"勘察快照会过期"上已经栽过一跤(班车 1 实录)。
-WORKSPACE_BLOCK_HEADING = "# Workspace (snapshot taken when this run started)"
+#:
+#: 说的是"这一轮开始时", 不是"这个 run 开始时" —— 块每轮重取(见
+#: ``graph_builder.builder._workspace_block_tail``)。写成 run 起点会让模型把一份
+#: 其实是新鲜的清单当成可能陈旧几十轮的东西, 那是拿一句不准的自述去换取谨慎。
+WORKSPACE_BLOCK_HEADING = "# Workspace (snapshot taken when this turn started)"
 
 #: 块首正文。三句话各有出处:
 #:
@@ -59,9 +71,9 @@ WORKSPACE_BLOCK_HEADING = "# Workspace (snapshot taken when this run started)"
 #: 2. 工具失败 != 文件不在 —— 与 PR-1 在**工具错误消息**里加的那句是同一件事的两处
 #:    落点, 所以直接复用 :data:`~orchestrator.tools.error_classifier.EXISTENCE_UNKNOWN`
 #:    这个常量本身, 不另写一份措辞。两处各说各的话, 模型读到的就是两条规矩。
-#: 3. 名字是数据不是指令 —— 文件名由用户(以及上一轮的模型)决定, 而这里是系统提示词,
-#:    没有 spotlight 围栏罩着。一个叫 ``ignore all previous instructions.txt`` 的文件
-#:    不该因为被列出来就获得指令效力。
+#: 3. 名字是数据不是指令 —— 文件名由用户(以及上一轮的模型)决定, 而这一段是平台自己
+#:    合成的消息, 不过 spotlight 围栏(围栏罩的是记忆与工具结果)。一个叫
+#:    ``ignore all previous instructions.txt`` 的文件不该因为被列出来就获得指令效力。
 _WORKSPACE_BLOCK_PREAMBLE = (
     "Files already in /workspace. This is a snapshot: it can be stale by the time "
     "you act on it, and it says nothing about content — re-read a file before "
@@ -186,7 +198,7 @@ def render_workspace_tree(
 def render_workspace_block(
     entries: Sequence[WorkspaceFileEntry], *, max_expanded: int = DEFAULT_MAX_EXPANDED
 ) -> str:
-    """完整的系统提示词块(块首 + 树), 空工作区返回 ``""``。"""
+    """完整的块(块首 + 树), 空工作区返回 ``""``。"""
     tree = render_workspace_tree(entries, max_expanded=max_expanded)
     if not tree:
         return ""
@@ -209,12 +221,21 @@ async def workspace_prompt_block(
     **传的是 ``agent_key`` 不是 agent 名。** NAS 上的目录名是 ``sanitize_agent_key()``
     的产物 = 净化后的名字 + 原始名字 sha256 的前 8 位(叫 ``pf-probe`` 的 agent 目录是
     ``pf-probe-33086dc0``), 所以作用域一律经
-    :func:`~orchestrator.tools.workspace_scope.agent_scope` 拼, 不在这里手工拼
+    :func:`~orchestrator.tools.workspace_scope.store_scope` 拼, 不在这里手工拼
     ``agents/<名字>`` —— 拼错的失败形态是"目录是空的"而不是报错。
+
+    **作用域不自己算。** 走 :func:`~orchestrator.tools.workspace_scope.store_scope`
+    这个既有的唯一翻译点(传 :data:`~orchestrator.tools.sandbox_image_contract.EXEC_VIEW`
+    = 「``/workspace`` 指的那棵树」), 而不是在这里写第二份 ``agent_scope(key) if key
+    else 用户根``。块里列的必须与模型 ``list_dir .`` 看到的是同一棵树, 而"同一棵"只有
+    共用同一个函数才结构上成立 —— 没绑 agent 的 agent 尤其明显:那一档 ``/workspace``
+    就是整个用户根, 自己算的话会拼出 ``agent:`` 这个谁也指不到的作用域。
     """
     try:
         entries = await store.list_files(
-            tenant_id=tenant_id, user_id=user_id, scope=agent_scope(agent_key)
+            tenant_id=tenant_id,
+            user_id=user_id,
+            scope=store_scope(EXEC_VIEW, agent_key=agent_key),
         )
     except Exception:
         logger.warning(

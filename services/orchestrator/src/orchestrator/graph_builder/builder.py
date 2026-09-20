@@ -79,7 +79,12 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from opentelemetry.trace import Status, StatusCode
 
-from expert_work.common.conversation_channel import INPUTS_BLOCK_MARK, is_hidden
+from expert_work.common.conversation_channel import (
+    HIDE_FROM_UI,
+    INPUTS_BLOCK_MARK,
+    WORKSPACE_BLOCK_MARK,
+    is_hidden,
+)
 from expert_work.common.dlp import scan_and_redact
 from expert_work.common.message_stamp import stamp_messages
 from expert_work.common.observability import (
@@ -199,6 +204,8 @@ from orchestrator.tools.registry import (
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
+from orchestrator.tools.workspace_store import WorkspaceStore
+from orchestrator.tools.workspace_tree import workspace_prompt_block
 
 logger = logging.getLogger(__name__)
 
@@ -477,6 +484,11 @@ def build_react_graph(
     # run's ToolContext (the real one rides the warm sandbox). ``None`` →
     # no state projection (the default; the unit-test / no-sandbox path).
     workspace_writer_factory: Callable[[ToolContext], WorkspaceFileWriter] | None = None,
+    # B-84 PR-2 —— 宿主侧工作区读(与 ``read_file`` / ``list_dir`` / ``search_files``
+    # 同一个 store)。接上以后 ``agent_node`` 每轮在提示词尾部挂一段工作区快照,
+    # 模型不必去探就知道自己上一轮写下的东西还在。``None``(单测 / 没接 NAS 的
+    # 环境)→ 不注入, 提示词与 B-84 之前逐字相同。
+    workspace_store: WorkspaceStore | None = None,
     approval_required_tools: frozenset[str] = frozenset(),
     approval_timeout_s: int = 86400,
     # B-20 approval triage — clarification-class ``ask_for_approval`` rows
@@ -890,6 +902,39 @@ def build_react_graph(
         # Stream Agent-Templates (M1-5a) — the end-user this run is for, threaded
         # to the token-usage middleware for per-user cost attribution.
         user_id = _parse_uuid(configurable.get("user_id"))
+        # B-84 PR-2 —— 工作区快照段。**每轮重取**(宿主 NAS listdir 实测 8.3ms),
+        # 挂在提示词尾部的一条隐藏 HumanMessage 上, 不进系统提示词。三个理由:
+        #
+        # 1. 构建缓存按 ``(tenant, name, version, spec_sha256, oauth_subject)`` 命中
+        #    (``control_plane.runtime.AgentRuntime.get_agent``), 而 ``oauth_subject``
+        #    只在该用户接了 OAuth 连接器时才等于 user —— 没接的 agent 在用户之间
+        #    共享同一份构建。快照进系统提示词 = 把 A 的文件名发给 B。
+        # 2. 系统提示词是 prompt 前缀缓存的那一段, 快照每轮都变, 进去等于每轮把缓存
+        #    打掉。L1 把 plan 从 ``SystemMessage`` 挪出来正是这个理由(见
+        #    ``_inject_plan`` 的 docstring)。
+        # 3. ``api/runs.py`` 每个 run 往线程追加一条完整系统提示词, 而
+        #    ``llm.coalesce.coalesce_system_messages`` 按**原始顺序**拼 —— 模型会同时
+        #    读到 N 份快照, 最旧的排最前。
+        #
+        # **不加任何入口判断。** 接线点在这里 = 每一条走 agent 图的路径(主 run /
+        # 队列 worker / 孤儿重收 / 触发器投递 / 技能演化 / 审批续跑 / 委派子代)自动
+        # 全覆盖;加一道"只有主 run 才注入"反而要额外写条件去挡掉其余六条。委派子代
+        # 透传的是**父的** ``agent_key``(``_child_run._child_config``), 与父共享同一
+        # 个工作区作用域, 块内容对两者是同一份 —— 真实 worker 事件里父代正是在任务
+        # 正文里手抄了一份文件清单给 worker, 那份清单就是这个块要自动化掉的东西。
+        # 「规矩只写一处就漏两个」在本仓库有前科(#1373 + #1382 的 run trace 绑定)。
+        #
+        # 身份一律从**本次 run 的** config 取, 与 ``read_file`` / ``list_dir`` 同一个
+        # 来源(``_build_tool_context`` 读的也是这三个键)。
+        agent_key_raw = configurable.get("agent_key")
+        if workspace_store is not None and tenant_id is not None and user_id is not None:
+            messages = await _workspace_block_tail(
+                messages,
+                workspace_store,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_key=agent_key_raw if isinstance(agent_key_raw, str) else "",
+            )
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 
@@ -1918,6 +1963,71 @@ def _keep_latest_inputs_block(
     if block is None or any(m is block for m in after):
         return list(after)
     return [*after, block]
+
+
+def _is_workspace_block(msg: BaseMessage) -> bool:
+    """B-84 PR-2 —— 这条消息是不是平台注入的工作区快照段。"""
+    return isinstance(msg, HumanMessage) and bool(
+        (msg.additional_kwargs or {}).get(WORKSPACE_BLOCK_MARK)
+    )
+
+
+def _without_workspace_blocks(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """剔掉提示词视图里**全部**工作区快照段。
+
+    与 :func:`_keep_latest_inputs_block` 不是一件事, 别照着改:那个是「压缩之后把
+    原件放回去」, 这个是 dedup。区别在「过期」的含义 —— 「本轮输入」段过期只是里面
+    的路径失效, 而工作区快照过期是**内容本身在说谎**:它逐字声称的是「/workspace
+    现在有什么」、块首还写明「这一轮开始时」。两段同时在场, 模型读到的是两份互相
+    矛盾的「现在」, 而最旧的那份排在最前面。
+
+    **为什么是"全剔"而不是"留最新一条"**:调用方
+    (:func:`_workspace_block_tail`)紧接着就挂一段这一轮新取的上去 —— 对它而言
+    "已经在场的"与"除最新之外的"是同一批。而这一轮取不到时(列目录失败 / 工作区被
+    清空), 上一轮那段更不能留下来顶班:它会顶着「这一轮开始时」的块首去描述一个已经
+    不存在的工作区, 那比没有块更坏。
+
+    只改这一次的提示词视图, 检查点不动(CM-C4)—— 被剔掉的消息在会话历史里原样还在。
+    """
+    return [m for m in messages if not _is_workspace_block(m)]
+
+
+async def _workspace_block_tail(
+    messages: list[BaseMessage],
+    store: WorkspaceStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+) -> list[BaseMessage]:
+    """B-84 PR-2 —— 重取一份工作区快照, 挂到提示词尾部;更早的那几段一并剔掉。
+
+    出口不变式:提示词视图里**至多一段**工作区快照, 而且它一定是这一轮取的。
+
+    **挂尾部**, 与 :func:`_append_tail_human_message` 同一个位置口径:它是隐藏
+    ``HumanMessage``, :func:`~expert_work.common.conversation_channel.opens_segment`
+    判它不开新一轮; 而尾部是这一轮唯一不可能夹在 ``tool_call`` ↔ ``tool_result``
+    之间的位置 —— ``agent_node`` 是「下一步要发给模型」的那一刻, 队尾要么是用户消息
+    要么是一批工具结果, 永远不会是一条还没收到结果的 ``tool_calls``。
+
+    **取不到就只剔不加**(``workspace_prompt_block`` 拿不到 listing 返回 ``""``):
+    工作区空了、或者这一轮列目录失败, 都不该让上一轮那份过期快照留下来顶班。
+    """
+    kept = _without_workspace_blocks(messages)
+    block = await workspace_prompt_block(
+        store, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key
+    )
+    if not block:
+        return kept
+    # ``HIDE_FROM_UI`` = 不进任何面向用户/第三方的视图, 也不开新一段;
+    # ``WORKSPACE_BLOCK_MARK`` 是更窄的一层, 让上面的 dedup 只认自己这一段。
+    return [
+        *kept,
+        HumanMessage(
+            content=block,
+            additional_kwargs={HIDE_FROM_UI: True, WORKSPACE_BLOCK_MARK: True},
+        ),
+    ]
 
 
 def _inject_plan(messages: list[BaseMessage], plan: Plan) -> list[BaseMessage]:

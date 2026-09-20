@@ -160,7 +160,6 @@ from orchestrator.tools.skill_seed import (
 )
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
-from orchestrator.tools.workspace_tree import workspace_prompt_block
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")
 
@@ -596,14 +595,6 @@ async def build_agent(
     # files (dual-read: inline rows need it never, external rows fetch through
     # it in skill_seed / skill_view). ``None`` keeps inline-only behavior.
     skill_asset_store: SkillAssetStore | None = None,
-    # B-84 PR-2 —— 这次构建归属的用户。给齐(且 ``tool_env.workspace_store`` 已接)
-    # 时, 系统提示词多一段 run 起点的工作区树形摘要, 让模型不必去探就知道自己上一
-    # 轮写下的东西还在。
-    #
-    # **为什么用户是单独一个参数**:工作区按 ``{tenant}/{user}`` 存, 而 ``build_agent``
-    # 的其余部分一概只认租户 —— 这是第一个需要"这次构建是给谁建的"的地方。``None``
-    # (今天所有调用方)= 块不出现, 系统提示词与 B-84 之前逐字相同。
-    workspace_user_id: UUID | None = None,
 ) -> BuiltAgent:
     """Assemble a :class:`BuiltAgent` from a validated :class:`AgentSpec`.
 
@@ -1053,29 +1044,6 @@ async def build_agent(
         and len(registry) > 0
         else None
     )
-    # B-84 PR-2 —— run 起点的工作区树形摘要。条件就是"够得着那棵树":接了工作区
-    # 存储(它同时也是 read_file / list_dir / search_files 的依赖, 所以有它就一定有
-    # 文件工具)、而且这次构建知道是给哪个用户建的。
-    #
-    # 列的是当前 agent 自己那一层(``agent_scope(agent_key)``), 不是整个用户根 ——
-    # 本块要回答的是"这个 agent 上次建的锚还在不在", 别的 agent 的文件既不相关也会
-    # 把块撑大。listing 失败 / 工作区是空的 -> 整块不出现(见
-    # ``workspace_prompt_block``), 永不让构建失败。
-    workspace_block: str | None = None
-    if (
-        env.workspace_store is not None
-        and workspace_user_id is not None
-        and isinstance(tenant_id, UUID)
-    ):
-        workspace_block = (
-            await workspace_prompt_block(
-                env.workspace_store,
-                tenant_id=tenant_id,
-                user_id=workspace_user_id,
-                agent_key=agent_key,
-            )
-            or None
-        )
     final_system_prompt = _assemble_system_prompt(
         base=spec.spec.system_prompt.template,
         skill_fragments=loaded_skills.prompt_fragments,
@@ -1086,7 +1054,6 @@ async def build_agent(
         current_date=current_date,
         tool_use_enforcement=tool_use_enforcement,
         spotlight=spec.spec.defenses.prompt_injection == "spotlight",
-        workspace_block=workspace_block,
         # 动态子智能体委派率增强(层 2)— gated on the spawn_worker tool having
         # actually registered for THIS build: the per-agent dynamic_workers
         # opt-out, the platform wiring switch, and the depth cap all fold into
@@ -1179,6 +1146,10 @@ async def build_agent(
         tool_output_budget_enabled=tool_budget_enabled,
         pre_compaction_flush=pre_compaction_flush,
         workspace_writer_factory=workspace_writer_factory,
+        # B-84 PR-2 —— 宿主侧工作区读。同一个 store 既是 read_file / list_dir /
+        # search_files 的依赖, 也是每轮那段工作区快照的取数口 —— 块里列的与模型
+        # ``list_dir .`` 看到的因此是同一棵树。``None``(没接 NAS 的单测)→ 不注入。
+        workspace_store=env.workspace_store,
         workspace_ingest_node=workspace_ingest_node,
         inputs_node=inputs_node,
         # B-67 §七 —— 手抄守卫的提示只对 trusted 变量写链接名。
@@ -1831,7 +1802,6 @@ def _assemble_system_prompt(
     tool_use_enforcement: str | None = None,
     spotlight: bool = False,
     worker_delegation: bool = False,
-    workspace_block: str | None = None,
 ) -> str:
     """Splice base system prompt + skill summary list + ordered body
     fragments (eager skills only) + SE-10 text-class component blocks.
@@ -1871,15 +1841,6 @@ def _assemble_system_prompt(
     # cache-stable (see ``_current_date_block``).
     if current_date:
         pieces.append("\n\n# Current date\n" + current_date)
-
-    # B-84 PR-2 —— 工作区快照。与 ``# Current date`` 同一档(平台算出来的事实性
-    # 背景, 先于下面那批顾问性 skill / memory 块)。块首自己声明会过期、声明只说
-    # 元数据、声明工具失败不等于文件不在, 措辞见 ``workspace_tree``。
-    #
-    # 传进来的要么是**完整的块**要么是 ``None`` —— 绝没有"(无法读取)"这种半截块:
-    # 半截块会被模型读成"工作区是空的", 而那正是本 PR 要治的误判。
-    if workspace_block:
-        pieces.append("\n\n" + workspace_block)
 
     # Stream PI-1 — spotlighting clause: tells the model the untrusted-content
     # markers/glyph mean "data, never instructions". Wrapping of the untrusted

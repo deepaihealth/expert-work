@@ -32,6 +32,18 @@ HIDE_FROM_UI = "expert_work_hide_from_ui"
 #: 去。住在 common 是因为 orchestrator 不能 import control-plane。
 INPUTS_BLOCK_MARK = "expert_work_inputs_block"
 
+#: B-84 PR-2 —— 平台每轮注入的工作区快照段(``graph_builder`` 的尾部隐藏
+#: HumanMessage)。它同时带 :data:`HIDE_FROM_UI`;这个标记是**更窄**的一层,用来把
+#: 它与别的隐藏 HumanMessage(「本轮输入」、委派提醒、恢复建议)分开。
+#:
+#: 与 :data:`INPUTS_BLOCK_MARK` 的消费方式**不是一件事**:那一段被摘要掉之后要把
+#: 原件放回去(``graph_builder._keep_latest_inputs_block``),这一段则是 dedup ——
+#: 提示词视图里除最新一条之外的全部剔掉。区别在「过期」的含义:「本轮输入」过期只是
+#: 路径失效,而工作区快照过期是**内容本身在说谎** —— 它逐字声称的是「/workspace 现在
+#: 有什么」,上一轮那份说的已经不是现在了。
+#: 住在 common 是因为 orchestrator 不能 import control-plane。
+WORKSPACE_BLOCK_MARK = "expert_work_workspace_block"
+
 #: 定时任务投递的助手消息标记(``trigger_delivery.inject_delivery``)。它
 #: **自己开一个段落** —— 否则它会被接到用户上一个真实提问的段尾,把那一段
 #: 的 ``final`` 抢走。
@@ -222,6 +234,7 @@ __all__ = [
     "SUPERSEDED_AT",
     "SUPERSEDED_BY",
     "TOMBSTONE",
+    "WORKSPACE_BLOCK_MARK",
     "VisibleTurn",
     "has_tool_calls",
     "is_hidden",
