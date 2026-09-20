@@ -33,10 +33,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -1561,6 +1562,87 @@ def _render_skill_summary(*, name: str, version: SkillVersion) -> str:
     return f'<skill name="{name}" description="{description}" />'
 
 
+#: B-84 item 8 —— ``<available-skills>`` 索引段的字符预算(单位是**字符**,
+#: 不是 token:字符是渲染出来就能数的,token 要挑 tokenizer,而护栏的价值
+#: 在于"任何人任何时候都能算出同一个数")。
+#:
+#: 2026-09-20 测试环境实测的定位依据:
+#:
+#: * 单条索引 288 ~ 471 字符;
+#: * 今天最大的绑定集合是 19 个(ai-health-plan / ai-health-report),索引
+#:   5,470 字符;体积最大的是 sop2-designer(13 个技能、描述长),6,129 字符;
+#: * 把全部 57 个活跃技能绑到一个 agent 上 = 18,571 字符。
+#:
+#: 18,000 因此落在"今天最大的 3 倍还多、而全绑 57 个刚好越线"的位置:存量
+#: 一个都碰不到,真出现"把整个技能库绑上去"的用法时它会在那一刻生效。
+MAX_SKILLS_INDEX_CHARS: Final[int] = 18_000
+
+#: 降级告知行(见 :func:`_render_skills_index`)的预留字符数。告知行本身也要
+#: 进提示词,所以只留名字的那一档按 ``MAX_SKILLS_INDEX_CHARS - 这个数`` 去量,
+#: 而不是假装那一行不要钱。200 对照实测:57 个技能时告知行约 110 字符。
+DEGRADE_NOTICE_OVERHEAD: Final[int] = 200
+
+#: 从 :func:`_render_skill_summary` 的产物里取回技能名。它和上面那个渲染函数
+#: 是一对 —— 改了那边的属性顺序,这边必须一起改(``test_agent_factory_skill_
+#: index_budget.py`` 里有一条 round-trip 钉住这件事)。
+_SKILL_SUMMARY_NAME_RE: Final[re.Pattern[str]] = re.compile(r'^<skill name="([^"]*)"')
+
+
+def _render_skill_name_only(summary: str) -> str:
+    """把一条完整索引压成只剩名字的形式。
+
+    取不到名字就原样返回 —— 降级的目的是省字符,**不是丢条目**;宁可这一条
+    没省下来,也不能让它从清单里消失。
+    """
+    match = _SKILL_SUMMARY_NAME_RE.match(summary)
+    if match is None:
+        return summary
+    return f'<skill name="{match.group(1)}" />'
+
+
+def _render_skills_index(summaries: Sequence[str]) -> str:
+    """B-84 item 8 —— 渲染 ``<available-skills>`` 的内容,超预算就降一档。
+
+    两档,没有第三档:
+
+    * **档 1(默认)**:原样 —— ``<skill name="..." description="..." />``。
+      今天所有 agent 都走这一档(最大 6,129 字符,预算 18,000)。
+    * **档 2(超预算)**:只留名字,**所有条目都在,一条不少**。名字是恢复
+      路径的句柄 —— ``skill_view(name)`` 按名字加载正文,所以只要名字还在,
+      模型就仍然够得着每一个技能;丢掉条目则是不可恢复的。降级时块首加一行
+      明说这件事,不让模型以为这些技能只有名字没有正文。
+
+    只留名字仍然超预算时**照发**,只打一条 ``logger.warning``,不截断、不丢。
+    57 个技能只留名字约 1-2 KB,离 18,000 还差一个数量级,所以这一档预期
+    永不触发;留着是兜底 —— 与其在那种情况下悄悄少给模型几个技能,不如超了
+    预算但清单完整,再由日志把这件事喊出来。
+
+    **判定与渲染只看 ``summaries`` 的内容与顺序**,不读 user_id / 租户 /
+    时间 / 使用频次。理由是它决定的是系统提示词的前缀:任何按轮、按用户变化
+    的内容都会让整段下游 prompt cache 作废,省下的那点字符远不够赔。
+    """
+    full = "\n  ".join(summaries)
+    if len(full) <= MAX_SKILLS_INDEX_CHARS:
+        return full
+
+    name_only = [_render_skill_name_only(s) for s in summaries]
+    notice = (
+        f"⚠️ {len(name_only)} skills listed by name only (index size budget). "
+        f"Call skill_view(name) to read any of them."
+    )
+    degraded = "\n  ".join([notice, *name_only])
+    if len("\n  ".join(name_only)) > MAX_SKILLS_INDEX_CHARS - DEGRADE_NOTICE_OVERHEAD:
+        logger.warning(
+            "skills index still over budget after name-only degrade: %d skills, "
+            "%d chars > %d — sending it anyway (dropping entries would strand "
+            "skills the model can no longer name)",
+            len(name_only),
+            len(degraded),
+            MAX_SKILLS_INDEX_CHARS,
+        )
+    return degraded
+
+
 #: Agent wall-clock timezone for the injected "current date" line. The injected
 #: value is day-granular (see ``_current_date_block``) so the system prompt stays
 #: byte-stable across every run within one calendar day, keeping the prompt-cache
@@ -1778,7 +1860,9 @@ def _assemble_system_prompt(
             '(e.g. python "$EXPERT_WORK_SKILLS_DIR/<skill name>/scripts/gen.py"). '
             "The sandbox working directory is /workspace, which is NOT where "
             "skill files live."
-            "\n\n<available-skills>\n  " + "\n  ".join(skill_summaries) + "\n</available-skills>"
+            "\n\n<available-skills>\n  "
+            + _render_skills_index(skill_summaries)
+            + "\n</available-skills>"
         )
 
     if skill_fragments:
