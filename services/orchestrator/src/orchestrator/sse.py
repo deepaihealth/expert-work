@@ -850,7 +850,7 @@ async def run_agent(
         # snapshot(多读两个键,不多一次 IO),降级也照同一条契约:读不到就是
         # **无记录**(两个值留 ``None``),绝不让 run 失败 —— 这两列是诚实性
         # 信号,它自己失灵不该反过来把一次正常的 run 判死。
-        last_batch_failures: list[Any] = []
+        unresolved_failures: list[Any] = []
         if not record.abort_event.is_set():
             try:
                 snapshot = await graph.aget_state(effective_config)
@@ -863,7 +863,7 @@ async def run_agent(
                     )
                 raw_exit = snapshot.values.get("exit_reason")
                 exit_reason = raw_exit if isinstance(raw_exit, str) else None
-                last_batch_failures = list(snapshot.values.get("last_batch_failures") or [])
+                unresolved_failures = list(snapshot.values.get("unresolved_failures") or [])
             except Exception:
                 logger.warning("run_agent.pause_check_failed run_id=%s", run_id, exc_info=True)
 
@@ -890,7 +890,7 @@ async def run_agent(
         # 不猜一个值填进去:造出来的「已完成」比没有信号更坏。
         if exit_reason is not None:
             completed = compute_completed(
-                exit_reason=exit_reason, last_batch_failures=last_batch_failures
+                exit_reason=exit_reason, unresolved_failures=unresolved_failures
             )
         await run_manager.set_status(
             run_id,

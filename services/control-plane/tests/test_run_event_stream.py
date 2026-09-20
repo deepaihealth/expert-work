@@ -777,7 +777,7 @@ async def test_both_sse_paths_carry_the_completion_signal() -> None:
     哪怕我只给其中一条路径接线,它照样绿。这一条把字段真的放进去再比一次。
 
     同时钉住本条最要命的那个组合:``status="success"`` 而 ``completed=false`` ——
-    图跑完了没抛异常,但最后一批工具调用里还有未解决的失败,事没做成。
+    图跑完了没抛异常,但 run 里还有没被抵消掉的工具失败,事没做成。
     """
     from expert_work.runtime.runs import RunManager
     from orchestrator.sse import run_agent, sse_consumer
@@ -793,7 +793,7 @@ async def test_both_sse_paths_carry_the_completion_signal() -> None:
     store = InMemoryRunEventStore()
 
     class _FailedBatch:
-        """``last_batch_failures`` 只看有没有,不看内容(见 compute_completed)。"""
+        """``unresolved_failures`` 只看有没有,不看内容(见 compute_completed)。"""
 
         error_class = "tool_error"
 
@@ -807,7 +807,7 @@ async def test_both_sse_paths_carry_the_completion_signal() -> None:
             from types import SimpleNamespace
 
             return SimpleNamespace(
-                values={"exit_reason": "text_response", "last_batch_failures": [_FailedBatch()]}
+                values={"exit_reason": "text_response", "unresolved_failures": [_FailedBatch()]}
             )
 
     await run_agent(

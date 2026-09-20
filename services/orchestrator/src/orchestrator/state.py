@@ -222,17 +222,36 @@ class AgentState(TypedDict):
     #: decomposition (already deep-thought by the planner) never re-fires.
     last_plan_goal: NotRequired[str | None]
     tool_failures: NotRequired[list[ClassifiedToolError]]
-    #: B-85 ③ —— 最近一批工具调用里**未解决的**失败(只留非 transient)。
+    #: B-85 ③ / B-84 第 3 条 —— **整个 run** 里还没被抵消掉的非 transient 工具失败,
+    #: 按首次出现的顺序排。
     #:
     #: 与 ``tool_failures`` 的区别是它**不按轮重置**:``tool_failures`` 被
     #: ``agent_node`` 读完、发完 ``<recovery-advisory>`` 就清空,走到 END 时
-    #: 恒为空,拿不到。这一条由 ``tools`` 节点**每批无条件覆盖**(全成功的批
-    #: 写 ``[]``),所以终局读到的恒是「最后一批的情况」。
+    #: 恒为空,拿不到。
     #:
-    #: 为什么写在 ``tools`` 节点而不是 ``agent_node``:后者看到空列表时分不清
-    #: 「这批工具全成功」与「这一轮压根没跑工具」,而 ``tools`` 节点只在真跑过
-    #: 一批时才执行 —— 它写下的值天然带着「确实跑过一批」这个前提。
-    last_batch_failures: NotRequired[list[ClassifiedToolError]]
+    #: 记账键是 ``(资源空间, 标识)``,**按写的是哪份东西记,不按哪个工具写的它**:
+    #: ``save_artifact`` → ``("artifact", name)``、``write_file`` / ``edit_file``
+    #: → ``("file", path)``、取不到路径的 → ``("tool", 工具名)``。
+    #:
+    #: * 本批出现非瞬态失败 → 以该键记一条;同键已有就**保留先出现的那条**
+    #:   (第一条错误信息比最后一条有用);
+    #: * 本批有同键的**成功**调用 → 把该键那条删掉;
+    #: * transient 一律不进账 —— 可重试的抖动不是「没做成」的证据。
+    #:
+    #: 前身是「只看最后一批」的 ``last_batch_failures``,它漏掉了整整一格:批 1
+    #: 调工具 A 失败、批 2 调工具 B 成功、然后模型给出文字答复 —— 终局那一批是
+    #: 干净的,于是判 ``completed=true``,而 A 从来没成功过。照 hermes-agent 的
+    #: ``turn_explainers._record_file_mutation_result`` 改成按键记账 + 抵消
+    #: (差别是它只管文件变更类工具,这里管全部工具)。
+    #:
+    #: **已知局限**:取不到路径的工具只有工具名这一层粒度 —— 一次失败的
+    #: ``exec_python`` 会被另一次跑完全不相干脚本的 ``exec_python`` 抵消掉。
+    #: 方向是少报不是多报,扩更多工具的路径提取不在本条范围内。
+    #:
+    #: 为什么写在 ``tools`` 节点而不是 ``agent_node``:后者分不清「这批工具全成功」
+    #: 与「这一轮压根没跑工具」,而 ``tools`` 节点只在真跑过一批时才执行 ——
+    #: 没跑工具的轮次天然不动这个通道,不会把前面的欠账抹掉。
+    unresolved_failures: NotRequired[list[ClassifiedToolError]]
     #: B-85 ③ —— run 从哪个出口结束的,由**知道答案的那一行**盖章。
     #:
     #: 封闭取值:``text_response`` / ``max_steps`` / ``no_progress`` /

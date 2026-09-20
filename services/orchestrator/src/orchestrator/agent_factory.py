@@ -1677,8 +1677,9 @@ def _tool_use_enforcement_active(*, mode: str, model: ModelSpec) -> bool:
 #: B-85 ③ 第二条腿 —— completion contract。**平台级,无开关,恒在。**
 #:
 #: A 腿(``exit_reason`` / ``completed``)只看得见「run 结束得紧挨着一批失败」
-#: 这个外在形态。模型换了个方法绕过失败、最后交出一个其实没做成的东西时,
-#: ``last_batch_failures`` 是空的,A 腿会判它做成了 —— 那一格只有让模型自己说。
+#: 这个外在形态。模型**绕过失败另起一条路**、最后交出一个其实没做成的东西时,
+#: 那条路自己是成功的,``unresolved_failures`` 里也就没有它 —— A 腿会判它做成了,
+#: 那一格只有让模型自己说。
 #: 做法照 openclaw 的 ``<completion_contract>``(``gpt5-prompt-overlay.ts``)。
 #:
 #: **平台不解析正文里的 ``[blocked]``**:解析模型自由文本是脆的,而且一旦解析

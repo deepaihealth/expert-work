@@ -176,6 +176,7 @@ from orchestrator.tools.error_classifier import (
 from orchestrator.tools.find_tools import promotion_events
 from orchestrator.tools.mcp import parse_mcp_tool_name
 from orchestrator.tools.mutation_classifier import classify as classify_mutation
+from orchestrator.tools.mutation_classifier import resource_space as mutation_resource_space
 from orchestrator.tools.overflow import (
     EXEMPT_TOOLS,
     EXTERNALIZE_MIN_CHARS,
@@ -1657,6 +1658,9 @@ def build_react_graph(
         #   2. success-but-didn't-land — L-4's mutation classifier on a
         #      non-error ToolMessage, folded into ``mutation_not_landed``.
         tool_failures: list[ClassifiedToolError] = []
+        # B-84 第 3 条 —— 本批每一次**真跑过**的调用留下 (记账键, 失败或 None),
+        # 按 tool_call 顺序,喂给 ``_apply_failure_ledger`` 去更新 run 级欠账。
+        batch_outcomes: list[tuple[tuple[str, str], ClassifiedToolError | None]] = []
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
             new_messages.append(tool_message)
@@ -1686,6 +1690,12 @@ def build_react_graph(
                 # read as "the write did not land") → no advisory, no error count.
                 continue
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
+            batch_outcomes.append(
+                (
+                    _ledger_key(tool_calls[idx], tool_message, failure),
+                    _ledger_failure(failure, classified),
+                )
+            )
             if failure is not None:
                 tool_failures.append(failure)
                 _cm_tool_error_total.labels(
@@ -1752,14 +1762,13 @@ def build_react_graph(
         # default fast-path active.
         if tool_failures:
             result_dict["tool_failures"] = tool_failures
-        # B-85 ③ —— **无条件**写(全成功的批写 ``[]``)。只在非空时写的话,
-        # 「批 1 失败 → 批 2 全成功 → 结束」之后通道里还留着批 1 的失败,
-        # 一个已经自我恢复的 run 会被误判成没做成。
-        # 只留非 transient:与下面 ``error_signal`` 同一条谓词 —— transient 是
-        # 可重试的抖动,不是「没做成」的证据。
-        result_dict["last_batch_failures"] = [
-            f for f in tool_failures if f.error_class != "transient"
-        ]
+        # B-85 ③ / B-84 第 3 条 —— run 级欠账:拿上一轮结转的账,套上本批的成败。
+        # **不是**「最后一批的情况」:批 1 的失败没被同键的成功抵消掉,就一直留着,
+        # 哪怕后面几批全干净。这个节点只在真跑过一批工具时执行,所以「没跑工具的
+        # 轮次不动它」是结构保证的。
+        result_dict["unresolved_failures"] = _apply_failure_ledger(
+            state.get("unresolved_failures") or [], batch_outcomes
+        )
         # Stream J.8 — when this batch ran on an approve / modify resume,
         # clear the transient ``approval_resume`` channel so a follow-on
         # turn does not re-apply the stale verdict.
@@ -2129,6 +2138,90 @@ def _classify_tool_failure(
             path=outcome.path,
         )
     return classified
+
+
+def _ledger_key_for(tool_name: str, path: str | None) -> tuple[str, str]:
+    """B-84 第 3 条 —— 欠账的记账键 ``(资源空间, 标识)``。
+
+    **按写的是哪份东西记,不按哪个工具写的它** —— 文件最后写成了债就还清,
+    照 hermes ``turn_explainers._record_file_mutation_result``。所以
+    ``edit_file`` 改 ``a.py`` 失败、``write_file`` 重写 ``a.py`` 成功,同键,
+    抵消得掉;按工具名记就抵消不掉,而这一格是 60 天数据里最常见的那一格。
+
+    **但不退成「path 单独一个键」**:产物名字空间与工作区路径会撞名(都可以叫
+    ``a.py``),撞上就是一次假抵消。资源空间既对齐 hermes 的语义,又不串味。
+
+    取不到路径的(非写类工具,或写类工具连入参都没给对)退化成
+    ``("tool", 工具名)`` —— 粒度粗,方向是**少报**不是多报,且永远不跨空间。
+    """
+    space = mutation_resource_space(tool_name)
+    if space is None or path is None:
+        return ("tool", tool_name)
+    return (space, path)
+
+
+def _ledger_key(
+    tool_call: dict[str, Any],
+    tool_message: ToolMessage,
+    failure: ClassifiedToolError | None,
+) -> tuple[str, str]:
+    """这次调用的记账键。失败侧读 :class:`ClassifiedToolError` 的 ``path``
+    (只有 ``mutation_not_landed`` 会填),成功侧走 L-4 的
+    :func:`~orchestrator.tools.mutation_classifier.classify` ——
+    **两侧同一个提取器**,否则键对不上,一次成功的重写抵消不掉它自己那条欠账。
+    """
+    if failure is not None:
+        return _ledger_key_for(failure.tool_name, failure.path)
+    name = str(tool_call.get("name", ""))
+    outcome = classify_mutation(name, tool_call.get("args") or {}, tool_message)
+    return _ledger_key_for(name, outcome.path if outcome is not None else None)
+
+
+def _ledger_failure(
+    failure: ClassifiedToolError | None,
+    classified: ClassifiedToolError | None,
+) -> ClassifiedToolError | None:
+    """记账用哪一条分类 —— **以催生它的那个异常为准**。
+
+    `_classify_tool_failure` 里 mutation 分类器优先(CM-B2),写类工具的失败
+    一律折成 ``mutation_not_landed``,**transient 那一位就被吃掉了**。这在
+    advisory 那一侧是既有行为(给模型的话确实该说「这个写没落地」),但在欠账
+    这一侧会直接违反本条自己的规矩:一次沙箱 504 —— 正是 #1639 刚修好归成
+    ``transient`` 的那种 —— 会被记成一笔真欠账,把一个只是抖了一下的 run
+    判成没做成。这里拿催生它的那条原始分类兜回来,只影响记账,不动 advisory。
+    """
+    if failure is not None and classified is not None and classified.error_class == "transient":
+        return classified
+    return failure
+
+
+def _apply_failure_ledger(
+    carried: Sequence[ClassifiedToolError],
+    batch: Sequence[tuple[tuple[str, str], ClassifiedToolError | None]],
+) -> list[ClassifiedToolError]:
+    """把一批工具调用的成败套到 run 级欠账上,返回还没被抵消的失败。
+
+    照 hermes-agent ``turn_explainers._record_file_mutation_result`` 的记账法
+    (差别是它只管文件变更类工具,这里管全部工具):
+
+    * 非瞬态失败 → 以该键记一条,**同键已有就保留先出现的那条** ——
+      第一条错误信息比最后一条有用;
+    * 同键的成功调用 → 把该键那条删掉;
+    * transient 既不进账也不抵消 —— 可重试的抖动两个方向都不是证据。
+
+    ``batch`` 按 tool_call 顺序处理,所以同一批里「失败在前、同键成功在后」
+    抵消得掉,反过来则留账。返回值按首次出现排序(``dict`` 的插入序,
+    ``setdefault`` 不会把已有键挪到末尾)。
+    """
+    ledger: dict[tuple[str, str], ClassifiedToolError] = {
+        _ledger_key_for(f.tool_name, f.path): f for f in carried
+    }
+    for key, failure in batch:
+        if failure is None:
+            ledger.pop(key, None)
+        elif failure.error_class != "transient":
+            ledger.setdefault(key, failure)
+    return list(ledger.values())
 
 
 def _build_recovery_advisory(failures: list[ClassifiedToolError]) -> HumanMessage:

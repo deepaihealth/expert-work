@@ -100,6 +100,38 @@ class _ScriptedSaveArtifact:
         return ToolResult(content=f"Saved {args.get('name')!r}.")
 
 
+@dataclass
+class _ScriptedWorkspaceWrite:
+    """``write_file`` / ``edit_file`` stub —— 路径参数叫 ``path``,不是 ``name``。
+
+    B-84 第 3 条把这两个工具加进了 L-4 的 mutation 分类器,所以它们的失败
+    现在也走 ``mutation_not_landed`` 并带得出路径。
+    """
+
+    name: str = "edit_file"
+    fail: bool = False
+    error: str = "old_string not found"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name=self.name,
+            description="scripted workspace write",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            path_args=("path",),
+        )
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del ctx
+        if self.fail:
+            raise OSError(self.error)
+        return ToolResult(content=f"Wrote {args.get('path')!r}.")
+
+
 def _tc(name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
     return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
 
@@ -168,6 +200,61 @@ async def test_failing_save_artifact_populates_tool_failures_channel() -> None:
     content = advisory.content if isinstance(advisory.content, str) else ""
     assert "report.md" in content
     assert "mutation_not_landed" in content
+
+
+@pytest.mark.asyncio
+async def test_failing_edit_file_advisory_carries_the_path() -> None:
+    """B-84 第 3 条 —— ``edit_file`` 进了 mutation 分类器之后,它的失败也
+    **带得出那个路径**。
+
+    这是扩集合带来的行为变化,不是纯加法:扩之前 ``edit_file`` 的失败走
+    error_classifier 的通用分类(``unknown`` 之类),advisory 里**没有路径**,
+    模型只知道「有个编辑失败了」。路径是 run 级欠账的记账单位,取不到它,
+    ``edit_file`` 失败 → ``write_file`` 重写成功这一格就抵消不掉。
+    """
+    prompts: list[list[BaseMessage]] = []
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("edit_file", {"path": "style/render.py"}, "t1")]),
+            AIMessage(content="done"),
+        ],
+        seen_prompts=prompts,
+    )
+    registry = ToolRegistry()
+    registry.register(_ScriptedWorkspaceWrite(fail=True))
+
+    await _run(llm, registry)
+
+    advisory = _find_advisory(prompts[1])
+    assert advisory is not None
+    content = advisory.content if isinstance(advisory.content, str) else ""
+    assert "style/render.py" in content, "路径没带出来,欠账就对不上键"
+    assert "mutation_not_landed" in content
+
+
+@pytest.mark.asyncio
+async def test_successful_write_file_is_not_judged_a_failure() -> None:
+    """扩集合的**反向**防线:成功的写不许被判成没落地。
+
+    ``classify`` 现在对 ``write_file`` 一律返回 ``MutationOutcome``,成功那条
+    ``landed=True``,``_classify_tool_failure`` 必须继续返回 ``None``。搞反了
+    就是每一次正常写入都发一条 advisory —— 比不发更坏,模型会学会无视它。
+    """
+    prompts: list[list[BaseMessage]] = []
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("write_file", {"path": "a.py"}, "t1")]),
+            AIMessage(content="done"),
+        ],
+        seen_prompts=prompts,
+    )
+    registry = ToolRegistry()
+    registry.register(_ScriptedWorkspaceWrite(name="write_file"))
+
+    state = await _run(llm, registry)
+
+    assert _find_advisory(prompts[1]) is None, "成功的写不该有 advisory"
+    assert state.get("unresolved_failures", []) == [], "成功的写不该留欠账"
 
 
 @pytest.mark.asyncio
