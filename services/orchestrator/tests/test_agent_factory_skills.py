@@ -615,3 +615,53 @@ async def test_inherited_matching_skill_still_loads(
         skills_inherited=True,
     )
     assert "be helpful with X" in built.system_prompt
+
+
+# ---------------------------------------------------------------------------
+# B-84 — the bind path reports "bind", never "view"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_time_bind_reports_kind_bind_not_view(
+    cp: BaseCheckpointSaver[object],
+) -> None:
+    """把技能绑进提示词 != 模型读过它。
+
+    这条是 B-84 的硬不变式: ``_load_skills`` 只能报 ``kind="bind"``。它一旦报
+    ``"view"``,每次 agent build 都会往 ``skill_run_usage`` 写一条 viewed 证据行,
+    于是「被打开过」重新退化成「还绑着吗」—— 正是这次改动要消灭的那个混淆。
+    """
+    from expert_work.common.skill_activity import SkillActivityKind, SkillViewEvent
+
+    calls: list[tuple[UUID, UUID, str, SkillViewEvent | None]] = []
+
+    class _Recorder:
+        async def record(
+            self,
+            *,
+            skill_id: UUID,
+            tenant_id: UUID,
+            kind: SkillActivityKind = "bind",
+            view: SkillViewEvent | None = None,
+        ) -> None:
+            calls.append((skill_id, tenant_id, kind, view))
+
+    spec = _spec_with_skills(["foo"])
+    version = _make_version(name="foo")
+    resolver = _make_resolver({("foo", None): _SkillLookupResult.ok(version)})
+    await _build(
+        spec,
+        secret_store=_secret_store(),
+        checkpointer=cp,
+        skill_resolver=resolver,
+        tenant_id=uuid4(),
+        skill_activity_recorder=_Recorder(),
+    )
+
+    assert calls, "绑定路径必须报一次活动,否则 Curator 会把刚绑上的技能判 stale"
+    assert [c[2] for c in calls] == ["bind"] * len(calls)
+    assert calls[0][0] == version.skill_id
+    assert calls[0][1] == version.tenant_id
+    # 绑定不该带证据载荷 —— 带了就等于宣称模型打开过它。
+    assert [c[3] for c in calls] == [None] * len(calls)

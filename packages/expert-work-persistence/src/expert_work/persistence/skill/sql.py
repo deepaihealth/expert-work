@@ -41,9 +41,10 @@ from expert_work.protocol import (
     SkillRunUsage,
     SkillStatus,
     SkillVersion,
+    SkillViewGap,
     SkillVisibility,
 )
-from expert_work.protocol.skill import SkillSupportingFile
+from expert_work.protocol.skill import SKILL_USAGE_VIEWED, SkillSupportingFile
 from expert_work.protocol.tenant_config import TenantPlan
 
 
@@ -643,6 +644,10 @@ class SqlSkillStore(SkillStore):
                     SkillRunUsageRow.skill_id == skill_id,
                     SkillRunUsageRow.skill_version == skill_version,
                     SkillRunUsageRow.created_at >= since,
+                    # B-84 — ``viewed`` 不是 run 终局, 混进来会被
+                    # ``decide_rollback`` 当成一个「非 success」样本并拉低
+                    # 成功率 → 健康版本被自动 archive。见 base.py 的说明。
+                    SkillRunUsageRow.outcome != SKILL_USAGE_VIEWED,
                 )
                 .order_by(SkillRunUsageRow.created_at.asc())
             )
@@ -1469,3 +1474,64 @@ class SqlSkillStore(SkillStore):
                 )
             ).scalar_one()
         return int(result or 0)
+
+    # ------------------------------------------- view-gap read-only (B-84)
+
+    async def skill_view_gap(
+        self,
+        *,
+        tenant_id: UUID,
+        agent_name: str,
+        names: Sequence[str],
+        viewed_before: datetime,
+    ) -> SkillViewGap:
+        wanted = list(dict.fromkeys(names))
+        if not wanted:
+            return SkillViewGap()
+        async with self._sf() as session:
+            # 合并视图: 同名时租户自有遮蔽平台行, 与 build 期的名字解析同序。
+            rows = (
+                (
+                    await session.execute(
+                        select(SkillRow).where(
+                            SkillRow.name.in_(wanted),
+                            or_(
+                                SkillRow.tenant_id == tenant_id,
+                                SkillRow.tenant_id.is_(None),
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            resolved: dict[str, SkillRow] = {}
+            for row in rows:
+                current = resolved.get(row.name)
+                if current is None or (current.tenant_id is None and row.tenant_id is not None):
+                    resolved[row.name] = row
+            if not resolved:
+                return SkillViewGap(untracked_names=tuple(sorted(wanted)))
+            # 证据行是**消费方租户自有**的, 所以平台技能在这里一样可量。
+            viewed_ids = set(
+                (
+                    await session.execute(
+                        select(SkillRunUsageRow.skill_id)
+                        .where(
+                            SkillRunUsageRow.tenant_id == tenant_id,
+                            SkillRunUsageRow.agent_name == agent_name,
+                            SkillRunUsageRow.outcome == SKILL_USAGE_VIEWED,
+                            SkillRunUsageRow.created_at >= viewed_before,
+                            SkillRunUsageRow.skill_id.in_([r.id for r in resolved.values()]),
+                        )
+                        .distinct()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        unviewed = [row for name, row in sorted(resolved.items()) if row.id not in viewed_ids]
+        return SkillViewGap(
+            unviewed=tuple(_skill_row_to_dto(r) for r in unviewed),
+            untracked_names=tuple(sorted(n for n in wanted if n not in resolved)),
+        )

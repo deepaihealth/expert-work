@@ -16,6 +16,20 @@ Process-local: each control-plane replica throttles independently. The
 worst case under N replicas is N writes per skill per hour, which is
 still negligible. Cross-process coordination via Redis would be tighter
 but not worth the dependency for state-machine-grade time scales.
+
+B-84 —— ``kind='view'`` 在原有 ``last_used_at`` bump 之外, 再往
+``skill_run_usage`` 追加一条 ``outcome='viewed'`` 的证据行。两件事各有各的
+去重门, 这是必须的而不是讲究:
+
+* ``last_used_at`` 的 TTL 窗口(``_last``)**两种 kind 共用, 与 B-84 之前逐行
+  一致** —— 绑定路径的节流行为一个字没变。
+* ``viewed`` 行按 ``(tenant_id, skill_id, thread_id)`` 去重(``_viewed``),
+  与上面那道门完全独立。共用一道的话, 每次 agent build 都发生的 ``bind`` 会
+  几乎吃掉每一次 ``view``, 一个**正在被读**的技能照样留不下证据行 —— 那正是
+  这个信号要消灭的假象。
+
+``viewed`` 行不进 Curator, 也不进回滚判定
+(``SkillStore.skill_run_usage_window`` 会把它们滤掉)。
 """
 
 from __future__ import annotations
@@ -24,10 +38,13 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from expert_work.common.skill_activity import SkillActivityKind, SkillViewEvent
 from expert_work.common.uplift_metrics import record_curator_transition
+from expert_work.protocol import SkillRunUsage
 
 if TYPE_CHECKING:
     from expert_work.persistence import SkillStore
@@ -76,32 +93,56 @@ class ThrottledActivityRecorder:
         self._ttl = ttl_seconds
         self._cap = cap
         self._last: OrderedDict[UUID, float] = OrderedDict()
+        # B-84 — ``viewed`` 行的去重门, 与 ``_last`` 完全独立(见模块 docstring)。
+        # key 是 ``(tenant_id, skill_id, thread_id)``: 一个 thread 内同一技能
+        # 记一次就够, 因为消费方问的是「有没有打开过」不是「打开过几次」。
+        # 进程内的, 多副本下最坏是每副本各插一行 —— 存在性查询对重复行免疫。
+        self._viewed: OrderedDict[tuple[UUID, UUID, UUID], None] = OrderedDict()
         self._lock = asyncio.Lock()
 
     def reset(self) -> None:
         """Drop all cached timestamps — for tests that want a fresh
         throttle state without re-constructing the recorder."""
         self._last.clear()
+        self._viewed.clear()
 
-    async def record(self, *, skill_id: UUID, tenant_id: UUID) -> None:
+    async def record(
+        self,
+        *,
+        skill_id: UUID,
+        tenant_id: UUID,
+        kind: SkillActivityKind = "bind",
+        view: SkillViewEvent | None = None,
+    ) -> None:
         """:class:`SkillActivityRecorder` Protocol entry — fire-and-forget
         from the agent hot path. Discards the boolean result; tests use
         :meth:`maybe_record` instead when they need to assert it."""
-        await self.maybe_record(skill_id=skill_id, tenant_id=tenant_id)
+        await self.maybe_record(skill_id=skill_id, tenant_id=tenant_id, kind=kind, view=view)
 
     async def maybe_record(
         self,
         *,
         skill_id: UUID,
         tenant_id: UUID,
+        kind: SkillActivityKind = "bind",
+        view: SkillViewEvent | None = None,
     ) -> bool:
         """Bump ``last_used_at`` if the throttle window has elapsed.
 
-        Returns ``True`` if a SQL UPDATE actually fired (used by tests +
-        the metrics layer to count real activity vs. squashed dupes).
-        Failures from the store are logged + swallowed — the agent hot
-        path must NOT fail because activity tracking hiccuped.
+        B-84 — ``kind='view'`` 还会(在它自己的去重门之后)往
+        ``skill_run_usage`` 插一条 ``outcome='viewed'``。两件事的成败彼此独立:
+        ``last_used_at`` 被节流掉不影响证据行照插, 反之亦然。
+
+        Returns ``True`` if the ``last_used_at`` SQL UPDATE actually fired
+        (used by tests + the metrics layer to count real activity vs.
+        squashed dupes) —— 返回值**只**说这一件, 与证据行无关, 免得既有
+        调用方的语义被悄悄改掉。Failures from the store are logged +
+        swallowed — the agent hot path must NOT fail because activity
+        tracking hiccuped.
         """
+        if kind == "view" and view is not None:
+            await self._maybe_record_view(skill_id=skill_id, tenant_id=tenant_id, view=view)
+
         now = time.monotonic()
         async with self._lock:
             last = self._last.get(skill_id)
@@ -141,3 +182,50 @@ class ThrottledActivityRecorder:
                 tenant_id,
             )
         return updated
+
+    async def _maybe_record_view(
+        self,
+        *,
+        skill_id: UUID,
+        tenant_id: UUID,
+        view: SkillViewEvent,
+    ) -> bool:
+        """Append one ``outcome='viewed'`` evidence row, deduped per thread.
+
+        Returns ``True`` iff a row was actually written. Errors are logged +
+        swallowed: 这是记账, 不能让一次 ``skill_view`` 失败。
+        """
+        key = (tenant_id, skill_id, view.thread_id)
+        async with self._lock:
+            if key in self._viewed:
+                self._viewed.move_to_end(key)
+                return False
+            self._viewed[key] = None
+            while len(self._viewed) > self._cap:
+                self._viewed.popitem(last=False)
+
+        try:
+            await self._store.record_skill_run_usage(
+                usage=SkillRunUsage(
+                    id=uuid4(),
+                    # 消费方租户 —— 平台技能(``skill.tenant_id IS NULL``)的
+                    # 证据行也落在读它的那个租户名下, 这正是 B-84 记在这张表
+                    # 而不是 ``skill`` 行上的原因: 平台技能因此对每个租户各自
+                    # 可量, 而且写入不需要 bypass RLS。
+                    tenant_id=tenant_id,
+                    skill_id=skill_id,
+                    skill_version=view.skill_version,
+                    thread_id=view.thread_id,
+                    agent_name=view.agent_name,
+                    outcome="viewed",
+                    created_at=datetime.now(UTC),
+                )
+            )
+        except Exception:
+            logger.exception(
+                "skill_activity.view_row_failed skill_id=%s tenant_id=%s",
+                skill_id,
+                tenant_id,
+            )
+            return False
+        return True

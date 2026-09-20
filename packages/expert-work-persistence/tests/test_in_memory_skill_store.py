@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,7 +12,7 @@ from expert_work.persistence import (
     InMemorySkillStore,
     SkillNotFoundError,
 )
-from expert_work.protocol import SkillStatus
+from expert_work.protocol import SkillRunUsage, SkillStatus
 
 
 def _t() -> UUID:
@@ -664,3 +665,218 @@ async def test_platform_list_keyset_filters_status_and_skips_tenant_rows() -> No
     rows, next_cursor = await store.list_platform_skills_keyset(status=SkillStatus.ACTIVE, limit=50)
     assert [s.id for s in rows] == [active]
     assert next_cursor is None
+
+
+# ---------------------------------------------------------------------------
+# B-84 — viewed 证据行 + 「绑了但这个 agent 没打开过」的只读盘点
+# ---------------------------------------------------------------------------
+
+_AGENT = "ai-health-plan"
+
+
+async def _seed_active(store: InMemorySkillStore, tenant: UUID, name: str) -> UUID:
+    sid = uuid4()
+    await store.create_skill(skill_id=sid, tenant_id=tenant, name=name)
+    await store.add_version(
+        version_id=uuid4(), skill_id=sid, tenant_id=tenant, prompt_fragment="body"
+    )
+    await store.set_status(skill_id=sid, tenant_id=tenant, status=SkillStatus.ACTIVE)
+    return sid
+
+
+async def _seed_viewed(
+    store: InMemorySkillStore,
+    *,
+    tenant: UUID,
+    skill_id: UUID,
+    agent: str = _AGENT,
+    at: datetime | None = None,
+) -> None:
+    await store.record_skill_run_usage(
+        usage=SkillRunUsage(
+            id=uuid4(),
+            tenant_id=tenant,
+            skill_id=skill_id,
+            skill_version=1,
+            thread_id=uuid4(),
+            agent_name=agent,
+            outcome="viewed",
+            created_at=at or datetime.now(UTC),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_usage_window_excludes_viewed_rows() -> None:
+    """viewed 行绝不能进回滚判定的样本。
+
+    ``decide_rollback`` 算的是 ``successes / len(非 cancelled)``: 一条 viewed
+    就是一个「非 success」样本, 会凭空拉低成功率并把健康版本自动 archive 掉。
+    """
+    store = InMemorySkillStore()
+    tenant, sid = _t(), uuid4()
+    now = datetime.now(UTC)
+    for outcome in ("success", "failed", "viewed"):
+        await store.record_skill_run_usage(
+            usage=SkillRunUsage(
+                id=uuid4(),
+                tenant_id=tenant,
+                skill_id=sid,
+                skill_version=1,
+                thread_id=uuid4(),
+                agent_name=_AGENT,
+                outcome=outcome,
+                created_at=now,
+            )
+        )
+
+    rows = await store.skill_run_usage_window(
+        skill_id=sid, skill_version=1, tenant_id=tenant, since=now - timedelta(days=1)
+    )
+    assert sorted(r.outcome for r in rows) == ["failed", "success"]
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_lists_bound_skills_with_no_viewed_row() -> None:
+    store = InMemorySkillStore()
+    tenant = _t()
+    never = await _seed_active(store, tenant, "never-read")
+    long_ago = await _seed_active(store, tenant, "read-long-ago")
+    fresh = await _seed_active(store, tenant, "read-just-now")
+
+    now = datetime.now(UTC)
+    await _seed_viewed(store, tenant=tenant, skill_id=long_ago, at=now - timedelta(days=90))
+    await _seed_viewed(store, tenant=tenant, skill_id=fresh, at=now)
+
+    gap = await store.skill_view_gap(
+        tenant_id=tenant,
+        agent_name=_AGENT,
+        names=["never-read", "read-long-ago", "read-just-now"],
+        viewed_before=now - timedelta(days=30),
+    )
+    assert [s.id for s in gap.unviewed] == [never, long_ago]
+    assert gap.untracked_names == ()
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_covers_platform_skills() -> None:
+    """**本次返工的全部意义**: 平台技能必须能被认出来「打开过 / 没打开过」。
+
+    对接方 ai-health-plan 绑的 19 个技能 19/19 是平台技能 (``tenant_id IS NULL``)。
+    证据行按消费方租户记账, 所以平台技能不再是盲区, 也不再落进 untracked。
+    """
+    store = InMemorySkillStore()
+    tenant = _t()
+    read_id, unread_id = uuid4(), uuid4()
+    await store.create_platform_skill(skill_id=read_id, name="pptx")
+    await store.create_platform_skill(skill_id=unread_id, name="ui-ux-pro-max")
+    await _seed_viewed(store, tenant=tenant, skill_id=read_id)
+
+    gap = await store.skill_view_gap(
+        tenant_id=tenant,
+        agent_name=_AGENT,
+        names=["pptx", "ui-ux-pro-max"],
+        viewed_before=datetime.now(UTC) - timedelta(days=30),
+    )
+    assert [s.name for s in gap.unviewed] == ["ui-ux-pro-max"]
+    assert gap.untracked_names == (), "平台技能现在可量了, 不该再被摆进 untracked"
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_is_per_agent() -> None:
+    """A 打开过不等于 B 读过 —— 不按 agent 分, 问出来的是「有没有人打开过」。"""
+    store = InMemorySkillStore()
+    tenant = _t()
+    sid = uuid4()
+    await store.create_platform_skill(skill_id=sid, name="pptx")
+    await _seed_viewed(store, tenant=tenant, skill_id=sid, agent="sop2-designer")
+
+    gap = await store.skill_view_gap(
+        tenant_id=tenant,
+        agent_name=_AGENT,
+        names=["pptx"],
+        viewed_before=datetime.now(UTC) - timedelta(days=30),
+    )
+    assert [s.id for s in gap.unviewed] == [sid]
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_is_per_tenant() -> None:
+    """别的租户打开过同一个平台技能, 不算这个租户读过。"""
+    store = InMemorySkillStore()
+    mine, theirs = _t(), _t()
+    sid = uuid4()
+    await store.create_platform_skill(skill_id=sid, name="pptx")
+    await _seed_viewed(store, tenant=theirs, skill_id=sid)
+
+    gap = await store.skill_view_gap(
+        tenant_id=mine,
+        agent_name=_AGENT,
+        names=["pptx"],
+        viewed_before=datetime.now(UTC) - timedelta(days=30),
+    )
+    assert [s.id for s in gap.unviewed] == [sid]
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_separates_names_it_cannot_resolve() -> None:
+    """解析不到技能行的名字落 ``untracked_names``, 不能混进 ``unviewed``。
+
+    它们不是「没被读过」, 是「没有观测对象」。
+    """
+    store = InMemorySkillStore()
+    tenant = _t()
+    owned = await _seed_active(store, tenant, "tenant-owned")
+
+    gap = await store.skill_view_gap(
+        tenant_id=tenant,
+        agent_name=_AGENT,
+        names=["tenant-owned", "typo-never-existed"],
+        viewed_before=datetime.now(UTC),
+    )
+    assert [s.id for s in gap.unviewed] == [owned]
+    assert gap.untracked_names == ("typo-never-existed",)
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_tenant_row_shadows_platform_row() -> None:
+    """同名时租户自有遮蔽平台行 —— 与 build 期的名字解析同序。"""
+    store = InMemorySkillStore()
+    tenant = _t()
+    platform_id = uuid4()
+    await store.create_platform_skill(skill_id=platform_id, name="pptx")
+    own_id = await _seed_active(store, tenant, "pptx")
+
+    gap = await store.skill_view_gap(
+        tenant_id=tenant,
+        agent_name=_AGENT,
+        names=["pptx"],
+        viewed_before=datetime.now(UTC),
+    )
+    assert [s.id for s in gap.unviewed] == [own_id]
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_ignores_other_tenants_rows() -> None:
+    store = InMemorySkillStore()
+    mine, theirs = _t(), _t()
+    await _seed_active(store, theirs, "same-name")
+
+    gap = await store.skill_view_gap(
+        tenant_id=mine,
+        agent_name=_AGENT,
+        names=["same-name"],
+        viewed_before=datetime.now(UTC),
+    )
+    assert gap.unviewed == ()
+    assert gap.untracked_names == ("same-name",)
+
+
+@pytest.mark.asyncio
+async def test_skill_view_gap_empty_binding_list() -> None:
+    store = InMemorySkillStore()
+    gap = await store.skill_view_gap(
+        tenant_id=_t(), agent_name=_AGENT, names=[], viewed_before=datetime.now(UTC)
+    )
+    assert gap.unviewed == ()
+    assert gap.untracked_names == ()

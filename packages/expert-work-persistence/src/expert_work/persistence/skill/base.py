@@ -38,6 +38,7 @@ from expert_work.protocol import (
     SkillRunUsage,
     SkillStatus,
     SkillVersion,
+    SkillViewGap,
     SkillVisibility,
 )
 from expert_work.protocol.skill import supporting_files_to_jsonable
@@ -406,7 +407,16 @@ class SkillStore(abc.ABC):
 
         Returns full rows (not bare outcomes) so the rollback gate can
         join user feedback by ``thread_id`` (Stream HX-2, Mini-ADR
-        HX-B2) before scoring."""
+        HX-B2) before scoring.
+
+        **B-84 —— ``outcome='viewed'`` 的行被排除在外, 这不是可选项。**
+        ``viewed`` 记的是「模型打开过这个技能」, 不是一次 run 的终局;而
+        ``decide_rollback`` 算的是 ``successes / len(非 cancelled)``, 一条
+        ``viewed`` 落进样本就是一个「非 success」, 会凭空拉低成功率并把健康
+        版本自动 archive 掉。这个方法是回滚判定唯一的读取口, 所以过滤放在
+        这里;``SkillRollbackGate`` 出于同一理由再过滤一次(失败后果是静默
+        删技能, 值得两道)。要读 ``viewed`` 行请走 :meth:`skill_view_gap`。
+        """
 
     # ----------------------------------- prediction-falsify ledger (SE-11)
 
@@ -845,3 +855,52 @@ class SkillStore(abc.ABC):
         """Total pinned skills across all tenants — for the
         ``expert_work_uplift_skill_pinned_total`` gauge. Caller MUST be inside
         ``bypass_rls_session()``."""
+
+    # ------------------------------------------- view-gap read-only (B-84)
+
+    @abc.abstractmethod
+    async def skill_view_gap(
+        self,
+        *,
+        tenant_id: UUID,
+        agent_name: str,
+        names: Sequence[str],
+        viewed_before: datetime,
+    ) -> SkillViewGap:
+        """「这个 agent 绑了哪些技能是它自己从没打开过的」—— 只读, 不写任何行。
+
+        ``names`` 是该 agent manifest 里 ``spec.skills`` 每条经
+        :func:`expert_work.protocol.parse_skill_ref` 解析后的**裸名字**(去掉
+        ``@N`` 版本钉)。SkillStore 不认识 agent, 所以绑定清单由调用方给 ——
+        与 :meth:`shadowed_skill_names` 同一个形状, 一次往返而不是按名字 N+1。
+
+        ``agent_name`` 不是可选的装饰: 证据行来自 ``skill_run_usage``, 它按
+        ``(tenant_id, agent_name, thread_id)`` 记账。不带 agent 过滤问出来的是
+        「**有没有人**打开过」, 而 B-84 要判的是「**这个 agent** 的绑定清单里
+        哪些是白带的」—— 同一个平台技能被 A 打开过, 不能算 B 读过。
+
+        命中条件: 在 ``created_at >= viewed_before`` 的窗口里, 这个
+        ``(tenant_id, agent_name, skill_id)`` **没有**任何
+        ``outcome='viewed'`` 行。调用方自己算 ``viewed_before``
+        (``now - timedelta(days=N)``), store 不碰时钟。
+
+        返回 :class:`SkillViewGap`:
+
+        * ``unviewed`` —— 命中的技能行, 按 ``name`` 升序。**租户自有与平台技能
+          都在内**: ``viewed`` 行的 ``tenant_id`` 是消费方租户, 所以一个
+          NULL-tenant 的平台技能对每个租户各自可量。同名时租户自有的行遮蔽
+          平台行(与 build 期解析同序)。
+        * ``untracked_names`` —— ``names`` 里**解析不到任何技能行**的名字, 升序。
+          拼错的、已删的。它们不是「没被读过」, 是「没有观测对象」;混进
+          ``unviewed`` 就是拿后者冒充前者。
+
+        Caller MUST be inside ``bypass_rls_session()`` —— 合并视图要读平台
+        (NULL-tenant)``skill`` 行, 与 :meth:`resolve_platform_by_name` 等
+        平台读取口同一条规矩。**写入侧不需要 bypass**(``viewed`` 行是租户
+        自有的), 这正是 B-84 把证据记在 ``skill_run_usage`` 而不是 ``skill``
+        行上的原因之一。
+
+        **与 Curator 无关**: 本方法只读, ``viewed`` 行没有接进 stale / archive
+        判定, 也不该接 —— 照 hermes-agent 的判据, ``use_count == 0`` 是
+        absence of evidence 而不是 staleness。
+        """

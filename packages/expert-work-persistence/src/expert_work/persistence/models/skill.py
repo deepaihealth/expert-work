@@ -314,8 +314,13 @@ class SkillRunUsageRow(Base):
 
     __table_args__ = (
         CheckConstraint("skill_version >= 1", name="skill_run_usage_version_positive"),
+        # B-84 (migration 0159) — ``viewed`` is the fifth value and the only
+        # one that is NOT a run terminal outcome: it records that the model
+        # actually called ``skill_view`` on this version. It must never enter
+        # the rollback sample (``decide_rollback`` would count it as a
+        # non-success); ``skill_run_usage_window`` filters it out.
         CheckConstraint(
-            "outcome IN ('success', 'failed', 'max_steps', 'cancelled')",
+            "outcome IN ('success', 'failed', 'max_steps', 'cancelled', 'viewed')",
             name="skill_run_usage_outcome_check",
         ),
         Index("ix_skill_run_usage_tenant_id", "tenant_id"),

@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
-from expert_work.common.skill_activity import SkillActivityRecorder
+from expert_work.common.skill_activity import SkillActivityRecorder, SkillViewEvent
 from expert_work.common.threat_patterns import scan_for_threats
 from expert_work.common.uplift_metrics import (
     record_skill_drift,
@@ -186,6 +186,12 @@ class SkillViewTool:
     # skill-asset-store — object store for externalized supporting files
     # (dual-read); ``None`` keeps inline-only behavior.
     skill_asset_store: SkillAssetObjectStore | None = None
+    # B-84 —— 本 agent 的 ``spec.metadata.name``, 随 ``viewed`` 证据行落库,
+    # 好让盘点能按 agent 分开算(同一个平台技能被 A 读过不代表 B 读过)。
+    # **不能**改用 ``ctx.agent_key``: 那是 sanitize 过、带 8 位十六进制后缀的
+    # 工作区键名, 与 SE-7d 既有行的 ``agent_name`` 对不上就连不成一条线。
+    # 空串 = 未接线(测试 / eval), 证据行照写, 只是 agent 维度是空的。
+    agent_name: str = ""
 
     @property
     def spec(self) -> ToolSpec:
@@ -284,9 +290,34 @@ class SkillViewTool:
         # Fires for both ACTIVE and STALE; STALE rows auto-revive to
         # ACTIVE inside the recorder's SQL UPDATE. The recorder owns
         # throttling + error swallowing.
+        #
+        # B-84 —— ``kind="view"`` 让这一跳额外往 ``skill_run_usage`` 记一条
+        # ``outcome='viewed'`` 的证据行。这是**唯一**写那种行的地方: 绑定路径
+        # 只 bump ``last_used_at``, 于是「还绑着」和「真被打开过」第一次分开了。
+        # 实测缺口(测试环境近 60 天): ai-health-plan 绑 19 个技能有 15 个
+        # (79%)从没被 skill_view 过, sop2-designer 13 个里有 8 个(62%)。
+        #
+        # ``ctx.thread_id`` 为空就只报 bind 语义的活动: ``skill_run_usage``
+        # 的 ``thread_id`` 是 NOT NULL, 而且它还是回滚闸门 join 用户反馈的键,
+        # 拿 ``run_id`` 顶替会把两种 id 混进同一列。真实会为空的只有 eval /
+        # 合成执行路径, 用户的每条 run 入口都带 thread。
         if self.activity_recorder is not None:
+            view_event = (
+                SkillViewEvent(
+                    skill_version=version.version,
+                    thread_id=ctx.thread_id,
+                    agent_name=self.agent_name,
+                )
+                if ctx.thread_id is not None
+                else None
+            )
             try:
-                await self.activity_recorder.record(skill_id=skill.id, tenant_id=ctx.tenant_id)
+                await self.activity_recorder.record(
+                    skill_id=skill.id,
+                    tenant_id=ctx.tenant_id,
+                    kind="view",
+                    view=view_event,
+                )
             except Exception:  # noqa: S110 — best-effort hot path
                 # ThrottledActivityRecorder swallows its own errors;
                 # this guard is belt-and-braces for non-default recorders.
