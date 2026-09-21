@@ -17,7 +17,6 @@ from tiktoken import Encoding
 
 from expert_work.runtime.tokens import (
     CHARS_PER_TOKEN,
-    IMAGE_BLOCK_TOKEN_COST,
     CharTokenEstimator,
     TiktokenEstimator,
     count_image_blocks,
@@ -143,8 +142,10 @@ def test_estimate_message_charges_for_images() -> None:
     est = default_estimator()
     text_only = est.count(flatten_message(_image_msg(0)))
     with_images = estimate_message(_image_msg(3), est)
-    # 三张图必须至少多算三倍的每图代价,而不是多算一点点字符串表示。
-    assert with_images >= text_only + 3 * IMAGE_BLOCK_TOKEN_COST
+    # 断言里不许出现 IMAGE_BLOCK_TOKEN_COST —— 引用被变异的常量会让这条断言
+    # 随变异一起塌成重言式(常量归零时它照样绿)。用一个独立的绝对下界:
+    # 100 dpi 一页约 1000 token,三张图至少 3000。
+    assert with_images >= text_only + 3_000
 
 
 def test_image_cost_dwarfs_its_string_repr() -> None:
