@@ -105,6 +105,7 @@ from orchestrator.multimodal import (
     ImageResolver,
     NasWorkspaceImageResolver,
     ObjectStoreImageResolver,
+    is_cacheable_image_ref,
 )
 from orchestrator.sse import ThreadStatsRecorder
 from orchestrator.tools import (
@@ -1874,19 +1875,27 @@ def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = Non
     backend: every LLM turn re-resolves every image in the conversation
     history (``_human_content`` re-walks all messages on each ``complete``
     call), so caching stops the same image — upload *or* rendered page —
-    being re-fetched each turn. A single cache is safe for both schemes
-    because refs are content-addressed for both: an uploaded image never
-    changes after landing, and a rendered page lives at a path keyed by
-    ``run_id`` + document sha + page number
-    (``.tool_results/<run_id>/figures/<doc-sha>/page-NN.jpg``) that is never
-    overwritten with different bytes once written. The cache key is the
-    full ref string, which already carries the scheme prefix, so an upload
-    ref and a workspace ref can never collide in the cache.
+    being re-fetched each turn. The cache key is the full ref string, which
+    already carries the scheme prefix, so an upload ref and a workspace ref
+    can never collide in the cache.
+
+    **Not every ref is cacheable, though** — see
+    :func:`~orchestrator.multimodal.is_cacheable_image_ref`, passed in as
+    ``should_cache``. An upload ref is uniformly content-addressed (an
+    ``image_id`` never changes what it names). A workspace ref is not:
+    ``parse_workspace_image_ref`` accepts any relative path under the user's
+    workspace, not only the write-once ``.tool_results/<run_id>/figures/
+    <doc-sha>/page-NN.jpg`` convention the rendering pipeline actually
+    writes, so a workspace ref *can* name an ordinary, overwritable file —
+    caching that would silently serve stale bytes, process-wide, after the
+    next overwrite. ``is_cacheable_image_ref`` is what keeps that class of
+    ref out of the cache while still caching the write-once ones.
     """
     workspace = NasWorkspaceImageResolver(root=workspace_root) if workspace_root else None
-    return CachingImageResolver(
-        DispatchingImageResolver(uploads=ObjectStoreImageResolver(store=store), workspace=workspace)
+    dispatcher = DispatchingImageResolver(
+        uploads=ObjectStoreImageResolver(store=store), workspace=workspace
     )
+    return CachingImageResolver(dispatcher, should_cache=is_cacheable_image_ref)
 
 
 def build_middleware_env(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ import pytest
 from expert_work.protocol.multimodal import ImageRef, parse_image_ref, parse_workspace_image_ref
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
 from orchestrator.multimodal import (
+    _MAX_WORKSPACE_IMAGE_BYTES,
     IMAGE_REF_BLOCK_TYPE,
     CachingImageResolver,
     DispatchingImageResolver,
@@ -20,6 +22,7 @@ from orchestrator.multimodal import (
     ObjectStoreImageResolver,
     ResolvedImage,
     image_ref_block,
+    is_cacheable_image_ref,
     split_human_content,
 )
 
@@ -145,6 +148,124 @@ def test_object_store_resolver_satisfies_protocol() -> None:
     assert isinstance(ObjectStoreImageResolver(store=InMemoryObjectStore()), ImageResolver)
 
 
+# ---------------------------------------------------------------------------
+# NasWorkspaceImageResolver (B-64) — symlink safety + size cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_resolves_a_real_file(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    (user_dir / "page-01.jpg").write_bytes(b"\xff\xd8\xff\xe0real-bytes")
+
+    resolved = await NasWorkspaceImageResolver(root=tmp_path).resolve(
+        f"expert_work://workspace/{tenant}/{user}/page-01.jpg"
+    )
+
+    assert resolved.data == b"\xff\xd8\xff\xe0real-bytes"
+    assert resolved.media_type == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_a_leaf_symlink_escaping_the_user_root(tmp_path: Path) -> None:
+    """Critical finding 1 —— a malicious run plants a symlink inside its OWN
+    subtree pointing at another tenant's file, then calls ``ask_image`` with
+    its own (legitimate) tenant/user. The ref string itself is a clean
+    relative path — ``parse_workspace_image_ref`` cannot see the escape; only
+    touching the filesystem can.
+    """
+    tenant, user = uuid4(), uuid4()
+    victim_tenant, victim_user = uuid4(), uuid4()
+    victim_dir = tmp_path / str(victim_tenant) / str(victim_user)
+    victim_dir.mkdir(parents=True)
+    (victim_dir / "secret.png").write_bytes(b"victim-bytes")
+
+    attacker_dir = tmp_path / str(tenant) / str(user)
+    attacker_dir.mkdir(parents=True)
+    (attacker_dir / "evil.png").symlink_to(
+        Path("..") / ".." / str(victim_tenant) / str(victim_user) / "secret.png"
+    )
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/evil.png"
+
+    with pytest.raises(ValueError, match="escapes the user root"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_an_intermediate_symlink_escaping_the_user_root(
+    tmp_path: Path,
+) -> None:
+    """Same escape, but the symlink is a directory one path segment up from
+    the leaf — exercises ``_walk_to_parent_fd`` (the dir_fd chain), not the
+    leaf-open branch. A resolve()-then-reopen-by-string approach would have
+    missed exactly this: only the *final* component was re-checked, not the
+    intermediate ones.
+    """
+    tenant, user = uuid4(), uuid4()
+    victim_tenant, victim_user = uuid4(), uuid4()
+    victim_dir = tmp_path / str(victim_tenant) / str(victim_user)
+    victim_dir.mkdir(parents=True)
+    (victim_dir / "secret.png").write_bytes(b"victim-bytes")
+
+    attacker_dir = tmp_path / str(tenant) / str(user)
+    attacker_dir.mkdir(parents=True)
+    (attacker_dir / "figures").symlink_to(victim_dir)
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/figures/secret.png"
+
+    with pytest.raises(ValueError, match="escapes the user root"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_a_file_over_the_size_cap(tmp_path: Path) -> None:
+    """Important finding 3 —— stat happens before read, so an outsized file
+    is refused instead of being loaded fully into the control-plane
+    process's memory. ``os.truncate`` makes a sparse file: the reported size
+    crosses the cap without actually writing that many bytes to disk.
+    """
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    big = user_dir / "too-big.jpg"
+    big.touch()
+    os.truncate(big, _MAX_WORKSPACE_IMAGE_BYTES + 1)
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/too-big.jpg"
+
+    with pytest.raises(ValueError, match="exceeds the"):
+        await resolver.resolve(ref)
+
+
+# ---------------------------------------------------------------------------
+# is_cacheable_image_ref (B-64) — which refs CachingImageResolver may keep
+# ---------------------------------------------------------------------------
+
+
+def test_is_cacheable_image_ref_true_for_upload_refs() -> None:
+    assert is_cacheable_image_ref(_image_ref().to_uri()) is True
+
+
+def test_is_cacheable_image_ref_true_under_write_once_prefix() -> None:
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/.tool_results/r1/figures/abc/page-03.jpg"
+    assert is_cacheable_image_ref(ref) is True
+
+
+def test_is_cacheable_image_ref_false_outside_write_once_prefix() -> None:
+    """An ordinary, overwritable workspace file named through this scheme
+    must never be cached — see the function's own docstring for why."""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/chart.png"
+    assert is_cacheable_image_ref(ref) is False
+
+
 class _CountingResolver:
     """Inner resolver that counts fetches — to prove the cache short-circuits."""
 
@@ -180,6 +301,24 @@ async def test_caching_resolver_lru_evicts_oldest() -> None:
     assert inner.calls == 3
     await resolver.resolve("a")  # "a" was evicted → re-fetched
     assert inner.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_caching_resolver_never_stores_a_ref_the_predicate_rejects() -> None:
+    inner = _CountingResolver()
+    resolver = CachingImageResolver(inner, should_cache=lambda ref: False)
+    await resolver.resolve("a")
+    await resolver.resolve("a")
+    assert inner.calls == 2  # never cached -> refetched every call
+
+
+@pytest.mark.asyncio
+async def test_caching_resolver_still_caches_a_ref_the_predicate_accepts() -> None:
+    inner = _CountingResolver()
+    resolver = CachingImageResolver(inner, should_cache=lambda ref: True)
+    await resolver.resolve("a")
+    await resolver.resolve("a")
+    assert inner.calls == 1
 
 
 # ---------------------------------------------------------------------------

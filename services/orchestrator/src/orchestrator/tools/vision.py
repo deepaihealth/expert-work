@@ -109,8 +109,20 @@ class AskImageTool:
         # 是 DispatchingImageResolver,两种 scheme 它自己认得,见
         # orchestrator.multimodal 的 docstring)——工具这一层只做校验+分派,
         # 两种 ref 在它之下投递方式完全一样。
+        #
+        # 工作区 ref 还多带一层上传 ref 没有的边界:``{root}/{tenant}/{user}/``
+        # 的 ``user`` 段。上传 ref(``ImageRef``)没有 user 概念,只按 tenant
+        # 隔离;工作区 ref 是 per-user 的工作区目录,只查 tenant 只堵了一半 ——
+        # 同租户、不同 user 的 ref 字符串不用任何路径穿越或 symlink,单纯换一个
+        # UUID 就能读别人的工作区。所以工作区分支在算出 tenant_of_ref 的同时,
+        # 立刻就地比对 user(不等共享的租户检查去做,那句检查两种 scheme 都要
+        # 走,不该单独为 user 再加一次分支)。
         if ref_str.startswith(WORKSPACE_REF_PREFIX):
-            tenant_of_ref = parse_workspace_image_ref(ref_str).tenant_id
+            workspace_ref = parse_workspace_image_ref(ref_str)
+            tenant_of_ref = workspace_ref.tenant_id
+            if workspace_ref.user_id != ctx.user_id:
+                msg = "ask_image image_ref user does not match the run user"
+                raise ToolBlockedError(msg)
         else:
             tenant_of_ref = parse_image_ref(ref_str).tenant_id  # raises ValueError on malformed
         if tenant_of_ref != ctx.tenant_id:

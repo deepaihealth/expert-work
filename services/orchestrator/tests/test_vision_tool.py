@@ -178,9 +178,28 @@ async def test_ask_image_accepts_a_workspace_ref() -> None:
 
 @pytest.mark.anyio
 async def test_ask_image_rejects_a_cross_tenant_workspace_ref() -> None:
-    """租户校验对两种 ref 都执行 —— 新 scheme 不是绕过它的后门。"""
+    """租户校验对两种 ref 都执行 —— 新 scheme 不是绕过它的后门。
+
+    ``user`` 在 ref 与 ctx 里保持一致,只让 tenant 不同 —— 否则(``ctx`` 默认
+    ``user_id=None``)会先撞上 user 检查,这条测试就验不到它名字里说的那条
+    规则了(fix round 2 review 抓到的一次真实误配)。
+    """
     mine, theirs, user = uuid4(), uuid4(), uuid4()
     tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
     ref = f"expert_work://workspace/{theirs}/{user}/.tool_results/r1/figures/a/page-01.jpg"
     with pytest.raises(ToolBlockedError, match="does not match the run tenant"):
-        await tool.call({"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=mine))
+        await tool.call({"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=mine, user_id=user))
+
+
+@pytest.mark.anyio
+async def test_ask_image_rejects_a_same_tenant_different_user_workspace_ref() -> None:
+    """Critical finding 2 —— ``{root}/{tenant}/{user}/`` 的 ``user`` 段也是隔离
+    边界的一半;只查 tenant 只堵了一半。ref 换一个 user UUID,tenant 不变,不
+    需要任何路径穿越或 symlink 就能读到别人的工作区。"""
+    tenant, mine, theirs = uuid4(), uuid4(), uuid4()
+    tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
+    ref = f"expert_work://workspace/{tenant}/{theirs}/.tool_results/r1/figures/a/page-01.jpg"
+    with pytest.raises(ToolBlockedError, match="does not match the run user"):
+        await tool.call(
+            {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=mine)
+        )

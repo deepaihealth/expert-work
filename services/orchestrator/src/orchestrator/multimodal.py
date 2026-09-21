@@ -15,13 +15,19 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 13.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import errno
+import os
+import stat
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
+from uuid import UUID
 
+from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
     WORKSPACE_REF_PREFIX,
@@ -43,6 +49,19 @@ _MEDIA_TYPE_BY_EXT: Final[dict[str, str]] = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+#: B-64 —— per-file read cap for :class:`NasWorkspaceImageResolver`. Mirrors
+#: ``orchestrator.tools.nas_workspace_store._MAX_READ_BYTES`` /
+#: ``sandbox_supervisor.supervisor._MAX_ARTIFACT_BYTES`` (same 64 MiB value,
+#: re-declared rather than imported — those two already independently
+#: re-declare the same constant for the same reason: the three modules have
+#: no runtime dependency on each other, and a contract test is what would
+#: catch a drift, not a shared import). This guards against an outsized file
+#: (a mis-tagged video, a multi-GB upload) being read fully into the
+#: control-plane process's memory before a size check ever runs — not
+#: against a normal rendered page, which is tens to a few hundred KB at the
+#: spec's 100 dpi default (§7.1).
+_MAX_WORKSPACE_IMAGE_BYTES: Final = 64 * 1024 * 1024
 
 
 def image_ref_block(uri: str) -> dict[str, str]:
@@ -146,15 +165,137 @@ class NasWorkspaceImageResolver:
 
     control-plane 已经挂着 ``/mnt/workspaces``,所以渲染页的字节直接从盘上读,
     不用走沙箱 ``exec`` 的 stdout(一页 base64 约 83 KB,没必要塞进管道)。
+
+    **TOCTOU —— 同 ``orchestrator.tools.nas_workspace_store`` 模块头注释的
+    判断,威胁模型逐字适用。** 这棵 NAS 树是沙箱直接写、同一个 tenant/user
+    下的 agent 自己也能落文件的树:一个恶意 run 可以在**自己的**子树里种一条
+    symlink(比如 ``evil.jpg -> ../../<other-tenant>/<user>/x.png``),再拿
+    自己的 tenant/user 调 ``ask_image``——``parse_workspace_image_ref`` 看不
+    出问题(它验的是**这条 ref 字符串**本身:相对路径、没有 ``..``、不碰保留
+    段;symlink 指向别处不改变字符串的形状),只有真去访问文件系统那一刻才能
+    拦。所以这里不走"``Path.resolve()`` 校验一次、再拿字符串路径重新
+    open"的写法——检查和真正打开之间的窗口里,任何中间分量都可能被并发种
+    进来的 symlink 换掉,不只是叶子,那样的重检查关不上这条洞。照搬
+    ``nas_workspace_store.py`` 的 openat/``O_NOFOLLOW`` dir_fd 链:从可信前缀
+    ``{root}/{tenant_id}/{user_id}``(两个 id 已经是
+    :func:`~expert_work.protocol.multimodal.parse_workspace_image_ref` 校验
+    过的 UUID,不是攻击者能塞进来的路径文本)开始,``rel`` 的每一段、包括
+    叶子,都用 ``O_NOFOLLOW`` openat——真的是 symlink,open 直接报错,不会
+    跟着走,拿到的目录 fd 也钉在打开时的 inode 上,后续任何改名/换链接都
+    动不了已经握着的 fd。
+
+    没有照抄 ``retention_cleanup_job/workspace_files.py`` 更轻的
+    ``resolve()`` + ``is_relative_to()`` + 叶子 ``lstat()`` 写法,是因为两者
+    的威胁模型不同:那条路径删的是**登记过**的产物路径,由平台自己的清理
+    job 低频触发,该模块自己的注释也承认"删除是不可逆的,多一次 lstat 便
+    宜"——多出的检查-到-访问窗口是可接受的残余风险。这里是**模型每次调用
+    ``ask_image`` 都会触发**的读,ref 字符串**完全由上游 agent/模型给
+    定**,正是 ``nas_workspace_store.py`` 自己 ``read_file`` 要防的那个场景
+    ——用它同款、真正消除竞态的做法,而不是只收窄窗口的那一种。
+
+    Stat-before-read(:data:`_MAX_WORKSPACE_IMAGE_BYTES`)+ 全部 IO 走
+    :func:`asyncio.to_thread`:NFS 上的阻塞系统调用不能占用 control-plane 的
+    事件循环,理由与 ``NasWorkspaceStore`` 完全一致。
     """
 
     root: Path
 
     async def resolve(self, ref: str) -> ResolvedImage:
         parsed = parse_workspace_image_ref(ref)
-        path = self.root / str(parsed.tenant_id) / str(parsed.user_id) / parsed.rel
         media_type = _MEDIA_TYPE_BY_EXT[parsed.ext]
-        return ResolvedImage(data=path.read_bytes(), media_type=media_type)
+        data = await asyncio.to_thread(
+            _read_workspace_leaf, self.root, parsed.tenant_id, parsed.user_id, parsed.rel, ref
+        )
+        return ResolvedImage(data=data, media_type=media_type)
+
+
+def _read_workspace_leaf(root: Path, tenant_id: UUID, user_id: UUID, rel: str, ref: str) -> bytes:
+    """Synchronous body of :meth:`NasWorkspaceImageResolver.resolve`.
+
+    Runs inside :func:`asyncio.to_thread` — see that method's docstring for
+    the symlink-safety rationale (mirrors ``nas_workspace_store.py``'s
+    ``read_file``, minus the create/mkdir/delete branches this resolver never
+    needs).
+    """
+    # tenant_id/user_id 已经是校验过的 UUID,不是攻击者路径文本 —— 同
+    # nas_workspace_store.py 对这一段前缀的信任论证,按普通路径字符串直接
+    # open 是安全的;只有 rel 的每一段需要 dir_fd 链。
+    user_root = (root / str(tenant_id) / str(user_id)).resolve()
+    try:
+        dfd = os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise FileNotFoundError(f"workspace image ref not found: {ref!r}") from exc
+    parts = PurePosixPath(rel).parts
+    dfd = _walk_to_parent_fd(dfd, parts[:-1], ref)
+    try:
+        try:
+            leaf_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        except OSError as exc:
+            raise _nofollow_open_error(exc, dfd, parts[-1], ref) from exc
+    finally:
+        os.close(dfd)
+    with os.fdopen(leaf_fd, "rb") as handle:
+        # Stat before reading so an over-cap file never gets fully loaded
+        # into memory — same reasoning as nas_workspace_store.read_file.
+        size = os.fstat(handle.fileno()).st_size
+        if size > _MAX_WORKSPACE_IMAGE_BYTES:
+            msg = (
+                f"workspace image ref exceeds the {_MAX_WORKSPACE_IMAGE_BYTES}-byte "
+                f"read cap: {ref!r}"
+            )
+            raise ValueError(msg)
+        return handle.read()
+
+
+def _walk_to_parent_fd(dfd: int, components: tuple[str, ...], ref: str) -> int:
+    """Step through ``components`` one ``O_NOFOLLOW`` openat at a time, closing
+    each fd behind us — mirrors ``nas_workspace_store._walk_dir_fd``.
+
+    Returns the final parent directory fd (the caller owns it). On a raised
+    exception, every fd this function opened — including the one passed in
+    — has already been closed; there is nothing left for the caller to clean
+    up.
+    """
+    for component in components:
+        try:
+            nfd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        except OSError as exc:
+            raise _nofollow_open_error(exc, dfd, component, ref, close_dfd=True) from exc
+        os.close(dfd)
+        dfd = nfd
+    return dfd
+
+
+def _nofollow_open_error(
+    exc: OSError, dfd: int, name: str, ref: str, *, close_dfd: bool = False
+) -> Exception:
+    """Translate an ``OSError`` from an ``O_NOFOLLOW`` open into the right
+    refusal — a symlink at ``name`` is a **safe refusal** (``ValueError``),
+    not "file doesn't exist" (``FileNotFoundError``).
+
+    ``O_NOFOLLOW``'s errno for "it's a symlink" is not portable (Linux:
+    ``ELOOP``; macOS's ``O_DIRECTORY | O_NOFOLLOW``: ``ENOTDIR``, which is
+    also the errno for an ordinary typo — a plain file where a directory was
+    expected), so this asks ``lstat`` directly rather than trusting one
+    errno value across platforms — same reasoning, same fix, as
+    ``nas_workspace_store._is_symlink_at``: production runs Linux, but a
+    check that only holds on Linux verifies nothing on a macOS dev box or a
+    macOS CI runner.
+    """
+    escaped = exc.errno == errno.ELOOP or _is_symlink_at(dfd, name)
+    if close_dfd:
+        os.close(dfd)
+    if escaped:
+        return ValueError(f"workspace image ref escapes the user root: {ref!r}")
+    return FileNotFoundError(f"workspace image ref not found: {ref!r}")
+
+
+def _is_symlink_at(dfd: int, name: str) -> bool:
+    """``name`` under ``dfd`` — is it a symlink? Asked once, only on the error path."""
+    try:
+        return stat.S_ISLNK(os.lstat(name, dir_fd=dfd).st_mode)
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -190,17 +331,58 @@ class DispatchingImageResolver:
         raise ValueError(msg)
 
 
+def _cache_every_ref(ref: str) -> bool:
+    """Default :attr:`CachingImageResolver.should_cache` — the pre-B-64 behaviour."""
+    return True
+
+
+def is_cacheable_image_ref(ref: str) -> bool:
+    """B-64 —— which refs :class:`CachingImageResolver` may remember.
+
+    An upload ref (``expert_work://image/...``) is genuinely content-addressed:
+    ``image_id`` is randomly generated per upload, so the same id can only ever
+    name the same bytes — caching it has no "goes stale" case. A workspace ref
+    is not uniformly like that: :func:`~expert_work.protocol.multimodal.parse_workspace_image_ref`
+    only validates the *shape* of ``rel`` (relative, no ``..``, not a reserved
+    tree) — it accepts any relative path, not only the write-once
+    ``.tool_results/<run_id>/figures/<doc-sha>/page-NN.jpg`` convention the
+    rendering pipeline actually writes (``WORKSPACE_OVERFLOW_DIR``, the
+    platform's general run-scoped/self-cleaning artifact prefix — spec §8.3).
+    Nothing stops a workspace ref from naming an ordinary, overwritable user
+    file instead (``chart.png`` at the workspace root); caching *that* would
+    mean a later overwrite silently keeps serving the old bytes, process-wide,
+    for the rest of this resolver's lifetime — no TTL, no invalidation path.
+    So only a workspace ref under :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
+    is cacheable; every other workspace ref resolves fresh on every call.
+    """
+    if not ref.startswith(WORKSPACE_REF_PREFIX):
+        return True
+    parsed = parse_workspace_image_ref(ref)
+    return parsed.rel == WORKSPACE_OVERFLOW_DIR or parsed.rel.startswith(
+        f"{WORKSPACE_OVERFLOW_DIR}/"
+    )
+
+
 @dataclass
 class CachingImageResolver:
     """Wraps an :class:`ImageResolver` with a bounded LRU cache.
 
-    Image refs are content-addressed + immutable, so a resolved image never
-    goes stale; and a ref identifies exactly one image, so a ``ref ->
-    ResolvedImage`` cache can only ever return that ref's own bytes (it never
-    exposes anything a direct ``resolve(ref)`` would not). Without it, every LLM
-    turn of a run re-fetches every image in the whole history from the object
-    store — ``_human_content`` re-walks all messages on each ``complete`` call,
-    and this resolver outlives individual turns, so the cache spans them.
+    A resolved image is only remembered when ``should_cache(ref)`` says so
+    (default :func:`_cache_every_ref` — cache everything, the pre-B-64
+    behaviour: every upload ref really is content-addressed + immutable, so a
+    resolved image never goes stale, and a ref identifies exactly one image,
+    so a ``ref -> ResolvedImage`` cache can only ever return that ref's own
+    bytes — it never exposes anything a direct ``resolve(ref)`` would not).
+    B-64 added a second ref scheme that is *not* uniformly immutable —
+    :func:`is_cacheable_image_ref` is the predicate ``make_image_resolver``
+    passes in production to exclude the refs that could go stale; see its
+    docstring. A ref that fails the predicate is resolved fresh on every
+    call, exactly like an ordinary cache miss that is never stored.
+
+    Without caching, every LLM turn of a run re-fetches every image in the
+    whole history from the object store — ``_human_content`` re-walks all
+    messages on each ``complete`` call, and this resolver outlives individual
+    turns, so the cache spans them.
 
     Failures are not cached (a raised lookup re-runs next time). ``max_size``
     bounds retained images so the cache cannot grow without limit.
@@ -208,6 +390,7 @@ class CachingImageResolver:
 
     inner: ImageResolver
     max_size: int = 32
+    should_cache: Callable[[str], bool] = _cache_every_ref
     _cache: OrderedDict[str, ResolvedImage] = field(
         default_factory=OrderedDict, init=False, repr=False
     )
@@ -218,8 +401,9 @@ class CachingImageResolver:
             self._cache.move_to_end(ref)
             return cached
         resolved = await self.inner.resolve(ref)
-        self._cache[ref] = resolved
-        self._cache.move_to_end(ref)
-        while len(self._cache) > self.max_size:
-            self._cache.popitem(last=False)
+        if self.should_cache(ref):
+            self._cache[ref] = resolved
+            self._cache.move_to_end(ref)
+            while len(self._cache) > self.max_size:
+                self._cache.popitem(last=False)
         return resolved

@@ -123,9 +123,14 @@ def parse_workspace_image_ref(uri: str) -> WorkspaceImageRef:
     **这是 :func:`parse_image_ref` 的兄弟,不是它的分支。** 那一个是明标的系统
     边界(``image_ref`` 参数从 LLM 工具调用直达),往里加一条 scheme 分支等于把
     一个已加固的校验点重新打开 —— 每加一个形态,它要同时为两种形态负责,而两种
-    形态的合法性规则并不相同。这里单独校验,规则与
-    ``orchestrator.tools.artifact._validate_path`` 同款:拒绝绝对路径、拒绝
-    ``..`` 段、拒绝 ``agents/`` 与 ``shared/`` 首段(别人的子树 / 只读共享区)。
+    形态的合法性规则并不相同。这里单独校验,规则参考
+    ``orchestrator.tools.artifact._validate_path`` 但更严,不是同款:后者会把
+    两种特定的绝对路径拼法(``/workspace/x``、``/workspace/agents/<own
+    key>/x``)折叠成相对路径再收,这里**一律拒绝、不折叠**——``image_ref`` 是
+    从模型的工具调用参数直达的字符串,没有 ``_validate_path`` 那种"来自哪个
+    已知视图"的上下文可折,折叠只会凭空多认一种合法拼法,扩大攻击面而不带来
+    实际好处。拒绝 ``..`` 段、拒绝 ``agents/`` 与 ``shared/`` 首段(别人的子树 /
+    只读共享区)这两条与 ``_validate_path`` 相同。
     """
     if not uri.startswith(WORKSPACE_REF_PREFIX):
         msg = f"workspace image ref must start with {WORKSPACE_REF_PREFIX!r}: {uri!r}"
