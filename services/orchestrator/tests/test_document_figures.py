@@ -16,6 +16,7 @@ xref 偏移量),``pdfplumber`` 本身在 ``uv.lock`` 里,不需要额外的库�
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import zipfile
@@ -24,7 +25,9 @@ from pathlib import Path
 import pytest
 
 from orchestrator.tools.document_figures import (
+    _FIGURE_INVENTORY_MAIN,
     MIN_FIGURE_EDGE_PT,
+    SUPPORTED_EXTENSIONS,
     build_figure_inventory_wrapper,
     render_figure_map,
 )
@@ -496,3 +499,39 @@ def test_map_caps_entries() -> None:
     text = render_figure_map(env)
     assert text.count("\n  ") <= 22  # 20 条 + 折叠行的余量
     assert "另有" in text
+
+
+# ---------------------------------------------------------------------------
+# B-64 fix round 2 —— SUPPORTED_EXTENSIONS 与沙箱内 builders 表不许悄悄分叉。
+# ---------------------------------------------------------------------------
+
+
+def _sandbox_dispatch_extensions() -> frozenset[str]:
+    """从 ``_FIGURE_INVENTORY_MAIN`` 的源码里 ``ast`` 解析出 ``builders`` 字典
+    的键集合 —— 不是手抄一份(那只会造出第三份字面量),是真的读沙箱片段里
+    那段决定"这个格式能不能分析"的代码。"""
+    tree = ast.parse(_FIGURE_INVENTORY_MAIN)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "builders"
+            and isinstance(node.value, ast.Dict)
+        ):
+            keys: list[str] = []
+            for key_node in node.value.keys:
+                assert isinstance(key_node, ast.Constant), key_node
+                assert isinstance(key_node.value, str), key_node.value
+                keys.append(key_node.value)
+            return frozenset(keys)
+    raise AssertionError("builders dict 没在 _FIGURE_INVENTORY_MAIN 里找到")
+
+
+def test_supported_extensions_matches_sandbox_dispatch_table() -> None:
+    """``read_document.py`` 的控制器侧早退闸门(``SUPPORTED_EXTENSIONS``)必须
+    与沙箱片段里真正的 dispatch 表(``builders``)一字不差 —— 单靠注释拴住两处
+    字面量,分叉是迟早的事,而且分叉方向恰好是这个功能最怕的那种:沙箱那边
+    多认一个格式而控制器不知道,有图的文档会在探测都没跑的情况下被判成
+    "没有图",还是静默的。"""
+    assert SUPPORTED_EXTENSIONS == _sandbox_dispatch_extensions()
