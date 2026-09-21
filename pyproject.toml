@@ -210,6 +210,18 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/*/tests", "services/*/tests", "tools/*"]
+# 仓库根必须在 ``sys.path`` 上。``tools/`` 是命名空间包(没有 ``__init__.py``),
+# 而 ``control_plane.eval_engine_live`` / ``eval_engine`` 懒 import
+# ``tools.eval.*``。跑全套时上面 ``testpaths`` 里的 ``tools/*`` 顺带把仓库根塞进
+# ``sys.path``,那些 import 于是能成;**单独**跑
+# ``services/control-plane/tests/test_eval_engine_live.py`` 则
+# ``ModuleNotFoundError: No module named 'tools'`` —— 6 条红,而且在干净 main 上
+# 同样红,与被测改动无关。
+#
+# 这一行不是给测试打补丁,它把生产里本来就成立的前提显式化:
+# ``services/control-plane/Dockerfile`` 把 ``tools/eval`` 放进 ``/app/tools/eval``
+# 且 ``WORKDIR /app``,靠的同样是"根目录在 sys.path 上"。
+pythonpath = ["."]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
 markers = [
