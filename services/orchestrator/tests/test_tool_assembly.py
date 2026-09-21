@@ -861,6 +861,15 @@ async def test_save_artifact_base_capability_needs_both_deps() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_page_without_supervisor_raises() -> None:
+    """B-64 回修 M3 —— 显式声明 read_page 但没接沙箱是真实配置错误,必须在
+    build 时炸,不能等到第一次调用才发现(与 read_document/exec_python 等
+    其它沙箱工具的同款契约)。"""
+    with pytest.raises(AgentFactoryError, match="read_page"):
+        await build_tool_registry([BuiltinToolSpec(name="read_page")], tool_env=ToolEnv())
+
+
+@pytest.mark.asyncio
 async def test_explicit_base_tool_not_double_registered() -> None:
     # A manifest that still lists a base tool explicitly must not register it
     # twice — the implicit pass dedups against what the manifest loop added.
