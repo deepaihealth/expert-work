@@ -159,6 +159,18 @@ def test_wrapper_globs_instead_of_building_the_page_filename(
     assert "JPEG-PAGE-3::" in content
 
 
+def test_wrapper_reports_not_found_for_a_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修 I3 —— 片段真跑:路径打错字与 LibreOffice 坏了不能长得一样。
+    ``_resolve`` 用 realpath 确认路径没越权,但不确认文件真的存在;真正的
+    存在性检查必须在尝试转换之前做,不然拿一个不存在的文件去跑 soffice 会
+    得到含糊的 convert_failed,而不是直白的 not_found。"""
+    _install_fake_office_binaries(tmp_path, monkeypatch)
+    env = _run_render(tmp_path, "missing.pdf", units=[1], out_rel=".tool_results/r1/figures/s")
+    assert env == {"ok": False, "error": "not_found"}
+
+
 def test_wrapper_does_not_confuse_units_across_calls_sharing_an_out_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
