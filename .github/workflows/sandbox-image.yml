@@ -73,7 +73,7 @@ jobs:
       # 没有 QEMU 步骤:这个 workflow 只建 linux/amd64,runner 本身就是 amd64,
       # 不需要跨架构模拟(见下面 `platforms` 处的说明)。
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Build into the local daemon so the smoke test + Trivy can use it.
       # Build context is infra/sandbox-image/ — the Dockerfile COPYs runner.py /
