@@ -9,7 +9,7 @@ fetched (offline CI must never fail on the fail-open path).
 from __future__ import annotations
 
 import logging
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -17,9 +17,12 @@ from tiktoken import Encoding
 
 from expert_work.runtime.tokens import (
     CHARS_PER_TOKEN,
+    IMAGE_BLOCK_TOKEN_COST,
     CharTokenEstimator,
     TiktokenEstimator,
+    count_image_blocks,
     default_estimator,
+    estimate_message,
     estimate_messages,
     flatten_message,
 )
@@ -123,3 +126,37 @@ def test_real_o200k_smoke_cjk_far_above_chars_heuristic() -> None:
         pytest.skip("o200k_base BPE unavailable (offline) — fail-open path covered elsewhere")
     # chars//4 would report ~len/4; real tokenisation of CJK is >=2x that.
     assert count > (len(text) // CHARS_PER_TOKEN) * 2
+
+
+def _image_msg(n: int) -> HumanMessage:
+    blocks: list[str | dict[str, Any]] = [{"type": "text", "text": "看这几页"}]
+    blocks += [{"type": "image_ref", "ref": f"expert_work://image/t/th/{i}.png"} for i in range(n)]
+    return HumanMessage(content=blocks)
+
+
+def test_image_blocks_are_counted() -> None:
+    assert count_image_blocks(_image_msg(3)) == 3
+    assert count_image_blocks(HumanMessage(content="纯文本")) == 0
+
+
+def test_estimate_message_charges_for_images() -> None:
+    est = default_estimator()
+    text_only = est.count(flatten_message(_image_msg(0)))
+    with_images = estimate_message(_image_msg(3), est)
+    # 三张图必须至少多算三倍的每图代价,而不是多算一点点字符串表示。
+    assert with_images >= text_only + 3 * IMAGE_BLOCK_TOKEN_COST
+
+
+def test_image_cost_dwarfs_its_string_repr() -> None:
+    """低估 65 倍就是这条测出来的:代价不能由 repr 的长度决定。"""
+    est = default_estimator()
+    one = _image_msg(1)
+    repr_tokens = est.count(flatten_message(one))
+    assert estimate_message(one, est) > 10 * repr_tokens
+
+
+def test_flatten_message_is_not_padded() -> None:
+    """``flatten_message`` 还要给 coalesce / 摘要器造**真文本**,不许掺填充。"""
+    flat = flatten_message(_image_msg(2))
+    assert "看这几页" in flat
+    assert len(flat) < 500  # 两个 ref 的 repr 而已,没有 8000 字填充

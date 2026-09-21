@@ -41,7 +41,7 @@ from expert_work.runtime.middleware import (
     RedactText,
     TokenUsageMiddleware,
 )
-from expert_work.runtime.tokens import TokenEstimator, flatten_message
+from expert_work.runtime.tokens import TokenEstimator, estimate_message
 
 
 @dataclass(frozen=True)
@@ -195,7 +195,7 @@ def _dynamic_context(
         shared = estimator
 
         def _per_message(msg: BaseMessage) -> int:
-            return shared.count(flatten_message(msg))
+            return estimate_message(msg, shared)
 
         kwargs["token_estimator"] = _per_message
     return DynamicContextMiddleware(**kwargs)
@@ -227,7 +227,7 @@ def _context_pressure(
         shared = estimator
 
         def _per_message(msg: BaseMessage) -> int:
-            return shared.count(flatten_message(msg))
+            return estimate_message(msg, shared)
 
         kwargs["token_estimator"] = _per_message
     return ContextPressureMiddleware(**kwargs)
