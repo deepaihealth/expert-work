@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 
 from orchestrator import DEFAULT_MAX_STEPS, AgentState
-from orchestrator.state import _merge_promoted
+from orchestrator.state import _merge_promoted, _merge_viewed_figures
 
 
 def test_required_keys_present() -> None:
@@ -18,8 +18,9 @@ def test_required_keys_present() -> None:
     CM-11 ``last_plan_goal``, 委派层 1 ``delegation_nudge_plan_hash``,
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
-    ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``
-    (last twenty-one ``NotRequired``)。
+    ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``,
+    B-64 ``viewed_figures``
+    (last twenty-two ``NotRequired``)。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -54,6 +55,7 @@ def test_required_keys_present() -> None:
         "plan_first_dispatch_plan_hash",
         "plan_first_dispatch_active",
         "plan_first_dispatch_retries",
+        "viewed_figures",
     }
 
 
@@ -80,3 +82,22 @@ def test_merge_promoted_dedupes_within_new() -> None:
 
 def test_merge_promoted_empty_new_keeps_existing() -> None:
     assert _merge_promoted(["a"], []) == ["a"]
+
+
+# --- B-64: viewed_figures reducer -------------------------------------------
+
+
+def test_viewed_figures_merges_across_turns_in_order() -> None:
+    merged = _merge_viewed_figures(["a", "b"], ["c"])
+    assert merged == ["a", "b", "c"]
+
+
+def test_viewed_figures_dedupes_without_reordering() -> None:
+    """重看同一页不该把它挪到队尾 —— 滑窗按「首次看到」排。"""
+    assert _merge_viewed_figures(["a", "b"], ["a", "c"]) == ["a", "b", "c"]
+
+
+def test_tools_may_write_viewed_figures() -> None:
+    from orchestrator.tools.registry import TOOL_ALLOWED_STATE_KEYS
+
+    assert "viewed_figures" in TOOL_ALLOWED_STATE_KEYS

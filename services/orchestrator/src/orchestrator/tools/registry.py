@@ -369,8 +369,10 @@ class ToolContext:
 #:   deferred tools it just retrieved so the next ``agent_node`` adds them
 #:   to the LLM bind (the state.py channel uses ``_merge_promoted`` to
 #:   union-dedupe across turns).
+#: - ``viewed_figures`` —— B-64 ``read_page`` 追加它刚渲出来的页 ref
+#:   (state.py 的通道用 ``_merge_viewed_figures`` 跨轮保序 union)。
 TOOL_ALLOWED_STATE_KEYS: frozenset[str] = frozenset(
-    {"plan", "subagent_invocations", "promoted_tools"}
+    {"plan", "subagent_invocations", "promoted_tools", "viewed_figures"}
 )
 
 

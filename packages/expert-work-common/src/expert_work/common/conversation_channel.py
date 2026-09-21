@@ -44,6 +44,21 @@ INPUTS_BLOCK_MARK = "expert_work_inputs_block"
 #: 住在 common 是因为 orchestrator 不能 import control-plane。
 WORKSPACE_BLOCK_MARK = "expert_work_workspace_block"
 
+#: B-64 —— 平台按需渲出来的文档页(``graph_builder`` 的尾部隐藏 HumanMessage)。
+#: 它同时带 :data:`HIDE_FROM_UI`;这个标记是**更窄**的一层。
+#:
+#: 与前两个的消费方式都**不是**一件事,别照着改。三者的区别在「过期」的含义:
+#:
+#: * :data:`INPUTS_BLOCK_MARK` 过期 = 里面的路径失效 → 压缩后把原件放回去;
+#: * :data:`WORKSPACE_BLOCK_MARK` 过期 = **内容本身在说谎**(它逐字声称
+#:   「/workspace 现在有什么」)→ dedup,只留最新;
+#: * 本标记 —— **不过期**。一份上传文档的第 7 页,渲出来是什么就永远是什么。
+#:
+#: 所以前两条规矩套上来都是错的:dedup 会在模型看第 7 页时丢掉还有用的第 3 页,
+#: 「放回最新」同理。它自己一条规矩 —— **累积 + 滑窗**(见
+#: ``graph_builder._figure_block_tail``)。
+FIGURE_BLOCK_MARK = "expert_work_figure_block"
+
 #: 定时任务投递的助手消息标记(``trigger_delivery.inject_delivery``)。它
 #: **自己开一个段落** —— 否则它会被接到用户上一个真实提问的段尾,把那一段
 #: 的 ``final`` 抢走。
@@ -228,6 +243,7 @@ def visible_turns(
 __all__ = [
     "CHANNEL_COMMENTARY",
     "CHANNEL_FINAL",
+    "FIGURE_BLOCK_MARK",
     "HIDE_FROM_UI",
     "INPUTS_BLOCK_MARK",
     "SCHEDULED_DELIVERY",

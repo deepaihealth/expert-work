@@ -89,6 +89,22 @@ def _merge_last_used(existing: dict[str, int] | None, new: dict[str, int]) -> di
     return out
 
 
+def _merge_viewed_figures(left: list[str], right: list[str]) -> list[str]:
+    """跨轮累积已看过的页 ref —— union 去重且**保序**。
+
+    保序是滑窗的前提:``_figure_block_tail`` 取「最新 N 条」靠的是列表次序。
+    重看同一页不该把它挪到队尾 —— 那会把一张更早看过、模型还在用的图挤出窗口。
+    照 ``_merge_promoted``(TE-6 ``promoted_tools``)的口径写。
+    """
+    out = list(left)
+    seen = set(out)
+    for ref in right:
+        if ref not in seen:
+            out.append(ref)
+            seen.add(ref)
+    return out
+
+
 class AgentState(TypedDict):
     """State threaded through every orchestrator LangGraph node.
 
@@ -293,3 +309,7 @@ class AgentState(TypedDict):
     #: B-35 — 0 on a fresh dispatch turn, 1 once the single retry was spent;
     #: the next refusal degrades (full tools restored) instead of looping.
     plan_first_dispatch_retries: NotRequired[int]
+    #: B-64 —— 本 run 里 ``read_page`` 渲出来、已经给过模型的页 ref,按首次
+    #: 看到的次序。检查点里只有这些字符串(几十字节一条),**图片字节从不落库**:
+    #: 块每轮由 ``_figure_block_tail`` 重建,与工作区快照同一口径(CM-C4)。
+    viewed_figures: NotRequired[Annotated[list[str], _merge_viewed_figures]]
