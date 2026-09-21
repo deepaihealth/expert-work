@@ -476,6 +476,49 @@ def test_map_forbids_rendering_everything() -> None:
     assert "OCR" not in text.upper() or "技能" in text  # 不点名具体 skill
 
 
+def _figures_env(fmt: str) -> dict:
+    return {
+        "ok": True,
+        "state": "figures",
+        "format": fmt,
+        "figures": [
+            {
+                "unit": 1,
+                "kind": "chart",
+                "count": 1,
+                "w_pt": 0.0,
+                "h_pt": 0.0,
+                "anchor": "",
+                "alt": None,
+                "title": None,
+            }
+        ],
+        "skipped_decorative": 0,
+    }
+
+
+def test_map_action_for_pdf_still_points_at_read_page() -> None:
+    text = render_figure_map(_figures_env("pdf"))
+    assert "调用 read_page" in text
+
+
+def test_map_action_for_xlsx_does_not_suggest_read_page() -> None:
+    """B-64 回修 C3 —— xlsx 永远不支持 read_page(spec §9.4),清单文案不能
+    诱导模型去调一个注定被拒的工具。"""
+    text = render_figure_map(_figures_env("xlsx"))
+    assert "调用 read_page" not in text
+    assert "chart_data" in text
+
+
+def test_map_action_for_docx_explains_the_temporary_limitation() -> None:
+    """B-64 回修 C3 —— docx 的编号是段落位置,read_page 暂不支持,文案要说
+    清楚这是临时限制而不是"docx 有图但你自己想办法"。"""
+    text = render_figure_map(_figures_env("docx"))
+    assert "调用 read_page" not in text
+    assert "段落" in text
+    assert "临时" in text
+
+
 def test_map_caps_entries() -> None:
     env = {
         "ok": True,

@@ -340,6 +340,25 @@ def _describe_figure(figure: Mapping[str, Any]) -> str:
     return " ".join(parts)
 
 
+#: B-64 回修 C3 —— ``read_page`` 目前只真正支持 pdf/pptx(见
+#: ``read_page._RENDERABLE_EXTENSIONS``)。下面这句「调用 read_page」的引导
+#: 对 docx/xlsx 是错的:docx 会被 read_page 显式拒绝(临时限制 —— 它的编号是
+#: 段落位置不是页码);xlsx 永远不支持(图表数据已经在 ``chart_data`` 字段
+#: 里)。文案按格式分档,不点名它们该做什么替代动作以外的技术细节。
+#: 与 read_page.py 里的判据各自独立维护——两处都只是"给模型的人话提示",
+#: 分叉的后果只是提示语气不够精确,不是功能性 bug(真正挡渲染的闸只有一处,
+#: 在 read_page.py)。
+_FIGURE_MAP_ACTION_BY_FORMAT: Final[dict[str, str]] = {
+    "xlsx": "这些图表的数据已经在上面每条里(chart_data),不需要也不支持用 read_page 去看图。",
+    "docx": (
+        "docx 的编号是段落位置,不是页码 —— read_page 暂不支持这类文档"
+        "(临时限制,不代表以后也不支持)。"
+    ),
+}
+#: pptx / pdf(以及任何未来加入清单支持、但暂未在上表登记的格式)用这句。
+_DEFAULT_FIGURE_MAP_ACTION: Final = "要看某一处:调用 read_page,传文档路径和上面的编号。"
+
+
 def render_figure_map(env: Mapping[str, Any]) -> str:
     """信封 -> 前置在 ``content`` 头部的清单块(空串 = 不加块)。
 
@@ -371,9 +390,12 @@ def render_figure_map(env: Mapping[str, Any]) -> str:
     remaining = total - len(shown)
     if remaining > 0:
         parts.append(f"\n  ...另有 {remaining} 处未列出")
+    action = _FIGURE_MAP_ACTION_BY_FORMAT.get(
+        str(env.get("format") or ""), _DEFAULT_FIGURE_MAP_ACTION
+    )
     parts.append(
         "\n这些内容不在上面的文字里。挑你真正需要的那几处 —— 不要把所有页都取一遍。"
-        "\n要看某一处:调用 read_page,传文档路径和上面的编号。"
+        f"\n{action}"
         "\n如果缺口很大而且都要看,先确认有没有可用的 OCR 技能(skills_list)。]\n\n"
     )
     return "".join(parts)
