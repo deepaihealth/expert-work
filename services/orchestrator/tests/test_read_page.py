@@ -257,6 +257,71 @@ def test_wrapper_does_not_reuse_a_stale_file_when_a_later_render_fails(
     assert second["failed"] == [{"unit": 3, "why": "pdftoppm_failed"}]
 
 
+def _install_pdftoppm_with_shifting_padding_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
+) -> None:
+    """桩 pdftoppm:第一次调用按 2 位补零产出(退出码 0);第二次调用(模拟同
+    一个 rel 指向的文档换成了总页数不同的另一份,pdftoppm 的补零宽度也跟着
+    变了)按 3 位补零产出、**同样退出码 0**——真实成功,不触发 New-2 的
+    ``returncode != 0`` 分支。这是用来单独证明"渲染前清空私有目录"这一半
+    修法独立起作用的场景:字典序下 ``page-003.jpg`` < ``page-03.jpg``,
+    ``sorted(...)[-1]`` 会挑中后者——如果不清空,第一次留下的旧
+    ``page-03.jpg`` 会在第二次真实成功之后仍然被误判成这次的产出。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    soffice = bin_dir / "soffice"
+    soffice.write_text("#!/usr/bin/env python3\nimport sys\n\nsys.exit(0)\n")
+    soffice.chmod(0o755)
+    pdftoppm = bin_dir / "pdftoppm"
+    pdftoppm.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        'unit = int(args[args.index("-f") + 1])\n'
+        "pdf_path, prefix = args[-2], args[-1]\n"
+        f"counter_path = {str(counter_path)!r}\n"
+        "count = 0\n"
+        "if os.path.exists(counter_path):\n"
+        "    count = int(open(counter_path).read().strip() or '0')\n"
+        "count += 1\n"
+        "open(counter_path, 'w').write(str(count))\n"
+        "width = 2 if count < 2 else 3\n"
+        "with open(pdf_path) as fh:\n"
+        "    pdf_content = fh.read()\n"
+        'with open(f"{prefix}-{unit:0{width}d}.jpg", "w") as fh:\n'
+        '    fh.write(f"JPEG-PAGE-{unit}::round{count}::{pdf_content}")\n'
+    )
+    pdftoppm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def test_wrapper_does_not_pick_a_stale_file_when_a_later_render_succeeds_differently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 2 轮 New-2(rmtree 那一半,独立于 returncode 检查自证)—— 第二次
+    调用 pdftoppm **真的成功了**(退出码 0),只是这次补零宽度与第一次不同
+    (``page-003.jpg`` 而不是 ``page-03.jpg``)。不清空私有目录的话,第一次
+    留下的 ``page-03.jpg`` 仍然待在目录里,字典序排序会让 ``sorted(...)[-1]``
+    挑中它而不是这次真正新产出的 ``page-003.jpg``。"""
+    counter_path = tmp_path / "pdftoppm_calls"
+    _install_pdftoppm_with_shifting_padding_width(tmp_path, monkeypatch, counter_path=counter_path)
+    (tmp_path / "d.pdf").write_text("first version")
+    out_rel = ".tool_results/r1/figures/abc"
+
+    first = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel)
+    assert first["ok"] is True
+    assert first["rendered"][0]["rel"].endswith("page-03.jpg")
+
+    second = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel)
+    assert second["ok"] is True
+    assert second["rendered"][0]["rel"].endswith("page-003.jpg"), (
+        f"expected this round's fresh page-003.jpg, got stale {second['rendered'][0]['rel']!r}"
+    )
+    content = (tmp_path / second["rendered"][0]["rel"]).read_text()
+    assert "round2" in content
+
+
 def test_wrapper_renders_jpeg_not_png() -> None:
     code = build_render_wrapper(
         "d.pptx", units=[1], ws="/workspace", out_rel=".tool_results/r1/figures/s", dpi=RENDER_DPI
