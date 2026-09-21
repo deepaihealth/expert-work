@@ -340,3 +340,52 @@ async def test_inventory_failure_says_undetermined_not_silent() -> None:
     assert "无法确定" in result.content
     assert result.meta["figures_state"] == "undetermined"
     assert "正文" in result.content
+
+
+@pytest.mark.anyio
+async def test_text_format_skips_the_probe_entirely() -> None:
+    """扩展名早退 —— txt 连 OOXML zip 都不是,答案能白算,不该再起一次沙箱。
+
+    这是「零图路径零额外开销」的钉子:去掉早退这条判断,``call`` 会对
+    ``.md`` 也去跑一次图清单探测,这里的 ``execs`` 就会从 1 变成 2。
+    """
+    body = "普通的笔记文字"
+    runtime = _SequenceRuntime(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "content": body,
+                    "format": "md",
+                    "chars": len(body),
+                    "truncated": False,
+                }
+            ),
+        ]
+    )
+    result = await ReadDocumentTool(client=runtime).call({"path": "notes.md"}, ctx=_ctx())
+    assert len(runtime.execs) == 1
+    assert result.content == body
+    assert result.meta["figures"] == 0
+    assert result.meta["figures_state"] == "none"
+
+
+@pytest.mark.anyio
+async def test_supported_format_still_runs_the_probe() -> None:
+    """反向钉子 —— pptx 这类真能分析的格式,早退闸门不能连它一起挡了。"""
+    runtime = _SequenceRuntime(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "content": "正文",
+                    "format": "pptx",
+                    "chars": 2,
+                    "truncated": False,
+                }
+            ),
+            json.dumps({"ok": True, "state": "none", "figures": []}),
+        ]
+    )
+    await ReadDocumentTool(client=runtime).call({"path": "d.pptx"}, ctx=_ctx())
+    assert len(runtime.execs) == 2

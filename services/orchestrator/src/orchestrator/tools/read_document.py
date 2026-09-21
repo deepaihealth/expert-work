@@ -25,11 +25,13 @@ clean ``{"ok": False, ...}`` envelope rather than crashing the sandbox.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from orchestrator.tools.document_figures import (
+    SUPPORTED_EXTENSIONS,
     build_figure_inventory_wrapper,
     render_figure_map,
 )
@@ -236,17 +238,29 @@ class ReadDocumentTool:
         # B-64 —— 图清单。**只读 zip 里的 XML(~1 ms),不跑 LibreOffice**:转换
         # 推迟到模型真的调 ``read_page`` 那一刻(spec § 四)。清单这一段失败绝不
         # 能拖垮正文 —— 但也绝不能静默降级成「没有图」,所以异常走 undetermined。
-        try:
-            fig_env: Mapping[str, Any] = await run_scoped_read(
-                self.client,
-                build=lambda w: build_figure_inventory_wrapper(rel, ws=w, max_bytes=_MAX_DOC_BYTES),
-                ws=ws,
-                ctx=ctx,
-                tool="read_document",
-                seed_files=self.skill_seed_files,
-            )
-        except Exception:  # 任何失败都只降级到「测不了」,绝不悄悄变成「没有图」
-            fig_env = {"ok": True, "state": "undetermined", "reason": "probe_failed"}
+        #
+        # 扩展名早退:txt/md/csv/... 这类格式连 OOXML zip 都不是,答案(没有图)
+        # 从扩展名就能白算出来 —— 不值当为它们再起一整套 sandbox
+        # acquire→exec→release 只为拿回同一个 state="none"。这是设计文档承诺的
+        # 「零图路径零额外开销」,不是可选的性能优化;真答不出来才叫
+        # undetermined,答得出来的「没有」不该走一次探测。
+        ext = os.path.splitext(rel)[1].lower().lstrip(".")
+        if ext not in SUPPORTED_EXTENSIONS:
+            fig_env: Mapping[str, Any] = {"ok": True, "state": "none", "figures": []}
+        else:
+            try:
+                fig_env = await run_scoped_read(
+                    self.client,
+                    build=lambda w: build_figure_inventory_wrapper(
+                        rel, ws=w, max_bytes=_MAX_DOC_BYTES
+                    ),
+                    ws=ws,
+                    ctx=ctx,
+                    tool="read_document",
+                    seed_files=self.skill_seed_files,
+                )
+            except Exception:  # 任何失败都只降级到「测不了」,绝不悄悄变成「没有图」
+                fig_env = {"ok": True, "state": "undetermined", "reason": "probe_failed"}
 
         prefix = render_figure_map(fig_env)
         body = str(env.get("content", ""))

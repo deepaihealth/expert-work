@@ -34,6 +34,14 @@ MIN_FIGURE_AREA_RATIO: Final[float] = 0.01
 MAX_MAP_ENTRIES: Final[int] = 20
 #: pptx 演讲者备注的每页字数上限(spec 14.3:今天全环境 0 条,这是保险不是收益)。
 MAX_NOTES_CHARS: Final[int] = 500
+#: 图清单能分析的格式(不带点,小写)。``read_document`` 拿它在**进沙箱之前**
+#: 按扩展名早退 —— 设计文档的架构一节写明零图路径「零额外开销」,txt/md 这类
+#: 格式连 OOXML zip 都不是,让它们也走一次完整的 sandbox acquire→exec→release
+#: 就不是零开销了,答案本来就能从扩展名白算出来。**必须与下面沙箱内探测片段
+#: 里 ``builders`` 字典的键集合保持一致**——那份是真正决定"能不能分析"的地方,
+#: 这份只是把同一个判断提前搬到控制器侧省一次沙箱往返,两处分叉就会出现「控制器
+#: 说能测但沙箱其实不认」或反过来的不一致。
+SUPPORTED_EXTENSIONS: Final[frozenset[str]] = frozenset({"pptx", "docx", "xlsx", "pdf"})
 #: PDF 空页判据 —— 字符数低于此判为空页(沿用 hermes 的 PDF_EMPTY_PAGE_CHARS)。
 _PDF_EMPTY_PAGE_CHARS: Final[int] = 20
 #: 空页三重阈值 —— 绝对页数下限。
