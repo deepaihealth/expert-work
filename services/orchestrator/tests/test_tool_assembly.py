@@ -37,6 +37,7 @@ from orchestrator.tools import (
     MCPToolDef,
     ReadDocumentTool,
     ReadFileTool,
+    ReadPageTool,
     RecordingMCPClient,
     RecordingSandboxRuntime,
     RecordingTavilyClient,
@@ -776,6 +777,7 @@ _BASE_SANDBOX_TOOLS = (
     "write_file",
     "edit_file",
     "read_document",
+    "read_page",
 )
 #: B-84 —— 只读那三件的依赖是 ``workspace_store``, 不是沙箱。从
 #: ``_BASE_SANDBOX_TOOLS`` 里拆出来, 否则"没有沙箱就一个都不注册"那条断言会在
@@ -806,6 +808,7 @@ async def test_base_capabilities_assembled_with_no_manifest_tools() -> None:
     assert isinstance(registry.get("list_dir"), ListDirTool)
     assert isinstance(registry.get("search_files"), SearchFilesTool)
     assert isinstance(registry.get("read_document"), ReadDocumentTool)
+    assert isinstance(registry.get("read_page"), ReadPageTool)
     assert isinstance(registry.get("save_artifact"), SaveArtifactTool)
     assert isinstance(registry.get("list_artifacts"), ListArtifactsTool)
 

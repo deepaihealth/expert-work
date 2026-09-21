@@ -54,6 +54,7 @@ from orchestrator.tools.knowledge import KnowledgeRetriever, KnowledgeSearchTool
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.mcp import MCPServerPool, register_mcp_tools
 from orchestrator.tools.read_document import ReadDocumentTool
+from orchestrator.tools.read_page import ReadPageTool
 from orchestrator.tools.registry import ToolRegistry
 from orchestrator.tools.sandbox import ExecPythonTool, SandboxRuntime
 from orchestrator.tools.skill_authoring import SKILL_AUTHORING_BUILTINS
@@ -85,6 +86,7 @@ KNOWN_BUILTINS = frozenset(
         "list_dir",
         "search_files",
         "read_document",
+        "read_page",
         "save_artifact",
         "list_artifacts",
         "ask_for_approval",
@@ -532,6 +534,8 @@ def _register_builtin(
         _register_file_op(registry, entry.name, env, skill_seed_files)
     elif entry.name == "read_document":
         _register_read_document(registry, env, skill_seed_files)
+    elif entry.name == "read_page":
+        _register_read_page(registry, env, skill_seed_files)
     elif entry.name == "save_artifact":
         # 登记前要 stat 工作区里那个文件,所以和 read_file/write_file 一样需要
         # 沙箱执行通道;没有它就没有「文件」这个概念,登记只会造出死产物。
@@ -575,6 +579,7 @@ BASE_CAPABILITY_BUILTINS: tuple[str, ...] = (
     "list_dir",
     "search_files",
     "read_document",
+    "read_page",
     "save_artifact",
     "list_artifacts",
 )
@@ -732,6 +737,26 @@ def _register_read_document(
         )
     registry.register(
         ReadDocumentTool(
+            client=env.sandbox_runtime,
+            skill_seed_files=skill_seed_files,
+        )
+    )
+
+
+def _register_read_page(
+    registry: ToolRegistry,
+    env: ToolEnv,
+    skill_seed_files: tuple[tuple[str, bytes], ...],
+) -> None:
+    # B-64 —— read_page rides the same warm sandbox runtime exec channel as
+    # read_document (soffice / pdftoppm run inside the per-user sandbox).
+    if env.sandbox_runtime is None:
+        raise AgentFactoryError(
+            "builtin 'read_page' declared but no sandbox runtime "
+            "is configured (ToolEnv.sandbox_runtime)"
+        )
+    registry.register(
+        ReadPageTool(
             client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
         )
