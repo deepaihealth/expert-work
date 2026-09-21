@@ -18,6 +18,14 @@ jpeg → glob 找产物。三个实测坑写进片段:
    先渲第 21 页、再请求第 1 页,``page-*1.jpg`` 这种兜底模式同时命中
    ``page-01.jpg`` 与 ``page-21.jpg``)。每个 unit 因此有自己的私有产出子目
    录,那里面只可能有这个 unit 刚产出的那一个文件。
+4. **私有产出目录必须在渲染前清空**(回修第 2 轮 New-2)—— 3 里的私有目录
+   只挡跨 unit 混淆,挡不住"同一个 unit 被重渲染、这一次失败了"这种情况:
+   ``out_dir`` 跨调用存活,旧文件还在目录里;第二次 ``pdftoppm`` 非零退出、
+   没产新文件,glob 会把上一次的旧文件当成这次的产出报成功(实测撞到:同一
+   个 rel 指向的文档在同一个 run 里被换过内容之后,这条路会把旧文档的页报成
+   新文档的页——一次真实的渲染失败被翻译成了成功)。渲染前
+   ``shutil.rmtree`` 再 ``makedirs``,并且接住 ``subprocess.run`` 的返回码,
+   非零直接算失败,不再只靠"有没有产出文件"去反推。
 
 落点固定在 :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
 (``.tool_results/``)下,这样渲出来的 ref 才落进
@@ -122,6 +130,12 @@ _UNKNOWN_ERROR_EXPLANATION: Final = (
 _FAILED_UNIT_REASONS: Final[dict[str, str]] = {
     "not_rendered": "转换后没能渲出这一页,常见原因是页码超出了文档实际页数",
     "TimeoutExpired": "渲染这一页超时了",
+    #: 回修第 2 轮 New-2 —— pdftoppm 非零退出(接住返回码,不再只靠有没有
+    #: 产出文件去反推)。
+    "pdftoppm_failed": "pdftoppm 处理这一页失败了",
+    #: 回修第 2 轮 New-3 —— 沙箱回报的 rel 没过 _validate_rendered_rel 这道
+    #: 闸(见该函数 docstring),不能被 call() 悄悄吞掉。
+    "rejected_rel": "产出路径不合法,已丢弃",
 }
 
 
@@ -172,18 +186,28 @@ def _main():
     for unit in _P["units"]:
         # 每个 unit 自己的私有产出目录(回修 C2)—— out_dir 跨调用累积, 一个
         # 只按 unit 数字子串匹配的 glob 会把其它 unit 的残留产物错当成这一页。
-        # 私有目录里只可能有这个 unit 刚产出的那一个文件, glob 不需要也不许
-        # 带 unit 后缀约束。
+        # 渲染前先清空再建(回修第 2 轮 New-2)——私有目录本身只挡跨 unit 混淆,
+        # 挡不住"同一个 unit 被重渲染、这一次失败了"这种情况:不清空的话旧
+        # 文件还在, 这次 pdftoppm 就算失败也会被 glob 到上一次的旧文件, 把
+        # 渲染失败报成了成功(实测撞到)。清空之后, 私有目录里才真的只可能
+        # 有这个 unit 这一次刚产出的那一个文件, glob 不需要也不许带 unit
+        # 后缀约束。
         unit_dir = os.path.join(out_dir, "_u" + str(unit))
+        shutil.rmtree(unit_dir, ignore_errors=True)
         os.makedirs(unit_dir, exist_ok=True)
         prefix = os.path.join(unit_dir, "page")
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["pdftoppm", "-jpeg", "-r", str(_P["dpi"]),
                  "-f", str(unit), "-l", str(unit), pdf, prefix],
                 capture_output=True, timeout=_P["render_timeout_s"], check=False)
         except Exception as exc:
             failed.append({"unit": unit, "why": type(exc).__name__})
+            continue
+        # 非零退出码本身就是失败信号(回修第 2 轮 New-2)——接住返回值, 不能
+        # 只靠"有没有产出文件"去反推 pdftoppm 是不是真的成功了。
+        if result.returncode != 0:
+            failed.append({"unit": unit, "why": "pdftoppm_failed"})
             continue
         # pdftoppm 把页号补零到总页数的宽度(22 页 -> page-01.jpg), 所以必须
         # glob, 不许拼文件名。
@@ -290,6 +314,10 @@ def _validate_rendered_rel(rel: object) -> str | None:
 
     校验不过就当这一页渲染失败(返回 ``None``),调用方据此把它从
     ``viewed_figures`` 里剔除 —— 不吞,也不当成功接受一个可能指向别处的 ref。
+    "不吞" 是对 ref 说的,不是对模型说的:``ReadPageTool.call``(回修第 2 轮
+    New-3)还要把被剔除的 unit 并进 ``failed`` 播报里告诉模型"这一页丢了",
+    单单在这里返回 ``None`` 而调用方不接话,模型看到的就是"请求了 3 页,只字
+    不提第 2 页"的沉默失败。
     """
     if not isinstance(rel, str) or not rel or not rel.endswith(".jpg"):
         return None
@@ -348,14 +376,21 @@ class ReadPageTool:
 
     @property
     def spec(self) -> ToolSpec:
+        # 回修第 2 轮 New-1 —— "哪些格式能渲染"这句不能手写字面量:15 行外的
+        # _reject_unrenderable_format 已经从 RENDERABLE_EXTENSIONS 派生了,这里
+        # 手写一份会在 Task 4b 给 RENDERABLE_EXTENSIONS 加 docx 之后立刻漂移——
+        # 模型每一轮读到的描述仍然说 docx 会被拒,子集钉与身份钉都管不到 prose,
+        # 没有任何测试会红。改成从同一个集合插值,并且不点名"谁被拒"(不然又是
+        # 同一个坑换个位置)。
+        renderable = " / ".join(sorted(ext.upper() for ext in RENDERABLE_EXTENSIONS))
         return ToolSpec(
             name="read_page",
             description=(
                 "Render a specific page/slide of a document in your own workspace "
                 "into an image, so you can actually look at a figure or chart the "
                 "document's figure map (shown by read_document) told you about. "
-                "Only PDF and PPTX are renderable today; DOCX and XLSX are refused "
-                "with an explanation (their unit numbering doesn't map to a page). "
+                f"Only {renderable} are renderable today; other formats are refused "
+                "with an explanation. "
                 "'units' are 1-based page/slide numbers; at most "
                 f"{MAX_PAGES_PER_CALL} per call — call it again for more. Paths "
                 "are relative to your own workspace root."
@@ -431,25 +466,38 @@ class ReadPageTool:
         scope = store_scope(ws, agent_key=ctx.agent_key)
         refs: list[str] = []
         rendered_units: list[int] = []
+        # 回修第 2 轮 New-3 —— _validate_rendered_rel 剔掉的 unit 不能悄悄消失:
+        # 函数自己的 docstring 说"不吞",但只做到了不接受那个 ref,没做到告诉
+        # 模型"你请求的这一页丢了"。并进下面统一的 failed 播报里,不单独起一套
+        # 文案。
+        rejected: list[Mapping[str, Any]] = []
         for item in env.get("rendered") or ():
             if not isinstance(item, Mapping):
                 continue
+            unit = item.get("unit")
             safe_rel = _validate_rendered_rel(item.get("rel"))
             if safe_rel is None:
+                if isinstance(unit, int) and not isinstance(unit, bool):
+                    rejected.append({"unit": unit, "why": "rejected_rel"})
                 continue
             host_rel = scoped_path(scope, safe_rel)
             refs.append(workspace_figure_ref(ctx.tenant_id, ctx.user_id, host_rel))
-            unit = item.get("unit")
             if isinstance(unit, int) and not isinstance(unit, bool):
                 rendered_units.append(unit)
+        raw_failed = env.get("failed")
+        all_failed = (list(raw_failed) if isinstance(raw_failed, list) else []) + rejected
         if not refs:
-            return ToolResult(content=f"无法渲染 {raw}:没有取到任何页。")
+            msg = f"无法渲染 {raw}:没有取到任何页。"
+            per_unit = _describe_failed_units(all_failed)
+            if per_unit:
+                msg = f"{msg} {per_unit}"
+            return ToolResult(content=msg)
 
         pages = "、".join(str(u) for u in rendered_units) if rendered_units else str(len(refs))
         content = (
             f"已渲染 {raw} 第 {pages} 页,已放进你的上下文 —— 需要仔细看细节时用 ask_image 问它。"
         )
-        per_unit = _describe_failed_units(env.get("failed"))
+        per_unit = _describe_failed_units(all_failed)
         if per_unit:
             content = f"{content} {per_unit}"
         return ToolResult(

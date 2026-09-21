@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS
 from orchestrator.tools.read_page import (
     _CONVERT_TIMEOUT_S,
     _RENDER_TIMEOUT_S,
@@ -195,6 +196,67 @@ def test_wrapper_does_not_confuse_units_across_calls_sharing_an_out_dir(
     )
 
 
+def _install_flaky_pdftoppm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
+) -> None:
+    """桩 pdftoppm:第一次调用正常产出,第二次(及以后)调用退出码 1、不产任何
+    文件——模拟一次真实的渲染失败(回修第 2 轮 New-2 回归钉)。soffice 桩只是
+    个空操作(``shutil.which`` 探测要求它存在,已是 pdf 的场景根本不会调用它)。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    soffice = bin_dir / "soffice"
+    soffice.write_text("#!/usr/bin/env python3\nimport sys\n\nsys.exit(0)\n")
+    soffice.chmod(0o755)
+    pdftoppm = bin_dir / "pdftoppm"
+    pdftoppm.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        'unit = int(args[args.index("-f") + 1])\n'
+        "pdf_path, prefix = args[-2], args[-1]\n"
+        f"counter_path = {str(counter_path)!r}\n"
+        "count = 0\n"
+        "if os.path.exists(counter_path):\n"
+        "    count = int(open(counter_path).read().strip() or '0')\n"
+        "count += 1\n"
+        "open(counter_path, 'w').write(str(count))\n"
+        "if count >= 2:\n"
+        "    sys.exit(1)\n"
+        "with open(pdf_path) as fh:\n"
+        "    pdf_content = fh.read()\n"
+        'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
+        '    fh.write(f"JPEG-PAGE-{unit}::{pdf_content}")\n'
+    )
+    pdftoppm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def test_wrapper_does_not_reuse_a_stale_file_when_a_later_render_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 2 轮 New-2 —— ``out_dir`` 跨调用存活:第一次渲染成功留下
+    ``page-03.jpg``;第二次对同一个 out_rel 再渲同一个 unit,这次 pdftoppm
+    真实失败(非零退出、不产文件)。私有 unit 目录如果不在渲染前清空,第二次
+    的 glob 会把第一次留下的旧文件当成这次的产出报成功——如果这期间 rel 指
+    向的文档已经换了内容(同一个 run 里 d.pdf 被覆盖),报的就是旧文档的页,
+    不是新文档的页。第二次必须落进 ``failed``,不是 ``rendered``。
+    """
+    counter_path = tmp_path / "pdftoppm_calls"
+    _install_flaky_pdftoppm(tmp_path, monkeypatch, counter_path=counter_path)
+    (tmp_path / "d.pdf").write_text("first version")
+    out_rel = ".tool_results/r1/figures/abc"
+
+    first = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel)
+    assert first["ok"] is True
+    assert first["rendered"][0]["rel"].endswith("page-03.jpg")
+
+    second = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel)
+    assert second["ok"] is False
+    assert second["error"] == "render_failed"
+    assert second["failed"] == [{"unit": 3, "why": "pdftoppm_failed"}]
+
+
 def test_wrapper_renders_jpeg_not_png() -> None:
     code = build_render_wrapper(
         "d.pptx", units=[1], ws="/workspace", out_rel=".tool_results/r1/figures/s", dpi=RENDER_DPI
@@ -210,6 +272,20 @@ def test_spec_is_not_read_only() -> None:
     spec = ReadPageTool(client=RecordingSandboxRuntime()).spec
     assert spec.is_read_only is False
     assert spec.side_effect == "reversible"
+
+
+def test_spec_description_derives_renderable_formats_from_the_single_source() -> None:
+    """回修第 2 轮 New-1 —— 模型每一轮都读到的工具描述,不能是一份独立手写的
+    格式名单:``_reject_unrenderable_format`` 已经从 ``RENDERABLE_EXTENSIONS``
+    派生,描述文案也必须从同一个集合插值,不能手写"PDF"/"PPTX" 这几个字。
+    否则 Task 4b 给 RENDERABLE_EXTENSIONS 加 docx 之后,模型读到的描述仍然说
+    docx 会被拒——子集钉与身份钉都管不到 prose。"""
+    description = ReadPageTool(client=RecordingSandboxRuntime()).spec.description
+    for ext in RENDERABLE_EXTENSIONS:
+        assert ext.upper() in description
+    # 也不能点名"谁被拒"——那是另一份手写名单,同一个坑换个位置。
+    assert "DOCX" not in description
+    assert "XLSX" not in description
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +482,44 @@ async def test_partial_failure_is_surfaced_per_unit() -> None:
         {"path": "d.pptx", "units": [1, 5]}, ctx=_ctx()
     )
     assert "第 5 页没取到" in result.content
+
+
+@pytest.mark.anyio
+async def test_rel_rejected_by_validate_rendered_rel_is_not_silently_swallowed() -> None:
+    """回修第 2 轮 New-3 —— 沙箱回报两页, 其中一页的 rel 没过
+    ``_validate_rendered_rel`` 这道闸(越权路径,像片段被攻破或出了 bug),
+    ``call()`` 此前直接 ``continue`` 把它整条丢弃,content 对模型只字不提 ——
+    模型请求了 2 页,只被告知拿到了 1 页,看不出另一页发生了什么。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 1,
+                            "rel": ".tool_results/r1/figures/abc/page-01.jpg",
+                            "bytes": 100,
+                        },
+                        {
+                            "unit": 2,
+                            "rel": "../../etc/passwd.jpg",
+                            "bytes": 100,
+                        },
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.pptx", "units": [1, 2]}, ctx=_ctx()
+    )
+    assert len(result.state_updates["viewed_figures"]) == 1
+    assert "第 2 页没取到" in result.content
+    assert "不合法" in result.content
     assert len(result.state_updates["viewed_figures"]) == 1
 
 

@@ -162,6 +162,18 @@ def parse_workspace_image_ref(uri: str) -> WorkspaceImageRef:
     ref 字符串本身看不出"自己"是谁,那是下一层的活(``vision.AskImageTool``
     比对 ``ctx.agent_key``;见该模块)。裸 ``agents/`` 后面没有 key(或 key 是
     空串)仍然拒。
+
+    B-64 回修第 2 轮 New-6(裁定:保持现状,只记账)—— 这道闸只校验"字符集
+    安全",不校验"长得像 ``sanitize_agent_key`` 的产物"(``<清洗前缀>-<8 位
+    hex>`` 那个形状)。所以 ``agents/x.jpg/...`` 这类第二段不是真实 agent_key
+    的 ref 也会解析成功(``agent_key='x.jpg'``)。无危害——真实的 agent_key
+    恒是 ``sanitize_agent_key`` 的产物,``vision.AskImageTool`` 拿它与
+    ``ctx.agent_key`` 逐字比对时,一个凭空编的 ``'x.jpg'`` 必然对不上任何真实
+    运行的 ``ctx.agent_key`` 而被拒。在这里加一条"key 必须长得像 sanitize
+    产物"的格式校验,等于把一条本该只由 ``sanitize_agent_key`` 一处决定的
+    格式约定钉进这道边界,以后改 ``sanitize_agent_key`` 的产物形状会在这个
+    远处的地方炸——解析器只保证 key 是一个安全的路径段,不保证它是调用方
+    自己的、也不保证它像谁的产物。
     """
     if not uri.startswith(WORKSPACE_REF_PREFIX):
         msg = f"workspace image ref must start with {WORKSPACE_REF_PREFIX!r}: {uri!r}"

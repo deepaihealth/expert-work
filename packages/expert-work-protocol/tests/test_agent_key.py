@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-from expert_work.protocol.agent_key import sanitize_agent_key
+from expert_work.protocol.agent_key import require_safe_key, sanitize_agent_key
 
 
 def _expected(name: str) -> str:
@@ -55,3 +55,13 @@ def test_orchestrator_reexport_is_the_same_object() -> None:
     from orchestrator.tools.skill_seed import sanitize_agent_key as reexported
 
     assert reexported is sanitize_agent_key
+
+
+def test_workspace_paths_reexport_is_the_same_object() -> None:
+    """B-64 回修 C1 —— ``require_safe_key`` 也是从这里下沉的,同一个理由:
+    老导入点 ``orchestrator.tools.workspace_paths`` 必须是**转出**,不是第二份
+    实现(回修第 2 轮 New-5,照 ``sanitize_agent_key`` 那条转出钉抄)。
+    """
+    from orchestrator.tools.workspace_paths import require_safe_key as reexported
+
+    assert reexported is require_safe_key

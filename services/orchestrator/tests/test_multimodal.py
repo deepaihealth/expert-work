@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -348,6 +348,24 @@ def test_is_cacheable_image_ref_false_outside_write_once_prefix_for_an_agent_sco
     assert is_cacheable_image_ref(ref) is False
 
 
+@pytest.mark.parametrize(
+    "rel_tail",
+    [
+        "agents/./pf-probe-33086dc0/.tool_results/r1/page.jpg",
+        "agents//pf-probe-33086dc0/.tool_results/r1/page.jpg",
+        "agents/pf-probe-33086dc0/./.tool_results/r1/page.jpg",
+    ],
+)
+def test_is_cacheable_image_ref_true_for_non_normalized_agent_scoped_rel(rel_tail: str) -> None:
+    """B-64 回修第 2 轮 New-4 —— ``parsed.rel`` 不保证被归一化过(``agent_key``
+    是拿 ``PurePosixPath(rel).parts`` 解出来的,但归一化结果从没写回 ``rel``
+    字段本身)。按字节长度砍 ``agents/<key>/`` 前缀,在带 ``.``/双斜杠这类写法
+    下会砍错位置,把真正落在 ``.tool_results/`` 下的渲染页误判成不可缓存。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/{rel_tail}"
+    assert is_cacheable_image_ref(ref) is True
+
+
 class _CountingResolver:
     """Inner resolver that counts fetches — to prove the cache short-circuits."""
 
@@ -539,3 +557,27 @@ def test_parse_image_ref_still_refuses_workspace_scheme() -> None:
     """老边界一个字没松 —— 这是「加兄弟不加分支」的钉子。"""
     with pytest.raises(ValueError, match="must start with"):
         parse_image_ref("expert_work://workspace/t/u/x.jpg")
+
+
+@pytest.mark.parametrize(
+    "rel_tail",
+    [
+        "agents/./k1/.tool_results/r1/page.jpg",
+        "agents//k1/.tool_results/r1/page.jpg",
+        "agents/k1/./.tool_results/r1/page.jpg",
+        "agents/k1/.tool_results/r1/page.jpg",
+    ],
+)
+def test_agent_key_matches_the_first_two_normalized_parts_of_rel(rel_tail: str) -> None:
+    """B-64 回修第 2 轮 New-4 —— ``agent_key`` 是拿归一化后的
+    ``PurePosixPath(rel).parts`` 解出来的,但 ``rel`` 字段本身不保证被归一化
+    (混了 ``.``/双斜杠这类写法也照样解得出 ``agent_key``)。这条测试钉住两者
+    必须永远一致:``agent_key`` 非 ``None`` 时,重新对 ``rel`` 分段,前两段
+    恒等于 ``("agents", agent_key)`` —— 任何在 ``rel`` 上按字节长度砍前缀的
+    消费方(如 ``is_cacheable_image_ref``)都依赖这条不变式成立。
+    """
+    t, u = uuid4(), uuid4()
+    parsed = parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/{rel_tail}")
+    assert parsed.agent_key is not None
+    parts = PurePosixPath(parsed.rel).parts
+    assert parts[:2] == ("agents", parsed.agent_key)

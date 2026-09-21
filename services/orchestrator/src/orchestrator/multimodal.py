@@ -27,7 +27,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
 from uuid import UUID
 
-from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_OVERFLOW_DIR
+from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
     WORKSPACE_REF_PREFIX,
@@ -392,16 +392,25 @@ def is_cacheable_image_ref(ref: str) -> bool:
     直接比 ``WORKSPACE_OVERFLOW_DIR`` 前缀,``agents/`` 段会让每一条比较全部落
     空,于是绑了 agent 的渲染页永远判成"不可缓存",每次都要重新走一次 NAS 读。
     这不是正确性 bug(未缓存只是慢,不是错),但完全背离了这个函数存在的理由。
+
+    B-64 回修第 2 轮 New-4 —— 剥前缀不能按**字节长度**砍。``parsed.rel`` 不
+    保证被归一化过:``parse_workspace_image_ref`` 只是拿
+    ``PurePosixPath(rel).parts`` 去解 ``agent_key``,从没把归一化结果写回
+    ``rel`` 字段(下面这行原来的注释"``rel`` 恒以这个前缀开头"是错的)。一个
+    形如 ``agents/./k1/.tool_results/...`` 或 ``agents//k1/...`` 的 ``rel``
+    (``agent_key`` 依然正确解成 ``k1``)按 ``len("agents/k1/")`` 这样的字节数
+    去切,切到的不是真正的前缀边界。**没有安全影响**(切错之后 ``tail`` 对
+    不上 ``WORKSPACE_OVERFLOW_DIR`` 前缀,只会让判据回落到"不可缓存"这一
+    支,不会反向产出错误的 ``True``),纯粹是缓存命中率的问题。改用
+    ``PurePosixPath`` 重新分段,按**分段数**砍前两段,不受这类写法影响。
     """
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True
     parsed = parse_workspace_image_ref(ref)
-    tail = parsed.rel
-    if parsed.agent_key is not None:
-        agent_prefix = f"{WORKSPACE_AGENTS_DIR}/{parsed.agent_key}/"
-        # parse_workspace_image_ref guarantees ``rel`` starts with exactly
-        # this prefix whenever ``agent_key`` is set — see its docstring.
-        tail = tail[len(agent_prefix) :]
+    if parsed.agent_key is None:
+        tail = parsed.rel
+    else:
+        tail = "/".join(PurePosixPath(parsed.rel).parts[2:])
     return tail == WORKSPACE_OVERFLOW_DIR or tail.startswith(f"{WORKSPACE_OVERFLOW_DIR}/")
 
 
