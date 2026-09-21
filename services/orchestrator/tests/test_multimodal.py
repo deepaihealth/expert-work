@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -240,6 +241,69 @@ async def test_nas_resolver_refuses_a_file_over_the_size_cap(tmp_path: Path) -> 
     ref = f"expert_work://workspace/{tenant}/{user}/too-big.jpg"
 
     with pytest.raises(ValueError, match="exceeds the"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_bounds_the_read_even_when_fstat_undercounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Important finding 1 —— the fstat cap alone isn't enough: it's asked
+    once, and the sandbox writes this tree directly while an agent controls
+    its own files, so a writer growing the file *after* that fstat is a
+    reachable race, not a hypothetical one. Simulated deterministically by
+    making ``os.fstat`` under-report the size of a file that is genuinely
+    over the cap on disk (a sparse file, so no real 64 MiB write) — proving
+    the real backstop is the bounded ``handle.read(cap + 1)`` + length
+    recheck, not the fstat pre-check.
+    """
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    big = user_dir / "grew-after-stat.jpg"
+    big.touch()
+    os.truncate(big, _MAX_WORKSPACE_IMAGE_BYTES + 10)  # sparse -- genuinely over cap
+
+    real_fstat = os.fstat
+
+    def _fstat_that_undercounts(fd: int) -> SimpleNamespace:
+        real = real_fstat(fd)
+        return SimpleNamespace(st_mode=real.st_mode, st_size=1)  # lies: "tiny file"
+
+    monkeypatch.setattr("os.fstat", _fstat_that_undercounts)
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/grew-after-stat.jpg"
+
+    with pytest.raises(ValueError, match="exceeds the"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_a_fifo_without_hanging(tmp_path: Path) -> None:
+    """Important finding 2 —— ``O_NOFOLLOW`` rejects symlinks, not FIFOs. An
+    agent naming a FIFO ``page.jpg`` in its own workspace would otherwise
+    have ``open``/``read`` block forever waiting for a writer that never
+    comes, pinning a worker in the shared ``asyncio.to_thread`` pool.
+
+    Why this test doesn't hang even if the fix regresses: the leaf open
+    carries ``O_NONBLOCK`` (a no-op for a regular file, but it makes opening
+    a writer-less FIFO return immediately instead of blocking), so the
+    refusal is reachable without ever calling a blocking ``read()``. The
+    ``@pytest.mark.timeout(5)`` is the second, independent safety net — if
+    a future change dropped ``O_NONBLOCK``, this test would fail on a bounded
+    timeout instead of hanging the whole suite.
+    """
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    os.mkfifo(user_dir / "page.jpg")
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/page.jpg"
+
+    with pytest.raises(ValueError, match="not a regular file"):
         await resolver.resolve(ref)
 
 

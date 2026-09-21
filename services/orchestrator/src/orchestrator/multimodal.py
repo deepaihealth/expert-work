@@ -195,7 +195,13 @@ class NasWorkspaceImageResolver:
 
     Stat-before-read(:data:`_MAX_WORKSPACE_IMAGE_BYTES`)+ 全部 IO 走
     :func:`asyncio.to_thread`:NFS 上的阻塞系统调用不能占用 control-plane 的
-    事件循环,理由与 ``NasWorkspaceStore`` 完全一致。
+    事件循环,理由与 ``NasWorkspaceStore`` 完全一致。fstat 同一次结果还兼两件
+    事:非 ``S_ISREG``(FIFO / socket / device)直接拒绝——不这样做的话,一个
+    agent 在自己工作区里放一个没有 writer 的 FIFO 就能把 open/read 永远卡住,
+    钉死共享 ``asyncio.to_thread`` 线程池里的一个 worker;读文件走
+    ``handle.read(cap + 1)`` 而不是无界 ``handle.read()``——沙箱直写这棵树,
+    agent 自己控制自己的文件,fstat 之后再把文件写大这条竞态是刻意可达的,
+    不只是意外。
     """
 
     root: Path
@@ -229,7 +235,11 @@ def _read_workspace_leaf(root: Path, tenant_id: UUID, user_id: UUID, rel: str, r
     dfd = _walk_to_parent_fd(dfd, parts[:-1], ref)
     try:
         try:
-            leaf_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+            # O_NONBLOCK —— 一个 FIFO 用阻塞模式 open 会卡在这一句本身(等一个
+            # 永远不会出现的 writer),连下面的 S_ISREG 检查都走不到。这个标志
+            # 对普通文件是空操作(POSIX),合法路径的行为不变;只有非常规文件
+            # 才会感觉到差别,而那正是下面要拒绝的对象。
+            leaf_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
         except OSError as exc:
             raise _nofollow_open_error(exc, dfd, parts[-1], ref) from exc
     finally:
@@ -237,14 +247,36 @@ def _read_workspace_leaf(root: Path, tenant_id: UUID, user_id: UUID, rel: str, r
     with os.fdopen(leaf_fd, "rb") as handle:
         # Stat before reading so an over-cap file never gets fully loaded
         # into memory — same reasoning as nas_workspace_store.read_file.
-        size = os.fstat(handle.fileno()).st_size
-        if size > _MAX_WORKSPACE_IMAGE_BYTES:
+        st = os.fstat(handle.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            # FIFO / socket / device (a symlink already can't reach here —
+            # O_NOFOLLOW rejected it above). Opening *or reading* a FIFO with
+            # no writer blocks indefinitely — that would pin a worker in the
+            # shared asyncio.to_thread pool forever; refused here, before any
+            # read is attempted, using the same fstat this function already
+            # takes for the size cap.
+            msg = f"workspace image ref is not a regular file: {ref!r}"
+            raise ValueError(msg)
+        if st.st_size > _MAX_WORKSPACE_IMAGE_BYTES:
             msg = (
                 f"workspace image ref exceeds the {_MAX_WORKSPACE_IMAGE_BYTES}-byte "
                 f"read cap: {ref!r}"
             )
             raise ValueError(msg)
-        return handle.read()
+        # Bounded read, not handle.read(): a writer that grows the file
+        # *after* the fstat above (the sandbox writes this tree directly,
+        # and an agent controls its own files — this race is reachable on
+        # purpose) would otherwise still be fully buffered into memory.
+        # Reading one byte past the cap is enough to detect the overrun
+        # without ever holding more than cap+1 bytes.
+        data = handle.read(_MAX_WORKSPACE_IMAGE_BYTES + 1)
+        if len(data) > _MAX_WORKSPACE_IMAGE_BYTES:
+            msg = (
+                f"workspace image ref exceeds the {_MAX_WORKSPACE_IMAGE_BYTES}-byte "
+                f"read cap: {ref!r}"
+            )
+            raise ValueError(msg)
+        return data
 
 
 def _walk_to_parent_fd(dfd: int, components: tuple[str, ...], ref: str) -> int:
