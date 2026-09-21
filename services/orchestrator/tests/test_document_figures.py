@@ -3,12 +3,22 @@
 两层,与 test_read_document 同构:
   1. 沙箱内探测片段,拿本地 temp 工作区直接跑;
   2. 信封 → 清单文本的渲染。
+
+docx/pdf 的结构性不变式测试**手搭字节,不依赖第三方解析库**:
+``python-docx`` 不在 ``uv.lock`` 里(这个仓库的文档解析走
+``markitdown[docx,pdf,pptx,xlsx]``,它的 docx extra 拉的是
+``mammoth``/``lxml``,不是 ``python-docx``),``reportlab``/``pypdf`` 也不在。
+用 ``pytest.importorskip`` 包一层会在 CI 里**静默跳过**,而这正是 B-64 要
+消灭的那类失效在测试里又出现了一次。docx 用 ``zipfile`` 手写最小 OOXML
+(与 ``_docx_inventory`` 读的是同一套 XML 形状);pdf 用手拼字节(带正确
+xref 偏移量),``pdfplumber`` 本身在 ``uv.lock`` 里,不需要额外的库来写。
 """
 
 from __future__ import annotations
 
 import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -81,18 +91,94 @@ def test_pptx_native_chart_becomes_data_not_a_figure(tmp_path: Path) -> None:
     assert chart["chart_data"]["series"] == {"血糖": [6.1, 5.8, 5.5]}
 
 
-def test_decorative_logo_is_skipped(tmp_path: Path) -> None:
-    """页脚 logo 29x29pt 占页 0.17%,不进清单;同页的 288x192pt 图表进。"""
-    docx = pytest.importorskip("docx")
-    from docx.shared import Inches
+# ---------------------------------------------------------------------------
+# docx —— 手搭最小 OOXML,不经过 python-docx(不在 uv.lock 里,CI 会跳过)。
+# ---------------------------------------------------------------------------
 
-    d = docx.Document()
-    d.add_heading("一、体检概览", 1)
-    d.add_paragraph("这是第一段正文，后面跟着一张血糖趋势图。")  # noqa: RUF001
-    d.add_picture(_png(600, 400), width=Inches(4))
-    d.add_paragraph("下面是一张小 logo。")
-    d.add_picture(_png(40, 40), width=Inches(0.4))
-    d.save(tmp_path / "d.docx")
+_DOCX_CONTENT_TYPES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="png" ContentType="image/png"/>
+<Override PartName="/word/document.xml"
+  ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+
+_DOCX_ROOT_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1"
+  Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+  Target="word/document.xml"/>
+</Relationships>"""
+
+_DOCX_NS = (
+    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+    'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+)
+
+
+def _docx_text(text: str) -> str:
+    return f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+
+
+def _docx_drawing(rid: str, name: str, cx: int, cy: int, descr: str | None = None) -> str:
+    """一个含 ``w:drawing`` 的段落 —— 与 ``_docx_inventory`` 读的 XML 形状
+    (``wp:inline`` / ``wp:docPr`` / ``wp:extent`` / ``a:graphicData`` /
+    ``a:blip``)一致。"""
+    descr_attr = f' descr="{descr}"' if descr else ""
+    return (
+        "<w:p><w:r><w:drawing>"
+        f'<wp:inline><wp:extent cx="{cx}" cy="{cy}"/>'
+        f'<wp:docPr id="1" name="{name}"{descr_attr}/>'
+        '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        f'<pic:pic><pic:blipFill><a:blip r:embed="{rid}"/></pic:blipFill></pic:pic>'
+        "</a:graphicData></a:graphic></wp:inline>"
+        "</w:drawing></w:r></w:p>"
+    )
+
+
+def _build_docx(path: Path, body: str, *, rels: dict[str, str] | None = None) -> None:
+    """拿 ``zipfile`` 手搭一份最小合法 docx。``rels`` 是 ``{关系 id: 媒体文件名}``,
+    只有引用了图片关系的 fixture 才需要传。"""
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("[Content_Types].xml", _DOCX_CONTENT_TYPES)
+        zf.writestr("_rels/.rels", _DOCX_ROOT_RELS)
+        document_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f"<w:document {_DOCX_NS}><w:body>{body}"
+            '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>'
+            "</w:body></w:document>"
+        )
+        zf.writestr("word/document.xml", document_xml)
+        if rels:
+            entries = "".join(
+                f'<Relationship Id="{rid}" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                f'Target="media/{name}"/>'
+                for rid, name in rels.items()
+            )
+            zf.writestr(
+                "word/_rels/document.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f"{entries}</Relationships>",
+            )
+            for name in set(rels.values()):
+                zf.writestr(f"word/media/{name}", _png(4, 4).read())
+
+
+def test_decorative_logo_is_skipped(tmp_path: Path) -> None:
+    """页脚 logo 28.8x28.8pt 占页 0.17%,不进清单;同页的 288x192pt 图进。"""
+    body = (
+        _docx_text("A paragraph before the chart mentions the glucose trend chart below.")
+        + _docx_drawing("rId1", "Picture 1", 3657600, 2438400)
+        + _docx_text("A small logo follows below.")
+        + _docx_drawing("rId2", "Picture 2", 365760, 365760)
+    )
+    _build_docx(tmp_path / "d.docx", body, rels={"rId1": "image1.png", "rId2": "image2.png"})
 
     env = _run(tmp_path, "d.docx")
     assert len(env["figures"]) == 1
@@ -101,35 +187,66 @@ def test_decorative_logo_is_skipped(tmp_path: Path) -> None:
     assert min(env["figures"][0]["w_pt"], env["figures"][0]["h_pt"]) >= MIN_FIGURE_EDGE_PT
 
 
-def test_docx_anchor_is_the_sentence_before_the_figure(tmp_path: Path) -> None:
-    docx = pytest.importorskip("docx")
-    from docx.shared import Inches
+def test_thin_strip_is_skipped_by_the_edge_clause(tmp_path: Path) -> None:
+    """``test_decorative_logo_is_skipped`` 的 28.8x28.8pt logo 同时撞了 edge
+    (< 40pt)与 area(0.17% < 1%)两条阈值,单独改 ``MIN_FIGURE_EDGE_PT`` 不会让
+    它露出来(见 M1 变异自证)。这里造一个只会撞 edge、撞不到 area 阈值的窄条
+    (30x170pt,面积占页约 1.05% >= ``MIN_FIGURE_AREA_RATIO``),专门钉住
+    ``MIN_FIGURE_EDGE_PT`` 这一条独立起作用。"""
+    body = _docx_drawing("rId1", "Picture 1", 381000, 2159000)
+    _build_docx(tmp_path / "thin.docx", body, rels={"rId1": "image1.png"})
 
-    d = docx.Document()
-    d.add_heading("一、体检概览", 1)
-    d.add_paragraph("这是第一段正文，后面跟着一张血糖趋势图。")  # noqa: RUF001
-    d.add_picture(_png(600, 400), width=Inches(4))
-    d.save(tmp_path / "a.docx")
+    env = _run(tmp_path, "thin.docx")
+    assert env["figures"] == []
+    assert env["skipped_decorative"] == 1
+
+
+def test_docx_anchor_is_the_sentence_before_the_figure(tmp_path: Path) -> None:
+    body = _docx_text(
+        "Section three tail sentence about the glucose trend chart follows below."
+    ) + _docx_drawing("rId1", "Picture 1", 3657600, 2438400)
+    _build_docx(tmp_path / "a.docx", body, rels={"rId1": "image1.png"})
 
     env = _run(tmp_path, "a.docx")
-    assert "血糖趋势图" in env["figures"][0]["anchor"]
+    assert "glucose trend chart" in env["figures"][0]["anchor"]
 
 
 def test_plain_table_is_not_a_figure(tmp_path: Path) -> None:
-    """纯表格零误报 —— 表格不是 drawing,没有 graphicData。"""
-    docx = pytest.importorskip("docx")
-
-    d = docx.Document()
-    d.add_heading("表格页", 1)
-    t = d.add_table(rows=6, cols=4)
-    for r in range(6):
-        for c in range(4):
-            t.cell(r, c).text = f"{r}-{c}"
-    d.save(tmp_path / "t.docx")
+    """纯表格零误报 —— 表格是 ``w:tbl``,不是 ``w:drawing``,没有 graphicData。"""
+    body = (
+        _docx_text("Table page")
+        + "<w:tbl>"
+        + "<w:tr><w:tc><w:p><w:r><w:t>0-0</w:t></w:r></w:p></w:tc>"
+        + "<w:tc><w:p><w:r><w:t>0-1</w:t></w:r></w:p></w:tc></w:tr>"
+        + "<w:tr><w:tc><w:p><w:r><w:t>1-0</w:t></w:r></w:p></w:tc>"
+        + "<w:tc><w:p><w:r><w:t>1-1</w:t></w:r></w:p></w:tc></w:tr>"
+        + "</w:tbl>"
+    )
+    _build_docx(tmp_path / "t.docx", body)
 
     env = _run(tmp_path, "t.docx")
     assert env["state"] == "none"
     assert env["figures"] == []
+
+
+def test_docx_real_word_shaped_output_also_parses(tmp_path: Path) -> None:
+    """交叉验证,不是结构性不变式的唯一承载者 —— 那些都在上面的手搭测试里,
+    不依赖任何 docx 库,CI 永远会跑。``python-docx`` 不在 ``uv.lock`` 里,
+    本地装了才跑;这里只确认真实 python-docx 产出的 XML(cNvGraphicFramePr
+    等手搭版本没有的细节)一样能被解析,不重复钉阈值精确值。"""
+    docx = pytest.importorskip("docx")
+    from docx.shared import Inches
+
+    d = docx.Document()
+    d.add_paragraph("A paragraph mentions the glucose trend chart below.")
+    d.add_picture(_png(600, 400), width=Inches(4))
+    d.add_picture(_png(40, 40), width=Inches(0.4))
+    d.save(tmp_path / "real.docx")
+
+    env = _run(tmp_path, "real.docx")
+    assert env["state"] == "figures"
+    assert len(env["figures"]) == 1
+    assert env["figures"][0]["kind"] == "picture"
 
 
 def test_xlsx_never_asks_for_pixels(tmp_path: Path) -> None:
@@ -159,6 +276,124 @@ def test_corrupt_file_is_undetermined_not_none(tmp_path: Path) -> None:
     env = _run(tmp_path, "bad.pptx")
     assert env["state"] == "undetermined"
     assert env["state"] != "none"
+
+
+# ---------------------------------------------------------------------------
+# pdf —— 手拼最小合法 PDF 字节(带正确 xref 偏移量)。pdfplumber 在 uv.lock
+# 里;reportlab/pypdf 都不在,不引入新依赖。
+# ---------------------------------------------------------------------------
+
+
+def _build_pdf(page_texts: list[str | None]) -> bytes:
+    """``page_texts[i]`` 非空则该页有一段显示该文字的内容流,为 ``None`` 则
+    内容流为空(``pdfplumber`` 的 ``extract_text()`` 判定为空页)。"""
+    n_pages = len(page_texts)
+    catalog_num, pages_num = 1, 2
+    font_num = 3 + n_pages * 2
+    kids = " ".join(f"{3 + i * 2} 0 R" for i in range(n_pages))
+
+    objs: dict[int, str] = {
+        catalog_num: f"<< /Type /Catalog /Pages {pages_num} 0 R >>",
+        pages_num: f"<< /Type /Pages /Kids [{kids}] /Count {n_pages} >>",
+    }
+    for i, text in enumerate(page_texts):
+        page_obj, content_obj = 3 + i * 2, 4 + i * 2
+        objs[page_obj] = (
+            f"<< /Type /Page /Parent {pages_num} 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 {font_num} 0 R >> >> /Contents {content_obj} 0 R >>"
+        )
+        stream = f"BT /F1 12 Tf 72 700 Td ({text}) Tj ET" if text else ""
+        objs[content_obj] = f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream"
+    objs[font_num] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+
+    buf = bytearray(b"%PDF-1.4\n")
+    offsets: dict[int, int] = {}
+    for num in sorted(objs):
+        offsets[num] = len(buf)
+        buf += f"{num} 0 obj\n{objs[num]}\nendobj\n".encode("latin-1")
+    xref_offset = len(buf)
+    max_num = max(objs)
+    buf += f"xref\n0 {max_num + 1}\n".encode()
+    buf += b"0000000000 65535 f \n"
+    for num in range(1, max_num + 1):
+        buf += f"{offsets.get(num, 0):010d} 00000 n \n".encode()
+    buf += (
+        f"trailer\n<< /Size {max_num + 1} /Root {catalog_num} 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF"
+    ).encode()
+    return bytes(buf)
+
+
+def test_pdf_ratio_threshold_triggers_scanned_page(tmp_path: Path) -> None:
+    """空页占比 >= 20% 且绝对数 >= 2 才触发;连续空页压成一个区间,锚点取
+    区间前最近一个有字页的尾部。"""
+    pytest.importorskip("pdfplumber")
+    texts = [
+        "Page one has a reasonably long body paragraph of text content.",
+        "Page two continues with a fairly long paragraph of body text.",
+        None,
+        None,
+        None,
+        "Page six resumes with another long paragraph of body content.",
+        "Page seven body text paragraph continues normally here too.",
+        "Page eight final body text paragraph wraps up the document.",
+    ]
+    (tmp_path / "ratio.pdf").write_bytes(_build_pdf(texts))
+
+    env = _run(tmp_path, "ratio.pdf")
+    assert env["state"] == "figures"
+    assert len(env["figures"]) == 1
+    fig = env["figures"][0]
+    assert fig["kind"] == "scanned_page"
+    assert fig["unit"] == 3
+    assert fig["count"] == 3
+    assert "body text" in fig["anchor"]
+
+
+def test_pdf_absolute_threshold_triggers_regardless_of_ratio(tmp_path: Path) -> None:
+    """空页绝对数 >= 10 时即使占比 < 20% 也要触发 —— 三重阈值的第二支。"""
+    pytest.importorskip("pdfplumber")
+    n = 60
+    blanks = set(range(1, n, 6))
+    assert len(blanks) == 10
+    texts = [
+        None
+        if i in blanks
+        else f"Page {i} has a reasonably long paragraph of body text content here."
+        for i in range(1, n + 1)
+    ]
+    (tmp_path / "absolute.pdf").write_bytes(_build_pdf(texts))
+
+    env = _run(tmp_path, "absolute.pdf")
+    assert env["state"] == "figures"
+    assert len(env["figures"]) == 10  # 10 个孤立空页,互不相邻 -> 10 个独立区间
+    assert sum(f["count"] for f in env["figures"]) == 10
+
+
+def test_pdf_below_both_thresholds_stays_none(tmp_path: Path) -> None:
+    """占比 16.7% < 20% 且绝对数 2 < 10 —— 两条阈值都不到,必须保持 none。"""
+    pytest.importorskip("pdfplumber")
+    texts = [
+        None
+        if i in (3, 9)
+        else f"Page {i} has a reasonably long paragraph of body text content here."
+        for i in range(1, 13)
+    ]
+    (tmp_path / "below.pdf").write_bytes(_build_pdf(texts))
+
+    env = _run(tmp_path, "below.pdf")
+    assert env["state"] == "none"
+    assert env["figures"] == []
+
+
+def test_pdf_single_page_stays_none(tmp_path: Path) -> None:
+    """总页数 < 2 直接 none,不管这唯一一页是不是空的。"""
+    pytest.importorskip("pdfplumber")
+    (tmp_path / "single.pdf").write_bytes(_build_pdf([None]))
+
+    env = _run(tmp_path, "single.pdf")
+    assert env["state"] == "none"
+    assert env["figures"] == []
 
 
 # --- 清单文本渲染 -----------------------------------------------------------
