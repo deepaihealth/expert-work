@@ -348,6 +348,18 @@ from expert_work.persistence.webhook import SqlWebhookEndpointStore as SqlWebhoo
 from expert_work.persistence.webhook import WebhookDeliveryStore as WebhookDeliveryStore
 from expert_work.persistence.webhook import WebhookEndpointStore as WebhookEndpointStore
 from expert_work.persistence.workspace import (
+    RENDERED_FIGURE_DIR as RENDERED_FIGURE_DIR,
+)
+from expert_work.persistence.workspace import (
+    RENDERED_FIGURE_PAGE_STEM as RENDERED_FIGURE_PAGE_STEM,
+)
+from expert_work.persistence.workspace import (
+    RENDERED_FIGURE_SHA_HEX_LEN as RENDERED_FIGURE_SHA_HEX_LEN,
+)
+from expert_work.persistence.workspace import (
+    RENDERED_FIGURE_UNIT_PREFIX as RENDERED_FIGURE_UNIT_PREFIX,
+)
+from expert_work.persistence.workspace import (
     SANDBOX_AGENTS_ROOT as SANDBOX_AGENTS_ROOT,
 )
 from expert_work.persistence.workspace import (
@@ -405,6 +417,9 @@ from expert_work.persistence.workspace import (
     is_delete_protected_workspace_path as is_delete_protected_workspace_path,
 )
 from expert_work.persistence.workspace import (
+    is_rendered_figure_rel as is_rendered_figure_rel,
+)
+from expert_work.persistence.workspace import (
     is_reserved_workspace_path as is_reserved_workspace_path,
 )
 from expert_work.persistence.workspace import (
@@ -412,6 +427,10 @@ from expert_work.persistence.workspace import (
 )
 
 __all__ = [
+    "RENDERED_FIGURE_DIR",
+    "RENDERED_FIGURE_PAGE_STEM",
+    "RENDERED_FIGURE_SHA_HEX_LEN",
+    "RENDERED_FIGURE_UNIT_PREFIX",
     "RLS_GUC_NAME",
     "RLS_USER_GUC_NAME",
     "SANDBOX_AGENTS_ROOT",
@@ -577,6 +596,7 @@ __all__ = [
     "current_tenant_id_var",
     "current_user_id_var",
     "is_delete_protected_workspace_path",
+    "is_rendered_figure_rel",
     "is_reserved_workspace_path",
     "workspace_volume_name",
 ]

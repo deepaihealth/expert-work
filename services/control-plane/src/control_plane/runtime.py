@@ -1885,7 +1885,7 @@ def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = Non
     ``image_id`` never changes what it names). A workspace ref is not:
     ``parse_workspace_image_ref`` accepts any relative path under the user's
     workspace, not only the ``.tool_results/<run_id>/figures/<doc-sha>/
-    <content-sha>/_u<unit>/page-NN.jpg`` convention the rendering pipeline
+    <render-sha>/_u<unit>/page-NN.jpg`` convention the rendering pipeline
     actually writes, so a workspace ref *can* name an ordinary, overwritable
     file — caching that would silently serve stale bytes, process-wide, after
     the next overwrite. ``is_cacheable_image_ref`` is what keeps that class of

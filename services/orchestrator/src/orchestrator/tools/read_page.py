@@ -49,10 +49,23 @@ jpeg → glob 找产物。三个实测坑写进片段:
    机制。相应地,内容没变时重复调用仍然会重新渲染一遍 —— 这是故意的,"已经存在
    就跳过"会把 4 刚拔掉的竞态原样请回来。
 
+7. **这一刀给下游带来的新形状**(回修第 5 轮 M-5,给 Task 7 留话)—— 同一页的
+   **每个内容版本**现在各得一条独立 ref(以前是同一条),于是:
+
+   * :func:`orchestrator.state._merge_viewed_figures` 是**首次出现序 union**,
+     所以"编辑文档 → 重读第 3 页"会把**新旧两版**一起推进将来
+     ``_figure_block_tail`` 的滑窗,而**没有任何东西标注哪一版是当前的** ——
+     模型可能同时看到同一页的两个版本。这比旧行为好(旧行为是直接发旧字节),
+     但它是个新形状,不是自动就对。Task 7 做滑窗时要自己决定:是按
+     ``(doc-sha, unit)`` 只留最新一版,还是把"这是第几版"显式说给模型。
+   * 每个内容版本在 ``.tool_results/<run_id>/`` 下**永久留一个 ``<render-sha>/``
+     目录**,直到这条 run 被 purge(B-50 Task 12 的会话 purge + 留存 job 孤儿
+     扫描收它)。一条 run 里反复编辑同一份文档会线性堆目录。
+
 落点固定在 :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
 (``.tool_results/``)下,这样渲出来的 ref 才落进
 :func:`orchestrator.multimodal.is_cacheable_image_ref` 认的可缓存子树。完整形状
-是 ``.tool_results/<run_id>/figures/<doc-sha>/<content-sha>/_u<unit>/page-NN.jpg``
+是 ``.tool_results/<run_id>/figures/<doc-sha>/<render-sha>/_u<unit>/page-NN.jpg``
 —— 前四段由宿主拼(:meth:`ReadPageTool.call` 的 ``out_rel``),后三段由片段拼。
 
 **ref 的 ``rel`` 必须是用户根相对,不是沙箱视图相对**(回修 C1)。B-60 之后,
@@ -75,7 +88,13 @@ from pathlib import PurePosixPath
 from typing import Any, Final
 from uuid import UUID
 
-from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
+from expert_work.persistence import (
+    RENDERED_FIGURE_DIR,
+    RENDERED_FIGURE_PAGE_STEM,
+    RENDERED_FIGURE_SHA_HEX_LEN,
+    RENDERED_FIGURE_UNIT_PREFIX,
+    WORKSPACE_OVERFLOW_DIR,
+)
 from expert_work.protocol.multimodal import WORKSPACE_REF_PREFIX
 from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
@@ -168,6 +187,12 @@ _FAILED_UNIT_REASONS: Final[dict[str, str]] = {
     #: 失效逐字同形。这种形状下连它是第几页都读不出来,所以 ``unit`` 记成
     #: ``"?"``,但"有东西被丢了"这件事必须说出来。
     "malformed_item": "这一条产出记录格式不合法,已丢弃",
+    #: 回修第 5 轮 I-2 —— ``failed`` 里出现了不是 Mapping 的元素。与
+    #: ``malformed_item`` 同形,只是落在失败清单这一侧。
+    "malformed_failed_item": "这一条失败记录格式不合法",
+    #: 回修第 5 轮 I-2 —— ``failed`` 整个就不是一个列表(沙箱回了 dict / 字符串
+    #: 之类),逐页原因根本读不出来,但"有失败信息读不出来"这件事必须说。
+    "malformed_failed_list": "沙箱回的失败清单整体格式不合法,逐页原因读不出来",
 }
 
 #: New-M1 那条记账用的 unit 占位:产出记录本身就不是 Mapping 时,页号无从读起。
@@ -183,21 +208,31 @@ import shutil
 import subprocess
 
 
-def _content_sha(full):
-    # 产出路径必须跟着**文件内容**走, 不是只跟着路径走(回修第 4 轮 New-I1)。
+def _render_sha(full):
+    # 产出路径必须跟着**渲染输入**走, 不是只跟着路径走(回修第 4 轮 New-I1)。
     # 宿主侧的 out_rel 只按 (run_id, 路径) 算, 同一条路径换了内容拿到的是逐字
     # 相同的产出 rel —— 前三层的洞(pdftoppm 层、soffice 层、缓存层)共享的正
-    # 是这一个前提。内容哈希在片段里算, 不在宿主侧算: ReadPageTool 手里只有
+    # 是这一个前提。这个哈希在片段里算, 不在宿主侧算: ReadPageTool 手里只有
     # SandboxRuntime 这一条通道(没有 workspace store), 够不着这个文件。
+    #
+    # **dpi 也要进来**(回修第 5 轮 M-1): 变了会让产出字节变、而 rel 不变的量,
+    # 一个都不能留在路径外面。dpi 是 build_render_wrapper 的公开参数(带默认值),
+    # 今天生产路径写死 RENDER_DPI 所以不可达 —— 但"公开入口的前置条件没人执行
+    # 就等于没有"正是审计 B 刚关掉的那个形状, 靠 docstring 钉不住。同一份文件
+    # 按 100dpi 与 300dpi 渲出的字节不同, 拼进来之后 rel 也就不同了。
+    # 其余参数核过: ws/rel 已在 doc_sha 里, units 已在 _u<unit>/page-NN 里,
+    # 两个 timeout 只决定成功与否、不决定成功时的字节。
+    #
     # 流式读: 上传里见过 47.8MB 的 deck, 不能一次读进内存。
     digest = hashlib.sha256()
+    digest.update(("dpi=" + str(_P["dpi"]) + ";").encode())
     with open(full, "rb") as fh:
         while True:
             chunk = fh.read(1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
-    return digest.hexdigest()[:16]
+    return digest.hexdigest()[:_P["sha_hex_len"]]
 
 
 def _fresh_dir(path):
@@ -226,14 +261,14 @@ def _main():
     if shutil.which("soffice") is None or shutil.which("pdftoppm") is None:
         return {"ok": False, "error": "soffice_missing"}
     try:
-        content_sha = _content_sha(full)
+        render_sha = _render_sha(full)
     except OSError as exc:
         return {"ok": False, "error": "io_error", "detail": str(exc)}
-    # out_rel 是宿主给的**基**路径(按 run_id + 文档路径算), 内容哈希在它下面
-    # 再开一层 —— 内容一变, 这一层就变, 整条产出 rel 跟着变(回修第 4 轮
+    # out_rel 是宿主给的**基**路径(按 run_id + 文档路径算), 渲染输入的哈希在它
+    # 下面再开一层 —— 输入一变, 这一层就变, 整条产出 rel 跟着变(回修第 4 轮
     # New-I1)。宿主不需要预知这一层: 片段回的 rel 本来就要流回宿主、过
     # _validate_rendered_rel 那道闸。
-    out_dir = os.path.join(_P["ws"], _P["out_rel"], content_sha)
+    out_dir = os.path.join(_P["ws"], _P["out_rel"], render_sha)
     os.makedirs(out_dir, exist_ok=True)
     ext = os.path.splitext(full)[1].lower()
     if ext == ".pdf":
@@ -279,11 +314,11 @@ def _main():
         # 就算失败也会被 glob 到上一次的旧文件, 把渲染失败报成了成功(实测
         # 撞到)。清空之后, 私有目录里才真的只可能有这个 unit 这一次刚产出
         # 的那一个文件, glob 不需要也不许带 unit 后缀约束。
-        unit_dir = os.path.join(out_dir, "_u" + str(unit))
+        unit_dir = os.path.join(out_dir, _P["unit_prefix"] + str(unit))
         if not _fresh_dir(unit_dir):
             failed.append({"unit": unit, "why": "unit_dir_not_clean"})
             continue
-        prefix = os.path.join(unit_dir, "page")
+        prefix = os.path.join(unit_dir, _P["page_stem"])
         try:
             result = subprocess.run(
                 ["pdftoppm", "-jpeg", "-r", str(_P["dpi"]),
@@ -328,9 +363,10 @@ def build_render_wrapper(
 ) -> str:
     """沙箱片段:把 ``ws/rel`` 的 ``units`` 页渲成 jpeg。
 
-    ``out_rel`` 是**基**路径,不是最终产出目录 —— 片段会在它下面按文档内容的
-    哈希再开一层(见模块 docstring 第 6 条),每个 unit 再开一层自己的私有目录,
-    最终落在 ``ws/out_rel/<content-sha>/_u<unit>/page-NN.jpg``。
+    ``out_rel`` 是**基**路径,不是最终产出目录 —— 片段会在它下面按**渲染输入**
+    (文档字节 + ``dpi``)的哈希再开一层(见模块 docstring 第 6 条),每个 unit
+    再开一层自己的私有目录,最终落在
+    ``ws/out_rel/<render-sha>/_u<unit>/page-NN.jpg``。
 
     ``units`` 在这里**保序去重**(回修第 4 轮 审计 B)。片段的前置条件是
     "``units`` 不重复"——重复时第 2 圈会 ``rmtree`` 掉第 1 圈刚记进 ``rendered``
@@ -349,6 +385,14 @@ def build_render_wrapper(
             "units": list(dict.fromkeys(units)),
             "out_rel": out_rel,
             "dpi": dpi,
+            # 落点形状的这三段由片段拼, 但值从共享真源来(回修第 5 轮 I-1):
+            # expert_work.persistence 的 RENDERED_FIGURE_* 一组常量, 同时也是
+            # is_cacheable_image_ref 判"这是不是一张渲染页"用的那一组。片段是
+            # 一段不能 import 的字符串, 所以当参数喂进去, 而不是在里面再写一
+            # 份字面量。
+            "sha_hex_len": RENDERED_FIGURE_SHA_HEX_LEN,
+            "unit_prefix": RENDERED_FIGURE_UNIT_PREFIX,
+            "page_stem": RENDERED_FIGURE_PAGE_STEM,
             "convert_timeout_s": convert_timeout_s,
             "render_timeout_s": render_timeout_s,
         },
@@ -386,11 +430,16 @@ def _require_units(args: Mapping[str, Any]) -> list[int]:
             msg = "read_page 'units' must be a list of positive integers"
             raise ValueError(msg)
         units.append(value)
-    # 回修第 3 轮 Important-2 —— 保序去重。重复 unit 会对同一个 _u<unit> 目录
-    # 渲两遍:第一遍成功、把 rel 记进 rendered;第二遍对同一个目录 rmtree,把
-    # 第一遍的产物删了,这次万一失败,rendered 里躺的就是一条指向已被删除的
-    # 文件的死 ref(New-2 的 rmtree 修法引入的新回归,实测撞到)。去重顺带
-    # 不浪费 MAX_PAGES_PER_CALL 的页数预算。
+    # 保序去重(回修第 3 轮 Important-2 起)。**防死 ref 这件事已经不在这一层**
+    # (回修第 5 轮 M-4 —— 原注释把它写成这里去重的主要理由,与
+    # build_render_wrapper 的新 docstring 打架):重复 unit 造成的
+    # "rmtree 删掉上一圈刚记进 rendered 的产物 → 死 ref" 现在由公开入口
+    # build_render_wrapper 自己执行前置条件挡掉(回修第 4 轮 审计 B),那才是
+    # 无论谁来调都成立的那一道。
+    #
+    # 这里保留去重是为另外两件事,都只在工具这一层有意义:
+    #   1. 页数预算 —— [3, 3] 不该吃掉 MAX_PAGES_PER_CALL 里的两页;
+    #   2. 页号播报 —— "已渲染 …… 第 X、Y 页"那句话要报对,不能重复报同一页。
     return list(dict.fromkeys(units))
 
 
@@ -450,10 +499,11 @@ def _doc_sha(ws: str, rel: str) -> str:
 
     **这个值只认路径,不认内容** —— 它是产出目录的**基**路径的一段,不是文档
     身份的全部。同一条路径换了内容,这个值一个字都不变;把内容那一维加进产出
-    路径是片段里 ``_content_sha`` 的活(回修第 4 轮 New-I1,见模块 docstring
-    第 6 条),因为文件只在沙箱里够得着。
+    路径是片段里 ``_render_sha`` 的活(回修第 4 轮 New-I1,见模块 docstring
+    第 6 条)—— 那个哈希只能在沙箱里算,``ReadPageTool`` 手里没有 workspace
+    store,够不着这个文件。
     """
-    return hashlib.sha256(f"{ws}/{rel}".encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{ws}/{rel}".encode()).hexdigest()[:RENDERED_FIGURE_SHA_HEX_LEN]
 
 
 def _explain_error(kind: str, detail: object) -> str:
@@ -461,19 +511,44 @@ def _explain_error(kind: str, detail: object) -> str:
     return f"{explanation}(detail: {detail})" if detail else explanation
 
 
+def _normalize_failed(raw: object) -> list[Any]:
+    """把片段回来的 ``failed`` 归一成一个列表,**不静默吃掉形状不对的输入**。
+
+    回修第 5 轮 I-2 —— ``call()`` 原来是
+    ``list(raw) if isinstance(raw, list) else []``:沙箱回一个 dict(或别的什么)
+    当 ``failed`` 时,整块失败信息就这么没了,模型一个字都读不到。与 New-M1
+    (``rendered`` 侧)是同一条通路的另一半、同样的可达性。
+
+    ``None``(键缺席,正常情况)→ 空列表。其它非列表 → 一条"清单整体不合法"的
+    记录,让它走和逐页失败**同一条**播报路径,不另起一套文案。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return list(raw)
+    return [{"unit": _UNKNOWN_UNIT, "why": "malformed_failed_list"}]
+
+
 def _describe_failed_units(failed: object) -> str:
-    """把片段回来的 ``failed: [{"unit": n, "why": ...}]`` 渲成一句人话(回修 I4)。
+    """把 ``failed: [{"unit": n, "why": ...}]`` 渲成一句人话(回修 I4)。
 
     空输入 → 空串(不加多余的句子)。
+
+    回修第 5 轮 I-2 —— 不是 Mapping 的元素**也要说话**。这里原来是一句裸
+    ``continue``:沙箱回 ``["bogus", None, 7, {"unit": 3, ...}]`` 时模型只读到
+    第 3 页那一条,另外三条一个字不提。这是本任务第三次出现"修在证据指的那一行、
+    而不是这一类通路"——New-M1 修的是 ``rendered`` 侧的同一个裸 ``continue``,
+    这一侧当时没跟着改。
     """
     if not isinstance(failed, list) or not failed:
         return ""
     parts: list[str] = []
     for item in failed:
-        if not isinstance(item, Mapping):
-            continue
-        unit = item.get("unit")
-        why = str(item.get("why", "unknown"))
+        if isinstance(item, Mapping):
+            unit = item.get("unit")
+            why = str(item.get("why", "unknown"))
+        else:
+            unit, why = _UNKNOWN_UNIT, "malformed_failed_item"
         reason = _FAILED_UNIT_REASONS.get(why, why)
         parts.append(f"第 {unit} 页没取到({reason})")
     return "".join(f"{part}。" for part in parts)
@@ -555,7 +630,7 @@ class ReadPageTool:
             return ToolResult(content="无法渲染:这条 run 缺少租户/用户/run 绑定。")
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_page")
         doc_sha = _doc_sha(ws, rel)
-        out_rel = f"{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/figures/{doc_sha}"
+        out_rel = f"{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/{RENDERED_FIGURE_DIR}/{doc_sha}"
         env = await run_scoped_read(
             self.client,
             build=lambda w: build_render_wrapper(
@@ -569,7 +644,7 @@ class ReadPageTool:
         if not env.get("ok"):
             kind = str(env.get("error", "unknown"))
             msg = f"无法渲染 {raw}:{_explain_error(kind, env.get('detail'))}"
-            per_unit = _describe_failed_units(env.get("failed"))
+            per_unit = _describe_failed_units(_normalize_failed(env.get("failed")))
             if per_unit:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)
@@ -605,8 +680,7 @@ class ReadPageTool:
             refs.append(workspace_figure_ref(ctx.tenant_id, ctx.user_id, host_rel))
             if isinstance(unit, int) and not isinstance(unit, bool):
                 rendered_units.append(unit)
-        raw_failed = env.get("failed")
-        all_failed = (list(raw_failed) if isinstance(raw_failed, list) else []) + rejected
+        all_failed = _normalize_failed(env.get("failed")) + rejected
         if not refs:
             msg = f"无法渲染 {raw}:没有取到任何页。"
             per_unit = _describe_failed_units(all_failed)

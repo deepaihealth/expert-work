@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import json
@@ -150,14 +151,38 @@ def _install_office_stubs(
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
-def _run_render(tmp_path: Path, rel: str, *, units: list[int], out_rel: str) -> dict:
+def _run_render(
+    tmp_path: Path, rel: str, *, units: list[int], out_rel: str, dpi: int = RENDER_DPI
+) -> dict:
     """本地真跑渲染片段(与 test_document_figures._run 同一房规)。"""
-    code = build_render_wrapper(rel, units=units, ws=str(tmp_path), out_rel=out_rel, dpi=RENDER_DPI)
+    code = build_render_wrapper(rel, units=units, ws=str(tmp_path), out_rel=out_rel, dpi=dpi)
     ns: dict = {}
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         exec(compile(code, "<snippet>", "exec"), ns)  # noqa: S102
     return json.loads(buf.getvalue())
+
+
+def _snippet_params(code: str) -> dict:
+    """从片段源码里取回宿主喂进去的那份参数(第一行就是 ``_PARAMS = '<json>'``)。
+
+    回修第 5 轮 I-1 —— 凡是要用「宿主真正拼出来的 out_rel」的测试,都必须从这里
+    取,不许自己再拼一份:自己拼的那份就是第二份路径真源,而这一轮整件事就是在
+    治这个。
+    """
+    first_line = code.split("\n", 1)[0]
+    return json.loads(ast.literal_eval(first_line.split(" = ", 1)[1]))
+
+
+async def _real_out_rel(*, path: str = "d.pptx", ctx: ToolContext | None = None) -> str:
+    """真跑一次 ``ReadPageTool.call``,把它实际传给片段的 ``out_rel`` 取出来。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps({"ok": True, "rendered": []}), stderr="", exit_code=0, timed_out=False
+        )
+    )
+    await ReadPageTool(client=runtime).call({"path": path, "units": [3]}, ctx=ctx or _ctx())
+    return str(_snippet_params(runtime.execs[0][1])["out_rel"])
 
 
 def test_wrapper_uses_a_private_outdir_per_conversion(
@@ -243,6 +268,14 @@ def test_wrapper_does_not_confuse_units_across_calls_sharing_an_out_dir(
 #: soffice 桩:把**源文件的内容**原样带进产出的 pdf(默认那份带的是 basename)。
 #: 同一条路径换了内容时,产物内容随之变化,New-I1 那条回归才看得出"模型到底
 #: 读到了哪一版"。
+#: pdftoppm 桩:把收到的 ``-r <dpi>`` 写进产出内容 —— 同一份源文件不同 dpi 产出
+#: 不同字节,M-1 那条回归才看得出 rel 有没有跟着分开。
+_PDFTOPPM_STAMPS_ITS_DPI = (
+    'dpi = args[args.index("-r") + 1]\n'
+    'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
+    '    fh.write(f"JPEG-AT-DPI-{dpi}")\n'
+)
+
 _SOFFICE_COPIES_THE_SOURCE_CONTENT = (
     "with open(src) as fh:\n"
     "    source = fh.read()\n"
@@ -251,7 +284,8 @@ _SOFFICE_COPIES_THE_SOURCE_CONTENT = (
 )
 
 
-def test_a_document_overwritten_between_calls_gets_a_different_rel(
+@pytest.mark.anyio
+async def test_a_document_overwritten_between_calls_gets_a_different_rel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """回修第 4 轮 New-I1 —— 产出路径必须跟着**文件内容**走。
@@ -266,7 +300,10 @@ def test_a_document_overwritten_between_calls_gets_a_different_rel(
     """
     _install_office_stubs(tmp_path, monkeypatch, soffice_body=_SOFFICE_COPIES_THE_SOURCE_CONTENT)
     (tmp_path / "d.pptx").write_text("VERSION-1")
-    out_rel = ".tool_results/r1/figures/abc"
+    # 用宿主真正拼出来的 out_rel(回修第 5 轮 I-1)—— 原来这里写的是
+    # ".tool_results/r1/figures/abc",在 is_cacheable_image_ref 还认目录前缀时
+    # 看不出问题;判据收窄成认路径形状之后,这条假前缀立刻暴露成假的。
+    out_rel = await _real_out_rel()
 
     first = _run_render(tmp_path, "d.pptx", units=[3], out_rel=out_rel)
     assert first["ok"] is True
@@ -294,6 +331,94 @@ def test_a_document_overwritten_between_calls_gets_a_different_rel(
     assert is_cacheable_image_ref(first_ref) is True
     assert is_cacheable_image_ref(second_ref) is True
     assert first_ref != second_ref
+
+
+@pytest.mark.anyio
+async def test_a_real_read_page_ref_is_recognised_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 5 轮 I-1 —— 判据收窄成认**路径形状**之后,最容易犯的错是严过头:
+    把功能本身关掉了还不知道(渲染页从此一条都不进缓存,每轮退化成一次 NAS 读,
+    而且没有任何测试会红)。
+
+    所以这条测试**不手写样本路径** —— out_rel 取自宿主真跑一次
+    ``ReadPageTool.call`` 实际喂给片段的那个值,尾巴取自片段真跑一次产出的那个
+    rel,两头都是真源拼的,中间只是把它们接起来。
+    """
+    _install_office_stubs(tmp_path, monkeypatch)
+    (tmp_path / "d.pptx").write_text("source")
+
+    out_rel = await _real_out_rel()
+    env = _run_render(tmp_path, "d.pptx", units=[3], out_rel=out_rel)
+    assert env["ok"] is True
+    rel = env["rendered"][0]["rel"]
+
+    tenant_id, user_id = uuid4(), uuid4()
+    assert is_cacheable_image_ref(workspace_figure_ref(tenant_id, user_id, rel)) is True
+
+    # 绑了 agent 的 run:ref 里多一层 agents/<key>/,判据必须在剥掉作用域前缀
+    # **之后**才比形状(回修 C1 定的口径),否则渲染页全判成不可缓存。
+    scoped = scoped_path(store_scope("/workspace", agent_key="pf-probe-33086dc0"), rel)
+    assert is_cacheable_image_ref(workspace_figure_ref(tenant_id, user_id, scoped)) is True
+
+
+@pytest.mark.anyio
+async def test_a_file_the_model_wrote_under_tool_results_is_not_cacheable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 5 轮 I-1 —— 第三个写入者是**模型自己**。
+
+    ``.tool_results`` 不在任何写保护集合里,``write_file`` 对
+    ``.tool_results/evil.jpg`` 是放行的;模型再把那条 ref 交给 ``ask_image``,
+    租户/用户/agent_key 三项校验全对得上(文件就是它自己写的)。目录前缀通行证
+    等于把"可缓存"发给了一个随时会被覆盖的文件 —— 写 A、读到 A、覆盖成 B、
+    **仍然读到 A**,与 New-I1 逐字同病。
+
+    连"藏在真实渲染目录里、只有文件名不对"这种也要挡住:形状是整条路径的形状,
+    不是前缀。
+    """
+    _install_office_stubs(tmp_path, monkeypatch)
+    (tmp_path / "d.pptx").write_text("source")
+    out_rel = await _real_out_rel()
+    real_rel = _run_render(tmp_path, "d.pptx", units=[3], out_rel=out_rel)["rendered"][0]["rel"]
+
+    tenant_id, user_id = uuid4(), uuid4()
+    model_written = [
+        ".tool_results/evil.jpg",
+        f"{out_rel}/evil.jpg",
+        # 摆在真实 unit 目录里、只是文件名不合 pdftoppm 的产出约定
+        real_rel.rsplit("/", 1)[0] + "/evil.jpg",
+    ]
+    for rel in model_written:
+        ref = workspace_figure_ref(tenant_id, user_id, rel)
+        assert is_cacheable_image_ref(ref) is False, f"{rel!r} 不该被当成渲染页缓存"
+
+
+def test_dpi_is_part_of_the_render_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 5 轮 M-1 —— 变了会让产出字节变、而 rel 不变的量,一个都不能留在
+    路径外面。
+
+    ``dpi`` 是 ``build_render_wrapper`` 的公开参数(带默认值)。今天生产路径写死
+    ``RENDER_DPI`` 所以不可达,但"公开入口的前置条件没人执行就等于没有"正是审计 B
+    刚关掉的那个形状 —— 靠 docstring 钉不住,得让不变式结构上成立。
+    """
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_STAMPS_ITS_DPI)
+    (tmp_path / "d.pdf").write_text("same bytes both times")
+    out_rel = ".tool_results/r1/figures/dpi"
+
+    low = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel, dpi=100)
+    high = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel, dpi=300)
+
+    assert low["ok"] is True
+    assert high["ok"] is True
+    low_rel, high_rel = low["rendered"][0]["rel"], high["rendered"][0]["rel"]
+    assert (tmp_path / low_rel).read_text() == "JPEG-AT-DPI-100"
+    assert (tmp_path / high_rel).read_text() == "JPEG-AT-DPI-300"
+    assert low_rel != high_rel, f"同一份文件、不同 dpi,产出字节不同而 rel 一模一样({low_rel!r})"
+    # 低 dpi 那一版必须原地还在 —— 高 dpi 那次没有把它覆盖掉。
+    assert (tmp_path / low_rel).read_text() == "JPEG-AT-DPI-100"
 
 
 #: 第一次调用正常产出,第二次(及以后)调用退出码 1、不产任何文件——模拟一次
@@ -973,6 +1098,87 @@ async def test_the_fallback_wording_reports_a_count_not_a_page_number() -> None:
     assert len(result.state_updates["viewed_figures"]) == 2
     assert "第 2 页" not in result.content
     assert "2 页" in result.content
+
+
+@pytest.mark.anyio
+async def test_malformed_failed_items_are_not_silently_dropped() -> None:
+    """回修第 5 轮 I-2 —— ``failed`` 里不是 Mapping 的元素也要说话。
+
+    这是 New-M1(``rendered`` 侧的裸 ``continue``)**同一条通路的另一半**:沙箱回
+    ``["bogus", None, 7, {"unit": 3, ...}]`` 时,模型此前只读到第 3 页那一条,
+    另外三条一个字不提。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 1,
+                            "rel": ".tool_results/r1/figures/abc/page-01.jpg",
+                            "bytes": 100,
+                        }
+                    ],
+                    "failed": ["bogus", None, 7, {"unit": 3, "why": "not_rendered"}],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.pptx", "units": [1, 3]}, ctx=_ctx()
+    )
+    assert "第 3 页没取到" in result.content
+    assert result.content.count("失败记录格式不合法") == 3
+
+
+@pytest.mark.anyio
+async def test_a_failed_list_that_is_not_a_list_is_still_reported() -> None:
+    """回修第 5 轮 I-2 —— ``failed`` 整个不是列表(沙箱回了个 dict)时,原来
+    ``call()`` 一句 ``if isinstance(raw, list) else []`` 就把整块失败信息吃掉了,
+    模型读到的是一次干净的成功。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 1,
+                            "rel": ".tool_results/r1/figures/abc/page-01.jpg",
+                            "bytes": 100,
+                        }
+                    ],
+                    "failed": {"unit": 3, "why": "not_rendered"},
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.pptx", "units": [1, 3]}, ctx=_ctx()
+    )
+    assert "失败清单整体格式不合法" in result.content
+
+
+@pytest.mark.anyio
+async def test_malformed_failed_list_is_reported_on_the_error_path_too() -> None:
+    """回修第 5 轮 I-2 —— ``ok: False`` 那条路也要过同一道归一化,两个调用点不能
+    只修一个(本任务已经三次栽在"只修证据指的那一处"上)。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps({"ok": False, "error": "render_failed", "failed": "bogus"}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [1]}, ctx=_ctx())
+    assert "失败清单整体格式不合法" in result.content
 
 
 @pytest.mark.anyio

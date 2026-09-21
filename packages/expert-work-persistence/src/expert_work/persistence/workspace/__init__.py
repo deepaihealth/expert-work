@@ -30,6 +30,18 @@ from expert_work.persistence.workspace.dlq import (
     VolumeOpKind as VolumeOpKind,
 )
 from expert_work.persistence.workspace.layout import (
+    RENDERED_FIGURE_DIR as RENDERED_FIGURE_DIR,
+)
+from expert_work.persistence.workspace.layout import (
+    RENDERED_FIGURE_PAGE_STEM as RENDERED_FIGURE_PAGE_STEM,
+)
+from expert_work.persistence.workspace.layout import (
+    RENDERED_FIGURE_SHA_HEX_LEN as RENDERED_FIGURE_SHA_HEX_LEN,
+)
+from expert_work.persistence.workspace.layout import (
+    RENDERED_FIGURE_UNIT_PREFIX as RENDERED_FIGURE_UNIT_PREFIX,
+)
+from expert_work.persistence.workspace.layout import (
     SANDBOX_AGENTS_ROOT as SANDBOX_AGENTS_ROOT,
 )
 from expert_work.persistence.workspace.layout import (
@@ -63,6 +75,9 @@ from expert_work.persistence.workspace.layout import (
     is_delete_protected_workspace_path as is_delete_protected_workspace_path,
 )
 from expert_work.persistence.workspace.layout import (
+    is_rendered_figure_rel as is_rendered_figure_rel,
+)
+from expert_work.persistence.workspace.layout import (
     is_reserved_workspace_path as is_reserved_workspace_path,
 )
 from expert_work.persistence.workspace.memory import (
@@ -73,6 +88,10 @@ from expert_work.persistence.workspace.sql import (
 )
 
 __all__ = [
+    "RENDERED_FIGURE_DIR",
+    "RENDERED_FIGURE_PAGE_STEM",
+    "RENDERED_FIGURE_SHA_HEX_LEN",
+    "RENDERED_FIGURE_UNIT_PREFIX",
     "SANDBOX_AGENTS_ROOT",
     "SANDBOX_SKILLS_ROOT",
     "WORKSPACE_AGENTS_DIR",
@@ -93,6 +112,7 @@ __all__ = [
     "VolumeOpKind",
     "WorkspaceNotFoundError",
     "is_delete_protected_workspace_path",
+    "is_rendered_figure_rel",
     "is_reserved_workspace_path",
     "workspace_volume_name",
 ]

@@ -22,6 +22,8 @@ change in one place can never silently desync from the filter.
 
 from __future__ import annotations
 
+import re
+
 #: Activated skill packages, seeded at ``skills/<name>/…`` (skill-runtime §5.1).
 #: Sandbox migration wave 2 (spec § 四) moved the actual seed *destination*
 #: out from under this workspace prefix to :data:`SANDBOX_SKILLS_ROOT` — this
@@ -84,6 +86,66 @@ SANDBOX_AGENTS_ROOT = "/opt/agents"
 #: Same value as ``orchestrator.tools.overflow.OVERFLOW_DIR``; that module
 #: imports this one rather than keeping a second literal.
 WORKSPACE_OVERFLOW_DIR = ".tool_results"
+
+#: ``read_page`` 渲出来的页在工作区里的落点形状(B-64 回修第 5 轮 I-1)。完整形状:
+#:
+#:     ``.tool_results/<run_id>/figures/<doc-sha>/<render-sha>/_u<unit>/page-NN.jpg``
+#:
+#: 这几个常量放在这个模块,理由与本模块 docstring 开头说的完全一样:**写它的人和
+#: 读它的人必须不能各写一份**。写的是 ``orchestrator.tools.read_page``(宿主拼前四
+#: 段、沙箱片段拼后三段,片段那几段也是从这里当参数传进去的,不是第二份字面量);
+#: 读的是 ``orchestrator.multimodal.is_cacheable_image_ref`` —— 它要判「这条 ref 指
+#: 的是不是一张**内容派生**的渲染页」,因为只有那种落点缓存才不会发旧字节。
+#:
+#: 判据之所以必须认**形状**而不是认 ``.tool_results/`` 这个目录前缀:那个目录不是
+#: 写保护的,模型自己就能往里写(``write_file`` 对 ``.tool_results/evil.jpg`` 放行),
+#: 再把它交给 ``ask_image``——一个目录前缀通行证等于把「可缓存」发给了模型自己写的、
+#: 随时会被覆盖的文件。
+RENDERED_FIGURE_DIR = "figures"
+#: 两段哈希(``<doc-sha>`` 路径派生、``<render-sha>`` 渲染输入派生)各取 sha256
+#: 十六进制的前多少位。
+RENDERED_FIGURE_SHA_HEX_LEN = 16
+#: 每个 unit 自己的私有产出子目录前缀:``_u<unit>``。
+RENDERED_FIGURE_UNIT_PREFIX = "_u"
+#: 交给 pdftoppm 的文件名主干;pdftoppm 自己补上 ``-<页号>.jpg``,页号补零到**总页数**
+#: 的宽度,所以这里只能认「``-`` 加若干位数字」,不能认固定位宽。
+RENDERED_FIGURE_PAGE_STEM = "page"
+
+_UUID_PATTERN = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_SHA_PATTERN = f"[0-9a-f]{{{RENDERED_FIGURE_SHA_HEX_LEN}}}"
+_RENDERED_FIGURE_RE = re.compile(
+    "^"
+    + re.escape(WORKSPACE_OVERFLOW_DIR)
+    + "/"
+    + _UUID_PATTERN
+    + "/"
+    + re.escape(RENDERED_FIGURE_DIR)
+    + "/"
+    + _SHA_PATTERN
+    + "/"
+    + _SHA_PATTERN
+    + "/"
+    + re.escape(RENDERED_FIGURE_UNIT_PREFIX)
+    + "[1-9][0-9]*/"
+    + re.escape(RENDERED_FIGURE_PAGE_STEM)
+    + r"-[0-9]+\.jpg$"
+)
+
+
+def is_rendered_figure_rel(rel: str) -> bool:
+    """``rel`` 是不是一条 ``read_page`` 渲染页的落点(见上面那组常量)。
+
+    ``rel`` 是**用户根相对**路径,且调用方需要先把 ``agents/<key>/`` 这类作用域前缀
+    剥掉(``is_cacheable_image_ref`` 就是这么做的)。
+
+    严格是**故意**的,而且失败方向是安全那一侧:判错成 ``False`` 只是让一条本可以
+    缓存的 ref 每轮多读一次盘(慢),判错成 ``True`` 才是发旧字节(错)。所以宁可
+    严。代价是「严到把功能关掉了还不知道」——
+    ``test_a_real_read_page_ref_is_recognised_end_to_end`` 用宿主 + 片段真拼出来的
+    路径钉住了这一侧,不是靠手写一条样本路径。
+    """
+    return _RENDERED_FIGURE_RE.match(rel) is not None
+
 
 #: Workspace prefixes that hold machinery / inputs rather than agent output —
 #: hidden from the "agent products" browse view. Add a new reserved namespace

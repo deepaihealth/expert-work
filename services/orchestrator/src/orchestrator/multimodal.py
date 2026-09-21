@@ -27,7 +27,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
 from uuid import UUID
 
-from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
+from expert_work.persistence import is_rendered_figure_rel
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
     WORKSPACE_REF_PREFIX,
@@ -377,15 +377,15 @@ def is_cacheable_image_ref(ref: str) -> bool:
     is not uniformly like that: :func:`~expert_work.protocol.multimodal.parse_workspace_image_ref`
     only validates the *shape* of ``rel`` (relative, no ``..``, not a reserved
     tree) — it accepts any relative path, not only the
-    ``.tool_results/<run_id>/figures/<doc-sha>/<content-sha>/_u<unit>/page-NN.jpg``
-    convention the rendering pipeline actually writes (``WORKSPACE_OVERFLOW_DIR``,
-    the platform's general run-scoped/self-cleaning artifact prefix — spec §8.3).
-    Nothing stops a workspace ref from naming an ordinary, overwritable user
-    file instead (``chart.png`` at the workspace root); caching *that* would
-    mean a later overwrite silently keeps serving the old bytes, process-wide,
-    for the rest of this resolver's lifetime — no TTL, no invalidation path.
-    So only a workspace ref under :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
-    is cacheable; every other workspace ref resolves fresh on every call.
+    ``.tool_results/<run_id>/figures/<doc-sha>/<render-sha>/_u<unit>/page-NN.jpg``
+    convention the rendering pipeline actually writes. Nothing stops a workspace
+    ref from naming an ordinary, overwritable user file instead (``chart.png`` at
+    the workspace root); caching *that* would mean a later overwrite silently
+    keeps serving the old bytes, process-wide, for the rest of this resolver's
+    lifetime — no TTL, no invalidation path. So only a workspace ref matching
+    that rendered-page **shape**
+    (:func:`~expert_work.persistence.is_rendered_figure_rel`) is cacheable;
+    every other workspace ref resolves fresh on every call.
 
     B-64 回修 C1 —— 判据要落在**作用域前缀之后**。绑了 agent 的 run 里,
     ``parsed.rel`` 形如 ``agents/<agent_key>/.tool_results/...``——``rel`` 整串
@@ -417,23 +417,50 @@ def is_cacheable_image_ref(ref: str) -> bool:
     路径)`` 算,同一条路径换了内容会拿到逐字相同的 ``rel``,渲染又是每次原地
     重写,于是"文档被覆盖 → 再渲一次 → 模型读到的仍是缓存里旧文档那一页"是
     端到端跑得通的。现在 ``read_page`` 把**文档内容的哈希**也拼进了产出路径
-    (``<content-sha>`` 那一段,见 :mod:`orchestrator.tools.read_page` 模块
-    docstring 第 6 条),所以这里能给出的事实陈述是:``.tool_results/`` 下这条
-    ``rel`` 是从"源文档内容 + 页号"派生的,**同一条 rel 只会是同一份源文档同一
-    页的渲染结果**;源文档内容一变,``rel`` 跟着变,缓存条目自然失效而不是被
-    悄悄覆盖。这句"只会"的边界是 sha256 取前 16 位 hex(64 位)的抗碰撞性 ——
-    同一条路径下两份不同内容撞上同一段哈希才会破,没有第二种机制在兜底。
-    还要注意这**不等于**那个文件从此不会被重写 —— 内容没变时重复调用会
-    原地重渲一遍(soffice 每次产出的 pdf 未必逐字节相同),但重渲出来的仍是同
-    一份源文档的同一页,所以缓存服务的旧字节与磁盘上的新字节画的是同一个东西,
-    这才是可缓存成立的真正理由。
+    (``<render-sha>`` 那一段,见 :mod:`orchestrator.tools.read_page` 模块
+    docstring 第 6 条),所以这里能给出的事实陈述是:这条 ``rel`` 是从"渲染输入
+    (源文档字节 + dpi)+ 页号"派生的,**绝大多数情况下同一条 rel 就是同一份源
+    文档同一页的渲染结果**;源文档内容一变,``rel`` 跟着变,缓存条目自然失效而
+    不是被悄悄覆盖。还要注意这**不等于**那个文件从此不会被重写 —— 内容没变时
+    重复调用会原地重渲一遍(soffice 每次产出的 pdf 未必逐字节相同),但重渲出来
+    的仍是同一份源文档的同一页,所以缓存服务的旧字节与磁盘上的新字节画的是同一
+    个东西,这才是可缓存成立的真正理由。
+
+    B-64 回修第 5 轮 I-1 —— 判据从"整棵 ``.tool_results/`` 的**目录前缀**通行证"
+    收窄成"认 ``read_page`` 自己那段**路径形状**"。上一轮把前者记成"今天没有触发
+    面",那是**枚举不全**:除了 ``read_page`` 和溢出缓存,还有第三个写入者 ——
+    **模型自己**。``.tool_results`` 不在任何写保护集合里
+    (``WORKSPACE_RESERVED_PREFIXES`` 只管浏览面隐藏,``_WRITE_TOOLS`` 只挡
+    ``shared:``),所以 ``write_file`` 对 ``.tool_results/evil.jpg`` 是放行的;
+    模型再把那条 ref 交给 ``ask_image``,租户/用户/agent_key 三项校验全都对得上
+    (文件就是它自己写的),于是"写 A → 读到 A → 覆盖成 B → **仍然读到 A**"
+    端到端成立,与 New-I1 逐字同病。形状判据是单一真源,和 ``read_page`` 拼路径
+    用的是同一组常量(:data:`~expert_work.persistence.RENDERED_FIGURE_DIR` 那一组)。
+
+    **代价是预期的**:``ask_image`` 读模型自己写的图片,现在一律不进缓存、每次
+    重新读盘。这是**对的** —— 那种文件随时可被覆盖,缓存它就等于发旧字节。慢一点
+    是这条路正确的样子。
+
+    **上面那句为什么不是"只会"(回修第 5 轮 M-2 / M-3)—— 两个已知的破绽:**
+
+    * **TOCTOU**:哈希取在转换**之前**,``soffice``/``pdftoppm`` 在**之后**才去读
+      同一个文件。``/workspace`` 是 NAS 上的共享目录,同一 ``(tenant, user,
+      agent)`` 的另一条并发 run、或同一个沙箱里的 ``bash``/``exec_python``,
+      都能在这个窗口里把文件换掉 —— 那样算出的 ``<render-sha>`` 属于旧字节,渲
+      出来的页却是新字节。窗口 = 哈希读完到 soffice 打开文件之间。这条路上没有
+      任何锁(``read_page`` 不持 workspace 锁),所以这是个真窗口,不是理论值。
+    * **哈希碰撞**:``<render-sha>`` 是 sha256 取前 16 位 hex = 64 位。对**意外**
+      碰撞而言这远够用;但文件内容是**模型自己写的**,对抗场景下生日界是
+      ``~2^32`` 而不是 ``2^64`` —— 一个刻意构造的攻击者能在可行算力内造出撞同
+      一段哈希的两份内容。这不是今天的威胁模型(能写文件的模型已经在自己的工作
+      区里了),但"只会"这个词担不起它,所以这里说的是"绝大多数情况下"。
     """
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True
     parsed = parse_workspace_image_ref(ref)
     skip = 2 if parsed.agent_key is not None else 0
     tail = "/".join(PurePosixPath(parsed.rel).parts[skip:])
-    return tail == WORKSPACE_OVERFLOW_DIR or tail.startswith(f"{WORKSPACE_OVERFLOW_DIR}/")
+    return is_rendered_figure_rel(tail)
 
 
 @dataclass

@@ -10,6 +10,13 @@ from uuid import uuid4
 
 import pytest
 
+from expert_work.persistence import (
+    RENDERED_FIGURE_DIR,
+    RENDERED_FIGURE_PAGE_STEM,
+    RENDERED_FIGURE_SHA_HEX_LEN,
+    RENDERED_FIGURE_UNIT_PREFIX,
+    WORKSPACE_OVERFLOW_DIR,
+)
 from expert_work.protocol.multimodal import ImageRef, parse_image_ref, parse_workspace_image_ref
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
 from orchestrator.multimodal import (
@@ -312,17 +319,39 @@ async def test_nas_resolver_refuses_a_fifo_without_hanging(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
+def _rendered_rel() -> str:
+    """一条**真形状**的渲染页 rel —— 按 ``expert_work.persistence`` 的落点常量拼。
+
+    回修第 5 轮 I-1 —— 判据从"``.tool_results/`` 目录前缀"收窄成"认 read_page 自己
+    那段路径形状"之后,这个文件里原先那些随手写的 ``.tool_results/r1/page.jpg``
+    全都不再是合法样本了。这里按常量拼而不是手打字面量,常量一变样本跟着变;
+    真正端到端的那道钉(宿主 + 片段真跑出来的路径)在
+    ``test_read_page.py::test_a_real_read_page_ref_is_recognised_end_to_end``。
+    """
+    return "/".join(
+        [
+            WORKSPACE_OVERFLOW_DIR,
+            str(uuid4()),
+            RENDERED_FIGURE_DIR,
+            "0" * RENDERED_FIGURE_SHA_HEX_LEN,
+            "1" * RENDERED_FIGURE_SHA_HEX_LEN,
+            f"{RENDERED_FIGURE_UNIT_PREFIX}3",
+            f"{RENDERED_FIGURE_PAGE_STEM}-03.jpg",
+        ]
+    )
+
+
 def test_is_cacheable_image_ref_true_for_upload_refs() -> None:
     assert is_cacheable_image_ref(_image_ref().to_uri()) is True
 
 
-def test_is_cacheable_image_ref_true_under_write_once_prefix() -> None:
+def test_is_cacheable_image_ref_true_for_a_rendered_page_shape() -> None:
     t, u = uuid4(), uuid4()
-    ref = f"expert_work://workspace/{t}/{u}/.tool_results/r1/figures/abc/page-03.jpg"
+    ref = f"expert_work://workspace/{t}/{u}/{_rendered_rel()}"
     assert is_cacheable_image_ref(ref) is True
 
 
-def test_is_cacheable_image_ref_false_outside_write_once_prefix() -> None:
+def test_is_cacheable_image_ref_false_for_an_ordinary_workspace_file() -> None:
     """An ordinary, overwritable workspace file named through this scheme
     must never be cached — see the function's own docstring for why."""
     t, u = uuid4(), uuid4()
@@ -330,18 +359,51 @@ def test_is_cacheable_image_ref_false_outside_write_once_prefix() -> None:
     assert is_cacheable_image_ref(ref) is False
 
 
-def test_is_cacheable_image_ref_true_under_write_once_prefix_for_an_agent_scoped_ref() -> None:
+@pytest.mark.parametrize(
+    "model_written_rel",
+    [
+        # 模型自己 write_file 写进 .tool_results/ 的图 —— 这个目录不是写保护的
+        f"{WORKSPACE_OVERFLOW_DIR}/evil.jpg",
+        f"{WORKSPACE_OVERFLOW_DIR}/{{run}}/evil.jpg",
+        # 连"藏进真实渲染目录、只有文件名不对"也要挡住:形状是整条路径的形状
+        f"{WORKSPACE_OVERFLOW_DIR}/{{run}}/figures/{{sha}}/{{sha}}/_u3/evil.jpg",
+        # 少一层 <render-sha> 的旧形状(回修第 4 轮之前的落点)
+        f"{WORKSPACE_OVERFLOW_DIR}/{{run}}/figures/{{sha}}/_u3/page-03.jpg",
+        # 注:``.tool_results/`` 下的第二个写入者(溢出缓存)产出的是 ``.txt``,
+        # 它根本组不成一条 workspace 图片 ref —— ``parse_workspace_image_ref``
+        # 在更早一层就按扩展名拒了,轮不到这个判据。所以这里不列它。
+    ],
+)
+def test_is_cacheable_image_ref_false_for_a_file_the_model_wrote_under_tool_results(
+    model_written_rel: str,
+) -> None:
+    """B-64 回修第 5 轮 I-1 —— 判据不能是 ``.tool_results/`` 的**目录前缀通行证**。
+
+    该目录不在任何写保护集合里(``WORKSPACE_RESERVED_PREFIXES`` 只管浏览面隐藏,
+    ``_WRITE_TOOLS`` 只挡 ``shared:``),``write_file`` 对
+    ``.tool_results/evil.jpg`` 是放行的;模型再把那条 ref 交给 ``ask_image``,
+    租户/用户/agent_key 三项校验全都对得上 —— 文件就是它自己写的。目录前缀通行证
+    等于把"可缓存"发给一个随时会被覆盖的文件:写 A → 读到 A → 覆盖成 B →
+    **仍然读到 A**,与 New-I1 逐字同病。
+    """
+    t, u = uuid4(), uuid4()
+    rel = model_written_rel.format(run=uuid4(), sha="0" * RENDERED_FIGURE_SHA_HEX_LEN)
+    ref = f"expert_work://workspace/{t}/{u}/{rel}"
+    assert is_cacheable_image_ref(ref) is False
+
+
+def test_is_cacheable_image_ref_true_for_a_rendered_page_under_an_agent_scope() -> None:
     """B-64 回修 C1 —— agent-bound run 的 ref 形如
     ``agents/<key>/.tool_results/...``,判据必须落在 ``agents/<key>/`` 之后,
     不然每一条绑了 agent 的渲染页都会被判成不可缓存(见函数自己的 C1 段落)。
     """
     t, u = uuid4(), uuid4()
-    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/.tool_results/r1/page.jpg"
+    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/{_rendered_rel()}"
     assert is_cacheable_image_ref(ref) is True
 
 
-def test_is_cacheable_image_ref_false_outside_write_once_prefix_for_an_agent_scoped_ref() -> None:
-    """同上,但落点仍在 ``agents/<key>/`` 下面、却不在 ``.tool_results/`` 里
+def test_is_cacheable_image_ref_false_for_an_ordinary_file_under_an_agent_scope() -> None:
+    """同上,但落点仍在 ``agents/<key>/`` 下面、却不是一张渲染页
     ——普通可覆写文件,agent 作用域不改变这条规则。"""
     t, u = uuid4(), uuid4()
     ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/chart.png"
@@ -349,20 +411,22 @@ def test_is_cacheable_image_ref_false_outside_write_once_prefix_for_an_agent_sco
 
 
 @pytest.mark.parametrize(
-    "rel_tail",
+    "scope_spelling",
     [
-        "agents/./pf-probe-33086dc0/.tool_results/r1/page.jpg",
-        "agents//pf-probe-33086dc0/.tool_results/r1/page.jpg",
-        "agents/pf-probe-33086dc0/./.tool_results/r1/page.jpg",
+        "agents/./pf-probe-33086dc0",
+        "agents//pf-probe-33086dc0",
+        "agents/pf-probe-33086dc0/.",
     ],
 )
-def test_is_cacheable_image_ref_true_for_non_normalized_agent_scoped_rel(rel_tail: str) -> None:
+def test_is_cacheable_image_ref_true_for_non_normalized_agent_scoped_rel(
+    scope_spelling: str,
+) -> None:
     """B-64 回修第 2 轮 New-4 —— ``parsed.rel`` 不保证被归一化过(``agent_key``
     是拿 ``PurePosixPath(rel).parts`` 解出来的,但归一化结果从没写回 ``rel``
     字段本身)。按字节长度砍 ``agents/<key>/`` 前缀,在带 ``.``/双斜杠这类写法
-    下会砍错位置,把真正落在 ``.tool_results/`` 下的渲染页误判成不可缓存。"""
+    下会砍错位置,把真正落在渲染子树里的页误判成不可缓存。"""
     t, u = uuid4(), uuid4()
-    ref = f"expert_work://workspace/{t}/{u}/{rel_tail}"
+    ref = f"expert_work://workspace/{t}/{u}/{scope_spelling}/{_rendered_rel()}"
     assert is_cacheable_image_ref(ref) is True
 
 
@@ -372,10 +436,10 @@ def test_is_cacheable_image_ref_true_for_non_normalized_unscoped_rel() -> None:
     仍然直接拿未归一化的 ``parsed.rel`` 字符串去比,没有像绑 agent 那一支一样
     先用 ``PurePosixPath`` 重新分段。``./.tool_results/...`` 这个 rel 里的
     ``.`` 段在字符串层面挡在最前面,``str.startswith(".tool_results/")`` 判
-    False;而它真实落在 ``.tool_results/`` 下,归一化之后应当判 True —— 与
-    round-2 的字节长度 bug 是同一类"没把 ``rel`` 归一化就直接用"。"""
+    False;而它真实落在渲染子树里,归一化之后应当判 True —— 与 round-2 的字节
+    长度 bug 是同一类"没把 ``rel`` 归一化就直接用"。"""
     t, u = uuid4(), uuid4()
-    ref = f"expert_work://workspace/{t}/{u}/./.tool_results/r1/page.jpg"
+    ref = f"expert_work://workspace/{t}/{u}/./{_rendered_rel()}"
     assert is_cacheable_image_ref(ref) is True
 
 
