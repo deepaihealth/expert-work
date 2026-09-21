@@ -37,10 +37,22 @@ jpeg → glob 找产物。三个实测坑写进片段:
    4 里的两道闸也就失去了意义。清空 + 重建之后必须再确认
    ``not (islink or listdir)``,不干净就当一次真实失败播报,不能当没看见
    继续往下走。
+6. **产出路径必须跟着文件内容走**(回修第 4 轮 New-I1)—— 上面 4、5 两条堵的
+   是"同一个目录被重用"带来的各种走样,但它们共享同一个前提:宿主侧的
+   ``out_rel`` 只按 ``(run_id, 文档路径)`` 算(见 :func:`_doc_sha`),同一条
+   路径换了内容,拿到的是**逐字相同**的产出 rel。于是 ``.tool_results/`` 下
+   那条 ref 被 :class:`~orchestrator.multimodal.CachingImageResolver` 记住之
+   后,文档被覆盖再渲一次,模型看到的还是旧文档那一页 —— 缓存是进程级、没有
+   TTL、没有失效通道,这一层的走样比前两层更难发现。修法是把**文件内容的
+   哈希**(片段里算,流式读,因为文件只在沙箱里够得着)拼进产出路径:内容一
+   变,路径就变,缓存与磁盘同时自然失效。相应地,内容没变时重复调用仍然会重
+   新渲染一遍 —— 这是故意的,"已经存在就跳过"会把 4 刚拔掉的竞态原样请回来。
 
 落点固定在 :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
 (``.tool_results/``)下,这样渲出来的 ref 才落进
-:func:`orchestrator.multimodal.is_cacheable_image_ref` 认的可缓存子树。
+:func:`orchestrator.multimodal.is_cacheable_image_ref` 认的可缓存子树。完整形状
+是 ``.tool_results/<run_id>/figures/<doc-sha>/<content-sha>/_u<unit>/page-NN.jpg``
+—— 前三段由宿主拼(:meth:`ReadPageTool.call`),后三段由片段拼。
 
 **ref 的 ``rel`` 必须是用户根相对,不是沙箱视图相对**(回修 C1)。B-60 之后,
 绑了 agent 的 run 在沙箱里看到的 ``/workspace`` bind 的是
@@ -150,7 +162,15 @@ _FAILED_UNIT_REASONS: Final[dict[str, str]] = {
     #: 回修第 3 轮 Minor-3 —— 私有产出目录清空后仍不干净(符号链接被
     #: rmtree 悄悄跳过,或残留文件删不掉),不能当没看见继续往下走。
     "unit_dir_not_clean": "这一页的临时产出目录没能清空,为安全起见跳过了",
+    #: 回修第 4 轮 New-M1 —— ``rendered`` 里出现了不是 Mapping 的元素。原来
+    #: 直接 ``continue`` 丢弃,模型对这一条只字不提,与前面花力气堵的那条静默
+    #: 失效逐字同形。这种形状下连它是第几页都读不出来,所以 ``unit`` 记成
+    #: ``"?"``,但"有东西被丢了"这件事必须说出来。
+    "malformed_item": "这一条产出记录格式不合法,已丢弃",
 }
+
+#: New-M1 那条记账用的 unit 占位:产出记录本身就不是 Mapping 时,页号无从读起。
+_UNKNOWN_UNIT: Final = "?"
 
 
 # 沙箱内渲染片段。``os`` / ``json`` / ``_P`` / ``_resolve`` 来自共享的
@@ -160,6 +180,22 @@ _RENDER_MAIN = """
 import glob as _glob
 import shutil
 import subprocess
+
+
+def _content_sha(full):
+    # 产出路径必须跟着**文件内容**走, 不是只跟着路径走(回修第 4 轮 New-I1)。
+    # 宿主侧的 out_rel 只按 (run_id, 路径) 算, 同一条路径换了内容拿到的是逐字
+    # 相同的产出 rel —— 前三层的洞(pdftoppm 层、soffice 层、缓存层)共享的正
+    # 是这一个前提。内容哈希由片段来算, 因为文件只在沙箱里够得着。
+    # 流式读: 已知上传里有 47.8MB 的 deck, 不能一次读进内存。
+    digest = hashlib.sha256()
+    with open(full, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
 
 
 def _fresh_dir(path):
@@ -187,7 +223,15 @@ def _main():
         return {"ok": False, "error": "io_error", "detail": str(exc)}
     if shutil.which("soffice") is None or shutil.which("pdftoppm") is None:
         return {"ok": False, "error": "soffice_missing"}
-    out_dir = os.path.join(_P["ws"], _P["out_rel"])
+    try:
+        content_sha = _content_sha(full)
+    except OSError as exc:
+        return {"ok": False, "error": "io_error", "detail": str(exc)}
+    # out_rel 是宿主给的**基**路径(按 run_id + 文档路径算), 内容哈希在它下面
+    # 再开一层 —— 内容一变, 这一层就变, 整条产出 rel 跟着变(回修第 4 轮
+    # New-I1)。宿主不需要预知这一层: 片段回的 rel 本来就要流回宿主、过
+    # _validate_rendered_rel 那道闸。
+    out_dir = os.path.join(_P["ws"], _P["out_rel"], content_sha)
     os.makedirs(out_dir, exist_ok=True)
     ext = os.path.splitext(full)[1].lower()
     if ext == ".pdf":
@@ -280,12 +324,27 @@ def build_render_wrapper(
     convert_timeout_s: int = _CONVERT_TIMEOUT_S,
     render_timeout_s: int = _RENDER_TIMEOUT_S,
 ) -> str:
-    """沙箱片段:把 ``ws/rel`` 的 ``units`` 页渲成 jpeg,写进 ``ws/out_rel/``。"""
+    """沙箱片段:把 ``ws/rel`` 的 ``units`` 页渲成 jpeg。
+
+    ``out_rel`` 是**基**路径,不是最终产出目录 —— 片段会在它下面按文档内容的
+    哈希再开一层(见模块 docstring 第 6 条),每个 unit 再开一层自己的私有目录,
+    最终落在 ``ws/out_rel/<content-sha>/_u<unit>/page-NN.jpg``。
+
+    ``units`` 在这里**保序去重**(回修第 4 轮 审计 B)。片段的前置条件是
+    "``units`` 不重复"——重复时第 2 圈会 ``rmtree`` 掉第 1 圈刚记进 ``rendered``
+    的产物,回出一个 ``ok: true`` 却同时把同一个 unit 记进 ``rendered`` 和
+    ``failed``、且 ``rendered`` 里那条 rel 指向已被删除文件的自相矛盾信封。
+    生产路径上 :func:`_require_units` 已经去过重,但它是**调用方**的去重,不是
+    这个公开入口自己的;这个函数是模块级公开函数,测试与未来的第二个调用方都
+    直接够得着它,前置条件没人执行就等于没有。这不是第二份真源,是公开入口执行
+    它自己 docstring 里写死的前置条件 —— :func:`_require_units` 保留去重另有
+    理由(页数预算 + "第 X、Y 页"那句话要报对),两处职责不同。
+    """
     return _snippet(
         {
             "ws": ws,
             "rel": rel,
-            "units": list(units),
+            "units": list(dict.fromkeys(units)),
             "out_rel": out_rel,
             "dpi": dpi,
             "convert_timeout_s": convert_timeout_s,
@@ -386,6 +445,11 @@ def _doc_sha(ws: str, rel: str) -> str:
     落进对文档 B 已经在用的 out_dir。``read_page`` 现在把 ``shared:`` 挡在了
     ``resolve_scope`` 那一层(见 ``workspace_paths._WRITE_TOOLS``),这里是第二
     层防线:即便以后 ``ws`` 又出现别的取值,同名 rel 也不会撞进同一个目录。
+
+    **这个值只认路径,不认内容** —— 它是产出目录的**基**路径的一段,不是文档
+    身份的全部。同一条路径换了内容,这个值一个字都不变;把内容那一维加进产出
+    路径是片段里 ``_content_sha`` 的活(回修第 4 轮 New-I1,见模块 docstring
+    第 6 条),因为文件只在沙箱里够得着。
     """
     return hashlib.sha256(f"{ws}/{rel}".encode()).hexdigest()[:16]
 
@@ -520,6 +584,11 @@ class ReadPageTool:
         rejected: list[Mapping[str, Any]] = []
         for item in env.get("rendered") or ():
             if not isinstance(item, Mapping):
+                # 回修第 4 轮 New-M1 —— 不是 Mapping 的产出记录也要记账,不能
+                # 裸 continue 丢掉:请求 3 页、沙箱回 1 张图 + 两个 "bogus" 时,
+                # 模型读到的是"已渲染 …… 第 1 页",另外两页一个字不提,与
+                # New-3/Minor-2 堵的那条静默失效逐字同形。
+                rejected.append({"unit": _UNKNOWN_UNIT, "why": "malformed_item"})
                 continue
             unit = item.get("unit")
             safe_rel = _validate_rendered_rel(item.get("rel"))
@@ -543,10 +612,17 @@ class ReadPageTool:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)
 
-        pages = "、".join(str(u) for u in rendered_units) if rendered_units else str(len(refs))
-        content = (
-            f"已渲染 {raw} 第 {pages} 页,已放进你的上下文 —— 需要仔细看细节时用 ask_image 问它。"
-        )
+        # 回修第 4 轮 New-M2 —— 兜底值不能写成页码。原来是
+        # `str(len(refs))` 直接插进"第 {pages} 页"这句**页码**文案:沙箱回
+        # unit:"7" 与 unit:"8"(字符串形态)加两条合法 rel 时,模型被告知
+        # "已渲染 d.pptx 第 2 页",而上下文里躺的是第 7、8 页 —— 一个具体而
+        # 错误的页码比不报页码坏得多。读不出页号时就只报张数。
+        if rendered_units:
+            pages = "、".join(str(u) for u in rendered_units)
+            head = f"已渲染 {raw} 第 {pages} 页"
+        else:
+            head = f"已渲染 {raw} {len(refs)} 页"
+        content = f"{head},已放进你的上下文 —— 需要仔细看细节时用 ask_image 问它。"
         per_unit = _describe_failed_units(all_failed)
         if per_unit:
             content = f"{content} {per_unit}"

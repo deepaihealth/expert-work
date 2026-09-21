@@ -376,10 +376,10 @@ def is_cacheable_image_ref(ref: str) -> bool:
     name the same bytes — caching it has no "goes stale" case. A workspace ref
     is not uniformly like that: :func:`~expert_work.protocol.multimodal.parse_workspace_image_ref`
     only validates the *shape* of ``rel`` (relative, no ``..``, not a reserved
-    tree) — it accepts any relative path, not only the write-once
-    ``.tool_results/<run_id>/figures/<doc-sha>/page-NN.jpg`` convention the
-    rendering pipeline actually writes (``WORKSPACE_OVERFLOW_DIR``, the
-    platform's general run-scoped/self-cleaning artifact prefix — spec §8.3).
+    tree) — it accepts any relative path, not only the
+    ``.tool_results/<run_id>/figures/<doc-sha>/<content-sha>/_u<unit>/page-NN.jpg``
+    convention the rendering pipeline actually writes (``WORKSPACE_OVERFLOW_DIR``,
+    the platform's general run-scoped/self-cleaning artifact prefix — spec §8.3).
     Nothing stops a workspace ref from naming an ordinary, overwritable user
     file instead (``chart.png`` at the workspace root); caching *that* would
     mean a later overwrite silently keeps serving the old bytes, process-wide,
@@ -411,6 +411,20 @@ def is_cacheable_image_ref(ref: str) -> bool:
     "改用 PurePosixPath 重新分段"这句话覆盖。统一成一个表达式:未绑 agent
     时跳过的段数是 0,绑了 agent 时是 2(``agents/<agent_key>``),分段数量
     照样不受 ``.``/``//`` 这类写法影响。
+
+    B-64 回修第 4 轮 New-I1 —— 这段 docstring 原来把渲染落点称作 **write-once**
+    并以此论证它可缓存,而那个前提当时并不成立:产出目录只按 ``(run_id, 文档
+    路径)`` 算,同一条路径换了内容会拿到逐字相同的 ``rel``,渲染又是每次原地
+    重写,于是"文档被覆盖 → 再渲一次 → 模型读到的仍是缓存里旧文档那一页"是
+    端到端跑得通的。现在 ``read_page`` 把**文档内容的哈希**也拼进了产出路径
+    (``<content-sha>`` 那一段,见 :mod:`orchestrator.tools.read_page` 模块
+    docstring 第 6 条),所以这里能给出的事实陈述是:``.tool_results/`` 下这条
+    ``rel`` 是从"源文档内容 + 页号"派生的,**同一条 rel 只会是同一份源文档同一
+    页的渲染结果**;源文档内容一变,``rel`` 跟着变,缓存条目自然失效而不是被
+    悄悄覆盖。注意这**不等于**那个文件从此不会被重写 —— 内容没变时重复调用会
+    原地重渲一遍(soffice 每次产出的 pdf 未必逐字节相同),但重渲出来的仍是同
+    一份源文档的同一页,所以缓存服务的旧字节与磁盘上的新字节画的是同一个东西,
+    这才是可缓存成立的真正理由。
     """
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True

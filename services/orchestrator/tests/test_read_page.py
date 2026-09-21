@@ -6,11 +6,13 @@ import contextlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from orchestrator.multimodal import is_cacheable_image_ref
 from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS, SUPPORTED_EXTENSIONS
 from orchestrator.tools.read_page import (
     _CONVERT_TIMEOUT_S,
@@ -63,44 +65,85 @@ def test_internal_render_budget_fits_under_the_exec_timeout_cap() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _install_fake_office_binaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """伪造 soffice / pdftoppm。
+#: 两个桩都先跑这一段:把本次是第几次被调用记进 ``<bin>/<binary>_calls``,
+#: 供需要"第一次成功、第二次失败"这类剧本的 body 用 ``count`` 分支。
+def _stub_source(*, binary: str, preamble: str, body: str) -> str:
+    return (
+        (
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "\n"
+            "args = sys.argv[1:]\n"
+            "_counter = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
+            + repr(f"{binary}_calls")
+            + ")\n"
+            "count = 0\n"
+            "if os.path.exists(_counter):\n"
+            "    count = int(open(_counter).read().strip() or '0')\n"
+            "count += 1\n"
+            "with open(_counter, 'w') as fh:\n"
+            "    fh.write(str(count))\n"
+        )
+        + preamble
+        + body
+    )
 
-    soffice 桩把源文件的完整 basename(含扩展名)写进它产出的 pdf 内容里 ——
-    如果两次转换共用同一个 outdir,后一次会覆盖前一次的 pdf 文件,届时读到的
-    内容会变成"另一个源文件"的标记而不是自己的,借此可以检出静默覆盖
-    (spec §13.1 #5)。
 
-    pdftoppm 桩固定按 2 位宽度补零产出(第 3 页 -> page-03.jpg),模拟真实
-    pdftoppm 按总页数补零的行为;它把读到的 pdf 内容原样带进 jpg,让上面那条
-    覆盖检测能一路传到最终产物。
+#: soffice body 可用的变量:``args`` ``outdir`` ``src`` ``base`` ``name``
+#: ``out_pdf`` ``count``。
+_SOFFICE_PREAMBLE = (
+    'outdir = args[args.index("--outdir") + 1]\n'
+    "src = args[-1]\n"
+    "os.makedirs(outdir, exist_ok=True)\n"
+    "base = os.path.basename(src)\n"
+    "name = os.path.splitext(base)[0]\n"
+    'out_pdf = os.path.join(outdir, name + ".pdf")\n'
+)
+#: pdftoppm body 可用的变量:``args`` ``unit`` ``pdf_path`` ``prefix``
+#: ``pdf_content`` ``count``。
+_PDFTOPPM_PREAMBLE = (
+    'unit = int(args[args.index("-f") + 1])\n'
+    "pdf_path, prefix = args[-2], args[-1]\n"
+    "with open(pdf_path) as fh:\n"
+    "    pdf_content = fh.read()\n"
+)
+
+#: 默认 soffice:把源文件的完整 basename(含扩展名)写进产出的 pdf 内容里——
+#: 两次转换共用同一个 outdir 时后一次会覆盖前一次,读到的内容会变成"另一个源
+#: 文件"的标记,借此检出静默覆盖(spec §13.1 #5)。
+_SOFFICE_WRITES_A_PDF = 'with open(out_pdf, "w") as fh:\n    fh.write("PDF-FROM:" + base)\n'
+#: 默认 pdftoppm:固定按 2 位宽度补零产出(第 3 页 -> page-03.jpg),模拟真实
+#: pdftoppm 按总页数补零的行为;把读到的 pdf 内容原样带进 jpg,让上面那条覆盖
+#: 检测能一路传到最终产物。
+_PDFTOPPM_WRITES_A_JPEG = (
+    'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
+    '    fh.write(f"JPEG-PAGE-{unit}::{pdf_content}")\n'
+)
+
+
+def _install_office_stubs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    soffice_body: str = _SOFFICE_WRITES_A_PDF,
+    pdftoppm_body: str = _PDFTOPPM_WRITES_A_JPEG,
+) -> None:
+    """伪造 soffice / pdftoppm 到 PATH 最前面,只让剧本那一段随测试变。
+
+    回修第 4 轮 New-M6 —— 这里原先是五个 helper 各自内联一整份 soffice +
+    pdftoppm 桩源码(其中两份 pdftoppm 逐字相同),不影响正确性,但下次改桩
+    要改五处。收口成这一个入口之后,变的只有 ``*_body``,两段 preamble 与
+    调用计数只有一份。
     """
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    bin_dir.mkdir(exist_ok=True)
     soffice = bin_dir / "soffice"
     soffice.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "args = sys.argv[1:]\n"
-        'outdir = args[args.index("--outdir") + 1]\n'
-        "src = args[-1]\n"
-        "os.makedirs(outdir, exist_ok=True)\n"
-        "base = os.path.basename(src)\n"
-        "name = os.path.splitext(base)[0]\n"
-        'with open(os.path.join(outdir, name + ".pdf"), "w") as fh:\n'
-        '    fh.write("PDF-FROM:" + base)\n'
+        _stub_source(binary="soffice", preamble=_SOFFICE_PREAMBLE, body=soffice_body)
     )
     pdftoppm = bin_dir / "pdftoppm"
     pdftoppm.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "args = sys.argv[1:]\n"
-        'unit = int(args[args.index("-f") + 1])\n'
-        "pdf_path, prefix = args[-2], args[-1]\n"
-        "with open(pdf_path) as fh:\n"
-        "    pdf_content = fh.read()\n"
-        'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
-        '    fh.write(f"JPEG-PAGE-{unit}::{pdf_content}")\n'
+        _stub_source(binary="pdftoppm", preamble=_PDFTOPPM_PREAMBLE, body=pdftoppm_body)
     )
     for script in (soffice, pdftoppm):
         script.chmod(0o755)
@@ -124,7 +167,7 @@ def test_wrapper_uses_a_private_outdir_per_conversion(
     中间 pdf 必须落在各自的 out_dir 下 —— 真跑桩程序后数盘面上有几份 pdf:
     私有 outdir 时两份都幸存;共用一个 outdir 时后一份会覆盖前一份,只剩一份。
     """
-    _install_fake_office_binaries(tmp_path, monkeypatch)
+    _install_office_stubs(tmp_path, monkeypatch)
     (tmp_path / "uploads").mkdir()
     (tmp_path / "uploads" / "report.docx").write_text("docx source")
     (tmp_path / "uploads" / "report.pptx").write_text("pptx source")
@@ -150,7 +193,7 @@ def test_wrapper_globs_instead_of_building_the_page_filename(
     """spec §13.1 #6 回归钉:pdftoppm 按总页数补零,第 3 页出 page-03.jpg 而不是
     page-3.jpg —— 真跑桩程序(固定 2 位补零),拼文件名的实现会找不到文件。
     """
-    _install_fake_office_binaries(tmp_path, monkeypatch)
+    _install_office_stubs(tmp_path, monkeypatch)
     (tmp_path / "d.pdf").write_text("fake pdf bytes")  # 已是 pdf,跳过 soffice 转换
 
     env = _run_render(tmp_path, "d.pdf", units=[3], out_rel=".tool_results/r1/figures/s")
@@ -169,7 +212,7 @@ def test_wrapper_reports_not_found_for_a_missing_file(
     ``_resolve`` 用 realpath 确认路径没越权,但不确认文件真的存在;真正的
     存在性检查必须在尝试转换之前做,不然拿一个不存在的文件去跑 soffice 会
     得到含糊的 convert_failed,而不是直白的 not_found。"""
-    _install_fake_office_binaries(tmp_path, monkeypatch)
+    _install_office_stubs(tmp_path, monkeypatch)
     env = _run_render(tmp_path, "missing.pdf", units=[1], out_rel=".tool_results/r1/figures/s")
     assert env == {"ok": False, "error": "not_found"}
 
@@ -182,7 +225,7 @@ def test_wrapper_does_not_confuse_units_across_calls_sharing_an_out_dir(
     不带 unit 边界的兜底 glob(``prefix + "-*" + "1" + ".jpg"``)会把上一次
     留下的 ``page-21.jpg`` 也匹配上(它以 "1.jpg" 结尾),``sorted(...)[-1]``
     取到的是它不是 ``page-01.jpg``。"""
-    _install_fake_office_binaries(tmp_path, monkeypatch)
+    _install_office_stubs(tmp_path, monkeypatch)
     (tmp_path / "d.pdf").write_text("fake pdf bytes")
     out_rel = ".tool_results/r1/figures/shared"
 
@@ -197,40 +240,90 @@ def test_wrapper_does_not_confuse_units_across_calls_sharing_an_out_dir(
     )
 
 
-def _install_flaky_pdftoppm(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
+#: soffice 桩:把**源文件的内容**原样带进产出的 pdf(默认那份带的是 basename)。
+#: 同一条路径换了内容时,产物内容随之变化,New-I1 那条回归才看得出"模型到底
+#: 读到了哪一版"。
+_SOFFICE_COPIES_THE_SOURCE_CONTENT = (
+    "with open(src) as fh:\n"
+    "    source = fh.read()\n"
+    'with open(out_pdf, "w") as fh:\n'
+    '    fh.write("PDF-FROM:" + source)\n'
+)
+
+
+def test_a_document_overwritten_between_calls_gets_a_different_rel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """桩 pdftoppm:第一次调用正常产出,第二次(及以后)调用退出码 1、不产任何
-    文件——模拟一次真实的渲染失败(回修第 2 轮 New-2 回归钉)。soffice 桩只是
-    个空操作(``shutil.which`` 探测要求它存在,已是 pdf 的场景根本不会调用它)。
+    """回修第 4 轮 New-I1 —— 产出路径必须跟着**文件内容**走。
+
+    原来 ``out_rel`` 只按 ``(run_id, 文档路径)`` 算,同一条路径换了内容拿到的
+    是逐字相同的 rel。``is_cacheable_image_ref`` 又对 ``.tool_results/`` 下的
+    ref 判 ``True``,而 ``CachingImageResolver`` 是进程级、无 TTL、无失效通道
+    的:于是"第一次渲 VERSION-1 → 模型 write_file 覆盖成 VERSION-2 → 再渲一次
+    同一页"这条链上,工具说"已渲染 d.pptx 第 3 页",模型看到的却是旧文档的第
+    3 页。修法是把内容哈希拼进路径:内容一变 rel 就变,缓存与磁盘同时自然
+    失效。
     """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    soffice = bin_dir / "soffice"
-    soffice.write_text("#!/usr/bin/env python3\nimport sys\n\nsys.exit(0)\n")
-    soffice.chmod(0o755)
-    pdftoppm = bin_dir / "pdftoppm"
-    pdftoppm.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "args = sys.argv[1:]\n"
-        'unit = int(args[args.index("-f") + 1])\n'
-        "pdf_path, prefix = args[-2], args[-1]\n"
-        f"counter_path = {str(counter_path)!r}\n"
-        "count = 0\n"
-        "if os.path.exists(counter_path):\n"
-        "    count = int(open(counter_path).read().strip() or '0')\n"
-        "count += 1\n"
-        "open(counter_path, 'w').write(str(count))\n"
-        "if count >= 2:\n"
-        "    sys.exit(1)\n"
-        "with open(pdf_path) as fh:\n"
-        "    pdf_content = fh.read()\n"
-        'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
-        '    fh.write(f"JPEG-PAGE-{unit}::{pdf_content}")\n'
+    _install_office_stubs(tmp_path, monkeypatch, soffice_body=_SOFFICE_COPIES_THE_SOURCE_CONTENT)
+    (tmp_path / "d.pptx").write_text("VERSION-1")
+    out_rel = ".tool_results/r1/figures/abc"
+
+    first = _run_render(tmp_path, "d.pptx", units=[3], out_rel=out_rel)
+    assert first["ok"] is True
+    first_rel = first["rendered"][0]["rel"]
+    assert (tmp_path / first_rel).read_text() == "JPEG-PAGE-3::PDF-FROM:VERSION-1"
+
+    (tmp_path / "d.pptx").write_text("VERSION-2")
+    second = _run_render(tmp_path, "d.pptx", units=[3], out_rel=out_rel)
+    assert second["ok"] is True
+    second_rel = second["rendered"][0]["rel"]
+    assert (tmp_path / second_rel).read_text() == "JPEG-PAGE-3::PDF-FROM:VERSION-2"
+
+    assert second_rel != first_rel, (
+        f"文档内容换了,产出 rel 却一模一样({second_rel!r})—— 缓存会继续端出旧字节"
     )
-    pdftoppm.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    # 旧 rel 的字节原地还在、没有被新一版原地覆盖:缓存里那条老条目指的依然是
+    # 它当初渲的那一版,这正是"内容一变 rel 就变"让缓存自然失效的样子。
+    assert (tmp_path / first_rel).read_text() == "JPEG-PAGE-3::PDF-FROM:VERSION-1"
+
+    # 两条都仍然落在可缓存子树里 —— 修法靠的是"缓存键变了",不是把渲染页
+    # 整个踢出缓存(那会把每一轮都退化成一次 NAS 读)。
+    tenant_id, user_id = uuid4(), uuid4()
+    first_ref = workspace_figure_ref(tenant_id, user_id, first_rel)
+    second_ref = workspace_figure_ref(tenant_id, user_id, second_rel)
+    assert is_cacheable_image_ref(first_ref) is True
+    assert is_cacheable_image_ref(second_ref) is True
+    assert first_ref != second_ref
+
+
+#: 第一次调用正常产出,第二次(及以后)调用退出码 1、不产任何文件——模拟一次
+#: 真实的渲染失败(回修第 2 轮 New-2 回归钉)。
+_PDFTOPPM_FAILS_ON_ITS_SECOND_CALL = "if count >= 2:\n    sys.exit(1)\n" + _PDFTOPPM_WRITES_A_JPEG
+
+
+def test_render_wrapper_deduplicates_units_so_rendered_never_holds_a_dead_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 4 轮 审计 B —— ``build_render_wrapper`` 是模块级公开入口,它
+    docstring 里写死的前置条件("units 不重复")必须由它自己执行。
+
+    重复 unit 下片段会对同一个 ``_u<unit>`` 目录跑两遍:第 1 圈渲成功、rel 记
+    进 ``rendered``;第 2 圈先 ``rmtree`` 把第 1 圈的产物删了,这次再失败,回出
+    来的就是 ``ok: true`` + 同一个 unit 同时躺在 ``rendered`` 和 ``failed`` +
+    ``rendered`` 里那条 rel 指向已被删除的文件 —— 一个自相矛盾且自信的信封,
+    代价是"一条死 ref 被当成成功交给模型"。生产路径上 ``_require_units`` 会
+    先去重,但那是调用方的去重,这个公开入口自己没有执行过这条前置条件。
+    """
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_FAILS_ON_ITS_SECOND_CALL)
+    (tmp_path / "d.pdf").write_text("fake pdf bytes")
+
+    env = _run_render(tmp_path, "d.pdf", units=[3, 3], out_rel=".tool_results/r1/figures/dup")
+
+    assert env["ok"] is True
+    assert [item["unit"] for item in env["rendered"]] == [3]
+    assert env["failed"] == []
+    for item in env["rendered"]:
+        assert (tmp_path / item["rel"]).exists(), f"rendered 里是一条死 ref:{item['rel']!r}"
 
 
 def test_wrapper_does_not_reuse_a_stale_file_when_a_later_render_fails(
@@ -243,8 +336,7 @@ def test_wrapper_does_not_reuse_a_stale_file_when_a_later_render_fails(
     向的文档已经换了内容(同一个 run 里 d.pdf 被覆盖),报的就是旧文档的页,
     不是新文档的页。第二次必须落进 ``failed``,不是 ``rendered``。
     """
-    counter_path = tmp_path / "pdftoppm_calls"
-    _install_flaky_pdftoppm(tmp_path, monkeypatch, counter_path=counter_path)
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_FAILS_ON_ITS_SECOND_CALL)
     (tmp_path / "d.pdf").write_text("first version")
     out_rel = ".tool_results/r1/figures/abc"
 
@@ -258,43 +350,14 @@ def test_wrapper_does_not_reuse_a_stale_file_when_a_later_render_fails(
     assert second["failed"] == [{"unit": 3, "why": "pdftoppm_failed"}]
 
 
-def _install_pdftoppm_with_shifting_padding_width(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
-) -> None:
-    """桩 pdftoppm:第一次调用按 2 位补零产出(退出码 0);第二次调用(模拟同
-    一个 rel 指向的文档换成了总页数不同的另一份,pdftoppm 的补零宽度也跟着
-    变了)按 3 位补零产出、**同样退出码 0**——真实成功,不触发 New-2 的
-    ``returncode != 0`` 分支。这是用来单独证明"渲染前清空私有目录"这一半
-    修法独立起作用的场景:字典序下 ``page-003.jpg`` < ``page-03.jpg``,
-    ``sorted(...)[-1]`` 会挑中后者——如果不清空,第一次留下的旧
-    ``page-03.jpg`` 会在第二次真实成功之后仍然被误判成这次的产出。
-    """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    soffice = bin_dir / "soffice"
-    soffice.write_text("#!/usr/bin/env python3\nimport sys\n\nsys.exit(0)\n")
-    soffice.chmod(0o755)
-    pdftoppm = bin_dir / "pdftoppm"
-    pdftoppm.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "args = sys.argv[1:]\n"
-        'unit = int(args[args.index("-f") + 1])\n'
-        "pdf_path, prefix = args[-2], args[-1]\n"
-        f"counter_path = {str(counter_path)!r}\n"
-        "count = 0\n"
-        "if os.path.exists(counter_path):\n"
-        "    count = int(open(counter_path).read().strip() or '0')\n"
-        "count += 1\n"
-        "open(counter_path, 'w').write(str(count))\n"
-        "width = 2 if count < 2 else 3\n"
-        "with open(pdf_path) as fh:\n"
-        "    pdf_content = fh.read()\n"
-        'with open(f"{prefix}-{unit:0{width}d}.jpg", "w") as fh:\n'
-        '    fh.write(f"JPEG-PAGE-{unit}::round{count}::{pdf_content}")\n'
-    )
-    pdftoppm.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+#: 第一次调用按 2 位补零产出(退出码 0);第二次调用(模拟同一个 rel 指向的文档
+#: 换成了总页数不同的另一份,pdftoppm 的补零宽度也跟着变了)按 3 位补零产出、
+#: **同样退出码 0**——真实成功,不触发 New-2 的 ``returncode != 0`` 分支。
+_PDFTOPPM_SHIFTS_ITS_PADDING_WIDTH = (
+    "width = 2 if count < 2 else 3\n"
+    'with open(f"{prefix}-{unit:0{width}d}.jpg", "w") as fh:\n'
+    '    fh.write(f"JPEG-PAGE-{unit}::round{count}::{pdf_content}")\n'
+)
 
 
 def test_wrapper_does_not_pick_a_stale_file_when_a_later_render_succeeds_differently(
@@ -305,8 +368,7 @@ def test_wrapper_does_not_pick_a_stale_file_when_a_later_render_succeeds_differe
     (``page-003.jpg`` 而不是 ``page-03.jpg``)。不清空私有目录的话,第一次
     留下的 ``page-03.jpg`` 仍然待在目录里,字典序排序会让 ``sorted(...)[-1]``
     挑中它而不是这次真正新产出的 ``page-003.jpg``。"""
-    counter_path = tmp_path / "pdftoppm_calls"
-    _install_pdftoppm_with_shifting_padding_width(tmp_path, monkeypatch, counter_path=counter_path)
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_SHIFTS_ITS_PADDING_WIDTH)
     (tmp_path / "d.pdf").write_text("first version")
     out_rel = ".tool_results/r1/figures/abc"
 
@@ -323,52 +385,14 @@ def test_wrapper_does_not_pick_a_stale_file_when_a_later_render_succeeds_differe
     assert "round2" in content
 
 
-def _install_flaky_soffice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
-) -> None:
-    """桩 soffice:第一次调用真实成功产出 pdf;第二次(及以后)调用退出码 1、
-    不产任何文件——模拟一次真实的转换失败(回修第 3 轮 Important-1,T1 同形但
-    落在 conv 层)。pdftoppm 桩只是把读到的 pdf 内容原样带进 jpg,这条测试用
-    不到它(第二次调用在到达 pdftoppm 之前就该失败)。
-    """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    soffice = bin_dir / "soffice"
-    soffice.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "args = sys.argv[1:]\n"
-        'outdir = args[args.index("--outdir") + 1]\n'
-        "src = args[-1]\n"
-        "os.makedirs(outdir, exist_ok=True)\n"
-        "base = os.path.basename(src)\n"
-        "name = os.path.splitext(base)[0]\n"
-        f"counter_path = {str(counter_path)!r}\n"
-        "count = 0\n"
-        "if os.path.exists(counter_path):\n"
-        "    count = int(open(counter_path).read().strip() or '0')\n"
-        "count += 1\n"
-        "open(counter_path, 'w').write(str(count))\n"
-        "if count >= 2:\n"
-        "    sys.exit(1)\n"
-        'with open(os.path.join(outdir, name + ".pdf"), "w") as fh:\n'
-        '    fh.write("PDF-OF:VERSION-" + str(count))\n'
-    )
-    pdftoppm = bin_dir / "pdftoppm"
-    pdftoppm.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "args = sys.argv[1:]\n"
-        'unit = int(args[args.index("-f") + 1])\n'
-        "pdf_path, prefix = args[-2], args[-1]\n"
-        "with open(pdf_path) as fh:\n"
-        "    pdf_content = fh.read()\n"
-        'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
-        '    fh.write(f"JPEG::{pdf_content}")\n'
-    )
-    for script in (soffice, pdftoppm):
-        script.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+#: 第一次调用真实成功产出 pdf;第二次(及以后)调用退出码 1、不产任何文件——
+#: 模拟一次真实的转换失败(回修第 3 轮 Important-1,T1 同形但落在 conv 层)。
+_SOFFICE_FAILS_ON_ITS_SECOND_CALL = (
+    "if count >= 2:\n"
+    "    sys.exit(1)\n"
+    'with open(out_pdf, "w") as fh:\n'
+    '    fh.write("PDF-OF:VERSION-" + str(count))\n'
+)
 
 
 def test_wrapper_does_not_reuse_a_stale_pdf_when_a_later_conversion_fails(
@@ -381,8 +405,7 @@ def test_wrapper_does_not_reuse_a_stale_pdf_when_a_later_conversion_fails(
     如果这期间 rel 指向的文档已经换了内容,报的就是旧文档的页,不是新文档的
     页(与 New-2 逐字相同的病,只是换了一层)。第二次必须落进
     ``convert_failed``,不是 ``ok``。"""
-    counter_path = tmp_path / "soffice_calls"
-    _install_flaky_soffice(tmp_path, monkeypatch, counter_path=counter_path)
+    _install_office_stubs(tmp_path, monkeypatch, soffice_body=_SOFFICE_FAILS_ON_ITS_SECOND_CALL)
     (tmp_path / "d.pptx").write_text("source")
     out_rel = ".tool_results/r1/figures/conv1"
 
@@ -395,54 +418,16 @@ def test_wrapper_does_not_reuse_a_stale_pdf_when_a_later_conversion_fails(
     assert second["detail"] == "exit=1"
 
 
-def _install_soffice_that_reports_success_without_writing_on_its_second_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
-) -> None:
-    """桩 soffice:第一次调用真实成功产出 pdf;第二次调用退出码 **0**(报告
-    成功)却不产出任何文件——模拟一次"报了成功但没真的重写"的转换(真实
-    LibreOffice 也观测到过这种形态)。用来单独证明"转换前清空 conv 目录"这
-    一半修法独立起作用:returncode 检查管不到这种"报成功却没写"的场景,只有
-    清空目录才能让 ``glob`` 在这一轮找不到任何 pdf、从而正确报失败,而不是
-    把第一次的旧 pdf 当成这次的产出。
-    """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    soffice = bin_dir / "soffice"
-    soffice.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "args = sys.argv[1:]\n"
-        'outdir = args[args.index("--outdir") + 1]\n'
-        "src = args[-1]\n"
-        "os.makedirs(outdir, exist_ok=True)\n"
-        "base = os.path.basename(src)\n"
-        "name = os.path.splitext(base)[0]\n"
-        f"counter_path = {str(counter_path)!r}\n"
-        "count = 0\n"
-        "if os.path.exists(counter_path):\n"
-        "    count = int(open(counter_path).read().strip() or '0')\n"
-        "count += 1\n"
-        "open(counter_path, 'w').write(str(count))\n"
-        "if count >= 2:\n"
-        "    sys.exit(0)\n"  # 报成功, 但不写文件
-        'with open(os.path.join(outdir, name + ".pdf"), "w") as fh:\n'
-        '    fh.write("PDF-OF:VERSION-" + str(count))\n'
-    )
-    pdftoppm = bin_dir / "pdftoppm"
-    pdftoppm.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "args = sys.argv[1:]\n"
-        'unit = int(args[args.index("-f") + 1])\n'
-        "pdf_path, prefix = args[-2], args[-1]\n"
-        "with open(pdf_path) as fh:\n"
-        "    pdf_content = fh.read()\n"
-        'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
-        '    fh.write(f"JPEG::{pdf_content}")\n'
-    )
-    for script in (soffice, pdftoppm):
-        script.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+#: 第一次调用真实成功产出 pdf;第二次调用退出码 **0**(报告成功)却不产出任何
+#: 文件——模拟一次"报了成功但没真的重写"的转换(真实 LibreOffice 也观测到过这
+#: 种形态)。returncode 检查管不到这种场景,只有清空 conv 目录能让 glob 在这一
+#: 轮找不到任何 pdf、从而正确报失败。
+_SOFFICE_REPORTS_SUCCESS_WITHOUT_WRITING_ON_ITS_SECOND_CALL = (
+    "if count >= 2:\n"
+    "    sys.exit(0)\n"
+    'with open(out_pdf, "w") as fh:\n'
+    '    fh.write("PDF-OF:VERSION-" + str(count))\n'
+)
 
 
 def test_wrapper_does_not_pick_a_stale_pdf_when_a_later_conversion_reports_success_without_writing(
@@ -453,9 +438,10 @@ def test_wrapper_does_not_pick_a_stale_pdf_when_a_later_conversion_reports_succe
     conv 目录里的 pdf。returncode 检查这半段管不到"报了成功却没产出"的场景;
     只有清空 conv 目录这一半修法能防止 glob 把第一次的旧 pdf 当成这次的转换
     结果。"""
-    counter_path = tmp_path / "soffice_calls"
-    _install_soffice_that_reports_success_without_writing_on_its_second_call(
-        tmp_path, monkeypatch, counter_path=counter_path
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        soffice_body=_SOFFICE_REPORTS_SUCCESS_WITHOUT_WRITING_ON_ITS_SECOND_CALL,
     )
     (tmp_path / "d.pptx").write_text("source")
     out_rel = ".tool_results/r1/figures/conv2"
@@ -469,6 +455,92 @@ def test_wrapper_does_not_pick_a_stale_pdf_when_a_later_conversion_reports_succe
     assert "detail" not in second  # 走的是"没有 pdf"分支,不是 returncode 分支
 
 
+#: soffice 桩:**写了一份(截断的)pdf 之后再非零退出**。这是 returncode 检查
+#: 唯一不可替代的场景 —— "没产出文件"那一半兜底在这里完全失效(文件确实产出
+#: 了),只有接住返回码才拦得住(回修第 4 轮 New-M5)。
+_SOFFICE_WRITES_A_PARTIAL_PDF_THEN_FAILS = (
+    'with open(out_pdf, "w") as fh:\n    fh.write("TRUNCATED-PARTIAL-PDF")\nsys.exit(1)\n'
+)
+#: pdftoppm 桩:同形 —— 写了一份截断的 jpeg 之后再非零退出。
+_PDFTOPPM_WRITES_A_PARTIAL_JPEG_THEN_FAILS = (
+    'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
+    '    fh.write("TRUNCATED-PARTIAL-JPEG")\n'
+    "sys.exit(1)\n"
+)
+
+
+def test_wrapper_fails_when_soffice_exits_nonzero_after_writing_a_partial_pdf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 4 轮 New-M5 —— 现有两条 conv 测试里"exit 1"那条其实被 ``_fresh_dir``
+    那半段兜住了(去掉 returncode 检查后 ``ok is False`` 仍然成立,只是 detail
+    变了),returncode 那一半的区分全压在 ``detail == "exit=1"`` 这一行上。
+    returncode 检查**唯一**不可替代的场景是"非零退出却产出了(部分)pdf"——
+    产物在,清空也清了,靠"有没有产出文件"反推只会反推成功。"""
+    _install_office_stubs(
+        tmp_path, monkeypatch, soffice_body=_SOFFICE_WRITES_A_PARTIAL_PDF_THEN_FAILS
+    )
+    (tmp_path / "d.pptx").write_text("source")
+
+    env = _run_render(tmp_path, "d.pptx", units=[1], out_rel=".tool_results/r1/figures/partial")
+
+    assert env == {"ok": False, "error": "convert_failed", "detail": "exit=1"}
+
+
+def test_wrapper_fails_when_pdftoppm_exits_nonzero_after_writing_a_partial_jpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 4 轮 New-M5(pdftoppm 侧同形)—— 单页渲染非零退出却留下了一份
+    截断的 jpeg:``_fresh_dir`` 已经清过目录、glob 也确实能捞到这份新文件,
+    只有接住返回码才认得出这是一次失败。"""
+    _install_office_stubs(
+        tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_WRITES_A_PARTIAL_JPEG_THEN_FAILS
+    )
+    (tmp_path / "d.pdf").write_text("fake pdf bytes")
+
+    env = _run_render(tmp_path, "d.pdf", units=[3], out_rel=".tool_results/r1/figures/partial")
+
+    assert env == {
+        "ok": False,
+        "error": "render_failed",
+        "failed": [{"unit": 3, "why": "pdftoppm_failed"}],
+    }
+
+
+def test_wrapper_reports_a_clean_failure_when_the_conv_dir_is_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 4 轮 New-M4 —— ``_fresh_dir(conv)`` 的返回值检查此前零回归覆盖
+    (把 ``if not _fresh_dir(conv):`` 变异成裸 ``_fresh_dir(conv)`` 后整个
+    orchestrator 测试套全绿)。与 unit 目录那条同形:conv 目录如果是指向别处
+    的目录符号链接,``rmtree(ignore_errors=True)`` 拒绝 follow、异常被吞,
+    ``makedirs(exist_ok=True)`` 也不报错,于是"已经清空"这个前提悄悄落空,
+    glob 会把那边的旧 pdf 当成这一轮的转换结果。
+
+    conv 目录在**内容哈希**那一层下面(回修第 4 轮 New-I1),同样不手算哈希:
+    先真跑一次拿到产出 rel,照着它定位 conv 目录再换成符号链接。"""
+    _install_office_stubs(tmp_path, monkeypatch)
+    (tmp_path / "d.pptx").write_text("source")
+    out_rel = ".tool_results/r1/figures/convlink"
+
+    first = _run_render(tmp_path, "d.pptx", units=[1], out_rel=out_rel)
+    assert first["ok"] is True
+    conv_dir = (tmp_path / first["rendered"][0]["rel"]).parent.parent / "_pdf"
+    assert conv_dir.is_dir()
+
+    evil_dir = tmp_path / "evil_conv"
+    evil_dir.mkdir()
+    (evil_dir / "stale.pdf").write_text("STALE-PDF-FROM-ELSEWHERE")
+    shutil.rmtree(conv_dir)
+    conv_dir.symlink_to(evil_dir, target_is_directory=True)
+
+    env = _run_render(tmp_path, "d.pptx", units=[1], out_rel=out_rel)
+
+    assert env == {"ok": False, "error": "convert_failed", "detail": "conv_dir_not_clean"}
+    # 别处那个目录必须原封不动——不能被当成这次的产出改动或删除。
+    assert (evil_dir / "stale.pdf").read_text() == "STALE-PDF-FROM-ELSEWHERE"
+
+
 def test_wrapper_reports_a_clean_failure_when_the_unit_dir_is_a_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -478,16 +550,25 @@ def test_wrapper_reports_a_clean_failure_when_the_unit_dir_is_a_symlink(
     的已存在目录也不会报错——"已经清空"这个前提会悄悄落空,旧目录(这里模拟
     成上一轮/攻击者留下的另一个目录)里的旧文件原样还在,足以让 New-2 的坑
     以第三种方式重开。必须播报成一次真实失败,不能被 glob 到、当成这次的
-    产出。"""
-    _install_fake_office_binaries(tmp_path, monkeypatch)
+    产出。
+
+    unit 目录现在在**内容哈希**那一层下面(回修第 4 轮 New-I1),测试不去手算
+    那一段哈希(那就成了第二份真源)—— 先真跑一次拿到产出 rel,再照着它把
+    ``_u3`` 换成符号链接,然后跑第二次。"""
+    _install_office_stubs(tmp_path, monkeypatch)
     (tmp_path / "d.pdf").write_text("fake pdf bytes")
     out_rel = ".tool_results/r1/figures/symlinked"
-    out_dir = tmp_path / out_rel
-    out_dir.mkdir(parents=True)
+
+    first = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel)
+    assert first["ok"] is True
+    unit_dir = (tmp_path / first["rendered"][0]["rel"]).parent
+    assert unit_dir.name == "_u3"
+
     evil_dir = tmp_path / "evil"
     evil_dir.mkdir()
     (evil_dir / "page-99.jpg").write_text("STALE-FROM-ELSEWHERE")
-    (out_dir / "_u3").symlink_to(evil_dir, target_is_directory=True)
+    shutil.rmtree(unit_dir)
+    unit_dir.symlink_to(evil_dir, target_is_directory=True)
 
     env = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel)
 
@@ -513,9 +594,14 @@ def test_require_units_deduplicates_preserving_order() -> None:
     一个 ``_u3`` 目录渲两遍:第一遍成功、把 rel 记进 ``rendered``;第二遍对
     同一个目录 rmtree,把第一遍的产物删了,这次万一失败,``rendered`` 里躺的
     就是一条指向已被删除的文件的死 ref(回修第 2 轮 New-2 的 rmtree 修法引入
-    的新回归,实测撞到)。去重必须保序,且不能误伤非重复的 unit。"""
+    的新回归,实测撞到)。去重必须保序,且不能误伤非重复的 unit。
+
+    回修第 4 轮 New-M3 —— "保序"那半条原来咬不住:两组输入(``[3, 3]`` 与
+    ``[1, 2, 1, 3, 2]``)的首次出现顺序**恰好都是升序**,``sorted(set(units))``
+    这个破坏顺序的去重跑出来逐字相同,变异之后 42 条测试全绿。换一组首次出现
+    顺序非升序的输入才分得开这两种实现。"""
     assert _require_units({"units": [3, 3]}) == [3]
-    assert _require_units({"units": [1, 2, 1, 3, 2]}) == [1, 2, 3]
+    assert _require_units({"units": [5, 1, 5, 2, 1]}) == [5, 1, 2]
 
 
 def test_spec_is_not_read_only() -> None:
@@ -814,6 +900,79 @@ async def test_rejected_rel_with_a_non_int_unit_is_still_reported() -> None:
     assert len(result.state_updates["viewed_figures"]) == 1
     assert "第 2 页没取到" in result.content
     assert "不合法" in result.content
+
+
+@pytest.mark.anyio
+async def test_malformed_rendered_items_are_not_silently_dropped() -> None:
+    """回修第 4 轮 New-M1 —— ``rendered`` 里不是 Mapping 的元素原来被裸
+    ``continue`` 丢掉,一个字都不记账:请求 3 页、沙箱回 1 张图 + 两个
+    ``"bogus"`` 时,模型读到的是"已渲染 d.pptx 第 1 页,已放进你的上下文",
+    另外两页只字不提 —— 与 New-3/Minor-2 花力气堵的那条静默失效逐字同形。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 1,
+                            "rel": ".tool_results/r1/figures/abc/page-01.jpg",
+                            "bytes": 100,
+                        },
+                        "bogus",
+                        "bogus",
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.pptx", "units": [1, 2, 3]}, ctx=_ctx()
+    )
+    assert len(result.state_updates["viewed_figures"]) == 1
+    assert result.content.count("格式不合法") == 2
+
+
+@pytest.mark.anyio
+async def test_the_fallback_wording_reports_a_count_not_a_page_number() -> None:
+    """回修第 4 轮 New-M2 —— 读不出页号时的兜底值是**条数**,原来却被插进
+    "已渲染 … 第 {pages} 页"这句**页码**文案里。实测:沙箱回 ``unit:"7"`` 与
+    ``unit:"8"``(字符串形态)加两条合法 rel,模型被告知"已渲染 d.pptx 第 2
+    页",而上下文里躺的是第 7、8 页 —— 一个具体而错误的页码比不报页码坏得多。
+    """
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": "7",
+                            "rel": ".tool_results/r1/figures/abc/page-07.jpg",
+                            "bytes": 100,
+                        },
+                        {
+                            "unit": "8",
+                            "rel": ".tool_results/r1/figures/abc/page-08.jpg",
+                            "bytes": 100,
+                        },
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.pptx", "units": [7, 8]}, ctx=_ctx()
+    )
+    assert len(result.state_updates["viewed_figures"]) == 2
+    assert "第 2 页" not in result.content
+    assert "2 页" in result.content
 
 
 @pytest.mark.anyio

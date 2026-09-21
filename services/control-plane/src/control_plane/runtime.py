@@ -1884,12 +1884,21 @@ def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = Non
     ``should_cache``. An upload ref is uniformly content-addressed (an
     ``image_id`` never changes what it names). A workspace ref is not:
     ``parse_workspace_image_ref`` accepts any relative path under the user's
-    workspace, not only the write-once ``.tool_results/<run_id>/figures/
-    <doc-sha>/page-NN.jpg`` convention the rendering pipeline actually
-    writes, so a workspace ref *can* name an ordinary, overwritable file —
-    caching that would silently serve stale bytes, process-wide, after the
-    next overwrite. ``is_cacheable_image_ref`` is what keeps that class of
-    ref out of the cache while still caching the write-once ones.
+    workspace, not only the ``.tool_results/<run_id>/figures/<doc-sha>/
+    <content-sha>/_u<unit>/page-NN.jpg`` convention the rendering pipeline
+    actually writes, so a workspace ref *can* name an ordinary, overwritable
+    file — caching that would silently serve stale bytes, process-wide, after
+    the next overwrite. ``is_cacheable_image_ref`` is what keeps that class of
+    ref out of the cache.
+
+    B-64 回修第 4 轮 New-I1 —— 这里原来管渲染落点叫 **write-once**,而那个前提
+    当时不成立(产出路径只按文档**路径**算,同一条路径换了内容拿到逐字相同的
+    ref,渲染又是原地重写;这个缓存是进程级、无 TTL、无失效通道,于是"文档被
+    覆盖之后模型仍然读到旧文档那一页"端到端跑得通)。现在产出路径里带了**文档
+    内容的哈希**,能给出的事实陈述是:``.tool_results/`` 下这条 ref 从"源文档
+    内容 + 页号"派生,同一条 ref 只会是同一份源文档同一页的渲染结果,内容一变
+    ref 就变。详见 :func:`~orchestrator.multimodal.is_cacheable_image_ref` 的
+    docstring —— 那里写清了为什么"文件仍可能被重写"与"缓存安全"并不矛盾。
     """
     workspace = NasWorkspaceImageResolver(root=workspace_root) if workspace_root else None
     dispatcher = DispatchingImageResolver(
