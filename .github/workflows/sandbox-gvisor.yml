@@ -69,19 +69,47 @@ jobs:
     timeout-minutes: 45
     # Shared-runner Docker is bursty and gVisor setup is new here; do not gate
     # PRs on it yet (mirrors the main integration job). Tighten once stable.
-    continue-on-error: true
+    #
+    # **但 main 的 push 必须能报红(2026-09-21)。** 无条件的
+    # ``continue-on-error: true`` 会把作业失败洗成工作流 ``success``,于是
+    # 2026-09-19T06:22 上游删掉裸 runsc 二进制之后,main 上 09-19T12:47 与
+    # 14:33 两次 push **都是红的而看板全绿**,两天没人发现;最后是靠两个
+    # dependabot PR 的检查栏才暴露出来,而它一开始看着像"依赖升级搞坏的"。
+    #
+    # 所以按事件分档:PR 仍不挡(原判据不变,共享 runner 会抖),**main 的
+    # push 照实报**。收紧到无条件之前需要一段干净样本 —— 实测 60 次运行
+    # 40 成功 / 11 取消 / 9 失败,其中 11 次取消全是 09-12~09-13 那批 20/30
+    # 分钟超时(已靠 45 分钟修掉)、9 次失败里 8 次是上游这次删二进制,
+    # 而"超时修好之后、上游坏掉之前"的干净样本只有约 5 次,不足以支撑
+    # 无条件收紧。
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Install runsc (gVisor)
+        # 上游在 2026-08-17 与 2026-09-07 之间换了发布布局:裸的 ``runsc`` /
+        # ``runsc.sha512`` 被删掉,只剩 ``gvisor.tar.bz2`` / ``gvisor.tar.zstd``。
+        # 实测该 bucket 的三个版本:20260601 只有裸二进制、20260817 两者都有
+        # (过渡版)、20260907 与之后只有 tarball。``RUNSC_RELEASE`` 是
+        # ``release/latest`` 这个会动的指针,所以上游一滚过去这一步就 404
+        # (``wget`` 退出码 8 = 服务器返回错误响应)。
+        #
+        # 校验文件是标准 ``sha512sum`` 格式(``<摘要>  gvisor.tar.bz2``),
+        # 与被删掉的 ``runsc.sha512`` 同形,``-c`` 原样可用。
+        #
+        # **整包解开,不能只取 runsc**:新的 ``runsc`` 会在自己所在目录旁找
+        # ``gvisor-bin/``(``gvisor_sentry`` / ``checkpointgofer`` /
+        # ``runsc-fd-parking`` 等)。缺了它会退回上游已废弃的内嵌回落(官方说
+        # 2026-10 之后停止工作)或在运行时去下载 —— 两条都会让这个套件测的东西
+        # 与生产跑的东西不是同一个。
         run: |
           set -euo pipefail
           arch="$(uname -m)"
           url="https://storage.googleapis.com/gvisor/releases/${RUNSC_RELEASE}/${arch}"
-          wget --quiet "${url}/runsc" "${url}/runsc.sha512"
-          sha512sum -c runsc.sha512
-          chmod +x runsc
-          sudo mv runsc /usr/local/bin/runsc
+          wget --quiet "${url}/gvisor.tar.bz2" "${url}/gvisor.tar.bz2.sha512"
+          sha512sum -c gvisor.tar.bz2.sha512
+          sudo tar -xf gvisor.tar.bz2 -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/runsc
           runsc --version
 
       - name: Register runsc with the Docker daemon
