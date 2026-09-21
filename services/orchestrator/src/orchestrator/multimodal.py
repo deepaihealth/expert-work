@@ -27,7 +27,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
 from uuid import UUID
 
-from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
+from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_OVERFLOW_DIR
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
     WORKSPACE_REF_PREFIX,
@@ -386,13 +386,23 @@ def is_cacheable_image_ref(ref: str) -> bool:
     for the rest of this resolver's lifetime — no TTL, no invalidation path.
     So only a workspace ref under :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
     is cacheable; every other workspace ref resolves fresh on every call.
+
+    B-64 回修 C1 —— 判据要落在**作用域前缀之后**。绑了 agent 的 run 里,
+    ``parsed.rel`` 形如 ``agents/<agent_key>/.tool_results/...``——``rel`` 整串
+    直接比 ``WORKSPACE_OVERFLOW_DIR`` 前缀,``agents/`` 段会让每一条比较全部落
+    空,于是绑了 agent 的渲染页永远判成"不可缓存",每次都要重新走一次 NAS 读。
+    这不是正确性 bug(未缓存只是慢,不是错),但完全背离了这个函数存在的理由。
     """
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True
     parsed = parse_workspace_image_ref(ref)
-    return parsed.rel == WORKSPACE_OVERFLOW_DIR or parsed.rel.startswith(
-        f"{WORKSPACE_OVERFLOW_DIR}/"
-    )
+    tail = parsed.rel
+    if parsed.agent_key is not None:
+        agent_prefix = f"{WORKSPACE_AGENTS_DIR}/{parsed.agent_key}/"
+        # parse_workspace_image_ref guarantees ``rel`` starts with exactly
+        # this prefix whenever ``agent_key`` is set — see its docstring.
+        tail = tail[len(agent_prefix) :]
+    return tail == WORKSPACE_OVERFLOW_DIR or tail.startswith(f"{WORKSPACE_OVERFLOW_DIR}/")
 
 
 @dataclass

@@ -18,10 +18,10 @@ agent 在 NAS 上的目录(``agent_nas_root`` bind 成 ``EXEC_VIEW``);没绑时�
 
 from __future__ import annotations
 
-import re
 from pathlib import PurePosixPath
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
+from expert_work.protocol.agent_key import require_safe_key as require_safe_key
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 
 #: 显式跨到用户级 ``shared/`` 区的前缀(照 ADK 的 ``user:`` 约定)。
@@ -42,20 +42,19 @@ SHARED_PREFIX = f"{WORKSPACE_SHARED_DIR}:"
 AGENTS_DIR = WORKSPACE_AGENTS_DIR
 _SHARED_DIR = WORKSPACE_SHARED_DIR
 
-#: ``agent_key`` 来自 ``config["configurable"]`` —— 不可信。它会被拼进 ``ws``,
-#: 一个带 ``/`` 或 ``..`` 的值能把整个作用域撬到 ``/workspace`` 之外。形状与
-#: ``sanitize_agent_key()`` 的产物一致:``[A-Za-z0-9._-]+``(见
-#: ``expert_work.protocol.agent_key``)。
-_AGENT_KEY_OK = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+#: ``require_safe_key`` 的定义已下沉到 ``expert_work.protocol.agent_key``
+#: ——``parse_workspace_image_ref``(protocol 包,B-64 回修 C1)要校验 ref 字符
+#: 串里 ``agents/<key>/`` 段的 key,而 protocol 不能反向 import orchestrator。
+#: 这里公开**转出**同一个对象(见上面 import 的 ``as require_safe_key``),老
+#: 导入点 ``from orchestrator.tools.workspace_paths import require_safe_key``
+#: 照旧可用;绝不在这里复制第二份实现。
 
-#: 单纯的 ``.`` / ``..`` **能过上面那条正则**(两个点都在字符集里),而
-#: ``{root}/agents/..`` 就是 ``{root}`` —— agent 作用域直接塌回用户根,正是
-#: 这道闸写来要挡的东西。正则管「有没有分隔符」,管不了「这一段是不是相对
-#: 路径的特殊名字」,必须单列。
-_DOTTED = frozenset({".", ".."})
-
-#: 会改字节的工具 —— 它们不许写进 ``shared/``。
-_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
+#: 会改字节的工具 —— 它们不许写进 ``shared/``。B-64 回修 I6 —— ``read_page``
+#: 也落在里面:它虽然不叫 write_file/edit_file,但会往 out_dir 里
+#: makedirs+落 jpg/中间 pdf,``shared/`` 是只读 bind,makedirs 会 OSError,而且
+#: 不挡的话 ``shared:d.pptx`` 与 ``d.pptx`` 会被判成同一个 ``doc_sha``(两个不同
+#: 文档共用一个 out_dir)。
+_WRITE_TOOLS = frozenset({"write_file", "edit_file", "read_page"})
 
 
 class WriteToSharedError(ValueError):
@@ -64,17 +63,6 @@ class WriteToSharedError(ValueError):
     静默改写(把 ``shared:x.md`` 当成 ``x.md`` 写进 agent 目录)会让模型以为
     自己更新了共享文件,而实际上造了个同名副本。报错让它当场看见。
     """
-
-
-def require_safe_key(agent_key: str) -> None:
-    """``agent_key`` 当成路径段安全吗。坏 key 一律 ``ValueError``,别悄悄回落。
-
-    B-84 —— 从 ``_require_safe_key`` 改成公开名:宿主侧的作用域解析
-    (``workspace_scope.scope_parts``)要用同一道闸,而不是在旁边再写一条正则。
-    """
-    if not agent_key or agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
-        msg = f"agent_key is not a safe path segment: {agent_key!r}"
-        raise ValueError(msg)
 
 
 def agent_nas_root(agent_key: str) -> str:

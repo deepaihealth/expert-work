@@ -117,11 +117,22 @@ class AskImageTool:
         # UUID 就能读别人的工作区。所以工作区分支在算出 tenant_of_ref 的同时,
         # 立刻就地比对 user(不等共享的租户检查去做,那句检查两种 scheme 都要
         # 走,不该单独为 user 再加一次分支)。
+        #
+        # B-64 回修 C1 —— tenant/user 还不够:同租户同用户下,``rel`` 现在可能
+        # 带 ``agents/<agent_key>/`` 前缀(见 ``parse_workspace_image_ref`` 的
+        # C1 段落)。不比 agent_key 就是同租户同用户下**跨 agent** 读 ——一个
+        # agent 能拿另一个 agent 渲染出来的页当自己的看。``ctx.agent_key`` 的
+        # 空串 ↔ ``None`` 是两套代码分别表达"没绑 agent"的写法(见
+        # ``ToolContext.agent_key`` 与 ``WorkspaceImageRef.agent_key`` 各自的
+        # docstring),这里统一折成同一个值再比较。
         if ref_str.startswith(WORKSPACE_REF_PREFIX):
             workspace_ref = parse_workspace_image_ref(ref_str)
             tenant_of_ref = workspace_ref.tenant_id
             if workspace_ref.user_id != ctx.user_id:
                 msg = "ask_image image_ref user does not match the run user"
+                raise ToolBlockedError(msg)
+            if workspace_ref.agent_key != (ctx.agent_key or None):
+                msg = "ask_image image_ref agent scope does not match the run agent"
                 raise ToolBlockedError(msg)
         else:
             tenant_of_ref = parse_image_ref(ref_str).tenant_id  # raises ValueError on malformed

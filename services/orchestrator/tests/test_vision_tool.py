@@ -39,8 +39,10 @@ def _resolver() -> InMemoryImageResolver:
     return InMemoryImageResolver(images={"any": ResolvedImage(media_type="image/png", data=b"PNG")})
 
 
-def _ctx(tenant_id: UUID | None = _TENANT, *, user_id: UUID | None = None) -> ToolContext:
-    return ToolContext(tenant_id=tenant_id, user_id=user_id)
+def _ctx(
+    tenant_id: UUID | None = _TENANT, *, user_id: UUID | None = None, agent_key: str = ""
+) -> ToolContext:
+    return ToolContext(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
 
 
 @pytest.mark.asyncio
@@ -202,4 +204,59 @@ async def test_ask_image_rejects_a_same_tenant_different_user_workspace_ref() ->
     with pytest.raises(ToolBlockedError, match="does not match the run user"):
         await tool.call(
             {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=mine)
+        )
+
+
+@pytest.mark.anyio
+async def test_ask_image_accepts_a_ref_matching_the_run_own_agent_scope() -> None:
+    """B-64 回修 C1 —— 绑了 agent 的 run 读自己 agent 渲染出来的页(``agents/<own
+    key>/...``)必须放行,不能因为多了这层前缀就误判成跨 agent。"""
+    tenant, user = uuid4(), uuid4()
+    vl = _FakeVLCaller(response=AIMessage(content="ok"))
+    tool = AskImageTool(vl_caller=vl, image_resolver=_resolver())
+    ref = (
+        f"expert_work://workspace/{tenant}/{user}/agents/pf-probe-33086dc0"
+        "/.tool_results/r1/figures/abc/page-03.jpg"
+    )
+
+    result = await tool.call(
+        {"image_ref": ref, "question": "?"},
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key="pf-probe-33086dc0"),
+    )
+
+    assert result.content == "ok"
+
+
+@pytest.mark.anyio
+async def test_ask_image_rejects_a_cross_agent_workspace_ref() -> None:
+    """Critical finding (B-64 回修 C1)——同租户同用户下,绑了 agent 的 run 不许
+    读**另一个** agent 渲染出来的页(``agents/other-key/...``),否则一个 agent
+    能拿别的 agent 渲染出来的页当自己的看。"""
+    tenant, user = uuid4(), uuid4()
+    tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
+    ref = (
+        f"expert_work://workspace/{tenant}/{user}/agents/other-agent-11111111"
+        "/.tool_results/r1/figures/abc/page-03.jpg"
+    )
+    with pytest.raises(ToolBlockedError, match="does not match the run agent"):
+        await tool.call(
+            {"image_ref": ref, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key="my-own-agent-22222222"),
+        )
+
+
+@pytest.mark.anyio
+async def test_ask_image_rejects_an_agent_scoped_ref_from_an_unbound_run() -> None:
+    """反方向:没绑 agent 的 run(``ctx.agent_key == ""``)不许读绑了 agent 的
+    ref —— 空串必须折成 ``None`` 才能与 ``workspace_ref.agent_key`` 比对,
+    不能被当成"随便哪个 agent 都行"的通配符。"""
+    tenant, user = uuid4(), uuid4()
+    tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
+    ref = (
+        f"expert_work://workspace/{tenant}/{user}/agents/some-agent-33086dc0"
+        "/.tool_results/r1/figures/abc/page-03.jpg"
+    )
+    with pytest.raises(ToolBlockedError, match="does not match the run agent"):
+        await tool.call(
+            {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=user)
         )

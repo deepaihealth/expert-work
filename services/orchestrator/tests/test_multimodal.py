@@ -330,6 +330,24 @@ def test_is_cacheable_image_ref_false_outside_write_once_prefix() -> None:
     assert is_cacheable_image_ref(ref) is False
 
 
+def test_is_cacheable_image_ref_true_under_write_once_prefix_for_an_agent_scoped_ref() -> None:
+    """B-64 回修 C1 —— agent-bound run 的 ref 形如
+    ``agents/<key>/.tool_results/...``,判据必须落在 ``agents/<key>/`` 之后,
+    不然每一条绑了 agent 的渲染页都会被判成不可缓存(见函数自己的 C1 段落)。
+    """
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/.tool_results/r1/page.jpg"
+    assert is_cacheable_image_ref(ref) is True
+
+
+def test_is_cacheable_image_ref_false_outside_write_once_prefix_for_an_agent_scoped_ref() -> None:
+    """同上,但落点仍在 ``agents/<key>/`` 下面、却不在 ``.tool_results/`` 里
+    ——普通可覆写文件,agent 作用域不改变这条规则。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/chart.png"
+    assert is_cacheable_image_ref(ref) is False
+
+
 class _CountingResolver:
     """Inner resolver that counts fetches — to prove the cache short-circuits."""
 
@@ -457,12 +475,43 @@ def test_workspace_ref_rejects_parent_traversal() -> None:
         )
 
 
-def test_workspace_ref_rejects_another_agents_subtree() -> None:
-    # Valid UUIDs + valid extension + no ``..`` — the reserved-tree check is
-    # the only thing that can reject this ref.
+def test_workspace_ref_accepts_an_agent_scoped_path() -> None:
+    """B-64 回修 C1 —— ``agents/<key>/...`` 现在是合法形状(绑了 agent 的 run
+    在用户根上的真实落点)。「这个 key 是不是调用方自己的」不在解析这层判 ——
+    见 ``test_multimodal.py`` (orchestrator 侧) 里 ``vision.AskImageTool`` 的
+    跨 agent 拒绝测试。"""
     t, u = uuid4(), uuid4()
-    with pytest.raises(ValueError, match="reserved agents/ tree"):
-        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/agents/other/x.jpg")
+    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/.tool_results/r1/page.jpg"
+    parsed = parse_workspace_image_ref(ref)
+    assert parsed.agent_key == "pf-probe-33086dc0"
+    assert parsed.rel == "agents/pf-probe-33086dc0/.tool_results/r1/page.jpg"
+
+
+def test_workspace_ref_rejects_bare_agents_segment() -> None:
+    # "agents" alone (nothing after it) can't name any real subtree.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="must be followed by an agent key"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/agents")
+
+
+def test_workspace_ref_rejects_an_unsafe_agent_key() -> None:
+    # "@" is outside require_safe_key's [A-Za-z0-9._-]+ charset.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="unsafe agent key"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/agents/weird@key/x.jpg")
+
+
+def test_workspace_ref_still_rejects_shared_subtree() -> None:
+    # shared/ stays reserved — it's a read-only bind, never a render target.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="reserved shared/ tree"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/shared/x.jpg")
+
+
+def test_workspace_ref_without_agents_prefix_has_no_agent_key() -> None:
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/.tool_results/r1/page.jpg"
+    assert parse_workspace_image_ref(ref).agent_key is None
 
 
 def test_workspace_ref_roundtrips() -> None:

@@ -21,6 +21,8 @@ from pathlib import PurePosixPath
 from typing import Final
 from uuid import UUID
 
+from expert_work.protocol.agent_key import require_safe_key
+
 #: URI scheme prefix for an uploaded image reference.
 IMAGE_REF_PREFIX: Final = "expert_work://image/"
 
@@ -109,12 +111,28 @@ def parse_image_ref(uri: str) -> ImageRef:
 
 @dataclass(frozen=True)
 class WorkspaceImageRef:
-    """工作区里一张图的引用 —— 平台自己渲出来的文档页(B-64)。"""
+    """工作区里一张图的引用 —— 平台自己渲出来的文档页(B-64)。
+
+    ``rel`` 恒相对**用户根**(``{root}/{tenant_id}/{user_id}/``),不是相对
+    某次沙箱 exec 的视图 —— 这是 :class:`orchestrator.multimodal.NasWorkspaceImageResolver`
+    的 openat 链实际走的那棵树。B-64 回修 C1 —— 绑了 agent 的 run 在这棵树里的
+    真实位置是 ``agents/<agent_key>/...``,``rel`` 因此可能以这一段开头;
+    ``agent_key`` 把这一层**结构性地**摘出来单独暴露成字段,而不是让每个消费方
+    自己再从 ``rel`` 里正则一遍(「规矩只写一处就漏两个」在本仓有前科 ——
+    见 :mod:`orchestrator.tools.vision` 与
+    :func:`orchestrator.multimodal.is_cacheable_image_ref` 现在都要读这个字段)。
+    没绑 agent 的 ref(``rel`` 直接在用户根下)是 ``None``。
+    """
 
     tenant_id: UUID
     user_id: UUID
     rel: str
     ext: str
+    #: B-64 回修 C1 —— 见类 docstring。``rel`` 以 ``agents/<agent_key>/`` 开头时
+    #: 非 ``None``;那种情况下 ``rel`` 仍然是**完整**路径(含这一段前缀),不裁剪
+    #: 掉它——``NasWorkspaceImageResolver`` 的 openat 链就是照用户根走的字符串
+    #: 相对路径,裁一段出去它就要在两处分别拼回来,徒增出错面。
+    agent_key: str | None = None
 
 
 def parse_workspace_image_ref(uri: str) -> WorkspaceImageRef:
@@ -129,8 +147,21 @@ def parse_workspace_image_ref(uri: str) -> WorkspaceImageRef:
     key>/x``)折叠成相对路径再收,这里**一律拒绝、不折叠**——``image_ref`` 是
     从模型的工具调用参数直达的字符串,没有 ``_validate_path`` 那种"来自哪个
     已知视图"的上下文可折,折叠只会凭空多认一种合法拼法,扩大攻击面而不带来
-    实际好处。拒绝 ``..`` 段、拒绝 ``agents/`` 与 ``shared/`` 首段(别人的子树 /
-    只读共享区)这两条与 ``_validate_path`` 相同。
+    实际好处。拒绝 ``..`` 段与 ``shared/`` 首段(只读共享区,永远不是渲染落点)
+    这两条与 ``_validate_path`` 相同。
+
+    B-64 回修 C1 —— ``agents/`` 首段**不再**一律拒绝。B-60 之后,绑了 agent 的
+    run 在 NAS 用户根上的真实位置就是 ``agents/<agent_key>/...``——``read_page``
+    渲染出来的文件本来就落在那里,一律拒等于把自己刚渲染的页也拒了(实测撞到:
+    渲染"成功"但 ``NasWorkspaceImageResolver`` 必然 ``FileNotFoundError``,而
+    模型被告知"图已在上下文里")。放行的前提是 ``agents/`` 后面必须跟着一个
+    通过 :func:`~expert_work.protocol.agent_key.require_safe_key` 校验的
+    key——那道闸与 ``sanitize_agent_key`` 产物的字符集同源,拒绝任何非
+    ``[A-Za-z0-9._-]+`` 或退化成 ``.``/``..`` 的 key,防的是 ref 字符串里的
+    key 段被塞进路径穿越字符。**"这个 key 是不是调用方自己的"不在这里判**——
+    ref 字符串本身看不出"自己"是谁,那是下一层的活(``vision.AskImageTool``
+    比对 ``ctx.agent_key``;见该模块)。裸 ``agents/`` 后面没有 key(或 key 是
+    空串)仍然拒。
     """
     if not uri.startswith(WORKSPACE_REF_PREFIX):
         msg = f"workspace image ref must start with {WORKSPACE_REF_PREFIX!r}: {uri!r}"
@@ -149,11 +180,25 @@ def parse_workspace_image_ref(uri: str) -> WorkspaceImageRef:
     if not rel or rel.startswith("/") or ".." in segments:
         msg = f"workspace image ref path must be relative and free of '..': {uri!r}"
         raise ValueError(msg)
-    if segments and segments[0] in ("agents", "shared"):
+    if segments and segments[0] == "shared":
         msg = f"workspace image ref must not address the reserved {segments[0]}/ tree: {uri!r}"
         raise ValueError(msg)
+    agent_key: str | None = None
+    if segments and segments[0] == "agents":
+        if len(segments) < 2 or not segments[1]:
+            msg = f"workspace image ref 'agents/' must be followed by an agent key: {uri!r}"
+            raise ValueError(msg)
+        key = segments[1]
+        try:
+            require_safe_key(key)
+        except ValueError as exc:
+            msg = f"workspace image ref has an unsafe agent key {key!r}: {uri!r}"
+            raise ValueError(msg) from exc
+        agent_key = key
     ext = PurePosixPath(rel).suffix.lower()
     if ext not in _MEDIA_TYPE_BY_EXT:
         msg = f"unsupported image extension {ext!r} in workspace ref {uri!r}"
         raise ValueError(msg)
-    return WorkspaceImageRef(tenant_id=tenant_id, user_id=user_id, rel=rel, ext=ext)
+    return WorkspaceImageRef(
+        tenant_id=tenant_id, user_id=user_id, rel=rel, ext=ext, agent_key=agent_key
+    )
