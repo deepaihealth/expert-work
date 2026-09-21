@@ -22,7 +22,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol, runtime_checkable
 
-from expert_work.protocol.multimodal import parse_image_ref, parse_workspace_image_ref
+from expert_work.protocol.multimodal import (
+    IMAGE_REF_PREFIX,
+    WORKSPACE_REF_PREFIX,
+    parse_image_ref,
+    parse_workspace_image_ref,
+)
 from expert_work.runtime.storage.base import ObjectStore
 
 #: ``content`` block discriminator for an uploaded-image reference.
@@ -150,6 +155,39 @@ class NasWorkspaceImageResolver:
         path = self.root / str(parsed.tenant_id) / str(parsed.user_id) / parsed.rel
         media_type = _MEDIA_TYPE_BY_EXT[parsed.ext]
         return ResolvedImage(data=path.read_bytes(), media_type=media_type)
+
+
+@dataclass(frozen=True)
+class DispatchingImageResolver:
+    """:class:`ImageResolver` that routes by ref scheme —— B-64。
+
+    有且只有**一个** ``ImageResolver`` 实例贯穿全程:
+    ``control_plane.runtime.make_image_resolver`` 造出它,两个 provider
+    适配器(``openai.py`` / ``anthropic.py``)与 ``AskImageTool`` 共享同一个
+    引用。给 B-64 加第二种 ref scheme(工作区渲出来的文档页)不能要求每个
+    消费方都另外接一根线——那样漏接一处就是那一条路径永远拿不到字节;正确
+    做法是把这**一个**实例本身改宽,让它认得两种 scheme。``ImageResolver`` 是
+    Protocol,所以这是"加一个实现",不是"改接口"。
+
+    ``workspace`` 为 ``None`` 时(部署没接 NAS,``settings.workspace_nas_root``
+    未配)工作区 ref 报一个说明性的 ``ValueError``,而不是落进 ``uploads`` 那支
+    然后被它自己的 scheme 校验拒掉——错误信息应该说「工作区没接」,不是「不是
+    合法的上传 ref」。
+    """
+
+    uploads: ImageResolver
+    workspace: ImageResolver | None = None
+
+    async def resolve(self, ref: str) -> ResolvedImage:
+        if ref.startswith(IMAGE_REF_PREFIX):
+            return await self.uploads.resolve(ref)
+        if ref.startswith(WORKSPACE_REF_PREFIX):
+            if self.workspace is None:
+                msg = f"workspace image refs are not available in this deployment: {ref!r}"
+                raise ValueError(msg)
+            return await self.workspace.resolve(ref)
+        msg = f"unrecognized image ref scheme: {ref!r}"
+        raise ValueError(msg)
 
 
 @dataclass

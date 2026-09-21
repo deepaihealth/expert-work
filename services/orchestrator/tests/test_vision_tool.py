@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import base64
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -13,12 +11,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from expert_work.protocol.multimodal import ImageRef
-from orchestrator.multimodal import (
-    IMAGE_REF_BLOCK_TYPE,
-    InMemoryImageResolver,
-    NasWorkspaceImageResolver,
-    ResolvedImage,
-)
+from orchestrator.multimodal import IMAGE_REF_BLOCK_TYPE, InMemoryImageResolver, ResolvedImage
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.vision import AskImageTool
 
@@ -149,76 +142,45 @@ def test_ask_image_spec_shape() -> None:
 # ---------------------------------------------------------------------------
 # workspace ref dispatch (B-64) — the sibling scheme, tenant check on both paths
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class _RecordingVLCaller:
-    """假 LLMCaller —— 记录它被塞进消息里的真实图片字节。
-
-    工作区 ref 这条路,``AskImageTool`` 自己现地把 NAS 上的字节解出来,内嵌成
-    消息块里的 ``resolved_data_uri``(见 ``vision.py``——provider 适配器
-    construction 时钉死的共享 resolver 不认工作区 scheme,所以字节不能像上传
-    ref 那样留给它事后再解)。这里直接从消息里把字节抠出来,证明分派链路真把
-    NAS 上的字节带到了 VL 调用这一步,而不仅仅是把 ref 字符串原样转发。
-    """
-
-    answer: str
-    seen_bytes: bytes | None = field(default=None, init=False)
-
-    async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
-        for msg in messages:
-            content = msg.content
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, Mapping) and "resolved_data_uri" in block:
-                    _, _, encoded = str(block["resolved_data_uri"]).partition(",")
-                    self.seen_bytes = base64.b64decode(encoded)
-        return AIMessage(content=self.answer)
+#
+# Fix round 1: byte resolution is no longer the tool's job. A single
+# DispatchingImageResolver (orchestrator.multimodal) shared by both provider
+# adapters and this tool now understands both ref schemes, so the workspace
+# branch emits the exact same ``image_ref_block(ref)`` shape as the upload
+# branch — the tool only picks which parser to use for the tenant check.
+# The "does the resolver actually fetch the right bytes" question moved to
+# test_multimodal.py (DispatchingImageResolver's own tests) and to
+# test_llm_provider_openai.py / test_llm_provider_anthropic.py (proving a
+# real adapter resolves a workspace ref end to end).
 
 
 @pytest.mark.anyio
-async def test_ask_image_accepts_a_workspace_ref(tmp_path: Path) -> None:
-    """按 scheme 分派到 NAS resolver,VL 模型拿到的是真字节。"""
+async def test_ask_image_accepts_a_workspace_ref() -> None:
+    """按 scheme 分派租户校验,并把 ref 原样转发 —— 工作区 ref 与上传 ref 在
+    工具这一层之下走同一条投递路径(``image_ref_block``),字节由共享的
+    ``DispatchingImageResolver`` 按 scheme 解析,不是本工具的活。"""
     tenant, user = uuid4(), uuid4()
-    page = tmp_path / str(tenant) / str(user) / ".tool_results" / "r1" / "figures" / "abc"
-    page.mkdir(parents=True)
-    (page / "page-03.jpg").write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
-
-    caller = _RecordingVLCaller(answer="曲线从 6.1 降到 5.5")
-    tool = AskImageTool(
-        vl_caller=caller,
-        image_resolver=InMemoryImageResolver({}),
-        workspace_image_resolver=NasWorkspaceImageResolver(root=tmp_path),
-    )
+    vl = _FakeVLCaller(response=AIMessage(content="曲线从 6.1 降到 5.5"))
+    tool = AskImageTool(vl_caller=vl, image_resolver=_resolver())
     ref = f"expert_work://workspace/{tenant}/{user}/.tool_results/r1/figures/abc/page-03.jpg"
+
     result = await tool.call(
         {"image_ref": ref, "question": "走势如何"},
         ctx=_ctx(tenant_id=tenant, user_id=user),
     )
+
     assert "5.5" in result.content
-    assert caller.seen_bytes == b"\xff\xd8\xff\xe0fake-jpeg"
+    sent = vl.calls[0]["messages"]
+    content = sent[1].content
+    assert isinstance(content, list)
+    assert content[1] == {"type": IMAGE_REF_BLOCK_TYPE, "ref": ref}
 
 
 @pytest.mark.anyio
-async def test_ask_image_rejects_a_cross_tenant_workspace_ref(tmp_path: Path) -> None:
+async def test_ask_image_rejects_a_cross_tenant_workspace_ref() -> None:
     """租户校验对两种 ref 都执行 —— 新 scheme 不是绕过它的后门。"""
     mine, theirs, user = uuid4(), uuid4(), uuid4()
-    tool = AskImageTool(
-        vl_caller=_RecordingVLCaller(answer="never"),
-        image_resolver=InMemoryImageResolver({}),
-        workspace_image_resolver=NasWorkspaceImageResolver(root=tmp_path),
-    )
+    tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
     ref = f"expert_work://workspace/{theirs}/{user}/.tool_results/r1/figures/a/page-01.jpg"
     with pytest.raises(ToolBlockedError, match="does not match the run tenant"):
         await tool.call({"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=mine))
-
-
-@pytest.mark.anyio
-async def test_ask_image_rejects_workspace_ref_when_resolver_not_configured() -> None:
-    """``workspace_image_resolver=None``(默认)——这条部署没装 Path B 的 NAS 直读。"""
-    tenant, user = uuid4(), uuid4()
-    tool = AskImageTool(vl_caller=_RecordingVLCaller(answer="never"), image_resolver=_resolver())
-    ref = f"expert_work://workspace/{tenant}/{user}/.tool_results/r1/x.jpg"
-    with pytest.raises(ToolBlockedError, match="not available"):
-        await tool.call({"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant))

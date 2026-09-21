@@ -184,14 +184,11 @@ class ToolEnv:
     #: Resolves ``image_ref`` content blocks to bytes (Stream J.6). Both
     #: Path A (image into the ``HumanMessage``) and Path B (the
     #: ``ask_image`` tool) draw on it; ``None`` → no image input is
-    #: available in this deployment.
+    #: available in this deployment. B-64 —— this is a
+    #: ``DispatchingImageResolver`` in production (``make_image_resolver``),
+    #: so it already understands the workspace-ref scheme too; there is no
+    #: separate field for it.
     image_resolver: ImageResolver | None = None
-    #: B-64 —— resolves ``expert_work://workspace/...`` refs (platform-rendered
-    #: document pages) for the ``ask_image`` tool. A sibling of
-    #: ``image_resolver``, not a replacement — ``None`` → this deployment has
-    #: no NAS-mounted workspace to read pages from (``ask_image`` still works
-    #: for uploaded images via ``image_resolver``).
-    workspace_image_resolver: ImageResolver | None = None
     #: Mini-ADR J-21 — when set, sub-agent runs write their own trajectory
     #: under ``{prefix}/{tenant}/{outcome}/{date}/{sub_thread_id}.jsonl``
     #: so J.13 eval can replay every node in a delegation tree. ``None``
@@ -425,13 +422,7 @@ def _register_ask_image(
             "manifest declares 'vision' but no VL llm_caller was built — "
             "this is an agent-factory bug, not a manifest defect"
         )
-    registry.register(
-        AskImageTool(
-            vl_caller=vl_caller,
-            image_resolver=env.image_resolver,
-            workspace_image_resolver=env.workspace_image_resolver,
-        )
-    )
+    registry.register(AskImageTool(vl_caller=vl_caller, image_resolver=env.image_resolver))
 
 
 def _register_subagents(

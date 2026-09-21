@@ -101,6 +101,7 @@ from orchestrator.llm import (
 )
 from orchestrator.multimodal import (
     CachingImageResolver,
+    DispatchingImageResolver,
     ImageResolver,
     NasWorkspaceImageResolver,
     ObjectStoreImageResolver,
@@ -1759,7 +1760,6 @@ def build_tool_env(
     artifact_store: ArtifactStore | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
     image_resolver: ImageResolver | None = None,
-    workspace_image_resolver: ImageResolver | None = None,
     workspace_lock: WorkspaceLock | None = None,
     workspace_store: WorkspaceStore | None = None,
 ) -> ToolEnv:
@@ -1777,10 +1777,11 @@ def build_tool_env(
     传进来的必须是 ``build_workspace_store`` 给工作区端点的**同一个实例**,不另造
     一份 —— 两份实例就是两份可能漂移的 root 配置。
 
-    B-64 —— ``workspace_image_resolver`` 是 ``image_resolver`` 的兄弟:backs
-    ``ask_image`` 的工作区 ref 路(平台渲出来的文档页),``None`` = 这个部署
-    没接 NAS(``make_workspace_image_resolver`` 与 ``build_workspace_store``
-    读同一个 ``settings.workspace_nas_root``)。
+    B-64 —— ``image_resolver`` 单独一个字段就够了:它现在是
+    :class:`~orchestrator.multimodal.DispatchingImageResolver`(见
+    ``make_image_resolver``),自己认得上传 ref 与工作区 ref 两种 scheme。
+    ``ask_image`` 与两个 provider 适配器共享同一个实例,不需要各自再接一根
+    "工作区专用"的线——那样每多一个消费方就多一处会漏接的风险。
     """
     return ToolEnv(
         allowlist_provider=_tenant_allowlist_provider(tenant_config_service),
@@ -1791,7 +1792,6 @@ def build_tool_env(
         artifact_store=artifact_store,
         knowledge_retriever=knowledge_retriever,
         image_resolver=image_resolver,
-        workspace_image_resolver=workspace_image_resolver,
         workspace_lock=workspace_lock or NullWorkspaceLock(),
         workspace_store=workspace_store,
     )
@@ -1854,28 +1854,39 @@ async def resolve_object_store_config(
     )
 
 
-def make_image_resolver(store: ObjectStore) -> ImageResolver:
-    """Build the J.6 image resolver over an object store — backs both
-    multimodal paths (Path A content blocks + Path B ``ask_image``).
+def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = None) -> ImageResolver:
+    """Build **the one** J.6 image resolver — backs both multimodal paths
+    (Path A content blocks + Path B ``ask_image``) and both provider
+    adapters (``openai.py`` / ``anthropic.py``): every consumer shares this
+    single instance (threaded through ``ToolEnv.image_resolver`` and each
+    provider's own ``image_resolver`` constructor arg), so it must itself
+    understand every ref scheme rather than each consumer wiring its own.
 
-    Wrapped in a bounded LRU cache: the resolver is a single long-lived
-    instance, and every LLM turn re-resolves every image in the conversation
-    history, so caching stops the same image being re-fetched each turn.
+    B-64 —— ``workspace_root`` wires the NAS-mounted workspace backend
+    (:class:`~orchestrator.multimodal.NasWorkspaceImageResolver`) into a
+    :class:`~orchestrator.multimodal.DispatchingImageResolver` alongside the
+    object-store backend; ``None`` (this deployment has no NAS mount —
+    ``settings.workspace_nas_root`` unset, same truthiness gate
+    :func:`build_workspace_store` uses) → workspace refs fail with a clear
+    "not available" error instead of silently never resolving.
+
+    Wrapped in **one** bounded LRU cache around the dispatcher, not one per
+    backend: every LLM turn re-resolves every image in the conversation
+    history (``_human_content`` re-walks all messages on each ``complete``
+    call), so caching stops the same image — upload *or* rendered page —
+    being re-fetched each turn. A single cache is safe for both schemes
+    because refs are content-addressed for both: an uploaded image never
+    changes after landing, and a rendered page lives at a path keyed by
+    ``run_id`` + document sha + page number
+    (``.tool_results/<run_id>/figures/<doc-sha>/page-NN.jpg``) that is never
+    overwritten with different bytes once written. The cache key is the
+    full ref string, which already carries the scheme prefix, so an upload
+    ref and a workspace ref can never collide in the cache.
     """
-    return CachingImageResolver(ObjectStoreImageResolver(store=store))
-
-
-def make_workspace_image_resolver(settings: Settings) -> ImageResolver | None:
-    """Build the B-64 workspace-page resolver backing ``ask_image``'s
-    workspace-ref path, or ``None`` when this deployment has no NAS mount.
-
-    Same settings source + truthiness gate as :func:`build_workspace_store`
-    (``settings.workspace_nas_root``) — the control-plane Pod's own NAS
-    mount, not a value ``ask_image`` should ever hardcode.
-    """
-    if not settings.workspace_nas_root:
-        return None
-    return NasWorkspaceImageResolver(root=Path(settings.workspace_nas_root))
+    workspace = NasWorkspaceImageResolver(root=workspace_root) if workspace_root else None
+    return CachingImageResolver(
+        DispatchingImageResolver(uploads=ObjectStoreImageResolver(store=store), workspace=workspace)
+    )
 
 
 def build_middleware_env(

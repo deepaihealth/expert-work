@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -26,7 +28,13 @@ from orchestrator.llm import (
     OpenAIProvider,
     RecordingOpenAIClient,
 )
-from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage, image_ref_block
+from orchestrator.multimodal import (
+    DispatchingImageResolver,
+    InMemoryImageResolver,
+    NasWorkspaceImageResolver,
+    ResolvedImage,
+    image_ref_block,
+)
 from orchestrator.tools.registry import ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -481,6 +489,39 @@ async def test_human_image_ref_dropped_without_resolver() -> None:
 
     # Image silently dropped → plain-text content, no crash.
     assert client.calls[0]["messages"][0]["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_human_workspace_ref_resolves_through_dispatching_resolver(tmp_path: Path) -> None:
+    """B-64 —— Path A 的适配器现在也认得工作区 ref。
+
+    这条不是靠假设:``DispatchingImageResolver`` 把上传 ref 与工作区 ref 收进
+    同一个实例后,provider 适配器一个字节都不用改就已经能解析新 scheme
+    ——证明 Task 5 关的正是「Path A 的字节永远到不了模型」这个洞,不用等
+    Path A 自己的任务落地。
+    """
+    tenant, user = uuid4(), uuid4()
+    page_dir = tmp_path / str(tenant) / str(user) / "r1"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page-01.jpg").write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    uri = f"expert_work://workspace/{tenant}/{user}/r1/page-01.jpg"
+    resolver = DispatchingImageResolver(
+        uploads=InMemoryImageResolver({}), workspace=NasWorkspaceImageResolver(root=tmp_path)
+    )
+    client = RecordingOpenAIClient(response={"choices": [{"message": {"content": "ok"}}]})
+    provider = OpenAIProvider(client=client, model="gpt-4o", image_resolver=resolver)
+
+    await provider.complete(
+        messages=[
+            HumanMessage(content=[{"type": "text", "text": "what is this?"}, image_ref_block(uri)])
+        ],
+        tools=[],
+    )
+
+    content = client.calls[0]["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "what is this?"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
 @pytest.mark.asyncio

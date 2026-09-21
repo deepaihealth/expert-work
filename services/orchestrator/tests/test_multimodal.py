@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -12,8 +13,10 @@ from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
 from orchestrator.multimodal import (
     IMAGE_REF_BLOCK_TYPE,
     CachingImageResolver,
+    DispatchingImageResolver,
     ImageResolver,
     InMemoryImageResolver,
+    NasWorkspaceImageResolver,
     ObjectStoreImageResolver,
     ResolvedImage,
     image_ref_block,
@@ -177,6 +180,61 @@ async def test_caching_resolver_lru_evicts_oldest() -> None:
     assert inner.calls == 3
     await resolver.resolve("a")  # "a" was evicted → re-fetched
     assert inner.calls == 4
+
+
+# ---------------------------------------------------------------------------
+# DispatchingImageResolver (B-64) — one resolver instance, two ref schemes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_routes_upload_ref_to_uploads_backend() -> None:
+    ref = _image_ref(".png").to_uri()
+    uploads = InMemoryImageResolver(images={ref: ResolvedImage(media_type="image/png", data=_DATA)})
+    resolver = DispatchingImageResolver(uploads=uploads, workspace=InMemoryImageResolver({}))
+
+    resolved = await resolver.resolve(ref)
+
+    assert resolved.data == _DATA
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_routes_workspace_ref_to_workspace_backend(
+    tmp_path: Path,
+) -> None:
+    tenant, user = uuid4(), uuid4()
+    page_dir = tmp_path / str(tenant) / str(user) / "r1"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page-01.jpg").write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    ref = f"expert_work://workspace/{tenant}/{user}/r1/page-01.jpg"
+    resolver = DispatchingImageResolver(
+        uploads=InMemoryImageResolver({}), workspace=NasWorkspaceImageResolver(root=tmp_path)
+    )
+
+    resolved = await resolver.resolve(ref)
+
+    assert resolved.data == b"\xff\xd8\xff\xe0fake-jpeg"
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_rejects_unknown_scheme() -> None:
+    resolver = DispatchingImageResolver(uploads=InMemoryImageResolver({}))
+    with pytest.raises(ValueError, match="unrecognized image ref scheme"):
+        await resolver.resolve("s3://not-a-scheme-we-know/x.png")
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_rejects_workspace_ref_when_unconfigured() -> None:
+    """``workspace=None``(默认)—— 这个部署没接 NAS。"""
+    tenant, user = uuid4(), uuid4()
+    resolver = DispatchingImageResolver(uploads=InMemoryImageResolver({}))
+    ref = f"expert_work://workspace/{tenant}/{user}/r1/page-01.jpg"
+    with pytest.raises(ValueError, match="not available"):
+        await resolver.resolve(ref)
+
+
+def test_dispatching_resolver_satisfies_protocol() -> None:
+    assert isinstance(DispatchingImageResolver(uploads=InMemoryImageResolver({})), ImageResolver)
 
 
 # ---------------------------------------------------------------------------

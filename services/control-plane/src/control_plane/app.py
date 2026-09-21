@@ -230,7 +230,6 @@ from control_plane.runtime import (
     make_image_resolver,
     make_knowledge_retriever,
     make_mcp_allowlist_provider,
-    make_workspace_image_resolver,
     resolve_object_store_config,
     resolve_web_search_client,
 )
@@ -1677,12 +1676,19 @@ def create_app(
                         interval_s=resolved_settings.curation_worker_interval_s,
                         batch_size=resolved_settings.curation_worker_batch_size,
                     )
-                image_resolver = make_image_resolver(object_store)
-                # B-64 — the ask_image workspace-ref path (platform-rendered
-                # document pages); ``None`` when this deployment has no NAS
-                # mount (same settings field + truthiness gate as
-                # ``resolved_workspace_store`` above).
-                workspace_image_resolver = make_workspace_image_resolver(resolved_settings)
+                # B-64 — one resolver instance handles both the upload scheme
+                # and the ask_image workspace-ref scheme (platform-rendered
+                # document pages); the NAS backend activates only when this
+                # deployment has a mount (same settings field + truthiness
+                # gate as ``resolved_workspace_store`` above).
+                image_resolver = make_image_resolver(
+                    object_store,
+                    workspace_root=(
+                        Path(resolved_settings.workspace_nas_root)
+                        if resolved_settings.workspace_nas_root
+                        else None
+                    ),
+                )
                 # Stream J.3 + Stream T (PR B) — long-term memory backend for
                 # the agent. The embedder reads the live platform embedding
                 # config per call (DB-row wins, env fallback), so an admin's
@@ -1731,7 +1737,6 @@ def create_app(
                     artifact_store=resolved_artifact_store,
                     knowledge_retriever=knowledge_retriever,
                     image_resolver=image_resolver,
-                    workspace_image_resolver=workspace_image_resolver,
                     # B-84 —— 只读文件工具(read_file / list_dir / search_files)
                     # 直读 control-plane 自己挂着的 NAS,不起沙箱。与工作区端点
                     # 共用同一个 store 实例,不另造一份。
