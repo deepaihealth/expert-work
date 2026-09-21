@@ -190,6 +190,15 @@ def test_wrapper_renders_jpeg_not_png() -> None:
     assert "-png" not in code
 
 
+def test_spec_is_not_read_only() -> None:
+    """回修 I2 —— 这个工具会 makedirs+落中间产物,不是只读。``is_read_only=True``
+    会让 L.L6 调度器把两次并发的 read_page 调用当成互不冲突(scheduling.py
+    规则 1:只读工具永不冲突),放大 C2 的竞态窗口。"""
+    spec = ReadPageTool(client=RecordingSandboxRuntime()).spec
+    assert spec.is_read_only is False
+    assert spec.side_effect == "reversible"
+
+
 # ---------------------------------------------------------------------------
 # _validate_rendered_rel —— 回修 I1:参数化的敌对输入 + M2 的扩展名闸。
 # 这一层校验的是"沙箱只报告了它自己 exec 视图下的东西"(相对沙箱视图,不是
