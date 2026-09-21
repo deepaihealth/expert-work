@@ -320,10 +320,10 @@ def test_render_wrapper_deduplicates_units_so_rendered_never_holds_a_dead_ref(
     env = _run_render(tmp_path, "d.pdf", units=[3, 3], out_rel=".tool_results/r1/figures/dup")
 
     assert env["ok"] is True
-    assert [item["unit"] for item in env["rendered"]] == [3]
-    assert env["failed"] == []
     for item in env["rendered"]:
         assert (tmp_path / item["rel"]).exists(), f"rendered 里是一条死 ref:{item['rel']!r}"
+    assert [item["unit"] for item in env["rendered"]] == [3]
+    assert env["failed"] == []
 
 
 def test_wrapper_does_not_reuse_a_stale_file_when_a_later_render_fails(
