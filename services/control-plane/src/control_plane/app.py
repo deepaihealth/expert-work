@@ -230,6 +230,7 @@ from control_plane.runtime import (
     make_image_resolver,
     make_knowledge_retriever,
     make_mcp_allowlist_provider,
+    make_workspace_image_resolver,
     resolve_object_store_config,
     resolve_web_search_client,
 )
@@ -1677,6 +1678,11 @@ def create_app(
                         batch_size=resolved_settings.curation_worker_batch_size,
                     )
                 image_resolver = make_image_resolver(object_store)
+                # B-64 — the ask_image workspace-ref path (platform-rendered
+                # document pages); ``None`` when this deployment has no NAS
+                # mount (same settings field + truthiness gate as
+                # ``resolved_workspace_store`` above).
+                workspace_image_resolver = make_workspace_image_resolver(resolved_settings)
                 # Stream J.3 + Stream T (PR B) — long-term memory backend for
                 # the agent. The embedder reads the live platform embedding
                 # config per call (DB-row wins, env fallback), so an admin's
@@ -1725,6 +1731,7 @@ def create_app(
                     artifact_store=resolved_artifact_store,
                     knowledge_retriever=knowledge_retriever,
                     image_resolver=image_resolver,
+                    workspace_image_resolver=workspace_image_resolver,
                     # B-84 —— 只读文件工具(read_file / list_dir / search_files)
                     # 直读 control-plane 自己挂着的 NAS,不起沙箱。与工作区端点
                     # 共用同一个 store 实例,不另造一份。

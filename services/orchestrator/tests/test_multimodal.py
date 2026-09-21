@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from expert_work.protocol.multimodal import ImageRef
+from expert_work.protocol.multimodal import ImageRef, parse_image_ref, parse_workspace_image_ref
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
 from orchestrator.multimodal import (
     IMAGE_REF_BLOCK_TYPE,
@@ -177,3 +177,55 @@ async def test_caching_resolver_lru_evicts_oldest() -> None:
     assert inner.calls == 3
     await resolver.resolve("a")  # "a" was evicted → re-fetched
     assert inner.calls == 4
+
+
+# ---------------------------------------------------------------------------
+# parse_workspace_image_ref (B-64) — sibling of parse_image_ref, not a branch
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_ref_rejects_parent_traversal() -> None:
+    # Extension is valid (``.jpg``) and the first segment is not a reserved
+    # tree, so the ONLY thing standing between this ref and a clean parse is
+    # the ``..`` check — a mutation that deletes that check turns this ValueError
+    # into a successful parse, not just a differently-worded error.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="free of '\\.\\.'"):
+        parse_workspace_image_ref(
+            f"expert_work://workspace/{t}/{u}/.tool_results/r1/figures/../../../etc/evil.jpg"
+        )
+
+
+def test_workspace_ref_rejects_another_agents_subtree() -> None:
+    # Valid UUIDs + valid extension + no ``..`` — the reserved-tree check is
+    # the only thing that can reject this ref.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="reserved agents/ tree"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/agents/other/x.jpg")
+
+
+def test_workspace_ref_roundtrips() -> None:
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/.tool_results/r1/figures/abc/page-03.jpg"
+    parsed = parse_workspace_image_ref(ref)
+    assert parsed.tenant_id == t
+    assert parsed.user_id == u
+    assert parsed.rel.endswith("page-03.jpg")
+
+
+def test_workspace_ref_rejects_unsupported_extension() -> None:
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="unsupported image extension"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/.tool_results/r1/page.pdf")
+
+
+def test_workspace_ref_rejects_malformed_tenant_id() -> None:
+    u = uuid4()
+    with pytest.raises(ValueError, match="malformed tenant/user id"):
+        parse_workspace_image_ref(f"expert_work://workspace/not-a-uuid/{u}/r1/page.jpg")
+
+
+def test_parse_image_ref_still_refuses_workspace_scheme() -> None:
+    """老边界一个字没松 —— 这是「加兄弟不加分支」的钉子。"""
+    with pytest.raises(ValueError, match="must start with"):
+        parse_image_ref("expert_work://workspace/t/u/x.jpg")

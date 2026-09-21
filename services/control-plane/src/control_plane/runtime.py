@@ -102,6 +102,7 @@ from orchestrator.llm import (
 from orchestrator.multimodal import (
     CachingImageResolver,
     ImageResolver,
+    NasWorkspaceImageResolver,
     ObjectStoreImageResolver,
 )
 from orchestrator.sse import ThreadStatsRecorder
@@ -1758,6 +1759,7 @@ def build_tool_env(
     artifact_store: ArtifactStore | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
     image_resolver: ImageResolver | None = None,
+    workspace_image_resolver: ImageResolver | None = None,
     workspace_lock: WorkspaceLock | None = None,
     workspace_store: WorkspaceStore | None = None,
 ) -> ToolEnv:
@@ -1774,6 +1776,11 @@ def build_tool_env(
     ``search_files``)的后端:它们直读 control-plane 自己挂着的 NAS,不起沙箱。
     传进来的必须是 ``build_workspace_store`` 给工作区端点的**同一个实例**,不另造
     一份 —— 两份实例就是两份可能漂移的 root 配置。
+
+    B-64 —— ``workspace_image_resolver`` 是 ``image_resolver`` 的兄弟:backs
+    ``ask_image`` 的工作区 ref 路(平台渲出来的文档页),``None`` = 这个部署
+    没接 NAS(``make_workspace_image_resolver`` 与 ``build_workspace_store``
+    读同一个 ``settings.workspace_nas_root``)。
     """
     return ToolEnv(
         allowlist_provider=_tenant_allowlist_provider(tenant_config_service),
@@ -1784,6 +1791,7 @@ def build_tool_env(
         artifact_store=artifact_store,
         knowledge_retriever=knowledge_retriever,
         image_resolver=image_resolver,
+        workspace_image_resolver=workspace_image_resolver,
         workspace_lock=workspace_lock or NullWorkspaceLock(),
         workspace_store=workspace_store,
     )
@@ -1855,6 +1863,19 @@ def make_image_resolver(store: ObjectStore) -> ImageResolver:
     history, so caching stops the same image being re-fetched each turn.
     """
     return CachingImageResolver(ObjectStoreImageResolver(store=store))
+
+
+def make_workspace_image_resolver(settings: Settings) -> ImageResolver | None:
+    """Build the B-64 workspace-page resolver backing ``ask_image``'s
+    workspace-ref path, or ``None`` when this deployment has no NAS mount.
+
+    Same settings source + truthiness gate as :func:`build_workspace_store`
+    (``settings.workspace_nas_root``) — the control-plane Pod's own NAS
+    mount, not a value ``ask_image`` should ever hardcode.
+    """
+    if not settings.workspace_nas_root:
+        return None
+    return NasWorkspaceImageResolver(root=Path(settings.workspace_nas_root))
 
 
 def build_middleware_env(

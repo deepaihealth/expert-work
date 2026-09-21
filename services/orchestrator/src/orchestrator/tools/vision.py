@@ -26,8 +26,12 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
-from expert_work.protocol.multimodal import parse_image_ref
-from orchestrator.multimodal import ImageResolver, image_ref_block
+from expert_work.protocol.multimodal import (
+    WORKSPACE_REF_PREFIX,
+    parse_image_ref,
+    parse_workspace_image_ref,
+)
+from orchestrator.multimodal import IMAGE_REF_BLOCK_TYPE, ImageResolver, image_ref_block
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
 if TYPE_CHECKING:
@@ -56,6 +60,8 @@ class AskImageTool:
 
     vl_caller: LLMCaller
     image_resolver: ImageResolver
+    #: B-64 —— 平台渲出来的文档页走工作区 ref;``None`` = 没装配这条路。
+    workspace_image_resolver: ImageResolver | None = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -95,10 +101,38 @@ class AskImageTool:
             raise ToolBlockedError(msg)
         ref_str = _require_string(args, "image_ref")
         question = _require_string(args, "question")
-        image_ref = parse_image_ref(ref_str)  # raises ValueError on malformed
-        if image_ref.tenant_id != ctx.tenant_id:
+        # B-64 —— 工作区 ref(平台渲出来的文档页)与上传 ref 走两套互相独立的
+        # 校验器:parse_workspace_image_ref 是 parse_image_ref 的**兄弟**,不是
+        # 分支(见它的 docstring)。但租户校验必须对两条路都执行到 —— 新 scheme
+        # 不能绕开它变成跨租户读洞,所以两支各自算出 tenant_of_ref 后走同一句
+        # 检查,而不是各写各的判断。
+        workspace_resolver: ImageResolver | None = None
+        if ref_str.startswith(WORKSPACE_REF_PREFIX):
+            workspace_resolver = self.workspace_image_resolver
+            if workspace_resolver is None:
+                msg = "workspace image refs are not available for this agent"
+                raise ToolBlockedError(msg)
+            tenant_of_ref = parse_workspace_image_ref(ref_str).tenant_id
+        else:
+            tenant_of_ref = parse_image_ref(ref_str).tenant_id  # raises ValueError on malformed
+        if tenant_of_ref != ctx.tenant_id:
             msg = "ask_image image_ref tenant does not match the run tenant"
             raise ToolBlockedError(msg)
+        if workspace_resolver is not None:
+            # 工作区 ref 现地读盘解出字节,直接内嵌进消息块:provider 适配器
+            # construction 时钉死的共享 resolver 只认得 expert_work://image/...
+            # 那一路,不认工作区 scheme(NasWorkspaceImageResolver 是另装的一条
+            # 路,见 orchestrator.multimodal 的 docstring)。上传 ref 原样不动 ——
+            # 仍只带 ref 字符串,字节解析留给 provider 适配器(PR3+PR4+PR6 既有
+            # 行为,零字节变化)。
+            resolved = await workspace_resolver.resolve(ref_str)
+            image_content: dict[str, Any] = {
+                "type": IMAGE_REF_BLOCK_TYPE,
+                "ref": ref_str,
+                "resolved_data_uri": resolved.data_uri,
+            }
+        else:
+            image_content = image_ref_block(ref_str)
         # Round-trip the image through the VL model. The provider adapter
         # resolves the ``image_ref`` content block to bytes via the same
         # shared resolver threaded into the VL caller (PR3 + PR4 + PR6).
@@ -107,7 +141,7 @@ class AskImageTool:
             HumanMessage(
                 content=[
                     {"type": "text", "text": question},
-                    image_ref_block(ref_str),
+                    image_content,
                 ]
             ),
         ]

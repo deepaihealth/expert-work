@@ -19,9 +19,10 @@ import base64
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Final, Protocol, runtime_checkable
 
-from expert_work.protocol.multimodal import parse_image_ref
+from expert_work.protocol.multimodal import parse_image_ref, parse_workspace_image_ref
 from expert_work.runtime.storage.base import ObjectStore
 
 #: ``content`` block discriminator for an uploaded-image reference.
@@ -132,6 +133,23 @@ class ObjectStoreImageResolver:
             raise ValueError(msg)
         data = await self.store.get(image_ref.storage_key)
         return ResolvedImage(media_type=media_type, data=data)
+
+
+@dataclass(frozen=True)
+class NasWorkspaceImageResolver:
+    """:class:`ImageResolver` over the NAS-mounted workspace volume —— B-64。
+
+    control-plane 已经挂着 ``/mnt/workspaces``,所以渲染页的字节直接从盘上读,
+    不用走沙箱 ``exec`` 的 stdout(一页 base64 约 83 KB,没必要塞进管道)。
+    """
+
+    root: Path
+
+    async def resolve(self, ref: str) -> ResolvedImage:
+        parsed = parse_workspace_image_ref(ref)
+        path = self.root / str(parsed.tenant_id) / str(parsed.user_id) / parsed.rel
+        media_type = _MEDIA_TYPE_BY_EXT[parsed.ext]
+        return ResolvedImage(data=path.read_bytes(), media_type=media_type)
 
 
 @dataclass
