@@ -1,6 +1,6 @@
 # 文档里的图:从静默丢失到按需取用(B-64)
 
-**状态**:设计定稿待评审
+**状态**:设计定稿(三条待决已于 2026-09-21 定案,见 §14)
 **日期**:2026-09-21
 **背景条目**:ROADMAP 小 backlog B-64
 **涉及**:`read_document` / `ask_image` / 工作区布局 / 沙箱镜像(无新增依赖)
@@ -90,13 +90,24 @@ n 小但分离完全。Fisher 精确检验单尾 **p = 4.3×10⁻⁶**。
                               │
                     ┌─────────┴─────────┐ 模型挑中某页
                     ▼                   ▼
-             ④ pdftoppm -jpeg -r 150 -f N -l N   (0.16 s / 173 KB)
+             ④ pdftoppm -jpeg -r 100 -f N -l N   (0.12 s / 62 KB,§7.1)
                     │
                     ▼
              ⑤ 按 agent 能力三分投递(§8.2)
 ```
 
-**阶段 ①②③ 在一次 `read_document` 调用里完成;④⑤ 是模型的第二次工具调用。**
+**阶段 ① 在 `read_document` 里完成;②③ 推迟到首次渲染请求;④⑤ 是模型的
+第二次工具调用。**
+
+「转换推迟」是因为清单与渲染需要的东西不一样:**清单只读 zip 里的 XML
+(~1 ms),不需要 LibreOffice**;页号和像素才需要转换。而 pptx 的 slide 与
+PDF page 严格 1:1(§6.2 实测),连页号都不用转换就知道。
+
+⇒ **一次 run 如果读了文档但没看图,LibreOffice 一次都不跑。**
+那个 22 页 deck 的 9.7 s,只有真要看图时才付。
+
+docx 是例外:段落序号 ≠ 页号,所以它的清单用「在哪句话之后」作锚点而不带
+页号,页号在首次渲染时才解析(§9.3)。
 
 ---
 
@@ -226,17 +237,59 @@ pdfplumber 0.11.10  pdf2image  Pillow 12.3.0
 | jpeg | 100 | 0.12 s | 62 KB | 83 KB |
 | jpeg | 200 | 0.20 s | 357 KB | 476 KB |
 
-**默认 `-jpeg -r 150`。** JPEG 比 PNG 小 6.5×。150 dpi 下一页 1500×1125 px,
-按 `w×h/750` 约 2250 图像 token,与 Anthropic 官方「1500–3000 tok/页」一致。
+JPEG 比 PNG 小 6.5×,这条没有争议。**但 150 dpi 是错的。**
 
-### 7.2 预算(原则 3 的落地)
+Anthropic 的建议上限是**长边 1568 px 且约 1.15 MP**;超了服务端自己缩,
+「多花字节、拖慢首 token,一点分辨率都不多」。hermes 的
+`_EMBED_MAX_DIMENSION = 1568` 就是这个数。
+
+四种页型算下来:
+
+| 页型 | 100 dpi | 150 dpi |
+|---|---|---|
+| pptx 16:9 (13.33×7.5 in) | 1333×750 = **1.00 MP** ✅ | 2000×1125 = 2.25 MP ❌ |
+| pptx 4:3 (10×7.5 in) | 1000×750 = **0.75 MP** ✅ | 1500×1125 = 1.69 MP ❌ |
+| docx Letter | 850×1100 = **0.94 MP** ✅ | 1275×1650 = 2.10 MP ❌ |
+| docx A4 | 827×1169 = **0.97 MP** ✅ | 1240×1754 = 2.17 MP ❌ |
+
+**150 dpi 在四种页型上全部超线** —— 2.8 倍的字节换零有效分辨率。
+
+**默认 `-jpeg -r 100`**(62 KB / 约 1000 图像 token)。
+
+⚠️ 待验:正文小字在 100 dpi 下 VLM 还认不认得出(10.5 pt 正文 ≈ 15 px 高)。
+进观察项 §13.3。若不够,提高 dpi 的同时必须**同步降低渲染区域**
+(只渲图所在的那一块而非整页),不能靠超过 1.15 MP 去换清晰度 —— 那一档是
+服务端缩掉的,花了也拿不到。
+
+### 7.2 两套预算,不是一套
+
+hermes 的源码注释点破了为什么必须分开:
+
+> *Proactive embed cap: **this image is re-sent on every later turn**, so resize
+> DOWN to the history-reuse target ... those are one-shot viewing limits —
+> **history embeds are sized smaller so repeated turns don't blow the context***
+
+它的两个数相差 78 倍:
+
+```python
+_MAX_BASE64_BYTES    = 20 * 1024 * 1024   # 一次性看图
+_EMBED_TARGET_BYTES  = 256 * 1024         # 进历史的
+_EMBED_MAX_DIMENSION = 1568
+```
+
+#### 渲染预算(一次调用内)
 
 抄 openclaw 的**像素预算**形状,而不是页数上限:
 
-- 单次 `read_page` 调用:`MAX_PAGES_PER_CALL`(起手 3)
-- 单 run 累计:`MAX_RENDER_PIXELS`(起手 12 M px ≈ 7 页 @150 dpi)
+- 单次调用:`MAX_PAGES_PER_CALL`(起手 3)
+- 单 run 累计:`MAX_RENDER_PIXELS`(起手 12 M px ≈ 12 页 @100 dpi)
 - **塞不下时降分辨率,不丢页** —— `resolveRenderPlan` 那套二分找最大可行 scale
 - 预算耗尽 → 工具返回明确的「预算用完,已渲 N 页」而不是静默截断
+
+#### 历史驻留预算(Path A 专有,见 §8.5)
+
+- `FIGURE_EMBED_MAX_BYTES = 256 KB`、`FIGURE_EMBED_MAX_DIMENSION = 1568`
+- 100 dpi 的渲染物天然落在里面;这两个值是**上限护栏**,不是常规路径
 
 起手值是**猜的**,进验收观察项(§13.3)。
 
@@ -244,13 +297,37 @@ pdfplumber 0.11.10  pdf2image  Pillow 12.3.0
 
 ## 八、投递
 
-### 8.1 约束
+### 8.1 约束:图只能走 HumanMessage,不能走工具结果
 
-- `ToolResult.content` 是 **`str`** —— 工具结果**回不了图片块**。
-- `ask_image` **只在**主模型 `supports_vision == False` **且** manifest 声明了
-  `vision:` 块时才挂(`agent_factory.py:835`)。它不是普遍可用的。
+两家参考实现都把图放进**工具结果**(hermes 的 `_multimodal` 封套 /
+openclaw 的 pi `ImageContent`)。**我们不能照抄**,而且原因不是我们的
+`ToolResult.content` 是 `str` —— 那只是表象,真正的约束在协议层:
 
-所以投递必须按 agent 能力分支,而不是假设某一条通道总在。
+| 通道 | Anthropic | OpenAI / GLM / Kimi / DeepSeek / Qwen / Doubao |
+|---|---|---|
+| 图进 `ToolMessage` | ✅ `tool_result` 内容块可含图 | ❌ **协议不允许**,tool 角色只收文本 |
+| 图进 `HumanMessage` | ✅ | ✅ 已实现(`_human_content` 解 `image_ref` 块) |
+
+`openai.py:618` 的翻译就是照协议写的:
+
+```python
+elif isinstance(msg, ToolMessage):
+    out.append({"role": "tool", "tool_call_id": ..., "content": _message_text(msg)})
+```
+
+而 `OpenAICompatibleProvider(OpenAIProvider)` —— GLM / Kimi / DeepSeek /
+Qwen / Doubao **全部继承这套翻译**。目录里 27 个 `vision=True` 的型号,
+实际在跑的 `kimi-k3` / `glm-5.3-flash` / `glm-4.6v` 全在这一侧。
+
+**给 `ToolResult` 开图片通道 = 造一个大部分机队收不到的东西。**
+hermes 能那么做是因为它原生打 Anthropic。
+
+我们的等价物是**尾部隐藏 `HumanMessage`**(B-67 / L1 既有通道):两个适配器
+都支持,而且 OpenAI 官方对这个场景的建议本来就是「tool 角色装不了图,
+改发后续 user 消息」。
+
+另一条约束:`ask_image` **只在**主模型 `supports_vision == False` **且**
+manifest 声明了 `vision:` 块时才挂(`agent_factory.py:835`)。它不普遍可用。
 
 ### 8.2 三分投递
 
@@ -258,8 +335,8 @@ pdfplumber 0.11.10  pdf2image  Pillow 12.3.0
 
 | agent 能力 | 投递 | 理由 |
 |---|---|---|
-| `supports_vision` | Path A:把页面 ref 作为 **image 内容块**挂在本轮尾部隐藏 `HumanMessage` 上(B-67 / L1 既有通道) | 主模型直接看。不进 system,不破坏 prompt 缓存前缀 |
-| `can_ask_image` | Path B:figure map 里列出页面 ref,模型调 `ask_image(ref, question)` | 字节从不进主上下文 —— 成本论证的核心 |
+| `supports_vision` | Path A:页面 ref 作为 **image 内容块**挂在尾部隐藏 `HumanMessage`(§8.5) | 主模型直接看 |
+| `can_ask_image` | Path B:figure map 里列出页面 ref,模型调 `ask_image(ref, question)` | 字节从不进主上下文 |
 | 都不行 | **只说有图、说明读不了,不给 ref** | 「命名它们只会诱使它编答案」(既有注释) |
 
 ### 8.3 渲染页落在哪
@@ -294,6 +371,89 @@ expert_work://workspace/<tenant>/<user>/.tool_results/<run_id>/figures/<doc-sha>
   新增一个 NAS 实现是**加实现不是改接口**。
 - `AskImageTool.invoke` 按 scheme 分派,租户校验不变(`image_ref.tenant_id != ctx.tenant_id` 那一条对两种 ref 都执行)。
 
+### 8.5 Path A 的完整形态:新标记 + 滑窗 + 可见占位符
+
+#### 为什么要第三个标记
+
+现有两个标记是按**过期语义**分的(`conversation_channel.py:29-45`):
+
+| 标记 | 过期含义 | 规矩 |
+|---|---|---|
+| `INPUTS_BLOCK_MARK` | 路径失效 | 压缩后把最新一段放回去 |
+| `WORKSPACE_BLOCK_MARK` | **内容本身在说谎**(上一轮快照已不是「现在」) | 去重,只留最新 |
+
+**图是第三种:它不过期。** 一份上传文档的第 7 页,渲出来是什么就永远是什么。
+
+- 用去重(工作区那条规矩)是错的 —— 模型看第 7 页时会丢掉还有用的第 3 页;
+- 用「放回最新」(输入那条)同理。
+
+所以 `FIGURE_BLOCK_MARK` 自己一条规矩:**累积 + 滑窗**。
+
+#### 滑窗
+
+两家独立撞上同一个数 —— hermes `_MAX_KEEP_TOOL_IMAGES = 3`、
+openclaw `keepLastAssistants: 3`。**起手也用 3**(`FIGURE_KEEP_RECENT`)。
+
+#### 退役是替换,不是删除
+
+超窗的图片块换成**可见文字**:
+
+```
+[图:第 7 页(用药清单)已退出上下文。需要重看就再调一次 read_page。]
+```
+
+hermes(`[image]` / `[image: <url>]`)与 openclaw
+(`[image removed during context pruning]`)都是这个形状。
+
+**删除是静默失效,替换不是** —— 模型看得见这里原来有张图,也看得见怎么拿回来。
+这一条直接服务于设计原则 1。
+
+#### 退役时机绑在缓存生命周期上
+
+openclaw 的 `mode: "cache-ttl"`(ttl 5 min):裁剪**只在 prompt 缓存已经过期
+之后**做,所以裁剪永远不会打掉一个还活着的缓存前缀。这条照抄。
+
+#### 我们比两家省掉的一层
+
+`image_ref_block` 存进历史的是 **URI 字符串**,字节由适配器在调用时解析:
+
+```python
+def image_ref_block(uri: str) -> dict[str, str]:
+    return {"type": IMAGE_REF_BLOCK_TYPE, "ref": uri}
+```
+
+| | hermes / openclaw | 我们 |
+|---|---|---|
+| 检查点里存什么 | base64 大块 | **一个 URI** |
+| 「退役一张图」是什么操作 | 重写多 MB 的消息 | **删一个 ref** |
+| 续跑加载成本 | 随图数增长 | 恒定 |
+
+hermes 为此写了 `drop_stale_api_content` / `_strip_images_from_tool_msg`
+一整套。**我们不需要。**
+
+### 8.6 ❗ 前置缺陷:估算器看不见图
+
+`packages/expert-work-runtime/src/expert_work/runtime/tokens.py:174` ——
+图片块只按它的**字符串表示**计入:
+
+```python
+# Tool-use / image / other → coarse repr keeps the ...
+```
+
+`{"type":"image_ref","ref":"expert_work://..."}` ≈ 80 字符 ≈ **20 token**,
+而真实成本 ≈ **1000–1300 token**。**低估约 65 倍。**
+
+后果:动态裁剪、压缩触发、working window 这些闸门对图片是**瞎的** ——
+塞三张图进去,它们以为只加了 60 token。
+
+两家都有这个常量(hermes `agent/image_token_cost.py`,压缩触发器用同一个数;
+openclaw `IMAGE_CHAR_ESTIMATE = 8_000`)。
+
+⚠️ **这不是本设计引进的缺陷** —— 今天用户自己传图就已经在低估。但
+Path A 会把这个洞放大到必然出事,所以它是 Path A 的**前置**,必须先修。
+修法:`image_ref` 块按一个可配的每图 token 常量计,与 §7.1 的渲染分辨率
+取同一个真源。
+
 ---
 
 ## 九、分格式行为
@@ -304,7 +464,7 @@ expert_work://workspace/<tenant>/<user>/.tool_results/<run_id>/figures/<doc-sha>
 |---|---|
 | 触发 | `ppt/media/` 非空 或 任一 slide 有 `PICTURE`/`CHART`/`diagram` |
 | 单位 | **整页 slide**,不是单张图(slide↔page 1:1) |
-| 清单项 | 页号 + slide 标题 + 形状构成(N 图 / 图表 / SmartArt) + 演讲者备注(有则带) |
+| 清单项 | 页号 + slide 标题 + 形状构成(N 图 / 图表 / SmartArt) + 演讲者备注(有则带,**每页 500 字上限**,见 §14.3) |
 | 空页判据 | `chars == 0` 且有图形 → 标 **「本页无任何文字」** |
 
 ### 9.2 PDF —— P0
@@ -441,6 +601,13 @@ zip 损坏。**任何一条都不许静默变成「没有图」。**
 4. soffice 不可用 → 输出**必须**是「测不了」,**不得**是「没有图」
 5. 同名 `x.docx` + `x.pptx` 同时处理 → 两份 PDF 都在(§6.3 坑 1 的回归钉)
 6. 22 页文档渲第 11 页 → 拿得到文件(§6.3 坑 2 的回归钉)
+7. 估算器:一条带 `image_ref` 块的消息,估出的 token **必须**显著高于
+   该块字符串表示的长度(§8.6 的回归钉 —— 今天这条会红)
+8. 滑窗:连看 4 页后,第 1 页的图片块**必须**已被替换成占位文字,且占位文字
+   里**必须**含恢复指引;该消息**不得**被整条删除
+9. 读了文档但一次都没请求渲染 → **soffice 进程数必须为 0**(§4 的「推迟转换」
+   回归钉;用 exec 侧的进程计数或耗时上界判)
+10. 渲染分辨率:任一页型渲出的图**必须** ≤ 1.15 MP 且长边 ≤ 1568 px(§7.1)
 
 每条都要能 break → red → restore → green 自证。
 
@@ -458,16 +625,48 @@ zip 损坏。**任何一条都不许静默变成「没有图」。**
 
 ---
 
-## 十四、未决(留给评审)
+## 十四、已定(原为待评审三条)
 
-1. **Path A 的落点。** §8.2 说把 image 块挂在本轮尾部隐藏 `HumanMessage` 上。
-   这复用 B-67 的既有通道,但那个通道今天承载的是「本轮输入」,
-   把渲染页也塞进去是否要单开一个 mark?
-2. **渲染页跨轮存活多久。** 落在 `.tool_results/<run_id>/` 意味着随 run 结束被收。
-   同一个 run 内多轮复用没问题;跨 run 重看同一页要重渲(0.16 s,可接受)。
-   这个取舍是否确认?
-3. **pptx 演讲者备注是否默认带上。** 它常含讲稿正文,信息密度高,
-   但也会显著拉长 `content`。
+初稿把三条留给评审;对照两份参考实现的源码 + 去数之后,三条都定了。
+记在这里是因为**理由比结论重要** —— 将来要翻案得先推翻这里的依据。
+
+### 14.1 Path A 的落点 → **单开 `FIGURE_BLOCK_MARK`**(§8.5)
+
+理由不是「怕挤」,是**过期语义不同**:现有两个标记一个「路径失效」
+一个「内容在说谎」,图这两样都不是 —— 它不过期。套任何一条现成规矩都会
+丢掉还有用的旧图。
+
+### 14.2 渲染页跨轮存活 → **随 run 收(§8.3),但缓存清单**
+
+两份参考实现**都不缓存**转换产物:
+
+- hermes `_temp_copy` 用 `NamedTemporaryFile` 且 `finally: os.unlink`;
+  视觉侧的 `cache/vision` 名为 cache 实为临时目录,用完 `_unlink_quietly`;
+- openclaw 的 `extractionCache` 是 `runPdfPrompt` 的**函数内闭包变量**,
+  只为厂商 fallback 重试时不重复抽取,零跨调用。
+
+RAG 流水线全都缓存,因为**索引本身就是产品**;agent 工具都不缓存,因为
+文档是在一次任务的语境里读一次。**我们是 agent,不是索引器。**
+
+加上两条已经变了的前提,代价比初稿小得多:
+
+1. 清单来自来源侧 OOXML(~1 ms),**不需要转换**;
+2. 转换推迟到**首次渲染请求**(§4)—— 不看图的 run 一秒不花。
+
+**但抄 hermes 一条**:`_describe_image_for_anthropic_fallback` 缓存的是
+**文字描述**(按 `sha256(image_url)` 索引),并在文本里附一个指针
+——「要细看就用这个 ref 重新取」。同构地,我们缓存 **figure map 文本**
+(~1 KB,按文档 sha 索引)并带指针,贵的字节不留。
+
+**上线后量**:同一文档指纹在多少个不同 run 里触发过转换。数大了再加,
+`inputs/cache/` 是现成的内容寻址缓存(B-61 已在回收)。
+
+### 14.3 pptx 演讲者备注 → **抽,但设 500 字/页上限**
+
+去数了:测试环境 **1649 张 slide,带备注的 0 张**(uploads 桶 0/39)。
+
+所以今天成本是零。不抽的话,将来真来一份带讲稿的 deck 又是一次静默丢失。
+与「图表抽成数据」同类:**便宜的保险,不拿它论证收益**。
 
 ---
 
@@ -483,6 +682,13 @@ zip 损坏。**任何一条都不许静默变成「没有图」。**
 | 限流单位 | 页数 | **像素预算** | 像素预算 |
 | 依赖缺失 | ❌ 静默回退 | ✅ 降级告警 | ✅ 三态 |
 | 图表 | ❌ | ❌ | ✅ 抽成数据 |
+| 图进历史的通道 | 工具结果(`_multimodal` 封套) | 工具结果(`ImageContent`) | **尾部 HumanMessage**(协议所迫,§8.1) |
+| 历史里存什么 | base64 大块 | base64 大块 | **URI ref**,字节调用时解析 |
+| 历史滑窗 | ✅ keep 3 + `[image]` 占位 | ✅ keep 3 + `[image removed…]` | ✅ keep 3 + 带恢复指引的占位 |
+| 退役时机 | 压缩时 | **缓存 TTL 到期后** | 缓存 TTL 到期后(抄 openclaw) |
+| 嵌入预算与看图预算分开 | ✅ 256 KB vs 20 MB | ➖ 单一像素预算 | ✅ §7.2 |
+| 估算器认图 | ✅ `image_token_cost` | ✅ `IMAGE_CHAR_ESTIMATE` | ⚠️ **今天不认,Path A 的前置**(§8.6) |
+| 转换产物跨会话缓存 | ❌ | ❌ | ❌(缓存清单文本,§14.2) |
 
 docling(业界最认真的开源解析器)在 docx/pptx 图片这块
 [issue #2225](https://github.com/docling-project/docling/issues/2225) 仍 open:
