@@ -29,6 +29,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.tools.document_figures import (
+    build_figure_inventory_wrapper,
+    render_figure_map,
+)
 from orchestrator.tools.file_ops import (
     _raise_for_error,
     _require_path,
@@ -228,12 +232,32 @@ class ReadDocumentTool:
             seed_files=self.skill_seed_files,
         )
         _raise_for_error(env, tool="read_document")
+
+        # B-64 —— 图清单。**只读 zip 里的 XML(~1 ms),不跑 LibreOffice**:转换
+        # 推迟到模型真的调 ``read_page`` 那一刻(spec § 四)。清单这一段失败绝不
+        # 能拖垮正文 —— 但也绝不能静默降级成「没有图」,所以异常走 undetermined。
+        try:
+            fig_env: Mapping[str, Any] = await run_scoped_read(
+                self.client,
+                build=lambda w: build_figure_inventory_wrapper(rel, ws=w, max_bytes=_MAX_DOC_BYTES),
+                ws=ws,
+                ctx=ctx,
+                tool="read_document",
+                seed_files=self.skill_seed_files,
+            )
+        except Exception:  # 任何失败都只降级到「测不了」,绝不悄悄变成「没有图」
+            fig_env = {"ok": True, "state": "undetermined", "reason": "probe_failed"}
+
+        prefix = render_figure_map(fig_env)
+        body = str(env.get("content", ""))
         return ToolResult(
-            content=str(env.get("content", "")),
+            content=prefix + body,
             meta={
                 "path": rel,
                 "format": env.get("format"),
                 "chars": env.get("chars"),
                 "truncated": bool(env.get("truncated")),
+                "figures": len(fig_env.get("figures") or ()),
+                "figures_state": fig_env.get("state"),
             },
         )
