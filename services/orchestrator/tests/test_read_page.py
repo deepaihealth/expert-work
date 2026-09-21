@@ -25,6 +25,7 @@ from orchestrator.tools.read_page import (
 from orchestrator.tools.registry import ToolContext
 from orchestrator.tools.sandbox import _MAX_EXEC_TIMEOUT_S, RecordingSandboxRuntime, SandboxOutcome
 from orchestrator.tools.workspace_paths import WriteToSharedError
+from orchestrator.tools.workspace_scope import scoped_path, store_scope
 
 
 def _ctx(*, agent_key: str = "") -> ToolContext:
@@ -240,6 +241,26 @@ def test_validate_rendered_rel_rejects_adversarial_input(bad_rel: str) -> None:
 def test_validate_rendered_rel_accepts_a_legitimate_rel() -> None:
     rel = ".tool_results/r1/figures/abc/page-03.jpg"
     assert _validate_rendered_rel(rel) == rel
+
+
+def test_validated_sandbox_rel_lands_correctly_after_agent_scope_translation() -> None:
+    """回修第 1 轮关切 1(裁定:``_validate_rendered_rel`` 保持校验翻译前的
+    沙箱侧 rel,不要在这里第二次认 ``agents/<key>/`` —— 那是
+    ``workspace_scope.scope_parts`` 的活,抄第二份就是本仓的「两份字面量」
+    老病)。这条测试钉住的是**组合**:一个过了 ``_validate_rendered_rel``
+    这道闸的沙箱侧 rel,经 ``store_scope`` + ``scoped_path`` 翻译之后,必须
+    老老实实落在 ``agents/<key>/.tool_results/...`` 里 —— 不越界、不撞
+    ``agents``/``shared`` 保留段,翻译层自己的两道闸(``normalize_workspace_path``
+    + ``_reject_reserved_head``)不会把这条本来合法的路径反而拒了。
+    """
+    sandbox_rel = ".tool_results/r1/figures/abc/page-03.jpg"
+    safe_rel = _validate_rendered_rel(sandbox_rel)
+    assert safe_rel is not None
+
+    scope = store_scope("/workspace", agent_key="pf-probe-33086dc0")
+    host_rel = scoped_path(scope, safe_rel)
+
+    assert host_rel == "agents/pf-probe-33086dc0/.tool_results/r1/figures/abc/page-03.jpg"
 
 
 # ---------------------------------------------------------------------------

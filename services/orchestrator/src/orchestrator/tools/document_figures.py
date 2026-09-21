@@ -42,6 +42,20 @@ MAX_NOTES_CHARS: Final[int] = 500
 #: 这份只是把同一个判断提前搬到控制器侧省一次沙箱往返,两处分叉就会出现「控制器
 #: 说能测但沙箱其实不认」或反过来的不一致。
 SUPPORTED_EXTENSIONS: Final[frozenset[str]] = frozenset({"pptx", "docx", "xlsx", "pdf"})
+#: B-64 回修第 1 轮关切 2 —— read_page **真能渲染**的格式,``SUPPORTED_EXTENSIONS``
+#: 的**子集**。两者回答的是不同的问题:``SUPPORTED_EXTENSIONS`` 是"这个格式的图
+#: 清单能不能分析出来"(判定层,只读 OOXML 结构,零渲染);``RENDERABLE_EXTENSIONS``
+#: 是"这个格式能不能真的转成 jpeg 给模型看"(``read_page`` 的渲染层,走
+#: soffice→pdftoppm)。docx/xlsx 能被分析出清单(在 ``SUPPORTED_EXTENSIONS`` 里),
+#: 但它们的 ``unit`` 语义与页码对不上——pptx/pdf 是 slide/页号,与 pdftoppm 的
+#: ``-f``/``-l`` 页号参数 1:1;docx 是**段落序号**(见下面 ``_docx_inventory`` 的
+#: ``enumerate(paragraphs, 1)``),xlsx 是 sheet 序号,两者都不能直接喂进 pdftoppm,
+#: 所以不在这个集合里(docx 是 Task 4b 要接的临时限制,xlsx 是 spec §9.4 的既定
+#: 结论)。**单一真源**:``read_page.py`` 与本模块的 ``render_figure_map`` 都从这里
+#: import,不许各自再声明一份 —— 本仓已经在这一波里因为"单一真源其实是装的"
+#: (两处独立字面量各写各的)吃过一次亏(见
+#: ``test_supported_extensions_matches_sandbox_dispatch_table`` 治的那次)。
+RENDERABLE_EXTENSIONS: Final[frozenset[str]] = frozenset({"pptx", "pdf"})
 #: PDF 空页判据 —— 字符数低于此判为空页(沿用 hermes 的 PDF_EMPTY_PAGE_CHARS)。
 _PDF_EMPTY_PAGE_CHARS: Final[int] = 20
 #: 空页三重阈值 —— 绝对页数下限。
@@ -340,14 +354,12 @@ def _describe_figure(figure: Mapping[str, Any]) -> str:
     return " ".join(parts)
 
 
-#: B-64 回修 C3 —— ``read_page`` 目前只真正支持 pdf/pptx(见
-#: ``read_page._RENDERABLE_EXTENSIONS``)。下面这句「调用 read_page」的引导
-#: 对 docx/xlsx 是错的:docx 会被 read_page 显式拒绝(临时限制 —— 它的编号是
-#: 段落位置不是页码);xlsx 永远不支持(图表数据已经在 ``chart_data`` 字段
-#: 里)。文案按格式分档,不点名它们该做什么替代动作以外的技术细节。
-#: 与 read_page.py 里的判据各自独立维护——两处都只是"给模型的人话提示",
-#: 分叉的后果只是提示语气不够精确,不是功能性 bug(真正挡渲染的闸只有一处,
-#: 在 read_page.py)。
+#: B-64 回修第 1 轮关切 2 —— "能不能渲染"这件事本身只问
+#: :data:`RENDERABLE_EXTENSIONS`(单一真源,``read_page.py`` 也是从那里
+#: import,不再各写各的格式名单)。下表**只管文案**:对已知不可渲染的格式给
+#: 一句具体理由,不参与"能不能渲染"的判断——docx 会被 ``read_page`` 显式拒绝
+#: (临时限制,Task 4b 会接段落->页码的真实映射);xlsx 永远不支持(图表数据
+#: 已经在 ``chart_data`` 字段里)。两者的"为什么"不一样,文案不能共用。
 _FIGURE_MAP_ACTION_BY_FORMAT: Final[dict[str, str]] = {
     "xlsx": "这些图表的数据已经在上面每条里(chart_data),不需要也不支持用 read_page 去看图。",
     "docx": (
@@ -355,8 +367,13 @@ _FIGURE_MAP_ACTION_BY_FORMAT: Final[dict[str, str]] = {
         "(临时限制,不代表以后也不支持)。"
     ),
 }
-#: pptx / pdf(以及任何未来加入清单支持、但暂未在上表登记的格式)用这句。
+#: 可渲染格式(``RENDERABLE_EXTENSIONS`` 里的)用这句正面引导。
 _DEFAULT_FIGURE_MAP_ACTION: Final = "要看某一处:调用 read_page,传文档路径和上面的编号。"
+#: 不可渲染、但没在 ``_FIGURE_MAP_ACTION_BY_FORMAT`` 登记具体理由的格式兜底用
+#: 这句(今天 ``SUPPORTED_EXTENSIONS - RENDERABLE_EXTENSIONS`` 恰好等于上表的
+#: 键集合,但两张表分开维护——以后加了新的不可渲染格式忘了配文案,不该因此
+#: 悄悄说出"调用 read_page"这种错误建议)。
+_FALLBACK_UNRENDERABLE_ACTION: Final = "这类文档不支持用 read_page 渲染成图。"
 
 
 def render_figure_map(env: Mapping[str, Any]) -> str:
@@ -390,9 +407,11 @@ def render_figure_map(env: Mapping[str, Any]) -> str:
     remaining = total - len(shown)
     if remaining > 0:
         parts.append(f"\n  ...另有 {remaining} 处未列出")
-    action = _FIGURE_MAP_ACTION_BY_FORMAT.get(
-        str(env.get("format") or ""), _DEFAULT_FIGURE_MAP_ACTION
-    )
+    fmt = str(env.get("format") or "")
+    if fmt in RENDERABLE_EXTENSIONS:
+        action = _DEFAULT_FIGURE_MAP_ACTION
+    else:
+        action = _FIGURE_MAP_ACTION_BY_FORMAT.get(fmt, _FALLBACK_UNRENDERABLE_ACTION)
     parts.append(
         "\n这些内容不在上面的文字里。挑你真正需要的那几处 —— 不要把所有页都取一遍。"
         f"\n{action}"

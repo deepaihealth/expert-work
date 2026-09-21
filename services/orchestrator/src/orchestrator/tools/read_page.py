@@ -45,6 +45,7 @@ from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
 from expert_work.protocol.multimodal import WORKSPACE_REF_PREFIX
+from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import SandboxRuntime
@@ -73,12 +74,13 @@ _CONVERT_TIMEOUT_S = 90
 #: pdftoppm 只渲一页,给一个小得多的超时。
 _RENDER_TIMEOUT_S = 30
 
-#: read_page 目前真正能渲染的格式。``unit`` 的含义按格式不同——pptx 是 slide
-#: 号、pdf 是页号,两者与 pdftoppm 的页号参数是 1:1 的;docx 是**段落序号**
-#: (``document_figures.py`` 的 ``enumerate(paragraphs, 1)``),xlsx 是 sheet
-#: 序号,都不能直接喂进 pdftoppm。docx/xlsx 因此显式拒绝而不是当成 pdf/pptx
-#: 硬转——那样只会渲出一堆文不对题的页。
-_RENDERABLE_EXTENSIONS: Final = frozenset({"pdf", "pptx"})
+#: read_page 目前真正能渲染的格式 —— 单一真源在 ``document_figures.py``
+#: (回修第 1 轮关切 2:两处各写一份字面量是本仓已经吃过亏的病,见那边
+#: ``RENDERABLE_EXTENSIONS`` 的 docstring)。``unit`` 的含义按格式不同——pptx
+#: 是 slide 号、pdf 是页号,两者与 pdftoppm 的页号参数是 1:1 的;docx 是
+#: **段落序号**(``document_figures.py`` 的 ``enumerate(paragraphs, 1)``),
+#: xlsx 是 sheet 序号,都不能直接喂进 pdftoppm。docx/xlsx 因此显式拒绝而不是
+#: 当成 pdf/pptx 硬转——那样只会渲出一堆文不对题的页。
 
 #: 明确不支持的格式,各自配一句能说清「为什么」的中文理由——两者的"为什么"
 #: 不一样,文案不能共用同一句。
@@ -262,13 +264,14 @@ def _require_units(args: Mapping[str, Any]) -> list[int]:
 
 def _reject_unrenderable_format(ext: str) -> str | None:
     """``ext``(不带点、小写)能不能渲染;不能就返回拒绝文案,能就 ``None``。"""
-    if ext in _RENDERABLE_EXTENSIONS:
+    if ext in RENDERABLE_EXTENSIONS:
         return None
     reason = _UNSUPPORTED_FORMAT_REASONS.get(ext)
     if reason is not None:
         return reason
     label = f".{ext}" if ext else "(无扩展名)"
-    return f"read_page 不支持 {label} 这种格式 —— 目前只能渲染 pdf / pptx。"
+    renderable = " / ".join(sorted(RENDERABLE_EXTENSIONS))
+    return f"read_page 不支持 {label} 这种格式 —— 目前只能渲染 {renderable}。"
 
 
 def _validate_rendered_rel(rel: object) -> str | None:

@@ -27,6 +27,7 @@ import pytest
 from orchestrator.tools.document_figures import (
     _FIGURE_INVENTORY_MAIN,
     MIN_FIGURE_EDGE_PT,
+    RENDERABLE_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
     build_figure_inventory_wrapper,
     render_figure_map,
@@ -578,3 +579,30 @@ def test_supported_extensions_matches_sandbox_dispatch_table() -> None:
     多认一个格式而控制器不知道,有图的文档会在探测都没跑的情况下被判成
     "没有图",还是静默的。"""
     assert SUPPORTED_EXTENSIONS == _sandbox_dispatch_extensions()
+
+
+# ---------------------------------------------------------------------------
+# B-64 回修第 1 轮关切 2 —— RENDERABLE_EXTENSIONS 是 read_page 真能渲染的格式,
+# 必须是 SUPPORTED_EXTENSIONS(图清单能分析的格式)的子集,而且 read_page.py
+# 不许再自己声明一份同样的字面量。
+# ---------------------------------------------------------------------------
+
+
+def test_renderable_extensions_is_a_subset_of_supported_extensions() -> None:
+    """能真渲染的格式,不可能比"清单能不能分析"这件事知道得更多 —— 一个格式
+    要是清单探测都不认(不在 SUPPORTED_EXTENSIONS 里),就更不该出现在
+    RENDERABLE_EXTENSIONS 里(渲染无从谈起)。"""
+    assert RENDERABLE_EXTENSIONS <= SUPPORTED_EXTENSIONS
+
+
+def test_read_page_imports_renderable_extensions_not_a_second_copy() -> None:
+    """``read_page.py`` 必须直接 import 这个模块的 ``RENDERABLE_EXTENSIONS``,
+    不许自己再声明一份"看起来一样"的 frozenset —— 值相等的两份字面量今天
+    测不出区别,明天改一处忘了改另一处就会静默分叉(本仓这一波已经因为同一
+    类问题吃过一次亏,见上面那条 sandbox dispatch 的测试)。用**对象身份**
+    (``is``,不是 ``==``)断言:即便有人在 read_page.py 里重新声明一份值相同
+    的 frozenset,``==`` 也测不出来,只有身份检查能确认它真的是同一个对象、
+    没有第二处声明。"""
+    from orchestrator.tools import read_page
+
+    assert read_page.RENDERABLE_EXTENSIONS is RENDERABLE_EXTENSIONS
