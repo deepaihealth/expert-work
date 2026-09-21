@@ -1898,7 +1898,8 @@ def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = Non
     内容的哈希**,能给出的事实陈述是:``.tool_results/`` 下这条 ref 从"源文档
     内容 + 页号"派生,同一条 ref 只会是同一份源文档同一页的渲染结果,内容一变
     ref 就变。详见 :func:`~orchestrator.multimodal.is_cacheable_image_ref` 的
-    docstring —— 那里写清了为什么"文件仍可能被重写"与"缓存安全"并不矛盾。
+    docstring —— 那里写清了为什么"文件仍可能被重写"与"缓存安全"并不矛盾,以及
+    这句"只会"的边界(哈希抗碰撞性)到底落在哪儿。
     """
     workspace = NasWorkspaceImageResolver(root=workspace_root) if workspace_root else None
     dispatcher = DispatchingImageResolver(

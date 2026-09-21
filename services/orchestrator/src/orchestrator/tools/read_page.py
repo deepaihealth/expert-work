@@ -44,15 +44,16 @@ jpeg → glob 找产物。三个实测坑写进片段:
    那条 ref 被 :class:`~orchestrator.multimodal.CachingImageResolver` 记住之
    后,文档被覆盖再渲一次,模型看到的还是旧文档那一页 —— 缓存是进程级、没有
    TTL、没有失效通道,这一层的走样比前两层更难发现。修法是把**文件内容的
-   哈希**(片段里算,流式读,因为文件只在沙箱里够得着)拼进产出路径:内容一
-   变,路径就变,缓存与磁盘同时自然失效。相应地,内容没变时重复调用仍然会重
-   新渲染一遍 —— 这是故意的,"已经存在就跳过"会把 4 刚拔掉的竞态原样请回来。
+   哈希**(片段里算,流式读)拼进产出路径:内容一变,路径就变,缓存与磁盘同时
+   自然失效。这句话的边界是 sha256 取前 16 位 hex(64 位)的抗碰撞性,不是别的
+   机制。相应地,内容没变时重复调用仍然会重新渲染一遍 —— 这是故意的,"已经存在
+   就跳过"会把 4 刚拔掉的竞态原样请回来。
 
 落点固定在 :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
 (``.tool_results/``)下,这样渲出来的 ref 才落进
 :func:`orchestrator.multimodal.is_cacheable_image_ref` 认的可缓存子树。完整形状
 是 ``.tool_results/<run_id>/figures/<doc-sha>/<content-sha>/_u<unit>/page-NN.jpg``
-—— 前三段由宿主拼(:meth:`ReadPageTool.call`),后三段由片段拼。
+—— 前四段由宿主拼(:meth:`ReadPageTool.call` 的 ``out_rel``),后三段由片段拼。
 
 **ref 的 ``rel`` 必须是用户根相对,不是沙箱视图相对**(回修 C1)。B-60 之后,
 绑了 agent 的 run 在沙箱里看到的 ``/workspace`` bind 的是
@@ -186,8 +187,9 @@ def _content_sha(full):
     # 产出路径必须跟着**文件内容**走, 不是只跟着路径走(回修第 4 轮 New-I1)。
     # 宿主侧的 out_rel 只按 (run_id, 路径) 算, 同一条路径换了内容拿到的是逐字
     # 相同的产出 rel —— 前三层的洞(pdftoppm 层、soffice 层、缓存层)共享的正
-    # 是这一个前提。内容哈希由片段来算, 因为文件只在沙箱里够得着。
-    # 流式读: 已知上传里有 47.8MB 的 deck, 不能一次读进内存。
+    # 是这一个前提。内容哈希在片段里算, 不在宿主侧算: ReadPageTool 手里只有
+    # SandboxRuntime 这一条通道(没有 workspace store), 够不着这个文件。
+    # 流式读: 上传里见过 47.8MB 的 deck, 不能一次读进内存。
     digest = hashlib.sha256()
     with open(full, "rb") as fh:
         while True:
