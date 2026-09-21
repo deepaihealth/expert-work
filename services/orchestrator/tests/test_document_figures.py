@@ -211,8 +211,42 @@ def test_docx_anchor_is_the_sentence_before_the_figure(tmp_path: Path) -> None:
     assert "glucose trend chart" in env["figures"][0]["anchor"]
 
 
+def test_docx_picture_inside_table_cell_is_reported(tmp_path: Path) -> None:
+    """图片放进表格单元格是最普通的 Word 排版之一 —— ``body.findall(w:p))``
+    只看 ``w:body`` 的直接子节点,单元格里的段落(``w:tbl/w:tr/w:tc/w:p``)
+    永远不会被访问到,于是这份文档会被判成 ``state="none"``,正是本功能要
+    消灭的那类静默降级。"""
+    drawing = _docx_drawing("rId1", "Picture 1", 3657600, 2438400)
+    body = (
+        _docx_text("Intro paragraph before the table.")
+        + "<w:tbl><w:tr><w:tc>"
+        + "<w:p><w:r><w:t>Cell caption mentions the glucose trend chart.</w:t></w:r></w:p>"
+        + drawing
+        + "</w:tc></w:tr></w:tbl>"
+    )
+    _build_docx(tmp_path / "table_pic.docx", body, rels={"rId1": "image1.png"})
+
+    env = _run(tmp_path, "table_pic.docx")
+    assert env["state"] == "figures"
+    assert len(env["figures"]) == 1
+    assert env["figures"][0]["kind"] == "picture"
+
+
 def test_plain_table_is_not_a_figure(tmp_path: Path) -> None:
-    """纯表格零误报 —— 表格是 ``w:tbl``,不是 ``w:drawing``,没有 graphicData。"""
+    """纯表格零误报,加一个「非图片」的 ``wp:inline``(``graphicData`` 的
+    ``uri`` 是文本框而不是图片)—— 这是唯一能让这条测试在拿掉 uri 门时变红
+    的构造:纯表格本身没有 ``graphicData``,拿掉 uri 门也测不出区别;
+    这个非图片 drawing 的 ``docPr``+``extent`` 形状和真图片一模一样,只有
+    uri 门才挡得住它。"""
+    non_picture_drawing = (
+        "<w:p><w:r><w:drawing>"
+        '<wp:inline><wp:extent cx="3657600" cy="2438400"/>'
+        '<wp:docPr id="9" name="TextBox 1"/>'
+        "<a:graphic>"
+        '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"/>'
+        "</a:graphic></wp:inline>"
+        "</w:drawing></w:r></w:p>"
+    )
     body = (
         _docx_text("Table page")
         + "<w:tbl>"
@@ -221,6 +255,7 @@ def test_plain_table_is_not_a_figure(tmp_path: Path) -> None:
         + "<w:tr><w:tc><w:p><w:r><w:t>1-0</w:t></w:r></w:p></w:tc>"
         + "<w:tc><w:p><w:r><w:t>1-1</w:t></w:r></w:p></w:tc></w:tr>"
         + "</w:tbl>"
+        + non_picture_drawing
     )
     _build_docx(tmp_path / "t.docx", body)
 
@@ -386,12 +421,17 @@ def test_pdf_below_both_thresholds_stays_none(tmp_path: Path) -> None:
     assert env["figures"] == []
 
 
-def test_pdf_single_page_stays_none(tmp_path: Path) -> None:
-    """总页数 < 2 直接 none,不管这唯一一页是不是空的。"""
+def test_pdf_zero_pages_stays_none_not_undetermined(tmp_path: Path) -> None:
+    """总页数 < 2 直接 none —— 用 0 页(不是 1 页)来钉这条分支,是唯一能
+    让它在拿掉这条分支时变红的构造:1 页时 ``empty_count`` 最多是 1,
+    天然就够不到 ``_PDF_EMPTY_ABS_MIN=2``,不管这条 ``total < 2`` 分支在不
+    在,1 页文档都会落回 none,分支拿掉也测不出来。0 页文档不一样:拿掉
+    这条分支会让 ``empty_count / total`` 除以 0 崩掉,被上层 ``except
+    Exception`` 接住变成 undetermined —— 这才是这条分支真正防住的差异。"""
     pytest.importorskip("pdfplumber")
-    (tmp_path / "single.pdf").write_bytes(_build_pdf([None]))
+    (tmp_path / "empty.pdf").write_bytes(_build_pdf([]))
 
-    env = _run(tmp_path, "single.pdf")
+    env = _run(tmp_path, "empty.pdf")
     assert env["state"] == "none"
     assert env["figures"] == []
 

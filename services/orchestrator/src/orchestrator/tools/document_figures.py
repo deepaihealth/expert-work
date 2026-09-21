@@ -43,11 +43,10 @@ _PDF_EMPTY_RATIO_MIN: Final[float] = 0.20
 #: 空页三重阈值 —— 绝对页数(不看占比)下限。
 _PDF_EMPTY_ABS_ALWAYS: Final[int] = 10
 
-# In-sandbox inventory body. ``os`` / ``json`` / ``_P`` / ``_resolve`` come from
-# the shared ``_PRELUDE`` (see file_ops). Parser imports are lazy + per-format
-# so a missing library degrades to ``state="undetermined"`` not a crash — the
-# whole point of this task is that "could not tell" must never collapse into
-# "no figures" (see _main below).
+# 沙箱内探测片段的正文。``os`` / ``json`` / ``_P`` / ``_resolve`` 来自共享的
+# ``_PRELUDE``(见 file_ops)。各格式解析库都是按需、分格式惰性 import 的,
+# 缺库降级成 ``state="undetermined"`` 而不是让沙箱崩掉 —— 这个任务的核心
+# 就是「测不了」永远不许悄悄变成「没有图」(见下面的 _main)。
 _FIGURE_INVENTORY_MAIN = """
 
 _PICTURE_URI = "http://schemas.openxmlformats.org/drawingml/2006/picture"
@@ -108,6 +107,21 @@ def _pptx_inventory(full):
     return figures, skipped
 
 
+# 依文档顺序遍历正文段落,含表格单元格里的段落 -- 表格(w:tbl/w:tr/w:tc,
+# 任意嵌套深度)会递归下钻找。碰到一个 w:p 就不再往它内部找更多顶层段落:
+# OOXML 里只有文本框(wp:txbx/w:txbxContent)才能在一个 w:p 里面再嵌一层
+# w:p,而文本框自己的段落不算独立的正文单位 -- 它的说明文字不该被锚点逻辑
+# 当成前文。它里面如果真有图片,不会漏:下面处理每个段落时用的是
+# p.iter(),扫的是整棵子树,不受这层"不算独立单位"限制,文本框内嵌的图片
+# 照样会被宿主段落找到。
+def _docx_flow_paragraphs(elem, p_tag):
+    for child in elem:
+        if child.tag == p_tag:
+            yield child
+        else:
+            yield from _docx_flow_paragraphs(child, p_tag)
+
+
 def _docx_inventory(full):
     import xml.etree.ElementTree as ET
     import zipfile
@@ -127,12 +141,12 @@ def _docx_inventory(full):
 
     with zipfile.ZipFile(full) as zf:
         xml_bytes = zf.read("word/document.xml")
-    root = ET.fromstring(xml_bytes)  # noqa: S314 -- our own zip part, not a network fetch
+    root = ET.fromstring(xml_bytes)  # noqa: S314 -- 自己刚解压的 zip 部件,不是网络抓取
 
     body = root.find(w("body"))
-    paragraphs = body.findall(w("p")) if body is not None else []
+    paragraphs = list(_docx_flow_paragraphs(body, w("p"))) if body is not None else []
 
-    page_w_pt, page_h_pt = 612.0, 792.0  # Letter default -- used when sectPr/pgSz is absent
+    page_w_pt, page_h_pt = 612.0, 792.0  # 拿不到 sectPr/pgSz 时用 Letter 兜底
     sect_pr = next(root.iter(w("sectPr")), None)
     if sect_pr is not None:
         pg_sz = sect_pr.find(w("pgSz"))
@@ -154,10 +168,9 @@ def _docx_inventory(full):
         for container in containers:
             graphic_data = next(container.iter(a("graphicData")), None)
             if graphic_data is None or graphic_data.get("uri") != _PICTURE_URI:
-                # Text boxes / OLE / other wp:inline payloads share the same
-                # docPr+extent shape but a different uri -- skip them so a
-                # text box never gets misreported as a picture (zero false
-                # positives is the point of gating on graphicData at all).
+                # 文本框/OLE/其他 wp:inline 载荷用的是同一套 docPr+extent 形状,
+                # 只是 uri 不一样 —— 挡掉它们,零误报是这道门存在的唯一理由;
+                # 不挡的话一个文本框形状就会被错报成图片。
                 continue
             doc_pr = container.find(wp("docPr"))
             extent = container.find(wp("extent"))
@@ -191,7 +204,7 @@ def _xlsx_inventory(full):
     try:
         figures, skipped = [], 0
         for sheet_idx, ws in enumerate(wb.worksheets, 1):
-            # spec 9.4 -- xlsx never renders pictures; every image is decorative.
+            # spec 9.4 —— xlsx 不渲染图片,所有图片一律按装饰图处理。
             skipped += len(list(getattr(ws, "_images", None) or []))
             for ch in list(getattr(ws, "_charts", None) or []):
                 series = {}
@@ -292,8 +305,7 @@ print(json.dumps(_main()))
 
 
 def build_figure_inventory_wrapper(rel: str, *, ws: str, max_bytes: int) -> str:
-    """Snippet that builds the figure inventory for ``ws/rel`` and prints the
-    JSON envelope described in the module contract."""
+    """沙箱片段:对 ``ws/rel`` 生成图清单,打印模块头部约定的那份 JSON 信封。"""
     return _snippet({"ws": ws, "rel": rel, "max_bytes": max_bytes}, _FIGURE_INVENTORY_MAIN)
 
 
