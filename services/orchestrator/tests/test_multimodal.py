@@ -366,6 +366,19 @@ def test_is_cacheable_image_ref_true_for_non_normalized_agent_scoped_rel(rel_tai
     assert is_cacheable_image_ref(ref) is True
 
 
+def test_is_cacheable_image_ref_true_for_non_normalized_unscoped_rel() -> None:
+    """B-64 回修第 3 轮 Minor-4 —— 上一条 New-4 的回归钉只覆盖了
+    ``agent_key is not None`` 那一支;没绑 agent 时,``is_cacheable_image_ref``
+    仍然直接拿未归一化的 ``parsed.rel`` 字符串去比,没有像绑 agent 那一支一样
+    先用 ``PurePosixPath`` 重新分段。``./.tool_results/...`` 这个 rel 里的
+    ``.`` 段在字符串层面挡在最前面,``str.startswith(".tool_results/")`` 判
+    False;而它真实落在 ``.tool_results/`` 下,归一化之后应当判 True —— 与
+    round-2 的字节长度 bug 是同一类"没把 ``rel`` 归一化就直接用"。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/./.tool_results/r1/page.jpg"
+    assert is_cacheable_image_ref(ref) is True
+
+
 class _CountingResolver:
     """Inner resolver that counts fetches — to prove the cache short-circuits."""
 

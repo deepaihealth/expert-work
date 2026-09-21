@@ -403,14 +403,20 @@ def is_cacheable_image_ref(ref: str) -> bool:
     不上 ``WORKSPACE_OVERFLOW_DIR`` 前缀,只会让判据回落到"不可缓存"这一
     支,不会反向产出错误的 ``True``),纯粹是缓存命中率的问题。改用
     ``PurePosixPath`` 重新分段,按**分段数**砍前两段,不受这类写法影响。
+
+    B-64 回修第 3 轮 Minor-4 —— 上一轮只把 ``agent_key is not None`` 那一支
+    改成了归一化的分段切法,``agent_key is None`` 那一支仍然直接用原始
+    ``parsed.rel`` 字符串。同样没有安全影响(只会让判据偏保守地回落到"不可
+    缓存"),但两支各写一套算法本身就是新的不一致,且不受这条 docstring 的
+    "改用 PurePosixPath 重新分段"这句话覆盖。统一成一个表达式:未绑 agent
+    时跳过的段数是 0,绑了 agent 时是 2(``agents/<agent_key>``),分段数量
+    照样不受 ``.``/``//`` 这类写法影响。
     """
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True
     parsed = parse_workspace_image_ref(ref)
-    if parsed.agent_key is None:
-        tail = parsed.rel
-    else:
-        tail = "/".join(PurePosixPath(parsed.rel).parts[2:])
+    skip = 2 if parsed.agent_key is not None else 0
+    tail = "/".join(PurePosixPath(parsed.rel).parts[skip:])
     return tail == WORKSPACE_OVERFLOW_DIR or tail.startswith(f"{WORKSPACE_OVERFLOW_DIR}/")
 
 

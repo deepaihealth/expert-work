@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import pytest
 
-from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS
+from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS, SUPPORTED_EXTENSIONS
 from orchestrator.tools.read_page import (
     _CONVERT_TIMEOUT_S,
     _RENDER_TIMEOUT_S,
@@ -19,6 +19,7 @@ from orchestrator.tools.read_page import (
     RENDER_DPI,
     ReadPageTool,
     _doc_sha,
+    _require_units,
     _validate_rendered_rel,
     build_render_wrapper,
     workspace_figure_ref,
@@ -322,12 +323,199 @@ def test_wrapper_does_not_pick_a_stale_file_when_a_later_render_succeeds_differe
     assert "round2" in content
 
 
+def _install_flaky_soffice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
+) -> None:
+    """桩 soffice:第一次调用真实成功产出 pdf;第二次(及以后)调用退出码 1、
+    不产任何文件——模拟一次真实的转换失败(回修第 3 轮 Important-1,T1 同形但
+    落在 conv 层)。pdftoppm 桩只是把读到的 pdf 内容原样带进 jpg,这条测试用
+    不到它(第二次调用在到达 pdftoppm 之前就该失败)。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    soffice = bin_dir / "soffice"
+    soffice.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        'outdir = args[args.index("--outdir") + 1]\n'
+        "src = args[-1]\n"
+        "os.makedirs(outdir, exist_ok=True)\n"
+        "base = os.path.basename(src)\n"
+        "name = os.path.splitext(base)[0]\n"
+        f"counter_path = {str(counter_path)!r}\n"
+        "count = 0\n"
+        "if os.path.exists(counter_path):\n"
+        "    count = int(open(counter_path).read().strip() or '0')\n"
+        "count += 1\n"
+        "open(counter_path, 'w').write(str(count))\n"
+        "if count >= 2:\n"
+        "    sys.exit(1)\n"
+        'with open(os.path.join(outdir, name + ".pdf"), "w") as fh:\n'
+        '    fh.write("PDF-OF:VERSION-" + str(count))\n'
+    )
+    pdftoppm = bin_dir / "pdftoppm"
+    pdftoppm.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        'unit = int(args[args.index("-f") + 1])\n'
+        "pdf_path, prefix = args[-2], args[-1]\n"
+        "with open(pdf_path) as fh:\n"
+        "    pdf_content = fh.read()\n"
+        'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
+        '    fh.write(f"JPEG::{pdf_content}")\n'
+    )
+    for script in (soffice, pdftoppm):
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def test_wrapper_does_not_reuse_a_stale_pdf_when_a_later_conversion_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 3 轮 Important-1(T1 同形,落在 conv 层)—— ``out_dir`` 跨调用
+    存活:第一次转换成功留下 ``conv/d.pdf``;第二次对同一个 out_rel 再转同一份
+    文档,这次 soffice 真实失败(非零退出、不产 pdf)。conv 目录如果不在转换
+    前清空,第二次的 glob 会把第一次留下的旧 pdf 当成这次的转换结果报成功——
+    如果这期间 rel 指向的文档已经换了内容,报的就是旧文档的页,不是新文档的
+    页(与 New-2 逐字相同的病,只是换了一层)。第二次必须落进
+    ``convert_failed``,不是 ``ok``。"""
+    counter_path = tmp_path / "soffice_calls"
+    _install_flaky_soffice(tmp_path, monkeypatch, counter_path=counter_path)
+    (tmp_path / "d.pptx").write_text("source")
+    out_rel = ".tool_results/r1/figures/conv1"
+
+    first = _run_render(tmp_path, "d.pptx", units=[1], out_rel=out_rel)
+    assert first["ok"] is True
+
+    second = _run_render(tmp_path, "d.pptx", units=[1], out_rel=out_rel)
+    assert second["ok"] is False
+    assert second["error"] == "convert_failed"
+    assert second["detail"] == "exit=1"
+
+
+def _install_soffice_that_reports_success_without_writing_on_its_second_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, counter_path: Path
+) -> None:
+    """桩 soffice:第一次调用真实成功产出 pdf;第二次调用退出码 **0**(报告
+    成功)却不产出任何文件——模拟一次"报了成功但没真的重写"的转换(真实
+    LibreOffice 也观测到过这种形态)。用来单独证明"转换前清空 conv 目录"这
+    一半修法独立起作用:returncode 检查管不到这种"报成功却没写"的场景,只有
+    清空目录才能让 ``glob`` 在这一轮找不到任何 pdf、从而正确报失败,而不是
+    把第一次的旧 pdf 当成这次的产出。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    soffice = bin_dir / "soffice"
+    soffice.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "args = sys.argv[1:]\n"
+        'outdir = args[args.index("--outdir") + 1]\n'
+        "src = args[-1]\n"
+        "os.makedirs(outdir, exist_ok=True)\n"
+        "base = os.path.basename(src)\n"
+        "name = os.path.splitext(base)[0]\n"
+        f"counter_path = {str(counter_path)!r}\n"
+        "count = 0\n"
+        "if os.path.exists(counter_path):\n"
+        "    count = int(open(counter_path).read().strip() or '0')\n"
+        "count += 1\n"
+        "open(counter_path, 'w').write(str(count))\n"
+        "if count >= 2:\n"
+        "    sys.exit(0)\n"  # 报成功, 但不写文件
+        'with open(os.path.join(outdir, name + ".pdf"), "w") as fh:\n'
+        '    fh.write("PDF-OF:VERSION-" + str(count))\n'
+    )
+    pdftoppm = bin_dir / "pdftoppm"
+    pdftoppm.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        'unit = int(args[args.index("-f") + 1])\n'
+        "pdf_path, prefix = args[-2], args[-1]\n"
+        "with open(pdf_path) as fh:\n"
+        "    pdf_content = fh.read()\n"
+        'with open(f"{prefix}-{unit:02d}.jpg", "w") as fh:\n'
+        '    fh.write(f"JPEG::{pdf_content}")\n'
+    )
+    for script in (soffice, pdftoppm):
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def test_wrapper_does_not_pick_a_stale_pdf_when_a_later_conversion_reports_success_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 3 轮 Important-1(rmtree 那一半,独立于 returncode 检查自证,
+    与 T2 同一房规)—— 第二次 soffice 调用报告成功(退出码 0)却没有真的重写
+    conv 目录里的 pdf。returncode 检查这半段管不到"报了成功却没产出"的场景;
+    只有清空 conv 目录这一半修法能防止 glob 把第一次的旧 pdf 当成这次的转换
+    结果。"""
+    counter_path = tmp_path / "soffice_calls"
+    _install_soffice_that_reports_success_without_writing_on_its_second_call(
+        tmp_path, monkeypatch, counter_path=counter_path
+    )
+    (tmp_path / "d.pptx").write_text("source")
+    out_rel = ".tool_results/r1/figures/conv2"
+
+    first = _run_render(tmp_path, "d.pptx", units=[1], out_rel=out_rel)
+    assert first["ok"] is True
+
+    second = _run_render(tmp_path, "d.pptx", units=[1], out_rel=out_rel)
+    assert second["ok"] is False
+    assert second["error"] == "convert_failed"
+    assert "detail" not in second  # 走的是"没有 pdf"分支,不是 returncode 分支
+
+
+def test_wrapper_reports_a_clean_failure_when_the_unit_dir_is_a_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回修第 3 轮 Minor-3 —— 私有产出目录如果是指向别处的目录符号链接,
+    ``shutil.rmtree(..., ignore_errors=True)`` 拒绝 follow 符号链接、异常被
+    ``ignore_errors`` 吞掉,``os.makedirs(exist_ok=True)`` 对一个符号链接指向
+    的已存在目录也不会报错——"已经清空"这个前提会悄悄落空,旧目录(这里模拟
+    成上一轮/攻击者留下的另一个目录)里的旧文件原样还在,足以让 New-2 的坑
+    以第三种方式重开。必须播报成一次真实失败,不能被 glob 到、当成这次的
+    产出。"""
+    _install_fake_office_binaries(tmp_path, monkeypatch)
+    (tmp_path / "d.pdf").write_text("fake pdf bytes")
+    out_rel = ".tool_results/r1/figures/symlinked"
+    out_dir = tmp_path / out_rel
+    out_dir.mkdir(parents=True)
+    evil_dir = tmp_path / "evil"
+    evil_dir.mkdir()
+    (evil_dir / "page-99.jpg").write_text("STALE-FROM-ELSEWHERE")
+    (out_dir / "_u3").symlink_to(evil_dir, target_is_directory=True)
+
+    env = _run_render(tmp_path, "d.pdf", units=[3], out_rel=out_rel)
+
+    assert env == {
+        "ok": False,
+        "error": "render_failed",
+        "failed": [{"unit": 3, "why": "unit_dir_not_clean"}],
+    }
+    # 旧目录必须原封不动——不能被当成这次的产出改动或删除。
+    assert (evil_dir / "page-99.jpg").read_text() == "STALE-FROM-ELSEWHERE"
+
+
 def test_wrapper_renders_jpeg_not_png() -> None:
     code = build_render_wrapper(
         "d.pptx", units=[1], ws="/workspace", out_rel=".tool_results/r1/figures/s", dpi=RENDER_DPI
     )
     assert "-jpeg" in code
     assert "-png" not in code
+
+
+def test_require_units_deduplicates_preserving_order() -> None:
+    """回修第 3 轮 Important-2 —— ``units=[3, 3]`` 不去重的话,沙箱片段会对同
+    一个 ``_u3`` 目录渲两遍:第一遍成功、把 rel 记进 ``rendered``;第二遍对
+    同一个目录 rmtree,把第一遍的产物删了,这次万一失败,``rendered`` 里躺的
+    就是一条指向已被删除的文件的死 ref(回修第 2 轮 New-2 的 rmtree 修法引入
+    的新回归,实测撞到)。去重必须保序,且不能误伤非重复的 unit。"""
+    assert _require_units({"units": [3, 3]}) == [3]
+    assert _require_units({"units": [1, 2, 1, 3, 2]}) == [1, 2, 3]
 
 
 def test_spec_is_not_read_only() -> None:
@@ -349,8 +537,14 @@ def test_spec_description_derives_renderable_formats_from_the_single_source() ->
     for ext in RENDERABLE_EXTENSIONS:
         assert ext.upper() in description
     # 也不能点名"谁被拒"——那是另一份手写名单,同一个坑换个位置。
-    assert "DOCX" not in description
-    assert "XLSX" not in description
+    # 回修第 3 轮 Minor-1 —— 这里原先是 `assert "DOCX" not in description` /
+    # `assert "XLSX" not in description`,本身就是第二份手写格式名单:给
+    # RENDERABLE_EXTENSIONS 加 "docx" 后,描述会正确地把 DOCX 挪进正面清单,
+    # 这两行会为错误的理由变红(它们守的是"docx 不该出现",而不是"被拒的格式
+    # 不该出现")。改成从 RENDERABLE_EXTENSIONS 派生的差集——谁被拒完全跟着
+    # 单一真源走。
+    for ext in SUPPORTED_EXTENSIONS - RENDERABLE_EXTENSIONS:
+        assert ext.upper() not in description
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +780,40 @@ async def test_rel_rejected_by_validate_rendered_rel_is_not_silently_swallowed()
     assert "第 2 页没取到" in result.content
     assert "不合法" in result.content
     assert len(result.state_updates["viewed_figures"]) == 1
+
+
+@pytest.mark.anyio
+async def test_rejected_rel_with_a_non_int_unit_is_still_reported() -> None:
+    """回修第 3 轮 Minor-2 —— 上一条 New-3 的回归钉传的 unit 是 int;这里换成
+    沙箱回一个字符串形态的 unit(片段被攻破或出了 bug 都可能出现这种形状),
+    证明补救不是只挑 ``isinstance(unit, int)`` 那一支——``_describe_failed_units``
+    只是把 unit 塞进 f-string,任何类型都能渲成一句话。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 1,
+                            "rel": ".tool_results/r1/figures/abc/page-01.jpg",
+                            "bytes": 100,
+                        },
+                        {"unit": "2", "rel": "../../etc/passwd.jpg", "bytes": 100},
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.pptx", "units": [1, 2]}, ctx=_ctx()
+    )
+    assert len(result.state_updates["viewed_figures"]) == 1
+    assert "第 2 页没取到" in result.content
+    assert "不合法" in result.content
 
 
 @pytest.mark.anyio

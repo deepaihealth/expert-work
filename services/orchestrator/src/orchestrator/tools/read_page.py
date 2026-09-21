@@ -18,14 +18,25 @@ jpeg → glob 找产物。三个实测坑写进片段:
    先渲第 21 页、再请求第 1 页,``page-*1.jpg`` 这种兜底模式同时命中
    ``page-01.jpg`` 与 ``page-21.jpg``)。每个 unit 因此有自己的私有产出子目
    录,那里面只可能有这个 unit 刚产出的那一个文件。
-4. **私有产出目录必须在渲染前清空**(回修第 2 轮 New-2)—— 3 里的私有目录
-   只挡跨 unit 混淆,挡不住"同一个 unit 被重渲染、这一次失败了"这种情况:
-   ``out_dir`` 跨调用存活,旧文件还在目录里;第二次 ``pdftoppm`` 非零退出、
-   没产新文件,glob 会把上一次的旧文件当成这次的产出报成功(实测撞到:同一
-   个 rel 指向的文档在同一个 run 里被换过内容之后,这条路会把旧文档的页报成
-   新文档的页——一次真实的渲染失败被翻译成了成功)。渲染前
-   ``shutil.rmtree`` 再 ``makedirs``,并且接住 ``subprocess.run`` 的返回码,
-   非零直接算失败,不再只靠"有没有产出文件"去反推。
+4. **私有产出目录必须在渲染前清空**(回修第 2 轮 New-2,回修第 3 轮
+   Important-1 扩到 soffice 那一层)—— 3 里的私有目录只挡跨 unit 混淆,挡不
+   住"同一个目录被重用、这一次失败了"这种情况:``out_dir`` 跨调用存活,旧
+   文件还在目录里;这一次的子进程非零退出、没产新文件,glob 会把上一次的
+   旧文件当成这次的产出报成功(实测撞到:同一个 rel 指向的文档在同一个
+   run 里被换过内容之后,这条路会把旧文档的页报成新文档的页——一次真实
+   的失败被翻译成了成功)。**片段里每一处 ``subprocess.run``、每一处"靠有
+   没有产出文件反推成功"的地方都要过这道闸**——不是只堵复审那一轮指出的
+   那一行:``soffice``/``_pdf`` 转换目录和 ``pdftoppm``/单 unit 目录各自
+   独立,回修第 2 轮只堵了后者,前者原样开着直到第 3 轮才补上。渲染/转换前
+   先 ``shutil.rmtree`` 再 ``makedirs``,并且接住 ``subprocess.run`` 的返回
+   码,非零直接算失败,不再只靠"有没有产出文件"去反推。
+5. **清空本身也可能悄悄没生效**(回修第 3 轮 Minor-3)—— ``shutil.rmtree``
+   配 ``ignore_errors=True`` 会吞掉"目标是指向别处的目录符号链接"这类错误
+   (rmtree 拒绝 follow 符号链接),而 ``os.makedirs(exist_ok=True)`` 对一个
+   符号链接指向的已存在目录不会报错,于是"已经清空"这个前提会悄悄落空,
+   4 里的两道闸也就失去了意义。清空 + 重建之后必须再确认
+   ``not (islink or listdir)``,不干净就当一次真实失败播报,不能当没看见
+   继续往下走。
 
 落点固定在 :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
 (``.tool_results/``)下,这样渲出来的 ref 才落进
@@ -136,6 +147,9 @@ _FAILED_UNIT_REASONS: Final[dict[str, str]] = {
     #: 回修第 2 轮 New-3 —— 沙箱回报的 rel 没过 _validate_rendered_rel 这道
     #: 闸(见该函数 docstring),不能被 call() 悄悄吞掉。
     "rejected_rel": "产出路径不合法,已丢弃",
+    #: 回修第 3 轮 Minor-3 —— 私有产出目录清空后仍不干净(符号链接被
+    #: rmtree 悄悄跳过,或残留文件删不掉),不能当没看见继续往下走。
+    "unit_dir_not_clean": "这一页的临时产出目录没能清空,为安全起见跳过了",
 }
 
 
@@ -146,6 +160,19 @@ _RENDER_MAIN = """
 import glob as _glob
 import shutil
 import subprocess
+
+
+def _fresh_dir(path):
+    # 清空 + 重建, 并确认真的清干净了(回修第 3 轮 Minor-3)—— shutil.rmtree
+    # 配 ignore_errors=True 会静默吞掉"path 是指向别处的目录符号链接"这类
+    # 错误(rmtree 拒绝 follow 符号链接), 而 os.makedirs(exist_ok=True) 对一个
+    # 符号链接指向的已存在目录不会报错, 于是"这里已经清空"这个前提会悄悄落
+    # 空, 后面的 subprocess/glob 全部建在这个前提之上。返回 False 时调用方
+    # 必须把它当一次真实失败播报, 不能当没看见继续往下走(否则又是 New-2/
+    # Important-1 那个坑的第三次重演)。
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+    return not (os.path.islink(path) or os.listdir(path))
 
 
 def _main():
@@ -167,16 +194,30 @@ def _main():
         pdf = full
     else:
         # 每次转换自己的 outdir —— soffice 的输出名按 basename 派生, 同目录里
-        # x.docx 与 x.pptx 会互相静默覆盖(实测撞到过)。
+        # x.docx 与 x.pptx 会互相静默覆盖(实测撞到过)。渲染前先清空再建、并
+        # 确认清空真的生效(回修第 3 轮 Important-1 —— 与下面 unit_dir 同一
+        # 个坑, New-2 那一轮只堵了 pdftoppm 那一层, soffice/conv 这一层原样
+        # 开着:out_dir 跨调用存活, 不清空的话上一轮的旧 pdf 还在, 这一轮
+        # soffice 真失败(非零退出、不产 pdf)时 glob 会把旧 pdf 当成这一轮的
+        # 转换结果, 把转换失败报成了成功, 返回旧文档的页)。
         conv = os.path.join(out_dir, "_pdf")
-        os.makedirs(conv, exist_ok=True)
+        if not _fresh_dir(conv):
+            return {"ok": False, "error": "convert_failed", "detail": "conv_dir_not_clean"}
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["soffice", "--headless", "--norestore", "--convert-to", "pdf",
                  "--outdir", conv, full],
                 capture_output=True, timeout=_P["convert_timeout_s"], check=False)
         except Exception as exc:
             return {"ok": False, "error": "convert_failed", "detail": type(exc).__name__}
+        # 非零退出码本身就是失败信号(回修第 3 轮 Important-1)——不能只靠
+        # "有没有产出 pdf"去反推 soffice 是不是真的成功了。
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": "convert_failed",
+                "detail": "exit=" + str(result.returncode),
+            }
         pdfs = _glob.glob(os.path.join(conv, "*.pdf"))
         if not pdfs:
             return {"ok": False, "error": "convert_failed"}
@@ -186,15 +227,16 @@ def _main():
     for unit in _P["units"]:
         # 每个 unit 自己的私有产出目录(回修 C2)—— out_dir 跨调用累积, 一个
         # 只按 unit 数字子串匹配的 glob 会把其它 unit 的残留产物错当成这一页。
-        # 渲染前先清空再建(回修第 2 轮 New-2)——私有目录本身只挡跨 unit 混淆,
-        # 挡不住"同一个 unit 被重渲染、这一次失败了"这种情况:不清空的话旧
-        # 文件还在, 这次 pdftoppm 就算失败也会被 glob 到上一次的旧文件, 把
-        # 渲染失败报成了成功(实测撞到)。清空之后, 私有目录里才真的只可能
-        # 有这个 unit 这一次刚产出的那一个文件, glob 不需要也不许带 unit
-        # 后缀约束。
+        # 渲染前先清空再建、并确认清空真的生效(回修第 2 轮 New-2 + 第 3 轮
+        # Minor-3)——私有目录本身只挡跨 unit 混淆, 挡不住"同一个 unit 被重
+        # 渲染、这一次失败了"这种情况:不清空的话旧文件还在, 这次 pdftoppm
+        # 就算失败也会被 glob 到上一次的旧文件, 把渲染失败报成了成功(实测
+        # 撞到)。清空之后, 私有目录里才真的只可能有这个 unit 这一次刚产出
+        # 的那一个文件, glob 不需要也不许带 unit 后缀约束。
         unit_dir = os.path.join(out_dir, "_u" + str(unit))
-        shutil.rmtree(unit_dir, ignore_errors=True)
-        os.makedirs(unit_dir, exist_ok=True)
+        if not _fresh_dir(unit_dir):
+            failed.append({"unit": unit, "why": "unit_dir_not_clean"})
+            continue
         prefix = os.path.join(unit_dir, "page")
         try:
             result = subprocess.run(
@@ -283,7 +325,12 @@ def _require_units(args: Mapping[str, Any]) -> list[int]:
             msg = "read_page 'units' must be a list of positive integers"
             raise ValueError(msg)
         units.append(value)
-    return units
+    # 回修第 3 轮 Important-2 —— 保序去重。重复 unit 会对同一个 _u<unit> 目录
+    # 渲两遍:第一遍成功、把 rel 记进 rendered;第二遍对同一个目录 rmtree,把
+    # 第一遍的产物删了,这次万一失败,rendered 里躺的就是一条指向已被删除的
+    # 文件的死 ref(New-2 的 rmtree 修法引入的新回归,实测撞到)。去重顺带
+    # 不浪费 MAX_PAGES_PER_CALL 的页数预算。
+    return list(dict.fromkeys(units))
 
 
 def _reject_unrenderable_format(ext: str) -> str | None:
@@ -477,8 +524,11 @@ class ReadPageTool:
             unit = item.get("unit")
             safe_rel = _validate_rendered_rel(item.get("rel"))
             if safe_rel is None:
-                if isinstance(unit, int) and not isinstance(unit, bool):
-                    rejected.append({"unit": unit, "why": "rejected_rel"})
+                # 回修第 3 轮 Minor-2 —— 无条件记账,不只挑 unit 是 int 的那
+                # 一支:沙箱回一个字符串/None 形态的 unit 时,New-3 想堵的沉默
+                # 失败原样保留。_describe_failed_units 只是把 unit 塞进
+                # f-string,任何类型都能渲成一句话。
+                rejected.append({"unit": unit, "why": "rejected_rel"})
                 continue
             host_rel = scoped_path(scope, safe_rel)
             refs.append(workspace_figure_ref(ctx.tenant_id, ctx.user_id, host_rel))
