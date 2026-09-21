@@ -437,9 +437,10 @@ def _require_units(args: Mapping[str, Any]) -> list[int]:
     # build_render_wrapper 自己执行前置条件挡掉(回修第 4 轮 审计 B),那才是
     # 无论谁来调都成立的那一道。
     #
-    # 这里保留去重是为另外两件事,都只在工具这一层有意义:
-    #   1. 页数预算 —— [3, 3] 不该吃掉 MAX_PAGES_PER_CALL 里的两页;
-    #   2. 页号播报 —— "已渲染 …… 第 X、Y 页"那句话要报对,不能重复报同一页。
+    # 这里保留去重只为**一件**事:页数预算 —— [3, 3] 不该吃掉 MAX_PAGES_PER_CALL
+    # 里的两页。M-4 换上来的第二条理由("页号播报要报对")经实测是假的:把这一层
+    # 的去重拿掉,build_render_wrapper 自己那一道仍然只把 [3] 喂给片段,播报照样
+    # 只报一次。**写一个假理由和写一个错理由是同一件事**,所以它被删掉而不是保留。
     return list(dict.fromkeys(units))
 
 

@@ -1891,15 +1891,25 @@ def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = Non
     the next overwrite. ``is_cacheable_image_ref`` is what keeps that class of
     ref out of the cache.
 
-    B-64 回修第 4 轮 New-I1 —— 这里原来管渲染落点叫 **write-once**,而那个前提
-    当时不成立(产出路径只按文档**路径**算,同一条路径换了内容拿到逐字相同的
-    ref,渲染又是原地重写;这个缓存是进程级、无 TTL、无失效通道,于是"文档被
-    覆盖之后模型仍然读到旧文档那一页"端到端跑得通)。现在产出路径里带了**文档
-    内容的哈希**,能给出的事实陈述是:``.tool_results/`` 下这条 ref 从"源文档
-    内容 + 页号"派生,同一条 ref 只会是同一份源文档同一页的渲染结果,内容一变
-    ref 就变。详见 :func:`~orchestrator.multimodal.is_cacheable_image_ref` 的
-    docstring —— 那里写清了为什么"文件仍可能被重写"与"缓存安全"并不矛盾,以及
-    这句"只会"的边界(哈希抗碰撞性)到底落在哪儿。
+    B-64 回修第 4/5 轮 —— 这里原来管渲染落点叫 **write-once**,而那个前提当时
+    不成立(产出路径只按文档**路径**算,同一条路径换了内容拿到逐字相同的 ref,
+    渲染又是原地重写;这个缓存是进程级、无 TTL、无失效通道,于是"文档被覆盖
+    之后模型仍然读到旧文档那一页"端到端跑得通)。
+
+    现在的事实陈述有两半,都别再简写成一句 write-once:
+
+    1. **判据认的是路径形状,不是 ``.tool_results/`` 这个目录。** 落在那个目录下
+       不再蕴含任何东西 —— 第 5 轮拆掉的正是那张目录通行证(``write_file`` 对
+       ``.tool_results/evil.jpg`` 是放行的,模型自己就是第三个写入者)。
+    2. **形状认下来的那条 rel,是从"渲染输入 + 页号"派生的**,不是从"源文档
+       内容 + 页号"—— 渲染输入含源文档字节与 dpi。源文档一变 rel 就跟着变,
+       缓存条目自然失效而不是被悄悄覆盖。
+
+    这不是"只会"级别的绝对保证,它有已知边界(取哈希与真正渲染之间的 TOCTOU
+    窗口、64 位摘要在对抗场景下约 2^32 的生日界、以及不在哈希里的沙箱渲染工具链
+    版本)。边界逐条写在
+    :func:`~orchestrator.multimodal.is_cacheable_image_ref` 的 docstring 里,
+    那里同时解释了为什么"文件仍可能被重写"与"缓存安全"并不矛盾。
     """
     workspace = NasWorkspaceImageResolver(root=workspace_root) if workspace_root else None
     dispatcher = DispatchingImageResolver(

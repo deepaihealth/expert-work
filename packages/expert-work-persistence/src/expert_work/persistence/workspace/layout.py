@@ -128,7 +128,9 @@ _RENDERED_FIGURE_RE = re.compile(
     + re.escape(RENDERED_FIGURE_UNIT_PREFIX)
     + "[1-9][0-9]*/"
     + re.escape(RENDERED_FIGURE_PAGE_STEM)
-    + r"-[0-9]+\.jpg$"
+    # ``\Z`` 不是 ``$``:后者在 Python 里也匹配结尾的换行,``page-1.jpg\n``
+    # 会被判成合法形状。今天被更早一层的扩展名校验挡住,这里只是纵深防御。
+    + r"-[0-9]+\.jpg\Z"
 )
 
 

@@ -866,6 +866,28 @@ async def test_units_at_the_cap_is_not_refused() -> None:
 
 
 @pytest.mark.anyio
+async def test_duplicate_units_do_not_eat_the_page_budget() -> None:
+    """末轮 M-a —— ``_require_units`` 去重**唯一**真实的理由,是行为级的。
+
+    ``[1, 1, 2, 2]`` 字面是 4 项、超过 ``MAX_PAGES_PER_CALL == 3``,但它实际只要
+    两页,必须放行。M-4 当初给这层去重写的第二条理由(「页号播报要报对」)经实测
+    是假的 —— 播报由 ``build_render_wrapper`` 自己那道去重保障,把这一层拿掉也
+    只报一次。所以这条测试守的是**剩下那条真理由**,而在它之前,两条理由一条
+    都没有行为级测试咬住。
+    """
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps({"ok": True, "rendered": []}), stderr="", exit_code=0, timed_out=False
+        )
+    )
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.pptx", "units": [1, 1, 2, 2]}, ctx=_ctx()
+    )
+    assert "一次最多" not in result.content
+    assert len(runtime.execs) == 1
+
+
+@pytest.mark.anyio
 async def test_rendered_pages_become_refs_in_state() -> None:
     runtime = RecordingSandboxRuntime(
         SandboxOutcome(
