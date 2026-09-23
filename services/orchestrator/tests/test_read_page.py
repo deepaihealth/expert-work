@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 from uuid import uuid4
@@ -100,7 +101,10 @@ def test_internal_render_budget_fits_under_the_exec_timeout_cap() -> None:
 def _stub_source(*, binary: str, preamble: str, body: str) -> str:
     return (
         (
-            "#!/usr/bin/env python3\n"
+            # 绝对解释器路径,不走 ``env python3``(回修第 2 轮 Minor-3):有测试会把
+            # PATH 收窄到只剩桩目录来模拟"沙箱里没装某个工具",那时 ``env`` 连
+            # python3 都找不到,桩会以非零退出,红出一个与被测行为无关的原因。
+            f"#!{sys.executable}\n"
             "import os, sys\n"
             "\n"
             "args = sys.argv[1:]\n"
@@ -1107,10 +1111,19 @@ def test_docx_page_resolvers_use_the_short_timeout(
     ``test_internal_render_budget_fits_under_the_exec_timeout_cap`` 只对两个常量
     做算术:把片段里的 ``render_timeout_s`` 换回 ``convert_timeout_s``,那条算术
     照样成立、**全套全绿** —— 实测变异存活过一次,是一条重言式。真正咬得住的是
-    行为:把两个 timeout 拉开成 1s / 60s,再让这个桩睡 3 秒 —— 用短的会超时并
-    具名失败,用长的会若无其事地跑完。
+    行为:把两个 timeout 拉开,再让这个桩睡到**夹在两者中间**的时长 —— 用短的
+    会超时并具名失败,用长的会若无其事地跑完。
+
+    回修第 2 轮 I-A —— 余量必须给足。第一版用的是 ``render=1s`` + ``sleep(3)``,
+    ``[pdfimages]`` 那一档因此要求**先跑的 pdftotext 桩在 1 秒内跑完**;实测桩
+    启动 median 18ms 但 **max 2.039s**,尾巴本身就超预算。串行与 ``-n 4`` 都绿,
+    单文件 ``-n 8`` 下**六次全红**(报成 ``pdftotext_failed``)。CI 跑的是
+    ``-n auto``,核数一变就会开始间歇性假红 —— 而本仓每一次假红都要有人去分辨
+    它是证人还是病人,这条又恰恰埋在本轮最重要的行为钉上。
+    ``render=5s``(中位数的 280 倍)、``sleep(30)``、``convert=60s``:
+    慢桩仍夹在 ``5 < 30 < 60`` 中间,杀变异能力一点不减。
     """
-    slow = "import time\ntime.sleep(3)\n"
+    slow = "import time\ntime.sleep(30)\n"
     bodies: dict[str, str] = {
         "pdftotext": _pdftotext_pages("Cover page body text.", _ANCHOR_ONE),
         "pdfimages": _pdfimages_rows([(2, *_BIG_ROW)]),
@@ -1130,10 +1143,145 @@ def test_docx_page_resolvers_use_the_short_timeout(
         units=[2],
         out_rel=".tool_results/r1/figures/s",
         convert_timeout_s=60,
-        render_timeout_s=1,
+        render_timeout_s=5,
     )
 
     assert env == {"ok": False, "error": expected_error}
+
+
+# ---------------------------------------------------------------------------
+# 回修第 2 轮 I-C —— 邻域里的行先**归因**再数。
+#
+# 不归因的话,一份「一页一张图」的普通报告(体检报告、趋势图册、图文教程都是
+# 这个形状)3 张里会有 2 张挂上歧义 note,而 3 张的页号**全是对的**。代价两层:
+# note 劝模型再取一页,单 run 像素预算(≈10 页 @100dpi)被砍掉近一半;更坏的是
+# **一条常响的警告不是警告** —— 模型学会忽略它之后就绕一圈回到「该有信号处无信号」。
+# ---------------------------------------------------------------------------
+
+
+def test_docx_one_figure_per_page_report_is_quiet_and_correct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一页一图三连:三处都必须**页号对**且**不响 note**。
+
+    每一页上那一行,都能被清单里"锚点页正好是这一页"的那条条目解释掉,所以对
+    相邻的那一处图来说它不是"来历不明的第二张图"。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Alpha caption one.", "Beta caption two.", "Gamma three."),
+        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW), (2, *_BIG_ROW), (3, *_BIG_ROW)]),
+    )
+    _write_docx(
+        tmp_path / "d.docx",
+        _para("Alpha caption one."),
+        _figure(),
+        _para("Beta caption two."),
+        _figure(),
+        _para("Gamma three."),
+        _figure(),
+    )
+
+    got = {}
+    for unit, out in ((2, "a"), (4, "b"), (6, "c")):
+        env = _run_render(tmp_path, "d.docx", units=[unit], out_rel=f".tool_results/r1/f/{out}")
+        assert env["ok"] is True, unit
+        item = env["rendered"][0]
+        got[unit] = (item["page"], item.get("note"))
+
+    assert got == {2: (1, None), 4: (2, None), 6: (3, None)}, (
+        f"一页一图的普通报告不该响歧义 note、页号也不该错:{got}"
+    )
+
+
+def test_docx_scenario_b_now_pins_the_next_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """场景 B 升级:锚点页那一行被**别的清单条目**认领光,目标图就钉到下一页。
+
+    文档:第 1 段文字 + 第 2 段图 A(锚点页 1),第 3 段文字 + 第 4 段图 B
+    (锚点页 1,排版把它挤到了第 2 页)。PDF 第 1 页一行(A)、第 2 页一行(B)。
+    问 B:第 1 页那一行归 A,剩下第 2 页那一行 —— 钉第 2 页,不响 note。
+    这一档上一轮是"渲锚点页 + 披露",现在是**渲对页**。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Figure A caption. Figure B caption.", "Overflow page."),
+        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW), (2, *_BIG_ROW)]),
+    )
+    _write_docx(
+        tmp_path / "d.docx",
+        _para("Figure A caption."),
+        _figure(),
+        _para("Figure B caption."),
+        _figure(),
+    )
+
+    env = _run_render(tmp_path, "d.docx", units=[4], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2, "锚点页那一行已归属别的条目,页号该落到下一页"
+    assert "note" not in item
+
+
+def test_docx_unexplained_row_next_to_an_explained_one_still_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """归因只吃掉**能解释的**那些行:同一页上混着一行被认领、一行没被认领时,
+    那一页仍然算"还剩着行",歧义 note 照响。
+
+    文档:第 1 段文字 + 第 2 段图 A(锚点页 1),第 3 段文字 + 第 4 段图 B(锚点页 2)。
+    PDF:第 1 页 1 行,第 2 页 **2** 行(B 的 + 一张没人认领的抬头图)。
+    问 A(锚点页 1):第 1 页剩 1 行;第 2 页 2 行只有 1 行归 B,还剩 1 行 ——
+    两页都剩着 → 响 note。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Figure A caption.", "Figure B caption."),
+        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW), (2, *_BIG_ROW), (2, *_BANNER_ROW)]),
+    )
+    _write_docx(
+        tmp_path / "d.docx",
+        _para("Figure A caption."),
+        _figure(),
+        _para("Figure B caption."),
+        _figure(),
+    )
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 1
+    assert item["note"] == "figure_page_ambiguous_fallback"
+
+
+def test_docx_two_rows_on_one_page_do_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一页上剩两行**不**响 note(回修第 2 轮 Minor-1 的措辞对应的行为)。
+
+    页号在两种解释下是同一个,没有"哪一页"的歧义可言 —— 判据是"还有几**页**
+    剩着行",不是"指认唯不唯一"。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages(_ANCHOR_ONE, "Second page."),
+        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW), (1, *_BIG_ROW)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 1
+    assert "note" not in item
 
 
 def test_docx_unmeasurable_rows_are_kept_not_dropped(
@@ -1407,6 +1555,24 @@ def test_docx_without_the_page_resolvers_is_a_clean_failure(
     assert env["ok"] is False
     assert env["error"] == "docx_resolver_missing"
     assert env["detail"] == "pdfimages"
+
+
+def test_pdf_input_does_not_need_soffice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.pdf`` 输入一次都不调 soffice,不该被那道闸拦下(回修第 2 轮 Minor-3)。
+
+    这道闸原来是无条件的:沙箱里没装 soffice 时,连纯 PDF 也会回
+    ``soffice_missing``。M-4 那条"缺 soffice 换格式也没用"的立论正是建在这上面 ——
+    它当时只是**恰好**为真。收窄成只在真要转换时才检查,那句话才真的成立。
+    """
+    bin_dir = _install_office_stubs(tmp_path, monkeypatch)
+    (bin_dir / "soffice").unlink()
+    (tmp_path / "d.pdf").write_text("fake pdf bytes")
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    env = _run_render(tmp_path, "d.pdf", units=[3], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True, f"纯 PDF 被 soffice 闸拦下了:{env}"
+    assert env["rendered"][0]["rel"].endswith("page-03.jpg")
 
 
 def test_docx_that_cannot_be_parsed_is_a_named_failure(
@@ -2095,6 +2261,51 @@ async def test_docx_ambiguous_page_fallback_is_told_to_the_model() -> None:
     assert "第 4 处(文档第 2 页)" in result.content
     assert "没法确定哪一张是你要的" in result.content
     assert "再取下一页" in result.content
+
+
+@pytest.mark.anyio
+async def test_named_per_unit_reasons_are_not_prefixed_by_the_generic_guess() -> None:
+    """有逐条**具名**原因时,不许拿 ``render_failed`` 那句泛化猜测开头
+    (回修第 2 轮 A)。
+
+    实测形状:一份带目录页的 docx,所有 unit 都撞 ``anchor_ambiguous``,模型读到的
+    第一句却是"大概率是页码超出了文档实际页数",真原因排在它后面 —— 把一个错归因
+    摆在真原因前面,与这个 feature 要消灭的东西同形。
+    """
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": False,
+                    "error": "render_failed",
+                    "failed": [{"unit": 2, "why": "anchor_ambiguous", "anchor": "血糖趋势"}],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [2]}, ctx=_ctx())
+    assert "页码超出" not in result.content
+    assert "不止出现在一页" in result.content
+    assert "血糖趋势" in result.content
+
+
+@pytest.mark.anyio
+async def test_generic_guess_still_shows_when_there_is_no_named_reason() -> None:
+    """反面:``failed`` 为空时那句泛化解释仍然要出现 —— 收窄的是"有真原因时别插队",
+    不是把它删掉。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps({"ok": False, "error": "render_failed"}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [99]}, ctx=_ctx())
+    assert "页码超出" in result.content
 
 
 @pytest.mark.anyio

@@ -72,7 +72,8 @@ jpeg → glob 找产物。三个实测坑写进片段:
       分隔;把页文本与清单里的 ``anchor``(图**正上方**那段文字的尾部 60 字符)
       都做空白归一化再找包含关系。``anchor`` 落在页底时图会被挤到下一页,
       所以这一步只给"含 anchor 的那一页或紧邻的下一页"这个**邻域**,不给答案。
-   b. **``pdfimages -list`` 把页钉死**:取邻域内、页号最小的那一行位图所在的页。
+   b. **``pdfimages -list`` 把页钉死**:邻域内的位图行先**归因**(见下),剩下
+      还解释不掉的行落在哪一页,哪一页就是答案。
 
    两步是组合不是二选一:只用 a 会在页边界上错一页;只用 b 对不上是**哪一处**
    图(清单跳过了装饰图,序号对不齐)。b 这一步还要按与清单**同一条**尺寸阈值
@@ -89,23 +90,38 @@ jpeg → glob 找产物。三个实测坑写进片段:
    ``anchor_not_found`` / ``anchor_ambiguous`` / ``unit_not_in_inventory``
    四种(见 :data:`_FAILED_UNIT_REASONS`)。
 
-   **邻域里有行、但指认不唯一时,渲锚点页 + 带保留意见**(见
-   :data:`_RENDER_NOTE_REASONS`)。note 的判据是「邻域里的位图**能不能唯一指认**
-   这一处图」,不是「邻域里**有没有**位图」—— 后者会让抬头 banner 那一档结构性地
-   不触发任何提示。两种 note:
+   **归因:一页上的行先让别的清单条目认领**(回修第 2 轮 I-C)。片段手里有
+   **整份**清单,所以每条条目自己的锚点页都算得出来;页 ``p`` 上的行,凡是有
+   另一条条目的锚点页正好是 ``p``,就先归它。剩下"解释不掉"的行才算可能是
+   这一处图。
 
-   * ``anchor_only_fallback`` —— 邻域内一行位图都没有。多半是 EMF/WMF 这类矢量
-     图片被 LibreOffice 渲成了 PDF 矢量算子(``pdfimages`` 看不见矢量)。
-   * ``figure_page_ambiguous_fallback`` —— 锚点页与下一页**都**有存活行
-     (抬头 banner 每页一份,或锚点页本来就还有别的图)。
+   没有这一步的话,警报会常响到失去意义:实测一份"一页一张图"的普通报告
+   (3 页 3 图),**3 张里 2 张**挂上歧义 note,而 3 张的页号**全是对的**。
+   体检报告、趋势图册、图文教程都是这个形状。代价有两层 —— note 劝模型再取
+   一页,单 run 像素预算(≈10 页 @100 dpi)被砍掉近一半;更坏的是**一条常响
+   的警告不是警告**,模型学会忽略它之后,就绕一圈回到了"该有信号处无信号"。
 
-   **已知残留,这条路不保证总是对**。歧义 note 挡住的是"邻域两页都有行";
-   剩下的那一档是「**邻域里恰好只有一页有存活行,而那一行不是目标图**」——
-   指认看起来"唯一",于是渲出那一页、**不带任何 note**,而它并不含目标图。
+   **归因之后仍然剩两页有行时,渲锚点页 + 带保留意见**(见
+   :data:`_RENDER_NOTE_REASONS`)。判据是「归因之后**还有几页**剩着解释不掉的
+   行」,不是「邻域里**有没有**位图」—— 后者会让抬头 banner 那一档结构性地不触发
+   任何提示。同一页上剩两行**不**触发:页号在两种解释下是同一个,没有歧义可言。
+   两种 note:
+
+   * ``anchor_only_fallback`` —— 邻域里没有能归给这一处图的行:可能一行都没有
+     (EMF/WMF 这类矢量图片被 LibreOffice 渲成了 PDF 矢量算子,``pdfimages``
+     看不见矢量),可能行全被别的条目认领了,也可能这处图排到了邻域之外的页上。
+   * ``figure_page_ambiguous_fallback`` —— 锚点页与下一页**都**还剩着解释不掉的
+     行(抬头 banner 每页一份是最常见的成因)。
+
+   **已知残留,这条路不保证总是对**。歧义 note 挡住的是"两页都还剩着行";
+   剩下的那一档是「**邻域里恰好只有一页剩着行,而那一页上剩的行都不是目标图**」——
+   看起来指认唯一,于是渲出那一页、**不带任何 note**,而它并不含目标图。
    目标图是矢量(``pdfimages`` 看不见)时两个方向都成立:
 
-   * 目标图在锚点页、下一页恰有别的位图 → 渲下一页;
-   * 目标图被挤到下一页、锚点页恰有别的位图 → 渲锚点页。
+   * 目标图在锚点页、下一页恰有别的(未被认领的)位图 → 渲下一页;
+   * 目标图被挤到下一页、锚点页恰有别的(未被认领的)位图 → 渲锚点页。
+
+   归因把这一档变窄了(能被别的条目认领的行不再参与),**没有消灭它**。
 
    本地没有信号能把这两种情形与"目标图确实是那一页上那张位图"分开 —— 后者
    正是 b 要修的那一档,判据完全相同。所以这里不猜,也不假装它被消灭了。
@@ -228,6 +244,11 @@ _ERROR_EXPLANATIONS: Final[dict[str, str]] = {
         "——换成同一份文档的 PDF 版再试,那条路不需要它们。"
     ),
 }
+#: 解释里带**猜测**成分的 kind(回修第 2 轮 A)。``render_failed`` 的那句
+#: "大概率是页码超出了文档实际页数" 只在没有逐条原因时才值得说;片段一旦给了
+#: 具名的 per-unit 原因,它就成了摆在真原因前面的一个错归因。
+_GUESSWORK_ERRORS: Final[frozenset[str]] = frozenset({"render_failed"})
+
 #: 没在上面列出的 kind(理论上不该出现,但沙箱片段变了而这张表没跟上时会
 #: 出现)—— 这不等于"这处内容不存在",先怀疑是基础设施问题。
 _UNKNOWN_ERROR_EXPLANATION: Final = (
@@ -286,8 +307,9 @@ _FAILED_UNIT_REASONS: Final[dict[str, str]] = {
 _RENDER_NOTE_REASONS: Final[dict[str, str]] = {
     "anchor_only_fallback": (
         "这一页是**按上文的文字锚点**定位的,不是按图本身的位置钉死的 —— 转出来的"
-        "PDF 在锚点那一页和紧邻的下一页都没有可识别的位图(EMF/WMF 这类矢量图片"
-        "转出来就是这种情况)。图有可能落在紧邻的下一页上。"
+        "PDF 在锚点那一页和紧邻的下一页上,没有能归给这一处图的位图(EMF/WMF 这类"
+        "矢量图片转出来就是这种情况;也可能那几行图都已经归给了清单里别的条目,"
+        "或者这处图排到了更远的页上)。图有可能落在紧邻的下一页上。"
     ),
     #: 回修第 1 轮 C-1 —— 邻域两页**都**有位图,谁是这处图在本地分不出来。
     #: 这一档以前**不触发任何 note**:抬头 banner(短边过了装饰图阈值、滤不掉)
@@ -357,8 +379,10 @@ def _pdf_page_texts(pdf):
     # 整篇 pdftotext 本来就快, 而 docx 支路的最坏预算是
     # soffice + pdftotext + pdfimages + MAX_PAGES_PER_CALL x pdftoppm, 按 90 算
     # 会顶到 300 = 沙箱自己的 _MAX_EXEC_TIMEOUT_S, 于是一次合法调用会被**供应商
-    # 的兜底超时**打断, 这个片段里所有优雅降级(convert_failed / pdftotext_failed
-    # 带解释)永远不会发生。见 test_internal_render_budget_fits_under_the_exec_timeout_cap。
+    # 的兜底超时**打断 —— 一次跑满的合法调用可能在片段自己返回之前就被掐掉,
+    # 于是这里准备好的具名失败(convert_failed / pdftotext_failed 带解释)那一次
+    # 就送不出去。300 是**上界不是可达态**: 任何一个子进程真超时都会立刻具名返回,
+    # 总耗时到不了那里。见 test_internal_render_budget_fits_under_the_exec_timeout_cap。
     try:
         result = subprocess.run(["pdftotext", pdf, "-"], capture_output=True,
                                 timeout=_P["render_timeout_s"], check=False)
@@ -402,7 +426,9 @@ def _pdf_figure_pages(pdf):
     # 每**画一次**位图一行, 第 1 列是页号, 按页号升序。同一个 XObject 被多页
     # 引用(页眉 logo 的真实形状)时**每页各一行**; 带 alpha 的图会多出一行
     # type=smask、页号与它相同。矢量算子在这里一行都没有 —— LibreOffice 把
-    # 图表/SmartArt/EMF 渲成的正是矢量算子, 那种图走回落分支。
+    # EMF/WMF 这类矢量**图片**渲成的正是矢量算子, 那种图走回落分支。(docx 的
+    # 原生图表与 SmartArt 不在这里: 清单的 uri 闸只收 .../picture, 它们连 unit
+    # 都拿不到, 永远走不到这条路。)
     #
     # 装饰图按与清单侧**同一条**阈值(_MIN_EDGE_PT, 由宿主从 MIN_FIGURE_EDGE_PT
     # 喂进 _P)滤掉: 页眉/页脚 logo 不在 word/document.xml 里(它住在
@@ -424,7 +450,9 @@ def _pdf_figure_pages(pdf):
         return None
     if result.returncode != 0:
         return None
-    pages = set()
+    # 回修第 2 轮 I-C —— 回的是 {页号: 行数} 而不是页号集合: 归因要数得出
+    # "这一页上有几行", 才比得过"清单里有几条别的图落在这一页"。
+    rows = {}
     for line in result.stdout.decode("utf-8", "replace").splitlines():
         cols = line.split()
         if not cols or not cols[0].isdigit():
@@ -432,8 +460,9 @@ def _pdf_figure_pages(pdf):
         short_edge = _row_short_edge_upper_pt(cols)
         if short_edge is not None and short_edge < _MIN_EDGE_PT:
             continue
-        pages.add(int(cols[0]))
-    return sorted(pages)
+        page = int(cols[0])
+        rows[page] = rows.get(page, 0) + 1
+    return rows
 
 
 def _docx_context(docx_full, pdf):
@@ -451,10 +480,22 @@ def _docx_context(docx_full, pdf):
     pages = _pdf_page_texts(pdf)
     if pages is None:
         return None, "pdftotext_failed"
-    image_pages = _pdf_figure_pages(pdf)
-    if image_pages is None:
+    image_rows = _pdf_figure_pages(pdf)
+    if image_rows is None:
         return None, "pdfimages_failed"
-    return {"anchors": anchors, "pages": pages, "image_pages": image_pages}, None
+    # 回修第 2 轮 I-C —— **整份清单**的锚点页先一次算出来。歧义判据要拿它做归因:
+    # 邻域里那一行如果能被**另一条清单条目**解释(它自己的锚点页就落在那儿),
+    # 它就不是"来历不明的第二张图", 不该让这一处图响警报。
+    near_by_unit = {}
+    for other_unit, other_anchor in anchors.items():
+        text = _norm_ws(other_anchor)
+        if not text:
+            continue
+        hits = [n for n, page_text in enumerate(pages, 1) if text in page_text]
+        if len(hits) == 1:
+            near_by_unit[other_unit] = hits[0]
+    return {"anchors": anchors, "pages": pages, "image_rows": image_rows,
+            "near_by_unit": near_by_unit}, None
 
 
 def _resolve_docx_page(ctx, unit):
@@ -473,20 +514,42 @@ def _resolve_docx_page(ctx, unit):
     near = hits[0]
     # anchor 是图**正上方**那段文字的尾部, 所以图要么在含 anchor 的那一页,
     # 要么被挤到紧邻的下一页 —— 邻域**之外**的位图行不是这处图, 不拿它定页。
-    in_window = [page for page in ctx["image_pages"] if near <= page <= near + 1]
-    if not in_window:
-        # 邻域里一行位图都没有 -> 这处图在 PDF 里不是位图(EMF/WMF 这类矢量图片
-        # 被 LibreOffice 渲成了矢量算子), 只能回落到锚点页。
+    #
+    # 回修第 2 轮 I-C —— 邻域里的行先**归因**再数(实测:不归因的话,一份"一页
+    # 一张图"的普通报告 3 张里有 2 张会挂上歧义 note, 而 3 张的页号全是对的 ——
+    # 一条常响的警告不是警告, 模型会学会忽略它, 于是绕一圈又回到"该有信号处
+    # 无信号"; 而且 note 劝模型多取一页, 会把单 run 的像素预算砍掉近一半)。
+    #
+    # 归因规则: 一页上的行, 先让**别的**清单条目按它们自己的锚点页认领, 剩下
+    # 的才算"可能是这一处图"。V 的锚点页就是 p 时, p 上的一行归 V 不归 U。
+    unexplained = {}
+    for page in (near, near + 1):
+        claimed = sum(
+            1
+            for other_unit, other_near in ctx["near_by_unit"].items()
+            if other_unit != unit and other_near == page
+        )
+        left = ctx["image_rows"].get(page, 0) - claimed
+        if left > 0:
+            unexplained[page] = left
+    if not unexplained:
+        # 邻域里没有**能归给这一处图**的位图行 —— 要么一行都没有(EMF/WMF 这类
+        # 矢量图片被 LibreOffice 渲成了矢量算子, pdfimages 看不见), 要么行全被
+        # 别的清单条目认领了, 要么这处图落在了邻域之外。只能回落到锚点页。
         return near, "anchor_only_fallback", anchor
-    if len(in_window) > 1:
-        # 回修第 1 轮 C-1 —— note 的判据是"邻域里的位图**能不能唯一指认**这一处
-        # 图", 不是"邻域里**有没有**位图"。两页都有存活行时, 哪一行是这处图在本地
-        # 是**分不出来**的: 可能是抬头 banner 每页一份(短边过了阈值、滤不掉),
-        # 也可能是锚点页本身另有一张真图而目标图被挤到了下一页。仍然返回锚点页
-        # (它是先验上更可能的那个), 但必须把"这一页是按文字锚点选的"说出来 ——
-        # 不说的话模型拿到的是一张**可能不含目标图**的页, 而且毫不知情。
+    if len(unexplained) > 1:
+        # 回修第 1 轮 C-1 —— note 的判据不是"邻域里**有没有**位图", 而是"**有
+        # 几页**还剩着解释不掉的行"。两页都还剩着时, 这处图在哪一页在本地是
+        # **分不出来**的(抬头 banner 每页一份、短边过了阈值滤不掉, 是最常见的
+        # 成因)。仍然返回锚点页(先验上更可能的那个), 但必须把"这一页是按文字
+        # 锚点选的"说出来 —— 不说的话模型拿到的是一张**可能不含目标图**的页,
+        # 而且毫不知情。
+        #
+        # 同一页上剩两行不进这一支: 页号在两种解释下**是同一个**, 没有歧义可言。
         return near, "figure_page_ambiguous_fallback", anchor
-    return in_window[0], None, anchor
+    # 回修第 2 轮 I-C 顺带: 锚点页的行被别的条目认领光、而下一页还剩着行时,
+    # 这里钉的是**下一页** —— 那一档从"已知渲错页、只是披露了"变成了渲对页。
+    return next(iter(unexplained)), None, anchor
 
 
 def _render_sha(full):
@@ -540,7 +603,12 @@ def _main():
     except OSError as exc:
         return {"ok": False, "error": "io_error", "detail": str(exc)}
     ext = os.path.splitext(full)[1].lower()
-    missing = [n for n in ("soffice", "pdftoppm") if shutil.which(n) is None]
+    # soffice 只有**要转换**的时候才需要(回修第 2 轮 Minor-3): .pdf 输入走的是
+    # 下面 `pdf = full` 那一支, 一次都不调 soffice, 却被这道无条件的闸拦下过
+    # (实测: 沙箱里没有 soffice 时 .pdf 输入也回 soffice_missing)。M-4 那条
+    # "缺 soffice 换格式也没用"的立论原来是**恰好**成立, 不是真的成立。
+    needed = ("pdftoppm",) if ext == ".pdf" else ("soffice", "pdftoppm")
+    missing = [n for n in needed if shutil.which(n) is None]
     if missing:
         return {"ok": False, "error": "soffice_missing", "detail": ",".join(missing)}
     if ext == ".docx":
@@ -711,7 +779,9 @@ def build_render_wrapper(
             "render_timeout_s": render_timeout_s,
             # 装饰图阈值也是共享真源喂进来的(回修第 1 轮 I-3):docx 的
             # unit -> anchor 片段要它,`_pdf_figure_pages` 的滤子也要它,而且
-            # **必须是同一个值** —— 两份清单按不同的线对齐就会钉错页。
+            # **必须是同一个值**。今天它们读的是同一个片段里的同一行, 结构上
+            # 分叉不了; 写在这里是为了**别再开第二个 _P 键** —— 那才会让两侧
+            # 按不同的线对齐。
             "min_figure_edge_pt": MIN_FIGURE_EDGE_PT,
             "min_figure_area_ratio": MIN_FIGURE_AREA_RATIO,
         },
@@ -997,10 +1067,16 @@ class ReadPageTool:
         )
         if not env.get("ok"):
             kind = str(env.get("error", "unknown"))
-            msg = f"无法渲染 {raw}:{_explain_error(kind, env.get('detail'))}"
             per_unit = _describe_failed_units(
                 _normalize_failed(env.get("failed")), unit_label=label
             )
+            if kind in _GUESSWORK_ERRORS and per_unit:
+                # 回修第 2 轮 A —— 有逐条**具名**原因时,不许拿那句泛化猜测开头。
+                # 实测:一份带目录页的 docx 全部 unit 撞 anchor_ambiguous,模型读到的
+                # 第一句是"大概率是页码超出了文档实际页数",真原因排在它后面 ——
+                # 把一个错归因摆在真原因前面,与这个 feature 要消灭的东西同形。
+                return ToolResult(content=f"无法渲染 {raw}:{per_unit}")
+            msg = f"无法渲染 {raw}:{_explain_error(kind, env.get('detail'))}"
             if per_unit:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)

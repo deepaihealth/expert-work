@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.tools import document_figures
 from orchestrator.tools.document_figures import (
     _DOCX_INVENTORY_FRAGMENT,
     _FIGURE_INVENTORY_MAIN,
@@ -204,6 +205,53 @@ def test_thin_strip_is_skipped_by_the_edge_clause(tmp_path: Path) -> None:
     env = _run(tmp_path, "thin.docx")
     assert env["figures"] == []
     assert env["skipped_decorative"] == 1
+
+
+#: 45x45 pt —— 短边 45 **过得了** ``MIN_FIGURE_EDGE_PT``(40),面积占 Letter
+#: 页 0.418% **过不了** ``MIN_FIGURE_AREA_RATIO``(1%)。只有面积闸挡得住它。
+_SMALL_SQUARE_EMU = (571500, 571500)
+
+
+def test_small_square_is_skipped_by_the_area_clause(tmp_path: Path) -> None:
+    """面积闸独立起作用 —— 与 ``test_thin_strip_is_skipped_by_the_edge_clause``
+    互为镜像(回修第 2 轮 I-B)。
+
+    上一轮把两个阈值做成了片段参数,但只给 ``MIN_FIGURE_EDGE_PT`` 立了证人:
+    实测 ``MIN_FIGURE_AREA_RATIO: 0.01 -> 0.0``(把面积闸**整个关掉**)全套全绿,
+    片段里退回字面量也全绿 —— 唯一点名它的那行 ``params[...] == MIN_FIGURE_AREA_RATIO``
+    是重言式(两边读同一个常量)。"一刀同时消灭两件事"当时只对两个常量里的一个成立。
+
+    面积闸是**唯一**挡住"短边够大、但整体很小"那类装饰图的闸;关掉之后这类图会灌进
+    清单、把 ``MAX_MAP_ENTRIES`` 撑爆,并让 ``unit`` 编号整体变化(段落序号不变,
+    但清单里多出来的条目会改变模型看到的编号分布)。
+    """
+    body = _docx_drawing("rId1", "Picture 1", *_SMALL_SQUARE_EMU)
+    _build_docx(tmp_path / "small.docx", body, rels={"rId1": "image1.png"})
+
+    env = _run(tmp_path, "small.docx")
+    assert env["figures"] == []
+    assert env["skipped_decorative"] == 1
+
+
+def test_area_clause_threshold_is_the_public_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``MIN_FIGURE_AREA_RATIO`` 必须**真的**被消费(回修第 2 轮 I-B)。
+
+    行为钉,不是等值断言:把公开常量放到 0.0(面积闸全关),上面那张 45x45pt
+    的图就该活下来进清单。片段里要是退回手写 0.01,这条立刻红。
+    """
+    monkeypatch.setattr(document_figures, "MIN_FIGURE_AREA_RATIO", 0.0)
+    body = _docx_text("A paragraph before the small square.") + _docx_drawing(
+        "rId1", "Picture 1", *_SMALL_SQUARE_EMU
+    )
+    _build_docx(tmp_path / "small.docx", body, rels={"rId1": "image1.png"})
+
+    env = _run(tmp_path, "small.docx")
+    assert [f["unit"] for f in env["figures"]] == [2], (
+        "面积闸关掉之后那张图仍被跳过 —— 片段没在用那个公开常量"
+    )
+    assert env["skipped_decorative"] == 0
 
 
 def test_docx_anchor_is_the_sentence_before_the_figure(tmp_path: Path) -> None:
