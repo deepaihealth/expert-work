@@ -1105,7 +1105,9 @@ def _delivery_sentence(
     ``"none"`` 档到不了这里:``ReadPageTool.call`` 在进沙箱之前就返回了(回修第 3 轮)。
     """
     if delivery == "ask_image":
-        # B-64 Task 8 —— 不再列 ref:列了模型就会去抄,而约 200 字符的 ref 手抄会错
+        # B-64 Task 8 —— 路径用「」括起来:中文文件名里常有逗号、空格、《》“”(),不括
+        # 模型切不准路径到哪里结束,半截路径算出另一个 doc-sha,只会一直「还没渲染」。
+        # 不再列 ref:列了模型就会去抄,而约 200 字符的 ref 手抄会错
         # (09-14 实证三抄三错)。改成让它填自己刚填过的两样:路径原样、页号是
         # ``_u<unit>`` 那一段(``ask_image`` 在宿主侧按它找渲染页),不是 pdf 页号 ——
         # docx 的 unit 是图编号。
@@ -1113,7 +1115,7 @@ def _delivery_sentence(
         rendered = f"(本次渲出:{'、'.join(f'第 {u} {unit_label}' for u in units)})" if units else ""
         return (
             f"{head}。当前模型不能直接看图 —— 要看哪一{unit_label},就调用 ask_image,"
-            f"path 填 {path},unit 填要看的是第几{unit_label}{rendered};不用填 image_ref。"
+            f"path 填「{path}」,unit 填要看的是第几{unit_label}{rendered};不用填 image_ref。"
         )
     return f"{head},下一轮起你会在上下文里直接看到这几页的图。"
 

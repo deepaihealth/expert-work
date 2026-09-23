@@ -2624,9 +2624,21 @@ async def test_the_ask_image_receipt_names_path_and_unit_not_the_ref() -> None:
     assert "ask_image" in content
     assert "expert_work://" not in content
     assert refs[0] not in content
-    assert "path 填 d.pptx" in content
+    assert "path 填「d.pptx」" in content
     assert "本次渲出:第 3 页" in content
     assert "已放进你的上下文" not in content
+
+
+@pytest.mark.anyio
+async def test_the_ask_image_receipt_quotes_a_path_full_of_punctuation() -> None:
+    """中文文件名里常有逗号、空格、《》“”() —— 不括起来,模型切不准路径到哪里结束。"""
+    # 全角逗号写成转义:ruff RUF001 不许字面量里出现它。
+    name = "《东营区落实“健康第一”工作\uff0c实施方案》 (1).pdf"
+    ctx = _ctx()
+    result = await ReadPageTool(
+        client=_one_rendered_page_runtime(ctx), figure_delivery="ask_image"
+    ).call({"path": name, "units": [3]}, ctx=ctx)
+    assert f"path 填「{name}」," in result.content
 
 
 @pytest.mark.anyio
@@ -2648,7 +2660,7 @@ async def test_the_ask_image_receipt_for_docx_gives_the_unit_not_the_page() -> N
     result = await ReadPageTool(client=runtime, figure_delivery="ask_image").call(
         {"path": "r.docx", "units": [7]}, ctx=ctx
     )
-    assert "path 填 r.docx" in result.content
+    assert "path 填「r.docx」" in result.content
     assert "本次渲出:第 7 处" in result.content
     assert "第几处" in result.content
 
