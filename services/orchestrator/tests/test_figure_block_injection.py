@@ -586,18 +586,18 @@ class _CountingSummariser:
         return AIMessage(content="- 摘要")
 
 
-def _history(total_tokens: int) -> list[BaseMessage]:
-    """六条消息,按 ``CharTokenEstimator``(4 字符 1 token)合计约 ``total_tokens``。"""
-    per = total_tokens * 4 // 6
+def _history(total_tokens: int, count: int = 6) -> list[BaseMessage]:
+    """``count`` 条消息,按 ``CharTokenEstimator``(4 字符 1 token)合计约 ``total_tokens``。"""
+    per = total_tokens * 4 // count
     out: list[BaseMessage] = []
-    for i in range(6):
+    for i in range(count):
         body = f"第{i}条" + "x" * per
         out.append(HumanMessage(content=body) if i % 2 == 0 else AIMessage(content=body))
     return out
 
 
 async def _run_with_compressor(
-    *, history_tokens: int, context_window: int, supports_vision: bool
+    *, history_tokens: int, context_window: int, supports_vision: bool, count: int = 6
 ) -> tuple[_CountingSummariser, _RecordingLLM]:
     summariser = _CountingSummariser()
     compressor = ContextCompressor(
@@ -614,7 +614,7 @@ async def _run_with_compressor(
         config: RunnableConfig = {"configurable": _configurable()}
         await compiled.ainvoke(
             {
-                "messages": _history(history_tokens),
+                "messages": _history(history_tokens, count),
                 "step_count": 0,
                 "max_steps": 5,
                 "viewed_figures": [_ref(p) for p in (1, 2, 3)],
@@ -654,4 +654,15 @@ async def test_a_small_window_compresses_hard_but_does_not_fail() -> None:
         history_tokens=1_500, context_window=4_000, supports_vision=True
     )
     assert summariser.calls >= 1
+    assert len(_pixels(llm.seen_prompts[0])) == 3
+
+
+async def test_a_small_window_with_nothing_left_to_summarise_does_not_fail() -> None:
+    """同上,但历史只有两条:头尾各留一条,中段一开始就是空的 —— 压缩器的
+    「中段已空」失败判据。不算预留时这段历史远在阈值下,不许因为预留抛
+    ``ContextOverflowError``(上一条测试走的是「次数用完」那条路,够不到这里)。"""
+    summariser, llm = await _run_with_compressor(
+        history_tokens=500, context_window=4_000, supports_vision=True, count=2
+    )
+    assert summariser.calls == 0
     assert len(_pixels(llm.seen_prompts[0])) == 3
