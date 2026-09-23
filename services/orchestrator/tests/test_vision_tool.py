@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -22,11 +23,17 @@ from orchestrator.multimodal import (
     ResolvedImage,
 )
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
-from orchestrator.tools.read_page import document_sha, workspace_figure_ref
+from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
-from orchestrator.tools.sandbox import WorkspacePermissionError
+from orchestrator.tools.sandbox import (
+    RecordingSandboxRuntime,
+    SandboxOutcome,
+    WorkspacePermissionError,
+)
 from orchestrator.tools.vision import AskImageTool
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
+
+from .test_read_page import _install_office_stubs, _run_render, _snippet_params
 
 _TENANT = UUID("11111111-1111-1111-1111-111111111111")
 _THREAD = UUID("22222222-2222-2222-2222-222222222222")
@@ -747,3 +754,64 @@ async def test_ask_image_short_form_with_no_usable_candidate_says_render_again()
     assert "读不出来" in str(info.value)
     assert f"read_page(path={_DOC!r}, units=[10])" in str(info.value)
     assert vl.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 终审 #9 —— 接缝:真 read_page 的产出 → ask_image 短形态解析到逐字相同的 ref
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _LocalRenderRuntime(RecordingSandboxRuntime):
+    """沙箱替身:把宿主真喂给片段的参数原样拿来,在本地 ``ws`` 上**真跑**渲染片段。
+
+    只把 ``ws`` 换成本地目录(片段里的 ``/workspace`` 在这里就是 agent 在 NAS 上的
+    目录);``rel`` / ``units`` / ``out_rel`` 一个字不改 —— 落点的每一层都是片段自己拼的。
+    """
+
+    ws: Path = field(default_factory=Path)
+
+    async def exec(
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
+    ) -> SandboxOutcome:
+        await super().exec(
+            sandbox_id=sandbox_id,
+            code=code,
+            timeout_s=timeout_s,
+            agent_key=agent_key,
+            run_id=run_id,
+        )
+        params = _snippet_params(code)
+        env = _run_render(self.ws, params["rel"], units=params["units"], out_rel=params["out_rel"])
+        return SandboxOutcome(stdout=json.dumps(env), stderr="", exit_code=0, timed_out=False)
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_finds_exactly_what_read_page_rendered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``figure_lookup`` 的目录走法是片段落点的第二种编码;片段的嵌套一变,手拼路径的
+    测试全绿而接缝已断 —— 这里两头都用真代码。"""
+    _install_office_stubs(tmp_path, monkeypatch)
+    root = tmp_path / "nas"
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+    agent_dir = root / str(tenant) / str(user) / "agents" / _AGENT
+    (agent_dir / "uploads").mkdir(parents=True)
+    (agent_dir / _DOC).write_text("source")
+    ctx = ToolContext(tenant_id=tenant, user_id=user, agent_key=_AGENT, run_id=run)
+    rendered = await ReadPageTool(
+        client=_LocalRenderRuntime(ws=agent_dir), figure_delivery="ask_image"
+    ).call({"path": _DOC, "units": [3]}, ctx=ctx)
+    refs = list(rendered.state_updates["viewed_figures"])
+    assert len(refs) == 1, f"真渲染没产出一页,下面什么也没验:{rendered.content}"
+
+    vl = _FakeVLCaller()
+    await _short_form_tool(root, vl).call({"path": _DOC, "unit": 3, "question": "?"}, ctx=ctx)
+
+    assert _sent_ref(vl) == refs[0]
