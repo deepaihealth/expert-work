@@ -283,10 +283,12 @@ async def test_compress_raises_when_no_middle_to_summarise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compress_raises_after_max_passes_when_summary_too_large() -> None:
+async def test_compress_raises_after_one_summary_when_the_summary_is_too_large() -> None:
     """A pathological summariser that itself returns a giant payload
-    can't bring the estimate below threshold — after ``max_passes``
-    attempts the compressor raises rather than looping forever."""
+    can't bring the estimate below threshold. Since B-64 there is nothing
+    left to summarise after the first pass (the middle is only that
+    summary), so the compressor raises after one summary regardless of
+    ``max_passes`` — and reports the pass that actually ran."""
 
     @dataclass
     class _BloatedSummariser:
@@ -314,8 +316,11 @@ async def test_compress_raises_after_max_passes_when_summary_too_large() -> None
         max_passes=2,
     )
     msgs = _conversation(head=1, middle=10, tail=1, char_per_msg=80)
-    with pytest.raises(ContextOverflowError):
+    with pytest.raises(ContextOverflowError) as exc_info:
         await compressor.compress(msgs)
+    # 终审 #3 —— 报真实跑过的遍数,不是 ``_compress_once`` 那句不知情的 0。
+    assert exc_info.value.passes == 1
+    assert "after 1 compression pass(es)" in str(exc_info.value)
     # B-64 Task 7 回修第 4 轮 —— 第 2 遍的中段只剩第 1 遍的摘要,没有新东西可总结,
     # 按「中段已空」抛,不再用空的 NEW EVENTS 再调一次「更新」。原来这里断言的
     # ``calls == 2`` / ``passes == 2`` 钉的正是那次空更新。

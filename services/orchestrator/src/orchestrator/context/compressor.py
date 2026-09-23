@@ -506,6 +506,12 @@ class ContextCompressor:
     threshold_pct: float = 0.7
     head_keep: int = 4
     tail_keep: int = 6
+    #: 终审 #3 —— **今天 ``>= 1`` 的任何值效果都一样**。第 1 遍之后提示词是
+    #: 「头 + 摘要 + 尾」,第 2 遍起中段永远只剩那份摘要(``head_keep == 0`` 时连
+    #: 摘要都被并进开头的 system 段、中段为空),:meth:`_compress_once` 按「中段已空」
+    #: 立即抛(B-64 Task 7 回修第 4 轮)。原来第 2..n 遍是用空 NEW EVENTS 调「更新」,
+    #: 靠模型碰巧把摘要写短才可能过线。字段留着:存量 manifest 带着它,而
+    #: ``ContextCompressionPolicy`` 是 ``extra="forbid"``,删掉会让它们 422。
     max_passes: int = 3
     #: Stream HX-1 (Mini-ADR HX-A1) — injected token estimator. ``None``
     #: keeps the legacy ``chars // 4`` heuristic (direct construction /
@@ -633,11 +639,20 @@ class ContextCompressor:
                 )
             try:
                 current = await self._compress_once(current, on_pre_compaction=on_pre_compaction)
-            except ContextOverflowError:
+            except ContextOverflowError as exc:
                 if reserve and self._estimate(current) < self.threshold_tokens:
                     return await self._finish_compaction(
                         current, tokens_before, passes_done, on_compacted
                     )
+                # 终审 #3 —— ``_compress_once`` 不知道这是第几遍,它报的 ``passes=0``
+                # 在第 2 遍撞上「中段只剩摘要」时是错的:RUN_FAILED 里会写「压了 0 遍」,
+                # 而第 1 遍其实跑过了。按本次调用真实完成的遍数重报。
+                if exc.passes != passes_done:
+                    raise ContextOverflowError(
+                        estimated_tokens=exc.estimated_tokens,
+                        threshold=exc.threshold,
+                        passes=passes_done,
+                    ) from exc
                 raise
             except RunCancelledError:
                 # A cancelled run must abort, never be mistaken for a

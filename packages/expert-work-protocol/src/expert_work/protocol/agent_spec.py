@@ -813,6 +813,10 @@ class ContextCompressionPolicy(BaseModel):
     #: write-back extraction path); a no-op otherwise. Default ``True`` so
     #: memory-enabled agents keep key decisions across multiple compactions.
     flush_before_compaction: bool = True
+    #: 保留字段,**目前取任何 ``>= 1`` 的值效果都相同**:压缩器总结一次,放不下就让
+    #: run 失败(B-64 起,第 2 遍起中段只剩上一遍的摘要、没有可总结的新内容,见
+    #: ``orchestrator.context.compressor.ContextCompressor.max_passes``)。不删是因为
+    #: 存量 manifest 带着它,而本模型 ``extra="forbid"``。
     max_passes: int = Field(default=3, ge=1)
     #: Coarse per-call view-trim caps for the E.3
     #: :class:`DynamicContextMiddleware`. Stream HX-1 (Mini-ADR HX-A5) —
