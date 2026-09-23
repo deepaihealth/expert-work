@@ -46,16 +46,21 @@ SUPPORTED_EXTENSIONS: Final[frozenset[str]] = frozenset({"pptx", "docx", "xlsx",
 #: 的**子集**。两者回答的是不同的问题:``SUPPORTED_EXTENSIONS`` 是"这个格式的图
 #: 清单能不能分析出来"(判定层,只读 OOXML 结构,零渲染);``RENDERABLE_EXTENSIONS``
 #: 是"这个格式能不能真的转成 jpeg 给模型看"(``read_page`` 的渲染层,走
-#: soffice→pdftoppm)。docx/xlsx 能被分析出清单(在 ``SUPPORTED_EXTENSIONS`` 里),
-#: 但它们的 ``unit`` 语义与页码对不上——pptx/pdf 是 slide/页号,与 pdftoppm 的
-#: ``-f``/``-l`` 页号参数 1:1;docx 是**段落序号**(见下面 ``_docx_inventory`` 的
-#: ``enumerate(paragraphs, 1)``),xlsx 是 sheet 序号,两者都不能直接喂进 pdftoppm,
-#: 所以不在这个集合里(docx 是 Task 4b 要接的临时限制,xlsx 是 spec §9.4 的既定
-#: 结论)。**单一真源**:``read_page.py`` 与本模块的 ``render_figure_map`` 都从这里
+#: soffice→pdftoppm)。
+#:
+#: ``unit`` 的语义按格式不同:pptx/pdf 是 slide/页号,与 pdftoppm 的
+#: ``-f``/``-l`` 页号参数 1:1;docx 是**段落序号**(见下面 ``_docx_inventory``
+#: 的 ``enumerate(paragraphs, 1)``),直接喂进 pdftoppm 会渲出一张无关页 ——
+#: Task 4b 之前 docx 因此被显式拒绝,现在由 ``read_page`` 的片段在渲染**之前**
+#: 把它解析成页号(解析法见 ``read_page`` 模块 docstring 第 8 条),解析不出来
+#: 就具名失败,不猜页。xlsx 是 sheet 序号、没有对应的页,是 spec §9.4 的既定
+#: 结论:永远不渲染,所以它不在这个集合里。
+#:
+#: **单一真源**:``read_page.py`` 与本模块的 ``render_figure_map`` 都从这里
 #: import,不许各自再声明一份 —— 本仓已经在这一波里因为"单一真源其实是装的"
 #: (两处独立字面量各写各的)吃过一次亏(见
 #: ``test_supported_extensions_matches_sandbox_dispatch_table`` 治的那次)。
-RENDERABLE_EXTENSIONS: Final[frozenset[str]] = frozenset({"pptx", "pdf"})
+RENDERABLE_EXTENSIONS: Final[frozenset[str]] = frozenset({"pptx", "pdf", "docx"})
 #: PDF 空页判据 —— 字符数低于此判为空页(沿用 hermes 的 PDF_EMPTY_PAGE_CHARS)。
 _PDF_EMPTY_PAGE_CHARS: Final[int] = 20
 #: 空页三重阈值 —— 绝对页数下限。
@@ -65,68 +70,30 @@ _PDF_EMPTY_RATIO_MIN: Final[float] = 0.20
 #: 空页三重阈值 —— 绝对页数(不看占比)下限。
 _PDF_EMPTY_ABS_ALWAYS: Final[int] = 10
 
-# 沙箱内探测片段的正文。``os`` / ``json`` / ``_P`` / ``_resolve`` 来自共享的
-# ``_PRELUDE``(见 file_ops)。各格式解析库都是按需、分格式惰性 import 的,
-# 缺库降级成 ``state="undetermined"`` 而不是让沙箱崩掉 —— 这个任务的核心
-# 就是「测不了」永远不许悄悄变成「没有图」(见下面的 _main)。
-_FIGURE_INVENTORY_MAIN = """
+#: docx 清单代码的片段正文 —— **两个沙箱片段共用的那一份**(Task 4b)。
+#:
+#: 抽出来的理由不是"省几行":``read_page`` 的渲染片段必须拿到与这里**逐字
+#: 相同**的 ``unit -> anchor`` 映射,才能把 docx 的段落序号解析成 PDF 页号。
+#: 两边各抄一份的话,只要有一处改了段落遍历规则(比如哪些 ``w:p`` 算独立正文
+#: 单位、装饰图阈值),两边的 ``unit`` 就会指向不同的段落 —— 而这件事没有任何
+#: 报错:read_page 会老老实实渲出一页,只是那一页对不上模型问的那处图。本仓
+#: 在这一波已经为"单一真源其实是装的"付过一次账(见
+#: ``test_supported_extensions_matches_sandbox_dispatch_table``)。
+#:
+#: 身份钉在 ``test_render_snippet_shares_the_docx_inventory_fragment``。
+#:
+#: ``_MIN_EDGE_PT`` / ``_MIN_AREA_RATIO`` 跟着一起搬进来是**故意**的:
+#: ``read_page`` 那边判"``pdfimages`` 报出来的这一行是不是装饰图"用的必须是
+#: 同一条阈值,否则两份清单根本没法对齐(见 ``read_page._RENDER_MAIN`` 里的
+#: ``_row_short_edge_upper_pt``)。``_pptx_inventory`` 也用这两个名字,它定义在
+#: 本片段之前 —— Python 在调用时才解析全局名,``_main()`` 跑在所有 def 之后,
+#: 顺序因此不影响。
+_DOCX_INVENTORY_FRAGMENT = """
 
 _PICTURE_URI = "http://schemas.openxmlformats.org/drawingml/2006/picture"
-_CHART_URI = "http://schemas.openxmlformats.org/drawingml/2006/chart"
-_DIAGRAM_URI = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
 _EMU_PER_PT = 12700
 _MIN_EDGE_PT = 40.0
 _MIN_AREA_RATIO = 0.01
-_MAX_NOTES = 500
-_PDF_EMPTY_CHARS = 20
-_PDF_EMPTY_ABS_MIN = 2
-_PDF_EMPTY_RATIO_MIN = 0.20
-_PDF_EMPTY_ABS_ALWAYS = 10
-
-
-def _pptx_inventory(full):
-    import pptx
-    from pptx.util import Emu
-
-    prs = pptx.Presentation(full)
-    page_area_pt = (Emu(prs.slide_width).pt) * (Emu(prs.slide_height).pt)
-    figures, skipped = [], 0
-    for n, slide in enumerate(prs.slides, 1):
-        title = None
-        if slide.shapes.title is not None and slide.shapes.title.text_frame.text.strip():
-            title = slide.shapes.title.text_frame.text.strip()
-        notes = ""
-        if slide.has_notes_slide:
-            notes = slide.notes_slide.notes_text_frame.text.strip()[:_MAX_NOTES]
-        pics, charts = [], []
-        for sh in slide.shapes:
-            if getattr(sh, "has_chart", False):
-                ch = sh.chart
-                try:
-                    cats = [str(c) for c in ch.plots[0].categories]
-                    series = {s.name: [None if v is None else float(v) for v in s.values]
-                              for s in ch.series}
-                except Exception:
-                    cats, series = [], {}
-                charts.append({"cats": cats, "series": series})
-                continue
-            if str(sh.shape_type).startswith("PICTURE") or str(sh.shape_type).startswith("GROUP"):
-                w_pt, h_pt = Emu(sh.width).pt, Emu(sh.height).pt
-                if min(w_pt, h_pt) < _MIN_EDGE_PT or (w_pt * h_pt) / page_area_pt < _MIN_AREA_RATIO:
-                    skipped += 1
-                    continue
-                pics.append((w_pt, h_pt))
-        for w_pt, h_pt in pics:
-            figures.append({"unit": n, "kind": "picture", "count": 1,
-                            "w_pt": round(w_pt, 1), "h_pt": round(h_pt, 1),
-                            "anchor": title or "", "alt": None, "title": title,
-                            "notes": notes})
-        for data in charts:
-            figures.append({"unit": n, "kind": "chart", "count": 1,
-                            "w_pt": 0.0, "h_pt": 0.0, "anchor": title or "",
-                            "alt": None, "title": title, "chart_data": data,
-                            "notes": notes})
-    return figures, skipped
 
 
 # 依文档顺序遍历正文段落,含表格单元格里的段落 -- 表格(w:tbl/w:tr/w:tc,
@@ -210,7 +177,73 @@ def _docx_inventory(full):
                             "w_pt": round(w_pt, 1), "h_pt": round(h_pt, 1),
                             "anchor": last_text[-60:], "alt": alt, "title": None})
     return figures, skipped
+"""
 
+# 沙箱内探测片段的正文。``os`` / ``json`` / ``_P`` / ``_resolve`` 来自共享的
+# ``_PRELUDE``(见 file_ops)。各格式解析库都是按需、分格式惰性 import 的,
+# 缺库降级成 ``state="undetermined"`` 而不是让沙箱崩掉 —— 这个任务的核心
+# 就是「测不了」永远不许悄悄变成「没有图」(见下面的 _main)。
+#
+# docx 那一段住在 :data:`_DOCX_INVENTORY_FRAGMENT` 里,与 ``read_page`` 的渲染
+# 片段共用同一个对象(Task 4b),不在这里重抄一份。
+_FIGURE_INVENTORY_MAIN = (
+    """
+
+_CHART_URI = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+_DIAGRAM_URI = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+_MAX_NOTES = 500
+_PDF_EMPTY_CHARS = 20
+_PDF_EMPTY_ABS_MIN = 2
+_PDF_EMPTY_RATIO_MIN = 0.20
+_PDF_EMPTY_ABS_ALWAYS = 10
+
+
+def _pptx_inventory(full):
+    import pptx
+    from pptx.util import Emu
+
+    prs = pptx.Presentation(full)
+    page_area_pt = (Emu(prs.slide_width).pt) * (Emu(prs.slide_height).pt)
+    figures, skipped = [], 0
+    for n, slide in enumerate(prs.slides, 1):
+        title = None
+        if slide.shapes.title is not None and slide.shapes.title.text_frame.text.strip():
+            title = slide.shapes.title.text_frame.text.strip()
+        notes = ""
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame.text.strip()[:_MAX_NOTES]
+        pics, charts = [], []
+        for sh in slide.shapes:
+            if getattr(sh, "has_chart", False):
+                ch = sh.chart
+                try:
+                    cats = [str(c) for c in ch.plots[0].categories]
+                    series = {s.name: [None if v is None else float(v) for v in s.values]
+                              for s in ch.series}
+                except Exception:
+                    cats, series = [], {}
+                charts.append({"cats": cats, "series": series})
+                continue
+            if str(sh.shape_type).startswith("PICTURE") or str(sh.shape_type).startswith("GROUP"):
+                w_pt, h_pt = Emu(sh.width).pt, Emu(sh.height).pt
+                if min(w_pt, h_pt) < _MIN_EDGE_PT or (w_pt * h_pt) / page_area_pt < _MIN_AREA_RATIO:
+                    skipped += 1
+                    continue
+                pics.append((w_pt, h_pt))
+        for w_pt, h_pt in pics:
+            figures.append({"unit": n, "kind": "picture", "count": 1,
+                            "w_pt": round(w_pt, 1), "h_pt": round(h_pt, 1),
+                            "anchor": title or "", "alt": None, "title": title,
+                            "notes": notes})
+        for data in charts:
+            figures.append({"unit": n, "kind": "chart", "count": 1,
+                            "w_pt": 0.0, "h_pt": 0.0, "anchor": title or "",
+                            "alt": None, "title": title, "chart_data": data,
+                            "notes": notes})
+    return figures, skipped
+"""
+    + _DOCX_INVENTORY_FRAGMENT
+    + """
 
 def _xlsx_ref(data_source):
     if data_source is None:
@@ -324,6 +357,7 @@ def _main():
 
 print(json.dumps(_main()))
 """
+)
 
 
 def build_figure_inventory_wrapper(rel: str, *, ws: str, max_bytes: int) -> str:
@@ -357,15 +391,13 @@ def _describe_figure(figure: Mapping[str, Any]) -> str:
 #: B-64 回修第 1 轮关切 2 —— "能不能渲染"这件事本身只问
 #: :data:`RENDERABLE_EXTENSIONS`(单一真源,``read_page.py`` 也是从那里
 #: import,不再各写各的格式名单)。下表**只管文案**:对已知不可渲染的格式给
-#: 一句具体理由,不参与"能不能渲染"的判断——docx 会被 ``read_page`` 显式拒绝
-#: (临时限制,Task 4b 会接段落->页码的真实映射);xlsx 永远不支持(图表数据
-#: 已经在 ``chart_data`` 字段里)。两者的"为什么"不一样,文案不能共用。
+#: 一句具体理由,不参与"能不能渲染"的判断——今天只剩 xlsx(图表数据已经在
+#: ``chart_data`` 字段里,永远不渲染)。docx 曾经也在这张表里(那时它的段落
+#: 序号喂不进 pdftoppm),Task 4b 把解析接上、它进了 ``RENDERABLE_EXTENSIONS``
+#: 之后,这一条就再也走不到了 —— 留一句说 "read_page 暂不支持 docx" 的死文案
+#: 比没有更坏,所以删掉而不是留着。
 _FIGURE_MAP_ACTION_BY_FORMAT: Final[dict[str, str]] = {
     "xlsx": "这些图表的数据已经在上面每条里(chart_data),不需要也不支持用 read_page 去看图。",
-    "docx": (
-        "docx 的编号是段落位置,不是页码 —— read_page 暂不支持这类文档"
-        "(临时限制,不代表以后也不支持)。"
-    ),
 }
 #: 可渲染格式(``RENDERABLE_EXTENSIONS`` 里的)用这句正面引导。
 _DEFAULT_FIGURE_MAP_ACTION: Final = "要看某一处:调用 read_page,传文档路径和上面的编号。"

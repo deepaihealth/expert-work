@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.tools.document_figures import (
+    _DOCX_INVENTORY_FRAGMENT,
     _FIGURE_INVENTORY_MAIN,
     MIN_FIGURE_EDGE_PT,
     RENDERABLE_EXTENSIONS,
@@ -511,13 +512,14 @@ def test_map_action_for_xlsx_does_not_suggest_read_page() -> None:
     assert "chart_data" in text
 
 
-def test_map_action_for_docx_explains_the_temporary_limitation() -> None:
-    """B-64 回修 C3 —— docx 的编号是段落位置,read_page 暂不支持,文案要说
-    清楚这是临时限制而不是"docx 有图但你自己想办法"。"""
+def test_map_action_for_docx_now_points_at_read_page() -> None:
+    """Task 4b —— 这条以前叫 ``..._explains_the_temporary_limitation``,钉的是
+    "docx 的编号是段落位置,read_page 暂不支持" 那句临时文案。段落序号 -> 页号
+    的解析接上之后,docx 进了 ``RENDERABLE_EXTENSIONS``,清单文案必须跟着变成
+    正面引导 —— 留着旧文案就是在劝模型别用一个其实已经能用的工具。"""
     text = render_figure_map(_figures_env("docx"))
-    assert "调用 read_page" not in text
-    assert "段落" in text
-    assert "临时" in text
+    assert "调用 read_page" in text
+    assert "临时" not in text
 
 
 def test_map_caps_entries() -> None:
@@ -606,3 +608,24 @@ def test_read_page_imports_renderable_extensions_not_a_second_copy() -> None:
     from orchestrator.tools import read_page
 
     assert read_page.RENDERABLE_EXTENSIONS is RENDERABLE_EXTENSIONS
+
+
+def test_render_snippet_shares_the_docx_inventory_fragment() -> None:
+    """Task 4b —— docx 清单那段代码只许有**一份**。
+
+    ``read_page`` 的渲染片段要靠它把段落序号解析成页号,拿到的 ``unit -> anchor``
+    必须与 ``read_document`` 那份**逐字相同**。抄第二份的话,只要有一处改了段落
+    遍历规则或装饰图阈值,两边的 ``unit`` 就指向不同的段落 —— 而这件事不报错:
+    read_page 照样渲出一页,只是那一页对不上模型问的那处图,正是本功能要消灭的
+    静默失效换个位置重现。
+
+    身份(``is``)+ 两个片段各自真的**包含**它 + 各只出现一次:少了最后一条,
+    "再抄一份贴在旁边" 这种改法仍然测不出来。"""
+    from orchestrator.tools import read_page
+
+    assert read_page._DOCX_INVENTORY_FRAGMENT is _DOCX_INVENTORY_FRAGMENT
+    assert "def _docx_inventory(" in _DOCX_INVENTORY_FRAGMENT
+    for snippet in (_FIGURE_INVENTORY_MAIN, read_page._RENDER_MAIN):
+        assert _DOCX_INVENTORY_FRAGMENT in snippet
+        assert snippet.count("def _docx_inventory(") == 1
+        assert snippet.count("def _docx_flow_paragraphs(") == 1

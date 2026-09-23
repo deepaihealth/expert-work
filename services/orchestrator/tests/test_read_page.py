@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import zipfile
 from pathlib import Path
 from uuid import uuid4
 
@@ -122,33 +123,134 @@ _PDFTOPPM_WRITES_A_JPEG = (
 )
 
 
+#: Task 4b —— docx 多用两件 poppler 工具把段落序号解析成页号。默认剧本:
+#: 两页正文 + 第 1 页一张够大的位图,让"不关心 docx 解析"的既有测试照常过。
+_ANCHOR_ONE = "Anchor paragraph one tail sentence."
+_ANCHOR_TWO = "Anchor paragraph two tail sentence."
+
+#: ``pdfimages -list`` 的真实表头 —— 逐字取自 2026-09-23 对 poppler 21.11.0 的
+#: 实测(两行:列名 + 横线)。桩必须长得和真家伙一样,否则测的是我对格式的
+#: 想象而不是解析器。
+_PDFIMAGES_HEADER = (
+    "page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio\n"
+    + "-" * 92
+    + "\n"
+)
+
+
+def _pdftotext_pages(*pages: str) -> str:
+    """pdftotext 桩 body:整篇一次输出,页间换页符,**最后一页后面也有一个**
+    —— 与真 pdftotext 一致(同一次实测)。"""
+    payload = "".join(page + chr(12) for page in pages)
+    return "sys.stdout.write(" + repr(payload) + ")\n"
+
+
+def _pdfimages_rows(rows: list[tuple[int, int, int, int, int]]) -> str:
+    """pdfimages -list 桩 body。``rows`` 每项是 ``(页号, 宽px, 高px, x-ppi, y-ppi)``
+    —— 显示尺寸由 px/ppi 反推,装饰图与真图靠这两个数分开。"""
+    body = "".join(
+        f"{page:6d} {i:5d} image {w:7d} {h:5d}  gray    1   8  image  no        99  0 "
+        f"{x_ppi:5d} {y_ppi:5d}   64B 100%\n"
+        for i, (page, w, h, x_ppi, y_ppi) in enumerate(rows)
+    )
+    return "sys.stdout.write(" + repr(_PDFIMAGES_HEADER + body) + ")\n"
+
+
+#: 一张够大的真图(800x600 px @ 200 ppi ≈ 288x216 pt,远在装饰图阈值之上)。
+_BIG_ROW = (800, 600, 200, 200)
+#: 一张页眉 logo(200x200 px @ 500 ppi ≈ 28.8 pt,短边低于阈值 = 装饰图)。
+_LOGO_ROW = (200, 200, 500, 500)
+
+
 def _install_office_stubs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     soffice_body: str = _SOFFICE_WRITES_A_PDF,
     pdftoppm_body: str = _PDFTOPPM_WRITES_A_JPEG,
-) -> None:
-    """伪造 soffice / pdftoppm 到 PATH 最前面,只让剧本那一段随测试变。
+    pdftotext_body: str | None = None,
+    pdfimages_body: str | None = None,
+) -> Path:
+    """伪造 soffice / pdftoppm / pdftotext / pdfimages 到 PATH 最前面,只让剧本
+    那一段随测试变。返回放桩的目录(调用计数文件也在那里)。
 
     回修第 4 轮 New-M6 —— 这里原先是五个 helper 各自内联一整份 soffice +
     pdftoppm 桩源码(其中两份 pdftoppm 逐字相同),不影响正确性,但下次改桩
     要改五处。收口成这一个入口之后,变的只有 ``*_body``,两段 preamble 与
     调用计数只有一份。
+
+    Task 4b —— 后两件是 docx 的段落序号 -> 页号解析用的。它们也**必须**是桩:
+    真机上有没有 poppler 是环境的事,测试不能跟着环境一次绿一次红。
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    soffice = bin_dir / "soffice"
-    soffice.write_text(
-        _stub_source(binary="soffice", preamble=_SOFFICE_PREAMBLE, body=soffice_body)
-    )
-    pdftoppm = bin_dir / "pdftoppm"
-    pdftoppm.write_text(
-        _stub_source(binary="pdftoppm", preamble=_PDFTOPPM_PREAMBLE, body=pdftoppm_body)
-    )
-    for script in (soffice, pdftoppm):
+    bodies = {
+        "soffice": (_SOFFICE_PREAMBLE, soffice_body),
+        "pdftoppm": (_PDFTOPPM_PREAMBLE, pdftoppm_body),
+        "pdftotext": (
+            "",
+            pdftotext_body
+            if pdftotext_body is not None
+            else _pdftotext_pages(_ANCHOR_ONE, _ANCHOR_TWO),
+        ),
+        "pdfimages": (
+            "",
+            pdfimages_body if pdfimages_body is not None else _pdfimages_rows([(1, *_BIG_ROW)]),
+        ),
+    }
+    for binary, (preamble, body) in bodies.items():
+        script = bin_dir / binary
+        script.write_text(_stub_source(binary=binary, preamble=preamble, body=body))
         script.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return bin_dir
+
+
+# ---------------------------------------------------------------------------
+# docx 夹具 —— 只塞 ``word/document.xml`` 的最小 OOXML。
+#
+# ``_docx_inventory`` 只读这一个部件(见 ``document_figures``
+# ``_DOCX_INVENTORY_FRAGMENT``),媒体/关系部件对段落序号与锚点没有任何影响,
+# 所以不造。``python-docx`` 不在 ``uv.lock`` 里,用它写的测试会在 CI 里**静默
+# skip** 而本地通过 —— 本波第 1 轮为此栽过一次,这里一律 stdlib ``zipfile``。
+# ---------------------------------------------------------------------------
+
+_DOCX_XML_NS = (
+    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+)
+_PICTURE_URI = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+#: 288x192 pt —— 过得了装饰图阈值。
+_BIG_EMU = (3657600, 2438400)
+#: 28.8x28.8 pt —— 撞装饰图阈值,清单会跳过它。
+_LOGO_EMU = (365760, 365760)
+
+
+def _para(text: str) -> str:
+    return f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+
+
+def _figure(emu: tuple[int, int] = _BIG_EMU) -> str:
+    cx, cy = emu
+    return (
+        "<w:p><w:r><w:drawing>"
+        f'<wp:inline><wp:extent cx="{cx}" cy="{cy}"/>'
+        '<wp:docPr id="1" name="Picture 1"/>'
+        f'<a:graphic><a:graphicData uri="{_PICTURE_URI}"/></a:graphic>'
+        "</wp:inline></w:drawing></w:r></w:p>"
+    )
+
+
+def _write_docx(path: Path, *body: str) -> None:
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "word/document.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f"<w:document {_DOCX_XML_NS}><w:body>{''.join(body)}"
+            '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>'
+            "</w:body></w:document>",
+        )
 
 
 def _run_render(
@@ -194,11 +296,14 @@ def test_wrapper_uses_a_private_outdir_per_conversion(
     """
     _install_office_stubs(tmp_path, monkeypatch)
     (tmp_path / "uploads").mkdir()
-    (tmp_path / "uploads" / "report.docx").write_text("docx source")
+    # Task 4b —— docx 这一侧现在会真的被解析:它必须是一份能读的 OOXML,
+    # 请求的 unit 也得是清单里真有的那个编号(图在第 2 段,所以是 2)。
+    # 这条测试本身管的仍然是 soffice 的同名 outdir 互相覆盖,不是 docx 解析。
+    _write_docx(tmp_path / "uploads" / "report.docx", _para(_ANCHOR_ONE), _figure())
     (tmp_path / "uploads" / "report.pptx").write_text("pptx source")
 
     env_a = _run_render(
-        tmp_path, "uploads/report.docx", units=[1], out_rel=".tool_results/r1/figures/aaa"
+        tmp_path, "uploads/report.docx", units=[2], out_rel=".tool_results/r1/figures/aaa"
     )
     env_b = _run_render(
         tmp_path, "uploads/report.pptx", units=[1], out_rel=".tool_results/r1/figures/bbb"
@@ -704,6 +809,296 @@ def test_wrapper_reports_a_clean_failure_when_the_unit_dir_is_a_symlink(
     }
     # 旧目录必须原封不动——不能被当成这次的产出改动或删除。
     assert (evil_dir / "page-99.jpg").read_text() == "STALE-FROM-ELSEWHERE"
+
+
+# ---------------------------------------------------------------------------
+# Task 4b —— docx 的段落序号 -> PDF 页号。
+#
+# 这一段测的是本功能的**核心风险**:解析错一页 = 渲出一张无关页并声称它就是
+# 模型问的那处图 —— 正是 Task 4 的 C3 当初把 docx 拒掉的理由。所以每一条要么
+# 钉住"渲对了哪一页",要么钉住"没渲、而且说了具名原因"。
+# ---------------------------------------------------------------------------
+
+
+def _rendered_jpegs(tmp_path: Path) -> list[Path]:
+    return sorted(tmp_path.glob("**/*.jpg"))
+
+
+def _pdftoppm_was_called(bin_dir: Path) -> bool:
+    return (bin_dir / "pdftoppm_calls").exists()
+
+
+def test_docx_unit_resolves_to_the_page_pdfimages_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """基本档:anchor 在第 2 页、``pdfimages`` 也把图报在第 2 页 -> 渲第 2 页。
+
+    同时钉住 ``rendered`` 里 ``unit``(段落序号)与 ``page``(真渲了哪一页)
+    是**两个**字段:宿主拿 unit 冒充页号就会告诉模型一个不存在的页码。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Trailing page."),
+        pdfimages_body=_pdfimages_rows([(2, *_BIG_ROW)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert (item["unit"], item["page"]) == (2, 2)
+    assert item["rel"].endswith("page-02.jpg")
+    assert "note" not in item
+
+
+def test_docx_figure_pushed_over_the_page_break_is_rendered_on_the_next_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**页边界** —— 只用 anchor 就会错的那一条,必须有。
+
+    anchor 那段文字排在第 2 页页底,图被挤到了第 3 页。第 1 步给出的邻域页是
+    2,第 2 步的 ``pdfimages`` 把它纠正到 3。拿掉第 2 步(或让它不起作用),
+    模型会拿到第 2 页 —— 一张不含目标图、却被声称是那处图的页。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows([(3, *_BIG_ROW)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 3, f"页边界没纠正过来:{item}"
+    assert item["rel"].endswith("page-03.jpg")
+
+
+def test_docx_header_logo_rows_do_not_pin_the_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """页眉 logo 不许把第 2 步压成"永远返回邻域页"(与简报的偏离,见报告)。
+
+    页眉/页脚的图住在 ``word/header1.xml``,**清单根本看不见它**(``_docx_inventory``
+    只读 ``word/document.xml``),而它在渲出来的 PDF 里**每一页都有一行**
+    (实测:同一个 XObject 被 N 页引用就出 N 行)。不按尺寸把这些行滤掉的话,
+    "页号 >= 邻域页的第一行"恒等于邻域页自己,上面那条页边界测试对所有带
+    页眉图的文档都会静默失效 —— 而带页眉 logo 的公文正是最常见的一种 docx。
+    """
+    bin_dir = _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows(
+            [(1, *_LOGO_ROW), (2, *_LOGO_ROW), (3, *_LOGO_ROW), (3, *_BIG_ROW)]
+        ),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    assert env["rendered"][0]["page"] == 3, "页眉 logo 那一行把页号钉在了邻域页上"
+    assert _pdftoppm_was_called(bin_dir)
+
+
+def test_docx_vector_figure_falls_back_to_the_anchor_page_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """图表 / SmartArt / EMF 被 LibreOffice 渲成 PDF **矢量算子**,``pdfimages``
+    一行都看不见(2026-09-23 实测:纯矢量页在 ``-list`` 里没有行)。这时回落到
+    邻域页,但**必须**把"这一页是按文字锚点定位的"说出来 —— 不说的话模型会把
+    一张可能不含目标图的页当成确凿证据。"""
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE),
+        pdfimages_body=_pdfimages_rows([]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2
+    assert item["note"] == "anchor_only_fallback"
+
+
+def test_docx_bitmap_outside_the_neighbourhood_does_not_pin_the_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """邻域之外的位图行不是这处图(与简报的偏离,见报告)。
+
+    anchor 在第 2 页,全文下一张位图在第 7 页 —— 那是别处的图。"页号 >= 邻域页
+    的第一行"会把第 7 页当成答案,跨出 anchor 能担保的范围整整五页。这里改成
+    回落到邻域页 + 说明,不拿一个远处的页硬凑。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows([(7, *_BIG_ROW)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2
+    assert item["note"] == "anchor_only_fallback"
+
+
+def test_docx_skipped_decorative_figures_do_not_shift_the_unit_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """清单跳过装饰图时,``unit`` **不**重新编号 —— 它是段落序号,不是"第几张图"。
+
+    这份文档的第 2 段是一张 28.8pt 的 logo(被跳过),第 4 段才是真图。清单里
+    只有 unit=4 这一条;要是哪天有人把 unit 改成"清单里的第几条",这里会变成
+    1,解析出来的锚点就整段错位。
+    """
+    bin_dir = _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_TWO),
+        pdfimages_body=_pdfimages_rows([(2, *_BIG_ROW)]),
+    )
+    _write_docx(
+        tmp_path / "d.docx",
+        _para(_ANCHOR_ONE),
+        _figure(_LOGO_EMU),
+        _para(_ANCHOR_TWO),
+        _figure(),
+    )
+
+    env = _run_render(tmp_path, "d.docx", units=[4], out_rel=".tool_results/r1/figures/s")
+    assert env["ok"] is True
+    assert (env["rendered"][0]["unit"], env["rendered"][0]["page"]) == (4, 2)
+
+    # 被跳过的那一段没有进清单 —— 拿它的序号来问是 honest 失败,不是渲第 2 段。
+    skipped = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/t")
+    assert skipped["ok"] is False
+    assert skipped["failed"] == [{"unit": 2, "why": "unit_not_in_inventory"}]
+    assert _pdftoppm_was_called(bin_dir) is True  # 上面那次成功调过
+
+
+@pytest.mark.parametrize(
+    ("scenario", "why", "units", "body", "pages"),
+    [
+        (
+            "anchor_empty",
+            "anchor_empty",
+            [1],
+            (_figure(),),
+            ("Cover page body text.", _ANCHOR_ONE),
+        ),
+        (
+            "anchor_not_found",
+            "anchor_not_found",
+            [2],
+            (_para(_ANCHOR_ONE), _figure()),
+            ("Cover page body text.", "Reflowed beyond recognition."),
+        ),
+        (
+            "anchor_ambiguous",
+            "anchor_ambiguous",
+            [2],
+            (_para(_ANCHOR_ONE), _figure()),
+            (_ANCHOR_ONE, "Middle page.", _ANCHOR_ONE),
+        ),
+        (
+            "unit_not_in_inventory",
+            "unit_not_in_inventory",
+            [9],
+            (_para(_ANCHOR_ONE), _figure()),
+            ("Cover page body text.", _ANCHOR_ONE),
+        ),
+    ],
+)
+def test_docx_unresolvable_units_fail_by_name_and_never_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    why: str,
+    units: list[int],
+    body: tuple[str, ...],
+    pages: tuple[str, ...],
+) -> None:
+    """四种 honest 失败,一种都不许退化成"拿 unit 当页号渲一张"。
+
+    两条断言缺一不可:原因**具名**(模型据此知道下一步做什么),以及
+    ``pdftoppm`` 压根没被调用过 + 盘面上零 jpeg(证明它真的没进渲染,而不是
+    渲了一张然后在信封里说失败)。
+    """
+    bin_dir = _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages(*pages),
+        pdfimages_body=_pdfimages_rows([(2, *_BIG_ROW)]),
+    )
+    _write_docx(tmp_path / "d.docx", *body)
+
+    env = _run_render(tmp_path, "d.docx", units=units, out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is False, scenario
+    assert env["error"] == "render_failed", scenario
+    assert [item["why"] for item in env["failed"]] == [why], scenario
+    assert _pdftoppm_was_called(bin_dir) is False, f"{scenario}:不该进渲染"
+    assert _rendered_jpegs(tmp_path) == [], scenario
+
+
+def test_docx_anchor_failures_carry_the_anchor_text_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """锚点类失败要把**平台用来定位的那段文字**原样带回去 —— 模型能在
+    ``read_document`` 的正文里找到它,据此判断是编号给错了还是排版变了。"""
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Nothing matching here at all."),
+        pdfimages_body=_pdfimages_rows([]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["failed"][0]["anchor"] == _ANCHOR_ONE
+
+
+def test_docx_without_the_page_resolvers_is_a_clean_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """沙箱里没有 pdftotext/pdfimages 时只能猜页 —— 而猜页正是这个功能要消灭的
+    东西,所以与"没装 soffice"同档:直接失败,并点名缺了哪个。"""
+    bin_dir = _install_office_stubs(tmp_path, monkeypatch)
+    (bin_dir / "pdfimages").unlink()
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+    # PATH 只留桩目录,免得撞上真机上装了的 poppler。
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is False
+    assert env["error"] == "soffice_missing"
+    assert env["detail"] == "pdfimages"
+
+
+def test_docx_that_cannot_be_parsed_is_a_named_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """段落结构读不出来(文件损坏)与"这处图不在第几页"是两件事,不能长得一样。"""
+    _install_office_stubs(tmp_path, monkeypatch)
+    (tmp_path / "d.docx").write_bytes(b"not a zip at all")
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env == {"ok": False, "error": "docx_inventory_failed"}
 
 
 def test_wrapper_renders_jpeg_not_png() -> None:
@@ -1264,13 +1659,102 @@ async def test_xlsx_is_refused_before_dispatch() -> None:
 
 
 @pytest.mark.anyio
-async def test_docx_is_refused_for_now_with_a_temporary_caveat() -> None:
-    runtime = RecordingSandboxRuntime()
+async def test_docx_is_no_longer_refused_by_the_format_gate() -> None:
+    """Task 4b —— 这条以前叫 ``..._is_refused_for_now_with_a_temporary_caveat``,
+    钉的是 Task 4 的 C3 临时闸。段落序号 -> 页号的解析接上之后,那道闸必须拆掉:
+    docx 进沙箱、走正常的渲染路径。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps({"ok": True, "rendered": []}), stderr="", exit_code=0, timed_out=False
+        )
+    )
     result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [1]}, ctx=_ctx())
-    assert "docx" in result.content
-    assert "段落" in result.content
-    assert "临时" in result.content
-    assert runtime.execs == []
+    assert "不支持" not in result.content
+    assert len(runtime.execs) == 1
+
+
+@pytest.mark.anyio
+async def test_docx_content_names_both_the_figure_number_and_the_page() -> None:
+    """docx 的 ``unit`` 是图清单里的编号,不是页号 —— 只说 "第 7 页" 会给模型
+    一个**不存在的页码**(与回修第 4 轮 New-M2 是同一条教训),只说页号又对不上
+    它问的那处图。两个都说。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 7,
+                            "page": 3,
+                            "rel": ".tool_results/r1/figures/abc/page-03.jpg",
+                            "bytes": 100,
+                        }
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [7]}, ctx=_ctx())
+    assert "第 7 处(文档第 3 页)" in result.content
+    assert "第 7 页" not in result.content
+
+
+@pytest.mark.anyio
+async def test_docx_anchor_only_fallback_is_told_to_the_model() -> None:
+    """回落分支渲**成功**了,但那一页不是被图本身钉死的 —— 保留意见必须出现在
+    content 里,否则模型会把一张可能不含目标图的页当成确凿证据。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 4,
+                            "page": 2,
+                            "note": "anchor_only_fallback",
+                            "rel": ".tool_results/r1/figures/abc/page-02.jpg",
+                            "bytes": 100,
+                        }
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [4]}, ctx=_ctx())
+    assert "文字锚点" in result.content
+    assert "下一页" in result.content
+
+
+@pytest.mark.anyio
+async def test_docx_named_failure_reaches_the_model_with_its_anchor() -> None:
+    """四种 honest 失败必须以人话 + 下一步动作抵达模型,并带上平台用来定位的
+    那段文字 —— 裸 ``anchor_not_found`` 对模型不构成任何可执行信息。"""
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": False,
+                    "error": "render_failed",
+                    "failed": [{"unit": 7, "why": "anchor_not_found", "anchor": "血糖趋势见下图"}],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [7]}, ctx=_ctx())
+    assert "第 7 处没取到" in result.content
+    assert "PDF 版" in result.content
+    assert "血糖趋势见下图" in result.content
 
 
 @pytest.mark.anyio

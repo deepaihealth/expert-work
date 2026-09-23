@@ -62,6 +62,34 @@ jpeg → glob 找产物。三个实测坑写进片段:
      目录**,直到这条 run 被 purge(B-50 Task 12 的会话 purge + 留存 job 孤儿
      扫描收它)。一条 run 里反复编辑同一份文档会线性堆目录。
 
+8. **docx 的 ``unit`` 是段落序号,渲染前必须解析成页号**(Task 4b)——
+   ``document_figures._docx_inventory`` 的 ``enumerate(paragraphs, 1)`` 数的是
+   段落,不是页。直接喂进 ``pdftoppm -f/-l`` 会渲出一张无关页**并声称它就是
+   模型问的那处图**,所以这条路在 Task 4 的 C3 里是被显式拒掉的。现在接上,
+   两步组合,一步都不能少:
+
+   a. **anchor 定位邻域**:``pdftotext <pdf> -`` 一次取回整篇,页间以换页符
+      分隔;把页文本与清单里的 ``anchor``(图**正上方**那段文字的尾部 60 字符)
+      都做空白归一化再找包含关系。``anchor`` 落在页底时图会被挤到下一页,
+      所以这一步只给"含 anchor 的那一页或紧邻的下一页"这个**邻域**,不给答案。
+   b. **``pdfimages -list`` 把页钉死**:取邻域内、页号最小的那一行位图所在的页。
+
+   两步是组合不是二选一:只用 a 会在页边界上错一页;只用 b 对不上是**哪一处**
+   图(清单跳过了装饰图,序号对不齐)。b 这一步还必须按与清单**同一条**尺寸
+   阈值滤掉装饰行 —— 页眉/页脚的 logo 住在 ``word/header1.xml``、清单根本看
+   不见它,而它在**每一页**都有一行,不滤的话 b 的结果恒等于 a 的邻域页,
+   页边界那一档就永远修不对(实测:同一个 XObject 被 N 页引用会出 N 行)。
+
+   **拿不到答案时一律具名失败,一处都不猜页**:``anchor_empty`` /
+   ``anchor_not_found`` / ``anchor_ambiguous`` / ``unit_not_in_inventory``
+   四种(见 :data:`_FAILED_UNIT_REASONS`)。邻域内一行位图都没有是**例外**:
+   那多半是图表/SmartArt/EMF 被 LibreOffice 渲成了 PDF 矢量算子(``pdfimages``
+   看不见矢量),这时回落到邻域页本身,但必须把"这一页是按文字锚点定位的"
+   说给模型(见 :data:`_RENDER_NOTE_REASONS`)。
+
+   这条路**不保证**总是对:锚点那一页本身另有一张真图、而目标图被挤到了下一页
+   时,b 会停在锚点页。这是已知残留,不是被消灭的情况 —— 见任务报告。
+
 落点固定在 :data:`~expert_work.persistence.WORKSPACE_OVERFLOW_DIR`
 (``.tool_results/``)下,这样渲出来的 ref 才落进
 :func:`orchestrator.multimodal.is_cacheable_image_ref` 认的可缓存子树。完整形状
@@ -85,7 +113,7 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Final
+from typing import Any, Final, TypeGuard
 from uuid import UUID
 
 from expert_work.persistence import (
@@ -96,7 +124,10 @@ from expert_work.persistence import (
     WORKSPACE_OVERFLOW_DIR,
 )
 from expert_work.protocol.multimodal import WORKSPACE_REF_PREFIX
-from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS
+from orchestrator.tools.document_figures import (
+    _DOCX_INVENTORY_FRAGMENT,
+    RENDERABLE_EXTENSIONS,
+)
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import SandboxRuntime
@@ -128,24 +159,19 @@ _RENDER_TIMEOUT_S = 30
 #: read_page 目前真正能渲染的格式 —— 单一真源在 ``document_figures.py``
 #: (回修第 1 轮关切 2:两处各写一份字面量是本仓已经吃过亏的病,见那边
 #: ``RENDERABLE_EXTENSIONS`` 的 docstring)。``unit`` 的含义按格式不同——pptx
-#: 是 slide 号、pdf 是页号,两者与 pdftoppm 的页号参数是 1:1 的;docx 是
-#: **段落序号**(``document_figures.py`` 的 ``enumerate(paragraphs, 1)``),
-#: xlsx 是 sheet 序号,都不能直接喂进 pdftoppm。docx/xlsx 因此显式拒绝而不是
-#: 当成 pdf/pptx 硬转——那样只会渲出一堆文不对题的页。
+#: 是 slide 号、pdf 是页号,两者与 pdftoppm 的页号参数是 1:1 的;docx 是图
+#: 清单里的**条目编号**(底下是 ``enumerate(paragraphs, 1)`` 的段落序号),
+#: 由片段在渲染前解析成页号(Task 4b,见模块 docstring 第 8 条);xlsx 是
+#: sheet 序号,没有对应的页,永远不渲染。
 
-#: 明确不支持的格式,各自配一句能说清「为什么」的中文理由——两者的"为什么"
-#: 不一样,文案不能共用同一句。
-#: * ``xlsx`` 是 spec §9.4 的既定结论(不渲染,图表数据走 chart_data)。
-#: * ``docx`` 是**临时**限制:段落号 -> 页码的真实映射由另一个任务
-#:   (Task 4b,与本任务同一波)接上,这里先按临时闸处理,不是永久结论。
+#: 明确不支持的格式,各自配一句能说清「为什么」的中文理由。
+#: 今天只剩 ``xlsx``,是 spec §9.4 的既定结论(不渲染,图表数据走 chart_data)。
+#: docx 曾经也在这里(段落号喂不进 pdftoppm),Task 4b 把段落号 -> 页号的解析
+#: 接上之后它进了 ``RENDERABLE_EXTENSIONS``,这条也就跟着删了。
 _UNSUPPORTED_FORMAT_REASONS: Final[dict[str, str]] = {
     "xlsx": (
         "xlsx 不支持 read_page —— 这类文档不渲染,图表数据已经在 read_document "
         "返回的文本里,不需要也不该再看图。"
-    ),
-    "docx": (
-        "docx 暂不支持 read_page —— docx 里的编号是段落位置,不是页码,按页码 "
-        "取图的映射还没接上。这是临时限制,不代表以后也不支持。"
     ),
 }
 
@@ -160,6 +186,19 @@ _ERROR_EXPLANATIONS: Final[dict[str, str]] = {
     "soffice_missing": "沙箱里没有装转换工具,这不是你能修的问题——先换别的方式获取这处内容。",
     "convert_failed": "文档转 PDF 失败了——文件可能已损坏,或者不是一份合法的这种格式的文件。",
     "render_failed": ("转成 PDF 之后,请求的页一页都没能渲出来——大概率是页码超出了文档实际页数。"),
+    #: Task 4b —— docx 专有的三种基础设施失败。共同点是"定位不了这处图在第几页",
+    #: 所以都给同一条替代路径(换 PDF 版),但各自的病因不一样,不共用一句。
+    "docx_inventory_failed": (
+        "读这份 docx 的段落结构失败了,定位不了图在第几页——文件可能已损坏,或者不是一份合法的 docx。"
+    ),
+    "pdftotext_failed": (
+        "文档转成 PDF 了,但取不出每页的文字,就没法按文字锚点定位这处图在第几页"
+        "——换成同一份文档的 PDF 版再试,那种格式的编号本来就是页号。"
+    ),
+    "pdfimages_failed": (
+        "文档转成 PDF 了,但列不出页面里的图,就没法把这处图的页号钉死"
+        "——换成同一份文档的 PDF 版再试,那种格式的编号本来就是页号。"
+    ),
 }
 #: 没在上面列出的 kind(理论上不该出现,但沙箱片段变了而这张表没跟上时会
 #: 出现)—— 这不等于"这处内容不存在",先怀疑是基础设施问题。
@@ -193,19 +232,199 @@ _FAILED_UNIT_REASONS: Final[dict[str, str]] = {
     #: 回修第 5 轮 I-2 —— ``failed`` 整个就不是一个列表(沙箱回了 dict / 字符串
     #: 之类),逐页原因根本读不出来,但"有失败信息读不出来"这件事必须说。
     "malformed_failed_list": "沙箱回的失败清单整体格式不合法,逐页原因读不出来",
+    #: Task 4b —— docx 的段落序号解析成页号时的四种**具名**失败。一种都不许
+    #: 退化成"拿 unit 当页号渲一张";每一句都要让模型知道下一步能做什么。
+    #: 锚点原文由 ``_describe_failed_units`` 从记录的 ``anchor`` 字段另外带出,
+    #: 不写进这里的固定句子。
+    "anchor_empty": (
+        "这处图前面没有正文可以当定位锚点(它在文档最开头),定不出它在第几页;"
+        "换成同一份文档的 PDF 版再试,那种格式的编号本来就是页号"
+    ),
+    "anchor_not_found": (
+        "转出来的 PDF 里找不到这处图上面那段文字(排版把它拆行或改写了),"
+        "定不出它在第几页;换成同一份文档的 PDF 版再试"
+    ),
+    "anchor_ambiguous": (
+        "这处图上面那段文字在 PDF 里不止出现在一页上,定不到唯一一页,"
+        "不拿第一页硬凑;换成同一份文档的 PDF 版再试"
+    ),
+    "unit_not_in_inventory": (
+        "这份文档的图清单里没有这个编号;回 read_document 的清单里核对「第 N 处」那个数字再调一次"
+    ),
+}
+
+#: 渲成功、但页号是**回落**得来的,那句必须说出来的话(Task 4b)。
+#: ``rendered`` 里带 ``note`` 的条目走这张表。
+_RENDER_NOTE_REASONS: Final[dict[str, str]] = {
+    "anchor_only_fallback": (
+        "这一页是**按上文的文字锚点**定位的,不是按图本身的位置钉死的 —— 转出来的"
+        "PDF 在锚点那一页和紧邻的下一页都没有可识别的位图(图表、SmartArt、"
+        "EMF/WMF 矢量图转出来就是这种情况)。图有可能落在紧邻的下一页上。"
+    ),
 }
 
 #: New-M1 那条记账用的 unit 占位:产出记录本身就不是 Mapping 时,页号无从读起。
 _UNKNOWN_UNIT: Final = "?"
 
 
+def _is_plain_int(value: object) -> TypeGuard[int]:
+    """真·整数(``True``/``False`` 不算)—— 播报页号前的那道闸。
+
+    ``bool`` 是 ``int`` 的子类,``True`` 会被渲成"第 True 页"。
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+#: ``unit`` 在对模型的文案里用哪个量词。pptx/pdf 的 unit 就是页号(「第 3 页」);
+#: docx 的 unit 是图清单里的条目编号,与 ``document_figures._describe_figure``
+#: 渲的「第 3 处」必须是同一个词 —— 模型是照着那份清单来调这个工具的。
+_UNIT_LABELS: Final[dict[str, str]] = {"docx": "处"}
+_DEFAULT_UNIT_LABEL: Final = "页"
+#: 锚点原文在失败文案里的截断长度,与 ``_describe_figure`` 的 40 同一个量级。
+_ANCHOR_ECHO_CHARS: Final = 40
+
+
 # 沙箱内渲染片段。``os`` / ``json`` / ``_P`` / ``_resolve`` 来自共享的
-# ``_PRELUDE``(见 file_ops)。
-_RENDER_MAIN = """
+# ``_PRELUDE``(见 file_ops);``_docx_inventory`` 来自与 ``document_figures``
+# 共用的 :data:`~orchestrator.tools.document_figures._DOCX_INVENTORY_FRAGMENT`
+# (Task 4b —— 两处各抄一份会让 ``unit`` 指向不同的段落,而且不报错)。
+_RENDER_MAIN = (
+    """
 
 import glob as _glob
 import shutil
 import subprocess
+"""
+    + _DOCX_INVENTORY_FRAGMENT
+    + """
+
+_FORM_FEED = chr(12)
+
+
+def _norm_ws(text):
+    return " ".join(text.split())
+
+
+def _pdf_page_texts(pdf):
+    # 每一页的正文, 空白折叠成单个空格; 读不出来返回 None(**不是**空列表 ——
+    # 空列表会被下游当成"这份 PDF 一页都没有", 那是猜)。
+    #
+    # pdftotext 一次跑整篇, 页与页之间是换页符(0x0c); 最后一页后面**也有**
+    # 一个, 所以 split 出来的最后一个元素恒为 "" —— 只丢这**一个**。真正的
+    # 空白页本身也是 "", 多丢一个会让它之后所有页号整体偏移一页。
+    try:
+        result = subprocess.run(["pdftotext", pdf, "-"], capture_output=True,
+                                timeout=_P["convert_timeout_s"], check=False)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.decode("utf-8", "replace").split(_FORM_FEED)
+    if parts and parts[-1] == "":
+        parts.pop()
+    return [_norm_ws(part) for part in parts]
+
+
+def _row_short_edge_upper_pt(cols):
+    # `pdfimages -list` 的一行 -> 这张位图在页面上**最大可能**的显示短边(pt);
+    # 读不出来返回 None(调用方据此**保留**这一行, 见下面)。
+    #
+    # 列位置: page/num/type/width/height 从**左**数(0..4), x-ppi/y-ppi 从
+    # **右**数(-4/-3, 右边还剩 size 与 ratio 两列)。ppi 不从左数是因为中间
+    # 的 "object ID" 那两列对内联图像会塌成一个 "[inline]" token, 左数会整体
+    # 错位; 右端这几列的宽度不受影响。
+    #
+    # ppi 在 -list 里是**取整**过的(实测 poppler 21.11.0), 反推尺寸因此带
+    # 误差。这里算的是"按最小可能 ppi(ppi-0.5)反推出来的最大可能尺寸",
+    # 让误差一律偏向**保留**这一行 —— 把一张真图误判成装饰图会把它从候选里
+    # 删掉, 那才是会让页号选错的方向。
+    try:
+        w_px, h_px = float(cols[3]), float(cols[4])
+        x_ppi, y_ppi = float(cols[-4]), float(cols[-3])
+    except (ValueError, IndexError):
+        return None
+    if w_px <= 0 or h_px <= 0 or x_ppi <= 0.5 or y_ppi <= 0.5:
+        return None
+    return min(w_px * 72.0 / (x_ppi - 0.5), h_px * 72.0 / (y_ppi - 0.5))
+
+
+def _pdf_figure_pages(pdf):
+    # 转出来的 PDF 里**位图**落在哪些页(升序去重); 读不出来返回 None。
+    #
+    # 实测(poppler 21.11.0, 2026-09-23): 前两行是表头(列名 + 横线), 之后
+    # 每**画一次**位图一行, 第 1 列是页号, 按页号升序。同一个 XObject 被多页
+    # 引用(页眉 logo 的真实形状)时**每页各一行**; 带 alpha 的图会多出一行
+    # type=smask、页号与它相同。矢量算子在这里一行都没有 —— LibreOffice 把
+    # 图表/SmartArt/EMF 渲成的正是矢量算子, 那种图走回落分支。
+    #
+    # 装饰图按与清单侧**同一条**阈值(_MIN_EDGE_PT)滤掉: 页眉/页脚 logo 不在
+    # word/document.xml 里(它住在 word/header1.xml), 清单根本看不见它, 而它
+    # 在每一页都有行 —— 不滤的话"页号 >= 邻域页的第一行"恒等于邻域页自己,
+    # 跨页那一档就永远修不对。**只丢能正面确认是装饰图的行**: 尺寸读不出来的
+    # 行一律留着。
+    try:
+        result = subprocess.run(["pdfimages", "-list", pdf], capture_output=True,
+                                timeout=_P["render_timeout_s"], check=False)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    pages = set()
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        cols = line.split()
+        if not cols or not cols[0].isdigit():
+            continue
+        short_edge = _row_short_edge_upper_pt(cols)
+        if short_edge is not None and short_edge < _MIN_EDGE_PT:
+            continue
+        pages.add(int(cols[0]))
+    return sorted(pages)
+
+
+def _docx_context(docx_full, pdf):
+    # docx 的 unit 是**段落序号**, 渲染前必须解析成页号。返回 (ctx, 错误名)。
+    try:
+        figures, _skipped = _docx_inventory(docx_full)
+    except Exception:
+        return None, "docx_inventory_failed"
+    # 同一段里有两张图时 _docx_inventory 给出两条 unit 相同的记录, 它们的
+    # anchor 逐字相同, 收进 dict 自然合一(这层歧义在清单那边就存在: 两条
+    # 都显示成"第 N 处")。
+    anchors = {}
+    for fig in figures:
+        anchors[fig["unit"]] = fig.get("anchor") or ""
+    pages = _pdf_page_texts(pdf)
+    if pages is None:
+        return None, "pdftotext_failed"
+    image_pages = _pdf_figure_pages(pdf)
+    if image_pages is None:
+        return None, "pdfimages_failed"
+    return {"anchors": anchors, "pages": pages, "image_pages": image_pages}, None
+
+
+def _resolve_docx_page(ctx, unit):
+    # 返回 (页号, 说明, 锚点文字)。页号为 None 表示**具名失败**——一处都不猜。
+    anchors = ctx["anchors"]
+    if unit not in anchors:
+        return None, "unit_not_in_inventory", None
+    anchor = _norm_ws(anchors[unit])
+    if not anchor:
+        return None, "anchor_empty", None
+    hits = [n for n, text in enumerate(ctx["pages"], 1) if anchor in text]
+    if not hits:
+        return None, "anchor_not_found", anchor
+    if len(hits) > 1:
+        return None, "anchor_ambiguous", anchor
+    near = hits[0]
+    # anchor 是图**正上方**那段文字的尾部, 所以图要么在含 anchor 的那一页,
+    # 要么被挤到紧邻的下一页 —— 邻域**之外**的位图行不是这处图, 不拿它定页。
+    for page in ctx["image_pages"]:
+        if page < near:
+            continue
+        if page <= near + 1:
+            return page, None, anchor
+        break
+    return near, "anchor_only_fallback", anchor
 
 
 def _render_sha(full):
@@ -258,8 +477,15 @@ def _main():
         return {"ok": False, "error": "not_found"}
     except OSError as exc:
         return {"ok": False, "error": "io_error", "detail": str(exc)}
-    if shutil.which("soffice") is None or shutil.which("pdftoppm") is None:
-        return {"ok": False, "error": "soffice_missing"}
+    ext = os.path.splitext(full)[1].lower()
+    # docx 多用两件 poppler 工具把段落序号解析成页号(见 _docx_context)。缺了
+    # 它们只能猜页, 而猜页正是这个功能要消灭的东西 —— 与缺 soffice 同档处理。
+    needed = ["soffice", "pdftoppm"]
+    if ext == ".docx":
+        needed += ["pdftotext", "pdfimages"]
+    missing = [name for name in needed if shutil.which(name) is None]
+    if missing:
+        return {"ok": False, "error": "soffice_missing", "detail": ",".join(missing)}
     try:
         render_sha = _render_sha(full)
     except OSError as exc:
@@ -270,7 +496,6 @@ def _main():
     # _validate_rendered_rel 那道闸。
     out_dir = os.path.join(_P["ws"], _P["out_rel"], render_sha)
     os.makedirs(out_dir, exist_ok=True)
-    ext = os.path.splitext(full)[1].lower()
     if ext == ".pdf":
         pdf = full
     else:
@@ -303,9 +528,25 @@ def _main():
         if not pdfs:
             return {"ok": False, "error": "convert_failed"}
         pdf = pdfs[0]
+    docx_ctx = None
+    if ext == ".docx":
+        docx_ctx, ctx_error = _docx_context(full, pdf)
+        if ctx_error is not None:
+            return {"ok": False, "error": ctx_error}
     rendered = []
     failed = []
     for unit in _P["units"]:
+        # docx 的 unit 是段落序号不是页号, 先解析; 解析不出来就**具名失败**,
+        # 绝不拿 unit 当页号硬渲 —— 那会渲出一张无关页并声称它是这处图。
+        page, note, anchor = unit, None, None
+        if docx_ctx is not None:
+            page, note, anchor = _resolve_docx_page(docx_ctx, unit)
+            if page is None:
+                record = {"unit": unit, "why": note}
+                if anchor:
+                    record["anchor"] = anchor
+                failed.append(record)
+                continue
         # 每个 unit 自己的私有产出目录(回修 C2)—— out_dir 跨调用累积, 一个
         # 只按 unit 数字子串匹配的 glob 会把其它 unit 的残留产物错当成这一页。
         # 渲染前先清空再建、并确认清空真的生效(回修第 2 轮 New-2 + 第 3 轮
@@ -322,7 +563,7 @@ def _main():
         try:
             result = subprocess.run(
                 ["pdftoppm", "-jpeg", "-r", str(_P["dpi"]),
-                 "-f", str(unit), "-l", str(unit), pdf, prefix],
+                 "-f", str(page), "-l", str(page), pdf, prefix],
                 capture_output=True, timeout=_P["render_timeout_s"], check=False)
         except Exception as exc:
             failed.append({"unit": unit, "why": type(exc).__name__})
@@ -339,9 +580,15 @@ def _main():
             failed.append({"unit": unit, "why": "not_rendered"})
             continue
         got = hits[-1]
-        rendered.append({"unit": unit,
-                         "rel": os.path.relpath(got, _P["ws"]),
-                         "bytes": os.path.getsize(got)})
+        # "page" 是**真正渲了哪一页**, 与 unit 不是一回事(docx 的 unit 是图
+        # 清单编号)。宿主拿它播报, 不许拿 unit 冒充页号 —— 一个具体而错误的
+        # 页码比不报页码坏得多(回修第 4 轮 New-M2 的同一条教训)。
+        item = {"unit": unit, "page": page,
+                "rel": os.path.relpath(got, _P["ws"]),
+                "bytes": os.path.getsize(got)}
+        if note:
+            item["note"] = note
+        rendered.append(item)
     if not rendered:
         return {"ok": False, "error": "render_failed", "failed": failed}
     return {"ok": True, "rendered": rendered, "failed": failed}
@@ -349,6 +596,7 @@ def _main():
 
 print(json.dumps(_main()))
 """
+)
 
 
 def build_render_wrapper(
@@ -530,8 +778,15 @@ def _normalize_failed(raw: object) -> list[Any]:
     return [{"unit": _UNKNOWN_UNIT, "why": "malformed_failed_list"}]
 
 
-def _describe_failed_units(failed: object) -> str:
+def _describe_failed_units(failed: object, *, unit_label: str = _DEFAULT_UNIT_LABEL) -> str:
     """把 ``failed: [{"unit": n, "why": ...}]`` 渲成一句人话(回修 I4)。
+
+    ``unit_label`` 是 ``unit`` 的量词(见 :data:`_UNIT_LABELS`)—— docx 的 unit
+    不是页号,照着"第 N 页"说会把一个**不存在的页码**塞给模型。
+
+    ``anchor`` 字段(Task 4b,只有 docx 的锚点类失败带)会原样回显给模型:
+    失败时模型最需要知道的就是"我问的这处图,平台是拿哪段文字去定位的",
+    它在 ``read_document`` 的正文里能找到那一段,据此换个编号或换份文档。
 
     空输入 → 空串(不加多余的句子)。
 
@@ -545,14 +800,34 @@ def _describe_failed_units(failed: object) -> str:
         return ""
     parts: list[str] = []
     for item in failed:
+        anchor: object = None
         if isinstance(item, Mapping):
             unit = item.get("unit")
             why = str(item.get("why", "unknown"))
+            anchor = item.get("anchor")
         else:
             unit, why = _UNKNOWN_UNIT, "malformed_failed_item"
         reason = _FAILED_UNIT_REASONS.get(why, why)
-        parts.append(f"第 {unit} 页没取到({reason})")
+        echo = f";平台是拿这段文字定位的:{str(anchor)[:_ANCHOR_ECHO_CHARS]}" if anchor else ""
+        parts.append(f"第 {unit} {unit_label}没取到({reason}{echo})")
     return "".join(f"{part}。" for part in parts)
+
+
+def _describe_render_notes(rendered: Sequence[Mapping[str, Any]], *, unit_label: str) -> str:
+    """成功渲出来、但页号是**回落**得来的那些条目,把保留意见说给模型(Task 4b)。
+
+    这是"渲成功"与"页号可信"两件事的分离:回落分支给出的页是锚点那一页,
+    它**不是**被图本身的位置钉死的。不说出来,模型会把一张可能不含目标图的页
+    当成确凿证据 —— 那正是这个功能要消灭的静默失效换个位置重现。
+    """
+    parts: list[str] = []
+    for item in rendered:
+        note = item.get("note")
+        if not note:
+            continue
+        explanation = _RENDER_NOTE_REASONS.get(str(note), str(note))
+        parts.append(f"第 {item.get('unit')} {unit_label}:{explanation}")
+    return "".join(parts)
 
 
 @dataclass
@@ -580,7 +855,9 @@ class ReadPageTool:
                 "document's figure map (shown by read_document) told you about. "
                 f"Only {renderable} are renderable today; other formats are refused "
                 "with an explanation. "
-                "'units' are 1-based page/slide numbers; at most "
+                "'units' are the 1-based entry numbers the figure map shows "
+                "(page/slide numbers for PDF and PPTX; for DOCX they identify "
+                "the figure, and the page is resolved for you); at most "
                 f"{MAX_PAGES_PER_CALL} per call — call it again for more. Paths "
                 "are relative to your own workspace root."
             ),
@@ -595,7 +872,8 @@ class ReadPageTool:
                         "type": "array",
                         "items": {"type": "integer", "minimum": 1},
                         "description": (
-                            f"1-based page/slide numbers to render (max {MAX_PAGES_PER_CALL})."
+                            "1-based entry numbers from the figure map to render "
+                            f"(max {MAX_PAGES_PER_CALL})."
                         ),
                     },
                 },
@@ -642,10 +920,13 @@ class ReadPageTool:
             tool="read_page",
             seed_files=self.skill_seed_files,
         )
+        label = _UNIT_LABELS.get(ext, _DEFAULT_UNIT_LABEL)
         if not env.get("ok"):
             kind = str(env.get("error", "unknown"))
             msg = f"无法渲染 {raw}:{_explain_error(kind, env.get('detail'))}"
-            per_unit = _describe_failed_units(_normalize_failed(env.get("failed")))
+            per_unit = _describe_failed_units(
+                _normalize_failed(env.get("failed")), unit_label=label
+            )
             if per_unit:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)
@@ -654,7 +935,10 @@ class ReadPageTool:
         # 根相对路径才能造出 NasWorkspaceImageResolver 能解析的 ref。
         scope = store_scope(ws, agent_key=ctx.agent_key)
         refs: list[str] = []
-        rendered_units: list[int] = []
+        #: ``(unit, page)`` —— 两者对 pptx/pdf 相等,对 docx 不等(Task 4b)。
+        rendered_units: list[tuple[int, int]] = []
+        #: 页号是回落得来的那些条目,原样留给 ``_describe_render_notes``。
+        notes: list[Mapping[str, Any]] = []
         # 回修第 2 轮 New-3 —— _validate_rendered_rel 剔掉的 unit 不能悄悄消失:
         # 函数自己的 docstring 说"不吞",但只做到了不接受那个 ref,没做到告诉
         # 模型"你请求的这一页丢了"。并进下面统一的 failed 播报里,不单独起一套
@@ -679,12 +963,18 @@ class ReadPageTool:
                 continue
             host_rel = scoped_path(scope, safe_rel)
             refs.append(workspace_figure_ref(ctx.tenant_id, ctx.user_id, host_rel))
-            if isinstance(unit, int) and not isinstance(unit, bool):
-                rendered_units.append(unit)
+            # ``page`` 缺席时按 ``page == unit`` 处理 —— 那是 pptx/pdf 的**定义**
+            # (unit 就是页号),片段对 docx 一律显式带上。这不是在替片段兜底:
+            # unit 本身读不出来时下面照样退回只报张数。
+            page = item.get("page", unit)
+            if _is_plain_int(unit) and _is_plain_int(page):
+                rendered_units.append((unit, page))
+            if item.get("note"):
+                notes.append(item)
         all_failed = _normalize_failed(env.get("failed")) + rejected
         if not refs:
             msg = f"无法渲染 {raw}:没有取到任何页。"
-            per_unit = _describe_failed_units(all_failed)
+            per_unit = _describe_failed_units(all_failed, unit_label=label)
             if per_unit:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)
@@ -694,13 +984,24 @@ class ReadPageTool:
         # unit:"7" 与 unit:"8"(字符串形态)加两条合法 rel 时,模型被告知
         # "已渲染 d.pptx 第 2 页",而上下文里躺的是第 7、8 页 —— 一个具体而
         # 错误的页码比不报页码坏得多。读不出页号时就只报张数。
+        #
+        # Task 4b —— docx 的 unit 不是页号,"第 7 处"渲出来的可能是第 3 页。
+        # 单说 unit 会让模型以为文档有第 7 页,单说页号又对不上它问的那处图,
+        # 所以两个都说。pptx/pdf 的 unit 与 page 按定义相等,措辞一字不变。
         if rendered_units:
-            pages = "、".join(str(u) for u in rendered_units)
-            head = f"已渲染 {raw} 第 {pages} 页"
+            if label != _DEFAULT_UNIT_LABEL:
+                shown = "、".join(f"第 {u} {label}(文档第 {p} 页)" for u, p in rendered_units)
+                head = f"已渲染 {raw} {shown}"
+            else:
+                pages = "、".join(str(u) for u, _ in rendered_units)
+                head = f"已渲染 {raw} 第 {pages} {label}"
         else:
             head = f"已渲染 {raw} {len(refs)} 页"
         content = f"{head},已放进你的上下文 —— 需要仔细看细节时用 ask_image 问它。"
-        per_unit = _describe_failed_units(all_failed)
+        caveats = _describe_render_notes(notes, unit_label=label)
+        if caveats:
+            content = f"{content} {caveats}"
+        per_unit = _describe_failed_units(all_failed, unit_label=label)
         if per_unit:
             content = f"{content} {per_unit}"
         return ToolResult(
