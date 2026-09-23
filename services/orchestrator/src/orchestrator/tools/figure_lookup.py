@@ -12,12 +12,21 @@
    形状合法的渲染页,取修改时间最新的那一张;
 2. **新鲜度闸**:文档自己的修改时间晚于那张渲染 → 不采用,显式失败,让模型重渲。
 
-闸的道理:渲染发生在文档最后一次修改**之后**,渲的就是当前内容。错了的代价是
-NAS 的 mtime 语义异常时误报「改过了请重渲」—— 可见、可恢复,不会静默看错页。
+闸的道理:渲染发生在文档最后一次修改**之后**,渲的就是当前内容。两个方向都会错:
+
+* **误报**:NAS 的 mtime 语义异常时报「改过了请重渲」—— 可见、可恢复。
+* **漏报(残余风险,会静默看错页)**:文档被换成一份**修改时间更早**的内容 ——
+  沙箱里 ``cp -p`` / ``tar x`` / ``unzip`` 都会保留原文件的 mtime —— 闸看到的是
+  「文档比渲染旧」,于是放行,模型看到的是**换之前**那份内容的页。mtime 闸挡不住
+  mtime 倒退;要挡住得比对内容哈希(``_render_sha``),那正是上面说的不在宿主复刻
+  的东西。
 
 **只用** :meth:`WorkspaceStore.list_dir`,而且只往列表里**确认是目录**的条目里走:
 NAS 实现对不存在的目录抛内部异常、内存替身回空列表,两者对「不存在」的说法不同;
 只走确认过的条目,两者的答案就一样(「SQL↔内存 store 谓词必同义」的同一条规矩)。
+有两处**不经确认**直接列(作用域根本身;本 run 自己的目录,见
+:func:`_rendered_candidates`),那两处把 NAS 的「不存在」接住、当空处理 —— 只接
+「不存在」,越界与权限错误照样抛。
 ``list_dir`` 用 ``lstat``,符号链接不会被当成目录走进去。
 
 形状判据是 :func:`~expert_work.persistence.is_rendered_figure_rel`,不在这里写第二份。
@@ -36,12 +45,14 @@ from expert_work.persistence import (
     WORKSPACE_OVERFLOW_DIR,
     is_rendered_figure_rel,
 )
+from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
 from orchestrator.tools.read_page import (
     _DEFAULT_UNIT_LABEL,
     _UNIT_LABELS,
     document_sha,
     workspace_figure_ref,
 )
+from orchestrator.tools.sandbox import WorkspaceFileNotFoundError
 from orchestrator.tools.workspace_paths import resolve_scope
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
 from orchestrator.tools.workspace_store import WorkspaceDirEntry, WorkspaceStore
@@ -69,6 +80,18 @@ class _ScopeLister:
         )
         return {entry.name: entry for entry in listing.entries}
 
+    async def entries_if_present(self, rel: str) -> dict[str, WorkspaceDirEntry]:
+        """同 :meth:`entries`,但目录不存在时回空 —— 只接「不存在」,别的错误照抛。
+
+        NAS 对不存在的目录抛它模块内部的 ``_WorkspacePathNotFoundError``(越界是
+        ``WorkspacePathEscapeError``、读不动是 ``WorkspacePermissionError``,都不接);
+        内存替身本来就回空列表。
+        """
+        try:
+            return await self.entries(rel)
+        except (_WorkspacePathNotFoundError, WorkspaceFileNotFoundError):
+            return {}
+
     async def subdirs(self, rel: str) -> list[str]:
         return [name for name, entry in (await self.entries(rel)).items() if entry.is_dir]
 
@@ -83,7 +106,12 @@ class _ScopeLister:
         for index, part in enumerate(parts):
             if index > 0 and (found is None or not found.is_dir):
                 return None
-            found = (await self.entries(current)).get(part)
+            # 第一层是作用域根本身,没人确认过它存在(一个还没写过任何文件的 agent
+            # 就没有这个目录);往下每一层都来自上一层的列表,已经确认过了。
+            listing = await (
+                self.entries_if_present(current) if index == 0 else self.entries(current)
+            )
+            found = listing.get(part)
             if found is None:
                 return None
             current = f"{current}/{part}" if current else part
@@ -98,13 +126,15 @@ async def resolve_rendered_figure(
     agent_key: str,
     path: str,
     unit: int,
+    run_id: UUID | None = None,
 ) -> str:
     """``path`` 第 ``unit`` 页(docx 为第 ``unit`` 处)最新一次渲染的工作区 ref。
 
     ``path`` 是已经过 ``file_ops._require_path`` 的值 —— 与 ``read_page`` 算
     ``<doc-sha>`` 用的同一个输入。解析不了抛 ``ValueError``;文档不在、没渲过、
     渲完文档又改过,都抛 ``FileNotFoundError``(文字说清下一步);工作区后端不报
-    修改时间、闸没法判,抛 ``RuntimeError``。
+    修改时间、闸没法判,抛 ``RuntimeError``。``run_id`` 是当前 run,它自己的目录
+    先查(见 :func:`_rendered_candidates`)。
     """
     doc_sha = document_sha(path, agent_key=agent_key)
     if doc_sha is None:
@@ -116,9 +146,12 @@ async def resolve_rendered_figure(
     label = _UNIT_LABELS.get(PurePosixPath(path).suffix.lower().lstrip("."), _DEFAULT_UNIT_LABEL)
     document = await lister.entry_at(PurePosixPath(rel).parts)
     if document is None or document.is_dir:
-        msg = f"文档 {path} 不在工作区里了,看不了它的第 {unit} {label}。"
+        msg = (
+            f"这个 Agent 的工作区里找不到文档 {path!r},它的第 {unit} {label}也就没有渲染过 —— "
+            f"核对路径后调用 read_page(path={path!r}, units=[{unit}])。"
+        )
         raise FileNotFoundError(msg)
-    candidates = await _rendered_candidates(lister, doc_sha=doc_sha, unit=unit)
+    candidates = await _rendered_candidates(lister, doc_sha=doc_sha, unit=unit, run_id=run_id)
     if not candidates:
         msg = (
             f"{path} 的第 {unit} {label}还没渲染 —— "
@@ -143,20 +176,45 @@ async def resolve_rendered_figure(
     return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, newest.rel))
 
 
-async def _rendered_candidates(lister: _ScopeLister, *, doc_sha: str, unit: int) -> list[_Rendered]:
-    """``.tool_results/*/figures/<doc_sha>/*/_u<unit>/`` 下形状合法的全部渲染页。"""
-    if not await lister.has_dir("", WORKSPACE_OVERFLOW_DIR):
-        return []
+async def _rendered_candidates(
+    lister: _ScopeLister, *, doc_sha: str, unit: int, run_id: UUID | None
+) -> list[_Rendered]:
+    """``.tool_results/*/figures/<doc_sha>/*/_u<unit>/`` 下形状合法的全部渲染页。
+
+    **本 run 自己的目录先直接查**,不经 ``.tool_results`` 的列表:那个列表有条目
+    上限(``list_dir`` 默认 2000)、按名字截断,run 目录积累多了之后,本 run 刚渲
+    出来的页可能正好被截掉 —— 模型刚调完 read_page 就被告知「还没渲染」,只会反复
+    重渲。其余 run 仍按列表扫,截掉的只是更早的 run。
+    """
     found: list[_Rendered] = []
-    for run_id in await lister.subdirs(WORKSPACE_OVERFLOW_DIR):
-        run_dir = f"{WORKSPACE_OVERFLOW_DIR}/{run_id}"
-        if not await lister.has_dir(run_dir, RENDERED_FIGURE_DIR):
+    own = str(run_id) if run_id is not None else None
+    if own is not None:
+        own_dir = f"{WORKSPACE_OVERFLOW_DIR}/{own}"
+        if RENDERED_FIGURE_DIR in await _subdir_names(lister, own_dir):
+            found.extend(await _run_pages(lister, own_dir, doc_sha=doc_sha, unit=unit))
+    if not await lister.has_dir("", WORKSPACE_OVERFLOW_DIR):
+        return found
+    for name in await lister.subdirs(WORKSPACE_OVERFLOW_DIR):
+        run_dir = f"{WORKSPACE_OVERFLOW_DIR}/{name}"
+        if name == own or not await lister.has_dir(run_dir, RENDERED_FIGURE_DIR):
             continue
-        figures_dir = f"{run_dir}/{RENDERED_FIGURE_DIR}"
-        if not await lister.has_dir(figures_dir, doc_sha):
-            continue
-        found.extend(await _unit_pages(lister, f"{figures_dir}/{doc_sha}", unit=unit))
+        found.extend(await _run_pages(lister, run_dir, doc_sha=doc_sha, unit=unit))
     return found
+
+
+async def _subdir_names(lister: _ScopeLister, rel: str) -> set[str]:
+    entries = await lister.entries_if_present(rel)
+    return {name for name, entry in entries.items() if entry.is_dir}
+
+
+async def _run_pages(
+    lister: _ScopeLister, run_dir: str, *, doc_sha: str, unit: int
+) -> list[_Rendered]:
+    """一个 run 目录(已确认有 ``figures/``)里这份文档第 ``unit`` 页的渲染页。"""
+    figures_dir = f"{run_dir}/{RENDERED_FIGURE_DIR}"
+    if not await lister.has_dir(figures_dir, doc_sha):
+        return []
+    return await _unit_pages(lister, f"{figures_dir}/{doc_sha}", unit=unit)
 
 
 async def _unit_pages(lister: _ScopeLister, doc_dir: str, *, unit: int) -> list[_Rendered]:

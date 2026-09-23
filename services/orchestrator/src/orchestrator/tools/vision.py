@@ -230,6 +230,7 @@ class AskImageTool:
             agent_key=ctx.agent_key,
             path=path,
             unit=unit,
+            run_id=ctx.run_id,
         )
         return ref, {"path": path, "unit": unit}
 

@@ -24,6 +24,7 @@ from orchestrator.multimodal import (
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import document_sha, workspace_figure_ref
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
+from orchestrator.tools.sandbox import WorkspacePermissionError
 from orchestrator.tools.vision import AskImageTool
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
 
@@ -579,10 +580,10 @@ async def test_ask_image_without_a_workspace_store_has_no_short_form() -> None:
     """没接工作区存储:短形态不存在 —— 调用被拒,描述与参数里也不许提它。"""
     tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
     spec = tool.spec
-    assert "path" not in spec.parameters["properties"]
-    assert "unit" not in spec.parameters["properties"]
-    assert "'path'" not in spec.description
-    assert "unit" not in spec.description
+    assert set(spec.parameters["properties"]) == {"image_ref", "question"}
+    for word in ("path", "unit", "read_page"):
+        assert word not in spec.description
+        assert word not in str(spec.parameters)
 
     with pytest.raises(ValueError, match="only accepts 'image_ref'"):
         await tool.call({"path": _DOC, "unit": 10, "question": "?"}, ctx=_ctx(user_id=uuid4()))
@@ -597,3 +598,77 @@ def test_ask_image_with_a_workspace_store_offers_both_forms() -> None:
     assert {"path", "unit", "image_ref", "question"} <= set(spec.parameters["properties"])
     assert spec.parameters["required"] == ["question"]
     assert "Prefer this for document pages" in spec.description
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_in_an_agent_workspace_that_does_not_exist_yet(
+    tmp_path: Path,
+) -> None:
+    """一个还没写过任何文件的 agent:NAS 列作用域根就是「不存在」。要落成与「还没渲染」
+    同一类的失败,并指出下一步,而不是一句 ``workspace path not found: '.'``。"""
+    tenant, user = uuid4(), uuid4()
+    (tmp_path / str(tenant) / str(user)).mkdir(parents=True)
+    vl = _FakeVLCaller()
+
+    with pytest.raises(FileNotFoundError) as info:
+        await _short_form_tool(tmp_path, vl).call(
+            {"path": _DOC, "unit": 10, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        )
+
+    assert f"read_page(path={_DOC!r}, units=[10])" in str(info.value)
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_does_not_hide_a_permission_error() -> None:
+    """只把「不存在」当空;读不动不是不存在,原样抛。"""
+    store = RecordingWorkspaceStore(workspace_list_error=WorkspacePermissionError("nope"))
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver(), workspace_store=store)
+
+    with pytest.raises(WorkspacePermissionError):
+        await tool.call(
+            {"path": _DOC, "unit": 10, "question": "?"},
+            ctx=_ctx(tenant_id=uuid4(), user_id=uuid4(), agent_key=_AGENT),
+        )
+
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_finds_this_run_page_past_the_listing_cap() -> None:
+    """``.tool_results`` 的列表按名字截到 2000 条;本 run 的目录名排在最后、被截掉时,
+    它刚渲出来的页仍要找得到。"""
+    tenant, user = uuid4(), uuid4()
+    stamp = datetime(2026, 9, 23, tzinfo=UTC)
+    rel = _figure_rel(run=_OLD_RUN)  # 全 f,名字排在最后
+    decoys = [
+        WorkspaceFileEntry(
+            path=f"agents/{_AGENT}/.tool_results/00000000-0000-4000-8000-{i:012d}/x.json",
+            size=1,
+            mtime=stamp,
+        )
+        for i in range(2000)
+    ]
+    store = RecordingWorkspaceStore(
+        workspace_files=[
+            WorkspaceFileEntry(path=f"agents/{_AGENT}/{_DOC}", size=1, mtime=stamp),
+            WorkspaceFileEntry(path=f"agents/{_AGENT}/{rel}", size=1, mtime=stamp),
+            *decoys,
+        ]
+    )
+    listing = await store.list_dir(
+        tenant_id=tenant, user_id=user, scope=f"agent:{_AGENT}", path=".tool_results"
+    )
+    assert listing.truncated
+    assert _OLD_RUN not in {entry.name for entry in listing.entries}, "没截到本 run,验不到"
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver(), workspace_store=store)
+
+    await tool.call(
+        {"path": _DOC, "unit": 10, "question": "?"},
+        ctx=ToolContext(tenant_id=tenant, user_id=user, agent_key=_AGENT, run_id=UUID(_OLD_RUN)),
+    )
+
+    assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
