@@ -93,7 +93,8 @@ jpeg → glob 找产物。三个实测坑写进片段:
    **归因:一页上的行先让别的清单条目认领**(回修第 2 轮 I-C)。片段手里有
    **整份**清单,所以每条条目自己的锚点页都算得出来;页 ``p`` 上的行,凡是有
    另一条条目的锚点页正好是 ``p``,就先归它。剩下"解释不掉"的行才算可能是
-   这一处图。
+   这一处图。**前提是 ``p`` 上的行够所有落在 ``p`` 上的条目分**(回修第 3 轮
+   Critical-1 的对称性检查,见下)。
 
    没有这一步的话,警报会常响到失去意义:实测一份"一页一张图"的普通报告
    (3 页 3 图),**3 张里 2 张**挂上歧义 note,而 3 张的页号**全是对的**。
@@ -123,12 +124,22 @@ jpeg → glob 找产物。三个实测坑写进片段:
 
    归因把这一档变窄了(能被别的条目认领的行不再参与),**没有消灭它**。
 
-   **归因本身也带进来一个新的错配面**(回修第 2 轮 I-C 自报):它拿"另一条清单
-   条目的锚点页正好是 ``p``"当作"``p`` 上那一行属于它"的证据。那条条目自己的
-   锚点解析错了、或者**它的**图也被挤到了下一页时,这个证据就是假的,本该属于
-   目标图的那一行会被错认走 —— 后果是少响一次 note,或者把页钉到下一页。
-   ``near_by_unit`` 只收"锚点在整篇里**唯一**命中一页"的条目,算一道收窄,
-   不是消灭。
+   **归因拿"另一条清单条目的锚点页正好是 ``p``"当作"``p`` 上那一行属于它"的
+   证据,而这个证据只在行够分的时候才成立**(回修第 3 轮 Critical-1)。所以
+   认领前有一道**对称性检查**:``rows(p) >= entries(p)`` 才允许认领,行不够时
+   那一页谁也不许认领。
+
+   不做这道检查的后果是**互认领**:两条条目锚点都落在 ``p``、而 ``p`` 只有一行
+   时,各自都把那一行算成"对方的",于是**双双**被静默推到 ``p+1`` ——
+   实测 216 次对照真跑里 24 条是这个形状,**错页与撤掉 note 同时发生**。
+   触发只需要"一页两图"的普通报告。
+
+   **残留**(对称性检查也兜不住的):两条条目的锚点页**不同**、而其中一条的
+   锚点解析错了(它的图其实不在它自己的锚点页上)时,它仍会错认走本该属于目标
+   图的那一行 —— 后果同样是"少响一次 note"与"把页钉到相邻页"同时发生。
+   ``near_by_unit`` 只收"锚点在整篇里**唯一**命中一页"的条目,这道收窄对**互
+   认领那个方向完全无效**(互认领的两条各自都是唯一命中),真正兜住互认领的是
+   上面那道对称性检查;它挡的是另一类,即锚点根本定不到唯一一页的条目。
 
    本地没有信号能把这两种情形与"目标图确实是那一页上那张位图"分开 —— 后者
    正是 b 要修的那一档,判据完全相同。所以这里不猜,也不假装它被消灭了。
@@ -251,10 +262,20 @@ _ERROR_EXPLANATIONS: Final[dict[str, str]] = {
         "——换成同一份文档的 PDF 版再试,那条路不需要它们。"
     ),
 }
-#: 解释里带**猜测**成分的 kind(回修第 2 轮 A)。``render_failed`` 的那句
-#: "大概率是页码超出了文档实际页数" 只在没有逐条原因时才值得说;片段一旦给了
-#: 具名的 per-unit 原因,它就成了摆在真原因前面的一个错归因。
-_GUESSWORK_ERRORS: Final[frozenset[str]] = frozenset({"render_failed"})
+#: 解释里带**对冲式因果猜测**的 kind(回修第 2 轮 A)—— "大概率是页码超出了
+#: 文档实际页数"、"文件可能已损坏"。这类话只在没有逐条原因时才值得说;片段一旦
+#: 给了具名的 per-unit 原因,它就成了摆在真原因前面的一个错归因。
+#:
+#: 回修第 3 轮 Minor-1 —— 这里原来只收了 ``render_failed`` 一个,注释还写着
+#: "今天只有它含猜测成分",**那是个枚举不全的否定断言**:另外两条也带"文件可能
+#: 已损坏"。它今天无害的真正理由是别的 —— 片段里**只有一处** ``ok: False``
+#: 返回带 ``failed``(``render_failed`` 那处),其余都是不带 ``failed`` 的早返,
+#: 所以那两条的 ``per_unit`` 恒空、这道闸根本开不了。**结论对、立论是"恰好
+#: 为真"**,与本轮刚修掉的 M-4 soffice 闸逐字同形。按集合自己的定义补齐,
+#: 不靠"今天到不了"当理由。
+_GUESSWORK_ERRORS: Final[frozenset[str]] = frozenset(
+    {"render_failed", "convert_failed", "docx_inventory_failed"}
+)
 
 #: 没在上面列出的 kind(理论上不该出现,但沙箱片段变了而这张表没跟上时会
 #: 出现)—— 这不等于"这处内容不存在",先怀疑是基础设施问题。
@@ -501,8 +522,13 @@ def _docx_context(docx_full, pdf):
         hits = [n for n, page_text in enumerate(pages, 1) if text in page_text]
         if len(hits) == 1:
             near_by_unit[other_unit] = hits[0]
+    # 回修第 3 轮 Critical-1 —— 每一页上**落了几条清单条目**, 认领前要拿它与
+    # 那一页的行数做对称性检查(见 _resolve_docx_page)。
+    entries_on_page = {}
+    for other_near in near_by_unit.values():
+        entries_on_page[other_near] = entries_on_page.get(other_near, 0) + 1
     return {"anchors": anchors, "pages": pages, "image_rows": image_rows,
-            "near_by_unit": near_by_unit}, None
+            "near_by_unit": near_by_unit, "entries_on_page": entries_on_page}, None
 
 
 def _resolve_docx_page(ctx, unit):
@@ -529,14 +555,32 @@ def _resolve_docx_page(ctx, unit):
     #
     # 归因规则: 一页上的行, 先让**别的**清单条目按它们自己的锚点页认领, 剩下
     # 的才算"可能是这一处图"。V 的锚点页就是 p 时, p 上的一行归 V 不归 U。
+    #
+    # **但认领前要先过一道对称性检查**(回修第 3 轮 Critical-1): 只有 p 上的
+    # 行数 >= 落在 p 上的条目数时, "这一行是别人的"才算得上证据。行不够分的
+    # 时候(有条目是矢量、或有条目的图被挤到了 p+1), **谁也不知道那行是谁的**,
+    # 于是谁也不许认领。
+    #
+    # 不做这道检查的后果是**互认领**: 两条条目锚点都落在 p、而 p 只有一行时,
+    # 各自都把那一行算成"对方的", 于是**双双**被静默推到 p+1 —— 实测 216 次
+    # 对照真跑里有 24 条是这个形状, 原本对的页被改错、连 note 都一并撤掉。
+    # 触发只需要"一页两图"的普通报告, 正是归因这件事立项时要服务的形状;
+    # 而且行不够分**恰恰就是**「图被挤到下一页」本身, 所以那一档每命中一次,
+    # 它的同页邻居就错一次。
+    #
+    # 行不够时退回"有行就算剩着"——那一族因此回到"锚点页 + 响 note"。这不是
+    # 折中: 那种情形下"这一行属于谁"本来就推不出来, 响 note 才是诚实的答案。
     unexplained = {}
     for page in (near, near + 1):
-        claimed = sum(
-            1
-            for other_unit, other_near in ctx["near_by_unit"].items()
-            if other_unit != unit and other_near == page
-        )
-        left = ctx["image_rows"].get(page, 0) - claimed
+        rows = ctx["image_rows"].get(page, 0)
+        claimed = 0
+        if rows >= ctx["entries_on_page"].get(page, 0):
+            claimed = sum(
+                1
+                for other_unit, other_near in ctx["near_by_unit"].items()
+                if other_unit != unit and other_near == page
+            )
+        left = rows - claimed
         if left > 0:
             unexplained[page] = left
     if not unexplained:

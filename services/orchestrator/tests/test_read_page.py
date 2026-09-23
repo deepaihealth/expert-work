@@ -1120,10 +1120,19 @@ def test_docx_page_resolvers_use_the_short_timeout(
     单文件 ``-n 8`` 下**六次全红**(报成 ``pdftotext_failed``)。CI 跑的是
     ``-n auto``,核数一变就会开始间歇性假红 —— 而本仓每一次假红都要有人去分辨
     它是证人还是病人,这条又恰恰埋在本轮最重要的行为钉上。
-    ``render=5s``(中位数的 280 倍)、``sleep(30)``、``convert=60s``:
-    慢桩仍夹在 ``5 < 30 < 60`` 中间,杀变异能力一点不减。
+    回修第 3 轮 Important-1 —— **界在哪一侧,我上一轮指错了**。当时写"真正的界是
+    ``sleep`` 与 ``render`` 之间那段";不成立:``sleep`` 是墙钟,**不可能提前跑完**,
+    那一侧根本不构成风险。会咬人的是**另一侧**:``[pdfimages]`` 这一档里,
+    **先跑的那个健康 pdftotext 桩必须在 ``render_timeout_s`` 内跑完**,否则
+    报成 ``pdftotext_failed``、断言直接红 —— 第一轮六次全红死的正是这条。
+    而且"中位数的 280 倍"是拿**中位数**说的,中位数恰恰是第一轮判断失误时用的
+    那个统计量。实测 8 路并发 spawn 同形桩 x400:median **0.020s** /
+    p95 **0.029s** / **p99 3.149s / max 3.155s** —— ``render=5s`` 对 p99 只有
+    约 **1.6 倍**余量。余量要按**尾部**算,不是按中位数。
+    现在是 ``render=15s`` / ``sleep(45)`` / ``convert=90s``:对 p99 约 4.8 倍,
+    慢桩仍夹在 ``15 < 45 < 90`` 中间,杀变异能力不变。代价:这条 ~11s 变 ~30s。
     """
-    slow = "import time\ntime.sleep(30)\n"
+    slow = "import time\ntime.sleep(45)\n"
     bodies: dict[str, str] = {
         "pdftotext": _pdftotext_pages("Cover page body text.", _ANCHOR_ONE),
         "pdfimages": _pdfimages_rows([(2, *_BIG_ROW)]),
@@ -1142,8 +1151,8 @@ def test_docx_page_resolvers_use_the_short_timeout(
         "d.docx",
         units=[2],
         out_rel=".tool_results/r1/figures/s",
-        convert_timeout_s=60,
-        render_timeout_s=5,
+        convert_timeout_s=90,
+        render_timeout_s=15,
     )
 
     assert env == {"ok": False, "error": expected_error}
@@ -1195,21 +1204,64 @@ def test_docx_one_figure_per_page_report_is_quiet_and_correct(
     )
 
 
-def test_docx_scenario_b_now_pins_the_next_page(
+def test_docx_next_page_row_claimed_by_a_later_entry_is_not_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """场景 B 升级:锚点页那一行被**别的清单条目**认领光,目标图就钉到下一页。
+    """归因**仍然**起作用的那一档:认领方的锚点页与目标不同(``a1 != a2``)。
 
-    文档:第 1 段文字 + 第 2 段图 A(锚点页 1),第 3 段文字 + 第 4 段图 B
-    (锚点页 1,排版把它挤到了第 2 页)。PDF 第 1 页一行(A)、第 2 页一行(B)。
-    问 B:第 1 页那一行归 A,剩下第 2 页那一行 —— 钉第 2 页,不响 note。
-    这一档上一轮是"渲锚点页 + 披露",现在是**渲对页**。
+    文档:第 1 段文字 + 第 2 段图 B(锚点页 2),第 3 段文字 + 第 4 段图 C
+    (锚点页 3)。PDF 第 2 页一行(B)、第 3 页一行(C)。
+    问 B:邻域 {2,3};第 3 页那一行归 C(第 3 页行数 1 >= 落在第 3 页的条目数 1,
+    对称性检查过),剩下第 2 页那一行 —— 钉第 2 页,**不响 note**。
+    不归因的话两页都剩着行 → 白响一次 note。
+
+    回修第 3 轮 Critical-1 —— 这条以前叫 ``..._scenario_b_now_pins_the_next_page``,
+    用的是"两条条目锚点**同在**第 1 页"的夹具;那个夹具正是**互认领**的形状,
+    对称性检查之后它回到"锚点页 + 响 note"(见
+    ``..._same_page_entries_without_enough_rows_stay_honest``)。
+    真正活下来的改善是 ``a1 != a2`` 这一族,改用它的形状。
     """
     _install_office_stubs(
         tmp_path,
         monkeypatch,
-        pdftotext_body=_pdftotext_pages("Figure A caption. Figure B caption.", "Overflow page."),
-        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW), (2, *_BIG_ROW)]),
+        pdftotext_body=_pdftotext_pages("Cover.", "Figure B caption.", "Figure C caption."),
+        pdfimages_body=_pdfimages_rows([(2, *_BIG_ROW), (3, *_BIG_ROW)]),
+    )
+    _write_docx(
+        tmp_path / "d.docx",
+        _para("Figure B caption."),
+        _figure(),
+        _para("Figure C caption."),
+        _figure(),
+    )
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2
+    assert "note" not in item, "下一页那一行已归属别的条目,不该判歧义"
+
+
+def test_docx_same_page_entries_without_enough_rows_stay_honest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**互认领**必须被对称性检查挡住(回修第 3 轮 Critical-1 的正题)。
+
+    文档:两处图的锚点段落都落在第 1 页,两处图**实际也都在第 1 页**,但其中
+    一处是矢量(``pdfimages`` 看不见),所以第 1 页只有 1 行;第 2 页另有一整幅
+    banner(不在清单里,没人认领)。
+
+    不做对称性检查时:问 A,第 1 页那一行被算成"B 的" → 第 1 页清空 → 只剩第 2 页
+    → 钉第 2 页、**不响 note**;问 B 同理。**两条都错页、都静默**,而它们本来
+    都在第 1 页。行数(1)不够落在第 1 页的条目数(2)分,"那一行是谁的"根本
+    推不出来 —— 这时谁也不许认领,两条都回到"锚点页 + 响 note",页对、话也说了。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Figure A caption. Figure B caption.", "Banner page."),
+        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW), (2, *_BANNER_ROW)]),
     )
     _write_docx(
         tmp_path / "d.docx",
@@ -1219,12 +1271,17 @@ def test_docx_scenario_b_now_pins_the_next_page(
         _figure(),
     )
 
-    env = _run_render(tmp_path, "d.docx", units=[4], out_rel=".tool_results/r1/figures/s")
+    got = {}
+    for unit, out in ((2, "a"), (4, "b")):
+        env = _run_render(tmp_path, "d.docx", units=[unit], out_rel=f".tool_results/r1/f/{out}")
+        assert env["ok"] is True, unit
+        item = env["rendered"][0]
+        got[unit] = (item["page"], item.get("note"))
 
-    assert env["ok"] is True
-    item = env["rendered"][0]
-    assert item["page"] == 2, "锚点页那一行已归属别的条目,页号该落到下一页"
-    assert "note" not in item
+    assert got == {
+        2: (1, "figure_page_ambiguous_fallback"),
+        4: (1, "figure_page_ambiguous_fallback"),
+    }, f"互认领把两条都静默推到了下一页:{got}"
 
 
 def test_docx_unexplained_row_next_to_an_explained_one_still_warns(
@@ -1258,6 +1315,39 @@ def test_docx_unexplained_row_next_to_an_explained_one_still_warns(
     item = env["rendered"][0]
     assert item["page"] == 1
     assert item["note"] == "figure_page_ambiguous_fallback"
+
+
+def test_docx_same_page_entries_do_not_both_fall_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """互认领的另一半后果,对称性检查一并解掉(回修第 3 轮 Critical-1 顺带)。
+
+    两条条目锚点同在第 1 页、第 1 页只有一行、第 2 页**没有**行:不做对称性
+    检查时,问谁都把那一行算成"对方的" → 邻域里一行都不剩 → 两条都多响一次
+    ``anchor_only_fallback``,而第 1 页明明有图。行不够分时不许认领之后,
+    两条都拿到第 1 页且不响 note。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Figure A caption. Figure B caption.", "Plain page."),
+        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW)]),
+    )
+    _write_docx(
+        tmp_path / "d.docx",
+        _para("Figure A caption."),
+        _figure(),
+        _para("Figure B caption."),
+        _figure(),
+    )
+
+    got = {}
+    for unit, out in ((2, "a"), (4, "b")):
+        env = _run_render(tmp_path, "d.docx", units=[unit], out_rel=f".tool_results/r1/f/{out}")
+        item = env["rendered"][0]
+        got[unit] = (item["page"], item.get("note"))
+
+    assert got == {2: (1, None), 4: (1, None)}, f"互认领让两条都白响了一次回落:{got}"
 
 
 def test_docx_two_rows_on_one_page_do_not_warn(
@@ -2264,20 +2354,34 @@ async def test_docx_ambiguous_page_fallback_is_told_to_the_model() -> None:
 
 
 @pytest.mark.anyio
-async def test_named_per_unit_reasons_are_not_prefixed_by_the_generic_guess() -> None:
-    """有逐条**具名**原因时,不许拿 ``render_failed`` 那句泛化猜测开头
-    (回修第 2 轮 A)。
+@pytest.mark.parametrize(
+    ("kind", "guess"),
+    [
+        ("render_failed", "页码超出"),
+        ("convert_failed", "可能已损坏"),
+        ("docx_inventory_failed", "可能已损坏"),
+    ],
+)
+async def test_named_per_unit_reasons_are_not_prefixed_by_the_generic_guess(
+    kind: str, guess: str
+) -> None:
+    """有逐条**具名**原因时,不许拿那句对冲式因果猜测开头(回修第 2 轮 A)。
 
     实测形状:一份带目录页的 docx,所有 unit 都撞 ``anchor_ambiguous``,模型读到的
     第一句却是"大概率是页码超出了文档实际页数",真原因排在它后面 —— 把一个错归因
     摆在真原因前面,与这个 feature 要消灭的东西同形。
+
+    回修第 3 轮 Minor-1 —— 三种 kind 都要钉。``convert_failed`` 与
+    ``docx_inventory_failed`` 的"文件可能已损坏"是同一类猜测;它们今天**到不了**
+    这条闸(片段里只有 ``render_failed`` 那一处 ``ok: False`` 返回带 ``failed``),
+    但"到不了"是**恰好为真**,不是判据。这里从宿主侧直接喂这个形状,把三条都咬住。
     """
     runtime = RecordingSandboxRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
                     "ok": False,
-                    "error": "render_failed",
+                    "error": kind,
                     "failed": [{"unit": 2, "why": "anchor_ambiguous", "anchor": "血糖趋势"}],
                 }
             ),
@@ -2287,7 +2391,7 @@ async def test_named_per_unit_reasons_are_not_prefixed_by_the_generic_guess() ->
         )
     )
     result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [2]}, ctx=_ctx())
-    assert "页码超出" not in result.content
+    assert guess not in result.content
     assert "不止出现在一页" in result.content
     assert "血糖趋势" in result.content
 
