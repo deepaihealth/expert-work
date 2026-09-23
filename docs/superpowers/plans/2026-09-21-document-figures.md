@@ -828,7 +828,8 @@ git commit -m "feat(read_document): 正文前置图清单,零图路径字节不�
 **Interfaces:**
 - Produces:
   - `ReadPageTool`(工具名 `read_page`,参数 `path: str`、`units: list[int]`)
-  - `RENDER_DPI = 100`、`MAX_PAGES_PER_CALL = 3`、`MAX_RENDER_PIXELS = 12_000_000`
+  - `RENDER_DPI = 100`、`MAX_PAGES_PER_CALL = 3`
+  - ~~`MAX_RENDER_PIXELS = 12_000_000`~~ —— 2026-09-23 删除,见 spec §7.2 修订(单 run 累计上限是猜的,参考实现无一家这么做)
   - `figure_ref(tenant_id, user_id, run_id, doc_sha, page) -> str` —— 造 `expert_work://workspace/...` ref
   - `ToolResult.state_updates = {"viewed_figures": [ref, ...]}`(Task 7 消费)
 - Consumes: Task 2 的常量
@@ -1023,7 +1024,7 @@ print(json.dumps(_main()))
 - `ok is False` → `content` 明说取不到及原因,`state_updates` 空
 - 成功 → `content` 列出取到了哪几页 + 「已放进你的上下文 / 用 `ask_image` 问它」(按 Task 6/7 的能力分支给不同措辞),`state_updates={"viewed_figures": [...]}`
 - `doc_sha` = `hashlib.sha256(rel.encode()).hexdigest()[:16]`
-- 累计像素预算记在 `meta` 里由 Task 7 的块渲染时汇总;本任务先按每次调用的页数硬限
+- 只按每次调用的页数硬限。~~累计像素预算记在 `meta` 里由 Task 7 的块渲染时汇总~~ ——这句从来没兑现(Task 7 的简报一字未提,且建块时页已渲完、汇总也咬不住);2026-09-23 连同单 run 累计上限一起删除,见 spec §7.2 修订
 
 - [ ] **Step 4: 跑,确认绿 + 真沙箱冒烟**
 
