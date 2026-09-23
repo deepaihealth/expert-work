@@ -1317,6 +1317,51 @@ def test_docx_unexplained_row_next_to_an_explained_one_still_warns(
     assert item["note"] == "figure_page_ambiguous_fallback"
 
 
+def test_docx_shared_anchor_page_next_door_does_not_make_a_third_figure_noisy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """对称性检查**只作用在锚点页**(回修第 4 轮 Important-1)。
+
+    三图文档:图①锚点在第 1 页,图②③锚点**都在第 2 页**,而第 2 页只有 1 行
+    可见行(②③里有一张是矢量)。问**图①** —— 它的邻域是 {1, 2},第 2 页上那一行
+    是②或③的,**这一点是确凿的**(图①根本不落在第 2 页),该认领就认领。
+
+    检查写宽到 ``near+1`` 上时,第 2 页因 ``rows(2)=1 < entries(2)=2`` 被一律禁止
+    认领 → 两页都"剩着行" → 图①白响一次歧义 note(噪声回流);锚点页再一行都
+    没有的话,答案还会从"锚点页 + 回落 note"变成"第 2 页 + **不带任何 note**"
+    (新开的静默错页)。触发条件与互认领是同一个,只是多要一张相邻的图。
+
+    ``..._one_figure_per_page_report_is_quiet_and_correct`` **结构上够不到**这个
+    形状 —— 它三条锚点互不共页,``entries`` 恒为 1,对称性检查永远放行。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Figure A caption.", "Figure B caption. Figure C caption."),
+        pdfimages_body=_pdfimages_rows([(1, *_BIG_ROW), (2, *_BIG_ROW)]),
+    )
+    _write_docx(
+        tmp_path / "d.docx",
+        _para("Figure A caption."),
+        _figure(),
+        _para("Figure B caption."),
+        _figure(),
+        _para("Figure C caption."),
+        _figure(),
+    )
+
+    got = {}
+    for unit, out in ((2, "a"), (4, "b"), (6, "c")):
+        env = _run_render(tmp_path, "d.docx", units=[unit], out_rel=f".tool_results/r1/f/{out}")
+        assert env["ok"] is True, unit
+        item = env["rendered"][0]
+        got[unit] = (item["page"], item.get("note"))
+
+    assert got == {2: (1, None), 4: (2, None), 6: (2, None)}, (
+        f"共锚点的那两条把不相干的图①也拖成了歧义:{got}"
+    )
+
+
 def test_docx_same_page_entries_do_not_both_fall_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2360,6 +2405,9 @@ async def test_docx_ambiguous_page_fallback_is_told_to_the_model() -> None:
         ("render_failed", "页码超出"),
         ("convert_failed", "可能已损坏"),
         ("docx_inventory_failed", "可能已损坏"),
+        # 回修第 4 轮 Minor-2 —— 没登记的 kind 走兜底文案,那句"先怀疑是基础设施
+        # 问题"同样是对冲式因果猜测,而它**没有 kind**、永远进不了那个集合。
+        ("some_future_kind", "先怀疑"),
     ],
 )
 async def test_named_per_unit_reasons_are_not_prefixed_by_the_generic_guess(
