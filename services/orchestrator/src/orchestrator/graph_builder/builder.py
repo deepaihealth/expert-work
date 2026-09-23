@@ -2108,8 +2108,9 @@ def _own_figure(
 
     另外要求 ref 是 ``read_page`` 的**产出形状**
     (:func:`~expert_work.persistence.is_rendered_figure_rel`):排槽与页号都从
-    这个形状里读,一条三项都对得上、但形状不对的 ref(比如模型自己写进
-    ``.tool_results/`` 的图)在这里拿不到页号,也不是这个通道该装的东西。
+    这个形状里读,形状不对就没有可信的槽和页号。三项都对得上、但形状不对的 ref
+    (比如模型自己写进工作区、尾巴凑成 ``_u3/page-3.jpg`` 的图)不是这个通道该装
+    的东西 —— 它是模型自己的文件,不是平台渲染的页。
     """
     if not isinstance(ref, str) or tenant_id is None or user_id is None:
         return None
