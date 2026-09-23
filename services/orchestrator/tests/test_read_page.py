@@ -68,6 +68,14 @@ def test_internal_render_budget_fits_under_the_exec_timeout_cap() -> None:
     真实最坏值是 ``90 + 90 + 30 + 3x30 = 300``,与 ``_MAX_EXEC_TIMEOUT_S``
     **恰好相等**,不再小于 —— 那条 docstring 写明要防的形状已经发生了,而守它的
     断言看不见。两条路分开算,docx 那条也必须进来。
+
+    这条测试**只对常量做算术**,咬不住"片段到底给每个子进程传了哪一个 timeout"
+    —— 把 pdftotext 换回 ``convert_timeout_s`` 时它照样绿(实测变异存活过一次)。
+    那一半由 ``test_docx_page_resolvers_use_the_short_timeout`` 从行为上钉。
+
+    边界也说清楚:这里算的是**子进程**预算。片段还有不带超时的纯 Python 工作
+    (``_render_sha`` 流式哈希整份文件、``_docx_inventory`` 解析 XML),那部分
+    不在这条不变式里 —— 这是既有形状,不是 Task 4b 引入的。
     """
     non_docx = _CONVERT_TIMEOUT_S + MAX_PAGES_PER_CALL * _RENDER_TIMEOUT_S
     assert non_docx < _MAX_EXEC_TIMEOUT_S
@@ -295,10 +303,29 @@ def _write_docx(path: Path, *body: str) -> None:
 
 
 def _run_render(
-    tmp_path: Path, rel: str, *, units: list[int], out_rel: str, dpi: int = RENDER_DPI
+    tmp_path: Path,
+    rel: str,
+    *,
+    units: list[int],
+    out_rel: str,
+    dpi: int = RENDER_DPI,
+    convert_timeout_s: int = _CONVERT_TIMEOUT_S,
+    render_timeout_s: int = _RENDER_TIMEOUT_S,
 ) -> dict:
-    """本地真跑渲染片段(与 test_document_figures._run 同一房规)。"""
-    code = build_render_wrapper(rel, units=units, ws=str(tmp_path), out_rel=out_rel, dpi=dpi)
+    """本地真跑渲染片段(与 test_document_figures._run 同一房规)。
+
+    两个 timeout 可覆盖(回修第 1 轮 I-1)—— 把它们拉开成两个**差得很远**的值,
+    再让某个桩故意慢,就能从行为上看出片段到底用了哪一个,而不是只对常量做算术。
+    """
+    code = build_render_wrapper(
+        rel,
+        units=units,
+        ws=str(tmp_path),
+        out_rel=out_rel,
+        dpi=dpi,
+        convert_timeout_s=convert_timeout_s,
+        render_timeout_s=render_timeout_s,
+    )
     ns: dict = {}
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -1064,6 +1091,49 @@ def test_both_snippets_get_the_thresholds_from_the_same_constants() -> None:
     # read_page 侧不许自己再声明一份同名常量 —— 身份而不是相等。
     assert read_page.MIN_FIGURE_EDGE_PT is MIN_FIGURE_EDGE_PT
     assert read_page.MIN_FIGURE_AREA_RATIO is MIN_FIGURE_AREA_RATIO
+
+
+@pytest.mark.parametrize(
+    ("slow_binary", "expected_error"),
+    [("pdftotext", "pdftotext_failed"), ("pdfimages", "pdfimages_failed")],
+    ids=["pdftotext", "pdfimages"],
+)
+def test_docx_page_resolvers_use_the_short_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slow_binary: str, expected_error: str
+) -> None:
+    """两件 poppler 解析工具必须用 ``render_timeout_s``,不是 ``convert_timeout_s``
+    (回修第 1 轮 I-1 的**行为**证人)。
+
+    ``test_internal_render_budget_fits_under_the_exec_timeout_cap`` 只对两个常量
+    做算术:把片段里的 ``render_timeout_s`` 换回 ``convert_timeout_s``,那条算术
+    照样成立、**全套全绿** —— 实测变异存活过一次,是一条重言式。真正咬得住的是
+    行为:把两个 timeout 拉开成 1s / 60s,再让这个桩睡 3 秒 —— 用短的会超时并
+    具名失败,用长的会若无其事地跑完。
+    """
+    slow = "import time\ntime.sleep(3)\n"
+    bodies: dict[str, str] = {
+        "pdftotext": _pdftotext_pages("Cover page body text.", _ANCHOR_ONE),
+        "pdfimages": _pdfimages_rows([(2, *_BIG_ROW)]),
+    }
+    bodies[slow_binary] = slow + bodies[slow_binary]
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=bodies["pdftotext"],
+        pdfimages_body=bodies["pdfimages"],
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(
+        tmp_path,
+        "d.docx",
+        units=[2],
+        out_rel=".tool_results/r1/figures/s",
+        convert_timeout_s=60,
+        render_timeout_s=1,
+    )
+
+    assert env == {"ok": False, "error": expected_error}
 
 
 def test_docx_unmeasurable_rows_are_kept_not_dropped(
