@@ -106,7 +106,8 @@ def _merge_viewed_figures(left: list[str], right: list[str]) -> list[str]:
     * 文档改了又改回去(内容哈希 A → B → A),重读得到的 A 版 ref 仍停在 B 前面,
       ``_figure_block_tail`` 就会把 B 当成当前版本、把 A 标成旧版本 —— 反了。
     """
-    fresh = list(dict.fromkeys(right))
+    # 同一批里重复出现的,按**最后一次**出现的位置算(``[A, B, A]`` → ``[B, A]``)。
+    fresh = list(reversed(dict.fromkeys(reversed(right))))
     moved = set(fresh)
     return [ref for ref in left if ref not in moved] + fresh
 

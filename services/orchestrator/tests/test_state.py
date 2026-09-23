@@ -102,8 +102,14 @@ def test_viewed_figures_moves_a_re_viewed_ref_to_the_tail() -> None:
     assert _merge_viewed_figures(["a", "b", "c"], ["a"]) == ["b", "c", "a"]
 
 
-def test_viewed_figures_dedupes_within_one_update() -> None:
-    assert _merge_viewed_figures(["a"], ["b", "b", "c"]) == ["a", "b", "c"]
+def test_viewed_figures_dedupes_within_one_update_by_last_occurrence() -> None:
+    """同一批更新里 ``[A, B, A]``:A 是最后看到的,必须排在 B 后面。
+
+    回修第 3 轮 —— 原来这条钉的是「保留第一次出现」(``[b, b, c]`` 分不出两种
+    口径,``[A, B, A]`` 才分得出),与「按最近一次看到排序」的口径相反。
+    """
+    assert _merge_viewed_figures([], ["a", "b", "a"]) == ["b", "a"]
+    assert _merge_viewed_figures(["x"], ["b", "b", "c"]) == ["x", "b", "c"]
 
 
 def test_tools_may_write_viewed_figures() -> None:
