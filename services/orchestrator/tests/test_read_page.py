@@ -42,6 +42,9 @@ from orchestrator.tools.sandbox import _MAX_EXEC_TIMEOUT_S, RecordingSandboxRunt
 from orchestrator.tools.workspace_paths import WriteToSharedError
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
 
+# 回修第 3 轮起 ``ReadPageTool`` 的默认投递档 ``"none"`` 不进沙箱;这个文件里测渲染
+# 行为的用例一律显式给 ``figure_delivery="inline"``(回执措辞另有专门的三条测试)。
+
 
 def _ctx(*, agent_key: str = "") -> ToolContext:
     return ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=uuid4(), agent_key=agent_key)
@@ -356,7 +359,9 @@ async def _real_out_rel(*, path: str = "d.pptx", ctx: ToolContext | None = None)
             stdout=json.dumps({"ok": True, "rendered": []}), stderr="", exit_code=0, timed_out=False
         )
     )
-    await ReadPageTool(client=runtime).call({"path": path, "units": [3]}, ctx=ctx or _ctx())
+    await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": path, "units": [3]}, ctx=ctx or _ctx()
+    )
     return str(_snippet_params(runtime.execs[0][1])["out_rel"])
 
 
@@ -1865,7 +1870,7 @@ async def test_too_many_units_is_refused_with_a_reason() -> None:
     runtime = RecordingSandboxRuntime(
         SandboxOutcome(stdout="{}", stderr="", exit_code=0, timed_out=False)
     )
-    tool = ReadPageTool(client=runtime)
+    tool = ReadPageTool(client=runtime, figure_delivery="inline")
     result = await tool.call(
         {"path": "d.pptx", "units": list(range(1, MAX_PAGES_PER_CALL + 5))}, ctx=_ctx()
     )
@@ -1883,7 +1888,7 @@ async def test_units_at_the_cap_is_not_refused() -> None:
             stdout=json.dumps({"ok": True, "rendered": []}), stderr="", exit_code=0, timed_out=False
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": list(range(1, MAX_PAGES_PER_CALL + 1))}, ctx=_ctx()
     )
     assert "一次最多" not in result.content
@@ -1905,7 +1910,7 @@ async def test_duplicate_units_do_not_eat_the_page_budget() -> None:
             stdout=json.dumps({"ok": True, "rendered": []}), stderr="", exit_code=0, timed_out=False
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [1, 1, 2, 2]}, ctx=_ctx()
     )
     assert "一次最多" not in result.content
@@ -1933,7 +1938,9 @@ async def test_rendered_pages_become_refs_in_state() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [3]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [3]}, ctx=_ctx()
+    )
     refs = result.state_updates["viewed_figures"]
     assert len(refs) == 1
     assert refs[0].startswith("expert_work://workspace/")
@@ -1965,7 +1972,9 @@ async def test_rendered_pages_become_agent_scoped_refs_when_agent_bound() -> Non
         )
     )
     ctx = _ctx(agent_key="pf-probe-33086dc0")
-    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [3]}, ctx=ctx)
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [3]}, ctx=ctx
+    )
     ref = result.state_updates["viewed_figures"][0]
     assert "/agents/pf-probe-33086dc0/.tool_results/r1/figures/abc/page-03.jpg" in ref
 
@@ -1994,7 +2003,7 @@ async def test_partial_failure_is_surfaced_per_unit() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [1, 5]}, ctx=_ctx()
     )
     assert "第 5 页没取到" in result.content
@@ -2030,7 +2039,7 @@ async def test_rel_rejected_by_validate_rendered_rel_is_not_silently_swallowed()
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [1, 2]}, ctx=_ctx()
     )
     assert len(result.state_updates["viewed_figures"]) == 1
@@ -2065,7 +2074,7 @@ async def test_rejected_rel_with_a_non_int_unit_is_still_reported() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [1, 2]}, ctx=_ctx()
     )
     assert len(result.state_updates["viewed_figures"]) == 1
@@ -2100,7 +2109,7 @@ async def test_malformed_rendered_items_are_not_silently_dropped() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [1, 2, 3]}, ctx=_ctx()
     )
     assert len(result.state_updates["viewed_figures"]) == 1
@@ -2138,7 +2147,7 @@ async def test_the_fallback_wording_reports_a_count_not_a_page_number() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [7, 8]}, ctx=_ctx()
     )
     assert len(result.state_updates["viewed_figures"]) == 2
@@ -2173,7 +2182,7 @@ async def test_malformed_failed_items_are_not_silently_dropped() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [1, 3]}, ctx=_ctx()
     )
     assert "第 3 页没取到" in result.content
@@ -2205,7 +2214,7 @@ async def test_a_failed_list_that_is_not_a_list_is_still_reported() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.pptx", "units": [1, 3]}, ctx=_ctx()
     )
     assert "失败清单整体格式不合法" in result.content
@@ -2223,7 +2232,9 @@ async def test_malformed_failed_list_is_reported_on_the_error_path_too() -> None
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [1]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [1]}, ctx=_ctx()
+    )
     assert "失败清单整体格式不合法" in result.content
 
 
@@ -2237,7 +2248,9 @@ async def test_soffice_missing_is_undetermined_not_empty() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [1]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [1]}, ctx=_ctx()
+    )
     assert "无法" in result.content
     assert result.state_updates.get("viewed_figures", []) == []
 
@@ -2253,7 +2266,9 @@ async def test_not_found_error_gets_an_actionable_chinese_explanation() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [1]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [1]}, ctx=_ctx()
+    )
     assert "没有这个文件" in result.content
 
 
@@ -2268,7 +2283,9 @@ async def test_error_detail_is_not_dropped() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [1]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [1]}, ctx=_ctx()
+    )
     assert "TimeoutExpired" in result.content
 
 
@@ -2283,7 +2300,9 @@ async def test_error_detail_is_not_dropped() -> None:
 @pytest.mark.anyio
 async def test_xlsx_is_refused_before_dispatch() -> None:
     runtime = RecordingSandboxRuntime()
-    result = await ReadPageTool(client=runtime).call({"path": "s.xlsx", "units": [1]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "s.xlsx", "units": [1]}, ctx=_ctx()
+    )
     assert "xlsx" in result.content
     assert "read_document" in result.content
     assert runtime.execs == []
@@ -2299,7 +2318,9 @@ async def test_docx_is_no_longer_refused_by_the_format_gate() -> None:
             stdout=json.dumps({"ok": True, "rendered": []}), stderr="", exit_code=0, timed_out=False
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [1]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.docx", "units": [1]}, ctx=_ctx()
+    )
     assert "不支持" not in result.content
     assert len(runtime.execs) == 1
 
@@ -2329,7 +2350,9 @@ async def test_docx_content_names_both_the_figure_number_and_the_page() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [7]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.docx", "units": [7]}, ctx=_ctx()
+    )
     assert "第 7 处(文档第 3 页)" in result.content
     assert "第 7 页" not in result.content
 
@@ -2359,7 +2382,9 @@ async def test_docx_anchor_only_fallback_is_told_to_the_model() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [4]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.docx", "units": [4]}, ctx=_ctx()
+    )
     assert "文字锚点" in result.content
     assert "下一页" in result.content
 
@@ -2392,7 +2417,9 @@ async def test_docx_ambiguous_page_fallback_is_told_to_the_model() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [4]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.docx", "units": [4]}, ctx=_ctx()
+    )
     assert "第 4 处(文档第 2 页)" in result.content
     assert "没法确定哪一张是你要的" in result.content
     assert "再取下一页" in result.content
@@ -2438,7 +2465,9 @@ async def test_named_per_unit_reasons_are_not_prefixed_by_the_generic_guess(
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [2]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.docx", "units": [2]}, ctx=_ctx()
+    )
     assert guess not in result.content
     assert "不止出现在一页" in result.content
     assert "血糖趋势" in result.content
@@ -2456,7 +2485,9 @@ async def test_generic_guess_still_shows_when_there_is_no_named_reason() -> None
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.pptx", "units": [99]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [99]}, ctx=_ctx()
+    )
     assert "页码超出" in result.content
 
 
@@ -2465,7 +2496,7 @@ async def test_too_many_units_uses_the_right_counter_word_for_docx() -> None:
     """回修第 1 轮 M-3 —— docx 传的是图清单编号,"你传了 4 页"是在用一个它
     没有的单位说话。量词必须跟着格式走,所以 ``ext`` 得在这句话之前算出来。"""
     runtime = RecordingSandboxRuntime()
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "d.docx", "units": [1, 2, 3, 4]}, ctx=_ctx()
     )
     assert "你传了 4 处" in result.content
@@ -2491,7 +2522,9 @@ async def test_docx_named_failure_reaches_the_model_with_its_anchor() -> None:
             timed_out=False,
         )
     )
-    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [7]}, ctx=_ctx())
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.docx", "units": [7]}, ctx=_ctx()
+    )
     assert "第 7 处没取到" in result.content
     assert "PDF 版" in result.content
     assert "血糖趋势见下图" in result.content
@@ -2500,7 +2533,7 @@ async def test_docx_named_failure_reaches_the_model_with_its_anchor() -> None:
 @pytest.mark.anyio
 async def test_unknown_extension_is_refused_by_name_before_dispatch() -> None:
     runtime = RecordingSandboxRuntime()
-    result = await ReadPageTool(client=runtime).call(
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
         {"path": "notes.txt", "units": [1]}, ctx=_ctx()
     )
     assert "txt" in result.content
@@ -2519,7 +2552,9 @@ async def test_pdf_and_pptx_are_not_refused_by_the_format_gate() -> None:
                 timed_out=False,
             )
         )
-        result = await ReadPageTool(client=runtime).call({"path": path, "units": [1]}, ctx=_ctx())
+        result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+            {"path": path, "units": [1]}, ctx=_ctx()
+        )
         assert "不支持" not in result.content
         assert len(runtime.execs) == 1
 
@@ -2533,7 +2568,9 @@ async def test_pdf_and_pptx_are_not_refused_by_the_format_gate() -> None:
 async def test_shared_prefix_is_refused_not_silently_redirected() -> None:
     runtime = RecordingSandboxRuntime()
     with pytest.raises(WriteToSharedError):
-        await ReadPageTool(client=runtime).call({"path": "shared:d.pptx", "units": [1]}, ctx=_ctx())
+        await ReadPageTool(client=runtime, figure_delivery="inline").call(
+            {"path": "shared:d.pptx", "units": [1]}, ctx=_ctx()
+        )
     assert runtime.execs == []
 
 
@@ -2560,7 +2597,7 @@ async def _receipt(delivery: FigureDelivery | None = None) -> tuple[str, list[st
     ctx = _ctx()
     runtime = _one_rendered_page_runtime(ctx)
     tool = (
-        ReadPageTool(client=runtime)
+        ReadPageTool(client=runtime, figure_delivery="inline")
         if delivery is None
         else ReadPageTool(client=runtime, figure_delivery=delivery)
     )
@@ -2588,9 +2625,21 @@ async def test_the_receipt_hands_over_the_ref_when_ask_image_is_the_way() -> Non
 
 
 @pytest.mark.anyio
-async def test_the_receipt_says_so_when_the_model_cannot_see_the_page() -> None:
-    """两样都没有:明说看不到,不许说「已放进你的上下文」。默认值就是这一档。"""
-    for content, _ in (await _receipt("none"), await _receipt()):
-        assert "你看不到它" in content
-        assert "已放进你的上下文" not in content
-        assert "直接看到" not in content
+async def test_read_page_does_not_render_when_the_model_cannot_see_the_page() -> None:
+    """两样都没有:不进沙箱,明说看不了,不写 viewed_figures。默认值就是这一档。
+
+    回修第 3 轮 —— 原来照样跑一遍 soffice + pdftoppm,渲完才说「你看不到它」。
+    """
+    for explicit in (True, False):
+        ctx = _ctx()
+        runtime = _one_rendered_page_runtime(ctx)
+        tool = (
+            ReadPageTool(client=runtime, figure_delivery="none")
+            if explicit
+            else ReadPageTool(client=runtime)
+        )
+        result = await tool.call({"path": "d.pptx", "units": [3]}, ctx=ctx)
+        assert runtime.execs == []
+        assert "看不了图" in result.content
+        assert "已放进你的上下文" not in result.content
+        assert "viewed_figures" not in result.state_updates

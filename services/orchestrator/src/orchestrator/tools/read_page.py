@@ -1072,15 +1072,17 @@ def _describe_render_notes(rendered: Sequence[Mapping[str, Any]], *, unit_label:
 FigureDelivery = Literal["inline", "ask_image", "none"]
 
 
-def _delivery_sentence(head: str, refs: Sequence[str], delivery: FigureDelivery) -> str:
+def _delivery_sentence(
+    head: str, refs: Sequence[str], delivery: Literal["inline", "ask_image"]
+) -> str:
     """成功回执的主句 —— 按**实际投递路径**说,不许许诺一条不存在的路。
 
     回修前这里对所有模型都说「已放进你的上下文 —— 需要仔细看细节时用 ask_image
     问它」:能看图的模型上 ``ask_image`` 根本没注册(让模型去调一个不存在的工具);
     两样都没有时「已放进你的上下文」是假话。
+
+    ``"none"`` 档到不了这里:``ReadPageTool.call`` 在进沙箱之前就返回了(回修第 3 轮)。
     """
-    if delivery == "inline":
-        return f"{head},下一轮起你会在上下文里直接看到这几页的图。"
     if delivery == "ask_image":
         # 模型要调 ask_image 就得有 image_ref,回执里不给就等于没有这条路。
         lines = []
@@ -1092,7 +1094,7 @@ def _delivery_sentence(head: str, refs: Sequence[str], delivery: FigureDelivery)
             f"{head}。当前模型不能直接看图 —— 要看哪一页,就调用 ask_image,"
             "把下面对应的那一条原样填进 image_ref:\n" + "\n".join(lines)
         )
-    return f"{head}。当前模型看不了图,也没有配看图的工具(ask_image);图已经渲出来了,但你看不到它。"
+    return f"{head},下一轮起你会在上下文里直接看到这几页的图。"
 
 
 @dataclass
@@ -1178,6 +1180,18 @@ class ReadPageTool:
         rejection = _reject_unrenderable_format(ext)
         if rejection is not None:
             return ToolResult(content=rejection)
+        delivery = self.figure_delivery
+        if delivery == "none":
+            # 回修第 3 轮 —— 看不了图、也没有 ask_image 时不进沙箱:渲出来也没人看,
+            # 白跑一次 soffice + pdftoppm。**仍然注册** read_page,不是撤掉它 ——
+            # read_document 的图清单会让模型来调这个工具,撤掉就成了指向一个不存在
+            # 的工具;留着,模型调到时得到一句明确的「看不了」。
+            return ToolResult(
+                content=(
+                    f"没有渲染 {raw}:当前模型看不了图,也没有配看图的工具(ask_image)"
+                    "—— 渲出来你也看不到,所以没有去渲。"
+                )
+            )
         if ctx.tenant_id is None or ctx.user_id is None or ctx.run_id is None:
             # 约束 B —— 三个 id 缺一个就没法造 workspace ref;说明白,不崩。
             return ToolResult(content="无法渲染:这条 run 缺少租户/用户/run 绑定。")
@@ -1284,7 +1298,7 @@ class ReadPageTool:
                 head = f"已渲染 {raw} 第 {pages} {label}"
         else:
             head = f"已渲染 {raw} {len(refs)} 页"
-        content = _delivery_sentence(head, refs, self.figure_delivery)
+        content = _delivery_sentence(head, refs, delivery)
         caveats = _describe_render_notes(notes, unit_label=label)
         if caveats:
             content = f"{content} {caveats}"
