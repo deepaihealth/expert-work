@@ -344,6 +344,14 @@ hermes 能那么做是因为它原生打 Anthropic。
 另一条约束:`ask_image` **只在**主模型 `supports_vision == False` **且**
 manifest 声明了 `vision:` 块时才挂(`agent_factory.py:835`)。它不普遍可用。
 
+> **修订(2026-09-24,用户拍板,Task 8)**:看图模型**仍由 Agent 自己配**,平台**不设**默认看图模型
+> —— 平台默认依赖某家厂商 key,key 缺失时会从「没配」变成「配了但静默失效」,更难察觉。平台负责的是:
+> ① 配置页在主模型非多模态时提示(文案:「主模型不能看图，配置视觉模型后才能看图片和文档里的图。」);
+> ② 没配时 `read_page` 回执说清**缺的是视觉模型配置、去哪里配**,让模型能转告用户;
+> ③ **不让模型手抄长 ref**:`ask_image` 增加 `path + unit` 短形态(宿主侧找本 agent 作用域内最新一张渲染页,
+> 文档 mtime 晚于渲染则显式失败),`read_page` 在 ask_image 档的回执只给「原样路径 + 页号」、不再列 ref。
+> 实证:同一 Agent(ai-health-plan)同一模型(glm-5.3)2026-09-14 手抄一个 URL 三次错三次。
+
 ### 8.2 三分投递
 
 复用 `_child_run.build_seed_content` 已经确立的判据(`_child_run.py:152-162`):
@@ -351,8 +359,8 @@ manifest 声明了 `vision:` 块时才挂(`agent_factory.py:835`)。它不普遍
 | agent 能力 | 投递 | 理由 |
 |---|---|---|
 | `supports_vision` | Path A:页面 ref 作为 **image 内容块**挂在尾部隐藏 `HumanMessage`(§8.5) | 主模型直接看 |
-| `can_ask_image` | Path B:figure map 里列出页面 ref,模型调 `ask_image(ref, question)` | 字节从不进主上下文 |
-| 都不行 | **只说有图、说明读不了,不给 ref** | 「命名它们只会诱使它编答案」(既有注释) |
+| `can_ask_image` | Path B:~~figure map 里列出页面 ref,模型调 `ask_image(ref, question)`~~ **回执给原样路径 + 页号,模型调 `ask_image(path, unit, question)`**(Task 8 修订,见 §8.1) | 字节从不进主上下文;模型不抄长串 |
+| 都不行 | **只说有图、说明读不了,不给 ref**;**并说清缺的是视觉模型配置与配置入口**(Task 8 修订) | 「命名它们只会诱使它编答案」(既有注释);失败要让用户当场看见原因 |
 
 ### 8.3 渲染页落在哪
 
@@ -398,6 +406,8 @@ expert_work://workspace/<tenant>/<user>/.tool_results/<run_id>/figures/<doc-sha>
 | `WORKSPACE_BLOCK_MARK` | **内容本身在说谎**(上一轮快照已不是「现在」) | 去重,只留最新 |
 
 **图是第三种:它不过期。** 一份上传文档的第 7 页,渲出来是什么就永远是什么。
+
+> **注(2026-09-24,实现核对)**:图块永远挂在**尾部**、从不进可复用的提示词前缀,所以下文「退役时机绑缓存 TTL」那条考虑在结构上是空转的 —— 尾部内容本来就不命中前缀缓存,退役只按滑窗走。
 
 - 用去重(工作区那条规矩)是错的 —— 模型看第 7 页时会丢掉还有用的第 3 页;
 - 用「放回最新」(输入那条)同理。
