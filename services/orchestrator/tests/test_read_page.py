@@ -15,7 +15,14 @@ from uuid import uuid4
 import pytest
 
 from orchestrator.multimodal import is_cacheable_image_ref
-from orchestrator.tools.document_figures import RENDERABLE_EXTENSIONS, SUPPORTED_EXTENSIONS
+from orchestrator.tools import read_page
+from orchestrator.tools.document_figures import (
+    MIN_FIGURE_AREA_RATIO,
+    MIN_FIGURE_EDGE_PT,
+    RENDERABLE_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+    build_figure_inventory_wrapper,
+)
 from orchestrator.tools.read_page import (
     _CONVERT_TIMEOUT_S,
     _RENDER_TIMEOUT_S,
@@ -53,11 +60,24 @@ def test_render_dpi_keeps_every_page_under_the_vision_limit() -> None:
 
 
 def test_internal_render_budget_fits_under_the_exec_timeout_cap() -> None:
-    """M5 —— 内层预算(soffice 转换一次 + 最多 MAX_PAGES_PER_CALL 次单页渲染)
-    必须严格小于外层 exec 的超时上限,否则一次合法的满页调用会被沙箱供应商
-    自己的兜底超时打断,而不是片段自己的 subprocess timeout 优雅降级。"""
-    worst_case = _CONVERT_TIMEOUT_S + MAX_PAGES_PER_CALL * _RENDER_TIMEOUT_S
-    assert worst_case < _MAX_EXEC_TIMEOUT_S
+    """M5 —— 内层预算必须严格小于外层 exec 的超时上限,否则一次合法的满页调用会被
+    沙箱供应商自己的兜底超时打断,而不是片段自己的 subprocess timeout 优雅降级。
+
+    回修第 1 轮 I-1 —— 这里原来只算 pptx/pdf 那条路(``90 + 3x30 = 180``),
+    Task 4b 给 docx 加了 pdftotext + pdfimages 两个子进程之后它**恒绿**:
+    真实最坏值是 ``90 + 90 + 30 + 3x30 = 300``,与 ``_MAX_EXEC_TIMEOUT_S``
+    **恰好相等**,不再小于 —— 那条 docstring 写明要防的形状已经发生了,而守它的
+    断言看不见。两条路分开算,docx 那条也必须进来。
+    """
+    non_docx = _CONVERT_TIMEOUT_S + MAX_PAGES_PER_CALL * _RENDER_TIMEOUT_S
+    assert non_docx < _MAX_EXEC_TIMEOUT_S
+
+    # docx 多两个子进程:整篇 pdftotext 一次 + pdfimages -list 一次。两者都用
+    # _RENDER_TIMEOUT_S(它们本来就快),不是 _CONVERT_TIMEOUT_S。
+    docx = _CONVERT_TIMEOUT_S + 2 * _RENDER_TIMEOUT_S + MAX_PAGES_PER_CALL * _RENDER_TIMEOUT_S
+    assert docx < _MAX_EXEC_TIMEOUT_S, (
+        f"docx 支路最坏 {docx}s 没有严格小于 exec 上限 {_MAX_EXEC_TIMEOUT_S}s"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +191,16 @@ def _pdfimages_rows(rows: list[tuple[int, ...]]) -> str:
 #: 一张够大的真图(800x600 px @ 200 ppi ≈ 288x216 pt,远在装饰图阈值之上)。
 _BIG_ROW = (800, 600, 200, 200)
 #: 一张页眉 logo(200x200 px @ 500 ppi ≈ 28.8 pt,短边低于阈值 = 装饰图)。
+#: **方的** —— 短边等于长边,所以它分不出"按短边判"和"按长边判"。
 _LOGO_ROW = (200, 200, 500, 500)
+#: 一条装饰色带(1200x20 px @ 144 ppi ≈ 602x10 pt):短边 10pt 低于阈值 = 装饰图,
+#: 但长边 602pt 远在阈值之上。清单侧为这条形状立过
+#: ``test_thin_strip_is_skipped_by_the_edge_clause``,渲染侧照着立一条
+#: (回修第 1 轮 I-2/N1:`min` 写成 `max` 时只有非方形的行分得出来)。
+_STRIP_ROW = (1200, 20, 144, 144)
+#: 抬头 banner(3000x400 px @ 480 ppi ≈ 450x60 pt):短边 60pt **高于**阈值,
+#: 所以尺寸滤子**滤不掉它** —— 红头文件的常见尺寸(回修第 1 轮 C-1 场景 A)。
+_BANNER_ROW = (3000, 400, 480, 480)
 
 
 def _install_office_stubs(
@@ -890,23 +919,28 @@ def test_docx_figure_pushed_over_the_page_break_is_rendered_on_the_next_page(
     assert item["rel"].endswith("page-03.jpg")
 
 
-def test_docx_header_logo_rows_do_not_pin_the_page(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("decorative", [_LOGO_ROW, _STRIP_ROW], ids=["square_logo", "thin_strip"])
+def test_docx_decorative_rows_do_not_pin_the_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decorative: tuple[int, int, int, int]
 ) -> None:
-    """页眉 logo 不许把第 2 步压成"永远返回邻域页"(与简报的偏离,见报告)。
+    """装饰行不许把第 2 步压成"永远返回邻域页"(与简报的偏离,见报告)。
 
     页眉/页脚的图住在 ``word/header1.xml``,**清单根本看不见它**(``_docx_inventory``
     只读 ``word/document.xml``),而它在渲出来的 PDF 里**每一页都有一行**
     (实测:同一个 XObject 被 N 页引用就出 N 行)。不按尺寸把这些行滤掉的话,
-    "页号 >= 邻域页的第一行"恒等于邻域页自己,上面那条页边界测试对所有带
-    页眉图的文档都会静默失效 —— 而带页眉 logo 的公文正是最常见的一种 docx。
+    "邻域里的第一行"恒等于邻域页自己,上面那条页边界测试对所有带页眉图的文档
+    都会静默失效 —— 而带页眉 logo 的公文正是最常见的一种 docx。
+
+    两种形状都跑(回修第 1 轮 I-2/N1):方 logo 的短边等于长边,**分不出**
+    "按短边判"和"按长边判";窄色带(602x10pt)才分得出来 —— 清单侧为同一件事
+    立过 ``test_thin_strip_is_skipped_by_the_edge_clause``,渲染侧当时没立。
     """
     bin_dir = _install_office_stubs(
         tmp_path,
         monkeypatch,
         pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
         pdfimages_body=_pdfimages_rows(
-            [(1, *_LOGO_ROW), (2, *_LOGO_ROW), (3, *_LOGO_ROW), (3, *_BIG_ROW)]
+            [(1, *decorative), (2, *decorative), (3, *decorative), (3, *_BIG_ROW)]
         ),
     )
     _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
@@ -914,8 +948,148 @@ def test_docx_header_logo_rows_do_not_pin_the_page(
     env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
 
     assert env["ok"] is True
-    assert env["rendered"][0]["page"] == 3, "页眉 logo 那一行把页号钉在了邻域页上"
+    item = env["rendered"][0]
+    assert item["page"] == 3, "装饰行把页号钉在了邻域页上"
+    assert "note" not in item, "装饰行没被滤掉,于是两页都算有图"
     assert _pdftoppm_was_called(bin_dir)
+
+
+# ---------------------------------------------------------------------------
+# 回修第 1 轮 C-1 —— 尺寸滤子**只**挡得住短边低于阈值的装饰图。抬头 banner
+# (450x60pt,短边 60pt > 40pt)滤不掉,于是"邻域里有没有位图"这个判据下,
+# 跨页的图会被静默钉回锚点页且**不带任何 note**:模型连"这可能不准"都不知道。
+# 判据因此改成"邻域里的位图**能不能唯一指认**这一处图"。
+# ---------------------------------------------------------------------------
+
+
+def test_docx_banner_on_every_page_still_renders_the_anchor_page_but_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C-1 场景 A:抬头 banner 每页一份 + 目标图在下一页。
+
+    banner 短边 60pt 高于装饰图阈值,滤不掉,所以锚点页与下一页**都**有存活行。
+    本地分不出哪一行是目标图,于是仍渲锚点页(先验上更可能),但**必须**带
+    歧义 note —— 这一档以前静默返回锚点页,是 C-1 的正题。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows(
+            [(1, *_BANNER_ROW), (2, *_BANNER_ROW), (3, *_BANNER_ROW), (3, *_BIG_ROW)]
+        ),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2
+    assert item["note"] == "figure_page_ambiguous_fallback"
+
+
+def test_docx_another_real_figure_on_the_anchor_page_is_flagged_as_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C-1 场景 B:锚点页本身另有一张真图,目标图被挤到了下一页。
+
+    与场景 A 同根:邻域两页都有存活行,指认不唯一。上一轮报告把这一档写成了
+    "已知残留、只能记账",实际上它与 A 共用同一条判据,一起兜住了 —— 渲锚点页
+    但把保留意见说出来。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows([(2, *_BIG_ROW), (3, *_BIG_ROW)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2
+    assert item["note"] == "figure_page_ambiguous_fallback"
+
+
+def test_render_side_decorative_threshold_is_the_public_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """渲染侧的装饰图阈值必须**真的**是 ``MIN_FIGURE_EDGE_PT``(回修第 1 轮 I-3/N4)。
+
+    实测过:把公开常量改成 1.0,全套**全绿存活** —— 它零生产消费者,而
+    ``document_figures.py`` 的注释写着"低于此的判为装饰图",照那句去调的人
+    什么都调不动。现在它由宿主喂进片段,这条测试把它钉活:把阈值压到 1.0,
+    原本被当装饰图丢掉的 logo 行就该活下来,于是锚点页也算"有图",两页都有
+    → 歧义 note。片段里要是再手写一份 40.0,这条立刻红。
+    """
+    monkeypatch.setattr(read_page, "MIN_FIGURE_EDGE_PT", 1.0)
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows([(2, *_LOGO_ROW), (3, *_BIG_ROW)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2
+    assert item["note"] == "figure_page_ambiguous_fallback", (
+        "阈值压到 1.0 之后 logo 行仍被丢掉 —— 片段没在用那个公开常量"
+    )
+
+
+def test_both_snippets_get_the_thresholds_from_the_same_constants() -> None:
+    """两个 wrapper 喂进片段的阈值必须来自**同一对**公开常量(回修第 1 轮 I-3)。
+
+    上一轮报告把这里的风险描述错了(说两侧"会分叉成页号选错"),实际上两侧读的
+    是同一个片段里的同一行,结构上分叉不了。真正的缺陷是那两个公开常量当时
+    **零生产消费者**。这条钉的是修好之后的形状:两个 wrapper 的 ``_P`` 里都带着
+    它们,而且带的就是模块常量的值。
+    """
+    render_params = _snippet_params(
+        build_render_wrapper("d.docx", units=[1], ws="/workspace", out_rel=".tool_results/r1/f/s")
+    )
+    inventory_params = _snippet_params(
+        build_figure_inventory_wrapper("d.docx", ws="/workspace", max_bytes=1024)
+    )
+    for params in (render_params, inventory_params):
+        assert params["min_figure_edge_pt"] == MIN_FIGURE_EDGE_PT
+        assert params["min_figure_area_ratio"] == MIN_FIGURE_AREA_RATIO
+    # read_page 侧不许自己再声明一份同名常量 —— 身份而不是相等。
+    assert read_page.MIN_FIGURE_EDGE_PT is MIN_FIGURE_EDGE_PT
+    assert read_page.MIN_FIGURE_AREA_RATIO is MIN_FIGURE_AREA_RATIO
+
+
+def test_docx_unmeasurable_rows_are_kept_not_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """尺寸**读不出来**的行一律留着(回修第 1 轮 I-2/S2)。
+
+    上一轮自查写了"这一条代码真的做到了",但没有任何测试咬得住:把"读不出来
+    就留着"改成"读不出来就丢掉",全套仍然全绿。这里给它一个证人 —— 一行
+    ppi 为 0(退化 CTM 会出这种值)的位图落在目标页上:留着它页号才钉得到
+    第 3 页,丢掉它就落回锚点页。丢掉一张真图比留下一张装饰图坏,方向不能反。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows([(3, 200, 200, 0, 0)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 3, "量不出尺寸的行被当成装饰图丢了"
+    assert "note" not in item
 
 
 def test_docx_vector_figure_falls_back_to_the_anchor_page_and_says_so(
@@ -946,15 +1120,21 @@ def test_docx_bitmap_outside_the_neighbourhood_does_not_pin_the_page(
 ) -> None:
     """邻域之外的位图行不是这处图(与简报的偏离,见报告)。
 
-    anchor 在第 2 页,全文下一张位图在第 7 页 —— 那是别处的图。"页号 >= 邻域页
-    的第一行"会把第 7 页当成答案,跨出 anchor 能担保的范围整整五页。这里改成
-    回落到邻域页 + 说明,不拿一个远处的页硬凑。
+    anchor 在第 2 页,全文下一张位图在第 **4** 页 —— 那是别处的图。"页号 >= 邻域页
+    的第一行"会把它当成答案,跨出 anchor 能担保的范围。这里改成回落到邻域页 +
+    说明,不拿一个远处的页硬凑。
+
+    回修第 1 轮 I-2/N2 —— 这一行原来放在第 7 页,离边界太远:把邻域宽度从
+    ``near + 1`` 放宽成 ``near + 2`` 也照样测不出来。放到 ``near + 2`` 这个
+    **紧贴边界**的位置才咬得住宽度本身。
     """
     _install_office_stubs(
         tmp_path,
         monkeypatch,
-        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
-        pdfimages_body=_pdfimages_rows([(7, *_BIG_ROW)]),
+        pdftotext_body=_pdftotext_pages(
+            "Cover page body text.", _ANCHOR_ONE, "Continued.", "Fourth page."
+        ),
+        pdfimages_body=_pdfimages_rows([(4, *_BIG_ROW)]),
     )
     _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
 
@@ -1141,7 +1321,11 @@ def test_docx_without_the_page_resolvers_is_a_clean_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """沙箱里没有 pdftotext/pdfimages 时只能猜页 —— 而猜页正是这个功能要消灭的
-    东西,所以与"没装 soffice"同档:直接失败,并点名缺了哪个。"""
+    东西,所以直接失败,并点名缺了哪个。
+
+    回修第 1 轮 M-4 —— kind 与 ``soffice_missing`` **分开**:这一档换成同一份
+    文档的 PDF 版就能绕过去(PDF 路径根本不用这两件工具),缺 soffice 那一档
+    换格式也没用,下一步动作不同就不能共用一句话。"""
     bin_dir = _install_office_stubs(tmp_path, monkeypatch)
     (bin_dir / "pdfimages").unlink()
     _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
@@ -1151,7 +1335,7 @@ def test_docx_without_the_page_resolvers_is_a_clean_failure(
     env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
 
     assert env["ok"] is False
-    assert env["error"] == "soffice_missing"
+    assert env["error"] == "docx_resolver_missing"
     assert env["detail"] == "pdfimages"
 
 
@@ -1718,8 +1902,10 @@ async def test_error_detail_is_not_dropped() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 回修 C3 —— 扩展名分档:pptx/pdf 直通,xlsx/docx/未知格式一律在 Python 侧
-# 拒绝,不进沙箱(runtime.execs == [] 证明零沙箱开销)。
+# 回修 C3 —— 扩展名分档:可渲染的格式直通,其余一律在 Python 侧拒绝,不进沙箱
+# (runtime.execs == [] 证明零沙箱开销)。
+# 回修第 1 轮 M-1:这两句原来写「xlsx/docx/未知」,Task 4b 之后 docx 已经不被
+# 拒了 —— 注释不跟着改就是又一份会漂的手写名单。
 # ---------------------------------------------------------------------------
 
 
@@ -1808,6 +1994,53 @@ async def test_docx_anchor_only_fallback_is_told_to_the_model() -> None:
 
 
 @pytest.mark.anyio
+async def test_docx_ambiguous_page_fallback_is_told_to_the_model() -> None:
+    """回修第 1 轮 C-1 —— 歧义回落那一档必须抵达模型,而且要说清"可能在下一页"。
+
+    这是整条链最容易悄悄断的一节:片段算对了、note 也挂上了,宿主要是不播报,
+    模型拿到的仍然是一张"看起来很确定"的页。
+    """
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {
+                            "unit": 4,
+                            "page": 2,
+                            "note": "figure_page_ambiguous_fallback",
+                            "rel": ".tool_results/r1/figures/abc/page-02.jpg",
+                            "bytes": 100,
+                        }
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime).call({"path": "d.docx", "units": [4]}, ctx=_ctx())
+    assert "第 4 处(文档第 2 页)" in result.content
+    assert "没法确定哪一张是你要的" in result.content
+    assert "再取下一页" in result.content
+
+
+@pytest.mark.anyio
+async def test_too_many_units_uses_the_right_counter_word_for_docx() -> None:
+    """回修第 1 轮 M-3 —— docx 传的是图清单编号,"你传了 4 页"是在用一个它
+    没有的单位说话。量词必须跟着格式走,所以 ``ext`` 得在这句话之前算出来。"""
+    runtime = RecordingSandboxRuntime()
+    result = await ReadPageTool(client=runtime).call(
+        {"path": "d.docx", "units": [1, 2, 3, 4]}, ctx=_ctx()
+    )
+    assert "你传了 4 处" in result.content
+    assert "你传了 4 页" not in result.content
+    assert runtime.execs == []
+
+
+@pytest.mark.anyio
 async def test_docx_named_failure_reaches_the_model_with_its_anchor() -> None:
     """四种 honest 失败必须以人话 + 下一步动作抵达模型,并带上平台用来定位的
     那段文字 —— 裸 ``anchor_not_found`` 对模型不构成任何可执行信息。"""
@@ -1843,7 +2076,7 @@ async def test_unknown_extension_is_refused_by_name_before_dispatch() -> None:
 
 @pytest.mark.anyio
 async def test_pdf_and_pptx_are_not_refused_by_the_format_gate() -> None:
-    """确认闸只挡 xlsx/docx/未知,不误伤真正支持的两种格式。"""
+    """确认闸只挡不可渲染的格式,不误伤 pdf/pptx 这两种。"""
     for path in ("d.pdf", "d.pptx"):
         runtime = RecordingSandboxRuntime(
             SandboxOutcome(

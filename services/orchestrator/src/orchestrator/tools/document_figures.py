@@ -27,8 +27,19 @@ from typing import Any, Final
 from orchestrator.tools.file_ops import _snippet
 
 #: 显示短边下限(pt)。低于此的判为装饰图。
+#:
+#: 回修第 1 轮 I-3 —— 这个值与下面的面积阈值**由这里喂进沙箱片段**
+#: (``build_figure_inventory_wrapper`` / ``build_render_wrapper`` 都把它放进
+#: ``_P``),片段里不再写第二份字面量。原来两边各是一份 40.0:改这里一个字都不会
+#: 变、而这行注释写着"低于此的判为装饰图",照它去调的人什么都调不动,还没有任何
+#: 测试会红 —— 本仓「描述不是被描述之物」的又一例。现在它是**真源**:
+#: ``read_page`` 那边判"``pdfimages`` 报出来的这一行是不是装饰图"用的也是同一个值
+#: (见 ``read_page._RENDER_MAIN`` 的 ``_row_short_edge_upper_pt``),两份清单必须
+#: 按同一条线对齐,否则页号会选错。
 MIN_FIGURE_EDGE_PT: Final[float] = 40.0
-#: 显示面积占页比下限。低于此的判为装饰图。
+#: 显示面积占页比下限。低于此的判为装饰图。同上,由宿主喂进片段。
+#: ``read_page`` 的滤子**用不到**它(``pdfimages -list`` 给不出 PDF 页尺寸),
+#: 只有清单侧消费。
 MIN_FIGURE_AREA_RATIO: Final[float] = 0.01
 #: 清单条目上限 —— 交替出现的图文页会把清单撑爆。
 MAX_MAP_ENTRIES: Final[int] = 20
@@ -88,12 +99,16 @@ _PDF_EMPTY_ABS_ALWAYS: Final[int] = 10
 #: ``_row_short_edge_upper_pt``)。``_pptx_inventory`` 也用这两个名字,它定义在
 #: 本片段之前 —— Python 在调用时才解析全局名,``_main()`` 跑在所有 def 之后,
 #: 顺序因此不影响。
+#:
+#: 回修第 1 轮 I-3/N4 —— 两个阈值从 ``_P`` 取,**片段里不写字面量**:写字面量的话
+#: 公开常量 :data:`MIN_FIGURE_EDGE_PT` 就是死的(实测把它改成 1.0 全绿),
+#: 而且 ``read_page`` 的滤子随时可以再长出第三份 40.0 而没有任何测试会红。
 _DOCX_INVENTORY_FRAGMENT = """
 
 _PICTURE_URI = "http://schemas.openxmlformats.org/drawingml/2006/picture"
 _EMU_PER_PT = 12700
-_MIN_EDGE_PT = 40.0
-_MIN_AREA_RATIO = 0.01
+_MIN_EDGE_PT = _P["min_figure_edge_pt"]
+_MIN_AREA_RATIO = _P["min_figure_area_ratio"]
 
 
 # 依文档顺序遍历正文段落,含表格单元格里的段落 -- 表格(w:tbl/w:tr/w:tc,
@@ -361,8 +376,21 @@ print(json.dumps(_main()))
 
 
 def build_figure_inventory_wrapper(rel: str, *, ws: str, max_bytes: int) -> str:
-    """沙箱片段:对 ``ws/rel`` 生成图清单,打印模块头部约定的那份 JSON 信封。"""
-    return _snippet({"ws": ws, "rel": rel, "max_bytes": max_bytes}, _FIGURE_INVENTORY_MAIN)
+    """沙箱片段:对 ``ws/rel`` 生成图清单,打印模块头部约定的那份 JSON 信封。
+
+    两个装饰图阈值从模块常量喂进 ``_P``(回修第 1 轮 I-3)—— 片段是一段不能
+    import 的字符串,不喂就只能在里面写第二份字面量,公开常量随之变成死的。
+    """
+    return _snippet(
+        {
+            "ws": ws,
+            "rel": rel,
+            "max_bytes": max_bytes,
+            "min_figure_edge_pt": MIN_FIGURE_EDGE_PT,
+            "min_figure_area_ratio": MIN_FIGURE_AREA_RATIO,
+        },
+        _FIGURE_INVENTORY_MAIN,
+    )
 
 
 def _describe_figure(figure: Mapping[str, Any]) -> str:
