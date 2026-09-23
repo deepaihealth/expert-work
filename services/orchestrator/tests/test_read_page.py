@@ -2568,10 +2568,14 @@ async def test_pdf_and_pptx_are_not_refused_by_the_format_gate() -> None:
 @pytest.mark.anyio
 async def test_shared_prefix_is_refused_not_silently_redirected() -> None:
     runtime = RecordingSandboxRuntime()
-    with pytest.raises(WriteToSharedError):
+    with pytest.raises(WriteToSharedError) as info:
         await ReadPageTool(client=runtime, figure_delivery="inline").call(
             {"path": "shared:d.pptx", "units": [1]}, ctx=_ctx()
         )
+    # 终审 #5 —— 模型没想写东西:说「共享区的文档先复制过来」,不说「去掉前缀去写」。
+    assert "共享区" in str(info.value)
+    assert "cp /workspace/shared/d.pptx d.pptx" in str(info.value)
+    assert "drop the" not in str(info.value)
     assert runtime.execs == []
 
 

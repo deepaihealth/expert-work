@@ -93,13 +93,21 @@ def resolve_scope(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:
     """
     raw = path.strip()
     if raw.startswith(SHARED_PREFIX):
+        rel = raw[len(SHARED_PREFIX) :].strip()
+        if tool == "read_page":
+            # 终审 #5 —— read_page 被挡是因为它要往文档旁边落渲染产物,不是模型想写
+            # 共享区;照抄写工具那句「去掉前缀」会把它指向另一个(多半不存在的)文件。
+            msg = (
+                f"read_page 不能直接渲染共享区里的文档 {rel!r} —— 先把它复制到你自己的工作区"
+                f"(比如 cp {EXEC_VIEW}/{_SHARED_DIR}/{rel} {rel}),再对副本调用 read_page。"
+            )
+            raise WriteToSharedError(msg)
         if tool in _WRITE_TOOLS:
             msg = (
                 f"{tool} cannot write to the shared area; "
                 f"drop the {SHARED_PREFIX!r} prefix to write into your own workspace"
             )
             raise WriteToSharedError(msg)
-        rel = raw[len(SHARED_PREFIX) :].strip()
         if not rel or rel.startswith("/") or ".." in PurePosixPath(rel).parts:
             msg = f"{tool} path must be relative and free of '..': {path!r}"
             raise ValueError(msg)
