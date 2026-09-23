@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 from pathlib import Path, PurePosixPath
@@ -31,6 +32,7 @@ from orchestrator.multimodal import (
     ResolvedImage,
     image_ref_block,
     is_cacheable_image_ref,
+    resolve_message_images,
     split_human_content,
 )
 
@@ -658,3 +660,15 @@ def test_agent_key_matches_the_first_two_normalized_parts_of_rel(rel_tail: str) 
     assert parsed.agent_key is not None
     parts = PurePosixPath(parsed.rel).parts
     assert parts[:2] == ("agents", parsed.agent_key)
+
+
+class _CancelledResolver:
+    async def resolve(self, ref: str) -> ResolvedImage:
+        raise asyncio.CancelledError
+
+
+async def test_a_cancelled_workspace_resolve_is_not_degraded() -> None:
+    """B-64 Task 7 —— 降级只接 ``Exception``:取消照常往上走,不被吞成一段文字。"""
+    ref = f"expert_work://workspace/{uuid4()}/{uuid4()}/a.jpg"
+    with pytest.raises(asyncio.CancelledError):
+        await resolve_message_images([ref], _CancelledResolver())

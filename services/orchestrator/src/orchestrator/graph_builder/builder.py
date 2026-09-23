@@ -69,7 +69,6 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -100,7 +99,6 @@ from expert_work.common.output_screen import REFUSAL_TEXT, screen_output
 from expert_work.common.spotlight import spotlight_untrusted
 from expert_work.common.supersede import filter_superseded_turns, stamped_run_id
 from expert_work.common.uplift_metrics import record_memory_inject_mode
-from expert_work.persistence import RENDERED_FIGURE_PAGE_STEM, is_rendered_figure_rel
 from expert_work.protocol import (
     AuditAction,
     AuditEntry,
@@ -110,7 +108,6 @@ from expert_work.protocol import (
     PlanStep,
     StructuredOutputSpec,
 )
-from expert_work.protocol.multimodal import parse_workspace_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.audit.redactor import DEFAULT_PATTERNS, PII_PATTERNS, DefaultSecretRedactor
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
@@ -160,7 +157,7 @@ from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
-from orchestrator.multimodal import image_ref_block
+from orchestrator.multimodal import image_ref_block, parse_rendered_figure_ref
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
@@ -2114,10 +2111,11 @@ def _own_figure(
     """
     if not isinstance(ref, str) or tenant_id is None or user_id is None:
         return None
-    try:
-        parsed = parse_workspace_image_ref(ref)
-    except ValueError:
+    # 解析、剥作用域前缀、形状判据、页号 —— 都在 ``parse_rendered_figure_ref`` 一处。
+    figure = parse_rendered_figure_ref(ref)
+    if figure is None:
         return None
+    parsed = figure.workspace
     if (
         parsed.tenant_id != tenant_id
         or parsed.user_id != user_id
@@ -2125,15 +2123,12 @@ def _own_figure(
         or parsed.agent_key != (agent_key or None)
     ):
         return None
-    # 剥作用域前缀按**分段数**,与 ``multimodal.is_cacheable_image_ref`` 同一个算法。
-    skip = 2 if parsed.agent_key is not None else 0
-    parts = PurePosixPath(parsed.rel).parts[skip:]
-    if not is_rendered_figure_rel("/".join(parts)):
-        return None
-    # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。
-    doc_sha, render_sha, unit_dir, name = parts[-4:]
-    page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
-    return _Figure(ref=ref, slot=(doc_sha, unit_dir), render_sha=render_sha, page=page)
+    return _Figure(
+        ref=ref,
+        slot=(figure.doc_sha, figure.unit_dir),
+        render_sha=figure.render_sha,
+        page=figure.page,
+    )
 
 
 def _figure_slots(figures: Sequence[_Figure]) -> list[tuple[_Figure, list[_Figure]]]:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import logging
 import os
 import stat
 from collections import OrderedDict
@@ -27,14 +28,17 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
 from uuid import UUID
 
-from expert_work.persistence import is_rendered_figure_rel
+from expert_work.persistence import RENDERED_FIGURE_PAGE_STEM, is_rendered_figure_rel
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
     WORKSPACE_REF_PREFIX,
+    WorkspaceImageRef,
     parse_image_ref,
     parse_workspace_image_ref,
 )
 from expert_work.runtime.storage.base import ObjectStore
+
+logger = logging.getLogger(__name__)
 
 #: ``content`` block discriminator for an uploaded-image reference.
 IMAGE_REF_BLOCK_TYPE: Final = "image_ref"
@@ -477,6 +481,106 @@ def is_cacheable_image_ref(ref: str) -> bool:
     skip = 2 if parsed.agent_key is not None else 0
     tail = "/".join(PurePosixPath(parsed.rel).parts[skip:])
     return is_rendered_figure_rel(tail)
+
+
+@dataclass(frozen=True)
+class RenderedFigureRef:
+    """一条 ``read_page`` 渲染页 ref 拆开之后的样子(B-64 Task 7)。
+
+    落点形状见 :data:`~expert_work.persistence.RENDERED_FIGURE_DIR` 那一组常量:
+    ``.tool_results/<run_id>/figures/<doc-sha>/<render-sha>/_u<unit>/page-NN.jpg``。
+    """
+
+    workspace: WorkspaceImageRef
+    #: 文档路径派生 —— 同一条路径换了内容,这一段不变。
+    doc_sha: str
+    #: 渲染输入(内容 + dpi)派生 —— 内容一变,这一段跟着变。
+    render_sha: str
+    #: ``_u<unit>`` 整段。对 docx,unit 是图的编号,**不是**页号。
+    unit_dir: str
+    #: 真实 PDF 页号,取自文件名 ``page-NN.jpg``(pdftoppm 按总页数补零,几位都认)。
+    page: int
+
+
+def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
+    """``ref`` 是 ``read_page`` 的渲染页就拆开;不是(或解析不了)就 ``None``。
+
+    B-64 Task 7 —— 提示词里的渲染页段(``graph_builder._figure_block_tail``)、
+    适配器的降级文字(:func:`resolve_message_images`)与 ``read_page`` 的回执都要从
+    ref 里读页号,读法只写这一处。剥作用域前缀按**分段数**,与
+    :func:`is_cacheable_image_ref` 同一个算法;形状判据是
+    :func:`~expert_work.persistence.is_rendered_figure_rel`。
+    **只看形状,不比身份** —— 这个 ref 是不是调用方自己的,是调用方的活。
+    """
+    if not ref.startswith(WORKSPACE_REF_PREFIX):
+        return None
+    try:
+        parsed = parse_workspace_image_ref(ref)
+    except ValueError:
+        return None
+    skip = 2 if parsed.agent_key is not None else 0
+    parts = PurePosixPath(parsed.rel).parts[skip:]
+    if not is_rendered_figure_rel("/".join(parts)):
+        return None
+    # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。
+    doc_sha, render_sha, unit_dir, name = parts[-4:]
+    page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
+    return RenderedFigureRef(
+        workspace=parsed, doc_sha=doc_sha, render_sha=render_sha, unit_dir=unit_dir, page=page
+    )
+
+
+def _unreadable_workspace_image_text(figure: RenderedFigureRef | None) -> str:
+    """工作区图读不出来时,顶替那张图的可见文字。"""
+    if figure is not None:
+        return (
+            f"[图:第 {figure.page} 页的图文件已不存在或读不出来(可能已被清理),"
+            "需要的话重新调用 read_page]"
+        )
+    return "[图:这张工作区图片的文件已不存在或读不出来(可能已被清理)]"
+
+
+async def resolve_message_images(
+    refs: Sequence[str], resolver: ImageResolver
+) -> list[ResolvedImage | str]:
+    """按次序解析一条消息里的图;**工作区** ref 读不出来时换成一段可见文字。
+
+    两个 provider 适配器(``openai.py`` / ``anthropic.py``)都从这里拿结果,再各自
+    映射成自己的 wire 形状 —— 「哪些失败降级、降级成什么」只写在这一处。返回值里
+    ``ResolvedImage`` 是图,``str`` 是顶替那张图的文字,位置与 ``refs`` 一一对应。
+
+    B-64 Task 7 —— 为什么工作区 ref 必须降级、不能让异常往上走:渲染页 ref 住在
+    会话检查点的 ``viewed_figures`` 里,每一轮都会重新挂进提示词;而它指向的文件
+    会消失 —— 留存清理(``retention_cleanup_job.orphan_threads.sweep_orphan_tool_results``)
+    在 run 行被清掉之后整个删掉 ``.tool_results/<run_id>/``,模型自己也能 ``rm``,
+    检查与读取之间还可能被删。异常往上走 = 这一步 LLM 调用失败,而下一轮同一条
+    ref 还在 —— **这条会话从此每一轮都失败**。换成文字,模型看得见那里原来有张图、
+    也知道怎么拿回来。
+
+    **上传图(``expert_work://image/...``)不降级**,失败行为与引入本函数之前逐字
+    相同:异常原样抛出。那条路径的失败语义不在 B-64 的范围里。
+
+    接的是 ``Exception``,不是 ``BaseException``:取消(``asyncio.CancelledError``)
+    照常往上走。
+    """
+    out: list[ResolvedImage | str] = []
+    for ref in refs:
+        if not ref.startswith(WORKSPACE_REF_PREFIX):
+            out.append(await resolver.resolve(ref))
+            continue
+        try:
+            out.append(await resolver.resolve(ref))
+        except Exception as exc:
+            figure = parse_rendered_figure_ref(ref)
+            # 只打 ref 的用户根相对路径与页号 —— tenant / user 两个 id 不进日志。
+            logger.warning(
+                "multimodal.workspace_image_degraded rel=%s page=%s error=%s",
+                figure.workspace.rel if figure is not None else "<not a rendered page>",
+                figure.page if figure is not None else "-",
+                type(exc).__name__,
+            )
+            out.append(_unreadable_workspace_image_text(figure))
+    return out
 
 
 @dataclass

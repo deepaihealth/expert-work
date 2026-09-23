@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -17,6 +17,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from expert_work.persistence import (
+    RENDERED_FIGURE_DIR,
+    RENDERED_FIGURE_PAGE_STEM,
+    RENDERED_FIGURE_SHA_HEX_LEN,
+    RENDERED_FIGURE_UNIT_PREFIX,
+    WORKSPACE_OVERFLOW_DIR,
+)
 from expert_work.runtime.middleware import (
     LLMClientError,
     LLMNetworkError,
@@ -522,6 +529,115 @@ async def test_human_workspace_ref_resolves_through_dispatching_resolver(tmp_pat
     assert content[0] == {"type": "text", "text": "what is this?"}
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+# ---------------------------------------------------------------------------
+# B-64 Task 7 回修 —— 工作区图读不出来时降级成文字,不让整次调用失败
+# ---------------------------------------------------------------------------
+
+
+def _rendered_page(root: Path, tenant: UUID, user: UUID, page: int, *, on_disk: bool) -> str:
+    """在 ``root`` 下按 ``read_page`` 的真实落点形状放一页(或故意不放),返回它的 ref。"""
+    rel = "/".join(
+        [
+            WORKSPACE_OVERFLOW_DIR,
+            str(uuid4()),
+            RENDERED_FIGURE_DIR,
+            "a" * RENDERED_FIGURE_SHA_HEX_LEN,
+            "b" * RENDERED_FIGURE_SHA_HEX_LEN,
+            f"{RENDERED_FIGURE_UNIT_PREFIX}{page}",
+            f"{RENDERED_FIGURE_PAGE_STEM}-{page:02d}.jpg",
+        ]
+    )
+    if on_disk:
+        path = root / str(tenant) / str(user) / rel
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    return f"expert_work://workspace/{tenant}/{user}/{rel}"
+
+
+def _workspace_resolver(root: Path) -> DispatchingImageResolver:
+    return DispatchingImageResolver(
+        uploads=InMemoryImageResolver({}), workspace=NasWorkspaceImageResolver(root=root)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_missing_workspace_image_degrades_to_text_in_its_place(tmp_path: Path) -> None:
+    """留存清理删掉了 ``.tool_results/<run_id>/``:那张图换成文字,另外两张照常。
+
+    不降级的话这里抛 ``FileNotFoundError`` —— 而同一条 ref 下一轮还在,会话从此
+    每一轮都失败。
+    """
+    tenant, user = uuid4(), uuid4()
+    refs = [
+        _rendered_page(tmp_path, tenant, user, 3, on_disk=True),
+        _rendered_page(tmp_path, tenant, user, 5, on_disk=False),
+        _rendered_page(tmp_path, tenant, user, 7, on_disk=True),
+    ]
+    client = RecordingOpenAIClient(response={"choices": [{"message": {"content": "ok"}}]})
+    provider = OpenAIProvider(
+        client=client, model="gpt-4o", image_resolver=_workspace_resolver(tmp_path)
+    )
+
+    await provider.complete(
+        messages=[
+            HumanMessage(
+                content=[{"type": "text", "text": "看图"}, *(image_ref_block(r) for r in refs)]
+            )
+        ],
+        tools=[],
+    )
+
+    content = client.calls[0]["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "看图"}
+    assert content[1]["type"] == "image_url"
+    assert content[2]["type"] == "text"
+    assert "第 5 页" in content[2]["text"]
+    assert "read_page" in content[2]["text"]
+    assert content[3]["type"] == "image_url"
+    assert len(content) == 4
+
+
+@pytest.mark.asyncio
+async def test_every_workspace_image_missing_still_calls_the_model(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    refs = [_rendered_page(tmp_path, tenant, user, p, on_disk=False) for p in (3, 5, 7)]
+    client = RecordingOpenAIClient(response={"choices": [{"message": {"content": "ok"}}]})
+    provider = OpenAIProvider(
+        client=client, model="gpt-4o", image_resolver=_workspace_resolver(tmp_path)
+    )
+
+    await provider.complete(
+        messages=[
+            HumanMessage(
+                content=[{"type": "text", "text": "看图"}, *(image_ref_block(r) for r in refs)]
+            )
+        ],
+        tools=[],
+    )
+
+    content = client.calls[0]["messages"][0]["content"]
+    assert [b["type"] for b in content] == ["text", "text", "text", "text"]
+    assert ["第 3 页" in content[1]["text"], "第 5 页" in content[2]["text"]] == [True, True]
+    assert "第 7 页" in content[3]["text"]
+
+
+@pytest.mark.asyncio
+async def test_an_upload_ref_that_fails_to_resolve_still_raises(tmp_path: Path) -> None:
+    """回归钉:上传图的失败行为不在这次改动范围里 —— 异常原样抛出,一个字不改。"""
+    uri = f"expert_work://image/{uuid4()}/{uuid4()}/{uuid4()}.png"
+    client = RecordingOpenAIClient(response={"choices": [{"message": {"content": "ok"}}]})
+    provider = OpenAIProvider(
+        client=client, model="gpt-4o", image_resolver=_workspace_resolver(tmp_path)
+    )
+
+    with pytest.raises(KeyError, match="no image for ref"):
+        await provider.complete(
+            messages=[HumanMessage(content=[{"type": "text", "text": "hi"}, image_ref_block(uri)])],
+            tools=[],
+        )
+    assert client.calls == []
 
 
 @pytest.mark.asyncio

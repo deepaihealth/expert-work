@@ -71,7 +71,11 @@ from orchestrator.llm.providers._streaming import (
     delta_from_anthropic_event,
 )
 from orchestrator.llm.structured_output import StructuredOutputCapability
-from orchestrator.multimodal import ImageResolver, split_human_content
+from orchestrator.multimodal import (
+    ImageResolver,
+    resolve_message_images,
+    split_human_content,
+)
 from orchestrator.tools.registry import ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -939,15 +943,18 @@ async def _human_content(
         logger.warning("anthropic_adapter.image_dropped_no_resolver count=%d", len(image_refs))
         return text
     blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
-    for ref in image_refs:
-        resolved = await resolver.resolve(ref)
+    # B-64 Task 7 —— 工作区图读不出来时 ``resolve_message_images`` 给一段文字顶替。
+    for item in await resolve_message_images(image_refs, resolver):
+        if isinstance(item, str):
+            blocks.append({"type": "text", "text": item})
+            continue
         blocks.append(
             {
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": resolved.media_type,
-                    "data": resolved.base64_data,
+                    "media_type": item.media_type,
+                    "data": item.base64_data,
                 },
             }
         )
