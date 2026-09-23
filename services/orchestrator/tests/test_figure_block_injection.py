@@ -40,6 +40,7 @@ from expert_work.persistence import (
 )
 from expert_work.protocol import StructuredOutputSpec
 from expert_work.runtime.checkpointer import make_checkpointer
+from expert_work.runtime.tokens import CharTokenEstimator
 from orchestrator import (
     GraphRunner,
     ToolContext,
@@ -48,10 +49,11 @@ from orchestrator import (
     ToolSpec,
     build_react_graph,
 )
-from orchestrator.graph_builder.builder import FIGURE_KEEP_RECENT, _figure_block_tail
+from orchestrator.context import ContextCompressor
+from orchestrator.graph_builder.figure_block import FIGURE_KEEP_RECENT, figure_block_tail
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.state import _merge_viewed_figures
-from orchestrator.tools.read_page import workspace_figure_ref
+from orchestrator.tools.read_page import document_sha, workspace_figure_ref
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
@@ -87,8 +89,9 @@ def _ref(
     """一条 ``read_page`` 形状的 ref。
 
     ``page`` 可以是带补零的字符串(pdftoppm 按总页数补零);``unit`` 缺省等于页号
-    (pptx/pdf 的定义),docx 的场景显式给一个不同的值。``doc`` 决定 ``<doc-sha>``
-    (路径派生),``content`` 决定 ``<render-sha>``(内容派生)。
+    (pptx/pdf 的定义),docx 的场景显式给一个不同的值。``doc`` 是模型传给
+    ``read_page`` 的路径,``<doc-sha>`` 用 ``read_page`` 自己那个函数由它算出来;
+    ``content`` 决定 ``<render-sha>``(内容派生)。
     """
     unit_no = int(page) if unit is None else unit
     rel = "/".join(
@@ -96,7 +99,7 @@ def _ref(
             WORKSPACE_OVERFLOW_DIR,
             str(run),
             RENDERED_FIGURE_DIR,
-            _sha(doc),
+            str(document_sha(doc, agent_key=agent_key)),
             _sha(content),
             f"{RENDERED_FIGURE_UNIT_PREFIX}{unit_no}",
             f"{RENDERED_FIGURE_PAGE_STEM}-{page}.jpg",
@@ -110,14 +113,16 @@ def _tail(
     messages: list[BaseMessage],
     viewed: Sequence[object],
     *,
+    documents: Mapping[str, object] | None = None,
     supports_vision: bool = True,
     tenant_id: UUID | None = _TENANT,
     user_id: UUID | None = _USER,
     agent_key: str = _AGENT_KEY,
 ) -> list[BaseMessage]:
-    return _figure_block_tail(
+    return figure_block_tail(
         messages,
         viewed=viewed,
+        documents=documents,
         supports_vision=supports_vision,
         tenant_id=tenant_id,
         user_id=user_id,
@@ -170,9 +175,8 @@ def test_retired_figures_leave_a_visible_placeholder() -> None:
     """删除是静默失效 —— 模型必须看得见这里原来有张图,以及怎么拿回来。"""
     out = _tail([], [_ref(p) for p in range(1, 6)])
     text = _block_text(out)
-    assert "第 1 页 已退出上下文" in text
-    assert "第 2 页 已退出上下文" in text
-    assert "第 3 页 已退出上下文" not in text
+    # 1、2 两页退役,按文档折叠成一行、编号压成区间;3 仍在窗口里。
+    assert "编号 1-2 的图已退出上下文" in text
     assert "read_page" in text
 
 
@@ -186,7 +190,7 @@ def test_a_re_read_retired_page_comes_back_into_the_window() -> None:
     again = _merge_viewed_figures(first, [_ref(1)])
     out = _tail([], again)
     assert _ref(1) in _pixels(out)
-    assert "第 1 页 已退出上下文" not in _block_text(out)
+    assert "编号 2-3 的图已退出上下文" in _block_text(out)
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +277,7 @@ def test_two_versions_of_one_page_share_one_pixel_slot() -> None:
     out = _tail([], [p5, old, p7, new])
     assert _pixels(out) == [p5, p7, new]
     text = _block_text(out)
-    assert "第 3 页(旧版本 —— 文档之后被改过)" in text
+    assert "编号 3 有旧版本(文档之后被改过)" in text
 
 
 def test_an_edit_reverted_page_shows_the_reverted_version_as_current() -> None:
@@ -508,3 +512,146 @@ async def test_the_block_never_lands_in_the_checkpoint() -> None:
     assert len(_marked(llm.seen_prompts[0])) == 1, "块没注入, 这条测试就什么也没验"
     assert _marked(snapshot.values["messages"]) == []
     assert _pixels(snapshot.values["messages"]) == []
+
+
+# ---------------------------------------------------------------------------
+# 回修第 3 轮 (a) —— 占位按文档折叠、可恢复
+# ---------------------------------------------------------------------------
+
+
+def _documents(*paths: str) -> dict[str, str]:
+    """``read_page`` 写进 ``figure_documents`` 的那个形状:``<doc-sha>`` → 路径。"""
+    return {str(document_sha(p, agent_key=_AGENT_KEY)): p for p in paths}
+
+
+def test_a_retired_page_says_which_path_to_pass_back() -> None:
+    """ref 里只有路径哈希;退役占位必须给出模型能原样再传给 read_page 的路径。"""
+    out = _tail(
+        [],
+        [_ref(p, doc="uploads/a.pptx") for p in (1, 2)]
+        + [_ref(p, doc="uploads/b.pdf") for p in (1, 2, 3)],
+        documents=_documents("uploads/a.pptx", "uploads/b.pdf"),
+    )
+    text = _block_text(out)
+    assert '文档 "uploads/a.pptx":编号 1-2 的图已退出上下文' in text
+    assert 'path 填 "uploads/a.pptx"' in text
+    assert '"uploads/b.pdf" 第 1 页' in text
+
+
+def test_without_a_recorded_path_the_placeholder_says_so() -> None:
+    text = _block_text(_tail([], [_ref(p) for p in range(1, 6)]))
+    assert "路径没记下来" in text
+    assert "你当初调用 read_page 时传的那个路径" in text
+
+
+def test_a_path_that_does_not_hash_to_the_key_is_not_shown() -> None:
+    """``figure_documents`` 是工具可写的通道:键对不上路径就不采信。"""
+    forged = {str(document_sha("d.pptx", agent_key=_AGENT_KEY)): "别的文件.pptx"}
+    text = _block_text(_tail([], [_ref(p) for p in range(1, 6)], documents=forged))
+    assert "别的文件" not in text
+    assert "路径没记下来" in text
+
+
+def test_placeholders_grow_with_documents_not_with_pages() -> None:
+    """同一份文档看 40 页、每页改 3 版:仍然只有「退役」「旧版本」两行,编号压成区间。"""
+
+    def text_for(pages: int) -> str:
+        viewed = [
+            _ref(p, doc="uploads/a.pptx", content=f"v{v}")
+            for v in range(3)
+            for p in range(1, pages + 1)
+        ]
+        return _block_text(_tail([], viewed, documents=_documents("uploads/a.pptx")))
+
+    few, many = text_for(5), text_for(40)
+    assert few.count("\n") == many.count("\n")
+    assert "编号 1-37 的图已退出上下文" in many
+    assert "编号 1-40 有旧版本" in many
+
+
+# ---------------------------------------------------------------------------
+# 回修第 3 轮 (b) —— 压缩判定看得见图块
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CountingSummariser:
+    calls: int = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del messages, tools
+        self.calls += 1
+        return AIMessage(content="- 摘要")
+
+
+def _history(total_tokens: int) -> list[BaseMessage]:
+    """六条消息,按 ``CharTokenEstimator``(4 字符 1 token)合计约 ``total_tokens``。"""
+    per = total_tokens * 4 // 6
+    out: list[BaseMessage] = []
+    for i in range(6):
+        body = f"第{i}条" + "x" * per
+        out.append(HumanMessage(content=body) if i % 2 == 0 else AIMessage(content=body))
+    return out
+
+
+async def _run_with_compressor(
+    *, history_tokens: int, context_window: int, supports_vision: bool
+) -> tuple[_CountingSummariser, _RecordingLLM]:
+    summariser = _CountingSummariser()
+    compressor = ContextCompressor(
+        llm_caller=summariser,
+        context_window=context_window,
+        head_keep=1,
+        tail_keep=1,
+        estimator=CharTokenEstimator(),
+    )
+    llm = _RecordingLLM()
+    async with _graph(
+        llm, context_compressor=compressor, supports_vision=supports_vision
+    ) as compiled:
+        config: RunnableConfig = {"configurable": _configurable()}
+        await compiled.ainvoke(
+            {
+                "messages": _history(history_tokens),
+                "step_count": 0,
+                "max_steps": 5,
+                "viewed_figures": [_ref(p) for p in (1, 2, 3)],
+            },
+            config=config,
+        )
+    return summariser, llm
+
+
+async def test_the_figure_block_counts_toward_the_compression_threshold() -> None:
+    """历史卡在阈值下(13k < 0.7 * 20k = 14k),三张图(3 * 1300)一加就超。
+
+    图块挂在压缩**之后**;不把它的估算交给压缩器,这里一次都不会压。
+    """
+    summariser, llm = await _run_with_compressor(
+        history_tokens=13_000, context_window=20_000, supports_vision=True
+    )
+    assert summariser.calls >= 1
+    prompt = llm.seen_prompts[0]
+    # 块本身不进被总结的那段:压缩之后它仍然完整地挂在尾部。
+    assert len(_marked(prompt)) == 1
+    assert len(_pixels(prompt)) == 3
+
+
+async def test_without_a_figure_block_the_same_history_is_not_compressed() -> None:
+    """对照组:同一段历史,主模型看不了图(没有块)—— 不压。"""
+    summariser, _ = await _run_with_compressor(
+        history_tokens=13_000, context_window=20_000, supports_vision=False
+    )
+    assert summariser.calls == 0
+
+
+async def test_a_small_window_compresses_hard_but_does_not_fail() -> None:
+    """8K 那一档:预留本身就接近或超过阈值。压到头也不许因为预留抛
+    ``ContextOverflowError`` —— 失败判据维持「不算预留」的口径。"""
+    summariser, llm = await _run_with_compressor(
+        history_tokens=1_500, context_window=4_000, supports_vision=True
+    )
+    assert summariser.calls >= 1
+    assert len(_pixels(llm.seen_prompts[0])) == 3

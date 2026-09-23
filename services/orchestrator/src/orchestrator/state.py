@@ -92,7 +92,7 @@ def _merge_last_used(existing: dict[str, int] | None, new: dict[str, int]) -> di
 def _merge_viewed_figures(left: list[str], right: list[str]) -> list[str]:
     """跨轮累积已看过的页 ref —— union 去重,按**最近一次看到**排序。
 
-    次序是滑窗的前提:``_figure_block_tail`` 取「最新 N 条」靠的是列表次序。
+    次序是滑窗的前提:``figure_block.figure_block_message`` 取「最新 N 条」靠的是列表次序。
 
     Task 7 改了口径:重看同一页**要**把它挪到队尾(原来是按首次看到排、重看不挪)。
     原来的顾虑是「挪到队尾会把一张更早看过、模型还在用的图挤出窗口」—— 这个顾虑
@@ -104,12 +104,21 @@ def _merge_viewed_figures(left: list[str], right: list[str]) -> list[str]:
     * 退出窗口的页再怎么重读也回不来 —— 而占位文字告诉模型的正是「再调一次
       read_page」;
     * 文档改了又改回去(内容哈希 A → B → A),重读得到的 A 版 ref 仍停在 B 前面,
-      ``_figure_block_tail`` 就会把 B 当成当前版本、把 A 标成旧版本 —— 反了。
+      ``figure_block.figure_block_message`` 就会把 B 当成当前版本、把 A 标成旧版本 —— 反了。
     """
     # 同一批里重复出现的,按**最后一次**出现的位置算(``[A, B, A]`` → ``[B, A]``)。
     fresh = list(reversed(dict.fromkeys(reversed(right))))
     moved = set(fresh)
     return [ref for ref in left if ref not in moved] + fresh
+
+
+def _merge_figure_documents(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
+    """B-64 Task 7 回修第 3 轮 —— ``<doc-sha>`` → 路径,跨轮合并,后写的赢。
+
+    同一个 ``<doc-sha>`` 由同一条路径算出(``read_page._doc_sha``),所以「后写的赢」
+    只在同一路径的不同写法之间选(比如首尾空白),不会把一份文档改指成另一份。
+    """
+    return {**left, **right}
 
 
 class AgentState(TypedDict):
@@ -320,5 +329,10 @@ class AgentState(TypedDict):
     #: 次序(见 :func:`_merge_viewed_figures`)。跨 run 累积:run 的起始输入
     #: (``control_plane.api.runs``)不写这个键,检查点里的旧值于是整条会话一直在。
     #: 检查点里只有这些字符串(几十字节一条),**图片字节从不落库**:
-    #: 块每轮由 ``_figure_block_tail`` 重建,与工作区快照同一口径(CM-C4)。
+    #: 块每轮由 ``figure_block.figure_block_message`` 重建,与工作区快照同一口径(CM-C4)。
     viewed_figures: NotRequired[Annotated[list[str], _merge_viewed_figures]]
+    #: B-64 Task 7 回修第 3 轮 —— ``<doc-sha>`` → 模型调 ``read_page`` 时传的路径。
+    #: ref 里只有路径哈希(不可逆),退役占位要告诉模型用哪个路径拿回来。放在 state
+    #: 而不是靠历史里的回执:压缩会把回执总结掉,state 不受影响。跨 run 累积,同
+    #: ``viewed_figures``。
+    figure_documents: NotRequired[Annotated[dict[str, str], _merge_figure_documents]]

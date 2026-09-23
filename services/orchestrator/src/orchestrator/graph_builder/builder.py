@@ -80,7 +80,6 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry.trace import Status, StatusCode
 
 from expert_work.common.conversation_channel import (
-    FIGURE_BLOCK_MARK,
     HIDE_FROM_UI,
     INPUTS_BLOCK_MARK,
     WORKSPACE_BLOCK_MARK,
@@ -144,6 +143,7 @@ from orchestrator.graph_builder._config import (
     current_run_id,
     token_sink_from_config,
 )
+from orchestrator.graph_builder.figure_block import figure_block_message, with_figure_block
 from orchestrator.graph_builder.input_url_guard import (
     GuardHit,
     UrlCandidate,
@@ -157,7 +157,6 @@ from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
-from orchestrator.multimodal import image_ref_block, parse_rendered_figure_ref
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
@@ -825,8 +824,25 @@ def build_react_graph(
         # middle, max_passes exhausted, or three consecutive failed
         # rounds — so the orchestrator can write a clean RUN_FAILED
         # audit row.
+        # B-64 Task 7 回修第 3 轮 —— 渲染页段在**压缩判定之前**造好:它挂在压缩之后,
+        # 压缩器看不见它,而它带着 ≤3 张图(每张按 ``IMAGE_BLOCK_TOKEN_COST`` 计)加
+        # 一段占位文字。把它作为 ``reserved`` 交给压缩器 —— 只计入估算、不进被总结的
+        # 那段(压缩器去总结或丢掉它都是错的)。身份与工作区快照同一个来源:本次 run 的
+        # config。每轮重建、不落检查点。
+        figure_agent_key = configurable.get("agent_key")
+        figure_block = figure_block_message(
+            viewed=state.get("viewed_figures") or [],
+            documents=state.get("figure_documents") or {},
+            supports_vision=supports_vision,
+            tenant_id=_parse_uuid(configurable.get("tenant_id")),
+            user_id=_parse_uuid(configurable.get("user_id")),
+            agent_key=figure_agent_key if isinstance(figure_agent_key, str) else "",
+        )
+        reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
         demoted_tools: list[str] = []
-        if context_compressor is not None and context_compressor.should_compress(messages):
+        if context_compressor is not None and context_compressor.should_compress(
+            messages, reserved=reserved
+        ):
             # Stream CM-3 — bind a config-scoped flush so the compressor can
             # hand the middle to long-term memory before discarding it. The
             # callback is best-effort (the flusher swallows its own non-cancel
@@ -879,6 +895,7 @@ def build_react_graph(
                 on_pre_compaction=on_pre_compaction,
                 on_compacted=on_compacted,
                 streak_key=str(compress_thread_id) if compress_thread_id else None,
+                reserved=reserved,
             )
             # B-73 ③ —— 这一轮的「本轮输入」段被摘要掉的话,模型就没有输入文件的
             # 路径了,只能退回去手抄上文里的长串。放回最新一段(见函数 docstring)。
@@ -941,17 +958,10 @@ def build_react_graph(
                 user_id=user_id,
                 agent_key=agent_key_raw if isinstance(agent_key_raw, str) else "",
             )
-        # B-64 —— 渲染页段(Path A)。与上面工作区快照同一个位置、同一个身份来源
-        # (本次 run 的 config),同样每轮重建、不落检查点。**无条件调用**:拿不到
-        # tenant/user 时它一张都不挂,但仍要把提示词视图里可能残留的旧段剔掉。
-        messages = _figure_block_tail(
-            messages,
-            viewed=state.get("viewed_figures") or [],
-            supports_vision=supports_vision,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            agent_key=agent_key_raw if isinstance(agent_key_raw, str) else "",
-        )
+        # B-64 —— 渲染页段(Path A)挂到尾部。块在压缩判定之前就造好了(见那里的
+        # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
+        # 提示词视图里可能残留的旧段剔掉。
+        messages = with_figure_block(messages, figure_block)
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 
@@ -2061,182 +2071,6 @@ async def _workspace_block_tail(
         HumanMessage(
             content=block,
             additional_kwargs={HIDE_FROM_UI: True, WORKSPACE_BLOCK_MARK: True},
-        ),
-    ]
-
-
-#: B-64 —— 带像素进提示词的**槽**数上限。超出的退役成可见占位文字。
-#:
-#: 两份参考实现独立撞上同一个数 —— hermes ``_MAX_KEEP_TOOL_IMAGES = 3``、
-#: openclaw ``keepLastAssistants: 3``。这是引用,不是本仓实测:我们没有数据说明
-#: 3 对我们的模型/页型是否合适。
-#:
-#: 一个「槽」是一个 ``(<doc-sha>, _u<n>)``,不是一条 ref —— 同一页的新旧两版只占
-#: 一个槽(见 :func:`_figure_slots`)。
-FIGURE_KEEP_RECENT = 3
-
-_FIGURE_BLOCK_HEADING = "# 你取来的文档页(这一轮可见)\n"
-
-
-@dataclass(frozen=True)
-class _Figure:
-    """``viewed_figures`` 里一条通过了校验的 ref,拆出排槽要用的三段。"""
-
-    ref: str
-    #: ``(<doc-sha>, _u<n>)`` —— 同一份文档(按路径)的同一个请求单元。
-    slot: tuple[str, str]
-    #: 内容 + dpi 的哈希。同槽不同值 = 文档在两次读之间被改过。
-    render_sha: str
-    #: 真实 PDF 页号,取自文件名 ``page-NN.jpg``。**不从** ``_u<n>`` 取:
-    #: 对 docx 那是图的编号,不是页号。
-    page: int
-
-
-def _own_figure(
-    ref: object, *, tenant_id: UUID | None, user_id: UUID | None, agent_key: str
-) -> _Figure | None:
-    """``ref`` 是不是**本次 run 自己**渲出来的一页;是就拆开,不是就 ``None``。
-
-    三项比对缺一不可 —— 照 :mod:`orchestrator.tools.vision` 的写法。理由:
-    ``TOOL_ALLOWED_STATE_KEYS`` 放行 ``viewed_figures``,**任何**工具(含 MCP 工具)
-    都能往这个通道写字符串;而下游 ``NasWorkspaceImageResolver`` 的 tenant/user
-    **取自 ref 自身**,不跟调用方比对。这里不拦,就是拿别的租户 / 用户 / agent 的
-    文件当自己的看。三个身份都来自调用方传入的**本次 run 的** config。
-
-    另外要求 ref 是 ``read_page`` 的**产出形状**
-    (:func:`~expert_work.persistence.is_rendered_figure_rel`):排槽与页号都从
-    这个形状里读,形状不对就没有可信的槽和页号。三项都对得上、但形状不对的 ref
-    (比如模型自己写进工作区、尾巴凑成 ``_u3/page-3.jpg`` 的图)不是这个通道该装
-    的东西 —— 它是模型自己的文件,不是平台渲染的页。
-    """
-    if not isinstance(ref, str) or tenant_id is None or user_id is None:
-        return None
-    # 解析、剥作用域前缀、形状判据、页号 —— 都在 ``parse_rendered_figure_ref`` 一处。
-    figure = parse_rendered_figure_ref(ref)
-    if figure is None:
-        return None
-    parsed = figure.workspace
-    if (
-        parsed.tenant_id != tenant_id
-        or parsed.user_id != user_id
-        # 空串 ↔ None 是两套代码分别表达「没绑 agent」的写法,折成同一个值再比。
-        or parsed.agent_key != (agent_key or None)
-    ):
-        return None
-    return _Figure(
-        ref=ref,
-        slot=(figure.doc_sha, figure.unit_dir),
-        render_sha=figure.render_sha,
-        page=figure.page,
-    )
-
-
-def _figure_slots(figures: Sequence[_Figure]) -> list[tuple[_Figure, list[_Figure]]]:
-    """按槽归并:每槽 ``(当前版本, 更早的其他内容版本)``,槽按当前版本的位置排。
-
-    「当前版本」= 这个槽在列表里**最靠后**的那一条。``viewed_figures`` 按最近一次
-    看到排序(``state._merge_viewed_figures``),所以它就是最近一次读到的那一版。
-    注意这不等于「磁盘上此刻的文档」:读完之后文档又被改了而没有重读,这里不知道。
-
-    同槽、同 ``render_sha`` 的更早条目(跨 run 重读一份没改过的文档:run_id 段不同,
-    像素相同)**不单独列出**:它画的就是当前版本那张图,并没有什么丢了。
-    """
-    last_index = {f.slot: i for i, f in enumerate(figures)}
-    slots: list[tuple[_Figure, list[_Figure]]] = []
-    for slot, idx in sorted(last_index.items(), key=lambda item: item[1]):
-        current = figures[idx]
-        older: dict[str, _Figure] = {}
-        for f in figures[:idx]:
-            if f.slot == slot and f.render_sha != current.render_sha:
-                older[f.render_sha] = f
-        slots.append((current, list(older.values())))
-    return slots
-
-
-def _is_figure_block(msg: BaseMessage) -> bool:
-    """B-64 —— 这条消息是不是平台注入的渲染页段。"""
-    return isinstance(msg, HumanMessage) and bool(
-        (msg.additional_kwargs or {}).get(FIGURE_BLOCK_MARK)
-    )
-
-
-def _figure_block_tail(
-    messages: list[BaseMessage],
-    *,
-    viewed: Sequence[object],
-    supports_vision: bool,
-    tenant_id: UUID | None,
-    user_id: UUID | None,
-    agent_key: str,
-) -> list[BaseMessage]:
-    """B-64 —— 把已看过的文档页挂到提示词尾部;更早的那几段一并剔掉。
-
-    **只进这一次的提示词视图,从不落检查点** —— 与 :func:`_workspace_block_tail`
-    同一口径(CM-C4),结构保证也是同一条(返回值只进 ``agent_node`` 的局部
-    ``messages``)。检查点里只有 ``state["viewed_figures"]`` 的 ref 字符串。
-
-    这是我们比两份参考实现省掉的一整层:hermes / openclaw 把 base64 塞进消息,
-    所以「退役一张图」要重写多 MB 的消息,还得管检查点里的大块
-    (``drop_stale_api_content`` / ``_strip_images_from_tool_msg``)。我们存的是
-    ref(``image_ref_block`` 返回 ``{"type": "image_ref", "ref": uri}``),字节由
-    适配器在**调用时**解析 —— 退役只是重建时少挂一个 ref。
-
-    **退役是替换不是删除。** 超窗的页换成可见文字,模型看得见这里原来有张图、
-    也看得见怎么拿回来(再调一次 ``read_page``:同一 run 里重读拿到逐字相同的
-    ref,``_merge_viewed_figures`` 把它挪到队尾,它就回到窗口里)。同一页的旧版本
-    同理,可见地标成旧版本,不静默丢。
-
-    **不挂像素的 ref 有两类,待遇不同:** 超窗的、旧版本的 —— 是模型自己读过的
-    东西,留可见文字;没通过 :func:`_own_figure` 的 —— 不是本次 run 自己的渲染页,
-    **连文字都不留**(那串 ref 可能是别的工具塞进来的任意内容),只打一条 warning。
-
-    ``supports_vision`` 为假时不挂任何块:那条路由走 ``ask_image``(Path B),
-    字节从不进主上下文;在这里挂了它也看不见,只会白烧 token。
-
-    适配器(``split_human_content``)把一条消息里的全部文字拼在前、全部图片排在
-    后,所以不能在每张图前面插一句说明 —— 文字段末尾按次序列出后面几张是哪几页。
-    """
-    kept = [m for m in messages if not _is_figure_block(m)]
-    if not supports_vision or not viewed:
-        return kept
-    figures: list[_Figure] = []
-    for ref in viewed:
-        fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
-        if fig is not None:
-            figures.append(fig)
-    if len(figures) != len(viewed):
-        logger.warning(
-            "figure_block.refs_rejected rejected=%d total=%d",
-            len(viewed) - len(figures),
-            len(viewed),
-        )
-    if not figures:
-        return kept
-    slots = _figure_slots(figures)
-    live_from = max(len(slots) - FIGURE_KEEP_RECENT, 0)
-    lines: list[str] = []
-    for i, (current, older) in enumerate(slots):
-        lines.extend(
-            f"[图:第 {old.page} 页(旧版本 —— 文档之后被改过)不再展示,以同一处的新版本为准。]"
-            for old in older
-        )
-        if i < live_from:
-            lines.append(f"[图:第 {current.page} 页 已退出上下文。需要重看就再调一次 read_page。]")
-    live = [current for current, _ in slots[live_from:]]
-    lines.append(
-        f"下面依次附上 {len(live)} 张:" + "、".join(f"第 {f.page} 页" for f in live) + "。"
-    )
-    blocks: list[str | dict[Any, Any]] = [
-        {"type": "text", "text": _FIGURE_BLOCK_HEADING + "\n".join(lines)}
-    ]
-    blocks.extend(image_ref_block(f.ref) for f in live)
-    # ``HIDE_FROM_UI`` = 不进任何面向用户/第三方的视图, 也不开新一段;
-    # ``FIGURE_BLOCK_MARK`` 是更窄的一层, 让上面的剔除只认自己这一段。
-    return [
-        *kept,
-        HumanMessage(
-            content=blocks,
-            additional_kwargs={HIDE_FROM_UI: True, FIGURE_BLOCK_MARK: True},
         ),
     ]
 

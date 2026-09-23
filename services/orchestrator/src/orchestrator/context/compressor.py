@@ -532,10 +532,18 @@ class ContextCompressor:
     def _estimate(self, messages: Sequence[BaseMessage]) -> int:
         return estimate_tokens(messages, estimator=self.estimator)
 
-    def should_compress(self, messages: Sequence[BaseMessage]) -> bool:
+    def should_compress(
+        self, messages: Sequence[BaseMessage], *, reserved: Sequence[BaseMessage] = ()
+    ) -> bool:
         """Cheap preflight — returns ``True`` if the estimated prompt
-        size meets or exceeds the threshold."""
-        return self._estimate(messages) >= self.threshold_tokens
+        size meets or exceeds the threshold.
+
+        B-64 Task 7 回修第 3 轮 —— ``reserved`` 是**压缩之后**才会挂进提示词、但压缩
+        器不该碰的消息(渲染页段)。它的估算计入判定,它本身不在 ``messages`` 里、
+        不会被总结。估算走同一个 :meth:`_estimate`(图片块按
+        ``IMAGE_BLOCK_TOKEN_COST`` 计),不另算一份。
+        """
+        return self._estimate(messages) + self._estimate(reserved) >= self.threshold_tokens
 
     async def compress(
         self,
@@ -544,6 +552,7 @@ class ContextCompressor:
         on_pre_compaction: PreCompactionHook | None = None,
         on_compacted: OnCompacted | None = None,
         streak_key: str | None = None,
+        reserved: Sequence[BaseMessage] = (),
     ) -> list[BaseMessage]:
         """Compress the message list until it fits under the threshold.
 
@@ -589,12 +598,19 @@ class ContextCompressor:
         :class:`CompactionStats` (a skip-only round or an entry already
         under threshold emits nothing). Best-effort by the same contract as
         ``on_pre_compaction``: the caller swallows its own failures.
+
+        B-64 Task 7 回修第 3 轮 —— ``reserved``(见 :meth:`should_compress`)计入
+        「压到阈值以下」的目标,但**不新增失败**:中段已空(``_compress_once`` 抛
+        :class:`ContextOverflowError`)时,只要不算预留已经在阈值以下就照常返回;
+        次数用完那条判据本来就只看 ``current``。两条失败判据都维持引入预留之前的
+        口径。小窗口模型(8K 那一档)因此会每轮大幅压缩,但不会因为预留而失败。
         """
+        reserve = self._estimate(reserved) if reserved else 0
         current: list[BaseMessage] = list(messages)
         tokens_before = self._estimate(current)
         passes_done = 0
         for pass_idx in range(self.max_passes):
-            if self._estimate(current) < self.threshold_tokens:
+            if self._estimate(current) + reserve < self.threshold_tokens:
                 if pass_idx > 0:
                     logger.info(
                         "context_compressor.compressed passes=%d final_tokens=%d",
@@ -607,6 +623,10 @@ class ContextCompressor:
             try:
                 current = await self._compress_once(current, on_pre_compaction=on_pre_compaction)
             except ContextOverflowError:
+                if reserve and self._estimate(current) < self.threshold_tokens:
+                    return await self._finish_compaction(
+                        current, tokens_before, passes_done, on_compacted
+                    )
                 raise
             except RunCancelledError:
                 # A cancelled run must abort, never be mistaken for a

@@ -426,7 +426,7 @@ def _ask_image_enabled(vision: VisionSpec | None) -> bool:
 def _figure_delivery(*, supports_vision: bool, vision: VisionSpec | None) -> FigureDelivery:
     """B-64 Task 7 回修 —— ``read_page`` 渲出来的页怎么到模型眼前。
 
-    主模型能看图就走 Path A(``graph_builder._figure_block_tail`` 挂进提示词,
+    主模型能看图就走 Path A(``graph_builder.figure_block.figure_block_message`` 挂进提示词,
     ``build_react_graph(supports_vision=...)`` 收的是同一个值);否则看 ``ask_image``
     在不在;两样都没有就是 ``"none"``。
     """

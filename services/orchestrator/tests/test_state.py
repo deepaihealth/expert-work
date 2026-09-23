@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 
 from orchestrator import DEFAULT_MAX_STEPS, AgentState
-from orchestrator.state import _merge_promoted, _merge_viewed_figures
+from orchestrator.state import _merge_figure_documents, _merge_promoted, _merge_viewed_figures
 
 
 def test_required_keys_present() -> None:
@@ -19,8 +19,8 @@ def test_required_keys_present() -> None:
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
     ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``,
-    B-64 ``viewed_figures``
-    (last twenty-two ``NotRequired``)。
+    B-64 ``viewed_figures`` / ``figure_documents``
+    (last twenty-three ``NotRequired``)。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -56,6 +56,7 @@ def test_required_keys_present() -> None:
         "plan_first_dispatch_active",
         "plan_first_dispatch_retries",
         "viewed_figures",
+        "figure_documents",
     }
 
 
@@ -116,3 +117,14 @@ def test_tools_may_write_viewed_figures() -> None:
     from orchestrator.tools.registry import TOOL_ALLOWED_STATE_KEYS
 
     assert "viewed_figures" in TOOL_ALLOWED_STATE_KEYS
+
+
+def test_figure_documents_merge_later_write_wins_and_is_tool_writable() -> None:
+    from orchestrator.tools.registry import TOOL_ALLOWED_STATE_KEYS
+
+    assert _merge_figure_documents({"a": "x.pptx"}, {"b": "y.pdf"}) == {
+        "a": "x.pptx",
+        "b": "y.pdf",
+    }
+    assert _merge_figure_documents({"a": "x.pptx"}, {"a": " x.pptx"}) == {"a": " x.pptx"}
+    assert "figure_documents" in TOOL_ALLOWED_STATE_KEYS

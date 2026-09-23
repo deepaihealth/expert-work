@@ -35,6 +35,7 @@ from orchestrator.tools.read_page import (
     _require_units,
     _validate_rendered_rel,
     build_render_wrapper,
+    document_sha,
     workspace_figure_ref,
 )
 from orchestrator.tools.registry import ToolContext
@@ -2643,3 +2644,16 @@ async def test_read_page_does_not_render_when_the_model_cannot_see_the_page() ->
         assert "看不了图" in result.content
         assert "已放进你的上下文" not in result.content
         assert "viewed_figures" not in result.state_updates
+
+
+@pytest.mark.anyio
+async def test_read_page_records_the_path_for_each_rendered_document() -> None:
+    """回修第 3 轮 —— 渲染页段的退役占位要给出拿回来的路径,而 ref 里只有路径哈希。
+    记下的键必须是 ``document_sha`` 对这条路径正向算出的那个值(读的一侧按它核对)。"""
+    ctx = _ctx()
+    result = await ReadPageTool(
+        client=_one_rendered_page_runtime(ctx), figure_delivery="inline"
+    ).call({"path": "d.pptx", "units": [3]}, ctx=ctx)
+    assert result.state_updates["figure_documents"] == {
+        document_sha("d.pptx", agent_key=ctx.agent_key): "d.pptx"
+    }

@@ -56,7 +56,7 @@ WORKSPACE_BLOCK_MARK = "expert_work_workspace_block"
 #:
 #: 所以前两条规矩套上来都是错的:dedup 会在模型看第 7 页时丢掉还有用的第 3 页,
 #: 「放回最新」同理。它自己一条规矩 —— **累积 + 滑窗**(见
-#: ``graph_builder._figure_block_tail``)。
+#: ``graph_builder.figure_block.figure_block_message``)。
 FIGURE_BLOCK_MARK = "expert_work_figure_block"
 
 #: 定时任务投递的助手消息标记(``trigger_delivery.inject_delivery``)。它

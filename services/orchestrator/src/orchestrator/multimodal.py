@@ -28,7 +28,11 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
 from uuid import UUID
 
-from expert_work.persistence import RENDERED_FIGURE_PAGE_STEM, is_rendered_figure_rel
+from expert_work.persistence import (
+    RENDERED_FIGURE_PAGE_STEM,
+    RENDERED_FIGURE_UNIT_PREFIX,
+    is_rendered_figure_rel,
+)
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
     WORKSPACE_REF_PREFIX,
@@ -498,6 +502,8 @@ class RenderedFigureRef:
     render_sha: str
     #: ``_u<unit>`` 整段。对 docx,unit 是图的编号,**不是**页号。
     unit_dir: str
+    #: ``unit_dir`` 里的那个数 —— 模型调 ``read_page`` 时传的 ``units`` 编号。
+    unit: int
     #: 真实 PDF 页号,取自文件名 ``page-NN.jpg``(pdftoppm 按总页数补零,几位都认)。
     page: int
 
@@ -505,7 +511,7 @@ class RenderedFigureRef:
 def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
     """``ref`` 是 ``read_page`` 的渲染页就拆开;不是(或解析不了)就 ``None``。
 
-    B-64 Task 7 —— 提示词里的渲染页段(``graph_builder._figure_block_tail``)、
+    B-64 Task 7 —— 提示词里的渲染页段(``graph_builder.figure_block.figure_block_message``)、
     适配器的降级文字(:func:`resolve_message_images`)与 ``read_page`` 的回执都要从
     ref 里读页号,读法只写这一处。剥作用域前缀按**分段数**,与
     :func:`is_cacheable_image_ref` 同一个算法;形状判据是
@@ -525,8 +531,14 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
     # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。
     doc_sha, render_sha, unit_dir, name = parts[-4:]
     page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
+    unit = int(unit_dir.removeprefix(RENDERED_FIGURE_UNIT_PREFIX))
     return RenderedFigureRef(
-        workspace=parsed, doc_sha=doc_sha, render_sha=render_sha, unit_dir=unit_dir, page=page
+        workspace=parsed,
+        doc_sha=doc_sha,
+        render_sha=render_sha,
+        unit_dir=unit_dir,
+        unit=unit,
+        page=page,
     )
 
 

@@ -54,9 +54,9 @@ jpeg → glob 找产物。三个实测坑写进片段:
 
    * :func:`orchestrator.state._merge_viewed_figures` 是 union,
      所以"编辑文档 → 重读第 3 页"会把**新旧两版**一起推进
-     ``_figure_block_tail`` 的滑窗。Task 7 的处理:按 ``(doc-sha, unit)`` 只让
+     ``figure_block.figure_block_message`` 的滑窗。Task 7 的处理:按 ``(doc-sha, unit)`` 只让
      最近一次看到的那一版占像素槽,更早的版本在文字段里可见地标成旧版本(见
-     ``graph_builder.builder._figure_block_tail``)。
+     ``graph_builder.figure_block.figure_block_message``)。
    * 每个内容版本在 ``.tool_results/<run_id>/`` 下**永久留一个 ``<render-sha>/``
      目录**,直到这条 run 被 purge(B-50 Task 12 的会话 purge + 留存 job 孤儿
      扫描收它)。一条 run 里反复编辑同一份文档会线性堆目录。
@@ -988,6 +988,22 @@ def _doc_sha(ws: str, rel: str) -> str:
     return hashlib.sha256(f"{ws}/{rel}".encode()).hexdigest()[:RENDERED_FIGURE_SHA_HEX_LEN]
 
 
+def document_sha(path: str, *, agent_key: str) -> str | None:
+    """``read_page`` 对 ``path`` 算出来的 ``<doc-sha>``;路径解析不了就 ``None``。
+
+    B-64 Task 7 回修第 3 轮 —— 提示词里的渲染页段要把 ``<doc-sha>``(路径哈希,不可逆)
+    翻回模型能再传给 ``read_page`` 的路径。路径记在 ``state["figure_documents"]``,
+    那是工具可写的通道,所以用这个函数**正向**算一遍、与键对上才采信 —— 与
+    :meth:`ReadPageTool.call` 算 ``doc_sha`` 是同一对函数(``resolve_scope`` +
+    :func:`_doc_sha`)。
+    """
+    try:
+        ws, rel = resolve_scope(path, agent_key=agent_key, tool="read_page")
+    except ValueError:
+        return None
+    return _doc_sha(ws, rel)
+
+
 def _explain_error(kind: str, detail: object) -> str:
     explanation = _ERROR_EXPLANATIONS.get(kind, _UNKNOWN_ERROR_EXPLANATION)
     return f"{explanation}(detail: {detail})" if detail else explanation
@@ -1065,7 +1081,7 @@ def _describe_render_notes(rendered: Sequence[Mapping[str, Any]], *, unit_label:
 
 #: B-64 Task 7 回修 —— 渲出来的页怎么到模型眼前,三选一:
 #:
-#: * ``"inline"``:主模型能直接看图,下一轮 ``graph_builder._figure_block_tail``
+#: * ``"inline"``:主模型能直接看图,下一轮 ``graph_builder.figure_block.figure_block_message``
 #:   把它挂进提示词(Path A);
 #: * ``"ask_image"``:主模型看不了图,但 ``ask_image`` 已注册(Path B);
 #: * ``"none"``:两样都没有 —— 图渲出来了,模型看不到。
@@ -1307,5 +1323,8 @@ class ReadPageTool:
             content = f"{content} {per_unit}"
         return ToolResult(
             content=content,
-            state_updates={"viewed_figures": refs},
+            # 回修第 3 轮 —— 顺带记下 ``<doc-sha>`` → 模型传的路径。提示词里的渲染页段
+            # 靠它告诉模型「退役的页用哪个路径拿回来」;它在 state 里,压缩总结掉
+            # 历史里这条回执之后仍在。
+            state_updates={"viewed_figures": refs, "figure_documents": {doc_sha: raw}},
         )
