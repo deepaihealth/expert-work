@@ -2700,3 +2700,24 @@ async def test_read_page_records_the_path_for_each_rendered_document() -> None:
     assert result.state_updates["figure_documents"] == {
         document_sha("d.pptx", agent_key=ctx.agent_key): "d.pptx"
     }
+
+
+@pytest.mark.parametrize("spelling", ["./d.pptx", "d.pptx", ".//d.pptx", "./sub/../d.pptx"])
+def test_every_spelling_of_one_path_gives_one_doc_sha(spelling: str) -> None:
+    """终审 #4 —— ``./x`` 与 ``x`` 是同一个文件,必须是同一个 ``<doc-sha>``;
+    ``..`` 不折(那种写法由调用方拒掉,这里只确认它不被悄悄等同)。"""
+    same = document_sha(spelling, agent_key="") == document_sha("d.pptx", agent_key="")
+    assert same is (".." not in spelling)
+
+
+@pytest.mark.anyio
+async def test_read_page_renders_a_dot_slash_path_under_the_plain_doc_sha() -> None:
+    """``read_page("./d.pptx")`` 的产出目录要落在 ``d.pptx`` 的 ``<doc-sha>`` 下 ——
+    ask_image 的短形态与渲染页段都按那个值找。"""
+    ctx = _ctx()
+    runtime = _one_rendered_page_runtime(ctx)
+    await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "./d.pptx", "units": [3]}, ctx=ctx
+    )
+    out_rel = str(_snippet_params(runtime.execs[0][1])["out_rel"])
+    assert out_rel.endswith(f"/figures/{document_sha('d.pptx', agent_key=ctx.agent_key)}")

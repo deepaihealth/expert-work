@@ -985,7 +985,11 @@ def _doc_sha(ws: str, rel: str) -> str:
     第 6 条)—— 那个哈希只能在沙箱里算,``ReadPageTool`` 手里没有 workspace
     store,够不着这个文件。
     """
-    return hashlib.sha256(f"{ws}/{rel}".encode()).hexdigest()[:RENDERED_FIGURE_SHA_HEX_LEN]
+    # 终审 #4 —— 先把 ``.`` 段与重复斜杠折掉:``./x.pdf`` / ``x.pdf`` / ``a//x.pdf`` 是同一个
+    # 文件,必须是同一个 ``<doc-sha>``;不折的话 read_page 用一种写法、ask_image 用另一种,
+    # 模型会被告知一句假的「还没渲染」。``PurePosixPath`` 不折 ``..``,那由调用方拒掉。
+    canonical = PurePosixPath(rel).as_posix()
+    return hashlib.sha256(f"{ws}/{canonical}".encode()).hexdigest()[:RENDERED_FIGURE_SHA_HEX_LEN]
 
 
 def document_sha(path: str, *, agent_key: str) -> str | None:
