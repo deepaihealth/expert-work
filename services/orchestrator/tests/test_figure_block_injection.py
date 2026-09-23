@@ -214,6 +214,19 @@ _OTHER_USER = uuid4()
             ),
             id="own-scope-not-a-render",
         ),
+        # 同上,但尾巴刻意凑成 ``_u<n>/page-NN.jpg`` —— 只有形状判据挡得住它,
+        # 光拆最后几段是能拆出一个像样的页号的。
+        pytest.param(
+            workspace_figure_ref(
+                _TENANT,
+                _USER,
+                scoped_path(
+                    store_scope(EXEC_VIEW, agent_key=_AGENT_KEY),
+                    f"notes/a/b/{RENDERED_FIGURE_UNIT_PREFIX}3/{RENDERED_FIGURE_PAGE_STEM}-3.jpg",
+                ),
+            ),
+            id="own-scope-render-lookalike",
+        ),
         pytest.param(f"expert_work://image/{_TENANT}/{uuid4()}/{uuid4()}.png", id="upload-scheme"),
     ],
 )
@@ -299,7 +312,8 @@ def test_page_label_comes_from_the_file_name_not_the_unit() -> None:
 
 
 @pytest.mark.parametrize(
-    ("page", "label"), [("3", "第 3 页"), ("03", "第 3 页"), ("005", "第 5 页")]
+    ("page", "label"),
+    [("3", "第 3 页"), ("03", "第 3 页"), ("005", "第 5 页"), ("105", "第 105 页")],
 )
 def test_every_padding_width_is_read(page: str, label: str) -> None:
     """pdftoppm 按总页数补零:``page-3`` / ``page-03`` / ``page-005`` 都会出现。"""
@@ -462,10 +476,14 @@ async def test_a_figure_a_tool_wrote_reaches_the_next_prompt() -> None:
 
 
 async def test_a_foreign_ref_a_tool_wrote_never_reaches_the_model() -> None:
-    """接线点必须拿**本次 run 的** config 去比,不是拿 ref 自己的身份。"""
+    """接线点必须拿**本次 run 的** config 去比,不是拿 ref 自己的身份。
+
+    外来的那条排在前面:一个「拿列表里第一条 ref 的身份当基准」的接线在这个次序下
+    会放行它、拒掉自己的那条。
+    """
     own, foreign = _ref(3), _ref(4, tenant=_OTHER_TENANT)
     registry = ToolRegistry()
-    registry.register(_WritesFigures([own, foreign]))
+    registry.register(_WritesFigures([foreign, own]))
     llm = _RecordingLLM(responses=[_tool_turn("fake_read_page")])
     async with _graph(llm, registry=registry, supports_vision=True) as compiled:
         await _invoke(compiled)
