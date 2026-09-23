@@ -375,6 +375,13 @@ manifest 声明了 `vision:` 块时才挂(`agent_factory.py:835`)。它不普遍
 
 **不开新目录、不开新 TTL、不新增配额来源** —— 原则 4。
 
+> **修订(2026-09-24,按实现核对)**:实际落点是
+> `[agents/<key>/].tool_results/<run_id>/figures/<doc-sha>/<render-sha>/_u<unit>/page-NN.jpg`。
+> 与上面初稿的差别:① 在 agent 自己的作用域下(带 `agents/<key>/` 前缀),不是用户根;
+> ② `<doc-sha>` 只认路径,另加 `<render-sha>`(文档内容 + dpi 的哈希)—— 同一路径换了内容必须落到不同目录,
+> 否则会送出旧页;③ 每个 unit 一个私有子目录 `_u<unit>`,多页并发渲染互不覆盖。路径形状的单一真源在
+> `expert_work.persistence` 的 workspace layout(`is_rendered_figure_rel`)。
+
 ### 8.4 ref 形态
 
 新 scheme,**不动** `parse_image_ref`:
@@ -393,6 +400,12 @@ expert_work://workspace/<tenant>/<user>/.tool_results/<run_id>/figures/<doc-sha>
   (`services/orchestrator/src/orchestrator/multimodal.py:91`),
   新增一个 NAS 实现是**加实现不是改接口**。
 - `AskImageTool.invoke` 按 scheme 分派,租户校验不变(`image_ref.tenant_id != ctx.tenant_id` 那一条对两种 ref 都执行)。
+
+> **修订(2026-09-24,按实现核对)**:ref 形态随 §8.3 带 `agents/<key>/` 前缀与 `<render-sha>/_u<unit>/` 两层;
+> 解析器**接受** `agents/<key>/` 首段(初稿写「拒 `agents/`」是错的 —— 渲染页就落在 agent 作用域里),
+> `shared/` 仍拒。校验从初稿的 tenant 一项扩为 **tenant / user / agent_key 三项**,外加形状判据:
+> 同租户换一个 user UUID、或同用户换一个 agent,都不能读到别人的渲染页。Task 8 起模型不再需要抄 ref,
+> `ask_image(path, unit)` 在宿主侧找本 agent 作用域内最新渲染页后造出同一个 ref,再走同一套校验(§8.1 修订)。
 
 ### 8.5 Path A 的完整形态:新标记 + 滑窗 + 可见占位符
 
@@ -433,7 +446,14 @@ hermes(`[image]` / `[image: <url>]`)与 openclaw
 **删除是静默失效,替换不是** —— 模型看得见这里原来有张图,也看得见怎么拿回来。
 这一条直接服务于设计原则 1。
 
+> **修订(2026-09-24,按实现核对)**:占位不是每页一条,而是**按文档折叠成一行、路径只写一次**,例如
+> `文档 「<路径>」:编号 1-3、7 的图已退出上下文(需要重看就调用 read_page,path 填这个路径,units 填要看的编号)`;
+> 同一编号有旧版本(文档之后被改过)时同一行里一并说明。文档路径来自 `figure_documents` 状态通道,
+> 正向重算 doc-sha 对上才采信;路径没记下来的老会话写「一份文档(路径没记下来)」。
+
 #### 退役时机绑在缓存生命周期上
+
+> **修订(2026-09-24)**:这一节在我们这里结构上不适用 —— 图块永远挂在尾部、从不进可复用前缀(见本节开头的注),不存在「打掉活着的缓存前缀」的问题;退役只按滑窗走。下面原文保留作出处。
 
 openclaw 的 `mode: "cache-ttl"`(ttl 5 min):裁剪**只在 prompt 缓存已经过期
 之后**做,所以裁剪永远不会打掉一个还活着的缓存前缀。这条照抄。
