@@ -1078,8 +1078,7 @@ const zhCN: TranslationKeys = {
     reflection_evaluator_hint: "反思时用这个模型给回答打分；不选 = 用智能体自己的主模型评判。",
     reflection_evaluator_clear: "清除（改用智能体自己的模型）",
     section_vision: "图像理解（VL 模型）",
-    vision_hint:
-      "主模型不支持图像。\n配置一个视觉模型后，智能体即可读图（通过 ask_image 工具）；推理仍走主模型。",
+    vision_hint: "主模型不能看图，配置视觉模型后才能看图片和文档里的图。",
     vision_clear: "清除（不配置图像理解）",
     section_vision_help:
       "仅当主模型为纯文本模型时显示。\n配的视觉模型专门回答图片相关问题，主模型负责统筹。\n留空 = 智能体不能看图。\n示例：qwen-vl-max",

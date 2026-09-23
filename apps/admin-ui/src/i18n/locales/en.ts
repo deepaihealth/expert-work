@@ -4307,7 +4307,7 @@ const en: TranslationKeys = {
     reflection_evaluator_clear: "Clear (use the agent's own model)",
     section_vision: "Image understanding (VL model)",
     vision_hint:
-      "The main model can't read images.\nAdd a model that can, and the agent can read images (via the ask_image tool); reasoning still runs on the main model.",
+      "The main model can't see images. Configure a vision model to let it read images and figures in documents.",
     vision_clear: "Clear (no image understanding)",
     section_vision_help:
       "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nExample: qwen-vl-max",
