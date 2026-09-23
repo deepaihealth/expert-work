@@ -19,6 +19,7 @@ ref 一律按 ``read_page`` 真实产出的形状拼(常量取自 ``expert_work.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -53,12 +54,13 @@ from orchestrator.context import ContextCompressor
 from orchestrator.graph_builder.figure_block import FIGURE_KEEP_RECENT, figure_block_tail
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.state import _merge_viewed_figures
-from orchestrator.tools.read_page import document_sha, workspace_figure_ref
+from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
+from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
 
-from .test_read_page import _install_office_stubs, _real_out_rel, _run_render
+from .test_read_page import _install_office_stubs, _real_out_rel, _run_render, _snippet_params
 
 _TENANT = uuid4()
 _USER = uuid4()
@@ -729,3 +731,100 @@ async def test_the_reserve_does_not_trigger_empty_summary_updates() -> None:
     assert summariser.calls == [("fresh", False)]
     assert len(flushed) == 1
     assert len(_pixels(llm.seen_prompts[0])) == 3
+
+
+# ---------------------------------------------------------------------------
+# 回修第 4 轮 I-2 —— 接缝:真 read_page → tools 节点 → reducer → 检查点 → 下一轮块
+# ---------------------------------------------------------------------------
+
+
+class _EchoRenderRuntime(RecordingSandboxRuntime):
+    """沙箱替身:按宿主真喂给片段的 ``out_rel`` / ``units`` 回一份「渲染成功」。
+
+    不跑片段 —— 这条测试管的是 state 的接线,不是渲染。``out_rel`` 从片段参数里
+    取(``_snippet_params``),不自己拼,所以 ``<doc-sha>`` 就是 read_page 真算的那个。
+    """
+
+    async def exec(
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
+    ) -> SandboxOutcome:
+        await super().exec(
+            sandbox_id=sandbox_id,
+            code=code,
+            timeout_s=timeout_s,
+            agent_key=agent_key,
+            run_id=run_id,
+        )
+        params = _snippet_params(code)
+        rendered = [
+            {
+                "unit": u,
+                "rel": f"{params['out_rel']}/{'b' * 16}/{RENDERED_FIGURE_UNIT_PREFIX}{u}/"
+                f"{RENDERED_FIGURE_PAGE_STEM}-{u:02d}.jpg",
+                "bytes": 100,
+            }
+            for u in params["units"]
+        ]
+        return SandboxOutcome(
+            stdout=json.dumps({"ok": True, "rendered": rendered}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+
+
+def _read_page_call(path: str, units: list[int], call_id: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "read_page", "args": {"path": path, "units": units}, "id": call_id}],
+    )
+
+
+async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> None:
+    """两次 read_page(共 4 页)→ 第 3 次模型调用时第 1 页已退役,占位里必须是
+    read_page 自己记下的路径;同一会话的下一个 run 里也还在。
+
+    ``agent_node`` 若不把 ``state["figure_documents"]`` 交给建块函数,占位会退化成
+    「路径没记下来」—— 那句话与旧会话的合法兜底逐字相同,看输出分不出是 bug 还是
+    旧数据,所以这里要直接断言路径本身。
+    """
+    registry = ToolRegistry()
+    registry.register(ReadPageTool(client=_EchoRenderRuntime(), figure_delivery="inline"))
+    thread = str(uuid4())
+
+    def _config() -> RunnableConfig:
+        return {"configurable": {**_configurable(), "thread_id": thread, "run_id": str(uuid4())}}
+
+    async with make_checkpointer("memory") as cp:
+        llm = _RecordingLLM(
+            responses=[
+                _read_page_call("a.pptx", [1, 2], "c1"),
+                _read_page_call("a.pptx", [3, 4], "c2"),
+            ]
+        )
+        graph = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=registry, supports_vision=True)
+        )
+        await graph.ainvoke(
+            {"messages": [HumanMessage(content="看图")], "step_count": 0, "max_steps": 8},
+            config=_config(),
+        )
+        third = _block_text(llm.seen_prompts[2])
+        assert "编号 1 的图已退出上下文" in third
+        assert 'path 填 "a.pptx"' in third
+
+        llm2 = _RecordingLLM()
+        graph2 = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm2, tool_registry=registry, supports_vision=True)
+        )
+        await graph2.ainvoke(
+            {"messages": [HumanMessage(content="继续")], "step_count": 0, "max_steps": 4},
+            config=_config(),
+        )
+        assert 'path 填 "a.pptx"' in _block_text(llm2.seen_prompts[0])
