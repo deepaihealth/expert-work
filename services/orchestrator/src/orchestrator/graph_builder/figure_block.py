@@ -153,15 +153,29 @@ def _document_path(doc_sha: str, documents: Mapping[str, object], agent_key: str
     return path
 
 
+def _quote_path(path: str) -> str:
+    """把路径渲成一个带引号的字面量,放进提示词文字里。
+
+    ``json.dumps`` 挡住了引号与换行;回修第 4 轮 —— 再把 U+2028 / U+2029(行分隔符 /
+    段分隔符,``json.dumps(ensure_ascii=False)`` 原样放行)也转义掉:模型可能把它们
+    当换行读,而文件名来自用户上传、第三方附件或模型自建,不可信。
+    """
+    return (
+        json.dumps(path, ensure_ascii=False)
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def _placeholder_lines(
     slots: Sequence[tuple[_Figure, list[_Figure]]],
     live_from: int,
     documents: Mapping[str, object],
     agent_key: str,
 ) -> list[str]:
-    """退役与旧版本的可见文字 —— **按文档折叠**,每份文档至多两行。
+    """退役与旧版本的可见文字 —— **按文档折叠**,每份文档一行、路径只写一次。
 
-    有界于什么(回修第 3 轮):行数 ≤ 2 * 有退役或旧版本的**文档数**;每行里的编号
+    有界于什么(回修第 3 轮):行数 = 有退役或旧版本的**文档数**;每行里的编号
     压成区间,区间个数 ≤ 这份文档里被看过的**不同编号数**,也 ≤ ⌈这份文档编号总数 / 2⌉
     (两个相邻区间之间至少隔一个没看过的编号)。同一编号重看、改版多少次都只占一次。
     **文档数本身没有上界** —— 一条会话读过多少份不同的文档,这里就有多少份的行;
@@ -177,26 +191,21 @@ def _placeholder_lines(
     lines: list[str] = []
     for doc_sha in dict.fromkeys([*retired, *old_versions]):
         path = _document_path(doc_sha, documents, agent_key)
-        label = (
-            f"文档 {json.dumps(path, ensure_ascii=False)}"
-            if path is not None
-            else "一份文档(路径没记下来)"
-        )
-        if doc_sha in old_versions:
-            lines.append(
-                f"[{label}:编号 {_unit_ranges(old_versions[doc_sha])} 有旧版本"
-                "(文档之后被改过),旧版本不再展示,以新版本为准。]"
-            )
+        # 回修第 4 轮 —— 路径每份文档只写一次:两件事并进同一行。
+        label = f"文档 {_quote_path(path)}" if path is not None else "一份文档(路径没记下来)"
+        path_hint = "这个路径" if path is not None else "你当初调用 read_page 时传的那个路径"
+        parts: list[str] = []
         if doc_sha in retired:
-            path_hint = (
-                json.dumps(path, ensure_ascii=False)
-                if path is not None
-                else "你当初调用 read_page 时传的那个路径"
+            parts.append(
+                f"编号 {_unit_ranges(retired[doc_sha])} 的图已退出上下文"
+                f"(需要重看就调用 read_page,path 填{path_hint},units 填要看的编号)"
             )
-            lines.append(
-                f"[{label}:编号 {_unit_ranges(retired[doc_sha])} 的图已退出上下文。"
-                f"需要重看就调用 read_page,path 填 {path_hint},units 填要看的编号。]"
+        if doc_sha in old_versions:
+            parts.append(
+                f"编号 {_unit_ranges(old_versions[doc_sha])} 有旧版本(文档之后被改过),"
+                "旧版本不再展示,以新版本为准"
             )
+        lines.append(f"[{label}:" + ";".join(parts) + "。]")
     return lines
 
 
@@ -252,13 +261,17 @@ def figure_block_message(
     slots = _figure_slots(figures)
     live_from = max(len(slots) - FIGURE_KEEP_RECENT, 0)
     lines = _placeholder_lines(slots, live_from, documents, agent_key)
-    live = [current for current, _ in slots[live_from:]]
-    labels = []
-    for f in live:
-        path = _document_path(f.doc_sha, documents, agent_key)
-        where = f"{json.dumps(path, ensure_ascii=False)} " if path is not None else ""
-        labels.append(f"{where}第 {f.page} 页")
-    lines.append(f"下面依次附上 {len(live)} 张:" + "、".join(labels) + "。")
+    # 回修第 4 轮 —— 窗口里的几张按文档归到一起(文档之间按首次出现排,文档内保持
+    # 原次序),路径每份文档只写一次;图片块按同一次序挂,文字与图一一对应。
+    in_window = [current for current, _ in slots[live_from:]]
+    doc_order = list(dict.fromkeys(f.doc_sha for f in in_window))
+    live = sorted(in_window, key=lambda f: doc_order.index(f.doc_sha))
+    groups: list[str] = []
+    for doc_sha in doc_order:
+        path = _document_path(doc_sha, documents, agent_key)
+        pages = "、".join(f"第 {f.page} 页" for f in live if f.doc_sha == doc_sha)
+        groups.append(f"{_quote_path(path)} {pages}" if path is not None else pages)
+    lines.append(f"下面依次附上 {len(live)} 张:" + ";".join(groups) + "。")
     blocks: list[str | dict[Any, Any]] = [
         {"type": "text", "text": _FIGURE_BLOCK_HEADING + "\n".join(lines)}
     ]

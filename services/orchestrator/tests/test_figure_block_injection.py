@@ -536,7 +536,7 @@ def test_a_retired_page_says_which_path_to_pass_back() -> None:
     )
     text = _block_text(out)
     assert '文档 "uploads/a.pptx":编号 1-2 的图已退出上下文' in text
-    assert 'path 填 "uploads/a.pptx"' in text
+    assert "path 填这个路径" in text
     assert '"uploads/b.pdf" 第 1 页' in text
 
 
@@ -816,8 +816,7 @@ async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> N
             config=_config(),
         )
         third = _block_text(llm.seen_prompts[2])
-        assert "编号 1 的图已退出上下文" in third
-        assert 'path 填 "a.pptx"' in third
+        assert '文档 "a.pptx":编号 1 的图已退出上下文' in third
 
         llm2 = _RecordingLLM()
         graph2 = GraphRunner(checkpointer=cp).compile(
@@ -827,4 +826,33 @@ async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> N
             {"messages": [HumanMessage(content="继续")], "step_count": 0, "max_steps": 4},
             config=_config(),
         )
-        assert 'path 填 "a.pptx"' in _block_text(llm2.seen_prompts[0])
+        assert '文档 "a.pptx":编号 1 的图已退出上下文' in _block_text(llm2.seen_prompts[0])
+
+
+# ---------------------------------------------------------------------------
+# 回修第 4 轮 M-2 —— 路径每份文档只写一次;行分隔符转义
+# ---------------------------------------------------------------------------
+
+
+def test_each_path_is_written_once_and_pixels_follow_the_labels() -> None:
+    """窗口里 a、b、a 交错:按文档归到一起,路径各写一次;图片次序与文字次序一致。"""
+    a1, b1, a2 = _ref(1, doc="a.pptx"), _ref(1, doc="b.pdf"), _ref(2, doc="a.pptx")
+    out = _tail([], [a1, b1, a2], documents=_documents("a.pptx", "b.pdf"))
+    text = _block_text(out)
+    assert text.count('"a.pptx"') == 1
+    assert text.count('"b.pdf"') == 1
+    assert '"a.pptx" 第 1 页、第 2 页;"b.pdf" 第 1 页' in text
+    assert _pixels(out) == [a1, a2, b1]
+
+
+def test_a_line_separator_in_a_path_is_escaped() -> None:
+    """U+2028 / U+2029 在 ``json.dumps(ensure_ascii=False)`` 下原样放行,模型可能当换行读。"""
+    path = "uploads/报告\u2028第二行\u2029.pptx"
+    out = _tail(
+        [],
+        [_ref(p, doc=path) for p in range(1, 5)],
+        documents=_documents(path),
+    )
+    text = _block_text(out)
+    assert "\u2028" not in text and "\u2029" not in text
+    assert "报告\\u2028第二行\\u2029.pptx" in text
