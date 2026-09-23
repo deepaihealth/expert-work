@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -11,7 +12,13 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from expert_work.protocol.multimodal import ImageRef
-from orchestrator.multimodal import IMAGE_REF_BLOCK_TYPE, InMemoryImageResolver, ResolvedImage
+from orchestrator.multimodal import (
+    IMAGE_REF_BLOCK_TYPE,
+    DispatchingImageResolver,
+    InMemoryImageResolver,
+    NasWorkspaceImageResolver,
+    ResolvedImage,
+)
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.vision import AskImageTool
 
@@ -279,20 +286,22 @@ async def test_ask_image_rejects_an_agent_scoped_ref_from_an_unbound_run() -> No
 # ---------------------------------------------------------------------------
 
 
+def _page_rel(page: int = 3) -> str:
+    return f".tool_results/{uuid4()}/figures/{'a' * 16}/{'b' * 16}/_u{page}/page-{page:02d}.jpg"
+
+
 @pytest.mark.anyio
-async def test_ask_image_fails_explicitly_on_a_deleted_workspace_image() -> None:
-    """文件被留存清理删了:这一次工具调用显式失败,VL 一次都不被调用。
+async def test_ask_image_fails_explicitly_on_a_deleted_workspace_image(tmp_path: Path) -> None:
+    """文件被留存清理删了(真 ``ENOENT``):这一次工具调用显式失败,VL 一次都不被调用。
 
     不预检的话,VL 收到的是适配器的降级文字、回一句「看不到图」,主模型会把它当成
     看图的结果。
     """
     tenant, user = uuid4(), uuid4()
+    (tmp_path / str(tenant) / str(user)).mkdir(parents=True)
     vl = _FakeVLCaller()
-    tool = AskImageTool(vl_caller=vl, image_resolver=InMemoryImageResolver())
-    ref = (
-        f"expert_work://workspace/{tenant}/{user}/.tool_results/{uuid4()}/figures/"
-        f"{'a' * 16}/{'b' * 16}/_u3/page-03.jpg"
-    )
+    tool = AskImageTool(vl_caller=vl, image_resolver=NasWorkspaceImageResolver(root=tmp_path))
+    ref = f"expert_work://workspace/{tenant}/{user}/{_page_rel()}"
 
     with pytest.raises(FileNotFoundError) as info:
         await tool.call(
@@ -300,7 +309,55 @@ async def test_ask_image_fails_explicitly_on_a_deleted_workspace_image() -> None
         )
 
     assert "第 3 页" in str(info.value)
-    assert "read_page" in str(info.value)
+    assert "已不存在" in str(info.value)
+    assert "重新调用 read_page" in str(info.value)
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_calls_an_unreachable_image_unreadable_not_missing(tmp_path: Path) -> None:
+    """回修第 3 轮 —— 「够不着」不是「不存在」:符号链接越界是**安全拒绝**,重渲也读
+    不到。不许说「已被清理」、不许引导模型去重渲,也不许报成 FileNotFoundError(那会让
+    错误分类给出「目标不存在」的建议)。"""
+    tenant, user = uuid4(), uuid4()
+    rel = _page_rel()
+    leaf = tmp_path / str(tenant) / str(user) / rel
+    leaf.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"\xff\xd8\xff\xe0")
+    leaf.symlink_to(outside)
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=NasWorkspaceImageResolver(root=tmp_path))
+    ref = f"expert_work://workspace/{tenant}/{user}/{rel}"
+
+    with pytest.raises(RuntimeError) as info:
+        await tool.call(
+            {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=user)
+        )
+
+    assert not isinstance(info.value, FileNotFoundError)
+    assert "读不了" in str(info.value)
+    assert "已被清理" not in str(info.value)
+    assert "需要的话重新调用 read_page" not in str(info.value)
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_on_a_deployment_without_workspace_says_unreadable() -> None:
+    """部署没接 NAS:引导模型「重新 read_page」只会再失败、空转到步数上限。"""
+    tenant, user = uuid4(), uuid4()
+    vl = _FakeVLCaller()
+    resolver = DispatchingImageResolver(uploads=InMemoryImageResolver(), workspace=None)
+    tool = AskImageTool(vl_caller=vl, image_resolver=resolver)
+    ref = f"expert_work://workspace/{tenant}/{user}/{_page_rel()}"
+
+    with pytest.raises(RuntimeError) as info:
+        await tool.call(
+            {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=user)
+        )
+
+    assert "读不了" in str(info.value)
+    assert "已被清理" not in str(info.value)
     assert vl.calls == []
 
 

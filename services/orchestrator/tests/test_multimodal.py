@@ -672,3 +672,35 @@ async def test_a_cancelled_workspace_resolve_is_not_degraded() -> None:
     ref = f"expert_work://workspace/{uuid4()}/{uuid4()}/a.jpg"
     with pytest.raises(asyncio.CancelledError):
         await resolve_message_images([ref], _CancelledResolver())
+
+
+async def test_only_a_missing_file_is_called_cleaned_up(tmp_path: Path) -> None:
+    """B-64 Task 7 回修第 3 轮 —— 降级文字分清「不存在」与「够不着」。
+
+    缺文件(真 ``ENOENT``)→「已不存在,重新调用 read_page」;符号链接越界(安全拒绝)
+    →「读不了,重渲也读不到」。两条都走真 ``NasWorkspaceImageResolver``。
+    """
+    tenant, user = uuid4(), uuid4()
+    unit_dir = (
+        f"{WORKSPACE_OVERFLOW_DIR}/{uuid4()}/{RENDERED_FIGURE_DIR}/"
+        f"{'a' * RENDERED_FIGURE_SHA_HEX_LEN}/{'b' * RENDERED_FIGURE_SHA_HEX_LEN}/"
+        f"{RENDERED_FIGURE_UNIT_PREFIX}3"
+    )
+    missing_rel = f"{unit_dir}/{RENDERED_FIGURE_PAGE_STEM}-03.jpg"
+    escaping_rel = f"{unit_dir}/{RENDERED_FIGURE_PAGE_STEM}-04.jpg"
+    leaf = tmp_path / str(tenant) / str(user) / escaping_rel
+    leaf.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(_DATA)
+    leaf.symlink_to(outside)
+    base = f"expert_work://workspace/{tenant}/{user}/"
+
+    missing, escaping = await resolve_message_images(
+        [base + missing_rel, base + escaping_rel], NasWorkspaceImageResolver(root=tmp_path)
+    )
+
+    assert isinstance(missing, str)
+    assert "第 3 页" in missing and "已不存在" in missing and "重新调用 read_page" in missing
+    assert isinstance(escaping, str)
+    assert "第 4 页" in escaping and "读不了" in escaping
+    assert "已被清理" not in escaping and "需要的话重新调用 read_page" not in escaping

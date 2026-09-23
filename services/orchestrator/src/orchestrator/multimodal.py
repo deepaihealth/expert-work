@@ -530,15 +530,36 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
     )
 
 
-def unreadable_workspace_image_text(figure: RenderedFigureRef | None) -> str:
+def is_missing_file(error: BaseException) -> bool:
+    """这次读失败,是不是因为**文件不在了**(``ENOENT``)。
+
+    B-64 Task 7 回修第 3 轮 —— 分清「不存在」与「够不着」。``NasWorkspaceImageResolver``
+    把几乎所有 ``OSError`` 都包成 ``FileNotFoundError`` 抛(原始的 ``OSError`` 挂在
+    ``__cause__`` 上),安全拒绝(符号链接越界)与部署没接 NAS 则是 ``ValueError``。
+    所以不能看外层类型,要沿 ``__cause__`` 链找真正的 ``errno``:只有 ``ENOENT`` 才算
+    「不在了」,别的一律算「读不了」。
+    """
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, OSError) and current.errno == errno.ENOENT:
+            return True
+        current = current.__cause__
+    return False
+
+
+def unreadable_workspace_image_text(figure: RenderedFigureRef | None, error: BaseException) -> str:
     """工作区图读不出来时告诉模型的那句话 —— Path A 的降级文字与 ``ask_image`` 的
-    显式错误用的是同一句(``orchestrator.tools.vision``)。"""
-    if figure is not None:
-        return (
-            f"[图:第 {figure.page} 页的图文件已不存在或读不出来(可能已被清理),"
-            "需要的话重新调用 read_page]"
-        )
-    return "[图:这张工作区图片的文件已不存在或读不出来(可能已被清理)]"
+    显式错误用的是同一句(``orchestrator.tools.vision``)。
+
+    只有文件真不在了(:func:`is_missing_file`)才说「已被清理、重新调用 read_page」
+    —— 重渲会把文件重新写出来。其余原因(权限、安全拒绝、部署没接工作区……)重渲
+    也读不到,引导模型去重渲只会让它空转,所以明说「读不了、重试没用」。
+    """
+    where = f"第 {figure.page} 页的图文件" if figure is not None else "这张工作区图片的文件"
+    if is_missing_file(error):
+        tail = ",需要的话重新调用 read_page" if figure is not None else ""
+        return f"[图:{where}已不存在(可能已被清理){tail}]"
+    return f"[图:{where}读不了 —— 不是文件被清理,重新调用 read_page 也读不到;这张图现在看不到]"
 
 
 async def resolve_message_images(
@@ -580,7 +601,7 @@ async def resolve_message_images(
                 figure.page if figure is not None else "-",
                 type(exc).__name__,
             )
-            out.append(unreadable_workspace_image_text(figure))
+            out.append(unreadable_workspace_image_text(figure, exc))
     return out
 
 

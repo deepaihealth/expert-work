@@ -34,6 +34,7 @@ from expert_work.protocol.multimodal import (
 from orchestrator.multimodal import (
     ImageResolver,
     image_ref_block,
+    is_missing_file,
     parse_rendered_figure_ref,
     unreadable_workspace_image_text,
 )
@@ -177,9 +178,11 @@ class AskImageTool:
         那段文字会被交给 VL 模型,VL 回一句「看不到图」,主模型会把这句**当成看图的
         结果** —— 该有失败信号的地方没有信号。所以这里先解析一次,失败就抛,文字与
         Path A 的降级同一句(:func:`~orchestrator.multimodal.unreadable_workspace_image_text`),
-        VL 不被调用。抛 ``FileNotFoundError`` 是为了让 ``tools`` 节点把它包成
-        ``status="error"`` 的 ToolMessage、错误分类记成 ``resource_not_found``;
-        真实原因(权限、部署没接 NAS……)挂在 ``__cause__`` 上。
+        VL 不被调用。文件真不在了(``ENOENT``)抛 ``FileNotFoundError``,``tools`` 节点
+        把它包成 ``status="error"`` 的 ToolMessage、错误分类记成 ``resource_not_found``;
+        其余原因(权限、安全拒绝、部署没接 NAS……)抛 ``RuntimeError``,文字明说
+        「读不了、重渲也没用」—— 不许把「够不着」说成「不存在」。原始异常挂在
+        ``__cause__`` 上。
 
         **这不保证 VL 永远拿不到降级文字。** 这次解析成功之后、VL caller 里的适配器
         再解析之前,文件仍可能被删(留存清理、并发 run、同一沙箱里的 ``rm``);那个
@@ -192,7 +195,12 @@ class AskImageTool:
             await self.image_resolver.resolve(ref_str)
         except Exception as exc:
             figure = parse_rendered_figure_ref(ref_str)
-            raise FileNotFoundError(unreadable_workspace_image_text(figure)) from exc
+            message = unreadable_workspace_image_text(figure, exc)
+            # 类型决定 ``tools`` 节点给模型的错误分类与建议:只有文件真不在了才是
+            # ``FileNotFoundError``(→ resource_not_found);「读不了」不能说成「不存在」。
+            if is_missing_file(exc):
+                raise FileNotFoundError(message) from exc
+            raise RuntimeError(message) from exc
 
 
 def _require_string(args: Mapping[str, Any], key: str) -> str:
