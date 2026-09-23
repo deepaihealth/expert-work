@@ -38,7 +38,10 @@ from orchestrator.multimodal import (
     parse_rendered_figure_ref,
     unreadable_workspace_image_text,
 )
+from orchestrator.tools.figure_lookup import resolve_rendered_figure
+from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.workspace_store import WorkspaceStore
 
 if TYPE_CHECKING:
     # Imported under TYPE_CHECKING only — a runtime import of
@@ -68,9 +71,14 @@ class AskImageTool:
     #: B-64 —— 这是一个 ``DispatchingImageResolver``(生产环境),自己认得上传
     #: ref 与工作区 ref 两种 scheme;工具这一层不需要单独再接一根线。
     image_resolver: ImageResolver
+    #: B-64 Task 8 —— ``path`` + ``unit`` 短形态在宿主侧找渲染页要读工作区。
+    #: ``None`` 时短形态不存在:只收 ``image_ref``,描述里也不提短形态。
+    workspace_store: WorkspaceStore | None = None
 
     @property
     def spec(self) -> ToolSpec:
+        if self.workspace_store is not None:
+            return _spec_with_short_form()
         return ToolSpec(
             name="ask_image",
             description=(
@@ -105,7 +113,7 @@ class AskImageTool:
         if ctx.tenant_id is None:
             msg = "ask_image requires a tenant binding"
             raise ToolBlockedError(msg)
-        ref_str = _require_string(args, "image_ref")
+        ref_str, resolved_from = await self._image_ref_from_args(args, ctx=ctx)
         question = _require_string(args, "question")
         # B-64 —— 工作区 ref(平台渲出来的文档页)与上传 ref 走两套互相独立的
         # 校验器:parse_workspace_image_ref 是 parse_image_ref 的**兄弟**,不是
@@ -166,9 +174,64 @@ class AskImageTool:
         # audit): the image ref plus the VL call's token usage — otherwise the
         # separate VL round-trip's cost is invisible (the tool only returns text).
         meta: dict[str, Any] = {"image_ref": ref_str}
+        if resolved_from is not None:
+            meta["resolved_from"] = resolved_from
         if response.usage_metadata:
             meta["vl_usage"] = dict(response.usage_metadata)
         return ToolResult(content=answer, meta=meta)
+
+    async def _image_ref_from_args(
+        self, args: Mapping[str, Any], *, ctx: ToolContext
+    ) -> tuple[str, dict[str, Any] | None]:
+        """两种用法二选一,返回 ``(image_ref, resolved_from)``。
+
+        B-64 Task 8 —— ``path`` + ``unit`` 只负责**找到** ref;找到之后回到调用方,
+        走 ``image_ref`` 那条路的全部校验(tenant / user / agent_key 三项、
+        :meth:`_require_readable_workspace_image`),不为短形态另写一套。
+        ``resolved_from`` 只在短形态下非 ``None``,记进 meta 便于真栈比对。
+        """
+        has_ref = _given(args, "image_ref")
+        has_path = _given(args, "path")
+        has_unit = _given(args, "unit")
+        if self.workspace_store is None:
+            if has_path or has_unit:
+                msg = "ask_image here only accepts 'image_ref'; 'path' / 'unit' are not available"
+                raise ValueError(msg)
+            return _require_string(args, "image_ref"), None
+        if has_ref and (has_path or has_unit):
+            msg = (
+                "ask_image takes either 'image_ref' or 'path' + 'unit', not both — "
+                "for a document page you rendered with read_page, pass only 'path' + 'unit'"
+            )
+            raise ValueError(msg)
+        if has_ref:
+            return _require_string(args, "image_ref"), None
+        if not has_path and not has_unit:
+            msg = (
+                "ask_image needs either 'image_ref' (an uploaded image) or 'path' + 'unit' "
+                "(a document page you rendered with read_page)"
+            )
+            raise ValueError(msg)
+        if not (has_path and has_unit):
+            msg = (
+                "ask_image 'path' and 'unit' go together: 'path' is the document path you "
+                "gave read_page, 'unit' is the page number you rendered"
+            )
+            raise ValueError(msg)
+        unit = _require_unit(args)
+        path = _require_path(args, tool="ask_image", agent_key=ctx.agent_key)
+        if ctx.tenant_id is None or ctx.user_id is None:
+            msg = "ask_image 'path' + 'unit' requires a tenant and user binding"
+            raise ToolBlockedError(msg)
+        ref = await resolve_rendered_figure(
+            self.workspace_store,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            agent_key=ctx.agent_key,
+            path=path,
+            unit=unit,
+        )
+        return ref, {"path": path, "unit": unit}
 
     async def _require_readable_workspace_image(self, ref_str: str) -> None:
         """B-64 Task 7 回修第 2 轮 —— 工作区图读不出来就让**这一次工具调用**显式失败。
@@ -201,6 +264,74 @@ class AskImageTool:
             if is_missing_file(exc):
                 raise FileNotFoundError(message) from exc
             raise RuntimeError(message) from exc
+
+
+def _spec_with_short_form() -> ToolSpec:
+    """B-64 Task 8 —— 接了 ``workspace_store`` 时的描述:两种用法,文档页优先短形态。"""
+    return ToolSpec(
+        name="ask_image",
+        description=(
+            "Ask a vision model a specific question about an image. Point at the image "
+            "in exactly one of two ways: (1) a document page you rendered with read_page "
+            "— pass 'path' (the same document path you gave read_page) and 'unit' (the "
+            "page number you rendered; for .docx the figure number read_page used). "
+            "Prefer this for document pages: do not copy long references by hand. "
+            "(2) 'image_ref' — an ``expert_work://image/...`` reference attached to the "
+            "user message, for images the user uploaded. Ask narrow, specific questions; "
+            "call ask_image repeatedly with sharper follow-ups if the first answer is too "
+            "vague — the image stays accessible."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Document page form: the document path exactly as you passed it "
+                        "to read_page. Use together with 'unit'."
+                    ),
+                },
+                "unit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Document page form: one of the 'units' you passed to read_page "
+                        "(page/slide number; for .docx the figure number)."
+                    ),
+                },
+                "image_ref": {
+                    "type": "string",
+                    "description": (
+                        "Uploaded image form: a ``expert_work://image/...`` reference "
+                        "attached to the user message. Do not combine with 'path'/'unit'."
+                    ),
+                },
+                "question": {
+                    "type": "string",
+                    "description": "What to ask about the image — be specific.",
+                },
+            },
+            "required": ["question"],
+        },
+        # Stream L.L6 — VL LLM call against an immutable image reference. Pure read.
+        is_read_only=True,
+    )
+
+
+def _given(args: Mapping[str, Any], key: str) -> bool:
+    """参数算不算「给了」:缺席、``null``、空白字符串都算没给。"""
+    value = args.get(key)
+    if value is None:
+        return False
+    return not (isinstance(value, str) and not value.strip())
+
+
+def _require_unit(args: Mapping[str, Any]) -> int:
+    raw = args.get("unit")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        msg = "ask_image 'unit' must be a positive integer (a page number you rendered)"
+        raise ValueError(msg)
+    return raw
 
 
 def _require_string(args: Mapping[str, Any], key: str) -> str:

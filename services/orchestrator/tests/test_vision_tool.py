@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -19,8 +21,11 @@ from orchestrator.multimodal import (
     NasWorkspaceImageResolver,
     ResolvedImage,
 )
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+from orchestrator.tools.read_page import document_sha, workspace_figure_ref
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.vision import AskImageTool
+from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
 
 _TENANT = UUID("11111111-1111-1111-1111-111111111111")
 _THREAD = UUID("22222222-2222-2222-2222-222222222222")
@@ -373,3 +378,222 @@ async def test_ask_image_does_not_pre_resolve_an_upload_ref() -> None:
     assert result.content == "ok"
     assert resolver.resolved == []
     assert len(vl.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# B-64 Task 8 —— 短形态 path + unit:模型不再手抄约 200 字符的 ref
+# ---------------------------------------------------------------------------
+
+_AGENT = "pf-probe-33086dc0"
+_DOC = "uploads/report.pdf"
+_OLD_RUN = "ffffffff-ffff-4fff-bfff-ffffffffffff"
+_NEW_RUN = "00000000-0000-4000-8000-000000000000"
+
+
+def _figure_rel(
+    *, run: str = _NEW_RUN, render: str = "b" * 16, unit: int = 10, agent_key: str = _AGENT
+) -> str:
+    """一张 ``read_page`` 渲染页的**作用域相对**落点(形状与片段产出一致)。"""
+    doc_sha = document_sha(_DOC, agent_key=agent_key)
+    assert doc_sha is not None
+    return f".tool_results/{run}/figures/{doc_sha}/{render}/_u{unit}/page-{unit:02d}.jpg"
+
+
+def _put(root: Path, tenant: UUID, user: UUID, rel: str, *, mtime: float) -> None:
+    target = root / str(tenant) / str(user) / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"\xff\xd8\xff\xe0")
+    os.utime(target, (mtime, mtime))
+
+
+def _short_form_tool(root: Path, vl: _FakeVLCaller) -> AskImageTool:
+    return AskImageTool(
+        vl_caller=vl,
+        image_resolver=NasWorkspaceImageResolver(root=root),
+        workspace_store=NasWorkspaceStore(root=str(root)),
+    )
+
+
+def _sent_ref(vl: _FakeVLCaller) -> str:
+    content = vl.calls[0]["messages"][1].content
+    assert isinstance(content, list)
+    block = content[1]
+    assert block["type"] == IMAGE_REF_BLOCK_TYPE
+    ref = block["ref"]
+    assert isinstance(ref, str)
+    return ref
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_resolves_the_rendered_page(tmp_path: Path) -> None:
+    """path + unit → 本 agent 作用域里那张 ``_u10`` 渲染页;VL 收到的 ref 与
+    ``workspace_figure_ref`` 对它拼出来的逐字相同,meta 记下解析来源。"""
+    tenant, user = uuid4(), uuid4()
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{_DOC}", mtime=1_000)
+    rel = _figure_rel()
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{rel}", mtime=2_000)
+    vl = _FakeVLCaller(response=AIMessage(content="血糖曲线"))
+
+    result = await _short_form_tool(tmp_path, vl).call(
+        {"path": _DOC, "unit": 10, "question": "图里是什么"},
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+    )
+
+    expected = workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
+    assert _sent_ref(vl) == expected
+    assert result.content == "血糖曲线"
+    assert result.meta["image_ref"] == expected
+    assert result.meta["resolved_from"] == {"path": _DOC, "unit": 10}
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_works_on_the_in_memory_store() -> None:
+    """同一套走法在内存替身上答案一样 —— 它对不存在的目录回空列表,NAS 抛异常,
+    解析只往确认过的目录里走,所以两边同义。"""
+    tenant, user = uuid4(), uuid4()
+    rel = _figure_rel()
+    stamp = datetime(2026, 9, 23, tzinfo=UTC)
+    store = RecordingWorkspaceStore(
+        workspace_files=[
+            WorkspaceFileEntry(path=f"agents/{_AGENT}/{_DOC}", size=1, mtime=stamp),
+            WorkspaceFileEntry(path=f"agents/{_AGENT}/{rel}", size=1, mtime=stamp),
+        ]
+    )
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver(), workspace_store=store)
+
+    await tool.call(
+        {"path": _DOC, "unit": 10, "question": "?"},
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+    )
+
+    assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_picks_the_newest_render(tmp_path: Path) -> None:
+    """多次渲染取修改时间最新的那张 —— 目录名排序在前的那个 run 反而是旧的,
+    按名字挑就会挑错。"""
+    tenant, user = uuid4(), uuid4()
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{_DOC}", mtime=1_000)
+    old = _figure_rel(run=_NEW_RUN, render="1" * 16)
+    new = _figure_rel(run=_OLD_RUN, render="2" * 16)
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{old}", mtime=2_000)
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{new}", mtime=3_000)
+    vl = _FakeVLCaller()
+
+    await _short_form_tool(tmp_path, vl).call(
+        {"path": _DOC, "unit": 10, "question": "?"},
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+    )
+
+    assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{new}")
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_refuses_a_render_older_than_the_document(
+    tmp_path: Path,
+) -> None:
+    """新鲜度闸:渲完之后文档又改过 —— 最新那张渲染也是旧内容,显式失败,VL 不被调用。"""
+    tenant, user = uuid4(), uuid4()
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{_figure_rel()}", mtime=2_000)
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{_DOC}", mtime=3_000)
+    vl = _FakeVLCaller()
+
+    with pytest.raises(FileNotFoundError) as info:
+        await _short_form_tool(tmp_path, vl).call(
+            {"path": _DOC, "unit": 10, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        )
+
+    assert "改过" in str(info.value)
+    assert f"read_page(path={_DOC!r}, units=[10])" in str(info.value)
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_without_a_render_says_call_read_page(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{_DOC}", mtime=1_000)
+    # 同一份文档渲过别的页 —— 不能拿来顶第 10 页。
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{_figure_rel(unit=3)}", mtime=2_000)
+    vl = _FakeVLCaller()
+
+    with pytest.raises(FileNotFoundError) as info:
+        await _short_form_tool(tmp_path, vl).call(
+            {"path": _DOC, "unit": 10, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        )
+
+    assert "还没渲染" in str(info.value)
+    assert f"read_page(path={_DOC!r}, units=[10])" in str(info.value)
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_only_searches_the_run_own_scope(tmp_path: Path) -> None:
+    """短形态绕不过身份边界:``<doc-sha>`` 只由路径决定,别的 agent、没绑 agent 的用户
+    根、同 agent 的另一个 user 下都能有同一个 ``<doc-sha>`` 的渲染页 —— 一张都不许命中。"""
+    tenant, user, other_user = uuid4(), uuid4(), uuid4()
+    other_agent = "someone-else-11111111"
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{_DOC}", mtime=1_000)
+    _put(tmp_path, tenant, user, f"agents/{other_agent}/{_figure_rel()}", mtime=2_000)
+    _put(tmp_path, tenant, user, _figure_rel(), mtime=2_000)
+    _put(tmp_path, tenant, other_user, f"agents/{_AGENT}/{_DOC}", mtime=1_000)
+    _put(tmp_path, tenant, other_user, f"agents/{_AGENT}/{_figure_rel()}", mtime=2_000)
+    vl = _FakeVLCaller()
+
+    with pytest.raises(FileNotFoundError, match="还没渲染"):
+        await _short_form_tool(tmp_path, vl).call(
+            {"path": _DOC, "unit": 10, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        )
+
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("args", "needle"),
+    [
+        ({"image_ref": "expert_work://image/x", "path": _DOC, "unit": 10}, "not both"),
+        ({}, "needs either"),
+        ({"path": _DOC}, "go together"),
+        ({"unit": 10}, "go together"),
+    ],
+    ids=["both", "neither", "path-only", "unit-only"],
+)
+async def test_ask_image_rejects_a_bad_argument_combination(
+    tmp_path: Path, args: dict[str, Any], needle: str
+) -> None:
+    vl = _FakeVLCaller()
+    with pytest.raises(ValueError, match=needle):
+        await _short_form_tool(tmp_path, vl).call(
+            {**args, "question": "?"}, ctx=_ctx(user_id=uuid4(), agent_key=_AGENT)
+        )
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_without_a_workspace_store_has_no_short_form() -> None:
+    """没接工作区存储:短形态不存在 —— 调用被拒,描述与参数里也不许提它。"""
+    tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
+    spec = tool.spec
+    assert "path" not in spec.parameters["properties"]
+    assert "unit" not in spec.parameters["properties"]
+    assert "'path'" not in spec.description
+    assert "unit" not in spec.description
+
+    with pytest.raises(ValueError, match="only accepts 'image_ref'"):
+        await tool.call({"path": _DOC, "unit": 10, "question": "?"}, ctx=_ctx(user_id=uuid4()))
+
+
+def test_ask_image_with_a_workspace_store_offers_both_forms() -> None:
+    spec = AskImageTool(
+        vl_caller=_FakeVLCaller(),
+        image_resolver=_resolver(),
+        workspace_store=RecordingWorkspaceStore(),
+    ).spec
+    assert {"path", "unit", "image_ref", "question"} <= set(spec.parameters["properties"])
+    assert spec.parameters["required"] == ["question"]
+    assert "Prefer this for document pages" in spec.description

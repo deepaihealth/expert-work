@@ -459,7 +459,15 @@ def _register_ask_image(
             "manifest declares 'vision' but no VL llm_caller was built — "
             "this is an agent-factory bug, not a manifest defect"
         )
-    registry.register(AskImageTool(vl_caller=vl_caller, image_resolver=env.image_resolver))
+    # B-64 Task 8 —— 带上工作区存储,``ask_image`` 才有 ``path`` + ``unit`` 短形态;
+    # 没接时它只收 ``image_ref``,描述里也不提短形态。
+    registry.register(
+        AskImageTool(
+            vl_caller=vl_caller,
+            image_resolver=env.image_resolver,
+            workspace_store=env.workspace_store,
+        )
+    )
 
 
 def _register_subagents(

@@ -366,6 +366,21 @@ async def test_vision_block_activates_ask_image_tool() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ask_image_gets_the_workspace_store_for_its_short_form() -> None:
+    """B-64 Task 8 —— ``path`` + ``unit`` 短形态要读工作区;接线漏了,工具就只剩
+    ``image_ref``,而 ``read_page`` 的回执已经不再给 ref。"""
+    store = RecordingWorkspaceStore()
+    env = ToolEnv(image_resolver=InMemoryImageResolver(), workspace_store=store)
+    registry = await build_tool_registry(
+        [], tool_env=env, vision=_vision_spec(), vl_caller=_stub_vl_caller
+    )
+    tool = registry.get("ask_image")
+    assert isinstance(tool, AskImageTool)
+    assert tool.workspace_store is store
+    assert "path" in tool.spec.parameters["properties"]
+
+
+@pytest.mark.asyncio
 async def test_vision_block_without_image_resolver_raises() -> None:
     with pytest.raises(AgentFactoryError, match="image resolver"):
         await build_tool_registry(
