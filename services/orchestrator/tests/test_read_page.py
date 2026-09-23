@@ -1937,7 +1937,6 @@ async def test_rendered_pages_become_refs_in_state() -> None:
     assert len(refs) == 1
     assert refs[0].startswith("expert_work://workspace/")
     assert "page-03.jpg" in refs[0]
-    assert result.meta["pixel_budget_per_run"] > 0  # 回修 I7 —— 新键名
 
 
 @pytest.mark.anyio

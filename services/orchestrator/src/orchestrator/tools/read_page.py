@@ -207,13 +207,24 @@ from orchestrator.tools.workspace_scope import scoped_path, store_scope
 RENDER_DPI: Final = 100
 #: 一次调用最多渲几页 —— 硬限,超了直接拒,不进沙箱。
 MAX_PAGES_PER_CALL: Final = 3
-#: 单个 **run 累计**的像素预算上限(spec §7.2),不是单页(回修 I7 —— 原注释
-#: 写反了)。100 dpi 下单页大约 ≤1.15 MP(见上面提到的那条测试),
-#: 12,000,000 / 1,150,000 ≈ 10 页量级,与 spec §7.2 "≈12 页 @100 dpi" 同一个
-#: 数量级。记在成功结果的 ``meta``(键 ``pixel_budget_per_run``)里,Task 7 的
-#: 块渲染据此汇总累计预算;本任务只按页数硬限单次调用,真正的累计追踪不在
-#: 这里做。
-MAX_RENDER_PIXELS: Final = 12_000_000
+
+# **刻意没有「单 run 累计」的渲染上限。** spec 初稿 §7.2 写过一条
+# ``MAX_RENDER_PIXELS = 12M``(≈12 页),2026-09-23 删掉,理由记在这里,
+# 免得下一个人凭感觉再加回来:
+#
+# * 那个数是**猜的**(spec 原话「起手值是猜的」),没有任何数据支撑;
+# * 参考实现里**没有一家**做单 run 累计:openclaw 的 ``PDF_MAX_PIXELS = 4M``
+#   是**每次调用**的,hermes 按页数限、同样是每次调用。spec 说「抄 openclaw 的
+#   像素预算」,抄的是形状,却把作用范围从每次调用换成了每 run 累计;
+# * 已有的两道限都与参考实现对齐 —— 每次调用 ``MAX_PAGES_PER_CALL = 3``
+#   (100 dpi 下 ≈ 3 MP,与 openclaw 每次 4 MP 同一量级),进上下文的驻留
+#   滑窗 3 张(两家都是 3);
+# * 累计上限唯一护得住的是「一个 run 里沙箱渲染的总时长」,而那已经被 run 的
+#   deadline 与步数上限兜住;它的代价却是用户看得见的 —— 一份合法的长扫描件,
+#   模型翻到第 12 页就被拦下。
+#
+# 上线后按真实 run 数一下每个 run 实际渲多少页(spec §13.3 观察项),
+# **真有失控再按数据定**,而不是再猜一个数。
 
 _WORKSPACE_ROOT = EXEC_VIEW
 #: soffice 转 pdf 的子进程超时。文档偶尔较大,给足预算;真超时时片段吞异常降级成
@@ -1245,6 +1256,5 @@ class ReadPageTool:
             content = f"{content} {per_unit}"
         return ToolResult(
             content=content,
-            meta={"pixel_budget_per_run": MAX_RENDER_PIXELS},
             state_updates={"viewed_figures": refs},
         )
