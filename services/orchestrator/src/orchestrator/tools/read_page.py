@@ -858,9 +858,10 @@ class ReadPageTool:
                 "document's figure map (shown by read_document) told you about. "
                 f"Only {renderable} are renderable today; other formats are refused "
                 "with an explanation. "
-                "'units' are the 1-based entry numbers the figure map shows "
-                "(page/slide numbers for PDF and PPTX; for DOCX they identify "
-                "the figure, and the page is resolved for you); at most "
+                "'units' are the 1-based entry numbers that figure map prints next "
+                "to each figure — for some formats those are page/slide numbers, "
+                "for others the page is resolved for you, so pass the number the "
+                "map printed rather than a page you guessed. At most "
                 f"{MAX_PAGES_PER_CALL} per call — call it again for more. Paths "
                 "are relative to your own workspace root."
             ),

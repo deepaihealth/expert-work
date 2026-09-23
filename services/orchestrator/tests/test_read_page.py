@@ -145,14 +145,26 @@ def _pdftotext_pages(*pages: str) -> str:
     return "sys.stdout.write(" + repr(payload) + ")\n"
 
 
-def _pdfimages_rows(rows: list[tuple[int, int, int, int, int]]) -> str:
-    """pdfimages -list 桩 body。``rows`` 每项是 ``(页号, 宽px, 高px, x-ppi, y-ppi)``
-    —— 显示尺寸由 px/ppi 反推,装饰图与真图靠这两个数分开。"""
-    body = "".join(
+def _pdfimages_line(i: int, row: tuple[int, ...]) -> str:
+    """一行 ``pdfimages -list`` 输出。``row`` 是 ``(页号, 宽px, 高px, x-ppi, y-ppi)``,
+    可选第 6 项为 ``True`` 时模拟**内联图像**(``BI … ID … EI``):``[inline]`` 顶掉
+    ``object`` + ``ID`` 两列,整行因此只有 **15** 个 token 而不是 16
+    ——2026-09-23 对 poppler 21.11.0 的实测形状,逐列对齐。"""
+    page, w, h, x_ppi, y_ppi = row[:5]
+    if len(row) > 5 and row[5]:
+        return (
+            f"{page:6d} {i:5d} image {w:7d} {h:5d}  gray    1   8  image  no   [inline] "
+            f"{x_ppi:5d} {y_ppi:5d}    0B 0.0%"
+        )
+    return (
         f"{page:6d} {i:5d} image {w:7d} {h:5d}  gray    1   8  image  no        99  0 "
-        f"{x_ppi:5d} {y_ppi:5d}   64B 100%\n"
-        for i, (page, w, h, x_ppi, y_ppi) in enumerate(rows)
+        f"{x_ppi:5d} {y_ppi:5d}   64B 100%"
     )
+
+
+def _pdfimages_rows(rows: list[tuple[int, ...]]) -> str:
+    """pdfimages -list 桩 body —— 显示尺寸由 px/ppi 反推,装饰图与真图靠这两个数分开。"""
+    body = "".join(_pdfimages_line(i, row) + "\n" for i, row in enumerate(rows))
     return "sys.stdout.write(" + repr(_PDFIMAGES_HEADER + body) + ")\n"
 
 
@@ -954,31 +966,25 @@ def test_docx_bitmap_outside_the_neighbourhood_does_not_pin_the_page(
     assert item["note"] == "anchor_only_fallback"
 
 
-#: 一行**内联图像**(``BI ... ID ... EI``)的 ``pdfimages -list`` 输出,逐字取自
-#: 2026-09-23 对 poppler 21.11.0 的实测。关键在 ``[inline]`` 顶掉了 ``object ID``
-#: 那**两**列 —— 这一行只有 15 个 token,正常行有 16 个。
-_INLINE_IMAGE_LINE = (
-    "   2     0 image       8     8  gray    1   8  image  no   [inline]       3     4    0B 0.0%"
-)
-
-
 def test_docx_inline_image_rows_are_read_from_the_right_edge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """ppi 两列必须从**右**边数。
 
-    ``[inline]`` 把 ``object ID`` 两列压成一个 token,整行少一列;按左边的固定
-    下标取 x-ppi 会读到 y-ppi,尺寸算错就可能把一张真图误判成装饰图丢掉,页号
-    随之落回邻域页。这一行的 8px @ 3/4 ppi ≈ 192x144 pt,是一张真图,必须把页
-    钉在第 2 页而不是回落。
+    内联图像(``BI … ID … EI``)那一行里 ``[inline]`` 把 ``object`` + ``ID`` 两列
+    压成一个 token,整行 15 列而不是 16(2026-09-23 实测)。按左边的固定下标取
+    ppi 会读到 y-ppi 和 ``size``,后者 parse 不出数字 -> 尺寸判定放弃 -> 这一行
+    被当成"量不出来,留着"。
+
+    所以能分开对错的只有"正确解析会**丢掉**它"的场景:第 2 页那张内联 logo
+    显示只有 28.8 pt,滤掉之后页号才会落到第 3 页那张真图上;左数版本会把 logo
+    留下,页号停在第 2 页 —— 又一次渲出不含目标图的页。
     """
     _install_office_stubs(
         tmp_path,
         monkeypatch,
-        pdftotext_body=_pdftotext_pages(_ANCHOR_ONE, "Second page."),
-        pdfimages_body="sys.stdout.write("
-        + repr(_PDFIMAGES_HEADER + _INLINE_IMAGE_LINE + "\n")
-        + ")\n",
+        pdftotext_body=_pdftotext_pages("Cover page body text.", _ANCHOR_ONE, "Continued."),
+        pdfimages_body=_pdfimages_rows([(2, *_LOGO_ROW, True), (3, *_BIG_ROW)]),
     )
     _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
 
@@ -986,8 +992,8 @@ def test_docx_inline_image_rows_are_read_from_the_right_edge(
 
     assert env["ok"] is True
     item = env["rendered"][0]
-    assert item["page"] == 2
-    assert "note" not in item, "内联图像那一行被丢了,页号退回成了锚点页"
+    assert item["page"] == 3, "内联行的 ppi 读错了,logo 把页号钉在了锚点页"
+    assert "note" not in item
 
 
 def test_docx_rounding_margin_keeps_a_row_that_might_be_a_real_figure(
@@ -1211,6 +1217,14 @@ def test_spec_description_derives_renderable_formats_from_the_single_source() ->
     # 单一真源走。
     for ext in SUPPORTED_EXTENSIONS - RENDERABLE_EXTENSIONS:
         assert ext.upper() not in description
+
+    # Task 4b —— 只钉"被拒的格式不出现"咬不住 prose 里**第二次**点名一个
+    # **可渲染**的格式:那同样是一份手写名单,同样会漂。实测撞到:讲 units
+    # 含义的那句话曾经写成 "page/slide numbers for PDF and PPTX; for DOCX …",
+    # 上面两个循环一条都不红。每个格式在整段描述里最多出现一次,而那一次只可能
+    # 来自派生出来的那份清单。
+    for ext in SUPPORTED_EXTENSIONS:
+        assert description.count(ext.upper()) == (1 if ext in RENDERABLE_EXTENSIONS else 0), ext
 
 
 # ---------------------------------------------------------------------------
