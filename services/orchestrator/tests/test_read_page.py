@@ -2579,6 +2579,19 @@ async def test_shared_prefix_is_refused_not_silently_redirected() -> None:
     assert runtime.execs == []
 
 
+@pytest.mark.anyio
+async def test_shared_copy_hint_is_runnable_for_names_with_spaces_and_parens() -> None:
+    # 终审复审 Minor-1 —— 示例命令模型会照抄进 bash:带空格/括号的名字必须加引号,
+    # 目标落在工作区根(子目录未必存在)。
+    runtime = RecordingSandboxRuntime()
+    with pytest.raises(WriteToSharedError) as info:
+        await ReadPageTool(client=runtime, figure_delivery="inline").call(
+            {"path": "shared:docs/报告 (1).pdf", "units": [1]}, ctx=_ctx()
+        )
+    assert "cp '/workspace/shared/docs/报告 (1).pdf' '报告 (1).pdf'" in str(info.value)
+    assert runtime.execs == []
+
+
 # ---------------------------------------------------------------------------
 # B-64 Task 7 回修 —— 成功回执按实际投递路径说
 # ---------------------------------------------------------------------------

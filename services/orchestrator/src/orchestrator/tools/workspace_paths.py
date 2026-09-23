@@ -18,6 +18,7 @@ agent 在 NAS 上的目录(``agent_nas_root`` bind 成 ``EXEC_VIEW``);没绑时�
 
 from __future__ import annotations
 
+import shlex
 from pathlib import PurePosixPath
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
@@ -97,9 +98,13 @@ def resolve_scope(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:
         if tool == "read_page":
             # 终审 #5 —— read_page 被挡是因为它要往文档旁边落渲染产物,不是模型想写
             # 共享区;照抄写工具那句「去掉前缀」会把它指向另一个(多半不存在的)文件。
+            # 命令要能原样执行:上传文件名常带空格与括号(``报告 (1).pdf``),不加引号
+            # 在 bash 里是语法错误;目标取文件名本身,落在工作区根,不依赖子目录存在。
+            copy = PurePosixPath(rel).name
+            source = shlex.quote(f"{EXEC_VIEW}/{_SHARED_DIR}/{rel}")
             msg = (
                 f"read_page 不能直接渲染共享区里的文档 {rel!r} —— 先把它复制到你自己的工作区"
-                f"(比如 cp {EXEC_VIEW}/{_SHARED_DIR}/{rel} {rel}),再对副本调用 read_page。"
+                f"(比如 cp {source} {shlex.quote(copy)}),再对副本 {copy!r} 调用 read_page。"
             )
             raise WriteToSharedError(msg)
         if tool in _WRITE_TOOLS:
