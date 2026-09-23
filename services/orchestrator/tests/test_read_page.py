@@ -954,6 +954,66 @@ def test_docx_bitmap_outside_the_neighbourhood_does_not_pin_the_page(
     assert item["note"] == "anchor_only_fallback"
 
 
+#: 一行**内联图像**(``BI ... ID ... EI``)的 ``pdfimages -list`` 输出,逐字取自
+#: 2026-09-23 对 poppler 21.11.0 的实测。关键在 ``[inline]`` 顶掉了 ``object ID``
+#: 那**两**列 —— 这一行只有 15 个 token,正常行有 16 个。
+_INLINE_IMAGE_LINE = (
+    "   2     0 image       8     8  gray    1   8  image  no   [inline]       3     4    0B 0.0%"
+)
+
+
+def test_docx_inline_image_rows_are_read_from_the_right_edge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ppi 两列必须从**右**边数。
+
+    ``[inline]`` 把 ``object ID`` 两列压成一个 token,整行少一列;按左边的固定
+    下标取 x-ppi 会读到 y-ppi,尺寸算错就可能把一张真图误判成装饰图丢掉,页号
+    随之落回邻域页。这一行的 8px @ 3/4 ppi ≈ 192x144 pt,是一张真图,必须把页
+    钉在第 2 页而不是回落。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages(_ANCHOR_ONE, "Second page."),
+        pdfimages_body="sys.stdout.write("
+        + repr(_PDFIMAGES_HEADER + _INLINE_IMAGE_LINE + "\n")
+        + ")\n",
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    item = env["rendered"][0]
+    assert item["page"] == 2
+    assert "note" not in item, "内联图像那一行被丢了,页号退回成了锚点页"
+
+
+def test_docx_rounding_margin_keeps_a_row_that_might_be_a_real_figure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``-list`` 里的 ppi 是**取整**过的,反推尺寸只能给出一个区间。
+
+    2x2 px @ 4 ppi:按取整后的 ppi 直算是 36 pt(<40,判成装饰图丢掉),按可能
+    的最小 ppi(3.5)算是 41.1 pt(>=40,是真图)。误差必须一律偏向**保留** ——
+    把一张真图误判成装饰图会把它从候选里删掉,页号跟着落回锚点页,而那正是
+    这个功能要消灭的"渲了一张无关页还说得很确定"。
+    """
+    _install_office_stubs(
+        tmp_path,
+        monkeypatch,
+        pdftotext_body=_pdftotext_pages(_ANCHOR_ONE, "Second page."),
+        pdfimages_body=_pdfimages_rows([(2, 2, 2, 4, 4)]),
+    )
+    _write_docx(tmp_path / "d.docx", _para(_ANCHOR_ONE), _figure())
+
+    env = _run_render(tmp_path, "d.docx", units=[2], out_rel=".tool_results/r1/figures/s")
+
+    assert env["ok"] is True
+    assert "note" not in env["rendered"][0], "落在取整误差里的行被当成装饰图丢了"
+
+
 def test_docx_skipped_decorative_figures_do_not_shift_the_unit_numbers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

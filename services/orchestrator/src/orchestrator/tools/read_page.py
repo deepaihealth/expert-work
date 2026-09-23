@@ -310,8 +310,11 @@ def _pdf_page_texts(pdf):
     # 空列表会被下游当成"这份 PDF 一页都没有", 那是猜)。
     #
     # pdftotext 一次跑整篇, 页与页之间是换页符(0x0c); 最后一页后面**也有**
-    # 一个, 所以 split 出来的最后一个元素恒为 "" —— 只丢这**一个**。真正的
-    # 空白页本身也是 "", 多丢一个会让它之后所有页号整体偏移一页。
+    # 一个(2026-09-23 实测 poppler 21.11.0), 所以 split 出来的最后一个元素恒为
+    # ""。丢掉它是为了让这个列表"一项一页"这件事成立 —— 今天的 _resolve_docx_page
+    # 只按 enumerate 取页号、不看长度, 所以留着那个空串也不会让页号错位; 这一行
+    # 是给将来会看 len() 的人留的, 不是在修一个现存的 bug。**只丢这一个**: 真正
+    # 的空白页本身也是 "", 多丢一个才会让它之后所有页号整体偏移一页。
     try:
         result = subprocess.run(["pdftotext", pdf, "-"], capture_output=True,
                                 timeout=_P["convert_timeout_s"], check=False)
