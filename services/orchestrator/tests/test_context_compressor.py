@@ -314,10 +314,12 @@ async def test_compress_raises_after_max_passes_when_summary_too_large() -> None
         max_passes=2,
     )
     msgs = _conversation(head=1, middle=10, tail=1, char_per_msg=80)
-    with pytest.raises(ContextOverflowError) as exc_info:
+    with pytest.raises(ContextOverflowError):
         await compressor.compress(msgs)
-    assert exc_info.value.passes == 2
-    assert summariser.calls == 2
+    # B-64 Task 7 回修第 4 轮 —— 第 2 遍的中段只剩第 1 遍的摘要,没有新东西可总结,
+    # 按「中段已空」抛,不再用空的 NEW EVENTS 再调一次「更新」。原来这里断言的
+    # ``calls == 2`` / ``passes == 2`` 钉的正是那次空更新。
+    assert summariser.calls == 1
 
 
 @pytest.mark.asyncio

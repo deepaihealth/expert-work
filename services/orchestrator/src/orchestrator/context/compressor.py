@@ -602,8 +602,19 @@ class ContextCompressor:
         B-64 Task 7 回修第 3 轮 —— ``reserved``(见 :meth:`should_compress`)计入
         「压到阈值以下」的目标,但**不新增失败**:中段已空(``_compress_once`` 抛
         :class:`ContextOverflowError`)时,只要不算预留已经在阈值以下就照常返回;
-        次数用完那条判据本来就只看 ``current``。两条失败判据都维持引入预留之前的
-        口径。小窗口模型(8K 那一档)因此会每轮大幅压缩,但不会因为预留而失败。
+        次数用完那条判据本来就只看 ``current``。
+
+        回修第 4 轮 —— 「中段已空」也包括「中段只剩上一轮的摘要」(见
+        :meth:`_compress_once`)。所以当「头 + 摘要 + 尾」不算预留已在阈值下、加上
+        预留仍超时,真实的样子是:**每一步**做一次全新总结(一次 ``on_pre_compaction``),
+        第二遍就以「中段已空」返回,不再白跑空的更新。压缩结果不落检查点,下一步
+        从完整历史重来,所以小窗口模型(8K 那一档)是**每步一次**总结调用;返回的
+        提示词加上图块仍可能超过阈值,由厂商在真实窗口上裁决。
+
+        不带预留时,「中段只剩摘要」这时仍在阈值上 → 抛 :class:`ContextOverflowError`,
+        与原来「空更新两遍 → 次数用完 → 抛」结果相同,只是少了两次白费的调用 ——
+        唯一的差别:原来的空更新可能把摘要本身改写得更短、侥幸压到阈值下,现在不再
+        碰这个运气。
         """
         reserve = self._estimate(reserved) if reserved else 0
         current: list[BaseMessage] = list(messages)
@@ -728,15 +739,26 @@ class ContextCompressor:
                 threshold=self.threshold_tokens,
                 passes=0,
             )
+        # Stream CM-7 (Mini-ADR CM-H2) — when the middle carries an
+        # earlier compression's summary, UPDATE it with the new events
+        # instead of re-summarising its own output (lossy chain).
+        prior, fresh_middle = _extract_prior_summary(split.middle)
+        if prior is not None and not fresh_middle:
+            # B-64 Task 7 回修第 4 轮 —— 中段只剩上一轮的摘要 = 没有新东西可总结,
+            # 按「中段已空」处理。不这样的话,这一遍会用空的 NEW EVENTS 调一次
+            # 「更新」(白花一次主模型调用、反复重写摘要会漂移),还会把那份摘要再
+            # 交给 ``on_pre_compaction`` 冲进长期记忆一次。带预留时最容易撞上:
+            # 头 + 摘要 + 尾不算预留已经够小、加上预留仍超,剩下的每一遍都是空更新。
+            raise ContextOverflowError(
+                estimated_tokens=self._estimate(messages),
+                threshold=self.threshold_tokens,
+                passes=0,
+            )
         # Stream CM-3 — flush the middle to durable memory BEFORE it is
         # summarised away (and before the summariser LLM call, so the
         # salient points survive even if summarisation then fails).
         if on_pre_compaction is not None:
             await on_pre_compaction(split.middle)
-        # Stream CM-7 (Mini-ADR CM-H2) — when the middle carries an
-        # earlier compression's summary, UPDATE it with the new events
-        # instead of re-summarising its own output (lossy chain).
-        prior, fresh_middle = _extract_prior_summary(split.middle)
         if prior is not None:
             # RT-ADR-10 — update mode splits the input budget evenly:
             # PREVIOUS SUMMARY and NEW EVENTS each get half, so neither

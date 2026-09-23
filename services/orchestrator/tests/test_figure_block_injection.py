@@ -666,3 +666,66 @@ async def test_a_small_window_with_nothing_left_to_summarise_does_not_fail() -> 
     )
     assert summariser.calls == 0
     assert len(_pixels(llm.seen_prompts[0])) == 3
+
+
+# ---------------------------------------------------------------------------
+# 回修第 4 轮 I-1 —— 预留不许让压缩器白跑空的总结更新
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ModeRecordingSummariser:
+    """记下每次总结调用是「全新总结」还是「更新」,以及更新时 NEW EVENTS 是否为空。"""
+
+    calls: list[tuple[str, bool]] = field(default_factory=list)
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del tools
+        body = str(messages[-1].content)
+        update = body.startswith("PREVIOUS SUMMARY")
+        self.calls.append(
+            ("update" if update else "fresh", update and body.rstrip().endswith("NEW EVENTS:"))
+        )
+        return AIMessage(content="- 摘要")
+
+
+async def test_the_reserve_does_not_trigger_empty_summary_updates() -> None:
+    """8K 窗口:压完一遍后「头 + 摘要 + 尾」不算预留在阈值下、加上预留仍超。
+
+    修前:第 2、3 遍中段只剩上一轮摘要,照样调一次「更新」而 NEW EVENTS 是空的,
+    每一遍还把中段(就是那份摘要)交给 ``on_pre_compaction`` 冲进长期记忆 ——
+    一步 3 次总结、3 次冲记忆,而压缩结果不落检查点,下一步从完整历史再来一遍。
+    修后:一步 1 次总结、1 次冲记忆。
+    """
+    summariser = _ModeRecordingSummariser()
+    flushed: list[list[BaseMessage]] = []
+
+    async def _flush(middle: Sequence[BaseMessage], config: RunnableConfig, token: Any) -> int:
+        del config, token
+        flushed.append(list(middle))
+        return 0
+
+    compressor = ContextCompressor(
+        llm_caller=summariser, context_window=8_000, estimator=CharTokenEstimator()
+    )
+    llm = _RecordingLLM()
+    async with _graph(
+        llm, context_compressor=compressor, supports_vision=True, pre_compaction_flush=_flush
+    ) as compiled:
+        config: RunnableConfig = {"configurable": _configurable()}
+        await compiled.ainvoke(
+            {
+                # 20 条、每条约 400 token:远超 5.6k 阈值;压完后头 4 + 尾 6 ≈ 4k,
+                # 不算预留在阈值下,加上三张图的预留就超。
+                "messages": _history(8_000, 20),
+                "step_count": 0,
+                "max_steps": 5,
+                "viewed_figures": [_ref(p) for p in (1, 2, 3)],
+            },
+            config=config,
+        )
+    assert summariser.calls == [("fresh", False)]
+    assert len(flushed) == 1
+    assert len(_pixels(llm.seen_prompts[0])) == 3
