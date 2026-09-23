@@ -143,7 +143,11 @@ from orchestrator.graph_builder._config import (
     current_run_id,
     token_sink_from_config,
 )
-from orchestrator.graph_builder.figure_block import figure_block_message, with_figure_block
+from orchestrator.graph_builder.figure_block import (
+    figure_block_message,
+    figure_freshness,
+    with_figure_block,
+)
 from orchestrator.graph_builder.input_url_guard import (
     GuardHit,
     UrlCandidate,
@@ -829,14 +833,34 @@ def build_react_graph(
         # 一段占位文字。把它作为 ``reserved`` 交给压缩器 —— 只计入估算、不进被总结的
         # 那段(压缩器去总结或丢掉它都是错的)。身份与工作区快照同一个来源:本次 run 的
         # config。每轮重建、不落检查点。
-        figure_agent_key = configurable.get("agent_key")
+        figure_agent_key_raw = configurable.get("agent_key")
+        figure_agent_key = figure_agent_key_raw if isinstance(figure_agent_key_raw, str) else ""
+        figure_viewed = state.get("viewed_figures") or []
+        figure_documents = state.get("figure_documents") or {}
+        figure_tenant = _parse_uuid(configurable.get("tenant_id"))
+        figure_user = _parse_uuid(configurable.get("user_id"))
+        # 终审 #1 —— 窗口里的页先核对新鲜度(文档在渲染之后被改过/替换了就不附图)。
+        # 没接工作区存储就核对不了,``None`` 保持原行为(见 figure_block_message)。
+        figure_fresh = (
+            await figure_freshness(
+                workspace_store,
+                viewed=figure_viewed,
+                documents=figure_documents,
+                tenant_id=figure_tenant,
+                user_id=figure_user,
+                agent_key=figure_agent_key,
+            )
+            if supports_vision and figure_viewed and workspace_store is not None
+            else None
+        )
         figure_block = figure_block_message(
-            viewed=state.get("viewed_figures") or [],
-            documents=state.get("figure_documents") or {},
+            viewed=figure_viewed,
+            documents=figure_documents,
             supports_vision=supports_vision,
-            tenant_id=_parse_uuid(configurable.get("tenant_id")),
-            user_id=_parse_uuid(configurable.get("user_id")),
-            agent_key=figure_agent_key if isinstance(figure_agent_key, str) else "",
+            tenant_id=figure_tenant,
+            user_id=figure_user,
+            agent_key=figure_agent_key,
+            freshness=figure_fresh,
         )
         reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
         demoted_tools: list[str] = []

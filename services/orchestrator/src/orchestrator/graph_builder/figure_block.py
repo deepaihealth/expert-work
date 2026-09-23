@@ -28,7 +28,9 @@ from langchain_core.messages import BaseMessage, HumanMessage
 
 from expert_work.common.conversation_channel import FIGURE_BLOCK_MARK, HIDE_FROM_UI
 from orchestrator.multimodal import image_ref_block, parse_rendered_figure_ref
+from orchestrator.tools.figure_lookup import FigureFreshness, rendered_page_freshness
 from orchestrator.tools.read_page import document_sha
+from orchestrator.tools.workspace_store import WorkspaceStore
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,8 @@ class _Figure:
     #: 真实 PDF 页号,取自文件名 ``page-NN.jpg``。**不从** ``_u<n>`` 取:
     #: 对 docx 那是图的编号,不是页号。
     page: int
+    #: 这张渲染页的**用户根相对**路径(``agents/<key>/`` 前缀在内)—— 核对新鲜度时要 stat 它。
+    rel: str
 
     @property
     def slot(self) -> tuple[str, int]:
@@ -103,6 +107,7 @@ def _own_figure(
         unit=figure.unit,
         render_sha=figure.render_sha,
         page=figure.page,
+        rel=parsed.rel,
     )
 
 
@@ -209,6 +214,97 @@ def _placeholder_lines(
     return lines
 
 
+def _bracket_path(path: str) -> str:
+    """「路径」—— 与 ``read_page`` 回执同一种括法;行分隔符照 :func:`_quote_path` 转义。"""
+    return "「" + path.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029") + "」"
+
+
+#: 窗口里某一页**这一轮不附图**的原因 → 给模型看的那半句(``{unit}`` 是编号区间)。
+_WITHHELD_REASONS: dict[FigureFreshness, str] = {
+    "stale": "在你看过之后被改过或替换了,编号 {units} 的渲染页已过期",
+    "missing": "已不在工作区里,编号 {units} 的渲染页核对不了是不是它现在的内容",
+    "unknown": "核对不了在渲染之后有没有被改过,编号 {units} 的渲染页",
+}
+
+
+def _withheld_lines(
+    withheld: Sequence[tuple[_Figure, FigureFreshness]],
+    documents: Mapping[str, object],
+    agent_key: str,
+) -> list[str]:
+    """终审 #1 —— 窗口里没附图的页,按 (文档, 原因) 折成一行,写明路径与编号怎么拿回来。"""
+    grouped: dict[tuple[str, FigureFreshness], list[int]] = {}
+    for figure, freshness in withheld:
+        grouped.setdefault((figure.doc_sha, freshness), []).append(figure.unit)
+    lines: list[str] = []
+    for (doc_sha, freshness), units in grouped.items():
+        path = _document_path(doc_sha, documents, agent_key)
+        label = f"文档{_bracket_path(path)}" if path is not None else "一份文档(路径没记下来)"
+        path_hint = (
+            _bracket_path(path) if path is not None else "你当初调用 read_page 时传的那个路径"
+        )
+        reason = _WITHHELD_REASONS.get(freshness, _WITHHELD_REASONS["unknown"])
+        ranges = _unit_ranges(units)
+        lines.append(
+            f"[{label}{reason.format(units=ranges)},这一轮不附图 —— 需要的话重新调用 read_page,"
+            f"path 填{path_hint},units 填 {ranges}。]"
+        )
+    return lines
+
+
+def _window(
+    viewed: Sequence[object], *, tenant_id: UUID | None, user_id: UUID | None, agent_key: str
+) -> tuple[list[tuple[_Figure, list[_Figure]]], int]:
+    """通过三项比对的 ref 按槽归并,外加窗口起点 —— 建块与核对新鲜度看的是同一个窗口。"""
+    figures: list[_Figure] = []
+    for ref in viewed:
+        fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+        if fig is not None:
+            figures.append(fig)
+    if len(figures) != len(viewed):
+        logger.warning(
+            "figure_block.refs_rejected rejected=%d total=%d",
+            len(viewed) - len(figures),
+            len(viewed),
+        )
+    slots = _figure_slots(figures)
+    return slots, max(len(slots) - FIGURE_KEEP_RECENT, 0)
+
+
+async def figure_freshness(
+    store: WorkspaceStore,
+    *,
+    viewed: Sequence[object],
+    documents: Mapping[str, object],
+    tenant_id: UUID | None,
+    user_id: UUID | None,
+    agent_key: str,
+) -> dict[str, FigureFreshness]:
+    """终审 #1 —— 窗口里每一张(至多 :data:`FIGURE_KEEP_RECENT` 张)的新鲜度,按 ref 索引。
+
+    判据是 ``figure_lookup`` 那一条(:func:`~orchestrator.tools.figure_lookup.render_is_stale`),
+    不在这里写第二份。路径没记下来(旧会话)时核对不了 → ``"unknown"``。
+    """
+    if tenant_id is None or user_id is None:
+        return {}
+    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    result: dict[str, FigureFreshness] = {}
+    for current, _older in slots[live_from:]:
+        path = _document_path(current.doc_sha, documents, agent_key)
+        if path is None:
+            result[current.ref] = "unknown"
+            continue
+        result[current.ref] = await rendered_page_freshness(
+            store,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_key=agent_key,
+            path=path,
+            render_rel=current.rel,
+        )
+    return result
+
+
 def is_figure_block(msg: BaseMessage) -> bool:
     """这条消息是不是平台注入的渲染页段。"""
     return isinstance(msg, HumanMessage) and bool(
@@ -224,8 +320,15 @@ def figure_block_message(
     tenant_id: UUID | None,
     user_id: UUID | None,
     agent_key: str,
+    freshness: Mapping[str, FigureFreshness] | None = None,
 ) -> HumanMessage | None:
     """造这一轮的渲染页段;没有可挂的就 ``None``。
+
+    **新鲜度(终审 #1)。** ``freshness`` 是 :func:`figure_freshness` 对窗口里每张的
+    核对结果。给了它,窗口里不是 ``"fresh"`` 的页**一律不附图**,换成可见文字(文档
+    被改过 / 不在了 / 核对不了 + 怎么拿回来)—— 同名上传覆盖了原文档时,不能拿旧文档
+    的页顶着当前路径的名字给模型看。``None`` = 调用方没有工作区存储、没法核对(单测;
+    没接 NAS 的部署,那里工作区 ref 本来就解析不了),行为与之前相同。
 
     **退役是替换不是删除。** 超窗的页换成可见文字,模型看得见这里原来有图、也看得见
     怎么拿回来(路径 + 编号再调 ``read_page``:同一 run 里重读拿到逐字相同的 ref,
@@ -245,25 +348,18 @@ def figure_block_message(
     """
     if not supports_vision or not viewed:
         return None
-    figures: list[_Figure] = []
-    for ref in viewed:
-        fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
-        if fig is not None:
-            figures.append(fig)
-    if len(figures) != len(viewed):
-        logger.warning(
-            "figure_block.refs_rejected rejected=%d total=%d",
-            len(viewed) - len(figures),
-            len(viewed),
-        )
-    if not figures:
+    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    if not slots:
         return None
-    slots = _figure_slots(figures)
-    live_from = max(len(slots) - FIGURE_KEEP_RECENT, 0)
     lines = _placeholder_lines(slots, live_from, documents, agent_key)
     # 回修第 4 轮 —— 窗口里的几张按文档归到一起(文档之间按首次出现排,文档内保持
     # 原次序),路径每份文档只写一次;图片块按同一次序挂,文字与图一一对应。
     in_window = [current for current, _ in slots[live_from:]]
+    if freshness is not None:
+        withheld = [(f, freshness.get(f.ref, "unknown")) for f in in_window]
+        withheld = [(f, state) for f, state in withheld if state != "fresh"]
+        lines.extend(_withheld_lines(withheld, documents, agent_key))
+        in_window = [f for f in in_window if freshness.get(f.ref) == "fresh"]
     doc_order = list(dict.fromkeys(f.doc_sha for f in in_window))
     live = sorted(in_window, key=lambda f: doc_order.index(f.doc_sha))
     groups: list[str] = []
@@ -271,7 +367,8 @@ def figure_block_message(
         path = _document_path(doc_sha, documents, agent_key)
         pages = "、".join(f"第 {f.page} 页" for f in live if f.doc_sha == doc_sha)
         groups.append(f"{_quote_path(path)} {pages}" if path is not None else pages)
-    lines.append(f"下面依次附上 {len(live)} 张:" + ";".join(groups) + "。")
+    if live:
+        lines.append(f"下面依次附上 {len(live)} 张:" + ";".join(groups) + "。")
     blocks: list[str | dict[Any, Any]] = [
         {"type": "text", "text": _FIGURE_BLOCK_HEADING + "\n".join(lines)}
     ]
@@ -305,6 +402,7 @@ def figure_block_tail(
     tenant_id: UUID | None,
     user_id: UUID | None,
     agent_key: str,
+    freshness: Mapping[str, FigureFreshness] | None = None,
 ) -> list[BaseMessage]:
     """:func:`figure_block_message` + :func:`with_figure_block` 一步做完(测试用这个入口)。"""
     block = figure_block_message(
@@ -314,5 +412,6 @@ def figure_block_tail(
         tenant_id=tenant_id,
         user_id=user_id,
         agent_key=agent_key,
+        freshness=freshness,
     )
     return with_figure_block(messages, block)

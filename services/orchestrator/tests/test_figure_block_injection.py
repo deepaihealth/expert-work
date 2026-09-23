@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -51,14 +52,21 @@ from orchestrator import (
     build_react_graph,
 )
 from orchestrator.context import ContextCompressor
-from orchestrator.graph_builder.figure_block import FIGURE_KEEP_RECENT, figure_block_tail
+from orchestrator.graph_builder.figure_block import (
+    FIGURE_KEEP_RECENT,
+    figure_block_tail,
+    figure_freshness,
+)
 from orchestrator.llm.providers._streaming import LLMDelta
+from orchestrator.multimodal import parse_rendered_figure_ref
 from orchestrator.state import _merge_viewed_figures
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
+from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 
 from .test_read_page import _install_office_stubs, _real_out_rel, _run_render, _snippet_params
 
@@ -856,3 +864,89 @@ def test_a_line_separator_in_a_path_is_escaped() -> None:
     text = _block_text(out)
     assert "\u2028" not in text and "\u2029" not in text
     assert "报告\\u2028第二行\\u2029.pptx" in text
+
+
+# ---------------------------------------------------------------------------
+# 终审 #1 —— 文档在渲染之后被改过/替换了:这一页不附图,换成可见文字
+# ---------------------------------------------------------------------------
+
+
+def _put_file(root: Path, rel: str, *, mtime: float, data: bytes = b"x") -> None:
+    target = root / str(_TENANT) / str(_USER) / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    os.utime(target, (mtime, mtime))
+
+
+def _render_rel(ref: str) -> str:
+    figure = parse_rendered_figure_ref(ref)
+    assert figure is not None
+    return figure.workspace.rel
+
+
+async def _prompt_with_store(root: Path, ref: str) -> list[BaseMessage]:
+    """真 ``agent_node`` + 真 NAS store:把 ``ref`` 放进 state,取第一次模型调用的提示词。"""
+    llm = _RecordingLLM()
+    async with _graph(
+        llm, supports_vision=True, workspace_store=NasWorkspaceStore(root=str(root))
+    ) as compiled:
+        await _invoke(compiled, viewed_figures=[ref], figure_documents=_documents("d.pptx"))
+    return llm.seen_prompts[0]
+
+
+async def test_a_page_whose_document_was_replaced_is_not_shown(tmp_path: Path) -> None:
+    """同名上传覆盖了原文档之后,不能拿旧文档的页顶着当前路径的名字给模型看。"""
+    ref = _ref(3)
+    doc = f"agents/{_AGENT_KEY}/d.pptx"
+    _put_file(tmp_path, doc, mtime=1_000, data=b"customer A")
+    _put_file(tmp_path, _render_rel(ref), mtime=2_000)
+
+    fresh = await _prompt_with_store(tmp_path, ref)
+    assert _pixels(fresh) == [ref], "新鲜的页都没挂上,下面的断言什么也没验"
+
+    _put_file(tmp_path, doc, mtime=3_000, data=b"customer B")
+    stale = await _prompt_with_store(tmp_path, ref)
+
+    assert _pixels(stale) == []
+    text = _block_text(stale)
+    assert "文档「d.pptx」在你看过之后被改过或替换了,编号 3 的渲染页已过期" in text
+    assert "重新调用 read_page,path 填「d.pptx」,units 填 3" in text
+    assert "下面依次附上" not in text
+
+
+@pytest.mark.parametrize(
+    ("state", "phrase"),
+    [
+        ("missing", "已不在工作区里"),
+        ("unknown", "核对不了在渲染之后有没有被改过"),
+    ],
+)
+def test_a_page_that_cannot_be_verified_is_withheld_visibly(state: str, phrase: str) -> None:
+    ref = _ref(3)
+    messages = figure_block_tail(
+        [],
+        viewed=[ref],
+        documents=_documents("d.pptx"),
+        supports_vision=True,
+        tenant_id=_TENANT,
+        user_id=_USER,
+        agent_key=_AGENT_KEY,
+        freshness={ref: state},  # type: ignore[dict-item]
+    )
+    assert _pixels(messages) == []
+    assert phrase in _block_text(messages)
+
+
+async def test_a_failing_freshness_check_withholds_the_page_and_does_not_raise() -> None:
+    """列目录失败:这一轮不许挂掉,也不许悄悄当成「新鲜」照挂。"""
+    ref = _ref(3)
+    store = RecordingWorkspaceStore(workspace_list_error=RuntimeError("nas down"))
+    freshness = await figure_freshness(
+        store,
+        viewed=[ref],
+        documents=_documents("d.pptx"),
+        tenant_id=_TENANT,
+        user_id=_USER,
+        agent_key=_AGENT_KEY,
+    )
+    assert freshness == {ref: "unknown"}
