@@ -54,7 +54,7 @@ from orchestrator.tools.knowledge import KnowledgeRetriever, KnowledgeSearchTool
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.mcp import MCPServerPool, register_mcp_tools
 from orchestrator.tools.read_document import ReadDocumentTool
-from orchestrator.tools.read_page import ReadPageTool
+from orchestrator.tools.read_page import FigureDelivery, ReadPageTool
 from orchestrator.tools.registry import ToolRegistry
 from orchestrator.tools.sandbox import ExecPythonTool, SandboxRuntime
 from orchestrator.tools.skill_authoring import SKILL_AUTHORING_BUILTINS
@@ -217,6 +217,7 @@ async def build_tool_registry(
     vision: VisionSpec | None = None,
     vl_caller: LLMCaller | None = None,
     context_window: int | None = None,
+    supports_vision: bool = False,
 ) -> ToolRegistry:
     """Build a :class:`ToolRegistry` from a manifest's ``tools:`` entries.
 
@@ -237,6 +238,11 @@ async def build_tool_registry(
     its presence activates the ``ask_image`` tool, which routes to the
     declared VL model via ``vl_caller``.
 
+    ``supports_vision`` (B-64) is the main model's native image input
+    (manifest ``model.supports_vision``). Together with ``vision`` it decides
+    how ``read_page``'s rendered pages reach the model, which is what its
+    success receipt tells the model (see :func:`_figure_delivery`).
+
     ``context_window`` (Stream HX-12) feeds the small-pool escape hatch:
     when the deferred (MCP) pool's total schema size fits comfortably in
     context, defer is pointless overhead and every tool registers active.
@@ -248,6 +254,7 @@ async def build_tool_registry(
         ``vision`` with no ``ToolEnv.image_resolver`` / ``vl_caller``.
     """
     registry = ToolRegistry()
+    figure_delivery = _figure_delivery(supports_vision=supports_vision, vision=vision)
     # B-61 §5.4(评审 I-3)—— 参数绑定先**跨条目**并成一张表,再发给每一条 mcp
     # 条目。一份 manifest 可以有多个 ``mcp`` 条目(协议层合法、也有测试),而每一条
     # 都会把它选中的服务器整个再注册一遍。按条目各发各的,后注册那一条就会用「我
@@ -263,7 +270,9 @@ async def build_tool_registry(
     ]
     for entry in tool_specs:
         if isinstance(entry, BuiltinToolSpec):
-            _register_builtin(registry, entry, tool_env, skill_seed_files)
+            _register_builtin(
+                registry, entry, tool_env, skill_seed_files, figure_delivery=figure_delivery
+            )
         elif isinstance(entry, HTTPToolSpec):
             _register_http(registry, tool_env)
         elif isinstance(entry, MCPToolSpec):
@@ -304,7 +313,9 @@ async def build_tool_registry(
             registry.note_unmatched_arg_binding(
                 binding.server, binding.tool, tuple(binding.args), reason="name_collision"
             )
-    _register_base_capabilities(registry, tool_env, skill_seed_files)
+    _register_base_capabilities(
+        registry, tool_env, skill_seed_files, figure_delivery=figure_delivery
+    )
     _register_subagents(registry, subagents, tool_env, subagent_depth)
     _register_spawn_worker(registry, tool_env, parent_spec, dynamic_workers, subagent_depth)
     _register_knowledge_search(registry, knowledge, tool_env)
@@ -402,6 +413,30 @@ def _register_knowledge_search(
     )
 
 
+def _ask_image_enabled(vision: VisionSpec | None) -> bool:
+    """``ask_image`` 注不注册的**唯一**判据 —— :func:`_register_ask_image` 与
+    :func:`_figure_delivery` 都读它,``read_page`` 的回执因此不会许诺一个没注册的工具。
+
+    声明了 ``vision`` 却缺依赖时 :func:`_register_ask_image` 直接抛错、整个构建失败,
+    所以构建成功时「这里为真」就等于「``ask_image`` 在注册表里」。
+    """
+    return vision is not None
+
+
+def _figure_delivery(*, supports_vision: bool, vision: VisionSpec | None) -> FigureDelivery:
+    """B-64 Task 7 回修 —— ``read_page`` 渲出来的页怎么到模型眼前。
+
+    主模型能看图就走 Path A(``graph_builder._figure_block_tail`` 挂进提示词,
+    ``build_react_graph(supports_vision=...)`` 收的是同一个值);否则看 ``ask_image``
+    在不在;两样都没有就是 ``"none"``。
+    """
+    if supports_vision:
+        return "inline"
+    if _ask_image_enabled(vision):
+        return "ask_image"
+    return "none"
+
+
 def _register_ask_image(
     registry: ToolRegistry,
     vision: VisionSpec | None,
@@ -412,7 +447,7 @@ def _register_ask_image(
     ``vision:`` block — Stream J.6 Path B. A declared block missing
     either the image resolver or the VL caller is an un-buildable
     manifest."""
-    if vision is None:
+    if not _ask_image_enabled(vision) or vision is None:
         return
     if env.image_resolver is None:
         raise AgentFactoryError(
@@ -519,6 +554,8 @@ def _register_builtin(
     entry: BuiltinToolSpec,
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
+    *,
+    figure_delivery: FigureDelivery = "none",
 ) -> None:
     if entry.name not in KNOWN_BUILTINS:
         raise AgentFactoryError(
@@ -535,7 +572,7 @@ def _register_builtin(
     elif entry.name == "read_document":
         _register_read_document(registry, env, skill_seed_files)
     elif entry.name == "read_page":
-        _register_read_page(registry, env, skill_seed_files)
+        _register_read_page(registry, env, skill_seed_files, figure_delivery)
     elif entry.name == "save_artifact":
         # 登记前要 stat 工作区里那个文件,所以和 read_file/write_file 一样需要
         # 沙箱执行通道;没有它就没有「文件」这个概念,登记只会造出死产物。
@@ -595,6 +632,8 @@ def _register_base_capabilities(
     registry: ToolRegistry,
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
+    *,
+    figure_delivery: FigureDelivery = "none",
 ) -> None:
     """Register the Tier 1 base capabilities the manifest did not declare.
 
@@ -626,7 +665,13 @@ def _register_base_capabilities(
                 continue
         elif env.sandbox_runtime is None:
             continue
-        _register_builtin(registry, BuiltinToolSpec(name=name), env, skill_seed_files)
+        _register_builtin(
+            registry,
+            BuiltinToolSpec(name=name),
+            env,
+            skill_seed_files,
+            figure_delivery=figure_delivery,
+        )
 
 
 def _register_web_search(registry: ToolRegistry, entry: BuiltinToolSpec, env: ToolEnv) -> None:
@@ -747,6 +792,7 @@ def _register_read_page(
     registry: ToolRegistry,
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
+    figure_delivery: FigureDelivery,
 ) -> None:
     # B-64 —— read_page rides the same warm sandbox runtime exec channel as
     # read_document (soffice / pdftoppm run inside the per-user sandbox).
@@ -759,6 +805,7 @@ def _register_read_page(
         ReadPageTool(
             client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
+            figure_delivery=figure_delivery,
         )
     )
 

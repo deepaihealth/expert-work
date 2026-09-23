@@ -556,11 +556,20 @@ async def test_build_agent_threads_supports_vision_into_the_graph(
         return real(**kwargs)
 
     monkeypatch.setattr("orchestrator.agent_factory.build_react_graph", _spy)
+    from orchestrator.agent_factory import build_tool_registry as real_registry
+
+    async def _registry_spy(*args: Any, **kwargs: Any) -> Any:
+        captured["registry_supports_vision"] = kwargs.get("supports_vision")
+        return await real_registry(*args, **kwargs)
+
+    # Task 7 回修 —— read_page 的回执也要知道同一个值。
+    monkeypatch.setattr("orchestrator.agent_factory.build_tool_registry", _registry_spy)
     doc = deepcopy(_MINIMAL_SPEC)
     doc["spec"]["model"]["supports_vision"] = vision
     async with make_checkpointer("memory") as cp:
         await _build(AgentSpec.model_validate(doc), secret_store=_secret_store(), checkpointer=cp)
     assert captured["supports_vision"] is vision
+    assert captured["registry_supports_vision"] is vision
 
 
 @pytest.mark.asyncio

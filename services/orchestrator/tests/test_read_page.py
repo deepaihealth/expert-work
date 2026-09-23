@@ -29,6 +29,7 @@ from orchestrator.tools.read_page import (
     _RENDER_TIMEOUT_S,
     MAX_PAGES_PER_CALL,
     RENDER_DPI,
+    FigureDelivery,
     ReadPageTool,
     _doc_sha,
     _require_units,
@@ -2534,3 +2535,62 @@ async def test_shared_prefix_is_refused_not_silently_redirected() -> None:
     with pytest.raises(WriteToSharedError):
         await ReadPageTool(client=runtime).call({"path": "shared:d.pptx", "units": [1]}, ctx=_ctx())
     assert runtime.execs == []
+
+
+# ---------------------------------------------------------------------------
+# B-64 Task 7 回修 —— 成功回执按实际投递路径说
+# ---------------------------------------------------------------------------
+
+
+def _one_rendered_page_runtime(ctx: ToolContext) -> RecordingSandboxRuntime:
+    """沙箱回一张 ``read_page`` 真实落点形状的第 3 页。"""
+    rel = f".tool_results/{ctx.run_id}/figures/{'a' * 16}/{'b' * 16}/_u3/page-03.jpg"
+    return RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps({"ok": True, "rendered": [{"unit": 3, "rel": rel, "bytes": 100}]}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+
+
+async def _receipt(delivery: FigureDelivery | None = None) -> tuple[str, list[str]]:
+    """``delivery=None`` = 不传,走 ``ReadPageTool`` 的默认值。"""
+    ctx = _ctx()
+    runtime = _one_rendered_page_runtime(ctx)
+    tool = (
+        ReadPageTool(client=runtime)
+        if delivery is None
+        else ReadPageTool(client=runtime, figure_delivery=delivery)
+    )
+    result = await tool.call({"path": "d.pptx", "units": [3]}, ctx=ctx)
+    refs = list(result.state_updates["viewed_figures"])
+    assert len(refs) == 1, "没渲出来,下面的断言什么也没验"
+    return result.content, refs
+
+
+@pytest.mark.anyio
+async def test_the_receipt_for_a_vision_model_does_not_mention_ask_image() -> None:
+    """主模型能看图时 ``ask_image`` 根本没注册 —— 回执不能让模型去调它。"""
+    content, _ = await _receipt("inline")
+    assert "直接看到" in content
+    assert "ask_image" not in content
+
+
+@pytest.mark.anyio
+async def test_the_receipt_hands_over_the_ref_when_ask_image_is_the_way() -> None:
+    """走 ``ask_image`` 就得有 ``image_ref`` —— 回执不给,这条路等于没有。"""
+    content, refs = await _receipt("ask_image")
+    assert "ask_image" in content
+    assert f"第 3 页:{refs[0]}" in content
+    assert "已放进你的上下文" not in content
+
+
+@pytest.mark.anyio
+async def test_the_receipt_says_so_when_the_model_cannot_see_the_page() -> None:
+    """两样都没有:明说看不到,不许说「已放进你的上下文」。默认值就是这一档。"""
+    for content, _ in (await _receipt("none"), await _receipt()):
+        assert "你看不到它" in content
+        assert "已放进你的上下文" not in content
+        assert "直接看到" not in content

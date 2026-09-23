@@ -839,6 +839,9 @@ async def build_agent(
         vl_caller=vl_caller,
         # Stream HX-12 — feeds the small-deferred-pool escape hatch.
         context_window=_resolved_context_window(spec.spec.model),
+        # B-64 —— read_page 的回执按实际投递路径说;与下面 build_react_graph /
+        # BuiltAgent 用的是同一个表达式。
+        supports_vision=spec.spec.model.supports_vision,
     )
     # Stream J.1 — a ``plan_execute`` manifest front-loads a planner node
     # that decomposes the task before the ReAct loop runs. B-35 — the

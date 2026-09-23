@@ -861,6 +861,43 @@ async def test_save_artifact_base_capability_needs_both_deps() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "base-capability"])
+@pytest.mark.parametrize(
+    ("supports_vision", "with_vision_block", "expected"),
+    [
+        (True, False, "inline"),
+        (False, True, "ask_image"),
+        (False, False, "none"),
+    ],
+)
+async def test_read_page_learns_how_its_pages_reach_the_model(
+    declared: bool, supports_vision: bool, with_vision_block: bool, expected: str
+) -> None:
+    """B-64 Task 7 回修 —— 回执怎么说,取决于注册表里**实际**有什么。
+
+    ``ask_image`` 在不在与 ``read_page`` 被告知走 ``ask_image`` 必须同进同退:两者
+    读的是同一个判据。显式声明与隐式基础能力两条注册路径都要接上。
+    """
+    env = ToolEnv(
+        sandbox_runtime=RecordingSandboxRuntime(),
+        artifact_store=InMemoryArtifactStore(),
+        workspace_store=RecordingWorkspaceStore(),
+        image_resolver=InMemoryImageResolver(),
+    )
+    registry = await build_tool_registry(
+        [BuiltinToolSpec(name="read_page")] if declared else [],
+        tool_env=env,
+        vision=_vision_spec() if with_vision_block else None,
+        vl_caller=_stub_vl_caller if with_vision_block else None,
+        supports_vision=supports_vision,
+    )
+    tool = registry.get("read_page")
+    assert isinstance(tool, ReadPageTool)
+    assert tool.figure_delivery == expected
+    assert (registry.get("ask_image") is not None) == (expected == "ask_image")
+
+
+@pytest.mark.asyncio
 async def test_read_page_without_supervisor_raises() -> None:
     """B-64 回修 M3 —— 显式声明 read_page 但没接沙箱是真实配置错误,必须在
     build 时炸,不能等到第一次调用才发现(与 read_document/exec_python 等

@@ -176,7 +176,7 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Final, TypeGuard
+from typing import Any, Final, Literal, TypeGuard
 from uuid import UUID
 
 from expert_work.persistence import (
@@ -187,6 +187,7 @@ from expert_work.persistence import (
     WORKSPACE_OVERFLOW_DIR,
 )
 from expert_work.protocol.multimodal import WORKSPACE_REF_PREFIX
+from orchestrator.multimodal import parse_rendered_figure_ref
 from orchestrator.tools.document_figures import (
     _DOCX_INVENTORY_FRAGMENT,
     MIN_FIGURE_AREA_RATIO,
@@ -1062,6 +1063,38 @@ def _describe_render_notes(rendered: Sequence[Mapping[str, Any]], *, unit_label:
     return "".join(parts)
 
 
+#: B-64 Task 7 回修 —— 渲出来的页怎么到模型眼前,三选一:
+#:
+#: * ``"inline"``:主模型能直接看图,下一轮 ``graph_builder._figure_block_tail``
+#:   把它挂进提示词(Path A);
+#: * ``"ask_image"``:主模型看不了图,但 ``ask_image`` 已注册(Path B);
+#: * ``"none"``:两样都没有 —— 图渲出来了,模型看不到。
+FigureDelivery = Literal["inline", "ask_image", "none"]
+
+
+def _delivery_sentence(head: str, refs: Sequence[str], delivery: FigureDelivery) -> str:
+    """成功回执的主句 —— 按**实际投递路径**说,不许许诺一条不存在的路。
+
+    回修前这里对所有模型都说「已放进你的上下文 —— 需要仔细看细节时用 ask_image
+    问它」:能看图的模型上 ``ask_image`` 根本没注册(让模型去调一个不存在的工具);
+    两样都没有时「已放进你的上下文」是假话。
+    """
+    if delivery == "inline":
+        return f"{head},下一轮起你会在上下文里直接看到这几页的图。"
+    if delivery == "ask_image":
+        # 模型要调 ask_image 就得有 image_ref,回执里不给就等于没有这条路。
+        lines = []
+        for ref in refs:
+            figure = parse_rendered_figure_ref(ref)
+            label = f"第 {figure.page} 页" if figure is not None else "这一张"
+            lines.append(f"{label}:{ref}")
+        return (
+            f"{head}。当前模型不能直接看图 —— 要看哪一页,就调用 ask_image,"
+            "把下面对应的那一条原样填进 image_ref:\n" + "\n".join(lines)
+        )
+    return f"{head}。当前模型看不了图,也没有配看图的工具(ask_image);图已经渲出来了,但你看不到它。"
+
+
 @dataclass
 class ReadPageTool:
     """按需把文档单页渲成 jpeg(暴露为 ``read_page``)。"""
@@ -1069,6 +1102,11 @@ class ReadPageTool:
     client: SandboxRuntime
     #: skill-runtime §5.1 — activated skill files seeded under /opt/skills/<agent_key>/.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
+    #: B-64 Task 7 回修 —— 渲出来的页**怎么到模型眼前**,决定成功回执怎么说。
+    #: 由注册方(``tools.assembly.build_tool_registry``)按与 ``ask_image`` 注册
+    #: 同一处的判据算好传进来,这里不重推。默认 ``"none"``:没接线时宁可说
+    #: 「你看不到」,也不许说「已放进你的上下文」。
+    figure_delivery: FigureDelivery = "none"
 
     @property
     def spec(self) -> ToolSpec:
@@ -1246,7 +1284,7 @@ class ReadPageTool:
                 head = f"已渲染 {raw} 第 {pages} {label}"
         else:
             head = f"已渲染 {raw} {len(refs)} 页"
-        content = f"{head},已放进你的上下文 —— 需要仔细看细节时用 ask_image 问它。"
+        content = _delivery_sentence(head, refs, self.figure_delivery)
         caveats = _describe_render_notes(notes, unit_label=label)
         if caveats:
             content = f"{content} {caveats}"
