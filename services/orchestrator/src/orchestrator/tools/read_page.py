@@ -1089,7 +1089,12 @@ FigureDelivery = Literal["inline", "ask_image", "none"]
 
 
 def _delivery_sentence(
-    head: str, refs: Sequence[str], delivery: Literal["inline", "ask_image"]
+    head: str,
+    refs: Sequence[str],
+    delivery: Literal["inline", "ask_image"],
+    *,
+    path: str,
+    unit_label: str,
 ) -> str:
     """成功回执的主句 —— 按**实际投递路径**说,不许许诺一条不存在的路。
 
@@ -1100,15 +1105,15 @@ def _delivery_sentence(
     ``"none"`` 档到不了这里:``ReadPageTool.call`` 在进沙箱之前就返回了(回修第 3 轮)。
     """
     if delivery == "ask_image":
-        # 模型要调 ask_image 就得有 image_ref,回执里不给就等于没有这条路。
-        lines = []
-        for ref in refs:
-            figure = parse_rendered_figure_ref(ref)
-            label = f"第 {figure.page} 页" if figure is not None else "这一张"
-            lines.append(f"{label}:{ref}")
+        # B-64 Task 8 —— 不再列 ref:列了模型就会去抄,而约 200 字符的 ref 手抄会错
+        # (09-14 实证三抄三错)。改成让它填自己刚填过的两样:路径原样、页号是
+        # ``_u<unit>`` 那一段(``ask_image`` 在宿主侧按它找渲染页),不是 pdf 页号 ——
+        # docx 的 unit 是图编号。
+        units = [f.unit for f in map(parse_rendered_figure_ref, refs) if f is not None]
+        rendered = f"(本次渲出:{'、'.join(f'第 {u} {unit_label}' for u in units)})" if units else ""
         return (
-            f"{head}。当前模型不能直接看图 —— 要看哪一页,就调用 ask_image,"
-            "把下面对应的那一条原样填进 image_ref:\n" + "\n".join(lines)
+            f"{head}。当前模型不能直接看图 —— 要看哪一{unit_label},就调用 ask_image,"
+            f"path 填 {path},unit 填要看的是第几{unit_label}{rendered};不用填 image_ref。"
         )
     return f"{head},下一轮起你会在上下文里直接看到这几页的图。"
 
@@ -1202,10 +1207,12 @@ class ReadPageTool:
             # 白跑一次 soffice + pdftoppm。**仍然注册** read_page,不是撤掉它 ——
             # read_document 的图清单会让模型来调这个工具,撤掉就成了指向一个不存在
             # 的工具;留着,模型调到时得到一句明确的「看不了」。
+            # B-64 Task 8 —— 说清缺的是什么、去哪配,让模型能原样转告用户。
             return ToolResult(
                 content=(
-                    f"没有渲染 {raw}:当前模型看不了图,也没有配看图的工具(ask_image)"
-                    "—— 渲出来你也看不到,所以没有去渲。"
+                    f"没有渲染 {raw}:这个 Agent 的主模型不能看图,也没有配置视觉模型,"
+                    "所以看不了文档里的图。如需读取,请在 Agent 配置的「图像理解(VL 模型)」"
+                    "里配一个视觉模型。"
                 )
             )
         if ctx.tenant_id is None or ctx.user_id is None or ctx.run_id is None:
@@ -1314,7 +1321,7 @@ class ReadPageTool:
                 head = f"已渲染 {raw} 第 {pages} {label}"
         else:
             head = f"已渲染 {raw} {len(refs)} 页"
-        content = _delivery_sentence(head, refs, delivery)
+        content = _delivery_sentence(head, refs, delivery, path=raw, unit_label=label)
         caveats = _describe_render_notes(notes, unit_label=label)
         if caveats:
             content = f"{content} {caveats}"

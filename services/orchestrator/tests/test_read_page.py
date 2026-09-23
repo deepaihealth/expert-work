@@ -2617,12 +2617,40 @@ async def test_the_receipt_for_a_vision_model_does_not_mention_ask_image() -> No
 
 
 @pytest.mark.anyio
-async def test_the_receipt_hands_over_the_ref_when_ask_image_is_the_way() -> None:
-    """走 ``ask_image`` 就得有 ``image_ref`` —— 回执不给,这条路等于没有。"""
+async def test_the_ask_image_receipt_names_path_and_unit_not_the_ref() -> None:
+    """B-64 Task 8 —— 走 ``ask_image`` 时回执不再列 ref(列了模型就会去抄,约 200
+    字符手抄会错),改成告诉它 path 填什么、unit 填哪几页 —— 都是它自己刚填过的。"""
     content, refs = await _receipt("ask_image")
     assert "ask_image" in content
-    assert f"第 3 页:{refs[0]}" in content
+    assert "expert_work://" not in content
+    assert refs[0] not in content
+    assert "path 填 d.pptx" in content
+    assert "本次渲出:第 3 页" in content
     assert "已放进你的上下文" not in content
+
+
+@pytest.mark.anyio
+async def test_the_ask_image_receipt_for_docx_gives_the_unit_not_the_page() -> None:
+    """docx 的 unit 是图编号、不是页号;``ask_image`` 按 ``_u<unit>`` 找渲染页,所以
+    回执里让模型填的必须是 unit(第 7 处),不是 pdf 页号(第 3 页)。"""
+    ctx = _ctx()
+    rel = f".tool_results/{ctx.run_id}/figures/{'a' * 16}/{'b' * 16}/_u7/page-03.jpg"
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {"ok": True, "rendered": [{"unit": 7, "page": 3, "rel": rel, "bytes": 100}]}
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime, figure_delivery="ask_image").call(
+        {"path": "r.docx", "units": [7]}, ctx=ctx
+    )
+    assert "path 填 r.docx" in result.content
+    assert "本次渲出:第 7 处" in result.content
+    assert "第几处" in result.content
 
 
 @pytest.mark.anyio
@@ -2641,8 +2669,11 @@ async def test_read_page_does_not_render_when_the_model_cannot_see_the_page() ->
         )
         result = await tool.call({"path": "d.pptx", "units": [3]}, ctx=ctx)
         assert runtime.execs == []
-        assert "看不了图" in result.content
+        assert "看不了文档里的图" in result.content
         assert "已放进你的上下文" not in result.content
+        # B-64 Task 8 —— 说清缺的是**视觉模型配置**、入口在哪,模型才能转告用户。
+        assert "没有配置视觉模型" in result.content
+        assert "Agent 配置的「图像理解(VL 模型)」" in result.content
         assert "viewed_figures" not in result.state_updates
 
 
