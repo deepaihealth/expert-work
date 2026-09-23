@@ -672,3 +672,78 @@ async def test_ask_image_short_form_finds_this_run_page_past_the_listing_cap() -
     )
 
     assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
+
+
+# ---------------------------------------------------------------------------
+# 终审 #6 / #7
+# ---------------------------------------------------------------------------
+
+
+def _store_with(*entries: tuple[str, datetime | None]) -> RecordingWorkspaceStore:
+    return RecordingWorkspaceStore(
+        workspace_files=[
+            WorkspaceFileEntry(path=f"agents/{_AGENT}/{rel}", size=1, mtime=mtime)
+            for rel, mtime in entries
+        ]
+    )
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_stops_at_a_fresh_page_in_this_run() -> None:
+    """终审 #6 —— 本 run 自己的目录里有过得了闸的一张,就不再列 ``.tool_results``
+    去扫别的 run(那一步的开销随历史 run 数增长)。"""
+    tenant, user = uuid4(), uuid4()
+    old, new = datetime(2026, 9, 1, tzinfo=UTC), datetime(2026, 9, 2, tzinfo=UTC)
+    rel = _figure_rel(run=_NEW_RUN)
+    store = _store_with((_DOC, old), (rel, new), (_figure_rel(run=_OLD_RUN, render="c" * 16), new))
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver(), workspace_store=store)
+
+    await tool.call(
+        {"path": _DOC, "unit": 10, "question": "?"},
+        ctx=ToolContext(tenant_id=tenant, user_id=user, agent_key=_AGENT, run_id=UUID(_NEW_RUN)),
+    )
+
+    assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
+    listed = {path for _t, _u, path in store.workspace_reads}
+    assert f"agents/{_AGENT}/.tool_results" not in listed
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_skips_a_candidate_without_mtime() -> None:
+    """终审 #7 —— 一张读不出修改时间的候选(lstat 撞上清理)只丢它自己。"""
+    tenant, user = uuid4(), uuid4()
+    stamp = datetime(2026, 9, 2, tzinfo=UTC)
+    good = _figure_rel(run=_OLD_RUN, render="1" * 16)
+    store = _store_with(
+        (_DOC, datetime(2026, 9, 1, tzinfo=UTC)),
+        (good, stamp),
+        (_figure_rel(run=_NEW_RUN, render="2" * 16), None),
+    )
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver(), workspace_store=store)
+
+    await tool.call(
+        {"path": _DOC, "unit": 10, "question": "?"},
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+    )
+
+    assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{good}")
+
+
+@pytest.mark.anyio
+async def test_ask_image_short_form_with_no_usable_candidate_says_render_again() -> None:
+    """一张都用不了:说「读不出来 → 重新 read_page」,不说「这里用不了短形态」。"""
+    store = _store_with((_DOC, datetime(2026, 9, 1, tzinfo=UTC)), (_figure_rel(), None))
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver(), workspace_store=store)
+
+    with pytest.raises(FileNotFoundError) as info:
+        await tool.call(
+            {"path": _DOC, "unit": 10, "question": "?"},
+            ctx=_ctx(tenant_id=uuid4(), user_id=uuid4(), agent_key=_AGENT),
+        )
+
+    assert "读不出来" in str(info.value)
+    assert f"read_page(path={_DOC!r}, units=[10])" in str(info.value)
+    assert vl.calls == []

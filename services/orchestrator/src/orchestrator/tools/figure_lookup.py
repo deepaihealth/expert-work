@@ -25,7 +25,7 @@
 NAS 实现对不存在的目录抛内部异常、内存替身回空列表,两者对「不存在」的说法不同;
 只走确认过的条目,两者的答案就一样(「SQL↔内存 store 谓词必同义」的同一条规矩)。
 有两处**不经确认**直接列(作用域根本身;本 run 自己的目录,见
-:func:`_rendered_candidates`),那两处把 NAS 的「不存在」接住、当空处理 —— 只接
+:func:`_own_run_candidates`),那两处把 NAS 的「不存在」接住、当空处理 —— 只接
 「不存在」,越界与权限错误照样抛。
 ``list_dir`` 用 ``lstat``,符号链接不会被当成目录走进去。
 
@@ -34,9 +34,11 @@ NAS 实现对不存在的目录抛内部异常、内存替身回空列表,两者
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
+from typing import Literal
 from uuid import UUID
 
 from expert_work.persistence import (
@@ -54,8 +56,28 @@ from orchestrator.tools.read_page import (
 )
 from orchestrator.tools.sandbox import WorkspaceFileNotFoundError
 from orchestrator.tools.workspace_paths import resolve_scope
-from orchestrator.tools.workspace_scope import scoped_path, store_scope
+from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, scoped_path, store_scope
 from orchestrator.tools.workspace_store import WorkspaceDirEntry, WorkspaceStore
+
+logger = logging.getLogger(__name__)
+
+#: 一张渲染页此刻还能不能代表磁盘上的文档(Path A 用,见 :func:`rendered_page_freshness`)。
+#:
+#: * ``"fresh"``:文档修改时间不晚于渲染 —— 渲的就是当前内容;
+#: * ``"stale"``:文档在渲染之后被改过或替换了;
+#: * ``"missing"``:文档已不在工作区里;
+#: * ``"unknown"``:核对不了(读不出修改时间、列目录失败、路径没记下来)。
+FigureFreshness = Literal["fresh", "stale", "missing", "unknown"]
+
+
+def render_is_stale(document_mtime: datetime, render_mtime: datetime) -> bool:
+    """文档修改时间晚于渲染 → 那张渲染页过期了。
+
+    **唯一一处**「文档比渲染新」的判据:``ask_image`` 短形态(:func:`resolve_rendered_figure`)
+    与 Path A 的渲染页段(:func:`rendered_page_freshness`)都用它。残余风险见模块
+    docstring(mtime 倒退时会漏)。
+    """
+    return document_mtime > render_mtime
 
 
 @dataclass(frozen=True)
@@ -98,6 +120,12 @@ class _ScopeLister:
     async def has_dir(self, rel: str, name: str) -> bool:
         entry = (await self.entries(rel)).get(name)
         return entry is not None and entry.is_dir
+
+    async def entry_direct(self, rel: str) -> WorkspaceDirEntry | None:
+        """直接列 ``rel`` 的父目录取这一项 —— 不从作用域根一段段走;父目录不在就 ``None``。"""
+        path = PurePosixPath(rel)
+        parent = path.parent.as_posix()
+        return (await self.entries_if_present("" if parent == "." else parent)).get(path.name)
 
     async def entry_at(self, parts: tuple[str, ...]) -> WorkspaceDirEntry | None:
         """逐段往下走,只进确认是目录的条目;任何一段不在就 ``None``。"""
@@ -151,47 +179,75 @@ async def resolve_rendered_figure(
             f"核对路径后调用 read_page(path={path!r}, units=[{unit}])。"
         )
         raise FileNotFoundError(msg)
-    candidates = await _rendered_candidates(lister, doc_sha=doc_sha, unit=unit, run_id=run_id)
+    if document.mtime is None:
+        msg = (
+            "当前部署的工作区不报告文件修改时间,核对不了渲染页是不是最新的,"
+            "path + unit 这种写法在这里用不了。"
+        )
+        raise RuntimeError(msg)
+    # 终审 #6 —— 本 run 自己的目录里有一张过得了闸的,就不再扫全部 run:别的 run 的
+    # 渲染要么更旧,要么同样得过这道闸,换不来更对的答案,只多花 O(run 数) 次列目录。
+    own = await _own_run_candidates(lister, doc_sha=doc_sha, unit=unit, run_id=run_id)
+    own_newest = _newest(own)
+    if own_newest is not None and not render_is_stale(document.mtime, own_newest[0]):
+        return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, own_newest[1].rel))
+    candidates = own + await _other_run_candidates(
+        lister, doc_sha=doc_sha, unit=unit, run_id=run_id
+    )
     if not candidates:
         msg = (
             f"{path} 的第 {unit} {label}还没渲染 —— "
             f"请先调用 read_page(path={path!r}, units=[{unit}]),再调用 ask_image。"
         )
         raise FileNotFoundError(msg)
-    dated = [(c.mtime, c) for c in candidates if c.mtime is not None]
-    if document.mtime is None or len(dated) != len(candidates):
+    # 终审 #7 —— 读不出修改时间的候选(lstat 撞上留存清理、坏符号链接)只丢掉它自己,
+    # 不拖垮整次查找;一张都用不了时才失败,并说对原因。
+    newest = _newest(candidates)
+    if newest is None:
         msg = (
-            "当前部署的工作区不报告文件修改时间,核对不了渲染页是不是最新的,"
-            "path + unit 这种写法在这里用不了。"
+            f"{path} 第 {unit} {label}的渲染页读不出来(可能正被清理)—— "
+            f"请重新调用 read_page(path={path!r}, units=[{unit}]),再调用 ask_image。"
         )
-        raise RuntimeError(msg)
-    newest_mtime, newest = max(dated, key=lambda pair: pair[0])
-    if document.mtime > newest_mtime:
+        raise FileNotFoundError(msg)
+    newest_mtime, newest_page = newest
+    if render_is_stale(document.mtime, newest_mtime):
         msg = (
             f"{path} 在渲染之后改过,那张渲染页已经过期 —— "
             f"请先重新调用 read_page(path={path!r}, units=[{unit}]) 渲染第 {unit} {label},"
             "再调用 ask_image。"
         )
         raise FileNotFoundError(msg)
-    return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, newest.rel))
+    return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, newest_page.rel))
 
 
-async def _rendered_candidates(
+def _newest(candidates: list[_Rendered]) -> tuple[datetime, _Rendered] | None:
+    """带修改时间的候选里最新的那张;一张都没有就 ``None``。"""
+    dated = [(c.mtime, c) for c in candidates if c.mtime is not None]
+    return max(dated, key=lambda pair: pair[0]) if dated else None
+
+
+async def _own_run_candidates(
     lister: _ScopeLister, *, doc_sha: str, unit: int, run_id: UUID | None
 ) -> list[_Rendered]:
-    """``.tool_results/*/figures/<doc_sha>/*/_u<unit>/`` 下形状合法的全部渲染页。
-
-    **本 run 自己的目录先直接查**,不经 ``.tool_results`` 的列表:那个列表有条目
+    """**本 run 自己的目录直接查**,不经 ``.tool_results`` 的列表:那个列表有条目
     上限(``list_dir`` 默认 2000)、按名字截断,run 目录积累多了之后,本 run 刚渲
     出来的页可能正好被截掉 —— 模型刚调完 read_page 就被告知「还没渲染」,只会反复
-    重渲。其余 run 仍按列表扫,截掉的只是更早的 run。
+    重渲。
     """
-    found: list[_Rendered] = []
+    if run_id is None:
+        return []
+    own_dir = f"{WORKSPACE_OVERFLOW_DIR}/{run_id}"
+    if RENDERED_FIGURE_DIR not in await _subdir_names(lister, own_dir):
+        return []
+    return await _run_pages(lister, own_dir, doc_sha=doc_sha, unit=unit)
+
+
+async def _other_run_candidates(
+    lister: _ScopeLister, *, doc_sha: str, unit: int, run_id: UUID | None
+) -> list[_Rendered]:
+    """其余 run 按 ``.tool_results`` 的列表扫(截掉的只是更早的 run)。"""
     own = str(run_id) if run_id is not None else None
-    if own is not None:
-        own_dir = f"{WORKSPACE_OVERFLOW_DIR}/{own}"
-        if RENDERED_FIGURE_DIR in await _subdir_names(lister, own_dir):
-            found.extend(await _run_pages(lister, own_dir, doc_sha=doc_sha, unit=unit))
+    found: list[_Rendered] = []
     if not await lister.has_dir("", WORKSPACE_OVERFLOW_DIR):
         return found
     for name in await lister.subdirs(WORKSPACE_OVERFLOW_DIR):
@@ -230,3 +286,38 @@ async def _unit_pages(lister: _ScopeLister, doc_dir: str, *, unit: int) -> list[
             if not entry.is_dir and is_rendered_figure_rel(rel):
                 pages.append(_Rendered(rel=rel, mtime=entry.mtime))
     return pages
+
+
+async def rendered_page_freshness(
+    store: WorkspaceStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    path: str,
+    render_rel: str,
+) -> FigureFreshness:
+    """Path A 用:``render_rel``(用户根相对)那张渲染页还能不能代表 ``path`` 此刻的内容。
+
+    终审 #1 —— 渲染页段每轮把最近看过的页挂进提示词,而那一页的文档可能早被同名
+    上传覆盖了。判据与 ``ask_image`` 短形态同一条(:func:`render_is_stale`)。
+
+    **永不抛**(除取消外):这是每一轮都走的路,核对失败不许让这一轮挂掉,也不许
+    悄悄当成「新鲜」—— 一律回 ``"unknown"``,由调用方换成可见文字。
+    """
+    try:
+        ws, rel = resolve_scope(path, agent_key=agent_key, tool="read_page")
+        doc_rel = scoped_path(store_scope(ws, agent_key=agent_key), rel)
+        lister = _ScopeLister(
+            store=store, tenant_id=tenant_id, user_id=user_id, scope=SCOPE_USER_ROOT
+        )
+        document = await lister.entry_direct(doc_rel)
+        render = await lister.entry_direct(render_rel)
+    except Exception:
+        logger.warning("figure_lookup.freshness_check_failed", exc_info=True)
+        return "unknown"
+    if document is None or document.is_dir:
+        return "missing"
+    if render is None or document.mtime is None or render.mtime is None:
+        return "unknown"
+    return "stale" if render_is_stale(document.mtime, render.mtime) else "fresh"
