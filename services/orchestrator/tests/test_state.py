@@ -92,9 +92,18 @@ def test_viewed_figures_merges_across_turns_in_order() -> None:
     assert merged == ["a", "b", "c"]
 
 
-def test_viewed_figures_dedupes_without_reordering() -> None:
-    """重看同一页不该把它挪到队尾 —— 滑窗按「首次看到」排。"""
-    assert _merge_viewed_figures(["a", "b"], ["a", "c"]) == ["a", "b", "c"]
+def test_viewed_figures_moves_a_re_viewed_ref_to_the_tail() -> None:
+    """Task 7 —— 重看同一页要把它挪到队尾:滑窗按「最近一次看到」排。
+
+    同一个 run 里重读同一页,拿到的是**逐字相同**的 ref(路径里只有 run_id、文档
+    路径、内容哈希、unit、页号,都没变)。按「首次看到」排的话,一张已经退出滑窗
+    的页再怎么重读也回不来 —— 而占位文字告诉模型的正是「再调一次 read_page」。
+    """
+    assert _merge_viewed_figures(["a", "b", "c"], ["a"]) == ["b", "c", "a"]
+
+
+def test_viewed_figures_dedupes_within_one_update() -> None:
+    assert _merge_viewed_figures(["a"], ["b", "b", "c"]) == ["a", "b", "c"]
 
 
 def test_tools_may_write_viewed_figures() -> None:

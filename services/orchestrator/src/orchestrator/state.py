@@ -90,19 +90,25 @@ def _merge_last_used(existing: dict[str, int] | None, new: dict[str, int]) -> di
 
 
 def _merge_viewed_figures(left: list[str], right: list[str]) -> list[str]:
-    """跨轮累积已看过的页 ref —— union 去重且**保序**。
+    """跨轮累积已看过的页 ref —— union 去重,按**最近一次看到**排序。
 
-    保序是滑窗的前提:``_figure_block_tail`` 取「最新 N 条」靠的是列表次序。
-    重看同一页不该把它挪到队尾 —— 那会把一张更早看过、模型还在用的图挤出窗口。
-    照 ``_merge_promoted``(TE-6 ``promoted_tools``)的口径写。
+    次序是滑窗的前提:``_figure_block_tail`` 取「最新 N 条」靠的是列表次序。
+
+    Task 7 改了口径:重看同一页**要**把它挪到队尾(原来是按首次看到排、重看不挪)。
+    原来的顾虑是「挪到队尾会把一张更早看过、模型还在用的图挤出窗口」—— 这个顾虑
+    不成立:被重看的那页若本来就在最新 N 条里,挪到队尾之后最新 N 条还是同一批,
+    谁也没被挤出去;只有它本来已经退出窗口时,挪动才会改变窗口 —— 而那正是想要的。
+    反过来,按首次看到排有两个真问题,都因为同一个 run 里重读同一页拿到的是
+    **逐字相同**的 ref:
+
+    * 退出窗口的页再怎么重读也回不来 —— 而占位文字告诉模型的正是「再调一次
+      read_page」;
+    * 文档改了又改回去(内容哈希 A → B → A),重读得到的 A 版 ref 仍停在 B 前面,
+      ``_figure_block_tail`` 就会把 B 当成当前版本、把 A 标成旧版本 —— 反了。
     """
-    out = list(left)
-    seen = set(out)
-    for ref in right:
-        if ref not in seen:
-            out.append(ref)
-            seen.add(ref)
-    return out
+    fresh = list(dict.fromkeys(right))
+    moved = set(fresh)
+    return [ref for ref in left if ref not in moved] + fresh
 
 
 class AgentState(TypedDict):
@@ -309,7 +315,9 @@ class AgentState(TypedDict):
     #: B-35 — 0 on a fresh dispatch turn, 1 once the single retry was spent;
     #: the next refusal degrades (full tools restored) instead of looping.
     plan_first_dispatch_retries: NotRequired[int]
-    #: B-64 —— 本 run 里 ``read_page`` 渲出来、已经给过模型的页 ref,按首次
-    #: 看到的次序。检查点里只有这些字符串(几十字节一条),**图片字节从不落库**:
+    #: B-64 —— ``read_page`` 渲出来、已经给过模型的页 ref,按**最近一次**看到的
+    #: 次序(见 :func:`_merge_viewed_figures`)。跨 run 累积:run 的起始输入
+    #: (``control_plane.api.runs``)不写这个键,检查点里的旧值于是整条会话一直在。
+    #: 检查点里只有这些字符串(几十字节一条),**图片字节从不落库**:
     #: 块每轮由 ``_figure_block_tail`` 重建,与工作区快照同一口径(CM-C4)。
     viewed_figures: NotRequired[Annotated[list[str], _merge_viewed_figures]]
