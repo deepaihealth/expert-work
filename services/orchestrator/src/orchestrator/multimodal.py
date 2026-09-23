@@ -530,8 +530,9 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
     )
 
 
-def _unreadable_workspace_image_text(figure: RenderedFigureRef | None) -> str:
-    """工作区图读不出来时,顶替那张图的可见文字。"""
+def unreadable_workspace_image_text(figure: RenderedFigureRef | None) -> str:
+    """工作区图读不出来时告诉模型的那句话 —— Path A 的降级文字与 ``ask_image`` 的
+    显式错误用的是同一句(``orchestrator.tools.vision``)。"""
     if figure is not None:
         return (
             f"[图:第 {figure.page} 页的图文件已不存在或读不出来(可能已被清理),"
@@ -579,7 +580,7 @@ async def resolve_message_images(
                 figure.page if figure is not None else "-",
                 type(exc).__name__,
             )
-            out.append(_unreadable_workspace_image_text(figure))
+            out.append(unreadable_workspace_image_text(figure))
     return out
 
 

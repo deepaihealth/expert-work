@@ -39,6 +39,17 @@ def _resolver() -> InMemoryImageResolver:
     return InMemoryImageResolver(images={"any": ResolvedImage(media_type="image/png", data=b"PNG")})
 
 
+@dataclass
+class _AnyRefResolver:
+    """任何 ref 都解析成一张图,并记下被解析过哪些 ref。"""
+
+    resolved: list[str] = field(default_factory=list)
+
+    async def resolve(self, ref: str) -> ResolvedImage:
+        self.resolved.append(ref)
+        return ResolvedImage(media_type="image/jpeg", data=b"JPG")
+
+
 def _ctx(
     tenant_id: UUID | None = _TENANT, *, user_id: UUID | None = None, agent_key: str = ""
 ) -> ToolContext:
@@ -163,7 +174,8 @@ async def test_ask_image_accepts_a_workspace_ref() -> None:
     ``DispatchingImageResolver`` 按 scheme 解析,不是本工具的活。"""
     tenant, user = uuid4(), uuid4()
     vl = _FakeVLCaller(response=AIMessage(content="曲线从 6.1 降到 5.5"))
-    tool = AskImageTool(vl_caller=vl, image_resolver=_resolver())
+    # Task 7 回修第 2 轮起工具会先解析一次工作区 ref,文件得「在」。
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver())
     ref = f"expert_work://workspace/{tenant}/{user}/.tool_results/r1/figures/abc/page-03.jpg"
 
     result = await tool.call(
@@ -213,7 +225,7 @@ async def test_ask_image_accepts_a_ref_matching_the_run_own_agent_scope() -> Non
     key>/...``)必须放行,不能因为多了这层前缀就误判成跨 agent。"""
     tenant, user = uuid4(), uuid4()
     vl = _FakeVLCaller(response=AIMessage(content="ok"))
-    tool = AskImageTool(vl_caller=vl, image_resolver=_resolver())
+    tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver())
     ref = (
         f"expert_work://workspace/{tenant}/{user}/agents/pf-probe-33086dc0"
         "/.tool_results/r1/figures/abc/page-03.jpg"
@@ -260,3 +272,47 @@ async def test_ask_image_rejects_an_agent_scoped_ref_from_an_unbound_run() -> No
         await tool.call(
             {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=user)
         )
+
+
+# ---------------------------------------------------------------------------
+# B-64 Task 7 回修第 2 轮 —— 读不出来的工作区图:显式失败,不交给 VL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_ask_image_fails_explicitly_on_a_deleted_workspace_image() -> None:
+    """文件被留存清理删了:这一次工具调用显式失败,VL 一次都不被调用。
+
+    不预检的话,VL 收到的是适配器的降级文字、回一句「看不到图」,主模型会把它当成
+    看图的结果。
+    """
+    tenant, user = uuid4(), uuid4()
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=InMemoryImageResolver())
+    ref = (
+        f"expert_work://workspace/{tenant}/{user}/.tool_results/{uuid4()}/figures/"
+        f"{'a' * 16}/{'b' * 16}/_u3/page-03.jpg"
+    )
+
+    with pytest.raises(FileNotFoundError) as info:
+        await tool.call(
+            {"image_ref": ref, "question": "走势如何"}, ctx=_ctx(tenant_id=tenant, user_id=user)
+        )
+
+    assert "第 3 页" in str(info.value)
+    assert "read_page" in str(info.value)
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+async def test_ask_image_does_not_pre_resolve_an_upload_ref() -> None:
+    """回归钉:上传 ref 的行为不变 —— 工具这一层不解析它,直接交给 VL caller。"""
+    resolver = _AnyRefResolver()
+    vl = _FakeVLCaller()
+    tool = AskImageTool(vl_caller=vl, image_resolver=resolver)
+
+    result = await tool.call({"image_ref": _ref(), "question": "?"}, ctx=_ctx())
+
+    assert result.content == "ok"
+    assert resolver.resolved == []
+    assert len(vl.calls) == 1

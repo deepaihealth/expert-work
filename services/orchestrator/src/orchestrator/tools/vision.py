@@ -31,7 +31,12 @@ from expert_work.protocol.multimodal import (
     parse_image_ref,
     parse_workspace_image_ref,
 )
-from orchestrator.multimodal import ImageResolver, image_ref_block
+from orchestrator.multimodal import (
+    ImageResolver,
+    image_ref_block,
+    parse_rendered_figure_ref,
+    unreadable_workspace_image_text,
+)
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
 if TYPE_CHECKING:
@@ -139,6 +144,8 @@ class AskImageTool:
         if tenant_of_ref != ctx.tenant_id:
             msg = "ask_image image_ref tenant does not match the run tenant"
             raise ToolBlockedError(msg)
+        if ref_str.startswith(WORKSPACE_REF_PREFIX):
+            await self._require_readable_workspace_image(ref_str)
         # Round-trip the image through the VL model. The provider adapter
         # resolves the ``image_ref`` content block to bytes via the same
         # shared resolver threaded into the VL caller (PR3 + PR4 + PR6).
@@ -161,6 +168,31 @@ class AskImageTool:
         if response.usage_metadata:
             meta["vl_usage"] = dict(response.usage_metadata)
         return ToolResult(content=answer, meta=meta)
+
+    async def _require_readable_workspace_image(self, ref_str: str) -> None:
+        """B-64 Task 7 回修第 2 轮 —— 工作区图读不出来就让**这一次工具调用**显式失败。
+
+        适配器那一层(``multimodal.resolve_message_images``)对读不出来的工作区图
+        降级成一段文字,因为另一个选择是整次 LLM 调用失败。到了 ``ask_image`` 这里,
+        那段文字会被交给 VL 模型,VL 回一句「看不到图」,主模型会把这句**当成看图的
+        结果** —— 该有失败信号的地方没有信号。所以这里先解析一次,失败就抛,文字与
+        Path A 的降级同一句(:func:`~orchestrator.multimodal.unreadable_workspace_image_text`),
+        VL 不被调用。抛 ``FileNotFoundError`` 是为了让 ``tools`` 节点把它包成
+        ``status="error"`` 的 ToolMessage、错误分类记成 ``resource_not_found``;
+        真实原因(权限、部署没接 NAS……)挂在 ``__cause__`` 上。
+
+        **这不保证 VL 永远拿不到降级文字。** 这次解析成功之后、VL caller 里的适配器
+        再解析之前,文件仍可能被删(留存清理、并发 run、同一沙箱里的 ``rm``);那个
+        窗口里命中,VL 收到的就是降级文字,不是崩溃。外层是
+        :class:`~orchestrator.multimodal.CachingImageResolver` 且这条 ref 可缓存时,
+        第二次解析多半命中本次填进去的缓存条目,但缓存有容量上限、可能被挤出,所以
+        窗口只是变小,没有关掉。代价是不可缓存的工作区 ref 每次多读一遍盘。
+        """
+        try:
+            await self.image_resolver.resolve(ref_str)
+        except Exception as exc:
+            figure = parse_rendered_figure_ref(ref_str)
+            raise FileNotFoundError(unreadable_workspace_image_text(figure)) from exc
 
 
 def _require_string(args: Mapping[str, Any], key: str) -> str:
