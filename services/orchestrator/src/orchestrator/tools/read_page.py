@@ -52,12 +52,11 @@ jpeg → glob 找产物。三个实测坑写进片段:
 7. **这一刀给下游带来的新形状**(回修第 5 轮 M-5,给 Task 7 留话)—— 同一页的
    **每个内容版本**现在各得一条独立 ref(以前是同一条),于是:
 
-   * :func:`orchestrator.state._merge_viewed_figures` 是**首次出现序 union**,
-     所以"编辑文档 → 重读第 3 页"会把**新旧两版**一起推进将来
-     ``_figure_block_tail`` 的滑窗,而**没有任何东西标注哪一版是当前的** ——
-     模型可能同时看到同一页的两个版本。这比旧行为好(旧行为是直接发旧字节),
-     但它是个新形状,不是自动就对。Task 7 做滑窗时要自己决定:是按
-     ``(doc-sha, unit)`` 只留最新一版,还是把"这是第几版"显式说给模型。
+   * :func:`orchestrator.state._merge_viewed_figures` 是 union,
+     所以"编辑文档 → 重读第 3 页"会把**新旧两版**一起推进
+     ``_figure_block_tail`` 的滑窗。Task 7 的处理:按 ``(doc-sha, unit)`` 只让
+     最近一次看到的那一版占像素槽,更早的版本在文字段里可见地标成旧版本(见
+     ``graph_builder.builder._figure_block_tail``)。
    * 每个内容版本在 ``.tool_results/<run_id>/`` 下**永久留一个 ``<render-sha>/``
      目录**,直到这条 run 被 purge(B-50 Task 12 的会话 purge + 留存 job 孤儿
      扫描收它)。一条 run 里反复编辑同一份文档会线性堆目录。

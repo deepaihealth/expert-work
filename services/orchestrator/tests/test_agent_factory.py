@@ -542,6 +542,28 @@ async def test_build_agent_supports_vision_propagates_from_manifest() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("vision", [True, False])
+async def test_build_agent_threads_supports_vision_into_the_graph(
+    monkeypatch: Any, vision: bool
+) -> None:
+    """B-64 —— Path A 的渲染页段靠 ``build_react_graph(supports_vision=...)`` 开关;
+    图的默认值是 ``False``,工厂不传就等于这个功能在生产上从没开过。"""
+    captured: dict[str, Any] = {}
+    from orchestrator.agent_factory import build_react_graph as real
+
+    def _spy(**kwargs: Any) -> Any:
+        captured["supports_vision"] = kwargs.get("supports_vision")
+        return real(**kwargs)
+
+    monkeypatch.setattr("orchestrator.agent_factory.build_react_graph", _spy)
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["model"]["supports_vision"] = vision
+    async with make_checkpointer("memory") as cp:
+        await _build(AgentSpec.model_validate(doc), secret_store=_secret_store(), checkpointer=cp)
+    assert captured["supports_vision"] is vision
+
+
+@pytest.mark.asyncio
 async def test_build_agent_ignores_vision_block_on_visual_model(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

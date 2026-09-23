@@ -1150,6 +1150,9 @@ async def build_agent(
         # search_files 的依赖, 也是每轮那段工作区快照的取数口 —— 块里列的与模型
         # ``list_dir .`` 看到的因此是同一棵树。``None``(没接 NAS 的单测)→ 不注入。
         workspace_store=env.workspace_store,
+        # B-64 —— Path A 的渲染页段只挂给能看图的主模型;与下面 ``BuiltAgent`` 用的
+        # 是同一个表达式。
+        supports_vision=spec.spec.model.supports_vision,
         workspace_ingest_node=workspace_ingest_node,
         inputs_node=inputs_node,
         # B-67 §七 —— 手抄守卫的提示只对 trusted 变量写链接名。
