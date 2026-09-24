@@ -88,13 +88,18 @@ def build_worker_end_frame(
     ``output_token_details``),消费者因此可以复用现成的解析,不必为
     worker 另写一套。
 
-    ``usage_by_model``(B-42)—— 同一笔账按 ``(provider, model)`` 分桶:
-    每桶 = ``{"provider", "model"}`` + 与 ``usage`` 同构的字段,桶的和等于
-    ``usage``。``usage`` 只说「烧了多少」不说「按谁的价」;worker 可以换
-    模型(``dynamic_workers.model``),父侧只知道主 Agent 的模型,没有这
-    张明细就只能整轮按主 Agent 的费率算 —— 线上 run f562fa69 里 95% 的
-    计价 token 来自 worker,全按错的价。分桶拿不到(模型未知)时同样
-    **不写这个键**,消费者退回按主 Agent 费率的老算法。
+    ``usage`` 覆盖这个 worker 这一段里**每一次**记了账的模型调用:它自己的回答(含
+    备用模型接管的)、规划、反思、对话压缩摘要、长期记忆的读写、看图;平台开销(安全
+    评审 / 重排序)不含。``llm_call_count`` 是同一批调用的次数。
+
+    ``usage_by_model``(B-42 / B-103)—— 同一笔账按**实际应答**的 ``(provider, model)``
+    分桶:每桶 = ``{"provider", "model"}`` + 与 ``usage`` 同构的字段,桶的和等于
+    ``usage``。一个 worker 可以有多个桶:worker 换了模型(``dynamic_workers.model``)、
+    备用模型接管、看图模型、routing 规则给规划 / 反思选的模型,各记各的名下(配置名,
+    不是厂商回显的别名)。``usage`` 只说「烧了多少」不说「按谁的价」,没有这张明细就
+    只能整轮按主 Agent 的费率算 —— 线上 run f562fa69 里 95% 的计价 token 来自 worker,
+    全按错的价。这一段**没有记账**(没接用量存储)时不写这个键,消费者退回按主 Agent
+    费率的老算法。
 
     没有它,父侧的每个消费者都只看得到主线消耗:前端 ``turn_summary.ts``
     第一行就是 ``if (evt.event !== "updates") continue;``,worker 事件整个

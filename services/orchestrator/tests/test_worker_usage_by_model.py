@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -144,6 +145,8 @@ async def test_worker_frame_buckets_the_main_model_and_the_vision_model_apart(
             row_totals.get((row.provider, row.model), 0) + row.input_tokens
         )
     assert row_totals == {k: b["input_tokens"] for k, b in buckets.items()}
+    # 调用次数与 usage 同一批:主模型两次 + 看图一次(消息里只有两条 AI 消息)。
+    assert end["data"]["llm_call_count"] == len(rows) == 3
 
 
 @dataclass
@@ -209,3 +212,75 @@ async def test_worker_frame_excludes_platform_overhead_and_keeps_reasoning() -> 
     assert buckets[_MAIN]["input_token_details"]["cache_read"] == 40
     assert data["usage"]["input_tokens"] == 100 + 7
     assert data["usage"]["output_token_details"] == {"reasoning": 6}
+    # 评审那次不计;消息里只有一条 AI 消息,次数来自记账。
+    assert data["llm_call_count"] == 2
+
+
+@dataclass
+class _InterleavedGraph:
+    """每记一次账就让出一次执行权,好让并行的兄弟 worker / 父侧交错记账。"""
+
+    middleware: TokenUsageMiddleware
+    calls: int
+    tokens: int
+
+    async def astream(self, state: Any, config: Any = None, *, stream_mode: Any = None) -> Any:
+        del state, config, stream_mode
+        for _ in range(self.calls):
+            usage = {
+                "input_tokens": self.tokens,
+                "output_tokens": 1,
+                "total_tokens": self.tokens + 1,
+            }
+            await _record(self.middleware, _stamped(None, usage))
+            await asyncio.sleep(0)
+        yield ("values", {"messages": [AIMessage(content="done")], "step_count": 1})
+
+
+def _labelled(store: InMemoryTokenUsageStore, model: str) -> TokenUsageMiddleware:
+    return TokenUsageMiddleware(
+        store=store, agent_name=model, agent_version="1", model=model, provider="p"
+    )
+
+
+@pytest.mark.asyncio
+async def test_parallel_workers_and_the_parent_never_share_a_ledger() -> None:
+    """父 run 并行派两个 worker(父侧并行工具调用走 gather),期间父侧自己也在记账:
+    每个 worker 的 end 帧只含它自己的桶,父侧的调用不进任何 worker 的帧,worker 的
+    调用也不进父侧(父侧若自己是 worker,它的账本)。"""
+    store = InMemoryTokenUsageStore()
+    frames_a: list[dict[str, Any]] = []
+    frames_b: list[dict[str, Any]] = []
+    parent_seen: list[MeteredCall] = []
+
+    async def _parent_metering() -> None:
+        for _ in range(3):
+            await _record(_labelled(store, "parent"), _stamped(None, _U))
+            await asyncio.sleep(0)
+
+    async def _worker(model: str, tokens: int, frames: list[dict[str, Any]]) -> None:
+        graph = _InterleavedGraph(middleware=_labelled(store, model), calls=3, tokens=tokens)
+        await run_child_to_result(
+            child=BuiltAgent(graph=graph, system_prompt="p", max_steps=5),  # type: ignore[arg-type]
+            task="t",
+            ctx=_worker_ctx(frames),
+            child_depth=1,
+            label="spawn_worker",
+            agent_ref="dynamic:general",
+            trajectory_recorder=None,
+            trajectory_metadata={},
+        )
+
+    with usage_tap(parent_seen.append):
+        await asyncio.gather(
+            _worker("A", 10, frames_a), _worker("B", 100, frames_b), _parent_metering()
+        )
+
+    def _buckets(frames: list[dict[str, Any]]) -> list[tuple[str, int]]:
+        return [(b["model"], b["input_tokens"]) for b in frames[-1]["data"]["usage_by_model"]]
+
+    assert _buckets(frames_a) == [("A", 30)]
+    assert _buckets(frames_b) == [("B", 300)]
+    assert [c.model for c in parent_seen] == ["parent"] * 3
+    # 三方的行都落了:串账只可能发生在帧上,不在行上。
+    assert len(await store.list_for_tenant(tenant_id=_TENANT)) == 9

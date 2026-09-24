@@ -304,7 +304,7 @@ async def run_child_to_result(
             metadata=trajectory_metadata,
         )
         if sink is not None:
-            partial_usage, partial_by_model = _worker_usage(ledger, partial_msgs)
+            partial = _worker_usage(ledger, partial_msgs)
             await _emit_worker_frame(
                 sink,
                 build_worker_end_frame(
@@ -312,10 +312,10 @@ async def run_child_to_result(
                     wseq=wseq,
                     outcome="cancelled",
                     iteration_used=partial_steps,
-                    llm_call_count=sum(1 for m in partial_msgs if isinstance(m, AIMessage)),
+                    llm_call_count=partial.llm_call_count,
                     wall_clock_ms=int((time.monotonic() - start_monotonic) * 1000),
-                    usage=partial_usage,
-                    usage_by_model=partial_by_model,
+                    usage=partial.usage,
+                    usage_by_model=partial.usage_by_model,
                 ),
             )
         raise
@@ -344,7 +344,7 @@ async def run_child_to_result(
         outcome = "failed"
 
     if sink is not None:
-        usage, usage_by_model = _worker_usage(ledger, messages)
+        frame_usage = _worker_usage(ledger, messages)
         await _emit_worker_frame(
             sink,
             build_worker_end_frame(
@@ -358,10 +358,10 @@ async def run_child_to_result(
                     else "success"
                 ),
                 iteration_used=step_count,
-                llm_call_count=llm_call_count,
+                llm_call_count=frame_usage.llm_call_count,
                 wall_clock_ms=wall_clock_ms,
-                usage=usage,
-                usage_by_model=usage_by_model,
+                usage=frame_usage.usage,
+                usage_by_model=frame_usage.usage_by_model,
             ),
         )
 
@@ -574,9 +574,12 @@ class _WorkerUsageLedger:
     """B-103 —— worker 这一段里记下的调用(:func:`~expert_work.runtime.middleware.usage_tap`)。
 
     收的是 ``TokenUsageMiddleware`` 落行时的同一份(同样的模型名、同样的「没有用量就不
-    记」),所以 end 帧与 ``token_usage`` 行对得上。平台开销(安全评审 / 重排序,
-    ``NON_BILLABLE_USAGE_KINDS``)不收:与 run 级 ``usage_by_model`` 及控制台合计同口径。
-    缓存命中的全 0 行没有 ``usage_metadata``,也不收(与按消息求和时一样)。
+    记」),所以 end 帧与这个 worker 的 ``token_usage`` 行对得上。只排除
+    ``NON_BILLABLE_USAGE_KINDS``(平台开销:安全评审 / 重排序),其余 kind 都收。对话构建
+    里剩下的全是 ``conversation``,于是与 run 级对外 ``usage_by_model``(只取
+    ``conversation``)一致;非对话构建(如 ``skill_evolution`` 回放)的帧收的是该构建的
+    kind,与 run 级对外视图不可比 —— 那类回放没有帧消费者。缓存命中的全 0 行没有
+    ``usage_metadata``,也不收(与按消息求和时一样)。
     """
 
     calls: list[MeteredCall] = field(default_factory=list)
@@ -587,22 +590,31 @@ class _WorkerUsageLedger:
         self.calls.append(call)
 
 
-def _worker_usage(
-    ledger: _WorkerUsageLedger, messages: Sequence[BaseMessage]
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
-    """worker end 帧的 ``(usage, usage_by_model)``。
+@dataclass(frozen=True)
+class _WorkerFrameUsage:
+    usage: dict[str, Any] | None
+    usage_by_model: list[dict[str, Any]] | None
+    llm_call_count: int
 
-    B-42 / B-103 —— ``usage_by_model`` 按**实际应答**的 ``(provider, model)`` 分桶,与
-    run 级 ``usage_by_model``(按 ``token_usage`` 行汇总)同口径:备用模型接管的调用记在
-    备用名下,worker 内的看图、规划、压缩、记忆调用各记在各自的模型名下;``usage`` 是
-    同一批调用的总和,桶的和恒等于它。
+
+def _worker_usage(ledger: _WorkerUsageLedger, messages: Sequence[BaseMessage]) -> _WorkerFrameUsage:
+    """worker end 帧的 ``usage`` / ``usage_by_model`` / ``llm_call_count``。
+
+    B-42 / B-103 —— ``usage_by_model`` 按**实际应答**的 ``(provider, model)`` 分桶:备用
+    模型接管的调用记在备用名下,worker 内的看图、规划、压缩、记忆调用各记在各自的模型
+    名下;``usage`` 是同一批调用的总和(桶的和恒等于它),``llm_call_count`` 是这批调用
+    的次数 —— 三个数说的是同一批调用。
 
     这一段一次都没记下(没接用量存储:测试 / 无控制面)→ 不知道谁应答的:``usage``
-    照旧按消息求和,``usage_by_model`` 缺席,消费者退回老算法;绝不编一个空桶列表让
-    「未知」变成「零成本」。
+    照旧按消息求和、``llm_call_count`` 按 AI 消息数,``usage_by_model`` 缺席,消费者
+    退回老算法;绝不编一个空桶列表让「未知」变成「零成本」。
     """
     if not ledger.calls:
-        return _usage_of(messages), None
+        return _WorkerFrameUsage(
+            usage=_usage_of(messages),
+            usage_by_model=None,
+            llm_call_count=sum(1 for msg in messages if isinstance(msg, AIMessage)),
+        )
     grouped: dict[tuple[str | None, str], list[Mapping[str, Any]]] = {}
     for call in ledger.calls:
         if call.usage_metadata is not None:
@@ -612,7 +624,11 @@ def _worker_usage(
         summed = _sum_usage(metadatas)
         if summed is not None:
             buckets.append({"provider": provider, "model": model, **summed})
-    return _sum_usage(call.usage_metadata for call in ledger.calls), buckets
+    return _WorkerFrameUsage(
+        usage=_sum_usage(call.usage_metadata for call in ledger.calls),
+        usage_by_model=buckets,
+        llm_call_count=len(ledger.calls),
+    )
 
 
 async def _fetch_partial(
