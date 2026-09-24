@@ -697,6 +697,7 @@ async def build_agent(
     # router shares the agent's wall-clock cap so a hung VL provider doesn't
     # outlive an otherwise-cancelled run.
     vl_caller: LLMCaller | None = None
+    quick_vl_caller: LLMCaller | None = None
     # B-64 Task 9 —— VL 调用的记账。主模型的用量由 after_llm_call 链上的
     # TokenUsageMiddleware 落行,那条链只在 agent 节点里跑;ask_image 在工具里直接调
     # vl_caller,绕开了它。没接用量存储时(测试 / 无控制面)两边都不记,VL 路由也不加
@@ -714,29 +715,42 @@ async def build_agent(
         vl_deadline_s = (
             float(max(manifest_dl, _VL_STREAM_DEADLINE_FLOOR_S)) if manifest_dl > 0 else None
         )
-        vl_caller = await build_llm_router(
-            vision_block.model,
-            secret_store=secret_store,
-            # B-64 Task 9 —— 记账要知道备用链上**实际应答**的是哪个模型,只有路由知道;
-            # 盖章层把应答句柄盖到响应上(见 ``orchestrator.vl_metering``)。
-            around_llm_chain=(
-                with_served_by(chains.around_llm_call)
-                if usage_store is not None
-                else chains.around_llm_call
-            ),
-            image_resolver=env.image_resolver,
-            first_token_timeout_s=vl_deadline_s,
-            # VL also streams (same OpenAI provider), so pass the same idle
-            # timer as chat — keep the VL floor for first-token only.
-            idle_timeout_s=_chat_idle_timeout_s(spec.spec.idle_timeout_s),
-            provider_timeout_s=vl_deadline_s,
-            # Mini-ADR J-33 — VL fallback chain (J.6.补强-4).
-            extra_fallbacks=list(vision_block.fallbacks),
-            provider_key_resolver=provider_key_resolver,
-            ignore_api_key_ref=True,  # Stream Y-2 (manifest-sourced VL model)
-            http_client=http_client,
-            rate_limiter_factory=rate_limiter_factory,
-        )
+
+        # B-64 Task 10 —— deep 路由 = 配置原样;quick 路由 = 同一条链上每个模型各自按
+        # 所属厂商「关思考 / 最低档」发送。两者只在模型规格上不同,记账盖章、超时、备用链
+        # 设置完全一样,所以同一个闭包建两次。
+        async def _vl_router(model: ModelSpec, fallbacks: list[ModelSpec]) -> LLMCaller:
+            return await build_llm_router(
+                model,
+                secret_store=secret_store,
+                # B-64 Task 9 —— 记账要知道备用链上**实际应答**的是哪个模型,只有路由知道;
+                # 盖章层把应答句柄盖到响应上(见 ``orchestrator.vl_metering``)。
+                around_llm_chain=(
+                    with_served_by(chains.around_llm_call)
+                    if usage_store is not None
+                    else chains.around_llm_call
+                ),
+                image_resolver=env.image_resolver,
+                first_token_timeout_s=vl_deadline_s,
+                # VL also streams (same OpenAI provider), so pass the same idle
+                # timer as chat — keep the VL floor for first-token only.
+                idle_timeout_s=_chat_idle_timeout_s(spec.spec.idle_timeout_s),
+                provider_timeout_s=vl_deadline_s,
+                # Mini-ADR J-33 — VL fallback chain (J.6.补强-4).
+                extra_fallbacks=fallbacks,
+                provider_key_resolver=provider_key_resolver,
+                ignore_api_key_ref=True,  # Stream Y-2 (manifest-sourced VL model)
+                http_client=http_client,
+                rate_limiter_factory=rate_limiter_factory,
+            )
+
+        vl_caller = await _vl_router(vision_block.model, list(vision_block.fallbacks))
+        quick_model = _thinking_off(vision_block.model)
+        quick_fallbacks = [_thinking_off(m) for m in vision_block.fallbacks]
+        # 整条链上没有一个模型能关思考(没有思考开关 / 目录外 / 已配成关)时 quick 与
+        # deep 相同,不建第二个路由。
+        if quick_model != vision_block.model or quick_fallbacks != list(vision_block.fallbacks):
+            quick_vl_caller = await _vl_router(quick_model, quick_fallbacks)
         if usage_store is not None:
             vl_chain = _flatten_chain(vision_block.model)
             for extra in vision_block.fallbacks:
@@ -862,6 +876,7 @@ async def build_agent(
         # (Path A wins), so ask_image is not wired in that case.
         vision=vision_block,
         vl_caller=vl_caller,
+        quick_vl_caller=quick_vl_caller,
         vl_usage_meter=vl_usage_meter,
         # Stream HX-12 — feeds the small-deferred-pool escape hatch.
         context_window=_resolved_context_window(spec.spec.model),
@@ -2165,6 +2180,25 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
         return {"enable_thinking": False}
     # doubao (budget) + toggle vendors (Kimi / GLM ≤5.1) share the disabled shape.
     return {"thinking": {"type": "disabled"}}
+
+
+def _thinking_off(model: ModelSpec) -> ModelSpec:
+    """B-64 Task 10 —— ``ask_image`` 快看用的模型规格:能关思考的都设 ``thinking_enabled=False``。
+
+    不另写厂商映射:``thinking_enabled=False`` 在构建 provider 时经 :func:`_thinking_payload`
+    落到 :func:`_thinking_disable_payload`(anthropic 走 provider 自己的
+    ``thinking: {type: disabled}``),与 Agent 配置里关掉思考是同一条路。目录里没有思考开关
+    (``entry.thinking is None``)或不在目录里的模型原样返回 —— 给它们设 ``thinking_enabled``
+    会被构建期闸门拒掉。备用树逐个节点各自判断。
+    """
+    entry = catalog_entry(model.provider, model.name)
+    update: dict[str, Any] = {}
+    if entry is not None and entry.thinking is not None and model.thinking_enabled is not False:
+        update["thinking_enabled"] = False
+    fallback = [_thinking_off(child) for child in model.fallback]
+    if fallback != model.fallback:
+        update["fallback"] = fallback
+    return model.model_copy(update=update) if update else model
 
 
 def _thinking_payload(model: ModelSpec) -> dict[str, Any] | None:

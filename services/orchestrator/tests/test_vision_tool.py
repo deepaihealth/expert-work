@@ -85,7 +85,7 @@ async def test_ask_image_happy_path() -> None:
     result = await tool.call({"image_ref": ref, "question": "what is this?"}, ctx=_ctx())
 
     assert result.content == "a red apple on a desk"
-    assert result.meta == {"image_ref": ref}
+    assert result.meta == {"image_ref": ref, "depth": "quick"}
     # The VL caller saw a system prompt + a human message with the image_ref block.
     sent = vl.calls[0]["messages"]
     assert isinstance(sent[0], SystemMessage)
@@ -108,7 +108,7 @@ async def test_ask_image_meta_carries_vl_usage_when_present() -> None:
 
     result = await tool.call({"image_ref": ref, "question": "what is this?"}, ctx=_ctx())
 
-    assert result.meta == {"image_ref": ref, "vl_usage": usage}
+    assert result.meta == {"image_ref": ref, "depth": "quick", "vl_usage": usage}
 
 
 @pytest.mark.asyncio
@@ -587,7 +587,7 @@ async def test_ask_image_without_a_workspace_store_has_no_short_form() -> None:
     """没接工作区存储:短形态不存在 —— 调用被拒,描述与参数里也不许提它。"""
     tool = AskImageTool(vl_caller=_FakeVLCaller(), image_resolver=_resolver())
     spec = tool.spec
-    assert set(spec.parameters["properties"]) == {"image_ref", "question"}
+    assert set(spec.parameters["properties"]) == {"image_ref", "question", "depth"}
     for word in ("path", "unit", "read_page"):
         assert word not in spec.description
         assert word not in str(spec.parameters)

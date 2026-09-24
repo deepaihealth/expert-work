@@ -18,13 +18,15 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 13.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Mapping
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import UUID
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.protocol.multimodal import (
@@ -59,6 +61,23 @@ _SYSTEM_PROMPT = (
 )
 
 
+#: B-64 Task 10 —— 一次 ``ask_image`` 的 VL 调用整体限时(秒)。数字取自 hermes-agent
+#: ``vision_analyze`` 看图调用的默认超时,**不是自拍的数**。路由自己的首 token / 空闲
+#: 超时对「一直在吐思考 token」的推理模型不触发(实测同类问题 11s 与 234s 两次),
+#: 所以这里在工具层再加一道整体上限。
+ASK_IMAGE_TIMEOUT_S = 120.0
+
+AskImageDepth = Literal["quick", "deep"]
+_DEPTHS: tuple[AskImageDepth, ...] = ("quick", "deep")
+
+_DEPTH_DESCRIPTION = (
+    "Optional, default 'quick': the vision model answers with thinking off (or its lowest "
+    "thinking tier) — right for reading text, recognising content, finding numbers. Pass "
+    "'deep' only when the answer needs reasoning, e.g. inferring a chart trend or "
+    "understanding a complex layout; it is much slower."
+)
+
+
 class VLUsageMeter(Protocol):
     """B-64 Task 9 —— 一次 VL 调用的记账回调(实现见 ``orchestrator.vl_metering``)。"""
 
@@ -87,6 +106,12 @@ class AskImageTool:
     #: B-64 Task 9 —— VL 调用落 ``token_usage`` 的记账回调。``None`` = 这次构建没接
     #: 用量存储(测试 / 无控制面),与主模型那边不装 ``TokenUsageMiddleware`` 同义。
     usage_meter: VLUsageMeter | None = None
+    #: B-64 Task 10 —— ``depth="quick"``(默认)走的路由:看图模型按各自厂商的「关思考 /
+    #: 最低档」发送。``None`` = 与 ``vl_caller`` 相同(整条链上没有可关的思考),
+    #: quick 与 deep 走同一条路由。
+    quick_vl_caller: LLMCaller | None = None
+    #: B-64 Task 10 —— 单次 VL 调用的整体上限;只有测试会改它。
+    timeout_s: float = ASK_IMAGE_TIMEOUT_S
 
     @property
     def spec(self) -> ToolSpec:
@@ -99,7 +124,9 @@ class AskImageTool:
                 "it. ``image_ref`` must be a ``expert_work://image/...`` reference the "
                 "user message attached. Ask narrow, specific questions; call "
                 "ask_image repeatedly with sharper follow-ups if the first "
-                "answer is too vague — the image stays accessible."
+                "answer is too vague — the image stays accessible. By default it is "
+                "a quick look (good for reading text and numbers); pass "
+                "depth='deep' only for questions that need reasoning."
             ),
             parameters={
                 "type": "object",
@@ -113,6 +140,11 @@ class AskImageTool:
                     "question": {
                         "type": "string",
                         "description": "What to ask about the image — be specific.",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": list(_DEPTHS),
+                        "description": _DEPTH_DESCRIPTION,
                     },
                 },
                 "required": ["image_ref", "question"],
@@ -128,6 +160,7 @@ class AskImageTool:
             raise ToolBlockedError(msg)
         ref_str, resolved_from = await self._image_ref_from_args(args, ctx=ctx)
         question = _require_string(args, "question")
+        depth = _require_depth(args)
         # B-64 —— 工作区 ref(平台渲出来的文档页)与上传 ref 走两套互相独立的
         # 校验器:parse_workspace_image_ref 是 parse_image_ref 的**兄弟**,不是
         # 分支(见它的 docstring)。但租户校验必须对两条路都执行到 —— 新 scheme
@@ -180,8 +213,11 @@ class AskImageTool:
                 ]
             ),
         ]
+        caller = self.vl_caller
+        if depth == "quick" and self.quick_vl_caller is not None:
+            caller = self.quick_vl_caller
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-            response = await self.vl_caller(messages=messages, tools=[])
+            response = await self._call_with_limit(caller, messages, depth=depth, ctx=ctx)
         # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
         # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
         # 两样都不做,也与主模型一致。
@@ -193,12 +229,46 @@ class AskImageTool:
         # Surface VL provenance in the ToolMessage artifact (event stream /
         # audit): the image ref plus the VL call's token usage — otherwise the
         # separate VL round-trip's cost is invisible (the tool only returns text).
-        meta: dict[str, Any] = {"image_ref": ref_str}
+        meta: dict[str, Any] = {"image_ref": ref_str, "depth": depth}
         if resolved_from is not None:
             meta["resolved_from"] = resolved_from
         if response.usage_metadata:
             meta["vl_usage"] = dict(response.usage_metadata)
         return ToolResult(content=answer, meta=meta)
+
+    async def _call_with_limit(
+        self,
+        caller: LLMCaller,
+        messages: Sequence[BaseMessage],
+        *,
+        depth: AskImageDepth,
+        ctx: ToolContext,
+    ) -> AIMessage:
+        """B-64 Task 10 —— 一次 VL 调用,整体不超过 ``timeout_s``,也不超过 run 的剩余时间。
+
+        超时由 ``asyncio.timeout`` 取消正在 await 的调用 —— 取消一路传进路由与厂商适配器,
+        底层流随之关闭,不是只停止等待。超时抛 ``TimeoutError``:``tools`` 节点把它包成
+        ``status="error"`` 的 ToolMessage、错误分类记成 ``transient``。调用没有返回,
+        所以调用方不扣池也不记账(与 Task 9「失败不记账」一致)。
+        """
+        limit_s = self.timeout_s
+        by_run_deadline = False
+        if ctx.deadline_at is not None:
+            remaining_s = ctx.deadline_at - time.monotonic()
+            if remaining_s < limit_s:
+                limit_s, by_run_deadline = remaining_s, True
+        if limit_s <= 0:
+            msg = "ask_image was not run: this run has no time left before its deadline."
+            raise TimeoutError(msg)
+        limit = asyncio.timeout(limit_s)
+        try:
+            async with limit:
+                return await caller(messages=messages, tools=[])
+        except TimeoutError as exc:
+            # 只改写本层限时触发的那一种;调用自己抛出的 TimeoutError 原样上抛。
+            if not limit.expired():
+                raise
+            raise TimeoutError(_timeout_message(limit_s, depth, by_run_deadline)) from exc
 
     async def _image_ref_from_args(
         self, args: Mapping[str, Any], *, ctx: ToolContext
@@ -300,7 +370,9 @@ def _spec_with_short_form() -> ToolSpec:
             "(2) 'image_ref' — an ``expert_work://image/...`` reference attached to the "
             "user message, for images the user uploaded. Ask narrow, specific questions; "
             "call ask_image repeatedly with sharper follow-ups if the first answer is too "
-            "vague — the image stays accessible."
+            "vague — the image stays accessible. By default it is a quick look (good for "
+            "reading text, recognising content, finding numbers); pass depth='deep' only "
+            "for questions that need reasoning, such as a chart's trend or a complex layout."
         ),
         parameters={
             "type": "object",
@@ -331,12 +403,41 @@ def _spec_with_short_form() -> ToolSpec:
                     "type": "string",
                     "description": "What to ask about the image — be specific.",
                 },
+                "depth": {
+                    "type": "string",
+                    "enum": list(_DEPTHS),
+                    "description": _DEPTH_DESCRIPTION,
+                },
             },
             "required": ["question"],
         },
         # Stream L.L6 — VL LLM call against an immutable image reference. Pure read.
         is_read_only=True,
     )
+
+
+def _timeout_message(limit_s: float, depth: AskImageDepth, by_run_deadline: bool) -> str:
+    seconds = f"{limit_s:.0f} seconds"
+    if by_run_deadline:
+        seconds += ", the time this run had left"
+    msg = (
+        f"ask_image timed out ({seconds}) and got no answer from the vision model. "
+        "You can try again with a more specific, narrower question"
+    )
+    if depth == "deep":
+        return msg + "; since this call used depth='deep', try the default quick look first."
+    return msg + "."
+
+
+def _require_depth(args: Mapping[str, Any]) -> AskImageDepth:
+    raw = args.get("depth")
+    if raw is None:
+        return "quick"
+    for depth in _DEPTHS:
+        if raw == depth:
+            return depth
+    msg = f"ask_image 'depth' must be one of {list(_DEPTHS)}, got {raw!r}"
+    raise ValueError(msg)
 
 
 def _given(args: Mapping[str, Any], key: str) -> bool:

@@ -216,6 +216,7 @@ async def build_tool_registry(
     knowledge: KnowledgeSpec | None = None,
     vision: VisionSpec | None = None,
     vl_caller: LLMCaller | None = None,
+    quick_vl_caller: LLMCaller | None = None,
     vl_usage_meter: VLUsageMeter | None = None,
     context_window: int | None = None,
     supports_vision: bool = False,
@@ -239,6 +240,8 @@ async def build_tool_registry(
     its presence activates the ``ask_image`` tool, which routes to the
     declared VL model via ``vl_caller``. ``vl_usage_meter`` (B-64 Task 9)
     records each VL call into ``token_usage``; ``None`` records nothing.
+    ``quick_vl_caller`` (B-64 Task 10) is the thinking-off VL router behind
+    ``ask_image``'s default ``depth="quick"``; ``None`` = same as ``vl_caller``.
 
     ``supports_vision`` (B-64) is the main model's native image input
     (manifest ``model.supports_vision``). Together with ``vision`` it decides
@@ -321,7 +324,7 @@ async def build_tool_registry(
     _register_subagents(registry, subagents, tool_env, subagent_depth)
     _register_spawn_worker(registry, tool_env, parent_spec, dynamic_workers, subagent_depth)
     _register_knowledge_search(registry, knowledge, tool_env)
-    _register_ask_image(registry, vision, tool_env, vl_caller, vl_usage_meter)
+    _register_ask_image(registry, vision, tool_env, vl_caller, quick_vl_caller, vl_usage_meter)
     # Stream HX-12 (Mini-ADR HX-I3) — small-pool escape hatch: when the
     # whole deferred pool fits comfortably in context, defer is pure
     # overhead (a find_tools round-trip per capability); activate it all.
@@ -444,6 +447,7 @@ def _register_ask_image(
     vision: VisionSpec | None,
     env: ToolEnv,
     vl_caller: LLMCaller | None,
+    quick_vl_caller: LLMCaller | None,
     vl_usage_meter: VLUsageMeter | None,
 ) -> None:
     """Register the ``ask_image`` tool when the manifest declares a
@@ -470,6 +474,7 @@ def _register_ask_image(
             image_resolver=env.image_resolver,
             workspace_store=env.workspace_store,
             usage_meter=vl_usage_meter,
+            quick_vl_caller=quick_vl_caller,
         )
     )
 
