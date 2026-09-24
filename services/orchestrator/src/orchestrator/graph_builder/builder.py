@@ -211,6 +211,7 @@ from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
+from orchestrator.usage_metering import without_served_by
 
 logger = logging.getLogger(__name__)
 
@@ -1338,6 +1339,9 @@ def build_react_graph(
             # P2 — stamp last: everything above (DLP / structured resend /
             # judge) may have rebound ``response``; stamping earlier would
             # be silently overwritten on the happy path.
+            # B-102 —— 实际应答模型的章只给记账(after-chain 已跑完),写 state 前剥掉。
+            # 这里是本轮所有落 state 的消息的唯一出口,主响应与结构化重发的候选都经过它。
+            persisted_messages = without_served_by(persisted_messages)
             persisted_messages = _stamp_agent_messages(persisted_messages, config)
             looped_this_turn = bool(ctx.payload.get("loop_detected")) or primary_loop_detected
             mw_exit_reason = _exit_reason_for(persisted_messages, budget_reason=budget_reason)
@@ -1384,6 +1388,7 @@ def build_react_graph(
         if dispatch_message is not None:
             emit_messages = [dispatch_message, *emit_messages]
         # P2 — same rationale as the middleware path above: stamp last.
+        emit_messages = without_served_by(emit_messages)  # B-102 —— 同上
         emit_messages = _stamp_agent_messages(emit_messages, config)
         plain_exit_reason = _exit_reason_for(emit_messages, budget_reason=budget_reason)
         update_plain: dict[str, Any] = {

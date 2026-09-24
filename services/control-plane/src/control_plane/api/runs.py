@@ -101,6 +101,7 @@ from expert_work.persistence.rls import current_user_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.token_usage_store import (
+    NON_BILLABLE_USAGE_KINDS,
     ModelTokenTotals,
     TokenTotals,
     TokenUsageStore,
@@ -1811,7 +1812,10 @@ def build_runs_router() -> APIRouter:
             # tenant GUC, set by applied_scope).
             tokens: dict[str, Any] | None = None
             if trace_id is not None:
-                totals = await token_usage.totals_by_trace_ids([trace_id])
+                # B-104 —— 租户侧合计与账单同口径:平台开销(评审 / 重排序)不计。
+                totals = await token_usage.totals_by_trace_ids(
+                    [trace_id], exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS
+                )
                 tokens = _tokens_to_dict(totals.get(trace_id))
         return JSONResponse(
             content={
@@ -2119,7 +2123,13 @@ def build_runs_router() -> APIRouter:
             trace_ids = sorted({r.trace_id for r in rows if r.trace_id is not None})
             try:
                 async with applied_scope(scope):
-                    by_trace = await token_usage.totals_by_trace_ids(trace_ids) if trace_ids else {}
+                    by_trace = (
+                        await token_usage.totals_by_trace_ids(
+                            trace_ids, exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS
+                        )
+                        if trace_ids
+                        else {}
+                    )
             except Exception:
                 logger.warning("thread_runs.tokens_failed", exc_info=True)
                 by_trace = {}
@@ -2698,7 +2708,13 @@ def build_runs_list_router() -> APIRouter:
             # inside the same scope, so no cross-tenant bleed. A run with no
             # trace_id / no recorded usage maps to None.
             trace_ids = [i.trace_id for i in items if i.trace_id]
-            tokens_by_trace = await token_usage.totals_by_trace_ids(trace_ids) if trace_ids else {}
+            tokens_by_trace = (
+                await token_usage.totals_by_trace_ids(
+                    trace_ids, exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS
+                )
+                if trace_ids
+                else {}
+            )
 
         items_json = [
             _run_to_dict(

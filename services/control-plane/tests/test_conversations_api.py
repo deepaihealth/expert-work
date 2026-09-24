@@ -25,7 +25,10 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.feedback_store import FeedbackRecord
-from expert_work.persistence.token_usage_store import TokenUsageRecord
+from expert_work.persistence.token_usage_store import (
+    PLATFORM_OVERHEAD_USAGE_KIND,
+    TokenUsageRecord,
+)
 from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -639,3 +642,32 @@ async def test_roleless_employee_cannot_search_transcripts(
     client, _ = client_and_threads
     resp = await client.get("/v1/conversations", params={"q": "refund"}, headers=_employee())
     assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_conversation_totals_leave_out_platform_overhead(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """B-104 —— 评审 / 重排序的 ``platform_overhead`` 与 run 同 trace,但不计费:
+    会话列表与详情的合计与账单同口径,不含它。"""
+    client, ids = client_and_threads
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.token_usage_store.insert(
+        TokenUsageRecord(
+            tenant_id=_TENANT,
+            agent_name="alpha",
+            agent_version="1.0.0",
+            model="qwen-max",
+            input_tokens=7000,
+            output_tokens=700,
+            trace_id="tr-1",
+            usage_kind=PLATFORM_OVERHEAD_USAGE_KIND,
+        )
+    )
+
+    items = {
+        i["thread_id"]: i for i in (await client.get("/v1/conversations")).json()["data"]["items"]
+    }
+    assert items[str(ids["convo"])]["tokens"]["input_tokens"] == 150
+    detail = (await client.get(f"/v1/conversations/{ids['convo']}")).json()["data"]
+    assert sorted(r["tokens"]["input_tokens"] for r in detail["runs"]) == [50, 100]

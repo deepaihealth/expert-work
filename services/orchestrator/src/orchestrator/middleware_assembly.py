@@ -42,6 +42,7 @@ from expert_work.runtime.middleware import (
     TokenUsageMiddleware,
 )
 from expert_work.runtime.tokens import TokenEstimator, estimate_message
+from orchestrator.usage_metering import ServedModelResolver, chain_models
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,11 @@ def build_middleware_chains(
                 provider=model.provider,
                 estimator=estimator,
                 usage_kind=token_usage_kind,
+                # B-102 —— 记在实际应答的模型名下(备用接管时是备用的配置名);agent 构建
+                # 给主循环路由加了盖章层(``orchestrator.usage_metering``)。
+                served_by=ServedModelResolver(
+                    default=(model.provider, model.name), models=chain_models(model)
+                ),
             )
         )
 

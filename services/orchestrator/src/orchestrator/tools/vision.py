@@ -80,7 +80,7 @@ _DEPTH_DESCRIPTION = (
 
 
 class VLUsageMeter(Protocol):
-    """B-64 Task 9 —— 一次 VL 调用的记账回调(实现见 ``orchestrator.vl_metering``)。"""
+    """B-64 Task 9 —— 一次 VL 调用的记账回调(实现见 ``orchestrator.usage_metering``)。"""
 
     async def __call__(
         self, response: AIMessage, *, tenant_id: UUID, user_id: UUID | None

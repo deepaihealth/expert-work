@@ -2771,3 +2771,65 @@ async def test_stream_run_carries_image_refs_into_delegation_context(
         await response.aread()
 
     assert captured[0]["graph_input"]["turn_image_refs"] == [ref]
+
+
+@pytest.mark.asyncio
+async def test_run_token_totals_leave_out_platform_overhead(runs_client: AsyncClient) -> None:
+    """B-104 —— 评审 / 重排序的 ``platform_overhead`` 与 run 同 trace,但不计费:run 详情、
+    会话的 run 列表、全局 run 列表的合计都与账单同口径,不含它。"""
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from expert_work.persistence.token_usage_store import (
+        PLATFORM_OVERHEAD_USAGE_KIND,
+        TokenUsageRecord,
+    )
+    from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
+
+    thread_id = await _create_session(runs_client)
+    run_id = uuid4()
+    trace = "b104b104b104b104b104b104b104b104"
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    await app.state.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=DEFAULT_DEV_TENANT_ID,
+            thread_id=UUID(thread_id),
+            user_id=None,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+            trace_id=trace,
+        )
+    )
+    for kind, model, inp in (
+        ("conversation", "claude-sonnet-4-6", 100),
+        (PLATFORM_OVERHEAD_USAGE_KIND, "qwen-max", 9000),
+    ):
+        await app.state.token_usage_store.insert(
+            TokenUsageRecord(
+                tenant_id=DEFAULT_DEV_TENANT_ID,
+                agent_name="code-reviewer",
+                agent_version="1.0.0",
+                model=model,
+                trace_id=trace,
+                input_tokens=inp,
+                output_tokens=0,
+                usage_kind=kind,
+            )
+        )
+
+    detail = (await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")).json()
+    assert (detail["tokens"]["input_tokens"], detail["tokens"]["models"]) == (
+        100,
+        ["claude-sonnet-4-6"],
+    )
+    thread_runs = (await runs_client.get(f"/v1/sessions/{thread_id}/runs")).json()["data"]["runs"]
+    assert [r["tokens"]["input_tokens"] for r in thread_runs] == [100]
+    listed = {i["run_id"]: i for i in (await runs_client.get("/v1/runs")).json()["data"]["items"]}
+    assert listed[str(run_id)]["tokens"]["input_tokens"] == 100

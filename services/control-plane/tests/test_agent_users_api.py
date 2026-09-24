@@ -20,7 +20,10 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.persistence.token_usage_store import TokenUsageRecord
+from expert_work.persistence.token_usage_store import (
+    PLATFORM_OVERHEAD_USAGE_KIND,
+    TokenUsageRecord,
+)
 from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -407,3 +410,30 @@ async def test_users_cross_tenant_scope_is_rejected(
     client, _, _ = client_and_users
     resp = await client.get("/v1/users", params={"tenant_id": "*"})
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_rollup_leaves_out_platform_overhead(
+    client_and_users: tuple[AsyncClient, UUID, UUID],
+) -> None:
+    """B-104 —— 用户合计与账单同口径:评审 / 重排序的平台开销不计。"""
+    client, alice_id, _ = client_and_users
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    await app.state.token_usage_store.insert(
+        TokenUsageRecord(
+            tenant_id=_TENANT,
+            agent_name="alpha",
+            agent_version="1.0.0",
+            model="qwen-max",
+            user_id=alice_id,
+            input_tokens=5000,
+            output_tokens=500,
+            usage_kind=PLATFORM_OVERHEAD_USAGE_KIND,
+        )
+    )
+
+    items = {
+        i["user_id"]: i
+        for i in (await client.get("/v1/agents/alpha/1.0.0/users")).json()["data"]["items"]
+    }
+    assert items[str(alice_id)]["tokens"]["input_tokens"] == 100

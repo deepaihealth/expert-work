@@ -145,6 +145,15 @@ def _totals_from_buckets(buckets: Sequence[ModelTokenTotals]) -> TokenTotals:
     )
 
 
+#: B-104 —— run 内用**平台模型**的调用(输出 / 工具调用安全评审、知识库 / 记忆重排序)
+#: 记这个 kind:运营用量页按 kind 可见、计入 run 的 token 熔断;不进对外对话用量
+#: (对外口径只取 ``conversation``),也不进客户账单(billing rollup 跳过它)。
+PLATFORM_OVERHEAD_USAGE_KIND = "platform_overhead"
+#: 不进租户侧合计的 kind:客户账单、控制台 run / 会话 / agent 用户合计、用量页总计
+#: 都排除它们(只在用量页「按用途」表里单列)。与对外口径、账单口径一致。
+NON_BILLABLE_USAGE_KINDS: tuple[str, ...] = (PLATFORM_OVERHEAD_USAGE_KIND,)
+
+
 @dataclass(frozen=True)
 class TokenUsageRecord:
     """One LLM-call row. ``id`` / ``observed_at`` are ``None`` pre-insert."""
@@ -235,7 +244,11 @@ class TokenUsageStore(abc.ABC):
 
     @abc.abstractmethod
     async def totals_by_trace_ids(
-        self, trace_ids: Sequence[str], *, usage_kinds: Sequence[str] | None = None
+        self,
+        trace_ids: Sequence[str],
+        *,
+        usage_kinds: Sequence[str] | None = None,
+        exclude_usage_kinds: Sequence[str] | None = None,
     ) -> dict[str, TokenTotals]:
         """Sum token usage grouped by ``trace_id`` for the given ids.
 
@@ -252,6 +265,10 @@ class TokenUsageStore(abc.ABC):
         the platform's own spend, and billing them to the caller would charge
         for our internal pipelines.
 
+        B-104 —— ``exclude_usage_kinds`` drops those kinds (applied after
+        ``usage_kinds``). The console's tenant-facing totals pass
+        :data:`NON_BILLABLE_USAGE_KINDS` so they match the bill.
+
         A trace whose rows are *all* filtered out is **absent** from the result
         rather than present with zeroes — absent means "no record", which the
         external frame renders as a missing field, while an empty bucket list
@@ -265,6 +282,7 @@ class TokenUsageStore(abc.ABC):
         agent_name: str,
         agent_version: str,
         user_ids: Sequence[UUID],
+        exclude_usage_kinds: Sequence[str] | None = None,
     ) -> dict[UUID, TokenTotals]:
         """Sum token usage per ``user_id`` for one agent version.
 
@@ -275,6 +293,9 @@ class TokenUsageStore(abc.ABC):
         trace join**. Tenant scoping rides on the RLS context, like
         :meth:`list_for_tenant`. Users with no recorded usage are absent
         from the result; the caller treats a missing id as zero.
+
+        B-104 —— ``exclude_usage_kinds`` drops those kinds (the console passes
+        :data:`NON_BILLABLE_USAGE_KINDS`).
         """
 
     @abc.abstractmethod
@@ -351,11 +372,16 @@ class InMemoryTokenUsageStore(TokenUsageStore):
         ]
 
     async def totals_by_trace_ids(
-        self, trace_ids: Sequence[str], *, usage_kinds: Sequence[str] | None = None
+        self,
+        trace_ids: Sequence[str],
+        *,
+        usage_kinds: Sequence[str] | None = None,
+        exclude_usage_kinds: Sequence[str] | None = None,
     ) -> dict[str, TokenTotals]:
         wanted = {t for t in trace_ids if t}
         # B-52 — same predicate as the SQL store: empty / None means no filter.
         kinds = set(usage_kinds) if usage_kinds else None
+        excluded = set(exclude_usage_kinds or ())
         # (trace_id, provider, model) → running bucket; folded per trace below.
         buckets: dict[tuple[str, str | None, str], ModelTokenTotals] = {}
         for r in self._rows:
@@ -363,6 +389,8 @@ class InMemoryTokenUsageStore(TokenUsageStore):
             if tid is None or tid not in wanted:
                 continue
             if kinds is not None and r.usage_kind not in kinds:
+                continue
+            if r.usage_kind in excluded:
                 continue
             key = (tid, r.provider, r.model)
             prev = buckets.get(key) or ModelTokenTotals(provider=r.provider, model=r.model)
@@ -385,8 +413,10 @@ class InMemoryTokenUsageStore(TokenUsageStore):
         agent_name: str,
         agent_version: str,
         user_ids: Sequence[UUID],
+        exclude_usage_kinds: Sequence[str] | None = None,
     ) -> dict[UUID, TokenTotals]:
         wanted = set(user_ids)
+        excluded = set(exclude_usage_kinds or ())
         grouped: dict[UUID, list[TokenUsageRecord]] = {}
         for r in self._rows:
             if (
@@ -394,6 +424,7 @@ class InMemoryTokenUsageStore(TokenUsageStore):
                 or r.user_id not in wanted
                 or r.agent_name != agent_name
                 or r.agent_version != agent_version
+                or r.usage_kind in excluded
             ):
                 continue
             grouped.setdefault(r.user_id, []).append(r)
@@ -575,7 +606,11 @@ class DbTokenUsageStore(TokenUsageStore):
         return out
 
     async def totals_by_trace_ids(
-        self, trace_ids: Sequence[str], *, usage_kinds: Sequence[str] | None = None
+        self,
+        trace_ids: Sequence[str],
+        *,
+        usage_kinds: Sequence[str] | None = None,
+        exclude_usage_kinds: Sequence[str] | None = None,
     ) -> dict[str, TokenTotals]:
         ids = [t for t in dict.fromkeys(trace_ids) if t]  # dedup, drop empty
         if not ids:
@@ -603,6 +638,8 @@ class DbTokenUsageStore(TokenUsageStore):
         # B-52 — same predicate as the in-memory store: empty / None means no filter.
         if usage_kinds:
             stmt = stmt.where(TokenUsageRow.usage_kind.in_(list(usage_kinds)))
+        if exclude_usage_kinds:
+            stmt = stmt.where(TokenUsageRow.usage_kind.not_in(list(exclude_usage_kinds)))
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
         per_trace: dict[str, list[ModelTokenTotals]] = {}
@@ -628,6 +665,7 @@ class DbTokenUsageStore(TokenUsageStore):
         agent_name: str,
         agent_version: str,
         user_ids: Sequence[UUID],
+        exclude_usage_kinds: Sequence[str] | None = None,
     ) -> dict[UUID, TokenTotals]:
         ids = list(dict.fromkeys(user_ids))
         if not ids:
@@ -651,6 +689,8 @@ class DbTokenUsageStore(TokenUsageStore):
             )
             .group_by(TokenUsageRow.user_id)
         )
+        if exclude_usage_kinds:
+            stmt = stmt.where(TokenUsageRow.usage_kind.not_in(list(exclude_usage_kinds)))
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
         return {

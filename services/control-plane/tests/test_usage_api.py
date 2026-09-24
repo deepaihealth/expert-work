@@ -288,6 +288,78 @@ async def test_tokens_by_kind_split_and_filter(ctx: _Ctx) -> None:
     assert {g["key"] for g in filtered["by_kind"]} == {"skill_evolution"}
 
 
+@pytest.mark.asyncio
+async def test_tokens_totals_leave_out_platform_overhead(ctx: _Ctx) -> None:
+    """B-104 —— 平台开销只在按用途表里单列,总计与按 agent / 模型的合计与账单同口径。"""
+    for kind, model, inp in (
+        ("conversation", "m1", 10),
+        ("platform_overhead", "judge-m", 70),
+    ):
+        await ctx.usage.insert(
+            TokenUsageRecord(
+                tenant_id=ctx.tenant_id,
+                agent_name="a1",
+                agent_version="1",
+                model=model,
+                usage_kind=kind,
+                input_tokens=inp,
+                output_tokens=1,
+            )
+        )
+    data = (await ctx.client.get("/v1/usage/tokens", headers=ctx.headers)).json()["data"]
+    assert data["total"]["input_tokens"] == 10
+    assert [(g["key"], g["input_tokens"]) for g in data["by_agent"]] == [("a1", 10)]
+    assert [g["key"] for g in data["by_model"]] == ["m1"]
+    assert {g["key"]: g["input_tokens"] for g in data["by_kind"]} == {
+        "conversation": 10,
+        "platform_overhead": 70,
+    }
+
+    # 显式按 kind 查平台开销时照常汇总总量;租户侧看不到平台评审 / 重排序用的模型。
+    only = (
+        await ctx.client.get("/v1/usage/tokens?kind=platform_overhead", headers=ctx.headers)
+    ).json()["data"]
+    assert only["total"]["input_tokens"] == 70
+    assert [(g["key"], g["input_tokens"]) for g in only["by_agent"]] == [("a1", 70)]
+    assert only["by_model"] == []
+    assert "judge-m" not in str(only)
+
+
+@pytest.mark.asyncio
+async def test_system_admin_sees_platform_overhead_models(ctx: _Ctx) -> None:
+    """平台系统管理员查平台开销时保留按模型的明细;默认视图仍不进合计。"""
+    for kind, model, inp in (
+        ("conversation", "m1", 10),
+        ("platform_overhead", "judge-m", 70),
+    ):
+        await ctx.usage.insert(
+            TokenUsageRecord(
+                tenant_id=ctx.tenant_id,
+                agent_name="a1",
+                agent_version="1",
+                model=model,
+                usage_kind=kind,
+                input_tokens=inp,
+                output_tokens=1,
+            )
+        )
+    headers = await grant_system_admin(ctx.client)
+    params = {"tenant_id": str(ctx.tenant_id)}
+
+    default = (await ctx.client.get("/v1/usage/tokens", params=params, headers=headers)).json()[
+        "data"
+    ]
+    assert [g["key"] for g in default["by_model"]] == ["m1"]
+
+    only = (
+        await ctx.client.get(
+            "/v1/usage/tokens", params={**params, "kind": "platform_overhead"}, headers=headers
+        )
+    ).json()["data"]
+    assert only["total"]["input_tokens"] == 70
+    assert [(g["key"], g["input_tokens"]) for g in only["by_model"]] == [("judge-m", 70)]
+
+
 # ---------------------------------------------------------------------------
 # W3/W4 — usage 读端点接跨租户 scope(系统管理员租户切换器 + "*" 真聚合)
 #

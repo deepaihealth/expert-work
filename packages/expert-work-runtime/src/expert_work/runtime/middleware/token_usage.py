@@ -3,7 +3,7 @@
 For every LLM call we:
 
 1. Increment a Prometheus counter
-   ``expert_work_llm_token_usage_total{tenant_id, agent_name, model, type}`` so
+   ``expert_work_llm_token_usage_total{tenant_id, agent_name, model, type, usage_kind}`` so
    dashboards (Grafana / per-tenant per-agent token spend) and alerts
    see usage in real time.
 2. Persist one row in the ``token_usage`` table (via
@@ -30,11 +30,21 @@ Agent identity (``agent_name`` / ``agent_version`` / ``model``) is
 baked into the middleware instance at construction by
 :func:`build_middleware_chains` — same pattern as
 :class:`LLMCacheStoreMiddleware`.
+
+B-102 —— ``model`` / ``provider`` 是**配置的主模型**;备用模型接管时,``served_by``
+(构建期给的解析器)从响应上认出**实际应答**的模型条目,行与计数器都记在它的配置名
+下(不用厂商回显的 ``response_metadata.model_name``)。缓存命中没有模型应答,仍记主模型。
+
+B-103 —— :func:`usage_tap` 让调用方在一段执行里收到这里记下的每一次调用(与落行同一
+口径:同样的「没有用量就不记」、同样的模型名),worker 的 end 帧据此按模型分桶。
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -64,21 +74,67 @@ _TOKEN_TYPE_CACHE_READ = "cache_read"  # noqa: S105
 _llm_token_usage_total = expert_work_counter(
     "expert_work_llm_token_usage_total",
     "Tokens consumed per LLM call, split by type (Stream G.9).",
-    ("tenant_id", "agent_name", "model", "type"),
+    # B-104 —— ``usage_kind``:run 内除主循环外的调用(规划 / 压缩 / 记忆 / 评审 /
+    # 重排序…)也走这里,面板与比值按 kind 区分(``platform_overhead`` 不计费)。
+    ("tenant_id", "agent_name", "model", "type", "usage_kind"),
 )
 
 #: Stream HX-1 (Mini-ADR HX-A6) — estimated prompt tokens, accumulated
 #: alongside the actual counts above so dashboards can derive the
 #: estimator drift ratio in PromQL:
 #: ``rate(expert_work_ew_token_estimated_total) /
-#: rate(expert_work_llm_token_usage_total{type=~"input|cache_.*"})``.
+#: rate(expert_work_ew_token_estimate_actual_total)``.
 #: A counter pair instead of a ratio histogram because the repo metric
 #: convention reserves histograms for durations (``_seconds``).
 _ew_token_estimated_total = expert_work_counter(
     "expert_work_ew_token_estimated_total",
     "Estimated prompt tokens per LLM call (Stream HX-1 drift numerator).",
-    ("tenant_id", "agent_name", "model"),
+    ("tenant_id", "agent_name", "model", "usage_kind"),
 )
+
+#: B-104 —— 漂移比的分母:**同一批**调用(带估算器、非缓存命中、有 prompt 视图)的上游
+#: 实报 prompt tokens(input + cache_creation + cache_read)。原来分母用
+#: ``expert_work_llm_token_usage_total`` 的全部调用,而只有主循环带估算器 —— 看图、规划、
+#: 压缩、记忆、评审、重排序这些不估算的调用只进分母,比值被系统性压低。
+_ew_token_estimate_actual_total = expert_work_counter(
+    "expert_work_ew_token_estimate_actual_total",
+    "Provider-reported prompt tokens of the calls counted in "
+    "expert_work_ew_token_estimated_total (HX-1 drift denominator, B-104).",
+    ("tenant_id", "agent_name", "model", "usage_kind"),
+)
+
+
+@dataclass(frozen=True)
+class MeteredCall:
+    """一次记下的调用 —— :func:`usage_tap` 收到的东西。
+
+    ``usage_metadata`` 是响应原样的用量(含 ``output_token_details.reasoning``,
+    ``token_usage`` 行没有这一列);缓存命中落的全 0 行这里是 ``None``。
+    """
+
+    provider: str | None
+    model: str
+    usage_kind: str
+    usage_metadata: Mapping[str, Any] | None
+
+
+_USAGE_TAP: ContextVar[Callable[[MeteredCall], None] | None] = ContextVar(
+    "expert_work_usage_tap", default=None
+)
+
+
+@contextmanager
+def usage_tap(tap: Callable[[MeteredCall], None]) -> Iterator[None]:
+    """在这段执行(及其中创建的任务)里,每记一次调用就交给 ``tap`` 一份。
+
+    **替换**而不是叠加外层的 tap:嵌套的 worker 收自己的,外层不重复收(孙 worker 的
+    账记在孙 worker 自己的 end 帧上)。
+    """
+    token = _USAGE_TAP.set(tap)
+    try:
+        yield
+    finally:
+        _USAGE_TAP.reset(token)
 
 
 @dataclass
@@ -107,6 +163,9 @@ class TokenUsageMiddleware:
     # the prompt that was actually sent (``payload["prompt_messages"]``) so
     # the drift counter accumulates next to the provider-reported truth.
     estimator: TokenEstimator | None = None
+    # B-102 —— 响应 → 实际应答模型的配置 ``(provider, model)``;``None`` 时一律记
+    # ``provider`` / ``model``。
+    served_by: Callable[[AIMessage], tuple[str, str]] | None = None
 
     name: str = "token_usage"
     anchor: str = "after_llm_call"
@@ -134,6 +193,10 @@ class TokenUsageMiddleware:
                 return
             counts = (0, 0, 0, 0)
         input_t, output_t, cache_creation_t, cache_read_t = counts
+        provider: str | None = self.provider
+        model = self.model
+        if self.served_by is not None and ctx.payload.get("cache_hit") is not True:
+            provider, model = self.served_by(response)
 
         # Counter — even when cache_hit=True we increment so dashboards
         # show the fact that a call landed; counts may legitimately be
@@ -143,35 +206,39 @@ class TokenUsageMiddleware:
             _llm_token_usage_total.labels(
                 tenant_id=tenant_label,
                 agent_name=self.agent_name,
-                model=self.model,
+                model=model,
                 type=_TOKEN_TYPE_INPUT,
+                usage_kind=self.usage_kind,
             ).inc(input_t)
             _llm_token_usage_total.labels(
                 tenant_id=tenant_label,
                 agent_name=self.agent_name,
-                model=self.model,
+                model=model,
                 type=_TOKEN_TYPE_OUTPUT,
+                usage_kind=self.usage_kind,
             ).inc(output_t)
             if cache_creation_t > 0:
                 _llm_token_usage_total.labels(
                     tenant_id=tenant_label,
                     agent_name=self.agent_name,
-                    model=self.model,
+                    model=model,
                     type=_TOKEN_TYPE_CACHE_CREATION,
+                    usage_kind=self.usage_kind,
                 ).inc(cache_creation_t)
             if cache_read_t > 0:
                 _llm_token_usage_total.labels(
                     tenant_id=tenant_label,
                     agent_name=self.agent_name,
-                    model=self.model,
+                    model=model,
                     type=_TOKEN_TYPE_CACHE_READ,
+                    usage_kind=self.usage_kind,
                 ).inc(cache_read_t)
         except Exception:
             logger.warning(
                 "token_usage.counter_failed tenant=%s agent=%s model=%s",
                 tenant_label,
                 self.agent_name,
-                self.model,
+                model,
                 exc_info=True,
             )
 
@@ -187,14 +254,21 @@ class TokenUsageMiddleware:
                     _ew_token_estimated_total.labels(
                         tenant_id=tenant_label,
                         agent_name=self.agent_name,
-                        model=self.model,
+                        model=model,
+                        usage_kind=self.usage_kind,
                     ).inc(estimated)
+                    _ew_token_estimate_actual_total.labels(
+                        tenant_id=tenant_label,
+                        agent_name=self.agent_name,
+                        model=model,
+                        usage_kind=self.usage_kind,
+                    ).inc(input_t + cache_creation_t + cache_read_t)
                 except Exception:
                     logger.warning(
                         "token_usage.estimate_failed tenant=%s agent=%s model=%s",
                         tenant_label,
                         self.agent_name,
-                        self.model,
+                        model,
                         exc_info=True,
                     )
 
@@ -204,14 +278,31 @@ class TokenUsageMiddleware:
         usage_user_id = ctx.payload.get("user_id")
         if not isinstance(usage_user_id, UUID):
             usage_user_id = None
+        tap = _USAGE_TAP.get()
+        if tap is not None:
+            try:
+                tap(
+                    MeteredCall(
+                        provider=provider,
+                        model=model,
+                        usage_kind=self.usage_kind,
+                        usage_metadata=(
+                            response.usage_metadata
+                            if isinstance(response.usage_metadata, Mapping)
+                            else None
+                        ),
+                    )
+                )
+            except Exception:
+                logger.warning("token_usage.tap_failed model=%s", model, exc_info=True)
         try:
             await self.store.insert(
                 TokenUsageRecord(
                     tenant_id=tenant_id,
                     agent_name=self.agent_name,
                     agent_version=self.agent_version,
-                    model=self.model,
-                    provider=self.provider,
+                    model=model,
+                    provider=provider,
                     user_id=usage_user_id,
                     usage_kind=self.usage_kind,
                     input_tokens=input_t,
@@ -226,7 +317,7 @@ class TokenUsageMiddleware:
                 "token_usage.persist_failed tenant=%s agent=%s model=%s",
                 tenant_label,
                 self.agent_name,
-                self.model,
+                model,
                 exc_info=True,
             )
 

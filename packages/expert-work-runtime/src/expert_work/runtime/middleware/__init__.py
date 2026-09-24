@@ -139,7 +139,13 @@ from expert_work.runtime.middleware.pii_redact import (
     RedactText as RedactText,
 )
 from expert_work.runtime.middleware.token_usage import (
+    MeteredCall as MeteredCall,
+)
+from expert_work.runtime.middleware.token_usage import (
     TokenUsageMiddleware as TokenUsageMiddleware,
+)
+from expert_work.runtime.middleware.token_usage import (
+    usage_tap as usage_tap,
 )
 
 __all__ = [
@@ -173,6 +179,7 @@ __all__ = [
     "LangfuseSdkClient",
     "LangfuseSpan",
     "LoopDetectionMiddleware",
+    "MeteredCall",
     "Middleware",
     "MiddlewareChain",
     "MiddlewareContext",
@@ -188,4 +195,5 @@ __all__ = [
     "fingerprint_tool_calls",
     "make_langfuse_client",
     "normalize_args",
+    "usage_tap",
 ]

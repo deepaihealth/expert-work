@@ -101,16 +101,6 @@ class BuiltAgent:
     #: platform hard cap. ``None`` = manifest didn't ask → platform default.
     worker_max_concurrent: int | None = None
     worker_max_per_run: int | None = None
-    #: B-42 — the build's configured ``(provider, model)`` (``spec.model``),
-    #: the same pair the token-usage middleware bakes into every
-    #: ``token_usage`` row. A child run stamps its own pair onto its end
-    #: frame's ``usage_by_model`` so the parent side can price a worker's
-    #: tokens at the *worker's* rate — ``dynamic_workers.model`` may differ
-    #: from the parent's, and the parent otherwise only knows its own.
-    #: ``None`` (test stubs / legacy construction) → the frame omits the
-    #: bucket list and consumers fall back to the parent's rate.
-    model_provider: str | None = None
-    model_name: str | None = None
     #: B-61 §5.4 —— 本次构建里落空的 MCP 参数绑定(整条没匹配上的,以及工具在、
     #: 参数已经不声明的)。存在的理由是保存时的试建 —— 那一刻平台才同时握着绑定
     #: 表和真实工具目录,当场就能告诉配置的人「这条绑定落空了」。落空不报出来就是

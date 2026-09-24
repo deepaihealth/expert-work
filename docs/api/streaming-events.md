@@ -99,8 +99,10 @@ Per-kind `data`:
   summaries: `{type: "ai", content_excerpt, tool_calls?: [{name,
   args_excerpt}]}` or `{type: "tool", name, tool_result_excerpt, …}`. All
   excerpts are truncated; they are a progress view, not the full transcript.
-- `end` — `outcome`, `iteration_used`, `llm_call_count`, `wall_clock_ms`,
-  `usage` and `usage_by_model` (both optional, see below).
+- `end` — `outcome`, `iteration_used`, `llm_call_count` (the number of model
+  calls counted in `usage`; when the platform recorded no usage for the
+  worker, the number of model replies), `wall_clock_ms`, `usage` and
+  `usage_by_model` (both optional, see below).
 
 ### A worker's token usage
 
@@ -108,20 +110,42 @@ The `end` frame carries a `usage` block with the tokens that worker spent:
 
 ```json
 {
-  "input_tokens": 3200000,
-  "output_tokens": 117974,
-  "total_tokens": 3317974,
+  "input_tokens": 3200800,
+  "output_tokens": 118014,
+  "total_tokens": 3318814,
   "input_token_details": {"cache_read": 900000, "cache_creation": 7},
   "output_token_details": {"reasoning": 20000}
 }
 ```
 
-Next to it, `usage_by_model` splits the same account by the model that spent
-it — one entry per `(provider, model)`, each carrying `provider`, `model` and
-the same fields as `usage`. The entries sum to `usage`. A worker runs on one
-model, so today the list has one entry, but a worker's model is **not
-necessarily the parent's** (`dynamic_workers.model`), and `usage` alone does
-not say which rate applies:
+`usage` covers every model call the worker made on the user's behalf:
+
+- the worker's own replies, including a reply that a fallback model gave
+  after the configured model failed;
+- planning and reflection steps;
+- summarising earlier conversation when the context grows long;
+- reading and writing long-term memory;
+- questions about images (the vision model).
+
+Calls the platform makes for its own safety checks and for ranking search
+results are not included. `llm_call_count` counts the same calls.
+
+Next to `usage`, `usage_by_model` splits the same account by the model that
+actually answered each call. It is a list with one entry per
+`(provider, model)`; each entry carries `provider`, `model` and the same
+fields as `usage`. The entries sum to `usage`, field by field.
+
+The list can hold several entries. Each of the following gets its own entry:
+
+- the worker's own model, which is not necessarily the parent agent's model
+  (`dynamic_workers.model`);
+- a fallback model, for the calls it answered;
+- the vision model, for image questions;
+- the model that the agent's routing rules assign to planning or reflection,
+  when it differs from the worker's own model.
+
+`model` is the model name as configured on the platform, not the name the
+provider reports back.
 
 ```json
 [
@@ -133,27 +157,45 @@ not say which rate applies:
     "total_tokens": 3317974,
     "input_token_details": {"cache_read": 900000, "cache_creation": 7},
     "output_token_details": {"reasoning": 20000}
+  },
+  {
+    "provider": "qwen",
+    "model": "qwen-vl-max",
+    "input_tokens": 800,
+    "output_tokens": 40,
+    "total_tokens": 840,
+    "input_token_details": {"cache_read": 0, "cache_creation": 0},
+    "output_token_details": {"reasoning": 0}
   }
 ]
 ```
 
 Price a run by summing each entry's tokens at that entry's own
-`(provider, model)` rate. When `usage_by_model` is absent (the worker's model
-was not known when the frame was built), fall back to pricing `usage` at the
-parent agent's rate — that is the pre-B-42 behaviour, and it is exact whenever
-the worker shares the parent's model. The run's persisted rollup
-(`tokens.usage_by_model` on the run / conversation records) carries the same
-split, computed from the `token_usage` rows instead of the frames.
+`(provider, model)` rate. `usage_by_model` is absent when the platform
+recorded no model calls for that worker; in that case price `usage` at the
+parent agent's rate. The run's persisted rollup (`tokens.usage_by_model` on
+the run and conversation records) carries the same split, computed from the
+platform's usage records instead of the events.
 
-Three things to know when you add up a run's tokens:
+How to get a run's total tokens:
 
-- **A worker's tokens appear nowhere else.** A worker's model calls do not
-  produce `updates` frames on the parent stream, so a total built only from
-  `updates` counts the main line and nothing else. Add every worker `end`
-  frame's `usage` to get the run's real total.
-- **Count the `end` frame only.** Each worker emits exactly one, so summing
-  across all of them covers the whole delegation tree — a nested worker
-  reports on its own `end` frame — with nothing counted twice.
+- **Use the run-level total, not a sum of events.** The authoritative total
+  is `usage_by_model` on the run's `end` event (the last event on the
+  stream), or the same data from `GET /v1/agents/{code}/runs/{run_id}/usage`.
+  It covers every model call made on the user's behalf: the main agent, its
+  workers, and the extra calls listed below. As with a worker's `usage`, the
+  platform's own safety checks and search-result ranking are not included.
+- **Events show progress, not the full account.** Summing `usage_metadata`
+  from `updates` events and `usage` from worker `end` events gives a lower
+  number than the run-level total. The `updates` events carry only the main
+  agent's replies. The main agent's own planning, reflection, conversation
+  summaries, long-term memory reads and writes, and image questions produce
+  no `updates` event, so they appear only in the run-level total. A worker's
+  `usage`, by contrast, already includes that worker's own calls of those
+  kinds. Use the event sum for an in-progress display only.
+- **Count each worker's `end` event once.** Each worker emits exactly one,
+  and a nested worker reports on its own `end` event, so adding up every
+  worker `end` event counts each worker exactly once.
 - **`usage` may be absent, and absent is not zero.** Token counts are
   optional for some providers and some cache paths. A missing block means
   "not reported", so treat it as unknown rather than free.

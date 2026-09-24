@@ -51,7 +51,10 @@ from expert_work.persistence.rls import (
     current_tenant_id_var,
     current_user_id_var,
 )
-from expert_work.persistence.token_usage_store import TokenUsageStore
+from expert_work.persistence.token_usage_store import (
+    NON_BILLABLE_USAGE_KINDS,
+    TokenUsageStore,
+)
 from expert_work.protocol import (
     TenantBillingLedgerRecord,
     TenantPlan,
@@ -257,6 +260,11 @@ class BillingRollupJob:
         for row in rows:
             if row.observed_at is None:
                 # Defensive: a windowed read never returns pre-insert rows.
+                continue
+            if row.usage_kind in NON_BILLABLE_USAGE_KINDS:
+                # B-104 — the platform's own safety / retrieval overhead (judges,
+                # rerank) is metered for ops visibility and the run's token
+                # breaker, but it is the platform's cost, not the tenant's bill.
                 continue
             provider = row.provider or provider_for_model(row.model)
             rate = None

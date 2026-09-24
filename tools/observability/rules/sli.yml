@@ -109,12 +109,15 @@ groups:
 
       # Token-estimate drift ratio (Stream HX-1): tiktoken estimate vs
       # provider-reported prompt tokens. Healthy ~1.0; chars//4 fallback
-      # shows ~0.3-0.4 on CJK-heavy traffic.
+      # shows ~0.3-0.4 on CJK-heavy traffic. B-104: the denominator is the
+      # paired counter over exactly the estimated calls (only the agent loop
+      # estimates; judges / rerank / planning / memory / VL do not), both
+      # sides narrowed to conversation spend.
       - record: expert_work:sli:token_estimate_drift:ratio1h
         expr: |
-          sum(rate(expert_work_ew_token_estimated_total[1h]))
+          sum(rate(expert_work_ew_token_estimated_total{usage_kind="conversation"}[1h]))
           /
-          sum(rate(expert_work_llm_token_usage_total{type=~"input|cache_creation|cache_read"}[1h]))
+          sum(rate(expert_work_ew_token_estimate_actual_total{usage_kind="conversation"}[1h]))
 
       # Checkpoint IO P95 (Stream HX-4): per-step persistence latency by
       # operation (aput / aput_writes / aget_tuple).

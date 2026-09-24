@@ -244,14 +244,22 @@ export function SettingsUsage() {
         render: (key: string) => (
           <Tag
             color={
-              key === "skill_evolution" ? "purple" : key === "memory_consolidation" ? "cyan" : "default"
+              key === "skill_evolution"
+                ? "purple"
+                : key === "memory_consolidation"
+                  ? "cyan"
+                  : key === "platform_overhead"
+                    ? "gold"
+                    : "default"
             }
           >
             {key === "skill_evolution"
               ? t("usage.kind_skill_evolution")
               : key === "memory_consolidation"
                 ? t("usage.kind_memory_consolidation")
-                : key === "conversation"
+                : key === "platform_overhead"
+                  ? t("usage.kind_platform_overhead")
+                  : key === "conversation"
                   ? t("usage.kind_conversation")
                   : key}
           </Tag>
