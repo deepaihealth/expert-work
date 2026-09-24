@@ -429,6 +429,7 @@ def make_child_agent_builder(
             token_usage_store=(
                 middleware_env.token_usage_store if middleware_env is not None else None
             ),
+            token_usage_kind=token_usage_kind,
         )
         built = await build_agent(
             child_spec,
@@ -642,6 +643,7 @@ def make_worker_build_fn(
             token_usage_store=(
                 middleware_env.token_usage_store if middleware_env is not None else None
             ),
+            token_usage_kind=token_usage_kind,
         )
         built = await build_agent(
             worker_spec,

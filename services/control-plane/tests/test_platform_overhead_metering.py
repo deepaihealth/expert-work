@@ -175,9 +175,15 @@ async def _rows(store: InMemoryTokenUsageStore) -> list[TokenUsageRecord]:
     return sorted(await store.list_for_tenant(tenant_id=_TENANT), key=lambda r: r.id or 0)
 
 
-def _assert_overhead_row(row: TokenUsageRecord, *, model: tuple[str, str], trace_id: str) -> None:
+def _assert_overhead_row(
+    row: TokenUsageRecord,
+    *,
+    model: tuple[str, str],
+    trace_id: str,
+    kind: str = PLATFORM_OVERHEAD_USAGE_KIND,
+) -> None:
     assert (row.provider, row.model) == model
-    assert row.usage_kind == PLATFORM_OVERHEAD_USAGE_KIND
+    assert row.usage_kind == kind
     assert (row.agent_name, row.agent_version) == ("ai-health-plan", "1.2.0")
     assert (row.tenant_id, row.user_id) == (_TENANT, _USER)
     assert (row.input_tokens, row.output_tokens) == (70, 5)
@@ -194,6 +200,7 @@ async def _run_judges(
     *,
     judge_config: tuple[str, str] | None,
     caller: _Caller,
+    token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
 ) -> tuple[InMemoryTokenUsageStore, TokenBudget, str]:
     _patch_router(monkeypatch, caller)
     store = InMemoryTokenUsageStore()
@@ -204,6 +211,7 @@ async def _run_judges(
         secret_store=_secret_store(),
         platform_judge_config_service=_JudgeConfig(judge_config),  # type: ignore[arg-type]
         token_usage_store=store,
+        token_usage_kind=token_usage_kind,
     )
     assert isinstance(defenses.output_judge, LLMOutputJudge)
     assert isinstance(defenses.action_judge, LLMActionJudge)
@@ -257,6 +265,26 @@ async def test_judge_falling_back_to_the_agent_model_is_still_platform_overhead(
 
 
 @pytest.mark.asyncio
+async def test_judges_in_a_skill_evolution_build_inherit_the_build_kind(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """裁定 #4 —— 回放这类非对话构建里,评审随构建 kind,不记 platform_overhead。"""
+    store, _budget, trace_id = await _run_judges(
+        monkeypatch, judge_config=None, caller=_Caller(), token_usage_kind="skill_evolution"
+    )
+
+    rows = await _rows(store)
+    assert len(rows) == 2
+    for row in rows:
+        _assert_overhead_row(
+            row,
+            model=("anthropic", "claude-haiku-4-5"),
+            trace_id=trace_id,
+            kind="skill_evolution",
+        )
+
+
+@pytest.mark.asyncio
 async def test_failed_judge_call_records_nothing(
     tracing: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -274,8 +302,12 @@ async def test_failed_judge_call_records_nothing(
 
 
 @pytest.mark.asyncio
-async def test_every_build_path_hands_the_usage_store_to_the_judges(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("build_kind", "judge_kind"),
+    [("conversation", PLATFORM_OVERHEAD_USAGE_KIND), ("skill_evolution", "skill_evolution")],
+)
+async def test_every_build_path_hands_the_usage_store_and_kind_to_the_judges(
+    monkeypatch: pytest.MonkeyPatch, build_kind: str, judge_kind: str
 ) -> None:
     _patch_router(monkeypatch, _Caller())
     calls: list[dict[str, Any]] = []
@@ -295,7 +327,7 @@ async def test_every_build_path_hands_the_usage_store_to_the_judges(
 
     await make_agent_builder(
         _secret_store(), InMemorySaver(), credentials_resolver=_credentials(), middleware_env=env
-    )(_spec(), tenant_id=_TENANT)
+    )(_spec(), tenant_id=_TENANT, token_usage_kind=build_kind)
     await make_child_agent_builder(
         spec_store=specs,
         secret_store=_secret_store(),
@@ -303,7 +335,13 @@ async def test_every_build_path_hands_the_usage_store_to_the_judges(
         base_tool_env=ToolEnv(),
         credentials_resolver=_credentials(),
         middleware_env=env,
-    )(tenant_id=_TENANT, name="researcher", version="1.2.0", depth=1)
+    )(
+        tenant_id=_TENANT,
+        name="researcher",
+        version="1.2.0",
+        depth=1,
+        token_usage_kind=build_kind,
+    )
     await make_worker_build_fn(
         secret_store=_secret_store(),
         checkpointer=InMemorySaver(),
@@ -312,14 +350,14 @@ async def test_every_build_path_hands_the_usage_store_to_the_judges(
         allowed_toolsets=[],
         credentials_resolver=_credentials(),
         middleware_env=env,
-    )(_spec(), tenant_id=_TENANT, role="probe", depth=1)
+    )(_spec(), tenant_id=_TENANT, role="probe", depth=1, token_usage_kind=build_kind)
 
     assert len(calls) == 3
     for kw in calls:
         for judge in (kw["output_judge"], kw["action_judge"]):
             assert isinstance(judge.caller, MeteredLLMCaller)
             assert judge.caller.meter.store is usage
-            assert judge.caller.meter.usage_kind == PLATFORM_OVERHEAD_USAGE_KIND
+            assert judge.caller.meter.usage_kind == judge_kind
 
 
 # ---------------------------------------------------------------------------

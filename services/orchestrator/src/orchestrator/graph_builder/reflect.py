@@ -40,6 +40,7 @@ from expert_work.protocol import Plan, PlanStep, Reflection
 from orchestrator.graph_builder._config import cancellation_token, current_run_id
 from orchestrator.llm import LLMCaller
 from orchestrator.state import AgentState
+from orchestrator.usage_metering import UsageMeter, charge_in_run
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,13 @@ def _parse_revised_plan(steps_raw: object, *, plan: Plan) -> Plan | None:
     return Plan(goal=plan.goal, steps=tuple(steps))
 
 
-def make_reflect_node(llm_caller: LLMCaller, *, budget: int, deadline_s: int = 30) -> ReflectNode:
+def make_reflect_node(
+    llm_caller: LLMCaller,
+    *,
+    budget: int,
+    deadline_s: int = 30,
+    usage_meter: UsageMeter | None = None,
+) -> ReflectNode:
     """Build the ``reflect`` graph node bound to ``llm_caller``.
 
     ``budget`` caps the reflection LLM calls per run; once reached the
@@ -159,6 +166,9 @@ def make_reflect_node(llm_caller: LLMCaller, *, budget: int, deadline_s: int = 3
     LLM call. When the provider hangs past this many seconds the node
     fails safe to ``accept`` — orthogonal to the cancellation token,
     which only fires on client disconnect.
+
+    ``usage_meter`` (B-104) —— 成功返回后记账 + 扣池。放在 ``wait_for`` **之外**:
+    记账写库慢不能把一次已经成功的反思判成超时。
     """
 
     async def reflect_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -211,6 +221,8 @@ def make_reflect_node(llm_caller: LLMCaller, *, budget: int, deadline_s: int = 3
                     )
                 ]
             }
+        if usage_meter is not None:
+            await charge_in_run(usage_meter, response)
         parsed, revised_plan = _parse_reflection(_message_text(response), plan=plan)
         reflection = parsed.model_copy(update={"run_id": run_id})
         logger.info("reflect.verdict=%s", reflection.verdict)

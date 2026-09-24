@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +44,7 @@ from expert_work.protocol import (
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MemoryEnv, MiddlewareEnv, ToolEnv, build_agent
+from orchestrator.graph_builder import make_reflect_node
 from orchestrator.llm import FakeEmbedder
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.tools import KnowledgeRetriever
@@ -207,6 +209,7 @@ async def _run(
     messages: list[BaseMessage] | None = None,
     memory_env: MemoryEnv | None = None,
     tool_env: ToolEnv | None = None,
+    token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
 ) -> _Run:
     store = InMemoryTokenUsageStore()
     budget = TokenBudget(limit=10_000_000)
@@ -219,6 +222,7 @@ async def _run(
             middleware_env=MiddlewareEnv(token_usage_store=store),
             memory_env=memory_env,
             tool_env=tool_env,
+            token_usage_kind=token_usage_kind,
         )
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "run"):
             trace_id = current_trace_id_hex()
@@ -362,9 +366,11 @@ async def _seeded_memory() -> InMemoryMemoryStore:
     return store
 
 
-def _assert_platform_identity(identity: UsageIdentity | None) -> None:
+def _assert_platform_identity(
+    identity: UsageIdentity | None, kind: str = PLATFORM_OVERHEAD_USAGE_KIND
+) -> None:
     assert identity is not None
-    assert identity.usage_kind == PLATFORM_OVERHEAD_USAGE_KIND
+    assert identity.usage_kind == kind
     assert (identity.agent_name, identity.agent_version) == ("ai-health-plan", "1.2.0")
     assert identity.store is not None
 
@@ -464,6 +470,142 @@ async def test_knowledge_rerank_carries_the_platform_identity(
     _assert_platform_identity(reranker.identities[0])
     # 主循环两轮两行,重排序替身不调模型,不多出行。
     assert [r.input_tokens for r in run.rows] == [100, 100]
+
+
+@pytest.mark.asyncio
+async def test_non_conversation_build_labels_every_in_run_call_with_the_build_kind(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """裁定 #4 —— skill_evolution 回放这类构建:规划等 Agent 自身调用与重排序(平台
+    模型)都随构建 kind,整棵回放树的花费归同一口径。"""
+    search = {
+        "name": "knowledge_search",
+        "args": {"query": "deductible"},
+        "id": "call-1",
+        "type": "tool_call",
+    }
+    brain = _Brain(
+        main_replies=[AIMessage(content="", tool_calls=[search], usage_metadata=_usage("main"))]
+    )
+    _patch_providers(monkeypatch, brain)
+    reranker = _SpyReranker()
+    spec = _spec(
+        {"workflow": {"type": "plan_execute"}, "knowledge": {"knowledge_base_refs": ["kb"]}}
+    )
+
+    run = await _run(
+        spec,
+        brain,
+        tool_env=await _knowledge_env(reranker),
+        token_usage_kind="skill_evolution",
+    )
+
+    _assert_platform_identity(reranker.identities[0], kind="skill_evolution")
+    _assert_row(run, "planner", model=_MAIN, kind="skill_evolution")
+    assert {r.usage_kind for r in run.rows} == {"skill_evolution"}
+
+
+# ---------------------------------------------------------------------------
+# 并发:同一个已构建 agent 并发多个 run,各自的行 / trace / 池不串
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SlowBrain(_Brain):
+    """每次调用都让出一次事件循环,多个 run 的调用交错进行。"""
+
+    async def complete(
+        self,
+        *,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[ToolSpec],
+        output_schema: StructuredOutputSpec | None = None,
+    ) -> AIMessage:
+        await asyncio.sleep(0.01)
+        return await super().complete(messages=messages, tools=tools, output_schema=output_schema)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_on_one_built_agent_keep_rows_and_budgets_apart(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brain = _SlowBrain()
+    _patch_providers(monkeypatch, brain)
+    spec = _spec({"workflow": {"type": "plan_execute"}, "reflection": {"budget": 1}})
+    store = InMemoryTokenUsageStore()
+    users = [UUID(int=i + 1) for i in range(6)]
+    budgets = {u: TokenBudget(limit=10_000_000) for u in users}
+    traces: dict[UUID, str | None] = {}
+
+    async with make_checkpointer("memory") as cp:
+        built = await build_agent(
+            spec,
+            secret_store=LocalDevSecretStore.from_mapping({_KEY: "sk-test"}),
+            checkpointer=cp,
+            provider_key_resolver=_any_key,
+            middleware_env=MiddlewareEnv(token_usage_store=store),
+        )
+
+        async def _one(user: UUID) -> None:
+            config = _config(budgets[user])
+            config["configurable"]["user_id"] = str(user)
+            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "run"):
+                traces[user] = current_trace_id_hex()
+                await built.graph.ainvoke(
+                    {"messages": [HumanMessage(content="x")], "step_count": 0, "max_steps": 5},
+                    config=config,
+                )
+
+        await asyncio.gather(*(_one(u) for u in users))
+
+    rows = await store.list_for_tenant(tenant_id=_TENANT)
+    # 每个 run:规划 + 主循环 + 反思 = 3 行。
+    assert len(rows) == 3 * len(users)
+    for user in users:
+        mine = [r for r in rows if r.user_id == user]
+        assert sorted(r.input_tokens for r in mine) == sorted(
+            _PURPOSE_INPUT[p] for p in ("planner", "main", "reflect")
+        )
+        assert {r.trace_id for r in mine} == {traces[user]}
+        assert budgets[user].spent == sum(r.input_tokens + r.output_tokens for r in mine)
+
+
+# ---------------------------------------------------------------------------
+# 反思:``wait_for`` 只计模型调用,记账写库不算进去(评审 i2)
+# ---------------------------------------------------------------------------
+
+
+class _SlowInsertStore(InMemoryTokenUsageStore):
+    async def insert(self, record: TokenUsageRecord) -> TokenUsageRecord:
+        await asyncio.sleep(1.2)
+        return await super().insert(record)
+
+
+@pytest.mark.asyncio
+async def test_reflect_deadline_does_not_time_the_metering_write() -> None:
+    store = _SlowInsertStore()
+    budget = TokenBudget(limit=1_000)
+    caller = _Caller(
+        response=AIMessage(
+            content='{"verdict": "revise", "critique": "missing step"}',
+            usage_metadata=_usage("reflect"),
+        )
+    )
+    node = make_reflect_node(caller, budget=1, deadline_s=1, usage_meter=_meter(store))
+    config = _config(budget)
+    token = var_child_runnable_config.set(config)
+    try:
+        update = await node(
+            {"messages": [HumanMessage(content="q"), AIMessage(content="a")]},  # type: ignore[typeddict-item]
+            config,
+        )
+    finally:
+        var_child_runnable_config.reset(token)
+
+    # 模型调用及时返回 → 用它的判定,不是「超时强制通过」;记账照样落下。
+    assert update["reflections"][0].verdict == "revise"
+    assert budget.spent == 13
+    assert len(await store.list_for_tenant(tenant_id=_TENANT)) == 1
 
 
 # ---------------------------------------------------------------------------

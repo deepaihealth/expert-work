@@ -63,7 +63,6 @@ from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ
 from expert_work.persistence.skill.base import SkillStore
 from expert_work.persistence.tenant_config import TenantConfigStore
-from expert_work.persistence.token_usage_store import PLATFORM_OVERHEAD_USAGE_KIND
 from expert_work.persistence.trigger.base import TriggerStore
 from expert_work.protocol import (
     AgentSpec,
@@ -166,6 +165,7 @@ from orchestrator.usage_metering import (
     ScopedReranker,
     UsageIdentity,
     UsageMeter,
+    overhead_usage_kind,
     with_served_by,
 )
 
@@ -720,15 +720,15 @@ async def build_agent(
     vl_usage_meter: UsageMeter | None = None
     usage_store = middleware_env.token_usage_store if middleware_env is not None else None
     # B-104 —— run 内其余模型调用的记账身份(见 ``orchestrator.usage_metering``):用 Agent
-    # 自己模型的调用记本次构建的 kind(与主循环同口径),用平台模型的调用(重排序)记
-    # ``platform_overhead``。没接用量存储时只扣 token 池、不落行。
+    # 自己模型的调用记本次构建的 kind(与主循环同口径),用平台模型的调用(重排序)对话构建
+    # 记 ``platform_overhead``、其它构建随构建 kind。没接用量存储时只扣 token 池、不落行。
     conversation_usage = UsageIdentity(
         store=usage_store,
         agent_name=spec.metadata.name,
         agent_version=spec.metadata.version,
         usage_kind=token_usage_kind,
     )
-    platform_usage = replace(conversation_usage, usage_kind=PLATFORM_OVERHEAD_USAGE_KIND)
+    platform_usage = replace(conversation_usage, usage_kind=overhead_usage_kind(token_usage_kind))
     if vision_block is not None:
         # B-64 Task 10 —— 首 token 超时与 provider httpx 超时都取
         # ``VL_FIRST_TOKEN_TIMEOUT_S``(manifest 的 ``stream_deadline_s`` 更小时取更小的),
@@ -940,7 +940,9 @@ async def build_agent(
     reflection = spec.spec.reflection
     reflect_node = (
         make_reflect_node(
-            _metered(routers.reflection, conversation_usage, _step_model(spec, "reflection")),
+            routers.reflection,
+            # B-104 —— 反思的记账不走包装:要放在 ``wait_for`` 之外(见 make_reflect_node)。
+            usage_meter=_step_meter(conversation_usage, _step_model(spec, "reflection")),
             budget=reflection.budget,
             deadline_s=reflection.deadline_s,
         )
@@ -2611,15 +2613,17 @@ def _step_model(spec: AgentSpec, when: str) -> ModelSpec:
     return model
 
 
-def _metered(caller: LLMCaller, identity: UsageIdentity, model: ModelSpec) -> MeteredLLMCaller:
-    """B-104 —— 给一个调用点的路由套记账;记账口径覆盖该路由的整条备用链。"""
-    return MeteredLLMCaller(
-        inner=caller,
-        meter=identity.meter(
-            default=(model.provider, model.name),
-            models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in _flatten_chain(model)},
-        ),
+def _step_meter(identity: UsageIdentity, model: ModelSpec) -> UsageMeter:
+    """B-104 —— 一个调用点的记账器;口径覆盖该路由的整条备用链。"""
+    return identity.meter(
+        default=(model.provider, model.name),
+        models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in _flatten_chain(model)},
     )
+
+
+def _metered(caller: LLMCaller, identity: UsageIdentity, model: ModelSpec) -> MeteredLLMCaller:
+    """B-104 —— 给一个调用点的路由套记账。"""
+    return MeteredLLMCaller(inner=caller, meter=_step_meter(identity, model))
 
 
 def _flatten_chain(model: ModelSpec) -> list[ModelSpec]:

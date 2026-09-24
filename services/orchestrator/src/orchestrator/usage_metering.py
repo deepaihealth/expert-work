@@ -50,7 +50,7 @@ from uuid import UUID
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables.config import var_child_runnable_config
 
-from expert_work.persistence.token_usage_store import TokenUsageStore
+from expert_work.persistence.token_usage_store import PLATFORM_OVERHEAD_USAGE_KIND, TokenUsageStore
 from expert_work.runtime.middleware import (
     CallNext,
     MiddlewareChain,
@@ -199,6 +199,15 @@ class UsageIdentity:
         )
 
 
+def overhead_usage_kind(build_kind: str) -> str:
+    """用平台模型的调用(安全评审 / 重排序)记什么 kind。
+
+    对话构建记 ``platform_overhead``;其它构建(如 ``skill_evolution`` 回放)随构建的
+    kind —— 回放整棵树的花费归同一口径,不因评审 / 重排序漏回对话侧的开销里。
+    """
+    return PLATFORM_OVERHEAD_USAGE_KIND if build_kind == "conversation" else build_kind
+
+
 def _parse_uuid(raw: object) -> UUID | None:
     if isinstance(raw, UUID):
         return raw
@@ -235,6 +244,22 @@ def current_run_usage_context() -> RunUsageContext | None:
     )
 
 
+async def charge_in_run(meter: UsageMeter, response: AIMessage) -> None:
+    """一次成功调用按当前 run 的上下文记一次;不在 run 里时什么都不记。
+
+    :class:`MeteredLLMCaller` 调用成功后用它;调用点要把计时(如反思的
+    ``wait_for``)只套在模型调用上、不把记账写库算进去时,直接调它。
+    """
+    ctx = current_run_usage_context()
+    if ctx is not None:
+        await meter.charge(
+            response,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            token_budget=ctx.token_budget,
+        )
+
+
 @dataclass(frozen=True)
 class MeteredLLMCaller:
     """给一个 :class:`~orchestrator.llm.LLMCaller` 套上记账:调用成功后按 run 上下文记一次。
@@ -260,14 +285,7 @@ class MeteredLLMCaller:
         if on_delta is not None:
             kwargs["on_delta"] = on_delta
         response = await self.inner(messages=messages, tools=tools, **kwargs)
-        ctx = current_run_usage_context()
-        if ctx is not None:
-            await self.meter.charge(
-                response,
-                tenant_id=ctx.tenant_id,
-                user_id=ctx.user_id,
-                token_budget=ctx.token_budget,
-            )
+        await charge_in_run(self.meter, response)
         return response
 
 

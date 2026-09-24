@@ -49,10 +49,7 @@ from expert_work.persistence import ArtifactStore, KnowledgeStore
 from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from expert_work.persistence.skill import SkillStore
-from expert_work.persistence.token_usage_store import (
-    PLATFORM_OVERHEAD_USAGE_KIND,
-    TokenUsageStore,
-)
+from expert_work.persistence.token_usage_store import TokenUsageStore
 from expert_work.persistence.trigger import TriggerStore
 from expert_work.protocol import (
     AgentSpec,
@@ -140,6 +137,7 @@ from orchestrator.usage_metering import (
     MeteredLLMCaller,
     UsageIdentity,
     current_usage_identity,
+    overhead_usage_kind,
 )
 
 
@@ -652,6 +650,7 @@ async def _build_judge_caller(
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
     token_usage_store: TokenUsageStore | None = None,
+    token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
 ) -> LLMCaller:
     """Stream PI-3-A2 — the LLM caller backing the output/action judges.
 
@@ -680,15 +679,16 @@ async def _build_judge_caller(
         # 波 2 线 A — the judge's provider handle draws from the same global bucket.
         rate_limiter_factory=rate_limiter_factory,
     )
-    # B-104 —— 评审调用记 ``platform_overhead``(按用途分:退回 Agent 主模型时也是),记在
-    # 本 agent 名下、计入 run 的 token 池;没接用量存储时只扣池。
+    # B-104 —— 评审调用记 ``platform_overhead``(按用途分:退回 Agent 主模型时也是;非对话
+    # 构建如 skill_evolution 回放随构建 kind),记在本 agent 名下、计入 run 的 token 池;
+    # 没接用量存储时只扣池。
     return MeteredLLMCaller(
         inner=router,
         meter=UsageIdentity(
             store=token_usage_store,
             agent_name=spec.metadata.name,
             agent_version=spec.metadata.version,
-            usage_kind=PLATFORM_OVERHEAD_USAGE_KIND,
+            usage_kind=overhead_usage_kind(token_usage_kind),
         ).meter(default=(provider, name)),
     )
 
@@ -703,6 +703,7 @@ async def _make_output_judge(
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
     token_usage_store: TokenUsageStore | None = None,
+    token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
 ) -> OutputJudge | None:
     """Stream PI-2b-3 / PI-3-A2 — build the output judge when the manifest opts
     in (``defenses.output_judge == "block"``), over the platform judge model
@@ -718,6 +719,7 @@ async def _make_output_judge(
         http_client=http_client,
         rate_limiter_factory=rate_limiter_factory,
         token_usage_store=token_usage_store,
+        token_usage_kind=token_usage_kind,
     )
     return LLMOutputJudge(caller=caller)
 
@@ -732,6 +734,7 @@ async def _make_action_judge(
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
     token_usage_store: TokenUsageStore | None = None,
+    token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
 ) -> ActionJudge | None:
     """Stream PI-3b-2 — build the action judge when the manifest opts in
     (``defenses.action_screen != "off"``), over the platform judge model (or
@@ -747,6 +750,7 @@ async def _make_action_judge(
         http_client=http_client,
         rate_limiter_factory=rate_limiter_factory,
         token_usage_store=token_usage_store,
+        token_usage_kind=token_usage_kind,
     )
     return LLMActionJudge(caller=caller)
 
@@ -771,6 +775,7 @@ async def resolve_defenses(
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
     token_usage_store: TokenUsageStore | None = None,
+    token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
 ) -> ResolvedDefenses:
     """Resolve the model-backed judges + the platform tool-budget switch for a build.
 
@@ -799,6 +804,7 @@ async def resolve_defenses(
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
             token_usage_store=token_usage_store,
+            token_usage_kind=token_usage_kind,
         )
         if credentials_resolver is not None and tenant_id is not None
         else None
@@ -813,6 +819,7 @@ async def resolve_defenses(
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
             token_usage_store=token_usage_store,
+            token_usage_kind=token_usage_kind,
         )
         if credentials_resolver is not None and tenant_id is not None
         else None
@@ -1032,6 +1039,7 @@ def make_agent_builder(
             token_usage_store=(
                 middleware_env.token_usage_store if middleware_env is not None else None
             ),
+            token_usage_kind=token_usage_kind,
         )
         return await build_agent(
             spec,
