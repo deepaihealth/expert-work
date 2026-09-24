@@ -188,7 +188,7 @@ PR 切分倾向：T0 不进 PR；T1–T4 一个后端 PR；T5 一个前端 PR；
 
 | 模型 | 厂商默认 | 关思考 | 目录现状 | 处理 |
 |---|---|---|---|---|
-| glm-4.6v | **默认思考**（小题超过 180 秒没答完；显式开时思考 2,114） | `thinking.type=disabled` 有效（思考 0，完成 28） | `thinking=None` → **快看完全不起作用** | 改成 `toggle` + 默认开；4.5v 同一族，实调后再同样处理 |
+| glm-4.6v | **默认思考**（小题超过 180 秒没答完；显式开时思考 2,114） | `thinking.type=disabled` 有效（思考 0，完成 28） | `thinking=None` → **快看完全不起作用** | 改成 `toggle` + 默认开；glm-4.5v 实调：disabled 有效（思考 0）、enabled 思考 2,738 → 同样处理 |
 | glm-5v-turbo | 默认思考（1,767） | disabled 有效 | toggle | 不变 |
 | kimi-k2.6 | 默认思考（1,883） | disabled 有效 | toggle | 不变 |
 | qwen3-vl-plus / flash | **默认不思考** | `enable_thinking=false` 有效；显式开时思考 5K | `thinking=None` → 用户开不了思考 | 改成 `budget` + 默认关 |
@@ -200,5 +200,5 @@ PR 切分倾向：T0 不进 PR；T1–T4 一个后端 PR；T5 一个前端 PR；
 - §4.0：不需要拼合计（每家都有真正的合计字段）。
 - §4.1：`output_cap_field` 按 8.1 填。
 - §4.2：通义的 `thinking_budget` 已实测是硬上限，按原设计做。
-- T1 补目录修正：glm-5.3 标 `always_thinking`；豆包档位从 `budget` 改成 `effort` 形态；glm-4.6v / 4.5v 改成 `toggle`（4.5v 先实调）；qwen3-vl-plus / flash 改成 `budget`、默认关。
+- T1 补目录修正：glm-5.3 标 `always_thinking`；豆包档位从 `budget` 改成 `effort` 形态；glm-4.6v / 4.5v 改成 `toggle` + 默认开（两款都已实调）；qwen3-vl-plus / flash 改成 `budget`、默认关。
 - 新增 §4.6：快看被拒时自动退回正常看图，并加上架规矩。
