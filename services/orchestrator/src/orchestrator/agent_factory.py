@@ -164,13 +164,21 @@ from orchestrator.vl_metering import VLUsageRecorder, with_served_by
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")
 
-#: Floor for the VL (``ask_image``) router's wall-clock deadline. Reasoning
-#: vision models (e.g. doubao-seed VL) are far slower than chat — a detailed
-#: image description routinely runs tens of seconds — so the chat default
-#: (``stream_deadline_s`` = 90s) is too tight and gets compounded by the
-#: provider httpx timeout firing first + a wasted retry. The VL deadline is
-#: floored here and the provider httpx timeout is aligned to it (Stream L.L3).
-_VL_STREAM_DEADLINE_FLOOR_S = 180
+#: B-64 Task 10 —— VL(``ask_image``)路由的首 token 超时与 provider httpx 超时(秒)。
+#: 数字取自 openclaw image 工具的默认 60s。取它是为了落在 ``ASK_IMAGE_TIMEOUT_S``(120s,
+#: ``tools/vision.py``)之内:主 VL 模型卡住时 60s 就换备用,备用还剩约 60s;若大于等于
+#: 工具的整体上限,工具先把整条链取消,J-33 的 VL 备用链在「主模型卡死」这种它专门要
+#: 兜的情形下永远轮不到。
+#:
+#: 这里原先是 180s 的**下限**(Stream L.L3):当时的顾虑是推理型 VL 描述一张图要几十秒,
+#: httpx 超时先于路由 deadline 触发、再白白重试一次。60s 现在不会误杀慢而正常的调用,因为
+#: VL 走流式:``LLMRouter._drive_stream`` 的首 token 计时是**每次等下一个 delta** 各算一次
+#: (``_next_delta`` 逐个 ``wait_for``),来一个 delta 就重新计;第一个「有进展」的 delta
+#: 之后换成 idle 计时,而 ``LLMDelta.has_progress`` 把思考增量(``reasoning``)也算作进展。
+#: 流式请求的 httpx 超时设了 ``read=None``(``providers/openai.py`` / ``anthropic.py``),
+#: 只管连接/写入/取连接池,不管读流。所以 60s 真正约束的只是「开流后 60 秒内一个 delta
+#: (含思考)都没有」,持续吐思考的推理模型不会被它误杀。
+VL_FIRST_TOKEN_TIMEOUT_S = 60
 
 #: Floor for the chat / worker router wall-clock deadline. A single heavy
 #: generation (a large-context step, an orchestrator-worker doing real work)
@@ -705,15 +713,13 @@ async def build_agent(
     vl_usage_meter: VLUsageRecorder | None = None
     usage_store = middleware_env.token_usage_store if middleware_env is not None else None
     if vision_block is not None:
-        # Vision (esp. reasoning VL) is far slower than chat, so floor the VL
-        # deadline above the chat default and align the provider httpx timeout
-        # to it — otherwise the 60s httpx default fires first on a legitimately
-        # slow image call, the error-handling middleware retries, and the run
-        # burns its whole budget before the deadline even applies (Stream L.L3).
-        # ``stream_deadline_s == 0`` (deadline disabled) is honoured as-is.
+        # B-64 Task 10 —— 首 token 超时与 provider httpx 超时都取
+        # ``VL_FIRST_TOKEN_TIMEOUT_S``(manifest 的 ``stream_deadline_s`` 更小时取更小的),
+        # 低于 ask_image 的整体上限,备用链才轮得到(理由见常量注释)。
+        # ``stream_deadline_s == 0``(关掉 deadline)照旧原样尊重。
         manifest_dl = spec.spec.stream_deadline_s
         vl_deadline_s = (
-            float(max(manifest_dl, _VL_STREAM_DEADLINE_FLOOR_S)) if manifest_dl > 0 else None
+            float(min(manifest_dl, VL_FIRST_TOKEN_TIMEOUT_S)) if manifest_dl > 0 else None
         )
 
         # B-64 Task 10 —— deep 路由 = 配置原样;quick 路由 = 同一条链上每个模型各自按

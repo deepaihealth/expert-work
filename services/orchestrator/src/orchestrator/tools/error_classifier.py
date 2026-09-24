@@ -85,6 +85,21 @@ class ClassifiedToolError:
     path: str | None = None
 
 
+class GuidedTimeoutError(TimeoutError):
+    """A timeout whose recovery the raising tool knows better than the generic advice.
+
+    B-64 Task 10 — ``ask_image`` times out after its per-call cap. It stays
+    ``transient`` (run-level ledger and escalation treat it as jitter, same as
+    any timeout), but the generic "safe to retry once" advice for a read-only
+    tool is wrong here: an identical retry just burns another full window. The
+    tool supplies the advice instead, and the failure is marked not retryable.
+    """
+
+    def __init__(self, message: str, *, advice: str) -> None:
+        super().__init__(message)
+        self.advice = advice
+
+
 # ---------------------------------------------------------------------------
 # Classification (error path)
 # ---------------------------------------------------------------------------
@@ -109,6 +124,14 @@ def classify_tool_error(
         return _make("blocked_by_policy", tool_name, summary, spec)
     if isinstance(error, ToolNotFoundError):
         return _make("unknown_tool", tool_name, summary, spec)
+    if isinstance(error, GuidedTimeoutError):
+        return ClassifiedToolError(
+            tool_name=tool_name,
+            error_class="transient",
+            summary=summary,
+            retryable=False,
+            advice=error.advice,
+        )
     return _make(_classify_by_signal(error), tool_name, summary, spec)
 
 

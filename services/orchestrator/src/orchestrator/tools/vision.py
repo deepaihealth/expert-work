@@ -42,6 +42,7 @@ from orchestrator.multimodal import (
     unreadable_workspace_image_text,
 )
 from orchestrator.tools._guards import usage_total
+from orchestrator.tools.error_classifier import GuidedTimeoutError
 from orchestrator.tools.figure_lookup import resolve_rendered_figure
 from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -247,8 +248,10 @@ class AskImageTool:
         """B-64 Task 10 —— 一次 VL 调用,整体不超过 ``timeout_s``,也不超过 run 的剩余时间。
 
         超时由 ``asyncio.timeout`` 取消正在 await 的调用 —— 取消一路传进路由与厂商适配器,
-        底层流随之关闭,不是只停止等待。超时抛 ``TimeoutError``:``tools`` 节点把它包成
-        ``status="error"`` 的 ToolMessage、错误分类记成 ``transient``。调用没有返回,
+        底层流随之关闭,不是只停止等待。超时抛 :class:`GuidedTimeoutError`:``tools`` 节点
+        把它包成 ``status="error"`` 的 ToolMessage、错误分类记成 ``transient``,但恢复建议
+        换成工具自己的(不许原样重试;run 没时间了就别再调),不是只读工具默认的「可安全
+        重试一次」。调用没有返回,
         所以调用方不扣池也不记账(与 Task 9「失败不记账」一致)。
         """
         limit_s = self.timeout_s
@@ -259,7 +262,7 @@ class AskImageTool:
                 limit_s, by_run_deadline = remaining_s, True
         if limit_s <= 0:
             msg = "ask_image was not run: this run has no time left before its deadline."
-            raise TimeoutError(msg)
+            raise GuidedTimeoutError(msg, advice=_NO_TIME_LEFT_ADVICE)
         limit = asyncio.timeout(limit_s)
         try:
             async with limit:
@@ -268,7 +271,9 @@ class AskImageTool:
             # 只改写本层限时触发的那一种;调用自己抛出的 TimeoutError 原样上抛。
             if not limit.expired():
                 raise
-            raise TimeoutError(_timeout_message(limit_s, depth, by_run_deadline)) from exc
+            advice = _NO_TIME_LEFT_ADVICE if by_run_deadline else _TIMEOUT_ADVICE
+            message = _timeout_message(limit_s, depth, by_run_deadline)
+            raise GuidedTimeoutError(message, advice=advice) from exc
 
     async def _image_ref_from_args(
         self, args: Mapping[str, Any], *, ctx: ToolContext
@@ -416,12 +421,28 @@ def _spec_with_short_form() -> ToolSpec:
     )
 
 
+#: B-64 Task 10 —— 超时后的恢复建议,替换 transient + 只读工具默认的「可安全重试一次」:
+#: 原样重试只会再耗一整个窗口。
+_TIMEOUT_ADVICE = (
+    "Do not repeat the identical call. Retry only with a narrower, more specific "
+    "question, or with the default quick depth if this call used depth='deep'; "
+    "otherwise continue without this image answer."
+)
+_NO_TIME_LEFT_ADVICE = (
+    "This run has no time left. Do not call ask_image again; finish with what you already have."
+)
+
+
 def _timeout_message(limit_s: float, depth: AskImageDepth, by_run_deadline: bool) -> str:
-    seconds = f"{limit_s:.0f} seconds"
     if by_run_deadline:
-        seconds += ", the time this run had left"
+        # 不写「0 seconds」:剩余时间不到 1 秒时如实说不到 1 秒。
+        left = "less than 1 second" if limit_s < 1 else f"{limit_s:.0f} seconds"
+        return (
+            f"ask_image timed out after {left}, all the time this run had left, "
+            "and got no answer from the vision model. This run has no time left."
+        )
     msg = (
-        f"ask_image timed out ({seconds}) and got no answer from the vision model. "
+        f"ask_image timed out ({limit_s:.0f} seconds) and got no answer from the vision model. "
         "You can try again with a more specific, narrower question"
     )
     if depth == "deep":
