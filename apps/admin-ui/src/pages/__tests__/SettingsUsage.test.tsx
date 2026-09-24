@@ -82,6 +82,7 @@ const TOKENS = {
   by_kind: [
     { key: "conversation", input_tokens: 900, output_tokens: 450, cache_creation_tokens: 10, cache_read_tokens: 20 },
     { key: "skill_evolution", input_tokens: 300, output_tokens: 150, cache_creation_tokens: 0, cache_read_tokens: 0 },
+    { key: "platform_overhead", input_tokens: 77, output_tokens: 7, cache_creation_tokens: 0, cache_read_tokens: 0 },
   ],
 };
 
@@ -231,6 +232,14 @@ describe("usage kind split (SE-A43)", () => {
     expect(within(kindTable).getByText(/技能自进化|Skill evolution/)).toBeInTheDocument();
     expect(within(kindTable).getByText("300")).toBeInTheDocument();
     expect(within(kindTable).getByText(/对话|Conversation/)).toBeInTheDocument();
+  });
+
+  it("labels platform overhead (B-104 judges / rerank) instead of the raw key", async () => {
+    installAdapter({});
+    renderUsage();
+    const kindTable = await screen.findByTestId("usage-token-kind-table");
+    expect(within(kindTable).getByText(/平台开销|Platform overhead/)).toBeInTheDocument();
+    expect(within(kindTable).queryByText("platform_overhead")).not.toBeInTheDocument();
   });
 });
 
