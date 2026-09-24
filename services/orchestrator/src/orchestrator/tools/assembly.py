@@ -60,7 +60,7 @@ from orchestrator.tools.sandbox import ExecPythonTool, SandboxRuntime
 from orchestrator.tools.skill_authoring import SKILL_AUTHORING_BUILTINS
 from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerBuildFn
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH, ChildAgentBuilder, SubAgentTool
-from orchestrator.tools.vision import AskImageTool
+from orchestrator.tools.vision import AskImageTool, VLUsageMeter
 from orchestrator.tools.web_search import DEFAULT_MAX_RESULTS, TavilyClient, WebSearchTool
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.trajectory import TrajectoryRecorder
@@ -216,6 +216,7 @@ async def build_tool_registry(
     knowledge: KnowledgeSpec | None = None,
     vision: VisionSpec | None = None,
     vl_caller: LLMCaller | None = None,
+    vl_usage_meter: VLUsageMeter | None = None,
     context_window: int | None = None,
     supports_vision: bool = False,
 ) -> ToolRegistry:
@@ -236,7 +237,8 @@ async def build_tool_registry(
 
     ``vision`` is the manifest's ``spec.vision`` block (Stream J.6 Path B);
     its presence activates the ``ask_image`` tool, which routes to the
-    declared VL model via ``vl_caller``.
+    declared VL model via ``vl_caller``. ``vl_usage_meter`` (B-64 Task 9)
+    records each VL call into ``token_usage``; ``None`` records nothing.
 
     ``supports_vision`` (B-64) is the main model's native image input
     (manifest ``model.supports_vision``). Together with ``vision`` it decides
@@ -319,7 +321,7 @@ async def build_tool_registry(
     _register_subagents(registry, subagents, tool_env, subagent_depth)
     _register_spawn_worker(registry, tool_env, parent_spec, dynamic_workers, subagent_depth)
     _register_knowledge_search(registry, knowledge, tool_env)
-    _register_ask_image(registry, vision, tool_env, vl_caller)
+    _register_ask_image(registry, vision, tool_env, vl_caller, vl_usage_meter)
     # Stream HX-12 (Mini-ADR HX-I3) — small-pool escape hatch: when the
     # whole deferred pool fits comfortably in context, defer is pure
     # overhead (a find_tools round-trip per capability); activate it all.
@@ -442,6 +444,7 @@ def _register_ask_image(
     vision: VisionSpec | None,
     env: ToolEnv,
     vl_caller: LLMCaller | None,
+    vl_usage_meter: VLUsageMeter | None,
 ) -> None:
     """Register the ``ask_image`` tool when the manifest declares a
     ``vision:`` block — Stream J.6 Path B. A declared block missing
@@ -466,6 +469,7 @@ def _register_ask_image(
             vl_caller=vl_caller,
             image_resolver=env.image_resolver,
             workspace_store=env.workspace_store,
+            usage_meter=vl_usage_meter,
         )
     )
 

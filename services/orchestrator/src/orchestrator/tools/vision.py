@@ -21,9 +21,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
+from uuid import UUID
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.protocol.multimodal import (
@@ -38,6 +39,7 @@ from orchestrator.multimodal import (
     parse_rendered_figure_ref,
     unreadable_workspace_image_text,
 )
+from orchestrator.tools._guards import usage_total
 from orchestrator.tools.figure_lookup import resolve_rendered_figure
 from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -57,6 +59,14 @@ _SYSTEM_PROMPT = (
 )
 
 
+class VLUsageMeter(Protocol):
+    """B-64 Task 9 —— 一次 VL 调用的记账回调(实现见 ``orchestrator.vl_metering``)。"""
+
+    async def __call__(
+        self, response: AIMessage, *, tenant_id: UUID, user_id: UUID | None
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class AskImageTool:
     """The ``ask_image`` tool — Stream J.6 Path B.
@@ -74,6 +84,9 @@ class AskImageTool:
     #: B-64 Task 8 —— ``path`` + ``unit`` 短形态在宿主侧找渲染页要读工作区。
     #: ``None`` 时短形态不存在:只收 ``image_ref``,描述里也不提短形态。
     workspace_store: WorkspaceStore | None = None
+    #: B-64 Task 9 —— VL 调用落 ``token_usage`` 的记账回调。``None`` = 这次构建没接
+    #: 用量存储(测试 / 无控制面),与主模型那边不装 ``TokenUsageMiddleware`` 同义。
+    usage_meter: VLUsageMeter | None = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -169,6 +182,13 @@ class AskImageTool:
         ]
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
             response = await self.vl_caller(messages=messages, tools=[])
+        # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
+        # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
+        # 两样都不做,也与主模型一致。
+        if ctx.token_budget is not None:
+            ctx.token_budget.add(usage_total(response.usage_metadata))
+        if self.usage_meter is not None:
+            await self.usage_meter(response, tenant_id=ctx.tenant_id, user_id=ctx.user_id)
         answer = _stringify(response.content) or "[VL model returned no text]"
         # Surface VL provenance in the ToolMessage artifact (event stream /
         # audit): the image ref plus the VL call's token usage — otherwise the

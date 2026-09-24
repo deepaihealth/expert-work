@@ -160,6 +160,7 @@ from orchestrator.tools.skill_seed import (
 )
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
+from orchestrator.vl_metering import VLUsageRecorder, with_served_by
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")
 
@@ -696,6 +697,12 @@ async def build_agent(
     # router shares the agent's wall-clock cap so a hung VL provider doesn't
     # outlive an otherwise-cancelled run.
     vl_caller: LLMCaller | None = None
+    # B-64 Task 9 —— VL 调用的记账。主模型的用量由 after_llm_call 链上的
+    # TokenUsageMiddleware 落行,那条链只在 agent 节点里跑;ask_image 在工具里直接调
+    # vl_caller,绕开了它。没接用量存储时(测试 / 无控制面)两边都不记,VL 路由也不加
+    # 盖章层 —— 与改动前逐字节一致。
+    vl_usage_meter: VLUsageRecorder | None = None
+    usage_store = middleware_env.token_usage_store if middleware_env is not None else None
     if vision_block is not None:
         # Vision (esp. reasoning VL) is far slower than chat, so floor the VL
         # deadline above the chat default and align the provider httpx timeout
@@ -710,7 +717,13 @@ async def build_agent(
         vl_caller = await build_llm_router(
             vision_block.model,
             secret_store=secret_store,
-            around_llm_chain=chains.around_llm_call,
+            # B-64 Task 9 —— 记账要知道备用链上**实际应答**的是哪个模型,只有路由知道;
+            # 盖章层把应答句柄盖到响应上(见 ``orchestrator.vl_metering``)。
+            around_llm_chain=(
+                with_served_by(chains.around_llm_call)
+                if usage_store is not None
+                else chains.around_llm_call
+            ),
             image_resolver=env.image_resolver,
             first_token_timeout_s=vl_deadline_s,
             # VL also streams (same OpenAI provider), so pass the same idle
@@ -724,6 +737,18 @@ async def build_agent(
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
         )
+        if usage_store is not None:
+            vl_chain = _flatten_chain(vision_block.model)
+            for extra in vision_block.fallbacks:
+                vl_chain.extend(_flatten_chain(extra))
+            vl_usage_meter = VLUsageRecorder(
+                store=usage_store,
+                agent_name=spec.metadata.name,
+                agent_version=spec.metadata.version,
+                usage_kind=token_usage_kind,
+                models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in vl_chain},
+                default=(vision_block.model.provider, vision_block.model.name),
+            )
     # Stream J.7a (Mini-ADR J-23) — resolve + merge declared skills BEFORE the
     # tool registry so the sandbox tools can be bound with the skill seed-file
     # set (skill-runtime §5.1 auto-mount). ``_load_skills`` is pure-read and does
@@ -837,6 +862,7 @@ async def build_agent(
         # (Path A wins), so ask_image is not wired in that case.
         vision=vision_block,
         vl_caller=vl_caller,
+        vl_usage_meter=vl_usage_meter,
         # Stream HX-12 — feeds the small-deferred-pool escape hatch.
         context_window=_resolved_context_window(spec.spec.model),
         # B-64 —— read_page 的回执按实际投递路径说;与下面 build_react_graph /
