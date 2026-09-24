@@ -52,6 +52,23 @@ ENV UV_CONCURRENT_DOWNLOADS=8 \
     UV_HTTP_TIMEOUT=120
 RUN uv sync --frozen --no-dev --no-editable --package expert-work-control-plane
 
+# B-106 —— 分词表构建期打进镜像。tiktoken 第一次 get_encoding 时同步去
+# openaipublic.blob.core.windows.net 下 BPE 文件(o200k_base 3.6MB),从
+# 测试集群实测 56~63s;run 里第一次估算 token 正好卡在事件循环上,存活探针
+# 把 pod 杀掉,每个新进程重来一遍,永远下不完。
+#
+# 用镜像里那一份 tiktoken 下载,TIKTOKEN_CACHE_DIR 与 runtime 阶段同一路径:
+# 缓存文件名是 URL 的 sha1,命中时再按内容 sha256 校验(tiktoken 0.14.0
+# load.py:35-58 read_file_cached),所以只要同版本、同路径就走得到命中分支。
+# 两份都要:o200k_base 给 run 的 token 估算器,cl100k_base 给知识库分块
+# (control_plane/knowledge/chunking.py 在模块导入时加载)。
+#
+# 下载失败必须让构建失败 —— 设了 TIKTOKEN_CACHE_DIR 时 tiktoken 写缓存失败
+# 也会抛;最后再数一遍文件,宁可构建红也不打出一个没有分词表的镜像。
+ENV TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
+RUN /app/.venv/bin/python -c "import tiktoken; [tiktoken.get_encoding(n) for n in ('o200k_base', 'cl100k_base')]" \
+    && test "$(ls /app/tiktoken-cache | wc -l)" -eq 2
+
 
 FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
@@ -72,6 +89,11 @@ WORKDIR /app
 RUN useradd --uid 10000 --no-create-home --shell /usr/sbin/nologin expert_work
 
 COPY --from=builder --chown=expert_work:expert_work /app/.venv /app/.venv
+
+# B-106 —— 构建期下好的两份分词表(见 builder 阶段)。只读即可:缓存命中
+# 不写文件。
+COPY --from=builder --chown=expert_work:expert_work /app/tiktoken-cache /app/tiktoken-cache
+ENV TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
 
 # Alembic assets for the compose ``migrate`` service. ``alembic.ini`` has
 # ``script_location = %(here)s/migrations``, so this layout resolves to
