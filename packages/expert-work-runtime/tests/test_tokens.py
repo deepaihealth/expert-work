@@ -1,20 +1,24 @@
 """Tests for :mod:`expert_work.runtime.tokens` — Stream HX-1.
 
 The estimator suite stays network-free: every test that needs a real
-encoding injects a fake one; the single smoke test that loads the
-actual ``o200k_base`` BPE skips itself when the file cannot be
-fetched (offline CI must never fail on the fail-open path).
+encoding injects a fake one; the smoke tests that load the actual
+``o200k_base`` BPE skip themselves when the file cannot be fetched
+(offline CI must never fail on the fail-open path).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import tiktoken.load
 from langchain_core.messages import AIMessage, HumanMessage
 from tiktoken import Encoding
 
+import expert_work.runtime.tokens as tokens_module
 from expert_work.runtime.tokens import (
     CHARS_PER_TOKEN,
     CharTokenEstimator,
@@ -24,6 +28,7 @@ from expert_work.runtime.tokens import (
     estimate_message,
     estimate_messages,
     flatten_message,
+    warm_default_estimator,
 )
 
 
@@ -114,6 +119,78 @@ def test_estimate_messages_sums_per_message() -> None:
 
 def test_default_estimator_is_a_process_singleton() -> None:
     assert default_estimator() is default_estimator()
+
+
+def test_warm_default_estimator_loads_the_shared_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-106 —— 预热的必须是 run 里用的那个进程级单例,不是另 new 一个。"""
+    monkeypatch.setattr(tokens_module, "_default_instance", None)
+    fake = _FakeEncoding()
+    encoding = cast(Encoding, fake)
+    monkeypatch.setattr(tiktoken, "get_encoding", lambda name: encoding)
+    assert warm_default_estimator() is True
+    shared = default_estimator()
+    assert isinstance(shared, TiktokenEstimator)
+    assert shared._encoding is encoding
+    shared.count("abc")
+    assert fake.calls == 1  # run 路径直接用已加载的编码
+
+
+def test_warm_failure_is_permanent_no_reload_in_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-106 —— 预热失败后 run 内不再尝试加载(不在事件循环上重下)。"""
+    monkeypatch.setattr(tokens_module, "_default_instance", None)
+    calls: list[str] = []
+
+    def _offline(name: str) -> Encoding:
+        calls.append(name)
+        raise OSError("offline")
+
+    monkeypatch.setattr(tiktoken, "get_encoding", _offline)
+    assert warm_default_estimator() is False
+    assert default_estimator().count("abcdefgh") == 8 // CHARS_PER_TOKEN
+    assert calls == ["o200k_base"]
+
+
+def test_cache_dir_hit_never_downloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-106 —— 镜像依赖的 tiktoken 行为:缓存目录里有且哈希对就不下载。
+
+    文件名 = URL 的 sha1,内容按 sha256 校验(tiktoken ``load.read_file_cached``)。
+    """
+    blobpath = "https://example.invalid/o200k_base.tiktoken"
+    data = b"aGk= 0\n"
+    (tmp_path / hashlib.sha1(blobpath.encode(), usedforsecurity=False).hexdigest()).write_bytes(
+        data
+    )
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path))
+
+    def _no_network(path: str) -> bytes:
+        raise AssertionError(f"tiktoken tried to download {path}")
+
+    monkeypatch.setattr(tiktoken.load, "read_file", _no_network)
+    got = tiktoken.load.read_file_cached(blobpath, hashlib.sha256(data).hexdigest())
+    assert got == data
+
+
+def test_real_o200k_loads_from_cache_dir_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """真 o200k_base:先填缓存目录(同 Dockerfile builder),再断网重建编码。"""
+    from tiktoken_ext import openai_public  # type: ignore[import-untyped]
+
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(tmp_path))
+    try:
+        openai_public.o200k_base()
+    except Exception:
+        pytest.skip("o200k_base BPE unavailable (offline) — cannot seed the cache dir")
+
+    def _no_network(path: str) -> bytes:
+        raise AssertionError(f"tiktoken tried to download {path}")
+
+    monkeypatch.setattr(tiktoken.load, "read_file", _no_network)
+    assert openai_public.o200k_base()["name"] == "o200k_base"
 
 
 def test_real_o200k_smoke_cjk_far_above_chars_heuristic() -> None:

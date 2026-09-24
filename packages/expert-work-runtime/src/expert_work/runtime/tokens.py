@@ -103,6 +103,17 @@ class TiktokenEstimator:
                     self._memo.popitem(last=False)
         return value
 
+    def warm(self) -> bool:
+        """Load the BPE vocabulary now; ``True`` iff it is usable.
+
+        B-106 —— 首次加载是同步文件 / 网络 I/O(无缓存时 tiktoken 会从海外
+        下载约 3.6MB,测试集群实测 56~63s),而 :meth:`count` 在 run 里是从
+        事件循环线程调的。调用方(control-plane lifespan)必须经
+        ``asyncio.to_thread`` 在就绪前调它,让 run 从不碰到首次加载。失败沿用
+        fail-open:标记失败后 run 内不再重试,直接走 ``chars // 4``。
+        """
+        return self._load_encoding() is not None
+
     def _count_uncached(self, text: str) -> int:
         encoding = self._load_encoding()
         if encoding is None:
@@ -238,3 +249,15 @@ def default_estimator() -> TokenEstimator:
         if _default_instance is None:
             _default_instance = TiktokenEstimator()
         return _default_instance
+
+
+def warm_default_estimator() -> bool:
+    """预热 :func:`default_estimator` 那个进程级单例 —— run 里用的同一个对象。
+
+    阻塞调用,调用方负责放到线程里(``asyncio.to_thread``)。返回 ``False``
+    表示分词表不可用、已永久回落 ``chars // 4``。
+    """
+    estimator = default_estimator()
+    if isinstance(estimator, TiktokenEstimator):
+        return estimator.warm()
+    return False
