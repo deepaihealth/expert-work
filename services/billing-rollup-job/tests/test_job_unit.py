@@ -24,6 +24,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.tenant_config.memory import InMemoryTenantConfigStore
 from expert_work.persistence.token_usage_store import (
+    PLATFORM_OVERHEAD_USAGE_KIND,
     InMemoryTokenUsageStore,
     TokenUsageRecord,
 )
@@ -84,6 +85,7 @@ async def _add_usage(
     output_tokens: int = 0,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
+    usage_kind: str = "conversation",
 ) -> None:
     stored = await usage.insert(
         TokenUsageRecord(
@@ -96,6 +98,7 @@ async def _add_usage(
             output_tokens=output_tokens,
             cache_creation_tokens=cache_creation_tokens,
             cache_read_tokens=cache_read_tokens,
+            usage_kind=usage_kind,
         )
     )
     # Pin observed_at (insert() stamps now()).
@@ -179,6 +182,36 @@ async def test_basic_pricing(tenants, usage, rates, ledger) -> None:
     assert bucket.base_cost_micros == 52_500
     assert bucket.billed_cost_micros == 52_500  # billed == base (markup 0)
     assert bucket.markup_cost_micros == 0
+
+
+@pytest.mark.asyncio
+async def test_platform_overhead_rows_stay_off_the_tenant_bill(
+    tenants: InMemoryTenantConfigStore,
+    usage: InMemoryTokenUsageStore,
+    rates: InMemoryModelRateCardStore,
+    ledger: InMemoryTenantBillingLedgerStore,
+) -> None:
+    # B-104 — judges / rerank spend is metered as ``platform_overhead``: visible to
+    # ops and to the run's token breaker, but it is the platform's cost.
+    tenant = await _add_tenant(tenants, plan=TenantPlan.PRO)
+    at = datetime(2026, 6, 10, tzinfo=UTC)
+    for kind, tokens in (("conversation", 1000), (PLATFORM_OVERHEAD_USAGE_KIND, 700)):
+        await _add_usage(
+            usage,
+            tenant_id=tenant,
+            model="claude-opus-4-8",
+            provider="anthropic",
+            observed_at=at,
+            input_tokens=tokens,
+            usage_kind=kind,
+        )
+    await _add_rate(rates, provider="anthropic", model="claude-opus-4-8", input_micros=15)
+
+    report = await _job(tenants, usage, rates, ledger).run_once(month=MONTH)
+
+    assert report.usage_rows_priced == 1
+    rows = await ledger.list_for_tenant(tenant_id=tenant, month=MONTH)
+    assert [(r.input_tokens, r.base_cost_micros) for r in rows] == [(1000, 15_000)]
 
 
 # ---------------------------------------------------------------------------
