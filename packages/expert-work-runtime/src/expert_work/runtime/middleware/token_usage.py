@@ -3,7 +3,7 @@
 For every LLM call we:
 
 1. Increment a Prometheus counter
-   ``expert_work_llm_token_usage_total{tenant_id, agent_name, model, type}`` so
+   ``expert_work_llm_token_usage_total{tenant_id, agent_name, model, type, usage_kind}`` so
    dashboards (Grafana / per-tenant per-agent token spend) and alerts
    see usage in real time.
 2. Persist one row in the ``token_usage`` table (via
@@ -64,20 +64,33 @@ _TOKEN_TYPE_CACHE_READ = "cache_read"  # noqa: S105
 _llm_token_usage_total = expert_work_counter(
     "expert_work_llm_token_usage_total",
     "Tokens consumed per LLM call, split by type (Stream G.9).",
-    ("tenant_id", "agent_name", "model", "type"),
+    # B-104 —— ``usage_kind``:run 内除主循环外的调用(规划 / 压缩 / 记忆 / 评审 /
+    # 重排序…)也走这里,面板与比值按 kind 区分(``platform_overhead`` 不计费)。
+    ("tenant_id", "agent_name", "model", "type", "usage_kind"),
 )
 
 #: Stream HX-1 (Mini-ADR HX-A6) — estimated prompt tokens, accumulated
 #: alongside the actual counts above so dashboards can derive the
 #: estimator drift ratio in PromQL:
 #: ``rate(expert_work_ew_token_estimated_total) /
-#: rate(expert_work_llm_token_usage_total{type=~"input|cache_.*"})``.
+#: rate(expert_work_ew_token_estimate_actual_total)``.
 #: A counter pair instead of a ratio histogram because the repo metric
 #: convention reserves histograms for durations (``_seconds``).
 _ew_token_estimated_total = expert_work_counter(
     "expert_work_ew_token_estimated_total",
     "Estimated prompt tokens per LLM call (Stream HX-1 drift numerator).",
-    ("tenant_id", "agent_name", "model"),
+    ("tenant_id", "agent_name", "model", "usage_kind"),
+)
+
+#: B-104 —— 漂移比的分母:**同一批**调用(带估算器、非缓存命中、有 prompt 视图)的上游
+#: 实报 prompt tokens(input + cache_creation + cache_read)。原来分母用
+#: ``expert_work_llm_token_usage_total`` 的全部调用,而只有主循环带估算器 —— 看图、规划、
+#: 压缩、记忆、评审、重排序这些不估算的调用只进分母,比值被系统性压低。
+_ew_token_estimate_actual_total = expert_work_counter(
+    "expert_work_ew_token_estimate_actual_total",
+    "Provider-reported prompt tokens of the calls counted in "
+    "expert_work_ew_token_estimated_total (HX-1 drift denominator, B-104).",
+    ("tenant_id", "agent_name", "model", "usage_kind"),
 )
 
 
@@ -145,12 +158,14 @@ class TokenUsageMiddleware:
                 agent_name=self.agent_name,
                 model=self.model,
                 type=_TOKEN_TYPE_INPUT,
+                usage_kind=self.usage_kind,
             ).inc(input_t)
             _llm_token_usage_total.labels(
                 tenant_id=tenant_label,
                 agent_name=self.agent_name,
                 model=self.model,
                 type=_TOKEN_TYPE_OUTPUT,
+                usage_kind=self.usage_kind,
             ).inc(output_t)
             if cache_creation_t > 0:
                 _llm_token_usage_total.labels(
@@ -158,6 +173,7 @@ class TokenUsageMiddleware:
                     agent_name=self.agent_name,
                     model=self.model,
                     type=_TOKEN_TYPE_CACHE_CREATION,
+                    usage_kind=self.usage_kind,
                 ).inc(cache_creation_t)
             if cache_read_t > 0:
                 _llm_token_usage_total.labels(
@@ -165,6 +181,7 @@ class TokenUsageMiddleware:
                     agent_name=self.agent_name,
                     model=self.model,
                     type=_TOKEN_TYPE_CACHE_READ,
+                    usage_kind=self.usage_kind,
                 ).inc(cache_read_t)
         except Exception:
             logger.warning(
@@ -188,7 +205,14 @@ class TokenUsageMiddleware:
                         tenant_id=tenant_label,
                         agent_name=self.agent_name,
                         model=self.model,
+                        usage_kind=self.usage_kind,
                     ).inc(estimated)
+                    _ew_token_estimate_actual_total.labels(
+                        tenant_id=tenant_label,
+                        agent_name=self.agent_name,
+                        model=self.model,
+                        usage_kind=self.usage_kind,
+                    ).inc(input_t + cache_creation_t + cache_read_t)
                 except Exception:
                     logger.warning(
                         "token_usage.estimate_failed tenant=%s agent=%s model=%s",

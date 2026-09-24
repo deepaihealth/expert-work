@@ -19,7 +19,7 @@
 | 7 | Session end-to-end P95（outcome=success）| < 30s（M0 Gate）| 30d | `expert_work_session_duration_seconds{outcome="success"}` | ✅ 指标已 emit（Stream M Gate follow-up）|
 | 8 | Run 成功率（排除用户中止） | TBD（基线数据未到，不预设） | 30d | `expert_work_session_duration_seconds_count{outcome}` 推导（Mini-ADR HX-D1） | ✅ rule 已落（HX-4） |
 | 9 | Run 瞬态重试恢复率 | TBD | 30d | `expert_work_orchestrator_run_retry_total{outcome}` | ✅ 指标已 emit（HX-3），rule 已落（HX-4） |
-| 10 | Token 估算漂移比 | ~1.0 ± 0.15（观察性，非告警线） | 7d | `expert_work_ew_token_estimated_total` / `expert_work_llm_token_usage_total{type=~"input\|cache_.*"}` | ✅ 指标已 emit（HX-1），rule 已落（HX-4） |
+| 10 | Token 估算漂移比 | ~1.0 ± 0.15（观察性，非告警线） | 7d | `expert_work_ew_token_estimated_total{usage_kind="conversation"}` / `expert_work_ew_token_estimate_actual_total{usage_kind="conversation"}`(B-104:分母只取被估算的同一批调用) | ✅ 指标已 emit（HX-1），rule 已落（HX-4） |
 | 11 | Checkpoint IO P95（per op） | TBD | 30d | `expert_work_checkpoint_op_seconds{op}` | ✅ 指标已 emit（HX-4） |
 | 12 | Pending approvals 积压 | 告警线 TBD（持续增长告警，M1 Alertmanager） | 即时 | `expert_work_control_plane_approvals_pending` gauge | ✅ 指标已 emit（HX-4） |
 | 13 | Sandbox 池命中率（临时沙盒） | TBD（基线数据未到；池仅覆盖无 user_id acquire——持久用户首触不可池化，Mini-ADR HX-F2） | 30d | `expert_work_sandbox_pool_total{event=hit/miss}` → `Expert Work:sli:sandbox_pool_hit:ratio1h` | ✅ 指标已 emit（HX-6），rule 已落 |

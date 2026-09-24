@@ -204,7 +204,7 @@ expert_work.orchestrator.session_run
 
 | metric | type | labels | 用途 |
 |---|---|---|---|
-| `expert_work_llm_token_usage_total` | counter | `tenant_id,agent_name,model,type` | 每次 LLM 调用 token 消耗，按 type 分（G.9） |
+| `expert_work_llm_token_usage_total` | counter | `tenant_id,agent_name,model,type,usage_kind` | 每次 LLM 调用 token 消耗，按 type 分（G.9）；`usage_kind` 区分对话 / 平台开销等（B-104） |
 | `expert_work_llm_billed_cost_micros` | gauge | `tenant,model` | rollup 计算的计费成本（µUSD）/租户·模型·月 |
 | `expert_work_llm_stream_stale_total` | counter | `provider_key` | provider 超 `stream_deadline_s`（L.L3） |
 | `expert_work_llm_auth_refresh_total` | counter | `provider_key,result` | OAuth provider 401 触发的凭证刷新（L.L8） |
@@ -314,7 +314,8 @@ expert_work.orchestrator.session_run
 | `expert_work_built_agent_cache_entries` | gauge | `scope` | in-process built-agent 缓存现存条目数，按 scope（二期 PR2 T4；此前漏登记） |
 | `expert_work_trajectory_recorded_total` | counter | `outcome` | 成功写 ObjectStore 的轨迹（L.L7） |
 | `expert_work_trajectory_record_errors_total` | counter | `outcome,reason` | 轨迹写失败（吞掉以保终态路径干净） |
-| `expert_work_ew_token_estimated_total` | counter | `tenant_id,agent_name,model` | 每次 LLM 调用估算 prompt token（HX-1 drift 分子） |
+| `expert_work_ew_token_estimated_total` | counter | `tenant_id,agent_name,model,usage_kind` | 每次 LLM 调用估算 prompt token（HX-1 drift 分子） |
+| `expert_work_ew_token_estimate_actual_total` | counter | `tenant_id,agent_name,model,usage_kind` | 同一批被估算调用的实报 prompt token（HX-1 drift 分母，B-104） |
 | `expert_work_checkpoint_op_seconds` | histogram | `op` | checkpointer 每次 IO 调用 wall-clock |
 
 > 计：counter ~84 / histogram 9 / gauge ~14；共 107。

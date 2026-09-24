@@ -28,7 +28,9 @@ from expert_work.runtime.middleware import MiddlewareContext
 from expert_work.runtime.middleware.token_usage import TokenUsageMiddleware
 
 
-def _counter_sample(tenant_id: str, agent_name: str, model: str, type_: str) -> float:
+def _counter_sample(
+    tenant_id: str, agent_name: str, model: str, type_: str, usage_kind: str = "conversation"
+) -> float:
     value = REGISTRY.get_sample_value(
         "expert_work_llm_token_usage_total",
         {
@@ -36,6 +38,7 @@ def _counter_sample(tenant_id: str, agent_name: str, model: str, type_: str) -> 
             "agent_name": agent_name,
             "model": model,
             "type": type_,
+            "usage_kind": usage_kind,
         },
     )
     return value or 0.0
@@ -298,10 +301,32 @@ async def test_persist_failure_does_not_propagate() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _estimated_sample(tenant_id: str, agent_name: str, model: str) -> float:
+def _estimated_sample(
+    tenant_id: str, agent_name: str, model: str, usage_kind: str = "conversation"
+) -> float:
     value = REGISTRY.get_sample_value(
         "expert_work_ew_token_estimated_total",
-        {"tenant_id": tenant_id, "agent_name": agent_name, "model": model},
+        {
+            "tenant_id": tenant_id,
+            "agent_name": agent_name,
+            "model": model,
+            "usage_kind": usage_kind,
+        },
+    )
+    return value or 0.0
+
+
+def _actual_sample(
+    tenant_id: str, agent_name: str, model: str, usage_kind: str = "conversation"
+) -> float:
+    value = REGISTRY.get_sample_value(
+        "expert_work_ew_token_estimate_actual_total",
+        {
+            "tenant_id": tenant_id,
+            "agent_name": agent_name,
+            "model": model,
+            "usage_kind": usage_kind,
+        },
     )
     return value or 0.0
 
@@ -424,3 +449,44 @@ async def test_usage_kind_defaults_conversation_and_overrides() -> None:
 
     kinds = [r.usage_kind for r in await store.list_for_tenant(tenant_id=tenant_id)]
     assert sorted(kinds) == ["conversation", "skill_evolution"]
+
+
+@pytest.mark.asyncio
+async def test_counters_carry_the_usage_kind_label() -> None:
+    """B-104 —— 评审 / 重排序的 ``platform_overhead`` 与对话花费在指标上分得开:
+    漂移比与租户面板按 ``usage_kind`` 取同一口径。"""
+    mw = TokenUsageMiddleware(
+        store=InMemoryTokenUsageStore(),
+        agent_name="b104-kind-label",
+        agent_version="1.0.0",
+        model="qwen-max",
+        usage_kind="platform_overhead",
+        estimator=_FixedEstimator(),
+    )
+    tenant_id = uuid4()
+    await mw(_usage_ctx(tenant_id, prompt=[HumanMessage(content="abcd")]), _noop)
+
+    tenant = str(tenant_id)
+    assert _counter_sample(tenant, "b104-kind-label", "qwen-max", "input", "platform_overhead") > 0
+    assert _counter_sample(tenant, "b104-kind-label", "qwen-max", "input") == 0
+    assert _estimated_sample(tenant, "b104-kind-label", "qwen-max", "platform_overhead") == 4
+    assert _estimated_sample(tenant, "b104-kind-label", "qwen-max") == 0
+    # 漂移比的分母:同一批被估算的调用的实报 prompt tokens。
+    assert _actual_sample(tenant, "b104-kind-label", "qwen-max", "platform_overhead") == 100
+
+
+@pytest.mark.asyncio
+async def test_drift_denominator_skips_calls_without_an_estimator() -> None:
+    """B-104 —— 不带估算器的调用(看图 / 规划 / 评审…)只进用量计数器,不进漂移分母。"""
+    mw = TokenUsageMiddleware(
+        store=InMemoryTokenUsageStore(),
+        agent_name="b104-no-estimator",
+        agent_version="1.0.0",
+        model="qwen-max",
+    )
+    tenant_id = uuid4()
+    await mw(_usage_ctx(tenant_id, prompt=[HumanMessage(content="abcd")]), _noop)
+
+    tenant = str(tenant_id)
+    assert _counter_sample(tenant, "b104-no-estimator", "qwen-max", "input") == 100
+    assert _actual_sample(tenant, "b104-no-estimator", "qwen-max") == 0
