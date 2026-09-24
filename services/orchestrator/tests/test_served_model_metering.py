@@ -11,6 +11,7 @@ B-103:worker 事件帧的 ``usage_by_model`` 原来按 worker 主模型单桶汇
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +40,7 @@ from expert_work.runtime.middleware import (
 )
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MiddlewareEnv, build_agent
+from orchestrator.sse import _to_jsonable
 from orchestrator.tools._guards import TokenBudget
 from orchestrator.tools.registry import ToolSpec
 from orchestrator.usage_metering import SERVED_BY_KEY, ServedModelResolver
@@ -341,3 +343,150 @@ async def test_cache_hit_row_stays_under_the_configured_model() -> None:
     await _record(_middleware(store), _stamped("qwen:qwen-max", None), cache_hit=True)
     rows = await store.list_for_tenant(tenant_id=_TENANT)
     assert [(r.provider, r.model, r.input_tokens) for r in rows] == [(*_MAIN, 0)]
+
+
+@pytest.mark.asyncio
+async def test_second_level_fallback_is_recorded_under_its_own_name(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """备用的备用(嵌套备用树)接管 → 记第二层备用的配置名。"""
+    brain = _Brain()
+    _patch(monkeypatch, brain, hung={_MAIN[1], _QWEN[1]})
+    spec = _spec(
+        {
+            "model": {
+                "provider": _MAIN[0],
+                "name": _MAIN[1],
+                "fallback": [
+                    {
+                        "provider": _QWEN[0],
+                        "name": _QWEN[1],
+                        "fallback": [{"provider": "kimi", "name": "kimi-k3"}],
+                    }
+                ],
+            }
+        }
+    )
+
+    run = await _run(spec)
+
+    assert run.model_of("main") == ("kimi", "kimi-k3")
+    assert run.by_model == {("kimi", "kimi-k3"): _PURPOSE_INPUT["main"]}
+
+
+# ---------------------------------------------------------------------------
+# 盖章只给记账:不进 state / checkpoint / updates 帧(对外 legacy 流与 run_event 的来源)
+# ---------------------------------------------------------------------------
+
+
+async def _stream_updates(
+    spec: AgentSpec, store: InMemoryTokenUsageStore
+) -> tuple[list[str], list[BaseMessage], list[BaseMessage]]:
+    """跑一轮,返回 ``(updates 帧 JSON, 流结束时的 state 消息, checkpoint 里的消息)``。
+
+    ``updates`` 帧按 ``sse._to_jsonable`` 序列化 —— run_event 落库与对外 legacy 流
+    转发的就是这份。
+    """
+    frames: list[str] = []
+    async with make_checkpointer("memory") as cp:
+        built = await build_agent(
+            spec,
+            secret_store=LocalDevSecretStore.from_mapping({_KEY: "sk-test"}),
+            checkpointer=cp,
+            provider_key_resolver=_any_key,
+            middleware_env=MiddlewareEnv(token_usage_store=store),
+        )
+        config = _config(TokenBudget(limit=10_000_000))
+        final: dict[str, Any] = {}
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "run"):
+            async for mode, chunk in built.graph.astream(
+                {
+                    "messages": [HumanMessage(content="plan my week")],
+                    "step_count": 0,
+                    "max_steps": 5,
+                },
+                config=config,
+                stream_mode=["updates", "values"],
+            ):
+                if mode == "updates":
+                    frames.append(json.dumps(_to_jsonable(chunk)))
+                elif isinstance(chunk, dict):
+                    final = chunk
+        snapshot = await built.graph.aget_state(config)
+    return frames, list(final["messages"]), list(snapshot.values["messages"])
+
+
+def _assert_no_stamp(
+    frames: list[str], state: list[BaseMessage], checkpoint: list[BaseMessage]
+) -> None:
+    assert frames
+    assert all(SERVED_BY_KEY not in frame for frame in frames)
+    for message in [*state, *checkpoint]:
+        assert SERVED_BY_KEY not in message.response_metadata, message
+
+
+@pytest.mark.asyncio
+async def test_served_by_stamp_never_leaves_the_metering(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    brain = _Brain()
+    _patch(monkeypatch, brain, hung={_MAIN[1]})
+    spec = _spec(
+        {
+            "model": {
+                "provider": _MAIN[0],
+                "name": _MAIN[1],
+                "fallback": [{"provider": _QWEN[0], "name": _QWEN[1]}],
+            }
+        }
+    )
+    store = InMemoryTokenUsageStore()
+
+    frames, state, checkpoint = await _stream_updates(spec, store)
+
+    _assert_no_stamp(frames, state, checkpoint)
+    # 厂商回显的别名这类非章元数据照旧保留。
+    assert state[-1].response_metadata == {"model_name": "qwen-max-latest"}
+    # 剥章在记账之后:行仍记实际应答者。
+    rows = await store.list_for_tenant(tenant_id=_TENANT)
+    assert [(r.provider, r.model) for r in rows] == [_QWEN]
+
+
+@pytest.mark.asyncio
+async def test_structured_resend_candidate_and_answer_carry_no_stamp(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """结构化收尾:候选不合 schema → 重发。两次调用都记在备用名下,state 里都没有章。"""
+    usage = {"input_tokens": _PURPOSE_INPUT["main"], "output_tokens": 1, "total_tokens": 101}
+    brain = _Brain(
+        main_replies=[
+            AIMessage(content="four out of five", usage_metadata=usage),
+            AIMessage(content='{"score": 4}', usage_metadata=usage),
+        ]
+    )
+    _patch(monkeypatch, brain, hung={_MAIN[1]})
+    spec = _spec(
+        {
+            "model": {
+                "provider": _MAIN[0],
+                "name": _MAIN[1],
+                "fallback": [{"provider": _QWEN[0], "name": _QWEN[1]}],
+            },
+            "output_schema": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {"score": {"type": "integer"}},
+                    "required": ["score"],
+                    "additionalProperties": False,
+                }
+            },
+        }
+    )
+    store = InMemoryTokenUsageStore()
+
+    frames, state, checkpoint = await _stream_updates(spec, store)
+
+    assert brain.purposes == ["main", "main"], "应当发生一次结构化重发"
+    _assert_no_stamp(frames, state, checkpoint)
+    rows = await store.list_for_tenant(tenant_id=_TENANT)
+    assert [(r.provider, r.model) for r in rows] == [_QWEN, _QWEN]

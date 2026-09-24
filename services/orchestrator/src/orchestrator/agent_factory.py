@@ -784,12 +784,12 @@ async def build_agent(
         if quick_model != vision_block.model or quick_fallbacks != list(vision_block.fallbacks):
             quick_vl_caller = await _vl_router(quick_model, quick_fallbacks)
         if usage_store is not None:
-            vl_chain = _flatten_chain(vision_block.model)
+            vl_models = chain_models(vision_block.model)
             for extra in vision_block.fallbacks:
-                vl_chain.extend(_flatten_chain(extra))
+                vl_models.update(chain_models(extra))
             vl_usage_meter = conversation_usage.meter(
                 default=(vision_block.model.provider, vision_block.model.name),
-                models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in vl_chain},
+                models=vl_models,
             )
     # Stream J.7a (Mini-ADR J-23) — resolve + merge declared skills BEFORE the
     # tool registry so the sandbox tools can be bound with the skill seed-file

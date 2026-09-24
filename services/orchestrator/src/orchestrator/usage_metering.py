@@ -100,6 +100,22 @@ class ServedByStamp:
             )
 
 
+def without_served_by(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """去掉消息上的盖章 —— 记账用完就剥,不进 state / checkpoint / 对外帧。
+
+    章的值是句柄 key,多 key 时带 ``#序号``,会透露平台为该厂商配了几把凭据;它只给
+    记账用。没有章的消息原样返回(同一个对象),有章的用 ``model_copy`` 换新。
+    """
+    out: list[BaseMessage] = []
+    for message in messages:
+        meta = message.response_metadata
+        if SERVED_BY_KEY in meta:
+            rest = {k: v for k, v in meta.items() if k != SERVED_BY_KEY}
+            message = message.model_copy(update={"response_metadata": rest})
+        out.append(message)
+    return out
+
+
 def with_served_by(chain: MiddlewareChain | None) -> MiddlewareChain:
     """带盖章的 ``around_llm_call`` 链:原链整条包进 :class:`ServedByStamp`。"""
     return MiddlewareChain.from_middlewares("around_llm_call", [ServedByStamp(inner=chain)])
