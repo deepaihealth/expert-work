@@ -117,8 +117,8 @@ def _patch_router(monkeypatch: pytest.MonkeyPatch, caller: _Caller) -> _RouterFa
 
 
 class _StubTenantConfig:
-    async def get(self, tenant_id: UUID) -> None:
-        del tenant_id
+    async def get(self, tenant_id: UUID) -> None:  # 桩:任何租户都没有配置
+        return None
 
 
 def _credentials() -> CredentialsResolver:
@@ -228,6 +228,8 @@ async def _run_judges(
                     user_request="summarise", tool_name="read_file", tool_args={"path": "a"}
                 )
             except RuntimeError:
+                # 桩评审模型不返回合法判定时会抛 RuntimeError;本测试只断言记账行,
+                # 判定结果不在范围内,所以吞掉是有意的。
                 pass
     finally:
         var_child_runnable_config.reset(token)

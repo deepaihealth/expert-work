@@ -127,8 +127,8 @@ def tracing() -> Iterator[None]:
 
 
 class _StubTenantConfig:
-    async def get(self, tenant_id: UUID) -> None:
-        del tenant_id
+    async def get(self, tenant_id: UUID) -> None:  # 桩:任何租户都没有配置
+        return None
 
 
 def _credentials() -> CredentialsResolver:
