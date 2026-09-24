@@ -165,6 +165,7 @@ from orchestrator.usage_metering import (
     ScopedReranker,
     UsageIdentity,
     UsageMeter,
+    chain_models,
     overhead_usage_kind,
     with_served_by,
 )
@@ -669,6 +670,15 @@ async def build_agent(
         context_window=_resolved_context_window(spec.spec.model),
         token_usage_kind=token_usage_kind,
     )
+    usage_store = middleware_env.token_usage_store if middleware_env is not None else None
+    # B-102 —— 记账要知道备用链上**实际应答**的是哪个模型,只有路由知道:有用量存储时,
+    # 主循环 / 规划 / 反思(及套在它们上的压缩、记忆调用)与思考升档的路由都加盖章层
+    # (见 ``orchestrator.usage_metering``)。没接存储时不加,与改动前逐字节一致。
+    step_llm_chain = (
+        with_served_by(chains.around_llm_call)
+        if usage_store is not None
+        else chains.around_llm_call
+    )
     # Stream J.11 — resolve the LLM router for each step class; the
     # planner / reflect nodes may route to a different model than the
     # agent loop. Stream J.6 — the image resolver threads into every
@@ -677,7 +687,7 @@ async def build_agent(
     routers = await build_step_routers(
         spec,
         secret_store=secret_store,
-        around_llm_chain=chains.around_llm_call,
+        around_llm_chain=step_llm_chain,
         image_resolver=env.image_resolver,
         provider_key_resolver=provider_key_resolver,
         # Stream Y-2 — manifest-pinned api_key_ref is ignored for agent builds
@@ -697,7 +707,7 @@ async def build_agent(
         escalated_llm_caller = await build_llm_router(
             escalated_spec,
             secret_store=secret_store,
-            around_llm_chain=chains.around_llm_call,
+            around_llm_chain=step_llm_chain,
             image_resolver=env.image_resolver,
             first_token_timeout_s=escalated_first_token,
             idle_timeout_s=escalated_idle,
@@ -718,7 +728,6 @@ async def build_agent(
     # vl_caller,绕开了它。没接用量存储时(测试 / 无控制面)两边都不记,VL 路由也不加
     # 盖章层 —— 与改动前逐字节一致。
     vl_usage_meter: UsageMeter | None = None
-    usage_store = middleware_env.token_usage_store if middleware_env is not None else None
     # B-104 —— run 内其余模型调用的记账身份(见 ``orchestrator.usage_metering``):用 Agent
     # 自己模型的调用记本次构建的 kind(与主循环同口径),用平台模型的调用(重排序)对话构建
     # 记 ``platform_overhead``、其它构建随构建 kind。没接用量存储时只扣 token 池、不落行。
@@ -2615,10 +2624,7 @@ def _step_model(spec: AgentSpec, when: str) -> ModelSpec:
 
 def _step_meter(identity: UsageIdentity, model: ModelSpec) -> UsageMeter:
     """B-104 —— 一个调用点的记账器;口径覆盖该路由的整条备用链。"""
-    return identity.meter(
-        default=(model.provider, model.name),
-        models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in _flatten_chain(model)},
-    )
+    return identity.meter(default=(model.provider, model.name), models=chain_models(model))
 
 
 def _metered(caller: LLMCaller, identity: UsageIdentity, model: ModelSpec) -> MeteredLLMCaller:

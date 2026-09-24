@@ -30,11 +30,16 @@ Agent identity (``agent_name`` / ``agent_version`` / ``model``) is
 baked into the middleware instance at construction by
 :func:`build_middleware_chains` — same pattern as
 :class:`LLMCacheStoreMiddleware`.
+
+B-102 —— ``model`` / ``provider`` 是**配置的主模型**;备用模型接管时,``served_by``
+(构建期给的解析器)从响应上认出**实际应答**的模型条目,行与计数器都记在它的配置名
+下(不用厂商回显的 ``response_metadata.model_name``)。缓存命中没有模型应答,仍记主模型。
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -120,6 +125,9 @@ class TokenUsageMiddleware:
     # the prompt that was actually sent (``payload["prompt_messages"]``) so
     # the drift counter accumulates next to the provider-reported truth.
     estimator: TokenEstimator | None = None
+    # B-102 —— 响应 → 实际应答模型的配置 ``(provider, model)``;``None`` 时一律记
+    # ``provider`` / ``model``。
+    served_by: Callable[[AIMessage], tuple[str, str]] | None = None
 
     name: str = "token_usage"
     anchor: str = "after_llm_call"
@@ -147,6 +155,10 @@ class TokenUsageMiddleware:
                 return
             counts = (0, 0, 0, 0)
         input_t, output_t, cache_creation_t, cache_read_t = counts
+        provider: str | None = self.provider
+        model = self.model
+        if self.served_by is not None and ctx.payload.get("cache_hit") is not True:
+            provider, model = self.served_by(response)
 
         # Counter — even when cache_hit=True we increment so dashboards
         # show the fact that a call landed; counts may legitimately be
@@ -156,14 +168,14 @@ class TokenUsageMiddleware:
             _llm_token_usage_total.labels(
                 tenant_id=tenant_label,
                 agent_name=self.agent_name,
-                model=self.model,
+                model=model,
                 type=_TOKEN_TYPE_INPUT,
                 usage_kind=self.usage_kind,
             ).inc(input_t)
             _llm_token_usage_total.labels(
                 tenant_id=tenant_label,
                 agent_name=self.agent_name,
-                model=self.model,
+                model=model,
                 type=_TOKEN_TYPE_OUTPUT,
                 usage_kind=self.usage_kind,
             ).inc(output_t)
@@ -171,7 +183,7 @@ class TokenUsageMiddleware:
                 _llm_token_usage_total.labels(
                     tenant_id=tenant_label,
                     agent_name=self.agent_name,
-                    model=self.model,
+                    model=model,
                     type=_TOKEN_TYPE_CACHE_CREATION,
                     usage_kind=self.usage_kind,
                 ).inc(cache_creation_t)
@@ -179,7 +191,7 @@ class TokenUsageMiddleware:
                 _llm_token_usage_total.labels(
                     tenant_id=tenant_label,
                     agent_name=self.agent_name,
-                    model=self.model,
+                    model=model,
                     type=_TOKEN_TYPE_CACHE_READ,
                     usage_kind=self.usage_kind,
                 ).inc(cache_read_t)
@@ -188,7 +200,7 @@ class TokenUsageMiddleware:
                 "token_usage.counter_failed tenant=%s agent=%s model=%s",
                 tenant_label,
                 self.agent_name,
-                self.model,
+                model,
                 exc_info=True,
             )
 
@@ -204,13 +216,13 @@ class TokenUsageMiddleware:
                     _ew_token_estimated_total.labels(
                         tenant_id=tenant_label,
                         agent_name=self.agent_name,
-                        model=self.model,
+                        model=model,
                         usage_kind=self.usage_kind,
                     ).inc(estimated)
                     _ew_token_estimate_actual_total.labels(
                         tenant_id=tenant_label,
                         agent_name=self.agent_name,
-                        model=self.model,
+                        model=model,
                         usage_kind=self.usage_kind,
                     ).inc(input_t + cache_creation_t + cache_read_t)
                 except Exception:
@@ -218,7 +230,7 @@ class TokenUsageMiddleware:
                         "token_usage.estimate_failed tenant=%s agent=%s model=%s",
                         tenant_label,
                         self.agent_name,
-                        self.model,
+                        model,
                         exc_info=True,
                     )
 
@@ -234,8 +246,8 @@ class TokenUsageMiddleware:
                     tenant_id=tenant_id,
                     agent_name=self.agent_name,
                     agent_version=self.agent_version,
-                    model=self.model,
-                    provider=self.provider,
+                    model=model,
+                    provider=provider,
                     user_id=usage_user_id,
                     usage_kind=self.usage_kind,
                     input_tokens=input_t,
@@ -250,7 +262,7 @@ class TokenUsageMiddleware:
                 "token_usage.persist_failed tenant=%s agent=%s model=%s",
                 tenant_label,
                 self.agent_name,
-                self.model,
+                model,
                 exc_info=True,
             )
 

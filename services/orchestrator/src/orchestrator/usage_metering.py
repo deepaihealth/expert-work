@@ -23,8 +23,10 @@
 「实际应答的是谁」只有路由知道:它按句柄逐个试,每个句柄的调用各包一层
 ``around_llm_call`` 链,``payload["provider_key"]`` 就是句柄 key(``provider:model``,
 多 key 时带 ``#序号``)。:class:`ServedByStamp` 在这一层把 key 盖到响应的
-``response_metadata`` 上,:class:`UsageMeter` 读它换回 ``(provider, model)``;没有盖章
-的响应记在该调用点配置的主模型名下。
+``response_metadata`` 上,:class:`ServedModelResolver` 读它换回该模型条目的**配置**
+``(provider, model)``(B-102:不用厂商回显的 ``model_name``,那会带别名);没有盖章
+的响应记在该调用点配置的主模型名下。主循环的 ``TokenUsageMiddleware`` 用同一个解析器
+(``served_by``),所以同一张表只有一种含义:实际应答的模型。
 
 run 的上下文(tenant / user / token 池)怎么来:
 
@@ -60,7 +62,7 @@ from expert_work.runtime.middleware import (
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget, usage_total
 
 if TYPE_CHECKING:
-    from expert_work.protocol import StructuredOutputSpec
+    from expert_work.protocol import ModelSpec, StructuredOutputSpec
     from orchestrator.llm import LLMCaller
     from orchestrator.llm.providers._streaming import LLMDelta
     from orchestrator.tools.knowledge import Reranker
@@ -80,7 +82,7 @@ class ServedByStamp:
     """
 
     inner: MiddlewareChain | None
-    name: str = "vl_served_by"
+    name: str = "served_by"
     anchor: str = "around_llm_call"
     after: tuple[str, ...] = field(default_factory=tuple)
     before: tuple[str, ...] = field(default_factory=tuple)
@@ -101,6 +103,39 @@ class ServedByStamp:
 def with_served_by(chain: MiddlewareChain | None) -> MiddlewareChain:
     """带盖章的 ``around_llm_call`` 链:原链整条包进 :class:`ServedByStamp`。"""
     return MiddlewareChain.from_middlewares("around_llm_call", [ServedByStamp(inner=chain)])
+
+
+@dataclass(frozen=True)
+class ServedModelResolver:
+    """响应 → 实际应答模型的配置 ``(provider, model)``。
+
+    ``models``:句柄 group(``provider:model``,不带 ``#序号``)→ ``(provider, model)``,
+    覆盖该路由的整条链(主模型 + 它的备用)。响应上没有盖章、或盖的 key 不在表里,记
+    ``default``(该路由配置的主模型)。
+    """
+
+    default: tuple[str, str]
+    models: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+
+    def __call__(self, response: AIMessage) -> tuple[str, str]:
+        key = response.response_metadata.get(SERVED_BY_KEY)
+        if isinstance(key, str):
+            group = key if key in self.models else key.rpartition("#")[0]
+            found = self.models.get(group)
+            if found is not None:
+                return found
+        return self.default
+
+
+def chain_models(model: ModelSpec) -> dict[str, tuple[str, str]]:
+    """``model`` 与它整棵备用树上每个条目的 ``group → (provider, model)``。"""
+    models: dict[str, tuple[str, str]] = {}
+    pending = [model]
+    while pending:
+        entry = pending.pop()
+        models[f"{entry.provider}:{entry.name}"] = (entry.provider, entry.name)
+        pending.extend(entry.fallback)
+    return models
 
 
 async def _noop(_ctx: MiddlewareContext) -> None:
@@ -168,13 +203,7 @@ class UsageMeter:
             await self(response, tenant_id=tenant_id, user_id=user_id)
 
     def _served(self, response: AIMessage) -> tuple[str, str]:
-        key = response.response_metadata.get(SERVED_BY_KEY)
-        if isinstance(key, str):
-            group = key if key in self.models else key.rpartition("#")[0]
-            found = self.models.get(group)
-            if found is not None:
-                return found
-        return self.default
+        return ServedModelResolver(default=self.default, models=self.models)(response)
 
 
 @dataclass(frozen=True)
