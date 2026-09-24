@@ -207,10 +207,10 @@ _FIGURE_INVENTORY_MAIN = (
 _CHART_URI = "http://schemas.openxmlformats.org/drawingml/2006/chart"
 _DIAGRAM_URI = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
 _MAX_NOTES = 500
-_PDF_EMPTY_CHARS = 20
-_PDF_EMPTY_ABS_MIN = 2
-_PDF_EMPTY_RATIO_MIN = 0.20
-_PDF_EMPTY_ABS_ALWAYS = 10
+_PDF_EMPTY_CHARS = _P["pdf_empty_page_chars"]
+_PDF_EMPTY_ABS_MIN = _P["pdf_empty_abs_min"]
+_PDF_EMPTY_RATIO_MIN = _P["pdf_empty_ratio_min"]
+_PDF_EMPTY_ABS_ALWAYS = _P["pdf_empty_abs_always"]
 
 
 def _pptx_inventory(full):
@@ -388,6 +388,11 @@ def build_figure_inventory_wrapper(rel: str, *, ws: str, max_bytes: int) -> str:
             "max_bytes": max_bytes,
             "min_figure_edge_pt": MIN_FIGURE_EDGE_PT,
             "min_figure_area_ratio": MIN_FIGURE_AREA_RATIO,
+            # PDF 空页三重阈值同理:片段里只读 ``_P``,真值只在模块头部这一份。
+            "pdf_empty_page_chars": _PDF_EMPTY_PAGE_CHARS,
+            "pdf_empty_abs_min": _PDF_EMPTY_ABS_MIN,
+            "pdf_empty_ratio_min": _PDF_EMPTY_RATIO_MIN,
+            "pdf_empty_abs_always": _PDF_EMPTY_ABS_ALWAYS,
         },
         _FIGURE_INVENTORY_MAIN,
     )

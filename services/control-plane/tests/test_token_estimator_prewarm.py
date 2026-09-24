@@ -17,7 +17,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 import control_plane.app as app_module
-from control_plane.app import create_app
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle, ShutdownState
 from tests.auth_fixtures import build_test_jwt_verifier
@@ -51,7 +50,7 @@ def _app_with_spy(
     lifecycle = Lifecycle()
     spy = _PrewarmSpy(lifecycle, result=result)
     monkeypatch.setattr(app_module, "warm_default_estimator", spy)
-    app = create_app(
+    app = app_module.create_app(
         settings=Settings(_env_file=None),  # type: ignore[call-arg]
         lifecycle=lifecycle,
         jwt_verifier=build_test_jwt_verifier(),
