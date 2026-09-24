@@ -532,6 +532,27 @@ describe("summarizeTurn — usage buckets by (provider, model)", () => {
     expect(s.usageByModel[0].usage.totalTokens).toBe(220);
   });
 
+  it("files each bucket of one worker end frame under its own (provider, model) — B-103", () => {
+    // 一个 worker 里主模型、备用、看图各记在实际应答的模型名下:一帧多桶。
+    const main = { input_tokens: 300, output_tokens: 30, total_tokens: 330 };
+    const vision = { input_tokens: 800, output_tokens: 40, total_tokens: 840 };
+    const events: SseEvent[] = [
+      workerEndByModel(
+        [
+          { provider: "anthropic", model: "claude-sonnet-4-6", ...main },
+          { provider: "qwen", model: "qwen-vl-max", ...vision },
+        ],
+        { input_tokens: 1_100, output_tokens: 70, total_tokens: 1_170 },
+      ),
+    ];
+    const s = summarizeTurn(events);
+    expect(s.usageByModel.map((b) => [b.provider, b.model, b.usage.totalTokens])).toEqual([
+      ["anthropic", "claude-sonnet-4-6", 330],
+      ["qwen", "qwen-vl-max", 840],
+    ]);
+    expect(s.usage?.totalTokens).toBe(1_170);
+  });
+
   it("falls back to an unattributed bucket when a worker end frame carries usage but no usage_by_model", () => {
     // 老后端 / 模型未知:退回今天的算法 —— 按主 Agent 的费率算,不是丢掉。
     const events: SseEvent[] = [
