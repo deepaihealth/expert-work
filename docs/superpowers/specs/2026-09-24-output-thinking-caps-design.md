@@ -94,6 +94,12 @@
 - 「思考长度上限」：放在「推理深度」下面。模型支持时可以编辑；不支持时置灰，并写「该模型只能调思考档位，不能限制思考长度。」
 - 文案按用户要求保持简洁。
 
+### 4.6 看图快看（ask_image depth=quick）的通用兜底
+
+- 快看的机制本身不针对任何厂商：`_thinking_off` 按目录把看图模型的思考关掉，关的方式和 Agent 配置里关思考走同一条路。它的缺口不在机制，在**目录登记错**和**有几家没法真调**（§8.6）。
+- **兜底**：快看请求被厂商以参数错误拒掉（4xx，不含 401/403/429）时，自动按 Agent 原本的看图配置（等同 deep）重试一次，并计指标 `expert_work_vision_quick_fallback_total{provider,model}`、打 warning 日志。这样新接入的模型即使关思考的参数写错，最坏也只是退回正常看图，不会看图失败。OpenAI（`minimal` 不在 gpt-5.5 取值表里、没有 key 实调）在真调之前就靠这一层兜住。
+- **上架规矩**（写进 `model_catalog.py` 模块注释）：新增或修改带视觉的模型，目录必须写明思考形态（开关 / 档位 / 预算）、默认开还是关、怎么关，并用 T0 探针（`thinking disabled` / `enable_thinking=false` / 默认各一次）实调后再合并。
+
 ## 5. 真调核实（实现之前先做，结果回填目录）
 
 在测试集群 pod 里跑探针，直接用平台 key 调厂商，只打印聚合结果。每个型号的核对项：
@@ -119,7 +125,7 @@
 | T1 | 目录加字段、填值；`effort_map` / `effort_off` 迁入目录，并改写两个 payload 函数（附等价测试：已核实的这几家，线格式和今天逐字节一致，除非 T0 证明今天发错了） | T0 |
 | T2 | `ModelSpec.max_tokens` 改为可空、新增 `thinking_max_tokens`、保存校验；provider 按目录发送输出上限 | T1 |
 | T3 | alembic 数据迁移（§4.3）+ seed_canary | T2 |
-| T4 | 截断的标准化、`OutputTruncatedError`、指标 | T2 |
+| T4 | 截断的标准化、`OutputTruncatedError`、指标；§4.6 快看被拒时退回正常看图 | T2 |
 | T5 | 配置页：两个字段、置灰、文案、i18n | T2 |
 | T6 | 测试环境发布，真栈回归：ai-health-plan 读 PDF 场景 + sop2-designer 长输出场景，各 5 家主模型设小 cap 一次，确认截断报错可见 | 全部 |
 
@@ -178,9 +184,21 @@ PR 切分倾向：T0 不进 PR；T1–T4 一个后端 PR；T5 一个前端 PR；
 2. **豆包的档位从来没生效过**：见 8.2。T1 改成 `reasoning_effort`，档位对照：low→low、medium→medium、high→high、max→high。
 3. 豆包默认思考非常长（小题 9K token、high 超过 3 分钟）。这和 B-64 真栈看到的 11,753 token 一致。看图默认走快看（关思考）已经避开了这一点；主模型用豆包时，建议配置页在豆包上提示「默认思考很长」—— 列为可选项，不在本期范围。
 
+### 8.6 看图模型的「关思考」补测（2026-09-24）
+
+| 模型 | 厂商默认 | 关思考 | 目录现状 | 处理 |
+|---|---|---|---|---|
+| glm-4.6v | **默认思考**（小题超过 180 秒没答完；显式开时思考 2,114） | `thinking.type=disabled` 有效（思考 0，完成 28） | `thinking=None` → **快看完全不起作用** | 改成 `toggle` + 默认开；4.5v 同一族，实调后再同样处理 |
+| glm-5v-turbo | 默认思考（1,767） | disabled 有效 | toggle | 不变 |
+| kimi-k2.6 | 默认思考（1,883） | disabled 有效 | toggle | 不变 |
+| qwen3-vl-plus / flash | **默认不思考** | `enable_thinking=false` 有效；显式开时思考 5K | `thinking=None` → 用户开不了思考 | 改成 `budget` + 默认关 |
+| qwen3.6-plus | 默认思考 | `enable_thinking=false` 有效 | budget | 不变 |
+| Anthropic opus / sonnet、OpenAI gpt-5.5 系列 | —（没有 key） | 未测 | effort | 靠 §4.6 的兜底；OpenAI 档位映射见拍板点 ② |
+
 ### 8.5 对设计的修正
 
 - §4.0：不需要拼合计（每家都有真正的合计字段）。
 - §4.1：`output_cap_field` 按 8.1 填。
 - §4.2：通义的 `thinking_budget` 已实测是硬上限，按原设计做。
-- T1 补两条目录修正：glm-5.3 标 `always_thinking`；豆包档位从 `budget` 改成 `effort` 形态。
+- T1 补目录修正：glm-5.3 标 `always_thinking`；豆包档位从 `budget` 改成 `effort` 形态；glm-4.6v / 4.5v 改成 `toggle`（4.5v 先实调）；qwen3-vl-plus / flash 改成 `budget`、默认关。
+- 新增 §4.6：快看被拒时自动退回正常看图，并加上架规矩。
