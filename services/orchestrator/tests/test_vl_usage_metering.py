@@ -38,7 +38,7 @@ from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools.registry import ToolContext, ToolSpec
 from orchestrator.tools.vision import AskImageTool
-from orchestrator.vl_metering import SERVED_BY_KEY, VLUsageRecorder, with_served_by
+from orchestrator.usage_metering import SERVED_BY_KEY, UsageMeter, with_served_by
 
 _TENANT = UUID("11111111-1111-1111-1111-111111111111")
 _USER = UUID("33333333-3333-3333-3333-333333333333")
@@ -102,8 +102,8 @@ async def _rows(store: InMemoryTokenUsageStore) -> list[TokenUsageRecord]:
     return sorted(await store.list_for_tenant(tenant_id=_TENANT), key=lambda r: r.id or 0)
 
 
-def _recorder(store: InMemoryTokenUsageStore) -> VLUsageRecorder:
-    return VLUsageRecorder(
+def _recorder(store: InMemoryTokenUsageStore) -> UsageMeter:
+    return UsageMeter(
         store=store,
         agent_name="ai-health-plan",
         agent_version="1.2.0",

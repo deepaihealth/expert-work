@@ -63,6 +63,7 @@ from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ
 from expert_work.persistence.skill.base import SkillStore
 from expert_work.persistence.tenant_config import TenantConfigStore
+from expert_work.persistence.token_usage_store import PLATFORM_OVERHEAD_USAGE_KIND
 from expert_work.persistence.trigger.base import TriggerStore
 from expert_work.protocol import (
     AgentSpec,
@@ -160,7 +161,13 @@ from orchestrator.tools.skill_seed import (
 )
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
-from orchestrator.vl_metering import VLUsageRecorder, with_served_by
+from orchestrator.usage_metering import (
+    MeteredLLMCaller,
+    ScopedReranker,
+    UsageIdentity,
+    UsageMeter,
+    with_served_by,
+)
 
 logger = logging.getLogger("expert_work.orchestrator.agent_factory")
 
@@ -710,8 +717,18 @@ async def build_agent(
     # TokenUsageMiddleware 落行,那条链只在 agent 节点里跑;ask_image 在工具里直接调
     # vl_caller,绕开了它。没接用量存储时(测试 / 无控制面)两边都不记,VL 路由也不加
     # 盖章层 —— 与改动前逐字节一致。
-    vl_usage_meter: VLUsageRecorder | None = None
+    vl_usage_meter: UsageMeter | None = None
     usage_store = middleware_env.token_usage_store if middleware_env is not None else None
+    # B-104 —— run 内其余模型调用的记账身份(见 ``orchestrator.usage_metering``):用 Agent
+    # 自己模型的调用记本次构建的 kind(与主循环同口径),用平台模型的调用(重排序)记
+    # ``platform_overhead``。没接用量存储时只扣 token 池、不落行。
+    conversation_usage = UsageIdentity(
+        store=usage_store,
+        agent_name=spec.metadata.name,
+        agent_version=spec.metadata.version,
+        usage_kind=token_usage_kind,
+    )
+    platform_usage = replace(conversation_usage, usage_kind=PLATFORM_OVERHEAD_USAGE_KIND)
     if vision_block is not None:
         # B-64 Task 10 —— 首 token 超时与 provider httpx 超时都取
         # ``VL_FIRST_TOKEN_TIMEOUT_S``(manifest 的 ``stream_deadline_s`` 更小时取更小的),
@@ -730,7 +747,7 @@ async def build_agent(
                 model,
                 secret_store=secret_store,
                 # B-64 Task 9 —— 记账要知道备用链上**实际应答**的是哪个模型,只有路由知道;
-                # 盖章层把应答句柄盖到响应上(见 ``orchestrator.vl_metering``)。
+                # 盖章层把应答句柄盖到响应上(见 ``orchestrator.usage_metering``)。
                 around_llm_chain=(
                     with_served_by(chains.around_llm_call)
                     if usage_store is not None
@@ -761,13 +778,9 @@ async def build_agent(
             vl_chain = _flatten_chain(vision_block.model)
             for extra in vision_block.fallbacks:
                 vl_chain.extend(_flatten_chain(extra))
-            vl_usage_meter = VLUsageRecorder(
-                store=usage_store,
-                agent_name=spec.metadata.name,
-                agent_version=spec.metadata.version,
-                usage_kind=token_usage_kind,
-                models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in vl_chain},
+            vl_usage_meter = conversation_usage.meter(
                 default=(vision_block.model.provider, vision_block.model.name),
+                models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in vl_chain},
             )
     # Stream J.7a (Mini-ADR J-23) — resolve + merge declared skills BEFORE the
     # tool registry so the sandbox tools can be bound with the skill seed-file
@@ -859,6 +872,16 @@ async def build_agent(
     # keeping that path byte-identical.
     if token_usage_kind != "conversation":  # noqa: S105 — usage label, not a secret
         env = _bind_delegation_usage_kind(env, token_usage_kind)
+    # B-104 —— 知识库重排序的 LLM 分支记在本 agent 名下(``platform_overhead``)。
+    retriever = env.knowledge_retriever
+    if retriever is not None and retriever.reranker is not None:
+        env = replace(
+            env,
+            knowledge_retriever=replace(
+                retriever,
+                reranker=ScopedReranker(inner=retriever.reranker, identity=platform_usage),
+            ),
+        )
 
     registry = await build_tool_registry(
         spec.spec.tools,
@@ -897,7 +920,10 @@ async def build_agent(
     # structured dispatch turns (see ``build_react_graph(plan_first=...)``).
     plan_first = spec.spec.workflow.execution_mode == "plan_first"
     planner_node = (
-        make_planner_node(routers.planning, plan_first=plan_first)
+        make_planner_node(
+            _metered(routers.planning, conversation_usage, _step_model(spec, "planning")),
+            plan_first=plan_first,
+        )
         if spec.spec.workflow.type == "plan_execute"
         else None
     )
@@ -914,7 +940,7 @@ async def build_agent(
     reflection = spec.spec.reflection
     reflect_node = (
         make_reflect_node(
-            routers.reflection,
+            _metered(routers.reflection, conversation_usage, _step_model(spec, "reflection")),
             budget=reflection.budget,
             deadline_s=reflection.deadline_s,
         )
@@ -923,8 +949,14 @@ async def build_agent(
     )
     # Stream J.3 — long-term memory recall / write-back nodes when the
     # manifest declares ``memory.long_term``.
+    # B-104 —— 记忆读时校验 / 查询改写 / 写回抽取 / 写回归并与对话压缩摘要都用 Agent 主
+    # 模型的路由,套一层记账;主循环自己用的 ``routers.default`` 不套(它在 agent 节点里记)。
+    metered_default = _metered(routers.default, conversation_usage, spec.spec.model)
     memory_recall_node, memory_writeback_node, pre_compaction_flush = _build_memory_nodes(
-        spec, memory_env=memory_env, llm_caller=routers.default
+        spec,
+        memory_env=memory_env,
+        llm_caller=metered_default,
+        rerank_usage=platform_usage,
     )
     # Stream L.L2 — context compressor preflight + summariser. The
     # default summariser shares the agent's main LLM router; a future
@@ -952,7 +984,7 @@ async def build_agent(
                 head_keep,
             )
         context_compressor = ContextCompressor(
-            llm_caller=routers.default,
+            llm_caller=metered_default,
             context_window=_resolved_context_window(spec.spec.model),
             threshold_pct=cc_policy.threshold_pct,
             head_keep=head_keep,
@@ -2491,6 +2523,7 @@ def _build_memory_nodes(
     *,
     memory_env: MemoryEnv | None,
     llm_caller: LLMCaller,
+    rerank_usage: UsageIdentity | None = None,
 ) -> tuple[MemoryNode | None, MemoryNode | None, PreCompactionFlush | None]:
     """Build ``(memory_recall, memory_writeback, pre_compaction_flush)`` — Stream J.3 / CM-3.
 
@@ -2519,7 +2552,13 @@ def _build_memory_nodes(
         embedder=env.embedder,
         top_k=long_term.retrieve_top_k,
         tenant_config_store=env.tenant_config_store,
-        reranker=env.reranker,  # Stream CM-4 — None → no rerank (pre-CM-4 behaviour)
+        # Stream CM-4 — None → no rerank (pre-CM-4 behaviour)。B-104 —— 重排序的 LLM
+        # 分支记在本 agent 名下(``platform_overhead``)。
+        reranker=(
+            ScopedReranker(inner=env.reranker, identity=rerank_usage)
+            if env.reranker is not None and rerank_usage is not None
+            else env.reranker
+        ),
         agent_name=agent_name,
         # Stream Memory-Enhance (M-3) — read-time verification uses the agent's
         # own chat model (no platform credential); fail-open inside the node.
@@ -2559,6 +2598,28 @@ def _build_memory_nodes(
         else None
     )
     return recall, writeback, pre_compaction_flush
+
+
+def _step_model(spec: AgentSpec, when: str) -> ModelSpec:
+    """``when`` 这一类步骤实际用的模型 —— 与 :func:`build_step_routers` 同一取法
+    (没有规则用主模型;多条同类规则时后一条覆盖前一条)。"""
+    model = spec.spec.model
+    if spec.spec.routing is not None:
+        for rule in spec.spec.routing.rules:
+            if rule.when == when:
+                model = rule.model
+    return model
+
+
+def _metered(caller: LLMCaller, identity: UsageIdentity, model: ModelSpec) -> MeteredLLMCaller:
+    """B-104 —— 给一个调用点的路由套记账;记账口径覆盖该路由的整条备用链。"""
+    return MeteredLLMCaller(
+        inner=caller,
+        meter=identity.meter(
+            default=(model.provider, model.name),
+            models={f"{m.provider}:{m.name}": (m.provider, m.name) for m in _flatten_chain(model)},
+        ),
+    )
 
 
 def _flatten_chain(model: ModelSpec) -> list[ModelSpec]:

@@ -145,6 +145,12 @@ def _totals_from_buckets(buckets: Sequence[ModelTokenTotals]) -> TokenTotals:
     )
 
 
+#: B-104 —— run 内用**平台模型**的调用(输出 / 工具调用安全评审、知识库 / 记忆重排序)
+#: 记这个 kind:运营用量页按 kind 可见、计入 run 的 token 熔断;不进对外对话用量
+#: (对外口径只取 ``conversation``),也不进客户账单(billing rollup 跳过它)。
+PLATFORM_OVERHEAD_USAGE_KIND = "platform_overhead"
+
+
 @dataclass(frozen=True)
 class TokenUsageRecord:
     """One LLM-call row. ``id`` / ``observed_at`` are ``None`` pre-insert."""
