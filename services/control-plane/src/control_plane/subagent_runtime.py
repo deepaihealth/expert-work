@@ -425,6 +425,10 @@ def make_child_agent_builder(
             platform_tool_budget_config_service=platform_tool_budget_config_service,
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
+            # B-104 —— 评审调用的 ``platform_overhead`` 行,与主路径同一个存储。
+            token_usage_store=(
+                middleware_env.token_usage_store if middleware_env is not None else None
+            ),
         )
         built = await build_agent(
             child_spec,
@@ -634,6 +638,10 @@ def make_worker_build_fn(
             platform_tool_budget_config_service=platform_tool_budget_config_service,
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
+            # B-104 —— 评审调用的 ``platform_overhead`` 行,与主路径同一个存储。
+            token_usage_store=(
+                middleware_env.token_usage_store if middleware_env is not None else None
+            ),
         )
         built = await build_agent(
             worker_spec,

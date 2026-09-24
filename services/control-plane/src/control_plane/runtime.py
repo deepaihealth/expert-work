@@ -49,7 +49,10 @@ from expert_work.persistence import ArtifactStore, KnowledgeStore
 from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from expert_work.persistence.skill import SkillStore
-from expert_work.persistence.token_usage_store import TokenUsageStore
+from expert_work.persistence.token_usage_store import (
+    PLATFORM_OVERHEAD_USAGE_KIND,
+    TokenUsageStore,
+)
 from expert_work.persistence.trigger import TriggerStore
 from expert_work.protocol import (
     AgentSpec,
@@ -133,6 +136,11 @@ from orchestrator.tools import (
     WorkspaceStore,
 )
 from orchestrator.trajectory.recorder import TrajectoryRecorder
+from orchestrator.usage_metering import (
+    MeteredLLMCaller,
+    UsageIdentity,
+    current_usage_identity,
+)
 
 
 #: Builds a runnable agent from a manifest. The production builder
@@ -643,6 +651,7 @@ async def _build_judge_caller(
     judge_config_service: PlatformJudgeConfigService | None,
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
+    token_usage_store: TokenUsageStore | None = None,
 ) -> LLMCaller:
     """Stream PI-3-A2 — the LLM caller backing the output/action judges.
 
@@ -664,12 +673,23 @@ async def _build_judge_caller(
             provider, name = cast(Provider, configured[0]), configured[1]
     secret_ref = await credentials_resolver.resolve_provider(tenant_id=tenant_id, provider=provider)
     judge_spec = ModelSpec(provider=provider, name=name, api_key_ref=secret_ref)
-    return await build_llm_router(
+    router = await build_llm_router(
         judge_spec,
         secret_store=secret_store,
         http_client=http_client,
         # 波 2 线 A — the judge's provider handle draws from the same global bucket.
         rate_limiter_factory=rate_limiter_factory,
+    )
+    # B-104 —— 评审调用记 ``platform_overhead``(按用途分:退回 Agent 主模型时也是),记在
+    # 本 agent 名下、计入 run 的 token 池;没接用量存储时只扣池。
+    return MeteredLLMCaller(
+        inner=router,
+        meter=UsageIdentity(
+            store=token_usage_store,
+            agent_name=spec.metadata.name,
+            agent_version=spec.metadata.version,
+            usage_kind=PLATFORM_OVERHEAD_USAGE_KIND,
+        ).meter(default=(provider, name)),
     )
 
 
@@ -682,6 +702,7 @@ async def _make_output_judge(
     judge_config_service: PlatformJudgeConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
+    token_usage_store: TokenUsageStore | None = None,
 ) -> OutputJudge | None:
     """Stream PI-2b-3 / PI-3-A2 — build the output judge when the manifest opts
     in (``defenses.output_judge == "block"``), over the platform judge model
@@ -696,6 +717,7 @@ async def _make_output_judge(
         judge_config_service=judge_config_service,
         http_client=http_client,
         rate_limiter_factory=rate_limiter_factory,
+        token_usage_store=token_usage_store,
     )
     return LLMOutputJudge(caller=caller)
 
@@ -709,6 +731,7 @@ async def _make_action_judge(
     judge_config_service: PlatformJudgeConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
+    token_usage_store: TokenUsageStore | None = None,
 ) -> ActionJudge | None:
     """Stream PI-3b-2 — build the action judge when the manifest opts in
     (``defenses.action_screen != "off"``), over the platform judge model (or
@@ -723,6 +746,7 @@ async def _make_action_judge(
         judge_config_service=judge_config_service,
         http_client=http_client,
         rate_limiter_factory=rate_limiter_factory,
+        token_usage_store=token_usage_store,
     )
     return LLMActionJudge(caller=caller)
 
@@ -746,6 +770,7 @@ async def resolve_defenses(
     platform_tool_budget_config_service: PlatformToolBudgetConfigService | None = None,
     http_client: httpx.AsyncClient | None = None,
     rate_limiter_factory: RateLimiterFactory | None = None,
+    token_usage_store: TokenUsageStore | None = None,
 ) -> ResolvedDefenses:
     """Resolve the model-backed judges + the platform tool-budget switch for a build.
 
@@ -773,6 +798,7 @@ async def resolve_defenses(
             judge_config_service=platform_judge_config_service,
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
+            token_usage_store=token_usage_store,
         )
         if credentials_resolver is not None and tenant_id is not None
         else None
@@ -786,6 +812,7 @@ async def resolve_defenses(
             judge_config_service=platform_judge_config_service,
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
+            token_usage_store=token_usage_store,
         )
         if credentials_resolver is not None and tenant_id is not None
         else None
@@ -1001,6 +1028,10 @@ def make_agent_builder(
             platform_tool_budget_config_service=platform_tool_budget_config_service,
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
+            # B-104 —— 评审调用落 ``platform_overhead`` 行用的存储(与主模型同一个)。
+            token_usage_store=(
+                middleware_env.token_usage_store if middleware_env is not None else None
+            ),
         )
         return await build_agent(
             spec,
@@ -1120,6 +1151,15 @@ def _is_dashscope_rerank_model(provider: str, model: str) -> bool:
     return provider == "qwen" and "rerank" in model.lower()
 
 
+def _metered_rerank(router: LLMCaller, provider: str, model: str) -> LLMCaller:
+    """B-104 —— 重排序的 LLM 分支:run 内(``ScopedReranker`` 放了记账身份)套记账,
+    记 ``platform_overhead``、记在调用它的 agent 名下;run 外(检索测试接口等)原样。"""
+    identity = current_usage_identity()
+    if identity is None:
+        return router
+    return MeteredLLMCaller(inner=router, meter=identity.meter(default=(provider, model)))
+
+
 @dataclass(frozen=True)
 class ResolvingReranker:
     """Per-tenant credential-resolving :class:`Reranker` (Mini-ADR O-9).
@@ -1184,7 +1224,8 @@ class ResolvingReranker:
             http_client=self.http,
             rate_limiter_factory=self.rate_limiter_factory,
         )
-        return await LLMReranker(llm_caller=router).rerank(
+        caller = _metered_rerank(router, self.provider, self.model)
+        return await LLMReranker(llm_caller=caller).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
 
@@ -1300,7 +1341,8 @@ class DynamicResolvingReranker:
             http_client=self.http,
             rate_limiter_factory=self.rate_limiter_factory,
         )
-        return await LLMReranker(llm_caller=router).rerank(
+        caller = _metered_rerank(router, provider, model)
+        return await LLMReranker(llm_caller=caller).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
 
