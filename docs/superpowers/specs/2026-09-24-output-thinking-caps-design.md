@@ -59,13 +59,13 @@
 | `max_output_tokens: int \| None` | 厂商公布的输出上限，用来做保存校验和配置页占位提示 | kimi-k3 1,048,576；GLM 128K；豆包 65,536 |
 | `thinking_cap: bool` | 是否支持独立的思考长度上限 | 目前只有通义带思考的模型为 True |
 
-档位映射从代码分支挪进目录：新增 `effort_map: dict[平台档位, 厂商取值]`，以及 `effort_off: str | None`（关思考时发什么）。GLM、Kimi、OpenAI、豆包现在散落在 `_thinking_enable_payload` / `_thinking_disable_payload` 里的特例改成读目录；**请求怎么拼（线格式）仍按厂商写在代码里**，档位值则由目录决定。这样以后换模型、加模型，只需要改一行目录。
+档位映射从代码分支挪进目录：新增 `effort_map: dict[平台档位, 厂商取值]`。（`effort_off` 不做 —— 计划裁定 2：关思考的线格式留在代码里，模型之间的差异用已有的 `always_thinking` 表达。）GLM、Kimi、OpenAI、豆包现在散落在 `_thinking_enable_payload` / `_thinking_disable_payload` 里的特例改成读目录；**请求怎么拼（线格式）仍按厂商写在代码里**，档位值则由目录决定。这样以后换模型、加模型，只需要改一行目录。
 
 ### 4.2 Manifest（`ModelSpec`）
 
 - `max_tokens: int | None`，**默认从 4096 改为 None**。None 的含义：
   - OpenAI 兼容这几家：请求里**不带**上限，用厂商默认值（和今天的实际行为逐字节一致）。
-  - Anthropic（必须带上限）：用目录里的 `default_output_tokens`（仅 Anthropic 条目需要填，取值以厂商文档为准）。
+  - Anthropic（必须带上限）：为空时仍发 4096，和今天一致（计划裁定 3：不引入未经实调的新默认值）。
 - 显式填了值：按目录里的 `output_cap_field` 发送，而且**只发这一个字段**（豆包两个字段同时发会 400，这条改成结构上不可能发生）。保存时校验不能超过 `max_output_tokens`。
 - 新增 `thinking_max_tokens: int | None`：
   - 目录里 `thinking_cap=True` 的模型：直接作为通义的 `thinking_budget` 发出，不再用「`max_tokens` × 比例」去推。
@@ -73,7 +73,9 @@
   - 没填、但设了档位：通义沿用按比例推算，只是基数从 `max_tokens` 换成 `max_tokens`（若有）或 81,920。
 - 目录外的模型 / 自部署：显式填了值就发 `max_tokens`，不填就什么都不发。
 
-### 4.3 存量数据迁移（一次性，alembic 数据迁移）
+### 4.3 存量处理 —— **已改为加载时归一（计划裁定 1）**：`ModelSpec` 的 before-validator 把非 Anthropic 模型上的 `max_tokens == 4096` 丢掉，一处覆盖 spec_json / 草稿 / revision / 平台模板 / 外部 API 五个来源，不动库、不动 `spec_sha256`。下面是原先的迁移方案，保留备查。
+
+#### 原方案（已弃用）
 
 - 范围：`agent_spec.spec_json` 和 `draft_spec_json`，覆盖所有 ModelSpec 位置（主模型、fallback、`vision.model`、worker 模型）。历史 revision 不动。
 - 规则：**非 Anthropic 的模型里，值恰好等于 4096 的删掉**（它是旧默认值，从来没生效过，删掉后行为和今天逐字节一致）；其他显式值原样保留，从此开始真的生效。迁移结束时按「厂商 / 值」打印聚合数（不打印 Agent 名）。
@@ -84,7 +86,7 @@
 
 - provider 层把「被截断」标准化：`finish_reason == "length"`，或 Anthropic 的 `stop_reason == "max_tokens"` → `response_metadata["truncated"] = True`。
 - agent 节点在收到回复之后判断：
-  - 被截断，且**没有可用内容**（正文为空，或者工具调用参数解析失败）→ 抛 `OutputTruncatedError`（归入现有的 `GuidedTimeoutError` 家族，都是「带操作指引的错误」）。run 以可见错误结束，文案：「模型输出被截断（已用满输出上限 N，含思考）。请在模型配置里调大『输出上限』，或者降低思考档位。」**不触发 fallback**（换备用模型也是同一个上限）。
+  - 被截断，且**没有可用内容**（正文为空，或者工具调用参数解析失败）→ 抛 `OutputTruncatedError`（独立的错误类型，在路由之后抛；计划裁定 4）。run 以可见错误结束，文案：「模型输出被截断（已用满输出上限 N，含思考）。请在模型配置里调大『输出上限』，或者降低思考档位。」**不触发 fallback**（换备用模型也是同一个上限）。
   - 被截断，但正文可用 → 照常交付，同时计一次指标 `expert_work_llm_output_truncated_total{provider,model}`，并打一条 warning 日志。
 - 看图（ask_image）走同一个 provider，自动享受上面的处理；快看（quick）档本来就短，不单独处理。
 
