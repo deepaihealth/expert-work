@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from expert_work.persistence import (
+    RENDERED_FIGURE_DIR,
+    RENDERED_FIGURE_PAGE_STEM,
+    RENDERED_FIGURE_SHA_HEX_LEN,
+    RENDERED_FIGURE_UNIT_PREFIX,
     SANDBOX_AGENTS_ROOT,
     SANDBOX_SKILLS_ROOT,
     WORKSPACE_DELETE_PROTECTED_PREFIXES,
@@ -12,6 +16,7 @@ from expert_work.persistence import (
     WORKSPACE_SKILLS_DIR,
     WORKSPACE_UPLOADS_DIR,
     is_delete_protected_workspace_path,
+    is_rendered_figure_rel,
     is_reserved_workspace_path,
 )
 
@@ -153,3 +158,22 @@ def test_a_file_named_like_the_inputs_prefix_is_still_agent_output() -> None:
     """收窄不能收过头:叫 ``inputs.md`` 的文件是产物,不是保留目录。"""
     assert not is_reserved_workspace_path("agents/plan-aaaaaaaa/inputs.md")
     assert not is_reserved_workspace_path("agents/plan-aaaaaaaa/客户inputs/x.md")
+
+
+def test_rendered_figure_shape_accepts_every_pdftoppm_padding_width() -> None:
+    """``pdftoppm`` 按**总页数**补零 —— 三种宽度都得认(B-64 末轮 M-b)。
+
+    这条钉的是「不许把页号收紧成固定位宽」。``read_page`` 的测试桩恒写两位
+    (``page-03.jpg``),所以那条端到端金丝雀只走过一种宽度:谁把这里收紧成
+    ``[0-9]{2}``,金丝雀会**保持绿**,而生产对所有 10 页以下与 99 页以上的文档
+    静默停止缓存 —— 正是那条测试声称要防的形状。失败方向只是性能,但「静默」
+    这一半正是 B-64 存在的理由。
+    """
+    base = (
+        f"{WORKSPACE_OVERFLOW_DIR}/9f2a0000-0000-0000-0000-000000000000/"
+        f"{RENDERED_FIGURE_DIR}/{'a' * RENDERED_FIGURE_SHA_HEX_LEN}/"
+        f"{'b' * RENDERED_FIGURE_SHA_HEX_LEN}/{RENDERED_FIGURE_UNIT_PREFIX}3/"
+        f"{RENDERED_FIGURE_PAGE_STEM}-"
+    )
+    for page in ("3", "03", "005"):  # <10 页 / 10-99 页 / >99 页
+        assert is_rendered_figure_rel(f"{base}{page}.jpg"), page

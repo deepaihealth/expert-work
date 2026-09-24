@@ -143,6 +143,11 @@ from orchestrator.graph_builder._config import (
     current_run_id,
     token_sink_from_config,
 )
+from orchestrator.graph_builder.figure_block import (
+    figure_block_message,
+    figure_freshness,
+    with_figure_block,
+)
 from orchestrator.graph_builder.input_url_guard import (
     GuardHit,
     UrlCandidate,
@@ -489,6 +494,10 @@ def build_react_graph(
     # 模型不必去探就知道自己上一轮写下的东西还在。``None``(单测 / 没接 NAS 的
     # 环境)→ 不注入, 提示词与 B-84 之前逐字相同。
     workspace_store: WorkspaceStore | None = None,
+    # B-64 —— 主模型能不能直接看图(manifest ``model.supports_vision``)。为真时
+    # ``agent_node`` 每轮把 ``viewed_figures`` 里最近几页挂到提示词尾部(Path A)。
+    # 默认 ``False`` = 不接线时一个像素都不挂 —— 失败方向是安全那一侧。
+    supports_vision: bool = False,
     approval_required_tools: frozenset[str] = frozenset(),
     approval_timeout_s: int = 86400,
     # B-20 approval triage — clarification-class ``ask_for_approval`` rows
@@ -819,8 +828,45 @@ def build_react_graph(
         # middle, max_passes exhausted, or three consecutive failed
         # rounds — so the orchestrator can write a clean RUN_FAILED
         # audit row.
+        # B-64 Task 7 回修第 3 轮 —— 渲染页段在**压缩判定之前**造好:它挂在压缩之后,
+        # 压缩器看不见它,而它带着 ≤3 张图(每张按 ``IMAGE_BLOCK_TOKEN_COST`` 计)加
+        # 一段占位文字。把它作为 ``reserved`` 交给压缩器 —— 只计入估算、不进被总结的
+        # 那段(压缩器去总结或丢掉它都是错的)。身份与工作区快照同一个来源:本次 run 的
+        # config。每轮重建、不落检查点。
+        figure_agent_key_raw = configurable.get("agent_key")
+        figure_agent_key = figure_agent_key_raw if isinstance(figure_agent_key_raw, str) else ""
+        figure_viewed = state.get("viewed_figures") or []
+        figure_documents = state.get("figure_documents") or {}
+        figure_tenant = _parse_uuid(configurable.get("tenant_id"))
+        figure_user = _parse_uuid(configurable.get("user_id"))
+        # 终审 #1 —— 窗口里的页先核对新鲜度(文档在渲染之后被改过/替换了就不附图)。
+        # 没接工作区存储就核对不了,``None`` 保持原行为(见 figure_block_message)。
+        figure_fresh = (
+            await figure_freshness(
+                workspace_store,
+                viewed=figure_viewed,
+                documents=figure_documents,
+                tenant_id=figure_tenant,
+                user_id=figure_user,
+                agent_key=figure_agent_key,
+            )
+            if supports_vision and figure_viewed and workspace_store is not None
+            else None
+        )
+        figure_block = figure_block_message(
+            viewed=figure_viewed,
+            documents=figure_documents,
+            supports_vision=supports_vision,
+            tenant_id=figure_tenant,
+            user_id=figure_user,
+            agent_key=figure_agent_key,
+            freshness=figure_fresh,
+        )
+        reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
         demoted_tools: list[str] = []
-        if context_compressor is not None and context_compressor.should_compress(messages):
+        if context_compressor is not None and context_compressor.should_compress(
+            messages, reserved=reserved
+        ):
             # Stream CM-3 — bind a config-scoped flush so the compressor can
             # hand the middle to long-term memory before discarding it. The
             # callback is best-effort (the flusher swallows its own non-cancel
@@ -873,6 +919,7 @@ def build_react_graph(
                 on_pre_compaction=on_pre_compaction,
                 on_compacted=on_compacted,
                 streak_key=str(compress_thread_id) if compress_thread_id else None,
+                reserved=reserved,
             )
             # B-73 ③ —— 这一轮的「本轮输入」段被摘要掉的话,模型就没有输入文件的
             # 路径了,只能退回去手抄上文里的长串。放回最新一段(见函数 docstring)。
@@ -935,6 +982,10 @@ def build_react_graph(
                 user_id=user_id,
                 agent_key=agent_key_raw if isinstance(agent_key_raw, str) else "",
             )
+        # B-64 —— 渲染页段(Path A)挂到尾部。块在压缩判定之前就造好了(见那里的
+        # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
+        # 提示词视图里可能残留的旧段剔掉。
+        messages = with_figure_block(messages, figure_block)
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 

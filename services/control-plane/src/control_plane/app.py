@@ -20,6 +20,7 @@ Wiring overview (see [STREAM-B-DESIGN § 2.2](../../../docs/streams/STREAM-B-DES
 
 from __future__ import annotations
 
+import asyncio
 import http.cookiejar
 import logging
 import os
@@ -530,6 +531,7 @@ from expert_work.runtime.runs import (
 )
 from expert_work.runtime.secret_store import SecretStore, make_secret_store
 from expert_work.runtime.storage import make_object_store
+from expert_work.runtime.tokens import warm_default_estimator
 from orchestrator import MemoryEnv
 from orchestrator.llm import RateLimiterFactory, make_redis_rate_limiter_factory
 from orchestrator.tools import (
@@ -1249,6 +1251,18 @@ def create_app(
             env=resolved_settings.env,
             otlp_endpoint=resolved_settings.otlp_traces_endpoint,
         )
+        # B-106 —— run 里的 token 估算器第一次用到时才加载 o200k_base 分词表;
+        # 那一刻在事件循环线程上,没有缓存时 tiktoken 同步从海外下载(测试集群
+        # 实测 56~63s),存活探针判死、pod 被杀,每个新进程的第一个 run 都这样。
+        # 镜像已经把分词表打进 TIKTOKEN_CACHE_DIR(见 Dockerfile),这里在
+        # 任何 worker 起来、进程就绪之前把**同一个**进程级单例加载好,并放到
+        # 线程里做,真要慢也只慢在启动探针的预算里,不卡事件循环。失败不阻止
+        # 启动:估算器已永久回落 chars//4,run 内不会再去下载。
+        if not await asyncio.to_thread(warm_default_estimator):
+            logger.warning(
+                "control_plane.lifespan.token_estimator_prewarm_failed — "
+                "tiktoken o200k_base unavailable, token estimates fall back to chars//4"
+            )
         async with AsyncExitStack() as stack:
             # 一期 Task 5 — one process-level httpx.AsyncClient, shared across
             # every LLM / embed / rerank / web-search / sandbox-supervisor
@@ -1676,7 +1690,19 @@ def create_app(
                         interval_s=resolved_settings.curation_worker_interval_s,
                         batch_size=resolved_settings.curation_worker_batch_size,
                     )
-                image_resolver = make_image_resolver(object_store)
+                # B-64 — one resolver instance handles both the upload scheme
+                # and the ask_image workspace-ref scheme (platform-rendered
+                # document pages); the NAS backend activates only when this
+                # deployment has a mount (same settings field + truthiness
+                # gate as ``resolved_workspace_store`` above).
+                image_resolver = make_image_resolver(
+                    object_store,
+                    workspace_root=(
+                        Path(resolved_settings.workspace_nas_root)
+                        if resolved_settings.workspace_nas_root
+                        else None
+                    ),
+                )
                 # Stream J.3 + Stream T (PR B) — long-term memory backend for
                 # the agent. The embedder reads the live platform embedding
                 # config per call (DB-row wins, env fallback), so an admin's

@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 
 from orchestrator import DEFAULT_MAX_STEPS, AgentState
-from orchestrator.state import _merge_promoted
+from orchestrator.state import _merge_figure_documents, _merge_promoted, _merge_viewed_figures
 
 
 def test_required_keys_present() -> None:
@@ -18,8 +18,9 @@ def test_required_keys_present() -> None:
     CM-11 ``last_plan_goal``, 委派层 1 ``delegation_nudge_plan_hash``,
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
-    ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``
-    (last twenty-one ``NotRequired``)。
+    ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``,
+    B-64 ``viewed_figures`` / ``figure_documents``
+    (last twenty-three ``NotRequired``)。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -54,6 +55,8 @@ def test_required_keys_present() -> None:
         "plan_first_dispatch_plan_hash",
         "plan_first_dispatch_active",
         "plan_first_dispatch_retries",
+        "viewed_figures",
+        "figure_documents",
     }
 
 
@@ -80,3 +83,48 @@ def test_merge_promoted_dedupes_within_new() -> None:
 
 def test_merge_promoted_empty_new_keeps_existing() -> None:
     assert _merge_promoted(["a"], []) == ["a"]
+
+
+# --- B-64: viewed_figures reducer -------------------------------------------
+
+
+def test_viewed_figures_merges_across_turns_in_order() -> None:
+    merged = _merge_viewed_figures(["a", "b"], ["c"])
+    assert merged == ["a", "b", "c"]
+
+
+def test_viewed_figures_moves_a_re_viewed_ref_to_the_tail() -> None:
+    """Task 7 —— 重看同一页要把它挪到队尾:滑窗按「最近一次看到」排。
+
+    同一个 run 里重读同一页,拿到的是**逐字相同**的 ref(路径里只有 run_id、文档
+    路径、内容哈希、unit、页号,都没变)。按「首次看到」排的话,一张已经退出滑窗
+    的页再怎么重读也回不来 —— 而占位文字告诉模型的正是「再调一次 read_page」。
+    """
+    assert _merge_viewed_figures(["a", "b", "c"], ["a"]) == ["b", "c", "a"]
+
+
+def test_viewed_figures_dedupes_within_one_update_by_last_occurrence() -> None:
+    """同一批更新里 ``[A, B, A]``:A 是最后看到的,必须排在 B 后面。
+
+    回修第 3 轮 —— 原来这条钉的是「保留第一次出现」(``[b, b, c]`` 分不出两种
+    口径,``[A, B, A]`` 才分得出),与「按最近一次看到排序」的口径相反。
+    """
+    assert _merge_viewed_figures([], ["a", "b", "a"]) == ["b", "a"]
+    assert _merge_viewed_figures(["x"], ["b", "b", "c"]) == ["x", "b", "c"]
+
+
+def test_tools_may_write_viewed_figures() -> None:
+    from orchestrator.tools.registry import TOOL_ALLOWED_STATE_KEYS
+
+    assert "viewed_figures" in TOOL_ALLOWED_STATE_KEYS
+
+
+def test_figure_documents_merge_later_write_wins_and_is_tool_writable() -> None:
+    from orchestrator.tools.registry import TOOL_ALLOWED_STATE_KEYS
+
+    assert _merge_figure_documents({"a": "x.pptx"}, {"b": "y.pdf"}) == {
+        "a": "x.pptx",
+        "b": "y.pdf",
+    }
+    assert _merge_figure_documents({"a": "x.pptx"}, {"a": " x.pptx"}) == {"a": " x.pptx"}
+    assert "figure_documents" in TOOL_ALLOWED_STATE_KEYS

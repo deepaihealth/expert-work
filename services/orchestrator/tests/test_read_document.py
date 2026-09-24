@@ -157,7 +157,8 @@ async def test_tool_parses_envelope_into_result() -> None:
     assert result.meta["format"] == "pdf"
     assert result.meta["chars"] == 8
     assert result.meta["path"] == "report.pdf"
-    assert len(client.execs) == 1
+    # B-64 —— 两段式:正文 + 图清单探测各一次 sandbox round-trip。
+    assert len(client.execs) == 2
     assert client.released
 
 
@@ -243,3 +244,148 @@ async def test_read_document_refuses_another_agents_path() -> None:
         await ReadDocumentTool(client=_client()).call(
             {"path": "agents/sop-bbbbbbbb/报告.docx"}, ctx=_ctx(agent_key="plan-aaaaaaaa")
         )
+
+
+# ---------------------------------------------------------------------------
+# B-64 —— 图清单接入 read_document:正文 + 清单两段式,清单前置且失败不拖垮正文。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_content_is_prefixed_with_the_figure_map() -> None:
+    """清单必须在头部 —— content 是 text[:cap] 硬截断,尾部会被砍掉。"""
+    runtime = _SequenceRuntime(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "content": "正文" * 100,
+                    "format": "pptx",
+                    "chars": 200,
+                    "truncated": False,
+                }
+            ),
+            json.dumps(
+                {
+                    "ok": True,
+                    "state": "figures",
+                    "format": "pptx",
+                    "skipped_decorative": 0,
+                    "figures": [
+                        {
+                            "unit": 3,
+                            "kind": "picture",
+                            "count": 1,
+                            "w_pt": 288.0,
+                            "h_pt": 192.0,
+                            "anchor": "趋势",
+                            "alt": None,
+                            "title": "趋势",
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    tool = ReadDocumentTool(client=runtime)
+    result = await tool.call({"path": "d.pptx"}, ctx=_ctx())
+    head = result.content[:300]
+    assert "read_page" in head
+    assert result.content.index("read_page") < result.content.index("正文")
+    assert result.meta["figures"] == 1
+    assert result.meta["figures_state"] == "figures"
+
+
+@pytest.mark.anyio
+async def test_no_figures_leaves_content_byte_identical() -> None:
+    """零图路径不许被碰 —— 这是「不回归」的钉子。"""
+    body = "纯文字文档"
+    runtime = _SequenceRuntime(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "content": body,
+                    "format": "docx",
+                    "chars": len(body),
+                    "truncated": False,
+                }
+            ),
+            json.dumps({"ok": True, "state": "none", "figures": []}),
+        ]
+    )
+    result = await ReadDocumentTool(client=runtime).call({"path": "d.docx"}, ctx=_ctx())
+    assert result.content == body
+    assert result.meta["figures"] == 0
+
+
+@pytest.mark.anyio
+async def test_inventory_failure_says_undetermined_not_silent() -> None:
+    """清单探测本身失败 → 正文照给,但必须显式说「测不了」。"""
+    runtime = _SequenceRuntime(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "content": "正文",
+                    "format": "pptx",
+                    "chars": 2,
+                    "truncated": False,
+                }
+            ),
+            "",
+        ]
+    )
+    result = await ReadDocumentTool(client=runtime).call({"path": "d.pptx"}, ctx=_ctx())
+    assert "无法确定" in result.content
+    assert result.meta["figures_state"] == "undetermined"
+    assert "正文" in result.content
+
+
+@pytest.mark.anyio
+async def test_text_format_skips_the_probe_entirely() -> None:
+    """扩展名早退 —— txt 连 OOXML zip 都不是,答案能白算,不该再起一次沙箱。
+
+    这是「零图路径零额外开销」的钉子:去掉早退这条判断,``call`` 会对
+    ``.md`` 也去跑一次图清单探测,这里的 ``execs`` 就会从 1 变成 2。
+    """
+    body = "普通的笔记文字"
+    runtime = _SequenceRuntime(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "content": body,
+                    "format": "md",
+                    "chars": len(body),
+                    "truncated": False,
+                }
+            ),
+        ]
+    )
+    result = await ReadDocumentTool(client=runtime).call({"path": "notes.md"}, ctx=_ctx())
+    assert len(runtime.execs) == 1
+    assert result.content == body
+    assert result.meta["figures"] == 0
+    assert result.meta["figures_state"] == "none"
+
+
+@pytest.mark.anyio
+async def test_supported_format_still_runs_the_probe() -> None:
+    """反向钉子 —— pptx 这类真能分析的格式,早退闸门不能连它一起挡了。"""
+    runtime = _SequenceRuntime(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "content": "正文",
+                    "format": "pptx",
+                    "chars": 2,
+                    "truncated": False,
+                }
+            ),
+            json.dumps({"ok": True, "state": "none", "figures": []}),
+        ]
+    )
+    await ReadDocumentTool(client=runtime).call({"path": "d.pptx"}, ctx=_ctx())
+    assert len(runtime.execs) == 2

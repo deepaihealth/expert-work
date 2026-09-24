@@ -89,6 +89,38 @@ def _merge_last_used(existing: dict[str, int] | None, new: dict[str, int]) -> di
     return out
 
 
+def _merge_viewed_figures(left: list[str], right: list[str]) -> list[str]:
+    """跨轮累积已看过的页 ref —— union 去重,按**最近一次看到**排序。
+
+    次序是滑窗的前提:``figure_block.figure_block_message`` 取「最新 N 条」靠的是列表次序。
+
+    Task 7 改了口径:重看同一页**要**把它挪到队尾(原来是按首次看到排、重看不挪)。
+    原来的顾虑是「挪到队尾会把一张更早看过、模型还在用的图挤出窗口」—— 这个顾虑
+    不成立:被重看的那页若本来就在最新 N 条里,挪到队尾之后最新 N 条还是同一批,
+    谁也没被挤出去;只有它本来已经退出窗口时,挪动才会改变窗口 —— 而那正是想要的。
+    反过来,按首次看到排有两个真问题,都因为同一个 run 里重读同一页拿到的是
+    **逐字相同**的 ref:
+
+    * 退出窗口的页再怎么重读也回不来 —— 而占位文字告诉模型的正是「再调一次
+      read_page」;
+    * 文档改了又改回去(内容哈希 A → B → A),重读得到的 A 版 ref 仍停在 B 前面,
+      ``figure_block.figure_block_message`` 就会把 B 当成当前版本、把 A 标成旧版本 —— 反了。
+    """
+    # 同一批里重复出现的,按**最后一次**出现的位置算(``[A, B, A]`` → ``[B, A]``)。
+    fresh = list(reversed(dict.fromkeys(reversed(right))))
+    moved = set(fresh)
+    return [ref for ref in left if ref not in moved] + fresh
+
+
+def _merge_figure_documents(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
+    """B-64 Task 7 回修第 3 轮 —— ``<doc-sha>`` → 路径,跨轮合并,后写的赢。
+
+    同一个 ``<doc-sha>`` 由同一条路径算出(``read_page._doc_sha``),所以「后写的赢」
+    只在同一路径的不同写法之间选(比如首尾空白),不会把一份文档改指成另一份。
+    """
+    return {**left, **right}
+
+
 class AgentState(TypedDict):
     """State threaded through every orchestrator LangGraph node.
 
@@ -293,3 +325,14 @@ class AgentState(TypedDict):
     #: B-35 — 0 on a fresh dispatch turn, 1 once the single retry was spent;
     #: the next refusal degrades (full tools restored) instead of looping.
     plan_first_dispatch_retries: NotRequired[int]
+    #: B-64 —— ``read_page`` 渲出来、已经给过模型的页 ref,按**最近一次**看到的
+    #: 次序(见 :func:`_merge_viewed_figures`)。跨 run 累积:run 的起始输入
+    #: (``control_plane.api.runs``)不写这个键,检查点里的旧值于是整条会话一直在。
+    #: 检查点里只有这些字符串(几十字节一条),**图片字节从不落库**:
+    #: 块每轮由 ``figure_block.figure_block_message`` 重建,与工作区快照同一口径(CM-C4)。
+    viewed_figures: NotRequired[Annotated[list[str], _merge_viewed_figures]]
+    #: B-64 Task 7 回修第 3 轮 —— ``<doc-sha>`` → 模型调 ``read_page`` 时传的路径。
+    #: ref 里只有路径哈希(不可逆),退役占位要告诉模型用哪个路径拿回来。放在 state
+    #: 而不是靠历史里的回执:压缩会把回执总结掉,state 不受影响。跨 run 累积,同
+    #: ``viewed_figures``。
+    figure_documents: NotRequired[Annotated[dict[str, str], _merge_figure_documents]]

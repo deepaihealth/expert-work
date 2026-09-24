@@ -12,6 +12,14 @@
 定义住在 protocol 而不是 orchestrator,是因为持久层(``expert-work-persistence``)
 只依赖 protocol、拿不到 orchestrator,而迁移 ``0154`` 的回填要算这个键。
 ``orchestrator.tools.skill_seed`` 从这里**转出**同名符号,老导入点照旧可用。
+
+B-64 回修 C1 —— ``require_safe_key`` 也下沉到这里,理由是同一条:
+``expert_work.protocol.multimodal.parse_workspace_image_ref`` 要校验 ref 字符串
+里 ``agents/<key>/`` 段的 ``key`` 是不是一个安全的路径段,而 protocol 包不能反向
+依赖 ``orchestrator``(它原来住在 ``orchestrator.tools.workspace_paths``)。这里
+是**唯一**实现,``orchestrator.tools.workspace_paths.require_safe_key`` 转出同一个
+符号,不再自己维护第二份正则——两份字面量正是本仓这一类 bug 的常见根因
+(见 ``sanitize_agent_key`` 上面这段注释,同一个教训)。
 """
 
 from __future__ import annotations
@@ -19,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-__all__ = ["sanitize_agent_key"]
+__all__ = ["require_safe_key", "sanitize_agent_key"]
 
 #: ``AgentMetadata.name`` 只约束长度不约束字符集,路径段里任何不在
 #: this set 的字符都收敛成 ``-``。
@@ -29,6 +37,25 @@ _AGENT_KEY_DISALLOWED = re.compile(r"[^a-zA-Z0-9._-]")
 #: is at most 96 + 1 + 8 = 105 bytes — comfortably inside any filesystem's
 #: path-segment limit (e.g. ext4/NAS's 255 bytes) with room to spare.
 _AGENT_KEY_PREFIX_MAX_LEN = 96
+
+#: ``require_safe_key`` 的字符集闸 —— ``sanitize_agent_key`` 的产物
+#: (``<清洗前缀>-<8 位 hex>``)恒过这条正则;这里反过来用它去**校验**一个
+#: 不可信字符串是不是一个安全的路径段。
+_AGENT_KEY_OK = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+#: 单独的 ``.`` / ``..`` 能过上面那条正则(两个点都在字符集里),必须单列拒绝。
+_DOTTED = frozenset({".", ".."})
+
+
+def require_safe_key(agent_key: str) -> None:
+    """``agent_key`` 当成路径段安全吗。坏 key 一律 ``ValueError``,别悄悄回落。
+
+    B-84 —— 从 ``_require_safe_key`` 改成公开名:宿主侧的作用域解析
+    (``orchestrator.tools.workspace_scope.scope_parts``)要用同一道闸,而不是在
+    旁边再写一条正则。
+    """
+    if not agent_key or agent_key in _DOTTED or not _AGENT_KEY_OK.match(agent_key):
+        msg = f"agent_key is not a safe path segment: {agent_key!r}"
+        raise ValueError(msg)
 
 
 def sanitize_agent_key(name: str) -> str:

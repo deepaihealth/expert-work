@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -34,7 +35,12 @@ from expert_work.runtime.storage import InMemoryObjectStore
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge
 from expert_work.testing import InMemorySecretStore
 from orchestrator.llm import FakeEmbedder
-from orchestrator.multimodal import CachingImageResolver, ObjectStoreImageResolver
+from orchestrator.multimodal import (
+    CachingImageResolver,
+    DispatchingImageResolver,
+    NasWorkspaceImageResolver,
+    ObjectStoreImageResolver,
+)
 from orchestrator.tools import KnowledgeRetriever
 
 _MINIMAL_MANIFEST: dict[str, Any] = {
@@ -148,10 +154,24 @@ def test_make_knowledge_retriever_builds_with_embedder() -> None:
 
 def test_make_image_resolver_builds_object_store_resolver() -> None:
     resolver = make_image_resolver(InMemoryObjectStore())
-    # Wrapped in the bounded-LRU caching layer over the object-store resolver
-    # (stops every LLM turn re-fetching the same image).
+    # Wrapped in the bounded-LRU caching layer over a DispatchingImageResolver
+    # (B-64 — one resolver instance routes both the upload scheme and the
+    # workspace scheme; stops every LLM turn re-fetching the same image).
     assert isinstance(resolver, CachingImageResolver)
-    assert isinstance(resolver.inner, ObjectStoreImageResolver)
+    assert isinstance(resolver.inner, DispatchingImageResolver)
+    assert isinstance(resolver.inner.uploads, ObjectStoreImageResolver)
+    # No workspace_root passed → the workspace backend is absent, not a
+    # crash — a workspace ref fails with a clear error instead of silently
+    # never resolving (DispatchingImageResolver's own tests cover that).
+    assert resolver.inner.workspace is None
+
+
+def test_make_image_resolver_wires_workspace_backend_when_root_given(tmp_path: Path) -> None:
+    resolver = make_image_resolver(InMemoryObjectStore(), workspace_root=tmp_path)
+    assert isinstance(resolver, CachingImageResolver)
+    assert isinstance(resolver.inner, DispatchingImageResolver)
+    assert isinstance(resolver.inner.workspace, NasWorkspaceImageResolver)
+    assert resolver.inner.workspace.root == tmp_path
 
 
 @pytest.mark.asyncio

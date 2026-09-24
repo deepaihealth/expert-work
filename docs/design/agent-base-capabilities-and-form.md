@@ -24,6 +24,7 @@
 | 文件读 | `read_file` / `list_dir` | 工作区只读 |
 | 文件写 | `write_file` / `edit_file` | 工作区写 |
 | 文档解析 | `read_document` **(新)** | 解析 PDF/Word/Excel/PPT/CSV/MD → 文本,沙箱内跑,无网 |
+| 文档单页渲染 | `read_page` **(新,B-64)** | 按需把文档单页渲成 jpeg 供多模态/ask_image 看图;渲染范围见 `document_figures.RENDERABLE_EXTENSIONS`(会随 Task 4b 等后续任务扩展),沙箱内跑 |
 | 产物 | `save_artifact` / `list_artifacts` | |
 | 主动记忆 | `remember` | |
 

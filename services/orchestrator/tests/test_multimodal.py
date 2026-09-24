@@ -2,21 +2,37 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import os
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
-from expert_work.protocol.multimodal import ImageRef
+from expert_work.persistence import (
+    RENDERED_FIGURE_DIR,
+    RENDERED_FIGURE_PAGE_STEM,
+    RENDERED_FIGURE_SHA_HEX_LEN,
+    RENDERED_FIGURE_UNIT_PREFIX,
+    WORKSPACE_OVERFLOW_DIR,
+)
+from expert_work.protocol.multimodal import ImageRef, parse_image_ref, parse_workspace_image_ref
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
 from orchestrator.multimodal import (
+    _MAX_WORKSPACE_IMAGE_BYTES,
     IMAGE_REF_BLOCK_TYPE,
     CachingImageResolver,
+    DispatchingImageResolver,
     ImageResolver,
     InMemoryImageResolver,
+    NasWorkspaceImageResolver,
     ObjectStoreImageResolver,
     ResolvedImage,
     image_ref_block,
+    is_cacheable_image_ref,
+    resolve_message_images,
     split_human_content,
 )
 
@@ -142,6 +158,293 @@ def test_object_store_resolver_satisfies_protocol() -> None:
     assert isinstance(ObjectStoreImageResolver(store=InMemoryObjectStore()), ImageResolver)
 
 
+# ---------------------------------------------------------------------------
+# NasWorkspaceImageResolver (B-64) — symlink safety + size cap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_resolves_a_real_file(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    (user_dir / "page-01.jpg").write_bytes(b"\xff\xd8\xff\xe0real-bytes")
+
+    resolved = await NasWorkspaceImageResolver(root=tmp_path).resolve(
+        f"expert_work://workspace/{tenant}/{user}/page-01.jpg"
+    )
+
+    assert resolved.data == b"\xff\xd8\xff\xe0real-bytes"
+    assert resolved.media_type == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_a_leaf_symlink_escaping_the_user_root(tmp_path: Path) -> None:
+    """Critical finding 1 —— a malicious run plants a symlink inside its OWN
+    subtree pointing at another tenant's file, then calls ``ask_image`` with
+    its own (legitimate) tenant/user. The ref string itself is a clean
+    relative path — ``parse_workspace_image_ref`` cannot see the escape; only
+    touching the filesystem can.
+    """
+    tenant, user = uuid4(), uuid4()
+    victim_tenant, victim_user = uuid4(), uuid4()
+    victim_dir = tmp_path / str(victim_tenant) / str(victim_user)
+    victim_dir.mkdir(parents=True)
+    (victim_dir / "secret.png").write_bytes(b"victim-bytes")
+
+    attacker_dir = tmp_path / str(tenant) / str(user)
+    attacker_dir.mkdir(parents=True)
+    (attacker_dir / "evil.png").symlink_to(
+        Path("..") / ".." / str(victim_tenant) / str(victim_user) / "secret.png"
+    )
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/evil.png"
+
+    with pytest.raises(ValueError, match="escapes the user root"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_an_intermediate_symlink_escaping_the_user_root(
+    tmp_path: Path,
+) -> None:
+    """Same escape, but the symlink is a directory one path segment up from
+    the leaf — exercises ``_walk_to_parent_fd`` (the dir_fd chain), not the
+    leaf-open branch. A resolve()-then-reopen-by-string approach would have
+    missed exactly this: only the *final* component was re-checked, not the
+    intermediate ones.
+    """
+    tenant, user = uuid4(), uuid4()
+    victim_tenant, victim_user = uuid4(), uuid4()
+    victim_dir = tmp_path / str(victim_tenant) / str(victim_user)
+    victim_dir.mkdir(parents=True)
+    (victim_dir / "secret.png").write_bytes(b"victim-bytes")
+
+    attacker_dir = tmp_path / str(tenant) / str(user)
+    attacker_dir.mkdir(parents=True)
+    (attacker_dir / "figures").symlink_to(victim_dir)
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/figures/secret.png"
+
+    with pytest.raises(ValueError, match="escapes the user root"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_a_file_over_the_size_cap(tmp_path: Path) -> None:
+    """Important finding 3 —— stat happens before read, so an outsized file
+    is refused instead of being loaded fully into the control-plane
+    process's memory. ``os.truncate`` makes a sparse file: the reported size
+    crosses the cap without actually writing that many bytes to disk.
+    """
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    big = user_dir / "too-big.jpg"
+    big.touch()
+    os.truncate(big, _MAX_WORKSPACE_IMAGE_BYTES + 1)
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/too-big.jpg"
+
+    with pytest.raises(ValueError, match="exceeds the"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.asyncio
+async def test_nas_resolver_bounds_the_read_even_when_fstat_undercounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Important finding 1 —— the fstat cap alone isn't enough: it's asked
+    once, and the sandbox writes this tree directly while an agent controls
+    its own files, so a writer growing the file *after* that fstat is a
+    reachable race, not a hypothetical one. Simulated deterministically by
+    making ``os.fstat`` under-report the size of a file that is genuinely
+    over the cap on disk (a sparse file, so no real 64 MiB write) — proving
+    the real backstop is the bounded ``handle.read(cap + 1)`` + length
+    recheck, not the fstat pre-check.
+    """
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    big = user_dir / "grew-after-stat.jpg"
+    big.touch()
+    os.truncate(big, _MAX_WORKSPACE_IMAGE_BYTES + 10)  # sparse -- genuinely over cap
+
+    real_fstat = os.fstat
+
+    def _fstat_that_undercounts(fd: int) -> SimpleNamespace:
+        real = real_fstat(fd)
+        return SimpleNamespace(st_mode=real.st_mode, st_size=1)  # lies: "tiny file"
+
+    monkeypatch.setattr("os.fstat", _fstat_that_undercounts)
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/grew-after-stat.jpg"
+
+    with pytest.raises(ValueError, match="exceeds the"):
+        await resolver.resolve(ref)
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.asyncio
+async def test_nas_resolver_refuses_a_fifo_without_hanging(tmp_path: Path) -> None:
+    """Important finding 2 —— ``O_NOFOLLOW`` rejects symlinks, not FIFOs. An
+    agent naming a FIFO ``page.jpg`` in its own workspace would otherwise
+    have ``open``/``read`` block forever waiting for a writer that never
+    comes, pinning a worker in the shared ``asyncio.to_thread`` pool.
+
+    Why this test doesn't hang even if the fix regresses: the leaf open
+    carries ``O_NONBLOCK`` (a no-op for a regular file, but it makes opening
+    a writer-less FIFO return immediately instead of blocking), so the
+    refusal is reachable without ever calling a blocking ``read()``. The
+    ``@pytest.mark.timeout(5)`` is the second, independent safety net — if
+    a future change dropped ``O_NONBLOCK``, this test would fail on a bounded
+    timeout instead of hanging the whole suite.
+    """
+    tenant, user = uuid4(), uuid4()
+    user_dir = tmp_path / str(tenant) / str(user)
+    user_dir.mkdir(parents=True)
+    os.mkfifo(user_dir / "page.jpg")
+
+    resolver = NasWorkspaceImageResolver(root=tmp_path)
+    ref = f"expert_work://workspace/{tenant}/{user}/page.jpg"
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        await resolver.resolve(ref)
+
+
+# ---------------------------------------------------------------------------
+# is_cacheable_image_ref (B-64) — which refs CachingImageResolver may keep
+# ---------------------------------------------------------------------------
+
+
+def _rendered_rel() -> str:
+    """一条**真形状**的渲染页 rel —— 按 ``expert_work.persistence`` 的落点常量拼。
+
+    回修第 5 轮 I-1 —— 判据从"``.tool_results/`` 目录前缀"收窄成"认 read_page 自己
+    那段路径形状"之后,这个文件里原先那些随手写的 ``.tool_results/r1/page.jpg``
+    全都不再是合法样本了。这里按常量拼而不是手打字面量,常量一变样本跟着变;
+    真正端到端的那道钉(宿主 + 片段真跑出来的路径)在
+    ``test_read_page.py::test_a_real_read_page_ref_is_recognised_end_to_end``。
+    """
+    return "/".join(
+        [
+            WORKSPACE_OVERFLOW_DIR,
+            str(uuid4()),
+            RENDERED_FIGURE_DIR,
+            "0" * RENDERED_FIGURE_SHA_HEX_LEN,
+            "1" * RENDERED_FIGURE_SHA_HEX_LEN,
+            f"{RENDERED_FIGURE_UNIT_PREFIX}3",
+            f"{RENDERED_FIGURE_PAGE_STEM}-03.jpg",
+        ]
+    )
+
+
+def test_is_cacheable_image_ref_true_for_upload_refs() -> None:
+    assert is_cacheable_image_ref(_image_ref().to_uri()) is True
+
+
+def test_is_cacheable_image_ref_true_for_a_rendered_page_shape() -> None:
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/{_rendered_rel()}"
+    assert is_cacheable_image_ref(ref) is True
+
+
+def test_is_cacheable_image_ref_false_for_an_ordinary_workspace_file() -> None:
+    """An ordinary, overwritable workspace file named through this scheme
+    must never be cached — see the function's own docstring for why."""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/chart.png"
+    assert is_cacheable_image_ref(ref) is False
+
+
+@pytest.mark.parametrize(
+    "model_written_rel",
+    [
+        # 模型自己 write_file 写进 .tool_results/ 的图 —— 这个目录不是写保护的
+        f"{WORKSPACE_OVERFLOW_DIR}/evil.jpg",
+        f"{WORKSPACE_OVERFLOW_DIR}/{{run}}/evil.jpg",
+        # 连"藏进真实渲染目录、只有文件名不对"也要挡住:形状是整条路径的形状
+        f"{WORKSPACE_OVERFLOW_DIR}/{{run}}/figures/{{sha}}/{{sha}}/_u3/evil.jpg",
+        # 少一层 <render-sha> 的旧形状(回修第 4 轮之前的落点)
+        f"{WORKSPACE_OVERFLOW_DIR}/{{run}}/figures/{{sha}}/_u3/page-03.jpg",
+        # 注:``.tool_results/`` 下的第二个写入者(溢出缓存)产出的是 ``.txt``,
+        # 它根本组不成一条 workspace 图片 ref —— ``parse_workspace_image_ref``
+        # 在更早一层就按扩展名拒了,轮不到这个判据。所以这里不列它。
+    ],
+)
+def test_is_cacheable_image_ref_false_for_a_file_the_model_wrote_under_tool_results(
+    model_written_rel: str,
+) -> None:
+    """B-64 回修第 5 轮 I-1 —— 判据不能是 ``.tool_results/`` 的**目录前缀通行证**。
+
+    该目录不在任何写保护集合里(``WORKSPACE_RESERVED_PREFIXES`` 只管浏览面隐藏,
+    ``_WRITE_TOOLS`` 只挡 ``shared:``),``write_file`` 对
+    ``.tool_results/evil.jpg`` 是放行的;模型再把那条 ref 交给 ``ask_image``,
+    租户/用户/agent_key 三项校验全都对得上 —— 文件就是它自己写的。目录前缀通行证
+    等于把"可缓存"发给一个随时会被覆盖的文件:写 A → 读到 A → 覆盖成 B →
+    **仍然读到 A**,与 New-I1 逐字同病。
+    """
+    t, u = uuid4(), uuid4()
+    rel = model_written_rel.format(run=uuid4(), sha="0" * RENDERED_FIGURE_SHA_HEX_LEN)
+    ref = f"expert_work://workspace/{t}/{u}/{rel}"
+    assert is_cacheable_image_ref(ref) is False
+
+
+def test_is_cacheable_image_ref_true_for_a_rendered_page_under_an_agent_scope() -> None:
+    """B-64 回修 C1 —— agent-bound run 的 ref 形如
+    ``agents/<key>/.tool_results/...``,判据必须落在 ``agents/<key>/`` 之后,
+    不然每一条绑了 agent 的渲染页都会被判成不可缓存(见函数自己的 C1 段落)。
+    """
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/{_rendered_rel()}"
+    assert is_cacheable_image_ref(ref) is True
+
+
+def test_is_cacheable_image_ref_false_for_an_ordinary_file_under_an_agent_scope() -> None:
+    """同上,但落点仍在 ``agents/<key>/`` 下面、却不是一张渲染页
+    ——普通可覆写文件,agent 作用域不改变这条规则。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/chart.png"
+    assert is_cacheable_image_ref(ref) is False
+
+
+@pytest.mark.parametrize(
+    "scope_spelling",
+    [
+        "agents/./pf-probe-33086dc0",
+        "agents//pf-probe-33086dc0",
+        "agents/pf-probe-33086dc0/.",
+    ],
+)
+def test_is_cacheable_image_ref_true_for_non_normalized_agent_scoped_rel(
+    scope_spelling: str,
+) -> None:
+    """B-64 回修第 2 轮 New-4 —— ``parsed.rel`` 不保证被归一化过(``agent_key``
+    是拿 ``PurePosixPath(rel).parts`` 解出来的,但归一化结果从没写回 ``rel``
+    字段本身)。按字节长度砍 ``agents/<key>/`` 前缀,在带 ``.``/双斜杠这类写法
+    下会砍错位置,把真正落在渲染子树里的页误判成不可缓存。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/{scope_spelling}/{_rendered_rel()}"
+    assert is_cacheable_image_ref(ref) is True
+
+
+def test_is_cacheable_image_ref_true_for_non_normalized_unscoped_rel() -> None:
+    """B-64 回修第 3 轮 Minor-4 —— 上一条 New-4 的回归钉只覆盖了
+    ``agent_key is not None`` 那一支;没绑 agent 时,``is_cacheable_image_ref``
+    仍然直接拿未归一化的 ``parsed.rel`` 字符串去比,没有像绑 agent 那一支一样
+    先用 ``PurePosixPath`` 重新分段。``./.tool_results/...`` 这个 rel 里的
+    ``.`` 段在字符串层面挡在最前面,``str.startswith(".tool_results/")`` 判
+    False;而它真实落在渲染子树里,归一化之后应当判 True —— 与 round-2 的字节
+    长度 bug 是同一类"没把 ``rel`` 归一化就直接用"。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/./{_rendered_rel()}"
+    assert is_cacheable_image_ref(ref) is True
+
+
 class _CountingResolver:
     """Inner resolver that counts fetches — to prove the cache short-circuits."""
 
@@ -177,3 +480,227 @@ async def test_caching_resolver_lru_evicts_oldest() -> None:
     assert inner.calls == 3
     await resolver.resolve("a")  # "a" was evicted → re-fetched
     assert inner.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_caching_resolver_never_stores_a_ref_the_predicate_rejects() -> None:
+    inner = _CountingResolver()
+    resolver = CachingImageResolver(inner, should_cache=lambda ref: False)
+    await resolver.resolve("a")
+    await resolver.resolve("a")
+    assert inner.calls == 2  # never cached -> refetched every call
+
+
+@pytest.mark.asyncio
+async def test_caching_resolver_still_caches_a_ref_the_predicate_accepts() -> None:
+    inner = _CountingResolver()
+    resolver = CachingImageResolver(inner, should_cache=lambda ref: True)
+    await resolver.resolve("a")
+    await resolver.resolve("a")
+    assert inner.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# DispatchingImageResolver (B-64) — one resolver instance, two ref schemes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_routes_upload_ref_to_uploads_backend() -> None:
+    ref = _image_ref(".png").to_uri()
+    uploads = InMemoryImageResolver(images={ref: ResolvedImage(media_type="image/png", data=_DATA)})
+    resolver = DispatchingImageResolver(uploads=uploads, workspace=InMemoryImageResolver({}))
+
+    resolved = await resolver.resolve(ref)
+
+    assert resolved.data == _DATA
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_routes_workspace_ref_to_workspace_backend(
+    tmp_path: Path,
+) -> None:
+    tenant, user = uuid4(), uuid4()
+    page_dir = tmp_path / str(tenant) / str(user) / "r1"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page-01.jpg").write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    ref = f"expert_work://workspace/{tenant}/{user}/r1/page-01.jpg"
+    resolver = DispatchingImageResolver(
+        uploads=InMemoryImageResolver({}), workspace=NasWorkspaceImageResolver(root=tmp_path)
+    )
+
+    resolved = await resolver.resolve(ref)
+
+    assert resolved.data == b"\xff\xd8\xff\xe0fake-jpeg"
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_rejects_unknown_scheme() -> None:
+    resolver = DispatchingImageResolver(uploads=InMemoryImageResolver({}))
+    with pytest.raises(ValueError, match="unrecognized image ref scheme"):
+        await resolver.resolve("s3://not-a-scheme-we-know/x.png")
+
+
+@pytest.mark.asyncio
+async def test_dispatching_resolver_rejects_workspace_ref_when_unconfigured() -> None:
+    """``workspace=None``(默认)—— 这个部署没接 NAS。"""
+    tenant, user = uuid4(), uuid4()
+    resolver = DispatchingImageResolver(uploads=InMemoryImageResolver({}))
+    ref = f"expert_work://workspace/{tenant}/{user}/r1/page-01.jpg"
+    with pytest.raises(ValueError, match="not available"):
+        await resolver.resolve(ref)
+
+
+def test_dispatching_resolver_satisfies_protocol() -> None:
+    assert isinstance(DispatchingImageResolver(uploads=InMemoryImageResolver({})), ImageResolver)
+
+
+# ---------------------------------------------------------------------------
+# parse_workspace_image_ref (B-64) — sibling of parse_image_ref, not a branch
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_ref_rejects_parent_traversal() -> None:
+    # Extension is valid (``.jpg``) and the first segment is not a reserved
+    # tree, so the ONLY thing standing between this ref and a clean parse is
+    # the ``..`` check — a mutation that deletes that check turns this ValueError
+    # into a successful parse, not just a differently-worded error.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="free of '\\.\\.'"):
+        parse_workspace_image_ref(
+            f"expert_work://workspace/{t}/{u}/.tool_results/r1/figures/../../../etc/evil.jpg"
+        )
+
+
+def test_workspace_ref_accepts_an_agent_scoped_path() -> None:
+    """B-64 回修 C1 —— ``agents/<key>/...`` 现在是合法形状(绑了 agent 的 run
+    在用户根上的真实落点)。「这个 key 是不是调用方自己的」不在解析这层判 ——
+    见 ``test_multimodal.py`` (orchestrator 侧) 里 ``vision.AskImageTool`` 的
+    跨 agent 拒绝测试。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/.tool_results/r1/page.jpg"
+    parsed = parse_workspace_image_ref(ref)
+    assert parsed.agent_key == "pf-probe-33086dc0"
+    assert parsed.rel == "agents/pf-probe-33086dc0/.tool_results/r1/page.jpg"
+
+
+def test_workspace_ref_rejects_bare_agents_segment() -> None:
+    # "agents" alone (nothing after it) can't name any real subtree.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="must be followed by an agent key"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/agents")
+
+
+def test_workspace_ref_rejects_an_unsafe_agent_key() -> None:
+    # "@" is outside require_safe_key's [A-Za-z0-9._-]+ charset.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="unsafe agent key"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/agents/weird@key/x.jpg")
+
+
+def test_workspace_ref_still_rejects_shared_subtree() -> None:
+    # shared/ stays reserved — it's a read-only bind, never a render target.
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="reserved shared/ tree"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/shared/x.jpg")
+
+
+def test_workspace_ref_without_agents_prefix_has_no_agent_key() -> None:
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/.tool_results/r1/page.jpg"
+    assert parse_workspace_image_ref(ref).agent_key is None
+
+
+def test_workspace_ref_roundtrips() -> None:
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/.tool_results/r1/figures/abc/page-03.jpg"
+    parsed = parse_workspace_image_ref(ref)
+    assert parsed.tenant_id == t
+    assert parsed.user_id == u
+    assert parsed.rel.endswith("page-03.jpg")
+
+
+def test_workspace_ref_rejects_unsupported_extension() -> None:
+    t, u = uuid4(), uuid4()
+    with pytest.raises(ValueError, match="unsupported image extension"):
+        parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/.tool_results/r1/page.pdf")
+
+
+def test_workspace_ref_rejects_malformed_tenant_id() -> None:
+    u = uuid4()
+    with pytest.raises(ValueError, match="malformed tenant/user id"):
+        parse_workspace_image_ref(f"expert_work://workspace/not-a-uuid/{u}/r1/page.jpg")
+
+
+def test_parse_image_ref_still_refuses_workspace_scheme() -> None:
+    """老边界一个字没松 —— 这是「加兄弟不加分支」的钉子。"""
+    with pytest.raises(ValueError, match="must start with"):
+        parse_image_ref("expert_work://workspace/t/u/x.jpg")
+
+
+@pytest.mark.parametrize(
+    "rel_tail",
+    [
+        "agents/./k1/.tool_results/r1/page.jpg",
+        "agents//k1/.tool_results/r1/page.jpg",
+        "agents/k1/./.tool_results/r1/page.jpg",
+        "agents/k1/.tool_results/r1/page.jpg",
+    ],
+)
+def test_agent_key_matches_the_first_two_normalized_parts_of_rel(rel_tail: str) -> None:
+    """B-64 回修第 2 轮 New-4 —— ``agent_key`` 是拿归一化后的
+    ``PurePosixPath(rel).parts`` 解出来的,但 ``rel`` 字段本身不保证被归一化
+    (混了 ``.``/双斜杠这类写法也照样解得出 ``agent_key``)。这条测试钉住两者
+    必须永远一致:``agent_key`` 非 ``None`` 时,重新对 ``rel`` 分段,前两段
+    恒等于 ``("agents", agent_key)`` —— 任何在 ``rel`` 上按字节长度砍前缀的
+    消费方(如 ``is_cacheable_image_ref``)都依赖这条不变式成立。
+    """
+    t, u = uuid4(), uuid4()
+    parsed = parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/{rel_tail}")
+    assert parsed.agent_key is not None
+    parts = PurePosixPath(parsed.rel).parts
+    assert parts[:2] == ("agents", parsed.agent_key)
+
+
+class _CancelledResolver:
+    async def resolve(self, ref: str) -> ResolvedImage:
+        raise asyncio.CancelledError
+
+
+async def test_a_cancelled_workspace_resolve_is_not_degraded() -> None:
+    """B-64 Task 7 —— 降级只接 ``Exception``:取消照常往上走,不被吞成一段文字。"""
+    ref = f"expert_work://workspace/{uuid4()}/{uuid4()}/a.jpg"
+    with pytest.raises(asyncio.CancelledError):
+        await resolve_message_images([ref], _CancelledResolver())
+
+
+async def test_only_a_missing_file_is_called_cleaned_up(tmp_path: Path) -> None:
+    """B-64 Task 7 回修第 3 轮 —— 降级文字分清「不存在」与「够不着」。
+
+    缺文件(真 ``ENOENT``)→「已不存在,重新调用 read_page」;符号链接越界(安全拒绝)
+    →「读不了,重渲也读不到」。两条都走真 ``NasWorkspaceImageResolver``。
+    """
+    tenant, user = uuid4(), uuid4()
+    unit_dir = (
+        f"{WORKSPACE_OVERFLOW_DIR}/{uuid4()}/{RENDERED_FIGURE_DIR}/"
+        f"{'a' * RENDERED_FIGURE_SHA_HEX_LEN}/{'b' * RENDERED_FIGURE_SHA_HEX_LEN}/"
+        f"{RENDERED_FIGURE_UNIT_PREFIX}3"
+    )
+    missing_rel = f"{unit_dir}/{RENDERED_FIGURE_PAGE_STEM}-03.jpg"
+    escaping_rel = f"{unit_dir}/{RENDERED_FIGURE_PAGE_STEM}-04.jpg"
+    leaf = tmp_path / str(tenant) / str(user) / escaping_rel
+    leaf.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(_DATA)
+    leaf.symlink_to(outside)
+    base = f"expert_work://workspace/{tenant}/{user}/"
+
+    missing, escaping = await resolve_message_images(
+        [base + missing_rel, base + escaping_rel], NasWorkspaceImageResolver(root=tmp_path)
+    )
+
+    assert isinstance(missing, str)
+    assert "第 3 页" in missing and "已不存在" in missing and "重新调用 read_page" in missing
+    assert isinstance(escaping, str)
+    assert "第 4 页" in escaping and "读不了" in escaping
+    assert "已被清理" not in escaping and "需要的话重新调用 read_page" not in escaping

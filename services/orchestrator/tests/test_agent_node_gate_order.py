@@ -89,8 +89,10 @@ class _TracingCompressor:
     order: list[str]
     seen: list[list[BaseMessage]] = field(default_factory=list)
 
-    def should_compress(self, messages: Sequence[BaseMessage]) -> bool:
-        del messages
+    def should_compress(
+        self, messages: Sequence[BaseMessage], *, reserved: Sequence[BaseMessage] = ()
+    ) -> bool:
+        del messages, reserved
         return True
 
     async def compress(
@@ -100,8 +102,9 @@ class _TracingCompressor:
         on_pre_compaction: object = None,
         on_compacted: object = None,
         streak_key: str | None = None,
+        reserved: Sequence[BaseMessage] = (),
     ) -> list[BaseMessage]:
-        del on_pre_compaction, on_compacted, streak_key
+        del on_pre_compaction, on_compacted, streak_key, reserved
         self.order.append("compressor")
         self.seen.append(list(messages))
         return [*messages, HumanMessage(content="[compressor-mark]")]
@@ -189,8 +192,10 @@ class _DroppingCompressor:
     tail_keep: int = 1
     seen: list[list[BaseMessage]] = field(default_factory=list)
 
-    def should_compress(self, messages: Sequence[BaseMessage]) -> bool:
-        del messages
+    def should_compress(
+        self, messages: Sequence[BaseMessage], *, reserved: Sequence[BaseMessage] = ()
+    ) -> bool:
+        del messages, reserved
         return True
 
     async def compress(
@@ -200,8 +205,9 @@ class _DroppingCompressor:
         on_pre_compaction: object = None,
         on_compacted: object = None,
         streak_key: str | None = None,
+        reserved: Sequence[BaseMessage] = (),
     ) -> list[BaseMessage]:
-        del on_pre_compaction, on_compacted, streak_key
+        del on_pre_compaction, on_compacted, streak_key, reserved
         self.seen.append(list(messages))
         head, tail = list(messages[:1]), list(messages[-self.tail_keep :])
         return [*head, HumanMessage(content="<context-summary>…</context-summary>"), *tail]

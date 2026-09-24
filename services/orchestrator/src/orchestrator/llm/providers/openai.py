@@ -76,7 +76,11 @@ from orchestrator.llm.structured_output import (
     StructuredOutputCapability,
     schema_instruction,
 )
-from orchestrator.multimodal import ImageResolver, split_human_content
+from orchestrator.multimodal import (
+    ImageResolver,
+    resolve_message_images,
+    split_human_content,
+)
 from orchestrator.tools.registry import ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -689,9 +693,12 @@ async def _human_content(
         logger.warning("openai_adapter.image_dropped_no_resolver count=%d", len(image_refs))
         return text
     blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
-    for ref in image_refs:
-        resolved = await resolver.resolve(ref)
-        blocks.append({"type": "image_url", "image_url": {"url": resolved.data_uri}})
+    # B-64 Task 7 —— 工作区图读不出来时 ``resolve_message_images`` 给一段文字顶替。
+    for item in await resolve_message_images(image_refs, resolver):
+        if isinstance(item, str):
+            blocks.append({"type": "text", "text": item})
+        else:
+            blocks.append({"type": "image_url", "image_url": {"url": item.data_uri}})
     return blocks
 
 

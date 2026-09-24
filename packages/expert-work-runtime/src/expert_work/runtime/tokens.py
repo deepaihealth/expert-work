@@ -103,6 +103,17 @@ class TiktokenEstimator:
                     self._memo.popitem(last=False)
         return value
 
+    def warm(self) -> bool:
+        """Load the BPE vocabulary now; ``True`` iff it is usable.
+
+        B-106 —— 首次加载是同步文件 / 网络 I/O(无缓存时 tiktoken 会从海外
+        下载约 3.6MB,测试集群实测 56~63s),而 :meth:`count` 在 run 里是从
+        事件循环线程调的。调用方(control-plane lifespan)必须经
+        ``asyncio.to_thread`` 在就绪前调它,让 run 从不碰到首次加载。失败沿用
+        fail-open:标记失败后 run 内不再重试,直接走 ``chars // 4``。
+        """
+        return self._load_encoding() is not None
+
     def _count_uncached(self, text: str) -> int:
         encoding = self._load_encoding()
         if encoding is None:
@@ -178,9 +189,53 @@ def flatten_message(msg: BaseMessage) -> str:
     return "".join(parts)
 
 
+#: 一个图片内容块的 token 代价。
+#:
+#: 为什么需要这个常量:``flatten_message`` 把图片块折成它的字符串表示
+#: (``{"type":"image_ref","ref":"expert_work://…"}`` 约 80 字符 ≈ 20 token),
+#: 而一页 100 dpi 的渲染图按 ``宽x高/750`` 约 1000 token —— 低估约 65 倍。
+#: 裁剪 / 压缩 / working window 三个闸门都靠估算值决定何时动手,低估的直接
+#: 后果是它们对图片**完全看不见**:塞三张图进上下文,它们以为只加了 60 token。
+#:
+#: 取值:1568x1568(Anthropic 建议的长边上限)/750 ≈ 3277 是最坏情况;本设计
+#: 渲染在 100 dpi、约 1.0 MP,实际约 1333。取 1300 作为常规档,宁可略低估
+#: 最坏情况也不让常规档虚高 —— 虚高会让压缩过早触发,那是另一种失效。
+#:
+#: 两份参考实现都有同一个常量(hermes ``agent/image_token_cost.py``、
+#: openclaw ``IMAGE_CHAR_ESTIMATE = 8_000``),它们同样把它喂给压缩触发器。
+IMAGE_BLOCK_TOKEN_COST = 1_300
+
+#: 计入 :data:`IMAGE_BLOCK_TOKEN_COST` 的块类型。``image_ref`` 是平台内部的
+#: 引用块(J.6 Path A,字节由适配器在调用时解析);另外两个是厂商线格式,
+#: 适配器翻译后的形状,历史重放时可能出现。
+_IMAGE_BLOCK_TYPES = frozenset({"image_ref", "image", "image_url"})
+
+
+def count_image_blocks(msg: BaseMessage) -> int:
+    """消息内容里的图片块个数(``str`` 内容恒为 0)。"""
+    content: Any = msg.content
+    if isinstance(content, str):
+        return 0
+    return sum(
+        1
+        for block in content
+        if isinstance(block, dict) and block.get("type") in _IMAGE_BLOCK_TYPES
+    )
+
+
+def estimate_message(msg: BaseMessage, estimator: TokenEstimator) -> int:
+    """单条消息的 token 估算 —— 文本走 ``estimator``,图片走固定档。
+
+    **不要把这个代价加进** :func:`flatten_message`:那个函数还要给
+    ``llm.coalesce``(把多条 system 合成真提示词)和压缩器的摘要格式化造
+    **真文本**,掺进填充会直接污染发给模型的内容。代价只加在估算这一侧。
+    """
+    return estimator.count(flatten_message(msg)) + count_image_blocks(msg) * IMAGE_BLOCK_TOKEN_COST
+
+
 def estimate_messages(messages: Sequence[BaseMessage], estimator: TokenEstimator) -> int:
-    """Per-message estimate sum over ``messages`` via ``estimator``."""
-    return sum(estimator.count(flatten_message(msg)) for msg in messages)
+    """Per-message estimate sum over ``messages`` via ``estimator``(含图片代价)。"""
+    return sum(estimate_message(msg, estimator) for msg in messages)
 
 
 _default_lock = threading.Lock()
@@ -194,3 +249,15 @@ def default_estimator() -> TokenEstimator:
         if _default_instance is None:
             _default_instance = TiktokenEstimator()
         return _default_instance
+
+
+def warm_default_estimator() -> bool:
+    """预热 :func:`default_estimator` 那个进程级单例 —— run 里用的同一个对象。
+
+    阻塞调用,调用方负责放到线程里(``asyncio.to_thread``)。返回 ``False``
+    表示分词表不可用、已永久回落 ``chars // 4``。
+    """
+    estimator = default_estimator()
+    if isinstance(estimator, TiktokenEstimator):
+        return estimator.warm()
+    return False

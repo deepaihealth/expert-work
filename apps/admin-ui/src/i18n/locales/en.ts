@@ -4036,9 +4036,9 @@ const en: TranslationKeys = {
       "Keeps important decisions from being lost after repeated compressions.\nOnly actually does anything when 'Learn (remember new info)' is on — otherwise this switch is a no-op.\nExample: the user confirmed an important decision somewhere in the middle of the conversation — before that stretch gets summarized away, the key point gets saved to long-term memory first, so it's still findable later.",
     cc_flush_before_compaction_default: "true",
     cc_max_passes_label: "Max compression passes",
-    cc_max_passes_brief: "Still over the limit? Retry at most N more times",
+    cc_max_passes_brief: "Currently has no effect (reserved)",
     cc_max_passes_impact:
-      "A one-off failure in the summarization model just skips that pass and retries; only 3 failures in a row actually fails the run.\nStill over the threshold after using up these retries? The run just fails outright (a context-overflow error, not a silent workaround).\nExample: set to 3 — if it's still over the threshold after one compression pass, it tries again, up to 3 total; if 3 passes still aren't enough, the run fails.",
+      "Compression summarizes once: if the prompt is still over the threshold after that, the run fails (a context-overflow error, not a silent workaround).\nAny value here currently behaves the same; it is kept so saved configurations stay valid.\nA one-off failure in the summarization model just skips that pass and retries; only 3 failures in a row actually fails the run.",
     cc_max_passes_default: "3",
     cc_pressure_feedback_label: "Pressure-feedback nudge",
     cc_pressure_feedback_brief: "Nudges the model to trim down near the limit",
@@ -4307,7 +4307,7 @@ const en: TranslationKeys = {
     reflection_evaluator_clear: "Clear (use the agent's own model)",
     section_vision: "Image understanding (VL model)",
     vision_hint:
-      "The main model can't read images.\nAdd a model that can, and the agent can read images (via the ask_image tool); reasoning still runs on the main model.",
+      "The main model can't see images. Configure a vision model to let it read images and figures in documents.",
     vision_clear: "Clear (no image understanding)",
     section_vision_help:
       "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nExample: qwen-vl-max",

@@ -37,6 +37,7 @@ from orchestrator.tools import (
     MCPToolDef,
     ReadDocumentTool,
     ReadFileTool,
+    ReadPageTool,
     RecordingMCPClient,
     RecordingSandboxRuntime,
     RecordingTavilyClient,
@@ -362,6 +363,21 @@ async def test_vision_block_activates_ask_image_tool() -> None:
     )
     tool = registry.get("ask_image")
     assert isinstance(tool, AskImageTool)
+
+
+@pytest.mark.asyncio
+async def test_ask_image_gets_the_workspace_store_for_its_short_form() -> None:
+    """B-64 Task 8 —— ``path`` + ``unit`` 短形态要读工作区;接线漏了,工具就只剩
+    ``image_ref``,而 ``read_page`` 的回执已经不再给 ref。"""
+    store = RecordingWorkspaceStore()
+    env = ToolEnv(image_resolver=InMemoryImageResolver(), workspace_store=store)
+    registry = await build_tool_registry(
+        [], tool_env=env, vision=_vision_spec(), vl_caller=_stub_vl_caller
+    )
+    tool = registry.get("ask_image")
+    assert isinstance(tool, AskImageTool)
+    assert tool.workspace_store is store
+    assert "path" in tool.spec.parameters["properties"]
 
 
 @pytest.mark.asyncio
@@ -776,6 +792,7 @@ _BASE_SANDBOX_TOOLS = (
     "write_file",
     "edit_file",
     "read_document",
+    "read_page",
 )
 #: B-84 —— 只读那三件的依赖是 ``workspace_store``, 不是沙箱。从
 #: ``_BASE_SANDBOX_TOOLS`` 里拆出来, 否则"没有沙箱就一个都不注册"那条断言会在
@@ -806,6 +823,7 @@ async def test_base_capabilities_assembled_with_no_manifest_tools() -> None:
     assert isinstance(registry.get("list_dir"), ListDirTool)
     assert isinstance(registry.get("search_files"), SearchFilesTool)
     assert isinstance(registry.get("read_document"), ReadDocumentTool)
+    assert isinstance(registry.get("read_page"), ReadPageTool)
     assert isinstance(registry.get("save_artifact"), SaveArtifactTool)
     assert isinstance(registry.get("list_artifacts"), ListArtifactsTool)
 
@@ -855,6 +873,52 @@ async def test_save_artifact_base_capability_needs_both_deps() -> None:
     registry = await build_tool_registry([], tool_env=env)
     for name in _BASE_ARTIFACT_TOOLS:
         assert registry.get(name) is not None, name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "base-capability"])
+@pytest.mark.parametrize(
+    ("supports_vision", "with_vision_block", "expected"),
+    [
+        (True, False, "inline"),
+        (False, True, "ask_image"),
+        (False, False, "none"),
+    ],
+)
+async def test_read_page_learns_how_its_pages_reach_the_model(
+    declared: bool, supports_vision: bool, with_vision_block: bool, expected: str
+) -> None:
+    """B-64 Task 7 回修 —— 回执怎么说,取决于注册表里**实际**有什么。
+
+    ``ask_image`` 在不在与 ``read_page`` 被告知走 ``ask_image`` 必须同进同退:两者
+    读的是同一个判据。显式声明与隐式基础能力两条注册路径都要接上。
+    """
+    env = ToolEnv(
+        sandbox_runtime=RecordingSandboxRuntime(),
+        artifact_store=InMemoryArtifactStore(),
+        workspace_store=RecordingWorkspaceStore(),
+        image_resolver=InMemoryImageResolver(),
+    )
+    registry = await build_tool_registry(
+        [BuiltinToolSpec(name="read_page")] if declared else [],
+        tool_env=env,
+        vision=_vision_spec() if with_vision_block else None,
+        vl_caller=_stub_vl_caller if with_vision_block else None,
+        supports_vision=supports_vision,
+    )
+    tool = registry.get("read_page")
+    assert isinstance(tool, ReadPageTool)
+    assert tool.figure_delivery == expected
+    assert (registry.get("ask_image") is not None) == (expected == "ask_image")
+
+
+@pytest.mark.asyncio
+async def test_read_page_without_supervisor_raises() -> None:
+    """B-64 回修 M3 —— 显式声明 read_page 但没接沙箱是真实配置错误,必须在
+    build 时炸,不能等到第一次调用才发现(与 read_document/exec_python 等
+    其它沙箱工具的同款契约)。"""
+    with pytest.raises(AgentFactoryError, match="read_page"):
+        await build_tool_registry([BuiltinToolSpec(name="read_page")], tool_env=ToolEnv())
 
 
 @pytest.mark.asyncio

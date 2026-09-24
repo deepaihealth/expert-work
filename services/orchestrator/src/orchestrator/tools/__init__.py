@@ -144,6 +144,9 @@ from orchestrator.tools.nas_workspace_store import (
 from orchestrator.tools.read_document import (
     ReadDocumentTool as ReadDocumentTool,
 )
+from orchestrator.tools.read_page import (
+    ReadPageTool as ReadPageTool,
+)
 from orchestrator.tools.registry import (
     Tool as Tool,
 )
@@ -281,6 +284,7 @@ __all__ = [
     "NullWorkspaceLock",
     "ReadDocumentTool",
     "ReadFileTool",
+    "ReadPageTool",
     "RecordingMCPClient",
     "RecordingSandboxRuntime",
     "RecordingTavilyClient",

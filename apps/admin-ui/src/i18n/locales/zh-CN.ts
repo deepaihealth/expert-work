@@ -815,9 +815,9 @@ const zhCN: TranslationKeys = {
       "它能保证压缩很多次以后，重要的决定不会被彻底丢掉。\n只有「学习（记住新信息）」开着的时候才会真的生效，不然这个开关等于白开。\n例：中间一段对话里用户确认了一个重要决定，这段内容被压缩丢弃前，要点会先存进长期记忆，以后翻旧账时还能查到。",
     cc_flush_before_compaction_default: "true",
     cc_max_passes_label: "最大压缩轮数",
-    cc_max_passes_brief: "压完还超限，最多再试几轮",
+    cc_max_passes_brief: "目前不起作用（保留项）",
     cc_max_passes_impact:
-      "做摘要的模型偶尔调用失败会先跳过重试，只有连续失败 3 次才会真的判定失败。\n如果试完这些轮数还是超限，这次运行就会直接失败（提示内容超限，不会静默降级）。\n例：设成 3，压缩一次还超限就再压一次，最多压 3 次；3 次都不够就直接失败。",
+      "压缩只做一次摘要：摘要后仍超限，这次运行就直接失败（提示内容超限，不会静默降级）。\n这个值目前填多少效果都一样，保留它只为兼容已保存的配置。\n做摘要的模型偶尔调用失败会先跳过重试，只有连续失败 3 次才会真的判定失败。",
     cc_max_passes_default: "3",
     cc_pressure_feedback_label: "压力反馈提示",
     cc_pressure_feedback_brief: "接近上限时提示模型精简输出",
@@ -1078,8 +1078,7 @@ const zhCN: TranslationKeys = {
     reflection_evaluator_hint: "反思时用这个模型给回答打分；不选 = 用智能体自己的主模型评判。",
     reflection_evaluator_clear: "清除（改用智能体自己的模型）",
     section_vision: "图像理解（VL 模型）",
-    vision_hint:
-      "主模型不支持图像。\n配置一个视觉模型后，智能体即可读图（通过 ask_image 工具）；推理仍走主模型。",
+    vision_hint: "主模型不能看图，配置视觉模型后才能看图片和文档里的图。",
     vision_clear: "清除（不配置图像理解）",
     section_vision_help:
       "仅当主模型为纯文本模型时显示。\n配的视觉模型专门回答图片相关问题，主模型负责统筹。\n留空 = 智能体不能看图。\n示例：qwen-vl-max",

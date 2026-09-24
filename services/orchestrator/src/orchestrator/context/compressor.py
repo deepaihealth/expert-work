@@ -506,6 +506,12 @@ class ContextCompressor:
     threshold_pct: float = 0.7
     head_keep: int = 4
     tail_keep: int = 6
+    #: 终审 #3 —— **今天 ``>= 1`` 的任何值效果都一样**。第 1 遍之后提示词是
+    #: 「头 + 摘要 + 尾」,第 2 遍起中段永远只剩那份摘要(``head_keep == 0`` 时连
+    #: 摘要都被并进开头的 system 段、中段为空),:meth:`_compress_once` 按「中段已空」
+    #: 立即抛(B-64 Task 7 回修第 4 轮)。原来第 2..n 遍是用空 NEW EVENTS 调「更新」,
+    #: 靠模型碰巧把摘要写短才可能过线。字段留着:存量 manifest 带着它,而
+    #: ``ContextCompressionPolicy`` 是 ``extra="forbid"``,删掉会让它们 422。
     max_passes: int = 3
     #: Stream HX-1 (Mini-ADR HX-A1) — injected token estimator. ``None``
     #: keeps the legacy ``chars // 4`` heuristic (direct construction /
@@ -532,10 +538,18 @@ class ContextCompressor:
     def _estimate(self, messages: Sequence[BaseMessage]) -> int:
         return estimate_tokens(messages, estimator=self.estimator)
 
-    def should_compress(self, messages: Sequence[BaseMessage]) -> bool:
+    def should_compress(
+        self, messages: Sequence[BaseMessage], *, reserved: Sequence[BaseMessage] = ()
+    ) -> bool:
         """Cheap preflight — returns ``True`` if the estimated prompt
-        size meets or exceeds the threshold."""
-        return self._estimate(messages) >= self.threshold_tokens
+        size meets or exceeds the threshold.
+
+        B-64 Task 7 回修第 3 轮 —— ``reserved`` 是**压缩之后**才会挂进提示词、但压缩
+        器不该碰的消息(渲染页段)。它的估算计入判定,它本身不在 ``messages`` 里、
+        不会被总结。估算走同一个 :meth:`_estimate`(图片块按
+        ``IMAGE_BLOCK_TOKEN_COST`` 计),不另算一份。
+        """
+        return self._estimate(messages) + self._estimate(reserved) >= self.threshold_tokens
 
     async def compress(
         self,
@@ -544,6 +558,7 @@ class ContextCompressor:
         on_pre_compaction: PreCompactionHook | None = None,
         on_compacted: OnCompacted | None = None,
         streak_key: str | None = None,
+        reserved: Sequence[BaseMessage] = (),
     ) -> list[BaseMessage]:
         """Compress the message list until it fits under the threshold.
 
@@ -589,12 +604,30 @@ class ContextCompressor:
         :class:`CompactionStats` (a skip-only round or an entry already
         under threshold emits nothing). Best-effort by the same contract as
         ``on_pre_compaction``: the caller swallows its own failures.
+
+        B-64 Task 7 回修第 3 轮 —— ``reserved``(见 :meth:`should_compress`)计入
+        「压到阈值以下」的目标,但**不新增失败**:中段已空(``_compress_once`` 抛
+        :class:`ContextOverflowError`)时,只要不算预留已经在阈值以下就照常返回;
+        次数用完那条判据本来就只看 ``current``。
+
+        回修第 4 轮 —— 「中段已空」也包括「中段只剩上一轮的摘要」(见
+        :meth:`_compress_once`)。所以当「头 + 摘要 + 尾」不算预留已在阈值下、加上
+        预留仍超时,真实的样子是:**每一步**做一次全新总结(一次 ``on_pre_compaction``),
+        第二遍就以「中段已空」返回,不再白跑空的更新。压缩结果不落检查点,下一步
+        从完整历史重来,所以小窗口模型(8K 那一档)是**每步一次**总结调用;返回的
+        提示词加上图块仍可能超过阈值,由厂商在真实窗口上裁决。
+
+        不带预留时,「中段只剩摘要」这时仍在阈值上 → 抛 :class:`ContextOverflowError`,
+        与原来「空更新两遍 → 次数用完 → 抛」结果相同,只是少了两次白费的调用 ——
+        唯一的差别:原来的空更新可能把摘要本身改写得更短、侥幸压到阈值下,现在不再
+        碰这个运气。
         """
+        reserve = self._estimate(reserved) if reserved else 0
         current: list[BaseMessage] = list(messages)
         tokens_before = self._estimate(current)
         passes_done = 0
         for pass_idx in range(self.max_passes):
-            if self._estimate(current) < self.threshold_tokens:
+            if self._estimate(current) + reserve < self.threshold_tokens:
                 if pass_idx > 0:
                     logger.info(
                         "context_compressor.compressed passes=%d final_tokens=%d",
@@ -606,7 +639,20 @@ class ContextCompressor:
                 )
             try:
                 current = await self._compress_once(current, on_pre_compaction=on_pre_compaction)
-            except ContextOverflowError:
+            except ContextOverflowError as exc:
+                if reserve and self._estimate(current) < self.threshold_tokens:
+                    return await self._finish_compaction(
+                        current, tokens_before, passes_done, on_compacted
+                    )
+                # 终审 #3 —— ``_compress_once`` 不知道这是第几遍,它报的 ``passes=0``
+                # 在第 2 遍撞上「中段只剩摘要」时是错的:RUN_FAILED 里会写「压了 0 遍」,
+                # 而第 1 遍其实跑过了。按本次调用真实完成的遍数重报。
+                if exc.passes != passes_done:
+                    raise ContextOverflowError(
+                        estimated_tokens=exc.estimated_tokens,
+                        threshold=exc.threshold,
+                        passes=passes_done,
+                    ) from exc
                 raise
             except RunCancelledError:
                 # A cancelled run must abort, never be mistaken for a
@@ -708,15 +754,26 @@ class ContextCompressor:
                 threshold=self.threshold_tokens,
                 passes=0,
             )
+        # Stream CM-7 (Mini-ADR CM-H2) — when the middle carries an
+        # earlier compression's summary, UPDATE it with the new events
+        # instead of re-summarising its own output (lossy chain).
+        prior, fresh_middle = _extract_prior_summary(split.middle)
+        if prior is not None and not fresh_middle:
+            # B-64 Task 7 回修第 4 轮 —— 中段只剩上一轮的摘要 = 没有新东西可总结,
+            # 按「中段已空」处理。不这样的话,这一遍会用空的 NEW EVENTS 调一次
+            # 「更新」(白花一次主模型调用、反复重写摘要会漂移),还会把那份摘要再
+            # 交给 ``on_pre_compaction`` 冲进长期记忆一次。带预留时最容易撞上:
+            # 头 + 摘要 + 尾不算预留已经够小、加上预留仍超,剩下的每一遍都是空更新。
+            raise ContextOverflowError(
+                estimated_tokens=self._estimate(messages),
+                threshold=self.threshold_tokens,
+                passes=0,
+            )
         # Stream CM-3 — flush the middle to durable memory BEFORE it is
         # summarised away (and before the summariser LLM call, so the
         # salient points survive even if summarisation then fails).
         if on_pre_compaction is not None:
             await on_pre_compaction(split.middle)
-        # Stream CM-7 (Mini-ADR CM-H2) — when the middle carries an
-        # earlier compression's summary, UPDATE it with the new events
-        # instead of re-summarising its own output (lossy chain).
-        prior, fresh_middle = _extract_prior_summary(split.middle)
         if prior is not None:
             # RT-ADR-10 — update mode splits the input budget evenly:
             # PREVIOUS SUMMARY and NEW EVENTS each get half, so neither

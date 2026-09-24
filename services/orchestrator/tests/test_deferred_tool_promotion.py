@@ -314,8 +314,10 @@ class _AlwaysCompress:
     async def compress(self, messages: Sequence[BaseMessage], **kwargs: Any) -> list[BaseMessage]:
         return list(messages)
 
-    def should_compress(self, messages: Sequence[BaseMessage]) -> bool:
-        del messages
+    def should_compress(
+        self, messages: Sequence[BaseMessage], *, reserved: Sequence[BaseMessage] = ()
+    ) -> bool:
+        del messages, reserved
         return True
 
 

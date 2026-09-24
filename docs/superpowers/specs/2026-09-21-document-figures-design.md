@@ -344,6 +344,14 @@ hermes 能那么做是因为它原生打 Anthropic。
 另一条约束:`ask_image` **只在**主模型 `supports_vision == False` **且**
 manifest 声明了 `vision:` 块时才挂(`agent_factory.py:835`)。它不普遍可用。
 
+> **修订(2026-09-24,用户拍板,Task 8)**:看图模型**仍由 Agent 自己配**,平台**不设**默认看图模型
+> —— 平台默认依赖某家厂商 key,key 缺失时会从「没配」变成「配了但静默失效」,更难察觉。平台负责的是:
+> ① 配置页在主模型非多模态时提示(文案:「主模型不能看图，配置视觉模型后才能看图片和文档里的图。」);
+> ② 没配时 `read_page` 回执说清**缺的是视觉模型配置、去哪里配**,让模型能转告用户;
+> ③ **不让模型手抄长 ref**:`ask_image` 增加 `path + unit` 短形态(宿主侧找本 agent 作用域内最新一张渲染页,
+> 文档 mtime 晚于渲染则显式失败),`read_page` 在 ask_image 档的回执只给「原样路径 + 页号」、不再列 ref。
+> 实证:同一 Agent(ai-health-plan)同一模型(glm-5.3)2026-09-14 手抄一个 URL 三次错三次。
+
 ### 8.2 三分投递
 
 复用 `_child_run.build_seed_content` 已经确立的判据(`_child_run.py:152-162`):
@@ -351,8 +359,8 @@ manifest 声明了 `vision:` 块时才挂(`agent_factory.py:835`)。它不普遍
 | agent 能力 | 投递 | 理由 |
 |---|---|---|
 | `supports_vision` | Path A:页面 ref 作为 **image 内容块**挂在尾部隐藏 `HumanMessage`(§8.5) | 主模型直接看 |
-| `can_ask_image` | Path B:figure map 里列出页面 ref,模型调 `ask_image(ref, question)` | 字节从不进主上下文 |
-| 都不行 | **只说有图、说明读不了,不给 ref** | 「命名它们只会诱使它编答案」(既有注释) |
+| `can_ask_image` | Path B:~~figure map 里列出页面 ref,模型调 `ask_image(ref, question)`~~ **回执给原样路径 + 页号,模型调 `ask_image(path, unit, question)`**(Task 8 修订,见 §8.1) | 字节从不进主上下文;模型不抄长串 |
+| 都不行 | **只说有图、说明读不了,不给 ref**;**并说清缺的是视觉模型配置与配置入口**(Task 8 修订) | 「命名它们只会诱使它编答案」(既有注释);失败要让用户当场看见原因 |
 
 ### 8.3 渲染页落在哪
 
@@ -366,6 +374,13 @@ manifest 声明了 `vision:` 块时才挂(`agent_factory.py:835`)。它不普遍
 - NAS 挂在 control-plane 上(`/mnt/workspaces`),读字节不用过沙箱 stdout。
 
 **不开新目录、不开新 TTL、不新增配额来源** —— 原则 4。
+
+> **修订(2026-09-24,按实现核对)**:实际落点是
+> `[agents/<key>/].tool_results/<run_id>/figures/<doc-sha>/<render-sha>/_u<unit>/page-NN.jpg`。
+> 与上面初稿的差别:① 在 agent 自己的作用域下(带 `agents/<key>/` 前缀),不是用户根;
+> ② `<doc-sha>` 只认路径,另加 `<render-sha>`(文档内容 + dpi 的哈希)—— 同一路径换了内容必须落到不同目录,
+> 否则会送出旧页;③ 每个 unit 一个私有子目录 `_u<unit>`,多页并发渲染互不覆盖。路径形状的单一真源在
+> `expert_work.persistence` 的 workspace layout(`is_rendered_figure_rel`)。
 
 ### 8.4 ref 形态
 
@@ -386,6 +401,12 @@ expert_work://workspace/<tenant>/<user>/.tool_results/<run_id>/figures/<doc-sha>
   新增一个 NAS 实现是**加实现不是改接口**。
 - `AskImageTool.invoke` 按 scheme 分派,租户校验不变(`image_ref.tenant_id != ctx.tenant_id` 那一条对两种 ref 都执行)。
 
+> **修订(2026-09-24,按实现核对)**:ref 形态随 §8.3 带 `agents/<key>/` 前缀与 `<render-sha>/_u<unit>/` 两层;
+> 解析器**接受** `agents/<key>/` 首段(初稿写「拒 `agents/`」是错的 —— 渲染页就落在 agent 作用域里),
+> `shared/` 仍拒。校验从初稿的 tenant 一项扩为 **tenant / user / agent_key 三项**,外加形状判据:
+> 同租户换一个 user UUID、或同用户换一个 agent,都不能读到别人的渲染页。Task 8 起模型不再需要抄 ref,
+> `ask_image(path, unit)` 在宿主侧找本 agent 作用域内最新渲染页后造出同一个 ref,再走同一套校验(§8.1 修订)。
+
 ### 8.5 Path A 的完整形态:新标记 + 滑窗 + 可见占位符
 
 #### 为什么要第三个标记
@@ -398,6 +419,8 @@ expert_work://workspace/<tenant>/<user>/.tool_results/<run_id>/figures/<doc-sha>
 | `WORKSPACE_BLOCK_MARK` | **内容本身在说谎**(上一轮快照已不是「现在」) | 去重,只留最新 |
 
 **图是第三种:它不过期。** 一份上传文档的第 7 页,渲出来是什么就永远是什么。
+
+> **注(2026-09-24,实现核对)**:图块永远挂在**尾部**、从不进可复用的提示词前缀,所以下文「退役时机绑缓存 TTL」那条考虑在结构上是空转的 —— 尾部内容本来就不命中前缀缓存,退役只按滑窗走。
 
 - 用去重(工作区那条规矩)是错的 —— 模型看第 7 页时会丢掉还有用的第 3 页;
 - 用「放回最新」(输入那条)同理。
@@ -423,7 +446,14 @@ hermes(`[image]` / `[image: <url>]`)与 openclaw
 **删除是静默失效,替换不是** —— 模型看得见这里原来有张图,也看得见怎么拿回来。
 这一条直接服务于设计原则 1。
 
+> **修订(2026-09-24,按实现核对)**:占位不是每页一条,而是**按文档折叠成一行、路径只写一次**,例如
+> `文档 「<路径>」:编号 1-3、7 的图已退出上下文(需要重看就调用 read_page,path 填这个路径,units 填要看的编号)`;
+> 同一编号有旧版本(文档之后被改过)时同一行里一并说明。文档路径来自 `figure_documents` 状态通道,
+> 正向重算 doc-sha 对上才采信;路径没记下来的老会话写「一份文档(路径没记下来)」。
+
 #### 退役时机绑在缓存生命周期上
+
+> **修订(2026-09-24)**:这一节在我们这里结构上不适用 —— 图块永远挂在尾部、从不进可复用前缀(见本节开头的注),不存在「打掉活着的缓存前缀」的问题;退役只按滑窗走。下面原文保留作出处。
 
 openclaw 的 `mode: "cache-ttl"`(ttl 5 min):裁剪**只在 prompt 缓存已经过期
 之后**做,所以裁剪永远不会打掉一个还活着的缓存前缀。这条照抄。

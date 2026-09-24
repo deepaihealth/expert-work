@@ -101,8 +101,11 @@ from orchestrator.llm import (
 )
 from orchestrator.multimodal import (
     CachingImageResolver,
+    DispatchingImageResolver,
     ImageResolver,
+    NasWorkspaceImageResolver,
     ObjectStoreImageResolver,
+    is_cacheable_image_ref,
 )
 from orchestrator.sse import ThreadStatsRecorder
 from orchestrator.tools import (
@@ -1774,6 +1777,12 @@ def build_tool_env(
     ``search_files``)的后端:它们直读 control-plane 自己挂着的 NAS,不起沙箱。
     传进来的必须是 ``build_workspace_store`` 给工作区端点的**同一个实例**,不另造
     一份 —— 两份实例就是两份可能漂移的 root 配置。
+
+    B-64 —— ``image_resolver`` 单独一个字段就够了:它现在是
+    :class:`~orchestrator.multimodal.DispatchingImageResolver`(见
+    ``make_image_resolver``),自己认得上传 ref 与工作区 ref 两种 scheme。
+    ``ask_image`` 与两个 provider 适配器共享同一个实例,不需要各自再接一根
+    "工作区专用"的线——那样每多一个消费方就多一处会漏接的风险。
     """
     return ToolEnv(
         allowlist_provider=_tenant_allowlist_provider(tenant_config_service),
@@ -1846,15 +1855,67 @@ async def resolve_object_store_config(
     )
 
 
-def make_image_resolver(store: ObjectStore) -> ImageResolver:
-    """Build the J.6 image resolver over an object store — backs both
-    multimodal paths (Path A content blocks + Path B ``ask_image``).
+def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = None) -> ImageResolver:
+    """Build **the one** J.6 image resolver — backs both multimodal paths
+    (Path A content blocks + Path B ``ask_image``) and both provider
+    adapters (``openai.py`` / ``anthropic.py``): every consumer shares this
+    single instance (threaded through ``ToolEnv.image_resolver`` and each
+    provider's own ``image_resolver`` constructor arg), so it must itself
+    understand every ref scheme rather than each consumer wiring its own.
 
-    Wrapped in a bounded LRU cache: the resolver is a single long-lived
-    instance, and every LLM turn re-resolves every image in the conversation
-    history, so caching stops the same image being re-fetched each turn.
+    B-64 —— ``workspace_root`` wires the NAS-mounted workspace backend
+    (:class:`~orchestrator.multimodal.NasWorkspaceImageResolver`) into a
+    :class:`~orchestrator.multimodal.DispatchingImageResolver` alongside the
+    object-store backend; ``None`` (this deployment has no NAS mount —
+    ``settings.workspace_nas_root`` unset, same truthiness gate
+    :func:`build_workspace_store` uses) → workspace refs fail with a clear
+    "not available" error instead of silently never resolving.
+
+    Wrapped in **one** bounded LRU cache around the dispatcher, not one per
+    backend: every LLM turn re-resolves every image in the conversation
+    history (``_human_content`` re-walks all messages on each ``complete``
+    call), so caching stops the same image — upload *or* rendered page —
+    being re-fetched each turn. The cache key is the full ref string, which
+    already carries the scheme prefix, so an upload ref and a workspace ref
+    can never collide in the cache.
+
+    **Not every ref is cacheable, though** — see
+    :func:`~orchestrator.multimodal.is_cacheable_image_ref`, passed in as
+    ``should_cache``. An upload ref is uniformly content-addressed (an
+    ``image_id`` never changes what it names). A workspace ref is not:
+    ``parse_workspace_image_ref`` accepts any relative path under the user's
+    workspace, not only the ``.tool_results/<run_id>/figures/<doc-sha>/
+    <render-sha>/_u<unit>/page-NN.jpg`` convention the rendering pipeline
+    actually writes, so a workspace ref *can* name an ordinary, overwritable
+    file — caching that would silently serve stale bytes, process-wide, after
+    the next overwrite. ``is_cacheable_image_ref`` is what keeps that class of
+    ref out of the cache.
+
+    B-64 回修第 4/5 轮 —— 这里原来管渲染落点叫 **write-once**,而那个前提当时
+    不成立(产出路径只按文档**路径**算,同一条路径换了内容拿到逐字相同的 ref,
+    渲染又是原地重写;这个缓存是进程级、无 TTL、无失效通道,于是"文档被覆盖
+    之后模型仍然读到旧文档那一页"端到端跑得通)。
+
+    现在的事实陈述有两半,都别再简写成一句 write-once:
+
+    1. **判据认的是路径形状,不是 ``.tool_results/`` 这个目录。** 落在那个目录下
+       不再蕴含任何东西 —— 第 5 轮拆掉的正是那张目录通行证(``write_file`` 对
+       ``.tool_results/evil.jpg`` 是放行的,模型自己就是第三个写入者)。
+    2. **形状认下来的那条 rel,是从"渲染输入 + 页号"派生的**,不是从"源文档
+       内容 + 页号"—— 渲染输入含源文档字节与 dpi。源文档一变 rel 就跟着变,
+       缓存条目自然失效而不是被悄悄覆盖。
+
+    这不是"只会"级别的绝对保证,它有已知边界(取哈希与真正渲染之间的 TOCTOU
+    窗口、64 位摘要在对抗场景下约 2^32 的生日界、以及不在哈希里的沙箱渲染工具链
+    版本)。边界逐条写在
+    :func:`~orchestrator.multimodal.is_cacheable_image_ref` 的 docstring 里,
+    那里同时解释了为什么"文件仍可能被重写"与"缓存安全"并不矛盾。
     """
-    return CachingImageResolver(ObjectStoreImageResolver(store=store))
+    workspace = NasWorkspaceImageResolver(root=workspace_root) if workspace_root else None
+    dispatcher = DispatchingImageResolver(
+        uploads=ObjectStoreImageResolver(store=store), workspace=workspace
+    )
+    return CachingImageResolver(dispatcher, should_cache=is_cacheable_image_ref)
 
 
 def build_middleware_env(
