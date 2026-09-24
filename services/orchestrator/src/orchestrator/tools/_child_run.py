@@ -23,7 +23,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -32,12 +33,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.observability import expert_work_counter
+from expert_work.persistence.token_usage_store import NON_BILLABLE_USAGE_KINDS
 from expert_work.protocol import MAX_RESULT_EXCERPT_CHARS, SubAgentInvocation, SubagentStatus
 from expert_work.runtime.cancellation import (
     CANCELLATION_TOKEN_KEY,
     CancellationToken,
     RunCancelledError,
 )
+from expert_work.runtime.middleware import MeteredCall, usage_tap
 from orchestrator.errors import MaxStepsExceededError
 from orchestrator.multimodal import image_ref_block
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
@@ -219,6 +222,8 @@ async def run_child_to_result(
     start_monotonic = time.monotonic()
     result: Any = None
     raised_max_steps = False
+    # B-103 —— worker 这一段记下的每次调用(与 ``token_usage`` 行同口径),end 帧据此分桶。
+    ledger = _WorkerUsageLedger()
 
     # B2 worker 可观测性 — 帧身份 + 局部序。sink 为 None(未接线:eval /
     # 单测)时零帧零开销。depth>1 说明"发起方自己就是 worker",其
@@ -253,30 +258,31 @@ async def run_child_to_result(
         # ainvoke 的返回值(LangGraph 语义),异常时缺失 → 下方
         # _fetch_partial 兜底(原语义)。
         last_chunk = time.monotonic()
-        async for part in child.graph.astream(
-            child_input, child_config, stream_mode=["updates", "values"]
-        ):
-            mode, chunk = part
-            if mode == "values":
-                result = chunk
-                continue
-            now = time.monotonic()
-            duration_ms = int((now - last_chunk) * 1000)
-            last_chunk = now
-            if sink is None or not isinstance(chunk, Mapping):
-                continue
-            for node, writes in chunk.items():
-                await _emit_worker_frame(
-                    sink,
-                    build_worker_update_frame(
-                        ident,
-                        wseq=wseq,
-                        node=str(node),
-                        writes=writes if isinstance(writes, Mapping) else {},
-                        duration_ms=duration_ms,
-                    ),
-                )
-                wseq += 1
+        with usage_tap(ledger):
+            async for part in child.graph.astream(
+                child_input, child_config, stream_mode=["updates", "values"]
+            ):
+                mode, chunk = part
+                if mode == "values":
+                    result = chunk
+                    continue
+                now = time.monotonic()
+                duration_ms = int((now - last_chunk) * 1000)
+                last_chunk = now
+                if sink is None or not isinstance(chunk, Mapping):
+                    continue
+                for node, writes in chunk.items():
+                    await _emit_worker_frame(
+                        sink,
+                        build_worker_update_frame(
+                            ident,
+                            wseq=wseq,
+                            node=str(node),
+                            writes=writes if isinstance(writes, Mapping) else {},
+                            duration_ms=duration_ms,
+                        ),
+                    )
+                    wseq += 1
         outcome: TrajectoryOutcome = "success"
     except MaxStepsExceededError:
         outcome = "max_steps"
@@ -298,7 +304,7 @@ async def run_child_to_result(
             metadata=trajectory_metadata,
         )
         if sink is not None:
-            partial_usage = _usage_of(partial_msgs)
+            partial_usage, partial_by_model = _worker_usage(ledger, partial_msgs)
             await _emit_worker_frame(
                 sink,
                 build_worker_end_frame(
@@ -309,7 +315,7 @@ async def run_child_to_result(
                     llm_call_count=sum(1 for m in partial_msgs if isinstance(m, AIMessage)),
                     wall_clock_ms=int((time.monotonic() - start_monotonic) * 1000),
                     usage=partial_usage,
-                    usage_by_model=_usage_by_model_of(child, partial_usage),
+                    usage_by_model=partial_by_model,
                 ),
             )
         raise
@@ -338,7 +344,7 @@ async def run_child_to_result(
         outcome = "failed"
 
     if sink is not None:
-        usage = _usage_of(messages)
+        usage, usage_by_model = _worker_usage(ledger, messages)
         await _emit_worker_frame(
             sink,
             build_worker_end_frame(
@@ -355,7 +361,7 @@ async def run_child_to_result(
                 llm_call_count=llm_call_count,
                 wall_clock_ms=wall_clock_ms,
                 usage=usage,
-                usage_by_model=_usage_by_model_of(child, usage),
+                usage_by_model=usage_by_model,
             ),
         )
 
@@ -531,11 +537,15 @@ def _usage_of(messages: Sequence[BaseMessage]) -> dict[str, Any] | None:
     每个 worker 只发一个 end 帧,不会重复(与 duration 的双计教训相反:
     那次是同一段时间既进工具行又进 subagent 行)。
     """
+    return _sum_usage(getattr(msg, "usage_metadata", None) for msg in messages)
+
+
+def _sum_usage(metadatas: Iterable[object]) -> dict[str, Any] | None:
+    """把若干份 ``usage_metadata`` 加成一份同构的;一份都没有 → ``None``。"""
     totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     cache_read = cache_creation = reasoning = 0
     seen = False
-    for msg in messages:
-        um = getattr(msg, "usage_metadata", None)
+    for um in metadatas:
         if not isinstance(um, Mapping):
             continue
         seen = True
@@ -559,25 +569,50 @@ def _usage_of(messages: Sequence[BaseMessage]) -> dict[str, Any] | None:
     }
 
 
-def _usage_by_model_of(
-    child: BuiltAgent, usage: Mapping[str, Any] | None
-) -> list[dict[str, Any]] | None:
-    """B-42 —— 把 ``usage`` 记在 worker **自己**的 ``(provider, model)`` 名下。
+@dataclass
+class _WorkerUsageLedger:
+    """B-103 —— worker 这一段里记下的调用(:func:`~expert_work.runtime.middleware.usage_tap`)。
 
-    父侧只知道主 Agent 的模型,而 ``dynamic_workers.model`` 可以给 worker
-    换模型;不带模型名回传,前端只能整轮按主 Agent 的费率计价 —— 错价
-    (run f562fa69 里 95% 的计价 token 来自 worker)。
-
-    一个 worker 一个模型,所以这里恒是单桶;形状仍是「桶列表」,与
-    ``token_usage`` 汇总接口的 ``usage_by_model`` 同构,消费者一套解析
-    走两处。桶记的是**配置里的**模型名,与 ``token_usage`` 记账同口径
-    (备用模型接管的调用也记在主模型名下 —— 计费就是这么记的,这里不另起
-    一套)。``usage`` 为 ``None`` 或子代模型未知 → ``None``(键缺席),
-    消费者退回老算法;绝不编一个空桶列表让「未知」变成「零成本」。
+    收的是 ``TokenUsageMiddleware`` 落行时的同一份(同样的模型名、同样的「没有用量就不
+    记」),所以 end 帧与 ``token_usage`` 行对得上。平台开销(安全评审 / 重排序,
+    ``NON_BILLABLE_USAGE_KINDS``)不收:与 run 级 ``usage_by_model`` 及控制台合计同口径。
+    缓存命中的全 0 行没有 ``usage_metadata``,也不收(与按消息求和时一样)。
     """
-    if usage is None or child.model_provider is None or child.model_name is None:
-        return None
-    return [{"provider": child.model_provider, "model": child.model_name, **usage}]
+
+    calls: list[MeteredCall] = field(default_factory=list)
+
+    def __call__(self, call: MeteredCall) -> None:
+        if call.usage_kind in NON_BILLABLE_USAGE_KINDS or call.usage_metadata is None:
+            return
+        self.calls.append(call)
+
+
+def _worker_usage(
+    ledger: _WorkerUsageLedger, messages: Sequence[BaseMessage]
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+    """worker end 帧的 ``(usage, usage_by_model)``。
+
+    B-42 / B-103 —— ``usage_by_model`` 按**实际应答**的 ``(provider, model)`` 分桶,与
+    run 级 ``usage_by_model``(按 ``token_usage`` 行汇总)同口径:备用模型接管的调用记在
+    备用名下,worker 内的看图、规划、压缩、记忆调用各记在各自的模型名下;``usage`` 是
+    同一批调用的总和,桶的和恒等于它。
+
+    这一段一次都没记下(没接用量存储:测试 / 无控制面)→ 不知道谁应答的:``usage``
+    照旧按消息求和,``usage_by_model`` 缺席,消费者退回老算法;绝不编一个空桶列表让
+    「未知」变成「零成本」。
+    """
+    if not ledger.calls:
+        return _usage_of(messages), None
+    grouped: dict[tuple[str | None, str], list[Mapping[str, Any]]] = {}
+    for call in ledger.calls:
+        if call.usage_metadata is not None:
+            grouped.setdefault((call.provider, call.model), []).append(call.usage_metadata)
+    buckets: list[dict[str, Any]] = []
+    for (provider, model), metadatas in grouped.items():
+        summed = _sum_usage(metadatas)
+        if summed is not None:
+            buckets.append({"provider": provider, "model": model, **summed})
+    return _sum_usage(call.usage_metadata for call in ledger.calls), buckets
 
 
 async def _fetch_partial(

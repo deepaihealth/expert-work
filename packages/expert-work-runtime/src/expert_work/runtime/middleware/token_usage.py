@@ -34,12 +34,17 @@ baked into the middleware instance at construction by
 B-102 —— ``model`` / ``provider`` 是**配置的主模型**;备用模型接管时,``served_by``
 (构建期给的解析器)从响应上认出**实际应答**的模型条目,行与计数器都记在它的配置名
 下(不用厂商回显的 ``response_metadata.model_name``)。缓存命中没有模型应答,仍记主模型。
+
+B-103 —— :func:`usage_tap` 让调用方在一段执行里收到这里记下的每一次调用(与落行同一
+口径:同样的「没有用量就不记」、同样的模型名),worker 的 end 帧据此按模型分桶。
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -97,6 +102,39 @@ _ew_token_estimate_actual_total = expert_work_counter(
     "expert_work_ew_token_estimated_total (HX-1 drift denominator, B-104).",
     ("tenant_id", "agent_name", "model", "usage_kind"),
 )
+
+
+@dataclass(frozen=True)
+class MeteredCall:
+    """一次记下的调用 —— :func:`usage_tap` 收到的东西。
+
+    ``usage_metadata`` 是响应原样的用量(含 ``output_token_details.reasoning``,
+    ``token_usage`` 行没有这一列);缓存命中落的全 0 行这里是 ``None``。
+    """
+
+    provider: str | None
+    model: str
+    usage_kind: str
+    usage_metadata: Mapping[str, Any] | None
+
+
+_USAGE_TAP: ContextVar[Callable[[MeteredCall], None] | None] = ContextVar(
+    "expert_work_usage_tap", default=None
+)
+
+
+@contextmanager
+def usage_tap(tap: Callable[[MeteredCall], None]) -> Iterator[None]:
+    """在这段执行(及其中创建的任务)里,每记一次调用就交给 ``tap`` 一份。
+
+    **替换**而不是叠加外层的 tap:嵌套的 worker 收自己的,外层不重复收(孙 worker 的
+    账记在孙 worker 自己的 end 帧上)。
+    """
+    token = _USAGE_TAP.set(tap)
+    try:
+        yield
+    finally:
+        _USAGE_TAP.reset(token)
 
 
 @dataclass
@@ -240,6 +278,23 @@ class TokenUsageMiddleware:
         usage_user_id = ctx.payload.get("user_id")
         if not isinstance(usage_user_id, UUID):
             usage_user_id = None
+        tap = _USAGE_TAP.get()
+        if tap is not None:
+            try:
+                tap(
+                    MeteredCall(
+                        provider=provider,
+                        model=model,
+                        usage_kind=self.usage_kind,
+                        usage_metadata=(
+                            response.usage_metadata
+                            if isinstance(response.usage_metadata, Mapping)
+                            else None
+                        ),
+                    )
+                )
+            except Exception:
+                logger.warning("token_usage.tap_failed model=%s", model, exc_info=True)
         try:
             await self.store.insert(
                 TokenUsageRecord(
