@@ -678,7 +678,7 @@ function onPlan(data) {
 |---|---|---|
 | `outcome` | string | 这个子任务结束时的结果。取值：`success`（正常执行完成）/ `max_steps`（把自己的步数预算用完，这是部分结果而不是失败，父 Agent 会带着这份部分进展继续推理）/ `cancelled`（执行中被取消）。只有这三个取值 |
 | `iteration_used` | integer | 实际用掉的步数，非负整数 |
-| `llm_call_count` | integer | `usage` 所计入的模型调用次数，非负整数 |
+| `llm_call_count` | integer | `usage` 所计入的模型调用次数，非负整数。平台没有记录到这个子任务的用量时，是模型回复的条数 |
 | `wall_clock_ms` | integer | 这个子任务从开始到结束的墙钟耗时，单位毫秒，非负整数 |
 | `usage` | object | 这个子任务全部模型调用消耗的 token，所含调用见表后说明。字段与 `updates` 事件里模型消息的 `usage_metadata` 相同：`input_tokens` / `output_tokens` / `total_tokens`，以及 `input_token_details`（含 `cache_read`、`cache_creation`）与 `output_token_details`（含 `reasoning`）；没有上报用量时不出现 |
 | `usage_by_model` | array | `usage` 按实际回答的模型拆开的明细，每一项是 `{provider, model}` 加上与 `usage` 相同的字段，各项相加等于 `usage`。可能有多项，见表后说明；平台没有记录到这个子任务的模型调用时，这个字段不出现 |
@@ -706,14 +706,19 @@ function onPlan(data) {
 
 #### 统计一次 run 的 token 消耗
 
-子任务的模型调用不产生 `updates` 事件，它消耗的 token 只在这里上报。只累加 `updates` 事件得到的是主线消耗，不含派出去的子任务；派出的子任务越多，两者差距越大。
+**一次 run 的总消耗以 run 级数据为准**：[`end` 事件](#end)的 `usage_by_model`，或 [5.9 run 用量](./query#_5-9-run-用量)。它计入代用户发起的全部模型调用，包括主 Agent、它派出的子任务，以及下面列出的额外调用；与子任务的 `usage` 相同，平台自身的安全校验与检索结果排序不计入。
 
-累加规则三条：
+事件里的数字只用于过程中的进度展示，不能加出总消耗：
 
-- 把每个子任务 `end` 事件的 `usage` 加进本次 run 的总数。
-- 只累加 `kind` 为 `end` 的事件。每个子任务只发一条，因此累加全部 `end` 事件即覆盖整棵子任务树——嵌套的子任务在它自己的 `end` 事件上单独上报，不会重复计入。
+- `updates` 事件只携带主 Agent 自己回答的用量。主 Agent 的规划、反思、对话摘要、长期记忆读写和看图不产生 `updates` 事件，这些调用只计入 run 级总数。
+- 子任务 `end` 事件的 `usage` 已经包含这个子任务自己的上述调用。
+- 因此，累加 `updates` 事件与各子任务 `end` 事件得到的数，小于 run 级总数；开启记忆、摘要或规划的 Agent 差得更多。
+
+做进度展示时按下列规则累加子任务：
+
+- 只累加 `kind` 为 `end` 的事件。每个子任务只发一条，嵌套的子任务在它自己的 `end` 事件上单独上报，因此每个子任务只计入一次。
 - `usage` 不出现时按「未上报」处理，不要当作 0。把未上报计成 0，展示出来的结果是这个子任务不消耗费用。
-- 折算费用时按 `usage_by_model` 逐项计算：每一项的 token 乘以这一项 `provider` 与 `model` 对应的单价，再相加。子任务的模型可以与主 Agent 不同，整个 run 的 token 一律按主 Agent 的单价折算会算错。`usage_by_model` 不出现时，退回把 `usage` 按主 Agent 的单价折算。
+- 折算费用时按 `usage_by_model` 逐项计算：每一项的 token 乘以这一项 `provider` 与 `model` 对应的单价，再相加。`usage_by_model` 不出现时，退回把 `usage` 按主 Agent 的单价折算。
 
 #### 示例
 

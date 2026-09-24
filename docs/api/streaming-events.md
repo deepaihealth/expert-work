@@ -100,8 +100,9 @@ Per-kind `data`:
   args_excerpt}]}` or `{type: "tool", name, tool_result_excerpt, …}`. All
   excerpts are truncated; they are a progress view, not the full transcript.
 - `end` — `outcome`, `iteration_used`, `llm_call_count` (the number of model
-  calls counted in `usage`), `wall_clock_ms`, `usage` and `usage_by_model`
-  (both optional, see below).
+  calls counted in `usage`; when the platform recorded no usage for the
+  worker, the number of model replies), `wall_clock_ms`, `usage` and
+  `usage_by_model` (both optional, see below).
 
 ### A worker's token usage
 
@@ -176,15 +177,25 @@ parent agent's rate. The run's persisted rollup (`tokens.usage_by_model` on
 the run and conversation records) carries the same split, computed from the
 platform's usage records instead of the events.
 
-Three things to know when you add up a run's tokens:
+How to get a run's total tokens:
 
-- **A worker's tokens appear nowhere else.** A worker's model calls do not
-  produce `updates` frames on the parent stream, so a total built only from
-  `updates` counts the main line and nothing else. Add every worker `end`
-  frame's `usage` to get the run's real total.
-- **Count the `end` frame only.** Each worker emits exactly one, so summing
-  across all of them covers the whole delegation tree — a nested worker
-  reports on its own `end` frame — with nothing counted twice.
+- **Use the run-level total, not a sum of events.** The authoritative total
+  is `usage_by_model` on the run's `end` event (the last event on the
+  stream), or the same data from `GET /v1/agents/{code}/runs/{run_id}/usage`.
+  It covers every model call made on the user's behalf: the main agent, its
+  workers, and the extra calls listed below. As with a worker's `usage`, the
+  platform's own safety checks and search-result ranking are not included.
+- **Events show progress, not the full account.** Summing `usage_metadata`
+  from `updates` events and `usage` from worker `end` events gives a lower
+  number than the run-level total. The `updates` events carry only the main
+  agent's replies. The main agent's own planning, reflection, conversation
+  summaries, long-term memory reads and writes, and image questions produce
+  no `updates` event, so they appear only in the run-level total. A worker's
+  `usage`, by contrast, already includes that worker's own calls of those
+  kinds. Use the event sum for an in-progress display only.
+- **Count each worker's `end` event once.** Each worker emits exactly one,
+  and a nested worker reports on its own `end` event, so adding up every
+  worker `end` event counts each worker exactly once.
 - **`usage` may be absent, and absent is not zero.** Token counts are
   optional for some providers and some cache paths. A missing block means
   "not reported", so treat it as unknown rather than free.
