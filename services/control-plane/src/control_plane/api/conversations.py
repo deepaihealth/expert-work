@@ -45,6 +45,7 @@ from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.thread_message import ThreadMessageStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.token_usage_store import (
+    NON_BILLABLE_USAGE_KINDS,
     TokenTotals,
     TokenUsageStore,
     merge_model_buckets,
@@ -356,7 +357,14 @@ def build_conversations_router() -> APIRouter:
                 else {}
             )
             all_traces = sorted({t for a in aggs.values() for t in a.trace_ids})
-            by_trace = await token_usage.totals_by_trace_ids(all_traces) if all_traces else {}
+            # B-104 —— 租户侧合计与账单同口径:平台开销(评审 / 重排序)不计。
+            by_trace = (
+                await token_usage.totals_by_trace_ids(
+                    all_traces, exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS
+                )
+                if all_traces
+                else {}
+            )
 
         items = [_conversation_to_dict(m, aggs.get(m.thread_id), by_trace) for m in metas]
 
@@ -437,7 +445,13 @@ def build_conversations_router() -> APIRouter:
 
         async with applied_scope(SingleTenant(tenant_id=target)):
             trace_ids = sorted({r.trace_id for r in run_list if r.trace_id is not None})
-            by_trace = await token_usage.totals_by_trace_ids(trace_ids) if trace_ids else {}
+            by_trace = (
+                await token_usage.totals_by_trace_ids(
+                    trace_ids, exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS
+                )
+                if trace_ids
+                else {}
+            )
 
         runs_json = [
             _run_to_dict(

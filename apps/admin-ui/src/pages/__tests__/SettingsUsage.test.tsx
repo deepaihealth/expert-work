@@ -238,7 +238,7 @@ describe("usage kind split (SE-A43)", () => {
     installAdapter({});
     renderUsage();
     const kindTable = await screen.findByTestId("usage-token-kind-table");
-    expect(within(kindTable).getByText(/平台开销|Platform overhead/)).toBeInTheDocument();
+    expect(within(kindTable).getByText(/平台开销(不计费)|Platform overhead \(not billed\)/)).toBeInTheDocument();
     expect(within(kindTable).queryByText("platform_overhead")).not.toBeInTheDocument();
   });
 });

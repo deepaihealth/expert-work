@@ -6591,7 +6591,7 @@ const en: TranslationKeys = {
     kind_conversation: "Conversation",
     kind_skill_evolution: "Skill evolution",
     kind_memory_consolidation: "Memory consolidation",
-    kind_platform_overhead: "Platform overhead (safety judges / rerank)",
+    kind_platform_overhead: "Platform overhead (not billed)",
     realtime: "Realtime",
     realtime_note:
       "Live current-month counters; billed cost above lags by up to an hour.",

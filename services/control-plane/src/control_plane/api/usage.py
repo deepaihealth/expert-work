@@ -39,7 +39,11 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import TenantBillingLedgerStore
-from expert_work.persistence.token_usage_store import TokenUsageRecord, TokenUsageStore
+from expert_work.persistence.token_usage_store import (
+    NON_BILLABLE_USAGE_KINDS,
+    TokenUsageRecord,
+    TokenUsageStore,
+)
 from expert_work.protocol import Principal
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -257,10 +261,14 @@ def build_usage_router() -> APIRouter:
         by_kind: dict[tuple[str, str], dict[str, int]] = defaultdict(_token_zero)
         for r in rows:
             tid = str(r.tenant_id)
+            _token_add(by_kind[(tid, r.usage_kind)], r)
+            # B-104 —— 平台开销(评审 / 重排序)不计费:只在按用途表里单列,不进总计与
+            # 按 agent / 模型的合计(与账单同口径)。显式 ``kind=`` 查它时照常汇总。
+            if r.usage_kind in NON_BILLABLE_USAGE_KINDS and kind != r.usage_kind:
+                continue
             _token_add(total, r)
             _token_add(by_agent[(tid, r.agent_name)], r)
             _token_add(by_model[(tid, r.model)], r)
-            _token_add(by_kind[(tid, r.usage_kind)], r)
 
         return {
             "success": True,

@@ -9,6 +9,8 @@ from uuid import UUID, uuid4
 import pytest
 
 from expert_work.persistence.token_usage_store import (
+    NON_BILLABLE_USAGE_KINDS,
+    PLATFORM_OVERHEAD_USAGE_KIND,
     InMemoryTokenUsageStore,
     TokenUsageRecord,
 )
@@ -665,3 +667,41 @@ async def test_totals_bucket_keeps_legacy_null_provider_as_its_own_bucket(
         (None, "m", 1),
         ("p", "m", 2),
     ]
+
+
+@pytest.mark.asyncio
+async def test_totals_exclude_non_billable_usage_kinds(store: InMemoryTokenUsageStore) -> None:
+    """B-104 —— 控制台的租户侧合计排除不计费的 kind。与 SQL 版同形。"""
+    tenant, user = uuid4(), uuid4()
+    for model, inp, kind in (
+        ("glm-5.3", 100, "conversation"),
+        ("qwen-max", 70, PLATFORM_OVERHEAD_USAGE_KIND),
+    ):
+        await store.insert(
+            TokenUsageRecord(
+                tenant_id=tenant,
+                agent_name="agent",
+                agent_version="v1",
+                model=model,
+                user_id=user,
+                trace_id="b104",
+                input_tokens=inp,
+                output_tokens=1,
+                usage_kind=kind,
+            )
+        )
+
+    by_trace = (
+        await store.totals_by_trace_ids(["b104"], exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS)
+    )["b104"]
+    assert (by_trace.input_tokens, by_trace.llm_calls, by_trace.models) == (100, 1, ("glm-5.3",))
+    by_user = (
+        await store.totals_by_users(
+            agent_name="agent",
+            agent_version="v1",
+            user_ids=[user],
+            exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS,
+        )
+    )[user]
+    assert (by_user.input_tokens, by_user.llm_calls) == (100, 1)
+    assert (await store.totals_by_trace_ids(["b104"]))["b104"].input_tokens == 170

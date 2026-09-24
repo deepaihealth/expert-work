@@ -52,7 +52,7 @@ from expert_work.persistence.rls import (
     current_user_id_var,
 )
 from expert_work.persistence.token_usage_store import (
-    PLATFORM_OVERHEAD_USAGE_KIND,
+    NON_BILLABLE_USAGE_KINDS,
     TokenUsageStore,
 )
 from expert_work.protocol import (
@@ -261,7 +261,7 @@ class BillingRollupJob:
             if row.observed_at is None:
                 # Defensive: a windowed read never returns pre-insert rows.
                 continue
-            if row.usage_kind == PLATFORM_OVERHEAD_USAGE_KIND:
+            if row.usage_kind in NON_BILLABLE_USAGE_KINDS:
                 # B-104 — the platform's own safety / retrieval overhead (judges,
                 # rerank) is metered for ops visibility and the run's token
                 # breaker, but it is the platform's cost, not the tenant's bill.

@@ -3272,7 +3272,7 @@ const zhCN: TranslationKeys = {
     kind_conversation: "对话",
     kind_skill_evolution: "技能自进化",
     kind_memory_consolidation: "记忆整合",
-    kind_platform_overhead: "平台开销(安全评审 / 重排序)",
+    kind_platform_overhead: "平台开销(不计费)",
     realtime: "实时",
     realtime_note: "本月实时计数；上方计费成本最多滞后一小时。",
     empty: "本月暂无用量记录。",

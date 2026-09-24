@@ -45,7 +45,11 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.tenant_member import TenantMemberStore
 from expert_work.persistence.tenant_user.base import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.persistence.token_usage_store import TokenTotals, TokenUsageStore
+from expert_work.persistence.token_usage_store import (
+    NON_BILLABLE_USAGE_KINDS,
+    TokenTotals,
+    TokenUsageStore,
+)
 from expert_work.protocol import AuditAction, AuditResult, Principal, TenantMember, TenantUser
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
@@ -246,6 +250,8 @@ def build_agent_users_router() -> APIRouter:
                     agent_name=agent_name,
                     agent_version=agent_version,
                     user_ids=user_ids,
+                    # B-104 —— 与账单同口径:平台开销不计。
+                    exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS,
                 )
                 if user_ids
                 else {}

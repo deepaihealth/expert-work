@@ -24,7 +24,12 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.persistence.token_usage_store import DbTokenUsageStore, TokenUsageRecord
+from expert_work.persistence.token_usage_store import (
+    NON_BILLABLE_USAGE_KINDS,
+    PLATFORM_OVERHEAD_USAGE_KIND,
+    DbTokenUsageStore,
+    TokenUsageRecord,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -255,5 +260,54 @@ async def test_totals_by_trace_ids_filtered_trace_is_absent_not_zero(
         )
 
         assert await store.totals_by_trace_ids([trace], usage_kinds=("conversation",)) == {}
+    finally:
+        await engine.dispose()
+
+
+# B-104 —— ``exclude_usage_kinds``:控制台的租户侧合计排除不计费的 kind。与内存版同形。
+
+
+@pytest.mark.asyncio
+async def test_totals_exclude_non_billable_usage_kinds(usage_store: SqlStoreFixture) -> None:
+    store, engine = usage_store
+    try:
+        tenant, user = uuid4(), uuid4()
+        trace = f"trace-{uuid4().hex}"
+
+        def _row(model: str, inp: int, kind: str) -> TokenUsageRecord:
+            return TokenUsageRecord(
+                tenant_id=tenant,
+                agent_name="agent",
+                agent_version="v1",
+                model=model,
+                user_id=user,
+                trace_id=trace,
+                input_tokens=inp,
+                output_tokens=1,
+                usage_kind=kind,
+            )
+
+        await store.insert(_row("glm-5.3", 100, "conversation"))
+        await store.insert(_row("qwen-max", 70, PLATFORM_OVERHEAD_USAGE_KIND))
+
+        by_trace = (
+            await store.totals_by_trace_ids([trace], exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS)
+        )[trace]
+        assert (by_trace.input_tokens, by_trace.llm_calls, by_trace.models) == (
+            100,
+            1,
+            ("glm-5.3",),
+        )
+        by_user = (
+            await store.totals_by_users(
+                agent_name="agent",
+                agent_version="v1",
+                user_ids=[user],
+                exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS,
+            )
+        )[user]
+        assert (by_user.input_tokens, by_user.llm_calls) == (100, 1)
+        # 不传 = 现有行为,全部 kind。
+        assert (await store.totals_by_trace_ids([trace]))[trace].input_tokens == 170
     finally:
         await engine.dispose()
