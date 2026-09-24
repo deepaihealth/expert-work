@@ -48,14 +48,14 @@
 - 平台层主流就是这个结构：OpenRouter 的 `max_tokens` 是总上限，思考预算必须严格小于它；Claude Code 用 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 管总量、`MAX_THINKING_TOKENS` 管其中的思考；Anthropic API 的 `max_tokens` 同样是合计。
 - 厂商层分两派：Anthropic / OpenAI / DeepSeek / Kimi / GLM 只有「合计」字段；通义（`thinking_budget` 单独管思考）和豆包（`max_tokens` 只管回答、`max_completion_tokens` 管合计）可以分开管。
 - 选「合计」有两个理由：① 在「合计派」厂商那里，没办法只限制回答长度 —— 思考用得少，回答就会多出来，所以「只限回答」这个承诺平台对一半厂商兑现不了；② 思考 token 按输出计费、同样耗时，用户设上限，通常是想给单次调用的钱和时间封顶。
-- 字段怎么落地：先总上限，思考预算是它里面的一块（只有支持的厂商才有这块）。T0 实测：5 家都有一个真正表示「合计」的字段（见 §8），**不需要拼合计**。
+- 字段怎么落地：先总上限，思考预算是它里面的一块（只有支持的厂商才有这块）。T0 实测（§8.7）：大多数模型有真正表示「合计」的字段；但 **qwen3-max、qwen3-vl-plus、qwen3-vl-flash 没有**（`max_tokens` 只管回答，`max_completion_tokens` 被忽略）。这三款用「拼合计」：开思考时发 `thinking_budget = T`、`max_tokens = cap − T`，合计必然 ≤ cap；T 取用户填的思考上限，没填就取 `cap × 档位比例`（没设档位按 high 的 0.8 算）。关思考时直接发 `max_tokens = cap`。
 
 
 ### 4.1 目录（`ModelEntry`）新增三个字段
 
 | 字段 | 含义 | 例子 |
 |---|---|---|
-| `output_cap_field: "max_tokens" \| "max_completion_tokens"` | 这家用哪个字段表示「思考 + 回答合计」的上限 | 实测（§8）：GLM、DeepSeek = `max_tokens`（**发 `max_completion_tokens` 会被静默忽略**）；通义、豆包 = `max_completion_tokens`（它们的 `max_tokens` 只管回答）；kimi-k3 两个都生效，按文档取 `max_completion_tokens`；OpenAI / Azure 按文档取 `max_completion_tokens`（未真调） |
+| `output_cap_field: "max_tokens" \| "max_completion_tokens" \| "split"` | 这家用哪个字段表示「思考 + 回答合计」的上限 | 实测（§8）：GLM、DeepSeek = `max_tokens`（**发 `max_completion_tokens` 会被静默忽略**）；通义、豆包 = `max_completion_tokens`（它们的 `max_tokens` 只管回答）；kimi-k3 两个都生效，按文档取 `max_completion_tokens`；OpenAI / Azure 按文档取 `max_completion_tokens`（未真调） |
 | `max_output_tokens: int \| None` | 厂商公布的输出上限，用来做保存校验和配置页占位提示 | kimi-k3 1,048,576；GLM 128K；豆包 65,536 |
 | `thinking_cap: bool` | 是否支持独立的思考长度上限 | 目前只有通义带思考的模型为 True |
 
@@ -195,9 +195,28 @@ PR 切分倾向：T0 不进 PR；T1–T4 一个后端 PR；T5 一个前端 PR；
 | qwen3.6-plus | 默认思考 | `enable_thinking=false` 有效 | budget | 不变 |
 | Anthropic opus / sonnet、OpenAI gpt-5.5 系列 | —（没有 key） | 未测 | effort | 靠 §4.6 的兜底；OpenAI 档位映射见拍板点 ② |
 
+### 8.7 全目录补测（在售、有 key 的所有对话模型）
+
+**输出上限的最大值**（发 cap=10,000,000，看厂商报错里给的范围）：
+
+| 模型 | 厂商给的上限 | 目录 `max_output_tokens` |
+|---|---|---|
+| glm-5.3 / 5.3-flash / 5.2 / 5.1 / 4.7 / 4.6 / 5v-turbo | [1, 131072] | 131072 |
+| glm-4.6v | [1, 32768] | 32768 |
+| glm-4.5v | [1, 16384] | 16384 |
+| deepseek-v4-pro / flash | [1, 393216] | 393216 |
+| doubao-seed-2-1-pro | ≤ 262144（**调研说的 65,536 是错的**） | 262144 |
+| kimi-k3 / k2.6、qwen 全部 | 发 10M 不报错 | None（不校验） |
+
+**合计字段是否生效**（cap=300，开思考）：glm-5.1 / 4.7 / 4.6 / 5v-turbo / 4.6v / 4.5v 的 `max_tokens`、kimi-k2.6 的 `max_completion_tokens`、qwen3.6-plus / 3.5-plus 的 `max_completion_tokens` 都生效（length，完成 300 左右）。**例外**：qwen3-max、qwen3-vl-plus、qwen3-vl-flash —— 开思考时 `max_completion_tokens=300` 和 `max_tokens=300` 都**限不住思考**（完成 2,400～4,499）；关思考时只有 `max_tokens` 生效（qwen3-max 两个都生效）→ 目录记 `split`。
+
+**思考预算**：qwen3.6-plus / 3.5-plus / 3-max / 3-vl-plus / 3-vl-flash 的 `thinking_budget=200` 全部生效（思考 ≤ 201）→ 全部通义带思考的模型 `thinking_cap=True`。
+
+**顺带发现（登记 backlog，不在本期）**：`kimi-k2.5` 返回 404（模型不存在或没权限），`doubao-seed-2.0-pro` / `2.0-lite` 返回 404 —— 目录里的这三个名字可能已经下架或写错，归到 B-112（模型名写错时构建放行）一起处理。
+
 ### 8.5 对设计的修正
 
-- §4.0：不需要拼合计（每家都有真正的合计字段）。
+- §4.0：三款通义要拼合计（§8.7），其余用合计字段。
 - §4.1：`output_cap_field` 按 8.1 填。
 - §4.2：通义的 `thinking_budget` 已实测是硬上限，按原设计做。
 - T1 补目录修正：glm-5.3 标 `always_thinking`；豆包档位从 `budget` 改成 `effort` 形态；glm-4.6v / 4.5v 改成 `toggle` + 默认开（两款都已实调）；qwen3-vl-plus / flash 改成 `budget`、默认关。
