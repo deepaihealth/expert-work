@@ -1011,10 +1011,12 @@ const zhCN: TranslationKeys = {
     max_tokens_label: "输出上限（含思考）",
     max_tokens_placeholder: "厂商默认",
     max_tokens_placeholder_max: "厂商默认（最大 {{n}}）",
+    max_tokens_placeholder_anthropic: "默认 {{n}}",
     max_tokens_hint: "单次输出上限，含思考。留空 = 厂商默认。",
     thinking_max_label: "思考长度上限",
     thinking_max_hint: "思考超过这个长度就停下来直接作答。留空 = 按推理深度。",
     thinking_max_unsupported: "该模型只能调思考档位，不能限制思考长度。",
+    thinking_max_clear: "清除",
     rate_limit_hint: "对该模型的请求速率上限（次/分钟）。超限请求排队等待，不报错。",
   },
   agent_form: {

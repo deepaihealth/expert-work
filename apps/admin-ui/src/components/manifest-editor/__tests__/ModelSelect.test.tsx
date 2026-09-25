@@ -826,4 +826,41 @@ describe("ModelSelect", () => {
       expect.objectContaining({ name: "qwen3.8-max", thinking_max_tokens: 2000 }),
     );
   });
+
+  // B-105 — Anthropic requires max_tokens; an empty cap is sent as 4096, not a
+  // vendor default, so the placeholder must say so.
+  it("output cap placeholder for an anthropic model names the 4096 actually sent", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "anthropic", name: "claude-4.6-sonnet" });
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Max output (incl. thinking)");
+    expect(input.getAttribute("placeholder")).toBe("Default 4096");
+  });
+
+  // B-105 — a stored thinking cap on a model without a real cap (e.g. from
+  // YAML) makes the backend reject the build; the disabled input must still
+  // show it and offer a way to clear it.
+  it("a stored thinking cap on an unsupported model stays visible and can be cleared", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSelect(
+      { provider: "glm", name: "glm-5.3", thinking_max_tokens: 2000 },
+      onChange,
+    );
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Thinking length cap");
+    expect(input).toBeDisabled();
+    expect(input).toHaveValue("2000");
+    await user.click(screen.getByTestId("model-select-thinking-max-clear"));
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ thinking_max_tokens: undefined }),
+    );
+  });
+
+  it("offers no clear affordance when nothing is stored or the model supports the cap", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "glm", name: "glm-5.3" });
+    await openAdvanced(user);
+    expect(screen.queryByTestId("model-select-thinking-max-clear")).toBeNull();
+  });
 });
