@@ -18,6 +18,13 @@ export interface ModelFields {
   // Adaptive thinking (Anthropic 4.6+) — model decides its own depth.
   // Anthropic-only; undefined (default) = off.
   adaptive_thinking?: boolean;
+  // B-105 — hard cap on the thinking phase's own length (distinct from
+  // max_tokens, the whole-reply cap incl. thinking). Undefined = follow
+  // reasoning depth. Only meaningful when the catalog entry's thinking_cap
+  // is true — the backend REJECTS this on a model where it's false, so
+  // ModelSelect clears it on a switch away from such a model (mirrors how
+  // effort is scrubbed on a switch away from a thinking model).
+  thinking_max_tokens?: number;
   // Anthropic prompt caching. Anthropic-only; default TRUE (undefined = on),
   // explicit ``false`` = off.
   cache_enabled?: boolean;

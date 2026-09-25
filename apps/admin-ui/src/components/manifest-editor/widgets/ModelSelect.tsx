@@ -49,6 +49,8 @@ export function ModelSelect({
       effort: undefined,
       adaptive_thinking: undefined,
       cache_enabled: undefined,
+      // B-105 — no model selected yet, so no thinking-cap knob either.
+      thinking_max_tokens: undefined,
     });
   }
   function onModel(name: string): void {
@@ -67,6 +69,10 @@ export function ModelSelect({
       // to a non-thinking model (agent_factory rejects effort with no
       // thinking knob); survives thinking→thinking switches.
       effort: entry?.thinking ? value.effort : undefined,
+      // B-105 — thinking_max_tokens only makes sense for a model with a REAL
+      // thinking-length cap — scrub it on a switch to a model without one
+      // (the backend REJECTS the save otherwise); survives cap→cap switches.
+      thinking_max_tokens: entry?.thinking_cap ? value.thinking_max_tokens : undefined,
     });
   }
 
@@ -181,14 +187,25 @@ export function ModelSelect({
               <>
                 <label style={{ display: "block", marginBottom: 8 }}>
                   <span style={{ display: "block", marginBottom: 4 }}>
-                    max_tokens
+                    {t("model_select.max_tokens_label")}
                   </span>
                   <InputNumber
                     value={value.max_tokens}
+                    min={1}
+                    max={currentEntry?.max_output_tokens ?? undefined}
+                    placeholder={
+                      currentEntry?.max_output_tokens != null
+                        ? t("model_select.max_tokens_placeholder_max", {
+                            n: currentEntry.max_output_tokens,
+                          })
+                        : t("model_select.max_tokens_placeholder")
+                    }
                     onChange={(v) =>
                       onChange({ ...value, max_tokens: v ?? undefined })
                     }
                     style={{ width: "100%" }}
+                    aria-label={t("model_select.max_tokens_label")}
+                    data-testid="model-select-max-tokens"
                   />
                   <span
                     style={{
@@ -280,6 +297,38 @@ export function ModelSelect({
                       }}
                     >
                       {t("model_select.effort_hint")}
+                    </span>
+                  </label>
+                )}
+                {hasThinkingKnob && (
+                  <label
+                    data-testid="model-select-thinking-max"
+                    style={{ display: "block", marginBottom: 8 }}
+                  >
+                    <span style={{ display: "block", marginBottom: 4 }}>
+                      {t("model_select.thinking_max_label")}
+                    </span>
+                    <InputNumber
+                      value={value.thinking_max_tokens}
+                      min={1}
+                      disabled={!currentEntry?.thinking_cap}
+                      onChange={(v) =>
+                        onChange({ ...value, thinking_max_tokens: v ?? undefined })
+                      }
+                      style={{ width: "100%" }}
+                      aria-label={t("model_select.thinking_max_label")}
+                    />
+                    <span
+                      style={{
+                        display: "block",
+                        marginTop: 4,
+                        fontSize: 12,
+                        color: "var(--ew-text-muted, #888)",
+                      }}
+                    >
+                      {currentEntry?.thinking_cap
+                        ? t("model_select.thinking_max_hint")
+                        : t("model_select.thinking_max_unsupported")}
                     </span>
                   </label>
                 )}

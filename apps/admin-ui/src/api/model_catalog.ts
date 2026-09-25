@@ -21,6 +21,17 @@ export interface CatalogModel {
   // config UI shows the not-fully-off hint even though the provider
   // otherwise has a real off.
   always_thinking?: boolean;
+  // B-105 — output-cap wire field the agent factory sends this model
+  // (informational; the form doesn't branch on it).
+  output_cap_field?: "max_tokens" | "max_completion_tokens" | "split";
+  // B-105 — vendor ceiling for a single reply's output tokens (thinking
+  // included), null = no known ceiling. Drives the output-cap input's
+  // placeholder + max.
+  max_output_tokens?: number | null;
+  // B-105 — whether this model has a REAL thinking-length hard cap (vs. only
+  // discrete effort/toggle levels). Gates the thinking-length-cap input —
+  // the backend rejects thinking_max_tokens on a model where this is false.
+  thinking_cap?: boolean;
 }
 
 export interface ProviderModels {
