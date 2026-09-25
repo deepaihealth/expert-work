@@ -78,6 +78,10 @@ class TenantConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: B-105 —— 旧的 ``ModelSpec.max_tokens`` 默认值;非 Anthropic 模型上加载时归一成空。
+_LEGACY_DEFAULT_MAX_TOKENS = 4096
+
+
 class ModelSpec(BaseModel):
     """LLM provider + fallback chain.
 
@@ -105,7 +109,11 @@ class ModelSpec(BaseModel):
     ]
     name: str = Field(min_length=1)
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=4096, gt=0)
+    #: B-105 —— 单次输出上限,**含思考**(平台语义:思考 + 回答合计)。``None`` = 请求里
+    #: 不带上限、用厂商默认;Anthropic 必须带上限,为空时发 4096。按目录 ``output_cap_field``
+    #: 发到该厂商真正表示合计的字段。注意:非 Anthropic 模型上的 4096 在加载时归一成空
+    #: (旧默认值被表单写回、从未生效,与「没设」分不出来);需要这个数请填 4095 / 4097。
+    max_tokens: int | None = Field(default=None, gt=0)
     #: Requests per minute the runtime is allowed to send to this
     #: provider key (E.12). Consumed by
     #: ``orchestrator.llm.rate_limit.RateLimitedProvider`` which wraps
@@ -188,6 +196,23 @@ class ModelSpec(BaseModel):
     #: B-105 —— 思考长度硬上限(token)。只在目录 ``thinking_cap=True`` 的模型上可用(实调:
     #: 通义 ``thinking_budget``),其他模型填了构建即报错。与 ``max_tokens`` 脱钩,不再按比例推。
     thinking_max_tokens: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_default_max_tokens(cls, data: Any) -> Any:
+        """B-105 —— 非 Anthropic 模型上的 ``max_tokens: 4096`` 归一成空(厂商默认)。
+
+        4096 是旧默认值,前端表单会把它原样写回清单,而它在这些厂商上从未发出过;
+        留着它会在本次改动后突然变成真上限。复制一份再删,不改调用方的 dict。
+        ``fallback`` 节点是嵌套的 ModelSpec,各自走一遍。
+        """
+        if (
+            isinstance(data, dict)
+            and data.get("provider") != "anthropic"
+            and data.get("max_tokens") == _LEGACY_DEFAULT_MAX_TOKENS
+        ):
+            data = {k: v for k, v in data.items() if k != "max_tokens"}
+        return data
 
 
 # ---------------------------------------------------------------------------

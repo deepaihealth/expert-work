@@ -61,7 +61,9 @@ spec:
     provider: anthropic
     name: claude-sonnet-4-5
     temperature: 0.2
-    max_tokens: 4096
+    # max_tokens: 16000       # 单次输出上限，含思考（思考 + 回答合计）；可省略，省略 = 厂商默认
+    #                         # （Anthropic 省略时发 4096）。非 Anthropic 模型写 4096 会在加载时
+    #                         # 归一成省略（旧默认值），确实要这个数请写 4095 / 4097
     fallback:                 # 主模型失败时按序降级；省略字段引擎自动注入推荐 chain（详见下文）
       - { provider: openai, name: gpt-4o }
 
@@ -590,7 +592,7 @@ class ModelSpec(BaseModel):
     provider: Literal["anthropic", "openai", "azure", "self-hosted"]
     name: str
     temperature: float = 0.2
-    max_tokens: int = 4096
+    max_tokens: int | None = None  # 含思考;None = 厂商默认(Anthropic 发 4096)
     fallback: list["ModelSpec"] = []
 
 class ToolBuiltin(BaseModel):

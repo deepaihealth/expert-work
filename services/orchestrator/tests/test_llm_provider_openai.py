@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -691,6 +692,44 @@ async def test_provider_threads_thinking_payload() -> None:
     assert recording.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
+async def _both_paths_extra_body(provider: OpenAIProvider) -> list[Any]:
+    """complete() 与 stream() 各打一次,返回两次请求的 ``extra_body``。"""
+    recording = provider.client
+    assert isinstance(recording, RecordingOpenAIClient)
+    await provider.complete(messages=[HumanMessage(content="hi")], tools=[])
+    async for _ in provider.stream(messages=[HumanMessage(content="hi")], tools=[]):
+        pass
+    return [call["extra_body"] for call in recording.calls]
+
+
+def _cap_provider(**kw: Any) -> OpenAIProvider:
+    recording = RecordingOpenAIClient(response={"choices": [{"message": {"content": "ok"}}]})
+    return OpenAIProvider(client=recording, model="m", **kw)
+
+
+@pytest.mark.asyncio
+async def test_output_cap_payload_on_both_paths() -> None:
+    """B-105 —— 输出上限随 complete / stream 两条路径都上线。"""
+    bodies = await _both_paths_extra_body(_cap_provider(output_cap_payload={"max_tokens": 123}))
+    assert bodies == [{"max_tokens": 123}, {"max_tokens": 123}]
+
+
+@pytest.mark.asyncio
+async def test_output_cap_payload_wins_over_thinking_payload() -> None:
+    """split 的 ``thinking_budget`` 覆盖思考翻译里按比例推的那个;其余键合并。"""
+    provider = _cap_provider(
+        thinking_payload={"enable_thinking": True, "thinking_budget": 65_536},
+        output_cap_payload={"max_tokens": 8000, "thinking_budget": 2000},
+    )
+    expected = {"enable_thinking": True, "max_tokens": 8000, "thinking_budget": 2000}
+    assert await _both_paths_extra_body(provider) == [expected, expected]
+
+
+@pytest.mark.asyncio
+async def test_no_cap_no_thinking_keeps_extra_body_none() -> None:
+    assert await _both_paths_extra_body(_cap_provider()) == [None, None]
+
+
 # --- Stream HX-13 — allowed_tools tier ---------------------------------------
 
 
@@ -741,7 +780,6 @@ async def test_allowed_tools_rejection_falls_back_and_sticks() -> None:
     provider instance stays on the application tier afterwards."""
     from collections.abc import Mapping
     from dataclasses import dataclass, field
-    from typing import Any
 
     @dataclass
     class _RejectConstraintOnce:

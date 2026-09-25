@@ -191,7 +191,37 @@ def test_model_spec_validate_directly() -> None:
     """ModelSpec works in isolation (used by the orchestrator router)."""
     model = ModelSpec.model_validate({"provider": "openai", "name": "gpt-4o"})
     assert model.temperature == 0.2
-    assert model.max_tokens == 4096
+    # B-105 —— 默认不带输出上限(厂商默认),不再是 4096。
+    assert model.max_tokens is None
+
+
+def test_legacy_default_4096_normalises_to_none_off_anthropic() -> None:
+    """B-105 —— 非 Anthropic 模型上的 4096 是旧默认值被表单写回,加载时归一成空。"""
+
+    def _cap(doc: dict[str, Any]) -> int | None:
+        return ModelSpec.model_validate(doc).max_tokens
+
+    assert _cap({"provider": "glm", "name": "glm-5.3", "max_tokens": 4096}) is None
+    assert _cap({"provider": "glm", "name": "glm-5.3"}) is None
+    # 用户自己设的值保留。
+    assert _cap({"provider": "glm", "name": "glm-5.3", "max_tokens": 40960}) == 40960
+    # Anthropic 的 4096 一直生效,原样保留。
+    assert _cap({"provider": "anthropic", "name": "claude-opus-4-8", "max_tokens": 4096}) == 4096
+    # fallback 节点同样归一。
+    spec = ModelSpec.model_validate(
+        {
+            "provider": "glm",
+            "name": "glm-5.3",
+            "fallback": [{"provider": "qwen", "name": "qwen3.8-max", "max_tokens": 4096}],
+        }
+    )
+    assert spec.fallback[0].max_tokens is None
+
+
+def test_legacy_normalisation_does_not_mutate_input() -> None:
+    raw: dict[str, Any] = {"provider": "glm", "name": "glm-5.3", "max_tokens": 4096}
+    ModelSpec.model_validate(raw)
+    assert raw == {"provider": "glm", "name": "glm-5.3", "max_tokens": 4096}
 
 
 @pytest.mark.parametrize(

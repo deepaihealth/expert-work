@@ -2104,9 +2104,77 @@ def _vendor_effort(entry: ModelEntry, level: str) -> str:
     return (entry.effort_map or {}).get(level, level)
 
 
-def _thinking_budget(effort: str, max_tokens: int) -> int:
+def _thinking_budget(effort: str, max_tokens: int | None) -> int:
+    # B-105 —— ``max_tokens`` 为空(厂商默认,不再有 4096 默认值)时基数取预算上限
+    # 81920。这改变了通义「只设档位、没设输出上限」时的预算:以前是 4096 x 比例
+    # (high → 3276),现在是 81920 x 比例(high → 65536)。
+    base = _THINKING_BUDGET_MAX if max_tokens is None else max_tokens
     ratio = _THINKING_BUDGET_RATIO[effort]
-    return max(_THINKING_BUDGET_MIN, min(int(max_tokens * ratio), _THINKING_BUDGET_MAX))
+    return max(_THINKING_BUDGET_MIN, min(int(base * ratio), _THINKING_BUDGET_MAX))
+
+
+#: B-105 —— Anthropic 必须带 ``max_tokens``;清单没设时沿用一直生效的 4096。
+_LEGACY_ANTHROPIC_MAX_TOKENS = 4096
+
+
+def _thinking_on(model: ModelSpec, entry: ModelEntry | None) -> bool:
+    """B-105 —— 本次请求思考是否开着(split 拼合计时要知道)。
+
+    显式 ``thinking_enabled`` 优先;否则碰过思考旋钮(档位 / adaptive / 思考上限)
+    = 开;否则取目录 ``thinking_default``(目录外 = 关)。
+    """
+    if model.thinking_enabled is not None:
+        return model.thinking_enabled
+    if model.effort is not None or model.adaptive_thinking or model.thinking_max_tokens is not None:
+        return True
+    return entry is not None and entry.thinking_default
+
+
+def _output_cap_payload(model: ModelSpec, entry: ModelEntry | None) -> dict[str, Any] | None:
+    """B-105 —— 输出上限(含思考)的请求字段;``None`` = 不带上限(厂商默认)。
+
+    字段取目录 ``output_cap_field``(实调结果),只发一个 —— 豆包同时发两个会 400,
+    GLM / DeepSeek 发错字段会被静默忽略。目录外模型按 ``max_tokens`` 发
+    (openai / azure 除外,见下)。``split``(通义 qwen3-max / qwen3-vl-*)的
+    ``max_tokens`` 只管回答,思考另由 ``thinking_budget`` 管,两者拼成合计。
+    """
+    cap = model.max_tokens
+    if cap is None:
+        return None
+    field: str
+    if entry is not None:
+        field = entry.output_cap_field
+    else:
+        # 目录外:OpenAI 推理模型拒收 max_tokens;Azure 部署名永远不在目录里,按 OpenAI 语义。
+        field = "max_completion_tokens" if model.provider in ("openai", "azure") else "max_tokens"
+    if field != "split":
+        return {field: cap}
+    if not _thinking_on(model, entry):
+        return {"max_tokens": cap}
+    budget = model.thinking_max_tokens
+    if budget is None:
+        budget = int(cap * _THINKING_BUDGET_RATIO[model.effort or "high"])
+    return {"max_tokens": cap - budget, "thinking_budget": budget}
+
+
+def _check_output_cap(model: ModelSpec, entry: ModelEntry | None) -> None:
+    """B-105 —— 构建期校验:输出上限不超厂商上限;split 的思考上限要小于输出上限。"""
+    cap = model.max_tokens
+    if cap is None or entry is None:
+        return
+    if entry.max_output_tokens is not None and cap > entry.max_output_tokens:
+        raise AgentFactoryError(
+            f"model {model.name!r}: 输出上限 {cap} 超过厂商上限 {entry.max_output_tokens}"
+        )
+    if (
+        entry.output_cap_field == "split"
+        and model.thinking_max_tokens is not None
+        and model.thinking_max_tokens >= cap
+    ):
+        raise AgentFactoryError(
+            f"model {model.name!r}: 思考长度上限必须小于输出上限"
+            f"(思考 {model.thinking_max_tokens} ≥ 输出 {cap};输出上限含思考)"
+        )
 
 
 #: Stream HX-1 (Mini-ADR HX-A4) — fallback window when neither the
@@ -2733,6 +2801,7 @@ def _build_provider(
                 f"model {model.name!r}: 该模型只能调思考档位,不能限制思考长度;"
                 "remove model.thinking_max_tokens from the manifest"
             )
+        _check_output_cap(model, entry)
         temperature: float | None = _constrained_temperature(model, entry)
         if entry is not None and not entry.sampling:
             # Opus 4.7+ removed sampling params — sending one is a 400.
@@ -2745,7 +2814,7 @@ def _build_provider(
         return AnthropicProvider(
             client=HTTPAnthropicClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
-            max_tokens=model.max_tokens,
+            max_tokens=model.max_tokens or _LEGACY_ANTHROPIC_MAX_TOKENS,
             temperature=temperature,
             image_resolver=image_resolver,
             # Stream L.L1 — propagate the manifest's per-model cache flag.
@@ -2792,7 +2861,9 @@ def _build_provider(
             model.name,
             model.effort,
         )
+    _check_output_cap(model, compat_entry)
     thinking_payload = _thinking_payload(model)
+    output_cap_payload = _output_cap_payload(model, compat_entry)
     compat_temperature = _constrained_temperature(model, compat_entry)
 
     if provider == "openai":
@@ -2802,6 +2873,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
         )
 
     openai_compatible = {
@@ -2828,6 +2900,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
             stream_extra_body=stream_extra_body,
         )
 
@@ -2842,6 +2915,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
         )
 
     if provider == "azure":
@@ -2863,6 +2937,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
         )
 
     raise AgentFactoryError(f"provider {provider!r} has no adapter")

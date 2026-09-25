@@ -2138,3 +2138,137 @@ async def test_output_schema_deep_invalid_schema_fails_the_build() -> None:
     async with make_checkpointer("memory") as cp:
         with pytest.raises(AgentFactoryError, match="not a valid JSON Schema"):
             await _build(bad, secret_store=_secret_store(), checkpointer=cp)
+
+
+# ---------------------------------------------------------------------------
+# B-105 —— 输出上限(含思考)按目录字段发送
+# ---------------------------------------------------------------------------
+
+
+def _cap_payload(provider: str, name: str, **kw: Any) -> dict[str, Any] | None:
+    p = _build_provider(_vendor_model(provider, name, **kw), "k")
+    assert isinstance(p, OpenAIProvider)
+    return p.output_cap_payload
+
+
+def test_no_cap_sends_nothing_on_every_compat_vendor() -> None:
+    for provider, name in (
+        ("glm", "glm-5.3"),
+        ("deepseek", "deepseek-v4-pro"),
+        ("kimi", "kimi-k3"),
+        ("qwen", "qwen3.8-max"),
+        ("qwen", "qwen3-max"),
+        ("doubao", "doubao-seed-2-1-pro-260628"),
+        ("openai", "gpt-5.5"),
+    ):
+        assert _cap_payload(provider, name) is None, name
+
+
+def test_cap_goes_to_the_catalog_field_only() -> None:
+    assert _cap_payload("glm", "glm-5.3", max_tokens=8000) == {"max_tokens": 8000}
+    assert _cap_payload("deepseek", "deepseek-v4-pro", max_tokens=8000) == {"max_tokens": 8000}
+    assert _cap_payload("qwen", "qwen3.8-max", max_tokens=8000) == {"max_completion_tokens": 8000}
+    doubao = _cap_payload("doubao", "doubao-seed-2-1-pro-260628", max_tokens=8000)
+    assert doubao == {"max_completion_tokens": 8000}  # 绝不同时带 max_tokens(实测 400)
+    assert _cap_payload("kimi", "kimi-k3", max_tokens=8000) == {"max_completion_tokens": 8000}
+    assert _cap_payload("openai", "gpt-5.5", max_tokens=8000) == {"max_completion_tokens": 8000}
+    # 目录外:openai / azure 按 OpenAI 语义,其余 max_tokens。
+    assert _cap_payload("qwen", "custom-gw", max_tokens=8000) == {"max_tokens": 8000}
+    assert _cap_payload("openai", "my-ft-model", max_tokens=8000) == {"max_completion_tokens": 8000}
+
+
+def test_azure_off_catalog_cap_uses_max_completion_tokens() -> None:
+    assert _cap_payload(
+        "azure",
+        "my-deployment",
+        max_tokens=8000,
+        base_url="https://r.openai.azure.com",
+        azure_deployment="d",
+        azure_api_version="2024-10-21",
+    ) == {"max_completion_tokens": 8000}
+
+
+def test_split_without_cap_sends_nothing() -> None:
+    assert _cap_payload("qwen", "qwen3-max", thinking_enabled=True) is None
+
+
+def test_split_with_thinking_on_sums_to_cap() -> None:
+    # 用户填了思考上限:T=2000,回答=cap-T。
+    assert _cap_payload(
+        "qwen",
+        "qwen3-max",
+        max_tokens=10_000,
+        thinking_enabled=True,
+        thinking_max_tokens=2000,
+    ) == {"max_tokens": 8000, "thinking_budget": 2000}
+    # 没填思考上限:T=cap x 档位比例(没设档位按 high 0.8)。
+    assert _cap_payload("qwen", "qwen3-vl-plus", max_tokens=10_000, thinking_enabled=True) == {
+        "max_tokens": 2000,
+        "thinking_budget": 8000,
+    }
+    assert _cap_payload("qwen", "qwen3-vl-plus", max_tokens=10_000, effort="low") == {
+        "max_tokens": 8000,
+        "thinking_budget": 2000,
+    }
+    # qwen3-max 默认思考(thinking_default=True),未碰开关 = 开。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=10_000) == {
+        "max_tokens": 2000,
+        "thinking_budget": 8000,
+    }
+
+
+def test_split_with_thinking_off_is_plain_max_tokens() -> None:
+    assert _cap_payload("qwen", "qwen3-vl-flash", max_tokens=3000, thinking_enabled=False) == {
+        "max_tokens": 3000
+    }
+    # qwen3-vl 默认不思考(thinking_default=False),未碰开关 = 关。
+    assert _cap_payload("qwen", "qwen3-vl-flash", max_tokens=3000) == {"max_tokens": 3000}
+
+
+def test_split_thinking_cap_must_be_below_output_cap() -> None:
+    with pytest.raises(AgentFactoryError, match="思考长度上限必须小于输出上限"):
+        _build_provider(
+            _vendor_model(
+                "qwen",
+                "qwen3-max",
+                max_tokens=2000,
+                thinking_enabled=True,
+                thinking_max_tokens=2000,
+            ),
+            "k",
+        )
+
+
+def test_cap_above_vendor_max_is_rejected() -> None:
+    with pytest.raises(AgentFactoryError, match="16384"):
+        _build_provider(_vendor_model("glm", "glm-4.5v", max_tokens=20_000), "k")
+    # 恰好等于厂商上限放行。
+    assert _cap_payload("glm", "glm-4.5v", max_tokens=16_384) == {"max_tokens": 16_384}
+    # 无公布上限的模型不校验。
+    assert _cap_payload("kimi", "kimi-k3", max_tokens=5_000_000) == {
+        "max_completion_tokens": 5_000_000
+    }
+
+
+def test_anthropic_empty_cap_keeps_4096() -> None:
+    p = _build_provider(_anthropic_model(max_tokens=None), "k")
+    assert isinstance(p, AnthropicProvider) and p.max_tokens == 4096
+    p = _build_provider(_anthropic_model(max_tokens=20_000), "k")
+    assert isinstance(p, AnthropicProvider) and p.max_tokens == 20_000
+
+
+def test_fallback_nodes_use_their_own_cap_field() -> None:
+    from expert_work.protocol.model_catalog import catalog_entry
+    from orchestrator.agent_factory import _output_cap_payload
+
+    primary = _vendor_model(
+        "glm",
+        "glm-5.3",
+        max_tokens=9000,
+        fallback=[{"provider": "qwen", "name": "qwen3.8-max", "max_tokens": 9000}],
+    )
+    fb = primary.fallback[0]
+    assert _output_cap_payload(primary, catalog_entry("glm", "glm-5.3")) == {"max_tokens": 9000}
+    assert _output_cap_payload(fb, catalog_entry("qwen", "qwen3.8-max")) == {
+        "max_completion_tokens": 9000
+    }

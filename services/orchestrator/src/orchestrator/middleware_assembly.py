@@ -130,7 +130,8 @@ def build_middleware_chains(
                 cache=env.response_cache,
                 model=model.name,
                 temperature=model.temperature,
-                max_tokens=model.max_tokens,
+                # B-105 —— 0 = 厂商默认(未设输出上限),只用于缓存键。
+                max_tokens=model.max_tokens or 0,
             )
         )
         middlewares.append(
@@ -138,7 +139,8 @@ def build_middleware_chains(
                 cache=env.response_cache,
                 model=model.name,
                 temperature=model.temperature,
-                max_tokens=model.max_tokens,
+                # B-105 —— 0 = 厂商默认(未设输出上限),只用于缓存键。
+                max_tokens=model.max_tokens or 0,
             )
         )
     if env.langfuse_client is not None:

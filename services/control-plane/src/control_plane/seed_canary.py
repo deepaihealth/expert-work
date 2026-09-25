@@ -109,12 +109,10 @@ spec:
     provider: {model_provider}
     name: {model_name}
     temperature: 0.0
-    max_tokens: 4096
     fallback:
       - provider: {fallback_provider}
         name: {fallback_name}
         temperature: 0.0
-        max_tokens: 4096
   system_prompt:
     template: |
       You are an automated release canary agent. Follow the user's numbered
