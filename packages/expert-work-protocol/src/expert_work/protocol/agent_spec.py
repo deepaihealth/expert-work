@@ -185,6 +185,9 @@ class ModelSpec(BaseModel):
     thinking_enabled: bool | None = Field(
         default=None, description="thinking on/off toggle (None=inherit vendor default)"
     )
+    #: B-105 —— 思考长度硬上限(token)。只在目录 ``thinking_cap=True`` 的模型上可用(实调:
+    #: 通义 ``thinking_budget``),其他模型填了构建即报错。与 ``max_tokens`` 脱钩,不再按比例推。
+    thinking_max_tokens: int | None = Field(default=None, gt=0)
 
 
 # ---------------------------------------------------------------------------

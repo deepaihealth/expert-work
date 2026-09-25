@@ -2098,15 +2098,9 @@ _THINKING_BUDGET_RATIO: dict[str, float] = {
 _THINKING_BUDGET_MIN = 1024
 _THINKING_BUDGET_MAX = 81_920
 
-#: GLM 5.2+ and kimi-k3 share a max/high/low ``reasoning_effort`` scale —
-#: no "medium", so the manifest's medium rounds up to high (bigmodel
-#: core-params page / platform.kimi.com thinking docs, 2026-08).
-_MAX_HIGH_LOW_EFFORT: dict[str, str] = {
-    "low": "low",
-    "medium": "high",
-    "high": "high",
-    "max": "max",
-}
+def _vendor_effort(entry: ModelEntry, level: str) -> str:
+    """平台档位 → 厂商取值(B-105:映射登记在目录 ``effort_map``,缺的键原样发)。"""
+    return (entry.effort_map or {}).get(level, level)
 
 
 def _thinking_budget(effort: str, max_tokens: int) -> int:
@@ -2164,7 +2158,7 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
                 return {"thinking": {"type": "enabled"}}
             return {
                 "thinking": {"type": "enabled"},
-                "reasoning_effort": _MAX_HIGH_LOW_EFFORT[model.effort],
+                "reasoning_effort": _vendor_effort(entry, model.effort),
             }
         if model.provider == "kimi":
             # kimi-k3 — ALWAYS thinking; top-level ``reasoning_effort`` on
@@ -2172,21 +2166,24 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
             # K2.x ``thinking.type`` param (the K3 docs forbid it).
             if model.effort is None:
                 return None
-            return {"reasoning_effort": _MAX_HIGH_LOW_EFFORT[model.effort]}
-        # OpenAI / Azure / DeepSeek — ``reasoning_effort`` shares the
-        # manifest's level names (DeepSeek maps medium→high vendor-side).
-        return {"reasoning_effort": model.effort} if model.effort is not None else None
-    if entry.thinking == "budget":
+            return {"reasoning_effort": _vendor_effort(entry, model.effort)}
         if model.provider == "doubao":
+            # B-105(2026-09-24 实调)—— ``thinking.budget_tokens`` 被厂商忽略
+            # (200 正常返回,思考长度不受限);真正生效的档位控制是
+            # ``reasoning_effort``(low/high,无 medium/max — effort_map 补上)。
             if model.effort is None:
                 return {"thinking": {"type": "auto"}}
-            return {
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": _thinking_budget(model.effort, model.max_tokens),
-                }
-            }
-        # Qwen / DashScope.
+            return {"reasoning_effort": _vendor_effort(entry, model.effort)}
+        # OpenAI / Azure / DeepSeek — ``reasoning_effort`` shares the
+        # manifest's level names (no catalog effort_map → passthrough).
+        if model.effort is None:
+            return None
+        return {"reasoning_effort": _vendor_effort(entry, model.effort)}
+    if entry.thinking == "budget":
+        # B-105 —— doubao 挪到上面的 effort 分支后,这里只剩通义。显式思考长度上限
+        # (``thinking_max_tokens``,目录 ``thinking_cap=True``)优先于按档位换算的预算。
+        if model.thinking_max_tokens is not None:
+            return {"enable_thinking": True, "thinking_budget": model.thinking_max_tokens}
         if model.effort is None:
             return {"enable_thinking": True}
         return {
@@ -2208,11 +2205,16 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
     a real off (``thinking.type=disabled``) and use it.
     """
     if entry.thinking == "effort":
-        # always_thinking (glm-5.3-flash) — thinking.type 仅支持 enabled;
-        # sending "disabled" is a vendor error, so off floors at the lowest
-        # effort tier (same owner decision as kimi-k3 below).
+        # always_thinking (glm-5.3 / glm-5.3-flash, B-105 2026-09-24 实调) —
+        # thinking.type 仅支持 enabled; sending "disabled" is a vendor error,
+        # so off floors at the lowest effort tier (same owner decision as
+        # kimi-k3 below).
         if entry.always_thinking and model.provider == "glm":
             return {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+        if model.provider == "doubao":
+            # B-105 —— catalog 挪到 effort 之后落进这支;关思考线格式不变
+            # (仍是 thinking.type=disabled,2026-09-24 实调确认思考归零)。
+            return {"thinking": {"type": "disabled"}}
         # GLM 5.2+ / DeepSeek keep a REAL off via the OpenAI-format thinking
         # object — "minimal" is not on either vendor's effort scale.
         if model.provider in ("glm", "deepseek"):
@@ -2223,7 +2225,8 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
         return {"reasoning_effort": "minimal"}
     if entry.thinking == "budget" and model.provider == "qwen":
         return {"enable_thinking": False}
-    # doubao (budget) + toggle vendors (Kimi / GLM ≤5.1) share the disabled shape.
+    # toggle vendors (Kimi / GLM ≤5.1) share the disabled shape. (doubao no
+    # longer reaches here — B-105 moved it into the effort branch above.)
     return {"thinking": {"type": "disabled"}}
 
 
@@ -2271,8 +2274,13 @@ def _thinking_payload(model: ModelSpec) -> dict[str, Any] | None:
     if model.thinking_enabled is True:
         return _thinking_enable_payload(model, entry)
     # Inherit — unchanged CM-10 behaviour: only an effort/adaptive-touched
-    # manifest sends anything.
-    if model.effort is None and not model.adaptive_thinking:
+    # manifest sends anything. B-105 — a manifest that only set
+    # ``thinking_max_tokens`` (no effort/adaptive) counts as touched too.
+    if (
+        model.effort is None
+        and not model.adaptive_thinking
+        and model.thinking_max_tokens is None
+    ):
         return None
     return _thinking_enable_payload(model, entry)
 
@@ -2721,6 +2729,13 @@ def _build_provider(
                 f"model {model.name!r} has no thinking toggle; "
                 "remove model.thinking_enabled from the manifest"
             )
+        # B-105 —— 思考长度硬上限只在目录 ``thinking_cap=True`` 的模型上可用(实调:
+        # 通义 thinking_budget);同一口径的能力闸门,off-catalog 不拦。
+        if model.thinking_max_tokens is not None and entry is not None and not entry.thinking_cap:
+            raise AgentFactoryError(
+                f"model {model.name!r}: 该模型只能调思考档位,不能限制思考长度;"
+                "remove model.thinking_max_tokens from the manifest"
+            )
         temperature: float | None = _constrained_temperature(model, entry)
         if entry is not None and not entry.sampling:
             # Opus 4.7+ removed sampling params — sending one is a 400.
@@ -2762,6 +2777,16 @@ def _build_provider(
         raise AgentFactoryError(
             f"model {model.name!r} has no thinking toggle; "
             "remove model.thinking_enabled from the manifest"
+        )
+    # B-105 —— 同上,思考长度硬上限只在目录 ``thinking_cap=True`` 的模型上可用。
+    if (
+        model.thinking_max_tokens is not None
+        and compat_entry is not None
+        and not compat_entry.thinking_cap
+    ):
+        raise AgentFactoryError(
+            f"model {model.name!r}: 该模型只能调思考档位,不能限制思考长度;"
+            "remove model.thinking_max_tokens from the manifest"
         )
     if compat_entry is not None and compat_entry.thinking == "toggle" and model.effort is not None:
         # Toggle entries (Kimi / GLM ≤5.1) have no depth — every level collapses to "enabled".

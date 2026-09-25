@@ -475,8 +475,10 @@ async def test_deep_sends_exactly_the_configured_payload(monkeypatch: pytest.Mon
 
     await harness.run(monkeypatch, {"model": configured}, depth="deep")
 
+    # B-105(2026-09-24 实调)—— 豆包档位改走 reasoning_effort(budget_tokens 被厂商
+    # 忽略),不再是 thinking.type=enabled + budget_tokens 的旧形态。
     today = agent_factory._thinking_payload(ModelSpec.model_validate(configured))
-    assert today is not None and today["thinking"]["type"] == "enabled"
+    assert today == {"reasoning_effort": "high"}
     assert harness.answered == [("doubao-seed-2-1-pro-260628", today)]
 
 
@@ -484,8 +486,9 @@ async def test_deep_sends_exactly_the_configured_payload(monkeypatch: pytest.Mon
 @pytest.mark.parametrize(
     "vision_model",
     [
-        # 目录里没有思考开关。
-        {"provider": "qwen", "name": "qwen3-vl-plus"},
+        # 目录里没有思考开关。(B-105 2026-09-24 实调:qwen3-vl-plus 曾是这里的例子,
+        # 但实测它确有思考开关——budget 形态、默认关——换成仍无开关的 glm-4-plus。)
+        {"provider": "glm", "name": "glm-4-plus"},
         # 目录外。
         {"provider": "doubao", "name": "doubao-seed-2-1-pro"},
         # 已配成关思考:quick 与 deep 本来就一样。

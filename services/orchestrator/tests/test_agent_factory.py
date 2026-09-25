@@ -1534,11 +1534,10 @@ def test_thinking_payload_budget_vendors() -> None:
 
     qwen = _thinking_payload(_vendor_model("qwen", "qwen3.7-max", effort="high", max_tokens=10_000))
     assert qwen == {"enable_thinking": True, "thinking_budget": 8_000}
-    doubao = _thinking_payload(
-        _vendor_model("doubao", "doubao-seed-2.0-pro", effort="low", max_tokens=4_096)
-    )
-    # 4096 x 0.2 = 819 → clamped up to the 1024 floor.
-    assert doubao == {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+    # B-105(2026-09-24 实调)—— doubao ``budget_tokens`` 被厂商忽略,档位改走
+    # reasoning_effort(不再算 max_tokens 比例);"budget" 分支此后只剩通义。
+    doubao = _thinking_payload(_vendor_model("doubao", "doubao-seed-2.0-pro", effort="low"))
+    assert doubao == {"reasoning_effort": "low"}
     # adaptive-only: qwen opens thinking without a budget; doubao uses auto.
     assert _thinking_payload(_vendor_model("qwen", "qwen3.7-max", adaptive_thinking=True)) == {
         "enable_thinking": True
@@ -1587,18 +1586,21 @@ def test_thinking_payload_glm_52_plus_effort_levels() -> None:
 
 
 def test_thinking_payload_glm_52_plus_toggle_semantics_kept() -> None:
+    # (B-105 2026-09-24 实调: glm-5.2 replaces glm-5.3 here — glm-5.3 turned out
+    # to ALSO be always_thinking, so its "real off" degraded to a floor instead;
+    # see test_glm_53_off_floors_at_low_instead_of_400.)
     from orchestrator.agent_factory import _thinking_payload
 
     # Force-on with no effort keeps the bare toggle; force-off is a REAL
     # off — GLM has no "minimal", it must not degrade like other effort
     # vendors. Untouched manifests still send nothing (vendor default).
-    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=True)) == {
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2", thinking_enabled=True)) == {
         "thinking": {"type": "enabled"}
     }
-    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=False)) == {
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2", thinking_enabled=False)) == {
         "thinking": {"type": "disabled"}
     }
-    assert _thinking_payload(_vendor_model("glm", "glm-5.3")) is None
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2")) is None
 
 
 def test_thinking_payload_glm_53_flash_always_thinking() -> None:
@@ -1658,13 +1660,69 @@ def test_thinking_payload_kimi_k3_effort_levels() -> None:
 
 
 # ---------------------------------------------------------------------------
+# B-105 — catalog-declared output-cap field / effort_map / thinking_max_tokens
+# ---------------------------------------------------------------------------
+
+
+def test_doubao_effort_goes_to_reasoning_effort() -> None:
+    # B-105(2026-09-24 实调)—— budget_tokens 被厂商忽略,豆包档位改走 reasoning_effort。
+    from orchestrator.agent_factory import _thinking_payload
+
+    m = "doubao-seed-2-1-pro-260628"
+    assert _thinking_payload(_vendor_model("doubao", m, effort="low")) == {"reasoning_effort": "low"}
+    assert _thinking_payload(_vendor_model("doubao", m, effort="max")) == {"reasoning_effort": "high"}
+    # 关思考仍是真关(实测 thinking.type=disabled 思考 0)。
+    assert _thinking_payload(_vendor_model("doubao", m, thinking_enabled=False)) == {
+        "thinking": {"type": "disabled"}
+    }
+
+
+def test_glm_53_off_floors_at_low_instead_of_400() -> None:
+    # B-105(2026-09-24 实调)—— glm-5.3 关思考(thinking.type=disabled)是 400,
+    # 与 5.3-flash 一样是 always_thinking,关思考落到最低档而不是真关。
+    from orchestrator.agent_factory import _thinking_payload
+
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=False)) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "low",
+    }
+
+
+def test_qwen_thinking_max_tokens_is_the_budget() -> None:
+    from orchestrator.agent_factory import _thinking_payload
+
+    payload = _thinking_payload(
+        _vendor_model("qwen", "qwen3.8-max", effort="low", thinking_max_tokens=2000)
+    )
+    assert payload == {"enable_thinking": True, "thinking_budget": 2000}
+    # 只填思考上限、没设档位 = 开思考并限长。
+    assert _thinking_payload(_vendor_model("qwen", "qwen3.8-max", thinking_max_tokens=500)) == {
+        "enable_thinking": True,
+        "thinking_budget": 500,
+    }
+
+
+def test_thinking_max_tokens_rejected_where_unsupported() -> None:
+    with pytest.raises(AgentFactoryError, match="只能调思考档位"):
+        _build_provider(_vendor_model("glm", "glm-5.3", thinking_max_tokens=1000), "k")
+    with pytest.raises(AgentFactoryError, match="只能调思考档位"):
+        _build_provider(_anthropic_model(thinking_max_tokens=1000), "k")
+    # 目录外不闸(能力未知,和 effort 闸门同一口径),但也不发。
+    ok = _build_provider(_vendor_model("qwen", "custom-gw", thinking_max_tokens=1000), "k")
+    assert isinstance(ok, OpenAIProvider) and ok.thinking_payload is None
+
+
+# ---------------------------------------------------------------------------
 # Stream CM-10 PR3 — gate + thinking payload wiring for compat vendors
 # ---------------------------------------------------------------------------
 
 
 def test_compat_effort_on_unsupported_model_fails_fast() -> None:
-    # qwen3-vl-plus is in-catalog with no thinking control.
-    model = _vendor_model("qwen", "qwen3-vl-plus", effort="high")
+    # glm-4-plus is in-catalog with no thinking control. (B-105 2026-09-24 实调:
+    # qwen3-vl-plus used to be the "no knob" example here, but the live probe
+    # found it DOES support thinking (budget shape, default off) — it moved to
+    # test_catalog_corrections_from_live_probe / test_qwen_thinking_max_tokens_*.)
+    model = _vendor_model("glm", "glm-4-plus", effort="high")
     with pytest.raises(AgentFactoryError, match="thinking-depth control"):
         _build_provider(model, "k")
 
@@ -1819,8 +1877,10 @@ def test_thinking_payload_force_on_per_vendor() -> None:
 
 def test_thinking_toggle_gate_on_no_knob_model() -> None:
     # in-catalog model with no thinking knob rejects thinking_enabled (compat).
+    # (B-105 2026-09-24 实调: qwen3-vl-plus moved off this list — it now has a
+    # real thinking knob, default off — glm-4-plus replaces it here.)
     with pytest.raises(AgentFactoryError, match="no thinking toggle"):
-        _build_provider(_vendor_model("qwen", "qwen3-vl-plus", thinking_enabled=False), "k")
+        _build_provider(_vendor_model("glm", "glm-4-plus", thinking_enabled=False), "k")
     # anthropic path too (haiku has no knob).
     with pytest.raises(AgentFactoryError, match="no thinking toggle"):
         _build_provider(_anthropic_model(name="claude-haiku-4-5", thinking_enabled=True), "k")
