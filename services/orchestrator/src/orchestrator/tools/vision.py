@@ -517,14 +517,15 @@ def _require_string(args: Mapping[str, Any], key: str) -> str:
 
 
 def _quick_rejected(exc: LLMClientError) -> bool:
-    """B-105 —— 快看被厂商拒、值得用正常看图再试一次:4xx 且不是 401。
+    """B-105 —— 快看被厂商拒、值得用正常看图再试一次:4xx 且不是 401 / 403。
 
     路由对 4xx 不走备用链、原样抛出(不包成 ``AllProvidersExhaustedError``),所以这里
     直接判异常本身。401 是凭据问题,换一套思考参数一样失败;真路由里它还是 key 级错误,
     轮完整条链后被包成 ``AllProvidersExhaustedError``、根本进不了这里。429
-    (``LLMRateLimitError``)不继承 ``LLMClientError``,也进不了这里。
+    (``LLMRateLimitError``)不继承 ``LLMClientError``,也进不了这里。403 是权限问题,同理
+    不退回;它是普通 ``LLMClientError``,靠 ``classify_http_error`` 填的 ``status`` 认出来。
     """
-    return not isinstance(exc, LLMUnauthorizedError)
+    return not isinstance(exc, LLMUnauthorizedError) and exc.status != 403
 
 
 def _stringify(content: Any) -> str:

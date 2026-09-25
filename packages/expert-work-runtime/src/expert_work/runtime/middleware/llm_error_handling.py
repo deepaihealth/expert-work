@@ -48,6 +48,9 @@ class LLMClientError(LLMError):
     **Never retried** and **does not** trip the circuit breaker.
     """
 
+    #: B-105 —— 上游 HTTP 状态码(``classify_http_error`` 抛出时填);非 HTTP 来源为 ``None``。
+    status: int | None = None
+
 
 class LLMUnauthorizedError(LLMClientError):
     """Stream L.L8 — HTTP 401-class error specifically.

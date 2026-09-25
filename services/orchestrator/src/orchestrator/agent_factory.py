@@ -137,6 +137,7 @@ from orchestrator.llm import (
     make_qwen_client,
     make_self_hosted_client,
 )
+from orchestrator.llm.truncation import served_output_cap
 from orchestrator.middleware_assembly import MiddlewareEnv, build_middleware_chains
 from orchestrator.multimodal import ImageResolver
 from orchestrator.output_judge import ActionJudge, OutputJudge
@@ -1279,10 +1280,8 @@ async def build_agent(
         tool_disclosure=_resolved_tool_disclosure(spec.spec.model),
         # Stream RT-1 PR-3 (RT-ADR-4) — Tier3 structured final reply.
         output_schema=output_schema_spec,
-        # B-105 —— 截断报错文案里的上限与计数器标签。
-        output_cap=spec.spec.model.max_tokens,
-        model_provider=spec.spec.model.provider,
-        model_name=spec.spec.model.name,
+        # B-105 —— 截断报错文案里的上限与计数器标签,按实际应答的模型(路由盖的章)。
+        output_cap_resolver=served_output_cap(spec.spec.model),
     )
     compiled = GraphRunner(checkpointer=checkpointer).compile(graph)
     base_prompt = spec.spec.system_prompt.template

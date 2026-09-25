@@ -76,5 +76,7 @@ def classify_http_error(provider: str, status: int, body: str) -> LLMError:
     if status == 403 and _looks_account_dead(body):
         return LLMKeyUnavailableError(detail)
     if 400 <= status < 500:
-        return LLMClientError(detail)
+        client_error = LLMClientError(detail)
+        client_error.status = status
+        return client_error
     return LLMServerError(detail)

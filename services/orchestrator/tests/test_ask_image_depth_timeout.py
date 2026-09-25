@@ -31,6 +31,7 @@ from expert_work.runtime.middleware.llm_error_handling import (
 )
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MiddlewareEnv, ToolEnv, agent_factory, build_agent
+from orchestrator.llm.providers._errors import classify_http_error
 from orchestrator.llm.providers._streaming import LLMDelta, OpenAIStreamAssembler
 from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage
 from orchestrator.tools._guards import TokenBudget
@@ -766,11 +767,15 @@ async def test_quick_rejected_by_the_vendor_falls_back_to_the_normal_look() -> N
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
-    [LLMUnauthorizedError("401"), LLMRateLimitError("429")],
-    ids=["unauthorized", "rate_limit"],
+    [
+        LLMUnauthorizedError("401"),
+        classify_http_error("qwen", 403, "forbidden"),
+        LLMRateLimitError("429"),
+    ],
+    ids=["unauthorized", "forbidden", "rate_limit"],
 )
 async def test_quick_fallback_skips_auth_and_rate_limit(error: Exception) -> None:
-    # 401 = 凭据问题,429 = 限流:换成正常看图也一样失败,原样抛出。
+    # 401 / 403 = 凭据或权限问题,429 = 限流:换成正常看图也一样失败,原样抛出。
     quick, deep = _Rejects(error), _Answer()
     tool = AskImageTool(vl_caller=deep, image_resolver=_resolver(), quick_vl_caller=quick)
 
@@ -834,4 +839,21 @@ async def test_real_router_401_on_the_quick_look_is_not_retried_as_deep(
     content, _ = await harness.run(monkeypatch, vision, depth=None)
 
     assert "tool error" in content and "AllProvidersExhaustedError" in content
+    assert [name for name, _ in harness.answered] == ["qwen3.6-plus"]
+
+
+@pytest.mark.asyncio
+async def test_real_router_403_on_the_quick_look_is_not_retried_as_deep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 真路由对 403(非欠费形态)按 4xx 原样抛出;状态码随异常一路带到工具层,不退回。
+    harness = _Harness(
+        rejects_quick=frozenset({"qwen3.6-plus"}),
+        quick_error=classify_http_error("qwen", 403, "forbidden"),
+    )
+    vision = {"model": {"provider": "qwen", "name": "qwen3.6-plus", "thinking_enabled": True}}
+
+    content, _ = await harness.run(monkeypatch, vision, depth=None)
+
+    assert "tool error" in content and "403" in content
     assert [name for name, _ in harness.answered] == ["qwen3.6-plus"]

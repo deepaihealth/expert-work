@@ -9,7 +9,7 @@ error-wrap mechanics; middleware integration follows in E.11.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -337,6 +337,25 @@ class _StreamingScriptedLLM(_ScriptedLLM):
         return await super().__call__(messages=messages, tools=tools)
 
 
+def _served_caps() -> Any:
+    from expert_work.protocol import ModelSpec
+    from orchestrator.llm.truncation import served_output_cap
+
+    return served_output_cap(
+        ModelSpec.model_validate(
+            {
+                "provider": "glm",
+                "name": "glm-5.3",
+                "max_tokens": 2048,
+                "fallback": [{"provider": "qwen", "name": "qwen3.6-plus", "max_tokens": 8192}],
+            }
+        )
+    )
+
+
+_GLM_CAPS = _served_caps()
+
+
 async def _run_through_sse(llm: _ScriptedLLM, registry: ToolRegistry) -> tuple[list[Any], Any]:
     """真 graph 过 ``run_agent``:断言落在用户看得见的 error 帧与 run 行上。"""
     from uuid import uuid4
@@ -354,9 +373,7 @@ async def _run_through_sse(llm: _ScriptedLLM, registry: ToolRegistry) -> tuple[l
             build_react_graph(
                 llm_caller=llm,
                 tool_registry=registry,
-                output_cap=2048,
-                model_provider="glm",
-                model_name="glm-5.3",
+                output_cap_resolver=_GLM_CAPS,
             )
         )
         await run_agent(
@@ -461,3 +478,166 @@ class _CountingTool:
         del args, ctx
         self.calls += 1
         return ToolResult(content="ok")
+
+
+def _count(provider: str, model: str, usable: str) -> float:
+    from prometheus_client import REGISTRY
+
+    value = REGISTRY.get_sample_value(
+        "expert_work_llm_output_truncated_total",
+        {"provider": provider, "model": model, "usable": usable},
+    )
+    return value or 0.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_served_truncation_reports_the_fallback_cap_and_label() -> None:
+    # 备用接管后截断:文案里的上限与计数器标签都按实际应答的模型(路由盖的章)。
+    from orchestrator.llm.truncation import OutputTruncatedError
+    from orchestrator.usage_metering import SERVED_BY_KEY
+
+    before = _count("qwen", "qwen3.6-plus", "false")
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(
+                content="",
+                response_metadata={"finish_reason": "length", SERVED_BY_KEY: "qwen:qwen3.6-plus#1"},
+            )
+        ]
+    )
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm, tool_registry=ToolRegistry(), output_cap_resolver=_GLM_CAPS
+            )
+        )
+        with pytest.raises(OutputTruncatedError) as info:
+            await compiled.ainvoke(
+                {"messages": [HumanMessage(content="start")], "step_count": 0, "max_steps": 5},
+                config={"configurable": {"thread_id": "t-fallback"}},
+            )
+
+    assert info.value.cap == 8192 and "8192" in str(info.value)
+    assert _count("qwen", "qwen3.6-plus", "false") == before + 1
+
+
+def test_served_output_cap_falls_back_to_the_primary_when_unstamped() -> None:
+    assert _GLM_CAPS(AIMessage(content="")) == ("glm", "glm-5.3", 2048)
+
+
+@dataclass
+class _SpyCache:
+    puts: list[AIMessage] = field(default_factory=list)
+
+    def make_key(self, **kwargs: Any) -> str:
+        del kwargs
+        return "k"
+
+    async def put(self, key: str, response: AIMessage, ttl_s: int | None = None) -> None:
+        del key, ttl_s
+        self.puts.append(response)
+
+
+async def _run_with_usage(response: AIMessage) -> tuple[Any, _SpyCache, BaseException | None]:
+    from uuid import uuid4
+
+    from expert_work.persistence.token_usage_store import InMemoryTokenUsageStore
+    from expert_work.runtime.middleware import MiddlewareChain, TokenUsageMiddleware
+    from expert_work.runtime.middleware.llm_cache import LLMCacheStoreMiddleware
+
+    store = InMemoryTokenUsageStore()
+    cache = _SpyCache()
+    after = MiddlewareChain.from_middlewares(
+        "after_llm_call",
+        [
+            TokenUsageMiddleware(
+                store=store,
+                agent_name="a",
+                agent_version="1",
+                model="glm-5.3",
+                provider="glm",
+                usage_kind="conversation",
+            ),
+            LLMCacheStoreMiddleware(cache=cache, model="glm-5.3", temperature=0.0, max_tokens=2048),  # type: ignore[arg-type]
+        ],
+    )
+    tenant = uuid4()
+    raised: BaseException | None = None
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=_ScriptedLLM(responses=[response]),
+                tool_registry=ToolRegistry(),
+                after_llm_chain=after,
+                output_cap_resolver=_GLM_CAPS,
+            )
+        )
+        try:
+            await compiled.ainvoke(
+                {"messages": [HumanMessage(content="start")], "step_count": 0, "max_steps": 5},
+                config={"configurable": {"thread_id": str(uuid4()), "tenant_id": str(tenant)}},
+            )
+        except Exception as exc:
+            raised = exc
+    rows = await store.list_for_tenant(tenant_id=tenant)
+    return rows, cache, raised
+
+
+_USAGE = {"input_tokens": 100, "output_tokens": 2048, "total_tokens": 2148}
+
+
+@pytest.mark.asyncio
+async def test_unusable_truncation_is_metered_but_not_cached() -> None:
+    # 截断那次调用照样计费(常常整个上限都花在思考上):落一行用量,但不进响应缓存。
+    from orchestrator.llm.truncation import OutputTruncatedError
+
+    rows, cache, raised = await _run_with_usage(
+        AIMessage(content="", usage_metadata=_USAGE, response_metadata={"finish_reason": "length"})
+    )
+
+    assert isinstance(raised, OutputTruncatedError)
+    assert [(r.model, r.input_tokens, r.output_tokens, r.usage_kind) for r in rows] == [
+        ("glm-5.3", 100, 2048, "conversation")
+    ]
+    assert cache.puts == []
+
+
+@pytest.mark.asyncio
+async def test_usable_truncation_still_goes_through_the_normal_after_chain() -> None:
+    # 对照:同一套中间件在可用回答上会落缓存 —— 证明上一条的「没落缓存」咬得住。
+    rows, cache, raised = await _run_with_usage(
+        AIMessage(
+            content="够用的回答",
+            usage_metadata=_USAGE,
+            response_metadata={"finish_reason": "length"},
+        )
+    )
+
+    assert raised is None
+    assert len(rows) == 1
+    assert len(cache.puts) == 1
+
+
+@pytest.mark.asyncio
+async def test_budget_exhausted_wrap_up_with_junk_tool_calls_is_delivered() -> None:
+    # 收尾轮(没绑工具)模型回的 tool_calls 本来就会被剥掉;剥完剩可用正文就照常交付。
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(
+                content="这是收尾总结",
+                tool_calls=[_tool_call("write_file", {}, "tc-1")],
+                response_metadata={"finish_reason": "length"},
+            )
+        ]
+    )
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=ToolRegistry())
+        )
+        state = await compiled.ainvoke(
+            {"messages": [HumanMessage(content="start")], "step_count": 1, "max_steps": 1},
+            config={"configurable": {"thread_id": "t-wrapup"}},
+        )
+
+    assert state["messages"][-1].content == "这是收尾总结"
+    assert state["messages"][-1].tool_calls == []

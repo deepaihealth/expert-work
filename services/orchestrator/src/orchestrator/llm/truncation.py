@@ -6,10 +6,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 from langchain_core.messages import AIMessage
 
 from expert_work.common.observability.metrics import expert_work_counter
 from orchestrator.llm.structured_output import _message_text
+from orchestrator.usage_metering import ServedModelResolver, chain_models
+
+if TYPE_CHECKING:
+    from expert_work.protocol import ModelSpec
 
 _TRUNCATED = {("finish_reason", "length"), ("stop_reason", "max_tokens")}
 
@@ -46,3 +54,36 @@ class OutputTruncatedError(RuntimeError):
             "请在模型配置里调大『输出上限』,或者降低思考档位。"
         )
         self.cap = cap
+
+
+@dataclass(frozen=True)
+class ServedOutputCap:
+    """响应 → 实际应答模型的 ``(provider, model, 输出上限)``。
+
+    实际应答的是谁由路由盖的章认出(``orchestrator.usage_metering``,与用量记账同一个
+    解析器);没盖章(没接用量存储)时记配置的主模型。上限取该模型条目自己的
+    ``max_tokens``(``None`` = 厂商默认)。
+    """
+
+    served_by: Callable[[AIMessage], tuple[str, str]]
+    caps: Mapping[tuple[str, str], int | None]
+
+    def __call__(self, response: AIMessage) -> tuple[str, str, int | None]:
+        provider, model = self.served_by(response)
+        return provider, model, self.caps.get((provider, model))
+
+
+def served_output_cap(model: ModelSpec) -> ServedOutputCap:
+    """``model`` 与它整棵备用树的截断标签 / 上限解析器。"""
+    caps: dict[tuple[str, str], int | None] = {}
+    pending = [model]
+    while pending:
+        entry = pending.pop()
+        caps[(entry.provider, entry.name)] = entry.max_tokens
+        pending.extend(entry.fallback)
+    return ServedOutputCap(
+        served_by=ServedModelResolver(
+            default=(model.provider, model.name), models=chain_models(model)
+        ),
+        caps=caps,
+    )
