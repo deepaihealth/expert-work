@@ -41,6 +41,10 @@ from expert_work.runtime.middleware.base import CallNext, MiddlewareContext
 
 logger = logging.getLogger(__name__)
 
+#: B-105 —— ``after_llm_call`` 载荷里的「照常记账,但别存进缓存」标记。截断成不可用的回答
+#: 已经计费,要落用量;但存进缓存会让下一次同样的提示词直接拿到这个坏回答。
+SKIP_STORE_KEY = "llm_cache_skip_store"
+
 
 def _coerce_messages(raw: object) -> list[BaseMessage]:
     if isinstance(raw, list):
@@ -146,6 +150,8 @@ class LLMCacheStoreMiddleware:
     - ``tenant_id`` — per-tenant namespace.
     - ``cache_hit`` — ``True`` when this turn was served from cache;
       storing again would be wasted work, so we skip.
+    - :data:`SKIP_STORE_KEY` — ``True`` when the response must be metered
+      but never replayed (B-105: a truncated, unusable reply).
     - ``output_schema`` — optional :class:`StructuredOutputSpec`; must
       mirror the lookup middleware's keying exactly, or structured
       entries would be stored under keys the lookup never derives.
@@ -165,7 +171,7 @@ class LLMCacheStoreMiddleware:
     async def __call__(self, ctx: MiddlewareContext, call_next: CallNext) -> None:
         await call_next(ctx)
 
-        if ctx.payload.get("cache_hit") is True:
+        if ctx.payload.get("cache_hit") is True or ctx.payload.get(SKIP_STORE_KEY) is True:
             return
 
         tenant_id = ctx.payload.get("tenant_id")

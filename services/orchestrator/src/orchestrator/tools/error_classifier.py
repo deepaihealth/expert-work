@@ -100,6 +100,20 @@ class GuidedTimeoutError(TimeoutError):
         self.advice = advice
 
 
+class GuidedToolError(RuntimeError):
+    """A non-timeout tool failure whose recovery the raising tool knows better.
+
+    B-105 — ``ask_image`` whose vision model was cut off by its output cap
+    with nothing usable. A real failure (``unknown`` class, it enters the
+    run's failure ledger), but an identical retry hits the same cap: the tool
+    supplies the advice and the failure is marked not retryable.
+    """
+
+    def __init__(self, message: str, *, advice: str) -> None:
+        super().__init__(message)
+        self.advice = advice
+
+
 # ---------------------------------------------------------------------------
 # Classification (error path)
 # ---------------------------------------------------------------------------
@@ -128,6 +142,14 @@ def classify_tool_error(
         return ClassifiedToolError(
             tool_name=tool_name,
             error_class="transient",
+            summary=summary,
+            retryable=False,
+            advice=error.advice,
+        )
+    if isinstance(error, GuidedToolError):
+        return ClassifiedToolError(
+            tool_name=tool_name,
+            error_class="unknown",
             summary=summary,
             retryable=False,
             advice=error.advice,

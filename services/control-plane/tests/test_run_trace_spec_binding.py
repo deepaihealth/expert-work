@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -218,3 +220,88 @@ async def test_hashing_failure_is_swallowed_and_logged(
 
     messages = [r.getMessage() for r in caplog.records]
     assert any("spec_bind_failed" in m for m in messages), messages
+
+
+def _legacy_non_anthropic_spec_and_stored_sha() -> tuple[AgentSpec, str]:
+    """B-105 前落库的非 Anthropic manifest:每个 ModelSpec 节点都物化了旧默认 4096,
+    列里的哈希按这个形态算。旧形态用 4097 占位再换回 4096 构造,不借实现本身。"""
+    raw = deepcopy(_SPEC)
+    raw["spec"]["model"] = {
+        "provider": "qwen",
+        "name": "qwen3-max",
+        "max_tokens": 4096,
+        "fallback": [{"provider": "glm", "name": "glm-5.3", "max_tokens": 4096}],
+    }
+    spec = AgentSpec.model_validate(raw)
+    placeholder = deepcopy(raw)
+    placeholder["spec"]["model"]["max_tokens"] = 4097
+    placeholder["spec"]["model"]["fallback"][0]["max_tokens"] = 4097
+    old_dump = AgentSpec.model_validate(placeholder).model_dump(by_alias=True, mode="json")
+    old_dump["spec"]["model"]["max_tokens"] = 4096
+    old_dump["spec"]["model"]["fallback"][0]["max_tokens"] = 4096
+    stored = hashlib.sha256(
+        json.dumps(old_dump, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return spec, stored
+
+
+@pytest.mark.asyncio
+async def test_legacy_4096_normalisation_alone_does_not_log_divergence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B-105 —— 存量非 Anthropic manifest 的 4096 加载时被归一成空;指纹的规范形态把空
+    上限按 4096 算,所以现算哈希就等于列,不打 warning。绑的仍是列。"""
+    tenant_id = uuid4()
+    runs = InMemoryRunStore()
+    run_id = await _seed_run(runs, tenant_id=tenant_id)
+    spec, stored = _legacy_non_anthropic_spec_and_stored_sha()
+    assert stored == compute_spec_sha256(spec)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        await bind_exec_spec(
+            runs=runs,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            spec=spec,
+            stored_sha256=stored,
+            source=_SOURCE,
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("spec_sha256_diverged" in m for m in messages), messages
+    info = await runs.get(run_id=run_id, tenant_id=tenant_id)
+    assert info is not None
+    assert info.agent_spec_sha256 == stored
+
+
+@pytest.mark.asyncio
+async def test_legacy_4096_spec_with_a_real_divergence_still_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """同一份存量 manifest,列与内容真不一致(这里换成别的哈希)时照样要打。"""
+    tenant_id = uuid4()
+    runs = InMemoryRunStore()
+    run_id = await _seed_run(runs, tenant_id=tenant_id)
+    spec, _ = _legacy_non_anthropic_spec_and_stored_sha()
+    stored = "3" * 64
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        await bind_exec_spec(
+            runs=runs,
+            run_id=run_id,
+            tenant_id=tenant_id,
+            spec=spec,
+            stored_sha256=stored,
+            source=_SOURCE,
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("spec_sha256_diverged" in m for m in messages), messages
+
+
+def test_digest_form_does_not_change_the_persisted_shape() -> None:
+    """4096 只在算指纹时写回;存库的 ``model_dump`` 照旧省略。"""
+    spec, _ = _legacy_non_anthropic_spec_and_stored_sha()
+    dumped = spec.model_dump(by_alias=True, mode="json")
+    assert "max_tokens" not in dumped["spec"]["model"]
+    assert "max_tokens" not in dumped["spec"]["model"]["fallback"][0]

@@ -944,3 +944,15 @@ async def test_base_capabilities_coexist_with_opt_in_tools() -> None:
     assert registry.get("web_search") is not None
     for name in (*_BASE_SANDBOX_TOOLS, *_BASE_HOST_READ_TOOLS, *_BASE_ARTIFACT_TOOLS):
         assert registry.get(name) is not None, name
+
+
+@pytest.mark.asyncio
+async def test_ask_image_gets_the_vision_model_cap_resolver() -> None:
+    """B-105 —— 截断报错里的上限 / 计数标签取看图模型(不是主模型)的配置。"""
+    env = ToolEnv(image_resolver=InMemoryImageResolver())
+    vision = VisionSpec(model=ModelSpec(provider="qwen", name="qwen3-vl-flash", max_tokens=3000))
+    registry = await build_tool_registry([], tool_env=env, vision=vision, vl_caller=_stub_vl_caller)
+    tool = registry.get("ask_image")
+    assert isinstance(tool, AskImageTool)
+    assert tool.output_cap_resolver is not None
+    assert tool.output_cap_resolver(AIMessage(content="")) == ("qwen", "qwen3-vl-flash", 3000)

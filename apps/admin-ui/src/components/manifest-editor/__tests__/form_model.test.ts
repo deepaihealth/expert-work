@@ -258,6 +258,21 @@ describe("form_model writers preserve siblings", () => {
     expect(next.spec?.system_prompt).toEqual(seed.spec.system_prompt);
   });
 
+  // B-105 Task 4 — thinking_max_tokens round-trips like context_window: set
+  // survives YAML, clearing (explicit undefined) omits the key so the
+  // manifest stays clean (the backend rejects the key on a non-cap model).
+  it("model.thinking_max_tokens round-trips through YAML; clearing omits the key", () => {
+    const withCap = setModel(seed, { thinking_max_tokens: 2000 });
+    const yaml = dumpYaml(withCap);
+    expect(yaml).toContain("thinking_max_tokens: 2000");
+    const roundTripped = parse(yaml) as AgentManifest;
+    expect(readModel(roundTripped).thinking_max_tokens).toBe(2000);
+
+    const cleared = setModel(withCap, { thinking_max_tokens: undefined });
+    const clearedYaml = dumpYaml(cleared);
+    expect(clearedYaml).not.toContain("thinking_max_tokens");
+  });
+
   it("setSystemPrompt preserves other spec keys", () => {
     const next = setSystemPrompt(seed, "New prompt.");
     expect(next.spec?.system_prompt?.template).toBe("New prompt.");

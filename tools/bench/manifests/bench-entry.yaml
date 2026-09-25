@@ -34,7 +34,8 @@ spec:
     provider: deepseek
     name: deepseek-chat
     temperature: 0.2
-    max_tokens: 2048
+    # No max_tokens: output cap = vendor default. Before B-105 the old 2048 was never
+    # sent to this vendor, so the baselines ran at the default; a cap now would differ.
     rate_limit_rpm: 60
 
   system_prompt:

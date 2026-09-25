@@ -983,7 +983,15 @@ export interface TranslationKeys {
     adaptive_hint: string;
     cache_label: string;
     cache_hint: string;
+    max_tokens_label: string;
+    max_tokens_placeholder: string;
+    max_tokens_placeholder_max: string;
+    max_tokens_placeholder_anthropic: string;
     max_tokens_hint: string;
+    thinking_max_label: string;
+    thinking_max_hint: string;
+    thinking_max_unsupported: string;
+    thinking_max_clear: string;
     rate_limit_hint: string;
   };
   agent_form: {
@@ -4235,8 +4243,18 @@ const en: TranslationKeys = {
     cache_label: "Prompt caching",
     cache_hint:
       "Anthropic prompt caching — significant savings on long sessions. On by default; turn off for agents whose prompt holds time-sensitive content. Anthropic-only.",
+    max_tokens_label: "Max output (incl. thinking)",
+    max_tokens_placeholder: "Vendor default",
+    max_tokens_placeholder_max: "Vendor default (max {{n}})",
+    max_tokens_placeholder_anthropic: "Default {{n}}",
     max_tokens_hint:
-      "Output token ceiling for a single reply. Only effective on the Anthropic path (qwen/doubao borrow it to derive the thinking budget); OpenAI-family providers ignore this value.",
+      "Per-reply output cap, thinking included. Empty = vendor default.",
+    thinking_max_label: "Thinking length cap",
+    thinking_max_hint:
+      "Thinking stops at this length and the model answers. Empty = follow reasoning depth.",
+    thinking_max_unsupported:
+      "This model only supports thinking levels, not a thinking length cap.",
+    thinking_max_clear: "Clear",
     rate_limit_hint:
       "Request-rate ceiling for this model (per minute). Requests over the limit queue instead of erroring.",
   },

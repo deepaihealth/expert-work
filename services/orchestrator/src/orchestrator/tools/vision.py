@@ -29,10 +29,20 @@ from uuid import UUID
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
+from expert_work.common.observability.metrics import expert_work_counter
 from expert_work.protocol.multimodal import (
     WORKSPACE_REF_PREFIX,
     parse_image_ref,
     parse_workspace_image_ref,
+)
+from expert_work.runtime.middleware.llm_error_handling import (
+    LLMClientError,
+    LLMUnauthorizedError,
+)
+from orchestrator.llm.truncation import (
+    ServedOutputCap,
+    is_unusable_truncation,
+    output_truncated_total,
 )
 from orchestrator.multimodal import (
     ImageResolver,
@@ -42,7 +52,7 @@ from orchestrator.multimodal import (
     unreadable_workspace_image_text,
 )
 from orchestrator.tools._guards import usage_total
-from orchestrator.tools.error_classifier import GuidedTimeoutError
+from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
 from orchestrator.tools.figure_lookup import resolve_rendered_figure
 from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -67,6 +77,13 @@ _SYSTEM_PROMPT = (
 #: 超时对「一直在吐思考 token」的推理模型不触发(实测同类问题 11s 与 234s 两次),
 #: 所以这里在工具层再加一道整体上限。
 ASK_IMAGE_TIMEOUT_S = 120.0
+
+#: B-105 —— 快看的「关思考」参数被厂商拒(4xx)、退回正常看图的次数。``model`` 是看图主模型名。
+vision_quick_fallback_total = expert_work_counter(
+    "expert_work_vision_quick_fallback_total",
+    "ask_image quick looks rejected by the vendor and retried with the configured thinking.",
+    ("model",),
+)
 
 AskImageDepth = Literal["quick", "deep"]
 _DEPTHS: tuple[AskImageDepth, ...] = ("quick", "deep")
@@ -113,6 +130,11 @@ class AskImageTool:
     quick_vl_caller: LLMCaller | None = None
     #: B-64 Task 10 —— 单次 VL 调用的整体上限;只有测试会改它。
     timeout_s: float = ASK_IMAGE_TIMEOUT_S
+    #: B-105 —— 看图主模型名,只用作快看退回计数器的标签。
+    vl_model_name: str = ""
+    #: B-105 —— 看图模型(含备用树)的截断标签 / 上限解析器:实际应答的是谁、它的输出上限。
+    #: ``None`` = 没接(测试),截断标签记 ``vl_model_name``、上限按厂商默认报。
+    output_cap_resolver: ServedOutputCap | None = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -214,11 +236,28 @@ class AskImageTool:
                 ]
             ),
         ]
-        caller = self.vl_caller
         if depth == "quick" and self.quick_vl_caller is not None:
-            caller = self.quick_vl_caller
-        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-            response = await self._call_with_limit(caller, messages, depth=depth, ctx=ctx)
+            try:
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    response = await self._call_with_limit(
+                        self.quick_vl_caller, messages, depth=depth, ctx=ctx
+                    )
+            except LLMClientError as exc:
+                if not _quick_rejected(exc):
+                    raise
+                # B-105 —— 关思考的参数被这家拒了(目录没实调过的新模型最常见):退回 Agent
+                # 原本的看图配置再看一次,而不是让看图整个失败。
+                vision_quick_fallback_total.labels(model=self.vl_model_name).inc()
+                logger.warning("ask_image.quick_rejected_fallback err=%s", type(exc).__name__)
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    response = await self._call_with_limit(
+                        self.vl_caller, messages, depth=depth, ctx=ctx
+                    )
+        else:
+            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                response = await self._call_with_limit(
+                    self.vl_caller, messages, depth=depth, ctx=ctx
+                )
         # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
         # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
         # 两样都不做,也与主模型一致。
@@ -226,6 +265,10 @@ class AskImageTool:
             ctx.token_budget.add(usage_total(response.usage_metadata))
         if self.usage_meter is not None:
             await self.usage_meter(response, tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+        # B-105 —— 截断成空回答(思考吃满上限)不当成「看图模型没说话」:上面已照常扣池 / 记账,
+        # 这里计数后给模型一个说清原因的工具错误,别让它原样再问一遍。
+        if is_unusable_truncation(response):
+            self._raise_truncated(response)
         answer = _stringify(response.content) or "[VL model returned no text]"
         # Surface VL provenance in the ToolMessage artifact (event stream /
         # audit): the image ref plus the VL call's token usage — otherwise the
@@ -236,6 +279,20 @@ class AskImageTool:
         if response.usage_metadata:
             meta["vl_usage"] = dict(response.usage_metadata)
         return ToolResult(content=answer, meta=meta)
+
+    def _raise_truncated(self, response: AIMessage) -> None:
+        if self.output_cap_resolver is not None:
+            provider, model, cap = self.output_cap_resolver(response)
+        else:
+            provider, model, cap = "", self.vl_model_name, None
+        output_truncated_total.labels(provider=provider, model=model, usable="false").inc()
+        logger.warning("ask_image.output_truncated model=%s", model)
+        shown = str(cap) if cap is not None else "厂商默认值"
+        msg = (
+            f"看图模型输出被截断(已用满输出上限 {shown},含思考)。"
+            "请在看图模型配置里调大『输出上限』,或者改用默认的快看。"
+        )
+        raise GuidedToolError(msg, advice=_TRUNCATED_ADVICE)
 
     async def _call_with_limit(
         self,
@@ -431,6 +488,13 @@ _TIMEOUT_ADVICE = (
 _NO_TIME_LEFT_ADVICE = (
     "This run has no time left. Do not call ask_image again; finish with what you already have."
 )
+#: B-105 —— 看图模型截断:原样再问只会再截一次(上限没变)。
+_TRUNCATED_ADVICE = (
+    "Do not repeat the identical call: the vision model will hit the same output cap again. "
+    "Retry once with the default quick depth if this call used depth='deep', or with a "
+    "narrower question; otherwise continue without this image answer and tell the user the "
+    "vision model's output cap needs raising."
+)
 
 
 def _timeout_message(limit_s: float, depth: AskImageDepth, by_run_deadline: bool) -> str:
@@ -483,6 +547,18 @@ def _require_string(args: Mapping[str, Any], key: str) -> str:
         msg = f"ask_image requires a non-empty {key!r} string"
         raise ValueError(msg)
     return raw.strip()
+
+
+def _quick_rejected(exc: LLMClientError) -> bool:
+    """B-105 —— 快看被厂商拒、值得用正常看图再试一次:4xx 且不是 401 / 403。
+
+    路由对 4xx 不走备用链、原样抛出(不包成 ``AllProvidersExhaustedError``),所以这里
+    直接判异常本身。401 是凭据问题,换一套思考参数一样失败;真路由里它还是 key 级错误,
+    轮完整条链后被包成 ``AllProvidersExhaustedError``、根本进不了这里。429
+    (``LLMRateLimitError``)不继承 ``LLMClientError``,也进不了这里。403 是权限问题,同理
+    不退回;它是普通 ``LLMClientError``,靠 ``classify_http_error`` 填的 ``status`` 认出来。
+    """
+    return not isinstance(exc, LLMUnauthorizedError) and exc.status != 403
 
 
 def _stringify(content: Any) -> str:

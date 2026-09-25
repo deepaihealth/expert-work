@@ -23,16 +23,25 @@ from expert_work.protocol import (
     PlatformAgentTemplateStatus,
     PlatformAgentTemplateUpsert,
 )
-from expert_work.protocol.agent_spec import AgentSpec
+from expert_work.protocol.agent_spec import SPEC_DIGEST_CONTEXT, AgentSpec
 
 
 def compute_spec_sha256(spec: AgentSpec) -> str:
     """Stable content hash of a manifest (canonical JSON: by alias, sorted keys).
 
     A template's sha is independent of the per-tenant ``agent_spec`` sha — it only
-    marks "did this version's base manifest change" for templates."""
+    marks "did this version's base manifest change" for templates.
+
+    B-105: hashed under :data:`SPEC_DIGEST_CONTEXT` — an unset ``max_tokens`` is
+    hashed as the old default ``4096`` and an unset ``thinking_max_tokens`` is
+    omitted, i.e. the pre-B-105 shape. Stored and new manifests keep the digest
+    they had before, so the ``run.agent_spec_sha256`` ↔
+    ``agent_spec_revision.spec_sha256`` join holds. The persisted dump still
+    omits both keys."""
     payload = json.dumps(
-        spec.model_dump(by_alias=True, mode="json"), sort_keys=True, separators=(",", ":")
+        spec.model_dump(by_alias=True, mode="json", context={SPEC_DIGEST_CONTEXT: True}),
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

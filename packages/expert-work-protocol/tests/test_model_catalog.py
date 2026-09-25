@@ -176,8 +176,11 @@ def test_glm_53_flash_capability_bits() -> None:
     assert flash.always_thinking is True
     assert "glm-5.3-flash" in {e.name for e in models_for_provider("glm")}
     # The flag defaults False everywhere else — the provider-level "real off"
-    # derivation stays intact for glm-5.3 and deepseek.
-    assert catalog_entry("glm", "glm-5.3").always_thinking is False  # type: ignore[union-attr]
+    # derivation stays intact for glm-5.2 and deepseek. (B-105 2026-09-24 实调:
+    # glm-5.3 itself turned out to ALSO be always_thinking — see
+    # test_catalog_corrections_from_live_probe — so glm-5.2 replaces it here as
+    # the still-真-off example.)
+    assert catalog_entry("glm", "glm-5.2").always_thinking is False  # type: ignore[union-attr]
     assert catalog_entry("deepseek", "deepseek-v4-pro").always_thinking is False  # type: ignore[union-attr]
 
 
@@ -186,7 +189,9 @@ def test_cross_vendor_thinking_shapes() -> None:
     assert catalog_entry("openai", "gpt-5.5").thinking == "effort"  # type: ignore[union-attr]
     assert catalog_entry("deepseek", "deepseek-v4-pro").thinking == "effort"  # type: ignore[union-attr]
     assert catalog_entry("qwen", "qwen3.7-max").thinking == "budget"  # type: ignore[union-attr]
-    assert catalog_entry("doubao", "doubao-seed-2.0-pro").thinking == "budget"  # type: ignore[union-attr]
+    # B-105(2026-09-24 实调)—— doubao ``thinking.budget_tokens`` 被厂商忽略,真正
+    # 生效的是 ``reasoning_effort`` → shape "effort"(不再是 "budget")。
+    assert catalog_entry("doubao", "doubao-seed-2.0-pro").thinking == "effort"  # type: ignore[union-attr]
     assert catalog_entry("glm", "glm-5.1").thinking == "toggle"  # type: ignore[union-attr]
     assert catalog_entry("kimi", "kimi-k2.6").thinking == "toggle"  # type: ignore[union-attr]
     # Always-thinking / no-control models stay None.
@@ -200,13 +205,18 @@ def test_thinking_defaults_none() -> None:
 
 def test_thinking_default_field() -> None:
     # Thinking-Toggle — field defaults False; every in-sale thinking-capable
-    # model declares its real default (currently all default ON), and no-knob
-    # models keep the False default.
+    # model declares its real default. Most default thinking ON; B-105
+    # (2026-09-24 实调) found qwen3-vl-plus / qwen3-vl-flash default OFF
+    # (enable_thinking is a real opt-in there), and no-knob models keep the
+    # False default. qwen3-max likewise defaults OFF (same probe: no flag →
+    # reasoning_tokens=null).
+    default_off = {("qwen", "qwen3-max"), ("qwen", "qwen3-vl-plus"), ("qwen", "qwen3-vl-flash")}
     assert ModelEntry(name="x").thinking_default is False
     for provider, models in MODEL_CATALOG.items():
         for entry in models:
             if entry.thinking is not None:
-                assert entry.thinking_default is True, f"{provider}/{entry.name}"
+                expected = (provider, entry.name) not in default_off
+                assert entry.thinking_default is expected, f"{provider}/{entry.name}"
             else:
                 assert entry.thinking_default is False, f"{provider}/{entry.name}"
 
@@ -260,3 +270,105 @@ def test_temperature_fixed_declared_only_where_documented() -> None:
     assert constrained == [("kimi", "kimi-k3")]
     # Field default — an entry that says nothing constrains nothing.
     assert ModelEntry(name="x").temperature_fixed is None
+
+
+# ---------------------------------------------------------------------------
+# B-105 — output-cap field / vendor output ceiling / thinking-length cap
+# ---------------------------------------------------------------------------
+
+
+def _e(provider: str, name: str) -> ModelEntry:
+    entry = catalog_entry(provider, name)
+    assert entry is not None, name
+    return entry
+
+
+def test_output_cap_fields_match_live_probe_2026_09_24() -> None:
+    # spec §8.1 / §8.7 —— 设错字段在 GLM / DeepSeek 上是静默的,这张表只能靠测试守。
+    for name in (
+        "glm-5.3",
+        "glm-5.3-flash",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-4.7",
+        "glm-4.6",
+        "glm-5v-turbo",
+        "glm-4.6v",
+        "glm-4.5v",
+    ):
+        assert _e("glm", name).output_cap_field == "max_tokens"
+    for name in ("deepseek-v4-pro", "deepseek-v4-flash"):
+        assert _e("deepseek", name).output_cap_field == "max_tokens"
+    for name in ("kimi-k3", "kimi-k2.6", "kimi-k2.5"):
+        assert _e("kimi", name).output_cap_field == "max_completion_tokens"
+    for name in ("qwen3.8-max", "qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus"):
+        assert _e("qwen", name).output_cap_field == "max_completion_tokens"
+    for name in ("qwen3-max", "qwen3-vl-plus", "qwen3-vl-flash"):
+        assert _e("qwen", name).output_cap_field == "split"
+    for name in ("doubao-seed-2-1-pro-260628", "doubao-seed-2.0-pro", "doubao-seed-2.0-lite"):
+        assert _e("doubao", name).output_cap_field == "max_completion_tokens"
+    for name in ("gpt-5.5", "gpt-5.5-pro", "gpt-5.4-mini"):
+        assert _e("openai", name).output_cap_field == "max_completion_tokens"
+    assert _e("anthropic", "claude-opus-4-8").output_cap_field == "max_tokens"
+
+
+def test_max_output_tokens_match_vendor_ranges() -> None:
+    for name in (
+        "glm-5.3",
+        "glm-5.3-flash",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-4.7",
+        "glm-4.6",
+        "glm-5v-turbo",
+    ):
+        assert _e("glm", name).max_output_tokens == 131_072
+    assert _e("glm", "glm-4.6v").max_output_tokens == 32_768
+    assert _e("glm", "glm-4.5v").max_output_tokens == 16_384
+    assert _e("deepseek", "deepseek-v4-pro").max_output_tokens == 393_216
+    assert _e("deepseek", "deepseek-v4-flash").max_output_tokens == 393_216
+    assert _e("doubao", "doubao-seed-2-1-pro-260628").max_output_tokens == 262_144
+    assert _e("kimi", "kimi-k3").max_output_tokens is None
+    assert _e("qwen", "qwen3.8-max").max_output_tokens is None
+
+
+def test_thinking_cap_only_on_qwen_thinking_models() -> None:
+    capped = {
+        "qwen3.8-max",
+        "qwen3.7-max",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        "qwen3-max",
+        "qwen3-vl-plus",
+        "qwen3-vl-flash",
+    }
+    from expert_work.protocol.model_catalog import MODEL_CATALOG
+
+    for provider, entries in MODEL_CATALOG.items():
+        for e in entries:
+            assert e.thinking_cap is (provider == "qwen" and e.name in capped), e.name
+
+
+def test_catalog_corrections_from_live_probe() -> None:
+    # glm-5.3 关思考 400(「该模型始终思考」)。
+    assert _e("glm", "glm-5.3").always_thinking is True
+    # 豆包 budget_tokens 被厂商忽略 → 档位走 reasoning_effort;没有 max 档。
+    for name in ("doubao-seed-2-1-pro-260628", "doubao-seed-2.0-pro", "doubao-seed-2.0-lite"):
+        e = _e("doubao", name)
+        assert e.thinking == "effort"
+        assert e.effort_map == {"max": "high"}
+    # glm-4.6v / 4.5v 实际默认思考、disabled 有效。
+    for name in ("glm-4.6v", "glm-4.5v"):
+        e = _e("glm", name)
+        assert (e.thinking, e.thinking_default) == ("toggle", True)
+    # qwen3-max / qwen3-vl 默认不思考、enable_thinking 有效。
+    for name in ("qwen3-max", "qwen3-vl-plus", "qwen3-vl-flash"):
+        e = _e("qwen", name)
+        assert (e.thinking, e.thinking_default) == ("budget", False)
+
+
+def test_max_high_low_effort_map_moved_into_catalog() -> None:
+    mhl = {"medium": "high"}
+    for name in ("glm-5.3", "glm-5.3-flash", "glm-5.2"):
+        assert _e("glm", name).effort_map == mhl
+    assert _e("kimi", "kimi-k3").effort_map == mhl

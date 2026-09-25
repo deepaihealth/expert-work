@@ -7,12 +7,16 @@
  *
  * Refactored from the old RJSF model field — no RJSF coupling.
  */
-import { Collapse, InputNumber, Select, Slider, Switch, Tag, Tooltip } from "antd";
+import { Button, Collapse, InputNumber, Select, Slider, Switch, Tag, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
 import type { ModelCatalog } from "../../../api/model_catalog";
 import type { ModelFields } from "../form_model";
 import { lookupModel, modelsFor, providerNames } from "../catalog";
+
+// B-105 — Anthropic requires max_tokens; an empty cap is sent as 4096
+// (agent_factory / truncation ANTHROPIC_DEFAULT_MAX_TOKENS), not a vendor default.
+const ANTHROPIC_DEFAULT_MAX_TOKENS = 4096;
 
 interface ModelSelectProps {
   value: ModelFields;
@@ -49,6 +53,8 @@ export function ModelSelect({
       effort: undefined,
       adaptive_thinking: undefined,
       cache_enabled: undefined,
+      // B-105 — no model selected yet, so no thinking-cap knob either.
+      thinking_max_tokens: undefined,
     });
   }
   function onModel(name: string): void {
@@ -67,6 +73,10 @@ export function ModelSelect({
       // to a non-thinking model (agent_factory rejects effort with no
       // thinking knob); survives thinking→thinking switches.
       effort: entry?.thinking ? value.effort : undefined,
+      // B-105 — thinking_max_tokens only makes sense for a model with a REAL
+      // thinking-length cap — scrub it on a switch to a model without one
+      // (the backend REJECTS the save otherwise); survives cap→cap switches.
+      thinking_max_tokens: entry?.thinking_cap ? value.thinking_max_tokens : undefined,
     });
   }
 
@@ -87,6 +97,11 @@ export function ModelSelect({
         value.provider !== "glm" &&
         value.provider !== "deepseek"));
   const thinkingOn = value.thinking_enabled ?? currentEntry?.thinking_default ?? false;
+  // B-105 — a stored thinking cap on a model without one (YAML, or saved
+  // before the catalog changed) makes the backend reject the build. The input
+  // stays disabled, but the value must remain visible and clearable.
+  const staleThinkingMax =
+    !currentEntry?.thinking_cap && value.thinking_max_tokens != null;
 
   const temperature = value.temperature ?? 0.2;
 
@@ -181,14 +196,35 @@ export function ModelSelect({
               <>
                 <label style={{ display: "block", marginBottom: 8 }}>
                   <span style={{ display: "block", marginBottom: 4 }}>
-                    max_tokens
+                    {t("model_select.max_tokens_label")}
                   </span>
                   <InputNumber
                     value={value.max_tokens}
+                    min={1}
+                    // No ``max`` — rc-input-number clamps ON BLUR even with
+                    // no typing (flushInputValue), which would silently
+                    // rewrite a manifest that already stores an
+                    // over-ceiling value down to the catalog ceiling. The
+                    // backend's dry-run build already rejects an
+                    // over-ceiling max_tokens with an explicit message; the
+                    // placeholder below still names the ceiling as a hint.
+                    placeholder={
+                      value.provider === "anthropic"
+                        ? t("model_select.max_tokens_placeholder_anthropic", {
+                            n: ANTHROPIC_DEFAULT_MAX_TOKENS,
+                          })
+                        : currentEntry?.max_output_tokens != null
+                        ? t("model_select.max_tokens_placeholder_max", {
+                            n: currentEntry.max_output_tokens,
+                          })
+                        : t("model_select.max_tokens_placeholder")
+                    }
                     onChange={(v) =>
                       onChange({ ...value, max_tokens: v ?? undefined })
                     }
                     style={{ width: "100%" }}
+                    aria-label={t("model_select.max_tokens_label")}
+                    data-testid="model-select-max-tokens"
                   />
                   <span
                     style={{
@@ -280,6 +316,51 @@ export function ModelSelect({
                       }}
                     >
                       {t("model_select.effort_hint")}
+                    </span>
+                  </label>
+                )}
+                {(hasThinkingKnob || staleThinkingMax) && (
+                  <label
+                    data-testid="model-select-thinking-max"
+                    style={{ display: "block", marginBottom: 8 }}
+                  >
+                    <span style={{ display: "block", marginBottom: 4 }}>
+                      {t("model_select.thinking_max_label")}
+                    </span>
+                    <InputNumber
+                      value={value.thinking_max_tokens}
+                      min={1}
+                      disabled={!currentEntry?.thinking_cap}
+                      onChange={(v) =>
+                        onChange({ ...value, thinking_max_tokens: v ?? undefined })
+                      }
+                      style={{ width: "100%" }}
+                      aria-label={t("model_select.thinking_max_label")}
+                    />
+                    {staleThinkingMax && (
+                      <Button
+                        type="link"
+                        size="small"
+                        style={{ padding: 0 }}
+                        onClick={() =>
+                          onChange({ ...value, thinking_max_tokens: undefined })
+                        }
+                        data-testid="model-select-thinking-max-clear"
+                      >
+                        {t("model_select.thinking_max_clear")}
+                      </Button>
+                    )}
+                    <span
+                      style={{
+                        display: "block",
+                        marginTop: 4,
+                        fontSize: 12,
+                        color: "var(--ew-text-muted, #888)",
+                      }}
+                    >
+                      {currentEntry?.thinking_cap
+                        ? t("model_select.thinking_max_hint")
+                        : t("model_select.thinking_max_unsupported")}
                     </span>
                   </label>
                 )}

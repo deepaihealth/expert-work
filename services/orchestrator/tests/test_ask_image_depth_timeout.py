@@ -24,8 +24,14 @@ from expert_work.protocol.model_catalog import catalog_entry
 from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.middleware import LLMStreamStaleError
+from expert_work.runtime.middleware.llm_error_handling import (
+    LLMClientError,
+    LLMRateLimitError,
+    LLMUnauthorizedError,
+)
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MiddlewareEnv, ToolEnv, agent_factory, build_agent
+from orchestrator.llm.providers._errors import classify_http_error
 from orchestrator.llm.providers._streaming import LLMDelta, OpenAIStreamAssembler
 from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage
 from orchestrator.tools._guards import TokenBudget
@@ -343,6 +349,11 @@ class _Harness:
     reasoning_first: frozenset[str] = frozenset()
     stream_deadline_s: int | None = None
     main: _Scripted = field(default_factory=lambda: _Scripted(responses=[]))
+    #: B-105 —— 这些模型收到「关思考」payload 时按 ``quick_error`` 拒绝(厂商不认参数)。
+    rejects_quick: frozenset[str] = frozenset()
+    quick_error: Exception = field(
+        default_factory=lambda: LLMClientError("400 invalid parameter: thinking")
+    )
     #: VL 路由的 (first_token_timeout_s, provider_timeout_s)。
     vl_router_timeouts: list[tuple[float | None, float | None]] = field(default_factory=list)
 
@@ -354,7 +365,11 @@ class _Harness:
         self.built_vl.append((entry.name, payload))
         if entry.name in self.stalled or entry.name in self.reasoning_first:
             return _StreamingVL(entry.name, self.answered, stall=entry.name in self.stalled)
-        error = LLMStreamStaleError("hung") if entry.name in self.hung else None
+        error: Exception | None = LLMStreamStaleError("hung") if entry.name in self.hung else None
+        if entry.name in self.rejects_quick and payload == _disable_payload(
+            entry.provider, entry.name
+        ):
+            error = self.quick_error
         return _VLProvider(entry.name, payload, self.answered, error)
 
     async def spy_build_llm_router(self, model: ModelSpec, **kwargs: Any) -> Any:
@@ -475,8 +490,10 @@ async def test_deep_sends_exactly_the_configured_payload(monkeypatch: pytest.Mon
 
     await harness.run(monkeypatch, {"model": configured}, depth="deep")
 
+    # B-105(2026-09-24 实调)—— 豆包档位改走 reasoning_effort(budget_tokens 被厂商
+    # 忽略),不再是 thinking.type=enabled + budget_tokens 的旧形态。
     today = agent_factory._thinking_payload(ModelSpec.model_validate(configured))
-    assert today is not None and today["thinking"]["type"] == "enabled"
+    assert today == {"reasoning_effort": "high"}
     assert harness.answered == [("doubao-seed-2-1-pro-260628", today)]
 
 
@@ -484,8 +501,9 @@ async def test_deep_sends_exactly_the_configured_payload(monkeypatch: pytest.Mon
 @pytest.mark.parametrize(
     "vision_model",
     [
-        # 目录里没有思考开关。
-        {"provider": "qwen", "name": "qwen3-vl-plus"},
+        # 目录里没有思考开关。(B-105 2026-09-24 实调:qwen3-vl-plus 曾是这里的例子,
+        # 但实测它确有思考开关——budget 形态、默认关——换成仍无开关的 glm-4-plus。)
+        {"provider": "glm", "name": "glm-4-plus"},
         # 目录外。
         {"provider": "doubao", "name": "doubao-seed-2-1-pro"},
         # 已配成关思考:quick 与 deep 本来就一样。
@@ -697,3 +715,145 @@ async def test_quick_turns_thinking_off_on_a_nested_model_fallback(
         ("qwen3.6-plus", _disable_payload("qwen", "qwen3.6-plus")),
         ("doubao-seed-2.0-pro", _disable_payload("doubao", "doubao-seed-2.0-pro")),
     ]
+
+
+# ---------------------------------------------------------------------------
+# B-105 —— 快看的「关思考」参数被厂商拒(4xx)时退回正常看图
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Rejects:
+    error: Exception
+    calls: int = 0
+
+    async def __call__(self, **kwargs: Any) -> AIMessage:
+        del kwargs
+        self.calls += 1
+        raise self.error
+
+
+def _quick_fallback_count(model: str) -> float:
+    from prometheus_client import REGISTRY
+
+    value = REGISTRY.get_sample_value("expert_work_vision_quick_fallback_total", {"model": model})
+    return value or 0.0
+
+
+@pytest.mark.asyncio
+async def test_quick_rejected_by_the_vendor_falls_back_to_the_normal_look() -> None:
+    before = _quick_fallback_count("vl-x")
+    quick, deep = _Rejects(LLMClientError("400 bad param")), _Answer("deep answer")
+    meter = _Meter()
+    tool = AskImageTool(
+        vl_caller=deep,
+        image_resolver=_resolver(),
+        quick_vl_caller=quick,
+        usage_meter=meter,
+        vl_model_name="vl-x",
+    )
+
+    result = await tool.call(
+        {"image_ref": _ref(), "question": "q"}, ctx=ToolContext(tenant_id=_TENANT)
+    )
+
+    assert result.content == "deep answer"
+    assert result.meta["depth"] == "quick"
+    assert (quick.calls, deep.calls) == (1, 1)
+    assert len(meter.calls) == 1  # 被拒的那次没有应答,不记账
+    assert _quick_fallback_count("vl-x") == before + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMUnauthorizedError("401"),
+        classify_http_error("qwen", 403, "forbidden"),
+        LLMRateLimitError("429"),
+    ],
+    ids=["unauthorized", "forbidden", "rate_limit"],
+)
+async def test_quick_fallback_skips_auth_and_rate_limit(error: Exception) -> None:
+    # 401 / 403 = 凭据或权限问题,429 = 限流:换成正常看图也一样失败,原样抛出。
+    quick, deep = _Rejects(error), _Answer()
+    tool = AskImageTool(vl_caller=deep, image_resolver=_resolver(), quick_vl_caller=quick)
+
+    with pytest.raises(type(error)):
+        await tool.call({"image_ref": _ref(), "question": "q"}, ctx=ToolContext(tenant_id=_TENANT))
+
+    assert deep.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_deep_client_error_is_not_retried() -> None:
+    # 只有快看退回:deep 本来就是配置原样,再发一次也是同样的 4xx。
+    deep = _Rejects(LLMClientError("400 bad param"))
+    tool = AskImageTool(vl_caller=deep, image_resolver=_resolver(), quick_vl_caller=_Answer())
+
+    with pytest.raises(LLMClientError):
+        await tool.call(
+            {"image_ref": _ref(), "question": "q", "depth": "deep"},
+            ctx=ToolContext(tenant_id=_TENANT),
+        )
+
+    assert deep.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_real_router_surfaces_the_vendor_400_and_the_tool_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 真路由:4xx 不走备用链、原样抛出(不包成 AllProvidersExhaustedError),工具据此退回
+    # deep 路由 —— 同一个模型带着配置原样的思考参数再看一次。
+    before = _quick_fallback_count("qwen3.6-plus")
+    harness = _Harness(rejects_quick=frozenset({"qwen3.6-plus"}))
+    vision = {
+        "model": {"provider": "qwen", "name": "qwen3.6-plus", "thinking_enabled": True},
+        "fallbacks": [{"provider": "doubao", "name": "doubao-seed-2.0-pro"}],
+    }
+
+    content, _ = await harness.run(monkeypatch, vision, depth=None)
+
+    # 计数器标签是 factory 从 vision 块接进来的看图主模型名。
+    assert _quick_fallback_count("qwen3.6-plus") == before + 1
+
+    # 输出被 spotlight 围栏改写,只比模型名
+    assert "qwen3.6-plus" in content and "tool error" not in content
+    assert [name for name, _ in harness.answered] == ["qwen3.6-plus", "qwen3.6-plus"]
+    assert harness.answered[0][1] == _disable_payload("qwen", "qwen3.6-plus")
+    assert harness.answered[1][1] != harness.answered[0][1]
+
+
+@pytest.mark.asyncio
+async def test_real_router_401_on_the_quick_look_is_not_retried_as_deep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 真路由把 401 当 key 级错误轮完整条链后包成 AllProvidersExhaustedError —— 不是
+    # LLMClientError,不触发退回。
+    harness = _Harness(
+        rejects_quick=frozenset({"qwen3.6-plus"}), quick_error=LLMUnauthorizedError("401")
+    )
+    vision = {"model": {"provider": "qwen", "name": "qwen3.6-plus", "thinking_enabled": True}}
+
+    content, _ = await harness.run(monkeypatch, vision, depth=None)
+
+    assert "tool error" in content and "AllProvidersExhaustedError" in content
+    assert [name for name, _ in harness.answered] == ["qwen3.6-plus"]
+
+
+@pytest.mark.asyncio
+async def test_real_router_403_on_the_quick_look_is_not_retried_as_deep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 真路由对 403(非欠费形态)按 4xx 原样抛出;状态码随异常一路带到工具层,不退回。
+    harness = _Harness(
+        rejects_quick=frozenset({"qwen3.6-plus"}),
+        quick_error=classify_http_error("qwen", 403, "forbidden"),
+    )
+    vision = {"model": {"provider": "qwen", "name": "qwen3.6-plus", "thinking_enabled": True}}
+
+    content, _ = await harness.run(monkeypatch, vision, depth=None)
+
+    assert "tool error" in content and "403" in content
+    assert [name for name, _ in harness.answered] == ["qwen3.6-plus"]

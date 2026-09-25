@@ -12,6 +12,13 @@ provider's official docs — do NOT carry stale names. Mark retired models
 
 Last verified: 2026-08 (glm/qwen additions) against each provider's official
 API docs; other providers 2026-07.
+
+B-105 上架规矩(2026-09-24 测试集群实调建立)—— 新增或修改带思考 / 视觉能力的模型,
+提交前必须在条目上写明:思考形态(``thinking``)、默认开关(``thinking_default`` /
+``always_thinking``)、``output_cap_field``、``max_output_tokens``,并用实调探针
+核过再合并(开思考 + cap=300、关思考、cap=10,000,000;探针模板见 spec §8)。
+``output_cap_field`` / ``max_output_tokens`` 设错在 GLM / DeepSeek 上是**静默的**
+(200 正常返回,上限不生效)——厂商文档与既有假设都靠不住,只认实调结果。
 """
 
 from __future__ import annotations
@@ -87,6 +94,18 @@ class ModelEntry(BaseModel):
     # stay None until their allowed_tools passthrough is individually
     # verified against official docs.
     tool_disclosure: Literal["native_search", "allowed_tools"] | None = None
+    # B-105 —— 请求里用哪个字段表示「思考 + 回答合计」的输出上限(2026-09-24 测试集群实调)。
+    #   "max_tokens" / "max_completion_tokens" —— 该字段就是合计上限;
+    #   "split" —— 没有合计字段(max_tokens 只管回答):开思考时发 thinking_budget=T、
+    #              max_tokens=cap-T 拼出合计,关思考时发 max_tokens=cap。
+    # **设错在 GLM / DeepSeek 上是静默的**(200 正常返回,上限不生效),改这里必须实调。
+    output_cap_field: Literal["max_tokens", "max_completion_tokens", "split"] = "max_tokens"
+    # B-105 —— 厂商接受的输出上限最大值(实调:发超大值看报错给的范围)。None = 厂商不报范围,不校验。
+    max_output_tokens: int | None = None
+    # B-105 —— 支持独立的思考长度硬上限(通义 thinking_budget,实调:设 200 思考停在 200 后照常作答)。
+    thinking_cap: bool = False
+    # B-105 —— 平台档位 → 厂商档位取值;缺的键按平台档位原样发。None = 全部原样。
+    effort_map: dict[str, str] | None = None
 
 
 #: Provider → its models. Verify names/capabilities against official docs when
@@ -109,6 +128,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking_default=True,
             sampling=False,
             tool_disclosure="native_search",
+            # B-105(按文档,未实调:测试环境没有 Anthropic key)—— ``max_tokens`` 就是
+            # 合计输出上限。
+            output_cap_field="max_tokens",
         ),
         ModelEntry(
             name="claude-sonnet-4-6",
@@ -134,6 +156,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking="effort",
             thinking_default=True,
             tool_disclosure="allowed_tools",
+            # B-105(按文档,未实调:测试环境没有 OpenAI key)—— OpenAI 用 max_completion_tokens
+            # 记合计上限。
+            output_cap_field="max_completion_tokens",
         ),
         ModelEntry(
             name="gpt-5.5-pro",
@@ -142,6 +167,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking="effort",
             thinking_default=True,
             tool_disclosure="allowed_tools",
+            output_cap_field="max_completion_tokens",
         ),
         ModelEntry(
             name="gpt-5.4-mini",
@@ -150,6 +176,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking="effort",
             thinking_default=True,
             tool_disclosure="allowed_tools",
+            output_cap_field="max_completion_tokens",
         ),
         ModelEntry(name="text-embedding-3-large", embeddings=True),
         ModelEntry(name="gpt-4o", vision=True, context_window=128_000, deprecated=True),
@@ -169,6 +196,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="effort",
             thinking_default=True,
+            # B-105(2026-09-24 实调)—— max_tokens 合计上限,厂商上限 393_216。
+            output_cap_field="max_tokens",
+            max_output_tokens=393_216,
         ),
         ModelEntry(
             name="deepseek-v4-flash",
@@ -176,6 +206,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="effort",
             thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=393_216,
         ),
         ModelEntry(name="deepseek-chat", vision=False, context_window=64_000, deprecated=True),
         ModelEntry(name="deepseek-reasoner", vision=False, context_window=64_000, deprecated=True),
@@ -202,6 +234,10 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking="effort",
             thinking_default=True,
             temperature_fixed=1.0,
+            # B-105(2026-09-24 实调)—— kimi 用 max_completion_tokens 记合计上限;
+            # K3 的 reasoning_effort 是 low/high/max 三档(无 medium),medium 顶到 high。
+            output_cap_field="max_completion_tokens",
+            effort_map={"medium": "high"},
         ),
         ModelEntry(
             name="kimi-k2.6",
@@ -209,6 +245,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=256_000,
             thinking="toggle",
             thinking_default=True,
+            output_cap_field="max_completion_tokens",
         ),
         ModelEntry(
             name="kimi-k2.5",
@@ -216,6 +253,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=256_000,
             thinking="toggle",
             thinking_default=True,
+            output_cap_field="max_completion_tokens",
         ),
         ModelEntry(name="moonshot-v1-128k", vision=False, context_window=128_000, deprecated=True),
         ModelEntry(name="moonshot-v1-32k", vision=False, context_window=32_000, deprecated=True),
@@ -245,6 +283,12 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="effort",
             thinking_default=True,
+            # B-105(2026-09-24 实调)—— 关思考(thinking.type=disabled)是 400「该模型
+            # 始终思考」,与 5.3-flash 一样是 always_thinking;关思考落到最低档。
+            always_thinking=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
+            effort_map={"medium": "high"},
         ),
         ModelEntry(
             name="glm-5.3-flash",
@@ -253,6 +297,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking="effort",
             thinking_default=True,
             always_thinking=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
+            effort_map={"medium": "high"},
         ),
         ModelEntry(
             name="glm-5.2",
@@ -260,6 +307,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="effort",
             thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
+            effort_map={"medium": "high"},
         ),
         ModelEntry(
             name="glm-5.1",
@@ -267,6 +317,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=200_000,
             thinking="toggle",
             thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
         ),
         ModelEntry(
             name="glm-4.7",
@@ -274,6 +326,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=200_000,
             thinking="toggle",
             thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
         ),
         ModelEntry(
             name="glm-4.6",
@@ -281,6 +335,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=200_000,
             thinking="toggle",
             thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
         ),
         ModelEntry(
             name="glm-5v-turbo",
@@ -288,9 +344,28 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=200_000,
             thinking="toggle",
             thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
         ),
-        ModelEntry(name="glm-4.6v", vision=True, context_window=128_000),
-        ModelEntry(name="glm-4.5v", vision=True),
+        ModelEntry(
+            name="glm-4.6v",
+            vision=True,
+            context_window=128_000,
+            # B-105(2026-09-24 实调)—— 实际默认思考、disabled 有效(与旧注释「无思考」
+            # 不符,以实调为准)。
+            thinking="toggle",
+            thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=32_768,
+        ),
+        ModelEntry(
+            name="glm-4.5v",
+            vision=True,
+            thinking="toggle",
+            thinking_default=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=16_384,
+        ),
         # Platform embedding model (Stream T, user-specified).
         ModelEntry(name="embedding-3", embeddings=True),
         ModelEntry(name="glm-4-plus", vision=False, context_window=128_000, deprecated=True),
@@ -313,6 +388,10 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="budget",
             thinking_default=True,
+            # B-105(2026-09-24 实调)—— 通义用 max_completion_tokens 记合计上限,
+            # thinking_budget 是独立的思考长度硬上限(设 200 思考停在 200 后照常作答)。
+            output_cap_field="max_completion_tokens",
+            thinking_cap=True,
         ),
         ModelEntry(
             name="qwen3.7-max",
@@ -320,6 +399,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="budget",
             thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            thinking_cap=True,
         ),
         ModelEntry(
             name="qwen3.6-plus",
@@ -327,11 +408,46 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             context_window=1_000_000,
             thinking="budget",
             thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            thinking_cap=True,
         ),
-        ModelEntry(name="qwen3.5-plus", vision=True, thinking="budget", thinking_default=True),
-        ModelEntry(name="qwen3-max", vision=False, thinking="budget", thinking_default=True),
-        ModelEntry(name="qwen3-vl-plus", vision=True),
-        ModelEntry(name="qwen3-vl-flash", vision=True),
+        ModelEntry(
+            name="qwen3.5-plus",
+            vision=True,
+            thinking="budget",
+            thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            thinking_cap=True,
+        ),
+        ModelEntry(
+            name="qwen3-max",
+            vision=False,
+            thinking="budget",
+            # B-105(2026-09-24 实调)—— 不带思考开关时 reasoning_tokens=null:默认不思考,
+            # enable_thinking 是真的开启项(与 qwen3-vl-* 同形)。旧值 True 是错的。
+            thinking_default=False,
+            # B-105 —— 没有合计字段,拼合计走 "split"(见 ModelEntry.output_cap_field)。
+            output_cap_field="split",
+            thinking_cap=True,
+        ),
+        ModelEntry(
+            name="qwen3-vl-plus",
+            vision=True,
+            # B-105(2026-09-24 实调)—— 目录旧结论「没有思考开关」是错的:实际默认不
+            # 思考、enable_thinking 有效,与其它通义模型同形。
+            thinking="budget",
+            thinking_default=False,
+            output_cap_field="split",
+            thinking_cap=True,
+        ),
+        ModelEntry(
+            name="qwen3-vl-flash",
+            vision=True,
+            thinking="budget",
+            thinking_default=False,
+            output_cap_field="split",
+            thinking_cap=True,
+        ),
         # Platform embedding model (Stream T, user-specified).
         ModelEntry(name="text-embedding-v4", embeddings=True),
         # Platform rerank model (Stream T, user-specified).
@@ -343,27 +459,37 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # Seed 2.1 (doubao-seed-2-1-pro-260628, dated model ID) is the current
     # flagship; Seed 2.0 family stays. All tiers support vision and 256K
     # context. Older doubao-*-32k series superseded.
+    # B-105(2026-09-24 实调)—— ``thinking.budget_tokens`` 被厂商忽略(200 正常返回,
+    # 思考长度不受限),真正生效的档位控制是 ``reasoning_effort`` → shape "effort";
+    # 厂商档位 minimal/low/medium/high 实调都有效、没有 max,effort_map 把 max 顶到 high。
     "doubao": (
         ModelEntry(
             name="doubao-seed-2-1-pro-260628",
             vision=True,
             context_window=256_000,
-            thinking="budget",
+            thinking="effort",
             thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            max_output_tokens=262_144,
+            effort_map={"max": "high"},
         ),
         ModelEntry(
             name="doubao-seed-2.0-pro",
             vision=True,
             context_window=256_000,
-            thinking="budget",
+            thinking="effort",
             thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            effort_map={"max": "high"},
         ),
         ModelEntry(
             name="doubao-seed-2.0-lite",
             vision=True,
             context_window=256_000,
-            thinking="budget",
+            thinking="effort",
             thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            effort_map={"max": "high"},
         ),
         ModelEntry(name="doubao-pro-32k", vision=False, context_window=32_000, deprecated=True),
         ModelEntry(

@@ -125,6 +125,55 @@ def test_configuring_a_binding_does_change_the_digest() -> None:
     )
 
 
+# B-105 —— ``max_tokens`` 变可空、空值不落库;指纹的规范形态仍是 B-105 之前那样:
+# 空上限按旧默认 4096 算,空的 ``thinking_max_tokens`` 不出现。
+
+
+def _digest_with_model(model: dict[str, Any]) -> str:
+    raw = _stored()
+    raw["spec"]["model"] = model
+    return compute_spec_sha256(AgentSpec.model_validate(raw))
+
+
+@pytest.mark.parametrize("provider,name", [("anthropic", "claude-sonnet-4-6"), ("glm", "glm-5.3")])
+def test_an_unset_cap_hashes_like_an_explicit_4096(provider: str, name: str) -> None:
+    unset = _digest_with_model({"provider": provider, "name": name})
+    assert unset == _digest_with_model({"provider": provider, "name": name, "max_tokens": 4096})
+    assert unset != _digest_with_model({"provider": provider, "name": name, "max_tokens": 8000})
+
+
+def test_setting_a_thinking_cap_changes_the_digest() -> None:
+    model = {"provider": "qwen", "name": "qwen3-max"}
+    assert _digest_with_model(model) != _digest_with_model({**model, "thinking_max_tokens": 2000})
+
+
+def test_fallback_nodes_follow_the_same_digest_rule() -> None:
+    def with_fallback(fallback: dict[str, Any]) -> str:
+        return _digest_with_model(
+            {"provider": "anthropic", "name": "claude-sonnet-4-6", "fallback": [fallback]}
+        )
+
+    unset = with_fallback({"provider": "anthropic", "name": "claude-haiku-4-5"})
+    explicit = {"provider": "anthropic", "name": "claude-haiku-4-5", "max_tokens": 4096}
+    assert unset == with_fallback(explicit)
+    assert unset != with_fallback({**explicit, "max_tokens": 8000})
+    assert unset != with_fallback(
+        {"provider": "anthropic", "name": "claude-haiku-4-5", "thinking_max_tokens": 2000}
+    )
+
+
+def test_the_persisted_dump_still_omits_unset_caps() -> None:
+    """规范形态只在算指纹时生效;存库的 dump 照旧省略两个空上限(回滚安全)。"""
+    raw = _stored()
+    raw["spec"]["model"]["fallback"] = [{"provider": "qwen", "name": "qwen3-max"}]
+    spec = AgentSpec.model_validate(raw)
+    compute_spec_sha256(spec)
+    model = spec.model_dump(by_alias=True, mode="json")["spec"]["model"]
+    for node in (model, model["fallback"][0]):
+        assert "max_tokens" not in node
+        assert "thinking_max_tokens" not in node
+
+
 # ---------------------------------------------------------------------------
 # 读回宽容
 # ---------------------------------------------------------------------------

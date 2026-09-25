@@ -115,6 +115,7 @@ from expert_work.runtime.middleware import (
     MiddlewareChain,
     MiddlewareContext,
 )
+from expert_work.runtime.middleware.llm_cache import SKIP_STORE_KEY
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
 from orchestrator.context import (
     CompactionStats,
@@ -161,6 +162,13 @@ from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
+from orchestrator.llm.truncation import (
+    OutputTruncatedError,
+    ServedOutputCap,
+    is_truncated,
+    is_unusable_truncation,
+    output_truncated_total,
+)
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
@@ -557,6 +565,10 @@ def build_react_graph(
     # keeps every path byte-identical to pre-PR-3 behaviour. See the
     # finalization block inside ``agent_node`` for the enforcement mechanism.
     output_schema: StructuredOutputSpec | None = None,
+    # B-105 —— 响应 → 实际应答模型的 ``(provider, model, 输出上限)``,只用于截断报错
+    # 文案里的上限与计数器标签(按路由盖的章认出备用接管)。不接线(单测 / 子图)= 照常
+    # 判截断,标签为空、文案里的上限写「厂商默认值」。
+    output_cap_resolver: ServedOutputCap | None = None,
 ) -> StateGraph[AgentState, None, AgentState, AgentState]:
     """Assemble the ReAct ``StateGraph`` and return it uncompiled.
 
@@ -1183,6 +1195,19 @@ def build_react_graph(
         # to END rather than back into the (already-spent) loop.
         if budget_exhausted and _extract_tool_calls(response):
             response = response.model_copy(update={"tool_calls": [], "invalid_tool_calls": []})
+
+        # B-105 —— 截断:答案不可用就让 run 可见地失败(在路由之后,不触发 fallback);
+        # 正文可用照常交付,只计数。缓存命中的旧回答不再判(存进缓存前已判过)。放在收尾轮
+        # 剥工具调用之后:那些调用本来就要丢,剥完剩可用正文就不算不可用。
+        if cache_hit_response is None and is_truncated(response):
+            await _check_truncation(
+                response,
+                prompt=messages,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                after_llm_chain=after_llm_chain,
+                resolver=output_cap_resolver,
+            )
 
         # Stream RT-1 PR-3 (RT-ADR-4) — structured finalization. Only a
         # terminal candidate (no tool_calls) is constrained; tool-calling
@@ -1968,6 +1993,44 @@ def build_react_graph(
     # not finished). Otherwise the normal ReAct loop continues to ``agent``.
     graph.add_conditional_edges("tools", _after_tools, {"agent": "agent", END: END})
     return graph
+
+
+async def _check_truncation(
+    response: AIMessage,
+    *,
+    prompt: Sequence[BaseMessage],
+    tenant_id: UUID | None,
+    user_id: UUID | None,
+    after_llm_chain: MiddlewareChain | None,
+    resolver: ServedOutputCap | None,
+) -> None:
+    """B-105 —— 被截断的回答:可用就计数放行;不可用就记账后抛 :class:`OutputTruncatedError`。
+
+    不可用时这次调用照样计费(常常整个上限都花在思考上),所以先跑一遍 after-chain 让
+    ``TokenUsageMiddleware`` 按正常主循环口径落用量,但带 :data:`SKIP_STORE_KEY`,坏回答
+    不进响应缓存。
+    """
+    provider, model, cap = resolver(response) if resolver is not None else ("", "", None)
+    usable = not is_unusable_truncation(response)
+    output_truncated_total.labels(provider=provider, model=model, usable=str(usable).lower()).inc()
+    if usable:
+        logger.warning("agent_node.output_truncated_usable model=%s", model)
+        return
+    if after_llm_chain is not None:
+        prompt_messages = list(prompt)
+        ctx = MiddlewareContext(
+            payload={
+                "messages": [*prompt_messages, response],
+                "response": response,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "prompt_messages": prompt_messages,
+                "cache_hit": False,
+                SKIP_STORE_KEY: True,
+            }
+        )
+        await after_llm_chain.invoke(ctx, _noop)
+    raise OutputTruncatedError(cap)
 
 
 def _after_reflect(state: AgentState) -> Literal["agent", "__end__"]:

@@ -1039,13 +1039,22 @@ def _from_anthropic_response(body: Mapping[str, Any]) -> AIMessage:
                 )
 
     usage_metadata = _extract_usage_metadata(body)
+    # B-105 —— 截断判定(``orchestrator.llm.truncation``)读 ``stop_reason``;
+    # 流式 assembler 把 message_delta 里的同一个值放回 body,两条路同形。
+    stop_reason = body.get("stop_reason")
+    response_metadata: dict[str, Any] = (
+        {"stop_reason": stop_reason} if isinstance(stop_reason, str) and stop_reason else {}
+    )
     if usage_metadata:
         return AIMessage(
             content="".join(text_parts),
             tool_calls=tool_calls,
             usage_metadata=usage_metadata,
+            response_metadata=response_metadata,
         )
-    return AIMessage(content="".join(text_parts), tool_calls=tool_calls)
+    return AIMessage(
+        content="".join(text_parts), tool_calls=tool_calls, response_metadata=response_metadata
+    )
 
 
 def _extract_usage_metadata(body: Mapping[str, Any]) -> dict[str, Any] | None:

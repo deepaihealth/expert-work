@@ -1534,11 +1534,10 @@ def test_thinking_payload_budget_vendors() -> None:
 
     qwen = _thinking_payload(_vendor_model("qwen", "qwen3.7-max", effort="high", max_tokens=10_000))
     assert qwen == {"enable_thinking": True, "thinking_budget": 8_000}
-    doubao = _thinking_payload(
-        _vendor_model("doubao", "doubao-seed-2.0-pro", effort="low", max_tokens=4_096)
-    )
-    # 4096 x 0.2 = 819 → clamped up to the 1024 floor.
-    assert doubao == {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+    # B-105(2026-09-24 实调)—— doubao ``budget_tokens`` 被厂商忽略,档位改走
+    # reasoning_effort(不再算 max_tokens 比例);"budget" 分支此后只剩通义。
+    doubao = _thinking_payload(_vendor_model("doubao", "doubao-seed-2.0-pro", effort="low"))
+    assert doubao == {"reasoning_effort": "low"}
     # adaptive-only: qwen opens thinking without a budget; doubao uses auto.
     assert _thinking_payload(_vendor_model("qwen", "qwen3.7-max", adaptive_thinking=True)) == {
         "enable_thinking": True
@@ -1587,18 +1586,21 @@ def test_thinking_payload_glm_52_plus_effort_levels() -> None:
 
 
 def test_thinking_payload_glm_52_plus_toggle_semantics_kept() -> None:
+    # (B-105 2026-09-24 实调: glm-5.2 replaces glm-5.3 here — glm-5.3 turned out
+    # to ALSO be always_thinking, so its "real off" degraded to a floor instead;
+    # see test_glm_53_off_floors_at_low_instead_of_400.)
     from orchestrator.agent_factory import _thinking_payload
 
     # Force-on with no effort keeps the bare toggle; force-off is a REAL
     # off — GLM has no "minimal", it must not degrade like other effort
     # vendors. Untouched manifests still send nothing (vendor default).
-    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=True)) == {
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2", thinking_enabled=True)) == {
         "thinking": {"type": "enabled"}
     }
-    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=False)) == {
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2", thinking_enabled=False)) == {
         "thinking": {"type": "disabled"}
     }
-    assert _thinking_payload(_vendor_model("glm", "glm-5.3")) is None
+    assert _thinking_payload(_vendor_model("glm", "glm-5.2")) is None
 
 
 def test_thinking_payload_glm_53_flash_always_thinking() -> None:
@@ -1658,13 +1660,73 @@ def test_thinking_payload_kimi_k3_effort_levels() -> None:
 
 
 # ---------------------------------------------------------------------------
+# B-105 — catalog-declared output-cap field / effort_map / thinking_max_tokens
+# ---------------------------------------------------------------------------
+
+
+def test_doubao_effort_goes_to_reasoning_effort() -> None:
+    # B-105(2026-09-24 实调)—— budget_tokens 被厂商忽略,豆包档位改走 reasoning_effort。
+    from orchestrator.agent_factory import _thinking_payload
+
+    m = "doubao-seed-2-1-pro-260628"
+    assert _thinking_payload(_vendor_model("doubao", m, effort="low")) == {
+        "reasoning_effort": "low"
+    }
+    assert _thinking_payload(_vendor_model("doubao", m, effort="max")) == {
+        "reasoning_effort": "high"
+    }
+    # 关思考仍是真关(实测 thinking.type=disabled 思考 0)。
+    assert _thinking_payload(_vendor_model("doubao", m, thinking_enabled=False)) == {
+        "thinking": {"type": "disabled"}
+    }
+
+
+def test_glm_53_off_floors_at_low_instead_of_400() -> None:
+    # B-105(2026-09-24 实调)—— glm-5.3 关思考(thinking.type=disabled)是 400,
+    # 与 5.3-flash 一样是 always_thinking,关思考落到最低档而不是真关。
+    from orchestrator.agent_factory import _thinking_payload
+
+    assert _thinking_payload(_vendor_model("glm", "glm-5.3", thinking_enabled=False)) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "low",
+    }
+
+
+def test_qwen_thinking_max_tokens_is_the_budget() -> None:
+    from orchestrator.agent_factory import _thinking_payload
+
+    payload = _thinking_payload(
+        _vendor_model("qwen", "qwen3.8-max", effort="low", thinking_max_tokens=2000)
+    )
+    assert payload == {"enable_thinking": True, "thinking_budget": 2000}
+    # 只填思考上限、没设档位 = 开思考并限长。
+    assert _thinking_payload(_vendor_model("qwen", "qwen3.8-max", thinking_max_tokens=500)) == {
+        "enable_thinking": True,
+        "thinking_budget": 500,
+    }
+
+
+def test_thinking_max_tokens_rejected_where_unsupported() -> None:
+    with pytest.raises(AgentFactoryError, match="只能调思考档位"):
+        _build_provider(_vendor_model("glm", "glm-5.3", thinking_max_tokens=1000), "k")
+    with pytest.raises(AgentFactoryError, match="只能调思考档位"):
+        _build_provider(_anthropic_model(thinking_max_tokens=1000), "k")
+    # 目录外不闸(能力未知,和 effort 闸门同一口径),但也不发。
+    ok = _build_provider(_vendor_model("qwen", "custom-gw", thinking_max_tokens=1000), "k")
+    assert isinstance(ok, OpenAIProvider) and ok.thinking_payload is None
+
+
+# ---------------------------------------------------------------------------
 # Stream CM-10 PR3 — gate + thinking payload wiring for compat vendors
 # ---------------------------------------------------------------------------
 
 
 def test_compat_effort_on_unsupported_model_fails_fast() -> None:
-    # qwen3-vl-plus is in-catalog with no thinking control.
-    model = _vendor_model("qwen", "qwen3-vl-plus", effort="high")
+    # glm-4-plus is in-catalog with no thinking control. (B-105 2026-09-24 实调:
+    # qwen3-vl-plus used to be the "no knob" example here, but the live probe
+    # found it DOES support thinking (budget shape, default off) — it moved to
+    # test_catalog_corrections_from_live_probe / test_qwen_thinking_max_tokens_*.)
+    model = _vendor_model("glm", "glm-4-plus", effort="high")
     with pytest.raises(AgentFactoryError, match="thinking-depth control"):
         _build_provider(model, "k")
 
@@ -1819,8 +1881,10 @@ def test_thinking_payload_force_on_per_vendor() -> None:
 
 def test_thinking_toggle_gate_on_no_knob_model() -> None:
     # in-catalog model with no thinking knob rejects thinking_enabled (compat).
+    # (B-105 2026-09-24 实调: qwen3-vl-plus moved off this list — it now has a
+    # real thinking knob, default off — glm-4-plus replaces it here.)
     with pytest.raises(AgentFactoryError, match="no thinking toggle"):
-        _build_provider(_vendor_model("qwen", "qwen3-vl-plus", thinking_enabled=False), "k")
+        _build_provider(_vendor_model("glm", "glm-4-plus", thinking_enabled=False), "k")
     # anthropic path too (haiku has no knob).
     with pytest.raises(AgentFactoryError, match="no thinking toggle"):
         _build_provider(_anthropic_model(name="claude-haiku-4-5", thinking_enabled=True), "k")
@@ -2074,3 +2138,209 @@ async def test_output_schema_deep_invalid_schema_fails_the_build() -> None:
     async with make_checkpointer("memory") as cp:
         with pytest.raises(AgentFactoryError, match="not a valid JSON Schema"):
             await _build(bad, secret_store=_secret_store(), checkpointer=cp)
+
+
+# ---------------------------------------------------------------------------
+# B-105 —— 输出上限(含思考)按目录字段发送
+# ---------------------------------------------------------------------------
+
+
+def _cap_payload(provider: str, name: str, **kw: Any) -> dict[str, Any] | None:
+    p = _build_provider(_vendor_model(provider, name, **kw), "k")
+    assert isinstance(p, OpenAIProvider)
+    return p.output_cap_payload
+
+
+def test_no_cap_sends_nothing_on_every_compat_vendor() -> None:
+    for provider, name in (
+        ("glm", "glm-5.3"),
+        ("deepseek", "deepseek-v4-pro"),
+        ("kimi", "kimi-k3"),
+        ("qwen", "qwen3.8-max"),
+        ("qwen", "qwen3-max"),
+        ("doubao", "doubao-seed-2-1-pro-260628"),
+        ("openai", "gpt-5.5"),
+    ):
+        assert _cap_payload(provider, name) is None, name
+
+
+def test_cap_goes_to_the_catalog_field_only() -> None:
+    assert _cap_payload("glm", "glm-5.3", max_tokens=8000) == {"max_tokens": 8000}
+    assert _cap_payload("deepseek", "deepseek-v4-pro", max_tokens=8000) == {"max_tokens": 8000}
+    assert _cap_payload("qwen", "qwen3.8-max", max_tokens=8000) == {"max_completion_tokens": 8000}
+    doubao = _cap_payload("doubao", "doubao-seed-2-1-pro-260628", max_tokens=8000)
+    assert doubao == {"max_completion_tokens": 8000}  # 绝不同时带 max_tokens(实测 400)
+    assert _cap_payload("kimi", "kimi-k3", max_tokens=8000) == {"max_completion_tokens": 8000}
+    assert _cap_payload("openai", "gpt-5.5", max_tokens=8000) == {"max_completion_tokens": 8000}
+    # 目录外:openai / azure 按 OpenAI 语义,其余 max_tokens。
+    assert _cap_payload("qwen", "custom-gw", max_tokens=8000) == {"max_tokens": 8000}
+    assert _cap_payload("openai", "my-ft-model", max_tokens=8000) == {"max_completion_tokens": 8000}
+
+
+def test_azure_off_catalog_cap_uses_max_completion_tokens() -> None:
+    assert _cap_payload(
+        "azure",
+        "my-deployment",
+        max_tokens=8000,
+        base_url="https://r.openai.azure.com",
+        azure_deployment="d",
+        azure_api_version="2024-10-21",
+    ) == {"max_completion_tokens": 8000}
+
+
+def test_split_without_cap_sends_nothing() -> None:
+    assert _cap_payload("qwen", "qwen3-max", thinking_enabled=True) is None
+
+
+def test_split_with_thinking_on_sums_to_cap() -> None:
+    # 用户填了思考上限:T=2000,回答=cap-T。
+    assert _cap_payload(
+        "qwen",
+        "qwen3-max",
+        max_tokens=10_000,
+        thinking_enabled=True,
+        thinking_max_tokens=2000,
+    ) == {"max_tokens": 8000, "thinking_budget": 2000}
+    # 没填思考上限:T=cap x 档位比例(没设档位按 high 0.8)。
+    assert _cap_payload("qwen", "qwen3-vl-plus", max_tokens=10_000, thinking_enabled=True) == {
+        "max_tokens": 2000,
+        "thinking_budget": 8000,
+    }
+    assert _cap_payload("qwen", "qwen3-vl-plus", max_tokens=10_000, effort="low") == {
+        "max_tokens": 8000,
+        "thinking_budget": 2000,
+    }
+
+
+def test_split_untouched_qwen3_max_is_plain_max_tokens() -> None:
+    # qwen3-max 实调默认不思考(不带开关 reasoning_tokens=null):未碰开关 = 关,
+    # 整个上限都给回答,不许按「默认思考」拆走 80%。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=10_000) == {"max_tokens": 10_000}
+
+
+def test_split_thinking_never_inferred_from_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 即使目录把某个 split 模型标成默认思考,未碰开关也不拆预算 —— 口径只认思考翻译
+    # 真发了 enable_thinking(与目录值解耦,目录再标错也不会静默压缩回答)。
+    from expert_work.protocol.model_catalog import catalog_entry
+
+    base = catalog_entry("qwen", "qwen3-max")
+    assert base is not None
+    lying = base.model_copy(update={"thinking_default": True})
+    monkeypatch.setattr("orchestrator.agent_factory.catalog_entry", lambda provider, name: lying)
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=10_000) == {"max_tokens": 10_000}
+
+
+def test_split_budget_is_clamped() -> None:
+    # 预算夹在通义上限 81920 内,不再是 cap x 0.8 = 160000。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=200_000, thinking_enabled=True) == {
+        "max_tokens": 118_080,
+        "thinking_budget": 81_920,
+    }
+    # 下限 1024:low 档 1200 x 0.2=240 抬到 1024。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=1200, effort="low") == {
+        "max_tokens": 176,
+        "thinking_budget": 1024,
+    }
+
+
+def test_split_cap_too_small_for_derived_budget_is_rejected() -> None:
+    with pytest.raises(AgentFactoryError, match="输出上限太小,放不下思考预算"):
+        _build_provider(
+            _vendor_model("qwen", "qwen3-max", max_tokens=1000, thinking_enabled=True), "k"
+        )
+    # 思考关着时没有预算,小上限照常。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=1000) == {"max_tokens": 1000}
+
+
+def test_split_with_thinking_off_is_plain_max_tokens() -> None:
+    assert _cap_payload("qwen", "qwen3-vl-flash", max_tokens=3000, thinking_enabled=False) == {
+        "max_tokens": 3000
+    }
+    # qwen3-vl 默认不思考(thinking_default=False),未碰开关 = 关。
+    assert _cap_payload("qwen", "qwen3-vl-flash", max_tokens=3000) == {"max_tokens": 3000}
+
+
+def test_split_thinking_cap_must_be_below_output_cap() -> None:
+    with pytest.raises(AgentFactoryError, match="思考长度上限必须小于输出上限"):
+        _build_provider(
+            _vendor_model(
+                "qwen",
+                "qwen3-max",
+                max_tokens=2000,
+                thinking_enabled=True,
+                thinking_max_tokens=2000,
+            ),
+            "k",
+        )
+
+
+def test_thinking_cap_must_be_below_output_cap_on_every_thinking_cap_model() -> None:
+    """B-105 —— 不只 split:目录 ``thinking_cap=True`` 的合计字段模型(qwen3.8-max 等)思考
+    开着时,思考上限 ≥ 输出上限同样拦(输出上限含思考,回答没有空间)。"""
+    for name in ("qwen3.8-max", "qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus"):
+        with pytest.raises(AgentFactoryError, match="思考长度上限必须小于输出上限"):
+            _build_provider(
+                _vendor_model("qwen", name, max_tokens=2000, thinking_max_tokens=2000), "k"
+            )
+
+
+def test_thinking_cap_not_checked_when_thinking_explicitly_off() -> None:
+    """显式关了思考就不发思考上限,两者大小无所谓,不拦。"""
+    for name in ("qwen3-max", "qwen3-vl-flash", "qwen3.7-max"):
+        _build_provider(
+            _vendor_model(
+                "qwen",
+                name,
+                max_tokens=2000,
+                thinking_enabled=False,
+                thinking_max_tokens=4000,
+            ),
+            "k",
+        )
+
+
+def test_cap_above_vendor_max_is_rejected() -> None:
+    with pytest.raises(AgentFactoryError, match="16384"):
+        _build_provider(_vendor_model("glm", "glm-4.5v", max_tokens=20_000), "k")
+    # 恰好等于厂商上限放行。
+    assert _cap_payload("glm", "glm-4.5v", max_tokens=16_384) == {"max_tokens": 16_384}
+    # 无公布上限的模型不校验。
+    assert _cap_payload("kimi", "kimi-k3", max_tokens=5_000_000) == {
+        "max_completion_tokens": 5_000_000
+    }
+
+
+def test_anthropic_empty_cap_keeps_4096() -> None:
+    p = _build_provider(_anthropic_model(max_tokens=None), "k")
+    assert isinstance(p, AnthropicProvider) and p.max_tokens == 4096
+    p = _build_provider(_anthropic_model(max_tokens=20_000), "k")
+    assert isinstance(p, AnthropicProvider) and p.max_tokens == 20_000
+
+
+def test_fallback_nodes_use_their_own_cap_field() -> None:
+    from expert_work.protocol.model_catalog import catalog_entry
+    from orchestrator.agent_factory import _output_cap_payload
+
+    primary = _vendor_model(
+        "glm",
+        "glm-5.3",
+        max_tokens=9000,
+        fallback=[{"provider": "qwen", "name": "qwen3.8-max", "max_tokens": 9000}],
+    )
+    fb = primary.fallback[0]
+    assert _output_cap_payload(primary, catalog_entry("glm", "glm-5.3")) == {"max_tokens": 9000}
+    assert _output_cap_payload(fb, catalog_entry("qwen", "qwen3.8-max")) == {
+        "max_completion_tokens": 9000
+    }
+
+
+def test_qwen_budget_without_output_cap_uses_budget_ceiling_as_base() -> None:
+    """B-105 —— 没设输出上限(厂商默认)时按 81920 x 档位比例推预算,不再按旧默认 4096。"""
+    from orchestrator.agent_factory import _thinking_payload
+
+    assert _thinking_payload(_vendor_model("qwen", "qwen3.7-max", effort="high")) == {
+        "enable_thinking": True,
+        "thinking_budget": 65_536,
+    }

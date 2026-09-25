@@ -137,6 +137,7 @@ from orchestrator.llm import (
     make_qwen_client,
     make_self_hosted_client,
 )
+from orchestrator.llm.truncation import ANTHROPIC_DEFAULT_MAX_TOKENS, served_output_cap
 from orchestrator.middleware_assembly import MiddlewareEnv, build_middleware_chains
 from orchestrator.multimodal import ImageResolver
 from orchestrator.output_judge import ActionJudge, OutputJudge
@@ -1279,6 +1280,8 @@ async def build_agent(
         tool_disclosure=_resolved_tool_disclosure(spec.spec.model),
         # Stream RT-1 PR-3 (RT-ADR-4) — Tier3 structured final reply.
         output_schema=output_schema_spec,
+        # B-105 —— 截断报错文案里的上限与计数器标签,按实际应答的模型(路由盖的章)。
+        output_cap_resolver=served_output_cap(spec.spec.model),
     )
     compiled = GraphRunner(checkpointer=checkpointer).compile(graph)
     base_prompt = spec.spec.system_prompt.template
@@ -2098,20 +2101,96 @@ _THINKING_BUDGET_RATIO: dict[str, float] = {
 _THINKING_BUDGET_MIN = 1024
 _THINKING_BUDGET_MAX = 81_920
 
-#: GLM 5.2+ and kimi-k3 share a max/high/low ``reasoning_effort`` scale —
-#: no "medium", so the manifest's medium rounds up to high (bigmodel
-#: core-params page / platform.kimi.com thinking docs, 2026-08).
-_MAX_HIGH_LOW_EFFORT: dict[str, str] = {
-    "low": "low",
-    "medium": "high",
-    "high": "high",
-    "max": "max",
-}
+
+def _vendor_effort(entry: ModelEntry, level: str) -> str:
+    """平台档位 → 厂商取值(B-105:映射登记在目录 ``effort_map``,缺的键原样发)。"""
+    return (entry.effort_map or {}).get(level, level)
 
 
-def _thinking_budget(effort: str, max_tokens: int) -> int:
+def _thinking_budget(effort: str, max_tokens: int | None) -> int:
+    # B-105 —— ``max_tokens`` 为空(厂商默认,不再有 4096 默认值)时基数取预算上限
+    # 81920。这改变了通义「只设档位、没设输出上限」时的预算:以前是 4096 x 比例
+    # (high → 3276),现在是 81920 x 比例(high → 65536)。
+    base = _THINKING_BUDGET_MAX if max_tokens is None else max_tokens
     ratio = _THINKING_BUDGET_RATIO[effort]
-    return max(_THINKING_BUDGET_MIN, min(int(max_tokens * ratio), _THINKING_BUDGET_MAX))
+    return max(_THINKING_BUDGET_MIN, min(int(base * ratio), _THINKING_BUDGET_MAX))
+
+
+def _split_thinking_on(model: ModelSpec) -> bool:
+    """B-105 —— split(通义)模型本次请求思考是否开着:只看思考翻译是否真的发了开启项。
+
+    唯一口径是 :func:`_thinking_payload` —— 它不发 ``enable_thinking: true`` 就按厂商默认,
+    而通义 split 三款实调默认都不思考;绝不从目录 ``thinking_default`` 推断(推错了会把
+    回答静默压到上限的零头)。
+    """
+    payload = _thinking_payload(model)
+    return payload is not None and payload.get("enable_thinking") is True
+
+
+def _split_thinking_budget(model: ModelSpec, cap: int) -> int:
+    """split 模型思考开着时的思考预算:显式思考上限优先,否则按档位比例推(夹紧)。"""
+    if model.thinking_max_tokens is not None:
+        return model.thinking_max_tokens
+    return _thinking_budget(model.effort or "high", cap)
+
+
+def _output_cap_payload(model: ModelSpec, entry: ModelEntry | None) -> dict[str, Any] | None:
+    """B-105 —— 输出上限(含思考)的请求字段;``None`` = 不带上限(厂商默认)。
+
+    字段取目录 ``output_cap_field``(实调结果),只发一个 —— 豆包同时发两个会 400,
+    GLM / DeepSeek 发错字段会被静默忽略。目录外模型按 ``max_tokens`` 发
+    (openai / azure 除外,见下)。``split``(通义 qwen3-max / qwen3-vl-*)的
+    ``max_tokens`` 只管回答,思考另由 ``thinking_budget`` 管,两者拼成合计。
+    """
+    cap = model.max_tokens
+    if cap is None:
+        return None
+    field: str
+    if entry is not None:
+        field = entry.output_cap_field
+    else:
+        # 目录外:OpenAI 推理模型拒收 max_tokens;Azure 部署名永远不在目录里,按 OpenAI 语义。
+        field = "max_completion_tokens" if model.provider in ("openai", "azure") else "max_tokens"
+    if field != "split":
+        return {field: cap}
+    if not _split_thinking_on(model):
+        return {"max_tokens": cap}
+    budget = _split_thinking_budget(model, cap)
+    return {"max_tokens": cap - budget, "thinking_budget": budget}
+
+
+def _check_output_cap(model: ModelSpec, entry: ModelEntry | None) -> None:
+    """B-105 —— 构建期校验:输出上限不超厂商上限;思考开着时思考上限要小于输出上限
+    (目录 ``thinking_cap=True`` 的模型都校验;显式关了思考就不发思考上限,不拦)。"""
+    cap = model.max_tokens
+    if cap is None or entry is None:
+        return
+    if entry.max_output_tokens is not None and cap > entry.max_output_tokens:
+        raise AgentFactoryError(
+            f"model {model.name!r}: 输出上限 {cap} 超过厂商上限 {entry.max_output_tokens}"
+        )
+    if (
+        entry.thinking_cap
+        and model.thinking_max_tokens is not None
+        and model.thinking_max_tokens >= cap
+        # 目录 thinking_cap 的模型都是通义形态,同一个「是否发了开启项」口径。
+        and _split_thinking_on(model)
+    ):
+        raise AgentFactoryError(
+            f"model {model.name!r}: 思考长度上限必须小于输出上限"
+            f"(思考 {model.thinking_max_tokens} ≥ 输出 {cap};输出上限含思考)"
+        )
+    if (
+        entry.output_cap_field == "split"
+        and model.thinking_max_tokens is None
+        and _split_thinking_on(model)
+    ):
+        budget = _split_thinking_budget(model, cap)
+        if budget >= cap:
+            raise AgentFactoryError(
+                f"model {model.name!r}: 输出上限太小,放不下思考预算"
+                f"(按档位推出的思考预算 {budget} ≥ 输出 {cap};输出上限含思考)"
+            )
 
 
 #: Stream HX-1 (Mini-ADR HX-A4) — fallback window when neither the
@@ -2164,7 +2243,7 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
                 return {"thinking": {"type": "enabled"}}
             return {
                 "thinking": {"type": "enabled"},
-                "reasoning_effort": _MAX_HIGH_LOW_EFFORT[model.effort],
+                "reasoning_effort": _vendor_effort(entry, model.effort),
             }
         if model.provider == "kimi":
             # kimi-k3 — ALWAYS thinking; top-level ``reasoning_effort`` on
@@ -2172,21 +2251,25 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
             # K2.x ``thinking.type`` param (the K3 docs forbid it).
             if model.effort is None:
                 return None
-            return {"reasoning_effort": _MAX_HIGH_LOW_EFFORT[model.effort]}
-        # OpenAI / Azure / DeepSeek — ``reasoning_effort`` shares the
-        # manifest's level names (DeepSeek maps medium→high vendor-side).
-        return {"reasoning_effort": model.effort} if model.effort is not None else None
-    if entry.thinking == "budget":
+            return {"reasoning_effort": _vendor_effort(entry, model.effort)}
         if model.provider == "doubao":
+            # B-105(2026-09-24 实调)—— ``thinking.budget_tokens`` 被厂商忽略
+            # (200 正常返回,思考长度不受限);真正生效的档位控制是
+            # ``reasoning_effort``(实调 minimal/low/medium/high 有效、无 max —
+            # effort_map 把 max 顶到 high)。
             if model.effort is None:
                 return {"thinking": {"type": "auto"}}
-            return {
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": _thinking_budget(model.effort, model.max_tokens),
-                }
-            }
-        # Qwen / DashScope.
+            return {"reasoning_effort": _vendor_effort(entry, model.effort)}
+        # OpenAI / Azure / DeepSeek — ``reasoning_effort`` shares the
+        # manifest's level names (no catalog effort_map → passthrough).
+        if model.effort is None:
+            return None
+        return {"reasoning_effort": _vendor_effort(entry, model.effort)}
+    if entry.thinking == "budget":
+        # B-105 —— doubao 挪到上面的 effort 分支后,这里只剩通义。显式思考长度上限
+        # (``thinking_max_tokens``,目录 ``thinking_cap=True``)优先于按档位换算的预算。
+        if model.thinking_max_tokens is not None:
+            return {"enable_thinking": True, "thinking_budget": model.thinking_max_tokens}
         if model.effort is None:
             return {"enable_thinking": True}
         return {
@@ -2208,11 +2291,16 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
     a real off (``thinking.type=disabled``) and use it.
     """
     if entry.thinking == "effort":
-        # always_thinking (glm-5.3-flash) — thinking.type 仅支持 enabled;
-        # sending "disabled" is a vendor error, so off floors at the lowest
-        # effort tier (same owner decision as kimi-k3 below).
+        # always_thinking (glm-5.3 / glm-5.3-flash, B-105 2026-09-24 实调) —
+        # thinking.type 仅支持 enabled; sending "disabled" is a vendor error,
+        # so off floors at the lowest effort tier (same owner decision as
+        # kimi-k3 below).
         if entry.always_thinking and model.provider == "glm":
             return {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}
+        if model.provider == "doubao":
+            # B-105 —— catalog 挪到 effort 之后落进这支;关思考线格式不变
+            # (仍是 thinking.type=disabled,2026-09-24 实调确认思考归零)。
+            return {"thinking": {"type": "disabled"}}
         # GLM 5.2+ / DeepSeek keep a REAL off via the OpenAI-format thinking
         # object — "minimal" is not on either vendor's effort scale.
         if model.provider in ("glm", "deepseek"):
@@ -2223,7 +2311,8 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
         return {"reasoning_effort": "minimal"}
     if entry.thinking == "budget" and model.provider == "qwen":
         return {"enable_thinking": False}
-    # doubao (budget) + toggle vendors (Kimi / GLM ≤5.1) share the disabled shape.
+    # toggle vendors (Kimi / GLM ≤5.1) share the disabled shape. (doubao no
+    # longer reaches here — B-105 moved it into the effort branch above.)
     return {"thinking": {"type": "disabled"}}
 
 
@@ -2271,8 +2360,9 @@ def _thinking_payload(model: ModelSpec) -> dict[str, Any] | None:
     if model.thinking_enabled is True:
         return _thinking_enable_payload(model, entry)
     # Inherit — unchanged CM-10 behaviour: only an effort/adaptive-touched
-    # manifest sends anything.
-    if model.effort is None and not model.adaptive_thinking:
+    # manifest sends anything. B-105 — a manifest that only set
+    # ``thinking_max_tokens`` (no effort/adaptive) counts as touched too.
+    if model.effort is None and not model.adaptive_thinking and model.thinking_max_tokens is None:
         return None
     return _thinking_enable_payload(model, entry)
 
@@ -2298,6 +2388,14 @@ def _escalated_model(model: ModelSpec) -> ModelSpec | None:
     """
     entry = catalog_entry(model.provider, model.name)
     if entry is None or entry.thinking is None:
+        return None
+    # B-105 —— split 模型设了输出上限、没设思考上限时,思考预算按档位从上限里推:升档
+    # 只会让思考吃掉更多、回答缩水(上限 10000 从 high 升到 max,回答只剩 500)。不升。
+    if (
+        entry.output_cap_field == "split"
+        and model.max_tokens is not None
+        and model.thinking_max_tokens is None
+    ):
         return None
     # Stream Thinking-Toggle (req #3) — a user-disabled toggle STILL escalates:
     # the escalated caller forces thinking back ON for one turn (ephemeral, the
@@ -2721,6 +2819,14 @@ def _build_provider(
                 f"model {model.name!r} has no thinking toggle; "
                 "remove model.thinking_enabled from the manifest"
             )
+        # B-105 —— 思考长度硬上限只在目录 ``thinking_cap=True`` 的模型上可用(实调:
+        # 通义 thinking_budget);同一口径的能力闸门,off-catalog 不拦。
+        if model.thinking_max_tokens is not None and entry is not None and not entry.thinking_cap:
+            raise AgentFactoryError(
+                f"model {model.name!r}: 该模型只能调思考档位,不能限制思考长度;"
+                "remove model.thinking_max_tokens from the manifest"
+            )
+        _check_output_cap(model, entry)
         temperature: float | None = _constrained_temperature(model, entry)
         if entry is not None and not entry.sampling:
             # Opus 4.7+ removed sampling params — sending one is a 400.
@@ -2733,7 +2839,7 @@ def _build_provider(
         return AnthropicProvider(
             client=HTTPAnthropicClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
-            max_tokens=model.max_tokens,
+            max_tokens=model.max_tokens or ANTHROPIC_DEFAULT_MAX_TOKENS,
             temperature=temperature,
             image_resolver=image_resolver,
             # Stream L.L1 — propagate the manifest's per-model cache flag.
@@ -2763,6 +2869,16 @@ def _build_provider(
             f"model {model.name!r} has no thinking toggle; "
             "remove model.thinking_enabled from the manifest"
         )
+    # B-105 —— 同上,思考长度硬上限只在目录 ``thinking_cap=True`` 的模型上可用。
+    if (
+        model.thinking_max_tokens is not None
+        and compat_entry is not None
+        and not compat_entry.thinking_cap
+    ):
+        raise AgentFactoryError(
+            f"model {model.name!r}: 该模型只能调思考档位,不能限制思考长度;"
+            "remove model.thinking_max_tokens from the manifest"
+        )
     if compat_entry is not None and compat_entry.thinking == "toggle" and model.effort is not None:
         # Toggle entries (Kimi / GLM ≤5.1) have no depth — every level collapses to "enabled".
         logger.debug(
@@ -2770,7 +2886,9 @@ def _build_provider(
             model.name,
             model.effort,
         )
+    _check_output_cap(model, compat_entry)
     thinking_payload = _thinking_payload(model)
+    output_cap_payload = _output_cap_payload(model, compat_entry)
     compat_temperature = _constrained_temperature(model, compat_entry)
 
     if provider == "openai":
@@ -2780,6 +2898,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
         )
 
     openai_compatible = {
@@ -2806,6 +2925,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
             stream_extra_body=stream_extra_body,
         )
 
@@ -2820,6 +2940,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
         )
 
     if provider == "azure":
@@ -2841,6 +2962,7 @@ def _build_provider(
             temperature=compat_temperature,
             image_resolver=image_resolver,
             thinking_payload=thinking_payload,
+            output_cap_payload=output_cap_payload,
         )
 
     raise AgentFactoryError(f"provider {provider!r} has no adapter")

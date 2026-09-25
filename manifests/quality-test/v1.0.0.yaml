@@ -30,7 +30,6 @@ spec:
     provider: deepseek # ← change to your configured provider
     name: deepseek-v4-pro # ← and its model name
     temperature: 0.0
-    max_tokens: 1024
 
   system_prompt:
     template: |

@@ -121,6 +121,9 @@ const CATALOG: ModelCatalog = {
           deprecated: false,
           thinking: "effort",
           thinking_default: true,
+          // B-105 — effort-only vendor: no real thinking-length knob.
+          thinking_cap: false,
+          max_output_tokens: 131072,
         },
         {
           name: "glm-5.3-flash",
@@ -131,6 +134,47 @@ const CATALOG: ModelCatalog = {
           thinking: "effort",
           thinking_default: true,
           always_thinking: true,
+        },
+        {
+          name: "glm-4.5v",
+          vision: true,
+          embeddings: false,
+          context_window: null,
+          deprecated: false,
+          thinking: "toggle",
+          thinking_default: true,
+          // B-105 — toggle-only vendor: no real thinking-length knob.
+          thinking_cap: false,
+          max_output_tokens: 16384,
+        },
+      ],
+    },
+    {
+      // B-105 — qwen's "budget" thinking shape has a REAL thinking-length cap
+      // (thinking_budget), distinct from the whole-reply max_output_tokens.
+      provider: "qwen",
+      models: [
+        {
+          name: "qwen3.8-max",
+          vision: true,
+          embeddings: false,
+          context_window: 1000000,
+          deprecated: false,
+          thinking: "budget",
+          thinking_default: true,
+          thinking_cap: true,
+          max_output_tokens: null,
+        },
+        {
+          // Real qwen catalog entry — no thinking knob at all. Used to test
+          // the onModel thinking_max_tokens clear within the SAME provider
+          // (mirrors how the effort-clearing tests use openai's real
+          // text-embedding-3-large as the "no thinking knob" target).
+          name: "text-embedding-v4",
+          vision: false,
+          embeddings: true,
+          context_window: null,
+          deprecated: false,
         },
       ],
     },
@@ -206,14 +250,16 @@ describe("ModelSelect", () => {
     );
   });
 
-  it("advanced panel exposes max_tokens and rate_limit_rpm inputs", async () => {
+  it("advanced panel exposes the output cap and rate_limit_rpm inputs", async () => {
     const user = userEvent.setup();
     renderSelect({ provider: "openai", name: "gpt-5.5" });
     await user.click(
       within(screen.getByTestId("model-select-advanced")).getByText("Advanced"),
     );
     const advanced = screen.getByTestId("model-select-advanced");
-    expect(within(advanced).getByText("max_tokens")).toBeInTheDocument();
+    expect(
+      within(advanced).getByText("Max output (incl. thinking)"),
+    ).toBeInTheDocument();
     expect(within(advanced).getByText("rate_limit_rpm")).toBeInTheDocument();
   });
 
@@ -372,7 +418,7 @@ describe("ModelSelect", () => {
     );
   });
 
-  it("switching provider clears effort, adaptive_thinking, cache_enabled", async () => {
+  it("switching provider clears effort, adaptive_thinking, cache_enabled, thinking_max_tokens", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     renderSelect(
@@ -382,6 +428,7 @@ describe("ModelSelect", () => {
         effort: "high",
         adaptive_thinking: true,
         cache_enabled: false,
+        thinking_max_tokens: 2000,
       },
       onChange,
     );
@@ -393,6 +440,7 @@ describe("ModelSelect", () => {
       expect.objectContaining({
         provider: "openai",
         effort: undefined,
+        thinking_max_tokens: undefined,
         adaptive_thinking: undefined,
         cache_enabled: undefined,
       }),
@@ -662,16 +710,157 @@ describe("ModelSelect", () => {
     );
   });
 
-  it("renders max_tokens and rate_limit_rpm hint text in the advanced panel", async () => {
+  it("renders the output cap and rate_limit_rpm hint text in the advanced panel", async () => {
     const user = userEvent.setup();
     renderSelect({ provider: "openai", name: "gpt-5.5" });
     await openAdvanced(user);
     const advanced = screen.getByTestId("model-select-advanced");
     expect(
-      within(advanced).getByText(/Output token ceiling for a single reply/),
+      within(advanced).getByText(/Per-reply output cap, thinking included/),
     ).toBeInTheDocument();
     expect(
       within(advanced).getByText(/Request-rate ceiling for this model/),
     ).toBeInTheDocument();
+  });
+
+  // ---- B-105 Task 4: output cap (max_output_tokens) + thinking length cap
+  // (thinking_max_tokens) ----
+
+  it("output cap label reads 'Max output (incl. thinking)'", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "openai", name: "gpt-5.5" });
+    await openAdvanced(user);
+    const advanced = screen.getByTestId("model-select-advanced");
+    expect(
+      within(advanced).getByText("Max output (incl. thinking)"),
+    ).toBeInTheDocument();
+  });
+
+  it("output cap placeholder names the vendor default and the catalog ceiling", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "glm", name: "glm-4.5v" });
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Max output (incl. thinking)");
+    const placeholder = input.getAttribute("placeholder") ?? "";
+    expect(placeholder).toContain("Vendor default");
+    expect(placeholder).toContain("16384");
+  });
+
+  // Review fix round 1, F1 — rc-input-number's ``max`` prop clamps on blur
+  // (flushInputValue) even with no typing, silently rewriting a manifest
+  // value that already exceeds the catalog ceiling. The backend's dry-run
+  // build already rejects an over-ceiling max_tokens with an explicit
+  // message — the UI must not pre-empt that by mutating the value out from
+  // under the operator on a mere focus+blur.
+  it("does not silently clamp a stored over-ceiling max_tokens on blur (no typing)", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSelect(
+      { provider: "glm", name: "glm-5.3", max_tokens: 200000 },
+      onChange,
+    );
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Max output (incl. thinking)");
+    await user.click(input);
+    await user.tab();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("thinking length cap is editable for a thinking_cap model and writes thinking_max_tokens", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSelect({ provider: "qwen", name: "qwen3.8-max" }, onChange);
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Thinking length cap");
+    expect(input).not.toBeDisabled();
+    await user.type(input, "2000");
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ thinking_max_tokens: 2000 }),
+    );
+  });
+
+  it("thinking length cap is disabled for a model with no real thinking-cap knob, with the unsupported hint", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "glm", name: "glm-5.3" });
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Thinking length cap");
+    expect(input).toBeDisabled();
+    expect(
+      screen.getByText(
+        "This model only supports thinking levels, not a thinking length cap.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("selecting a different model in the same provider clears thinking_max_tokens (was set on a thinking_cap model)", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSelect(
+      { provider: "qwen", name: "qwen3.8-max", thinking_max_tokens: 2000 },
+      onChange,
+    );
+    const nameSel = within(screen.getByTestId("model-select-name")).getByRole(
+      "combobox",
+    );
+    await pickOption(user, nameSel, "text-embedding-v4");
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "text-embedding-v4",
+        thinking_max_tokens: undefined,
+      }),
+    );
+  });
+
+  it("selecting another thinking_cap model in the same provider preserves thinking_max_tokens", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSelect(
+      { provider: "qwen", name: "text-embedding-v4", thinking_max_tokens: 2000 },
+      onChange,
+    );
+    const nameSel = within(screen.getByTestId("model-select-name")).getByRole(
+      "combobox",
+    );
+    await pickOption(user, nameSel, "qwen3.8-max");
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "qwen3.8-max", thinking_max_tokens: 2000 }),
+    );
+  });
+
+  // B-105 — Anthropic requires max_tokens; an empty cap is sent as 4096, not a
+  // vendor default, so the placeholder must say so.
+  it("output cap placeholder for an anthropic model names the 4096 actually sent", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "anthropic", name: "claude-4.6-sonnet" });
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Max output (incl. thinking)");
+    expect(input.getAttribute("placeholder")).toBe("Default 4096");
+  });
+
+  // B-105 — a stored thinking cap on a model without a real cap (e.g. from
+  // YAML) makes the backend reject the build; the disabled input must still
+  // show it and offer a way to clear it.
+  it("a stored thinking cap on an unsupported model stays visible and can be cleared", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSelect(
+      { provider: "glm", name: "glm-5.3", thinking_max_tokens: 2000 },
+      onChange,
+    );
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Thinking length cap");
+    expect(input).toBeDisabled();
+    expect(input).toHaveValue("2000");
+    await user.click(screen.getByTestId("model-select-thinking-max-clear"));
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ thinking_max_tokens: undefined }),
+    );
+  });
+
+  it("offers no clear affordance when nothing is stored or the model supports the cap", async () => {
+    const user = userEvent.setup();
+    renderSelect({ provider: "glm", name: "glm-5.3" });
+    await openAdvanced(user);
+    expect(screen.queryByTestId("model-select-thinking-max-clear")).toBeNull();
   });
 });

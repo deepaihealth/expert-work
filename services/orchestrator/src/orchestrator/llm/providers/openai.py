@@ -453,6 +453,15 @@ class RecordingOpenAIClient:
             yield chunk
 
 
+def _merge_extra(
+    base: dict[str, Any] | None, override: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """B-105 —— 合并两份 ``extra_body`` 片段,后者优先;都为 ``None`` 时仍为 ``None``。"""
+    if base is None and override is None:
+        return None
+    return {**(base or {}), **(override or {})}
+
+
 @dataclass
 class OpenAIProvider:
     """:class:`LLMProvider` for OpenAI Chat Completions.
@@ -476,6 +485,10 @@ class OpenAIProvider:
     #: payload (``_thinking_payload``), merged into the request body.
     #: ``None`` (every untouched manifest) keeps the body byte-identical.
     thinking_payload: dict[str, Any] | None = None
+    #: B-105 —— 输出上限(含思考)的请求字段(``_output_cap_payload``),与
+    #: ``thinking_payload`` 合并进 ``extra_body``,键冲突以本字段为准(split 的
+    #: ``thinking_budget`` 覆盖思考翻译里按比例推的那个)。``None`` 时请求体逐字节不变。
+    output_cap_payload: dict[str, Any] | None = None
     #: glm-only (2026-07-18) — vendor request params merged into ``extra_body``
     #: ONLY on the streaming path. glm's ``tool_stream: true`` makes it emit
     #: tool-call args incrementally instead of one silent batch, so the router's
@@ -531,7 +544,7 @@ class OpenAIProvider:
             "messages": mapped,
             "tools": tool_payload,
             "temperature": self.temperature,
-            "extra_body": self.thinking_payload,
+            "extra_body": _merge_extra(self.thinking_payload, self.output_cap_payload),
             "tool_choice": tool_choice,
             "response_format": response_format,
         }
