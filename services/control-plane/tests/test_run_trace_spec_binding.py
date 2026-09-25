@@ -249,13 +249,13 @@ def _legacy_non_anthropic_spec_and_stored_sha() -> tuple[AgentSpec, str]:
 async def test_legacy_4096_normalisation_alone_does_not_log_divergence(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """B-105 —— 存量非 Anthropic manifest 的 4096 加载时被归一掉,现算哈希必然与列不同;
-    只因这一处归一而分叉不是「宽容生效」,不该每个 run 都打 warning。绑的仍是列。"""
+    """B-105 —— 存量非 Anthropic manifest 的 4096 加载时被归一成空;指纹的规范形态把空
+    上限按 4096 算,所以现算哈希就等于列,不打 warning。绑的仍是列。"""
     tenant_id = uuid4()
     runs = InMemoryRunStore()
     run_id = await _seed_run(runs, tenant_id=tenant_id)
     spec, stored = _legacy_non_anthropic_spec_and_stored_sha()
-    assert stored != compute_spec_sha256(spec)
+    assert stored == compute_spec_sha256(spec)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
         await bind_exec_spec(
@@ -299,8 +299,8 @@ async def test_legacy_4096_spec_with_a_real_divergence_still_logs(
     assert any("spec_sha256_diverged" in m for m in messages), messages
 
 
-def test_restore_context_does_not_change_the_persisted_shape() -> None:
-    """写回 4096 只在比对用的 context 下发生;存库的 ``model_dump`` 照旧省略。"""
+def test_digest_form_does_not_change_the_persisted_shape() -> None:
+    """4096 只在算指纹时写回;存库的 ``model_dump`` 照旧省略。"""
     spec, _ = _legacy_non_anthropic_spec_and_stored_sha()
     dumped = spec.model_dump(by_alias=True, mode="json")
     assert "max_tokens" not in dumped["spec"]["model"]

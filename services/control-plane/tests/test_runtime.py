@@ -8,9 +8,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import yaml
 from langgraph.checkpoint.memory import InMemorySaver
 
-from control_plane.api.agents import _spec_sha256
+from control_plane.api.agents import ManifestPayload, _load_manifest
+from control_plane.manifest import ManifestLoader
 from control_plane.runtime import (
     AgentRuntime,
     ResolvingEmbedder,
@@ -377,7 +379,8 @@ async def test_get_agent_serves_the_edited_spec_after_a_revert() -> None:
     assert builds == ["a", "b"]
 
 
-def test_cache_key_hash_matches_the_stored_agent_spec_sha() -> None:
+@pytest.mark.asyncio
+async def test_cache_key_hash_matches_the_stored_agent_spec_sha() -> None:
     """The cache key's hash and the ``agent_spec`` row's ``spec_sha256`` must be
     the same canonical form.
 
@@ -386,9 +389,18 @@ def test_cache_key_hash_matches_the_stored_agent_spec_sha() -> None:
     the run row records the STORED sha (PR-B), so an operator asking "which
     config produced this run" compares two numbers that can no longer be
     compared. Pinning it here fails loudly at the moment either side changes
-    its canonicalisation."""
-    spec = _make_spec(prompt="canonical form check")
-    assert compute_spec_sha256(spec) == _spec_sha256(spec.model_dump(by_alias=True, mode="json"))
+    its canonicalisation.
+
+    B-105: the manifest leaves ``max_tokens`` unset, so the persisted dump omits
+    it while the canonical form hashes it as 4096 — a save path that hashed the
+    dump would drift here."""
+    manifest = dict(_MINIMAL_MANIFEST)
+    manifest["spec"] = dict(manifest["spec"], system_prompt={"template": "canonical form check"})
+    spec, stored_sha = await _load_manifest(
+        ManifestPayload(manifest_yaml=yaml.safe_dump(manifest)), ManifestLoader()
+    )
+    assert "max_tokens" not in spec.model_dump(by_alias=True, mode="json")["spec"]["model"]
+    assert stored_sha == compute_spec_sha256(spec)
 
 
 # ---------------------------------------------------------------------------

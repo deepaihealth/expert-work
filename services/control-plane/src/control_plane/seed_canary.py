@@ -40,7 +40,6 @@ import logging
 from dataclasses import dataclass
 from uuid import UUID
 
-from control_plane.api.agents import _spec_sha256
 from control_plane.auth.api_key_verifier import mint_api_key
 from control_plane.manifest.loader import ManifestLoader
 from control_plane.settings import Settings
@@ -65,6 +64,7 @@ from expert_work.persistence.auth import (
     SqlApiKeyStore,
     SqlServiceAccountStore,
 )
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.protocol import AgentSpec, ApiKeyScope
 
 logger = logging.getLogger("expert_work.control_plane.seed_canary")
@@ -281,7 +281,7 @@ async def seed_canary(
             await specs.create(
                 tenant_id=tenant_id,
                 spec=spec,
-                spec_sha256=_spec_sha256(spec.model_dump(by_alias=True, mode="json")),
+                spec_sha256=compute_spec_sha256(spec),
                 created_by=_SEED_ACTOR,
             )
             agent_created = True

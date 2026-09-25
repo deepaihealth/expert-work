@@ -11,8 +11,6 @@ round-tripping YAML keeps lint enforcement at the boundary.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -104,6 +102,7 @@ from expert_work.persistence import ApprovalStore, TriggerStore
 from expert_work.persistence.agent_disable import AgentDisableStore
 from expert_work.persistence.agent_instance import AgentInstanceStore
 from expert_work.persistence.agent_spec import AgentSpecStore, DuplicateAgentSpecError
+from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.token_usage_store import TokenUsageStore
@@ -474,11 +473,6 @@ def external_run_bounds_error(
         f"inputs 序列化后总大小不能超过 {MAX_RUN_INPUT_TOTAL_BYTES} 字节",
         422,
     )
-
-
-def _spec_sha256(spec_json: Mapping[str, Any]) -> str:
-    canonical = json.dumps(spec_json, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ForkTemplateRequest(BaseModel):
@@ -1087,10 +1081,13 @@ async def _load_manifest(
     payload: ManifestPayload,
     loader: ManifestLoader,
 ) -> tuple[Any, str]:
-    """Parse the request body into an ``AgentSpec`` + canonical sha256."""
+    """Parse the request body into an ``AgentSpec`` + canonical sha256.
+
+    The sha is :func:`compute_spec_sha256` — the same canonical form the run-time
+    cache key and ``bind_exec_spec`` recompute (B-105: not a hash of the persisted
+    dump, which omits unset output caps)."""
     spec = loader.load_from_string(payload.manifest_yaml)
-    spec_json = spec.model_dump(by_alias=True, mode="json")
-    return spec, _spec_sha256(spec_json)
+    return spec, compute_spec_sha256(spec)
 
 
 def _manifest_error_to_response(exc: ManifestError) -> JSONResponse:
@@ -1468,7 +1465,7 @@ def build_agents_router() -> APIRouter:
             )
 
         # 5. Persist as an ordinary tenant agent_spec.
-        sha = _spec_sha256(doc)
+        sha = compute_spec_sha256(fork_spec)
         try:
             record = await repo.create(
                 tenant_id=tenant_id, spec=fork_spec, spec_sha256=sha, created_by=actor_id

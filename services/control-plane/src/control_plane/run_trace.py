@@ -148,13 +148,7 @@ async def bind_exec_spec(
     try:
         computed = compute_spec_sha256(spec)
         bound = stored_sha256 or computed
-        # B-105 —— 非 Anthropic 模型上的旧默认 4096 在加载时被归一掉;存量 manifest 的列是
-        # 含 4096 的旧形态算的。只因这一处归一而分叉的不是「宽容生效」,不打日志。
-        if (
-            stored_sha256
-            and stored_sha256 != computed
-            and stored_sha256 != compute_spec_sha256(spec, restore_legacy_max_tokens=True)
-        ):
+        if stored_sha256 and stored_sha256 != computed:
             logger.warning(
                 "%s.spec_sha256_diverged run_id=%s stored=%s computed=%s",
                 source,
