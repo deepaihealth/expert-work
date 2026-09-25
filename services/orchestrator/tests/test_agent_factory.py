@@ -2223,13 +2223,12 @@ def test_split_thinking_never_inferred_from_catalog_default(
 ) -> None:
     # 即使目录把某个 split 模型标成默认思考,未碰开关也不拆预算 —— 口径只认思考翻译
     # 真发了 enable_thinking(与目录值解耦,目录再标错也不会静默压缩回答)。
-    import orchestrator.agent_factory as af
     from expert_work.protocol.model_catalog import catalog_entry
 
     base = catalog_entry("qwen", "qwen3-max")
     assert base is not None
     lying = base.model_copy(update={"thinking_default": True})
-    monkeypatch.setattr(af, "catalog_entry", lambda provider, name: lying)
+    monkeypatch.setattr("orchestrator.agent_factory.catalog_entry", lambda provider, name: lying)
     assert _cap_payload("qwen", "qwen3-max", max_tokens=10_000) == {"max_tokens": 10_000}
 
 
