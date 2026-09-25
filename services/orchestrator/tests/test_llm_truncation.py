@@ -61,3 +61,26 @@ def test_error_message_names_the_cap_or_vendor_default() -> None:
     assert err.cap == 2048
     assert "模型输出被截断" in str(err) and "2048" in str(err)
     assert "厂商默认值" in str(OutputTruncatedError(None))
+
+
+def test_served_cap_reports_the_4096_anthropic_actually_sends() -> None:
+    """Anthropic 清单没设上限时请求里发的是 4096;截断标签 / 报错里的上限要是这个数,
+    不能说成「厂商默认值」。其他厂商为空照旧是 ``None``。"""
+    from expert_work.protocol import ModelSpec
+    from orchestrator.llm.truncation import served_output_cap
+
+    resolve = served_output_cap(
+        ModelSpec.model_validate(
+            {
+                "provider": "anthropic",
+                "name": "claude-sonnet-4-6",
+                "fallback": [
+                    {"provider": "glm", "name": "glm-5.3"},
+                    {"provider": "anthropic", "name": "claude-opus-4-8", "max_tokens": 8000},
+                ],
+            }
+        )
+    )
+    assert resolve(AIMessage(content="")) == ("anthropic", "claude-sonnet-4-6", 4096)
+    assert resolve.caps[("glm", "glm-5.3")] is None
+    assert resolve.caps[("anthropic", "claude-opus-4-8")] == 8000

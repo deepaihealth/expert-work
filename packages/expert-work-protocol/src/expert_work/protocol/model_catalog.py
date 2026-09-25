@@ -128,7 +128,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking_default=True,
             sampling=False,
             tool_disclosure="native_search",
-            # B-105(2026-09-24 实调)—— ``max_tokens`` 就是合计输出上限。
+            # B-105(按文档,未实调:测试环境没有 Anthropic key)—— ``max_tokens`` 就是
+            # 合计输出上限。
             output_cap_field="max_tokens",
         ),
         ModelEntry(
@@ -155,7 +156,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking="effort",
             thinking_default=True,
             tool_disclosure="allowed_tools",
-            # B-105(2026-09-24 实调)—— OpenAI 用 max_completion_tokens 记合计上限。
+            # B-105(按文档,未实调:测试环境没有 OpenAI key)—— OpenAI 用 max_completion_tokens
+            # 记合计上限。
             output_cap_field="max_completion_tokens",
         ),
         ModelEntry(
@@ -459,7 +461,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # context. Older doubao-*-32k series superseded.
     # B-105(2026-09-24 实调)—— ``thinking.budget_tokens`` 被厂商忽略(200 正常返回,
     # 思考长度不受限),真正生效的档位控制是 ``reasoning_effort`` → shape "effort";
-    # 厂商档位只有 low/high(无 medium/max),effort_map 把 max 顶到 high。
+    # 厂商档位 minimal/low/medium/high 实调都有效、没有 max,effort_map 把 max 顶到 high。
     "doubao": (
         ModelEntry(
             name="doubao-seed-2-1-pro-260628",

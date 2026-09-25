@@ -355,3 +355,28 @@ def test_disabled_toggle_still_escalates_to_on() -> None:
     assert (
         _escalated_model(_vendor("deepseek", "deepseek-reasoner", thinking_enabled=False)) is None
     )
+
+
+def test_split_model_with_cap_and_derived_thinking_does_not_escalate() -> None:
+    """B-105 —— split(qwen3-max / qwen3-vl-*)设了输出上限、没设思考上限时,思考预算从
+    上限按档位推;升档只会把回答挤小(10000 从 high 升 max,回答剩 500),所以不升。"""
+    for name in ("qwen3-max", "qwen3-vl-plus", "qwen3-vl-flash"):
+        assert _escalated_model(_vendor("qwen", name, max_tokens=10_000, effort="high")) is None
+        # 关着思考的也不升(升档 = 开思考,同样从上限里切预算)。
+        assert (
+            _escalated_model(
+                _vendor("qwen", name, max_tokens=10_000, thinking_enabled=False, effort="low")
+            )
+            is None
+        )
+    # 显式思考上限:预算固定,升档不挤回答,照常升。
+    explicit = _escalated_model(
+        _vendor("qwen", "qwen3-max", max_tokens=10_000, thinking_max_tokens=2000, effort="high")
+    )
+    assert explicit is not None and explicit.effort == "max"
+    # 没设输出上限:没有可挤的合计,照常升。
+    uncapped = _escalated_model(_vendor("qwen", "qwen3-max", effort="high"))
+    assert uncapped is not None and uncapped.effort == "max"
+    # 非 split 的通义模型不受影响。
+    total = _escalated_model(_vendor("qwen", "qwen3.7-max", max_tokens=10_000, effort="high"))
+    assert total is not None and total.effort == "max"

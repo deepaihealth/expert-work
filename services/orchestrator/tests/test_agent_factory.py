@@ -2277,6 +2277,31 @@ def test_split_thinking_cap_must_be_below_output_cap() -> None:
         )
 
 
+def test_thinking_cap_must_be_below_output_cap_on_every_thinking_cap_model() -> None:
+    """B-105 —— 不只 split:目录 ``thinking_cap=True`` 的合计字段模型(qwen3.8-max 等)思考
+    开着时,思考上限 ≥ 输出上限同样拦(输出上限含思考,回答没有空间)。"""
+    for name in ("qwen3.8-max", "qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus"):
+        with pytest.raises(AgentFactoryError, match="思考长度上限必须小于输出上限"):
+            _build_provider(
+                _vendor_model("qwen", name, max_tokens=2000, thinking_max_tokens=2000), "k"
+            )
+
+
+def test_thinking_cap_not_checked_when_thinking_explicitly_off() -> None:
+    """显式关了思考就不发思考上限,两者大小无所谓,不拦。"""
+    for name in ("qwen3-max", "qwen3-vl-flash", "qwen3.7-max"):
+        _build_provider(
+            _vendor_model(
+                "qwen",
+                name,
+                max_tokens=2000,
+                thinking_enabled=False,
+                thinking_max_tokens=4000,
+            ),
+            "k",
+        )
+
+
 def test_cap_above_vendor_max_is_rejected() -> None:
     with pytest.raises(AgentFactoryError, match="16384"):
         _build_provider(_vendor_model("glm", "glm-4.5v", max_tokens=20_000), "k")

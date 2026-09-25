@@ -1,7 +1,7 @@
 """B-105 —— 输出被上限截断的判定与报错。
 
-各家形态(2026-09-24 实调):OpenAI 兼容 ``finish_reason == "length"``;Anthropic
-``stop_reason == "max_tokens"``。思考模型截断时通常是思考吃满额度、正文为空。
+各家形态:OpenAI 兼容 ``finish_reason == "length"``(2026-09-24 实调);Anthropic
+``stop_reason == "max_tokens"``(按文档,未实调)。思考模型截断时通常是思考吃满额度、正文为空。
 """
 
 from __future__ import annotations
@@ -18,6 +18,10 @@ from orchestrator.usage_metering import ServedModelResolver, chain_models
 
 if TYPE_CHECKING:
     from expert_work.protocol import ModelSpec
+
+#: Anthropic 必须带 ``max_tokens``;清单没设时沿用一直生效的 4096(构建 provider 与报错
+#: 文案同一个数)。
+ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
 
 _TRUNCATED = {("finish_reason", "length"), ("stop_reason", "max_tokens")}
 
@@ -61,8 +65,8 @@ class ServedOutputCap:
     """响应 → 实际应答模型的 ``(provider, model, 输出上限)``。
 
     实际应答的是谁由路由盖的章认出(``orchestrator.usage_metering``,与用量记账同一个
-    解析器);没盖章(没接用量存储)时记配置的主模型。上限取该模型条目自己的
-    ``max_tokens``(``None`` = 厂商默认)。
+    解析器);没盖章(没接用量存储)时记配置的主模型。上限取该模型条目实际发出的值
+    (:func:`effective_output_cap`;``None`` = 厂商默认)。
     """
 
     served_by: Callable[[AIMessage], tuple[str, str]]
@@ -73,13 +77,20 @@ class ServedOutputCap:
         return provider, model, self.caps.get((provider, model))
 
 
+def effective_output_cap(model: ModelSpec) -> int | None:
+    """实际发出的输出上限:清单值;Anthropic 为空时是 4096;其余为空 = 厂商默认(``None``)。"""
+    if model.max_tokens is None and model.provider == "anthropic":
+        return ANTHROPIC_DEFAULT_MAX_TOKENS
+    return model.max_tokens
+
+
 def served_output_cap(model: ModelSpec) -> ServedOutputCap:
     """``model`` 与它整棵备用树的截断标签 / 上限解析器。"""
     caps: dict[tuple[str, str], int | None] = {}
     pending = [model]
     while pending:
         entry = pending.pop()
-        caps[(entry.provider, entry.name)] = entry.max_tokens
+        caps[(entry.provider, entry.name)] = effective_output_cap(entry)
         pending.extend(entry.fallback)
     return ServedOutputCap(
         served_by=ServedModelResolver(

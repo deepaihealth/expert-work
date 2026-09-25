@@ -137,7 +137,7 @@ from orchestrator.llm import (
     make_qwen_client,
     make_self_hosted_client,
 )
-from orchestrator.llm.truncation import served_output_cap
+from orchestrator.llm.truncation import ANTHROPIC_DEFAULT_MAX_TOKENS, served_output_cap
 from orchestrator.middleware_assembly import MiddlewareEnv, build_middleware_chains
 from orchestrator.multimodal import ImageResolver
 from orchestrator.output_judge import ActionJudge, OutputJudge
@@ -2116,10 +2116,6 @@ def _thinking_budget(effort: str, max_tokens: int | None) -> int:
     return max(_THINKING_BUDGET_MIN, min(int(base * ratio), _THINKING_BUDGET_MAX))
 
 
-#: B-105 —— Anthropic 必须带 ``max_tokens``;清单没设时沿用一直生效的 4096。
-_LEGACY_ANTHROPIC_MAX_TOKENS = 4096
-
-
 def _split_thinking_on(model: ModelSpec) -> bool:
     """B-105 —— split(通义)模型本次请求思考是否开着:只看思考翻译是否真的发了开启项。
 
@@ -2164,7 +2160,8 @@ def _output_cap_payload(model: ModelSpec, entry: ModelEntry | None) -> dict[str,
 
 
 def _check_output_cap(model: ModelSpec, entry: ModelEntry | None) -> None:
-    """B-105 —— 构建期校验:输出上限不超厂商上限;split 的思考上限要小于输出上限。"""
+    """B-105 —— 构建期校验:输出上限不超厂商上限;思考开着时思考上限要小于输出上限
+    (目录 ``thinking_cap=True`` 的模型都校验;显式关了思考就不发思考上限,不拦)。"""
     cap = model.max_tokens
     if cap is None or entry is None:
         return
@@ -2173,9 +2170,11 @@ def _check_output_cap(model: ModelSpec, entry: ModelEntry | None) -> None:
             f"model {model.name!r}: 输出上限 {cap} 超过厂商上限 {entry.max_output_tokens}"
         )
     if (
-        entry.output_cap_field == "split"
+        entry.thinking_cap
         and model.thinking_max_tokens is not None
         and model.thinking_max_tokens >= cap
+        # 目录 thinking_cap 的模型都是通义形态,同一个「是否发了开启项」口径。
+        and _split_thinking_on(model)
     ):
         raise AgentFactoryError(
             f"model {model.name!r}: 思考长度上限必须小于输出上限"
@@ -2256,7 +2255,8 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
         if model.provider == "doubao":
             # B-105(2026-09-24 实调)—— ``thinking.budget_tokens`` 被厂商忽略
             # (200 正常返回,思考长度不受限);真正生效的档位控制是
-            # ``reasoning_effort``(low/high,无 medium/max — effort_map 补上)。
+            # ``reasoning_effort``(实调 minimal/low/medium/high 有效、无 max —
+            # effort_map 把 max 顶到 high)。
             if model.effort is None:
                 return {"thinking": {"type": "auto"}}
             return {"reasoning_effort": _vendor_effort(entry, model.effort)}
@@ -2388,6 +2388,14 @@ def _escalated_model(model: ModelSpec) -> ModelSpec | None:
     """
     entry = catalog_entry(model.provider, model.name)
     if entry is None or entry.thinking is None:
+        return None
+    # B-105 —— split 模型设了输出上限、没设思考上限时,思考预算按档位从上限里推:升档
+    # 只会让思考吃掉更多、回答缩水(上限 10000 从 high 升到 max,回答只剩 500)。不升。
+    if (
+        entry.output_cap_field == "split"
+        and model.max_tokens is not None
+        and model.thinking_max_tokens is None
+    ):
         return None
     # Stream Thinking-Toggle (req #3) — a user-disabled toggle STILL escalates:
     # the escalated caller forces thinking back ON for one turn (ephemeral, the
@@ -2831,7 +2839,7 @@ def _build_provider(
         return AnthropicProvider(
             client=HTTPAnthropicClient(api_key=api_key, timeout_s=timeout_eff, http=http_client),
             model=model.name,
-            max_tokens=model.max_tokens or _LEGACY_ANTHROPIC_MAX_TOKENS,
+            max_tokens=model.max_tokens or ANTHROPIC_DEFAULT_MAX_TOKENS,
             temperature=temperature,
             image_resolver=image_resolver,
             # Stream L.L1 — propagate the manifest's per-model cache flag.
