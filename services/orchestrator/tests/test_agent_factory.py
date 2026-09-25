@@ -2210,11 +2210,34 @@ def test_split_with_thinking_on_sums_to_cap() -> None:
         "max_tokens": 8000,
         "thinking_budget": 2000,
     }
-    # qwen3-max 默认思考(thinking_default=True),未碰开关 = 开。
-    assert _cap_payload("qwen", "qwen3-max", max_tokens=10_000) == {
-        "max_tokens": 2000,
-        "thinking_budget": 8000,
+
+
+def test_split_untouched_qwen3_max_is_plain_max_tokens() -> None:
+    # qwen3-max 实调默认不思考(不带开关 reasoning_tokens=null):未碰开关 = 关,
+    # 整个上限都给回答,不许按「默认思考」拆走 80%。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=10_000) == {"max_tokens": 10_000}
+
+
+def test_split_budget_is_clamped() -> None:
+    # 预算夹在通义上限 81920 内,不再是 cap x 0.8 = 160000。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=200_000, thinking_enabled=True) == {
+        "max_tokens": 118_080,
+        "thinking_budget": 81_920,
     }
+    # 下限 1024:low 档 1200 x 0.2=240 抬到 1024。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=1200, effort="low") == {
+        "max_tokens": 176,
+        "thinking_budget": 1024,
+    }
+
+
+def test_split_cap_too_small_for_derived_budget_is_rejected() -> None:
+    with pytest.raises(AgentFactoryError, match="输出上限太小,放不下思考预算"):
+        _build_provider(
+            _vendor_model("qwen", "qwen3-max", max_tokens=1000, thinking_enabled=True), "k"
+        )
+    # 思考关着时没有预算,小上限照常。
+    assert _cap_payload("qwen", "qwen3-max", max_tokens=1000) == {"max_tokens": 1000}
 
 
 def test_split_with_thinking_off_is_plain_max_tokens() -> None:

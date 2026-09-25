@@ -218,6 +218,43 @@ def test_legacy_default_4096_normalises_to_none_off_anthropic() -> None:
     assert spec.fallback[0].max_tokens is None
 
 
+def test_unset_caps_are_not_serialised() -> None:
+    """B-105 —— 空的 max_tokens / thinking_max_tokens 不落库(回滚到旧版 extra=forbid 仍可读)。"""
+    doc: dict[str, Any] = {
+        "provider": "glm",
+        "name": "glm-5.3",
+        "fallback": [{"provider": "qwen", "name": "qwen3.8-max"}],
+    }
+    for dumped in (
+        ModelSpec.model_validate(doc).model_dump(mode="json"),
+        ModelSpec.model_validate(doc).model_dump(by_alias=True, mode="json"),
+    ):
+        for node in (dumped, dumped["fallback"][0]):
+            assert "max_tokens" not in node
+            assert "thinking_max_tokens" not in node
+        assert ModelSpec.model_validate(dumped).model_dump(mode="json") == dumped
+
+    doc = {
+        "provider": "qwen",
+        "name": "qwen3.8-max",
+        "max_tokens": 8000,
+        "thinking_max_tokens": 2000,
+        "fallback": [{"provider": "glm", "name": "glm-5.3", "max_tokens": 9000}],
+    }
+    dumped = ModelSpec.model_validate(doc).model_dump(by_alias=True, mode="json")
+    assert dumped["max_tokens"] == 8000
+    assert dumped["thinking_max_tokens"] == 2000
+    assert dumped["fallback"][0]["max_tokens"] == 9000
+    assert "thinking_max_tokens" not in dumped["fallback"][0]
+    assert ModelSpec.model_validate(dumped).model_dump(mode="json") == dumped
+
+
+def test_agent_spec_save_path_omits_unset_caps() -> None:
+    spec = AgentSpec.model_validate(deepcopy(_MINIMAL))
+    model = spec.model_dump(by_alias=True, mode="json")["spec"]["model"]
+    assert "max_tokens" not in model and "thinking_max_tokens" not in model
+
+
 def test_legacy_normalisation_does_not_mutate_input() -> None:
     raw: dict[str, Any] = {"provider": "glm", "name": "glm-5.3", "max_tokens": 4096}
     ModelSpec.model_validate(raw)

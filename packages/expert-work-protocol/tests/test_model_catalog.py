@@ -208,8 +208,9 @@ def test_thinking_default_field() -> None:
     # model declares its real default. Most default thinking ON; B-105
     # (2026-09-24 实调) found qwen3-vl-plus / qwen3-vl-flash default OFF
     # (enable_thinking is a real opt-in there), and no-knob models keep the
-    # False default.
-    default_off = {("qwen", "qwen3-vl-plus"), ("qwen", "qwen3-vl-flash")}
+    # False default. qwen3-max likewise defaults OFF (same probe: no flag →
+    # reasoning_tokens=null).
+    default_off = {("qwen", "qwen3-max"), ("qwen", "qwen3-vl-plus"), ("qwen", "qwen3-vl-flash")}
     assert ModelEntry(name="x").thinking_default is False
     for provider, models in MODEL_CATALOG.items():
         for entry in models:
@@ -360,8 +361,8 @@ def test_catalog_corrections_from_live_probe() -> None:
     for name in ("glm-4.6v", "glm-4.5v"):
         e = _e("glm", name)
         assert (e.thinking, e.thinking_default) == ("toggle", True)
-    # qwen3-vl 默认不思考、enable_thinking 有效。
-    for name in ("qwen3-vl-plus", "qwen3-vl-flash"):
+    # qwen3-max / qwen3-vl 默认不思考、enable_thinking 有效。
+    for name in ("qwen3-max", "qwen3-vl-plus", "qwen3-vl-flash"):
         e = _e("qwen", name)
         assert (e.thinking, e.thinking_default) == ("budget", False)
 

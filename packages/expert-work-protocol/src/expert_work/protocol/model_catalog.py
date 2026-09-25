@@ -421,7 +421,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             name="qwen3-max",
             vision=False,
             thinking="budget",
-            thinking_default=True,
+            # B-105(2026-09-24 实调)—— 不带思考开关时 reasoning_tokens=null:默认不思考,
+            # enable_thinking 是真的开启项(与 qwen3-vl-* 同形)。旧值 True 是错的。
+            thinking_default=False,
             # B-105 —— 没有合计字段,拼合计走 "split"(见 ModelEntry.output_cap_field)。
             output_cap_field="split",
             thinking_cap=True,

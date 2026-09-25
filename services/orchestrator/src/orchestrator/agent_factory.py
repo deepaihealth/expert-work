@@ -2117,17 +2117,22 @@ def _thinking_budget(effort: str, max_tokens: int | None) -> int:
 _LEGACY_ANTHROPIC_MAX_TOKENS = 4096
 
 
-def _thinking_on(model: ModelSpec, entry: ModelEntry | None) -> bool:
-    """B-105 —— 本次请求思考是否开着(split 拼合计时要知道)。
+def _split_thinking_on(model: ModelSpec) -> bool:
+    """B-105 —— split(通义)模型本次请求思考是否开着:只看思考翻译是否真的发了开启项。
 
-    显式 ``thinking_enabled`` 优先;否则碰过思考旋钮(档位 / adaptive / 思考上限)
-    = 开;否则取目录 ``thinking_default``(目录外 = 关)。
+    唯一口径是 :func:`_thinking_payload` —— 它不发 ``enable_thinking: true`` 就按厂商默认,
+    而通义 split 三款实调默认都不思考;绝不从目录 ``thinking_default`` 推断(推错了会把
+    回答静默压到上限的零头)。
     """
-    if model.thinking_enabled is not None:
-        return model.thinking_enabled
-    if model.effort is not None or model.adaptive_thinking or model.thinking_max_tokens is not None:
-        return True
-    return entry is not None and entry.thinking_default
+    payload = _thinking_payload(model)
+    return payload is not None and payload.get("enable_thinking") is True
+
+
+def _split_thinking_budget(model: ModelSpec, cap: int) -> int:
+    """split 模型思考开着时的思考预算:显式思考上限优先,否则按档位比例推(夹紧)。"""
+    if model.thinking_max_tokens is not None:
+        return model.thinking_max_tokens
+    return _thinking_budget(model.effort or "high", cap)
 
 
 def _output_cap_payload(model: ModelSpec, entry: ModelEntry | None) -> dict[str, Any] | None:
@@ -2149,11 +2154,9 @@ def _output_cap_payload(model: ModelSpec, entry: ModelEntry | None) -> dict[str,
         field = "max_completion_tokens" if model.provider in ("openai", "azure") else "max_tokens"
     if field != "split":
         return {field: cap}
-    if not _thinking_on(model, entry):
+    if not _split_thinking_on(model):
         return {"max_tokens": cap}
-    budget = model.thinking_max_tokens
-    if budget is None:
-        budget = int(cap * _THINKING_BUDGET_RATIO[model.effort or "high"])
+    budget = _split_thinking_budget(model, cap)
     return {"max_tokens": cap - budget, "thinking_budget": budget}
 
 
@@ -2175,6 +2178,17 @@ def _check_output_cap(model: ModelSpec, entry: ModelEntry | None) -> None:
             f"model {model.name!r}: 思考长度上限必须小于输出上限"
             f"(思考 {model.thinking_max_tokens} ≥ 输出 {cap};输出上限含思考)"
         )
+    if (
+        entry.output_cap_field == "split"
+        and model.thinking_max_tokens is None
+        and _split_thinking_on(model)
+    ):
+        budget = _split_thinking_budget(model, cap)
+        if budget >= cap:
+            raise AgentFactoryError(
+                f"model {model.name!r}: 输出上限太小,放不下思考预算"
+                f"(按档位推出的思考预算 {budget} ≥ 输出 {cap};输出上限含思考)"
+            )
 
 
 #: Stream HX-1 (Mini-ADR HX-A4) — fallback window when neither the

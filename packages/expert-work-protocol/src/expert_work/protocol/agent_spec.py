@@ -214,6 +214,25 @@ class ModelSpec(BaseModel):
             data = {k: v for k, v in data.items() if k != "max_tokens"}
         return data
 
+    @model_serializer(mode="wrap")
+    # 同 ``MCPToolSpec._omit_empty_arg_bindings``:不标注返回类型,否则
+    # serialization-mode JSON Schema 塌成 additionalProperties。
+    def _omit_unset_caps(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """B-105 —— 空的 ``max_tokens`` / ``thinking_max_tokens`` 不落库。
+
+        存库走 ``model_dump(by_alias=True, mode="json")``,空值会物化成 ``null``;上一版
+        ``ModelSpec`` 的 ``max_tokens`` 是 int、且 ``extra="forbid"`` 不认
+        ``thinking_max_tokens`` —— 不拦这一下,回滚后每个保存过的 agent 都起不来。
+        只省略这两个键,不全局 exclude_none。fallback 节点各自走一遍。
+        """
+        data: dict[str, Any] = handler(self)
+        for key in ("max_tokens", "thinking_max_tokens"):
+            if data.get(key, 0) is None:
+                data.pop(key)
+        return data
+
 
 # ---------------------------------------------------------------------------
 # system_prompt + dynamic_context
