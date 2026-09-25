@@ -4,12 +4,24 @@
 > (fresh tag / 记录 PR / smoke)原样沿用,本文只写生产差异与一次性开荒。
 > K8s 侧唯一事实源是 `infra/k8s/overlays/prod/`;本文是操作顺序,不是配置副本。
 
-## 发布日
+## 生产现状与下一班
 
-**2026-09-10(周四)** —— 2026-08-31 用户拍板。
+| | |
+|---|---|
+| 生产现在钉的版本 | **`5775fbf3`**(班车 1,2026-09-16 上线,记录 #1567) |
+| 下一班 | **班车 2,发布日待定(等用户指令)**,钉 `f92c6fae`,执行单 [`2026-09-24-prod-release-checklist.md`](./2026-09-24-prod-release-checklist.md)(文件名是原定日期,09-24 没发) |
 
-改期时间线:原定 08-26 → 08-24 改 08-30 → 08-29 延期 → 08-31 定 09-10。
-(勘误:ROADMAP 早前把 08-30 称作「周六」,该日实为周日;旧记录里的星期标注不可信,以日期为准。)
+历次生产发布(执行单都在本目录,发完归档):
+
+| 日期 | 版本 | 内容 | 执行单 / 记录 |
+|---|---|---|---|
+| 2026-09-07 | `2d5742c6` | 生产首发(开荒,§1) | #1422 |
+| 2026-09-08 | `ad79ba28` | 首管理员凭据重发 | #1426 |
+| 2026-09-16 | `5775fbf3` | 班车 1:三段式(B1 `ca225258` → B-50 工作区搬迁 → B2) | [`2026-09-14-prod-release-checklist.md`](./2026-09-14-prod-release-checklist.md)、#1567 |
+| 待定 | `f92c6fae` | 班车 2(原定 09-24,并入 B-84 本波 / B-64 / B-106 / B-102~104 / B-105) | [`2026-09-24-prod-release-checklist.md`](./2026-09-24-prod-release-checklist.md) |
+
+首发改期时间线(留档):原定 08-26 → 08-24 改 08-30 → 08-29 延期 → 08-31 定 09-10 → 实际 09-07 上线。
+旧记录里的星期标注不可信,以日期为准。
 
 ## 拍板记录(2026-08-24)
 
@@ -309,7 +321,14 @@ kubectl -n default get sandboxset expert-work-sandbox \
 **「release.sh 为什么不做」**和**「漏了会怎样」**——只写「要做 X」下次还是会被跳过。
 一并写清**回滚窗口**:这一版有没有单向门(数据搬迁、破坏性迁移),门在哪一步之前。
 
-已有样板:[`2026-09-14-prod-release-checklist.md`](./2026-09-14-prod-release-checklist.md)。
+已有样板:[`2026-09-14-prod-release-checklist.md`](./2026-09-14-prod-release-checklist.md)(三段式)、
+[`2026-09-24-prod-release-checklist.md`](./2026-09-24-prod-release-checklist.md)(单段 + 手工集群对象 + 发前只读盘点)。
+
+**会改变已有 Agent 行为的版本,发前先出只读盘点 SQL**(2026-09-25 B-105 起的惯例):
+改默认值、让某个配置从「不生效」变成「生效」、改计价口径 —— 这类改动对存量 Agent 的影响只能在生产库上数。
+写成只读聚合(不出客户数据),**先在测试库原样跑一遍**,连同「每种结果怎么读」一起写进执行单 §1,由用户在生产上跑。
+执行单里的 `run_sql` 包装带 `SET TRANSACTION READ ONLY`,写语句会直接报错。
+另:**测试环境的价目表是空的**,计价相关的改动在测试上验不出成本数字,只能靠生产盘点。
 
 > ⚠️ runbook 里写的命令,**在它真正要跑的地方跑一遍再交**。2026-09-12 清点时发现
 > 工作区搬迁 runbook 三条命令全跑不起来(模块不在镜像里 / 标签选择器选不中 /
@@ -328,21 +347,10 @@ tools/deploy/release.sh prod            # 确认 'prod';或 --yes 走脚本
 算完(金丝雀未 seed 会 WARNING 跳过 —— 先按 §1.6.7 补 seed)。
 发布窗口:migrate 是 expand-only 约定(向后兼容一版,deployment.md §10)。
 
-P-1(重新生成 / 编辑重发)上线那一次:`alembic upgrade head` 会带上
-`0153_agent_run_supersede`(三列 NULL,秒级)。发布后用探针 user 对金丝雀 agent
-`release-canary` 跑一次 `POST …/runs/{run_id}:regenerate`(queue 模式),再拉
-`/messages` 看旧轮每条带 `superseded_by`、拉 `GET /v1/runs/{id}` 看两轮 `tokens`
-都在(明确不回滚计费)—— 脚本形态见
-`docs/superpowers/plans/2026-09-09-regenerate-edit-resend.md` 的 Task 12。
-
-B-50(工作区按 agent 分层)上线那一次:**金丝雀绿之后立刻跑存量搬迁**,
-按 `docs/runbooks/workspace-agent-scoping-migration.md`。不是择日再跑 ——
-发版完成到搬迁完成之间,控制台工作区浏览面与对外两个 workspace 端点都会返回空
-(文件还在扁平根,新代码按 agent 目录去找)。agent 自己的 run 不受影响
-(PR3 的迁移期读回落兜着),产物与附件接口也不受影响(走数据库字段)。
-`alembic upgrade head` 里的 `0154_artifact_agent_key` 是搬迁的**前置**:
-它没跑或回填链断时,本可归属的产物会被**静默**扫进 `shared/` —— 不报错、
-文件数照样守恒,只有人工比对才看得出来(搬迁脚本自己也会断言这一条并拒绝开工)。
+已完成的一次性动作(留档,**不要再做**):P-1 重新生成上线的 `0153` 验证、B-50 工作区存量搬迁
+(`0154` 前置 + `workspace-agent-scoping-migration.md`)—— 都随班车 1(2026-09-16)做完,
+过程见 [`2026-09-14-prod-release-checklist.md`](./2026-09-14-prod-release-checklist.md)。
+每一版特有的动作一律写进该版执行单,不再往本节追加。
 
 ## 3. 回滚
 

@@ -1,18 +1,22 @@
-# 2026-09-24 生产发布执行单（班车 2）
+# 班车 2 生产发布执行单（原定 2026-09-24，改期待定）
 
+> **⚠️ 2026-09-25 改期说明**：本班 09-24 **没有发**（用户 09-20 拍板等 B-84 本波做完一起发，
+> 之后又陆续合入 B-64 / B-106 / B-102~104 / B-105）。文件名保留原日期，免得外链断；**发布日以表头为准**。
+> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）。
+>
 > 一次性文档，发完归档。通用流程在 [`production-release.md`](./production-release.md)，
 > **这份只列那一份不覆盖的东西**。上一班的单子在
 > [`2026-09-14-prod-release-checklist.md`](./2026-09-14-prod-release-checklist.md)（已归档）。
 
 | | |
 |---|---|
-| 发布日 | **2026-09-24（周四）**，用户 2026-09-17 拍板（原 09-22） |
+| 发布日 | **待定（等用户指令）**。原定 09-24（用户 09-17 拍板，原 09-22），09-20 用户拍板延期等 B-84 本波 |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`139057c8`** —— 测试环境 2026-09-20 第二次发过的那一版（`SMOKE PASS` 17 项全绿，金丝雀真跑 + 产物链 PASS，B-85 ③ 真栈双向验过） |
-| 区间提交数 | **74**（`git log --oneline 5775fbf3..139057c8`） |
-| 数据库迁移 | **三条**：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
+| 本版 tag | **`f92c6fae`** —— 测试环境 2026-09-25 发过的那一版（`release.sh test` smoke PASS + 金丝雀产物链 PASS；B-105 五家真栈回归 + 豆包修复真栈复验，记录 #1667 / #1670） |
+| 区间提交数 | **109**（`git log --oneline 5775fbf3..f92c6fae`；其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1） |
+| 数据库迁移 | **四条**（`0159` 为 09-20 之后追加）：`0159_skill_usage_viewed`（只放宽 `skill_run_usage.outcome` 的 CHECK，允许 `viewed`；不加表不加列不动数据）+ 原三条：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
 | 段数 | **单段**。有迁移但不是三段式：`0156` / `0158` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这些表上正常跑 |
-| 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉 |
+| 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉。`0159` 同理：旧代码从不写 `viewed`，放宽的 CHECK 对它无害；downgrade 会先删掉全部 `viewed` 行 |
 | 沙箱镜像钉子 | `e8aac104` → **`7ac31957`**（Step A）。瘦身 + 只建 amd64，测试实测 619.4→433.7 MiB、拉取 66.19s→40.55s |
 | 新增集群对象 | **留存清理 CronJob `retention-cleanup`**（首次进 prod overlay，`apply -k` 会创建） |
 | 执行人 / 开始时间 | `___________` |
@@ -130,7 +134,47 @@
   隐藏段的文件名前缀歧义指向清单、**平台脚手架行不进控制台内容搜索**（带迁移 `0156`）、
   审计视图里这些行渲染成折叠的「平台自动生成」块。
 
-> **钉子纪律**：本单钉 `139057c8`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+### 0.1 09-20 之后追加（2026-09-25 第七次重钉带上）
+
+全部已合 main、已在测试环境真栈验过。按「对生产行为的影响」从大到小排：
+
+- **B-105 输出上限 / 思考上限**（#1666，09-25 测试 `8eaed4ba` 真栈）：**本批唯一一条会让已有 Agent 行为变化的改动，发前必须先跑 §1 的盘点 SQL。**
+  - 「输出上限」语义定为**思考 + 回答合计**（用户拍板，与 OpenRouter / Claude Code / Anthropic 一致），
+    并且**第一次对非 Anthropic 厂商真正生效**（此前除 Anthropic 外请求体里根本不带上限）。
+  - 存量里的 `max_tokens: 4096` 在非 Anthropic 上是**老默认值、从没生效过**，加载时归一为「厂商默认」
+    —— 这部分行为不变、配置指纹不变。**不是 4096 的值从本版起开始生效**（测试环境 `ai-health-plan`
+    存的 40960 即如此；它历史最长单次输出 33,522，真栈复跑读扫描 PDF 未截断）。
+  - 新增「思考长度上限」（`thinking_max_tokens`，只有通义能用；其它模型填了**保存即拒**）。
+  - 通义只设档位、没设上限的：思考预算的基数从 4096 变成 81920（思考可以更长）。
+  - 豆包档位改走 `reasoning_effort`（此前发的 `budget_tokens` 被厂商忽略）→ **档位从本版起真正生效，high 会变慢**。
+  - 回复被上限截断且不可用时，run 以「模型输出被截断（已用满输出上限 N，含思考）」失败、**照常计费**；
+    计数器 `expert_work_llm_output_truncated_total{provider,model,usable}`。
+  - ⚠️ **回滚影响**：见 §4 新增的一行（`thinking_max_tokens`）。
+- **豆包「开思考、档位留空」400**（#1668，09-25 测试 `f92c6fae` 真栈复验）：此前发 `thinking.type=auto`，
+  seed-2.1 直接 400（**既有 bug，生产现在就有**）。改发 `enabled`。
+- **B-102/103/104 用量记账口径补齐**（#1663，测试 `c78f6d15` 真栈）：run 内规划 / 反思 / 压缩 / 记忆四类调用
+  记入会话用量；输出评审 / 工具评审 / 重排序记入 `platform_overhead`（不进账单、不进对外、不进控制台合计）；
+  **所有用量行按实际回答的模型记**（备用模型接管时不再记在主模型名下）。
+  ⚠️ **计价前置**：价目表没覆盖的模型，成本从「按主模型价错算」变成 **0** → §1 核价目表。
+  **测试环境价目表是空的（0 行），计价这条链在测试上从没验过**，只能到生产上核。
+- **B-64 文档图片按需取用 + B-106 分词表进镜像**（#1661，测试 `f6bf42ee` 真栈）：
+  PDF 等文档里的图按需渲染（`read_page`，渲染页落 NAS 工作区）、看图用量记账、`ask_image` 单次 120s + 默认快看不开思考。
+  B-106：`tiktoken` 分词表构建期打进 control-plane 镜像 —— 修掉「每个新进程第一个 run 卡 56~63s 被存活探针杀掉」，
+  **这条发布当天就会用到**（滚动出来的新 pod 不再被误杀）。
+- **B-84 本波**（#1639 / #1645 / #1647 / #1648 / #1650 / #1651 / #1653 等，测试 `927087ed` 真栈验收 #1657）：
+  工具失败后给模型明确下一步、一次失败不被后面的漂亮话盖过去、`list_dir` / `read_file` 改走宿主 NAS（新增 `search_files`）、
+  每轮工作区树形摘要进提示词、技能体积护栏、技能「被打开过」单独记账（**带迁移 `0159`**）。
+  宿主读 NAS 用的是 control-plane 已有的 `workspace-nas` 挂载与 `EXPERT_WORK_WORKSPACE_NAS_ROOT`（生产 overlay 早已配好），**无新配置**。
+- **其余**：SLI 规则 `token_estimate_drift` 分母改口径（随 `apply -k` 上）、CI（gVisor 走发布 tarball）、
+  dependabot 四批（buildx / build-push action、admin-ui 小版本、python 四包）。
+
+**没有新的手工集群对象、没有新 secret、没有新配置键**：09-20 之后追加的 35 个提交里 `infra/k8s/` 只动了
+`base/observability/rules/sli.yml` 与 test overlay；沙箱镜像没有重烤（钉子仍是 `7ac31957`，Step A 不变）。
+
+> **2026-09-25 第七次重钉：`139057c8` → `f92c6fae`。** 操作位（表头、Step B / C / F、§6）已全部改到新钉子；
+> 下面历史段落里出现的旧 sha 是记账位，按原判据放过。
+
+> **钉子纪律**：本单钉 `f92c6fae`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
@@ -224,12 +268,104 @@
       git fetch origin main
       TAG=<本版 tag>                                        # 见表头「本版 tag」
       git log --oneline 5775fbf3..$TAG | wc -l             # 与表头「区间提交数」对得上
-      git diff --name-only 5775fbf3..$TAG | grep -i migrations/versions   # 期望**恰好三条**：
+      git diff --name-only 5775fbf3..$TAG | grep -i migrations/versions   # 期望**恰好四条**：
       #   packages/expert-work-persistence/migrations/versions/0156_thread_message_hidden.py
       #   packages/expert-work-persistence/migrations/versions/0157_thread_mirror_resweep.py
       #   packages/expert-work-persistence/migrations/versions/0158_run_completion.py
+      #   packages/expert-work-persistence/migrations/versions/0159_skill_usage_viewed.py
       # 多出别的迁移 = 装载和这份单子对不上，停下来查，别往下发
       ```
+
+- [ ] **两条只读盘点 SQL（09-25 新增，由你在生产上跑）**。两条都只读、只出聚合，不含客户数据。
+      跑法相同：把 SQL 存成本地文件，喂给下面这段（`SET TRANSACTION READ ONLY` 兜底，写语句会直接报错）：
+
+      ```sh
+      export KUBECONFIG=~/.kube/expert-work-prod.yaml
+      POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+        -o jsonpath='{.items[0].metadata.name}')
+      run_sql() {  # 用法: run_sql 本地文件.sql
+        { printf 'SQL = r"""\n'; cat "$1"; printf '\n"""\n'; cat <<'EOF'
+      import asyncio
+      from sqlalchemy import text
+      from control_plane.app import _build_sql_stores
+      from control_plane.settings import Settings
+      from control_plane.tenant_scope import bypass_rls_session
+
+      async def main():
+          stores = _build_sql_stores(Settings())
+          try:
+              async with bypass_rls_session():
+                  async with stores.session_factory() as s:
+                      await s.execute(text("SET TRANSACTION READ ONLY"))
+                      r = await s.execute(text(SQL))
+                      print(" | ".join(r.keys()))
+                      for row in r:
+                          print(" | ".join(str(x) for x in row))
+          finally:
+              await stores.engine.dispose()
+
+      asyncio.run(main())
+      EOF
+        } | kubectl -n expert-work exec -i "$POD" -- python3 -
+      }
+      ```
+
+      **① 价目表覆盖（B-102~104 的前置）** —— 把会被计费的模型逐个对价目表：
+
+      ```sql
+      WITH a AS (SELECT spec_json->'spec' AS s FROM agent_spec WHERE status <> 'deleted'),
+      used AS (
+        SELECT s->'model'->>'provider' AS provider, s->'model'->>'name' AS model, 'agent 主模型' AS src FROM a
+        UNION SELECT f->>'provider', f->>'name', 'agent 备用' FROM a, jsonb_array_elements(COALESCE(s->'model'->'fallback','[]'::jsonb)) f
+        UNION SELECT s->'vision'->'model'->>'provider', s->'vision'->'model'->>'name', 'agent 看图' FROM a WHERE jsonb_typeof(s->'vision') = 'object'
+        UNION SELECT f->>'provider', f->>'name', 'agent 看图备用' FROM a, jsonb_array_elements(COALESCE(s->'vision'->'fallbacks','[]'::jsonb)) f
+        UNION SELECT s->'dynamic_workers'->'model'->>'provider', s->'dynamic_workers'->'model'->>'name', 'worker 模型' FROM a WHERE jsonb_typeof(s->'dynamic_workers'->'model') = 'object'
+        UNION SELECT judge_provider, judge_model, '平台评审模型' FROM platform_judge_config WHERE judge_model IS NOT NULL
+        UNION SELECT 'qwen', 'qwen-plus', '重排序(settings 默认 rerank_model)'
+        UNION SELECT DISTINCT provider, model, '近 30 天实际用量' FROM token_usage WHERE observed_at > now() - interval '30 days'
+      )
+      SELECT u.provider, u.model, string_agg(DISTINCT u.src, ' / ') AS used_as,
+             CASE WHEN EXISTS (SELECT 1 FROM model_rate_card r WHERE r.tenant_id IS NULL AND r.provider = u.provider AND r.model = u.model)
+                  THEN '有' ELSE '⚠️ 缺' END AS platform_rate_card
+      FROM used u WHERE u.model IS NOT NULL
+      GROUP BY u.provider, u.model
+      ORDER BY platform_rate_card DESC, u.provider, u.model
+      ```
+
+      判据：**`⚠️ 缺` 的行要么发前补价（控制台价目表页），要么明确接受「这些模型的成本记 0」**，写进 §6。
+      测试环境跑出来是全缺（价目表 0 行）—— 那是测试的现状，不是 SQL 错了。
+
+      **② 输出上限 / 思考档位盘点（B-105 的前置）** —— 哪些 Agent 的行为会因本版变化：
+
+      ```sql
+      WITH a AS (SELECT name, spec_json->'spec' AS s FROM agent_spec WHERE status <> 'deleted'),
+      m AS (
+        SELECT name, s->'model' AS mm FROM a
+        UNION ALL SELECT name, f FROM a, jsonb_array_elements(COALESCE(s->'model'->'fallback','[]'::jsonb)) f
+        UNION ALL SELECT name, s->'vision'->'model' FROM a WHERE jsonb_typeof(s->'vision') = 'object'
+        UNION ALL SELECT name, f FROM a, jsonb_array_elements(COALESCE(s->'vision'->'fallbacks','[]'::jsonb)) f
+      )
+      SELECT mm->>'provider' AS provider, mm->>'name' AS model,
+             COALESCE(mm->>'max_tokens','<空>') AS max_tokens,
+             COALESCE(mm->>'effort','<空>') AS effort,
+             COALESCE(mm->>'thinking_enabled','<空>') AS thinking_enabled,
+             count(*) AS entries,
+             string_agg(DISTINCT CASE WHEN name = 'ai-health-plan' THEN 'ai-health-plan' END, ',') AS named
+      FROM m GROUP BY 1,2,3,4,5 ORDER BY 1,2,3
+      ```
+
+      读法：
+
+      | 看到的行 | 本版之后 |
+      |---|---|
+      | 非 anthropic，`max_tokens` = 4096 或 `<空>` | 行为不变（4096 是老默认，从没生效过） |
+      | 非 anthropic，`max_tokens` 是别的值 | **这个上限开始生效**（含思考）。偏小的（< 16000）发前和 Agent 负责人确认 |
+      | qwen，有 `effort`、`max_tokens` 空 | 思考可以更长（预算基数 4096 → 81920） |
+      | doubao，有 `effort` | 档位开始真正生效（high 会变慢） |
+      | doubao，`thinking_enabled=true`、`effort` 空 | **生产现在每次都 400**（看图位只影响「细看」），本版修好 |
+      | anthropic | 不变（空 = 4096） |
+
+      两条 SQL 都已在测试库原样跑过（09-25）。
 
 - [ ] **预拉三个 base 镜像**（ECR Public 按 IP 限流，一天能红六次；建镜像前先拉一遍，
       见 [`production-release.md`](./production-release.md) 的预拉脚本）。
@@ -467,15 +603,15 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 
 ```sh
 git fetch origin main
-git checkout 139057c8
+git checkout f92c6fae
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `139057c8`
+- [ ] 确认 checkout 的是 `f92c6fae`
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
-- [ ] migrate Job `condition met`，且日志里出现**两条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`（本版不是空跑）
+- [ ] migrate Job `condition met`，且日志里出现**四条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`、`0157… -> 0158_run_completion`、`0158… -> 0159_skill_usage_viewed`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
 - [ ] **smoke 全绿，且阶段 6 金丝雀是 PASS 不是 WARNING**
 - [ ] smoke 里的沙箱钉子检查是 `OK`（Step A 做过了；显示 `WARN 落后 N` 说明 Step A 漏了）
@@ -489,7 +625,7 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `139057c8`（admin-ui 是 `139057c8-prod`）
+- [ ] 三个应用镜像都是 `f92c6fae`（admin-ui 是 `f92c6fae-prod`）
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -511,8 +647,14 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 - [ ] **B-67 / B-61（只读观察，可留到次日）**：对接方跑过一轮之后，在控制台看那一轮的系统提示词
       —— 变量位置应当是 `$EXPERT_WORK_INPUTS_DIR/...` 的本地路径，不再是原始签名链接。
 - [ ] **审批（可选）**：rollout 全部完成之后再处理任何待审批；确认批准之后只执行审批单上那一条。
+- [ ] **B-106**：新 pod 起来后的**第一个** run（金丝雀就是）不再卡顿；`kubectl -n expert-work get pods` 的 RESTARTS 仍是 0
+      （修之前每个新进程首个 run 卡 56~63s 被存活探针杀）。
+- [ ] **B-102~104**：金丝雀这一轮的 `end` 帧 `usage_by_model` 有值；控制台该会话的成本 —— 价目表缺的模型会显示 0，
+      与 §1 ① 的结果对得上即可。
+- [ ] **B-105（只读观察）**：发布后 24h 内看 `expert_work_llm_output_truncated_total` 有没有 `usable="false"` 的增长。
+      有增长 = 某个 Agent 的上限偏小开始截断，对照 §1 ② 的盘点结果找到它，和负责人商量调大上限。
 
-### Step E — 次日核对（09-25 早上）
+### Step E — 次日核对（发布次日早上）
 
 - [ ] **留存清理首跑**：
 
@@ -537,9 +679,9 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag 139057c8` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag f92c6fae` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、回滚命令。
-- [ ] ROADMAP 班车 2 行销案；本执行单补 §6 执行记录。
+- [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 的「生产待发」改成已上线；本执行单补 §6 执行记录。
 
 ---
 
@@ -549,7 +691,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 tools/deploy/rollback.sh prod 5775fbf3
 ```
 
-一个档位就够：本版**有一条迁移但不用退**，没有数据搬迁，旧镜像直接能跑在当前 schema 上。
+一个档位就够：本版**有四条迁移但都不用退**，没有数据搬迁，旧镜像直接能跑在当前 schema 上。
 
 🚫 **不要 `alembic downgrade`。** `0156` 是纯加列（`thread_message.hidden`，带默认 `false`）：
 旧版本的 ORM 不映射这一列，既不 SELECT 也不 INSERT，`server_default` 兜住写入 —— 多这一列
@@ -562,6 +704,7 @@ tools/deploy/rollback.sh prod 5775fbf3
 |---|---|---|
 | Agent 配置里的 `arg_bindings`（工具参数绑定） | 旧版 `MCPToolSpec` 是 `extra="forbid"`，读到带 `arg_bindings` 的配置**校验失败 → Agent 起不来** | 回滚窗口内**别在生产配绑定**；配了就先在配置页删掉再回滚 |
 | 变量上的 `render: raw` | 同上，旧版 `PromptVariableSpec` 也是 `extra="forbid"` | 同上 |
+| 模型上的「思考长度上限」（`thinking_max_tokens`，B-105） | 旧版 `ModelSpec` 也是 `extra="forbid"`，读到这个字段**校验失败 → Agent 起不来**。留空的上限不落库，所以只有**真填了**的才有问题 | 回滚前先在配置页清空再回滚。另：回滚后非 Anthropic 的输出上限重新**全部不生效**，豆包「开思考不填档位」重新 400 |
 | 留存 CronJob | `apply -k` 旧 overlay **不会**删掉已创建的对象 | 要一并退掉就显式删：`kubectl -n expert-work delete cronjob retention-cleanup` |
 
 沙箱钉子单独回：`git checkout 5775fbf3 -- infra/k8s/sandbox/sandboxset.yaml && kubectl apply -f infra/k8s/sandbox/sandboxset.yaml`
@@ -589,7 +732,7 @@ tools/deploy/rollback.sh prod 5775fbf3
 
 ---
 
-## 6. 执行记录（2026-09-24，发完当晚写）
+## 6. 执行记录（发完当晚写）
 
 | 项 | 实况 |
 |---|---|
@@ -597,7 +740,9 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 发布前在跑 / 排队 / 待审批 | `___` |
 | Step A 沙箱钉子 | 发前 `________` → 发后 `________` |
 | Step B smoke / 金丝雀 | `________` |
-| migrate Job | 期望跑两条（`0156` + `0157`），实况 `________` |
+| migrate Job | 期望跑四条（`0156` ~ `0159`），实况 `________` |
 | CronJob 创建 | `________` |
 | 次日首跑删除计数 | `________` |
+| §1 ① 价目表缺的模型 / 处理方式 | `________` |
+| §1 ② 会变化的上限（Agent / 值） | `________` |
 | 与执行单不符之处 | `________` |
