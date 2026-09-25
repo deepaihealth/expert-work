@@ -43,7 +43,7 @@ deepseek-reasoner/kimi-k2-thinking 恒思考)。`ModelSpec` 只有 `effort`
 | effort | anthropic | `output_config.effort`(有 effort)/ 默认动态(无)| `thinking:{type:"disabled"}` |
 | effort | openai/azure/deepseek | `reasoning_effort:<effort>` / 省略(默认开)| `reasoning_effort:"minimal"`(**不能全关**)|
 | budget | qwen | `enable_thinking:true`(+`thinking_budget`)| `enable_thinking:false` |
-| budget | doubao | `thinking:{type:"enabled",budget_tokens}`/`{type:"auto"}` | `thinking:{type:"disabled"}` |
+| effort(B-105 起) | doubao | `reasoning_effort` / 无档位时 `thinking:{type:"enabled"}`(seed-2.1 拒 `auto`) | `thinking:{type:"disabled"}` |
 | toggle | glm/kimi | `thinking:{type:"enabled"}` | `thinking:{type:"disabled"}` |
 | None | haiku/embeddings/恒思考 | — 无开关 — | — |
 
