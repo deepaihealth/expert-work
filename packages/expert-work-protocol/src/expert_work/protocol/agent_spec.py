@@ -32,6 +32,9 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ModelWrapValidatorHandler,
+    PrivateAttr,
+    SerializationInfo,
     SerializerFunctionWrapHandler,
     model_serializer,
     model_validator,
@@ -80,6 +83,11 @@ class TenantConfig(BaseModel):
 
 #: B-105 —— 旧的 ``ModelSpec.max_tokens`` 默认值;非 Anthropic 模型上加载时归一成空。
 _LEGACY_DEFAULT_MAX_TOKENS = 4096
+
+#: B-105 —— 序列化 context 键:为真时,加载时被归一掉的 4096 原样写回输出。只给
+#: 「与库里旧哈希比对」用(``compute_spec_sha256(..., restore_legacy_max_tokens=True)``),
+#: 存库 / 接口输出都不带这个 context,照旧省略。
+RESTORE_LEGACY_MAX_TOKENS_CONTEXT = "restore_legacy_max_tokens"
 
 
 class ModelSpec(BaseModel):
@@ -197,28 +205,41 @@ class ModelSpec(BaseModel):
     #: 通义 ``thinking_budget``),其他模型填了构建即报错。与 ``max_tokens`` 脱钩,不再按比例推。
     thinking_max_tokens: int | None = Field(default=None, gt=0)
 
-    @model_validator(mode="before")
+    #: B-105 —— 加载时是否把旧默认 4096 归一掉了。不进输出;只在序列化 context 带
+    #: :data:`RESTORE_LEGACY_MAX_TOKENS_CONTEXT` 时用来把 4096 写回,还原旧版的落库形态。
+    _legacy_max_tokens_dropped: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="wrap")
     @classmethod
-    def _drop_legacy_default_max_tokens(cls, data: Any) -> Any:
+    def _drop_legacy_default_max_tokens(
+        cls, data: Any, handler: ModelWrapValidatorHandler[ModelSpec]
+    ) -> ModelSpec:
         """B-105 —— 非 Anthropic 模型上的 ``max_tokens: 4096`` 归一成空(厂商默认)。
 
         4096 是旧默认值,前端表单会把它原样写回清单,而它在这些厂商上从未发出过;
         留着它会在本次改动后突然变成真上限。复制一份再删,不改调用方的 dict。
         ``fallback`` 节点是嵌套的 ModelSpec,各自走一遍。
+
+        删掉时在实例上记一笔:存量 manifest 的 ``spec_sha256`` 是按含 4096 的旧形态
+        算的,``bind_exec_spec`` 靠这笔记录把「只因这次归一而分叉」与真分叉分开。
         """
-        if (
+        dropped = (
             isinstance(data, dict)
             and data.get("provider") != "anthropic"
             and data.get("max_tokens") == _LEGACY_DEFAULT_MAX_TOKENS
-        ):
+        )
+        if dropped:
             data = {k: v for k, v in data.items() if k != "max_tokens"}
-        return data
+        spec = handler(data)
+        if dropped:
+            spec._legacy_max_tokens_dropped = True
+        return spec
 
     @model_serializer(mode="wrap")
     # 同 ``MCPToolSpec._omit_empty_arg_bindings``:不标注返回类型,否则
     # serialization-mode JSON Schema 塌成 additionalProperties。
     def _omit_unset_caps(  # type: ignore[no-untyped-def]
-        self, handler: SerializerFunctionWrapHandler
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
     ):
         """B-105 —— 空的 ``max_tokens`` / ``thinking_max_tokens`` 不落库。
 
@@ -226,11 +247,21 @@ class ModelSpec(BaseModel):
         ``ModelSpec`` 的 ``max_tokens`` 是 int、且 ``extra="forbid"`` 不认
         ``thinking_max_tokens`` —— 不拦这一下,回滚后每个保存过的 agent 都起不来。
         只省略这两个键,不全局 exclude_none。fallback 节点各自走一遍。
+
+        context 带 :data:`RESTORE_LEGACY_MAX_TOKENS_CONTEXT` 时,加载时归一掉的 4096
+        写回来 —— 只用于重算存量 manifest 的旧哈希,不落库。
         """
         data: dict[str, Any] = handler(self)
         for key in ("max_tokens", "thinking_max_tokens"):
             if data.get(key, 0) is None:
                 data.pop(key)
+        context = info.context
+        if (
+            self._legacy_max_tokens_dropped
+            and isinstance(context, dict)
+            and context.get(RESTORE_LEGACY_MAX_TOKENS_CONTEXT)
+        ):
+            data["max_tokens"] = _LEGACY_DEFAULT_MAX_TOKENS
         return data
 
 

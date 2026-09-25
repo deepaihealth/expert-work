@@ -23,16 +23,24 @@ from expert_work.protocol import (
     PlatformAgentTemplateStatus,
     PlatformAgentTemplateUpsert,
 )
-from expert_work.protocol.agent_spec import AgentSpec
+from expert_work.protocol.agent_spec import RESTORE_LEGACY_MAX_TOKENS_CONTEXT, AgentSpec
 
 
-def compute_spec_sha256(spec: AgentSpec) -> str:
+def compute_spec_sha256(spec: AgentSpec, *, restore_legacy_max_tokens: bool = False) -> str:
     """Stable content hash of a manifest (canonical JSON: by alias, sorted keys).
 
     A template's sha is independent of the per-tenant ``agent_spec`` sha — it only
-    marks "did this version's base manifest change" for templates."""
+    marks "did this version's base manifest change" for templates.
+
+    ``restore_legacy_max_tokens`` (B-105) re-inserts the legacy ``max_tokens: 4096``
+    that loading normalised away on non-Anthropic models, reproducing the hash the
+    pre-B-105 version stored. Comparison only — never use it for a hash that is
+    written."""
+    context = {RESTORE_LEGACY_MAX_TOKENS_CONTEXT: True} if restore_legacy_max_tokens else None
     payload = json.dumps(
-        spec.model_dump(by_alias=True, mode="json"), sort_keys=True, separators=(",", ":")
+        spec.model_dump(by_alias=True, mode="json", context=context),
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
