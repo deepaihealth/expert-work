@@ -1131,3 +1131,34 @@ async def test_plain_client_error_propagates_without_fallback() -> None:
             tools=[ToolSpec(name="active_tool", description="x")],
         )
     assert len(client.calls) == 1  # no resend on the non-beta path
+
+
+# ---------------------------------------------------------------------------
+# B-105 —— stop_reason 进 response_metadata(截断判定读它)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usage", [None, {"input_tokens": 3, "output_tokens": 2}])
+async def test_stop_reason_lands_in_response_metadata(usage: dict[str, int] | None) -> None:
+    body: dict[str, Any] = {
+        "content": [{"type": "text", "text": "partial"}],
+        "stop_reason": "max_tokens",
+    }
+    if usage is not None:
+        body["usage"] = usage
+    provider = AnthropicProvider(client=RecordingAnthropicClient(response=body), model="claude")
+
+    result = await provider.complete(messages=[HumanMessage(content="hi")], tools=[])
+
+    assert result.response_metadata["stop_reason"] == "max_tokens"
+
+
+@pytest.mark.asyncio
+async def test_missing_stop_reason_leaves_metadata_without_it() -> None:
+    client = RecordingAnthropicClient(response={"content": [{"type": "text", "text": "x"}]})
+    provider = AnthropicProvider(client=client, model="claude")
+
+    result = await provider.complete(messages=[HumanMessage(content="hi")], tools=[])
+
+    assert "stop_reason" not in result.response_metadata

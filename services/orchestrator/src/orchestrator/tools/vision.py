@@ -29,10 +29,15 @@ from uuid import UUID
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
+from expert_work.common.observability.metrics import expert_work_counter
 from expert_work.protocol.multimodal import (
     WORKSPACE_REF_PREFIX,
     parse_image_ref,
     parse_workspace_image_ref,
+)
+from expert_work.runtime.middleware.llm_error_handling import (
+    LLMClientError,
+    LLMUnauthorizedError,
 )
 from orchestrator.multimodal import (
     ImageResolver,
@@ -67,6 +72,13 @@ _SYSTEM_PROMPT = (
 #: 超时对「一直在吐思考 token」的推理模型不触发(实测同类问题 11s 与 234s 两次),
 #: 所以这里在工具层再加一道整体上限。
 ASK_IMAGE_TIMEOUT_S = 120.0
+
+#: B-105 —— 快看的「关思考」参数被厂商拒(4xx)、退回正常看图的次数。``model`` 是看图主模型名。
+vision_quick_fallback_total = expert_work_counter(
+    "expert_work_vision_quick_fallback_total",
+    "ask_image quick looks rejected by the vendor and retried with the configured thinking.",
+    ("model",),
+)
 
 AskImageDepth = Literal["quick", "deep"]
 _DEPTHS: tuple[AskImageDepth, ...] = ("quick", "deep")
@@ -113,6 +125,8 @@ class AskImageTool:
     quick_vl_caller: LLMCaller | None = None
     #: B-64 Task 10 —— 单次 VL 调用的整体上限;只有测试会改它。
     timeout_s: float = ASK_IMAGE_TIMEOUT_S
+    #: B-105 —— 看图主模型名,只用作快看退回计数器的标签。
+    vl_model_name: str = ""
 
     @property
     def spec(self) -> ToolSpec:
@@ -214,11 +228,28 @@ class AskImageTool:
                 ]
             ),
         ]
-        caller = self.vl_caller
         if depth == "quick" and self.quick_vl_caller is not None:
-            caller = self.quick_vl_caller
-        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-            response = await self._call_with_limit(caller, messages, depth=depth, ctx=ctx)
+            try:
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    response = await self._call_with_limit(
+                        self.quick_vl_caller, messages, depth=depth, ctx=ctx
+                    )
+            except LLMClientError as exc:
+                if not _quick_rejected(exc):
+                    raise
+                # B-105 —— 关思考的参数被这家拒了(目录没实调过的新模型最常见):退回 Agent
+                # 原本的看图配置再看一次,而不是让看图整个失败。
+                vision_quick_fallback_total.labels(model=self.vl_model_name).inc()
+                logger.warning("ask_image.quick_rejected_fallback err=%s", type(exc).__name__)
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    response = await self._call_with_limit(
+                        self.vl_caller, messages, depth=depth, ctx=ctx
+                    )
+        else:
+            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                response = await self._call_with_limit(
+                    self.vl_caller, messages, depth=depth, ctx=ctx
+                )
         # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
         # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
         # 两样都不做,也与主模型一致。
@@ -483,6 +514,17 @@ def _require_string(args: Mapping[str, Any], key: str) -> str:
         msg = f"ask_image requires a non-empty {key!r} string"
         raise ValueError(msg)
     return raw.strip()
+
+
+def _quick_rejected(exc: LLMClientError) -> bool:
+    """B-105 —— 快看被厂商拒、值得用正常看图再试一次:4xx 且不是 401。
+
+    路由对 4xx 不走备用链、原样抛出(不包成 ``AllProvidersExhaustedError``),所以这里
+    直接判异常本身。401 是凭据问题,换一套思考参数一样失败;真路由里它还是 key 级错误,
+    轮完整条链后被包成 ``AllProvidersExhaustedError``、根本进不了这里。429
+    (``LLMRateLimitError``)不继承 ``LLMClientError``,也进不了这里。
+    """
+    return not isinstance(exc, LLMUnauthorizedError)
 
 
 def _stringify(content: Any) -> str:

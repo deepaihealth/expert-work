@@ -372,6 +372,8 @@ class AnthropicStreamAssembler:
         body: dict[str, Any] = {"content": blocks}
         if self._usage:
             body["usage"] = self._usage
+        if self._finish:
+            body["stop_reason"] = self._finish
         return _from_anthropic_response(body)
 
 

@@ -475,6 +475,7 @@ def _register_ask_image(
             workspace_store=env.workspace_store,
             usage_meter=vl_usage_meter,
             quick_vl_caller=quick_vl_caller,
+            vl_model_name=vision.model.name,
         )
     )
 

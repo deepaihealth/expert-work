@@ -109,3 +109,22 @@ async def test_stream_then_assemble_tool_use_equals_complete() -> None:
     assert got.tool_calls == expected.tool_calls
     assert got.content == expected.content
     assert got.usage_metadata == expected.usage_metadata
+
+
+@pytest.mark.asyncio
+async def test_assembled_message_carries_the_stream_stop_reason() -> None:
+    # B-105 —— 截断判定读 response_metadata["stop_reason"];流式与非流式同形。
+    events = _text_events()
+    events[3] = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "max_tokens"},
+        "usage": {"output_tokens": 2},
+    }
+    provider = AnthropicProvider(
+        client=RecordingAnthropicClient(stream_events=events), model="claude-x", max_tokens=1024
+    )
+    asm = provider.new_stream_assembler()
+    async for d in provider.stream(messages=[HumanMessage(content="hi")], tools=[]):
+        asm.add(d)
+
+    assert asm.build().response_metadata["stop_reason"] == "max_tokens"

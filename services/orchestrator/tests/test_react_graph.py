@@ -305,3 +305,159 @@ async def test_parallel_tool_calls_produce_separate_toolmessages() -> None:
     tool_msgs = [m for m in state["messages"] if isinstance(m, ToolMessage)]
     assert [m.tool_call_id for m in tool_msgs] == ["tc-1", "tc-2"]
     assert state["messages"][-1].content == "done"
+
+
+# ---------------------------------------------------------------------------
+# B-105 —— 输出被上限截断
+# ---------------------------------------------------------------------------
+
+
+def _truncated_count(usable: str) -> float:
+    from prometheus_client import REGISTRY
+
+    value = REGISTRY.get_sample_value(
+        "expert_work_llm_output_truncated_total",
+        {"provider": "glm", "model": "glm-5.3", "usable": usable},
+    )
+    return value or 0.0
+
+
+@dataclass
+class _StreamingScriptedLLM(_ScriptedLLM):
+    """``run_agent`` 接了 token 流,调用会多带 ``on_delta``;脚本回答不走流。"""
+
+    async def __call__(
+        self,
+        *,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[ToolSpec],
+        on_delta: Any = None,
+    ) -> AIMessage:
+        del on_delta
+        return await super().__call__(messages=messages, tools=tools)
+
+
+async def _run_through_sse(llm: _ScriptedLLM, registry: ToolRegistry) -> tuple[list[Any], Any]:
+    """真 graph 过 ``run_agent``:断言落在用户看得见的 error 帧与 run 行上。"""
+    from uuid import uuid4
+
+    from expert_work.runtime.runs import InMemoryRunStore, RunManager
+    from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
+    from orchestrator.sse import run_agent
+
+    bridge = InMemoryStreamBridge()
+    store = InMemoryRunStore()
+    rm = RunManager(store=store)
+    record = await rm.create(run_id=uuid4(), thread_id=uuid4(), tenant_id=uuid4())
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm,
+                tool_registry=registry,
+                output_cap=2048,
+                model_provider="glm",
+                model_name="glm-5.3",
+            )
+        )
+        await run_agent(
+            bridge=bridge,
+            run_manager=rm,
+            record=record,
+            graph=compiled,
+            graph_input={
+                "messages": [HumanMessage(content="start")],
+                "step_count": 0,
+                "max_steps": 5,
+            },
+            config={"configurable": {"thread_id": str(record.thread_id)}},
+        )
+    events: list[Any] = []
+    async for entry in bridge.subscribe(record.run_id, heartbeat_interval=5.0):
+        if is_end(entry):
+            break
+        events.append(entry)
+    row = await store.get(run_id=record.run_id, tenant_id=record.tenant_id)
+    return events, row
+
+
+@pytest.mark.asyncio
+async def test_truncated_empty_reply_fails_the_run_visibly() -> None:
+    # 思考模型截断的实测形态:额度全给了思考,正文为空。
+    before = _truncated_count("false")
+    llm = _StreamingScriptedLLM(
+        responses=[AIMessage(content="", response_metadata={"finish_reason": "length"})]
+    )
+
+    events, row = await _run_through_sse(llm, ToolRegistry())
+
+    errors = [e for e in events if e.event == "error"]
+    assert len(errors) == 1
+    assert errors[0].data["name"] == "OutputTruncatedError"
+    assert "模型输出被截断" in errors[0].data["message"]
+    assert "2048" in errors[0].data["message"]
+    assert row is not None and row.error is not None and "模型输出被截断" in row.error
+    assert _truncated_count("false") == before + 1
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_call_fails_before_dispatch() -> None:
+    # 截断时最后一个工具调用的参数必然被截:不能把残缺参数派给工具。
+    llm = _StreamingScriptedLLM(
+        responses=[
+            AIMessage(
+                content="好的,我来写文件",
+                tool_calls=[_tool_call("write_file", {}, "tc-1")],
+                response_metadata={"stop_reason": "max_tokens"},
+            )
+        ]
+    )
+    tool = _CountingTool(name="write_file")
+    registry = ToolRegistry()
+    registry.register(tool)
+
+    events, _ = await _run_through_sse(llm, registry)
+
+    assert [e.data["name"] for e in events if e.event == "error"] == ["OutputTruncatedError"]
+    assert tool.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_truncated_but_usable_text_is_delivered_and_counted() -> None:
+    before = _truncated_count("true")
+    llm = _StreamingScriptedLLM(
+        responses=[
+            AIMessage(content="一段完整度够用的回答", response_metadata={"finish_reason": "length"})
+        ]
+    )
+
+    events, _ = await _run_through_sse(llm, ToolRegistry())
+
+    assert [e for e in events if e.event == "error"] == []
+    assert _truncated_count("true") == before + 1
+
+
+@pytest.mark.asyncio
+async def test_truncation_without_wiring_labels_is_still_judged() -> None:
+    # 不接 output_cap / 模型名(单测 / 子图)也判;报错文案退到「厂商默认值」。
+    from orchestrator.llm.truncation import OutputTruncatedError
+
+    llm = _ScriptedLLM(
+        responses=[AIMessage(content="", response_metadata={"finish_reason": "length"})]
+    )
+    with pytest.raises(OutputTruncatedError, match="厂商默认值"):
+        await _run_graph(llm, ToolRegistry())
+
+
+@dataclass
+class _CountingTool:
+    name: str
+    calls: int = 0
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=self.name, description=f"counting {self.name}")
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        self.calls += 1
+        return ToolResult(content="ok")

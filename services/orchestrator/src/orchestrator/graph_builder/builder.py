@@ -161,6 +161,12 @@ from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
+from orchestrator.llm.truncation import (
+    OutputTruncatedError,
+    is_truncated,
+    is_unusable_truncation,
+    output_truncated_total,
+)
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
@@ -557,6 +563,12 @@ def build_react_graph(
     # keeps every path byte-identical to pre-PR-3 behaviour. See the
     # finalization block inside ``agent_node`` for the enforcement mechanism.
     output_schema: StructuredOutputSpec | None = None,
+    # B-105 —— 主模型的输出上限(manifest ``model.max_tokens``,``None`` = 厂商默认)与
+    # 厂商 / 模型名:只用于截断报错的文案与计数器标签。备用模型应答的截断也记在主模型
+    # 名下(节点看不到实际应答的是谁)。不接线(单测 / 子图)= 照常判截断,标签为空。
+    output_cap: int | None = None,
+    model_provider: str = "",
+    model_name: str = "",
 ) -> StateGraph[AgentState, None, AgentState, AgentState]:
     """Assemble the ReAct ``StateGraph`` and return it uncompiled.
 
@@ -1176,6 +1188,17 @@ def build_react_graph(
         # separately, inside ``_finalize_structured_response``.
         if token_budget is not None:
             token_budget.add(usage_total(getattr(response, "usage_metadata", None)))
+
+        # B-105 —— 截断:答案不可用就让 run 可见地失败(在路由之后,不触发 fallback);
+        # 正文可用照常交付,只计数。缓存命中的旧回答不再判(存进缓存前已判过)。
+        if cache_hit_response is None and is_truncated(response):
+            usable = not is_unusable_truncation(response)
+            output_truncated_total.labels(
+                provider=model_provider, model=model_name, usable=str(usable).lower()
+            ).inc()
+            if not usable:
+                raise OutputTruncatedError(output_cap)
+            logger.warning("agent_node.output_truncated_usable model=%s", model_name)
 
         # Budget-exhausted turn must terminate: no tools were bound so the model
         # shouldn't emit tool_calls, but strip any it returns anyway (defends
