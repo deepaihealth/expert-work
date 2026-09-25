@@ -2257,8 +2257,10 @@ def _thinking_enable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, A
             # (200 正常返回,思考长度不受限);真正生效的档位控制是
             # ``reasoning_effort``(实调 minimal/low/medium/high 有效、无 max —
             # effort_map 把 max 顶到 high)。
+            # 开思考不带档位发 ``type: enabled``:seed-2.1 拒 ``type: auto``
+            # (2026-09-25 实调 400 Unsupported thinking type,enabled/disabled/不传都 200)。
             if model.effort is None:
-                return {"thinking": {"type": "auto"}}
+                return {"thinking": {"type": "enabled"}}
             return {"reasoning_effort": _vendor_effort(entry, model.effort)}
         # OpenAI / Azure / DeepSeek — ``reasoning_effort`` shares the
         # manifest's level names (no catalog effort_map → passthrough).

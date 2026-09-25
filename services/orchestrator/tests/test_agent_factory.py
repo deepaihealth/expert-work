@@ -1538,13 +1538,17 @@ def test_thinking_payload_budget_vendors() -> None:
     # reasoning_effort(不再算 max_tokens 比例);"budget" 分支此后只剩通义。
     doubao = _thinking_payload(_vendor_model("doubao", "doubao-seed-2.0-pro", effort="low"))
     assert doubao == {"reasoning_effort": "low"}
-    # adaptive-only: qwen opens thinking without a budget; doubao uses auto.
+    # adaptive-only: qwen opens thinking without a budget; doubao sends enabled
+    # (seed-2.1 rejects ``type: auto`` with a 400).
     assert _thinking_payload(_vendor_model("qwen", "qwen3.7-max", adaptive_thinking=True)) == {
         "enable_thinking": True
     }
     assert _thinking_payload(
         _vendor_model("doubao", "doubao-seed-2.0-pro", adaptive_thinking=True)
-    ) == {"thinking": {"type": "auto"}}
+    ) == {"thinking": {"type": "enabled"}}
+    assert _thinking_payload(
+        _vendor_model("doubao", "doubao-seed-2-1-pro-260628", thinking_enabled=True)
+    ) == {"thinking": {"type": "enabled"}}
 
 
 def test_thinking_payload_budget_clamps_at_ceiling() -> None:
