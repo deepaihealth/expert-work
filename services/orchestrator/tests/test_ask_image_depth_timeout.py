@@ -801,6 +801,7 @@ async def test_real_router_surfaces_the_vendor_400_and_the_tool_falls_back(
 ) -> None:
     # 真路由:4xx 不走备用链、原样抛出(不包成 AllProvidersExhaustedError),工具据此退回
     # deep 路由 —— 同一个模型带着配置原样的思考参数再看一次。
+    before = _quick_fallback_count("qwen3.6-plus")
     harness = _Harness(rejects_quick=frozenset({"qwen3.6-plus"}))
     vision = {
         "model": {"provider": "qwen", "name": "qwen3.6-plus", "thinking_enabled": True},
@@ -808,6 +809,9 @@ async def test_real_router_surfaces_the_vendor_400_and_the_tool_falls_back(
     }
 
     content, _ = await harness.run(monkeypatch, vision, depth=None)
+
+    # 计数器标签是 factory 从 vision 块接进来的看图主模型名。
+    assert _quick_fallback_count("qwen3.6-plus") == before + 1
 
     # 输出被 spotlight 围栏改写,只比模型名
     assert "qwen3.6-plus" in content and "tool error" not in content
