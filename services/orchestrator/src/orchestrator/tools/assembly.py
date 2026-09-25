@@ -36,6 +36,7 @@ from expert_work.protocol import (
 )
 from expert_work.runtime.tokens import default_estimator
 from orchestrator.errors import AgentFactoryError
+from orchestrator.llm.truncation import served_output_cap
 from orchestrator.multimodal import ImageResolver
 from orchestrator.tools.approval import AskForApprovalTool
 from orchestrator.tools.arg_bindings import bindings_by_tool
@@ -476,6 +477,7 @@ def _register_ask_image(
             usage_meter=vl_usage_meter,
             quick_vl_caller=quick_vl_caller,
             vl_model_name=vision.model.name,
+            output_cap_resolver=served_output_cap(vision.model),
         )
     )
 

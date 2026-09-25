@@ -39,6 +39,11 @@ from expert_work.runtime.middleware.llm_error_handling import (
     LLMClientError,
     LLMUnauthorizedError,
 )
+from orchestrator.llm.truncation import (
+    ServedOutputCap,
+    is_unusable_truncation,
+    output_truncated_total,
+)
 from orchestrator.multimodal import (
     ImageResolver,
     image_ref_block,
@@ -47,7 +52,7 @@ from orchestrator.multimodal import (
     unreadable_workspace_image_text,
 )
 from orchestrator.tools._guards import usage_total
-from orchestrator.tools.error_classifier import GuidedTimeoutError
+from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
 from orchestrator.tools.figure_lookup import resolve_rendered_figure
 from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -127,6 +132,9 @@ class AskImageTool:
     timeout_s: float = ASK_IMAGE_TIMEOUT_S
     #: B-105 —— 看图主模型名,只用作快看退回计数器的标签。
     vl_model_name: str = ""
+    #: B-105 —— 看图模型(含备用树)的截断标签 / 上限解析器:实际应答的是谁、它的输出上限。
+    #: ``None`` = 没接(测试),截断标签记 ``vl_model_name``、上限按厂商默认报。
+    output_cap_resolver: ServedOutputCap | None = None
 
     @property
     def spec(self) -> ToolSpec:
@@ -257,6 +265,10 @@ class AskImageTool:
             ctx.token_budget.add(usage_total(response.usage_metadata))
         if self.usage_meter is not None:
             await self.usage_meter(response, tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+        # B-105 —— 截断成空回答(思考吃满上限)不当成「看图模型没说话」:上面已照常扣池 / 记账,
+        # 这里计数后给模型一个说清原因的工具错误,别让它原样再问一遍。
+        if is_unusable_truncation(response):
+            self._raise_truncated(response)
         answer = _stringify(response.content) or "[VL model returned no text]"
         # Surface VL provenance in the ToolMessage artifact (event stream /
         # audit): the image ref plus the VL call's token usage — otherwise the
@@ -267,6 +279,20 @@ class AskImageTool:
         if response.usage_metadata:
             meta["vl_usage"] = dict(response.usage_metadata)
         return ToolResult(content=answer, meta=meta)
+
+    def _raise_truncated(self, response: AIMessage) -> None:
+        if self.output_cap_resolver is not None:
+            provider, model, cap = self.output_cap_resolver(response)
+        else:
+            provider, model, cap = "", self.vl_model_name, None
+        output_truncated_total.labels(provider=provider, model=model, usable="false").inc()
+        logger.warning("ask_image.output_truncated model=%s", model)
+        shown = str(cap) if cap is not None else "厂商默认值"
+        msg = (
+            f"看图模型输出被截断(已用满输出上限 {shown},含思考)。"
+            "请在看图模型配置里调大『输出上限』,或者改用默认的快看。"
+        )
+        raise GuidedToolError(msg, advice=_TRUNCATED_ADVICE)
 
     async def _call_with_limit(
         self,
@@ -461,6 +487,13 @@ _TIMEOUT_ADVICE = (
 )
 _NO_TIME_LEFT_ADVICE = (
     "This run has no time left. Do not call ask_image again; finish with what you already have."
+)
+#: B-105 —— 看图模型截断:原样再问只会再截一次(上限没变)。
+_TRUNCATED_ADVICE = (
+    "Do not repeat the identical call: the vision model will hit the same output cap again. "
+    "Retry once with the default quick depth if this call used depth='deep', or with a "
+    "narrower question; otherwise continue without this image answer and tell the user the "
+    "vision model's output cap needs raising."
 )
 
 
