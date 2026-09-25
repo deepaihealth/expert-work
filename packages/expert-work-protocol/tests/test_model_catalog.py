@@ -284,8 +284,17 @@ def _e(provider: str, name: str) -> ModelEntry:
 
 def test_output_cap_fields_match_live_probe_2026_09_24() -> None:
     # spec §8.1 / §8.7 —— 设错字段在 GLM / DeepSeek 上是静默的,这张表只能靠测试守。
-    for name in ("glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.7", "glm-4.6",
-                 "glm-5v-turbo", "glm-4.6v", "glm-4.5v"):
+    for name in (
+        "glm-5.3",
+        "glm-5.3-flash",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-4.7",
+        "glm-4.6",
+        "glm-5v-turbo",
+        "glm-4.6v",
+        "glm-4.5v",
+    ):
         assert _e("glm", name).output_cap_field == "max_tokens"
     for name in ("deepseek-v4-pro", "deepseek-v4-flash"):
         assert _e("deepseek", name).output_cap_field == "max_tokens"
@@ -303,7 +312,15 @@ def test_output_cap_fields_match_live_probe_2026_09_24() -> None:
 
 
 def test_max_output_tokens_match_vendor_ranges() -> None:
-    for name in ("glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-4.7", "glm-4.6", "glm-5v-turbo"):
+    for name in (
+        "glm-5.3",
+        "glm-5.3-flash",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-4.7",
+        "glm-4.6",
+        "glm-5v-turbo",
+    ):
         assert _e("glm", name).max_output_tokens == 131_072
     assert _e("glm", "glm-4.6v").max_output_tokens == 32_768
     assert _e("glm", "glm-4.5v").max_output_tokens == 16_384
@@ -315,9 +332,17 @@ def test_max_output_tokens_match_vendor_ranges() -> None:
 
 
 def test_thinking_cap_only_on_qwen_thinking_models() -> None:
-    capped = {"qwen3.8-max", "qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus", "qwen3-max",
-              "qwen3-vl-plus", "qwen3-vl-flash"}
+    capped = {
+        "qwen3.8-max",
+        "qwen3.7-max",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        "qwen3-max",
+        "qwen3-vl-plus",
+        "qwen3-vl-flash",
+    }
     from expert_work.protocol.model_catalog import MODEL_CATALOG
+
     for provider, entries in MODEL_CATALOG.items():
         for e in entries:
             assert e.thinking_cap is (provider == "qwen" and e.name in capped), e.name

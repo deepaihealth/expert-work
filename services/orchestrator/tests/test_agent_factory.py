@@ -1669,8 +1669,12 @@ def test_doubao_effort_goes_to_reasoning_effort() -> None:
     from orchestrator.agent_factory import _thinking_payload
 
     m = "doubao-seed-2-1-pro-260628"
-    assert _thinking_payload(_vendor_model("doubao", m, effort="low")) == {"reasoning_effort": "low"}
-    assert _thinking_payload(_vendor_model("doubao", m, effort="max")) == {"reasoning_effort": "high"}
+    assert _thinking_payload(_vendor_model("doubao", m, effort="low")) == {
+        "reasoning_effort": "low"
+    }
+    assert _thinking_payload(_vendor_model("doubao", m, effort="max")) == {
+        "reasoning_effort": "high"
+    }
     # 关思考仍是真关(实测 thinking.type=disabled 思考 0)。
     assert _thinking_payload(_vendor_model("doubao", m, thinking_enabled=False)) == {
         "thinking": {"type": "disabled"}

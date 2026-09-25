@@ -2098,6 +2098,7 @@ _THINKING_BUDGET_RATIO: dict[str, float] = {
 _THINKING_BUDGET_MIN = 1024
 _THINKING_BUDGET_MAX = 81_920
 
+
 def _vendor_effort(entry: ModelEntry, level: str) -> str:
     """平台档位 → 厂商取值(B-105:映射登记在目录 ``effort_map``,缺的键原样发)。"""
     return (entry.effort_map or {}).get(level, level)
@@ -2276,11 +2277,7 @@ def _thinking_payload(model: ModelSpec) -> dict[str, Any] | None:
     # Inherit — unchanged CM-10 behaviour: only an effort/adaptive-touched
     # manifest sends anything. B-105 — a manifest that only set
     # ``thinking_max_tokens`` (no effort/adaptive) counts as touched too.
-    if (
-        model.effort is None
-        and not model.adaptive_thinking
-        and model.thinking_max_tokens is None
-    ):
+    if model.effort is None and not model.adaptive_thinking and model.thinking_max_tokens is None:
         return None
     return _thinking_enable_payload(model, entry)
 

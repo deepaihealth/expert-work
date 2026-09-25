@@ -97,7 +97,7 @@ class ModelEntry(BaseModel):
     # B-105 —— 请求里用哪个字段表示「思考 + 回答合计」的输出上限(2026-09-24 测试集群实调)。
     #   "max_tokens" / "max_completion_tokens" —— 该字段就是合计上限;
     #   "split" —— 没有合计字段(max_tokens 只管回答):开思考时发 thinking_budget=T、
-    #              max_tokens=cap−T 拼出合计,关思考时发 max_tokens=cap。
+    #              max_tokens=cap-T 拼出合计,关思考时发 max_tokens=cap。
     # **设错在 GLM / DeepSeek 上是静默的**(200 正常返回,上限不生效),改这里必须实调。
     output_cap_field: Literal["max_tokens", "max_completion_tokens", "split"] = "max_tokens"
     # B-105 —— 厂商接受的输出上限最大值(实调:发超大值看报错给的范围)。None = 厂商不报范围,不校验。
