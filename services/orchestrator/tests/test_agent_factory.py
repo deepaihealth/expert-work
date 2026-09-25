@@ -2272,3 +2272,13 @@ def test_fallback_nodes_use_their_own_cap_field() -> None:
     assert _output_cap_payload(fb, catalog_entry("qwen", "qwen3.8-max")) == {
         "max_completion_tokens": 9000
     }
+
+
+def test_qwen_budget_without_output_cap_uses_budget_ceiling_as_base() -> None:
+    """B-105 —— 没设输出上限(厂商默认)时按 81920 x 档位比例推预算,不再按旧默认 4096。"""
+    from orchestrator.agent_factory import _thinking_payload
+
+    assert _thinking_payload(_vendor_model("qwen", "qwen3.7-max", effort="high")) == {
+        "enable_thinking": True,
+        "thinking_budget": 65_536,
+    }
