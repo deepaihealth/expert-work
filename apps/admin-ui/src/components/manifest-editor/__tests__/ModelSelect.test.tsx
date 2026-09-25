@@ -746,6 +746,26 @@ describe("ModelSelect", () => {
     expect(placeholder).toContain("16384");
   });
 
+  // Review fix round 1, F1 — rc-input-number's ``max`` prop clamps on blur
+  // (flushInputValue) even with no typing, silently rewriting a manifest
+  // value that already exceeds the catalog ceiling. The backend's dry-run
+  // build already rejects an over-ceiling max_tokens with an explicit
+  // message — the UI must not pre-empt that by mutating the value out from
+  // under the operator on a mere focus+blur.
+  it("does not silently clamp a stored over-ceiling max_tokens on blur (no typing)", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSelect(
+      { provider: "glm", name: "glm-5.3", max_tokens: 200000 },
+      onChange,
+    );
+    await openAdvanced(user);
+    const input = screen.getByLabelText("Max output (incl. thinking)");
+    await user.click(input);
+    await user.tab();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
   it("thinking length cap is editable for a thinking_cap model and writes thinking_max_tokens", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

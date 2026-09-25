@@ -192,7 +192,13 @@ export function ModelSelect({
                   <InputNumber
                     value={value.max_tokens}
                     min={1}
-                    max={currentEntry?.max_output_tokens ?? undefined}
+                    // No ``max`` — rc-input-number clamps ON BLUR even with
+                    // no typing (flushInputValue), which would silently
+                    // rewrite a manifest that already stores an
+                    // over-ceiling value down to the catalog ceiling. The
+                    // backend's dry-run build already rejects an
+                    // over-ceiling max_tokens with an explicit message; the
+                    // placeholder below still names the ceiling as a hint.
                     placeholder={
                       currentEntry?.max_output_tokens != null
                         ? t("model_select.max_tokens_placeholder_max", {
