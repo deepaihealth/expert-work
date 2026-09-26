@@ -209,7 +209,7 @@ module = ["e2b.*", "kruise_agents.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "packages/*/tests", "services/*/tests", "tools/*"]
+testpaths = ["tests", "packages/*/tests", "services/*/tests", "tools/*", "platform-skills/tests"]
 # 仓库根必须在 ``sys.path`` 上。``tools/`` 是命名空间包(没有 ``__init__.py``),
 # 而 ``control_plane.eval_engine_live`` / ``eval_engine`` 懒 import
 # ``tools.eval.*``。跑全套时上面 ``testpaths`` 里的 ``tools/*`` 顺带把仓库根塞进
