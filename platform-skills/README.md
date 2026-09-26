@@ -85,5 +85,35 @@ python platform-skills/build.py --out /tmp/out      # 自定义输出目录
 
 ## 发布
 
-导入命令由 Task 8 的 `platform-skills/import_in_pod.py` 提供（本任务尚未实现，占位）。
-Task 8 完成后本节会补全为完整的 `kubectl exec` 发布命令。
+`import_in_pod.py bundle` 在本机把「自身源码 + 本地打好的 `.skill` 包（base64）」拼成一个自包含
+的 Python 程序打到 stdout；不连集群、不 import 任何平台代码。把它接到 pod 里的 `python3 -` 才会
+真正导入：跑的是平台自己 ZIP 上传接口那一条 `_ingest_platform_skill_payload` 管线（解析 → 名称
+校验 → 内容审核 → Mini-ADR U-21 严格威胁扫描 → 幂等创建/加版本 → 审计），导入成功会自动发一次
+跨副本 `platform_skill` 失效广播（Redis pub/sub），所有副本的内建 Agent 缓存立刻感知，不用重启。
+
+先只读预演（`--dry-run`：只解析 + 审核 + 扫描 + 算 `content_hash` 并与线上当前版本比较，不写库、
+不发失效）：
+
+```bash
+python platform-skills/build.py
+POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane -o jsonpath='{.items[0].metadata.name}')
+python platform-skills/import_in_pod.py bundle --dry-run platform-skills/dist/*.skill \
+  | kubectl -n expert-work exec -i "$POD" -- python3 -
+```
+
+确认 `would_create_version` 符合预期后，去掉 `--dry-run` 正式导入：
+
+```bash
+python platform-skills/import_in_pod.py bundle platform-skills/dist/*.skill \
+  | kubectl -n expert-work exec -i "$POD" -- python3 -
+```
+
+每个包输出一行 JSON（`name` / `status`（201 新建、200 内容未变、`"dry-run"`）/ `created` /
+`version` 或 `would_create_version` / `content_hash`）；只要有任意一个 201，末尾会再打一行
+`{"invalidation": "published"}`。
+
+导入成功会自动发跨副本失效，无需重启任何 pod。
+
+回滚 = 用 git 历史里的旧源码（`git checkout <旧 commit> -- platform-skills/<技能名>/`）重新
+`build.py` + 重新导入——旧内容的 `content_hash` 和线上记录的历史版本一致时会是幂等的
+「200 不变」，不一致则作为新版本导入（skill_version 只增不改，随时能再切回）。
