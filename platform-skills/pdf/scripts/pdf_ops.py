@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _cli import emit_json, fail, resolve_io
-from pypdf import PdfReader, PdfWriter
+from pypdf import PageObject, PdfReader, PdfWriter, Transformation
 from pypdf.errors import FileNotDecryptedError, PdfReadError
 
 # pypdf logs recoverable parse issues (e.g. "EOF marker not found") as WARNINGs on child
@@ -34,6 +34,40 @@ body {{ margin:0; width:{w}pt; height:{h}pt; display:flex;
 div {{ font-family:"{font}"; font-size:{size:.0f}pt; color: rgba(128,128,128,{opacity});
        transform: rotate(-{angle}deg); white-space: nowrap }}
 </style></head><body><div>{text}</div></body></html>"""
+
+
+def _visible_box(page: PageObject) -> tuple[float, float, float, float, int]:
+    """(x0, y0, x1, y1, rotation) of the area a viewer shows: the cropbox (pypdf falls back
+    to the mediabox), whose origin need not be (0, 0), and /Rotate normalized to 0/90/180/270
+    (clockwise, as viewers apply it)."""
+    box = page.cropbox
+    rotation = int(page.rotation or 0) % 360
+    if rotation not in (0, 90, 180, 270):
+        rotation = 0
+    return float(box.left), float(box.bottom), float(box.right), float(box.top), rotation
+
+
+def _display_size(page: PageObject) -> tuple[float, float]:
+    x0, y0, x1, y1, rotation = _visible_box(page)
+    w, h = x1 - x0, y1 - y0
+    return (h, w) if rotation in (90, 270) else (w, h)
+
+
+def _merge_upright(page: PageObject, overlay: PageObject) -> None:
+    """Overlay ``overlay`` (drawn upright, origin at its mediabox lower-left) so that it
+    appears upright and anchored at the lower-left of what a viewer shows for ``page`` —
+    i.e. undo the page's /Rotate and non-zero box origin instead of assuming both are 0."""
+    x0, y0, x1, y1, rotation = _visible_box(page)
+    # display (u, v) -> page user space; a, b, c, d rotate counter-clockwise by `rotation`
+    a, b, c, d, e, f = {
+        0: (1, 0, 0, 1, x0, y0),
+        90: (0, 1, -1, 0, x1, y0),
+        180: (-1, 0, 0, -1, x1, y1),
+        270: (0, -1, 1, 0, x0, y1),
+    }[rotation]
+    ox, oy = float(overlay.mediabox.left), float(overlay.mediabox.bottom)
+    ctm = (a, b, c, d, e - a * ox - c * oy, f - b * ox - d * oy)
+    page.merge_transformed_page(overlay, Transformation(ctm))
 
 
 def _parse_pages(spec: str, total: int) -> list[int]:
@@ -158,9 +192,9 @@ def cmd_watermark(args: argparse.Namespace) -> None:
     writer.append(reader)
     from weasyprint import HTML  # imported lazily: only watermark/create need it
 
-    cache: dict[tuple[float, float], object] = {}
+    cache: dict[tuple[float, float], PageObject] = {}
     for page in writer.pages:
-        w, h = float(page.mediabox.width), float(page.mediabox.height)
+        w, h = _display_size(page)
         key = (round(w, 2), round(h, 2))
         stamp_page = cache.get(key)
         if stamp_page is None:
@@ -176,7 +210,7 @@ def cmd_watermark(args: argparse.Namespace) -> None:
             pdf_bytes = HTML(string=html).write_pdf()
             stamp_page = PdfReader(BytesIO(pdf_bytes)).pages[0]
             cache[key] = stamp_page
-        page.merge_page(stamp_page)
+        _merge_upright(page, stamp_page)
     writer.write(str(dst))
     emit_json({"output": str(dst)})
 
@@ -195,7 +229,7 @@ def cmd_stamp(args: argparse.Namespace) -> None:
     writer = PdfWriter()
     writer.append(reader)
     for n in pages:
-        writer.pages[n - 1].merge_page(stamp_page)
+        _merge_upright(writer.pages[n - 1], stamp_page)
     writer.write(str(dst))
     emit_json({"output": str(dst), "stamped": pages})
 

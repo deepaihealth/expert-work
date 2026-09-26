@@ -105,7 +105,8 @@ HTML(string=html).write_pdf("骨架 示例.pdf")
 - `watermark IN.pdf OUT.pdf --text "内部资料" [--opacity 0.15] [--angle 45] [--font "..."]`：每页
   叠加一层文字水印，水印本身也用 weasyprint 生成，中文照样嵌入字体，不会变方块。
 - `stamp IN.pdf OUT.pdf --stamp 章.pdf [--pages 4]`：把另一份 PDF（例如盖章图、签名做成的一页）
-  的第 1 页叠加到指定页上；不给 `--pages` 默认整份都盖。
+  的第 1 页叠加到指定页上，以页面显示时的左下角为原点；不给 `--pages` 默认整份都盖。水印与盖章都按
+  页面显示方向叠加，旋转过的页也是正的。
 
 ## 检查成品
 
