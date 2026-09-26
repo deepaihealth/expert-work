@@ -1,11 +1,15 @@
+import copy
 import json
 import os
 
 import pptx
 from _harness import check, run, script
 from pptx.enum.shapes import MSO_SHAPE
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.packuri import PackURI
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn
+from pptx.parts.slide import SlideLayoutPart, SlideMasterPart
 from pptx.util import Inches
 
 os.chdir("/workspace")
@@ -87,6 +91,68 @@ check(
     and title_ph["width"] is None
     and title_ph["height"] is None,
     f"geometry-less placeholder should be null, got {title_ph}",
+)
+
+
+# realistic edge case #5: institutional templates often carry several slide masters;
+# prs.slide_layouts only covers the first. python-pptx has no API to add a master, so
+# clone master 1 (and its layouts, renamed) into a second master part by hand.
+def add_second_master(prs, prefix: str) -> None:
+    m1 = prs.slide_masters[0].part
+    pkg = prs.part.package
+    m2 = SlideMasterPart(
+        PackURI("/ppt/slideMasters/slideMaster2.xml"),
+        m1.content_type,
+        pkg,
+        copy.deepcopy(m1._element),
+    )
+    next_id = 2147483648 + 1000  # sldLayoutId / sldMasterId ids must be unique
+    for n, sid in enumerate(list(m2._element.find(qn("p:sldLayoutIdLst")))):
+        old = m1.related_part(sid.get(qn("r:id")))
+        lp = SlideLayoutPart(
+            PackURI(f"/ppt/slideLayouts/slideLayout{100 + n}.xml"),
+            old.content_type,
+            pkg,
+            copy.deepcopy(old._element),
+        )
+        lp._element.cSld.set("name", f"{prefix}{n}")
+        lp.relate_to(m2, RT.SLIDE_MASTER)
+        sid.set(qn("r:id"), m2.relate_to(lp, RT.SLIDE_LAYOUT))
+        sid.set("id", str(next_id))
+        next_id += 1
+    m2.relate_to(m1.part_related_by(RT.THEME), RT.THEME)
+    master_ids = prs.part._element.find(qn("p:sldMasterIdLst"))
+    new = copy.deepcopy(master_ids[0])
+    new.set("id", str(next_id))
+    new.set(qn("r:id"), prs.part.relate_to(m2, RT.SLIDE_MASTER))
+    master_ids.append(new)
+
+
+p6 = pptx.Presentation()
+add_second_master(p6, "二号母版-")
+p6.save("双母版_中间.pptx")
+p6 = pptx.Presentation("双母版_中间.pptx")
+p6.slides.add_slide(p6.slide_layouts[0])
+p6.slides.add_slide(p6.slide_masters[1].slide_layouts[5])
+p6.save("双母版.pptx")
+res6 = json.loads(run(["python", script("pptx", "inspect_template.py"), "双母版.pptx"]).stdout)
+layouts6 = res6["layouts"]
+check(len(layouts6) == 22, f"two masters x 11 layouts, got {len(layouts6)}")
+check(
+    [(la["master"], la["index"]) for la in layouts6[:11]] == [(0, i) for i in range(11)],
+    f"master 0 entries must keep prs.slide_layouts indexes: {layouts6[:11]}",
+)
+second = [la for la in layouts6 if la["master"] == 1]
+check(
+    [(la["index"], la["name"]) for la in second] == [(i, f"二号母版-{i}") for i in range(11)],
+    f"second master layouts missing/misindexed: {second}",
+)
+check(
+    [(s["master"], s["layout"]) for s in res6["slides"]] == [(0, "Title Slide"), (1, "二号母版-5")],
+    f"slides master attribution: {res6['slides']}",
+)
+check(
+    res["layouts"][0]["master"] == 0, f"single-master layouts carry master=0: {res['layouts'][0]}"
 )
 
 print("PASS case_pptx_inspect")

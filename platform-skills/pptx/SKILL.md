@@ -110,11 +110,11 @@ prs.save("骨架 示例.pptx")
 
 先看模板有哪些版式与占位符：
 `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/inspect_template.py 模板.pptx`
-输出 `layouts`（版式的 `index`/`name`/`placeholders`，占位符含 `idx`/`type`/`name`/位置）与
-`slides`（已有页用的版式与形状概况）。选定版式号后加页、按 `idx` 填值：
+输出 `layouts`（所有母版的版式：`master`/`index`/`name`/`placeholders`，占位符含 `idx`/`type`/
+`name`/位置）与 `slides`（已有页的母版、版式与形状）。选定版式后加页、按 `idx` 填值：
 
 ```python
-slide = prs.slides.add_slide(prs.slide_layouts[1])  # index 取自 inspect_template.py 的输出
+slide = prs.slides.add_slide(prs.slide_masters[0].slide_layouts[1])  # 两个下标取自上面输出
 slide.placeholders[0].text_frame.text = "标题文字"
 slide.placeholders[1].text_frame.text = "正文内容"
 # 图片占位符：slide.placeholders[idx].insert_picture("图.png")
@@ -150,7 +150,7 @@ ids.insert(0, ids[-1])  # 把最后一页挪到最前
 slide.shapes.add_movie("演示.mp4", left, top, width, height, poster_frame_image="封面.png")
 ```
 
-必须给封面图（`poster_frame_image`），拿不到视频首帧时用一张说明性截图代替；尺寸不自动缩放，
+必须给封面图（`poster_frame_image`），拿不到首帧就用说明性截图；尺寸不自动缩放，
 宽高要自己算好。
 
 ## 转换
