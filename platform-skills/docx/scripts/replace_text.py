@@ -1,4 +1,10 @@
-"""Replace text in a .docx while keeping formatting (body, tables incl. nested, headers/footers)."""
+"""Replace text in a .docx while keeping formatting (body, tables incl. nested, headers/footers).
+
+Also reaches into hyperlink runs (``paragraph.runs`` alone silently skips text inside
+``w:hyperlink``) and guards against a replacement that itself contains the search text
+(search resumes right after the just-written replacement instead of re-scanning it, so
+it always terminates).
+"""
 
 from __future__ import annotations
 
@@ -13,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import docx
 from _cli import emit_json, fail, resolve_io
 from docx.table import Table
+from docx.text.hyperlink import Hyperlink
 from docx.text.paragraph import Paragraph
+from docx.text.run import Run
 
 
 def _iter_block(container) -> Iterator[Paragraph]:
@@ -46,20 +54,40 @@ def iter_paragraphs(document) -> Iterator[Paragraph]:
                 yield from _iter_block(part)
 
 
-def replace_in_paragraph(paragraph: Paragraph, find: str, replace: str) -> int:
-    """Replace every occurrence of ``find`` even when it spans several runs.
+def _iter_runs(paragraph: Paragraph) -> list[Run]:
+    """Flatten a paragraph's runs in document order, descending into hyperlinks.
 
-    The replaced text lands in the run where the match starts (keeping that
-    run's formatting); the consumed parts of the following runs are removed.
+    ``paragraph.runs`` silently skips text inside ``w:hyperlink`` (confirmed on
+    python-docx 1.2.0); ``iter_inner_content`` sees both plain runs and hyperlinks.
+    ``Hyperlink.runs`` returns live proxies over the same ``w:r`` elements, so editing
+    ``.text`` on them edits the hyperlink's visible text in place without touching the
+    surrounding ``w:hyperlink`` (and its ``r:id`` / address).
+    """
+    units: list[Run] = []
+    for item in paragraph.iter_inner_content():
+        units.extend(item.runs if isinstance(item, Hyperlink) else (item,))
+    return units
+
+
+def replace_in_paragraph(paragraph: Paragraph, find: str, replace: str) -> int:
+    """Replace every non-overlapping, left-to-right occurrence of ``find`` — including
+    inside hyperlinks — even when it spans several runs.
+
+    The replaced text lands in the run where the match starts (keeping that run's
+    formatting); the consumed parts of the following runs are removed. The search cursor
+    always resumes at ``idx + len(replace)`` (past the text just written), so a
+    ``replace`` that itself contains ``find`` (e.g. "客户" -> "尊敬的客户") cannot loop
+    forever or re-match its own output.
     """
     if not find:
         return 0
     count = 0
+    cursor = 0
     while True:
-        runs = paragraph.runs
+        runs = _iter_runs(paragraph)
         texts = [r.text for r in runs]
         full = "".join(texts)
-        idx = full.find(find)
+        idx = full.find(find, cursor)
         if idx < 0:
             return count
         starts = []
@@ -77,6 +105,29 @@ def replace_in_paragraph(paragraph: Paragraph, find: str, replace: str) -> int:
             keep_after = texts[i][max(0, end - s) :] if e > end else ""
             run.text = keep_before + (replace if i == first else "") + keep_after
         count += 1
+        cursor = idx + len(replace)
+
+
+def _load_rules(path: Path) -> list[tuple[str, str]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        fail(f"--rules 读取失败：{exc}", 2)  # noqa: RUF001
+    except ValueError as exc:
+        fail(f"--rules 不是合法的 JSON：{exc}", 2)  # noqa: RUF001
+    if not isinstance(raw, list) or not raw:
+        fail('--rules 必须是非空列表，每项形如 {"find": "...", "replace": "..."}', 2)  # noqa: RUF001
+    pairs: list[tuple[str, str]] = []
+    for i, rule in enumerate(raw, start=1):
+        find = rule.get("find") if isinstance(rule, dict) else None
+        repl = rule.get("replace") if isinstance(rule, dict) else None
+        if not isinstance(find, str) or not isinstance(repl, str):
+            fail(f"--rules 第 {i} 条格式不对：find / replace 必须是字符串", 2)  # noqa: RUF001
+        pairs.append((find, repl))
+    empty_at = [i for i, (find, _) in enumerate(pairs, start=1) if find == ""]
+    if empty_at:
+        fail(f"--rules 第 {empty_at} 条的 find 不能是空字符串", 1)
+    return pairs
 
 
 def main() -> None:
@@ -86,11 +137,7 @@ def main() -> None:
     ap.add_argument("--rules", required=True, help='JSON 文件：[{"find": "...", "replace": "..."}]')  # noqa: RUF001
     args = ap.parse_args()
     src, dst = resolve_io(args.input, args.output)
-    try:
-        rules = json.loads(Path(args.rules).read_text(encoding="utf-8"))
-        pairs = [(str(r["find"]), str(r["replace"])) for r in rules]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        fail(f'--rules 读取失败（需要 [{{"find": ..., "replace": ...}}]）：{exc}', 2)  # noqa: RUF001
+    pairs = _load_rules(Path(args.rules))
     document = docx.Document(str(src))
     counts = [0] * len(pairs)
     for paragraph in list(iter_paragraphs(document)):

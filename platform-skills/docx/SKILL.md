@@ -114,6 +114,8 @@ document.save("骨架 示例.docx")
   `python $EXPERT_WORK_SKILLS_DIR/docx/scripts/fill_template.py TEMPLATE.docx OUT.docx --data DATA.json`
   按 `DATA.json`（`{"占位符名": "值"}`）填值，输出 `filled`（已填）、`missing`（模板有但没给值，
   原样留在文档里）、`unused`（给了值但模板里没有这个占位符）。
+  占位符只做标量替换（不做循环 / 条件）；表格多行数据按正文里的 python-docx 表格写法做。
+  `DATA.json` 的值只能是字符串或数字，`null` / 列表 / 字典 / 布尔值会直接报错退出。
 - 增删段落 / 插图 / 页眉页脚，直接用 python-docx：
   ```python
   document.add_paragraph("新增的一段")                    # 末尾加一段
@@ -131,8 +133,7 @@ document.save("骨架 示例.docx")
 
 1. 用 python-docx 重新打开成品，确认没坏：`docx.Document("成品.docx")` 不报错即可。
 2. `python $EXPERT_WORK_SKILLS_DIR/docx/scripts/preview.py 成品.docx` 出图。
-3. 用 `ask_image(path=...)` 看首页和信息最密的一页：中文是否变成方块、文字是否溢出/重叠、版式是否
-   错乱。没有配看图能力时跳过这一步，并在回复里写明「未做视觉检查」。
+3. 用 `ask_image(path=...)` 看首页和信息最密的一页：中文是否方块、文字是否溢出 / 重叠、版式是否错乱。Agent 没配看图能力时跳过这一步，并在回复里写明「未做视觉检查」。
 
 ## 字体
 
@@ -148,6 +149,7 @@ Word 只记字体名，客户打开时用他自己电脑上的字体，没装就
   `replace_text.py`。
 - 表格列宽只设在 `table.columns[i].width` 不生效，要设在**每个单元格**的 `cell.width` 上。
 - 图片按原始像素插入容易溢出页面 → 按「新建」里的可用宽度算法等比缩放。
+- 超链接（`w:hyperlink`）里的锚文字也在 `replace_text.py` / `fill_template.py` 的替换范围内，不会漏改。
 
 ## 做不到
 

@@ -15,6 +15,15 @@ from _cli import emit_json, fail, resolve_io
 from replace_text import iter_paragraphs, replace_in_paragraph
 
 _PH = re.compile(r"\{\{\s*([^{}\s]+)\s*\}\}")
+_SCALAR_TYPES = (str, int, float)
+
+
+def _reject_non_scalar_values(data: dict) -> None:
+    bad = sorted(
+        str(k) for k, v in data.items() if isinstance(v, bool) or not isinstance(v, _SCALAR_TYPES)
+    )
+    if bad:
+        fail(f"--data 的值只能是字符串或数字，这些键不是：{bad}", 1)  # noqa: RUF001
 
 
 def _placeholders(document) -> dict[str, set[str]]:
@@ -45,6 +54,7 @@ def main() -> None:
             raise TypeError("顶层必须是一个 JSON 对象")
     except (OSError, ValueError, TypeError) as exc:
         fail(f"--data 需要一个 JSON 对象：{exc}", 2)  # noqa: RUF001
+    _reject_non_scalar_values(data)
     document = docx.Document(str(src))
     found = _placeholders(document)
     for key, spellings in found.items():
