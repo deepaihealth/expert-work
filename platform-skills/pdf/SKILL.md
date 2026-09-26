@@ -9,8 +9,8 @@ expert_work:
 
 新建 PDF、或对已有 PDF 做合并 / 拆分 / 旋转 / 加水印 / 盖章时用本技能。读取 PDF 文字 / 表格：用
 `read_document`；需要精确表格结构（跨行合并单元格等）时用 `pdfplumber`，两种情况都不用本技能。把
-Word / PPT / Excel 转成 PDF，用那个文件对应技能（docx / pptx / xlsx）自己的 `convert.py --to pdf`，
-本技能只处理输入已经是 PDF 的场景。做不到的事见文末「做不到」一节。
+Word / PPT / Excel 转成 PDF，用 docx / pptx / xlsx 任一技能里的 `convert.py --to pdf`（三份是同一个
+脚本，每份都能转全部格式，手边加载了哪个就用哪个），本技能只处理输入已经是 PDF 的场景。做不到的事见文末「做不到」一节。
 
 ## 环境
 

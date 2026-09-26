@@ -201,13 +201,16 @@ expert_work:
   - 表头样式、列宽、冻结首行、数字 / 日期 / 百分比格式。
   - **公式写成公式**（`=SUM(B2:B9)`），不在 Python 里算好写死结果。
   - 条件格式、数据校验的基本写法；图表同样推荐 matplotlib 出图插入。
-- 修改要点：`openpyxl.load_workbook` 默认保留公式与样式；**原文件里的图表 / 图片保存后会丢失**
-  → 正文要求：检测到原文件有图表时先告知用户，征得同意再改。
+- 修改要点：`openpyxl.load_workbook` 默认保留公式、样式、图片与原生图表（沙箱镜像 openpyxl 3.1.5 实测：
+  加载即有 `_charts` / `_images`，保存后图表与图片部件都在）；真正丢的是**文本框与形状**（保存后消失），
+  原生图表经 openpyxl 重写、部分样式可能走样 → 正文要求：照常改，在回复里说明；用户要求原样保留时如实说做不到
+  （2026-09-26 终审修正：原稿写「图表 / 图片保存后会丢失」并要求先征得同意，与实测不符，且确认回合会卡住自动运行）。
 - `scripts/recalc.py`
   - `recalc.py IN.xlsx OUT.xlsx [--timeout 120]`
   - 用 LibreOffice 重算所有公式并另存（openpyxl 写入的公式没有缓存值，不重算的话别的软件读到的是空）。
   - 重算后扫描错误值（`#REF!` `#DIV/0!` `#VALUE!` `#NAME?` `#N/A` `#NUM!` `#NULL!`），
-    输出 JSON：`{"formulas": N, "errors": [{"sheet","cell","value"}]}`；有错误时退出码 2。
+    输出 JSON：`{"formulas": N, "errors": [{"sheet","cell","value"}]}`；有错误时退出码 3
+    （2026-09-26 终审改：原定 2 与 argparse 用法错误的 2 撞车，只看退出码分不开）。
 
 ### 4.5 pdf
 
@@ -311,7 +314,7 @@ PDF 把字体**嵌入文件**，在任何电脑上都一样。沙箱里的字体
   6. `fill_template.py`：`--list` 列全占位符；缺值与多余键被报告。
   7. `inspect_template.py` 能列出版式与占位符；`duplicate_slide.py` 复制带图片的页后文件能被 python-pptx
      与 LibreOffice 打开，新页图片独立存在。
-  8. `recalc.py`：含 `=1/0` 的表报出 `#DIV/0!`、退出码 2；正常表退出码 0、公式有缓存值。
+  8. `recalc.py`：含 `=1/0` 的表报出 `#DIV/0!`、退出码 3；正常表退出码 0、公式有缓存值。
   9. `pdf_ops.py`：merge / split / rotate / watermark（中文水印）/ stamp 各一例，页数与旋转角度断言。
 - 实现形式：一个 pytest 文件在宿主机驱动 `docker run`（仿照现有 `infra/sandbox-image/smoke_test.py`
   的做法），挂上打好的包；具体接入哪个 workflow（新 job 还是并入 `sandbox-image.yml`）在实施计划里定。

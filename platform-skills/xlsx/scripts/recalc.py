@@ -84,7 +84,9 @@ def main() -> None:
                 if isinstance(v, str) and v in _ERRORS:
                     errors.append({"sheet": ws.title, "cell": cell.coordinate, "value": v})
     emit_json({"formulas": formulas, "errors": errors})
-    sys.exit(2 if errors else 0)
+    # 3, not 2: argparse already owns 2 (usage error), and 1 is "recalc itself failed" —
+    # a caller keying on the exit code alone must be able to tell the three apart.
+    sys.exit(3 if errors else 0)
 
 
 def _recalc_same_format(src: Path, out_dir: Path, timeout: float) -> Path:

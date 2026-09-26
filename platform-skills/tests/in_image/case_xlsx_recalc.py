@@ -17,7 +17,7 @@ ws2["B3"] = "=数据!A3+1"
 wb.save("预算 表.xlsx")
 res = json.loads(
     run(
-        ["python", script("xlsx", "recalc.py"), "预算 表.xlsx", "重算/预算 表.xlsx"], expect=2
+        ["python", script("xlsx", "recalc.py"), "预算 表.xlsx", "重算/预算 表.xlsx"], expect=3
     ).stdout
 )
 check(res["formulas"] == 3, f"formulas={res['formulas']}")
@@ -47,7 +47,7 @@ ws5["A7"] = "=SUM(A1 B1)"  # #NULL! (space = intersection of non-overlapping cel
 wb5.save("全部错误.xlsx")
 res_all = json.loads(
     run(
-        ["python", script("xlsx", "recalc.py"), "全部错误.xlsx", "全部错误_出.xlsx"], expect=2
+        ["python", script("xlsx", "recalc.py"), "全部错误.xlsx", "全部错误_出.xlsx"], expect=3
     ).stdout
 )
 expected_all = {
@@ -67,6 +67,9 @@ wb2.active["A1"] = "=1+1"
 wb2.save("ok.xlsx")
 run(["python", script("xlsx", "recalc.py"), "ok.xlsx", "ok2.xlsx"], expect=0)
 run(["python", script("xlsx", "recalc.py"), "ok.xlsx", "ok.xlsx"], expect=1)
+# usage error (missing OUT) is argparse's 2 — distinct from formula errors' 3
+usage = run(["python", script("xlsx", "recalc.py"), "ok.xlsx"], expect=2)
+check(usage.stdout == "" and "usage" in usage.stderr, f"usage error: {usage}")
 
 # extra: a workbook with no formulas at all must report formulas=0, errors=[], exit 0
 # (recalc.py's counting loop has nothing else to exercise this path).
