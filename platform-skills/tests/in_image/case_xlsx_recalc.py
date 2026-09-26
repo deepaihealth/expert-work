@@ -31,6 +31,37 @@ check(
     "cached values missing after recalc",
 )
 check(openpyxl.load_workbook("重算/预算 表.xlsx")["数据"]["A3"].value == "=A1*A2", "formula lost")
+
+# extra: exercise ALL 7 _ERRORS strings through one real recalc.py run (the test above only
+# hits #DIV/0!), one formula per error, asserting each is reported against the right cell.
+wb5 = openpyxl.Workbook()
+ws5 = wb5.active
+ws5.title = "错误全集"
+ws5["A1"] = "=1/0"  # #DIV/0!
+ws5["A2"] = "=INDEX(A1:B1,1,5)"  # #REF! (column index out of the 2-column range)
+ws5["A3"] = '="a"+1'  # #VALUE!
+ws5["A4"] = "=NOPE()"  # #NAME? (undefined function)
+ws5["A5"] = "=NA()"  # #N/A
+ws5["A6"] = "=ASIN(2)"  # #NUM! (out of domain)
+ws5["A7"] = "=SUM(A1 B1)"  # #NULL! (space = intersection of non-overlapping cells)
+wb5.save("全部错误.xlsx")
+res_all = json.loads(
+    run(
+        ["python", script("xlsx", "recalc.py"), "全部错误.xlsx", "全部错误_出.xlsx"], expect=2
+    ).stdout
+)
+expected_all = {
+    "A1": "#DIV/0!",
+    "A2": "#REF!",
+    "A3": "#VALUE!",
+    "A4": "#NAME?",
+    "A5": "#N/A",
+    "A6": "#NUM!",
+    "A7": "#NULL!",
+}
+got_all = {e["cell"]: e["value"] for e in res_all["errors"] if e["sheet"] == "错误全集"}
+check(got_all == expected_all, f"not all 7 _ERRORS reproduced: {got_all}")
+
 wb2 = openpyxl.Workbook()
 wb2.active["A1"] = "=1+1"
 wb2.save("ok.xlsx")
