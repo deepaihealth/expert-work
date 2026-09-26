@@ -615,7 +615,7 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
 
 **用哪份源码打包**：Step B 钉的发版提交不含 `platform-skills/`。本步先检出 office 技能合并进 main 的
-那个提交（`<OFFICE_SKILLS_SHA>`，PR 合并后回填）打包导入；Step B 再照常检出发版提交。打包与导入脚本要用
+那个提交（`<OFFICE_SKILLS_SHA>`，PR 合并后回填）打包导入；Step B 再照常检出发版提交。（发版钉子不前移是 09-26 拍板：office 技能的代码侧文案改动因此不随本班上生产，见 ROADMAP B-119。）打包与导入脚本要用
 仓库自己的 venv（`uv run --no-sync`），所以就在平时的仓库目录里做，不另开 worktree：
 
 ```sh
