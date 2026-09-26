@@ -120,9 +120,10 @@ def test_preinstalled_binaries_are_in_the_dockerfile() -> None:
 def test_note_states_that_npm_is_gone() -> None:
     """否定句必须真的出现在工具描述里 —— B-55。
 
-    这一条不是措辞洁癖:``docx`` / ``pptx`` 两个平台技能的正文明写
-    ``npm install -g``,而 npm 已经不在镜像里了。肯定清单只说"有什么",不说
-    "没什么";只摘掉 ``npm`` 那一条,模型照技能正文去敲,仍然白跑一轮。
+    这一条不是措辞洁癖:旧版(Anthropic 原版)``docx`` / ``pptx`` 两个平台技能的
+    正文曾明写 ``npm install -g``,而 npm 已经不在镜像里了。技能换成自写新版之后
+    正文不再这么写,但模型仍可能凭训练数据的先验去试 npm。肯定清单只说"有什么",
+    不说"没什么";只摘掉 ``npm`` 那一条,模型仍然会白跑一轮。
     """
     note = preinstalled_note()
     assert "npm" in note, "工具描述没提 npm —— 技能正文还在教模型用它"
