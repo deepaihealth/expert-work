@@ -1,0 +1,5 @@
+shared:
+  - _cli.py
+  - _office.py
+  - convert.py
+  - preview.py

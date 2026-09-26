@@ -11,6 +11,7 @@
 
 ## 0.1 现状（已 file:line 核实，2026-06-05）
 - 沙箱镜像 `infra/sandbox-image/Dockerfile` = `python:3.12-alpine`（~50MB）+ 纯 stdlib，**运行时卸载 pip**（安全 F-2/F-13）；无办公库、无中文字体、无 locale。
+  > **2026-09-25 更正**：「运行时卸载 pip」已不成立——B-81 之后沙箱配了 pip 内网镜像源（注入点 `exec_envs`），测试环境真实路径复验 `pip download pymupdf` 11.31s 成功（此前四次 `pip install` 全部超时失败）。详见 `docs/superpowers/specs/2026-09-25-platform-office-skills-design.md` §0.1。
 - 镜像名 supervisor **硬编码** `settings.sandbox_image`（`settings.py:34`，env `EXPERT_WORK_SANDBOX_SANDBOX_IMAGE`）；`AcquireRequest`（`schemas.py:16`）无 image 字段；一个 supervisor 实例当前无法按请求选镜像。
 - `SandboxSpec`（`agent_spec.py:225`）**已有未使用的 `image` / `image_build` 字段**；无 `image_variant`。
 - `persistent_workspace`（J.15）是 manifest→supervisor 传递的**完美模板**：manifest → `agent_factory.build_tool_registry` → 沙箱工具字段 → `run_in_sandbox` → `acquire`。
@@ -28,6 +29,8 @@
 - **决策**：office 镜像基于 `python:3.12-slim`（glibc → pandas/numpy/Pillow 有 manylinux wheels 直接装；alpine musl 需现编译）；`docker build` 阶段 `pip install` 办公库，**装完卸载 pip**（保运行时安全：仍无 pip、无 egress）。
 - **库集**：`pandas` / `openpyxl`（xlsx）/ `python-docx`（docx）/ `python-pptx`（pptx）/ `pypdf` + `pdfplumber`（PDF 读）/ `Pillow`（图像）/ `matplotlib`（图表，中文需字体）。
 - **不含**（推后）：libreoffice（.doc/.xls 老格式转换、Office→PDF 渲染）、pandoc、wkhtmltopdf。真有"格式互转"需求再开 OFFICE-1c。
+- **2026-09-25 更正（pip）**：`装完卸载 pip` 已不成立——见 §0.1 本节更正注（B-81 之后运行时 pip 可用）。
+- **2026-09-25 更正（libreoffice）**：「不含（推后）：libreoffice」已不成立——镜像早已装有 `libreoffice-writer-nogui` / `-calc-nogui` / `-impress-nogui`（自 #763 起），B-55 收官时 pod 内复探仍确认 `soffice` 二进制在位。详见 `docs/superpowers/specs/2026-09-25-platform-office-skills-design.md` §0.1。
 
 ### OFFICE-ADR-2 镜像 variant 机制（复用 persistent_workspace 链路）
 - **决策**：`SandboxSpec` 加 `image_variant: Literal["minimal","office"] | None`（None→默认/minimal，向后兼容）。链路照搬 `persistent_workspace`：
@@ -47,6 +50,7 @@
 - **决策**：补一个**平台级 skill 导入端点** `POST /v1/platform/skills/import`（system_admin + `bypass_rls`，multipart `.skill` ZIP，复用租户侧 `_skill_zip` 解析 + 威胁扫描），让平台管理员把 `.skill` 包导入成**平台级 skill**（NULL-tenant），租户经 X-6 merged view + X-4 resolver 自动可见 + `required_tier` 门控。**包来源由管理员定**（自打 / 挑 license 干净的现成包），平台不预置内容。
 - **content_hash 幂等（租户+平台统一）**：导入同名 skill 时，与 **latest 版本 content_hash 相同则跳过**（不产生冗余版本），不同则 `add_version` 生成新版本。租户现有 `POST /v1/skills/import` **每次都加版本**，本轮一并补幂等，两边语义一致。
 - store 接口齐全无需新方法：`get_skill_by_name`/`get_platform_skill_by_name` + `get_version_by_number`/`get_platform_version_by_number`（取 latest content_hash）+ `add_version`/`add_platform_version`/`create_*`。
+- **2026-09-25 修订**：推翻本条「包来源由管理员定（自打 / 挑 license 干净的现成包），平台不预置内容」一句——`docx`/`pptx`/`xlsx`/`pdf` 四个技能改为**平台自写**（clean-room），源码放本仓库 `platform-skills/`，走 PR + CI。理由：① 这四个技能目前是 2026-08-03 从 `anthropics/skills` 原样导入的第 1 版，许可证明文禁止衍生作品与再分发，在其上修改不可行；② 原版「新建」路线依赖 npm（docx→npm `docx` 包、pptx→`pptxgenjs`），而沙箱里没有 npm（B-55 已删），模型读了技能也照做不了。旧版本（Anthropic 原版）保留在版本历史里不删，许可风险用户知情选择。详见 `docs/superpowers/specs/2026-09-25-platform-office-skills-design.md`。
 
 ## 2. Stream 切分
 - **OFFICE-1a 镜像 variant 机制**：manifest `image_variant` + supervisor `_select_image` + acquire 字段 + orchestrator 链路。先用现有 minimal 镜像验证机制（不依赖 office 镜像就绪）。

@@ -512,7 +512,9 @@
 ## 3. 执行顺序
 
 顺序是约束：**A0 在 A 之前**（B-55：凭据与 ALB 都要先就位，A 一 apply 就去拉 `-vpc` 的镜像）、
-**A 在 B 之前**（金丝雀要在新沙箱镜像上验）、**B 之后立刻做 C**。
+**A 在 B 之前**（金丝雀要在新沙箱镜像上验）、**B 之后立刻做 C**、**A2 在 B 通过、C 点检完之后**（技能正文的
+脚本路径靠 B-84 带来的 `EXPERT_WORK_SKILLS_DIR`，生产现版 `5775fbf3` 没有；09-26 终审改，原先放在 B 之前）。
+实际顺序：A0 → A → B → C → A2 → D → E → F。
 
 ### Step A0 — `acr-pull` 两个 host + ALB 80 端口超时（B-55，本版新增）
 
@@ -621,6 +623,8 @@ tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 - [ ] smoke 里的沙箱钉子检查是 `OK`（Step A 做过了；显示 `WARN 落后 N` 说明 Step A 漏了）
 - [ ] overlay 的 newTag 改动先别提交 —— Step F 一起记
 
+> Step B 失败要回滚见 §4。此时 Step A2 还没做，技能不受影响；若 A2 做完之后才决定回滚，§4 里有「技能也要一起回」那一条。
+
 ### Step C — 发后即时点检（rollout 完成后 10 分钟内）
 
 ```sh
@@ -641,6 +645,114 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
       期望 `23 3 * * *  tz=Asia/Shanghai  suspend=false`。
 
 - [ ] **对话可用**（金丝雀之外再看一眼真实流量）：控制台随便打开一段最近会话，能正常加载。
+
+### Step A2 — 导入 office 技能（docx / pptx / xlsx / pdf，本版新增）
+
+必须在 **Step B 通过之后**（smoke 全绿、金丝雀 PASS，且 Step C 点检完）才做，理由（09-26 终审改，原先放在
+Step B 之前是错的）：新技能正文里的脚本路径全部写成 `$EXPERT_WORK_SKILLS_DIR/<技能>/scripts/…`，这个环境变量
+是 B-84（`233791e5`）才加的，随 `f92c6fae` 上生产；生产现版 `5775fbf3` 没有它，路径会展开成
+`/docx/scripts/…`，脚本调用全部失败。若先导入技能再发版，从导入到 Step B 结束这段时间里 office 技能不可用，
+Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之后**（技能脚本依赖新沙箱镜像里的 LibreOffice 与
+预装库，第二层测试验的也是这份镜像）。
+
+放在 Step B 之后，**缓存失效就要靠本步自己**：Step B 的滚动重启已经发生过，不会再顺带清缓存。导入脚本在
+有新版本时会发一次跨副本失效广播；没发到时要补一次 `rollout restart`（见下面「正式导入」的检查项）。
+
+**逐技能 go / no-go**：以 09-27 晚测试环境验收结论为准（controller 拍板，结论写进 §6）。**没过的技能
+本步跳过、保持生产原版不导入**——下面的命令只把 go 的技能对应的 `$PS/dist/<name>.skill`
+传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
+
+**用哪份源码打包**：Step B 钉的发版提交不含 `platform-skills/`，要用 office 技能合并进 main 的那个提交
+（`<OFFICE_SKILLS_SHA>`，PR 合并后回填）打包导入。（发版钉子不前移是 09-26 拍板：office 技能的代码侧文案
+改动因此不随本班上生产，见 ROADMAP B-119。）此刻主仓库目录检出的是 `f92c6fae`，而且 Step B 留下了
+**未提交的 overlay newTag 改动**（Step F 要用），所以**不要在主仓库里 checkout**：把那个提交放进一个独立
+worktree，命令仍在主仓库目录里跑（要用仓库自己的 venv；在 worktree 目录里跑 `uv run` 会建一个没有依赖的
+空 venv）。`build.py` 的输入与 `dist/` 输出都按它自己所在的目录定位，与当前目录无关：
+
+```sh
+git fetch origin main
+git worktree add /tmp/ps-office <OFFICE_SKILLS_SHA>
+git -C /tmp/ps-office log -1 --oneline   # 确认就是它
+```
+
+`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`f92c6fae`），与生产 pod 里跑的是
+同一版，这正是要的。
+
+**导入前只读核对**：
+
+```sh
+export KUBECONFIG=~/.kube/expert-work-prod.yaml
+kubectl config current-context  # 执行 exec 前务必确认连的是生产
+POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+  --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+```
+
+① 四个平台技能当前版本（`run_sql`，用 §1 已定义的那个包装）：
+
+```sql
+SELECT s.name, s.latest_version, v.content_hash
+FROM skill s JOIN skill_version v ON v.skill_id = s.id AND v.version = s.latest_version
+WHERE s.tenant_id IS NULL AND s.name IN ('docx','pptx','xlsx','pdf') ORDER BY s.name;
+```
+
+② 绑定这四个技能的 Agent 数（同一份 `run_sql`）：
+
+```sql
+SELECT sk AS skill, count(*) AS agents FROM agent_spec a,
+  jsonb_array_elements_text(COALESCE(a.spec_json->'spec'->'skills','[]'::jsonb)) sk
+WHERE a.status <> 'deleted' AND sk IN ('docx','pptx','xlsx','pdf') GROUP BY 1 ORDER BY 1;
+```
+
+- [ ] 两条查询结果已记入 §6（导入前基线）
+
+**dry-run**（只看会不会建版本，不落库）：
+
+```sh
+uv run --no-sync python /tmp/ps-office/platform-skills/build.py   # 写到 /tmp/ps-office/platform-skills/dist/
+PS=/tmp/ps-office/platform-skills
+
+# 下面按四个技能全部 go 写；哪个 no-go 就把它的 .skill 从这行删掉
+uv run --no-sync python $PS/import_in_pod.py bundle --dry-run \
+  $PS/dist/docx.skill $PS/dist/pptx.skill \
+  $PS/dist/xlsx.skill $PS/dist/pdf.skill \
+  | kubectl -n expert-work exec -i "$POD" -- python3 -
+```
+
+- [ ] 每个 go 的技能都输出一行 `"status":"dry-run"`，`would_create_version` 是期望的下一个版本号
+
+**正式导入**（同一份文件列表，去掉 `--dry-run`）：
+
+```sh
+uv run --no-sync python $PS/import_in_pod.py bundle \
+  $PS/dist/docx.skill $PS/dist/pptx.skill \
+  $PS/dist/xlsx.skill $PS/dist/pdf.skill \
+  | kubectl -n expert-work exec -i "$POD" -- python3 -
+```
+
+- [ ] 每个 go 的技能输出 `"status":201`（新建版本）或 `"status":200`（`content_hash` 与 `latest` 相同，
+      幂等跳过，不产生冗余版本）
+- [ ] 只要有一个 `201`，输出里出现 `{"invalidation":"published","receivers":N}`（N ≥ 1 = 有 N 个订阅者
+      收到失效，不保证是全部副本）。Step B 的重启已经过去了，**这一行就是各副本换上新技能的唯一信号**
+- [ ] 若输出 `{"invalidation":"skipped",...}` 且退出码非 0：版本已写入，只是失效没发到。**不要重跑**（重跑
+      全是 `200`，不会再发失效）——补救用 `kubectl -n expert-work rollout restart deploy/control-plane`
+      （会再滚一次 control-plane，在跑的对话按 B-80 交接），或接受最多 1800s 后缓存自然过期；选哪个记进 §6
+- [ ] 若中途某个包失败：已输出的 `201` 行已经落库，失效行照样会打印；把失败原因记进 §6 后按该技能 no-go 处理
+
+**导入后只读核对**：把①②两条 SQL 再跑一遍，写入 §6。做完删掉临时 worktree：
+`git worktree remove /tmp/ps-office`。
+
+- [ ] go 的技能：`latest_version` / `content_hash` 与刚才导入输出的 `version` / `content_hash` 一致
+- [ ] 绑定 Agent 数（②）与导入前**不变**——导入只加版本，不改任何 Agent 的技能绑定
+- [ ] no-go 的技能：`latest_version` / `content_hash` 与导入前**不变**（没碰过）
+
+**回滚**：某个技能新版本有问题——`git worktree add /tmp/ps-rollback <旧提交>`，在**主仓库目录**里跑
+`uv run --no-sync python /tmp/ps-rollback/platform-skills/build.py`（打包的是 worktree 里的旧源码，输出在
+`/tmp/ps-rollback/platform-skills/dist/`），先 `PS=/tmp/ps-rollback/platform-skills`（上面的 `/tmp/ps-office` 此时已删），再按上面「正式导入」把 `$PS/dist/<技能>.skill`
+重新导入（平台存成更新的版本，内容等同旧版），最后 `git worktree remove /tmp/ps-rollback`。**不要**
+`git checkout <旧提交> -- 路径`（会覆盖工作区未提交的改动），也**不要**在 worktree 目录里跑 `uv run`（空 venv）
+或从主仓库跑 `platform-skills/build.py`（打的是主仓库当前的源码）。**不要**手工改 `skill.latest_version`
+或直接删版本行。每个技能独立回滚，互不影响其它三个。需要紧急退回 Anthropic 原版：控制台导出第 1 版
+（原版保留在版本历史里未删，见 ROADMAP B-117）再重新导入。
 
 ### Step D — 真栈验证（本版新功能，按需做，全部只用金丝雀）
 
@@ -711,6 +823,12 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 模型上的「思考长度上限」（`thinking_max_tokens`，B-105） | 旧版 `ModelSpec` 也是 `extra="forbid"`，读到这个字段**校验失败 → Agent 起不来**。留空的上限不落库，所以只有**真填了**的才有问题 | 回滚前先在配置页清空再回滚。另：回滚后非 Anthropic 的输出上限重新**全部不生效**，豆包「开思考不填档位」重新 400 |
 | 留存 CronJob | `apply -k` 旧 overlay **不会**删掉已创建的对象 | 要一并退掉就显式删：`kubectl -n expert-work delete cronjob retention-cleanup` |
 
+⚠️ **Step A2 已做（新 office 技能已导入）时，回滚镜像必须连技能一起回。**回到 `5775fbf3` 后控制面没有
+`EXPERT_WORK_SKILLS_DIR`，新技能正文里的脚本路径全部失效，office 技能会一直坏着。`rollback.sh` 跑完立刻
+把本次导入过（201）的技能退回上一版：控制台「平台技能」页导出第 1 版（Anthropic 原版，仍在版本历史里，
+见 ROADMAP B-117），再逐个上传导入（平台存成新版本，内容等同原版）。导入后用 Step A2 的 SQL ① 核对
+`content_hash` 回到了 A2 导入前的基线值。只导入了其中几个就只回那几个。
+
 沙箱钉子单独回：`git checkout 5775fbf3 -- infra/k8s/sandbox/sandboxset.yaml && kubectl apply -f infra/k8s/sandbox/sandboxset.yaml`
 （回到 `e8aac104`）。
 
@@ -744,6 +862,7 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 发布前在跑 / 排队 / 待审批 | `___` |
 | Step A 沙箱钉子 | 发前 `________` → 发后 `________` |
 | Step B smoke / 金丝雀 | `________` |
+| Step A2 office 技能导入（B、C 之后） | go/no-go(docx/pptx/xlsx/pdf)`________`；导入前 latest_version `________` → 导入后 `________`；失效 published(N=`__`) / skipped → restart 或等 1800s `________` |
 | migrate Job | 期望跑四条（`0156` ~ `0159`），实况 `________` |
 | CronJob 创建 | `________` |
 | 次日首跑删除计数 | `________` |
