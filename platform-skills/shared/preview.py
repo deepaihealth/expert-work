@@ -59,24 +59,33 @@ def main() -> None:
         images: list[str] = []
         for n in pages:
             prefix = out_dir / f"page-{n:03d}"
-            subprocess.run(  # noqa: S603
-                [  # noqa: S607 — resolved via PATH, matches _office.py's soffice lookup pattern
-                    "pdftoppm",
-                    "-png",
-                    "-r",
-                    str(args.dpi),
-                    "-f",
-                    str(n),
-                    "-l",
-                    str(n),
-                    "-singlefile",
-                    str(pdf),
-                    str(prefix),
-                ],
-                check=True,
-                capture_output=True,
-                timeout=args.timeout,
-            )
+            try:
+                subprocess.run(  # noqa: S603
+                    [  # noqa: S607 — resolved via PATH, matches _office.py's soffice lookup pattern
+                        "pdftoppm",
+                        "-png",
+                        "-r",
+                        str(args.dpi),
+                        "-f",
+                        str(n),
+                        "-l",
+                        str(n),
+                        "-singlefile",
+                        str(pdf),
+                        str(prefix),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=args.timeout,
+                )
+            except FileNotFoundError:
+                fail("沙箱里找不到 pdftoppm（poppler-utils）")  # noqa: RUF001
+            except subprocess.TimeoutExpired:
+                fail(f"第 {n} 页渲染超时 {args.timeout:.0f}s")
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or "").strip()[-500:]
+                fail(f"第 {n} 页渲染失败（退出码 {exc.returncode}）：{detail}")  # noqa: RUF001
             images.append(str(prefix.with_suffix(".png")))
         emit_json({"pages_total": total, "images": images})
     finally:
