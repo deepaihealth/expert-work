@@ -122,6 +122,7 @@ res = json.loads(
     ).stdout
 )
 check("备注" not in res["shared_parts_warning"], f"notes must not be shared: {res}")
+check(res["notes_format_lost"] is False, f"normal notes copy must not report format lost: {res}")
 out3 = pptx.Presentation("带备注 副本.pptx")
 notes0, notes1 = out3.slides[0].notes_slide, out3.slides[1].notes_slide
 check(notes0.part is not notes1.part, "duplicated slide shares the same notes part")
@@ -141,6 +142,37 @@ check(
 check(
     out3_reloaded.slides[1].notes_slide.notes_text_frame.text == "改过的副本备注",
     "edit to the copy's notes did not persist",
+)
+
+# realistic edge case #2b: a notes placeholder present but with no <p:txBody> at all (some
+# other authoring tool can produce this; python-pptx itself never omits it once a notes
+# slide is touched) must not raise — duplicate_slide.py falls back to a plain-text copy and
+# discloses that explicitly via notes_format_lost, instead of a broad except silently
+# swallowing this (or any unrelated real bug) behind the same "best effort" fallback.
+p3b = pptx.Presentation()
+s3b = p3b.slides.add_slide(p3b.slide_layouts[6])
+notes_ph = s3b.notes_slide.notes_placeholder
+notes_ph._element.remove(notes_ph._element.txBody)
+p3b.save("备注无正文.pptx")
+res3b = json.loads(
+    run(
+        [
+            "python",
+            script("pptx", "duplicate_slide.py"),
+            "备注无正文.pptx",
+            "备注无正文 副本.pptx",
+            "--index",
+            "1",
+        ]
+    ).stdout
+)
+check(res3b["notes_format_lost"] is True, f"missing txBody must report format lost: {res3b}")
+out3b = pptx.Presentation("备注无正文 副本.pptx")
+new_slide3b = out3b.slides[1]
+check(new_slide3b.has_notes_slide, "no-txBody fallback lost the notes slide entirely")
+check(
+    new_slide3b.notes_slide.notes_text_frame.text == "",
+    "no-txBody fallback should copy empty text, not crash or invent content",
 )
 
 # realistic edge case #3: an external hyperlink inside a text run must still point to the

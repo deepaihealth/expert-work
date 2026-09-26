@@ -29,27 +29,39 @@ _SHARED_WARN = {
 }
 
 
-def _copy_notes(src, new) -> None:
-    """Give the duplicate its own independent notes part (not shared with the source)."""
+def _copy_notes(src, new) -> bool:
+    """Give the duplicate its own independent notes part (not shared with the source).
+
+    Returns True if formatting could not be preserved and a plain-text-only copy was used
+    instead (``notes_format_lost``); False when there was nothing to copy or the structural
+    (rich-formatting) copy succeeded.
+    """
     if not src.has_notes_slide:
-        return
+        return False
     src_ph = src.notes_slide.notes_placeholder
     if src_ph is None:
-        return
+        return False
     dst_ph = new.notes_slide.notes_placeholder  # new.notes_slide auto-vivifies a fresh part
     if dst_ph is None:
-        return
-    try:
-        # Deep-copy the whole txBody (not just .text) to keep run-level formatting
-        # (bold, bullets, ...); falls back to plain text if that structure ever doesn't
-        # match what a fresh notes placeholder expects.
-        dst_tx_body = dst_ph.text_frame._element
-        dst_tx_body.getparent().replace(dst_tx_body, copy.deepcopy(src_ph.text_frame._element))
-    except Exception:
+        return False
+    # `ph._element.txBody` is the raw (non-mutating) ZeroOrOne lookup — None when the
+    # placeholder has never had a `<p:txBody>` written into it (e.g. a notes placeholder
+    # shape present but stripped of its text body by some other tool). `.text_frame`
+    # instead *auto-creates* an empty txBody via `get_or_add_txBody()`, which would both
+    # mutate `src` as a side effect and give us nothing real to deep-copy — so check the
+    # raw element first and only take the rich-copy path when there is an actual txBody.
+    src_tx_body = src_ph._element.txBody
+    if src_tx_body is None:
         dst_ph.text_frame.text = src_ph.text_frame.text
+        return True
+    # Deep-copy the whole txBody (not just .text) to keep run-level formatting (bold,
+    # bullets, multiple paragraphs, ...).
+    dst_tx_body = dst_ph.text_frame._element
+    dst_tx_body.getparent().replace(dst_tx_body, copy.deepcopy(src_tx_body))
+    return False
 
 
-def duplicate(prs, index: int, after: int) -> tuple[int, list[str]]:
+def duplicate(prs, index: int, after: int) -> tuple[int, list[str], bool]:
     src = prs.slides[index - 1]
     new = prs.slides.add_slide(src.slide_layout)
     for shape in list(new.shapes):
@@ -74,12 +86,12 @@ def duplicate(prs, index: int, after: int) -> tuple[int, list[str]]:
                 if attr.startswith(f"{{{_R_NS}}}") and val in rid_map:
                     node.set(attr, rid_map[val])
         new.shapes._spTree.append(clone)
-    _copy_notes(src, new)
+    notes_format_lost = _copy_notes(src, new)
     ids = prs.slides._sldIdLst
     moved = ids[-1]
     ids.remove(moved)
     ids.insert(after, moved)
-    return after + 1, sorted(warnings)
+    return after + 1, sorted(warnings), notes_format_lost
 
 
 def main() -> None:
@@ -97,9 +109,15 @@ def main() -> None:
     after = args.index if args.after is None else args.after
     if not 0 <= after <= total:
         fail(f"--after 超出范围：0..{total}")  # noqa: RUF001
-    number, warnings = duplicate(prs, args.index, after)
+    number, warnings, notes_format_lost = duplicate(prs, args.index, after)
     prs.save(str(dst))
-    emit_json({"new_slide_number": number, "shared_parts_warning": warnings})
+    emit_json(
+        {
+            "new_slide_number": number,
+            "shared_parts_warning": warnings,
+            "notes_format_lost": notes_format_lost,
+        }
+    )
 
 
 if __name__ == "__main__":
