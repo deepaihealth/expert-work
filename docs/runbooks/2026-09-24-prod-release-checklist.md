@@ -512,6 +512,7 @@
 ## 3. 执行顺序
 
 顺序是约束：**A0 在 A 之前**（B-55：凭据与 ALB 都要先就位，A 一 apply 就去拉 `-vpc` 的镜像）、
+**A 在 A2 之前**（技能脚本依赖新沙箱镜像）、**A2 在 B 之前**（B 的滚动发布顺带清缓存）、
 **A 在 B 之前**（金丝雀要在新沙箱镜像上验）、**B 之后立刻做 C**。
 
 ### Step A0 — `acr-pull` 两个 host + ALB 80 端口超时（B-55，本版新增）
@@ -602,6 +603,81 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 |---|---|---|
 | `insufficient_scope: authorization failed` | A0-1 没做或只写了一个 host | 回去做 A0-1 |
 | `Pulling` 之后长时间没有 `Pulled` | 正常冷拉。**瘦身后测试集群实测 40.5s**（瘦身前 66.2s；公网 112s） | 等 |
+
+### Step A2 — 导入 office 技能（docx / pptx / xlsx / pdf，本版新增）
+
+必须在 **Step A 之后**（技能脚本依赖新沙箱镜像里的 LibreOffice 与预装库，第二层测试验的也是这份镜像）、
+**Step B 之前**（Step B 的滚动发布会重启全部 control-plane，缓存自然清空，不需要像测试环境那样额外
+`kubectl rollout restart`）。
+
+**逐技能 go / no-go**：以 09-27 晚测试环境验收结论为准（controller 拍板，结论写进 §6）。**没过的技能
+本步跳过、保持生产原版不导入**——下面的命令只把 go 的技能对应的 `platform-skills/dist/<name>.skill`
+传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
+
+**导入前只读核对**：
+
+```sh
+export KUBECONFIG=~/.kube/expert-work-prod.yaml
+POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+  -o jsonpath='{.items[0].metadata.name}')
+```
+
+① 四个平台技能当前版本（`run_sql`，用 §1 已定义的那个包装）：
+
+```sql
+SELECT s.name, s.latest_version, v.content_hash
+FROM skill s JOIN skill_version v ON v.skill_id = s.id AND v.version = s.latest_version
+WHERE s.tenant_id IS NULL AND s.name IN ('docx','pptx','xlsx','pdf') ORDER BY s.name;
+```
+
+② 绑定这四个技能的 Agent 数（同一份 `run_sql`）：
+
+```sql
+SELECT sk AS skill, count(*) AS agents FROM agent_spec a,
+  jsonb_array_elements_text(COALESCE(a.spec_json->'spec'->'skills','[]'::jsonb)) sk
+WHERE a.status <> 'deleted' AND sk IN ('docx','pptx','xlsx','pdf') GROUP BY 1 ORDER BY 1;
+```
+
+- [ ] 两条查询结果已记入 §6（导入前基线）
+
+**dry-run**（只看会不会建版本，不落库）：
+
+```sh
+python platform-skills/build.py
+
+# 下面按四个技能全部 go 写；哪个 no-go 就把它的 .skill 从这行删掉
+python platform-skills/import_in_pod.py bundle --dry-run \
+  platform-skills/dist/docx.skill platform-skills/dist/pptx.skill \
+  platform-skills/dist/xlsx.skill platform-skills/dist/pdf.skill \
+  | kubectl -n expert-work exec -i "$POD" -- python3 -
+```
+
+- [ ] 每个 go 的技能都输出一行 `"status":"dry-run"`，`would_create_version` 是期望的下一个版本号
+
+**正式导入**（同一份文件列表，去掉 `--dry-run`）：
+
+```sh
+python platform-skills/import_in_pod.py bundle \
+  platform-skills/dist/docx.skill platform-skills/dist/pptx.skill \
+  platform-skills/dist/xlsx.skill platform-skills/dist/pdf.skill \
+  | kubectl -n expert-work exec -i "$POD" -- python3 -
+```
+
+- [ ] 每个 go 的技能输出 `"status":201`（新建版本）或 `"status":200`（`content_hash` 与 `latest` 相同，
+      幂等跳过，不产生冗余版本）
+- [ ] 只要有一个 `201`，输出里出现 `{"invalidation":"published"}`（只清了处理这次请求的那个副本的缓存；
+      Step B 的滚动发布会把其余副本一并清掉）
+
+**导入后只读核对**：把①②两条 SQL 再跑一遍，写入 §6。
+
+- [ ] go 的技能：`latest_version` / `content_hash` 与刚才导入输出的 `version` / `content_hash` 一致
+- [ ] 绑定 Agent 数（②）与导入前**不变**——导入只加版本，不改任何 Agent 的技能绑定
+- [ ] no-go 的技能：`latest_version` / `content_hash` 与导入前**不变**（没碰过）
+
+**回滚**：某个技能新版本有问题——从本仓库 git 历史取该技能上一版源码 → `python platform-skills/build.py`
+→ 按上面「正式导入」重新导入（平台存成更新的版本，内容等同旧版）。**不要**手工改 `skill.latest_version`
+或直接删版本行。每个技能独立回滚，互不影响其它三个。需要紧急退回 Anthropic 原版：控制台导出第 1 版
+（原版保留在版本历史里未删，见 ROADMAP B-117）再重新导入。
 
 ### Step B — 发版（单段）
 
@@ -743,6 +819,7 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 窗口 | `___ : ___` ~ `___ : ___` |
 | 发布前在跑 / 排队 / 待审批 | `___` |
 | Step A 沙箱钉子 | 发前 `________` → 发后 `________` |
+| Step A2 office 技能导入 | go/no-go(docx/pptx/xlsx/pdf)`________`；导入前 latest_version `________` → 导入后 `________` |
 | Step B smoke / 金丝雀 | `________` |
 | migrate Job | 期望跑四条（`0156` ~ `0159`），实况 `________` |
 | CronJob 创建 | `________` |

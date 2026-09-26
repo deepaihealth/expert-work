@@ -206,8 +206,8 @@ class PreinstalledBinary(NamedTuple):
 #: 真的装了。反向不钉 —— Dockerfile 里装的多数是共享库,不该也不必进工具描述)。
 #:
 #: ``npm`` 曾经在这份清单里,B-55 摘掉了 —— 它不在镜像里了。摘掉**不等于**模型
-#: 就不会去试:``docx`` / ``pptx`` 两个平台技能的 SKILL.md 里写着
-#: ``npm install -g docx`` / ``npm install -g pptxgenjs``。所以否定句要显式说出来,
+#: 就不会去试:模型受训练数据影响,遇到"生成/编辑 Word、PPT"类任务本能会想到
+#: JavaScript 生态的包(``docx``/``pptxgenjs``)。所以否定句要显式说出来,
 #: 见 :data:`SANDBOX_UNAVAILABLE_NOTE`。
 SANDBOX_PREINSTALLED_BINARIES: tuple[PreinstalledBinary, ...] = (
     PreinstalledBinary("soffice", "apt", "libreoffice-writer-nogui"),
@@ -223,10 +223,10 @@ SANDBOX_PREINSTALLED_BINARIES: tuple[PreinstalledBinary, ...] = (
 #: ``sitecustomize.py`` 补上,npm 没有),**0 个 run 成功装上过任何一个 npm 包**。
 #: 也就是说这条路在 npm 还在镜像里的时候就已经是死的,只是模型每次都要自己撞一遍
 #: 才知道。镜像里没有 npm 之后,报错会从「407 超时」变成「command not found」——
-#: 更快,但仍然是白跑一轮。技能正文改不动(它们是上游技能),平台这一处说得清。
+#: 更快,但仍然是白跑一轮。这句否定断言与具体哪份技能正文无关,写在工具描述里最省心。
 SANDBOX_UNAVAILABLE_NOTE = (
-    "沙箱里**没有 npm**（node 有）。技能文档里的 `npm install` / `npm install -g` "  # noqa: RUF001
-    "一律走不通，出网代理也挡 npm registry —— 遇到就直接改用 Python 等价物"  # noqa: RUF001
+    "沙箱里**没有 npm**（node 有），`npm install` / `npm install -g` "  # noqa: RUF001
+    "一律走不通，出网代理也挡 npm registry —— 需要生成 Word/PPT 时改用 Python 等价物"  # noqa: RUF001
     "（docx→python-docx，pptx→python-pptx，两者都已预装）。"  # noqa: RUF001
 )
 
