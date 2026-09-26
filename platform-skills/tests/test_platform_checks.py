@@ -60,7 +60,13 @@ def test_platform_zip_parse_accepts_package(built_packages, name):
 def test_threat_scans_pass_body_and_every_text_file(unpacked_skills, name):
     for f in sorted((unpacked_skills / name).rglob("*")):
         if f.is_file():
-            text = f.read_text(encoding="utf-8")
+            try:
+                text = f.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                pytest.fail(
+                    f"{f}: not valid UTF-8 — binary supporting files aren't expected in "
+                    f"these skills ({exc})"
+                )
             assert not scan_for_threats(text, scope="strict"), f"strict scan hit: {f}"
             assert not scan_for_threats(text, scope="context"), (
                 f"context scan hit (would be dropped at seed): {f}"
@@ -119,5 +125,12 @@ def test_env_block_claims_match_sandbox_contract(unpacked_skills):
     preinstalled = {p.lower() for p in contract.SANDBOX_PREINSTALLED_PYTHON}
     assert libs <= preinstalled, f"claimed but not preinstalled: {libs - preinstalled}"
     bins = {b.command for b in contract.SANDBOX_PREINSTALLED_BINARIES}
-    claimed_bins = {w for w in ("soffice", "pdftoppm") if w in m.group(2)}
-    assert claimed_bins <= bins
+    # Generic extraction: split every listed tool on 、, strip a trailing
+    # parenthetical note (e.g. "soffice(LibreOffice)" -> "soffice") — no
+    # hardcoded candidate set, so a false claim (e.g. a stray "、npm") is
+    # caught instead of silently ignored.
+    claimed_bins = {
+        re.sub(r"[（(].*?[）)]", "", tok).strip()  # noqa: RUF001
+        for tok in m.group(2).split("、")
+    }
+    assert claimed_bins <= bins, f"claimed but not preinstalled: {claimed_bins - bins}"
