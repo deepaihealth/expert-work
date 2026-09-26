@@ -747,7 +747,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle \
 
 **回滚**：某个技能新版本有问题——`git worktree add /tmp/ps-rollback <旧提交>`，在**主仓库目录**里跑
 `uv run --no-sync python /tmp/ps-rollback/platform-skills/build.py`（打包的是 worktree 里的旧源码，输出在
-`/tmp/ps-rollback/platform-skills/dist/`），再按上面「正式导入」把 `/tmp/ps-rollback/platform-skills/dist/<技能>.skill`
+`/tmp/ps-rollback/platform-skills/dist/`），先 `PS=/tmp/ps-rollback/platform-skills`（上面的 `/tmp/ps-office` 此时已删），再按上面「正式导入」把 `$PS/dist/<技能>.skill`
 重新导入（平台存成更新的版本，内容等同旧版），最后 `git worktree remove /tmp/ps-rollback`。**不要**
 `git checkout <旧提交> -- 路径`（会覆盖工作区未提交的改动），也**不要**在 worktree 目录里跑 `uv run`（空 venv）
 或从主仓库跑 `platform-skills/build.py`（打的是主仓库当前的源码）。**不要**手工改 `skill.latest_version`

@@ -146,7 +146,7 @@ uv run --no-sync python platform-skills/import_in_pod.py bundle platform-skills/
 git worktree add /tmp/ps-rollback <旧 commit>
 # 在主仓库目录里跑（用仓库自己的 venv）；build.py 按它自己的位置找源码、写 dist/，与当前目录无关
 uv run --no-sync python /tmp/ps-rollback/platform-skills/build.py
-uv run --no-sync python platform-skills/import_in_pod.py bundle /tmp/ps-rollback/platform-skills/dist/<技能名>.skill \
+uv run --no-sync python /tmp/ps-rollback/platform-skills/import_in_pod.py bundle /tmp/ps-rollback/platform-skills/dist/<技能名>.skill \
   | kubectl -n expert-work exec -i <control-plane-pod> -- python3 -
 git worktree remove /tmp/ps-rollback
 ```
