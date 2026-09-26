@@ -86,34 +86,49 @@ python platform-skills/build.py --out /tmp/out      # 自定义输出目录
 ## 发布
 
 `import_in_pod.py bundle` 在本机把「自身源码 + 本地打好的 `.skill` 包（base64）」拼成一个自包含
-的 Python 程序打到 stdout；不连集群、不 import 任何平台代码。把它接到 pod 里的 `python3 -` 才会
-真正导入：跑的是平台自己 ZIP 上传接口那一条 `_ingest_platform_skill_payload` 管线（解析 → 名称
-校验 → 内容审核 → Mini-ADR U-21 严格威胁扫描 → 幂等创建/加版本 → 审计），导入成功会自动发一次
-跨副本 `platform_skill` 失效广播（Redis pub/sub），所有副本的内建 Agent 缓存立刻感知，不用重启。
+的 Python 程序打到 stdout；不连集群。它自己 import `control_plane`/`expert_work`（只为了把源码读
+出来拼进输出——生成阶段不连数据库、不碰 Redis），所以本机跑 `bundle` 子命令要带上平台依赖的
+venv（`uv run --no-sync python ...`），裸 `python3` 会 `ModuleNotFoundError`。把打印结果接到 pod
+里的 `python3 -` 才会真正导入：跑的是平台自己 ZIP 上传接口那一条 `_ingest_platform_skill_payload`
+管线（解析 → 名称校验 → 内容审核 → Mini-ADR U-21 严格威胁扫描 → 幂等创建/加版本 → 审计），导入
+成功会自动发一次跨副本 `platform_skill` 失效广播（Redis pub/sub），所有副本的内建 Agent 缓存立刻
+感知，不用重启。
 
-先只读预演（`--dry-run`：只解析 + 审核 + 扫描 + 算 `content_hash` 并与线上当前版本比较，不写库、
-不发失效）：
+先只读预演（`--dry-run`：只解析 + 名称校验 + 审核 + 扫描 + 算 `content_hash` 并与线上当前版本
+比较，不写库、不发失效、也不上传技能资产对象存储——即使配了 OSS 也不会真的 PUT）：
 
 ```bash
-python platform-skills/build.py
-POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane -o jsonpath='{.items[0].metadata.name}')
-python platform-skills/import_in_pod.py bundle --dry-run platform-skills/dist/*.skill \
+uv run --no-sync python platform-skills/build.py
+export KUBECONFIG=~/.kube/expert-work-test.yaml   # 按目标环境换成对应的 kubeconfig
+POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+  --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+uv run --no-sync python platform-skills/import_in_pod.py bundle --dry-run platform-skills/dist/*.skill \
   | kubectl -n expert-work exec -i "$POD" -- python3 -
 ```
+
+（`--field-selector=status.phase=Running` 避免滚动发布期间挑中一个正在 Terminating 的 pod。）
 
 确认 `would_create_version` 符合预期后，去掉 `--dry-run` 正式导入：
 
 ```bash
-python platform-skills/import_in_pod.py bundle platform-skills/dist/*.skill \
+uv run --no-sync python platform-skills/import_in_pod.py bundle platform-skills/dist/*.skill \
   | kubectl -n expert-work exec -i "$POD" -- python3 -
 ```
 
-每个包输出一行 JSON（`name` / `status`（201 新建、200 内容未变、`"dry-run"`）/ `created` /
-`version` 或 `would_create_version` / `content_hash`）；只要有任意一个 201，末尾会再打一行
-`{"invalidation": "published"}`。
+每个包输出一行 JSON：`file`（本地文件名）/ `name`（技能正文里解析出的真实技能名，可能与文件名不同）
+/ `status`（201 新建、200 内容未变、`"dry-run"`）/ `created` / `version` 或 `would_create_version`
+/ `content_hash` / `runtime`（advisory：这份技能里的脚本能否在当前沙箱运行，仅供参考不影响导入）。
 
-导入成功会自动发跨副本失效，无需重启任何 pod。
+只要有任意一个包 201，末尾会再打一行汇总：确认发出了跨副本失效广播时是
+`{"invalidation": "published"}`；没配失效总线（未设 `EXPERT_WORK_QUOTA_REDIS_URL`）或广播本身失败
+时是 `{"invalidation": "skipped", "reason": "..."}`，且这种情况整个脚本以非零退出码结束——技能
+已经导入成功，但其它副本可能还在用旧的内建 Agent 缓存，需要人工确认（重跑一次这条命令是幂等的，
+已导入的包会是 200，不会重复计版本）。任何一个包导入失败（校验/审核/扫描不过）都会让脚本抛出未捕获
+异常、非零退出，且不影响它之前已经成功导入的包（那些包的失效发布不受影响，仍然会照常发生一次）。
 
-回滚 = 用 git 历史里的旧源码（`git checkout <旧 commit> -- platform-skills/<技能名>/`）重新
-`build.py` + 重新导入——旧内容的 `content_hash` 和线上记录的历史版本一致时会是幂等的
-「200 不变」，不一致则作为新版本导入（skill_version 只增不改，随时能再切回）。
+回滚 = 拿旧 commit 的技能源码重新打包再导入，平台会把旧内容存成**新版本**（`skill_version` 只增
+不改，`content_hash` 幂等判断只比较"最新版本"，回滚到的是比当前版本更早的内容，所以一定会新建
+一个版本号，不会是 200 不变）。取旧源码用 `git worktree add /tmp/ps-rollback <旧 commit>`（或
+`git archive <旧 commit> -- platform-skills/<技能名>/ | tar -x -C /tmp/ps-rollback`），从这个
+独立目录里跑 `build.py` 再导入；不要用 `git checkout <旧 commit> -- platform-skills/<技能名>/`，
+它会静默覆盖当前工作区里未提交的改动并留下脏树。
