@@ -69,10 +69,16 @@ check(
 # empirically: same false result with merge_page present or removed). pdffonts is the tool that
 # actually resolves and reports embedding, matching what the task asked us to verify ("rather
 # than tofu"), so we shell out to it instead.
+# Column-scoped like case_pdf_create.py's check: `pdffonts` always ends each row with 6 fixed
+# columns (encoding, emb, sub, uni, object, id), so cols[-5] is always the `emb` column — not
+# just "yes" appearing anywhere in the row (which would also match sub/uni). Font name must
+# contain the full "NotoSansCJK" (hyphens stripped), not just "Noto" alone (this sandbox image
+# has no plain "Noto Sans" family, but requiring the full name is not incidental on that fact).
 fonts_out = run(["pdffonts", "水印.pdf"]).stdout
 embedded_cjk = any(
-    cols and ("CJK" in cols[0] or "Noto" in cols[0]) and "yes" in cols
+    "NotoSansCJK" in cols[0].replace("-", "") and cols[-5] == "yes"
     for cols in (line.split() for line in fonts_out.splitlines()[2:])
+    if len(cols) >= 6
 )
 check(embedded_cjk, f"watermark font not embedded CJK: {fonts_out[:300]}")
 HTML(string="<p style='color:red;font-size:40pt'>已审核</p>").write_pdf("章.pdf")
@@ -123,12 +129,48 @@ enc_fail = run(
 )
 check("加密" in enc_fail.stderr, f"expected Chinese '已加密' error, got: {enc_fail.stderr}")
 
+# owner-only encrypted (empty user password): pypdf auto-decrypts transparently, so `info`
+# should report real page data alongside encrypted=true — unlike the real-user-password case
+# above, which cannot be read at all. Other subcommands still refuse: the guard is a blanket
+# `is_encrypted` check with no password-strength distinction.
+enc_owner = PdfWriter()
+enc_owner.append("原 文件.pdf")
+enc_owner.encrypt(user_password="", owner_password="ownerpw")
+enc_owner.write("所有者加密.pdf")
+info_owner = json.loads(
+    run(["python", script("pdf", "pdf_ops.py"), "info", "所有者加密.pdf"]).stdout
+)
+check(
+    info_owner["encrypted"] is True and info_owner["pages"] == 4 and info_owner["has_text"],
+    f"owner-only encrypted info should still report real page data: {info_owner}",
+)
+owner_fail = run(
+    [
+        "python",
+        script("pdf", "pdf_ops.py"),
+        "rotate",
+        "所有者加密.pdf",
+        "所有者转.pdf",
+        "--degrees",
+        "90",
+    ],
+    expect=1,
+)
+check(
+    "加密" in owner_fail.stderr,
+    f"owner-only encrypted rotate should still refuse: {owner_fail.stderr}",
+)
+
 # corrupt / not-a-PDF input: clean failure, not a raw traceback.
 with open("损坏.pdf", "wb") as fh:
     fh.write(b"this is not a pdf file at all")
 corrupt_fail = run(["python", script("pdf", "pdf_ops.py"), "info", "损坏.pdf"], expect=1)
 check(
     "损坏" in corrupt_fail.stderr or "合法" in corrupt_fail.stderr, f"stderr={corrupt_fail.stderr}"
+)
+check(
+    "EOF marker" not in corrupt_fail.stderr,
+    f"pypdf's English warning leaked to stderr: {corrupt_fail.stderr}",
 )
 
 # malformed / reversed / out-of-bounds --pages: usage errors (exit 2), except a partial overlap
@@ -242,6 +284,17 @@ merge_same = run(
 )
 check(
     "覆盖" in merge_same.stderr, f"expected overwrite-rejection message, got: {merge_same.stderr}"
+)
+
+# stamp's secondary input (--stamp) must also be checked against the output, not just the
+# primary input: a user reusing one signature/stamp file across calls could otherwise pick an
+# output name that clobbers the stamp source itself.
+stamp_same = run(
+    ["python", script("pdf", "pdf_ops.py"), "stamp", "原 文件.pdf", "章.pdf", "--stamp", "章.pdf"],
+    expect=1,
+)
+check(
+    "覆盖" in stamp_same.stderr, f"expected overwrite-rejection message, got: {stamp_same.stderr}"
 )
 
 # preview.py and pdf_ops.py each carry a copy of _parse_pages — the two must agree.

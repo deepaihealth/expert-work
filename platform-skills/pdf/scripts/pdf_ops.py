@@ -7,6 +7,7 @@ except ``info``, which reports ``encrypted`` truthfully instead of failing.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from html import escape
 from io import BytesIO
@@ -17,6 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _cli import emit_json, fail, resolve_io
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import FileNotDecryptedError, PdfReadError
+
+# pypdf logs recoverable parse issues (e.g. "EOF marker not found") as WARNINGs on child
+# loggers under "pypdf.*"; with no handler configured, Python's logging "handler of last
+# resort" prints those straight to stderr in English, ahead of our own Chinese error. Raise
+# the threshold so stderr carries only the message we emit via fail().
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 _ENCRYPTED_MSG = "PDF 已加密，本技能不处理加密文件"  # noqa: RUF001
 
@@ -178,7 +185,7 @@ def cmd_stamp(args: argparse.Namespace) -> None:
     src, dst = resolve_io(args.input, args.output)
     reader = _open_reader(src)
     _reject_encrypted(reader, src)
-    stamp_src, _ = resolve_io(args.stamp, None)
+    stamp_src, _ = resolve_io(args.stamp, args.output)  # also rejects stamp-src == output
     stamp_reader = _open_reader(stamp_src)
     _reject_encrypted(stamp_reader, stamp_src)
     if not stamp_reader.pages:
