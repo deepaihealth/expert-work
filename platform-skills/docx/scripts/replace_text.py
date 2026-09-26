@@ -31,8 +31,15 @@ def _iter_block(container) -> Iterator[Paragraph]:
 
 
 def _iter_table(table: Table) -> Iterator[Paragraph]:
+    # ``row.cells`` repeats a merged cell once per grid column it spans (horizontal
+    # merge) and once per row it spans (vertical merge, python-docx maps the continuation
+    # to the top cell) — visit each underlying ``w:tc`` once, or replacements stack.
+    seen: set = set()
     for row in table.rows:
         for cell in row.cells:
+            if cell._tc in seen:
+                continue
+            seen.add(cell._tc)
             yield from _iter_block(cell)
 
 
