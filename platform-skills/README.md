@@ -140,7 +140,18 @@ uv run --no-sync python platform-skills/import_in_pod.py bundle platform-skills/
 
 回滚 = 拿旧 commit 的技能源码重新打包再导入，平台会把旧内容存成**新版本**（`skill_version` 只增
 不改，`content_hash` 幂等判断只比较"最新版本"，回滚到的是比当前版本更早的内容，所以一定会新建
-一个版本号，不会是 200 不变）。取旧源码用 `git worktree add /tmp/ps-rollback <旧 commit>`（或
-`git archive <旧 commit> -- platform-skills/<技能名>/ | tar -x -C /tmp/ps-rollback`），从这个
-独立目录里跑 `build.py` 再导入；不要用 `git checkout <旧 commit> -- platform-skills/<技能名>/`，
-它会静默覆盖当前工作区里未提交的改动并留下脏树。
+一个版本号，不会是 200 不变）。做法：
+
+```sh
+git worktree add /tmp/ps-rollback <旧 commit>
+# 在主仓库目录里跑（用仓库自己的 venv）；build.py 按它自己的位置找源码、写 dist/，与当前目录无关
+uv run --no-sync python /tmp/ps-rollback/platform-skills/build.py
+uv run --no-sync python platform-skills/import_in_pod.py bundle /tmp/ps-rollback/platform-skills/dist/<技能名>.skill \
+  | kubectl -n expert-work exec -i <control-plane-pod> -- python3 -
+git worktree remove /tmp/ps-rollback
+```
+
+三个容易踩的坑：从主仓库跑 `platform-skills/build.py` 打的是**当前**源码不是旧版；在 worktree 目录里跑
+`uv run` 会建一个没有依赖（pyyaml 等）的空 venv；只 `git archive` 某个技能目录会缺 `shared/` 与 `build.py`，
+打包直接报错。也不要用 `git checkout <旧 commit> -- platform-skills/<技能名>/`，它会静默覆盖当前工作区里
+未提交的改动并留下脏树。

@@ -352,14 +352,21 @@ PDF 把字体**嵌入文件**，在任何电脑上都一样。沙箱里的字体
 - 平台对构建好的 Agent 有缓存（按 manifest 指纹），导入端点只在返回 201 时清缓存，而且只清处理这次请求的那个副本。
 - **测试环境**：导入后我执行 `kubectl rollout restart deploy/control-plane`，确保两个副本都用新版；
   实施计划里同时核实是否存在跨副本失效机制，若存在则省去重启（结论写回本节）。
-- **生产（09-28）**：导入放在班车 2 执行单 **Step A（新沙箱镜像）之后、Step B（发版）之前**：
-  - 必须在 Step A 之后：技能脚本依赖新沙箱镜像里的 LibreOffice 与各库，第二层测试验的也是这份镜像；
-  - 在 Step B 之前：Step B 的滚动发布会重启所有 control-plane，缓存自然清空，无需额外重启。
+- **生产（09-28）**：导入放在班车 2 执行单 **Step B（发版）通过、Step C 点检完之后**（2026-09-26 终审改；
+  原稿写「Step A 之后、Step B 之前」，理由是借 Step B 的滚动重启清缓存 —— 但漏看了依赖）：
+  - 必须在 Step B 之后：技能正文的脚本路径写成 `$EXPERT_WORK_SKILLS_DIR/...`，这个变量是 B-84（`233791e5`）
+    才加的、随发版提交 `f92c6fae` 上生产；生产现版 `5775fbf3` 没有它，路径展开成 `/docx/scripts/...`，
+    先导入则从导入到发版完成之间 office 技能不可用，发版一旦回滚就一直坏；
+  - 自然也在 Step A 之后：技能脚本依赖新沙箱镜像里的 LibreOffice 与各库，第二层测试验的也是这份镜像；
+  - 缓存：Step B 的重启已经过去，靠导入脚本自己发的跨副本失效广播（`platform_skill`）；广播没送达
+    （`skipped`）时 `rollout restart deploy/control-plane` 或等 1800s 缓存过期。
+  - Step B 若在 A2 之后回滚到 `5775fbf3`，导入过的技能也要一起退回上一版（控制台导出第 1 版再导入），见执行单 §4。
 - 导入前后各做一次只读核对（写进执行单）：生产里这四个平台技能的 `latest_version` 与绑定它们的 Agent 列表。
 
 ### 7.3 回滚
 
-- 新版本有问题：从本仓库 git 历史取上一版源码 → `build.py` → 导入（平台存成新版本，内容同旧版）。
+- 新版本有问题：`git worktree add <目录> <旧提交>`，在主仓库目录里跑 `uv run --no-sync python <目录>/platform-skills/build.py`
+  （`build.py` 按自身位置定位源码与 `dist/`），导入 `<目录>/platform-skills/dist/<技能>.skill`（平台存成新版本，内容同旧版）。
 - 需要紧急退回 Anthropic 原版：旧版本保留在历史里（D4），控制台导出第 1 版再导入。
 - 每个技能独立回滚，互不影响。
 
