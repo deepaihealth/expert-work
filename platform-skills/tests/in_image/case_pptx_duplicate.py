@@ -174,6 +174,15 @@ check(
     new_slide3b.notes_slide.notes_text_frame.text == "",
     "no-txBody fallback should copy empty text, not crash or invent content",
 )
+# the fallback must not read src_ph.text_frame (which would auto-vivify a txBody via
+# get_or_add_txBody() and so mutate the *original* slide as a side effect of duplicating a
+# different one) — the source's own notes placeholder, as saved in the same output package,
+# must still have no txBody at all.
+src_notes_ph = out3b.slides[0].notes_slide.notes_placeholder
+check(
+    src_notes_ph._element.txBody is None,
+    "duplicating a no-txBody notes slide must not add a txBody to the source",
+)
 
 # realistic edge case #3: an external hyperlink inside a text run must still point to the
 # right address on the copy (its r:id is remapped, not left dangling).

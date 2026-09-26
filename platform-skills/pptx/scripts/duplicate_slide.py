@@ -52,7 +52,10 @@ def _copy_notes(src, new) -> bool:
     # raw element first and only take the rich-copy path when there is an actual txBody.
     src_tx_body = src_ph._element.txBody
     if src_tx_body is None:
-        dst_ph.text_frame.text = src_ph.text_frame.text
+        # No txBody means no text either — set "" directly instead of reading
+        # src_ph.text_frame.text, which would auto-vivify (and so mutate) a txBody on the
+        # *source* placeholder via the same get_or_add_txBody() this branch exists to avoid.
+        dst_ph.text_frame.text = ""
         return True
     # Deep-copy the whole txBody (not just .text) to keep run-level formatting (bold,
     # bullets, multiple paragraphs, ...).
