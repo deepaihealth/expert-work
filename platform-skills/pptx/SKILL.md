@@ -7,8 +7,7 @@ expert_work:
   category: 通用
 ---
 
-新建、修改已有 .pptx、套用模板、转 PDF 时用本技能；只想读取已有演示文稿内容用 `read_document` /
-`read_page`，不用本技能。动画、改内嵌图表数据等做不到的事见文末「做不到」一节。
+新建、修改已有 .pptx、套用模板、转 PDF 时用本技能。动画、改内嵌图表数据等做不到的事见文末「做不到」一节。
 
 ## 环境
 
@@ -98,13 +97,12 @@ chart_slide.shapes.add_picture("_skeleton_chart.png", Inches(1), Inches(1.8), wi
 prs.save("骨架 示例.pptx")
 ```
 
-要点：`slide_width` / `slide_height` 直接赋 EMU 值，不要用 `Inches(13.333)` 之类的浮点换算（累计误差
-会让尺寸对不上标准 16:9）；图片按可用宽度（页宽减左右各 1 英寸）等比缩放，不要写死像素。
+要点：`slide_width` / `slide_height` 直接赋 EMU 值，不要用 `Inches(13.333)` 之类的浮点换算（有累计
+误差）；图片按可用宽度（页宽减左右各 1 英寸）等比缩放，不要写死像素。
 
 ## 版式网格与留白原则
 
-- 统一边距、同级元素对齐：同一份演示文稿页边距固定，不要每页各设一套；并列的卡片、文字块要上下
-  左右对齐，不要靠肉眼估。
+- 统一边距、同级元素对齐：页边距全篇固定；并列的卡片、文字块上下左右对齐，不靠肉眼估。
 - 一页一个视觉焦点：多个要点用项目符号纵向排列，不要平铺塞满。
 - 内容多就拆页，不缩字号：字号只在四级常量里选，塞不下就拆成两页，不靠缩字号硬塞。
 
@@ -126,13 +124,16 @@ slide.placeholders[1].text_frame.text = "正文内容"
 
 python-pptx 没有 `delete_slide` 方法，直接操作幻灯片 ID 列表 `prs.slides._sldIdLst`：
 
-```python
+```python title=delete-slide
 ids = prs.slides._sldIdLst
-ids.remove(ids[2])  # 删除第 3 页（下标从 0 开始）
+sid = ids[2]  # 删除第 3 页（下标从 0 开始）
+prs.part.drop_rel(sid.rId)  # 先断开关系，否则旧页残留在包里，重开后与别的页重名
+ids.remove(sid)
 ids.insert(0, ids[-1])  # 把最后一页挪到最前
 ```
 
-删页 / 调序后必须**另存为新文件**，不要覆盖原件。
+删页放在加页之后做。删页后先保存，要再加页就重新打开——同一次打开里删了再 `add_slide`，新页会和
+已有页重名，静默丢页。删页 / 调序后必须**另存为新文件**，不要覆盖原件。
 
 ## 复制一页
 
@@ -176,7 +177,6 @@ PowerPoint 只记字体名，客户打开时用他自己电脑上的字体，没
 - `text_frame.text = "新文字"` 会冲掉原有字号、颜色等格式 → 改某个 `run.text`，或先记下格式再重设。
 - 原生图表在 LibreOffice 预览里的渲染效果可能和 PowerPoint 不一致 → 推荐 matplotlib 出图再
   `add_picture` 插入。
-- 图片不按「新建」里的可用宽度等比缩放，写死像素会拉伸变形。
 - 只设 `font.name`，中文仍是默认字体 → 必须同时设 `a:ea`（见 `set_cn_font`）。
 - `inspect_template.py` 里某个占位符的 left/top/width/height 是 `null` → 版式和母版都没单独设位置
   （继承链到头了），按“没有固定位置”处理，不要当成 0。
