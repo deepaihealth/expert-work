@@ -138,9 +138,9 @@ ids.insert(0, ids[-1])  # 把最后一页挪到最前
 
 `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/duplicate_slide.py IN.pptx OUT.pptx --index N [--after M]`
 （页码从 1 开始；默认紧跟原页，`--after 0` = 放最前）。输出 `new_slide_number`、
-`shared_parts_warning`：图表 / SmartArt / 嵌入对象 / 嵌入文件 / 备注这几类关系复制后**共享同一个
-数据部件**，改一页的这类数据会连带改到另一页，出现在告警里就要提醒用户；图片、视频、超链接各自
-独立，不受影响。
+`shared_parts_warning`：图表 / SmartArt / 嵌入对象 / 嵌入文件这几类关系复制后**共享同一个数据部件**，
+改一页的这类数据会连带改到另一页，出现在告警里就要提醒用户；图片、视频、超链接各自独立，不受影响；
+演讲者备注各自拷贝一份，互不影响、也不出现在告警里。
 
 ## 嵌视频
 
@@ -177,6 +177,8 @@ PowerPoint 只记字体名，客户打开时用他自己电脑上的字体，没
   `add_picture` 插入。
 - 图片不按「新建」里的可用宽度等比缩放，写死像素会拉伸变形。
 - 只设 `font.name`，中文仍是默认字体 → 必须同时设 `a:ea`（见 `set_cn_font`）。
+- `inspect_template.py` 里某个占位符的 left/top/width/height 是 `null` → 版式和母版都没单独设位置
+  （继承链到头了），按“没有固定位置”处理，不要当成 0。
 
 ## 做不到
 

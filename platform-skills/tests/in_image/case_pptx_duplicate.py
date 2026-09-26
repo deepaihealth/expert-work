@@ -99,8 +99,12 @@ charts = [sh for sh in out2.slides[1].shapes if sh.has_chart]
 check(len(charts) == 1, "duplicated slide lost its chart")
 
 # realistic edge case #2: a slide with speaker notes — a naive implementation drops the
-# notes relationship entirely (silent data loss). The duplicate must keep the notes text
-# (even if, like the chart above, it's a shared part and gets its own warning).
+# notes relationship entirely (silent data loss, the brief's own verbatim code), OR relays
+# it through the generic shared-rel loop (shares the *same* physical notes part, so a later,
+# separate edit to just the copy's notes would silently overwrite the original's too — a
+# worse, delayed footgun). The duplicate must get its own independent notes part with the
+# same text: no warning (it is not shared), different part identity, and an edit to one
+# slide's notes must not leak into the other's after a save/reload round trip.
 p3 = pptx.Presentation()
 s3 = p3.slides.add_slide(p3.slide_layouts[6])
 s3.notes_slide.notes_text_frame.text = "演讲备注：先讲背景"  # noqa: RUF001
@@ -117,13 +121,26 @@ res = json.loads(
         ]
     ).stdout
 )
-check("备注" in res["shared_parts_warning"], f"notes slide must warn 备注: {res}")
+check("备注" not in res["shared_parts_warning"], f"notes must not be shared: {res}")
 out3 = pptx.Presentation("带备注 副本.pptx")
-new_slide3 = out3.slides[1]
-check(new_slide3.has_notes_slide, "duplicated slide lost its notes slide")
+notes0, notes1 = out3.slides[0].notes_slide, out3.slides[1].notes_slide
+check(notes0.part is not notes1.part, "duplicated slide shares the same notes part")
+check(notes0.part.partname != notes1.part.partname, "duplicated slide's notes part not independent")
 check(
-    new_slide3.notes_slide.notes_text_frame.text == "演讲备注：先讲背景",  # noqa: RUF001
-    f"notes text wrong: {new_slide3.notes_slide.notes_text_frame.text!r}",
+    notes1.notes_text_frame.text == "演讲备注：先讲背景",  # noqa: RUF001
+    f"notes text wrong: {notes1.notes_text_frame.text!r}",
+)
+# editing the copy's notes and reloading must leave the original's notes untouched.
+out3.slides[1].notes_slide.notes_text_frame.text = "改过的副本备注"
+out3.save("带备注 副本2.pptx")
+out3_reloaded = pptx.Presentation("带备注 副本2.pptx")
+check(
+    out3_reloaded.slides[0].notes_slide.notes_text_frame.text == "演讲备注：先讲背景",  # noqa: RUF001
+    "editing the copy's notes changed the original's notes",
+)
+check(
+    out3_reloaded.slides[1].notes_slide.notes_text_frame.text == "改过的副本备注",
+    "edit to the copy's notes did not persist",
 )
 
 # realistic edge case #3: an external hyperlink inside a text run must still point to the
@@ -225,11 +242,14 @@ res2 = json.loads(
     ).stdout
 )
 check(res2["shared_parts_warning"] == ["图表"], f"second duplicate must still warn: {res2}")
-out5 = pptx.Presentation("带图表 副本2.pptx")
-check(len(out5.slides) == 3, f"expected 3 slides after duplicating twice, got {len(out5.slides)}")
+out6 = pptx.Presentation("带图表 副本2.pptx")
+check(len(out6.slides) == 3, f"expected 3 slides after duplicating twice, got {len(out6.slides)}")
+# slides[1] is the actual product of the *second* duplicate_slide.py call (--index 1 with no
+# --after inserts right after position 1); slides[2] is the untouched first-generation copy
+# carried over from before this call, so asserting on it wouldn't catch a second-call bug.
 check(
-    len([sh for sh in out5.slides[2].shapes if sh.has_chart]) == 1,
-    "second duplicate lost its chart",
+    len([sh for sh in out6.slides[1].shapes if sh.has_chart]) == 1,
+    "second duplicate's own output slide lost its chart",
 )
 
 print("PASS case_pptx_duplicate")

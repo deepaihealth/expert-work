@@ -16,14 +16,37 @@ from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 # Relationships whose *data part* is not duplicated — the new slide's relationship points
 # at the very same part as the original, so editing one's data (chart series, SmartArt
-# text, embedded workbook, speaker notes, ...) silently edits the other's too.
+# text, embedded workbook, ...) silently edits the other's too. Speaker notes are NOT in
+# this set: they get their own independent part (see _copy_notes) because a later, separate
+# edit to just the copy's notes silently overwriting the original's would be a much worse
+# (delayed, easy-to-miss) footgun than the one-time disclosure this warning gives for the
+# other types, and copying them independently is cheap (no embedded relationship graph).
 _SHARED_WARN = {
     RT.CHART: "图表",
     RT.DIAGRAM_DATA: "SmartArt",
     RT.OLE_OBJECT: "嵌入对象",
     RT.PACKAGE: "嵌入文件",
-    RT.NOTES_SLIDE: "备注",
 }
+
+
+def _copy_notes(src, new) -> None:
+    """Give the duplicate its own independent notes part (not shared with the source)."""
+    if not src.has_notes_slide:
+        return
+    src_ph = src.notes_slide.notes_placeholder
+    if src_ph is None:
+        return
+    dst_ph = new.notes_slide.notes_placeholder  # new.notes_slide auto-vivifies a fresh part
+    if dst_ph is None:
+        return
+    try:
+        # Deep-copy the whole txBody (not just .text) to keep run-level formatting
+        # (bold, bullets, ...); falls back to plain text if that structure ever doesn't
+        # match what a fresh notes placeholder expects.
+        dst_tx_body = dst_ph.text_frame._element
+        dst_tx_body.getparent().replace(dst_tx_body, copy.deepcopy(src_ph.text_frame._element))
+    except Exception:
+        dst_ph.text_frame.text = src_ph.text_frame.text
 
 
 def duplicate(prs, index: int, after: int) -> tuple[int, list[str]]:
@@ -34,8 +57,8 @@ def duplicate(prs, index: int, after: int) -> tuple[int, list[str]]:
     rid_map: dict[str, str] = {}
     warnings: set[str] = set()
     for rid, rel in src.part.rels.items():
-        if rel.reltype == RT.SLIDE_LAYOUT:
-            continue  # already set by add_slide() above
+        if rel.reltype in (RT.SLIDE_LAYOUT, RT.NOTES_SLIDE):
+            continue  # layout already set by add_slide(); notes copied independently below
         if rel.is_external:
             rid_map[rid] = new.part.relate_to(rel.target_ref, rel.reltype, is_external=True)
         else:
@@ -51,6 +74,7 @@ def duplicate(prs, index: int, after: int) -> tuple[int, list[str]]:
                 if attr.startswith(f"{{{_R_NS}}}") and val in rid_map:
                     node.set(attr, rid_map[val])
         new.shapes._spTree.append(clone)
+    _copy_notes(src, new)
     ids = prs.slides._sldIdLst
     moved = ids[-1]
     ids.remove(moved)

@@ -5,6 +5,7 @@ import pptx
 from _harness import check, run, script
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.oxml import parse_xml
+from pptx.oxml.ns import qn
 from pptx.util import Inches
 
 os.chdir("/workspace")
@@ -66,5 +67,26 @@ p4.save("空.pptx")
 res4 = json.loads(run(["python", script("pptx", "inspect_template.py"), "空.pptx"]).stdout)
 check(len(res4["layouts"]) == 11, f"empty presentation layouts={len(res4['layouts'])}")
 check(res4["slides"] == [], f"empty presentation slides={res4['slides']}")
+
+# realistic edge case #4: a real institutional template's layout placeholder can have no
+# geometry of its own AND no matching-type placeholder on the slide master either (both
+# ends of python-pptx's inheritance chain come up empty) — left/top/width/height must come
+# back JSON null, not crash the script or the JSON encoder.
+p5 = pptx.Presentation()
+master = p5.slide_masters[0]
+title_master_ph = next(ph for ph in master.placeholders if ph.placeholder_format.idx == 0)
+xfrm = title_master_ph._element.spPr.find(qn("a:xfrm"))
+title_master_ph._element.spPr.remove(xfrm)
+p5.save("无版式几何.pptx")
+res5 = json.loads(run(["python", script("pptx", "inspect_template.py"), "无版式几何.pptx"]).stdout)
+title_only = next(layout for layout in res5["layouts"] if layout["name"] == "Title Only")
+title_ph = next(ph for ph in title_only["placeholders"] if ph["idx"] == 0)
+check(
+    title_ph["left"] is None
+    and title_ph["top"] is None
+    and title_ph["width"] is None
+    and title_ph["height"] is None,
+    f"geometry-less placeholder should be null, got {title_ph}",
+)
 
 print("PASS case_pptx_inspect")
