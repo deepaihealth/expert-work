@@ -614,12 +614,24 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 本步跳过、保持生产原版不导入**——下面的命令只把 go 的技能对应的 `platform-skills/dist/<name>.skill`
 传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
 
+**用哪份源码打包**：Step B 钉的发版提交不含 `platform-skills/`。本步先检出 office 技能合并进 main 的
+那个提交（`<OFFICE_SKILLS_SHA>`，PR 合并后回填）打包导入；Step B 再照常检出发版提交。打包与导入脚本要用
+仓库自己的 venv（`uv run --no-sync`），所以就在平时的仓库目录里做，不另开 worktree：
+
+```sh
+git status --porcelain          # 必须为空；非空先 commit，别让 checkout 吞掉改动
+git fetch origin main
+git checkout <OFFICE_SKILLS_SHA>
+git log -1 --oneline            # 确认就是它
+```
+
 **导入前只读核对**：
 
 ```sh
 export KUBECONFIG=~/.kube/expert-work-prod.yaml
+kubectl config current-context  # 执行 exec 前务必确认连的是生产
 POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
-  -o jsonpath='{.items[0].metadata.name}')
+  --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 ```
 
 ① 四个平台技能当前版本（`run_sql`，用 §1 已定义的那个包装）：
@@ -643,10 +655,10 @@ WHERE a.status <> 'deleted' AND sk IN ('docx','pptx','xlsx','pdf') GROUP BY 1 OR
 **dry-run**（只看会不会建版本，不落库）：
 
 ```sh
-python platform-skills/build.py
+uv run --no-sync python platform-skills/build.py
 
 # 下面按四个技能全部 go 写；哪个 no-go 就把它的 .skill 从这行删掉
-python platform-skills/import_in_pod.py bundle --dry-run \
+uv run --no-sync python platform-skills/import_in_pod.py bundle --dry-run \
   platform-skills/dist/docx.skill platform-skills/dist/pptx.skill \
   platform-skills/dist/xlsx.skill platform-skills/dist/pdf.skill \
   | kubectl -n expert-work exec -i "$POD" -- python3 -
@@ -657,7 +669,7 @@ python platform-skills/import_in_pod.py bundle --dry-run \
 **正式导入**（同一份文件列表，去掉 `--dry-run`）：
 
 ```sh
-python platform-skills/import_in_pod.py bundle \
+uv run --no-sync python platform-skills/import_in_pod.py bundle \
   platform-skills/dist/docx.skill platform-skills/dist/pptx.skill \
   platform-skills/dist/xlsx.skill platform-skills/dist/pdf.skill \
   | kubectl -n expert-work exec -i "$POD" -- python3 -
@@ -665,8 +677,12 @@ python platform-skills/import_in_pod.py bundle \
 
 - [ ] 每个 go 的技能输出 `"status":201`（新建版本）或 `"status":200`（`content_hash` 与 `latest` 相同，
       幂等跳过，不产生冗余版本）
-- [ ] 只要有一个 `201`，输出里出现 `{"invalidation":"published"}`（只清了处理这次请求的那个副本的缓存；
-      Step B 的滚动发布会把其余副本一并清掉）
+- [ ] 只要有一个 `201`，输出里出现 `{"invalidation":"published","receivers":N}`（N ≥ 1 = 有 N 个订阅者
+      收到失效，不保证是全部副本；Step B 的滚动发布会把全部副本重启，缓存一并清空）
+- [ ] 若输出 `{"invalidation":"skipped",...}` 且退出码非 0：版本已写入，只是失效没发到。**不要重跑**（重跑
+      全是 `200`，不会再发失效）——本单紧接着的 Step B 会重启全部 control-plane，等同补救；单独做本步时用
+      `kubectl -n expert-work rollout restart deploy/control-plane`，或接受最多 1800s 后缓存自然过期
+- [ ] 若中途某个包失败：已输出的 `201` 行已经落库，失效行照样会打印；把失败原因记进 §6 后按该技能 no-go 处理
 
 **导入后只读核对**：把①②两条 SQL 再跑一遍，写入 §6。
 
@@ -674,7 +690,8 @@ python platform-skills/import_in_pod.py bundle \
 - [ ] 绑定 Agent 数（②）与导入前**不变**——导入只加版本，不改任何 Agent 的技能绑定
 - [ ] no-go 的技能：`latest_version` / `content_hash` 与导入前**不变**（没碰过）
 
-**回滚**：某个技能新版本有问题——从本仓库 git 历史取该技能上一版源码 → `python platform-skills/build.py`
+**回滚**：某个技能新版本有问题——用 `git worktree add <目录> <旧提交>`（或 `git archive`）取该技能上一版源码，
+**不要** `git checkout <旧提交> -- 路径`（会覆盖工作区未提交的改动）→ `uv run --no-sync python platform-skills/build.py`
 → 按上面「正式导入」重新导入（平台存成更新的版本，内容等同旧版）。**不要**手工改 `skill.latest_version`
 或直接删版本行。每个技能独立回滚，互不影响其它三个。需要紧急退回 Anthropic 原版：控制台导出第 1 版
 （原版保留在版本历史里未删，见 ROADMAP B-117）再重新导入。
