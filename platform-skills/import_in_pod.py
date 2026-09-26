@@ -47,6 +47,7 @@ import sys
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from control_plane.api._skill_moderation import (
@@ -309,8 +310,44 @@ async def run_import(
 # ---------------------------------------------------------------------------
 # Pod-side wiring — only reachable inside a running control-plane pod (needs
 # a live DB / Redis via env). Never exercised by the unit tests, which build
-# ``ImportDeps`` from in-memory stores directly.
+# ``ImportDeps`` from in-memory stores directly. ``_PublishRecordingRedisClient``
+# and ``_publish_outcome`` are pure enough to unit-test on their own, though.
 # ---------------------------------------------------------------------------
+
+
+class _PublishRecordingRedisClient:
+    """Thin proxy around a real (async) redis client: records ``PUBLISH``'s
+    own return value (the receiver/subscriber count — ``InvalidationBus``
+    calls it and discards it, ``invalidation_bus.py``'s ``publish()``) so
+    the caller can tell "confirmed delivered to at least one replica" from
+    "sent into the void" without duplicating ``InvalidationBus``'s own
+    channel/payload construction (fix round 2, N3 — replaces round 1's
+    PING-before-publish probe). Every other attribute delegates straight
+    through to the wrapped client.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self.last_publish_receivers: int | None = None
+
+    async def publish(self, channel: str, message: str) -> int:
+        receivers = await self._client.publish(channel, message)
+        self.last_publish_receivers = receivers
+        return receivers
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+def _publish_outcome(receivers: int | None) -> bool:
+    """``True`` only when ``PUBLISH`` reached at least one receiver.
+    ``None`` (never recorded — ``InvalidationBus.publish()`` swallowed an
+    exception before assigning it) and ``0`` (no replica currently
+    subscribed) both count as "not confirmed", the same way: an operator
+    cannot tell them apart from ``receivers`` alone, and both mean no
+    replica is guaranteed to have picked up the change.
+    """
+    return bool(receivers)
 
 
 async def _pod_entrypoint(packages: dict[str, bytes], *, dry_run: bool) -> None:
@@ -318,10 +355,14 @@ async def _pod_entrypoint(packages: dict[str, bytes], *, dry_run: bool) -> None:
     stack from live env vars (``Settings()`` reads ``EXPERT_WORK_*``, the
     same env the control-plane process itself boots from) and run the
     import. Prints each package's result line as soon as it is produced
-    (``flush=True``) so partial progress survives a later package raising —
-    an uncaught exception here (e.g. a rejected package) still exits
-    non-zero, same as any other Python script. Closes the DB engine and (if
-    opened) the Redis connection before returning, success or failure.
+    (``flush=True``), and prints the ``{"invalidation": ...}`` line from
+    inside the publish step itself (fix round 2, N1) — both survive a later
+    package raising, since ``run_import`` calls the publish step from its
+    own ``finally``. An uncaught exception here (e.g. a rejected package)
+    still exits non-zero, same as any other Python script; on a *clean* run
+    where nothing confirms the invalidation went out, this function raises
+    ``SystemExit(1)`` itself. Closes the DB engine and (if opened) the
+    Redis connection before returning, success or failure.
     """
     from control_plane.app import _build_secret_store, _build_sql_stores
     from control_plane.runtime import resolve_object_store_config
@@ -357,7 +398,7 @@ async def _pod_entrypoint(packages: dict[str, bytes], *, dry_run: bool) -> None:
                 )
 
             bus: InvalidationBus | NoopInvalidationBus = NoopInvalidationBus()
-            bus_redis = None
+            recorder: _PublishRecordingRedisClient | None = None
             bus_is_noop = True
             if settings.quota_redis_url:
                 import redis.asyncio as redis_async
@@ -366,29 +407,49 @@ async def _pod_entrypoint(packages: dict[str, bytes], *, dry_run: bool) -> None:
                     settings.quota_redis_url, encoding="utf-8", decode_responses=True
                 )
                 stack.push_async_callback(bus_redis.aclose)
-                bus = InvalidationBus(redis_client=bus_redis, origin=socket.gethostname())
+                recorder = _PublishRecordingRedisClient(bus_redis)
+                bus = InvalidationBus(redis_client=recorder, origin=socket.gethostname())
                 bus_is_noop = False
 
+            def _report_invalidation(*, confirmed: bool, **extra: object) -> None:
+                # Printed from inside the publish step itself (not after
+                # `run_import` returns) so it still shows up on a
+                # partial-batch failure — `run_import` calls `deps.publish`
+                # from its own `finally`, which runs even when a later
+                # package raises (fix round 2, N1).
+                body: dict[str, object] = {
+                    "invalidation": "published" if confirmed else "skipped",
+                    **extra,
+                }
+                print(json.dumps(body, sort_keys=True), flush=True)
+
             async def _publish() -> bool:
-                # ``InvalidationBus.publish()`` never raises by design (a
-                # live app degrades to a WARNING + counter because its
-                # *local* invalidation, which already ran, is the real
-                # safety net — see invalidation_bus.py's module docstring).
-                # This batch script has no local cache to fall back on, so
-                # a best-effort PING stands in for the success signal that
-                # call itself can't give us. A PING that succeeds
-                # immediately before a `publish` that then itself fails is
-                # not caught by this — rare enough not to justify
-                # duplicating InvalidationBus's own channel/payload logic
-                # just to observe its result.
-                if bus_is_noop or bus_redis is None:
+                if bus_is_noop or recorder is None:
+                    _report_invalidation(
+                        confirmed=False,
+                        reason="no invalidation bus configured (EXPERT_WORK_QUOTA_REDIS_URL unset)",
+                    )
                     return False
-                try:
-                    await bus_redis.ping()
-                except Exception:
-                    return False
+                # `InvalidationBus.publish()` never raises by design (a live
+                # app degrades to a WARNING + counter because its *local*
+                # invalidation, which already ran, is the real safety net —
+                # see invalidation_bus.py's module docstring); this batch
+                # script has no local cache to fall back on, so success is
+                # judged by the PUBLISH receiver count `recorder` captured,
+                # not by the absence of an exception.
                 await bus.publish(InvalidationEvent(kind="platform_skill"))
-                return True
+                receivers = recorder.last_publish_receivers
+                if _publish_outcome(receivers):
+                    _report_invalidation(confirmed=True, receivers=receivers)
+                    return True
+                _report_invalidation(
+                    confirmed=False,
+                    reason=(
+                        f"redis PUBLISH reached 0 receivers (recorded={receivers!r} — no replica "
+                        "subscribed, or the publish itself failed; see control-plane logs)"
+                    ),
+                )
+                return False
 
             deps = ImportDeps(
                 store=sql_stores.skill,
@@ -400,17 +461,16 @@ async def _pod_entrypoint(packages: dict[str, bytes], *, dry_run: bool) -> None:
     finally:
         await sql_stores.engine.dispose()
 
-    if not dry_run:
-        if published is True:
-            print(json.dumps({"invalidation": "published"}))
-        elif published is False:
-            reason = (
-                "no invalidation bus configured (EXPERT_WORK_QUOTA_REDIS_URL unset)"
-                if bus_is_noop
-                else "redis publish failed or unreachable"
-            )
-            print(json.dumps({"invalidation": "skipped", "reason": reason}))
-            raise SystemExit(1)
+    # `_publish` (above) already printed the "published"/"skipped" line the
+    # moment it ran — including on a partial-batch failure, since it's
+    # called from `run_import`'s `finally`. If a package failure is what
+    # ended the run, that exception already guarantees a non-zero exit and
+    # has already propagated past this point (this function would not still
+    # be executing). Reaching here means `run_import` returned normally, so
+    # this is only about the exit code for "everything imported, but the
+    # invalidation itself wasn't confirmed".
+    if not dry_run and published is False:
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------

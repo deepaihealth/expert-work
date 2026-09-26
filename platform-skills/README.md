@@ -99,14 +99,17 @@ venv（`uv run --no-sync python ...`），裸 `python3` 会 `ModuleNotFoundError
 
 ```bash
 uv run --no-sync python platform-skills/build.py
-export KUBECONFIG=~/.kube/expert-work-test.yaml   # 按目标环境换成对应的 kubeconfig
+export KUBECONFIG=~/.kube/expert-work-test.yaml   # 生产换成 ~/.kube/expert-work-prod.yaml
+kubectl config current-context                    # 执行 exec 前务必确认连的是哪个集群
 POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
   --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
 uv run --no-sync python platform-skills/import_in_pod.py bundle --dry-run platform-skills/dist/*.skill \
   | kubectl -n expert-work exec -i "$POD" -- python3 -
 ```
 
-（`--field-selector=status.phase=Running` 避免滚动发布期间挑中一个正在 Terminating 的 pod。）
+（`--field-selector=status.phase=Running` 避免滚动发布期间挑中一个正在 Terminating 的 pod；
+`kubectl config current-context` 只是确认，不改变行为——`$KUBECONFIG` 指哪个集群这条命令就连哪个,
+生产库操作前这一步不能省。）
 
 确认 `would_create_version` 符合预期后，去掉 `--dry-run` 正式导入：
 
@@ -119,12 +122,21 @@ uv run --no-sync python platform-skills/import_in_pod.py bundle platform-skills/
 / `status`（201 新建、200 内容未变、`"dry-run"`）/ `created` / `version` 或 `would_create_version`
 / `content_hash` / `runtime`（advisory：这份技能里的脚本能否在当前沙箱运行，仅供参考不影响导入）。
 
-只要有任意一个包 201，末尾会再打一行汇总：确认发出了跨副本失效广播时是
-`{"invalidation": "published"}`；没配失效总线（未设 `EXPERT_WORK_QUOTA_REDIS_URL`）或广播本身失败
-时是 `{"invalidation": "skipped", "reason": "..."}`，且这种情况整个脚本以非零退出码结束——技能
-已经导入成功，但其它副本可能还在用旧的内建 Agent 缓存，需要人工确认（重跑一次这条命令是幂等的，
-已导入的包会是 200，不会重复计版本）。任何一个包导入失败（校验/审核/扫描不过）都会让脚本抛出未捕获
-异常、非零退出，且不影响它之前已经成功导入的包（那些包的失效发布不受影响，仍然会照常发生一次）。
+只要有任意一个包 201，就会尝试发一次跨副本失效广播，并且**不论后面还有没有包导入失败**都会打印这行
+汇总（这一行由发布步骤自己打，不等整批做完）：确认 Redis PUBLISH 真的送达了至少一个副本时是
+`{"invalidation": "published", "receivers": N}`（`N` 是 Redis 返回的接收方数量）；没配失效总线（未设
+`EXPERT_WORK_QUOTA_REDIS_URL`）或送达数为 0 时是 `{"invalidation": "skipped", "reason": "..."}`，且
+只要没有其它包导入失败，脚本会额外以非零退出码结束（提醒操作者：技能已经导入成功，但没有任何副本
+确认收到失效信号）。
+
+**"skipped" 出现时不要重跑这条命令补救**——重跑时所有包都已存在且内容未变，会全部变成 200，
+`created` 全 False，脚本根本不会再尝试发布，等于什么也没做。正确处理二选一：
+① `kubectl -n expert-work rollout restart deploy/control-plane` 强制所有副本重启、重新加载技能；
+② 接受各副本最长 1800 秒（30 分钟，见 `control_plane/runtime.py` 里 `AgentRuntime.cache_ttl_s`）后
+自然过期，到时候会自己读到新版本，代价是这段时间内已导入的技能变化可能在部分副本上还看不到。
+
+任何一个包导入失败（校验/审核/扫描不过）都会让脚本抛出未捕获异常、非零退出，且不影响它之前已经
+成功导入的包（那些包触发的失效发布不受影响，按上面的规则照常尝试一次）。
 
 回滚 = 拿旧 commit 的技能源码重新打包再导入，平台会把旧内容存成**新版本**（`skill_version` 只增
 不改，`content_hash` 幂等判断只比较"最新版本"，回滚到的是比当前版本更早的内容，所以一定会新建

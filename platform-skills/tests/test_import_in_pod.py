@@ -1,4 +1,4 @@
-"""Tests for `platform-skills/import_in_pod.py` (Task 8 + fix round 1).
+"""Tests for `platform-skills/import_in_pod.py` (Task 8 + fix rounds 1-2).
 
 Exercises `run_import` — the whole create / version-bump / no-op / dry-run /
 partial-batch-failure decision logic — against in-memory stores
@@ -352,6 +352,58 @@ async def test_output_name_is_the_parsed_skill_name_not_the_file_stem(
     [result] = results
     assert result["file"] == "totally-different-filename"
     assert result["name"] == "docx"
+
+
+class _FakeRedisClient:
+    """Stand-in for the real `redis.asyncio` client — only `publish` is
+    exercised by `_PublishRecordingRedisClient`/`InvalidationBus`."""
+
+    def __init__(self, receivers: int) -> None:
+        self._receivers = receivers
+        self.published: list[tuple[str, str]] = []
+
+    async def publish(self, channel: str, message: str) -> int:
+        self.published.append((channel, message))
+        return self._receivers
+
+
+async def test_publish_recording_client_records_receiver_count_and_delegates() -> None:
+    """Finding N3: the proxy must forward the call and the real return
+    value unchanged (so `InvalidationBus.publish()` keeps working exactly
+    as before), while separately recording the receiver count for the
+    caller to inspect afterward."""
+    fake = _FakeRedisClient(receivers=3)
+    recorder = import_in_pod._PublishRecordingRedisClient(fake)
+
+    result = await recorder.publish("expert_work:invalidation", '{"kind": "platform_skill"}')
+
+    assert result == 3
+    assert recorder.last_publish_receivers == 3
+    assert fake.published == [("expert_work:invalidation", '{"kind": "platform_skill"}')]
+
+
+def test_publish_recording_client_delegates_other_attributes() -> None:
+    class _WithExtra:
+        async def publish(self, channel: str, message: str) -> int:
+            return 0
+
+        def pubsub(self) -> str:
+            return "a-pubsub-object"
+
+    recorder = import_in_pod._PublishRecordingRedisClient(_WithExtra())
+
+    assert recorder.pubsub() == "a-pubsub-object"
+
+
+def test_publish_outcome_true_only_when_receivers_positive() -> None:
+    """Finding N3: 0 receivers (published to nobody) and None (never
+    recorded — e.g. InvalidationBus swallowed an exception before
+    assigning it) must both count as "not confirmed", the same as a
+    genuine failure."""
+    assert import_in_pod._publish_outcome(3) is True
+    assert import_in_pod._publish_outcome(1) is True
+    assert import_in_pod._publish_outcome(0) is False
+    assert import_in_pod._publish_outcome(None) is False
 
 
 def test_bundle_program_compiles_and_embeds_packages_and_asyncio_run(
