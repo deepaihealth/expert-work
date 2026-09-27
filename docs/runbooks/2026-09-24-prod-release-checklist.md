@@ -658,12 +658,14 @@ Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之�
 放在 Step B 之后，**缓存失效就要靠本步自己**：Step B 的滚动重启已经发生过，不会再顺带清缓存。导入脚本在
 有新版本时会发一次跨副本失效广播；没发到时要补一次 `rollout restart`（见下面「正式导入」的检查项）。
 
-**逐技能 go / no-go**：以 09-27 晚测试环境验收结论为准（controller 拍板，结论写进 §6）。**没过的技能
+**逐技能 go / no-go**：以 09-27 晚测试环境验收结论为准（controller 拍板，结论写进 §6）。
+
+> **09-27 结论：四个技能全部 GO。** 测试环境导入 v2 后第三层验收 8 项（新建 docx/pptx/xlsx/pdf、按模板出文档、复制 PPT 页、Word 转 PDF、PDF 加水印）：全部打开技能、跑技能脚本、npm 0 次、成品可打开且内容正确；唯一系统性问题是「检查成品」看图步骤写错（7/8 首次 ask_image 报错）→ #1679 修正后导入 v3 复验 4 项全部 completed、工具失败 0。ai-health-plan 回归（虚构客户出 Word 方案）completed、0 工具失败、按新步骤看图。**没过的技能
 本步跳过、保持生产原版不导入**——下面的命令只把 go 的技能对应的 `$PS/dist/<name>.skill`
 传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
 
 **用哪份源码打包**：Step B 钉的发版提交不含 `platform-skills/`，要用 office 技能合并进 main 的那个提交
-（`<OFFICE_SKILLS_SHA>`，PR 合并后回填）打包导入。（发版钉子不前移是 09-26 拍板：office 技能的代码侧文案
+（`58c0f2a9` = #1678 + #1679，09-27 回填）打包导入。（发版钉子不前移是 09-26 拍板：office 技能的代码侧文案
 改动因此不随本班上生产，见 ROADMAP B-119。）此刻主仓库目录检出的是 `f92c6fae`，而且 Step B 留下了
 **未提交的 overlay newTag 改动**（Step F 要用），所以**不要在主仓库里 checkout**：把那个提交放进一个独立
 worktree，命令仍在主仓库目录里跑（要用仓库自己的 venv；在 worktree 目录里跑 `uv run` 会建一个没有依赖的
@@ -671,7 +673,7 @@ worktree，命令仍在主仓库目录里跑（要用仓库自己的 venv；在 
 
 ```sh
 git fetch origin main
-git worktree add /tmp/ps-office <OFFICE_SKILLS_SHA>
+git worktree add /tmp/ps-office 58c0f2a9
 git -C /tmp/ps-office log -1 --oneline   # 确认就是它
 ```
 
@@ -862,10 +864,10 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 发布前在跑 / 排队 / 待审批 | `___` |
 | Step A 沙箱钉子 | 发前 `________` → 发后 `________` |
 | Step B smoke / 金丝雀 | `________` |
-| Step A2 office 技能导入（B、C 之后） | go/no-go(docx/pptx/xlsx/pdf)`________`；导入前 latest_version `________` → 导入后 `________`；失效 published(N=`__`) / skipped → restart 或等 1800s `________` |
+| Step A2 office 技能导入（B、C 之后） | go/no-go(docx/pptx/xlsx/pdf)**全部 GO**（09-27 测试环境验收，见下）；导入前 latest_version `________` → 导入后 `________`；失效 published(N=`__`) / skipped → restart 或等 1800s `________` |
 | migrate Job | 期望跑四条（`0156` ~ `0159`），实况 `________` |
 | CronJob 创建 | `________` |
 | 次日首跑删除计数 | `________` |
-| §1 ① 价目表缺的模型 / 处理方式 | `________` |
-| §1 ② 会变化的上限（Agent / 值） | `________` |
+| §1 ① 价目表缺的模型 / 处理方式 | 09-27 核对 8 个全缺 → 用户拍板按官网标价补 7 个（DeepSeek 取高峰价），已写入生产（审计 actor `rate-card-bootstrap-2026-09-27`），复核 7 有；`qwen-plus`（重排序）不在模型目录、价目表拒收，接受记 0（ROADMAP B-120） |
+| §1 ② 会变化的上限（Agent / 值） | 09-27 核对：ai-health-plan 的 glm-5.3 / qwen3.8-max 与 deepseek-v4-pro 的 40960 开始生效（≥16000，测试已验）；豆包看图 medium 档位开始生效；4096 的 glm-5.3 / kimi-k3 不变；无「豆包开思考无档位」行。无需动作 |
 | 与执行单不符之处 | `________` |
