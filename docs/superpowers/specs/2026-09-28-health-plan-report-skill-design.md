@@ -91,10 +91,10 @@ style 层 1..N ─┤   3. resolve_style.py —— 叠加样式层 + 品牌锁�
           render.py  —— 版式引擎（测量、分页、合并短章节）→ PPT / PDF
                │
                ▼
-   成品文件 + 每页预览 PNG + qa.json（丢字 / 溢出 / 对比度）+ params-report.json
+   成品文件 + qa.json（丢字 / 溢出 / 对比度 / 越界）+ params-report.json
                │
                ▼
-   4. Agent 看图核验（ask_image）→ 5. save_artifact 登记 → 报告未生效参数与降级
+   4. Agent 看图核验（read_page 渲染成品页 → ask_image）→ 5. save_artifact 登记 → 报告未生效参数与降级
 ```
 
 技能目录（与 docx/pptx/xlsx/pdf 同构）：
@@ -102,7 +102,7 @@ style 层 1..N ─┤   3. resolve_style.py —— 叠加样式层 + 品牌锁�
 ```
 platform-skills/health-plan-report/
   SKILL.md                 技能正文（何时用、流程、命令、可调项、大白话对照表、边界声明：只呈现不制定）
-  skill.yaml               shared: [preview.py, convert.py, _cli.py, _office.py]（按需声明）
+  skill.yaml               shared: [_cli.py]
   reference/               懒加载参考文档
     content-schema.md      内容 JSON 全量字段说明 + 虚构完整样例
     style-options.md       视觉可调项全表 + 取值 + 大白话对照表
@@ -125,8 +125,13 @@ platform-skills/health-plan-report/
   sample/                  虚构完整样例内容 JSON（测试与自检用）
 ```
 
-依赖全部为沙箱镜像已预装：python-pptx、weasyprint、matplotlib、Pillow、pypdf；预览复用
-`shared/preview.py`（soffice + pdftoppm）。**不需要改沙箱镜像，不需要 Node。**
+依赖全部为沙箱镜像已预装（2026-09-28 实测镜像 7ac31957：Python 3.12、python-pptx 1.0.2、weasyprint 70.0、
+matplotlib 3.11、Pillow 12.3、pypdf 6.18；字体 `/usr/share/fonts/opentype/noto/NotoSansCJK-{Regular,Bold}.ttc`；
+镜像无 pydantic / PyYAML，渲染器只用标准库 + 上述包）。**不需要改沙箱镜像，不需要 Node。**
+
+实现结构：内容积木先映射为一小组**版式原语**（卡片网格、表格、键值、要点、提醒框、图表、时间线、分栏、素材、图片），
+PPT 与 PDF 各自只实现原语的绘制；版式引擎（测量、分页、合并）只用于 PPT，PDF 交给 weasyprint 的流式分页
+（CSS `break-inside: avoid`、表头重复）。技能分类（frontmatter `expert_work.category`）取「健康」。
 
 ## 4. 内容 JSON（Agent 写什么）
 
@@ -161,7 +166,7 @@ platform-skills/health-plan-report/
 | `summary` 方案摘要 | `items:[{label, text}]`（由调用方提供的「一页看懂」要点） | 摘要页（分栏要点） | 分栏、列表 |
 | `profile` 健康画像 | `items:[{name, value, unit, ref_low, ref_high, ref_text, position}]`，`position` ∈ `within/above/below/none`（由 Agent 给出） | 指标卡 + 参考范围条 + 中性对照标签（「在参考范围内 / 高于参考范围 / 低于参考范围」） | 卡片、表格 |
 | `issues` 核心问题 | `items:[{title, evidence, level}]`，`level` ∈ `focus/watch/info` | 编号问题卡，按内容顺序，等级只影响标签颜色 | 卡片、列表 |
-| `trend` 指标趋势 | `metric, unit, points:[{date,value}], target_low, target_high, ref_text` | 折线 + 目标区间色带 + 首末值标注 | 折线、柱状 |
+| `trend` 指标趋势 | `metric, unit, points:[{date,value}], target_low, target_high, ref_text` | 折线 + 目标区间（PDF 为色带；PPT 原生图表不支持折线与面积组合，改为上下限虚线系列）+ 末值标注 | 折线、柱状 |
 | `goals` 阶段目标 | `items:[{name, current, target, unit, due, note}]` | 「现在 → 目标」对比卡 | 卡片、表格 |
 | `phases` 阶段计划 | `items:[{label, focus:[{area, text}]}]` | 周时间线 | 时间线、分栏卡片、表格 |
 | `nutrition` 营养处方 | `energy_kcal, macros:[{name, grams, percent}], meals:[{name, percent, note}]` | 环形图 + 数值卡 + 餐次分配 | 环形图 + 表、纯表 |
@@ -305,8 +310,8 @@ LOGO 文件缺失或无法解码：保留机构名称文字，记入降级警告
 
 1. 写内容 JSON → `validate.py` 校验 → `save_artifact(kind="data")` 登记。
 2. 组装样式层（按调用方优先级；个人默认从 `report-style/personal.json` 读取，不存在则略过）。
-3. `render.py` 出成品，同时产出每页预览 PNG、`qa.json`、`params-report.json`。
-4. **看图核验（必做）**：至少对封面与内容最密的两页调用 ask_image；发现问题只能调整样式参数重新渲染，不得改代码。
+3. `render.py` 出成品，同时产出 `qa.json`、`params-report.json`。
+4. **看图核验（必做）**：`read_page(path=成品, units=[…])` 渲染封面与内容最密的两页，再对同页 `ask_image`（平台 R14：ask_image 只接受 read_page 渲染过的页，不接受 PNG 路径）；发现问题只能调整样式参数重新渲染，不得改代码。
 5. `save_artifact(kind="document")` 登记成品；回复中报告未生效参数（§5.6）与降级警告（LOGO、视频）。
 
 用户后续说「改一下（视觉）」：新增一层本次样式，**同一份内容 JSON** 重新渲染，不重新拉数、不重写内容；
@@ -322,7 +327,7 @@ LOGO 文件缺失或无法解码：保留机构名称文字，记入降级警告
 - **对比度**：所有前景 / 背景组合满足 §5.3 阈值。
 - **结构**：PPT 页数、每页形状均在页面范围内（坐标与尺寸落在 0..页宽 / 页高，防 2026-09-27 双重换算类 bug）。
 
-预览图（`shared/preview.py`）用于 Agent 看图与人工验收，不作为自动判据。
+视觉核验由 Agent 走 read_page + ask_image 完成，不作为自动判据；技能不单独产出预览 PNG。
 
 ## 8. ai-health-plan 迁移（调用方侧改动，不属于技能本身）
 
