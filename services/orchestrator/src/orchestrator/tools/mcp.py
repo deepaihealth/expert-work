@@ -238,6 +238,9 @@ class MCPToolDef:
     name: str
     description: str
     input_schema: Mapping[str, Any]
+    #: B-122 —— 服务器 ``list_tools`` 标注里的 ``readOnlyHint``:``True`` 只读,
+    #: ``False`` 有写操作,``None`` 没标(worker 一律当写)。
+    read_only: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +255,17 @@ class MCPCallResult:
 
     content: str
     is_error: bool = False
+
+
+def _read_only_hint(tool: Any) -> bool | None:
+    """``Tool.annotations.readOnlyHint`` —— 只认 SDK 对象上的真 bool。
+
+    没标、字典形态、字符串 ``"true"``、``1`` 一律 ``None``:worker 按「没标 = 当写」
+    处理,宁可少给一个读工具,也不把写工具认成只读。
+    """
+    annotations = getattr(tool, "annotations", None)
+    value = getattr(annotations, "readOnlyHint", None) if annotations is not None else None
+    return value if isinstance(value, bool) else None
 
 
 def _materialize_tool_defs(raw_tools: Sequence[Any], *, server: str) -> tuple[MCPToolDef, ...]:
@@ -287,7 +301,14 @@ def _materialize_tool_defs(raw_tools: Sequence[Any], *, server: str) -> tuple[MC
                 getattr(t, "name", "?"),
             )
             schema = {}
-        defs.append(MCPToolDef(name=str(t.name), description=description, input_schema=schema))
+        defs.append(
+            MCPToolDef(
+                name=str(t.name),
+                description=description,
+                input_schema=schema,
+                read_only=_read_only_hint(t),
+            )
+        )
     return tuple(defs)
 
 
@@ -959,6 +980,7 @@ async def register_mcp_tools(
     allow_tools: Collection[str] | None = None,
     deferred: bool = False,
     arg_bindings: Mapping[str, Mapping[str, str]] | None = None,
+    read_only_only: bool = False,
 ) -> list[str]:
     """List tools from ``client`` and register each as :class:`MCPTool`.
 
@@ -980,6 +1002,10 @@ async def register_mcp_tools(
     ``server`` / ``tool`` names while the registry is keyed by
     :func:`mcp_tool_name`, and duplicating that folding rule is how the two
     sides drift apart.
+
+    ``read_only_only`` (B-122) registers only tools whose server marked them
+    ``readOnlyHint: true`` — the worker build's view; unannotated tools count
+    as writes.
 
     Two kinds of miss can happen here; neither is ever raised — an upstream
     interface drift must degrade, never block the run (spec §5.4). Only the
@@ -1007,8 +1033,15 @@ async def register_mcp_tools(
     # ``build_tool_registry`` 里,等所有条目都注册完之后做一次。
     pending_bindings = {tool: dict(bound) for tool, bound in (arg_bindings or {}).items()}
     registered: list[str] = []
+    dropped_write = dropped_unannotated = 0
     for tool_def in tools:
         if allow_tools is not None and tool_def.name not in allow_tools:
+            continue
+        if read_only_only and tool_def.read_only is not True:
+            if tool_def.read_only is False:
+                dropped_write += 1
+            else:
+                dropped_unannotated += 1
             continue
         bound = pending_bindings.pop(tool_def.name, None) or {}
         # B-65 —— 这条绑定有没有落在一个真实工具上,要在 ``absent`` 把参数删空之前定。
@@ -1062,6 +1095,14 @@ async def register_mcp_tools(
             registry.note_landed_arg_binding(server_name, tool_def.name, expert_work_tool.spec.name)
         registered.append(expert_work_tool.spec.name)
     logger.info("mcp.registered server=%s tools=%s", server_name, registered)
+    if read_only_only:
+        logger.info(
+            "mcp.worker_read_only_filter server=%s kept=%d dropped_write=%d dropped_unannotated=%d",
+            server_name,
+            len(registered),
+            dropped_write,
+            dropped_unannotated,
+        )
     return registered
 
 

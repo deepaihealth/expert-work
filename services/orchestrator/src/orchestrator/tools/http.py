@@ -105,6 +105,9 @@ class HTTPTool:
     client_factory: HTTPXClientFactory = field(default=_default_client_factory)
     body_char_cap: int = DEFAULT_BODY_CHAR_CAP
     header_char_cap: int = DEFAULT_HEADER_CHAR_CAP
+    #: B-122 — methods this instance accepts. Defaults to all; worker builds
+    #: pass ``worker_policy.READ_ONLY_HTTP_METHODS`` and the schema enum narrows with it.
+    allowed_methods: frozenset[str] = _ALLOWED_METHODS
 
     @property
     def spec(self) -> ToolSpec:
@@ -121,7 +124,7 @@ class HTTPTool:
                 "properties": {
                     "method": {
                         "type": "string",
-                        "enum": sorted(_ALLOWED_METHODS),
+                        "enum": sorted(self.allowed_methods),
                     },
                     "url": {"type": "string", "format": "uri"},
                     "headers": {
@@ -167,8 +170,16 @@ class HTTPTool:
             msg = "'method' must be a string"
             raise ValueError(msg)
         upper = raw.strip().upper()
+        if upper in _ALLOWED_METHODS and upper not in self.allowed_methods:
+            # B-122 — a valid method this instance withholds (worker): say why and who does it.
+            msg = (
+                f"HTTP {upper} is not available to worker sub-agents: writes to "
+                "outside systems stay with the orchestrator. Report what should "
+                "be sent in your final message instead."
+            )
+            raise ValueError(msg)
         if upper not in _ALLOWED_METHODS:
-            msg = f"unsupported HTTP method {raw!r}; allowed: {sorted(_ALLOWED_METHODS)}"
+            msg = f"unsupported HTTP method {raw!r}; allowed: {sorted(self.allowed_methods)}"
             raise ValueError(msg)
         return upper
 

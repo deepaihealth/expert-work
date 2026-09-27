@@ -39,6 +39,7 @@ from expert_work.runtime.cancellation import RunCancelledError
 from orchestrator.tools._budget import DELEGATIONS_GATED, WorkerSpawnBudget
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.worker_policy import worker_policy_enabled
 from orchestrator.trajectory import TrajectoryRecorder
 
 # Re-exported for back-compat: callers import WorkerSpawnBudget from here.
@@ -65,6 +66,18 @@ _workers_blocked = expert_work_counter(
 
 #: The spawn_worker tool name handed to the parent LLM.
 SPAWN_WORKER_TOOL_NAME = "spawn_worker"
+
+_TOOLS_SENTENCE_LEGACY = (
+    "Workers carry the same tool set as you — including MCP tools — and can "
+    "fetch data on their own. "
+)
+#: B-122 —— 与 worker 实际拿到的工具一致;说「same tool set」就是对模型说假话。
+_TOOLS_SENTENCE_RESTRICTED = (
+    "Workers carry your read-side tools — including read-only MCP tools — and "
+    "can fetch data on their own, but they cannot register deliverables, write "
+    "to systems outside the workspace, or change the agent's memory, skills or "
+    "schedules; those steps stay with the top-level agent. "
+)
 
 
 @runtime_checkable
@@ -144,9 +157,13 @@ class SpawnWorkerTool:
                 "in isolation, then return its result. Workers are lightweight, "
                 "fast, and cheap; several can run in parallel; each starts with a "
                 "fresh context — it sees none of this conversation, only 'task' — "
-                "and is discarded when done. Workers carry the same tool set as "
-                "you — including MCP tools — and can fetch data on their own. "
-                "They excel at reading, extracting, and organizing work, "
+                "and is discarded when done. "
+                + (
+                    _TOOLS_SENTENCE_RESTRICTED
+                    if worker_policy_enabled()
+                    else _TOOLS_SENTENCE_LEGACY
+                )
+                + "They excel at reading, extracting, and organizing work, "
                 "keeping bulk material out of this conversation's context.\n"
                 "USE this tool proactively — do not wait to be asked — whenever "
                 "the work has one of these shapes, regardless of domain: "
