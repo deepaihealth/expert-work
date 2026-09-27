@@ -36,6 +36,7 @@ import httpx
 
 from expert_work.common.observability import inject_context
 from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
+from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -155,12 +156,17 @@ _PIP_ENV_SOURCES = {
 
 
 def platform_exec_envs() -> dict[str, str]:
-    """部署级、与 agent 无关的 exec 环境变量(B-81:目前只有 pip 索引)。
+    """部署级、与 agent 无关的 exec 环境变量:``TZ`` + pip 索引(B-81)。
 
-    只收非空值:空串与纯空白都当作「没配」,否则一个手滑的空变量会把 pip 的
+    ``TZ`` 恒注入,取值与系统提示词「当前日期」行同源(:mod:`orchestrator.agent_timezone`)。
+    提示词让模型「精确时间调 exec_python 去算」,沙箱默认却是 UTC —— 不注入的话模型照做
+    反而拿到慢 8 小时的钟点(文件名时间戳错、0~8 点之间连日期都差一天)。沙箱镜像自带
+    ``/usr/share/zoneinfo``(python:3.12-slim),glibc 与 ``zoneinfo`` 都认。
+
+    pip 索引只收非空值:空串与纯空白都当作「没配」,否则一个手滑的空变量会把 pip 的
     默认索引覆盖成空、比不配更糟。
     """
-    out: dict[str, str] = {}
+    out: dict[str, str] = {"TZ": resolve_agent_timezone().key}
     for name, source in _PIP_ENV_SOURCES.items():
         value = os.environ.get(source, "").strip()
         if value:

@@ -946,6 +946,74 @@ async def test_exec_injects_per_agent_pythonuserbase(runtime: SandboxRuntime) ->
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
 
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sandbox_clock_is_in_the_prompt_timezone(runtime: SandboxRuntime) -> None:
+    """系统提示词让模型「精确时间调 exec_python 去算」—— 两个后端的沙箱里,本地时区的
+    UTC 偏移必须等于提示词那一行用的时区。沙箱镜像认不认 ``TZ``(有没有 zoneinfo)只有
+    真沙箱验得出:认不出时 glibc 静默回落 UTC,偏移变 0,这里红。"""
+    from datetime import datetime
+
+    from orchestrator.agent_timezone import resolve_agent_timezone
+
+    expected = datetime.now(resolve_agent_timezone()).utcoffset()
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c-tz")
+    try:
+        outcome = await runtime.exec(
+            sandbox_id=sid,
+            code="import datetime; print(datetime.datetime.now().astimezone().utcoffset())",
+            timeout_s=30,
+            agent_key="contract-agent",
+        )
+        assert outcome.stdout.strip() == str(expected)
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
+
+
+def _prompt_timezone_label() -> str:
+    """系统提示词「当前日期」行里写的时区名 —— 走 ``agent_factory`` 的真实装配路径取。"""
+    from datetime import datetime
+
+    from orchestrator.agent_factory import _current_date_block, _resolve_agent_timezone
+
+    line = _current_date_block(datetime.now(_resolve_agent_timezone()))
+    return line.split("(timezone ", 1)[1].split(")", 1)[0]
+
+
+def test_sandbox_tz_defaults_to_the_prompt_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认部署:提示词说 Asia/Shanghai,沙箱的 ``TZ`` 也必须是 Asia/Shanghai。
+
+    没有 ``TZ`` 时沙箱是 UTC —— 模型照提示词去 exec_python 取时间,拿到的比提示词说的
+    时区慢 8 小时(ai-health-plan 文件名 ``_041135`` 实际是 12:11)。"""
+    from orchestrator.tools.sandbox import exec_envs
+
+    monkeypatch.delenv("EXPERT_WORK_TIMEZONE", raising=False)
+    assert exec_envs("k")["TZ"] == "Asia/Shanghai"
+    assert _prompt_timezone_label() == "Asia/Shanghai"
+
+
+def test_sandbox_tz_follows_the_deployment_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """改部署时区,两边一起变 —— 只改了一边就是这次的 bug 换个时区再来一遍。"""
+    from orchestrator.tools.sandbox import exec_envs
+
+    monkeypatch.setenv("EXPERT_WORK_TIMEZONE", "America/New_York")
+    assert exec_envs("k")["TZ"] == "America/New_York"
+    assert exec_envs("")["TZ"] == "America/New_York", "没绑 agent 的 exec 也是同一个钟"
+    assert _prompt_timezone_label() == "America/New_York"
+
+
+def test_sandbox_tz_invalid_zone_degrades_to_utc_on_both_sides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """配错时区名:提示词回落 UTC,沙箱也必须是 UTC —— 不能把一个 glibc 不认的名字
+    原样塞进沙箱,那里会静默变 UTC 却让人以为配上了。"""
+    from orchestrator.tools.sandbox import exec_envs
+
+    monkeypatch.setenv("EXPERT_WORK_TIMEZONE", "Not/AZone")
+    assert exec_envs("k")["TZ"] == "UTC"
+    assert _prompt_timezone_label() == "UTC"
+
+
 def test_exec_envs_carry_the_inputs_path_when_a_run_is_bound() -> None:
     """B-61 §4.4 + B-67 §4.2 —— ``agent_key_envs`` 单源:``run_id`` 非 ``None`` 时两个
     后端都会经由它拿到同一对 ``EXPERT_WORK_INPUTS`` / ``EXPERT_WORK_INPUTS_DIR``。"""
@@ -1843,7 +1911,9 @@ def test_platform_pip_envs_are_off_unless_configured(monkeypatch: pytest.MonkeyP
 
     for name in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_TRUSTED_HOST"):
         monkeypatch.delenv(f"EXPERT_WORK_SANDBOX_{name}", raising=False)
-    assert exec_envs("k") == agent_key_envs("k")
+    envs = exec_envs("k")
+    envs.pop("TZ")  # 平台级恒注入的那一个,见 test_sandbox_tz_* 各条
+    assert envs == agent_key_envs("k")
 
 
 def test_platform_pip_envs_reach_the_exec(monkeypatch: pytest.MonkeyPatch) -> None:

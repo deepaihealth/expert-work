@@ -32,14 +32,12 @@ each adapter and onto the request body.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID, uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:
     from orchestrator.tools.skill_view import SkillResolution
@@ -86,6 +84,7 @@ from expert_work.runtime.tokens import default_estimator
 # (breaks the agent_factory ↔ orchestrator.tools import cycle). Re-exported here
 # so every existing ``from orchestrator.agent_factory import BuiltAgent`` importer
 # (and ``orchestrator.__init__``) keeps working unchanged.
+from orchestrator.agent_timezone import resolve_agent_timezone as _resolve_agent_timezone
 from orchestrator.built_agent import BuiltAgent as BuiltAgent
 from orchestrator.context import (
     ContextCompressor,
@@ -1742,14 +1741,6 @@ def _render_skills_index(summaries: Sequence[str]) -> str:
     return degraded
 
 
-#: Agent wall-clock timezone for the injected "current date" line. The injected
-#: value is day-granular (see ``_current_date_block``) so the system prompt stays
-#: byte-stable across every run within one calendar day, keeping the prompt-cache
-#: prefix warm. ``EXPERT_WORK_TIMEZONE`` overrides the default (zh-CN deployment →
-#: Asia/Shanghai) so "今天几号" answers in the user's local day, not the server's
-#: UTC day.
-_DEFAULT_AGENT_TIMEZONE = "Asia/Shanghai"
-
 _WEEKDAYS_EN = (
     "Monday",
     "Tuesday",
@@ -1759,21 +1750,6 @@ _WEEKDAYS_EN = (
     "Saturday",
     "Sunday",
 )
-
-
-def _resolve_agent_timezone() -> ZoneInfo:
-    """Resolve the agent wall-clock timezone, falling back to UTC.
-
-    Reads ``EXPERT_WORK_TIMEZONE`` (default ``Asia/Shanghai``). An invalid zone
-    name degrades to UTC rather than failing the build — a stale tz label is
-    recoverable, a crashed build is not.
-    """
-    name = os.environ.get("EXPERT_WORK_TIMEZONE", _DEFAULT_AGENT_TIMEZONE)
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        logger.warning("invalid EXPERT_WORK_TIMEZONE %r; falling back to UTC", name)
-        return ZoneInfo("UTC")
 
 
 def _current_date_block(now: datetime) -> str:
