@@ -42,6 +42,7 @@ from orchestrator import BuiltAgent, MemoryEnv, MiddlewareEnv, ToolEnv, build_ag
 from orchestrator.llm import RateLimiterFactory
 from orchestrator.tools import ChildAgentBuilder
 from orchestrator.tools.spawn_worker import WorkerBuildFn
+from orchestrator.tools.worker_policy import WORKER_DENIED_BUILTINS, worker_policy_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +63,32 @@ logger = logging.getLogger(__name__)
 _ChildKey = tuple[UUID, str, str, int, str, str, str | None]
 
 
-def _worker_system_prompt(role: str | None) -> str:
+#: B-122 —— worker 工具边界的提示词侧。结构上已经不给这些工具(assembly /
+#: synthesize),这段让模型知道「缺工具是有意的」,别拿 bash / exec_python 绕,
+#: 并在小结里列出改过的文件(替代「禁止改文件」,两家业界实现都这样做)。
+_WORKER_POLICY_PROMPT = (
+    " You are not the orchestrator and you never talk to the end user: your "
+    "final message goes only to the orchestrator, which decides what reaches "
+    "the user."
+    " Some capabilities are deliberately not available to you and stay with "
+    "the orchestrator: registering deliverables, sending messages or otherwise "
+    "writing to systems outside this workspace, and changing the agent's "
+    "memory, skills or schedules. Do not try to work around a missing tool "
+    "(for example by making outbound requests from bash or exec_python); if "
+    "the task needs one, say so in your final message."
+    " End your final message with a list of every file you created or "
+    "modified in the workspace — its path and one line on what it holds."
+)
+
+
+def _worker_system_prompt(role: str | None, *, restricted: bool = False) -> str:
     """Generated system prompt for an ephemeral worker (1.3).
 
     A fresh, focused worker prompt (Claude Code / hermes shape) — the worker
     sees only this + the delegated task, none of the parent conversation.
     """
     focus = f" Your focus for this task: {role}." if role else ""
-    return (
+    base = (
         "You are a worker sub-agent spawned to complete a single, focused subtask "
         "in isolation." + focus + " Do the task fully and return a concise, complete "
         "result as your final message — it is reported straight back to the "
@@ -91,6 +110,7 @@ def _worker_system_prompt(role: str | None) -> str:
         "orchestrator can read the file, and nothing is lost or truncated in the "
         "retelling."
     )
+    return base + _WORKER_POLICY_PROMPT if restricted else base
 
 
 def _without_manage_task(spec: AgentSpec) -> AgentSpec:
@@ -139,6 +159,7 @@ def synthesize_worker_spec(
     max_iterations: int,
     allowed_toolsets: list[str],
     inherit_skills: bool = True,
+    worker_policy: bool = True,
 ) -> AgentSpec:
     """Derive an ephemeral worker :class:`AgentSpec` from ``parent`` (1.3).
 
@@ -172,8 +193,13 @@ def synthesize_worker_spec(
     ``inherit_skills=False`` is the ops rollback valve (platform env, never a
     tenant-facing setting) restoring the pre-B-37 stripped shape byte for byte.
     See ``docs/superpowers/specs/2026-08-28-worker-context-inheritance-design.md``.
+
+    B-122 — ``worker_policy`` strips :data:`WORKER_DENIED_BUILTINS` (delivery
+    + self-modification) and appends the boundary text; ``False`` is the ops
+    rollback shape (only ``manage_task`` stripped, prompt byte-identical).
     """
     body = parent.spec
+    denied = WORKER_DENIED_BUILTINS if worker_policy else frozenset({"manage_task"})
     worker_body = body.model_copy(
         update={
             **(
@@ -181,13 +207,16 @@ def synthesize_worker_spec(
                 if body.dynamic_workers.model is not None
                 else {}
             ),
-            "system_prompt": SystemPromptSpec(template=_worker_system_prompt(role)),
+            "system_prompt": SystemPromptSpec(
+                template=_worker_system_prompt(role, restricted=worker_policy)
+            ),
             # BUG-19b —— 与下面剥 triggers **块**同理由,连 manage_task **工具**
-            # 一起剥:worker 无 TriggerStore,留着必撞 build_agent 硬闸。
+            # 一起剥:worker 无 TriggerStore,留着必撞 build_agent 硬闸。B-122 —
+            # 回滚阀开时把往外交付 / 自我修改的工具也一并剥掉(见 denied)。
             "tools": [
                 t
                 for t in _filter_worker_tools(body.tools, allowed_toolsets)
-                if not (isinstance(t, BuiltinToolSpec) and t.name == "manage_task")
+                if not (isinstance(t, BuiltinToolSpec) and t.name in denied)
             ],
             "subagents": [],
             "memory": None,
@@ -600,7 +629,21 @@ def make_worker_build_fn(
             ),
             allowed_toolsets=allowed_toolsets,
             inherit_skills=inherit_skills,
+            worker_policy=worker_tool_env.worker_policy,
         )
+        if worker_tool_env.worker_policy:
+            stripped = sorted(
+                t.name
+                for t in parent_spec.spec.tools
+                if isinstance(t, BuiltinToolSpec) and t.name in WORKER_DENIED_BUILTINS
+            )
+            logger.info(
+                "worker_policy.applied role=%s depth=%d stripped_declared=%s "
+                "base_save_artifact=dropped http=read_only mcp=read_only",
+                role or "general",
+                depth,
+                stripped,
+            )
         provider_key_resolver = (
             make_provider_key_resolver(resolver=credentials_resolver, tenant_id=tenant_id)
             if credentials_resolver is not None
@@ -681,5 +724,8 @@ def make_worker_build_fn(
 
     # The worker's own ToolEnv carries this same build_fn so a worker can in
     # turn spawn a grandchild worker (bounded by the depth cap).
-    worker_tool_env = replace(base_tool_env, worker_build_fn=_build)
+    # B-122 —— 回滚阀在工厂创建时读一次;孙级 worker 复用这个 env,限制一路带下去。
+    worker_tool_env = replace(
+        base_tool_env, worker_build_fn=_build, worker_policy=worker_policy_enabled()
+    )
     return _build

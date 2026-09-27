@@ -114,7 +114,8 @@ def test_spec_description_carries_shape_criteria() -> None:
     # 真栈对照(2026-08-28,run eac902ed)逮到的信息缺口:kimi 思考原文
     # 「spawn_worker 有工具吗?」——不确定 worker 能不能自己拉数,于是放弃
     # 委派取数型任务。工具继承必须写明,且钉住短语防止未来改丢。
-    assert "same tool set as you" in desc
+    # B-122 —— worker 只拿到读侧工具(平台默认),短语随之改为如实描述。
+    assert "read-side tools" in desc
     assert "MCP tools" in desc
     # 委派契约含工具指引(照 Anthropic cookbook / deepagents 的委派三要素)。
     assert "which tools to use" in desc
