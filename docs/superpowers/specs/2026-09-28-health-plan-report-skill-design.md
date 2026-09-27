@@ -63,6 +63,7 @@ ai-health-plan 目前的成品链路是：模型先写方案 JSON，再**由模�
 | D9 | 参数接入 | 技能只定义「能调什么」，不认参数名；样式层数与优先级由调用方传入 |
 | D10 | 方案 JSON 格式变更 | 可改；对接方不解析 JSON 产物，无需对外协调 |
 | D11 | 用药积木 | 不做 |
+| D12 | 用药数据 | Agent 可读取作内部安全判断依据，成品中不出现任何用药字样 |
 
 ## 3. 总体架构
 
@@ -320,8 +321,8 @@ LOGO 文件缺失或无法解码：保留机构名称文字，记入降级警告
     `org_name` / `org_logo` / `disclaimer` 写入内容 `brand`；`output_format` 映射 `output.formats`；
     `materials` 映射 `material` 积木（素材硬规则保留）。
   - 保留：拉数流程与纪律、健康红线、素材使用硬规则、改版规则（新生成时间命名、不覆盖旧文件）。
-  - 修正：删除「在用药」相关的读取与写入要求（D11 / 非目标），或至少不再写入成品（以产品最终确认为准，
-    在迁移任务中单列确认）。
+  - 修正（D12）：保留 `medication_query_plans` 读取，仅作 Agent 内部安全判断依据（如服降糖药者不安排空腹运动）；
+    删除「在注意事项写明当前用药仅作参考」等写入要求——成品中不出现任何用药字样。
 - 员工旧偏好：已有 `style/PLAN_STYLE.md` 的员工，首次使用新技能时由 Agent 按 `reference/migration.md`
   把其中视觉偏好翻译写入 `report-style/personal.json`；旧 `style/render_plan.py` 不再使用、不删除。
 - Agent 配置：为 ai-health-plan 挂载 `health-plan-report` 技能（与现有 docx/pptx/pdf 技能并存）。
