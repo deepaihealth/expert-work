@@ -665,3 +665,84 @@ async def test_build_time_bind_reports_kind_bind_not_view(
     assert calls[0][1] == version.tenant_id
     # 绑定不该带证据载荷 —— 带了就等于宣称模型打开过它。
     assert [c[3] for c in calls] == [None] * len(calls)
+
+
+@pytest.mark.asyncio
+async def test_worker_build_skill_seeds_follow_the_parent_key_at_exec(
+    cp: BaseCheckpointSaver[object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-124 —— worker 构建按**自己的** spec 名(``<父>-worker``)生成技能种子、绑沙箱;
+    委派通道给它的 ctx.agent_key 却是**父的**。exec 改用 ctx.agent_key 之后,
+    ``EXPERT_WORK_SKILLS_DIR``、种子落盘位置、``/workspace`` 视图三者必须是同一个 key(父的),
+    否则 ``python "$EXPERT_WORK_SKILLS_DIR/foo/…"`` 找不到 worker 自己的技能文件。
+    """
+    import json
+
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+    from expert_work.protocol.skill import compute_content_hash, supporting_files_to_jsonable
+    from orchestrator import agent_factory
+    from orchestrator.tools import ToolContext, ToolEnv
+    from orchestrator.tools.sandbox import (
+        RecordingSandboxRuntime,
+        SandboxOutcome,
+        agent_key_envs,
+    )
+    from orchestrator.tools.skill_seed import sanitize_agent_key
+
+    captured: list[Any] = []
+    real_build_tool_registry = agent_factory.build_tool_registry  # type: ignore[attr-defined]
+
+    async def _capture(*args: Any, **kwargs: Any) -> Any:
+        registry = await real_build_tool_registry(*args, **kwargs)
+        captured.append(registry)
+        return registry
+
+    monkeypatch.setattr(agent_factory, "build_tool_registry", _capture)
+
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["metadata"]["name"] = "ai-health-plan-worker"
+    doc["spec"]["skills"] = ["foo"]
+    doc["spec"]["tools"] = [{"type": "builtin", "name": "write_file"}]
+    spec = AgentSpec.model_validate(doc)
+    base = _make_version(name="foo")
+    version = base.model_copy(
+        update={
+            "content_hash": compute_content_hash(
+                base.prompt_fragment, supporting_files_to_jsonable(base.supporting_files)
+            )
+        }
+    )
+    runtime = RecordingSandboxRuntime(
+        outcome=SandboxOutcome(
+            stdout=json.dumps({"ok": True, "content_hash": "h", "size": 2, "path": "x.md"}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    await _build(
+        spec,
+        secret_store=_secret_store(),
+        checkpointer=cp,
+        skill_resolver=_make_resolver({("foo", None): _SkillLookupResult.ok(version)}),
+        tenant_id=uuid4(),
+        tool_env=ToolEnv(sandbox_runtime=runtime),
+        subagent_depth=1,
+        skills_inherited=True,
+    )
+    parent_key = sanitize_agent_key("ai-health-plan")
+    worker_key = sanitize_agent_key("ai-health-plan-worker")
+    assert parent_key != worker_key
+
+    tool = captured[-1].get_required("write_file")
+    # 构建期种子确实是按 worker 自己的 key 生成的 —— 这条是本测试的前提。
+    assert all(rel.startswith(f"{worker_key}/") for rel, _ in tool.skill_seed_files)
+    ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4(), user_id=uuid4(), agent_key=parent_key)
+    await tool.call({"path": "x.md", "content": "hi"}, ctx=ctx)
+
+    assert runtime.exec_agent_keys == [parent_key]
+    skills_dir = agent_key_envs(runtime.exec_agent_keys[0])["EXPERT_WORK_SKILLS_DIR"]
+    assert skills_dir == f"{SANDBOX_SKILLS_ROOT}/{parent_key}"
+    seeded = [rel for rel, _ in runtime.acquired[0][3]]
+    assert f"{parent_key}/foo/SKILL.md" in seeded
+    assert all(f"{SANDBOX_SKILLS_ROOT}/{rel}".startswith(skills_dir + "/") for rel in seeded)
