@@ -2,7 +2,7 @@
 
 > **⚠️ 2026-09-25 改期说明**：本班 09-24 **没有发**（用户 09-20 拍板等 B-84 本波做完一起发，
 > 之后又陆续合入 B-64 / B-106 / B-102~104 / B-105）。**用户 09-25 拍板 09-28（周一）发**。文件名保留原日期，免得外链断；**发布日以表头为准**。
-> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）。
+> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）。
 >
 > 一次性文档，发完归档。通用流程在 [`production-release.md`](./production-release.md)，
 > **这份只列那一份不覆盖的东西**。上一班的单子在
@@ -12,8 +12,8 @@
 |---|---|
 | 发布日 | **2026-09-28（周一）** —— 用户 2026-09-25 拍板。原定 09-24（用户 09-17 拍板，原 09-22），09-20 用户拍板延期等 B-84 本波 |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`f92c6fae`** —— 测试环境 2026-09-25 发过的那一版（`release.sh test` smoke PASS + 金丝雀产物链 PASS；B-105 五家真栈回归 + 豆包修复真栈复验，记录 #1667 / #1670） |
-| 区间提交数 | **109**（`git log --oneline 5775fbf3..f92c6fae`；其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1） |
+| 本版 tag | **`e5341495`** = `f92c6fae` + B-121 一个提交（分支 `release/train2-tz`，**不在 main 上**，发完前别删这个分支）。测试环境 2026-09-27 发过（`release.sh test` smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST、ai-health-plan 文件名为北京时间，#1681）。`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
+| 区间提交数 | **110**（`git log --oneline 5775fbf3..e5341495`；其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 1 个 B-121） |
 | 数据库迁移 | **四条**（`0159` 为 09-20 之后追加）：`0159_skill_usage_viewed`（只放宽 `skill_run_usage.outcome` 的 CHECK，允许 `viewed`；不加表不加列不动数据）+ 原三条：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
 | 段数 | **单段**。有迁移但不是三段式：`0156` / `0158` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这些表上正常跑 |
 | 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉。`0159` 同理：旧代码从不写 `viewed`，放宽的 CHECK 对它无害；downgrade 会先删掉全部 `viewed` 行 |
@@ -171,10 +171,12 @@
 **没有新的手工集群对象、没有新 secret、没有新配置键**：09-20 之后追加的 35 个提交里 `infra/k8s/` 只动了
 `base/observability/rules/sli.yml` 与 test overlay；沙箱镜像没有重烤（钉子仍是 `7ac31957`，Step A 不变）。
 
+> **2026-09-27 第八次重钉：`f92c6fae` → `e5341495`。** 只叠 B-121（沙箱注入 `TZ`，与系统提示词「当前日期」的时区同源；此前沙箱是 UTC，模型取到的时间慢 8 小时），用户 09-27 拍板随本班带上。**cherry-pick 到旧钉子上而不是前移到 main**：B-119 的「钉子不前移」仍成立，生产只比 `f92c6fae` 多这一个提交（6 个文件，全在 `services/orchestrator/`，无迁移、无配置键、不动沙箱镜像）。操作位（表头、Step B / C / F、Step A2 说明）已改到新钉子。
+>
 > **2026-09-25 第七次重钉：`139057c8` → `f92c6fae`。** 操作位（表头、Step B / C / F、§6）已全部改到新钉子；
 > 下面历史段落里出现的旧 sha 是记账位，按原判据放过。
 
-> **钉子纪律**：本单钉 `f92c6fae`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `e5341495`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
@@ -252,7 +254,7 @@
 
 > **本班时间点**：09-28 是周一，前一天是周日 → **两条只读盘点 SQL 建议 09-26（周五）就跑**：
 > ① 价目表若有缺价要在控制台补价、② 上限偏小的 Agent 要找负责人确认，这两件都需要工作日。
-> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。
+> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。`e5341495` 09-27 13:10 发到测试，只多 B-121 一处，按它的真栈验证（沙箱时钟 + 出方案）放行，不另等 24h。
 
 - [ ] **本机接线还在**（只看存在与权限，不读内容）：
 
@@ -608,14 +610,14 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 ### Step B — 发版（单段）
 
 ```sh
-git fetch origin main
-git checkout f92c6fae
+git fetch origin release/train2-tz
+git checkout e5341495
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `f92c6fae`
+- [ ] 确认 checkout 的是 `e5341495`（`git log -1` 标题是 `fix(sandbox): inject TZ … (B-121)`，父提交是 `f92c6fae`）
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
 - [ ] migrate Job `condition met`，且日志里出现**四条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`、`0157… -> 0158_run_completion`、`0158… -> 0159_skill_usage_viewed`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
@@ -633,7 +635,7 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `f92c6fae`（admin-ui 是 `f92c6fae-prod`）
+- [ ] 三个应用镜像都是 `e5341495`（admin-ui 是 `e5341495-prod`）
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -650,7 +652,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 必须在 **Step B 通过之后**（smoke 全绿、金丝雀 PASS，且 Step C 点检完）才做，理由（09-26 终审改，原先放在
 Step B 之前是错的）：新技能正文里的脚本路径全部写成 `$EXPERT_WORK_SKILLS_DIR/<技能>/scripts/…`，这个环境变量
-是 B-84（`233791e5`）才加的，随 `f92c6fae` 上生产；生产现版 `5775fbf3` 没有它，路径会展开成
+是 B-84（`233791e5`）才加的，随本班钉子（`f92c6fae` 起就有，`e5341495` 照带）上生产；生产现版 `5775fbf3` 没有它，路径会展开成
 `/docx/scripts/…`，脚本调用全部失败。若先导入技能再发版，从导入到 Step B 结束这段时间里 office 技能不可用，
 Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之后**（技能脚本依赖新沙箱镜像里的 LibreOffice 与
 预装库，第二层测试验的也是这份镜像）。
@@ -666,7 +668,7 @@ Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之�
 
 **用哪份源码打包**：Step B 钉的发版提交不含 `platform-skills/`，要用 office 技能合并进 main 的那个提交
 （`58c0f2a9` = #1678 + #1679，09-27 回填）打包导入。（发版钉子不前移是 09-26 拍板：office 技能的代码侧文案
-改动因此不随本班上生产，见 ROADMAP B-119。）此刻主仓库目录检出的是 `f92c6fae`，而且 Step B 留下了
+改动因此不随本班上生产，见 ROADMAP B-119。）此刻主仓库目录检出的是 `e5341495`，而且 Step B 留下了
 **未提交的 overlay newTag 改动**（Step F 要用），所以**不要在主仓库里 checkout**：把那个提交放进一个独立
 worktree，命令仍在主仓库目录里跑（要用仓库自己的 venv；在 worktree 目录里跑 `uv run` 会建一个没有依赖的
 空 venv）。`build.py` 的输入与 `dist/` 输出都按它自己所在的目录定位，与当前目录无关：
@@ -677,7 +679,7 @@ git worktree add /tmp/ps-office 58c0f2a9
 git -C /tmp/ps-office log -1 --oneline   # 确认就是它
 ```
 
-`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`f92c6fae`），与生产 pod 里跑的是
+`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`e5341495`），与生产 pod 里跑的是
 同一版，这正是要的。
 
 **导入前只读核对**：
@@ -797,7 +799,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle \
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag f92c6fae` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag e5341495` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、回滚命令。
 - [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 的「生产待发」改成已上线；本执行单补 §6 执行记录。
 

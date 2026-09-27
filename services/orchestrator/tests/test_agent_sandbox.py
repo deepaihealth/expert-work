@@ -74,6 +74,7 @@ from expert_work.persistence.sandbox_instance_store import (
     SandboxClaimContendedError,
     _missing_row_message,
 )
+from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.tools import agent_sandbox as agent_sandbox_module
 from orchestrator.tools.agent_sandbox import (
     _LAYOUT_MISMATCH_DESTROY_REASON,
@@ -1607,6 +1608,8 @@ async def test_exec_injects_pythonuserbase_when_agent_key_set() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="my-agent")
 
     assert sdk.sandbox.commands.envs_calls[-1] == {
+        # 平台级,每次 exec 都带(与提示词「当前日期」行同源)
+        "TZ": resolve_agent_timezone().key,
         "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
         # B-84 —— 同一条 per-agent 通道里的第二个值(技能文件根)
         "EXPERT_WORK_SKILLS_DIR": f"{SANDBOX_SKILLS_ROOT}/my-agent",
@@ -1615,15 +1618,15 @@ async def test_exec_injects_pythonuserbase_when_agent_key_set() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_omits_pythonuserbase_when_agent_key_unset() -> None:
-    """默认(未绑定 agent_key 的调用方,如老测试直调 exec)不该往 envs 里塞
-    任何东西 —— envs=None,不是 envs={}(避免猜 SDK 对空 dict 的语义)。"""
+    """默认(未绑定 agent_key 的调用方,如老测试直调 exec)不该塞任何 per-agent 的值;
+    只剩平台级的 ``TZ`` —— 沙箱的钟点与 agent 无关,谁调 exec 都该是同一个时区。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
     sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
 
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
 
-    assert sdk.sandbox.commands.envs_calls[-1] is None
+    assert sdk.sandbox.commands.envs_calls[-1] == {"TZ": resolve_agent_timezone().key}
 
 
 @pytest.mark.asyncio
@@ -1644,6 +1647,7 @@ async def test_exec_injects_expert_work_inputs_when_run_id_set() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, run_id=run_id)
 
     assert sdk.sandbox.commands.envs_calls[-1] == {
+        "TZ": resolve_agent_timezone().key,
         "EXPERT_WORK_INPUTS": inputs_abs_path(run_id),
         "EXPERT_WORK_INPUTS_DIR": inputs_abs_dir(run_id),
     }

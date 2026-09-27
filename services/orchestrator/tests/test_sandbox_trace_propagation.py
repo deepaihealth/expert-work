@@ -23,6 +23,7 @@ from expert_work.common.observability import (
     expert_work_span,
     init_tracing,
 )
+from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.tools.sandbox import HTTPSupervisorRuntime
 from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
 
@@ -185,6 +186,7 @@ async def test_exec_injects_agent_key_env_when_set() -> None:
     await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5, agent_key="my-agent")
 
     assert body["envs"] == {
+        "TZ": resolve_agent_timezone().key,
         "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
         # B-84 —— 两个后端送同一份 per-agent env,这条与
         # ``test_agent_sandbox.py`` 的云侧断言是一对
@@ -192,7 +194,7 @@ async def test_exec_injects_agent_key_env_when_set() -> None:
     }
 
 
-async def test_exec_omits_envs_when_agent_key_unset() -> None:
+async def test_exec_sends_only_platform_envs_when_agent_key_unset() -> None:
     import json as _json
 
     body: dict[str, object] = {}
@@ -208,7 +210,8 @@ async def test_exec_omits_envs_when_agent_key_unset() -> None:
     )
     await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5)
 
-    assert "envs" not in body  # back-compat: no key when there's nothing to inject
+    # No per-agent values without an agent_key; only the platform-wide ``TZ``.
+    assert body["envs"] == {"TZ": resolve_agent_timezone().key}
 
 
 async def test_exec_sends_agent_scoped_agent_root() -> None:
