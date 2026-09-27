@@ -2,7 +2,7 @@
 
 > **⚠️ 2026-09-25 改期说明**：本班 09-24 **没有发**（用户 09-20 拍板等 B-84 本波做完一起发，
 > 之后又陆续合入 B-64 / B-106 / B-102~104 / B-105）。**用户 09-25 拍板 09-28（周一）发**。文件名保留原日期，免得外链断；**发布日以表头为准**。
-> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）。
+> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）；同日第九次重钉到 main 的 `68a7b75f`，再带上 B-122 / B-123 与 B-119 的文案（见 §0.1）。
 >
 > 一次性文档，发完归档。通用流程在 [`production-release.md`](./production-release.md)，
 > **这份只列那一份不覆盖的东西**。上一班的单子在
@@ -12,8 +12,8 @@
 |---|---|
 | 发布日 | **2026-09-28（周一）** —— 用户 2026-09-25 拍板。原定 09-24（用户 09-17 拍板，原 09-22），09-20 用户拍板延期等 B-84 本波 |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`e5341495`** = `f92c6fae` + B-121 一个提交（分支 `release/train2-tz`，**不在 main 上**，发完前别删这个分支）。测试环境 2026-09-27 发过（`release.sh test` smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST、ai-health-plan 文件名为北京时间，#1681）。`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
-| 区间提交数 | **110**（`git log --oneline 5775fbf3..e5341495`；其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 1 个 B-121） |
+| 本版 tag | **`68a7b75f`**（**main**，#1683 的合并提交）= `f92c6fae` + 其后 main 上的 10 个提交：运行时代码只多 B-121（#1681，与第八次钉子 `e5341495` 同一份改动）、B-122（#1682）、B-123（#1683）与 B-119 的一处文案（#1678），其余是文档 / `platform-skills/`（不进镜像）/ test overlay。**不再用分支 `release/train2-tz`**（发版不从它取，留不留不影响本单）。测试环境 2026-09-27 发过（`release.sh test`，镜像 `68a7b75f`、admin-ui `68a7b75f-test`）：〔待填:测试环境验收结果〕。第八次钉子 `e5341495` 09-27 测试验过（smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST，#1681）；`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
+| 区间提交数 | **119**（`git log --oneline 5775fbf3..68a7b75f`；其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 `f92c6fae` 之后 main 上的 10 个 —— B-121 / B-122 / B-123 / office 技能两个 / 五个纯文档或 test overlay 记录） |
 | 数据库迁移 | **四条**（`0159` 为 09-20 之后追加）：`0159_skill_usage_viewed`（只放宽 `skill_run_usage.outcome` 的 CHECK，允许 `viewed`；不加表不加列不动数据）+ 原三条：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
 | 段数 | **单段**。有迁移但不是三段式：`0156` / `0158` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这些表上正常跑 |
 | 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉。`0159` 同理：旧代码从不写 `viewed`，放宽的 CHECK 对它无害；downgrade 会先删掉全部 `viewed` 行 |
@@ -171,12 +171,28 @@
 **没有新的手工集群对象、没有新 secret、没有新配置键**：09-20 之后追加的 35 个提交里 `infra/k8s/` 只动了
 `base/observability/rules/sli.yml` 与 test overlay；沙箱镜像没有重烤（钉子仍是 `7ac31957`，Step A 不变）。
 
+> **2026-09-27 第九次重钉：`e5341495` → `68a7b75f`（main HEAD）。** 用户 09-27 拍板：B-122（#1682，子智能体工具边界平台化）与 B-123（#1683，子 Agent / 子智能体构建也按租户 MCP 开通名单取工具）随本班上生产。钉子反正要动，用户选**直接前移到 main**，不再往 `release/train2-tz` 上 cherry-pick —— 这就同时推翻了 B-119 的「钉子不前移」，office 技能那处代码侧文案随本班上线（B-119 由本班销案，见 Step C 的核对项）。B-121 在 main 上是 `c632d3e3`（#1681 的 squash），与 `e5341495` 的改动逐字相同（`git diff e5341495 68a7b75f -- services/orchestrator/src/orchestrator/agent_timezone.py services/orchestrator/src/orchestrator/tools/sandbox.py` 为空），所以时区修复照带。
+>
+> 比第八次钉子多出的**运行时代码**（`git diff --stat e5341495 68a7b75f -- services packages infra`，不含测试）：
+>
+> | 条目 | 文件 |
+> |---|---|
+> | B-122 子智能体工具边界 | `orchestrator/tools/worker_policy.py`（新）、`tools/assembly.py`、`tools/mcp.py`、`tools/http.py`、`tools/spawn_worker.py`、`agent_factory.py`、`control_plane/subagent_runtime.py` |
+> | B-123 子代构建读 MCP 开通名单 | `control_plane/subagent_runtime.py` |
+> | B-119 文案 | `orchestrator/tools/sandbox_image_contract.py`（`SANDBOX_UNAVAILABLE_NOTE` 与注释，无功能影响） |
+>
+> 另有 `infra/k8s/overlays/test/kustomization.yaml`（test newTag 记录）与各自的测试。**无迁移**（区间内 `migrations/versions` 零命中，迁移仍是四条）、**无配置键、无新集群对象、不动沙箱镜像**；`platform-skills/` 不进任何镜像（Dockerfile 只 COPY `packages/` / `services/` 等），仍由 Step A2 单独导入。
+>
+> **B-122 出问题不用回滚镜像**：它自带运维回退阀 `EXPERT_WORK_WORKER_TOOL_POLICY=off`（`0` / `false` / `no` 同义），设上并重启 control-plane pod 后，子智能体的工具与父侧文案逐字节回到 B-122 之前。B-123 没有单独的阀，要退只能回滚镜像（§4）。
+>
+> 测试环境验收（09-27 发 `68a7b75f`）：〔待填:测试环境验收结果〕
+>
 > **2026-09-27 第八次重钉：`f92c6fae` → `e5341495`。** 只叠 B-121（沙箱注入 `TZ`，与系统提示词「当前日期」的时区同源；此前沙箱是 UTC，模型取到的时间慢 8 小时），用户 09-27 拍板随本班带上。**cherry-pick 到旧钉子上而不是前移到 main**：B-119 的「钉子不前移」仍成立，生产只比 `f92c6fae` 多这一个提交（6 个文件，全在 `services/orchestrator/`，无迁移、无配置键、不动沙箱镜像）。操作位（表头、Step B / C / F、Step A2 说明）已改到新钉子。
 >
 > **2026-09-25 第七次重钉：`139057c8` → `f92c6fae`。** 操作位（表头、Step B / C / F、§6）已全部改到新钉子；
 > 下面历史段落里出现的旧 sha 是记账位，按原判据放过。
 
-> **钉子纪律**：本单钉 `e5341495`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `68a7b75f`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
@@ -254,7 +270,7 @@
 
 > **本班时间点**：09-28 是周一，前一天是周日 → **两条只读盘点 SQL 建议 09-26（周五）就跑**：
 > ① 价目表若有缺价要在控制台补价、② 上限偏小的 Agent 要找负责人确认，这两件都需要工作日。
-> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。`e5341495` 09-27 13:10 发到测试，只多 B-121 一处，按它的真栈验证（沙箱时钟 + 出方案）放行，不另等 24h。
+> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。`e5341495` 09-27 13:10 发到测试，只多 B-121 一处，按它的真栈验证（沙箱时钟 + 出方案）放行，不另等 24h。`68a7b75f`（第九次重钉）同一原则：在验过的钉子上只多 B-122 / B-123 与 B-119 的一处文案，按它的真栈验收放行、不另等 24h —— 〔待填:测试环境验收结果〕。
 
 - [ ] **本机接线还在**（只看存在与权限，不读内容）：
 
@@ -610,14 +626,14 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 ### Step B — 发版（单段）
 
 ```sh
-git fetch origin release/train2-tz
-git checkout e5341495
+git fetch origin main
+git checkout 68a7b75f
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `e5341495`（`git log -1` 标题是 `fix(sandbox): inject TZ … (B-121)`，父提交是 `f92c6fae`）
+- [ ] 确认 checkout 的是 `68a7b75f`（`git log -1` 标题是 `fix(subagent): delegated builds apply the tenant MCP allowlist, like the main build (B-123) (#1683)`，父提交是 `b4d95243`（B-122 #1682）；`git merge-base --is-ancestor 68a7b75f origin/main` 退出码 0 = 在 main 上）
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
 - [ ] migrate Job `condition met`，且日志里出现**四条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`、`0157… -> 0158_run_completion`、`0158… -> 0159_skill_usage_viewed`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
@@ -635,7 +651,7 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `e5341495`（admin-ui 是 `e5341495-prod`）
+- [ ] 三个应用镜像都是 `68a7b75f`（admin-ui 是 `68a7b75f-prod`）
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -647,12 +663,34 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
       期望 `23 3 * * *  tz=Asia/Shanghai  suspend=false`。
 
 - [ ] **对话可用**（金丝雀之外再看一眼真实流量）：控制台随便打开一段最近会话，能正常加载。
+- [ ] **B-122 子智能体工具边界是开着的**（默认开；生产不该配回退阀）。只看变量名在不在、不打印任何取值：
+
+      ```sh
+      for p in $(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+          --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'); do
+        printf '%s: ' "$p"
+        kubectl -n expert-work exec "$p" -- python3 -c 'import os; from orchestrator.tools.worker_policy import WORKER_POLICY_ENV as k, worker_policy_enabled as f; print("set=", k in os.environ, " enabled=", f())'
+      done
+      ```
+
+      每个 pod 期望 `set= False  enabled= True`。`set= True` 说明有人在 ConfigMap / Secret / Deployment 里配了
+      `EXPERT_WORK_WORKER_TOOL_POLICY`，先弄清楚是谁、为什么，再决定是否保留。
+- [ ] **B-119 文案已上线**（销案判据）：生产 `SANDBOX_UNAVAILABLE_NOTE` 是新文案：
+
+      ```sh
+      POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+        --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+      kubectl -n expert-work exec "$POD" -- python3 -c 'from orchestrator.tools.sandbox_image_contract import SANDBOX_UNAVAILABLE_NOTE as n; print("需要生成 Word/PPT 时改用 Python 等价物" in n, "技能文档里的" in n)'
+      ```
+
+      期望 `True False`（新文案在、旧文案「技能文档里的 `npm install`」不在）。
+      过了就把 ROADMAP B-119 销案。
 
 ### Step A2 — 导入 office 技能（docx / pptx / xlsx / pdf，本版新增）
 
 必须在 **Step B 通过之后**（smoke 全绿、金丝雀 PASS，且 Step C 点检完）才做，理由（09-26 终审改，原先放在
 Step B 之前是错的）：新技能正文里的脚本路径全部写成 `$EXPERT_WORK_SKILLS_DIR/<技能>/scripts/…`，这个环境变量
-是 B-84（`233791e5`）才加的，随本班钉子（`f92c6fae` 起就有，`e5341495` 照带）上生产；生产现版 `5775fbf3` 没有它，路径会展开成
+是 B-84（`233791e5`）才加的，随本班钉子（`f92c6fae` 起就有，`68a7b75f` 照带）上生产；生产现版 `5775fbf3` 没有它，路径会展开成
 `/docx/scripts/…`，脚本调用全部失败。若先导入技能再发版，从导入到 Step B 结束这段时间里 office 技能不可用，
 Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之后**（技能脚本依赖新沙箱镜像里的 LibreOffice 与
 预装库，第二层测试验的也是这份镜像）。
@@ -666,12 +704,14 @@ Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之�
 本步跳过、保持生产原版不导入**——下面的命令只把 go 的技能对应的 `$PS/dist/<name>.skill`
 传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
 
-**用哪份源码打包**：Step B 钉的发版提交不含 `platform-skills/`，要用 office 技能合并进 main 的那个提交
-（`58c0f2a9` = #1678 + #1679，09-27 回填）打包导入。（发版钉子不前移是 09-26 拍板：office 技能的代码侧文案
-改动因此不随本班上生产，见 ROADMAP B-119。）此刻主仓库目录检出的是 `e5341495`，而且 Step B 留下了
-**未提交的 overlay newTag 改动**（Step F 要用），所以**不要在主仓库里 checkout**：把那个提交放进一个独立
-worktree，命令仍在主仓库目录里跑（要用仓库自己的 venv；在 worktree 目录里跑 `uv run` 会建一个没有依赖的
-空 venv）。`build.py` 的输入与 `dist/` 输出都按它自己所在的目录定位，与当前目录无关：
+**用哪份源码打包**：用 office 技能在 main 上的最后一个改动提交 `58c0f2a9`（#1678 + #1679，09-27 回填，
+即测试环境验收 GO 的那一份）打包导入。第九次重钉之后，Step B 检出的 `68a7b75f` 本身就包含它，而且
+`git diff 58c0f2a9 68a7b75f -- platform-skills/` 为空 —— 两者的技能源码逐字相同。（09-26 拍板的「发版钉子不前移」
+已被 09-27 第九次重钉推翻，office 技能的代码侧文案随本班上生产，见 ROADMAP B-119 与 Step C 的核对项。）
+仍然**用独立 worktree 打包、不直接用主仓库的 `platform-skills/`**：主仓库目录此刻有 Step B 留下的
+**未提交的 overlay newTag 改动**（Step F 要用），别在它上面 checkout；worktree 钉死提交，打包输入不随主仓库
+工作区变化，下面的回滚做法也是同一个形状。命令仍在主仓库目录里跑（要用仓库自己的 venv；在 worktree 目录里跑
+`uv run` 会建一个没有依赖的空 venv）。`build.py` 的输入与 `dist/` 输出都按它自己所在的目录定位，与当前目录无关：
 
 ```sh
 git fetch origin main
@@ -679,7 +719,7 @@ git worktree add /tmp/ps-office 58c0f2a9
 git -C /tmp/ps-office log -1 --oneline   # 确认就是它
 ```
 
-`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`e5341495`），与生产 pod 里跑的是
+`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`68a7b75f`），与生产 pod 里跑的是
 同一版，这正是要的。
 
 **导入前只读核对**：
@@ -799,9 +839,9 @@ uv run --no-sync python $PS/import_in_pod.py bundle \
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag e5341495` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag 68a7b75f` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、回滚命令。
-- [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 的「生产待发」改成已上线；本执行单补 §6 执行记录。
+- [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 / B-121 / B-122 / B-123 的「生产待发」改成已上线，B-119 按 Step C 核对结果销案；本执行单补 §6 执行记录。
 
 ---
 
@@ -838,6 +878,8 @@ tools/deploy/rollback.sh prod 5775fbf3
 
 其它回滚事实：
 
+- **只是 B-122（子智能体工具边界）出问题时不用走本节**：在 control-plane 上设 `EXPERT_WORK_WORKER_TOOL_POLICY=off`
+  并重启 control-plane pod，子智能体的工具与父侧文案逐字节回到 B-122 之前（见 §0.1 第九次重钉）。B-123 没有单独的阀。
 - **回滚会退回「发布打断在跑的对话」的老行为**（B-80 的修复在本版里）：回滚窗口内被
   打断的对话救不回来，只能让用户重发。要回滚得快，见 §2 第 2 条末尾的强杀写法 ——
   但注意那条只有**回滚前**（还是本版代码）才带接管效果；镜像换回旧版之后就没有了。
@@ -872,4 +914,5 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 次日首跑删除计数 | `________` |
 | §1 ① 价目表缺的模型 / 处理方式 | 09-27 核对 8 个全缺 → 用户拍板按官网标价补 7 个（DeepSeek 取高峰价），已写入生产（审计 actor `rate-card-bootstrap-2026-09-27`），复核 7 有；`qwen-plus`（重排序）不在模型目录、价目表拒收，接受记 0（ROADMAP B-120） |
 | §1 ② 会变化的上限（Agent / 值） | 09-27 核对：ai-health-plan 的 glm-5.3 / qwen3.8-max 与 deepseek-v4-pro 的 40960 开始生效（≥16000，测试已验）；豆包看图 medium 档位开始生效；4096 的 glm-5.3 / kimi-k3 不变；无「豆包开思考无档位」行。无需动作 |
+| Step C B-122 阀 / B-119 文案 | `set= ___ enabled= ___` / `____ ____`（期望 `False True` / `True False`） |
 | 与执行单不符之处 | `________` |
