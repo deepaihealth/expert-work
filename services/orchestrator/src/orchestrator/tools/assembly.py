@@ -19,7 +19,7 @@ import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from expert_work.persistence import ArtifactStore
 from expert_work.protocol import (
@@ -63,6 +63,7 @@ from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerBuildFn
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH, ChildAgentBuilder, SubAgentTool
 from orchestrator.tools.vision import AskImageTool, VLUsageMeter
 from orchestrator.tools.web_search import DEFAULT_MAX_RESULTS, TavilyClient, WebSearchTool
+from orchestrator.tools.worker_policy import READ_ONLY_HTTP_METHODS, WORKER_DENIED_BUILTINS
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.trajectory import TrajectoryRecorder
 
@@ -203,6 +204,12 @@ class ToolEnv:
     #: :class:`NullWorkspaceLock` (single process / tests); the control plane
     #: injects a Postgres advisory-lock implementation in production.
     workspace_lock: WorkspaceLock = field(default_factory=NullWorkspaceLock)
+    #: B-122 —— 这是一次动态子智能体(worker)构建。控制面在 ``make_worker_build_fn``
+    #: 里置 True(孙级复用同一个 env,自动带上);主 Agent、静态子 Agent 恒为 False。
+    #: 为 True 时:不注册 ``WORKER_DENIED_BUILTINS``(含基础能力 ``save_artifact``)、
+    #: MCP 只注册标了只读的、http 只放行读方法、不做「绑定落空」判定。
+    #: 进程内字段,**不是** manifest 字段(extra="forbid" 的回滚坑)。
+    worker_policy: bool = False
 
 
 async def build_tool_registry(
@@ -276,6 +283,8 @@ async def build_tool_registry(
     ]
     for entry in tool_specs:
         if isinstance(entry, BuiltinToolSpec):
+            if tool_env.worker_policy and entry.name in WORKER_DENIED_BUILTINS:
+                continue
             _register_builtin(
                 registry, entry, tool_env, skill_seed_files, figure_delivery=figure_delivery
             )
@@ -295,30 +304,34 @@ async def build_tool_registry(
     # 折成同一个 wire 名时,后注册的会把前者的绑定从表里清掉。所以判定分两步:先看落没
     # 落过地(``tool_missing``),再拿落地时的那个 wire 名回查活着的绑定表(``name_collision``)。
     # 把撞名报成「目录里没有这个工具」是假话:工具明明在。
-    landed = registry.landed_arg_bindings()
-    live = registry.arg_bindings()
-    # 一条绑定的参数**全部**漂没了时,``bind_tool_args`` 收到空表、同样会清掉那一项 ——
-    # 那不是撞名,而且上面已经报过 ``params_absent`` 了。同一条绑定只说一次。
-    configured_args: dict[tuple[str, str], set[str]] = {}
-    for b in all_arg_bindings:
-        configured_args.setdefault((b.server, b.tool), set()).update(b.args)
-    fully_drifted = {
-        (u.server, u.tool)
-        for u in registry.unmatched_arg_bindings()
-        if u.reason == "params_absent"
-        and set(u.params) == configured_args.get((u.server, u.tool), set())
-    }
-    for binding in all_arg_bindings:
-        key = (binding.server, binding.tool)
-        wire_name = landed.get(key)
-        if wire_name is None:
-            registry.note_unmatched_arg_binding(
-                binding.server, binding.tool, tuple(binding.args), reason="tool_missing"
-            )
-        elif wire_name not in live and key not in fully_drifted:
-            registry.note_unmatched_arg_binding(
-                binding.server, binding.tool, tuple(binding.args), reason="name_collision"
-            )
+    # B-122 —— worker 构建不做这项判定:它的 MCP 注册按只读滤过,被滤掉的写工具
+    # 上的绑定必然「没落地」,报出来就是对配置者说假话。同一份 manifest 的主构建
+    # (保存时的试建 + 每次主 run)照常判定,覆盖不丢。
+    if not tool_env.worker_policy:
+        landed = registry.landed_arg_bindings()
+        live = registry.arg_bindings()
+        # 一条绑定的参数**全部**漂没了时,``bind_tool_args`` 收到空表、同样会清掉那一项 ——
+        # 那不是撞名,而且上面已经报过 ``params_absent`` 了。同一条绑定只说一次。
+        configured_args: dict[tuple[str, str], set[str]] = {}
+        for b in all_arg_bindings:
+            configured_args.setdefault((b.server, b.tool), set()).update(b.args)
+        fully_drifted = {
+            (u.server, u.tool)
+            for u in registry.unmatched_arg_bindings()
+            if u.reason == "params_absent"
+            and set(u.params) == configured_args.get((u.server, u.tool), set())
+        }
+        for binding in all_arg_bindings:
+            key = (binding.server, binding.tool)
+            wire_name = landed.get(key)
+            if wire_name is None:
+                registry.note_unmatched_arg_binding(
+                    binding.server, binding.tool, tuple(binding.args), reason="tool_missing"
+                )
+            elif wire_name not in live and key not in fully_drifted:
+                registry.note_unmatched_arg_binding(
+                    binding.server, binding.tool, tuple(binding.args), reason="name_collision"
+                )
     _register_base_capabilities(
         registry, tool_env, skill_seed_files, figure_delivery=figure_delivery
     )
@@ -669,6 +682,8 @@ def _register_base_capabilities(
     dependency is missing (a real misconfiguration).
     """
     for name in BASE_CAPABILITY_BUILTINS:
+        if env.worker_policy and name in WORKER_DENIED_BUILTINS:
+            continue
         if registry.get(name) is not None:
             continue  # explicit manifest entry already registered it
         if name in ("save_artifact", "list_artifacts"):
@@ -845,10 +860,14 @@ def _register_http(registry: ToolRegistry, env: ToolEnv) -> None:
             "'http' tool declared but no allowlist provider is "
             "configured (ToolEnv.allowlist_provider)"
         )
+    http_kwargs: dict[str, Any] = (
+        {"allowed_methods": READ_ONLY_HTTP_METHODS} if env.worker_policy else {}
+    )
     registry.register(
         HTTPTool(
             allowlist_provider=env.allowlist_provider,
             denylist_provider=env.denylist_provider,
+            **http_kwargs,
         )
     )
 
@@ -909,6 +928,7 @@ async def _register_mcp(
                 allow_tools=allow,
                 deferred=True,
                 arg_bindings=bindings_for.get(server_name),
+                read_only_only=env.worker_policy,
             )
             # Platform reserves the server NAME unconditionally — even if
             # allow_tools filtered out all its tools this build — so a tenant
@@ -943,6 +963,7 @@ async def _register_mcp(
                 allow_tools=allow,
                 deferred=True,
                 arg_bindings=bindings_for.get(server_name),
+                read_only_only=env.worker_policy,
             )
             registered_servers.add(server_name)
 
@@ -967,6 +988,7 @@ async def _register_mcp(
                 allow_tools=allow,
                 deferred=True,
                 arg_bindings=bindings_for.get(server_name),
+                read_only_only=env.worker_policy,
             )
             registered_servers.add(server_name)
 
@@ -990,5 +1012,6 @@ async def _register_mcp(
                 allow_tools=allow,
                 deferred=True,
                 arg_bindings=bindings_for.get(server_name),
+                read_only_only=env.worker_policy,
             )
             registered_servers.add(server_name)
