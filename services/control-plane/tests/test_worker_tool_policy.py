@@ -88,6 +88,16 @@ def test_worker_prompt_valve_off_is_byte_identical() -> None:
     )
     assert w.spec.system_prompt.template == _worker_system_prompt("designer")
     assert "deliberately not available" not in w.spec.system_prompt.template
+    # Fix round 1 (Minor) — golden anchor copied verbatim from base commit
+    # b1c005fd's ``_worker_system_prompt`` (pre-B-122), independent of the
+    # function under test: the two lines above would drift together with an
+    # accidental edit to the base text, this would not.
+    assert w.spec.system_prompt.template.startswith(
+        "You are a worker sub-agent spawned to complete a single, focused subtask in isolation."
+    )
+    assert w.spec.system_prompt.template.endswith(
+        "the orchestrator can read the file, and nothing is lost or truncated in the retelling."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +124,11 @@ def build_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 @pytest.mark.asyncio
 async def test_worker_build_defaults_to_policy_on(build_calls: list[dict[str, Any]]) -> None:
+    """Fix round 1 (Important) — the parent declares every denied builtin, so
+    a build that forgets to thread ``worker_policy`` into
+    ``synthesize_worker_spec`` (or hardcodes it) is caught here: with
+    ``_KEPT``-only parents the spec comprehension is a no-op either way and
+    the gap stays invisible."""
     build_fn = make_worker_build_fn(
         secret_store=InMemorySecretStore(),
         checkpointer=InMemorySaver(),
@@ -122,9 +137,12 @@ async def test_worker_build_defaults_to_policy_on(build_calls: list[dict[str, An
         allowed_toolsets=[],
     )
 
-    await build_fn(_parent(_KEPT), tenant_id=uuid4(), role="probe", depth=1)
+    await build_fn(_parent(_DENIED + _KEPT), tenant_id=uuid4(), role="probe", depth=1)
 
     assert build_calls[0]["tool_env"].worker_policy is True
+    built_spec = build_calls[0]["spec"]
+    assert _names(built_spec) == {"web_search", "http"}
+    assert "deliberately not available to you" in built_spec.spec.system_prompt.template
 
 
 @pytest.mark.asyncio
@@ -132,7 +150,14 @@ async def test_worker_build_valve_off_reads_env_at_factory_creation(
     build_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The valve is read once when the factory is created — set it before
-    ``make_worker_build_fn`` is called, not before the build call."""
+    ``make_worker_build_fn`` is called, not before the build call.
+
+    Fix round 1 (Important) — same parent as the default-on test above: the
+    rollback shape must leave every denied builtin except ``manage_task`` in
+    place and the prompt byte-identical to the unrestricted one, not merely
+    leave ``ToolEnv.worker_policy`` flipped while the spec itself still gets
+    policed.
+    """
     monkeypatch.setenv("EXPERT_WORK_WORKER_TOOL_POLICY", "off")
     build_fn = make_worker_build_fn(
         secret_store=InMemorySecretStore(),
@@ -142,9 +167,15 @@ async def test_worker_build_valve_off_reads_env_at_factory_creation(
         allowed_toolsets=[],
     )
 
-    await build_fn(_parent(_KEPT), tenant_id=uuid4(), role="probe", depth=1)
+    await build_fn(_parent(_DENIED + _KEPT), tenant_id=uuid4(), role="probe", depth=1)
 
     assert build_calls[0]["tool_env"].worker_policy is False
+    built_spec = build_calls[0]["spec"]
+    assert _names(built_spec) == (WORKER_DENIED_BUILTINS - {"manage_task"}) | {
+        "web_search",
+        "http",
+    }
+    assert built_spec.spec.system_prompt.template == _worker_system_prompt("probe")
 
 
 @pytest.mark.asyncio
