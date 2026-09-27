@@ -21,7 +21,8 @@ def test_parent_block_tells_it_to_verify_register_and_take_over(
     monkeypatch.delenv(WORKER_POLICY_ENV, raising=False)
     block = _worker_delegation_block()
     assert block.startswith(_WORKER_DELEGATION_BLOCK)
-    assert "not deliverables until you register them yourself" in block
+    assert "not deliverables until they are registered as such" in block
+    assert "if you do not have that tool" in block
     assert "do that part yourself" in block
 
 

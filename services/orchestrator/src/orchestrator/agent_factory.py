@@ -1805,10 +1805,11 @@ _WORKER_DELEGATION_BLOCK = (
 _WORKER_POLICY_PARENT_ADDENDUM = (
     " A worker's final message is its own report: check its key claims — open "
     "the files it lists — before relying on them or passing them on. Files a "
-    "worker writes are not deliverables until you register them yourself with "
-    "save_artifact. If a worker fails, returns something unusable, or says it "
-    "needed a tool it does not have, do that part yourself instead of "
-    "abandoning the task."
+    "worker writes are not deliverables until they are registered as such — do "
+    "that yourself with save_artifact, or, if you do not have that tool, list "
+    "them in your own final message. If a worker fails, returns something "
+    "unusable, or says it needed a tool it does not have, do that part "
+    "yourself instead of abandoning the task."
 )
 
 
