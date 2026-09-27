@@ -64,6 +64,7 @@ check(
     next(s.shapes.title.text for s in pptx.Presentation("汇报 首.pptx").slides) == "第3页",
     "--after 0 = first",
 )
+check(res["new_slide_number"] == 1, f"--after 0 reports slide 1: {res}")
 run(
     ["python", script("pptx", "duplicate_slide.py"), "汇报 原件.pptx", "x.pptx", "--index", "9"],
     expect=1,
