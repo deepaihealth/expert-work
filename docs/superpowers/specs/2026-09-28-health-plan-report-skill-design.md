@@ -27,6 +27,17 @@ ai-health-plan 目前的成品链路是：模型先写方案 JSON，再**由模�
 
 ## 1. 目标与非目标
 
+### 技能边界（首要原则）
+
+本技能是**健康方案交付件的设计规范及其执行程序**，只负责「把已定稿的内容呈现成专业的 PPT / PDF」，
+**不参与健康方案的制定**：
+
+- 不拉数、不做任何健康判断、不生成 / 改写 / 补充 / 删减 / 重排任何健康内容；
+- 不内置任何健康业务规则（红线、阈值、措辞要求、板块取舍都属于调用方 Agent）；
+- 内容 JSON 的每个字、每个章节与积木的顺序都按调用方给的原样呈现；技能能改变的只有「长什么样」。
+
+下文任何条目与本原则冲突时，以本原则为准。
+
 ### 目标
 
 - 新增一个**平台技能** `health-plan-report`：把「已确定的健康管理方案内容」渲染成企业级的 PPT（16:9，可编辑）
@@ -44,6 +55,7 @@ ai-health-plan 目前的成品链路是：模型先写方案 JSON，再**由模�
 
 - 不做诊断、用药相关内容的承载与呈现（健康管理机构无权诊断与用药指导）。
 - 不做医学判断：状态、参考范围、目标值、阈值全部由调用方 Agent 给出，渲染器只呈现。
+- 不承载方案制定逻辑：技能正文与脚本中不出现健康红线、阈值、措辞规范等业务规则。
 - 不生成 HTML / H5 交付件；不生成二维码。
 - 不支持模型或用户改渲染代码；超出可调范围的诉求如实告知做不到。
 - 不迁移其它 Agent；本期只迁移 ai-health-plan。
@@ -89,7 +101,7 @@ style 层 1..N ─┤   3. resolve_style.py —— 叠加样式层 + 品牌锁�
 
 ```
 platform-skills/health-plan-report/
-  SKILL.md                 技能正文（何时用、流程、命令、可调项、大白话对照表、红线边界）
+  SKILL.md                 技能正文（何时用、流程、命令、可调项、大白话对照表、边界声明：只呈现不制定）
   skill.yaml               shared: [preview.py, convert.py, _cli.py, _office.py]（按需声明）
   reference/               懒加载参考文档
     content-schema.md      内容 JSON 全量字段说明 + 虚构完整样例
@@ -146,8 +158,9 @@ platform-skills/health-plan-report/
 
 | kind | 主要字段 | 默认呈现（方向 A） | 可选版式 |
 |---|---|---|---|
+| `summary` 方案摘要 | `items:[{label, text}]`（由调用方提供的「一页看懂」要点） | 摘要页（分栏要点） | 分栏、列表 |
 | `profile` 健康画像 | `items:[{name, value, unit, ref_low, ref_high, ref_text, position}]`，`position` ∈ `within/above/below/none`（由 Agent 给出） | 指标卡 + 参考范围条 + 中性对照标签（「在参考范围内 / 高于参考范围 / 低于参考范围」） | 卡片、表格 |
-| `issues` 核心问题 | `items:[{title, evidence, level}]`，`level` ∈ `focus/watch/info` | 编号问题卡，按等级排序 | 卡片、列表 |
+| `issues` 核心问题 | `items:[{title, evidence, level}]`，`level` ∈ `focus/watch/info` | 编号问题卡，按内容顺序，等级只影响标签颜色 | 卡片、列表 |
 | `trend` 指标趋势 | `metric, unit, points:[{date,value}], target_low, target_high, ref_text` | 折线 + 目标区间色带 + 首末值标注 | 折线、柱状 |
 | `goals` 阶段目标 | `items:[{name, current, target, unit, due, note}]` | 「现在 → 目标」对比卡 | 卡片、表格 |
 | `phases` 阶段计划 | `items:[{label, focus:[{area, text}]}]` | 周时间线 | 时间线、分栏卡片、表格 |
@@ -160,7 +173,7 @@ platform-skills/health-plan-report/
 | `habits` 生活习惯 | `items:[{name, current, target, how}]`（吸烟、饮酒、久坐等） | 现状 → 目标对比卡 | 卡片、表格 |
 | `material` 动作/产品素材 | `name, description, url, media_path?` | 素材卡；PPT 嵌 MP4（失败降级链接），PDF 可点击链接；`description` 原文呈现 | — |
 | `monitoring` 监测计划 | `items:[{item, frequency, timing, alert}]` | 监测表，`alert` 阈值高亮 | 表格、卡片 |
-| `referral` 就医提醒 | `text` | 红色警示框；自动排到所在章节最前；措辞由 Agent 给，只写「建议就医确认」类转介，不写病名 | — |
+| `referral` 就医提醒 | `text` | 红色警示框（醒目样式）；位置与文字均按内容 JSON 原样 | — |
 | `shopping` 采购清单 | `groups:[{name, items[]}]` | 分类清单 | 分栏、列表 |
 | `follow_up` 随访安排 | `items:[{label, value}]`（复评日期、联系人、反馈方式） | 键值卡 | 卡片、表格 |
 
@@ -196,8 +209,9 @@ platform-skills/health-plan-report/
 | 目录 | `toc` | `auto`（PPT ≥ 8 个章节、PDF ≥ 6 页自动加）/ 开 / 关 |
 | 章节图标 | `section.icons` | 开 / 关 |
 | 积木版式 | `blocks.<kind>.variant` 或 `blocks.<章节id>[.<积木id>].variant` | 见 §4.3 各积木可选版式；精确定位优先于按 kind 全局设置 |
-| 章节呈现 | `sections.<id>.hidden` / `.title` / `order` | 隐藏、改显示名、调整顺序（只影响呈现） |
 | 格式与纸张 | `output.formats` | `pptx` / `pdf` / 两者；PPT 固定 16:9，PDF 固定 A4 竖版 |
+
+章节的增删、改名、调序属于内容，由调用方改内容 JSON，不设样式键。
 
 ### 5.2 样式层与优先级
 
@@ -266,7 +280,7 @@ LOGO 文件缺失或无法解码：保留机构名称文字，记入降级警告
 
 ### 6.2 页面类型
 
-- PPT：封面、目录（按 §5.1 规则）、摘要（有 `issues`/`goals`/`profile` 时自动组一页「一页看懂」）、
+- PPT：封面、目录（按 §5.1 规则）、摘要（仅当内容含 `summary` 积木时，以摘要页版式呈现；技能不自动从其它章节提炼摘要）、
   章节内容页、结束页（随访安排 + 联系方式 + 免责声明）。内容页顶部 3px 品牌条（主色 60% + 强调色 40%），
   左上章节图标 + 页标题，右上「页码 / 总页数」，底部两行页脚（机构名称 ｜ 页脚署名；免责声明）。
 - PDF：封面、目录（自动）、摘要、连续正文（章节标题带图标与细线）、每页页眉（机构名 + 方案名）与页脚（署名、免责声明、页码）。
@@ -279,7 +293,6 @@ LOGO 文件缺失或无法解码：保留机构名称文字，记入降级警告
 - 放不下就拆页（标题加「（续）」），表格拆页时重复表头；**不缩字号、不压行距、不侵占页脚**。
 - 单个不可拆元素（一张卡片 / 一行表格）在一页放不下：报错并指出位置（内容需拆分），不静默截断。
 - 短章节合并：相邻章节内容高度之和不超过一页 85% 时合并到同页（章节标题降为页内小标题），避免「一页一句话」。
-- 就医提醒 `referral` 始终置于所在章节最前。
 
 ### 6.4 设计稿先行
 
@@ -311,7 +324,7 @@ LOGO 文件缺失或无法解码：保留机构名称文字，记入降级警告
 
 预览图（`shared/preview.py`）用于 Agent 看图与人工验收，不作为自动判据。
 
-## 8. ai-health-plan 迁移
+## 8. ai-health-plan 迁移（调用方侧改动，不属于技能本身）
 
 - 提示词：
   - 删除：「渲染锚 style/render_plan.py」全部规则（首次写脚本、语法自检、修复 2 轮、降级）、「默认视觉基线」
