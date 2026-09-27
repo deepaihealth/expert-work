@@ -44,3 +44,6 @@ eval-out/
 
 # SDD 工作区(brief / report / review package)——本地脚手架,不进仓库
 .superpowers/
+
+# platform-skills 打包产物(build.py 生成,不进仓库)
+platform-skills/dist/
