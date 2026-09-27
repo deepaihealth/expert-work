@@ -24,7 +24,12 @@ from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerCo
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
-from control_plane.runtime import make_provider_key_resolver, make_skill_resolver, resolve_defenses
+from control_plane.runtime import (
+    make_mcp_allowlist_provider,
+    make_provider_key_resolver,
+    make_skill_resolver,
+    resolve_defenses,
+)
 from control_plane.tenancy import TenantConfigService
 from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolProvider
@@ -430,6 +435,15 @@ def make_child_agent_builder(
             platform_pool = await platform_mcp_pool_provider()
             if platform_pool.names():
                 call_tool_env = replace(call_tool_env, platform_mcp_pool=platform_pool)
+        # B-123 —— apply the tenant's MCP allowlist, same gate as the main build
+        # (runtime.make_agent_builder): only when a platform pool (operator file
+        # pool or shared catalog) is attached; empty/unconfigured leaves it as is.
+        if tenant_config_service is not None and (
+            call_tool_env.mcp_pool is not None or call_tool_env.platform_mcp_pool is not None
+        ):
+            allowlist = await make_mcp_allowlist_provider(tenant_config_service)(tenant_id)
+            if allowlist:
+                call_tool_env = replace(call_tool_env, mcp_allowlist=tuple(allowlist))
         if tenant_mcp_pool_provider is not None:
             tenant_pool = await tenant_mcp_pool_provider(tenant_id)
             if tenant_pool.names():
@@ -661,6 +675,15 @@ def make_worker_build_fn(
             platform_pool = await platform_mcp_pool_provider()
             if platform_pool.names():
                 call_tool_env = replace(call_tool_env, platform_mcp_pool=platform_pool)
+        # B-123 —— apply the tenant's MCP allowlist, same gate as the main build
+        # (runtime.make_agent_builder): only when a platform pool (operator file
+        # pool or shared catalog) is attached; empty/unconfigured leaves it as is.
+        if tenant_config_service is not None and (
+            call_tool_env.mcp_pool is not None or call_tool_env.platform_mcp_pool is not None
+        ):
+            allowlist = await make_mcp_allowlist_provider(tenant_config_service)(tenant_id)
+            if allowlist:
+                call_tool_env = replace(call_tool_env, mcp_allowlist=tuple(allowlist))
         if tenant_mcp_pool_provider is not None:
             tenant_pool = await tenant_mcp_pool_provider(tenant_id)
             if tenant_pool.names():
