@@ -76,7 +76,7 @@ _TOOLS_SENTENCE_RESTRICTED = (
     "Workers carry your read-side tools — including read-only MCP tools — and "
     "can fetch data on their own, but they cannot register deliverables, write "
     "to systems outside the workspace, or change the agent's memory, skills or "
-    "schedules; keep those steps here. "
+    "schedules; those steps stay with the top-level agent. "
 )
 
 

@@ -105,8 +105,8 @@ class HTTPTool:
     client_factory: HTTPXClientFactory = field(default=_default_client_factory)
     body_char_cap: int = DEFAULT_BODY_CHAR_CAP
     header_char_cap: int = DEFAULT_HEADER_CHAR_CAP
-    #: B-122 —— 这个实例放行的方法。默认全部;worker 构建传只读集合
-    #: (``worker_policy.READ_ONLY_HTTP_METHODS``),schema 的 enum 随之收窄。
+    #: B-122 — methods this instance accepts. Defaults to all; worker builds
+    #: pass ``worker_policy.READ_ONLY_HTTP_METHODS`` and the schema enum narrows with it.
     allowed_methods: frozenset[str] = _ALLOWED_METHODS
 
     @property
@@ -171,7 +171,7 @@ class HTTPTool:
             raise ValueError(msg)
         upper = raw.strip().upper()
         if upper in _ALLOWED_METHODS and upper not in self.allowed_methods:
-            # B-122 —— 方法本身合法,只是这个实例不放行(worker):说清为什么、交给谁。
+            # B-122 — a valid method this instance withholds (worker): say why and who does it.
             msg = (
                 f"HTTP {upper} is not available to worker sub-agents: writes to "
                 "outside systems stay with the orchestrator. Report what should "
