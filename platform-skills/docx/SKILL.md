@@ -132,8 +132,16 @@ document.save("骨架 示例.docx")
 ## 检查成品
 
 1. 用 python-docx 重新打开成品，确认没坏：`docx.Document("成品.docx")` 不报错即可。
-2. `python $EXPERT_WORK_SKILLS_DIR/docx/scripts/preview.py 成品.docx` 出图。
-3. 用 `ask_image(path=...)` 看首页和信息最密的一页：中文是否方块、文字是否溢出 / 重叠、版式是否错乱。Agent 没配看图能力时跳过这一步，并在回复里写明「未做视觉检查」。
+2. 需要看图时先用 `python $EXPERT_WORK_SKILLS_DIR/docx/scripts/convert.py 成品.docx --to pdf --out-dir DIR`
+   转成 PDF（docx 的 read_page unit 是图清单条目号、不是页号，不转换定位不到想看的那一页），再用
+   `read_page(path=PDF 路径, units=[1, N])` 渲染首页和信息最密的一页（一次最多 3 页，read_page 自身限制）。
+3. `ask_image(path=同一 PDF 路径, unit=同一页号, question=...)` 逐页看：中文是否方块、文字是否溢出 / 重叠、
+   版式是否错乱。必须先 read_page 再 ask_image；不要把 preview.py 出的 PNG 路径交给 ask_image。Agent 没配
+   看图能力时跳过这一步，并在回复里写明「未做视觉检查」。
+
+需要把预览图当文件交给用户（例如缩略图交付）时才用
+`python $EXPERT_WORK_SKILLS_DIR/docx/scripts/preview.py 成品.docx --out-dir DIR` 出 PNG，走 save_artifact；
+这不是「检查」，检查用上面的 read_page + ask_image。
 
 ## 字体
 

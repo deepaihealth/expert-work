@@ -260,11 +260,26 @@ PDF 把字体**嵌入文件**，在任何电脑上都一样。沙箱里的字体
   - `preview.py IN [--out-dir DIR] [--pages 1-3] [--dpi 110]` → 打印 JSON：生成的 PNG 路径列表与总页数。
   - PDF 直接 `pdftoppm`；docx / pptx / xlsx 及老格式先经 `_office.py` 转 PDF 再转图。
   - 默认只出前 3 页（控制耗时与看图次数），`--pages all` 出全部。
-- **「检查成品」固定三步**（四份正文一字不差）：
+- **「检查成品」固定三步**（四份正文一字不差，除下面第 2 步里「转不转 PDF」那半句因格式而异）：
   1. 用对应库重新打开成品，确认没坏（给出一行校验代码）。
-  2. `preview.py` 出图。
-  3. 用 `ask_image(path=...)` 看首页和信息最密的一页：中文是否方块、文字是否溢出 / 重叠、版式是否错乱。
-     Agent 没配看图能力时跳过这一步，并在回复里写明「未做视觉检查」。
+  2. 需要看图时渲染成可看的页面：pdf / pptx 成品直接用；docx / xlsx 先用本技能的 `convert.py` 转成
+     PDF（pdf 技能没有 `convert.py`，也不需要）。再用 `read_page(path=<该 pdf/pptx 路径>,
+     units=[1, N])` 渲染首页和信息最密的一页（一次最多 `MAX_PAGES_PER_CALL` 页，今天是 3，见
+     `read_page.py`）。
+  3. `ask_image(path=<同一路径>, unit=<同一页号>, question=...)` 逐页看：中文是否方块、文字是否
+     溢出 / 重叠、版式是否错乱。必须先 `read_page` 再 `ask_image`；不许把 `preview.py` 出的 PNG
+     路径交给 `ask_image`——工作区文件路径不是 `ask_image` 认的引用。Agent 没配看图能力时跳过这一步，
+     并在回复里写明「未做视觉检查」。
+
+  **2026-09-27 补记（第三层验收发现，Ruling R14）**：上面这版三步替换了本节原来写的旧三步
+  （`preview.py` 出图 + 直接 `ask_image(path=...)`）。旧写法在真实平台上跑不通：`ask_image` 只认
+  `image_ref`（用户上传的图片）或 `path` + `unit`（`read_page` 已经渲染过的文档页），
+  `preview.py` 写进工作区的 PNG 两种它都不是（见 `services/orchestrator/.../tools/vision.py`
+  `_spec_with_short_form` / `_image_ref_from_args`）。8 次第三层验收里 7 次模型第一次调
+  `ask_image` 就报错（提示「第 1 页还没渲染」或「image ref must start with
+  expert_work://image/」），其中 1 次因此 `completed=false`，xlsx 那次靠临时把 PNG 拼成 PDF
+  才勉强看成。`preview.py` 脚本本身保留，四份正文各改成一句话：用户要预览图文件本身（例如缩略图
+  交付）时才用它，出图后走 `save_artifact`；这不是「检查」，检查一律走 `read_page` + `ask_image`。
 
 ## 5. 平台环境事实（四份正文统一写法）
 
