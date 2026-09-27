@@ -160,6 +160,7 @@ from orchestrator.tools.skill_seed import (
 )
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
+from orchestrator.tools.worker_policy import worker_policy_enabled
 from orchestrator.usage_metering import (
     MeteredLLMCaller,
     ScopedReranker,
@@ -1799,6 +1800,25 @@ _WORKER_DELEGATION_BLOCK = (
     "the worker sees none of this conversation."
 )
 
+#: B-122 —— worker 已拿不到登记交付物 / 对外写 / 改 Agent 自己的工具:父侧要知道
+#: 小结是自述、文件登记了才算交付、worker 做不了的自己接。阀关时不追加。
+_WORKER_POLICY_PARENT_ADDENDUM = (
+    " A worker's final message is its own report: check its key claims — open "
+    "the files it lists — before relying on them or passing them on. Files a "
+    "worker writes are not deliverables until you register them yourself with "
+    "save_artifact. If a worker fails, returns something unusable, or says it "
+    "needed a tool it does not have, do that part yourself instead of "
+    "abandoning the task."
+)
+
+
+def _worker_delegation_block() -> str:
+    """委派块全文;B-122 回滚阀关时逐字节等于 :data:`_WORKER_DELEGATION_BLOCK`。"""
+    if worker_policy_enabled():
+        return _WORKER_DELEGATION_BLOCK + _WORKER_POLICY_PARENT_ADDENDUM
+    return _WORKER_DELEGATION_BLOCK
+
+
 _TOOL_USE_ENFORCEMENT_BLOCK = (
     "You have tools that fetch real, current information and take real actions "
     "(web search, code execution, file and system access, and more). When the "
@@ -1974,7 +1994,7 @@ def _assemble_system_prompt(
     # spawn_worker. Appended last, after the advisory blocks, per the
     # append-a-section convention above.
     if worker_delegation:
-        pieces.append("\n\n# Subtask delegation\n" + _WORKER_DELEGATION_BLOCK)
+        pieces.append("\n\n# Subtask delegation\n" + _worker_delegation_block())
 
     return "".join(pieces)
 
