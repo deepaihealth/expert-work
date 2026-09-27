@@ -177,7 +177,7 @@
 >
 > - **修前探针（`68a7b75f`）**：子智能体 `exec_python` 读父的 style 文件报 `FileNotFoundError`；子智能体 `read_file` 读自己刚写的文件 `not_found`；父 `read_file` 读子智能体写的文件 `not_found`，`list_dir` 里也没有。
 > - **修后（分支树与 `c0789ca6` 逐字相同，09-27 约 19:00 发测试）**：四条全过 —— 子智能体 `read_file` 与 `exec_python` 都读到 `PARENT-OK`；子智能体读回自己写的 `WORKER-OK`；父 `read_file` 读到 `WORKER-OK`，`list_dir` 里有它。ai-health-plan 委派回归：父 `read_file("layout_design.md")`（子智能体写的版式设计）成功，交付物只有 json + docx，run success。smoke + 金丝雀 PASS。
-> - **`c0789ca6` 本身**：`release.sh test` 发过，smoke + 金丝雀 PASS。
+> - **`c0789ca6` 本身**：`release.sh test` 发过，smoke PASS；阶段 6 金丝雀**首跑 `FAIL transport: ReadError`**（rollout 刚完、旧 pod 正在摘除的窗口里连接被断；新 pod 零重启），原地单独重跑金丝雀 PASS（真 run + 产物下载）—— 按「一次 vs 每次」判为环境；随后在 `c0789ca6` 上重跑 B-124 四条检查全过。**发生产时若金丝雀首跑出同形态的 transport 错,先原地重跑一次再判**,别直接回滚。
 >
 > 下面第九次重钉段里的 `68a7b75f` 从此是记账位。
 >
