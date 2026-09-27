@@ -102,9 +102,9 @@ prs.save("骨架 示例.pptx")
 
 ## 版式网格与留白原则
 
-- 统一边距、同级元素对齐：页边距全篇固定；并列的卡片、文字块上下左右对齐，不靠肉眼估。
-- 一页一个视觉焦点：多个要点用项目符号纵向排列，不要平铺塞满。
-- 内容多就拆页，不缩字号：字号只在四级常量里选，塞不下就拆成两页，不靠缩字号硬塞。
+- 统一边距、同级元素对齐：页边距固定，卡片 / 文字块对齐，不靠肉眼估。
+- 一页一个视觉焦点：要点纵向排列，不平铺塞满。
+- 内容多就拆页、不缩字号：字号只在四级常量里选。
 
 ## 套用机构模板
 
@@ -132,17 +132,16 @@ ids.remove(sid)
 ids.insert(0, ids[-1])  # 把最后一页挪到最前
 ```
 
-删页放在加页之后做。删页后先保存，要再加页就重新打开——同一次打开里删了再 `add_slide`，新页会和
-已有页重名，静默丢页。删页 / 调序后必须**另存为新文件**，不要覆盖原件。
+删页放在加页之后做。删页后先保存，要再加页就重新打开——同一次打开里删了再 `add_slide`，新页会跟
+已有页重名、静默丢页。删页 / 调序后必须**另存新文件**，不要覆盖原件。
 
 ## 复制一页
 
 `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/duplicate_slide.py IN.pptx OUT.pptx --index N [--after M]`
 （页码从 1 开始；默认紧跟原页，`--after 0` = 放最前）。输出 `new_slide_number`、
-`shared_parts_warning`：图表 / SmartArt / 嵌入对象 / 嵌入文件这几类关系复制后**共享同一个数据部件**，
-改一页的这类数据会连带改到另一页，出现在告警里就要提醒用户；图片、视频、超链接各自独立，不受影响；
-演讲者备注各自拷贝一份，互不影响、也不出现在告警里；`notes_format_lost` 为 `true` 说明只复制了备注
-纯文本、格式没保留（极少见）。
+`shared_parts_warning`：图表 / SmartArt / 嵌入对象 / 嵌入文件这几类**共享同一个数据部件**，改一页会
+连带改另一页，出现告警要提醒用户；图片、视频、超链接各自独立、不受影响；演讲者备注各自拷贝、互不
+影响、不出现在告警里；`notes_format_lost` 为 `true` 说明备注只复制了纯文本、格式没保留（极少见）。
 
 ## 嵌视频
 
@@ -150,8 +149,7 @@ ids.insert(0, ids[-1])  # 把最后一页挪到最前
 slide.shapes.add_movie("演示.mp4", left, top, width, height, poster_frame_image="封面.png")
 ```
 
-必须给封面图（`poster_frame_image`），拿不到首帧就用说明性截图；尺寸不自动缩放，
-宽高要自己算好。
+必须给 `poster_frame_image`，拿不到首帧用说明性截图；尺寸不自动缩放，宽高自己算。
 
 ## 转换
 
@@ -161,25 +159,30 @@ slide.shapes.add_movie("演示.mp4", left, top, width, height, poster_frame_imag
 ## 检查成品
 
 1. 用 python-pptx 重新打开成品，确认没坏：`pptx.Presentation("成品.pptx")` 不报错即可。
-2. `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/preview.py 成品.pptx` 出图。
-3. 用 `ask_image(path=...)` 看首页和信息最密的一页：中文是否方块、文字是否溢出 / 重叠、版式是否
-   错乱。Agent 没配看图能力时跳过这一步，并在回复里写明「未做视觉检查」。
+2. 需要看图时直接用 `read_page(path=成品.pptx, units=[1, N])` 渲染首页和信息最密的一页（一次最多
+   3 页，read_page 自身限制）。
+3. `ask_image(path=成品.pptx, unit=同一页号, question=...)` 逐页看：中文是否方块、文字是否溢出 / 重叠、
+   版式是否错乱。必须先 read_page 再 ask_image；不要把 preview.py 出的 PNG 路径交给 ask_image。Agent 没
+   配看图能力时跳过这一步，并在回复里写明「未做视觉检查」。
+
+预览图要交给用户（例如缩略图交付）时才用 `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/preview.py
+成品.pptx --out-dir DIR` 出 PNG，走 save_artifact；这不是「检查」，检查用上面的 read_page + ask_image。
 
 ## 字体
 
-PowerPoint 只记字体名，客户打开时用他自己电脑上的字体，没装就被 Office 自动换掉；沙箱字体只影响
-预览图。默认中文用 `微软雅黑`、西文用 `Arial`（Windows / Mac 版 Office 普遍自带）。员工指定了某个
-字体时照写该字体名，并提醒一句：「客户电脑没装这个字体时，Office 会自动替换成别的字体。」品牌
-字体要求严格时，建议改交付 PDF（字体嵌入文件，谁打开都一样）。
+PowerPoint 只记字体名，客户打开时用自己电脑的字体，没装就被 Office 换掉；沙箱字体只影响预览图。
+默认中文用 `微软雅黑`、西文用 `Arial`（Windows / Mac 版 Office 普遍自带）。员工指定字体时照写，并
+提醒：「客户电脑没装这个字体时，Office 会自动替换。」品牌字体要求严格时建议改交付 PDF（字体嵌入
+文件，谁打开都一样）。
 
 ## 常见坑
 
 - `text_frame.text = "新文字"` 会冲掉原有字号、颜色等格式 → 改某个 `run.text`，或先记下格式再重设。
-- 原生图表在 LibreOffice 预览里的渲染效果可能和 PowerPoint 不一致 → 推荐 matplotlib 出图再
-  `add_picture` 插入。
+- 原生图表在 LibreOffice 预览里渲染效果可能和 PowerPoint 不一致 → 推荐 matplotlib 出图再 `add_picture`
+  插入。
 - 只设 `font.name`，中文仍是默认字体 → 必须同时设 `a:ea`（见 `set_cn_font`）。
-- `inspect_template.py` 里某个占位符的 left/top/width/height 是 `null` → 版式和母版都没单独设位置
-  （继承链到头了），按“没有固定位置”处理，不要当成 0。
+- `inspect_template.py` 里某个占位符的 left/top/width/height 是 `null` → 继承链到头了，按“没有固定
+  位置”处理，不要当成 0。
 
 ## 做不到
 

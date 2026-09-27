@@ -33,6 +33,12 @@ _JS_ROUTE = re.compile(r"npm install|npx\s|require\(|pptxgenjs|docx-js|\bnode\s+
 _SCRIPT_REF = re.compile(r"\$EXPERT_WORK_SKILLS_DIR/([a-z]+)/scripts/([A-Za-z0-9_]+\.py)")
 _ENV_BLOCK = re.compile(r"^## 环境\n(.*?)(?=^## )", re.S | re.M)
 _LIBS_LINE = re.compile(r"已预装、直接用、不要装：(.*?)；命令行 (.*?)；")  # noqa: RUF001
+# R14: the "检查成品" section must tell the model to render a real document page
+# with read_page before ever calling ask_image, and must never hand ask_image a
+# preview.py PNG path — ask_image only accepts an uploaded image_ref or a
+# read_page-rendered path+unit (see services/orchestrator/.../tools/vision.py).
+_CHECK_SECTION = re.compile(r"^## 检查成品\n(.*?)(?=^## )", re.S | re.M)
+_ASK_IMAGE_CALL = re.compile(r"ask_image\(([^)]*)\)")
 
 
 def _frontmatter(md: str) -> dict:
@@ -134,3 +140,27 @@ def test_env_block_claims_match_sandbox_contract(unpacked_skills):
         for tok in m.group(2).split("、")
     }
     assert claimed_bins <= bins, f"claimed but not preinstalled: {claimed_bins - bins}"
+
+
+@pytest.mark.parametrize("name", EXPECTED_SKILLS)
+def test_check_output_section_renders_with_read_page_before_ask_image(unpacked_skills, name):
+    """R14 — a workspace preview.py PNG is not viewable by ask_image on the real platform:
+
+    it only accepts an uploaded ``image_ref`` or a ``path`` + ``unit`` that ``read_page``
+    already rendered. Live acceptance hit this in 7/8 runs (first ``ask_image`` call failed).
+    """
+    body = (unpacked_skills / name / "SKILL.md").read_text(encoding="utf-8")
+    m = _CHECK_SECTION.search(body)
+    assert m, f"{name}: no '## 检查成品' section"
+    section = m.group(1)
+    read_page_pos = section.find("read_page(")
+    ask_image_pos = section.find("ask_image(")
+    assert read_page_pos != -1, f"{name}: 检查成品 never calls read_page"
+    assert ask_image_pos != -1, f"{name}: 检查成品 never calls ask_image"
+    assert read_page_pos < ask_image_pos, (
+        f"{name}: ask_image is called before read_page in 检查成品"
+    )
+    calls = _ASK_IMAGE_CALL.findall(section)
+    assert calls, f"{name}: no ask_image(...) call found in 检查成品"
+    for call in calls:
+        assert ".png" not in call.lower(), f"{name}: ask_image given a .png path: {call}"
