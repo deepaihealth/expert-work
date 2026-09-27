@@ -29,15 +29,16 @@ async def test_bind_agent_key_injects_key_into_exec() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bind_agent_key_overrides_caller_supplied_key() -> None:
+async def test_bind_agent_key_yields_to_caller_supplied_key() -> None:
     inner = RecordingSandboxRuntime()
     client = bind_agent_key(inner, "my-agent")
     sandbox_id = await client.acquire(tenant_id=uuid4(), thread_id="t-1")
 
     await client.exec(sandbox_id=sandbox_id, code="print(1)", timeout_s=5, agent_key="other")
 
-    # The build-time binding wins over anything a caller passes.
-    assert inner.exec_agent_keys == ["my-agent"]
+    # B-124 —— 调用方(run_in_sandbox 传 ctx.agent_key)的 key 优先;绑定的只是兜底。
+    # 委派子代的 ctx.agent_key 是父的,旧的「绑定优先」让子代 exec 进了自己的目录。
+    assert inner.exec_agent_keys == ["other"]
 
 
 @pytest.mark.asyncio

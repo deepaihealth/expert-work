@@ -343,9 +343,10 @@ class SandboxRuntime(Protocol):
         ``agent_key`` (spec 决策 10) injects
         ``PYTHONUSERBASE=SANDBOX_AGENTS_ROOT/<agent_key>`` so a ``pip install
         --user`` stays isolated per agent even when two agents share one warm
-        sandbox; see :func:`agent_key_envs`. Normally injected by
-        :class:`_AgentKeyBindingClient`, so callers (``run_in_sandbox``) leave
-        it unset (``""`` → no override).
+        sandbox; see :func:`agent_key_envs`. ``run_in_sandbox`` passes
+        ``ctx.agent_key`` (B-124 —— 委派子代那里是父的 key);空串时
+        :class:`_AgentKeyBindingClient` 补上构建期绑的 key(``""`` 到了后端 →
+        no override).
 
         ``run_id``(B-61 §4.4)非 ``None`` 时同样经 :func:`agent_key_envs` 注入
         ``EXPERT_WORK_INPUTS``。与 ``agent_key`` 不同,它不经过任何 binding
@@ -680,7 +681,8 @@ def bind_egress(client: SandboxRuntime, egress: EgressContext | None) -> Sandbox
 @dataclass
 class _AgentKeyBindingClient:
     """Wraps a :class:`SandboxRuntime`, injecting a fixed ``agent_key`` into
-    every ``exec`` (spec 决策 10 — ``PYTHONUSERBASE`` per-agent isolation).
+    every ``exec`` the caller didn't key itself (spec 决策 10 —
+    ``PYTHONUSERBASE`` per-agent isolation; B-124 —— 调用方的 key 优先).
 
     Bound once per agent build (``agent_factory``) around the shared sandbox
     client — mirrors :class:`_EgressBindingClient`, but binds into ``exec``
@@ -722,14 +724,18 @@ class _AgentKeyBindingClient:
         agent_key: str = "",
         run_id: UUID | None = None,
     ) -> SandboxOutcome:
-        # The bound key wins — callers (run_in_sandbox) don't supply their own.
+        # B-124 —— 调用方给了 key 就用调用方的:``run_in_sandbox`` 传 ``ctx.agent_key``,
+        # 委派出去的子代那里是**父的** key(``_child_run._child_config``),与宿主侧
+        # read_file / list_dir 同一个口径;绑定的 key 是子代自己 spec 名算出来的,
+        # 用它 exec 就把子代的写落进一个父看不见的目录。绑定的 key 只做兜底,留给
+        # 没有 ctx.agent_key 的调用方(inputs 节点 / 合成评测);主 run 两者相等。
         # run_id isn't owned by this wrapper (it's per-call, not per-agent-build) —
         # passthrough, same reasoning as _EgressBindingClient (B-61 §4.4).
         return await self.inner.exec(
             sandbox_id=sandbox_id,
             code=code,
             timeout_s=timeout_s,
-            agent_key=self.agent_key,
+            agent_key=agent_key or self.agent_key,
             run_id=run_id,
         )
 
@@ -748,6 +754,22 @@ def bind_agent_key(client: SandboxRuntime, agent_key: str) -> SandboxRuntime:
     if not agent_key:
         return client
     return _AgentKeyBindingClient(inner=client, agent_key=agent_key)
+
+
+def _anchor_seed_files(
+    seed_files: tuple[tuple[str, bytes], ...], agent_key: str
+) -> tuple[tuple[str, bytes], ...]:
+    """B-124 —— 把技能种子挪到本次 exec 用的那个 key 底下。
+
+    种子是构建期按 ``sanitize_agent_key(spec 名)`` 生成的(``<key>/<技能名>/…``,
+    见 ``build_skill_seed_files``);exec 却按 ``ctx.agent_key`` 注入
+    ``EXPERT_WORK_SKILLS_DIR=/opt/skills/<key>``。主 run 两者相等,这里原样返回;
+    子代的 ctx.agent_key 是父的,不挪的话环境变量指向的目录里没有子代的技能文件。
+    空 key(没绑 agent 的调用方)不动 —— exec 那边也回落到构建期的 key。
+    """
+    if not agent_key:
+        return seed_files
+    return tuple((f"{agent_key}/{rel.partition('/')[2]}", data) for rel, data in seed_files)
 
 
 async def run_in_sandbox(
@@ -786,6 +808,8 @@ async def run_in_sandbox(
         msg = f"{tool_label} requires a tenant binding (ctx.tenant_id)"
         raise ToolBlockedError(msg)
     thread_id = str(ctx.run_id) if ctx.run_id is not None else fallback_thread_id
+    # B-124 —— 技能种子、``EXPERT_WORK_SKILLS_DIR``、``/workspace`` 视图都跟 ctx.agent_key 走。
+    seed_files = _anchor_seed_files(seed_files, ctx.agent_key)
     # Durability is automatic for user-scoped runs: pass through the run's
     # user so the supervisor mounts that user's persistent workspace volume;
     # no ``user_id`` (e.g. a system run) → an ephemeral tmpfs.
@@ -810,6 +834,7 @@ async def run_in_sandbox(
             sandbox_id=sandbox_id,
             code=code,
             timeout_s=timeout_s,
+            agent_key=ctx.agent_key,
             run_id=ctx.inputs_run_id or ctx.run_id,
         )
     except asyncio.CancelledError:
