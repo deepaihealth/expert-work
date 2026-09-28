@@ -444,11 +444,67 @@ def _check_ids(content: dict, errs: list[ContentError]) -> None:
                 bseen.add(bid)
 
 
+_KCAL = ("kcal", re.compile(r"kcal|千卡|大卡|卡路里", re.IGNORECASE))
+_GRAM = ("g", re.compile(r"(?<![a-z])g(?![a-z])|克", re.IGNORECASE))
+_PCT = ("%", re.compile(r"[%％]"))  # noqa: RUF001
+
+
+def _implicit_units(kind: str, blk: dict) -> Iterator[tuple[str, Any, tuple[str, re.Pattern]]]:
+    """(relative path, value, unit) for every field the layout prints with its own unit."""
+    if kind == "nutrition":
+        if "energy_kcal" in blk:
+            yield "energy_kcal", blk["energy_kcal"], _KCAL
+        for i, m in enumerate(blk.get("macros") or []):
+            for key, unit in (("grams", _GRAM), ("percent", _PCT)):
+                if key in m:
+                    yield f"macros[{i}].{key}", m[key], unit
+        for i, m in enumerate(blk.get("meals") or []):
+            if "percent" in m:
+                yield f"meals[{i}].percent", m["percent"], _PCT
+    elif kind == "meal_plan":
+        for ti, tpl in enumerate(blk["templates"]):
+            for mi, meal in enumerate(tpl["meals"]):
+                if "kcal" in meal:
+                    yield f"templates[{ti}].meals[{mi}].kcal", meal["kcal"], _KCAL
+
+
+def _explicit_units(kind: str, blk: dict) -> Iterator[tuple[str, Any, str]]:
+    """(relative path, value, unit) for values that sit beside the item's own ``unit``."""
+    keys = {"profile": ("value",), "goals": ("current", "target")}.get(kind, ())
+    for i, it in enumerate((blk.get("items") or []) if keys else []):
+        for key in keys:
+            if key in it and it.get("unit"):
+                yield f"items[{i}].{key}", it[key], it["unit"]
+
+
+def _unit_msg(value: str, unit: str, pattern: re.Pattern) -> str:
+    bare = re.sub(r"\s+", " ", pattern.sub("", value)).strip()
+    return (
+        f"数值里写了单位「{unit}」，版式会自动加上，会显示成重复单位；"  # noqa: RUF001
+        f"这里只写数值，例如「{bare}」"  # noqa: RUF001
+    )
+
+
+def _check_units(content: dict, errs: list[ContentError]) -> None:
+    for si, sec in enumerate(content["sections"]):
+        for bi, blk in enumerate(sec["blocks"]):
+            base = f"sections[{si}].blocks[{bi}]"
+            for rel, value, (unit, pattern) in _implicit_units(blk["kind"], blk):
+                if isinstance(value, str) and pattern.search(value):
+                    errs.append(ContentError(f"{base}.{rel}", _unit_msg(value, unit, pattern)))
+            for rel, value, unit in _explicit_units(blk["kind"], blk):
+                pattern = re.compile(re.escape(unit.strip()), re.IGNORECASE)
+                if isinstance(value, str) and pattern.search(value):
+                    errs.append(ContentError(f"{base}.{rel}", _unit_msg(value, unit, pattern)))
+
+
 def validate_content(content: Any) -> list[ContentError]:
     errs: list[ContentError] = []
     _check(content, TOP, "", errs)
     if isinstance(content, dict):
         _check_ids(content, errs)
+    if not errs:  # the unit check walks a structure the schema has already vouched for
+        _check_units(content, errs)
     return errs
 
 

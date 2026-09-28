@@ -153,3 +153,16 @@ def test_package_is_text_only(pkg):
     with zipfile.ZipFile(pkg) as z:
         for name in z.namelist():
             z.read(name).decode("utf-8")
+
+
+# The platform replaces a tool result longer than 12,000 characters with a 3,000-character
+# preview (orchestrator ``EXTERNALIZE_MIN_CHARS``), measured before any prompt wrapping; a doc
+# over it reaches the agent cut to its head and tail. SKILL.md additionally carries the
+# supporting-file list (~1,300 characters today), hence the shared 11,000 ceiling.
+DOC_CHAR_CEILING = 11_000
+
+
+def test_every_doc_reaches_the_agent_whole(root):
+    docs = [root / "SKILL.md", *sorted((root / "reference").glob("*.md"))]
+    over = {d.name: n for d in docs if (n := len(d.read_text(encoding="utf-8"))) > DOC_CHAR_CEILING}
+    assert len(docs) >= 4 and not over, over
