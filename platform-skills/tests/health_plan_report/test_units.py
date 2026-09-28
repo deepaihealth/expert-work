@@ -22,6 +22,12 @@ def _unit_errors(sample: dict) -> list[str]:
         ("nutrition", lambda b: b.update(energy_kcal="约1600大卡"), "energy_kcal"),
         ("nutrition", lambda b: b["macros"][0].update(grams="185g"), "grams"),
         ("nutrition", lambda b: b["macros"][0].update(grams="约 185 克"), "grams"),
+        ("meal_plan", lambda b: b["templates"][0]["meals"][0].update(kcal="约400卡"), "kcal"),
+        ("meal_plan", lambda b: b["templates"][0]["meals"][0].update(kcal="400 Cal"), "kcal"),
+        ("nutrition", lambda b: b["macros"][0].update(grams="≥1.2 g/kg"), "grams"),
+        ("nutrition", lambda b: b["macros"][0].update(grams="500 mg"), "grams"),
+        ("nutrition", lambda b: b["macros"][0].update(grams="1.5 公斤"), "grams"),
+        ("nutrition", lambda b: b["meals"][0].update(percent="30%"), "percent"),
         ("nutrition", lambda b: b["macros"][0].update(percent="45%"), "percent"),
         ("nutrition", lambda b: b["macros"][0].update(percent="45％"), "percent"),  # noqa: RUF001
     ],
@@ -69,3 +75,18 @@ def test_message_tells_what_to_write(sample):
     _block(sample, "meal_plan")["templates"][0]["meals"][0]["kcal"] = "约 400 kcal"
     (err,) = [e for e in validate_content(sample) if "单位" in e.message]
     assert "约 400" in err.message and "kcal" in err.message
+
+
+def test_latin_unit_matches_whole_words_only(sample):
+    item = _block(sample, "profile")["items"][0]
+    item["unit"] = "L"
+    item["value"] = "见 LDL 说明"
+    assert _unit_errors(sample) == []
+    item["value"] = "1.2 L"
+    assert len(_unit_errors(sample)) == 1
+
+
+def test_no_misleading_example_when_the_bare_value_is_not_a_number(sample):
+    _block(sample, "nutrition")["macros"][0]["grams"] = "≥1.2 g/kg"
+    (err,) = [e for e in validate_content(sample) if "单位" in e.message]
+    assert "例如" not in err.message

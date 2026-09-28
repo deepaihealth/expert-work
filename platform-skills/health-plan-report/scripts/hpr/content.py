@@ -444,8 +444,8 @@ def _check_ids(content: dict, errs: list[ContentError]) -> None:
                 bseen.add(bid)
 
 
-_KCAL = ("kcal", re.compile(r"kcal|千卡|大卡|卡路里", re.IGNORECASE))
-_GRAM = ("g", re.compile(r"(?<![a-z])g(?![a-z])|克", re.IGNORECASE))
+_KCAL = ("kcal", re.compile(r"(?<![a-z])k?cal(?![a-z])|卡", re.IGNORECASE))  # 千卡/大卡/卡路里/卡
+_GRAM = ("g", re.compile(r"(?<![a-z])[mkµμ]?g(?![a-z])|克|斤", re.IGNORECASE))  # mg/kg/毫克/公斤…
 _PCT = ("%", re.compile(r"[%％]"))  # noqa: RUF001
 
 
@@ -478,11 +478,19 @@ def _explicit_units(kind: str, blk: dict) -> Iterator[tuple[str, Any, str]]:
 
 
 def _unit_msg(value: str, unit: str, pattern: re.Pattern) -> str:
+    msg = f"数值里写了单位「{unit}」，版式会自动加上，会显示成重复单位；这里只写数值"  # noqa: RUF001
     bare = re.sub(r"\s+", " ", pattern.sub("", value)).strip()
-    return (
-        f"数值里写了单位「{unit}」，版式会自动加上，会显示成重复单位；"  # noqa: RUF001
-        f"这里只写数值，例如「{bare}」"  # noqa: RUF001
-    )
+    if bare and not re.search(r"[A-Za-zµμ/]", bare):  # "1.2 g/kg" minus g is no example
+        msg += f"，例如「{bare}」"  # noqa: RUF001
+    return msg
+
+
+def _unit_pattern(unit: str) -> re.Pattern:
+    """A latin unit matches as a whole word ("L" is not inside "LDL"); others as written."""
+    u = re.escape(unit.strip())
+    if unit.strip().isascii() and unit.strip()[:1].isalpha():
+        u = rf"(?<![A-Za-z]){u}(?![A-Za-z])"
+    return re.compile(u, re.IGNORECASE)
 
 
 def _check_units(content: dict, errs: list[ContentError]) -> None:
@@ -493,7 +501,7 @@ def _check_units(content: dict, errs: list[ContentError]) -> None:
                 if isinstance(value, str) and pattern.search(value):
                     errs.append(ContentError(f"{base}.{rel}", _unit_msg(value, unit, pattern)))
             for rel, value, unit in _explicit_units(blk["kind"], blk):
-                pattern = re.compile(re.escape(unit.strip()), re.IGNORECASE)
+                pattern = _unit_pattern(unit)
                 if isinstance(value, str) and pattern.search(value):
                     errs.append(ContentError(f"{base}.{rel}", _unit_msg(value, unit, pattern)))
 

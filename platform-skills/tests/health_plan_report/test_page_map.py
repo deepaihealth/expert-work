@@ -93,6 +93,7 @@ def test_pdf_html_marks_every_section_end_and_the_toc(sample, tmp_path):
     assert html.count('<div id="end-') == len(sample["sections"]) + 1  # + the client band
     for s in sample["sections"]:
         start = html.index(f'id="sec-{s["id"]}"')
-        head = html.index(f'<h2 id="head-sec-{s["id"]}"')
+        head = html.index(f'<span id="head-sec-{s["id"]}">')
+        assert f'href="#head-sec-{s["id"]}"' in html  # the TOC number is the heading's page
         end = html.index(f'id="end-sec-{s["id"]}"')
         assert start < head < end < html.index("</section>", start)

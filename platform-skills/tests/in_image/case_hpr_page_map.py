@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+from itertools import pairwise
 from pathlib import Path
 
 import pdfplumber
@@ -61,6 +62,14 @@ for scale in ("standard", "large"):
     check(res["ok"], f"{scale} renders")
     verify(res["page_map"]["pptx"], pptx_pages(res["files"]["pptx"]), f"pptx/{scale}")
     verify(res["page_map"]["pdf"], pdf_pages(res["files"]["pdf"]), f"pdf/{scale}")
+    sections = [e for e in res["page_map"]["pdf"] if "section" in e]
+    for a, b in pairwise(sections):
+        check(a["pages"][-1] <= b["pages"][0], f"pdf/{scale} {a['title']} ends before next starts")
+    with pdfplumber.open(res["files"]["pdf"]) as pdf:
+        toc = pdf.pages[1].extract_text() or ""
+    for i, e in enumerate(sections, start=1):
+        m = re.search(rf"{i:02d}\s*{re.escape(e['title'])}\.*\s*(\d+)", toc)
+        check(bool(m) and int(m.group(1)) == e["pages"][0], f"pdf/{scale} TOC page of {e['title']}")
     multi = [e for e in res["page_map"]["pdf"] if len(e["pages"]) > 1]
     check(bool(multi), f"pdf/{scale} has a section spanning pages (end markers exercised)")
-print("OK")
+print("PASS case_hpr_page_map")

@@ -385,7 +385,7 @@ def _band(content: dict, style: dict, t: Theme) -> str:
     )
     return (
         f'<section class="sec info" id="{BAND_ANCHOR}">'
-        f'<h2 id="{PDF_HEAD_PREFIX}{BAND_ANCHOR}">{icon}{CLIENT_BAND_TITLE}</h2>'
+        f'<h2>{icon}<span id="{PDF_HEAD_PREFIX}{BAND_ANCHOR}">{CLIENT_BAND_TITLE}</span></h2>'
         f'<div class="band" style="grid-template-columns:{cols}">{cells}</div>'
         f"{_end_mark(BAND_ANCHOR)}</section>"
     )
@@ -535,7 +535,7 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
     ]
     if style["toc"] == "on" or (style["toc"] == "auto" and len(content["sections"]) >= 6):
         links = "".join(
-            f'<a href="#sec-{e(s["id"])}">{i:02d}　{e(s["title"])}</a>'
+            f'<a href="#{PDF_HEAD_PREFIX}sec-{e(s["id"])}">{i:02d}　{e(s["title"])}</a>'
             for i, s in enumerate(content["sections"], start=1)
         )
         parts.append(f'<section class="toc" id="{PDF_TOC_ID}"><h2>目录</h2>{links}</section>')
@@ -550,7 +550,8 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
         body = _body(items, t, base_dir)
         parts.append(
             f'<section class="sec" id="sec-{e(sec["id"])}">'
-            f'<h2 id="{PDF_HEAD_PREFIX}sec-{e(sec["id"])}">{icon}{e(sec["title"])}</h2>'
+            f'<h2>{icon}<span id="{PDF_HEAD_PREFIX}sec-{e(sec["id"])}">'
+            f"{e(sec['title'])}</span></h2>"
             f"{body}{_end_mark('sec-' + e(sec['id']))}</section>"
         )
     parts.append("</body></html>")

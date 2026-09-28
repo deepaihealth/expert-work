@@ -49,10 +49,12 @@ def pptx_page_map(
 
 def pdf_page_map(content: dict, document: Any, band_anchor: str) -> list[dict[str, Any]]:
     """``document`` is a rendered weasyprint Document. A section starts on the page that shows
-    its heading (``head-<id>``) and ends on the page of its empty end marker (``end-<id>``).
-    When a heading moves on with what follows it, weasyprint still leaves an empty fragment of
-    the section and of the heading, anchors included, at the foot of the page before (seen in
-    the real image) -- so a heading counts on the last page it is anchored on."""
+    its heading text (``head-<id>``, an inline span, the same anchor the TOC numbers use) and
+    ends on the page of its empty end marker (``end-<id>``). Block boxes are no anchor: when a
+    heading moves on with what follows it, weasyprint leaves an empty, anchored fragment of the
+    section and of the flex ``h2`` at the foot of the page before (seen in the real image, where
+    it also put the TOC one page early). The heading still counts on the last page it is
+    anchored on, in case a fragment ever carries the span."""
     first: dict[str, int] = {}
     last: dict[str, int] = {}
     for n, page in enumerate(document.pages, start=1):
