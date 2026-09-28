@@ -60,4 +60,15 @@ theme = build_theme(resolve([], SAMPLE).style, "pdf")
 q = qa_pdf(Path("out/phases.pdf"), [*required_texts(ph), once], theme)
 check(q["missing"] == [once], f"PDF gate must count occurrences: {q['missing']}")
 
+# I3: the PDF bar trend prints every value, negatives included
+neg = json.loads(json.dumps(SAMPLE))
+tr = blocks(neg, "trend")[0]
+tr["points"] = [{"date": d, "value": v} for d, v in (("W1", -0.8), ("W2", -1.2), ("W3", 0.3))]
+r = render(neg, "negbar", fmt="pdf", style={"blocks.trend.variant": "bar"})
+check(r["ok"] is True, f"negative bar: {r}")
+from pypdf import PdfReader  # noqa: E402
+
+text = "".join("".join((p.extract_text() or "").split()) for p in PdfReader("out/negbar.pdf").pages)
+check(all(v in text for v in ("-0.8", "-1.2", "0.3")), "PDF bar chart must print every value")
+
 print("PASS case_hpr_fixes")

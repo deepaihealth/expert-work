@@ -192,6 +192,52 @@ def test_line_chart_labels_bounds_and_unit():
     assert "目标下限 4.4" in svg and "目标上限 6.1" in svg and "mmol/L" in svg
 
 
+def _svg_texts(svg: str) -> list[str]:
+    ns = "{http://www.w3.org/2000/svg}"
+    return [el.text or "" for el in ET.fromstring(svg).iter(f"{ns}text")]  # noqa: S314
+
+
+def _bars(svg: str) -> list[dict]:
+    ns = "{http://www.w3.org/2000/svg}"
+    return [el.attrib for el in ET.fromstring(svg).iter(f"{ns}rect")]  # noqa: S314
+
+
+def test_bar_chart_labels_every_value_and_has_a_value_axis():
+    t = build_theme(resolve([]).style, "pdf")
+    svg = bar_svg(Chart("bar", ("W1", "W2", "W3"), (78.2, 77.4, 76.9), "kg"), t)
+    texts = _svg_texts(svg)
+    for v in ("78.2", "77.4", "76.9"):
+        assert v in texts
+    assert "0" in texts  # positive data: the value axis starts at zero, like the PPT chart
+    assert len([x for x in texts if x not in ("W1", "W2", "W3", "78.2", "77.4", "76.9")]) >= 5
+
+
+def test_bar_chart_draws_negative_values_below_a_zero_baseline():
+    t = build_theme(resolve([]).style, "pdf")
+    svg = bar_svg(Chart("bar", ("W1", "W2", "W3"), (-0.8, -1.2, 0.3), "kg"), t)
+    texts = _svg_texts(svg)
+    for v in ("-0.8", "-1.2", "0.3"):
+        assert v in texts
+    zero = next(
+        float(a["y1"])
+        for a in (
+            el.attrib
+            for el in ET.fromstring(svg).iter("{http://www.w3.org/2000/svg}line")  # noqa: S314
+        )
+        if a.get("data-zero")
+    )
+    bars = [a for a in _bars(svg) if a.get("fill") == t.primary]
+    assert len(bars) == 3 and all(float(b["height"]) > 0 for b in bars)
+    below = [b for b in bars if abs(float(b["y"]) - zero) < 0.2]  # negative: hangs from zero
+    above = [b for b in bars if abs(float(b["y"]) + float(b["height"]) - zero) < 0.2]
+    assert len(below) == 2 and len(above) == 1
+    plot_top, plot_bottom = 12, 190  # the plot area inside the viewBox
+    assert all(
+        float(b["y"]) >= plot_top and float(b["y"]) + float(b["height"]) <= plot_bottom + 0.1
+        for b in bars
+    )
+
+
 def test_corrupt_image_is_a_block_error_not_a_crash(sample, base):
     noisy = PILImage.effect_noise((640, 360), 64).convert("RGB")
     noisy.save(base / "trend-note.png")

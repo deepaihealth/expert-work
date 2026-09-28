@@ -10,6 +10,7 @@ from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Pt
 
+from hpr.common import bar_domain
 from hpr.prims import Chart
 from hpr.theme import Theme, donut_colors
 
@@ -53,8 +54,10 @@ def add_chart(slide, prim: Chart, x: float, y: float, w: float, h: float, t: The
     va.has_major_gridlines = True
     va.major_gridlines.format.line.color.rgb = _rgb(t.line)
     va.format.line.fill.background()
-    va.minimum_scale = 0 if prim.kind == "bar" and lo >= 0 else round(lo - pad, 2)
-    va.maximum_scale = round(hi + pad, 2)
+    if prim.kind == "bar":
+        va.minimum_scale, va.maximum_scale = bar_domain(prim.values)
+    else:
+        va.minimum_scale, va.maximum_scale = round(lo - pad, 2), round(hi + pad, 2)
     va.tick_labels.font.size = Pt(t.caption)
     ca = ch.category_axis
     ca.format.line.color.rgb = _rgb(t.line)

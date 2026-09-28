@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from html import escape
 
+from hpr.common import bar_domain
 from hpr.icons import ICONS
 from hpr.prims import Chart
 from hpr.style import mix
@@ -111,26 +112,49 @@ def line_svg(prim: Chart, t: Theme) -> str:
 
 
 def bar_svg(prim: Chart, t: Theme) -> str:
+    """Bar chart with a value axis (5 gridlines + tick labels), a zero baseline that negative
+    bars hang from, and each bar's value printed at its end — same domain as the PPT chart."""
     w, h, left, right, top, bottom = 600, 220, 42, 590, 12, 190
-    vmax = max(max(prim.values), 0) * 1.15 or 1.0
+    vmin, vmax = bar_domain(prim.values)
     n = len(prim.values)
     slot = (right - left) / n
-    out = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="100%">',
-        f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="{t.line}"/>',
-    ]
-    for i, v in enumerate(prim.values):
-        bh = (bottom - top) * max(v, 0) / vmax
-        x = left + i * slot + slot * 0.2
+
+    def py(v: float) -> float:
+        return bottom - (bottom - top) * (v - vmin) / (vmax - vmin)
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="100%">']
+    for k in range(5):
+        v = vmin + (vmax - vmin) * k / 4
         out.append(
-            f'<rect x="{x:.1f}" y="{bottom - bh:.1f}" width="{slot * 0.6:.1f}" height="{bh:.1f}" '
+            f'<line x1="{left}" y1="{py(v):.1f}" x2="{right}" y2="{py(v):.1f}" stroke="{t.line}" '
+            f'stroke-width="0.6"/>'
+        )
+        out.append(
+            f'<text x="{left - 6}" y="{py(v) + 3:.1f}" font-size="9" text-anchor="end" '
+            f'fill="{t.muted}">{_num(v)}</text>'
+        )
+    zero = py(0.0)
+    for i, v in enumerate(prim.values):
+        x = left + i * slot + slot * 0.2
+        y0, y1 = sorted((zero, py(v)))
+        out.append(
+            f'<rect x="{x:.1f}" y="{y0:.1f}" width="{slot * 0.6:.1f}" height="{y1 - y0:.1f}" '
             f'fill="{t.primary}"/>'
+        )
+        label_y = py(v) - 4 if v >= 0 else py(v) + 11
+        out.append(
+            f'<text x="{x + slot * 0.3:.1f}" y="{label_y:.1f}" font-size="9" font-weight="700" '
+            f'text-anchor="middle" fill="{t.ink}">{_num(v)}</text>'
         )
         out.append(
             f'<text x="{x + slot * 0.3:.1f}" y="{h - 10}" font-size="9" text-anchor="middle" '
             f'fill="{t.muted}">'
             f"{escape(prim.categories[i])}</text>"
         )
+    out.append(
+        f'<line data-zero="1" x1="{left}" y1="{zero:.1f}" x2="{right}" y2="{zero:.1f}" '
+        f'stroke="{t.muted}" stroke-width="0.8"/>'
+    )
     out.append("</svg>")
     return "".join(out)
 
