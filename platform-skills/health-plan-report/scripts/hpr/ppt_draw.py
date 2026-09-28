@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -212,8 +213,11 @@ class Canvas:
         for pl in ICONS[name]:
             self.polyline([(x + px * k, y + py * k) for px, py in pl], color, 1.5)
 
-    def picture(self, path: Path, x: float, y: float, w: float, h: float, name: str) -> Any:
-        pic = self.slide.shapes.add_picture(str(path), emu(x), emu(y), emu(w), emu(h))
+    def picture(
+        self, src: Path | BinaryIO, x: float, y: float, w: float, h: float, name: str
+    ) -> Any:
+        image = str(src) if isinstance(src, Path) else src
+        pic = self.slide.shapes.add_picture(image, emu(x), emu(y), emu(w), emu(h))
         pic.name = name
         return pic
 
@@ -312,16 +316,26 @@ PLATE_PAD = 8.0
 BRAND_BAND_H = 76.0  # vertical room kept free for a bottom-anchored logo (with plate) or org name
 
 
-def _logo_size(path: Path) -> tuple[float, float] | None:
+def _load_logo(path: Path) -> tuple[io.BytesIO, float, float] | None:
+    """LOGO trimmed to its visible (alpha) bounding box, as an in-memory PNG plus its drawn size
+    in pt; None when unreadable. The input file is never modified or copied on disk."""
     from PIL import Image as PILImage
 
     try:
         with PILImage.open(path) as im:
-            iw, ih = im.size
+            im.load()
+            rgba = im.convert("RGBA")
     except (OSError, ValueError):
         return None
+    bbox = rgba.getchannel("A").getbbox()
+    if bbox is not None:
+        rgba = rgba.crop(bbox)
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+    buf.seek(0)
+    iw, ih = rgba.size
     k = min(LOGO_MAX_W / iw, LOGO_MAX_H / ih)
-    return iw * k, ih * k
+    return buf, iw * k, ih * k
 
 
 def _anchor(
@@ -358,18 +372,18 @@ def _place_brand(
     logo_box: tuple[float, float, float, float] | None = None
     path = _logo_path(content, base_dir)
     if path is not None:
-        size = _logo_size(path) if path.is_file() else None
-        if size is None:
+        logo = _load_logo(path) if path.is_file() else None
+        if logo is None:
             warnings.append(
                 f"LOGO 文件不存在或无法读取，封面只保留机构名称：{brand.get('logo_path')}"  # noqa: RUF001
             )
         else:
-            lw, lh_ = size
+            stream, lw, lh_ = logo
             x0, y0, x1, y1 = box
             x, y = _anchor(logo_pos, lw, lh_, (x0 + pad, y0 + pad, x1 - pad, y1 - pad))
             if plate:
                 cv.rect(x - pad, y - pad, lw + 2 * pad, lh_ + 2 * pad, WHITE, rounded=True)
-            cv.picture(path, x, y, lw, lh_, "hpr:logo")
+            cv.picture(stream, x, y, lw, lh_, "hpr:logo")
             logo_box = (x, y, lw, lh_)
     org = brand.get("org_name")
     if not org:

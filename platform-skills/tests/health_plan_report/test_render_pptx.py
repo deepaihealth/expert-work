@@ -390,3 +390,52 @@ def test_rerun_refuses_when_any_output_of_basename_exists(workdir, sidecar):
     assert "已存在" in res.stdout
     assert not (out / "q.pptx").exists()
     assert (out / sidecar).read_text(encoding="utf-8") == "旧结果"
+
+
+def _padded_logo(path):
+    im = PILImage.new("RGBA", (300, 120), (0, 0, 0, 0))
+    im.paste(PILImage.new("RGBA", (110, 110), (32, 64, 160, 255)), (5, 5))
+    im.save(path)
+
+
+def test_logo_plate_hugs_visible_logo_not_transparent_padding(workdir, sample):
+    _padded_logo(workdir / "logo.png")
+    sample["brand"]["logo_path"] = "logo.png"
+    layers = [
+        Layer(
+            "x",
+            {
+                "cover.variant": "band",
+                "brand.logo_position": "top-left",
+                "brand.org_position": "top-left",
+            },
+        )
+    ]
+    out, _, _ = _render(sample, workdir, layers)
+    slide = Presentation(str(out)).slides[0]
+    (logo,) = [sh for sh in slide.shapes if sh.name == "hpr:logo"]
+    (plate,) = _plates(slide, logo)
+    pt = 12700
+    assert abs(logo.width / pt - 56) < 0.5 and abs(logo.height / pt - 56) < 0.5
+    assert plate.width / pt <= logo.width / pt + 2 * 8 + 1
+    (org,) = [
+        sh
+        for sh in slide.shapes
+        if sh.has_text_frame and sh.text_frame.text == sample["brand"]["org_name"]
+    ]
+    gap = (org.left - (plate.left + plate.width)) / pt
+    assert 0 <= gap <= 16
+    assert list(workdir.glob("logo*")) == [workdir / "logo.png"]
+
+
+def test_end_slide_long_signature_gets_its_measured_height(workdir, sample):
+    sample["brand"]["footer_signature"] = "示例健康管理中心健康管理团队与营养师团队联合出品" * 3
+    out, _, _ = _render(sample, workdir)
+    last = Presentation(str(out)).slides[-1]
+    (sig,) = [
+        sh
+        for sh in last.shapes
+        if sh.has_text_frame and sh.text_frame.text == sample["brand"]["footer_signature"]
+    ]
+    assert sig.height / 12700 > 16 * 1.35 * 1.5
+    assert pptx_overflow(out, M) == []
