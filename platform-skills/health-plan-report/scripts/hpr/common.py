@@ -82,11 +82,16 @@ def clock_minutes(hhmm: str) -> int:
 
 
 _CJK = "\u3400-\u9fff\uf900-\ufaff"
+# CJK units that stay with their number (longest first, so 分钟 wins over 分)
+_UNITS = (
+    "分钟|小时|个月|公斤|千克|千卡|毫升|毫米|厘米|公里|"
+    "周|天|次|个|组|年|月|日|岁|克|斤|碗|份|步|分|秒|粒|片|杯|勺|米|度|倍|遍|餐|顿|口"
+)
 _NOBREAK = re.compile(
     # an opening bracket stays with what follows, closing punctuation with what precedes;
     # between them: a number (+ its unit), a latin word, a short CJK label (<= 4 chars)
     rf"[（(《「『【]?"  # noqa: RUF001
-    rf"(?:[0-9][0-9A-Za-z.,:%/+~–\-]*(?: ?(?:[A-Za-z]+|[{_CJK}]))?"  # noqa: RUF001
+    rf"(?:[0-9][0-9A-Za-z.,:%/+~–\-]*(?: ?(?:[A-Za-z]+|{_UNITS}))?"  # noqa: RUF001
     rf"|[A-Za-z][A-Za-z0-9.,:%/+~–\-_]*"  # noqa: RUF001
     rf"|(?<![{_CJK}])[{_CJK}]{{1,4}}(?![{_CJK}])"
     rf"|\S)"
@@ -150,6 +155,9 @@ def _even_out(want: list[float], room: float) -> list[float]:
             keep[i] = True
 
 
+LABEL_SHARE = 0.4  # a band label takes at most this share of its cell and wraps beyond it
+
+
 def band_columns(
     items: list[tuple[str, str]] | tuple[tuple[str, str], ...],
     total: float,
@@ -163,16 +171,29 @@ def band_columns(
     line, widths driven by content and evened out; otherwise two columns whose value parts are
     sized by column_widths (no mid-token break), or one. Cells run in caller order, left to
     right, then down."""
+    if not items:
+        return 1, [total], [0.0]
+
+    def labels(n: int, col: float) -> list[float]:  # a long label wraps within its share
+        return [
+            min(max(label_width(k) for k, _ in items[j::n]), LABEL_SHARE * col) for j in range(n)
+        ]
+
+    def done(
+        n: int, widths: list[float], labs: list[float]
+    ) -> tuple[int, list[float], list[float]]:
+        return n, widths, [min(lab, LABEL_SHARE * w) for lab, w in zip(labs, widths, strict=True)]
+
     for n in sorted({min(k, len(items)) for k in (4, 3, 2, 1)}, reverse=True):
         room = total - gap * (n - 1)
-        labs = [max(label_width(k) for k, _ in items[j::n]) for j in range(n)]
+        labs = labels(n, room / n)
         vals = [[v for _, v in items[j::n]] for j in range(n)]
         want = [
             lab + inner + max(value_width(j, ln) for v in col for ln in v.split("\n"))
             for j, (lab, col) in enumerate(zip(labs, vals, strict=True))
         ]
         if sum(want) <= room:
-            return n, _even_out(want, room), labs
+            return done(n, _even_out(want, room), labs)
         if n == 2:
             grid = [
                 (items[r][1], items[r + 1][1] if r + 1 < len(items) else "")
@@ -185,5 +206,5 @@ def band_columns(
             ]
             if sum(need) < room - fixed:
                 vw = column_widths(("", ""), tuple(grid), room - fixed, value_width)
-                return 2, [lab + inner + w for lab, w in zip(labs, vw, strict=True)], labs
-    return 1, [total], [max(label_width(k) for k, _ in items)]
+                return done(2, [lab + inner + w for lab, w in zip(labs, vw, strict=True)], labs)
+    return done(1, [total], labels(1, total))

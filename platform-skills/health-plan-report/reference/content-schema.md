@@ -19,9 +19,11 @@
 | `brand` | 可选 | 对象 `{org_name, logo_path, footer_signature, disclaimer}` | 四个字段都可选；只从这里读取，任何样式层都改不了（见 `style-options.md`） |
 | `sections` | 必填，至少 1 项 | 数组 | 见下「章节与积木」 |
 
-封面只放 LOGO/机构名称、`title`、`subtitle`、`client.name`，以及底部一行「生成日期 · 健康管理师 姓名」；
+封面只放 LOGO/机构名称、`title`、`subtitle`、`client.name`，以及底部一行「生成日期 · 头衔 姓名」（头衔取 `manager.title`，缺省为「健康管理师」）；
 `client.facts`、`period.label`、`data_basis` 不上封面，统一放在正文第一页顶部的「客户信息」栏（目录之后、第一个章节之前）。
-方案名称或副标题长到封面放不下会渲染失败，报错位置是 `title` 或 `subtitle`（≤30 字的名称、≤40 字的副标题总能放下）。
+封面放不下会渲染失败，报错位置通常是 `title` 或 `subtitle`（≤30 字的名称、≤40 字的副标题总能放下）；PDF 封面极端情况下也可能报
+`client.name`、`generated_at` 或 `brand`。「客户信息」栏超过一页（信息项极多）会报 `client.facts`：封面信息项请写简短的身份信息，
+更长的背景写进健康画像或键值积木。
 `brand.disclaimer` 太长会把 PDF 页脚顶出页面底边，同样会报错（路径 `brand.disclaimer`），页脚最多约 4 行，请把免责声明控制在合理长度内。
 
 ## 章节与积木

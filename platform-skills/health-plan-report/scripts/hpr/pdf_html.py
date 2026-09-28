@@ -196,6 +196,7 @@ body {{ margin: 0; background: {t.background}; line-height: 1.55; }}
 h3 {{ font-size: {t.heading}pt; margin: 5mm 0 2mm; break-after: avoid;
   border-left: 1mm solid {t.accent}; padding-left: 2.5mm; }}
 p {{ margin: 0 0 3mm; }}
+p, li {{ orphans: 3; widows: 3; }}  /* no 1-2 line stub on either side of a break */
 p.boxed {{ background: {t.pale}; padding: 3mm 4mm; border-radius: 1.5mm; break-inside: avoid; }}
 ul, ol {{ margin: 0 0 3mm; padding-left: 6mm; }}
 li {{ margin-bottom: 1.2mm; }} li::marker {{ color: {t.primary}; }}
@@ -229,6 +230,8 @@ th, td {{ padding: 1.8mm 2.2mm; border-bottom: 0.5pt solid {t.line}; vertical-al
   overflow-wrap: anywhere; }}
 td.hl {{ color: {t.out_text}; font-weight: 700; }}
 tr {{ break-inside: avoid; }}
+/* a split table keeps two rows or more on each side (so a table under four rows never splits) */
+tbody tr:first-child, tbody tr:nth-last-child(2) {{ break-after: avoid; }}
 dl.kv {{ display: grid; gap: 1mm 8mm; margin: 0 0 4mm; }}
 dl.kv.c2 {{ grid-template-columns: 1fr 1fr; }} dl.kv.c1 {{ grid-template-columns: 1fr; }}
 dl.kv div {{ display: grid; grid-template-columns: 34% 1fr; gap: 2mm;

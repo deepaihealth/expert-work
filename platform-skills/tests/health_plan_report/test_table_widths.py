@@ -33,6 +33,10 @@ MEAL = Table(
         ("12:00", ["12:00"]),
         ("420 kcal", ["420 kcal"]),
         ("前 2 周", ["前", "2 周"]),
+        ("每次 30 分钟", ["每次", "30 分钟"]),
+        ("睡 7 小时", ["睡", "7 小时"]),
+        ("7:30 早餐", ["7:30", "早餐"]),
+        ("3 组动作", ["3 组", "动", "作"]),
         ("加餐（下午）", ["加餐", "（下午）"]),  # noqa: RUF001
         ("女 / 48 岁（1978-01）", ["女", "/", "48 岁", "（1978-01）"]),  # noqa: RUF001
     ],
@@ -89,7 +93,7 @@ def test_pdf_tables_have_fixed_token_fitting_colgroups(sample, tmp_path, scale):
     t = build_theme(style, "pdf")
     html, _ = build_html(sample, style, t, tmp_path)
     assert "table-layout: fixed" in html
-    tables = re.findall(r"<table>(.*?)</table>", html)
+    tables = re.findall(r"<table[^>]*>(.*?)</table>", html)
     groups = _colgroup_pt(html)
     assert tables and len(groups) == len(tables)
     pad = 2.2 / 25.4 * 72

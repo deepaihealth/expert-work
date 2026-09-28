@@ -281,3 +281,23 @@ def test_first_section_follows_the_band_even_with_little_room(sample):
     assert pages[0].section_id == BAND_ID
     assert any(pl.path == "sections[0]" for pl in pages[0].placed), "section 1 must start here"
     assert [pl.prim for pl in pages[0].placed][1] == SubHeading("第一节")
+
+
+def test_band_label_is_capped_so_the_value_keeps_room():
+    label = "一个非常非常长的客户信息标签文字" * 5
+    items = [(label, "2026-09-28"), ("乙", "短")]
+    n, widths, labs = band_columns(items, 400.0, 20.0, _LW, _VW, 6.0)
+    for c in range(n):
+        assert labs[c] <= widths[c] * 0.4 + 1e-6
+        assert widths[c] - labs[c] - 6.0 >= _VW(0, "2026-09-28")
+
+
+def test_band_columns_of_nothing_is_not_a_crash():
+    assert band_columns([], 400.0, 20.0, _LW, _VW, 6.0) == (1, [400.0], [0.0])
+
+
+def test_band_with_a_long_label_passes_ppt_qa(sample, base):
+    sample["client"]["facts"][0]["label"] = "既往检查与家族史说明（含近三年体检结论）"  # noqa: RUF001
+    out, style = _pptx(sample, base, [Layer("x", {"type.scale": "large"})])
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa

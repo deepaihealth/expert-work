@@ -312,8 +312,9 @@ def draw_band(cv: Canvas, x: float, y: float, w: float, band: InfoBand, ctx: Ctx
         cx = x + geo.pad
         for (label, value), cw, lab in zip(row, geo.col_w, geo.label_w, strict=False):
             role = CHROME if label in BAND_CHROME_LABELS else BODY
-            lab_h = rh - lift
-            cv.text(cx, cy + lift, lab, lab_h, label, t.caption, t.muted, name=role)
+            need = ctx.m.lines(label, lab, t.caption) * lh(t.caption)
+            down = min(lift, rh - need)  # a wrapped (long) label starts at the row top
+            cv.text(cx, cy + down, lab, rh - down, label, t.caption, t.muted, name=role)
             vx, vw = cx + lab + geo.inner, cw - lab - geo.inner
             cv.text(vx, cy, vw, rh, value, t.body, t.ink, bold=True)
             cx += cw + geo.gap
