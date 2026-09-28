@@ -576,14 +576,19 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
         return pg
 
     def min_head(prim: Prim) -> float:
-        """The least of ``prim`` that may end a page (keep_apart's minimum head)."""
+        """The least of ``prim`` that may end a page: the smallest head split() will actually
+        place (keep_apart keeps the same minimum on the tail), else the whole element."""
         full = measure(prim, BODY_W, ctx)
         if isinstance(prim, Table):
+            if len(prim.rows) < 2 * MIN_TABLE_ROWS:
+                return full
             geo = table_geometry(prim, BODY_W, ctx)
-            return min(full, geo.header_h + sum(geo.row_h[:MIN_TABLE_ROWS]))
+            return geo.header_h + sum(geo.row_h[:MIN_TABLE_ROWS])
         if isinstance(prim, Paragraph):
-            pad = 2 * t.gap_m if prim.boxed else 0.0
-            return min(full, MIN_PARA_LINES * lh(t.body) + pad)
+            pad = t.gap_m if prim.boxed else 0.0
+            if ctx.m.lines(prim.text, BODY_W - 2 * pad, t.body) < 2 * MIN_PARA_LINES:
+                return full
+            return MIN_PARA_LINES * lh(t.body) + 2 * pad
         return min(full, 2 * lh(t.body) + 2 * t.gap_m) if splittable(prim) else full
 
     def captioned(i: int, items: list[tuple[Prim, str]]) -> bool:

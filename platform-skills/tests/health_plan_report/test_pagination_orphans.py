@@ -106,3 +106,41 @@ def test_merged_section_title_is_not_left_behind_by_a_captioned_chart(scale):
         b = ({"id": "b", "title": "第二节", "blocks": []}, items)
         for pg in paginate([a, b], ctx):
             assert not isinstance(pg.placed[-1].prim, SubHeading), n
+
+
+SHORT = {
+    "3-row table": Table(("日期", "安排"), tuple((f"第 {i} 天", "快走 30 分钟") for i in range(3))),
+    "4-line paragraph": Paragraph("\n".join(f"第{i}行内容" for i in range(4))),
+    "5-line paragraph": Paragraph("\n".join(f"第{i}行内容" for i in range(5))),
+}
+
+
+@pytest.mark.parametrize("scale", ["compact", "standard", "large"])
+@pytest.mark.parametrize("what", sorted(SHORT))
+def test_heading_moves_with_a_block_that_cannot_split(scale, what):
+    ctx = _ctx(scale)
+    for n in range(1, _per_page(ctx) + 2):
+        pages = _pages(ctx, [_filler(n), SubHeading("小标题"), SHORT[what]])
+        for pg in pages:
+            assert not isinstance(pg.placed[-1].prim, SubHeading), (what, n)
+
+
+@pytest.mark.parametrize("scale", ["compact", "standard", "large"])
+def test_chart_moves_with_a_five_line_caption(scale):
+    from hpr.prims import Chart
+
+    ctx = _ctx(scale)
+    chart = Chart("line", ("a", "b"), (1.0, 2.0))
+    caption = Paragraph("\n".join(f"说明第{i}行" for i in range(5)))
+    for n in range(1, _per_page(ctx) + 2):
+        sec = {"id": "s", "title": "章节", "blocks": []}
+        items = [(_filler(n), "b0"), (chart, "b1"), (caption, "b1")]
+        pages = paginate([(sec, items)], ctx)
+        chart_page = next(i for i, pg in enumerate(pages) for pl in pg.placed if pl.prim is chart)
+        cap_pages = [
+            i
+            for i, pg in enumerate(pages)
+            for pl in pg.placed
+            if isinstance(pl.prim, Paragraph) and pl.prim.text.startswith("说明")
+        ]
+        assert chart_page == min(cap_pages), n
