@@ -91,3 +91,18 @@ def test_stub_is_accepted_only_when_the_table_cannot_fit_otherwise():
     pages = _pages(ctx, [three])
     pieces = [pl.prim for pg in pages for pl in pg.placed]
     assert sum(len(p.rows) for p in pieces) == 3 and len(pieces) >= 2
+
+
+@pytest.mark.parametrize("scale", ["standard", "large"])
+def test_merged_section_title_is_not_left_behind_by_a_captioned_chart(scale):
+    from hpr.prims import Chart
+
+    ctx = _ctx(scale)
+    chart = Chart("line", ("a", "b"), (1.0, 2.0))
+    caption = Paragraph("虚线为本阶段目标区间。" * 3)
+    for n in range(1, _per_page(ctx)):
+        a = ({"id": "a", "title": "第一节", "blocks": []}, [(_filler(n), "sections[0].blocks[0]")])
+        items = [(SubHeading("空腹血糖"), "p1"), (chart, "p2"), (caption, "p2")]
+        b = ({"id": "b", "title": "第二节", "blocks": []}, items)
+        for pg in paginate([a, b], ctx):
+            assert not isinstance(pg.placed[-1].prim, SubHeading), n

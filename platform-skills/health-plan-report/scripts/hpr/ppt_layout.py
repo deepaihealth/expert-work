@@ -616,8 +616,8 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
         first = items[0][0]
         if isinstance(first, SubHeading) and len(items) > 1:
             rest = room - measure(first, BODY_W, ctx) - t.gap_l
-            return head_fits(items[1][0], rest)
-        return head_fits(first, room)
+            return lead_need(1, items) <= rest and head_fits(items[1][0], rest)
+        return lead_need(0, items) <= room and head_fits(first, room)
 
     lead = sum(1 for sec, _ in sections if sec["id"] == BAND_ID)  # not a caller section
     for si, (sec, items) in enumerate(sections, start=-lead):
