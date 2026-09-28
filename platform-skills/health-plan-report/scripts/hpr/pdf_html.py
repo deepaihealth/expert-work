@@ -204,6 +204,7 @@ li {{ margin-bottom: 1.2mm; }} li::marker {{ color: {t.primary}; }}
 ul.checks {{ list-style: none; padding-left: 5mm; }} ul.checks li::before {{ content: "✓ ";
   color: {t.primary}; }}
 .grid {{ display: grid; gap: 3mm; margin-bottom: 4mm; }}
+.grid.keep {{ break-inside: avoid; }}  /* a card grid is one topic */
 .grid.c1 {{ grid-template-columns: 1fr; }} .grid.c2 {{ grid-template-columns: 1fr 1fr; }}
 .grid.c3 {{ grid-template-columns: 1fr 1fr 1fr; }}
   .grid.c4 {{ grid-template-columns: 1fr 1fr 1fr 1fr; }}
@@ -392,6 +393,7 @@ def _band(content: dict, style: dict, t: Theme) -> str:
 
 
 BAND_ANCHOR = "client-info"
+GRID_KEEP = " keep"  # class that keeps a card grid on one page
 
 
 def _end_mark(anchor: str) -> str:
@@ -438,7 +440,8 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         cls = ' class="checks"' if p.style == "checks" else ""
         return f"<{tag}{cls}>" + "".join(f"<li>{eb(i)}</li>" for i in p.items) + f"</{tag}>"
     if isinstance(p, CardGrid):
-        return f'<div class="grid c{p.cols}">' + "".join(_card(c) for c in p.cards) + "</div>"
+        cards = "".join(_card(c) for c in p.cards)
+        return f'<div class="grid c{p.cols}{GRID_KEEP}">{cards}</div>'
     if isinstance(p, Table):
         head = "".join(f"<th>{e(c)}</th>" for c in p.columns)
         rows = "".join(
@@ -630,7 +633,13 @@ def render_pdf(
     collect = _Collect()
     logger.addHandler(collect)
     try:
-        document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
+        try:
+            document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
+        except AssertionError:
+            # weasyprint asserts when a keep-together grid is taller than a page; lay out again
+            # letting every grid split between rows (the behaviour before grids were kept whole)
+            html = html.replace(f'{GRID_KEEP}">', '">')
+            document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
         check_cover(document)
         check_footer(document)
         raise_for_failed_images(collect.failed, images)

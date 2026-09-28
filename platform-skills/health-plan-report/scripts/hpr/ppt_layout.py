@@ -576,6 +576,13 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
         pages.append(pg)
         return pg
 
+    def breakable(prim: Prim) -> bool:
+        """May end a page part-way. A card grid is one topic: it splits between rows only
+        when it cannot fit on a page of its own; otherwise it moves whole."""
+        if isinstance(prim, CardGrid):
+            return measure(prim, BODY_W, ctx) > avail_total
+        return splittable(prim)
+
     def min_head(prim: Prim) -> float:
         """The least of ``prim`` that may end a page: the smallest head split() will actually
         place (keep_apart keeps the same minimum on the tail), else the whole element."""
@@ -590,7 +597,7 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
             if ctx.m.lines(prim.text, BODY_W - 2 * pad, t.body) < 2 * MIN_PARA_LINES:
                 return full
             return MIN_PARA_LINES * lh(t.body) + 2 * pad
-        return min(full, 2 * lh(t.body) + 2 * t.gap_m) if splittable(prim) else full
+        return min(full, 2 * lh(t.body) + 2 * t.gap_m) if breakable(prim) else full
 
     def captioned(i: int, items: list[tuple[Prim, str]]) -> bool:
         """items[i] is a chart followed by its own caption paragraph (same block)."""
@@ -613,7 +620,7 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
             return False
         if measure(prim, BODY_W, ctx) <= room:
             return True
-        return splittable(prim) and split(prim, BODY_W, room, ctx)[0] is not None
+        return breakable(prim) and split(prim, BODY_W, room, ctx)[0] is not None
 
     def lead_fits(items: list[tuple[Prim, str]], room: float) -> bool:
         """The section's first item (a sub-heading together with what follows it) fits in room."""
@@ -660,7 +667,7 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
                     y += h
                     pending = None
                     continue
-                if splittable(pending):
+                if breakable(pending):
                     head_part, tail = split(pending, BODY_W, bottom - y, ctx)
                     if head_part is None and at_top:
                         head_part, tail = split(pending, BODY_W, bottom - y, ctx, force=True)
