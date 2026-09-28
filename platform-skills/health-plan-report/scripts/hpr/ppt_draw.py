@@ -17,8 +17,9 @@ from pptx.util import Emu, Pt
 
 from hpr.blocks import section_prims
 from hpr.icons import ICONS
+from hpr.logo import trimmed_logo
 from hpr.measure import LINE, Measurer
-from hpr.ppt_charts import add_chart, donut_colors
+from hpr.ppt_charts import add_chart
 from hpr.ppt_layout import (
     BODY_TOP,
     BODY_W,
@@ -69,7 +70,7 @@ from hpr.prims import (
     Timeline,
 )
 from hpr.style import mix
-from hpr.theme import WHITE, Theme, build_theme, on_color
+from hpr.theme import WHITE, Theme, build_theme, donut_colors, on_color
 
 BODY, CHROME, DECO = "hpr:body", "hpr:chrome", "hpr:deco"
 NO_GRID_STYLE = "{2D5ABB26-0587-4C30-8999-92F81FD0307C}"
@@ -319,23 +320,12 @@ BRAND_BAND_H = 76.0  # vertical room kept free for a bottom-anchored logo (with 
 def _load_logo(path: Path) -> tuple[io.BytesIO, float, float] | None:
     """LOGO trimmed to its visible (alpha) bounding box, as an in-memory PNG plus its drawn size
     in pt; None when unreadable. The input file is never modified or copied on disk."""
-    from PIL import Image as PILImage
-
-    try:
-        with PILImage.open(path) as im:
-            im.load()
-            rgba = im.convert("RGBA")
-    except (OSError, ValueError):
+    logo = trimmed_logo(path)
+    if logo is None:
         return None
-    bbox = rgba.getchannel("A").getbbox()
-    if bbox is not None:
-        rgba = rgba.crop(bbox)
-    buf = io.BytesIO()
-    rgba.save(buf, format="PNG")
-    buf.seek(0)
-    iw, ih = rgba.size
+    data, iw, ih = logo
     k = min(LOGO_MAX_W / iw, LOGO_MAX_H / ih)
-    return buf, iw * k, ih * k
+    return io.BytesIO(data), iw * k, ih * k
 
 
 def _anchor(

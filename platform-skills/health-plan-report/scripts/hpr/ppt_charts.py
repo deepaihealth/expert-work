@@ -11,8 +11,7 @@ from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Pt
 
 from hpr.prims import Chart
-from hpr.style import mix
-from hpr.theme import Theme
+from hpr.theme import Theme, donut_colors
 
 
 def _emu(pt: float) -> Emu:
@@ -21,17 +20,6 @@ def _emu(pt: float) -> Emu:
 
 def _rgb(hex_: str) -> RGBColor:
     return RGBColor.from_string(hex_[1:])
-
-
-def donut_colors(t: Theme) -> list[str]:
-    return [
-        t.primary,
-        t.accent,
-        t.primary_soft,
-        mix(t.primary, t.background, 0.75),
-        t.muted,
-        t.within,
-    ]
 
 
 def add_chart(slide, prim: Chart, x: float, y: float, w: float, h: float, t: Theme):  # type: ignore[no-untyped-def]

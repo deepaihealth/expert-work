@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a health-plan content JSON to PPTX (and, from a later version, PDF) with QA gates."""
+"""Render a health-plan content JSON to PPTX and/or PDF with hard QA gates."""
 
 from __future__ import annotations
 
@@ -16,9 +16,10 @@ from _cli import emit_json
 from hpr.blocks import RenderError
 from hpr.content import iter_blocks, load_content, required_texts, validate_content
 from hpr.measure import Measurer
+from hpr.pdf_html import render_pdf
 from hpr.ppt_draw import render_pptx
 from hpr.ppt_layout import LayoutError
-from hpr.qa import qa_pptx
+from hpr.qa import qa_pdf, qa_pptx
 from hpr.style import NOT_APPLIED, Layer, load_layer, resolve
 from hpr.theme import build_theme
 
@@ -87,19 +88,23 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(
             [f"文件已存在，不覆盖：{p}（请换一个 basename，例如用新的生成时间）" for p in existing]  # noqa: RUF001
         )
-    if "pdf" in formats:
-        return _fail(["PDF 输出在本版本尚未提供，请先用 --format pptx"])  # noqa: RUF001
     m = Measurer()
     required = required_texts(content)
     files: dict[str, str] = {}
     qa: dict[str, dict] = {}
     warnings: list[str] = []
     try:
-        warnings += render_pptx(content, style, targets["pptx"], base_dir, m)
-    except (RenderError, LayoutError) as exc:
+        if "pptx" in targets:
+            warnings += render_pptx(content, style, targets["pptx"], base_dir, m)
+            qa["pptx"] = qa_pptx(targets["pptx"], required, build_theme(style, "pptx"), m)
+            files["pptx"] = str(targets["pptx"])
+        if "pdf" in targets:
+            warnings += render_pdf(content, style, targets["pdf"], base_dir)
+            qa["pdf"] = qa_pdf(targets["pdf"], content, required, build_theme(style, "pdf"))
+            files["pdf"] = str(targets["pdf"])
+    except (RenderError, LayoutError, RuntimeError) as exc:
         return _fail([str(exc)])
-    qa["pptx"] = qa_pptx(targets["pptx"], required, build_theme(style, "pptx"), m)
-    files["pptx"] = str(targets["pptx"])
+    warnings = list(dict.fromkeys(warnings))
     ok = all(q["status"] == "passed" for q in qa.values())
     if not ok:
         for fmt, q in qa.items():

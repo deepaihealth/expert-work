@@ -250,28 +250,6 @@ def test_basename_with_slash_rejected(workdir):
     assert res.returncode == 1
 
 
-def test_pdf_not_yet_available_message(workdir):
-    # T7 实现 PDF 后删除本测试（T7 Step 1 会替换它）  # noqa: RUF003
-    res = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            str(RENDER),
-            "--content",
-            str(workdir / "plan.json"),
-            "--format",
-            "pdf",
-            "--out-dir",
-            str(workdir / "o"),
-            "--basename",
-            "x",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res.returncode == 1
-
-
 def test_period_label_is_drawn_even_when_subtitle_omits_it(workdir, sample):
     sample["subtitle"] = "控糖与体重管理"
     out, style, _ = _render(sample, workdir)
