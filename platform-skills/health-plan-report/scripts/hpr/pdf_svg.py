@@ -21,8 +21,31 @@ def _scale(values: list[float], lo_pad: float = 0.15) -> tuple[float, float]:
     return lo - pad, hi + pad
 
 
+def _text_w(s: str, size: float) -> float:
+    return sum(size if ord(c) > 0x2E7F else size * 0.55 for c in s)
+
+
+def _legend(entries: list[tuple[str, str, bool]], x: float, y: float, t: Theme) -> str:
+    """Legend row: (label, colour, dashed) → line swatch + label, left to right from x."""
+    out = []
+    for label, color, dashed in entries:
+        dash = ' stroke-dasharray="4 3"' if dashed else ""
+        out.append(
+            f'<line x1="{x:.1f}" y1="{y - 3:.1f}" x2="{x + 18:.1f}" y2="{y - 3:.1f}" '
+            f'stroke="{color}" stroke-width="{1 if dashed else 2}"{dash}/>'
+        )
+        out.append(
+            f'<text x="{x + 23:.1f}" y="{y:.1f}" font-size="9" fill="{t.muted}">'
+            f"{escape(label)}</text>"
+        )
+        x += 23 + _text_w(label, 9) + 18
+    return "".join(out)
+
+
 def line_svg(prim: Chart, t: Theme) -> str:
-    w, h, left, right, top, bottom = 600, 220, 42, 590, 12, 190
+    """Line chart with the target band; the legend names the series by its unit and labels the
+    bounds 「目标下限 / 目标上限」 like the PPT chart legend."""
+    w, h, left, right, top, bottom = 600, 240, 42, 590, 12, 190
     vals = list(prim.values) + [v for v in (prim.low, prim.high) if v is not None]
     vmin, vmax = _scale(vals)
     n = len(prim.values)
@@ -72,10 +95,17 @@ def line_svg(prim: Chart, t: Theme) -> str:
         # end labels anchor inward so they stay inside the viewBox
         anchor = "start" if i == 0 and n > 1 else "end" if i == n - 1 and n > 1 else "middle"
         out.append(
-            f'<text x="{px(i):.1f}" y="{h - 10}" font-size="9" text-anchor="{anchor}" '
+            f'<text x="{px(i):.1f}" y="{bottom + 20}" font-size="9" text-anchor="{anchor}" '
             f'fill="{t.muted}">'
             f"{escape(prim.categories[i])}</text>"
         )
+    legend = [(prim.unit or "数值", t.primary, False)]
+    legend += [
+        (f"{name} {_num(v)}", t.within, True)
+        for name, v in (("目标下限", prim.low), ("目标上限", prim.high))
+        if v is not None
+    ]
+    out.append(_legend(legend, left, h - 4, t))
     out.append("</svg>")
     return "".join(out)
 

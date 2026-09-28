@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import base64
+import logging
+import unicodedata
 from html import escape
 from pathlib import Path
 from typing import Any
 
-from hpr.blocks import section_prims
+from hpr.blocks import RenderError, section_prims
 from hpr.icons import icon_for_section
 from hpr.logo import trimmed_logo
+from hpr.pdf_guard import check_cover, check_footer, make_fetcher
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
-from hpr.ppt_layout import LayoutError, brand_line
+from hpr.ppt_layout import brand_line
 from hpr.prims import (
     Bullets,
     Callout,
@@ -39,12 +42,35 @@ _POS_CLASS = {
 }
 
 
+_BREAKS_TEXT = frozenset(("Cc", "Cs", "Zl", "Zp"))
+
+
+def clean(s: str) -> str:
+    """Control / separator code points (\\f, \\r, U+2028 …; not \\n, \\t) become a space: weasyprint
+    writes them into the font subset and the whole PDF text layer comes out garbled."""
+    return "".join(
+        " " if ch not in "\n\t" and unicodedata.category(ch) in _BREAKS_TEXT else ch for ch in s
+    )
+
+
 def e(s: str) -> str:
-    return escape(s, quote=True)
+    return escape(clean(s), quote=True)
+
+
+_CSS_HEX = frozenset('\\"<>')
+_NON_PRINTING = frozenset(("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"))
 
 
 def css_string(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\A ") + '"'
+    """A single CSS string token: quotes, backslash, angle brackets (no `</style>` breakout) and
+    every control / non-printing code point become CSS hex escapes."""
+    out = []
+    for ch in s:
+        if ch in _CSS_HEX or unicodedata.category(ch) in _NON_PRINTING:
+            out.append(f"\\{ord(ch):X} ")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def _css(content: dict, style: dict, t: Theme) -> str:
@@ -59,11 +85,12 @@ def _css(content: dict, style: dict, t: Theme) -> str:
     org = (content.get("brand") or {}).get("org_name", "")
     return f"""
 @page {{
-  size: A4; margin: 22mm 18mm 28mm 18mm;
-  @top-left {{ content: {css_string(content["title"])}; font-size: {t.caption}pt; color: {t.muted};
+  size: A4; margin: 22mm 18mm 32mm 18mm;
+  @top-left {{ content: {css_string(clean(content["title"]))}; font-size: {t.caption}pt;
+  color: {t.muted};
   }}
-  @top-right {{ content: {css_string(org)}; font-size: {t.caption}pt; color: {t.muted}; }}
-  {footer_box} {{ content: element(pfoot); width: 140mm; vertical-align: top; padding-top: 4mm; }}
+  @top-right {{ content: {css_string(clean(org))}; font-size: {t.caption}pt; color: {t.muted}; }}
+  {footer_box} {{ content: element(pfoot); width: 140mm; vertical-align: top; padding-top: 3mm; }}
   {page_no}
 }}
 @page cover {{ margin: 0; @top-left {{ content: none; }} @top-right {{ content: none; }}
@@ -158,6 +185,7 @@ dl.kv dt {{ color: {t.muted}; font-size: {t.small}pt; }} dl.kv dd {{ margin: 0; 
 .callout.alert {{ background: {t.pale_alert}; border-left-color: {t.alert}; }}
 .callout .ct {{ font-weight: 700; }}
 .callout.alert .ct {{ color: {t.alert}; }} .callout.warn .ct {{ color: {t.out}; }}
+.keep {{ break-inside: avoid; }}
 .chart {{ break-inside: avoid; margin-bottom: 4mm; }}
 .donut {{ display: grid; grid-template-columns: 45mm 1fr; gap: 6mm; align-items: center;
   break-inside: avoid; margin-bottom: 4mm; }}
@@ -418,7 +446,7 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
             if style["section.icons"]
             else ""
         )
-        body = "".join(_prim(p, t, base_dir) for p, _ in items)
+        body = _body(items, t, base_dir)
         parts.append(
             f'<section class="sec" id="sec-{e(sec["id"])}">'
             f"<h2>{icon}{e(sec['title'])}</h2>{body}</section>"
@@ -427,68 +455,87 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
     return "".join(parts), warnings
 
 
+def _body(items: list[tuple[Prim, str]], t: Theme, base_dir: Path) -> str:
+    """Section body; a chart and the caption paragraph of the same block stay on one page."""
+    out: list[str] = []
+    i = 0
+    while i < len(items):
+        p, path = items[i]
+        nxt = items[i + 1] if i + 1 < len(items) else None
+        if isinstance(p, Chart) and nxt and isinstance(nxt[0], Paragraph) and nxt[1] == path:
+            out.append(
+                f'<div class="keep">{_prim(p, t, base_dir)}{_prim(nxt[0], t, base_dir)}</div>'
+            )
+            i += 2
+            continue
+        out.append(_prim(p, t, base_dir))
+        i += 1
+    return "".join(out)
+
+
 def _pfoot(content: dict) -> str:
     brand = content.get("brand") or {}
     lines = [x for x in (brand_line(brand), brand.get("disclaimer", "")) if x]
     return f'<div class="pfoot">{"<br>".join(e(x) for x in lines)}</div>' if lines else ""
 
 
-_COVER_PARTS = (("h1", "title"), ("sub", "subtitle"), ("meta", "client.facts"), ("brand", "brand"))
+class PdfUnavailableError(Exception):
+    """weasyprint is not installed in this environment."""
 
 
-_COVER_HINT = "请缩短方案名称/副标题或减少封面信息项"
-_COVER_FULL = f"封面内容过多，一页放不下，{_COVER_HINT}"  # noqa: RUF001
+class _Collect(logging.Handler):
+    """weasyprint's resource-loading failures (it logs and skips them) become render warnings;
+    environment chatter (e.g. font-subsetting backend notices) is left to the log."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if "Failed to load" in msg:
+            self.messages.append(f"PDF 资源未能加载：{msg}")  # noqa: RUF001
 
 
-def _cover_part(el: Any) -> str | None:
-    if el.tag == "h1":
-        return "title"
-    classes = (el.get("class") or "").split()
-    return next((path for cls, path in _COVER_PARTS if cls in classes), None)
+def _image_files(content: dict, style: dict, base_dir: Path) -> frozenset[Path]:
+    """Resolved paths of the image blocks; each must decode, or the block path is reported."""
+    from PIL import Image as PILImage
 
-
-def _is_cover(box: Any) -> bool:
-    el = getattr(box, "element", None)
-    return el is not None and "cover" in (el.get("class") or "").split()
-
-
-def check_cover(document: Any) -> None:
-    """Raise LayoutError when laid-out cover text overlaps or does not fit on the cover page."""
-    pages = document.pages
-    if len(pages) > 1 and any(_is_cover(b) for b in pages[1]._page_box.descendants()):
-        raise LayoutError("title", _COVER_FULL)
-    page = pages[0]._page_box
-    seen: set[int] = set()
-    rects: list[tuple[str, float, float, float, float]] = []
-    for box in page.descendants():
-        el = getattr(box, "element", None)
-        if el is None or id(el) in seen or not hasattr(box, "border_box_x"):
-            continue
-        seen.add(id(el))
-        part = _cover_part(el)
-        if part:
-            x, y = box.border_box_x(), box.border_box_y()
-            rects.append((part, x, y, x + box.border_width(), y + box.border_height()))
-    if not {"title", "client.facts"} <= {r[0] for r in rects}:  # pushed off the fixed-height cover
-        raise LayoutError("title", _COVER_FULL)
-    bottom = page.margin_height()
-    for i, (part, x0, y0, x1, y1) in enumerate(rects):
-        if y1 > bottom + 0.5:
-            raise LayoutError(part, _COVER_FULL)
-        for other, a0, b0, a1, b1 in rects[i + 1 :]:
-            if x0 < a1 - 0.5 and a0 < x1 - 0.5 and y0 < b1 - 0.5 and b0 < y1 - 0.5:
-                raise LayoutError(part, f"封面上与 {other} 重叠，{_COVER_HINT}")  # noqa: RUF001
+    files = set()
+    for _sec, items in section_prims(content, style):
+        for p, path in items:
+            if isinstance(p, Image):
+                f = Path(p.path)
+                f = (f if f.is_absolute() else base_dir / f).resolve()
+                try:
+                    with PILImage.open(f) as im:
+                        im.load()
+                except (OSError, ValueError) as exc:
+                    raise RenderError(path, f"图片无法读取（文件损坏或格式不支持）：{exc}") from exc  # noqa: RUF001
+                files.add(f)
+    return frozenset(files)
 
 
 def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> list[str]:
+    images = _image_files(content, style, base_dir)
     try:
         from weasyprint import HTML
     except ImportError as exc:
-        raise RuntimeError("当前环境缺少 weasyprint，无法生成 PDF（沙箱镜像已预装）") from exc  # noqa: RUF001
+        raise PdfUnavailableError(
+            "当前环境缺少 weasyprint，无法生成 PDF（沙箱镜像已预装）"  # noqa: RUF001
+        ) from exc
     from hpr.theme import build_theme
 
+    fetcher = make_fetcher(base_dir, images)
     html, warnings = build_html(content, style, build_theme(style, "pdf"), base_dir)
-    document = HTML(string=html, base_url=str(base_dir)).render()
-    check_cover(document)
-    document.write_pdf(str(out_path))
-    return warnings
+    logger = logging.getLogger("weasyprint")
+    collect = _Collect()
+    logger.addHandler(collect)
+    try:
+        document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
+        check_cover(document)
+        check_footer(document)
+        document.write_pdf(str(out_path))
+    finally:
+        logger.removeHandler(collect)
+    return warnings + collect.messages

@@ -9,7 +9,8 @@ from PIL import Image
 os.chdir("/workspace")
 skill = Path(os.environ["EXPERT_WORK_SKILLS_DIR"]) / "health-plan-report"
 sys.path.insert(0, str(skill / "scripts"))
-from hpr.pdf_html import build_html, check_cover  # noqa: E402
+from hpr.pdf_guard import check_cover, make_fetcher  # noqa: E402
+from hpr.pdf_html import build_html  # noqa: E402
 from hpr.ppt_layout import LayoutError  # noqa: E402
 from hpr.style import Layer, resolve  # noqa: E402
 from hpr.theme import build_theme  # noqa: E402
@@ -44,4 +45,21 @@ crowded["subtitle"] = "第 1 阶段 · 这是一个较长的副标题，用于�
 for variant in ("band", "split", "minimal"):
     err = cover_error(crowded, [Layer("x", {"cover.variant": variant})])
     check(err is not None, f"{variant}: an over-full cover must be a LayoutError")
+
+# deny-by-default fetcher: remote and out-of-tree file URLs are refused (weasyprint logs, skips)
+import logging  # noqa: E402
+
+seen: list[str] = []
+
+
+class _Grab(logging.Handler):
+    def emit(self, record):
+        seen.append(record.getMessage())
+
+
+logging.getLogger("weasyprint").addHandler(_Grab())
+probe = '<p>x</p><img src="http://example.invalid/a.png"><img src="file:///etc/hostname">'
+HTML(string=probe, base_url=str(base), url_fetcher=make_fetcher(base, frozenset())).render()
+refused = [m for m in seen if "不允许加载外部资源" in m]
+check(len(refused) == 2, f"fetcher must refuse both URLs: {seen}")
 print("PASS case_hpr_pdf_cover")

@@ -11,8 +11,10 @@ from pathlib import Path
 
 import pytest
 from hpr import ppt_charts, theme
+from hpr.blocks import RenderError
 from hpr.content import required_texts
-from hpr.pdf_html import build_html, check_cover, css_string
+from hpr.pdf_guard import check_cover, check_footer, check_url
+from hpr.pdf_html import build_html, css_string, render_pdf
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import LayoutError
 from hpr.prims import Chart
@@ -118,7 +120,86 @@ def test_toc_rules(sample, base):
 
 
 def test_css_string_escapes():
-    assert css_string('a"b\\c\nd') == '"a\\"b\\\\c\\A d"'
+    assert css_string('a"b\\c\nd') == '"a\\22 b\\5C c\\A d"'
+
+
+HOSTILE = '李先生</style><img src="http://x/y">\r\f\u2028方案'
+
+
+def test_css_string_is_one_token_without_raw_markup_or_controls():
+    out = css_string(HOSTILE)
+    inner = out[1:-1]
+    assert out[0] == out[-1] == '"' and '"' not in inner
+    assert "<" not in out and ">" not in out
+    assert not any(ord(c) < 0x20 or c in "\u2028\u2029\x7f" for c in out)
+
+
+def test_hostile_title_and_org_cannot_inject_markup(sample, base):
+    sample["title"] = HOSTILE
+    sample["brand"]["org_name"] = HOSTILE
+    html, _ = _html(sample, base)
+    assert html.count("</style>") == 1
+    assert '<img src="http' not in html
+    assert not any(c in html for c in "\r\f\u2028")  # would garble the PDF text layer
+    style = html[html.index("<style>") + len("<style>") : html.index("</style>")]
+    assert "<" not in style
+
+
+@pytest.mark.parametrize(
+    ("url", "ok"),
+    [
+        ("data:image/png;base64,AAAA", True),
+        ("http://x/y.png", False),
+        ("https://x/y.png", False),
+        ("ftp://x/y.png", False),
+        ("file://remote-host/etc/passwd", False),
+    ],
+)
+def test_url_policy_schemes(tmp_path, url, ok):
+    if ok:
+        check_url(url, tmp_path)
+    else:
+        with pytest.raises(ValueError, match="不允许"):
+            check_url(url, tmp_path)
+
+
+def test_url_policy_files(tmp_path):
+    base = tmp_path / "work"
+    base.mkdir()
+    inside = base / "a.png"
+    outside = tmp_path / "secret.png"
+    check_url(inside.as_uri(), base)
+    for bad in (outside.as_uri(), (base / ".." / "secret.png").as_uri()):
+        with pytest.raises(ValueError):
+            check_url(bad, base)
+    check_url(outside.as_uri(), base, frozenset({outside.resolve()}))
+
+
+def test_chart_and_its_caption_stay_together(sample, base):
+    html, _ = _html(sample, base)
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    keep = html[html.index('<div class="keep">') :]
+    assert (
+        keep.index('<div class="chart">') < keep.index(trend["ref_text"]) < keep.index("</p></div>")
+    )
+
+
+def test_line_chart_labels_bounds_and_unit():
+    t = build_theme(resolve([]).style, "pdf")
+    line = Chart("line", ("09-01", "09-08"), (6.8, 6.2), "mmol/L", low=4.4, high=6.1)
+    svg = line_svg(line, t)
+    assert "目标下限 4.4" in svg and "目标上限 6.1" in svg and "mmol/L" in svg
+
+
+def test_corrupt_image_is_a_block_error_not_a_crash(sample, base):
+    noisy = PILImage.effect_noise((640, 360), 64).convert("RGB")
+    noisy.save(base / "trend-note.png")
+    data = (base / "trend-note.png").read_bytes()
+    (base / "trend-note.png").write_bytes(data[: len(data) // 2])  # header fine, body truncated
+    with pytest.raises(RenderError) as exc:
+        render_pdf(sample, resolve([], sample).style, base / "x.pdf", base)
+    assert exc.value.path.startswith("sections[") and "图片无法读取" in str(exc.value)
+    assert not (base / "x.pdf").exists()
 
 
 def test_user_text_is_escaped(sample, base):
@@ -241,6 +322,21 @@ def _cover_boxes(sub_y=260.0, meta_y=800.0):
         _Box("div", "sub", sub_y, 40),
         _Box("div", "meta", meta_y, 120),
     ]
+
+
+def _foot_doc(bottom):
+    cover = [_Box("section", "cover cover-band", 0, 1000)]
+    return _Doc(cover, [_Box("div", "pfoot", bottom - 60, 60)], [_Box("div", "pfoot", 900, 40)])
+
+
+def test_check_footer_accepts_footer_above_the_edge():
+    check_footer(_foot_doc(975))
+
+
+def test_check_footer_rejects_footer_running_into_the_edge():
+    with pytest.raises(LayoutError) as exc:
+        check_footer(_foot_doc(990))
+    assert exc.value.path == "brand.disclaimer"
 
 
 def test_check_cover_accepts_clean_layout():

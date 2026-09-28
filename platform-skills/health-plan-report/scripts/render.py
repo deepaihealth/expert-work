@@ -16,7 +16,7 @@ from _cli import emit_json
 from hpr.blocks import RenderError
 from hpr.content import iter_blocks, load_content, required_texts, validate_content
 from hpr.measure import Measurer
-from hpr.pdf_html import render_pdf
+from hpr.pdf_html import PdfUnavailableError, render_pdf
 from hpr.ppt_draw import render_pptx
 from hpr.ppt_layout import LayoutError
 from hpr.qa import qa_pdf, qa_pptx
@@ -29,6 +29,13 @@ _BASENAME = re.compile(r"^[^/\\\x00]{1,120}$")
 def _fail(errors: list[str]) -> int:
     emit_json({"ok": False, "errors": errors})
     return 1
+
+
+def _remove(paths: list[Path]) -> None:
+    """Drop this run's partial outputs; none existed before (existing ones are refused), so a
+    rerun with the same basename works after a failure."""
+    for p in paths:
+        p.unlink(missing_ok=True)
 
 
 def _missing_images(content: dict, base_dir: Path) -> list[str]:
@@ -102,8 +109,12 @@ def main(argv: list[str] | None = None) -> int:
             warnings += render_pdf(content, style, targets["pdf"], base_dir)
             qa["pdf"] = qa_pdf(targets["pdf"], content, required, build_theme(style, "pdf"))
             files["pdf"] = str(targets["pdf"])
-    except (RenderError, LayoutError, RuntimeError) as exc:
+    except (RenderError, LayoutError, PdfUnavailableError) as exc:
+        _remove(outputs)
         return _fail([str(exc)])
+    except BaseException:
+        _remove(outputs)
+        raise
     warnings = list(dict.fromkeys(warnings))
     ok = all(q["status"] == "passed" for q in qa.values())
     if not ok:

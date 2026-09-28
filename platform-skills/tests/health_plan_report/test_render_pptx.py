@@ -417,3 +417,21 @@ def test_end_slide_long_signature_gets_its_measured_height(workdir, sample):
     ]
     assert sig.height / 12700 > 16 * 1.35 * 1.5
     assert pptx_overflow(out, M) == []
+
+
+def test_partial_failure_removes_this_runs_outputs_so_rerun_works(workdir, monkeypatch, capsys):
+    mod = _load_render()
+
+    def broken_pdf(content, style, out_path, base_dir):
+        out_path.write_bytes(b"%PDF-partial")
+        raise LayoutError("brand.disclaimer", "页脚过长")
+
+    monkeypatch.setattr(mod, "render_pdf", broken_pdf)
+    out = workdir / "out"
+    args = ["--content", str(workdir / "plan.json"), "--out-dir", str(out), "--basename", "q"]
+    code = mod.main([*args, "--format", "both"])
+    summary = json.loads(capsys.readouterr().out)
+    assert code == 1 and "页脚过长" in summary["errors"][0]
+    assert sorted(p.name for p in out.iterdir()) == []
+    assert mod.main([*args, "--format", "pptx"]) == 0
+    assert (out / "q.pptx").is_file()

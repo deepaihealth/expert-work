@@ -15,7 +15,7 @@ from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Pt
 
-from hpr.blocks import section_prims
+from hpr.blocks import RenderError, section_prims
 from hpr.icons import ICONS
 from hpr.logo import trimmed_logo
 from hpr.measure import LINE, Measurer
@@ -297,7 +297,7 @@ def _check_titles(content: dict, ctx: Ctx, style: dict) -> None:
     t, m = ctx.theme, ctx.m
     title_w = SLIDE_W - 2 * MARGIN_X - 100 - (40 if style["section.icons"] else 0)
     for si, sec in enumerate(content["sections"]):
-        if m.lines(sec["title"] + "（续）", title_w, t.title, True) > 1:  # noqa: RUF001
+        if m.lines(sec["title"], title_w, t.title, True) > 1:
             raise LayoutError(f"sections[{si}].title", "章节标题过长，页标题只能一行，请缩短")  # noqa: RUF001
 
 
@@ -962,7 +962,10 @@ def _draw_image(cv: Canvas, pl: Placed, im: Image, ctx: Ctx) -> None:
     w, h = image_size(im, pl.w, ctx)
     path = Path(im.path)
     path = path if path.is_absolute() else ctx.base_dir / path
-    cv.picture(path, pl.x, pl.y, w, h, "hpr:image")
+    try:
+        cv.picture(path, pl.x, pl.y, w, h, "hpr:image")
+    except (OSError, ValueError) as exc:
+        raise RenderError(pl.path, f"图片无法读取（文件损坏或格式不支持）：{exc}") from exc  # noqa: RUF001
     if im.caption:
         ch = m.lines(im.caption, pl.w, t.caption) * lh(t.caption)
         cv.text(pl.x, pl.y + h + t.gap_xs, pl.w, ch, im.caption, t.caption, t.muted)
