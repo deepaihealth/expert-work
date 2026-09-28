@@ -213,7 +213,7 @@ PPT 与 PDF 各自只实现原语的绘制；版式引擎（测量、分页、�
 | 封面样式 | `cover.variant` | `band`（整版色块 + 数据曲线图形，默认）/ `split`（左右分栏）/ `minimal`（白底极简） |
 | 目录 | `toc` | `auto`（PPT ≥ 8 个章节、PDF ≥ 6 页自动加）/ 开 / 关 |
 | 章节图标 | `section.icons` | 开 / 关 |
-| 积木版式 | `blocks.<kind>.variant` 或 `blocks.<章节id>[.<积木id>].variant` | 见 §4.3 各积木可选版式；精确定位优先于按 kind 全局设置 |
+| 积木版式 | `blocks.<kind>.variant`（按类型全局）/ `sections.<章节id>.variant` / `sections.<章节id>.<积木id或1起序号>.variant`（精确定位） | 见 §4.3 各积木可选版式；优先级：积木精确 > 章节 > 类型 > 默认 |
 | 格式与纸张 | `output.formats` | `pptx` / `pdf` / 两者；PPT 固定 16:9，PDF 固定 A4 竖版 |
 
 章节的增删、改名、调序属于内容，由调用方改内容 JSON，不设样式键。
