@@ -11,11 +11,13 @@ def trimmed_logo(path: Path) -> tuple[bytes, int, int] | None:
     The input file is never modified or copied on disk."""
     from PIL import Image as PILImage
 
+    from hpr.images import IMAGE_ERRORS, strict_images
+
     try:
-        with PILImage.open(path) as im:
+        with strict_images(), PILImage.open(path) as im:
             im.load()
             rgba = im.convert("RGBA")
-    except (OSError, ValueError):
+    except IMAGE_ERRORS:
         return None
     bbox = rgba.getchannel("A").getbbox()
     if bbox is not None:

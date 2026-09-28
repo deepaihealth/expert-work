@@ -5,25 +5,41 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
+from hpr.blocks import RenderError
 from hpr.ppt_layout import LayoutError
 
 FOOT_EDGE_PX = 5 / 25.4 * 96  # footer text must end at least 5 mm above the paper edge
 
 
+def file_path(url: str) -> Path | None:
+    """The resolved local path a file: URL opens, decoded exactly once — the way urllib's
+    FileHandler (weasyprint's fetcher) decodes it; None for other URLs."""
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "file" or parts.netloc not in ("", "localhost"):
+        return None
+    return Path(url2pathname(parts.path)).resolve()
+
+
+def raise_for_failed_images(failed_urls: list[str], images: dict[Path, str]) -> None:
+    """An image block that weasyprint refused or failed to load must not silently vanish."""
+    for url in failed_urls:
+        path = file_path(url)
+        if path is not None and path in images:
+            raise RenderError(images[path], f"图片未能嵌入 PDF：{url}")  # noqa: RUF001
+
+
 def check_url(url: str, base_dir: Path, allowed_files: frozenset[Path] = frozenset()) -> None:
     """Allow only data: URIs and file: URIs inside base_dir or explicitly referenced; raise
     ValueError for anything else (weasyprint then logs the resource as failed and skips it)."""
-    parts = urlsplit(url)
-    scheme = parts.scheme.lower()
+    scheme = urlsplit(url).scheme.lower()
     if scheme == "data":
         return
-    if scheme == "file" and parts.netloc in ("", "localhost"):
-        path = Path(url2pathname(unquote(parts.path))).resolve()
-        if path in allowed_files or path.is_relative_to(base_dir.resolve()):
-            return
+    path = file_path(url)
+    if path is not None and (path in allowed_files or path.is_relative_to(base_dir.resolve())):
+        return
     raise ValueError(f"不允许加载外部资源：{url}")  # noqa: RUF001
 
 

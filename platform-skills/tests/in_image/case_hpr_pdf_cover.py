@@ -62,4 +62,17 @@ probe = '<p>x</p><img src="http://example.invalid/a.png"><img src="file:///etc/h
 HTML(string=probe, base_url=str(base), url_fetcher=make_fetcher(base, frozenset())).render()
 refused = [m for m in seen if "不允许加载外部资源" in m]
 check(len(refused) == 2, f"fetcher must refuse both URLs: {seen}")
+
+# an image block weasyprint cannot load (here: refused) fails the render instead of vanishing
+import hpr.pdf_html as pdf_html  # noqa: E402
+from hpr.blocks import RenderError  # noqa: E402
+
+pdf_html.make_fetcher = lambda _base, _files: make_fetcher(Path("/nonexistent"), frozenset())
+try:
+    pdf_html.render_pdf(sample, resolve([], sample).style, base / "refused.pdf", base)
+    raised = None
+except RenderError as exc:
+    raised = exc
+check(raised is not None and raised.path.startswith("sections["), f"refused image: {raised}")
+check(not (base / "refused.pdf").exists(), "no PDF may be written when an image is dropped")
 print("PASS case_hpr_pdf_cover")

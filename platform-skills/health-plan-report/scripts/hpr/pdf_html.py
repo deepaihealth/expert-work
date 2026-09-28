@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import unicodedata
 from html import escape
 from pathlib import Path
 from typing import Any
 
-from hpr.blocks import RenderError, section_prims
+from hpr.blocks import section_prims
 from hpr.icons import icon_for_section
+from hpr.images import image_blocks
 from hpr.logo import trimmed_logo
-from hpr.pdf_guard import check_cover, check_footer, make_fetcher
+from hpr.pdf_guard import check_cover, check_footer, make_fetcher, raise_for_failed_images
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import brand_line
 from hpr.prims import (
@@ -483,6 +485,9 @@ class PdfUnavailableError(Exception):
     """weasyprint is not installed in this environment."""
 
 
+_FAILED_URL = re.compile(r"Failed to load \w+ at '([^']*)'")
+
+
 class _Collect(logging.Handler):
     """weasyprint's resource-loading failures (it logs and skips them) become render warnings;
     environment chatter (e.g. font-subsetting backend notices) is left to the log."""
@@ -490,34 +495,19 @@ class _Collect(logging.Handler):
     def __init__(self) -> None:
         super().__init__(logging.WARNING)
         self.messages: list[str] = []
+        self.failed: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
         if "Failed to load" in msg:
             self.messages.append(f"PDF 资源未能加载：{msg}")  # noqa: RUF001
-
-
-def _image_files(content: dict, style: dict, base_dir: Path) -> frozenset[Path]:
-    """Resolved paths of the image blocks; each must decode, or the block path is reported."""
-    from PIL import Image as PILImage
-
-    files = set()
-    for _sec, items in section_prims(content, style):
-        for p, path in items:
-            if isinstance(p, Image):
-                f = Path(p.path)
-                f = (f if f.is_absolute() else base_dir / f).resolve()
-                try:
-                    with PILImage.open(f) as im:
-                        im.load()
-                except (OSError, ValueError) as exc:
-                    raise RenderError(path, f"图片无法读取（文件损坏或格式不支持）：{exc}") from exc  # noqa: RUF001
-                files.add(f)
-    return frozenset(files)
+            m = _FAILED_URL.search(msg)
+            if m:
+                self.failed.append(m.group(1))
 
 
 def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> list[str]:
-    images = _image_files(content, style, base_dir)
+    images = image_blocks(content, style, base_dir)
     try:
         from weasyprint import HTML
     except ImportError as exc:
@@ -526,7 +516,7 @@ def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> li
         ) from exc
     from hpr.theme import build_theme
 
-    fetcher = make_fetcher(base_dir, images)
+    fetcher = make_fetcher(base_dir, frozenset(images))
     html, warnings = build_html(content, style, build_theme(style, "pdf"), base_dir)
     logger = logging.getLogger("weasyprint")
     collect = _Collect()
@@ -535,6 +525,7 @@ def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> li
         document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
         check_cover(document)
         check_footer(document)
+        raise_for_failed_images(collect.failed, images)
         document.write_pdf(str(out_path))
     finally:
         logger.removeHandler(collect)

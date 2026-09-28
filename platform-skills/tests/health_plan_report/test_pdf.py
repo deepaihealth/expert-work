@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+import urllib.request
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 from hpr import ppt_charts, theme
 from hpr.blocks import RenderError
 from hpr.content import required_texts
-from hpr.pdf_guard import check_cover, check_footer, check_url
+from hpr.pdf_guard import check_cover, check_footer, check_url, file_path, raise_for_failed_images
 from hpr.pdf_html import build_html, css_string, render_pdf
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import LayoutError
@@ -380,3 +381,63 @@ def test_pdf_without_weasyprint_is_a_clear_error(sample, base):
     )
     assert res.returncode == 1
     assert "weasyprint" in json.loads(res.stdout)["errors"][0]
+
+
+def test_url_policy_allows_referenced_file_with_percent_in_name(tmp_path):
+    base = tmp_path / "work"
+    base.mkdir()
+    outside = tmp_path / "b%41.png"  # a real file name containing "%41"
+    check_url(outside.as_uri(), base, frozenset({outside.resolve()}))
+
+
+def test_url_policy_refuses_single_encoded_traversal(tmp_path):
+    base = tmp_path / "work"
+    base.mkdir()
+    for tail in ("/%2e%2e/secret.png", "/x%2f..%2f..%2fsecret.png"):
+        with pytest.raises(ValueError):
+            check_url(base.as_uri() + tail, base)
+
+
+def test_url_policy_refuses_symlink_named_like_an_encoded_slash(tmp_path):
+    base = tmp_path / "work"
+    base.mkdir()
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "hostname").write_text("secret", encoding="utf-8")
+    (base / "L%2fX").symlink_to(tmp_path / "etc")
+    url = (base / "L%2fX" / "hostname").as_uri()
+    assert "L%252fX" in url
+    with pytest.raises(ValueError):
+        check_url(url, base)
+
+
+def test_policy_judges_the_path_that_is_actually_opened(tmp_path):
+    base = tmp_path / "work"
+    (base / "%2e%2e").mkdir(parents=True)
+    (base / "%2e%2e" / "f.txt").write_text("inside", encoding="utf-8")
+    (tmp_path / "f.txt").write_text("outside", encoding="utf-8")
+    url = base.as_uri() + "/%252e%252e/f.txt"
+    check_url(url, base)
+    with urllib.request.urlopen(url) as fh:  # noqa: S310 — local file: URL on purpose
+        opened = fh.read().decode()
+    assert file_path(url).read_text(encoding="utf-8") == opened == "inside"
+
+
+def test_failed_image_block_is_an_error_not_a_silent_drop(tmp_path):
+    img = (tmp_path / "b%41.png").resolve()
+    images = {img: "sections[2].blocks[1]"}
+    raise_for_failed_images(["data:image/png;base64,AAAA"], images)  # the LOGO may degrade
+    with pytest.raises(RenderError) as exc:
+        raise_for_failed_images([img.as_uri()], images)
+    assert exc.value.path == "sections[2].blocks[1]"
+
+
+@pytest.mark.parametrize("kind", ["bomb-error", "bomb-warning"])
+def test_decompression_bomb_image_is_a_block_error(base, sample, kind, huge_png, monkeypatch):
+    if kind == "bomb-error":  # header declares 20000x20000; nothing is allocated
+        (base / "trend-note.png").write_bytes(huge_png(20000, 20000))
+    else:  # a real, decodable image just above a lowered pixel limit: warning, not error
+        monkeypatch.setattr(PILImage, "MAX_IMAGE_PIXELS", 1000)
+        PILImage.new("RGB", (40, 40), "#DDEEEE").save(base / "trend-note.png")
+    with pytest.raises(RenderError) as exc:
+        render_pdf(sample, resolve([], sample).style, base / "x.pdf", base)
+    assert exc.value.path.startswith("sections[")

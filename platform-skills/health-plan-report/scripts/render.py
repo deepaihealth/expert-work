@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -90,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir / f"{args.basename}.qa.json",
         out_dir / f"{args.basename}.params-report.json",
     ]
-    existing = [str(p) for p in outputs if p.exists()]
+    existing = [str(p) for p in outputs if os.path.lexists(p)]  # dangling symlinks too
     if existing:
         return _fail(
             [f"文件已存在，不覆盖：{p}（请换一个 basename，例如用新的生成时间）" for p in existing]  # noqa: RUF001

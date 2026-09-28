@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from hpr.icons import icon_for_section
+from hpr.images import IMAGE_ERRORS, strict_images
 from hpr.measure import LINE, Measurer
 from hpr.prims import (
     Bullets,
@@ -327,9 +328,9 @@ def image_size(img: Image, w: float, ctx: Ctx) -> tuple[float, float]:
     path = Path(img.path)
     path = path if path.is_absolute() else ctx.base_dir / path
     try:
-        with PILImage.open(path) as im:
+        with strict_images(), PILImage.open(path) as im:
             iw, ih = im.size
-    except (OSError, ValueError) as exc:
+    except IMAGE_ERRORS as exc:
         raise LayoutError(img.path, f"找不到图片文件或无法读取：{exc}") from exc  # noqa: RUF001
     box_w = min(w, 520.0)
     h = min(IMAGE_MAX_H, box_w * ih / iw)

@@ -17,6 +17,7 @@ from pptx.util import Emu, Pt
 
 from hpr.blocks import RenderError, section_prims
 from hpr.icons import ICONS
+from hpr.images import IMAGE_ERRORS, image_blocks, strict_images
 from hpr.logo import trimmed_logo
 from hpr.measure import LINE, Measurer
 from hpr.ppt_charts import add_chart
@@ -963,8 +964,9 @@ def _draw_image(cv: Canvas, pl: Placed, im: Image, ctx: Ctx) -> None:
     path = Path(im.path)
     path = path if path.is_absolute() else ctx.base_dir / path
     try:
-        cv.picture(path, pl.x, pl.y, w, h, "hpr:image")
-    except (OSError, ValueError) as exc:
+        with strict_images():
+            cv.picture(path, pl.x, pl.y, w, h, "hpr:image")
+    except IMAGE_ERRORS as exc:
         raise RenderError(pl.path, f"图片无法读取（文件损坏或格式不支持）：{exc}") from exc  # noqa: RUF001
     if im.caption:
         ch = m.lines(im.caption, pl.w, t.caption) * lh(t.caption)
@@ -1075,6 +1077,7 @@ def render_pptx(
     theme = build_theme(style, "pptx")
     ctx = make_ctx(content, theme, m, base_dir)
     _check_titles(content, ctx, style)
+    image_blocks(content, style, base_dir)  # every image decodes, or its block path is reported
     pages = paginate(section_prims(content, style), ctx)
     warnings: list[str] = []
     prs = Presentation()
