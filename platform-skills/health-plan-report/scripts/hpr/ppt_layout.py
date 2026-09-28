@@ -403,12 +403,37 @@ def _fit_count(heights: list[float], gap: float, avail: float) -> int:
     return n
 
 
-def split(prim: Prim, w: float, avail: float, ctx: Ctx) -> tuple[Prim | None, Prim | None]:
-    """Split so that head fits in ``avail``. (None, prim) when nothing fits."""
+MIN_TABLE_ROWS = 2  # a split table keeps at least this many rows on each side
+MIN_PARA_LINES = 3  # a split paragraph keeps at least this many lines on each side
+
+
+def keep_apart(k: int, n: int, least: int, force: bool) -> int:
+    """How many of ``n`` units to put before a break when ``k`` fit: both sides keep at least
+    ``least`` units, else 0 (the element moves whole). ``force`` (the element starts a page and
+    still does not fit) relaxes only what cannot be honoured."""
+    if k >= n:
+        return n
+    if k < 1:
+        return 0
+    kept = min(k, n - least)
+    if kept >= least:
+        return kept
+    if not force:
+        return 0
+    return kept if kept >= 1 else k
+
+
+def split(
+    prim: Prim, w: float, avail: float, ctx: Ctx, *, force: bool = False
+) -> tuple[Prim | None, Prim | None]:
+    """Split so that head fits in ``avail``. (None, prim) when nothing fits, or when a split
+    would leave a stub (see keep_apart); ``force`` accepts a stub rather than no split."""
     t, m = ctx.theme, ctx.m
     if isinstance(prim, Paragraph):
         pad = t.gap_m if prim.boxed else 0.0
-        n = int((avail - 2 * pad) // lh(t.body))
+        fit = int((avail - 2 * pad) // lh(t.body))
+        total = m.lines(prim.text, w - 2 * pad, t.body)
+        n = keep_apart(fit, total, MIN_PARA_LINES, force) if fit >= 1 else 0
         if n < 1:
             return None, prim
         head, tail = m.split_text(prim.text, w - 2 * pad, t.body, n)
@@ -429,6 +454,7 @@ def split(prim: Prim, w: float, avail: float, ctx: Ctx) -> tuple[Prim | None, Pr
     if isinstance(prim, Table):
         geo = table_geometry(prim, w, ctx)
         k = _fit_count(geo.row_h, 0.0, avail - geo.header_h)
+        k = keep_apart(k, len(prim.rows), MIN_TABLE_ROWS, force) if k else 0
         return _cut(prim, "rows", k)
     if isinstance(prim, KeyValue):
         rows = kv_rows(prim)
@@ -503,7 +529,14 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
         return pg
 
     def min_head(prim: Prim) -> float:
+        """The least of ``prim`` that may end a page (keep_apart's minimum head)."""
         full = measure(prim, BODY_W, ctx)
+        if isinstance(prim, Table):
+            geo = table_geometry(prim, BODY_W, ctx)
+            return min(full, geo.header_h + sum(geo.row_h[:MIN_TABLE_ROWS]))
+        if isinstance(prim, Paragraph):
+            pad = 2 * t.gap_m if prim.boxed else 0.0
+            return min(full, MIN_PARA_LINES * lh(t.body) + pad)
         return min(full, 2 * lh(t.body) + 2 * t.gap_m) if splittable(prim) else full
 
     def captioned(i: int, items: list[tuple[Prim, str]]) -> bool:
@@ -573,6 +606,8 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
                     continue
                 if splittable(pending):
                     head_part, tail = split(pending, BODY_W, bottom - y, ctx)
+                    if head_part is None and at_top:
+                        head_part, tail = split(pending, BODY_W, bottom - y, ctx, force=True)
                     if head_part is None and at_top:
                         raise LayoutError(path, "单个条目超过一页，请把内容拆小")  # noqa: RUF001
                     if head_part is not None:
