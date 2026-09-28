@@ -485,6 +485,33 @@ def required_texts(content: dict) -> list[str]:
     return out
 
 
+_PATH_KEYS = frozenset({"path", "logo_path", "media_path"})
+_C0_BUT_TAB_LF = re.compile(r"[\x00-\x08\x0b-\x1f]")
+
+
+def normalize_text(s: str) -> str:
+    """Presentation-level whitespace only (spec §4.4): CRLF / CR become LF, every other C0
+    control except LF and TAB becomes a space. python-pptx would store them as literal
+    ``_x000D_`` escapes and weasyprint garbles the text layer, so both writers see this form."""
+    return _C0_BUT_TAB_LF.sub(" ", s.replace("\r\n", "\n").replace("\r", "\n"))
+
+
+def normalize_content(content: dict) -> dict:
+    """A new content dict with every display string normalised; file paths are left as given
+    (they name files, they are not text the reader sees)."""
+
+    def walk(value: Any, key: str | None) -> Any:
+        if isinstance(value, dict):
+            return {k: walk(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, key) for v in value]
+        if isinstance(value, str) and key not in _PATH_KEYS:
+            return normalize_text(value)
+        return value
+
+    return walk(content, None)
+
+
 def iter_blocks(content: dict) -> Iterator[tuple[int, str, int, dict]]:
     for si, sec in enumerate(content["sections"]):
         for bi, blk in enumerate(sec["blocks"], start=1):

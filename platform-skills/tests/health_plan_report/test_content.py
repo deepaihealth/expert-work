@@ -4,7 +4,13 @@ import sys
 from pathlib import Path
 
 from hpr.catalog import KINDS, VARIANTS
-from hpr.content import ContentError, load_content, required_texts, validate_content
+from hpr.content import (
+    ContentError,
+    load_content,
+    normalize_content,
+    required_texts,
+    validate_content,
+)
 
 SKILL_DIR = Path(__file__).resolve().parents[2] / "health-plan-report"
 SAMPLE = SKILL_DIR / "sample" / "sample-plan.json"
@@ -134,3 +140,18 @@ def test_validate_cli_exit_codes(tmp_path, sample):
     )
     assert res.returncode == 1
     assert json.loads(res.stdout)["errors"] == ["sections: 缺少必填字段"]
+
+
+def test_normalize_content_maps_line_ends_and_controls_without_mutating(sample):
+    para = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "paragraph")
+    para["text"] = "a\r\nb\rc\x0bd\x0ce\x00f\tg\nh\x1fi"
+    sample["client"]["facts"][0]["value"] = "x\r\ny"
+    sample["brand"]["logo_path"] = "logo\r.png"
+    before = json.dumps(sample, ensure_ascii=False)
+    out = normalize_content(sample)
+    assert json.dumps(sample, ensure_ascii=False) == before  # input untouched
+    para_out = next(b for s in out["sections"] for b in s["blocks"] if b["kind"] == "paragraph")
+    assert para_out["text"] == "a\nb\nc d e f\tg\nh i"
+    assert out["client"]["facts"][0]["value"] == "x\ny"
+    assert out["brand"]["logo_path"] == "logo\r.png"  # file names are not display text
+    assert out["title"] == sample["title"]

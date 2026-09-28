@@ -461,3 +461,19 @@ def test_decompression_bomb_image_is_a_block_error_in_pptx(
     with pytest.raises(RenderError) as exc:
         _render(sample, workdir)
     assert exc.value.path.startswith("sections[")
+
+
+def test_crlf_and_control_characters_in_caller_text_still_pass_pptx_qa(workdir, sample, capsys):
+    blocks = [b for s in sample["sections"] for b in s["blocks"]]
+    next(b for b in blocks if b["kind"] == "paragraph")["text"] = "第一段\r\n第二段\r第三段"
+    next(b for b in blocks if b["kind"] == "callout")["text"] = "第一行\x0b第二行"
+    next(b for b in blocks if b["kind"] == "table")["rows"][0][0] = "A\x0cB"
+    (workdir / "cc.json").write_text(json.dumps(sample, ensure_ascii=False), encoding="utf-8")
+    code = _load_render().main(
+        ["--content", str(workdir / "cc.json"), "--out-dir", str(workdir / "o"), "--basename", "c"]
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert code == 0, summary
+    assert summary["qa"]["pptx"]["missing"] == []
+    corpus = pptx_corpus(workdir / "o" / "c.pptx")
+    assert "_x000" not in corpus

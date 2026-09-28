@@ -15,7 +15,13 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "shared"))
 
 from _cli import emit_json
 from hpr.blocks import RenderError
-from hpr.content import iter_blocks, load_content, required_texts, validate_content
+from hpr.content import (
+    iter_blocks,
+    load_content,
+    normalize_content,
+    required_texts,
+    validate_content,
+)
 from hpr.measure import Measurer
 from hpr.pdf_html import PdfUnavailableError, render_pdf
 from hpr.ppt_draw import render_pptx
@@ -73,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     errs = validate_content(content)
     if errs:
         return _fail([str(e) for e in errs])
+    content = normalize_content(content)
     base_dir = Path(args.content).resolve().parent
     img_errs = _missing_images(content, base_dir)
     if img_errs:
