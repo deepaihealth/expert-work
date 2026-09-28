@@ -21,8 +21,9 @@ from expert_work.common.threat_patterns import scan_for_threats
 from orchestrator.tools import sandbox_image_contract as contract
 
 # Not imported from conftest: with --import-mode=importlib a test module cannot
-# reliably ``import conftest``. Keep in sync with conftest.EXPECTED_SKILLS.
-EXPECTED_SKILLS = ("docx", "pptx", "xlsx", "pdf")
+# reliably ``import conftest``. Keep in sync with conftest.ALL_SKILLS (minus
+# health-plan-report, which isn't part of the shared office-skill contract below).
+OFFICE_SKILLS = ("docx", "pptx", "xlsx", "pdf")
 
 # Ruling R2: the JS-route ban targets actionable JS instructions, not the
 # required env-block sentence "没有 npm：不要走任何 JavaScript 路线。" (whose own  # noqa: RUF003
@@ -46,11 +47,11 @@ def _frontmatter(md: str) -> dict:
     return yaml.safe_load(fm)
 
 
-def test_exactly_the_four_office_skills_exist(built_packages):
-    assert sorted(built_packages) == sorted(EXPECTED_SKILLS)
+def test_exactly_the_expected_skills_exist(built_packages):
+    assert sorted(built_packages) == sorted((*OFFICE_SKILLS, "health-plan-report"))
 
 
-@pytest.mark.parametrize("name", EXPECTED_SKILLS)
+@pytest.mark.parametrize("name", OFFICE_SKILLS)
 def test_platform_zip_parse_accepts_package(built_packages, name):
     payload = parse_skill_zip(built_packages[name].read_bytes(), asset_tier=False)
     assert payload.name == name
@@ -62,7 +63,7 @@ def test_platform_zip_parse_accepts_package(built_packages, name):
     moderate_required_models(payload.required_models)
 
 
-@pytest.mark.parametrize("name", EXPECTED_SKILLS)
+@pytest.mark.parametrize("name", OFFICE_SKILLS)
 def test_threat_scans_pass_body_and_every_text_file(unpacked_skills, name):
     for f in sorted((unpacked_skills / name).rglob("*")):
         if f.is_file():
@@ -79,7 +80,7 @@ def test_threat_scans_pass_body_and_every_text_file(unpacked_skills, name):
             )
 
 
-@pytest.mark.parametrize("name", EXPECTED_SKILLS)
+@pytest.mark.parametrize("name", OFFICE_SKILLS)
 def test_frontmatter(unpacked_skills, name):
     fm = _frontmatter((unpacked_skills / name / "SKILL.md").read_text(encoding="utf-8"))
     assert fm["name"] == name
@@ -88,7 +89,7 @@ def test_frontmatter(unpacked_skills, name):
     assert fm["expert_work"] == {"lazy": True, "category": "通用"}
 
 
-@pytest.mark.parametrize("name", EXPECTED_SKILLS)
+@pytest.mark.parametrize("name", OFFICE_SKILLS)
 def test_body_length_and_no_js_route(unpacked_skills, name):
     root = unpacked_skills / name
     body = (root / "SKILL.md").read_text(encoding="utf-8").split("---\n", 2)[2]
@@ -97,7 +98,7 @@ def test_body_length_and_no_js_route(unpacked_skills, name):
         assert not _JS_ROUTE.search(f.read_text(encoding="utf-8")), f"JS route in {f}"
 
 
-@pytest.mark.parametrize("name", EXPECTED_SKILLS)
+@pytest.mark.parametrize("name", OFFICE_SKILLS)
 def test_every_referenced_script_exists_and_every_script_is_referenced(unpacked_skills, name):
     root = unpacked_skills / name
     body = (root / "SKILL.md").read_text(encoding="utf-8")
@@ -116,7 +117,7 @@ def test_every_referenced_script_exists_and_every_script_is_referenced(unpacked_
 
 def test_env_block_identical_across_skills_modulo_name(unpacked_skills):
     blocks = {}
-    for name in EXPECTED_SKILLS:
+    for name in OFFICE_SKILLS:
         m = _ENV_BLOCK.search((unpacked_skills / name / "SKILL.md").read_text(encoding="utf-8"))
         assert m, f"{name}: no '## 环境' section"
         blocks[name] = m.group(1).replace(f"/{name}/", "/<skill>/")
@@ -142,7 +143,7 @@ def test_env_block_claims_match_sandbox_contract(unpacked_skills):
     assert claimed_bins <= bins, f"claimed but not preinstalled: {claimed_bins - bins}"
 
 
-@pytest.mark.parametrize("name", EXPECTED_SKILLS)
+@pytest.mark.parametrize("name", OFFICE_SKILLS)
 def test_check_output_section_renders_with_read_page_before_ask_image(unpacked_skills, name):
     """R14 — a workspace preview.py PNG is not viewable by ask_image on the real platform:
 
