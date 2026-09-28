@@ -468,8 +468,11 @@ def resolve(layers: list[Layer], content: dict | None = None) -> Resolution:
             final_entry[key] = entry
     bg, bg_note = _fix_background(style["color.background"], style["color.primary"])
     style["color.background"] = bg
-    if bg_note and "color.background" in final_entry:
-        final_entry["color.background"].update(status="adjusted", value=bg, note=bg_note)
+    if "color.background" in final_entry:
+        if bg_note:
+            final_entry["color.background"].update(status="adjusted", value=bg, note=bg_note)
+        else:
+            final_entry["color.background"]["value"] = bg
     primary, p_note = _fix_primary(style["color.primary"], bg)
     style["color.primary"] = primary
     if p_note and "color.primary" in final_entry:

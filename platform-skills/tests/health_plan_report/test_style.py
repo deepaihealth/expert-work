@@ -88,6 +88,14 @@ def test_background_keywords():
     assert tint != "#FFFFFF"
 
 
+def test_tint_background_report_value_is_final_hex():
+    res = resolve([Layer("x", {"color.background": "tint"})])
+    entry = _entry(res, "color.background")
+    assert entry["value"] == res.style["color.background"]
+    assert entry["value"].startswith("#")
+    assert entry["status"] == "applied"
+
+
 def test_low_contrast_primary_is_darkened():
     res = resolve([Layer("x", {"color.primary": "浅蓝"})])
     p = res.style["color.primary"]
