@@ -25,7 +25,7 @@
 | `footer.align` | `left` / `center` | `left` | PDF 页脚（署名/免责声明）对齐方式 |
 | `footer.page_number` | 开 / 关 | 开 | 是否显示页码 |
 | `cover.variant` | `band` / `split` / `minimal` | `band` | 封面版式 |
-| `toc` | `auto` / `on` / `off` | `auto` | 目录；`auto` 时章节数 ≥ 6 自动加目录 |
+| `toc` | `auto` / `on` / `off` | `auto` | 目录；`auto` 时 PDF 章节数 ≥ 6、PPTX 章节数 ≥ 8 自动加目录（两种格式阈值不同） |
 | `section.icons` | 开 / 关 | 开 | 章节标题旁是否显示图标 |
 | `output.formats` | `pptx` / `pdf` / `both` | `pptx`（`render.py --format` 会覆盖这一项） | 输出格式 |
 

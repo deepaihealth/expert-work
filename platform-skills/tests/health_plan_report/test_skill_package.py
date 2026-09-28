@@ -4,12 +4,14 @@ tenant/customer/employee/agent names), and the shared platform moderation/threat
 See Task 9 of .superpowers/sdd/2026-09-28-health-plan-report-skill/.
 """
 
+import inspect
 import re
 import zipfile
 from pathlib import Path
 
 import pytest
 import yaml
+from hpr import pdf_html, ppt_draw
 from hpr.catalog import VARIANTS
 from hpr.style import OPTIONS
 
@@ -24,6 +26,14 @@ from expert_work.common.threat_patterns import scan_for_threats
 NAME = "health-plan-report"
 REF = re.compile(r"\$EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/([A-Za-z0-9_]+\.py)")
 KEY = re.compile(r"`((?:color|type|layout|brand|footer|cover|section|output)\.[a-z_.]+|toc)`")
+_TOC_THRESHOLD = re.compile(r'len\(content\["sections"\]\)\s*>=\s*(\d+)')
+
+
+def _toc_threshold(fn) -> int:
+    """The literal section-count threshold `fn`'s source uses for `toc: auto`."""
+    m = _TOC_THRESHOLD.search(inspect.getsource(fn))
+    assert m, f"未在 {fn.__qualname__} 里找到 TOC 章节数阈值表达式"
+    return int(m.group(1))
 
 
 @pytest.fixture(scope="module")
@@ -90,6 +100,16 @@ def test_every_style_key_in_docs_exists(root):
         ), key
     for key in OPTIONS:
         assert f"`{key}`" in text, f"style-options.md 漏写 {key}"
+
+
+def test_toc_auto_thresholds_documented(root):
+    """PDF (`build_html`) and PPTX (`_show_toc`) use different section-count thresholds for
+    `toc: auto`; style-options.md must state each format's real number, not one shared number."""
+    pdf_n = _toc_threshold(pdf_html.build_html)
+    pptx_n = _toc_threshold(ppt_draw._show_toc)
+    text = (root / "reference" / "style-options.md").read_text(encoding="utf-8")
+    assert f"PDF 章节数 ≥ {pdf_n}" in text
+    assert f"PPTX 章节数 ≥ {pptx_n}" in text
 
 
 def test_every_kind_and_variant_documented(root):

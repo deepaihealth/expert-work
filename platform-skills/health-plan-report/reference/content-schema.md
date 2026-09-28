@@ -15,13 +15,13 @@
 | `generated_at` | 必填 | 日期 `YYYY-MM-DD` | 生成日期 |
 | `data_basis` | 可选 | 非空文字 | 封面「数据依据」一栏 |
 | `client` | 必填 | 对象 `{name, facts[]}` | `name` 必填；`facts` 每项 `{label, value}`，出现在封面客户信息区 |
-| `manager` | 可选 | 对象 `{name, title}` | `title` 可选，缺省时封面显示为「负责人」 |
+| `manager` | 可选 | 对象 `{name, title}` | `name` 必填；`title` 可选，缺省时封面显示为「负责人」 |
 | `brand` | 可选 | 对象 `{org_name, logo_path, footer_signature, disclaimer}` | 四个字段都可选；只从这里读取，任何样式层都改不了（见 `style-options.md`） |
 | `sections` | 必填，至少 1 项 | 数组 | 见下「章节与积木」 |
 
-封面信息（标题、副标题、客户信息卡）挤不下会渲染失败并报错指出是哪一块（标题 / 副标题 / 客户信息），
-遇到时精简对应字段。`brand.disclaimer` 太长会把 PDF 页脚顶出页面底边，同样会报错（路径
-`brand.disclaimer`），页脚最多约 4 行，请把免责声明控制在合理长度内。
+封面信息挤不下或互相重叠会渲染失败，报错位置是这四者之一：`title`（标题）、`subtitle`（副标题）、
+`client.facts`（客户信息卡）、`brand`（LOGO/机构名称行），遇到时精简对应字段。`brand.disclaimer` 太长会把
+PDF 页脚顶出页面底边，同样会报错（路径 `brand.disclaimer`），页脚最多约 4 行，请把免责声明控制在合理长度内。
 
 ## 章节与积木
 
@@ -216,7 +216,10 @@
 | `url` | 必填 | `http(s)` 链接 |
 | `media_path` | 可选 | 文件路径 |
 
-`media_path` 目前只作为展示信息保留，实际跳转用的是 `url`。
+`media_path` 只用于 PPTX：指向一个存在、可读的 `.mp4` 文件，且版面留有足够空间时，会把视频真正嵌入为可播放
+对象；文件不是 `.mp4`、文件不存在、空间不够，或者嵌入本身失败，都会降级为可点击链接并给出警告，不会中断渲染。
+`url` 始终会同时渲染成一行可点击链接文字。PDF 不使用 `media_path`，只把 `name`/`description`/`url` 渲染成
+可点击链接。
 
 示例：`{"kind": "material", "name": "快走动作示范", "description": "示范视频说明快走姿势。", "url": "https://example.com/materials/brisk-walk"}`
 
