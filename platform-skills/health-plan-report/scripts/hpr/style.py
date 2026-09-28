@@ -3,6 +3,7 @@ lock brand keys, keep text readable, and account for every input (spec §5)."""
 
 from __future__ import annotations
 
+import colorsys
 import json
 import re
 from dataclasses import dataclass
@@ -424,14 +425,30 @@ def _fix_background(bg: str, primary: str) -> tuple[str, str]:
     return fixed, f"背景只支持浅色，已调浅为 {fixed}"  # noqa: RUF001
 
 
+def darken_to(hex_: str, bg: str, ratio: float = 4.5) -> str:
+    """Nearest shade of ``hex_`` with the same hue and HSL saturation (lower lightness only)
+    whose contrast with ``bg`` is >= ratio. Every RGB channel of hls_to_rgb is non-decreasing in
+    L, so contrast against a light background is monotone in L and bisection is valid; L = 0 is
+    black, which passes on the light backgrounds _fix_background guarantees (contrast >= 17)."""
+    h, light, s = colorsys.rgb_to_hls(*(c / 255 for c in _rgb(hex_)))
+
+    def at(lv: float) -> str:
+        return _hex(*(c * 255 for c in colorsys.hls_to_rgb(h, lv, s)))
+
+    lo, hi = 0.0, light  # invariant: at(lo) passes, at(hi) fails
+    for _ in range(20):
+        mid = (lo + hi) / 2
+        if contrast(at(mid), bg) >= ratio:
+            lo = mid
+        else:
+            hi = mid
+    return at(lo)  # the hex that was actually tested, so rounding cannot drop below ratio
+
+
 def _fix_primary(primary: str, bg: str) -> tuple[str, str]:
     if contrast(primary, bg) >= 4.5:
         return primary, ""
-    fixed = primary
-    for step in range(1, 21):
-        fixed = mix(primary, "#000000", step * 0.05)
-        if contrast(fixed, bg) >= 4.5:
-            break
+    fixed = darken_to(primary, bg)
     return fixed, f"与背景对比不足，已加深为 {fixed}"  # noqa: RUF001
 
 

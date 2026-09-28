@@ -1,3 +1,4 @@
+import colorsys
 import json
 import subprocess
 import sys
@@ -5,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from hpr.style import (
+    COLOR_NAMES,
     NOT_APPLIED,
     Layer,
     contrast,
@@ -101,6 +103,26 @@ def test_low_contrast_primary_is_darkened():
     p = res.style["color.primary"]
     assert contrast(p, res.style["color.background"]) >= 4.5
     assert _entry(res, "color.primary")["status"] == "adjusted"
+
+
+def _hls(hex_: str) -> tuple[float, float, float]:
+    return colorsys.rgb_to_hls(*(int(hex_[i : i + 2], 16) / 255 for i in (1, 3, 5)))
+
+
+@pytest.mark.parametrize("name", ["浅蓝", "浅绿", "浅紫", "米色", "橙"])
+def test_darkened_primary_keeps_its_hue_instead_of_turning_grey(name):
+    src = COLOR_NAMES[name]
+    p = resolve([Layer("x", {"color.primary": name})]).style["color.primary"]
+    assert contrast(p, "#FFFFFF") >= 4.5
+    (h0, _, s0), (h1, _, s1) = _hls(src), _hls(p)
+    assert min(abs(h1 - h0), 1 - abs(h1 - h0)) * 360 <= 5
+    assert s1 >= min(0.5, s0 - 0.05)  # mixing toward black left 浅蓝 at S≈0.06 (grey)
+
+
+def test_light_blue_darkens_to_the_nearest_readable_blue():
+    res = resolve([Layer("x", {"color.primary": "浅蓝"})])
+    assert res.style["color.primary"] == "#1E78D1"
+    assert "#1E78D1" in _entry(res, "color.primary")["note"]
 
 
 def test_relative_words_move_one_step_from_lower_layer():
