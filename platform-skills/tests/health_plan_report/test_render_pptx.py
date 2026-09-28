@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import subprocess
 import sys
@@ -7,6 +8,7 @@ import pytest
 from hpr.content import required_texts
 from hpr.measure import Measurer
 from hpr.ppt_draw import BODY, Canvas, render_pptx
+from hpr.ppt_layout import LayoutError
 from hpr.qa import missing_texts, pptx_bounds, pptx_corpus, pptx_overflow, qa_pptx
 from hpr.style import Layer, resolve
 from hpr.theme import build_theme
@@ -225,7 +227,7 @@ def test_missing_image_reports_block_path(workdir, sample):
 
 def test_long_title_is_a_clear_error(workdir, sample):
     sample["title"] = "非常长的方案名称" * 12
-    with pytest.raises(Exception, match="title"):
+    with pytest.raises(LayoutError, match="title"):
         _render(sample, workdir)
 
 
@@ -268,3 +270,123 @@ def test_pdf_not_yet_available_message(workdir):
         check=False,
     )
     assert res.returncode == 1
+
+
+def test_period_label_is_drawn_even_when_subtitle_omits_it(workdir, sample):
+    sample["subtitle"] = "控糖与体重管理"
+    out, style, _ = _render(sample, workdir)
+    assert "第 1 阶段" in pptx_corpus(out)
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa
+
+
+def _crowded_cover(sample, repeat):
+    sample["title"] = "李先生健康管理方案之控糖减重与睡眠改善综合计划书"
+    sample["subtitle"] = (
+        "第 1 阶段 · 这是一个较长的副标题，用于说明本方案的适用范围与执行周期，"  # noqa: RUF001
+        "内容相对较长需要换行显示"
+    ) * repeat
+    base = 3 + bool(sample.get("data_basis")) + bool(sample.get("manager"))
+    sample["client"]["facts"] = [
+        {"label": f"项目{i}", "value": f"数值说明{i}"} for i in range(12 - base)
+    ]
+    sample["brand"]["logo_path"] = "logo.png"
+
+
+# split keeps the meta grid beside the title panel, so only a much longer subtitle reaches its limit
+@pytest.mark.parametrize(("variant", "repeat"), [("band", 2), ("split", 4), ("minimal", 2)])
+def test_cover_text_colliding_with_meta_is_an_error(workdir, sample, variant, repeat):
+    PILImage.new("RGB", (300, 120), "#FFFFFF").save(workdir / "logo.png")
+    _crowded_cover(sample, repeat)
+    layers = [Layer("x", {"cover.variant": variant, "brand.logo_position": "bottom-left"})]
+    with pytest.raises(LayoutError) as exc:
+        _render(sample, workdir, layers)
+    assert exc.value.path in ("title", "subtitle")
+
+
+def _plates(slide, logo):
+    return [
+        sh
+        for sh in slide.shapes
+        if sh.name == "hpr:deco"
+        and sh.fill.type == 1
+        and str(sh.fill.fore_color.rgb) == "FFFFFF"
+        and sh.left <= logo.left
+        and sh.top <= logo.top
+        and sh.left + sh.width >= logo.left + logo.width
+        and sh.top + sh.height >= logo.top + logo.height
+    ]
+
+
+@pytest.mark.parametrize(("variant", "plated"), [("band", True), ("minimal", False)])
+def test_logo_on_dark_cover_sits_on_white_plate(workdir, sample, variant, plated):
+    PILImage.new("RGB", (300, 120), "#0B4F5C").save(workdir / "logo.png")
+    sample["brand"]["logo_path"] = "logo.png"
+    layers = [Layer("x", {"cover.variant": variant, "brand.logo_position": "top-right"})]
+    out, _, _ = _render(sample, workdir, layers)
+    slide = Presentation(str(out)).slides[0]
+    (logo,) = [sh for sh in slide.shapes if sh.name == "hpr:logo"]
+    assert abs(logo.width / 12700 - 140) < 0.5 and abs(logo.height / 12700 - 56) < 0.5
+    assert bool(_plates(slide, logo)) is plated
+    assert pptx_bounds(out) == []
+
+
+def _load_render():
+    spec = importlib.util.spec_from_file_location("hpr_render_cli", RENDER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_cli_qa_failure_renames_output_and_exits_1(workdir, monkeypatch, capsys):
+    mod = _load_render()
+
+    def failed(path, required, theme, m):
+        return {
+            "status": "failed",
+            "slides": 1,
+            "missing": ["x"],
+            "overflow": [],
+            "out_of_bounds": [],
+            "contrast": {"ok": True},
+        }
+
+    monkeypatch.setattr(mod, "qa_pptx", failed)
+    out = workdir / "out"
+    code = mod.main(
+        ["--content", str(workdir / "plan.json"), "--out-dir", str(out), "--basename", "q"]
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert summary["ok"] is False
+    assert (out / "q.qa-failed.pptx").is_file()
+    assert not (out / "q.pptx").exists()
+    assert summary["files"]["pptx"] == str(out / "q.qa-failed.pptx")
+    assert json.loads((out / "q.qa.json").read_text(encoding="utf-8"))["pptx"]["status"] == "failed"
+    assert (out / "q.params-report.json").is_file()
+
+
+@pytest.mark.parametrize("sidecar", ["q.qa-failed.pptx", "q.qa.json", "q.params-report.json"])
+def test_rerun_refuses_when_any_output_of_basename_exists(workdir, sidecar):
+    out = workdir / "out"
+    out.mkdir()
+    (out / sidecar).write_text("旧结果", encoding="utf-8")
+    res = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(RENDER),
+            "--content",
+            str(workdir / "plan.json"),
+            "--out-dir",
+            str(out),
+            "--basename",
+            "q",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "已存在" in res.stdout
+    assert not (out / "q.pptx").exists()
+    assert (out / sidecar).read_text(encoding="utf-8") == "旧结果"

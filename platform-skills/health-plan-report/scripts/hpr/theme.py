@@ -53,7 +53,7 @@ class Theme:
 
     @property
     def small(self) -> float:
-        return max(self.caption, self.body - 2)
+        return max(self.caption, self.body - 1)
 
 
 def on_color(bg: str) -> str:

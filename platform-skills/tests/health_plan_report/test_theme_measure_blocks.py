@@ -30,6 +30,7 @@ def test_theme_scales_and_density():
     assert (std.title, std.heading, std.body, std.caption) == (24, 16, 14, 11)
     assert big.body == std.body + 2
     assert small.body == 13 and small.body >= 12
+    assert std.small == std.body - 1 and small.small == small.body - 1
     pdf = build_theme(resolve([]).style, "pdf")
     assert (pdf.title, pdf.heading, pdf.body, pdf.caption) == (20, 13, 10.5, 8.5)
     airy = build_theme(resolve([Layer("x", {"layout.density": "airy"})]).style, "pptx")

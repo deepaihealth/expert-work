@@ -34,7 +34,7 @@ MARGIN_X = 40.0
 BODY_TOP = 80.0
 BODY_W = SLIDE_W - 2 * MARGIN_X
 FOOTER_BOTTOM = 526.0
-MERGE_FILL = 0.85
+NEXT_SECTION_MIN_ROOM = 0.35  # start the next section in-page only if >= 35% of the body is left
 CHART_H = 200.0
 DONUT_H = 180.0
 BAR_H = 10.0
@@ -62,12 +62,17 @@ def lh(size: float) -> float:
     return size * LINE
 
 
+def brand_line(brand: dict) -> str:
+    return "  ｜  ".join(v for v in (brand.get("org_name"), brand.get("footer_signature")) if v)  # noqa: RUF001
+
+
 def make_ctx(content: dict, theme: Theme, m: Measurer, base_dir: Path) -> Ctx:
     brand = content.get("brand") or {}
     t = theme
     h = 0.0
-    if brand.get("org_name") or brand.get("footer_signature"):
-        h += lh(t.caption)
+    line1 = brand_line(brand)
+    if line1:
+        h += m.lines(line1, BODY_W, t.caption) * lh(t.caption)
     if brand.get("disclaimer"):
         n = m.lines(brand["disclaimer"], BODY_W, t.caption)
         if n > MAX_DISCLAIMER_LINES:
@@ -162,8 +167,15 @@ class TableGeo:
 def table_geometry(tbl: Table, w: float, ctx: Ctx) -> TableGeo:
     t, m = ctx.theme, ctx.m
     n = len(tbl.columns)
+
+    def bold_cell(i: int, value: str) -> bool:
+        return tbl.highlight_col == i and value not in ("", "—")
+
     longest = [
-        max([m.width(tbl.columns[i], t.small, True)] + [m.width(r[i], t.small) for r in tbl.rows])
+        max(
+            [m.width(tbl.columns[i], t.small, True)]
+            + [m.width(r[i], t.small, bold_cell(i, r[i])) for r in tbl.rows]
+        )
         for i in range(n)
     ]
     total = sum(longest) or 1.0
@@ -173,9 +185,12 @@ def table_geometry(tbl: Table, w: float, ctx: Ctx) -> TableGeo:
     col_w = [x * scale for x in raw]
     pad_x, pad_y = t.gap_s, t.gap_xs + 2
 
-    def row_height(cells: tuple[str, ...], size: float, bold: bool) -> float:
+    def row_height(cells: tuple[str, ...], size: float, header: bool) -> float:
         return (
-            max(m.lines(c, cw - 2 * pad_x, size, bold) for c, cw in zip(cells, col_w, strict=True))
+            max(
+                m.lines(c, cw - 2 * pad_x, size, header or bold_cell(i, c))
+                for i, (c, cw) in enumerate(zip(cells, col_w, strict=True))
+            )
             * lh(size)
             + 2 * pad_y
         )
@@ -252,11 +267,55 @@ def column_height(col: Column, col_w: float, ctx: Ctx) -> float:
     return (
         STRIPE
         + 2 * t.gap_m
-        + lh(t.heading)
+        + column_title_height(col, col_w, ctx)
         + t.gap_s
         + items
         + t.gap_xs * max(0, len(col.items) - 1)
     )
+
+
+def column_title_height(col: Column, col_w: float, ctx: Ctx) -> float:
+    t = ctx.theme
+    return ctx.m.lines(col.title, col_w - 2 * t.gap_m, t.heading, True) * lh(t.heading)
+
+
+# ---------- callout / media / donut ----------
+
+
+def callout_title_height(co: Callout, w: float, ctx: Ctx) -> float:
+    """Height of the title slot (0 without title); ``w`` is the callout's inner text width."""
+    t = ctx.theme
+    return ctx.m.lines(co.title, w, t.body, True) * lh(t.body) if co.title else 0.0
+
+
+@dataclass(frozen=True)
+class MediaGeo:
+    text_w: float
+    name_h: float
+    box_w: float
+    link_text: str
+    link_h: float
+
+
+def media_geometry(md: Media, w: float, ctx: Ctx) -> MediaGeo:
+    t, m = ctx.theme, ctx.m
+    text_w = w * 0.62 - 2 * t.gap_m
+    box_w = w * 0.38 - t.gap_m
+    label = f"查看示范/产品详情：{md.name}"  # noqa: RUF001
+    return MediaGeo(
+        text_w,
+        m.lines(md.name, text_w, t.heading, True) * lh(t.heading),
+        box_w,
+        label,
+        m.lines(label, box_w - 2 * t.gap_s, t.body, True) * lh(t.body),
+    )
+
+
+def donut_legend_heights(ch: Chart, w: float, ctx: Ctx) -> list[float]:
+    """Heights of the legend lines next to a DONUT_H donut in a primitive of width ``w``."""
+    t = ctx.theme
+    lw = w - DONUT_H - t.gap_l - 18
+    return [ctx.m.lines(line, lw, t.body) * lh(t.body) for line in ch.legend]
 
 
 # ---------- image ----------
@@ -302,11 +361,12 @@ def measure(prim: Prim, w: float, ctx: Ctx) -> float:
         return sum(kv_geometry(prim, w, ctx)[2])
     if isinstance(prim, Callout):
         inner = w - 2 * t.gap_m - 4
-        title = (lh(t.body) + t.gap_xs) if prim.title else 0.0
+        title = (callout_title_height(prim, inner, ctx) + t.gap_xs) if prim.title else 0.0
         return 2 * t.gap_m + title + m.lines(prim.text, inner, t.body) * lh(t.body)
     if isinstance(prim, Chart):
         if prim.kind == "donut":
-            return max(DONUT_H, len(prim.legend) * (lh(t.body) + t.gap_xs))
+            legend = donut_legend_heights(prim, w, ctx)
+            return max(DONUT_H, sum(legend) + t.gap_xs * len(legend))
         return CHART_H
     if isinstance(prim, Timeline):
         rows = _timeline_row_heights(prim, w, ctx)
@@ -318,9 +378,10 @@ def measure(prim: Prim, w: float, ctx: Ctx) -> float:
             heights.append(max(column_height(c, cw, ctx) for c in row))
         return sum(heights) + t.gap_m * (len(heights) - 1)
     if isinstance(prim, Media):
-        text_w = w * 0.62 - 2 * t.gap_m
-        body = lh(t.heading) + t.gap_xs + m.lines(prim.description, text_w, t.body) * lh(t.body)
-        return max(96.0, body + 2 * t.gap_m)
+        geo = media_geometry(prim, w, ctx)
+        body = geo.name_h + t.gap_xs + m.lines(prim.description, geo.text_w, t.body) * lh(t.body)
+        link_box = geo.link_h + 2 * t.gap_s
+        return max(96.0, body + 2 * t.gap_m, link_box + 2 * t.gap_m)
     if isinstance(prim, Image):
         _, h = image_size(prim, w, ctx)
         cap = (
@@ -451,14 +512,31 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
         full = measure(prim, BODY_W, ctx)
         return min(full, 2 * lh(t.body) + 2 * t.gap_m) if splittable(prim) else full
 
+    def head_fits(prim: Prim, room: float) -> bool:
+        if min_head(prim) > room:
+            return False
+        if measure(prim, BODY_W, ctx) <= room:
+            return True
+        return splittable(prim) and split(prim, BODY_W, room, ctx)[0] is not None
+
+    def lead_fits(items: list[tuple[Prim, str]], room: float) -> bool:
+        """The section's first item (a sub-heading together with what follows it) fits in room."""
+        if not items:
+            return room >= 0
+        first = items[0][0]
+        if isinstance(first, SubHeading) and len(items) > 1:
+            rest = room - measure(first, BODY_W, ctx) - t.gap_l
+            return head_fits(items[1][0], rest)
+        return head_fits(first, room)
+
     for si, (sec, items) in enumerate(sections):
-        total = sum(measure(p, BODY_W, ctx) for p, _ in items) + t.gap_l * max(0, len(items) - 1)
         head = SubHeading(sec["title"])
         head_h = measure(head, BODY_W, ctx)
         if (
             cur is not None
             and cur.placed
-            and (y - BODY_TOP) + t.gap_l + head_h + total <= MERGE_FILL * avail_total
+            and bottom - y >= NEXT_SECTION_MIN_ROOM * avail_total
+            and lead_fits(items, bottom - y - t.gap_l - head_h)
         ):
             y += t.gap_l
             cur.placed.append(Placed(head, MARGIN_X, y, BODY_W, head_h, f"sections[{si}]"))

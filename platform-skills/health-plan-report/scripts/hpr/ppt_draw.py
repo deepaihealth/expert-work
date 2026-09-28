@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from hpr.ppt_charts import add_chart, donut_colors
 from hpr.ppt_layout import (
     BODY_TOP,
     BODY_W,
+    DONUT_H,
     FOOTER_BOTTOM,
     MARGIN_X,
     SLIDE_H,
@@ -29,10 +31,14 @@ from hpr.ppt_layout import (
     LayoutError,
     Page,
     Placed,
+    brand_line,
+    callout_title_height,
     card_height,
     card_parts,
     column_height,
+    column_title_height,
     columns_rows,
+    donut_legend_heights,
     grid_col_w,
     grid_rows,
     image_size,
@@ -40,6 +46,7 @@ from hpr.ppt_layout import (
     kv_rows,
     lh,
     make_ctx,
+    media_geometry,
     paginate,
     step_height,
     table_geometry,
@@ -61,7 +68,7 @@ from hpr.prims import (
     Timeline,
 )
 from hpr.style import mix
-from hpr.theme import Theme, build_theme, on_color
+from hpr.theme import WHITE, Theme, build_theme, on_color
 
 BODY, CHROME, DECO = "hpr:body", "hpr:chrome", "hpr:deco"
 NO_GRID_STYLE = "{2D5ABB26-0587-4C30-8999-92F81FD0307C}"
@@ -214,17 +221,14 @@ class Canvas:
 # ---------- chrome ----------
 
 
-def _brand_line(brand: dict) -> str:
-    return "  ｜  ".join(v for v in (brand.get("org_name"), brand.get("footer_signature")) if v)  # noqa: RUF001
-
-
 def _footer(cv: Canvas, content: dict, style: dict, ctx: Ctx) -> None:
     t, m = ctx.theme, ctx.m
     brand = content.get("brand") or {}
-    line1 = _brand_line(brand)
+    line1 = brand_line(brand)
+    line1_h = m.lines(line1, BODY_W, t.caption) * lh(t.caption) if line1 else 0.0
     disc = brand.get("disclaimer", "")
     n_disc = m.lines(disc, BODY_W, t.caption) if disc else 0
-    text_h = (lh(t.caption) if line1 else 0) + n_disc * lh(t.caption)
+    text_h = line1_h + n_disc * lh(t.caption)
     if not text_h:
         return
     top = FOOTER_BOTTOM - text_h
@@ -232,10 +236,8 @@ def _footer(cv: Canvas, content: dict, style: dict, ctx: Ctx) -> None:
     align = style["footer.align"]
     y = top
     if line1:
-        cv.text(
-            MARGIN_X, y, BODY_W, lh(t.caption), line1, t.caption, t.muted, align=align, name=CHROME
-        )
-        y += lh(t.caption)
+        cv.text(MARGIN_X, y, BODY_W, line1_h, line1, t.caption, t.muted, align=align, name=CHROME)
+        y += line1_h
     if disc:
         cv.text(
             MARGIN_X,
@@ -305,6 +307,11 @@ def _logo_path(content: dict, base_dir: Path) -> Path | None:
     return p if p.is_absolute() else base_dir / p
 
 
+LOGO_MAX_W, LOGO_MAX_H = 140.0, 56.0
+PLATE_PAD = 8.0
+BRAND_BAND_H = 76.0  # vertical room kept free for a bottom-anchored logo (with plate) or org name
+
+
 def _logo_size(path: Path) -> tuple[float, float] | None:
     from PIL import Image as PILImage
 
@@ -313,7 +320,7 @@ def _logo_size(path: Path) -> tuple[float, float] | None:
             iw, ih = im.size
     except (OSError, ValueError):
         return None
-    k = min(120 / iw, 44 / ih)
+    k = min(LOGO_MAX_W / iw, LOGO_MAX_H / ih)
     return iw * k, ih * k
 
 
@@ -339,10 +346,15 @@ def _place_brand(
     color: str,
     box: tuple[float, float, float, float],
     warnings: list[str],
+    *,
+    plate: bool = False,
 ) -> None:
+    """Place LOGO and org name inside ``box``; ``plate`` puts the LOGO on a white rounded plate
+    (used where the LOGO would sit on a dark area)."""
     t, m = ctx.theme, ctx.m
     brand = content.get("brand") or {}
     logo_pos, org_pos = style["brand.logo_position"], style["brand.org_position"]
+    pad = PLATE_PAD if plate else 0.0
     logo_box: tuple[float, float, float, float] | None = None
     path = _logo_path(content, base_dir)
     if path is not None:
@@ -353,7 +365,10 @@ def _place_brand(
             )
         else:
             lw, lh_ = size
-            x, y = _anchor(logo_pos, lw, lh_, box)
+            x0, y0, x1, y1 = box
+            x, y = _anchor(logo_pos, lw, lh_, (x0 + pad, y0 + pad, x1 - pad, y1 - pad))
+            if plate:
+                cv.rect(x - pad, y - pad, lw + 2 * pad, lh_ + 2 * pad, WHITE, rounded=True)
             cv.picture(path, x, y, lw, lh_, "hpr:logo")
             logo_box = (x, y, lw, lh_)
     org = brand.get("org_name")
@@ -366,11 +381,11 @@ def _place_brand(
         lx, ly, lw, lh_ = logo_box
         y = ly + (lh_ - oh) / 2
         if org_pos in ("top-right", "bottom-right"):
-            x = lx - 12 - ow
+            x = lx - pad - 12 - ow
         elif org_pos == "center":
-            y = ly + lh_ + 8
+            y = ly + lh_ + pad + 8
         else:
-            x = lx + lw + 12
+            x = lx + lw + pad + 12
     cv.text(x, y, ow, oh, org, t.body, color, bold=True, name=CHROME)
 
 
@@ -380,6 +395,9 @@ def _place_brand(
 def _meta_items(content: dict) -> list[tuple[str, str]]:
     items = [("客户", content["client"]["name"])]
     items += [(f["label"], f["value"]) for f in content["client"].get("facts", [])]
+    period = content.get("period")
+    if period:
+        items.append(("阶段", period["label"]))
     if content.get("data_basis"):
         items.append(("数据依据", content["data_basis"]))
     items.append(("生成日期", content["generated_at"]))
@@ -396,55 +414,79 @@ def _cover_title(
     x: float,
     y: float,
     w: float,
-    color: str,
-    sub_color: str,
+    colors: tuple[str, str],
     max_lines: int,
+    limit: tuple[float, str],
 ) -> float:
+    """Draw title + subtitle from ``y``; both must end above ``limit`` = (y, what lies below)."""
     t, m = ctx.theme, ctx.m
+    color, sub_color = colors
+    bottom, below = limit
     size = t.title + 12
     n = m.lines(content["title"], w, size, True)
     if n > max_lines:
         raise LayoutError("title", f"方案名称过长（封面最多 {max_lines} 行），请缩短")  # noqa: RUF001
-    cv.text(x, y, w, n * lh(size), content["title"], size, color, bold=True, name=CHROME)
-    y += n * lh(size) + ctx.theme.gap_m
-    if content.get("subtitle"):
-        k = m.lines(content["subtitle"], w, t.heading)
+    title_h = n * lh(size)
+    if y + title_h > bottom:
+        raise LayoutError("title", f"方案名称过长，封面上会压住{below}，请缩短")  # noqa: RUF001
+    k = m.lines(content["subtitle"], w, t.heading) if content.get("subtitle") else 0
+    sub_top = y + title_h + t.gap_m
+    if k and sub_top + k * lh(t.heading) > bottom:
+        raise LayoutError(
+            "subtitle",
+            f"副标题过长，封面上会压住{below}，请缩短副标题或减少封面信息项",  # noqa: RUF001
+        )
+    cv.text(x, y, w, title_h, content["title"], size, color, bold=True, name=CHROME)
+    y = sub_top
+    if k:
         cv.text(x, y, w, k * lh(t.heading), content["subtitle"], t.heading, sub_color, name=CHROME)
         y += k * lh(t.heading)
     return y
 
 
-def _meta_grid(
-    cv: Canvas,
-    items: list[tuple[str, str]],
-    ctx: Ctx,
-    x: float,
-    bottom: float,
-    w: float,
-    label_color: str,
-    value_color: str,
-    rule: str,
-) -> None:
+@dataclass(frozen=True)
+class MetaGeo:
+    col_w: float
+    rows: list[list[tuple[str, str]]]
+    label_h: list[float]
+    row_h: list[float]
+    height: float  # grid height, excluding the rule drawn gap_m above it
+
+
+def _meta_geometry(items: list[tuple[str, str]], ctx: Ctx, w: float) -> MetaGeo:
     t, m = ctx.theme, ctx.m
     per = 4
     cw = (w - (per - 1) * t.gap_l) / per
     rows = [items[i : i + per] for i in range(0, len(items), per)]
-    heights = [
-        max(lh(t.caption) + m.lines(v, cw, t.body, True) * lh(t.body) for _, v in row)
-        for row in rows
-    ]
-    total = sum(heights) + t.gap_m * (len(rows) - 1)
     if len(rows) > 3:
         raise LayoutError("client.facts", "封面信息过多（最多 12 项），请精简或移到正文")  # noqa: RUF001
-    y = bottom - total
+    label_h = [max(m.lines(k, cw, t.caption) * lh(t.caption) for k, _ in row) for row in rows]
+    row_h = [
+        lab + max(m.lines(v, cw, t.body, True) * lh(t.body) for _, v in row)
+        for row, lab in zip(rows, label_h, strict=True)
+    ]
+    return MetaGeo(cw, rows, label_h, row_h, sum(row_h) + t.gap_m * (len(rows) - 1))
+
+
+def _meta_grid(
+    cv: Canvas,
+    geo: MetaGeo,
+    ctx: Ctx,
+    x: float,
+    bottom: float,
+    w: float,
+    colors: tuple[str, str, str],
+) -> None:
+    t = ctx.theme
+    label_color, value_color, rule = colors
+    y = bottom - geo.height
     cv.rect(x, y - t.gap_m, w, 0.75, rule)
-    for row, rh in zip(rows, heights, strict=True):
+    for row, lab, rh in zip(geo.rows, geo.label_h, geo.row_h, strict=True):
         for i, (label, value) in enumerate(row):
-            cx = x + i * (cw + t.gap_l)
-            cv.text(cx, y, cw, lh(t.caption), label, t.caption, label_color, name=CHROME)
-            vh = rh - lh(t.caption)
+            cx = x + i * (geo.col_w + t.gap_l)
+            cv.text(cx, y, geo.col_w, lab, label, t.caption, label_color, name=CHROME)
             cv.text(
-                cx, y + lh(t.caption), cw, vh, value, t.body, value_color, bold=True, name=CHROME
+                cx, y + lab, geo.col_w, rh - lab, value, t.body, value_color, bold=True, name=CHROME
             )
         y += rh + t.gap_m
 
@@ -452,6 +494,9 @@ def _meta_grid(
 def _bg(slide: Any, color: str) -> None:
     slide.background.fill.solid()
     slide.background.fill.fore_color.rgb = rgb(color)
+
+
+_META_BELOW = "下方的客户信息区"
 
 
 def _cover(
@@ -464,13 +509,26 @@ def _cover(
     bottom_brand = style["brand.logo_position"].startswith("bottom") or style[
         "brand.org_position"
     ].startswith("bottom")
-    meta_bottom = SLIDE_H - 40 - (60 if bottom_brand else 0)
+    meta_bottom = SLIDE_H - 40 - (BRAND_BAND_H if bottom_brand else 0)
+    items = _meta_items(content)
     if variant == "split":
         panel_w = SLIDE_W * 0.42
+        meta_w = SLIDE_W - panel_w - 80
+        geo = _meta_geometry(items, ctx, meta_w)
         _bg(slide, t.background)
         cv.rect(0, 0, panel_w, SLIDE_H, t.primary)
         fg = on_color(t.primary)
-        _cover_title(cv, content, ctx, 40, 150, panel_w - 80, fg, mix(fg, t.primary, 0.25), 4)
+        _cover_title(
+            cv,
+            content,
+            ctx,
+            40,
+            150,
+            panel_w - 80,
+            (fg, mix(fg, t.primary, 0.25)),
+            4,
+            (SLIDE_H - 40, "左侧色块底边"),
+        )
         _place_brand(
             cv,
             content,
@@ -481,22 +539,26 @@ def _cover(
             (panel_w + 40, 32, SLIDE_W - 40, SLIDE_H - 24),
             warnings,
         )
-        _meta_grid(
-            cv,
-            _meta_items(content),
-            ctx,
-            panel_w + 40,
-            meta_bottom,
-            SLIDE_W - panel_w - 80,
-            t.muted,
-            t.ink,
-            t.line,
-        )
+        _meta_grid(cv, geo, ctx, panel_w + 40, meta_bottom, meta_w, (t.muted, t.ink, t.line))
         return
     if variant == "minimal":
+        meta_w = SLIDE_W - 112
+        geo = _meta_geometry(items, ctx, meta_w)
+        limit = meta_bottom - geo.height - t.gap_m - t.gap_l
         _bg(slide, t.background)
         cv.rect(0, 0, SLIDE_W, 6, t.primary)
-        y = _cover_title(cv, content, ctx, 56, 170, 620, t.ink, t.muted, 3)
+        # the accent bar under the subtitle needs gap_m + 4 of the room above the meta grid
+        y = _cover_title(
+            cv,
+            content,
+            ctx,
+            56,
+            170,
+            620,
+            (t.ink, t.muted),
+            3,
+            (limit - t.gap_m - 4, _META_BELOW),
+        )
         cv.rect(56, y + t.gap_m, 64, 4, t.accent)
         _place_brand(
             cv,
@@ -508,34 +570,37 @@ def _cover(
             (56, 32, SLIDE_W - 56, SLIDE_H - 24),
             warnings,
         )
-        _meta_grid(
-            cv, _meta_items(content), ctx, 56, meta_bottom, SLIDE_W - 112, t.muted, t.ink, t.line
-        )
+        _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (t.muted, t.ink, t.line))
         return
+    meta_w = 560.0
+    geo = _meta_geometry(items, ctx, meta_w)
+    limit = meta_bottom - geo.height - t.gap_m - t.gap_l
     _bg(slide, t.primary)
     fg = on_color(t.primary)
     soft = mix(t.primary, fg, 0.25)
-    for r in (185.0, 140.0, 95.0):
-        cv.oval(765 - r, 270 - r, 2 * r, 2 * r, None, line=soft)
+    for r in (165.0, 125.0, 85.0):
+        cv.oval(790 - r, 270 - r, 2 * r, 2 * r, None, line=soft)
+    # decoration stays right of the meta grid (x 56..616) and the title column (..576)
     cv.polyline(
-        [
-            (430, 350),
-            (520, 336),
-            (575, 358),
-            (630, 308),
-            (685, 318),
-            (740, 260),
-            (805, 270),
-            (955, 210),
-        ],
+        [(640, 330), (690, 318), (730, 336), (775, 290), (820, 298), (870, 250), (955, 225)],
         t.accent,
         2.2,
     )
-    _cover_title(cv, content, ctx, 56, 150, 520, fg, mix(fg, t.primary, 0.25), 3)
-    _place_brand(
-        cv, content, style, ctx, base_dir, fg, (56, 32, SLIDE_W - 56, SLIDE_H - 24), warnings
+    _cover_title(
+        cv, content, ctx, 56, 150, 520, (fg, mix(fg, t.primary, 0.25)), 3, (limit, _META_BELOW)
     )
-    _meta_grid(cv, _meta_items(content), ctx, 56, meta_bottom, 560, soft, fg, soft)
+    _place_brand(
+        cv,
+        content,
+        style,
+        ctx,
+        base_dir,
+        fg,
+        (56, 32, SLIDE_W - 56, SLIDE_H - 24),
+        warnings,
+        plate=True,
+    )
+    _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (soft, fg, soft))
 
 
 def _show_toc(content: dict, style: dict) -> bool:
@@ -587,11 +652,12 @@ def _end(prs: Any, content: dict, ctx: Ctx) -> None:
     cv.text(130, y, 700, n * lh(t.title), org, t.title, fg, bold=True, align="center", name=CHROME)
     y += n * lh(t.title) + t.gap_m
     if brand.get("footer_signature"):
+        k = m.lines(brand["footer_signature"], 700, t.heading)
         cv.text(
             130,
             y,
             700,
-            lh(t.heading),
+            k * lh(t.heading),
             brand["footer_signature"],
             t.heading,
             mix(fg, t.primary, 0.25),
@@ -750,8 +816,9 @@ def _draw_callout(cv: Canvas, pl: Placed, co: Callout, ctx: Ctx) -> None:
     cv.rect(pl.x, pl.y, 4, pl.h, edge)
     x, y, w = pl.x + 4 + t.gap_m, pl.y + t.gap_m, pl.w - 4 - 2 * t.gap_m
     if co.title:
-        cv.text(x, y, w, lh(t.body), co.title, t.body, edge, bold=True)
-        y += lh(t.body) + t.gap_xs
+        th = callout_title_height(co, w, ctx)
+        cv.text(x, y, w, th, co.title, t.body, edge, bold=True)
+        y += th + t.gap_xs
     cv.text(x, y, w, m.lines(co.text, w, t.body) * lh(t.body), co.text, t.body, t.ink)
 
 
@@ -760,7 +827,7 @@ def _draw_chart(cv: Canvas, pl: Placed, ch: Chart, ctx: Ctx) -> None:
     if ch.kind != "donut":
         add_chart(cv.slide, ch, pl.x, pl.y, pl.w, pl.h, t)
         return
-    size = min(pl.h, 180.0)
+    size = min(pl.h, DONUT_H)
     add_chart(cv.slide, ch, pl.x, pl.y, size, size, t)
     if ch.center:
         cv.text(
@@ -775,12 +842,13 @@ def _draw_chart(cv: Canvas, pl: Placed, ch: Chart, ctx: Ctx) -> None:
             align="center",
         )
     colors = donut_colors(t)
+    heights = donut_legend_heights(ch, pl.w, ctx)
     lx = pl.x + size + t.gap_l
-    ly = pl.y + (size - len(ch.legend) * (lh(t.body) + t.gap_xs)) / 2
-    for i, line in enumerate(ch.legend):
+    ly = pl.y + max(0.0, (size - sum(heights) - t.gap_xs * len(heights)) / 2)
+    for i, (line, h) in enumerate(zip(ch.legend, heights, strict=True)):
         cv.rect(lx, ly + lh(t.body) / 2 - 5, 10, 10, colors[i % len(colors)])
-        cv.text(lx + 18, ly, pl.w - size - t.gap_l - 18, lh(t.body), line, t.body, t.ink)
-        ly += lh(t.body) + t.gap_xs
+        cv.text(lx + 18, ly, pl.w - size - t.gap_l - 18, h, line, t.body, t.ink)
+        ly += h + t.gap_xs
 
 
 def _draw_timeline(cv: Canvas, pl: Placed, tl: Timeline, ctx: Ctx) -> None:
@@ -819,17 +887,11 @@ def _draw_columns(cv: Canvas, pl: Placed, cols: Columns, ctx: Ctx) -> None:
             cv.rect(x, y, cw, rh, t.pale, rounded=True)
             cv.rect(x, y, cw, STRIPE, color)
             cy = y + STRIPE + t.gap_m
+            title_h = column_title_height(col, cw, ctx)
             cv.text(
-                x + t.gap_m,
-                cy,
-                cw - 2 * t.gap_m,
-                lh(t.heading),
-                col.title,
-                t.heading,
-                color,
-                bold=True,
+                x + t.gap_m, cy, cw - 2 * t.gap_m, title_h, col.title, t.heading, color, bold=True
             )
-            cy += lh(t.heading) + t.gap_s
+            cy += title_h + t.gap_s
             inner = cw - 2 * t.gap_m
             for item in col.items:
                 h = m.lines(item, inner - t.small, t.small) * lh(t.small)
@@ -846,18 +908,18 @@ def _draw_media(
 ) -> None:
     t, m = ctx.theme, ctx.m
     cv.rect(pl.x, pl.y, pl.w, pl.h, t.pale, rounded=True)
-    tx, tw = pl.x + t.gap_m, pl.w * 0.62 - 2 * t.gap_m
-    cv.text(tx, pl.y + t.gap_m, tw, lh(t.heading), md.name, t.heading, t.primary, bold=True)
-    dy = pl.y + t.gap_m + lh(t.heading) + t.gap_xs
+    geo = media_geometry(md, pl.w, ctx)
+    tx, tw = pl.x + t.gap_m, geo.text_w
+    cv.text(tx, pl.y + t.gap_m, tw, geo.name_h, md.name, t.heading, t.primary, bold=True)
+    dy = pl.y + t.gap_m + geo.name_h + t.gap_xs
     cv.text(
         tx, dy, tw, m.lines(md.description, tw, t.body) * lh(t.body), md.description, t.body, t.ink
     )
     bx = pl.x + pl.w * 0.62
-    bw, bh = pl.w * 0.38 - t.gap_m, pl.h - 2 * t.gap_m
+    bw, bh = geo.box_w, pl.h - 2 * t.gap_m
     by = pl.y + t.gap_m
     cv.rect(bx, by, bw, bh, t.background, line=t.line, rounded=True)
-    label = f"查看示范/产品详情：{md.name}"  # noqa: RUF001
-    link_h = m.lines(label, bw - 2 * t.gap_s, t.body, True) * lh(t.body)
+    label, link_h = geo.link_text, geo.link_h
     if md.media_path:
         path = Path(md.media_path)
         path = path if path.is_absolute() else base_dir / path

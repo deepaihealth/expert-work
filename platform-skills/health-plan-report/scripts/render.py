@@ -76,7 +76,13 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     targets = {f: out_dir / f"{args.basename}.{f}" for f in formats}
-    existing = [str(p) for p in targets.values() if p.exists()]
+    outputs = [*targets.values()]
+    outputs += [out_dir / f"{args.basename}.qa-failed.{f}" for f in formats]
+    outputs += [
+        out_dir / f"{args.basename}.qa.json",
+        out_dir / f"{args.basename}.params-report.json",
+    ]
+    existing = [str(p) for p in outputs if p.exists()]
     if existing:
         return _fail(
             [f"文件已存在，不覆盖：{p}（请换一个 basename，例如用新的生成时间）" for p in existing]  # noqa: RUF001

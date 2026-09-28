@@ -5,14 +5,29 @@ from hpr.blocks import section_prims
 from hpr.measure import Measurer
 from hpr.ppt_layout import (
     BODY_TOP,
+    BODY_W,
     LayoutError,
     Page,
+    lh,
     make_ctx,
     measure,
     paginate,
     split,
+    table_geometry,
 )
-from hpr.prims import Bullets, Card, CardGrid, Chart, Column, Columns, Paragraph, SubHeading, Table
+from hpr.prims import (
+    Bullets,
+    Callout,
+    Card,
+    CardGrid,
+    Chart,
+    Column,
+    Columns,
+    Media,
+    Paragraph,
+    SubHeading,
+    Table,
+)
 from hpr.style import resolve
 from hpr.theme import build_theme
 
@@ -130,3 +145,59 @@ def test_sample_paginates_within_body(sample):
     assert pages
     assert _within_body(pages, ctx)
     assert next(pg.section_id for pg in pages if not pg.continued) == sample["sections"][0]["id"]
+
+
+def _lines_text(n: int) -> str:
+    return "\n".join(f"第{i}行" for i in range(n))
+
+
+def test_next_section_follows_small_continuation_remainder():
+    ctx = _ctx()
+    t = ctx.theme
+    per = int((ctx.body_bottom - BODY_TOP) // lh(t.body))
+    a = _one([Paragraph(_lines_text(per + 2))], "a", "第一节")
+    b = _one([Paragraph("健康管理建议。" * 165)], "b", "第二节")
+    pages = paginate([a, b], ctx)
+    assert pages[1].title == "第一节（续）"  # noqa: RUF001
+    assert SubHeading("第二节") in [pl.prim for pl in pages[1].placed]
+    assert not any(pg.section_id == "b" and not pg.continued for pg in pages)
+    assert _within_body(pages, ctx)
+
+
+def test_next_section_starts_new_page_when_little_room_left():
+    ctx = _ctx()
+    t = ctx.theme
+    per = int((ctx.body_bottom - BODY_TOP) // lh(t.body))
+    a = _one([Paragraph(_lines_text(int(per * 0.7)))], "a", "第一节")
+    b = _one([Paragraph("第二节。")], "b", "第二节")
+    pages = paginate([a, b], ctx)
+    assert [pg.title for pg in pages] == ["第一节", "第二节"]
+
+
+def test_single_line_slots_are_measured():
+    ctx = _ctx()
+    w = BODY_W
+    long = "很长的标题文字" * 20
+    assert measure(Callout("正文", title=long), w, ctx) > measure(
+        Callout("正文", title="短"), w, ctx
+    )
+    assert measure(Media(long, "说明", "https://e.x"), w, ctx) > measure(
+        Media("短", "说明", "https://e.x"), w, ctx
+    )
+    assert measure(Columns((Column(long, ("a",)),)), w, ctx) > measure(
+        Columns((Column("短", ("a",)),)), w, ctx
+    )
+    legend = tuple(long for _ in range(6))
+    assert measure(Chart("donut", ("a",) * 6, (1.0,) * 6, legend=legend), w, ctx) > measure(
+        Chart("donut", ("a",) * 6, (1.0,) * 6, legend=("短",) * 6), w, ctx
+    )
+    brand = {"org_name": long, "footer_signature": "团队"}
+    assert _ctx({"brand": brand}).body_bottom < _ctx({"brand": {"org_name": "短"}}).body_bottom
+
+
+def test_table_highlight_column_measured_bold():
+    ctx = _ctx()
+    rows = tuple(("第 1 天", "≥ 7.0 连续 2 次请联系管理师") for _ in range(3))
+    plain = table_geometry(Table(("日期", "阈值"), rows), BODY_W, ctx)
+    hl = table_geometry(Table(("日期", "阈值"), rows, highlight_col=1), BODY_W, ctx)
+    assert hl.col_w[1] > plain.col_w[1]
