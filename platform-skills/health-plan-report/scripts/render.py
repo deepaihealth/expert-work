@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             files["pptx"] = str(targets["pptx"])
         if "pdf" in targets:
             warnings += render_pdf(content, style, targets["pdf"], base_dir)
-            qa["pdf"] = qa_pdf(targets["pdf"], content, required, build_theme(style, "pdf"))
+            qa["pdf"] = qa_pdf(targets["pdf"], required, build_theme(style, "pdf"))
             files["pdf"] = str(targets["pdf"])
     except (RenderError, LayoutError, PdfUnavailableError) as exc:
         _remove(outputs)

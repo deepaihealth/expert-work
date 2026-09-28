@@ -59,8 +59,9 @@ def _join(*parts: str, sep: str = " ") -> str:
 
 
 def _table(columns: list[str], rows: list[list[str]], highlight: str | None = None) -> Table:
-    """Drop columns that are empty in every row (keeps caller text; only removes our dashes)."""
-    keep = [i for i in range(len(columns)) if i == 0 or any(r[i] not in ("", DASH) for r in rows)]
+    """Drop columns that are empty ("") in every row, then show empty cells as a dash. Builders
+    pass "" for a missing field, so a caller's own "—" is text and keeps its column."""
+    keep = [i for i in range(len(columns)) if i == 0 or any(r[i] != "" for r in rows)]
     cols = tuple(columns[i] for i in keep)
     body = tuple(tuple(r[i] or DASH for i in keep) for r in rows)
     hl = cols.index(highlight) if highlight in cols else None
@@ -91,8 +92,8 @@ def _profile(b: dict, v: str) -> list[Prim]:
             [
                 it["name"],
                 _join(fmt(it["value"]), it.get("unit", "")),
-                _ref_text(it) or DASH,
-                _POSITION_TAG[it["position"]].text if it.get("position") in _POSITION_TAG else DASH,
+                _ref_text(it),
+                _POSITION_TAG[it["position"]].text if it.get("position") in _POSITION_TAG else "",
             ]
             for it in items
         ]
@@ -158,11 +159,11 @@ def _goals(b: dict, v: str) -> list[Prim]:
         rows = [
             [
                 i["name"],
-                fmt(i["current"]) if "current" in i else DASH,
+                fmt(i["current"]) if "current" in i else "",
                 fmt(i["target"]),
-                i.get("unit", "") or DASH,
-                i.get("due", "") or DASH,
-                i.get("note", "") or DASH,
+                i.get("unit", ""),
+                i.get("due", ""),
+                i.get("note", ""),
             ]
             for i in items
         ]
@@ -186,7 +187,7 @@ def _phases(b: dict, v: str) -> list[Prim]:
         rows = [
             [
                 it["label"],
-                *({f["area"]: f["text"] for f in it["focus"]}.get(a, DASH) for a in areas),
+                *("\n".join(f["text"] for f in it["focus"] if f["area"] == a) for a in areas),
             ]
             for it in items
         ]
@@ -255,8 +256,8 @@ def _nutrition(b: dict, v: str, path: str) -> list[Prim]:
                     [
                         [
                             m["name"],
-                            fmt(m["grams"]) if "grams" in m else DASH,
-                            f"{fmt(m['percent'])}%" if "percent" in m else DASH,
+                            fmt(m["grams"]) if "grams" in m else "",
+                            f"{fmt(m['percent'])}%" if "percent" in m else "",
                         ]
                         for m in macros
                     ],
@@ -269,8 +270,8 @@ def _nutrition(b: dict, v: str, path: str) -> list[Prim]:
                 [
                     [
                         m["name"],
-                        f"{fmt(m['percent'])}%" if "percent" in m else DASH,
-                        m.get("note", "") or DASH,
+                        f"{fmt(m['percent'])}%" if "percent" in m else "",
+                        m.get("note", ""),
                     ]
                     for m in b["meals"]
                 ],
@@ -298,9 +299,9 @@ def _meal_plan(b: dict, v: str) -> list[Prim]:
                     [
                         [
                             m["name"],
-                            m.get("time", "") or DASH,
+                            m.get("time", ""),
                             "、".join(_foods(m)),
-                            f"{fmt(m['kcal'])} kcal" if "kcal" in m else DASH,
+                            f"{fmt(m['kcal'])} kcal" if "kcal" in m else "",
                         ]
                         for m in meals
                     ],
@@ -442,9 +443,9 @@ def _habits(b: dict, v: str) -> list[Prim]:
                 [
                     [
                         i["name"],
-                        i.get("current", "") or DASH,
-                        i.get("target", "") or DASH,
-                        i.get("how", "") or DASH,
+                        i.get("current", ""),
+                        i.get("target", ""),
+                        i.get("how", ""),
                     ]
                     for i in items
                 ],
@@ -479,9 +480,9 @@ def _monitoring(b: dict, v: str) -> list[Prim]:
             [
                 [
                     i["item"],
-                    i.get("frequency", "") or DASH,
-                    i.get("timing", "") or DASH,
-                    i.get("alert", "") or DASH,
+                    i.get("frequency", ""),
+                    i.get("timing", ""),
+                    i.get("alert", ""),
                 ]
                 for i in items
             ],

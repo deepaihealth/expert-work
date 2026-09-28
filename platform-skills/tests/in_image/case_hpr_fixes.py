@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from _harness import check, run, script
@@ -37,5 +38,26 @@ blocks(cc, "table")[0]["rows"][0][0] = "A\x0cB"
 r = render(cc, "ctrl")
 check(r["ok"] is True, f"control characters: {r}")
 check(r["qa"]["pptx"]["missing"] == [] and r["qa"]["pdf"]["missing"] == [], f"ctrl qa: {r}")
+
+# I2: two focus items sharing an area in the phases table both reach both formats
+ph = json.loads(json.dumps(SAMPLE))
+blocks(ph, "phases")[0]["items"][0]["focus"] = [
+    {"area": "饮食", "text": "控糖"},
+    {"area": "饮食", "text": "晚餐控糖饮食"},
+]
+r = render(ph, "phases", style={"blocks.phases.variant": "table"})
+check(r["ok"] is True, f"shared phase area: {r}")
+
+# I2: the PDF gate counts occurrences (a body text required twice but printed once is missing)
+sys.path.insert(0, str(skill / "scripts"))
+from hpr.content import required_texts  # noqa: E402
+from hpr.qa import qa_pdf  # noqa: E402
+from hpr.style import resolve  # noqa: E402
+from hpr.theme import build_theme  # noqa: E402
+
+once = blocks(SAMPLE, "paragraph")[0]["text"]
+theme = build_theme(resolve([], SAMPLE).style, "pdf")
+q = qa_pdf(Path("out/phases.pdf"), [*required_texts(ph), once], theme)
+check(q["missing"] == [once], f"PDF gate must count occurrences: {q['missing']}")
 
 print("PASS case_hpr_fixes")

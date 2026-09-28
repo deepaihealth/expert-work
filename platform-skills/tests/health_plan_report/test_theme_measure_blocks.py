@@ -200,3 +200,34 @@ def test_icons_are_in_grid_and_every_section_has_one(sample):
             assert len(pl) >= 2, name
             assert all(0 <= x <= 24 and 0 <= y <= 24 for x, y in pl), name
     assert all(icon_for_section(s) in ICONS for s in sample["sections"])
+
+
+def test_phases_table_keeps_every_text_when_two_focus_items_share_an_area():
+    blk = {
+        "kind": "phases",
+        "items": [
+            {
+                "label": "第1阶段",
+                "focus": [
+                    {"area": "饮食", "text": "控糖"},
+                    {"area": "饮食", "text": "晚餐控糖饮食"},
+                    {"area": "运动", "text": "快走"},
+                ],
+            },
+            {"label": "第2阶段", "focus": [{"area": "运动", "text": "慢跑"}]},
+        ],
+    }
+    (tbl,) = block_to_prims(blk, "table", "p")
+    assert tbl.columns == ("阶段", "饮食", "运动")
+    assert tbl.rows[0][1].split("\n") == ["控糖", "晚餐控糖饮食"]  # both, in caller order
+    assert tbl.rows[1][1] == "—"
+
+
+def test_kind_table_keeps_a_column_the_caller_filled_with_dashes():
+    blk = {
+        "kind": "habits",
+        "items": [{"name": "饮水", "current": "—"}, {"name": "步行", "current": "—"}],
+    }
+    (tbl,) = block_to_prims(blk, "table", "p")
+    assert tbl.columns == ("习惯", "现状")  # caller's "—" is text; our empty columns still drop
+    assert [r[1] for r in tbl.rows] == ["—", "—"]

@@ -19,7 +19,7 @@ from hpr.pdf_html import build_html, css_string, render_pdf
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import LayoutError
 from hpr.prims import Chart
-from hpr.qa import PAGE_NO_RE, missing_texts, norm
+from hpr.qa import missing_texts
 from hpr.style import Layer, resolve
 from hpr.theme import build_theme
 from PIL import Image as PILImage
@@ -236,10 +236,6 @@ def test_donut_palette_has_a_single_source():
     t = build_theme(resolve([]).style, "pdf")
     donut = Chart("donut", ("a", "b"), (1.0, 1.0))
     assert all(c in donut_svg(donut, t) for c in theme.donut_colors(t)[:2])
-
-
-def test_page_number_regex_matches_normalised_footer():
-    assert PAGE_NO_RE.search(norm("第 3 页 / 共 12 页"))
 
 
 def test_missing_logo_warns(sample, base):

@@ -477,3 +477,34 @@ def test_crlf_and_control_characters_in_caller_text_still_pass_pptx_qa(workdir, 
     assert summary["qa"]["pptx"]["missing"] == []
     corpus = pptx_corpus(workdir / "o" / "c.pptx")
     assert "_x000" not in corpus
+
+
+def test_missing_texts_counts_occurrences_not_just_presence():
+    assert missing_texts(["多喝水", "多喝水"], "多喝水") == ["多喝水"]
+    assert missing_texts(["多喝水", "多喝水"], "多喝水\x00多喝水") == []
+    # a dropped text hidden inside a longer one is still missing
+    assert missing_texts(["控糖", "晚餐控糖饮食"], "晚餐控糖饮食") == ["控糖"]
+    assert missing_texts(["控糖", "晚餐控糖饮食"], "晚餐控糖饮食·控糖") == []
+
+
+def test_shared_phase_area_texts_all_reach_the_pptx(workdir, sample):
+    ph = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "phases")
+    ph["items"][0]["focus"] = [
+        {"area": "饮食", "text": "控糖"},
+        {"area": "饮食", "text": "晚餐控糖饮食"},
+    ]
+    out, style, _ = _render(sample, workdir, [Layer("x", {"blocks.phases.variant": "table"})])
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa
+
+
+def test_phase_area_shared_by_several_phases_is_one_table_header_not_a_missing_text(
+    workdir, sample
+):
+    ph = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "phases")
+    for it in ph["items"]:
+        it["focus"][0]["area"] = "独有领域"  # appears nowhere else in the plan
+    assert required_texts(sample).count("独有领域") == 1
+    out, style, _ = _render(sample, workdir, [Layer("x", {"blocks.phases.variant": "table"})])
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa

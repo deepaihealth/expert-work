@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from hpr.measure import LINE, Measurer
-from hpr.ppt_layout import brand_line
 from hpr.style import INK, contrast
 from hpr.theme import Theme, on_color
 
@@ -21,12 +20,19 @@ def norm(s: str) -> str:
 
 
 def missing_texts(required: list[str], corpus: str) -> list[str]:
-    c = norm(corpus)
-    out: list[str] = []
-    for r in required:
-        if norm(r) not in c and r not in out:
-            out.append(r)
-    return out
+    """Multiset containment (spec §7.2: 计数不足即失败). Longest first, each required text
+    consumes one occurrence from a working copy of the corpus, so a text required twice must
+    appear twice and a dropped text cannot hide inside a longer one. Chrome repeated on every
+    page only adds occurrences, so it cannot cause a false failure."""
+    work = norm(corpus)
+    lost: set[str] = set()
+    for r in sorted(required, key=lambda x: len(norm(x)), reverse=True):
+        n = norm(r)
+        if n and n in work:
+            work = work.replace(n, "\x00", 1)
+        else:
+            lost.add(r)
+    return [r for r in dict.fromkeys(required) if r in lost]
 
 
 def _shape_texts(sh: Any) -> list[str]:
@@ -141,9 +147,6 @@ def qa_pptx(path: Path, required: list[str], theme: Theme, m: Measurer) -> dict[
     }
 
 
-PAGE_NO_RE = re.compile(r"第\d+页/共\d+页")
-
-
 def pdf_text(path: Path) -> str:
     from pypdf import PdfReader
 
@@ -161,25 +164,10 @@ def pdf_fonts(path: Path) -> list[str]:
     return sorted(names)
 
 
-def _pdf_chrome(content: dict) -> list[str]:
-    brand = content.get("brand") or {}
-    parts = (
-        content["title"],
-        brand.get("org_name", ""),
-        brand_line(brand),
-        brand.get("disclaimer", ""),
-    )
-    return [norm(x) for x in parts if x]
-
-
-def qa_pdf(path: Path, content: dict, required: list[str], theme: Theme) -> dict[str, Any]:
+def qa_pdf(path: Path, required: list[str], theme: Theme) -> dict[str, Any]:
     from pypdf import PdfReader
 
-    raw = norm(pdf_text(path))
-    cleaned = PAGE_NO_RE.sub("", raw)
-    for chrome in sorted(_pdf_chrome(content), key=len, reverse=True):
-        cleaned = cleaned.replace(chrome, "")
-    missing = [r for r in dict.fromkeys(required) if norm(r) not in raw and norm(r) not in cleaned]
+    missing = missing_texts(required, pdf_text(path))
     fonts = pdf_fonts(path)
     embedded = any("NotoSansCJK" in re.sub(r"[\s-]", "", f) for f in fonts)  # "Noto-Sans-CJK-SC"
     cr = contrast_report(theme)

@@ -466,11 +466,22 @@ _NON_TEXT_KEYS = frozenset(
 )
 
 
+def _phase_areas_once(block: dict) -> dict:
+    """A phases block's ``area`` names are grouping labels: the table variant shows each one once
+    as a column header, so each distinct area is required once per block (texts all count)."""
+    areas = list(dict.fromkeys(f["area"] for it in block["items"] for f in it["focus"]))
+    items = [{**it, "focus": [{"text": f["text"]} for f in it["focus"]]} for it in block["items"]]
+    return {**block, "items": items, "areas": areas}
+
+
 def required_texts(content: dict) -> list[str]:
-    """Every string the reader must find in the deliverable (numbers and chart points excluded)."""
+    """Every string the reader must find in the deliverable, once per occurrence (numbers and
+    chart points excluded)."""
     out: list[str] = []
 
     def walk(value: Any, in_points: bool) -> None:
+        if isinstance(value, dict) and value.get("kind") == "phases":
+            value = _phase_areas_once(value)
         if isinstance(value, dict):
             for key, item in value.items():
                 if key not in _NON_TEXT_KEYS:
