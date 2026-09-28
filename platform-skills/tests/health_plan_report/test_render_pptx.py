@@ -565,3 +565,60 @@ def test_out_of_range_tag_and_card_title_are_drawn_readable(workdir, sample):
     assert tags and titles
     for hex_ in tags + titles:
         assert contrast(f"#{hex_}", t.background) >= 4.5, hex_
+
+
+def test_unexpected_exception_is_a_json_envelope_not_a_traceback(workdir, monkeypatch, capsys):
+    mod = _load_render()
+
+    def boom(*_a, **_k):
+        raise KeyError("意外")
+
+    monkeypatch.setattr(mod, "render_pptx", boom)
+    out = workdir / "out"
+    code = mod.main(
+        ["--content", str(workdir / "plan.json"), "--out-dir", str(out), "--basename", "x"]
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert summary["ok"] is False
+    assert summary["errors"][0].startswith("内部错误：") and "意外" in summary["errors"][0]  # noqa: RUF001
+    assert not list(out.glob("x*"))
+
+
+def test_table_cell_newlines_become_paragraphs_not_a_raw_lf(workdir, sample):
+    tbl = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "table")
+    tbl["rows"][0][0] = "第一行\n第二行"
+    out, style, _ = _render(sample, workdir)
+    cells = [
+        cell
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_table", False) and sh.has_table
+        for row in sh.table.rows
+        for cell in row.cells
+        if "第一行" in cell.text
+    ]
+    (cell,) = cells
+    assert [p.text for p in cell.text_frame.paragraphs] == ["第一行", "第二行"]
+    assert all("\n" not in (t.text or "") for t in cell._tc.iter(qn("a:t")))
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa
+
+
+def test_line_value_axis_never_collapses_for_small_values(workdir, sample):
+    from pptx.enum.chart import XL_CHART_TYPE
+
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    trend["points"] = [{"date": d, "value": v} for d, v in (("a", 0.001), ("b", 0.003))]
+    for k in ("target_low", "target_high"):
+        trend.pop(k, None)
+    out, _, _ = _render(sample, workdir)
+    va = next(
+        sh.chart.value_axis
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_chart", False)
+        and sh.has_chart
+        and sh.chart.chart_type == XL_CHART_TYPE.LINE_MARKERS
+    )
+    assert va.minimum_scale < 0.001 and va.maximum_scale > 0.003

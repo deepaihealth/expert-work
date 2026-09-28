@@ -16,6 +16,7 @@ from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Pt
 
 from hpr.blocks import RenderError, section_prims
+from hpr.common import clock_minutes, cover_meta_items
 from hpr.icons import ICONS
 from hpr.images import IMAGE_ERRORS, image_blocks, strict_images
 from hpr.logo import trimmed_logo
@@ -403,21 +404,6 @@ def _place_brand(
 # ---------- cover / toc / end ----------
 
 
-def _meta_items(content: dict) -> list[tuple[str, str]]:
-    items = [("客户", content["client"]["name"])]
-    items += [(f["label"], f["value"]) for f in content["client"].get("facts", [])]
-    period = content.get("period")
-    if period:
-        items.append(("阶段", period["label"]))
-    if content.get("data_basis"):
-        items.append(("数据依据", content["data_basis"]))
-    items.append(("生成日期", content["generated_at"]))
-    mgr = content.get("manager")
-    if mgr:
-        items.append((mgr.get("title") or "负责人", mgr["name"]))
-    return items
-
-
 def _cover_title(
     cv: Canvas,
     content: dict,
@@ -521,7 +507,7 @@ def _cover(
         "brand.org_position"
     ].startswith("bottom")
     meta_bottom = SLIDE_H - 40 - (BRAND_BAND_H if bottom_brand else 0)
-    items = _meta_items(content)
+    items = cover_meta_items(content)
     if variant == "split":
         panel_w = SLIDE_W * 0.42
         meta_w = SLIDE_W - panel_w - 80
@@ -795,11 +781,12 @@ def _draw_table(cv: Canvas, pl: Placed, tb: Table, ctx: Ctx) -> None:
                 cell.fill.background()
             highlight = r > 0 and tb.highlight_col == c and value not in ("", "—")
             color = t.primary if r == 0 else (t.out_text if highlight else t.ink)
-            para = cell.text_frame.paragraphs[0]
-            para.line_spacing = Pt(t.small * LINE)
-            run = para.add_run()
-            run.text = value
-            _set_font(run, t, t.small, color, r == 0 or highlight)
+            for k, line in enumerate(value.split("\n")):
+                para = cell.text_frame.paragraphs[0] if k == 0 else cell.text_frame.add_paragraph()
+                para.line_spacing = Pt(t.small * LINE)
+                run = para.add_run()
+                run.text = line
+                _set_font(run, t, t.small, color, r == 0 or highlight)
 
 
 def _draw_kv(cv: Canvas, pl: Placed, kv: KeyValue, ctx: Ctx) -> None:
@@ -979,12 +966,6 @@ def _draw_image(cv: Canvas, pl: Placed, im: Image, ctx: Ctx) -> None:
         cv.text(pl.x, pl.y + h + t.gap_xs, pl.w, ch, im.caption, t.caption, t.muted)
 
 
-def _minutes(hhmm: str) -> int:
-    h, mm = (int(x) for x in hhmm.split(":"))
-    total = h * 60 + mm
-    return total + 24 * 60 if total < 18 * 60 else total
-
-
 def _draw_timebars(cv: Canvas, pl: Placed, tb: TimeBars, ctx: Ctx) -> None:
     t, m = ctx.theme, ctx.m
     start, span = 18 * 60, 18 * 60
@@ -994,7 +975,7 @@ def _draw_timebars(cv: Canvas, pl: Placed, tb: TimeBars, ctx: Ctx) -> None:
     for i, (label, bed, wake) in enumerate(tb.rows):
         rh = lh(t.body)
         cv.text(pl.x, y, label_w - 8, rh, label, t.body, t.muted, bold=True, name=DECO)
-        b, w_ = _minutes(bed), _minutes(wake)
+        b, w_ = clock_minutes(bed), clock_minutes(wake)
         if w_ <= b:
             w_ += 24 * 60
         x0 = ax + aw * max(0, min(span, b - start)) / span

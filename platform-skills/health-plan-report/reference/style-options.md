@@ -22,7 +22,7 @@
 | `layout.density` | `compact` / `standard` / `airy` | `standard` | 版面密度（行距/间距） |
 | `brand.logo_position` | `top-left` / `top-right` / `bottom-left` / `bottom-right` / `center` | `top-left` | 封面 LOGO 位置；LOGO 会自动裁掉透明边距，落在深色底上时自动加白色底板，不用预先处理 LOGO 图片 |
 | `brand.org_position` | 同上五选一 | `top-left` | 封面机构名称位置 |
-| `footer.align` | `left` / `center` | `left` | PDF 页脚（署名/免责声明）对齐方式 |
+| `footer.align` | `left` / `center` | `left` | 页脚（署名/免责声明）对齐方式，PPTX 与 PDF 都生效 |
 | `footer.page_number` | 开 / 关 | 开 | 是否显示页码 |
 | `cover.variant` | `band` / `split` / `minimal` | `band` | 封面版式 |
 | `toc` | `auto` / `on` / `off` | `auto` | 目录；`auto` 时 PDF 章节数 ≥ 6、PPTX 章节数 ≥ 8 自动加目录（两种格式阈值不同） |

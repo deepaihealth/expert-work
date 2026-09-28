@@ -155,3 +155,18 @@ def test_normalize_content_maps_line_ends_and_controls_without_mutating(sample):
     assert out["client"]["facts"][0]["value"] == "x\ny"
     assert out["brand"]["logo_path"] == "logo\r.png"  # file names are not display text
     assert out["title"] == sample["title"]
+
+
+def test_nan_and_infinity_are_not_numbers(sample, tmp_path):
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    trend["points"][0]["value"] = float("nan")
+    trend["target_high"] = float("inf")
+    paths = _paths(validate_content(sample))
+    assert any(p.endswith(".points[0].value") for p in paths)
+    assert any(p.endswith(".target_high") for p in paths)
+    p = tmp_path / "nan.json"
+    p.write_text(json.dumps(sample, ensure_ascii=False), encoding="utf-8")  # writes bare NaN
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, str(VALIDATE), str(p)], capture_output=True, text=True, check=False
+    )
+    assert res.returncode == 1 and "points[0].value" in res.stdout

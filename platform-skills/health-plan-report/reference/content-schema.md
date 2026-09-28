@@ -66,7 +66,8 @@ PDF 页脚顶出页面底边，同样会报错（路径 `brand.disclaimer`），
 | --- | --- | --- |
 | `items` | 必填，≥1 项 | 数组，每项 `{title, evidence?, level?}` |
 
-`title` 文字必填；`evidence` 文字可选；`level` 可选枚举 `focus`/`watch`/`info`。
+`title` 文字必填；`evidence` 文字可选；`level` 可选枚举 `focus`/`watch`/`info`
+（`focus` 显示「重点关注」、`watch` 显示「留意」标签，卡片与列表版式都显示；`info` 不加标签）。
 
 示例：`{"kind": "issues", "items": [{"title": "血糖偏高", "evidence": "近 30 天有 9 天超标", "level": "focus"}]}`
 
@@ -218,8 +219,8 @@ PDF 页脚顶出页面底边，同样会报错（路径 `brand.disclaimer`），
 
 `media_path` 只用于 PPTX：指向一个存在、可读的 `.mp4` 文件，且版面留有足够空间时，会把视频真正嵌入为可播放
 对象；文件不是 `.mp4`、文件不存在、空间不够，或者嵌入本身失败，都会降级为可点击链接并给出警告，不会中断渲染。
-`url` 始终会同时渲染成一行可点击链接文字。PDF 不使用 `media_path`，只把 `name`/`description`/`url` 渲染成
-可点击链接。
+`url` 始终会渲染成一个可点击的链接，链接文字是「查看示范/产品详情：{name}」。PDF 不使用 `media_path`；
+为了打印出来也能用，PDF 还会在链接文字下方用小字印出 `url` 本身。
 
 示例：`{"kind": "material", "name": "快走动作示范", "description": "示范视频说明快走姿势。", "url": "https://example.com/materials/brisk-walk"}`
 

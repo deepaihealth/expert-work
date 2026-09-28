@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from html import escape
 
-from hpr.common import bar_domain
+from hpr.common import bar_domain, clock_minutes
 from hpr.icons import ICONS
 from hpr.prims import Chart
 from hpr.style import mix
@@ -200,15 +200,9 @@ def icon_svg(name: str, color: str, size_mm: float) -> str:
     )
 
 
-def _minutes(hhmm: str) -> int:
-    h, m = (int(x) for x in hhmm.split(":"))
-    total = h * 60 + m
-    return total + 24 * 60 if total < 18 * 60 else total
-
-
 def timebar_svg(bed: str, wake: str, color: str, t: Theme) -> str:
     start, span = 18 * 60, 18 * 60
-    b, w = _minutes(bed), _minutes(wake)
+    b, w = clock_minutes(bed), clock_minutes(wake)
     if w <= b:
         w += 24 * 60
     x0 = 300 * max(0, min(span, b - start)) / span

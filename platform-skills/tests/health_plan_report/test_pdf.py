@@ -492,3 +492,34 @@ def test_pdf_text_roles_use_the_readable_theme_colours(sample, base):
     assert f".callout.warn .ct {{ color: {t.out_text}; }}" in html
     assert f"td.hl {{ color: {t.out_text};" in html
     assert f"color: {t.on_primary_soft}" in html  # cover labels / subtitle on the colour band
+
+
+def test_pdf_prints_the_material_url_under_its_link(sample, base):
+    html, _ = _html(sample, base)
+    mat = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "material")
+    assert f'<div class="url">{mat["url"]}</div>' in html
+
+
+def test_pdf_newlines_in_list_table_kv_and_card_text_become_line_breaks(sample, base):
+    blocks = [b for s in sample["sections"] for b in s["blocks"]]
+    next(b for b in blocks if b["kind"] == "bullets")["items"][0] = "甲一\n甲二"
+    next(b for b in blocks if b["kind"] == "table")["rows"][0][0] = "乙一\n乙二"
+    next(b for b in blocks if b["kind"] == "kv")["items"][0]["value"] = "丙一\n丙二"
+    next(b for b in blocks if b["kind"] == "summary")["items"][0]["text"] = "丁一\n丁二"
+    html, _ = _html(sample, base)
+    for a, b in (("甲一", "甲二"), ("乙一", "乙二"), ("丙一", "丙二"), ("丁一", "丁二")):
+        assert f"{a}<br>{b}" in html, a
+
+
+def test_failed_resource_url_is_caught_in_either_repr_quote_style():
+    import logging
+
+    from hpr.pdf_html import _Collect
+
+    c = _Collect()
+    for url in ("file:///w/a.png", "file:///w/it's.png"):
+        rec = logging.LogRecord(
+            "weasyprint", logging.ERROR, "x", 1, "Failed to load image at %r: %s", (url, "e"), None
+        )
+        c.emit(rec)
+    assert c.failed == ["file:///w/a.png", "file:///w/it's.png"]

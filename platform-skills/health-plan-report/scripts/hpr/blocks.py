@@ -116,11 +116,18 @@ def _profile(b: dict, v: str) -> list[Prim]:
     return [_grid(cards, 4)]
 
 
+def _level_prefix(item: dict) -> str:
+    tag = _LEVEL_TAG.get(item.get("level", ""))
+    return f"【{tag.text}】" if tag else ""
+
+
 def _issues(b: dict, v: str) -> list[Prim]:
     items = b["items"]
     if v == "list":
         sep = "："  # noqa: RUF001
-        joined = tuple(_join(i["title"], i.get("evidence", ""), sep=sep) for i in items)
+        joined = tuple(
+            _level_prefix(i) + _join(i["title"], i.get("evidence", ""), sep=sep) for i in items
+        )
         return [Bullets(joined, "numbers")]
     cards = [
         Card(

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from hpr.blocks import section_prims
+from hpr.common import cover_meta_items
 from hpr.icons import icon_for_section
 from hpr.images import image_blocks
 from hpr.logo import trimmed_logo
@@ -58,6 +59,11 @@ def clean(s: str) -> str:
 
 def e(s: str) -> str:
     return escape(clean(s), quote=True)
+
+
+def eb(s: str) -> str:
+    """Escaped text whose line breaks stay line breaks (escape first, then <br>)."""
+    return e(s).replace("\n", "<br>")
 
 
 _CSS_HEX = frozenset('\\"<>')
@@ -220,6 +226,8 @@ dl.kv dt {{ color: {t.muted}; font-size: {t.small}pt; }} dl.kv dd {{ margin: 0; 
 .media a {{ display: block; background: {t.background}; border: 0.5pt solid {t.line};
   border-radius: 1.5mm;
   padding: 3mm; color: {t.primary}; font-weight: 700; text-decoration: none; }}
+.media .url {{ margin-top: 1.5mm; font-size: {t.caption}pt; color: {t.muted};
+  overflow-wrap: anywhere; }}
 figure {{ margin: 0 0 4mm; break-inside: avoid; }} figure img {{ max-width: 100%;
   max-height: 110mm; }}
 figcaption {{ font-size: {t.caption}pt; color: {t.muted}; }}
@@ -267,19 +275,6 @@ def _brand_rows(content: dict, style: dict, logo: str, dark: dict[bool, bool]) -
     )
 
 
-def _meta_items(content: dict) -> list[tuple[str, str]]:
-    meta = [("客户", content["client"]["name"])]
-    meta += [(f["label"], f["value"]) for f in content["client"].get("facts", [])]
-    if content.get("period"):
-        meta.append(("阶段", content["period"]["label"]))
-    if content.get("data_basis"):
-        meta.append(("数据依据", content["data_basis"]))
-    meta.append(("生成日期", content["generated_at"]))
-    if content.get("manager"):
-        meta.append((content["manager"].get("title") or "负责人", content["manager"]["name"]))
-    return meta
-
-
 def _cover(content: dict, style: dict, t: Theme, base_dir: Path, warnings: list[str]) -> str:
     """Cover in normal flow: a two-row grid, head (brand row, title, subtitle) over foot (meta
     grid, bottom brand row), so title, subtitle and meta can never overlap. The decoration lives
@@ -297,7 +292,7 @@ def _cover(content: dict, style: dict, t: Theme, base_dir: Path, warnings: list[
     rule = '<div class="rule"></div>' if variant == "minimal" else ""
     cells = "".join(
         f'<div><div class="k">{e(k)}</div><div class="v num">{e(v)}</div></div>'
-        for k, v in _meta_items(content)
+        for k, v in cover_meta_items(content)
     )
     return (
         f'<section class="cover cover-{variant}">'
@@ -316,7 +311,7 @@ def _card(c: Any) -> str:
     if c.value or c.unit:
         unit = f"<small>{e(c.unit)}</small>" if c.unit else ""
         out.append(f'<div class="v num">{e(c.value)}{unit}</div>')
-    out += [f'<div class="l">{e(ln)}</div>' for ln in c.lines]
+    out += [f'<div class="l">{eb(ln)}</div>' for ln in c.lines]
     if c.tag:
         out.append(f'<div class="tag tone-{c.tag.tone}">{e(c.tag.text)}</div>')
     if c.bar:
@@ -339,11 +334,11 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         return f"<h3>{e(p.text)}</h3>"
     if isinstance(p, Paragraph):
         cls = ' class="boxed"' if p.boxed else ""
-        return f"<p{cls}>{e(p.text).replace(chr(10), '<br>')}</p>"
+        return f"<p{cls}>{eb(p.text)}</p>"
     if isinstance(p, Bullets):
         tag = "ol" if p.style == "numbers" else "ul"
         cls = ' class="checks"' if p.style == "checks" else ""
-        return f"<{tag}{cls}>" + "".join(f"<li>{e(i)}</li>" for i in p.items) + f"</{tag}>"
+        return f"<{tag}{cls}>" + "".join(f"<li>{eb(i)}</li>" for i in p.items) + f"</{tag}>"
     if isinstance(p, CardGrid):
         return f'<div class="grid c{p.cols}">' + "".join(_card(c) for c in p.cards) + "</div>"
     if isinstance(p, Table):
@@ -352,7 +347,8 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
             "<tr>"
             + "".join(
                 f"<td "
-                f'class="{"hl" if i == p.highlight_col and v not in ("", "—") else ""}">{e(v)}</td>'
+                f'class="{"hl" if i == p.highlight_col and v not in ("", "—") else ""}">'
+                f"{eb(v)}</td>"
                 for i, v in enumerate(r)
             )
             + "</tr>"
@@ -362,15 +358,12 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
     if isinstance(p, KeyValue):
         return (
             f'<dl class="kv c{p.cols}">'
-            + "".join(f"<div><dt>{e(k)}</dt><dd>{e(v)}</dd></div>" for k, v in p.pairs)
+            + "".join(f"<div><dt>{e(k)}</dt><dd>{eb(v)}</dd></div>" for k, v in p.pairs)
             + "</dl>"
         )
     if isinstance(p, Callout):
         title = f'<div class="ct">{e(p.title)}</div>' if p.title else ""
-        return (
-            f'<div class="callout {p.tone}">{title}<div>{e(p.text).replace(chr(10), "<br>")}</div>'
-            f"</div>"
-        )
+        return f'<div class="callout {p.tone}">{title}<div>{eb(p.text)}</div></div>'
     if isinstance(p, Chart):
         if p.kind == "donut":
             colors = donut_colors(t)
@@ -389,7 +382,7 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         per = min(5, len(p.steps))
         steps = "".join(
             f'<div class="step"><div class="dot"></div><div class="lbl">{e(s.label)}</div>'
-            + (f'<div class="box">{"<br>".join(e(x) for x in s.lines)}</div>' if s.lines else "")
+            + (f'<div class="box">{"<br>".join(eb(x) for x in s.lines)}</div>' if s.lines else "")
             + "</div>"
             for s in p.steps
         )
@@ -400,7 +393,7 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         per = len(p.columns) if len(p.columns) <= 4 else 3
         cols = "".join(
             f'<div class="col tone-{c.tone}"><div class="ch">{e(c.title)}</div><ul>'
-            + "".join(f"<li>{e(i)}</li>" for i in c.items)
+            + "".join(f"<li>{eb(i)}</li>" for i in c.items)
             + "</ul></div>"
             for c in p.columns
         )
@@ -409,7 +402,8 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         return (
             f'<div class="media"><div><div class="mn">{e(p.name)}</div>'
             f"<div>{e(p.description)}</div></div>"
-            f'<a href="{e(p.url)}">查看示范/产品详情：{e(p.name)}</a></div>'  # noqa: RUF001
+            f'<div><a href="{e(p.url)}">查看示范/产品详情：{e(p.name)}</a>'  # noqa: RUF001
+            f'<div class="url">{e(p.url)}</div></div></div>'
         )
     if isinstance(p, Image):
         path = Path(p.path)
@@ -488,7 +482,7 @@ class PdfUnavailableError(Exception):
     """weasyprint is not installed in this environment."""
 
 
-_FAILED_URL = re.compile(r"Failed to load \w+ at '([^']*)'")
+_FAILED_URL = re.compile(r"""Failed to load \w+ at (?:'([^']*)'|"([^"]*)")""")
 
 
 class _Collect(logging.Handler):
@@ -506,7 +500,7 @@ class _Collect(logging.Handler):
             self.messages.append(f"PDF 资源未能加载：{msg}")  # noqa: RUF001
             m = _FAILED_URL.search(msg)
             if m:
-                self.failed.append(m.group(1))
+                self.failed.append(m.group(1) if m.group(1) is not None else m.group(2))
 
 
 def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> list[str]:

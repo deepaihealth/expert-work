@@ -268,3 +268,35 @@ def test_every_text_role_is_readable_on_its_surfaces(primary, bg, fmt):
         "out_text_on_background",
         "out_text_on_pale_out",
     } <= set(report)
+
+
+def test_issues_list_shows_the_callers_level():
+    blk = {
+        "kind": "issues",
+        "items": [
+            {"title": "血糖偏高", "evidence": "空腹 6.4", "level": "focus"},
+            {"title": "肌肉量偏低", "level": "watch"},
+            {"title": "睡眠", "level": "info"},
+        ],
+    }
+    (bl,) = block_to_prims(blk, "list", "p")
+    assert bl.items[0].startswith("【重点关注】") and "血糖偏高" in bl.items[0]
+    assert bl.items[1].startswith("【留意】")
+    assert bl.items[2] == "睡眠"  # info has no tag in the cards variant either
+
+
+def test_cover_meta_and_clock_rules_have_a_single_source():
+    from pathlib import Path
+
+    from hpr import common
+
+    hpr_dir = Path(common.__file__).parent
+    for name in ("_meta_items", "_minutes"):
+        owners = [p.name for p in hpr_dir.glob("*.py") if f"def {name}(" in p.read_text("utf-8")]
+        assert owners == [], (name, owners)
+    assert common.cover_meta_items({"client": {"name": "甲"}, "generated_at": "2026-09-28"}) == [
+        ("客户", "甲"),
+        ("生成日期", "2026-09-28"),
+    ]
+    assert common.clock_minutes("06:30") == 24 * 60 + 6 * 60 + 30
+    assert common.clock_minutes("23:00") == 23 * 60

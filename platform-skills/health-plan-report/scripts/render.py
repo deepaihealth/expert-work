@@ -120,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
     except (RenderError, LayoutError, PdfUnavailableError) as exc:
         _remove(outputs)
         return _fail([str(exc)])
+    except Exception as exc:  # anything unforeseen still answers with the JSON envelope
+        _remove(outputs)
+        return _fail([f"内部错误：{type(exc).__name__}: {exc}"])  # noqa: RUF001
     except BaseException:
         _remove(outputs)
         raise

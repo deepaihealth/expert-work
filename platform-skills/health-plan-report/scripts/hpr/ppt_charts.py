@@ -57,7 +57,8 @@ def add_chart(slide, prim: Chart, x: float, y: float, w: float, h: float, t: The
     if prim.kind == "bar":
         va.minimum_scale, va.maximum_scale = bar_domain(prim.values)
     else:
-        va.minimum_scale, va.maximum_scale = round(lo - pad, 2), round(hi + pad, 2)
+        # unrounded: rounding collapsed small-magnitude data (0.001-0.003) to min == max
+        va.minimum_scale, va.maximum_scale = lo - pad, hi + pad
     va.tick_labels.font.size = Pt(t.caption)
     ca = ch.category_axis
     ca.format.line.color.rgb = _rgb(t.line)
