@@ -172,7 +172,7 @@ ul.checks {{ list-style: none; padding-left: 5mm; }} ul.checks li::before {{ con
 .tag {{ font-size: {t.small}pt; font-weight: 700; }}
 .tone-within {{ color: {t.within_text}; }} .tone-out {{ color: {t.out_text}; }}
   .tone-alert {{ color: {t.alert_text}; }}
-.tone-info {{ color: {t.primary}; }} .tone-neutral {{ color: {t.muted}; }}
+.tone-info {{ color: {t.primary_text}; }} .tone-neutral {{ color: {t.muted}; }}
 .bar {{ position: relative; height: 3mm; margin-top: 1.5mm; }}
 .bar .track {{ position: absolute; left: 0; right: 0; top: 1mm; height: 1mm; background: {t.pale};
   }}
@@ -180,7 +180,7 @@ ul.checks {{ list-style: none; padding-left: 5mm; }} ul.checks li::before {{ con
 .bar .mark {{ position: absolute; top: 0; width: 0.6mm; height: 3mm; background: {t.ink}; }}
 table {{ width: 100%; border-collapse: collapse; margin-bottom: 4mm; font-size: {t.small}pt; }}
 thead {{ display: table-header-group; }}
-th {{ background: {t.pale}; color: {t.primary}; text-align: left; }}
+th {{ background: {t.pale}; color: {t.primary_text}; text-align: left; }}
 th, td {{ padding: 1.8mm 2.2mm; border-bottom: 0.5pt solid {t.line}; vertical-align: top;
   overflow-wrap: anywhere; }}
 td.hl {{ color: {t.out_text}; font-weight: 700; }}
@@ -222,10 +222,10 @@ dl.kv dt {{ color: {t.muted}; font-size: {t.small}pt; }} dl.kv dd {{ margin: 0; 
 .col ul {{ font-size: {t.small}pt; color: {t.ink}; }}
 .media {{ display: grid; grid-template-columns: 62% 1fr; gap: 4mm; background: {t.pale};
   padding: 3mm; break-inside: avoid; margin-bottom: 4mm; }}
-.media .mn {{ color: {t.primary}; font-weight: 700; font-size: {t.heading}pt; }}
+.media .mn {{ color: {t.primary_text}; font-weight: 700; font-size: {t.heading}pt; }}
 .media a {{ display: block; background: {t.background}; border: 0.5pt solid {t.line};
   border-radius: 1.5mm;
-  padding: 3mm; color: {t.primary}; font-weight: 700; text-decoration: none; }}
+  padding: 3mm; color: {t.primary_text}; font-weight: 700; text-decoration: none; }}
 .media .url {{ margin-top: 1.5mm; font-size: {t.caption}pt; color: {t.muted};
   overflow-wrap: anywhere; }}
 figure {{ margin: 0 0 4mm; break-inside: avoid; }} figure img {{ max-width: 100%;

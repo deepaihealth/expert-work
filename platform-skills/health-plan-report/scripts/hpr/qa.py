@@ -119,6 +119,7 @@ def _text_pairs(t: Theme) -> dict[str, tuple[str, str]]:
     """Every theme text role on every surface the writers draw it on (spec §7.2)."""
     return {
         "primary_on_background": (t.primary, t.background),
+        "primary_text_on_pale": (t.primary_text, t.pale),
         "text_on_primary": (on_color(t.primary), t.primary),
         "cover_label_on_primary": (t.on_primary_soft, t.primary),
         "muted_on_background": (t.muted, t.background),

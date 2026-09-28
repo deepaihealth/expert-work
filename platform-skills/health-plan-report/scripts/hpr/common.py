@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 
 def bar_domain(values: tuple[float, ...] | list[float]) -> tuple[float, float]:
     """Value-axis range for a bar chart: always contains zero (bars grow from a zero baseline,
@@ -9,6 +11,36 @@ def bar_domain(values: tuple[float, ...] | list[float]) -> tuple[float, float]:
     lo, hi = min(min(values), 0.0), max(max(values), 0.0)
     pad = (hi - lo) * 0.15 or 1.0
     return (lo - pad if lo < 0 else 0.0), (hi + pad if hi > 0 or lo == 0 else 0.0)
+
+
+_NICE = (1.0, 2.0, 2.5, 5.0, 10.0)
+
+
+def nice_ticks(lo: float, hi: float, target: int = 5) -> tuple[float, float, float]:
+    """Axis (min, max, step) for the range lo..hi: step is 1 / 2 / 2.5 / 5 x 10^n giving at most
+    ``target`` intervals, and min / max are the step multiples just covering lo..hi. PPT and PDF
+    both use it, so the native chart and the SVG show the same ticks."""
+    raw = (hi - lo) / target
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in _NICE if m * mag >= raw * (1 - 1e-9))
+    return (
+        round(math.floor(lo / step + 1e-9) * step, 12),
+        round(math.ceil(hi / step - 1e-9) * step, 12),
+        step,
+    )
+
+
+def tick_decimals(step: float) -> int:
+    """Decimals that print every multiple of ``step`` exactly (0.25 -> 2, 0.5 -> 1, 5 -> 0)."""
+    for d in range(12):
+        if abs(step * 10**d - round(step * 10**d)) < 1e-9:
+            return d
+    return 12
+
+
+def tick_label(v: float, step: float) -> str:
+    text = f"{v:.{tick_decimals(step)}f}"
+    return "0" if float(text) == 0 else text
 
 
 def cover_meta_items(content: dict) -> list[tuple[str, str]]:

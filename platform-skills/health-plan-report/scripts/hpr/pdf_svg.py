@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from html import escape
+from typing import Any
 
-from hpr.common import bar_domain, clock_minutes
+from hpr.common import bar_domain, clock_minutes, nice_ticks, tick_label
 from hpr.icons import ICONS
 from hpr.prims import Chart
 from hpr.style import mix
@@ -43,12 +44,30 @@ def _legend(entries: list[tuple[str, str, bool]], x: float, y: float, t: Theme) 
     return "".join(out)
 
 
+def _value_axis(
+    vmin: float, vmax: float, step: float, left: float, right: float, py: Any, t: Theme
+) -> list[str]:
+    """Gridline + label at every nice tick (hpr.common.nice_ticks) from vmin to vmax."""
+    out = []
+    for k in range(round((vmax - vmin) / step) + 1):
+        v = vmin + k * step
+        out.append(
+            f'<line x1="{left}" y1="{py(v):.1f}" x2="{right}" y2="{py(v):.1f}" stroke="{t.line}" '
+            f'stroke-width="0.6"/>'
+        )
+        out.append(
+            f'<text x="{left - 6}" y="{py(v) + 3:.1f}" font-size="9" text-anchor="end" '
+            f'fill="{t.muted}">{tick_label(v, step)}</text>'
+        )
+    return out
+
+
 def line_svg(prim: Chart, t: Theme) -> str:
     """Line chart with the target band; the legend names the series by its unit and labels the
     bounds 「目标下限 / 目标上限」 like the PPT chart legend."""
     w, h, left, right, top, bottom = 600, 240, 42, 590, 12, 190
     vals = list(prim.values) + [v for v in (prim.low, prim.high) if v is not None]
-    vmin, vmax = _scale(vals)
+    vmin, vmax, step = nice_ticks(*_scale(vals))
     n = len(prim.values)
 
     def px(i: int) -> float:
@@ -58,17 +77,7 @@ def line_svg(prim: Chart, t: Theme) -> str:
         return bottom - (bottom - top) * (v - vmin) / (vmax - vmin)
 
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="100%">']
-    for k in range(5):
-        v = vmin + (vmax - vmin) * k / 4
-        y = py(v)
-        out.append(
-            f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" stroke="{t.line}" '
-            f'stroke-width="0.6"/>'
-        )
-        out.append(
-            f'<text x="{left - 6}" y="{y + 3:.1f}" font-size="9" text-anchor="end" '
-            f'fill="{t.muted}">{_num(v)}</text>'
-        )
+    out += _value_axis(vmin, vmax, step, left, right, py, t)
     if prim.low is not None and prim.high is not None:
         out.append(
             f'<rect x="{left}" y="{py(prim.high):.1f}" width="{right - left}" '
@@ -115,7 +124,7 @@ def bar_svg(prim: Chart, t: Theme) -> str:
     """Bar chart with a value axis (5 gridlines + tick labels), a zero baseline that negative
     bars hang from, and each bar's value printed at its end — same domain as the PPT chart."""
     w, h, left, right, top, bottom = 600, 220, 42, 590, 12, 190
-    vmin, vmax = bar_domain(prim.values)
+    vmin, vmax, step = nice_ticks(*bar_domain(prim.values))
     n = len(prim.values)
     slot = (right - left) / n
 
@@ -123,16 +132,7 @@ def bar_svg(prim: Chart, t: Theme) -> str:
         return bottom - (bottom - top) * (v - vmin) / (vmax - vmin)
 
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="100%">']
-    for k in range(5):
-        v = vmin + (vmax - vmin) * k / 4
-        out.append(
-            f'<line x1="{left}" y1="{py(v):.1f}" x2="{right}" y2="{py(v):.1f}" stroke="{t.line}" '
-            f'stroke-width="0.6"/>'
-        )
-        out.append(
-            f'<text x="{left - 6}" y="{py(v) + 3:.1f}" font-size="9" text-anchor="end" '
-            f'fill="{t.muted}">{_num(v)}</text>'
-        )
+    out += _value_axis(vmin, vmax, step, left, right, py, t)
     zero = py(0.0)
     for i, v in enumerate(prim.values):
         x = left + i * slot + slot * 0.2

@@ -523,3 +523,27 @@ def test_failed_resource_url_is_caught_in_either_repr_quote_style():
         )
         c.emit(rec)
     assert c.failed == ["file:///w/a.png", "file:///w/it's.png"]
+
+
+def test_primary_text_on_pale_uses_the_readable_text_colour(sample, base):
+    html, _ = _html(sample, base, [Layer("x", {"color.primary": "浅蓝"})])
+    t = build_theme(resolve([Layer("x", {"color.primary": "浅蓝"})], sample).style, "pdf")
+    assert t.primary_text != t.primary
+    assert f"th {{ background: {t.pale}; color: {t.primary_text};" in html
+    assert f".media .mn {{ color: {t.primary_text};" in html
+
+
+def test_pdf_chart_ticks_are_nice_values():
+    from hpr.common import bar_domain, nice_ticks, tick_label
+
+    t = build_theme(resolve([]).style, "pdf")
+    svg = bar_svg(Chart("bar", ("W1", "W2", "W3"), (-0.8, -1.4, 0.3)), t)
+    lo, hi, step = nice_ticks(*bar_domain((-0.8, -1.4, 0.3)))
+    n = round((hi - lo) / step)
+    want = [tick_label(lo + k * step, step) for k in range(n + 1)]
+    texts = _svg_texts(svg)
+    assert all(w in texts for w in want), (want, texts)
+    assert "-0.4" not in texts and "-0.9" not in texts
+    line = line_svg(Chart("line", ("a", "b", "c"), (6.8, 6.5, 6.2), "mmol/L", low=4.4, high=6.1), t)
+    lo, hi, step = nice_ticks(4.4 - 0.36, 6.8 + 0.36)
+    assert tick_label(lo, step) in _svg_texts(line) and tick_label(hi, step) in _svg_texts(line)

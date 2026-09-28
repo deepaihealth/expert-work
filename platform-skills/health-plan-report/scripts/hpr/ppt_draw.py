@@ -68,7 +68,7 @@ _TONE = {
     "within": "within_text",
     "out": "out_text",
     "alert": "alert_text",
-    "info": "primary",
+    "info": "primary_text",
     "neutral": "muted",
 }
 
@@ -187,7 +187,7 @@ def _draw_table(cv: Canvas, pl: Placed, tb: Table, ctx: Ctx) -> None:
             else:
                 cell.fill.background()
             highlight = r > 0 and tb.highlight_col == c and value not in ("", "—")
-            color = t.primary if r == 0 else (t.out_text if highlight else t.ink)
+            color = t.primary_text if r == 0 else (t.out_text if highlight else t.ink)
             for k, line in enumerate(value.split("\n")):
                 para = cell.text_frame.paragraphs[0] if k == 0 else cell.text_frame.add_paragraph()
                 para.line_spacing = Pt(t.small * LINE)
@@ -220,7 +220,7 @@ def _draw_callout(cv: Canvas, pl: Placed, co: Callout, ctx: Ctx) -> None:
     x, y, w = pl.x + 4 + t.gap_m, pl.y + t.gap_m, pl.w - 4 - 2 * t.gap_m
     if co.title:
         th = callout_title_height(co, w, ctx)
-        title_color = {"alert": t.alert_text, "warn": t.out_text}.get(co.tone, t.primary)
+        title_color = {"alert": t.alert_text, "warn": t.out_text}.get(co.tone, t.primary_text)
         cv.text(x, y, w, th, co.title, t.body, title_color, bold=True)
         y += th + t.gap_xs
     cv.text(x, y, w, m.lines(co.text, w, t.body) * lh(t.body), co.text, t.body, t.ink)
@@ -287,7 +287,7 @@ def _draw_columns(cv: Canvas, pl: Placed, cols: Columns, ctx: Ctx) -> None:
         rh = max(column_height(c, cw, ctx) for c in row)
         for i, col in enumerate(row):
             x = pl.x + i * (cw + t.gap_m)
-            color = _tone(t, col.tone) if col.tone != "neutral" else t.primary
+            color = _tone(t, col.tone) if col.tone != "neutral" else t.primary_text
             fill = getattr(t, col.tone) if col.tone in ("within", "out", "alert") else t.primary
             cv.rect(x, y, cw, rh, t.pale, rounded=True)
             cv.rect(x, y, cw, STRIPE, fill)
@@ -315,7 +315,7 @@ def _draw_media(
     cv.rect(pl.x, pl.y, pl.w, pl.h, t.pale, rounded=True)
     geo = media_geometry(md, pl.w, ctx)
     tx, tw = pl.x + t.gap_m, geo.text_w
-    cv.text(tx, pl.y + t.gap_m, tw, geo.name_h, md.name, t.heading, t.primary, bold=True)
+    cv.text(tx, pl.y + t.gap_m, tw, geo.name_h, md.name, t.heading, t.primary_text, bold=True)
     dy = pl.y + t.gap_m + geo.name_h + t.gap_xs
     cv.text(
         tx, dy, tw, m.lines(md.description, tw, t.body) * lh(t.body), md.description, t.body, t.ink
@@ -351,7 +351,7 @@ def _draw_media(
         link_h,
         label,
         t.body,
-        t.primary,
+        t.primary_text,
         bold=True,
         name=CHROME,
         link=md.url,

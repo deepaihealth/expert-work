@@ -300,3 +300,40 @@ def test_cover_meta_and_clock_rules_have_a_single_source():
     ]
     assert common.clock_minutes("06:30") == 24 * 60 + 6 * 60 + 30
     assert common.clock_minutes("23:00") == 23 * 60
+
+
+def test_primary_text_on_the_pale_tint_is_gated_and_readable():
+    import dataclasses
+
+    t = build_theme(resolve([Layer("x", {"color.primary": "浅蓝"})]).style, "pptx")
+    assert t.primary == "#1E78D1"  # fills keep the ruled primary
+    assert round(contrast(t.primary, t.pale), 2) == 4.18
+    report = _gate(t)
+    assert report["ok"] is True and report["primary_text_on_pale"] >= 4.5
+    assert _gate(dataclasses.replace(t, primary_text=t.primary))["ok"] is False
+    import colorsys
+
+    def hls(h):
+        return colorsys.rgb_to_hls(*(int(h[i : i + 2], 16) / 255 for i in (1, 3, 5)))
+
+    (h0, _, s0), (h1, _, s1) = hls(t.primary), hls(t.primary_text)
+    assert abs(h1 - h0) * 360 <= 1 and abs(s1 - s0) <= 0.02  # lightness only
+
+
+def test_nice_ticks_are_round_steps_covering_the_data():
+    from hpr.common import bar_domain, nice_ticks
+
+    lo, hi, step = nice_ticks(*bar_domain((-0.8, -1.4, 0.3)))
+    assert step in (0.1, 0.2, 0.25, 0.5, 1.0)
+    assert lo <= -1.4 and hi >= 0.3
+    n = round((hi - lo) / step)
+    ticks = [round(lo + k * step, 10) for k in range(n + 1)]
+    assert all(abs(x / step - round(x / step)) < 1e-9 for x in ticks)
+    assert 0.0 in ticks and 3 <= n <= 8
+    assert nice_ticks(0.0007, 0.0033) == pytest.approx((0.0, 0.004, 0.001))
+
+
+def test_normalize_maps_line_and_paragraph_separators_to_lf():
+    from hpr.content import normalize_text
+
+    assert normalize_text("a\u2028b\u2029c") == "a\nb\nc"

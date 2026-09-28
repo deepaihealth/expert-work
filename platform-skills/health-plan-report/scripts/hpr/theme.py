@@ -40,6 +40,7 @@ class Theme:
     pale_out: str
     pale_alert: str
     on_primary_soft: str  # secondary text on the primary colour (cover labels, subtitle, end page)
+    primary_text: str  # primary-coloured text on the pale tint (table header, media, info titles)
     within_text: str  # status colours as text: darkened only when too light for their surfaces
     out_text: str
     alert_text: str
@@ -121,6 +122,7 @@ def build_theme(style: dict[str, Any], fmt: Literal["pptx", "pdf"]) -> Theme:
         pale_out=pale_out,
         pale_alert=pale_alert,
         on_primary_soft=soft_on(primary),
+        primary_text=text_on(primary, bg, pale),
         within_text=text_on(WITHIN, bg, pale),
         out_text=text_on(OUT, bg, pale, pale_out),
         alert_text=text_on(ALERT, bg, pale, pale_alert),

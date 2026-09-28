@@ -502,10 +502,12 @@ _C0_BUT_TAB_LF = re.compile(r"[\x00-\x08\x0b-\x1f]")
 
 
 def normalize_text(s: str) -> str:
-    """Presentation-level whitespace only (spec §4.4): CRLF / CR become LF, every other C0
-    control except LF and TAB becomes a space. python-pptx would store them as literal
-    ``_x000D_`` escapes and weasyprint garbles the text layer, so both writers see this form."""
-    return _C0_BUT_TAB_LF.sub(" ", s.replace("\r\n", "\n").replace("\r", "\n"))
+    """Presentation-level whitespace only (spec §4.4): CRLF / CR and the line / paragraph
+    separators U+2028 / U+2029 become LF, every other C0 control except LF and TAB becomes a
+    space. python-pptx would store C0 as literal ``_x000D_`` escapes and weasyprint garbles the
+    text layer, so both writers see this form."""
+    s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n").replace("\u2029", "\n")
+    return _C0_BUT_TAB_LF.sub(" ", s)
 
 
 def normalize_content(content: dict) -> dict:

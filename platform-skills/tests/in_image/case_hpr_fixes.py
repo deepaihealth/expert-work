@@ -35,6 +35,7 @@ cc = json.loads(json.dumps(SAMPLE))
 blocks(cc, "paragraph")[0]["text"] = "第一段\r\n第二段\r第三段"
 blocks(cc, "callout")[0]["text"] = "第一行\x0b第二行"
 blocks(cc, "table")[0]["rows"][0][0] = "A\x0cB"
+blocks(cc, "bullets")[0]["items"][0] = "甲\u2028乙\u2029丙"
 r = render(cc, "ctrl")
 check(r["ok"] is True, f"control characters: {r}")
 check(r["qa"]["pptx"]["missing"] == [] and r["qa"]["pdf"]["missing"] == [], f"ctrl qa: {r}")

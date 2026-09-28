@@ -511,7 +511,7 @@ def test_phase_area_shared_by_several_phases_is_one_table_header_not_a_missing_t
 
 
 def test_bar_trend_axis_in_pptx_uses_the_pdf_domain_and_keeps_zero(workdir, sample):
-    from hpr.common import bar_domain
+    from hpr.common import bar_domain, nice_ticks
     from pptx.enum.chart import XL_CHART_TYPE
 
     trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
@@ -525,7 +525,7 @@ def test_bar_trend_axis_in_pptx_uses_the_pdf_domain_and_keeps_zero(workdir, samp
         if getattr(sh, "has_chart", False) and sh.has_chart
     ]
     va = next(c for c in charts if c.chart_type == XL_CHART_TYPE.COLUMN_CLUSTERED).value_axis
-    lo, hi = bar_domain((-0.8, -1.2, 0.3))
+    lo, hi, _ = nice_ticks(*bar_domain((-0.8, -1.2, 0.3)))
     assert (va.minimum_scale, va.maximum_scale) == pytest.approx((lo, hi))
     assert va.minimum_scale < -1.2 and va.maximum_scale > 0.3
 
@@ -622,3 +622,70 @@ def test_line_value_axis_never_collapses_for_small_values(workdir, sample):
         and sh.chart.chart_type == XL_CHART_TYPE.LINE_MARKERS
     )
     assert va.minimum_scale < 0.001 and va.maximum_scale > 0.003
+
+
+def test_primary_text_on_pale_is_drawn_readable(workdir, sample):
+    from hpr.style import contrast
+
+    out, style, _ = _render(sample, workdir, [Layer("x", {"color.primary": "浅蓝"})])
+    t = build_theme(style, "pptx")
+    slides = Presentation(str(out)).slides
+    tbl = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "table")
+    mat = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "material")
+    header = [
+        str(r.font.color.rgb)
+        for sl in slides
+        for sh in sl.shapes
+        if getattr(sh, "has_table", False) and sh.has_table
+        for cell in sh.table.rows[0].cells
+        for p in cell.text_frame.paragraphs
+        for r in p.runs
+        if r.text == tbl["columns"][0]
+    ]
+    name = [c for s in slides for c in _run_colours(s, mat["name"])]
+    assert header and name
+    for hex_ in header + name:
+        assert contrast(f"#{hex_}", t.pale) >= 4.5, hex_
+
+
+def test_ppt_value_axis_uses_the_shared_nice_ticks(workdir, sample):
+    from hpr.common import bar_domain, nice_ticks
+    from pptx.enum.chart import XL_CHART_TYPE
+
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    pts = (("W1", -0.8), ("W2", -1.4), ("W3", 0.3))
+    trend["points"] = [{"date": d, "value": v} for d, v in pts]
+    out, _, _ = _render(sample, workdir, [Layer("x", {"blocks.trend.variant": "bar"})])
+    va = next(
+        sh.chart.value_axis
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_chart", False)
+        and sh.has_chart
+        and sh.chart.chart_type == XL_CHART_TYPE.COLUMN_CLUSTERED
+    )
+    lo, hi, step = nice_ticks(*bar_domain((-0.8, -1.4, 0.3)))
+    assert (va.minimum_scale, va.maximum_scale, va.major_unit) == pytest.approx((lo, hi, step))
+
+
+def test_negative_bars_are_not_inverted_and_dates_sit_below_the_plot(workdir, sample):
+    """Without an explicit invertIfNegative=0, LibreOffice draws negative columns upward (seen
+    on a rendered deck); category labels at the zero line would sit on the bars."""
+    from pptx.enum.chart import XL_CHART_TYPE, XL_TICK_LABEL_POSITION
+
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    pts = (("W1", -0.8), ("W2", -1.2), ("W3", 0.3))
+    trend["points"] = [{"date": d, "value": v} for d, v in pts]
+    out, _, _ = _render(sample, workdir, [Layer("x", {"blocks.trend.variant": "bar"})])
+    ch = next(
+        sh.chart
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_chart", False)
+        and sh.has_chart
+        and sh.chart.chart_type == XL_CHART_TYPE.COLUMN_CLUSTERED
+    )
+    ser = ch.plots[0].series[0]
+    inv = ser._element.find(qn("c:invertIfNegative"))
+    assert inv is not None and inv.get("val") == "0"
+    assert ch.category_axis.tick_label_position == XL_TICK_LABEL_POSITION.LOW
