@@ -15,10 +15,12 @@ from hpr.blocks import RenderError, section_prims
 from hpr.common import clock_minutes
 from hpr.images import IMAGE_ERRORS, image_blocks, strict_images
 from hpr.measure import LINE, Measurer
+from hpr.page_map import pptx_page_map
 from hpr.ppt_canvas import BODY, CHROME, DECO, Canvas, _bg, _footer, _header, _set_font, emu, rgb
 from hpr.ppt_charts import add_chart
 from hpr.ppt_cover import _cover, _end, _show_toc, _toc, band_section, draw_band
 from hpr.ppt_layout import (
+    BAND_ID,
     DONUT_H,
     MARGIN_X,
     SLIDE_W,
@@ -469,8 +471,14 @@ def _draw(cv: Canvas, pl: Placed, ctx: Ctx, base_dir: Path, warnings: list[str])
 
 
 def render_pptx(
-    content: dict, style: dict, out_path: Path, base_dir: Path, m: Measurer
+    content: dict,
+    style: dict,
+    out_path: Path,
+    base_dir: Path,
+    m: Measurer,
+    page_map_out: list[dict[str, Any]] | None = None,
 ) -> list[str]:
+    """Write the deck; ``page_map_out``, when given, receives which slides each part is on."""
     theme = build_theme(style, "pptx")
     ctx = make_ctx(content, theme, m, base_dir)
     _check_titles(content, ctx, style)
@@ -497,4 +505,6 @@ def render_pptx(
     if end:
         _end(prs, content, ctx)
     prs.save(str(out_path))
+    if page_map_out is not None:
+        page_map_out.extend(pptx_page_map(content, pages, BAND_ID, toc, end))
     return warnings

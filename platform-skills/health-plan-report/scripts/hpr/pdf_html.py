@@ -24,6 +24,7 @@ from hpr.icons import icon_for_section
 from hpr.images import image_blocks
 from hpr.logo import trimmed_logo
 from hpr.measure import SAFETY, Measurer
+from hpr.page_map import PDF_END_PREFIX, PDF_HEAD_PREFIX, PDF_TOC_ID, pdf_page_map
 from hpr.pdf_guard import check_cover, check_footer, make_fetcher, raise_for_failed_images
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import brand_line
@@ -383,9 +384,20 @@ def _band(content: dict, style: dict, t: Theme) -> str:
         else ""
     )
     return (
-        f'<section class="sec info" id="client-info"><h2>{icon}{CLIENT_BAND_TITLE}</h2>'
-        f'<div class="band" style="grid-template-columns:{cols}">{cells}</div></section>'
+        f'<section class="sec info" id="{BAND_ANCHOR}">'
+        f'<h2 id="{PDF_HEAD_PREFIX}{BAND_ANCHOR}">{icon}{CLIENT_BAND_TITLE}</h2>'
+        f'<div class="band" style="grid-template-columns:{cols}">{cells}</div>'
+        f"{_end_mark(BAND_ANCHOR)}</section>"
     )
+
+
+BAND_ANCHOR = "client-info"
+
+
+def _end_mark(anchor: str) -> str:
+    """Empty, zero-height marker closing a section: its anchor names the section's last page.
+    Margins collapse through an empty block, so the layout is unchanged."""
+    return f'<div id="{PDF_END_PREFIX}{anchor}"></div>'
 
 
 def _card(c: Any) -> str:
@@ -526,7 +538,7 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
             f'<a href="#sec-{e(s["id"])}">{i:02d}　{e(s["title"])}</a>'
             for i, s in enumerate(content["sections"], start=1)
         )
-        parts.append(f'<section class="toc"><h2>目录</h2>{links}</section>')
+        parts.append(f'<section class="toc" id="{PDF_TOC_ID}"><h2>目录</h2>{links}</section>')
     parts.append(_band(content, style, t))
     fg = on_color(t.primary)
     for sec, items in section_prims(content, style):
@@ -538,7 +550,8 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
         body = _body(items, t, base_dir)
         parts.append(
             f'<section class="sec" id="sec-{e(sec["id"])}">'
-            f"<h2>{icon}{e(sec['title'])}</h2>{body}</section>"
+            f'<h2 id="{PDF_HEAD_PREFIX}sec-{e(sec["id"])}">{icon}{e(sec["title"])}</h2>'
+            f"{body}{_end_mark('sec-' + e(sec['id']))}</section>"
         )
     parts.append("</body></html>")
     return "".join(parts), warnings
@@ -593,7 +606,14 @@ class _Collect(logging.Handler):
                 self.failed.append(m.group(1) if m.group(1) is not None else m.group(2))
 
 
-def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> list[str]:
+def render_pdf(
+    content: dict,
+    style: dict,
+    out_path: Path,
+    base_dir: Path,
+    page_map_out: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Write the PDF; ``page_map_out``, when given, receives which pages each part landed on."""
     images = image_blocks(content, style, base_dir)
     try:
         from weasyprint import HTML
@@ -614,6 +634,8 @@ def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> li
         check_footer(document)
         raise_for_failed_images(collect.failed, images)
         document.write_pdf(str(out_path))
+        if page_map_out is not None:
+            page_map_out.extend(pdf_page_map(content, document, BAND_ANCHOR))
     finally:
         logger.removeHandler(collect)
     return warnings + collect.messages

@@ -419,7 +419,7 @@ def test_end_slide_long_signature_gets_its_measured_height(workdir, sample):
 def test_partial_failure_removes_this_runs_outputs_so_rerun_works(workdir, monkeypatch, capsys):
     mod = _load_render()
 
-    def broken_pdf(content, style, out_path, base_dir):
+    def broken_pdf(content, style, out_path, base_dir, page_map_out=None):
         out_path.write_bytes(b"%PDF-partial")
         raise LayoutError("brand.disclaimer", "页脚过长")
 

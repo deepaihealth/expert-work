@@ -108,13 +108,14 @@ def main(argv: list[str] | None = None) -> int:
     files: dict[str, str] = {}
     qa: dict[str, dict] = {}
     warnings: list[str] = []
+    page_map: dict[str, list[dict]] = {f: [] for f in formats}
     try:
         if "pptx" in targets:
-            warnings += render_pptx(content, style, targets["pptx"], base_dir, m)
+            warnings += render_pptx(content, style, targets["pptx"], base_dir, m, page_map["pptx"])
             qa["pptx"] = qa_pptx(targets["pptx"], required, build_theme(style, "pptx"), m)
             files["pptx"] = str(targets["pptx"])
         if "pdf" in targets:
-            warnings += render_pdf(content, style, targets["pdf"], base_dir)
+            warnings += render_pdf(content, style, targets["pdf"], base_dir, page_map["pdf"])
             qa["pdf"] = qa_pdf(targets["pdf"], required, build_theme(style, "pdf"))
             files["pdf"] = str(targets["pdf"])
     except (RenderError, LayoutError, PdfUnavailableError) as exc:
@@ -145,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             "ok": ok,
             "files": files,
             "qa": qa,
+            "page_map": page_map,
             "not_applied": [e for e in res.report if e["status"] in NOT_APPLIED],
             "warnings": warnings,
             "errors": [],
