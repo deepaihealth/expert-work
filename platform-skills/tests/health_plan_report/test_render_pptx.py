@@ -528,3 +528,40 @@ def test_bar_trend_axis_in_pptx_uses_the_pdf_domain_and_keeps_zero(workdir, samp
     lo, hi = bar_domain((-0.8, -1.2, 0.3))
     assert (va.minimum_scale, va.maximum_scale) == pytest.approx((lo, hi))
     assert va.minimum_scale < -1.2 and va.maximum_scale > 0.3
+
+
+def _run_colours(slide, text):
+    return [
+        str(r.font.color.rgb)
+        for sh in slide.shapes
+        if sh.has_text_frame
+        for p in sh.text_frame.paragraphs
+        for r in p.runs
+        if r.text == text
+    ]
+
+
+@pytest.mark.parametrize("primary", ["#0B4F5C", "蓝"])
+def test_band_cover_labels_are_drawn_readable(workdir, sample, primary):
+    from hpr.style import contrast
+
+    out, style, _ = _render(sample, workdir, [Layer("x", {"color.primary": primary})])
+    t = build_theme(style, "pptx")
+    cover = Presentation(str(out)).slides[0]
+    labels = [f["label"] for f in sample["client"]["facts"]] + [sample["manager"]["title"]]
+    for label in labels:
+        (hex_,) = _run_colours(cover, label)
+        assert contrast(f"#{hex_}", t.primary) >= 4.5, (label, hex_)
+
+
+def test_out_of_range_tag_and_card_title_are_drawn_readable(workdir, sample):
+    from hpr.style import contrast
+
+    out, style, _ = _render(sample, workdir)
+    t = build_theme(style, "pptx")
+    slides = Presentation(str(out)).slides
+    tags = [c for s in slides for c in _run_colours(s, "高于参考范围")]
+    titles = [c for s in slides for c in _run_colours(s, "空腹血糖")]
+    assert tags and titles
+    for hex_ in tags + titles:
+        assert contrast(f"#{hex_}", t.background) >= 4.5, hex_

@@ -115,16 +115,33 @@ def pptx_overflow(path: Path, m: Measurer) -> list[str]:
     return issues
 
 
-def contrast_report(t: Theme) -> dict[str, Any]:
-    ratios = {
-        "ink_on_background": round(contrast(INK, t.background), 2),
-        "primary_on_background": round(contrast(t.primary, t.background), 2),
-        "text_on_primary": round(contrast(on_color(t.primary), t.primary), 2),
+def _text_pairs(t: Theme) -> dict[str, tuple[str, str]]:
+    """Every theme text role on every surface the writers draw it on (spec §7.2)."""
+    return {
+        "primary_on_background": (t.primary, t.background),
+        "text_on_primary": (on_color(t.primary), t.primary),
+        "cover_label_on_primary": (t.on_primary_soft, t.primary),
+        "muted_on_background": (t.muted, t.background),
+        "muted_on_pale": (t.muted, t.pale),
+        "ink_on_pale": (t.ink, t.pale),
+        "ink_on_pale_out": (t.ink, t.pale_out),
+        "ink_on_pale_alert": (t.ink, t.pale_alert),
+        "within_text_on_background": (t.within_text, t.background),
+        "within_text_on_pale": (t.within_text, t.pale),
+        "out_text_on_background": (t.out_text, t.background),
+        "out_text_on_pale": (t.out_text, t.pale),
+        "out_text_on_pale_out": (t.out_text, t.pale_out),
+        "alert_text_on_background": (t.alert_text, t.background),
+        "alert_text_on_pale": (t.alert_text, t.pale),
+        "alert_text_on_pale_alert": (t.alert_text, t.pale_alert),
     }
-    ok = (
-        ratios["ink_on_background"] >= 7
-        and ratios["primary_on_background"] >= 4.5
-        and ratios["text_on_primary"] >= 4.5
+
+
+def contrast_report(t: Theme) -> dict[str, Any]:
+    ratios = {"ink_on_background": round(contrast(INK, t.background), 2)}
+    ratios |= {k: round(contrast(fg, bg), 2) for k, (fg, bg) in _text_pairs(t).items()}
+    ok = ratios["ink_on_background"] >= 7 and all(
+        v >= 4.5 for k, v in ratios.items() if k != "ink_on_background"
     )
     return {"ok": ok, **ratios}
 

@@ -231,3 +231,40 @@ def test_kind_table_keeps_a_column_the_caller_filled_with_dashes():
     (tbl,) = block_to_prims(blk, "table", "p")
     assert tbl.columns == ("习惯", "现状")  # caller's "—" is text; our empty columns still drop
     assert [r[1] for r in tbl.rows] == ["—", "—"]
+
+
+def _gate(t):
+    from hpr.qa import contrast_report
+
+    return contrast_report(t)
+
+
+def test_contrast_gate_fails_on_the_pre_fix_text_colours():
+    import dataclasses
+
+    from hpr.style import INK, mix
+    from hpr.theme import OUT
+
+    t = build_theme(resolve([]).style, "pptx")
+    assert _gate(t)["ok"] is True
+    fg = on_color(t.primary)
+    old_cover_label = mix(t.primary, fg, 0.25)  # band cover fact labels / manager title
+    assert _gate(dataclasses.replace(t, on_primary_soft=old_cover_label))["ok"] is False
+    assert _gate(dataclasses.replace(t, muted=mix(INK, t.background, 0.40)))["ok"] is False
+    assert _gate(dataclasses.replace(t, out_text=OUT))["ok"] is False  # 高于参考范围 tag
+
+
+@pytest.mark.parametrize("primary", ["#0B4F5C", "浅蓝", "#111111", "墨绿", "蓝", "橙"])
+@pytest.mark.parametrize("bg", ["白", "浅紫", "米色", "浅灰", "tint"])
+@pytest.mark.parametrize("fmt", ["pptx", "pdf"])
+def test_every_text_role_is_readable_on_its_surfaces(primary, bg, fmt):
+    style = resolve([Layer("x", {"color.primary": primary, "color.background": bg})]).style
+    t = build_theme(style, fmt)
+    report = _gate(t)
+    assert report["ok"] is True, report
+    assert {
+        "muted_on_background",
+        "cover_label_on_primary",
+        "out_text_on_background",
+        "out_text_on_pale_out",
+    } <= set(report)

@@ -123,6 +123,8 @@ body {{ margin: 0; background: {t.background}; line-height: 1.55; }}
 .cover .meta {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5mm 8mm;
   border-top: 0.5pt solid currentColor; padding-top: 5mm; }}
 .cover .meta .k {{ font-size: {t.caption}pt; opacity: 0.75; }}
+.cover-band .sub, .cover-band .meta .k, .cover-split .head .sub {{ color: {t.on_primary_soft};
+  opacity: 1; }}
 .cover .meta .v {{ font-weight: 700; }}
 .brand-row {{ display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; }}
 .foot .brand-row {{ margin-top: 8mm; }}
@@ -162,8 +164,8 @@ ul.checks {{ list-style: none; padding-left: 5mm; }} ul.checks li::before {{ con
 .card .v small {{ font-size: {t.caption}pt; color: {t.muted}; font-weight: 400; margin-left: 1mm; }}
 .card .l {{ font-size: {t.small}pt; }}
 .tag {{ font-size: {t.small}pt; font-weight: 700; }}
-.tone-within {{ color: {t.within}; }} .tone-out {{ color: {t.out}; }}
-  .tone-alert {{ color: {t.alert}; }}
+.tone-within {{ color: {t.within_text}; }} .tone-out {{ color: {t.out_text}; }}
+  .tone-alert {{ color: {t.alert_text}; }}
 .tone-info {{ color: {t.primary}; }} .tone-neutral {{ color: {t.muted}; }}
 .bar {{ position: relative; height: 3mm; margin-top: 1.5mm; }}
 .bar .track {{ position: absolute; left: 0; right: 0; top: 1mm; height: 1mm; background: {t.pale};
@@ -175,7 +177,7 @@ thead {{ display: table-header-group; }}
 th {{ background: {t.pale}; color: {t.primary}; text-align: left; }}
 th, td {{ padding: 1.8mm 2.2mm; border-bottom: 0.5pt solid {t.line}; vertical-align: top;
   overflow-wrap: anywhere; }}
-td.hl {{ color: {t.out}; font-weight: 700; }}
+td.hl {{ color: {t.out_text}; font-weight: 700; }}
 tr {{ break-inside: avoid; }}
 dl.kv {{ display: grid; gap: 1mm 8mm; margin: 0 0 4mm; }}
 dl.kv.c2 {{ grid-template-columns: 1fr 1fr; }} dl.kv.c1 {{ grid-template-columns: 1fr; }}
@@ -187,7 +189,7 @@ dl.kv dt {{ color: {t.muted}; font-size: {t.small}pt; }} dl.kv dd {{ margin: 0; 
 .callout.warn {{ background: {t.pale_out}; border-left-color: {t.out}; }}
 .callout.alert {{ background: {t.pale_alert}; border-left-color: {t.alert}; }}
 .callout .ct {{ font-weight: 700; }}
-.callout.alert .ct {{ color: {t.alert}; }} .callout.warn .ct {{ color: {t.out}; }}
+.callout.alert .ct {{ color: {t.alert_text}; }} .callout.warn .ct {{ color: {t.out_text}; }}
 .keep {{ break-inside: avoid; }}
 .chart {{ break-inside: avoid; margin-bottom: 4mm; }}
 .donut {{ display: grid; grid-template-columns: 45mm 1fr; gap: 6mm; align-items: center;

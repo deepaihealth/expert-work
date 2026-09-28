@@ -76,7 +76,13 @@ from hpr.theme import WHITE, Theme, build_theme, donut_colors, on_color
 BODY, CHROME, DECO = "hpr:body", "hpr:chrome", "hpr:deco"
 NO_GRID_STYLE = "{2D5ABB26-0587-4C30-8999-92F81FD0307C}"
 _ALIGN = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}
-_TONE = {"within": "within", "out": "out", "alert": "alert", "info": "primary", "neutral": "muted"}
+_TONE = {
+    "within": "within_text",
+    "out": "out_text",
+    "alert": "alert_text",
+    "info": "primary",
+    "neutral": "muted",
+}
 
 
 def emu(pt: float) -> Emu:
@@ -530,7 +536,7 @@ def _cover(
             40,
             150,
             panel_w - 80,
-            (fg, mix(fg, t.primary, 0.25)),
+            (fg, t.on_primary_soft),
             4,
             (SLIDE_H - 40, "左侧色块底边"),
         )
@@ -591,9 +597,7 @@ def _cover(
         t.accent,
         2.2,
     )
-    _cover_title(
-        cv, content, ctx, 56, 150, 520, (fg, mix(fg, t.primary, 0.25)), 3, (limit, _META_BELOW)
-    )
+    _cover_title(cv, content, ctx, 56, 150, 520, (fg, t.on_primary_soft), 3, (limit, _META_BELOW))
     _place_brand(
         cv,
         content,
@@ -605,7 +609,7 @@ def _cover(
         warnings,
         plate=True,
     )
-    _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (soft, fg, soft))
+    _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (t.on_primary_soft, fg, soft))
 
 
 def _show_toc(content: dict, style: dict) -> bool:
@@ -665,7 +669,7 @@ def _end(prs: Any, content: dict, ctx: Ctx) -> None:
             k * lh(t.heading),
             brand["footer_signature"],
             t.heading,
-            mix(fg, t.primary, 0.25),
+            t.on_primary_soft,
             align="center",
             name=CHROME,
         )
@@ -678,7 +682,7 @@ def _end(prs: Any, content: dict, ctx: Ctx) -> None:
             k * lh(t.caption),
             brand["disclaimer"],
             t.caption,
-            mix(fg, t.primary, 0.25),
+            t.on_primary_soft,
             align="center",
             name=CHROME,
         )
@@ -790,7 +794,7 @@ def _draw_table(cv: Canvas, pl: Placed, tb: Table, ctx: Ctx) -> None:
             else:
                 cell.fill.background()
             highlight = r > 0 and tb.highlight_col == c and value not in ("", "—")
-            color = t.primary if r == 0 else (t.out if highlight else t.ink)
+            color = t.primary if r == 0 else (t.out_text if highlight else t.ink)
             para = cell.text_frame.paragraphs[0]
             para.line_spacing = Pt(t.small * LINE)
             run = para.add_run()
@@ -822,7 +826,8 @@ def _draw_callout(cv: Canvas, pl: Placed, co: Callout, ctx: Ctx) -> None:
     x, y, w = pl.x + 4 + t.gap_m, pl.y + t.gap_m, pl.w - 4 - 2 * t.gap_m
     if co.title:
         th = callout_title_height(co, w, ctx)
-        cv.text(x, y, w, th, co.title, t.body, edge, bold=True)
+        title_color = {"alert": t.alert_text, "warn": t.out_text}.get(co.tone, t.primary)
+        cv.text(x, y, w, th, co.title, t.body, title_color, bold=True)
         y += th + t.gap_xs
     cv.text(x, y, w, m.lines(co.text, w, t.body) * lh(t.body), co.text, t.body, t.ink)
 
@@ -889,8 +894,9 @@ def _draw_columns(cv: Canvas, pl: Placed, cols: Columns, ctx: Ctx) -> None:
         for i, col in enumerate(row):
             x = pl.x + i * (cw + t.gap_m)
             color = _tone(t, col.tone) if col.tone != "neutral" else t.primary
+            fill = getattr(t, col.tone) if col.tone in ("within", "out", "alert") else t.primary
             cv.rect(x, y, cw, rh, t.pale, rounded=True)
-            cv.rect(x, y, cw, STRIPE, color)
+            cv.rect(x, y, cw, STRIPE, fill)
             cy = y + STRIPE + t.gap_m
             title_h = column_title_height(col, cw, ctx)
             cv.text(

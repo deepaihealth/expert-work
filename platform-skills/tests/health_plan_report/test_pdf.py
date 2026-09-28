@@ -483,3 +483,12 @@ def test_decompression_bomb_image_is_a_block_error(base, sample, kind, huge_png,
     with pytest.raises(RenderError) as exc:
         render_pdf(sample, resolve([], sample).style, base / "x.pdf", base)
     assert exc.value.path.startswith("sections[")
+
+
+def test_pdf_text_roles_use_the_readable_theme_colours(sample, base):
+    html, _ = _html(sample, base)
+    t = build_theme(resolve([], sample).style, "pdf")
+    assert f".tone-out {{ color: {t.out_text}; }}" in html
+    assert f".callout.warn .ct {{ color: {t.out_text}; }}" in html
+    assert f"td.hl {{ color: {t.out_text};" in html
+    assert f"color: {t.on_primary_soft}" in html  # cover labels / subtitle on the colour band
