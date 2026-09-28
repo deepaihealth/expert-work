@@ -11,17 +11,18 @@
 | `schema_version` | 必填 | 固定字符串 | 目前固定写 `"1"` |
 | `title` | 必填 | 非空文字 | 方案名称，出现在封面主标题 |
 | `subtitle` | 可选 | 非空文字 | 封面副标题 |
-| `period` | 可选 | 对象 `{label, weeks}` | `label` 必填、`weeks` 可选数字；`label` 会出现在封面「阶段」一栏 |
+| `period` | 可选 | 对象 `{label, weeks}` | `label` 必填、`weeks` 可选数字；`label` 出现在「客户信息」栏的「阶段」一项（不上封面） |
 | `generated_at` | 必填 | 日期 `YYYY-MM-DD` | 生成日期 |
-| `data_basis` | 可选 | 非空文字 | 封面「数据依据」一栏 |
-| `client` | 必填 | 对象 `{name, facts[]}` | `name` 必填；`facts` 每项 `{label, value}`，出现在封面客户信息区 |
-| `manager` | 可选 | 对象 `{name, title}` | `name` 必填；`title` 可选，缺省时封面显示为「负责人」 |
+| `data_basis` | 可选 | 非空文字 | 「客户信息」栏的「数据依据」一项 |
+| `client` | 必填 | 对象 `{name, facts[]}` | `name` 必填，显示在封面；`facts` 每项 `{label, value}`，按原顺序出现在正文第一页顶部的「客户信息」栏 |
+| `manager` | 可选 | 对象 `{name, title}` | `name` 必填；`title` 可选，缺省为「健康管理师」；封面底部一行显示「生成日期 · 头衔 姓名」 |
 | `brand` | 可选 | 对象 `{org_name, logo_path, footer_signature, disclaimer}` | 四个字段都可选；只从这里读取，任何样式层都改不了（见 `style-options.md`） |
 | `sections` | 必填，至少 1 项 | 数组 | 见下「章节与积木」 |
 
-封面信息挤不下或互相重叠会渲染失败，报错位置是这四者之一：`title`（标题）、`subtitle`（副标题）、
-`client.facts`（客户信息卡）、`brand`（LOGO/机构名称行），遇到时精简对应字段。`brand.disclaimer` 太长会把
-PDF 页脚顶出页面底边，同样会报错（路径 `brand.disclaimer`），页脚最多约 4 行，请把免责声明控制在合理长度内。
+封面只放 LOGO/机构名称、`title`、`subtitle`、`client.name`，以及底部一行「生成日期 · 健康管理师 姓名」；
+`client.facts`、`period.label`、`data_basis` 不上封面，统一放在正文第一页顶部的「客户信息」栏（目录之后、第一个章节之前）。
+方案名称或副标题长到封面放不下会渲染失败，报错位置是 `title` 或 `subtitle`（≤30 字的名称、≤40 字的副标题总能放下）。
+`brand.disclaimer` 太长会把 PDF 页脚顶出页面底边，同样会报错（路径 `brand.disclaimer`），页脚最多约 4 行，请把免责声明控制在合理长度内。
 
 ## 章节与积木
 

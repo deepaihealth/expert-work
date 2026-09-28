@@ -45,18 +45,32 @@ def tick_label(v: float, step: float) -> str:
     return "0" if float(text) == 0 else text
 
 
-def cover_meta_items(content: dict) -> list[tuple[str, str]]:
-    """The cover's client-info cells, in order (the cover content rule for both formats)."""
-    items = [("客户", content["client"]["name"])]
-    items += [(f["label"], f["value"]) for f in content["client"].get("facts", [])]
+CLIENT_BAND_TITLE = "客户信息"
+MANAGER_LABEL = "健康管理师"
+
+
+def cover_meta_line(content: dict) -> str:
+    """The cover's one quiet meta line: generated date · manager (missing parts dropped)."""
+    parts = [content["generated_at"]]
+    if content.get("manager"):
+        mg = content["manager"]
+        parts.append(f"{mg.get('title') or MANAGER_LABEL} {mg['name']}")
+    return " · ".join(parts)
+
+
+def client_band_items(content: dict) -> list[tuple[str, str]]:
+    """The 「客户信息」 band cells, in order: the caller's facts, then 阶段 and 数据依据.
+    The cover shows none of them (both formats draw the band at the top of the first body
+    page)."""
+    items = [(f["label"], f["value"]) for f in content["client"].get("facts", [])]
     if content.get("period"):
         items.append(("阶段", content["period"]["label"]))
     if content.get("data_basis"):
         items.append(("数据依据", content["data_basis"]))
-    items.append(("生成日期", content["generated_at"]))
-    if content.get("manager"):
-        items.append((content["manager"].get("title") or "负责人", content["manager"]["name"]))
     return items
+
+
+BAND_CHROME_LABELS = frozenset(("阶段", "数据依据"))
 
 
 def clock_minutes(hhmm: str) -> int:
@@ -120,3 +134,56 @@ def column_widths(
     extra = total - sum(base)
     gap = [w - b for w, b in zip(want, base, strict=True)]
     return [b + extra * g / sum(gap) for b, g in zip(base, gap, strict=True)]
+
+
+def _even_out(want: list[float], room: float) -> list[float]:
+    """Widths >= ``want`` summing to ``room``, as even as possible: columns that need more
+    than an even share keep what they need, the others share the rest equally."""
+    keep = [False] * len(want)
+    while True:
+        free = [i for i in range(len(want)) if not keep[i]]
+        share = (room - sum(want[i] for i in range(len(want)) if keep[i])) / len(free)
+        grow = [i for i in free if want[i] > share]
+        if not grow:
+            return [want[i] if keep[i] else share for i in range(len(want))]
+        for i in grow:
+            keep[i] = True
+
+
+def band_columns(
+    items: list[tuple[str, str]] | tuple[tuple[str, str], ...],
+    total: float,
+    gap: float,
+    label_width: Callable[[str], float],
+    value_width: Callable[[int, str], float],
+    inner: float,
+) -> tuple[int, list[float], list[float]]:
+    """(columns, column widths, label widths) for the client-info band, whose cells put the
+    label and its value side by side. As many columns (4, 3, 2) as keep every value on one
+    line, widths driven by content and evened out; otherwise two columns whose value parts are
+    sized by column_widths (no mid-token break), or one. Cells run in caller order, left to
+    right, then down."""
+    for n in sorted({min(k, len(items)) for k in (4, 3, 2, 1)}, reverse=True):
+        room = total - gap * (n - 1)
+        labs = [max(label_width(k) for k, _ in items[j::n]) for j in range(n)]
+        vals = [[v for _, v in items[j::n]] for j in range(n)]
+        want = [
+            lab + inner + max(value_width(j, ln) for v in col for ln in v.split("\n"))
+            for j, (lab, col) in enumerate(zip(labs, vals, strict=True))
+        ]
+        if sum(want) <= room:
+            return n, _even_out(want, room), labs
+        if n == 2:
+            grid = [
+                (items[r][1], items[r + 1][1] if r + 1 < len(items) else "")
+                for r in range(0, len(items), 2)
+            ]
+            fixed = sum(labs) + 2 * inner
+            need = [
+                max(value_width(j, tok) for row in grid for tok in (nobreak_tokens(row[j]) or [""]))
+                for j in range(2)
+            ]
+            if sum(need) < room - fixed:
+                vw = column_widths(("", ""), tuple(grid), room - fixed, value_width)
+                return 2, [lab + inner + w for lab, w in zip(labs, vw, strict=True)], labs
+    return 1, [total], [max(label_width(k) for k, _ in items)]

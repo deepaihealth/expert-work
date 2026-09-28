@@ -7,10 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hpr.common import cover_meta_items
+from hpr.common import BAND_CHROME_LABELS, CLIENT_BAND_TITLE, client_band_items, cover_meta_line
 from hpr.logo import trimmed_logo
-from hpr.ppt_canvas import CHROME, DECO, Canvas, _bg, _footer
+from hpr.ppt_canvas import BODY, CHROME, DECO, Canvas, _bg, _footer
 from hpr.ppt_layout import (
+    BAND_ID,
     BODY_TOP,
     BODY_W,
     FOOTER_BOTTOM,
@@ -19,8 +20,10 @@ from hpr.ppt_layout import (
     SLIDE_W,
     Ctx,
     LayoutError,
+    band_geometry,
     lh,
 )
+from hpr.prims import InfoBand, Prim
 from hpr.style import mix
 from hpr.theme import WHITE, on_color
 
@@ -118,194 +121,203 @@ def _place_brand(
 
 # ---------- cover / toc / end ----------
 
+# The cover does not scale 1:1 with body type: its sizes are capped at the standard scale
+# (a large body scale must not push a normal title / subtitle off the cover), and the title
+# steps down twice before a title is reported as too long.
+COVER_TITLE_CAP, COVER_SUB_CAP = 24.0, 16.0
+COVER_TITLE_STEPS = (12.0, 8.0, 4.0)  # added to the capped title size
+TITLE_TOP_BRAND = 32 + LOGO_MAX_H + 2 * PLATE_PAD + 20  # below a top-anchored LOGO (with plate)
+TITLE_TOP = 60.0
+TITLE_PREFERRED_Y = 150.0
+CLIENT_LABEL = "客户"
 
-def _cover_title(
+
+@dataclass(frozen=True)
+class CoverText:
+    title_size: float
+    title_h: float
+    sub_size: float
+    sub_h: float
+    height: float  # title + gap + subtitle (+ accent rule room)
+
+
+def _cover_text(content: dict, ctx: Ctx, w: float, max_lines: int, rule: float) -> list[CoverText]:
+    """Candidate title / subtitle geometries, largest first (the title shrinks in steps)."""
+    t, m = ctx.theme, ctx.m
+    sub_size = min(t.heading, COVER_SUB_CAP)
+    sub = content.get("subtitle")
+    sub_h = m.lines(sub, w, sub_size) * lh(sub_size) if sub else 0.0
+    out = []
+    for step in COVER_TITLE_STEPS:
+        size = min(t.title, COVER_TITLE_CAP) + step
+        n = m.lines(content["title"], w, size, True)
+        if n <= max_lines:
+            title_h = n * lh(size)
+            height = title_h + (t.gap_m + sub_h if sub else 0.0) + rule
+            out.append(CoverText(size, title_h, sub_size, sub_h, height))
+    if not out:
+        raise LayoutError("title", f"方案名称过长（封面最多 {max_lines} 行），请缩短")  # noqa: RUF001
+    return out
+
+
+def _place_cover_text(
     cv: Canvas,
     content: dict,
     ctx: Ctx,
     x: float,
-    y: float,
     w: float,
+    span: tuple[float, float],
     colors: tuple[str, str],
     max_lines: int,
-    limit: tuple[float, str],
+    rule: float = 0.0,
 ) -> float:
-    """Draw title + subtitle from ``y``; both must end above ``limit`` = (y, what lies below)."""
-    t, m = ctx.theme, ctx.m
-    color, sub_color = colors
-    bottom, below = limit
-    size = t.title + 12
-    n = m.lines(content["title"], w, size, True)
-    if n > max_lines:
-        raise LayoutError("title", f"方案名称过长（封面最多 {max_lines} 行），请缩短")  # noqa: RUF001
-    title_h = n * lh(size)
-    if y + title_h > bottom:
-        raise LayoutError("title", f"方案名称过长，封面上会压住{below}，请缩短")  # noqa: RUF001
-    k = m.lines(content["subtitle"], w, t.heading) if content.get("subtitle") else 0
-    sub_top = y + title_h + t.gap_m
-    if k and sub_top + k * lh(t.heading) > bottom:
+    """Title + subtitle inside ``span`` = (top, bottom), starting at TITLE_PREFERRED_Y and
+    moving up (then shrinking the title) as far as needed. Returns the subtitle's bottom."""
+    t = ctx.theme
+    top, bottom = span
+    geo = next(
+        (g for g in _cover_text(content, ctx, w, max_lines, rule) if g.height <= bottom - top), None
+    )
+    if geo is None:
         raise LayoutError(
-            "subtitle",
-            f"副标题过长，封面上会压住{below}，请缩短副标题或减少封面信息项",  # noqa: RUF001
+            "subtitle" if content.get("subtitle") else "title",
+            "方案名称/副标题过长，封面放不下，请缩短",  # noqa: RUF001
         )
-    cv.text(x, y, w, title_h, content["title"], size, color, bold=True, name=CHROME)
-    y = sub_top
-    if k:
-        cv.text(x, y, w, k * lh(t.heading), content["subtitle"], t.heading, sub_color, name=CHROME)
-        y += k * lh(t.heading)
+    y = max(top, min(TITLE_PREFERRED_Y, bottom - geo.height))
+    color, sub_color = colors
+    cv.text(x, y, w, geo.title_h, content["title"], geo.title_size, color, bold=True, name=CHROME)
+    y += geo.title_h
+    if content.get("subtitle"):
+        y += t.gap_m
+        cv.text(x, y, w, geo.sub_h, content["subtitle"], geo.sub_size, sub_color, name=CHROME)
+        y += geo.sub_h
     return y
 
 
-@dataclass(frozen=True)
-class MetaGeo:
-    col_w: float
-    rows: list[list[tuple[str, str]]]
-    label_h: list[float]
-    row_h: list[float]
-    height: float  # grid height, excluding the rule drawn gap_m above it
-
-
-def _meta_geometry(items: list[tuple[str, str]], ctx: Ctx, w: float) -> MetaGeo:
+def _who_height(content: dict, ctx: Ctx, w: float) -> float:
     t, m = ctx.theme, ctx.m
-    per = 4
-    cw = (w - (per - 1) * t.gap_l) / per
-    rows = [items[i : i + per] for i in range(0, len(items), per)]
-    if len(rows) > 3:
-        raise LayoutError("client.facts", "封面信息过多（最多 12 项），请精简或移到正文")  # noqa: RUF001
-    label_h = [max(m.lines(k, cw, t.caption) * lh(t.caption) for k, _ in row) for row in rows]
-    row_h = [
-        lab + max(m.lines(v, cw, t.body, True) * lh(t.body) for _, v in row)
-        for row, lab in zip(rows, label_h, strict=True)
-    ]
-    return MetaGeo(cw, rows, label_h, row_h, sum(row_h) + t.gap_m * (len(rows) - 1))
+    size = min(t.heading, COVER_SUB_CAP)
+    return lh(t.caption) + m.lines(content["client"]["name"], w, size, True) * lh(size)
 
 
-def _meta_grid(
-    cv: Canvas,
-    geo: MetaGeo,
-    ctx: Ctx,
-    x: float,
-    bottom: float,
-    w: float,
-    colors: tuple[str, str, str],
+def _who(
+    cv: Canvas, content: dict, ctx: Ctx, x: float, y: float, w: float, colors: tuple[str, str]
 ) -> None:
-    t = ctx.theme
-    label_color, value_color, rule = colors
-    y = bottom - geo.height
-    cv.rect(x, y - t.gap_m, w, 0.75, rule)
-    for row, lab, rh in zip(geo.rows, geo.label_h, geo.row_h, strict=True):
-        for i, (label, value) in enumerate(row):
-            cx = x + i * (geo.col_w + t.gap_l)
-            cv.text(cx, y, geo.col_w, lab, label, t.caption, label_color, name=CHROME)
-            cv.text(
-                cx, y + lab, geo.col_w, rh - lab, value, t.body, value_color, bold=True, name=CHROME
-            )
-        y += rh + t.gap_m
+    """The client's name under a quiet 「客户」 label."""
+    t, m = ctx.theme, ctx.m
+    size = min(t.heading, COVER_SUB_CAP)
+    name = content["client"]["name"]
+    label_color, color = colors
+    cv.text(x, y, w, lh(t.caption), CLIENT_LABEL, t.caption, label_color, name=CHROME)
+    h = m.lines(name, w, size, True) * lh(size)
+    cv.text(x, y + lh(t.caption), w, h, name, size, color, bold=True, name=CHROME)
 
 
-_META_BELOW = "下方的客户信息区"
+def _meta_line(
+    cv: Canvas, content: dict, ctx: Ctx, x: float, bottom: float, w: float, color: str
+) -> float:
+    """generated date · manager, one quiet line ending at ``bottom``; returns its top."""
+    t, m = ctx.theme, ctx.m
+    line = cover_meta_line(content)
+    h = m.lines(line, w, t.caption) * lh(t.caption)
+    cv.text(x, bottom - h, w, h, line, t.caption, color, name=CHROME)
+    return bottom - h
 
 
 def _cover(
     prs: Any, content: dict, style: dict, ctx: Ctx, base_dir: Path, warnings: list[str]
 ) -> None:
+    """Cover: LOGO / org name, title, subtitle, client name and one meta line. Nothing else
+    (client facts, period and data basis are in the 「客户信息」 band on the first body page)."""
     t = ctx.theme
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     cv = Canvas(slide, t)
     variant = style["cover.variant"]
-    bottom_brand = style["brand.logo_position"].startswith("bottom") or style[
-        "brand.org_position"
-    ].startswith("bottom")
-    meta_bottom = SLIDE_H - 40 - (BRAND_BAND_H if bottom_brand else 0)
-    items = cover_meta_items(content)
+    pos = (style["brand.logo_position"], style["brand.org_position"])
+    bottom_brand = any(p.startswith("bottom") for p in pos)
+    top_brand = any(not p.startswith("bottom") for p in pos)
+    foot = SLIDE_H - 40 - (BRAND_BAND_H if bottom_brand else 0)
+    top = TITLE_TOP_BRAND if top_brand else TITLE_TOP
     if variant == "split":
         panel_w = SLIDE_W * 0.42
-        meta_w = SLIDE_W - panel_w - 80
-        geo = _meta_geometry(items, ctx, meta_w)
         _bg(slide, t.background)
         cv.rect(0, 0, panel_w, SLIDE_H, t.primary)
-        fg = on_color(t.primary)
-        _cover_title(
-            cv,
-            content,
-            ctx,
-            40,
-            150,
-            panel_w - 80,
-            (fg, t.on_primary_soft),
-            4,
-            (SLIDE_H - 40, "左侧色块底边"),
-        )
+        colors = (on_color(t.primary), t.on_primary_soft)
+        _place_cover_text(cv, content, ctx, 40, panel_w - 80, (TITLE_TOP, SLIDE_H - 40), colors, 4)
+        rx, rw = panel_w + 40, SLIDE_W - panel_w - 80
         _place_brand(
-            cv,
-            content,
-            style,
-            ctx,
-            base_dir,
-            t.ink,
-            (panel_w + 40, 32, SLIDE_W - 40, SLIDE_H - 24),
-            warnings,
+            cv, content, style, ctx, base_dir, t.ink, (rx, 32, SLIDE_W - 40, SLIDE_H - 24), warnings
         )
-        _meta_grid(cv, geo, ctx, panel_w + 40, meta_bottom, meta_w, (t.muted, t.ink, t.line))
+        meta_top = _meta_line(cv, content, ctx, rx, foot, rw, t.muted)
+        who_y = meta_top - t.gap_l - _who_height(content, ctx, rw)
+        _who(cv, content, ctx, rx, who_y, rw, (t.muted, t.ink))
         return
-    if variant == "minimal":
-        meta_w = SLIDE_W - 112
-        geo = _meta_geometry(items, ctx, meta_w)
-        limit = meta_bottom - geo.height - t.gap_m - t.gap_l
+    x = 56.0
+    minimal = variant == "minimal"
+    w = 620.0 if minimal else 540.0
+    fg = t.ink if minimal else on_color(t.primary)
+    soft = t.muted if minimal else t.on_primary_soft
+    meta_top = foot - lh(t.caption) * ctx.m.lines(cover_meta_line(content), w, t.caption)
+    who_h = _who_height(content, ctx, w)
+    text_bottom = meta_top - t.gap_l - who_h - t.gap_l
+    if minimal:
         _bg(slide, t.background)
         cv.rect(0, 0, SLIDE_W, 6, t.primary)
-        # the accent bar under the subtitle needs gap_m + 4 of the room above the meta grid
-        y = _cover_title(
-            cv,
-            content,
-            ctx,
-            56,
-            170,
-            620,
-            (t.ink, t.muted),
-            3,
-            (limit - t.gap_m - 4, _META_BELOW),
-        )
-        cv.rect(56, y + t.gap_m, 64, 4, t.accent)
-        _place_brand(
-            cv,
-            content,
-            style,
-            ctx,
-            base_dir,
-            t.primary,
-            (56, 32, SLIDE_W - 56, SLIDE_H - 24),
-            warnings,
-        )
-        _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (t.muted, t.ink, t.line))
-        return
-    meta_w = 560.0
-    geo = _meta_geometry(items, ctx, meta_w)
-    limit = meta_bottom - geo.height - t.gap_m - t.gap_l
-    _bg(slide, t.primary)
-    fg = on_color(t.primary)
-    soft = mix(t.primary, fg, 0.25)
-    for r in (165.0, 125.0, 85.0):
-        cv.oval(790 - r, 270 - r, 2 * r, 2 * r, None, line=soft)
-    # decoration stays right of the meta grid (x 56..616) and the title column (..576)
-    cv.polyline(
-        [(640, 330), (690, 318), (730, 336), (775, 290), (820, 298), (870, 250), (955, 225)],
-        t.accent,
-        2.2,
-    )
-    _cover_title(cv, content, ctx, 56, 150, 520, (fg, t.on_primary_soft), 3, (limit, _META_BELOW))
+    else:
+        _bg(slide, t.primary)
+        ring = mix(t.primary, fg, 0.25)
+        for r in (165.0, 125.0, 85.0):  # quiet rings; no data-like shapes on the cover
+            cv.oval(790 - r, 270 - r, 2 * r, 2 * r, None, line=ring)
+    rule = t.gap_m + 4 if minimal else 0.0
+    y = _place_cover_text(cv, content, ctx, x, w, (top, text_bottom), (fg, soft), 3, rule)
+    if minimal:
+        cv.rect(x, y + t.gap_m, 64, 4, t.accent)
+    brand_color = t.primary if minimal else fg
     _place_brand(
         cv,
         content,
         style,
         ctx,
         base_dir,
-        fg,
-        (56, 32, SLIDE_W - 56, SLIDE_H - 24),
+        brand_color,
+        (x, 32, SLIDE_W - x, SLIDE_H - 24),
         warnings,
-        plate=True,
+        plate=not minimal,
     )
-    _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (t.on_primary_soft, fg, soft))
+    _who(cv, content, ctx, x, meta_top - t.gap_l - who_h, w, (soft, fg))
+    _meta_line(cv, content, ctx, x, foot, w, soft)
+
+
+# ---------- client-info band ----------
+
+
+def band_section(content: dict) -> list[tuple[dict, list[tuple[Prim, str]]]]:
+    """The 「客户信息」 band as a leading pseudo-section (first body page, after the TOC);
+    empty when the caller gave no facts, period or data basis."""
+    items = client_band_items(content)
+    if not items:
+        return []
+    sec = {"id": BAND_ID, "title": CLIENT_BAND_TITLE, "blocks": [{"kind": "profile"}]}
+    return [(sec, [(InfoBand(tuple(items)), "client.facts")])]
+
+
+def draw_band(cv: Canvas, x: float, y: float, w: float, band: InfoBand, ctx: Ctx) -> None:
+    t = ctx.theme
+    geo = band_geometry(band, w, ctx)
+    cv.rect(x, y, w, geo.height, t.pale, rounded=True)
+    rows = [band.items[i : i + geo.cols] for i in range(0, len(band.items), geo.cols)]
+    cy = y + geo.pad
+    lift = max(0.0, lh(t.body) - lh(t.caption)) * 0.6  # label on the value's baseline
+    for row, rh in zip(rows, geo.row_h, strict=True):
+        cx = x + geo.pad
+        for (label, value), cw, lab in zip(row, geo.col_w, geo.label_w, strict=False):
+            role = CHROME if label in BAND_CHROME_LABELS else BODY
+            lab_h = rh - lift
+            cv.text(cx, cy + lift, lab, lab_h, label, t.caption, t.muted, name=role)
+            vx, vw = cx + lab + geo.inner, cw - lab - geo.inner
+            cv.text(vx, cy, vw, rh, value, t.body, t.ink, bold=True)
+            cx += cw + geo.gap
+        cy += rh + t.gap_s
 
 
 def _show_toc(content: dict, style: dict) -> bool:

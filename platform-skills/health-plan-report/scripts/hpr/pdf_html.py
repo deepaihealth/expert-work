@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from hpr.blocks import section_prims
-from hpr.common import column_widths, cover_meta_items
+from hpr.common import (
+    BAND_CHROME_LABELS,
+    CLIENT_BAND_TITLE,
+    band_columns,
+    client_band_items,
+    column_widths,
+    cover_meta_line,
+)
 from hpr.icons import icon_for_section
 from hpr.images import image_blocks
 from hpr.logo import trimmed_logo
@@ -47,6 +54,7 @@ _POS_CLASS = {
 }
 
 
+COVER_TITLE_CAP, COVER_SUB_CAP = 20.0, 13.0  # the cover does not scale 1:1 with body type
 PT_PER_MM = 72 / 25.4
 PDF_BODY_W = (210 - 18 - 18) * PT_PER_MM  # A4 width minus the @page side margins, in pt
 CELL_PAD_X = 2.2 * PT_PER_MM
@@ -146,20 +154,27 @@ body {{ margin: 0; background: {t.background}; line-height: 1.55; }}
 .cover-minimal {{ background: {t.background}; color: {t.ink}; border-top: 3mm solid {t.primary}; }}
 .cover-split {{ background: {t.background}; color: {t.ink}; }}
 .cover-split .head {{ background: {t.primary}; color: {fg}; }}
-.cover .deco {{ position: absolute; right: -12mm; top: 40mm; width: 120mm; }}
+.cover .deco {{ position: absolute; right: 12mm; top: 40mm; width: 90mm; }}
 .cover .head {{ position: relative; padding: 18mm 20mm 12mm; }}
 .cover .hero {{ padding-top: 45mm; }}
-.cover h1 {{ margin: 0; max-width: 150mm; font-size: {t.title + 10}pt; line-height: 1.25; }}
-.cover .sub {{ margin-top: 5mm; max-width: 160mm; font-size: {t.heading}pt; opacity: 0.85; }}
+.cover h1 {{ margin: 0; max-width: 150mm; font-size: {min(t.title, COVER_TITLE_CAP) + 10}pt;
+  line-height: 1.25; }}
+.cover .sub {{ margin-top: 5mm; max-width: 160mm; font-size: {min(t.heading, COVER_SUB_CAP)}pt;
+  opacity: 0.85; }}
 .cover-minimal .rule {{ width: 18mm; height: 1.2mm; margin-top: 6mm; background: {t.accent}; }}
 .cover .foot {{ position: relative; padding: 10mm 20mm 20mm; }}
 .cover-split .foot {{ min-height: 110mm; padding-top: 14mm; }}
-.cover .meta {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5mm 8mm;
-  border-top: 0.5pt solid currentColor; padding-top: 5mm; }}
-.cover .meta .k {{ font-size: {t.caption}pt; opacity: 0.75; }}
-.cover-band .sub, .cover-band .meta .k, .cover-split .head .sub {{ color: {t.on_primary_soft};
-  opacity: 1; }}
-.cover .meta .v {{ font-weight: 700; }}
+.cover .who {{ border-top: 0.5pt solid currentColor; padding-top: 5mm; }}
+.cover .who .k, .cover .metaline {{ font-size: {t.caption}pt; color: {t.muted}; }}
+.cover .who .v {{ font-weight: 700; font-size: {min(t.heading, COVER_SUB_CAP)}pt; }}
+.cover .metaline {{ margin-top: 4mm; }}
+.cover-band .sub, .cover-band .who .k, .cover-band .metaline, .cover-split .head .sub {{
+  color: {t.on_primary_soft}; opacity: 1; }}
+.band {{ display: grid; gap: 2mm {BAND_GAP_MM}mm; background: {t.pale}; padding: {BAND_PAD_MM}mm;
+  border-radius: 1.5mm; margin-bottom: 4mm; break-inside: avoid; }}
+.band > div {{ display: grid; gap: 0 {BAND_INNER_MM}mm; align-items: baseline; }}
+.band .k {{ font-size: {t.caption}pt; color: {t.muted}; }}
+.band .v {{ font-weight: 700; }}
 .brand-row {{ display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; }}
 .foot .brand-row {{ margin-top: 8mm; }}
 .brand {{ display: flex; align-items: center; gap: 4mm; font-weight: 700; }}
@@ -319,15 +334,54 @@ def _cover(content: dict, style: dict, t: Theme, base_dir: Path, warnings: list[
     )
     sub = f'<div class="sub">{e(content["subtitle"])}</div>' if content.get("subtitle") else ""
     rule = '<div class="rule"></div>' if variant == "minimal" else ""
-    cells = "".join(
-        f'<div><div class="k">{e(k)}</div><div class="v num">{e(v)}</div></div>'
-        for k, v in cover_meta_items(content)
+    who = (
+        f'<div class="who"><div class="k">客户</div>'
+        f'<div class="v">{e(content["client"]["name"])}</div></div>'
     )
+    meta = f'<div class="metaline num">{e(cover_meta_line(content))}</div>'
     return (
         f'<section class="cover cover-{variant}">'
         f'<div class="head">{deco}{top_row}<div class="hero">'
         f"<h1>{e(content['title'])}</h1>{sub}{rule}</div></div>"
-        f'<div class="foot"><div class="meta">{cells}</div>{bottom_row}</div></section>'
+        f'<div class="foot">{who}{meta}{bottom_row}</div></section>'
+    )
+
+
+BAND_PAD_MM, BAND_GAP_MM, BAND_INNER_MM = 4.0, 6.0, 2.0
+
+
+def _band(content: dict, style: dict, t: Theme) -> str:
+    """The 「客户信息」 band after the TOC and before the first section: the caller's facts,
+    then 阶段 / 数据依据, in order; widths from common.band_columns (no mid-token break)."""
+    items = client_band_items(content)
+    if not items:
+        return ""
+    m = _measurer()
+
+    def label_w(text: str) -> float:
+        return m.width(clean(text), t.caption) * SAFETY + 1
+
+    def value_w(_j: int, text: str) -> float:
+        return m.width(clean(text), t.body, True) * SAFETY + 1
+
+    inner = PDF_BODY_W - 2 * BAND_PAD_MM * PT_PER_MM
+    gap, gap_in = BAND_GAP_MM * PT_PER_MM, BAND_INNER_MM * PT_PER_MM
+    n, widths, labs = band_columns(items, inner, gap, label_w, value_w, gap_in)
+    cols = " ".join(f"{w:.2f}pt" for w in widths)
+    cells = "".join(
+        f'<div style="grid-template-columns:{labs[i % n]:.2f}pt 1fr">'
+        f'<div class="k{" chrome" if k in BAND_CHROME_LABELS else ""}">{e(k)}</div>'
+        f'<div class="v num">{eb(v)}</div></div>'
+        for i, (k, v) in enumerate(items)
+    )
+    icon = (
+        f'<span class="ic">{icon_svg("pulse", on_color(t.primary), 4.5)}</span>'
+        if style["section.icons"]
+        else ""
+    )
+    return (
+        f'<section class="sec info" id="client-info"><h2>{icon}{CLIENT_BAND_TITLE}</h2>'
+        f'<div class="band" style="grid-template-columns:{cols}">{cells}</div></section>'
     )
 
 
@@ -470,6 +524,7 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
             for i, s in enumerate(content["sections"], start=1)
         )
         parts.append(f'<section class="toc"><h2>目录</h2>{links}</section>')
+    parts.append(_band(content, style, t))
     fg = on_color(t.primary)
     for sec, items in section_prims(content, style):
         icon = (

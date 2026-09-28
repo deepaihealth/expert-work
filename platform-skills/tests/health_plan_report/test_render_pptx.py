@@ -265,18 +265,14 @@ def _crowded_cover(sample, repeat):
         "第 1 阶段 · 这是一个较长的副标题，用于说明本方案的适用范围与执行周期，"  # noqa: RUF001
         "内容相对较长需要换行显示"
     ) * repeat
-    base = 3 + bool(sample.get("data_basis")) + bool(sample.get("manager"))
-    sample["client"]["facts"] = [
-        {"label": f"项目{i}", "value": f"数值说明{i}"} for i in range(12 - base)
-    ]
     sample["brand"]["logo_path"] = "logo.png"
 
 
-# split keeps the meta grid beside the title panel, so only a much longer subtitle reaches its limit
-@pytest.mark.parametrize(("variant", "repeat"), [("band", 2), ("split", 4), ("minimal", 2)])
-def test_cover_text_colliding_with_meta_is_an_error(workdir, sample, variant, repeat):
+# far beyond any realistic subtitle: the cover reports it instead of overlapping the name
+@pytest.mark.parametrize("variant", ["band", "split", "minimal"])
+def test_cover_text_colliding_with_client_name_is_an_error(workdir, sample, variant):
     PILImage.new("RGB", (300, 120), "#FFFFFF").save(workdir / "logo.png")
-    _crowded_cover(sample, repeat)
+    _crowded_cover(sample, 8)
     layers = [Layer("x", {"cover.variant": variant, "brand.logo_position": "bottom-left"})]
     with pytest.raises(LayoutError) as exc:
         _render(sample, workdir, layers)
@@ -548,7 +544,9 @@ def test_band_cover_labels_are_drawn_readable(workdir, sample, primary):
     out, style, _ = _render(sample, workdir, [Layer("x", {"color.primary": primary})])
     t = build_theme(style, "pptx")
     cover = Presentation(str(out)).slides[0]
-    labels = [f["label"] for f in sample["client"]["facts"]] + [sample["manager"]["title"]]
+    from hpr.common import cover_meta_line
+
+    labels = ["客户", cover_meta_line(sample)]
     for label in labels:
         (hex_,) = _run_colours(cover, label)
         assert contrast(f"#{hex_}", t.primary) >= 4.5, (label, hex_)

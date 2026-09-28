@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from hpr.common import column_widths
+from hpr.common import band_columns, column_widths
 from hpr.icons import icon_for_section
 from hpr.images import IMAGE_ERRORS, strict_images
 from hpr.measure import LINE, SAFETY, Measurer
@@ -19,6 +19,7 @@ from hpr.prims import (
     Column,
     Columns,
     Image,
+    InfoBand,
     KeyValue,
     Media,
     Paragraph,
@@ -37,6 +38,7 @@ BODY_TOP = 80.0
 BODY_W = SLIDE_W - 2 * MARGIN_X
 FOOTER_BOTTOM = 526.0
 NEXT_SECTION_MIN_ROOM = 0.35  # start the next section in-page only if >= 35% of the body is left
+BAND_ID = "hpr:client-info"  # the 「客户信息」 band: the first section follows it whenever it fits
 CHART_H = 200.0
 DONUT_H = 180.0
 BAR_H = 10.0
@@ -221,6 +223,49 @@ def kv_geometry(kv: KeyValue, w: float, ctx: Ctx) -> tuple[float, float, list[fl
     return pair_w, label_w, heights
 
 
+# ---------- client-info band ----------
+
+
+@dataclass(frozen=True)
+class BandGeo:
+    cols: int
+    col_w: list[float]
+    label_w: list[float]  # per column; the value takes col_w - label_w - inner
+    inner: float
+    pad: float
+    gap: float
+    row_h: list[float]
+    height: float
+
+
+def band_geometry(band: InfoBand, w: float, ctx: Ctx) -> BandGeo:
+    """Cells on a pale band, each a caption-size label beside its bold value; column count and
+    widths from common.band_columns, so a value never breaks inside a date, number or unit."""
+    t, m = ctx.theme, ctx.m
+    pad, gap, inner = t.gap_m, t.gap_l, t.gap_s
+
+    def label_w(text: str) -> float:
+        return m.width(text, t.caption) * SAFETY + 1
+
+    def value_w(_j: int, text: str) -> float:
+        return m.width(text, t.body, True) * SAFETY + 1
+
+    cols, col_w, labs = band_columns(band.items, w - 2 * pad, gap, label_w, value_w, inner)
+    rows = [band.items[i : i + cols] for i in range(0, len(band.items), cols)]
+    row_h = [
+        max(
+            max(
+                m.lines(k, lab, t.caption) * lh(t.caption),
+                m.lines(v, cw - lab - inner, t.body, True) * lh(t.body),
+            )
+            for (k, v), cw, lab in zip(row, col_w, labs, strict=False)
+        )
+        for row in rows
+    ]
+    height = 2 * pad + sum(row_h) + t.gap_s * (len(rows) - 1)
+    return BandGeo(cols, col_w, labs, inner, pad, gap, row_h, height)
+
+
 # ---------- timeline / columns ----------
 
 
@@ -384,6 +429,8 @@ def measure(prim: Prim, w: float, ctx: Ctx) -> float:
             else 0.0
         )
         return h + cap
+    if isinstance(prim, InfoBand):
+        return band_geometry(prim, w, ctx).height
     if isinstance(prim, TimeBars):
         return len(prim.rows) * (lh(t.body) + t.gap_s) + lh(t.caption) + t.gap_s
     raise TypeError(f"unknown primitive {type(prim).__name__}")
@@ -572,13 +619,14 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
             return head_fits(items[1][0], rest)
         return head_fits(first, room)
 
-    for si, (sec, items) in enumerate(sections):
+    lead = sum(1 for sec, _ in sections if sec["id"] == BAND_ID)  # not a caller section
+    for si, (sec, items) in enumerate(sections, start=-lead):
         head = SubHeading(sec["title"])
         head_h = measure(head, BODY_W, ctx)
         if (
             cur is not None
             and cur.placed
-            and bottom - y >= NEXT_SECTION_MIN_ROOM * avail_total
+            and (bottom - y >= NEXT_SECTION_MIN_ROOM * avail_total or cur.section_id == BAND_ID)
             and lead_fits(items, bottom - y - t.gap_l - head_h)
         ):
             y += t.gap_l

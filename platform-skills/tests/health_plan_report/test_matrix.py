@@ -118,8 +118,8 @@ def test_bad_logo_bytes_warns(sample, base):
     assert any("LOGO" in w for w in warnings)
 
 
-def test_too_many_cover_facts_is_error(sample, base):
-    sample["client"]["facts"] = [{"label": f"项{i}", "value": "值"} for i in range(14)]
+def test_client_band_taller_than_a_page_is_an_error_with_its_path(sample, base):
+    sample["client"]["facts"] = [{"label": f"项{i}", "value": "值" * 40} for i in range(60)]
     with pytest.raises(LayoutError, match=r"client\.facts"):
         render_pptx(sample, resolve([], sample).style, base / "f.pptx", base, M)
 

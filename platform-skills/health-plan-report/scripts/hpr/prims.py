@@ -126,6 +126,13 @@ class SubHeading:
     text: str
 
 
+@dataclass(frozen=True)
+class InfoBand:
+    """The 「客户信息」 band: (label, value) cells in caller order (common.client_band_items)."""
+
+    items: tuple[tuple[str, str], ...]
+
+
 Prim = (
     CardGrid
     | Table
@@ -140,4 +147,5 @@ Prim = (
     | Image
     | TimeBars
     | SubHeading
+    | InfoBand
 )

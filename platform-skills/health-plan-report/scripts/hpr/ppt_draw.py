@@ -17,7 +17,7 @@ from hpr.images import IMAGE_ERRORS, image_blocks, strict_images
 from hpr.measure import LINE, Measurer
 from hpr.ppt_canvas import BODY, CHROME, DECO, Canvas, _bg, _footer, _header, _set_font, emu, rgb
 from hpr.ppt_charts import add_chart
-from hpr.ppt_cover import _cover, _end, _show_toc, _toc
+from hpr.ppt_cover import _cover, _end, _show_toc, _toc, band_section, draw_band
 from hpr.ppt_layout import (
     DONUT_H,
     MARGIN_X,
@@ -53,6 +53,7 @@ from hpr.prims import (
     Chart,
     Columns,
     Image,
+    InfoBand,
     KeyValue,
     Media,
     Paragraph,
@@ -461,6 +462,8 @@ def _draw(cv: Canvas, pl: Placed, ctx: Ctx, base_dir: Path, warnings: list[str])
         _draw_image(cv, pl, p, ctx)
     elif isinstance(p, TimeBars):
         _draw_timebars(cv, pl, p, ctx)
+    elif isinstance(p, InfoBand):
+        draw_band(cv, pl.x, pl.y, pl.w, p, ctx)
     else:
         raise TypeError(type(p).__name__)
 
@@ -472,7 +475,7 @@ def render_pptx(
     ctx = make_ctx(content, theme, m, base_dir)
     _check_titles(content, ctx, style)
     image_blocks(content, style, base_dir)  # every image decodes, or its block path is reported
-    pages = paginate(section_prims(content, style), ctx)
+    pages = paginate(band_section(content) + section_prims(content, style), ctx)
     warnings: list[str] = []
     prs = Presentation()
     prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)

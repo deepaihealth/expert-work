@@ -221,13 +221,11 @@ def timebar_svg(bed: str, wake: str, color: str, t: Theme) -> str:
 
 
 def cover_deco_svg(t: Theme, fg: str) -> str:
+    """Quiet concentric rings, wholly inside their viewBox (no data-like shapes on a cover)."""
     soft = mix(t.primary, fg, 0.25)
     circles = "".join(
-        f'<circle cx="160" cy="120" r="{r}" fill="none" stroke="{soft}" stroke-width="0.6"/>'
-        for r in (110, 80, 50)
+        f'<circle cx="105" cy="105" r="{r}" fill="none" stroke="{soft}" stroke-width="0.6"/>'
+        for r in (100, 72, 44)
     )
-    return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 240" width="100%">{circles}'
-        f'<polyline points="0,170 40,162 62,174 88,146 112,152 136,122 162,128 210,98" fill="none" '
-        f'stroke="{t.accent}" stroke-width="1.6"/></svg>'
-    )
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 210" width="100%">'
+    return f"{svg}{circles}</svg>"

@@ -294,10 +294,8 @@ def test_cover_meta_and_clock_rules_have_a_single_source():
     for name in ("_meta_items", "_minutes"):
         owners = [p.name for p in hpr_dir.glob("*.py") if f"def {name}(" in p.read_text("utf-8")]
         assert owners == [], (name, owners)
-    assert common.cover_meta_items({"client": {"name": "甲"}, "generated_at": "2026-09-28"}) == [
-        ("客户", "甲"),
-        ("生成日期", "2026-09-28"),
-    ]
+    assert common.client_band_items({"client": {"name": "甲"}, "generated_at": "2026-09-28"}) == []
+    assert common.cover_meta_line({"generated_at": "2026-09-28"}) == "2026-09-28"
     assert common.clock_minutes("06:30") == 24 * 60 + 6 * 60 + 30
     assert common.clock_minutes("23:00") == 23 * 60
 

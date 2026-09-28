@@ -75,11 +75,13 @@ def test_every_required_text_is_in_visible_html(sample, base):
     assert warnings == []
 
 
-def test_cover_meta_includes_period_even_when_subtitle_omits_it(sample, base):
+def test_period_is_in_the_client_band_not_on_the_cover(sample, base):
     sample["subtitle"] = "控糖与体重管理"
-    cover = _cover(_html(sample, base)[0])
-    assert '<div class="k">阶段</div>' in cover
-    assert sample["period"]["label"] in _visible_text(cover)
+    html = _html(sample, base)[0]
+    band = html[html.index('id="client-info"') :]
+    assert '<div class="k chrome">阶段</div>' in band
+    assert sample["period"]["label"] in _visible_text(band)
+    assert sample["period"]["label"] not in _visible_text(_cover(html))
 
 
 def test_no_scripts_and_font_declared(sample, base):
@@ -108,7 +110,7 @@ def test_cover_variants(sample, base, variant):
 def test_cover_text_is_laid_out_in_flow_not_at_fixed_offsets(sample, base, variant):
     html, _ = _html(sample, base, [Layer("x", {"cover.variant": variant})])
     css = html[html.index("<style>") : html.index("</style>")]
-    for sel in (".cover h1", ".cover .sub", ".cover .meta"):
+    for sel in (".cover h1", ".cover .sub", ".cover .who", ".cover .metaline"):
         rules = [m.group(1) for m in re.finditer(re.escape(sel) + r"\s*\{([^}]*)\}", css)]
         assert rules, sel
         fixed = [r for r in rules if "absolute" in r or re.search(r"(?<![-\w])(top|bottom)\s*:", r)]
@@ -358,12 +360,13 @@ class _Doc:
         self.pages = [type("P", (), {"_page_box": _PageBox(b)})() for b in pages]
 
 
-def _cover_boxes(sub_y=260.0, meta_y=800.0):
+def _cover_boxes(sub_y=260.0, who_y=800.0):
     return [
         _Box("section", "cover cover-band", 0, 1000),
         _Box("h1", "", 150, 100),
         _Box("div", "sub", sub_y, 40),
-        _Box("div", "meta", meta_y, 120),
+        _Box("div", "who", who_y, 60),
+        _Box("div", "metaline", who_y + 70, 20),
     ]
 
 
@@ -390,9 +393,9 @@ def test_check_cover_accepts_clean_layout():
     ("doc", "path"),
     [
         (_Doc(_cover_boxes(sub_y=200)), "title"),  # subtitle drawn over the title
-        (_Doc(_cover_boxes(meta_y=950)), "client.facts"),  # meta runs past the page bottom
+        (_Doc(_cover_boxes(who_y=950)), "client.name"),  # client name runs past the bottom
         (_Doc(_cover_boxes(), [_Box("section", "cover cover-band", 0, 80)]), "title"),  # spills
-        (_Doc(_cover_boxes()[:3]), "title"),  # meta pushed off the fixed-height cover entirely
+        (_Doc(_cover_boxes()[:3]), "title"),  # name pushed off the fixed-height cover entirely
     ],
 )
 def test_check_cover_rejects_overlap_and_overflow(doc, path):

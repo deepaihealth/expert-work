@@ -54,10 +54,16 @@ def make_fetcher(base_dir: Path, allowed_files: frozenset[Path]) -> Any:
     return _Fetcher(allowed_protocols=("data", "file"))
 
 
-_COVER_PARTS = (("h1", "title"), ("sub", "subtitle"), ("meta", "client.facts"), ("brand", "brand"))
+_COVER_PARTS = (
+    ("h1", "title"),
+    ("sub", "subtitle"),
+    ("who", "client.name"),
+    ("metaline", "generated_at"),
+    ("brand", "brand"),
+)
 
 
-_COVER_HINT = "请缩短方案名称/副标题或减少封面信息项"
+_COVER_HINT = "请缩短方案名称或副标题"
 _COVER_FULL = f"封面内容过多，一页放不下，{_COVER_HINT}"  # noqa: RUF001
 
 
@@ -90,7 +96,7 @@ def check_cover(document: Any) -> None:
         if part:
             x, y = box.border_box_x(), box.border_box_y()
             rects.append((part, x, y, x + box.border_width(), y + box.border_height()))
-    if not {"title", "client.facts"} <= {r[0] for r in rects}:  # pushed off the fixed-height cover
+    if not {"title", "client.name"} <= {r[0] for r in rects}:  # pushed off the fixed-height cover
         raise LayoutError("title", _COVER_FULL)
     bottom = page.margin_height()
     for i, (part, x0, y0, x1, y1) in enumerate(rects):
