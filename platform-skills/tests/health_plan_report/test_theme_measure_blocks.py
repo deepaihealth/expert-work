@@ -117,6 +117,23 @@ def test_profile_without_range_has_tag_no_bar():
     assert card.tag.text == "高于参考范围"
 
 
+def test_profile_numeric_value_without_range_has_no_bar():
+    blk = {
+        "kind": "profile",
+        "items": [{"name": "腰围", "value": 92, "unit": "cm", "position": "above"}],
+    }
+    [grid] = block_to_prims(blk, "cards", "p")
+    card = grid.cards[0]
+    assert card.bar is None
+    assert card.tag.text == "高于参考范围"
+
+
+def test_profile_numeric_value_with_only_low_has_no_bar():
+    blk = {"kind": "profile", "items": [{"name": "腰围", "value": 92, "unit": "cm", "ref_low": 70}]}
+    [grid] = block_to_prims(blk, "cards", "p")
+    assert grid.cards[0].bar is None
+
+
 def test_profile_table_variant(sample):
     prof = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "profile")
     [tbl] = block_to_prims(prof, "table", "p")
