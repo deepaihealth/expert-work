@@ -301,3 +301,10 @@ def test_band_with_a_long_label_passes_ppt_qa(sample, base):
     out, style = _pptx(sample, base, [Layer("x", {"type.scale": "large"})])
     qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
     assert qa["status"] == "passed", qa
+
+
+def test_pdf_band_label_wraps_even_without_break_opportunities(sample, base):
+    html = _pdf_html(sample, base)
+    css = html[html.index("<style>") : html.index("</style>")]
+    rule = re.search(r"\.band \.k \{([^}]*)\}", css).group(1)
+    assert "overflow-wrap: anywhere" in rule

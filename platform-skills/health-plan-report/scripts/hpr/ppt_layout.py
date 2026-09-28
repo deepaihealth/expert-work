@@ -3,6 +3,7 @@ sections onto 16:9 slides (merge short sections, continue long ones under the sa
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -649,6 +650,8 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
                 need = h
                 if isinstance(pending, SubHeading) and idx + 1 < len(items):
                     need = h + t.gap_l + lead_need(idx + 1, items)  # keep heading with what follows
+                    if not head_fits(items[idx + 1][0], bottom - y - h - t.gap_l):
+                        need = math.inf  # split() would place none of it here (a tall first row)
                 elif pending is prim and captioned(idx, items):
                     need = h + t.gap_l + min_head(items[idx + 1][0])  # keep chart with caption
                 at_top = y <= BODY_TOP + 0.01

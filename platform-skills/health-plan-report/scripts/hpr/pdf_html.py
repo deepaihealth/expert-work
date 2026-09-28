@@ -173,7 +173,7 @@ body {{ margin: 0; background: {t.background}; line-height: 1.55; }}
 .band {{ display: grid; gap: 2mm {BAND_GAP_MM}mm; background: {t.pale}; padding: {BAND_PAD_MM}mm;
   border-radius: 1.5mm; margin-bottom: 4mm; break-inside: avoid; }}
 .band > div {{ display: grid; gap: 0 {BAND_INNER_MM}mm; align-items: baseline; }}
-.band .k {{ font-size: {t.caption}pt; color: {t.muted}; }}
+.band .k {{ font-size: {t.caption}pt; color: {t.muted}; overflow-wrap: anywhere; }}
 .band .v {{ font-weight: 700; }}
 .brand-row {{ display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; }}
 .foot .brand-row {{ margin-top: 8mm; }}

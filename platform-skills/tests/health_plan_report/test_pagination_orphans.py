@@ -144,3 +144,26 @@ def test_chart_moves_with_a_five_line_caption(scale):
             if isinstance(pl.prim, Paragraph) and pl.prim.text.startswith("说明")
         ]
         assert chart_page == min(cap_pages), n
+
+
+def _tall_first_row():
+    from hpr.prims import Bullets, Card, CardGrid, Step, Timeline
+
+    four = tuple(f"第{i}行说明" for i in range(4))
+    five = tuple(f"第{i}行安排" for i in range(5))
+    return {
+        "card grid": CardGrid(tuple(Card(title=f"卡片{i}", lines=four) for i in range(6)), cols=3),
+        "timeline": Timeline(tuple(Step(f"第 {i} 周", five) for i in range(8))),
+        "bullets": Bullets(("长条目说明文字，" * 45, "短条目")),  # noqa: RUF001
+    }
+
+
+@pytest.mark.parametrize("scale", ["compact", "standard", "large"])
+@pytest.mark.parametrize("what", ["card grid", "timeline", "bullets"])
+def test_heading_moves_with_a_block_whose_first_row_is_tall(scale, what):
+    ctx = _ctx(scale)
+    block = _tall_first_row()[what]
+    for n in range(1, _per_page(ctx) + 2):
+        pages = _pages(ctx, [_filler(n), SubHeading("小标题"), block])
+        for pg in pages:
+            assert not isinstance(pg.placed[-1].prim, SubHeading), (what, n)
