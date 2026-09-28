@@ -89,10 +89,9 @@ openclaw / hermes 的压缩门槛也按百分比,在 100 万窗口上同样撞�
 一行,写明:工具名 + 主要参数摘要(如 `form_get_field_detail form_customer_basic_info`)、原结果大小、找回方式(读某副本文件 / 重新 `skill_view`)。
 复用现有 footer / skill reference 格式,补上参数摘要。
 
-### 3.5 副本文件按对话隔开
+### 3.5 副本文件不串对话(计划阶段修订,见计划 R1)
 
-外置副本当前写在 `.tool_results/<run_id>/…`。改为按对话分目录(如 `.tool_results/<thread>/<run>/…`),占位只引用本对话目录下的路径。
-计划里须核对:`list_dir` / `search_files` 是否会把 `.tool_results` 列给模型,若会,默认列表排除该目录。
+原写「按对话分目录」。核代码后改为不搬目录:外置副本已按 run 分目录(`.tool_results/<run_id>/…`),`search_files` 与工作区树摘要已过滤该目录;跨轮清理留下的占位只引用本对话历史里已有的路径,构造上不可能指向别的对话。搬目录会连带留存 job 孤儿扫描、会话 purge、`figure_lookup` 三处,风险大于收益。模型用 `list_dir` 显式列该目录、沙箱里 `ls` 的暴露面是现状就有、不因本改动扩大,另立待办。
 
 ### 3.6 有损步骤的门槛
 
