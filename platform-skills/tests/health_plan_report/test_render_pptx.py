@@ -689,3 +689,24 @@ def test_negative_bars_are_not_inverted_and_dates_sit_below_the_plot(workdir, sa
     inv = ser._element.find(qn("c:invertIfNegative"))
     assert inv is not None and inv.get("val") == "0"
     assert ch.category_axis.tick_label_position == XL_TICK_LABEL_POSITION.LOW
+
+
+def test_counting_gate_is_not_fooled_by_text_straddling_two_cells():
+    corpus = "空腹血糖偏高血压偏高其他高血压"  # 偏高|血压 spells 高血压 across a cell boundary
+    assert missing_texts(["空腹血糖", "偏高", "血压", "偏高", "高血压"], corpus) == []
+
+
+def _straddle_plan(sample):
+    mon = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "table")
+    mon["columns"] = ["指标", "状态"]
+    mon["rows"] = [["空腹血糖", "偏高"], ["血压", "偏高"]]
+    para = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "paragraph")
+    para["text"] = "高血压"
+    return sample
+
+
+def test_straddling_table_cells_pass_pptx_qa(workdir, sample):
+    plan = _straddle_plan(sample)
+    out, style, _ = _render(plan, workdir)
+    qa = qa_pptx(out, required_texts(plan), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa

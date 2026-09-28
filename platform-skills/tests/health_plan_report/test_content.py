@@ -170,3 +170,10 @@ def test_nan_and_infinity_are_not_numbers(sample, tmp_path):
         [sys.executable, str(VALIDATE), str(p)], capture_output=True, text=True, check=False
     )
     assert res.returncode == 1 and "points[0].value" in res.stdout
+
+
+def test_normalize_maps_del_and_c1_controls_to_a_space():
+    from hpr.content import normalize_text
+
+    assert normalize_text("a\x7fb\x80c\x85d\x9fe") == "a b c d e"
+    assert normalize_text("\xa0ok") == "\xa0ok"  # U+00A0 is not a control

@@ -72,4 +72,12 @@ from pypdf import PdfReader  # noqa: E402
 text = "".join("".join((p.extract_text() or "").split()) for p in PdfReader("out/negbar.pdf").pages)
 check(all(v in text for v in ("-0.8", "-1.2", "0.3")), "PDF bar chart must print every value")
 
+# N1: a required text spelled across two adjacent cells must not make real cells "missing"
+st = json.loads(json.dumps(SAMPLE))
+tb = blocks(st, "table")[0]
+tb["columns"], tb["rows"] = ["指标", "状态"], [["空腹血糖", "偏高"], ["血压", "偏高"]]
+blocks(st, "paragraph")[0]["text"] = "高血压"
+r = render(st, "straddle")
+check(r["ok"] is True, f"straddling cells: {r}")
+
 print("PASS case_hpr_fixes")

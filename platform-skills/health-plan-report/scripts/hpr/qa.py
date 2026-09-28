@@ -4,6 +4,7 @@ page, readable contrast (spec §7.2)."""
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -20,19 +21,21 @@ def norm(s: str) -> str:
 
 
 def missing_texts(required: list[str], corpus: str) -> list[str]:
-    """Multiset containment (spec §7.2: 计数不足即失败). Longest first, each required text
-    consumes one occurrence from a working copy of the corpus, so a text required twice must
-    appear twice and a dropped text cannot hide inside a longer one. Chrome repeated on every
-    page only adds occurrences, so it cannot cause a false failure."""
+    """Counted containment (spec §7.2: 计数不足即失败), without consuming positions. Text n
+    needs its own required count plus, for every longer required text m containing it,
+    count(m) x occurrences of n inside m; it passes iff the corpus has at least that many.
+    So a text required twice must appear twice and a dropped text cannot hide inside a longer
+    one, while a longer text that happens to straddle two adjacent cells (the corpus joins them
+    without a separator) can no longer eat characters the real cells need. The accepted cost:
+    neighbouring cells that happen to spell n can make a missing n pass."""
     work = norm(corpus)
-    lost: set[str] = set()
-    for r in sorted(required, key=lambda x: len(norm(x)), reverse=True):
-        n = norm(r)
-        if n and n in work:
-            work = work.replace(n, "\x00", 1)
-        else:
-            lost.add(r)
-    return [r for r in dict.fromkeys(required) if r in lost]
+    req = Counter(n for n in (norm(r) for r in required) if n)
+    lost = set()
+    for n, k in req.items():
+        need = k + sum(km * m.count(n) for m, km in req.items() if len(m) > len(n) and n in m)
+        if work.count(n) < need:
+            lost.add(n)
+    return [r for r in dict.fromkeys(required) if norm(r) in lost]
 
 
 def _shape_texts(sh: Any) -> list[str]:

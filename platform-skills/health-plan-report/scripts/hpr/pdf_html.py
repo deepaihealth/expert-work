@@ -49,9 +49,9 @@ _BREAKS_TEXT = frozenset(("Cc", "Cs", "Zl", "Zp"))
 
 
 def clean(s: str) -> str:
-    """Defence in depth: render.py already normalised C0 controls (normalize_content); this also
-    covers C1 controls and U+2028 / U+2029, which weasyprint writes into the font subset and the
-    whole PDF text layer comes out garbled. They become a space (not \\n, \\t)."""
+    """Defence in depth: render.py already normalised control characters and U+2028 / U+2029
+    (normalize_content); weasyprint writes such code points into the font subset and the whole
+    PDF text layer comes out garbled, so any that reach here become a space (not \\n, \\t)."""
     return "".join(
         " " if ch not in "\n\t" and unicodedata.category(ch) in _BREAKS_TEXT else ch for ch in s
     )

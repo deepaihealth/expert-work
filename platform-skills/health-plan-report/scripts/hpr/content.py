@@ -498,16 +498,16 @@ def required_texts(content: dict) -> list[str]:
 
 
 _PATH_KEYS = frozenset({"path", "logo_path", "media_path"})
-_C0_BUT_TAB_LF = re.compile(r"[\x00-\x08\x0b-\x1f]")
+_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def normalize_text(s: str) -> str:
     """Presentation-level whitespace only (spec §4.4): CRLF / CR and the line / paragraph
-    separators U+2028 / U+2029 become LF, every other C0 control except LF and TAB becomes a
-    space. python-pptx would store C0 as literal ``_x000D_`` escapes and weasyprint garbles the
-    text layer, so both writers see this form."""
+    separators U+2028 / U+2029 become LF; every other C0 control except LF and TAB, DEL and the
+    C1 controls (U+0080-U+009F) become a space. python-pptx would store C0 as literal
+    ``_x000D_`` escapes and weasyprint garbles the text layer, so both writers see this form."""
     s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n").replace("\u2029", "\n")
-    return _C0_BUT_TAB_LF.sub(" ", s)
+    return _CONTROLS.sub(" ", s)
 
 
 def normalize_content(content: dict) -> dict:
