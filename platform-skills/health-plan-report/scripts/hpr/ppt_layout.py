@@ -6,9 +6,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from hpr.common import column_widths
 from hpr.icons import icon_for_section
 from hpr.images import IMAGE_ERRORS, strict_images
-from hpr.measure import LINE, Measurer
+from hpr.measure import LINE, SAFETY, Measurer
 from hpr.prims import (
     Bullets,
     Callout,
@@ -167,24 +168,16 @@ class TableGeo:
 
 def table_geometry(tbl: Table, w: float, ctx: Ctx) -> TableGeo:
     t, m = ctx.theme, ctx.m
-    n = len(tbl.columns)
 
     def bold_cell(i: int, value: str) -> bool:
         return tbl.highlight_col == i and value not in ("", "—")
 
-    longest = [
-        max(
-            [m.width(tbl.columns[i], t.small, True)]
-            + [m.width(r[i], t.small, bold_cell(i, r[i])) for r in tbl.rows]
-        )
-        for i in range(n)
-    ]
-    total = sum(longest) or 1.0
-    floor_w = w * 0.12
-    raw = [max(floor_w, w * x / total) for x in longest]
-    scale = w / sum(raw)
-    col_w = [x * scale for x in raw]
     pad_x, pad_y = t.gap_s, t.gap_xs + 2
+
+    def need(_i: int, text: str) -> float:  # measured bold: headers and highlights are bold
+        return m.width(text, t.small, True) * SAFETY + 2 * pad_x + 1
+
+    col_w = column_widths(tbl.columns, tbl.rows, w, need)
 
     def row_height(cells: tuple[str, ...], size: float, header: bool) -> float:
         return (

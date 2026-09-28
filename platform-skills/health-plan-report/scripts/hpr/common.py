@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import re
+from collections.abc import Callable
 
 
 def bar_domain(values: tuple[float, ...] | list[float]) -> tuple[float, float]:
@@ -63,3 +65,58 @@ def clock_minutes(hhmm: str) -> int:
     h, m = (int(x) for x in hhmm.split(":"))
     total = h * 60 + m
     return total + 24 * 60 if total < 18 * 60 else total
+
+
+_CJK = "\u3400-\u9fff\uf900-\ufaff"
+_NOBREAK = re.compile(
+    # an opening bracket stays with what follows, closing punctuation with what precedes;
+    # between them: a number (+ its unit), a latin word, a short CJK label (<= 4 chars)
+    rf"[（(《「『【]?"  # noqa: RUF001
+    rf"(?:[0-9][0-9A-Za-z.,:%/+~–\-]*(?: ?(?:[A-Za-z]+|[{_CJK}]))?"  # noqa: RUF001
+    rf"|[A-Za-z][A-Za-z0-9.,:%/+~–\-_]*"  # noqa: RUF001
+    rf"|(?<![{_CJK}])[{_CJK}]{{1,4}}(?![{_CJK}])"
+    rf"|\S)"
+    rf"[）)》」』】，。、；：！？%]*"  # noqa: RUF001
+)
+
+
+def nobreak_tokens(text: str) -> list[str]:
+    """The pieces of ``text`` a line must never break inside: times, dates and numbers with
+    their unit, latin words, short CJK labels (<= 4 chars), each with its brackets. Both
+    writers size table columns and cover fact cells so that the longest of them fits."""
+    return _NOBREAK.findall(text)
+
+
+SHORT_COLUMN = 0.25  # a column whose longest cell fits in this share of the width never wraps
+
+
+def column_widths(
+    columns: tuple[str, ...],
+    rows: tuple[tuple[str, ...], ...],
+    total: float,
+    width: Callable[[int, str], float],
+) -> list[float]:
+    """Table column widths summing to ``total``. ``width(i, text)`` is the room ``text`` needs
+    in column i (padding included). Every column first gets its longest unbreakable token, so
+    no short cell breaks mid-token; the rest goes to the columns whose full text still wraps,
+    in proportion to how much more they need (then, if room is left, to all columns)."""
+    cells = [[columns[i]] + [r[i] for r in rows] for i in range(len(columns))]
+    need = [
+        max(width(i, tok) for c in col for tok in (nobreak_tokens(c) or [c]))
+        for i, col in enumerate(cells)
+    ]
+    want = [
+        max(need[i], *(width(i, ln) for c in col for ln in c.split("\n")))
+        for i, col in enumerate(cells)
+    ]
+    if sum(need) >= total:  # cannot honour every token: scale down (a very wide table)
+        return [x * total / sum(need) for x in need]
+    if sum(want) <= total:  # everything fits on one line: share the slack by width
+        return [w + (total - sum(want)) * w / sum(want) for w in want]
+    base = list(need)
+    for i in sorted(range(len(want)), key=want.__getitem__):  # short columns: whole text
+        if want[i] <= total * SHORT_COLUMN and sum(base) - base[i] + want[i] <= total:
+            base[i] = want[i]
+    extra = total - sum(base)
+    gap = [w - b for w, b in zip(want, base, strict=True)]
+    return [b + extra * g / sum(gap) for b, g in zip(base, gap, strict=True)]

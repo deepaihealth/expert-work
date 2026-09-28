@@ -6,15 +6,17 @@ import base64
 import logging
 import re
 import unicodedata
+from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Any
 
 from hpr.blocks import section_prims
-from hpr.common import cover_meta_items
+from hpr.common import column_widths, cover_meta_items
 from hpr.icons import icon_for_section
 from hpr.images import image_blocks
 from hpr.logo import trimmed_logo
+from hpr.measure import SAFETY, Measurer
 from hpr.pdf_guard import check_cover, check_footer, make_fetcher, raise_for_failed_images
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import brand_line
@@ -43,6 +45,32 @@ _POS_CLASS = {
     "bottom-right": "r",
     "center": "c",
 }
+
+
+PT_PER_MM = 72 / 25.4
+PDF_BODY_W = (210 - 18 - 18) * PT_PER_MM  # A4 width minus the @page side margins, in pt
+CELL_PAD_X = 2.2 * PT_PER_MM
+
+
+@lru_cache(maxsize=1)
+def _measurer() -> Measurer:
+    return Measurer()
+
+
+def table_colgroup(p: Table, t: Theme) -> str:
+    """Fixed column widths (percent of the body width): each column fits its longest
+    unbreakable token, the long text column takes the rest (see common.column_widths)."""
+    m = _measurer()
+
+    def need(_i: int, text: str) -> float:  # measured bold: headers and highlights are bold
+        return m.width(clean(text), t.small, True) * SAFETY + 2 * CELL_PAD_X + 1
+
+    widths = column_widths(p.columns, p.rows, PDF_BODY_W, need)
+    return (
+        "<colgroup>"
+        + "".join(f'<col style="width:{w / PDF_BODY_W * 100:.3f}%">' for w in widths)
+        + "</colgroup>"
+    )
 
 
 _BREAKS_TEXT = frozenset(("Cc", "Cs", "Zl", "Zp"))
@@ -178,7 +206,8 @@ ul.checks {{ list-style: none; padding-left: 5mm; }} ul.checks li::before {{ con
   }}
 .bar .range {{ position: absolute; top: 1mm; height: 1mm; background: {t.primary_soft}; }}
 .bar .mark {{ position: absolute; top: 0; width: 0.6mm; height: 3mm; background: {t.ink}; }}
-table {{ width: 100%; border-collapse: collapse; margin-bottom: 4mm; font-size: {t.small}pt; }}
+table {{ width: 100%; table-layout: fixed; border-collapse: collapse; margin-bottom: 4mm;
+  font-size: {t.small}pt; }}
 thead {{ display: table-header-group; }}
 th {{ background: {t.pale}; color: {t.primary_text}; text-align: left; }}
 th, td {{ padding: 1.8mm 2.2mm; border-bottom: 0.5pt solid {t.line}; vertical-align: top;
@@ -354,7 +383,10 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
             + "</tr>"
             for r in p.rows
         )
-        return f"<table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>"
+        return (
+            f"<table>{table_colgroup(p, t)}<thead><tr>{head}</tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
     if isinstance(p, KeyValue):
         return (
             f'<dl class="kv c{p.cols}">'

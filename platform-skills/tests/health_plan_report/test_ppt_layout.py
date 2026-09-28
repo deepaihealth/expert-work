@@ -197,10 +197,20 @@ def test_single_line_slots_are_measured():
 
 def test_table_highlight_column_measured_bold():
     ctx = _ctx()
-    rows = tuple(("第 1 天", "≥ 7.0 连续 2 次请联系管理师") for _ in range(3))
-    plain = table_geometry(Table(("日期", "阈值"), rows), BODY_W, ctx)
-    hl = table_geometry(Table(("日期", "阈值"), rows, highlight_col=1), BODY_W, ctx)
-    assert hl.col_w[1] > plain.col_w[1]
+    t, m = ctx.theme, ctx.m
+    rows = tuple(("第 1 天", "≥ 7.0 连续 2 次请联系管理师" * 3) for _ in range(3))
+    tbl = Table(("日期", "阈值"), rows, highlight_col=1)
+
+    def lines(geo, bold):
+        return m.lines(rows[0][1], geo.col_w[1] - 2 * geo.pad_x, t.small, bold)
+
+    # a table width where the bold highlight wraps to more lines than regular text would
+    geo = next(
+        g
+        for g in (table_geometry(tbl, w, ctx) for w in range(200, 600, 5))
+        if lines(g, True) > lines(g, False)
+    )
+    assert geo.row_h[0] == pytest.approx(lines(geo, True) * lh(t.small) + 2 * geo.pad_y)
 
 
 def test_chart_keeps_its_caption_on_the_same_page():
