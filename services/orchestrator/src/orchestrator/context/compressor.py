@@ -304,6 +304,20 @@ class _SplitMessages:
     tail: list[BaseMessage]
 
 
+def _is_summary_message(m: BaseMessage) -> bool:
+    """B-126 (fix round 1, M3) — one shared predicate for "is this a
+    compressor-authored ``<context-summary>`` block", used by the
+    leading-system scan below, :func:`_last_middle_id`, and
+    :func:`_summary_text_of` (previously two subtly different checks —
+    ``in`` vs ``startswith``). ``startswith`` is the correct one: the tag
+    is always the first characters of the wrapped content (see
+    ``_compress_once``'s ``wrapped = SystemMessage(...)``), so a message
+    that merely mentions the tag string somewhere inside customer text can
+    never false-positive.
+    """
+    return isinstance(m, SystemMessage) and str(m.content).startswith(_SUMMARY_TAG_OPEN)
+
+
 def _split(messages: Sequence[BaseMessage], *, head_keep: int, tail_keep: int) -> _SplitMessages:
     """Split ``messages`` into (leading systems, head, middle, tail).
 
@@ -311,10 +325,28 @@ def _split(messages: Sequence[BaseMessage], *, head_keep: int, tail_keep: int) -
     head/tail accounting — the L1 invariant requires the system
     prompt block to stay byte-stable, so the compressor never touches
     it. Head / tail are slices of the *non-system* tail of the list.
+
+    B-126 (fix round 1, I1) — a ``<context-summary>``-tagged SystemMessage
+    is NEVER counted as a leading system, even when it sits immediately
+    after the real leading system prompt with nothing in between
+    (``head_keep=0`` puts it exactly there — :func:`_apply_cached_summary`
+    substitutes ``[*leading_systems, *head(empty), summary, ...]``, and a
+    within-call second pass does the same via ``_compress_once``'s own
+    ``[*leading_systems, *head(empty), wrapped, *tail]``). Without this
+    exemption the scan silently folds the summary into the byte-stable
+    prefix, where :func:`_extract_prior_summary` can never see it again:
+    CM-7 update mode never fires, a fresh disconnected summary is produced
+    instead, and :func:`_summary_text_of` keeps reporting the stale text
+    forever after (through_id advances, the reported text doesn't — the
+    reviewer's repro).
     """
     leading_systems: list[BaseMessage] = []
     cursor = 0
-    while cursor < len(messages) and isinstance(messages[cursor], SystemMessage):
+    while (
+        cursor < len(messages)
+        and isinstance(messages[cursor], SystemMessage)
+        and not _is_summary_message(messages[cursor])
+    ):
         leading_systems.append(messages[cursor])
         cursor += 1
     remainder = list(messages[cursor:])
@@ -342,6 +374,18 @@ def _apply_cached_summary(
     """把中段里 ``through_id`` 及之前的消息换成缓存摘要;``through_id`` 不在中段则返回 ``None``。"""
     split = _split(messages, head_keep=head_keep, tail_keep=tail_keep)
     ids = [getattr(m, "id", None) for m in split.middle]
+    # B-126 (fix round 1, M1) — this checks PRESENCE of the boundary id in
+    # the current middle, NOT that every message before it (content already
+    # folded into ``cached.text``) is byte-identical to what was actually
+    # summarised. Narrow gap: CM-12 / the working window (both run BEFORE
+    # the compressor) can prune or drop OLDER messages that fall strictly
+    # before ``through_id`` — content the cached summary already covers —
+    # without touching through_id's own message, and this membership check
+    # alone can't see that. Accepted: the covered content was already
+    # folded into an LLM-authored summary, so a later mechanical change to
+    # its raw form doesn't make the summary text wrong, only means we don't
+    # re-verify a span we no longer need the raw form of; catching it would
+    # require hashing the whole covered span, out of scope for this fix.
     if cached.through_id not in ids:
         return None
     cut = ids.index(cached.through_id) + 1
@@ -357,15 +401,24 @@ def _last_middle_id(
     middle = _split(messages, head_keep=head_keep, tail_keep=tail_keep).middle
     for m in reversed(middle):
         mid = getattr(m, "id", None)
-        if mid and not (isinstance(m, SystemMessage) and _SUMMARY_TAG_OPEN in str(m.content)):
+        if mid and not _is_summary_message(m):
             return str(mid)
     return None
 
 
 def _summary_text_of(messages: Sequence[BaseMessage]) -> str:
-    """B-126 —— 取回一次 ``_compress_once`` 产出的整段 ``<context-summary>`` 消息内容。"""
-    for m in messages:
-        if isinstance(m, SystemMessage) and str(m.content).startswith(_SUMMARY_TAG_OPEN):
+    """B-126 —— 取回一次 ``_compress_once`` 产出的整段 ``<context-summary>`` 消息内容。
+
+    B-126 (fix round 1, I1) — iterates in REVERSE and returns the LAST
+    match, mirroring :func:`_extract_prior_summary` / the existing
+    ``_summary_chars`` helper's "last one wins" convention (not the
+    original forward-scan-first-match, which could return a stale
+    duplicate sitting earlier in the list instead of the summary the pass
+    just produced — see the ``_split`` fix above for how such a duplicate
+    could arise).
+    """
+    for m in reversed(messages):
+        if _is_summary_message(m):
             return str(m.content)
     return ""
 
@@ -612,6 +665,7 @@ class ContextCompressor:
         reserved: Sequence[BaseMessage] = (),
         cached_summary: CachedSummary | None = None,
         on_summary: Callable[[CachedSummary], None] | None = None,
+        on_cache_hit: Callable[[], None] | None = None,
     ) -> list[BaseMessage]:
         """Compress the message list until it fits under the threshold.
 
@@ -682,6 +736,11 @@ class ContextCompressor:
         绝不会拼进一份对不上当前历史的摘要,退化为本方法原有的从头压缩路径。
         ``on_summary``(存在时)在每一遍真正产出新摘要后被调用一次,携带这一遍的
         :class:`CachedSummary`;调用方用最后一次上报的实例写回检查点。
+
+        B-126(fix round 1, §3.9)—— ``on_cache_hit``(存在时)在 ``cached_summary``
+        真正被拼进 ``current``(``_apply_cached_summary`` 命中,不是 stale 未命中)
+        时调用一次,不带任何正文 —— 只报「这次复用了缓存」这一个布尔事实,给
+        ``context_gates``/compression span 挂 ``cm.summary.reused`` 用。
         """
         reserve = self._estimate(reserved) if reserved else 0
         current: list[BaseMessage] = list(messages)
@@ -691,6 +750,8 @@ class ContextCompressor:
             )
             if applied is not None:
                 current = applied
+                if on_cache_hit is not None:
+                    on_cache_hit()
         tokens_before = self._estimate(current)
         passes_done = 0
         for pass_idx in range(self.max_passes):

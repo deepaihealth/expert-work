@@ -190,6 +190,50 @@ async def test_run_agent_stamps_node_duration_ms_on_updates() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_agent_strips_context_summary_from_updates() -> None:
+    """B-126 fix round 1, I2 — ``context_summary`` is internal bookkeeping
+    (a condensed restatement of customer conversation content, L2
+    compression's rolling summary); it must never reach a published
+    ``updates`` frame, and ``_publish_frame`` persists the SAME object to
+    ``run_event`` (no separate assertion needed — one strip covers both)."""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    secret_text = "<context-summary>the customer's SSN is 000-00-0000</context-summary>"
+    graph = _ScriptedGraph(
+        chunks=[
+            {
+                "agent": {
+                    "step_count": 1,
+                    "context_summary": {"through_id": "a8", "text": secret_text},
+                }
+            },
+        ]
+    )
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+    events = await _drain(bridge, record.run_id)
+    updates = [e for e in events if e.event == "updates"]
+    assert updates, "expected updates frames"
+    for e in updates:
+        for node_val in e.data.values():
+            assert "context_summary" not in node_val
+    # Belt + suspenders: the secret text must not survive anywhere at all
+    # in any published frame (not just under the expected key name).
+    assert not any(secret_text in json.dumps(e.data) for e in events)
+    # The rest of that node's write (step_count) must be unaffected — the
+    # strip removes ONLY the internal key, nothing else.
+    agent_update = next(e for e in updates if "agent" in e.data)
+    assert agent_update.data["agent"]["step_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_run_agent_serializes_base_messages() -> None:
     """LangGraph chunks carry ``BaseMessage`` objects — they must land
     in the bridge as JSON-safe dicts, not raw objects."""

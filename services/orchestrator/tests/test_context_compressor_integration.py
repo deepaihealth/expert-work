@@ -485,4 +485,23 @@ async def test_agent_node_reuses_cached_summary_across_turns() -> None:
             config=cfg,
         )
 
+        # I3 — pin the EXACT reused sequence: head (m0), the reused summary,
+        # every message strictly after through_id in order (m18, m19 — the
+        # span between the cached boundary and the old tail), then the new
+        # tail (turn 1's own reply + this turn's new message). An off-by-one
+        # at the cut point (too small: duplicates through_id's own message
+        # back in; too large: drops the first genuinely-new message) changes
+        # this sequence without changing ``summariser.calls`` — that's why a
+        # call-count-only assertion doesn't catch it.
+        prompt = agent_llm.calls[-1]
+        assert len(prompt) == 6
+        assert prompt[0].content == history[0].content
+        assert isinstance(prompt[1], SystemMessage)
+        assert "<context-summary>" in str(prompt[1].content)
+        assert "topic recap" in str(prompt[1].content)
+        assert prompt[2].content == history[18].content
+        assert prompt[3].content == history[19].content
+        assert prompt[4].content == "done"
+        assert prompt[5].content == "one more short thing"
+
     assert summariser.calls == calls_before_turn2

@@ -952,15 +952,25 @@ def build_react_graph(
                 else None
             )
             new_summary: list[CachedSummary] = []
-            messages = await context_compressor.compress(
-                messages,
-                on_pre_compaction=on_pre_compaction,
-                on_compacted=on_compacted,
-                streak_key=str(compress_thread_id) if compress_thread_id else None,
-                reserved=reserved,
-                cached_summary=cached,
-                on_summary=new_summary.append,
-            )
+            # B-126 (fix round 1, §3.9) — ``cache_hit_marks`` stays empty unless
+            # ``on_cache_hit`` fires (cached_summary genuinely matched, not a
+            # stale miss); the span attribute is a bare boolean, never the
+            # summary text itself.
+            cache_hit_marks: list[bool] = []
+            with expert_work_span(
+                ExpertWorkComponent.ORCHESTRATOR, "compression"
+            ) as compression_span:
+                messages = await context_compressor.compress(
+                    messages,
+                    on_pre_compaction=on_pre_compaction,
+                    on_compacted=on_compacted,
+                    streak_key=str(compress_thread_id) if compress_thread_id else None,
+                    reserved=reserved,
+                    cached_summary=cached,
+                    on_summary=new_summary.append,
+                    on_cache_hit=lambda: cache_hit_marks.append(True),
+                )
+                compression_span.set_attribute("cm.summary.reused", bool(cache_hit_marks))
             if new_summary:
                 summary_update = {
                     "through_id": new_summary[-1].through_id,
