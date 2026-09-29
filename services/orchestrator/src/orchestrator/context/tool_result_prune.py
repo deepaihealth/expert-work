@@ -51,12 +51,15 @@ Design anchors (docs/design/tool-result-context-budget.md §Phase 2):
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
-from langchain_core.messages import BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.runtime.tokens import TokenEstimator
 from orchestrator.context.compressor import estimate_tokens
 from orchestrator.context.skill_reference import skill_view_reference
@@ -82,6 +85,8 @@ class PruneResult:
 
     messages: list[BaseMessage]
     pruned_count: int
+    #: B-126 —— 本次跨轮清理估算省下的 token(观测用;非跨轮路径为 0)。
+    reclaimed_tokens: int = 0
 
 
 def _is_already_pruned(content: str) -> bool:
@@ -211,6 +216,130 @@ def prune_old_tool_results(
         else:
             out.append(message)
     return PruneResult(messages=out, pruned_count=pruned)
+
+
+_ARGS_HINT_LIMIT = 120
+
+
+def current_turn_start(messages: Sequence[BaseMessage]) -> int:
+    """B-126 —— 本轮起点 = 最后一条**真实**用户消息的下标;没有则 0。
+
+    平台注入的隐藏 HumanMessage(本轮输入块 / 计划 / 工作区摘要 …)带
+    ``HIDE_FROM_UI``,不算边界 —— 与 CM-2 ``trim_to_recent_turns`` 同一口径。
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, HumanMessage) and not is_hidden(m):
+            return i
+    return 0
+
+
+def _args_hint(args: Mapping[str, Any]) -> str:
+    text = json.dumps(dict(args), ensure_ascii=False, sort_keys=True, default=str)
+    return text if len(text) <= _ARGS_HINT_LIMIT else text[: _ARGS_HINT_LIMIT - 1] + "…"
+
+
+def _lossless_reference(message: ToolMessage) -> str | None:
+    """无损找回途径 —— 技能引用 / 外置 footer / 持久化路径;都没有则 ``None``。"""
+    reference = skill_view_reference(message)
+    if reference is not None:
+        return reference
+    content = message.content
+    if isinstance(content, str):
+        footer_at = content.find(OVERFLOW_FOOTER_TAG_OPEN)
+        if footer_at != -1:
+            return content[footer_at:].strip()
+    path = _artifact_path(message)
+    if path is not None and isinstance(content, str):
+        return render_overflow_footer(rel=path, total_chars=len(content)).strip()
+    return None
+
+
+def _cross_turn_stub(
+    message: ToolMessage, *, args: Mapping[str, Any] | None, reference: str
+) -> str:
+    content = message.content
+    size = len(content) if isinstance(content, str) else 0
+    head = f"[{message.name or 'tool'}]"
+    if args:
+        head += f" {_args_hint(args)}"
+    return (
+        f"{_PRUNE_TAG_OPEN}\n"
+        f"{head} — {size:,} chars from an earlier turn, elided; recover below if needed.\n"
+        f"{reference}\n"
+        f"{_PRUNE_TAG_CLOSE}"
+    )
+
+
+def prune_prior_turns(
+    messages: Sequence[BaseMessage],
+    *,
+    recent_tool_results_kept: int,
+    min_context_tokens: int,
+    min_reclaim_tokens: int,
+    estimator: TokenEstimator | None = None,
+) -> PruneResult:
+    """B-126 —— 新一轮开头无损收起更早轮次的大块工具结果。
+
+    决定只依赖 ``messages[:boundary + 1]``(旧轮次 + 本轮用户消息),所以同一轮内
+    每次调用结果逐字相同、缓存前缀稳定(spec D3 / R2)。只收有无损找回途径的结果
+    (D6),``status == "error"`` 与非字符串内容一律不动(R4)。去重只在旧轮次内部做
+    (R3)。返回新列表,不改入参。
+    """
+    msgs = list(messages)
+    boundary = current_turn_start(msgs)
+    if boundary == 0:
+        return PruneResult(messages=msgs, pruned_count=0)
+    if estimate_tokens(msgs[: boundary + 1], estimator=estimator) < min_context_tokens:
+        return PruneResult(messages=msgs, pruned_count=0)
+
+    prior_tool_idxs = [i for i in range(boundary) if isinstance(msgs[i], ToolMessage)]
+    protected = set(prior_tool_idxs[max(0, len(prior_tool_idxs) - recent_tool_results_kept) :])
+    args_by_call: dict[str, Mapping[str, Any]] = {}
+    for i in range(boundary):
+        m = msgs[i]
+        if isinstance(m, AIMessage):
+            for tc in m.tool_calls:
+                call_id = tc.get("id")
+                if call_id:
+                    args_by_call[call_id] = tc.get("args") or {}
+    last_occurrence: dict[str, int] = {}
+    for i in prior_tool_idxs:
+        c = msgs[i].content
+        if isinstance(c, str):
+            last_occurrence[c] = i
+
+    replacements: dict[int, ToolMessage] = {}
+    reclaimed = 0
+    for i in prior_tool_idxs:
+        m = msgs[i]
+        if not isinstance(m, ToolMessage):
+            continue
+        content = m.content
+        if not isinstance(content, str) or _is_already_pruned(content):
+            continue
+        if getattr(m, "status", "success") == "error":
+            continue
+        is_duplicate = last_occurrence.get(content, i) > i
+        if i in protected and not is_duplicate:
+            continue
+        reference = _lossless_reference(m)
+        if reference is None:
+            continue
+        stub = _cross_turn_stub(m, args=args_by_call.get(m.tool_call_id), reference=reference)
+        new = _rebuild(m, stub)
+        saved = estimate_tokens([m], estimator=estimator) - estimate_tokens(
+            [new], estimator=estimator
+        )
+        if saved <= 0:
+            continue
+        replacements[i] = new
+        reclaimed += saved
+
+    if not replacements or reclaimed < min_reclaim_tokens:
+        return PruneResult(messages=msgs, pruned_count=0)
+    out = [replacements.get(i, m) for i, m in enumerate(msgs)]
+    return PruneResult(messages=out, pruned_count=len(replacements), reclaimed_tokens=reclaimed)
 
 
 @dataclass(frozen=True)
