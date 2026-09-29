@@ -130,6 +130,7 @@ from orchestrator.context import (
     WorkspaceProjector,
     safe_thread_projection_prefix,
 )
+from orchestrator.context.system_prompt_view import keep_latest_system_prompt
 from orchestrator.graph_builder._approval import (
     ApprovalTarget,
     apply_resume_decision,
@@ -713,6 +714,10 @@ def build_react_graph(
         # compressor)之前:它们不占窗口预算、不进摘要。只改 prompt 视图,检查点
         # 不动(CM-C4 同一契约);读面照常看到这些消息。
         messages = filter_superseded_turns(messages)
+        # B-128 —— 检查点里每轮各有一条系统提示词,prompt 视图只留最新一份放下标 0;
+        # 不去重的话 coalesce 会把 N 份拼成一条,前缀缓存每轮在上一份末尾断开。
+        # 放在一切上下文闸之前,让它们按真实大小估算。检查点不动(CM-C4)。
+        messages = keep_latest_system_prompt(messages)
         # Stream CM-12 — mechanical tool-result prune: the cheapest, least-lossy
         # gate, run FIRST. When over threshold it collapses OLD tool results
         # (beyond the most-recent N) to 1-line references — lossless for
