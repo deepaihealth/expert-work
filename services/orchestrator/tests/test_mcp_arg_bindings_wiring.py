@@ -47,6 +47,7 @@ from orchestrator.tools import (
     build_tool_registry,
 )
 from orchestrator.tools._child_run import _child_config
+from orchestrator.tools.arg_bindings import ToolArgBindings
 from orchestrator.tools.registry import UnmatchedArgBinding
 
 pytestmark = pytest.mark.asyncio
@@ -68,6 +69,7 @@ async def _build_registry(
     *,
     tools: Sequence[Mapping[str, Any]],
     arg_bindings: Mapping[str, Mapping[str, str]] | None = None,
+    fixed: Mapping[str, Mapping[str, str]] | None = None,
 ) -> tuple[ToolRegistry, RecordingMCPClient]:
     """走**整条装配路径** —— wire 名折叠、剥 schema、落地判定全是生产代码。
 
@@ -85,8 +87,14 @@ async def _build_registry(
     entry = MCPToolSpec(
         servers=[_SERVER],
         arg_bindings=[
-            ArgBindingSpec(server=_SERVER, tool=tool, args=dict(args))
-            for tool, args in (arg_bindings or {}).items()
+            ArgBindingSpec(
+                server=_SERVER,
+                tool=tool,
+                args=dict((arg_bindings or {}).get(tool, {})),
+                fixed=dict((fixed or {}).get(tool, {})),
+            )
+            # B-127 —— 同一个工具的变量绑定与固定值是**一条**绑定(协议层不许重复)。
+            for tool in dict.fromkeys([*(arg_bindings or {}), *(fixed or {})])
         ],
     )
     registry = await build_tool_registry([entry], tool_env=ToolEnv(mcp_pool=pool))
@@ -258,6 +266,7 @@ def graph_harness():  # type: ignore[no-untyped-def]
         action_screen: Literal["off", "block", "approval"] = "off",
         tool_schema: Mapping[str, Any] | None = None,
         extra_bindings: Mapping[str, Mapping[str, str]] | None = None,
+        fixed: Mapping[str, Mapping[str, str]] | None = None,
     ) -> _Harness:
         # ``bindings`` 用 wire 名(与测试正文一致),注册那一侧收的是**裸**名。
         # ``extra_bindings`` 已经是裸名,用来造「这个工具服务器没有」的落空项。
@@ -273,6 +282,10 @@ def graph_harness():  # type: ignore[no-untyped-def]
         registry, client = await _build_registry(
             tools=[{"name": "t1", "input_schema": schema}],
             arg_bindings=bare,
+            fixed={
+                name.removeprefix(f"mcp__{_SERVER}__"): dict(pinned)
+                for name, pinned in (fixed or {}).items()
+            },
         )
         judge = _RecordingJudge(aligned=action_screen == "off") if action_screen != "off" else None
         return _Harness(
@@ -541,7 +554,7 @@ async def test_a_binding_that_matches_reports_nothing() -> None:
         tool_env=ToolEnv(mcp_pool=await _pool_with_t1()),
     )
     assert registry.unmatched_arg_bindings() == ()
-    assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}
+    assert registry.arg_bindings() == {_WIRE: ToolArgBindings(args={"project_code": "pc"})}
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +655,9 @@ async def test_a_second_mcp_entry_does_not_wipe_the_first_ones_binding() -> None
         registry = await build_tool_registry(
             list(order), tool_env=ToolEnv(mcp_pool=await _pool_with_t1())
         )
-        assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}, order
+        assert registry.arg_bindings() == {_WIRE: ToolArgBindings(args={"project_code": "pc"})}, (
+            order
+        )
         schema = registry.get_required(_WIRE).spec.parameters
         assert "project_code" not in (schema.get("properties") or {}), order
         assert registry.unmatched_arg_bindings() == (), order
@@ -686,7 +701,9 @@ async def test_a_sibling_entrys_allow_tools_does_not_fake_an_unmatched_binding()
             list(order), tool_env=ToolEnv(mcp_pool=await _split_pool("t1", "t2"))
         )
         assert registry.unmatched_arg_bindings() == (), order
-        assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}, order
+        assert registry.arg_bindings() == {_WIRE: ToolArgBindings(args={"project_code": "pc"})}, (
+            order
+        )
         schema = registry.get_required(_WIRE).spec.parameters
         assert "project_code" not in (schema.get("properties") or {}), order
 
@@ -747,9 +764,10 @@ async def test_arg_bindings_is_a_copy(mcp_registry_factory) -> None:
         arg_bindings={"t1": {"project_code": "pc"}},
     )
     handed_out = registry.arg_bindings()
-    handed_out[_WIRE]["project_code"] = "TAMPERED"
-    handed_out["mcp__deepcare__injected"] = {"x": "y"}
-    assert registry.arg_bindings() == {_WIRE: {"project_code": "pc"}}
+    handed_out[_WIRE].args["project_code"] = "TAMPERED"
+    handed_out[_WIRE].fixed["detail_level"] = "TAMPERED"
+    handed_out["mcp__deepcare__injected"] = ToolArgBindings(args={"x": "y"})
+    assert registry.arg_bindings() == {_WIRE: ToolArgBindings(args={"project_code": "pc"})}
 
 
 async def test_a_human_modify_cannot_overwrite_a_platform_binding(graph_harness) -> None:
@@ -852,7 +870,9 @@ async def test_the_surviving_binding_of_a_collision_is_not_reported(
     assert registry.unmatched_arg_bindings() == ()
     from orchestrator.tools.mcp import mcp_tool_name
 
-    assert registry.arg_bindings()[mcp_tool_name(_SERVER, _LONG_B)] == {"project_code": "pc"}
+    assert registry.arg_bindings()[mcp_tool_name(_SERVER, _LONG_B)] == ToolArgBindings(
+        args={"project_code": "pc"}
+    )
 
 
 async def test_a_fully_drifted_binding_is_not_also_called_a_collision(
@@ -869,3 +889,146 @@ async def test_a_fully_drifted_binding_is_not_also_called_a_collision(
             server=_SERVER, tool="t1", params=("project_code",), reason="params_absent"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# B-127 —— 固定值:与变量绑定同一条剥 / 填路径,值来自 manifest 而不是本轮 inputs
+# ---------------------------------------------------------------------------
+
+_DETAIL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"keyword": {"type": "string"}, "detail_level": {"type": "string"}},
+    "required": ["keyword"],
+}
+
+
+async def test_the_model_never_sees_a_fixed_parameter(mcp_registry_factory) -> None:
+    registry, _ = await mcp_registry_factory(
+        tools=[{"name": "t1", "input_schema": _DETAIL_SCHEMA}],
+        fixed={"t1": {"detail_level": "brief"}},
+    )
+    schema = registry.get_required(_WIRE).spec.parameters
+    assert set(schema["properties"]) == {"keyword"}
+    assert registry.arg_bindings() == {_WIRE: ToolArgBindings(fixed={"detail_level": "brief"})}
+    assert registry.unmatched_arg_bindings() == ()
+
+
+async def test_the_fixed_value_reaches_the_server_over_the_models_value(graph_harness) -> None:
+    """模型不该知道这个参数,知道了也不算数;审计只记名字。"""
+    harness = await graph_harness(
+        bindings={},
+        fixed={_WIRE: {"detail_level": "brief"}},
+        prompt_inputs={},
+        tool_schema=_DETAIL_SCHEMA,
+    )
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "k", "detail_level": "full"})
+    assert harness.client.calls, "工具应当照跑"
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args == {"keyword": "k", "detail_level": "brief"}
+    row = harness.audit_rows[-1]
+    assert row.details["bound_args"] == ["detail_level"]
+
+
+async def test_the_approval_request_shows_the_fixed_value(graph_harness) -> None:
+    harness = await graph_harness(
+        approval_required_tools={_WIRE},
+        bindings={},
+        fixed={_WIRE: {"detail_level": "brief"}},
+        prompt_inputs={},
+        tool_schema=_DETAIL_SCHEMA,
+    )
+    update = await harness.run_turn_with_tool_call(_WIRE, {"keyword": "k"})
+    assert update["pending_approval"].proposed_args.get("detail_level") == "brief"
+
+
+async def test_a_fixed_param_the_server_does_not_declare_yet_is_reported_and_never_sent(
+    graph_harness,
+) -> None:
+    """上游还是旧版本、没有这个参数:与变量绑定落空同一处置 —— 报出来、不注入。
+
+    ``additionalProperties: false`` 的服务端会把多出来的键整个硬拒,本来能跑的调用
+    就跑不了了;所以落空的固定值一个字节都不能发出去。同一条只报一次(不能再被判
+    成撞名)。
+    """
+    harness = await graph_harness(
+        bindings={},
+        fixed={_WIRE: {"detail_level": "brief"}},
+        prompt_inputs={},
+        tool_schema={
+            "type": "object",
+            "properties": {"keyword": {"type": "string"}},
+            "required": ["keyword"],
+            "additionalProperties": False,
+        },
+    )
+    assert harness.registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(
+            server=_SERVER, tool="t1", params=("detail_level",), reason="params_absent"
+        ),
+    )
+    assert harness.registry.arg_bindings() == {}
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "k"})
+    assert harness.client.calls, "工具应当照跑 —— 落空的固定值不阻断 run"
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args == {"keyword": "k"}
+
+
+async def test_a_partly_absent_binding_keeps_the_part_that_landed(graph_harness) -> None:
+    """变量参数在、固定参数还没有:只摘掉没有的那个,变量绑定照常。"""
+    harness = await graph_harness(
+        bindings={_WIRE: {"project_code": "pc"}},
+        fixed={_WIRE: {"detail_level": "brief"}},
+        prompt_inputs={"pc": "PRJ001"},
+    )
+    assert harness.registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(
+            server=_SERVER, tool="t1", params=("detail_level",), reason="params_absent"
+        ),
+    )
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "k"})
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args == {"keyword": "k", "project_code": "PRJ001"}
+
+
+async def test_a_fixed_binding_on_a_missing_tool_is_reported_with_its_params() -> None:
+    pool = await _pool(**{_SERVER: [_tool_def("t1", _DETAIL_SCHEMA)]})
+    registry = await build_tool_registry(
+        [
+            MCPToolSpec(
+                servers=[_SERVER],
+                arg_bindings=[
+                    ArgBindingSpec(server=_SERVER, tool="t9", fixed={"detail_level": "brief"})
+                ],
+            )
+        ],
+        tool_env=ToolEnv(mcp_pool=pool),
+    )
+    assert registry.unmatched_arg_bindings() == (
+        UnmatchedArgBinding(
+            server=_SERVER, tool="t9", params=("detail_level",), reason="tool_missing"
+        ),
+    )
+
+
+async def test_a_delegated_child_gets_the_fixed_value_with_no_inputs_at_all(
+    graph_harness,
+) -> None:
+    """worker / 静态子 Agent 跑同一个 ``tools_node``,查的是**自己** registry 上的表;
+    固定值住在那张表里(worker 的 spec 是父 spec 的拷贝,``tools`` 连绑定原样带过去),
+    不靠 config 透传。子代 config 里一个 prompt input 都没有也照填。"""
+    parent_cfg: RunnableConfig = {
+        "configurable": {"tenant_id": str(uuid4()), "run_id": str(uuid4())}
+    }
+    child_cfg = _child_config(
+        _build_tool_context(parent_cfg), sub_thread_id=uuid4(), sub_run_id=uuid4()
+    )
+    assert PROMPT_INPUTS_KEY not in child_cfg["configurable"]
+    harness = await graph_harness(
+        bindings={},
+        fixed={_WIRE: {"detail_level": "brief"}},
+        prompt_inputs={},
+        tool_schema=_DETAIL_SCHEMA,
+    )
+    await harness.run_turn_with_tool_call(_WIRE, {"keyword": "k"}, config=child_cfg)
+    _, sent_args = harness.client.calls[-1]
+    assert sent_args["detail_level"] == "brief"

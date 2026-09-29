@@ -99,3 +99,24 @@ async def test_worker_build_skips_declared_ask_for_approval() -> None:
         [BuiltinToolSpec(name="ask_for_approval")], tool_env=await _env(worker=True)
     )
     assert "ask_for_approval" not in registry
+
+
+async def test_worker_build_keeps_a_fixed_value_on_a_read_tool() -> None:
+    """B-127 —— worker 的 registry 由父 spec 的拷贝建出,``tools`` 连同 ``fixed`` 原样
+    带过来;只读过滤只摘写工具,读工具上的固定值照样剥掉、照样登记。"""
+    from orchestrator.tools.arg_bindings import ToolArgBindings
+
+    tools = [
+        MCPToolSpec(
+            servers=["deepcare"],
+            arg_bindings=[
+                ArgBindingSpec(server="deepcare", tool="form_list", fixed={"text": "brief"})
+            ],
+        )
+    ]
+    registry = await build_tool_registry(tools, tool_env=await _env(worker=True))
+    assert registry.arg_bindings() == {
+        "mcp__deepcare__form_list": ToolArgBindings(fixed={"text": "brief"})
+    }
+    schema = registry.get_required("mcp__deepcare__form_list").spec.parameters
+    assert set(schema["properties"]) == {"employee_code"}

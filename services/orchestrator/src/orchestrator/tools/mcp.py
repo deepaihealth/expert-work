@@ -53,7 +53,11 @@ from expert_work.common.uplift_metrics import (
     record_mcp_call,
     record_mcp_circuit_state,
 )
-from orchestrator.tools.arg_bindings import strip_bound_params, unbindable_params
+from orchestrator.tools.arg_bindings import (
+    ToolArgBindings,
+    strip_bound_params,
+    unbindable_params,
+)
 from orchestrator.tools.registry import (
     ToolContext,
     ToolNotFoundError,
@@ -979,7 +983,7 @@ async def register_mcp_tools(
     content_char_cap: int = DEFAULT_MCP_CHAR_CAP,
     allow_tools: Collection[str] | None = None,
     deferred: bool = False,
-    arg_bindings: Mapping[str, Mapping[str, str]] | None = None,
+    arg_bindings: Mapping[str, ToolArgBindings] | None = None,
     read_only_only: bool = False,
 ) -> list[str]:
     """List tools from ``client`` and register each as :class:`MCPTool`.
@@ -995,9 +999,10 @@ async def register_mcp_tools(
     passes ``deferred=True`` (deer-flow's always-defer-MCP policy).
 
     ``arg_bindings`` (B-61 §5.2) maps this server's **bare** tool names to
-    ``{parameter: declared-variable}``. Each bound parameter is stripped from
-    the schema the model sees and recorded on the ``registry`` under the
-    **wire** name, so ``tools_node`` can fill it in from the run's inputs.
+    their :class:`ToolArgBindings` (variable-bound parameters plus B-127 fixed
+    values). Each bound parameter — either kind — is stripped from the schema
+    the model sees and recorded on the ``registry`` under the **wire** name, so
+    ``tools_node`` can fill it in (from the run's inputs / from the manifest).
     This is the one place that translation happens: the protocol stores raw
     ``server`` / ``tool`` names while the registry is keyed by
     :func:`mcp_tool_name`, and duplicating that folding rule is how the two
@@ -1013,7 +1018,9 @@ async def register_mcp_tools(
 
     * a bound parameter this tool's advertised schema does not have → dropped
       from the binding (so the platform never injects a parameter the server
-      would reject) plus an ``mcp.binding_param_absent`` warning;
+      would reject) plus an ``mcp.binding_param_absent`` warning. A fixed
+      value is treated exactly like a variable binding here (B-127): an
+      upstream that does not declare the parameter yet never receives it;
     * a binding naming a tool this server does not advertise → simply never
       lands. This function only records the bindings that DID land
       (``ToolRegistry.note_landed_arg_binding``); which ones fell through is
@@ -1031,7 +1038,7 @@ async def register_mcp_tools(
     # 单趟的剩余项不构成「这台服务器没有这个工具」的证据(评审 N-1:按剩余项
     # 判就是那条会对配置的人说假话的规则)。落空的判定统一在
     # ``build_tool_registry`` 里,等所有条目都注册完之后做一次。
-    pending_bindings = {tool: dict(bound) for tool, bound in (arg_bindings or {}).items()}
+    pending_bindings = {tool: bound.copy() for tool, bound in (arg_bindings or {}).items()}
     registered: list[str] = []
     dropped_write = dropped_unannotated = 0
     for tool_def in tools:
@@ -1043,12 +1050,12 @@ async def register_mcp_tools(
             else:
                 dropped_unannotated += 1
             continue
-        bound = pending_bindings.pop(tool_def.name, None) or {}
+        bound = pending_bindings.pop(tool_def.name, None) or ToolArgBindings()
         # B-65 —— 这条绑定有没有落在一个真实工具上,要在 ``absent`` 把参数删空之前定。
         binding_landed = bool(bound)
         dispatch_schema: Mapping[str, Any] | None = None
         if bound:
-            absent = unbindable_params(tool_def.input_schema, bound)
+            absent = unbindable_params(tool_def.input_schema, bound.params)
             if absent:
                 # 上游改了接口,绑定指向一个不存在的参数。不阻断 run:这个 agent
                 # 的其它工具照常可用,该条按未命中处理(spec §5.4)。工具名来自
@@ -1064,13 +1071,12 @@ async def register_mcp_tools(
                 registry.note_unmatched_arg_binding(
                     server_name, tool_def.name, tuple(absent), reason="params_absent"
                 )
-                for param in absent:
-                    del bound[param]
+                bound = bound.without(absent)
         if bound:
             # 剥之前的那份是服务端的合同,dispatch 前的校验要对着它。
             dispatch_schema = tool_def.input_schema
             tool_def = replace(
-                tool_def, input_schema=strip_bound_params(tool_def.input_schema, bound)
+                tool_def, input_schema=strip_bound_params(tool_def.input_schema, bound.params)
             )
         expert_work_tool = MCPTool(
             client=client,

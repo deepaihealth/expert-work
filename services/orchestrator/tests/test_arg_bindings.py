@@ -7,6 +7,7 @@ from typing import Any
 
 from expert_work.protocol import ArgBindingSpec, BuiltinToolSpec, MCPToolSpec
 from orchestrator.tools.arg_bindings import (
+    ToolArgBindings,
     apply_arg_bindings,
     bindings_by_tool,
     manifest_bindings,
@@ -28,7 +29,9 @@ def test_bindings_are_selected_by_server() -> None:
         ArgBindingSpec(server="deepcare", tool="t1", args={"project_code": "pc"}),
         ArgBindingSpec(server="other", tool="t1", args={"project_code": "pc"}),
     ]
-    assert bindings_by_tool(entries, server="deepcare") == {"t1": {"project_code": "pc"}}
+    assert bindings_by_tool(entries, server="deepcare") == {
+        "t1": ToolArgBindings(args={"project_code": "pc"})
+    }
 
 
 def test_stripping_removes_the_property_and_the_required_entry() -> None:
@@ -83,7 +86,7 @@ def test_apply_fills_the_bound_arg_from_this_runs_inputs() -> None:
     calls = [{"name": "mcp__deepcare__t1", "args": {"keyword": "王"}, "id": "c1"}]
     filled, names = apply_arg_bindings(
         calls,
-        bindings={"mcp__deepcare__t1": {"project_code": "pc"}},
+        bindings={"mcp__deepcare__t1": ToolArgBindings(args={"project_code": "pc"})},
         inputs={"pc": "PRJ001"},
     )
     assert filled[0]["args"] == {"keyword": "王", "project_code": "PRJ001"}
@@ -94,7 +97,9 @@ def test_apply_fills_the_bound_arg_from_this_runs_inputs() -> None:
 def test_a_missing_optional_variable_leaves_the_arg_unfilled() -> None:
     calls = [{"name": "mcp__deepcare__t1", "args": {}, "id": "c1"}]
     filled, names = apply_arg_bindings(
-        calls, bindings={"mcp__deepcare__t1": {"project_code": "pc"}}, inputs={}
+        calls,
+        bindings={"mcp__deepcare__t1": ToolArgBindings(args={"project_code": "pc"})},
+        inputs={},
     )
     assert filled[0]["args"] == {}
     assert names == []
@@ -104,7 +109,9 @@ def test_a_model_supplied_value_never_wins_over_the_binding() -> None:
     """schema 里已经没这个参数了,模型还是塞了一个 —— 平台的值覆盖它。"""
     calls = [{"name": "mcp__deepcare__t1", "args": {"project_code": "伪造"}, "id": "c1"}]
     filled, _ = apply_arg_bindings(
-        calls, bindings={"mcp__deepcare__t1": {"project_code": "pc"}}, inputs={"pc": "PRJ001"}
+        calls,
+        bindings={"mcp__deepcare__t1": ToolArgBindings(args={"project_code": "pc"})},
+        inputs={"pc": "PRJ001"},
     )
     assert filled[0]["args"]["project_code"] == "PRJ001"
 
@@ -133,7 +140,9 @@ def test_the_filled_call_shares_no_mutable_object_with_call_or_inputs() -> None:
     ]
     inputs: dict[str, Any] = {"pc": {"code": "PRJ001", "tags": ["a"]}}
     filled, _ = apply_arg_bindings(
-        calls, bindings={"mcp__deepcare__t1": {"project_code": "pc"}}, inputs=inputs
+        calls,
+        bindings={"mcp__deepcare__t1": ToolArgBindings(args={"project_code": "pc"})},
+        inputs=inputs,
     )
     assert filled[0]["args"]["filters"] is not calls[0]["args"]["filters"]
     assert filled[0]["args"]["project_code"] is not inputs["pc"]
@@ -158,14 +167,16 @@ def test_another_servers_binding_never_leaks_into_this_servers_map() -> None:
         ArgBindingSpec(server="deepcare", tool="t1", args={"project_code": "pc"}),
         ArgBindingSpec(server="other", tool="t2", args={"patient_id": "pid"}),
     ]
-    assert bindings_by_tool(entries, server="deepcare") == {"t1": {"project_code": "pc"}}
+    assert bindings_by_tool(entries, server="deepcare") == {
+        "t1": ToolArgBindings(args={"project_code": "pc"})
+    }
 
 
 def test_bindings_by_tool_hands_back_a_copy_not_the_spec_s_own_dict() -> None:
     """返回值被下游改了不能回头改到 spec —— spec 对象在 BuiltAgent 缓存里活很久。"""
     entries = [ArgBindingSpec(server="deepcare", tool="t1", args={"project_code": "pc"})]
     out = bindings_by_tool(entries, server="deepcare")
-    out["t1"]["project_code"] = "被改了"
+    out["t1"].args["project_code"] = "被改了"
     assert entries[0].args == {"project_code": "pc"}
 
 
@@ -221,7 +232,9 @@ def test_a_forged_value_is_dropped_when_the_variable_is_absent() -> None:
     """
     calls = [{"name": "mcp__deepcare__t1", "args": {"project_code": "伪造", "k": "1"}}]
     filled, names = apply_arg_bindings(
-        calls, bindings={"mcp__deepcare__t1": {"project_code": "pc"}}, inputs={}
+        calls,
+        bindings={"mcp__deepcare__t1": ToolArgBindings(args={"project_code": "pc"})},
+        inputs={},
     )
     assert filled[0]["args"] == {"k": "1"}
     assert names == []
@@ -260,3 +273,88 @@ def test_built_agent_defaults_to_no_bindings() -> None:
     factory = field.default_factory
     default = field.default if factory is dataclasses.MISSING else factory()
     assert default == ()
+
+
+# --------------------------------------------------------------------------
+# B-127 —— 固定值(``fixed``)
+# --------------------------------------------------------------------------
+
+
+def test_bindings_by_tool_carries_fixed_values_separately_from_variables() -> None:
+    entries = [
+        ArgBindingSpec(
+            server="deepcare",
+            tool="fetch_record",
+            args={"project_code": "pc"},
+            fixed={"detail_level": "brief"},
+        ),
+        ArgBindingSpec(server="deepcare", tool="t2", fixed={"mode": "fast"}),
+    ]
+    assert bindings_by_tool(entries, server="deepcare") == {
+        "fetch_record": ToolArgBindings(
+            args={"project_code": "pc"}, fixed={"detail_level": "brief"}
+        ),
+        "t2": ToolArgBindings(fixed={"mode": "fast"}),
+    }
+
+
+def test_bindings_by_tool_copies_the_fixed_map_too() -> None:
+    """``fixed`` 同样是 spec 身上的 dict,spec 活在 BuiltAgent 缓存里。"""
+    entries = [ArgBindingSpec(server="deepcare", tool="t1", fixed={"detail_level": "brief"})]
+    out = bindings_by_tool(entries, server="deepcare")
+    out["t1"].fixed["detail_level"] = "被改了"
+    assert entries[0].fixed == {"detail_level": "brief"}
+
+
+def test_params_lists_variable_bound_then_fixed_names() -> None:
+    bound = ToolArgBindings(args={"project_code": "pc"}, fixed={"detail_level": "brief"})
+    assert bound.params == ("project_code", "detail_level")
+    assert ToolArgBindings().params == ()
+    assert not ToolArgBindings()
+    assert ToolArgBindings(fixed={"detail_level": "brief"})
+
+
+def test_without_drops_names_from_both_sides_and_leaves_the_original() -> None:
+    bound = ToolArgBindings(args={"project_code": "pc"}, fixed={"detail_level": "brief"})
+    narrowed = bound.without(["detail_level"])
+    assert narrowed == ToolArgBindings(args={"project_code": "pc"})
+    assert bound.without(["project_code"]) == ToolArgBindings(fixed={"detail_level": "brief"})
+    assert bound == ToolArgBindings(args={"project_code": "pc"}, fixed={"detail_level": "brief"})
+
+
+def test_apply_injects_the_fixed_value_without_any_input() -> None:
+    calls = [{"name": "mcp__deepcare__t1", "args": {"keyword": "k"}, "id": "c1"}]
+    filled, names = apply_arg_bindings(
+        calls,
+        bindings={"mcp__deepcare__t1": ToolArgBindings(fixed={"detail_level": "brief"})},
+        inputs={},
+    )
+    assert filled[0]["args"] == {"keyword": "k", "detail_level": "brief"}
+    assert names == ["detail_level"]
+    assert calls[0]["args"] == {"keyword": "k"}, "原 tool_calls 不可变"
+
+
+def test_a_model_supplied_value_never_wins_over_a_fixed_value() -> None:
+    calls = [{"name": "mcp__deepcare__t1", "args": {"detail_level": "full"}, "id": "c1"}]
+    filled, names = apply_arg_bindings(
+        calls,
+        bindings={"mcp__deepcare__t1": ToolArgBindings(fixed={"detail_level": "brief"})},
+        inputs={"detail_level": "full"},  # 同名输入也不算数:固定值不读 inputs
+    )
+    assert filled[0]["args"] == {"detail_level": "brief"}
+    assert names == ["detail_level"]
+
+
+def test_apply_fills_variables_and_fixed_values_together() -> None:
+    calls = [{"name": "mcp__deepcare__t1", "args": {}, "id": "c1"}]
+    filled, names = apply_arg_bindings(
+        calls,
+        bindings={
+            "mcp__deepcare__t1": ToolArgBindings(
+                args={"project_code": "pc"}, fixed={"detail_level": "brief"}
+            )
+        },
+        inputs={"pc": "PRJ001"},
+    )
+    assert filled[0]["args"] == {"project_code": "PRJ001", "detail_level": "brief"}
+    assert names == ["project_code", "detail_level"]

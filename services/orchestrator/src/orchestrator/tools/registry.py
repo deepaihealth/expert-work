@@ -19,7 +19,7 @@ import copy
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from expert_work.protocol import Plan
@@ -27,6 +27,9 @@ from expert_work.runtime.cancellation import CancellationToken
 from orchestrator.tools._budget import DelegationGate, WorkerSpawnBudget
 from orchestrator.tools._guards import TokenBudget
 from orchestrator.tools.ranking import build_document, rank_tools
+
+if TYPE_CHECKING:
+    from orchestrator.tools.arg_bindings import ToolArgBindings
 
 #: Stream TE-1 — a tool's effect on the world. Descriptive metadata only in
 #: TE-1; intended to drive the side-effect-aware scheduler / approval gate
@@ -494,10 +497,10 @@ class ToolRegistry:
         #: invalidated on every register (cheap: rebuilt on next search).
         self._ranking_corpus: list[tuple[str, list[str]]] | None = None
         #: B-61 §5.3 — 平台接管的 MCP 工具参数:wire 名(``mcp__<server>__<tool>``)
-        #: → ``{参数名: 声明变量名}``。``tools_node`` 按 tool_call 里出现的那个名
-        #: 直接查这张表,所以键必须是折叠后的 wire 名(折叠规则只有
-        #: ``register_mcp_tools`` 那一处知道)。
-        self._arg_bindings: dict[str, dict[str, str]] = {}
+        #: → :class:`ToolArgBindings`(变量绑定 + B-127 固定值)。
+        #: ``tools_node`` 按 tool_call 里出现的那个名直接查这张表,所以键必须是
+        #: 折叠后的 wire 名(折叠规则只有 ``register_mcp_tools`` 那一处知道)。
+        self._arg_bindings: dict[str, ToolArgBindings] = {}
         #: B-61 §5.4 — 落空的绑定。两个消费者:随 ``BuiltAgent`` 走到保存时的
         #: 试建(当场告诉配置的人),以及 ``tools_node`` 的运行期兜底告警 ——
         #: 保存之后对方才下线 / 改名的那条路上,运行期是唯一还能说话的地方。
@@ -582,26 +585,26 @@ class ToolRegistry:
             for name, tool in self._tools.items()
         )
 
-    def bind_tool_args(self, name: str, bound: Mapping[str, str]) -> None:
-        """B-61 — 记下 ``name`` 这个工具被平台接管的参数(参数名 → 声明变量名)。
+    def bind_tool_args(self, name: str, bound: ToolArgBindings) -> None:
+        """B-61 — 记下 ``name`` 这个工具被平台接管的参数(变量绑定 + B-127 固定值)。
 
         ``bound`` 为空表示「这个名字没有绑定」,连带**清掉**之前可能存在的那条:
         ``register`` 按名字覆盖注册,wire 名又会被截断到 64 字符,两台服务器的
         工具折叠成同一个名是可能的。留着旧表项就会让后来者顶着前者的绑定跑。
         """
         if bound:
-            self._arg_bindings[name] = dict(bound)
+            self._arg_bindings[name] = bound.copy()
         else:
             self._arg_bindings.pop(name, None)
 
-    def arg_bindings(self) -> dict[str, dict[str, str]]:
+    def arg_bindings(self) -> dict[str, ToolArgBindings]:
         """B-61 §5.3 — ``tools_node`` 填值时查的那张表,每次一份新的拷贝。
 
         与 :meth:`catalog` 同一口径。交出活字典等于把「下游只读」写成一条靠
         约定成立的不变式,而这张表活在 ``BuiltAgent`` 缓存里 —— 谁就地改一下,
         之后每一个 run 拿到的都是被污染的绑定。
         """
-        return {name: dict(bound) for name, bound in self._arg_bindings.items()}
+        return {name: bound.copy() for name, bound in self._arg_bindings.items()}
 
     def note_unmatched_arg_binding(
         self, server: str, tool: str, params: tuple[str, ...], *, reason: UnmatchedReason
