@@ -32,9 +32,9 @@ open http://localhost:9001   # log in with the dev credentials below;
                               # click "Create Bucket" → expert-work-dev
 
 # Path 2 — mc CLI
-docker run --rm --network infra_default \
-    minio/mc:RELEASE.2025-08-13T08-35-41Z \
-    sh -c "mc alias set local http://minio:9000 expert_work expert_work_dev_minio \
+docker run --rm --network infra_default --entrypoint sh \
+    ghcr.io/deepaihealth/mirror/minio-client:latest-dev \
+    -c "mc alias set local http://minio:9000 expert_work expert_work_dev_minio \
            && mc mb --ignore-existing local/expert-work-dev"
 ```
 
@@ -170,8 +170,8 @@ docker compose up -d --force-recreate minio
 # 3. Mark a bucket SSE-KMS-default (one-off via mc).
 docker run --rm --network infra_default \
     -e MC_HOST_local="http://${EXPERT_WORK_MINIO_ROOT_USER:-expert_work}:${EXPERT_WORK_MINIO_ROOT_PASSWORD:-expert_work_dev_minio}@minio:9000" \
-    minio/mc:RELEASE.2025-08-13T08-35-41Z \
-    mc encrypt set sse-kms expert-work-master local/expert-work-dev
+    ghcr.io/deepaihealth/mirror/minio-client:latest-dev \
+    encrypt set sse-kms expert-work-master local/expert-work-dev
 
 # 4. Verify: write an object + inspect the on-disk file inside the
 #    container. Object body should be ciphertext.

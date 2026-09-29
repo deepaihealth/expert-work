@@ -308,8 +308,13 @@ services:
     # MinIO S3-compatible object storage (Stream A.5 / ADR-0004).
     # Local dev stand-in for Aliyun OSS — same protocol, zero code changes
     # between environments.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # MinIO stopped publishing images (Docker Hub / quay deleted 2026-09-11); this is
+    # Chainguard's source build, mirrored by .github/workflows/mirror-images.yml.
+    image: ghcr.io/deepaihealth/mirror/minio:latest-dev
     container_name: expert-work-minio
+    # Chainguard runs as uid 65532; the old image ran as root, so existing
+    # ``minio-data`` volumes are root-owned. Keep root for this dev stand-in.
+    user: "0:0"
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: ${EXPERT_WORK_MINIO_ROOT_USER:-expert_work}
@@ -327,7 +332,7 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/minio/health/live >/dev/null || exit 1"]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -414,7 +419,7 @@ services:
     # One-shot: ensure the ``expert-work`` bucket exists (skill-asset-store +
     # J.6 image uploads land here when the s3-compatible backend is enabled).
     profiles: ["full"]
-    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
+    image: ghcr.io/deepaihealth/mirror/minio-client:latest-dev
     container_name: expert-work-minio-init
     depends_on:
       minio:
@@ -810,7 +815,7 @@ services:
   langfuse-minio-init:
     profiles: ["observability"]
     # One-shot: ensure the ``langfuse`` bucket exists in the shared MinIO.
-    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
+    image: ghcr.io/deepaihealth/mirror/minio-client:latest-dev
     container_name: expert-work-langfuse-minio-init
     depends_on:
       minio:
