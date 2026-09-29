@@ -69,6 +69,7 @@ from expert_work.runtime.tokens import TokenEstimator
 from orchestrator.context.compressor import estimate_tokens
 from orchestrator.context.skill_reference import skill_view_reference
 from orchestrator.tools.overflow import (
+    OVERFLOW_DIR,
     OVERFLOW_FOOTER_TAG_OPEN,
     TOOL_RESULT_PATH_ARTIFACT_KEY,
     render_overflow_footer,
@@ -123,7 +124,13 @@ def _artifact_path(message: ToolMessage) -> str | None:
 #: by the builder), so this is the ONE structured field either function ever
 #: extracts from it. Never the raw text between the tags, which could
 #: otherwise smuggle arbitrary content past the spotlight fence.
-_FOOTER_SAVED_TO_RE = re.compile(r"saved to (\S+) in your workspace")
+#: Only the shape ``overflow_rel_path`` can produce is accepted (fixed
+#: directory, safe-charset components), so a forged block cannot pass free
+#: text off as a "path".
+_FOOTER_SAVED_TO_RE = re.compile(
+    rf"saved to ({re.escape(OVERFLOW_DIR)}/[A-Za-z0-9_.-]{{1,80}}/[A-Za-z0-9_.-]{{1,200}}) "
+    r"in your workspace"
+)
 
 #: Recovers the true pre-truncation size out of a footer-shaped block's own
 #: wording — the other field a freshly rendered template may fill in (see
@@ -143,7 +150,9 @@ def _footer_claimed_path(content: str) -> str | None:
     if footer_at == -1:
         return None
     match = _FOOTER_SAVED_TO_RE.search(content[footer_at:])
-    return match.group(1) if match else None
+    if match is None or ".." in match.group(1):
+        return None
+    return match.group(1)
 
 
 def _footer_total_chars(content: str) -> int | None:
