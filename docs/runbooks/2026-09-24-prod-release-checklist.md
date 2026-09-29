@@ -191,7 +191,7 @@
 > 测试环境验收：
 >
 > - **B-126**（`78abe0f3`）：Tempo 上第 2 轮起每次调用收起 2~3 条旧结果、每次省 1.1~1.4 万 token，轮首上下文少约 2 万 token；同一轮内前缀逐字不变。
-> - **B-127**：ai-health-plan 在测试环境用「固定值」把 `form_get_field_detail` 的 `detail_level` 定为 `brief`（测试配置 sha `2b536d40`），真跑中该工具单次结果从平均 4,440 字降到 538 字（加上对方的 options 列后 783 字）。
+> - **B-127**：ai-health-plan 在测试环境用「固定值」把 `form_get_field_detail` 的 `detail_level` 定为 `brief`（当时测试配置 sha `2b536d40`；之后又删 8 个零调用工具，rev39 终版为 `28eb1ba5`，见 §0.2），真跑中该工具单次结果从平均 4,440 字降到 538 字（加上对方的 options 列后 783 字）。
 > - **B-128 + 整体**（`f29ac13b`）：同一段 ai-health-plan 真实 7 轮对话重放，成本 ¥12.64（基线）→ ¥8.01（B-126 + 精简模式）→ **¥6.63**（再加 B-128，7/7 success）；第 3~7 轮首次调用未命中缓存的 token 从每轮 3.4~6 万降到 1.3~2.4 千。smoke + 金丝雀 PASS（金丝雀首跑即 PASS，真 run + 产物下载）。
 > - **admin-ui**（`f29ac13b-test`）：B-127 固定值配置页在测试环境发过，见 §6 前的记录。
 >
@@ -306,8 +306,14 @@
 
 - **内容**：平台技能 `health-plan-report`（把定稿的健康方案渲染成可编辑 PPT + A4 PDF，纯 Python，在沙箱里跑）
   + ai-health-plan 配置 **rev39**（技能绑定 `pptx` / `pdf` / `docx` / `health-plan-report`，出交付件改用本技能；
-  另含两处 09-29 追加：① MCP 工具 `form_get_field_detail` 的参数 `detail_level` 用 B-127「固定值」定为 `brief`；
-  ② 提示词第 2 行的改写。测试环境 rev39 配置 sha `2b536d40`）。
+  另含三处 09-29 追加：① MCP 工具 `form_get_field_detail` 的参数 `detail_level` 用 B-127「固定值」定为 `brief`；
+  ② 提示词第 2 行的改写；③ **删掉 8 个近 30 天零调用的工具**（测试环境 116 段会话 / 2134 次模型调用统计）：
+  内置 `web_search` / `list_artifacts` / `remember` / `note_behavior_patch` / `clarify_tool_usage`、`http` 工具、
+  MCP `customer_search_by_cpwx_tags` / `customer_list_cpwx_tags`（连同这两个工具上的 `project_code` / `employee_code` 绑定）。
+  测试环境 rev39 配置 sha **`28eb1ba5`**（① ② 时为 `2b536d40`，再做 ③ 得到）。
+  ③ 的依据与验收：`remember` 等三个自我进化工具全平台从没被用起来（草稿无人启用），`remember` 对本 Agent 还有串客户风险
+  （记忆按员工存、不按客户）；删后工具说明 10,072 → 8,744 token（o200k 计，−13%），首次调用输入实测 −1,252 token；
+  同一 7 轮对话重放 7/7 success、被删工具零调用。`list_artifacts` 是平台基础能力，删了仍会自动带上（构建出 24 个工具，不是 23 个），属预期。）。
   代码 #1686–#1689 已合 main（`523a1050`）；ROADMAP B-125。
 - **不动镜像、不动钉子**：`platform-skills/` 不进任何镜像，技能由 Step A3 用导入脚本上线；提示词由 Step A4 改 Agent 配置。
 - **依赖**：① Step B 的 `ab4097cf`（`EXPERT_WORK_SKILLS_DIR`，B-84；「固定值」要 B-127）；② Step A 的沙箱镜像 `7ac31957`（python-pptx /
@@ -890,10 +896,12 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
       结果记入 §6。**完全一致** → 直接发 rev39；**有差异** → 把差异拿给用户，合并成生产版 rev39 后再发，不要直接覆盖
 - [ ] 保存生产当前配置的备份（控制台导出或 API 取 manifest），作为回滚点
 - [ ] 按 rev39 更新：提示词正文（含第 2 行改写）+ 技能绑定 `pptx` / `pdf` / `docx` / `health-plan-report` + MCP 工具 `form_get_field_detail` 参数 `detail_level` 选「固定值」填 `brief`；**保存后必须「发布」草稿**（保存 ≠ 上线）
+- [ ] 同一次保存里删掉 8 个工具（生产配置里有哪个删哪个，没有的跳过）：内置 `web_search` / `list_artifacts` / `remember` / `note_behavior_patch` / `clarify_tool_usage`、`http` 工具、MCP 允许列表里的 `customer_search_by_cpwx_tags` / `customer_list_cpwx_tags`；**这两个 MCP 工具上的参数绑定要一起删**，否则配置引用了不在允许列表里的工具
 - [ ] 保存时若提示 `detail_level` **绑定落空**（上游 schema 里没有这个参数）：**预期内，照常发布** —— 对方生产 MCP 还没上 brief 版本时就是这样，平台不注入、行为与不配相同；对方上线后下一次构建起自动生效（主 Agent 构建缓存最长 1800s）。记入 §6
 - [ ] 核对线上版本号已递增、技能绑定为上面四个、`form_get_field_detail` 的 `detail_level` 是固定值 `brief`
+- [ ] 控制台 Agent 的「工具」清单里没有上面除 `list_artifacts` 外的 7 个（`list_artifacts` 是平台基础能力，会自动带上，属预期）
 
-**回滚**：用备份把提示词、技能绑定与工具参数恢复成发布前的版本并发布。**回滚镜像（§4）之前必须先做这一步** —— 旧镜像读不了带 `fixed` 的配置。
+**回滚**：用备份把提示词、技能绑定、工具清单与工具参数恢复成发布前的版本并发布。**回滚镜像（§4）之前必须先做这一步** —— 旧镜像读不了带 `fixed` 的配置。
 
 ### Step D — 真栈验证（本版新功能，按需做，全部只用金丝雀）
 
@@ -1011,7 +1019,7 @@ tools/deploy/rollback.sh prod 5775fbf3
 | Step B smoke / 金丝雀 | `________` |
 | Step A2 office 技能导入（B、C 之后） | go/no-go(docx/pptx/xlsx/pdf)**全部 GO**（09-27 测试环境验收，见下）；导入前 latest_version `________` → 导入后 `________`；失效 published(N=`__`) / skipped → restart 或等 1800s `________` |
 | Step A3 health-plan-report 导入 + 启用 | dry-run `created`/hash `________`；导入 `201` + published(N=`__`)；控制台启用 `____` |
-| Step A4 ai-health-plan rev39 | 生产 vs 测试 rev38 比对 `一致 / 有差异（已合并）`；备份位置 `________`；发布后版本号 `____`、技能绑定 `____` |
+| Step A4 ai-health-plan rev39 | 生产 vs 测试 rev38 比对 `一致 / 有差异（已合并）`；备份位置 `________`；发布后版本号 `____`、技能绑定 `____`；删掉的工具 `________`（生产原本没有而跳过的 `____`）；工具清单总数 `____` |
 | B-125 发后验证 | 用户指定的测试客户跑一轮出方案：PPTX `____` / PDF `____`（`ok:true`、打开正常） |
 | migrate Job | 期望跑四条（`0156` ~ `0159`），实况 `________` |
 | CronJob 创建 | `________` |
