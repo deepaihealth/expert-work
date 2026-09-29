@@ -12,6 +12,9 @@ losing the conversation's salient points. See
 """
 
 from orchestrator.context.compressor import (
+    CachedSummary as CachedSummary,
+)
+from orchestrator.context.compressor import (
     CompactionStats as CompactionStats,
 )
 from orchestrator.context.compressor import (
@@ -91,6 +94,7 @@ from orchestrator.context.workspace_projection import (
 )
 
 __all__ = [
+    "CachedSummary",
     "CompactionStats",
     "ContextCompressor",
     "ContextOverflowError",

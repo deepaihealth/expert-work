@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI
 from orchestrator.context import (
+    CachedSummary,
     CompactionStats,
     ContextCompressor,
     ContextOverflowError,
@@ -878,3 +879,63 @@ def test_b126_compressor_threshold_capped() -> None:
         ContextCompressor(llm_caller=_never, context_window=1_000_000).threshold_tokens == 200_000
     )
     assert ContextCompressor(llm_caller=_never, context_window=100_000).threshold_tokens == 70_000
+
+
+# ---------------------------------------------------------------------------
+# B-126 Task 5 — cached summary written back to the checkpoint, reused
+# ---------------------------------------------------------------------------
+
+
+def _conv(n: int, pad: int = 400) -> list[BaseMessage]:
+    out: list[BaseMessage] = []
+    for i in range(n):
+        out.append(HumanMessage(content=f"u{i} " + "z" * pad, id=f"h{i}"))
+        out.append(AIMessage(content=f"a{i} " + "z" * pad, id=f"a{i}"))
+    return out
+
+
+@dataclass
+class _CountingLLM:
+    calls: int = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del messages, tools
+        self.calls += 1
+        return AIMessage(content="SUMMARY")
+
+
+async def test_summary_is_reported_with_through_id() -> None:
+    llm = _CountingLLM()
+    got: list[CachedSummary] = []
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=2
+    )
+    await c.compress(_conv(10), on_summary=got.append)
+    assert llm.calls == 1
+    assert got and got[-1].through_id and "SUMMARY" in got[-1].text
+
+
+async def test_cached_summary_reused_without_llm_call() -> None:
+    llm = _CountingLLM()
+    got: list[CachedSummary] = []
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=2
+    )
+    msgs = _conv(10)
+    await c.compress(msgs, on_summary=got.append)
+    llm.calls = 0
+    await c.compress(msgs, cached_summary=got[-1])
+    assert llm.calls == 0
+
+
+async def test_stale_cached_summary_is_ignored() -> None:
+    llm = _CountingLLM()
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=2
+    )
+    stale = CachedSummary(through_id="not-in-view", text="<context-summary>OLD</context-summary>")
+    out = await c.compress(_conv(10), cached_summary=stale)
+    assert llm.calls == 1
+    assert "OLD" not in "\n".join(str(m.content) for m in out)
