@@ -1,5 +1,5 @@
 """PPT layout engine in points: measure primitives, split the splittable ones, paginate
-sections onto 16:9 slides (merge short sections, continue long ones with「（续）」)."""  # noqa: RUF002
+sections onto 16:9 slides (merge short sections, continue long ones under the same title)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from hpr.icons import icon_for_section
+from hpr.images import IMAGE_ERRORS, strict_images
 from hpr.measure import LINE, Measurer
 from hpr.prims import (
     Bullets,
@@ -327,9 +328,9 @@ def image_size(img: Image, w: float, ctx: Ctx) -> tuple[float, float]:
     path = Path(img.path)
     path = path if path.is_absolute() else ctx.base_dir / path
     try:
-        with PILImage.open(path) as im:
+        with strict_images(), PILImage.open(path) as im:
             iw, ih = im.size
-    except (OSError, ValueError) as exc:
+    except IMAGE_ERRORS as exc:
         raise LayoutError(img.path, f"找不到图片文件或无法读取：{exc}") from exc  # noqa: RUF001
     box_w = min(w, 520.0)
     h = min(IMAGE_MAX_H, box_w * ih / iw)
@@ -500,7 +501,7 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
 
     def new_page(sec: dict, continued: bool) -> Page:
         pg = Page(
-            sec["title"] + ("（续）" if continued else ""),  # noqa: RUF001
+            sec["title"],
             icon_for_section(sec),
             sec["id"],
             continued,
@@ -511,6 +512,22 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
     def min_head(prim: Prim) -> float:
         full = measure(prim, BODY_W, ctx)
         return min(full, 2 * lh(t.body) + 2 * t.gap_m) if splittable(prim) else full
+
+    def captioned(i: int, items: list[tuple[Prim, str]]) -> bool:
+        """items[i] is a chart followed by its own caption paragraph (same block)."""
+        return (
+            isinstance(items[i][0], Chart)
+            and i + 1 < len(items)
+            and isinstance(items[i + 1][0], Paragraph)
+            and items[i + 1][1] == items[i][1]
+        )
+
+    def lead_need(i: int, items: list[tuple[Prim, str]]) -> float:
+        """Minimum room item i needs at the bottom of a page, including a caption it keeps."""
+        need = min_head(items[i][0])
+        if captioned(i, items):
+            need += t.gap_l + min_head(items[i + 1][0])
+        return need
 
     def head_fits(prim: Prim, room: float) -> bool:
         if min_head(prim) > room:
@@ -552,9 +569,9 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
                 h = measure(pending, BODY_W, ctx)
                 need = h
                 if isinstance(pending, SubHeading) and idx + 1 < len(items):
-                    need = (
-                        h + t.gap_l + min_head(items[idx + 1][0])
-                    )  # keep heading with what follows
+                    need = h + t.gap_l + lead_need(idx + 1, items)  # keep heading with what follows
+                elif pending is prim and captioned(idx, items):
+                    need = h + t.gap_l + min_head(items[idx + 1][0])  # keep chart with caption
                 at_top = y <= BODY_TOP + 0.01
                 if y + need <= bottom or (at_top and h <= avail_total):
                     cur.placed.append(Placed(pending, MARGIN_X, y, BODY_W, h, path))

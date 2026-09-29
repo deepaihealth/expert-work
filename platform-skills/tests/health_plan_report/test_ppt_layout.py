@@ -73,7 +73,7 @@ def test_long_table_continues_with_header_repeated():
     tbl = Table(("日期", "内容"), tuple((f"第 {i} 天", "记录空腹血糖与体重") for i in range(60)))
     pages = paginate([_one([tbl])], ctx)
     assert len(pages) >= 3
-    assert pages[1].continued and pages[1].title == "章节（续）"  # noqa: RUF001
+    assert pages[1].continued and pages[1].title == "章节"
     pieces = [pl.prim for pg in pages for pl in pg.placed]
     assert all(isinstance(p, Table) and p.columns == ("日期", "内容") for p in pieces)
     assert sum(len(p.rows) for p in pieces) == 60
@@ -158,7 +158,7 @@ def test_next_section_follows_small_continuation_remainder():
     a = _one([Paragraph(_lines_text(per + 2))], "a", "第一节")
     b = _one([Paragraph("健康管理建议。" * 165)], "b", "第二节")
     pages = paginate([a, b], ctx)
-    assert pages[1].title == "第一节（续）"  # noqa: RUF001
+    assert pages[1].continued and pages[1].title == "第一节"
     assert SubHeading("第二节") in [pl.prim for pl in pages[1].placed]
     assert not any(pg.section_id == "b" and not pg.continued for pg in pages)
     assert _within_body(pages, ctx)
@@ -201,3 +201,30 @@ def test_table_highlight_column_measured_bold():
     plain = table_geometry(Table(("日期", "阈值"), rows), BODY_W, ctx)
     hl = table_geometry(Table(("日期", "阈值"), rows, highlight_col=1), BODY_W, ctx)
     assert hl.col_w[1] > plain.col_w[1]
+
+
+def test_chart_keeps_its_caption_on_the_same_page():
+    ctx = _ctx()
+    t = ctx.theme
+    chart = Chart("line", ("a", "b"), (1.0, 2.0), low=0.5, high=1.5)
+    caption = Paragraph("虚线为本阶段目标区间。")
+    ch = measure(chart, BODY_W, ctx)
+    room = ctx.body_bottom - BODY_TOP
+    # filler leaves room for the chart but not for chart + gap + caption
+    n = next(
+        n
+        for n in range(1, 60)
+        if ch
+        <= room - measure(Paragraph(_lines_text(n)), BODY_W, ctx) - t.gap_l
+        < ch + t.gap_l + measure(caption, BODY_W, ctx)
+    )
+    sec = {"id": "s", "title": "章节", "blocks": []}
+    items = [
+        (Paragraph(_lines_text(n)), "sections[0].blocks[0]"),
+        (chart, "sections[0].blocks[1]"),
+        (caption, "sections[0].blocks[1]"),
+    ]
+    pages = paginate([(sec, items)], ctx)
+    where = {id(pl.prim): i for i, pg in enumerate(pages) for pl in pg.placed}
+    assert where[id(chart)] == where[id(caption)] == 1
+    assert _within_body(pages, ctx)

@@ -15,10 +15,12 @@ from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Pt
 
-from hpr.blocks import section_prims
+from hpr.blocks import RenderError, section_prims
 from hpr.icons import ICONS
+from hpr.images import IMAGE_ERRORS, image_blocks, strict_images
+from hpr.logo import trimmed_logo
 from hpr.measure import LINE, Measurer
-from hpr.ppt_charts import add_chart, donut_colors
+from hpr.ppt_charts import add_chart
 from hpr.ppt_layout import (
     BODY_TOP,
     BODY_W,
@@ -69,7 +71,7 @@ from hpr.prims import (
     Timeline,
 )
 from hpr.style import mix
-from hpr.theme import WHITE, Theme, build_theme, on_color
+from hpr.theme import WHITE, Theme, build_theme, donut_colors, on_color
 
 BODY, CHROME, DECO = "hpr:body", "hpr:chrome", "hpr:deco"
 NO_GRID_STYLE = "{2D5ABB26-0587-4C30-8999-92F81FD0307C}"
@@ -296,7 +298,7 @@ def _check_titles(content: dict, ctx: Ctx, style: dict) -> None:
     t, m = ctx.theme, ctx.m
     title_w = SLIDE_W - 2 * MARGIN_X - 100 - (40 if style["section.icons"] else 0)
     for si, sec in enumerate(content["sections"]):
-        if m.lines(sec["title"] + "（续）", title_w, t.title, True) > 1:  # noqa: RUF001
+        if m.lines(sec["title"], title_w, t.title, True) > 1:
             raise LayoutError(f"sections[{si}].title", "章节标题过长，页标题只能一行，请缩短")  # noqa: RUF001
 
 
@@ -319,23 +321,12 @@ BRAND_BAND_H = 76.0  # vertical room kept free for a bottom-anchored logo (with 
 def _load_logo(path: Path) -> tuple[io.BytesIO, float, float] | None:
     """LOGO trimmed to its visible (alpha) bounding box, as an in-memory PNG plus its drawn size
     in pt; None when unreadable. The input file is never modified or copied on disk."""
-    from PIL import Image as PILImage
-
-    try:
-        with PILImage.open(path) as im:
-            im.load()
-            rgba = im.convert("RGBA")
-    except (OSError, ValueError):
+    logo = trimmed_logo(path)
+    if logo is None:
         return None
-    bbox = rgba.getchannel("A").getbbox()
-    if bbox is not None:
-        rgba = rgba.crop(bbox)
-    buf = io.BytesIO()
-    rgba.save(buf, format="PNG")
-    buf.seek(0)
-    iw, ih = rgba.size
+    data, iw, ih = logo
     k = min(LOGO_MAX_W / iw, LOGO_MAX_H / ih)
-    return buf, iw * k, ih * k
+    return io.BytesIO(data), iw * k, ih * k
 
 
 def _anchor(
@@ -972,7 +963,11 @@ def _draw_image(cv: Canvas, pl: Placed, im: Image, ctx: Ctx) -> None:
     w, h = image_size(im, pl.w, ctx)
     path = Path(im.path)
     path = path if path.is_absolute() else ctx.base_dir / path
-    cv.picture(path, pl.x, pl.y, w, h, "hpr:image")
+    try:
+        with strict_images():
+            cv.picture(path, pl.x, pl.y, w, h, "hpr:image")
+    except IMAGE_ERRORS as exc:
+        raise RenderError(pl.path, f"图片无法读取（文件损坏或格式不支持）：{exc}") from exc  # noqa: RUF001
     if im.caption:
         ch = m.lines(im.caption, pl.w, t.caption) * lh(t.caption)
         cv.text(pl.x, pl.y + h + t.gap_xs, pl.w, ch, im.caption, t.caption, t.muted)
@@ -1082,6 +1077,7 @@ def render_pptx(
     theme = build_theme(style, "pptx")
     ctx = make_ctx(content, theme, m, base_dir)
     _check_titles(content, ctx, style)
+    image_blocks(content, style, base_dir)  # every image decodes, or its block path is reported
     pages = paginate(section_prims(content, style), ctx)
     warnings: list[str] = []
     prs = Presentation()

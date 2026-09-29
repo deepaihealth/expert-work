@@ -60,6 +60,18 @@ def on_color(bg: str) -> str:
     return WHITE if contrast(WHITE, bg) >= contrast(INK, bg) else INK
 
 
+def donut_colors(t: Theme) -> list[str]:
+    """Slice colours for nutrition donuts, shared by the PPT and PDF writers."""
+    return [
+        t.primary,
+        t.accent,
+        t.primary_soft,
+        mix(t.primary, t.background, 0.75),
+        t.muted,
+        t.within,
+    ]
+
+
 def build_theme(style: dict[str, Any], fmt: Literal["pptx", "pdf"]) -> Theme:
     primary = style["color.primary"]
     bg = style["color.background"]

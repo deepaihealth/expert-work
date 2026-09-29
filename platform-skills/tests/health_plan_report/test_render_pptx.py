@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from hpr.blocks import RenderError
 from hpr.content import required_texts
 from hpr.measure import Measurer
 from hpr.ppt_draw import BODY, Canvas, render_pptx
@@ -250,28 +251,6 @@ def test_basename_with_slash_rejected(workdir):
     assert res.returncode == 1
 
 
-def test_pdf_not_yet_available_message(workdir):
-    # T7 实现 PDF 后删除本测试（T7 Step 1 会替换它）  # noqa: RUF003
-    res = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            str(RENDER),
-            "--content",
-            str(workdir / "plan.json"),
-            "--format",
-            "pdf",
-            "--out-dir",
-            str(workdir / "o"),
-            "--basename",
-            "x",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert res.returncode == 1
-
-
 def test_period_label_is_drawn_even_when_subtitle_omits_it(workdir, sample):
     sample["subtitle"] = "控糖与体重管理"
     out, style, _ = _render(sample, workdir)
@@ -439,3 +418,46 @@ def test_end_slide_long_signature_gets_its_measured_height(workdir, sample):
     ]
     assert sig.height / 12700 > 16 * 1.35 * 1.5
     assert pptx_overflow(out, M) == []
+
+
+def test_partial_failure_removes_this_runs_outputs_so_rerun_works(workdir, monkeypatch, capsys):
+    mod = _load_render()
+
+    def broken_pdf(content, style, out_path, base_dir):
+        out_path.write_bytes(b"%PDF-partial")
+        raise LayoutError("brand.disclaimer", "页脚过长")
+
+    monkeypatch.setattr(mod, "render_pdf", broken_pdf)
+    out = workdir / "out"
+    args = ["--content", str(workdir / "plan.json"), "--out-dir", str(out), "--basename", "q"]
+    code = mod.main([*args, "--format", "both"])
+    summary = json.loads(capsys.readouterr().out)
+    assert code == 1 and "页脚过长" in summary["errors"][0]
+    assert sorted(p.name for p in out.iterdir()) == []
+    assert mod.main([*args, "--format", "pptx"]) == 0
+    assert (out / "q.pptx").is_file()
+
+
+def test_dangling_symlink_at_a_target_path_is_refused(workdir, capsys):
+    mod = _load_render()
+    out = workdir / "out"
+    out.mkdir()
+    (out / "q.pptx").symlink_to(workdir / "elsewhere.pptx")
+    args = ["--content", str(workdir / "plan.json"), "--out-dir", str(out), "--basename", "q"]
+    assert mod.main(args) == 1
+    assert "已存在" in json.loads(capsys.readouterr().out)["errors"][0]
+    assert (out / "q.pptx").is_symlink() and not (workdir / "elsewhere.pptx").exists()
+
+
+@pytest.mark.parametrize("kind", ["bomb-error", "bomb-warning"])
+def test_decompression_bomb_image_is_a_block_error_in_pptx(
+    workdir, sample, kind, huge_png, monkeypatch
+):
+    if kind == "bomb-error":  # header declares 20000x20000; nothing is allocated
+        (workdir / "trend-note.png").write_bytes(huge_png(20000, 20000))
+    else:  # a real, decodable image just above a lowered pixel limit: warning, not error
+        monkeypatch.setattr(PILImage, "MAX_IMAGE_PIXELS", 1000)
+        PILImage.new("RGB", (40, 40), "#DDEEEE").save(workdir / "trend-note.png")
+    with pytest.raises(RenderError) as exc:
+        _render(sample, workdir)
+    assert exc.value.path.startswith("sections[")

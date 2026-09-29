@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Render a health-plan content JSON to PPTX (and, from a later version, PDF) with QA gates."""
+"""Render a health-plan content JSON to PPTX and/or PDF with hard QA gates."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -16,9 +17,10 @@ from _cli import emit_json
 from hpr.blocks import RenderError
 from hpr.content import iter_blocks, load_content, required_texts, validate_content
 from hpr.measure import Measurer
+from hpr.pdf_html import PdfUnavailableError, render_pdf
 from hpr.ppt_draw import render_pptx
 from hpr.ppt_layout import LayoutError
-from hpr.qa import qa_pptx
+from hpr.qa import qa_pdf, qa_pptx
 from hpr.style import NOT_APPLIED, Layer, load_layer, resolve
 from hpr.theme import build_theme
 
@@ -28,6 +30,13 @@ _BASENAME = re.compile(r"^[^/\\\x00]{1,120}$")
 def _fail(errors: list[str]) -> int:
     emit_json({"ok": False, "errors": errors})
     return 1
+
+
+def _remove(paths: list[Path]) -> None:
+    """Drop this run's partial outputs; none existed before (existing ones are refused), so a
+    rerun with the same basename works after a failure."""
+    for p in paths:
+        p.unlink(missing_ok=True)
 
 
 def _missing_images(content: dict, base_dir: Path) -> list[str]:
@@ -82,24 +91,32 @@ def main(argv: list[str] | None = None) -> int:
         out_dir / f"{args.basename}.qa.json",
         out_dir / f"{args.basename}.params-report.json",
     ]
-    existing = [str(p) for p in outputs if p.exists()]
+    existing = [str(p) for p in outputs if os.path.lexists(p)]  # dangling symlinks too
     if existing:
         return _fail(
             [f"文件已存在，不覆盖：{p}（请换一个 basename，例如用新的生成时间）" for p in existing]  # noqa: RUF001
         )
-    if "pdf" in formats:
-        return _fail(["PDF 输出在本版本尚未提供，请先用 --format pptx"])  # noqa: RUF001
     m = Measurer()
     required = required_texts(content)
     files: dict[str, str] = {}
     qa: dict[str, dict] = {}
     warnings: list[str] = []
     try:
-        warnings += render_pptx(content, style, targets["pptx"], base_dir, m)
-    except (RenderError, LayoutError) as exc:
+        if "pptx" in targets:
+            warnings += render_pptx(content, style, targets["pptx"], base_dir, m)
+            qa["pptx"] = qa_pptx(targets["pptx"], required, build_theme(style, "pptx"), m)
+            files["pptx"] = str(targets["pptx"])
+        if "pdf" in targets:
+            warnings += render_pdf(content, style, targets["pdf"], base_dir)
+            qa["pdf"] = qa_pdf(targets["pdf"], content, required, build_theme(style, "pdf"))
+            files["pdf"] = str(targets["pdf"])
+    except (RenderError, LayoutError, PdfUnavailableError) as exc:
+        _remove(outputs)
         return _fail([str(exc)])
-    qa["pptx"] = qa_pptx(targets["pptx"], required, build_theme(style, "pptx"), m)
-    files["pptx"] = str(targets["pptx"])
+    except BaseException:
+        _remove(outputs)
+        raise
+    warnings = list(dict.fromkeys(warnings))
     ok = all(q["status"] == "passed" for q in qa.values())
     if not ok:
         for fmt, q in qa.items():
