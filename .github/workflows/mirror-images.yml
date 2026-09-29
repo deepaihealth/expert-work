@@ -70,6 +70,18 @@ jobs:
           - name: pgbouncer
             upstream: edoburu/pgbouncer
             tag: v1.24.1-p1
+          # MinIO 官方 2025-10 停发镜像、2026-09-11 删光 Docker Hub / quay 上的旧镜像
+          # (integration 起 minio 从那天起 unauthorized)。Chainguard 从源码持续构建、
+          # 免费档只给 latest / latest-dev;-dev 带 busybox(健康检查的 wget、
+          # init 的 /bin/sh)。浮动 tag,与 pg16 一样靠周同步保鲜。
+          - name: minio
+            registry: cgr.dev
+            upstream: chainguard/minio
+            tag: latest-dev
+          - name: minio-client
+            registry: cgr.dev
+            upstream: chainguard/minio-client
+            tag: latest-dev
     steps:
       # Actions SHA-pinned —— 这个 workflow 持有能往 org 包仓写入的 token,
       # 可变 tag 被重指向恶意代码的风险不能留(与 sandbox-image.yml 同一规矩)。
@@ -85,10 +97,10 @@ jobs:
 
       # imagetools create 跨 registry 复制整份 manifest list(每个架构的
       # manifest + 缺的 blob),目标上的 digest 与上游逐位相同。源端是对
-      # Docker Hub 的匿名读,一周两次,远在限额之内。
+      # Docker Hub(没写 registry 时)或 cgr.dev 的匿名读,一周一次,远在限额之内。
       - name: Copy manifest list to GHCR
         env:
-          SRC: docker.io/${{ matrix.upstream }}:${{ matrix.tag }}
+          SRC: ${{ matrix.registry || 'docker.io' }}/${{ matrix.upstream }}:${{ matrix.tag }}
           DST: ghcr.io/deepaihealth/mirror/${{ matrix.name }}:${{ matrix.tag }}
         run: |
           set -euo pipefail
