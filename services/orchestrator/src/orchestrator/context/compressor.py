@@ -304,7 +304,7 @@ class _SplitMessages:
     tail: list[BaseMessage]
 
 
-def _is_summary_message(m: BaseMessage) -> bool:
+def is_summary_message(m: BaseMessage) -> bool:
     """B-126 (fix round 1, M3) — one shared predicate for "is this a
     compressor-authored ``<context-summary>`` block", used by the
     leading-system scan below and :func:`_last_middle_id` (previously two
@@ -347,7 +347,7 @@ def _split(messages: Sequence[BaseMessage], *, head_keep: int, tail_keep: int) -
     while (
         cursor < len(messages)
         and isinstance(messages[cursor], SystemMessage)
-        and not _is_summary_message(messages[cursor])
+        and not is_summary_message(messages[cursor])
     ):
         leading_systems.append(messages[cursor])
         cursor += 1
@@ -403,7 +403,7 @@ def _last_middle_id(
     middle = _split(messages, head_keep=head_keep, tail_keep=tail_keep).middle
     for m in reversed(middle):
         mid = getattr(m, "id", None)
-        if mid and not _is_summary_message(m):
+        if mid and not is_summary_message(m):
             return str(mid)
     return None
 
