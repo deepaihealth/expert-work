@@ -1,5 +1,7 @@
-# 班车 2 生产发布执行单（2026-09-28 发；原定 09-24）
+# 班车 2 生产发布执行单（2026-10-08 发；原定 09-24，后改 09-28）
 
+> **⚠️ 2026-09-29 再次改期**：09-28 没有发，**用户 09-29 拍板推迟到 2026-10-08**，并把 **B-125 健康方案交付件技能**（`health-plan-report` 导入 + ai-health-plan 提示词 rev39）一起带上，见 §0.2 与 Step A3 / A4。钉子暂不变（仍 `c0789ca6`），B-125 不进镜像（`platform-skills/` 只由导入脚本上线）。**同日用户再拍板：B-126（跨轮上下文降本）也随本班上生产；钉子等 B-126 合入后一次性前移到 main**（届时连同 #1690 fast-uri / #1691 MinIO 一起带上），前移后先发测试环境验过再重钉，本单操作位随之改。
+>
 > **⚠️ 2026-09-25 改期说明**：本班 09-24 **没有发**（用户 09-20 拍板等 B-84 本波做完一起发，
 > 之后又陆续合入 B-64 / B-106 / B-102~104 / B-105）。**用户 09-25 拍板 09-28（周一）发**。文件名保留原日期，免得外链断；**发布日以表头为准**。
 > 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）；同日第九次重钉到 main 的 `68a7b75f`，再带上 B-122 / B-123 与 B-119 的文案；当晚第十次重钉到 main 的 `c0789ca6`，再带上 B-124 子代沙箱工作区修复（见 §0.1）。
@@ -10,7 +12,7 @@
 
 | | |
 |---|---|
-| 发布日 | **2026-09-28（周一）** —— 用户 2026-09-25 拍板。原定 09-24（用户 09-17 拍板，原 09-22），09-20 用户拍板延期等 B-84 本波 |
+| 发布日 | **2026-10-08（周四）** —— 用户 2026-09-29 拍板（09-28 未发）。此前 **2026-09-28（周一）** —— 用户 2026-09-25 拍板。原定 09-24（用户 09-17 拍板，原 09-22），09-20 用户拍板延期等 B-84 本波 |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
 | 本版 tag | **`c0789ca6`**（**main**，#1685 的合并提交，父提交 `68a7b75f`）= `f92c6fae` + 其后 main 上的 11 个提交：运行时代码只多 B-121（#1681，与第八次钉子 `e5341495` 同一份改动）、B-122（#1682）、B-123（#1683）、B-124（#1685）与 B-119 的一处文案（#1678），其余是文档 / `platform-skills/`（不进镜像）/ test overlay。**不再用分支 `release/train2-tz`**（发版不从它取，留不留不影响本单）。测试环境 2026-09-27 发过 `c0789ca6`（`release.sh test`，镜像 `c0789ca6`、admin-ui `c0789ca6-test`；smoke + 金丝雀 PASS；B-124 真栈四条全过，见 §0.1 第十次重钉）。第九次钉子 `68a7b75f` 此前 09-27 发过（`release.sh test`，镜像 `68a7b75f`、admin-ui `68a7b75f-test`）：测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。第八次钉子 `e5341495` 09-27 测试验过（smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST，#1681）；`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
 | 区间提交数 | **120**（`git log --oneline 5775fbf3..c0789ca6`；其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 `f92c6fae` 之后 main 上的 11 个 —— B-121 / B-122 / B-123 / B-124 / office 技能两个 / 五个纯文档或 test overlay 记录） |
@@ -275,6 +277,19 @@
 > 本次一并补齐，改钉子的判据定死为：**`grep -n '<旧 sha>' 这份文件` 必须零命中**才算改完。
 
 ---
+
+### 0.2 2026-09-29 追加：B-125 健康方案交付件技能（随 10-08 发）
+
+- **内容**：平台技能 `health-plan-report`（把定稿的健康方案渲染成可编辑 PPT + A4 PDF，纯 Python，在沙箱里跑）
+  + ai-health-plan 提示词 **rev39**（技能绑定 `pptx` / `pdf` / `docx` / `health-plan-report`，出交付件改用本技能）。
+  代码 #1686–#1689 已合 main（`523a1050`）；ROADMAP B-125。
+- **不动镜像、不动钉子**：`platform-skills/` 不进任何镜像，技能由 Step A3 用导入脚本上线；提示词由 Step A4 改 Agent 配置。
+- **依赖**：① Step B 的 `c0789ca6`（`EXPERT_WORK_SKILLS_DIR`，B-84）；② Step A 的沙箱镜像 `7ac31957`（python-pptx /
+  weasyprint / Noto CJK —— 测试环境 in-image 用例就在这个镜像上跑）；③ Step A2 的 `pptx` / `pdf` / `docx`（rev39 绑定它们）。
+  所以顺序是 **A → B → C → A2 → A3 → A4**。
+- **两件必须一起做**：只导入技能，Agent 不会用；只发 rev39，Agent 会调一个生产上不存在（或未启用）的技能。
+- **测试环境验收**：技能 v1→v5（v5 = `cc2df66a`，卡片组整组不拆页）；rev39 在测试环境 `ai-health-plan` 上两次重放真实 5 轮对话，
+  带出的问题全部修进 v2~v5；v5 抽查 PPTX 16/19 页、PDF 11 页，质检全过。
 
 ## 1. 前置（发布前一天做完）
 
@@ -808,6 +823,42 @@ uv run --no-sync python $PS/import_in_pod.py bundle \
 或直接删版本行。每个技能独立回滚，互不影响其它三个。需要紧急退回 Anthropic 原版：控制台导出第 1 版
 （原版保留在版本历史里未删，见 ROADMAP B-117）再重新导入。
 
+### Step A3 — 导入 `health-plan-report` 技能并启用（B-125，本版新增）
+
+在 **Step A2 之后**做（理由见 §0.2 的依赖）。打包方式同 A2：用独立 worktree 从 **main** 打包，不用主仓库目录的 `platform-skills/`。
+
+```sh
+git worktree add /tmp/ps-hpr origin/main
+uv run --no-sync python /tmp/ps-hpr/platform-skills/build.py --only health-plan-report
+PS=/tmp/ps-hpr/platform-skills
+uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-plan-report.skill \
+  | kubectl -n expert-work exec -i "$POD" -- python3 -
+```
+
+- [ ] dry-run 输出 `"status":"dry-run"`；生产上是**首次导入**，应为 `"created": true` 的新建（不是版本递增）
+- [ ] 打包出的 `content_hash` 应为 `cc2df66a…`（测试环境 v5）；不同说明 main 上技能源码又变过，停下来先对差异
+
+正式导入去掉 `--dry-run`：
+
+- [ ] 输出 `"status":201` 与 `{"invalidation":"published","receivers":N}`（N ≥ 1）
+- [ ] **⚠️ 首次导入的技能落库是草稿（DRAFT），必须在控制台「平台技能」里把 `health-plan-report` 启用**。
+      测试环境实测：不启用时 Agent 调用返回 422 `skill 'health-plan-report' is not in 'active' status`
+- [ ] 做完 `git worktree remove /tmp/ps-hpr`
+
+**回滚**：在控制台把 `health-plan-report` 停用即可（A4 若已做，先回 A4）。技能本身不影响其它 Agent。
+
+### Step A4 — 发布 ai-health-plan 提示词 rev39（B-125，本版新增）
+
+在 **Step A3 启用之后**做。rev39 是在**测试环境 rev38** 上改出来的，生产的提示词未必与测试一致：
+
+- [ ] **发布前一天（只读）**：导出生产 `ai-health-plan` 当前的提示词与技能绑定，与测试环境 rev38 逐字比对；
+      结果记入 §6。**完全一致** → 直接发 rev39；**有差异** → 把差异拿给用户，合并成生产版 rev39 后再发，不要直接覆盖
+- [ ] 保存生产当前配置的备份（控制台导出或 API 取 manifest），作为回滚点
+- [ ] 按 rev39 更新：提示词正文 + 技能绑定 `pptx` / `pdf` / `docx` / `health-plan-report`；**保存后必须「发布」草稿**（保存 ≠ 上线）
+- [ ] 核对线上版本号已递增、技能绑定为上面四个
+
+**回滚**：用备份把提示词与技能绑定恢复成发布前的版本并发布。
+
 ### Step D — 真栈验证（本版新功能，按需做，全部只用金丝雀）
 
 > 对接方的 agent（`ai-health-plan` / `sop2-designer`）**不做实验**，只读观察。
@@ -852,7 +903,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle \
 
 - [ ] `chore(deploy): prod newTag c0789ca6` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、回滚命令。
-- [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 / B-121 / B-122 / B-123 / B-124 的「生产待发」改成已上线，B-119 按 Step C 核对结果销案；本执行单补 §6 执行记录。
+- [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 / B-121 / B-122 / B-123 / B-124 / **B-125** 的「生产待发」改成已上线，B-119 按 Step C 核对结果销案；本执行单补 §6 执行记录。
 
 ---
 
@@ -920,6 +971,9 @@ tools/deploy/rollback.sh prod 5775fbf3
 | Step A 沙箱钉子 | 发前 `________` → 发后 `________` |
 | Step B smoke / 金丝雀 | `________` |
 | Step A2 office 技能导入（B、C 之后） | go/no-go(docx/pptx/xlsx/pdf)**全部 GO**（09-27 测试环境验收，见下）；导入前 latest_version `________` → 导入后 `________`；失效 published(N=`__`) / skipped → restart 或等 1800s `________` |
+| Step A3 health-plan-report 导入 + 启用 | dry-run `created`/hash `________`；导入 `201` + published(N=`__`)；控制台启用 `____` |
+| Step A4 ai-health-plan rev39 | 生产 vs 测试 rev38 比对 `一致 / 有差异（已合并）`；备份位置 `________`；发布后版本号 `____`、技能绑定 `____` |
+| B-125 发后验证 | 用户指定的测试客户跑一轮出方案：PPTX `____` / PDF `____`（`ok:true`、打开正常） |
 | migrate Job | 期望跑四条（`0156` ~ `0159`），实况 `________` |
 | CronJob 创建 | `________` |
 | 次日首跑删除计数 | `________` |
