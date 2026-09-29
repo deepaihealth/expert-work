@@ -157,6 +157,26 @@ def test_error_results_are_never_pruned() -> None:
     assert r.pruned_count == 0
 
 
+def test_ask_image_conclusion_is_never_pruned_cross_turn() -> None:
+    """Spec §3.3 —— 看图的文字结论一律不清,哪怕它有持久化路径、哪怕最近窗保护
+    关掉了(``recent_tool_results_kept=0``)。同尺寸的普通工具结果对照组照样
+    被收起,证明豁免只对 ``ask_image`` 生效,不是门槛没触发。
+    """
+    prior = [
+        HumanMessage(content="u"),
+        _call("a-0", name="ask_image", args={"image_ref": "expert_work://image/1"}),
+        _res("a-0", name="ask_image"),
+        _call("a-1"),
+        _res("a-1"),
+        AIMessage(content="answer a"),
+    ]
+    r = _run([*prior, *_turn("b", 1)], recent_tool_results_kept=0)
+    assert r.pruned_count == 1
+    tools = {m.tool_call_id: m for m in r.messages if isinstance(m, ToolMessage)}
+    assert str(tools["a-0"].content) == f"{_BIG}#a-0"
+    assert str(tools["a-1"].content).startswith("<tool-result-pruned>")
+
+
 def test_non_string_content_untouched() -> None:
     prior = [
         HumanMessage(content="u"),

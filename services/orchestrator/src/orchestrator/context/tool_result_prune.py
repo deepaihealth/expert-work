@@ -83,6 +83,17 @@ logger = logging.getLogger(__name__)
 _PRUNE_TAG_OPEN = "<tool-result-pruned>"
 _PRUNE_TAG_CLOSE = "</tool-result-pruned>"
 
+#: Spec §3.3 (docs/superpowers/specs/2026-09-28-cross-turn-context-pruning-design.md
+#: line 84) — "看图的文字结论" (image-reading text conclusions) are never pruned,
+#: full stop, regardless of size or recovery path: ``ask_image``'s reply IS the
+#: vision model's own analysis, not a raw payload with an equivalent workspace
+#: copy the model can just re-fetch, so collapsing it loses the actual
+#: conclusion rather than a redundant copy. No public name constant exists for
+#: this string (``tools/vision.py`` registers it as a literal
+#: ``ToolSpec(name="ask_image")``); deliberately not importing
+#: ``tools/_child_run.py``'s private ``_ASK_IMAGE_TOOL_NAME`` across packages.
+_NEVER_PRUNE_TOOLS = frozenset({"ask_image"})
+
 
 @dataclass(frozen=True)
 class PruneResult:
@@ -170,9 +181,11 @@ def _footer_total_chars(content: str) -> int | None:
 def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
     """1-line replacement for a ``ToolMessage`` — lossless if recoverable.
 
-    Returns ``None`` when the message is non-string (multimodal) content or is
-    already collapsed (idempotent skip), so the caller's ``pruned_count`` stays
-    accurate. Recoverability ladder:
+    Returns ``None`` when the message is non-string (multimodal) content, is
+    already collapsed (idempotent skip), or names a tool in
+    :data:`_NEVER_PRUNE_TOOLS` (spec §3.3 — ``ask_image``'s text conclusion is
+    never touched, size/recovery-path notwithstanding), so the caller's
+    ``pruned_count`` stays accurate. Recoverability ladder:
 
     0. **Skill reference** (RT-2 PR-3 / RT-ADR-7) — a successful ``skill_view``
        result collapses to a one-line skill reference (name + source path +
@@ -204,6 +217,8 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
     """
     content = message.content
     if not isinstance(content, str) or _is_already_pruned(content):
+        return None
+    if message.name in _NEVER_PRUNE_TOOLS:
         return None
     reference = skill_view_reference(message)
     if reference is not None:
@@ -255,11 +270,22 @@ def prune_old_tool_results(
     * **Age** — a non-duplicate ``ToolMessage`` beyond the most-recent
       ``recent_tool_results_kept`` is collapsed.
 
+    A :data:`_NEVER_PRUNE_TOOLS` result (``ask_image`` — spec §3.3) is kept out
+    of ``tool_idxs`` entirely: it never occupies one of the ``recent_tool_results_kept``
+    protected slots (that protection would be wasted on a message that is
+    never collapsed anyway, diluting the window meant for real candidates) and
+    never seeds/matches the dedup map. :func:`_collapsed_content` also refuses
+    it directly, so it is never touched even if reached by some other path.
+
     Token-unaware: callers gate on size via :meth:`ToolResultPruner.should_prune`.
     Returns a new list — never mutates the input.
     """
     msgs = list(messages)
-    tool_idxs = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
+    tool_idxs = [
+        i
+        for i, m in enumerate(msgs)
+        if isinstance(m, ToolMessage) and m.name not in _NEVER_PRUNE_TOOLS
+    ]
     # Last index each exact content appears at — anything earlier is a duplicate.
     last_occurrence: dict[str, int] = {}
     for i in tool_idxs:
@@ -376,6 +402,11 @@ def prune_prior_turns(
     每次调用结果逐字相同、缓存前缀稳定(spec D3 / R2)。只收有无损找回途径的结果
     (D6),``status == "error"`` 与非字符串内容一律不动(R4)。去重只在旧轮次内部做
     (R3)。返回新列表,不改入参。
+
+    :data:`_NEVER_PRUNE_TOOLS` 的结果(``ask_image`` —— spec §3.3 看图的文字结论)
+    整段排除在 ``prior_tool_idxs`` 之外:既不占 ``recent_tool_results_kept`` 的保护名
+    额(保护一条永不清理的消息是浪费,会挤掉本该保护的真候选),也不进去重表 —— 但
+    它的原文仍计入上面 ``min_context_tokens`` 的整段估算(它是真实占用的上下文)。
     """
     msgs = list(messages)
     boundary = current_turn_start(msgs)
@@ -384,7 +415,11 @@ def prune_prior_turns(
     if estimate_tokens(msgs[: boundary + 1], estimator=estimator) < min_context_tokens:
         return PruneResult(messages=msgs, pruned_count=0)
 
-    prior_tool_idxs = [i for i in range(boundary) if isinstance(msgs[i], ToolMessage)]
+    prior_tool_idxs = [
+        i
+        for i, m in enumerate(msgs[:boundary])
+        if isinstance(m, ToolMessage) and m.name not in _NEVER_PRUNE_TOOLS
+    ]
     protected = set(prior_tool_idxs[max(0, len(prior_tool_idxs) - recent_tool_results_kept) :])
     args_by_call: dict[str, Mapping[str, Any]] = {}
     for i in range(boundary):

@@ -89,6 +89,30 @@ def test_over_threshold_collapses_old_keeps_recent_full() -> None:
         assert _collapsed(tm) and "older context" in str(tm.content)
 
 
+def test_ask_image_conclusion_is_never_pruned_same_turn() -> None:
+    """Spec §3.3 —— the CM-12 same-turn fallback must not touch ``ask_image``
+    either, even with an on-disk copy and recency protection off. A same-size
+    ordinary result in the identical spot IS collapsed, proving the exemption
+    is name-scoped rather than the gate simply not firing.
+    """
+    msgs: list[BaseMessage] = [
+        HumanMessage(content="go"),
+        _ai_call("v0"),
+        _tool(
+            f"{_BIG}#v0",
+            call_id="v0",
+            name="ask_image",
+            artifact={TOOL_RESULT_PATH_ARTIFACT_KEY: ".tool_results/run/v0-ask_image.txt"},
+        ),
+        _ai_call("tc-1"),
+        _tool(f"{_BIG}#1", call_id="tc-1"),
+    ]
+    res = _pruner(kept=0).apply(msgs)
+    tools = {m.tool_call_id: m for m in _tools(res.messages)}
+    assert str(tools["v0"].content) == f"{_BIG}#v0"
+    assert _collapsed(tools["tc-1"])
+
+
 def test_externalized_result_pruned_to_footer_only_lossless() -> None:
     rel = ".tool_results/run-abc/tc-0-web_search.txt"
     footer = render_overflow_footer(rel=rel, total_chars=50_000)
