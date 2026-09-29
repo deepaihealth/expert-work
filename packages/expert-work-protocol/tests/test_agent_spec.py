@@ -1221,3 +1221,56 @@ def test_dynamic_workers_budget_fields_in_json_schema() -> None:
     dw = schema["$defs"]["DynamicWorkersSpec"]["properties"]
     for key in ("max_iterations", "max_concurrent", "max_per_run"):
         assert key in dw
+
+
+from expert_work.protocol.agent_spec import (
+    ContextCompressionPolicy,
+    ToolResultPrunePolicy,
+    WorkingMemoryPolicy,
+)
+
+_B126_DEFAULTS = {
+    "cross_turn": True,
+    "min_context_tokens": 30_000,
+    "min_reclaim_tokens": 5_000,
+    "absolute_cap_tokens": 200_000,
+}
+
+
+def test_b126_prune_policy_defaults() -> None:
+    p = ToolResultPrunePolicy()
+    for k, v in _B126_DEFAULTS.items():
+        assert getattr(p, k) == v
+
+
+def test_b126_lossy_gate_caps_default() -> None:
+    assert WorkingMemoryPolicy().absolute_cap_tokens == 200_000
+    assert ContextCompressionPolicy().absolute_cap_tokens == 200_000
+
+
+def test_new_fields_omitted_at_default() -> None:
+    # 回滚纪律:旧版本 extra="forbid" 读到新字段会拒 —— 默认值不能落库。
+    for model in (ToolResultPrunePolicy(), WorkingMemoryPolicy(), ContextCompressionPolicy()):
+        dumped = model.model_dump(mode="json")
+        for k in _B126_DEFAULTS:
+            assert k not in dumped, f"{type(model).__name__}.{k} leaked at default"
+
+
+def test_new_fields_kept_when_non_default() -> None:
+    dumped = ToolResultPrunePolicy(cross_turn=False, min_reclaim_tokens=1).model_dump(mode="json")
+    assert dumped["cross_turn"] is False
+    assert dumped["min_reclaim_tokens"] == 1
+    assert "min_context_tokens" not in dumped
+    assert WorkingMemoryPolicy(absolute_cap_tokens=64_000).model_dump(mode="json")[
+        "absolute_cap_tokens"
+    ] == 64_000
+
+
+def test_new_fields_validate() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ToolResultPrunePolicy(absolute_cap_tokens=0)
+    with pytest.raises(ValidationError):
+        ToolResultPrunePolicy(min_reclaim_tokens=-1)
