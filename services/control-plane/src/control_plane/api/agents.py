@@ -1044,21 +1044,45 @@ def _unmatched_binding_warning(built: Any) -> str | None:
     unmatched = getattr(built, "unmatched_arg_bindings", ()) or ()
     if not unmatched:
         return None
+    # B-127 —— 哪些参数是固定值,从 manifest 原件的绑定表里查(``BuiltAgent.arg_bindings``)。
+    fixed_params = {
+        (b.server, b.tool): set(b.fixed) for b in getattr(built, "arg_bindings", ()) or ()
+    }
     # 三类落空的改法完全不同,所以分开说:名字写错 / 服务器没挂上,是「这个工具
     # 压根不在目录里」;上游改了接口,是「工具在,但它不再声明这个参数」;B-65 撞名,
     # 是「工具在、参数也在,但它的内部名被另一个工具占走了」—— 对最后一种说前两种
     # 里的任何一句都是假话,配置的人会去改一个没错的名字。
     by_reason = {
         reason: [_binding_label(u) for u in unmatched if u.reason == reason]
-        for reason in ("tool_missing", "params_absent", "name_collision")
+        for reason in ("tool_missing", "name_collision")
     }
+    # B-127 —— 「参数不在」对固定值是另一件事:上游**还没有**这个参数(对方服务端比
+    # 配置先落地的反面),值不会回到模型手里,而是**不发**,等上游声明了、agent 重建之后
+    # 才生效。与变量那部分拆开说,同一条绑定两边各报各的参数。
+    drifted: list[str] = []
+    fixed_pending: list[str] = []
+    for u in unmatched:
+        if u.reason != "params_absent":
+            continue
+        fixed = fixed_params.get((u.server, u.tool), set())
+        variable_part = tuple(p for p in u.params if p not in fixed)
+        fixed_part = tuple(p for p in u.params if p in fixed)
+        if variable_part:
+            drifted.append(_binding_label(u, variable_part))
+        if fixed_part:
+            fixed_pending.append(_binding_label(u, fixed_part))
     chunks: list[str] = []
     if by_reason["tool_missing"]:
         chunks.append(
             "no such tool in the assembled catalog: " + "; ".join(by_reason["tool_missing"])
         )
-    if by_reason["params_absent"]:
-        chunks.append("the tool no longer declares: " + "; ".join(by_reason["params_absent"]))
+    if drifted:
+        chunks.append("the tool no longer declares: " + "; ".join(drifted))
+    if fixed_pending:
+        chunks.append(
+            "the tool does not declare these fixed parameters, so their values are not sent "
+            "until it does and the agent is rebuilt: " + "; ".join(fixed_pending)
+        )
     if by_reason["name_collision"]:
         chunks.append(
             "the tool is in the catalog but another tool took over its internal name "
@@ -1066,15 +1090,18 @@ def _unmatched_binding_warning(built: Any) -> str | None:
             "can collide): " + "; ".join(by_reason["name_collision"])
         )
     return (
-        "some arg_bindings did not land, so their parameters stay in the model's "
-        "hands — " + " | ".join(chunks) + ". Check the server / tool / parameter "
+        "some arg_bindings did not land, so the platform does not fill those parameters "
+        "(a variable-bound one stays in the model's hands, a fixed value is not sent) — "
+        + " | ".join(chunks)
+        + ". Check the server / tool / parameter "
         "spelling, and that the server is reachable and enabled for this tenant."
     )
 
 
-def _binding_label(unmatched: UnmatchedArgBinding) -> str:
-    """``server/tool (param, param)`` —— 只有名字,一个值都不带。"""
-    return f"{unmatched.server}/{unmatched.tool} ({', '.join(unmatched.params)})"
+def _binding_label(unmatched: UnmatchedArgBinding, params: tuple[str, ...] | None = None) -> str:
+    """``server/tool (param, param)`` —— 只有名字,一个值都不带(固定值也不带)。"""
+    names = unmatched.params if params is None else params
+    return f"{unmatched.server}/{unmatched.tool} ({', '.join(names)})"
 
 
 async def _load_manifest(

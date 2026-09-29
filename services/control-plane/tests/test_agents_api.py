@@ -1095,6 +1095,50 @@ async def test_unmatched_arg_bindings_save_with_a_warning_not_a_refusal(
 
 
 @pytest.mark.asyncio
+async def test_a_fixed_param_the_tool_does_not_declare_yet_gets_its_own_warning(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """B-127 —— 固定值落空(上游还没有这个参数)的话与变量绑定不同:值不是「回到模型
+    手里」,而是**不发**,等上游声明了、agent 重建之后才生效。同一条绑定里变量那部分
+    照旧按「不再声明」说。"""
+    from expert_work.protocol import ArgBindingSpec
+
+    app, client = b5_app_client
+
+    async def _built(spec, *, tenant_id=None, user_id=None):
+        return SimpleNamespace(
+            arg_bindings=(
+                ArgBindingSpec(
+                    server="records",
+                    tool="fetch_record",
+                    args={"project_code": "pc"},
+                    fixed={"detail_level": "brief"},
+                ),
+            ),
+            unmatched_arg_bindings=(
+                UnmatchedArgBinding(
+                    server="records",
+                    tool="fetch_record",
+                    params=("project_code", "detail_level"),
+                    reason="params_absent",
+                ),
+            ),
+        )
+
+    app.state.agent_runtime.agent_builder = _built  # type: ignore[attr-defined]
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    warning = resp.json()["data"]["build_warning"]
+    assert "the tool no longer declares: records/fetch_record (project_code)" in warning
+    assert (
+        "the tool does not declare these fixed parameters, so their values are not sent "
+        "until it does and the agent is rebuilt: records/fetch_record (detail_level)"
+    ) in warning
+    assert "(project_code, detail_level)" not in warning
+
+
+@pytest.mark.asyncio
 async def test_rollback_is_not_gated_by_the_build_check(
     b5_app_client: tuple[object, AsyncClient],
 ) -> None:
