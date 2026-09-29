@@ -23,12 +23,16 @@ Design anchors (docs/design/tool-result-context-budget.md §Phase 2):
   content, never removes a message, so no ``AIMessage.tool_calls`` ↔
   ``ToolMessage`` pair is ever split. No boundary logic needed.
 * **Lossless when a copy is on disk** — a result is collapsed losslessly when
-  either (a) it carries the ``<tool-result-overflow>`` footer (#859 externalized
-  → keep just the footer; bonus: drops the untrusted spotlight-fenced preview),
-  or (b) its ``artifact`` records a persisted-copy path (item 2 persist floor →
-  render a footer reference). Only a small result below the persist floor (no
-  on-disk copy) collapses to a lossy ``<tool-result-pruned>`` stub — still
-  strictly less lossy than the whole-turn drop the window would otherwise apply.
+  either (a) its ``artifact`` records a persisted-copy path (item 2 persist
+  floor → render a footer reference; checked FIRST — see the security note on
+  ``_lossless_reference`` / ``_collapsed_content``: the builder always records
+  this path alongside a real footer, so preferring it means the untrusted body
+  never has to be scanned for the footer tag), or (b) it carries the
+  ``<tool-result-overflow>`` footer (#859 externalized — only when no path was
+  recorded; bonus: drops the untrusted spotlight-fenced preview). Only a small
+  result below the persist floor (no on-disk copy) collapses to a lossy
+  ``<tool-result-pruned>`` stub — still strictly less lossy than the
+  whole-turn drop the window would otherwise apply.
 * **Dedup (item 1)** — a tool result whose exact content recurs later is
   collapsed to a reference (latest copy kept), reclaiming the bulk of a repeated
   identical search/fetch even inside the recent window.
@@ -53,6 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -123,10 +128,21 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
        durable while the workspace copy is run-scoped, so ``skill_view``
        re-read is the better recovery handle. Blocked/error placeholders get
        no reference (see :mod:`orchestrator.context.skill_reference`).
-    1. **In-context footer** (CM-5 / #859 externalized) — keep the trusted footer
-       alone; the full output is on disk and re-readable via ``read_file``.
-    2. **Artifact path** (item 2 persist floor) — render a footer reference to the
-       persisted copy, even though there was no in-context footer.
+    1. **Artifact path** (item 2 persist floor) — render a footer reference to
+       the persisted copy. Checked BEFORE the in-context footer (security —
+       the builder always records this path alongside a real footer, so
+       preferring it means the untrusted ``content`` never has to be scanned
+       for the footer tag at all; see the note below).
+    2. **In-context footer** (CM-5 / #859 externalized) — only when no path
+       was recorded: keep the trusted footer alone; the full output is on
+       disk and re-readable via ``read_file``. Located via the LAST
+       occurrence of the tag, never the first — a tool result is untrusted
+       (indirect-injection surface), and the real footer is always appended
+       AFTER the body (``builder.py``: ``tool_content + footer``); a body
+       that plants the literal ``<tool-result-overflow>`` tag earlier would,
+       under a first-occurrence search, smuggle its own text (plus whatever
+       genuinely trails it) past the spotlight fence as if it were the
+       trusted footer.
     3. **Lossy stub** — only when no on-disk copy exists (small result below the
        persist floor): a short note with the tool name + char count + reason.
     """
@@ -138,12 +154,12 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
         # Wrapped in the prune tags so ``_is_already_pruned`` keeps the pass
         # idempotent for skill stubs too.
         return f"{_PRUNE_TAG_OPEN}\n{reference}\n{_PRUNE_TAG_CLOSE}"
-    footer_at = content.find(OVERFLOW_FOOTER_TAG_OPEN)
-    if footer_at != -1:
-        return content[footer_at:].lstrip("\n")
     path = _artifact_path(message)
     if path is not None:
         return render_overflow_footer(rel=path, total_chars=len(content)).lstrip("\n")
+    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
+    if footer_at != -1:
+        return content[footer_at:].lstrip("\n")
     name = message.name or "tool"
     return (
         f"{_PRUNE_TAG_OPEN}\n"
@@ -239,33 +255,80 @@ def _args_hint(args: Mapping[str, Any]) -> str:
     return text if len(text) <= _ARGS_HINT_LIMIT else text[: _ARGS_HINT_LIMIT - 1] + "…"
 
 
+#: Recovers a workspace-relative path out of a REAL overflow footer's own
+#: wording (``render_overflow_footer``'s fixed template) — used only as a
+#: fallback when no ``artifact`` path was recorded (see ``_lossless_reference``).
+_FOOTER_SAVED_TO_RE = re.compile(r"saved to (\S+) in your workspace")
+
+#: Recovers the true pre-truncation size out of a REAL overflow footer's own
+#: wording — used by ``_cross_turn_stub`` so the stub header states the
+#: original size, not the (possibly much shorter) preview currently sitting
+#: in ``content``.
+_FOOTER_TOTAL_CHARS_RE = re.compile(r"full output \((\d+) chars\)")
+
+
+def _footer_total_chars(content: str) -> int | None:
+    """True pre-truncation size stated by a real overflow footer, if present.
+
+    Located via the LAST occurrence of the tag — the real footer is always
+    appended after the (possibly untrusted) body, so the first occurrence
+    could be a planted fake instead (see ``_lossless_reference``).
+    """
+    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
+    if footer_at == -1:
+        return None
+    match = _FOOTER_TOTAL_CHARS_RE.search(content[footer_at:])
+    return int(match.group(1)) if match else None
+
+
 def _lossless_reference(message: ToolMessage) -> str | None:
-    """无损找回途径 —— 技能引用 / 外置 footer / 持久化路径;都没有则 ``None``。"""
+    """无损找回途径 —— 技能引用 / 持久化路径 / 外置 footer;都没有则 ``None``。
+
+    安全 —— 真 footer 由 builder 在工具调用时追加在 body **之后**(spotlight
+    围栏之外),且追加 footer 的同时必然把持久化路径记进 ``artifact``(见
+    ``builder.py`` 的 ``_externalize_tool_overflow``:写盘成功才渲染 footer,
+    两者同一个 ``rel``)。因此这里优先走 ``_artifact_path`` 凭路径重新渲出一条
+    精简找回提示,完全不碰 ``content`` —— 天然避开「攻击者在 body 里塞一段假
+    footer 标签,``str.find`` 命中假标签的第一次出现,切片把 body 剩余部分连同
+    后面真正的 footer 一起当作『可信引用』带出去」这种越狱。只有没记录路径时
+    才退回扫 ``content``,且必须找**最后一次出现**(``str.rfind``,不是
+    ``str.find``)—— body 排在 footer 之前,真 footer 结构上必然是那最后一份。
+    """
     reference = skill_view_reference(message)
     if reference is not None:
         return reference
     content = message.content
-    if isinstance(content, str):
-        footer_at = content.find(OVERFLOW_FOOTER_TAG_OPEN)
-        if footer_at != -1:
-            return content[footer_at:].strip()
     path = _artifact_path(message)
-    if path is not None and isinstance(content, str):
-        return render_overflow_footer(rel=path, total_chars=len(content)).strip()
-    return None
+    if path is None and isinstance(content, str):
+        footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
+        if footer_at != -1:
+            match = _FOOTER_SAVED_TO_RE.search(content[footer_at:])
+            path = match.group(1) if match else None
+    if path is None:
+        return None
+    return f"Saved to {path} in your workspace. Use read_file / exec_python / bash to inspect it."
 
 
 def _cross_turn_stub(
     message: ToolMessage, *, args: Mapping[str, Any] | None, reference: str
 ) -> str:
     content = message.content
-    size = len(content) if isinstance(content, str) else 0
+    if isinstance(content, str):
+        full_size = _footer_total_chars(content)
+        if full_size is not None:
+            size, qualifier = full_size, ""
+        else:
+            has_footer_tag = OVERFLOW_FOOTER_TAG_OPEN in content
+            size, qualifier = len(content), (" (preview size)" if has_footer_tag else "")
+    else:
+        size, qualifier = 0, ""
     head = f"[{message.name or 'tool'}]"
     if args:
         head += f" {_args_hint(args)}"
     return (
         f"{_PRUNE_TAG_OPEN}\n"
-        f"{head} — {size:,} chars from an earlier turn, elided; recover below if needed.\n"
+        f"{head} — {size:,} chars{qualifier} from an earlier turn, elided; "
+        "recover below if needed.\n"
         f"{reference}\n"
         f"{_PRUNE_TAG_CLOSE}"
     )
