@@ -336,3 +336,6 @@ class AgentState(TypedDict):
     #: 而不是靠历史里的回执:压缩会把回执总结掉,state 不受影响。跨 run 累积,同
     #: ``viewed_figures``。
     figure_documents: NotRequired[Annotated[dict[str, str], _merge_figure_documents]]
+    #: B-126 —— L2 滚动摘要写回检查点:``{"through_id": <消息 id>, "text": <整段摘要>}``。
+    #: 下一次压缩时被覆盖的历史未变就直接复用,不再每步重写(spec §3.7)。默认覆盖 reducer。
+    context_summary: NotRequired[dict[str, str] | None]

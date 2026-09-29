@@ -118,6 +118,7 @@ from expert_work.runtime.middleware import (
 from expert_work.runtime.middleware.llm_cache import SKIP_STORE_KEY
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
 from orchestrator.context import (
+    CachedSummary,
     CompactionStats,
     ContextCompressor,
     OnCompacted,
@@ -887,6 +888,10 @@ def build_react_graph(
             freshness=figure_fresh,
         )
         reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
+        # B-126 —— set below when this turn's compression reports a fresh/updated
+        # summary; written into ``update_mw``/``update_plain`` alongside the other
+        # per-turn channels so the next turn's agent_node can replay it.
+        summary_update: dict[str, str] | None = None
         demoted_tools: list[str] = []
         if context_compressor is not None and context_compressor.should_compress(
             messages, reserved=reserved
@@ -938,13 +943,39 @@ def build_react_graph(
             # user of the agent, so the streak must key on thread_id.
             compress_thread_id = (config.get("configurable") or {}).get("thread_id")
             before_compress = messages
-            messages = await context_compressor.compress(
-                messages,
-                on_pre_compaction=on_pre_compaction,
-                on_compacted=on_compacted,
-                streak_key=str(compress_thread_id) if compress_thread_id else None,
-                reserved=reserved,
+            # B-126 —— 检查点里的上一次摘要(有的话)按 through_id 复用;
+            # 历史未变(下一次要覆盖的那一段还对得上)就不再调模型重写。
+            cached_raw = state.get("context_summary") or None
+            cached = (
+                CachedSummary(through_id=cached_raw["through_id"], text=cached_raw["text"])
+                if cached_raw and cached_raw.get("through_id") and cached_raw.get("text")
+                else None
             )
+            new_summary: list[CachedSummary] = []
+            # B-126 (fix round 1, §3.9) — ``cache_hit_marks`` stays empty unless
+            # ``on_cache_hit`` fires (cached_summary genuinely matched, not a
+            # stale miss); the span attribute is a bare boolean, never the
+            # summary text itself.
+            cache_hit_marks: list[bool] = []
+            with expert_work_span(
+                ExpertWorkComponent.ORCHESTRATOR, "compression"
+            ) as compression_span:
+                messages = await context_compressor.compress(
+                    messages,
+                    on_pre_compaction=on_pre_compaction,
+                    on_compacted=on_compacted,
+                    streak_key=str(compress_thread_id) if compress_thread_id else None,
+                    reserved=reserved,
+                    cached_summary=cached,
+                    on_summary=new_summary.append,
+                    on_cache_hit=lambda: cache_hit_marks.append(True),
+                )
+                compression_span.set_attribute("cm.summary.reused", bool(cache_hit_marks))
+            if new_summary:
+                summary_update = {
+                    "through_id": new_summary[-1].through_id,
+                    "text": new_summary[-1].text,
+                }
             # B-73 ③ —— 这一轮的「本轮输入」段被摘要掉的话,模型就没有输入文件的
             # 路径了,只能退回去手抄上文里的长串。放回最新一段(见函数 docstring)。
             messages = _keep_latest_inputs_block(before_compress, messages)
@@ -1402,6 +1433,8 @@ def build_react_graph(
             }
             if demoted_tools:
                 update_mw["promoted_tools"] = {"remove": demoted_tools}
+            if summary_update is not None:
+                update_mw["context_summary"] = summary_update
             # B-85 ③ —— 只在真的走到出口时写;还要继续的轮次不盖章,
             # 盖了会把中间态当终局读。
             if mw_exit_reason is not None:
@@ -1438,6 +1471,8 @@ def build_react_graph(
         }
         if demoted_tools:
             update_plain["promoted_tools"] = {"remove": demoted_tools}
+        if summary_update is not None:
+            update_plain["context_summary"] = summary_update
         # B-85 ③ —— 同 ``update_mw`` 那一处:只在真的走到出口时写。
         if plain_exit_reason is not None:
             update_plain["exit_reason"] = plain_exit_reason

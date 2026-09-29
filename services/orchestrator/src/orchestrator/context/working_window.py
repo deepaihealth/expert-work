@@ -152,12 +152,14 @@ class WorkingWindow:
     #: shared tiktoken-backed estimator (same instance as the compressor
     #: so the two gates keep one estimation basis — CM-C6).
     estimator: TokenEstimator | None = None
+    #: B-126 —— 门槛 = min(窗口 x 百分比, 本值);大窗口模型不再等到 70%。
+    absolute_cap_tokens: int = 200_000
 
     @property
     def threshold_tokens(self) -> int:
         """Token threshold at/above which a pass trims. Same shape as the
         compressor's threshold so the two gates share one estimation basis."""
-        return int(self.context_window * self.threshold_pct)
+        return min(int(self.context_window * self.threshold_pct), self.absolute_cap_tokens)
 
     def should_trim(self, messages: Sequence[BaseMessage]) -> bool:
         """Cheap preflight — ``True`` when the estimate meets/exceeds the

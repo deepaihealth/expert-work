@@ -258,3 +258,12 @@ def test_only_user_messages_count_toward_the_turn_budget() -> None:
     msgs = _jinja_conversation(2)  # two user turns, six HumanMessages
     result = trim_to_recent_turns(msgs, max_recent_turns=2, keep_first_turn=False)
     assert result == TrimResult(messages=msgs, dropped_turns=0)
+
+
+def test_b126_window_threshold_capped() -> None:
+    assert WorkingWindow(context_window=1_000_000).threshold_tokens == 200_000
+    assert WorkingWindow(context_window=100_000).threshold_tokens == 70_000
+    assert (
+        WorkingWindow(context_window=1_000_000, absolute_cap_tokens=64_000).threshold_tokens
+        == 64_000
+    )

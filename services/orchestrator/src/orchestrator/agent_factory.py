@@ -1003,6 +1003,7 @@ async def build_agent(
             tail_keep=cc_policy.tail_keep,
             max_passes=cc_policy.max_passes,
             estimator=estimator,
+            absolute_cap_tokens=cc_policy.absolute_cap_tokens,
         )
     # Stream CM-2 — working-memory sliding window: the cheap LLM-free gate
     # that runs before the compressor in agent_node. Conservative defaults
@@ -1017,6 +1018,7 @@ async def build_agent(
             max_recent_turns=wm_policy.max_recent_turns,
             keep_first_turn=wm_policy.keep_first_turn,
             estimator=estimator,
+            absolute_cap_tokens=wm_policy.absolute_cap_tokens,
         )
     # Phase 3 — resolve the tool-output-budget master switch:
     # effective = platform AND agent. Platform = the control-plane-resolved value

@@ -209,6 +209,39 @@ DEFAULT_STREAM_MODE = "updates"
 #: ``hide_events`` (see ``sse_consumer``).
 SYSTEM_PROMPT_EVENT = "system_prompt"
 
+#: B-126 (fix round 1, I2) — ``AgentState`` channels that are internal
+#: bookkeeping, never run output: an ``updates`` chunk publishes a node's
+#: *entire* write dict verbatim (no allowlist, unlike ``_worker_events.
+#: build_worker_update_frame``'s explicit ``step_count``/``messages`` pick),
+#: and the same ``data`` object is also persisted to ``run_event`` by
+#: ``_publish_frame`` below. ``context_summary`` carries a condensed
+#: restatement of customer conversation content (L2 compression's rolling
+#: summary, see ``orchestrator.context.compressor``) that has no business
+#: reaching a live SSE subscriber, a third-party API consumer, or the
+#: debug console's raw "updates" view, nor being duplicated into the
+#: durable event log. Stripped once, at the single choke point both paths
+#: share — see ``_strip_internal_state_keys``.
+_INTERNAL_STATE_KEYS: frozenset[str] = frozenset({"context_summary"})
+
+
+def _strip_internal_state_keys(chunk: Any) -> Any:
+    """Remove :data:`_INTERNAL_STATE_KEYS` from every node's writes in an
+    ``updates``-mode chunk (``{node_name: {key: value, ...}}``).
+
+    Returns a new object — never mutates ``chunk``. Non-dict / non-dict-writes
+    shapes pass through unchanged (defensive: an unexpected chunk shape must
+    never crash the stream loop)."""
+    if not isinstance(chunk, dict):
+        return chunk
+    return {
+        node: (
+            {k: v for k, v in writes.items() if k not in _INTERNAL_STATE_KEYS}
+            if isinstance(writes, dict)
+            else writes
+        )
+        for node, writes in chunk.items()
+    }
+
 
 def _system_prompt_of(graph_input: Any) -> str | None:
     """The ``SystemMessage`` text at the head of a fresh run's input, else None.
@@ -773,6 +806,12 @@ async def run_agent(
                                 _durable_resume_seconds.observe(ttft)
                             first_chunk_seen = True
                         jsonable_chunk = _to_jsonable(chunk)
+                        # B-126 (fix round 1, I2) — strip internal-only state
+                        # keys BEFORE anything downstream sees this chunk: the
+                        # SAME object is published live (bridge) and persisted
+                        # (run_event) by ``_publish_frame`` below, so one strip
+                        # here covers both.
+                        jsonable_chunk = _strip_internal_state_keys(jsonable_chunk)
                         # 一期 Task 3 —— agent 节点的 updates 帧是无 token 流
                         # 时用户第一次看到内容的时刻。必须挑 agent 那帧:
                         # first_chunk_seen 认的是任意第一个节点,有 recall 的

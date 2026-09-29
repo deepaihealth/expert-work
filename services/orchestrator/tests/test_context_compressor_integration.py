@@ -25,6 +25,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.runtime.checkpointer import make_checkpointer
+from expert_work.runtime.middleware import LoopDetectionMiddleware, MiddlewareChain
 from orchestrator import (
     GraphRunner,
     ToolContext,
@@ -415,3 +416,118 @@ async def test_compressor_summary_is_a_system_message_not_a_human_message() -> N
     summary_msgs = [m for m in prompt if isinstance(m, SystemMessage)]
     assert len(summary_msgs) == 1
     assert "<context-summary>" in str(summary_msgs[0].content)
+
+
+# ---------------------------------------------------------------------------
+# B-126 Task 5 — cached summary written back to the checkpoint, reused
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "use_after_llm_chain",
+    [False, True],
+    ids=["update_plain", "update_mw"],
+)
+async def test_agent_node_reuses_cached_summary_across_turns(use_after_llm_chain: bool) -> None:
+    """The summary a turn's compression produces is written back into the
+    checkpoint (``state["context_summary"]``); the next turn — one short
+    HumanMessage added on top of the same over-threshold history — reuses
+    it via ``through_id`` instead of calling the summariser LLM again.
+
+    Final-review fix — ``context_summary`` is only ever written on the
+    ``update_mw`` return path (``builder.py``'s ``after_llm_chain is not
+    None`` branch); in PRODUCTION that branch is ALWAYS taken
+    (``LoopDetectionMiddleware`` is always registered at ``after_llm_call``)
+    but every graph test up to this point only ever built the graph with
+    ``after_llm_chain=None``, so the write on line ~1437 had zero test
+    coverage and a reviewer had to catch it by inspection. Parametrised over
+    both paths — ``update_mw`` uses the REAL ``LoopDetectionMiddleware``
+    (not a hand-rolled no-op), matching production exactly and the existing
+    ``test_agent_node_stamp.py`` precedent for covering this same branch
+    split. The middleware is a no-op here regardless (it only acts on 3
+    identical tool calls in a row; this conversation has none), so both
+    parametrisations must produce byte-identical assertions below."""
+
+    @dataclass
+    class _CountingSummariser:
+        summary_text: str = "- topic recap"
+        calls: int = 0
+
+        async def __call__(
+            self,
+            *,
+            messages: Sequence[BaseMessage],
+            tools: Sequence[ToolSpec],
+        ) -> AIMessage:
+            del messages, tools
+            self.calls += 1
+            return AIMessage(content=self.summary_text)
+
+    summariser = _CountingSummariser()
+    compressor = ContextCompressor(
+        llm_caller=summariser,
+        context_window=2000,
+        threshold_pct=0.5,
+        head_keep=1,
+        tail_keep=2,
+    )
+    agent_llm = _RecordingLLM()
+    after_llm_chain = (
+        MiddlewareChain.from_middlewares("after_llm_call", [LoopDetectionMiddleware()])
+        if use_after_llm_chain
+        else None
+    )
+    graph = build_react_graph(
+        llm_caller=agent_llm,
+        tool_registry=ToolRegistry(),
+        context_compressor=compressor,
+        after_llm_chain=after_llm_chain,
+    )
+    # 20 messages x 400 chars = 2000 tokens — over the 1000 threshold.
+    history: list[BaseMessage] = [HumanMessage(content=_pad(f"m-{i}-", 400)) for i in range(20)]
+
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(graph)
+        cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
+
+        await compiled.ainvoke(
+            {"messages": history, "step_count": 0, "max_steps": 5},
+            config=cfg,
+        )
+        assert summariser.calls == 1
+
+        snapshot = await compiled.aget_state(cfg)
+        cached = snapshot.values.get("context_summary")
+        assert cached and cached.get("through_id")
+
+        calls_before_turn2 = summariser.calls
+        # Turn 2 — the raw checkpointed history only grows by turn 1's
+        # reply plus this one short message, so it stays over threshold,
+        # but the part that pushes it over is already inside the cached
+        # summary's coverage.
+        await compiled.ainvoke(
+            {"messages": [HumanMessage(content="one more short thing")]},
+            config=cfg,
+        )
+
+        # I3 — pin the EXACT reused sequence: head (m0), the reused summary,
+        # every message strictly after through_id in order (m18, m19 — the
+        # span between the cached boundary and the old tail), then the new
+        # tail (turn 1's own reply + this turn's new message). An off-by-one
+        # at the cut point (too small: duplicates through_id's own message
+        # back in; too large: drops the first genuinely-new message) changes
+        # this sequence without changing ``summariser.calls`` — that's why a
+        # call-count-only assertion doesn't catch it.
+        prompt = agent_llm.calls[-1]
+        assert len(prompt) == 6
+        assert prompt[0].content == history[0].content
+        assert isinstance(prompt[1], SystemMessage)
+        assert "<context-summary>" in str(prompt[1].content)
+        assert "topic recap" in str(prompt[1].content)
+        assert prompt[2].content == history[18].content
+        assert prompt[3].content == history[19].content
+        assert prompt[4].content == "done"
+        assert prompt[5].content == "one more short thing"
+
+    assert summariser.calls == calls_before_turn2

@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI
 from orchestrator.context import (
+    CachedSummary,
     CompactionStats,
     ContextCompressor,
     ContextOverflowError,
@@ -868,3 +869,243 @@ def test_floor_head_keep_leaves_positive_values_untouched() -> None:
     assert floor_head_keep_for_injection(1, per_session_memory_active=True) == 1
     assert floor_head_keep_for_injection(4, per_session_memory_active=True) == 4
     assert floor_head_keep_for_injection(4, per_session_memory_active=False) == 4
+
+
+def test_b126_compressor_threshold_capped() -> None:
+    async def _never(**_: object):
+        raise AssertionError("summariser must not be called")
+
+    assert (
+        ContextCompressor(llm_caller=_never, context_window=1_000_000).threshold_tokens == 200_000
+    )
+    assert ContextCompressor(llm_caller=_never, context_window=100_000).threshold_tokens == 70_000
+
+
+# ---------------------------------------------------------------------------
+# B-126 Task 5 — cached summary written back to the checkpoint, reused
+# ---------------------------------------------------------------------------
+
+
+def _conv(n: int, pad: int = 400) -> list[BaseMessage]:
+    out: list[BaseMessage] = []
+    for i in range(n):
+        out.append(HumanMessage(content=f"u{i} " + "z" * pad, id=f"h{i}"))
+        out.append(AIMessage(content=f"a{i} " + "z" * pad, id=f"a{i}"))
+    return out
+
+
+@dataclass
+class _CountingLLM:
+    calls: int = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del messages, tools
+        self.calls += 1
+        return AIMessage(content="SUMMARY")
+
+
+async def test_summary_is_reported_with_through_id() -> None:
+    llm = _CountingLLM()
+    got: list[CachedSummary] = []
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=2
+    )
+    await c.compress(_conv(10), on_summary=got.append)
+    assert llm.calls == 1
+    assert got and got[-1].through_id and "SUMMARY" in got[-1].text
+
+
+async def test_cached_summary_reused_without_llm_call() -> None:
+    llm = _CountingLLM()
+    got: list[CachedSummary] = []
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=2
+    )
+    msgs = _conv(10)
+    await c.compress(msgs, on_summary=got.append)
+    llm.calls = 0
+    # I3 — resending the byte-identical ``msgs`` makes "everything after
+    # through_id" trivially empty (through_id is chosen as the LAST message
+    # in round 1's middle), so a cut-point off-by-one has nothing to
+    # disturb and slips past. Grow the history by one turn — mirrors what
+    # actually happens cross-turn (builder.py always re-reads the FULL raw
+    # checkpointed history, which only ever grows) — so through_id's
+    # message (h/a-8's pair boundary) lands strictly inside the new middle,
+    # with genuinely new content (h9/a9, previously the tail) after it.
+    grown = [
+        *msgs,
+        HumanMessage(content="u10 new", id="h10"),
+        AIMessage(content="a10 new", id="a10"),
+    ]
+    out = await c.compress(grown, cached_summary=got[-1])
+    assert llm.calls == 0
+    # Exact reused sequence: head(h0), the reused summary, every message
+    # strictly after through_id in order (h9, a9 — round 1's own tail,
+    # pushed into the new middle by growth), then the new tail (h10, a10).
+    # A ``cut`` off-by-one (too small → a8 reappears; too large → h9 is
+    # dropped) changes this sequence without ever touching ``llm.calls``.
+    assert len(out) == 6
+    assert out[0] is msgs[0]  # h0
+    assert isinstance(out[1], SystemMessage)
+    assert str(out[1].content) == got[-1].text
+    assert out[2] is msgs[18]  # h9
+    assert out[3] is msgs[19]  # a9
+    assert out[4] is grown[20]  # h10
+    assert out[5] is grown[21]  # a10
+
+
+async def test_stale_cached_summary_is_ignored() -> None:
+    llm = _CountingLLM()
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=2
+    )
+    stale = CachedSummary(through_id="not-in-view", text="<context-summary>OLD</context-summary>")
+    out = await c.compress(_conv(10), cached_summary=stale)
+    assert llm.calls == 1
+    assert "OLD" not in "\n".join(str(m.content) for m in out)
+
+
+async def test_on_cache_hit_fires_only_on_a_genuine_match() -> None:
+    """§3.9 — ``on_cache_hit`` is the signal ``builder.py`` uses for the
+    ``cm.summary.reused`` span attribute (a bare boolean, never the summary
+    text). It must fire when ``cached_summary`` is genuinely spliced in
+    (even on a full cache hit with zero further LLM passes), and must NOT
+    fire on a stale miss."""
+    llm = _CountingLLM()
+    got: list[CachedSummary] = []
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=2
+    )
+    msgs = _conv(10)
+    hits: list[bool] = []
+    await c.compress(msgs, on_summary=got.append, on_cache_hit=hits.append)
+    assert hits == [], "round 1 has no cache to hit"
+
+    hits.clear()
+    await c.compress(msgs, cached_summary=got[-1], on_cache_hit=lambda: hits.append(True))
+    assert hits == [True], "a genuine (byte-identical resend) cache match must fire once"
+
+    hits.clear()
+    stale = CachedSummary(through_id="not-in-view", text="<context-summary>OLD</context-summary>")
+    await c.compress(msgs, cached_summary=stale, on_cache_hit=lambda: hits.append(True))
+    assert hits == [], "a stale miss must never report a cache hit"
+
+
+# ---------------------------------------------------------------------------
+# B-126 fix round 1, I1 — head_keep=0 must not strand the reused summary
+# ---------------------------------------------------------------------------
+
+#: Tags the stub below scans its own prompt for. Small + fixed, scanned by
+#: substring membership (never by character position — position-based
+#: truncation is fragile once a marker sits behind a variable-length prior
+#: summary from an earlier round).
+_I1_TAGS: tuple[str, ...] = ("SUMMARY1", "u9", "u10")
+
+
+@dataclass
+class _TagScanLLM:
+    """Round 1 returns the fixed marker ``SUMMARY1``. Every later call
+    scans its OWN prompt (which ``_summarise_update`` builds as
+    ``f"PREVIOUS SUMMARY:\\n{prior}\\n\\nNEW EVENTS:\\n{transcript}"``) for
+    :data:`_I1_TAGS` and echoes back exactly which ones it found — a short,
+    bounded output (never grows across chained rounds, unlike echoing the
+    prompt verbatim would) that still proves two things: the call really
+    was CM-7 UPDATE mode (it received ``PREVIOUS SUMMARY`` — only reachable
+    when the reused summary is recognised as ``prior``, i.e. NOT stranded
+    as a fake leading system message), and which new content rolled in.
+    """
+
+    calls: int = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del tools
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(content="SUMMARY1")
+        text = "\n".join(str(m.content) for m in messages)
+        seen = [tag for tag in _I1_TAGS if tag in text]
+        return AIMessage(content=f"SUMMARY{self.calls}[{','.join(seen)}]")
+
+
+async def test_head_keep_zero_reuse_survives_two_growth_rounds() -> None:
+    """I1 repro — the reviewer found that with ``head_keep=0`` the reused
+    summary sits with nothing separating it from (empty) leading systems;
+    pre-fix, ``_split``'s leading-system scan swallowed it, CM-7 update
+    mode never fired (a fresh, disconnected summary was produced instead),
+    and ``_summary_text_of`` kept reporting the FIRST (stale) summary
+    forever after while ``through_id`` kept advancing (through_id moved
+    a8→a14, text stayed SUMMARY1 in the repro). Two consecutive growth
+    rounds prove the fix holds under repeated reuse, not just once.
+    """
+    llm = _TagScanLLM()
+    got: list[CachedSummary] = []
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.3, head_keep=0, tail_keep=2
+    )
+
+    round1 = _conv(10)
+    await c.compress(round1, on_summary=got.append)
+    assert llm.calls == 1
+    through1 = got[-1].through_id
+
+    # Growth round 1 — forces a genuine UPDATE pass (round1's own tail,
+    # u9/a9, rolls into the summarised middle).
+    round2 = [
+        *round1,
+        HumanMessage(content="u10 " + "z" * 400, id="h10"),
+        AIMessage(content="a10 " + "z" * 400, id="a10"),
+    ]
+    await c.compress(round2, cached_summary=got[-1], on_summary=got.append)
+    assert llm.calls == 2, "growth must force a genuine UPDATE pass, not a full cache hit"
+    through2 = got[-1].through_id
+    text2 = got[-1].text
+    assert through2 != through1, "through_id must advance"
+    assert "SUMMARY1" in text2, "round 2 lost round 1's content — the stale-first-match bug"
+    assert "u9" in text2, "round 2 is missing its own new events (round 1's rolled-off tail)"
+
+    # Growth round 2 — on top of round 2's already-merged text (round2's
+    # own tail, u10/a10, now rolls in).
+    round3 = [
+        *round2,
+        HumanMessage(content="u11 " + "z" * 400, id="h11"),
+        AIMessage(content="a11 " + "z" * 400, id="a11"),
+    ]
+    await c.compress(round3, cached_summary=got[-1], on_summary=got.append)
+    assert llm.calls == 3
+    through3 = got[-1].through_id
+    text3 = got[-1].text
+    assert through3 != through2, "through_id must advance again"
+    assert "SUMMARY1" in text3, "round 3 lost round 1's content across two reuse rounds"
+    assert "u9" in text3, "round 3 lost round 2's content"
+    assert "u10" in text3, "round 3 is missing its own new events (round 2's rolled-off tail)"
+
+
+async def test_on_summary_text_is_the_pass_summary_not_a_tail_look_alike() -> None:
+    """B-126 (fix round 2) — a kept-verbatim TAIL message that happens to
+    also start with the ``<context-summary>`` tag (a system-prompt copy or
+    template literally beginning with that string — the reviewer's repro)
+    must never be mistaken for the summary this pass just produced.
+    Before this fix, ``on_summary``'s text came from a reverse scan over
+    the WHOLE post-pass message list — ``wrapped`` is followed by
+    ``*split.tail`` in that list, so a look-alike tail message sitting
+    after it would win the scan first. Now ``_compress_once`` hands
+    ``wrapped`` straight back to the caller; there is no scan to fool."""
+    llm = _CountingLLM()
+    got: list[CachedSummary] = []
+    decoy_tail = SystemMessage(
+        content="<context-summary>DECOY not the real summary</context-summary>",
+        id="decoy",
+    )
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=1
+    )
+    msgs = [*_conv(10), decoy_tail]
+    await c.compress(msgs, on_summary=got.append)
+    assert llm.calls == 1
+    assert got, "no summary reported"
+    assert "SUMMARY" in got[-1].text
+    assert "DECOY" not in got[-1].text

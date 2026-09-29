@@ -19,7 +19,8 @@ def test_required_keys_present() -> None:
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
     ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``,
-    B-64 ``viewed_figures`` / ``figure_documents``
+    B-64 ``viewed_figures`` / ``figure_documents``,
+    B-126 ``context_summary``
     (last twenty-three ``NotRequired``)。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
@@ -57,6 +58,7 @@ def test_required_keys_present() -> None:
         "plan_first_dispatch_retries",
         "viewed_figures",
         "figure_documents",
+        "context_summary",
     }
 
 
