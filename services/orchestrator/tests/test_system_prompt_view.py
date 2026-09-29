@@ -78,8 +78,10 @@ def test_input_is_not_mutated() -> None:
         HumanMessage(content="u2"),
     ]
     snapshot = list(messages)
-    keep_latest_system_prompt(messages)
+    out = keep_latest_system_prompt(messages)
     assert messages == snapshot
+    assert out is not messages
+    assert keep_latest_system_prompt(snapshot[:2]) is not snapshot
 
 
 # ------------------------------------------------------------------ wiring
