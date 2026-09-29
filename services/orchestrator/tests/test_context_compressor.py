@@ -868,3 +868,13 @@ def test_floor_head_keep_leaves_positive_values_untouched() -> None:
     assert floor_head_keep_for_injection(1, per_session_memory_active=True) == 1
     assert floor_head_keep_for_injection(4, per_session_memory_active=True) == 4
     assert floor_head_keep_for_injection(4, per_session_memory_active=False) == 4
+
+
+def test_b126_compressor_threshold_capped() -> None:
+    async def _never(**_: object):
+        raise AssertionError("summariser must not be called")
+
+    assert (
+        ContextCompressor(llm_caller=_never, context_window=1_000_000).threshold_tokens == 200_000
+    )
+    assert ContextCompressor(llm_caller=_never, context_window=100_000).threshold_tokens == 70_000

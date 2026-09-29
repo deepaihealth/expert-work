@@ -518,6 +518,8 @@ class ContextCompressor:
     #: unit tests stay network-free); the factory injects the shared
     #: tiktoken-backed estimator.
     estimator: TokenEstimator | None = None
+    #: B-126 —— 门槛 = min(窗口 x 百分比, 本值);大窗口模型不再等到 70%。
+    absolute_cap_tokens: int = 200_000
     #: RT-ADR-6 — per-conversation consecutive-failure streaks, keyed by
     #: the ``streak_key`` handed to :meth:`compress` (thread_id in
     #: production; this instance is shared across conversations). A
@@ -533,7 +535,7 @@ class ContextCompressor:
         """Token threshold above which a preflight should trigger a
         compression. The agent_node preflight uses ``>=`` against this
         value to decide whether to call :meth:`compress`."""
-        return int(self.context_window * self.threshold_pct)
+        return min(int(self.context_window * self.threshold_pct), self.absolute_cap_tokens)
 
     def _estimate(self, messages: Sequence[BaseMessage]) -> int:
         return estimate_tokens(messages, estimator=self.estimator)
