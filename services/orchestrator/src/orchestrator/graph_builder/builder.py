@@ -349,7 +349,8 @@ _cm_working_window_dropped_turns = expert_work_gauge(
 #: B-126 —— 跨轮无损清理省下的 token(估算)累计;配合 run 级日志算账。
 _cm_cross_turn_reclaimed_tokens = expert_work_counter(
     "expert_work_cm_cross_turn_reclaimed_tokens_total",
-    "Estimated tokens reclaimed by the cross-turn tool-result prune (B-126).",
+    "Estimated prompt tokens not sent thanks to the cross-turn tool-result prune "
+    "(B-126), summed over model calls (a turn with N calls counts N times).",
 )
 #: Stream CM-3 — pre-compaction flush passes by outcome. ``flushed`` =
 #: memories written from the discarded middle; ``empty`` = nothing

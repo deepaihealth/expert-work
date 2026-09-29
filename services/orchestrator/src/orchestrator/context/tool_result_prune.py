@@ -514,7 +514,8 @@ class ToolResultPruner:
             )
             msgs, pruned, reclaimed = cross.messages, cross.pruned_count, cross.reclaimed_tokens
             if pruned:
-                logger.info(
+                # Recomputed identically on every call of a turn — DEBUG, not INFO.
+                logger.debug(
                     "tool_result_prune.cross_turn count=%d reclaimed_tokens=%d", pruned, reclaimed
                 )
         if not self.should_prune(msgs):

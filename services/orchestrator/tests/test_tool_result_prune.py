@@ -113,6 +113,25 @@ def test_ask_image_conclusion_is_never_pruned_same_turn() -> None:
     assert _collapsed(tools["tc-1"])
 
 
+def test_ask_image_does_not_take_a_recent_protected_slot() -> None:
+    """With ``kept=1`` and ``ask_image`` last, the protected slot goes to the most
+    recent *ordinary* result, not to the exempt image conclusion."""
+    msgs: list[BaseMessage] = [
+        HumanMessage(content="go"),
+        _ai_call("tc-0"),
+        _tool(f"{_BIG}#0", call_id="tc-0"),
+        _ai_call("tc-1"),
+        _tool(f"{_BIG}#1", call_id="tc-1"),
+        _ai_call("v2"),
+        _tool(f"{_BIG}#v2", call_id="v2", name="ask_image"),
+    ]
+    res = _pruner(kept=1).apply(msgs)
+    tools = {m.tool_call_id: m for m in _tools(res.messages)}
+    assert _collapsed(tools["tc-0"])
+    assert str(tools["tc-1"].content) == f"{_BIG}#1"
+    assert str(tools["v2"].content) == f"{_BIG}#v2"
+
+
 def test_externalized_result_pruned_to_footer_only_lossless() -> None:
     rel = ".tool_results/run-abc/tc-0-web_search.txt"
     footer = render_overflow_footer(rel=rel, total_chars=50_000)
