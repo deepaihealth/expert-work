@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 PLATFORM_SKILLS = Path(__file__).resolve().parents[1]
-EXPECTED_SKILLS = ("docx", "pptx", "xlsx", "pdf")
+ALL_SKILLS = ("docx", "pptx", "xlsx", "pdf", "health-plan-report")
 
 
 def _load_build():

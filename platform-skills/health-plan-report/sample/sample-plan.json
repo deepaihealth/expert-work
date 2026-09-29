@@ -1,0 +1,114 @@
+{
+  "schema_version": "1",
+  "title": "李先生健康管理方案",
+  "subtitle": "第 1 阶段 · 2 周 ｜ 控糖与体重管理",
+  "period": {"label": "第 1 阶段", "weeks": 2},
+  "generated_at": "2026-09-28",
+  "data_basis": "近 30 天记录",
+  "client": {
+    "name": "李先生",
+    "facts": [
+      {"label": "性别 / 年龄", "value": "男 · 48 岁"},
+      {"label": "身高 / 体重", "value": "172 cm · 77.0 kg"},
+      {"label": "管理方向", "value": "控糖 + 体重管理"}
+    ]
+  },
+  "manager": {"name": "王老师", "title": "健康管理师"},
+  "brand": {
+    "org_name": "示例健康管理中心",
+    "footer_signature": "健康管理团队",
+    "disclaimer": "本方案为生活方式管理建议，不构成医学诊断或治疗建议；如有不适请及时就医。"
+  },
+  "sections": [
+    {"id": "summary", "title": "一页看懂", "blocks": [
+      {"kind": "summary", "items": [
+        {"label": "核心问题", "text": "空腹血糖略高于参考范围，体重超出目标约 5 kg。"},
+        {"label": "阶段目标", "text": "两周内空腹血糖回到 6.1 以下，体重下降 1.0–1.5 kg。"},
+        {"label": "关键行动", "text": "控制总热量、餐后快走 30 分钟、每天记录血糖与体重。"}
+      ]}
+    ]},
+    {"id": "profile", "title": "健康画像", "blocks": [
+      {"kind": "profile", "items": [
+        {"name": "空腹血糖", "value": 6.4, "unit": "mmol/L", "ref_low": 3.9, "ref_high": 6.1, "position": "above"},
+        {"name": "BMI", "value": 26.0, "ref_low": 18.5, "ref_high": 23.9, "position": "above"},
+        {"name": "体脂率", "value": 31.5, "unit": "%", "ref_low": 20, "ref_high": 30, "position": "above"},
+        {"name": "血尿酸", "value": 398, "unit": "μmol/L", "ref_low": 208, "ref_high": 428, "position": "within"}
+      ]},
+      {"kind": "issues", "items": [
+        {"title": "血糖偏高", "evidence": "近 30 天空腹血糖有 9 天高于 6.1", "level": "focus"},
+        {"title": "体重超标", "evidence": "BMI 26.0，较目标高约 5 kg", "level": "focus"},
+        {"title": "肌肉量偏低", "evidence": "骨骼肌 22.4 kg，减重期需保肌", "level": "watch"}
+      ]}
+    ]},
+    {"id": "trend", "title": "近 30 天趋势", "blocks": [
+      {"kind": "trend", "metric": "空腹血糖", "unit": "mmol/L", "target_low": 4.4, "target_high": 6.1,
+       "ref_text": "虚线为本阶段目标区间。", "points": [
+        {"date": "2026-08-30", "value": 6.8}, {"date": "2026-09-03", "value": 6.9},
+        {"date": "2026-09-07", "value": 6.6}, {"date": "2026-09-11", "value": 6.7},
+        {"date": "2026-09-15", "value": 6.5}, {"date": "2026-09-19", "value": 6.3},
+        {"date": "2026-09-23", "value": 6.4}, {"date": "2026-09-27", "value": 6.2}
+      ]},
+      {"kind": "image", "path": "trend-note.png", "caption": "示例配图（虚构）"}
+    ]},
+    {"id": "goals", "title": "阶段目标与计划", "blocks": [
+      {"kind": "goals", "items": [
+        {"name": "空腹血糖", "current": 6.4, "target": "< 6.1", "unit": "mmol/L", "due": "2 周"},
+        {"name": "体重", "current": 77.0, "target": "75.5–76.0", "unit": "kg", "due": "2 周", "note": "每周下降 0.5–0.8 kg"}
+      ]},
+      {"kind": "phases", "items": [
+        {"label": "第 1 周", "focus": [{"area": "饮食", "text": "按 A/B 模板执行，记录三餐"}, {"area": "运动", "text": "餐后快走 25 分钟，每周 5 次"}]},
+        {"label": "第 2 周", "focus": [{"area": "饮食", "text": "复盘餐后血糖，调整进食顺序"}, {"area": "运动", "text": "快走 30 分钟，加入 2 次抗阻"}]}
+      ]}
+    ]},
+    {"id": "diet", "title": "饮食安排", "blocks": [
+      {"kind": "nutrition", "energy_kcal": 1650, "macros": [
+        {"name": "碳水化合物", "grams": 185, "percent": 45},
+        {"name": "蛋白质", "grams": 95, "percent": 23},
+        {"name": "脂肪", "grams": 58, "percent": 32}
+      ], "meals": [
+        {"name": "早餐", "percent": 25}, {"name": "午餐", "percent": 35, "note": "主食粗细搭配"},
+        {"name": "晚餐", "percent": 30}, {"name": "加餐", "percent": 10, "note": "水果或坚果"}
+      ]},
+      {"kind": "meal_plan", "templates": [
+        {"name": "A 模板", "applies_to": "周一 / 三 / 五 / 日", "meals": [
+          {"name": "早餐", "time": "7:30", "foods": [{"name": "杂粮馒头", "amount": "50 g"}, {"name": "鸡蛋", "amount": "1 个"}, {"name": "无糖豆浆", "amount": "250 ml"}], "kcal": 420},
+          {"name": "午餐", "time": "12:00", "foods": [{"name": "杂粮饭", "amount": "75 g"}, {"name": "去皮鸡腿肉", "amount": "100 g"}, {"name": "清炒时蔬", "amount": "200 g"}], "kcal": 580},
+          {"name": "晚餐", "time": "18:30", "foods": [{"name": "荞麦面", "amount": "50 g"}, {"name": "清蒸鱼", "amount": "100 g"}, {"name": "蔬菜", "amount": "200 g"}], "kcal": 480}
+        ]}
+      ]},
+      {"kind": "diet_rules", "recommend": ["粗细搭配的主食", "每餐先吃蔬菜"], "limit": ["水果每天不超过 200 g"], "avoid": ["含糖饮料", "动物内脏、浓肉汤"], "swaps": [{"from": "白米饭", "to": "杂粮饭"}]},
+      {"kind": "shopping", "groups": [
+        {"name": "主食", "items": ["燕麦", "荞麦面", "杂粮米"]},
+        {"name": "蛋白质", "items": ["鸡蛋", "鸡腿肉", "鱼", "豆腐"]},
+        {"name": "蔬果", "items": ["西兰花", "黄瓜", "苹果"]}
+      ]}
+    ]},
+    {"id": "exercise", "title": "运动安排", "blocks": [
+      {"kind": "exercise", "fitt": {"frequency": "每周 5 次", "intensity": "中等，微微出汗能说话", "time": "每次 30 分钟", "type": "餐后快走 + 抗阻"},
+       "schedule": [{"day": "周一 / 三 / 五", "items": ["快走 30 分钟"]}, {"day": "周二 / 四", "items": ["靠墙静蹲 3 组", "弹力带划船 3 组"]}],
+       "progression": "第 2 周起快走延长到 35 分钟。", "cautions": ["运动中头晕、心慌立即停止", "空腹时不做中等以上强度运动"]},
+      {"kind": "material", "name": "快走动作示范", "description": "示范视频说明快走姿势与呼吸节奏（虚构素材）。", "url": "https://example.com/materials/brisk-walk"}
+    ]},
+    {"id": "lifestyle", "title": "睡眠与生活方式", "blocks": [
+      {"kind": "sleep", "current": {"bed": "00:30", "wake": "07:00"}, "target": {"bed": "23:00", "wake": "06:30"}, "tips": ["睡前 1 小时不看手机", "午睡不超过 30 分钟"]},
+      {"kind": "stress", "status": "工作压力较大，晚间易焦虑。", "methods": [{"name": "腹式呼吸", "how": "吸 4 秒、呼 6 秒", "frequency": "每天 2 次"}, {"name": "晚间散步", "frequency": "每周 3 次"}]},
+      {"kind": "habits", "items": [{"name": "饮酒", "current": "每周 3 次", "target": "每周不超过 1 次", "how": "聚餐改喝无糖茶"}, {"name": "久坐", "current": "连续坐 3 小时", "target": "每小时起身 5 分钟"}]}
+    ]},
+    {"id": "monitoring", "title": "监测计划", "blocks": [
+      {"kind": "monitoring", "items": [
+        {"item": "空腹血糖", "frequency": "每周 4 次", "timing": "晨起空腹", "alert": "≥ 7.0 连续 2 次请联系管理师"},
+        {"item": "体重", "frequency": "每天 1 次", "timing": "晨起排便后"},
+        {"item": "腰围", "frequency": "每周 1 次"}
+      ]},
+      {"kind": "table", "columns": ["日期", "空腹血糖", "体重", "备注"], "rows": [["第 1 天", "—", "—", "—"], ["第 2 天", "—", "—", "—"]]}
+    ]},
+    {"id": "notes", "title": "注意事项", "blocks": [
+      {"kind": "referral", "text": "如出现持续口渴多尿、视物模糊等情况，建议先就医确认。"},
+      {"kind": "callout", "level": "warn", "title": "提醒", "text": "方案执行中如有不适请暂停并联系健康管理师。"},
+      {"kind": "bullets", "items": ["按时记录数据", "两周后复盘调整"]},
+      {"kind": "paragraph", "text": "家人可协助准备清淡餐食，提醒按时运动。"},
+      {"kind": "kv", "items": [{"label": "反馈方式", "value": "企业微信"}, {"label": "响应时间", "value": "工作日 24 小时内"}]},
+      {"kind": "follow_up", "items": [{"label": "复评日期", "value": "2026-10-12"}, {"label": "负责管理师", "value": "王老师"}]}
+    ]}
+  ]
+}
