@@ -1232,14 +1232,62 @@ class ArgBindingSpec(BaseModel):
     on a different server is very likely not the same thing (``project_code``
     is the archetype). Hence there is **no** global by-parameter-name rule;
     every binding is listed one by one, explicitly (spec §十一 之二).
+
+    B-127 — ``fixed`` pins a parameter to a constant written in the config
+    itself (``detail_level: brief``). Same strip-and-fill path as ``args``;
+    the only difference is where the value comes from: the manifest, not this
+    turn's ``inputs``. So nobody has to remember to pass it on every run, and
+    nobody has to remember to say it in the prompt.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     server: str = Field(min_length=1)
     tool: str = Field(min_length=1)
-    #: Tool parameter name → declared prompt variable name. At least one entry.
-    args: dict[str, str] = Field(min_length=1)
+    #: Tool parameter name → declared prompt variable name.
+    args: dict[str, str] = Field(default_factory=dict)
+    #: B-127 —— 工具参数名 → 固定值。只收字符串(唯一的真实用例是个枚举字面量)。
+    fixed: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_args_and_fixed(self) -> ArgBindingSpec:
+        """B-127 —— ``args`` / ``fixed`` 至少一边非空、两边的参数名不相交、固定值非空白。
+
+        「变量必须已声明」那条不在这里:声明集在兄弟块里,归
+        ``AgentSpecBody._check_arg_bindings``,且只管 ``args``。
+        """
+        where = f"{self.server}/{self.tool}"
+        if not self.args and not self.fixed:
+            msg = f"{where} binds nothing: set args and/or fixed"
+            raise ValueError(msg)
+        # 同一个参数既绑变量又写死:谁覆盖谁都是悄悄丢掉一份配置,直接拒。
+        both = sorted(self.args.keys() & self.fixed.keys())
+        if both:
+            msg = f"{where}: a parameter cannot be in both args and fixed: {both}"
+            raise ValueError(msg)
+        for param, value in self.fixed.items():
+            if not param.strip() or not value.strip():
+                msg = f"{where}: fixed parameter names and values must be non-empty"
+                raise ValueError(msg)
+        return self
+
+    @model_serializer(mode="wrap")
+    # 与 ``MCPToolSpec._omit_empty_arg_bindings`` 同一条理由、同一种写法(不标注返回类型,
+    # 否则 serialization-mode JSON Schema 塌成 additionalProperties)。
+    def _omit_empty_fixed(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """B-127 —— 空的 ``fixed`` 不落库。
+
+        存库走 ``model_dump(mode="json")``,默认值会被物化 —— 不拦这一下,字段一上线,
+        每个配过变量绑定的 agent 只要保存过就带 ``fixed: {}``;回滚到旧版本后
+        ``extra="forbid"`` 会把它们全拒掉。省略空值,「会坏」的范围缩到真配了固定值的
+        那几个;连带存量 manifest 的 ``compute_spec_sha256`` 不变。
+        """
+        data: dict[str, Any] = handler(self)
+        if not self.fixed:
+            data.pop("fixed", None)
+        return data
 
 
 class MCPToolSpec(BaseModel):
@@ -1568,6 +1616,9 @@ class AgentSpecBody(BaseModel):
         entry's ``allow_tools``; (4) a binding pointing at a name that
         ``system_prompt.variables`` does not declare. Empty ``servers`` /
         ``allow_tools`` mean "all", so (2) / (3) do not apply there.
+
+        B-127 —— (1)-(3) 管的是整条绑定,``fixed`` 也算;(4) 只看 ``args`` 的值:
+        ``fixed`` 的值是常量,不是变量名。
 
         这道闸必须在 manifest 层,不在前端:配置页有 YAML 直编、后端有
         ``PUT …/draft``、模板复制会把绑定带到变量集不同的 agent 上,下拉框

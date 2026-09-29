@@ -125,6 +125,34 @@ def test_configuring_a_binding_does_change_the_digest() -> None:
     )
 
 
+#: B-127 —— 一份**配过变量绑定**的 manifest(``_bound_before_b127``)在 B-127 之前
+#: (6215abb0)算出来的指纹,用当时那版协议源码实测得出。``ArgBindingSpec`` 加了
+#: ``fixed``,``args`` 改成可空;没配固定值的绑定落库形态必须一个字节都不变。
+_DIGEST_BOUND_BEFORE_B127 = "e926564e350b8cd8a60ed7797ef97b5a9c47aafa301a38200718a22f45c5277a"
+
+
+def _bound_before_b127() -> dict[str, Any]:
+    raw = _stored()
+    raw["spec"]["system_prompt"] = {"template": "x", "jinja": True, "variables": [{"name": "a"}]}
+    raw["spec"]["tools"][0]["arg_bindings"] = [
+        {"server": "deepcare", "tool": "t", "args": {"p": "a"}}
+    ]
+    return raw
+
+
+def test_the_digest_of_a_variable_only_binding_is_unchanged_by_fixed() -> None:
+    assert compute_spec_sha256(AgentSpec.model_validate(_bound_before_b127())) == (
+        _DIGEST_BOUND_BEFORE_B127
+    )
+
+
+def test_configuring_a_fixed_value_does_change_the_digest() -> None:
+    """反面对照:上一条不能是「指纹对什么都一样」的重言式。"""
+    fixed = _bound_before_b127()
+    fixed["spec"]["tools"][0]["arg_bindings"][0]["fixed"] = {"detail_level": "brief"}
+    assert compute_spec_sha256(AgentSpec.model_validate(fixed)) != _DIGEST_BOUND_BEFORE_B127
+
+
 # B-105 —— ``max_tokens`` 变可空、空值不落库;指纹的规范形态仍是 B-105 之前那样:
 # 空上限按旧默认 4096 算,空的 ``thinking_max_tokens`` 不出现。
 
