@@ -190,3 +190,53 @@ def test_stubs_only_reference_paths_already_in_history() -> None:
     for m in _run(msgs).messages:
         if isinstance(m, ToolMessage) and m.content.startswith("<tool-result-pruned>"):
             assert any(p in m.content for p in own_paths)
+
+
+def test_min_context_gate_scoped_to_boundary_not_full_context() -> None:
+    """R2/D3 —— 门槛只看 ``messages[:boundary + 1]``,不看本轮已经长多大。
+
+    brief ``prune_prior_turns`` docstring 原话:"决定只依赖
+    ``messages[:boundary + 1]``(旧轮次 + 本轮用户消息),所以同一轮内每次调用
+    结果逐字相同、缓存前缀稳定(spec D3 / R2)"。选边界口径而非全量口径 ——
+    若门槛看全量,本轮自己工具调用越喊越多会让门槛中途跳闸,同一轮内的视图
+    (进而缓存前缀)就不稳定,违反上面那条不变式。
+
+    构造:旧轮 2 条中等大小结果(合计 800 tokens,门槛 1500 之下)+ 本轮 2 条
+    ``_BIG``(每条 2000 tokens)。旧轮单独在门槛下,旧轮+本轮合计远超门槛。
+    正确实现(只看旧轮)应判定未过线、什么都不清;若退化成看全量(mutation 2),
+    会判定过线,进而把旧轮里未受保护的那条(a-0)清掉 —— pruned_count 非 0。
+    """
+    small = "m" * 1600  # 400 tokens via chars // 4 — small on its own
+    prior: list[BaseMessage] = [
+        HumanMessage(content="user a"),
+        _call("a-0"),
+        _res("a-0", small),
+        _call("a-1"),
+        _res("a-1", small),
+        AIMessage(content="answer a"),
+    ]
+    msgs = [*prior, *_turn("b", 2)]
+    r = prune_prior_turns(
+        msgs, recent_tool_results_kept=1, min_context_tokens=1500, min_reclaim_tokens=50
+    )
+    assert r.pruned_count == 0
+    assert r.messages == msgs
+
+
+def test_recent_kept_counts_within_prior_turns_only() -> None:
+    """D... —— ``recent_tool_results_kept`` 从旧轮次自己的末尾倒数,不是从整条
+    消息列表的末尾倒数。
+
+    构造:``recent_tool_results_kept=2``,旧轮 3 条大结果 + 本轮 2 条大结果。
+    正确实现只在旧轮 3 条里倒数 2 条保护(a-1、a-2 保留,只清最老的 a-0)。
+    若退化成在全部消息里倒数 2 条(mutation 5),本轮的 2 条工具结果排在最后,
+    会把"保护名额"整个吃掉,旧轮 3 条一条不剩全部被清。
+    """
+    msgs = [*_turn("a", 3), *_turn("b", 2)]
+    r = _run(msgs, recent_tool_results_kept=2)
+    tools = [m for m in r.messages if isinstance(m, ToolMessage)]
+    assert r.pruned_count == 1
+    assert tools[0].content.startswith("<tool-result-pruned>")  # a-0(最老)被清
+    assert tools[1].content.startswith(_BIG)  # a-1 保留(旧轮最近 2 条之一)
+    assert tools[2].content.startswith(_BIG)  # a-2 保留(旧轮最近 2 条之一)
+    assert all(t.content.startswith(_BIG) for t in tools[3:])  # 本轮 b 两条不动
