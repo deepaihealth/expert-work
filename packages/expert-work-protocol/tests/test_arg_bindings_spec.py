@@ -350,6 +350,36 @@ def test_a_blank_fixed_key_or_value_is_rejected(fixed: dict[str, str]) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "fixed",
+    [
+        {"detail_level": "brief "},
+        {"detail_level": " brief"},
+        {"detail_level": "brief\n"},
+        {" detail_level": "brief"},
+        {"detail_level\t": "brief"},
+    ],
+)
+def test_a_fixed_key_or_value_with_surrounding_whitespace_is_rejected(
+    fixed: dict[str, str],
+) -> None:
+    """B-127 —— 固定值原样发给工具:多出来的空格不是「差不多」,而是另一个值
+    (``"brief "`` 对枚举参数就是非法值)。拒掉并说清楚,而不是悄悄 strip。"""
+    with pytest.raises(
+        ValidationError,
+        match=r"records/fetch_record: fixed .* no leading or trailing whitespace",
+    ):
+        AgentSpec.model_validate(
+            _manifest(servers=[], variables=[], bindings=[_fixed_binding(fixed=fixed)])
+        )
+
+
+def test_inner_spaces_in_a_fixed_value_are_fine() -> None:
+    AgentSpec.model_validate(
+        _manifest(servers=[], variables=[], bindings=[_fixed_binding(fixed={"mode": "very brief"})])
+    )
+
+
 def test_a_non_string_fixed_value_is_rejected() -> None:
     """只收字符串(YAGNI:唯一的真实用例是 ``detail_level: brief``)。"""
     with pytest.raises(ValidationError) as excinfo:

@@ -126,16 +126,21 @@ def test_configuring_a_binding_does_change_the_digest() -> None:
 
 
 #: B-127 —— 一份**配过变量绑定**的 manifest(``_bound_before_b127``)在 B-127 之前
-#: (6215abb0)算出来的指纹,用当时那版协议源码实测得出。``ArgBindingSpec`` 加了
+#: (6215abb0)算出来的指纹,用当时那版协议源码实测得出(``git archive 6215abb0 packages``
+#: 解到临时目录、只把它放上 PYTHONPATH 去算;现版源码算出同一个值)。``ArgBindingSpec`` 加了
 #: ``fixed``,``args`` 改成可空;没配固定值的绑定落库形态必须一个字节都不变。
-_DIGEST_BOUND_BEFORE_B127 = "e926564e350b8cd8a60ed7797ef97b5a9c47aafa301a38200718a22f45c5277a"
+_DIGEST_BOUND_BEFORE_B127 = "00fffb30be6c8873f58793168cbf74d15fa7f74c0163180cf648ba6172528824"
 
 
 def _bound_before_b127() -> dict[str, Any]:
     raw = _stored()
     raw["spec"]["system_prompt"] = {"template": "x", "jinja": True, "variables": [{"name": "a"}]}
-    raw["spec"]["tools"][0]["arg_bindings"] = [
-        {"server": "deepcare", "tool": "t", "args": {"p": "a"}}
+    raw["spec"]["tools"] = [
+        {
+            "type": "mcp",
+            "servers": ["records"],
+            "arg_bindings": [{"server": "records", "tool": "fetch_record", "args": {"p": "a"}}],
+        }
     ]
     return raw
 

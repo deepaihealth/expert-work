@@ -106,17 +106,48 @@ async def test_worker_build_keeps_a_fixed_value_on_a_read_tool() -> None:
     带过来;只读过滤只摘写工具,读工具上的固定值照样剥掉、照样登记。"""
     from orchestrator.tools.arg_bindings import ToolArgBindings
 
+    pool = MCPServerPool()
+    schema_in = {
+        "type": "object",
+        "properties": {"record_id": {"type": "string"}, "detail_level": {"type": "string"}},
+    }
+    await pool.add(
+        "records",
+        RecordingMCPClient(
+            tools=(
+                MCPToolDef(
+                    name="fetch_record", description="r", input_schema=schema_in, read_only=True
+                ),
+                MCPToolDef(
+                    name="update_record", description="w", input_schema=schema_in, read_only=False
+                ),
+            )
+        ),
+    )
+    env = replace(
+        ToolEnv(
+            sandbox_runtime=Mock(),
+            artifact_store=Mock(),
+            workspace_store=Mock(),
+            allowlist_provider=_allow_all,
+            mcp_pool=pool,
+        ),
+        worker_policy=True,
+    )
     tools = [
         MCPToolSpec(
-            servers=["deepcare"],
+            servers=["records"],
             arg_bindings=[
-                ArgBindingSpec(server="deepcare", tool="form_list", fixed={"text": "brief"})
+                ArgBindingSpec(
+                    server="records", tool="fetch_record", fixed={"detail_level": "brief"}
+                )
             ],
         )
     ]
-    registry = await build_tool_registry(tools, tool_env=await _env(worker=True))
+    registry = await build_tool_registry(tools, tool_env=env)
+    assert "mcp__records__update_record" not in registry  # 真在 worker 口径下建
     assert registry.arg_bindings() == {
-        "mcp__deepcare__form_list": ToolArgBindings(fixed={"text": "brief"})
+        "mcp__records__fetch_record": ToolArgBindings(fixed={"detail_level": "brief"})
     }
-    schema = registry.get_required("mcp__deepcare__form_list").spec.parameters
-    assert set(schema["properties"]) == {"employee_code"}
+    schema = registry.get_required("mcp__records__fetch_record").spec.parameters
+    assert set(schema["properties"]) == {"record_id"}

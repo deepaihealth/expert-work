@@ -1251,7 +1251,8 @@ class ArgBindingSpec(BaseModel):
 
     @model_validator(mode="after")
     def _check_args_and_fixed(self) -> ArgBindingSpec:
-        """B-127 —— ``args`` / ``fixed`` 至少一边非空、两边的参数名不相交、固定值非空白。
+        """B-127 —— ``args`` / ``fixed`` 至少一边非空、两边的参数名不相交、固定值非空白且
+        首尾无空白(值原样发给工具,``"brief "`` 是另一个值;拒掉,不悄悄 strip)。
 
         「变量必须已声明」那条不在这里:声明集在兄弟块里,归
         ``AgentSpecBody._check_arg_bindings``,且只管 ``args``。
@@ -1268,6 +1269,12 @@ class ArgBindingSpec(BaseModel):
         for param, value in self.fixed.items():
             if not param.strip() or not value.strip():
                 msg = f"{where}: fixed parameter names and values must be non-empty"
+                raise ValueError(msg)
+            if param != param.strip() or value != value.strip():
+                msg = (
+                    f"{where}: fixed parameter {param.strip()!r} — names and values must "
+                    f"have no leading or trailing whitespace (the value is sent verbatim)"
+                )
                 raise ValueError(msg)
         return self
 
