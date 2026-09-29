@@ -10,6 +10,7 @@ import {
   AUTO,
   choiceFromSelect,
   choiceOf,
+  fixedValueValid,
   selectValueOf,
   setParamChoice,
 } from "../mcp_arg_bindings";
@@ -142,5 +143,15 @@ describe("boundParamsOf", () => {
     expect(boundParamsOf(B({ fixed: { detail_level: "brief" } }))).toEqual([
       { param: "detail_level", kind: "fixed", value: "brief" },
     ]);
+  });
+});
+
+describe("fixedValueValid", () => {
+  it("rejects empty and leading/trailing whitespace, accepts inner spaces", () => {
+    expect(fixedValueValid("brief")).toBe(true);
+    expect(fixedValueValid("very brief")).toBe(true);
+    for (const bad of ["", " ", "brief ", " brief", "\tbrief", "brief\n"]) {
+      expect(fixedValueValid(bad)).toBe(false);
+    }
   });
 });

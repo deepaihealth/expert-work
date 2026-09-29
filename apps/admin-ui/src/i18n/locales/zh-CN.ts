@@ -1060,11 +1060,12 @@ const zhCN: TranslationKeys = {
     mcp_bind_fixed: "固定值",
     mcp_bind_fixed_input: "{{param}} 的固定值",
     mcp_bind_fixed_placeholder: "每次调用都原样发送这个值",
+    mcp_bind_fixed_invalid: "填写一个值，首尾不能有空格",
     mcp_bind_hint:
       "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。固定值则每次调用都原样发送。不绑定的参数仍由模型自己填。",
     mcp_bind_required: "这个参数是必填的",
     mcp_bind_no_variables:
-      "先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量，再回来把参数绑到变量上。",
+      "还没有声明变量。仍可以写固定值；要把参数绑到变量上，先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量。",
     mcp_bind_drop_title_one: "这会同时删掉 1 条参数绑定",
     mcp_bind_drop_title_other: "这会同时删掉 {{count}} 条参数绑定",
     mcp_bind_drop_item: "{{tool}} 的 {{param}} ← 变量 {{variable}}",

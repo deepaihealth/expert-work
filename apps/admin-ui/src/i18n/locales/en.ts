@@ -1031,6 +1031,7 @@ export interface TranslationKeys {
     mcp_bind_fixed: string;
     mcp_bind_fixed_input: string;
     mcp_bind_fixed_placeholder: string;
+    mcp_bind_fixed_invalid: string;
     mcp_bind_hint: string;
     mcp_bind_required: string;
     mcp_bind_no_variables: string;
@@ -4301,11 +4302,12 @@ const en: TranslationKeys = {
     mcp_bind_fixed: "Fixed value",
     mcp_bind_fixed_input: "Fixed value for {{param}}",
     mcp_bind_fixed_placeholder: "Sent as-is on every call",
+    mcp_bind_fixed_invalid: "Enter a value with no leading or trailing spaces",
     mcp_bind_hint:
       "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. A fixed value is sent as-is on every call. Unbound parameters are still filled in by the model.",
     mcp_bind_required: "This parameter is required",
     mcp_bind_no_variables:
-      "Declare a variable under Prompt & Output → Dynamic prompt (Jinja) first, then come back and bind parameters to it.",
+      "No variables declared yet. You can still set a fixed value; to bind a parameter to a variable, declare one under Prompt & Output → Dynamic prompt (Jinja) first.",
     mcp_bind_drop_title_one: "This will also delete 1 bound parameter",
     mcp_bind_drop_title_other: "This will also delete {{count}} bound parameters",
     mcp_bind_drop_item: "{{param}} on {{tool}} ← variable {{variable}}",

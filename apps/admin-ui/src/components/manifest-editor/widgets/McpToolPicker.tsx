@@ -50,6 +50,7 @@ import {
   boundParamsOf,
   choiceFromSelect,
   choiceOf,
+  fixedValueValid,
   paramsOf,
   selectValueOf,
   setParamChoice,
@@ -737,24 +738,35 @@ export function McpToolPicker({
                     ]}
                   />
                   {choice.kind === "fixed" && (
-                    <Input
-                      size="small"
-                      style={{ width: 200 }}
-                      data-testid={`af-mcp-bind-fixed-${tool.name}-${param.name}`}
-                      aria-label={t("agent_form.mcp_bind_fixed_input", {
-                        param: param.name,
-                      })}
-                      placeholder={t("agent_form.mcp_bind_fixed_placeholder")}
-                      // 空值后端会拒(ArgBindingSpec 要求非空),当场标红而不是等保存 422。
-                      status={choice.value.trim() === "" ? "error" : undefined}
-                      value={choice.value}
-                      onChange={(e) =>
-                        setChoice(row.name, tool.name, param.name, {
-                          kind: "fixed",
-                          value: e.target.value,
-                        })
-                      }
-                    />
+                    <>
+                      <Input
+                        size="small"
+                        style={{ width: 200 }}
+                        data-testid={`af-mcp-bind-fixed-${tool.name}-${param.name}`}
+                        aria-label={t("agent_form.mcp_bind_fixed_input", {
+                          param: param.name,
+                        })}
+                        placeholder={t("agent_form.mcp_bind_fixed_placeholder")}
+                        // 空值 / 首尾空格后端会拒(ArgBindingSpec),当场标红而不是等保存 422。
+                        status={fixedValueValid(choice.value) ? undefined : "error"}
+                        value={choice.value}
+                        onChange={(e) =>
+                          setChoice(row.name, tool.name, param.name, {
+                            kind: "fixed",
+                            value: e.target.value,
+                          })
+                        }
+                      />
+                      {!fixedValueValid(choice.value) && (
+                        <Text
+                          type="danger"
+                          data-testid={`af-mcp-bind-fixed-hint-${tool.name}-${param.name}`}
+                          style={{ fontSize: 12 }}
+                        >
+                          {t("agent_form.mcp_bind_fixed_invalid")}
+                        </Text>
+                      )}
+                    </>
                   )}
                 </div>
               );

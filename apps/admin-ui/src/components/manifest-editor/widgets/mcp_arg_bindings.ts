@@ -61,6 +61,12 @@ export function choiceOf(
   return { kind: "auto" };
 }
 
+/** Whether a fixed value would pass ``ArgBindingSpec``: non-empty, and no
+ *  leading/trailing whitespace (a stray space would be sent to the tool as-is,
+ *  so the backend rejects it rather than guessing). */
+export const fixedValueValid = (value: string): boolean =>
+  value !== "" && value === value.trim();
+
 /** The Select value that shows ``choice``. */
 export const selectValueOf = (choice: ParamChoice): string =>
   choice.kind === "variable" ? choice.name : choice.kind === "fixed" ? FIXED : AUTO;
