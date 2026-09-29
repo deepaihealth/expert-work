@@ -346,6 +346,11 @@ _cm_working_window_dropped_turns = expert_work_gauge(
     "expert_work_cm_working_window_dropped_turns",
     "User turns dropped by the most recent working-memory window trim (Stream CM-2).",
 )
+#: B-126 —— 跨轮无损清理省下的 token(估算)累计;配合 run 级日志算账。
+_cm_cross_turn_reclaimed_tokens = expert_work_counter(
+    "expert_work_cm_cross_turn_reclaimed_tokens_total",
+    "Estimated tokens reclaimed by the cross-turn tool-result prune (B-126).",
+)
 #: Stream CM-3 — pre-compaction flush passes by outcome. ``flushed`` =
 #: memories written from the discarded middle; ``empty`` = nothing
 #: extracted (or a swallowed best-effort failure — see memory.flush logs).
@@ -714,9 +719,14 @@ def build_react_graph(
         # reasoning intact. Running it before the window means the coarser gates
         # re-estimate against a smaller prompt and fire less often. Prompt-view
         # only — the checkpointed history is never rewritten (CM-C4).
-        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "context_gates"):
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "context_gates") as gates_span:
             if tool_result_pruner is not None:
-                messages = tool_result_pruner.apply(messages).messages
+                pruned = tool_result_pruner.apply(messages)
+                messages = pruned.messages
+                if pruned.reclaimed_tokens:
+                    _cm_cross_turn_reclaimed_tokens.inc(pruned.reclaimed_tokens)
+                gates_span.set_attribute("cm.tool_result_prune.count", pruned.pruned_count)
+                gates_span.set_attribute("cm.cross_turn.reclaimed_tokens", pruned.reclaimed_tokens)
             # Stream CM-2 — working-memory sliding window: cheap LLM-free first
             # gate. Trims the raw history to first turn + most-recent N turns
             # when over threshold (on HumanMessage boundaries, so tool-call

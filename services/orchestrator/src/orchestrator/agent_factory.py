@@ -1043,6 +1043,10 @@ async def build_agent(
             threshold_pct=trp_policy.threshold_pct,
             recent_tool_results_kept=trp_policy.recent_tool_results_kept,
             estimator=estimator,
+            cross_turn=trp_policy.cross_turn,
+            min_context_tokens=trp_policy.min_context_tokens,
+            min_reclaim_tokens=trp_policy.min_reclaim_tokens,
+            absolute_cap_tokens=trp_policy.absolute_cap_tokens,
         )
     # ``loaded_skills`` was resolved above (before the tool registry) so the
     # sandbox tools could be bound with the skill seed-file set.

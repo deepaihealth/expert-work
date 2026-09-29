@@ -314,3 +314,49 @@ def test_pure_function_returns_prune_result() -> None:
     res = prune_old_tool_results(_trace(4), recent_tool_results_kept=1)
     assert isinstance(res, PruneResult)
     assert res.pruned_count == 3
+
+
+# --------------------------------------------------------------------- B-126
+
+
+def test_b126_threshold_is_min_of_pct_and_cap() -> None:
+    p = ToolResultPruner(context_window=1_000_000, threshold_pct=0.7, absolute_cap_tokens=200_000)
+    assert p.threshold_tokens == 200_000
+    small = ToolResultPruner(context_window=100_000, threshold_pct=0.7, absolute_cap_tokens=200_000)
+    assert small.threshold_tokens == 70_000
+
+
+def test_b126_cross_turn_runs_under_legacy_threshold() -> None:
+    from orchestrator.tools.overflow import TOOL_RESULT_PATH_ARTIFACT_KEY as K
+
+    msgs: list[BaseMessage] = [HumanMessage(content="first")]
+    for i in range(3):
+        msgs += [
+            _ai_call(f"a{i}"),
+            _tool(f"{_BIG}#{i}", call_id=f"a{i}", artifact={K: f".tool_results/r/a{i}.txt"}),
+        ]
+    msgs += [AIMessage(content="ok"), HumanMessage(content="second")]
+    p = ToolResultPruner(
+        context_window=10**9,
+        recent_tool_results_kept=1,
+        min_context_tokens=100,
+        min_reclaim_tokens=100,
+    )
+    r = p.apply(msgs)
+    assert r.pruned_count == 2 and r.reclaimed_tokens > 0
+
+
+def test_b126_cross_turn_off_restores_legacy() -> None:
+    from orchestrator.tools.overflow import TOOL_RESULT_PATH_ARTIFACT_KEY as K
+
+    msgs: list[BaseMessage] = [HumanMessage(content="first")]
+    for i in range(3):
+        msgs += [
+            _ai_call(f"a{i}"),
+            _tool(f"{_BIG}#{i}", call_id=f"a{i}", artifact={K: f".tool_results/r/a{i}.txt"}),
+        ]
+    msgs += [HumanMessage(content="second")]
+    p = ToolResultPruner(
+        context_window=10**9, cross_turn=False, min_context_tokens=0, min_reclaim_tokens=0
+    )
+    assert p.apply(msgs).pruned_count == 0

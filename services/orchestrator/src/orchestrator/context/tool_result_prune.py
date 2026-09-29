@@ -14,7 +14,7 @@ Design anchors (docs/design/tool-result-context-budget.md §Phase 2):
 
 * **Token-gated** — no-op under ``context_window * threshold_pct`` (zero
   behaviour change for runs that are not overflowing). Shares the compressor's
-  estimator basis (CM-C6).
+  estimator basis (CM-C6). B-126:跨轮部分不看窗口,按本轮开始时的绝对量 + 最小清理量触发。
 * **Count-based recent protection** — the bloat shape is *many tool calls*
   (often within one turn), so the recent window is counted in ``ToolMessage``s,
   not turns: a turn-based window would not relieve a single turn that fired
@@ -450,26 +450,40 @@ class ToolResultPruner:
     #: compressor so all gates keep one estimation basis (CM-C6). ``None`` keeps
     #: the legacy ``chars // 4`` heuristic for network-free unit tests.
     estimator: TokenEstimator | None = None
+    #: B-126 —— 跨轮无损清理与兜底门槛(见 ``ToolResultPrunePolicy``)。
+    cross_turn: bool = True
+    min_context_tokens: int = 30_000
+    min_reclaim_tokens: int = 5_000
+    absolute_cap_tokens: int = 200_000
 
     @property
     def threshold_tokens(self) -> int:
-        """Token threshold at/above which a pass prunes. Same shape as the
-        window / compressor thresholds so the gates share one basis."""
-        return int(self.context_window * self.threshold_pct)
+        """同一轮内逐次清理的兜底门槛 = min(窗口 x 百分比, 绝对上限)(B-126)。"""
+        return min(int(self.context_window * self.threshold_pct), self.absolute_cap_tokens)
 
     def should_prune(self, messages: Sequence[BaseMessage]) -> bool:
-        """Cheap preflight — ``True`` when the estimate meets/exceeds threshold."""
         return estimate_tokens(messages, estimator=self.estimator) >= self.threshold_tokens
 
     def apply(self, messages: Sequence[BaseMessage]) -> PruneResult:
-        """Collapse old + duplicate tool results when over threshold, else no-op.
-
-        Returns a :class:`PruneResult`; ``pruned_count == 0`` means the prompt was
-        left untouched (under threshold, or nothing old/duplicate to collapse).
-        """
+        """先跨轮无损清理(新一轮开头),再按兜底门槛逐次清理。"""
         msgs = list(messages)
+        pruned = 0
+        reclaimed = 0
+        if self.cross_turn:
+            cross = prune_prior_turns(
+                msgs,
+                recent_tool_results_kept=self.recent_tool_results_kept,
+                min_context_tokens=self.min_context_tokens,
+                min_reclaim_tokens=self.min_reclaim_tokens,
+                estimator=self.estimator,
+            )
+            msgs, pruned, reclaimed = cross.messages, cross.pruned_count, cross.reclaimed_tokens
+            if pruned:
+                logger.info(
+                    "tool_result_prune.cross_turn count=%d reclaimed_tokens=%d", pruned, reclaimed
+                )
         if not self.should_prune(msgs):
-            return PruneResult(messages=msgs, pruned_count=0)
+            return PruneResult(messages=msgs, pruned_count=pruned, reclaimed_tokens=reclaimed)
         result = prune_old_tool_results(
             msgs, recent_tool_results_kept=self.recent_tool_results_kept
         )
@@ -479,4 +493,8 @@ class ToolResultPruner:
                 result.pruned_count,
                 self.recent_tool_results_kept,
             )
-        return result
+        return PruneResult(
+            messages=result.messages,
+            pruned_count=pruned + result.pruned_count,
+            reclaimed_tokens=reclaimed,
+        )
