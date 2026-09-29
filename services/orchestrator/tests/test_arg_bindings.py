@@ -283,14 +283,14 @@ def test_built_agent_defaults_to_no_bindings() -> None:
 def test_bindings_by_tool_carries_fixed_values_separately_from_variables() -> None:
     entries = [
         ArgBindingSpec(
-            server="deepcare",
+            server="records",
             tool="fetch_record",
             args={"project_code": "pc"},
             fixed={"detail_level": "brief"},
         ),
-        ArgBindingSpec(server="deepcare", tool="t2", fixed={"mode": "fast"}),
+        ArgBindingSpec(server="records", tool="t2", fixed={"mode": "fast"}),
     ]
-    assert bindings_by_tool(entries, server="deepcare") == {
+    assert bindings_by_tool(entries, server="records") == {
         "fetch_record": ToolArgBindings(
             args={"project_code": "pc"}, fixed={"detail_level": "brief"}
         ),
@@ -300,8 +300,8 @@ def test_bindings_by_tool_carries_fixed_values_separately_from_variables() -> No
 
 def test_bindings_by_tool_copies_the_fixed_map_too() -> None:
     """``fixed`` 同样是 spec 身上的 dict,spec 活在 BuiltAgent 缓存里。"""
-    entries = [ArgBindingSpec(server="deepcare", tool="t1", fixed={"detail_level": "brief"})]
-    out = bindings_by_tool(entries, server="deepcare")
+    entries = [ArgBindingSpec(server="records", tool="t1", fixed={"detail_level": "brief"})]
+    out = bindings_by_tool(entries, server="records")
     out["t1"].fixed["detail_level"] = "被改了"
     assert entries[0].fixed == {"detail_level": "brief"}
 
@@ -323,10 +323,10 @@ def test_without_drops_names_from_both_sides_and_leaves_the_original() -> None:
 
 
 def test_apply_injects_the_fixed_value_without_any_input() -> None:
-    calls = [{"name": "mcp__deepcare__t1", "args": {"keyword": "k"}, "id": "c1"}]
+    calls = [{"name": "mcp__records__t1", "args": {"keyword": "k"}, "id": "c1"}]
     filled, names = apply_arg_bindings(
         calls,
-        bindings={"mcp__deepcare__t1": ToolArgBindings(fixed={"detail_level": "brief"})},
+        bindings={"mcp__records__t1": ToolArgBindings(fixed={"detail_level": "brief"})},
         inputs={},
     )
     assert filled[0]["args"] == {"keyword": "k", "detail_level": "brief"}
@@ -335,10 +335,10 @@ def test_apply_injects_the_fixed_value_without_any_input() -> None:
 
 
 def test_a_model_supplied_value_never_wins_over_a_fixed_value() -> None:
-    calls = [{"name": "mcp__deepcare__t1", "args": {"detail_level": "full"}, "id": "c1"}]
+    calls = [{"name": "mcp__records__t1", "args": {"detail_level": "full"}, "id": "c1"}]
     filled, names = apply_arg_bindings(
         calls,
-        bindings={"mcp__deepcare__t1": ToolArgBindings(fixed={"detail_level": "brief"})},
+        bindings={"mcp__records__t1": ToolArgBindings(fixed={"detail_level": "brief"})},
         inputs={"detail_level": "full"},  # 同名输入也不算数:固定值不读 inputs
     )
     assert filled[0]["args"] == {"detail_level": "brief"}
@@ -346,11 +346,11 @@ def test_a_model_supplied_value_never_wins_over_a_fixed_value() -> None:
 
 
 def test_apply_fills_variables_and_fixed_values_together() -> None:
-    calls = [{"name": "mcp__deepcare__t1", "args": {}, "id": "c1"}]
+    calls = [{"name": "mcp__records__t1", "args": {}, "id": "c1"}]
     filled, names = apply_arg_bindings(
         calls,
         bindings={
-            "mcp__deepcare__t1": ToolArgBindings(
+            "mcp__records__t1": ToolArgBindings(
                 args={"project_code": "pc"}, fixed={"detail_level": "brief"}
             )
         },
