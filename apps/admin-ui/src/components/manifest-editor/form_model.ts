@@ -67,11 +67,17 @@ export interface RoutingFields {
 }
 /** B-61 — one MCP tool's parameter bindings: tool parameter → declared
  *  prompt variable. Mirrors the manifest's ``ArgBindingSpec`` exactly;
- *  ``(server, tool)`` is unique across the whole entry. */
+ *  ``(server, tool)`` is unique across the whole entry.
+ *
+ *  B-127 — ``fixed`` pins a parameter to a constant (tool parameter → value).
+ *  Both maps are optional: the backend accepts a binding with only one of them
+ *  (and omits an empty ``fixed`` when it serializes), so a hand-written or
+ *  backend-dumped binding may lack either key. Read them with ``?? {}``. */
 export interface ArgBindingFields {
   server: string;
   tool: string;
-  args: Record<string, string>;
+  args?: Record<string, string>;
+  fixed?: Record<string, string>;
 }
 export type ToolEntry = {
   type: string;
@@ -629,8 +635,9 @@ export interface BindingUse {
  */
 export function bindingsUsingVariable(m: unknown, name: string): BindingUse[] {
   if (name === "") return [];
+  // B-127 —— 只看 ``args``:``fixed`` 的值是常量,碰巧与变量同名也不是引用。
   return readTools(m).mcpArgBindings.flatMap((binding) =>
-    Object.entries(binding.args)
+    Object.entries(binding.args ?? {})
       .filter(([, variable]) => variable === name)
       .map(([param]) => ({ server: binding.server, tool: binding.tool, param })),
   );

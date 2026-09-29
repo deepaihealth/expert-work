@@ -22,7 +22,7 @@ function orphansIn(m: unknown): string[] {
       .filter((n): n is string => (n ?? "") !== ""),
   );
   return readTools(m).mcpArgBindings.flatMap((b) =>
-    Object.entries(b.args)
+    Object.entries(b.args ?? {})
       .filter(([, variable]) => !declared.has(variable))
       .map(([param, variable]) => `${b.server}/${b.tool}.${param}=${variable}`),
   );
