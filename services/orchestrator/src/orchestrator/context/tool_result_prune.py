@@ -14,7 +14,7 @@ Design anchors (docs/design/tool-result-context-budget.md §Phase 2):
 
 * **Token-gated** — no-op under ``context_window * threshold_pct`` (zero
   behaviour change for runs that are not overflowing). Shares the compressor's
-  estimator basis (CM-C6).
+  estimator basis (CM-C6). B-126:跨轮部分不看窗口,按本轮开始时的绝对量 + 最小清理量触发。
 * **Count-based recent protection** — the bloat shape is *many tool calls*
   (often within one turn), so the recent window is counted in ``ToolMessage``s,
   not turns: a turn-based window would not relieve a single turn that fired
@@ -23,12 +23,16 @@ Design anchors (docs/design/tool-result-context-budget.md §Phase 2):
   content, never removes a message, so no ``AIMessage.tool_calls`` ↔
   ``ToolMessage`` pair is ever split. No boundary logic needed.
 * **Lossless when a copy is on disk** — a result is collapsed losslessly when
-  either (a) it carries the ``<tool-result-overflow>`` footer (#859 externalized
-  → keep just the footer; bonus: drops the untrusted spotlight-fenced preview),
-  or (b) its ``artifact`` records a persisted-copy path (item 2 persist floor →
-  render a footer reference). Only a small result below the persist floor (no
-  on-disk copy) collapses to a lossy ``<tool-result-pruned>`` stub — still
-  strictly less lossy than the whole-turn drop the window would otherwise apply.
+  either (a) its ``artifact`` records a persisted-copy path (item 2 persist
+  floor → render a footer reference; checked FIRST — see the security note on
+  ``_lossless_reference`` / ``_collapsed_content``: the builder always records
+  this path alongside a real footer, so preferring it means the untrusted body
+  never has to be scanned for the footer tag), or (b) it carries the
+  ``<tool-result-overflow>`` footer (#859 externalized — only when no path was
+  recorded; bonus: drops the untrusted spotlight-fenced preview). Only a small
+  result below the persist floor (no on-disk copy) collapses to a lossy
+  ``<tool-result-pruned>`` stub — still strictly less lossy than the
+  whole-turn drop the window would otherwise apply.
 * **Dedup (item 1)** — a tool result whose exact content recurs later is
   collapsed to a reference (latest copy kept), reclaiming the bulk of a repeated
   identical search/fetch even inside the recent window.
@@ -51,16 +55,21 @@ Design anchors (docs/design/tool-result-context-budget.md §Phase 2):
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
-from langchain_core.messages import BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.runtime.tokens import TokenEstimator
 from orchestrator.context.compressor import estimate_tokens
 from orchestrator.context.skill_reference import skill_view_reference
 from orchestrator.tools.overflow import (
+    OVERFLOW_DIR,
     OVERFLOW_FOOTER_TAG_OPEN,
     TOOL_RESULT_PATH_ARTIFACT_KEY,
     render_overflow_footer,
@@ -74,6 +83,17 @@ logger = logging.getLogger(__name__)
 _PRUNE_TAG_OPEN = "<tool-result-pruned>"
 _PRUNE_TAG_CLOSE = "</tool-result-pruned>"
 
+#: Spec §3.3 (docs/superpowers/specs/2026-09-28-cross-turn-context-pruning-design.md
+#: line 84) — "看图的文字结论" (image-reading text conclusions) are never pruned,
+#: full stop, regardless of size or recovery path: ``ask_image``'s reply IS the
+#: vision model's own analysis, not a raw payload with an equivalent workspace
+#: copy the model can just re-fetch, so collapsing it loses the actual
+#: conclusion rather than a redundant copy. No public name constant exists for
+#: this string (``tools/vision.py`` registers it as a literal
+#: ``ToolSpec(name="ask_image")``); deliberately not importing
+#: ``tools/_child_run.py``'s private ``_ASK_IMAGE_TOOL_NAME`` across packages.
+_NEVER_PRUNE_TOOLS = frozenset({"ask_image"})
+
 
 @dataclass(frozen=True)
 class PruneResult:
@@ -82,6 +102,8 @@ class PruneResult:
 
     messages: list[BaseMessage]
     pruned_count: int
+    #: B-126 —— 本次跨轮清理估算省下的 token(观测用;非跨轮路径为 0)。
+    reclaimed_tokens: int = 0
 
 
 def _is_already_pruned(content: str) -> bool:
@@ -105,12 +127,65 @@ def _artifact_path(message: ToolMessage) -> str | None:
     return None
 
 
+#: Recovers a workspace-relative path out of a footer-shaped block's own
+#: wording (``render_overflow_footer``'s fixed template). Shared by
+#: ``_collapsed_content`` and ``_lossless_reference`` for the fallback used
+#: only when no persisted ``artifact`` path is recorded — that block may be
+#: entirely attacker-authored in that case (no real footer was ever appended
+#: by the builder), so this is the ONE structured field either function ever
+#: extracts from it. Never the raw text between the tags, which could
+#: otherwise smuggle arbitrary content past the spotlight fence.
+#: Only the shape ``overflow_rel_path`` can produce is accepted (fixed
+#: directory, safe-charset components), so a forged block cannot pass free
+#: text off as a "path".
+_FOOTER_SAVED_TO_RE = re.compile(
+    rf"saved to ({re.escape(OVERFLOW_DIR)}/[A-Za-z0-9_.-]{{1,80}}/[A-Za-z0-9_.-]{{1,200}}) "
+    r"in your workspace"
+)
+
+#: Recovers the true pre-truncation size out of a footer-shaped block's own
+#: wording — the other field a freshly rendered template may fill in (see
+#: ``_footer_claimed_path``); also used by ``_cross_turn_stub`` so its header
+#: states the original size, not the (possibly much shorter) preview
+#: currently sitting in ``content``.
+_FOOTER_TOTAL_CHARS_RE = re.compile(r"full output \((\d+) chars\)")
+
+
+def _footer_claimed_path(content: str) -> str | None:
+    """Path claimed by a footer-shaped block, located via the LAST occurrence
+    of the tag — never the first (see the security note on
+    ``_collapsed_content`` / ``_lossless_reference``: the real footer, when
+    one was genuinely appended, is structurally always the last occurrence).
+    """
+    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
+    if footer_at == -1:
+        return None
+    match = _FOOTER_SAVED_TO_RE.search(content[footer_at:])
+    if match is None or ".." in match.group(1):
+        return None
+    return match.group(1)
+
+
+def _footer_total_chars(content: str) -> int | None:
+    """True pre-truncation size stated by a footer-shaped block, if present.
+
+    Located via the LAST occurrence of the tag — see ``_footer_claimed_path``.
+    """
+    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
+    if footer_at == -1:
+        return None
+    match = _FOOTER_TOTAL_CHARS_RE.search(content[footer_at:])
+    return int(match.group(1)) if match else None
+
+
 def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
     """1-line replacement for a ``ToolMessage`` — lossless if recoverable.
 
-    Returns ``None`` when the message is non-string (multimodal) content or is
-    already collapsed (idempotent skip), so the caller's ``pruned_count`` stays
-    accurate. Recoverability ladder:
+    Returns ``None`` when the message is non-string (multimodal) content, is
+    already collapsed (idempotent skip), or names a tool in
+    :data:`_NEVER_PRUNE_TOOLS` (spec §3.3 — ``ask_image``'s text conclusion is
+    never touched, size/recovery-path notwithstanding), so the caller's
+    ``pruned_count`` stays accurate. Recoverability ladder:
 
     0. **Skill reference** (RT-2 PR-3 / RT-ADR-7) — a successful ``skill_view``
        result collapses to a one-line skill reference (name + source path +
@@ -118,27 +193,45 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
        durable while the workspace copy is run-scoped, so ``skill_view``
        re-read is the better recovery handle. Blocked/error placeholders get
        no reference (see :mod:`orchestrator.context.skill_reference`).
-    1. **In-context footer** (CM-5 / #859 externalized) — keep the trusted footer
-       alone; the full output is on disk and re-readable via ``read_file``.
-    2. **Artifact path** (item 2 persist floor) — render a footer reference to the
-       persisted copy, even though there was no in-context footer.
-    3. **Lossy stub** — only when no on-disk copy exists (small result below the
-       persist floor): a short note with the tool name + char count + reason.
+    1. **Artifact path** (item 2 persist floor) — render a footer reference to
+       the persisted copy. Checked BEFORE the in-context footer (security —
+       the builder always records this path alongside a real footer, so
+       preferring it means the untrusted ``content`` never has to be scanned
+       for the footer tag at all; see the note below).
+    2. **In-context footer** (CM-5 / #859 externalized) — only when no path
+       was recorded: a footer-shaped block located via the LAST occurrence
+       of the tag, never the first (a tool result is untrusted — indirect-
+       injection surface — and the real footer, when one was genuinely
+       appended, is always AFTER the body: ``builder.py``'s ``tool_content +
+       footer``). The reply is never a raw slice of that block, even so:
+       when no persisted path is recorded the block could be entirely
+       attacker-authored, so only its claimed path/size fields are ever
+       regex-extracted (:func:`_footer_claimed_path` / :func:`_footer_total_chars`,
+       shared with :func:`_lossless_reference`) into a FRESHLY rendered
+       footer — never the free-form text between the tags, which could
+       otherwise smuggle arbitrary content past the spotlight fence. No
+       parseable path at all falls through to rung 3.
+    3. **Lossy stub** — no on-disk copy exists (small result below the
+       persist floor, or a footer-shaped block whose path didn't parse): a
+       short note with the tool name + char count + reason.
     """
     content = message.content
     if not isinstance(content, str) or _is_already_pruned(content):
+        return None
+    if message.name in _NEVER_PRUNE_TOOLS:
         return None
     reference = skill_view_reference(message)
     if reference is not None:
         # Wrapped in the prune tags so ``_is_already_pruned`` keeps the pass
         # idempotent for skill stubs too.
         return f"{_PRUNE_TAG_OPEN}\n{reference}\n{_PRUNE_TAG_CLOSE}"
-    footer_at = content.find(OVERFLOW_FOOTER_TAG_OPEN)
-    if footer_at != -1:
-        return content[footer_at:].lstrip("\n")
     path = _artifact_path(message)
     if path is not None:
         return render_overflow_footer(rel=path, total_chars=len(content)).lstrip("\n")
+    claimed_path = _footer_claimed_path(content)
+    if claimed_path is not None:
+        claimed_size = _footer_total_chars(content) or len(content)
+        return render_overflow_footer(rel=claimed_path, total_chars=claimed_size).lstrip("\n")
     name = message.name or "tool"
     return (
         f"{_PRUNE_TAG_OPEN}\n"
@@ -177,11 +270,22 @@ def prune_old_tool_results(
     * **Age** — a non-duplicate ``ToolMessage`` beyond the most-recent
       ``recent_tool_results_kept`` is collapsed.
 
+    A :data:`_NEVER_PRUNE_TOOLS` result (``ask_image`` — spec §3.3) is kept out
+    of ``tool_idxs`` entirely: it never occupies one of the ``recent_tool_results_kept``
+    protected slots (that protection would be wasted on a message that is
+    never collapsed anyway, diluting the window meant for real candidates) and
+    never seeds/matches the dedup map. :func:`_collapsed_content` also refuses
+    it directly, so it is never touched even if reached by some other path.
+
     Token-unaware: callers gate on size via :meth:`ToolResultPruner.should_prune`.
     Returns a new list — never mutates the input.
     """
     msgs = list(messages)
-    tool_idxs = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
+    tool_idxs = [
+        i
+        for i, m in enumerate(msgs)
+        if isinstance(m, ToolMessage) and m.name not in _NEVER_PRUNE_TOOLS
+    ]
     # Last index each exact content appears at — anything earlier is a duplicate.
     last_occurrence: dict[str, int] = {}
     for i in tool_idxs:
@@ -213,6 +317,157 @@ def prune_old_tool_results(
     return PruneResult(messages=out, pruned_count=pruned)
 
 
+_ARGS_HINT_LIMIT = 120
+
+
+def current_turn_start(messages: Sequence[BaseMessage]) -> int:
+    """B-126 —— 本轮起点 = 最后一条**真实**用户消息的下标;没有则 0。
+
+    平台注入的隐藏 HumanMessage(本轮输入块 / 计划 / 工作区摘要 …)带
+    ``HIDE_FROM_UI``,不算边界 —— 与 CM-2 ``trim_to_recent_turns`` 同一口径。
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, HumanMessage) and not is_hidden(m):
+            return i
+    return 0
+
+
+def _args_hint(args: Mapping[str, Any]) -> str:
+    text = json.dumps(dict(args), ensure_ascii=False, sort_keys=True, default=str)
+    return text if len(text) <= _ARGS_HINT_LIMIT else text[: _ARGS_HINT_LIMIT - 1] + "…"
+
+
+def _lossless_reference(message: ToolMessage) -> str | None:
+    """无损找回途径 —— 技能引用 / 持久化路径 / 外置 footer;都没有则 ``None``。
+
+    安全 —— 真 footer 由 builder 在工具调用时追加在 body **之后**(spotlight
+    围栏之外),且追加 footer 的同时必然把持久化路径记进 ``artifact``(见
+    ``builder.py`` 的 ``_externalize_tool_overflow``:写盘成功才渲染 footer,
+    两者同一个 ``rel``)。因此这里优先走 ``_artifact_path`` 凭路径重新渲出一条
+    精简找回提示,完全不碰 ``content``。只有没记录路径时才退回
+    :func:`_footer_claimed_path`(与 ``_collapsed_content`` 共用同一套
+    抽取)—— 那条路径也可能整段是攻击者伪造的,所以只取这一个结构化字段,
+    永远不返回标签之间的原始文本,避免把攻击者的正文内容当作『可信引用』带
+    出围栏。
+    """
+    reference = skill_view_reference(message)
+    if reference is not None:
+        return reference
+    content = message.content
+    path = _artifact_path(message)
+    if path is None and isinstance(content, str):
+        path = _footer_claimed_path(content)
+    if path is None:
+        return None
+    return f"Saved to {path} in your workspace. Use read_file / exec_python / bash to inspect it."
+
+
+def _cross_turn_stub(
+    message: ToolMessage, *, args: Mapping[str, Any] | None, reference: str
+) -> str:
+    content = message.content
+    if isinstance(content, str):
+        full_size = _footer_total_chars(content)
+        if full_size is not None:
+            size, qualifier = full_size, ""
+        else:
+            has_footer_tag = OVERFLOW_FOOTER_TAG_OPEN in content
+            size, qualifier = len(content), (" (preview size)" if has_footer_tag else "")
+    else:
+        size, qualifier = 0, ""
+    head = f"[{message.name or 'tool'}]"
+    if args:
+        head += f" {_args_hint(args)}"
+    return (
+        f"{_PRUNE_TAG_OPEN}\n"
+        f"{head} — {size:,} chars{qualifier} from an earlier turn, elided; "
+        "recover below if needed.\n"
+        f"{reference}\n"
+        f"{_PRUNE_TAG_CLOSE}"
+    )
+
+
+def prune_prior_turns(
+    messages: Sequence[BaseMessage],
+    *,
+    recent_tool_results_kept: int,
+    min_context_tokens: int,
+    min_reclaim_tokens: int,
+    estimator: TokenEstimator | None = None,
+) -> PruneResult:
+    """B-126 —— 新一轮开头无损收起更早轮次的大块工具结果。
+
+    决定只依赖 ``messages[:boundary + 1]``(旧轮次 + 本轮用户消息),所以同一轮内
+    每次调用结果逐字相同、缓存前缀稳定(spec D3 / R2)。只收有无损找回途径的结果
+    (D6),``status == "error"`` 与非字符串内容一律不动(R4)。去重只在旧轮次内部做
+    (R3)。返回新列表,不改入参。
+
+    :data:`_NEVER_PRUNE_TOOLS` 的结果(``ask_image`` —— spec §3.3 看图的文字结论)
+    整段排除在 ``prior_tool_idxs`` 之外:既不占 ``recent_tool_results_kept`` 的保护名
+    额(保护一条永不清理的消息是浪费,会挤掉本该保护的真候选),也不进去重表 —— 但
+    它的原文仍计入上面 ``min_context_tokens`` 的整段估算(它是真实占用的上下文)。
+    """
+    msgs = list(messages)
+    boundary = current_turn_start(msgs)
+    if boundary == 0:
+        return PruneResult(messages=msgs, pruned_count=0)
+    if estimate_tokens(msgs[: boundary + 1], estimator=estimator) < min_context_tokens:
+        return PruneResult(messages=msgs, pruned_count=0)
+
+    prior_tool_idxs = [
+        i
+        for i, m in enumerate(msgs[:boundary])
+        if isinstance(m, ToolMessage) and m.name not in _NEVER_PRUNE_TOOLS
+    ]
+    protected = set(prior_tool_idxs[max(0, len(prior_tool_idxs) - recent_tool_results_kept) :])
+    args_by_call: dict[str, Mapping[str, Any]] = {}
+    for i in range(boundary):
+        m = msgs[i]
+        if isinstance(m, AIMessage):
+            for tc in m.tool_calls:
+                call_id = tc.get("id")
+                if call_id:
+                    args_by_call[call_id] = tc.get("args") or {}
+    last_occurrence: dict[str, int] = {}
+    for i in prior_tool_idxs:
+        c = msgs[i].content
+        if isinstance(c, str):
+            last_occurrence[c] = i
+
+    replacements: dict[int, ToolMessage] = {}
+    reclaimed = 0
+    for i in prior_tool_idxs:
+        m = msgs[i]
+        if not isinstance(m, ToolMessage):
+            continue
+        content = m.content
+        if not isinstance(content, str) or _is_already_pruned(content):
+            continue
+        if getattr(m, "status", "success") == "error":
+            continue
+        is_duplicate = last_occurrence.get(content, i) > i
+        if i in protected and not is_duplicate:
+            continue
+        reference = _lossless_reference(m)
+        if reference is None:
+            continue
+        stub = _cross_turn_stub(m, args=args_by_call.get(m.tool_call_id), reference=reference)
+        new = _rebuild(m, stub)
+        saved = estimate_tokens([m], estimator=estimator) - estimate_tokens(
+            [new], estimator=estimator
+        )
+        if saved <= 0:
+            continue
+        replacements[i] = new
+        reclaimed += saved
+
+    if not replacements or reclaimed < min_reclaim_tokens:
+        return PruneResult(messages=msgs, pruned_count=0)
+    out = [replacements.get(i, m) for i, m in enumerate(msgs)]
+    return PruneResult(messages=out, pruned_count=len(replacements), reclaimed_tokens=reclaimed)
+
+
 @dataclass(frozen=True)
 class ToolResultPruner:
     """Token-gated mechanical prune of old tool results (working memory).
@@ -230,26 +485,41 @@ class ToolResultPruner:
     #: compressor so all gates keep one estimation basis (CM-C6). ``None`` keeps
     #: the legacy ``chars // 4`` heuristic for network-free unit tests.
     estimator: TokenEstimator | None = None
+    #: B-126 —— 跨轮无损清理与兜底门槛(见 ``ToolResultPrunePolicy``)。
+    cross_turn: bool = True
+    min_context_tokens: int = 30_000
+    min_reclaim_tokens: int = 5_000
+    absolute_cap_tokens: int = 200_000
 
     @property
     def threshold_tokens(self) -> int:
-        """Token threshold at/above which a pass prunes. Same shape as the
-        window / compressor thresholds so the gates share one basis."""
-        return int(self.context_window * self.threshold_pct)
+        """同一轮内逐次清理的兜底门槛 = min(窗口 x 百分比, 绝对上限)(B-126)。"""
+        return min(int(self.context_window * self.threshold_pct), self.absolute_cap_tokens)
 
     def should_prune(self, messages: Sequence[BaseMessage]) -> bool:
-        """Cheap preflight — ``True`` when the estimate meets/exceeds threshold."""
         return estimate_tokens(messages, estimator=self.estimator) >= self.threshold_tokens
 
     def apply(self, messages: Sequence[BaseMessage]) -> PruneResult:
-        """Collapse old + duplicate tool results when over threshold, else no-op.
-
-        Returns a :class:`PruneResult`; ``pruned_count == 0`` means the prompt was
-        left untouched (under threshold, or nothing old/duplicate to collapse).
-        """
+        """先跨轮无损清理(新一轮开头),再按兜底门槛逐次清理。"""
         msgs = list(messages)
+        pruned = 0
+        reclaimed = 0
+        if self.cross_turn:
+            cross = prune_prior_turns(
+                msgs,
+                recent_tool_results_kept=self.recent_tool_results_kept,
+                min_context_tokens=self.min_context_tokens,
+                min_reclaim_tokens=self.min_reclaim_tokens,
+                estimator=self.estimator,
+            )
+            msgs, pruned, reclaimed = cross.messages, cross.pruned_count, cross.reclaimed_tokens
+            if pruned:
+                # Recomputed identically on every call of a turn — DEBUG, not INFO.
+                logger.debug(
+                    "tool_result_prune.cross_turn count=%d reclaimed_tokens=%d", pruned, reclaimed
+                )
         if not self.should_prune(msgs):
-            return PruneResult(messages=msgs, pruned_count=0)
+            return PruneResult(messages=msgs, pruned_count=pruned, reclaimed_tokens=reclaimed)
         result = prune_old_tool_results(
             msgs, recent_tool_results_kept=self.recent_tool_results_kept
         )
@@ -259,4 +529,8 @@ class ToolResultPruner:
                 result.pruned_count,
                 self.recent_tool_results_kept,
             )
-        return result
+        return PruneResult(
+            messages=result.messages,
+            pruned_count=pruned + result.pruned_count,
+            reclaimed_tokens=reclaimed,
+        )

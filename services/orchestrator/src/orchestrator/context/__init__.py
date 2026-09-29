@@ -39,7 +39,13 @@ from orchestrator.context.tool_result_prune import (
     ToolResultPruner as ToolResultPruner,
 )
 from orchestrator.context.tool_result_prune import (
+    current_turn_start as current_turn_start,
+)
+from orchestrator.context.tool_result_prune import (
     prune_old_tool_results as prune_old_tool_results,
+)
+from orchestrator.context.tool_result_prune import (
+    prune_prior_turns as prune_prior_turns,
 )
 from orchestrator.context.working_window import (
     TrimResult as TrimResult,
@@ -99,10 +105,12 @@ __all__ = [
     "WorkspaceFileWriter",
     "WorkspaceIngester",
     "WorkspaceProjector",
+    "current_turn_start",
     "estimate_tokens",
     "floor_head_keep_for_injection",
     "parse_plan_md",
     "prune_old_tool_results",
+    "prune_prior_turns",
     "render_memory_md",
     "render_plan_md",
     "render_todo_md",

@@ -34,6 +34,7 @@ from orchestrator import (
     build_step_routers,
 )
 from orchestrator.agent_factory import _build_provider, _chat_stream_deadline_s
+from orchestrator.context import ToolResultPruner
 from orchestrator.llm import FakeEmbedder, RateLimitedProvider
 from orchestrator.llm.providers.openai_compatible import OpenAICompatibleProvider
 from orchestrator.tools import (
@@ -2057,6 +2058,41 @@ async def test_tool_budget_platform_none_falls_back_to_env(monkeypatch: Any) -> 
         monkeypatch.setenv("EXPERT_WORK_TOOL_OUTPUT_BUDGET", "0")
         await _build(_spec(), secret_store=_secret_store(), checkpointer=cp)
         assert captured["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# B-126 — the factory threads every ``ToolResultPrunePolicy`` field (including
+# the new cross-turn knobs) into the ``ToolResultPruner`` it hands
+# ``build_react_graph`` — not just the pre-B-126 three.
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_result_pruner_threads_trp_policy_fields(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    from orchestrator.agent_factory import build_react_graph as real
+
+    def _spy(**kwargs: Any) -> Any:
+        captured["pruner"] = kwargs.get("tool_result_pruner")
+        return real(**kwargs)
+
+    monkeypatch.setattr("orchestrator.agent_factory.build_react_graph", _spy)
+
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["policies"] = {"tool_result_prune": {"min_reclaim_tokens": 7}}
+    spec = AgentSpec.model_validate(doc)
+
+    async with make_checkpointer("memory") as cp:
+        await _build(
+            spec, secret_store=_secret_store(), checkpointer=cp, platform_tool_budget_enabled=True
+        )
+
+    pruner = captured["pruner"]
+    assert isinstance(pruner, ToolResultPruner)
+    assert pruner.min_reclaim_tokens == 7
+    # The other three B-126 fields still ride the manifest defaults.
+    assert pruner.cross_turn is True
+    assert pruner.min_context_tokens == 30_000
+    assert pruner.absolute_cap_tokens == 200_000
 
 
 # ---------------------------------------------------------------------------
