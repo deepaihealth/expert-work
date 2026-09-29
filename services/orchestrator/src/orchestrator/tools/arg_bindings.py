@@ -14,28 +14,91 @@
 折 ``_``、截断 64),两者不是一一对应;这个换算归接线那一层,本模块不引入运行期命名
 规则。所以 :func:`bindings_by_tool` 吐的是**裸**工具名,而 :func:`apply_arg_bindings`
 收的是 tool_call 里实际出现的那个名 —— 对齐由调用方负责。
+
+B-127 —— **固定值**(``ArgBindingSpec.fixed``)走同一条剥 / 填路径,只是值的来处不同:
+变量绑定取本轮 ``inputs``,固定值取 manifest 里写死的常量。所以凡是回答「这个工具有哪些
+参数归平台管」的地方(剥 schema、判落空、审计里的参数名),两种一起算
+(:attr:`ToolArgBindings.params`)。落空的处置也一样:上游 schema 里没有这个参数 → 报
+``params_absent``、从下发给 ``tools_node`` 的表里摘掉、**不注入**(``additionalProperties:
+false`` 的服务端会把多出来的键整个硬拒)。
+
+**上游后来加上了这个参数,固定值从什么时候开始生效**:剥 / 摘的判定只发生在建工具目录时
+(``register_mcp_tools`` 每次都现调一遍 ``list_tools()``,客户端不缓存工具列表),结果随
+``BuiltAgent`` 缓存。所以是**下一次构建**起生效,不是下一次调用:
+
+* 主 Agent:``AgentRuntime`` 的构建缓存(``control_plane/runtime.py``,键含 spec 指纹,
+  TTL ``cache_ttl_s`` 默认 1800s)失效之后的第一个 run —— TTL 到期、改配置保存(指纹变)、
+  改租户 MCP 服务器 / 平台 MCP 目录触发的 ``invalidate_tenant`` / ``invalidate_all``、
+  或者进程重启,哪个先到算哪个;
+* 静态子 Agent:它自己的构建缓存(``subagent_runtime.py``,同样 1800s TTL,随上面两个
+  invalidate 一起清);
+* worker:不缓存,每次 ``spawn_worker`` 现建,下一次派发就生效。
+
+在那之前,缓存里那份构建认定「上游没有这个参数」,固定值不发 —— 与今天变量绑定落空后
+上游恢复的时序完全一样。
 """
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from expert_work.protocol import ArgBindingSpec, MCPToolSpec
 
 
+@dataclass(frozen=True)
+class ToolArgBindings:
+    """B-127 —— 一个工具归平台管的参数:``args`` 参数名 → 声明变量名,``fixed`` 参数名 → 常量。
+
+    两张表分开放,而不是塞进一张 ``{参数: 值或变量名}``:同一个字符串在一边是「去 inputs
+    里查的名字」、在另一边是「原样发出去的值」,混在一起就得靠约定区分,而分错的后果是把
+    变量名当值发给服务端,或者拿常量去 inputs 里查、查不到就把参数删掉。两边的参数名不相交
+    由协议层保证(``ArgBindingSpec._check_args_and_fixed``)。
+
+    ``frozen`` 只挡住整张表被换掉;里面的 dict 仍是可变的,所以凡是把它交出去的地方都给
+    :meth:`copy`(与 ``ToolRegistry.arg_bindings`` 同一口径)。
+    """
+
+    args: dict[str, str] = field(default_factory=dict)
+    fixed: dict[str, str] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.args or self.fixed)
+
+    @property
+    def params(self) -> tuple[str, ...]:
+        """全部归平台管的参数名,变量绑定在前、固定值在后(各自保持配置顺序)。"""
+        return (*self.args, *self.fixed)
+
+    def copy(self) -> ToolArgBindings:
+        return ToolArgBindings(args=dict(self.args), fixed=dict(self.fixed))
+
+    def without(self, params: Iterable[str]) -> ToolArgBindings:
+        """一份新的,去掉 ``params`` 里的参数(两边都去);原件不动。"""
+        drop = set(params)
+        return ToolArgBindings(
+            args={k: v for k, v in self.args.items() if k not in drop},
+            fixed={k: v for k, v in self.fixed.items() if k not in drop},
+        )
+
+
 def bindings_by_tool(
     entries: Sequence[ArgBindingSpec], *, server: str
-) -> dict[str, dict[str, str]]:
-    """该服务器下的 ``{裸工具名: {参数名: 变量名}}``。
+) -> dict[str, ToolArgBindings]:
+    """该服务器下的 ``{裸工具名: ToolArgBindings}``。
 
     可以跨 mcp 条目拼:``(server, tool)`` 在整份 manifest 里唯一是协议层校验保证的
     (``AgentSpecBody._check_arg_bindings``),这里不会有后来者静默覆盖前者。
 
-    ``dict(e.args)`` 是**拷贝**不是引用:spec 对象活在 BuiltAgent 缓存里,下游改一下
-    返回值就会改到缓存里的 spec,下一个 run 拿到的是被污染的绑定。
+    ``dict(e.args)`` / ``dict(e.fixed)`` 是**拷贝**不是引用:spec 对象活在 BuiltAgent
+    缓存里,下游改一下返回值就会改到缓存里的 spec,下一个 run 拿到的是被污染的绑定。
     """
-    return {e.tool: dict(e.args) for e in entries if e.server == server}
+    return {
+        e.tool: ToolArgBindings(args=dict(e.args), fixed=dict(e.fixed))
+        for e in entries
+        if e.server == server
+    }
 
 
 def _copy_json(value: Any) -> Any:
@@ -149,10 +212,12 @@ def _top_level_params(
 def apply_arg_bindings(
     tool_calls: Sequence[Mapping[str, Any]],
     *,
-    bindings: Mapping[str, Mapping[str, str]],
+    bindings: Mapping[str, ToolArgBindings],
     inputs: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """把绑定的参数填进每个 tool_call,返回(新 calls, 实际填入的参数名)。
+
+    B-127 —— 固定值每次都填、永远覆盖模型给的同名值,与 ``inputs`` 无关(同名输入也不算数)。
 
     变量本轮没传(``required: false`` 的可选变量)→ 该参数**不填,并且把模型塞进来的
     同名值删掉**。被绑的参数只有平台一个来源;平台没值时放行模型自己编的串,等于给
@@ -177,12 +242,16 @@ def apply_arg_bindings(
             filled.append(new_call)
             continue
         args = dict(new_call.get("args") or {})
-        for param, var_name in bound.items():
+        for param, var_name in bound.args.items():
             if var_name in inputs:
                 args[param] = _copy_json(inputs[var_name])
                 names.append(param)
             else:
                 args.pop(param, None)
+        # 值只可能是 str(协议层只收字符串),不可变,不用复制。
+        for param, value in bound.fixed.items():
+            args[param] = value
+            names.append(param)
         new_call["args"] = args
         filled.append(new_call)
     return filled, names

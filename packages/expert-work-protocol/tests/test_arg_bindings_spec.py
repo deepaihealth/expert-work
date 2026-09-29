@@ -140,10 +140,11 @@ def test_empty_servers_and_allow_tools_mean_all_so_any_binding_is_accepted() -> 
 
 def test_empty_args_is_rejected() -> None:
     # 必须钉住 loc + 原因:裸 ``pytest.raises(ValidationError)`` 在 fixture 将来
-    # 任何一个字段变非法时都照样绿,等于验不出 ``args`` 的 min_length。
+    # 任何一个字段变非法时都照样绿,等于验不出「一条绑定什么都没绑」被拒了。
+    # B-127 起 ``args`` 可以空(只配固定值),拒的是 args 与 fixed **都**空。
     with pytest.raises(
         ValidationError,
-        match=r"arg_bindings\.0\.args\n\s+Dictionary should have at least 1 item",
+        match=r"arg_bindings\.0\n.*deepcare/t binds nothing: set args and/or fixed",
     ):
         AgentSpec.model_validate(
             _manifest(
@@ -265,3 +266,182 @@ def test_input_validation_is_still_strict() -> None:
     assert [(e["type"], e["loc"]) for e in excinfo.value.errors()] == [
         ("extra_forbidden", ("spec", "tools", 0, "mcp", "bogus_key"))
     ]
+
+
+# ---------------------------------------------------------------------------
+# B-127 —— 固定值(``fixed``):参数恒为配置里写死的常量
+# ---------------------------------------------------------------------------
+
+
+def _fixed_binding(**extra: Any) -> dict[str, Any]:
+    return {"server": "records", "tool": "fetch_record", **extra}
+
+
+def test_a_fixed_only_binding_is_accepted_without_any_variable() -> None:
+    """固定值不引用变量:没有声明任何变量也合法,值本身不按变量名查。"""
+    spec = AgentSpec.model_validate(
+        _manifest(
+            servers=[], variables=[], bindings=[_fixed_binding(fixed={"detail_level": "brief"})]
+        )
+    )
+    entry = spec.spec.tools[0]
+    assert isinstance(entry, MCPToolSpec)
+    assert entry.arg_bindings[0].fixed == {"detail_level": "brief"}
+    assert entry.arg_bindings[0].args == {}
+
+
+def test_args_and_fixed_can_share_one_binding() -> None:
+    spec = AgentSpec.model_validate(
+        _manifest(
+            servers=[],
+            variables=[{"name": "pc"}],
+            bindings=[_fixed_binding(args={"project_code": "pc"}, fixed={"detail_level": "brief"})],
+        )
+    )
+    binding = spec.spec.tools[0].arg_bindings[0]  # type: ignore[union-attr]
+    assert binding.args == {"project_code": "pc"}
+    assert binding.fixed == {"detail_level": "brief"}
+
+
+def test_a_fixed_value_is_not_checked_against_declared_variables() -> None:
+    """值 ``pc`` 恰好是个**没声明**的名字:固定值是常量,不是变量引用,不能被拦。"""
+    AgentSpec.model_validate(
+        _manifest(servers=[], variables=[], bindings=[_fixed_binding(fixed={"project_code": "pc"})])
+    )
+
+
+def test_a_variable_binding_is_still_checked_when_fixed_is_present() -> None:
+    with pytest.raises(ValidationError, match=r"\.args\[project_code\] → 'nope' is not a declared"):
+        AgentSpec.model_validate(
+            _manifest(
+                servers=[],
+                variables=[],
+                bindings=[
+                    _fixed_binding(args={"project_code": "nope"}, fixed={"detail_level": "brief"})
+                ],
+            )
+        )
+
+
+def test_a_param_cannot_be_both_variable_bound_and_fixed() -> None:
+    with pytest.raises(
+        ValidationError,
+        match=r"records/fetch_record: .*both args and fixed: \['detail_level'\]",
+    ):
+        AgentSpec.model_validate(
+            _manifest(
+                servers=[],
+                variables=[{"name": "lvl"}],
+                bindings=[
+                    _fixed_binding(args={"detail_level": "lvl"}, fixed={"detail_level": "brief"})
+                ],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "fixed",
+    [{"": "brief"}, {"  ": "brief"}, {"detail_level": ""}, {"detail_level": "  "}],
+)
+def test_a_blank_fixed_key_or_value_is_rejected(fixed: dict[str, str]) -> None:
+    with pytest.raises(ValidationError, match=r"records/fetch_record: fixed .* must be non-empty"):
+        AgentSpec.model_validate(
+            _manifest(servers=[], variables=[], bindings=[_fixed_binding(fixed=fixed)])
+        )
+
+
+@pytest.mark.parametrize(
+    "fixed",
+    [
+        {"detail_level": "brief "},
+        {"detail_level": " brief"},
+        {"detail_level": "brief\n"},
+        {" detail_level": "brief"},
+        {"detail_level\t": "brief"},
+    ],
+)
+def test_a_fixed_key_or_value_with_surrounding_whitespace_is_rejected(
+    fixed: dict[str, str],
+) -> None:
+    """B-127 —— 固定值原样发给工具:多出来的空格不是「差不多」,而是另一个值
+    (``"brief "`` 对枚举参数就是非法值)。拒掉并说清楚,而不是悄悄 strip。"""
+    with pytest.raises(
+        ValidationError,
+        match=r"records/fetch_record: fixed .* no leading or trailing whitespace",
+    ):
+        AgentSpec.model_validate(
+            _manifest(servers=[], variables=[], bindings=[_fixed_binding(fixed=fixed)])
+        )
+
+
+def test_inner_spaces_in_a_fixed_value_are_fine() -> None:
+    AgentSpec.model_validate(
+        _manifest(servers=[], variables=[], bindings=[_fixed_binding(fixed={"mode": "very brief"})])
+    )
+
+
+def test_a_non_string_fixed_value_is_rejected() -> None:
+    """只收字符串(YAGNI:唯一的真实用例是 ``detail_level: brief``)。"""
+    with pytest.raises(ValidationError) as excinfo:
+        AgentSpec.model_validate(
+            _manifest(servers=[], variables=[], bindings=[_fixed_binding(fixed={"limit": 5})])
+        )
+    assert [e["type"] for e in excinfo.value.errors()] == ["string_type"]
+
+
+def test_the_manifest_level_rules_still_apply_to_a_fixed_only_binding() -> None:
+    """server / allow_tools / 重复三条规则管的是整条绑定,与它绑的是变量还是常量无关。"""
+    with pytest.raises(ValidationError, match=r"is not among this mcp entry's allow_tools"):
+        AgentSpec.model_validate(
+            _manifest(
+                servers=[],
+                variables=[],
+                allow_tools=["other"],
+                bindings=[_fixed_binding(fixed={"detail_level": "brief"})],
+            )
+        )
+    with pytest.raises(ValidationError, match=r"duplicate arg_bindings"):
+        AgentSpec.model_validate(
+            _manifest(
+                servers=[],
+                variables=[{"name": "pc"}],
+                bindings=[
+                    _fixed_binding(fixed={"detail_level": "brief"}),
+                    _fixed_binding(args={"project_code": "pc"}),
+                ],
+            )
+        )
+
+
+def test_an_empty_fixed_is_not_serialized() -> None:
+    """``fixed`` 空就不写 —— 旧镜像读回来不撞 ``extra="forbid"``,存量指纹也不变。"""
+    spec = AgentSpec.model_validate(
+        _manifest(
+            servers=[],
+            variables=[{"name": "a"}],
+            bindings=[{"server": "records", "tool": "t", "args": {"p": "a"}}],
+        )
+    )
+    binding = spec.model_dump(by_alias=True, mode="json")["spec"]["tools"][0]["arg_bindings"][0]
+    assert binding == {"server": "records", "tool": "t", "args": {"p": "a"}}
+
+
+def test_a_configured_fixed_serializes_and_round_trips() -> None:
+    spec = AgentSpec.model_validate(
+        _manifest(
+            servers=[], variables=[], bindings=[_fixed_binding(fixed={"detail_level": "brief"})]
+        )
+    )
+    dumped = spec.model_dump(by_alias=True, mode="json")
+    binding = dumped["spec"]["tools"][0]["arg_bindings"][0]
+    assert binding["fixed"] == {"detail_level": "brief"}
+    assert AgentSpec.model_validate(dumped) == spec
+
+
+def test_the_binding_serialization_schema_is_not_collapsed() -> None:
+    """与 ``MCPToolSpec`` 那条同理:wrap serializer 标了返回类型就会把 schema 塌掉。"""
+    from expert_work.protocol import ArgBindingSpec
+
+    schema = ArgBindingSpec.model_json_schema(mode="serialization")
+    assert schema.get("additionalProperties") is not True
+    assert {"server", "tool", "args", "fixed"} <= schema.get("properties", {}).keys()

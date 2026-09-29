@@ -268,7 +268,8 @@ test("(c) MCP per-parameter binding editor passes axe (serious + critical)", asy
   await page.getByTestId("agents-create").click();
   await expect(page.getByTestId("manifest-form-view")).toBeVisible();
 
-  // 先声明一个提示词变量 —— 没有声明变量时绑定区只给一句提示,下拉根本不渲染。
+  // 先声明一个提示词变量,让下拉里有变量那几档可扫(B-127 起没有变量时参数行也照样
+  // 渲染,只多一句提示、下拉只有「自动 / 固定值」)。
   await page.getByTestId("cfg-nav-prompt").click();
   await page.getByTestId("af-prompt-jinja").click();
   await page.getByTestId("af-prompt-var-add").click();

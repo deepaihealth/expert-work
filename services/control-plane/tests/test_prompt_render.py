@@ -488,6 +488,27 @@ def _unset_built(*, trusted: bool, bound: bool) -> _Built:
     )
 
 
+def test_a_fixed_value_is_never_a_bound_variable_name() -> None:
+    """B-127 —— ``fixed`` 的值是常量,不是变量名。它碰巧与某个声明变量同名时,也不能让
+    「本轮输入」段说那个变量「已绑定到工具参数」—— 那样说,模型会以为值由平台填了。"""
+    from types import SimpleNamespace
+
+    from expert_work.protocol import ArgBindingSpec
+
+    built = SimpleNamespace(
+        arg_bindings=(
+            ArgBindingSpec(server="records", tool="fetch_record", fixed={"lvl": "customer_code"}),
+            ArgBindingSpec(
+                server="records",
+                tool="t2",
+                args={"project": "project_code"},
+                fixed={"logo": "org_logo"},
+            ),
+        )
+    )
+    assert bound_variable_names(built) == frozenset({"project_code"})
+
+
 @pytest.mark.parametrize("bound", [False, True])
 def test_an_unset_optional_variable_stays_unset(bound: bool) -> None:
     """本轮没传的变量渲染成今天的值,不走形态渲染 —— 被绑定也一样:平台此时什么都

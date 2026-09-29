@@ -12,6 +12,115 @@ import type { ArgBindingFields } from "../form_model";
  *  with a declared variable name (those are non-empty by construction). */
 export const AUTO = "";
 
+/** B-127 — the "fixed value" choice in the same Select. A declared variable
+ *  name must match ``^[a-zA-Z_][a-zA-Z0-9_]*$`` (``PromptVariableSpec.name``),
+ *  so a leading colon can never collide with one. */
+export const FIXED = ":fixed";
+
+/** What the platform does with one parameter of one tool. */
+export type ParamChoice =
+  | { kind: "auto" }
+  | { kind: "variable"; name: string }
+  | { kind: "fixed"; value: string };
+
+/** One platform-owned parameter of a binding, flattened (for counts / lists). */
+export type BoundParam =
+  | { param: string; kind: "variable"; name: string }
+  | { param: string; kind: "fixed"; value: string };
+
+/** Every parameter a binding owns: variable-bound first, then fixed — the
+ *  same order the backend reports them in (``ToolArgBindings.params``). */
+export const boundParamsOf = (binding: ArgBindingFields): BoundParam[] => [
+  ...Object.entries(binding.args ?? {}).map(
+    ([param, name]): BoundParam => ({ param, kind: "variable", name }),
+  ),
+  ...Object.entries(binding.fixed ?? {}).map(
+    ([param, value]): BoundParam => ({ param, kind: "fixed", value }),
+  ),
+];
+
+const sameTool =
+  (server: string, tool: string) =>
+  (b: ArgBindingFields): boolean =>
+    b.server === server && b.tool === tool;
+
+/** The current choice for ``param`` of ``server``/``tool``. A fixed value that
+ *  is still empty is the fixed choice (the operator is typing it) — reading it
+ *  as "auto" would snap the row back and swallow the first keystroke. */
+export function choiceOf(
+  bindings: ArgBindingFields[],
+  server: string,
+  tool: string,
+  param: string,
+): ParamChoice {
+  const binding = bindings.find(sameTool(server, tool));
+  const variable = binding?.args?.[param];
+  if (variable !== undefined) return { kind: "variable", name: variable };
+  const value = binding?.fixed?.[param];
+  if (value !== undefined) return { kind: "fixed", value };
+  return { kind: "auto" };
+}
+
+/** Whether a fixed value would pass ``ArgBindingSpec``: non-empty, and no
+ *  leading/trailing whitespace (a stray space would be sent to the tool as-is,
+ *  so the backend rejects it rather than guessing). */
+export const fixedValueValid = (value: string): boolean =>
+  value !== "" && value === value.trim();
+
+/** The Select value that shows ``choice``. */
+export const selectValueOf = (choice: ParamChoice): string =>
+  choice.kind === "variable" ? choice.name : choice.kind === "fixed" ? FIXED : AUTO;
+
+/** The choice a Select pick means. Re-picking "fixed" keeps the value already
+ *  typed rather than blanking it. */
+export const choiceFromSelect = (value: string, current: ParamChoice): ParamChoice => {
+  if (value === AUTO) return { kind: "auto" };
+  if (value === FIXED) {
+    return { kind: "fixed", value: current.kind === "fixed" ? current.value : "" };
+  }
+  return { kind: "variable", name: value };
+};
+
+/**
+ * A new binding list with ``param`` of ``server``/``tool`` set to ``choice``.
+ *
+ * The parameter is first taken out of BOTH maps, then put into the one the
+ * choice names — so it can never end up in ``args`` and ``fixed`` at once
+ * (``ArgBindingSpec`` rejects that). Empty maps are omitted rather than
+ * written as ``{}`` (a variable-only binding keeps its pre-B-127 shape, and an
+ * empty ``fixed`` would otherwise reach the manifest); a binding left with
+ * neither is removed — the backend rejects a binding that binds nothing.
+ * Like the B-61 writer this replaced, the edited binding moves to the end.
+ */
+export function setParamChoice(
+  bindings: ArgBindingFields[],
+  server: string,
+  tool: string,
+  param: string,
+  choice: ParamChoice,
+): ArgBindingFields[] {
+  const current = bindings.find(sameTool(server, tool));
+  const others = bindings.filter((b) => !sameTool(server, tool)(b));
+  const without = (map: Record<string, string> | undefined) =>
+    Object.fromEntries(Object.entries(map ?? {}).filter(([key]) => key !== param));
+  const args = without(current?.args);
+  const fixed = without(current?.fixed);
+  if (choice.kind === "variable") args[param] = choice.name;
+  if (choice.kind === "fixed") fixed[param] = choice.value;
+  const hasArgs = Object.keys(args).length > 0;
+  const hasFixed = Object.keys(fixed).length > 0;
+  if (!hasArgs && !hasFixed) return others;
+  return [
+    ...others,
+    {
+      server,
+      tool,
+      ...(hasArgs ? { args } : {}),
+      ...(hasFixed ? { fixed } : {}),
+    },
+  ];
+}
+
 /** One row of the binding editor: a parameter of the tool's input schema. */
 export interface ToolParam {
   name: string;

@@ -314,7 +314,8 @@ async def build_tool_registry(
         # 那不是撞名,而且上面已经报过 ``params_absent`` 了。同一条绑定只说一次。
         configured_args: dict[tuple[str, str], set[str]] = {}
         for b in all_arg_bindings:
-            configured_args.setdefault((b.server, b.tool), set()).update(b.args)
+            # B-127 —— 固定值的参数名同样算「这条绑定配了的参数」。
+            configured_args.setdefault((b.server, b.tool), set()).update(b.args, b.fixed)
         fully_drifted = {
             (u.server, u.tool)
             for u in registry.unmatched_arg_bindings()
@@ -324,13 +325,14 @@ async def build_tool_registry(
         for binding in all_arg_bindings:
             key = (binding.server, binding.tool)
             wire_name = landed.get(key)
+            params = (*binding.args, *binding.fixed)
             if wire_name is None:
                 registry.note_unmatched_arg_binding(
-                    binding.server, binding.tool, tuple(binding.args), reason="tool_missing"
+                    binding.server, binding.tool, params, reason="tool_missing"
                 )
             elif wire_name not in live and key not in fully_drifted:
                 registry.note_unmatched_arg_binding(
-                    binding.server, binding.tool, tuple(binding.args), reason="name_collision"
+                    binding.server, binding.tool, params, reason="name_collision"
                 )
     _register_base_capabilities(
         registry, tool_env, skill_seed_files, figure_delivery=figure_delivery

@@ -64,7 +64,10 @@ def _fence_value(value: str, *, nonce: str | None) -> str:
 
 
 def bound_variable_names(built: Any) -> frozenset[str]:
-    """被某条 ``arg_bindings`` 引用的变量名(``BuiltAgent.arg_bindings``,manifest 原件)。"""
+    """被某条 ``arg_bindings`` 引用的变量名(``BuiltAgent.arg_bindings``,manifest 原件)。
+
+    只看 ``args`` 的值。B-127 的 ``fixed`` 值是常量不是变量名,碰巧同名也不算。
+    """
     return frozenset(
         var_name
         for binding in getattr(built, "arg_bindings", ())

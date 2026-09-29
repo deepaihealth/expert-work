@@ -81,6 +81,16 @@ const T2: serversSdk.McpTool = {
   input_schema: { properties: { note: {} } },
 };
 
+/** B-127 用例的中性工具:一个必填的记录号 + 一个可写死的详略档位。 */
+const FETCH: serversSdk.McpTool = {
+  name: "fetch_record",
+  description: "",
+  input_schema: {
+    properties: { record_id: {}, detail_level: {} },
+    required: ["record_id"],
+  },
+};
+
 const BINDING: ArgBindingFields = {
   server: "deepcare",
   tool: "t1",
@@ -88,6 +98,8 @@ const BINDING: ArgBindingFields = {
 };
 
 interface PickerOpts {
+  /** B-127 用例用中性的服务器名;默认沿用 B-61 用例的那个。 */
+  server?: string;
   tools?: serversSdk.McpTool[];
   promptVariables?: string[];
   argBindings?: ArgBindingFields[];
@@ -100,13 +112,14 @@ interface PickerOpts {
 }
 
 function renderPicker(opts: PickerOpts = {}) {
-  availableMock.mockResolvedValue([{ name: "deepcare", source: "tenant" }]);
+  const server = opts.server ?? "deepcare";
+  availableMock.mockResolvedValue([{ name: server, source: "tenant" }]);
   toolsMock.mockResolvedValue(opts.tools ?? [T1]);
   const user = userEvent.setup();
   render(
     <App>
       <McpToolPicker
-        servers={["deepcare"]}
+        servers={[server]}
         allowTools={opts.allowTools ?? []}
         argBindings={opts.argBindings ?? []}
         promptVariables={opts.promptVariables ?? ["project_code"]}
@@ -164,16 +177,24 @@ async function findConfirm(): Promise<HTMLElement> {
 }
 
 /** 只开到「选择工具」弹窗(有些用例压根不该有展开按钮可点)。 */
-async function openToolModal(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(await screen.findByTestId("af-mcp-choose-deepcare"));
-  await screen.findByTestId("af-mcp-tool-t1");
+async function openToolModal(
+  user: ReturnType<typeof userEvent.setup>,
+  server = "deepcare",
+  tool = "t1",
+) {
+  await user.click(await screen.findByTestId(`af-mcp-choose-${server}`));
+  await screen.findByTestId(`af-mcp-tool-${tool}`);
   return user;
 }
 
 /** 绑定 UI 住在「选择工具」弹窗里 —— 先开到那儿,再展开 t1 的参数绑定。 */
-async function openBindings(user: ReturnType<typeof userEvent.setup>) {
-  await openToolModal(user);
-  await user.click(await screen.findByRole("button", { name: /t1/ }));
+async function openBindings(
+  user: ReturnType<typeof userEvent.setup>,
+  server = "deepcare",
+  tool = "t1",
+) {
+  await openToolModal(user, server, tool);
+  await user.click(await screen.findByRole("button", { name: new RegExp(tool) }));
 }
 
 describe("McpToolPicker 参数绑定", () => {
@@ -203,6 +224,7 @@ describe("McpToolPicker 参数绑定", () => {
     await waitFor(() => expect(optionLabels().length).toBeGreaterThan(0));
     expect(optionLabels()).toEqual([
       "自动（模型填）",
+      "固定值",
       "project_code",
       "employee_code",
     ]);
@@ -240,8 +262,9 @@ describe("McpToolPicker 参数绑定", () => {
     );
   });
 
-  it("声明变量为空时给出提示而不是一个空下拉", async () => {
-    await openBindings(renderPicker({ promptVariables: [] }));
+  it("声明变量为空时给出提示,参数行照列(固定值不需要变量)", async () => {
+    const user = renderPicker({ promptVariables: [] });
+    await openBindings(user);
     const hint = screen.getByTestId("af-mcp-bind-no-vars-t1");
     expect(hint.textContent).toContain("声明变量");
     // 提示必须指得着**页面上真实存在的**那一节。直接取那两个 i18n 键:谁把分组
@@ -253,7 +276,137 @@ describe("McpToolPicker 参数绑定", () => {
     // 「绑定文案」那个 describe 里按 locale 各钉了一遍。别把这两行"顺手"改掉。
     expect(hint.textContent).toContain(i18n.t("manifest_editor.group_prompt"));
     expect(hint.textContent).toContain(i18n.t("agent_form.section_prompt_vars"));
-    expect(screen.queryByLabelText("project_code")).not.toBeInTheDocument();
+    // B-127 —— 没有变量也能写死固定值,所以下拉在、只是没有变量那几档。
+    await user.click(screen.getByLabelText("project_code"));
+    await waitFor(() => expect(optionLabels().length).toBeGreaterThan(0));
+    expect(optionLabels()).toEqual(["自动（模型填）", "固定值"]);
+  });
+
+  // ── B-127:第三种选择「固定值」 ─────────────────────────────────────────
+  function ControlledPicker({ initial }: { initial: ArgBindingFields[] }) {
+    const [bindings, setBindings] = useState<ArgBindingFields[]>(initial);
+    return (
+      <App>
+        <McpToolPicker
+          servers={["records"]}
+          allowTools={[]}
+          argBindings={bindings}
+          promptVariables={["record_ref"]}
+          onChange={(_s, _a, next) => setBindings(next)}
+        />
+        <pre data-testid="bindings-json">{JSON.stringify(bindings)}</pre>
+      </App>
+    );
+  }
+
+  function renderControlled(initial: ArgBindingFields[] = []) {
+    availableMock.mockResolvedValue([{ name: "records", source: "tenant" }]);
+    toolsMock.mockResolvedValue([FETCH]);
+    const user = userEvent.setup();
+    render(<ControlledPicker initial={initial} />);
+    return user;
+  }
+
+  const openFetch = (user: ReturnType<typeof userEvent.setup>) =>
+    openBindings(user, "records", "fetch_record");
+
+  const writtenBindings = (): unknown =>
+    JSON.parse(screen.getByTestId("bindings-json").textContent ?? "[]");
+
+  it("选「固定值」出现输入框,键入的值写成 fixed(不是 args)", async () => {
+    const user = renderControlled();
+    await openFetch(user);
+    await user.click(screen.getByLabelText("detail_level"));
+    await pickOption(user, "固定值");
+    const input = await screen.findByTestId("af-mcp-bind-fixed-fetch_record-detail_level");
+    await user.type(input, "brief");
+    await waitFor(() =>
+      expect(writtenBindings()).toEqual([
+        { server: "records", tool: "fetch_record", fixed: { detail_level: "brief" } },
+      ]),
+    );
+    expect(
+      screen.getByTestId("af-mcp-bind-row-fetch_record-detail_level").textContent,
+    ).toContain("固定值");
+    expect(screen.getByTestId("af-mcp-bind-toggle-fetch_record").textContent).toContain("1");
+    // 值合法:不标红、没有提示。
+    expect(input.className).not.toContain("ant-input-status-error");
+    expect(
+      screen.queryByTestId("af-mcp-bind-fixed-hint-fetch_record-detail_level"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("固定值还空着时输入框标红带提示,选回「自动」整条删除", async () => {
+    const user = renderControlled();
+    await openFetch(user);
+    await user.click(screen.getByLabelText("detail_level"));
+    await pickOption(user, "固定值");
+    const input = await screen.findByTestId("af-mcp-bind-fixed-fetch_record-detail_level");
+    expect(input.className).toContain("ant-input-status-error");
+    expect(
+      screen.getByTestId("af-mcp-bind-fixed-hint-fetch_record-detail_level").textContent,
+    ).toBe("填写一个值，首尾不能有空格");
+    await user.click(screen.getByLabelText("detail_level"));
+    await pickOption(user, "自动（模型填）");
+    await waitFor(() => expect(writtenBindings()).toEqual([]));
+    expect(
+      screen.queryByTestId("af-mcp-bind-fixed-fetch_record-detail_level"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("固定值首尾带空格时标红带提示(后端会拒)", async () => {
+    const user = renderControlled([
+      { server: "records", tool: "fetch_record", fixed: { detail_level: "brief " } },
+    ]);
+    await openFetch(user);
+    const input = screen.getByTestId("af-mcp-bind-fixed-fetch_record-detail_level");
+    expect(input.className).toContain("ant-input-status-error");
+    expect(
+      screen.getByTestId("af-mcp-bind-fixed-hint-fetch_record-detail_level"),
+    ).toBeInTheDocument();
+  });
+
+  it("manifest 里已有的固定值,一打开就显示在对应参数上;改变量不动它", async () => {
+    const user = renderControlled([
+      { server: "records", tool: "fetch_record", fixed: { detail_level: "brief" } },
+    ]);
+    await openFetch(user);
+    expect(screen.getByTestId("af-mcp-bind-fixed-fetch_record-detail_level")).toHaveValue(
+      "brief",
+    );
+    await user.click(screen.getByLabelText("record_id"));
+    await pickOption(user, "record_ref");
+    await waitFor(() =>
+      expect(writtenBindings()).toEqual([
+        {
+          server: "records",
+          tool: "fetch_record",
+          args: { record_id: "record_ref" },
+          fixed: { detail_level: "brief" },
+        },
+      ]),
+    );
+  });
+
+  it("删绑定的确认框把固定值也逐条列出来", async () => {
+    const user = renderPicker({
+      server: "records",
+      tools: [FETCH],
+      promptVariables: ["record_ref"],
+      argBindings: [
+        {
+          server: "records",
+          tool: "fetch_record",
+          args: { record_id: "record_ref" },
+          fixed: { detail_level: "brief" },
+        },
+      ],
+    });
+    await user.click(await screen.findByTestId("af-mcp-server-records"));
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain("这会同时删掉 2 条参数绑定");
+    expect(within(dialog).getAllByRole("listitem")).toHaveLength(2);
+    expect(dialog.textContent).toContain("fetch_record 的 detail_level = 固定值 brief");
   });
 
   // ── 追加要求:删绑定前先说清楚删的是哪几条 ───────────────────────────────
@@ -494,10 +647,14 @@ const BIND_COPY = {
     open: "t1 的参数绑定",
     count: "已绑 1 个",
     auto: "自动（模型填）",
-    hint: "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。不绑定的参数仍由模型自己填。",
+    fixed: "固定值",
+    fixedInput: "detail_level 的固定值",
+    fixedHint: "填写一个值，首尾不能有空格",
+    dropItemFixed: "fetch_record 的 detail_level = 固定值 brief",
+    hint: "绑定后，这个参数由平台按变量的值填写：模型看不到它，也就不会把长串抄错。固定值则每次调用都原样发送。不绑定的参数仍由模型自己填。",
     required: "这个参数是必填的",
     noVariables:
-      "先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量，再回来把参数绑到变量上。",
+      "还没有声明变量。仍可以写固定值；要把参数绑到变量上，先到「提示词与输出」→「动态 Prompt(Jinja)」里声明变量。",
     dropTitle: "这会同时删掉 1 条参数绑定",
     dropTitleMany: "这会同时删掉 2 条参数绑定",
     dropItem: "t1 的 project_code ← 变量 project_code",
@@ -510,10 +667,14 @@ const BIND_COPY = {
     open: "Bound parameters for t1",
     count: "1 bound",
     auto: "Auto (model fills it in)",
-    hint: "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. Unbound parameters are still filled in by the model.",
+    fixed: "Fixed value",
+    fixedInput: "Fixed value for detail_level",
+    fixedHint: "Enter a value with no leading or trailing spaces",
+    dropItemFixed: "detail_level on fetch_record = fixed value brief",
+    hint: "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. A fixed value is sent as-is on every call. Unbound parameters are still filled in by the model.",
     required: "This parameter is required",
     noVariables:
-      "Declare a variable under Prompt & Output → Dynamic prompt (Jinja) first, then come back and bind parameters to it.",
+      "No variables declared yet. You can still set a fixed value; to bind a parameter to a variable, declare one under Prompt & Output → Dynamic prompt (Jinja) first.",
     dropTitle: "This will also delete 1 bound parameter",
     dropTitleMany: "This will also delete 2 bound parameters",
     dropItem: "project_code on t1 ← variable project_code",
@@ -565,6 +726,29 @@ describe.each(["zh-CN", "en"] as const)("McpToolPicker 绑定文案 (%s)", (lang
     // 下拉里的「自动」那一档。
     await user.click(screen.getByLabelText("keyword"));
     expect(optionLabels()).toContain(copy.auto);
+    // B-127 —— 「固定值」那一档,以及选中后输入框的读屏名。
+    expect(optionLabels()).toContain(copy.fixed);
+    await pickOption(user, copy.fixed);
+  });
+
+  it("固定值的输入框、提示与确认框条目按本 locale 渲染", async () => {
+    const user = renderPicker({
+      server: "records",
+      tools: [FETCH],
+      argBindings: [
+        // 尾随空格:提示那一句也得按 locale 出来。
+        { server: "records", tool: "fetch_record", fixed: { detail_level: "brief " } },
+      ],
+    });
+    await openBindings(user, "records", "fetch_record");
+    const input = screen.getByTestId("af-mcp-bind-fixed-fetch_record-detail_level");
+    expect(input).toHaveAttribute("aria-label", copy.fixedInput);
+    expect(
+      screen.getByTestId("af-mcp-bind-fixed-hint-fetch_record-detail_level").textContent,
+    ).toBe(copy.fixedHint);
+    await user.click(screen.getByTestId("af-mcp-server-records"));
+    const dialog = await findConfirm();
+    expect(dialog.textContent).toContain(copy.dropItemFixed);
   });
 
   it("一条变量都没声明时的提示按本 locale 渲染", async () => {
@@ -698,7 +882,7 @@ describe("FormView 把 MCP 绑定接到 manifest 上", () => {
     await user.click(screen.getByLabelText("project_code"));
     await waitFor(() => expect(optionLabels().length).toBeGreaterThan(0));
     // 没起名字的变量行不是一个可绑的变量,不该进下拉。
-    expect(optionLabels()).toEqual(["自动（模型填）", "project_code"]);
+    expect(optionLabels()).toEqual(["自动（模型填）", "固定值", "project_code"]);
 
     await pickOption(user, "project_code");
     await waitFor(() => expect(onChange).toHaveBeenCalled());

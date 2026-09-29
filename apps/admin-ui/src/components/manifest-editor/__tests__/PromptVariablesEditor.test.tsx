@@ -22,7 +22,7 @@ function orphansIn(m: unknown): string[] {
       .filter((n): n is string => (n ?? "") !== ""),
   );
   return readTools(m).mcpArgBindings.flatMap((b) =>
-    Object.entries(b.args)
+    Object.entries(b.args ?? {})
       .filter(([, variable]) => !declared.has(variable))
       .map(([param, variable]) => `${b.server}/${b.tool}.${param}=${variable}`),
   );
@@ -578,6 +578,29 @@ describe("PromptVariablesEditor 绑定守卫(B-61)", () => {
     const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
     expect(last.spec?.system_prompt?.jinja).toBeUndefined();
     expect(orphansIn(last)).toEqual([]);
+  });
+
+  // B-127 —— 固定值不引用变量,关 Jinja 不删它,所以不弹框、也不算进要删的条数。
+  it("关 Jinja:只有固定值时不弹框,固定值原样留下", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const fixedOnly: ArgBindingFields = {
+      server: "records",
+      tool: "fetch_record",
+      fixed: { detail_level: "brief" },
+    };
+    render(
+      <App>
+        <PromptVariablesEditor
+          formData={boundSeed([{ name: "project_code" }], [fixedOnly])}
+          onChange={onChange}
+        />
+      </App>,
+    );
+    await user.click(screen.getByTestId("af-prompt-jinja"));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(readTools(last).mcpArgBindings).toEqual([fixedOnly]);
   });
 
   it("绑的是别的变量时,这一行不受影响", async () => {

@@ -19,6 +19,10 @@
  * "auto (model fills it in)" and one of the agent's DECLARED prompt variables.
  * Free-text variable names are deliberately impossible here — a name nothing
  * declares is exactly how a binding silently matches nothing.
+ *
+ * B-127 — a third choice, "fixed value": the parameter is pinned to a constant
+ * typed right here (``arg_bindings[].fixed``). It needs no declared variable,
+ * so the rows render even when the agent declares none.
  */
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -41,9 +45,17 @@ import { useTranslation } from "react-i18next";
 import type { ArgBindingFields } from "../form_model";
 import {
   AUTO,
+  FIXED,
   bindingInScope,
+  boundParamsOf,
+  choiceFromSelect,
+  choiceOf,
+  fixedValueValid,
   paramsOf,
+  selectValueOf,
+  setParamChoice,
   toolInScope,
+  type ParamChoice,
   type ToolParam,
 } from "./mcp_arg_bindings";
 
@@ -259,14 +271,9 @@ export function McpToolPicker({
     // 数的是**参数**,不是 arg_bindings 条目 —— 一个条目可以绑好几个参数,而用户
     // 要衡量的是「有几个参数要回到模型自己填」。标题的 N 与下面的列表都从这一份
     // 摊平结果来(带上 tool/server,列表才用得上它),所以「说 3 条、列 4 行」不是
-    // 靠两段代码碰巧一样,而是结构上产生不出来。
+    // 靠两段代码碰巧一样,而是结构上产生不出来。B-127 —— 固定值同样算一条。
     const droppedParams = dropped.flatMap((b) =>
-      Object.entries(b.args).map(([param, variable]) => ({
-        server: b.server,
-        tool: b.tool,
-        param,
-        variable,
-      })),
+      boundParamsOf(b).map((p) => ({ server: b.server, tool: b.tool, ...p })),
     );
     modal.confirm({
       title: t("agent_form.mcp_bind_drop_title", {
@@ -279,11 +286,17 @@ export function McpToolPicker({
           <ul style={{ margin: "0 0 8px", paddingLeft: 18 }}>
             {droppedParams.map((row) => (
               <li key={`${row.server}/${row.tool}/${row.param}`}>
-                {t("agent_form.mcp_bind_drop_item", {
-                  tool: row.tool,
-                  param: row.param,
-                  variable: row.variable,
-                })}
+                {row.kind === "fixed"
+                  ? t("agent_form.mcp_bind_drop_item_fixed", {
+                      tool: row.tool,
+                      param: row.param,
+                      value: row.value,
+                    })
+                  : t("agent_form.mcp_bind_drop_item", {
+                      tool: row.tool,
+                      param: row.param,
+                      variable: row.name,
+                    })}
               </li>
             ))}
           </ul>
@@ -338,37 +351,17 @@ export function McpToolPicker({
     );
   };
 
-  // ── B-61: per-parameter bindings ─────────────────────────────────────────
-  const argsOf = (server: string, tool: string): Record<string, string> =>
-    argBindings.find((b) => b.server === server && b.tool === tool)?.args ?? {};
-
-  /** Bind ``param`` to ``variable``, or unbind it when ``variable`` is null.
-   *  A tool whose last parameter is unbound loses its whole entry — the
-   *  manifest requires ``args`` to be non-empty. */
-  const setBinding = (
+  // ── B-61 / B-127: per-parameter bindings ─────────────────────────────────
+  /** Set one parameter to auto / a variable / a fixed value. The shape rules
+   *  (never in both maps, empty maps omitted, empty binding removed) live in
+   *  ``setParamChoice``. */
+  const setChoice = (
     server: string,
     tool: string,
     param: string,
-    variable: string | null,
-  ): void => {
-    const current = argsOf(server, tool);
-    const nextArgs =
-      variable === null
-        ? Object.fromEntries(
-            Object.entries(current).filter(([key]) => key !== param),
-          )
-        : { ...current, [param]: variable };
-    const others = argBindings.filter(
-      (b) => !(b.server === server && b.tool === tool),
-    );
-    emit(
-      servers,
-      allowTools,
-      Object.keys(nextArgs).length === 0
-        ? others
-        : [...others, { server, tool, args: nextArgs }],
-    );
-  };
+    choice: ParamChoice,
+  ): void =>
+    emit(servers, allowTools, setParamChoice(argBindings, server, tool, param, choice));
 
   // ── Loading / error / empty ──────────────────────────────────────────────
   if (loading) {
@@ -647,8 +640,10 @@ export function McpToolPicker({
     // 没有 schema 就没有参数可绑;不在范围内的工具绑了也会被 manifest 校验拒掉。
     if (params.length === 0) return null;
     if (!toolInScope(row.name, tool.name, servers, allowTools)) return null;
-    const bound = argsOf(row.name, tool.name);
-    const boundCount = Object.keys(bound).length;
+    const binding = argBindings.find(
+      (b) => b.server === row.name && b.tool === tool.name,
+    );
+    const boundCount = binding === undefined ? 0 : boundParamsOf(binding).length;
     const open = expandedBindings.includes(tool.name);
     // 读屏要能答「展开的是哪一块」,所以 aria-expanded 必须配一个 aria-controls
     // 指向真实存在的 id。
@@ -674,77 +669,110 @@ export function McpToolPicker({
           {t("agent_form.mcp_bind_label")}
           {boundCount > 0 && ` · ${t("agent_form.mcp_bind_count", { count: boundCount })}`}
         </Button>
-        {open &&
-          (promptVariables.length === 0 ? (
-            <Text
-              type="secondary"
-              id={panelId}
-              data-testid={`af-mcp-bind-no-vars-${tool.name}`}
-              style={{ display: "block", fontSize: 12, paddingBottom: 4 }}
-            >
-              {t("agent_form.mcp_bind_no_variables")}
+        {open && (
+          <div
+            id={panelId}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+              paddingBottom: 6,
+            }}
+          >
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {t("agent_form.mcp_bind_hint")}
             </Text>
-          ) : (
-            <div
-              id={panelId}
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-                paddingBottom: 6,
-              }}
-            >
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {t("agent_form.mcp_bind_hint")}
+            {promptVariables.length === 0 && (
+              // B-127 —— 没有变量照样能写固定值,所以只提示、不再挡掉整个编辑区。
+              <Text
+                type="secondary"
+                data-testid={`af-mcp-bind-no-vars-${tool.name}`}
+                style={{ display: "block", fontSize: 12 }}
+              >
+                {t("agent_form.mcp_bind_no_variables")}
               </Text>
-              {params.map((param: ToolParam) => {
-                const id = `af-mcp-bind-${row.name}-${tool.name}-${param.name}`;
-                return (
-                  <div
-                    key={param.name}
-                    data-testid={`af-mcp-bind-row-${tool.name}-${param.name}`}
-                    style={{ display: "flex", alignItems: "center", gap: 8 }}
-                  >
-                    <span style={{ fontSize: 12, minWidth: 180 }}>
-                      <label htmlFor={id}>{param.name}</label>
-                      {param.required && (
-                        // antd 自己的必填星号同款:视觉标记,读屏不念。
+            )}
+            {params.map((param: ToolParam) => {
+              const id = `af-mcp-bind-${row.name}-${tool.name}-${param.name}`;
+              const choice = choiceOf(argBindings, row.name, tool.name, param.name);
+              return (
+                <div
+                  key={param.name}
+                  data-testid={`af-mcp-bind-row-${tool.name}-${param.name}`}
+                  style={{ display: "flex", alignItems: "center", gap: 8 }}
+                >
+                  <span style={{ fontSize: 12, minWidth: 180 }}>
+                    <label htmlFor={id}>{param.name}</label>
+                    {param.required && (
+                      // antd 自己的必填星号同款:视觉标记,读屏不念。
+                      <Text
+                        type="danger"
+                        aria-hidden="true"
+                        title={t("agent_form.mcp_bind_required")}
+                        style={{ marginLeft: 2 }}
+                      >
+                        *
+                      </Text>
+                    )}
+                  </span>
+                  <Select
+                    id={id}
+                    size="small"
+                    style={{ minWidth: 220 }}
+                    value={selectValueOf(choice)}
+                    onChange={(value: string) =>
+                      setChoice(
+                        row.name,
+                        tool.name,
+                        param.name,
+                        choiceFromSelect(value, choice),
+                      )
+                    }
+                    options={[
+                      { value: AUTO, label: t("agent_form.mcp_bind_auto") },
+                      { value: FIXED, label: t("agent_form.mcp_bind_fixed") },
+                      ...promptVariables.map((name) => ({
+                        value: name,
+                        label: name,
+                      })),
+                    ]}
+                  />
+                  {choice.kind === "fixed" && (
+                    <>
+                      <Input
+                        size="small"
+                        style={{ width: 200 }}
+                        data-testid={`af-mcp-bind-fixed-${tool.name}-${param.name}`}
+                        aria-label={t("agent_form.mcp_bind_fixed_input", {
+                          param: param.name,
+                        })}
+                        placeholder={t("agent_form.mcp_bind_fixed_placeholder")}
+                        // 空值 / 首尾空格后端会拒(ArgBindingSpec),当场标红而不是等保存 422。
+                        status={fixedValueValid(choice.value) ? undefined : "error"}
+                        value={choice.value}
+                        onChange={(e) =>
+                          setChoice(row.name, tool.name, param.name, {
+                            kind: "fixed",
+                            value: e.target.value,
+                          })
+                        }
+                      />
+                      {!fixedValueValid(choice.value) && (
                         <Text
                           type="danger"
-                          aria-hidden="true"
-                          title={t("agent_form.mcp_bind_required")}
-                          style={{ marginLeft: 2 }}
+                          data-testid={`af-mcp-bind-fixed-hint-${tool.name}-${param.name}`}
+                          style={{ fontSize: 12 }}
                         >
-                          *
+                          {t("agent_form.mcp_bind_fixed_invalid")}
                         </Text>
                       )}
-                    </span>
-                    <Select
-                      id={id}
-                      size="small"
-                      style={{ minWidth: 220 }}
-                      value={bound[param.name] ?? AUTO}
-                      onChange={(value: string) =>
-                        setBinding(
-                          row.name,
-                          tool.name,
-                          param.name,
-                          value === AUTO ? null : value,
-                        )
-                      }
-                      options={[
-                        { value: AUTO, label: t("agent_form.mcp_bind_auto") },
-                        ...promptVariables.map((name) => ({
-                          value: name,
-                          label: name,
-                        })),
-                      ]}
-                    />
-                  </div>
-                );
-              })}
-            </div>
-          ))}
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   }

@@ -1028,12 +1028,17 @@ export interface TranslationKeys {
     mcp_bind_open: string;
     mcp_bind_count: string;
     mcp_bind_auto: string;
+    mcp_bind_fixed: string;
+    mcp_bind_fixed_input: string;
+    mcp_bind_fixed_placeholder: string;
+    mcp_bind_fixed_invalid: string;
     mcp_bind_hint: string;
     mcp_bind_required: string;
     mcp_bind_no_variables: string;
     mcp_bind_drop_title_one: string;
     mcp_bind_drop_title_other: string;
     mcp_bind_drop_item: string;
+    mcp_bind_drop_item_fixed: string;
     mcp_bind_drop_hint: string;
     mcp_bind_drop_ok: string;
     mcp_bind_drop_cancel: string;
@@ -4294,14 +4299,19 @@ const en: TranslationKeys = {
     mcp_bind_open: "Bound parameters for {{tool}}",
     mcp_bind_count: "{{count}} bound",
     mcp_bind_auto: "Auto (model fills it in)",
+    mcp_bind_fixed: "Fixed value",
+    mcp_bind_fixed_input: "Fixed value for {{param}}",
+    mcp_bind_fixed_placeholder: "Sent as-is on every call",
+    mcp_bind_fixed_invalid: "Enter a value with no leading or trailing spaces",
     mcp_bind_hint:
-      "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. Unbound parameters are still filled in by the model.",
+      "A bound parameter is filled in by the platform from the variable's value. The model never sees it, so it cannot mistype it. A fixed value is sent as-is on every call. Unbound parameters are still filled in by the model.",
     mcp_bind_required: "This parameter is required",
     mcp_bind_no_variables:
-      "Declare a variable under Prompt & Output → Dynamic prompt (Jinja) first, then come back and bind parameters to it.",
+      "No variables declared yet. You can still set a fixed value; to bind a parameter to a variable, declare one under Prompt & Output → Dynamic prompt (Jinja) first.",
     mcp_bind_drop_title_one: "This will also delete 1 bound parameter",
     mcp_bind_drop_title_other: "This will also delete {{count}} bound parameters",
     mcp_bind_drop_item: "{{param}} on {{tool}} ← variable {{variable}}",
+    mcp_bind_drop_item_fixed: "{{param}} on {{tool}} = fixed value {{value}}",
     mcp_bind_drop_hint:
       "Once deleted, the model fills these parameters in again. Cancel to keep them.",
     mcp_bind_drop_ok: "Delete and continue",

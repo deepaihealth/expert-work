@@ -759,6 +759,8 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # 模型也补不上 —— 那个 MCP 工具在子代身上就永远缺一个必填参数,
     # ``additionalProperties: false`` 的服务端更是直接硬拒。绑定属于**父**的 spec,
     # 子代干的也是父 agent 的活,取值口径与 agent_key / inputs_run_id 一致:用父的。
+    # B-127 的固定值不走这里:它住在子代**自己**的 registry 绑定表里(worker 的 spec
+    # 是父 spec 的拷贝、``tools`` 连绑定原样带过去),与 config 无关。
     if ctx.prompt_inputs:
         # 键写成字面量,与上面 ``inputs_run_id`` / ``agent_key`` 同一写法:本模块在
         # ``tools`` 早于 ``sse`` 被导入(tools → assembly → spawn_worker → 本模块),

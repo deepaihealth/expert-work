@@ -67,6 +67,7 @@ import {
   readFallback,
   setFallback,
   normalizeForSubmit,
+  bindingsUsingVariable,
   readPromptInjection,
   readOutputScreen,
   readOutputJudge,
@@ -565,6 +566,68 @@ test("setMcp with an empty binding list drops the key entirely", () => {
   expect(entry !== undefined && "arg_bindings" in entry).toBe(false);
 });
 
+// B-127 —— 固定值(``fixed``)。配置页任何与它无关的编辑都不许把它弄丢:丢了之后参数
+// 回到模型手里,而没人会记得去提示词里补一句 —— 那正是这个特性要消灭的故障。
+const FIXED_YAML = `apiVersion: expert-work/v1
+kind: Agent
+metadata:
+  name: bot
+spec:
+  model:
+    provider: openai
+    name: gpt-4o
+  system_prompt:
+    template: hi
+  tools:
+    - type: mcp
+      servers: [records]
+      allow_tools: []
+      arg_bindings:
+        - server: records
+          tool: fetch_record
+          fixed:
+            detail_level: brief
+`;
+
+test("a fixed binding survives load → unrelated edit → save (YAML round-trip)", () => {
+  const loaded = parse(FIXED_YAML) as AgentManifest;
+  const edited = normalizeForSubmit(setDescription(loaded, "changed"));
+  const reloaded = parse(dumpYaml(edited)) as AgentManifest;
+  expect(bindingsOf(reloaded)).toEqual([
+    { server: "records", tool: "fetch_record", fixed: { detail_level: "brief" } },
+  ]);
+});
+
+test("the MCP writers preserve a fixed binding", () => {
+  const loaded = parse(FIXED_YAML) as AgentManifest;
+  const expected = bindingsOf(loaded);
+  expect(bindingsOf(setMcpServers(loaded, ["records", "other"]))).toEqual(expected);
+  expect(bindingsOf(setMcpAllowTools(loaded, ["fetch_record"]))).toEqual(expected);
+  expect(bindingsOf(setMcp(loaded, ["records"], []))).toEqual(expected);
+  expect(readTools(loaded).mcpArgBindings).toEqual(expected);
+});
+
+test("bindingsUsingVariable ignores fixed values and bindings without args", () => {
+  // 固定值 ``project_code`` 碰巧与变量同名:它是常量,不是对变量的引用 —— 删变量不该被拦。
+  const m = setMcp(
+    { apiVersion: "v1", kind: "Agent", spec: {} },
+    ["records"],
+    [],
+    [
+      { server: "records", tool: "fetch_record", fixed: { mode: "project_code" } },
+      {
+        server: "records",
+        tool: "t2",
+        args: { code: "project_code" },
+        fixed: { detail_level: "brief" },
+      },
+    ],
+  );
+  expect(bindingsUsingVariable(m, "project_code")).toEqual([
+    { server: "records", tool: "t2", param: "code" },
+  ]);
+});
+
 test("setTool(mcp, off) still drops the entry", () => {
   const m = setTool(seedBindings(withBindings()), "mcp", false);
   expect(readTools(m).mcp).toBe(false);
@@ -964,6 +1027,38 @@ describe("form_model — dynamic prompt (jinja + variables)", () => {
     // key 删掉而不是留个空数组(与后端 _omit_empty_arg_bindings 同口径)。
     const entry = (off.spec?.tools ?? []).find((t) => t.type === "mcp");
     expect(entry !== undefined && "arg_bindings" in entry).toBe(false);
+  });
+
+  // B-127 —— 关掉 Jinja 只会让**变量**绑定成孤儿;固定值不引用变量,必须留下。
+  it("disabling jinja keeps a fixed-only binding", () => {
+    const fixedOnly = { server: "records", tool: "fetch_record", fixed: { detail_level: "brief" } };
+    const on = setMcp(
+      setPromptVariables(setPromptJinja(seed, true), [{ name: "project_code" }]),
+      ["records"],
+      [],
+      [fixedOnly],
+    );
+    expect(readTools(setPromptJinja(on, false)).mcpArgBindings).toEqual([fixedOnly]);
+  });
+
+  it("disabling jinja strips args but keeps fixed on a mixed binding", () => {
+    const on = setMcp(
+      setPromptVariables(setPromptJinja(seed, true), [{ name: "project_code" }]),
+      ["records"],
+      [],
+      [
+        {
+          server: "records",
+          tool: "fetch_record",
+          args: { code: "project_code" },
+          fixed: { detail_level: "brief" },
+        },
+        { server: "records", tool: "t2", args: { code: "project_code" } },
+      ],
+    );
+    expect(readTools(setPromptJinja(on, false)).mcpArgBindings).toEqual([
+      { server: "records", tool: "fetch_record", fixed: { detail_level: "brief" } },
+    ]);
   });
 
   it("disabling jinja on a manifest with no tools does not grow an empty tools list", () => {

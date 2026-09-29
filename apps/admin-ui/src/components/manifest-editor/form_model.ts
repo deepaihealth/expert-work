@@ -67,11 +67,17 @@ export interface RoutingFields {
 }
 /** B-61 — one MCP tool's parameter bindings: tool parameter → declared
  *  prompt variable. Mirrors the manifest's ``ArgBindingSpec`` exactly;
- *  ``(server, tool)`` is unique across the whole entry. */
+ *  ``(server, tool)`` is unique across the whole entry.
+ *
+ *  B-127 — ``fixed`` pins a parameter to a constant (tool parameter → value).
+ *  Both maps are optional: the backend accepts a binding with only one of them
+ *  (and omits an empty ``fixed`` when it serializes), so a hand-written or
+ *  backend-dumped binding may lack either key. Read them with ``?? {}``. */
 export interface ArgBindingFields {
   server: string;
   tool: string;
-  args: Record<string, string>;
+  args?: Record<string, string>;
+  fixed?: Record<string, string>;
 }
 export type ToolEntry = {
   type: string;
@@ -629,8 +635,9 @@ export interface BindingUse {
  */
 export function bindingsUsingVariable(m: unknown, name: string): BindingUse[] {
   if (name === "") return [];
+  // B-127 —— 只看 ``args``:``fixed`` 的值是常量,碰巧与变量同名也不是引用。
   return readTools(m).mcpArgBindings.flatMap((binding) =>
-    Object.entries(binding.args)
+    Object.entries(binding.args ?? {})
       .filter(([, variable]) => variable === name)
       .map(([param]) => ({ server: binding.server, tool: binding.tool, param })),
   );
@@ -640,8 +647,13 @@ export const readPromptVariables = (m: unknown): PromptVariableFields[] =>
   specOf(m).system_prompt?.variables ?? [];
 
 /**
- * Drop every MCP ``arg_bindings`` entry. Only used when the declared-variable
- * block itself goes away — see ``setPromptJinja``.
+ * Drop every variable binding (``args``) from the MCP ``arg_bindings``. Only
+ * used when the declared-variable block itself goes away — see
+ * ``setPromptJinja``.
+ *
+ * B-127 — ``fixed`` values reference no variable, so they are NOT orphaned by
+ * this and stay; a binding left with neither map is removed (the backend
+ * rejects a binding that binds nothing), and an empty list drops the key.
  *
  * Returns the manifest untouched when there is nothing bound, so a manifest
  * with no ``tools`` never grows an empty ``tools: []``.
@@ -655,8 +667,12 @@ function dropAllArgBindings(m: unknown): AgentManifest {
   return patchSpec(m, {
     tools: tools.map((t) => {
       if (t.type !== "mcp") return t;
-      const { arg_bindings: _dropped, ...rest } = t;
-      return rest;
+      const { arg_bindings: current, ...rest } = t;
+      const kept = (current ?? []).flatMap((b): ArgBindingFields[] => {
+        const { args: _args, ...withoutArgs } = b;
+        return Object.keys(b.fixed ?? {}).length > 0 ? [withoutArgs] : [];
+      });
+      return kept.length > 0 ? { ...rest, arg_bindings: kept } : rest;
     }),
   });
 }
@@ -665,7 +681,8 @@ function dropAllArgBindings(m: unknown): AgentManifest {
  * Turn Jinja mode on/off.
  *
  * ``off`` drops ``jinja`` AND the whole ``variables`` block — and therefore has
- * to drop ``arg_bindings`` with it (B-61). Every binding names a declared
+ * to drop the variable side (``args``) of ``arg_bindings`` with it (B-61);
+ * B-127 ``fixed`` values survive. Every binding names a declared
  * variable; with the declarations gone, every single one of them is an orphan,
  * and ``AgentSpecBody._check_arg_bindings`` rule (4) REJECTS the save outright:
  * "'x' is not a declared prompt variable". Keeping the bindings would not be

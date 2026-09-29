@@ -292,3 +292,36 @@ def test_worker_prompt_tells_it_to_offload_bulk_output_to_a_file() -> None:
     ).spec.system_prompt.template.lower()
     assert "write it to a file" in prompt
     assert "summary" in prompt
+
+
+@pytest.mark.parametrize("worker_policy", [True, False])
+def test_worker_inherits_fixed_tool_args(worker_policy: bool) -> None:
+    """B-127 —— worker 的 registry 由这份 spec 建出;固定值必须随 mcp 条目原样过来,
+    否则 worker 调同一个工具时平台不填、模型也看不见那个参数(已从 schema 剥掉)。"""
+    parent = _parent(
+        tools=[
+            {
+                "type": "mcp",
+                "servers": ["records"],
+                "arg_bindings": [
+                    {
+                        "server": "records",
+                        "tool": "fetch_record",
+                        "fixed": {"detail_level": "brief"},
+                    }
+                ],
+            }
+        ]
+    )
+    w = synthesize_worker_spec(
+        parent,
+        role=None,
+        max_iterations=8,
+        allowed_toolsets=[],
+        worker_policy=worker_policy,
+    )
+    (entry,) = w.spec.tools
+    assert entry.type == "mcp"
+    assert [(b.tool, b.fixed) for b in entry.arg_bindings] == [  # type: ignore[union-attr]
+        ("fetch_record", {"detail_level": "brief"})
+    ]
