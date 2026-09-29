@@ -48,11 +48,10 @@ C 的依据:Anthropic context editing、JetBrains《The Complexity Trap》(有�
 
 ### 2.4 "可重新查询名单"怎么来
 
-- **内置工具**:`ToolSpec.is_read_only is True` 的(`read_file` / `list_dir` / `search_files` / `read_document` / `read_page` / `skill_view` / `knowledge_search` …)。
+- **内置工具**:`ToolSpec.is_read_only is True` 的(`read_file` / `list_dir` / `search_files` / `read_document` / `read_page` / `skill_view` / `knowledge_search` / `web_search` …)。
 - **MCP 工具**:服务器 `list_tools` 标注 `readOnlyHint: true` 的(B-122 已读取这个标注;ai-health-plan 现有的 9 个 MCP 工具全部标了只读(09-27 B-122 验收时 11 个 `kept=11 dropped_write=0`,09-29 删了 2 个))。没标或标 `false` 的一律不算。
-- **排除**:
-  - `ask_image`(已在 `_NEVER_PRUNE_TOOLS`,看图结论不清,不变);
-  - `web_search`:外部来源,再查结果可能完全不同且有额外费用。
+- **排除**:只有 `ask_image`(已在 `_NEVER_PRUNE_TOOLS`,看图结论不清,不变)。
+- **`web_search` 在名单里**(用户 09-29 拍板):重查拿到的是最新结果,这正是它该有的行为;内置后端是自建 SearXNG,重查不产生费用;要回看之前某条结果对应的网页,历史里留着链接,可直接 `read_page`。初稿曾以"结果会变 + 有费用"排除它,费用一条核实为错。
 - **不改 `ToolSpec.is_read_only`**:它还决定失败自动重试(`error_classifier`)与并行调度(`scheduling`),把 MCP 工具标成只读会顺带改这两处行为。名单在构建 Agent 时单独算出来,传给 `ToolResultPruner`。
 
 ### 2.5 收起后的样子
