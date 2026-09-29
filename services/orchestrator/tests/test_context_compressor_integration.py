@@ -25,6 +25,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.runtime.checkpointer import make_checkpointer
+from expert_work.runtime.middleware import LoopDetectionMiddleware, MiddlewareChain
 from orchestrator import (
     GraphRunner,
     ToolContext,
@@ -423,11 +424,30 @@ async def test_compressor_summary_is_a_system_message_not_a_human_message() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_node_reuses_cached_summary_across_turns() -> None:
+@pytest.mark.parametrize(
+    "use_after_llm_chain",
+    [False, True],
+    ids=["update_plain", "update_mw"],
+)
+async def test_agent_node_reuses_cached_summary_across_turns(use_after_llm_chain: bool) -> None:
     """The summary a turn's compression produces is written back into the
     checkpoint (``state["context_summary"]``); the next turn — one short
     HumanMessage added on top of the same over-threshold history — reuses
-    it via ``through_id`` instead of calling the summariser LLM again."""
+    it via ``through_id`` instead of calling the summariser LLM again.
+
+    Final-review fix — ``context_summary`` is only ever written on the
+    ``update_mw`` return path (``builder.py``'s ``after_llm_chain is not
+    None`` branch); in PRODUCTION that branch is ALWAYS taken
+    (``LoopDetectionMiddleware`` is always registered at ``after_llm_call``)
+    but every graph test up to this point only ever built the graph with
+    ``after_llm_chain=None``, so the write on line ~1437 had zero test
+    coverage and a reviewer had to catch it by inspection. Parametrised over
+    both paths — ``update_mw`` uses the REAL ``LoopDetectionMiddleware``
+    (not a hand-rolled no-op), matching production exactly and the existing
+    ``test_agent_node_stamp.py`` precedent for covering this same branch
+    split. The middleware is a no-op here regardless (it only acts on 3
+    identical tool calls in a row; this conversation has none), so both
+    parametrisations must produce byte-identical assertions below."""
 
     @dataclass
     class _CountingSummariser:
@@ -453,10 +473,16 @@ async def test_agent_node_reuses_cached_summary_across_turns() -> None:
         tail_keep=2,
     )
     agent_llm = _RecordingLLM()
+    after_llm_chain = (
+        MiddlewareChain.from_middlewares("after_llm_call", [LoopDetectionMiddleware()])
+        if use_after_llm_chain
+        else None
+    )
     graph = build_react_graph(
         llm_caller=agent_llm,
         tool_registry=ToolRegistry(),
         context_compressor=compressor,
+        after_llm_chain=after_llm_chain,
     )
     # 20 messages x 400 chars = 2000 tokens — over the 1000 threshold.
     history: list[BaseMessage] = [HumanMessage(content=_pad(f"m-{i}-", 400)) for i in range(20)]

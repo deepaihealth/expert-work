@@ -29,7 +29,6 @@ from orchestrator.context.compressor import (
     _SUMMARY_PER_MESSAGE_CHAR_CAP,
     _bound_text,
     _format_middle_for_summary,
-    _summary_text_of,
 )
 from orchestrator.tools.registry import ToolSpec
 
@@ -1085,14 +1084,28 @@ async def test_head_keep_zero_reuse_survives_two_growth_rounds() -> None:
     assert "u10" in text3, "round 3 is missing its own new events (round 2's rolled-off tail)"
 
 
-def test_summary_text_of_returns_the_last_match_not_the_first() -> None:
-    """I1 (defense in depth) — with the ``_split`` fix above a single
-    ``compress()`` result should only ever carry ONE summary-tagged
-    message, but :func:`_summary_text_of` must still report the freshest
-    one if that invariant is ever violated: a stale duplicate sitting
-    earlier in the list (e.g. mistakenly classified as a leading system,
-    the exact I1 failure mode) must never win over the summary the pass
-    just produced."""
-    stale = SystemMessage(content="<context-summary>STALE</context-summary>")
-    fresh = SystemMessage(content="<context-summary>FRESH</context-summary>")
-    assert _summary_text_of([stale, HumanMessage(content="hi"), fresh]) == str(fresh.content)
+async def test_on_summary_text_is_the_pass_summary_not_a_tail_look_alike() -> None:
+    """B-126 (fix round 2) — a kept-verbatim TAIL message that happens to
+    also start with the ``<context-summary>`` tag (a system-prompt copy or
+    template literally beginning with that string — the reviewer's repro)
+    must never be mistaken for the summary this pass just produced.
+    Before this fix, ``on_summary``'s text came from a reverse scan over
+    the WHOLE post-pass message list — ``wrapped`` is followed by
+    ``*split.tail`` in that list, so a look-alike tail message sitting
+    after it would win the scan first. Now ``_compress_once`` hands
+    ``wrapped`` straight back to the caller; there is no scan to fool."""
+    llm = _CountingLLM()
+    got: list[CachedSummary] = []
+    decoy_tail = SystemMessage(
+        content="<context-summary>DECOY not the real summary</context-summary>",
+        id="decoy",
+    )
+    c = ContextCompressor(
+        llm_caller=llm, context_window=1000, threshold_pct=0.5, head_keep=1, tail_keep=1
+    )
+    msgs = [*_conv(10), decoy_tail]
+    await c.compress(msgs, on_summary=got.append)
+    assert llm.calls == 1
+    assert got, "no summary reported"
+    assert "SUMMARY" in got[-1].text
+    assert "DECOY" not in got[-1].text

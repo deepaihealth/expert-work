@@ -307,13 +307,12 @@ class _SplitMessages:
 def _is_summary_message(m: BaseMessage) -> bool:
     """B-126 (fix round 1, M3) — one shared predicate for "is this a
     compressor-authored ``<context-summary>`` block", used by the
-    leading-system scan below, :func:`_last_middle_id`, and
-    :func:`_summary_text_of` (previously two subtly different checks —
-    ``in`` vs ``startswith``). ``startswith`` is the correct one: the tag
-    is always the first characters of the wrapped content (see
-    ``_compress_once``'s ``wrapped = SystemMessage(...)``), so a message
-    that merely mentions the tag string somewhere inside customer text can
-    never false-positive.
+    leading-system scan below and :func:`_last_middle_id` (previously two
+    subtly different checks — ``in`` vs ``startswith``). ``startswith`` is
+    the correct one: the tag is always the first characters of the wrapped
+    content (see ``_compress_once``'s ``wrapped = SystemMessage(...)``), so
+    a message that merely mentions the tag string somewhere inside customer
+    text can never false-positive.
     """
     return isinstance(m, SystemMessage) and str(m.content).startswith(_SUMMARY_TAG_OPEN)
 
@@ -335,10 +334,13 @@ def _split(messages: Sequence[BaseMessage], *, head_keep: int, tail_keep: int) -
     ``[*leading_systems, *head(empty), wrapped, *tail]``). Without this
     exemption the scan silently folds the summary into the byte-stable
     prefix, where :func:`_extract_prior_summary` can never see it again:
-    CM-7 update mode never fires, a fresh disconnected summary is produced
-    instead, and :func:`_summary_text_of` keeps reporting the stale text
-    forever after (through_id advances, the reported text doesn't — the
-    reviewer's repro).
+    CM-7 update mode never fires, and a fresh disconnected summary is
+    produced instead of an updated one (through_id advances, but the merge
+    never happens — the reviewer's repro). Fix round 2 removed the
+    complementary ``_summary_text_of`` re-scan this comment used to
+    reference: ``_compress_once`` now hands its ``wrapped`` message straight
+    back to the caller instead of making anyone search for it (see
+    :meth:`ContextCompressor.compress`).
     """
     leading_systems: list[BaseMessage] = []
     cursor = 0
@@ -404,23 +406,6 @@ def _last_middle_id(
         if mid and not _is_summary_message(m):
             return str(mid)
     return None
-
-
-def _summary_text_of(messages: Sequence[BaseMessage]) -> str:
-    """B-126 —— 取回一次 ``_compress_once`` 产出的整段 ``<context-summary>`` 消息内容。
-
-    B-126 (fix round 1, I1) — iterates in REVERSE and returns the LAST
-    match, mirroring :func:`_extract_prior_summary` / the existing
-    ``_summary_chars`` helper's "last one wins" convention (not the
-    original forward-scan-first-match, which could return a stale
-    duplicate sitting earlier in the list instead of the summary the pass
-    just produced — see the ``_split`` fix above for how such a duplicate
-    could arise).
-    """
-    for m in reversed(messages):
-        if _is_summary_message(m):
-            return str(m.content)
-    return ""
 
 
 def _extract_prior_summary(
@@ -769,10 +754,12 @@ class ContextCompressor:
                 pending_through = _last_middle_id(
                     current, head_keep=self.head_keep, tail_keep=self.tail_keep
                 )
-                current = await self._compress_once(current, on_pre_compaction=on_pre_compaction)
+                current, wrapped_summary = await self._compress_once(
+                    current, on_pre_compaction=on_pre_compaction
+                )
                 if on_summary is not None and pending_through is not None:
                     on_summary(
-                        CachedSummary(through_id=pending_through, text=_summary_text_of(current))
+                        CachedSummary(through_id=pending_through, text=str(wrapped_summary.content))
                     )
             except ContextOverflowError as exc:
                 if reserve and self._estimate(current) < self.threshold_tokens:
@@ -875,8 +862,19 @@ class ContextCompressor:
         messages: list[BaseMessage],
         *,
         on_pre_compaction: PreCompactionHook | None = None,
-    ) -> list[BaseMessage]:
-        """One summarise-the-middle pass."""
+    ) -> tuple[list[BaseMessage], SystemMessage]:
+        """One summarise-the-middle pass.
+
+        Returns ``(new_messages, wrapped)`` — ``wrapped`` is the EXACT
+        ``<context-summary>`` message this pass just built. B-126 (fix
+        round 2) — the caller uses ``wrapped`` directly for ``on_summary``
+        instead of re-scanning ``new_messages`` for it: ``wrapped`` is
+        followed by ``*split.tail`` in the returned list, so a reverse
+        scan over the whole list could find a DIFFERENT message that also
+        happens to start with the tag (e.g. a system-prompt copy or
+        template kept verbatim in the tail) before it ever reaches
+        ``wrapped`` — the reviewer's repro.
+        """
         split = _split(messages, head_keep=self.head_keep, tail_keep=self.tail_keep)
         if not split.middle:
             # Nothing summarisable — head+tail already span the
@@ -931,7 +929,7 @@ class ContextCompressor:
                 f"{_SUMMARY_TAG_OPEN}\n{_SUMMARY_PREAMBLE}\n\n{summary_text}\n{_SUMMARY_TAG_CLOSE}"
             )
         )
-        return [*split.leading_systems, *split.head, wrapped, *split.tail]
+        return [*split.leading_systems, *split.head, wrapped, *split.tail], wrapped
 
     async def _summarise(self, transcript: str) -> str:
         """Invoke the summariser LLM and return the summary body."""
