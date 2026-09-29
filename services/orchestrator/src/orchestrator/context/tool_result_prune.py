@@ -115,6 +115,49 @@ def _artifact_path(message: ToolMessage) -> str | None:
     return None
 
 
+#: Recovers a workspace-relative path out of a footer-shaped block's own
+#: wording (``render_overflow_footer``'s fixed template). Shared by
+#: ``_collapsed_content`` and ``_lossless_reference`` for the fallback used
+#: only when no persisted ``artifact`` path is recorded — that block may be
+#: entirely attacker-authored in that case (no real footer was ever appended
+#: by the builder), so this is the ONE structured field either function ever
+#: extracts from it. Never the raw text between the tags, which could
+#: otherwise smuggle arbitrary content past the spotlight fence.
+_FOOTER_SAVED_TO_RE = re.compile(r"saved to (\S+) in your workspace")
+
+#: Recovers the true pre-truncation size out of a footer-shaped block's own
+#: wording — the other field a freshly rendered template may fill in (see
+#: ``_footer_claimed_path``); also used by ``_cross_turn_stub`` so its header
+#: states the original size, not the (possibly much shorter) preview
+#: currently sitting in ``content``.
+_FOOTER_TOTAL_CHARS_RE = re.compile(r"full output \((\d+) chars\)")
+
+
+def _footer_claimed_path(content: str) -> str | None:
+    """Path claimed by a footer-shaped block, located via the LAST occurrence
+    of the tag — never the first (see the security note on
+    ``_collapsed_content`` / ``_lossless_reference``: the real footer, when
+    one was genuinely appended, is structurally always the last occurrence).
+    """
+    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
+    if footer_at == -1:
+        return None
+    match = _FOOTER_SAVED_TO_RE.search(content[footer_at:])
+    return match.group(1) if match else None
+
+
+def _footer_total_chars(content: str) -> int | None:
+    """True pre-truncation size stated by a footer-shaped block, if present.
+
+    Located via the LAST occurrence of the tag — see ``_footer_claimed_path``.
+    """
+    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
+    if footer_at == -1:
+        return None
+    match = _FOOTER_TOTAL_CHARS_RE.search(content[footer_at:])
+    return int(match.group(1)) if match else None
+
+
 def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
     """1-line replacement for a ``ToolMessage`` — lossless if recoverable.
 
@@ -134,17 +177,21 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
        preferring it means the untrusted ``content`` never has to be scanned
        for the footer tag at all; see the note below).
     2. **In-context footer** (CM-5 / #859 externalized) — only when no path
-       was recorded: keep the trusted footer alone; the full output is on
-       disk and re-readable via ``read_file``. Located via the LAST
-       occurrence of the tag, never the first — a tool result is untrusted
-       (indirect-injection surface), and the real footer is always appended
-       AFTER the body (``builder.py``: ``tool_content + footer``); a body
-       that plants the literal ``<tool-result-overflow>`` tag earlier would,
-       under a first-occurrence search, smuggle its own text (plus whatever
-       genuinely trails it) past the spotlight fence as if it were the
-       trusted footer.
-    3. **Lossy stub** — only when no on-disk copy exists (small result below the
-       persist floor): a short note with the tool name + char count + reason.
+       was recorded: a footer-shaped block located via the LAST occurrence
+       of the tag, never the first (a tool result is untrusted — indirect-
+       injection surface — and the real footer, when one was genuinely
+       appended, is always AFTER the body: ``builder.py``'s ``tool_content +
+       footer``). The reply is never a raw slice of that block, even so:
+       when no persisted path is recorded the block could be entirely
+       attacker-authored, so only its claimed path/size fields are ever
+       regex-extracted (:func:`_footer_claimed_path` / :func:`_footer_total_chars`,
+       shared with :func:`_lossless_reference`) into a FRESHLY rendered
+       footer — never the free-form text between the tags, which could
+       otherwise smuggle arbitrary content past the spotlight fence. No
+       parseable path at all falls through to rung 3.
+    3. **Lossy stub** — no on-disk copy exists (small result below the
+       persist floor, or a footer-shaped block whose path didn't parse): a
+       short note with the tool name + char count + reason.
     """
     content = message.content
     if not isinstance(content, str) or _is_already_pruned(content):
@@ -157,9 +204,10 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
     path = _artifact_path(message)
     if path is not None:
         return render_overflow_footer(rel=path, total_chars=len(content)).lstrip("\n")
-    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
-    if footer_at != -1:
-        return content[footer_at:].lstrip("\n")
+    claimed_path = _footer_claimed_path(content)
+    if claimed_path is not None:
+        claimed_size = _footer_total_chars(content) or len(content)
+        return render_overflow_footer(rel=claimed_path, total_chars=claimed_size).lstrip("\n")
     name = message.name or "tool"
     return (
         f"{_PRUNE_TAG_OPEN}\n"
@@ -255,32 +303,6 @@ def _args_hint(args: Mapping[str, Any]) -> str:
     return text if len(text) <= _ARGS_HINT_LIMIT else text[: _ARGS_HINT_LIMIT - 1] + "…"
 
 
-#: Recovers a workspace-relative path out of a REAL overflow footer's own
-#: wording (``render_overflow_footer``'s fixed template) — used only as a
-#: fallback when no ``artifact`` path was recorded (see ``_lossless_reference``).
-_FOOTER_SAVED_TO_RE = re.compile(r"saved to (\S+) in your workspace")
-
-#: Recovers the true pre-truncation size out of a REAL overflow footer's own
-#: wording — used by ``_cross_turn_stub`` so the stub header states the
-#: original size, not the (possibly much shorter) preview currently sitting
-#: in ``content``.
-_FOOTER_TOTAL_CHARS_RE = re.compile(r"full output \((\d+) chars\)")
-
-
-def _footer_total_chars(content: str) -> int | None:
-    """True pre-truncation size stated by a real overflow footer, if present.
-
-    Located via the LAST occurrence of the tag — the real footer is always
-    appended after the (possibly untrusted) body, so the first occurrence
-    could be a planted fake instead (see ``_lossless_reference``).
-    """
-    footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
-    if footer_at == -1:
-        return None
-    match = _FOOTER_TOTAL_CHARS_RE.search(content[footer_at:])
-    return int(match.group(1)) if match else None
-
-
 def _lossless_reference(message: ToolMessage) -> str | None:
     """无损找回途径 —— 技能引用 / 持久化路径 / 外置 footer;都没有则 ``None``。
 
@@ -288,11 +310,11 @@ def _lossless_reference(message: ToolMessage) -> str | None:
     围栏之外),且追加 footer 的同时必然把持久化路径记进 ``artifact``(见
     ``builder.py`` 的 ``_externalize_tool_overflow``:写盘成功才渲染 footer,
     两者同一个 ``rel``)。因此这里优先走 ``_artifact_path`` 凭路径重新渲出一条
-    精简找回提示,完全不碰 ``content`` —— 天然避开「攻击者在 body 里塞一段假
-    footer 标签,``str.find`` 命中假标签的第一次出现,切片把 body 剩余部分连同
-    后面真正的 footer 一起当作『可信引用』带出去」这种越狱。只有没记录路径时
-    才退回扫 ``content``,且必须找**最后一次出现**(``str.rfind``,不是
-    ``str.find``)—— body 排在 footer 之前,真 footer 结构上必然是那最后一份。
+    精简找回提示,完全不碰 ``content``。只有没记录路径时才退回
+    :func:`_footer_claimed_path`(与 ``_collapsed_content`` 共用同一套
+    抽取)—— 那条路径也可能整段是攻击者伪造的,所以只取这一个结构化字段,
+    永远不返回标签之间的原始文本,避免把攻击者的正文内容当作『可信引用』带
+    出围栏。
     """
     reference = skill_view_reference(message)
     if reference is not None:
@@ -300,10 +322,7 @@ def _lossless_reference(message: ToolMessage) -> str | None:
     content = message.content
     path = _artifact_path(message)
     if path is None and isinstance(content, str):
-        footer_at = content.rfind(OVERFLOW_FOOTER_TAG_OPEN)
-        if footer_at != -1:
-            match = _FOOTER_SAVED_TO_RE.search(content[footer_at:])
-            path = match.group(1) if match else None
+        path = _footer_claimed_path(content)
     if path is None:
         return None
     return f"Saved to {path} in your workspace. Use read_file / exec_python / bash to inspect it."
