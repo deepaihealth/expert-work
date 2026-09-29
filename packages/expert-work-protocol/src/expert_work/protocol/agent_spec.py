@@ -862,7 +862,19 @@ def _omit_b126_defaults(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-class ContextCompressionPolicy(BaseModel):
+class _B126OmitDefaultsMixin(BaseModel):
+    """B-126 —— ``_omit_default_b126`` 序列化器,供下面三个 Policy 共用(避免同一
+    ``@model_serializer(mode="wrap")`` 方法在三个类里逐字重复)。"""
+
+    @model_serializer(mode="wrap")
+    def _omit_default_b126(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """默认值不落库(B-126,回滚纪律)。"""
+        return _omit_b126_defaults(handler(self))
+
+
+class ContextCompressionPolicy(_B126OmitDefaultsMixin):
     """Stream L.L2 — per-agent context compression knobs.
 
     Drives :class:`~orchestrator.context.compressor.ContextCompressor`:
@@ -914,18 +926,11 @@ class ContextCompressionPolicy(BaseModel):
     #: until they are genuinely near the limit.
     pressure_feedback: bool = True
     pressure_warn_pct: float = Field(default=0.75, gt=0.0, le=1.0)
-    #: B-126 —— 门槛 = min(context_window × threshold_pct, 本值);大窗口模型不再等到 70%。
+    #: B-126 —— 门槛 = min(context_window x threshold_pct, 本值);大窗口模型不再等到 70%。
     absolute_cap_tokens: int = Field(default=200_000, gt=0)
 
-    @model_serializer(mode="wrap")
-    def _omit_default_b126(  # type: ignore[no-untyped-def]
-        self, handler: SerializerFunctionWrapHandler
-    ):
-        """默认值不落库(B-126,回滚纪律)。"""
-        return _omit_b126_defaults(handler(self))
 
-
-class WorkingMemoryPolicy(BaseModel):
+class WorkingMemoryPolicy(_B126OmitDefaultsMixin):
     """Stream CM-2 — working-memory sliding-window knobs.
 
     Drives :class:`~orchestrator.context.working_window.WorkingWindow`, the
@@ -950,15 +955,8 @@ class WorkingMemoryPolicy(BaseModel):
     threshold_pct: float = Field(default=0.7, gt=0.0, le=1.0)
     max_recent_turns: int = Field(default=20, gt=0)
     keep_first_turn: bool = True
-    #: B-126 —— 门槛 = min(context_window × threshold_pct, 本值);大窗口模型不再等到 70%。
+    #: B-126 —— 门槛 = min(context_window x threshold_pct, 本值);大窗口模型不再等到 70%。
     absolute_cap_tokens: int = Field(default=200_000, gt=0)
-
-    @model_serializer(mode="wrap")
-    def _omit_default_b126(  # type: ignore[no-untyped-def]
-        self, handler: SerializerFunctionWrapHandler
-    ):
-        """默认值不落库(B-126,回滚纪律)。"""
-        return _omit_b126_defaults(handler(self))
 
 
 class ToolOutputBudgetPolicy(BaseModel):
@@ -982,7 +980,7 @@ class ToolOutputBudgetPolicy(BaseModel):
     enabled: bool = True
 
 
-class ToolResultPrunePolicy(BaseModel):
+class ToolResultPrunePolicy(_B126OmitDefaultsMixin):
     """Stream CM-12 — mechanical tool-result prune gate knobs.
 
     Drives :class:`~orchestrator.context.tool_result_prune.ToolResultPruner`,
@@ -1014,15 +1012,8 @@ class ToolResultPrunePolicy(BaseModel):
     min_context_tokens: int = Field(default=30_000, ge=0)
     #: 这一次能省的合计低于此值不清(不值得打断缓存)。
     min_reclaim_tokens: int = Field(default=5_000, ge=0)
-    #: 同一轮内逐次清理的兜底门槛 = min(context_window × threshold_pct, 本值)。
+    #: 同一轮内逐次清理的兜底门槛 = min(context_window x threshold_pct, 本值)。
     absolute_cap_tokens: int = Field(default=200_000, gt=0)
-
-    @model_serializer(mode="wrap")
-    def _omit_default_b126(  # type: ignore[no-untyped-def]
-        self, handler: SerializerFunctionWrapHandler
-    ):
-        """默认值不落库(B-126,回滚纪律)。"""
-        return _omit_b126_defaults(handler(self))
 
 
 class MemoryConsolidationPolicy(BaseModel):
