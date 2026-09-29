@@ -1029,6 +1029,38 @@ describe("form_model — dynamic prompt (jinja + variables)", () => {
     expect(entry !== undefined && "arg_bindings" in entry).toBe(false);
   });
 
+  // B-127 —— 关掉 Jinja 只会让**变量**绑定成孤儿;固定值不引用变量,必须留下。
+  it("disabling jinja keeps a fixed-only binding", () => {
+    const fixedOnly = { server: "records", tool: "fetch_record", fixed: { detail_level: "brief" } };
+    const on = setMcp(
+      setPromptVariables(setPromptJinja(seed, true), [{ name: "project_code" }]),
+      ["records"],
+      [],
+      [fixedOnly],
+    );
+    expect(readTools(setPromptJinja(on, false)).mcpArgBindings).toEqual([fixedOnly]);
+  });
+
+  it("disabling jinja strips args but keeps fixed on a mixed binding", () => {
+    const on = setMcp(
+      setPromptVariables(setPromptJinja(seed, true), [{ name: "project_code" }]),
+      ["records"],
+      [],
+      [
+        {
+          server: "records",
+          tool: "fetch_record",
+          args: { code: "project_code" },
+          fixed: { detail_level: "brief" },
+        },
+        { server: "records", tool: "t2", args: { code: "project_code" } },
+      ],
+    );
+    expect(readTools(setPromptJinja(on, false)).mcpArgBindings).toEqual([
+      { server: "records", tool: "fetch_record", fixed: { detail_level: "brief" } },
+    ]);
+  });
+
   it("disabling jinja on a manifest with no tools does not grow an empty tools list", () => {
     const on = setPromptVariables(setPromptJinja(seed, true), [{ name: "a" }]);
     const off = setPromptJinja(on, false);

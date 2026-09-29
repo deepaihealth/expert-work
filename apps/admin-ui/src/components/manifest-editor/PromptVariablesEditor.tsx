@@ -113,6 +113,9 @@ export function PromptVariablesEditor({
    *
    * 清理本身在 ``setPromptJinja`` 里做,不在这个回调里:走到这一步的不只这一个
    * 开关,而不变式不该由某个调用点的自觉来守。
+   *
+   * B-127 —— 这里列的正好是会被删的那些:``setPromptJinja`` 只删变量那一侧
+   * (``args``),固定值(``fixed``)不引用变量、原样留下,所以不进列表。
    */
   const toggleJinja = (on: boolean): void => {
     const uses = variables.flatMap(boundUses);
