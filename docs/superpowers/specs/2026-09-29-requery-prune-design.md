@@ -32,7 +32,7 @@ B-126 已经在新一轮开头把旧结果收成一行引用,但**只收有副�
 
 | 方案 | 做法 | 为什么没选 |
 |---|---|---|
-| A. 降存副本门槛到约 1000 字 | 小结果也存副本,再按 B-126 收 | 行业没有"给小结果存副本再清"的先例;副本多了会放大 §2.7 的串客户搜索问题 |
+| A. 降存副本门槛到约 1000 字 | 小结果也存副本,再按 B-126 收 | 行业没有"给小结果存副本再清"的先例;只读查询本来就能再调一次,不需要副本 |
 | B. 照搬 hermes / openclaw 原样配置 | 按窗口百分比触发 | glm-5.3 窗口 100 万,hermes 50 万 / openclaw 30 万才触发,我们最大 9 万 → 永不触发 |
 | **C. 本设计** | 只读工具清成"再查一次",触发时机沿用 B-126 每轮开头 | —— |
 
@@ -79,13 +79,14 @@ Read-only lookup: call the same tool again with the same arguments to get the da
 | 失败的结果 | 不动 | B-126 |
 | **单条最小长度(新增)** | **500 字** | 提示本身约 200~300 字,更短的收了几乎不省;hermes 用 200,我们取稍保守 |
 
-### 2.7 顺带修:`search_files` 跳过 `.tool_results`
+### 2.7 勘误:`search_files` 本来就搜不到 `.tool_results`
 
-现状问题(与本设计无关,**现在就存在**):员工工作区按"员工 + Agent"分、不按客户分,`.tool_results/` 下是这位员工所有对话的超长结果副本;`search_files` 按内容搜索时会搜进去,给客户 B 做方案时可能搜出客户 A 的数据。
-
-修法:`search_files` 遍历时跳过 `.tool_results` 子树(`name_glob` 与 `content` 两种都跳)。模型拿副本走的是引用里的确切路径 + `read_file`,不经过搜索,不受影响。**先于本设计单独合入**。
-
-`list_dir` 只列一层,根目录会看到 `.tool_results` 这个目录名,不涉及内容,不改。
+初稿这里写"`search_files` 会搜进 `.tool_results/`,可能搜出别的客户的副本",要单独修。**错了**:
+`NasWorkspaceStore` 的遍历对每个文件先过 `is_reserved_workspace_path`(B-50 起会剥掉 `agents/<key>/`
+前缀再判),`.tool_results` / `uploads` / `skills` / `inputs` 一律跳过。09-29 用生产实现
+`_walk_and_match` 实测:`agents/ahp/.tool_results/…` 与 `agents/ahp/uploads/…` 里带标记串的文件,
+按内容、按文件名都搜不到,只返回正常文件。错因=只看了遍历循环里没写 `.tool_results`,没看它调的过滤函数。
+本设计不再包含这一项。
 
 ### 2.8 开关
 
@@ -125,10 +126,8 @@ Read-only lookup: call the same tool again with the same arguments to get the da
    - 质量:两组交付件都过技能校验;章节、数字出处比对无退化;追问轮的数字与原始数据一致;
    - 行为:统计重查次数;凭印象写错 = 0;
    - 7 轮全部 success。
-4. `search_files` 修复:单测覆盖两种搜索都不返回 `.tool_results/` 下的文件;测试环境造一个含标记字符串的副本,真跑确认搜不到。
 
 ## 6. 交付拆分
 
-- **PR 1**:`search_files` 跳过 `.tool_results`(小,独立,可先上)。
-- **PR 2**:可重新查询名单(构建时算出,MCP 标注透传)+ 清理器新增再查分支 + 配置开关 + 观测。
+- **一个 PR**:可重新查询名单(构建时算出,MCP 标注透传)+ 清理器新增再查分支 + 配置开关 + 观测。
 - 验收通过后写 ROADMAP 销案与后续排期。
