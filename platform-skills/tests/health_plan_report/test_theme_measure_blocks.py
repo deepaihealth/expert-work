@@ -200,3 +200,138 @@ def test_icons_are_in_grid_and_every_section_has_one(sample):
             assert len(pl) >= 2, name
             assert all(0 <= x <= 24 and 0 <= y <= 24 for x, y in pl), name
     assert all(icon_for_section(s) in ICONS for s in sample["sections"])
+
+
+def test_phases_table_keeps_every_text_when_two_focus_items_share_an_area():
+    blk = {
+        "kind": "phases",
+        "items": [
+            {
+                "label": "第1阶段",
+                "focus": [
+                    {"area": "饮食", "text": "控糖"},
+                    {"area": "饮食", "text": "晚餐控糖饮食"},
+                    {"area": "运动", "text": "快走"},
+                ],
+            },
+            {"label": "第2阶段", "focus": [{"area": "运动", "text": "慢跑"}]},
+        ],
+    }
+    (tbl,) = block_to_prims(blk, "table", "p")
+    assert tbl.columns == ("阶段", "饮食", "运动")
+    assert tbl.rows[0][1].split("\n") == ["控糖", "晚餐控糖饮食"]  # both, in caller order
+    assert tbl.rows[1][1] == "—"
+
+
+def test_kind_table_keeps_a_column_the_caller_filled_with_dashes():
+    blk = {
+        "kind": "habits",
+        "items": [{"name": "饮水", "current": "—"}, {"name": "步行", "current": "—"}],
+    }
+    (tbl,) = block_to_prims(blk, "table", "p")
+    assert tbl.columns == ("习惯", "现状")  # caller's "—" is text; our empty columns still drop
+    assert [r[1] for r in tbl.rows] == ["—", "—"]
+
+
+def _gate(t):
+    from hpr.qa import contrast_report
+
+    return contrast_report(t)
+
+
+def test_contrast_gate_fails_on_the_pre_fix_text_colours():
+    import dataclasses
+
+    from hpr.style import INK, mix
+    from hpr.theme import OUT
+
+    t = build_theme(resolve([]).style, "pptx")
+    assert _gate(t)["ok"] is True
+    fg = on_color(t.primary)
+    old_cover_label = mix(t.primary, fg, 0.25)  # band cover fact labels / manager title
+    assert _gate(dataclasses.replace(t, on_primary_soft=old_cover_label))["ok"] is False
+    assert _gate(dataclasses.replace(t, muted=mix(INK, t.background, 0.40)))["ok"] is False
+    assert _gate(dataclasses.replace(t, out_text=OUT))["ok"] is False  # 高于参考范围 tag
+
+
+@pytest.mark.parametrize("primary", ["#0B4F5C", "浅蓝", "#111111", "墨绿", "蓝", "橙"])
+@pytest.mark.parametrize("bg", ["白", "浅紫", "米色", "浅灰", "tint"])
+@pytest.mark.parametrize("fmt", ["pptx", "pdf"])
+def test_every_text_role_is_readable_on_its_surfaces(primary, bg, fmt):
+    style = resolve([Layer("x", {"color.primary": primary, "color.background": bg})]).style
+    t = build_theme(style, fmt)
+    report = _gate(t)
+    assert report["ok"] is True, report
+    assert {
+        "muted_on_background",
+        "cover_label_on_primary",
+        "out_text_on_background",
+        "out_text_on_pale_out",
+    } <= set(report)
+
+
+def test_issues_list_shows_the_callers_level():
+    blk = {
+        "kind": "issues",
+        "items": [
+            {"title": "血糖偏高", "evidence": "空腹 6.4", "level": "focus"},
+            {"title": "肌肉量偏低", "level": "watch"},
+            {"title": "睡眠", "level": "info"},
+        ],
+    }
+    (bl,) = block_to_prims(blk, "list", "p")
+    assert bl.items[0].startswith("【重点关注】") and "血糖偏高" in bl.items[0]
+    assert bl.items[1].startswith("【留意】")
+    assert bl.items[2] == "睡眠"  # info has no tag in the cards variant either
+
+
+def test_cover_meta_and_clock_rules_have_a_single_source():
+    from pathlib import Path
+
+    from hpr import common
+
+    hpr_dir = Path(common.__file__).parent
+    for name in ("_meta_items", "_minutes"):
+        owners = [p.name for p in hpr_dir.glob("*.py") if f"def {name}(" in p.read_text("utf-8")]
+        assert owners == [], (name, owners)
+    assert common.client_band_items({"client": {"name": "甲"}, "generated_at": "2026-09-28"}) == []
+    assert common.cover_meta_line({"generated_at": "2026-09-28"}) == "2026-09-28"
+    assert common.clock_minutes("06:30") == 24 * 60 + 6 * 60 + 30
+    assert common.clock_minutes("23:00") == 23 * 60
+
+
+def test_primary_text_on_the_pale_tint_is_gated_and_readable():
+    import dataclasses
+
+    t = build_theme(resolve([Layer("x", {"color.primary": "浅蓝"})]).style, "pptx")
+    assert t.primary == "#1E78D1"  # fills keep the ruled primary
+    assert round(contrast(t.primary, t.pale), 2) == 4.18
+    report = _gate(t)
+    assert report["ok"] is True and report["primary_text_on_pale"] >= 4.5
+    assert _gate(dataclasses.replace(t, primary_text=t.primary))["ok"] is False
+    import colorsys
+
+    def hls(h):
+        return colorsys.rgb_to_hls(*(int(h[i : i + 2], 16) / 255 for i in (1, 3, 5)))
+
+    (h0, _, s0), (h1, _, s1) = hls(t.primary), hls(t.primary_text)
+    assert abs(h1 - h0) * 360 <= 1 and abs(s1 - s0) <= 0.02  # lightness only
+
+
+def test_nice_ticks_are_round_steps_covering_the_data():
+    from hpr.common import bar_domain, nice_ticks
+
+    lo, hi, step = nice_ticks(*bar_domain((-0.8, -1.4, 0.3)))
+    assert step in (0.1, 0.2, 0.25, 0.5, 1.0)
+    assert lo <= -1.4 and hi >= 0.3
+    n = round((hi - lo) / step)
+    ticks = [round(lo + k * step, 10) for k in range(n + 1)]
+    assert all(abs(x / step - round(x / step)) < 1e-9 for x in ticks)
+    assert 0.0 in ticks and 3 <= n <= 8
+    assert nice_ticks(0.0007, 0.0033) == pytest.approx((0.0, 0.004, 0.001))
+
+
+def test_normalize_maps_line_and_paragraph_separators_to_lf():
+    from hpr.content import normalize_text
+
+    assert normalize_text("a\u2028b\u2029c") == "a\nb\nc"

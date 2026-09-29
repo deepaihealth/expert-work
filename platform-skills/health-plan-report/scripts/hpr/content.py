@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -332,7 +333,7 @@ def _join(path: str, key: str) -> str:
 
 
 def _is_num(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def _nonempty_str(v: Any) -> bool:
@@ -443,11 +444,75 @@ def _check_ids(content: dict, errs: list[ContentError]) -> None:
                 bseen.add(bid)
 
 
+_KCAL = ("kcal", re.compile(r"(?<![a-z])k?cal(?![a-z])|卡", re.IGNORECASE))  # 千卡/大卡/卡路里/卡
+_GRAM = ("g", re.compile(r"(?<![a-z])[mkµμ]?g(?![a-z])|克|斤", re.IGNORECASE))  # mg/kg/毫克/公斤…
+_PCT = ("%", re.compile(r"[%％]"))  # noqa: RUF001
+
+
+def _implicit_units(kind: str, blk: dict) -> Iterator[tuple[str, Any, tuple[str, re.Pattern]]]:
+    """(relative path, value, unit) for every field the layout prints with its own unit."""
+    if kind == "nutrition":
+        if "energy_kcal" in blk:
+            yield "energy_kcal", blk["energy_kcal"], _KCAL
+        for i, m in enumerate(blk.get("macros") or []):
+            for key, unit in (("grams", _GRAM), ("percent", _PCT)):
+                if key in m:
+                    yield f"macros[{i}].{key}", m[key], unit
+        for i, m in enumerate(blk.get("meals") or []):
+            if "percent" in m:
+                yield f"meals[{i}].percent", m["percent"], _PCT
+    elif kind == "meal_plan":
+        for ti, tpl in enumerate(blk["templates"]):
+            for mi, meal in enumerate(tpl["meals"]):
+                if "kcal" in meal:
+                    yield f"templates[{ti}].meals[{mi}].kcal", meal["kcal"], _KCAL
+
+
+def _explicit_units(kind: str, blk: dict) -> Iterator[tuple[str, Any, str]]:
+    """(relative path, value, unit) for values that sit beside the item's own ``unit``."""
+    keys = {"profile": ("value",), "goals": ("current", "target")}.get(kind, ())
+    for i, it in enumerate((blk.get("items") or []) if keys else []):
+        for key in keys:
+            if key in it and it.get("unit"):
+                yield f"items[{i}].{key}", it[key], it["unit"]
+
+
+def _unit_msg(value: str, unit: str, pattern: re.Pattern) -> str:
+    msg = f"数值里写了单位「{unit}」，版式会自动加上，会显示成重复单位；这里只写数值"  # noqa: RUF001
+    bare = re.sub(r"\s+", " ", pattern.sub("", value)).strip()
+    if bare and not re.search(r"[A-Za-zµμ/]", bare):  # "1.2 g/kg" minus g is no example
+        msg += f"，例如「{bare}」"  # noqa: RUF001
+    return msg
+
+
+def _unit_pattern(unit: str) -> re.Pattern:
+    """A latin unit matches as a whole word ("L" is not inside "LDL"); others as written."""
+    u = re.escape(unit.strip())
+    if unit.strip().isascii() and unit.strip()[:1].isalpha():
+        u = rf"(?<![A-Za-z]){u}(?![A-Za-z])"
+    return re.compile(u, re.IGNORECASE)
+
+
+def _check_units(content: dict, errs: list[ContentError]) -> None:
+    for si, sec in enumerate(content["sections"]):
+        for bi, blk in enumerate(sec["blocks"]):
+            base = f"sections[{si}].blocks[{bi}]"
+            for rel, value, (unit, pattern) in _implicit_units(blk["kind"], blk):
+                if isinstance(value, str) and pattern.search(value):
+                    errs.append(ContentError(f"{base}.{rel}", _unit_msg(value, unit, pattern)))
+            for rel, value, unit in _explicit_units(blk["kind"], blk):
+                pattern = _unit_pattern(unit)
+                if isinstance(value, str) and pattern.search(value):
+                    errs.append(ContentError(f"{base}.{rel}", _unit_msg(value, unit, pattern)))
+
+
 def validate_content(content: Any) -> list[ContentError]:
     errs: list[ContentError] = []
     _check(content, TOP, "", errs)
     if isinstance(content, dict):
         _check_ids(content, errs)
+    if not errs:  # the unit check walks a structure the schema has already vouched for
+        _check_units(content, errs)
     return errs
 
 
@@ -466,11 +531,22 @@ _NON_TEXT_KEYS = frozenset(
 )
 
 
+def _phase_areas_once(block: dict) -> dict:
+    """A phases block's ``area`` names are grouping labels: the table variant shows each one once
+    as a column header, so each distinct area is required once per block (texts all count)."""
+    areas = list(dict.fromkeys(f["area"] for it in block["items"] for f in it["focus"]))
+    items = [{**it, "focus": [{"text": f["text"]} for f in it["focus"]]} for it in block["items"]]
+    return {**block, "items": items, "areas": areas}
+
+
 def required_texts(content: dict) -> list[str]:
-    """Every string the reader must find in the deliverable (numbers and chart points excluded)."""
+    """Every string the reader must find in the deliverable, once per occurrence (numbers and
+    chart points excluded)."""
     out: list[str] = []
 
     def walk(value: Any, in_points: bool) -> None:
+        if isinstance(value, dict) and value.get("kind") == "phases":
+            value = _phase_areas_once(value)
         if isinstance(value, dict):
             for key, item in value.items():
                 if key not in _NON_TEXT_KEYS:
@@ -483,6 +559,35 @@ def required_texts(content: dict) -> list[str]:
 
     walk(content, False)
     return out
+
+
+_PATH_KEYS = frozenset({"path", "logo_path", "media_path"})
+_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def normalize_text(s: str) -> str:
+    """Presentation-level whitespace only (spec §4.4): CRLF / CR and the line / paragraph
+    separators U+2028 / U+2029 become LF; every other C0 control except LF and TAB, DEL and the
+    C1 controls (U+0080-U+009F) become a space. python-pptx would store C0 as literal
+    ``_x000D_`` escapes and weasyprint garbles the text layer, so both writers see this form."""
+    s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n").replace("\u2029", "\n")
+    return _CONTROLS.sub(" ", s)
+
+
+def normalize_content(content: dict) -> dict:
+    """A new content dict with every display string normalised; file paths are left as given
+    (they name files, they are not text the reader sees)."""
+
+    def walk(value: Any, key: str | None) -> Any:
+        if isinstance(value, dict):
+            return {k: walk(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v, key) for v in value]
+        if isinstance(value, str) and key not in _PATH_KEYS:
+            return normalize_text(value)
+        return value
+
+    return walk(content, None)
 
 
 def iter_blocks(content: dict) -> Iterator[tuple[int, str, int, dict]]:

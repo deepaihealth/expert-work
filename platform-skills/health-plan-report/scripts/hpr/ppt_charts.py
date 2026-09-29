@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
-from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_MARKER_STYLE
+from pptx.enum.chart import (
+    XL_CHART_TYPE,
+    XL_LEGEND_POSITION,
+    XL_MARKER_STYLE,
+    XL_TICK_LABEL_POSITION,
+)
 from pptx.enum.dml import MSO_LINE_DASH_STYLE
 from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Pt
 
+from hpr.common import bar_domain, nice_ticks, tick_decimals
 from hpr.prims import Chart
 from hpr.theme import Theme, donut_colors
 
@@ -49,12 +55,18 @@ def add_chart(slide, prim: Chart, x: float, y: float, w: float, h: float, t: The
     values = list(prim.values) + [v for v in (prim.low, prim.high) if v is not None]
     lo, hi = min(values), max(values)
     pad = (hi - lo) * 0.15 or 1.0
+    domain = bar_domain(prim.values) if prim.kind == "bar" else (lo - pad, hi + pad)
+    vmin, vmax, step = nice_ticks(*domain)
     va = ch.value_axis
     va.has_major_gridlines = True
     va.major_gridlines.format.line.color.rgb = _rgb(t.line)
     va.format.line.fill.background()
-    va.minimum_scale = 0 if prim.kind == "bar" and lo >= 0 else round(lo - pad, 2)
-    va.maximum_scale = round(hi + pad, 2)
+    # same nice ticks as the PDF SVG (never rounded to a fixed precision: that collapsed
+    # small-magnitude data to min == max)
+    va.minimum_scale, va.maximum_scale, va.major_unit = vmin, vmax, step
+    d = tick_decimals(step)
+    va.tick_labels.number_format = "0" + ("." + "0" * d if d else "")
+    va.tick_labels.number_format_is_linked = False
     va.tick_labels.font.size = Pt(t.caption)
     ca = ch.category_axis
     ca.format.line.color.rgb = _rgb(t.line)
@@ -80,6 +92,9 @@ def add_chart(slide, prim: Chart, x: float, y: float, w: float, h: float, t: The
         plot.gap_width = 80
         first.format.fill.solid()
         first.format.fill.fore_color.rgb = _rgb(t.primary)
+        # explicit: LibreOffice otherwise draws negative columns upward
+        first.invert_if_negative = False
+        ca.tick_label_position = XL_TICK_LABEL_POSITION.LOW  # dates below negative bars
     return gf
 
 

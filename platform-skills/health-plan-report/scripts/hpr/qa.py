@@ -4,11 +4,11 @@ page, readable contrast (spec §7.2)."""
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from hpr.measure import LINE, Measurer
-from hpr.ppt_layout import brand_line
 from hpr.style import INK, contrast
 from hpr.theme import Theme, on_color
 
@@ -21,12 +21,21 @@ def norm(s: str) -> str:
 
 
 def missing_texts(required: list[str], corpus: str) -> list[str]:
-    c = norm(corpus)
-    out: list[str] = []
-    for r in required:
-        if norm(r) not in c and r not in out:
-            out.append(r)
-    return out
+    """Counted containment (spec §7.2: 计数不足即失败), without consuming positions. Text n
+    needs its own required count plus, for every longer required text m containing it,
+    count(m) x occurrences of n inside m; it passes iff the corpus has at least that many.
+    So a text required twice must appear twice and a dropped text cannot hide inside a longer
+    one, while a longer text that happens to straddle two adjacent cells (the corpus joins them
+    without a separator) can no longer eat characters the real cells need. The accepted cost:
+    neighbouring cells that happen to spell n can make a missing n pass."""
+    work = norm(corpus)
+    req = Counter(n for n in (norm(r) for r in required) if n)
+    lost = set()
+    for n, k in req.items():
+        need = k + sum(km * m.count(n) for m, km in req.items() if len(m) > len(n) and n in m)
+        if work.count(n) < need:
+            lost.add(n)
+    return [r for r in dict.fromkeys(required) if norm(r) in lost]
 
 
 def _shape_texts(sh: Any) -> list[str]:
@@ -109,16 +118,34 @@ def pptx_overflow(path: Path, m: Measurer) -> list[str]:
     return issues
 
 
-def contrast_report(t: Theme) -> dict[str, Any]:
-    ratios = {
-        "ink_on_background": round(contrast(INK, t.background), 2),
-        "primary_on_background": round(contrast(t.primary, t.background), 2),
-        "text_on_primary": round(contrast(on_color(t.primary), t.primary), 2),
+def _text_pairs(t: Theme) -> dict[str, tuple[str, str]]:
+    """Every theme text role on every surface the writers draw it on (spec §7.2)."""
+    return {
+        "primary_on_background": (t.primary, t.background),
+        "primary_text_on_pale": (t.primary_text, t.pale),
+        "text_on_primary": (on_color(t.primary), t.primary),
+        "cover_label_on_primary": (t.on_primary_soft, t.primary),
+        "muted_on_background": (t.muted, t.background),
+        "muted_on_pale": (t.muted, t.pale),
+        "ink_on_pale": (t.ink, t.pale),
+        "ink_on_pale_out": (t.ink, t.pale_out),
+        "ink_on_pale_alert": (t.ink, t.pale_alert),
+        "within_text_on_background": (t.within_text, t.background),
+        "within_text_on_pale": (t.within_text, t.pale),
+        "out_text_on_background": (t.out_text, t.background),
+        "out_text_on_pale": (t.out_text, t.pale),
+        "out_text_on_pale_out": (t.out_text, t.pale_out),
+        "alert_text_on_background": (t.alert_text, t.background),
+        "alert_text_on_pale": (t.alert_text, t.pale),
+        "alert_text_on_pale_alert": (t.alert_text, t.pale_alert),
     }
-    ok = (
-        ratios["ink_on_background"] >= 7
-        and ratios["primary_on_background"] >= 4.5
-        and ratios["text_on_primary"] >= 4.5
+
+
+def contrast_report(t: Theme) -> dict[str, Any]:
+    ratios = {"ink_on_background": round(contrast(INK, t.background), 2)}
+    ratios |= {k: round(contrast(fg, bg), 2) for k, (fg, bg) in _text_pairs(t).items()}
+    ok = ratios["ink_on_background"] >= 7 and all(
+        v >= 4.5 for k, v in ratios.items() if k != "ink_on_background"
     )
     return {"ok": ok, **ratios}
 
@@ -141,9 +168,6 @@ def qa_pptx(path: Path, required: list[str], theme: Theme, m: Measurer) -> dict[
     }
 
 
-PAGE_NO_RE = re.compile(r"第\d+页/共\d+页")
-
-
 def pdf_text(path: Path) -> str:
     from pypdf import PdfReader
 
@@ -161,25 +185,10 @@ def pdf_fonts(path: Path) -> list[str]:
     return sorted(names)
 
 
-def _pdf_chrome(content: dict) -> list[str]:
-    brand = content.get("brand") or {}
-    parts = (
-        content["title"],
-        brand.get("org_name", ""),
-        brand_line(brand),
-        brand.get("disclaimer", ""),
-    )
-    return [norm(x) for x in parts if x]
-
-
-def qa_pdf(path: Path, content: dict, required: list[str], theme: Theme) -> dict[str, Any]:
+def qa_pdf(path: Path, required: list[str], theme: Theme) -> dict[str, Any]:
     from pypdf import PdfReader
 
-    raw = norm(pdf_text(path))
-    cleaned = PAGE_NO_RE.sub("", raw)
-    for chrome in sorted(_pdf_chrome(content), key=len, reverse=True):
-        cleaned = cleaned.replace(chrome, "")
-    missing = [r for r in dict.fromkeys(required) if norm(r) not in raw and norm(r) not in cleaned]
+    missing = missing_texts(required, pdf_text(path))
     fonts = pdf_fonts(path)
     embedded = any("NotoSansCJK" in re.sub(r"[\s-]", "", f) for f in fonts)  # "Noto-Sans-CJK-SC"
     cr = contrast_report(theme)

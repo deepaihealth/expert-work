@@ -15,7 +15,13 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "shared"))
 
 from _cli import emit_json
 from hpr.blocks import RenderError
-from hpr.content import iter_blocks, load_content, required_texts, validate_content
+from hpr.content import (
+    iter_blocks,
+    load_content,
+    normalize_content,
+    required_texts,
+    validate_content,
+)
 from hpr.measure import Measurer
 from hpr.pdf_html import PdfUnavailableError, render_pdf
 from hpr.ppt_draw import render_pptx
@@ -73,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     errs = validate_content(content)
     if errs:
         return _fail([str(e) for e in errs])
+    content = normalize_content(content)
     base_dir = Path(args.content).resolve().parent
     img_errs = _missing_images(content, base_dir)
     if img_errs:
@@ -101,18 +108,22 @@ def main(argv: list[str] | None = None) -> int:
     files: dict[str, str] = {}
     qa: dict[str, dict] = {}
     warnings: list[str] = []
+    page_map: dict[str, list[dict]] = {f: [] for f in formats}
     try:
         if "pptx" in targets:
-            warnings += render_pptx(content, style, targets["pptx"], base_dir, m)
+            warnings += render_pptx(content, style, targets["pptx"], base_dir, m, page_map["pptx"])
             qa["pptx"] = qa_pptx(targets["pptx"], required, build_theme(style, "pptx"), m)
             files["pptx"] = str(targets["pptx"])
         if "pdf" in targets:
-            warnings += render_pdf(content, style, targets["pdf"], base_dir)
-            qa["pdf"] = qa_pdf(targets["pdf"], content, required, build_theme(style, "pdf"))
+            warnings += render_pdf(content, style, targets["pdf"], base_dir, page_map["pdf"])
+            qa["pdf"] = qa_pdf(targets["pdf"], required, build_theme(style, "pdf"))
             files["pdf"] = str(targets["pdf"])
     except (RenderError, LayoutError, PdfUnavailableError) as exc:
         _remove(outputs)
         return _fail([str(exc)])
+    except Exception as exc:  # anything unforeseen still answers with the JSON envelope
+        _remove(outputs)
+        return _fail([f"内部错误：{type(exc).__name__}: {exc}"])  # noqa: RUF001
     except BaseException:
         _remove(outputs)
         raise
@@ -135,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             "ok": ok,
             "files": files,
             "qa": qa,
+            "page_map": page_map,
             "not_applied": [e for e in res.report if e["status"] in NOT_APPLIED],
             "warnings": warnings,
             "errors": [],

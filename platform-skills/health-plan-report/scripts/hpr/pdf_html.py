@@ -6,14 +6,25 @@ import base64
 import logging
 import re
 import unicodedata
+from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Any
 
 from hpr.blocks import section_prims
+from hpr.common import (
+    BAND_CHROME_LABELS,
+    CLIENT_BAND_TITLE,
+    band_columns,
+    client_band_items,
+    column_widths,
+    cover_meta_line,
+)
 from hpr.icons import icon_for_section
 from hpr.images import image_blocks
 from hpr.logo import trimmed_logo
+from hpr.measure import SAFETY, Measurer
+from hpr.page_map import PDF_END_PREFIX, PDF_HEAD_PREFIX, PDF_TOC_ID, pdf_page_map
 from hpr.pdf_guard import check_cover, check_footer, make_fetcher, raise_for_failed_images
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import brand_line
@@ -44,12 +55,40 @@ _POS_CLASS = {
 }
 
 
+COVER_TITLE_CAP, COVER_SUB_CAP = 20.0, 13.0  # the cover does not scale 1:1 with body type
+PT_PER_MM = 72 / 25.4
+PDF_BODY_W = (210 - 18 - 18) * PT_PER_MM  # A4 width minus the @page side margins, in pt
+CELL_PAD_X = 2.2 * PT_PER_MM
+
+
+@lru_cache(maxsize=1)
+def _measurer() -> Measurer:
+    return Measurer()
+
+
+def table_colgroup(p: Table, t: Theme) -> str:
+    """Fixed column widths (percent of the body width): each column fits its longest
+    unbreakable token, the long text column takes the rest (see common.column_widths)."""
+    m = _measurer()
+
+    def need(_i: int, text: str) -> float:  # measured bold: headers and highlights are bold
+        return m.width(clean(text), t.small, True) * SAFETY + 2 * CELL_PAD_X + 1
+
+    widths = column_widths(p.columns, p.rows, PDF_BODY_W, need)
+    return (
+        "<colgroup>"
+        + "".join(f'<col style="width:{w / PDF_BODY_W * 100:.3f}%">' for w in widths)
+        + "</colgroup>"
+    )
+
+
 _BREAKS_TEXT = frozenset(("Cc", "Cs", "Zl", "Zp"))
 
 
 def clean(s: str) -> str:
-    """Control / separator code points (\\f, \\r, U+2028 …; not \\n, \\t) become a space: weasyprint
-    writes them into the font subset and the whole PDF text layer comes out garbled."""
+    """Defence in depth: render.py already normalised control characters and U+2028 / U+2029
+    (normalize_content); weasyprint writes such code points into the font subset and the whole
+    PDF text layer comes out garbled, so any that reach here become a space (not \\n, \\t)."""
     return "".join(
         " " if ch not in "\n\t" and unicodedata.category(ch) in _BREAKS_TEXT else ch for ch in s
     )
@@ -57,6 +96,11 @@ def clean(s: str) -> str:
 
 def e(s: str) -> str:
     return escape(clean(s), quote=True)
+
+
+def eb(s: str) -> str:
+    """Escaped text whose line breaks stay line breaks (escape first, then <br>)."""
+    return e(s).replace("\n", "<br>")
 
 
 _CSS_HEX = frozenset('\\"<>')
@@ -111,18 +155,27 @@ body {{ margin: 0; background: {t.background}; line-height: 1.55; }}
 .cover-minimal {{ background: {t.background}; color: {t.ink}; border-top: 3mm solid {t.primary}; }}
 .cover-split {{ background: {t.background}; color: {t.ink}; }}
 .cover-split .head {{ background: {t.primary}; color: {fg}; }}
-.cover .deco {{ position: absolute; right: -12mm; top: 40mm; width: 120mm; }}
+.cover .deco {{ position: absolute; right: 12mm; top: 40mm; width: 90mm; }}
 .cover .head {{ position: relative; padding: 18mm 20mm 12mm; }}
 .cover .hero {{ padding-top: 45mm; }}
-.cover h1 {{ margin: 0; max-width: 150mm; font-size: {t.title + 10}pt; line-height: 1.25; }}
-.cover .sub {{ margin-top: 5mm; max-width: 160mm; font-size: {t.heading}pt; opacity: 0.85; }}
+.cover h1 {{ margin: 0; max-width: 150mm; font-size: {min(t.title, COVER_TITLE_CAP) + 10}pt;
+  line-height: 1.25; }}
+.cover .sub {{ margin-top: 5mm; max-width: 160mm; font-size: {min(t.heading, COVER_SUB_CAP)}pt;
+  opacity: 0.85; }}
 .cover-minimal .rule {{ width: 18mm; height: 1.2mm; margin-top: 6mm; background: {t.accent}; }}
 .cover .foot {{ position: relative; padding: 10mm 20mm 20mm; }}
 .cover-split .foot {{ min-height: 110mm; padding-top: 14mm; }}
-.cover .meta {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5mm 8mm;
-  border-top: 0.5pt solid currentColor; padding-top: 5mm; }}
-.cover .meta .k {{ font-size: {t.caption}pt; opacity: 0.75; }}
-.cover .meta .v {{ font-weight: 700; }}
+.cover .who {{ border-top: 0.5pt solid currentColor; padding-top: 5mm; }}
+.cover .who .k, .cover .metaline {{ font-size: {t.caption}pt; color: {t.muted}; }}
+.cover .who .v {{ font-weight: 700; font-size: {min(t.heading, COVER_SUB_CAP)}pt; }}
+.cover .metaline {{ margin-top: 4mm; }}
+.cover-band .sub, .cover-band .who .k, .cover-band .metaline, .cover-split .head .sub {{
+  color: {t.on_primary_soft}; opacity: 1; }}
+.band {{ display: grid; gap: 2mm {BAND_GAP_MM}mm; background: {t.pale}; padding: {BAND_PAD_MM}mm;
+  border-radius: 1.5mm; margin-bottom: 4mm; break-inside: avoid; }}
+.band > div {{ display: grid; gap: 0 {BAND_INNER_MM}mm; align-items: baseline; }}
+.band .k {{ font-size: {t.caption}pt; color: {t.muted}; overflow-wrap: anywhere; }}
+.band .v {{ font-weight: 700; }}
 .brand-row {{ display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; }}
 .foot .brand-row {{ margin-top: 8mm; }}
 .brand {{ display: flex; align-items: center; gap: 4mm; font-weight: 700; }}
@@ -144,12 +197,14 @@ body {{ margin: 0; background: {t.background}; line-height: 1.55; }}
 h3 {{ font-size: {t.heading}pt; margin: 5mm 0 2mm; break-after: avoid;
   border-left: 1mm solid {t.accent}; padding-left: 2.5mm; }}
 p {{ margin: 0 0 3mm; }}
+p, li {{ orphans: 3; widows: 3; }}  /* no 1-2 line stub on either side of a break */
 p.boxed {{ background: {t.pale}; padding: 3mm 4mm; border-radius: 1.5mm; break-inside: avoid; }}
 ul, ol {{ margin: 0 0 3mm; padding-left: 6mm; }}
 li {{ margin-bottom: 1.2mm; }} li::marker {{ color: {t.primary}; }}
 ul.checks {{ list-style: none; padding-left: 5mm; }} ul.checks li::before {{ content: "✓ ";
   color: {t.primary}; }}
 .grid {{ display: grid; gap: 3mm; margin-bottom: 4mm; }}
+.grid.keep {{ break-inside: avoid; }}  /* a card grid is one topic */
 .grid.c1 {{ grid-template-columns: 1fr; }} .grid.c2 {{ grid-template-columns: 1fr 1fr; }}
 .grid.c3 {{ grid-template-columns: 1fr 1fr 1fr; }}
   .grid.c4 {{ grid-template-columns: 1fr 1fr 1fr 1fr; }}
@@ -161,21 +216,24 @@ ul.checks {{ list-style: none; padding-left: 5mm; }} ul.checks li::before {{ con
 .card .v small {{ font-size: {t.caption}pt; color: {t.muted}; font-weight: 400; margin-left: 1mm; }}
 .card .l {{ font-size: {t.small}pt; }}
 .tag {{ font-size: {t.small}pt; font-weight: 700; }}
-.tone-within {{ color: {t.within}; }} .tone-out {{ color: {t.out}; }}
-  .tone-alert {{ color: {t.alert}; }}
-.tone-info {{ color: {t.primary}; }} .tone-neutral {{ color: {t.muted}; }}
+.tone-within {{ color: {t.within_text}; }} .tone-out {{ color: {t.out_text}; }}
+  .tone-alert {{ color: {t.alert_text}; }}
+.tone-info {{ color: {t.primary_text}; }} .tone-neutral {{ color: {t.muted}; }}
 .bar {{ position: relative; height: 3mm; margin-top: 1.5mm; }}
 .bar .track {{ position: absolute; left: 0; right: 0; top: 1mm; height: 1mm; background: {t.pale};
   }}
 .bar .range {{ position: absolute; top: 1mm; height: 1mm; background: {t.primary_soft}; }}
 .bar .mark {{ position: absolute; top: 0; width: 0.6mm; height: 3mm; background: {t.ink}; }}
-table {{ width: 100%; border-collapse: collapse; margin-bottom: 4mm; font-size: {t.small}pt; }}
+table {{ width: 100%; table-layout: fixed; border-collapse: collapse; margin-bottom: 4mm;
+  font-size: {t.small}pt; }}
 thead {{ display: table-header-group; }}
-th {{ background: {t.pale}; color: {t.primary}; text-align: left; }}
+th {{ background: {t.pale}; color: {t.primary_text}; text-align: left; }}
 th, td {{ padding: 1.8mm 2.2mm; border-bottom: 0.5pt solid {t.line}; vertical-align: top;
   overflow-wrap: anywhere; }}
-td.hl {{ color: {t.out}; font-weight: 700; }}
+td.hl {{ color: {t.out_text}; font-weight: 700; }}
 tr {{ break-inside: avoid; }}
+/* a split table keeps two rows or more on each side (so a table under four rows never splits) */
+tbody tr:first-child, tbody tr:nth-last-child(2) {{ break-after: avoid; }}
 dl.kv {{ display: grid; gap: 1mm 8mm; margin: 0 0 4mm; }}
 dl.kv.c2 {{ grid-template-columns: 1fr 1fr; }} dl.kv.c1 {{ grid-template-columns: 1fr; }}
 dl.kv div {{ display: grid; grid-template-columns: 34% 1fr; gap: 2mm;
@@ -186,7 +244,7 @@ dl.kv dt {{ color: {t.muted}; font-size: {t.small}pt; }} dl.kv dd {{ margin: 0; 
 .callout.warn {{ background: {t.pale_out}; border-left-color: {t.out}; }}
 .callout.alert {{ background: {t.pale_alert}; border-left-color: {t.alert}; }}
 .callout .ct {{ font-weight: 700; }}
-.callout.alert .ct {{ color: {t.alert}; }} .callout.warn .ct {{ color: {t.out}; }}
+.callout.alert .ct {{ color: {t.alert_text}; }} .callout.warn .ct {{ color: {t.out_text}; }}
 .keep {{ break-inside: avoid; }}
 .chart {{ break-inside: avoid; margin-bottom: 4mm; }}
 .donut {{ display: grid; grid-template-columns: 45mm 1fr; gap: 6mm; align-items: center;
@@ -213,10 +271,12 @@ dl.kv dt {{ color: {t.muted}; font-size: {t.small}pt; }} dl.kv dd {{ margin: 0; 
 .col ul {{ font-size: {t.small}pt; color: {t.ink}; }}
 .media {{ display: grid; grid-template-columns: 62% 1fr; gap: 4mm; background: {t.pale};
   padding: 3mm; break-inside: avoid; margin-bottom: 4mm; }}
-.media .mn {{ color: {t.primary}; font-weight: 700; font-size: {t.heading}pt; }}
+.media .mn {{ color: {t.primary_text}; font-weight: 700; font-size: {t.heading}pt; }}
 .media a {{ display: block; background: {t.background}; border: 0.5pt solid {t.line};
   border-radius: 1.5mm;
-  padding: 3mm; color: {t.primary}; font-weight: 700; text-decoration: none; }}
+  padding: 3mm; color: {t.primary_text}; font-weight: 700; text-decoration: none; }}
+.media .url {{ margin-top: 1.5mm; font-size: {t.caption}pt; color: {t.muted};
+  overflow-wrap: anywhere; }}
 figure {{ margin: 0 0 4mm; break-inside: avoid; }} figure img {{ max-width: 100%;
   max-height: 110mm; }}
 figcaption {{ font-size: {t.caption}pt; color: {t.muted}; }}
@@ -264,19 +324,6 @@ def _brand_rows(content: dict, style: dict, logo: str, dark: dict[bool, bool]) -
     )
 
 
-def _meta_items(content: dict) -> list[tuple[str, str]]:
-    meta = [("客户", content["client"]["name"])]
-    meta += [(f["label"], f["value"]) for f in content["client"].get("facts", [])]
-    if content.get("period"):
-        meta.append(("阶段", content["period"]["label"]))
-    if content.get("data_basis"):
-        meta.append(("数据依据", content["data_basis"]))
-    meta.append(("生成日期", content["generated_at"]))
-    if content.get("manager"):
-        meta.append((content["manager"].get("title") or "负责人", content["manager"]["name"]))
-    return meta
-
-
 def _cover(content: dict, style: dict, t: Theme, base_dir: Path, warnings: list[str]) -> str:
     """Cover in normal flow: a two-row grid, head (brand row, title, subtitle) over foot (meta
     grid, bottom brand row), so title, subtitle and meta can never overlap. The decoration lives
@@ -292,16 +339,67 @@ def _cover(content: dict, style: dict, t: Theme, base_dir: Path, warnings: list[
     )
     sub = f'<div class="sub">{e(content["subtitle"])}</div>' if content.get("subtitle") else ""
     rule = '<div class="rule"></div>' if variant == "minimal" else ""
-    cells = "".join(
-        f'<div><div class="k">{e(k)}</div><div class="v num">{e(v)}</div></div>'
-        for k, v in _meta_items(content)
+    who = (
+        f'<div class="who"><div class="k">客户</div>'
+        f'<div class="v">{e(content["client"]["name"])}</div></div>'
     )
+    meta = f'<div class="metaline num">{e(cover_meta_line(content))}</div>'
     return (
         f'<section class="cover cover-{variant}">'
         f'<div class="head">{deco}{top_row}<div class="hero">'
         f"<h1>{e(content['title'])}</h1>{sub}{rule}</div></div>"
-        f'<div class="foot"><div class="meta">{cells}</div>{bottom_row}</div></section>'
+        f'<div class="foot">{who}{meta}{bottom_row}</div></section>'
     )
+
+
+BAND_PAD_MM, BAND_GAP_MM, BAND_INNER_MM = 4.0, 6.0, 2.0
+
+
+def _band(content: dict, style: dict, t: Theme) -> str:
+    """The 「客户信息」 band after the TOC and before the first section: the caller's facts,
+    then 阶段 / 数据依据, in order; widths from common.band_columns (no mid-token break)."""
+    items = client_band_items(content)
+    if not items:
+        return ""
+    m = _measurer()
+
+    def label_w(text: str) -> float:
+        return m.width(clean(text), t.caption) * SAFETY + 1
+
+    def value_w(_j: int, text: str) -> float:
+        return m.width(clean(text), t.body, True) * SAFETY + 1
+
+    inner = PDF_BODY_W - 2 * BAND_PAD_MM * PT_PER_MM
+    gap, gap_in = BAND_GAP_MM * PT_PER_MM, BAND_INNER_MM * PT_PER_MM
+    n, widths, labs = band_columns(items, inner, gap, label_w, value_w, gap_in)
+    cols = " ".join(f"{w:.2f}pt" for w in widths)
+    cells = "".join(
+        f'<div style="grid-template-columns:{labs[i % n]:.2f}pt 1fr">'
+        f'<div class="k{" chrome" if k in BAND_CHROME_LABELS else ""}">{e(k)}</div>'
+        f'<div class="v num">{eb(v)}</div></div>'
+        for i, (k, v) in enumerate(items)
+    )
+    icon = (
+        f'<span class="ic">{icon_svg("pulse", on_color(t.primary), 4.5)}</span>'
+        if style["section.icons"]
+        else ""
+    )
+    return (
+        f'<section class="sec info" id="{BAND_ANCHOR}">'
+        f'<h2>{icon}<span id="{PDF_HEAD_PREFIX}{BAND_ANCHOR}">{CLIENT_BAND_TITLE}</span></h2>'
+        f'<div class="band" style="grid-template-columns:{cols}">{cells}</div>'
+        f"{_end_mark(BAND_ANCHOR)}</section>"
+    )
+
+
+BAND_ANCHOR = "client-info"
+GRID_KEEP = " keep"  # class that keeps a card grid on one page
+
+
+def _end_mark(anchor: str) -> str:
+    """Empty, zero-height marker closing a section: its anchor names the section's last page.
+    Margins collapse through an empty block, so the layout is unchanged."""
+    return f'<div id="{PDF_END_PREFIX}{anchor}"></div>'
 
 
 def _card(c: Any) -> str:
@@ -313,7 +411,7 @@ def _card(c: Any) -> str:
     if c.value or c.unit:
         unit = f"<small>{e(c.unit)}</small>" if c.unit else ""
         out.append(f'<div class="v num">{e(c.value)}{unit}</div>')
-    out += [f'<div class="l">{e(ln)}</div>' for ln in c.lines]
+    out += [f'<div class="l">{eb(ln)}</div>' for ln in c.lines]
     if c.tag:
         out.append(f'<div class="tag tone-{c.tag.tone}">{e(c.tag.text)}</div>')
     if c.bar:
@@ -336,38 +434,40 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         return f"<h3>{e(p.text)}</h3>"
     if isinstance(p, Paragraph):
         cls = ' class="boxed"' if p.boxed else ""
-        return f"<p{cls}>{e(p.text).replace(chr(10), '<br>')}</p>"
+        return f"<p{cls}>{eb(p.text)}</p>"
     if isinstance(p, Bullets):
         tag = "ol" if p.style == "numbers" else "ul"
         cls = ' class="checks"' if p.style == "checks" else ""
-        return f"<{tag}{cls}>" + "".join(f"<li>{e(i)}</li>" for i in p.items) + f"</{tag}>"
+        return f"<{tag}{cls}>" + "".join(f"<li>{eb(i)}</li>" for i in p.items) + f"</{tag}>"
     if isinstance(p, CardGrid):
-        return f'<div class="grid c{p.cols}">' + "".join(_card(c) for c in p.cards) + "</div>"
+        cards = "".join(_card(c) for c in p.cards)
+        return f'<div class="grid c{p.cols}{GRID_KEEP}">{cards}</div>'
     if isinstance(p, Table):
         head = "".join(f"<th>{e(c)}</th>" for c in p.columns)
         rows = "".join(
             "<tr>"
             + "".join(
                 f"<td "
-                f'class="{"hl" if i == p.highlight_col and v not in ("", "—") else ""}">{e(v)}</td>'
+                f'class="{"hl" if i == p.highlight_col and v not in ("", "—") else ""}">'
+                f"{eb(v)}</td>"
                 for i, v in enumerate(r)
             )
             + "</tr>"
             for r in p.rows
         )
-        return f"<table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table>"
+        return (
+            f"<table>{table_colgroup(p, t)}<thead><tr>{head}</tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
     if isinstance(p, KeyValue):
         return (
             f'<dl class="kv c{p.cols}">'
-            + "".join(f"<div><dt>{e(k)}</dt><dd>{e(v)}</dd></div>" for k, v in p.pairs)
+            + "".join(f"<div><dt>{e(k)}</dt><dd>{eb(v)}</dd></div>" for k, v in p.pairs)
             + "</dl>"
         )
     if isinstance(p, Callout):
         title = f'<div class="ct">{e(p.title)}</div>' if p.title else ""
-        return (
-            f'<div class="callout {p.tone}">{title}<div>{e(p.text).replace(chr(10), "<br>")}</div>'
-            f"</div>"
-        )
+        return f'<div class="callout {p.tone}">{title}<div>{eb(p.text)}</div></div>'
     if isinstance(p, Chart):
         if p.kind == "donut":
             colors = donut_colors(t)
@@ -386,7 +486,7 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         per = min(5, len(p.steps))
         steps = "".join(
             f'<div class="step"><div class="dot"></div><div class="lbl">{e(s.label)}</div>'
-            + (f'<div class="box">{"<br>".join(e(x) for x in s.lines)}</div>' if s.lines else "")
+            + (f'<div class="box">{"<br>".join(eb(x) for x in s.lines)}</div>' if s.lines else "")
             + "</div>"
             for s in p.steps
         )
@@ -397,7 +497,7 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         per = len(p.columns) if len(p.columns) <= 4 else 3
         cols = "".join(
             f'<div class="col tone-{c.tone}"><div class="ch">{e(c.title)}</div><ul>'
-            + "".join(f"<li>{e(i)}</li>" for i in c.items)
+            + "".join(f"<li>{eb(i)}</li>" for i in c.items)
             + "</ul></div>"
             for c in p.columns
         )
@@ -406,7 +506,8 @@ def _prim(p: Prim, t: Theme, base_dir: Path) -> str:
         return (
             f'<div class="media"><div><div class="mn">{e(p.name)}</div>'
             f"<div>{e(p.description)}</div></div>"
-            f'<a href="{e(p.url)}">查看示范/产品详情：{e(p.name)}</a></div>'  # noqa: RUF001
+            f'<div><a href="{e(p.url)}">查看示范/产品详情：{e(p.name)}</a>'  # noqa: RUF001
+            f'<div class="url">{e(p.url)}</div></div></div>'
         )
     if isinstance(p, Image):
         path = Path(p.path)
@@ -437,10 +538,11 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
     ]
     if style["toc"] == "on" or (style["toc"] == "auto" and len(content["sections"]) >= 6):
         links = "".join(
-            f'<a href="#sec-{e(s["id"])}">{i:02d}　{e(s["title"])}</a>'
+            f'<a href="#{PDF_HEAD_PREFIX}sec-{e(s["id"])}">{i:02d}　{e(s["title"])}</a>'
             for i, s in enumerate(content["sections"], start=1)
         )
-        parts.append(f'<section class="toc"><h2>目录</h2>{links}</section>')
+        parts.append(f'<section class="toc" id="{PDF_TOC_ID}"><h2>目录</h2>{links}</section>')
+    parts.append(_band(content, style, t))
     fg = on_color(t.primary)
     for sec, items in section_prims(content, style):
         icon = (
@@ -451,7 +553,9 @@ def build_html(content: dict, style: dict, theme: Theme, base_dir: Path) -> tupl
         body = _body(items, t, base_dir)
         parts.append(
             f'<section class="sec" id="sec-{e(sec["id"])}">'
-            f"<h2>{icon}{e(sec['title'])}</h2>{body}</section>"
+            f'<h2>{icon}<span id="{PDF_HEAD_PREFIX}sec-{e(sec["id"])}">'
+            f"{e(sec['title'])}</span></h2>"
+            f"{body}{_end_mark('sec-' + e(sec['id']))}</section>"
         )
     parts.append("</body></html>")
     return "".join(parts), warnings
@@ -485,7 +589,7 @@ class PdfUnavailableError(Exception):
     """weasyprint is not installed in this environment."""
 
 
-_FAILED_URL = re.compile(r"Failed to load \w+ at '([^']*)'")
+_FAILED_URL = re.compile(r"""Failed to load \w+ at (?:'([^']*)'|"([^"]*)")""")
 
 
 class _Collect(logging.Handler):
@@ -503,10 +607,17 @@ class _Collect(logging.Handler):
             self.messages.append(f"PDF 资源未能加载：{msg}")  # noqa: RUF001
             m = _FAILED_URL.search(msg)
             if m:
-                self.failed.append(m.group(1))
+                self.failed.append(m.group(1) if m.group(1) is not None else m.group(2))
 
 
-def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> list[str]:
+def render_pdf(
+    content: dict,
+    style: dict,
+    out_path: Path,
+    base_dir: Path,
+    page_map_out: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Write the PDF; ``page_map_out``, when given, receives which pages each part landed on."""
     images = image_blocks(content, style, base_dir)
     try:
         from weasyprint import HTML
@@ -522,11 +633,19 @@ def render_pdf(content: dict, style: dict, out_path: Path, base_dir: Path) -> li
     collect = _Collect()
     logger.addHandler(collect)
     try:
-        document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
+        try:
+            document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
+        except AssertionError:
+            # weasyprint asserts when a keep-together grid is taller than a page; lay out again
+            # letting every grid split between rows (the behaviour before grids were kept whole)
+            html = html.replace(f'{GRID_KEEP}">', '">')
+            document = HTML(string=html, base_url=str(base_dir), url_fetcher=fetcher).render()
         check_cover(document)
         check_footer(document)
         raise_for_failed_images(collect.failed, images)
         document.write_pdf(str(out_path))
+        if page_map_out is not None:
+            page_map_out.extend(pdf_page_map(content, document, BAND_ANCHOR))
     finally:
         logger.removeHandler(collect)
     return warnings + collect.messages

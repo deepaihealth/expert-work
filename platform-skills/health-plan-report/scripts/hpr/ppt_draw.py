@@ -2,39 +2,32 @@
 
 from __future__ import annotations
 
-import io
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
 
 from pptx import Presentation
-from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
+from pptx.enum.text import MSO_ANCHOR
 from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Emu, Pt
 
 from hpr.blocks import RenderError, section_prims
-from hpr.icons import ICONS
+from hpr.common import clock_minutes
 from hpr.images import IMAGE_ERRORS, image_blocks, strict_images
-from hpr.logo import trimmed_logo
 from hpr.measure import LINE, Measurer
+from hpr.page_map import pptx_page_map
+from hpr.ppt_canvas import BODY, CHROME, DECO, Canvas, _bg, _footer, _header, _set_font, emu, rgb
 from hpr.ppt_charts import add_chart
+from hpr.ppt_cover import _cover, _end, _show_toc, _toc, band_section, draw_band
 from hpr.ppt_layout import (
-    BODY_TOP,
-    BODY_W,
+    BAND_ID,
     DONUT_H,
-    FOOTER_BOTTOM,
     MARGIN_X,
-    SLIDE_H,
     SLIDE_W,
     STRIPE,
     Ctx,
     LayoutError,
-    Page,
     Placed,
-    brand_line,
     callout_title_height,
     card_height,
     card_parts,
@@ -62,6 +55,7 @@ from hpr.prims import (
     Chart,
     Columns,
     Image,
+    InfoBand,
     KeyValue,
     Media,
     Paragraph,
@@ -70,228 +64,16 @@ from hpr.prims import (
     TimeBars,
     Timeline,
 )
-from hpr.style import mix
-from hpr.theme import WHITE, Theme, build_theme, donut_colors, on_color
+from hpr.theme import Theme, build_theme, donut_colors, on_color
 
-BODY, CHROME, DECO = "hpr:body", "hpr:chrome", "hpr:deco"
 NO_GRID_STYLE = "{2D5ABB26-0587-4C30-8999-92F81FD0307C}"
-_ALIGN = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}
-_TONE = {"within": "within", "out": "out", "alert": "alert", "info": "primary", "neutral": "muted"}
-
-
-def emu(pt: float) -> Emu:
-    return Emu(round(pt * 12700))
-
-
-def rgb(hex_: str) -> RGBColor:
-    return RGBColor.from_string(hex_[1:])
-
-
-def _set_font(run: Any, t: Theme, size: float, color: str, bold: bool) -> None:
-    run.font.size = Pt(size)
-    run.font.bold = bold
-    run.font.color.rgb = rgb(color)
-    run.font.name = t.font_latin
-    rpr = run.font._element
-    ea = rpr.find(qn("a:ea"))
-    if ea is None:
-        ea = OxmlElement("a:ea")
-        rpr.insert_element_before(
-            ea, "a:cs", "a:sym", "a:hlinkClick", "a:hlinkMouseOver", "a:rtl", "a:extLst"
-        )
-    ea.set("typeface", t.font_cn)
-
-
-def _drop_style(shp: Any) -> None:
-    """Remove the theme style reference so no renderer adds the theme's shadow/effects."""
-    style = shp._element.find(qn("p:style"))
-    if style is not None:
-        shp._element.remove(style)
-
-
-class Canvas:
-    def __init__(self, slide: Any, theme: Theme) -> None:
-        self.slide = slide
-        self.t = theme
-
-    def rect(
-        self,
-        x: float,
-        y: float,
-        w: float,
-        h: float,
-        fill: str | None,
-        *,
-        line: str | None = None,
-        rounded: bool = False,
-        name: str = DECO,
-    ) -> Any:
-        kind = MSO_SHAPE.ROUNDED_RECTANGLE if rounded else MSO_SHAPE.RECTANGLE
-        shp = self.slide.shapes.add_shape(kind, emu(x), emu(y), emu(w), emu(h))
-        shp.name = name
-        if rounded:
-            shp.adjustments[0] = min(0.5, 4.0 / max(1.0, min(w, h)))
-        if fill:
-            shp.fill.solid()
-            shp.fill.fore_color.rgb = rgb(fill)
-        else:
-            shp.fill.background()
-        if line:
-            shp.line.color.rgb = rgb(line)
-            shp.line.width = Pt(0.75)
-        else:
-            shp.line.fill.background()
-        shp.shadow.inherit = False
-        _drop_style(shp)
-        return shp
-
-    def oval(
-        self, x: float, y: float, w: float, h: float, fill: str | None, line: str | None = None
-    ) -> Any:
-        shp = self.slide.shapes.add_shape(MSO_SHAPE.OVAL, emu(x), emu(y), emu(w), emu(h))
-        shp.name = DECO
-        if fill:
-            shp.fill.solid()
-            shp.fill.fore_color.rgb = rgb(fill)
-        else:
-            shp.fill.background()
-        if line:
-            shp.line.color.rgb = rgb(line)
-            shp.line.width = Pt(0.75)
-        else:
-            shp.line.fill.background()
-        shp.shadow.inherit = False
-        _drop_style(shp)
-        return shp
-
-    def text(
-        self,
-        x: float,
-        y: float,
-        w: float,
-        h: float,
-        text: str,
-        size: float,
-        color: str,
-        *,
-        bold: bool = False,
-        align: str = "left",
-        name: str = BODY,
-        link: str | None = None,
-    ) -> Any:
-        tb = self.slide.shapes.add_textbox(emu(x), emu(y), emu(w), emu(h))
-        tb.name = name
-        tf = tb.text_frame
-        tf.word_wrap = True
-        tf.auto_size = MSO_AUTO_SIZE.NONE
-        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
-        tf.vertical_anchor = MSO_ANCHOR.TOP
-        for i, para_text in enumerate(text.split("\n")):
-            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-            p.alignment = _ALIGN[align]
-            p.line_spacing = Pt(size * LINE)
-            r = p.add_run()
-            r.text = para_text
-            _set_font(r, self.t, size, color, bold)
-            if link:
-                r.hyperlink.address = link
-        return tb
-
-    def polyline(self, pts: list[tuple[float, float]], color: str, width: float) -> Any:
-        (x0, y0), rest = pts[0], pts[1:]
-        builder = self.slide.shapes.build_freeform(emu(x0), emu(y0), scale=1.0)
-        builder.add_line_segments([(emu(x), emu(y)) for x, y in rest], close=False)
-        shp = builder.convert_to_shape()
-        shp.name = DECO
-        shp.fill.background()
-        shp.line.color.rgb = rgb(color)
-        shp.line.width = Pt(width)
-        shp.shadow.inherit = False
-        _drop_style(shp)
-        return shp
-
-    def icon(self, name: str, x: float, y: float, size: float, color: str) -> None:
-        k = size / 24.0
-        for pl in ICONS[name]:
-            self.polyline([(x + px * k, y + py * k) for px, py in pl], color, 1.5)
-
-    def picture(
-        self, src: Path | BinaryIO, x: float, y: float, w: float, h: float, name: str
-    ) -> Any:
-        image = str(src) if isinstance(src, Path) else src
-        pic = self.slide.shapes.add_picture(image, emu(x), emu(y), emu(w), emu(h))
-        pic.name = name
-        return pic
-
-
-# ---------- chrome ----------
-
-
-def _footer(cv: Canvas, content: dict, style: dict, ctx: Ctx) -> None:
-    t, m = ctx.theme, ctx.m
-    brand = content.get("brand") or {}
-    line1 = brand_line(brand)
-    line1_h = m.lines(line1, BODY_W, t.caption) * lh(t.caption) if line1 else 0.0
-    disc = brand.get("disclaimer", "")
-    n_disc = m.lines(disc, BODY_W, t.caption) if disc else 0
-    text_h = line1_h + n_disc * lh(t.caption)
-    if not text_h:
-        return
-    top = FOOTER_BOTTOM - text_h
-    cv.rect(MARGIN_X, top - t.gap_s, BODY_W, 0.75, t.line)
-    align = style["footer.align"]
-    y = top
-    if line1:
-        cv.text(MARGIN_X, y, BODY_W, line1_h, line1, t.caption, t.muted, align=align, name=CHROME)
-        y += line1_h
-    if disc:
-        cv.text(
-            MARGIN_X,
-            y,
-            BODY_W,
-            n_disc * lh(t.caption),
-            disc,
-            t.caption,
-            t.muted,
-            align=align,
-            name=CHROME,
-        )
-
-
-def _header(cv: Canvas, page: Page, number: str, style: dict, ctx: Ctx) -> None:
-    t = ctx.theme
-    cv.rect(0, 0, SLIDE_W * 0.6, 4, t.primary)
-    cv.rect(SLIDE_W * 0.6, 0, SLIDE_W * 0.4, 4, t.accent)
-    x = MARGIN_X
-    if style["section.icons"]:
-        cv.rect(MARGIN_X, 22, 28, 28, t.primary, rounded=True)
-        cv.icon(page.icon, MARGIN_X + 5, 27, 18, on_color(t.primary))
-        x = MARGIN_X + 40
-    title_w = SLIDE_W - MARGIN_X - x - 100
-    cv.text(
-        x,
-        36 - lh(t.title) / 2,
-        title_w,
-        lh(t.title),
-        page.title,
-        t.title,
-        t.ink,
-        bold=True,
-        name=CHROME,
-    )
-    if style["footer.page_number"]:
-        cv.text(
-            SLIDE_W - MARGIN_X - 90,
-            36 - lh(t.caption) / 2,
-            90,
-            lh(t.caption),
-            number,
-            t.caption,
-            t.muted,
-            align="right",
-            name=DECO,
-        )
-    cv.rect(MARGIN_X, 62, BODY_W, 0.75, t.line)
+_TONE = {
+    "within": "within_text",
+    "out": "out_text",
+    "alert": "alert_text",
+    "info": "primary_text",
+    "neutral": "muted",
+}
 
 
 def _check_titles(content: dict, ctx: Ctx, style: dict) -> None:
@@ -300,388 +82,6 @@ def _check_titles(content: dict, ctx: Ctx, style: dict) -> None:
     for si, sec in enumerate(content["sections"]):
         if m.lines(sec["title"], title_w, t.title, True) > 1:
             raise LayoutError(f"sections[{si}].title", "章节标题过长，页标题只能一行，请缩短")  # noqa: RUF001
-
-
-# ---------- brand placement ----------
-
-
-def _logo_path(content: dict, base_dir: Path) -> Path | None:
-    raw = (content.get("brand") or {}).get("logo_path")
-    if not raw:
-        return None
-    p = Path(raw)
-    return p if p.is_absolute() else base_dir / p
-
-
-LOGO_MAX_W, LOGO_MAX_H = 140.0, 56.0
-PLATE_PAD = 8.0
-BRAND_BAND_H = 76.0  # vertical room kept free for a bottom-anchored logo (with plate) or org name
-
-
-def _load_logo(path: Path) -> tuple[io.BytesIO, float, float] | None:
-    """LOGO trimmed to its visible (alpha) bounding box, as an in-memory PNG plus its drawn size
-    in pt; None when unreadable. The input file is never modified or copied on disk."""
-    logo = trimmed_logo(path)
-    if logo is None:
-        return None
-    data, iw, ih = logo
-    k = min(LOGO_MAX_W / iw, LOGO_MAX_H / ih)
-    return io.BytesIO(data), iw * k, ih * k
-
-
-def _anchor(
-    pos: str, w: float, h: float, box: tuple[float, float, float, float]
-) -> tuple[float, float]:
-    x0, y0, x1, y1 = box
-    return {
-        "top-left": (x0, y0),
-        "top-right": (x1 - w, y0),
-        "bottom-left": (x0, y1 - h),
-        "bottom-right": (x1 - w, y1 - h),
-        "center": ((x0 + x1 - w) / 2, y0),
-    }[pos]
-
-
-def _place_brand(
-    cv: Canvas,
-    content: dict,
-    style: dict,
-    ctx: Ctx,
-    base_dir: Path,
-    color: str,
-    box: tuple[float, float, float, float],
-    warnings: list[str],
-    *,
-    plate: bool = False,
-) -> None:
-    """Place LOGO and org name inside ``box``; ``plate`` puts the LOGO on a white rounded plate
-    (used where the LOGO would sit on a dark area)."""
-    t, m = ctx.theme, ctx.m
-    brand = content.get("brand") or {}
-    logo_pos, org_pos = style["brand.logo_position"], style["brand.org_position"]
-    pad = PLATE_PAD if plate else 0.0
-    logo_box: tuple[float, float, float, float] | None = None
-    path = _logo_path(content, base_dir)
-    if path is not None:
-        logo = _load_logo(path) if path.is_file() else None
-        if logo is None:
-            warnings.append(
-                f"LOGO 文件不存在或无法读取，封面只保留机构名称：{brand.get('logo_path')}"  # noqa: RUF001
-            )
-        else:
-            stream, lw, lh_ = logo
-            x0, y0, x1, y1 = box
-            x, y = _anchor(logo_pos, lw, lh_, (x0 + pad, y0 + pad, x1 - pad, y1 - pad))
-            if plate:
-                cv.rect(x - pad, y - pad, lw + 2 * pad, lh_ + 2 * pad, WHITE, rounded=True)
-            cv.picture(stream, x, y, lw, lh_, "hpr:logo")
-            logo_box = (x, y, lw, lh_)
-    org = brand.get("org_name")
-    if not org:
-        return
-    ow = min(m.width(org, t.body, True) * 1.2 + 4, 360.0)
-    oh = m.lines(org, ow, t.body, True) * lh(t.body)
-    x, y = _anchor(org_pos, ow, oh, box)
-    if logo_box and org_pos == logo_pos:
-        lx, ly, lw, lh_ = logo_box
-        y = ly + (lh_ - oh) / 2
-        if org_pos in ("top-right", "bottom-right"):
-            x = lx - pad - 12 - ow
-        elif org_pos == "center":
-            y = ly + lh_ + pad + 8
-        else:
-            x = lx + lw + pad + 12
-    cv.text(x, y, ow, oh, org, t.body, color, bold=True, name=CHROME)
-
-
-# ---------- cover / toc / end ----------
-
-
-def _meta_items(content: dict) -> list[tuple[str, str]]:
-    items = [("客户", content["client"]["name"])]
-    items += [(f["label"], f["value"]) for f in content["client"].get("facts", [])]
-    period = content.get("period")
-    if period:
-        items.append(("阶段", period["label"]))
-    if content.get("data_basis"):
-        items.append(("数据依据", content["data_basis"]))
-    items.append(("生成日期", content["generated_at"]))
-    mgr = content.get("manager")
-    if mgr:
-        items.append((mgr.get("title") or "负责人", mgr["name"]))
-    return items
-
-
-def _cover_title(
-    cv: Canvas,
-    content: dict,
-    ctx: Ctx,
-    x: float,
-    y: float,
-    w: float,
-    colors: tuple[str, str],
-    max_lines: int,
-    limit: tuple[float, str],
-) -> float:
-    """Draw title + subtitle from ``y``; both must end above ``limit`` = (y, what lies below)."""
-    t, m = ctx.theme, ctx.m
-    color, sub_color = colors
-    bottom, below = limit
-    size = t.title + 12
-    n = m.lines(content["title"], w, size, True)
-    if n > max_lines:
-        raise LayoutError("title", f"方案名称过长（封面最多 {max_lines} 行），请缩短")  # noqa: RUF001
-    title_h = n * lh(size)
-    if y + title_h > bottom:
-        raise LayoutError("title", f"方案名称过长，封面上会压住{below}，请缩短")  # noqa: RUF001
-    k = m.lines(content["subtitle"], w, t.heading) if content.get("subtitle") else 0
-    sub_top = y + title_h + t.gap_m
-    if k and sub_top + k * lh(t.heading) > bottom:
-        raise LayoutError(
-            "subtitle",
-            f"副标题过长，封面上会压住{below}，请缩短副标题或减少封面信息项",  # noqa: RUF001
-        )
-    cv.text(x, y, w, title_h, content["title"], size, color, bold=True, name=CHROME)
-    y = sub_top
-    if k:
-        cv.text(x, y, w, k * lh(t.heading), content["subtitle"], t.heading, sub_color, name=CHROME)
-        y += k * lh(t.heading)
-    return y
-
-
-@dataclass(frozen=True)
-class MetaGeo:
-    col_w: float
-    rows: list[list[tuple[str, str]]]
-    label_h: list[float]
-    row_h: list[float]
-    height: float  # grid height, excluding the rule drawn gap_m above it
-
-
-def _meta_geometry(items: list[tuple[str, str]], ctx: Ctx, w: float) -> MetaGeo:
-    t, m = ctx.theme, ctx.m
-    per = 4
-    cw = (w - (per - 1) * t.gap_l) / per
-    rows = [items[i : i + per] for i in range(0, len(items), per)]
-    if len(rows) > 3:
-        raise LayoutError("client.facts", "封面信息过多（最多 12 项），请精简或移到正文")  # noqa: RUF001
-    label_h = [max(m.lines(k, cw, t.caption) * lh(t.caption) for k, _ in row) for row in rows]
-    row_h = [
-        lab + max(m.lines(v, cw, t.body, True) * lh(t.body) for _, v in row)
-        for row, lab in zip(rows, label_h, strict=True)
-    ]
-    return MetaGeo(cw, rows, label_h, row_h, sum(row_h) + t.gap_m * (len(rows) - 1))
-
-
-def _meta_grid(
-    cv: Canvas,
-    geo: MetaGeo,
-    ctx: Ctx,
-    x: float,
-    bottom: float,
-    w: float,
-    colors: tuple[str, str, str],
-) -> None:
-    t = ctx.theme
-    label_color, value_color, rule = colors
-    y = bottom - geo.height
-    cv.rect(x, y - t.gap_m, w, 0.75, rule)
-    for row, lab, rh in zip(geo.rows, geo.label_h, geo.row_h, strict=True):
-        for i, (label, value) in enumerate(row):
-            cx = x + i * (geo.col_w + t.gap_l)
-            cv.text(cx, y, geo.col_w, lab, label, t.caption, label_color, name=CHROME)
-            cv.text(
-                cx, y + lab, geo.col_w, rh - lab, value, t.body, value_color, bold=True, name=CHROME
-            )
-        y += rh + t.gap_m
-
-
-def _bg(slide: Any, color: str) -> None:
-    slide.background.fill.solid()
-    slide.background.fill.fore_color.rgb = rgb(color)
-
-
-_META_BELOW = "下方的客户信息区"
-
-
-def _cover(
-    prs: Any, content: dict, style: dict, ctx: Ctx, base_dir: Path, warnings: list[str]
-) -> None:
-    t = ctx.theme
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    cv = Canvas(slide, t)
-    variant = style["cover.variant"]
-    bottom_brand = style["brand.logo_position"].startswith("bottom") or style[
-        "brand.org_position"
-    ].startswith("bottom")
-    meta_bottom = SLIDE_H - 40 - (BRAND_BAND_H if bottom_brand else 0)
-    items = _meta_items(content)
-    if variant == "split":
-        panel_w = SLIDE_W * 0.42
-        meta_w = SLIDE_W - panel_w - 80
-        geo = _meta_geometry(items, ctx, meta_w)
-        _bg(slide, t.background)
-        cv.rect(0, 0, panel_w, SLIDE_H, t.primary)
-        fg = on_color(t.primary)
-        _cover_title(
-            cv,
-            content,
-            ctx,
-            40,
-            150,
-            panel_w - 80,
-            (fg, mix(fg, t.primary, 0.25)),
-            4,
-            (SLIDE_H - 40, "左侧色块底边"),
-        )
-        _place_brand(
-            cv,
-            content,
-            style,
-            ctx,
-            base_dir,
-            t.ink,
-            (panel_w + 40, 32, SLIDE_W - 40, SLIDE_H - 24),
-            warnings,
-        )
-        _meta_grid(cv, geo, ctx, panel_w + 40, meta_bottom, meta_w, (t.muted, t.ink, t.line))
-        return
-    if variant == "minimal":
-        meta_w = SLIDE_W - 112
-        geo = _meta_geometry(items, ctx, meta_w)
-        limit = meta_bottom - geo.height - t.gap_m - t.gap_l
-        _bg(slide, t.background)
-        cv.rect(0, 0, SLIDE_W, 6, t.primary)
-        # the accent bar under the subtitle needs gap_m + 4 of the room above the meta grid
-        y = _cover_title(
-            cv,
-            content,
-            ctx,
-            56,
-            170,
-            620,
-            (t.ink, t.muted),
-            3,
-            (limit - t.gap_m - 4, _META_BELOW),
-        )
-        cv.rect(56, y + t.gap_m, 64, 4, t.accent)
-        _place_brand(
-            cv,
-            content,
-            style,
-            ctx,
-            base_dir,
-            t.primary,
-            (56, 32, SLIDE_W - 56, SLIDE_H - 24),
-            warnings,
-        )
-        _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (t.muted, t.ink, t.line))
-        return
-    meta_w = 560.0
-    geo = _meta_geometry(items, ctx, meta_w)
-    limit = meta_bottom - geo.height - t.gap_m - t.gap_l
-    _bg(slide, t.primary)
-    fg = on_color(t.primary)
-    soft = mix(t.primary, fg, 0.25)
-    for r in (165.0, 125.0, 85.0):
-        cv.oval(790 - r, 270 - r, 2 * r, 2 * r, None, line=soft)
-    # decoration stays right of the meta grid (x 56..616) and the title column (..576)
-    cv.polyline(
-        [(640, 330), (690, 318), (730, 336), (775, 290), (820, 298), (870, 250), (955, 225)],
-        t.accent,
-        2.2,
-    )
-    _cover_title(
-        cv, content, ctx, 56, 150, 520, (fg, mix(fg, t.primary, 0.25)), 3, (limit, _META_BELOW)
-    )
-    _place_brand(
-        cv,
-        content,
-        style,
-        ctx,
-        base_dir,
-        fg,
-        (56, 32, SLIDE_W - 56, SLIDE_H - 24),
-        warnings,
-        plate=True,
-    )
-    _meta_grid(cv, geo, ctx, 56, meta_bottom, meta_w, (soft, fg, soft))
-
-
-def _show_toc(content: dict, style: dict) -> bool:
-    return style["toc"] == "on" or (style["toc"] == "auto" and len(content["sections"]) >= 8)
-
-
-def _toc(prs: Any, content: dict, style: dict, ctx: Ctx) -> None:
-    t, m = ctx.theme, ctx.m
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _bg(slide, t.background)
-    cv = Canvas(slide, t)
-    cv.rect(0, 0, SLIDE_W * 0.6, 4, t.primary)
-    cv.rect(SLIDE_W * 0.6, 0, SLIDE_W * 0.4, 4, t.accent)
-    cv.text(
-        MARGIN_X,
-        36 - lh(t.title) / 2,
-        400,
-        lh(t.title),
-        "目录",
-        t.title,
-        t.ink,
-        bold=True,
-        name=DECO,
-    )
-    cv.rect(MARGIN_X, 62, BODY_W, 0.75, t.line)
-    col_w = (BODY_W - t.gap_l) / 2
-    per_col = (len(content["sections"]) + 1) // 2
-    for i, sec in enumerate(content["sections"]):
-        col, row = divmod(i, per_col)
-        x = MARGIN_X + col * (col_w + t.gap_l)
-        y = BODY_TOP + 10 + row * (lh(t.heading) + t.gap_m)
-        cv.text(x, y, 44, lh(t.heading), f"{i + 1:02d}", t.heading, t.primary, bold=True, name=DECO)
-        if m.lines(sec["title"], col_w - 52, t.heading) > 1:
-            raise LayoutError(f"sections[{i}].title", "章节标题过长，目录只能一行，请缩短")  # noqa: RUF001
-        cv.text(x + 52, y, col_w - 52, lh(t.heading), sec["title"], t.heading, t.ink, name=CHROME)
-    _footer(cv, content, style, ctx)
-
-
-def _end(prs: Any, content: dict, ctx: Ctx) -> None:
-    t, m = ctx.theme, ctx.m
-    brand = content.get("brand") or {}
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _bg(slide, t.primary)
-    cv = Canvas(slide, t)
-    fg = on_color(t.primary)
-    y = 200.0
-    org = brand["org_name"]
-    n = m.lines(org, 700, t.title, True)
-    cv.text(130, y, 700, n * lh(t.title), org, t.title, fg, bold=True, align="center", name=CHROME)
-    y += n * lh(t.title) + t.gap_m
-    if brand.get("footer_signature"):
-        k = m.lines(brand["footer_signature"], 700, t.heading)
-        cv.text(
-            130,
-            y,
-            700,
-            k * lh(t.heading),
-            brand["footer_signature"],
-            t.heading,
-            mix(fg, t.primary, 0.25),
-            align="center",
-            name=CHROME,
-        )
-    if brand.get("disclaimer"):
-        k = m.lines(brand["disclaimer"], BODY_W, t.caption)
-        cv.text(
-            MARGIN_X,
-            FOOTER_BOTTOM - k * lh(t.caption),
-            BODY_W,
-            k * lh(t.caption),
-            brand["disclaimer"],
-            t.caption,
-            mix(fg, t.primary, 0.25),
-            align="center",
-            name=CHROME,
-        )
 
 
 # ---------- primitives ----------
@@ -790,12 +190,13 @@ def _draw_table(cv: Canvas, pl: Placed, tb: Table, ctx: Ctx) -> None:
             else:
                 cell.fill.background()
             highlight = r > 0 and tb.highlight_col == c and value not in ("", "—")
-            color = t.primary if r == 0 else (t.out if highlight else t.ink)
-            para = cell.text_frame.paragraphs[0]
-            para.line_spacing = Pt(t.small * LINE)
-            run = para.add_run()
-            run.text = value
-            _set_font(run, t, t.small, color, r == 0 or highlight)
+            color = t.primary_text if r == 0 else (t.out_text if highlight else t.ink)
+            for k, line in enumerate(value.split("\n")):
+                para = cell.text_frame.paragraphs[0] if k == 0 else cell.text_frame.add_paragraph()
+                para.line_spacing = Pt(t.small * LINE)
+                run = para.add_run()
+                run.text = line
+                _set_font(run, t, t.small, color, r == 0 or highlight)
 
 
 def _draw_kv(cv: Canvas, pl: Placed, kv: KeyValue, ctx: Ctx) -> None:
@@ -822,7 +223,8 @@ def _draw_callout(cv: Canvas, pl: Placed, co: Callout, ctx: Ctx) -> None:
     x, y, w = pl.x + 4 + t.gap_m, pl.y + t.gap_m, pl.w - 4 - 2 * t.gap_m
     if co.title:
         th = callout_title_height(co, w, ctx)
-        cv.text(x, y, w, th, co.title, t.body, edge, bold=True)
+        title_color = {"alert": t.alert_text, "warn": t.out_text}.get(co.tone, t.primary_text)
+        cv.text(x, y, w, th, co.title, t.body, title_color, bold=True)
         y += th + t.gap_xs
     cv.text(x, y, w, m.lines(co.text, w, t.body) * lh(t.body), co.text, t.body, t.ink)
 
@@ -888,9 +290,10 @@ def _draw_columns(cv: Canvas, pl: Placed, cols: Columns, ctx: Ctx) -> None:
         rh = max(column_height(c, cw, ctx) for c in row)
         for i, col in enumerate(row):
             x = pl.x + i * (cw + t.gap_m)
-            color = _tone(t, col.tone) if col.tone != "neutral" else t.primary
+            color = _tone(t, col.tone) if col.tone != "neutral" else t.primary_text
+            fill = getattr(t, col.tone) if col.tone in ("within", "out", "alert") else t.primary
             cv.rect(x, y, cw, rh, t.pale, rounded=True)
-            cv.rect(x, y, cw, STRIPE, color)
+            cv.rect(x, y, cw, STRIPE, fill)
             cy = y + STRIPE + t.gap_m
             title_h = column_title_height(col, cw, ctx)
             cv.text(
@@ -915,7 +318,7 @@ def _draw_media(
     cv.rect(pl.x, pl.y, pl.w, pl.h, t.pale, rounded=True)
     geo = media_geometry(md, pl.w, ctx)
     tx, tw = pl.x + t.gap_m, geo.text_w
-    cv.text(tx, pl.y + t.gap_m, tw, geo.name_h, md.name, t.heading, t.primary, bold=True)
+    cv.text(tx, pl.y + t.gap_m, tw, geo.name_h, md.name, t.heading, t.primary_text, bold=True)
     dy = pl.y + t.gap_m + geo.name_h + t.gap_xs
     cv.text(
         tx, dy, tw, m.lines(md.description, tw, t.body) * lh(t.body), md.description, t.body, t.ink
@@ -951,7 +354,7 @@ def _draw_media(
         link_h,
         label,
         t.body,
-        t.primary,
+        t.primary_text,
         bold=True,
         name=CHROME,
         link=md.url,
@@ -973,12 +376,6 @@ def _draw_image(cv: Canvas, pl: Placed, im: Image, ctx: Ctx) -> None:
         cv.text(pl.x, pl.y + h + t.gap_xs, pl.w, ch, im.caption, t.caption, t.muted)
 
 
-def _minutes(hhmm: str) -> int:
-    h, mm = (int(x) for x in hhmm.split(":"))
-    total = h * 60 + mm
-    return total + 24 * 60 if total < 18 * 60 else total
-
-
 def _draw_timebars(cv: Canvas, pl: Placed, tb: TimeBars, ctx: Ctx) -> None:
     t, m = ctx.theme, ctx.m
     start, span = 18 * 60, 18 * 60
@@ -988,7 +385,7 @@ def _draw_timebars(cv: Canvas, pl: Placed, tb: TimeBars, ctx: Ctx) -> None:
     for i, (label, bed, wake) in enumerate(tb.rows):
         rh = lh(t.body)
         cv.text(pl.x, y, label_w - 8, rh, label, t.body, t.muted, bold=True, name=DECO)
-        b, w_ = _minutes(bed), _minutes(wake)
+        b, w_ = clock_minutes(bed), clock_minutes(wake)
         if w_ <= b:
             w_ += 24 * 60
         x0 = ax + aw * max(0, min(span, b - start)) / span
@@ -1067,18 +464,26 @@ def _draw(cv: Canvas, pl: Placed, ctx: Ctx, base_dir: Path, warnings: list[str])
         _draw_image(cv, pl, p, ctx)
     elif isinstance(p, TimeBars):
         _draw_timebars(cv, pl, p, ctx)
+    elif isinstance(p, InfoBand):
+        draw_band(cv, pl.x, pl.y, pl.w, p, ctx)
     else:
         raise TypeError(type(p).__name__)
 
 
 def render_pptx(
-    content: dict, style: dict, out_path: Path, base_dir: Path, m: Measurer
+    content: dict,
+    style: dict,
+    out_path: Path,
+    base_dir: Path,
+    m: Measurer,
+    page_map_out: list[dict[str, Any]] | None = None,
 ) -> list[str]:
+    """Write the deck; ``page_map_out``, when given, receives which slides each part is on."""
     theme = build_theme(style, "pptx")
     ctx = make_ctx(content, theme, m, base_dir)
     _check_titles(content, ctx, style)
     image_blocks(content, style, base_dir)  # every image decodes, or its block path is reported
-    pages = paginate(section_prims(content, style), ctx)
+    pages = paginate(band_section(content) + section_prims(content, style), ctx)
     warnings: list[str] = []
     prs = Presentation()
     prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
@@ -1100,4 +505,6 @@ def render_pptx(
     if end:
         _end(prs, content, ctx)
     prs.save(str(out_path))
+    if page_map_out is not None:
+        page_map_out.extend(pptx_page_map(content, pages, BAND_ID, toc, end))
     return warnings

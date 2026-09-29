@@ -19,7 +19,7 @@ from hpr.pdf_html import build_html, css_string, render_pdf
 from hpr.pdf_svg import bar_svg, cover_deco_svg, donut_svg, icon_svg, line_svg, timebar_svg
 from hpr.ppt_layout import LayoutError
 from hpr.prims import Chart
-from hpr.qa import PAGE_NO_RE, missing_texts, norm
+from hpr.qa import missing_texts
 from hpr.style import Layer, resolve
 from hpr.theme import build_theme
 from PIL import Image as PILImage
@@ -75,11 +75,13 @@ def test_every_required_text_is_in_visible_html(sample, base):
     assert warnings == []
 
 
-def test_cover_meta_includes_period_even_when_subtitle_omits_it(sample, base):
+def test_period_is_in_the_client_band_not_on_the_cover(sample, base):
     sample["subtitle"] = "控糖与体重管理"
-    cover = _cover(_html(sample, base)[0])
-    assert '<div class="k">阶段</div>' in cover
-    assert sample["period"]["label"] in _visible_text(cover)
+    html = _html(sample, base)[0]
+    band = html[html.index('id="client-info"') :]
+    assert '<div class="k chrome">阶段</div>' in band
+    assert sample["period"]["label"] in _visible_text(band)
+    assert sample["period"]["label"] not in _visible_text(_cover(html))
 
 
 def test_no_scripts_and_font_declared(sample, base):
@@ -108,7 +110,7 @@ def test_cover_variants(sample, base, variant):
 def test_cover_text_is_laid_out_in_flow_not_at_fixed_offsets(sample, base, variant):
     html, _ = _html(sample, base, [Layer("x", {"cover.variant": variant})])
     css = html[html.index("<style>") : html.index("</style>")]
-    for sel in (".cover h1", ".cover .sub", ".cover .meta"):
+    for sel in (".cover h1", ".cover .sub", ".cover .who", ".cover .metaline"):
         rules = [m.group(1) for m in re.finditer(re.escape(sel) + r"\s*\{([^}]*)\}", css)]
         assert rules, sel
         fixed = [r for r in rules if "absolute" in r or re.search(r"(?<![-\w])(top|bottom)\s*:", r)]
@@ -192,6 +194,52 @@ def test_line_chart_labels_bounds_and_unit():
     assert "目标下限 4.4" in svg and "目标上限 6.1" in svg and "mmol/L" in svg
 
 
+def _svg_texts(svg: str) -> list[str]:
+    ns = "{http://www.w3.org/2000/svg}"
+    return [el.text or "" for el in ET.fromstring(svg).iter(f"{ns}text")]  # noqa: S314
+
+
+def _bars(svg: str) -> list[dict]:
+    ns = "{http://www.w3.org/2000/svg}"
+    return [el.attrib for el in ET.fromstring(svg).iter(f"{ns}rect")]  # noqa: S314
+
+
+def test_bar_chart_labels_every_value_and_has_a_value_axis():
+    t = build_theme(resolve([]).style, "pdf")
+    svg = bar_svg(Chart("bar", ("W1", "W2", "W3"), (78.2, 77.4, 76.9), "kg"), t)
+    texts = _svg_texts(svg)
+    for v in ("78.2", "77.4", "76.9"):
+        assert v in texts
+    assert "0" in texts  # positive data: the value axis starts at zero, like the PPT chart
+    assert len([x for x in texts if x not in ("W1", "W2", "W3", "78.2", "77.4", "76.9")]) >= 5
+
+
+def test_bar_chart_draws_negative_values_below_a_zero_baseline():
+    t = build_theme(resolve([]).style, "pdf")
+    svg = bar_svg(Chart("bar", ("W1", "W2", "W3"), (-0.8, -1.2, 0.3), "kg"), t)
+    texts = _svg_texts(svg)
+    for v in ("-0.8", "-1.2", "0.3"):
+        assert v in texts
+    zero = next(
+        float(a["y1"])
+        for a in (
+            el.attrib
+            for el in ET.fromstring(svg).iter("{http://www.w3.org/2000/svg}line")  # noqa: S314
+        )
+        if a.get("data-zero")
+    )
+    bars = [a for a in _bars(svg) if a.get("fill") == t.primary]
+    assert len(bars) == 3 and all(float(b["height"]) > 0 for b in bars)
+    below = [b for b in bars if abs(float(b["y"]) - zero) < 0.2]  # negative: hangs from zero
+    above = [b for b in bars if abs(float(b["y"]) + float(b["height"]) - zero) < 0.2]
+    assert len(below) == 2 and len(above) == 1
+    plot_top, plot_bottom = 12, 190  # the plot area inside the viewBox
+    assert all(
+        float(b["y"]) >= plot_top and float(b["y"]) + float(b["height"]) <= plot_bottom + 0.1
+        for b in bars
+    )
+
+
 def test_corrupt_image_is_a_block_error_not_a_crash(sample, base):
     noisy = PILImage.effect_noise((640, 360), 64).convert("RGB")
     noisy.save(base / "trend-note.png")
@@ -236,10 +284,6 @@ def test_donut_palette_has_a_single_source():
     t = build_theme(resolve([]).style, "pdf")
     donut = Chart("donut", ("a", "b"), (1.0, 1.0))
     assert all(c in donut_svg(donut, t) for c in theme.donut_colors(t)[:2])
-
-
-def test_page_number_regex_matches_normalised_footer():
-    assert PAGE_NO_RE.search(norm("第 3 页 / 共 12 页"))
 
 
 def test_missing_logo_warns(sample, base):
@@ -316,12 +360,13 @@ class _Doc:
         self.pages = [type("P", (), {"_page_box": _PageBox(b)})() for b in pages]
 
 
-def _cover_boxes(sub_y=260.0, meta_y=800.0):
+def _cover_boxes(sub_y=260.0, who_y=800.0):
     return [
         _Box("section", "cover cover-band", 0, 1000),
         _Box("h1", "", 150, 100),
         _Box("div", "sub", sub_y, 40),
-        _Box("div", "meta", meta_y, 120),
+        _Box("div", "who", who_y, 60),
+        _Box("div", "metaline", who_y + 70, 20),
     ]
 
 
@@ -348,9 +393,9 @@ def test_check_cover_accepts_clean_layout():
     ("doc", "path"),
     [
         (_Doc(_cover_boxes(sub_y=200)), "title"),  # subtitle drawn over the title
-        (_Doc(_cover_boxes(meta_y=950)), "client.facts"),  # meta runs past the page bottom
+        (_Doc(_cover_boxes(who_y=950)), "client.name"),  # client name runs past the bottom
         (_Doc(_cover_boxes(), [_Box("section", "cover cover-band", 0, 80)]), "title"),  # spills
-        (_Doc(_cover_boxes()[:3]), "title"),  # meta pushed off the fixed-height cover entirely
+        (_Doc(_cover_boxes()[:3]), "title"),  # name pushed off the fixed-height cover entirely
     ],
 )
 def test_check_cover_rejects_overlap_and_overflow(doc, path):
@@ -441,3 +486,67 @@ def test_decompression_bomb_image_is_a_block_error(base, sample, kind, huge_png,
     with pytest.raises(RenderError) as exc:
         render_pdf(sample, resolve([], sample).style, base / "x.pdf", base)
     assert exc.value.path.startswith("sections[")
+
+
+def test_pdf_text_roles_use_the_readable_theme_colours(sample, base):
+    html, _ = _html(sample, base)
+    t = build_theme(resolve([], sample).style, "pdf")
+    assert f".tone-out {{ color: {t.out_text}; }}" in html
+    assert f".callout.warn .ct {{ color: {t.out_text}; }}" in html
+    assert f"td.hl {{ color: {t.out_text};" in html
+    assert f"color: {t.on_primary_soft}" in html  # cover labels / subtitle on the colour band
+
+
+def test_pdf_prints_the_material_url_under_its_link(sample, base):
+    html, _ = _html(sample, base)
+    mat = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "material")
+    assert f'<div class="url">{mat["url"]}</div>' in html
+
+
+def test_pdf_newlines_in_list_table_kv_and_card_text_become_line_breaks(sample, base):
+    blocks = [b for s in sample["sections"] for b in s["blocks"]]
+    next(b for b in blocks if b["kind"] == "bullets")["items"][0] = "甲一\n甲二"
+    next(b for b in blocks if b["kind"] == "table")["rows"][0][0] = "乙一\n乙二"
+    next(b for b in blocks if b["kind"] == "kv")["items"][0]["value"] = "丙一\n丙二"
+    next(b for b in blocks if b["kind"] == "summary")["items"][0]["text"] = "丁一\n丁二"
+    html, _ = _html(sample, base)
+    for a, b in (("甲一", "甲二"), ("乙一", "乙二"), ("丙一", "丙二"), ("丁一", "丁二")):
+        assert f"{a}<br>{b}" in html, a
+
+
+def test_failed_resource_url_is_caught_in_either_repr_quote_style():
+    import logging
+
+    from hpr.pdf_html import _Collect
+
+    c = _Collect()
+    for url in ("file:///w/a.png", "file:///w/it's.png"):
+        rec = logging.LogRecord(
+            "weasyprint", logging.ERROR, "x", 1, "Failed to load image at %r: %s", (url, "e"), None
+        )
+        c.emit(rec)
+    assert c.failed == ["file:///w/a.png", "file:///w/it's.png"]
+
+
+def test_primary_text_on_pale_uses_the_readable_text_colour(sample, base):
+    html, _ = _html(sample, base, [Layer("x", {"color.primary": "浅蓝"})])
+    t = build_theme(resolve([Layer("x", {"color.primary": "浅蓝"})], sample).style, "pdf")
+    assert t.primary_text != t.primary
+    assert f"th {{ background: {t.pale}; color: {t.primary_text};" in html
+    assert f".media .mn {{ color: {t.primary_text};" in html
+
+
+def test_pdf_chart_ticks_are_nice_values():
+    from hpr.common import bar_domain, nice_ticks, tick_label
+
+    t = build_theme(resolve([]).style, "pdf")
+    svg = bar_svg(Chart("bar", ("W1", "W2", "W3"), (-0.8, -1.4, 0.3)), t)
+    lo, hi, step = nice_ticks(*bar_domain((-0.8, -1.4, 0.3)))
+    n = round((hi - lo) / step)
+    want = [tick_label(lo + k * step, step) for k in range(n + 1)]
+    texts = _svg_texts(svg)
+    assert all(w in texts for w in want), (want, texts)
+    assert "-0.4" not in texts and "-0.9" not in texts
+    line = line_svg(Chart("line", ("a", "b", "c"), (6.8, 6.5, 6.2), "mmol/L", low=4.4, high=6.1), t)
+    lo, hi, step = nice_ticks(4.4 - 0.36, 6.8 + 0.36)
+    assert tick_label(lo, step) in _svg_texts(line) and tick_label(hi, step) in _svg_texts(line)

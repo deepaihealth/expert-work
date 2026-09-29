@@ -3,12 +3,14 @@ sections onto 16:9 slides (merge short sections, continue long ones under the sa
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from hpr.common import band_columns, column_widths
 from hpr.icons import icon_for_section
 from hpr.images import IMAGE_ERRORS, strict_images
-from hpr.measure import LINE, Measurer
+from hpr.measure import LINE, SAFETY, Measurer
 from hpr.prims import (
     Bullets,
     Callout,
@@ -18,6 +20,7 @@ from hpr.prims import (
     Column,
     Columns,
     Image,
+    InfoBand,
     KeyValue,
     Media,
     Paragraph,
@@ -36,6 +39,7 @@ BODY_TOP = 80.0
 BODY_W = SLIDE_W - 2 * MARGIN_X
 FOOTER_BOTTOM = 526.0
 NEXT_SECTION_MIN_ROOM = 0.35  # start the next section in-page only if >= 35% of the body is left
+BAND_ID = "hpr:client-info"  # the 「客户信息」 band: the first section follows it whenever it fits
 CHART_H = 200.0
 DONUT_H = 180.0
 BAR_H = 10.0
@@ -167,24 +171,16 @@ class TableGeo:
 
 def table_geometry(tbl: Table, w: float, ctx: Ctx) -> TableGeo:
     t, m = ctx.theme, ctx.m
-    n = len(tbl.columns)
 
     def bold_cell(i: int, value: str) -> bool:
         return tbl.highlight_col == i and value not in ("", "—")
 
-    longest = [
-        max(
-            [m.width(tbl.columns[i], t.small, True)]
-            + [m.width(r[i], t.small, bold_cell(i, r[i])) for r in tbl.rows]
-        )
-        for i in range(n)
-    ]
-    total = sum(longest) or 1.0
-    floor_w = w * 0.12
-    raw = [max(floor_w, w * x / total) for x in longest]
-    scale = w / sum(raw)
-    col_w = [x * scale for x in raw]
     pad_x, pad_y = t.gap_s, t.gap_xs + 2
+
+    def need(_i: int, text: str) -> float:  # measured bold: headers and highlights are bold
+        return m.width(text, t.small, True) * SAFETY + 2 * pad_x + 1
+
+    col_w = column_widths(tbl.columns, tbl.rows, w, need)
 
     def row_height(cells: tuple[str, ...], size: float, header: bool) -> float:
         return (
@@ -226,6 +222,49 @@ def kv_geometry(kv: KeyValue, w: float, ctx: Ctx) -> tuple[float, float, list[fl
             + t.gap_s
         )
     return pair_w, label_w, heights
+
+
+# ---------- client-info band ----------
+
+
+@dataclass(frozen=True)
+class BandGeo:
+    cols: int
+    col_w: list[float]
+    label_w: list[float]  # per column; the value takes col_w - label_w - inner
+    inner: float
+    pad: float
+    gap: float
+    row_h: list[float]
+    height: float
+
+
+def band_geometry(band: InfoBand, w: float, ctx: Ctx) -> BandGeo:
+    """Cells on a pale band, each a caption-size label beside its bold value; column count and
+    widths from common.band_columns, so a value never breaks inside a date, number or unit."""
+    t, m = ctx.theme, ctx.m
+    pad, gap, inner = t.gap_m, t.gap_l, t.gap_s
+
+    def label_w(text: str) -> float:
+        return m.width(text, t.caption) * SAFETY + 1
+
+    def value_w(_j: int, text: str) -> float:
+        return m.width(text, t.body, True) * SAFETY + 1
+
+    cols, col_w, labs = band_columns(band.items, w - 2 * pad, gap, label_w, value_w, inner)
+    rows = [band.items[i : i + cols] for i in range(0, len(band.items), cols)]
+    row_h = [
+        max(
+            max(
+                m.lines(k, lab, t.caption) * lh(t.caption),
+                m.lines(v, cw - lab - inner, t.body, True) * lh(t.body),
+            )
+            for (k, v), cw, lab in zip(row, col_w, labs, strict=False)
+        )
+        for row in rows
+    ]
+    height = 2 * pad + sum(row_h) + t.gap_s * (len(rows) - 1)
+    return BandGeo(cols, col_w, labs, inner, pad, gap, row_h, height)
 
 
 # ---------- timeline / columns ----------
@@ -391,6 +430,8 @@ def measure(prim: Prim, w: float, ctx: Ctx) -> float:
             else 0.0
         )
         return h + cap
+    if isinstance(prim, InfoBand):
+        return band_geometry(prim, w, ctx).height
     if isinstance(prim, TimeBars):
         return len(prim.rows) * (lh(t.body) + t.gap_s) + lh(t.caption) + t.gap_s
     raise TypeError(f"unknown primitive {type(prim).__name__}")
@@ -410,12 +451,37 @@ def _fit_count(heights: list[float], gap: float, avail: float) -> int:
     return n
 
 
-def split(prim: Prim, w: float, avail: float, ctx: Ctx) -> tuple[Prim | None, Prim | None]:
-    """Split so that head fits in ``avail``. (None, prim) when nothing fits."""
+MIN_TABLE_ROWS = 2  # a split table keeps at least this many rows on each side
+MIN_PARA_LINES = 3  # a split paragraph keeps at least this many lines on each side
+
+
+def keep_apart(k: int, n: int, least: int, force: bool) -> int:
+    """How many of ``n`` units to put before a break when ``k`` fit: both sides keep at least
+    ``least`` units, else 0 (the element moves whole). ``force`` (the element starts a page and
+    still does not fit) relaxes only what cannot be honoured."""
+    if k >= n:
+        return n
+    if k < 1:
+        return 0
+    kept = min(k, n - least)
+    if kept >= least:
+        return kept
+    if not force:
+        return 0
+    return kept if kept >= 1 else k
+
+
+def split(
+    prim: Prim, w: float, avail: float, ctx: Ctx, *, force: bool = False
+) -> tuple[Prim | None, Prim | None]:
+    """Split so that head fits in ``avail``. (None, prim) when nothing fits, or when a split
+    would leave a stub (see keep_apart); ``force`` accepts a stub rather than no split."""
     t, m = ctx.theme, ctx.m
     if isinstance(prim, Paragraph):
         pad = t.gap_m if prim.boxed else 0.0
-        n = int((avail - 2 * pad) // lh(t.body))
+        fit = int((avail - 2 * pad) // lh(t.body))
+        total = m.lines(prim.text, w - 2 * pad, t.body)
+        n = keep_apart(fit, total, MIN_PARA_LINES, force) if fit >= 1 else 0
         if n < 1:
             return None, prim
         head, tail = m.split_text(prim.text, w - 2 * pad, t.body, n)
@@ -436,6 +502,7 @@ def split(prim: Prim, w: float, avail: float, ctx: Ctx) -> tuple[Prim | None, Pr
     if isinstance(prim, Table):
         geo = table_geometry(prim, w, ctx)
         k = _fit_count(geo.row_h, 0.0, avail - geo.header_h)
+        k = keep_apart(k, len(prim.rows), MIN_TABLE_ROWS, force) if k else 0
         return _cut(prim, "rows", k)
     if isinstance(prim, KeyValue):
         rows = kv_rows(prim)
@@ -509,9 +576,28 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
         pages.append(pg)
         return pg
 
+    def breakable(prim: Prim) -> bool:
+        """May end a page part-way. A card grid is one topic: it splits between rows only
+        when it cannot fit on a page of its own; otherwise it moves whole."""
+        if isinstance(prim, CardGrid):
+            return measure(prim, BODY_W, ctx) > avail_total
+        return splittable(prim)
+
     def min_head(prim: Prim) -> float:
+        """The least of ``prim`` that may end a page: the smallest head split() will actually
+        place (keep_apart keeps the same minimum on the tail), else the whole element."""
         full = measure(prim, BODY_W, ctx)
-        return min(full, 2 * lh(t.body) + 2 * t.gap_m) if splittable(prim) else full
+        if isinstance(prim, Table):
+            if len(prim.rows) < 2 * MIN_TABLE_ROWS:
+                return full
+            geo = table_geometry(prim, BODY_W, ctx)
+            return geo.header_h + sum(geo.row_h[:MIN_TABLE_ROWS])
+        if isinstance(prim, Paragraph):
+            pad = t.gap_m if prim.boxed else 0.0
+            if ctx.m.lines(prim.text, BODY_W - 2 * pad, t.body) < 2 * MIN_PARA_LINES:
+                return full
+            return MIN_PARA_LINES * lh(t.body) + 2 * pad
+        return min(full, 2 * lh(t.body) + 2 * t.gap_m) if breakable(prim) else full
 
     def captioned(i: int, items: list[tuple[Prim, str]]) -> bool:
         """items[i] is a chart followed by its own caption paragraph (same block)."""
@@ -534,7 +620,7 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
             return False
         if measure(prim, BODY_W, ctx) <= room:
             return True
-        return splittable(prim) and split(prim, BODY_W, room, ctx)[0] is not None
+        return breakable(prim) and split(prim, BODY_W, room, ctx)[0] is not None
 
     def lead_fits(items: list[tuple[Prim, str]], room: float) -> bool:
         """The section's first item (a sub-heading together with what follows it) fits in room."""
@@ -543,16 +629,17 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
         first = items[0][0]
         if isinstance(first, SubHeading) and len(items) > 1:
             rest = room - measure(first, BODY_W, ctx) - t.gap_l
-            return head_fits(items[1][0], rest)
-        return head_fits(first, room)
+            return lead_need(1, items) <= rest and head_fits(items[1][0], rest)
+        return lead_need(0, items) <= room and head_fits(first, room)
 
-    for si, (sec, items) in enumerate(sections):
+    lead = sum(1 for sec, _ in sections if sec["id"] == BAND_ID)  # not a caller section
+    for si, (sec, items) in enumerate(sections, start=-lead):
         head = SubHeading(sec["title"])
         head_h = measure(head, BODY_W, ctx)
         if (
             cur is not None
             and cur.placed
-            and bottom - y >= NEXT_SECTION_MIN_ROOM * avail_total
+            and (bottom - y >= NEXT_SECTION_MIN_ROOM * avail_total or cur.section_id == BAND_ID)
             and lead_fits(items, bottom - y - t.gap_l - head_h)
         ):
             y += t.gap_l
@@ -570,6 +657,8 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
                 need = h
                 if isinstance(pending, SubHeading) and idx + 1 < len(items):
                     need = h + t.gap_l + lead_need(idx + 1, items)  # keep heading with what follows
+                    if not head_fits(items[idx + 1][0], bottom - y - h - t.gap_l):
+                        need = math.inf  # split() would place none of it here (a tall first row)
                 elif pending is prim and captioned(idx, items):
                     need = h + t.gap_l + min_head(items[idx + 1][0])  # keep chart with caption
                 at_top = y <= BODY_TOP + 0.01
@@ -578,8 +667,10 @@ def paginate(sections: list[tuple[dict, list[tuple[Prim, str]]]], ctx: Ctx) -> l
                     y += h
                     pending = None
                     continue
-                if splittable(pending):
+                if breakable(pending):
                     head_part, tail = split(pending, BODY_W, bottom - y, ctx)
+                    if head_part is None and at_top:
+                        head_part, tail = split(pending, BODY_W, bottom - y, ctx, force=True)
                     if head_part is None and at_top:
                         raise LayoutError(path, "单个条目超过一页，请把内容拆小")  # noqa: RUF001
                     if head_part is not None:

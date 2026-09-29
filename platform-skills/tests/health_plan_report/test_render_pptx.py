@@ -265,18 +265,14 @@ def _crowded_cover(sample, repeat):
         "第 1 阶段 · 这是一个较长的副标题，用于说明本方案的适用范围与执行周期，"  # noqa: RUF001
         "内容相对较长需要换行显示"
     ) * repeat
-    base = 3 + bool(sample.get("data_basis")) + bool(sample.get("manager"))
-    sample["client"]["facts"] = [
-        {"label": f"项目{i}", "value": f"数值说明{i}"} for i in range(12 - base)
-    ]
     sample["brand"]["logo_path"] = "logo.png"
 
 
-# split keeps the meta grid beside the title panel, so only a much longer subtitle reaches its limit
-@pytest.mark.parametrize(("variant", "repeat"), [("band", 2), ("split", 4), ("minimal", 2)])
-def test_cover_text_colliding_with_meta_is_an_error(workdir, sample, variant, repeat):
+# far beyond any realistic subtitle: the cover reports it instead of overlapping the name
+@pytest.mark.parametrize("variant", ["band", "split", "minimal"])
+def test_cover_text_colliding_with_client_name_is_an_error(workdir, sample, variant):
     PILImage.new("RGB", (300, 120), "#FFFFFF").save(workdir / "logo.png")
-    _crowded_cover(sample, repeat)
+    _crowded_cover(sample, 8)
     layers = [Layer("x", {"cover.variant": variant, "brand.logo_position": "bottom-left"})]
     with pytest.raises(LayoutError) as exc:
         _render(sample, workdir, layers)
@@ -423,7 +419,7 @@ def test_end_slide_long_signature_gets_its_measured_height(workdir, sample):
 def test_partial_failure_removes_this_runs_outputs_so_rerun_works(workdir, monkeypatch, capsys):
     mod = _load_render()
 
-    def broken_pdf(content, style, out_path, base_dir):
+    def broken_pdf(content, style, out_path, base_dir, page_map_out=None):
         out_path.write_bytes(b"%PDF-partial")
         raise LayoutError("brand.disclaimer", "页脚过长")
 
@@ -461,3 +457,254 @@ def test_decompression_bomb_image_is_a_block_error_in_pptx(
     with pytest.raises(RenderError) as exc:
         _render(sample, workdir)
     assert exc.value.path.startswith("sections[")
+
+
+def test_crlf_and_control_characters_in_caller_text_still_pass_pptx_qa(workdir, sample, capsys):
+    blocks = [b for s in sample["sections"] for b in s["blocks"]]
+    next(b for b in blocks if b["kind"] == "paragraph")["text"] = "第一段\r\n第二段\r第三段"
+    next(b for b in blocks if b["kind"] == "callout")["text"] = "第一行\x0b第二行"
+    next(b for b in blocks if b["kind"] == "table")["rows"][0][0] = "A\x0cB"
+    (workdir / "cc.json").write_text(json.dumps(sample, ensure_ascii=False), encoding="utf-8")
+    code = _load_render().main(
+        ["--content", str(workdir / "cc.json"), "--out-dir", str(workdir / "o"), "--basename", "c"]
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert code == 0, summary
+    assert summary["qa"]["pptx"]["missing"] == []
+    corpus = pptx_corpus(workdir / "o" / "c.pptx")
+    assert "_x000" not in corpus
+
+
+def test_missing_texts_counts_occurrences_not_just_presence():
+    assert missing_texts(["多喝水", "多喝水"], "多喝水") == ["多喝水"]
+    assert missing_texts(["多喝水", "多喝水"], "多喝水\x00多喝水") == []
+    # a dropped text hidden inside a longer one is still missing
+    assert missing_texts(["控糖", "晚餐控糖饮食"], "晚餐控糖饮食") == ["控糖"]
+    assert missing_texts(["控糖", "晚餐控糖饮食"], "晚餐控糖饮食·控糖") == []
+
+
+def test_shared_phase_area_texts_all_reach_the_pptx(workdir, sample):
+    ph = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "phases")
+    ph["items"][0]["focus"] = [
+        {"area": "饮食", "text": "控糖"},
+        {"area": "饮食", "text": "晚餐控糖饮食"},
+    ]
+    out, style, _ = _render(sample, workdir, [Layer("x", {"blocks.phases.variant": "table"})])
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa
+
+
+def test_phase_area_shared_by_several_phases_is_one_table_header_not_a_missing_text(
+    workdir, sample
+):
+    ph = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "phases")
+    for it in ph["items"]:
+        it["focus"][0]["area"] = "独有领域"  # appears nowhere else in the plan
+    assert required_texts(sample).count("独有领域") == 1
+    out, style, _ = _render(sample, workdir, [Layer("x", {"blocks.phases.variant": "table"})])
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa
+
+
+def test_bar_trend_axis_in_pptx_uses_the_pdf_domain_and_keeps_zero(workdir, sample):
+    from hpr.common import bar_domain, nice_ticks
+    from pptx.enum.chart import XL_CHART_TYPE
+
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    pts = (("W1", -0.8), ("W2", -1.2), ("W3", 0.3))
+    trend["points"] = [{"date": d, "value": v} for d, v in pts]
+    out, _, _ = _render(sample, workdir, [Layer("x", {"blocks.trend.variant": "bar"})])
+    charts = [
+        sh.chart
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_chart", False) and sh.has_chart
+    ]
+    va = next(c for c in charts if c.chart_type == XL_CHART_TYPE.COLUMN_CLUSTERED).value_axis
+    lo, hi, _ = nice_ticks(*bar_domain((-0.8, -1.2, 0.3)))
+    assert (va.minimum_scale, va.maximum_scale) == pytest.approx((lo, hi))
+    assert va.minimum_scale < -1.2 and va.maximum_scale > 0.3
+
+
+def _run_colours(slide, text):
+    return [
+        str(r.font.color.rgb)
+        for sh in slide.shapes
+        if sh.has_text_frame
+        for p in sh.text_frame.paragraphs
+        for r in p.runs
+        if r.text == text
+    ]
+
+
+@pytest.mark.parametrize("primary", ["#0B4F5C", "蓝"])
+def test_band_cover_labels_are_drawn_readable(workdir, sample, primary):
+    from hpr.style import contrast
+
+    out, style, _ = _render(sample, workdir, [Layer("x", {"color.primary": primary})])
+    t = build_theme(style, "pptx")
+    cover = Presentation(str(out)).slides[0]
+    from hpr.common import cover_meta_line
+
+    labels = ["客户", cover_meta_line(sample)]
+    for label in labels:
+        (hex_,) = _run_colours(cover, label)
+        assert contrast(f"#{hex_}", t.primary) >= 4.5, (label, hex_)
+
+
+def test_out_of_range_tag_and_card_title_are_drawn_readable(workdir, sample):
+    from hpr.style import contrast
+
+    out, style, _ = _render(sample, workdir)
+    t = build_theme(style, "pptx")
+    slides = Presentation(str(out)).slides
+    tags = [c for s in slides for c in _run_colours(s, "高于参考范围")]
+    titles = [c for s in slides for c in _run_colours(s, "空腹血糖")]
+    assert tags and titles
+    for hex_ in tags + titles:
+        assert contrast(f"#{hex_}", t.background) >= 4.5, hex_
+
+
+def test_unexpected_exception_is_a_json_envelope_not_a_traceback(workdir, monkeypatch, capsys):
+    mod = _load_render()
+
+    def boom(*_a, **_k):
+        raise KeyError("意外")
+
+    monkeypatch.setattr(mod, "render_pptx", boom)
+    out = workdir / "out"
+    code = mod.main(
+        ["--content", str(workdir / "plan.json"), "--out-dir", str(out), "--basename", "x"]
+    )
+    summary = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert summary["ok"] is False
+    assert summary["errors"][0].startswith("内部错误：") and "意外" in summary["errors"][0]  # noqa: RUF001
+    assert not list(out.glob("x*"))
+
+
+def test_table_cell_newlines_become_paragraphs_not_a_raw_lf(workdir, sample):
+    tbl = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "table")
+    tbl["rows"][0][0] = "第一行\n第二行"
+    out, style, _ = _render(sample, workdir)
+    cells = [
+        cell
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_table", False) and sh.has_table
+        for row in sh.table.rows
+        for cell in row.cells
+        if "第一行" in cell.text
+    ]
+    (cell,) = cells
+    assert [p.text for p in cell.text_frame.paragraphs] == ["第一行", "第二行"]
+    assert all("\n" not in (t.text or "") for t in cell._tc.iter(qn("a:t")))
+    qa = qa_pptx(out, required_texts(sample), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa
+
+
+def test_line_value_axis_never_collapses_for_small_values(workdir, sample):
+    from pptx.enum.chart import XL_CHART_TYPE
+
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    trend["points"] = [{"date": d, "value": v} for d, v in (("a", 0.001), ("b", 0.003))]
+    for k in ("target_low", "target_high"):
+        trend.pop(k, None)
+    out, _, _ = _render(sample, workdir)
+    va = next(
+        sh.chart.value_axis
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_chart", False)
+        and sh.has_chart
+        and sh.chart.chart_type == XL_CHART_TYPE.LINE_MARKERS
+    )
+    assert va.minimum_scale < 0.001 and va.maximum_scale > 0.003
+
+
+def test_primary_text_on_pale_is_drawn_readable(workdir, sample):
+    from hpr.style import contrast
+
+    out, style, _ = _render(sample, workdir, [Layer("x", {"color.primary": "浅蓝"})])
+    t = build_theme(style, "pptx")
+    slides = Presentation(str(out)).slides
+    tbl = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "table")
+    mat = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "material")
+    header = [
+        str(r.font.color.rgb)
+        for sl in slides
+        for sh in sl.shapes
+        if getattr(sh, "has_table", False) and sh.has_table
+        for cell in sh.table.rows[0].cells
+        for p in cell.text_frame.paragraphs
+        for r in p.runs
+        if r.text == tbl["columns"][0]
+    ]
+    name = [c for s in slides for c in _run_colours(s, mat["name"])]
+    assert header and name
+    for hex_ in header + name:
+        assert contrast(f"#{hex_}", t.pale) >= 4.5, hex_
+
+
+def test_ppt_value_axis_uses_the_shared_nice_ticks(workdir, sample):
+    from hpr.common import bar_domain, nice_ticks
+    from pptx.enum.chart import XL_CHART_TYPE
+
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    pts = (("W1", -0.8), ("W2", -1.4), ("W3", 0.3))
+    trend["points"] = [{"date": d, "value": v} for d, v in pts]
+    out, _, _ = _render(sample, workdir, [Layer("x", {"blocks.trend.variant": "bar"})])
+    va = next(
+        sh.chart.value_axis
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_chart", False)
+        and sh.has_chart
+        and sh.chart.chart_type == XL_CHART_TYPE.COLUMN_CLUSTERED
+    )
+    lo, hi, step = nice_ticks(*bar_domain((-0.8, -1.4, 0.3)))
+    assert (va.minimum_scale, va.maximum_scale, va.major_unit) == pytest.approx((lo, hi, step))
+
+
+def test_negative_bars_are_not_inverted_and_dates_sit_below_the_plot(workdir, sample):
+    """Without an explicit invertIfNegative=0, LibreOffice draws negative columns upward (seen
+    on a rendered deck); category labels at the zero line would sit on the bars."""
+    from pptx.enum.chart import XL_CHART_TYPE, XL_TICK_LABEL_POSITION
+
+    trend = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "trend")
+    pts = (("W1", -0.8), ("W2", -1.2), ("W3", 0.3))
+    trend["points"] = [{"date": d, "value": v} for d, v in pts]
+    out, _, _ = _render(sample, workdir, [Layer("x", {"blocks.trend.variant": "bar"})])
+    ch = next(
+        sh.chart
+        for sl in Presentation(str(out)).slides
+        for sh in sl.shapes
+        if getattr(sh, "has_chart", False)
+        and sh.has_chart
+        and sh.chart.chart_type == XL_CHART_TYPE.COLUMN_CLUSTERED
+    )
+    ser = ch.plots[0].series[0]
+    inv = ser._element.find(qn("c:invertIfNegative"))
+    assert inv is not None and inv.get("val") == "0"
+    assert ch.category_axis.tick_label_position == XL_TICK_LABEL_POSITION.LOW
+
+
+def test_counting_gate_is_not_fooled_by_text_straddling_two_cells():
+    corpus = "空腹血糖偏高血压偏高其他高血压"  # 偏高|血压 spells 高血压 across a cell boundary
+    assert missing_texts(["空腹血糖", "偏高", "血压", "偏高", "高血压"], corpus) == []
+
+
+def _straddle_plan(sample):
+    mon = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "table")
+    mon["columns"] = ["指标", "状态"]
+    mon["rows"] = [["空腹血糖", "偏高"], ["血压", "偏高"]]
+    para = next(b for s in sample["sections"] for b in s["blocks"] if b["kind"] == "paragraph")
+    para["text"] = "高血压"
+    return sample
+
+
+def test_straddling_table_cells_pass_pptx_qa(workdir, sample):
+    plan = _straddle_plan(sample)
+    out, style, _ = _render(plan, workdir)
+    qa = qa_pptx(out, required_texts(plan), build_theme(style, "pptx"), M)
+    assert qa["status"] == "passed", qa
