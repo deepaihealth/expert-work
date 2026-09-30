@@ -229,3 +229,29 @@ async def test_reflect_revise_does_not_complete_steps_before_the_real_end() -> N
     second_prompt = "\n".join(str(m.content) for m in agent_llm.seen[1])
     assert "[~] 2." in second_prompt
     assert _statuses(state["plan"]) == ["completed", "completed", "completed"]
+
+
+# ---------------------------------------------------------------- CI round 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan", [None, _plan("completed", "completed")])
+async def test_injected_agent_message_leaves_a_clean_turn_end(plan: Plan | None) -> None:
+    """定时任务投递 / 重新生成用 ``aupdate_state(as_node="agent")`` 补一条消息;
+    计划没有要收尾的步骤时图必须直接结束,不能停在「plan_close 待跑」。"""
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=_LLM(AIMessage(content="x")), tool_registry=ToolRegistry())
+        )
+        cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
+        await compiled.aupdate_state(
+            cfg,
+            {
+                "messages": [HumanMessage(content="hi"), AIMessage(content="delivered")],
+                "plan": plan,
+                "exit_reason": "text_response",
+            },
+            as_node="agent",
+        )
+        snap = await compiled.aget_state(cfg)
+    assert snap.next == ()
