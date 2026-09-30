@@ -48,10 +48,10 @@ C 的依据:Anthropic context editing、JetBrains《The Complexity Trap》(有�
 
 ### 2.4 "可重新查询名单"怎么来
 
-- **内置工具**:`ToolSpec.is_read_only is True` 的(`read_file` / `list_dir` / `search_files` / `read_document` / `read_page` / `skill_view` / `knowledge_search` / `web_search` …)。
+- **内置工具**:`ToolSpec.is_read_only is True` 的(`read_file` / `list_dir` / `search_files` / `read_document` / `skill_view` / `knowledge_search` / `web_search` …)。`read_page` 不在其中:它会把整页写进 `.tool_results/`,`is_read_only=False`(`read_page.py` 约 1187 行)。
 - **MCP 工具**:服务器 `list_tools` 标注 `readOnlyHint: true` 的(B-122 已读取这个标注;ai-health-plan 现有的 9 个 MCP 工具全部标了只读(09-27 B-122 验收时 11 个 `kept=11 dropped_write=0`,09-29 删了 2 个))。没标或标 `false` 的一律不算。
 - **排除**:只有 `ask_image`(已在 `_NEVER_PRUNE_TOOLS`,看图结论不清,不变)。
-- **`web_search` 在名单里**(用户 09-29 拍板):重查拿到的是最新结果,这正是它该有的行为;内置后端是自建 SearXNG,重查不产生费用;要回看之前某条结果对应的网页,历史里留着链接,可直接 `read_page`。初稿曾以"结果会变 + 有费用"排除它,费用一条核实为错。
+- **`web_search` 在名单里**(用户 09-29 拍板):重查拿到的是最新结果,这正是它该有的行为;内置后端是自建 SearXNG,重查不产生费用。注意:提示收起的是**整条结果,链接一并收掉**;历史里只留下模型自己在回复里转述过的链接,重新搜索拿到的是当前结果。初稿曾以"结果会变 + 有费用"排除它,费用一条核实为错。
 - **不改 `ToolSpec.is_read_only`**:它还决定失败自动重试(`error_classifier`)与并行调度(`scheduling`),把 MCP 工具标成只读会顺带改这两处行为。名单在构建 Agent 时单独算出来,传给 `ToolResultPruner`。
 
 ### 2.5 收起后的样子
@@ -99,6 +99,15 @@ Read-only lookup: call the same tool again with the same arguments to get the da
 - span 属性:`cm.cross_turn.requery_stubbed`(本次收成再查提示的条数)。
 - 计数器:`expert_work_cm_requery_stub_total`(按工具名不打标签,避免基数问题)。
 - 验收时另从检查点统计"被收起的工具又被重新调用"的次数(不上线为指标)。
+
+### 2.10 变量绑定的工具
+
+B-61 的变量绑定按**本轮**输入填参数,这些参数不在模型可见的调用参数里。换一轮、输入指向另一个对象时,"用同样参数再调一次"查到的会是另一个对象的数据。所以:
+
+- 派发时对这个工具的**变量绑定**取到的值算一个指纹(规范化 JSON 的 sha256),记在该条结果的 `artifact` 上(与持久化路径等已有字段合并,不覆盖;`artifact` 不发给模型)。
+- 新一轮开头按本轮输入算同一个指纹:**相等才收成再查提示**;结果上没有记录、或不相等 → 原样不动。
+- 只有固定值(B-127)的工具不受影响(固定值每轮都一样);有存盘副本的结果照常走无损引用(副本就是当时的原始数据)。
+- 只存哈希,原值既不存也不写日志(那是客户资料)。一个 run 内输入不变,指纹表每次调用都一样,前缀缓存不受影响。
 
 ## 3. 不做什么
 
