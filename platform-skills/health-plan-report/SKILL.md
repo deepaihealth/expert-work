@@ -22,6 +22,17 @@ expert_work:
 - 工作目录 /workspace；脚本在 $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/。
 - 成品必须用 save_artifact 登记，否则用户拿不到。
 
+## 改稿速查（已经出过稿、用户要改时用）
+
+不必重读全文，也不要为了确认用法先列目录、翻参考文件或不带参数试跑脚本。按下面四步走，每一步用一次回复完成：
+
+1. **改**：只改视觉 → 写一个新的本次样式层 JSON；改内容 → 改 `{FN}.json` 并在同一次回复里跑 `validate.py {FN}.json`。
+   字段拿不准才去看 `reference/content-schema.md`。
+2. **渲染**：用下面「流程」第 3 步的完整命令，换一个新的 basename。
+3. **看图**：按输出的 `page_map` 找刚改的章节页。一次回复里 `read_page`（最多 3 页）；下一次回复里把这几页的
+   `ask_image` **一起发出**（每页一个调用，同一次回复里并行）。
+4. **保存并回复**：要交付的文件在**同一次回复里一起** `save_artifact`（每个文件一个调用，并行），然后回复用户。
+
 ## 流程
 
 1. 按 `reference/content-schema.md` 写内容 JSON（例：`{FN}.json`），校验：
@@ -36,7 +47,7 @@ expert_work:
    - `ok` 为 true：`files` 是产物路径，看第 5 步。
    - `ok` 为 false：`errors` 非空是内容/参数错误（按提示改后**可以用原 basename 重跑**，失败时本次产生的文件已被清理）；
      `errors` 为空而 `qa` 里某项 `status` 不是 `passed`，是质检没过（缺字、溢出、越界、对比度不够），产物已改名为 `{FN}.qa-failed.pptx/pdf` 供你排查，改内容或参数、**换新 basename** 重新渲染。
-5. 按下面「检查成品」看图；没问题再 save_artifact（kind=document），登记的是 `files` 里的路径。
+5. 按下面「检查成品」看图；没问题再 save_artifact（kind=document），登记的是 `files` 里的路径；要交付多个文件时在同一次回复里一起登记。
 6. 回复用户时，把输出里的 `not_applied`（没生效的参数及原因）与 `warnings`（LOGO 缺失、视频改链接等）如实告知。
 
 ## 内容 JSON
@@ -67,7 +78,7 @@ expert_work:
 1. 渲染输出 `ok: true` 表示机器质检通过（字全在、不溢出、不越界、对比度够）。
 2. 再看图：输出里的 `page_map` 列出封面、客户信息和每个章节在哪几页，按它挑页，不要猜页号——首次出稿看封面和
    内容最多的章节，改稿后看刚改的章节。`read_page(path={FN}.pptx, units=[页号…])`（一次最多 3 页），然后
-   `ask_image(path={FN}.pptx, unit=同一页号, question=...)` 看中文是否正常、有无重叠、是否美观。
+   `ask_image(path={FN}.pptx, unit=同一页号, question=...)` 看中文是否正常、有无重叠、是否美观；要看几页就在同一次回复里并行发几个 `ask_image`。
    必须先 read_page 再 ask_image。Agent 没有看图能力时跳过，并在回复里写明「未做视觉检查」。
 3. 发现问题只调样式参数或内容后重新渲染（用新的 basename），不要改脚本。
 
