@@ -70,10 +70,20 @@ def _pruner() -> ToolResultPruner:
 
 
 async def _invoke(llm: _RecordingLLM, history: list[BaseMessage], thread: str, **state: object):
+    return await _invoke_with(llm, history, thread, _pruner(), **state)
+
+
+async def _invoke_with(
+    llm: _RecordingLLM,
+    history: list[BaseMessage],
+    thread: str,
+    pruner: ToolResultPruner,
+    **state: object,
+):
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(
             build_react_graph(
-                llm_caller=llm, tool_registry=ToolRegistry(), tool_result_pruner=_pruner()
+                llm_caller=llm, tool_registry=ToolRegistry(), tool_result_pruner=pruner
             )
         )
         cfg: RunnableConfig = {"configurable": {"thread_id": thread}}
@@ -163,3 +173,31 @@ async def test_current_turn_tool_result_survives_the_max_steps_wrapup_tail_injec
     assert old_results and all(
         str(m.content).startswith("<tool-result-pruned>") for m in old_results
     )
+
+
+# --------------------------------------------------------------------- B-129
+
+
+@pytest.mark.asyncio
+async def test_requery_stub_reaches_the_llm_and_checkpoint_is_intact() -> None:
+    history: list[BaseMessage] = [HumanMessage(content="user a")]
+    for i in range(3):
+        cid = f"a-{i}"
+        history += [
+            AIMessage(content="", tool_calls=[{"id": cid, "name": "mcp_x", "args": {"k": cid}}]),
+            ToolMessage(content="r" * 8000 + f"#{i}", tool_call_id=cid, name="mcp_x"),
+        ]
+    history += [AIMessage(content="answer a"), HumanMessage(content="now")]
+    llm = _RecordingLLM()
+    pruner = ToolResultPruner(
+        context_window=10**9,
+        recent_tool_results_kept=1,
+        min_context_tokens=100,
+        min_reclaim_tokens=100,
+        requery_tools=frozenset({"mcp_x"}),
+    )
+    state = await _invoke_with(llm, history, str(uuid4()), pruner)
+    prompt_tools = [m for m in llm.seen[0] if isinstance(m, ToolMessage)]
+    assert sum("call the same tool again" in str(m.content) for m in prompt_tools) == 2
+    saved = [m for m in state["messages"] if isinstance(m, ToolMessage)]
+    assert all(str(m.content).startswith("r" * 100) for m in saved)

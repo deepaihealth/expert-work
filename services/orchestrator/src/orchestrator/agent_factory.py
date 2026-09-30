@@ -148,6 +148,7 @@ from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.manage_task import ManageTaskTool
 from orchestrator.tools.overflow import tool_output_budget_enabled
 from orchestrator.tools.registry import ToolContext, ToolRegistry
+from orchestrator.tools.requery import requery_tool_names
 from orchestrator.tools.sandbox import EgressContext, SandboxRuntime, bind_agent_key, bind_egress
 from orchestrator.tools.skill_authoring import (
     SKILL_AUTHORING_BUILTINS,
@@ -1049,6 +1050,7 @@ async def build_agent(
             min_context_tokens=trp_policy.min_context_tokens,
             min_reclaim_tokens=trp_policy.min_reclaim_tokens,
             absolute_cap_tokens=trp_policy.absolute_cap_tokens,
+            requery=trp_policy.requery,
         )
     # ``loaded_skills`` was resolved above (before the tool registry) so the
     # sandbox tools could be bound with the skill seed-file set.
@@ -1228,6 +1230,10 @@ async def build_agent(
             strict=spec.spec.output_schema.strict,
             fence_nonce=spotlight_nonce or uuid4().hex[:12],
         )
+    # B-129 —— 名单要在所有工具注册完之后算(skill_view / 技能编写工具 / manage_task 都注册在
+    # 上面的清理器构造之后)。
+    if tool_result_pruner is not None:
+        tool_result_pruner = replace(tool_result_pruner, requery_tools=requery_tool_names(registry))
     graph = build_react_graph(
         llm_caller=routers.default,
         escalated_llm_caller=escalated_llm_caller,  # CM-9 — None → no escalation

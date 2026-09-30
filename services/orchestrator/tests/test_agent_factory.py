@@ -9,7 +9,11 @@ from typing import Any
 import pytest
 from langgraph.graph.state import CompiledStateGraph
 
-from expert_work.persistence import InMemoryKnowledgeStore, InMemoryMemoryStore
+from expert_work.persistence import (
+    InMemoryArtifactStore,
+    InMemoryKnowledgeStore,
+    InMemoryMemoryStore,
+)
 from expert_work.protocol import (
     AgentSpec,
     ArgBindingSpec,
@@ -2093,6 +2097,47 @@ async def test_tool_result_pruner_threads_trp_policy_fields(monkeypatch: Any) ->
     assert pruner.cross_turn is True
     assert pruner.min_context_tokens == 30_000
     assert pruner.absolute_cap_tokens == 200_000
+
+
+# ---------------------------------------------------------------------------
+# B-129 — the factory computes the re-queryable tool list only after every
+# tool is registered and threads it (plus the policy's ``requery`` switch)
+# into the ``ToolResultPruner`` it hands ``build_react_graph``.
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_result_pruner_gets_requery_tool_list(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    from orchestrator.agent_factory import build_react_graph as real
+    from orchestrator.tools.requery import requery_tool_names
+
+    def _spy(**kwargs: Any) -> Any:
+        captured["pruner"] = kwargs.get("tool_result_pruner")
+        captured["registry"] = kwargs.get("tool_registry")
+        return real(**kwargs)
+
+    monkeypatch.setattr("orchestrator.agent_factory.build_react_graph", _spy)
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["policies"] = {"tool_result_prune": {"requery": False}}
+    # _MINIMAL_SPEC declares no tools at all -> requery_tool_names would be
+    # empty and the equality assertion below couldn't catch a missing
+    # replace() block. Add one read-only builtin so the list is non-empty.
+    doc["spec"]["tools"] = [{"type": "builtin", "name": "list_artifacts"}]
+    spec = AgentSpec.model_validate(doc)
+    tool_env = ToolEnv(artifact_store=InMemoryArtifactStore())
+    async with make_checkpointer("memory") as cp:
+        await _build(
+            spec,
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            platform_tool_budget_enabled=True,
+            tool_env=tool_env,
+        )
+    pruner = captured["pruner"]
+    expected = requery_tool_names(captured["registry"])
+    assert expected  # 名单非空,否则下面的相等断言咬不住「没补名单」
+    assert pruner.requery_tools == expected
+    assert pruner.requery is False
 
 
 # ---------------------------------------------------------------------------

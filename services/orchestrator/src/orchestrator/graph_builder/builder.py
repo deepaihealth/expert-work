@@ -354,6 +354,11 @@ _cm_cross_turn_reclaimed_tokens = expert_work_counter(
     "Estimated prompt tokens not sent thanks to the cross-turn tool-result prune "
     "(B-126), summed over model calls (a turn with N calls counts N times).",
 )
+#: B-129 —— 收成「再调一次」提示的旧结果条数,按模型调用累加(不按工具名打标签)。
+_cm_requery_stub_total = expert_work_counter(
+    "expert_work_cm_requery_stub_total",
+    "Old read-only tool results collapsed to a call-again stub (B-129), summed over model calls.",
+)
 #: Stream CM-3 — pre-compaction flush passes by outcome. ``flushed`` =
 #: memories written from the discarded middle; ``empty`` = nothing
 #: extracted (or a swallowed best-effort failure — see memory.flush logs).
@@ -734,6 +739,9 @@ def build_react_graph(
                     _cm_cross_turn_reclaimed_tokens.inc(pruned.reclaimed_tokens)
                 gates_span.set_attribute("cm.tool_result_prune.count", pruned.pruned_count)
                 gates_span.set_attribute("cm.cross_turn.reclaimed_tokens", pruned.reclaimed_tokens)
+                gates_span.set_attribute("cm.cross_turn.requery_stubbed", pruned.requery_count)
+                if pruned.requery_count:
+                    _cm_requery_stub_total.inc(pruned.requery_count)
             # Stream CM-2 — working-memory sliding window: cheap LLM-free first
             # gate. Trims the raw history to first turn + most-recent N turns
             # when over threshold (on HumanMessage boundaries, so tool-call
