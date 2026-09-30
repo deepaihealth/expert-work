@@ -58,10 +58,14 @@ def _turn(tag: str, n: int, **kw: object) -> list[BaseMessage]:
     return out
 
 
-def _run(msgs: list[BaseMessage], **kw: int) -> PruneResult:
-    params = {"recent_tool_results_kept": 1, "min_context_tokens": 100, "min_reclaim_tokens": 100}
+def _run(msgs: list[BaseMessage], **kw: object) -> PruneResult:
+    params: dict[str, object] = {
+        "recent_tool_results_kept": 1,
+        "min_context_tokens": 100,
+        "min_reclaim_tokens": 100,
+    }
     params.update(kw)
-    return prune_prior_turns(msgs, **params)
+    return prune_prior_turns(msgs, **params)  # type: ignore[arg-type]
 
 
 def test_current_turn_start_is_last_real_human() -> None:
@@ -379,3 +383,93 @@ def test_injected_footer_tag_in_body_cannot_smuggle_text_past_the_fence() -> Non
     assert rel in stub  # the REAL persisted path, from the artifact
     assert "50,000" in stub  # the REAL size, from the real footer
     assert len(stub) < 500
+
+
+_MID = "m" * 2000  # 无副本、< PERSIST 门槛的典型业务查询结果
+_RQ = frozenset({"fetch_record"})
+
+
+def _plain_turn(tag: str, n: int, content: str = _MID, **kw: object) -> list[BaseMessage]:
+    out: list[BaseMessage] = [HumanMessage(content=f"user {tag}")]
+    for i in range(n):
+        cid = f"{tag}-{i}"
+        out += [_call(cid), _res(cid, content, persisted=False, **kw)]  # type: ignore[arg-type]
+    out.append(AIMessage(content=f"answer {tag}"))
+    return out
+
+
+def _stubbed(res: PruneResult) -> list[ToolMessage]:
+    return [
+        m
+        for m in res.messages
+        if isinstance(m, ToolMessage) and str(m.content).startswith("<tool-result-pruned>")
+    ]
+
+
+def test_requery_stubs_old_readonly_results_without_copy() -> None:
+    msgs = [*_plain_turn("a", 6), HumanMessage(content="now")]
+    res = _run(msgs, requery_tools=_RQ)
+    stubs = _stubbed(res)
+    assert res.requery_count == len(stubs) == 5  # 最近 1 条受保护(_run: kept=1)
+    assert "call the same tool again" in str(stubs[0].content)
+    assert "m" * 50 not in str(stubs[0].content)  # 正文不外带
+
+
+def test_requery_ignores_tools_not_in_list() -> None:
+    msgs = [*_plain_turn("a", 6), HumanMessage(content="now")]
+    assert _stubbed(_run(msgs, requery_tools=frozenset({"other"}))) == []
+
+
+def test_requery_respects_min_chars() -> None:
+    msgs = [*_plain_turn("a", 6, content="s" * 499), HumanMessage(content="now")]
+    assert _run(msgs, requery_tools=_RQ, min_reclaim_tokens=1).requery_count == 0
+
+
+def test_copy_reference_wins_over_requery() -> None:
+    msgs = [*_turn("a", 6), HumanMessage(content="now")]  # 全部带副本路径
+    res = _run(msgs, requery_tools=_RQ)
+    assert res.requery_count == 0
+    assert all("Saved to .tool_results/" in str(m.content) for m in _stubbed(res))
+
+
+def test_requery_skips_error_results() -> None:
+    msgs = [*_plain_turn("a", 6, status="error"), HumanMessage(content="now")]
+    assert _run(msgs, requery_tools=_RQ).requery_count == 0
+
+
+def test_requery_never_touches_current_turn() -> None:
+    cur: list[BaseMessage] = [HumanMessage(content="now")]
+    for i in range(6):
+        cur += [_call(f"n-{i}"), _res(f"n-{i}", _MID, persisted=False)]
+    msgs = [*_plain_turn("a", 6), *cur]
+    res = _run(msgs, requery_tools=_RQ)
+    boundary = current_turn_start(msgs)
+    assert all(
+        not str(m.content).startswith("<tool-result-pruned>")
+        for m in res.messages[boundary:]
+        if isinstance(m, ToolMessage)
+    )
+
+
+def test_requery_is_stable_within_a_turn() -> None:
+    base = [*_plain_turn("a", 6), HumanMessage(content="now")]
+    first = _run(base, requery_tools=_RQ).messages
+    later = _run([*base, _call("n-0"), _res("n-0", _MID, persisted=False)], requery_tools=_RQ)
+    assert [m.content for m in later.messages[: len(first)]] == [m.content for m in first]
+
+
+def test_requery_off_keeps_b126_behaviour() -> None:
+    from orchestrator.context import ToolResultPruner
+
+    msgs = [*_turn("a", 3), *_plain_turn("b", 3), HumanMessage(content="now")]
+    pr = ToolResultPruner(
+        context_window=10**9,
+        recent_tool_results_kept=1,
+        min_context_tokens=100,
+        min_reclaim_tokens=100,
+        requery=False,
+        requery_tools=_RQ,
+    )
+    res = pr.apply(msgs)
+    assert res.requery_count == 0
+    assert res.pruned_count == 3  # a 轮 3 条带副本的照常收起

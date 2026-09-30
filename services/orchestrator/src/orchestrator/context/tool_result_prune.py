@@ -104,6 +104,8 @@ class PruneResult:
     pruned_count: int
     #: B-126 —— 本次跨轮清理估算省下的 token(观测用;非跨轮路径为 0)。
     reclaimed_tokens: int = 0
+    #: B-129 —— 其中收成「再调一次」提示的条数(观测用)。
+    requery_count: int = 0
 
 
 def _is_already_pruned(content: str) -> bool:
@@ -319,6 +321,9 @@ def prune_old_tool_results(
 
 _ARGS_HINT_LIMIT = 120
 
+#: B-129 —— 可重新查询的结果至少多长才收(提示本身约 200~300 字,更短的几乎不省)。
+REQUERY_MIN_CHARS = 500
+
 
 def current_turn_start(messages: Sequence[BaseMessage]) -> int:
     """B-126 —— 本轮起点 = 最后一条**真实**用户消息的下标;没有则 0。
@@ -388,6 +393,22 @@ def _cross_turn_stub(
     )
 
 
+def _requery_stub(message: ToolMessage, *, args: Mapping[str, Any] | None) -> str:
+    """B-129 —— 只读、可重新查询的旧结果的提示:只含工具名、参数提示、字数,不外带正文。"""
+    content = message.content
+    size = len(content) if isinstance(content, str) else 0
+    head = f"[{message.name or 'tool'}]"
+    if args:
+        head += f" {_args_hint(args)}"
+    return (
+        f"{_PRUNE_TAG_OPEN}\n"
+        f"{head} — {size:,} chars from an earlier turn, elided.\n"
+        "Read-only lookup: call the same tool again with the same arguments as that earlier "
+        "call to get the data back (it returns current data, which may have changed since).\n"
+        f"{_PRUNE_TAG_CLOSE}"
+    )
+
+
 def prune_prior_turns(
     messages: Sequence[BaseMessage],
     *,
@@ -395,6 +416,8 @@ def prune_prior_turns(
     min_context_tokens: int,
     min_reclaim_tokens: int,
     estimator: TokenEstimator | None = None,
+    requery_tools: frozenset[str] = frozenset(),
+    requery_min_chars: int = REQUERY_MIN_CHARS,
 ) -> PruneResult:
     """B-126 —— 新一轮开头无损收起更早轮次的大块工具结果。
 
@@ -407,6 +430,10 @@ def prune_prior_turns(
     整段排除在 ``prior_tool_idxs`` 之外:既不占 ``recent_tool_results_kept`` 的保护名
     额(保护一条永不清理的消息是浪费,会挤掉本该保护的真候选),也不进去重表 —— 但
     它的原文仍计入上面 ``min_context_tokens`` 的整段估算(它是真实占用的上下文)。
+
+    B-129 —— 没有无损引用、但工具在 ``requery_tools`` 里且正文 ≥
+    ``requery_min_chars`` 的结果,收成「再调一次」提示(不外带正文)。优先级:
+    无损引用 > 再查 > 不动。
     """
     msgs = list(messages)
     boundary = current_turn_start(msgs)
@@ -437,6 +464,7 @@ def prune_prior_turns(
 
     replacements: dict[int, ToolMessage] = {}
     reclaimed = 0
+    requery_count = 0
     for i in prior_tool_idxs:
         m = msgs[i]
         if not isinstance(m, ToolMessage):
@@ -450,9 +478,15 @@ def prune_prior_turns(
         if i in protected and not is_duplicate:
             continue
         reference = _lossless_reference(m)
-        if reference is None:
+        args = args_by_call.get(m.tool_call_id)
+        if reference is not None:
+            stub = _cross_turn_stub(m, args=args, reference=reference)
+            is_requery = False
+        elif m.name in requery_tools and len(content) >= requery_min_chars:
+            stub = _requery_stub(m, args=args)
+            is_requery = True
+        else:
             continue
-        stub = _cross_turn_stub(m, args=args_by_call.get(m.tool_call_id), reference=reference)
         new = _rebuild(m, stub)
         saved = estimate_tokens([m], estimator=estimator) - estimate_tokens(
             [new], estimator=estimator
@@ -461,11 +495,17 @@ def prune_prior_turns(
             continue
         replacements[i] = new
         reclaimed += saved
+        requery_count += is_requery
 
     if not replacements or reclaimed < min_reclaim_tokens:
         return PruneResult(messages=msgs, pruned_count=0)
     out = [replacements.get(i, m) for i, m in enumerate(msgs)]
-    return PruneResult(messages=out, pruned_count=len(replacements), reclaimed_tokens=reclaimed)
+    return PruneResult(
+        messages=out,
+        pruned_count=len(replacements),
+        reclaimed_tokens=reclaimed,
+        requery_count=requery_count,
+    )
 
 
 @dataclass(frozen=True)
@@ -490,6 +530,9 @@ class ToolResultPruner:
     min_context_tokens: int = 30_000
     min_reclaim_tokens: int = 5_000
     absolute_cap_tokens: int = 200_000
+    #: B-129 —— 配置开关(``policies.tool_result_prune.requery``)与可重新查询的工具名单。
+    requery: bool = True
+    requery_tools: frozenset[str] = frozenset()
 
     @property
     def threshold_tokens(self) -> int:
@@ -504,6 +547,7 @@ class ToolResultPruner:
         msgs = list(messages)
         pruned = 0
         reclaimed = 0
+        requery = 0
         if self.cross_turn:
             cross = prune_prior_turns(
                 msgs,
@@ -511,15 +555,22 @@ class ToolResultPruner:
                 min_context_tokens=self.min_context_tokens,
                 min_reclaim_tokens=self.min_reclaim_tokens,
                 estimator=self.estimator,
+                requery_tools=self.requery_tools if self.requery else frozenset(),
             )
             msgs, pruned, reclaimed = cross.messages, cross.pruned_count, cross.reclaimed_tokens
+            requery = cross.requery_count
             if pruned:
                 # Recomputed identically on every call of a turn — DEBUG, not INFO.
                 logger.debug(
                     "tool_result_prune.cross_turn count=%d reclaimed_tokens=%d", pruned, reclaimed
                 )
         if not self.should_prune(msgs):
-            return PruneResult(messages=msgs, pruned_count=pruned, reclaimed_tokens=reclaimed)
+            return PruneResult(
+                messages=msgs,
+                pruned_count=pruned,
+                reclaimed_tokens=reclaimed,
+                requery_count=requery,
+            )
         result = prune_old_tool_results(
             msgs, recent_tool_results_kept=self.recent_tool_results_kept
         )
@@ -533,4 +584,5 @@ class ToolResultPruner:
             messages=result.messages,
             pruned_count=pruned + result.pruned_count,
             reclaimed_tokens=reclaimed,
+            requery_count=requery,
         )
