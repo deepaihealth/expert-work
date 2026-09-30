@@ -277,6 +277,27 @@ def test_temperature_fixed_declared_only_where_documented() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_glm_53_flashx_mirrors_flash() -> None:
+    """glm-5.3-flashx (bigmodel, 2026-09-18): same model as glm-5.3-flash —
+    one docs page "GLM-5.3-Flash/FlashX" — served faster (~200 vs ~49
+    tokens/s) at 2.5x the price. Every capability bit must match flash."""
+    flash = _e("glm", "glm-5.3-flash")
+    flashx = _e("glm", "glm-5.3-flashx")
+    for attr in (
+        "vision",
+        "context_window",
+        "thinking",
+        "thinking_default",
+        "always_thinking",
+        "output_cap_field",
+        "max_output_tokens",
+        "effort_map",
+        "deprecated",
+    ):
+        assert getattr(flashx, attr) == getattr(flash, attr), attr
+    assert "glm-5.3-flashx" in {e.name for e in models_for_provider("glm")}
+
+
 def _e(provider: str, name: str) -> ModelEntry:
     entry = catalog_entry(provider, name)
     assert entry is not None, name

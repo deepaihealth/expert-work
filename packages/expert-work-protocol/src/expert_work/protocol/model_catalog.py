@@ -271,6 +271,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # param; Kimi's ``thinking.keep`` is the same concept) is deliberately
     # NOT sent — enabling it requires replaying prior reasoning content
     # verbatim, which our multi-turn replay does not do (backlog with B-30).
+    # glm-5.3-flashx (2026-09-18) is the same model served faster, see entry.
     # glm-5.1 (200K), glm-4.7 (355B MoE, 200K)
     # and glm-4.6 (200K) are current text models, on/off only. Vision goes
     # through glm-5v-turbo (multimodal Agent/coding base, 200K, thinking.type
@@ -292,6 +293,20 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ),
         ModelEntry(
             name="glm-5.3-flash",
+            vision=True,
+            context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
+            always_thinking=True,
+            output_cap_field="max_tokens",
+            max_output_tokens=131_072,
+            effort_map={"medium": "high"},
+        ),
+        ModelEntry(
+            # 2026-09-18: same model as 5.3-flash (one docs page
+            # "GLM-5.3-Flash/FlashX"), served at ~200 vs ~49 tokens/s for 2.5x
+            # the price — every capability bit is flash's.
+            name="glm-5.3-flashx",
             vision=True,
             context_window=1_000_000,
             thinking="effort",
