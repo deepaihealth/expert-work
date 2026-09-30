@@ -14,7 +14,7 @@ the between-gate payloads so any reorder fails loudly.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -56,7 +56,13 @@ class _TracingPruner:
     order: list[str]
     seen: list[list[BaseMessage]] = field(default_factory=list)
 
-    def apply(self, messages: Sequence[BaseMessage]) -> PruneResult:
+    def apply(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        requery_current_fingerprints: Mapping[str, str | None] | None = None,
+    ) -> PruneResult:
+        del requery_current_fingerprints
         self.order.append("pruner")
         self.seen.append(list(messages))
         return PruneResult(
