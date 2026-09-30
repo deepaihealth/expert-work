@@ -1448,11 +1448,6 @@ def build_react_graph(
             # 盖了会把中间态当终局读。
             if mw_exit_reason is not None:
                 update_mw["exit_reason"] = mw_exit_reason
-            # B-131 —— 自然答完时把仍「进行中」的步骤标为完成(模型不必单独调一次打勾)。
-            if mw_exit_reason == "text_response":
-                completed_plan = complete_in_progress_steps(state.get("plan"))
-                if completed_plan is not None:
-                    update_mw["plan"] = completed_plan
             # B-35 — only a plan_first build ever writes the dispatch
             # channels (off = state shape untouched).
             if plan_first:
@@ -1490,11 +1485,6 @@ def build_react_graph(
         # B-85 ③ —— 同 ``update_mw`` 那一处:只在真的走到出口时写。
         if plain_exit_reason is not None:
             update_plain["exit_reason"] = plain_exit_reason
-        # B-131 —— 同 ``update_mw`` 那一处。
-        if plain_exit_reason == "text_response":
-            completed_plan = complete_in_progress_steps(state.get("plan"))
-            if completed_plan is not None:
-                update_plain["plan"] = completed_plan
         # B-35 — only a plan_first build ever writes the dispatch channels.
         if plan_first:
             update_plain["plan_first_dispatch_active"] = dispatch_active
@@ -1989,6 +1979,37 @@ def build_react_graph(
             result_dict["last_projection_hash"] = projection.digest
         return result_dict
 
+    async def plan_close_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        """B-131 —— 本轮真正结束时,把计划里仍「进行中」的步骤标为完成,并同步 PLAN.md。
+
+        只挂在「自然答完」的出口上(agent 无 tool_calls 且不再回 agent;有复查时是复查
+        通过之后):派发打回、复查要求返工都回到 agent,不经过这里;审批暂停 / 拒绝走
+        tools → END,也不经过这里。步数 / 预算耗尽的收尾同样到这里,但 ``exit_reason``
+        不是 ``text_response``,原样放过。标完成后立刻投影一次 PLAN.md:投影平时只在
+        tools_node 里做,不补这一次的话,下一轮 workspace_ingest 读回的旧文件会被当成
+        人工修改,把步骤改回「进行中」。
+        """
+        if state.get("exit_reason") != "text_response":
+            return {}
+        completed = complete_in_progress_steps(state.get("plan"))
+        if completed is None:
+            return {}
+        update: dict[str, Any] = {"plan": completed}
+        projection = await _project_workspace_state(
+            workspace_writer_factory,
+            {**state, "plan": completed},
+            _build_tool_context(config, plan=completed),
+            audit_logger_from_config(config),
+            prefix=(
+                None
+                if (config.get("configurable") or {}).get("child_run")
+                else safe_thread_projection_prefix(configurable_uuid(config, "thread_id"))
+            ),
+        )
+        if projection is not None and not projection.skipped:
+            update["last_projection_hash"] = projection.digest
+        return update
+
     graph: StateGraph[AgentState, None, AgentState, AgentState] = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
@@ -2039,6 +2060,10 @@ def build_react_graph(
         graph.add_node("memory_writeback", memory_writeback_node)  # type: ignore[arg-type]
         graph.add_edge("memory_writeback", END)
         end_target = "memory_writeback"
+    # B-131 —— 自然答完的出口先经 plan_close(标完成 + 同步 PLAN.md)再去原来的终点。
+    graph.add_node("plan_close", plan_close_node)
+    graph.add_edge("plan_close", end_target)
+    natural_end = "plan_close"
 
     if reflect_node is not None:
         # When the agent stops issuing tool_calls, route to ``reflect``
@@ -2047,10 +2072,10 @@ def build_react_graph(
         graph.add_conditional_edges(
             "agent", _should_continue, {"tools": "tools", "agent": "agent", END: "reflect"}
         )
-        graph.add_conditional_edges("reflect", _after_reflect, {"agent": "agent", END: end_target})
+        graph.add_conditional_edges("reflect", _after_reflect, {"agent": "agent", END: natural_end})
     else:
         graph.add_conditional_edges(
-            "agent", _should_continue, {"tools": "tools", "agent": "agent", END: end_target}
+            "agent", _should_continue, {"tools": "tools", "agent": "agent", END: natural_end}
         )
     # Stream J.8 — after ``tools``, a run with ``pending_approval`` set
     # routes straight to END (RunStatus.PAUSED): the checkpoint persists

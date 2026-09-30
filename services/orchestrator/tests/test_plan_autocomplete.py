@@ -18,7 +18,7 @@ from langchain_core.runnables import RunnableConfig
 from expert_work.protocol import Plan
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.middleware import LoopDetectionMiddleware, MiddlewareChain
-from orchestrator import GraphRunner, ToolRegistry, ToolSpec, build_react_graph
+from orchestrator import GraphRunner, ToolRegistry, ToolSpec, build_react_graph, make_reflect_node
 from orchestrator.graph_builder import render_plan
 from orchestrator.graph_builder.planner import complete_in_progress_steps
 from orchestrator.tools.update_plan import UpdatePlanTool
@@ -128,3 +128,94 @@ async def test_budget_exit_leaves_plan_untouched_on_middleware_path() -> None:
         AIMessage(content="wrapping up"), step_count=5, max_steps=5, with_middleware=True
     )
     assert _statuses(state["plan"]) == ["completed", "in_progress", "pending"]
+
+
+# ---------------------------------------------------------------- review round 1
+
+
+@dataclass
+class _Writer:
+    writes: dict[str, str] = field(default_factory=dict)
+
+    async def write(self, *, rel: str, content: str) -> None:
+        self.writes[rel] = content
+
+
+_THREAD = "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0131"
+
+
+@pytest.mark.asyncio
+async def test_auto_completed_plan_is_projected_to_plan_md() -> None:
+    """标完成之后必须把 PLAN.md 同步一次;否则下一轮 workspace_ingest 读回的是旧文件,
+    会当成人工修改把步骤改回「进行中」(review round 1, finding 1)。"""
+    writer = _Writer()
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=_LLM(AIMessage(content="all done")),
+                tool_registry=ToolRegistry(),
+                workspace_writer_factory=lambda _ctx: writer,
+            )
+        )
+        cfg: RunnableConfig = {"configurable": {"thread_id": _THREAD}}
+        state = await compiled.ainvoke(
+            {
+                "messages": [HumanMessage(content="do it")],
+                "step_count": 0,
+                "max_steps": 5,
+                "plan": _plan("completed", "in_progress", "pending"),
+            },
+            config=cfg,
+        )
+    assert _statuses(state["plan"]) == ["completed", "completed", "pending"]
+    plan_md = writer.writes[f"threads/{_THREAD}/PLAN.md"]
+    assert "[x] 2." in plan_md and "[~] 2." not in plan_md
+    assert state.get("last_projection_hash")
+
+
+@dataclass
+class _SeqLLM:
+    replies: list[AIMessage]
+    seen: list[list[BaseMessage]] = field(default_factory=list)
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del tools
+        self.seen.append(list(messages))
+        return self.replies[len(self.seen) - 1]
+
+
+@pytest.mark.asyncio
+async def test_reflect_revise_does_not_complete_steps_before_the_real_end() -> None:
+    """复查判「要返工」时这一轮没结束:返工那次调用看到的计划必须仍是「进行中」
+    (review round 1, finding 3)。复查通过、真正结束时才标完成。"""
+    agent_llm = _SeqLLM([AIMessage(content="first answer"), AIMessage(content="second answer")])
+    critic = _SeqLLM(
+        [
+            AIMessage(content='{"verdict": "revise", "critique": "incomplete"}'),
+            AIMessage(content='{"verdict": "accept", "critique": "ok"}'),
+        ]
+    )
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=agent_llm,
+                tool_registry=ToolRegistry(),
+                reflect_node=make_reflect_node(critic, budget=2),
+            )
+        )
+        cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
+        state = await compiled.ainvoke(
+            {
+                "messages": [HumanMessage(content="do it")],
+                "step_count": 0,
+                "max_steps": 5,
+                "plan": _plan("completed", "in_progress", "pending"),
+            },
+            config=cfg,
+        )
+    assert len(agent_llm.seen) == 2
+    second_prompt = "\n".join(str(m.content) for m in agent_llm.seen[1])
+    assert "[~] 2." in second_prompt
+    assert _statuses(state["plan"]) == ["completed", "completed", "pending"]
