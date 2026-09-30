@@ -178,11 +178,33 @@ def render_plan(plan: Plan) -> str:
     )
     lines.append("")
     lines.append(
-        "Work through this plan step by step, marking steps done as you "
-        "complete them; adapt it if you discover something that requires a "
-        "different approach."
+        "Work through this plan step by step; adapt it if you discover something "
+        "that requires a different approach. Update step statuses in the same "
+        "response as your next action - never spend a response only to tick a "
+        "step. When you give your final reply, steps still in progress are "
+        "marked completed automatically."
     )
     return "\n".join(lines)
+
+
+def complete_in_progress_steps(plan: Plan | None) -> Plan | None:
+    """B-131 —— 本轮自然结束时,把仍「进行中」的步骤标为完成;没有可改的返回 ``None``。
+
+    模型不必为了在最终回复前打勾而单独花一次调用(见 :func:`render_plan` 的附言)。
+    只动 ``in_progress``:``pending`` 的步骤没开始做,不能替模型宣称做完了。
+    """
+    if plan is None or not any(step.status == "in_progress" for step in plan.steps):
+        return None
+    return plan.model_copy(
+        update={
+            "steps": tuple(
+                step.model_copy(update={"status": "completed"})
+                if step.status == "in_progress"
+                else step
+                for step in plan.steps
+            )
+        }
+    )
 
 
 def make_planner_node(llm_caller: LLMCaller, *, plan_first: bool = False) -> PlannerNode:

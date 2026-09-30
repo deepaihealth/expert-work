@@ -159,7 +159,11 @@ from orchestrator.graph_builder.input_url_guard import (
     guard_message,
 )
 from orchestrator.graph_builder.memory import MemoryNode, PreCompactionFlush
-from orchestrator.graph_builder.planner import PlannerNode, render_plan
+from orchestrator.graph_builder.planner import (
+    PlannerNode,
+    complete_in_progress_steps,
+    render_plan,
+)
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
@@ -1444,6 +1448,11 @@ def build_react_graph(
             # 盖了会把中间态当终局读。
             if mw_exit_reason is not None:
                 update_mw["exit_reason"] = mw_exit_reason
+            # B-131 —— 自然答完时把仍「进行中」的步骤标为完成(模型不必单独调一次打勾)。
+            if mw_exit_reason == "text_response":
+                completed_plan = complete_in_progress_steps(state.get("plan"))
+                if completed_plan is not None:
+                    update_mw["plan"] = completed_plan
             # B-35 — only a plan_first build ever writes the dispatch
             # channels (off = state shape untouched).
             if plan_first:
@@ -1481,6 +1490,11 @@ def build_react_graph(
         # B-85 ③ —— 同 ``update_mw`` 那一处:只在真的走到出口时写。
         if plain_exit_reason is not None:
             update_plain["exit_reason"] = plain_exit_reason
+        # B-131 —— 同 ``update_mw`` 那一处。
+        if plain_exit_reason == "text_response":
+            completed_plan = complete_in_progress_steps(state.get("plan"))
+            if completed_plan is not None:
+                update_plain["plan"] = completed_plan
         # B-35 — only a plan_first build ever writes the dispatch channels.
         if plan_first:
             update_plain["plan_first_dispatch_active"] = dispatch_active

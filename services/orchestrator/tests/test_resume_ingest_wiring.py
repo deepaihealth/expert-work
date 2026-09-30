@@ -69,7 +69,10 @@ def _db_plan() -> Plan:
         goal="ship the feature",
         steps=(
             PlanStep(id="1", description="write tests", status="completed"),
-            PlanStep(id="2", description="implement", status="in_progress"),
+            # B-131 —— ``pending`` 而不是 ``in_progress``:本轮自然结束时平台会把
+            # ``in_progress`` 自动标成完成,那样「没接 ingest、DB 计划保留」与「人改的
+            # PLAN.md 生效」在终态上就分不开了;``pending`` 不会被自动改。
+            PlanStep(id="2", description="implement", status="pending"),
         ),
     )
 
@@ -182,4 +185,4 @@ async def test_resume_without_ingest_wiring_keeps_db_plan() -> None:
     plan = final.get("plan")
     assert plan is not None
     # No ingest node → pre-CM-8 behaviour, the DB plan stands.
-    assert [s.status for s in plan.steps] == ["completed", "in_progress"]
+    assert [s.status for s in plan.steps] == ["completed", "pending"]

@@ -79,8 +79,11 @@ class UpdatePlanTool:
                 "Create or replace your plan with an ordered list of steps. "
                 "Use this when a task needs 3+ distinct steps or spans "
                 "multiple tools; skip it for simple one-shot tasks. Mark "
-                "steps completed / in_progress as you go so the recitation "
-                "tracks progress."
+                "steps completed / in_progress so the recitation tracks "
+                "progress, calling this in the same response as your next "
+                "action - never as a response of its own. Before your final "
+                "reply there is no need to tick the last step: steps still in "
+                "progress are marked completed automatically."
             ),
             parameters={
                 "type": "object",
