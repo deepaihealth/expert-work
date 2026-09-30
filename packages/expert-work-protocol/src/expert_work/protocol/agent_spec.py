@@ -852,6 +852,7 @@ _B126_OMIT_AT_DEFAULT: dict[str, object] = {
     "min_context_tokens": 30_000,
     "min_reclaim_tokens": 5_000,
     "absolute_cap_tokens": 200_000,
+    "requery": True,
 }
 
 
@@ -1014,6 +1015,8 @@ class ToolResultPrunePolicy(_B126OmitDefaultsMixin):
     min_reclaim_tokens: int = Field(default=5_000, ge=0)
     #: 同一轮内逐次清理的兜底门槛 = min(context_window x threshold_pct, 本值)。
     absolute_cap_tokens: int = Field(default=200_000, gt=0)
+    #: B-129 —— 旧轮次里可重新查询的只读工具结果(无副本、≥500 字)收成「再调一次」提示。
+    requery: bool = True
 
 
 class MemoryConsolidationPolicy(BaseModel):

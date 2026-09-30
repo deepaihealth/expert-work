@@ -1233,6 +1233,7 @@ _B126_DEFAULTS = {
     "min_context_tokens": 30_000,
     "min_reclaim_tokens": 5_000,
     "absolute_cap_tokens": 200_000,
+    "requery": True,
 }
 
 
@@ -1279,3 +1280,9 @@ def test_new_fields_validate() -> None:
         ToolResultPrunePolicy(absolute_cap_tokens=0)
     with pytest.raises(ValidationError):
         ToolResultPrunePolicy(min_reclaim_tokens=-1)
+
+
+def test_b129_requery_kept_when_disabled() -> None:
+    dumped = ToolResultPrunePolicy(requery=False).model_dump(mode="json")
+    assert dumped["requery"] is False
+    assert "requery" not in ToolResultPrunePolicy().model_dump()
