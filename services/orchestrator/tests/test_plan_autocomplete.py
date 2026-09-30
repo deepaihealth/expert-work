@@ -1,4 +1,4 @@
-"""B-131 —— 本轮正常答完时,平台把计划里仍「进行中」的步骤标为完成。
+"""B-131 —— 本轮正常答完时,平台把计划里所有未完成的步骤标为完成。
 
 模型不用为了打勾单独花一次调用:更新计划要跟下一步动作放在同一次回复里,
 最终回复前也不必再专门标一次完成。只在自然结束(``text_response``)时生效;
@@ -20,7 +20,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.middleware import LoopDetectionMiddleware, MiddlewareChain
 from orchestrator import GraphRunner, ToolRegistry, ToolSpec, build_react_graph, make_reflect_node
 from orchestrator.graph_builder import render_plan
-from orchestrator.graph_builder.planner import complete_in_progress_steps
+from orchestrator.graph_builder.planner import complete_open_steps
 from orchestrator.tools.update_plan import UpdatePlanTool
 
 
@@ -40,27 +40,36 @@ def _statuses(plan: Plan) -> list[str]:
     return [s.status for s in plan.steps]
 
 
-def test_in_progress_becomes_completed_pending_untouched() -> None:
-    out = complete_in_progress_steps(_plan("completed", "in_progress", "pending"))
+def test_every_open_step_becomes_completed() -> None:
+    # 重放实测:模型常常建完计划就不再更新,最后留着 in_progress 和一串 pending。
+    out = complete_open_steps(_plan("completed", "in_progress", "pending"))
     assert out is not None
-    assert _statuses(out) == ["completed", "completed", "pending"]
+    assert _statuses(out) == ["completed", "completed", "completed"]
 
 
-def test_no_in_progress_step_returns_none() -> None:
-    assert complete_in_progress_steps(_plan("completed", "pending")) is None
-    assert complete_in_progress_steps(None) is None
+def test_pending_only_plan_is_completed_too() -> None:
+    out = complete_open_steps(_plan("completed", "pending", "pending"))
+    assert out is not None
+    assert _statuses(out) == ["completed", "completed", "completed"]
+
+
+def test_all_completed_or_no_plan_returns_none() -> None:
+    assert complete_open_steps(_plan("completed", "completed")) is None
+    assert complete_open_steps(None) is None
 
 
 def test_recitation_tells_model_not_to_spend_a_step_on_ticking() -> None:
     text = render_plan(_plan("pending"))
-    assert "same response as your next action" in text
-    assert "marked completed automatically" in text
+    assert "same response as that step's first action" in text
+    assert "The one update you may skip is the last" in text
+    assert "any step not yet completed is marked completed automatically" in text
 
 
 def test_update_plan_description_says_the_same() -> None:
     desc = UpdatePlanTool().spec.description
-    assert "same response" in desc
-    assert "marked completed automatically" in desc
+    assert "same response as that step's first action" in desc
+    assert "The one update you may skip is the last" in desc
+    assert "any step not yet completed is marked completed automatically" in desc
 
 
 @dataclass
@@ -105,9 +114,9 @@ async def _run(
 
 
 @pytest.mark.asyncio
-async def test_final_text_reply_completes_in_progress_steps() -> None:
+async def test_final_text_reply_completes_open_steps() -> None:
     state = await _run(AIMessage(content="all done"))
-    assert _statuses(state["plan"]) == ["completed", "completed", "pending"]
+    assert _statuses(state["plan"]) == ["completed", "completed", "completed"]
 
 
 @pytest.mark.asyncio
@@ -117,9 +126,9 @@ async def test_budget_exit_leaves_plan_untouched() -> None:
 
 
 @pytest.mark.asyncio
-async def test_final_text_reply_completes_in_progress_steps_on_middleware_path() -> None:
+async def test_final_text_reply_completes_open_steps_on_middleware_path() -> None:
     state = await _run(AIMessage(content="all done"), with_middleware=True)
-    assert _statuses(state["plan"]) == ["completed", "completed", "pending"]
+    assert _statuses(state["plan"]) == ["completed", "completed", "completed"]
 
 
 @pytest.mark.asyncio
@@ -167,9 +176,10 @@ async def test_auto_completed_plan_is_projected_to_plan_md() -> None:
             },
             config=cfg,
         )
-    assert _statuses(state["plan"]) == ["completed", "completed", "pending"]
+    assert _statuses(state["plan"]) == ["completed", "completed", "completed"]
     plan_md = writer.writes[f"threads/{_THREAD}/PLAN.md"]
     assert "[x] 2." in plan_md and "[~] 2." not in plan_md
+    assert "[x] 3." in plan_md and "[ ] 3." not in plan_md
     assert state.get("last_projection_hash")
 
 
@@ -218,4 +228,4 @@ async def test_reflect_revise_does_not_complete_steps_before_the_real_end() -> N
     assert len(agent_llm.seen) == 2
     second_prompt = "\n".join(str(m.content) for m in agent_llm.seen[1])
     assert "[~] 2." in second_prompt
-    assert _statuses(state["plan"]) == ["completed", "completed", "pending"]
+    assert _statuses(state["plan"]) == ["completed", "completed", "completed"]

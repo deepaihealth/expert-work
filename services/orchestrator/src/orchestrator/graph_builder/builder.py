@@ -161,7 +161,7 @@ from orchestrator.graph_builder.input_url_guard import (
 from orchestrator.graph_builder.memory import MemoryNode, PreCompactionFlush
 from orchestrator.graph_builder.planner import (
     PlannerNode,
-    complete_in_progress_steps,
+    complete_open_steps,
     render_plan,
 )
 from orchestrator.graph_builder.reflect import ReflectNode
@@ -1980,7 +1980,7 @@ def build_react_graph(
         return result_dict
 
     async def plan_close_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-        """B-131 —— 本轮真正结束时,把计划里仍「进行中」的步骤标为完成,并同步 PLAN.md。
+        """B-131 —— 本轮真正结束时,把计划里所有未完成的步骤标为完成,并同步 PLAN.md。
 
         只挂在「自然答完」的出口上(agent 无 tool_calls 且不再回 agent;有复查时是复查
         通过之后):派发打回、复查要求返工都回到 agent,不经过这里;审批暂停 / 拒绝走
@@ -1991,7 +1991,7 @@ def build_react_graph(
         """
         if state.get("exit_reason") != "text_response":
             return {}
-        completed = complete_in_progress_steps(state.get("plan"))
+        completed = complete_open_steps(state.get("plan"))
         if completed is None:
             return {}
         update: dict[str, Any] = {"plan": completed}
