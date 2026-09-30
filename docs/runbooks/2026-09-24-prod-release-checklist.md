@@ -1,10 +1,10 @@
 # 班车 2 生产发布执行单（2026-10-08 发；原定 09-24，后改 09-28）
 
-> **⚠️ 2026-09-29 再次改期**：09-28 没有发，**用户 09-29 拍板推迟到 2026-10-08**，并把 **B-125 健康方案交付件技能**（`health-plan-report` 导入 + ai-health-plan 提示词 rev39）一起带上，见 §0.2 与 Step A3 / A4。钉子当时未变（`c0789ca6`），B-125 不进镜像（`platform-skills/` 只由导入脚本上线）。**同日用户再拍板：B-126（跨轮上下文降本）也随本班上生产；钉子等 B-126 合入后一次性前移到 main**（届时连同 #1690 fast-uri / #1691 MinIO 一起带上），前移后先发测试环境验过再重钉，本单操作位随之改。**✅ 09-29 已前移（第十一次重钉）到 main `ab4097cf`**：带 B-126 / B-127 / B-128 与 #1690 / #1691，测试环境验过，操作位已全部改到新钉子，见 §0.1 第十一次重钉。
+> **⚠️ 2026-09-29 再次改期**：09-28 没有发，**用户 09-29 拍板推迟到 2026-10-08**，并把 **B-125 健康方案交付件技能**（`health-plan-report` 导入 + ai-health-plan 提示词 rev39）一起带上，见 §0.2 与 Step A3 / A4。钉子当时未变（`c0789ca6`），B-125 不进镜像（`platform-skills/` 只由导入脚本上线）。**同日用户再拍板：B-126（跨轮上下文降本）也随本班上生产；钉子等 B-126 合入后一次性前移到 main**（届时连同 #1690 fast-uri / #1691 MinIO 一起带上），前移后先发测试环境验过再重钉，本单操作位随之改。**✅ 09-29 已前移（第十一次重钉）到 main `ab4097cf`**：带 B-126 / B-127 / B-128 与 #1690 / #1691，测试环境验过，操作位已全部改到新钉子，见 §0.1 第十一次重钉。**✅ 09-30 第十二次重钉到 main `39c93912`**：用户 09-30 拍板 B-131（减少修改轮的额外调用，平台部分）随本班上，同时带上 pyjwt 2.14.0 安全升级（#1701）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十二次重钉。
 >
 > **⚠️ 2026-09-25 改期说明**：本班 09-24 **没有发**（用户 09-20 拍板等 B-84 本波做完一起发，
 > 之后又陆续合入 B-64 / B-106 / B-102~104 / B-105）。**用户 09-25 拍板 09-28（周一）发**。文件名保留原日期，免得外链断；**发布日以表头为准**。
-> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）；同日第九次重钉到 main 的 `68a7b75f`，再带上 B-122 / B-123 与 B-119 的文案；当晚第十次重钉到 main 的 `c0789ca6`，再带上 B-124 子代沙箱工作区修复；09-29 第十一次重钉到 main 的 `ab4097cf`，再带上 B-126 / B-127 / B-128（见 §0.1）。
+> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）；同日第九次重钉到 main 的 `68a7b75f`，再带上 B-122 / B-123 与 B-119 的文案；当晚第十次重钉到 main 的 `c0789ca6`，再带上 B-124 子代沙箱工作区修复；09-29 第十一次重钉到 main 的 `ab4097cf`，再带上 B-126 / B-127 / B-128；09-30 第十二次重钉到 main 的 `39c93912`，再带上 B-131 与 pyjwt 升级（见 §0.1）。
 >
 > 一次性文档，发完归档。通用流程在 [`production-release.md`](./production-release.md)，
 > **这份只列那一份不覆盖的东西**。上一班的单子在
@@ -14,8 +14,8 @@
 |---|---|
 | 发布日 | **2026-10-08（周四）** —— 用户 2026-09-29 拍板（09-28 未发）。此前 **2026-09-28（周一）** —— 用户 2026-09-25 拍板。原定 09-24（用户 09-17 拍板，原 09-22），09-20 用户拍板延期等 B-84 本波 |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`ab4097cf`**（**main**，#1697 的合并提交，父提交 `78abe0f3`）= `c0789ca6` + 其后 main 上的 13 个提交：运行时代码 B-126（#1694 / #1696，跨轮上下文降本）、B-127（#1695，MCP 工具参数固定值，含 admin-ui 配置页）、B-128（#1697，prompt 只留最新一份系统提示词）与 admin-ui 依赖 fast-uri 升版（#1690）；其余是 `platform-skills/`（B-125，不进镜像）/ CI / 文档。测试环境 2026-09-29 发过（`release.sh test`，镜像 `f29ac13b`、admin-ui `f29ac13b-test`，代码树与 `ab4097cf` 逐字相同 —— `git diff f29ac13b ab4097cf` 为空；smoke + 金丝雀 PASS；ai-health-plan 真实 7 轮对话重放 7/7 success，见 §0.1 第十一次重钉）。**以下为第十次钉子的记录**：`c0789ca6`（**main**，#1685 的合并提交，父提交 `68a7b75f`）= `f92c6fae` + 其后 main 上的 11 个提交：运行时代码只多 B-121（#1681，与第八次钉子 `e5341495` 同一份改动）、B-122（#1682）、B-123（#1683）、B-124（#1685）与 B-119 的一处文案（#1678），其余是文档 / `platform-skills/`（不进镜像）/ test overlay。**不再用分支 `release/train2-tz`**（发版不从它取，留不留不影响本单）。测试环境 2026-09-27 发过 `c0789ca6`（`release.sh test`，镜像 `c0789ca6`、admin-ui `c0789ca6-test`；smoke + 金丝雀 PASS；B-124 真栈四条全过，见 §0.1 第十次重钉）。第九次钉子 `68a7b75f` 此前 09-27 发过（`release.sh test`，镜像 `68a7b75f`、admin-ui `68a7b75f-test`）：测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。第八次钉子 `e5341495` 09-27 测试验过（smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST，#1681）；`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
-| 区间提交数 | **133**（`git log --oneline 5775fbf3..ab4097cf`；第十次钉子 `c0789ca6` 时为 120，第十一次多 13 个 —— B-125 四个 + B-126 两个 + B-127 / B-128 / fast-uri / MinIO CI 各一个 + 两个文档；原记录：其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 `f92c6fae` 之后 main 上的 11 个 —— B-121 / B-122 / B-123 / B-124 / office 技能两个 / 五个纯文档或 test overlay 记录） |
+| 本版 tag | **`39c93912`**（**main**，#1700 的合并提交，父提交 `63a0600c`）= `ab4097cf` + 其后 main 上的 2 个提交：B-131（#1700，减少修改轮的额外调用：计划打勾与下一步动作同一次回复、自然答完时平台把未完成步骤标完成；另含 `health-plan-report` 技能 v6，不进镜像）与 pyjwt 2.13.0 → 2.14.0（#1701，只改 `uv.lock`，修 2026-09-30 公布的 10 个 CVE）。测试环境 2026-09-30 发过（`release.sh test`，镜像 `39c93912`、admin-ui 沿用 `f29ac13b-test` —— `git diff f29ac13b 39c93912 -- apps/admin-ui` 为空；smoke + 金丝雀 PASS；`health-plan-report` 技能在 pod 内 dry-run 为 `786d30fe…`、unchanged；见 §0.1 第十二次重钉）。**以下为第十一次钉子的记录**：`ab4097cf`（**main**，#1697 的合并提交，父提交 `78abe0f3`）= `c0789ca6` + 其后 main 上的 13 个提交：运行时代码 B-126（#1694 / #1696，跨轮上下文降本）、B-127（#1695，MCP 工具参数固定值，含 admin-ui 配置页）、B-128（#1697，prompt 只留最新一份系统提示词）与 admin-ui 依赖 fast-uri 升版（#1690）；其余是 `platform-skills/`（B-125，不进镜像）/ CI / 文档。测试环境 2026-09-29 发过（`release.sh test`，镜像 `f29ac13b`、admin-ui `f29ac13b-test`，代码树与 `ab4097cf` 逐字相同 —— `git diff f29ac13b ab4097cf` 为空；smoke + 金丝雀 PASS；ai-health-plan 真实 7 轮对话重放 7/7 success，见 §0.1 第十一次重钉）。**以下为第十次钉子的记录**：`c0789ca6`（**main**，#1685 的合并提交，父提交 `68a7b75f`）= `f92c6fae` + 其后 main 上的 11 个提交：运行时代码只多 B-121（#1681，与第八次钉子 `e5341495` 同一份改动）、B-122（#1682）、B-123（#1683）、B-124（#1685）与 B-119 的一处文案（#1678），其余是文档 / `platform-skills/`（不进镜像）/ test overlay。**不再用分支 `release/train2-tz`**（发版不从它取，留不留不影响本单）。测试环境 2026-09-27 发过 `c0789ca6`（`release.sh test`，镜像 `c0789ca6`、admin-ui `c0789ca6-test`；smoke + 金丝雀 PASS；B-124 真栈四条全过，见 §0.1 第十次重钉）。第九次钉子 `68a7b75f` 此前 09-27 发过（`release.sh test`，镜像 `68a7b75f`、admin-ui `68a7b75f-test`）：测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。第八次钉子 `e5341495` 09-27 测试验过（smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST，#1681）；`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
+| 区间提交数 | **135**（`git log --oneline 5775fbf3..39c93912`；第十一次钉子 `ab4097cf` 时为 133，第十二次多 2 个 —— B-131 / pyjwt；第十次钉子 `c0789ca6` 时为 120，第十一次多 13 个 —— B-125 四个 + B-126 两个 + B-127 / B-128 / fast-uri / MinIO CI 各一个 + 两个文档；原记录：其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 `f92c6fae` 之后 main 上的 11 个 —— B-121 / B-122 / B-123 / B-124 / office 技能两个 / 五个纯文档或 test overlay 记录） |
 | 数据库迁移 | **四条**（`0159` 为 09-20 之后追加）：`0159_skill_usage_viewed`（只放宽 `skill_run_usage.outcome` 的 CHECK，允许 `viewed`；不加表不加列不动数据）+ 原三条：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
 | 段数 | **单段**。有迁移但不是三段式：`0156` / `0158` 纯加列、`0157` 只清一张派生状态表，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这些表上正常跑 |
 | 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉。`0159` 同理：旧代码从不写 `viewed`，放宽的 CHECK 对它无害；downgrade 会先删掉全部 `viewed` 行 |
@@ -173,6 +173,28 @@
 **没有新的手工集群对象、没有新 secret、没有新配置键**：09-20 之后追加的 35 个提交里 `infra/k8s/` 只动了
 `base/observability/rules/sli.yml` 与 test overlay；沙箱镜像没有重烤（钉子仍是 `7ac31957`，Step A 不变）。
 
+> **2026-09-30 第十二次重钉：`ab4097cf` → `39c93912`（main HEAD）。** 用户 09-30 拍板 B-131 的平台部分随本班上（技能部分已先拍板随本班）；同日 pyjwt 公布 10 个 CVE，pip-audit 挡住所有 PR，#1701 升到修复版一并带上。比第十一次钉子多出的**运行时代码**（`git diff --stat ab4097cf 39c93912 -- services packages infra apps`，不含测试）：
+>
+> | 条目 | 文件 | 做什么 |
+> |---|---|---|
+> | B-131 减少修改轮的额外调用（#1700） | `orchestrator/graph_builder/builder.py`、`graph_builder/planner.py`、`tools/update_plan.py` | 计划附言与 `update_plan` 说明改成「换到下一步时，在做下一步的同一次回复里打勾，不单独花一次回复；最后一下可省」；新增 `plan_close` 节点：**自然答完**（`exit_reason=text_response`）且计划还有未完成步骤时，把它们全部标完成并同步 `PLAN.md`。步数 / 预算耗尽、审批暂停 / 拒绝、派发打回、复查返工都不经过它；定时任务投递、重新生成（`aupdate_state(as_node="agent")`）也不会停在它前面 |
+> | pyjwt 升级（#1701） | `uv.lock` | `pyjwt` 2.13.0 → 2.14.0（CVE-2026-101917、CVE-2026-102265~102274），`pyproject` 的范围 `>=2.13.0,<3` 不变 |
+>
+> **无迁移**（区间内 `migrations/versions` 零命中，迁移仍是四条）、**无配置键、无新集群对象、不动沙箱镜像、admin-ui 零改动**。`platform-skills/health-plan-report` 同一 PR 改成 v6（加「改稿速查」），仍由 Step A3 单独导入 —— 期望 hash 随之从 `cc2df66a` 改为 **`786d30fe`**。
+>
+> **行为变化面向全部 Agent**：所有用 `update_plan` 的 Agent 在正常答完时，控制台的计划卡片会全部显示完成（此前常留着「进行中」和一串「待处理」）。代价：模型中途反问用户、活没干完就答完时，也会显示全部完成（用户 09-30 拍板接受）。
+>
+> **回退阀**：B-131 **没有开关**，出问题只能按 §4 回滚镜像；它不写新字段、不改配置结构，旧镜像读新检查点无影响。技能 v6 在旧镜像上照常可用，回滚镜像不必连技能一起回。
+>
+> 测试环境验收（同一段 ai-health-plan 8 轮对话重放，基线 3 次 vs B-131 6 次，`7f68b32d` 3 次 + `40ae953b` 3 次）：
+>
+> - 修改轮（第 2~8 轮）平均每轮模型回复次数 7.0 → 4.2~6.0；先翻文档 / 列目录 10 → 0~2 次、逐张看图多余 4 → 0~1 次；看图检查次数不减（22 → 21 / 26）。
+> - 每次都做同样活的第 1 / 2 / 7 / 8 轮成本 ¥7.31 → ¥5.99（−18%），纯改稿第 7 / 8 轮 ¥3.55 → ¥2.55（−28%）。交付件（初稿 PPT、改稿 PPT、第 8 轮 PDF）与「以后都这样」写个人默认，9 次全部一致。
+> - 第一版只收「进行中」，重放发现模型常建完计划就不再更新，留下一串待办 → 用户拍板「提示词要求逐步打勾 + 平台兜底收全部」；修后 24 轮每轮结束都全部打勾。代价：3 次里有 1 次模型仍会在最终回复前单独花一次回复打勾（约 ¥0.1 / 次）。
+> - `39c93912` 本身：2026-09-30 `release.sh test` 发到测试环境（control-plane / credential-proxy `39c93912`，admin-ui `f29ac13b-test`），smoke + 金丝雀 PASS；`health-plan-report` 在 pod 内 dry-run 导入得 `786d30fe…`、`unchanged`（测试环境已是这版）。
+>
+> 下面第十一次重钉段里的 `ab4097cf` 从此是记账位。
+>
 > **2026-09-29 第十一次重钉：`c0789ca6` → `ab4097cf`（main HEAD）。** 用户 09-29 拍板 B-126 随本班上生产、钉子等它合入后一次性前移到 main；同日 B-127、B-128 也拍板随本班。比第十次钉子多出的**运行时代码**（`git diff --stat c0789ca6 ab4097cf`，不含测试）：
 >
 > | 条目 | 文件 | 做什么 |
@@ -228,7 +250,7 @@
 > **2026-09-25 第七次重钉：`139057c8` → `f92c6fae`。** 操作位（表头、Step B / C / F、§6）已全部改到新钉子；
 > 下面历史段落里出现的旧 sha 是记账位，按原判据放过。
 
-> **钉子纪律**：本单钉 `ab4097cf`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `39c93912`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
@@ -316,18 +338,18 @@
   同一 7 轮对话重放 7/7 success、被删工具零调用。`list_artifacts` 是平台基础能力，删了仍会自动带上（构建出 24 个工具，不是 23 个），属预期。）。
   代码 #1686–#1689 已合 main（`523a1050`）；ROADMAP B-125。
 - **不动镜像、不动钉子**：`platform-skills/` 不进任何镜像，技能由 Step A3 用导入脚本上线；提示词由 Step A4 改 Agent 配置。
-- **依赖**：① Step B 的 `ab4097cf`（`EXPERT_WORK_SKILLS_DIR`，B-84；「固定值」要 B-127）；② Step A 的沙箱镜像 `7ac31957`（python-pptx /
+- **依赖**：① Step B 的 `39c93912`（`EXPERT_WORK_SKILLS_DIR`，B-84；「固定值」要 B-127）；② Step A 的沙箱镜像 `7ac31957`（python-pptx /
   weasyprint / Noto CJK —— 测试环境 in-image 用例就在这个镜像上跑）；③ Step A2 的 `pptx` / `pdf` / `docx`（rev39 绑定它们）。
   所以顺序是 **A → B → C → A2 → A3 → A4**。
 - **两件必须一起做**：只导入技能，Agent 不会用；只发 rev39，Agent 会调一个生产上不存在（或未启用）的技能。
 - **测试环境验收**：技能 v1→v5（v5 = `cc2df66a`，卡片组整组不拆页）；rev39 在测试环境 `ai-health-plan` 上两次重放真实 5 轮对话，
-  带出的问题全部修进 v2~v5；v5 抽查 PPTX 16/19 页、PDF 11 页，质检全过。
+  带出的问题全部修进 v2~v5；v5 抽查 PPTX 16/19 页、PDF 11 页，质检全过。**09-30 起 v6**（`786d30fe`，B-131 加「改稿速查」，同一 8 轮对话重放 6 次验收，见 §0.1 第十二次重钉）。
 
 ## 1. 前置（发布前一天做完）
 
 > **本班时间点**：09-28 是周一，前一天是周日 → **两条只读盘点 SQL 建议 09-26（周五）就跑**：
 > ① 价目表若有缺价要在控制台补价、② 上限偏小的 Agent 要找负责人确认，这两件都需要工作日。
-> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。`e5341495` 09-27 13:10 发到测试，只多 B-121 一处，按它的真栈验证（沙箱时钟 + 出方案）放行，不另等 24h。`68a7b75f`（第九次重钉）同一原则：在验过的钉子上只多 B-122 / B-123 与 B-119 的一处文案，按它的真栈验收放行、不另等 24h —— 测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。`c0789ca6`（第十次重钉）同理：只多 B-124 一个文件，按它的真栈验收（修前修后四条探针 + ai-health-plan 委派回归 + smoke / 金丝雀 PASS）放行，不另等 24h。`ab4097cf`（第十一次重钉）09-29 发到测试（镜像 `f29ac13b`，树相同），到 10-08 早已满 24h，**24h 复查按原判据对它做**（重点看 B-126 / B-128 生效后有无 run 失败或上下文相关报错）。
+> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。`e5341495` 09-27 13:10 发到测试，只多 B-121 一处，按它的真栈验证（沙箱时钟 + 出方案）放行，不另等 24h。`68a7b75f`（第九次重钉）同一原则：在验过的钉子上只多 B-122 / B-123 与 B-119 的一处文案，按它的真栈验收放行、不另等 24h —— 测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。`c0789ca6`（第十次重钉）同理：只多 B-124 一个文件，按它的真栈验收（修前修后四条探针 + ai-health-plan 委派回归 + smoke / 金丝雀 PASS）放行，不另等 24h。`ab4097cf`（第十一次重钉）09-29 发到测试（镜像 `f29ac13b`，树相同），到 10-08 早已满 24h，**24h 复查按原判据对它做**（重点看 B-126 / B-128 生效后有无 run 失败或上下文相关报错）。`39c93912`（第十二次重钉）09-30 发到测试，只多 B-131 与 pyjwt，按它的真栈验收放行；到 10-08 同样早已满 24h，复查时顺带看控制台计划卡片是否都收尾。
 
 - [ ] **本机接线还在**（只看存在与权限，不读内容）：
 
@@ -455,6 +477,7 @@
       "常识"——不必再为它专门约时间。仍建议避开对接方明确的高峰，理由只剩一条：
       滚动期间在跑的对话越多，收口越久（见 §2 第 2 条的实测数字）。
 - [ ] **通知对接方**：只有一件事要说 ——**窗口内先别处理待审批**（§2 第 3 条）。
+- [ ] **project-service 的计费改动已先上生产**（09-30 与对方会话一起定）：本版起 end 帧的 `usage_by_model` 会多出看图模型 `doubao:doubao-seed-2-1-pro-260628` 一桶（B-102~104 起看图调用记账；B-125 让 ai-health-plan 每次出稿都看图）。project-service 旧代码遇到没定价的桶会**整个 run 不扣康豆**，所以它必须在本班之前上线三件事：豆包补价（6 / 1.2 / 30 元每百万 token）、未定价桶只跳过并报警、缓存命中价计费。问对方要上线时间与版本号，没上就先别发本班。
       在跑的对话不用管，会自动换实例接着跑完，对外无感。
 
 ---
@@ -684,13 +707,13 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 
 ```sh
 git fetch origin main
-git checkout ab4097cf
+git checkout 39c93912
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `ab4097cf`（`git log -1` 标题是 `perf(context): keep only the latest system prompt in the prompt view (B-128) (#1697)`，父提交是 `78abe0f3`（B-126 PR 2/2 #1696）；`git merge-base --is-ancestor ab4097cf origin/main` 退出码 0 = 在 main 上）
+- [ ] 确认 checkout 的是 `39c93912`（`git log -1` 标题是 `perf(plan): fewer overhead calls in edit turns (B-131) (#1700)`，父提交是 `63a0600c`（pyjwt 升级 #1701）；`git merge-base --is-ancestor 39c93912 origin/main` 退出码 0 = 在 main 上）
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
 - [ ] migrate Job `condition met`，且日志里出现**四条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`、`0157… -> 0158_run_completion`、`0158… -> 0159_skill_usage_viewed`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
@@ -708,13 +731,13 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `ab4097cf`（admin-ui 是 `ab4097cf-prod`）
-- [ ] **B-126 / B-128 代码在位**（只看符号在不在）：
+- [ ] 三个应用镜像都是 `39c93912`（admin-ui 是 `39c93912-prod`）
+- [ ] **B-126 / B-128 / B-131 代码在位、pyjwt 是 2.14.0**（只看符号与版本号）：
 
       ```sh
       POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
         --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
-      kubectl -n expert-work exec "$POD" -- python3 -c 'from orchestrator.context.system_prompt_view import keep_latest_system_prompt; from orchestrator.context.tool_result_prune import prune_prior_turns; print("ok")'
+      kubectl -n expert-work exec "$POD" -- python3 -c 'from orchestrator.context.system_prompt_view import keep_latest_system_prompt; from orchestrator.context.tool_result_prune import prune_prior_turns; from orchestrator.graph_builder.planner import complete_open_steps; import jwt; assert jwt.__version__ == "2.14.0", jwt.__version__; print("ok")'
       ```
 
       期望 `ok`。
@@ -756,7 +779,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 必须在 **Step B 通过之后**（smoke 全绿、金丝雀 PASS，且 Step C 点检完）才做，理由（09-26 终审改，原先放在
 Step B 之前是错的）：新技能正文里的脚本路径全部写成 `$EXPERT_WORK_SKILLS_DIR/<技能>/scripts/…`，这个环境变量
-是 B-84（`233791e5`）才加的，随本班钉子（`f92c6fae` 起就有，`ab4097cf` 照带）上生产；生产现版 `5775fbf3` 没有它，路径会展开成
+是 B-84（`233791e5`）才加的，随本班钉子（`f92c6fae` 起就有，`39c93912` 照带）上生产；生产现版 `5775fbf3` 没有它，路径会展开成
 `/docx/scripts/…`，脚本调用全部失败。若先导入技能再发版，从导入到 Step B 结束这段时间里 office 技能不可用，
 Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之后**（技能脚本依赖新沙箱镜像里的 LibreOffice 与
 预装库，第二层测试验的也是这份镜像）。
@@ -771,8 +794,8 @@ Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之�
 传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
 
 **用哪份源码打包**：用 office 技能在 main 上的最后一个改动提交 `58c0f2a9`（#1678 + #1679，09-27 回填，
-即测试环境验收 GO 的那一份）打包导入。第九次重钉之后，Step B 检出的钉子（现为 `ab4097cf`）本身就包含它，而且
-`git diff 58c0f2a9 ab4097cf -- platform-skills/docx platform-skills/pptx platform-skills/xlsx platform-skills/pdf platform-skills/shared platform-skills/build.py platform-skills/import_in_pod.py` 为空 —— 四个 office 技能的源码逐字相同（`58c0f2a9` 之后 `platform-skills/` 只多了 B-125 的 `health-plan-report/` 与 `tests/`，由 Step A3 另导）。（09-26 拍板的「发版钉子不前移」
+即测试环境验收 GO 的那一份）打包导入。第九次重钉之后，Step B 检出的钉子（现为 `39c93912`）本身就包含它，而且
+`git diff 58c0f2a9 39c93912 -- platform-skills/docx platform-skills/pptx platform-skills/xlsx platform-skills/pdf platform-skills/shared platform-skills/build.py platform-skills/import_in_pod.py` 为空 —— 四个 office 技能的源码逐字相同（`58c0f2a9` 之后 `platform-skills/` 只多了 B-125 的 `health-plan-report/` 与 `tests/`，由 Step A3 另导）。（09-26 拍板的「发版钉子不前移」
 已被 09-27 第九次重钉推翻，office 技能的代码侧文案随本班上生产，见 ROADMAP B-119 与 Step C 的核对项。）
 仍然**用独立 worktree 打包、不直接用主仓库的 `platform-skills/`**：主仓库目录此刻有 Step B 留下的
 **未提交的 overlay newTag 改动**（Step F 要用），别在它上面 checkout；worktree 钉死提交，打包输入不随主仓库
@@ -785,7 +808,7 @@ git worktree add /tmp/ps-office 58c0f2a9
 git -C /tmp/ps-office log -1 --oneline   # 确认就是它
 ```
 
-`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`ab4097cf`），与生产 pod 里跑的是
+`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`39c93912`），与生产 pod 里跑的是
 同一版，这正是要的。
 
 **导入前只读核对**：
@@ -877,7 +900,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
 ```
 
 - [ ] dry-run 输出 `"status":"dry-run"`；生产上是**首次导入**，应为 `"created": true` 的新建（不是版本递增）
-- [ ] 打包出的 `content_hash` 应为 `cc2df66a…`（测试环境 v5）；不同说明 main 上技能源码又变过，停下来先对差异
+- [ ] 打包出的 `content_hash` 应为 `786d30fe…`（测试环境 v6，B-131 加「改稿速查」；v5 是 `cc2df66a`）；不同说明 main 上技能源码又变过，停下来先对差异
 
 正式导入去掉 `--dry-run`：
 
@@ -945,7 +968,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag ab4097cf` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag 39c93912` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、回滚命令。
 - [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 / B-121 / B-122 / B-123 / B-124 / **B-125** / **B-126** / **B-127** / **B-128** 的「生产待发」改成已上线，B-119 按 Step C 核对结果销案；本执行单补 §6 执行记录。
 
@@ -988,6 +1011,7 @@ tools/deploy/rollback.sh prod 5775fbf3
 
 - **只是 B-122（子智能体工具边界）出问题时不用走本节**：在 control-plane 上设 `EXPERT_WORK_WORKER_TOOL_POLICY=off`
   并重启 control-plane pod，子智能体的工具与父侧文案逐字节回到 B-122 之前（见 §0.1 第九次重钉）。B-123、B-124 没有单独的阀。
+- **B-131 没有阀**：出问题只能回滚镜像；它不写新字段，旧镜像读新检查点无影响；`health-plan-report` v6 在旧镜像上照常可用，不用回退技能。
 - **只是 B-126 跨轮清理出问题时不用走本节**：在出问题的 Agent 配置里设 `policies.tool_result_prune.cross_turn: false` 并发布。20 万封顶、摘要复用与 B-128 没有阀，只能回滚镜像；旧镜像读带 `context_summary` 的检查点不报错（测试环境已验），B-128 不写数据。
 - **回滚会退回「发布打断在跑的对话」的老行为**（B-80 的修复在本版里）：回滚窗口内被
   打断的对话救不回来，只能让用户重发。要回滚得快，见 §2 第 2 条末尾的强杀写法 ——
@@ -1026,7 +1050,8 @@ tools/deploy/rollback.sh prod 5775fbf3
 | 次日首跑删除计数 | `________` |
 | §1 ① 价目表缺的模型 / 处理方式 | 09-27 核对 8 个全缺 → 用户拍板按官网标价补 7 个（DeepSeek 取高峰价），已写入生产（审计 actor `rate-card-bootstrap-2026-09-27`），复核 7 有；`qwen-plus`（重排序）不在模型目录、价目表拒收，接受记 0（ROADMAP B-120） |
 | §1 ② 会变化的上限（Agent / 值） | 09-27 核对：ai-health-plan 的 glm-5.3 / qwen3.8-max 与 deepseek-v4-pro 的 40960 开始生效（≥16000，测试已验）；豆包看图 medium 档位开始生效；4096 的 glm-5.3 / kimi-k3 不变；无「豆包开思考无档位」行。无需动作 |
-| Step C B-126 / B-128 在位 | `____`（期望 `ok`） |
+| Step C B-126 / B-128 / B-131 在位 + pyjwt 2.14.0 | `____`（期望 `ok`） |
+| project-service 计费改动（豆包补价 / 未定价桶 / 缓存价） | 上线时间 `________`、版本 `________`（必须早于 Step B） |
 | Step A4 `detail_level` 固定值 | 保存时是否提示绑定落空 `____`（对方生产 MCP 未上 brief 时预期提示） |
 | Step C B-122 阀 / B-119 文案 | `set= ___ enabled= ___` / `____ ____`（期望 `False True` / `True False`） |
 | B-124 首个带子智能体的会话 | 父 `read_file` 子代文件 `____`（期望无 `not_found`） |
