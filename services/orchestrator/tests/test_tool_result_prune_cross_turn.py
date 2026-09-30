@@ -9,6 +9,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI
 from orchestrator.context import PruneResult, current_turn_start, prune_prior_turns
+from orchestrator.context.tool_result_prune import REQUERY_MIN_CHARS
+from orchestrator.tools.arg_bindings import BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY
 from orchestrator.tools.overflow import (
     OVERFLOW_FOOTER_TAG_OPEN,
     TOOL_RESULT_PATH_ARTIFACT_KEY,
@@ -393,7 +395,9 @@ def _plain_turn(tag: str, n: int, content: str = _MID, **kw: object) -> list[Bas
     out: list[BaseMessage] = [HumanMessage(content=f"user {tag}")]
     for i in range(n):
         cid = f"{tag}-{i}"
-        out += [_call(cid), _res(cid, content, persisted=False, **kw)]  # type: ignore[arg-type]
+        # 每条正文各不相同(长度不变),让再查用例走「非重复」那条路径,而不是去重。
+        body = f"{content[: len(content) - len(cid) - 1]}#{cid}"
+        out += [_call(cid), _res(cid, body, persisted=False, **kw)]  # type: ignore[arg-type]
     out.append(AIMessage(content=f"answer {tag}"))
     return out
 
@@ -423,6 +427,12 @@ def test_requery_ignores_tools_not_in_list() -> None:
 def test_requery_respects_min_chars() -> None:
     msgs = [*_plain_turn("a", 6, content="s" * 499), HumanMessage(content="now")]
     assert _run(msgs, requery_tools=_RQ, min_reclaim_tokens=1).requery_count == 0
+
+
+def test_requery_stubs_a_result_of_exactly_min_chars() -> None:
+    msgs = [*_plain_turn("a", 6, content="s" * REQUERY_MIN_CHARS), HumanMessage(content="now")]
+    res = _run(msgs, requery_tools=_RQ, min_reclaim_tokens=1)
+    assert res.requery_count == 5
 
 
 def test_copy_reference_wins_over_requery() -> None:
@@ -473,3 +483,61 @@ def test_requery_off_keeps_b126_behaviour() -> None:
     res = pr.apply(msgs)
     assert res.requery_count == 0
     assert res.pruned_count == 3  # a 轮 3 条带副本的照常收起
+
+
+# ------------------------------------------------ B-129 变量绑定的工具:指纹一致才再查
+
+
+def _bound_turn(tag: str, n: int, fp: str | None, *, persisted: bool = False) -> list[BaseMessage]:
+    out: list[BaseMessage] = [HumanMessage(content=f"user {tag}")]
+    for i in range(n):
+        cid = f"{tag}-{i}"
+        art: dict[str, str] = {}
+        if fp is not None:
+            art[BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY] = fp
+        if persisted:
+            art[TOOL_RESULT_PATH_ARTIFACT_KEY] = f".tool_results/run-1/{cid}-fetch_record.txt"
+        out += [
+            _call(cid),
+            ToolMessage(
+                content=f"{_MID}#{cid}", tool_call_id=cid, name="fetch_record", artifact=art or None
+            ),
+        ]
+    out.append(AIMessage(content=f"answer {tag}"))
+    return out
+
+
+def test_requery_stubs_a_bound_tool_when_fingerprint_matches() -> None:
+    msgs = [*_bound_turn("a", 6, "fp-A"), HumanMessage(content="now")]
+    res = _run(msgs, requery_tools=_RQ, requery_current_fingerprints={"fetch_record": "fp-A"})
+    assert res.requery_count == 5
+
+
+def test_requery_keeps_a_bound_tool_when_fingerprint_differs() -> None:
+    msgs = [*_bound_turn("a", 6, "fp-A"), HumanMessage(content="now")]
+    res = _run(msgs, requery_tools=_RQ, requery_current_fingerprints={"fetch_record": "fp-B"})
+    assert res.requery_count == 0
+    assert _stubbed(res) == []
+    assert [m.content for m in res.messages] == [m.content for m in msgs]
+
+
+def test_requery_keeps_a_bound_tool_result_with_no_recorded_fingerprint() -> None:
+    msgs = [*_bound_turn("a", 6, None), HumanMessage(content="now")]
+    res = _run(msgs, requery_tools=_RQ, requery_current_fingerprints={"fetch_record": "fp-A"})
+    assert res.requery_count == 0
+    assert _stubbed(res) == []
+
+
+def test_requery_unrestricted_when_the_tool_has_no_variable_binding() -> None:
+    msgs = [*_bound_turn("a", 6, None), HumanMessage(content="now")]
+    res = _run(msgs, requery_tools=_RQ, requery_current_fingerprints={"fetch_record": None})
+    assert res.requery_count == 5
+
+
+def test_copy_reference_of_a_bound_tool_ignores_the_fingerprint() -> None:
+    msgs = [*_bound_turn("a", 6, "fp-A", persisted=True), HumanMessage(content="now")]
+    res = _run(msgs, requery_tools=_RQ, requery_current_fingerprints={"fetch_record": "fp-B"})
+    stubs = _stubbed(res)
+    assert res.requery_count == 0
+    assert len(stubs) == 5
+    assert all("Saved to .tool_results/" in str(m.content) for m in stubs)

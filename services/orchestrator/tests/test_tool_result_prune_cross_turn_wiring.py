@@ -13,8 +13,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -22,8 +23,21 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.runtime.checkpointer import make_checkpointer
-from orchestrator import GraphRunner, ToolRegistry, ToolSpec, build_react_graph
+from orchestrator import (
+    GraphRunner,
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+    build_react_graph,
+)
 from orchestrator.context import ToolResultPruner
+from orchestrator.sse import PROMPT_INPUTS_KEY
+from orchestrator.tools.arg_bindings import (
+    BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY,
+    ToolArgBindings,
+    bound_values_fingerprint,
+)
 from orchestrator.tools.overflow import TOOL_RESULT_PATH_ARTIFACT_KEY
 
 _BIG = "q" * 8000
@@ -201,3 +215,130 @@ async def test_requery_stub_reaches_the_llm_and_checkpoint_is_intact() -> None:
     assert sum("call the same tool again" in str(m.content) for m in prompt_tools) == 2
     saved = [m for m in state["messages"] if isinstance(m, ToolMessage)]
     assert all(str(m.content).startswith("r" * 100) for m in saved)
+
+
+# ------------------------------------------- B-129 变量绑定的工具:派发记指纹,再查按指纹
+
+
+_BOUND = ToolArgBindings(args={"project_code": "project"}, fixed={"scope": "all"})
+
+
+@dataclass
+class _RecordingWriter:
+    writes: dict[str, str] = field(default_factory=dict)
+
+    async def write(self, *, rel: str, content: str) -> None:
+        self.writes[rel] = content
+
+
+@dataclass
+class _LookupTool:
+    """只读查询工具;正文落在持久化区间(4k-12k),派发时会写盘并把路径记进 artifact。"""
+
+    name: str = "lookup"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=self.name, description="lookup", is_read_only=True)
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        return ToolResult(content="v" * 6_000, meta={"source": "unit"})
+
+
+@dataclass
+class _OneCallLLM:
+    calls: int = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "lookup", "args": {}, "id": "tc-1", "type": "tool_call"}],
+            )
+        return AIMessage(content="done")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_records_bound_values_fingerprint_and_keeps_the_copy_path() -> None:
+    registry = ToolRegistry()
+    registry.register(_LookupTool())
+    registry.bind_tool_args("lookup", _BOUND)
+    writer = _RecordingWriter()
+    inputs = {"project": "P-1"}
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=_OneCallLLM(),
+                tool_registry=registry,
+                workspace_writer_factory=lambda _ctx: writer,
+            )
+        )
+        cfg: RunnableConfig = {
+            "configurable": {"thread_id": str(uuid4()), PROMPT_INPUTS_KEY: inputs}
+        }
+        state = await compiled.ainvoke(
+            {"messages": [HumanMessage(content="go")], "step_count": 0, "max_steps": 5},
+            config=cfg,
+        )
+    (message,) = [m for m in state["messages"] if isinstance(m, ToolMessage)]
+    artifact = message.artifact
+    assert isinstance(artifact, dict)
+    assert artifact[BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY] == bound_values_fingerprint(_BOUND, inputs)
+    assert artifact[TOOL_RESULT_PATH_ARTIFACT_KEY] == ".tool_results/adhoc/tc-1-lookup.txt"
+    assert artifact["source"] == "unit"
+    assert "P-1" not in str(artifact)
+
+
+def _bound_history(fp: str | None) -> list[BaseMessage]:
+    history: list[BaseMessage] = [HumanMessage(content="user a")]
+    for i in range(3):
+        cid = f"a-{i}"
+        history += [
+            AIMessage(content="", tool_calls=[{"id": cid, "name": "lookup", "args": {}}]),
+            ToolMessage(
+                content="r" * 8000 + f"#{i}",
+                tool_call_id=cid,
+                name="lookup",
+                artifact={BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY: fp} if fp else None,
+            ),
+        ]
+    history += [AIMessage(content="answer a"), HumanMessage(content="now")]
+    return history
+
+
+async def _requery_prompt(history: list[BaseMessage], inputs: Mapping[str, Any]) -> list[str]:
+    registry = ToolRegistry()
+    registry.register(_LookupTool())
+    registry.bind_tool_args("lookup", _BOUND)
+    llm = _RecordingLLM()
+    pruner = ToolResultPruner(
+        context_window=10**9,
+        recent_tool_results_kept=1,
+        min_context_tokens=100,
+        min_reclaim_tokens=100,
+        requery_tools=frozenset({"lookup"}),
+    )
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=registry, tool_result_pruner=pruner)
+        )
+        cfg: RunnableConfig = {
+            "configurable": {"thread_id": str(uuid4()), PROMPT_INPUTS_KEY: dict(inputs)}
+        }
+        await compiled.ainvoke({"messages": history, "step_count": 0, "max_steps": 5}, config=cfg)
+    return [str(m.content) for m in llm.seen[0] if isinstance(m, ToolMessage)]
+
+
+@pytest.mark.asyncio
+async def test_agent_node_requery_stubs_only_when_this_turns_bound_values_match() -> None:
+    same = bound_values_fingerprint(_BOUND, {"project": "P-1"})
+    stubbed = await _requery_prompt(_bound_history(same), {"project": "P-1"})
+    assert sum("call the same tool again" in c for c in stubbed) == 2
+    kept = await _requery_prompt(_bound_history(same), {"project": "P-2"})
+    assert sum("call the same tool again" in c for c in kept) == 0
+    assert all(c.startswith("r" * 100) for c in kept)

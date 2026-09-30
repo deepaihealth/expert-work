@@ -40,11 +40,17 @@ false`` 的服务端会把多出来的键整个硬拒)。
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from expert_work.protocol import ArgBindingSpec, MCPToolSpec
+
+#: B-129 —— ``ToolMessage.artifact`` 里记「这次调用用的变量绑定值」指纹的键。只存哈希,
+#: 不存值(值就是客户资料);``artifact`` 不发给模型。
+BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY = "expert_work_bound_args_fp"
 
 
 @dataclass(frozen=True)
@@ -255,6 +261,23 @@ def apply_arg_bindings(
         new_call["args"] = args
         filled.append(new_call)
     return filled, names
+
+
+def bound_values_fingerprint(bound: ToolArgBindings, inputs: Mapping[str, Any]) -> str | None:
+    """B-129 —— 这个工具的**变量绑定**本轮取到的值的指纹(sha256 hex);没有变量绑定 → ``None``。
+
+    再查提示(「用同样的参数再调一次」)只在本轮的被绑值与当初那次调用用的一样时才成立:
+    被绑参数不在模型可见的 args 里,换了一轮、输入指向另一个实体,再调一次查到的就是别人的
+    数据。固定值(``fixed``)每轮都一样,不算。变量本轮没传记作 ``null``(与填值那步把参数
+    删掉对应)。只有哈希离开本函数,值本身不记、不返回。
+    """
+    if not bound.args:
+        return None
+    used = {param: inputs.get(var_name) for param, var_name in bound.args.items()}
+    canonical = json.dumps(
+        used, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def manifest_bindings(tools: Sequence[Any]) -> tuple[ArgBindingSpec, ...]:

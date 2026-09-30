@@ -10,6 +10,7 @@ from orchestrator.tools.arg_bindings import (
     ToolArgBindings,
     apply_arg_bindings,
     bindings_by_tool,
+    bound_values_fingerprint,
     manifest_bindings,
     strip_bound_params,
 )
@@ -358,3 +359,43 @@ def test_apply_fills_variables_and_fixed_values_together() -> None:
     )
     assert filled[0]["args"] == {"project_code": "PRJ001", "detail_level": "brief"}
     assert names == ["project_code", "detail_level"]
+
+
+# ---------------------------------------------------------------- B-129 指纹
+
+
+def test_fingerprint_is_none_without_variable_bindings() -> None:
+    assert bound_values_fingerprint(ToolArgBindings(), {"pc": "P-1"}) is None
+
+
+def test_fingerprint_ignores_fixed_only_bindings() -> None:
+    bound = ToolArgBindings(fixed={"scope": "all"})
+    assert bound_values_fingerprint(bound, {"pc": "P-1"}) is None
+
+
+def test_fingerprint_is_deterministic_for_equal_inputs() -> None:
+    bound = ToolArgBindings(args={"project_code": "pc", "member": "m"})
+    first = bound_values_fingerprint(bound, {"pc": "P-1", "m": {"id": 7}, "x": 1})
+    second = bound_values_fingerprint(bound, {"m": {"id": 7}, "pc": "P-1"})
+    assert first is not None
+    assert first == second
+
+
+def test_fingerprint_changes_when_a_bound_value_changes() -> None:
+    bound = ToolArgBindings(args={"project_code": "pc"}, fixed={"scope": "all"})
+    assert bound_values_fingerprint(bound, {"pc": "P-1"}) != bound_values_fingerprint(
+        bound, {"pc": "P-2"}
+    )
+
+
+def test_fingerprint_distinguishes_a_missing_variable_from_a_present_one() -> None:
+    bound = ToolArgBindings(args={"project_code": "pc"})
+    assert bound_values_fingerprint(bound, {}) != bound_values_fingerprint(bound, {"pc": "P-1"})
+
+
+def test_fingerprint_never_carries_the_raw_value() -> None:
+    bound = ToolArgBindings(args={"project_code": "pc"})
+    fp = bound_values_fingerprint(bound, {"pc": "RAW-VALUE-123"})
+    assert fp is not None
+    assert "RAW-VALUE-123" not in fp
+    assert len(fp) == 64

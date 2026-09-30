@@ -68,6 +68,7 @@ from expert_work.common.conversation_channel import is_hidden
 from expert_work.runtime.tokens import TokenEstimator
 from orchestrator.context.compressor import estimate_tokens
 from orchestrator.context.skill_reference import skill_view_reference
+from orchestrator.tools.arg_bindings import BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY
 from orchestrator.tools.overflow import (
     OVERFLOW_DIR,
     OVERFLOW_FOOTER_TAG_OPEN,
@@ -393,6 +394,19 @@ def _cross_turn_stub(
     )
 
 
+def _bound_values_match(message: ToolMessage, current: str | None) -> bool:
+    """B-129 —— 变量绑定的工具:本轮被绑值的指纹与这条结果当初记下的一致才算能再查。
+
+    ``current`` 为 ``None`` = 这个工具没有变量绑定,不设限。记录缺失或不等一律不算 ——
+    宁可不收,也不让模型用本轮的输入去查另一个实体、再当成旧结果。
+    """
+    if current is None:
+        return True
+    art = message.artifact
+    recorded = art.get(BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY) if isinstance(art, dict) else None
+    return isinstance(recorded, str) and recorded == current
+
+
 def _requery_stub(message: ToolMessage, *, args: Mapping[str, Any] | None) -> str:
     """B-129 —— 只读、可重新查询的旧结果的提示:只含工具名、参数提示、字数,不外带正文。"""
     content = message.content
@@ -418,6 +432,7 @@ def prune_prior_turns(
     estimator: TokenEstimator | None = None,
     requery_tools: frozenset[str] = frozenset(),
     requery_min_chars: int = REQUERY_MIN_CHARS,
+    requery_current_fingerprints: Mapping[str, str | None] | None = None,
 ) -> PruneResult:
     """B-126 —— 新一轮开头无损收起更早轮次的大块工具结果。
 
@@ -434,7 +449,13 @@ def prune_prior_turns(
     B-129 —— 没有无损引用、但工具在 ``requery_tools`` 里且正文 ≥
     ``requery_min_chars`` 的结果,收成「再调一次」提示(不外带正文)。优先级:
     无损引用 > 再查 > 不动。
+
+    ``requery_current_fingerprints``(工具名 → 本轮被绑值的指纹,见
+    :func:`~orchestrator.tools.arg_bindings.bound_values_fingerprint`):有变量绑定的
+    工具只在结果记下的指纹与本轮一致时才收成再查提示;缺失或不等 → 不动。无损引用不受影响。
+    整轮不变(本轮输入在一个 run 内不变),前缀稳定性不受影响。
     """
+    current_fps = requery_current_fingerprints or {}
     msgs = list(messages)
     boundary = current_turn_start(msgs)
     if boundary == 0:
@@ -482,7 +503,11 @@ def prune_prior_turns(
         if reference is not None:
             stub = _cross_turn_stub(m, args=args, reference=reference)
             is_requery = False
-        elif m.name in requery_tools and len(content) >= requery_min_chars:
+        elif (
+            m.name in requery_tools
+            and len(content) >= requery_min_chars
+            and _bound_values_match(m, current_fps.get(m.name or ""))
+        ):
             stub = _requery_stub(m, args=args)
             is_requery = True
         else:
@@ -542,8 +567,16 @@ class ToolResultPruner:
     def should_prune(self, messages: Sequence[BaseMessage]) -> bool:
         return estimate_tokens(messages, estimator=self.estimator) >= self.threshold_tokens
 
-    def apply(self, messages: Sequence[BaseMessage]) -> PruneResult:
-        """先跨轮无损清理(新一轮开头),再按兜底门槛逐次清理。"""
+    def apply(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        requery_current_fingerprints: Mapping[str, str | None] | None = None,
+    ) -> PruneResult:
+        """先跨轮无损清理(新一轮开头),再按兜底门槛逐次清理。
+
+        ``requery_current_fingerprints`` 见 :func:`prune_prior_turns`。
+        """
         msgs = list(messages)
         pruned = 0
         reclaimed = 0
@@ -556,6 +589,7 @@ class ToolResultPruner:
                 min_reclaim_tokens=self.min_reclaim_tokens,
                 estimator=self.estimator,
                 requery_tools=self.requery_tools if self.requery else frozenset(),
+                requery_current_fingerprints=requery_current_fingerprints,
             )
             msgs, pruned, reclaimed = cross.messages, cross.pruned_count, cross.reclaimed_tokens
             requery = cross.requery_count

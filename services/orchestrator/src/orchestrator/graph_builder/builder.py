@@ -184,7 +184,12 @@ from orchestrator.tools._guards import (
     usage_total,
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
-from orchestrator.tools.arg_bindings import apply_arg_bindings
+from orchestrator.tools.arg_bindings import (
+    BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY,
+    ToolArgBindings,
+    apply_arg_bindings,
+    bound_values_fingerprint,
+)
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
@@ -733,7 +738,14 @@ def build_react_graph(
         # only — the checkpointed history is never rewritten (CM-C4).
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "context_gates") as gates_span:
             if tool_result_pruner is not None:
-                pruned = tool_result_pruner.apply(messages)
+                # B-129 —— 变量绑定的工具只在本轮被绑值与当初一致时才收成再查提示。
+                # 本轮输入在一个 run 内不变,这张表每次调用都一样,前缀稳定。
+                pruned = tool_result_pruner.apply(
+                    messages,
+                    requery_current_fingerprints=_bound_fingerprints(
+                        tool_registry.arg_bindings(), config
+                    ),
+                )
                 messages = pruned.messages
                 if pruned.reclaimed_tokens:
                     _cm_cross_turn_reclaimed_tokens.inc(pruned.reclaimed_tokens)
@@ -1544,6 +1556,8 @@ def build_react_graph(
             return filled, names_by_index
 
         tool_calls, bound_arg_names = _fill_bound_args(tool_calls)
+        # B-129 —— 本轮被绑值的指纹,派发后记进 ToolMessage.artifact(只存哈希)。
+        bound_fps = _bound_fingerprints(registry_bindings, config)
         # B-61 §5.4 / §8 —— 运行期兜底告警。保存时的试建早就过去了,对方服务器
         # 是**保存之后**下线 / 改名的那条路上,这里是唯一还能说话的地方 —— 不说
         # 就是静默失效:参数回到模型手里,模型继续手抄那串长字符串。
@@ -1776,7 +1790,7 @@ def build_react_graph(
             # a cancel mid-batch interrupts every in-flight tool via
             # the shared token.
             token.raise_if_cancelled()
-            return await token.run_cancellable(
+            dispatched = await token.run_cancellable(
                 _dispatch_tool(
                     tc,
                     tool_registry,
@@ -1789,6 +1803,11 @@ def build_react_graph(
                     bound_args=bound_args,
                 )
             )
+            fingerprint = bound_fps.get(str(tc.get("name", "")))
+            if fingerprint is None:
+                return dispatched
+            message, state_updates, refund, classified = dispatched
+            return _with_bound_fingerprint(message, fingerprint), state_updates, refund, classified
 
         semaphore = asyncio.Semaphore(MAX_TOOL_WORKERS)
 
@@ -3863,6 +3882,33 @@ def _build_tool_context(
         inputs_run_id=inputs_run_id,
         prompt_inputs=prompt_inputs,
     )
+
+
+def _bound_fingerprints(
+    bindings: Mapping[str, ToolArgBindings], config: RunnableConfig
+) -> dict[str, str | None]:
+    """B-129 —— 工具名 → 本轮变量绑定值的指纹(没有变量绑定的为 ``None``)。
+
+    输入取法与 ``tools_node`` 填值那一步相同(``PROMPT_INPUTS_KEY``),两边算出的指纹才对得上。
+    """
+    if not bindings:
+        return {}
+    raw_inputs = (config.get("configurable") or {}).get(PROMPT_INPUTS_KEY) or {}
+    inputs = raw_inputs if isinstance(raw_inputs, Mapping) else {}
+    return {name: bound_values_fingerprint(bound, inputs) for name, bound in bindings.items()}
+
+
+def _with_bound_fingerprint(message: ToolMessage, fingerprint: str) -> ToolMessage:
+    """B-129 —— 把指纹**并入** ``artifact``(保留持久化路径等已有键);非 dict 的不动。"""
+    art = message.artifact
+    if art is None:
+        merged: dict[str, Any] = {}
+    elif isinstance(art, dict):
+        merged = dict(art)
+    else:
+        return message
+    merged[BOUND_ARGS_FINGERPRINT_ARTIFACT_KEY] = fingerprint
+    return message.model_copy(update={"artifact": merged})
 
 
 def _string_list(raw: object) -> tuple[str, ...]:
