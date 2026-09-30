@@ -79,7 +79,9 @@ def _edited_plan() -> Plan:
         goal="ship the feature",
         steps=(
             PlanStep(id="1", description="write tests", status="completed"),
-            PlanStep(id="2", description="implement", status="completed"),
+            # B-131 —— 本轮自然结束时平台会把未完成的步骤都标成完成,勾选状态分不出
+            # 「人改的 PLAN.md 生效」与「DB 计划保留」;人改的是步骤文字,按文字判。
+            PlanStep(id="2", description="implement and deploy", status="completed"),
         ),
     )
 
@@ -163,7 +165,7 @@ async def test_resume_approve_ingests_pause_edit() -> None:
     assert tool.dispatched == 1
     plan = final.get("plan")
     assert plan is not None
-    assert [s.status for s in plan.steps] == ["completed", "completed"]
+    assert [s.description for s in plan.steps] == ["write tests", "implement and deploy"]
 
 
 async def test_resume_reject_still_ingests_pause_edit() -> None:
@@ -173,7 +175,7 @@ async def test_resume_reject_still_ingests_pause_edit() -> None:
     # …but the human's PLAN.md edit is not voided by the verdict.
     plan = final.get("plan")
     assert plan is not None
-    assert [s.status for s in plan.steps] == ["completed", "completed"]
+    assert [s.description for s in plan.steps] == ["write tests", "implement and deploy"]
 
 
 async def test_resume_without_ingest_wiring_keeps_db_plan() -> None:
@@ -182,4 +184,4 @@ async def test_resume_without_ingest_wiring_keeps_db_plan() -> None:
     plan = final.get("plan")
     assert plan is not None
     # No ingest node → pre-CM-8 behaviour, the DB plan stands.
-    assert [s.status for s in plan.steps] == ["completed", "in_progress"]
+    assert [s.description for s in plan.steps] == ["write tests", "implement"]

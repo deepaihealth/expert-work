@@ -159,7 +159,11 @@ from orchestrator.graph_builder.input_url_guard import (
     guard_message,
 )
 from orchestrator.graph_builder.memory import MemoryNode, PreCompactionFlush
-from orchestrator.graph_builder.planner import PlannerNode, render_plan
+from orchestrator.graph_builder.planner import (
+    PlannerNode,
+    complete_open_steps,
+    render_plan,
+)
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
@@ -1975,6 +1979,37 @@ def build_react_graph(
             result_dict["last_projection_hash"] = projection.digest
         return result_dict
 
+    async def plan_close_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        """B-131 —— 本轮真正结束时,把计划里所有未完成的步骤标为完成,并同步 PLAN.md。
+
+        只挂在「自然答完」的出口上(agent 无 tool_calls 且不再回 agent;有复查时是复查
+        通过之后):派发打回、复查要求返工都回到 agent,不经过这里;审批暂停 / 拒绝走
+        tools → END,也不经过这里。步数 / 预算耗尽的收尾同样到这里,但 ``exit_reason``
+        不是 ``text_response``,原样放过。标完成后立刻投影一次 PLAN.md:投影平时只在
+        tools_node 里做,不补这一次的话,下一轮 workspace_ingest 读回的旧文件会被当成
+        人工修改,把步骤改回「进行中」。
+        """
+        if state.get("exit_reason") != "text_response":
+            return {}
+        completed = complete_open_steps(state.get("plan"))
+        if completed is None:
+            return {}
+        update: dict[str, Any] = {"plan": completed}
+        projection = await _project_workspace_state(
+            workspace_writer_factory,
+            {**state, "plan": completed},
+            _build_tool_context(config, plan=completed),
+            audit_logger_from_config(config),
+            prefix=(
+                None
+                if (config.get("configurable") or {}).get("child_run")
+                else safe_thread_projection_prefix(configurable_uuid(config, "thread_id"))
+            ),
+        )
+        if projection is not None and not projection.skipped:
+            update["last_projection_hash"] = projection.digest
+        return update
+
     graph: StateGraph[AgentState, None, AgentState, AgentState] = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
@@ -2025,6 +2060,12 @@ def build_react_graph(
         graph.add_node("memory_writeback", memory_writeback_node)  # type: ignore[arg-type]
         graph.add_edge("memory_writeback", END)
         end_target = "memory_writeback"
+    # B-131 —— 自然答完且计划里还有没完成的步骤时,先经 plan_close(标完成 + 同步
+    # PLAN.md)再去原来的终点;其余情况照旧直达终点。只在需要时才进:定时任务投递、
+    # 重新生成会用 ``aupdate_state(as_node="agent")`` 补一条消息,若无条件经过
+    # plan_close,图会停在「plan_close 待跑」,不再是干净的一轮结束。
+    graph.add_node("plan_close", plan_close_node)
+    graph.add_edge("plan_close", end_target)
 
     if reflect_node is not None:
         # When the agent stops issuing tool_calls, route to ``reflect``
@@ -2033,10 +2074,16 @@ def build_react_graph(
         graph.add_conditional_edges(
             "agent", _should_continue, {"tools": "tools", "agent": "agent", END: "reflect"}
         )
-        graph.add_conditional_edges("reflect", _after_reflect, {"agent": "agent", END: end_target})
+        graph.add_conditional_edges(
+            "reflect",
+            _with_plan_close(_after_reflect),
+            {"agent": "agent", "plan_close": "plan_close", END: end_target},
+        )
     else:
         graph.add_conditional_edges(
-            "agent", _should_continue, {"tools": "tools", "agent": "agent", END: end_target}
+            "agent",
+            _with_plan_close(_should_continue),
+            {"tools": "tools", "agent": "agent", "plan_close": "plan_close", END: end_target},
         )
     # Stream J.8 — after ``tools``, a run with ``pending_approval`` set
     # routes straight to END (RunStatus.PAUSED): the checkpoint persists
@@ -2082,6 +2129,24 @@ async def _check_truncation(
         )
         await after_llm_chain.invoke(ctx, _noop)
     raise OutputTruncatedError(cap)
+
+
+def _with_plan_close(
+    route: Callable[[AgentState], str],
+) -> Callable[[AgentState], str]:
+    """B-131 —— 把 ``route`` 的 END 改成 ``plan_close``,仅当这是自然答完且计划还有没完成的步骤。"""
+
+    def _routed(state: AgentState) -> str:
+        decision = route(state)
+        if (
+            decision == END
+            and state.get("exit_reason") == "text_response"
+            and complete_open_steps(state.get("plan")) is not None
+        ):
+            return "plan_close"
+        return decision
+
+    return _routed
 
 
 def _after_reflect(state: AgentState) -> Literal["agent", "__end__"]:

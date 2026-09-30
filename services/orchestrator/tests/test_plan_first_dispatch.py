@@ -298,6 +298,28 @@ async def test_dispatch_refusal_retries_once_then_degrades() -> None:
     assert not state.get("plan_first_dispatch_active")
 
 
+@pytest.mark.asyncio
+async def test_dispatch_refusal_does_not_auto_complete_an_in_progress_delegate_step() -> None:
+    """B-131 review round 1, finding 2 —— 派发打回的那一轮不是真正结束。要是在这里把
+    「进行中」的委派步骤自动标完成,``pending_delegate`` 就空了,重试不会发生。"""
+    steps = [
+        {**_DELEGATE_STEPS[0], "status": "in_progress"},
+        {**_DELEGATE_STEPS[1], "status": "in_progress"},
+        _DELEGATE_STEPS[2],
+    ]
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", steps)]),
+            AIMessage(content="I'd rather just answer."),
+            AIMessage(content="Still answering in prose."),
+            AIMessage(content="final answer"),
+        ]
+    )
+    state = await _run(llm, thread_id="dispatch-inprogress")
+    assert len(_hidden_with(state, _RETRY_MARKER)) == 1
+    assert len(_hidden_with(state, _DEGRADED_MARKER)) == 1
+
+
 # ---------------------------------------------------------------------------
 # Budget wrap-up wins over dispatch
 # ---------------------------------------------------------------------------
