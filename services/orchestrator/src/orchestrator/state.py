@@ -305,6 +305,14 @@ class AgentState(TypedDict):
     #: per-turn bind slims down).
     promoted_tool_last_used: NotRequired[Annotated[dict[str, int], _merge_last_used]]
     last_projection_hash: NotRequired[str | None]
+    #: PLAN.md 完整性 —— 我们自己最近一次**成功写入** ``PLAN.md`` 的那份正文的摘要
+    #: (:func:`~orchestrator.context.plan_md_digest`),或者 run 开始时已处理过的那份
+    #: 人工改动的摘要。``workspace_ingest`` 读回的文件与它相同 = 还是我们写的那份、没人
+    #: 动过 → 不导入:那是**上一轮**的计划,导入会盖掉 planner 刚为本轮做的新计划。
+    #: 只在 PLAN.md 那一次写成功时前进(写失败时文件还是旧内容,旧摘要仍然对);
+    #: 投影因内容未变跳过时不动。缺省 / ``None``(本字段上线前就投影过的会话,或从没
+    #: 投影过)一律当「没改过」,分不清人改与自己的旧投影,宁可不导入。
+    last_plan_md_digest: NotRequired[str | None]
     #: 动态子智能体委派增强(层 1)— identity hash (goal + step descriptions,
     #: statuses excluded) of the last plan the ``tools_node`` nudged the agent
     #: about after an ``update_plan``. Dedupe key: one delegation nudge per
@@ -315,8 +323,10 @@ class AgentState(TypedDict):
     #: B-35(plan_first 分发轮)— identity hash (goal + step descriptions +
     #: execution markers, statuses excluded) of the last plan version a
     #: dispatch turn ran for. Dedupe key: one dispatch turn per plan version;
-    #: a structural replan (new/changed delegate steps) re-fires. All three
-    #: channels are only ever written when the build has ``plan_first`` on.
+    #: a structural replan re-fires, but only for delegate steps not yet
+    #: listed in a dispatch turn (``plan_first_dispatched_steps``). All
+    #: dispatch channels are only ever written when the build has
+    #: ``plan_first`` on (the planner resets two of them at run start).
     plan_first_dispatch_plan_hash: NotRequired[str | None]
     #: B-35 — True while the just-finished agent turn was a dispatch turn;
     #: ``_should_continue`` routes a tool-less reply back to ``agent``
@@ -325,6 +335,12 @@ class AgentState(TypedDict):
     #: B-35 — 0 on a fresh dispatch turn, 1 once the single retry was spent;
     #: the next refusal degrades (full tools restored) instead of looping.
     plan_first_dispatch_retries: NotRequired[int]
+    #: 防重复派发 —— 本条计划谱系里已经在分发指令中列出过的委派步骤(按描述)。委派
+    #: 标记跨 ``update_plan`` 保留之后,一次结构性改计划会让 ``_dispatch_plan_hash``
+    #: 变化;只有**不在**这里的未完成委派步骤才能开新的分发轮,已经派出去、只是还没
+    #: 标完成的步骤不会被再派一次。planner 在 run 开始产出新计划时清空。同样只在
+    #: ``plan_first`` 开着时写。
+    plan_first_dispatched_steps: NotRequired[list[str]]
     #: B-64 —— ``read_page`` 渲出来、已经给过模型的页 ref,按**最近一次**看到的
     #: 次序(见 :func:`_merge_viewed_figures`)。跨 run 累积:run 的起始输入
     #: (``control_plane.api.runs``)不写这个键,检查点里的旧值于是整条会话一直在。

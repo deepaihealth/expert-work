@@ -27,7 +27,7 @@ from orchestrator import (
     ToolSpec,
     build_react_graph,
 )
-from orchestrator.context import WorkspaceFileWriter
+from orchestrator.context import WorkspaceFileWriter, plan_md_digest
 
 
 @dataclass
@@ -136,6 +136,11 @@ async def test_turn_end_projection_writes_plan_files() -> None:
     assert "no longer read" in writer.writes["PLAN.md"]
     # The projection cursor is persisted on the checkpointed state.
     assert state.get("last_projection_hash")
+    # PLAN.md 完整性 —— 写进去的那份 PLAN.md 的摘要同样落检查点(tools_node 这一处;
+    # 计划只有一个已完成步骤,plan_close 不会再投影)。
+    assert state.get("last_plan_md_digest") == plan_md_digest(
+        writer.writes[f"threads/{T1}/PLAN.md"]
+    )
 
 
 async def test_traversal_bearing_thread_id_projects_nothing() -> None:

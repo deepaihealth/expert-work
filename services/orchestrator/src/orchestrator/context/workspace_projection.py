@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from expert_work.protocol import MemoryItem, Plan, PlanStep
-from expert_work.protocol.plan import PlanStepStatus
+from expert_work.protocol.plan import PlanStepExecution, PlanStepStatus
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,12 @@ LEGACY_REDIRECT_NOTE = (
 _STATUS_BOX: dict[PlanStepStatus, str] = {"pending": " ", "in_progress": "~", "completed": "x"}
 _BOX_STATUS: dict[str, PlanStepStatus] = {" ": "pending", "~": "in_progress", "x": "completed"}
 
+#: 委派标记 —— ``execution=delegate`` 的步骤在 PLAN.md 里描述行末尾带这个记号,
+#: 人能看懂、也能自己删 / 加;``inline`` 步骤不带任何记号,所以没有委派步骤的计划
+#: 渲染结果与加标记之前逐字节相同(已有文件的摘要不变)。``parse_plan_md`` 认它、
+#: 剥掉它,把步骤还原成 ``delegate`` —— 否则读回来的计划每一步都成了 ``inline``。
+_DELEGATE_TAG = "_(delegate)_"
+
 #: One PLAN.md step line, e.g. ``- [x] 1. write tests``. ``id`` is non-greedy
 #: up to the first ``. `` so dotted ids (``1.2``) parse correctly.
 _PLAN_STEP_RE = re.compile(r"^- \[(.)\] (\S+?)\.\s+(.*)$", re.MULTILINE)
@@ -115,9 +121,16 @@ def render_plan_md(plan: Plan | None) -> str:
     lines = [_PLAN_NOTE, "", "# Plan", "", f"**Goal:** {plan.goal}", "", "## Steps", ""]
     lines.extend(
         f"- [{_STATUS_BOX.get(step.status, ' ')}] {step.id}. {step.description}"
+        + (f" {_DELEGATE_TAG}" if step.execution == "delegate" else "")
         for step in plan.steps
     )
     return "\n".join(lines) + "\n"
+
+
+def plan_md_digest(text: str) -> str:
+    """PLAN.md 正文的摘要(UTF-8 字节的 sha256)。投影写入成功时记下写进去的那一份,
+    run 开始时与读回的文件比对:相同 = 文件还是我们自己写的那份,没人动过。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def render_todo_md(plan: Plan | None) -> str:
@@ -153,9 +166,16 @@ def parse_plan_md(text: str) -> Plan | None:
     if goal_match is None:
         return None
     steps: list[PlanStep] = []
-    for box, step_id, description in _PLAN_STEP_RE.findall(text):
+    for box, step_id, raw_description in _PLAN_STEP_RE.findall(text):
         status = _BOX_STATUS.get(box, "pending")
-        steps.append(PlanStep(id=step_id, description=description.strip(), status=status))
+        description = raw_description.strip()
+        execution: PlanStepExecution = "inline"
+        if description.endswith(_DELEGATE_TAG):
+            description = description[: -len(_DELEGATE_TAG)].rstrip()
+            execution = "delegate"
+        steps.append(
+            PlanStep(id=step_id, description=description, status=status, execution=execution)
+        )
     if not steps:
         return None
     return Plan(goal=goal_match.group(1).strip(), steps=tuple(steps))
@@ -182,11 +202,20 @@ class ProjectionResult:
     when every intended write succeeded; on a partial failure it stays at the
     caller's ``last_digest`` so the next turn retries. ``None`` means there
     was nothing to project.
+
+    ``plan_md_digest`` is :func:`plan_md_digest` of the PLAN.md text **this
+    call actually wrote** — set only when the PLAN.md write itself succeeded
+    (independent of TODO.md / MEMORY.md), ``None`` otherwise (skipped, no
+    plan, or that write failed: the file still holds the older content whose
+    digest the caller already stored). The caller persists it as
+    ``last_plan_md_digest`` so the run-start ingest can tell our own
+    projection apart from a genuine edit.
     """
 
     written: tuple[str, ...]
     skipped: bool
     digest: str | None
+    plan_md_digest: str | None = None
 
 
 def _digest(items: Sequence[tuple[str, str]]) -> str | None:
@@ -257,6 +286,7 @@ class WorkspaceProjector:
 
         written: list[str] = []
         all_ok = True
+        written_plan_md_digest: str | None = None
         for rel, content in to_write:
             try:
                 await self.writer.write(rel=rel, content=content)
@@ -271,13 +301,20 @@ class WorkspaceProjector:
                 )
                 continue
             written.append(rel)
+            if plan_md and rel == prefix + PLAN_FILE and content == plan_md:
+                written_plan_md_digest = plan_md_digest(plan_md)
 
         out_digest = digest if all_ok else last_digest
         logger.info(
             "workspace_projection.projected",
             extra={"written": written, "all_ok": all_ok},
         )
-        return ProjectionResult(written=tuple(written), skipped=False, digest=out_digest)
+        return ProjectionResult(
+            written=tuple(written),
+            skipped=False,
+            digest=out_digest,
+            plan_md_digest=written_plan_md_digest,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +332,21 @@ class WorkspaceFileReader(Protocol):
 
 
 @dataclass(frozen=True)
+class PlanIngest:
+    """A genuine edit of ``PLAN.md`` found at run start.
+
+    ``digest`` is :func:`plan_md_digest` of the edited file text — the caller
+    records it as ``last_plan_md_digest`` once it has dealt with the edit, so
+    the same edit is consumed exactly once and never re-applied over a later
+    planner plan. ``plan`` is the parsed candidate to apply (after the strict
+    injection scan), or ``None`` when the edit parses to the plan already in
+    state (nothing to apply, but still consumed)."""
+
+    plan: Plan | None
+    digest: str
+
+
+@dataclass(frozen=True)
 class WorkspaceIngester:
     """Reads the human-/agent-editable ``PLAN.md`` back into a candidate
     :class:`Plan` (Mini-ADR CM-A2, the ``file → DB`` direction). The caller
@@ -303,14 +355,30 @@ class WorkspaceIngester:
 
     reader: WorkspaceFileReader
 
-    async def ingest_plan(self, *, current: Plan | None, prefix: str) -> Plan | None:
+    async def ingest_plan(
+        self, *, current: Plan | None, prefix: str, last_written_digest: str | None
+    ) -> PlanIngest | None:
         """Read + parse the thread's ``PLAN.md`` (under ``prefix`` — BUG-10
         方案 a: never the workspace root, which is user-scoped cross-thread
-        state). Returns the parsed plan **only** when it differs from
-        ``current`` (a genuine edit); returns ``None`` when the file is
-        absent, unparseable, or unchanged. Never raises — projection / ingest
-        must not break a run (Mini-ADR CM-A8); a read failure is logged and
-        treated as "no edit"."""
+        state). Never raises — projection / ingest must not break a run
+        (Mini-ADR CM-A8); a read failure is logged and treated as "no edit".
+
+        Only a **genuine edit** counts: the file is compared with
+        ``last_written_digest`` — the digest of the PLAN.md text our own
+        projection last wrote (``AgentState.last_plan_md_digest``):
+
+        * equal → the file is our projection, untouched → ``None``. It holds
+          the *previous* turn's plan; adopting it would overwrite the plan the
+          planner just made for this turn (the stale-clobber bug).
+        * ``None`` (thread projected before the digest existed, or never) →
+          ``None``: a human edit cannot be told apart from our own stale
+          projection, and adopting a stale plan is the bug.
+        * different → a human / the agent edited it → parse it; unparseable →
+          ``None``; parsed equal to ``current`` → ``PlanIngest(plan=None)``;
+          else ``PlanIngest(plan=parsed)``.
+        """
+        if last_written_digest is None:
+            return None
         try:
             text = await self.reader.read(prefix + PLAN_FILE)
         except Exception:
@@ -318,10 +386,13 @@ class WorkspaceIngester:
             return None
         if not text:
             return None
+        digest = plan_md_digest(text)
+        if digest == last_written_digest:
+            return None
         parsed = parse_plan_md(text)
         if parsed is None:
             logger.warning("workspace_ingest.parse_failed")
             return None
         if parsed == current:
-            return None
-        return parsed
+            return PlanIngest(plan=None, digest=digest)
+        return PlanIngest(plan=parsed, digest=digest)

@@ -125,6 +125,22 @@ def test_render_plan_shows_status_checkboxes() -> None:
     assert any("[ ] 3. todo step" in line for line in lines)
 
 
+def test_render_plan_marks_delegate_steps() -> None:
+    """模型每轮读的计划要看得见委派标记;inline 步骤原样不变。"""
+    plan = Plan.model_validate(
+        {
+            "goal": "win",
+            "steps": [
+                {"id": "1", "description": "read reports", "execution": "delegate"},
+                {"id": "2", "description": "decide", "execution": "inline"},
+            ],
+        }
+    )
+    lines = render_plan(plan).splitlines()
+    assert "- [ ] 1. (delegate) read reports" in lines
+    assert "- [ ] 2. decide" in lines
+
+
 # ---------------------------------------------------------------------------
 # planner node
 # ---------------------------------------------------------------------------
@@ -358,6 +374,29 @@ async def test_plan_first_planner_prompt_asks_for_execution_markers() -> None:
     # 层 0 形状判据进 planner prompt。
     assert "independent" in system_text
     assert result["plan"].steps[0].execution == "delegate"
+
+
+@pytest.mark.asyncio
+async def test_plan_first_planner_starts_a_new_dispatch_lineage() -> None:
+    """新的一轮 = 新的计划谱系:清空已派步骤集合与分发去重键。"""
+    llm = _RecordingLLM(responses=[AIMessage(content='{"goal": "g", "steps": ["a"]}')])
+    node = make_planner_node(llm, plan_first=True)
+    state = {
+        **_state("do the thing"),
+        "plan_first_dispatched_steps": ["a"],
+        "plan_first_dispatch_plan_hash": "old",
+    }
+    result = await node(state, {"configurable": {}})  # type: ignore[arg-type]
+    assert result["plan_first_dispatched_steps"] == []
+    assert result["plan_first_dispatch_plan_hash"] is None
+
+
+@pytest.mark.asyncio
+async def test_planner_without_plan_first_writes_only_the_plan() -> None:
+    llm = _RecordingLLM(responses=[AIMessage(content='{"goal": "g", "steps": ["a"]}')])
+    node = make_planner_node(llm)
+    result = await node(_state("do the thing"), {"configurable": {}})  # type: ignore[arg-type]
+    assert set(result) == {"plan"}
 
 
 @pytest.mark.asyncio

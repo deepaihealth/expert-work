@@ -7,6 +7,11 @@ workspace and — when it genuinely changed and passes a strict prompt-injection
 scan — apply it to ``AgentState.plan``. The DB stays authoritative (Mini-ADR
 CM-A2/A8): a missing / unparseable / unchanged / injection-bearing file is a
 no-op that leaves ``state.plan`` untouched.
+
+"Genuinely changed" means the file differs from the PLAN.md text our own
+projection last wrote (``AgentState.last_plan_md_digest``) — NOT "differs from
+``state.plan``": at run start the planner has just made a new plan for this
+turn, while the untouched file still holds the previous turn's projection.
 """
 
 from __future__ import annotations
@@ -82,7 +87,9 @@ async def _emit_state_ingested_audit(
 def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
     """Build the entry-chain ingest node. Reads ``PLAN.md`` via the warm
     sandbox, parses it, and returns ``{"plan": ...}`` only on a genuine,
-    injection-clean edit; otherwise ``{}`` (DB authoritative).
+    injection-clean edit; otherwise ``{}`` (DB authoritative). A handled edit
+    also records its digest as ``last_plan_md_digest`` so it is consumed once
+    and never re-applied over a later turn's planner plan.
 
     The node's *existence* stays gated by the manifest ``persistent_workspace``
     flag in ``agent_factory`` (CM-0 plan-projection opt-in); the workspace mount
@@ -127,14 +134,23 @@ def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
             reader = SandboxWorkspaceReader(client=client, ctx=ctx)
             current = state.get("plan")
             try:
-                candidate = await token.run_cancellable(
-                    WorkspaceIngester(reader=reader).ingest_plan(current=current, prefix=prefix)
+                edit = await token.run_cancellable(
+                    WorkspaceIngester(reader=reader).ingest_plan(
+                        current=current,
+                        prefix=prefix,
+                        last_written_digest=state.get("last_plan_md_digest"),
+                    )
                 )
             except Exception:
                 logger.warning("workspace_ingest.failed", exc_info=True)
                 return {}
-            if candidate is None:
+            if edit is None:
                 return {}
+            consumed: dict[str, Any] = {"last_plan_md_digest": edit.digest}
+            candidate = edit.plan
+            if candidate is None:
+                # 改过但与当前计划相同:没东西可应用,记下摘要,免得下一轮把它当新改动。
+                return consumed
             # Strict injection scan on the human-edited content before it can land
             # in the plan the model executes against (Mini-ADR CM-A8). On a hit,
             # discard the edit — DB stays authoritative — and keep the file for
@@ -147,6 +163,6 @@ def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
             await _emit_state_ingested_audit(
                 audit_logger_from_config(config), ctx, steps=len(candidate.steps)
             )
-            return {"plan": candidate}
+            return {**consumed, "plan": candidate}
 
     return workspace_ingest_node

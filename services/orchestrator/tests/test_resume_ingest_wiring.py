@@ -30,7 +30,7 @@ from orchestrator import (
     build_react_graph,
     pending_request_binding,
 )
-from orchestrator.context import render_plan_md
+from orchestrator.context import plan_md_digest, render_plan_md
 from orchestrator.graph_builder import make_workspace_ingest_node
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
@@ -140,6 +140,10 @@ async def _pause_edit_resume(
                 "step_count": 0,
                 "max_steps": 5,
                 "plan": _db_plan(),
+                # The file before the pause is our own projection of the DB plan —
+                # its digest is what lets the resume ingest see the pause edit as
+                # a genuine edit (PLAN.md 完整性).
+                "last_plan_md_digest": plan_md_digest(render_plan_md(_db_plan())),
             },
             config=cfg,
         )

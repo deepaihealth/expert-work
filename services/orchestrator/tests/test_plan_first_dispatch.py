@@ -31,6 +31,7 @@ from orchestrator import (
     ToolSpec,
     build_react_graph,
 )
+from orchestrator.graph_builder.planner import make_planner_node
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
 
@@ -422,3 +423,171 @@ def test_dispatch_instruction_narrows_the_remark_escape() -> None:
     )
     assert "side-effectful writes" in text
     assert "do not re-mark those" in text
+
+
+# ---------------------------------------------------------------------------
+# 防重复派发 —— 委派标记跨 update_plan 保留之后,结构性改计划不能把已经派出去、
+# 还没标完成的步骤再派一遍;新加的委派步骤照样开分发轮
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_replan_keeping_a_dispatched_step_does_not_redispatch() -> None:
+    from orchestrator.graph_builder.builder import _plan_first_dispatch_degraded_total
+
+    # Structural replan (a new inline step) that keeps both dispatched delegate
+    # steps pending; execution omitted → inherited, so the marks survive and
+    # the plan hash changes.
+    replanned: list[Any] = [
+        {"description": "fetch template A details"},
+        {"description": "fetch customer B trajectory"},
+        {"description": "cross-check A against B", "execution": "inline"},
+        {"description": "decide and write the report"},
+    ]
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _tc(SPAWN_WORKER_TOOL_NAME, "tc-2", {"task": "fetch template A"}),
+                    _tc(SPAWN_WORKER_TOOL_NAME, "tc-3", {"task": "fetch customer B"}),
+                ],
+            ),
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-4", replanned, "replan")]),
+            AIMessage(content="done"),
+        ]
+    )
+    before = _counter_value(_plan_first_dispatch_degraded_total)
+    state = await _run(llm, thread_id="dispatch-no-double")
+
+    assert state["plan"] is not None
+    assert [s.execution for s in state["plan"].steps][:2] == ["delegate", "delegate"]
+    assert len(_hidden_with(state, _DISPATCH_MARKER)) == 1
+    assert "noop" in llm.seen_tools[3]
+    assert state.get("plan_first_dispatched_steps") == [
+        "fetch template A details",
+        "fetch customer B trajectory",
+    ]
+    assert _counter_value(_plan_first_dispatch_degraded_total) == before
+
+
+@pytest.mark.asyncio
+async def test_new_delegate_step_dispatches_only_itself() -> None:
+    from orchestrator.graph_builder.builder import _plan_first_dispatch_degraded_total
+
+    replanned: list[Any] = [
+        {"description": "fetch template A details"},
+        {"description": "fetch customer B trajectory"},
+        {"description": "fetch supplier C records", "execution": "delegate"},
+        {"description": "decide and write the report"},
+    ]
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            AIMessage(
+                content="",
+                tool_calls=[_tc(SPAWN_WORKER_TOOL_NAME, "tc-2", {"task": "fetch A and B"})],
+            ),
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-3", replanned, "replan")]),
+            AIMessage(
+                content="",
+                tool_calls=[_tc(SPAWN_WORKER_TOOL_NAME, "tc-4", {"task": "fetch supplier C"})],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    before = _counter_value(_plan_first_dispatch_degraded_total)
+    state = await _run(llm, thread_id="dispatch-new-only")
+
+    instructions = _hidden_with(state, _DISPATCH_MARKER)
+    assert len(instructions) == 2
+    second = str(instructions[1].content)
+    assert "fetch supplier C records" in second
+    assert "fetch template A details" not in second
+    assert "fetch customer B trajectory" not in second
+    assert set(llm.seen_tools[3]) == _NARROWED
+    # Already-dispatched steps still pending must not make anything count degraded.
+    assert _counter_value(_plan_first_dispatch_degraded_total) == before
+
+
+@pytest.mark.asyncio
+async def test_dispatch_turn_answered_with_progress_only_counts_degraded() -> None:
+    """分发轮只调 update_plan 标进度、一个都没派:标记现在留得住,不会再落进「全部
+    改标 inline」那一支 —— 必须另外计入降级,否则指标看不见这次绕过。"""
+    from orchestrator.graph_builder.builder import _plan_first_dispatch_degraded_total
+
+    progress = [
+        {"description": "fetch template A details", "status": "in_progress"},
+        {"description": "fetch customer B trajectory"},
+        {"description": "decide and write the report"},
+    ]
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-2", progress, "progress")]),
+            AIMessage(content="done"),
+        ]
+    )
+    before = _counter_value(_plan_first_dispatch_degraded_total)
+    state = await _run(llm, thread_id="dispatch-progress-only")
+
+    assert _counter_value(_plan_first_dispatch_degraded_total) == before + 1
+    # Observability only — no second dispatch turn, the run ends normally.
+    assert len(_hidden_with(state, _DISPATCH_MARKER)) == 1
+    assert str(state["messages"][-1].content) == "done"
+
+
+@dataclass
+class _PlannerLLM:
+    reply: str
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]
+    ) -> AIMessage:
+        del messages, tools
+        return AIMessage(content=self.reply)
+
+
+@pytest.mark.asyncio
+async def test_planner_resets_the_dispatched_set_for_a_new_run() -> None:
+    """同一会话第 2 轮,planner 给出与第 1 轮相同的委派步骤:新谱系,照样开分发轮。"""
+    plan_json = (
+        '{"goal": "g", "steps": [{"description": "read every report", '
+        '"execution": "delegate"}, {"description": "reply", "execution": "inline"}]}'
+    )
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[_tc(SPAWN_WORKER_TOOL_NAME, "tc-1", {"task": "read every report"})],
+            ),
+            AIMessage(content="run 1 done"),
+            AIMessage(
+                content="",
+                tool_calls=[_tc(SPAWN_WORKER_TOOL_NAME, "tc-2", {"task": "read every report"})],
+            ),
+            AIMessage(content="run 2 done"),
+        ]
+    )
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm,
+                tool_registry=_registry(),
+                planner_node=make_planner_node(_PlannerLLM(plan_json), plan_first=True),
+                plan_first=True,
+            )
+        )
+        for question in ("q1", "q2"):
+            cfg: RunnableConfig = {
+                "configurable": {"thread_id": "dispatch-lineage", "run_id": question}
+            }
+            state = await compiled.ainvoke(
+                {"messages": [HumanMessage(content=question)], "step_count": 0, "max_steps": 10},
+                config=cfg,
+            )
+
+    assert len(_hidden_with(state, _DISPATCH_MARKER)) == 2
+    assert set(llm.seen_tools[0]) == _NARROWED
+    assert set(llm.seen_tools[2]) == _NARROWED

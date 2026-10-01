@@ -19,6 +19,7 @@ from expert_work.protocol import Plan
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.middleware import LoopDetectionMiddleware, MiddlewareChain
 from orchestrator import GraphRunner, ToolRegistry, ToolSpec, build_react_graph, make_reflect_node
+from orchestrator.context import plan_md_digest
 from orchestrator.graph_builder import render_plan
 from orchestrator.graph_builder.planner import complete_open_steps
 from orchestrator.tools.update_plan import UpdatePlanTool
@@ -181,6 +182,8 @@ async def test_auto_completed_plan_is_projected_to_plan_md() -> None:
     assert "[x] 2." in plan_md and "[~] 2." not in plan_md
     assert "[x] 3." in plan_md and "[ ] 3." not in plan_md
     assert state.get("last_projection_hash")
+    # 收尾投影写进去的那份 PLAN.md 的摘要也要落检查点,下一轮才认得出它没被人动过。
+    assert state.get("last_plan_md_digest") == plan_md_digest(plan_md)
 
 
 @dataclass

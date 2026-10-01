@@ -286,3 +286,75 @@ def test_update_plan_schema_execution_enum_declares_type() -> None:
     execution = obj_variant["properties"]["execution"]
     assert execution["type"] == "string"
     assert set(execution["enum"]) == {"delegate", "inline"}
+
+
+# ---------------------------------------------------------------------------
+# 委派标记跨更新保留 —— 只标进度的更新不能把还没派的 delegate 步骤抹成 inline
+# ---------------------------------------------------------------------------
+
+_DELEGATE_PLAN = Plan(
+    goal="compare suppliers",
+    steps=(
+        PlanStep(id="1", description="read each supplier report", execution="delegate"),
+        PlanStep(id="2", description="decide and reply"),
+    ),
+)
+
+
+@pytest.mark.asyncio
+async def test_progress_update_without_execution_keeps_the_delegate_mark() -> None:
+    result = await UpdatePlanTool().call(
+        {
+            "steps": [
+                {"description": "read each supplier report", "status": "in_progress"},
+                "decide and reply",
+            ]
+        },
+        ctx=_ctx_with_plan(_DELEGATE_PLAN),
+    )
+    steps = result.state_updates["plan"].steps
+    assert [s.execution for s in steps] == ["delegate", "inline"]
+    assert steps[0].status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_bare_string_step_keeps_the_delegate_mark() -> None:
+    result = await UpdatePlanTool().call(
+        {"steps": ["read each supplier report", "decide and reply"]},
+        ctx=_ctx_with_plan(_DELEGATE_PLAN),
+    )
+    assert result.state_updates["plan"].steps[0].execution == "delegate"
+
+
+@pytest.mark.asyncio
+async def test_matching_uses_the_trimmed_description() -> None:
+    result = await UpdatePlanTool().call(
+        {"steps": [{"description": "  read each supplier report  "}]},
+        ctx=_ctx_with_plan(_DELEGATE_PLAN),
+    )
+    assert result.state_updates["plan"].steps[0].execution == "delegate"
+
+
+@pytest.mark.asyncio
+async def test_explicit_inline_wins_over_the_current_mark() -> None:
+    """分发轮的出口「改标 inline」必须照常可用。"""
+    result = await UpdatePlanTool().call(
+        {"steps": [{"description": "read each supplier report", "execution": "inline"}]},
+        ctx=_ctx_with_plan(_DELEGATE_PLAN),
+    )
+    assert result.state_updates["plan"].steps[0].execution == "inline"
+
+
+@pytest.mark.asyncio
+async def test_new_description_defaults_to_inline() -> None:
+    result = await UpdatePlanTool().call(
+        {"steps": [{"description": "read each supplier report twice"}]},
+        ctx=_ctx_with_plan(_DELEGATE_PLAN),
+    )
+    assert result.state_updates["plan"].steps[0].execution == "inline"
+
+
+def test_steps_schema_documents_execution_and_inheritance() -> None:
+    steps = UpdatePlanTool().spec.parameters["properties"]["steps"]
+    assert "{description, status, execution}" in steps["description"]
+    assert "Omitting execution keeps the step's current marking" in steps["description"]

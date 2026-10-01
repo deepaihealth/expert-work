@@ -112,8 +112,10 @@ class UpdatePlanTool:
                                             "description": (
                                                 "How the step should be executed: "
                                                 "'delegate' = hand it to an ephemeral "
-                                                "worker (spawn_worker), 'inline' "
-                                                "(default) = do it yourself."
+                                                "worker (spawn_worker), 'inline' = do "
+                                                "it yourself. Omit it to keep the "
+                                                "step's current marking (inline for "
+                                                "a new step)."
                                             ),
                                         },
                                     },
@@ -126,9 +128,12 @@ class UpdatePlanTool:
                         "description": (
                             "Ordered list of steps for the plan. Each "
                             "entry is either a short imperative description "
-                            "string, or an object {description, status} where "
-                            "status is pending / in_progress / completed — use "
-                            "the object form to mark progress as you go."
+                            "string, or an object {description, status, "
+                            "execution} where status is pending / in_progress / "
+                            "completed — use the object form to mark progress "
+                            "as you go. Omitting execution keeps the step's "
+                            "current marking (matched by identical "
+                            "description); a new step defaults to inline."
                         ),
                     },
                     "reason": {
@@ -166,6 +171,14 @@ class UpdatePlanTool:
             msg = "update_plan requires a non-empty 'steps' array"
             raise ValueError(msg)
 
+        # 委派标记跨更新保留 —— 没给合法 ``execution`` 的步骤(或裸字符串步骤)继承
+        # 当前计划里描述完全相同那一步的标记。模型被要求每一步都调本工具标进度,
+        # 以前一次只标进度的更新就会把还没派出去的 delegate 步骤全部悄悄改成 inline。
+        # 显式给出的 ``execution`` 永远优先(分发轮「改标 inline」的出口照常可用)。
+        current_execution: dict[str, PlanStepExecution] = {}
+        if ctx.plan is not None:
+            for existing in ctx.plan.steps:
+                current_execution.setdefault(existing.description, existing.execution)
         # Trim each step + drop empties. The schema's minItems=1 already
         # rejects an empty array, but a list of empty strings would
         # produce an unusable plan; surface it as a value error so the
@@ -178,7 +191,7 @@ class UpdatePlanTool:
             # the agent can mark progress; an invalid status falls back to
             # pending rather than rejecting the whole replan.
             status: PlanStepStatus = "pending"
-            execution: PlanStepExecution = "inline"
+            execution: PlanStepExecution | None = None
             if isinstance(raw_step, Mapping):
                 description = str(raw_step.get("description", "")).strip()
                 if raw_step.get("status") in _VALID_STATUSES:
@@ -193,6 +206,8 @@ class UpdatePlanTool:
                 continue
             if len(description) > _MAX_STEP_DESCRIPTION_CHARS:
                 description = description[:_MAX_STEP_DESCRIPTION_CHARS] + "…"
+            if execution is None:
+                execution = current_execution.get(description, "inline")
             cleaned.append(
                 PlanStep(id=str(index), description=description, status=status, execution=execution)
             )

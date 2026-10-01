@@ -801,14 +801,26 @@ def build_react_graph(
         # retry, then the turn degrades (full tools restored) so the run
         # never dies here. ``budget_exhausted`` wins: the wrap-up turn is
         # never a dispatch turn. ``plan_first=False`` skips the block and
-        # never writes the three dispatch channels — byte-identical.
+        # never writes the dispatch channels — byte-identical.
         dispatch_active = False
         dispatch_retries = int(state.get("plan_first_dispatch_retries") or 0)
         dispatched_hash: str | None = None
         dispatch_message: HumanMessage | None = None
+        # 防重复派发 —— 本条计划谱系里已经列进过分发指令的委派步骤(按描述);
+        # 开新分发轮时追加,``None`` = 本轮没开新的分发轮,不写通道。
+        dispatched_steps: list[str] | None = None
         if plan_first and not budget_exhausted and plan is not None:
             pending_delegate = [
                 s for s in plan.steps if s.execution == "delegate" and s.status != "completed"
+            ]
+            # 只有还没派过的委派步骤能开新的分发轮:委派标记跨 update_plan 保留后,
+            # 一次结构性改计划会改掉 plan hash,已经派出去、只是还没标完成的步骤
+            # 不能因此再派一遍。重试 / 降级 / 「全部改标 inline」的判定仍按全部
+            # 未完成委派步骤(``pending_delegate``)算 —— 分发轮刚列出的步骤此刻
+            # 都已在已派集合里,按「未派」算的话重试永远不会发生。
+            already_dispatched = set(state.get("plan_first_dispatched_steps") or [])
+            fresh_delegate = [
+                s for s in pending_delegate if s.description not in already_dispatched
             ]
             # Kimi 真栈发现(2026-08-28)— the update_plan escape hatch can be
             # abused: a dispatch turn that re-marks every delegate step inline
@@ -818,14 +830,7 @@ def build_react_graph(
             # the delegate set is now empty, and its tool calls carried no
             # spawn_worker → degraded (observability only, no flow change).
             if not pending_delegate and bool(state.get("plan_first_dispatch_active")):
-                last_ai = next(
-                    (m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None
-                )
-                called = {
-                    str(c.get("name", ""))
-                    for c in (_extract_tool_calls(last_ai) if last_ai is not None else [])
-                }
-                if SPAWN_WORKER_TOOL_NAME not in called:
+                if SPAWN_WORKER_TOOL_NAME not in _last_ai_tool_names(state["messages"]):
                     _plan_first_dispatch_degraded_total.inc()
                     logger.warning("agent.plan_first_dispatch_remarked_inline")
             if pending_delegate:
@@ -833,11 +838,15 @@ def build_react_graph(
                 prev_active = bool(state.get("plan_first_dispatch_active"))
                 last_msg = state["messages"][-1] if state["messages"] else None
                 refused = isinstance(last_msg, AIMessage) and not _extract_tool_calls(last_msg)
-                if d_hash != state.get("plan_first_dispatch_plan_hash"):
+                if fresh_delegate and d_hash != state.get("plan_first_dispatch_plan_hash"):
                     dispatch_active = True
                     dispatched_hash = d_hash
                     dispatch_retries = 0
-                    dispatch_message = _build_dispatch_instruction(pending_delegate)
+                    dispatch_message = _build_dispatch_instruction(fresh_delegate)
+                    dispatched_steps = [
+                        *(state.get("plan_first_dispatched_steps") or []),
+                        *(s.description for s in fresh_delegate),
+                    ]
                     _plan_first_dispatch_total.inc()
                 elif prev_active and refused and dispatch_retries == 0:
                     dispatch_active = True
@@ -847,6 +856,15 @@ def build_react_graph(
                     dispatch_message = _build_dispatch_degraded()
                     _plan_first_dispatch_degraded_total.inc()
                     logger.warning("agent.plan_first_dispatch_degraded")
+                elif prev_active and SPAWN_WORKER_TOOL_NAME not in _last_ai_tool_names(
+                    state["messages"]
+                ):
+                    # 分发轮只调了 update_plan(比如只标进度),委派步骤原样留着、一个
+                    # 都没派。委派标记跨 update_plan 保留之前,这种回复会把标记全抹成
+                    # inline、落进上面「全部改标」那一支被计数;现在标记留下了,不在这里
+                    # 补计数的话指标就看不见这次绕过(仅可观测性,不改流程)。
+                    _plan_first_dispatch_degraded_total.inc()
+                    logger.warning("agent.plan_first_dispatch_ignored")
             if dispatch_active:
                 tools = [s for s in tools if s.name in _DISPATCH_TOOL_NAMES]
             if dispatch_message is not None:
@@ -1455,6 +1473,8 @@ def build_react_graph(
                 update_mw["plan_first_dispatch_retries"] = dispatch_retries
                 if dispatched_hash is not None:
                     update_mw["plan_first_dispatch_plan_hash"] = dispatched_hash
+                if dispatched_steps is not None:
+                    update_mw["plan_first_dispatched_steps"] = dispatched_steps
             return update_mw
 
         # Stream CM-1 — persist the advisory in conversation history
@@ -1491,6 +1511,8 @@ def build_react_graph(
             update_plain["plan_first_dispatch_retries"] = dispatch_retries
             if dispatched_hash is not None:
                 update_plain["plan_first_dispatch_plan_hash"] = dispatched_hash
+            if dispatched_steps is not None:
+                update_plain["plan_first_dispatched_steps"] = dispatched_steps
         return update_plain
 
     async def tools_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -1977,6 +1999,9 @@ def build_react_graph(
         )
         if projection is not None and not projection.skipped:
             result_dict["last_projection_hash"] = projection.digest
+        # PLAN.md 完整性 —— 只在 PLAN.md 那一次真写成功时前进(见 ``ProjectionResult``)。
+        if projection is not None and projection.plan_md_digest is not None:
+            result_dict["last_plan_md_digest"] = projection.plan_md_digest
         return result_dict
 
     async def plan_close_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -1986,8 +2011,9 @@ def build_react_graph(
         通过之后):派发打回、复查要求返工都回到 agent,不经过这里;审批暂停 / 拒绝走
         tools → END,也不经过这里。步数 / 预算耗尽的收尾同样到这里,但 ``exit_reason``
         不是 ``text_response``,原样放过。标完成后立刻投影一次 PLAN.md:投影平时只在
-        tools_node 里做,不补这一次的话,下一轮 workspace_ingest 读回的旧文件会被当成
-        人工修改,把步骤改回「进行中」。
+        tools_node 里做,不补这一次的话,PLAN.md 会停在「进行中」,人打开看到的不是实情。
+        (下一轮 workspace_ingest 不会再把这份没人动过的旧文件当成人工修改读回来 ——
+        它比对的是 ``last_plan_md_digest``,见 ``WorkspaceIngester.ingest_plan``。)
         """
         if state.get("exit_reason") != "text_response":
             return {}
@@ -2008,6 +2034,8 @@ def build_react_graph(
         )
         if projection is not None and not projection.skipped:
             update["last_projection_hash"] = projection.digest
+        if projection is not None and projection.plan_md_digest is not None:
+            update["last_plan_md_digest"] = projection.plan_md_digest
         return update
 
     graph: StateGraph[AgentState, None, AgentState, AgentState] = StateGraph(AgentState)
@@ -2017,7 +2045,9 @@ def build_react_graph(
     # Entry chain(二期 P1.3)—— 两条分支从 START 并发,AND-join 汇到 agent:
     #   分支 1: memory_recall(写 recalled_memories)
     #   分支 2: planner → workspace_ingest(写 plan;分支内保序 —— CM-0:
-    #           人改的 PLAN.md 仍覆盖 planner 生成的 plan)
+    #           只有 PLAN.md 与上次投影写入的那份(``last_plan_md_digest``)不同,
+    #           即真被人 / agent 改过,才覆盖 planner 本轮生成的 plan;没人动过的
+    #           文件是上一轮的计划,一律不读回)
     # 写集不相交;汇合用列表形式 add_edge([a, b], "agent") 建 AND-join
     # 屏障(NamedBarrierValue),agent 等全部父分支完成后执行一次。
     # ``# type: ignore[arg-type]``: the bare Callable node aliases don't
@@ -2632,6 +2662,14 @@ def _plan_identity_hash(plan: Plan) -> str:
 
 #: B-35 — the narrowed tool set of a dispatch turn.
 _DISPATCH_TOOL_NAMES = frozenset({SPAWN_WORKER_TOOL_NAME, "update_plan"})
+
+
+def _last_ai_tool_names(messages: Sequence[BaseMessage]) -> set[str]:
+    """B-35 —— 最近一条 AI 消息调用的工具名(没有 AI 消息 = 空集)。"""
+    last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+    if last_ai is None:
+        return set()
+    return {str(c.get("name", "")) for c in _extract_tool_calls(last_ai)}
 
 
 def _dispatch_plan_hash(plan: Plan) -> str:

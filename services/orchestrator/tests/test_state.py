@@ -15,13 +15,14 @@ def test_required_keys_present() -> None:
     J.4-补强-2 ``subagent_invocations``, J.8 ``pending_approval`` /
     ``approval_resume`` / ``approval_outcome``, TE-6 ``promoted_tools``,
     HX-12 ``promoted_tool_last_used``, CM-0 ``last_projection_hash``,
+    PLAN.md 完整性 ``last_plan_md_digest`` / ``plan_first_dispatched_steps``,
     CM-11 ``last_plan_goal``, 委派层 1 ``delegation_nudge_plan_hash``,
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
     ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``,
     B-64 ``viewed_figures`` / ``figure_documents``,
     B-126 ``context_summary``
-    (last twenty-three ``NotRequired``)。
+    (last twenty-five ``NotRequired``)。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -52,10 +53,12 @@ def test_required_keys_present() -> None:
         "promoted_tools",
         "promoted_tool_last_used",
         "last_projection_hash",
+        "last_plan_md_digest",
         "delegation_nudge_plan_hash",
         "plan_first_dispatch_plan_hash",
         "plan_first_dispatch_active",
         "plan_first_dispatch_retries",
+        "plan_first_dispatched_steps",
         "viewed_figures",
         "figure_documents",
         "context_summary",
