@@ -772,8 +772,8 @@ def test_build_tool_context_delegation_gate_defaults_none() -> None:
 
 # ---------------------------------------------------------------------------
 # _child_config — forwards the SAME gate object to a child's config (the
-# gate is process-wide, unlike the per-run worker_spawn_budget which is
-# deliberately NOT forwarded)
+# gate is process-wide; the per-run worker_spawn_budget is forwarded too, see
+# test_child_config_forwards_same_worker_spawn_budget_object)
 # ---------------------------------------------------------------------------
 
 
@@ -790,3 +790,22 @@ def test_child_config_omits_delegation_gate_when_absent() -> None:
     ctx = ToolContext(tenant_id=uuid4())
     child_config = _child_config(ctx, sub_thread_id=uuid4(), sub_run_id=uuid4())
     assert DELEGATION_GATE_KEY not in child_config["configurable"]
+
+
+def test_child_config_forwards_same_worker_spawn_budget_object() -> None:
+    """per-run 预算必须是**同一个对象**一路下传,孙代的 ``_build_tool_context``
+    读回来的也得是它 —— 否则孙 worker 不受本 run 的个数上限约束。"""
+    from orchestrator.tools.spawn_worker import WorkerSpawnBudget
+
+    budget = WorkerSpawnBudget(max_per_run=3, max_concurrent=1)
+    ctx = ToolContext(tenant_id=uuid4(), worker_spawn_budget=budget)
+
+    child_config = _child_config(ctx, sub_thread_id=uuid4(), sub_run_id=uuid4())
+
+    assert _build_tool_context(child_config).worker_spawn_budget is budget
+
+
+def test_child_config_omits_worker_spawn_budget_when_absent() -> None:
+    ctx = ToolContext(tenant_id=uuid4())
+    child_config = _child_config(ctx, sub_thread_id=uuid4(), sub_run_id=uuid4())
+    assert "worker_spawn_budget" not in child_config["configurable"]

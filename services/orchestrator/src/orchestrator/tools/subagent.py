@@ -131,9 +131,12 @@ class SubAgentTool:
                 },
                 "required": ["task"],
             },
-            # Mini-ADR J-40 — sibling delegations share neither ``thread_id``
-            # nor sandbox session, so plan_stages may schedule them in the
-            # same stage and run them concurrently via ``asyncio.gather``.
+            # Mini-ADR J-40 — sibling delegations each get their own
+            # ``thread_id`` / checkpoint, so plan_stages may schedule them in
+            # the same stage and run them concurrently via ``asyncio.gather``.
+            # They DO share the sandbox session and workspace (sessions are per
+            # (tenant, user)); bash / write_file / edit_file serialize on the
+            # user-level workspace lock, so concurrent writes don't interleave.
             is_parallel_safe=True,
         )
 

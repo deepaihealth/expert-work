@@ -557,3 +557,152 @@ async def test_image_refs_reach_a_grandchild_worker() -> None:
     await _tool(builder).call({"task": "t"}, ctx=ctx)
 
     assert graph.calls[0][0]["turn_image_refs"] == ["expert_work://image/x"]
+
+
+# --- 嵌套 worker 也计入本 run 的预算(B1)+ 先占 per-run 并发再占全局闸(B2) -------
+
+
+@dataclass
+class _NestedSpawnGraph:
+    """一个 depth-1 worker 的图:运行时用**自己拿到的 config** 还原 ToolContext
+    (与真 ``tools_node`` 同一条路),再以 depth 2 派 ``nested`` 个孙 worker。
+
+    孙 worker 的结果收在 ``nested_results`` 里供断言;图本身返回一句话。"""
+
+    nested: int
+    nested_results: list[Any] = field(default_factory=list)
+
+    async def astream(
+        self, state: Any, config: Any = None, *, stream_mode: Any = None
+    ) -> AsyncIterator[Any]:
+        del state, stream_mode
+        from orchestrator.graph_builder.builder import _build_tool_context
+
+        inner_ctx = _build_tool_context(config)
+        inner = _tool(_RecordingWorkerBuilder(built=_built(_answer_graph("leaf"))), child_depth=2)
+        for i in range(self.nested):
+            self.nested_results.append(await inner.call({"task": f"leaf {i}"}, ctx=inner_ctx))
+        yield ("values", {"messages": [AIMessage(content="parent done")], "step_count": 1})
+
+
+@pytest.mark.asyncio
+async def test_nested_workers_spend_the_same_per_run_budget() -> None:
+    """depth-2 的 spawn 以前看到的是 ``worker_spawn_budget=None`` —— 不限个数、
+    不限并发。现在与顶层共用同一个预算对象:2 个名额,顶层用掉 1 个,
+    孙代第 1 个拿到最后一个,第 2 个被拒。"""
+    budget = WorkerSpawnBudget(max_per_run=2, max_concurrent=4)
+    graph = _NestedSpawnGraph(nested=2)
+    tool = _tool(_RecordingWorkerBuilder(built=_built(graph)))  # type: ignore[arg-type]
+
+    result = await tool.call({"task": "fan out"}, ctx=_ctx(worker_spawn_budget=budget))
+
+    assert result.content == "parent done"
+    first, second = graph.nested_results
+    assert first.content == "leaf"
+    assert second.meta.get("spawn_worker_blocked") is True
+    assert "worker budget (2)" in second.content
+
+
+@pytest.mark.asyncio
+async def test_nested_worker_does_not_take_a_concurrency_slot() -> None:
+    """max_concurrent=1:顶层 worker 占着唯一的并发位等它的孙 worker。若孙代也要
+    并发位,父等子、子等父 —— 死锁。规则:depth>=2 只扣个数、不占并发位。"""
+    budget = WorkerSpawnBudget(max_per_run=5, max_concurrent=1)
+    graph = _NestedSpawnGraph(nested=2)
+    tool = _tool(_RecordingWorkerBuilder(built=_built(graph)))  # type: ignore[arg-type]
+
+    result = await asyncio.wait_for(
+        tool.call({"task": "fan out"}, ctx=_ctx(worker_spawn_budget=budget)), timeout=2.0
+    )
+
+    assert result.content == "parent done"
+    assert [r.content for r in graph.nested_results] == ["leaf", "leaf"]
+
+
+@dataclass
+class _BlockingGraph:
+    """跑起来就停在 ``release`` 上,直到测试放行。"""
+
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def astream(
+        self, state: Any, config: Any = None, *, stream_mode: Any = None
+    ) -> AsyncIterator[Any]:
+        del state, config, stream_mode
+        self.started.set()
+        await self.release.wait()
+        yield ("values", {"messages": [AIMessage(content="ok")], "step_count": 1})
+
+
+@pytest.mark.asyncio
+async def test_worker_queued_on_per_run_concurrency_holds_no_gate_slot() -> None:
+    """排在本 run 并发位后面的 worker 不许占着全进程的委派闸 —— 那等于拿别的
+    run 的名额来排自己的队。全局闸容量 2、本 run 并发 1:第二个 worker 等并发位
+    时,闸里只有第一个。"""
+    from orchestrator.tools._budget import DelegationGate
+
+    async def _cap() -> int:
+        return 2
+
+    gate = DelegationGate(_cap, timeout_s=5.0)
+    budget = WorkerSpawnBudget(max_per_run=5, max_concurrent=1)
+    graph = _BlockingGraph()
+    builder = _RecordingWorkerBuilder(built=_built(graph))  # type: ignore[arg-type]
+    tool = _tool(builder)
+    ctx = _ctx(worker_spawn_budget=budget, delegation_gate=gate)
+
+    first = asyncio.create_task(tool.call({"task": "a"}, ctx=ctx))
+    await asyncio.wait_for(graph.started.wait(), timeout=2.0)
+    second = asyncio.create_task(tool.call({"task": "b"}, ctx=ctx))
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert gate.active == 1  # 只有在跑的那个;排队的没占闸
+    assert len(builder.calls) == 1  # 排队的也还没付构建的钱
+
+    graph.release.set()
+    r1, r2 = await asyncio.wait_for(asyncio.gather(first, second), timeout=2.0)
+    assert (r1.content, r2.content) == ("ok", "ok")
+    assert gate.active == 0
+
+
+@pytest.mark.asyncio
+async def test_gate_refusal_gives_back_the_concurrency_slot() -> None:
+    """闸拒了 → 已经拿到的并发位必须还回去,否则本 run 后面的 worker 永远排不上。"""
+
+    @dataclass
+    class _RefusingGate:
+        async def acquire(self, *, timeout_s: float | None = None) -> bool:
+            return False
+
+        async def release(self) -> None:
+            raise AssertionError("refused acquire must not be released")
+
+    budget = WorkerSpawnBudget(max_per_run=5, max_concurrent=1)
+    builder = _RecordingWorkerBuilder(built=_built(_answer_graph("ok")))
+    tool = _tool(builder)
+
+    refused = await tool.call(
+        {"task": "a"}, ctx=_ctx(worker_spawn_budget=budget, delegation_gate=_RefusingGate())
+    )
+    assert refused.meta.get("delegation_gated") is True
+
+    ok = await asyncio.wait_for(
+        tool.call({"task": "b"}, ctx=_ctx(worker_spawn_budget=budget)), timeout=2.0
+    )
+    assert ok.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_builder_failure_gives_back_the_concurrency_slot() -> None:
+    budget = WorkerSpawnBudget(max_per_run=5, max_concurrent=1)
+    failing = _tool(_RecordingWorkerBuilder(raises=RuntimeError("build boom")))
+    with pytest.raises(RuntimeError, match="build boom"):
+        await failing.call({"task": "a"}, ctx=_ctx(worker_spawn_budget=budget))
+
+    ok_tool = _tool(_RecordingWorkerBuilder(built=_built(_answer_graph("ok"))))
+    ok = await asyncio.wait_for(
+        ok_tool.call({"task": "b"}, ctx=_ctx(worker_spawn_budget=budget)), timeout=2.0
+    )
+    assert ok.content == "ok"

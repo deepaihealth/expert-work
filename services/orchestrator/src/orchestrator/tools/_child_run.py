@@ -790,6 +790,12 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # the 30s acquire timeout exists to resolve without deadlocking.
     if ctx.delegation_gate is not None:
         configurable[DELEGATION_GATE_KEY] = ctx.delegation_gate
+    # per-run worker 预算同样下传**同一个对象**:漏传时孙代的 spawn_worker 看到
+    # ``None`` = 个数、并发都不限,「本 run 最多 N 个 worker」被一层嵌套绕穿。
+    # 孙代只扣个数不占并发位(见 ``SpawnWorkerTool.call``),否则父等子、子等父。
+    # 键写成字面量,与 ``_build_tool_context`` 的读取一致。
+    if ctx.worker_spawn_budget is not None:
+        configurable["worker_spawn_budget"] = ctx.worker_spawn_budget
     # 本轮附件继续往下传:一个 worker 再派孙 worker 时,孙代同样看不到本对话,
     # 而它干的还是同一轮用户交办的活 —— 断在这里等于深一层就退回原来的猜。
     return {"configurable": configurable}

@@ -225,8 +225,11 @@ class SpawnWorkerTool:
                 },
                 "required": ["task"],
             },
-            # Sibling workers share neither thread nor sandbox session, so the
-            # scheduler may run them concurrently (bounded by the budget).
+            # Sibling workers each run on their own thread / checkpoint, so the
+            # scheduler may run them concurrently (bounded by the budget). They
+            # DO share the sandbox session and workspace — sessions are per
+            # (tenant, user) — and bash / write_file / edit_file serialize on
+            # the user-level workspace lock, so concurrent writes don't interleave.
             is_parallel_safe=True,
         )
 
@@ -258,34 +261,47 @@ class SpawnWorkerTool:
         # refusal is transient (retry later), and the budget is a defense
         # against runaway spawning — erring toward spending it down is the
         # conservative direction here.
-        # 二期 PR3(spec P4)— process-wide delegation concurrency gate, layered
-        # on top of the per-run budget above. Acquired before the child build
-        # so a saturated gate doesn't pay for building a worker it can't run.
-        gate = ctx.delegation_gate
-        if gate is not None:
-            # PR3 加固 — the gate wait is bounded by whichever is smaller:
-            # the gate's own default or the run's remaining deadline (Mini-
-            # ADR J-40), so a near-expired run never waits out the gate's
-            # full default before degrading to a soft-fail refusal.
-            remaining = ctx.deadline_at - time.monotonic() if ctx.deadline_at is not None else None
-            if not await gate.acquire(timeout_s=remaining):
-                DELEGATIONS_GATED.labels(tool="spawn_worker").inc()
-                return ToolResult(
-                    content=(
-                        "[delegation refused: platform-wide delegation concurrency is "
-                        "saturated; retry later or complete the work without delegating]"
-                    ),
-                    meta={"delegation_gated": True, "reason": "global_gate_timeout"},
+        #
+        # 占用顺序:本 run 的并发位 → 全进程委派闸 → 构建 → 运行,逆序归还。
+        # 反过来(先闸后并发位)时,排在本 run 并发位后面干等的 worker 占着一个
+        # 全进程的闸位 —— 拿别的 run 的名额来排自己的队。
+        #
+        # 嵌套 spawn(depth>=2,发起方自己就是 worker)只扣个数、不占并发位:
+        # 父 worker 正占着并发位等它的孩子,孩子再要并发位 = 父等子、子等父,
+        # 并发位被等孩子的父全部占满时整棵树死锁。孙代仍受全局闸约束(闸的
+        # acquire 有超时,正是为这种嵌套准备的)。
+        concurrency_budget = budget if self.child_depth < 2 else None
+        async with _maybe_concurrency(concurrency_budget):
+            # 二期 PR3(spec P4)— process-wide delegation concurrency gate,
+            # layered on top of the per-run budget above. Acquired before the
+            # child build so a saturated gate doesn't pay for building a
+            # worker it can't run.
+            gate = ctx.delegation_gate
+            if gate is not None:
+                # PR3 加固 — the gate wait is bounded by whichever is smaller:
+                # the gate's own default or the run's remaining deadline (Mini-
+                # ADR J-40), so a near-expired run never waits out the gate's
+                # full default before degrading to a soft-fail refusal.
+                remaining = (
+                    ctx.deadline_at - time.monotonic() if ctx.deadline_at is not None else None
                 )
-        try:
-            child = await self.builder(
-                tenant_id=ctx.tenant_id,
-                role=role,
-                depth=self.child_depth,
-                oauth_user_id=ctx.oauth_user_id,
-            )
-            _workers_spawned.inc()
-            async with _maybe_concurrency(budget):
+                if not await gate.acquire(timeout_s=remaining):
+                    DELEGATIONS_GATED.labels(tool="spawn_worker").inc()
+                    return ToolResult(
+                        content=(
+                            "[delegation refused: platform-wide delegation concurrency is "
+                            "saturated; retry later or complete the work without delegating]"
+                        ),
+                        meta={"delegation_gated": True, "reason": "global_gate_timeout"},
+                    )
+            try:
+                child = await self.builder(
+                    tenant_id=ctx.tenant_id,
+                    role=role,
+                    depth=self.child_depth,
+                    oauth_user_id=ctx.oauth_user_id,
+                )
+                _workers_spawned.inc()
                 return await run_child_to_result(
                     child=child,
                     task=task,
@@ -302,9 +318,9 @@ class SpawnWorkerTool:
                     },
                     extra_meta={"dynamic": True, "role": role},
                 )
-        finally:
-            if gate is not None:
-                await gate.release()
+            finally:
+                if gate is not None:
+                    await gate.release()
 
     def _require_task(self, args: Mapping[str, Any]) -> str:
         raw = args.get("task")
