@@ -140,8 +140,13 @@ async def test_nudge_injected_once_and_hidden_from_ui() -> None:
     nudges = _nudges(state)
     assert len(nudges) == 1
     nudge = nudges[0]
-    assert "contains 3 pending items" in str(nudge.content)
-    assert "spawn_worker" in str(nudge.content)
+    text = str(nudge.content)
+    assert "has 3 unfinished steps" in text
+    assert "spawn_worker" in text
+    # 触发条件只有「≥2 个未完成步骤」—— 文案不得替模型断言它们互相独立。
+    assert "look mutually independent" not in text
+    assert "If some of them are independent of each other" in text
+    assert "otherwise continue" in text
     assert nudge.additional_kwargs.get("expert_work_hide_from_ui") is True
     # Dedupe key persisted for the next batch.
     assert state.get("delegation_nudge_plan_hash")
@@ -173,7 +178,7 @@ async def test_in_progress_steps_count_as_pending() -> None:
 
     nudges = _nudges(state)
     assert len(nudges) == 1
-    assert "contains 2 pending items" in str(nudges[0].content)
+    assert "has 2 unfinished steps" in str(nudges[0].content)
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +263,8 @@ async def test_plan_replacement_renudges() -> None:
 
     nudges = _nudges(state)
     assert len(nudges) == 2
-    assert "contains 2 pending items" in str(nudges[0].content)
-    assert "contains 3 pending items" in str(nudges[1].content)
+    assert "has 2 unfinished steps" in str(nudges[0].content)
+    assert "has 3 unfinished steps" in str(nudges[1].content)
 
 
 # ---------------------------------------------------------------------------

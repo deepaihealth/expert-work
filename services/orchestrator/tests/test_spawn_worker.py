@@ -108,9 +108,9 @@ def test_spec_description_carries_shape_criteria() -> None:
     so the delegation judgment lives at the decision site. Pinned phrase by
     phrase so a future rewrite cannot silently drop a criterion."""
     desc = _tool(_RecordingWorkerBuilder()).spec.description
-    # Worker profile: fresh context, parallel, cheap.
+    # Worker profile: fresh context, concurrent, NOT cheap (a worker is a full run).
     assert "sees none of this conversation" in desc
-    assert "parallel" in desc
+    assert "run concurrently" in desc
     # 真栈对照(2026-08-28,run eac902ed)逮到的信息缺口:kimi 思考原文
     # 「spawn_worker 有工具吗?」——不确定 worker 能不能自己拉数,于是放弃
     # 委派取数型任务。工具继承必须写明,且钉住短语防止未来改丢。
@@ -125,9 +125,14 @@ def test_spec_description_carries_shape_criteria() -> None:
     assert "three or more similar, mutually independent sub-items" in desc
     assert "read in full" in desc
     assert "exploratory search" in desc
-    # Negative criteria — writes / final decisions stay with the caller.
+    # Negative criteria — external side effects / final call stay with the caller;
+    # intermediate workspace files are fine (no blanket "writes" ban).
     assert "Do NOT use" in desc
-    assert "final decision" in desc
+    assert "external side effects" in desc
+    assert "registering deliverables" in desc
+    assert "final call on deliverables" in desc
+    assert "work involving writes" not in desc
+    assert "Workers may write intermediate files in the shared workspace" in desc
     # Self-contained task contract + verify-results clause.
     assert "self-contained" in desc
     assert "verify" in desc

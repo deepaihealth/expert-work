@@ -420,5 +420,7 @@ def test_dispatch_instruction_narrows_the_remark_escape() -> None:
             [PlanStep(id="1", description="d", execution="delegate")]
         ).content
     )
-    assert "side-effectful writes" in text
+    assert "external side effects" in text
+    assert "registering deliverables" in text
+    assert "side-effectful writes" not in text
     assert "do not re-mark those" in text

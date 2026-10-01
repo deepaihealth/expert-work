@@ -1801,7 +1801,12 @@ _WORKER_DELEGATION_BLOCK = (
     "parallelizable parts to the spawn_worker tool and keep only the "
     "aggregation and judgment here. Large work: list the subtasks first, "
     "delegate in batches, and review each batch's results before the next. "
-    "Never delegate writes, design judgment, or the final call on "
+    "Each worker is a full separate run that costs about as much as doing "
+    "the subtask yourself; delegate for a clean context and for running "
+    "independent items at the same time. Workers may write intermediate "
+    "files in the shared workspace, but never delegate actions with external "
+    "side effects (sending messages, changing business-system data, "
+    "registering deliverables), design judgment, or the final call on "
     "deliverables. When delegating, write the task fully self-contained — "
     "the worker sees none of this conversation."
 )

@@ -68,15 +68,16 @@ _workers_blocked = expert_work_counter(
 SPAWN_WORKER_TOOL_NAME = "spawn_worker"
 
 _TOOLS_SENTENCE_LEGACY = (
-    "Workers carry the same tool set as you — including MCP tools — and can "
-    "fetch data on their own. "
+    "Workers carry the same tool set as you — including MCP tools, but no "
+    "knowledge-base search — and can fetch data on their own. "
 )
 #: B-122 —— 与 worker 实际拿到的工具一致;说「same tool set」就是对模型说假话。
 _TOOLS_SENTENCE_RESTRICTED = (
-    "Workers carry your read-side tools — including read-only MCP tools — and "
-    "can fetch data on their own, but they cannot register deliverables, write "
-    "to systems outside the workspace, or change the agent's memory, skills or "
-    "schedules; those steps stay with the top-level agent. "
+    "Workers carry your read-side tools — including read-only MCP tools, but no "
+    "knowledge-base search — and can fetch data on their own, but they cannot "
+    "register deliverables, write to systems outside the workspace, or change "
+    "the agent's memory, skills or schedules; those steps stay with the "
+    "top-level agent. "
 )
 
 
@@ -154,10 +155,15 @@ class SpawnWorkerTool:
             # delegate, mirrored by the system-prompt scale rubric (层 2).
             description=(
                 "Spawn an ephemeral worker sub-agent to complete a focused subtask "
-                "in isolation, then return its result. Workers are lightweight, "
-                "fast, and cheap; several can run in parallel; each starts with a "
-                "fresh context — it sees none of this conversation, only 'task' — "
-                "and is discarded when done. "
+                "in isolation, then return its result. Each worker is a full, "
+                "separate agent run — it costs about as much as doing the subtask "
+                "yourself, more if tasks overlap — and is discarded when done. The "
+                "payoff is a clean context (it sees none of this conversation, only "
+                "'task') and running independent items at the same time: several "
+                "spawn_worker calls in one response run concurrently, but workers "
+                "share your workspace and file writes / bash commands take turns, "
+                "so the speed-up is for reading, fetching and thinking, not for "
+                "many scripts or file writes. "
                 + (
                     _TOOLS_SENTENCE_RESTRICTED
                     if worker_policy_enabled()
@@ -172,10 +178,12 @@ class SpawnWorkerTool:
                 "must be read in full while only the conclusions matter here; "
                 "(3) exploratory search — finding a small amount of relevant "
                 "information in a large body of content.\n"
-                "Do NOT use it for: small work a single step can finish; work "
-                "involving writes or the final decision (those stay here); work "
-                "so dependent on this conversation that the task cannot be "
-                "written self-contained.\n"
+                "Do NOT use it for: small work a single step can finish; actions "
+                "with external side effects (sending messages, changing "
+                "business-system data, registering deliverables) or the final "
+                "call on deliverables (those stay here); work so dependent on this "
+                "conversation that the task cannot be written self-contained. "
+                "Workers may write intermediate files in the shared workspace.\n"
                 # B-37 — the delegation contract's four elements (Anthropic's
                 # multi-agent research system): vague task text makes workers
                 # duplicate each other's work and leave gaps.
@@ -193,15 +201,18 @@ class SpawnWorkerTool:
                 "them by path (name the file) instead of "
                 "copying their content into the task — it reads the current "
                 "version itself, and nothing is lost in the retelling. "
-                # B-37 — the reverse direction: a worker's final message lands
-                # in this conversation verbatim, so bulk output should be
-                # offloaded to the shared workspace and referenced.
+                # B-37 — the reverse direction: bulk output should be offloaded
+                # to the shared workspace and referenced. A final message over
+                # EXTERNALIZE_MIN_CHARS (overflow.py, 12_000) is replaced in
+                # this conversation by a head/tail preview + a path, so say so
+                # instead of claiming it "lands in full".
                 "Symmetrically, when a subtask will produce bulk output (a long "
                 "report, a dataset, generated content), tell it to write the "
                 "result to a file there and reply with a short summary plus the "
-                "path — its final message lands in this conversation in full, so "
-                "offloading keeps the bulk out of your context and lets you read "
-                "the untruncated version when you need it.\n"
+                "path. A reply longer than about 12,000 characters is replaced "
+                "in this conversation by a head/tail preview plus a path to the "
+                "full text, so offloading keeps the result complete and your "
+                "context small.\n"
                 "Treat worker results as raw material — "
                 "verify key conclusions here before relying on them."
             ),

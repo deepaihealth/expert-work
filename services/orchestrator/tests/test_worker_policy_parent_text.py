@@ -38,6 +38,31 @@ def test_spawn_worker_description_matches_worker_tools(monkeypatch: pytest.Monke
     assert "read-only MCP tools" in desc
     monkeypatch.setenv(WORKER_POLICY_ENV, "off")
     assert (
-        "Workers carry the same tool set as you — including MCP tools — and can "
-        "fetch data on their own."
+        "Workers carry the same tool set as you — including MCP tools, but no "
+        "knowledge-base search — and can fetch data on their own."
     ) in _desc()
+
+
+@pytest.mark.parametrize("policy", [None, "off"])
+def test_spawn_worker_description_is_truthful(
+    monkeypatch: pytest.MonkeyPatch, policy: str | None
+) -> None:
+    """Cost / tools / result size / parallelism claims match the code
+    (subagent_runtime worker synth, overflow.EXTERNALIZE_MIN_CHARS, workspace lock)."""
+    if policy is None:
+        monkeypatch.delenv(WORKER_POLICY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(WORKER_POLICY_ENV, policy)
+    desc = _desc()
+    # False claims are gone.
+    assert "lightweight" not in desc
+    assert "cheap" not in desc
+    assert "fast," not in desc
+    assert "lands in this conversation in full" not in desc
+    # True clauses are present.
+    assert "full, separate agent run" in desc
+    assert "costs about as much as doing the subtask yourself" in desc
+    assert "no knowledge-base search" in desc
+    assert "longer than about 12,000 characters" in desc
+    assert "head/tail preview plus a path" in desc
+    assert "file writes / bash commands take turns" in desc
