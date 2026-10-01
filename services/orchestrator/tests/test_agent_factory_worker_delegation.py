@@ -30,8 +30,21 @@ def test_worker_delegation_block_carries_scale_rubric() -> None:
     assert "spawn_worker" in block
     # Tier 3 — large work is batched and reviewed.
     assert "delegate in batches" in block
-    # Red lines — writes / judgment / final call never leave the main line.
-    assert "Never delegate writes" in block
+    # Red lines — external side effects / judgment / final call never leave
+    # the main line; "writes" is defined once (no blanket "Never delegate
+    # writes" that contradicts workers writing intermediate files).
+    assert "Never delegate writes" not in block
+    assert "never delegate actions with external side effects" in block
+    assert "registering deliverables" in block
+    assert "the final call on deliverables" in block
+    assert "Workers may write intermediate files in the shared workspace" in block
+    # Cost truth — a worker is a full run, not a cheap helper.
+    assert "full separate run" in block
+    assert "with its own cost" in block
+    assert "re-sent on every later step" in block
+    assert "about as much" not in block
+    assert "cheap" not in block
+    assert "lightweight" not in block
     # Self-contained task contract.
     assert "self-contained" in block
     assert "sees none of this conversation" in block

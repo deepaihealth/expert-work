@@ -2694,10 +2694,11 @@ def _build_dispatch_instruction(pending: list[PlanStep]) -> HumanMessage:
             "several calls in parallel where independent — and write every "
             "task fully self-contained: spell out identifiers, scope, which "
             "tools to use, and the expected output format. Re-mark a step "
-            "inline via update_plan ONLY if it involves side-effectful "
-            "writes or the final decision — reading, summarising, "
-            "extracting, or drafting per-item content is exactly what "
-            "workers are for; do not re-mark those. "
+            "inline via update_plan ONLY if it involves external side effects "
+            "(sending messages, changing business-system data, registering "
+            "deliverables) or the final call on deliverables — reading, "
+            "summarising, extracting, or drafting per-item content is exactly "
+            "what workers are for; do not re-mark those. "
             "Inline-marked steps stay with you for later turns."
         ),
         additional_kwargs={"expert_work_hide_from_ui": True},
@@ -2740,11 +2741,10 @@ def _build_delegation_nudge(pending_count: int) -> HumanMessage:
     """
     return HumanMessage(
         content=(
-            f"[system reminder] The current plan contains {pending_count} pending "
-            'items that look mutually independent. Per the "Subtask delegation" '
-            "guidance, consider dispatching the parallelizable ones via "
-            "spawn_worker; if they are not truly independent, continue "
-            "sequentially."
+            f"[system reminder] The current plan has {pending_count} unfinished "
+            "steps. If some of them are independent of each other, consider "
+            'dispatching those via spawn_worker per the "Subtask delegation" '
+            "guidance; otherwise continue with the plan yourself."
         ),
         additional_kwargs={"expert_work_hide_from_ui": True},
     )
