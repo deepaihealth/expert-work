@@ -100,8 +100,10 @@ def conflicts(a: _ScheduledCall, b: _ScheduledCall) -> bool:
         return False
     # Mini-ADR J-40 (J.4-补强-2) — two ``is_parallel_safe`` calls don't
     # conflict either. The canonical case is SubAgentTool: each
-    # delegation gets its own ``thread_id`` / sandbox session, so
-    # multiple sibling sub-agents can run via ``asyncio.gather``. This
+    # delegation gets its own ``thread_id`` / checkpoint, so multiple
+    # sibling sub-agents can run via ``asyncio.gather``. (They share the
+    # per-(tenant, user) sandbox session and workspace; writes there
+    # serialize on the user-level workspace lock.) This
     # is checked *before* the empty-paths rule below — a SubAgentTool
     # has no declared paths but is explicitly safe.
     a_par = a.spec is not None and a.spec.is_parallel_safe

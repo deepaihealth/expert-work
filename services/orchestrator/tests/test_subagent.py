@@ -677,7 +677,8 @@ async def test_call_emits_invocation_on_max_steps() -> None:
 
 @pytest.mark.asyncio
 async def test_call_emits_invocation_on_empty_answer() -> None:
-    """Status=COMPLETED with empty result_excerpt when child produced no AIMessage."""
+    """Status=FAILED (with an error) and empty result_excerpt when the child
+    produced no AIMessage — an answerless child did not complete its task."""
     from expert_work.protocol import SubagentStatus
 
     graph = _FakeGraph(result={"messages": [HumanMessage(content="task")], "step_count": 1})
@@ -689,7 +690,8 @@ async def test_call_emits_invocation_on_empty_answer() -> None:
 
     invocations = result.state_updates.get("subagent_invocations")
     assert len(invocations) == 1
-    assert invocations[0].status is SubagentStatus.COMPLETED
+    assert invocations[0].status is SubagentStatus.FAILED
+    assert invocations[0].error
     assert invocations[0].result_excerpt == ""
     assert result.meta.get("subagent_empty") is True
 
