@@ -17,8 +17,10 @@ import pytest
 
 from expert_work.protocol import Plan, PlanStep
 from orchestrator.context import (
+    PlanIngest,
     WorkspaceIngester,
     parse_plan_md,
+    plan_md_digest,
     render_plan_md,
 )
 from orchestrator.tools.file_ops import FileOpError, SandboxWorkspaceReader
@@ -100,37 +102,129 @@ def test_parse_empty_returns_none() -> None:
 # ---------------------------------------------------------------------------
 
 
+#: The digest of some earlier projection — "we wrote something else than what
+#: the file holds now", i.e. the file was edited after our last write.
+_OTHER_DIGEST = plan_md_digest("an earlier projection")
+
+
 async def test_ingest_returns_none_when_unchanged() -> None:
     plan = _plan()
-    reader = _StubReader(contents={"PLAN.md": render_plan_md(plan)})
-    # The projected file matches the DB plan → no edit → no-op.
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=plan, prefix="") is None
+    text = render_plan_md(plan)
+    reader = _StubReader(contents={"PLAN.md": text})
+    # The file is exactly what we last projected → no edit → no-op.
+    assert (
+        await WorkspaceIngester(reader=reader).ingest_plan(
+            current=plan, prefix="", last_written_digest=plan_md_digest(text)
+        )
+        is None
+    )
 
 
 async def test_ingest_returns_candidate_on_edit() -> None:
     plan = _plan()
     edited = render_plan_md(plan).replace("- [ ] 3. review", "- [x] 3. review")
     reader = _StubReader(contents={"PLAN.md": edited})
-    candidate = await WorkspaceIngester(reader=reader).ingest_plan(current=plan, prefix="")
-    assert candidate is not None
-    assert candidate.steps[2].status == "completed"
-    assert candidate != plan
+    edit = await WorkspaceIngester(reader=reader).ingest_plan(
+        current=plan, prefix="", last_written_digest=plan_md_digest(render_plan_md(plan))
+    )
+    assert edit is not None and edit.plan is not None
+    assert edit.plan.steps[2].status == "completed"
+    assert edit.plan != plan
+    # The edit's digest is handed back so the caller consumes it exactly once.
+    assert edit.digest == plan_md_digest(edited)
 
 
 async def test_ingest_returns_none_when_file_absent() -> None:
     reader = _StubReader(contents={})
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan(), prefix="") is None
+    assert (
+        await WorkspaceIngester(reader=reader).ingest_plan(
+            current=_plan(), prefix="", last_written_digest=_OTHER_DIGEST
+        )
+        is None
+    )
 
 
 async def test_ingest_returns_none_on_unparseable_file() -> None:
     reader = _StubReader(contents={"PLAN.md": "garbage that is not a plan"})
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan(), prefix="") is None
+    assert (
+        await WorkspaceIngester(reader=reader).ingest_plan(
+            current=_plan(), prefix="", last_written_digest=_OTHER_DIGEST
+        )
+        is None
+    )
 
 
 async def test_ingest_swallows_reader_failure() -> None:
     reader = _StubReader(contents={}, raise_on_read=True)
     # A read failure must not raise — projection/ingest never breaks a run.
-    assert await WorkspaceIngester(reader=reader).ingest_plan(current=_plan(), prefix="") is None
+    assert (
+        await WorkspaceIngester(reader=reader).ingest_plan(
+            current=_plan(), prefix="", last_written_digest=_OTHER_DIGEST
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# PLAN.md 完整性 —— 只导入真被改过的文件(与上次投影写入的那份比,不与 state.plan 比)
+# ---------------------------------------------------------------------------
+
+
+def _planner_turn2_plan() -> Plan:
+    """The plan the planner just made for turn 2's (different) question."""
+    return Plan(
+        goal="answer the follow-up",
+        steps=(
+            PlanStep(id="1", description="look up the new data", execution="delegate"),
+            PlanStep(id="2", description="reply"),
+        ),
+    )
+
+
+async def test_turn2_untouched_projection_does_not_clobber_the_planner_plan() -> None:
+    """生产实证:第 2 轮起,PLAN.md 里是上一轮投影的计划,与 planner 本轮新做的计划必然
+    不同 —— 旧规则(``parsed != current`` 就导入)每轮都拿旧计划盖掉新计划。文件就是
+    我们上次写的那份(摘要相等)→ 不导入。"""
+    turn1_text = render_plan_md(_plan())
+    reader = _StubReader(contents={"PLAN.md": turn1_text})
+    edit = await WorkspaceIngester(reader=reader).ingest_plan(
+        current=_planner_turn2_plan(), prefix="", last_written_digest=plan_md_digest(turn1_text)
+    )
+    assert edit is None
+
+
+async def test_genuine_edit_is_still_ingested_over_the_planner_plan() -> None:
+    """文件与上次写入的那份不同 = 人 / agent 改过 → 照旧解析并作为候选返回。"""
+    turn1_text = render_plan_md(_plan())
+    edited = turn1_text.replace("- [ ] 3. review", "- [ ] 3. review twice")
+    reader = _StubReader(contents={"PLAN.md": edited})
+    edit = await WorkspaceIngester(reader=reader).ingest_plan(
+        current=_planner_turn2_plan(), prefix="", last_written_digest=plan_md_digest(turn1_text)
+    )
+    assert edit is not None and edit.plan is not None
+    assert edit.plan.steps[2].description == "review twice"
+
+
+async def test_no_stored_digest_means_no_ingest() -> None:
+    """上线前就投影过 / 从没投影过的会话:分不清人改与自己的旧投影,一律不导入。"""
+    edited = render_plan_md(_plan()).replace("- [ ] 3. review", "- [ ] 3. review twice")
+    reader = _StubReader(contents={"PLAN.md": edited})
+    edit = await WorkspaceIngester(reader=reader).ingest_plan(
+        current=_planner_turn2_plan(), prefix="", last_written_digest=None
+    )
+    assert edit is None
+
+
+async def test_edit_equal_to_current_is_consumed_without_a_plan() -> None:
+    """改过但解析出来就是当前计划:没东西可应用,但要把摘要交回去记下,
+    否则下一轮 planner 换了新计划,这份旧文件又会被当成「改动」盖上去。"""
+    plan = _plan()
+    noisy = render_plan_md(plan) + "\n<!-- a note the human left -->\n"
+    reader = _StubReader(contents={"PLAN.md": noisy})
+    edit = await WorkspaceIngester(reader=reader).ingest_plan(
+        current=plan, prefix="", last_written_digest=plan_md_digest(render_plan_md(plan))
+    )
+    assert edit == PlanIngest(plan=None, digest=plan_md_digest(noisy))
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +298,13 @@ async def test_ingest_reads_only_the_thread_scoped_plan() -> None:
             "threads/t-1/PLAN.md": edited,
         }
     )
-    candidate = await WorkspaceIngester(reader=reader).ingest_plan(
-        current=plan, prefix="threads/t-1/"
+    edit = await WorkspaceIngester(reader=reader).ingest_plan(
+        current=plan,
+        prefix="threads/t-1/",
+        last_written_digest=plan_md_digest(render_plan_md(plan)),
     )
-    assert candidate is not None
-    assert candidate.steps[2].status == "completed"
+    assert edit is not None and edit.plan is not None
+    assert edit.plan.steps[2].status == "completed"
 
 
 async def test_ingest_ignores_legacy_root_plan_for_a_fresh_thread() -> None:
@@ -216,6 +312,8 @@ async def test_ingest_ignores_legacy_root_plan_for_a_fresh_thread() -> None:
     # thread's plan) must NOT seed this thread's state.
     reader = _StubReader(contents={"PLAN.md": render_plan_md(_plan())})
     assert (
-        await WorkspaceIngester(reader=reader).ingest_plan(current=None, prefix="threads/t-2/")
+        await WorkspaceIngester(reader=reader).ingest_plan(
+            current=None, prefix="threads/t-2/", last_written_digest=_OTHER_DIGEST
+        )
         is None
     )

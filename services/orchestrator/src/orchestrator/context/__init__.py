@@ -60,6 +60,9 @@ from orchestrator.context.working_window import (
     trim_to_recent_turns as trim_to_recent_turns,
 )
 from orchestrator.context.workspace_projection import (
+    PlanIngest as PlanIngest,
+)
+from orchestrator.context.workspace_projection import (
     ProjectionResult as ProjectionResult,
 )
 from orchestrator.context.workspace_projection import (
@@ -76,6 +79,9 @@ from orchestrator.context.workspace_projection import (
 )
 from orchestrator.context.workspace_projection import (
     parse_plan_md as parse_plan_md,
+)
+from orchestrator.context.workspace_projection import (
+    plan_md_digest as plan_md_digest,
 )
 from orchestrator.context.workspace_projection import (
     render_memory_md as render_memory_md,
@@ -99,6 +105,7 @@ __all__ = [
     "ContextCompressor",
     "ContextOverflowError",
     "OnCompacted",
+    "PlanIngest",
     "PreCompactionHook",
     "ProjectionResult",
     "PruneResult",
@@ -113,6 +120,7 @@ __all__ = [
     "estimate_tokens",
     "floor_head_keep_for_injection",
     "parse_plan_md",
+    "plan_md_digest",
     "prune_old_tool_results",
     "prune_prior_turns",
     "render_memory_md",

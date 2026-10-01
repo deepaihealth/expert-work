@@ -17,6 +17,8 @@ import pytest
 from expert_work.protocol import MemoryItem, Plan, PlanStep
 from orchestrator.context import (
     WorkspaceProjector,
+    parse_plan_md,
+    plan_md_digest,
     render_memory_md,
     render_plan_md,
     render_todo_md,
@@ -323,3 +325,112 @@ async def test_legacy_root_write_failure_does_not_pin_digest() -> None:
         plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
     )
     assert result.digest is not None
+
+
+# ---------------------------------------------------------------------------
+# PLAN.md 完整性 —— 写成功才记摘要;委派标记往返
+# ---------------------------------------------------------------------------
+
+_P = "threads/t-1/"
+
+
+async def test_plan_md_digest_reported_only_when_plan_md_write_succeeded() -> None:
+    writer = _RecordingWriter()
+    result = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest="older", prefix=_P
+    )
+    assert result.plan_md_digest == plan_md_digest(writer.writes[_P + "PLAN.md"])
+
+
+async def test_failed_plan_md_write_does_not_advance_its_digest() -> None:
+    """PLAN.md 写失败 → 文件还是旧内容,旧摘要仍然对 → 不交新摘要。"""
+    writer = _RecordingWriter(fail_on=frozenset({_P + "PLAN.md"}))
+    result = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest="older", prefix=_P
+    )
+    assert result.plan_md_digest is None
+    assert _P + "TODO.md" in writer.writes  # the other file still landed
+
+
+async def test_plan_md_digest_advances_even_if_another_file_failed() -> None:
+    """PLAN.md 写成功、TODO.md 失败:文件已是新内容,PLAN.md 摘要必须前进
+    (合并摘要不前进,下一轮重试 —— 两者各管各的)。"""
+    writer = _RecordingWriter(fail_on=frozenset({_P + "TODO.md"}))
+    result = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest="older", prefix=_P
+    )
+    assert result.digest == "older"
+    assert result.plan_md_digest == plan_md_digest(render_plan_md(_plan()))
+
+
+async def test_skipped_projection_reports_no_plan_md_digest() -> None:
+    writer = _RecordingWriter()
+    first = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest=None, prefix=_P
+    )
+    second = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest=first.digest, prefix=_P
+    )
+    assert second.skipped
+    assert second.plan_md_digest is None
+
+
+#: The exact pre-delegate-marker rendering of :func:`_plan` — a plan with no
+#: delegate step must stay byte-identical so existing files' digests and the
+#: only-if-changed gate are unaffected.
+_PLAN_MD_BEFORE = (
+    "<!-- Edit this file to steer the agent: change the goal, add/remove/reorder "
+    "steps, or flip a checkbox ([ ] todo / [~] in progress / [x] done). Changes "
+    "are ingested at the next run start; the database stays the source of truth. -->\n"
+    "\n"
+    "# Plan\n"
+    "\n"
+    "**Goal:** ship the feature\n"
+    "\n"
+    "## Steps\n"
+    "\n"
+    "- [x] 1. write tests\n"
+    "- [~] 2. implement\n"
+    "- [ ] 3. review\n"
+)
+
+
+def test_plan_without_delegate_renders_byte_identical() -> None:
+    assert render_plan_md(_plan()) == _PLAN_MD_BEFORE
+
+
+def _delegate_plan() -> Plan:
+    return Plan(
+        goal="g",
+        steps=(
+            PlanStep(id="1", description="read all five reports", execution="delegate"),
+            PlanStep(
+                id="2", description="compare suppliers", status="in_progress", execution="delegate"
+            ),
+            PlanStep(id="3", description="write the decision"),
+        ),
+    )
+
+
+def test_delegate_step_renders_a_visible_marker() -> None:
+    md = render_plan_md(_delegate_plan())
+    assert "- [ ] 1. read all five reports _(delegate)_\n" in md
+    assert "- [~] 2. compare suppliers _(delegate)_\n" in md
+    assert "- [ ] 3. write the decision\n" in md
+
+
+def test_delegate_marks_round_trip_through_plan_md() -> None:
+    plan = _delegate_plan()
+    assert parse_plan_md(render_plan_md(plan)) == plan
+
+
+def test_human_can_remove_or_add_the_delegate_marker() -> None:
+    md = (
+        render_plan_md(_delegate_plan())
+        .replace("read all five reports _(delegate)_", "read all five reports")
+        .replace("write the decision", "write the decision _(delegate)_")
+    )
+    parsed = parse_plan_md(md)
+    assert parsed is not None
+    assert [s.execution for s in parsed.steps] == ["inline", "delegate", "delegate"]
+    assert parsed.steps[2].description == "write the decision"

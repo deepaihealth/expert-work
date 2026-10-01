@@ -170,10 +170,15 @@ def render_plan(plan: Plan) -> str:
     """Render a :class:`Plan` as the tail-recitation block the agent reads each
     turn (Stream J.1 + CM-0 N1). The status checkbox (``[ ]`` / ``[~]`` /
     ``[x]``) keeps progress in recent attention so a long run does not lose
-    track of what is already done vs. still pending."""
+    track of what is already done vs. still pending. A ``delegate`` step
+    carries a ``(delegate)`` marker so the model sees which steps are meant
+    for workers (and that its marking survives progress updates); ``inline``
+    steps render unchanged."""
     lines = ["## Execution plan", f"Goal: {plan.goal}", ""]
     lines.extend(
-        f"- [{_STATUS_BOX.get(step.status, ' ')}] {index}. {step.description}"
+        f"- [{_STATUS_BOX.get(step.status, ' ')}] {index}. "
+        + ("(delegate) " if step.execution == "delegate" else "")
+        + step.description
         for index, step in enumerate(plan.steps, start=1)
     )
     lines.append("")
@@ -232,6 +237,14 @@ def make_planner_node(llm_caller: LLMCaller, *, plan_first: bool = False) -> Pla
             response = await token.run_cancellable(llm_caller(messages=plan_messages, tools=[]))
         plan = parse_plan(_message_text(response), fallback_goal=task)
         logger.info("planner.plan_built steps=%d", len(plan.steps))
-        return {"plan": plan}
+        if not plan_first:
+            return {"plan": plan}
+        # 新的一轮 = 新的计划谱系:上一轮派过的步骤与分发去重键都不再适用。不清的话,
+        # 用户换个说法再问同一件事、planner 给出同样的步骤时,这一轮一个都不会派。
+        return {
+            "plan": plan,
+            "plan_first_dispatched_steps": [],
+            "plan_first_dispatch_plan_hash": None,
+        }
 
     return planner_node
