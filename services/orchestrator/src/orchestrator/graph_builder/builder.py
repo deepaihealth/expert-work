@@ -801,7 +801,7 @@ def build_react_graph(
         # retry, then the turn degrades (full tools restored) so the run
         # never dies here. ``budget_exhausted`` wins: the wrap-up turn is
         # never a dispatch turn. ``plan_first=False`` skips the block and
-        # never writes the three dispatch channels — byte-identical.
+        # never writes the dispatch channels — byte-identical.
         dispatch_active = False
         dispatch_retries = int(state.get("plan_first_dispatch_retries") or 0)
         dispatched_hash: str | None = None

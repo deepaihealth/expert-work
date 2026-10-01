@@ -323,8 +323,10 @@ class AgentState(TypedDict):
     #: B-35(plan_first 分发轮)— identity hash (goal + step descriptions +
     #: execution markers, statuses excluded) of the last plan version a
     #: dispatch turn ran for. Dedupe key: one dispatch turn per plan version;
-    #: a structural replan (new/changed delegate steps) re-fires. All three
-    #: channels are only ever written when the build has ``plan_first`` on.
+    #: a structural replan re-fires, but only for delegate steps not yet
+    #: listed in a dispatch turn (``plan_first_dispatched_steps``). All
+    #: dispatch channels are only ever written when the build has
+    #: ``plan_first`` on (the planner resets two of them at run start).
     plan_first_dispatch_plan_hash: NotRequired[str | None]
     #: B-35 — True while the just-finished agent turn was a dispatch turn;
     #: ``_should_continue`` routes a tool-less reply back to ``agent``
