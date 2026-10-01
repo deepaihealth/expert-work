@@ -40,7 +40,9 @@ def test_worker_delegation_block_carries_scale_rubric() -> None:
     assert "Workers may write intermediate files in the shared workspace" in block
     # Cost truth — a worker is a full run, not a cheap helper.
     assert "full separate run" in block
-    assert "costs about as much as doing the subtask yourself" in block
+    assert "with its own cost" in block
+    assert "re-sent on every later step" in block
+    assert "about as much" not in block
     assert "cheap" not in block
     assert "lightweight" not in block
     # Self-contained task contract.

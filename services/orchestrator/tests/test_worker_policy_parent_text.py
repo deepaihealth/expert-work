@@ -61,7 +61,9 @@ def test_spawn_worker_description_is_truthful(
     assert "lands in this conversation in full" not in desc
     # True clauses are present.
     assert "full, separate agent run" in desc
-    assert "costs about as much as doing the subtask yourself" in desc
+    assert "its own token cost" in desc
+    assert "re-sent on every later step" in desc
+    assert "about as much" not in desc
     assert "no knowledge-base search" in desc
     assert "longer than about 12,000 characters" in desc
     assert "head/tail preview plus a path" in desc
