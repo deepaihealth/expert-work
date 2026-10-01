@@ -36,7 +36,7 @@ from orchestrator import (
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
 
-_NUDGE_MARKER = "[system reminder] The current plan contains"
+_NUDGE_MARKER = "[system reminder] The current plan has"
 
 # ---------------------------------------------------------------------------
 # Test helpers (mirror test_step_count_refund.py)
