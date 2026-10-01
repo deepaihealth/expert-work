@@ -83,6 +83,15 @@ _worker_approval_blocked = expert_work_counter(
     "Child runs halted at an approval gate and soft-refused to the parent.",
 )
 
+#: 子图「预算用尽 → 一次无工具收尾轮」出口的 ``exit_reason`` 取值(盖章处:
+#: ``graph_builder.builder.budget_exit_reason``;本模块在 graph_builder 下层,写成
+#: 字面量)→ 给父的状态说明。
+_BUDGET_EXIT_NOTES: Mapping[str, str] = {
+    "max_steps": "reached its step limit ({max_steps} steps)",
+    "no_progress": "stopped making progress ({max_no_progress} steps in a row without any)",
+    "token_budget": "the run's token budget ran out",
+}
+
 _children_seeded_with_attachments = expert_work_counter(
     "expert_work_child_seeded_with_attachments_total",
     "Delegated child runs whose seed message carried this turn's attachments.",
@@ -191,6 +200,17 @@ async def run_child_to_result(
     tool failure — its partial-progress note returns as a normal
     ``ToolResult`` so the parent can reason about it. A cancellation
     re-raises (the parent run tears down anyway).
+
+    Every exit tells the parent what actually happened and (when a sink is
+    wired) emits exactly one ``end`` frame:
+
+    * the run's deadline expires mid-child → the child is cancelled and its
+      partial work comes back as a ``ToolResult`` led by a status line;
+    * the child's graph ended on a budget wrap-up (``exit_reason`` step /
+      no-progress / token budget) → the answer comes back led by a status
+      line saying it is a forced wrap-up;
+    * any other exception → ``end`` frame + trajectory, then re-raised so
+      the parent's ``[tool error]`` path handles it unchanged.
     """
     sub_thread_id = uuid4()
     sub_run_id = uuid4()
@@ -252,37 +272,42 @@ async def run_child_to_result(
         )
         wseq += 1
 
+    # 子代与父共用 run 的墙钟:``deadline_at`` 以前只在派出去之前查一次,子代一旦
+    # 跑起来就不再理会它。把整段流式执行框进剩余时间里;没有 deadline = 不设限。
+    deadline_scope = asyncio.timeout(
+        None if ctx.deadline_at is None else ctx.deadline_at - time.monotonic()
+    )
+    stream = child.graph.astream(child_input, child_config, stream_mode=["updates", "values"])
     try:
         # B2 — ainvoke → astream:同一 compiled graph、同一 config,
         # updates chunk 逐个截断成 worker 帧;最后一个 values chunk 即
         # ainvoke 的返回值(LangGraph 语义),异常时缺失 → 下方
         # _fetch_partial 兜底(原语义)。
         last_chunk = time.monotonic()
-        with usage_tap(ledger):
-            async for part in child.graph.astream(
-                child_input, child_config, stream_mode=["updates", "values"]
-            ):
-                mode, chunk = part
-                if mode == "values":
-                    result = chunk
-                    continue
-                now = time.monotonic()
-                duration_ms = int((now - last_chunk) * 1000)
-                last_chunk = now
-                if sink is None or not isinstance(chunk, Mapping):
-                    continue
-                for node, writes in chunk.items():
-                    await _emit_worker_frame(
-                        sink,
-                        build_worker_update_frame(
-                            ident,
-                            wseq=wseq,
-                            node=str(node),
-                            writes=writes if isinstance(writes, Mapping) else {},
-                            duration_ms=duration_ms,
-                        ),
-                    )
-                    wseq += 1
+        async with deadline_scope:
+            with usage_tap(ledger):
+                async for part in stream:
+                    mode, chunk = part
+                    if mode == "values":
+                        result = chunk
+                        continue
+                    now = time.monotonic()
+                    duration_ms = int((now - last_chunk) * 1000)
+                    last_chunk = now
+                    if sink is None or not isinstance(chunk, Mapping):
+                        continue
+                    for node, writes in chunk.items():
+                        await _emit_worker_frame(
+                            sink,
+                            build_worker_update_frame(
+                                ident,
+                                wseq=wseq,
+                                node=str(node),
+                                writes=writes if isinstance(writes, Mapping) else {},
+                                duration_ms=duration_ms,
+                            ),
+                        )
+                        wseq += 1
         outcome: TrajectoryOutcome = "success"
     except MaxStepsExceededError:
         outcome = "max_steps"
@@ -319,6 +344,82 @@ async def run_child_to_result(
                 ),
             )
         raise
+    except Exception:
+        # 两种情况都落到这里:run 的墙钟到了(``deadline_scope`` 取消了子代,
+        # 抛 ``TimeoutError``),或子代抛了一个上面没接住的异常。以前后者直接逃出
+        # 本函数:没有 end 帧(前端卡片永远停在「运行中」),也没有轨迹。
+        # ``asyncio.CancelledError`` 不是 ``Exception``,原样穿过。
+        deadline_hit = deadline_scope.expired()
+        # 异常若出在我们自己的循环体里(比如等 sink 时被取消),子代的流还挂在
+        # 某个 yield 上、节点任务仍在跑 —— 显式关掉,才算真把子代停了。
+        await _aclose_quietly(stream)
+        if isinstance(result, Mapping):
+            partial_msgs = list(result.get("messages", []))
+            partial_steps = int(result.get("step_count", 0) or 0)
+        else:
+            partial_msgs, partial_steps = await _fetch_partial(
+                child.graph, child_config, label=label
+            )
+        finished_at = datetime.now(UTC)
+        wall_clock_ms = int((time.monotonic() - start_monotonic) * 1000)
+        _dispatch_trajectory(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            sub_thread_id=sub_thread_id,
+            sub_run_id=sub_run_id,
+            outcome="cancelled" if deadline_hit else "failed",
+            messages=partial_msgs,
+            started_at=started_at,
+            finished_at=finished_at,
+            step_count=partial_steps,
+            recorder=trajectory_recorder,
+            metadata=trajectory_metadata,
+        )
+        if sink is not None:
+            partial = _worker_usage(ledger, partial_msgs)
+            await _emit_worker_frame(
+                sink,
+                build_worker_end_frame(
+                    ident,
+                    wseq=wseq,
+                    # end 帧对外(对接方前端消费),outcome 只用文档里已有的取值、不新增:
+                    # 到墙钟 = 被平台的一个上限叫停并带回部分结果,与步数用尽同类 →
+                    # max_steps;意外异常 = 没带回结果就结束了,最接近的是 cancelled。
+                    outcome="max_steps" if deadline_hit else "cancelled",
+                    iteration_used=partial_steps,
+                    llm_call_count=partial.llm_call_count,
+                    wall_clock_ms=wall_clock_ms,
+                    usage=partial.usage,
+                    usage_by_model=partial.usage_by_model,
+                ),
+            )
+        if not deadline_hit:
+            logger.warning(
+                "child_run.failed label=%s agent_ref=%s", label, agent_ref, exc_info=True
+            )
+            raise
+        logger.info(
+            "child_run.deadline label=%s agent_ref=%s steps=%d", label, agent_ref, partial_steps
+        )
+        return _deadline_result(
+            messages=partial_msgs,
+            meta={
+                "subagent": label,
+                "iteration_used": partial_steps,
+                "llm_call_count": sum(1 for msg in partial_msgs if isinstance(msg, AIMessage)),
+                "wall_clock_ms": wall_clock_ms,
+                **(extra_meta or {}),
+            },
+            label=label,
+            agent_ref=agent_ref,
+            child_depth=child_depth,
+            sub_thread_id=sub_thread_id,
+            sub_run_id=sub_run_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            step_count=partial_steps,
+            wall_clock_ms=wall_clock_ms,
+        )
 
     wall_clock_ms = int((time.monotonic() - start_monotonic) * 1000)
     finished_at = datetime.now(UTC)
@@ -342,6 +443,23 @@ async def run_child_to_result(
     approval_blocked = pending_approval is not None and not raised_max_steps
     if approval_blocked:
         outcome = "failed"
+    # 子图正常走到 END,但走的是「预算用尽 → 一次无工具收尾轮」那个出口(state 上的
+    # ``exit_reason`` 由 ``budget_exit_reason`` 盖章)。收尾轮的回答与自然说完逐字
+    # 同形,不看这个章就会把「被平台叫停」当成「做完了」交给父。
+    raw_exit = result.get("exit_reason") if isinstance(result, Mapping) else None
+    budget_exit = (
+        raw_exit
+        if isinstance(raw_exit, str)
+        and raw_exit in _BUDGET_EXIT_NOTES
+        and not approval_blocked
+        and not raised_max_steps
+        else None
+    )
+    if budget_exit is not None:
+        outcome = "max_steps"
+    answer = _final_answer(messages)
+    if answer is None and outcome == "success":
+        outcome = "failed"
 
     if sink is not None:
         frame_usage = _worker_usage(ledger, messages)
@@ -352,7 +470,7 @@ async def run_child_to_result(
                 wseq=wseq,
                 outcome=(
                     "max_steps"
-                    if raised_max_steps
+                    if raised_max_steps or budget_exit is not None
                     else "approval_blocked"
                     if approval_blocked
                     else "success"
@@ -388,7 +506,6 @@ async def run_child_to_result(
     if extra_meta:
         meta.update(extra_meta)
 
-    answer = _final_answer(messages)
     if approval_blocked:
         summary = getattr(pending_approval, "action_summary", "") or "a gated action"
         _worker_approval_blocked.inc()
@@ -448,14 +565,14 @@ async def run_child_to_result(
         return _build_tool_result(
             content=f"[sub-agent {label!r} produced no answer]",
             meta=meta,
-            status=SubagentStatus.COMPLETED,
+            status=SubagentStatus.FAILED,
             label=label,
             agent_ref=agent_ref,
             child_depth=child_depth,
             sub_thread_id=sub_thread_id,
             sub_run_id=sub_run_id,
             result_excerpt="",
-            error=None,
+            error=f"finished without producing an answer ({step_count} steps)",
             started_at=started_at,
             finished_at=finished_at,
             iteration_used=step_count,
@@ -463,8 +580,20 @@ async def run_child_to_result(
             wall_clock_ms=wall_clock_ms,
         )
 
+    content = answer
+    if budget_exit is not None:
+        # COMPLETED 而不是 FAILED:收尾轮的回答是可用的部分成果,父该拿来用;
+        # 「不完整」由首行状态说明 + ``subagent_exit_reason`` 交代,不靠状态位。
+        meta["subagent_exit_reason"] = budget_exit
+        note = _BUDGET_EXIT_NOTES[budget_exit].format(
+            max_steps=child.max_steps, max_no_progress=child.max_no_progress
+        )
+        content = (
+            f"[worker stopped early: {note} — the reply below is a forced wrap-up "
+            f"and may be incomplete]\n\n{answer}"
+        )
     return _build_tool_result(
-        content=answer,
+        content=content,
         meta=meta,
         status=SubagentStatus.COMPLETED,
         label=label,
@@ -472,7 +601,7 @@ async def run_child_to_result(
         child_depth=child_depth,
         sub_thread_id=sub_thread_id,
         sub_run_id=sub_run_id,
-        result_excerpt=answer[:MAX_RESULT_EXCERPT_CHARS],
+        result_excerpt=content[:MAX_RESULT_EXCERPT_CHARS],
         error=None,
         started_at=started_at,
         finished_at=finished_at,
@@ -709,12 +838,78 @@ async def _record_safe(recorder: TrajectoryRecorder, record: TrajectoryRecord) -
 
 
 def _final_answer(messages: Sequence[BaseMessage]) -> str | None:
-    """Return the last ``AIMessage``'s content as text, or ``None``."""
+    """Return the last ``AIMessage``'s text, or ``None``.
+
+    Block-list content (thinking + text blocks) is reduced to its joined text
+    blocks — ``str(list)`` would hand the parent a Python repr."""
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            content = message.content
-            return content if isinstance(content, str) else str(content)
+            return str(message.text)
     return None
+
+
+def _last_ai_text(messages: Sequence[BaseMessage]) -> str:
+    """The most recent non-blank ``AIMessage`` text (``""`` if none) — for a
+    child stopped mid-flight, whose last AI turn may be a bare tool call."""
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            text = str(message.text).strip()
+            if text:
+                return text
+    return ""
+
+
+def _deadline_result(
+    *,
+    messages: Sequence[BaseMessage],
+    meta: dict[str, Any],
+    label: str,
+    agent_ref: str,
+    child_depth: int,
+    sub_thread_id: UUID,
+    sub_run_id: UUID,
+    started_at: datetime,
+    finished_at: datetime,
+    step_count: int,
+    wall_clock_ms: int,
+) -> ToolResult:
+    """The parent-facing result for a child the run's deadline stopped mid-flight."""
+    partial = _last_ai_text(messages)
+    status_line = f"[worker stopped: the run's time limit was reached after {step_count} steps"
+    content = (
+        f"{status_line} — partial result below, may be incomplete]\n\n{partial}"
+        if partial
+        else f"{status_line} — it produced no partial result]"
+    )
+    meta["subagent_deadline"] = True
+    return _build_tool_result(
+        content=content,
+        meta=meta,
+        status=SubagentStatus.FAILED,
+        label=label,
+        agent_ref=agent_ref,
+        child_depth=child_depth,
+        sub_thread_id=sub_thread_id,
+        sub_run_id=sub_run_id,
+        result_excerpt=content[:MAX_RESULT_EXCERPT_CHARS],
+        error=f"stopped at the run's time limit after {step_count} steps",
+        started_at=started_at,
+        finished_at=finished_at,
+        iteration_used=step_count,
+        llm_call_count=int(meta.get("llm_call_count", 0)),
+        wall_clock_ms=wall_clock_ms,
+    )
+
+
+async def _aclose_quietly(stream: object) -> None:
+    """Best-effort ``aclose`` of the child's stream (no-op once exhausted)."""
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:
+        logger.warning("child_run.stream_close_failed err=%s", type(exc).__name__)
 
 
 def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) -> RunnableConfig:

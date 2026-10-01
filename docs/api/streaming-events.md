@@ -199,11 +199,14 @@ How to get a run's total tokens:
 - **`usage` may be absent, and absent is not zero.** Token counts are
   optional for some providers and some cache paths. A missing block means
   "not reported", so treat it as unknown rather than free.
-  `outcome` is one of `"success"`, `"max_steps"` (partial result, not a
-  failure), `"cancelled"`, or `"approval_blocked"` (the worker hit a tool
-  that requires human approval, which is unavailable inside a worker — the
-  main agent takes the sub-task back). Treat unknown outcome values as
-  non-success rather than erroring.
+  `outcome` is one of `"success"`, `"max_steps"` (a platform limit stopped
+  the worker — its step limit, its token or no-progress budget, or the run's
+  time limit — and what it handed back is a partial result, not a failure),
+  `"cancelled"` (the worker ended without handing back a result: the run was
+  cancelled, or the worker hit an unexpected error), or `"approval_blocked"`
+  (the worker hit a tool that requires human approval, which is unavailable
+  inside a worker — the main agent takes the sub-task back). Treat unknown
+  outcome values as non-success rather than erroring.
 
 Consumer checklist:
 
