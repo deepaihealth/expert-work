@@ -17,7 +17,7 @@
 | `2db9ebbd` #1714、`da500b0e` #1715 | admin-ui 依赖:lucide-react / react-i18next / vitest;安全覆盖 moment 2.31.0(随 antd 日期控件进浏览器)、dompurify 3.4.16(随 monaco 编辑器与文档站进浏览器)、undici、brace-expansion | 是 | §4 |
 | #1724 | B-149 数据标记保留换行与缩进;`edit_file` 去标记符兜底 | 是 | §5 |
 | #1725 | B-137 `edit_file` 一次改多处 / 全部替换;不再让模型传哈希 | 是 | §6 |
-| (本 PR) | B-139 同一会话的多轮串行执行(排队);新迁移 `0160` | 是 | §7 |
+| #1727 | B-139 同一会话的多轮串行执行(排队);新迁移 `0160` | 是 | §7 |
 | `5c583c69` #1675 | CI 的 codeql upload-sarif | 否 | — |
 | 其余 | 文档(ROADMAP / 执行单) | 否 | — |
 
