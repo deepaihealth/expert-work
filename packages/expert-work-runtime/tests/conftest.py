@@ -217,3 +217,218 @@ def event_names_filter_contract() -> Callable[..., Awaitable[None]]:
 def keyset_before_contract() -> Callable[..., Awaitable[None]]:
     """``RunStore.list_for_tenant(before=…)`` 的契约断言,两个实现共用。"""
     return _assert_keyset_before
+
+
+# --- B-139 —— 同一会话串行执行:存储层场景,内存版与 SQL 版共用 -----------------
+
+#: 远离其它测试共用库里的行:``list_queued`` 是跨租户全表扫, 场景只看自己造的行。
+_TQ_T0 = datetime(2031, 1, 1, tzinfo=UTC)
+_TQ_LEASE = timedelta(seconds=30)
+
+
+def _row(
+    *,
+    tenant_id: UUID,
+    thread_id: UUID,
+    status: RunStatus,
+    at: timedelta,
+    run_id: UUID | None = None,
+    claimed_by: str | None = None,
+    lease_until: datetime | None = None,
+) -> RunInfo:
+    created = _TQ_T0 + at
+    return RunInfo(
+        run_id=run_id or uuid4(),
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        user_id=None,
+        status=status,
+        on_disconnect=DisconnectMode.CONTINUE,
+        is_resume=False,
+        error=None,
+        created_at=created,
+        updated_at=created,
+        finished_at=None,
+        claimed_by=claimed_by,
+        lease_until=lease_until,
+        enqueued_input={"input": "hi"} if status is RunStatus.QUEUED else None,
+    )
+
+
+async def _queued_ids(store: RunStore, *, now: datetime, mine: set[UUID]) -> list[UUID]:
+    return [r.run_id for r in await store.list_queued(limit=1000, now=now) if r.run_id in mine]
+
+
+async def _claim(store: RunStore, run_id: UUID, *, owner: str, now: datetime) -> RunInfo | None:
+    return await store.claim_queued(
+        run_id=run_id, new_owner=owner, lease_until=now + _TQ_LEASE, heartbeat_at=now
+    )
+
+
+async def inflight_lists_only_busy_runs_of_the_thread(store: RunStore) -> None:
+    tenant, thread, other = uuid4(), uuid4(), uuid4()
+    done = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.SUCCESS, at=timedelta(0))
+    paused = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.PAUSED, at=timedelta(1))
+    running = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.RUNNING, at=timedelta(2))
+    queued = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.QUEUED, at=timedelta(3))
+    pending = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.PENDING, at=timedelta(4))
+    elsewhere = _row(tenant_id=tenant, thread_id=other, status=RunStatus.RUNNING, at=timedelta(0))
+    for r in (pending, queued, done, paused, running, elsewhere):
+        await store.create(r)
+
+    busy = await store.list_inflight_by_thread(thread_id=thread, tenant_id=tenant)
+
+    # 等审批(PAUSED)不算忙:新一轮会作废那条审批(已拍板的规则)。
+    assert [r.run_id for r in busy] == [running.run_id, queued.run_id, pending.run_id]
+    assert await store.list_inflight_by_thread(thread_id=thread, tenant_id=uuid4()) == []
+
+
+async def follower_waits_for_every_earlier_busy_run(store: RunStore) -> None:
+    tenant, thread = uuid4(), uuid4()
+    leader = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.RUNNING, at=timedelta(0))
+    first = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.QUEUED, at=timedelta(1))
+    second = _row(tenant_id=tenant, thread_id=thread, status=RunStatus.QUEUED, at=timedelta(2))
+    for r in (leader, first, second):
+        await store.create(r)
+    mine = {first.run_id, second.run_id}
+    now = _TQ_T0 + timedelta(minutes=1)
+
+    assert await _queued_ids(store, now=now, mine=mine) == []
+    assert await _claim(store, first.run_id, owner="w", now=now) is None
+
+    await store.set_status(
+        run_id=leader.run_id, tenant_id=tenant, status=RunStatus.SUCCESS, updated_at=now
+    )
+    # 只有排在最前的那一轮轮到了;第二轮还要等第一轮。
+    assert await _queued_ids(store, now=now, mine=mine) == [first.run_id]
+    assert await _claim(store, second.run_id, owner="w", now=now) is None
+    claimed = await _claim(store, first.run_id, owner="w", now=now)
+    assert claimed is not None and claimed.status is RunStatus.RUNNING
+
+    # 第一轮被领走在跑 —— 仍然挡着第二轮。
+    assert await _queued_ids(store, now=now, mine=mine) == []
+    await store.set_status(
+        run_id=first.run_id, tenant_id=tenant, status=RunStatus.ERROR, updated_at=now
+    )
+    assert await _queued_ids(store, now=now, mine=mine) == [second.run_id]
+
+
+async def other_threads_do_not_block(store: RunStore) -> None:
+    tenant = uuid4()
+    busy = _row(tenant_id=tenant, thread_id=uuid4(), status=RunStatus.RUNNING, at=timedelta(0))
+    free = _row(tenant_id=tenant, thread_id=uuid4(), status=RunStatus.QUEUED, at=timedelta(1))
+    for r in (busy, free):
+        await store.create(r)
+    now = _TQ_T0 + timedelta(minutes=1)
+    assert await _queued_ids(store, now=now, mine={free.run_id}) == [free.run_id]
+    assert await _claim(store, free.run_id, owner="w", now=now) is not None
+
+
+async def same_instant_runs_order_by_id(store: RunStore) -> None:
+    """``created_at`` 相同(应用侧取时间)时按 run id 定先后 —— 不能两条互相等。"""
+    tenant, thread = uuid4(), uuid4()
+    a, b = sorted((uuid4(), uuid4()))
+    for rid in (b, a):
+        await store.create(
+            _row(
+                tenant_id=tenant,
+                thread_id=thread,
+                status=RunStatus.QUEUED,
+                at=timedelta(0),
+                run_id=rid,
+            )
+        )
+    now = _TQ_T0 + timedelta(minutes=1)
+    assert await _queued_ids(store, now=now, mine={a, b}) == [a]
+
+
+async def a_live_reservation_keeps_others_out(store: RunStore) -> None:
+    tenant, thread = uuid4(), uuid4()
+    now = _TQ_T0 + timedelta(minutes=1)
+    held = _row(
+        tenant_id=tenant,
+        thread_id=thread,
+        status=RunStatus.QUEUED,
+        at=timedelta(0),
+        claimed_by="replica-a",
+        lease_until=now + _TQ_LEASE,
+    )
+    await store.create(held)
+
+    assert await _queued_ids(store, now=now, mine={held.run_id}) == []
+    assert await _claim(store, held.run_id, owner="replica-b", now=now) is None
+    # 预订者自己可以领。
+    claimed = await _claim(store, held.run_id, owner="replica-a", now=now)
+    assert claimed is not None and claimed.claimed_by == "replica-a"
+
+
+async def an_expired_reservation_is_fair_game(store: RunStore) -> None:
+    tenant, thread = uuid4(), uuid4()
+    now = _TQ_T0 + timedelta(minutes=1)
+    stale = _row(
+        tenant_id=tenant,
+        thread_id=thread,
+        status=RunStatus.QUEUED,
+        at=timedelta(0),
+        claimed_by="replica-a",
+        lease_until=now - timedelta(seconds=1),
+    )
+    await store.create(stale)
+    assert await _queued_ids(store, now=now, mine={stale.run_id}) == [stale.run_id]
+    claimed = await _claim(store, stale.run_id, owner="replica-b", now=now)
+    assert claimed is not None and claimed.claimed_by == "replica-b"
+
+
+async def reservation_renew_and_release(store: RunStore) -> None:
+    tenant, thread = uuid4(), uuid4()
+    now = _TQ_T0 + timedelta(minutes=1)
+    row = _row(
+        tenant_id=tenant,
+        thread_id=thread,
+        status=RunStatus.QUEUED,
+        at=timedelta(0),
+        claimed_by="replica-a",
+        lease_until=now + _TQ_LEASE,
+    )
+    await store.create(row)
+    later = now + timedelta(seconds=20)
+
+    assert await store.renew_queued_reservation(
+        run_id=row.run_id, owner="replica-a", lease_until=later + _TQ_LEASE, now=later
+    )
+    # 别人抢不走一份还有效的预订。
+    assert not await store.renew_queued_reservation(
+        run_id=row.run_id, owner="replica-b", lease_until=later + _TQ_LEASE, now=later
+    )
+    # 别人的释放不生效。
+    await store.release_queued_reservation(run_id=row.run_id, owner="replica-b")
+    assert await _queued_ids(store, now=later, mine={row.run_id}) == []
+
+    await store.release_queued_reservation(run_id=row.run_id, owner="replica-a")
+    assert await _queued_ids(store, now=later, mine={row.run_id}) == [row.run_id]
+
+    # 行已不再排队(被取消)—— 续不上。
+    await store.request_cancel(
+        run_id=row.run_id, tenant_id=tenant, updated_at=later, reason="user_cancel"
+    )
+    assert not await store.renew_queued_reservation(
+        run_id=row.run_id, owner="replica-a", lease_until=later + _TQ_LEASE, now=later
+    )
+
+
+_THREAD_QUEUE_SCENARIOS = (
+    inflight_lists_only_busy_runs_of_the_thread,
+    follower_waits_for_every_earlier_busy_run,
+    other_threads_do_not_block,
+    same_instant_runs_order_by_id,
+    a_live_reservation_keeps_others_out,
+    an_expired_reservation_is_fair_game,
+    reservation_renew_and_release,
+)
+
+
+@pytest.fixture
+def thread_queue_scenarios() -> tuple[Callable[[RunStore], Awaitable[None]], ...]:
+    """B-139 —— 「忙 / 轮到没有 / 预订有效没有」的契约场景,两个实现共用:
+    两份实现的谓词必须逐字同义, 否则内存版全绿、线上 SQL 放两轮并跑。"""
+    return _THREAD_QUEUE_SCENARIOS

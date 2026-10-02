@@ -37,8 +37,9 @@ _PKG_ROOTS = {
 #: (Global Constraint:``sanitize_agent_key`` 只许有一种算法)。
 _LAUNCH_SITES: dict[str, tuple[str, bool] | None] = {
     # —— 用户的五条真 run 入口,各自就地建 configurable ——
-    "control-plane/api/runs.py::spawn_run": (
-        "control-plane/api/runs.py::spawn_run",
+    # B-139 —— 起 run 的那段抽进了 ``_start_run``(立即执行与排队轮到后执行共用)。
+    "control-plane/api/runs.py::_start_run": (
+        "control-plane/api/runs.py::_start_run",
         True,
     ),
     "control-plane/api/runs.py::resolve_approval_decision": (

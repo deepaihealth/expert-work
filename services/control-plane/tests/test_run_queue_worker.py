@@ -623,3 +623,64 @@ async def test_unsettled_previous_turn_fails_the_claimed_run(
     assert row.status is RunStatus.ERROR
     assert row.error is not None and "previous_turn_unsettled" in row.error
     assert runtime.run_manager.get(run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_lost_draft_follower_fails_instead_of_running_the_published_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-139 —— 草稿跑、排在后面的那一轮本该由持着连接的副本执行;落到后台队列
+    说明那台副本没了。按线上版本重建会跑错版本,收成失败。"""
+    started: list[object] = []
+    monkeypatch.setattr(worker_module, "run_agent", lambda **kw: started.append(kw))
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={"input": "hi", "image_refs": [], "use_draft": True},
+    )
+
+    await _worker(store, runtime).run_once()
+
+    row = await store.get(run_id=run_id, tenant_id=tenant)
+    assert row is not None
+    assert row.status is RunStatus.ERROR
+    assert row.error == "queued run could not start: draft_run_lost"
+    assert started == []
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_start_a_turn_while_an_earlier_one_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-139 —— 同一会话里前面那一轮没结束,后面排队的那一轮领不到。"""
+
+    async def _noop(**_kw: object) -> None:
+        return None
+
+    monkeypatch.setattr(worker_module, "run_agent", _noop)
+    # 收口上一轮要读真图的检查点;这里只看领取顺序。
+    monkeypatch.setattr(worker_module, "close_previous_turn", _noop)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    tenant, thread = uuid4(), uuid4()
+    first, second = uuid4(), uuid4()
+    for run_id in (first, second):
+        await runtime.run_manager.enqueue(
+            run_id=run_id,
+            thread_id=thread,
+            tenant_id=tenant,
+            enqueued_input={"input": "hi", "image_refs": [], "untrusted_content": []},
+        )
+    worker = _worker(store, runtime)
+
+    assert await worker.run_once() == 1
+    first_row = await store.get(run_id=first, tenant_id=tenant)
+    second_row = await store.get(run_id=second, tenant_id=tenant)
+    assert first_row is not None and first_row.status is RunStatus.RUNNING
+    assert second_row is not None and second_row.status is RunStatus.QUEUED
+    assert await worker.run_once() == 0

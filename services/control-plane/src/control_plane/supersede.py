@@ -63,7 +63,7 @@ from expert_work.common.supersede import mark_superseded, tombstone_message
 from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.thread_message import ThreadMessageStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
+from expert_work.runtime.runs import THREAD_BUSY_STATUSES, RunInfo, RunStatus, RunStore
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +81,8 @@ __all__ = [
 #: 会话里任一 run 处于这些状态 → 409 THREAD_BUSY。与
 #: ``api/external_sessions._ACTIVE_RUN_STATUSES`` 同集合(PENDING / QUEUED /
 #: RUNNING);``api/plan.py`` 的 ``_WRITE_BLOCKED_STATUSES`` 少了 QUEUED,不能用。
-SUPERSEDE_BUSY_STATUSES: frozenset[RunStatus] = frozenset(
-    {RunStatus.PENDING, RunStatus.QUEUED, RunStatus.RUNNING}
-)
+#: B-139 —— 与 ``THREAD_BUSY_STATUSES``(新一轮排不排队)是同一个口径,取同一份定义。
+SUPERSEDE_BUSY_STATUSES: frozenset[RunStatus] = frozenset(THREAD_BUSY_STATUSES)
 
 #: 同一逻辑轮(沿 ``regenerated_from_run_id`` 回溯的链)最多保留的旧版本数;
 #: 超出的最老版本正文置墓碑(spec §3.1-5,拍板 5)。

@@ -25,6 +25,7 @@ from expert_work.runtime.runs import (
     InMemoryRunStore,
     RunInfo,
     RunStatus,
+    RunStore,
     SqlRunEventStore,
     SqlRunStore,
     make_event_record,
@@ -737,7 +738,7 @@ async def test_list_queued_round_trips_enqueued_input(run_store: SqlRunStore) ->
         replace(info, enqueued_input={"input": "hi", "untrusted_content": ["x"]})
     )
 
-    queued = await run_store.list_queued(limit=10)
+    queued = await run_store.list_queued(limit=10, now=datetime.now(UTC))
     assert any(q.run_id == run_id for q in queued)
     match = next(q for q in queued if q.run_id == run_id)
     assert match.enqueued_input == {"input": "hi", "untrusted_content": ["x"]}
@@ -1088,3 +1089,15 @@ async def test_latest_by_thread_picks_newest_scoped_and_can_skip_one(
     )
     assert skipped is not None and skipped.run_id == middle
     assert await run_store.latest_by_thread(thread_id=uuid4(), tenant_id=tenant_a) is None
+
+
+# --- B-139 —— 同一会话串行执行(场景与内存版共用 thread_queue_scenarios) ---
+
+
+@pytest.mark.asyncio
+async def test_thread_queue_sql(
+    run_store: SqlRunStore,
+    thread_queue_scenarios: tuple[Callable[[RunStore], Awaitable[None]], ...],
+) -> None:
+    for scenario in thread_queue_scenarios:
+        await scenario(run_store)

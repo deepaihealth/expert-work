@@ -104,7 +104,10 @@ TENANT_RESOURCE_LOCK_CLASSID: Final[int] = 8618
 #: deploy window (see "Renumbering a live lock" above).
 TRIGGER_DELIVERY_LOCK_CLASSID: Final[int] = 8619
 
-#: ``supersede`` — per-thread regenerate / edit-resend lock, key = thread id.
+#: ``supersede`` — per-thread **turn-admission** lock, key = thread id. Taken by
+#: every new turn in ``spawn_run`` since B-139 (busy check → queue or start),
+#: not only regenerate / edit-resend; same value because the two must exclude
+#: each other (one lock, no lock-order deadlock).
 SUPERSEDE_LOCK_CLASSID: Final[int] = 8620
 
 #: ``workspace_janitor`` — single-flight janitor cycle, key
