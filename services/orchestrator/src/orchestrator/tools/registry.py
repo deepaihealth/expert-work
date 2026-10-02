@@ -414,6 +414,13 @@ class ToolResult:
     exec_python / http / mcp); read-only tools must leave it ``None`` —
     their sources are re-readable, and the exemption is the
     persist→read→persist loop guard.
+
+    ``notice`` (B-136) is a short platform-authored line about the result
+    itself (e.g. "showing lines 1-412 of 655, continue with offset=413").
+    The tools node appends it after ``content`` **outside** the spotlight
+    fence, so the model reads it as trusted platform text and file content
+    that imitates it stays fenced. It must never carry tool output — only
+    facts the tool computed (counts, the next argument to pass).
     """
 
     content: str
@@ -421,6 +428,7 @@ class ToolResult:
     state_updates: Mapping[str, Any] = field(default_factory=dict)
     refund_iterations: int = 0
     full_content: str | None = None
+    notice: str | None = None
 
     def __post_init__(self) -> None:
         # Frozen dataclass — direct setattr is disabled. The check runs

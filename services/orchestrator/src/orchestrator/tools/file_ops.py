@@ -677,6 +677,115 @@ def _raise_for_store_error(exc: SandboxSupervisorError, *, tool: str) -> NoRetur
     raise FileOpError(msg) from exc
 
 
+def _optional_line_arg(args: Mapping[str, Any], name: str) -> int | None:
+    """``read_file`` 的 ``offset`` / ``limit``:缺省回 ``None``, 否则必须是 >= 1 的整数。
+
+    正常派发时 JSON Schema 已经先拦了一道;这里再查一遍是给不经 schema 的直接调用
+    兜底(``bool`` 是 ``int`` 的子类, 也要挡掉)。"""
+    value = args.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        msg = f"read_file '{name}' must be an integer >= 1"
+        raise ValueError(msg)
+    return value
+
+
+@dataclass(frozen=True)
+class _ReadPage:
+    """``read_file`` 一次返回的那一段, 以及要告诉模型的话(B-136)。"""
+
+    content: str
+    #: 没把整个文件给全时的说明;整个文件一次给完则为 ``None``(正文逐字不变)。
+    notice: str | None
+    #: 返回的这段**之后**还有内容没给。
+    truncated: bool
+    lines_total: int
+    line_start: int
+    line_end: int
+
+
+def _select_page(text: str, *, offset: int, limit: int | None, cap: int) -> _ReadPage:
+    """从 ``text`` 里取第 ``offset`` 行起、至多 ``limit`` 行、至多 ``cap`` 个字符。
+
+    B-136 —— 此前是 ``text[:cap]`` 加一个只进 ``meta`` 的 ``truncated``, 而 ``meta``
+    模型看不到:它读到前 20,000 个字符, 不知道后面还有, 也没有办法读后面。
+
+    只按 LF 分行并保留行尾(不用 ``str.splitlines``:它连 CR / 换页符 / U+2028
+    也切, 报出来的行号就和 ``wc -l`` / ``sed -n`` 对不上了), 于是各页
+    首尾相接恰好还原文件。只返回整行;唯一的例外是起始行自己就超过 ``cap``, 那就
+    给它的前 ``cap`` 个字符并明说这一行被切了。
+    """
+    lines = text.split("\n")
+    last = lines.pop()
+    lines = [f"{line}\n" for line in lines]
+    if last:
+        lines.append(last)
+    total = len(lines)
+    if offset > max(total, 1):
+        # 措辞有讲究:error_classifier 按文本找针, " 404" / " 500" 这类「空格+数字」
+        # 会把它归成「文件不存在」/「瞬时故障」, 所以数字一律不跟在空格后面;
+        # "must be" 让它落在 invalid_arguments(改参数重试), 文件本身是在的。
+        valid = f"within lines 1-{total}" if total else "1 (the file is empty)"
+        msg = (
+            f"read_file failed: offset_out_of_range (offset={offset} is past the end "
+            f"of the file; offset must be {valid})"
+        )
+        raise FileOpError(msg)
+
+    stop = total if limit is None else min(total, offset - 1 + limit)
+    taken: list[str] = []
+    used = 0
+    for line in lines[offset - 1 : stop]:
+        if used + len(line) > cap:
+            break
+        taken.append(line)
+        used += len(line)
+
+    if not taken and offset <= stop:
+        # 起始行自己就放不下 —— 给前 cap 个字符, 不然这一页永远是空的。
+        line_len = len(lines[offset - 1])
+        after = (
+            f"Call read_file again with offset={offset + 1} to continue from the next line."
+            if offset < total
+            else "It is the last line of the file."
+        )
+        cut_notice = (
+            f"[read_file: line {offset} of {total} is {line_len:,} characters long, over "
+            f"the {cap:,}-character limit per call, so only its first {cap:,} characters "
+            f"are shown. Use exec_python or bash to read the rest of that line. {after}]"
+        )
+        return _ReadPage(
+            content=lines[offset - 1][:cap],
+            notice=cut_notice,
+            truncated=True,
+            lines_total=total,
+            line_start=offset,
+            line_end=offset,
+        )
+
+    line_end = offset - 1 + len(taken)
+    content = "".join(taken)
+    if line_end < total:
+        notice: str | None = (
+            f"[read_file: showing lines {offset}-{line_end} of {total} "
+            f"({used:,} of {len(text):,} characters). The file continues — call "
+            f"read_file again with offset={line_end + 1} to read on.]"
+        )
+    elif offset > 1:
+        notice = f"[read_file: showing lines {offset}-{line_end} of {total}. End of file.]"
+    else:
+        notice = None
+    return _ReadPage(
+        content=content,
+        notice=notice,
+        truncated=line_end < total,
+        lines_total=total,
+        line_start=offset,
+        line_end=line_end,
+    )
+
+
 @dataclass
 class ReadFileTool:
     """Read a UTF-8 text file from the agent's workspace (exposed as ``read_file``).
@@ -711,7 +820,11 @@ class ReadFileTool:
             description=(
                 "Read a UTF-8 text file from your own workspace and return "
                 "its contents plus a content hash (pass the hash to edit_file "
-                "for safe concurrent edits). Paths are relative to your own "
+                "for safe concurrent edits). A long file is returned in pages: "
+                "when the result does not reach the end of the file, a note after "
+                "it gives the line range shown and the 'offset' to pass to read "
+                "on. Use 'offset' / 'limit' to read a specific range of lines. "
+                "Paths are relative to your own "
                 "workspace root. Files belonging to other agents working for "
                 "the same user are not reachable. Prefix a path with 'shared:' "
                 "to read the shared legacy area (read-only)."
@@ -722,6 +835,18 @@ class ReadFileTool:
                     "path": {
                         "type": "string",
                         "description": "Workspace-relative file path (no leading '/' or '..').",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line number to start reading from (default 1).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Maximum number of lines to return (default: as many as fit)."
+                        ),
                     },
                 },
                 "required": ["path"],
@@ -734,6 +859,8 @@ class ReadFileTool:
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         raw = _require_path(args, tool="read_file", agent_key=ctx.agent_key)
+        offset = _optional_line_arg(args, "offset") or 1
+        limit = _optional_line_arg(args, "limit")
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_file")
         if not PurePosixPath(rel).parts:
             # ``/workspace`` 折成 ``.`` —— 指的是作用域根, 一个目录。沙箱片段过去
@@ -758,16 +885,20 @@ class ReadFileTool:
         except UnicodeDecodeError as exc:
             msg = "read_file failed: binary_unsupported"
             raise FileOpError(msg) from exc
-        cap = self.output_char_cap
+        page = _select_page(text, offset=offset, limit=limit, cap=self.output_char_cap)
         return ToolResult(
-            content=text[:cap],
+            content=page.content,
+            notice=page.notice,
             meta={
                 "path": rel,
                 # 整个文件的 sha256(不是返回给模型的那一截)—— edit_file 的
                 # expected_hash CAS 拿它做比对, 截断过的哈希对不上任何东西。
                 "content_hash": hashlib.sha256(data).hexdigest(),
                 "size": len(data),
-                "truncated": len(text) > cap,
+                "truncated": page.truncated,
+                "lines_total": page.lines_total,
+                "line_start": page.line_start,
+                "line_end": page.line_end,
             },
         )
 

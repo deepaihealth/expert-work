@@ -4096,6 +4096,12 @@ async def _invoke_tool(
     # it so embedded instructions read as data. The expert-work-owned overflow footer
     # stays trusted (outside the fence).
     tool_content = spotlight_untrusted(body, nonce=spotlight_nonce) if spotlight_nonce else body
+    # B-136 — the tool's own platform notice ("showing lines 1-412 of 655 ...") is
+    # trusted for the same reason the footer is, so it also goes outside the fence.
+    # It precedes the footer: the CM-12 prune gate locates the footer as the LAST
+    # tagged block in the message.
+    if result.notice:
+        tool_content = f"{tool_content}\n\n{result.notice}"
     content = tool_content + footer if footer is not None else tool_content
     # ``artifact`` surfaces the tool's structured metadata (``ToolResult.meta``
     # — e.g. ask_image's ``image_ref`` / VL usage, truncation flags) in the raw
