@@ -332,6 +332,45 @@ def _candidate(text, old):
     return None
 
 
+#: B-149 —— spotlight 的数据标记符(U+2581)。与
+#: ``expert_work.common.spotlight.DATAMARK_GLYPH`` 同值(测试钉住);沙箱代码段
+#: 只能用 stdlib, 不能 import 它。
+_GLYPH = "\\u2581"
+
+
+def _apply(text, old, new):
+    # One replacement on ``text``: level 1 exact substring, level 2
+    # whitespace-normalized line block. Returns {"ok": True, "text", "match"}
+    # or the error envelope.
+    # Level 1 — exact substring (byte-precise). count / replace share
+    # non-overlapping semantics, so count matches what replace() targets.
+    count = text.count(old)
+    if count > 1:
+        return {"ok": False, "error": "ambiguous", "detail": "count=" + str(count), "count": count}
+    if count == 1:
+        return {"ok": True, "text": text.replace(old, new, 1), "match": "exact"}
+    # Level 2 — whitespace-normalized line-block fallback (handles LLM
+    # indent / trailing-space drift). Replaces the matched line range.
+    span = _fuzzy_line_span(text, old)
+    if span == "ambiguous":
+        return {"ok": False, "error": "ambiguous", "detail": "multiple fuzzy matches"}
+    if span is None:
+        result = {"ok": False, "error": "no_match"}
+        hint = _candidate(text, old)
+        if hint:
+            result["detail"] = hint
+        return result
+    i, j = span
+    # Preserve a uniformly-CRLF file's endings; mixed / LF rebuild as LF.
+    if "\\r\\n" in text and "\\n" not in text.replace("\\r\\n", ""):
+        nl = "\\r\\n"
+    else:
+        nl = "\\n"
+    tl = text.split(nl)
+    new_lines = new.replace("\\r\\n", "\\n").split("\\n")
+    return {"ok": True, "text": nl.join(tl[:i] + new_lines + tl[j:]), "match": "fuzzy"}
+
+
 def _main():
     full = _resolve(_P["rel"])
     if full is None:
@@ -360,36 +399,23 @@ def _main():
         }
     old = _P["old"]
     new = _P["new"]
-    # Level 1 — exact substring (byte-precise). count / replace share
-    # non-overlapping semantics, so count matches what replace() targets.
-    count = text.count(old)
-    if count > 1:
-        return {"ok": False, "error": "ambiguous", "detail": "count=" + str(count), "count": count}
-    if count == 1:
-        updated = text.replace(old, new, 1)
-        match = "exact"
-    else:
-        # Level 2 — whitespace-normalized line-block fallback (handles LLM
-        # indent / trailing-space drift). Replaces the matched line range.
-        span = _fuzzy_line_span(text, old)
-        if span == "ambiguous":
-            return {"ok": False, "error": "ambiguous", "detail": "multiple fuzzy matches"}
-        if span is None:
-            result = {"ok": False, "error": "no_match"}
-            hint = _candidate(text, old)
-            if hint:
-                result["detail"] = hint
-            return result
-        i, j = span
-        # Preserve a uniformly-CRLF file's endings; mixed / LF rebuild as LF.
-        if "\\r\\n" in text and "\\n" not in text.replace("\\r\\n", ""):
-            nl = "\\r\\n"
-        else:
-            nl = "\\n"
-        tl = text.split(nl)
-        new_lines = new.replace("\\r\\n", "\\n").split("\\n")
-        updated = nl.join(tl[:i] + new_lines + tl[j:])
-        match = "fuzzy"
+    applied = _apply(text, old, new)
+    if (
+        not applied.get("ok")
+        and applied.get("error") == "no_match"
+        and _GLYPH in old
+    ):
+        # Level 3 (B-149) — the model copied the datamark glyph out of what it
+        # read. Only reached when levels 1-2 failed, so a file that really
+        # contains the glyph matched exactly above and keeps it.
+        retry = _apply(text, old.replace(_GLYPH, ""), new.replace(_GLYPH, ""))
+        if retry.get("ok"):
+            retry["match"] = "unmarked"
+            applied = retry
+    if not applied.get("ok"):
+        return applied
+    updated = applied["text"]
+    match = applied["match"]
     try:
         out = updated.encode("utf-8")
     except UnicodeEncodeError:
