@@ -16,7 +16,7 @@
 | `d8a32812` #1713 | 沙箱镜像依赖:pandas 3.0.6、pypdf 6.19.0、markdown 3.11、imageio | 是,**但要单独重建沙箱镜像才会生效** | §3 |
 | `2db9ebbd` #1714、`da500b0e` #1715 | admin-ui 依赖:lucide-react / react-i18next / vitest;安全覆盖 moment 2.31.0(随 antd 日期控件进浏览器)、dompurify 3.4.16(随 monaco 编辑器与文档站进浏览器)、undici、brace-expansion | 是 | §4 |
 | #1724 | B-149 数据标记保留换行与缩进;`edit_file` 去标记符兜底 | 是 | §5 |
-| (本 PR) | B-137 `edit_file` 一次改多处 / 全部替换;不再让模型传哈希 | 是 | §6 |
+| #1725 | B-137 `edit_file` 一次改多处 / 全部替换;不再让模型传哈希 | 是 | §6 |
 | `5c583c69` #1675 | CI 的 codeql upload-sarif | 否 | — |
 | 其余 | 文档(ROADMAP / 执行单) | 否 | — |
 
