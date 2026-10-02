@@ -15,7 +15,7 @@
 | `8a2bba23` #1716 | Python 依赖:langchain-core 1.6.3→1.6.5、langgraph 1.2.11→1.2.12、opentelemetry 1.44→1.45、langfuse 4.15.3→4.15.6、ruff | 是 | §2 |
 | `d8a32812` #1713 | 沙箱镜像依赖:pandas 3.0.6、pypdf 6.19.0、markdown 3.11、imageio | 是,**但要单独重建沙箱镜像才会生效** | §3 |
 | `2db9ebbd` #1714、`da500b0e` #1715 | admin-ui 依赖:lucide-react / react-i18next / vitest;安全覆盖 moment 2.31.0(随 antd 日期控件进浏览器)、dompurify 3.4.16(随 monaco 编辑器与文档站进浏览器)、undici、brace-expansion | 是 | §4 |
-| (本 PR) | B-149 数据标记保留换行与缩进;`edit_file` 去标记符兜底 | 是 | §5 |
+| #1724 | B-149 数据标记保留换行与缩进;`edit_file` 去标记符兜底 | 是 | §5 |
 | `5c583c69` #1675 | CI 的 codeql upload-sarif | 否 | — |
 | 其余 | 文档(ROADMAP / 执行单) | 否 | — |
 
