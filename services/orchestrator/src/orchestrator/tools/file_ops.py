@@ -41,7 +41,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, NoReturn
@@ -371,6 +372,33 @@ def _apply(text, old, new):
     return {"ok": True, "text": nl.join(tl[:i] + new_lines + tl[j:]), "match": "fuzzy"}
 
 
+def _replace_all(text, old, new):
+    # B-137 — every exact occurrence; no line-block fallback (under "all" an
+    # indent-insensitive match would silently rewrite lines nobody meant).
+    count = text.count(old)
+    if count == 0:
+        result = {"ok": False, "error": "no_match"}
+        hint = _candidate(text, old)
+        if hint:
+            result["detail"] = hint
+        return result
+    return {"ok": True, "text": text.replace(old, new), "match": "exact", "count": count}
+
+
+def _apply_edit(text, old, new, replace_all):
+    apply = _replace_all if replace_all else _apply
+    applied = apply(text, old, new)
+    if not applied.get("ok") and applied.get("error") == "no_match" and _GLYPH in old:
+        # Level 3 (B-149) — the model copied the datamark glyph out of what it
+        # read. Only reached when the levels above failed, so a file that
+        # really contains the glyph matched exactly there and keeps it.
+        retry = apply(text, old.replace(_GLYPH, ""), new.replace(_GLYPH, ""))
+        if retry.get("ok"):
+            retry["match"] = "unmarked"
+            applied = retry
+    return applied
+
+
 def _main():
     full = _resolve(_P["rel"])
     if full is None:
@@ -397,25 +425,23 @@ def _main():
             "detail": "current_hash=" + current_hash,
             "current_hash": current_hash,
         }
-    old = _P["old"]
-    new = _P["new"]
-    applied = _apply(text, old, new)
-    if (
-        not applied.get("ok")
-        and applied.get("error") == "no_match"
-        and _GLYPH in old
-    ):
-        # Level 3 (B-149) — the model copied the datamark glyph out of what it
-        # read. Only reached when levels 1-2 failed, so a file that really
-        # contains the glyph matched exactly above and keeps it.
-        retry = _apply(text, old.replace(_GLYPH, ""), new.replace(_GLYPH, ""))
-        if retry.get("ok"):
-            retry["match"] = "unmarked"
-            applied = retry
-    if not applied.get("ok"):
-        return applied
-    updated = applied["text"]
-    match = applied["match"]
+    # B-137 — every call is a list of edits (a single edit is a list of one).
+    # They apply in order, each to the text the previous one produced, and
+    # the file is written only if all of them matched.
+    edits = _P["edits"]
+    updated = text
+    matches = []
+    replaced = 0
+    for k, edit in enumerate(edits):
+        applied = _apply_edit(updated, edit["old"], edit["new"], edit.get("replace_all", False))
+        if not applied.get("ok"):
+            if len(edits) > 1:
+                applied["index"] = k + 1
+                applied["total"] = len(edits)
+            return applied
+        updated = applied["text"]
+        matches.append(applied["match"])
+        replaced += applied.get("count", 1)
     try:
         out = updated.encode("utf-8")
     except UnicodeEncodeError:
@@ -429,7 +455,9 @@ def _main():
         "content_hash": hashlib.sha256(out).hexdigest(),
         "size": len(out),
         "path": _P["rel"],
-        "match": match,
+        "match": matches[0],
+        "matches": matches,
+        "replaced": replaced,
     }
 
 
@@ -486,12 +514,36 @@ def build_edit_wrapper(
     old: str,
     new: str,
     *,
+    replace_all: bool = False,
     expected_hash: str | None = None,
     ws: str = _WORKSPACE_ROOT,
 ) -> str:
-    """Snippet that replaces an exact substring in ``ws/rel`` (atomic write),
+    """Snippet that replaces one substring in ``ws/rel`` (atomic write),
     with an optional ``expected_hash`` compare-and-swap."""
-    params: dict[str, Any] = {"ws": ws, "rel": rel, "old": old, "new": new}
+    edit = {"old": old, "new": new, "replace_all": replace_all}
+    return _edit_snippet(rel, [edit], expected_hash=expected_hash, ws=ws)
+
+
+def build_edits_wrapper(
+    rel: str,
+    edits: Sequence[Mapping[str, Any]],
+    *,
+    expected_hash: str | None = None,
+    ws: str = _WORKSPACE_ROOT,
+) -> str:
+    """B-137 —— snippet that applies ``edits`` (``{old, new, replace_all}``) to
+    ``ws/rel`` in order, all-or-nothing, in one atomic write."""
+    return _edit_snippet(rel, edits, expected_hash=expected_hash, ws=ws)
+
+
+def _edit_snippet(
+    rel: str,
+    edits: Sequence[Mapping[str, Any]],
+    *,
+    expected_hash: str | None,
+    ws: str,
+) -> str:
+    params: dict[str, Any] = {"ws": ws, "rel": rel, "edits": [dict(e) for e in edits]}
     if expected_hash is not None:
         params["expected_hash"] = expected_hash
     return _snippet(params, _EDIT_MAIN)
@@ -605,10 +657,9 @@ _EDIT_ESCALATE_AFTER_TWO = (
 #: 第二级升级排在最后:被截掉的永远是阶梯的第二级, 不是第一级。
 _EDIT_RECOVERY: dict[str, str] = {
     "stale": (
-        "The file changed after you read it, so NOTHING was written. The hash above "
-        "is the file's current hash, not an error code. Call read_file on this path "
-        "again, rebuild 'old_string' from what you just read, and pass the new hash "
-        "as 'expected_hash'. " + _EDIT_ESCALATE_AFTER_TWO
+        "The file changed after you read it, so NOTHING was written. Call read_file "
+        "on this path again and rebuild 'old_string' from what you just read. "
+        + _EDIT_ESCALATE_AFTER_TWO
     ),
     "no_match": (
         "'old_string' matched nothing, so NOTHING was written and the file is "
@@ -637,7 +688,9 @@ def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
         msg = f"{tool}: path escapes the workspace"
         raise ToolBlockedError(msg)
     detail = env.get("detail")
-    msg = f"{tool} failed: {kind}" + (f" ({detail})" if detail else "")
+    # B-137 —— 多处编辑里第几项失败(整次调用什么都没写)。
+    where = f"edit {env['index']} of {env['total']}: " if env.get("index") else ""
+    msg = f"{tool} failed: {where}{kind}" + (f" ({detail})" if detail else "")
     if tool == "edit_file":
         guidance = _EDIT_RECOVERY.get(str(kind))
         if guidance:
@@ -845,8 +898,7 @@ class ReadFileTool:
             name="read_file",
             description=(
                 "Read a UTF-8 text file from your own workspace and return "
-                "its contents plus a content hash (pass the hash to edit_file "
-                "for safe concurrent edits). A long file is returned in pages: "
+                "its contents. A long file is returned in pages: "
                 "when the result does not reach the end of the file, a note after "
                 "it gives the line range shown and the 'offset' to pass to read "
                 "on. Use 'offset' / 'limit' to read a specific range of lines. "
@@ -946,7 +998,9 @@ class WriteFileTool:
             name="write_file",
             description=(
                 "Write (create or overwrite) a UTF-8 text file in your own "
-                "workspace. The write is atomic. Returns the new content hash. "
+                "workspace. The write is atomic and replaces the whole file. To "
+                "change part of an existing file, use edit_file instead (several "
+                "changes fit in one call). "
                 "Paths are relative to your own workspace root; parent "
                 "directories are created. Writing to 'shared:' is refused — "
                 "that area is read-only."
@@ -1188,6 +1242,68 @@ def _format_search(found: WorkspaceSearchResult) -> str:
     return "\n".join(lines)
 
 
+#: B-137 —— 一次 ``edit_file`` 最多几处改动。
+_MAX_EDITS = 50
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _edit_item(raw: Mapping[str, Any], *, where: str) -> dict[str, Any]:
+    old = raw.get("old_string")
+    if not isinstance(old, str) or old == "":
+        msg = f"edit_file {where}requires a non-empty 'old_string'"
+        raise ValueError(msg)
+    new = raw.get("new_string")
+    if not isinstance(new, str):
+        msg = f"edit_file {where}requires a 'new_string' string"
+        raise ValueError(msg)
+    if len(new) > _MAX_WRITE_CHARS:
+        msg = f"edit_file {where}new_string exceeds the {_MAX_WRITE_CHARS}-character limit"
+        raise ValueError(msg)
+    replace_all = raw.get("replace_all", False)
+    if not isinstance(replace_all, bool):
+        msg = f"edit_file {where}'replace_all' must be true or false"
+        raise ValueError(msg)
+    return {"old": old, "new": new, "replace_all": replace_all}
+
+
+def _parse_edits(args: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """B-137 —— 单处写法与 ``edits`` 二选一, 统一成一份改动清单。"""
+    raw_edits = args.get("edits")
+    if raw_edits is None:
+        return [_edit_item(args, where="")]
+    if "old_string" in args or "new_string" in args:
+        msg = "edit_file takes either 'edits' or 'old_string'/'new_string', not both"
+        raise ValueError(msg)
+    if not isinstance(raw_edits, list) or not raw_edits:
+        msg = "edit_file 'edits' must be a non-empty list"
+        raise ValueError(msg)
+    if len(raw_edits) > _MAX_EDITS:
+        msg = f"edit_file takes at most {_MAX_EDITS} edits per call"
+        raise ValueError(msg)
+    items = []
+    for k, raw in enumerate(raw_edits, start=1):
+        where = f"edit {k}: "
+        if not isinstance(raw, Mapping):
+            msg = f"edit_file {where}must be an object with 'old_string' and 'new_string'"
+            raise ValueError(msg)
+        items.append(_edit_item(raw, where=where))
+    return items
+
+
+def _expected_hash(value: object) -> tuple[str | None, bool]:
+    """B-137 —— 只认 64 位小写十六进制(真 sha256 的样子)。
+
+    模型看不到真哈希;测试环境 30 天传了 13 次, 9 次长度就不对, ``stale`` 失败也
+    恰好 9 次。不可能是真值的直接忽略(返回 ``ignored=True`` 记进元数据), 免得
+    造出假失败。64 位的可能是从旧版 ``stale`` 报错里抄的真值, 照常比对。"""
+    if value is None:
+        return None, False
+    if isinstance(value, str) and _SHA256_HEX.fullmatch(value):
+        return value, False
+    return None, True
+
+
 @dataclass
 class EditFileTool:
     """Replace an exact substring in a workspace text file (exposed as ``edit_file``).
@@ -1207,16 +1323,18 @@ class EditFileTool:
         return ToolSpec(
             name="edit_file",
             description=(
-                "Replace an exact substring in a workspace text file. Read the file "
-                "with read_file first and copy 'old_string' out of what it returns. "
-                "'old_string' must occur exactly once; if it isn't found exactly, a "
+                "Replace text in a workspace text file. Read the file with read_file "
+                "first and copy 'old_string' out of what it returns. Put all "
+                "changes to one file into ONE call: pass 'edits', a list of "
+                "{old_string, new_string} applied in order — either all of them "
+                "succeed or nothing is written. For a single change pass "
+                "'old_string' / 'new_string' instead. Each 'old_string' must occur "
+                "exactly once, unless 'replace_all' is true (then every exact "
+                "occurrence is replaced). If an 'old_string' isn't found exactly, a "
                 "whitespace-tolerant line-block match is attempted (ignores indent / "
                 "trailing-space drift; that fallback normalizes line endings to LF "
-                "unless the file is uniformly CRLF). Optionally pass 'expected_hash' "
-                "(from read_file) for a safe compare-and-swap: the edit is rejected "
-                "as stale if the file changed since you read it. Paths are relative "
-                "to your own workspace root; editing 'shared:' is refused — that "
-                "area is read-only."
+                "unless the file is uniformly CRLF). Paths are relative to your own "
+                "workspace root; editing 'shared:' is refused — that area is read-only."
             ),
             parameters={
                 "type": "object",
@@ -1225,20 +1343,37 @@ class EditFileTool:
                         "type": "string",
                         "description": "Workspace-relative file path (no leading '/' or '..').",
                     },
+                    "edits": {
+                        "type": "array",
+                        "description": (
+                            "Several changes to this file, applied in order in one call."
+                        ),
+                        "minItems": 1,
+                        "maxItems": _MAX_EDITS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"},
+                                "replace_all": {"type": "boolean"},
+                            },
+                            "required": ["old_string", "new_string"],
+                        },
+                    },
                     "old_string": {
                         "type": "string",
-                        "description": "Exact text to replace; must occur exactly once.",
+                        "description": "Single change: exact text to replace.",
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "Replacement text (may be empty to delete).",
+                        "description": "Single change: replacement text (may be empty to delete).",
                     },
-                    "expected_hash": {
-                        "type": "string",
-                        "description": "Optional content hash from read_file for compare-and-swap.",
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Single change: replace every exact occurrence.",
                     },
                 },
-                "required": ["path", "old_string", "new_string"],
+                "required": ["path"],
             },
             path_args=("path",),
             side_effect="reversible",
@@ -1252,27 +1387,14 @@ class EditFileTool:
         # 写永不回落(edit 也改字节)——「读得到 legacy」不等于「可以就地改它」:
         # 那会把一份归属不明的文件悄悄变成本 agent 的既成事实。
         ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="edit_file")
-        old = args.get("old_string")
-        if not isinstance(old, str) or old == "":
-            msg = "edit_file requires a non-empty 'old_string'"
-            raise ValueError(msg)
-        new = args.get("new_string")
-        if not isinstance(new, str):
-            msg = "edit_file requires a 'new_string' string"
-            raise ValueError(msg)
-        if len(new) > _MAX_WRITE_CHARS:
-            msg = f"edit_file new_string exceeds the {_MAX_WRITE_CHARS}-character limit"
-            raise ValueError(msg)
-        expected = args.get("expected_hash")
-        if expected is not None and not isinstance(expected, str):
-            msg = "edit_file 'expected_hash' must be a string"
-            raise ValueError(msg)
+        edits = _parse_edits(args)
+        expected, hash_ignored = _expected_hash(args.get("expected_hash"))
         # Stream TE-8 — lock scopes to the run's user (durable workspace that
         # may be shared across replicas); a user-less run needs no lock.
         async with self.workspace_lock.acquire(tenant_id=ctx.tenant_id, user_id=ctx.user_id):
             outcome = await run_in_sandbox(
                 self.client,
-                code=build_edit_wrapper(rel, old, new, expected_hash=expected, ws=ws),
+                code=build_edits_wrapper(rel, edits, expected_hash=expected, ws=ws),
                 timeout_s=None,
                 ctx=ctx,
                 tool_label="edit_file",
@@ -1280,19 +1402,30 @@ class EditFileTool:
                 seed_files=self.skill_seed_files,
             )
         env = parse_envelope(outcome, tool="edit_file")
+        if env.get("error") == "stale":
+            # B-137 —— 不把哈希交给模型:它从来看不到真值, 交了只会被抄去再编。
+            env = {**env, "detail": None}
         _raise_for_error(env, tool="edit_file")
         size = env.get("size")
         match = env.get("match")
-        suffix = f" ({match} match)" if match else ""
-        return ToolResult(
-            content=f"Edited {rel} ({size} bytes){suffix}",
-            meta={
-                "path": rel,
-                "content_hash": env.get("content_hash"),
-                "size": size,
-                "match": match,
-            },
-        )
+        matches = env.get("matches") or ([match] if match else [])
+        if len(edits) > 1:
+            suffix = f": {len(edits)} edits ({', '.join(map(str, matches))} match)"
+        elif edits[0]["replace_all"]:
+            suffix = f" (replaced {env.get('replaced')} occurrences)"
+        else:
+            suffix = f" ({match} match)" if match else ""
+        meta: dict[str, Any] = {
+            "path": rel,
+            "content_hash": env.get("content_hash"),
+            "size": size,
+            "match": match,
+            "matches": matches,
+            "replaced": env.get("replaced"),
+        }
+        if hash_ignored:
+            meta["expected_hash_ignored"] = True
+        return ToolResult(content=f"Edited {rel} ({size} bytes){suffix}", meta=meta)
 
 
 @dataclass(frozen=True)

@@ -26,6 +26,7 @@ _BUILDERS = frozenset(
         "build_read_wrapper",
         "build_write_wrapper",
         "build_edit_wrapper",
+        "build_edits_wrapper",
         "build_read_document_wrapper",
     }
 )
