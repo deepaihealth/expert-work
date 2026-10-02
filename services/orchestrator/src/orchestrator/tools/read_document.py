@@ -62,8 +62,9 @@ _MAX_DOC_PAGES = 200
 #: Per-sheet row ceiling for spreadsheets (same rationale).
 _MAX_SHEET_ROWS = 5000
 #: Returned-text cap (chars). Documents are large; this bounds what reaches
-#: the model's context. The full char count is reported in ``meta`` so the
-#: model knows truncation happened.
+#: the model's context. ``meta`` (full char count + ``truncated``) is NOT shown
+#: to the model — it rides ``ToolMessage.artifact`` — so a cut is also spelled
+#: out in ``ToolResult.notice`` (B-136).
 _DOC_OUTPUT_CHAR_CAP = 200_000
 
 
@@ -184,6 +185,21 @@ def build_read_document_wrapper(
     )
 
 
+def _truncation_notice(*, shown: int, total: object) -> str:
+    """B-136 —— 截断这件事要让模型读得到(``meta`` 它看不到)。
+
+    这次不给 ``read_document`` 加分页, 所以只说清「没给全」和「接下来能怎么办」。
+    不提 ``read_page``:它把页面渲染成图, 拿不回被截掉的文字。
+    """
+    of_total = f" of {total:,}" if isinstance(total, int) else ""
+    return (
+        f"[read_document: showing the first {shown:,}{of_total} characters of the "
+        "extracted text; the rest was not returned. If this is a plain-text file, page "
+        "through it with read_file (offset / limit); otherwise extract the part you "
+        "need with exec_python or bash.]"
+    )
+
+
 @dataclass
 class ReadDocumentTool:
     """Parse a PDF / Word / Excel / PowerPoint / text file to plain text
@@ -264,13 +280,17 @@ class ReadDocumentTool:
 
         prefix = render_figure_map(fig_env)
         body = str(env.get("content", ""))
+        truncated = bool(env.get("truncated"))
         return ToolResult(
             content=prefix + body,
+            notice=_truncation_notice(shown=len(body), total=env.get("chars"))
+            if truncated
+            else None,
             meta={
                 "path": rel,
                 "format": env.get("format"),
                 "chars": env.get("chars"),
-                "truncated": bool(env.get("truncated")),
+                "truncated": truncated,
                 "figures": len(fig_env.get("figures") or ()),
                 "figures_state": fig_env.get("state"),
             },

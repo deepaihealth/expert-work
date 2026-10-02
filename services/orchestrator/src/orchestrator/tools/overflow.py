@@ -189,6 +189,7 @@ def render_overflow_footer(*, rel: str, total_chars: int) -> str:
     return (
         f"\n\n{OVERFLOW_FOOTER_TAG_OPEN}\n"
         f"The output above was truncated. The full output ({total_chars} chars) was saved to "
-        f"{rel} in your workspace. Use read_file / exec_python / bash to inspect it.\n"
+        f"{rel} in your workspace. Read it in pages with read_file (offset / limit), "
+        "or use exec_python / bash to inspect it.\n"
         "</tool-result-overflow>"
     )

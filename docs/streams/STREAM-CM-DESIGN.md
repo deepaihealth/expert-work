@@ -673,7 +673,7 @@ memory_recall_node（reranker 注入，可选）
 | **截断后完整结果即丢、LLM 不知情** | `ToolResult.meta["truncated"]` 在工具内生成，但 ToolMessage 只装 `content`+`tool_call_id`，meta 提取后丢弃；完整原文不落任何地方 | `graph_builder/builder.py:584,1232-1237`、`tools/registry.py:198-227` |
 | **首批 4 工具的完整输出在 orchestrator 内存可得** | bash/exec_python：supervisor 返回**全量** `SandboxOutcome`，cap 在 orchestrator 侧 `format_sandbox_outcome`；http：`_format` 前全量 body 在内存；mcp：middle-trim 前全量在内存 | `tools/sandbox.py:314-322`、`tools/http.py:216`、`tools/mcp.py:642` |
 | **CM-0 writer 范式可整体复用** | `WorkspaceFileWriter` Protocol（`write(*, rel, content)`）+ `SandboxWorkspaceWriter`（sandbox 原子写、自动建父目录）+ `workspace_writer_factory` 已从 factory 流到 builder（gate：persistent_workspace ∧ supervisor_client）+ best-effort 钩子先例 `_project_workspace_state` | `context/workspace_projection.py:130-134`、`tools/file_ops.py:759-774`、`agent_factory.py:120,595-621`、`builder.py:243,632,1126-1156` |
-| **恢复工具已存在，不新造** | `read_file`（20k cap、无 offset——超 20k 文件用 exec_python/bash 切片/grep 是预期恢复路径，sandbox 内零网络成本）；`list_dir` 可发现 `.tool_results/` | `tools/file_ops.py:460-513` |
+| **恢复工具已存在，不新造** | `read_file`（20k cap；**B-136 起**带 `offset` / `limit` 按行分页，没读到文件末尾时结果后会注明已给的行范围和下一个 `offset`——此前无 offset 且截断不告知模型；exec_python/bash 切片/grep 仍可用）；`list_dir` 可发现 `.tool_results/` | `tools/file_ops.py:460-513` |
 | **ToolResult 可向后兼容扩展** | frozen dataclass + 默认值字段追加不破现有构造点 | `tools/registry.py:198-227` |
 
 > **结论**：CM-5 = `ToolResult` 加可选 `full_content` 字段（4 个工具截断时带出全文）+ tools_node 中央 best-effort 外部化（复用 CM-0 `workspace_writer_factory`，零新注入参数）+ ToolMessage 引用 footer。截断策略不动、无 schema 变更、无新工具。
@@ -691,7 +691,8 @@ tools_node（中央，best-effort，复用 CM-0 writer）
       → rel = ".tool_results/<run_id>/<call_id>-<tool>.txt"
       → writer.write(rel=rel, content=full_content[:_OVERFLOW_MAX_CHARS])   # sandbox 原子写
       → ToolMessage.content += "\n\n<tool-result-overflow>output truncated; full output
-         (N chars) saved to .tool_results/…; use read_file / exec_python / bash to inspect
+         (N chars) saved to .tool_results/…; read it in pages with read_file (offset /
+         limit), or use exec_python / bash to inspect
          </tool-result-overflow>"
     写失败 / 无 writer / read_only → 维持现状（inline "...[truncated]" marker 仍在）
 ```

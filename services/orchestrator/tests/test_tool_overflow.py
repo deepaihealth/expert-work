@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from orchestrator.context.tool_result_prune import _footer_claimed_path, _footer_total_chars
 from orchestrator.tools.overflow import (
     OVERFLOW_DIR,
     OVERFLOW_MAX_CHARS,
@@ -89,3 +90,18 @@ def test_footer_references_path_and_size_inside_tagged_block() -> None:
     assert rel in footer
     assert "123456 chars" in footer
     assert "read_file" in footer
+
+
+def test_footer_tells_the_model_it_can_page_with_read_file() -> None:
+    # B-136 —— footer 指给模型的工具必须真能分页读, 并且把参数名说出来。
+    footer = render_overflow_footer(rel=f"{OVERFLOW_DIR}/adhoc/c1-bash.txt", total_chars=50_000)
+    assert "read_file (offset / limit)" in footer
+    assert "exec_python / bash" in footer
+
+
+def test_reworded_footer_is_still_parsed_by_the_prune_gate() -> None:
+    # CM-12 的 prune gate 从 footer 文案里正则抠路径和原始长度 —— 改措辞不能把它抠瞎。
+    rel = f"{OVERFLOW_DIR}/adhoc/c1-bash.txt"
+    content = "preview" + render_overflow_footer(rel=rel, total_chars=123_456)
+    assert _footer_claimed_path(content) == rel
+    assert _footer_total_chars(content) == 123_456

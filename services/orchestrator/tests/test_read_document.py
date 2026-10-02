@@ -162,6 +162,33 @@ async def test_tool_parses_envelope_into_result() -> None:
     assert client.released
 
 
+async def test_tool_not_truncated_has_no_notice() -> None:
+    env = {"ok": True, "content": "doc text", "format": "txt", "chars": 8, "truncated": False}
+    result = await ReadDocumentTool(client=_client(json.dumps(env))).call(
+        {"path": "notes.txt"}, ctx=_ctx()
+    )
+    assert result.content == "doc text"
+    assert result.notice is None
+    assert result.meta["truncated"] is False
+
+
+async def test_tool_truncated_tells_the_model_in_a_notice() -> None:
+    # B-136 —— ``truncated`` 只进 meta(ToolMessage.artifact, 模型看不到);被截断
+    # 这件事必须出现在模型读得到的地方。
+    env = {"ok": True, "content": "x" * 10, "format": "txt", "chars": 12_345, "truncated": True}
+    result = await ReadDocumentTool(client=_client(json.dumps(env))).call(
+        {"path": "notes.txt"}, ctx=_ctx()
+    )
+    assert result.content == "x" * 10  # 正文不变, 提示走 notice
+    assert result.meta["truncated"] is True
+    assert result.notice == (
+        "[read_document: showing the first 10 of 12,345 characters of the extracted "
+        "text; the rest was not returned. If this is a plain-text file, page through "
+        "it with read_file (offset / limit); otherwise extract the part you need with "
+        "exec_python or bash.]"
+    )
+
+
 async def test_tool_spec_is_read_only() -> None:
     spec = ReadDocumentTool(client=_client()).spec
     assert spec.name == "read_document"
