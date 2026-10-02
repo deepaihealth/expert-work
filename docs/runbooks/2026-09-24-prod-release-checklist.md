@@ -405,6 +405,13 @@
 
       三个文件都在、都是 `600`。
 
+- [ ] **本机 venv 能跑打包导入**（Step A2 / A3 的 `import_in_pod.py bundle` 在本机跑，模块顶层就 import `control_plane`）：
+
+      ```sh
+      uv run --no-sync python -c 'import control_plane, expert_work.protocol; print(control_plane.__file__)'
+      ```
+
+      打印的路径必须在**主仓库目录**下（不是 `.worktrees/...` 或 `.claude/worktrees/...`）。报 `ModuleNotFoundError` 或路径在别的 worktree 里，说明共享 venv 的 editable 安装被某个 worktree 改指过（2026-10-02 本机实测就是这样：指向一个已删除的 worktree），在主仓库目录跑一次 `uv sync` 修复后再核一次。
 - [ ] **overlay 无占位符**：`grep -rn PROD_PLACEHOLDER infra/k8s/overlays/prod/` 无输出。
 - [ ] **金丝雀还在**：班车 1 已 seed 过（`release-canary` 有会话行、工作区里有 `canary-check.txt`）。
       smoke 阶段 6 报 WARNING 而不是 PASS，就说明它没了，按
@@ -935,10 +942,11 @@ uv run --no-sync python $PS/import_in_pod.py bundle \
 
 ### Step A3 — 导入 `health-plan-report` 技能并启用（B-125，本版新增）
 
-在 **Step A2 之后**做（理由见 §0.2 的依赖）。打包方式同 A2：用独立 worktree 从 **main** 打包，不用主仓库目录的 `platform-skills/`。
+在 **Step A2 之后**做（理由见 §0.2 的依赖）。打包方式同 A2：用独立 worktree 打包，不用主仓库目录的 `platform-skills/`。
+**打包源码钉在本版 tag `54d1ed70`，不用 `origin/main`**（2026-10-02 改）：10-08 前主干会继续合入新开发，从 main 打包会让发版内容随主干漂移；钉住之后，主干上无论合什么都影响不到这一步。2026-10-02 已按下面的命令在 `54d1ed70` 上实打一次，`content_hash` = `786d30fe`（与测试环境 v6 一致；`54d1ed70` 之后主干上 `platform-skills/` 零改动）。
 
 ```sh
-git worktree add /tmp/ps-hpr origin/main
+git worktree add /tmp/ps-hpr 54d1ed70
 uv run --no-sync python /tmp/ps-hpr/platform-skills/build.py --only health-plan-report
 PS=/tmp/ps-hpr/platform-skills
 uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-plan-report.skill \
@@ -946,7 +954,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
 ```
 
 - [ ] dry-run 输出 `"status":"dry-run"`；生产上是**首次导入**，应为 `"created": true` 的新建（不是版本递增）
-- [ ] 打包出的 `content_hash` 应为 `786d30fe…`（测试环境 v6，B-131 加「改稿速查」；v5 是 `cc2df66a`）；不同说明 main 上技能源码又变过，停下来先对差异
+- [ ] 打包出的 `content_hash` 应为 `786d30fe…`（测试环境 v6，B-131 加「改稿速查」；v5 是 `cc2df66a`）；不同说明 checkout 的不是 `54d1ed70`，或本机 venv 不对（见 §1「本机 venv 能跑打包导入」），停下来先查
 
 正式导入去掉 `--dry-run`：
 
