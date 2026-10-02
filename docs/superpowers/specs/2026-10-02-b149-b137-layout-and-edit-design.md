@@ -140,7 +140,7 @@ def datamark(text: str) -> str:
 - 所有 `spotlight_untrusted` 调用点自动生效:工具结果、记忆块、不可信注入变量、对外 run 的不可信输入。
 - `prompt_render` 的 `_PATH_END`(路径后接全角分号)仍然成立:路径后面不是空白,不会贴上标记。
 - **提示词缓存**:同一份内容的字节变了,发布后每个会话第一次请求缓存不命中一次,之后恢复。
-- **token**:换行和缩进原样保留,读代码时 token 会略多。用 tiktoken 在样本上量出差值,写进 PR。
+- **token**:实测(o200k)不增反降 —— 旧规则每处空白都换成「标记符 + 空格」两个 token,新规则多数空白与标记符合并。读代码与表格省 5% ~ 9%,本仓库 `file_ops.py` 前 2 万字符省 5.1%,纯中文文档基本持平(−0.3%)。
 
 ## 4. B-137 设计:一次改多处
 
@@ -238,7 +238,7 @@ def datamark(text: str) -> str:
 
 ### 5.3 统一发测试后的真栈用例
 
-写进 `docs/runbooks/pending-test-release-acceptance.md` §5,同一个 PR 加:
+写进 `docs/runbooks/pending-test-release-acceptance.md`(B-149 → §5,#1724;B-137 → §6,#1725),各自同一个 PR 加。要点:
 
 - **5.1** 读一个带缩进的 Python 文件:控制台对话页显示的工具结果有换行和缩进;`run_event` 里发给模型的正文换行数接近原文。
 - **5.2** 叫模型改同一文件三处:一次 `edit_file` 带 `edits` 完成,文件三处都变了。
