@@ -41,6 +41,7 @@ from orchestrator.tools import (
 )
 from orchestrator.tools.error_classifier import classify_tool_error
 from orchestrator.tools.file_ops import (
+    _EDIT_MAIN,
     SandboxWorkspaceWriter,
     build_artifact_locate_wrapper,
     build_edit_wrapper,
@@ -225,6 +226,54 @@ def test_edit_no_match(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello")
     out = _run_snippet(build_edit_wrapper("f.txt", "absent", "x", ws=str(tmp_path)))
     assert out == {"ok": False, "error": "no_match"}
+
+
+def test_edit_strips_copied_datamark_glyphs_as_a_last_resort(tmp_path: Path) -> None:
+    """B-149 —— 模型偶尔把读到的 ``▁`` 抄进 ``old_string``(测试环境 30 天
+    116 次里 1 次, 那次失败了)。前两级都对不上、且 ``old_string`` 带标记符时,
+    去掉标记符(``new_string`` 一起去)再试。"""
+    (tmp_path / "f.py").write_text("def f(x):\n    return x + 1\n")
+    out = _run_snippet(
+        build_edit_wrapper(
+            "f.py",
+            "return\u2581 x\u2581 +\u2581 1",
+            "return\u2581 x\u2581 +\u2581 2",
+            ws=str(tmp_path),
+        )
+    )
+    assert out["ok"] is True
+    assert out["match"] == "unmarked"
+    assert (tmp_path / "f.py").read_text() == "def f(x):\n    return x + 2\n"
+
+
+def test_edit_glyph_fallback_also_tolerates_indent_drift(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("if a:\n    b = 1\n    c = 2\n")
+    old = "b\u2581 =\u2581 1\nc\u2581 =\u2581 2"
+    out = _run_snippet(build_edit_wrapper("f.py", old, "    b = 3\n    c = 4", ws=str(tmp_path)))
+    assert out["ok"] is True
+    assert out["match"] == "unmarked"
+    assert (tmp_path / "f.py").read_text() == "if a:\n    b = 3\n    c = 4\n"
+
+
+def test_edit_snippet_glyph_is_the_spotlight_glyph() -> None:
+    """沙箱代码段不能 import spotlight, 只能抄一份 —— 两份必须同值。"""
+    from expert_work.common.spotlight import DATAMARK_GLYPH
+
+    ns: dict[str, Any] = {}
+    exec(_EDIT_MAIN.split("\ndef _main():")[0], ns)  # noqa: S102 — fixed template
+    assert ns["_GLYPH"] == DATAMARK_GLYPH
+
+
+def test_edit_matches_a_file_that_really_contains_the_glyph_first(tmp_path: Path) -> None:
+    """文件里本来就有 ``▁``(例如 sentencepiece 词表)时, 精确匹配先命中,
+    轮不到去标记符那一级 —— 不能把真内容里的 ``▁`` 删掉。"""
+    (tmp_path / "vocab.txt").write_text("\u2581the 1\n\u2581cat 2\n")
+    out = _run_snippet(
+        build_edit_wrapper("vocab.txt", "\u2581cat 2", "\u2581dog 2", ws=str(tmp_path))
+    )
+    assert out["ok"] is True
+    assert out["match"] == "exact"
+    assert (tmp_path / "vocab.txt").read_text() == "\u2581the 1\n\u2581dog 2\n"
 
 
 def test_edit_ambiguous(tmp_path: Path) -> None:
