@@ -45,6 +45,7 @@ from orchestrator.tools.file_ops import (
     SandboxWorkspaceWriter,
     build_artifact_locate_wrapper,
     build_edit_wrapper,
+    build_edits_wrapper,
     build_read_wrapper,
     build_write_wrapper,
 )
@@ -274,6 +275,72 @@ def test_edit_matches_a_file_that_really_contains_the_glyph_first(tmp_path: Path
     assert out["ok"] is True
     assert out["match"] == "exact"
     assert (tmp_path / "vocab.txt").read_text() == "\u2581the 1\n\u2581dog 2\n"
+
+
+# --- B-137 —— 一次调用改多处 / 全部替换 ------------------------------------
+
+
+def _edits(*pairs: tuple[str, str], replace_all: bool = False) -> list[dict[str, Any]]:
+    return [{"old": o, "new": n, "replace_all": replace_all} for o, n in pairs]
+
+
+def test_edits_apply_in_order_on_the_updated_text(tmp_path: Path) -> None:
+    """后一项作用在前一项改完的文本上 —— 第二项的 old 只在第一项改完后才存在。"""
+    (tmp_path / "f.py").write_text("a = 1\nb = 2\n")
+    edits = _edits(("a = 1", "a = 10"), ("a = 10\nb", "a = 10\nc"))
+    out = _run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path)))
+    assert out["ok"] is True
+    assert out["matches"] == ["exact", "exact"]
+    assert (tmp_path / "f.py").read_text() == "a = 10\nc = 2\n"
+
+
+def test_edits_are_all_or_nothing(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("x = 1\ny = 2\nz = 3\n")
+    edits = _edits(("x = 1", "x = 9"), ("absent", "q"), ("z = 3", "z = 9"))
+    out = _run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path)))
+    assert out["ok"] is False
+    assert out["error"] == "no_match"
+    assert (out["index"], out["total"]) == (2, 3)
+    assert (tmp_path / "f.py").read_text() == "x = 1\ny = 2\nz = 3\n"
+
+
+def test_each_edit_may_use_the_line_block_fallback(tmp_path: Path) -> None:
+    (tmp_path / "f.py").write_text("if a:\n    b = 1\nc = 2\n")
+    edits = _edits(("if a:\nb = 1", "if a:\n    b = 5"), ("c = 2", "c = 6"))
+    out = _run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path)))
+    assert out["ok"] is True
+    assert out["matches"] == ["fuzzy", "exact"]
+    assert (tmp_path / "f.py").read_text() == "if a:\n    b = 5\nc = 6\n"
+
+
+def test_replace_all_replaces_every_exact_occurrence(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("cat dog cat bird cat")
+    out = _run_snippet(
+        build_edit_wrapper("f.txt", "cat", "fox", replace_all=True, ws=str(tmp_path))
+    )
+    assert out["ok"] is True
+    assert out["replaced"] == 3
+    assert (tmp_path / "f.txt").read_text() == "fox dog fox bird fox"
+
+
+def test_replace_all_does_not_use_the_line_block_fallback(tmp_path: Path) -> None:
+    """全部替换只认精确匹配:按行去缩进的匹配在「全部」语义下会悄悄改到不该改的地方。"""
+    (tmp_path / "f.py").write_text("if a:\n    b = 1\n")
+    out = _run_snippet(
+        build_edit_wrapper("f.py", "if a:\nb = 1", "x", replace_all=True, ws=str(tmp_path))
+    )
+    assert out["ok"] is False
+    assert out["error"] == "no_match"
+    assert (tmp_path / "f.py").read_text() == "if a:\n    b = 1\n"
+
+
+def test_single_edit_envelope_keeps_its_match_field(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("hello world")
+    out = _run_snippet(build_edit_wrapper("f.txt", "world", "there", ws=str(tmp_path)))
+    assert out["match"] == "exact"
+    assert out["matches"] == ["exact"]
+    assert out["replaced"] == 1
+    assert "index" not in out
 
 
 def test_edit_ambiguous(tmp_path: Path) -> None:
@@ -888,14 +955,18 @@ async def test_edit_no_match_raises_fileop() -> None:
         )
 
 
-async def test_edit_stale_surfaces_current_hash() -> None:
+async def test_edit_stale_does_not_hand_the_model_a_hash() -> None:
+    """B-137 —— 模型看不到真哈希, 过去照着 stale 报错去抄哈希、或者干脆编一个
+    (测试环境 30 天:传哈希 13 次, 9 次长度不对;stale 失败恰好 9 次)。"""
     env = {"ok": False, "error": "stale", "detail": "current_hash=abc", "current_hash": "abc"}
     client = _client(json.dumps(env))
-    with pytest.raises(FileOpError, match=r"stale.*current_hash=abc"):
+    with pytest.raises(FileOpError, match="stale") as excinfo:
         await EditFileTool(client=client).call(
-            {"path": "f.txt", "old_string": "a", "new_string": "b", "expected_hash": "old"},
+            {"path": "f.txt", "old_string": "a", "new_string": "b", "expected_hash": "a" * 64},
             ctx=_ctx(),
         )
+    assert "abc" not in str(excinfo.value)
+    assert "expected_hash" not in str(excinfo.value)
 
 
 async def _edit_failure_message(env: dict[str, Any]) -> str:
@@ -922,13 +993,11 @@ async def test_edit_stale_tells_the_model_to_re_read() -> None:
     msg = await _edit_failure_message(
         {"ok": False, "error": "stale", "detail": "current_hash=abc", "current_hash": "abc"}
     )
-    # 既有信息不能丢:哈希还在。
-    assert "current_hash=abc" in msg
-    # 阶梯第一级:重新读 -> 用读到的内容重建 old_string -> 带上新哈希再试。
+    # 阶梯第一级:重新读 -> 用读到的内容重建 old_string。B-137 起不再让模型传哈希。
     assert "The file changed after you read it, so NOTHING was written" in msg
     assert "Call read_file on this path again" in msg
     assert "rebuild 'old_string' from what you just read" in msg
-    assert "pass the new hash as 'expected_hash'" in msg
+    assert "expected_hash" not in msg
     # 阶梯第二级:连撞两次才升级成整份重写(不是禁令)。
     assert "If this region has now failed twice" in msg
     assert "rewrite the enclosing function or the whole file with write_file" in msg
@@ -966,6 +1035,24 @@ async def test_edit_guidance_survives_the_tool_error_cap() -> None:
     with pytest.raises(FileOpError) as excinfo:
         await EditFileTool(client=client).call(
             {"path": "f.txt", "old_string": "a", "new_string": "b"}, ctx=_ctx()
+        )
+    rendered = _format_error(excinfo.value)
+    assert "[truncated]" not in rendered
+    assert rendered.endswith(
+        "rewrite the enclosing function or the whole file with write_file instead."
+    )
+
+
+async def test_multi_edit_failure_guidance_still_fits_the_truncation_budget() -> None:
+    """B-137 —— 多处编辑的失败多带一段「edit 50 of 50: 」前缀, 同一份预算照样要放得下。"""
+    from orchestrator.graph_builder.builder import _format_error
+
+    worst = "near line 99999999: " + "x" * 80
+    env = {"ok": False, "error": "no_match", "detail": worst, "index": 50, "total": 50}
+    client = _client(json.dumps(env))
+    with pytest.raises(FileOpError) as excinfo:
+        await EditFileTool(client=client).call(
+            {"path": "f.txt", "edits": [{"old_string": "a", "new_string": "b"}] * 50}, ctx=_ctx()
         )
     rendered = _format_error(excinfo.value)
     assert "[truncated]" not in rendered
@@ -1026,14 +1113,120 @@ async def test_edit_requires_non_empty_old_string() -> None:
         )
 
 
-async def test_edit_expected_hash_threaded_into_snippet() -> None:
+async def test_edit_real_looking_hash_is_threaded_into_snippet() -> None:
+    real = hashlib.sha256(b"x").hexdigest()
     client = _client(json.dumps({"ok": True, "content_hash": "h", "size": 1, "path": "f.txt"}))
-    await EditFileTool(client=client).call(
-        {"path": "f.txt", "old_string": "a", "new_string": "b", "expected_hash": "cafe"},
+    result = await EditFileTool(client=client).call(
+        {"path": "f.txt", "old_string": "a", "new_string": "b", "expected_hash": real},
         ctx=_ctx(),
     )
+    assert f'"expected_hash": "{real}"' in client.execs[0][1]
+    assert "expected_hash_ignored" not in result.meta
+
+
+@pytest.mark.parametrize("made_up", ["", "cafe", "abc123def", "a" * 32, "A" * 64, "g" * 64])
+async def test_edit_made_up_hash_is_ignored(made_up: str) -> None:
+    """不是 64 位小写十六进制的值不可能是真哈希(模型从来看不到真值)——
+    照着比只会造出假的 stale 失败。忽略, 并在元数据里记一笔。"""
+    client = _client(json.dumps({"ok": True, "content_hash": "h", "size": 1, "path": "f.txt"}))
+    result = await EditFileTool(client=client).call(
+        {"path": "f.txt", "old_string": "a", "new_string": "b", "expected_hash": made_up},
+        ctx=_ctx(),
+    )
+    params_line = client.execs[0][1].splitlines()[0]
+    assert params_line.startswith("_PARAMS = ")
+    assert "expected_hash" not in params_line
+    assert result.meta["expected_hash_ignored"] is True
+
+
+async def test_edit_with_edits_sends_all_of_them_in_one_exec() -> None:
+    env = {
+        "ok": True,
+        "content_hash": "h",
+        "size": 9,
+        "path": "f.txt",
+        "match": "exact",
+        "matches": ["exact", "fuzzy", "exact"],
+        "replaced": 3,
+    }
+    client = _client(json.dumps(env))
+    result = await EditFileTool(client=client).call(
+        {
+            "path": "f.txt",
+            "edits": [
+                {"old_string": "a", "new_string": "b"},
+                {"old_string": "c", "new_string": "d"},
+                {"old_string": "e", "new_string": "f", "replace_all": True},
+            ],
+        },
+        ctx=_ctx(),
+    )
+    assert len(client.execs) == 1
     code = client.execs[0][1]
-    assert '"expected_hash": "cafe"' in code
+    assert '"old": "a"' in code
+    assert '"old": "e"' in code
+    assert '"replace_all": true' in code
+    assert "3 edits" in result.content
+    assert result.meta["matches"] == ["exact", "fuzzy", "exact"]
+
+
+_ONE = {"old_string": "a", "new_string": "b"}
+
+
+@pytest.mark.parametrize(
+    ("args", "needle"),
+    [
+        ({"old_string": "a", "new_string": "b", "edits": [_ONE]}, "either"),
+        ({}, "old_string"),
+        ({"edits": []}, "edits"),
+        ({"edits": [_ONE] * 51}, "50"),
+        ({"edits": [_ONE, {"new_string": "b"}]}, "edit 2"),
+        ({"edits": [{"old_string": "a", "new_string": 3}]}, "edit 1"),
+        ({"edits": ["a"]}, "edit 1"),
+        ({"edits": [{**_ONE, "replace_all": "yes"}]}, "replace_all"),
+        ({"old_string": "a", "new_string": "b", "replace_all": "yes"}, "replace_all"),
+    ],
+)
+async def test_edit_rejects_malformed_edit_arguments(args: dict[str, Any], needle: str) -> None:
+    client = _client(json.dumps({"ok": True, "content_hash": "h", "size": 0, "path": "f"}))
+    with pytest.raises(ValueError, match=needle):
+        await EditFileTool(client=client).call({"path": "f.txt", **args}, ctx=_ctx())
+    assert client.execs == []
+
+
+async def test_edit_failure_in_edits_names_the_item_and_says_nothing_was_written() -> None:
+    env = {
+        "ok": False,
+        "error": "no_match",
+        "index": 2,
+        "total": 3,
+        "detail": "near line 4: b = 2",
+    }
+    client = _client(json.dumps(env))
+    with pytest.raises(FileOpError) as excinfo:
+        await EditFileTool(client=client).call({"path": "f.txt", "edits": [_ONE] * 3}, ctx=_ctx())
+    msg = str(excinfo.value)
+    assert msg.startswith("edit_file failed: edit 2 of 3: no_match (near line 4: b = 2)")
+    assert "NOTHING was written" in msg
+
+
+def test_edit_file_schema_offers_edits_and_hides_the_hash() -> None:
+    spec = EditFileTool(client=_client("{}")).spec
+    props = spec.parameters["properties"]
+    assert "expected_hash" not in props
+    assert props["edits"]["maxItems"] == 50
+    assert props["replace_all"]["type"] == "boolean"
+    assert spec.parameters["required"] == ["path"]
+    assert "'edits'" in spec.description
+    assert "hash" not in spec.description
+
+
+def test_write_and_read_file_descriptions_point_to_edit_file_not_the_hash() -> None:
+    write = WriteFileTool(client=_client("{}")).spec.description
+    assert "To change part of an existing file, use edit_file" in write
+    assert "hash" not in write
+    read = ReadFileTool(store=RecordingWorkspaceStore()).spec.description
+    assert "hash" not in read
 
 
 @pytest.mark.parametrize(
