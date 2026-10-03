@@ -47,7 +47,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [ ] **2.2 检查点续跑**:跑一个会触发审批的 run,批准后续跑完成(langgraph 检查点读写)。
 - [ ] **2.3 委派**:跑一次会派 worker 的 run,worker 正常返回(子图)。
 - [x] **2.4 链路追踪**:上面任一 run 在 Langfuse(langfuse-test)能看到完整 trace,LLM span 有输入输出与 token 数;调试台 trace 瀑布正常展开。**10-03 首轮(`d0342507`)不过**:Langfuse 08-21 之后 0 条 trace,根因见 ROADMAP B-153,#1733 修。复验:发测试后跑一轮,`agent_run.trace_id` 在 Langfuse `/api/public/traces/{id}` 能取到,带 GENERATION 观测(有输入输出与 token 数);control-plane 日志不再出现 `langfuse.start_span_failed`。 **10-03 二轮(`52d92f60`)过**:`start_span_failed` 归零,但 ClickHouse 盘 100% 满、worker 把写入丢了(B-154);手工清掉系统日志表后,run `71134169` 的 trace 在 Langfuse 取得到,1 条 GENERATION,有输入输出与 token 数。
-- [ ] **2.5 ClickHouse 系统日志有保留期(#1734)**:发测试后 ① `system.tables` 里 `query_log` / `text_log` / `metric_log` 等的 `engine_full` 含 `TTL`,`text_log` 新行只有 `Warning` 及以上;② 按生产执行单 Step C「B-154 清掉 ClickHouse 的旧日志表」原样跑一遍,`*_log_0` 与两张诊断表删掉、`df` 下降;③ smoke 输出里有 `OK   clickhouse data disk N% used`;④ 之后再跑一轮 run,Langfuse 照样有 trace。
+- [x] **2.5 ClickHouse 系统日志有保留期(#1734)**:发测试后 ① `system.tables` 里 `query_log` / `text_log` / `metric_log` 等的 `engine_full` 含 `TTL`,`text_log` 新行只有 `Warning` 及以上;② 按生产执行单 Step C「B-154 清掉 ClickHouse 的旧日志表」原样跑一遍,`*_log_0` 与两张诊断表删掉、`df` 下降;③ smoke 输出里有 `OK   clickhouse data disk N% used`;④ 之后再跑一轮 run,Langfuse 照样有 trace。 **10-03 过(分支 `9391dbd6` 发测试)**:① 11 张日志表带 `TTL`,重启后 `text_log` 只有 `Warning`,`processors_profile_log` 重启后零写入;② Step C 原样跑,10 张 `*_log_0` + 两张诊断表删净(剩 0);③ smoke 打出 `OK   clickhouse data disk 2% used`;④ 新 run `72b7b6bc` 的 trace 进了 Langfuse(1 条 GENERATION,有输入输出与 token 数)。发布时金丝雀首跑 `transport: ReadError`(新 pod 起来 2 分钟内),原地重跑 5/5 过 —— 本 PR 没动 control-plane 代码。
 
 ## §3 沙箱镜像依赖(#1713)
 
