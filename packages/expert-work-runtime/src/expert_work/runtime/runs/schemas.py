@@ -113,6 +113,16 @@ def compute_completed(*, exit_reason: str, unresolved_failures: Sequence[Any]) -
     return exit_reason == "text_response" and not unresolved_failures
 
 
+#: B-139 —— 一个会话「忙」的口径:里面有 run 处于这三种状态之一。新一轮
+#: 遇到忙的会话就排队;后台队列只领「同会话里没有更早的忙 run」的排队行。
+#: ``PAUSED``(等审批)不算忙:新一轮会作废那条待审批(已拍板的规则)。
+#: 与重新生成的 ``SUPERSEDE_BUSY_STATUSES``、会话列表的 ``running`` 字段同一口径。
+THREAD_BUSY_STATUSES: tuple[RunStatus, ...] = (
+    RunStatus.PENDING,
+    RunStatus.QUEUED,
+    RunStatus.RUNNING,
+)
+
 #: Run statuses that mark a run as finished — ``RunManager`` stamps
 #: ``finished_at`` when a run transitions into one of these.
 TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset(

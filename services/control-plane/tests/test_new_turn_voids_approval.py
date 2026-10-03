@@ -489,19 +489,38 @@ async def test_queued_new_turn_voids_at_enqueue_and_runs_behind_the_gate(s: _Sta
 async def test_queued_turn_voids_an_approval_that_appeared_after_it_was_enqueued(
     s: _Stack,
 ) -> None:
-    """入队时会话还没停在审批上;出队前 A 停下了 —— 出队这一侧必须补上作废。"""
+    """入队时会话还没停在审批上;出队前 A 停下了 —— 出队这一侧必须补上作废。
+
+    B-139 之后同一会话的多轮串行:这只会发生在 B 被受理时 A **还在跑**(受理那一刻
+    没有待审批可作废),A 随后停在审批上(``paused`` 不算忙),B 才轮到。测试栈里
+    一次 ``start`` 会读完整条流,插不进「A 跑到一半」的那个时刻,所以 B 的排队行
+    按 ``spawn_run`` 受理时会写的样子直接落库。
+    """
     thread, _, _ = await s.start()
-    _, run_b, _ = await s.start(thread, mode="queue")
     _, run_a, _ = await s.start(thread)
     assert (await s.approval(run_a)).status is ApprovalStatus.PENDING
+    end_user = await s.app.state.tenant_user_repo.resolve(
+        tenant_id=s.tenant_id, subject_type="user", subject_id=f"ext:{_USER}"
+    )
+    run_b = uuid4()
+    await s.runtime.run_manager.enqueue(
+        run_id=run_b,
+        thread_id=thread,
+        tenant_id=s.tenant_id,
+        user_id=end_user.id,
+        enqueued_input={
+            "input": "查一下",
+            "image_refs": [],
+            "untrusted_content": [],
+            "inputs": {},
+            "document_names": [],
+        },
+    )
 
     assert await s.queue_worker().run_once() == 1
     await s.settle(run_b)
 
     await _assert_voided(s, run_a, by=run_b)
-    end_user = await s.app.state.tenant_user_repo.resolve(
-        tenant_id=s.tenant_id, subject_type="user", subject_id=f"ext:{_USER}"
-    )
     (audit,) = await s.void_audits()
     assert audit.actor_id == "run_queue_worker"
     assert audit.on_behalf_of == str(end_user.id)

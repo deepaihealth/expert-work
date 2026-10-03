@@ -28,16 +28,20 @@ from uuid import UUID
 from sqlalchemy import String, and_, cast, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from expert_work.persistence.models import AgentRunRow, RunEventRow, ThreadMetaRow
 from expert_work.persistence.thread_meta.base import ThreadMetaStore
 from expert_work.runtime.runs.event_store import RunEventStore
 from expert_work.runtime.runs.schemas import (
+    THREAD_BUSY_STATUSES,
     DisconnectMode,
     RunInfo,
     RunStatus,
     ThreadRunAggregate,
 )
+
+_BUSY_VALUES: tuple[str, ...] = tuple(s.value for s in THREAD_BUSY_STATUSES)
 
 #: Terminal run statuses that count as a conversation-level failure signal.
 _FAILED_RUN_VALUES: frozenset[str] = frozenset({RunStatus.ERROR.value, RunStatus.TIMEOUT.value})
@@ -605,14 +609,39 @@ class RunStore(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def list_queued(self, *, limit: int) -> list[RunInfo]:
-        """Cross-tenant ``status='queued'`` runs, oldest first (FIFO).
+    async def list_queued(self, *, limit: int, now: datetime) -> list[RunInfo]:
+        """Cross-tenant ``status='queued'`` runs that may start now, oldest first.
 
         Stream 9.5 — the run-queue worker's scan. Caller MUST wrap in
         ``bypass_rls_session()`` (cross-tenant). The claim CAS
         (:meth:`claim_queued`) is the authoritative exactly-once guard;
         this scan only nominates candidates.
+
+        B-139 —— 只列「轮到了」的行:同一会话里没有更早的忙 run
+        (:data:`THREAD_BUSY_STATUSES`,按 ``(created_at, id)`` 定先后),且没有
+        一份在 ``now`` 仍有效的预订(``claimed_by`` 非空且 ``lease_until > now``)。
         """
+
+    @abc.abstractmethod
+    async def list_inflight_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> list[RunInfo]:
+        """B-139 —— 会话里处于 :data:`THREAD_BUSY_STATUSES` 的 run,按
+        ``(created_at, id)`` 从早到晚。读库,看得到别的副本与排队中的 run ——
+        进程内存版(``RunManager.has_inflight``)两样都看不到。"""
+
+    @abc.abstractmethod
+    async def renew_queued_reservation(
+        self, *, run_id: UUID, owner: str, lease_until: datetime, now: datetime
+    ) -> bool:
+        """B-139 —— 预订(或续订)一条排队行:持着这条流式连接的副本要自己执行它。
+
+        CAS:行仍是 ``queued``,且没有别人的有效预订(``claimed_by`` 为空、是自己、
+        或 ``lease_until <= now``)。``True`` = 预订在手。``False`` = 行已不再排队
+        (被取消 / 被领走)或被别人有效预订着。"""
+
+    @abc.abstractmethod
+    async def release_queued_reservation(self, *, run_id: UUID, owner: str) -> None:
+        """B-139 —— 放掉自己对一条排队行的预订(连接断开、按「断开继续」交给后台
+        队列)。只清自己的;别人的预订、已不再排队的行不动。"""
 
     @abc.abstractmethod
     async def claim_queued(
@@ -630,6 +659,10 @@ class RunStore(abc.ABC):
         same queued run. Returns the claimed :class:`RunInfo` (carrying the
         ``enqueued_input`` the worker needs) on a win, ``None`` on a loss
         (rowcount 0). Caller wraps in ``bypass_rls_session()``.
+
+        B-139 —— 同一个 CAS 里再加两条(与 :meth:`list_queued` 同义,``now`` 取
+        ``heartbeat_at``):同会话没有更早的忙 run;没有别人的有效预订(预订者
+        自己 ``new_owner`` 可领)。条件与领取在同一条 UPDATE 里,不留竞态。
         """
 
 
@@ -1073,10 +1106,62 @@ class InMemoryRunStore(RunStore):
         )
         return True
 
-    async def list_queued(self, *, limit: int) -> list[RunInfo]:
-        rows = [r for r in self._rows.values() if r.status is RunStatus.QUEUED]
-        rows.sort(key=lambda r: r.created_at)
+    def _has_earlier_busy(self, row: RunInfo) -> bool:
+        key = (row.created_at, row.run_id)
+        return any(
+            p.thread_id == row.thread_id
+            and p.run_id != row.run_id
+            and p.status in THREAD_BUSY_STATUSES
+            and (p.created_at, p.run_id) < key
+            for p in self._rows.values()
+        )
+
+    @staticmethod
+    def _reserved_by_other(row: RunInfo, *, owner: str | None, now: datetime) -> bool:
+        return (
+            row.claimed_by is not None
+            and row.claimed_by != owner
+            and row.lease_until is not None
+            and row.lease_until > now
+        )
+
+    async def list_queued(self, *, limit: int, now: datetime) -> list[RunInfo]:
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.status is RunStatus.QUEUED
+            and not self._has_earlier_busy(r)
+            and not self._reserved_by_other(r, owner=None, now=now)
+        ]
+        rows.sort(key=lambda r: (r.created_at, r.run_id))
         return rows[: max(1, limit)]
+
+    async def list_inflight_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> list[RunInfo]:
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.thread_id == thread_id
+            and r.tenant_id == tenant_id
+            and r.status in THREAD_BUSY_STATUSES
+        ]
+        rows.sort(key=lambda r: (r.created_at, r.run_id))
+        return rows
+
+    async def renew_queued_reservation(
+        self, *, run_id: UUID, owner: str, lease_until: datetime, now: datetime
+    ) -> bool:
+        row = self._rows.get(run_id)
+        if row is None or row.status is not RunStatus.QUEUED:
+            return False
+        if self._reserved_by_other(row, owner=owner, now=now):
+            return False
+        self._rows[run_id] = replace(row, claimed_by=owner, lease_until=lease_until)
+        return True
+
+    async def release_queued_reservation(self, *, run_id: UUID, owner: str) -> None:
+        row = self._rows.get(run_id)
+        if row is not None and row.status is RunStatus.QUEUED and row.claimed_by == owner:
+            self._rows[run_id] = replace(row, claimed_by=None, lease_until=None)
 
     async def claim_queued(
         self,
@@ -1088,6 +1173,10 @@ class InMemoryRunStore(RunStore):
     ) -> RunInfo | None:
         row = self._rows.get(run_id)
         if row is None or row.status is not RunStatus.QUEUED:
+            return None
+        if self._has_earlier_busy(row) or self._reserved_by_other(
+            row, owner=new_owner, now=heartbeat_at
+        ):
             return None
         claimed = replace(
             row,
@@ -1166,6 +1255,41 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         superseded_by_run_id=row.superseded_by_run_id,
         regenerated_from_run_id=row.regenerated_from_run_id,
     )
+
+
+def _earlier_busy_exists() -> Any:
+    """B-139 —— ``EXISTS``:与外层 ``agent_run`` 行同会话、更早、处于忙状态的 run。
+
+    「更早」按 ``(created_at, id)`` —— ``created_at`` 是应用侧取的时间, 并列时
+    靠 id 定先后, 否则两条并列的排队行会互相等、谁都领不到。与内存版
+    ``InMemoryRunStore._has_earlier_busy`` 逐字同义(``conftest`` 的共用场景钉住)。
+    """
+    prior = aliased(AgentRunRow)
+    return (
+        select(prior.id)
+        .where(
+            prior.thread_id == AgentRunRow.thread_id,
+            prior.id != AgentRunRow.id,
+            prior.status.in_(_BUSY_VALUES),
+            or_(
+                prior.created_at < AgentRunRow.created_at,
+                and_(prior.created_at == AgentRunRow.created_at, prior.id < AgentRunRow.id),
+            ),
+        )
+        .exists()
+    )
+
+
+def _not_reserved_by_other(*, owner: str | None, now: datetime) -> Any:
+    """B-139 —— 没有别人的有效预订:``claimed_by`` 为空、是 ``owner``、或已过期。"""
+    clauses = [
+        AgentRunRow.claimed_by.is_(None),
+        AgentRunRow.lease_until.is_(None),
+        AgentRunRow.lease_until <= now,
+    ]
+    if owner is not None:
+        clauses.append(AgentRunRow.claimed_by == owner)
+    return or_(*clauses)
 
 
 class SqlRunStore(RunStore):
@@ -1783,12 +1907,16 @@ class SqlRunStore(RunStore):
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
 
-    async def list_queued(self, *, limit: int) -> list[RunInfo]:
+    async def list_queued(self, *, limit: int, now: datetime) -> list[RunInfo]:
         # Cross-tenant: no tenant filter — caller wraps in bypass_rls_session().
         stmt = (
             select(AgentRunRow)
-            .where(AgentRunRow.status == RunStatus.QUEUED.value)
-            .order_by(AgentRunRow.created_at.asc())
+            .where(
+                AgentRunRow.status == RunStatus.QUEUED.value,
+                ~_earlier_busy_exists(),
+                _not_reserved_by_other(owner=None, now=now),
+            )
+            .order_by(AgentRunRow.created_at.asc(), AgentRunRow.id.asc())
             .limit(max(1, limit))
         )
         async with self._sf() as session:
@@ -1812,6 +1940,8 @@ class SqlRunStore(RunStore):
                 .where(
                     AgentRunRow.id == run_id,
                     AgentRunRow.status == RunStatus.QUEUED.value,
+                    ~_earlier_busy_exists(),
+                    _not_reserved_by_other(owner=new_owner, now=heartbeat_at),
                 )
                 .values(
                     status=RunStatus.RUNNING.value,
@@ -1824,3 +1954,46 @@ class SqlRunStore(RunStore):
             row = result.scalars().first()
             await session.commit()
         return _row_to_dto(row) if row is not None else None
+
+    async def list_inflight_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> list[RunInfo]:
+        stmt = (
+            select(AgentRunRow)
+            .where(
+                AgentRunRow.thread_id == thread_id,
+                AgentRunRow.tenant_id == tenant_id,
+                AgentRunRow.status.in_(_BUSY_VALUES),
+            )
+            .order_by(AgentRunRow.created_at.asc(), AgentRunRow.id.asc())
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_dto(r) for r in rows]
+
+    async def renew_queued_reservation(
+        self, *, run_id: UUID, owner: str, lease_until: datetime, now: datetime
+    ) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(AgentRunRow)
+                .where(
+                    AgentRunRow.id == run_id,
+                    AgentRunRow.status == RunStatus.QUEUED.value,
+                    _not_reserved_by_other(owner=owner, now=now),
+                )
+                .values(claimed_by=owner, lease_until=lease_until)
+            )
+            await session.commit()
+        return bool(result.rowcount)  # type: ignore[attr-defined]
+
+    async def release_queued_reservation(self, *, run_id: UUID, owner: str) -> None:
+        async with self._sf() as session:
+            await session.execute(
+                update(AgentRunRow)
+                .where(
+                    AgentRunRow.id == run_id,
+                    AgentRunRow.status == RunStatus.QUEUED.value,
+                    AgentRunRow.claimed_by == owner,
+                )
+                .values(claimed_by=None, lease_until=None)
+            )
+            await session.commit()

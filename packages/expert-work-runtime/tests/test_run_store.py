@@ -14,6 +14,7 @@ from expert_work.runtime.runs import (
     InMemoryRunStore,
     RunInfo,
     RunStatus,
+    RunStore,
     make_event_record,
 )
 
@@ -946,7 +947,7 @@ async def test_list_queued_returns_queued_fifo() -> None:
     # A non-queued run must not appear.
     await store.create(_info(run_id=uuid4(), tenant_id=tenant, status=RunStatus.RUNNING))
 
-    queued = await store.list_queued(limit=10)
+    queued = await store.list_queued(limit=10, now=datetime.now(UTC))
     assert [q.run_id for q in queued] == [old, new]  # oldest first
 
 
@@ -1425,3 +1426,16 @@ async def test_latest_by_thread_picks_newest_scoped_and_can_skip_one() -> None:
     )
     assert skipped is not None and skipped.run_id == middle
     assert await store.latest_by_thread(thread_id=uuid4(), tenant_id=tenant_a) is None
+
+
+# --------------------------------------------------------------------------
+# B-139 —— 同一会话串行执行(场景与 SQL 版共用 thread_queue_scenarios)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thread_queue_in_memory(
+    thread_queue_scenarios: tuple[Callable[[RunStore], Awaitable[None]], ...],
+) -> None:
+    for scenario in thread_queue_scenarios:
+        await scenario(InMemoryRunStore())

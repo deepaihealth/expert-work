@@ -206,7 +206,10 @@ _SRC = Path(__file__).resolve().parents[1] / "src" / "control_plane"
 #:   且函数体里必须真有那条重放分支(见下面的 ``_calls_replay_builder``)。
 #: * ``None`` —— 不传 inputs,理由写在行上。
 _RUN_AGENT_SITES: dict[str, tuple[str | None, bool]] = {
-    "api/runs.py::spawn_run": ("fresh", True),
+    # B-139 —— 起 run 的那段抽进了 ``_start_run``(立即执行与排队轮到后执行共用);
+    # inputs 仍由 ``spawn_run`` 调 ``resolve_turn_inputs`` 取回后传进来,见下面
+    # ``test_spawn_run_still_resolves_the_turn_inputs``。
+    "api/runs.py::_start_run": ("fresh", False),
     # 排队 run 的 inputs(含 ``:regenerate`` 带过来的)在 ``enqueued_input`` 里,
     # 由 ``spawn_run`` 建行时写好。
     "run_queue_worker.py::_execute": ("fresh", False),
@@ -305,3 +308,15 @@ def test_every_run_agent_call_passes_the_turn_inputs() -> None:
             f"{site}: inputs_run_id 只有续跑类入口该传"
         )
         assert _calls_resolver(func) == resolves, f"{site}: resolve_turn_inputs 的调用与登记不符"
+
+
+def test_spawn_run_still_resolves_the_turn_inputs() -> None:
+    """B-139 —— ``run_agent`` 挪进了 ``_start_run``, 取 inputs 的那一步留在
+    ``spawn_run``(``:regenerate`` 要用被取代那一轮的)。两处都得在。"""
+    tree = ast.parse((_SRC / "api" / "runs.py").read_text(encoding="utf-8"))
+    spawn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "spawn_run"
+    )
+    assert _calls_resolver(spawn)

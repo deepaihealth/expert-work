@@ -273,6 +273,8 @@ class RunManager:
         idempotency_key: str | None = None,
         request_digest: str | None = None,
         regenerated_from_run_id: UUID | None = None,
+        on_disconnect: DisconnectMode = DisconnectMode.CONTINUE,
+        reserved_until: datetime | None = None,
     ) -> None:
         """Persist a ``QUEUED`` run for the distributed queue (Stream 9.5).
 
@@ -293,6 +295,11 @@ class RunManager:
         re-queries the winner. Both default to ``None``, so every existing
         caller (the internal session-run endpoint) is unaffected: no key,
         no possible conflict, byte-identical behaviour to before this task.
+
+        B-139 —— 流式请求遇到忙会话也走这里排队,但要由**持着这条连接的本实例**
+        执行(逐字输出只在执行它的进程里有):``reserved_until`` 给了就把行预订
+        给本实例(``claimed_by`` = 本实例、``lease_until`` = 这个时间),后台队列在
+        预订有效期内不会领它。``on_disconnect`` 记下这条连接的断开语义。
         """
         if self._store is None:
             msg = "enqueue requires a durable RunStore"
@@ -304,7 +311,7 @@ class RunManager:
             thread_id=thread_id,
             user_id=user_id,
             status=RunStatus.QUEUED,
-            on_disconnect=DisconnectMode.CONTINUE,
+            on_disconnect=on_disconnect,
             is_resume=is_resume,
             error=None,
             created_at=now,
@@ -315,6 +322,8 @@ class RunManager:
             idempotency_key=idempotency_key,
             request_digest=request_digest,
             regenerated_from_run_id=regenerated_from_run_id,
+            claimed_by=self._instance_id if reserved_until is not None else None,
+            lease_until=reserved_until,
         )
         await self._store.create(info)
         logger.info("run.enqueue id=%s thread=%s tenant=%s", run_id, thread_id, tenant_id)

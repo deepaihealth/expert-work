@@ -174,7 +174,7 @@ class RunQueueWorker:
     async def run_once(self) -> int:
         """Claim + start one batch of queued runs. Returns how many started."""
         with _bypass_rls():
-            queued = await self._runs.list_queued(limit=self._batch_size)
+            queued = await self._runs.list_queued(limit=self._batch_size, now=datetime.now(UTC))
         started = 0
         for run in queued:
             try:
@@ -281,6 +281,12 @@ class RunQueueWorker:
         ):
             await self._bind_exec_trace(run)
 
+            if (run.enqueued_input or {}).get("use_draft"):
+                # B-139 —— 调试台用草稿跑、遇到忙会话排在后面的那一轮,本该由持着
+                # 连接的副本执行(草稿只在那条请求里构建过)。走到这里说明那台副本
+                # 没了;按线上版本重建会跑错版本,收成失败,不冒充草稿。
+                await self._fail(run, reason="draft_run_lost")
+                return
             meta = await self._threads.get(run.thread_id, tenant_id=run.tenant_id)
             if meta is None or meta.agent_name is None or meta.agent_version is None:
                 await self._fail(run, reason="no_agent")

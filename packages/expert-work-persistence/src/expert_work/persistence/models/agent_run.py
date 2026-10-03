@@ -140,6 +140,15 @@ class AgentRunRow(Base):
             "status",
             postgresql_where=text("status IN ('pending', 'running')"),
         ),
+        # B-139 —— 「同会话里有没有更早的忙 run」(接单与后台队列领取都要问);
+        # 上面那条不含 ``queued``。迁移 0160。
+        Index(
+            "ix_agent_run_thread_busy",
+            "thread_id",
+            "created_at",
+            "id",
+            postgresql_where=text("status IN ('pending', 'queued', 'running')"),
+        ),
         # Stream 9.4 — the orphan sweep scans running runs by lease deadline.
         Index(
             "ix_agent_run_lease_sweep",

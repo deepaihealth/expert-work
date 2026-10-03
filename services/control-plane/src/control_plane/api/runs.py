@@ -26,10 +26,9 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Sequence
-from contextlib import nullcontext
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID, uuid4
 
@@ -85,6 +84,13 @@ from control_plane.tenant_scope import (
     ensure_tenant_scope,
 )
 from control_plane.tenant_status import TenantStatusService
+from control_plane.thread_queue import (
+    THREAD_QUEUE_FULL,
+    Admission,
+    ThreadQueueFullError,
+    admit,
+    queued_turn_stream,
+)
 from control_plane.transcript import extract_turns, read_messages
 from control_plane.turn_inputs import resolve_turn_inputs
 from expert_work.common.conversation_channel import SUPERSEDED_AT, SUPERSEDED_BY, is_hidden
@@ -120,7 +126,14 @@ from expert_work.protocol import (
 from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.protocol.multimodal import parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunEventStore, RunStore
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    InterruptReason,
+    RunEventStore,
+    RunInfo,
+    RunRecord,
+    RunStore,
+)
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES, RunStatus
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import (
@@ -133,6 +146,7 @@ from orchestrator import (
     sse_consumer,
 )
 from orchestrator.multimodal import image_ref_block
+from orchestrator.sse import end_frame_data, format_sse
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
 
 logger = logging.getLogger("expert_work.control_plane.runs")
@@ -1288,16 +1302,39 @@ async def spawn_run(
     # P-1 —— supersede 与建行必须在同一把 per-thread 锁里(spec §8-4):queue worker
     # 只认已存在的 QUEUED 行,行在 supersede 全部写完之后才 INSERT,worker 抢不到
     # 「标记未落、run 已跑」的窗口;两副本并发 supersede 同一轮,后进的锁内看到
-    # 已链接的后继 → 409。没有 supersede 时 nullcontext,原路径一字节不变。
+    # 已链接的后继 → 409。
+    #
+    # B-139 —— 这把锁现在是**会话接单锁**,每一轮都拿:锁里读库判断会话忙不忙,
+    # 两个同时打到空闲会话的请求只有一个看到「空闲」,另一个看到前一个刚写的行、
+    # 去排队。与 supersede 同一把(classid 8620):重新生成本来就在锁里查忙,两件事
+    # 必须互斥,用两把锁会互相等。
     state = request.app.state
-    lock = (
-        supersede_thread_lock(state.session_factory, thread_id)
-        if supersede is not None
-        else nullcontext()
-    )
-    async with lock:
+    store = runtime.run_manager.store
+    queued_behind: Admission | None = None
+    run_record: RunRecord | None = None
+    async with supersede_thread_lock(state.session_factory, thread_id):
         replay_messages: tuple[BaseMessage, ...] | None = None
         regenerated_from: UUID | None = None
+        if supersede is None and store is not None:
+            try:
+                admission = await admit(store, thread_id=thread_id, tenant_id=tenant_id)
+            except ThreadQueueFullError:
+                logger.info("control_plane.run.thread_queue_full thread_id=%s", thread_id)
+                if envelope:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "success": False,
+                            "data": None,
+                            "error": {
+                                "code": THREAD_QUEUE_FULL,
+                                "message": ThreadQueueFullError.message,
+                            },
+                        },
+                    )
+                raise HTTPException(status_code=409, detail=ThreadQueueFullError.message) from None
+            if admission.busy:
+                queued_behind = admission
         if supersede is not None:
             result = await supersede_run(
                 graph=built.graph,
@@ -1331,8 +1368,42 @@ async def spawn_run(
             on_behalf_of=on_behalf_of,
         )
 
+        # B-139 —— 流式请求遇到忙会话:按排队写库,但预订给本副本 —— 这条连接
+        # 在本进程,逐字输出也只在执行它的进程里有。轮到了由下面的
+        # ``queued_turn_stream`` 领走执行;本副本挂了,预订过期后后台队列接手
+        # (从 ``enqueued_input`` 重建,所以这里写的和 queue 模式是同一份)。
+        if payload.mode != "queue" and queued_behind is not None:
+            follower_input: dict[str, Any] = {
+                "input": payload.input,
+                "image_refs": payload.image_refs,
+                "untrusted_content": payload.untrusted_content,
+                "inputs": payload.inputs,
+                "document_names": payload.document_names,
+            }
+            if payload.use_draft:
+                # 草稿只在这条请求里构建过;后台队列按线上版本重建会跑错版本,
+                # 它看到这个标记就收成失败,不替草稿跑线上版。
+                follower_input["use_draft"] = True
+            await runtime.run_manager.enqueue(
+                run_id=run_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                user_id=effective_user_id,
+                enqueued_input=follower_input,
+                is_resume=bool(prior_runs),
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                on_disconnect=on_disconnect,
+                reserved_until=datetime.now(UTC)
+                + timedelta(seconds=runtime.run_manager.lease_ttl_s),
+            )
+            logger.info(
+                "control_plane.run.queued_behind run_id=%s ahead=%d", run_id, queued_behind.ahead
+            )
+
         # Stream 9.5 — queue mode: persist as ``queued`` + return 202.
-        if payload.mode == "queue":
+        elif payload.mode == "queue":
             enqueued_input: dict[str, Any] = {
                 "input": payload.input,
                 "image_refs": payload.image_refs,
@@ -1370,18 +1441,156 @@ async def spawn_run(
                 content = {"success": True, "data": content, "error": None}
             return JSONResponse(status_code=202, content=content)
 
-        run_record = await runtime.run_manager.create(
-            run_id=run_id,
+        else:
+            run_record = await runtime.run_manager.create(
+                run_id=run_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                user_id=effective_user_id,
+                on_disconnect=on_disconnect,
+                is_resume=bool(prior_runs),
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                regenerated_from_run_id=regenerated_from,
+            )
+
+    async def _start(record: RunRecord) -> None:
+        await _start_run(
+            run_record=record,
+            runtime=runtime,
+            audit=audit,
+            approvals=approvals,
+            built=built,
+            record_spec=record_spec,
+            record_spec_sha256=record_spec_sha256,
             thread_id=thread_id,
             tenant_id=tenant_id,
-            user_id=effective_user_id,
-            on_disconnect=on_disconnect,
-            is_resume=bool(prior_runs),
-            trace_id=trace_id,
-            idempotency_key=idempotency_key,
-            request_digest=request_digest,
-            regenerated_from_run_id=regenerated_from,
+            effective_user_id=effective_user_id,
+            oauth_subject=oauth_subject,
+            payload=payload,
+            replay_messages=replay_messages,
+            inputs=inputs,
         )
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "X-Expert-Work-Run-Id": str(run_id),
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    def _consume(run_record: RunRecord) -> AsyncIterator[bytes]:
+        return sse_consumer(
+            bridge=runtime.stream_bridge,
+            record=run_record,
+            run_manager=runtime.run_manager,
+            is_disconnected=request.is_disconnected,
+            last_event_id=request.headers.get("Last-Event-ID"),
+            hide_events=hide_events,
+            stream_format=stream_format,
+            # B-52 —— end 帧带本 run 的用量;装配与口径在 ``_run_usage``。
+            load_usage=make_usage_loader(
+                usage=request.app.state.token_usage_store,
+                runs=request.app.state.run_store,
+                run_id=run_record.run_id,
+                tenant_id=tenant_id,
+            ),
+        )
+
+    if queued_behind is not None:
+        if store is None:  # admission only runs with a durable store
+            raise RuntimeError("queued turn without a durable RunStore")
+        durable = store
+
+        async def _launch(claimed: RunInfo) -> AsyncIterator[bytes]:
+            # 出队这一侧再收口一次(与 RunQueueWorker 同一口径):排队期间上一轮
+            # 可能停在了审批上,那条审批只有这里能作废。失败就收成 error,不留
+            # 一行没有执行者的 running。
+            try:
+                await close_previous_turn(
+                    graph=built.graph,
+                    thread_id=thread_id,
+                    tenant_id=tenant_id,
+                    new_run_id=run_id,
+                    approvals=approvals,
+                    run_manager=runtime.run_manager,
+                    audit=audit,
+                    actor_id=actor_id,
+                    trace_id=trace_id,
+                    on_behalf_of=on_behalf_of,
+                )
+            except Exception:
+                logger.exception("control_plane.run.queued_close_previous_failed run_id=%s", run_id)
+                now = datetime.now(UTC)
+                await durable.set_status(
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    status=RunStatus.ERROR,
+                    updated_at=now,
+                    error="queued run could not start: previous_turn_unsettled",
+                    finished_at=now,
+                )
+                return _one_frame(format_sse("end", end_frame_data(run_id=run_id, status="error")))
+            adopted = await runtime.run_manager.adopt(
+                run_id=claimed.run_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                user_id=effective_user_id,
+            )
+            adopted.on_disconnect = on_disconnect
+            adopted.is_resume = bool(prior_runs)
+            await _start(adopted)
+            return _consume(adopted)
+
+        return StreamingResponse(
+            queued_turn_stream(
+                store=durable,
+                run_id=run_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                owner=runtime.run_manager.instance_id,
+                lease_ttl_s=runtime.run_manager.lease_ttl_s,
+                ahead=queued_behind.ahead,
+                launch=_launch,
+                is_disconnected=request.is_disconnected,
+                cancel_on_disconnect=on_disconnect is DisconnectMode.CANCEL,
+            ),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+
+    if run_record is None:  # the non-queued stream branch always creates it
+        raise RuntimeError("stream run was not registered")
+    await _start(run_record)
+    return StreamingResponse(_consume(run_record), media_type="text/event-stream", headers=headers)
+
+
+async def _one_frame(frame: bytes) -> AsyncIterator[bytes]:
+    yield frame
+
+
+async def _start_run(
+    *,
+    run_record: RunRecord,
+    runtime: AgentRuntime,
+    audit: AuditLogger,
+    approvals: ApprovalStore,
+    built: BuiltAgent,
+    record_spec: AgentSpec,
+    record_spec_sha256: str,
+    thread_id: UUID,
+    tenant_id: UUID,
+    effective_user_id: UUID | None,
+    oauth_subject: str,
+    payload: RunRequest,
+    replay_messages: tuple[BaseMessage, ...] | None,
+    inputs: dict[str, Any] | None,
+) -> None:
+    """建好输入与配置、起 ``run_agent``。B-139 抽出来:立即执行与排队轮到后执行
+    走同一份,``deadline_at`` 从**真正开跑**那一刻算。"""
+    run_id = run_record.run_id
     # 只有 stream 分支记:上面的 queue 分支入队就返回,``built`` 直接丢掉,
     # 真正的构建晚一步发生在 RunQueueWorker 里(那边自己记)。
     await bind_exec_spec(
@@ -1459,34 +1668,6 @@ async def spawn_run(
     )
     await runtime.run_manager.attach_task(run_id, worker)
     logger.info("control_plane.run.started run_id=%s", run_id)
-
-    headers = {
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-        "X-Expert-Work-Run-Id": str(run_id),
-    }
-    if extra_headers:
-        headers.update(extra_headers)
-    return StreamingResponse(
-        sse_consumer(
-            bridge=runtime.stream_bridge,
-            record=run_record,
-            run_manager=runtime.run_manager,
-            is_disconnected=request.is_disconnected,
-            last_event_id=request.headers.get("Last-Event-ID"),
-            hide_events=hide_events,
-            stream_format=stream_format,
-            # B-52 —— end 帧带本 run 的用量;装配与口径在 ``_run_usage``。
-            load_usage=make_usage_loader(
-                usage=request.app.state.token_usage_store,
-                runs=request.app.state.run_store,
-                run_id=run_record.run_id,
-                tenant_id=tenant_id,
-            ),
-        ),
-        media_type="text/event-stream",
-        headers=headers,
-    )
 
 
 def build_runs_router() -> APIRouter:

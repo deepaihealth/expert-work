@@ -17,6 +17,7 @@
 | `2db9ebbd` #1714、`da500b0e` #1715 | admin-ui 依赖:lucide-react / react-i18next / vitest;安全覆盖 moment 2.31.0(随 antd 日期控件进浏览器)、dompurify 3.4.16(随 monaco 编辑器与文档站进浏览器)、undici、brace-expansion | 是 | §4 |
 | #1724 | B-149 数据标记保留换行与缩进;`edit_file` 去标记符兜底 | 是 | §5 |
 | #1725 | B-137 `edit_file` 一次改多处 / 全部替换;不再让模型传哈希 | 是 | §6 |
+| #1727 | B-139 同一会话的多轮串行执行(排队);新迁移 `0160` | 是 | §7 |
 | `5c583c69` #1675 | CI 的 codeql upload-sarif | 否 | — |
 | 其余 | 文档(ROADMAP / 执行单) | 否 | — |
 
@@ -80,3 +81,19 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [ ] **6.3 一项对不上什么都不写**:叫模型一次改两处,其中一处写一个文件里不存在的原文(提示词里直接给它错的原文)。判据:报错以 `edit_file failed: edit 2 of 2: no_match` 开头;文件内容与改之前逐字节相同(读出来比)。
 - [ ] **6.4 改已有文件不再整篇重写**:ai-health-plan 一次真实的「改一下上一轮的方案」对话。判据:修改走 `edit_file`(多处时带 `edits`),而不是 `write_file` 整篇重写同一文件;记下 `write_file` 次数与改动字符,与 B-137 立项时的数据对比写进 ROADMAP。
 - [ ] **6.5 哈希不再造成假失败**:统一发测试后一周,按 B-149 设计稿 §1.3 的口径重量 `edit_file` 失败。判据:`stale` 不再出现长度不对的哈希造成的失败(看 `expected_hash_ignored` 的次数,对应失败数应为 0)。
+
+## §7 B-139 同一会话串行执行(ROADMAP B-139)
+
+**前置**:本批带迁移 `0160_agent_run_thread_busy`(只加一个索引),发布时随 `release.sh test` 的迁移步骤执行;发完先确认 `alembic current` 是 0160。
+
+判据看 `agent_run` 两行的 `status` / `created_at` / `finished_at`,开始时间取该 run 在 `run_event` 里第一帧(`metadata`)的时间(`agent_run` 没有开始时间列),再加流里收到的事件。
+
+- [ ] **7.1 控制台连发两条**:调试台或对话页里,第一条还在跑时立刻发第二条。判据:第二条显示「排队中」(收到 `queued` 帧);第一条结束后第二条自动开始;会话历史里两轮都在、顺序正确。**没修好时**:两轮同时跑,其中一轮的对话从历史里消失。
+- [ ] **7.2 对外接口连续两个流式请求**:同一个 `session_id`,第一个还在跑时发第二个。判据:第二个连接先收到 `event: queued`(`ahead` 为 1),之后是完整的 `metadata` … `end`;第二个 run 的开始时间晚于第一个的 `finished_at`。
+- [ ] **7.3 `mode=queue` 连续两个**:判据:两个都 202;第二个在第一个结束之后才开始(看两行时间)。
+- [ ] **7.4 排队中取消**:第二轮排队时对它调 `:cancel`。判据:它结束为 `interrupted`,从未开始执行(无 `metadata`、无 token 用量);第二轮的流以 `status: interrupted` 的 `end` 收尾。
+- [ ] **7.5 控制台排队时关页面**:判据:排队中的那一轮被取消(`interrupted`,原因 `client_disconnect`),不会在后台跑起来。
+- [ ] **7.6 对外排队时断开**:对外流式请求排队时断开连接。判据:那一轮仍在第一轮结束后执行完(`success`),用 `/events` 能读到它的事件。
+- [ ] **7.7 排满**:同一会话连发 4 轮(前 3 轮排着)。判据:第 4 轮 409 `THREAD_QUEUE_FULL`,库里没有多出第 4 行。
+- [ ] **7.8 执行第一轮的 pod 被删**:第一轮跑的时候删掉执行它的 control-plane pod。判据:第一轮由孤儿重收接着跑完,第二轮随后执行;两轮都在历史里。(先起 `kubectl logs -f` 落文件再删 pod。)
+- [ ] **7.9 金丝雀 PASS**,smoke 全过。
