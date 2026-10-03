@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
+import anyio
 import pytest
 
+from control_plane import thread_queue
 from control_plane.thread_queue import (
     MAX_QUEUED_PER_THREAD,
     ThreadQueueFullError,
@@ -148,6 +152,11 @@ class _Harness:
         return row
 
 
+async def _cleanup_done() -> None:
+    """断开清理在独立任务里跑(见 ``thread_queue._spawn_cleanup``),等它跑完再断言。"""
+    await asyncio.gather(*list(thread_queue._CLEANUP_TASKS))
+
+
 @pytest.mark.asyncio
 async def test_waits_for_the_leader_then_runs_here() -> None:
     h = _Harness()
@@ -196,9 +205,69 @@ async def test_console_disconnect_while_waiting_cancels_the_turn() -> None:
     h.disconnected = True
 
     _ = [f async for f in h.stream(cancel_on_disconnect=True)]
+    await _cleanup_done()
 
     assert h.launched == []
     assert (await h.row()).status is RunStatus.INTERRUPTED
+
+
+class _IOStore(InMemoryRunStore):
+    """写入前先让出一次事件循环,像真的数据库 I/O 一样 —— 内存店的写入从不挂起,
+    取消落不到它头上,测不出「清理被取消」。"""
+
+    async def request_cancel(self, **kw: Any) -> bool:
+        await asyncio.sleep(0)
+        return await super().request_cancel(**kw)
+
+    async def release_queued_reservation(self, **kw: Any) -> None:
+        await asyncio.sleep(0)
+        await super().release_queued_reservation(**kw)
+
+
+async def _stream_cancelled_like_starlette(h: _Harness, *, cancel_on_disconnect: bool) -> None:
+    """客户端断开时 Starlette 不是等 ``is_disconnected`` 变真,而是**取消**整条响应
+    (anyio 的取消:同一作用域里之后的每个 await 都会再被取消)。真栈上控制台点
+    「取消排队」后,排队那一轮没被取消、30 秒后预订过期照样跑完,就是这条路。"""
+
+    async def poll(_: float) -> None:
+        await asyncio.sleep(0.01)
+
+    async def consume() -> None:
+        async for _ in h.stream(cancel_on_disconnect=cancel_on_disconnect, sleep=poll):  # type: ignore[arg-type]
+            pass
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(consume)
+        await asyncio.sleep(0.05)  # 已发出 queued 帧、正在等上一轮
+        tg.cancel_scope.cancel()
+    await _cleanup_done()
+
+
+@pytest.mark.asyncio
+async def test_console_disconnect_cancels_the_waiting_turn_when_cancelled() -> None:
+    h = _Harness()
+    h.store = _IOStore()
+    await h.setup()
+
+    await _stream_cancelled_like_starlette(h, cancel_on_disconnect=True)
+
+    row = await h.row()
+    assert row.status is RunStatus.INTERRUPTED
+    assert row.error == "client_disconnect"
+    assert h.launched == []
+
+
+@pytest.mark.asyncio
+async def test_external_disconnect_releases_the_reservation_when_cancelled() -> None:
+    h = _Harness()
+    h.store = _IOStore()
+    await h.setup()
+
+    await _stream_cancelled_like_starlette(h, cancel_on_disconnect=False)
+
+    row = await h.row()
+    assert row.status is RunStatus.QUEUED
+    assert row.claimed_by is None
 
 
 @pytest.mark.asyncio
@@ -209,6 +278,7 @@ async def test_external_disconnect_hands_the_turn_to_the_queue_worker() -> None:
     h.disconnected = True
 
     _ = [f async for f in h.stream(cancel_on_disconnect=False)]
+    await _cleanup_done()
 
     row = await h.row()
     assert row.status is RunStatus.QUEUED

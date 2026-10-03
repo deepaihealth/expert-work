@@ -127,6 +127,18 @@ function turnWithSystem(key: string, text: string): ConsoleTurn {
 }
 
 describe("buildLedger", () => {
+  it("a tool record's one-line result drops the ▁ datamark glyph (B-149 live test)", () => {
+    const events = [
+      upd("agent", { step_count: 1, _duration_ms: 10, messages: [{
+        type: "ai", content: "", tool_calls: [call("r1", "read_file", { path: "big.txt" })],
+      }] }, 1000),
+      upd("tools", { messages: [result("r1", "read_file", 5, "«UNTRUSTED nonce=ab12»\nline▁ 0001▁ xxxx\nline▁ 0002\n«/UNTRUSTED nonce=ab12»")] }, 1100),
+    ];
+    const turn = turnOf({ key: "G", seq: 0, turn: { id: "G", input: "读", attachments: [], inputs: {}, events, status: "done", error: null, approval: null } });
+    const tool = buildLedger({ turns: [turn], streamTurnKey: null, nowMs: NOW }).records.find((r) => r.kind === "tool");
+    expect(tool?.resultText).toBe("line 0001 xxxx");
+  });
+
   it("records are in turn order with turnStart/turnEnd and 0-based index", () => {
     const ledger = build();
     expect(ledger.records.map((r) => r.id)).toEqual([

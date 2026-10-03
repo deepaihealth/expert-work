@@ -9,6 +9,7 @@
  */
 import i18n from "../../i18n";
 import { ledgerRowsOf, type TrajectoryInput, type TrajectoryRow } from "../../api/trajectory_rows";
+import { cleanUntrusted } from "../../pages/agent_detail/playground/untrusted_clean";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import { absoluteSpans } from "./ledger_timing";
 import { liveLedgerRows } from "./live_rows";
@@ -86,7 +87,11 @@ function contentOf(row: TrajectoryRow): { text: string; resultText: string | nul
     case "tool":
       return {
         text: `${row.entry.toolName} ${JSON.stringify(row.entry.args)}`.slice(0, TOOL_TEXT_MAX),
-        resultText: firstLineOrNull(row.entry.resultPreview),
+        // 预览只剥了围栏,▁ 还在(``ToolTimeline`` 拿它当「来自不可信内容」的
+        // 证据);一行摘要是给人看的,和展开后的全文一样去掉。
+        resultText: firstLineOrNull(
+          row.entry.resultPreview === null ? null : cleanUntrusted(row.entry.resultPreview).text,
+        ),
       };
     case "plan": {
       const name = row.source === "update_plan" ? "update_plan" : "planner";
