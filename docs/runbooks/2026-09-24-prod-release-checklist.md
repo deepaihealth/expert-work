@@ -827,6 +827,41 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
       期望 `True False`（新文案在、旧文案「技能文档里的 `npm install`」不在）。
       过了就把 ROADMAP B-119 销案。
+- [ ] **B-154 清掉 ClickHouse 的旧日志表**（本版新增，2026-10-03 加入）。本版给 Langfuse 的
+      ClickHouse 加了 `system-logs.xml`（系统日志 7 天 TTL、级别降到 warning、关掉两张诊断表）。
+      ClickHouse 换配置后第一次启动会把每张旧日志表改名成 `<表名>_0` 留着、另建新表 ——
+      **旧表永远不会自己清掉**，发完要手工删一次。只删 `system` 库里的日志表，不碰 Langfuse
+      的 `default` 库（traces / observations 在那里）。
+
+      ```sh
+      CH='clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD"'
+      kubectl -n expert-work exec langfuse-clickhouse-0 -- df -h /var/lib/clickhouse   # 发前值留档
+      # 1) 列出要删的表（只读）
+      kubectl -n expert-work exec -i langfuse-clickhouse-0 -- sh -c "$CH" <<'SQL'
+      SELECT name, formatReadableSize(total_bytes) FROM system.tables
+      WHERE database = 'system'
+        AND (match(name, '_log_[0-9]+$') OR name IN ('processors_profile_log', 'opentelemetry_span_log'))
+      FORMAT TSV
+      SQL
+      # 2) 逐张删（上一步列出的那些；名字都以 _log_0 结尾，外加两张关掉的诊断表）
+      for t in $(kubectl -n expert-work exec -i langfuse-clickhouse-0 -- sh -c "$CH" <<'SQL'
+      SELECT name FROM system.tables
+      WHERE database = 'system'
+        AND (match(name, '_log_[0-9]+$') OR name IN ('processors_profile_log', 'opentelemetry_span_log'))
+      FORMAT TSV
+      SQL
+      ); do
+        kubectl -n expert-work exec langfuse-clickhouse-0 -- sh -c "$CH -q 'DROP TABLE system.$t SYNC'"
+      done
+      kubectl -n expert-work exec langfuse-clickhouse-0 -- df -h /var/lib/clickhouse   # 发后值
+      ```
+
+      期望：第 1 步列出的全是 `system` 库的 `*_log_0` 加那两张诊断表；删完 `df` 明显下降。
+      盘已经 100% 满也能删（测试环境 10-03 实测：满盘时 `TRUNCATE` 报 `NOT_ENOUGH_SPACE`，
+      `DROP TABLE … SYNC` 成功）。
+- [ ] **B-153 / B-154 Langfuse 真有数据**：金丝雀跑完后，Langfuse 控制台按时间倒序看 Traces，
+      最新一条应在几分钟内，点开有 GENERATION、带输入输出和 token 用量。
+      没有就看 `kubectl -n expert-work logs deploy/langfuse-worker --since=10m | grep -iE 'not enough space|Dropping record'`。
 
 ### Step A2 — 导入 office 技能（docx / pptx / xlsx / pdf，本版新增）
 

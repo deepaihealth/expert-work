@@ -22,6 +22,7 @@
 | #1731 | B-151 定时任务结果写回原会话时,原会话有一轮没结束(或停在审批上)就推迟,等它结束再写 | 是 | §9 |
 | #1732 | 10-03 首轮真栈发现的两处:排队那一轮断开时的清理被取消(控制台「取消排队」取消不掉、对外断开放不掉预订);控制台工具一行摘要里残留 `▁` | 是 | §5.2、§7.5、§8.2 复验 |
 | #1733 | B-153 Langfuse 从 08-20 起收不到数据(SDK 4.x 去掉了 `start_generation`) | 是 | §2.4 复验 |
+| #PRCH | B-154 Langfuse 的 ClickHouse 系统日志表无保留期、把数据盘写满(Langfuse 写入被静默丢弃);加 7 天 TTL + 降日志级别 + smoke 磁盘告警 | 是 | §2.5 |
 | `5c583c69` #1675 | CI 的 codeql upload-sarif | 否 | — |
 | 其余 | 文档(ROADMAP / 执行单) | 否 | — |
 
@@ -45,7 +46,8 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [ ] **2.1** smoke 全过 + 金丝雀 PASS(带跨厂商备用)。
 - [ ] **2.2 检查点续跑**:跑一个会触发审批的 run,批准后续跑完成(langgraph 检查点读写)。
 - [ ] **2.3 委派**:跑一次会派 worker 的 run,worker 正常返回(子图)。
-- [ ] **2.4 链路追踪**:上面任一 run 在 Langfuse(langfuse-test)能看到完整 trace,LLM span 有输入输出与 token 数;调试台 trace 瀑布正常展开。**10-03 首轮(`d0342507`)不过**:Langfuse 08-21 之后 0 条 trace,根因见 ROADMAP B-153,#1733 修。复验:发测试后跑一轮,`agent_run.trace_id` 在 Langfuse `/api/public/traces/{id}` 能取到,带 GENERATION 观测(有输入输出与 token 数);control-plane 日志不再出现 `langfuse.start_span_failed`。
+- [x] **2.4 链路追踪**:上面任一 run 在 Langfuse(langfuse-test)能看到完整 trace,LLM span 有输入输出与 token 数;调试台 trace 瀑布正常展开。**10-03 首轮(`d0342507`)不过**:Langfuse 08-21 之后 0 条 trace,根因见 ROADMAP B-153,#1733 修。复验:发测试后跑一轮,`agent_run.trace_id` 在 Langfuse `/api/public/traces/{id}` 能取到,带 GENERATION 观测(有输入输出与 token 数);control-plane 日志不再出现 `langfuse.start_span_failed`。 **10-03 二轮(`52d92f60`)过**:`start_span_failed` 归零,但 ClickHouse 盘 100% 满、worker 把写入丢了(B-154);手工清掉系统日志表后,run `71134169` 的 trace 在 Langfuse 取得到,1 条 GENERATION,有输入输出与 token 数。
+- [ ] **2.5 ClickHouse 系统日志有保留期(#PRCH)**:发测试后 ① `system.tables` 里 `query_log` / `text_log` / `metric_log` 等的 `engine_full` 含 `TTL`,`text_log` 新行只有 `Warning` 及以上;② 按生产执行单 Step C「B-154 清掉 ClickHouse 的旧日志表」原样跑一遍,`*_log_0` 与两张诊断表删掉、`df` 下降;③ smoke 输出里有 `OK   clickhouse data disk N% used`;④ 之后再跑一轮 run,Langfuse 照样有 trace。
 
 ## §3 沙箱镜像依赖(#1713)
 
