@@ -12,7 +12,8 @@ data flow needs no extra code.
 
 Each LLM call maps to a Langfuse *generation* (the LLM-typed
 observation, so token usage and model cost land in Langfuse's
-accounting) — created un-nested via ``start_generation``; submission is
+accounting) — created un-nested via ``start_observation(as_type="generation")``
+(langfuse 4.x; 3.x's ``start_generation`` is gone); submission is
 the SDK's own bounded background queue, matching the protocol's
 "must not block" contract. Failures are already fail-soft at the
 middleware layer; this module adds no second try/except blanket.
@@ -99,8 +100,12 @@ class LangfuseSdkClient:
     ) -> _SdkSpan:
         meta = dict(metadata or {})
         model = meta.get("model")
-        generation = self._sdk.start_generation(
+        # langfuse 4.x removed ``start_generation``; a generation is now an
+        # observation of type "generation" (same LLM-typed record, same
+        # update / end handle).
+        generation = self._sdk.start_observation(
             name=name,
+            as_type="generation",
             input=input,
             metadata=meta,
             model=str(model) if model is not None else None,
