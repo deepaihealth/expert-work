@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { buildConsoleTurns, statsInputOf } from "../console_turns";
+import type { SseEvent } from "../../../api/sessions";
+import type { Turn } from "../../turn/types";
+import { buildConsoleTurns, isQueuedTurn, statsInputOf } from "../console_turns";
 
 const meta = (runId: string) => ({ id: "1", event: "metadata", data: { run_id: runId }, rawData: "", receivedAt: "" });
 
@@ -209,5 +211,61 @@ describe("P-1 被取代 / 墓碑标记的投影", () => {
       ["h2", null, false],
       ["L1", null, false],
     ]);
+  });
+});
+
+describe("B-139 排队中的轮次", () => {
+  const queuedFrame = { id: null, event: "queued", data: { run_id: "r9", ahead: 1 }, rawData: "", receivedAt: "" };
+  const hist = (runId: string, status: string) => ({
+    key: runId, input: "q", fallbackLines: [], runId, status, tokens: null, createdAt: null,
+    finishedAt: null, runError: null, supersededBy: null, tombstone: false, platformLines: [],
+  });
+  const live = (events: SseEvent[], status: Turn["status"] = "running"): Turn => ({
+    id: "l1", input: "q", attachments: [], events, status, error: null, approval: null,
+  });
+
+  it("isQueuedTurn: 没有 metadata 帧,且有 queued 帧或 run 行是 queued", () => {
+    expect(isQueuedTurn([queuedFrame], null)).toBe(true);
+    expect(isQueuedTurn([], "queued")).toBe(true);
+    expect(isQueuedTurn([queuedFrame, meta("r9")], null)).toBe(false);
+    expect(isQueuedTurn([meta("r9")], "queued")).toBe(false);
+    expect(isQueuedTurn([], "running")).toBe(false);
+    expect(isQueuedTurn([], null)).toBe(false);
+    // 排队中被取消 / 失败的一轮从没开始:只有 end,没有 metadata。
+    expect(isQueuedTurn([{ ...queuedFrame, event: "end", data: { status: "interrupted" } }], "queued")).toBe(false);
+  });
+
+  it("live 轮:收到 queued 帧时排队,开始执行(metadata)后不再排队,结束了也不算排队", () => {
+    const build = (turn: Turn) =>
+      buildConsoleTurns({ historyTurns: null, historyLoads: {}, liveTurns: [turn], timings: {} })[0];
+    expect(build(live([queuedFrame])).queued).toBe(true);
+    expect(build(live([queuedFrame, meta("r9")])).queued).toBe(false);
+    expect(build(live([queuedFrame], "interrupted")).queued).toBe(false);
+    expect(build(live([])).queued).toBe(false);
+  });
+
+  it("历史轮:run 行 queued 时排队;实时跟读收到 metadata 就翻过来,不等刷新;在跑的那一轮不算", () => {
+    const out = buildConsoleTurns({
+      historyTurns: [hist("r1", "running"), hist("r2", "queued"), hist("r3", "queued")],
+      historyLoads: {
+        r1: { state: "live", events: [] },
+        r2: { state: "pending", events: [] },
+        r3: { state: "live", events: [meta("r3")] },
+      },
+      liveTurns: [],
+      timings: {},
+    });
+    expect(out.map((t) => t.queued)).toEqual([false, true, false]);
+  });
+
+  it("历史轮:排队中被取消、run 行还没刷新(仍是 queued)—— 跟读收到 end 就不再显示排队", () => {
+    const end = { id: "2", event: "end", data: { status: "interrupted" }, rawData: "", receivedAt: "" };
+    const out = buildConsoleTurns({
+      historyTurns: [hist("r2", "queued")],
+      historyLoads: { r2: { state: "done", events: [end] } },
+      liveTurns: [],
+      timings: {},
+    });
+    expect(out[0].queued).toBe(false);
   });
 });

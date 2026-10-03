@@ -58,4 +58,7 @@ export interface ConsoleTurn {
   /** P-1 —— 这一轮的消息正文已清理(被取代的老版本超出保留份数);live turns
    *  恒 ``false``。 */
   tombstone: boolean;
+  /** B-139 —— 这一轮在排队:会话里上一轮还没结束,它还没开始执行(见
+   *  ``isQueuedTurn``)。``buildConsoleTurns`` 总会填;缺省 = 没在排队。 */
+  queued?: boolean;
 }

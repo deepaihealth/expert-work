@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { InternalAxiosRequestConfig } from "axios";
 
 import { apiClient } from "../client";
-import { listSessions, parseSseStream } from "../sessions";
+import { listSessions, parseSseStream, streamRun, THREAD_QUEUE_FULL } from "../sessions";
 
 function streamOf(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -111,5 +111,28 @@ describe("listSessions order_by", () => {
     calls = captureAdapter();
     await listSessions();
     expect(calls[0].params?.order_by).toBeUndefined();
+  });
+});
+
+describe("streamRun error replies", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("B-139: a structured 409 surfaces as 'CODE: message' — the playground keys off the code", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            detail: { code: THREAD_QUEUE_FULL, message: "this session already has 3 turns waiting" },
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    await expect(collect(streamRun("t1", { input: "x" }))).rejects.toThrow(
+      `${THREAD_QUEUE_FULL}: this session already has 3 turns waiting`,
+    );
   });
 });

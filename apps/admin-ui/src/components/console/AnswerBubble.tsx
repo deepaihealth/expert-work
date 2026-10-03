@@ -37,9 +37,17 @@ export interface AnswerBubbleProps {
   /** 流式:当前未落地步的 content(打字机);settled 或历史轮 undefined。 */
   liveText?: string;
   onDownloadArtifact: (name: string) => Promise<void>;
+  /** B-139 —— 排队中这一轮的「取消排队」;不传 = 不出按钮(只读视图)。 */
+  onCancelQueued?: () => void;
 }
 
-export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: AnswerBubbleProps) {
+export function AnswerBubble({
+  turn,
+  summary,
+  liveText,
+  onDownloadArtifact,
+  onCancelQueued,
+}: AnswerBubbleProps) {
   const { t } = useTranslation();
   const status = turn.turn.status;
   const segments = summary.segments;
@@ -96,7 +104,19 @@ export function AnswerBubble({ turn, summary, liveText, onDownloadArtifact }: An
         />
       )}
 
-      {showAnswerBlock ? (
+      {turn.queued ? (
+        <div
+          style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
+          data-testid="console-turn-queued"
+        >
+          <Text style={{ fontSize: 13 }}>{t("playground.turn_queued")}</Text>
+          {onCancelQueued && (
+            <Button size="small" onClick={onCancelQueued} data-testid="console-cancel-queued">
+              {t("playground.cancel_queued")}
+            </Button>
+          )}
+        </div>
+      ) : showAnswerBlock ? (
         <>
           <div
             ref={answerScrollRef}

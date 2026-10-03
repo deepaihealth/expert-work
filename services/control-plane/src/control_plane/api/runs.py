@@ -1332,7 +1332,12 @@ async def spawn_run(
                             },
                         },
                     )
-                raise HTTPException(status_code=409, detail=ThreadQueueFullError.message) from None
+                # 控制台按 ``detail.code`` 认错误(``streamRun``),纯字符串 detail
+                # 在那边只剩「HTTP_409」。
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": THREAD_QUEUE_FULL, "message": ThreadQueueFullError.message},
+                ) from None
             if admission.busy:
                 queued_behind = admission
         if supersede is not None:

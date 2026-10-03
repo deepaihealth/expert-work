@@ -415,6 +415,135 @@ describe("PlaygroundTab", () => {
     expect(streamRunMock.mock.calls[0][1].use_draft).toBe(true);
   });
 
+  it("B-139: a turn the backend queued shows as queued; cancelling it drops the connection", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    let seenSignal: AbortSignal | undefined;
+    streamRunMock.mockImplementation((_thread, _body, opts) => {
+      seenSignal = opts?.signal;
+      return (async function* () {
+        yield {
+          id: null,
+          event: "queued",
+          data: { run_id: "r-q", ahead: 1 },
+          rawData: "",
+          receivedAt: "2026-05-25T00:00:01Z",
+        } as SseEvent;
+        // Held open like the real stream until the turn starts — or the
+        // client disconnects, which on the console plane cancels the turn.
+        await new Promise<never>((_, reject) => {
+          opts?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        });
+      })();
+    });
+    renderPg();
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "second question");
+    await user.click(screen.getByTestId("playground-run"));
+
+    const queued = await screen.findByTestId("console-turn-queued");
+    expect(queued).toHaveTextContent("Queued — starts when the previous turn finishes");
+    await user.click(screen.getByTestId("console-cancel-queued"));
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("console-turn-queued")).not.toBeInTheDocument(),
+    );
+    expect(seenSignal?.aborted).toBe(true);
+    expect(screen.queryByTestId("playground-stop")).not.toBeInTheDocument();
+  });
+
+  it("B-139: a queued stream the server closes without `end` (run claimed elsewhere) is read on from /events", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([
+        {
+          id: null,
+          event: "queued",
+          data: { run_id: "r-q", ahead: 1 },
+          rawData: "",
+          receivedAt: "2026-05-25T00:00:01Z",
+        },
+      ]),
+    );
+    streamRunEventsMock.mockReturnValue(
+      makeStream([
+        { id: "1", event: "metadata", data: { run_id: "r-q" }, rawData: "", receivedAt: "" },
+        {
+          id: "2",
+          event: "updates",
+          data: { agent: { messages: [{ type: "ai", content: "answered elsewhere" }] } },
+          rawData: "",
+          receivedAt: "",
+        },
+        { id: "3", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
+      ]),
+    );
+    renderPg();
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "second question");
+    await user.click(screen.getByTestId("playground-run"));
+
+    const turn = await screen.findByTestId("console-turn");
+    await waitFor(() =>
+      expect(within(turn).getByTestId("playground-turn-answer")).toHaveTextContent(
+        "answered elsewhere",
+      ),
+    );
+    expect(streamRunEventsMock).toHaveBeenCalledWith(
+      sampleThread.thread_id,
+      "r-q",
+      expect.objectContaining({ signal: expect.anything() }),
+    );
+    expect(screen.queryByTestId("console-turn-queued")).not.toBeInTheDocument();
+  });
+
+  it("B-139: a stream that ends normally never reads /events again", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([
+        { id: null, event: "queued", data: { run_id: "r-q", ahead: 1 }, rawData: "", receivedAt: "" },
+        { id: "1", event: "metadata", data: { run_id: "r-q" }, rawData: "", receivedAt: "" },
+        { id: "2", event: "end", data: "ok", rawData: "ok", receivedAt: "" },
+      ]),
+    );
+    renderPg();
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "second question");
+    await user.click(screen.getByTestId("playground-run"));
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("playground-stop")).not.toBeInTheDocument(),
+    );
+    expect(streamRunEventsMock).not.toHaveBeenCalledWith(
+      sampleThread.thread_id,
+      "r-q",
+      expect.anything(),
+    );
+  });
+
+  it("B-139: a full queue (409 THREAD_QUEUE_FULL) reads as an actionable message", async () => {
+    const user = userEvent.setup();
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockImplementation(() =>
+      (async function* () {
+        throw new Error("THREAD_QUEUE_FULL: this session already has 3 turns waiting");
+      })(),
+    );
+    renderPg();
+    await screen.findByTestId("playground-input");
+    await user.type(screen.getByTestId("playground-input"), "fourth");
+    await user.click(screen.getByTestId("playground-run"));
+
+    expect(
+      await screen.findByText(/queue is full\. Wait for a turn to finish/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/THREAD_QUEUE_FULL/)).not.toBeInTheDocument();
+  });
+
   it("streams events from streamRun and renders the answer in the turn block", async () => {
     const user = userEvent.setup();
     createSessionMock.mockResolvedValue(sampleThread);

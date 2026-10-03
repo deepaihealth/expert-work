@@ -47,6 +47,20 @@ export function runIdOf(events: readonly SseEvent[]): string | null {
   return null;
 }
 
+/** B-139 —— 这一轮还在排队:会话里上一轮没结束,它还没开始执行。判据是
+ *  「还没有 ``metadata`` 帧(开始执行的第一帧)也还没有 ``end``」,再加上排队的证据 ——
+ *  live 轮是后端先发的 ``queued`` 帧,历史轮是 run 行的 ``queued`` 状态。
+ *  run 行状态只在刷新时更新,而它的实时跟读一收到 ``metadata`` 就翻过来,
+ *  所以「开始执行」不用等页面刷新。 */
+export function isQueuedTurn(
+  events: readonly SseEvent[],
+  runStatus: string | null,
+): boolean {
+  // ``end`` 也算:排队中被取消 / 失败的一轮从没开始,流里只有 ``end``。
+  if (events.some((e) => e.event === "metadata" || e.event === "end")) return false;
+  return runStatus === "queued" || events.some((e) => e.event === "queued");
+}
+
 /** D-5/D-6 — the last ``approval`` frame in a replayed stream, as the
  *  ``ApprovalItem`` the in-place approve/reject card needs. ``null`` when
  *  the stream carries none (or the frame doesn't parse). */
@@ -131,6 +145,7 @@ export function buildConsoleTurns(args: {
       runError: h.runError,
       supersededBy: h.supersededBy,
       tombstone: h.tombstone,
+      queued: inFlight && isQueuedTurn(load.events, h.status),
     });
     seq += 1;
   }
@@ -154,6 +169,7 @@ export function buildConsoleTurns(args: {
       // P-1 —— 本会话刚跑出来的一轮不可能已经被取代。
       supersededBy: null,
       tombstone: false,
+      queued: turn.status === "running" && isQueuedTurn(turn.events, null),
     });
     seq += 1;
   }

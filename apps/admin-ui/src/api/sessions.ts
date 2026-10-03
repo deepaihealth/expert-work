@@ -326,6 +326,9 @@ export interface SseEvent {
   receivedAt: string;
 }
 
+/** B-139 —— 会话里排队的轮次已满(后端 409 ``detail.code``)。 */
+export const THREAD_QUEUE_FULL = "THREAD_QUEUE_FULL";
+
 /** Yield SSE frames from a control-plane run stream. The caller awaits
  *  the iterator; cancellation flows through ``options.signal``. */
 export async function* streamRun(
