@@ -19,9 +19,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from expert_work.runtime.runs import InterruptReason, RunInfo, RunStatus
@@ -167,12 +168,44 @@ async def queued_turn_stream(
             await sleep(poll_interval_s)
     finally:
         if not launched:
-            if cancel_on_disconnect:
-                await store.request_cancel(
+            # 客户端断开时 Starlette 是**取消**这条响应(anyio:同一作用域里之后的
+            # 每个 await 都会再被取消),所以这里不能原地 await 写库 —— 写不进去,
+            # 控制台的「取消排队」就取消不掉,对外断开也放不掉预订(真栈实测)。
+            # 与 ``orchestrator.sse`` 拆除路径同一做法:交给独立任务。
+            _spawn_cleanup(
+                _leave_queue(
+                    store,
                     run_id=run_id,
                     tenant_id=tenant_id,
-                    updated_at=datetime.now(UTC),
-                    reason=InterruptReason.CLIENT_DISCONNECT.value,
+                    owner=owner,
+                    cancel=cancel_on_disconnect,
                 )
-            else:
-                await store.release_queued_reservation(run_id=run_id, owner=owner)
+            )
+
+
+#: 断开清理的独立任务;留引用,免得任务没跑完就被回收。
+_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _spawn_cleanup(coro: Coroutine[Any, Any, None]) -> None:
+    task = asyncio.create_task(coro)
+    _CLEANUP_TASKS.add(task)
+    task.add_done_callback(_CLEANUP_TASKS.discard)
+
+
+async def _leave_queue(
+    store: RunStore, *, run_id: UUID, tenant_id: UUID, owner: str, cancel: bool
+) -> None:
+    """没等到执行就断开:控制台取消这一轮,对外放掉预订(后台队列立刻能接手)。"""
+    try:
+        if cancel:
+            await store.request_cancel(
+                run_id=run_id,
+                tenant_id=tenant_id,
+                updated_at=datetime.now(UTC),
+                reason=InterruptReason.CLIENT_DISCONNECT.value,
+            )
+        else:
+            await store.release_queued_reservation(run_id=run_id, owner=owner)
+    except Exception:
+        logger.exception("thread_queue.leave_queue_failed run_id=%s", run_id)

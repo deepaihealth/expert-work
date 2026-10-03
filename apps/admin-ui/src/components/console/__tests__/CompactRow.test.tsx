@@ -72,6 +72,37 @@ describe("CompactRow", () => {
     ).toBeInTheDocument();
   });
 
+  it("tool row summary drops the ▁ datamark glyph (B-149 live test)", () => {
+    const row: ToolRow = {
+      id: "tool:0:0",
+      kind: "tool",
+      seq: 0,
+      step: 1,
+      status: "ok",
+      durationMs: 10,
+      eventIndexes: [0, 1],
+      serverMs: null,
+      entry: {
+        id: "c1",
+        rawName: "read_file",
+        isMcp: false,
+        server: null,
+        toolName: "read_file",
+        args: { path: "big.txt" },
+        status: "success",
+        resultPreview: "line▁ 0001▁ xxxx\nline▁ 0002",
+        durationMs: 10,
+      },
+    };
+    render(
+      <App>
+        <CompactRow row={row} expanded={false} onToggle={vi.fn()} />
+      </App>,
+    );
+    expect(screen.getByTestId("console-row-tool")).toHaveTextContent("line 0001 xxxx");
+    expect(screen.getByTestId("console-row-tool")).not.toHaveTextContent("▁");
+  });
+
   it("skill_view row: 技能 · 名称/路径 → 结果,不再是裸 args JSON", () => {
     const row: ToolRow = {
       id: "tool:0:0",

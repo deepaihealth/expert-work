@@ -16,6 +16,7 @@ import type { PlanStepStatus } from "../../api/plan";
 import { skillNameOf, type ToolCallEntry } from "../../api/tool_timeline";
 import type { FireNowResult } from "../../api/triggers";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
+import { cleanUntrusted } from "../../pages/agent_detail/playground/untrusted_clean";
 import { ToolCallCard } from "../ToolTimeline";
 import { firstSentence } from "./text_summary";
 
@@ -52,7 +53,8 @@ function truncate(text: string, max: number): string {
 
 function toolResultText(entry: ToolCallEntry, t: TFn): string {
   if (entry.resultPreview === null) return t("console.row_tool_pending");
-  const firstLine = entry.resultPreview.split("\n")[0];
+  // 同 ledger.ts:预览里还留着 ▁,摘要行去掉再显示。
+  const firstLine = cleanUntrusted(entry.resultPreview).text.split("\n")[0];
   return entry.status === "error"
     ? `${t("console.row_tool_error")}: ${firstLine}`
     : firstLine;
