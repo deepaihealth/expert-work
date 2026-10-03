@@ -21,6 +21,7 @@
 | #1728 | B-139 控制台:调试台 / 对话页显示「排队中」、取消排队;排满给中文提示 | 是 | §8 |
 | #1731 | B-151 定时任务结果写回原会话时,原会话有一轮没结束(或停在审批上)就推迟,等它结束再写 | 是 | §9 |
 | #1732 | 10-03 首轮真栈发现的两处:排队那一轮断开时的清理被取消(控制台「取消排队」取消不掉、对外断开放不掉预订);控制台工具一行摘要里残留 `▁` | 是 | §5.2、§7.5、§8.2 复验 |
+| #1733 | B-153 Langfuse 从 08-20 起收不到数据(SDK 4.x 去掉了 `start_generation`) | 是 | §2.4 复验 |
 | `5c583c69` #1675 | CI 的 codeql upload-sarif | 否 | — |
 | 其余 | 文档(ROADMAP / 执行单) | 否 | — |
 
@@ -44,7 +45,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [ ] **2.1** smoke 全过 + 金丝雀 PASS(带跨厂商备用)。
 - [ ] **2.2 检查点续跑**:跑一个会触发审批的 run,批准后续跑完成(langgraph 检查点读写)。
 - [ ] **2.3 委派**:跑一次会派 worker 的 run,worker 正常返回(子图)。
-- [ ] **2.4 链路追踪**:上面任一 run 在 Langfuse(langfuse-test)能看到完整 trace,LLM span 有输入输出与 token 数;调试台 trace 瀑布正常展开。
+- [ ] **2.4 链路追踪**:上面任一 run 在 Langfuse(langfuse-test)能看到完整 trace,LLM span 有输入输出与 token 数;调试台 trace 瀑布正常展开。**10-03 首轮(`d0342507`)不过**:Langfuse 08-21 之后 0 条 trace,根因见 ROADMAP B-153,#1733 修。复验:发测试后跑一轮,`agent_run.trace_id` 在 Langfuse `/api/public/traces/{id}` 能取到,带 GENERATION 观测(有输入输出与 token 数);control-plane 日志不再出现 `langfuse.start_span_failed`。
 
 ## §3 沙箱镜像依赖(#1713)
 

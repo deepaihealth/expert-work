@@ -45,7 +45,7 @@ class _FakeSdk:
         self.flushed = 0
         self.shutdowns = 0
 
-    def start_generation(self, **kwargs: Any) -> _FakeGeneration:
+    def start_observation(self, **kwargs: Any) -> _FakeGeneration:
         self.generations.append(kwargs)
         generation = _FakeGeneration()
         self.created.append(generation)
@@ -56,6 +56,58 @@ class _FakeSdk:
 
     def shutdown(self) -> None:
         self.shutdowns += 1
+
+
+# ---------------------------------------------------------------------------
+# Contract with the INSTALLED langfuse SDK
+# ---------------------------------------------------------------------------
+#
+# The fakes above are what let a major SDK upgrade slip through: #1233
+# (2026-08-20) bumped langfuse 3.15 → 4.14, which removed
+# ``Langfuse.start_generation``. Every adapter test kept passing against the
+# fake, while production raised AttributeError on every LLM call — swallowed
+# by the middleware's fail-soft guard as ``langfuse.start_span_failed`` —
+# and Langfuse received nothing for six weeks. These two tests run the
+# adapter against the real class, so the next API change fails CI instead.
+
+
+def test_adapter_only_calls_methods_the_installed_sdk_has() -> None:
+    from unittest.mock import create_autospec
+
+    from langfuse import Langfuse
+    from langfuse._client.span import LangfuseGeneration
+
+    sdk = create_autospec(Langfuse, instance=True)
+    sdk.start_observation.return_value = create_autospec(LangfuseGeneration, instance=True)
+
+    span = LangfuseSdkClient(sdk).start_span(
+        name="agent", input=[{"role": "user", "content": "hi"}], metadata={"model": "glm-5.3"}
+    )
+    span.record_output("answer")
+    span.record_usage({"input_tokens": 10, "output_tokens": 3})
+    span.record_error(RuntimeError("provider down"))
+    span.end()
+
+    sdk.start_observation.assert_called_once()
+    assert sdk.start_observation.call_args.kwargs["as_type"] == "generation"
+
+
+def test_adapter_runs_against_a_real_langfuse_instance() -> None:
+    """A real client with export switched off — no network, but every call goes
+    through the SDK's own signatures and return types."""
+    from langfuse import Langfuse
+
+    sdk = Langfuse(
+        public_key="pk-lf-contract-test",
+        secret_key="sk-lf-contract-test",
+        host="http://127.0.0.1:9",
+        tracing_enabled=False,
+    )
+    span = LangfuseSdkClient(sdk).start_span(name="agent", input="x", metadata={"model": "m"})
+    span.record_output("y")
+    span.record_usage({"input_tokens": 1})
+    span.record_error(RuntimeError("e"))
+    span.end()
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +129,7 @@ def test_start_span_maps_to_generation_with_model() -> None:
     assert sdk.generations == [
         {
             "name": "my-agent",
+            "as_type": "generation",
             "input": [{"role": "user", "content": "hi"}],
             "metadata": {"model": "qwen-max", "tenant_id": "t-1", "run_id": "r-1"},
             "model": "qwen-max",
