@@ -720,6 +720,16 @@ def build_triggers_router() -> APIRouter:
                 # PROD-9 —— 与 scheduler reconcile 抢同一 thread 的投递,同一把锁。
                 session_factory=session_factory,
             )
+            if outcome.status == "deferred":
+                # B-151 —— 原会话还有一轮没结束,这次没写。行留在 FIRED 由 scheduler
+                # 稍后投递;对控制台就是「还没送达」(``pending``,同上面 PAUSED)。
+                return _FireNowResponse(
+                    run_id=str(run_id),
+                    thread_id=str(run.thread_id),
+                    run_status=run.status.value,
+                    trigger_run_status=TriggerRunStatus.FIRED.value,
+                    delivery="pending",
+                )
             won = await trigger_runs.claim_reconcile(
                 fired.model_copy(update={"status": TriggerRunStatus.SUCCEEDED})
             )

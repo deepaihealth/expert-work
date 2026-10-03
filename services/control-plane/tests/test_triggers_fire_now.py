@@ -488,6 +488,67 @@ async def test_fire_now_timeout_returns_pending(
 
 
 @pytest.mark.asyncio
+async def test_fire_now_leaves_the_firing_pending_when_the_conversation_is_busy(
+    triggers_client: AsyncClient,
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-151 —— 投递因原会话忙被推迟:接口报 ``pending``(控制台显示「还没送达」),
+    行留在 FIRED 交给 scheduler 稍后投递,不记 TRIGGER_COMPLETED、不标 SUCCEEDED
+    —— 标了 SUCCEEDED 就再也不会有人投它。"""
+    from control_plane.trigger_delivery import DeliveryOutcome
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    app = triggers_client._transport.app  # type: ignore[attr-defined,union-attr]
+    run_store = app.state.run_store
+    trigger_run_store = app.state.trigger_run_store
+    created = await _create_cron(triggers_client, name="fire-now-busy-conversation")
+    trigger_id = created["id"]
+
+    async def _fake_fire_trigger(record: TriggerRecord, *, now: datetime, **_kwargs: Any) -> UUID:
+        run_id = uuid4()
+        await run_store.create(
+            RunInfo(
+                run_id=run_id,
+                tenant_id=record.tenant_id,
+                thread_id=uuid4(),
+                user_id=None,
+                status=RunStatus.SUCCESS,
+                on_disconnect=DisconnectMode.CANCEL,
+                is_resume=False,
+                error=None,
+                created_at=now,
+                updated_at=now,
+                finished_at=now,
+            )
+        )
+        return run_id
+
+    async def _deferred(**_kwargs: Any) -> DeliveryOutcome:
+        return DeliveryOutcome("deferred")
+
+    monkeypatch.setattr("control_plane.api.triggers.fire_trigger", _fake_fire_trigger)
+    monkeypatch.setattr("control_plane.api.triggers.deliver_run_result", _deferred)
+
+    resp = await triggers_client.post(f"/v1/triggers/{trigger_id}:fire")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivery"] == "pending"
+    assert body["trigger_run_status"] == "fired"
+    still_fired = await trigger_run_store.list_fired(limit=10)
+    assert [str(r.trigger_id) for r in still_fired] == [trigger_id]
+    page = await audit_store.query(
+        AuditQuery(
+            tenant_id=_DEFAULT_TENANT,
+            action=AuditAction.TRIGGER_COMPLETED,
+            resource_id=trigger_id,
+        )
+    )
+    assert page.entries == []
+
+
+@pytest.mark.asyncio
 async def test_fire_now_success_audit_gated_when_claim_reconcile_loses(
     triggers_client: AsyncClient,
     audit_store: InMemoryAuditLogStore,

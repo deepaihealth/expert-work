@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from control_plane.transcript import read_turns
 from control_plane.trigger_delivery import (
     DeliveryOutcome,
+    _thread_busy,
     deliver_run_result,
     delivery_thread_lock,
     inject_delivery,
@@ -25,7 +26,7 @@ from expert_work.persistence import InMemoryThreadMessageStore, MessageTurn
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.protocol import AgentSpec, TriggerRecord
 from expert_work.runtime.checkpointer import make_checkpointer
-from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
+from expert_work.runtime.runs import DisconnectMode, InMemoryRunStore, RunInfo, RunStatus
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator.agent_factory import build_agent
 from tests.agent_fixtures import stub_agent_runtime
@@ -483,7 +484,23 @@ async def test_deliver_run_result_wraps_inject_in_delivery_lock(
             order.append("inject")
             await real_inject(*args, **kwargs)
 
+        @asynccontextmanager
+        async def _spy_turn_lock(session_factory: Any, thread_id: Any) -> AsyncIterator[None]:
+            assert session_factory is factory_sentinel, "session_factory 没有透传给会话接单锁"
+            assert thread_id == orig, "会话接单锁的键必须是 originating thread"
+            order.append("turn_lock_enter")
+            yield
+            order.append("turn_lock_exit")
+
         monkeypatch.setattr("control_plane.trigger_delivery.delivery_thread_lock", _spy_lock)
+        monkeypatch.setattr("control_plane.trigger_delivery.supersede_thread_lock", _spy_turn_lock)
+        real_busy = _thread_busy
+
+        async def _spy_busy(*args: Any, **kwargs: Any) -> bool:
+            order.append("busy_check")
+            return await real_busy(*args, **kwargs)
+
+        monkeypatch.setattr("control_plane.trigger_delivery._thread_busy", _spy_busy)
         monkeypatch.setattr("control_plane.trigger_delivery.inject_delivery", _spy_inject)
 
         trigger = TriggerRecord(
@@ -526,4 +543,137 @@ async def test_deliver_run_result_wraps_inject_in_delivery_lock(
         )
 
         assert outcome.status == "delivered"
-        assert order == ["lock_enter", "inject", "lock_exit"], f"读-查-写没有整段进锁:{order}"
+        # B-151 —— 8619 在外、会话接单锁(8620)在内;查忙与写入都在两把锁里
+        # (查在锁外的话,查完到写入之间可能冒出新的一轮)。
+        assert order == [
+            "lock_enter",
+            "turn_lock_enter",
+            "busy_check",
+            "inject",
+            "turn_lock_exit",
+            "lock_exit",
+        ], f"读-查-写没有整段进锁:{order}"
+
+
+# --- B-151 —— 原会话忙时不写 ---------------------------------------------------
+
+
+def _thread_run(tenant: UUID, thread: UUID, status: RunStatus, *, minute: int) -> RunInfo:
+    at = _NOW.replace(minute=minute)
+    return RunInfo(
+        run_id=uuid4(),
+        tenant_id=tenant,
+        thread_id=thread,
+        user_id=None,
+        status=status,
+        on_disconnect=DisconnectMode.CANCEL,
+        is_resume=False,
+        error=None,
+        created_at=at,
+        updated_at=at,
+        finished_at=None if status in (RunStatus.RUNNING, RunStatus.QUEUED) else at,
+    )
+
+
+async def _deliver_into(
+    monkeypatch: pytest.MonkeyPatch, originating_runs: Sequence[RunStatus]
+) -> tuple[DeliveryOutcome, list[str]]:
+    """原会话里按顺序已有这些状态的 run(第一条最早),投递一次;返回结果与
+    投递后原会话的助手消息。"""
+    tenant, orig, scratch = uuid4(), uuid4(), uuid4()
+    async with make_checkpointer("memory") as cp:
+        spec = _spec()
+        built = await build_agent(
+            spec,
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            provider_key_resolver=_platform_resolver,
+        )
+        await built.graph.aupdate_state(
+            {"configurable": {"thread_id": str(orig), "tenant_id": str(tenant)}},
+            {"messages": [HumanMessage(content="make me a task"), AIMessage(content="scheduled")]},
+            as_node="agent",
+        )
+        await built.graph.aupdate_state(
+            {"configurable": {"thread_id": str(scratch), "tenant_id": str(tenant)}},
+            {"messages": [HumanMessage(content="go"), AIMessage(content="task result")]},
+            as_node="agent",
+        )
+        agents = InMemoryAgentSpecStore()
+        await agents.create(tenant_id=tenant, spec=spec, spec_sha256="a" * 64, created_by="test")
+        run_store = InMemoryRunStore()
+        for i, status in enumerate(originating_runs):
+            await run_store.create(_thread_run(tenant, orig, status, minute=i))
+        runtime = stub_agent_runtime(run_store=run_store)
+        runtime.durable_checkpointer = cp
+
+        async def _get_agent(**_kwargs: Any) -> Any:
+            return built
+
+        monkeypatch.setattr(runtime, "get_agent", _get_agent)
+        trigger = TriggerRecord(
+            id=uuid4(),
+            tenant_id=tenant,
+            agent_name="test-agent",
+            agent_version="1.0.0",
+            name="nightly",
+            kind="cron",
+            config={"expr": "0 9 * * *"},
+            enabled=True,
+            source="api",
+            originating_thread_id=orig,
+            context_mode="reuse_thread",
+            created_at=_NOW,
+            updated_at=_NOW,
+        )
+        outcome = await deliver_run_result(
+            trigger=trigger,
+            run=_thread_run(tenant, scratch, RunStatus.SUCCESS, minute=30),
+            runtime=runtime,
+            agent_spec_store=agents,
+            thread_message_store=None,
+            now=_NOW,
+        )
+        turns = await read_turns(cp, orig, include_hidden=False)
+        return outcome, [t.content for t in turns if t.role == "assistant"]
+
+
+@pytest.mark.parametrize("busy", [RunStatus.RUNNING, RunStatus.QUEUED, RunStatus.PENDING])
+@pytest.mark.asyncio
+async def test_delivery_waits_while_a_turn_of_the_conversation_is_unfinished(
+    monkeypatch: pytest.MonkeyPatch, busy: RunStatus
+) -> None:
+    """原会话有一轮没结束 → 这次不写(``deferred``)。写进去的话,那一轮结束时
+    存的是它自己那条链上的检查点,投递从历史里消失(测试环境实测复现)。"""
+    outcome, answers = await _deliver_into(monkeypatch, [RunStatus.SUCCESS, busy])
+    assert outcome == DeliveryOutcome("deferred")
+    assert answers == ["scheduled"]
+
+
+@pytest.mark.asyncio
+async def test_delivery_waits_while_the_latest_turn_waits_on_an_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最新一轮停在审批上:它还要从挂起的中断处恢复,先不往后面追加。"""
+    outcome, answers = await _deliver_into(monkeypatch, [RunStatus.SUCCESS, RunStatus.PAUSED])
+    assert outcome == DeliveryOutcome("deferred")
+    assert answers == ["scheduled"]
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        [],
+        [RunStatus.SUCCESS],
+        # 一轮早先停在审批上、后面又有新的一轮(审批已被作废)—— 只看最新一轮。
+        [RunStatus.PAUSED, RunStatus.SUCCESS],
+        [RunStatus.SUCCESS, RunStatus.INTERRUPTED],
+    ],
+)
+@pytest.mark.asyncio
+async def test_delivery_writes_when_the_conversation_is_idle(
+    monkeypatch: pytest.MonkeyPatch, history: list[RunStatus]
+) -> None:
+    outcome, answers = await _deliver_into(monkeypatch, history)
+    assert outcome == DeliveryOutcome("delivered", text="task result")
+    assert answers == ["scheduled", "task result"]
