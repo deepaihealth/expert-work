@@ -46,6 +46,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/clickhouse
+            # B-154 —— without this the system log tables grow forever and
+            # filled the test volume (Langfuse then dropped every insert).
+            - name: config
+              mountPath: /etc/clickhouse-server/config.d/system-logs.xml
+              subPath: system-logs.xml
+              readOnly: true
           # Heaviest pod in this base — pin real requests so it never
           # runs BestEffort (first evicted under node pressure), cap
           # memory so a runaway merge can't take the node down.
@@ -75,6 +81,10 @@ spec:
               port: http
             periodSeconds: 10
             failureThreshold: 6
+      volumes:
+        - name: config
+          configMap:
+            name: langfuse-clickhouse-config
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -1,0 +1,39 @@
+<!--
+  Langfuse ClickHouse — cap ClickHouse's own system log tables.
+
+  Out of the box every system log table grows forever and text_log records
+  at `trace` level. On the test cluster that filled the 20Gi data volume in
+  three weeks (text_log alone 12 GiB, Langfuse's own data ~170 MiB); from
+  then on every Langfuse insert failed with NOT_ENOUGH_SPACE and the worker
+  dropped it, silently, for six weeks.
+
+  - server log level and text_log: warning (was trace)
+  - every system log table that is on by default: 7-day TTL
+  - processors_profile_log / opentelemetry_span_log: off (per-query
+    profiling nobody reads here)
+
+  A TTL change alters the table definition, so on the first start with this
+  file ClickHouse renames each existing table to <name>_0 and creates a new
+  one. The _0 tables keep their old data and are never cleaned up: drop them
+  once after the first deploy (see the prod release runbook).
+-->
+<clickhouse>
+    <logger>
+        <level>warning</level>
+    </logger>
+    <text_log>
+        <level>warning</level>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </text_log>
+    <query_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>
+    <query_thread_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_thread_log>
+    <query_views_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_views_log>
+    <query_metric_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_metric_log>
+    <trace_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></trace_log>
+    <part_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></part_log>
+    <metric_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></metric_log>
+    <error_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></error_log>
+    <asynchronous_metric_log><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></asynchronous_metric_log>
+    <processors_profile_log remove="remove"/>
+    <opentelemetry_span_log remove="remove"/>
+</clickhouse>

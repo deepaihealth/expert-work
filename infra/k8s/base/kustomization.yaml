@@ -129,6 +129,11 @@ configMapGenerator:
       - observability/rules/burn_rate.yml
       - observability/rules/sli.yml
       - observability/rules/uplift.yml
+  # B-154 —— ClickHouse system-log caps (TTL + level), mounted into
+  # config.d by langfuse/clickhouse-statefulset.yaml. See the file header.
+  - name: langfuse-clickhouse-config
+    files:
+      - system-logs.xml=langfuse/clickhouse-system-logs.xml
   - name: tempo-config
     files:
       - observability/tempo.yaml

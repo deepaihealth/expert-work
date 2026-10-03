@@ -271,6 +271,24 @@ if [[ -n "${pinned_tag}" ]]; then
     esac
 fi
 
+# B-154 —— Langfuse 的 ClickHouse 数据盘。它满了的失败形态是**无声的**:
+# Langfuse 的 web 照样 200(上面那两条 langfuse 检查照过),worker 每次写入
+# NOT_ENOUGH_SPACE 后重试三次就把记录丢掉,只在 worker 日志里留一行 error。
+# 测试环境就这样从 2026-08-20 起六周没进一条 trace,没有任何东西提过一句。
+# warn-only,理由同上:盘快满要人去清/扩,不是要人回滚一个健康的发布。
+echo "== langfuse clickhouse disk (B-154, warn-only) =="
+ch_use="$(kubectl -n expert-work exec langfuse-clickhouse-0 -- df -P /var/lib/clickhouse 2>/dev/null \
+    | awk 'NR==2{sub("%","",$5); print $5}')"
+if [[ -z "${ch_use}" ]]; then
+    echo "WARN clickhouse disk: 读不到 langfuse-clickhouse-0 的 df(pod 不在 / 名字变了?)"
+elif (( ch_use >= 80 )); then
+    echo "WARN clickhouse data disk ${ch_use}% used —— 到 100% 后 Langfuse 的写入会被静默丢掉。"
+    echo "     先看是哪些表:system.parts 按 database/table 聚合 bytes_on_disk;"
+    echo "     system.* 日志表本该被 clickhouse-system-logs.xml 的 7 天 TTL 管住。"
+else
+    echo "OK   clickhouse data disk ${ch_use}% used"
+fi
+
 # Same Ready+not-Terminating filter as the POD pick above — probing a
 # Terminating pod's IP is a phantom failure, not a finding.
 POD_ROWS="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
