@@ -412,6 +412,7 @@ export interface TranslationKeys {
     cancel_run_confirm: string;
     cancel_done: string;
     cancel_failed: string;
+    cancel_queued_done: string;
     role_user: string;
     role_assistant: string;
     superseded_tag: string;
@@ -1483,6 +1484,9 @@ export interface TranslationKeys {
     uploading: string;
     transcript_label: string;
     turn_running: string;
+    turn_queued: string;
+    cancel_queued: string;
+    thread_queue_full: string;
     turn_no_text: string;
     segment_commentary: string;
     turn_failed: string;
@@ -3640,6 +3644,7 @@ const en: TranslationKeys = {
     cancel_run_confirm: "Cancel the run in progress? Work it has already finished is kept.",
     cancel_done: "Run cancelled.",
     cancel_failed: "Could not cancel the run.",
+    cancel_queued_done: "Queued turn cancelled.",
     role_user: "User",
     role_assistant: "Agent",
     superseded_tag: "Superseded",
@@ -4830,6 +4835,9 @@ const en: TranslationKeys = {
     uploading: "Uploading…",
     transcript_label: "Conversation",
     turn_running: "Running…",
+    turn_queued: "Queued — starts when the previous turn finishes",
+    cancel_queued: "Cancel",
+    thread_queue_full: "This conversation's queue is full. Wait for a turn to finish or cancel one, then send again.",
     turn_no_text: "(no text answer)",
     segment_commentary: "Progress note",
     turn_failed: "This turn's run failed",

@@ -1276,3 +1276,78 @@ describe("D-5/D-6 live tail + operations", () => {
     expect(screen.queryByTestId("conversation-cancel-run")).not.toBeInTheDocument();
   });
 });
+
+describe("B-139 一轮在跑、一轮排队", () => {
+  const QUEUED_RUN = "33333333-3333-3333-3333-333333333377";
+  const fixture = () => {
+    const convo: ConversationDetailModel = {
+      ...CONVO,
+      runs: [
+        CONVO.runs[0],
+        { ...CONVO.runs[1], status: "running", error: null, finished_at: null },
+        {
+          ...CONVO.runs[1],
+          run_id: QUEUED_RUN,
+          status: "queued",
+          error: null,
+          created_at: "2026-06-30T12:06:00Z",
+          finished_at: null,
+        },
+      ],
+    };
+    const messages: sessionsSdk.HistoryMessage[] = [
+      ...TWO_TURNS.slice(0, 3),
+      { role: "user", content: "third question" },
+    ];
+    const run = (runId: string, status: "success" | "running" | "queued", at: string) => ({
+      runId, status, isResume: false, supersededBy: null, regeneratedFrom: null,
+      createdAt: at, finishedAt: null, error: null, tokens: null,
+    });
+    const runs = [
+      run(RUN_1, "success", "2026-06-30T12:00:00Z"),
+      run(RUN_2, "running", "2026-06-30T12:05:00Z"),
+      run(QUEUED_RUN, "queued", "2026-06-30T12:06:00Z"),
+    ];
+    return { convo, messages, runs };
+  };
+
+  it("排队的那一轮显示排队提示,点「取消排队」取消的是它", async () => {
+    const fx = fixture();
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(fx.convo);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(fx.runs);
+    const cancelMock = vi.spyOn(runsSdk, "cancelRun").mockResolvedValue(undefined);
+
+    renderPage();
+    const queued = await screen.findAllByTestId("console-turn-queued");
+    expect(queued).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("console-cancel-queued"));
+    await waitFor(() => expect(cancelMock).toHaveBeenCalledWith(THREAD_ID, QUEUED_RUN));
+  });
+
+  it("标题栏「取消运行」取消的是正在跑的那一轮,不是排在最后的那一轮", async () => {
+    const fx = fixture();
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(fx.convo);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(fx.runs);
+    const cancelMock = vi.spyOn(runsSdk, "cancelRun").mockResolvedValue(undefined);
+
+    renderPage();
+    fireEvent.click(await screen.findByTestId("conversation-cancel-run"));
+    const confirm = await screen.findAllByRole("button", { name: /取消运行|Cancel run/i });
+    fireEvent.click(confirm[confirm.length - 1]);
+    await waitFor(() => expect(cancelMock).toHaveBeenCalledWith(THREAD_ID, RUN_2));
+  });
+
+  it("viewer 只看得到排队提示,没有取消按钮", async () => {
+    setStoredToken(jwt({ sub: "v", tenant_id: TENANT_ID, roles: ["viewer"] }));
+    const fx = fixture();
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(fx.convo);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue(fx.runs);
+
+    renderPage();
+    await screen.findByTestId("console-turn-queued");
+    expect(screen.queryByTestId("console-cancel-queued")).not.toBeInTheDocument();
+  });
+});

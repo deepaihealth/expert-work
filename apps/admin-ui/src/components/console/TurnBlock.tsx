@@ -78,6 +78,9 @@ export interface TurnBlockProps {
   onExport: (turn: Turn) => void;
   exporting: boolean;
   onRetry?: (turn: Turn) => void;
+  /** B-139 —— 取消这一轮的排队;不传 = 不出按钮。与 ``readOnly`` 无关:对话页
+   *  整页只读,写操作由页面按权限单独放行(同 ``allowDecide``)。 */
+  onCancelQueued?: (turn: ConsoleTurn) => void;
   onDownloadArtifact: (name: string) => Promise<void>;
   onFireResult?: (r: FireNowResult) => void;
   /** 历史轮懒加载 ref(``useHistoryTurns.registerRow(runId, threadId)`` 的
@@ -128,6 +131,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     onExport,
     exporting,
     onRetry,
+    onCancelQueued,
     onDownloadArtifact,
     onFireResult,
     rowRef,
@@ -243,6 +247,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         summary={summary}
         liveText={liveText}
         onDownloadArtifact={onDownloadArtifact}
+        onCancelQueued={onCancelQueued ? () => onCancelQueued(turn) : undefined}
       />
 
       {/* BUG-13(修订)— 本轮产出的计划快照,长在产生它的那一轮里。

@@ -75,6 +75,10 @@ export interface TranscriptProps {
   exportingKey: string | null;
   onRetryLive?: (turn: Turn) => void;
   onRetryHistory?: (turn: Turn) => void;
+  /** B-139 —— 排队中那一轮的「取消排队」,live / 历史轮分开给(同 onRetry*):
+   *  调试台 live 轮断开连接即取消,对话页历史轮调取消接口。 */
+  onCancelQueuedLive?: (turn: ConsoleTurn) => void;
+  onCancelQueuedHistory?: (turn: ConsoleTurn) => void;
   onDownloadArtifact: (name: string) => Promise<void>;
   onFireResult?: (r: FireNowResult) => void;
   /** PR-B Task 3 — ConversationDetail 脚注「查看运行」深链;透传给
@@ -119,6 +123,8 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     exportingKey,
     onRetryLive,
     onRetryHistory,
+    onCancelQueuedLive,
+    onCancelQueuedHistory,
     onDownloadArtifact,
     onFireResult,
     runHrefOf,
@@ -239,6 +245,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
             onExport={onExport}
             exporting={exportingKey === turn.key}
             onRetry={onRetryHistory}
+            onCancelQueued={onCancelQueuedHistory}
             onDownloadArtifact={onDownloadArtifact}
             onFireResult={onFireResult}
             runHrefOf={runHrefOf}
@@ -290,6 +297,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onExport={onExport}
           exporting={exportingKey === turn.key}
           onRetry={onRetryLive}
+          onCancelQueued={onCancelQueuedLive}
           onDownloadArtifact={onDownloadArtifact}
           onFireResult={onFireResult}
           runHrefOf={runHrefOf}

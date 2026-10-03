@@ -297,3 +297,48 @@ describe("AnswerBubble", () => {
     expect(onDownload).toHaveBeenCalledWith("report.txt");
   });
 });
+
+describe("AnswerBubble — B-139 排队中", () => {
+  it("排队中的一轮显示排队提示和取消按钮,点了调回调", async () => {
+    const onCancelQueued = vi.fn();
+    const turn = makeConsoleTurn({ status: "running" }, { queued: true });
+    render(
+      <App>
+        <AnswerBubble
+          turn={turn}
+          summary={summarizeTurn([])}
+          onDownloadArtifact={vi.fn()}
+          onCancelQueued={onCancelQueued}
+        />
+      </App>,
+    );
+    expect(screen.getByTestId("console-turn-queued")).toHaveTextContent(
+      "Queued — starts when the previous turn finishes",
+    );
+    expect(screen.queryByText("Running…")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("console-cancel-queued"));
+    expect(onCancelQueued).toHaveBeenCalledTimes(1);
+  });
+
+  it("不给取消回调(只读视图)时只有提示没有按钮", () => {
+    const turn = makeConsoleTurn({ status: "running" }, { queued: true });
+    render(
+      <App>
+        <AnswerBubble turn={turn} summary={summarizeTurn([])} onDownloadArtifact={vi.fn()} />
+      </App>,
+    );
+    expect(screen.getByTestId("console-turn-queued")).toBeInTheDocument();
+    expect(screen.queryByTestId("console-cancel-queued")).not.toBeInTheDocument();
+  });
+
+  it("没在排队的运行中轮次照旧显示「运行中」", () => {
+    const turn = makeConsoleTurn({ status: "running" }, { queued: false });
+    render(
+      <App>
+        <AnswerBubble turn={turn} summary={summarizeTurn([])} onDownloadArtifact={vi.fn()} />
+      </App>,
+    );
+    expect(screen.queryByTestId("console-turn-queued")).not.toBeInTheDocument();
+    expect(screen.getByText("Running…")).toBeInTheDocument();
+  });
+});

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
 from uuid import UUID, uuid4
@@ -35,11 +36,18 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.inputs_block import inputs_block_message
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
+from control_plane.thread_queue import MAX_QUEUED_PER_THREAD, THREAD_QUEUE_FULL
 from expert_work.common.message_stamp import STAMP_RUN_ID
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.protocol import AuditQuery
-from expert_work.runtime.runs import DisconnectMode, InMemoryRunEventStore, InMemoryRunStore
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    InMemoryRunEventStore,
+    InMemoryRunStore,
+    RunInfo,
+    RunStatus,
+)
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -599,6 +607,62 @@ async def test_console_stream_run_is_cancelled_when_the_connection_drops() -> No
     info = await run_store.get(run_id=run_id, tenant_id=_DEFAULT_TENANT)
     assert info is not None
     assert info.on_disconnect is DisconnectMode.CANCEL
+
+
+@pytest.mark.asyncio
+async def test_console_run_on_a_full_queue_is_a_coded_409() -> None:
+    """B-139 —— 控制台平面排满时的 409 带 ``detail.code``:调试台按 code 认出
+    「排满了」并给中文提示,纯字符串 detail 在它那边只剩「HTTP_409」。
+
+    自建 app 的理由同上一条:要往 fixture 不暴露的 ``RunStore`` 里塞排队行。
+    """
+    settings = Settings(
+        env="dev",
+        auth_mode="dev",
+        rate_limit_burst=10_000,
+        rate_limit_per_second=10_000.0,
+        oidc_issuer=TEST_ISSUER,
+        oidc_audience=[TEST_AUDIENCE],
+    )
+    run_store = InMemoryRunStore()
+    run_event_store = InMemoryRunEventStore()
+    app = create_app(
+        settings=settings,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+        agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
+        run_repo=run_store,
+        run_event_repo=run_event_store,
+    )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {make_test_jwt(tenant_id=_DEFAULT_TENANT)}"}
+    async with AsyncClient(
+        transport=transport, base_url="http://control-plane.test", headers=headers
+    ) as client:
+        await client.post("/v1/agents", json={"manifest_yaml": _AGENT_YAML})
+        thread_id = await _create_session(client)
+        now = datetime.now(UTC)
+        for _ in range(MAX_QUEUED_PER_THREAD):
+            await run_store.create(
+                RunInfo(
+                    run_id=uuid4(),
+                    tenant_id=_DEFAULT_TENANT,
+                    thread_id=UUID(thread_id),
+                    user_id=None,
+                    status=RunStatus.QUEUED,
+                    on_disconnect=DisconnectMode.CANCEL,
+                    is_resume=False,
+                    error=None,
+                    created_at=now,
+                    updated_at=now,
+                    finished_at=None,
+                    enqueued_input={"input": "waiting"},
+                )
+            )
+        response = await client.post(f"/v1/sessions/{thread_id}/runs", json={"input": "hello"})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == THREAD_QUEUE_FULL
 
 
 @pytest.mark.asyncio

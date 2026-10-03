@@ -20,12 +20,13 @@ import {
 import { streamRunEvents } from "../../../api/runs";
 import {
   streamRun,
+  THREAD_QUEUE_FULL,
   type RunRequest,
   type SseEvent,
   type ThreadMeta,
 } from "../../../api/sessions";
 import { summarizeTurn } from "../../../api/turn_summary";
-import { runIdOf } from "../../../components/console/console_turns";
+import { isQueuedTurn, runIdOf } from "../../../components/console/console_turns";
 import { approvalItemFromEvent } from "../../../components/turn/ApprovalGate";
 import type { Attachment, Turn, TurnStatus } from "../../../components/turn/types";
 import { useTokenStream, type TokenStreamController } from "./useTokenStream";
@@ -48,6 +49,14 @@ export function terminalTurnStatus(frames: readonly SseEvent[]): TurnStatus {
     }
   }
   return "done";
+}
+
+/** B-139 —— ``queued`` 帧带的 run id(排队时还没有 ``metadata``)。 */
+function queuedRunIdOf(frames: readonly SseEvent[]): string | null {
+  const data = frames.find((f) => f.event === "queued")?.data;
+  if (data === null || typeof data !== "object") return null;
+  const rid = (data as Record<string, unknown>).run_id;
+  return typeof rid === "string" && rid ? rid : null;
 }
 
 /** One dispatch's raw request — the shared kernel re-derives the doc note and
@@ -184,29 +193,45 @@ export function useRunEngine(args: {
       abortRef.current = ac;
       const frames: SseEvent[] = [];
       const threadId = active.thread_id;
+      /** Folds one frame into the turn; ``true`` = the run's ``end`` frame. */
+      const onFrame = (frame: SseEvent): boolean => {
+        if (frame.event === "token") {
+          tokenStream.push(frame);
+          return false;
+        }
+        frames.push(frame);
+        // #5 — a dedicated ``approval`` event surfaces the gate
+        // deterministically (no dependence on ``end`` or a post-stream poll).
+        const approvalFromFrame =
+          frame.event === "approval" ? approvalItemFromEvent(frame.data) : null;
+        setTurns((prev) =>
+          prev.map((tn) =>
+            tn.id === turnId
+              ? {
+                  ...tn,
+                  events: [...tn.events, frame],
+                  approval: approvalFromFrame ?? tn.approval,
+                }
+              : tn,
+          ),
+        );
+        return frame.event === "end";
+      };
       try {
         for await (const frame of streamRun(threadId, body, { signal: ac.signal })) {
-          if (frame.event === "token") {
-            tokenStream.push(frame);
-            continue;
+          if (onFrame(frame)) break;
+        }
+        // B-139 —— 排队的这一轮被别的副本领去执行时,服务端不发 ``end`` 就收尾
+        // 这条连接(它还没开始,结果不在本副本)。按对外文档的断线续传,用
+        // ``queued`` 帧里的 run id 改从 ``/events`` 读完;否则这一轮会被当成
+        // 「已完成、无回复」,而它其实正在别处执行。
+        const handedOff = isQueuedTurn(frames, null) ? queuedRunIdOf(frames) : null;
+        if (handedOff !== null) {
+          for await (const frame of streamRunEvents(threadId, handedOff, {
+            signal: ac.signal,
+          })) {
+            if (onFrame(frame)) break;
           }
-          frames.push(frame);
-          // #5 — a dedicated ``approval`` event surfaces the gate
-          // deterministically (no dependence on ``end`` or a post-stream poll).
-          const approvalFromFrame =
-            frame.event === "approval" ? approvalItemFromEvent(frame.data) : null;
-          setTurns((prev) =>
-            prev.map((tn) =>
-              tn.id === turnId
-                ? {
-                    ...tn,
-                    events: [...tn.events, frame],
-                    approval: approvalFromFrame ?? tn.approval,
-                  }
-                : tn,
-            ),
-          );
-          if (frame.event === "end") break;
         }
         updateTurn({ status: terminalTurnStatus(frames) });
       } catch (err) {
@@ -216,7 +241,14 @@ export function useRunEngine(args: {
           updateTurn({ status: "interrupted" });
         } else {
           const message = err instanceof Error ? err.message : "stream failed";
-          updateTurn({ status: "error", error: message });
+          // B-139 —— 会话里已排满,后端 409 ``THREAD_QUEUE_FULL``(``streamRun``
+          // 把它拼成「CODE: message」);换成能照着做的中文提示。
+          updateTurn({
+            status: "error",
+            error: message.startsWith(`${THREAD_QUEUE_FULL}:`)
+              ? t("playground.thread_queue_full")
+              : message,
+          });
         }
       } finally {
         tokenStream.finalize();

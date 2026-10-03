@@ -718,6 +718,9 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               // Track C W2 — 切入态只读:重试是写操作,不传 handler 按钮就不渲染。
               onRetryLive={isTenantSwitched ? undefined : handleRetry}
               onRetryHistory={isTenantSwitched ? undefined : handleHistoryRetry}
+              // B-139 —— 排队中的只会是正在流式的那一轮;断开连接 = 后端取消排队
+              // (控制台平面的规矩,同停止按钮)。
+              onCancelQueuedLive={stopRun}
               onDownloadArtifact={handleDownloadArtifact}
               onFireResult={handleFireResult}
             />

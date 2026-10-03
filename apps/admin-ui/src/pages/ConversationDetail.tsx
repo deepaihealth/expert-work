@@ -361,17 +361,20 @@ export function ConversationDetail() {
     ((identity?.roles ?? []).some((r) => r === "admin" || r === "operator") ||
       isSystemAdmin);
 
-  // D-5 — the thread's in-flight tail run (running/pending/queued; NOT
-  // paused — a paused run can wait on a human for hours and must not keep
-  // the 1s trajectory ticker alive, 终审 M-5). Drives the header's cancel
+  // D-5 — the thread's in-flight run (running/pending/queued; NOT paused — a
+  // paused run can wait on a human for hours and must not keep the 1s
+  // trajectory ticker alive, 终审 M-5). Drives the header's cancel
   // affordance and the running flags below.
-  const cancellableRun = useMemo(() => {
-    const last = convoRuns?.[convoRuns.length - 1];
-    return last !== undefined &&
-      (last.status === "running" || last.status === "pending" || last.status === "queued")
-      ? last
-      : null;
-  }, [convoRuns]);
+  // B-139 —— 同一会话的轮次串行:没结束的可能不止一条(一条在跑、后面的在
+  // 排队)。标题栏的「取消运行」取**最早**那条,也就是正在执行的那一轮;
+  // 排队的轮次在各自位置有「取消排队」。取最后一条的话,在跑的那轮就取消不了。
+  const cancellableRun = useMemo(
+    () =>
+      convoRuns?.find(
+        (r) => r.status === "running" || r.status === "pending" || r.status === "queued",
+      ) ?? null,
+    [convoRuns],
+  );
   const runInFlight = cancellableRun !== null;
 
   // D-6 — decide a paused turn's approval in place, then silently refresh:
@@ -425,6 +428,28 @@ export function ConversationDetail() {
       }
     })();
   }, [threadId, cancellableRun, refresh, t]);
+
+  // B-139 —— 取消一条排队中的轮次(它还没开始执行)。不弹确认:没开始的一轮
+  // 取消了也没有丢掉任何工作,与标题栏取消正在跑的一轮不同。
+  const handleCancelQueued = useCallback(
+    (turn: ConsoleTurn) => {
+      const runId = turn.runId;
+      if (!threadId || runId === null) return;
+      void (async () => {
+        try {
+          await cancelRun(threadId, runId);
+          message.success(t("conversations_detail.cancel_queued_done"));
+        } catch (err) {
+          message.error(
+            err instanceof Error ? err.message : t("conversations_detail.cancel_failed"),
+          );
+        } finally {
+          void refresh({ silent: true });
+        }
+      })();
+    },
+    [threadId, refresh, t],
+  );
 
   // Export a turn's full event stream as JSON — same contract as the
   // playground's toolbar button (prefer the authoritative persisted replay,
@@ -742,6 +767,7 @@ export function ConversationDetail() {
                     deciding={deciding}
                     onExport={handleExport}
                     exportingKey={exportingId}
+                    onCancelQueuedHistory={canOperate ? handleCancelQueued : undefined}
                     onDownloadArtifact={handleDownloadArtifact}
                     runHrefOf={runHrefOf}
                     planOf={planOf}
