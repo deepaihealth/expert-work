@@ -119,6 +119,7 @@ async def _build_scheduler(
     run_store: InMemoryRunStore | None = None,
     seed_agent: bool = True,
     audit_store: InMemoryAuditLogStore | None = None,
+    share_run_store: bool = False,
 ) -> tuple[TriggerScheduler, AgentRuntime]:
     agents = InMemoryAgentSpecStore()
     if seed_agent:
@@ -128,12 +129,15 @@ async def _build_scheduler(
             spec_sha256="a" * 64,
             created_by="test",
         )
-    runtime = stub_agent_runtime()
+    run_store = run_store or InMemoryRunStore()
+    # B-151 —— 生产里 runtime 的 run 库与 scheduler 的是同一张表;投递要靠它判断
+    # 原会话忙不忙时让两边共用一份。
+    runtime = stub_agent_runtime(run_store=run_store if share_run_store else None)
     store = audit_store or InMemoryAuditLogStore()
     scheduler = TriggerScheduler(
         trigger_store=trigger_store,
         trigger_run_store=trigger_run_store,
-        run_store=run_store or InMemoryRunStore(),
+        run_store=run_store,
         agent_spec_store=agents,
         thread_store=InMemoryThreadMetaStore(),
         runtime=runtime,
@@ -474,6 +478,88 @@ async def test_reconcile_delivers_result_to_originating_thread(
             AuditQuery(tenant_id=_TENANT, action=AuditAction.TRIGGER_COMPLETED)
         )
         assert page.entries and page.entries[0].details.get("delivery") == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_waits_for_a_busy_conversation_then_delivers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-151 —— 原会话有一轮在跑:这一遍 reconcile 不写、行留在 FIRED、不记
+    TRIGGER_COMPLETED;那一轮结束后的下一遍才投递并收尾。"""
+    orig_thread, scratch_thread, run_id = uuid4(), uuid4(), uuid4()
+    audit = InMemoryAuditLogStore()
+    async with make_checkpointer("memory") as cp:
+        built = await build_agent(
+            AgentSpec.model_validate(_MANIFEST),
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            provider_key_resolver=_platform_resolver,
+        )
+        await built.graph.aupdate_state(
+            {"configurable": {"thread_id": str(orig_thread), "tenant_id": str(_TENANT)}},
+            {"messages": [HumanMessage(content="make me a task"), AIMessage(content="scheduled")]},
+            as_node="agent",
+        )
+        await built.graph.aupdate_state(
+            {"configurable": {"thread_id": str(scratch_thread), "tenant_id": str(_TENANT)}},
+            {"messages": [HumanMessage(content="go"), AIMessage(content="Today's AI news: X")]},
+            as_node="agent",
+        )
+        triggers, trigger_runs, run_store = (
+            InMemoryTriggerStore(),
+            InMemoryTriggerRunStore(),
+            InMemoryRunStore(),
+        )
+        trig = _reuse_thread_trigger(originating_thread_id=orig_thread)
+        await triggers.create(trig)
+        fired = await trigger_runs.create(_fired_run(trigger_id=trig.id, run_id=run_id))
+        await run_store.create(
+            _run_info(run_id, status=RunStatus.SUCCESS, thread_id=scratch_thread)
+        )
+        busy_turn = _run_info(uuid4(), status=RunStatus.RUNNING, thread_id=orig_thread)
+        await run_store.create(busy_turn)
+        scheduler, runtime = await _build_scheduler(
+            trigger_store=triggers,
+            trigger_run_store=trigger_runs,
+            run_store=run_store,
+            audit_store=audit,
+            share_run_store=True,
+        )
+        runtime.durable_checkpointer = cp
+
+        async def _get_agent(**_kwargs: Any) -> Any:
+            return built
+
+        monkeypatch.setattr(runtime, "get_agent", _get_agent)
+
+        await scheduler._reconcile_fired()
+
+        turns = await read_turns(cp, orig_thread, include_hidden=False)
+        assert [t.content for t in turns if t.role == "assistant"] == ["scheduled"]
+        row = await trigger_runs.get(trigger_run_id=fired.id, tenant_id=_TENANT)
+        assert row is not None and row.status is TriggerRunStatus.FIRED
+        page = await audit.query(
+            AuditQuery(tenant_id=_TENANT, action=AuditAction.TRIGGER_COMPLETED)
+        )
+        assert page.entries == []
+
+        await run_store.set_status(
+            run_id=busy_turn.run_id,
+            tenant_id=_TENANT,
+            status=RunStatus.SUCCESS,
+            updated_at=_BASE,
+            finished_at=_BASE,
+        )
+        await scheduler._reconcile_fired()
+
+        turns = await read_turns(cp, orig_thread, include_hidden=False)
+        assert turns[-1].role == "assistant" and turns[-1].content == "Today's AI news: X"
+        row = await trigger_runs.get(trigger_run_id=fired.id, tenant_id=_TENANT)
+        assert row is not None and row.status is TriggerRunStatus.SUCCEEDED
+        page = await audit.query(
+            AuditQuery(tenant_id=_TENANT, action=AuditAction.TRIGGER_COMPLETED)
+        )
+        assert [e.details.get("delivery") for e in page.entries] == ["delivered"]
 
 
 @pytest.mark.asyncio

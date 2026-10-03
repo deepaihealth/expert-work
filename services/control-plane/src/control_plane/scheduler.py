@@ -377,6 +377,10 @@ class TriggerScheduler:
                 return
             if run.status is RunStatus.SUCCESS:
                 delivery = await self._deliver(row, run)
+                if delivery == "deferred":
+                    # B-151 —— 原会话还有一轮没结束:这次不写,行留在 FIRED,
+                    # 下一轮 reconcile 再投(list_fired 只挑 FIRED)。
+                    return
                 won = await self._trigger_runs.claim_reconcile(
                     row.model_copy(update={"status": TriggerRunStatus.SUCCEEDED})
                 )

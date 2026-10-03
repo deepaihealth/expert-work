@@ -38,13 +38,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from control_plane.advisory_locks import TRIGGER_DELIVERY_LOCK_CLASSID
 from control_plane.runtime import AgentRuntime
+from control_plane.supersede import supersede_thread_lock
 from control_plane.transcript import read_turns
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
 from expert_work.persistence import ThreadMessageStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.protocol import TriggerRecord
 from expert_work.protocol.agent_spec import AgentSpecStatus
-from expert_work.runtime.runs import RunInfo
+from expert_work.runtime.runs import THREAD_BUSY_STATUSES, RunInfo, RunStatus, RunStore
 from orchestrator.sse import ThreadStatsRecorder
 
 logger = logging.getLogger(__name__)
@@ -152,14 +153,36 @@ async def inject_delivery(
         )
 
 
+async def _thread_busy(store: RunStore | None, *, thread_id: UUID, tenant_id: UUID) -> bool:
+    """B-151 —— 原会话现在能不能写:有没结束的一轮(B-139 的「忙」),或最新一轮
+    停在审批上。
+
+    在跑的那一轮写完时存的是**它自己**那条链上的检查点,不含这次投递 —— 投递
+    从「最新」里消失(测试环境实测复现:接口报 delivered,历史里没有)。停在
+    审批上的那一轮还挂着待恢复的中断,往它后面追加一条助手消息会改掉恢复点;
+    投递不急,等审批处理完再写。``store`` 为 ``None``(内存栈)= 不忙。
+    """
+    if store is None:
+        return False
+    runs = await store.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+    if any(r.status in THREAD_BUSY_STATUSES for r in runs):
+        return True
+    latest = max(runs, key=lambda r: (r.created_at, str(r.run_id)), default=None)
+    return latest is not None and latest.status is RunStatus.PAUSED
+
+
 @dataclass(frozen=True)
 class DeliveryOutcome:
     """Result of :func:`deliver_run_result`.
 
     ``status`` is also what lands in the ``TRIGGER_COMPLETED`` audit entry's
-    ``delivery`` detail. ``text`` carries the delivered result (non-empty
-    only when ``status == "delivered"``) so a fire-now HTTP endpoint (PR4
-    Task 3) can echo it back to the caller without a second checkpoint read.
+    ``delivery`` detail. ``"deferred"`` (B-151) = the originating conversation
+    was busy; nothing was written and the caller must leave the firing
+    ``FIRED`` so a later reconcile pass delivers it.
+
+    ``text`` carries the delivered result (non-empty only when
+    ``status == "delivered"``) so a fire-now HTTP endpoint (PR4 Task 3) can
+    echo it back to the caller without a second checkpoint read.
     """
 
     status: str
@@ -217,7 +240,19 @@ async def deliver_run_result(
         )
         # PROD-9 —— 读-查-写整段进锁:aget_state 的快照与 aupdate_state 的追加
         # 之间不允许别的副本插进同一 thread 的投递。
-        async with delivery_thread_lock(session_factory, trigger.originating_thread_id):
+        # B-151 —— 再套 B-139 的会话接单锁(8620),锁里查原会话忙不忙:新一轮的
+        # 接单也在这把锁里,所以「查到空闲 → 写入」之间不会冒出一轮新的。8619
+        # 不换号(换已上线的锁会在滚动发布期间失去互斥,见 advisory_locks)。
+        # 顺序固定 8619 → 8620;别处只拿 8620,不会互等。
+        thread_id = trigger.originating_thread_id
+        async with (
+            delivery_thread_lock(session_factory, thread_id),
+            supersede_thread_lock(session_factory, thread_id),
+        ):
+            if await _thread_busy(
+                runtime.run_manager.store, thread_id=thread_id, tenant_id=trigger.tenant_id
+            ):
+                return DeliveryOutcome("deferred")
             await inject_delivery(
                 built.graph,
                 thread_id=trigger.originating_thread_id,
