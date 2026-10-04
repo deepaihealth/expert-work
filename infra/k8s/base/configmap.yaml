@@ -108,18 +108,23 @@ data:
   EXPERT_WORK_BOOTSTRAP_ADMIN_EMAIL: ""
 
   # ------------------------------------------------------------- eval worker
+  # B-156 —— 平台辅助模型(记忆整理 / 「生成委派策略」/ 技能进化 / 评测 / 质量评审)
+  # 必须是平台凭据里真有的厂商。原先写死 anthropic,而测试 / 生产都只配了
+  # glm / kimi / deepseek / qwen / doubao,记忆整理因此从开荒起每轮报
+  # CredentialsResolverError、一条没整理成(B-51 只把它做成了看得见)。
+  # 用户 2026-10-04 拍板:统一用 glm-5.3-flash。smoke 会核对这几个厂商有没有平台凭据。
   EXPERT_WORK_ENABLE_EVAL_WORKER: "false"
   EXPERT_WORK_EVAL_WORKER_INTERVAL_S: "300"
-  EXPERT_WORK_EVAL_AGENT_PROVIDER: "anthropic"
-  EXPERT_WORK_EVAL_AGENT_MODEL: "claude-sonnet-4-6"
+  EXPERT_WORK_EVAL_AGENT_PROVIDER: "glm"
+  EXPERT_WORK_EVAL_AGENT_MODEL: "glm-5.3-flash"
 
   # ------------------------------------------------------ skill evolution
   EXPERT_WORK_ENABLE_SKILL_EVOLUTION_WORKER: "false"
   EXPERT_WORK_ENABLE_SKILL_ROLLBACK_MONITOR: "false"
   EXPERT_WORK_SKILL_EVOLUTION_WORKER_INTERVAL_S: "600"
   EXPERT_WORK_CURATION_WORKER_INTERVAL_S: "300"
-  EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_PROVIDER: "anthropic"
-  EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_MODEL: "claude-sonnet-4-6"
+  EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_PROVIDER: "glm"
+  EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_MODEL: "glm-5.3-flash"
 
   # ---------------------------------------------------------- quality monitor
   EXPERT_WORK_ENABLE_QUALITY_MONITOR: "false"
@@ -127,8 +132,8 @@ data:
   EXPERT_WORK_QUALITY_SAMPLING_RATE_PCT: "5"
   EXPERT_WORK_QUALITY_DAILY_CAP: "500"
   EXPERT_WORK_QUALITY_MONITOR_BATCH_SIZE: "200"
-  EXPERT_WORK_QUALITY_JUDGE_PROVIDER: "anthropic"
-  EXPERT_WORK_QUALITY_JUDGE_MODEL: "claude-haiku-4-5-20251001"
+  EXPERT_WORK_QUALITY_JUDGE_PROVIDER: "glm"
+  EXPERT_WORK_QUALITY_JUDGE_MODEL: "glm-5.3-flash"
   EXPERT_WORK_QUALITY_DRIFT_INTERVAL_S: "3600"
   EXPERT_WORK_QUALITY_DRIFT_RECENT_WINDOW_H: "24"
   EXPERT_WORK_QUALITY_DRIFT_BASELINE_WINDOW_H: "168"

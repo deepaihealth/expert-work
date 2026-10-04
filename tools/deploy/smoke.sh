@@ -289,6 +289,44 @@ else
     echo "OK   clickhouse data disk ${ch_use}% used"
 fi
 
+# B-156 —— 平台辅助模型的厂商必须有平台凭据。记忆整理的默认厂商写死成 anthropic、
+# 而两个环境都没配 anthropic,于是从开荒起每 4 小时报一批 CredentialsResolverError、
+# 一条记忆没整理成 —— run 不受影响,所以没有任何别的检查会红。
+# warn-only:缺凭据要人去配或改 configmap,不是要人回滚一个健康的发布。
+echo "== platform aux model credentials (B-156, warn-only) =="
+aux_check="$(kubectl -n expert-work exec "${POD}" -- python -c '
+import asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from control_plane.settings import Settings
+s = Settings()
+need = {"memory_consolidator": s.memory_consolidator_default_aux_provider}
+if s.enable_eval_worker:
+    need["eval_worker"] = s.eval_agent_provider
+if s.enable_quality_monitor:
+    need["quality_judge"] = s.quality_judge_provider
+async def main():
+    e = create_async_engine(s.db_dsn)
+    async with e.connect() as c:
+        have = {r[0] for r in (await c.execute(text("SELECT provider FROM platform_provider_secret WHERE enabled"))).all()}
+    await e.dispose()
+    for who, prov in sorted(need.items()):
+        print(("OK" if prov in have else "MISSING"), who, prov)
+asyncio.run(main())
+' 2>/dev/null)"
+if [[ -z "${aux_check}" ]]; then
+    echo "WARN aux credentials: 在 ${POD} 里没跑出结果(Settings / 表结构变了?)"
+else
+    while read -r verdict who prov; do
+        if [[ "${verdict}" == "OK" ]]; then
+            echo "OK   ${who} aux provider ${prov} has a platform credential"
+        else
+            echo "WARN ${who} aux provider ${prov} has NO enabled platform credential —— 这个后台功能每次调用都会失败。"
+            echo "     在平台凭据页给 ${prov} 配上,或改 infra/k8s/base/configmap.yaml 里对应的 *_PROVIDER / *_MODEL。"
+        fi
+    done <<< "${aux_check}"
+fi
+
 # Same Ready+not-Terminating filter as the POD pick above — probing a
 # Terminating pod's IP is a phantom failure, not a finding.
 POD_ROWS="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
