@@ -80,8 +80,14 @@ logger = logging.getLogger("expert_work.control_plane.memory_consolidator")
 _DEFAULT_INTERVAL_S: float = 14_400.0
 
 #: The lock txn is held open for the whole sweep; keep it off any idle
-#: reaper.
-_LOCK_TXN_TIMEOUT_MS = 5 * 60 * 1000
+#: reaper. It must outlast any real sweep, which is sequential LLM calls:
+#: the first sweep after aux calls started working (B-156, test env
+#: 2026-10-04) ran 27 min — 5 min let PG kill the winner's lock session,
+#: the other replica started a duplicate sweep, and the winner's final
+#: ``rollback()`` logged a misleading ``cycle_failed``. A dropped
+#: connection releases the lock at once anyway; this only bounds a live
+#: but stuck session. Same reasoning and value as ``workspace_janitor``.
+_LOCK_TXN_TIMEOUT_MS = 12 * 60 * 60 * 1000
 
 # Per-(tenant, user) safety caps. Hard-coded for Sprint #7 — Mini-ADR
 # U-34. Prevents a runaway worker from emitting thousands of LLM calls

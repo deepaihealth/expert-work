@@ -1021,3 +1021,46 @@ async def test_sweep_runs_every_store_call_under_an_explicit_rls_context() -> No
             assert ctx == (_TENANT, _USER, False), name
     assert audit_tenants == {_TENANT, _PLATFORM_TENANT_ID}
     assert _rls_ctx() == (None, None, False), "上下文必须复原,不能漏给调用方"
+
+
+@pytest.mark.asyncio
+async def test_lock_txn_idle_timeout_outlasts_a_real_sweep() -> None:
+    """B-156 — the single-flight lock txn sits idle while the sweep makes
+    sequential LLM calls. The first working sweep on test ran 27 min; a
+    5-min ``idle_in_transaction_session_timeout`` let PG kill the lock
+    session, a second replica swept in parallel, and the winner logged
+    ``cycle_failed``. The timeout must cover hours, not minutes."""
+    from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
+
+    statements: list[str] = []
+    factory = FakeAdvisoryLockSessionFactory()
+
+    def recording_factory() -> object:
+        session = factory()
+        real = session.execute
+
+        async def execute(stmt: object, params: dict[str, object] | None = None) -> object:
+            statements.append(str(stmt))
+            return await real(stmt, params)
+
+        session.execute = execute  # type: ignore[method-assign]
+        return session
+
+    audit_logger, _audit_store = _build_logger()
+    worker = MemoryConsolidator(
+        memory_store=InMemoryMemoryStore(),
+        tenant_config_service=TenantConfigService(
+            store=InMemoryTenantConfigStore(), audit_logger=audit_logger
+        ),
+        audit_logger=audit_logger,
+        aux_model=_ScriptedAuxModel([]),
+        embedder=_FakeEmbedder(),
+        session_factory=recording_factory,  # type: ignore[arg-type]
+    )
+    await worker.run_once()
+
+    timeouts = [
+        int(s.rsplit("=", 1)[1]) for s in statements if "idle_in_transaction_session_timeout" in s
+    ]
+    assert timeouts, statements
+    assert min(timeouts) >= 4 * 60 * 60 * 1000
