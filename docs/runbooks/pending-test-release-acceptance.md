@@ -1,6 +1,6 @@
 # 待统一发测试的真栈验收清单
 
-> **规矩(2026-10-03 用户改拍板,取代 10-02 的「测试环境保持 `54d1ed70` 不动」)**:主干上做完的这一批**不等 10-08 之后**,先重钉 main 统一发测试环境,按本清单逐条做真栈验收,随 10-08 上生产。**10-07 判定**:任何一条该过的不过,10-08 就退回原钉子 `54d1ed70` 发。10-03 已重钉到 `fc07b8b1`(生产执行单第十五次重钉),验收记录见各条「10-03」。
+> **规矩(2026-10-03 用户改拍板,取代 10-02 的「测试环境保持 `54d1ed70` 不动」)**:主干上做完的这一批**不等 10-08 之后**,先重钉 main 统一发测试环境,按本清单逐条做真栈验收,随 10-08 上生产。**10-07 判定**:任何一条该过的不过,10-08 就退回原钉子 `54d1ed70` 发。10-03 已重钉到 `fc07b8b1`(生产执行单第十五次重钉),验收记录见各条「10-03」。10-04 24h 复查发现的三个问题修在 #1736 / #1737 / #1738,重钉到 `5091938c`(第十六次),用例见 §10。
 >
 > - **每个合进 main、要上测试才能验的 PR,必须在同一个 PR 里往本清单加用例**(或在已有条目下补)。纯文档 / CI 改动不用加。
 > - 用例写到「怎么触发 + 看哪里 + 判据」,判据要能红(先问:没修好的话这里会不会红)。
@@ -25,6 +25,9 @@
 | #1734 | B-154 Langfuse 的 ClickHouse 系统日志表无保留期、把数据盘写满(Langfuse 写入被静默丢弃);加 7 天 TTL + 降日志级别 + smoke 磁盘告警 | 是 | §2.5 |
 | `5c583c69` #1675 | CI 的 codeql upload-sarif | 否 | — |
 | 其余 | 文档(ROADMAP / 执行单) | 否 | — |
+| #1736 | B-156 平台辅助模型默认 anthropic → `glm` / `glm-5.3-flash`;记忆整理锁超时 5 分钟 → 12 小时;smoke 加辅助模型凭据检查(10-04 追加,`fc07b8b1..5091938c`) | 是 | §10.1、§10.2 |
+| #1738 | B-155 MCP 会话放进专属任务,新 pod 首个流式请求不再断(10-04 追加) | 是 | §10.3 |
+| #1737 | B-157 三个 204 接口不带响应体(10-04 追加) | 是 | §10.4 |
 
 ## §1 B-136 读文件分页(ROADMAP B-136)
 
@@ -125,3 +128,12 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [x] **9.2 空闲时触发(对照)**:会话空闲时点「立即运行」。判据:接口直接返回 `delivered`,历史立刻多出那条结果。 **10-03 首轮(`d0342507`)过**。
 - [ ] **9.3 按时间自然触发**:把任务时间改到两分钟后,在那之前开始一轮长文,让触发时刻落在长文中间。判据:同 9.1,结果在长文结束后才出现,一条不少。 **10-03 未完全覆盖**:自然到点触发的路径跑通(结果正常写回),但触发时刻没落在长文中间(没形成重叠);「忙时推迟」本身由 9.1 / 9.2 的立即触发验过。
 - [x] **9.4 原会话停在审批上**(需要一个带审批工具的 Agent,没有可跳过并注明):最新一轮停在审批上时触发。判据:返回 `pending`;审批处理完、那一轮结束后结果才写进去;审批恢复照常(不报错、不丢那一轮)。 **10-03 首轮(`d0342507`)过**。
+
+## §10 24h 复查的三个修复(ROADMAP B-155 / B-156 / B-157)
+
+**背景**:10-04 对 `fc07b8b1` 做 24h 复查,结论 GO 但带三条问题:记忆整理每轮约 196 次 `CredentialsResolverError`(辅助模型默认 anthropic,两个环境都没有它的平台凭据);发版后金丝雀首跑 `ReadError`(4 次发版 3 次,anyio 4.14 下 MCP 会话把 cancel scope 留在请求任务上);删除类 204 接口服务端报 `Response content longer than Content-Length`。
+
+- [x] **10.1 辅助模型能调通**:临时把 `EXPERT_WORK_MEMORY_CONSOLIDATOR_INTERVAL_S` 设成 120(`kubectl set env`,验完用 `…INTERVAL_S-` 去掉,`apply -k` 不会清掉它),等一轮整理跑完。判据:`token_usage` 里 `usage_kind='memory_consolidation'` 出现 `glm-5.3-flash` 的行;日志 `memory_consolidator.sweep_complete … errors=0`;smoke 打出 `OK   memory_consolidator aux provider glm has a platform credential`(改前同一检查打 `WARN … anthropic has NO enabled platform credential`)。 **10-04(#1736 分支 `18dde1d5`)过**:13:31 起一轮,glm-5.3-flash 调用 124+ 次,13:58 `sweep_complete tenants=1 users=27 candidates=3 consolidated=1 rejected=2 purged=44 reviewed_durable=97 errors=0`;一次 `lone_review_failed` 是 glm 侧 `LLMNetworkError`(单条容错,不计 errors)。
+- [x] **10.2 整理只在一个副本上跑,不误报失败**:同一轮里看两个 pod 的 `memory_consolidator` 日志。判据:只有一个 pod 在跑整理,没有 `cycle_failed`。 **10-04 首跑(`18dde1d5`)不过**:27 分钟的一轮里,第二个 pod 13:45 也在跑(它的 `lone_review_failed`),赢家 13:58 收尾报 `cycle_failed`(`cannot call Transaction.rollback(): the underlying connection is closed`)—— 锁事务空闲超时只有 5 分钟。修在 #1736 第二个提交(12 小时)。**复验(`38e7ecd3`)过**:只有一个 pod 打 `sweep_complete … errors=0`、无 `cycle_failed`;但那一轮积压已清、很短,够不到 5 分钟,**长轮的复现靠单元测试**(`test_lock_txn_idle_timeout_outlasts_a_real_sweep`,退回 5 分钟即红)。
+- [x] **10.3 新 pod 的第一个流式请求不断**:发版后**不要先跑别的**,在每个全新 pod 上各跑一次金丝雀(`kubectl exec` 进指定 pod 跑 `tools/deploy/canary.py`)。判据:首跑 PASS;每个 pod `grep -c 'Attempted to exit a cancel scope'` 为 0(修前:新 pod 的首个流式请求必中)。 **10-04 过**:`38e7ecd3` 两个新 pod 首跑 PASS、计数 0;去掉整理间隔又滚出两个新 pod,首跑 PASS、计数 0 —— 4/4。main `5091938c` 发测试后再两个新 pod 首跑 PASS、计数 0(累计 6/6)。
+- [x] **10.4 删除类 204 不再报错**:控制台登录态下建临时 Agent + 会话 + 上传一张图,再删图(`DELETE /v1/uploads/{id}`)、删 Agent(`DELETE /v1/agents/{name}/{version}`),最后归档会话。判据:两个都 204;**打到的 pod** 日志 `grep -c 'Response content longer'` 为 0(浏览器对 204 会丢弃响应体,客户端看不出区别,判据只能在服务端)。断开 MCP OAuth 需要真实授权连接,测试环境没有,靠单元测试(同一行改法)。 **10-04(`38e7ecd3` 后滚出的 pod)过**:删图 204、删 Agent 204,两条 DELETE 都落在 `t9tk2`,计数 0、该 pod ERROR 0;临时 Agent `b157-probe` 已删、会话已归档。
