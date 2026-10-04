@@ -467,14 +467,13 @@ async def _open_owned_session(
                     return
                 ready.set_result(session)
                 await stop.wait()
-        except BaseException as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             if not ready.done():
                 ready.set_exception(exc)
                 return
-            if isinstance(exc, Exception):
-                logger.debug("mcp.session_owner_exit_error err=%s", exc)
-                return
-            raise
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            logger.debug("mcp.session_owner_exit_error err=%s", exc)
 
     task = asyncio.create_task(_own())
     try:
@@ -486,8 +485,8 @@ async def _open_owned_session(
         ready.cancel()
         stop.set()
         task.cancel()
-        with contextlib.suppress(BaseException):
-            await task
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(task, return_exceptions=True)
         raise
     return _OwnedSession(task, stop), session
 

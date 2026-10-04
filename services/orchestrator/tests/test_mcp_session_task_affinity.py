@@ -32,7 +32,6 @@ from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import orchestrator.tools.mcp as mcp_mod
-from orchestrator.tools.mcp import MCPServerConfig, _RemoteMCPClientBase
 
 _SERVER_TASKS: set[asyncio.Task[None]] = set()
 
@@ -48,7 +47,7 @@ def _fastmcp() -> FastMCP:
 
 
 @dataclass
-class _InMemoryMCPClient(_RemoteMCPClientBase):
+class _InMemoryMCPClient(mcp_mod._RemoteMCPClientBase):
     """Real ``ClientSession`` over anyio memory streams; server in its own task."""
 
     _server: Any = field(default_factory=_fastmcp, init=False, repr=False)
@@ -75,7 +74,9 @@ def _app(holder: dict[str, Any]) -> FastAPI:
     async def run(request: Request) -> StreamingResponse:
         if "client" not in holder:  # lazy first-use build, like TenantMCPPool
             client = _InMemoryMCPClient(
-                config=MCPServerConfig(name="t", transport="streamable_http", url="http://x/mcp")
+                config=mcp_mod.MCPServerConfig(
+                    name="t", transport="streamable_http", url="http://x/mcp"
+                )
             )
             await client.start()
             holder["client"] = client
@@ -95,7 +96,6 @@ def _app(holder: dict[str, Any]) -> FastAPI:
 
 @pytest.mark.timeout(30)
 async def test_lazy_mcp_session_in_request_does_not_break_middleware() -> None:
-    print("orchestrator.tools.mcp from", mcp_mod.__file__)
     holder: dict[str, Any] = {}
     transport = httpx.ASGITransport(app=_app(holder))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
@@ -138,8 +138,8 @@ async def test_cancelled_open_closes_the_stack_and_leaves_nothing_behind() -> No
         opener = asyncio.create_task(mcp_mod._open_owned_session(slow_open))
         await opening.wait()
         opener.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await opener
+        await asyncio.wait({opener})
+        assert opener.cancelled()
         del opener
         for _ in range(3):
             await asyncio.sleep(0)
