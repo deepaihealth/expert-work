@@ -426,6 +426,71 @@ def _lenient_client_session_cls() -> Any:
     return LenientClientSession
 
 
+class _OwnedSession:
+    """Handle for a session whose transport lives in its own owner task.
+
+    The SDK's transports and ``ClientSession`` each hold an anyio task group;
+    anyio requires a cancel scope to be exited by the task that entered it, in
+    LIFO order. Opening them on the caller's task (a request, lazily) leaves
+    those scopes pushed on that task's stack after ``_open_session`` returns;
+    under anyio >= 4.14 the request task's own per-task scope then fails to
+    exit (``isn't the current tasks's current cancel scope``), and closing
+    later from another task fails (``different task``). Entering *and*
+    exiting everything inside one dedicated task avoids both.
+
+    Exposes ``__aexit__`` so the existing ``stack.__aexit__(None, None, None)``
+    call sites (``close`` / ``_restart``) keep working unchanged.
+    """
+
+    def __init__(self, task: asyncio.Task[None], stop: asyncio.Event) -> None:
+        self._task = task
+        self._stop = stop
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self._stop.set()
+        await self._task
+
+
+async def _open_owned_session(
+    open_in_stack: Callable[[contextlib.AsyncExitStack], Any],
+) -> tuple[_OwnedSession, Any]:
+    """Run ``open_in_stack`` + the session's whole lifetime in one owner task."""
+    loop = asyncio.get_running_loop()
+    ready: asyncio.Future[Any] = loop.create_future()
+    stop = asyncio.Event()
+
+    async def _own() -> None:
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                session = await open_in_stack(stack)
+                if ready.done():  # opener was cancelled meanwhile
+                    return
+                ready.set_result(session)
+                await stop.wait()
+        except (Exception, asyncio.CancelledError) as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+                return
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            logger.debug("mcp.session_owner_exit_error err=%s", exc)
+
+    task = asyncio.create_task(_own())
+    try:
+        session = await asyncio.shield(ready)
+    except BaseException:
+        # Cancel ``ready`` first so the owner re-raises its cancellation
+        # instead of parking it on a future nobody reads ("Future exception
+        # was never retrieved").
+        ready.cancel()
+        stop.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(task, return_exceptions=True)
+        raise
+    return _OwnedSession(task, stop), session
+
+
 @dataclass
 class StdioMCPClient:
     """Production :class:`MCPClient` — wraps the mcp SDK stdio transport.
@@ -441,7 +506,7 @@ class StdioMCPClient:
     """
 
     config: MCPServerConfig
-    _stack: contextlib.AsyncExitStack | None = field(default=None, init=False, repr=False)
+    _stack: _OwnedSession | None = field(default=None, init=False, repr=False)
     _session: Any = field(default=None, init=False, repr=False)
     #: BUG-17 — serialises :meth:`_restart` so N concurrent callers hitting
     #: one dead session reconnect exactly once.
@@ -454,7 +519,7 @@ class StdioMCPClient:
             raise RuntimeError(msg)
         self._stack, self._session = await self._open_session()
 
-    async def _open_session(self) -> tuple[contextlib.AsyncExitStack, Any]:
+    async def _open_session(self) -> tuple[_OwnedSession, Any]:
         """Launch the subprocess + handshake; return ``(stack, session)``."""
         # Imports kept local so the orchestrator can be imported in
         # contexts where the mcp SDK isn't available (e.g. middleware-
@@ -476,16 +541,14 @@ class StdioMCPClient:
             args=list(command[1:]),
             env=dict(self.config.env) or None,
         )
-        stack = contextlib.AsyncExitStack()
-        await stack.__aenter__()
-        try:
+
+        async def _open(stack: contextlib.AsyncExitStack) -> Any:
             read, write = await stack.enter_async_context(stdio_client(params))
             session = await stack.enter_async_context(session_cls(read, write))
             await session.initialize()
-        except BaseException:
-            await stack.__aexit__(None, None, None)
-            raise
-        return stack, session
+            return session
+
+        return await _open_owned_session(_open)
 
     def _require_session(self) -> Any:
         if self._session is None:
@@ -598,7 +661,7 @@ class _RemoteMCPClientBase:
 
     config: MCPServerConfig
     resolved_headers: Mapping[str, str] = field(default_factory=dict, repr=False)
-    _stack: contextlib.AsyncExitStack | None = field(default=None, init=False, repr=False)
+    _stack: _OwnedSession | None = field(default=None, init=False, repr=False)
     _session: Any = field(default=None, init=False, repr=False)
     #: Mini-ADR U-13 — per-server breaker so a down remote server short-circuits
     #: instead of eating the full ``timeout_s`` on every call (audit #3).
@@ -620,23 +683,20 @@ class _RemoteMCPClientBase:
             raise RuntimeError(msg)
         self._stack, self._session = await self._open_session()
 
-    async def _open_session(self) -> tuple[contextlib.AsyncExitStack, Any]:
+    async def _open_session(self) -> tuple[_OwnedSession, Any]:
         """Open the transport streams + handshake; return ``(stack, session)``."""
         # Imports kept local so orchestrator can be imported in contexts
         # that don't have the mcp SDK on the path (e.g. middleware-only
         # unit tests with no MCP wiring).
         session_cls = _lenient_client_session_cls()
 
-        stack = contextlib.AsyncExitStack()
-        await stack.__aenter__()
-        try:
+        async def _open(stack: contextlib.AsyncExitStack) -> Any:
             read, write = await self._open_streams(stack)
             session = await stack.enter_async_context(session_cls(read, write))
             await session.initialize()
-        except BaseException:
-            await stack.__aexit__(None, None, None)
-            raise
-        return stack, session
+            return session
+
+        return await _open_owned_session(_open)
 
     def _require_session(self) -> Any:
         if self._session is None:
