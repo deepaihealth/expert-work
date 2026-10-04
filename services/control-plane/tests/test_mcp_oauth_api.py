@@ -293,6 +293,7 @@ async def test_disconnect_revokes_and_removes(monkeypatch: pytest.MonkeyPatch) -
         ).access_token_ref
         dele = await client.delete(f"/v1/mcp-oauth/connections/{cid}", headers=headers)
     assert dele.status_code == 204
+    assert dele.content == b""  # 204 carries no body (uvicorn rejects one)
     # Row gone.
     gone = await app.state.mcp_oauth_connection_store.get_for_connector(  # type: ignore[attr-defined]
         tenant_id=tenant_id, user_id=user_id, catalog_id=cat_id

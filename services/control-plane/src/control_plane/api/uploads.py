@@ -25,7 +25,7 @@ from typing import Annotated, Final
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._image_sanitize import ImageSanitizeError, strip_exif
@@ -601,7 +601,7 @@ def build_uploads_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
-    ) -> JSONResponse:
+    ) -> Response:
         """Soft-delete an image upload.
 
         Mini-ADR J-32 (J.6.补强-3) — flips ``image_upload.deleted_at`` so
@@ -654,6 +654,6 @@ def build_uploads_router() -> APIRouter:
                 "operation": "soft_delete",
             },
         )
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     return router

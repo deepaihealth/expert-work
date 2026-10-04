@@ -20,7 +20,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
@@ -2598,7 +2598,7 @@ def build_agents_router() -> APIRouter:
         runtime: Annotated[AgentRuntime, Depends(_get_runtime)],
         triggers: Annotated[TriggerStore, Depends(_get_trigger_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
-    ) -> JSONResponse:
+    ) -> Response:
         tenant_id = request.state.tenant_id
         actor_id = request.state.actor_id
         trace_id = current_trace_id_hex()
@@ -2680,7 +2680,7 @@ def build_agents_router() -> APIRouter:
             trace_id=trace_id,
             details=details,
         )
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     async def _agent_exists(repo: AgentSpecStore, tenant_id: UUID, name: str) -> bool:
         """``True`` iff the tenant has any version of ``name`` (any lifecycle status)."""
