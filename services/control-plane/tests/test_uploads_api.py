@@ -600,6 +600,7 @@ async def test_delete_image_soft_deletes_row_and_emits_audit(audit_setup: AuditS
 
     response = await client.delete(f"/v1/uploads/{image_id}")
     assert response.status_code == 204
+    assert response.content == b""  # 204 carries no body (uvicorn rejects one)
 
     images = client._transport.app.state.image_upload_store  # type: ignore[attr-defined,union-attr]
     active = await images.list_active_for_thread(tenant_id=_TENANT, thread_id=thread_id)

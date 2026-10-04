@@ -22,7 +22,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._authz import console_only, require
@@ -417,7 +417,7 @@ def build_mcp_oauth_router() -> APIRouter:
         connection_id: Annotated[UUID, Path()],
         principal: Annotated[Principal, Depends(require("mcp_oauth", "delete"))],
         request: Request,
-    ) -> JSONResponse:
+    ) -> Response:
         """OA-4 — disconnect: delete the stored tokens, drop the row, invalidate
         the caches."""
         tenant_id = principal.tenant_id
@@ -454,6 +454,6 @@ def build_mcp_oauth_router() -> APIRouter:
             trace_id=current_trace_id_hex(),
             details={"scope": "oauth", "name": existing.name, "source": "oauth_disconnect"},
         )
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     return router

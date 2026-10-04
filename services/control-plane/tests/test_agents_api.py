@@ -276,6 +276,9 @@ async def test_delete_soft_removes(b5_client: AsyncClient) -> None:
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
     response = await b5_client.delete("/v1/agents/code-reviewer/1.0.0")
     assert response.status_code == 204
+    # A 204 must carry no body; ``JSONResponse(None)`` sent ``null`` and uvicorn
+    # raised "Response content longer than Content-Length" after replying.
+    assert response.content == b""
 
     # GET no longer returns the row (soft-deleted rows are hidden).
     follow_up = await b5_client.get("/v1/agents/code-reviewer/1.0.0")
