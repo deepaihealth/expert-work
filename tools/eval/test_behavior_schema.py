@@ -113,3 +113,20 @@ def test_read_results_requires_header(tmp_path: Path) -> None:
     append_line(out, CaseResult(case_id="g99-sample", rep=1, passed=True))
     with pytest.raises(ValueError, match="header"):
         read_results(out)
+
+
+def test_case_set_hash_ignores_caches_and_dotfiles(tmp_path: Path) -> None:
+    cases, fixtures = tmp_path / "cases", tmp_path / "fixtures"
+    _write(cases, "g99-sample.yaml", _CASE)
+    _write(fixtures, "a.md", "旧\n")
+    before = case_set_hash(cases, fixtures)
+    (fixtures / "__pycache__").mkdir()
+    (fixtures / "__pycache__" / "make_fixtures.cpython-313.pyc").write_bytes(b"\x00pyc")
+    (fixtures / ".DS_Store").write_bytes(b"mac")
+    assert case_set_hash(cases, fixtures) == before
+
+
+def test_final_text_regex_must_compile(tmp_path: Path) -> None:
+    bad = _CASE.replace("{type: completed}", "{type: final_text_regex, pattern: '(unclosed'}")
+    with pytest.raises(ValidationError, match="regex"):
+        load_case(_write(tmp_path, "g99-sample.yaml", bad))

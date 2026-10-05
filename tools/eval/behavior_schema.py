@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DATASET_DIR = Path(__file__).parent / "datasets" / "behavior"
 CASES_DIR = DATASET_DIR / "cases"
@@ -51,6 +52,16 @@ class FinalTextNotContains(_Strict):
 class FinalTextRegex(_Strict):
     type: Literal["final_text_regex"]
     pattern: str = Field(min_length=1)
+
+    @field_validator("pattern")
+    @classmethod
+    def _compiles(cls, value: str) -> str:
+        # 加载时就报错,别等智能体跑完才在判分时炸掉整批。
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"invalid regex {value!r}: {exc}") from exc
+        return value
 
 
 class ArtifactExists(_Strict):
@@ -175,11 +186,17 @@ def load_cases(cases_dir: Path = CASES_DIR, only: Iterable[str] | None = None) -
     return [c for c in cases if c.id in wanted]
 
 
+def _counts(path: Path, root: Path) -> bool:
+    """只算入库的内容:跳过 ``__pycache__`` 与点文件(测试导入生成脚本会留下 pyc)。"""
+    parts = path.relative_to(root).parts
+    return not any(part == "__pycache__" or part.startswith(".") for part in parts)
+
+
 def case_set_hash(cases_dir: Path = CASES_DIR, fixtures_dir: Path = FIXTURES_DIR) -> str:
     """用例与 fixtures 的内容哈希(12 位)。对照时两边不同就拒绝比较。"""
     digest = hashlib.sha256()
     for root in (cases_dir, fixtures_dir):
-        for p in sorted(q for q in root.rglob("*") if q.is_file()):
+        for p in sorted(q for q in root.rglob("*") if q.is_file() and _counts(q, root)):
             digest.update(str(p.relative_to(root.parent)).encode())
             digest.update(b"\0")
             digest.update(p.read_bytes())

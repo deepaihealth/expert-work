@@ -55,3 +55,11 @@ def test_g02_fixture_has_the_three_outdated_lines_where_the_case_says() -> None:
 def test_no_coach_wording_in_cases() -> None:
     for path in Path(CASES_DIR).glob("*.yaml"):
         assert "教练" not in path.read_text(encoding="utf-8").replace("any: [教练]", ""), path.name
+
+
+def test_every_fixture_used_by_a_case_is_an_allowed_upload_type() -> None:
+    from behavior_client import content_type_for
+
+    for case in load_cases(CASES_DIR):
+        for name in case.fixtures:
+            content_type_for(name)  # raises ValueError for types the upload API rejects

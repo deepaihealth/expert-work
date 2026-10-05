@@ -201,3 +201,27 @@ def test_main_refuses_missing_token_and_existing_output(
     out.write_text("", encoding="utf-8")
     with pytest.raises(SystemExit, match="exists"):
         runner.main(["--label", "x", "--base-url", "http://localhost", "--out", str(out)])
+
+
+@pytest.mark.asyncio
+async def test_run_one_records_unexpected_errors_as_harness_errors(tmp_path: Path) -> None:
+    client = FakeClient([ValueError("bad fixture type")])
+    res = await runner.run_one(
+        client, _case(), 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
+    )
+    assert res.passed is None and (res.infra_error or "").startswith("harness error")
+    assert sum(1 for c in client.calls if c[0] == "run_turn") == 1
+
+
+def test_check_base_url_is_an_exact_allowlist() -> None:
+    with pytest.raises(SystemExit):
+        runner.check_base_url("https://prod-test.attacker.io")
+    with pytest.raises(SystemExit):
+        runner.check_base_url("http://expert-work-test.deepaihealth.com")
+    runner.check_base_url("http://127.0.0.1:8000")
+
+
+def test_validate_agent_map_rejects_unknown_source() -> None:
+    runner.validate_agent_map({"eval-general": "eval-general-b"}, [_case()])
+    with pytest.raises(SystemExit, match="eval-aph"):
+        runner.validate_agent_map({"eval-aph": "eval-ahp-b"}, [_case()])

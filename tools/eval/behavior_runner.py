@@ -43,6 +43,8 @@ from behavior_schema import (  # noqa: E402
 )
 
 DEFAULT_BASE_URL = "https://expert-work-test.deepaihealth.com"
+_TEST_HOSTS = frozenset({"expert-work-test.deepaihealth.com"})
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _ATTEMPTS = 3
 
 
@@ -71,10 +73,26 @@ class Client(Protocol):
 
 
 def check_base_url(url: str) -> None:
-    host = urlparse(url).hostname or ""
-    if not (host in {"localhost", "127.0.0.1"} or "-test." in host):
+    """只放行测试环境(https)与本机 —— API key 会随每个请求发出去。"""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if host in _LOCAL_HOSTS:
+        return
+    if host in _TEST_HOSTS and parsed.scheme == "https":
+        return
+    raise SystemExit(
+        f"refusing to run against {url!r}: "
+        f"B-140 runs only on https://{min(_TEST_HOSTS)} or localhost"
+    )
+
+
+def validate_agent_map(agent_map: dict[str, str], cases: list[Case]) -> None:
+    """替换表的源必须是用例真用到的智能体 —— 写错时静默不换,对照会报一张假的「持平」。"""
+    used = {c.agent for c in cases}
+    unknown = sorted(set(agent_map) - used)
+    if unknown:
         raise SystemExit(
-            f"refusing to run against {host!r}: B-140 runs only on the test env or localhost"
+            f"--agent-map source(s) {unknown} not used by the selected cases ({sorted(used)})"
         )
 
 
@@ -172,6 +190,9 @@ async def run_one(
             if exc.response.status_code < 500:
                 break  # 4xx 是用例或配置错,重试没用
             continue
+        except Exception as exc:  # 评测框架自己的错:记下来、不判分,别让一条用例拖垮整批
+            last_error = f"harness error: {type(exc).__name__}: {exc}"
+            break
         verdicts = evaluate(case, record, files, fixtures_dir)
         return CaseResult(
             case_id=case.id,
@@ -234,6 +255,7 @@ def _agent_map(items: list[str]) -> dict[str, str]:
 async def _amain(args: argparse.Namespace, token: str, out: Path) -> int:
     cases = load_cases(only=args.only.split(",") if args.only else None)
     agent_map = _agent_map(args.agent_map)
+    validate_agent_map(agent_map, cases)
     header = ResultHeader(
         label=args.label,
         started_at=datetime.now(UTC).isoformat(timespec="seconds"),
