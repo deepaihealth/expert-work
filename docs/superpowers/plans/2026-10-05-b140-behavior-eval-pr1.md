@@ -453,7 +453,7 @@ git commit -m "feat(eval): B-140 behavior eval data model and case loader"
 - Test: `tools/eval/test_behavior_extract.py`
 
 **Interfaces:**
-- Produces: `document_text(name: str, data: bytes) -> str`;异常 `UnsupportedDocument(ValueError)`。docx 每段一行;pptx 按幻灯片编号顺序、每段一行;`.md/.txt/.csv/.json/.py/.html` 按 UTF-8 解码;其余(含 `.pdf` / `.xlsx`)抛 `UnsupportedDocument`。
+- Produces: `document_text(name: str, data: bytes) -> str`;异常 `UnsupportedDocumentError(ValueError)`。docx 每段一行;pptx 按幻灯片编号顺序、每段一行;`.md/.txt/.csv/.json/.py/.html` 按 UTF-8 解码;其余(含 `.pdf` / `.xlsx`)抛 `UnsupportedDocumentError`。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -467,7 +467,7 @@ import zipfile
 
 import pytest
 
-from behavior_extract import UnsupportedDocument, document_text
+from behavior_extract import UnsupportedDocumentError, document_text
 
 _W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
 _A = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
@@ -495,7 +495,9 @@ def test_pptx_slides_in_numeric_order() -> None:
     def slide(text: str) -> str:
         return f"<p:sld {_A} xmlns:p='x'><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:sld>"
 
-    data = _zip({"ppt/slides/slide10.xml": slide("第十页"), "ppt/slides/slide2.xml": slide("第二页")})
+    data = _zip(
+        {"ppt/slides/slide10.xml": slide("第十页"), "ppt/slides/slide2.xml": slide("第二页")}
+    )
     assert document_text("deck.PPTX", data) == "第二页\n第十页"
 
 
@@ -504,7 +506,7 @@ def test_plain_text_decoded() -> None:
 
 
 def test_pdf_is_unsupported() -> None:
-    with pytest.raises(UnsupportedDocument):
+    with pytest.raises(UnsupportedDocumentError):
         document_text("a.pdf", b"%PDF-1.7")
 ```
 
@@ -535,7 +537,7 @@ _TEXT_SUFFIXES = (".md", ".txt", ".csv", ".json", ".py", ".html")
 _SLIDE_RE = re.compile(r"ppt/slides/slide(\d+)\.xml")
 
 
-class UnsupportedDocument(ValueError):
+class UnsupportedDocumentError(ValueError):
     """判据要读的产物类型本版取不出文本。"""
 
 
@@ -563,7 +565,7 @@ def document_text(name: str, data: bytes) -> str:
             return "\n".join(lines)
     if lower.endswith(_TEXT_SUFFIXES):
         return data.decode("utf-8", errors="replace")
-    raise UnsupportedDocument(f"no text extractor for {name!r}")
+    raise UnsupportedDocumentError(f"no text extractor for {name!r}")
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -587,7 +589,7 @@ git commit -m "feat(eval): B-140 extract text from docx/pptx artifacts without n
 - Test: `tools/eval/test_behavior_checks.py`
 
 **Interfaces:**
-- Consumes: Task 1 全部判据类、`Case`、`RunRecord`、`ToolCall`、`TurnRecord`、`CheckVerdict`;Task 2 `document_text`、`UnsupportedDocument`。
+- Consumes: Task 1 全部判据类、`Case`、`RunRecord`、`ToolCall`、`TurnRecord`、`CheckVerdict`;Task 2 `document_text`、`UnsupportedDocumentError`。
 - Produces: `FileKey = tuple[Literal["artifact", "workspace"], str]`;`FetchedFile = tuple[str, bytes]`(实际文件名,内容);`required_files(case) -> list[FileKey]`;`evaluate(case, record, files: Mapping[FileKey, FetchedFile | None], fixtures_dir: Path) -> list[CheckVerdict]`;`changed_lines(before: str, after: str) -> set[int]`;`path_matches(candidate: str, target: str) -> bool`。
 
 - [ ] **Step 1: 写失败的测试**
@@ -785,7 +787,7 @@ from pathlib import Path
 from typing import Literal
 from xml.etree import ElementTree as ET
 
-from behavior_extract import UnsupportedDocument, document_text
+from behavior_extract import UnsupportedDocumentError, document_text
 from behavior_schema import (
     ArtifactContains,
     ArtifactExists,
@@ -813,7 +815,7 @@ from behavior_schema import (
 FileKey = tuple[Literal["artifact", "workspace"], str]
 FetchedFile = tuple[str, bytes]  # (实际文件名, 内容)
 
-_UNREADABLE = (UnsupportedDocument, zipfile.BadZipFile, KeyError, ET.ParseError)
+_UNREADABLE = (UnsupportedDocumentError, zipfile.BadZipFile, KeyError, ET.ParseError)
 
 
 def required_files(case: Case) -> list[FileKey]:
@@ -1006,7 +1008,7 @@ git status --porcelain   # 期望为空
   - `download_artifact(agent: str, user_id: str, entry: dict[str, Any]) -> bytes | None`(404 → None)
   - `read_workspace_file(agent: str, user_id: str, path: str) -> bytes | None`(404 → None)
   - `archive(agent: str, user_id: str, session_id: str) -> None`
-- 异常 `StreamIncomplete(RuntimeError)`:流在 `end` 帧前结束。
+- 异常 `StreamIncompleteError(RuntimeError)`:流在 `end` 帧前结束。
 - 辅助:`SseParser.feed(line) -> tuple[str, str] | None`、`SseParser.flush()`;`TurnBuilder(index)`、`.on_frame(event, raw)`、`.result(wall_s) -> TurnRecord`、`.session_id`。
 
 - [ ] **Step 1: 写失败的测试**
@@ -1023,7 +1025,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from behavior_client import ExternalClient, SseParser, StreamIncomplete
+from behavior_client import ExternalClient, SseParser, StreamIncompleteError
 
 
 def _sse(*frames: tuple[str, object]) -> str:
@@ -1098,7 +1100,7 @@ async def test_run_turn_continues_session_and_keeps_usage_absent() -> None:
 async def test_run_turn_without_end_raises_stream_incomplete() -> None:
     frames = [f for f in _FRAMES if f[0] != "end"]
     client = _client(lambda request: httpx.Response(200, text=_sse(*frames)))
-    with pytest.raises(StreamIncomplete):
+    with pytest.raises(StreamIncompleteError):
         await client.run_turn("eval-general", "u1", None, "p", [], 1)
 
 
@@ -1183,7 +1185,7 @@ _AI_TYPES = {"ai", "AIMessage", "AIMessageChunk"}
 _TOOL_TYPES = {"tool", "ToolMessage"}
 
 
-class StreamIncomplete(RuntimeError):
+class StreamIncompleteError(RuntimeError):
     """流在 ``end`` 帧之前结束 —— 记为 infra_error,不算任务不过。"""
 
 
@@ -1286,7 +1288,7 @@ class TurnBuilder:
 
     def result(self, wall_s: float) -> TurnRecord:
         if self._end is None:
-            raise StreamIncomplete(f"turn {self.index}: stream ended without an end frame (run {self._run_id})")
+            raise StreamIncompleteError(f"turn {self.index}: stream ended without an end frame (run {self._run_id})")
         end = self._end
         usage = end.get("usage_by_model")
         tokens_in: int | None = None
@@ -1401,7 +1403,7 @@ git commit -m "feat(eval): B-140 external-plane client (upload, stream a turn, f
 - Test: `tools/eval/test_behavior_runner.py`
 
 **Interfaces:**
-- Consumes: Task 1 `Case` / `CaseResult` / `ResultHeader` / `RunRecord` / `TurnRecord` / `append_line` / `case_set_hash` / `load_cases` / `FIXTURES_DIR`;Task 3 `FileKey` / `FetchedFile` / `evaluate` / `required_files`;Task 4 `ExternalClient` / `StreamIncomplete`。
+- Consumes: Task 1 `Case` / `CaseResult` / `ResultHeader` / `RunRecord` / `TurnRecord` / `append_line` / `case_set_hash` / `load_cases` / `FIXTURES_DIR`;Task 3 `FileKey` / `FetchedFile` / `evaluate` / `required_files`;Task 4 `ExternalClient` / `StreamIncompleteError`。
 - Produces: `check_base_url(url: str) -> None`(不合规 `SystemExit`);`find_artifact(turns: list[TurnRecord], pattern: str) -> dict[str, Any] | None`;`metrics_of(record: RunRecord) -> dict[str, float]`;`async run_case_once(client, case, *, rep, label, agent_map, fixtures_dir) -> tuple[RunRecord, dict[FileKey, FetchedFile | None]]`;`async run_one(client, case, rep, *, label, agent_map, fixtures_dir) -> CaseResult`;`async run_suite(client, cases, *, header, out_path, repeats, concurrency, agent_map, fixtures_dir=FIXTURES_DIR) -> list[CaseResult]`;`main() -> int`。
 
 - [ ] **Step 1: 写失败的测试**
@@ -1418,7 +1420,7 @@ import httpx
 import pytest
 
 import behavior_runner as runner
-from behavior_client import StreamIncomplete
+from behavior_client import StreamIncompleteError
 from behavior_schema import Case, ResultHeader, RunRecord, TurnRecord, read_results
 
 
@@ -1495,7 +1497,7 @@ async def test_run_one_scores_a_passing_case(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_run_one_retries_transport_errors_then_records_infra(tmp_path: Path) -> None:
     fx = _fixtures(tmp_path)
-    flaky = FakeClient([httpx.ConnectError("boom"), StreamIncomplete("cut")])
+    flaky = FakeClient([httpx.ConnectError("boom"), StreamIncompleteError("cut")])
     assert (await runner.run_one(flaky, _case(), 1, label="b", agent_map={}, fixtures_dir=fx)).passed is True
     dead = FakeClient([httpx.ConnectError("boom")] * 3)
     res = await runner.run_one(dead, _case(), 1, label="b", agent_map={}, fixtures_dir=fx)
@@ -1593,7 +1595,7 @@ if str(_HERE) not in sys.path:  # 从仓库根目录以脚本方式运行
     sys.path.insert(0, str(_HERE))
 
 from behavior_checks import FetchedFile, FileKey, evaluate, required_files  # noqa: E402
-from behavior_client import ExternalClient, StreamIncomplete  # noqa: E402
+from behavior_client import ExternalClient, StreamIncompleteError  # noqa: E402
 from behavior_schema import (  # noqa: E402
     FIXTURES_DIR,
     Case,
@@ -1712,7 +1714,7 @@ async def run_one(
             record, files = await run_case_once(
                 client, case, rep=rep, label=label, agent_map=agent_map, fixtures_dir=fixtures_dir
             )
-        except (httpx.TransportError, StreamIncomplete) as exc:
+        except (httpx.TransportError, StreamIncompleteError) as exc:
             last_error = f"attempt {attempt}: {type(exc).__name__}: {exc}"
             continue
         except httpx.HTTPStatusError as exc:
