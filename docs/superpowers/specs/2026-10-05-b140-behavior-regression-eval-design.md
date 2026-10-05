@@ -228,4 +228,3 @@ PR-1 已合(#1740);10-05 样板 smoke 修了两处用例设计(见 §13)。
 - **g02** 首跑判不过,但**结果完全正确**(三处已改、其余 297 行不变、没有整篇 `write_file`):模型用 `exec_python` 做替换,没调 `edit_file`。`tool_used: edit_file` 判的是实现手段不是结果,属于用例过拟合 → 去掉。这也说明 §9 的坏候选只去 `edit_file` 测不出东西,改为三件都去。
 - **h01** 首跑 `status=error`:`OutputTruncatedError`(输出上限 8000 含思考,写整篇方案不够)。是评测智能体配置抄了探针的 8000 → 改 32768 仍在一次输出 33k token 时截断 → `eval-ahp` 改为与生产 ai-health-plan 相同的 40960;`eval-general` 32768。
 - **自证坏候选第一版无效**:manifest 里删掉 `edit_file` / `bash` / `exec_python`,模型照样调用(平台基础能力,见 §9),g02 仍过 → 改为提示词坏候选。
-
