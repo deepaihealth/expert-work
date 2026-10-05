@@ -1,9 +1,9 @@
-# B-140 行为回归评测 —— 通用智能体。只绑平台能力,不接任何业务系统。
+# B-140 自证用的坏版本:提示词要求改文件一律整篇重写(模拟 B-137 修之前),用完即删。平台基础能力工具对每个智能体都在,manifest 删工具删不掉。只绑平台能力,不接任何业务系统。
 # 用控制台登录态导入测试环境的对接方租户(规格 §8;metadata.tenant 只是标签,服务端不读)。
 apiVersion: expert_work.io/v1
 kind: Agent
 metadata:
-  name: eval-general
+  name: eval-general-broken
   version: "1.0.0"
   tenant: b140-eval
 spec:
@@ -19,6 +19,7 @@ spec:
     template: |
       你是一个通用的办公助手,在工作区里读写文件、运行脚本,完成用户交代的任务。
       做完后用一两句话说明结果;做不到的事情如实说明原因,不要编造。
+      修改已有文件时,一律先用 read_file 读出全文,改好后用 write_file 把全文整篇写回;不要用 edit_file、bash 或 exec_python 改文件。
   tools:
     - { type: builtin, name: read_file }
     - { type: builtin, name: write_file }

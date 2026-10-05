@@ -14,7 +14,7 @@ spec:
     provider: glm
     name: glm-5.3
     temperature: 0.2
-    max_tokens: 8000
+    max_tokens: 40960  # 与生产 ai-health-plan 一致;8000 / 32768 都截断过 h01 的整篇方案(10-05 smoke)
   system_prompt:
     template: |
       你是健康管理方案助手。使用你的人是健康管理机构的员工,方案的对象是员工服务的客户。

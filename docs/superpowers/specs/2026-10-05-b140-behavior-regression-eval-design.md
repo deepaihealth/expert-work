@@ -180,9 +180,9 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 
 ## 8. 运行在哪、凭据、清理、成本
 
-- **测试环境、独立的评测租户**。测试环境现在只有对接方一个业务租户;每次运行要新建几十个 user_id(§5 第 1 步),放进对接方租户会把他们的用户列表与会话列表弄脏。**一次性准备(用户操作)**:平台管理员在控制台 `POST /v1/tenants` 建租户 `b140-eval` → 建服务账号与 `write` 档 API key → 把 key 存进测试集群 Secret `eval-credentials`(与 `canary-credentials` 同形)→ 用控制台导入两个评测智能体 manifest。平台凭据(glm 等)是平台级的,新租户直接可用。**若开不了新租户**,退回对接方租户 + `b140-` 前缀 + 跑完归档,并在对接方知情后再用(这一条需要用户再拍板)。
+- **测试环境、对接方租户(用户 10-05 拍板,不新开租户)**。原方案是独立评测租户;但平台没有「切到别的租户」的能力,新租户要先建首位管理员账号才能建服务账号与 key,用户定直接用对接方租户 + 现成的 canary key(Secret `canary-credentials`)。代价:每次运行在对接方租户里新建一批 `b140-…` 用户(会话跑完归档,用户条目留着)。评测智能体由用户的控制台登录态导入同一租户(新建智能体只能走控制台平面)。
 - **凭据**:runner 从环境变量 `EXPERT_WORK_API_TOKEN` 读 key(沿用 `verify_live` 的约定),key 只经 `kubectl get secret … | base64 -d` 进变量,不进命令行参数、不落文件、不打印。
-- **清理**:每个会话跑完即归档;评测租户本身就是隔离的,不需要再清 user。
+- **清理**:每个会话跑完即归档;`b140-` 用户条目留在对接方租户里(平台没有删用户的接口)。自证用的 `eval-general-broken` 用完即删。
 - **成本**:24 × 3 = 72 次运行、约 110 轮。耗时按 4 路并发估 30 ~ 40 分钟。token 第一次跑完实测后写进 ROADMAP;评测智能体 manifest 里设单 run token 上限,防一个任务失控。
 
 ## 9. 怎么证明它能红(自证)
@@ -190,7 +190,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 1. **判据层**:`checks.py` 每种判据配「好记录过 / 坏记录不过」两条单元测试,坏记录照真实失败形态构造;
 2. **端到端层**:第一次上线时跑两遍 ——
    - 基线:`eval-general`;
-   - 坏候选:另建 `eval-general-broken`(**工具清单去掉 `edit_file`**,模拟 B-137 回退),`--agent-map eval-general=eval-general-broken`;
+   - 坏候选:另建 `eval-general-broken`,**只改系统提示词**:要求「修改已有文件一律 read_file 读全文、write_file 整篇写回」,模拟 B-137 修之前「改文件只能整篇重写」,`--agent-map eval-general=eval-general-broken`。**不能靠在 manifest 里删工具**:`exec_python` / `bash` / 读写改文件等是平台基础能力(`BASE_CAPABILITY_BUILTINS`),每个智能体都有、与 manifest 的 `tools` 无关(10-05 smoke 实测:删了照样调用);
    - 判据:`compare` 必须把 g02 / g03 / g04 / h06 至少三个标成稳定退步、退出码 1;其余任务不该出现稳定退步(否则说明噪声太大,先调重复次数或阈值)。
 3. **重复性**:基线自己跑两遍对比,稳定退步必须为 0(同一版本对自己不该「退步」)。
 
@@ -220,4 +220,11 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 | PR-1 | 框架:`schema` / `client` / `checks` / `runner` / `compare` + 单元测试 + 两个评测智能体 manifest + 3 个样板用例(g02 / g08 / h01) |
 | PR-2 | 其余 21 个用例 + fixtures;第一次基线 + §9 自证结果写进 PR 与 ROADMAP;`pending-test-release-acceptance.md` 加「用 B-140 对照」的用法 |
 
-PR-1 合并前就能在测试环境跑样板用例验证框架;评测租户的一次性准备在 PR-1 合并前由用户完成。
+PR-1 已合(#1740);10-05 样板 smoke 修了两处用例设计(见 §13)。
+
+## 13. 第一次真跑(2026-10-05,测试环境 `5091938c`)
+
+- **g08** 过:上传 → 跑 → 读最终回复整条链路通。
+- **g02** 首跑判不过,但**结果完全正确**(三处已改、其余 297 行不变、没有整篇 `write_file`):模型用 `exec_python` 做替换,没调 `edit_file`。`tool_used: edit_file` 判的是实现手段不是结果,属于用例过拟合 → 去掉。这也说明 §9 的坏候选只去 `edit_file` 测不出东西,改为三件都去。
+- **h01** 首跑 `status=error`:`OutputTruncatedError`(输出上限 8000 含思考,写整篇方案不够)。是评测智能体配置抄了探针的 8000 → 改 32768 仍在一次输出 33k token 时截断 → `eval-ahp` 改为与生产 ai-health-plan 相同的 40960;`eval-general` 32768。
+- **自证坏候选第一版无效**:manifest 里删掉 `edit_file` / `bash` / `exec_python`,模型照样调用(平台基础能力,见 §9),g02 仍过 → 改为提示词坏候选。
