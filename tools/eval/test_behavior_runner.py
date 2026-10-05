@@ -268,3 +268,16 @@ async def test_multi_turn_case_without_session_is_a_harness_error(tmp_path: Path
         fixtures_dir=_fixtures(tmp_path),
     )
     assert res.passed is None and "no session id" in (res.infra_error or "")
+
+
+def test_turn_metrics_keep_each_turn_for_threshold_calibration() -> None:
+    rec = RunRecord(
+        case_id="g99-x",
+        rep=1,
+        user_id="u",
+        turns=[_turn(1, input_tokens=300), _turn(2, input_tokens=None)],
+    )
+    assert runner.turn_metrics_of(rec) == [
+        {"tool_calls": 0, "input_tokens": 300},
+        {"tool_calls": 0, "input_tokens": None},
+    ]

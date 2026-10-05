@@ -14,5 +14,5 @@ checks:
   - {type: completed}
   - {type: artifact_exists, name: summary.md}
   - {type: artifact_contains, name: summary.md, all: ['1045', '2090', '355', '104.5', '209.0', '35.5']}
-  # 阈值先放宽,首次 3× 基线后按「基线 ×1.5」收紧(规格 §7)
-  - {type: tool_count_max, max: 15}
+  # 阈值 = 首次 3× 基线(base-1005,test 5091938c)最大值 6 次 ×1.5,向上取整(规格 §7)
+  - {type: tool_count_max, max: 9}

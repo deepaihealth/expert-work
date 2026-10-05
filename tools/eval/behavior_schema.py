@@ -290,6 +290,7 @@ class CaseResult(_Strict):
     passed: bool | None  # None = infra_error,不计入过 / 不过
     verdicts: list[CheckVerdict] = Field(default_factory=list)
     metrics: dict[str, float] = Field(default_factory=dict)
+    turn_metrics: list[dict[str, int | None]] = Field(default_factory=list)
     infra_error: str | None = None
     session_id: str | None = None
 

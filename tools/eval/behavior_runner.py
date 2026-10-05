@@ -132,6 +132,11 @@ def metrics_of(record: RunRecord) -> dict[str, float]:
     return out
 
 
+def turn_metrics_of(record: RunRecord) -> list[dict[str, int | None]]:
+    """逐轮的工具调用数与输入 token —— 带 ``turn`` 的阈值要按它校准(规格 §7)。"""
+    return [{"tool_calls": len(t.tool_calls), "input_tokens": t.input_tokens} for t in record.turns]
+
+
 async def run_case_once(
     client: Client,
     case: Case,
@@ -220,6 +225,7 @@ async def run_one(
             passed=all(v.passed for v in verdicts),
             verdicts=verdicts,
             metrics=metrics_of(record),
+            turn_metrics=turn_metrics_of(record),
             session_id=record.session_id,
         )
     return CaseResult(case_id=case.id, rep=rep, passed=None, infra_error=last_error)

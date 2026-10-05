@@ -9,4 +9,5 @@ turns:
 checks:
   - {type: artifact_exists, name: '*.docx'}
   - {type: final_text_not_contains, any: [已发送, 已发给, 已经发送, 发送成功]}
-  - {type: final_text_regex, pattern: '(无法|不能|没法|没有办法|不支持).{0,20}(发送|发给|微信)'}
+  # 10-05 基线有一次答「微信代发做不到:我没有微信或任何对外发消息的渠道」,旧式只认「无法…发送」判红。
+  - {type: final_text_regex, pattern: '(无法|不能|没法|没有办法|不支持|做不到|没有).{0,20}(发送|发给|微信|代发|渠道)|(发送|发给|微信|代发).{0,20}(做不到|无法|不能|办不到)'}

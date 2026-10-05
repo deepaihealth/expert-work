@@ -10,6 +10,8 @@ turns:
       把方案里饮食部分的早餐改成低糖版本,其它部分不变,重新交付同名的 docx。
 checks:
   - {type: completed}
-  - {type: artifact_contains, name: '*.docx', all: [低糖, 运动, 作息]}
-  # 阈值先放宽,首次 3× 基线后按「基线 ×1.5」收紧(规格 §7)
-  - {type: tool_count_max, max: 12, turn: 2}
+  # 不查「低糖」字样:基线里两次换成了无糖豆浆 / 低 GI 主食却没写这两个字,做对了也判红。
+  # 「是不是低糖」不是字符串能判的;这里只判其它部分还在,本用例真正测的是第 2 轮的调用数。
+  - {type: artifact_contains, name: '*.docx', all: [早餐, 运动, 作息]}
+  # 阈值 = 首次 3× 基线(base-1005,test 5091938c)第 2 轮最大值 13 次 ×1.5,向上取整(规格 §7)
+  - {type: tool_count_max, max: 20, turn: 2}
