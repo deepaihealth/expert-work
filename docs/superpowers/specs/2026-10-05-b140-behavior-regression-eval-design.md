@@ -51,18 +51,18 @@ B-129 / B-131 / B-136 / B-137 / B-149 都是这样验的)。问题:
 ## 5. 架构
 
 ```
-tools/eval/behavior/
-  agents/               两个评测智能体的 manifest(入库,随用例版本走)
-    eval-general.yaml
-    eval-ahp.yaml
-  cases/                用例,一个文件一个任务(YAML)
-  fixtures/             开局要上传的文件(合成)
-  schema.py             用例 / 结果的 pydantic 模型
-  client.py             对外 API 客户端(httpx;会话、上传、流式一轮、下载产物、归档)
-  checks.py             判据,纯函数:输入一次运行的记录,输出逐条判定
-  runner.py             CLI:跑整套 → 写结果 JSONL
-  compare.py            CLI:两份结果 → Markdown 对照表 + 退步时非 0 退出码
-  test_*.py             单元测试(MockTransport / 纯函数)
+tools/eval/                    沿用该目录的平铺约定(无包、conftest 把目录放进 sys.path)
+  behavior_schema.py           用例 / 运行记录 / 结果的 pydantic 模型 + 加载 + 结果读写
+  behavior_extract.py          从产物取文本(docx / pptx 用标准库读 zip 里的 XML,不加依赖)
+  behavior_checks.py           判据,纯函数:输入一次运行的记录与取回的文件,输出逐条判定
+  behavior_client.py           对外平面客户端(httpx;上传、流式一轮、取产物 / 工作区文件、归档)
+  behavior_runner.py           CLI:跑整套 → 写结果 JSONL
+  behavior_compare.py          CLI:两份结果 → Markdown 对照表 + 有稳定退步时退出码 1
+  test_behavior_*.py           单元测试(MockTransport / 纯函数)
+  datasets/behavior/
+    agents/                    两个评测智能体的 manifest(入库,随用例版本走)
+    cases/                     用例,一个文件一个任务(YAML,文件名 = id)
+    fixtures/                  开局要上传的合成文件 + 生成脚本
 ```
 
 **数据流**(每个任务的每一次重复):
@@ -105,7 +105,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 
 | 类型 | 判什么 |
 |---|---|
-| `completed` | 结束帧 `completed == true` 且 `exit_reason == "text_response"`(每个用例默认带) |
+| `completed` | 每一轮结束帧 `status == "success"`、`completed == true` 且 `exit_reason == "text_response"`。**由用例显式列出**,不默认加:「诚实报不能完成」类任务(g12 / h10)读不存在的文件本身就是一次工具失败,`completed` 按定义就是 false |
 | `exit_reason` | 指定结束方式(诚实报不能完成的任务要 `text_response` + 文本判据) |
 | `final_text_contains` / `final_text_regex` / `final_text_not_contains` | 最后一轮回复 |
 | `artifact_exists` | 产物按名字(或 glob)存在 |
@@ -131,10 +131,10 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 | 改了什么 | 怎么对照 |
 |---|---|
 | 平台代码(执行层、工具、剪裁…) | 先在测试环境当前版本上跑一遍存基线,`release.sh test` 发候选,再跑一遍,`compare` |
-| 提示词 / 工具清单 / 模型 | 不用发版:评测智能体建两个版本(`eval-ahp@1.0.0` vs `1.0.1`),`runner --agent-version` 各跑一遍 |
+| 提示词 / 工具清单 / 模型 | 不用发版:建一个改过的评测智能体副本(另一个 agent code,如 `eval-ahp-b`),`runner --agent-map eval-ahp=eval-ahp-b` 跑一遍,与原版对照。对外 API 只认 agent code、总是跑当前生效版本,所以用两个 code 而不是两个版本号 |
 | 只想看现状 | 跑一遍,与上一次存档的结果比 |
 
-每份结果文件头记:测试环境 control-plane 镜像 tag、两个评测智能体的 `agent_spec_sha256`、用例集版本(用例目录的内容哈希)、时间、重复次数。对照时这几项不同会写在表头,用例集不同直接拒绝对比。
+每份结果文件头记:标签、时间、目标地址、`--note`(写测试环境镜像 tag 等,对外 API 拿不到 `agent_spec_sha256`)、agent code 替换表、用例集版本(用例与 fixtures 的内容哈希)、重复次数。对照时这几项不同会写在表头,用例集不同直接拒绝对比。
 
 ## 7. 第一版用例目录(24 个)
 
@@ -189,8 +189,8 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 
 1. **判据层**:`checks.py` 每种判据配「好记录过 / 坏记录不过」两条单元测试,坏记录照真实失败形态构造;
 2. **端到端层**:第一次上线时跑两遍 ——
-   - 基线:`eval-general@1.0.0`;
-   - 坏候选:`eval-general@1.0.1-broken`,**工具清单去掉 `edit_file`**(模拟 B-137 回退);
+   - 基线:`eval-general`;
+   - 坏候选:另建 `eval-general-broken`(**工具清单去掉 `edit_file`**,模拟 B-137 回退),`--agent-map eval-general=eval-general-broken`;
    - 判据:`compare` 必须把 g02 / g03 / g04 / h06 至少三个标成稳定退步、退出码 1;其余任务不该出现稳定退步(否则说明噪声太大,先调重复次数或阈值)。
 3. **重复性**:基线自己跑两遍对比,稳定退步必须为 0(同一版本对自己不该「退步」)。
 
