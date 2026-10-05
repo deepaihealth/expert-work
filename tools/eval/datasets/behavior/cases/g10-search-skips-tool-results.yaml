@@ -13,4 +13,5 @@ checks:
   - {type: completed}
   # 只判结果行:10-05 基线里模型多解释一句「长输出存在 .tool_results/ 下、不在搜索范围」,
   # 旧判据「全文不许出现 .tool_results」把这句正确的说明判红(3 次红 2 次,平台其实每次都只回 note.md)。
-  - {type: final_text_regex, pattern: '(?m)^\W*FILES:\W*(/?workspace/)?note\.md\W*$'}
+  # 10-05 补跑有一次结果对、但结果行写成「文件:note.md」—— 格式不是本用例要测的,两种都认。
+  - {type: final_text_regex, pattern: '(?m)^\W*(FILES|文件)\W*(/?workspace/)?note\.md\W*$'}

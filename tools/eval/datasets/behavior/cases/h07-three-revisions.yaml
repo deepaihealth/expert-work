@@ -13,5 +13,6 @@ turns:
 checks:
   - {type: completed}
   - {type: artifact_contains, name: '*.docx', all: [游泳, '23:00']}
-  # 阈值先放宽,首次 3× 基线后按「基线 ×1.5」收紧(规格 §7)
-  - {type: turn_tokens_max, turn: 3, max_input_tokens: 400000}
+  # 阈值 = 3× 补跑(fix-h-1005,test 5091938c)第 3 轮输入最大值 528392 ×1.5,向上取整(规格 §7)。
+  # 同一用例三次在 20 万 ~ 53 万之间,波动大;占位值 40 万两次判红,是占位值定低了。
+  - {type: turn_tokens_max, turn: 3, max_input_tokens: 800000}
