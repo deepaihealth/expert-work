@@ -1,0 +1,17 @@
+id: g02-edit-three-places
+agent: eval-general
+shape: B-137
+fixtures: [report-300-lines.md]
+turns:
+  - prompt: |
+      工作区的 uploads/report-300-lines.md 是一份巡检报告。请先用 bash 执行
+      `cp uploads/report-300-lines.md report.md`,然后只修改 report.md 里过时的三处,其余内容一个字都不要动:
+      1. 「数据截至 2026 年 6 月」改成「数据截至 2026 年 9 月」;
+      2. 「注册用户数为 987 人」改成「注册用户数为 1,234 人」;
+      3. 「负责人:张工」改成「负责人:李工」。
+checks:
+  - {type: completed}
+  - {type: workspace_file_contains, path: report.md, all: ["数据截至 2026 年 9 月", "注册用户数为 1,234 人", "负责人:李工"]}
+  - {type: workspace_file_unchanged_lines, path: report.md, fixture: report-300-lines.md, except_lines: [12, 140, 288]}
+  - {type: tool_used, tool: edit_file}
+  - {type: tool_not_used_on, tool: write_file, path: report.md}

@@ -1,0 +1,43 @@
+# B-140 行为回归评测 —— 通用智能体。只绑平台能力,不接任何业务系统。
+# 由用户在测试环境评测租户 b140-eval 的控制台导入(规格 §8)。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-general
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-140 行为回归评测用的通用智能体(合成任务专用)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 8000
+  system_prompt:
+    template: |
+      你是一个通用的办公助手,在工作区里读写文件、运行脚本,完成用户交代的任务。
+      做完后用一两句话说明结果;做不到的事情如实说明原因,不要编造。
+  tools:
+    - { type: builtin, name: read_file }
+    - { type: builtin, name: write_file }
+    - { type: builtin, name: edit_file }
+    - { type: builtin, name: search_files }
+    - { type: builtin, name: exec_python }
+    - { type: builtin, name: bash }
+    - { type: builtin, name: save_artifact }
+  policies:
+    token_budget: 400000
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp
+      persistent_workspace: true

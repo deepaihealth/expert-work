@@ -1,0 +1,12 @@
+id: g08-group-mean
+agent: eval-general
+shape: 沙箱 exec_python 基本链路
+fixtures: [sales.csv]
+turns:
+  - prompt: |
+      工作区的 uploads/sales.csv 有 region 与 amount 两列。用 exec_python 按 region 分组计算 amount 的平均值。
+      回复的最后一行只写结果,格式为 `A=…, B=…, C=…`,保留一位小数。
+checks:
+  - {type: completed}
+  - {type: tool_used, tool: exec_python}
+  - {type: final_text_contains, all: ["A=104.5", "B=209.0", "C=35.5"]}

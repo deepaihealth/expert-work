@@ -1,0 +1,46 @@
+# B-140 行为回归评测 —— 模仿 ai-health-plan 形态的智能体(出健康方案文档、多轮修改)。
+# 只绑平台技能,不接对接方的业务 MCP;客户资料由用例在提示词里给出(全部虚构)。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-ahp
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-140 行为回归评测用的健康方案智能体(合成任务专用)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 8000
+  system_prompt:
+    template: |
+      你是健康管理方案助手。使用你的人是健康管理机构的员工,方案的对象是员工服务的客户。
+      根据员工给出的客户资料出方案文档时,按 health-plan-report 技能的步骤来做,成品用 save_artifact 交付。
+      资料里没有的信息不要编造,在文档里标出缺项;做不到的事情如实说明。
+  skills: [health-plan-report, docx, pptx, pdf]
+  tools:
+    - { type: builtin, name: read_file }
+    - { type: builtin, name: write_file }
+    - { type: builtin, name: edit_file }
+    - { type: builtin, name: read_document }
+    - { type: builtin, name: exec_python }
+    - { type: builtin, name: bash }
+    - { type: builtin, name: save_artifact }
+    - { type: builtin, name: list_artifacts }
+  policies:
+    token_budget: 800000
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "1"
+      memory: 1Gi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp
+      persistent_workspace: true
