@@ -111,8 +111,8 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 | `artifact_exists` | 产物按名字(或 glob)存在 |
 | `artifact_contains` / `artifact_not_contains` | 产物文本(`.docx` / `.pptx` / `.pdf` 本机抽文本后判) |
 | `artifact_unchanged_lines` | 与开局文件逐行比,除指定行外不变(抓「整篇重写顺手改坏别处」) |
-| `workspace_file_contains` / `workspace_file_unchanged_lines` | 同上两条,但读工作区里的文件(改已有文件的任务不要求另存产物) |
-| `tool_used` / `tool_not_used` / `tool_count_max` | 工具调用形状 |
+| `workspace_file_contains` / `workspace_file_not_contains` / `workspace_file_unchanged_lines` | 同上三条,但读工作区里的文件(改已有文件的任务不要求另存产物) |
+| `tool_used` / `tool_not_used` / `tool_count_max` | 工具调用形状;四个工具类判据都可加 `turn: N` 只看第 N 轮(多轮任务用) |
 | `tool_not_used_on` | 某工具没有用在某路径上(抓「改已有文件却整篇 write_file」) |
 | `turn_tokens_max` | 某一轮输入 token 上限(B-126 / B-128 那类「越聊越贵」) |
 

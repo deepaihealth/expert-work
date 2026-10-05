@@ -130,3 +130,31 @@ def test_final_text_regex_must_compile(tmp_path: Path) -> None:
     bad = _CASE.replace("{type: completed}", "{type: final_text_regex, pattern: '(unclosed'}")
     with pytest.raises(ValidationError, match="regex"):
         load_case(_write(tmp_path, "g99-sample.yaml", bad))
+
+
+def test_load_cases_rejects_non_yaml_files(tmp_path: Path) -> None:
+    _write(tmp_path, "g99-sample.yaml", _CASE)
+    _write(tmp_path, "g98-other.yml", _CASE.replace("g99-sample", "g98-other"))
+    with pytest.raises(ValueError, match=r"g98-other\.yml"):
+        load_cases(tmp_path)
+
+
+@pytest.mark.parametrize("check_type", ["artifact_contains", "artifact_not_contains"])
+def test_content_checks_on_pdf_or_xlsx_are_rejected_at_load(
+    tmp_path: Path, check_type: str
+) -> None:
+    key = "all" if check_type == "artifact_contains" else "any"
+    bad = _CASE.replace("{type: completed}", f"{{type: {check_type}, name: '*.pdf', {key}: [x]}}")
+    with pytest.raises(ValidationError, match="text"):
+        load_case(_write(tmp_path, "g99-sample.yaml", bad))
+
+
+def test_tool_checks_accept_a_turn(tmp_path: Path) -> None:
+    case = load_case(
+        _write(
+            tmp_path,
+            "g99-sample.yaml",
+            _CASE.replace("tool: edit_file}", "tool: edit_file, turn: 2}"),
+        )
+    )
+    assert isinstance(case.checks[1], ToolUsed) and case.checks[1].turn == 2

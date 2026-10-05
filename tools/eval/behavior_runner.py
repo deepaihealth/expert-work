@@ -46,6 +46,15 @@ DEFAULT_BASE_URL = "https://expert-work-test.deepaihealth.com"
 _TEST_HOSTS = frozenset({"expert-work-test.deepaihealth.com"})
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 _ATTEMPTS = 3
+_MAX_BACKOFF_S = 60.0
+
+
+def _backoff_s(response: httpx.Response, attempt: int) -> float:
+    """429 的等待秒数:优先 ``Retry-After``(上限 60 秒),否则 10 秒乘以第几次。"""
+    try:
+        return min(float(response.headers.get("Retry-After", "")), _MAX_BACKOFF_S)
+    except ValueError:
+        return min(10.0 * attempt, _MAX_BACKOFF_S)
 
 
 class Client(Protocol):
@@ -150,6 +159,9 @@ async def run_case_once(
             )
             session_id = session_id or sid
             turns.append(record)
+            if session_id is None and index < len(case.turns):
+                # 下一轮会开新会话、丢掉上下文,多轮用例就测歪了。
+                raise RuntimeError(f"no session id after turn {index}")
         files: dict[FileKey, FetchedFile | None] = {}
         for kind, name in required_files(case):
             if kind == "artifact":
@@ -192,8 +204,11 @@ async def run_one(
             last_error = (
                 f"attempt {attempt}: HTTP {exc.response.status_code} {exc.request.url.path}"
             )
+            if exc.response.status_code == 429:  # 配额 / 并发闸,等一等再来
+                await asyncio.sleep(_backoff_s(exc.response, attempt))
+                continue
             if exc.response.status_code < 500:
-                break  # 4xx 是用例或配置错,重试没用
+                break  # 其余 4xx 是用例或配置错,重试没用
             continue
         except Exception as exc:  # 评测框架自己的错:记下来、不判分,别让一条用例拖垮整批
             last_error = f"harness error: {type(exc).__name__}: {exc}"

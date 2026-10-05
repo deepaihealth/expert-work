@@ -112,3 +112,23 @@ def test_main_exit_codes_and_report(tmp_path: Path) -> None:
     assert "| g02 | 3/3 | 0/3 | ❌ 稳定退步 |" in text
     assert "g02 第 1 次:不过: tool_used(tools used: [])" in text
     assert cmp.main([str(base), str(other)]) == 2
+
+
+def test_report_lists_every_failed_run_not_only_regressions(tmp_path: Path) -> None:
+    rows = cmp.compare(
+        _header("a"),
+        _results("g01", [True] * 3),
+        _header("b"),
+        _results("g01", [True, True, False]),
+    )
+    assert rows[0].verdict == "flaky"
+    same = cmp.compare(
+        _header("a"),
+        _results("g03", [True, False, False]),
+        _header("b"),
+        _results("g03", [False, True, False]),
+    )
+    text = cmp.render_markdown(
+        _header("a"), _header("b"), same, _results("g03", [False, True, False])
+    )
+    assert "g03 第 1 次:不过" in text and "g03 第 3 次:不过" in text

@@ -210,6 +210,7 @@ def test_required_files_dedupes_in_order() -> None:
         "artifact_not_contains",
         "artifact_unchanged_lines",
         "workspace_file_contains",
+        "workspace_file_not_contains",
         "workspace_file_unchanged_lines",
         "tool_used",
         "tool_not_used",
@@ -224,3 +225,35 @@ def test_every_check_type_is_documented_in_spec(check_type: str) -> None:
         / "docs/superpowers/specs/2026-10-05-b140-behavior-regression-eval-design.md"
     )
     assert f"`{check_type}`" in spec.read_text(encoding="utf-8")
+
+
+def test_workspace_file_not_contains() -> None:
+    files = {("workspace", "r.md"): ("r.md", b"BetaDesk\n")}
+    rec = _record(_turn())
+    assert _one(
+        {"type": "workspace_file_not_contains", "path": "r.md", "any": ["AlphaDesk"]}, rec, files
+    )[0]
+    ok, detail = _one(
+        {"type": "workspace_file_not_contains", "path": "r.md", "any": ["Beta"]}, rec, files
+    )
+    assert not ok and "Beta" in detail
+
+
+def test_tool_checks_scoped_to_a_turn() -> None:
+    rec = _record(
+        _turn(1, tool_calls=[ToolCall(turn=1, name="write_file", args={"path": "a.md"})]),
+        _turn(2, tool_calls=[ToolCall(turn=2, name="save_artifact", args={"name": "poem.md"})]),
+    )
+    assert _one({"type": "tool_not_used_on", "tool": "write_file", "path": "a.md", "turn": 2}, rec)[
+        0
+    ]
+    assert not _one({"type": "tool_not_used_on", "tool": "write_file", "path": "a.md"}, rec)[0]
+    assert _one({"type": "tool_used", "tool": "save_artifact", "turn": 2}, rec)[0]
+    assert not _one({"type": "tool_used", "tool": "save_artifact", "turn": 1}, rec)[0]
+    assert _one({"type": "tool_not_used", "tool": "write_file", "turn": 2}, rec)[0]
+    assert _one({"type": "tool_count_max", "max": 1, "turn": 1}, rec)[0]
+
+
+def test_completed_reports_missing_record_separately() -> None:
+    ok, detail = _one({"type": "completed"}, _record(_turn(completed=None, exit_reason=None)))
+    assert not ok and "no completion record" in detail

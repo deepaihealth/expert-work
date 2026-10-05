@@ -159,7 +159,9 @@ def render_markdown(
     for r in rows:
         cells = [r.case_id, _cell(r.base), _cell(r.cand), _LABEL[r.verdict], "、".join(r.flags)]
         lines.append("| " + " | ".join(cells) + " |")
-    detail = [r for r in rows if r.verdict in ("regressed", "flaky")]
+    # 规格 §6:每个任务每次的判定明细 —— 只要改动后有一次没过就列出来,不只退步 / 抖动。
+    failing = {r.case_id for r in cand_results if r.passed is not True}
+    detail = [r for r in rows if r.case_id in failing]
     if detail:
         lines += ["", "## 改动后没过的判据", ""]
         for r in detail:
