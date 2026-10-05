@@ -1,0 +1,11 @@
+id: h04-bmi-consistent
+agent: eval-ahp
+shape: 数字一致性
+turns:
+  - prompt: |
+      请为下面这位客户出一份 Word 版健康管理方案,用 save_artifact 交付,文件名用「王小雨-健康方案.docx」。
+      客户资料(虚构):王小雨,女,42 岁,身高 162 cm,体重 68 kg,空腹血糖 6.4 mmol/L,平时久坐、晚睡;诉求是三个月内减重 5 kg、把空腹血糖降到 6.1 以下。
+      方案至少包括饮食、运动、作息三部分。方案里写出客户的 BMI(保留一位小数)。
+checks:
+  - {type: completed}
+  - {type: artifact_contains, name: '*.docx', all: ['25.9']}

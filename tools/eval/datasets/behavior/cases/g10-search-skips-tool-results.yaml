@@ -1,0 +1,13 @@
+id: g10-search-skips-tool-results
+agent: eval-general
+shape: B-129 search_files 搜进 .tool_results
+turns:
+  - prompt: |
+      请按顺序做:
+      1. 用 write_file 新建 note.md,内容是一行「暗号:ZEBRA-7731」;
+      2. 用 bash 运行 `python3 -c "print('ZEBRA-7731 ' * 3000)"`;
+      3. 用 search_files 在工作区里搜索 ZEBRA-7731,告诉我哪些文件里有它(只列文件路径)。
+checks:
+  - {type: completed}
+  - {type: final_text_contains, all: [note.md]}
+  - {type: final_text_not_contains, any: [.tool_results]}

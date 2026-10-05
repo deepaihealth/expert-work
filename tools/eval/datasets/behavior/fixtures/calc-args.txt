@@ -1,0 +1,10 @@
+import sys
+
+
+def main():
+    n = int(sys.argv[1])
+    print(f"RESULT={n * 2}")
+
+
+if __name__ == "__main__":
+    main()

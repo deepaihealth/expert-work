@@ -1,0 +1,10 @@
+id: h11-long-checkup-report
+agent: eval-ahp
+shape: B-136 + read_document
+fixtures: [checkup-report.docx]
+turns:
+  - prompt: |
+      工作区的 uploads/checkup-report.docx 是王小雨的年度体检报告(虚构,很长)。请据此为她出一份 Word 版健康管理方案,要专门处理报告里的异常指标,用 save_artifact 交付,文件名用「王小雨-健康方案.docx」。
+checks:
+  - {type: completed}
+  - {type: artifact_contains, name: '*.docx', all: [尿酸]}

@@ -42,8 +42,29 @@ def test_agent_manifests_match_codes() -> None:
 
 def test_committed_fixtures_match_generator() -> None:
     built = _make_fixtures_module().build()
-    for name, text in built.items():
-        assert (FIXTURES_DIR / name).read_text(encoding="utf-8") == text, name
+    for name, content in built.items():
+        data = content if isinstance(content, bytes) else content.encode("utf-8")
+        assert (FIXTURES_DIR / name).read_bytes() == data, name
+
+
+def test_fixture_facts_the_cases_rely_on() -> None:
+    from behavior_extract import document_text
+
+    module = _make_fixtures_module()
+    regulation = (FIXTURES_DIR / "regulation-60k.md").read_text(encoding="utf-8")
+    assert len(regulation) > 50_000 and regulation.rstrip().endswith("B140-Z9Q7。")
+    notes = (FIXTURES_DIR / "product-notes.md").read_text(encoding="utf-8").splitlines()
+    assert [
+        i + 1 for i, line in enumerate(notes) if "AlphaDesk" in line
+    ] == module.G03_RENAMED_LINES
+    script = (FIXTURES_DIR / "buggy-script.txt").read_text(encoding="utf-8").splitlines()
+    assert "range(1, limit)" in script[module.G04_BUG_LINE - 1]
+    report = document_text(
+        "checkup-report.docx", (FIXTURES_DIR / "checkup-report.docx").read_bytes()
+    )
+    assert len(report) > 30_000 and report.splitlines()[-1].startswith("尿酸")
+    plan = document_text("previous-plan.docx", (FIXTURES_DIR / "previous-plan.docx").read_bytes())
+    assert "每周快走3次" in plan and "23:30前入睡" in plan
 
 
 def test_g02_fixture_has_the_three_outdated_lines_where_the_case_says() -> None:

@@ -1,0 +1,13 @@
+id: h06-edit-previous-plan
+agent: eval-ahp
+shape: B-137 + 修改轮
+fixtures: [previous-plan.docx]
+turns:
+  - prompt: |
+      工作区的 uploads/previous-plan.docx 是王小雨的上一版方案。只改两处,其余文字一个字都不要改:
+      把「每周快走3次,每次30分钟」改成「每周快走5次,每次30分钟」;把「23:30前入睡」改成「23:00前入睡」。
+      改好后用 save_artifact 交付,文件名用「王小雨-健康方案-v2.docx」。
+checks:
+  - {type: completed}
+  - {type: artifact_contains, name: '*v2.docx', all: [每周快走5次, 23:00前入睡, 早餐全麦面包配牛奶, 三个月后复查空腹血糖]}
+  - {type: artifact_not_contains, name: '*v2.docx', any: [每周快走3次, 23:30前入睡]}
