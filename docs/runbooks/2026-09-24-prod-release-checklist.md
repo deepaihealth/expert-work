@@ -1,10 +1,10 @@
 # 班车 2 生产发布执行单（2026-10-08 发；原定 09-24，后改 09-28）
 
-> **⚠️ 2026-09-29 再次改期**：09-28 没有发，**用户 09-29 拍板推迟到 2026-10-08**，并把 **B-125 健康方案交付件技能**（`health-plan-report` 导入 + ai-health-plan 提示词 rev39）一起带上，见 §0.2 与 Step A3 / A4。钉子当时未变（`c0789ca6`），B-125 不进镜像（`platform-skills/` 只由导入脚本上线）。**同日用户再拍板：B-126（跨轮上下文降本）也随本班上生产；钉子等 B-126 合入后一次性前移到 main**（届时连同 #1690 fast-uri / #1691 MinIO 一起带上），前移后先发测试环境验过再重钉，本单操作位随之改。**✅ 09-29 已前移（第十一次重钉）到 main `ab4097cf`**：带 B-126 / B-127 / B-128 与 #1690 / #1691，测试环境验过，操作位已全部改到新钉子，见 §0.1 第十一次重钉。**✅ 09-30 第十二次重钉到 main `39c93912`**：用户 09-30 拍板 B-131（减少修改轮的额外调用，平台部分）随本班上，同时带上 pyjwt 2.14.0 安全升级（#1701）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十二次重钉。**✅ 10-01 第十三次重钉到 main `31f22602`**：用户 09-30 拍板新模型 glm-5.3-flashx（#1702）随本班上，同时带上三个依赖安全升级（urllib3 #1703、pyjwt 2.15.1 #1705、virtualenv #1706）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十三次重钉。**✅ 10-01 第十四次重钉到 main `54d1ed70`**：用户 10-01 拍板子智能体委派三项修复（#1710 计划不再被旧 PLAN.md 盖掉 + 委派标记保留；#1709 子代容错；#1708 委派说明对齐事实）随本班上；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十四次重钉。**✅ 10-03 第十五次重钉到 main `fc07b8b1`**：用户 10-03 拍板主干上做完的全部随本班上（harness 质量批 B-136 / B-137 / B-139 / B-149 / B-151 + 依赖三批），先统一发测试跑真栈清单，首轮发现的问题修在 #1732 / #1733（B-153）/ #1734（B-154）；**10-07 判定，不过就退回 `54d1ed70`**；操作位已全部改到新钉子，见 §0.1 第十五次重钉。
+> **⚠️ 2026-09-29 再次改期**：09-28 没有发，**用户 09-29 拍板推迟到 2026-10-08**，并把 **B-125 健康方案交付件技能**（`health-plan-report` 导入 + ai-health-plan 提示词 rev39）一起带上，见 §0.2 与 Step A3 / A4。钉子当时未变（`c0789ca6`），B-125 不进镜像（`platform-skills/` 只由导入脚本上线）。**同日用户再拍板：B-126（跨轮上下文降本）也随本班上生产；钉子等 B-126 合入后一次性前移到 main**（届时连同 #1690 fast-uri / #1691 MinIO 一起带上），前移后先发测试环境验过再重钉，本单操作位随之改。**✅ 09-29 已前移（第十一次重钉）到 main `ab4097cf`**：带 B-126 / B-127 / B-128 与 #1690 / #1691，测试环境验过，操作位已全部改到新钉子，见 §0.1 第十一次重钉。**✅ 09-30 第十二次重钉到 main `39c93912`**：用户 09-30 拍板 B-131（减少修改轮的额外调用，平台部分）随本班上，同时带上 pyjwt 2.14.0 安全升级（#1701）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十二次重钉。**✅ 10-01 第十三次重钉到 main `31f22602`**：用户 09-30 拍板新模型 glm-5.3-flashx（#1702）随本班上，同时带上三个依赖安全升级（urllib3 #1703、pyjwt 2.15.1 #1705、virtualenv #1706）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十三次重钉。**✅ 10-01 第十四次重钉到 main `54d1ed70`**：用户 10-01 拍板子智能体委派三项修复（#1710 计划不再被旧 PLAN.md 盖掉 + 委派标记保留；#1709 子代容错；#1708 委派说明对齐事实）随本班上；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十四次重钉。**✅ 10-03 第十五次重钉到 main `fc07b8b1`**：用户 10-03 拍板主干上做完的全部随本班上（harness 质量批 B-136 / B-137 / B-139 / B-149 / B-151 + 依赖三批），先统一发测试跑真栈清单，首轮发现的问题修在 #1732 / #1733（B-153）/ #1734（B-154）；**10-07 判定，不过就退回 `54d1ed70`**；操作位已全部改到新钉子，见 §0.1 第十五次重钉。**✅ 10-04 第十六次重钉到 main `5091938c`**：测试环境 24h 复查发现的三个问题修在 #1736（B-156 平台辅助模型默认改 `glm` / `glm-5.3-flash` + 记忆整理锁超时）/ #1737（B-157 204 不带响应体）/ #1738（B-155 MCP 会话 cancel scope，**必须随本班**：本班带 anyio 4.14，不修则生产一上线就开始发作）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十六次重钉。
 >
 > **⚠️ 2026-09-25 改期说明**：本班 09-24 **没有发**（用户 09-20 拍板等 B-84 本波做完一起发，
 > 之后又陆续合入 B-64 / B-106 / B-102~104 / B-105）。**用户 09-25 拍板 09-28（周一）发**。文件名保留原日期，免得外链断；**发布日以表头为准**。
-> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）；同日第九次重钉到 main 的 `68a7b75f`，再带上 B-122 / B-123 与 B-119 的文案；当晚第十次重钉到 main 的 `c0789ca6`，再带上 B-124 子代沙箱工作区修复；09-29 第十一次重钉到 main 的 `ab4097cf`，再带上 B-126 / B-127 / B-128；09-30 第十二次重钉到 main 的 `39c93912`，再带上 B-131 与 pyjwt 升级；10-01 第十三次重钉到 main 的 `31f22602`，再带上 glm-5.3-flashx 与三个依赖安全升级；同日第十四次重钉到 main 的 `54d1ed70`，再带上子智能体委派三项修复；10-03 第十五次重钉到 main 的 `fc07b8b1`，再带上 harness 质量批（B-136 / B-137 / B-139 / B-149 / B-151）、真栈测试发现的修复（#1732 / B-153 / B-154）与三批依赖升级（见 §0.1）。
+> 这一版把 09-20 之后合入的全部内容一并带上，钉子重钉到 `f92c6fae`（第七次重钉，见 §0.1）；09-27 再在它上面只叠一个 B-121 沙箱时区修复，钉子为 `e5341495`（第八次重钉）；同日第九次重钉到 main 的 `68a7b75f`，再带上 B-122 / B-123 与 B-119 的文案；当晚第十次重钉到 main 的 `c0789ca6`，再带上 B-124 子代沙箱工作区修复；09-29 第十一次重钉到 main 的 `ab4097cf`，再带上 B-126 / B-127 / B-128；09-30 第十二次重钉到 main 的 `39c93912`，再带上 B-131 与 pyjwt 升级；10-01 第十三次重钉到 main 的 `31f22602`，再带上 glm-5.3-flashx 与三个依赖安全升级；同日第十四次重钉到 main 的 `54d1ed70`，再带上子智能体委派三项修复；10-03 第十五次重钉到 main 的 `fc07b8b1`，再带上 harness 质量批（B-136 / B-137 / B-139 / B-149 / B-151）、真栈测试发现的修复（#1732 / B-153 / B-154）与三批依赖升级（见 §0.1）；10-04 第十六次重钉到 main 的 `5091938c`，再带上 24h 复查的三个修复（B-155 / B-156 / B-157）。
 >
 > 一次性文档，发完归档。通用流程在 [`production-release.md`](./production-release.md)，
 > **这份只列那一份不覆盖的东西**。上一班的单子在
@@ -14,8 +14,8 @@
 |---|---|
 | 发布日 | **2026-10-08（周四）** —— 用户 2026-09-29 拍板（09-28 未发）。此前 **2026-09-28（周一）** —— 用户 2026-09-25 拍板。原定 09-24（用户 09-17 拍板，原 09-22），09-20 用户拍板延期等 B-84 本波 |
 | 上一版 tag（回滚用） | **`5775fbf3`**（班车 1 的 B2，2026-09-16 18:51 上线） |
-| 本版 tag | **`fc07b8b1`**（**main**，#1734 的合并提交，父提交 `52d92f60`）= `54d1ed70` + 其后 main 上的 23 个提交（见 §0.1 第十五次重钉）。用户 10-03 拍板：主干上做完的全部带上 10-08，先统一发测试跑真栈清单（`docs/runbooks/pending-test-release-acceptance.md` §1–§9），10-07 判定 —— 不过就退回 `54d1ed70`。测试环境 10-03 发过 `52d92f60`（smoke + 金丝雀 PASS）与 #1734 分支 `9391dbd6`（smoke PASS；金丝雀首跑 `ReadError`、原地重跑 PASS），`9391dbd6` 与 `fc07b8b1` 只差文档与 test overlay 记录。**以下为第十四次钉子的记录**：`54d1ed70`（**main**，#1708 的合并提交，父提交 `6eba2435`）= `31f22602` + 其后 main 上的 4 个提交：子智能体委派三项修复（#1710 / #1709 / #1708）与执行单本身（#1707）。测试环境 2026-10-01 发过（`release.sh test`，镜像 `54d1ed70`、admin-ui 沿用 `f29ac13b-test` —— 三个 PR 都不碰 `apps/admin-ui`）；smoke PASS；金丝雀首跑客户端读流 `ReadError`（服务端该 run 32 秒 success，0 重启），单独重跑 PASS；委派两轮探针 + Step C 命令通过，见 §0.1 第十四次重钉。**以下为第十三次钉子的记录**：`31f22602`（**main**，#1702 的合并提交，父提交 `f3cfa4f7`）= `39c93912` + 其后 main 上的 5 个提交：新模型 glm-5.3-flashx（#1702，模型目录加一条，能力位与 glm-5.3-flash 逐项相同）、`uv.lock` 三个依赖安全升级（#1703 urllib3 2.7.0 → 2.8.0；#1705 pyjwt 2.14.0 → 2.15.1；#1706 virtualenv 21.3.1 → 21.7.13，只是开发工具 pre-commit 的依赖、不进镜像）与执行单本身（#1698）。测试环境 2026-10-01 发过（`release.sh test`，镜像 `31f22602`、admin-ui 沿用 `f29ac13b-test` —— `git diff f29ac13b 31f22602 -- apps/admin-ui` 为空；smoke + 金丝雀 PASS；Step C 符号 / 版本核对命令在测试 pod 实跑输出 `ok`；见 §0.1 第十三次重钉）。**以下为第十二次钉子的记录**：`39c93912`（**main**，#1700 的合并提交，父提交 `63a0600c`）= `ab4097cf` + 其后 main 上的 2 个提交：B-131（#1700，减少修改轮的额外调用：计划打勾与下一步动作同一次回复、自然答完时平台把未完成步骤标完成；另含 `health-plan-report` 技能 v6，不进镜像）与 pyjwt 2.13.0 → 2.14.0（#1701，只改 `uv.lock`，修 2026-09-30 公布的 10 个 CVE）。测试环境 2026-09-30 发过（`release.sh test`，镜像 `39c93912`、admin-ui 沿用 `f29ac13b-test` —— `git diff f29ac13b 39c93912 -- apps/admin-ui` 为空；smoke + 金丝雀 PASS；`health-plan-report` 技能在 pod 内 dry-run 为 `786d30fe…`、unchanged；见 §0.1 第十二次重钉）。**以下为第十一次钉子的记录**：`ab4097cf`（**main**，#1697 的合并提交，父提交 `78abe0f3`）= `c0789ca6` + 其后 main 上的 13 个提交：运行时代码 B-126（#1694 / #1696，跨轮上下文降本）、B-127（#1695，MCP 工具参数固定值，含 admin-ui 配置页）、B-128（#1697，prompt 只留最新一份系统提示词）与 admin-ui 依赖 fast-uri 升版（#1690）；其余是 `platform-skills/`（B-125，不进镜像）/ CI / 文档。测试环境 2026-09-29 发过（`release.sh test`，镜像 `f29ac13b`、admin-ui `f29ac13b-test`，代码树与 `ab4097cf` 逐字相同 —— `git diff f29ac13b ab4097cf` 为空；smoke + 金丝雀 PASS；ai-health-plan 真实 7 轮对话重放 7/7 success，见 §0.1 第十一次重钉）。**以下为第十次钉子的记录**：`c0789ca6`（**main**，#1685 的合并提交，父提交 `68a7b75f`）= `f92c6fae` + 其后 main 上的 11 个提交：运行时代码只多 B-121（#1681，与第八次钉子 `e5341495` 同一份改动）、B-122（#1682）、B-123（#1683）、B-124（#1685）与 B-119 的一处文案（#1678），其余是文档 / `platform-skills/`（不进镜像）/ test overlay。**不再用分支 `release/train2-tz`**（发版不从它取，留不留不影响本单）。测试环境 2026-09-27 发过 `c0789ca6`（`release.sh test`，镜像 `c0789ca6`、admin-ui `c0789ca6-test`；smoke + 金丝雀 PASS；B-124 真栈四条全过，见 §0.1 第十次重钉）。第九次钉子 `68a7b75f` 此前 09-27 发过（`release.sh test`，镜像 `68a7b75f`、admin-ui `68a7b75f-test`）：测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。第八次钉子 `e5341495` 09-27 测试验过（smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST，#1681）；`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
-| 区间提交数 | **167**（`git log --oneline 5775fbf3..fc07b8b1`；第十四次钉子 `54d1ed70` 时为 144，第十五次多 23 个，列表见 §0.1；第十三次钉子 `31f22602` 时为 140，第十四次多 4 个 —— #1707 / #1710 / #1709 / #1708；第十二次钉子 `39c93912` 时为 135，第十三次多 5 个 —— #1698 / #1703 / #1705 / #1706 / #1702；第十一次钉子 `ab4097cf` 时为 133，第十二次多 2 个 —— B-131 / pyjwt；第十次钉子 `c0789ca6` 时为 120，第十一次多 13 个 —— B-125 四个 + B-126 两个 + B-127 / B-128 / fast-uri / MinIO CI 各一个 + 两个文档；原记录：其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 `f92c6fae` 之后 main 上的 11 个 —— B-121 / B-122 / B-123 / B-124 / office 技能两个 / 五个纯文档或 test overlay 记录） |
+| 本版 tag | **`5091938c`**（**main**，#1738 的合并提交，父提交 `f7151970`（#1737））= `fc07b8b1` + 其后 main 上的 4 个提交：执行单第十五次重钉（#1735）与 24h 复查的三个修复 #1736 / #1737 / #1738（见 §0.1 第十六次重钉）。测试环境 2026-10-04 发过 `5091938c`（`release.sh test`，镜像 `5091938c`、admin-ui `5091938c-test`；smoke PASS，含新的辅助模型凭据行 `OK   memory_consolidator aux provider glm has a platform credential`；金丝雀**首跑** PASS，另一个新 pod 首跑也 PASS，两个 pod cancel scope 计数 0、零重启；Step C 符号 / 版本核对命令在测试 pod 原样实跑输出 `ok`；Step A3 在 `5091938c` 上实打 dry-run 仍为 `786d30fe`、unchanged；见 §0.1 第十六次重钉）。 **以下为第十五次钉子的记录**：`fc07b8b1`（**main**，#1734 的合并提交，父提交 `52d92f60`）= `54d1ed70` + 其后 main 上的 23 个提交（见 §0.1 第十五次重钉）。用户 10-03 拍板：主干上做完的全部带上 10-08，先统一发测试跑真栈清单（`docs/runbooks/pending-test-release-acceptance.md` §1–§9），10-07 判定 —— 不过就退回 `54d1ed70`。测试环境 10-03 发过 `52d92f60`（smoke + 金丝雀 PASS）与 #1734 分支 `9391dbd6`（smoke PASS；金丝雀首跑 `ReadError`、原地重跑 PASS），`9391dbd6` 与 `fc07b8b1` 只差文档与 test overlay 记录。**以下为第十四次钉子的记录**：`54d1ed70`（**main**，#1708 的合并提交，父提交 `6eba2435`）= `31f22602` + 其后 main 上的 4 个提交：子智能体委派三项修复（#1710 / #1709 / #1708）与执行单本身（#1707）。测试环境 2026-10-01 发过（`release.sh test`，镜像 `54d1ed70`、admin-ui 沿用 `f29ac13b-test` —— 三个 PR 都不碰 `apps/admin-ui`）；smoke PASS；金丝雀首跑客户端读流 `ReadError`（服务端该 run 32 秒 success，0 重启），单独重跑 PASS；委派两轮探针 + Step C 命令通过，见 §0.1 第十四次重钉。**以下为第十三次钉子的记录**：`31f22602`（**main**，#1702 的合并提交，父提交 `f3cfa4f7`）= `39c93912` + 其后 main 上的 5 个提交：新模型 glm-5.3-flashx（#1702，模型目录加一条，能力位与 glm-5.3-flash 逐项相同）、`uv.lock` 三个依赖安全升级（#1703 urllib3 2.7.0 → 2.8.0；#1705 pyjwt 2.14.0 → 2.15.1；#1706 virtualenv 21.3.1 → 21.7.13，只是开发工具 pre-commit 的依赖、不进镜像）与执行单本身（#1698）。测试环境 2026-10-01 发过（`release.sh test`，镜像 `31f22602`、admin-ui 沿用 `f29ac13b-test` —— `git diff f29ac13b 31f22602 -- apps/admin-ui` 为空；smoke + 金丝雀 PASS；Step C 符号 / 版本核对命令在测试 pod 实跑输出 `ok`；见 §0.1 第十三次重钉）。**以下为第十二次钉子的记录**：`39c93912`（**main**，#1700 的合并提交，父提交 `63a0600c`）= `ab4097cf` + 其后 main 上的 2 个提交：B-131（#1700，减少修改轮的额外调用：计划打勾与下一步动作同一次回复、自然答完时平台把未完成步骤标完成；另含 `health-plan-report` 技能 v6，不进镜像）与 pyjwt 2.13.0 → 2.14.0（#1701，只改 `uv.lock`，修 2026-09-30 公布的 10 个 CVE）。测试环境 2026-09-30 发过（`release.sh test`，镜像 `39c93912`、admin-ui 沿用 `f29ac13b-test` —— `git diff f29ac13b 39c93912 -- apps/admin-ui` 为空；smoke + 金丝雀 PASS；`health-plan-report` 技能在 pod 内 dry-run 为 `786d30fe…`、unchanged；见 §0.1 第十二次重钉）。**以下为第十一次钉子的记录**：`ab4097cf`（**main**，#1697 的合并提交，父提交 `78abe0f3`）= `c0789ca6` + 其后 main 上的 13 个提交：运行时代码 B-126（#1694 / #1696，跨轮上下文降本）、B-127（#1695，MCP 工具参数固定值，含 admin-ui 配置页）、B-128（#1697，prompt 只留最新一份系统提示词）与 admin-ui 依赖 fast-uri 升版（#1690）；其余是 `platform-skills/`（B-125，不进镜像）/ CI / 文档。测试环境 2026-09-29 发过（`release.sh test`，镜像 `f29ac13b`、admin-ui `f29ac13b-test`，代码树与 `ab4097cf` 逐字相同 —— `git diff f29ac13b ab4097cf` 为空；smoke + 金丝雀 PASS；ai-health-plan 真实 7 轮对话重放 7/7 success，见 §0.1 第十一次重钉）。**以下为第十次钉子的记录**：`c0789ca6`（**main**，#1685 的合并提交，父提交 `68a7b75f`）= `f92c6fae` + 其后 main 上的 11 个提交：运行时代码只多 B-121（#1681，与第八次钉子 `e5341495` 同一份改动）、B-122（#1682）、B-123（#1683）、B-124（#1685）与 B-119 的一处文案（#1678），其余是文档 / `platform-skills/`（不进镜像）/ test overlay。**不再用分支 `release/train2-tz`**（发版不从它取，留不留不影响本单）。测试环境 2026-09-27 发过 `c0789ca6`（`release.sh test`，镜像 `c0789ca6`、admin-ui `c0789ca6-test`；smoke + 金丝雀 PASS；B-124 真栈四条全过，见 §0.1 第十次重钉）。第九次钉子 `68a7b75f` 此前 09-27 发过（`release.sh test`，镜像 `68a7b75f`、admin-ui `68a7b75f-test`）：测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。第八次钉子 `e5341495` 09-27 测试验过（smoke PASS + 金丝雀产物链 PASS；沙箱 `date` 打出 CST，#1681）；`f92c6fae` 本身 09-25 测试验过（记录 #1667 / #1670） |
+| 区间提交数 | **171**（`git log --oneline 5775fbf3..5091938c`；第十五次钉子 `fc07b8b1` 时为 167，第十六次多 4 个 —— #1735 / #1736 / #1737 / #1738；第十四次钉子 `54d1ed70` 时为 144，第十五次多 23 个，列表见 §0.1；第十三次钉子 `31f22602` 时为 140，第十四次多 4 个 —— #1707 / #1710 / #1709 / #1708；第十二次钉子 `39c93912` 时为 135，第十三次多 5 个 —— #1698 / #1703 / #1705 / #1706 / #1702；第十一次钉子 `ab4097cf` 时为 133，第十二次多 2 个 —— B-131 / pyjwt；第十次钉子 `c0789ca6` 时为 120，第十一次多 13 个 —— B-125 四个 + B-126 两个 + B-127 / B-128 / fast-uri / MinIO CI 各一个 + 两个文档；原记录：其中 74 个是原班车 2，35 个是 09-20 之后追加，见 §0.1，再加 `f92c6fae` 之后 main 上的 11 个 —— B-121 / B-122 / B-123 / B-124 / office 技能两个 / 五个纯文档或 test overlay 记录） |
 | 数据库迁移 | **五条**（`0160` 为 10-03 第十五次重钉追加，`0159` 为 09-20 之后追加）：`0160_agent_run_thread_busy`（B-139，`agent_run` 加一个部分索引 `ix_agent_run_thread_busy`，只建索引不动数据；普通 `CREATE INDEX`，`agent_run` 量级小，锁时间可忽略）+ `0159_skill_usage_viewed`（只放宽 `skill_run_usage.outcome` 的 CHECK，允许 `viewed`；不加表不加列不动数据）+ 原三条：`0156_thread_message_hidden`（expand-only，`thread_message` 加 `hidden` 一列带默认 `false`）+ `0157_thread_mirror_resweep`（**数据迁移**，一句 `DELETE FROM thread_message_sync`）+ `0158_run_completion`（expand-only，`agent_run` 加 `completed` / `exit_reason` 两列，**可空、不回填**，B-85 ③）。migrate Job 自动跑，不需要额外动作 |
 | 段数 | **单段**。有迁移但不是三段式：`0156` / `0158` 纯加列、`0157` 只清一张派生状态表、`0160` 只加索引，都没有数据搬迁、没有 expand/contract 关系，新旧两版代码都能在这些表上正常跑 |
 | 回滚纪律 | **只回镜像，不要 `alembic downgrade`。** 多一列对旧版本无害（旧 ORM 不映射它，既不 SELECT 也不 INSERT，`server_default` 兜住）；downgrade 会把新版本写进去的 `hidden` 全抹掉，而回滚窗口里随时可能再滚回来。`0157` 的 downgrade 是空转，`downgrade -1 && upgrade head` 会把那句 DELETE **再跑一遍**（只是多触发一次全量重扫，不丢数据，但没必要）。`0158` 同 `0156`：两列可空、旧代码不读不写，多两列对旧版本无害；downgrade 会把新版本写进去的 `completed` / `exit_reason` 全抹掉。`0159` 同理：旧代码从不写 `viewed`，放宽的 CHECK 对它无害；downgrade 会先删掉全部 `viewed` 行。`0160` 只是索引，旧代码用不到也无害，不必 downgrade。**B-139 回滚注意**：回滚瞬间若有排队中的轮（`queued`），旧版后台队列照常领走、但不按会话串行（回到 B-139 之前的行为），不丢数据 |
@@ -173,6 +173,27 @@
 **没有新的手工集群对象、没有新 secret、没有新配置键**：09-20 之后追加的 35 个提交里 `infra/k8s/` 只动了
 `base/observability/rules/sli.yml` 与 test overlay；沙箱镜像没有重烤（钉子仍是 `7ac31957`，Step A 不变）。
 
+> **2026-10-04 第十六次重钉：`fc07b8b1` → `5091938c`（main HEAD）。** 用户 10-04 要求 24h 复查发现的三个问题全部解决（「三个问题都要解决」），修完随本班上。比第十五次钉子多出 4 个提交（`git log --oneline fc07b8b1..5091938c`），运行时相关的：
+>
+> | 条目 | PR | 做什么 | 对外影响 |
+> |---|---|---|---|
+> | B-155 MCP 会话 cancel scope | #1738 | MCP 会话的打开、使用、关闭全放进一个专属任务（`_open_owned_session`），不再把 anyio 的 cancel scope 留在请求任务上。本班带 anyio 4.14（#1605），**不修则每个新 pod 的第一个流式请求、之后每次 MCP 池过期重建都会断**：run 成功、客户端收到 `ReadError`（测试环境发版后金丝雀首跑 4 次断 3 次就是它）；生产现版 `5775fbf3` 还是 anyio 4.13，所以生产暂时没有 | 对接方不再遇到「run 成功但连接异常断开」 |
+> | B-156 平台辅助模型 | #1736 | `infra/k8s/base/configmap.yaml` 里记忆整理 / 评测 / 质量评审三对辅助模型默认从 anthropic / claude-\* 改为 `glm` / `glm-5.3-flash`（用户 10-04 拍板，生产同测试）；两个环境都没有 anthropic 平台凭据，记忆整理从开荒起每轮全败。同 PR：记忆整理单飞锁事务的空闲超时 5 分钟 → 12 小时（调用调得通后首轮追积压跑了 27 分钟，5 分钟时锁会话被 PG 杀掉、另一副本并发再跑一轮、成功的一轮被报 `cycle_failed`）；smoke 加「辅助模型厂商有没有平台凭据」warn-only 检查 | 无。生产记忆整理从本版起真正开始跑：rollout 后约 4 小时第一轮，追积压会调用较多次 glm-5.3-flash（测试 27 个用户一轮约 130 次） |
+> | B-157 204 不带响应体 | #1737 | 删除智能体、断开 MCP OAuth、删除上传图片三个 204 接口不再带 4 字节 `null`（原先 uvicorn 回完 204 报 `Response content longer than Content-Length`） | 无（客户端拿到的 204 本来就正常，只是服务端每次留一条错误堆栈） |
+>
+> **迁移**：无新迁移（仍是五条，`git diff fc07b8b1 5091938c -- packages/expert-work-persistence/migrations` 为空）。**配置**：只改 base ConfigMap 里上面三对已有键的取值，prod overlay 不覆盖它们（`infra/k8s/overlays/prod/` 里 grep 不到），随 `apply -k` 生效；**无新配置键、无新 secret、无新集群对象**。**平台技能零改动**（`git diff fc07b8b1 5091938c -- platform-skills` 为空，Step A2 / A3 的 hash 不变）。admin-ui、沙箱镜像零改动。
+>
+> **回退阀**：B-155 / B-157 没有开关，出问题只能回滚镜像。B-156 的辅助模型可以在 ConfigMap 里改回（但改回 anthropic 就是回到每轮全败）；锁超时没有开关。
+>
+> 测试环境验收（10-04）：
+>
+> - #1736 分支 `18dde1d5`：smoke 新检查由改前的 `WARN … anthropic has NO enabled platform credential` 变为 `OK … glm …`；整理间隔临时设 120 秒，一轮 27 分钟、glm-5.3-flash 调用 124+ 次、`sweep_complete … errors=0`；同一轮带出锁超时问题（第二个 pod 13:45 并发在跑、赢家 13:58 报 `cycle_failed`），修在 #1736 第二个提交。金丝雀首跑仍 `ReadError`（B-155 当时未修）。
+> - 三个分支合集 `38e7ecd3`：两个新 pod 首跑金丝雀 PASS、cancel scope 计数 0；去掉整理间隔又滚出两个新 pod，首跑 PASS、计数 0（修前 4 次发版 3 次首跑断）；整理只在一个 pod 上跑、无 `cycle_failed`（那一轮积压已清、很短，长轮由单元测试兜底）；控制台登录态删图 / 删 Agent 都 204，打到的 pod 上 `Response content longer` 计数 0。
+> - main `5091938c`（#1738 合并后补了 CodeQL 要求的一处收窄与测试写法，行为不变）：smoke PASS；两个新 pod 首跑金丝雀 PASS（147.6 秒 / 86.5 秒 —— 慢在 `exec_python` 等沙箱约 60 秒与一次 glm 调用 55 秒：前面短时间连跑 6 次金丝雀把沙箱池用空，与本次改动无关，本次不碰沙箱）；cancel scope 计数 0、ERROR 0、零重启；Step C 新命令与 B-155 计数命令原样实跑通过；Step A3 dry-run `786d30fe` unchanged。
+> - 用例与记录见 `pending-test-release-acceptance.md` §10。
+>
+> 下面第十五次重钉段里的 `fc07b8b1` 从此是记账位。
+>
 > **2026-10-03 第十五次重钉：`54d1ed70` → `fc07b8b1`（main HEAD）。** 用户 10-02 原定「钉子不动、主干继续开发」；10-03 改拍板：主干上已经做完的全部带上 10-08，先重钉 main 统一发测试、按 `docs/runbooks/pending-test-release-acceptance.md` §1–§9 跑真栈，**10-07 判定，任何一条不过就退回 `54d1ed70`**。比第十四次钉子多出 23 个提交（`git log --oneline 54d1ed70..fc07b8b1`），运行时相关的：
 >
 > | 条目 | PR | 做什么 | 对外影响 |
@@ -327,7 +348,7 @@
 > **2026-09-25 第七次重钉：`139057c8` → `f92c6fae`。** 操作位（表头、Step B / C / F、§6）已全部改到新钉子；
 > 下面历史段落里出现的旧 sha 是记账位，按原判据放过。
 
-> **钉子纪律**：本单钉 `fc07b8b1`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
+> **钉子纪律**：本单钉 `5091938c`。发布日若要带上它之后的**任何代码或 admin-ui 文档站改动**，
 > 必须**先发一次测试环境验过**再改钉子 —— 别在发布当天直接发 main HEAD。
 >
 > **改期记录**：2026-09-18 先钉 `498492d5`（#1591），当天下午用户拍板把 B-56 / B-72 / B-65 /
@@ -415,7 +436,7 @@
   同一 7 轮对话重放 7/7 success、被删工具零调用。`list_artifacts` 是平台基础能力，删了仍会自动带上（构建出 24 个工具，不是 23 个），属预期。）。
   代码 #1686–#1689 已合 main（`523a1050`）；ROADMAP B-125。
 - **不动镜像、不动钉子**：`platform-skills/` 不进任何镜像，技能由 Step A3 用导入脚本上线；提示词由 Step A4 改 Agent 配置。
-- **依赖**：① Step B 的 `fc07b8b1`（`EXPERT_WORK_SKILLS_DIR`，B-84；「固定值」要 B-127）；② Step A 的沙箱镜像 `7ac31957`（python-pptx /
+- **依赖**：① Step B 的 `5091938c`（`EXPERT_WORK_SKILLS_DIR`，B-84；「固定值」要 B-127）；② Step A 的沙箱镜像 `7ac31957`（python-pptx /
   weasyprint / Noto CJK —— 测试环境 in-image 用例就在这个镜像上跑）；③ Step A2 的 `pptx` / `pdf` / `docx`（rev39 绑定它们）。
   所以顺序是 **A → B → C → A2 → A3 → A4**。
 - **两件必须一起做**：只导入技能，Agent 不会用；只发 rev39，Agent 会调一个生产上不存在（或未启用）的技能。
@@ -426,7 +447,7 @@
 
 > **本班时间点**：09-28 是周一，前一天是周日 → **两条只读盘点 SQL 建议 09-26（周五）就跑**：
 > ① 价目表若有缺价要在控制台补价、② 上限偏小的 Agent 要找负责人确认，这两件都需要工作日。
-> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。`e5341495` 09-27 13:10 发到测试，只多 B-121 一处，按它的真栈验证（沙箱时钟 + 出方案）放行，不另等 24h。`68a7b75f`（第九次重钉）同一原则：在验过的钉子上只多 B-122 / B-123 与 B-119 的一处文案，按它的真栈验收放行、不另等 24h —— 测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。`c0789ca6`（第十次重钉）同理：只多 B-124 一个文件，按它的真栈验收（修前修后四条探针 + ai-health-plan 委派回归 + smoke / 金丝雀 PASS）放行，不另等 24h。`ab4097cf`（第十一次重钉）09-29 发到测试（镜像 `f29ac13b`，树相同），到 10-08 早已满 24h，**24h 复查按原判据对它做**（重点看 B-126 / B-128 生效后有无 run 失败或上下文相关报错）。`39c93912`（第十二次重钉）09-30 发到测试，只多 B-131 与 pyjwt，按它的真栈验收放行；到 10-08 同样早已满 24h，复查时顺带看控制台计划卡片是否都收尾。`31f22602`（第十三次重钉）10-01 发到测试，只多模型目录一条与三个依赖升级，按它的 smoke + 金丝雀 + flashx 真跑放行。`54d1ed70`（第十四次重钉）同日发到测试，只多子智能体委派三项修复，按它的 smoke + 金丝雀 + 委派两轮探针放行。`fc07b8b1`（第十五次重钉）10-03 发到测试（`52d92f60` 与 #1734 分支 `9391dbd6`，后者与 `fc07b8b1` 代码相同），按真栈清单 `pending-test-release-acceptance.md` §1–§9 放行；10-04 起满 24h，**24h 复查对象改为它**，10-07 判定前做一次。
+> 测试环境 24h 复查的对象是 `f92c6fae`（09-25 发到测试），09-26 起即满 24h。`e5341495` 09-27 13:10 发到测试，只多 B-121 一处，按它的真栈验证（沙箱时钟 + 出方案）放行，不另等 24h。`68a7b75f`（第九次重钉）同一原则：在验过的钉子上只多 B-122 / B-123 与 B-119 的一处文案，按它的真栈验收放行、不另等 24h —— 测试环境 09-27 发 `68a7b75f`,smoke + 金丝雀 PASS;B-122/B-123 真栈 4 条全过(子智能体无 save_artifact、能调深护智康只读工具、写工具 `kept=31 dropped_write=9`)。`c0789ca6`（第十次重钉）同理：只多 B-124 一个文件，按它的真栈验收（修前修后四条探针 + ai-health-plan 委派回归 + smoke / 金丝雀 PASS）放行，不另等 24h。`ab4097cf`（第十一次重钉）09-29 发到测试（镜像 `f29ac13b`，树相同），到 10-08 早已满 24h，**24h 复查按原判据对它做**（重点看 B-126 / B-128 生效后有无 run 失败或上下文相关报错）。`39c93912`（第十二次重钉）09-30 发到测试，只多 B-131 与 pyjwt，按它的真栈验收放行；到 10-08 同样早已满 24h，复查时顺带看控制台计划卡片是否都收尾。`31f22602`（第十三次重钉）10-01 发到测试，只多模型目录一条与三个依赖升级，按它的 smoke + 金丝雀 + flashx 真跑放行。`54d1ed70`（第十四次重钉）同日发到测试，只多子智能体委派三项修复，按它的 smoke + 金丝雀 + 委派两轮探针放行。`fc07b8b1`（第十五次重钉）10-03 发到测试（`52d92f60` 与 #1734 分支 `9391dbd6`，后者与 `fc07b8b1` 代码相同），按真栈清单 `pending-test-release-acceptance.md` §1–§9 放行；10-04 起满 24h，**24h 复查对象改为它**，10-07 判定前做一次。**10-04 已做**：结论 GO，带三条问题（B-155 / B-156 / B-157），修完即第十六次重钉 `5091938c`；`5091938c` 在验过的钉子上只多这三处修复，按它的真栈验收（§0.1 第十六次重钉、`pending-test-release-acceptance.md` §10）放行，不另等 24h。
 
 - [ ] **本机接线还在**（只看存在与权限，不读内容）：
 
@@ -791,19 +812,20 @@ kubectl -n default get events --field-selector involvedObject.kind=Pod | grep -i
 
 ```sh
 git fetch origin main
-git checkout fc07b8b1
+git checkout 5091938c
 git log -1 --oneline            # 确认就是它
 
 tools/deploy/release.sh prod    # 输入 'prod' 确认；或 --yes
 ```
 
-- [ ] 确认 checkout 的是 `fc07b8b1`（`git log -1` 标题是 `fix(langfuse): cap ClickHouse system logs so they stop filling the disk (B-154) (#1734)`，父提交是 `52d92f60`（#1733）；`git merge-base --is-ancestor fc07b8b1 origin/main` 退出码 0 = 在 main 上）
+- [ ] 确认 checkout 的是 `5091938c`（`git log -1` 标题是 `fix(mcp): open and close each MCP session inside its own task (B-155) (#1738)`，父提交是 `f7151970`（#1737）；`git merge-base --is-ancestor 5091938c origin/main` 退出码 0 = 在 main 上）
 - [ ] 三个镜像建推成功（ECR Public 限流是已知形态 —— 失败先把三个 base 全拉一遍再重跑）
 - [ ] migrate Job `condition met`，且日志里出现**五条** upgrade：`0155… -> 0156_thread_message_hidden`、`0156… -> 0157_thread_mirror_resweep`、`0157… -> 0158_run_completion`、`0158… -> 0159_skill_usage_viewed`、`0159… -> 0160_agent_run_thread_busy`（本版不是空跑）
 - [ ] 全部 Deployment rollout 完成
-- [ ] **smoke 全绿，且阶段 6 金丝雀是 PASS 不是 WARNING**
+- [ ] **smoke 全绿，且阶段 6 金丝雀是 PASS 不是 WARNING**。B-155 修好之后金丝雀**首跑**就该 PASS（新 pod 的第一个流式请求正是原先必断的那一个）；首跑若是 `ReadError`，先跑下面 Step C 的 cancel scope 计数，非 0 = B-155 没修住，按 §4 回滚
 - [ ] smoke 里的沙箱钉子检查是 `WARN … 落后 1 个提交`，受影响提交只有 `d8a32812`（#1713，本班有意不带）；落后数大于 1 或列出别的提交，说明 Step A 漏了
 - [ ] smoke 里有 `OK   clickhouse data disk N% used`（B-154 新增；发前生产实测 27%，10-03 用户跑 `df`：5.2G / 19.5G）
+- [ ] smoke 里有 `OK   memory_consolidator aux provider glm has a platform credential`（B-156 新增）。若是 `WARN … has NO enabled platform credential`：生产 glm 平台凭据没启用，记忆整理 / 委派策略生成 / 技能进化会照旧全败 —— 不必回滚（与现状相同），但当天要在控制台把 glm 平台凭据启用
 - [ ] Langfuse 的 ClickHouse 被 `apply -k` 换了配置、重启过（`kubectl -n expert-work get pod langfuse-clickhouse-0` 的 AGE 是刚才）
 - [ ] overlay 的 newTag 改动先别提交 —— Step F 一起记
 
@@ -817,16 +839,26 @@ kubectl -n expert-work get pods            # 无 CrashLoop、重启计数为 0
 kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image'
 ```
 
-- [ ] 三个应用镜像都是 `fc07b8b1`（admin-ui 是 `fc07b8b1-prod`）
-- [ ] **B-126 / B-128 / B-131 代码在位、目录有 glm-5.3-flashx、pyjwt 2.15.1 / urllib3 2.8.0、委派修复在位（#1710 / #1709）、B-139 排队 / B-151 推迟投递 / B-153 Langfuse 4.x 接口在位、langfuse 4.15.6**（只看符号与版本号）：
+- [ ] 三个应用镜像都是 `5091938c`（admin-ui 是 `5091938c-prod`）
+- [ ] **B-126 / B-128 / B-131 代码在位、目录有 glm-5.3-flashx、pyjwt 2.15.1 / urllib3 2.8.0、委派修复在位（#1710 / #1709）、B-139 排队 / B-151 推迟投递 / B-153 Langfuse 4.x 接口在位、langfuse 4.15.6、B-155 MCP 专属任务在位、B-156 辅助模型为 glm-5.3-flash 且整理锁超时 12 小时**（只看符号与版本号）：
 
       ```sh
       POD=$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
         --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
-      kubectl -n expert-work exec "$POD" -- python3 -c 'from orchestrator.context.system_prompt_view import keep_latest_system_prompt; from orchestrator.context.tool_result_prune import prune_prior_turns; from orchestrator.graph_builder.planner import complete_open_steps; import jwt, urllib3; assert jwt.__version__ == "2.15.1", jwt.__version__; assert urllib3.__version__ == "2.8.0", urllib3.__version__; from expert_work.protocol.model_catalog import catalog_entry; assert catalog_entry("glm", "glm-5.3-flashx") is not None; from orchestrator.context import plan_md_digest; from orchestrator.tools._child_run import _deadline_result; from control_plane.thread_queue import MAX_QUEUED_PER_THREAD, queued_turn_stream, _spawn_cleanup; assert MAX_QUEUED_PER_THREAD == 3; from control_plane.trigger_delivery import _thread_busy; import inspect; from expert_work.runtime.middleware.langfuse_sdk import LangfuseSdkClient; assert "start_observation" in inspect.getsource(LangfuseSdkClient.start_span); from importlib.metadata import version; assert version("langfuse") == "4.15.6", version("langfuse"); print("ok")'
+      kubectl -n expert-work exec "$POD" -- python3 -c 'from orchestrator.context.system_prompt_view import keep_latest_system_prompt; from orchestrator.context.tool_result_prune import prune_prior_turns; from orchestrator.graph_builder.planner import complete_open_steps; import jwt, urllib3; assert jwt.__version__ == "2.15.1", jwt.__version__; assert urllib3.__version__ == "2.8.0", urllib3.__version__; from expert_work.protocol.model_catalog import catalog_entry; assert catalog_entry("glm", "glm-5.3-flashx") is not None; from orchestrator.context import plan_md_digest; from orchestrator.tools._child_run import _deadline_result; from control_plane.thread_queue import MAX_QUEUED_PER_THREAD, queued_turn_stream, _spawn_cleanup; assert MAX_QUEUED_PER_THREAD == 3; from control_plane.trigger_delivery import _thread_busy; import inspect; from expert_work.runtime.middleware.langfuse_sdk import LangfuseSdkClient; assert "start_observation" in inspect.getsource(LangfuseSdkClient.start_span); from importlib.metadata import version; assert version("langfuse") == "4.15.6", version("langfuse"); from orchestrator.tools.mcp import _open_owned_session; from control_plane.memory_consolidator import _LOCK_TXN_TIMEOUT_MS; assert _LOCK_TXN_TIMEOUT_MS == 43200000; import os; assert os.environ["EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_PROVIDER"] == "glm" and os.environ["EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_MODEL"] == "glm-5.3-flash"; print("ok")'
       ```
 
-      期望 `ok`（10-03 在测试 pod（`9391dbd6`，与 `fc07b8b1` 代码相同）原样跑过，输出 `ok`）。
+      期望 `ok`（10-04 在测试 pod（`5091938c`）原样跑过，输出 `ok`）。
+- [ ] **B-155 没有复发**：金丝雀跑完后，每个 control-plane pod 的 cancel scope 报错计数都是 0：
+
+      ```sh
+      for p in $(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+          --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'); do
+        printf '%s: ' "$p"; kubectl -n expert-work logs "$p" | grep -c 'Attempted to exit a cancel scope'
+      done
+      ```
+
+      期望每个 pod `0`。非 0 = 对接方会遇到「run 成功但连接断开」，按 §4 回滚到 `5775fbf3`（anyio 4.13，没有这个问题）。
 - [ ] 全 pod Running、零重启
 - [ ] **留存 CronJob 已创建且参数正确**：
 
@@ -900,7 +932,7 @@ kubectl -n expert-work get deploy -o 'custom-columns=NAME:.metadata.name,IMAGE:.
 
 必须在 **Step B 通过之后**（smoke 全绿、金丝雀 PASS，且 Step C 点检完）才做，理由（09-26 终审改，原先放在
 Step B 之前是错的）：新技能正文里的脚本路径全部写成 `$EXPERT_WORK_SKILLS_DIR/<技能>/scripts/…`，这个环境变量
-是 B-84（`233791e5`）才加的，随本班钉子（`f92c6fae` 起就有，`fc07b8b1` 照带）上生产；生产现版 `5775fbf3` 没有它，路径会展开成
+是 B-84（`233791e5`）才加的，随本班钉子（`f92c6fae` 起就有，`5091938c` 照带）上生产；生产现版 `5775fbf3` 没有它，路径会展开成
 `/docx/scripts/…`，脚本调用全部失败。若先导入技能再发版，从导入到 Step B 结束这段时间里 office 技能不可用，
 Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之后**（技能脚本依赖新沙箱镜像里的 LibreOffice 与
 预装库，第二层测试验的也是这份镜像）。
@@ -915,8 +947,8 @@ Step B 一旦回滚就一直坏下去（见 §4）。自然也在 **Step A 之�
 传给 `import_in_pod.py`，不要整批 `*.skill` glob 把 no-go 的也带上。
 
 **用哪份源码打包**：用 office 技能在 main 上的最后一个改动提交 `58c0f2a9`（#1678 + #1679，09-27 回填，
-即测试环境验收 GO 的那一份）打包导入。第九次重钉之后，Step B 检出的钉子（现为 `fc07b8b1`）本身就包含它，而且
-`git diff 58c0f2a9 fc07b8b1 -- platform-skills/docx platform-skills/pptx platform-skills/xlsx platform-skills/pdf platform-skills/shared platform-skills/build.py platform-skills/import_in_pod.py` 为空 —— 四个 office 技能的源码逐字相同（`58c0f2a9` 之后 `platform-skills/` 只多了 B-125 的 `health-plan-report/` 与 `tests/`，由 Step A3 另导）。（09-26 拍板的「发版钉子不前移」
+即测试环境验收 GO 的那一份）打包导入。第九次重钉之后，Step B 检出的钉子（现为 `5091938c`）本身就包含它，而且
+`git diff 58c0f2a9 5091938c -- platform-skills/docx platform-skills/pptx platform-skills/xlsx platform-skills/pdf platform-skills/shared platform-skills/build.py platform-skills/import_in_pod.py` 为空 —— 四个 office 技能的源码逐字相同（`58c0f2a9` 之后 `platform-skills/` 只多了 B-125 的 `health-plan-report/` 与 `tests/`，由 Step A3 另导）。（09-26 拍板的「发版钉子不前移」
 已被 09-27 第九次重钉推翻，office 技能的代码侧文案随本班上生产，见 ROADMAP B-119 与 Step C 的核对项。）
 仍然**用独立 worktree 打包、不直接用主仓库的 `platform-skills/`**：主仓库目录此刻有 Step B 留下的
 **未提交的 overlay newTag 改动**（Step F 要用），别在它上面 checkout；worktree 钉死提交，打包输入不随主仓库
@@ -929,7 +961,7 @@ git worktree add /tmp/ps-office 58c0f2a9
 git -C /tmp/ps-office log -1 --oneline   # 确认就是它
 ```
 
-`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`fc07b8b1`），与生产 pod 里跑的是
+`import_in_pod.py bundle` 在本机导入的 `control_plane` 代码来自主仓库（`5091938c`），与生产 pod 里跑的是
 同一版，这正是要的。
 
 **导入前只读核对**：
@@ -1011,10 +1043,10 @@ uv run --no-sync python $PS/import_in_pod.py bundle \
 ### Step A3 — 导入 `health-plan-report` 技能并启用（B-125，本版新增）
 
 在 **Step A2 之后**做（理由见 §0.2 的依赖）。打包方式同 A2：用独立 worktree 打包，不用主仓库目录的 `platform-skills/`。
-**打包源码钉在本版 tag `fc07b8b1`，不用 `origin/main`**（2026-10-02 改，10-03 随第十五次重钉前移）：10-08 前主干会继续合入新开发，从 main 打包会让发版内容随主干漂移；钉住之后，主干上无论合什么都影响不到这一步。2026-10-02 在 `54d1ed70` 上实打一次、2026-10-03 在 `fc07b8b1` 上再打一次（对测试 pod dry-run），`content_hash` 都是 `786d30fe`（与测试环境 v6 一致；`git diff 54d1ed70 fc07b8b1 -- platform-skills` 为空）。
+**打包源码钉在本版 tag `5091938c`，不用 `origin/main`**（2026-10-02 改，10-03 随第十五次重钉、10-04 随第十六次重钉前移）：10-08 前主干会继续合入新开发，从 main 打包会让发版内容随主干漂移；钉住之后，主干上无论合什么都影响不到这一步。2026-10-02 在 `54d1ed70` 上实打一次、2026-10-03 在 `fc07b8b1` 上再打一次（对测试 pod dry-run）、2026-10-04 在 `5091938c` 上再打一次（对测试 pod dry-run，`unchanged`），`content_hash` 都是 `786d30fe`（与测试环境 v6 一致；`git diff 54d1ed70 5091938c -- platform-skills` 为空）。
 
 ```sh
-git worktree add /tmp/ps-hpr fc07b8b1
+git worktree add /tmp/ps-hpr 5091938c
 uv run --no-sync python /tmp/ps-hpr/platform-skills/build.py --only health-plan-report
 PS=/tmp/ps-hpr/platform-skills
 uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-plan-report.skill \
@@ -1022,7 +1054,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
 ```
 
 - [ ] dry-run 输出 `"status":"dry-run"`；生产上是**首次导入**，应为 `"created": true` 的新建（不是版本递增）
-- [ ] 打包出的 `content_hash` 应为 `786d30fe…`（测试环境 v6，B-131 加「改稿速查」；v5 是 `cc2df66a`）；不同说明 checkout 的不是 `fc07b8b1`，或本机 venv 不对（见 §1「本机 venv 能跑打包导入」），停下来先查
+- [ ] 打包出的 `content_hash` 应为 `786d30fe…`（测试环境 v6，B-131 加「改稿速查」；v5 是 `cc2df66a`）；不同说明 checkout 的不是 `5091938c`，或本机 venv 不对（见 §1「本机 venv 能跑打包导入」），停下来先查
 
 正式导入去掉 `--dry-run`：
 
@@ -1067,6 +1099,16 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
 
 ### Step E — 次日核对（发布次日早上）
 
+- [ ] **记忆整理首轮跑通（B-156）**：rollout 后约 4 小时第一轮，追积压可能跑几十分钟。
+
+      ```sh
+      for p in $(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+          --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'); do
+        echo "== $p"; kubectl -n expert-work logs "$p" | grep -E 'memory_consolidator\.(sweep_complete|cycle_failed)' | cut -c1-300
+      done
+      ```
+
+      期望：只有**一个** pod 打出 `sweep_complete … errors=0`（单飞锁生效，另一个 pod 没有并发跑），两个 pod 都没有 `cycle_failed`。`errors` 非 0 时看同 pod 的 `lone_review_failed` / `cluster_failed`：零星 `LLMNetworkError` 是模型侧抖动（测试 10-04 一轮里 1 次），成片 `CredentialsResolverError` 是 glm 平台凭据没启用。
 - [ ] **留存清理首跑**：
 
       ```sh
@@ -1090,9 +1132,9 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
 
 ### Step F — 记录
 
-- [ ] `chore(deploy): prod newTag fc07b8b1` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
+- [ ] `chore(deploy): prod newTag 5091938c` 记录 PR，正文写上：上一版 `5775fbf3`、本版装载、
       沙箱钉子 `e8aac104 → 7ac31957`、留存 CronJob 首次接入、ClickHouse 清旧表前后 `df`、回滚命令。
-- [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 / B-121 / B-122 / B-123 / B-124 / **B-125** / **B-126** / **B-127** / **B-128** / **B-136** / **B-137** / **B-139** / **B-149** / **B-151** / **B-153** / **B-154** 的「生产待发」改成已上线，B-119 按 Step C 核对结果销案；本执行单补 §6 执行记录。
+- [ ] ROADMAP 班车 2 行销案，B-64 / B-102~104 / B-105 / B-121 / B-122 / B-123 / B-124 / **B-125** / **B-126** / **B-127** / **B-128** / **B-136** / **B-137** / **B-139** / **B-149** / **B-151** / **B-153** / **B-154** / **B-155** / **B-156** / **B-157** 的「生产待发」改成已上线，B-119 按 Step C 核对结果销案；本执行单补 §6 执行记录。
 
 ---
 
