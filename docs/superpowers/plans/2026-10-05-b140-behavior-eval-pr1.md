@@ -1564,7 +1564,7 @@ Expected: FAIL,`ModuleNotFoundError: No module named 'behavior_runner'`
 - [ ] **Step 3: 实现 `tools/eval/behavior_runner.py`**
 
 ```python
-"""B-140 跑整套:每个用例 × 每次重复,在测试环境真跑,结果逐行写 JSONL。
+"""B-140 跑整套:每个用例的每次重复,在测试环境真跑,结果逐行写 JSONL。
 
 用法(key 只经环境变量,不进命令行):
   EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py --label base \\
@@ -1666,7 +1666,7 @@ async def run_case_once(
     fixtures_dir: Path,
 ) -> tuple[RunRecord, dict[FileKey, FetchedFile | None]]:
     agent = agent_map.get(case.agent, case.agent)
-    # 每次一个新 user_id:工作区按「用户 × 智能体」划分,复用会把上一次的 PLAN.md 带进来。
+    # 每次一个新 user_id:工作区按「用户 + 智能体」划分,复用会把上一次的 PLAN.md 带进来。
     user_id = f"b140-{label}-{case.id}-{rep}-{uuid.uuid4().hex[:6]}"
     session_id: str | None = None
     try:
