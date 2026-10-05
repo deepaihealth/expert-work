@@ -51,7 +51,8 @@ _ATTEMPTS = 3
 class Client(Protocol):
     async def upload(
         self, agent: str, user_id: str, filename: str, data: bytes, session_id: str | None
-    ) -> tuple[str, str]: ...
+    ) -> tuple[str, str]:
+        """Upload one fixture; return ``(upload_id, session_id)``."""
 
     async def run_turn(
         self,
@@ -61,15 +62,19 @@ class Client(Protocol):
         prompt: str,
         upload_ids: list[str],
         index: int,
-    ) -> tuple[TurnRecord, str | None]: ...
+    ) -> tuple[TurnRecord, str | None]:
+        """Stream one turn; return its record and the session id."""
 
     async def download_artifact(
         self, agent: str, user_id: str, entry: dict[str, Any]
-    ) -> bytes | None: ...
+    ) -> bytes | None:
+        """Download an artifact; ``None`` when it is gone."""
 
-    async def read_workspace_file(self, agent: str, user_id: str, path: str) -> bytes | None: ...
+    async def read_workspace_file(self, agent: str, user_id: str, path: str) -> bytes | None:
+        """Read a workspace file; ``None`` when it does not exist."""
 
-    async def archive(self, agent: str, user_id: str, session_id: str) -> None: ...
+    async def archive(self, agent: str, user_id: str, session_id: str) -> None:
+        """Soft-archive the session."""
 
 
 def check_base_url(url: str) -> None:
