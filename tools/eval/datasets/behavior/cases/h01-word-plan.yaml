@@ -1,0 +1,14 @@
+id: h01-word-plan
+agent: eval-ahp
+shape: ai-health-plan 主流程
+turns:
+  - prompt: |
+      请为下面这位客户出一份 Word 版健康管理方案,用 save_artifact 交付,文件名用「王小雨-健康方案.docx」。
+      客户资料(虚构):王小雨,女,42 岁,身高 162 cm,体重 68 kg,空腹血糖 6.4 mmol/L,
+      平时久坐、晚睡;诉求是三个月内减重 5 kg、把空腹血糖降到 6.1 以下。
+      方案至少包括饮食、运动、作息三部分。
+checks:
+  - {type: completed}
+  - {type: artifact_exists, name: "*.docx"}
+  - {type: artifact_contains, name: "*.docx", all: ["王小雨", "饮食", "运动", "作息"]}
+  - {type: artifact_not_contains, name: "*.docx", any: [教练]}

@@ -97,3 +97,27 @@ Variants are manifest YAML files — export a revision snapshot via
 History tab. `--provider mock` (default) runs the deterministic mock
 pipeline (CI exercises that path; real-LLM comparisons are manual).
 The JSON artifact lands in `eval-out/prompt_ab_<eval-set>.json`.
+
+## B-140 行为回归评测(在测试环境真跑)
+
+设计:`docs/superpowers/specs/2026-10-05-b140-behavior-regression-eval-design.md`。用例在
+`datasets/behavior/cases/`(全部合成),两个评测智能体在 `datasets/behavior/agents/`。
+
+一次性准备(平台管理员,测试环境):建租户 `b140-eval` → 建服务账号与 `write` 档 API key →
+存进集群 Secret `eval-credentials`(键 `api-key`)→ 控制台导入两个评测智能体 manifest。
+
+跑一遍(key 只进环境变量):
+
+```sh
+export KUBECONFIG=~/.kube/expert-work-test.yaml
+EXPERT_WORK_API_TOKEN="$(kubectl -n expert-work get secret eval-credentials -o jsonpath='{.data.api-key}' | base64 -d)" \
+  uv run --no-sync python tools/eval/behavior_runner.py --label base-$(date +%m%d) --note "test <镜像 tag>"
+```
+
+对照两次:
+
+```sh
+uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>.jsonl eval-out/b140/<改动后>.jsonl --out report.md
+```
+
+退出码 1 = 有稳定退步(改动前 ≥2/3 过、改动后 ≤1/3 过)。只换提示词 / 工具 / 模型时,不用发版:建一个改过的评测智能体副本(另一个 code),`--agent-map eval-ahp=eval-ahp-b`。
