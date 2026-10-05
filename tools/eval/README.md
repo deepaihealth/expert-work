@@ -103,14 +103,14 @@ The JSON artifact lands in `eval-out/prompt_ab_<eval-set>.json`.
 设计:`docs/superpowers/specs/2026-10-05-b140-behavior-regression-eval-design.md`。用例在
 `datasets/behavior/cases/`(全部合成),两个评测智能体在 `datasets/behavior/agents/`。
 
-一次性准备(平台管理员,测试环境):建租户 `b140-eval` → 建服务账号与 `write` 档 API key →
-存进集群 Secret `eval-credentials`(键 `api-key`)→ 控制台导入两个评测智能体 manifest。
+跑在测试环境的对接方租户里(用户 10-05 拍板),用现成的 canary key(Secret `canary-credentials`)。一次性准备:
+用控制台登录态把两个评测智能体 manifest 导入该租户(新建智能体只能走控制台平面)。
 
 跑一遍(key 只进环境变量):
 
 ```sh
 export KUBECONFIG=~/.kube/expert-work-test.yaml
-EXPERT_WORK_API_TOKEN="$(kubectl -n expert-work get secret eval-credentials -o jsonpath='{.data.api-key}' | base64 -d)" \
+EXPERT_WORK_API_TOKEN="$(kubectl -n expert-work get secret canary-credentials -o jsonpath='{.data.api-key}' | base64 -d)" \
   uv run --no-sync python tools/eval/behavior_runner.py --label base-$(date +%m%d) --note "test <镜像 tag>"
 ```
 
@@ -121,3 +121,7 @@ uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>
 ```
 
 退出码 1 = 有稳定退步(改动前 ≥2/3 过、改动后 ≤1/3 过)。只换提示词 / 工具 / 模型时,不用发版:建一个改过的评测智能体副本(另一个 code),`--agent-map eval-ahp=eval-ahp-b`。
+
+自证(评测能红):`datasets/behavior/agents/eval-general-broken.yaml` 只改提示词(要求改文件一律整篇重写),导入后
+`--only g02-edit-three-places --agent-map eval-general=eval-general-broken`,g02 必须在 `tool_not_used_on` 上判不过。
+注意 manifest 里删工具没用:`exec_python` / `bash` / 读写改文件是平台基础能力,每个智能体都有。

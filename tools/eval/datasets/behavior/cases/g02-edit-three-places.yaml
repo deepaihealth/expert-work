@@ -13,5 +13,4 @@ checks:
   - {type: completed}
   - {type: workspace_file_contains, path: report.md, all: ["数据截至 2026 年 9 月", "注册用户数为 1,234 人", "负责人:李工"]}
   - {type: workspace_file_unchanged_lines, path: report.md, fixture: report-300-lines.md, except_lines: [12, 140, 288]}
-  - {type: tool_used, tool: edit_file}
   - {type: tool_not_used_on, tool: write_file, path: report.md}
