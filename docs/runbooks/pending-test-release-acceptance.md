@@ -151,3 +151,10 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 - [x] **12.1 B-140 对照**:`behavior_runner.py --only h08-word-and-pdf,h10-missing-weight,h11-long-checkup-report --repeats 3`。判据:没有因 `OutputTruncatedError` 判「未完成」的(修前 9 次里 3 ~ 4 次);同期 `expert_work_llm_output_truncated_total{usable="false"}` 可以 > 0,日志有 `agent_node.output_truncated_retry`。 **10-06 全量 `after-1006`(`7e865654`)过**:h08 / h10 / h11 共 9 次全过,eval-ahp 36 次 `OutputTruncatedError` 0 次;两个 pod 日志 `agent_node.output_truncated_retry` 共 2 次(都在 `7kmlm`),两次重做都交付。
 - [x] **12.2 重试那次的历史**:挑一个触发了重试的 run,看会话条目与 `run_event`。判据:被截的回答不在历史里、它的工具调用没执行;拆小提示在历史里但对话页不显示(`expert_work_hide_from_ui`);用户看到的是重做后的正常回答。**没修好时**:run `error`,`OutputTruncatedError`。 **10-06 过(`7e865654`)**:两次重试的 run(`029b9544` h08 → docx + pdf、`f5e822e0` → docx)都 `success`、`completed=true`;重试那一步的 `updates` 只有一条带 `expert_work_hide_from_ui` + `expert_work_truncation_retry` 的提示,被截的回答没进历史,下一步是重做后的正常回答。
+
+## §13 欠账按轮清零(ROADMAP B-160)
+
+**背景**:10-06 B-140 修后全量(`7e865654`),h07 第 2 次:第 2 轮 `edit_file` 匹配失败、模型改用 `exec_python` 改写成功(换工具还不上,已知局限),第 2 轮判没做完;**第 3 轮零失败也 `completed=false`**。`unresolved_failures` 通道没有 reducer、每轮图输入又没写它,上一轮的欠账一直留在检查点里。修法:`build_run_graph_input` / `replay_graph_input` 每轮写空列表,与审批三件套同一处。
+
+- [ ] **13.1 B-140 对照**:`behavior_runner.py --only h07-three-revisions,h09-check-output-per-skill --repeats 3`。判据:某一轮判没做完时,后面零失败的轮次判做完了(逐轮看 `agent_run.completed`)。**没修好时**:同一会话里第一次 `completed=false` 之后每一轮都是 false。
+- [ ] **13.2 库里抽查**:发测试后 24h,同一 `thread_id` 里 `completed=false` 的 run,逐条确认本轮 `run_event` 里确有没还上的工具失败。
