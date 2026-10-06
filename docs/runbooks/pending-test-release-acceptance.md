@@ -137,3 +137,10 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [x] **10.2 整理只在一个副本上跑,不误报失败**:同一轮里看两个 pod 的 `memory_consolidator` 日志。判据:只有一个 pod 在跑整理,没有 `cycle_failed`。 **10-04 首跑(`18dde1d5`)不过**:27 分钟的一轮里,第二个 pod 13:45 也在跑(它的 `lone_review_failed`),赢家 13:58 收尾报 `cycle_failed`(`cannot call Transaction.rollback(): the underlying connection is closed`)—— 锁事务空闲超时只有 5 分钟。修在 #1736 第二个提交(12 小时)。**复验(`38e7ecd3`)过**:只有一个 pod 打 `sweep_complete … errors=0`、无 `cycle_failed`;但那一轮积压已清、很短,够不到 5 分钟,**长轮的复现靠单元测试**(`test_lock_txn_idle_timeout_outlasts_a_real_sweep`,退回 5 分钟即红)。
 - [x] **10.3 新 pod 的第一个流式请求不断**:发版后**不要先跑别的**,在每个全新 pod 上各跑一次金丝雀(`kubectl exec` 进指定 pod 跑 `tools/deploy/canary.py`)。判据:首跑 PASS;每个 pod `grep -c 'Attempted to exit a cancel scope'` 为 0(修前:新 pod 的首个流式请求必中)。 **10-04 过**:`38e7ecd3` 两个新 pod 首跑 PASS、计数 0;去掉整理间隔又滚出两个新 pod,首跑 PASS、计数 0 —— 4/4。main `5091938c` 发测试后再两个新 pod 首跑 PASS、计数 0(累计 6/6)。
 - [x] **10.4 删除类 204 不再报错**:控制台登录态下建临时 Agent + 会话 + 上传一张图,再删图(`DELETE /v1/uploads/{id}`)、删 Agent(`DELETE /v1/agents/{name}/{version}`),最后归档会话。判据:两个都 204;**打到的 pod** 日志 `grep -c 'Response content longer'` 为 0(浏览器对 204 会丢弃响应体,客户端看不出区别,判据只能在服务端)。断开 MCP OAuth 需要真实授权连接,测试环境没有,靠单元测试(同一行改法)。 **10-04(`38e7ecd3` 后滚出的 pod)过**:删图 204、删 Agent 204,两条 DELETE 都落在 `t9tk2`,计数 0、该 pod ERROR 0;临时 Agent `b157-probe` 已删、会话已归档。
+
+## §11 B-159 只读工具「找不到」不再判成没做完(ROADMAP B-159)
+
+**背景**:10-05 B-140 首次 3× 基线,h10 一次:模型猜了个不存在的技能路径,`read_file` 回「找不到」,随后换 `skill_view` 读到同一份内容、正常交付,run 却 `completed=false`(`exit_reason=text_response`)。按键抵消的欠账里,换一个工具永远还不上。修法只收一格:**只读工具 + 「找不到」**不进欠账;只读工具别的失败、写类工具的「找不到」照旧记。
+
+- [ ] **11.1 B-140 对照**:`behavior_runner.py --only h10-missing-weight,g12-missing-file-honest --repeats 3`。判据:没有因 `completed` 不过的(h10 的 B-158 截断另算);g12(读一个不存在的文件后如实说明)仍判过。
+- [ ] **11.2 库里抽查**:发测试后 24h,`agent_run` 里 `exit_reason='text_response' and completed=false` 的 run 逐条看 `run_event` 的工具失败,不应再有「只是一次只读找不到」的。**没修好时**:这类 run 的唯一失败是 `read_file` / `skill_view` 的 `resource_not_found`。
