@@ -67,6 +67,10 @@ class _ScriptedTool:
     error: str = "disk full"
     #: 路径参数名 —— ``save_artifact`` 用 ``name``,工作区写工具用 ``path``。
     path_arg: str = "name"
+    #: B-159 —— 声明为只读工具(``side_effect="read_only"``)。
+    read_only: bool = False
+    #: 失败时抛的异常类型;``FileNotFoundError`` 让分类器判 ``resource_not_found``。
+    exc: type[Exception] = OSError
     calls: int = 0
     _seen: list[int] = field(default_factory=list)
 
@@ -80,6 +84,8 @@ class _ScriptedTool:
                 "properties": {self.path_arg: {"type": "string"}},
                 "required": [self.path_arg],
             },
+            is_read_only=self.read_only,
+            side_effect="read_only" if self.read_only else None,
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
@@ -88,7 +94,7 @@ class _ScriptedTool:
         self.calls += 1
         self._seen.append(idx)
         if idx in self.fail_on:
-            raise OSError(self.error)
+            raise self.exc(self.error)
         return ToolResult(content=f"Saved {args.get(self.path_arg)!r}.")
 
 
@@ -431,3 +437,107 @@ def test_budget_reason_precedence_is_pinned() -> None:
 def test_max_steps_zero_means_no_budget() -> None:
     """``max_steps=0`` 是「不设预算」,不是「预算为零、立刻用尽」。"""
     assert budget_exit_reason(max_steps=0, step_count=7, stuck=False, token_tripped=False) is None
+
+
+# ---------------------------------------------------------------------------
+# B-159 —— 只读工具「找不到」不是没做完
+# ---------------------------------------------------------------------------
+
+
+def _completed(state: AgentState) -> bool | None:
+    return compute_completed(
+        exit_reason=str(state.get("exit_reason")),
+        unresolved_failures=state.get("unresolved_failures", []),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_lookup_that_finds_nothing_is_not_left_unfinished() -> None:
+    """B-159 实例(10-05 B-140 h10):模型猜了个不存在的技能路径,``read_file`` 回
+    「找不到」,随后换 ``skill_view`` 读到同一份内容、正常交付 —— 旧账本按键抵消,
+    换工具永远还不上,run 被判 ``completed=false``。
+
+    只读工具回「找不到」是一次**有答案的**查询(目标不在那里),不会让交付件少任何
+    东西,不该进「没做完」的账。
+    """
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("read_file", "tc-1", {"path": "guess.md"})]),
+            AIMessage(content="", tool_calls=[_tc("skill_view", "tc-2", {"path": "SKILL.md"})]),
+            AIMessage(content="方案已交付"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(
+        _ScriptedTool(
+            name="read_file",
+            path_arg="path",
+            read_only=True,
+            fail_on=frozenset({0}),
+            exc=FileNotFoundError,
+            error="workspace path not found: 'guess.md'",
+        )
+    )
+    registry.register(_ScriptedTool(name="skill_view", path_arg="path", read_only=True))
+
+    state = await _run(llm, registry)
+
+    assert state.get("exit_reason") == "text_response", "前提:模型是自然说完的"
+    assert _failure_keys(state) == []
+    assert _completed(state) is True
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_failure_other_than_not_found_still_counts() -> None:
+    """收窄只收「找不到」:只读工具别的失败(权限、上游报错……)是**没读到**,
+    后面的内容可能就缺了这一块,照旧记账。"""
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("read_file", "tc-1", {"path": "a.md"})]),
+            AIMessage(content="方案已交付"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(
+        _ScriptedTool(
+            name="read_file",
+            path_arg="path",
+            read_only=True,
+            fail_on=frozenset({0}),
+            exc=PermissionError,
+            error="permission denied",
+        )
+    )
+
+    state = await _run(llm, registry)
+
+    assert [k[0] for k in _failure_keys(state)] == ["read_file"]
+    assert _completed(state) is False
+
+
+@pytest.mark.asyncio
+async def test_a_write_tool_not_found_still_counts() -> None:
+    """收窄只收**只读**工具:写类工具回「找不到」(比如业务 MCP 更新一条不存在的记录)
+    意味着那次写没落地,照旧记账。
+
+    用一把不在 L-4 写类清单里的工具:清单里的 ``save_artifact`` / ``write_file`` 失败
+    一律折成 ``mutation_not_landed``,到不了「找不到」这一格,咬不住只读那个条件。
+    """
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("update_record", "tc-1")]),
+            AIMessage(content="方案已交付"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(
+        _ScriptedTool(
+            name="update_record", fail_on=frozenset({0}), exc=FileNotFoundError, error="not found"
+        )
+    )
+
+    state = await _run(llm, registry)
+
+    assert _failure_classes(state) == ["resource_not_found"], "前提:失败被判成「找不到」"
+    assert [k[0] for k in _failure_keys(state)] == ["update_record"]
+    assert _completed(state) is False
