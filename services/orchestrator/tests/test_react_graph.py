@@ -399,11 +399,10 @@ async def _run_through_sse(llm: _ScriptedLLM, registry: ToolRegistry) -> tuple[l
 
 @pytest.mark.asyncio
 async def test_truncated_empty_reply_fails_the_run_visibly() -> None:
-    # 思考模型截断的实测形态:额度全给了思考,正文为空。
+    # 思考模型截断的实测形态:额度全给了思考,正文为空。B-158:重试一次仍截断才报错。
     before = _truncated_count("false")
-    llm = _StreamingScriptedLLM(
-        responses=[AIMessage(content="", response_metadata={"finish_reason": "length"})]
-    )
+    truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
+    llm = _StreamingScriptedLLM(responses=[truncated, truncated])
 
     events, row = await _run_through_sse(llm, ToolRegistry())
 
@@ -413,21 +412,19 @@ async def test_truncated_empty_reply_fails_the_run_visibly() -> None:
     assert "模型输出被截断" in errors[0].data["message"]
     assert "2048" in errors[0].data["message"]
     assert row is not None and row.error is not None and "模型输出被截断" in row.error
-    assert _truncated_count("false") == before + 1
+    assert _truncated_count("false") == before + 2, "两次截断各计一次"
+    assert llm.calls == 2
 
 
 @pytest.mark.asyncio
 async def test_truncated_tool_call_fails_before_dispatch() -> None:
-    # 截断时最后一个工具调用的参数必然被截:不能把残缺参数派给工具。
-    llm = _StreamingScriptedLLM(
-        responses=[
-            AIMessage(
-                content="好的,我来写文件",
-                tool_calls=[_tool_call("write_file", {}, "tc-1")],
-                response_metadata={"stop_reason": "max_tokens"},
-            )
-        ]
+    # 截断时最后一个工具调用的参数必然被截:不能把残缺参数派给工具(重试那次也一样)。
+    truncated = AIMessage(
+        content="好的,我来写文件",
+        tool_calls=[_tool_call("write_file", {}, "tc-1")],
+        response_metadata={"stop_reason": "max_tokens"},
     )
+    llm = _StreamingScriptedLLM(responses=[truncated, truncated])
     tool = _CountingTool(name="write_file")
     registry = ToolRegistry()
     registry.register(tool)
@@ -436,6 +433,7 @@ async def test_truncated_tool_call_fails_before_dispatch() -> None:
 
     assert [e.data["name"] for e in events if e.event == "error"] == ["OutputTruncatedError"]
     assert tool.calls == 0
+    assert llm.calls == 2
 
 
 @pytest.mark.asyncio
@@ -458,9 +456,8 @@ async def test_truncation_without_wiring_labels_is_still_judged() -> None:
     # 不接 output_cap / 模型名(单测 / 子图)也判;报错文案退到「厂商默认值」。
     from orchestrator.llm.truncation import OutputTruncatedError
 
-    llm = _ScriptedLLM(
-        responses=[AIMessage(content="", response_metadata={"finish_reason": "length"})]
-    )
+    truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
+    llm = _ScriptedLLM(responses=[truncated, truncated])
     with pytest.raises(OutputTruncatedError, match="厂商默认值"):
         await _run_graph(llm, ToolRegistry())
 
@@ -497,14 +494,11 @@ async def test_fallback_served_truncation_reports_the_fallback_cap_and_label() -
     from orchestrator.usage_metering import SERVED_BY_KEY
 
     before = _count("qwen", "qwen3.6-plus", "false")
-    llm = _ScriptedLLM(
-        responses=[
-            AIMessage(
-                content="",
-                response_metadata={"finish_reason": "length", SERVED_BY_KEY: "qwen:qwen3.6-plus#1"},
-            )
-        ]
+    truncated = AIMessage(
+        content="",
+        response_metadata={"finish_reason": "length", SERVED_BY_KEY: "qwen:qwen3.6-plus#1"},
     )
+    llm = _ScriptedLLM(responses=[truncated, truncated])
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(
             build_react_graph(
@@ -518,7 +512,7 @@ async def test_fallback_served_truncation_reports_the_fallback_cap_and_label() -
             )
 
     assert info.value.cap == 8192 and "8192" in str(info.value)
-    assert _count("qwen", "qwen3.6-plus", "false") == before + 1
+    assert _count("qwen", "qwen3.6-plus", "false") == before + 2
 
 
 def test_served_output_cap_falls_back_to_the_primary_when_unstamped() -> None:
@@ -566,7 +560,7 @@ async def _run_with_usage(response: AIMessage) -> tuple[Any, _SpyCache, BaseExce
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(
             build_react_graph(
-                llm_caller=_ScriptedLLM(responses=[response]),
+                llm_caller=_ScriptedLLM(responses=[response, response]),
                 tool_registry=ToolRegistry(),
                 after_llm_chain=after,
                 output_cap_resolver=_GLM_CAPS,
@@ -598,7 +592,7 @@ async def test_unusable_truncation_is_metered_but_not_cached() -> None:
     assert isinstance(raised, OutputTruncatedError)
     assert [(r.model, r.input_tokens, r.output_tokens, r.usage_kind) for r in rows] == [
         ("glm-5.3", 100, 2048, "conversation")
-    ]
+    ] * 2, "B-158:原调用与重试各计一行"
     assert cache.puts == []
 
 
@@ -641,3 +635,55 @@ async def test_budget_exhausted_wrap_up_with_junk_tool_calls_is_delivered() -> N
 
     assert state["messages"][-1].content == "这是收尾总结"
     assert state["messages"][-1].tool_calls == []
+
+
+# ---------------------------------------------------------------------------
+# B-158 —— 截断不可用:丢弃、加拆小提示、重试一次
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_call_is_discarded_and_retried_once() -> None:
+    # B-140 实测形态:想一口气把整份文件连思考写完,撞满上限。被截的回答不进历史、
+    # 里面的工具调用不执行;模型看到隐藏提示后拆小重做,run 照常完成。
+    from orchestrator.graph_builder.builder import TRUNCATION_RETRY_KEY
+
+    before = _truncated_count("false")
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[_tool_call("write_file", {}, "tc-cut")],
+                response_metadata={"finish_reason": "length"},
+            ),
+            AIMessage(content="分步写完了"),
+        ]
+    )
+    tool = _CountingTool(name="write_file")
+    registry = ToolRegistry()
+    registry.register(tool)
+    seen: list[Sequence[BaseMessage]] = []
+    inner = llm.__call__
+
+    async def spy(*, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]) -> AIMessage:
+        seen.append(list(messages))
+        return await inner(messages=messages, tools=tools)
+
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=spy, tool_registry=registry, output_cap_resolver=_GLM_CAPS)
+        )
+        state = await compiled.ainvoke(
+            {"messages": [HumanMessage(content="start")], "step_count": 0, "max_steps": 5},
+            config={"configurable": {"thread_id": "t-b158"}},
+        )
+
+    assert tool.calls == 0, "被截的工具调用不执行"
+    assert state["messages"][-1].content == "分步写完了"
+    assert not any(getattr(m, "tool_calls", None) for m in state["messages"]), "被截的回答不进历史"
+    notices = [m for m in state["messages"] if m.additional_kwargs.get(TRUNCATION_RETRY_KEY)]
+    assert len(notices) == 1
+    assert notices[0].additional_kwargs.get("expert_work_hide_from_ui") is True
+    assert "2048" in str(notices[0].content)
+    assert seen[1][-1] is not None and seen[1][-1].additional_kwargs.get(TRUNCATION_RETRY_KEY)
+    assert _truncated_count("false") == before + 1
