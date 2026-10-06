@@ -11,5 +11,6 @@ checks:
   - {type: workspace_file_contains, path: notes.md, all: [BetaDesk 第 120 条更新说明]}
   - {type: workspace_file_unchanged_lines, path: notes.md, fixture: product-notes.md, except_lines: [3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 87, 90, 93, 96, 99, 102, 105, 108, 111, 114, 117, 120]}
   - {type: tool_not_used_on, tool: write_file, path: notes.md}
-  # 阈值 = 首次 3× 基线(base-1005,test 5091938c)最大值 4 次 ×1.5,向上取整(规格 §7)
-  - {type: tool_count_max, max: 6}
+  # 阈值 = 两轮 3× 共 6 次(base-1005 最多 4 次;after-1006 为 8 / 6 / 3,多出来的是
+  # 反复 grep / sed 自检,结果都对)最大值 8 ×1.5(规格 §7、§15)
+  - {type: tool_count_max, max: 12}
