@@ -1,0 +1,14 @@
+id: g07-three-independent-analyses
+agent: eval-general
+shape: B-36 / B-133 委派
+fixtures: [sales.csv]
+turns:
+  - prompt: |
+      工作区的 uploads/sales.csv 有 region 与 amount 两列。下面三件小分析互不相关,可以并行完成:
+      1. A 组 amount 的最大值;
+      2. B 组 amount 的最小值;
+      3. C 组的记录条数。
+      回复的最后一行只写结果,格式为 `MAX_A=…, MIN_B=…, COUNT_C=…`。
+checks:
+  - {type: completed}
+  - {type: final_text_contains, all: [MAX_A=109, MIN_B=200, COUNT_C=10]}

@@ -36,6 +36,7 @@ from behavior_schema import (
     ToolUsed,
     TurnTokensMax,
     WorkspaceFileContains,
+    WorkspaceFileNotContains,
     WorkspaceFileUnchangedLines,
 )
 
@@ -52,7 +53,9 @@ def required_files(case: Case) -> list[FileKey]:
         key: FileKey
         if isinstance(check, ArtifactContains | ArtifactNotContains | ArtifactUnchangedLines):
             key = ("artifact", check.name)
-        elif isinstance(check, WorkspaceFileContains | WorkspaceFileUnchangedLines):
+        elif isinstance(
+            check, WorkspaceFileContains | WorkspaceFileNotContains | WorkspaceFileUnchangedLines
+        ):
             key = ("workspace", check.path)
         else:
             continue
@@ -128,6 +131,10 @@ def _one(
     calls = _calls(record)
 
     if isinstance(check, Completed):
+        # 缺 completed 键 = 没有记录,不等于 false(streaming-events.md);判不过但分开说。
+        unrecorded = [t.index for t in turns if t.completed is None]
+        if unrecorded:
+            return _verdict(check, False, f"no completion record for turns {unrecorded}")
         bad = [
             t.index
             for t in turns
@@ -172,8 +179,13 @@ def _one(
             return _verdict(check, False, problem)
         missing = [s for s in check.all if s not in text]
         return _verdict(check, not missing, f"missing {missing}")
-    if isinstance(check, ArtifactNotContains):
-        text, problem = _text(files, ("artifact", check.name))
+    if isinstance(check, ArtifactNotContains | WorkspaceFileNotContains):
+        key = (
+            ("artifact", check.name)
+            if isinstance(check, ArtifactNotContains)
+            else ("workspace", check.path)
+        )
+        text, problem = _text(files, key)
         if text is None:
             return _verdict(check, False, problem)
         found = [s for s in check.any if s in text]
@@ -190,6 +202,8 @@ def _one(
         before = (fixtures_dir / check.fixture).read_text(encoding="utf-8")
         extra = sorted(changed_lines(before, text) - set(check.except_lines))
         return _verdict(check, not extra, f"unexpected changes at fixture lines {extra[:20]}")
+    if isinstance(check, ToolUsed | ToolNotUsed | ToolCountMax | ToolNotUsedOn):
+        calls = [c for c in calls if check.turn is None or c.turn == check.turn]
     if isinstance(check, ToolUsed):
         return _verdict(
             check,

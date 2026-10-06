@@ -1,0 +1,11 @@
+id: g01-read-tail-of-long-file
+agent: eval-general
+shape: B-136 读文件截断
+fixtures: [regulation-60k.md]
+turns:
+  - prompt: |
+      工作区的 uploads/regulation-60k.md 是一份很长的规程。规程最末尾的「附录 C」里登记的设备编号是什么?只回答编号。
+checks:
+  - {type: completed}
+  - {type: final_text_contains, all: [B140-Z9Q7]}
+  - {type: final_text_not_contains, any: [B140-OLD1]}

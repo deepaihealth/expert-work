@@ -1,0 +1,11 @@
+id: g04-fix-indented-script
+agent: eval-general
+shape: B-149 数据标记吃掉换行缩进
+fixtures: [buggy-script.txt]
+turns:
+  - prompt: |
+      工作区的 uploads/buggy-script.txt 是一个 Python 脚本。请先用 bash 执行 `cp uploads/buggy-script.txt fix_me.py`。它本应打印 1 到 10 的和(TOTAL=55),现在结果不对。只修改有 bug 的那一行,其余行一个字都不要动;修好后运行 `python fix_me.py`,把输出原样贴在回复里。
+checks:
+  - {type: completed}
+  - {type: final_text_contains, all: [TOTAL=55]}
+  - {type: workspace_file_unchanged_lines, path: fix_me.py, fixture: buggy-script.txt, except_lines: [3]}

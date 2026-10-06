@@ -1,0 +1,18 @@
+id: g05-plan-five-steps
+agent: eval-general
+shape: B-131 计划与动作同轮
+fixtures: [sales.csv]
+turns:
+  - prompt: |
+      请先用 update_plan 列出计划,再按这 5 步完成:
+      1. 读取工作区的 uploads/sales.csv(region、amount 两列);
+      2. 按 region 求 amount 的和;
+      3. 按 region 求 amount 的平均值(保留一位小数);
+      4. 把两项结果写成一张 Markdown 表格,保存为 summary.md;
+      5. 用 save_artifact 交付 summary.md。
+checks:
+  - {type: completed}
+  - {type: artifact_exists, name: summary.md}
+  - {type: artifact_contains, name: summary.md, all: ['1045', '2090', '355', '104.5', '209.0', '35.5']}
+  # 阈值 = 首次 3× 基线(base-1005,test 5091938c)最大值 6 次 ×1.5,向上取整(规格 §7)
+  - {type: tool_count_max, max: 9}

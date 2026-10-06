@@ -1,0 +1,17 @@
+id: g10-search-skips-tool-results
+agent: eval-general
+shape: B-129 search_files 搜进 .tool_results
+turns:
+  - prompt: |
+      请按顺序做:
+      1. 用 write_file 新建 note.md,内容是一行「暗号:ZEBRA-7731」;
+      2. 用 bash 运行 `python3 -c "print('ZEBRA-7731 ' * 3000)"`;
+      3. 用 search_files 在工作区里搜索 ZEBRA-7731,告诉我它返回了哪些文件。
+      回答的最后单独一行按这个格式写 search_files 返回的文件路径,逗号分隔,不加别的字:
+      FILES: 路径1, 路径2
+checks:
+  - {type: completed}
+  # 只判结果行:10-05 基线里模型多解释一句「长输出存在 .tool_results/ 下、不在搜索范围」,
+  # 旧判据「全文不许出现 .tool_results」把这句正确的说明判红(3 次红 2 次,平台其实每次都只回 note.md)。
+  # 10-05 补跑有一次结果对、但结果行写成「文件:note.md」—— 格式不是本用例要测的,两种都认。
+  - {type: final_text_regex, pattern: '(?m)^\W*(FILES|文件)\W*(/?workspace/)?note\.md\W*$'}

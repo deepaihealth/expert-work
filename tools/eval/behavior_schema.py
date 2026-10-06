@@ -69,16 +69,38 @@ class ArtifactExists(_Strict):
     name: str = Field(min_length=1)  # fnmatch 通配
 
 
+_NO_TEXT_SUFFIXES = (".pdf", ".xlsx")
+
+
+def _text_readable(name: str) -> str:
+    # 本版取不出 pdf / xlsx 的文本:放进来两边都 0/3,对照永远「持平」,会藏住退步。
+    if name.lower().endswith(_NO_TEXT_SUFFIXES):
+        raise ValueError(
+            f"no text extractor for {name!r}; check its existence with artifact_exists"
+        )
+    return name
+
+
 class ArtifactContains(_Strict):
     type: Literal["artifact_contains"]
     name: str = Field(min_length=1)
     all: list[str] = Field(min_length=1)
+
+    @field_validator("name")
+    @classmethod
+    def _readable(cls, value: str) -> str:
+        return _text_readable(value)
 
 
 class ArtifactNotContains(_Strict):
     type: Literal["artifact_not_contains"]
     name: str = Field(min_length=1)
     any: list[str] = Field(min_length=1)
+
+    @field_validator("name")
+    @classmethod
+    def _readable(cls, value: str) -> str:
+        return _text_readable(value)
 
 
 class ArtifactUnchangedLines(_Strict):
@@ -94,6 +116,12 @@ class WorkspaceFileContains(_Strict):
     all: list[str] = Field(min_length=1)
 
 
+class WorkspaceFileNotContains(_Strict):
+    type: Literal["workspace_file_not_contains"]
+    path: str = Field(min_length=1)
+    any: list[str] = Field(min_length=1)
+
+
 class WorkspaceFileUnchangedLines(_Strict):
     type: Literal["workspace_file_unchanged_lines"]
     path: str = Field(min_length=1)
@@ -104,23 +132,27 @@ class WorkspaceFileUnchangedLines(_Strict):
 class ToolUsed(_Strict):
     type: Literal["tool_used"]
     tool: str = Field(min_length=1)
+    turn: int | None = Field(default=None, ge=1)  # None = 全部轮次
 
 
 class ToolNotUsed(_Strict):
     type: Literal["tool_not_used"]
     tool: str = Field(min_length=1)
+    turn: int | None = Field(default=None, ge=1)  # None = 全部轮次
 
 
 class ToolCountMax(_Strict):
     type: Literal["tool_count_max"]
     max: int = Field(ge=0)
     tool: str | None = None  # None = 全部工具
+    turn: int | None = Field(default=None, ge=1)  # None = 全部轮次
 
 
 class ToolNotUsedOn(_Strict):
     type: Literal["tool_not_used_on"]
     tool: str = Field(min_length=1)
     path: str = Field(min_length=1)
+    turn: int | None = Field(default=None, ge=1)  # None = 全部轮次
 
 
 class TurnTokensMax(_Strict):
@@ -140,6 +172,7 @@ Check = Annotated[
     | ArtifactNotContains
     | ArtifactUnchangedLines
     | WorkspaceFileContains
+    | WorkspaceFileNotContains
     | WorkspaceFileUnchangedLines
     | ToolUsed
     | ToolNotUsed
@@ -176,6 +209,11 @@ def load_case(path: Path) -> Case:
 
 def load_cases(cases_dir: Path = CASES_DIR, only: Iterable[str] | None = None) -> list[Case]:
     """按 id 排序加载全部用例;``only`` 里有不存在的 id 直接报错。"""
+    stray = sorted(
+        p.name for p in cases_dir.iterdir() if p.suffix != ".yaml" and not p.name.startswith(".")
+    )
+    if stray:
+        raise ValueError(f"{cases_dir}: only *.yaml case files are loaded; found {stray}")
     cases = [load_case(p) for p in sorted(cases_dir.glob("*.yaml"))]
     if only is None:
         return cases
@@ -252,6 +290,7 @@ class CaseResult(_Strict):
     passed: bool | None  # None = infra_error,不计入过 / 不过
     verdicts: list[CheckVerdict] = Field(default_factory=list)
     metrics: dict[str, float] = Field(default_factory=dict)
+    turn_metrics: list[dict[str, int | None]] = Field(default_factory=list)
     infra_error: str | None = None
     session_id: str | None = None
 

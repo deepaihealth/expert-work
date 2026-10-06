@@ -1,0 +1,11 @@
+id: h03-ppt-deck
+agent: eval-ahp
+shape: 技能 pptx
+turns:
+  - prompt: |
+      请为下面这位客户做一份 PPT 版健康管理方案,用 save_artifact 交付,文件名用「王小雨-健康方案.pptx」。
+      客户资料(虚构):王小雨,女,42 岁,身高 162 cm,体重 68 kg,空腹血糖 6.4 mmol/L,平时久坐、晚睡;诉求是三个月内减重 5 kg、把空腹血糖降到 6.1 以下。
+checks:
+  - {type: completed}
+  - {type: artifact_exists, name: '*.pptx'}
+  - {type: artifact_contains, name: '*.pptx', all: [王小雨]}

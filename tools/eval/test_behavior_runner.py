@@ -225,3 +225,59 @@ def test_validate_agent_map_rejects_unknown_source() -> None:
     runner.validate_agent_map({"eval-general": "eval-general-b"}, [_case()])
     with pytest.raises(SystemExit, match="eval-aph"):
         runner.validate_agent_map({"eval-aph": "eval-ahp-b"}, [_case()])
+
+
+@pytest.mark.asyncio
+async def test_run_one_backs_off_on_429(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    waits: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr(runner.asyncio, "sleep", fake_sleep)
+    req = httpx.Request("POST", "http://t/v1/agents/eval-general/runs")
+    busy = httpx.HTTPStatusError(
+        "busy", request=req, response=httpx.Response(429, request=req, headers={"Retry-After": "7"})
+    )
+    res = await runner.run_one(
+        FakeClient([busy]), _case(), 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
+    )
+    assert res.passed is True and waits == [7.0]
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_case_without_session_is_a_harness_error(tmp_path: Path) -> None:
+    class NoSession(FakeClient):
+        async def run_turn(
+            self,
+            agent: str,
+            user_id: str,
+            session_id: str | None,
+            prompt: str,
+            upload_ids: list[str],
+            index: int,
+        ) -> tuple[TurnRecord, str | None]:
+            return _turn(index), None
+
+    res = await runner.run_one(
+        NoSession(),
+        _case(fixtures=[]),
+        1,
+        label="b",
+        agent_map={},
+        fixtures_dir=_fixtures(tmp_path),
+    )
+    assert res.passed is None and "no session id" in (res.infra_error or "")
+
+
+def test_turn_metrics_keep_each_turn_for_threshold_calibration() -> None:
+    rec = RunRecord(
+        case_id="g99-x",
+        rep=1,
+        user_id="u",
+        turns=[_turn(1, input_tokens=300), _turn(2, input_tokens=None)],
+    )
+    assert runner.turn_metrics_of(rec) == [
+        {"tool_calls": 0, "input_tokens": 300},
+        {"tool_calls": 0, "input_tokens": None},
+    ]

@@ -1,0 +1,20 @@
+id: g09-five-follow-ups
+agent: eval-general
+shape: B-126 / B-128 跨轮滚雪球
+fixtures: [sales.csv]
+turns:
+  - prompt: |
+      工作区的 uploads/sales.csv 有 region 与 amount 两列。A 组 amount 的和是多少?只回答数字。
+  - prompt: |
+      B 组 amount 的平均值是多少?保留一位小数,只回答数字。
+  - prompt: |
+      C 组 amount 的最大值是多少?只回答数字。
+  - prompt: |
+      全表一共有多少条记录?只回答数字。
+  - prompt: |
+      全表 amount 的平均值是多少?保留一位小数,只回答数字。
+checks:
+  - {type: completed}
+  - {type: final_text_contains, all: ['116.3']}
+  # 阈值 = 3× 补跑(fix-g-1005,test 5091938c)第 5 轮输入最大值 11449 ×1.5,向上取整(规格 §7)
+  - {type: turn_tokens_max, turn: 5, max_input_tokens: 17200}

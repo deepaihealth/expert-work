@@ -1,0 +1,15 @@
+id: g06-new-task-replaces-old-plan
+agent: eval-general
+shape: B-133 新计划被旧 PLAN.md 盖掉
+fixtures: [sales.csv]
+turns:
+  - prompt: |
+      先列计划再做:读取工作区的 uploads/sales.csv,把 A 组 amount 的和写进 a.md(只写一个数字)。
+  - prompt: |
+      现在换一个完全不同的任务,上一个任务已经结束,不要再碰 a.md:写一首四行关于秋天的短诗,保存为 poem.md,并用 save_artifact 交付。
+checks:
+  - {type: completed}
+  - {type: workspace_file_contains, path: a.md, all: ['1045']}
+  - {type: artifact_exists, name: poem.md}
+  - {type: tool_not_used_on, tool: write_file, path: a.md, turn: 2}
+  - {type: tool_not_used_on, tool: edit_file, path: a.md, turn: 2}

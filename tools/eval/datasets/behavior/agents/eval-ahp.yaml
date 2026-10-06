@@ -31,7 +31,11 @@ spec:
     - { type: builtin, name: save_artifact }
     - { type: builtin, name: list_artifacts }
   policies:
-    token_budget: 800000
+    # 测试环境 ai-health-plan 不设 token 总预算、连续无进展上限 4。10-05 基线 h11 两次交付完
+    # 才被原先的 80 万预算截停、判成未完成 —— 配错的是这里。预算只留作失控兜底:
+    # 基线单次最高 101 万(h07),取约 3 倍。
+    token_budget: 3000000
+    max_no_progress: 4
   sandbox:
     runtime: gvisor
     resources:

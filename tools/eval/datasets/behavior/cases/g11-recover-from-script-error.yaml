@@ -1,0 +1,11 @@
+id: g11-recover-from-script-error
+agent: eval-general
+shape: 工具失败后的恢复
+fixtures: [calc-args.txt]
+turns:
+  - prompt: |
+      工作区的 uploads/calc-args.txt 是一个 Python 脚本。请先用 bash 执行 `cp uploads/calc-args.txt calc.py`,然后运行 `python calc.py`。目标是让它打印 RESULT=42;遇到报错自己想办法,但不要修改脚本本身。把最后成功的输出贴在回复里。
+checks:
+  - {type: completed}
+  - {type: final_text_contains, all: [RESULT=42]}
+  - {type: workspace_file_unchanged_lines, path: calc.py, fixture: calc-args.txt}

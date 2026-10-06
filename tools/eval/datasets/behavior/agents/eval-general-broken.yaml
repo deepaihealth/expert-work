@@ -4,7 +4,7 @@ apiVersion: expert_work.io/v1
 kind: Agent
 metadata:
   name: eval-general-broken
-  version: "1.0.0"
+  version: "1.0.1"  # 1.0.0 在 10-05 用完软删,同名同版本不能重建(MANIFEST_DUPLICATE)
   tenant: b140-eval
 spec:
   description: B-140 行为回归评测用的通用智能体(合成任务专用)。
