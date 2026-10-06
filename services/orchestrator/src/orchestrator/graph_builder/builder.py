@@ -1269,7 +1269,7 @@ def build_react_graph(
         # 正文可用照常交付,只计数。缓存命中的旧回答不再判(存进缓存前已判过)。放在收尾轮
         # 剥工具调用之后:那些调用本来就要丢,剥完剩可用正文就不算不可用。
         if cache_hit_response is None and is_truncated(response):
-            await _check_truncation(
+            truncated = await _check_truncation(
                 response,
                 prompt=messages,
                 tenant_id=tenant_id,
@@ -1277,6 +1277,20 @@ def build_react_graph(
                 after_llm_chain=after_llm_chain,
                 resolver=output_cap_resolver,
             )
+            # B-158 —— 不可用的截断先丢弃重来一次:被截的回答不进历史(工具调用一个都不
+            # 执行),只落一条隐藏的拆小提示,路由回 agent。本轮输入的最后一条已经是这条
+            # 提示 = 重试过了,照旧报错。其余通道不动,重试那次照原样重新推导。
+            if truncated is not None:
+                if _is_truncation_retry(state["messages"][-1]):
+                    raise truncated
+                logger.warning("agent_node.output_truncated_retry cap=%s", truncated.cap)
+                return {
+                    "messages": _stamp_agent_messages(
+                        [_build_truncation_retry(truncated.cap)], config
+                    ),
+                    "step_count": step_count + 1,
+                    "step_count_refund_pending": 0,
+                }
 
         # Stream RT-1 PR-3 (RT-ADR-4) — structured finalization. Only a
         # terminal candidate (no tool_calls) is constrained; tool-calling
@@ -2132,8 +2146,9 @@ async def _check_truncation(
     user_id: UUID | None,
     after_llm_chain: MiddlewareChain | None,
     resolver: ServedOutputCap | None,
-) -> None:
-    """B-105 —— 被截断的回答:可用就计数放行;不可用就记账后抛 :class:`OutputTruncatedError`。
+) -> OutputTruncatedError | None:
+    """B-105 —— 被截断的回答:可用就计数放行(``None``);不可用就记账后交回
+    :class:`OutputTruncatedError`,抛不抛由调用方定(B-158 先重试一次)。
 
     不可用时这次调用照样计费(常常整个上限都花在思考上),所以先跑一遍 after-chain 让
     ``TokenUsageMiddleware`` 按正常主循环口径落用量,但带 :data:`SKIP_STORE_KEY`,坏回答
@@ -2144,7 +2159,7 @@ async def _check_truncation(
     output_truncated_total.labels(provider=provider, model=model, usable=str(usable).lower()).inc()
     if usable:
         logger.warning("agent_node.output_truncated_usable model=%s", model)
-        return
+        return None
     if after_llm_chain is not None:
         prompt_messages = list(prompt)
         ctx = MiddlewareContext(
@@ -2159,7 +2174,34 @@ async def _check_truncation(
             }
         )
         await after_llm_chain.invoke(ctx, _noop)
-    raise OutputTruncatedError(cap)
+    return OutputTruncatedError(cap)
+
+
+#: B-158 —— 拆小提示的标记。节点开头看输入的最后一条是不是它,判「已经重试过」。
+TRUNCATION_RETRY_KEY = "expert_work_truncation_retry"
+
+
+def _build_truncation_retry(cap: int | None) -> HumanMessage:
+    """B-158 —— 截断作废后给模型的隐藏提示(与 recovery advisory 同一形态)。
+
+    照 openclaw ``recordOutputLimitNotice``:说清这条没执行、让它拆小。不调高上限 ——
+    上限是租户的配置,也是成本闸。
+    """
+    shown = f"{cap} tokens" if cap is not None else "the provider default"
+    return HumanMessage(
+        content=(
+            f"[output limit notice] Your previous reply hit the per-reply output limit "
+            f"({shown}, thinking included) and was discarded: none of its tool calls ran. "
+            "Redo that step in smaller pieces: split a large file across several files, or "
+            "write a short skeleton first and fill it in with edit_file; keep tool arguments "
+            "short and reasoning brief."
+        ),
+        additional_kwargs={"expert_work_hide_from_ui": True, TRUNCATION_RETRY_KEY: True},
+    )
+
+
+def _is_truncation_retry(message: BaseMessage) -> bool:
+    return bool(message.additional_kwargs.get(TRUNCATION_RETRY_KEY))
 
 
 def _with_plan_close(
@@ -2809,6 +2851,9 @@ def _should_continue(state: AgentState) -> Literal["tools", "agent", "__end__"]:
     last = state["messages"][-1]
     if _extract_tool_calls(last):
         return "tools"
+    # B-158 —— 截断作废、刚落了拆小提示:回 agent 重做这一步(至多一次,见 agent_node)。
+    if _is_truncation_retry(last):
+        return "agent"
     # B-35 — a dispatch turn that produced no tool calls must not end the
     # run (the plan still has undone work): route back to ``agent``, whose
     # dispatch block either retries once (harder instruction) or degrades

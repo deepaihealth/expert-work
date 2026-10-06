@@ -144,3 +144,10 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 - [ ] **11.1 B-140 对照**:`behavior_runner.py --only h10-missing-weight,g12-missing-file-honest --repeats 3`。判据:没有因 `completed` 不过的(h10 的 B-158 截断另算);g12(读一个不存在的文件后如实说明)仍判过。
 - [ ] **11.2 库里抽查**:发测试后 24h,`agent_run` 里 `exit_reason='text_response' and completed=false` 的 run 逐条看 `run_event` 的工具失败,不应再有「只是一次只读找不到」的。**没修好时**:这类 run 的唯一失败是 `read_file` / `skill_view` 的 `resource_not_found`。
+
+## §12 B-158 截断作废后拆小重做一次(ROADMAP B-158)
+
+**背景**:10-05 B-140 基线里 eval-ahp 51 次运行有 4 次因一次回答撑满输出上限(40960)抛 `OutputTruncatedError`、整轮无交付。修法(设计稿 `docs/superpowers/specs/2026-10-06-b158-output-truncation-retry-design.md`):被截的回答作废、落一条隐藏的拆小提示、重做一次;再截断照旧报错。
+
+- [ ] **12.1 B-140 对照**:`behavior_runner.py --only h08-word-and-pdf,h10-missing-weight,h11-long-checkup-report --repeats 3`。判据:没有因 `OutputTruncatedError` 判「未完成」的(修前 9 次里 3 ~ 4 次);同期 `expert_work_llm_output_truncated_total{usable="false"}` 可以 > 0,日志有 `agent_node.output_truncated_retry`。
+- [ ] **12.2 重试那次的历史**:挑一个触发了重试的 run,看会话条目与 `run_event`。判据:被截的回答不在历史里、它的工具调用没执行;拆小提示在历史里但对话页不显示(`expert_work_hide_from_ui`);用户看到的是重做后的正常回答。**没修好时**:run `error`,`OutputTruncatedError`。
