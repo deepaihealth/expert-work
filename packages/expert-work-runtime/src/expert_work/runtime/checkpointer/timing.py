@@ -168,7 +168,9 @@ class TimingCheckpointSaver(BaseCheckpointSaver[Any]):
     def get_next_version(self, current: Any, channel: None = None) -> Any:
         return self._inner.get_next_version(current, channel)
 
-    def with_allowlist(self, extra_allowlist: Collection[tuple[str, ...]]) -> BaseCheckpointSaver[Any]:
+    def with_allowlist(
+        self, extra_allowlist: Collection[tuple[str, ...]]
+    ) -> BaseCheckpointSaver[Any]:
         # B-161 — strict-msgpack ``StateGraph.compile`` registers the state
         # schema's types through this. The inherited version swaps the
         # serde on a copy of *this* wrapper, but every IO call goes to

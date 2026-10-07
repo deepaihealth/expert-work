@@ -2031,6 +2031,8 @@ def make_agent_runtime(
     return AgentRuntime(
         run_manager=RunManager(store=run_store),
         stream_bridge=InMemoryStreamBridge(),
-        agent_builder=make_agent_builder(secret_store, InMemorySaver(serde=make_checkpoint_serde())),
+        agent_builder=make_agent_builder(
+            secret_store, InMemorySaver(serde=make_checkpoint_serde())
+        ),
         run_event_store=run_event_store,
     )

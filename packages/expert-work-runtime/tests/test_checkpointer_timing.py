@@ -106,7 +106,7 @@ async def test_with_allowlist_reaches_the_inner_saver() -> None:
     widened = saver.with_allowlist({(_Probe.__module__, _Probe.__name__)})
     assert isinstance(widened, TimingCheckpointSaver)
 
-    checkpoint = {
+    checkpoint: Any = {
         **_checkpoint(),
         "channel_values": {"probe": _Probe(value=1)},
         "channel_versions": {"probe": 1},
@@ -115,4 +115,3 @@ async def test_with_allowlist_reaches_the_inner_saver() -> None:
     fetched = await widened.aget_tuple(stored)
     assert fetched is not None
     assert fetched.checkpoint["channel_values"]["probe"] == _Probe(value=1)
-
