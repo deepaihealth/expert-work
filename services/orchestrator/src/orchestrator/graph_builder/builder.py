@@ -958,6 +958,7 @@ def build_react_graph(
                                 "tokens_before": stats.tokens_before,
                                 "tokens_after": stats.tokens_after,
                                 "summary_chars": stats.summary_chars,
+                                "summary_input_chars": stats.summary_input_chars,
                             }
                         )
                     except Exception:
