@@ -66,6 +66,23 @@ groups:
           description: "{{ $value }} sandbox egress attempt(s) were rejected by the credential proxy with 407 in the last 15m — most likely an egress token that outlived its sandbox (or a warm session past its token TTL before the age cap kicked in)."
           runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/control-plane.md"
 
+      # P2 — our side failed to hand trace data to Langfuse (B-153 follow-up).
+      # Alerts on the failure signal, not on "Langfuse received nothing":
+      # test/prod traffic is too low for an absence alert to be quiet.
+      # stage = start_span / record_response / record_error / end (middleware
+      # guards that swallow SDK errors) or export (OTLP batch rejected/failed).
+      # Does NOT cover Langfuse's own worker dropping writes after accepting
+      # them (B-154 ClickHouse disk full) — that is the smoke disk check.
+      - alert: ExpertWorkLangfuseDeliveryFailing
+        expr: sum by (stage) (increase(expert_work_langfuse_delivery_failures_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Langfuse trace delivery failing (stage={{ $labels.stage }})"
+          description: "{{ $value }} Langfuse delivery failure(s) at stage {{ $labels.stage }} in the last 15m — traces for these LLM calls are missing from Langfuse."
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/langfuse.md"
+
   # Stream M — M0→M1 Gate-watch group.
   #
   # These alerts fire when 30-day Gate Exit Criteria thresholds

@@ -42,3 +42,70 @@ tests:
       - eval_time: 20m
         alertname: ExpertWorkSandboxEgressAuthBlocked
         exp_alerts: []
+
+  # ExpertWorkLangfuseDeliveryFailing (B-153 follow-up). The control-plane
+  # exports every stage at 0 from import time, so a healthy pod is a flat-0
+  # series — that must stay silent.
+  - interval: 1m
+    name: langfuse delivery alert stays silent on pre-initialised zero series
+    input_series:
+      - series: 'expert_work_langfuse_delivery_failures_total{stage="export",instance="cp-0"}'
+        values: "0x20"
+      - series: 'expert_work_langfuse_delivery_failures_total{stage="start_span",instance="cp-0"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ExpertWorkLangfuseDeliveryFailing
+        exp_alerts: []
+
+  # A single export failure on one pod (low traffic: one failed batch is all
+  # a real outage may produce in 15m) fires, summed across pods, per stage.
+  - interval: 1m
+    name: langfuse delivery alert fires on a single export failure
+    input_series:
+      - series: 'expert_work_langfuse_delivery_failures_total{stage="export",instance="cp-0"}'
+        values: "0x10 1x10"
+      - series: 'expert_work_langfuse_delivery_failures_total{stage="export",instance="cp-1"}'
+        values: "0x20"
+      - series: 'expert_work_langfuse_delivery_failures_total{stage="start_span",instance="cp-0"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ExpertWorkLangfuseDeliveryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: P2
+              stage: export
+            exp_annotations:
+              summary: "Langfuse trace delivery failing (stage=export)"
+              description: "1 Langfuse delivery failure(s) at stage export in the last 15m — traces for these LLM calls are missing from Langfuse."
+              runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/langfuse.md"
+
+  # The B-153 shape: every LLM call's start_span failing.
+  - interval: 1m
+    name: langfuse delivery alert fires on persistent start_span failures
+    input_series:
+      - series: 'expert_work_langfuse_delivery_failures_total{stage="start_span",instance="cp-0"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ExpertWorkLangfuseDeliveryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: P2
+              stage: start_span
+            exp_annotations:
+              summary: "Langfuse trace delivery failing (stage=start_span)"
+              description: "15 Langfuse delivery failure(s) at stage start_span in the last 15m — traces for these LLM calls are missing from Langfuse."
+              runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/langfuse.md"
+
+  # Failures older than the 15m window resolve the alert.
+  - interval: 1m
+    name: langfuse delivery alert resolves once failures age out of the window
+    input_series:
+      - series: 'expert_work_langfuse_delivery_failures_total{stage="end",instance="cp-0"}'
+        values: "0 1 1x40"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: ExpertWorkLangfuseDeliveryFailing
+        exp_alerts: []

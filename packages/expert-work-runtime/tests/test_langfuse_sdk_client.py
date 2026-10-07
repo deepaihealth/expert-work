@@ -8,15 +8,25 @@ degrade-to-recording behaviour.
 from __future__ import annotations
 
 import sys
+import threading
+from collections.abc import Sequence
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from prometheus_client import REGISTRY
 
 from expert_work.runtime.middleware import (
     LangfuseClient,
     LangfuseSdkClient,
     RecordingLangfuseClient,
     make_langfuse_client,
+)
+from expert_work.runtime.middleware.langfuse_sdk import (
+    FailureCountingSpanExporter,
+    build_langfuse_span_exporter,
 )
 
 # ---------------------------------------------------------------------------
@@ -233,6 +243,9 @@ def test_factory_complete_settings_build_sdk_client(
     # PII masking defaults on (Mini-ADR OBS-L1, decision 4 — fail-safe).
     mask = kwargs.pop("mask")
     assert callable(mask)
+    # B-153 follow-up — the export-failure counting seam.
+    span_exporter = kwargs.pop("span_exporter")
+    assert isinstance(span_exporter, FailureCountingSpanExporter)
     assert kwargs == {
         "public_key": "pk",
         "secret_key": "sk",
@@ -298,3 +311,201 @@ def test_factory_masking_disabled_passes_no_mask(
         pii_masking_enabled=False,
     )
     assert "mask" not in constructed[0]
+
+
+# ---------------------------------------------------------------------------
+# B-153 follow-up — export failures are counted
+# ---------------------------------------------------------------------------
+#
+# The SDK ships spans from an OTel BatchSpanProcessor thread; it discards the
+# exporter's FAILURE result and only logs (opentelemetry/sdk/_shared_internal
+# ``BatchProcessor._export``). That log line shares its logger with our Tempo
+# exporter, so the only Langfuse-specific seam is the exporter itself — the
+# SDK's public ``span_exporter=`` argument.
+
+
+def _export_failures() -> float:
+    return (
+        REGISTRY.get_sample_value(
+            "expert_work_langfuse_delivery_failures_total", {"stage": "export"}
+        )
+        or 0.0
+    )
+
+
+def _finished_span() -> ReadableSpan:
+    span = TracerProvider().get_tracer("b153-test").start_span("s")
+    span.end()
+    assert isinstance(span, ReadableSpan)
+    return span
+
+
+class _FakeExporter(SpanExporter):
+    def __init__(
+        self,
+        result: SpanExportResult = SpanExportResult.SUCCESS,
+        exc: Exception | None = None,
+    ) -> None:
+        self.result = result
+        self.exc = exc
+        self.batches: list[Sequence[ReadableSpan]] = []
+        self.shutdowns = 0
+        self.flush_timeouts: list[int] = []
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        self.batches.append(spans)
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+    def shutdown(self) -> None:
+        self.shutdowns += 1
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        self.flush_timeouts.append(timeout_millis)
+        return True
+
+
+def test_export_failure_result_is_counted_and_passed_through() -> None:
+    inner = _FakeExporter(result=SpanExportResult.FAILURE)
+    spans = [_finished_span()]
+    before = _export_failures()
+
+    result = FailureCountingSpanExporter(inner).export(spans)
+
+    assert result is SpanExportResult.FAILURE
+    assert inner.batches == [spans]
+    assert _export_failures() - before == 1
+
+
+def test_export_exception_is_counted_and_reraised() -> None:
+    inner = _FakeExporter(exc=ConnectionError("langfuse-web unreachable"))
+    before = _export_failures()
+
+    with pytest.raises(ConnectionError):
+        FailureCountingSpanExporter(inner).export([_finished_span()])
+
+    assert _export_failures() - before == 1
+
+
+def test_export_success_is_not_counted() -> None:
+    inner = _FakeExporter(result=SpanExportResult.SUCCESS)
+    before = _export_failures()
+
+    result = FailureCountingSpanExporter(inner).export([_finished_span()])
+
+    assert result is SpanExportResult.SUCCESS
+    assert _export_failures() == before
+
+
+def test_counting_exporter_delegates_shutdown_and_flush() -> None:
+    inner = _FakeExporter()
+    exporter = FailureCountingSpanExporter(inner)
+
+    assert exporter.force_flush(1234) is True
+    exporter.shutdown()
+
+    assert inner.flush_timeouts == [1234]
+    assert inner.shutdowns == 1
+
+
+class _Reject401(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(401)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+def test_real_otlp_rejection_is_counted() -> None:
+    """The real OTLP exporter against an endpoint that answers 401 (a wrong
+    key) — the failure mode the counter exists for, end to end through the
+    exporter's own HTTP client."""
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Reject401)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}/api/public/otel/v1/traces"
+        exporter = FailureCountingSpanExporter(OTLPSpanExporter(endpoint=endpoint, timeout=5))
+        before = _export_failures()
+
+        result = exporter.export([_finished_span()])
+
+        assert result is SpanExportResult.FAILURE
+        assert _export_failures() - before == 1
+        exporter.shutdown()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_real_sdk_export_failure_reaches_the_counter() -> None:
+    """Whole chain through the installed SDK: ``Langfuse(span_exporter=...)``
+    really ships through our exporter (inside its own media/mask wrapper), and
+    a rejected batch lands in the counter. A private TracerProvider keeps the
+    process-global one untouched."""
+    from langfuse import Langfuse
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Reject401)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host = f"http://127.0.0.1:{server.server_address[1]}"
+        public_key, secret_key = "pk-lf-b153-chain", "sk-lf-b153-chain"
+        sdk = Langfuse(
+            public_key=public_key,
+            secret_key=secret_key,
+            host=host,
+            tracing_enabled=True,
+            tracer_provider=TracerProvider(),
+            span_exporter=build_langfuse_span_exporter(
+                host=host, public_key=public_key, secret_key=secret_key
+            ),
+        )
+        before = _export_failures()
+
+        LangfuseSdkClient(sdk).start_span(name="agent", input="x", metadata={}).end()
+        sdk.flush()
+
+        assert _export_failures() - before == 1
+        sdk.shutdown()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_counting_exporter_ships_exactly_like_the_sdk_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing ``span_exporter=`` makes the SDK skip its own endpoint / auth /
+    timeout wiring, so ours must match it field for field. Pinned against the
+    installed SDK's own default exporter (private attributes, test-only): a
+    langfuse upgrade that changes the default fails here, not in production."""
+    from langfuse._client.span_processor import LangfuseSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    monkeypatch.delenv("LANGFUSE_TIMEOUT", raising=False)
+    monkeypatch.delenv("LANGFUSE_OTEL_TRACES_EXPORT_PATH", raising=False)
+    host, public_key, secret_key = "https://langfuse.local", "pk-lf-x", "sk-lf-x"
+
+    # langfuse/_client/client.py resolves ``timeout or LANGFUSE_TIMEOUT or 5``
+    # before handing it to the processor.
+    sdk_processor = LangfuseSpanProcessor(
+        public_key=public_key, secret_key=secret_key, base_url=host, timeout=5
+    )
+    try:
+        sdk_default = sdk_processor._batch_processor._exporter
+        ours = build_langfuse_span_exporter(host=host, public_key=public_key, secret_key=secret_key)
+        inner = ours._inner
+        assert isinstance(sdk_default, OTLPSpanExporter)
+        assert isinstance(inner, OTLPSpanExporter)
+        assert inner._endpoint == sdk_default._endpoint
+        assert inner._client._headers == sdk_default._client._headers
+        assert inner._client._timeout == sdk_default._client._timeout
+        ours.shutdown()
+    finally:
+        sdk_processor.shutdown()  # type: ignore[no-untyped-call]
