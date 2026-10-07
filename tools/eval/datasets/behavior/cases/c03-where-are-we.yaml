@@ -32,8 +32,8 @@ turns:
       下一步:第 M 步
 checks:
   - {type: completed}
-  - {type: final_text_regex, pattern: '已完成\s*[::]\s*6\s*步'}
-  - {type: final_text_regex, pattern: '下一步\s*[::]\s*第\s*7\s*步'}
+  - {type: final_text_regex, pattern: '已完成\s*[:：]\s*6\s*步'}
+  - {type: final_text_regex, pattern: '下一步\s*[:：]\s*第\s*7\s*步'}
   # 工作区实际:正好 6 行进度,第 1~6 步各一次(重做一步多一行、跳过一步少一行)
   - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*[1-8]\s*步完成', count: 6}
   - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*1\s*步完成\s*$', count: 1}

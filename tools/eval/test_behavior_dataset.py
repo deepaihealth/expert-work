@@ -128,3 +128,38 @@ def test_every_fixture_used_by_a_case_is_an_allowed_upload_type() -> None:
     for case in load_cases(CASES_DIR):
         for name in case.fixtures:
             content_type_for(name)  # raises ValueError for types the upload API rejects
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "已完成：6 步\n下一步：第 7 步",  # c-base-1007 两次的真实回答(全角冒号)
+        "已完成：6 步 下一步：第 7 步",
+        "已完成:6 步\n下一步:第 7 步",
+    ],
+)
+def test_c03_text_checks_accept_the_real_answer(answer: str) -> None:
+    from behavior_checks import evaluate
+    from behavior_schema import RunRecord, TurnRecord
+
+    [case] = load_cases(CASES_DIR, only=["c03-where-are-we"])
+    record = RunRecord(
+        case_id=case.id, rep=1, user_id="u", turns=[TurnRecord(index=1, final_text=answer)]
+    )
+    verdicts = [v for v in evaluate(case, record, {}, FIXTURES_DIR) if v.type == "final_text_regex"]
+    assert len(verdicts) == 2 and all(v.passed for v in verdicts), verdicts
+    wrong = RunRecord(
+        case_id=case.id,
+        rep=1,
+        user_id="u",
+        turns=[TurnRecord(index=1, final_text=answer.replace("6", "5").replace("7", "6"))],
+    )
+    assert not any(
+        v.passed for v in evaluate(case, wrong, {}, FIXTURES_DIR) if v.type == "final_text_regex"
+    )
+
+
+def test_no_case_regex_has_a_doubled_ascii_colon_class() -> None:
+    # c03 曾把全角冒号写成第二个半角冒号:`[::]` 永远匹配不到「：」
+    for path in Path(CASES_DIR).glob("*.yaml"):
+        assert "[::]" not in path.read_text(encoding="utf-8"), path.name
