@@ -561,6 +561,9 @@ def build_run_graph_input(
         # 审批三件套只属于一轮,每一轮都清零(班车 2)—— 省略时检查点里上一轮
         # 停在审批上留下的 pending_approval 会让本轮的门控调用跳过审批门。
         **APPROVAL_TURN_RESET,
+        # B-160 —— 「没做成」的欠账也只属于一轮:省略时上一轮没还上的失败一直
+        # 留在检查点里,这个对话此后每一轮都判 completed=false。
+        "unresolved_failures": [],
     }
 
 
@@ -614,8 +617,9 @@ def replay_graph_input(
         "step_count": 0,
         "max_steps": built.max_steps,
         "max_no_progress": built.max_no_progress,
-        # 与 ``build_run_graph_input`` 同一条:审批三件套每一轮清零(班车 2)。
+        # 与 ``build_run_graph_input`` 同一条:审批三件套与欠账(B-160)每一轮清零。
         **APPROVAL_TURN_RESET,
+        "unresolved_failures": [],
     }
 
 

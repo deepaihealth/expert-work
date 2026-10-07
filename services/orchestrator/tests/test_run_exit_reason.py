@@ -127,6 +127,55 @@ def _failure_keys(state: AgentState) -> list[tuple[str, str | None]]:
 
 
 # ---------------------------------------------------------------------------
+# B-160 —— 欠账按轮记,不跨轮
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_outlives_a_turn_unless_the_next_input_clears_it() -> None:
+    """同一对话(同一 thread)的第二轮没调任何工具。
+
+    通道没有 reducer、``tools`` 节点只在跑过工具时才写它 —— 第二轮输入里不带这个键,
+    第一轮的欠账就原样留在终局,第二轮被判没做完(B-140 h07 实测:第 2 轮
+    ``edit_file`` 没还上,第 3 轮零失败也 ``completed=false``)。所以每一轮的图输入
+    (control-plane ``build_run_graph_input`` / ``replay_graph_input``)都写空列表。
+    """
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("save_artifact", "tc-1")]),
+            AIMessage(content="没存上"),
+            AIMessage(content="第二轮的答复"),
+            AIMessage(content="第三轮的答复"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(_ScriptedTool(fail_on=frozenset({0})))
+
+    def _turn(text: str) -> dict[str, Any]:
+        return {"messages": [HumanMessage(content=text)], "step_count": 0, "max_steps": 5}
+
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=registry)
+        )
+        cfg: RunnableConfig = {"configurable": {"thread_id": str(uuid4())}}
+        first = await compiled.ainvoke(_turn("a"), config=cfg)
+        assert _failure_keys(first) == [("save_artifact", "x.md")]
+
+        carried = await compiled.ainvoke(_turn("b"), config=cfg)
+        assert _failure_keys(carried) == [("save_artifact", "x.md")], "前提:不清就跨轮"
+        assert not compute_completed(
+            exit_reason="text_response", unresolved_failures=carried["unresolved_failures"]
+        )
+
+        cleared = await compiled.ainvoke({**_turn("c"), "unresolved_failures": []}, config=cfg)
+        assert _failure_keys(cleared) == []
+        assert compute_completed(
+            exit_reason="text_response", unresolved_failures=cleared["unresolved_failures"]
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 1 —— unresolved_failures 通道
 # ---------------------------------------------------------------------------
 

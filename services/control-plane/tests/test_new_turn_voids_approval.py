@@ -1214,3 +1214,17 @@ def test_every_turn_input_resets_the_approval_channels() -> None:
         for key, value in APPROVAL_TURN_RESET.items():
             assert key in graph_input
             assert graph_input[key] is value
+
+
+def test_every_turn_input_clears_the_failure_ledger() -> None:
+    """B-160 —— 「没做成」的欠账只属于一轮。省略这个键时 LangGraph 沿用检查点里的
+    旧值,上一轮没还上的一次失败会让这个对话此后每一轮都判 ``completed=false``。"""
+    built = BuiltAgent(graph=None, system_prompt="sys", max_steps=3)  # type: ignore[arg-type]
+    fresh = build_run_graph_input(
+        built, input_text="hi", image_refs=[], untrusted_content=None, run_id=uuid4()
+    )
+    replay = replay_graph_input(
+        built, [SystemMessage(content="sys"), HumanMessage(content="hi")], run_id=uuid4()
+    )
+    for graph_input in (fresh, replay):
+        assert graph_input["unresolved_failures"] == []
