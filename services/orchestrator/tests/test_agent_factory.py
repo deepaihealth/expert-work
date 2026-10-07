@@ -33,7 +33,7 @@ from orchestrator import (
     build_llm_router,
     build_step_routers,
 )
-from orchestrator.agent_factory import _build_provider, _chat_stream_deadline_s
+from orchestrator.agent_factory import _build_provider, _chat_stream_deadline_s, _compression_model
 from orchestrator.context import ToolResultPruner
 from orchestrator.llm import FakeEmbedder, RateLimitedProvider
 from orchestrator.llm.providers.openai_compatible import OpenAICompatibleProvider
@@ -1029,6 +1029,89 @@ async def test_build_step_routers_routes_planning_to_its_model() -> None:
     assert routers.planning.providers[0].key == "openai:gpt-4o"
     assert routers.default.providers[0].key == "anthropic:claude-sonnet-4-6"
     assert routers.reflection is routers.default
+
+
+_GLM_KEY_NAME = "expert-work/dev/llm/glm"
+
+
+def _glm_secret_store() -> LocalDevSecretStore:
+    return LocalDevSecretStore.from_mapping(
+        {_ANTHROPIC_KEY_NAME: "sk-ant-test", _GLM_KEY_NAME: "glm-test"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_step_routers_compression_defaults_to_same_vendor_cheap_model() -> None:
+    """B-143 —— 没写 ``when: compression`` 规则时,压缩摘要默认用主模型同一家的便宜型号,
+    主模型挂在它后面当备用(便宜型号报错由路由器现成的备用链转主模型)。"""
+    spec = _spec(provider="glm", name="glm-5.3", api_key_ref=f"secret://{_GLM_KEY_NAME}")
+    routers = await build_step_routers(spec, secret_store=_glm_secret_store())
+    assert [p.key for p in routers.compression.providers] == ["glm:glm-5.3-flash", "glm:glm-5.3"]
+    assert routers.default.providers[0].key == "glm:glm-5.3"
+
+
+@pytest.mark.asyncio
+async def test_build_step_routers_compression_without_cheap_sibling_reuses_default() -> None:
+    """B-143 —— 映射表里没有的型号(这里是 anthropic)照旧用主模型,不换厂商。"""
+    routers = await build_step_routers(_spec(), secret_store=_secret_store())
+    assert routers.compression is routers.default
+
+
+@pytest.mark.asyncio
+async def test_build_step_routers_compression_rule_overrides_the_default() -> None:
+    """B-143 —— 显式的 ``when: compression`` 规则优先:主模型 anthropic、规则写 glm,
+    摘要就走 glm(写主模型即退回主模型)。"""
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["routing"] = {
+        "rules": [
+            {
+                "when": "compression",
+                "model": {
+                    "provider": "glm",
+                    "name": "glm-5.3",
+                    "api_key_ref": f"secret://{_GLM_KEY_NAME}",
+                },
+            }
+        ]
+    }
+    routers = await build_step_routers(
+        AgentSpec.model_validate(doc), secret_store=_glm_secret_store()
+    )
+    assert [p.key for p in routers.compression.providers] == ["glm:glm-5.3"]
+    assert routers.default.providers[0].key == "anthropic:claude-sonnet-4-6"
+
+
+def test_compression_model_matches_the_router_for_metering() -> None:
+    """B-143 —— 记账用的模型与路由用的是同一个取法:便宜型号在前、主模型在备用链上。"""
+    spec = _spec(provider="glm", name="glm-5.3", api_key_ref=f"secret://{_GLM_KEY_NAME}")
+    model = _compression_model(spec)
+    assert model.name == "glm-5.3-flash"
+    assert model.effort == "low"
+    assert [m.name for m in model.fallback] == ["glm-5.3"]
+    assert _compression_model(_spec()) == _spec().spec.model
+
+
+@pytest.mark.asyncio
+async def test_build_agent_wires_the_compressor_to_the_compression_router(monkeypatch: Any) -> None:
+    """B-143 —— 压缩器的摘要调用真的走 ``compression`` 路由(而不是主循环那条)。"""
+    captured: dict[str, Any] = {}
+    from orchestrator.agent_factory import build_react_graph as real
+
+    def _spy(**kwargs: Any) -> Any:
+        captured["compressor"] = kwargs.get("context_compressor")
+        return real(**kwargs)
+
+    monkeypatch.setattr("orchestrator.agent_factory.build_react_graph", _spy)
+    monkeypatch.setitem(_PROVIDER_KEY_NAMES, "glm", _GLM_KEY_NAME)
+    spec = _spec(provider="glm", name="glm-5.3", api_key_ref=f"secret://{_GLM_KEY_NAME}")
+    async with make_checkpointer("memory") as cp:
+        await _build(spec, secret_store=_glm_secret_store(), checkpointer=cp)
+    compressor = captured["compressor"]
+    assert compressor is not None
+    assert [p.key for p in compressor.llm_caller.inner.providers] == [
+        "glm:glm-5.3-flash",
+        "glm:glm-5.3",
+    ]
 
 
 @pytest.mark.asyncio

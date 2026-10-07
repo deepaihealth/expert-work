@@ -282,13 +282,16 @@ class StepRouters:
     """Per-step-class LLM routers — Stream J.11.
 
     The agent loop uses ``default``; the planner / reflect nodes use
-    ``planning`` / ``reflection``. A step class with no ``routing`` rule
-    reuses ``default``.
+    ``planning`` / ``reflection``; the context compressor's summary call uses
+    ``compression`` (B-143). A step class with no ``routing`` rule reuses
+    ``default`` — except ``compression``, which defaults to the main model's
+    same-vendor cheap sibling when there is one (:func:`_compression_model`).
     """
 
     default: LLMRouter
     planning: LLMRouter
     reflection: LLMRouter
+    compression: LLMRouter
 
 
 #: Stream J.7a (Mini-ADR J-23) — resolver signature for the skill loader.
@@ -996,7 +999,8 @@ async def build_agent(
                 head_keep,
             )
         context_compressor = ContextCompressor(
-            llm_caller=metered_default,
+            # B-143 —— 摘要走 ``compression`` 路由(默认同一家的便宜型号),记账口径同一个模型。
+            llm_caller=_metered(routers.compression, conversation_usage, _compression_model(spec)),
             context_window=_resolved_context_window(spec.spec.model),
             threshold_pct=cc_policy.threshold_pct,
             head_keep=head_keep,
@@ -2611,9 +2615,29 @@ async def build_step_routers(
     )
     planning = default
     reflection = default
+    compression_model = _compression_model(spec)
+    compression = (
+        default
+        if compression_model == spec.spec.model
+        else await build_llm_router(
+            compression_model,
+            secret_store=secret_store,
+            around_llm_chain=around_llm_chain,
+            image_resolver=image_resolver,
+            first_token_timeout_s=first_token,
+            idle_timeout_s=idle,
+            provider_timeout_s=first_token,
+            provider_key_resolver=provider_key_resolver,
+            ignore_api_key_ref=ignore_api_key_ref,
+            http_client=http_client,
+            rate_limiter_factory=rate_limiter_factory,
+        )
+    )
     routing = spec.spec.routing
     if routing is not None:
         for rule in routing.rules:
+            if rule.when == "compression":
+                continue  # 已由 _compression_model 取到上面的 ``compression``
             routed = await build_llm_router(
                 rule.model,
                 secret_store=secret_store,
@@ -2631,7 +2655,9 @@ async def build_step_routers(
                 planning = routed
             elif rule.when == "reflection":
                 reflection = routed
-    return StepRouters(default=default, planning=planning, reflection=reflection)
+    return StepRouters(
+        default=default, planning=planning, reflection=reflection, compression=compression
+    )
 
 
 def _build_memory_nodes(
@@ -2725,6 +2751,36 @@ def _step_model(spec: AgentSpec, when: str) -> ModelSpec:
             if rule.when == when:
                 model = rule.model
     return model
+
+
+#: B-143 —— 压缩摘要的「同一家便宜型号」映射。只在同一厂商内换型号:凭据、地域与主模型
+#: 一致,不把租户的对话发给它没选的厂商。新增条目前先核生产价目表有这个型号(B-132)。
+_COMPRESSION_CHEAP_SIBLING: dict[tuple[str, str], str] = {
+    ("glm", "glm-5.3"): "glm-5.3-flash",
+    ("glm", "glm-5.2"): "glm-5.3-flash",
+}
+
+
+def _compression_model(spec: AgentSpec) -> ModelSpec:
+    """B-143 —— 压缩摘要那次调用实际用的模型;路由与记账共用这一个取法。
+
+    显式的 ``when: compression`` 规则优先(多条时后一条覆盖前一条,与
+    :func:`_step_model` 一致)。没有规则时,主模型在映射表里就换成同一家的便宜型号:
+    沿用主模型的同一份配置(凭据、超时等),只换型号名、思考档降到最低、
+    ``fallback`` 挂主模型本身(便宜型号报错时由路由器现成的备用链转主模型);
+    不在表里就是主模型本身。
+    """
+    if spec.spec.routing is not None and any(
+        rule.when == "compression" for rule in spec.spec.routing.rules
+    ):
+        return _step_model(spec, "compression")
+    main = spec.spec.model
+    cheap = _COMPRESSION_CHEAP_SIBLING.get((main.provider, main.name))
+    if cheap is None:
+        return main
+    return main.model_copy(
+        update={"name": cheap, "effort": "low", "context_window": None, "fallback": [main]}
+    )
 
 
 def _step_meter(identity: UsageIdentity, model: ModelSpec) -> UsageMeter:

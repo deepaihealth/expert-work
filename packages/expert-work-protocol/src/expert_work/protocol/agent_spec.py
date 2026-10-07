@@ -562,7 +562,10 @@ class RouteRule(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    when: Literal["planning", "reflection"]
+    #: B-143 —— ``compression``:对话压缩时写摘要的那次调用。不写这条规则时平台默认用
+    #: 主模型同一家的便宜型号(见 ``orchestrator.agent_factory._compression_model``)。
+    #: 生产 manifest 不要写它:回滚窗口里旧镜像的 Literal 不认识这个值,整份 manifest 会被拒。
+    when: Literal["planning", "reflection", "compression"]
     model: ModelSpec
 
 
