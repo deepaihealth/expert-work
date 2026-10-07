@@ -206,4 +206,3 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [ ] **19.2 B-141 对照**:`release.sh test` 发含 #1755 的候选,同样跑一遍后 `compare`。判据:没有用例稳定变差;c01 / c03 至少一个从不稳定 / 不过变 3/3,或基线已 3/3 时如实记「这批用例分不出差别」;COMPACTION 帧带 `summary_input_chars`,且多数压缩的值超过 24,000(修前摘要输入的上限)。
 - [ ] **19.3 B-143 对照**:同一版本 `eval-compress`(便宜型号)对 `eval-compress-main`(规则指回 glm-5.3)。判据:没有用例稳定变差;`token_usage` 里压缩调用记在 `glm-5.3-flash` 名下;报告两边摘要调用的 token 与花费。
 - [ ] **19.4 原有 24 个用例不受影响**:候选版本上跑一遍原 g / h 用例。判据:与 `after-1006` 相比无稳定翻转,且它们都不触发压缩(生产配置门槛不变)。
-
