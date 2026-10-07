@@ -21,16 +21,26 @@ middleware layer; this module adds no second try/except blanket.
 
 from __future__ import annotations
 
+import base64
+import importlib.metadata
 import logging
-from collections.abc import Callable, Mapping
+import os
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
+
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from expert_work.runtime.audit.redactor import (
     DEFAULT_PATTERNS,
     PII_PATTERNS,
     DefaultSecretRedactor,
 )
-from expert_work.runtime.middleware.langfuse import LangfuseClient, RecordingLangfuseClient
+from expert_work.runtime.middleware.langfuse import (
+    LangfuseClient,
+    RecordingLangfuseClient,
+    record_delivery_failure,
+)
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a hard import
     from langfuse._client.span import LangfuseGeneration
@@ -121,6 +131,71 @@ class LangfuseSdkClient:
         self._sdk.shutdown()
 
 
+class FailureCountingSpanExporter(SpanExporter):
+    """Count failed Langfuse export batches (B-153 follow-up, stage ``export``).
+
+    The SDK ships spans from an OTel ``BatchSpanProcessor`` worker thread,
+    which discards the exporter's ``FAILURE`` result and catches its
+    exceptions with only a log line (``opentelemetry/sdk/_shared_internal``
+    ``BatchProcessor._export``). That logger is shared with our Tempo
+    exporter, so the exporter is the one Langfuse-specific place a failed
+    delivery is visible. Behaviour is otherwise a pure pass-through: the
+    result is returned and exceptions re-raised unchanged.
+    """
+
+    def __init__(self, inner: SpanExporter) -> None:
+        self._inner = inner
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        try:
+            result = self._inner.export(spans)
+        except Exception:
+            record_delivery_failure("export")
+            raise
+        if result is not SpanExportResult.SUCCESS:
+            record_delivery_failure("export")
+        return result
+
+    def shutdown(self) -> None:
+        self._inner.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._inner.force_flush(timeout_millis)
+
+
+def build_langfuse_span_exporter(
+    *, host: str, public_key: str, secret_key: str
+) -> FailureCountingSpanExporter:
+    """The SDK's default OTLP exporter, wrapped in :class:`FailureCountingSpanExporter`.
+
+    ``Langfuse(span_exporter=...)`` is the SDK's public seam for the
+    exporter, but passing one makes it skip its own endpoint / auth /
+    timeout wiring — so this mirrors ``langfuse/_client/span_processor.py``
+    (``LangfuseSpanProcessor.__init__``) field for field, and
+    ``test_counting_exporter_ships_exactly_like_the_sdk_default`` pins it
+    against the installed SDK. A mismatch would itself fail export and
+    trip the alert this exists for.
+    """
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "x-langfuse-sdk-name": "python",
+        "x-langfuse-sdk-version": importlib.metadata.version("langfuse"),
+        "x-langfuse-public-key": public_key,
+    }
+    # langfuse/_client/client.py: ``timeout or int(os.environ.get(LANGFUSE_TIMEOUT, 5))``.
+    timeout = int(os.environ.get("LANGFUSE_TIMEOUT", 5))
+    return FailureCountingSpanExporter(
+        OTLPSpanExporter(
+            endpoint=f"{host}/api/public/otel/v1/traces",
+            headers=headers,
+            timeout=timeout,
+        )
+    )
+
+
 def make_langfuse_client(
     *,
     host: str | None,
@@ -158,6 +233,10 @@ def make_langfuse_client(
         "secret_key": secret_key,
         "host": host,
         "tracing_enabled": True,
+        # B-153 follow-up — count failed export batches for alerting.
+        "span_exporter": build_langfuse_span_exporter(
+            host=host, public_key=public_key, secret_key=secret_key
+        ),
     }
     if pii_masking_enabled:
         kwargs["mask"] = _build_pii_mask()

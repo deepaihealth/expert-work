@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from prometheus_client import REGISTRY
 
 from expert_work.runtime.middleware import (
     LangfuseClient,
@@ -198,3 +199,104 @@ def test_satisfies_middleware_protocol() -> None:
 
 def test_recording_client_satisfies_client_protocol() -> None:
     assert isinstance(RecordingLangfuseClient(), LangfuseClient)
+
+
+# ---------------------------------------------------------------------------
+# B-153 follow-up — every swallowed failure is counted
+# ---------------------------------------------------------------------------
+#
+# The fail-soft guards above are why Langfuse received nothing for six weeks
+# without anyone noticing: each failure was a WARNING log line, and no alert
+# can query logs. ``expert_work_langfuse_delivery_failures_total{stage}`` is
+# what the ExpertWorkLangfuseDeliveryFailing alert watches.
+
+_FAILURE_COUNTER = "expert_work_langfuse_delivery_failures_total"
+_MIDDLEWARE_STAGES = ("start_span", "record_response", "record_error", "end")
+
+
+def _failure_counts() -> dict[str, float]:
+    return {
+        stage: REGISTRY.get_sample_value(_FAILURE_COUNTER, {"stage": stage}) or 0.0
+        for stage in _MIDDLEWARE_STAGES
+    }
+
+
+def _deltas(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+    return {stage: after[stage] - before[stage] for stage in _MIDDLEWARE_STAGES}
+
+
+def test_failure_series_exist_before_any_failure() -> None:
+    """``increase()`` cannot see a series' first sample — a counter born at 1
+    on the first failure would not alert until the second. Every stage must be
+    exported at 0 from import time."""
+    for stage in (*_MIDDLEWARE_STAGES, "export"):
+        assert REGISTRY.get_sample_value(_FAILURE_COUNTER, {"stage": stage}) is not None, stage
+
+
+@pytest.mark.asyncio
+async def test_start_span_failure_is_counted() -> None:
+    before = _failure_counts()
+    mw = LangfuseMiddleware(client=_FailingClient(raise_on_start=True))
+    await mw(MiddlewareContext(payload={}), _ok_terminal)
+    assert _deltas(before, _failure_counts()) == {
+        "start_span": 1,
+        "record_response": 0,
+        "record_error": 0,
+        "end": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_record_response_failure_is_counted() -> None:
+    before = _failure_counts()
+    mw = LangfuseMiddleware(client=_FailingClient(span=_FailingSpan(raise_on_record=True)))
+    await mw(
+        MiddlewareContext(payload={"llm_response": {"output": "ok", "usage": {"input_tokens": 1}}}),
+        _ok_terminal,
+    )
+    assert _deltas(before, _failure_counts()) == {
+        "start_span": 0,
+        "record_response": 1,
+        "record_error": 0,
+        "end": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_record_error_failure_is_counted() -> None:
+    before = _failure_counts()
+    mw = LangfuseMiddleware(client=_FailingClient(span=_FailingSpan(raise_on_record=True)))
+    with pytest.raises(RuntimeError, match="LLM hiccup"):
+        await mw(MiddlewareContext(payload={}), _failing_terminal)
+    assert _deltas(before, _failure_counts()) == {
+        "start_span": 0,
+        "record_response": 0,
+        "record_error": 1,
+        "end": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_end_failure_is_counted() -> None:
+    before = _failure_counts()
+    mw = LangfuseMiddleware(client=_FailingClient(span=_FailingSpan(raise_on_end=True)))
+    await mw(MiddlewareContext(payload={}), _ok_terminal)
+    assert _deltas(before, _failure_counts()) == {
+        "start_span": 0,
+        "record_response": 0,
+        "record_error": 0,
+        "end": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_successful_calls_count_no_failure() -> None:
+    before = _failure_counts()
+    mw = LangfuseMiddleware(client=RecordingLangfuseClient())
+    await mw(
+        MiddlewareContext(payload={"llm_response": {"output": "ok", "usage": {"input_tokens": 1}}}),
+        _ok_terminal,
+    )
+    with pytest.raises(RuntimeError, match="LLM hiccup"):
+        await mw(MiddlewareContext(payload={}), _failing_terminal)
+    assert _failure_counts() == before

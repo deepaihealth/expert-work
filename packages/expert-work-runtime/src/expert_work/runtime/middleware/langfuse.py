@@ -37,9 +37,37 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from expert_work.common.observability.metrics import expert_work_counter
 from expert_work.runtime.middleware.base import CallNext, MiddlewareContext
 
 logger = logging.getLogger(__name__)
+
+#: B-153 follow-up — every place our side fails to hand data to Langfuse.
+#: The four fail-soft guards below and the SDK export path
+#: (``langfuse_sdk.FailureCountingSpanExporter``, stage ``export``) used to
+#: only log a WARNING, and no alert can query logs: after langfuse 4.x dropped
+#: ``start_generation`` every call logged ``langfuse.start_span_failed`` and
+#: Langfuse received nothing for six weeks. Fixed label set, no tenant ids;
+#: the ExpertWorkLangfuseDeliveryFailing alert watches this counter (a failure
+#: signal, independent of traffic volume).
+LANGFUSE_FAILURE_STAGES = ("start_span", "record_response", "record_error", "end", "export")
+
+_delivery_failures_total = expert_work_counter(
+    "expert_work_langfuse_delivery_failures_total",
+    "Failures handing trace data to Langfuse, by stage: the middleware's "
+    "swallowed client errors and failed SDK export batches (B-153).",
+    ("stage",),
+)
+# Export every stage at 0 from import time: ``increase()`` cannot see a
+# series' first sample, so a series born at 1 on the first failure would not
+# alert until the second one.
+for _stage in LANGFUSE_FAILURE_STAGES:
+    _delivery_failures_total.labels(stage=_stage)
+
+
+def record_delivery_failure(stage: str) -> None:
+    """Count one failure to hand data to Langfuse (``stage`` ∈ LANGFUSE_FAILURE_STAGES)."""
+    _delivery_failures_total.labels(stage=stage).inc()
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +174,8 @@ class LangfuseMiddleware:
 
     Failures inside the client (``start_span`` raises, ``end`` raises,
     etc.) are swallowed with a warn log — never propagated. Tracing
-    outages must not take down LLM serving.
+    outages must not take down LLM serving. Each swallowed failure is
+    also counted in ``expert_work_langfuse_delivery_failures_total``.
     """
 
     client: LangfuseClient
@@ -187,6 +216,7 @@ class LangfuseMiddleware:
             )
         except Exception:
             logger.warning("langfuse.start_span_failed", exc_info=True)
+            record_delivery_failure("start_span")
             return None
 
     def _record_response_safe(
@@ -207,6 +237,7 @@ class LangfuseMiddleware:
                 span.record_usage(usage)
         except Exception:
             logger.warning("langfuse.record_response_failed", exc_info=True)
+            record_delivery_failure("record_response")
 
     def _record_error_safe(
         self,
@@ -219,6 +250,7 @@ class LangfuseMiddleware:
             span.record_error(exc)
         except Exception:
             logger.warning("langfuse.record_error_failed", exc_info=True)
+            record_delivery_failure("record_error")
 
     def _end_safe(self, span: LangfuseSpan | None) -> None:
         if span is None:
@@ -227,3 +259,4 @@ class LangfuseMiddleware:
             span.end()
         except Exception:
             logger.warning("langfuse.end_failed", exc_info=True)
+            record_delivery_failure("end")
