@@ -200,7 +200,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 ## §19 B-141 / B-143 压缩摘要(ROADMAP B-141 / B-143)
 
-设计稿 `docs/superpowers/specs/2026-10-07-b141-b143-compression-summary-design.md` §4。前置:用户在控制台导入 `tools/eval/datasets/behavior/agents/eval-compress.yaml`(B-143 合入后再导 `eval-compress-main`);B-143 上生产前**生产价目表必须有 `glm-5.3-flash`**。
+设计稿 `docs/superpowers/specs/2026-10-07-b141-b143-compression-summary-design.md` §4。前置:用户在控制台导入 `tools/eval/datasets/behavior/agents/eval-compress.yaml`(B-143 合入后再导 `eval-compress-main`);B-143 上生产前**生产价目表必须有 `glm-5.3-flash`** —— **10-07 已核**(用户在生产跑查询):平台通用价,输入 0.8 / 输出 2.8 / 缓存读 0.23 元每百万 token,与测试一致。`eval-compress` 10-07 已导入(1.0.0)。
 
 - [ ] **19.1 基线**:当前测试版本 `behavior_runner.py --only c01,c02,c03,c04 --agent-map eval-general=eval-compress --repeats 3`。判据:每个用例每次都触发了压缩(结果里 `compactions >= 1`,没有「不可判」);触发不了就改用例,不改判据。
 - [ ] **19.2 B-141 对照**:`release.sh test` 发含 #1755 的候选,同样跑一遍后 `compare`。判据:没有用例稳定变差;c01 / c03 至少一个从不稳定 / 不过变 3/3,或基线已 3/3 时如实记「这批用例分不出差别」;COMPACTION 帧带 `summary_input_chars`,且多数压缩的值超过 24,000(修前摘要输入的上限)。
