@@ -61,18 +61,19 @@
 
 ### 3.3 B-143 摘要模型
 
-- `ContextCompressionPolicy` 新增 `summary_model`:`"auto"`(默认)/ `"main"`。
-  - `auto`:查一张「同厂商便宜型号」映射表(先只有 `glm-5.3` → `glm-5.3-flash`、`glm-5.2` → `glm-5.3-flash`);查不到就用主模型。
-  - `main`:始终用主模型(给出问题时回退用)。
-  - 默认值不落库(沿用 `_B126OmitDefaultsMixin`),**旧镜像读新 manifest 不会因为 `extra="forbid"` 拒绝**;只有显式写了 `summary_model` 的 manifest 在回滚窗口里有风险,所以生产上不写它。
-- **只在同一家内切换**:不把一个租户的对话发给它没选的厂商。
-- 便宜型号走同一套凭据解析与计量:`token_usage` 按 provider·model 分桶记账(B-42),价目表必须有 `glm-5.3-flash` —— **生产价目表要先核(用户)**。
-- 便宜模型调用报错时,当次用主模型重试一次;仍失败照旧走 RT-ADR-6 的「跳过本轮、连续三次才失败」。
-- `glm-5.3-flash` 是始终思考的模型,摘要调用按最低思考档发。
+沿用现成的「按步骤换模型」(`routing.rules`,`build_step_routers`,现有 `planning` / `reflection` 两类),不新加配置字段:
+
+- `routing.rules[].when` 增加一个取值 `compression`。写了这条规则就用规则里的模型(要退回主模型,规则里写主模型即可)。
+- **没写规则时(默认)**:查一张「同厂商便宜型号」映射表 —— 先只有 `glm-5.3` / `glm-5.2` → `glm-5.3-flash`;查到就用「主模型的同一份 `ModelSpec`、只换型号名、`fallback` 挂主模型本身」,查不到就用主模型(与现在一样)。
+  - 便宜型号报错 → 路由器现成的备用链自动转主模型,不用另写退回逻辑;仍失败照旧走 RT-ADR-6(跳过本轮、连续三次才失败)。
+  - **只在同一家内切换**,凭据、地域与主模型一致:不把一个租户的对话发给它没选的厂商。
+- 记账:压缩调用的记账器按这条路由的整条链分桶(`_step_meter`,B-42 / B-104 口径),便宜型号记在自己的 provider·model 名下。**生产价目表必须有 `glm-5.3-flash`(用户核)**。
+- `glm-5.3-flash` 始终思考(`always_thinking`),摘要调用按最低思考档发。
+- 回滚兼容:默认路径不改 manifest;只有显式写了 `when: compression` 的 manifest 在回滚窗口里会被旧镜像拒(`extra="forbid"` + Literal),所以生产上不写这条规则,只在测试环境的评测智能体上写。
 
 ### 3.4 观测
 
-- COMPACTION 事件 payload 加两项:`summary_input_chars`(实际交给摘要模型的字符数)、`summary_model`(用的哪个型号)。事件本来就对外可见(`EXTERNAL_HIDDEN_EVENTS` 只藏 `system_prompt`)。
+- COMPACTION 事件 payload 加 `summary_input_chars`(实际交给摘要模型的字符数,B-141);用的哪个型号看 `token_usage` 分桶即可,不进事件。事件本来就对外可见(`EXTERNAL_HIDDEN_EVENTS` 只藏 `system_prompt`)。
 - 现有 `expert_work_cm_compressor_tokens_saved_total` 不动。
 
 ## 4. 验证(B-140 扩展)
@@ -84,7 +85,7 @@
 
 ### 4.2 评测智能体
 - 新增 `eval-compress`:与 `eval-general` 相同,但 ① 关掉收起旧工具结果(`tool_result_prune.enabled: false`,跨轮清理一并关)和工作窗口,让**摘要成为唯一一道闸**;② 压缩门槛 `absolute_cap_tokens: 30000`。
-- 新增 `eval-compress-main`:同上,`summary_model: main`(B-143 对照用)。
+- 新增 `eval-compress-main`:同上,另加一条 `routing.rules: [{when: compression, model: <主模型>}]`(B-143 对照用;要等 B-143 合入后才能导入)。
 - **两个都要用户在控制台导入一次**(新建智能体只能走控制台平面),或用户 codegen 登录一次、我用登录态无头导入。
 
 ### 4.3 新用例(4 个,c 开头)
@@ -107,7 +108,7 @@
 
 - 纯代码 + 默认值,回滚 = 回镜像。
 - 检查点兼容见 3.2;manifest 兼容见 3.3(新字段默认不落库)。
-- B-143 单独回退:`summary_model: main` 只用于测试环境;生产要临时回退靠回镜像,不靠改 manifest(理由同 3.3)。
+- B-143 单独回退:`when: compression` 规则只用于测试环境;生产要临时回退靠回镜像,不靠改 manifest(理由同 3.3)。
 
 ## 6. 实施任务
 
@@ -115,9 +116,9 @@
 |---|---|---|
 | T1 | 摘要输入:按角色上限 + 先砍旧工具结果的分配;预算 16 万字符;单测含「中段中间的内容不再整块丢失」 | B-141 |
 | T2 | 四段摘要 + 进度段规则 + 更新模式整段替换 Progress;单测锁提示词关键句;旧三段摘要的兼容测试 | B-141 |
-| T3 | COMPACTION payload 加 `summary_input_chars` / `summary_model` | B-141 |
+| T3 | COMPACTION payload 加 `summary_input_chars`;对外文档 `sse-events.md` 同步 | B-141 |
 | T4 | 评测:`compaction` 帧计数、`requires_compaction` 判「不可判」、`workspace_file_line_count`;两份评测智能体 manifest;c01~c04 用例与 fixtures | B-141 |
-| T5 | `summary_model` 字段 + 同厂商映射 + 失败退回主模型 + 计量分桶;单测含回滚兼容(默认不落库) | B-143 |
+| T5 | `routing.when` 加 `compression` + 默认同厂商便宜型号(主模型挂备用)+ 记账分桶;单测含「没有规则时主模型不变的厂商」与回滚兼容 | B-143 |
 | T6 | 真栈对照(4.4)、结果写进本设计稿 §7 与验收清单 | 两个 PR 都要 |
 
 ## 7. 结果

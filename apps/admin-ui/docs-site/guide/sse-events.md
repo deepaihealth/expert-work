@@ -885,15 +885,16 @@ function onGuard(data) {
 | `tokens_before` | integer | 压缩前的上下文大小，是估算值，非负整数 |
 | `tokens_after` | integer | 压缩后的上下文大小，是估算值，非负整数，与 `tokens_before` 采用同一种估算方式 |
 | `summary_chars` | integer | 结果里那条摘要的字符数，非负整数；没有摘要时是 `0` |
+| `summary_input_chars` | integer | 写这条摘要时交给摘要模型的内容字符数，非负整数。被压缩的历史超出摘要模型一次能读的量时，平台先把较早的工具输出收成一行再交过去，所以它通常小于被压缩历史的原文长度 |
 
-这四个数只用于提示。`tokens_before` 与 `tokens_after` 都是按字符数折算出来的估算值，既不是计费依据，也不是模型返回的真实用量，真实用量在 `updates` 里 `ai` 消息的 `usage_metadata` 中。正因为是两次估算，两者相减可能是负数：要显示「节省了多少」，先把下界夹住，下面的示例使用的是 `Math.max(0, …)`，否则用户会看到「节省约 -37 token」。
+这几个数只用于提示。`tokens_before` 与 `tokens_after` 都是按字符数折算出来的估算值，既不是计费依据，也不是模型返回的真实用量，真实用量在 `updates` 里 `ai` 消息的 `usage_metadata` 中。正因为是两次估算，两者相减可能是负数：要显示「节省了多少」，先把下界夹住，下面的示例使用的是 `Math.max(0, …)`，否则用户会看到「节省约 -37 token」。
 
 #### 示例
 
 ``` [事件流片段]
 id: 1755229384902-16
 event: compaction
-data: {"passes":1,"tokens_before":18420,"tokens_after":6103,"summary_chars":2048}
+data: {"passes":1,"tokens_before":18420,"tokens_after":6103,"summary_chars":2048,"summary_input_chars":61250}
 ```
 
 #### 客户端怎么处理

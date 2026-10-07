@@ -162,6 +162,8 @@ async def test_compaction_fires_event_sink_from_config() -> None:
     assert payload["passes"] >= 1
     assert payload["tokens_before"] > payload["tokens_after"]
     assert payload["summary_chars"] > 0
+    # B-141 —— 摘要模型实际读到的字符数也随事件发出
+    assert payload["summary_input_chars"] > 0
 
 
 @pytest.mark.asyncio
