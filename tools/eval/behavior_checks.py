@@ -36,6 +36,7 @@ from behavior_schema import (
     ToolUsed,
     TurnTokensMax,
     WorkspaceFileContains,
+    WorkspaceFileLineCount,
     WorkspaceFileNotContains,
     WorkspaceFileUnchangedLines,
 )
@@ -54,7 +55,11 @@ def required_files(case: Case) -> list[FileKey]:
         if isinstance(check, ArtifactContains | ArtifactNotContains | ArtifactUnchangedLines):
             key = ("artifact", check.name)
         elif isinstance(
-            check, WorkspaceFileContains | WorkspaceFileNotContains | WorkspaceFileUnchangedLines
+            check,
+            WorkspaceFileContains
+            | WorkspaceFileNotContains
+            | WorkspaceFileUnchangedLines
+            | WorkspaceFileLineCount,
         ):
             key = ("workspace", check.path)
         else:
@@ -202,6 +207,15 @@ def _one(
         before = (fixtures_dir / check.fixture).read_text(encoding="utf-8")
         extra = sorted(changed_lines(before, text) - set(check.except_lines))
         return _verdict(check, not extra, f"unexpected changes at fixture lines {extra[:20]}")
+    if isinstance(check, WorkspaceFileLineCount):
+        text, problem = _text(files, ("workspace", check.path))
+        if text is None:
+            return _verdict(check, False, problem)
+        regex = re.compile(check.pattern)
+        n = sum(1 for line in text.splitlines() if regex.search(line))
+        return _verdict(
+            check, n == check.count, f"{n} lines match {check.pattern!r}, want {check.count}"
+        )
     if isinstance(check, ToolUsed | ToolNotUsed | ToolCountMax | ToolNotUsedOn):
         calls = [c for c in calls if check.turn is None or c.turn == check.turn]
     if isinstance(check, ToolUsed):

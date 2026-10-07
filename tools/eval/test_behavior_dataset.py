@@ -5,9 +5,13 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
+import pytest
 import yaml
 from behavior_schema import AGENTS_DIR, CASES_DIR, FIXTURES_DIR, load_cases
+
+from expert_work.protocol.agent_spec import AgentSpec
 
 
 def _make_fixtures_module() -> ModuleType:
@@ -32,12 +36,52 @@ def test_all_cases_load_and_reference_existing_files() -> None:
                 assert (FIXTURES_DIR / fixture).is_file(), (case.id, fixture)
 
 
+def _manifest(code: str) -> dict[str, Any]:
+    raw: dict[str, Any] = yaml.safe_load((AGENTS_DIR / f"{code}.yaml").read_text(encoding="utf-8"))
+    return raw
+
+
 def test_agent_manifests_match_codes() -> None:
-    for code in ("eval-general", "eval-ahp"):
-        manifest = yaml.safe_load((AGENTS_DIR / f"{code}.yaml").read_text(encoding="utf-8"))
+    for code in ("eval-general", "eval-ahp", "eval-compress"):
+        manifest = _manifest(code)
         assert manifest["metadata"]["name"] == code
         assert manifest["spec"]["sandbox"]["filesystem"]["persistent_workspace"] is True
         assert manifest["spec"]["policies"]["token_budget"] > 0
+
+
+@pytest.mark.parametrize("path", sorted(AGENTS_DIR.glob("*.yaml")), ids=lambda p: p.stem)
+def test_agent_manifests_validate_against_the_protocol(path: Path) -> None:
+    # 控制台导入走同一个模型(extra="forbid"):这里不过,导入就是 422
+    AgentSpec.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+
+
+def test_eval_compress_is_eval_general_with_only_the_compression_knobs_changed() -> None:
+    general, compress = _manifest("eval-general"), _manifest("eval-compress")
+    spec = AgentSpec.model_validate(compress).spec
+    assert spec.policies.context_compression.absolute_cap_tokens == 30_000
+    assert spec.policies.working_memory.enabled is False
+    # 关掉它 agent_factory 就不建 ToolResultPruner,跨轮清理(cross_turn)也在它里面
+    assert spec.policies.tool_result_prune.enabled is False
+    for key in ("tenant_config", "model", "system_prompt", "tools", "sandbox"):
+        assert compress["spec"][key] == general["spec"][key], key
+    allowed = {"description", "workflow", "policies"}
+    assert set(compress["spec"]) - set(general["spec"]) <= allowed
+    assert {k for k in general["spec"] if compress["spec"].get(k) != general["spec"][k]} <= allowed
+    assert set(compress["spec"]["policies"]) == {
+        "token_budget",
+        "context_compression",
+        "working_memory",
+        "tool_result_prune",
+    }
+
+
+def test_c01_checks_carry_the_generated_totals() -> None:
+    totals = _make_fixtures_module().c01_totals()
+    [case] = load_cases(CASES_DIR, only=["c01-ten-ledgers-one-by-one"])
+    assert case.fixtures == list(totals)
+    patterns = {getattr(c, "pattern", "") for c in case.checks}
+    for name, total in totals.items():
+        assert f"^\\s*{name.replace('.', chr(92) + '.')},合计={total}\\s*$" in patterns, name
 
 
 def test_committed_fixtures_match_generator() -> None:
@@ -82,5 +126,47 @@ def test_every_fixture_used_by_a_case_is_an_allowed_upload_type() -> None:
     from behavior_client import content_type_for
 
     for case in load_cases(CASES_DIR):
-        for name in case.fixtures:
+        for name in [*case.fixtures, *(n for t in case.turns for n in t.fixtures)]:
             content_type_for(name)  # raises ValueError for types the upload API rejects
+
+
+def test_turn_fixtures_exist() -> None:
+    for case in load_cases(CASES_DIR):
+        for turn in case.turns:
+            for name in turn.fixtures:
+                assert (FIXTURES_DIR / name).is_file(), (case.id, name)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "已完成\uff1a6 步\n下一步\uff1a第 7 步",  # c-base-1007 两次的真实回答(全角冒号)
+        "已完成\uff1a6 步 下一步\uff1a第 7 步",
+        "已完成:6 步\n下一步:第 7 步",
+    ],
+)
+def test_c03_text_checks_accept_the_real_answer(answer: str) -> None:
+    from behavior_checks import evaluate
+    from behavior_schema import RunRecord, TurnRecord
+
+    [case] = load_cases(CASES_DIR, only=["c03-where-are-we"])
+    record = RunRecord(
+        case_id=case.id, rep=1, user_id="u", turns=[TurnRecord(index=1, final_text=answer)]
+    )
+    verdicts = [v for v in evaluate(case, record, {}, FIXTURES_DIR) if v.type == "final_text_regex"]
+    assert len(verdicts) == 2 and all(v.passed for v in verdicts), verdicts
+    wrong = RunRecord(
+        case_id=case.id,
+        rep=1,
+        user_id="u",
+        turns=[TurnRecord(index=1, final_text=answer.replace("6", "5").replace("7", "6"))],
+    )
+    assert not any(
+        v.passed for v in evaluate(case, wrong, {}, FIXTURES_DIR) if v.type == "final_text_regex"
+    )
+
+
+def test_no_case_regex_has_a_doubled_ascii_colon_class() -> None:
+    # c03 曾把全角冒号 U+FF1A 写成第二个半角冒号:`[::]` 永远匹配不到全角冒号
+    for path in Path(CASES_DIR).glob("*.yaml"):
+        assert "[::]" not in path.read_text(encoding="utf-8"), path.name

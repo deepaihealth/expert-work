@@ -1,0 +1,52 @@
+id: c04-export-keeps-revisions
+agent: eval-compress
+shape: B-141 压缩后导出丢掉前几轮的修改
+requires_compaction: true
+# 健康方案形态,但跑在 eval-compress(通用智能体,没有 eval-ahp 的 health-plan-report / docx 技能):
+# 方案写成 Markdown、导出用 save_artifact 交付 .md。只保留一个压缩评测智能体;要测 docx 形态得另建
+# 一个基于 eval-ahp 的压缩副本。客户资料全部虚构(同 h 系列的王小雨)。
+#
+# 第一版的教训(c-base-1007):6 份资料都在第 1 轮上传,模型一次并行读完 —— 一轮只有「用户消息 +
+# 一次 6 个调用 + 6 份结果」,开头 4 条与末尾 6 条把整轮盖住、中段为空,压缩器一遍都压不了,run 以
+# `context overflow: estimated 37692 tokens > threshold 30000 after 0 compression pass(es)` 失败。
+# 现在第 1 轮只给 4 份小的体检报告,补充记录在第 2~5 轮各上传一份(轮级 fixtures),
+# 一轮最多能并行读到的那批远小于门槛。
+#
+# 尺寸(o200k,test_behavior_dataset.py / test_behavior_compaction_sizing.py 复核):体检报告 4 份
+# 各约 2,990 token;运动 / 饮食 / 睡眠 / 随访记录各约 4,770~4,810。门槛 3 万,S 按 1,000~5,000 估:
+#   第 1 轮读完 4 份 ≈ S + 约 12,000(+ 零碎)—— S=5,000 时约 18,800,第 1 轮不越线
+#   之后每轮 + 约 4,800(+ 改 plan.md 时重读它的一两千)
+#   S=1,000:第 5 轮越线(≈ 32,200);S=5,000:第 4 轮越线(≈ 33,900)、第 3 轮 ≈ 28,700 不越。
+# → 至少两轮修改之后才压缩,第 6 轮导出在压缩之后。
+# 一轮能拿到的整批都进末尾:第 1 轮 S + 约 12,000 < 3 万;压缩后剩 S + 头 4 条(至多两份报告)
+# + 摘要 + 尾 6 条(本轮记录 + 重读的 plan.md + 上一轮的记录)< 3 万。
+fixtures: [checkup-part-1.md, checkup-part-2.md, checkup-part-3.md, checkup-part-4.md]
+turns:
+  - prompt: |
+      uploads/ 下的 checkup-part-1.md 到 checkup-part-4.md 是客户王小雨(虚构,女,42 岁)的年度体检报告,分成了 4 份。
+      请读完这 4 份,然后在工作区写一份健康管理方案 plan.md(Markdown),
+      包含「## 饮食」「## 运动」「## 作息」三节,针对报告里的异常指标给建议。
+  - fixtures: [exercise-log.md]
+    prompt: |
+      客户补充了近四个月的运动记录,刚上传在 uploads/exercise-log.md,先读一下。
+      然后把 plan.md 的运动部分改成每周游泳两次、每次 45 分钟,只改运动这一节。
+  - fixtures: [diet-log.md]
+    prompt: |
+      客户又补充了饮食记录 uploads/diet-log.md,先读一下。
+      然后把 plan.md 的饮食部分里的早餐改成燕麦粥配水煮蛋,只改饮食这一节。
+  - fixtures: [sleep-log.md]
+    prompt: |
+      客户又补充了睡眠记录 uploads/sleep-log.md,先读一下。
+      然后把 plan.md 的作息部分改成 23:00 前入睡,只改作息这一节。
+  - fixtures: [followup-notes.md]
+    prompt: |
+      这是最近的随访记录 uploads/followup-notes.md,先读一下。
+      然后在 plan.md 末尾加一节「## 复查」,写明三个月后复查空腹血糖,其余各节不动。
+  - prompt: |
+      方案定稿,请导出:把 plan.md 的最新内容另存为 final-plan.md,第一行加上「# 王小雨 健康管理方案(最终版)」,
+      然后用 save_artifact 交付 final-plan.md。
+checks:
+  - {type: completed}
+  - {type: artifact_exists, name: final-plan.md}
+  # 第 2~5 轮的四处修改都还在
+  - {type: artifact_contains, name: final-plan.md, all: [最终版, '## 饮食', '## 运动', '## 作息', '## 复查', 游泳, 燕麦, '23:00']}

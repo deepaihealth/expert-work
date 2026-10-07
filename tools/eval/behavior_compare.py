@@ -5,7 +5,8 @@
       [--out report.md] [--allow-different-cases]
 
 退出码:有稳定退步 1;用例集不同(且没加 --allow-different-cases)2;否则 0。
-规则见规格 §6:改动前 ≥2/3 过、改动后 ≤1/3 过才算稳定退步;infra_error 不计入。
+规则见规格 §6:改动前 ≥2/3 过、改动后 ≤1/3 过才算稳定退步;infra_error 与「不可判」
+(B-141:要求压缩的用例一次都没压缩)都不计入,按缺数据处理。
 """
 
 from __future__ import annotations
@@ -40,10 +41,11 @@ _LABEL: dict[Verdict, str] = {
 @dataclass(frozen=True)
 class CaseSummary:
     case_id: str
-    n: int  # 不含 infra_error
+    n: int  # 不含 infra_error 与不可判
     passed: int
     infra: int
     medians: dict[str, float] = field(default_factory=dict)
+    indeterminate: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ def summarize(results: list[CaseResult]) -> dict[str, CaseSummary]:
     out: dict[str, CaseSummary] = {}
     for case_id, rows in by_case.items():
         scored = [r for r in rows if r.passed is not None]
+        indeterminate = sum(r.indeterminate is not None for r in rows)
         medians: dict[str, float] = {}
         for metric in METRICS:
             values = [r.metrics[metric] for r in scored if metric in r.metrics]
@@ -71,8 +74,9 @@ def summarize(results: list[CaseResult]) -> dict[str, CaseSummary]:
             case_id=case_id,
             n=len(scored),
             passed=sum(r.passed is True for r in scored),
-            infra=len(rows) - len(scored),
+            infra=len(rows) - len(scored) - indeterminate,
             medians=medians,
+            indeterminate=indeterminate,
         )
     return out
 
@@ -127,7 +131,9 @@ def compare(
 def _cell(s: CaseSummary | None) -> str:
     if s is None:
         return "—"
-    return f"{s.passed}/{s.n}" + (f"(另 {s.infra} 次环境错误)" if s.infra else "")
+    extra = [f"{s.infra} 次环境错误"] if s.infra else []
+    extra += [f"{s.indeterminate} 次不可判"] if s.indeterminate else []
+    return f"{s.passed}/{s.n}" + (f"(另 {'、'.join(extra)})" if extra else "")
 
 
 def render_markdown(
@@ -168,7 +174,9 @@ def render_markdown(
             for res in sorted(
                 (x for x in cand_results if x.case_id == r.case_id), key=lambda x: x.rep
             ):
-                if res.passed is None:
+                if res.indeterminate is not None:
+                    state = f"不可判 {res.indeterminate}"
+                elif res.passed is None:
                     state = f"环境错误 {res.infra_error or ''}"
                 elif res.passed:
                     state = "过"

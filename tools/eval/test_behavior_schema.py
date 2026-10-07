@@ -11,6 +11,7 @@ from behavior_schema import (
     ResultHeader,
     ToolUsed,
     WorkspaceFileContains,
+    WorkspaceFileLineCount,
     append_line,
     case_set_hash,
     load_case,
@@ -158,3 +159,60 @@ def test_tool_checks_accept_a_turn(tmp_path: Path) -> None:
         )
     )
     assert isinstance(case.checks[1], ToolUsed) and case.checks[1].turn == 2
+
+
+def test_compression_cases_take_a_c_id_and_the_compress_agent(tmp_path: Path) -> None:
+    text = _CASE.replace("g99-sample", "c99-sample").replace("eval-general", "eval-compress")
+    case = load_case(_write(tmp_path, "c99-sample.yaml", text + "requires_compaction: true\n"))
+    assert case.agent == "eval-compress" and case.requires_compaction is True
+    assert load_case(_write(tmp_path, "g99-sample.yaml", _CASE)).requires_compaction is False
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        "{type: workspace_file_line_count, path: r.md, pattern: '(unclosed', count: 1}",
+        "{type: workspace_file_line_count, path: r.md, pattern: '^a', count: -1}",
+        "{type: workspace_file_line_count, path: r.md, pattern: '^a', count: 1, extra: 1}",
+        "{type: workspace_file_line_count, path: r.md, count: 1}",
+    ],
+)
+def test_line_count_check_is_strict(tmp_path: Path, check: str) -> None:
+    bad = _CASE.replace("{type: completed}", check)
+    with pytest.raises(ValidationError):
+        load_case(_write(tmp_path, "g99-sample.yaml", bad))
+
+
+def test_indeterminate_result_round_trips(tmp_path: Path) -> None:
+    out = tmp_path / "r.jsonl"
+    header = ResultHeader(
+        label="b",
+        started_at="t",
+        base_url="http://localhost",
+        case_set_hash="a" * 12,
+        repeats=1,
+        case_ids=["c99-sample"],
+    )
+    result = CaseResult(
+        case_id="c99-sample", rep=1, passed=None, indeterminate="no compaction in any turn"
+    )
+    append_line(out, header)
+    append_line(out, result)
+    assert read_results(out)[1] == [result]
+
+
+def test_turns_may_bring_their_own_fixtures(tmp_path: Path) -> None:
+    text = _CASE.replace(
+        "  - prompt: 改一下\n", "  - prompt: 改一下\n  - prompt: 再改\n    fixtures: [b.md]\n"
+    )
+    case = load_case(_write(tmp_path, "g99-sample.yaml", text))
+    assert case.turns[0].fixtures == [] and case.turns[1].fixtures == ["b.md"]
+
+
+def test_line_count_check_loads(tmp_path: Path) -> None:
+    ok = _CASE.replace(
+        "{type: completed}",
+        "{type: workspace_file_line_count, path: r.md, pattern: '^a', count: 0}",
+    )
+    check = load_case(_write(tmp_path, "g99-sample.yaml", ok)).checks[0]
+    assert isinstance(check, WorkspaceFileLineCount) and check.count == 0

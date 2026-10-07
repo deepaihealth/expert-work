@@ -132,3 +132,36 @@ def test_report_lists_every_failed_run_not_only_regressions(tmp_path: Path) -> N
         _header("a"), _header("b"), same, _results("g03", [False, True, False])
     )
     assert "g03 第 1 次:不过" in text and "g03 第 3 次:不过" in text
+
+
+def _indeterminate(case_id: str, rep: int) -> CaseResult:
+    return CaseResult(
+        case_id=case_id,
+        rep=rep,
+        passed=None,
+        verdicts=[CheckVerdict(type="completed", passed=False, detail="x")],
+        metrics={"tokens_in": 99999.0, "compactions": 0.0},
+        indeterminate="no compaction in any turn",
+    )
+
+
+def test_indeterminate_runs_are_missing_data_not_failures() -> None:
+    rows = [*_results("c01", [True, True]), _indeterminate("c01", 3)]
+    s = cmp.summarize(rows)["c01"]
+    assert (s.n, s.passed, s.infra, s.indeterminate) == (2, 2, 0, 1)
+    assert s.medians["tokens_in"] == 1000.0  # 不可判那次的指标不进中位数
+    # 改动后两次不可判、一次过:样本不足,不是「从 3/3 掉到 1/3」的稳定退步
+    base = cmp.summarize(_results("c01", [True] * 3))["c01"]
+    cand = cmp.summarize(
+        [*_results("c01", [True]), _indeterminate("c01", 2), _indeterminate("c01", 3)]
+    )["c01"]
+    assert cmp.classify(base, cand) == "insufficient"
+
+
+def test_report_shows_indeterminate_counts() -> None:
+    cand_results = [*_results("c01", [True, True]), _indeterminate("c01", 3)]
+    rows = cmp.compare(_header("a"), _results("c01", [True] * 3), _header("b"), cand_results)
+    assert rows[0].verdict == "same"
+    text = cmp.render_markdown(_header("a"), _header("b"), rows, cand_results)
+    assert "| c01 | 3/3 | 2/2(另 1 次不可判) | 持平 |" in text
+    assert "c01 第 3 次:不可判 no compaction in any turn" in text

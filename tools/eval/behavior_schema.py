@@ -20,7 +20,7 @@ CASES_DIR = DATASET_DIR / "cases"
 FIXTURES_DIR = DATASET_DIR / "fixtures"
 AGENTS_DIR = DATASET_DIR / "agents"
 
-AgentCode = Literal["eval-general", "eval-ahp"]
+AgentCode = Literal["eval-general", "eval-ahp", "eval-compress"]
 
 
 class _Strict(BaseModel):
@@ -49,6 +49,15 @@ class FinalTextNotContains(_Strict):
     any: list[str] = Field(min_length=1)
 
 
+def _regex(value: str) -> str:
+    # 加载时就报错,别等智能体跑完才在判分时炸掉整批。
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise ValueError(f"invalid regex {value!r}: {exc}") from exc
+    return value
+
+
 class FinalTextRegex(_Strict):
     type: Literal["final_text_regex"]
     pattern: str = Field(min_length=1)
@@ -56,12 +65,7 @@ class FinalTextRegex(_Strict):
     @field_validator("pattern")
     @classmethod
     def _compiles(cls, value: str) -> str:
-        # 加载时就报错,别等智能体跑完才在判分时炸掉整批。
-        try:
-            re.compile(value)
-        except re.error as exc:
-            raise ValueError(f"invalid regex {value!r}: {exc}") from exc
-        return value
+        return _regex(value)
 
 
 class ArtifactExists(_Strict):
@@ -129,6 +133,23 @@ class WorkspaceFileUnchangedLines(_Strict):
     except_lines: list[int] = Field(default_factory=list)
 
 
+class WorkspaceFileLineCount(_Strict):
+    """工作区文件里匹配 ``pattern``(逐行 ``re.search``)的行数恰好是 ``count``。
+
+    B-141:抓「重做一步」(同一行出现两次)和「漏一步」(该有的行没有)。
+    """
+
+    type: Literal["workspace_file_line_count"]
+    path: str = Field(min_length=1)
+    pattern: str = Field(min_length=1)
+    count: int = Field(ge=0)
+
+    @field_validator("pattern")
+    @classmethod
+    def _compiles(cls, value: str) -> str:
+        return _regex(value)
+
+
 class ToolUsed(_Strict):
     type: Literal["tool_used"]
     tool: str = Field(min_length=1)
@@ -174,6 +195,7 @@ Check = Annotated[
     | WorkspaceFileContains
     | WorkspaceFileNotContains
     | WorkspaceFileUnchangedLines
+    | WorkspaceFileLineCount
     | ToolUsed
     | ToolNotUsed
     | ToolCountMax
@@ -188,15 +210,21 @@ Check = Annotated[
 
 class Turn(_Strict):
     prompt: str = Field(min_length=1)
+    #: 这一轮才上传、才附上的开局文件(B-141 c04:后几轮才拿到的补充资料,模型不能在第 1 轮
+    #: 一口气全读进来)。用例级 ``fixtures`` 仍在第 1 轮之前上传。
+    fixtures: list[str] = Field(default_factory=list)
 
 
 class Case(_Strict):
-    id: str = Field(pattern=r"^[gh][0-9]{2}-[a-z0-9-]+$")
+    id: str = Field(pattern=r"^[ghc][0-9]{2}-[a-z0-9-]+$")
     agent: AgentCode
     shape: str = Field(min_length=1)  # 出处:ROADMAP 编号
     fixtures: list[str] = Field(default_factory=list)
     turns: list[Turn] = Field(min_length=1)
     checks: list[Check] = Field(min_length=1)
+    #: B-141 —— 用例测的是压缩之后的行为:整次运行一次 ``compaction`` 都没有就判「不可判」
+    #: (不算过也不算不过)—— 在不可能失败的条件下验证等于没验证。
+    requires_compaction: bool = False
 
 
 def load_case(path: Path) -> Case:
@@ -264,6 +292,7 @@ class TurnRecord(_Strict):
     input_tokens: int | None = None  # None = 结束帧没有用量(缺席 ≠ 0)
     output_tokens: int | None = None
     wall_s: float = 0.0
+    compactions: int = 0  # 本轮 ``compaction`` 帧个数(帧对外可见,没有帧 = 没压缩)
 
 
 class RunRecord(_Strict):
@@ -287,11 +316,14 @@ class CaseResult(_Strict):
     kind: Literal["case"] = "case"
     case_id: str
     rep: int
-    passed: bool | None  # None = infra_error,不计入过 / 不过
+    passed: bool | None  # None = infra_error 或不可判,不计入过 / 不过
     verdicts: list[CheckVerdict] = Field(default_factory=list)
     metrics: dict[str, float] = Field(default_factory=dict)
     turn_metrics: list[dict[str, int | None]] = Field(default_factory=list)
     infra_error: str | None = None
+    #: 不可判的原因(``requires_compaction`` 而一次压缩都没发生);此时 ``passed`` 为 None,
+    #: ``verdicts`` 照常记下来留作排查。
+    indeterminate: str | None = None
     session_id: str | None = None
 
 
