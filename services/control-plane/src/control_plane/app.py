@@ -186,6 +186,7 @@ from control_plane.middleware import (
     TenantRateLimitMiddleware,
     TenantRateLimitOverrideCache,
 )
+from control_plane.middleware.observability import NATIVE_TELEMETRY_OFF
 from control_plane.orphan_sweep import OrphanSweep
 from control_plane.platform_delegation_config import (
     DelegationConfig,
@@ -2447,6 +2448,7 @@ def create_app(
         title="Expert Work Control Plane",
         version=_VERSION,
         lifespan=lifespan,
+        telemetry=NATIVE_TELEMETRY_OFF,
     )
     app.state.settings = resolved_settings
     app.state.lifecycle = resolved_lifecycle

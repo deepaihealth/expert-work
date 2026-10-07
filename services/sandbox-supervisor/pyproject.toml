@@ -18,7 +18,7 @@ dependencies = [
     # 上下界与 control-plane 同步(ROADMAP X-12):>=0.138 是
     # ``iter_route_contexts`` 出现的版本;本服务自己没有路由自审,跟着走是为了
     # 整个 workspace 只解出一个 fastapi 版本。
-    "fastapi>=0.138,<1",
+    "fastapi>=0.142.1,<1",
     "uvicorn[standard]>=0.32,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",

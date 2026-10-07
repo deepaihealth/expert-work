@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
+from fastapi.telemetry import TelemetryConfig
 from opentelemetry import context as otel_context
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -33,6 +34,20 @@ from expert_work.common.observability import (
 )
 
 TRACE_ID_HEADER = "X-Expert-Work-Trace-Id"
+
+#: FastAPI ≥ 0.142 instruments itself with OpenTelemetry, on by default as soon as
+#: a global provider exists: a route span plus ``fastapi.endpoint`` /
+#: ``fastapi.dependencies`` per request (probes included), its own HTTP metrics,
+#: exception logs with stack traces, and an OTLP exporter picked up from
+#: ``OTEL_EXPORTER_OTLP_*``. This middleware already owns the request span, so the
+#: app turns the native layer off wholesale.
+NATIVE_TELEMETRY_OFF: TelemetryConfig = {
+    "tracing": False,
+    "metrics": False,
+    "logs": False,
+    "operation_spans": False,
+    "auto_configure": False,
+}
 
 
 class TraceContextMiddleware(BaseHTTPMiddleware):
