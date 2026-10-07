@@ -150,3 +150,17 @@ groups:
       # 后续 SLO 面板用。sum 聚掉 tool 标签,单序列口径与本文件同侪一致。
       - record: expert_work:sli:delegations_gated:rate_5m
         expr: sum(rate(expert_work_delegations_gated_total[5m]))
+
+      # B-142 — prompt-cache hit ratio per agent / model / usage_kind: of the
+      # provider-reported prompt tokens, how many were served from the
+      # provider's prompt cache. Fed by expert_work_llm_prompt_tokens_total,
+      # whose prompt size is provider-aware (Anthropic reports cache reads
+      # separately, OpenAI-compatible prompt_tokens already includes them) —
+      # do not derive this from expert_work_llm_token_usage_total. NaN when an
+      # agent made no calls in the window (traffic on test/prod is low; read it
+      # over a day in the dashboard).
+      - record: expert_work:llm_prompt_cache_hit:ratio1h
+        expr: |
+          sum by (agent_name, model, usage_kind) (rate(expert_work_llm_prompt_tokens_total{cache="read"}[1h]))
+          /
+          sum by (agent_name, model, usage_kind) (rate(expert_work_llm_prompt_tokens_total[1h]))
