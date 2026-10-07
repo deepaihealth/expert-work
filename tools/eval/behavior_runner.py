@@ -136,7 +136,11 @@ def metrics_of(record: RunRecord) -> dict[str, float]:
 def turn_metrics_of(record: RunRecord) -> list[dict[str, int | None]]:
     """逐轮的工具调用数、输入 token 与压缩次数 —— 带 ``turn`` 的阈值要按它校准(规格 §7)。"""
     return [
-        {"tool_calls": len(t.tool_calls), "input_tokens": t.input_tokens, "compactions": t.compactions}
+        {
+            "tool_calls": len(t.tool_calls),
+            "input_tokens": t.input_tokens,
+            "compactions": t.compactions,
+        }
         for t in record.turns
     ]
 
@@ -276,10 +280,8 @@ async def run_suite(
         else:
             mark = "INFRA" if res.passed is None else ("PASS" if res.passed else "FAIL")
         failed = [v.type for v in res.verdicts if not v.passed]
-        print(
-            f"{mark:5} {case.id} #{rep} {failed or ''} {res.infra_error or res.indeterminate or ''}".rstrip(),
-            flush=True,
-        )
+        reason = res.infra_error or res.indeterminate or ""
+        print(f"{mark:5} {case.id} #{rep} {failed or ''} {reason}".rstrip(), flush=True)
 
     await asyncio.gather(*(job(c, r) for c in cases for r in range(1, repeats + 1)))
     return results

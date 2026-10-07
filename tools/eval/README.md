@@ -125,3 +125,8 @@ uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>
 自证(评测能红):`datasets/behavior/agents/eval-general-broken.yaml` 只改提示词(要求改文件一律整篇重写),导入后
 `--only g02-edit-three-places --agent-map eval-general=eval-general-broken`,g02 必须在 `tool_not_used_on` 上判不过。
 注意 manifest 里删工具没用:`exec_python` / `bash` / 读写改文件是平台基础能力,每个智能体都有。
+
+压缩用例(B-141,`c01`~`c04`,`--only` 选它们):跑在 `eval-compress`(压缩门槛 3 万 token、只留摘要一道闸),
+**要先在控制台导入** `datasets/behavior/agents/eval-compress.yaml`。用例写了 `requires_compaction: true`,整次一次
+`compaction` 帧都没有的那次判「不可判」,不计过 / 不过(对照表里写成「2/2(另 1 次不可判)」);每轮与整次的压缩次数
+在结果的 `turn_metrics` / `metrics` 的 `compactions` 里。fixtures 的尺寸算式在各用例文件开头,`test_behavior_compaction_sizing.py` 复核。

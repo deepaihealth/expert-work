@@ -213,7 +213,9 @@ def _one(
             return _verdict(check, False, problem)
         regex = re.compile(check.pattern)
         n = sum(1 for line in text.splitlines() if regex.search(line))
-        return _verdict(check, n == check.count, f"{n} lines match {check.pattern!r}, want {check.count}")
+        return _verdict(
+            check, n == check.count, f"{n} lines match {check.pattern!r}, want {check.count}"
+        )
     if isinstance(check, ToolUsed | ToolNotUsed | ToolCountMax | ToolNotUsedOn):
         calls = [c for c in calls if check.turn is None or c.turn == check.turn]
     if isinstance(check, ToolUsed):

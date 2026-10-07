@@ -186,8 +186,12 @@ def test_line_count_check_is_strict(tmp_path: Path, check: str) -> None:
 def test_indeterminate_result_round_trips(tmp_path: Path) -> None:
     out = tmp_path / "r.jsonl"
     header = ResultHeader(
-        label="b", started_at="t", base_url="http://localhost", case_set_hash="a" * 12,
-        repeats=1, case_ids=["c99-sample"],
+        label="b",
+        started_at="t",
+        base_url="http://localhost",
+        case_set_hash="a" * 12,
+        repeats=1,
+        case_ids=["c99-sample"],
     )
     result = CaseResult(
         case_id="c99-sample", rep=1, passed=None, indeterminate="no compaction in any turn"
@@ -199,7 +203,8 @@ def test_indeterminate_result_round_trips(tmp_path: Path) -> None:
 
 def test_line_count_check_loads(tmp_path: Path) -> None:
     ok = _CASE.replace(
-        "{type: completed}", "{type: workspace_file_line_count, path: r.md, pattern: '^a', count: 0}"
+        "{type: completed}",
+        "{type: workspace_file_line_count, path: r.md, pattern: '^a', count: 0}",
     )
     check = load_case(_write(tmp_path, "g99-sample.yaml", ok)).checks[0]
     assert isinstance(check, WorkspaceFileLineCount) and check.count == 0

@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 import yaml
 from behavior_schema import AGENTS_DIR, CASES_DIR, FIXTURES_DIR, Case, load_cases
+
 from expert_work.protocol.agent_spec import AgentSpec
 from orchestrator.tools.overflow import EXTERNALIZE_MIN_CHARS
 
