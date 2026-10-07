@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from pydantic import BaseModel
 
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.checkpointer.timing import (
@@ -85,3 +87,32 @@ async def test_inner_exception_propagates_with_sample() -> None:
 async def test_factory_wraps_memory_backend() -> None:
     async with make_checkpointer("memory") as saver:
         assert isinstance(saver, TimingCheckpointSaver)
+
+
+class _Probe(BaseModel):
+    value: int
+
+
+@pytest.mark.asyncio
+async def test_with_allowlist_reaches_the_inner_saver() -> None:
+    """B-161 — in strict msgpack mode ``StateGraph.compile`` registers the state
+    schema's types via ``checkpointer.with_allowlist(...)``. The inherited
+    implementation clones the wrapper and swaps the *wrapper's* serde, while
+    every IO call goes to ``_inner`` — so the registration silently never
+    reached the serializer that actually loads the checkpoint."""
+    strict_inner = InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=None))
+    saver = TimingCheckpointSaver(strict_inner)
+
+    widened = saver.with_allowlist({(_Probe.__module__, _Probe.__name__)})
+    assert isinstance(widened, TimingCheckpointSaver)
+
+    checkpoint = {
+        **_checkpoint(),
+        "channel_values": {"probe": _Probe(value=1)},
+        "channel_versions": {"probe": 1},
+    }
+    stored = await widened.aput(_config("t-allow"), checkpoint, {}, {"probe": 1})
+    fetched = await widened.aget_tuple(stored)
+    assert fetched is not None
+    assert fetched.checkpoint["channel_values"]["probe"] == _Probe(value=1)
+

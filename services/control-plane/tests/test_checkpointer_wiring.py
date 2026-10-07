@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.event_hooks import SerdeEvent, register_serde_event_listener
 
 from control_plane.app import create_app
 from control_plane.runtime import (
@@ -32,6 +33,8 @@ from control_plane.runtime import (
 from control_plane.settings import Settings
 from control_plane.tenancy import TenantConfigNotConfiguredError
 from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.protocol import Plan
+from expert_work.protocol.plan import PlanStep
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.llm import FakeEmbedder
@@ -99,6 +102,33 @@ async def test_lifespan_swaps_builder_to_inject_envs() -> None:
     builder_before = app.state.agent_runtime.agent_builder
     async with app.router.lifespan_context(app):
         assert app.state.agent_runtime.agent_builder is not builder_before
+
+
+@pytest.mark.asyncio
+async def test_lifespan_memory_checkpointer_uses_allowlisted_serde() -> None:
+    """B-161 — the ``memory`` backend's durable saver names our state types:
+    a :class:`Plan` round-trips without the "unregistered type" path (which,
+    under strict msgpack, hands it back as a bare ``dict``)."""
+    unregistered: list[str] = []
+
+    def _listener(event: SerdeEvent) -> None:
+        if event["kind"] in ("msgpack_blocked", "msgpack_unregistered_allowed"):
+            unregistered.append(f"{event['module']}.{event['name']}")
+
+    app = create_app(
+        settings=Settings(checkpointer_backend="memory"),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    plan = Plan(goal="g", steps=(PlanStep(id="1", description="d"),))
+    async with app.router.lifespan_context(app):
+        serde = app.state.agent_runtime.durable_checkpointer.serde
+        unregister = register_serde_event_listener(_listener)
+        try:
+            assert serde.loads_typed(serde.dumps_typed(plan)) == plan
+        finally:
+            unregister()
+    assert unregistered == []
 
 
 # ---------------------------------------------------------------------------

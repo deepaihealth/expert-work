@@ -11,5 +11,8 @@ from expert_work.runtime.checkpointer.factory import (
 from expert_work.runtime.checkpointer.factory import (
     make_checkpointer as make_checkpointer,
 )
+from expert_work.runtime.checkpointer.serde import (
+    make_checkpoint_serde as make_checkpoint_serde,
+)
 
-__all__ = ["CheckpointerBackend", "make_checkpointer"]
+__all__ = ["CheckpointerBackend", "make_checkpoint_serde", "make_checkpointer"]

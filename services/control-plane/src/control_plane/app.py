@@ -518,7 +518,7 @@ from expert_work.protocol import (
     TokenReservationRecord,
 )
 from expert_work.runtime.audit.logger import AuditLogger
-from expert_work.runtime.checkpointer import make_checkpointer
+from expert_work.runtime.checkpointer import make_checkpoint_serde, make_checkpointer
 from expert_work.runtime.middleware import make_langfuse_client
 from expert_work.runtime.runs import (
     DrainObserver,
@@ -1414,7 +1414,7 @@ def create_app(
                     )
                     logger.info("control_plane.checkpointer.postgres_ready")
                 else:
-                    checkpointer = InMemorySaver()
+                    checkpointer = InMemorySaver(serde=make_checkpoint_serde())
                 # Expose the durable checkpointer so the ``/messages`` resume
                 # endpoint can read a thread's checkpoint directly (no agent
                 # rebuild). Same instance bound into ``agent_builder`` below.

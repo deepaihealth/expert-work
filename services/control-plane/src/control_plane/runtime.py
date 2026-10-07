@@ -63,6 +63,7 @@ from expert_work.protocol import (
 )
 from expert_work.runtime.audit import DefaultSecretRedactor
 from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.checkpointer import make_checkpoint_serde
 from expert_work.runtime.llm import InMemoryRedisCache, LLMResponseCache
 from expert_work.runtime.middleware import LangfuseClient, RecordingLangfuseClient
 from expert_work.runtime.runs import RunEventStore, RunManager, RunStore
@@ -2030,6 +2031,6 @@ def make_agent_runtime(
     return AgentRuntime(
         run_manager=RunManager(store=run_store),
         stream_bridge=InMemoryStreamBridge(),
-        agent_builder=make_agent_builder(secret_store, InMemorySaver()),
+        agent_builder=make_agent_builder(secret_store, InMemorySaver(serde=make_checkpoint_serde())),
         run_event_store=run_event_store,
     )

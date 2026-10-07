@@ -92,6 +92,7 @@ async def make_checkpointer(
     # Stream HX-4 (Mini-ADR HX-D3) — both backends leave the factory
     # wrapped in the timing proxy so the IO histogram exists on every
     # deployment shape (and tests exercise the same call path as prod).
+    from expert_work.runtime.checkpointer.serde import make_checkpoint_serde
     from expert_work.runtime.checkpointer.timing import TimingCheckpointSaver
 
     bk: str = backend
@@ -99,7 +100,7 @@ async def make_checkpointer(
         from langgraph.checkpoint.memory import InMemorySaver
 
         logger.info("checkpointer.memory.init")
-        yield TimingCheckpointSaver(InMemorySaver())
+        yield TimingCheckpointSaver(InMemorySaver(serde=make_checkpoint_serde()))
         return
 
     if bk == "postgres":
@@ -116,7 +117,7 @@ async def make_checkpointer(
         pool = _build_checkpointer_pool(dsn)
         await pool.open(wait=True)
         try:
-            saver = AsyncPostgresSaver(pool)
+            saver = AsyncPostgresSaver(pool, serde=make_checkpoint_serde())
             await setup_with_retry(saver)
             logger.info("checkpointer.postgres.ready")
             yield TimingCheckpointSaver(saver)
