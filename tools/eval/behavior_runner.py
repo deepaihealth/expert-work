@@ -123,6 +123,7 @@ def metrics_of(record: RunRecord) -> dict[str, float]:
     out = {
         "tool_calls": float(sum(len(t.tool_calls) for t in record.turns)),
         "wall_s": round(sum(t.wall_s for t in record.turns), 1),
+        "compactions": float(sum(t.compactions for t in record.turns)),
     }
     # 任何一轮没有用量就不出 token 指标 —— 半截求和比没有更误导。
     if record.turns and all(t.input_tokens is not None for t in record.turns):
@@ -133,8 +134,18 @@ def metrics_of(record: RunRecord) -> dict[str, float]:
 
 
 def turn_metrics_of(record: RunRecord) -> list[dict[str, int | None]]:
-    """逐轮的工具调用数与输入 token —— 带 ``turn`` 的阈值要按它校准(规格 §7)。"""
-    return [{"tool_calls": len(t.tool_calls), "input_tokens": t.input_tokens} for t in record.turns]
+    """逐轮的工具调用数、输入 token 与压缩次数 —— 带 ``turn`` 的阈值要按它校准(规格 §7)。"""
+    return [
+        {"tool_calls": len(t.tool_calls), "input_tokens": t.input_tokens, "compactions": t.compactions}
+        for t in record.turns
+    ]
+
+
+def indeterminate_reason(case: Case, record: RunRecord) -> str | None:
+    """B-141 —— 要求压缩的用例整次一次都没压缩:判据测不到它要测的东西,不判过 / 不过。"""
+    if case.requires_compaction and not any(t.compactions for t in record.turns):
+        return "no compaction in any turn (requires_compaction)"
+    return None
 
 
 async def run_case_once(
@@ -219,11 +230,13 @@ async def run_one(
             last_error = f"harness error: {type(exc).__name__}: {exc}"
             break
         verdicts = evaluate(case, record, files, fixtures_dir)
+        indeterminate = indeterminate_reason(case, record)
         return CaseResult(
             case_id=case.id,
             rep=rep,
-            passed=all(v.passed for v in verdicts),
+            passed=None if indeterminate else all(v.passed for v in verdicts),
             verdicts=verdicts,
+            indeterminate=indeterminate,
             metrics=metrics_of(record),
             turn_metrics=turn_metrics_of(record),
             session_id=record.session_id,
@@ -258,10 +271,14 @@ async def run_suite(
             )
         append_line(out_path, res)  # 单线程事件循环,两次 await 之间的同步写不会交错
         results.append(res)
-        mark = "INFRA" if res.passed is None else ("PASS" if res.passed else "FAIL")
+        if res.indeterminate:
+            mark = "INDET"
+        else:
+            mark = "INFRA" if res.passed is None else ("PASS" if res.passed else "FAIL")
         failed = [v.type for v in res.verdicts if not v.passed]
         print(
-            f"{mark:5} {case.id} #{rep} {failed or ''} {res.infra_error or ''}".rstrip(), flush=True
+            f"{mark:5} {case.id} #{rep} {failed or ''} {res.infra_error or res.indeterminate or ''}".rstrip(),
+            flush=True,
         )
 
     await asyncio.gather(*(job(c, r) for c in cases for r in range(1, repeats + 1)))
@@ -307,8 +324,12 @@ async def _amain(args: argparse.Namespace, token: str, out: Path) -> int:
             agent_map=agent_map,
         )
     passed = sum(r.passed is True for r in results)
-    infra = sum(r.passed is None for r in results)
-    print(f"done: {passed}/{len(results)} passed, {infra} infra errors -> {out}")
+    indeterminate = sum(r.indeterminate is not None for r in results)
+    infra = sum(r.passed is None for r in results) - indeterminate
+    print(
+        f"done: {passed}/{len(results)} passed, {infra} infra errors, "
+        f"{indeterminate} indeterminate -> {out}"
+    )
     return 0
 
 

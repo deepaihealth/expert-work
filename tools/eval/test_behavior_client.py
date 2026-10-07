@@ -201,3 +201,14 @@ async def test_archive_passes_user_id() -> None:
         return httpx.Response(200, json={"success": True})
 
     await _client(handler).archive("eval-general", "u1", "s1")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_counts_compaction_frames() -> None:
+    compaction = ("compaction", {"passes": 1, "tokens_before": 31000, "tokens_after": 18000})
+    frames = [*_FRAMES[:2], compaction, *_FRAMES[2:4], compaction, *_FRAMES[4:]]
+    client = _client(lambda request: httpx.Response(200, text=_sse(*frames)))
+    rec, _ = await client.run_turn("eval-compress", "u1", None, "p", [], 1)
+    assert rec.compactions == 2
+    plain = _client(lambda request: httpx.Response(200, text=_sse(*_FRAMES)))
+    assert (await plain.run_turn("eval-general", "u1", None, "p", [], 1))[0].compactions == 0

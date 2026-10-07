@@ -86,7 +86,7 @@ tools/eval/                    沿用该目录的平铺约定(无包、conftest 
 
 ```yaml
 id: g02-edit-three-places
-agent: eval-general          # eval-general | eval-ahp
+agent: eval-general          # eval-general | eval-ahp | eval-compress(B-141 压缩用例)
 shape: B-137                 # 来自哪条失败形态(ROADMAP 编号)
 fixtures: [report-300-lines.md]
 turns:
@@ -115,6 +115,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 | `tool_used` / `tool_not_used` / `tool_count_max` | 工具调用形状;四个工具类判据都可加 `turn: N` 只看第 N 轮(多轮任务用) |
 | `tool_not_used_on` | 某工具没有用在某路径上(抓「改已有文件却整篇 write_file」) |
 | `turn_tokens_max` | 某一轮输入 token 上限(B-126 / B-128 那类「越聊越贵」) |
+| `workspace_file_line_count` | 工作区文件里匹配某正则(逐行 `re.search`)的行数恰好等于 N(B-141:抓压缩后「重做一步」= 行重复、「漏一步」= 行缺失) |
 
 判据只认**行为的结果**,不认措辞。每条新判据在单元测试里必须能红(先构造一份「坏记录」证明它会判不过)。
 
@@ -125,6 +126,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 - 指标(输入 / 输出 token、工具调用数、墙钟)比**中位数**,涨跌超过 20% 标出;
 - `compare.py` 有稳定退步时退出码 1,方便放进发版前的检查步骤;
 - 对照表另附一段「每个任务每次的判定明细」,定位到哪条判据翻了。
+- **不可判**(B-141):用例写 `requires_compaction: true`,而这次运行整次一次 `compaction` 帧都没有 —— 判据测不到它要测的东西,这次记「不可判」(判据照常算出来留作排查),与 `infra_error` 一样**不计入**过 / 不过,对照表里写成「2/2(另 1 次不可判)」。客户端逐轮数 `compaction` 帧,写进轮指标与整次指标(`compactions`)。
 
 ### 三种对照方式
 

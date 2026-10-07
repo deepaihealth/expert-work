@@ -94,8 +94,12 @@ class TurnBuilder:
         self._final_text = ""
         self._calls: list[ToolCall] = []
         self._tool_errors = 0
+        self._compactions = 0
 
     def on_frame(self, event: str, raw: str) -> None:
+        if event == "compaction":  # 一帧 = 一次真正落地的摘要(压缩器每次调用至多发一帧)
+            self._compactions += 1
+            return
         if event not in {"metadata", "updates", "end"}:
             return
         try:
@@ -165,6 +169,7 @@ class TurnBuilder:
             input_tokens=tokens_in,
             output_tokens=tokens_out,
             wall_s=round(wall_s, 1),
+            compactions=self._compactions,
         )
 
 

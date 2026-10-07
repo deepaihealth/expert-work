@@ -212,6 +212,7 @@ def test_required_files_dedupes_in_order() -> None:
         "workspace_file_contains",
         "workspace_file_not_contains",
         "workspace_file_unchanged_lines",
+        "workspace_file_line_count",
         "tool_used",
         "tool_not_used",
         "tool_count_max",
@@ -257,3 +258,20 @@ def test_tool_checks_scoped_to_a_turn() -> None:
 def test_completed_reports_missing_record_separately() -> None:
     ok, detail = _one({"type": "completed"}, _record(_turn(completed=None, exit_reason=None)))
     assert not ok and "no completion record" in detail
+
+
+def _line_count(pattern: str, count: int) -> dict[str, Any]:
+    return {"type": "workspace_file_line_count", "path": "r.md", "pattern": pattern, "count": count}
+
+
+def test_workspace_file_line_count() -> None:
+    files = {("workspace", "r.md"): ("r.md", "# 结果\na,1\nb,2\na,1\n".encode())}
+    rec = _record(_turn())
+    assert _one(_line_count(r"^[ab],\d$", 3), rec, files)[0]
+    ok, detail = _one(_line_count(r"^a,1$", 1), rec, files)
+    assert not ok and "2 lines" in detail
+    assert _one(_line_count(r"^c,", 0), rec, files)[0]
+    assert not _one(_line_count(r"^b,2$", 2), rec, files)[0]
+    ok, detail = _one(_line_count(r"^a,", 2), rec, {("workspace", "r.md"): None})
+    assert not ok and "not found" in detail
+    assert required_files(_case([_line_count("x", 1)])) == [("workspace", "r.md")]

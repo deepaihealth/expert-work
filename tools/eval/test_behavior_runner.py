@@ -111,7 +111,13 @@ async def test_run_one_scores_a_passing_case(tmp_path: Path) -> None:
         FakeClient(), _case(), 1, label="base", agent_map={}, fixtures_dir=_fixtures(tmp_path)
     )
     assert res.passed is True and [v.passed for v in res.verdicts] == [True, True]
-    assert res.metrics == {"tool_calls": 0.0, "wall_s": 2.0, "tokens_in": 200.0, "tokens_out": 20.0}
+    assert res.metrics == {
+        "tool_calls": 0.0,
+        "wall_s": 2.0,
+        "compactions": 0.0,
+        "tokens_in": 200.0,
+        "tokens_out": 20.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -187,7 +193,7 @@ def test_metrics_skip_tokens_when_any_turn_lacks_usage() -> None:
         user_id="u",
         turns=[_turn(1), _turn(2, input_tokens=None, output_tokens=None)],
     )
-    assert runner.metrics_of(rec) == {"tool_calls": 0.0, "wall_s": 2.0}
+    assert runner.metrics_of(rec) == {"tool_calls": 0.0, "wall_s": 2.0, "compactions": 0.0}
 
 
 def test_main_refuses_missing_token_and_existing_output(
@@ -278,6 +284,59 @@ def test_turn_metrics_keep_each_turn_for_threshold_calibration() -> None:
         turns=[_turn(1, input_tokens=300), _turn(2, input_tokens=None)],
     )
     assert runner.turn_metrics_of(rec) == [
-        {"tool_calls": 0, "input_tokens": 300},
-        {"tool_calls": 0, "input_tokens": None},
+        {"tool_calls": 0, "input_tokens": 300, "compactions": 0},
+        {"tool_calls": 0, "input_tokens": None, "compactions": 0},
     ]
+
+
+class CompactingClient(FakeClient):
+    """第 2 轮报一次压缩。"""
+
+    def __init__(self, compactions: int) -> None:
+        super().__init__()
+        self.compactions = compactions
+
+    async def run_turn(
+        self,
+        agent: str,
+        user_id: str,
+        session_id: str | None,
+        prompt: str,
+        upload_ids: list[str],
+        index: int,
+    ) -> tuple[TurnRecord, str | None]:
+        rec, sid = await super().run_turn(agent, user_id, session_id, prompt, upload_ids, index)
+        n = self.compactions if index == 2 else 0
+        return rec.model_copy(update={"compactions": n}), sid
+
+
+@pytest.mark.asyncio
+async def test_required_compaction_that_never_happened_is_indeterminate(tmp_path: Path) -> None:
+    case = _case(id="c99-x", agent="eval-compress", requires_compaction=True)
+    res = await runner.run_one(
+        CompactingClient(0), case, 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
+    )
+    assert res.passed is None and res.infra_error is None
+    assert res.indeterminate and "compaction" in res.indeterminate
+    # 判据照常算出来留作排查,只是不计过 / 不过
+    assert [v.passed for v in res.verdicts] == [True, True]
+    assert res.metrics["compactions"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_required_compaction_that_happened_is_scored(tmp_path: Path) -> None:
+    case = _case(id="c99-x", agent="eval-compress", requires_compaction=True)
+    res = await runner.run_one(
+        CompactingClient(2), case, 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
+    )
+    assert res.passed is True and res.indeterminate is None
+    assert res.metrics["compactions"] == 2.0
+    assert [t["compactions"] for t in res.turn_metrics] == [0, 2]
+
+
+@pytest.mark.asyncio
+async def test_cases_without_the_flag_ignore_compaction(tmp_path: Path) -> None:
+    res = await runner.run_one(
+        CompactingClient(0), _case(), 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
+    )
+    assert res.passed is True and res.indeterminate is None
