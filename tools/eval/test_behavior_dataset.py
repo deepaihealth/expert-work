@@ -140,8 +140,8 @@ def test_turn_fixtures_exist() -> None:
 @pytest.mark.parametrize(
     "answer",
     [
-        "已完成：6 步\n下一步：第 7 步",  # c-base-1007 两次的真实回答(全角冒号)
-        "已完成：6 步 下一步：第 7 步",
+        "已完成\uff1a6 步\n下一步\uff1a第 7 步",  # c-base-1007 两次的真实回答(全角冒号)
+        "已完成\uff1a6 步 下一步\uff1a第 7 步",
         "已完成:6 步\n下一步:第 7 步",
     ],
 )
@@ -167,6 +167,6 @@ def test_c03_text_checks_accept_the_real_answer(answer: str) -> None:
 
 
 def test_no_case_regex_has_a_doubled_ascii_colon_class() -> None:
-    # c03 曾把全角冒号写成第二个半角冒号:`[::]` 永远匹配不到「：」
+    # c03 曾把全角冒号 U+FF1A 写成第二个半角冒号:`[::]` 永远匹配不到全角冒号
     for path in Path(CASES_DIR).glob("*.yaml"):
         assert "[::]" not in path.read_text(encoding="utf-8"), path.name

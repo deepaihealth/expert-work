@@ -130,3 +130,5 @@ uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>
 **要先在控制台导入** `datasets/behavior/agents/eval-compress.yaml`。用例写了 `requires_compaction: true`,整次一次
 `compaction` 帧都没有的那次判「不可判」,不计过 / 不过(对照表里写成「2/2(另 1 次不可判)」);每轮与整次的压缩次数
 在结果的 `turn_metrics` / `metrics` 的 `compactions` 里。fixtures 的尺寸算式在各用例文件开头,`test_behavior_compaction_sizing.py` 复核。
+某一轮才给的资料写在那一轮的 `fixtures` 里(该轮之前上传进同一会话、只附在该轮):用例级 `fixtures` 第 1 轮全都看得到,
+模型会一次并行读完,一轮盖满压缩器保留的头尾就压不了(c04 第一版的教训)。
