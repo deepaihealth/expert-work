@@ -79,6 +79,32 @@ _llm_token_usage_total = expert_work_counter(
     ("tenant_id", "agent_name", "model", "type", "usage_kind"),
 )
 
+#: B-142 —— 每次调用的提示词按「命中缓存 / 未命中」拆开计数,用来出持续的缓存命中率
+#: (``read / (read + uncached)``)。不能直接拿上面那个计数器的 ``cache_read / input``:
+#: 两家口径不同(见 :func:`_prompt_tokens`),同一条 PromQL 在 Anthropic 上会算错。
+_llm_prompt_tokens_total = expert_work_counter(
+    "expert_work_llm_prompt_tokens_total",
+    "Provider-reported prompt tokens per LLM call, split by prompt-cache hit (B-142).",
+    ("tenant_id", "agent_name", "model", "usage_kind", "cache"),
+)
+
+
+def _prompt_tokens(
+    provider: str | None, input_t: int, cache_creation_t: int, cache_read_t: int
+) -> int:
+    """B-142 —— 一次调用上游实报的提示词总量。
+
+    Anthropic 的 ``input_tokens`` **不含**缓存读写(``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens`` 单列),总量是三者相加;OpenAI 与所有 OpenAI 兼容
+    厂商的 ``prompt_tokens`` **已含** ``prompt_tokens_details.cached_tokens``(后者只是
+    明细),总量就是 ``input_tokens``。``provider`` 未知时按 OpenAI 口径(除 Anthropic
+    外的适配器都是这一口径)。
+    """
+    if provider == "anthropic":
+        return input_t + cache_creation_t + cache_read_t
+    return input_t
+
+
 #: Stream HX-1 (Mini-ADR HX-A6) — estimated prompt tokens, accumulated
 #: alongside the actual counts above so dashboards can derive the
 #: estimator drift ratio in PromQL:
@@ -93,7 +119,8 @@ _ew_token_estimated_total = expert_work_counter(
 )
 
 #: B-104 —— 漂移比的分母:**同一批**调用(带估算器、非缓存命中、有 prompt 视图)的上游
-#: 实报 prompt tokens(input + cache_creation + cache_read)。原来分母用
+#: 实报 prompt tokens(B-142 起按 :func:`_prompt_tokens` 的厂商口径;原来一律
+#: input + cache_creation + cache_read,OpenAI 兼容厂商上把命中缓存的部分算了两遍)。原来分母用
 #: ``expert_work_llm_token_usage_total`` 的全部调用,而只有主循环带估算器 —— 看图、规划、
 #: 压缩、记忆、评审、重排序这些不估算的调用只进分母,比值被系统性压低。
 _ew_token_estimate_actual_total = expert_work_counter(
@@ -233,6 +260,18 @@ class TokenUsageMiddleware:
                     type=_TOKEN_TYPE_CACHE_READ,
                     usage_kind=self.usage_kind,
                 ).inc(cache_read_t)
+            prompt_t = _prompt_tokens(provider, input_t, cache_creation_t, cache_read_t)
+            for cache_label, value in (
+                ("read", cache_read_t),
+                ("uncached", max(0, prompt_t - cache_read_t)),
+            ):
+                _llm_prompt_tokens_total.labels(
+                    tenant_id=tenant_label,
+                    agent_name=self.agent_name,
+                    model=model,
+                    usage_kind=self.usage_kind,
+                    cache=cache_label,
+                ).inc(value)
         except Exception:
             logger.warning(
                 "token_usage.counter_failed tenant=%s agent=%s model=%s",
@@ -262,7 +301,7 @@ class TokenUsageMiddleware:
                         agent_name=self.agent_name,
                         model=model,
                         usage_kind=self.usage_kind,
-                    ).inc(input_t + cache_creation_t + cache_read_t)
+                    ).inc(_prompt_tokens(provider, input_t, cache_creation_t, cache_read_t))
                 except Exception:
                     logger.warning(
                         "token_usage.estimate_failed tenant=%s agent=%s model=%s",

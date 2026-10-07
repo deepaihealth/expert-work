@@ -490,3 +490,93 @@ async def test_drift_denominator_skips_calls_without_an_estimator() -> None:
     tenant = str(tenant_id)
     assert _counter_sample(tenant, "b104-no-estimator", "qwen-max", "input") == 100
     assert _actual_sample(tenant, "b104-no-estimator", "qwen-max") == 0
+
+
+# ---------------------------------------------------------------------------
+# B-142 — prompt-cache hit counter (provider-aware prompt size)
+# ---------------------------------------------------------------------------
+
+
+def _prompt_sample(tenant_id: str, agent_name: str, model: str, cache: str) -> float:
+    value = REGISTRY.get_sample_value(
+        "expert_work_llm_prompt_tokens_total",
+        {
+            "tenant_id": tenant_id,
+            "agent_name": agent_name,
+            "model": model,
+            "usage_kind": "conversation",
+            "cache": cache,
+        },
+    )
+    return value or 0.0
+
+
+def _cached_ctx(tenant_id: UUID, details: dict[str, int], input_tokens: int) -> MiddlewareContext:
+    return MiddlewareContext(
+        payload={
+            "tenant_id": tenant_id,
+            "prompt_messages": [HumanMessage(content="abcd")],
+            "response": AIMessage(
+                content="ok",
+                usage_metadata={
+                    "input_tokens": input_tokens,
+                    "output_tokens": 10,
+                    "total_tokens": input_tokens + 10,
+                    "input_token_details": details,
+                },
+            ),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_counter_openai_compatible_input_already_includes_cache() -> None:
+    """B-142 —— OpenAI 兼容口径(glm / kimi / deepseek …):``prompt_tokens`` 已含
+    ``cached_tokens``,命中 870、未命中 = 1000 - 870。"""
+    mw = TokenUsageMiddleware(
+        store=InMemoryTokenUsageStore(),
+        agent_name="b142-oa",
+        agent_version="1.0.0",
+        model="glm-5.3",
+        provider="zhipu",
+    )
+    tenant_id = uuid4()
+    await mw(_cached_ctx(tenant_id, {"cache_read": 870}, input_tokens=1000), _noop)
+    assert _prompt_sample(str(tenant_id), "b142-oa", "glm-5.3", "read") == 870
+    assert _prompt_sample(str(tenant_id), "b142-oa", "glm-5.3", "uncached") == 130
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_counter_anthropic_reports_cache_separately() -> None:
+    """B-142 —— Anthropic 口径:``input_tokens`` 不含缓存读写,提示词总量 = 三者相加。"""
+    mw = TokenUsageMiddleware(
+        store=InMemoryTokenUsageStore(),
+        agent_name="b142-an",
+        agent_version="1.0.0",
+        model="claude-sonnet-4-6",
+        provider="anthropic",
+    )
+    tenant_id = uuid4()
+    await mw(
+        _cached_ctx(tenant_id, {"cache_creation": 800, "cache_read": 1200}, input_tokens=200),
+        _noop,
+    )
+    assert _prompt_sample(str(tenant_id), "b142-an", "claude-sonnet-4-6", "read") == 1200
+    assert _prompt_sample(str(tenant_id), "b142-an", "claude-sonnet-4-6", "uncached") == 1000
+
+
+@pytest.mark.asyncio
+async def test_drift_denominator_does_not_double_count_cached_tokens() -> None:
+    """B-142 —— 漂移比分母原来一律 input + cache_creation + cache_read;OpenAI 兼容口径下
+    input 已含缓存,命中率 87% 时分母接近翻倍。"""
+    mw = TokenUsageMiddleware(
+        store=InMemoryTokenUsageStore(),
+        agent_name="b142-drift",
+        agent_version="1.0.0",
+        model="glm-5.3",
+        provider="zhipu",
+        estimator=_FixedEstimator(),
+    )
+    tenant_id = uuid4()
+    await mw(_cached_ctx(tenant_id, {"cache_read": 80}, input_tokens=100), _noop)
+    assert _actual_sample(str(tenant_id), "b142-drift", "glm-5.3") == 100

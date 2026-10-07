@@ -1,0 +1,23 @@
+# promtool unit test for the B-142 prompt-cache hit ratio recording rule.
+# Run: promtool test rules tools/observability/rules/tests/sli_cache_test.yml
+
+rule_files:
+  - ../sli.yml
+
+evaluation_interval: 1m
+
+tests:
+  # 3 of every 4 prompt tokens served from cache → ratio 0.75 (swapping the labels would give 0.25).
+  - interval: 1m
+    name: cache hit ratio is read / (read + uncached)
+    input_series:
+      - series: 'expert_work_llm_prompt_tokens_total{agent_name="eval-ahp",model="glm-5.3",usage_kind="conversation",cache="read",tenant_id="t"}'
+        values: "0+750x90"
+      - series: 'expert_work_llm_prompt_tokens_total{agent_name="eval-ahp",model="glm-5.3",usage_kind="conversation",cache="uncached",tenant_id="t"}'
+        values: "0+250x90"
+    promql_expr_test:
+      - expr: expert_work:llm_prompt_cache_hit:ratio1h
+        eval_time: 70m
+        exp_samples:
+          - labels: 'expert_work:llm_prompt_cache_hit:ratio1h{agent_name="eval-ahp",model="glm-5.3",usage_kind="conversation"}'
+            value: 0.75

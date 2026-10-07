@@ -247,6 +247,41 @@
           "legendFormat": "fail_open"
         }
       ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "LLM prompt-cache hit ratio (by agent \u00b7 model, trailing 24h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "expert-work-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "expert-work-prometheus"
+          },
+          "expr": "sum by (agent_name, model) (increase(expert_work_llm_prompt_tokens_total{cache=\"read\"}[24h])) / sum by (agent_name, model) (increase(expert_work_llm_prompt_tokens_total[24h]))",
+          "legendFormat": "{{agent_name}} \u00b7 {{model}}"
+        }
+      ]
     }
   ]
 }
