@@ -22,7 +22,7 @@ from __future__ import annotations
 import importlib
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import pytest
@@ -37,10 +37,13 @@ from langgraph.graph import END, START, StateGraph
 from expert_work.protocol import ApprovalRequest, MemoryItem, Plan, Reflection, SubAgentInvocation
 from expert_work.protocol.plan import PlanStep
 from expert_work.protocol.subagent import SubagentStatus
-from expert_work.runtime.checkpointer import make_checkpointer
+from expert_work.runtime.checkpointer import make_checkpoint_serde, make_checkpointer
 from expert_work.runtime.checkpointer.serde import CHECKPOINT_MSGPACK_ALLOWLIST
 from orchestrator.state import AgentState
 from orchestrator.tools.error_classifier import ClassifiedToolError
+
+if TYPE_CHECKING:
+    from testcontainers.postgres import PostgresContainer
 
 _NOW = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
 _UUID = UUID("00000000-0000-0000-0000-000000000161")
@@ -148,29 +151,61 @@ def _assert_types_survived(loaded: dict[str, Any], expected: dict[str, Any]) -> 
     assert type(loaded["subagent_invocations"][0].status) is SubagentStatus
 
 
+async def _round_trip(saver: BaseCheckpointSaver[Any], thread_id: str) -> dict[str, Any]:
+    """``aput`` a checkpoint holding every custom type, ``aget_tuple`` it back."""
+    values = _state_values()
+    versions = {ch: saver.get_next_version(None, None) for ch in values}
+    config: Any = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    checkpoint: Any = {
+        "v": 4,
+        "id": "1ef00000-0000-6000-8000-000000000161",
+        "ts": _NOW.isoformat(),
+        "channel_values": values,
+        "channel_versions": versions,
+        "versions_seen": {},
+    }
+    stored = await saver.aput(config, checkpoint, {"step": 1}, versions)
+    fetched = await saver.aget_tuple(stored)
+    assert fetched is not None
+    loaded: dict[str, Any] = fetched.checkpoint["channel_values"]
+    return loaded
+
+
 @pytest.mark.usefixtures("strict_msgpack")
 async def test_factory_saver_round_trips_state_types_under_strict_msgpack(
     blocked_types: list[str],
 ) -> None:
     """Serializer level: write a checkpoint holding every custom type through
     the memory saver the factory builds, read it back, get the same objects."""
-    values = _state_values()
     async with make_checkpointer("memory") as saver:
-        config: Any = {"configurable": {"thread_id": "b161", "checkpoint_ns": ""}}
-        checkpoint: Any = {
-            "v": 4,
-            "id": "c-1",
-            "ts": _NOW.isoformat(),
-            "channel_values": values,
-            "channel_versions": dict.fromkeys(values, 1),
-            "versions_seen": {},
-        }
-        stored = await saver.aput(config, checkpoint, {"step": 1}, dict.fromkeys(values, 1))
-        fetched = await saver.aget_tuple(stored)
-
-    assert fetched is not None
-    _assert_types_survived(fetched.checkpoint["channel_values"], values)
+        loaded = await _round_trip(saver, "b161")
+    _assert_types_survived(loaded, _state_values())
     assert blocked_types == []
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("strict_msgpack")
+async def test_postgres_saver_round_trips_state_types_under_strict_msgpack(
+    postgres_container: PostgresContainer, blocked_types: list[str]
+) -> None:
+    """Same, through real Postgres blobs — the production backend."""
+    dsn = str(postgres_container.get_connection_url()).replace("+psycopg2", "")
+    async with make_checkpointer("postgres", dsn) as saver:
+        loaded = await _round_trip(saver, "b161-pg")
+    _assert_types_survived(loaded, _state_values())
+    assert blocked_types == []
+
+
+def test_written_bytes_unchanged_so_either_image_reads_the_other() -> None:
+    """Rollback: the allowlist is a load-time policy only. The new serializer
+    writes the same bytes the default one does, an old image (default,
+    permissive serializer) reads what the new one wrote, and vice versa."""
+    new, old = make_checkpoint_serde(), JsonPlusSerializer()
+    for channel, value in _state_values().items():
+        written = new.dumps_typed(value)
+        assert written == old.dumps_typed(value), channel
+        assert old.loads_typed(written) == value, channel
+        assert new.loads_typed(old.dumps_typed(value)) == value, channel
 
 
 def _write_state(_state: AgentState) -> dict[str, Any]:
