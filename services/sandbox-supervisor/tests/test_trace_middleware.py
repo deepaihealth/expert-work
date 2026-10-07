@@ -23,7 +23,13 @@ from expert_work.common.observability import (
     init_tracing,
     inject_context,
 )
-from sandbox_supervisor.trace_middleware import TRACE_ID_HEADER, TraceContextMiddleware
+from sandbox_supervisor.app import create_app
+from sandbox_supervisor.settings import SandboxSupervisorSettings
+from sandbox_supervisor.trace_middleware import (
+    NATIVE_TELEMETRY_OFF,
+    TRACE_ID_HEADER,
+    TraceContextMiddleware,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -42,7 +48,7 @@ def tracing_setup() -> Iterator[None]:
 
 
 def _probe_app() -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(telemetry=NATIVE_TELEMETRY_OFF)
     app.add_middleware(TraceContextMiddleware)
 
     @app.get("/probe")
@@ -83,3 +89,26 @@ async def test_no_traceparent_starts_fresh_root(tracing_setup: None) -> None:
     server_trace_id = resp.json()["trace_id"]
     assert server_trace_id is not None and server_trace_id != "0" * 32
     assert resp.headers[TRACE_ID_HEADER] == server_trace_id
+
+
+async def test_real_app_opens_no_fastapi_native_spans() -> None:
+    """FastAPI 0.142 instruments itself once a global tracer provider exists;
+    ``create_app`` turns that off (our ``TraceContextMiddleware`` owns the span)."""
+    exporter = InMemorySpanExporter()
+    provider = init_tracing(
+        service_name="supervisor-trace-test",
+        env="test",
+        span_processor=SimpleSpanProcessor(exporter),
+    )
+    try:
+        app = create_app(SandboxSupervisorSettings(), enable_reaper=False)
+        async with _client(app) as client:
+            await client.get("/no-such-route")
+        scopes = {
+            s.instrumentation_scope.name
+            for s in exporter.get_finished_spans()
+            if s.instrumentation_scope is not None
+        }
+        assert "fastapi" not in scopes
+    finally:
+        provider.shutdown()

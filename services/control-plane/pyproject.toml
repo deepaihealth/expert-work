@@ -29,7 +29,7 @@ dependencies = [
     # (0.137.x 只有懒挂载、没有替代枚举口,是个两头不着的空档)。
     # 自审全部收在 tests/_route_audit.py 一处,枚举空了会红而不是静默变绿,
     # 所以这里不再压 minor 上界(ROADMAP X-12)。
-    "fastapi>=0.138,<1",
+    "fastapi>=0.142.1,<1",
     "uvicorn[standard]>=0.32,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",

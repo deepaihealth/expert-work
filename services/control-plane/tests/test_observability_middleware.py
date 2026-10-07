@@ -11,7 +11,11 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from starlette.responses import JSONResponse
 
 from control_plane.middleware import ObservabilityMiddleware
-from control_plane.middleware.observability import TRACE_ID_HEADER, _request_total
+from control_plane.middleware.observability import (
+    NATIVE_TELEMETRY_OFF,
+    TRACE_ID_HEADER,
+    _request_total,
+)
 from expert_work.common.observability import init_tracing
 
 
@@ -29,7 +33,7 @@ def tracer_provider() -> TracerProvider:
 
 
 def _build_app() -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(telemetry=NATIVE_TELEMETRY_OFF)
     app.add_middleware(ObservabilityMiddleware)
 
     @app.get("/ping")
@@ -85,7 +89,7 @@ async def test_span_records_status_code(tracer_provider: TracerProvider) -> None
 
 def _build_probe_app() -> FastAPI:
     """App shaped like the real control plane: probes + scrape + one API route."""
-    app = FastAPI()
+    app = FastAPI(telemetry=NATIVE_TELEMETRY_OFF)
     app.add_middleware(ObservabilityMiddleware)
 
     @app.get("/healthz/live")
@@ -165,3 +169,25 @@ async def test_probe_paths_still_counted_in_request_metrics(
         await client.get("/healthz/live")
 
     assert _request_total.labels(**labels)._value.get() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_real_app_opens_no_fastapi_native_spans(
+    tracer_provider: TracerProvider, client: AsyncClient
+) -> None:
+    """FastAPI 0.142 ships its own OTel instrumentation, on by default once a
+    global tracer provider exists: three extra spans per request (route span +
+    ``fastapi.endpoint`` / ``fastapi.dependencies``), probes included, plus its
+    own HTTP metrics, exception logs with stack traces and an OTLP exporter from
+    ``OTEL_EXPORTER_OTLP_*``. We already trace requests in
+    ``ObservabilityMiddleware``; ``create_app`` turns the native layer off."""
+    exporter: InMemorySpanExporter = tracer_provider.test_exporter  # type: ignore[attr-defined]
+    exporter.clear()
+    await client.get("/healthz/live")
+    await client.get("/v1/agents")
+    scopes = {
+        s.instrumentation_scope.name
+        for s in exporter.get_finished_spans()
+        if s.instrumentation_scope is not None
+    }
+    assert "fastapi" not in scopes
