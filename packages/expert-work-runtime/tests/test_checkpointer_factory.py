@@ -11,9 +11,12 @@ from typing import Any
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.serde.event_hooks import SerdeEvent, register_serde_event_listener
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from expert_work.protocol import Plan
+from expert_work.protocol.plan import PlanStep
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.checkpointer.factory import _build_checkpointer_pool
 
@@ -120,3 +123,43 @@ async def test_postgres_factory_opens_pool_and_closes_on_exit(
         assert inner.conn is fake_pool
         assert events == ["open(wait=True)", "setup"]
     assert events == ["open(wait=True)", "setup", "close"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "postgres"])
+async def test_factory_savers_carry_the_msgpack_allowlist(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-161 — both backends load our state types as registered, not via the
+    "unregistered type" path that strict msgpack turns into a bare ``dict``."""
+    from expert_work.runtime.checkpointer import factory
+
+    class FakePool:
+        async def open(self, wait: bool = False) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    async def fake_setup(saver: object) -> None:
+        pass
+
+    fake_pool: Any = FakePool()
+    monkeypatch.setattr(factory, "_build_checkpointer_pool", lambda dsn: fake_pool)
+    monkeypatch.setattr(factory, "setup_with_retry", fake_setup)
+
+    unregistered: list[str] = []
+
+    def _listener(event: SerdeEvent) -> None:
+        if event["kind"] in ("msgpack_blocked", "msgpack_unregistered_allowed"):
+            unregistered.append(f"{event['module']}.{event['name']}")
+
+    plan = Plan(goal="g", steps=(PlanStep(id="1", description="d"),))
+    async with factory.make_checkpointer(backend, _DSN) as cp:  # type: ignore[arg-type]
+        serde = cp._inner.serde  # type: ignore[attr-defined]
+        unregister = register_serde_event_listener(_listener)
+        try:
+            assert serde.loads_typed(serde.dumps_typed(plan)) == plan
+        finally:
+            unregister()
+    assert unregistered == []

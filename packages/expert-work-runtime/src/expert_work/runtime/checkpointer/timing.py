@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Collection, Iterator, Sequence
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -167,3 +167,15 @@ class TimingCheckpointSaver(BaseCheckpointSaver[Any]):
 
     def get_next_version(self, current: Any, channel: None = None) -> Any:
         return self._inner.get_next_version(current, channel)
+
+    def with_allowlist(
+        self, extra_allowlist: Collection[tuple[str, ...]]
+    ) -> BaseCheckpointSaver[Any]:
+        # B-161 — strict-msgpack ``StateGraph.compile`` registers the state
+        # schema's types through this. The inherited version swaps the
+        # serde on a copy of *this* wrapper, but every IO call goes to
+        # ``_inner`` — widen the inner saver's serializer instead.
+        inner = self._inner.with_allowlist(extra_allowlist)
+        if inner is self._inner:
+            return self
+        return TimingCheckpointSaver(inner)
