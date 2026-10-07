@@ -174,8 +174,14 @@ async def run_case_once(
             upload_ids.append(upload_id)
         turns: list[TurnRecord] = []
         for index, turn in enumerate(case.turns, start=1):
+            turn_uploads = upload_ids if index == 1 else []
+            for name in turn.fixtures:
+                upload_id, session_id = await client.upload(
+                    agent, user_id, name, (fixtures_dir / name).read_bytes(), session_id
+                )
+                turn_uploads = [*turn_uploads, upload_id]
             record, sid = await client.run_turn(
-                agent, user_id, session_id, turn.prompt, upload_ids if index == 1 else [], index
+                agent, user_id, session_id, turn.prompt, turn_uploads, index
             )
             session_id = session_id or sid
             turns.append(record)

@@ -126,8 +126,15 @@ def test_every_fixture_used_by_a_case_is_an_allowed_upload_type() -> None:
     from behavior_client import content_type_for
 
     for case in load_cases(CASES_DIR):
-        for name in case.fixtures:
+        for name in [*case.fixtures, *(n for t in case.turns for n in t.fixtures)]:
             content_type_for(name)  # raises ValueError for types the upload API rejects
+
+
+def test_turn_fixtures_exist() -> None:
+    for case in load_cases(CASES_DIR):
+        for turn in case.turns:
+            for name in turn.fixtures:
+                assert (FIXTURES_DIR / name).is_file(), (case.id, name)
 
 
 @pytest.mark.parametrize(

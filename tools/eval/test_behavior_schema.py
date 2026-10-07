@@ -201,6 +201,12 @@ def test_indeterminate_result_round_trips(tmp_path: Path) -> None:
     assert read_results(out)[1] == [result]
 
 
+def test_turns_may_bring_their_own_fixtures(tmp_path: Path) -> None:
+    text = _CASE.replace("  - prompt: 改一下\n", "  - prompt: 改一下\n  - prompt: 再改\n    fixtures: [b.md]\n")
+    case = load_case(_write(tmp_path, "g99-sample.yaml", text))
+    assert case.turns[0].fixtures == [] and case.turns[1].fixtures == ["b.md"]
+
+
 def test_line_count_check_loads(tmp_path: Path) -> None:
     ok = _CASE.replace(
         "{type: completed}",

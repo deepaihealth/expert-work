@@ -210,6 +210,9 @@ Check = Annotated[
 
 class Turn(_Strict):
     prompt: str = Field(min_length=1)
+    #: 这一轮才上传、才附上的开局文件(B-141 c04:后几轮才拿到的补充资料,模型不能在第 1 轮
+    #: 一口气全读进来)。用例级 ``fixtures`` 仍在第 1 轮之前上传。
+    fixtures: list[str] = Field(default_factory=list)
 
 
 class Case(_Strict):

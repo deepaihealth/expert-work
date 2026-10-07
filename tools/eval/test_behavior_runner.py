@@ -334,6 +334,36 @@ async def test_required_compaction_that_happened_is_scored(tmp_path: Path) -> No
     assert [t["compactions"] for t in res.turn_metrics] == [0, 2]
 
 
+class NumberedUploads(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.n = 0
+
+    async def upload(
+        self, agent: str, user_id: str, filename: str, data: bytes, session_id: str | None
+    ) -> tuple[str, str]:
+        await super().upload(agent, user_id, filename, data, session_id)
+        self.n += 1
+        return f"upl_{self.n}", "s1"
+
+
+@pytest.mark.asyncio
+async def test_turn_fixtures_are_uploaded_into_the_session_before_their_turn(
+    tmp_path: Path,
+) -> None:
+    fx = _fixtures(tmp_path)
+    (fx / "b.md").write_text("补充\n", encoding="utf-8")
+    client = NumberedUploads()
+    case = _case(turns=[{"prompt": "一"}, {"prompt": "二", "fixtures": ["b.md"]}])
+    await runner.run_case_once(client, case, rep=1, label="b", agent_map={}, fixtures_dir=fx)
+    kinds = [(c[0], c[1][1] if c[0] == "upload" else c[1][-1]) for c in client.calls]
+    assert kinds[:4] == [("upload", "a.md"), ("run_turn", 1), ("upload", "b.md"), ("run_turn", 2)]
+    uploads = [c[1] for c in client.calls if c[0] == "upload"]
+    assert uploads[1] == ("eval-general", "b.md", "s1")  # 传进已有会话
+    runs = [c[1] for c in client.calls if c[0] == "run_turn"]
+    assert runs[0][3] == ["upl_1"] and runs[1][3] == ["upl_2"]
+
+
 @pytest.mark.asyncio
 async def test_cases_without_the_flag_ignore_compaction(tmp_path: Path) -> None:
     res = await runner.run_one(
