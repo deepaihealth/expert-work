@@ -156,5 +156,5 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 **背景**:10-06 B-140 修后全量(`7e865654`),h07 第 2 次:第 2 轮 `edit_file` 匹配失败、模型改用 `exec_python` 改写成功(换工具还不上,已知局限),第 2 轮判没做完;**第 3 轮零失败也 `completed=false`**。`unresolved_failures` 通道没有 reducer、每轮图输入又没写它,上一轮的欠账一直留在检查点里。修法:`build_run_graph_input` / `replay_graph_input` 每轮写空列表,与审批三件套同一处。
 
-- [ ] **13.1 B-140 对照**:`behavior_runner.py --only h07-three-revisions,g09-five-follow-ups,g06-new-task-replaces-old-plan,h02-revise-breakfast --repeats 3`。判据:某一轮判没做完时,后面零失败的轮次判做完了(逐轮看 `agent_run.completed`)。**没修好时**:同一会话里第一次 `completed=false` 之后每一轮都是 false。
+- [x] **13.1 B-140 对照**:`behavior_runner.py --only h07-three-revisions,g09-five-follow-ups,g06-new-task-replaces-old-plan,h02-revise-breakfast --repeats 3`。判据:某一轮判没做完时,后面零失败的轮次判做完了(逐轮看 `agent_run.completed`)。**没修好时**:同一会话里第一次 `completed=false` 之后每一轮都是 false。 **10-07 过(`880b5a46`)**:四个多轮用例 × 3 共 12 次全过,但工具零失败、验不出;补做必触发探针 × 3(第 1 轮 `edit_file` 改不存在的文字必失败并如实说明,第 2 轮不调工具):3/3 第 1 轮 `completed=false`、第 2 轮 `completed=true`。
 - [ ] **13.2 库里抽查**:发测试后 24h,同一 `thread_id` 里 `completed=false` 的 run,逐条确认本轮 `run_event` 里确有没还上的工具失败。
