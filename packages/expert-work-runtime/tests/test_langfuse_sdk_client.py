@@ -244,7 +244,8 @@ def test_factory_complete_settings_build_sdk_client(
     mask = kwargs.pop("mask")
     assert callable(mask)
     # B-153 follow-up — the export-failure counting seam.
-    assert isinstance(kwargs.pop("span_exporter"), FailureCountingSpanExporter)
+    span_exporter = kwargs.pop("span_exporter")
+    assert isinstance(span_exporter, FailureCountingSpanExporter)
     assert kwargs == {
         "public_key": "pk",
         "secret_key": "sk",
