@@ -68,6 +68,19 @@ test("create modal opens the manifest editor on the Form tab", async ({ page }) 
   await expect(page.getByTestId("manifest-yaml-view")).toBeVisible();
 });
 
+test("YAML view renders Monaco from the local bundle (no CDN request)", async ({ page }) => {
+  // B-152: Monaco used to be fetched from cdn.jsdelivr.net at runtime.
+  const cdnRequests: string[] = [];
+  page.on("request", (req) => {
+    if (new URL(req.url()).hostname !== "localhost") cdnRequests.push(req.url());
+  });
+  await page.getByTestId("agents-create").click();
+  await expect(page.getByTestId("manifest-editor-create")).toBeVisible();
+  await page.getByTestId("cfg-yaml-toggle").click();
+  await expect(page.getByTestId("manifest-yaml-view").locator(".monaco-editor")).toBeVisible();
+  expect(cdnRequests.filter((u) => u.includes("jsdelivr"))).toEqual([]);
+});
+
 test("create modal passes axe (serious + critical)", async ({ page }) => {
   await page.getByTestId("agents-create").click();
   await expect(page.getByTestId("manifest-editor-create")).toBeVisible();
