@@ -191,4 +191,3 @@ async def test_real_app_opens_no_fastapi_native_spans(
         if s.instrumentation_scope is not None
     }
     assert "fastapi" not in scopes
-

@@ -112,4 +112,3 @@ async def test_real_app_opens_no_fastapi_native_spans() -> None:
         assert "fastapi" not in scopes
     finally:
         provider.shutdown()
-
