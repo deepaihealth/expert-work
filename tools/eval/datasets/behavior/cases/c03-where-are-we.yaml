@@ -1,0 +1,44 @@
+id: c03-where-are-we
+agent: eval-compress
+shape: B-141 压缩后说不清做到哪一步
+requires_compaction: true
+# 8 步任务,一轮一步,第 2~6 轮只说「继续做下一步」(不给步号):压缩之后,下一步是第几步只能从
+# 摘要、末尾 6 条消息或工作区里找。第 7 轮问做到哪一步了。8 步的清单在第 1 轮用户消息里,
+# 那条在压缩器原样保留的开头 4 条里;被摘要的是「做完了哪几步」。
+# 不用 update_plan:计划每次调用都单独注入、不经摘要(CM-0),用了就测不到摘要。
+# 尺寸(o200k,test_behavior_dataset.py 复核):每部分约 4,800~5,100 token、7,400 字符。
+# 门槛 3 万,S(系统提示词)按 1,000~5,000 估:
+#   第 k 步读完后 ≈ S + 约 500(提示词)+ k × (约 5,000 + 约 300)
+#   S=1,000:第 6 步读完 ≈ 31,500 越线;S=5,000:第 5 步读完 ≈ 32,000 越线、第 4 步 ≈ 27,000 不越。
+# → 在第 5~6 步越线,第 7 轮的问答在压缩之后。
+# 压缩后剩:S + 头 4 条(含第 1 部分约 5,000)+ 摘要 + 尾 6 条(最多 3 部分约 15,400)< 3 万。
+fixtures: [manual-part-1.md, manual-part-2.md, manual-part-3.md, manual-part-4.md, manual-part-5.md, manual-part-6.md, manual-part-7.md, manual-part-8.md]
+turns:
+  - prompt: |
+      工作区 uploads/ 下有一份设备维护手册(合成数据),分成 8 个部分 manual-part-1.md 到 manual-part-8.md。
+      我们分 8 步把它整理成要点,第 N 步是:
+      - 用 read_file 读 uploads/manual-part-N.md;
+      - 把这一部分的 3 条要点写进工作区的 notes-N.md;
+      - 在工作区的 progress.md 末尾追加一行「第 N 步完成」(只追加这一行,不改别的行)。
+      不要用 update_plan,每一轮只做一步,做完这一步就停下来等我。现在做第 1 步。
+  - prompt: 继续做下一步。
+  - prompt: 继续做下一步。
+  - prompt: 继续做下一步。
+  - prompt: 继续做下一步。
+  - prompt: 继续做下一步。
+  - prompt: |
+      先别继续。现在做到哪一步了、下一步要做什么?请严格按下面两行的格式回答,不要多写:
+      已完成:N 步
+      下一步:第 M 步
+checks:
+  - {type: completed}
+  - {type: final_text_regex, pattern: '已完成\s*[::]\s*6\s*步'}
+  - {type: final_text_regex, pattern: '下一步\s*[::]\s*第\s*7\s*步'}
+  # 工作区实际:正好 6 行进度,第 1~6 步各一次(重做一步多一行、跳过一步少一行)
+  - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*[1-8]\s*步完成', count: 6}
+  - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*1\s*步完成\s*$', count: 1}
+  - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*2\s*步完成\s*$', count: 1}
+  - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*3\s*步完成\s*$', count: 1}
+  - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*4\s*步完成\s*$', count: 1}
+  - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*5\s*步完成\s*$', count: 1}
+  - {type: workspace_file_line_count, path: progress.md, pattern: '^\s*第\s*6\s*步完成\s*$', count: 1}

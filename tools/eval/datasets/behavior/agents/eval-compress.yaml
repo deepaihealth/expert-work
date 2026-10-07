@@ -1,0 +1,59 @@
+# B-141 / B-143 压缩评测智能体 —— eval-general 的副本,只改下面标出的几处,让「模型写摘要」
+# 成为唯一一道上下文闸,并在 3 万 token 就触发(设计稿 2026-10-07-b141-b143 §4.2)。
+# 用控制台登录态导入测试环境的对接方租户(规格 §8;新建智能体只能走控制台平面)。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-compress
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-141 压缩摘要评测用的通用智能体(合成任务专用,压缩门槛 3 万 token)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 32768  # 同 eval-general
+  system_prompt:
+    template: |
+      你是一个通用的办公助手,在工作区里读写文件、运行脚本,完成用户交代的任务。
+      做完后用一两句话说明结果;做不到的事情如实说明原因,不要编造。
+  tools:
+    - { type: builtin, name: read_file }
+    - { type: builtin, name: write_file }
+    - { type: builtin, name: edit_file }
+    - { type: builtin, name: search_files }
+    - { type: builtin, name: exec_python }
+    - { type: builtin, name: bash }
+    - { type: builtin, name: save_artifact }
+  # 与 eval-general 不同 ①:c01 一轮里逐份处理 10 份文件,约 25~35 步,默认 30 步会截停。
+  workflow:
+    max_iterations: 80
+  policies:
+    # 与 eval-general 不同 ②:每次模型调用都带着 2~3 万 token 的上下文,c01 一轮约 30 次调用
+    # ≈ 90 万;40 万会在任务中途按 token_budget 截停、判成未完成。取值同 eval-ahp,只作失控兜底。
+    token_budget: 3000000
+    # 与 eval-general 不同 ③:门槛 = min(窗口 100 万 × 0.7, 本值) = 30000。
+    context_compression:
+      absolute_cap_tokens: 30000
+    # 与 eval-general 不同 ④:关掉另外两道闸,摘要成为唯一一道。
+    # tool_result_prune 关掉后 agent_factory 不建 ToolResultPruner,跨轮清理(cross_turn)
+    # 也在它里面,一并关掉。
+    working_memory:
+      enabled: false
+    tool_result_prune:
+      enabled: false
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp
+      persistent_workspace: true

@@ -1,0 +1,34 @@
+id: c04-export-keeps-revisions
+agent: eval-compress
+shape: B-141 压缩后导出丢掉前几轮的修改
+requires_compaction: true
+# 健康方案形态,但跑在 eval-compress(通用智能体,没有 eval-ahp 的 health-plan-report / docx 技能):
+# 方案写成 Markdown、导出用 save_artifact 交付 .md。只保留一个压缩评测智能体;要测 docx 形态得另建
+# 一个基于 eval-ahp 的压缩副本。客户资料全部虚构(同 h 系列的王小雨)。
+# 尺寸(o200k,test_behavior_dataset.py 复核):体检报告 4 份各约 4,800 token、7,300 字符;
+# 运动记录约 5,400、睡眠记录约 4,900。门槛 3 万,S(系统提示词)按 1,000~5,000 估:
+#   第 1 轮读完 4 份 ≈ S + 约 300 + 4 × (4,800 + 约 300) = S + 约 20,700 —— 第 1 轮不越线
+#   第 2 轮读完运动记录再 + 约 5,700;第 3 轮读完睡眠记录再 + 约 5,200
+#   S=1,000:第 3 轮越线(≈ 32,600);S=5,000:第 2 轮越线(≈ 31,400)。
+# → 压缩发生在第 2 或第 3 轮(两次修改之间或之后),第 4 轮导出在压缩之后。
+# 压缩后剩:S + 头 4 条(含第 1 份约 4,800)+ 摘要 + 尾 6 条(最多 3 份约 16,200)< 3 万。
+fixtures: [checkup-part-1.md, checkup-part-2.md, checkup-part-3.md, checkup-part-4.md, exercise-log.md, sleep-log.md]
+turns:
+  - prompt: |
+      uploads/ 下的 checkup-part-1.md 到 checkup-part-4.md 是客户王小雨(虚构,女,42 岁)的年度体检报告,分成了 4 份。
+      请依次用 read_file 读完这 4 份,然后在工作区写一份健康管理方案 plan.md(Markdown),
+      包含「## 饮食」「## 运动」「## 作息」三节,针对报告里的异常指标给建议。
+  - prompt: |
+      客户补充了近四个月的运动记录 uploads/exercise-log.md,先读一下。
+      然后把 plan.md 的运动部分改成每周游泳两次、每次 45 分钟,只改运动这一节。
+  - prompt: |
+      客户又补充了睡眠记录 uploads/sleep-log.md,先读一下。
+      然后把 plan.md 的作息部分改成 23:00 前入睡,只改作息这一节。
+  - prompt: |
+      方案定稿,请导出:把 plan.md 的最新内容另存为 final-plan.md,第一行加上「# 王小雨 健康管理方案(最终版)」,
+      然后用 save_artifact 交付 final-plan.md。
+checks:
+  - {type: completed}
+  - {type: artifact_exists, name: final-plan.md}
+  # 第 2、3 轮的修改都还在
+  - {type: artifact_contains, name: final-plan.md, all: [最终版, '## 饮食', '## 运动', '## 作息', 游泳, '23:00']}

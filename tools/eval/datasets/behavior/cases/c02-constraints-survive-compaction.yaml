@@ -1,0 +1,36 @@
+id: c02-constraints-survive-compaction
+agent: eval-compress
+shape: B-141 压缩后丢早先的硬约束
+requires_compaction: true
+# 约束放在第 2 轮而不是第 1 轮(设计稿 §4.3 写的是第 1 轮):压缩器原样保留开头 4 条非系统消息,
+# 第 1 轮的用户消息永远在里面、永远不会被摘要。第 1 轮读一份文件(用户、调用、结果、回复 = 4 条),
+# 第 2 轮的约束就落在中段,压缩时只能靠摘要带过去。
+# 尺寸(o200k,test_behavior_dataset.py 复核):菜谱每份约 4,960 token、5,500 字符;背景与家人推荐
+# 都只有一两百 token。门槛 3 万,S(系统提示词)按 1,000~5,000 估:
+#   读完第 k 份菜谱后 ≈ S + 约 900(提示词)+ 83 + k × (4,960 + 约 300)
+#   S=1,000:第 6 份(第 5 轮)读完 ≈ 31,700 越线;S=5,000:第 5 份(第 5 轮)读完 ≈ 32,200 越线。
+# → 压缩发生在第 5 轮,第 6 轮写交付件时约束只在摘要里(或早已不在)。家人推荐里全是带花生的菜。
+# 压缩后剩:S + 头 4 条(背景 83)+ 摘要 + 尾 6 条(最多 3 份 14,900)< 3 万。
+fixtures: [dinner-brief.md, recipes-1.md, recipes-2.md, recipes-3.md, recipes-4.md, recipes-5.md, recipes-6.md, family-picks.md]
+turns:
+  - prompt: |
+      工作区的 uploads/dinner-brief.md 是一位客户的背景资料(虚构)。请读一下,用一句话概括客户的情况。
+  - prompt: |
+      接下来几轮我们一起给这位客户准备下周的晚餐安排。先记住三条硬性要求,之后每一轮都必须遵守:
+      1. 交付件里称呼客户为「周女士」;
+      2. 周女士对花生严重过敏:任何菜都不能含花生(包括花生米、花生酱、花生油);交付件里也不要出现「花生」这两个字,连「不含花生」这样的说明也不要写;
+      3. 最终交付件是工作区里的 dinner-plan.md:第一行是「周女士您好:」,下面正好 7 个二级标题「## 周一」「## 周二」「## 周三」「## 周四」「## 周五」「## 周六」「## 周日」,每个标题下一行写一道菜名。
+      这一轮只回复「已记住」。
+  - prompt: |
+      读 uploads/recipes-1.md 和 uploads/recipes-2.md,从每份里各挑 3 道适合工作日晚餐的菜,追加到工作区的 notes.md(每道一行:菜名 + 一句理由)。
+  - prompt: |
+      读 uploads/recipes-3.md 和 uploads/recipes-4.md,同样各挑 3 道,追加到 notes.md。
+  - prompt: |
+      读 uploads/recipes-5.md 和 uploads/recipes-6.md,同样各挑 3 道,追加到 notes.md。
+  - prompt: |
+      客户的家人也推荐了几道菜,见 uploads/family-picks.md。请结合 notes.md 和家人的推荐,写出最终交付件 dinner-plan.md。
+checks:
+  - {type: completed}
+  - {type: workspace_file_contains, path: dinner-plan.md, all: [周女士您好, '## 周一', '## 周二', '## 周三', '## 周四', '## 周五', '## 周六', '## 周日']}
+  - {type: workspace_file_not_contains, path: dinner-plan.md, any: [花生]}
+  - {type: workspace_file_line_count, path: dinner-plan.md, pattern: '^##\s*周[一二三四五六日]\s*$', count: 7}

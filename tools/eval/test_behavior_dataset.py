@@ -5,9 +5,12 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
+import pytest
 import yaml
 from behavior_schema import AGENTS_DIR, CASES_DIR, FIXTURES_DIR, load_cases
+from expert_work.protocol.agent_spec import AgentSpec
 
 
 def _make_fixtures_module() -> ModuleType:
@@ -32,12 +35,52 @@ def test_all_cases_load_and_reference_existing_files() -> None:
                 assert (FIXTURES_DIR / fixture).is_file(), (case.id, fixture)
 
 
+def _manifest(code: str) -> dict[str, Any]:
+    raw: dict[str, Any] = yaml.safe_load((AGENTS_DIR / f"{code}.yaml").read_text(encoding="utf-8"))
+    return raw
+
+
 def test_agent_manifests_match_codes() -> None:
-    for code in ("eval-general", "eval-ahp"):
-        manifest = yaml.safe_load((AGENTS_DIR / f"{code}.yaml").read_text(encoding="utf-8"))
+    for code in ("eval-general", "eval-ahp", "eval-compress"):
+        manifest = _manifest(code)
         assert manifest["metadata"]["name"] == code
         assert manifest["spec"]["sandbox"]["filesystem"]["persistent_workspace"] is True
         assert manifest["spec"]["policies"]["token_budget"] > 0
+
+
+@pytest.mark.parametrize("path", sorted(AGENTS_DIR.glob("*.yaml")), ids=lambda p: p.stem)
+def test_agent_manifests_validate_against_the_protocol(path: Path) -> None:
+    # 控制台导入走同一个模型(extra="forbid"):这里不过,导入就是 422
+    AgentSpec.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+
+
+def test_eval_compress_is_eval_general_with_only_the_compression_knobs_changed() -> None:
+    general, compress = _manifest("eval-general"), _manifest("eval-compress")
+    spec = AgentSpec.model_validate(compress).spec
+    assert spec.policies.context_compression.absolute_cap_tokens == 30_000
+    assert spec.policies.working_memory.enabled is False
+    # 关掉它 agent_factory 就不建 ToolResultPruner,跨轮清理(cross_turn)也在它里面
+    assert spec.policies.tool_result_prune.enabled is False
+    for key in ("tenant_config", "model", "system_prompt", "tools", "sandbox"):
+        assert compress["spec"][key] == general["spec"][key], key
+    allowed = {"description", "workflow", "policies"}
+    assert set(compress["spec"]) - set(general["spec"]) <= allowed
+    assert {k for k in general["spec"] if compress["spec"].get(k) != general["spec"][k]} <= allowed
+    assert set(compress["spec"]["policies"]) == {
+        "token_budget",
+        "context_compression",
+        "working_memory",
+        "tool_result_prune",
+    }
+
+
+def test_c01_checks_carry_the_generated_totals() -> None:
+    totals = _make_fixtures_module().c01_totals()
+    [case] = load_cases(CASES_DIR, only=["c01-ten-ledgers-one-by-one"])
+    assert case.fixtures == list(totals)
+    patterns = {getattr(c, "pattern", "") for c in case.checks}
+    for name, total in totals.items():
+        assert f"^\\s*{name.replace('.', chr(92) + '.')},合计={total}\\s*$" in patterns, name
 
 
 def test_committed_fixtures_match_generator() -> None:

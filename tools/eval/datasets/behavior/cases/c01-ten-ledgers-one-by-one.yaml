@@ -1,0 +1,36 @@
+id: c01-ten-ledgers-one-by-one
+agent: eval-compress
+shape: B-141 压缩后丢进度(重做 / 漏做一步)
+requires_compaction: true
+# 尺寸(o200k,test_behavior_dataset.py 复核):每份台账约 4,550 token、6,600 字符(低于
+# 12,000 字符的外置线,read_file 本就不外置)。门槛 3 万 = min(100 万 × 0.7, 30000)。
+# 估算只数消息正文(系统提示词 S + 用户消息 + 工具结果 + 助手文字;工具调用参数不计),
+# S 按 1,000~5,000 估(10-06 基线 g08 首次调用连工具清单约 5,200)。
+#   第 k 份读完后 ≈ S + 400 + k × (4,550 + 每份约 300 的小结果/文字)
+#   S=1,000:k=7 时 ≈ 33,200 越线;S=5,000:k=6 时 ≈ 34,500 越线、k=5 时 ≈ 29,600 不越。
+# → 在第 6~7 份越线,压缩后还要再处理 3~4 份,正好测「压缩后还记得做到第几份」。
+# 压缩后剩:S + 头 4 条(含第 1 份 4,550)+ 摘要 + 尾 6 条(最多 3 份 13,650)< 3 万。
+fixtures: [ledger-01.csv, ledger-02.csv, ledger-03.csv, ledger-04.csv, ledger-05.csv, ledger-06.csv, ledger-07.csv, ledger-08.csv, ledger-09.csv, ledger-10.csv]
+turns:
+  - prompt: |
+      工作区 uploads/ 下有 10 份门店台账 ledger-01.csv 到 ledger-10.csv(列:日期,门店,品类,单号,金额)。
+      请按编号从 01 到 10 逐份处理,每次只处理一份(不要写一个脚本一次处理多份):
+      1. 先用 read_file 把这一份完整读一遍;
+      2. 再用 exec_python 算出这一份「金额」列的合计,并把结果追加为工作区 results.md 的一行;
+      3. 然后才开始下一份。
+      results.md 每行的格式严格为 `ledger-01.csv,合计=12345`(整数,不加千位分隔符),不要表头和其它行。
+      10 份都处理完后,用一句话告诉我完成了。
+checks:
+  - {type: completed}
+  # 正好 10 行(漏一份少一行、重做一份多一行),且每份的那一行正好一次、数值正确
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-\d{2}\.csv,', count: 10}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-01\.csv,合计=105075\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-02\.csv,合计=102120\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-03\.csv,合计=99165\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-04\.csv,合计=98110\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-05\.csv,合计=107505\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-06\.csv,合计=104550\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-07\.csv,合计=101595\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-08\.csv,合计=98640\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-09\.csv,合计=100435\s*$', count: 1}
+  - {type: workspace_file_line_count, path: results.md, pattern: '^\s*ledger-10\.csv,合计=106980\s*$', count: 1}
