@@ -546,7 +546,7 @@ async def test_update_mode_splits_budget_between_prior_and_events() -> None:
         HumanMessage(content="head-1"),
         HumanMessage(content="head-2"),
         SystemMessage(content=giant_prior),
-        # B-141 —— 预算放大到 16 万后,新事件要超过一半(8 万)才会被截:30 条 × 每条封顶 4~6 千。
+        # B-141 —— 预算放大到 16 万后,新事件要超过一半(8 万)才会被截:30 条 x 每条封顶 4~6 千。
         *_conversation(head=0, middle=30, tail=0, char_per_msg=7000),
         HumanMessage(content="tail-1"),
         HumanMessage(content="tail-2"),
