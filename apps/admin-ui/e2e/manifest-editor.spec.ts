@@ -77,7 +77,10 @@ test("YAML view renders Monaco from the local bundle (no CDN request)", async ({
   await page.getByTestId("agents-create").click();
   await expect(page.getByTestId("manifest-editor-create")).toBeVisible();
   await page.getByTestId("cfg-yaml-toggle").click();
-  await expect(page.getByTestId("manifest-yaml-view").locator(".monaco-editor")).toBeVisible();
+  // 开发服务器冷启动时首次编译 Monaco 较慢(CI 上同样),放宽等待。
+  await expect(page.getByTestId("manifest-yaml-view").locator(".monaco-editor")).toBeVisible({
+    timeout: 30_000,
+  });
   expect(cdnRequests.filter((u) => u.includes("jsdelivr"))).toEqual([]);
 });
 
