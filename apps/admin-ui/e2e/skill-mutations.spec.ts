@@ -270,3 +270,39 @@ test("Delete supporting file requires typing the path to confirm", async ({ page
   await submit.click();
   await expect.poll(() => deletePath).toBe("reference/error_codes.md");
 });
+
+test("language-service workers download only when a file of that language is opened", async ({ page }) => {
+  // B-152 —— JS/TS/HTML/CSS 的语言服务各是一个独立的 worker 文件(TS 约 7 MB)。
+  // 打开别的文件不该下载它们;打开 .js 时才下载 TS 那一个。
+  const workerRequests: string[] = [];
+  page.on("request", (req) => {
+    // 只算 worker 本体:开发服务器是 ``*.worker.js?worker_file``,正式构建是
+    // ``assets/*.worker-<hash>.js``;``*.worker.js?worker`` 只是几行的包装模块。
+    const url = req.url();
+    if (/(ts|css|html)\.worker(\.js\?worker_file|-[\w-]+\.js)/.test(url)) workerRequests.push(url);
+  });
+  await installSkillRoutes(page, {
+    version: {
+      ...HIGH_RISK_VERSION,
+      supporting_files: {
+        ...HIGH_RISK_VERSION.supporting_files,
+        "scripts/build.js": { size: 12, mime: "text/javascript" },
+      } as typeof HIGH_RISK_VERSION.supporting_files,
+    },
+  });
+  await login(page);
+  await page.goto(`/skills/${SKILL_ID}`);
+  await expandFileTree(page);
+
+  await page.getByTestId("skill-file-tree").getByText("error_codes.md").click();
+  await expect(page.getByTestId("skill-editor-monaco").locator(".monaco-editor")).toBeVisible({
+    timeout: 30_000,
+  });
+  expect(workerRequests).toEqual([]);
+
+  await page.getByTestId("skill-file-tree").getByText("build.js").click();
+  await expect.poll(() => workerRequests.some((u) => u.includes("ts.worker"))).toBe(true);
+  expect(workerRequests.some((u) => u.includes("css.worker") || u.includes("html.worker"))).toBe(
+    false,
+  );
+});
