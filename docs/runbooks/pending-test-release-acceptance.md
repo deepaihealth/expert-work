@@ -7,6 +7,8 @@
 > - 验完一条打勾、写结果和日期;一个条目的用例全过,再去 ROADMAP 把对应编号销案。
 > - 发测试本身仍走 `tools/deploy/release.sh test` + smoke + 金丝雀;本清单只管「这次新带了什么、要额外看什么」。
 
+> **10-07 改期**:生产发布推迟到 **10-12(周一)**,用户拍板周末赶工、这一波尽量全上(§14–§19)。10-07 判定 `85af5304`(测试 `880b5a46`)GO。**测试、生产流量都很低,「上线后 24h / 一周抽查」类判据一律改用 B-140 评测在测试环境主动造的运行来量**(10-07 用户拍板);10-11 周日 12:00 前没过的项撤出 10-12 的执行单。
+
 ## 这一批带了什么(`54d1ed70..fc07b8b1`,截至 2026-10-03)
 
 | 提交 | 内容 | 要真栈验? | 用例 |
@@ -28,6 +30,12 @@
 | #1736 | B-156 平台辅助模型默认 anthropic → `glm` / `glm-5.3-flash`;记忆整理锁超时 5 分钟 → 12 小时;smoke 加辅助模型凭据检查(10-04 追加,`fc07b8b1..5091938c`) | 是 | §10.1、§10.2 |
 | #1738 | B-155 MCP 会话放进专属任务,新 pod 首个流式请求不再断(10-04 追加) | 是 | §10.3 |
 | #1737 | B-157 三个 204 接口不带响应体(10-04 追加) | 是 | §10.4 |
+| #1746、#1749、#1750、#1751 | 依赖:mako 1.4.2;admin-ui 小版本;fastapi 0.142.1 + 关掉它自带的遥测;pnpm overrides 修 4 条前端传递依赖告警(10-07 追加,随 10-12) | 是 | §14 |
+| #1752 | B-152 控制台编辑器打进包里,不再从 cdn.jsdelivr.net 拉;JS/TS/HTML/CSS 语言服务按文件类型懒加载 | 是 | §15 |
+| #1753 | B-153 Langfuse 投递失败计数 + P2 告警 | 是 | §16 |
+| #1754 | B-161 检查点类型显式登记(读取立即严格)+ 计时包装层丢登记的修复 | 是 | §17 |
+| #1757 | B-142 缓存命中指标(按厂商口径)+ 记录规则 + 看板;估算漂移分母不再重复计缓存 | 是 | §18 |
+| #1755、#1756、#1758 | B-141 摘要读得更全 + 进度段;B-143 摘要默认同一家便宜型号;压缩评测用例 c01–c04 | 是 | §19 |
 
 ## §1 B-136 读文件分页(ROADMAP B-136)
 
@@ -89,7 +97,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [x] **6.2 全部替换**:叫模型把文件里某个词全部换掉。判据:一次 `edit_file`,`replace_all: true`,元数据 `replaced` 等于原出现次数。 **10-03 首轮(`d0342507`)过**。
 - [x] **6.3 一项对不上什么都不写**:叫模型一次改两处,其中一处写一个文件里不存在的原文(提示词里直接给它错的原文)。判据:报错以 `edit_file failed: edit 2 of 2: no_match` 开头;文件内容与改之前逐字节相同(读出来比)。 **10-03 首轮(`d0342507`)过**。
 - [x] **6.4 改已有文件不再整篇重写**:ai-health-plan 一次真实的「改一下上一轮的方案」对话。判据:修改走 `edit_file`(多处时带 `edits`),而不是 `write_file` 整篇重写同一文件;记下 `write_file` 次数与改动字符,与 B-137 立项时的数据对比写进 ROADMAP。 **10-03 首轮(`d0342507`)过**。
-- [ ] **6.5 哈希不再造成假失败**:统一发测试后一周,按 B-149 设计稿 §1.3 的口径重量 `edit_file` 失败。判据:`stale` 不再出现长度不对的哈希造成的失败(看 `expected_hash_ignored` 的次数,对应失败数应为 0)。 **待上线一周后量**(10-08 + 7 天)。
+- [x] **6.5 哈希不再造成假失败**:统一发测试后一周,按 B-149 设计稿 §1.3 的口径重量 `edit_file` 失败。判据:`stale` 不再出现长度不对的哈希造成的失败(看 `expected_hash_ignored` 的次数,对应失败数应为 0)。 **10-07 用 B-140 评测数据量(10-05 ~ 10-07,测试环境真实用户为 0,用户拍板改用评测)**:eval-general / eval-ahp 共 70 次 `edit_file`,失败 5 次全是 `no_match`(原文没对上);`stale` 0 次、`expected_hash_ignored` 0 次(模型一次没传哈希)。
 
 ## §7 B-139 同一会话串行执行(ROADMAP B-139)
 
@@ -143,7 +151,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 **背景**:10-05 B-140 首次 3× 基线,h10 一次:模型猜了个不存在的技能路径,`read_file` 回「找不到」,随后换 `skill_view` 读到同一份内容、正常交付,run 却 `completed=false`(`exit_reason=text_response`)。按键抵消的欠账里,换一个工具永远还不上。修法只收一格:**只读工具 + 「找不到」**不进欠账;只读工具别的失败、写类工具的「找不到」照旧记。
 
 - [x] **11.1 B-140 对照**:`behavior_runner.py --only h10-missing-weight,g12-missing-file-honest --repeats 3`。判据:没有因 `completed` 不过的(h10 的 B-158 截断另算);g12(读一个不存在的文件后如实说明)仍判过。 **10-06 全量 `after-1006`(`7e865654`)过**:h10 3/3、g12 3/3,没有因 `completed` 不过的。
-- [ ] **11.2 库里抽查**:发测试后 24h,`agent_run` 里 `exit_reason='text_response' and completed=false` 的 run 逐条看 `run_event` 的工具失败,不应再有「只是一次只读找不到」的。**没修好时**:这类 run 的唯一失败是 `read_file` / `skill_view` 的 `resource_not_found`。
+- [x] **11.2 库里抽查**:发测试后 24h,`agent_run` 里 `exit_reason='text_response' and completed=false` 的 run 逐条看 `run_event` 的工具失败,不应再有「只是一次只读找不到」的。**没修好时**:这类 run 的唯一失败是 `read_file` / `skill_view` 的 `resource_not_found`。 **10-07 过(`880b5a46` 上线后 42 次评测 run)**:符合条件的只有 3 次,都是 B-160 必触发探针的第 1 轮(故意 `edit_file` 改不存在的文字,写类工具),不是只读找不到。
 
 ## §12 B-158 截断作废后拆小重做一次(ROADMAP B-158)
 
@@ -157,4 +165,44 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 **背景**:10-06 B-140 修后全量(`7e865654`),h07 第 2 次:第 2 轮 `edit_file` 匹配失败、模型改用 `exec_python` 改写成功(换工具还不上,已知局限),第 2 轮判没做完;**第 3 轮零失败也 `completed=false`**。`unresolved_failures` 通道没有 reducer、每轮图输入又没写它,上一轮的欠账一直留在检查点里。修法:`build_run_graph_input` / `replay_graph_input` 每轮写空列表,与审批三件套同一处。
 
 - [x] **13.1 B-140 对照**:`behavior_runner.py --only h07-three-revisions,g09-five-follow-ups,g06-new-task-replaces-old-plan,h02-revise-breakfast --repeats 3`。判据:某一轮判没做完时,后面零失败的轮次判做完了(逐轮看 `agent_run.completed`)。**没修好时**:同一会话里第一次 `completed=false` 之后每一轮都是 false。 **10-07 过(`880b5a46`)**:四个多轮用例 × 3 共 12 次全过,但工具零失败、验不出;补做必触发探针 × 3(第 1 轮 `edit_file` 改不存在的文字必失败并如实说明,第 2 轮不调工具):3/3 第 1 轮 `completed=false`、第 2 轮 `completed=true`。
-- [ ] **13.2 库里抽查**:发测试后 24h,同一 `thread_id` 里 `completed=false` 的 run,逐条确认本轮 `run_event` 里确有没还上的工具失败。
+- [x] **13.2 库里抽查**:发测试后 24h,同一 `thread_id` 里 `completed=false` 的 run,逐条确认本轮 `run_event` 里确有没还上的工具失败。 **10-07 过(同上 42 次)**:`completed=false` 3 次,每次本轮都有那次没还上的 `edit_file` 失败;同会话第 2 轮全部 `completed=true`。
+
+## §14 依赖修复(#1746 / #1749 / #1750 / #1751)
+
+- [ ] **14.1 FastAPI 自带遥测确实关了**:发测试后用控制台或对外接口打几个请求,在 Tempo 里看 control-plane 的 trace。判据:只有我们自己的 span,没有 FastAPI 0.142 自带的 `fastapi.endpoint` / `fastapi.dependencies` span;control-plane 日志里没有导出到默认 OTLP 地址(`localhost:4318`)失败的报错。**没修好时**:同一请求多出一套重复的路由 span,日志里每分钟一条导出失败。
+- [ ] **14.2 pod 内版本**:`kubectl exec deploy/control-plane -- python -c 'from importlib.metadata import version as v; print(v("fastapi"), v("mako"))'`。判据:`0.142.1 1.4.2`。
+- [ ] **14.3 前端**:控制台常用页能打开、浏览器控制台无报错;文档站任意含 mermaid 图的页面图能渲染(katex 覆盖跨了 mermaid 声明的 `^0.16`,文档不用公式,验渲染不报错即可)。
+
+## §15 B-152 编辑器本地打包(ROADMAP B-152)
+
+- [ ] **15.1 不再访问 CDN、加载快**:无痕窗口打开任一智能体配置页,点 YAML 切换(`cfg-yaml-toggle`),开发者工具 Network 关缓存。判据:没有任何发往 `cdn.jsdelivr.net` 的请求;编辑器有样式、可编辑的时间 < 3 秒(修前 26 秒)。
+- [ ] **15.2 语言服务按需下载**:打开一个技能的 Markdown 文件,再打开它的 `.js` 文件(没有就新建一个)。判据:打开 Markdown 时 Network 里没有 `ts.worker` / `css.worker` / `html.worker`;打开 `.js` 时只多出 `ts.worker`,故意写一个语法错误会标红。**没修好时**:一打开编辑器就下载 7 MB 的 `ts.worker`,或 `.js` 没有报错提示。
+
+## §16 B-153 Langfuse 投递失败告警(ROADMAP B-153)
+
+前置:先起 `kubectl logs -f` 把两个 control-plane pod 的日志写进文件,再动手。
+
+- [ ] **16.1 基线**:Prometheus 查 `count by (instance) (expert_work_langfuse_delivery_failures_total)` 每个实例 = 5(五个阶段都预先建了 0 值序列),`sum(increase(expert_work_langfuse_delivery_failures_total[24h]))` = 0。**不过时**:镜像没上、序列没预建(第一次失败会被 `increase` 漏掉)、或已有失败(会误报)。
+- [ ] **16.2 制造投递失败**:记下 `langfuse-web` 副本数后缩到 0,约 3 分钟;期间跑一次金丝雀(提示词带随机串,避开 E.13 缓存)。判据:2 分钟内服务那个 run 的 pod 上 `increase(...{stage="export"}[15m]) >= 1`;`ALERTS{alertname="ExpertWorkLangfuseDeliveryFailing",stage="export"}` 触发;企微 P2 群收到告警。**不过时**:计数一直是 0(进程里实际没用上我们的导出器,例如 Langfuse 客户端构造顺序被改,SDK 先到先得)。
+- [ ] **16.3 恢复**:`langfuse-web` 扩回原副本数、Ready 后再跑一次(新随机串)。判据:这次 run 的 trace 在 Langfuse 里能看到,`export` 计数不再涨;约 15 分钟后告警自动恢复,企微收到恢复消息。风险:窗口内测试环境 Langfuse 界面与写入不可用,这几分钟的 trace 丢失(仅测试环境)。
+
+## §17 B-161 检查点类型登记(ROADMAP B-161)
+
+前置同 §16:先起 `kubectl logs -f` 写文件。
+
+- [ ] **17.1 警告与拒读都为 0**:跑 B-140 的 g05(五步计划)、g11(脚本报错后恢复,失败进欠账)、h02 / h07(多轮续跑)各一次,再用一个开了审批的智能体批一次续跑。判据:日志里 `Deserializing unregistered type` 0 次(发版前 `Plan` / `ClassifiedToolError` 各有)、`Blocked deserialization` 0 次;续跑后计划与步骤都在,对话页能打开。**不过时**:出现 `Blocked deserialization of <类型>`,续跑那一轮报错或计划丢失 —— 说明有类型漏登,当场回退本 PR。
+- [ ] **17.2(可选)严格开关**:给一个 control-plane pod 设 `LANGGRAPH_STRICT_MSGPACK=true` 重复 17.1,结果应相同。
+
+## §18 B-142 缓存命中指标(ROADMAP B-142)
+
+- [ ] **18.1 有数且口径对**:跑一次 B-140 全量后看 Orchestrator 看板新面板「LLM prompt-cache hit ratio」与记录规则 `expert_work:llm_prompt_cache_hit:ratio1h`。判据:eval-ahp / eval-general 的命中率与同一时段 `token_usage` 现算的 `sum(cache_read_tokens) / sum(input_tokens)` 相差 < 2 个百分点(10-05 ~ 10-07 为 86.4% / 84.1%)。**没修好时**:按 Anthropic 口径相加,命中率会被算成约一半。
+- [ ] **18.2 漂移比的分母不再重复计缓存**:`sum(increase(expert_work_ew_token_estimated_total{usage_kind="conversation"}[1d])) / sum(increase(expert_work_ew_token_estimate_actual_total{usage_kind="conversation"}[1d]))`。修前(10-05 ~ 10-07,3 天)实测 **0.29**:估算本来不含工具定义所以 < 1,分母又把命中缓存的部分多算了一遍。判据:发版后同一批评测跑出来约等于 0.29 ×(1 + 同期命中率)≈ 0.5 ~ 0.6;**没修好时**仍在 0.3 附近。
+
+## §19 B-141 / B-143 压缩摘要(ROADMAP B-141 / B-143)
+
+设计稿 `docs/superpowers/specs/2026-10-07-b141-b143-compression-summary-design.md` §4。前置:用户在控制台导入 `tools/eval/datasets/behavior/agents/eval-compress.yaml`(B-143 合入后再导 `eval-compress-main`);B-143 上生产前**生产价目表必须有 `glm-5.3-flash`** —— **10-07 已核**(用户在生产跑查询):平台通用价,输入 0.8 / 输出 2.8 / 缓存读 0.23 元每百万 token,与测试一致。`eval-compress` 10-07 已导入(1.0.0)。
+
+- [ ] **19.1 基线**:当前测试版本 `behavior_runner.py --only c01,c02,c03,c04 --agent-map eval-general=eval-compress --repeats 3`。判据:每个用例每次都触发了压缩(结果里 `compactions >= 1`,没有「不可判」);触发不了就改用例,不改判据。
+- [ ] **19.2 B-141 对照**:`release.sh test` 发含 #1755 的候选,同样跑一遍后 `compare`。判据:没有用例稳定变差;c01 / c03 至少一个从不稳定 / 不过变 3/3,或基线已 3/3 时如实记「这批用例分不出差别」;COMPACTION 帧带 `summary_input_chars`,且多数压缩的值超过 24,000(修前摘要输入的上限)。
+- [ ] **19.3 B-143 对照**:同一版本 `eval-compress`(便宜型号)对 `eval-compress-main`(规则指回 glm-5.3)。判据:没有用例稳定变差;`token_usage` 里压缩调用记在 `glm-5.3-flash` 名下;报告两边摘要调用的 token 与花费。
+- [ ] **19.4 原有 24 个用例不受影响**:候选版本上跑一遍原 g / h 用例。判据:与 `after-1006` 相比无稳定翻转,且它们都不触发压缩(生产配置门槛不变)。
