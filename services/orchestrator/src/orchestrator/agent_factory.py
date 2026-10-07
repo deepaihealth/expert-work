@@ -114,6 +114,7 @@ from orchestrator.graph_builder import (
     make_reflect_node,
     make_workspace_ingest_node,
 )
+from orchestrator.graph_builder.platform_context import PLATFORM_CONTEXT_SYSTEM_CLAUSE
 from orchestrator.llm import (
     AnthropicProvider,
     Embedder,
@@ -1942,6 +1943,8 @@ def _assemble_system_prompt(
     # B-85 ③ —— 无条件。与 ``tool_use_enforcement`` 同一档(行为指令先于下面的
     # 顾问性 skill / memory 块)。
     pieces.append("\n\n" + COMPLETION_CONTRACT_CLAUSE)
+    # B-162 —— 无条件:``<platform-context>`` 的含义只在这里讲一次, 段内只留短标注。
+    pieces.append("\n\n" + PLATFORM_CONTEXT_SYSTEM_CLAUSE)
 
     # Dynamic-context — day-granular current date (``dynamic_context.
     # inject_current_date``). Placed first after base so the model reads it as

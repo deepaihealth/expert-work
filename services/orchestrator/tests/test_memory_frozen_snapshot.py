@@ -23,6 +23,7 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
 
@@ -77,10 +78,11 @@ def _memory(content: str) -> MemoryItem:
     )
 
 
-def _find_memory_message(messages: Sequence[BaseMessage]) -> tuple[int, HumanMessage] | None:
+def _find_memory_message(messages: Sequence[BaseMessage]) -> tuple[int, BaseMessage] | None:
+    # B-162 —— ``per_turn`` 记忆追加在最后一条消息(用户消息 / 工具结果)末尾。
     for idx, msg in enumerate(messages):
         if (
-            isinstance(msg, HumanMessage)
+            isinstance(msg, HumanMessage | ToolMessage)
             and isinstance(msg.content, str)
             and "Relevant memories" in msg.content
         ):

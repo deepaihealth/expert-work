@@ -46,6 +46,10 @@ from orchestrator import (
     build_react_graph,
 )
 from orchestrator.built_agent import BuiltAgent
+from orchestrator.graph_builder.platform_context import (
+    PLATFORM_CONTEXT_CLOSE,
+    PLATFORM_CONTEXT_OPEN,
+)
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.skill_seed import sanitize_agent_key
@@ -169,7 +173,21 @@ def _texts(messages: Sequence[BaseMessage]) -> str:
 
 
 def _blocks(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
-    return [m for m in messages if (m.additional_kwargs or {}).get(WORKSPACE_BLOCK_MARK)]
+    """带工作区快照的消息。B-162 起快照进模型前包进 ``<platform-context>``、追加到
+    最后一条消息末尾, 所以提示词视图里按快照标题认, 检查点里按原标记认。"""
+    return [
+        m
+        for m in messages
+        if (m.additional_kwargs or {}).get(WORKSPACE_BLOCK_MARK)
+        or WORKSPACE_BLOCK_HEADING in str(m.content)
+    ]
+
+
+def _block_text(msg: BaseMessage) -> str:
+    """消息里那段平台上下文的正文(去掉它被追加到的那条消息自己的内容)。"""
+    text = str(msg.content)
+    start = text.find(PLATFORM_CONTEXT_OPEN)
+    return text if start < 0 else text[start : text.index(PLATFORM_CONTEXT_CLOSE, start)]
 
 
 def _configurable(**overrides: Any) -> dict[str, Any]:
@@ -248,6 +266,7 @@ async def test_only_the_latest_snapshot_reaches_the_model() -> None:
     assert "render_plan.py" in text
     assert "ghost_from_last_turn.py" not in text
     assert len(_blocks(prompt)) == 1
+    assert text.count(WORKSPACE_BLOCK_HEADING) == 1
 
 
 async def test_the_snapshot_is_refetched_every_turn() -> None:
@@ -456,7 +475,7 @@ async def test_a_delegated_child_sees_the_same_block_as_its_parent() -> None:
     parent_llm = _RecordingLLM()
     async with _graph(store, llm=parent_llm) as compiled:
         await _invoke(compiled, [HumanMessage(content="做一版海报")])
-    parent_block = str(_blocks(parent_llm.seen_prompts[0])[0].content)
+    parent_block = _block_text(_blocks(parent_llm.seen_prompts[0])[0])
     assert "render_plan.py" in parent_block
 
     child_llm = _RecordingLLM()
@@ -484,4 +503,4 @@ async def test_a_delegated_child_sees_the_same_block_as_its_parent() -> None:
     assert result.content
     child_prompt = child_llm.seen_prompts[0]
     assert len(_blocks(child_prompt)) == 1
-    assert str(_blocks(child_prompt)[0].content) == parent_block
+    assert _block_text(_blocks(child_prompt)[0]) == parent_block
