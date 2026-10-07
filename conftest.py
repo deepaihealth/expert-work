@@ -17,11 +17,46 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import pytest
+from langgraph.checkpoint.serde.event_hooks import SerdeEvent, register_serde_event_listener
 
+from expert_work.runtime.checkpointer.serde import CHECKPOINT_MSGPACK_ALLOWLIST
 from expert_work.testing import InMemorySecretStore, MockLLM
 
 if TYPE_CHECKING:
     from testcontainers.postgres import PostgresContainer
+
+
+#: Module prefixes of our own code — a checkpoint type from anywhere else
+#: (langgraph's safe set, a test-local model) is not ours to register.
+_OWN_MODULE_PREFIXES = ("expert_work.", "orchestrator.", "control_plane.")
+
+
+@pytest.fixture(autouse=True)
+def _checkpoint_types_are_registered() -> Iterator[None]:
+    """B-161 — any test that loads one of OUR types from a checkpoint must find
+    it in ``CHECKPOINT_MSGPACK_ALLOWLIST``. Strict msgpack (the announced
+    langgraph default) hands an unlisted type back as a bare ``dict``.
+
+    The schema walk in ``test_checkpoint_serde_allowlist.py`` only sees typed
+    ``AgentState`` fields; this catches the rest — a model parked in a
+    ``dict[str, Any]`` channel or a message's ``artifact`` — whenever any test
+    round-trips it. Fires for savers built with or without the allowlist.
+    """
+    registered = set(CHECKPOINT_MSGPACK_ALLOWLIST)
+    unregistered: set[str] = set()
+
+    def _listener(event: SerdeEvent) -> None:
+        key = (event["module"], event["name"])
+        if key[0].startswith(_OWN_MODULE_PREFIXES) and key not in registered:
+            unregistered.add(".".join(key))
+
+    unregister = register_serde_event_listener(_listener)
+    yield
+    unregister()
+    assert not unregistered, (
+        f"checkpoint loaded unregistered types {sorted(unregistered)} — add them to "
+        "CHECKPOINT_MSGPACK_ALLOWLIST (expert_work/runtime/checkpointer/serde.py)"
+    )
 
 
 @pytest.fixture
