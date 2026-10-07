@@ -45,8 +45,8 @@ def _encoding():  # type: ignore[no-untyped-def]
     tiktoken = pytest.importorskip("tiktoken")
     try:
         return tiktoken.get_encoding("o200k_base")
-    except Exception:  # 离线拿不到分词表:与 runtime 的 tiktoken 测试同样跳过
-        pytest.skip("o200k_base BPE unavailable (offline)")
+    except Exception as exc:  # 离线拿不到分词表:与 runtime 的 tiktoken 测试同样跳过
+        raise pytest.skip.Exception("o200k_base BPE unavailable (offline)") from exc
 
 
 def _cap() -> int:
