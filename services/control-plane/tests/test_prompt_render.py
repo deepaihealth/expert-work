@@ -557,16 +557,27 @@ def test_plain_text_only_prompt_logs_nothing(caplog: pytest.LogCaptureFixture) -
     assert not [r for r in caplog.records if r.getMessage() == "prompt.rendered_by_reference"]
 
 
-def test_a_long_url_list_renders_in_linear_time() -> None:
-    """逐项渲染按项分组一次;逐项扫全部 site 是平方级 —— 一万项时旧写法要两秒多,
-    新写法几十毫秒。界放得很宽(1 秒),只拦平方级,不拦机器快慢。"""
-    n = 10_000
+def _render_materials(n: int) -> tuple[float, str]:
+    """渲染 ``n`` 项素材列表三次,返回最快一次的耗时与输出(取最快一次压掉 GC / 调度抖动)。"""
     materials = [{"description": f"d{i}", "url": f"https://x/{i}.mp4"} for i in range(n)]
     built = _jinja_built("{{ materials }}", (_Var("materials"),))
-    started = time.perf_counter()
-    out = render_system_prompt(built, {"materials": materials})
-    elapsed = time.perf_counter() - started
-    assert elapsed < 1.0, elapsed
+    best, out = float("inf"), ""
+    for _ in range(3):
+        started = time.perf_counter()
+        out = render_system_prompt(built, {"materials": materials})
+        best = min(best, time.perf_counter() - started)
+    return best, out
+
+
+def test_a_long_url_list_renders_in_linear_time() -> None:
+    """逐项渲染按项分组一次;逐项扫全部 site 是平方级 —— 一万项时旧写法要两秒多。
+
+    按比例判,不按绝对耗时:1 千项 → 1 万项,线性约 10 倍,平方级约 100 倍,界取 40 倍,
+    只拦平方级。原来的「1 万项 < 1 秒」在共享 CI runner 上 10-07 连红三次(1.02 ~ 1.14 秒,
+    本机 0.06 秒),拦的是机器快慢。"""
+    small, _ = _render_materials(1_000)
+    large, out = _render_materials(10_000)
+    assert large < 40 * small, (small, large)
     assert "https://x/" not in out
-    last = n - 1
+    last = 10_000 - 1
     assert f"{last}. d{last} → $EXPERT_WORK_INPUTS_DIR/materials/{last}-d{last}.mp4{_END}" in out
