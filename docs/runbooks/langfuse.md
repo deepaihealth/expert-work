@@ -105,3 +105,13 @@ docker volume rm infra_langfuse-postgres-data infra_langfuse-clickhouse-data
 - **bucket 报错**：`langfuse-minio-init` 应 `completed`；没有则手动
   `mc mb m/langfuse`（见 [infra/README](../../infra/README.md) bucket 段）。
 - **队列丢事件**：确认连的是 `langfuse-redis`（noeviction）而非 quota redis。
+- **告警 `ExpertWorkLangfuseDeliveryFailing`**（B-153 后续）：我们这一侧没把
+  trace 交给 Langfuse，看 `stage` 标签：
+  - `start_span` / `record_response` / `record_error` / `end` → 中间件吞掉的
+    SDK 调用异常，control-plane 日志搜同名 `langfuse.<stage>_failed`（带堆栈）；
+    多半是 SDK 升级改了 API（B-153 即 4.x 删 `start_generation`）。
+  - `export` → OTLP 批次发不出去或被拒，日志搜 `Failed to export spans batch`：
+    401/403 查 `EXPERT_WORK_LANGFUSE_PUBLIC_KEY/SECRET_KEY`，连接错误/超时查
+    `langfuse-web` pod 与 `EXPERT_WORK_LANGFUSE_HOST`。
+  - 这条告警**不覆盖** Langfuse 收下之后自己 worker 写库失败（B-154
+    ClickHouse 盘满）—— 那条看 smoke 的磁盘检查。
