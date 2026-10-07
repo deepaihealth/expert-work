@@ -299,18 +299,22 @@ _C04_FINDINGS = {
 }
 
 
+# c04 第 1 轮可拿到的 4 份合计要小:模型会一次并行读完(c-base-1007),一轮盖满头尾就压不了。
+_C04_REPORT_LINES = 155
+
+
 def _checkup_part(n: int) -> str:
     lines = [f"# 王小雨 年度体检报告(虚构)第 {n} 部分", ""]
-    for i in range(1, 251):
-        if i == 125:
+    for i in range(1, _C04_REPORT_LINES + 1):
+        if i == _C04_REPORT_LINES // 2:
             lines.append(_C04_FINDINGS[n])
         lines.append(f"第 {n}-{i:03d} 项检查:结果在参考范围内,未见明显异常。")
     return "\n".join(lines) + "\n"
 
 
-def _daily_log(title: str, entry: str) -> str:
+def _daily_log(title: str, entry: str, days: int) -> str:
     lines = [f"# 王小雨 {title}(虚构)", ""]
-    for day in range(1, 121):
+    for day in range(1, days + 1):
         lines.append(f"第 {day} 天:{entry.format(n=day % 5 + 1)}")
     return "\n".join(lines) + "\n"
 
@@ -319,6 +323,7 @@ def _exercise_log() -> str:
     return _daily_log(
         "近四个月运动记录",
         "步行约 {n} 千步,其余时间久坐办公;晚饭后偶尔散步,没有游泳、跑步等规律运动,膝盖无不适。",
+        106,
     )
 
 
@@ -326,6 +331,23 @@ def _sleep_log() -> str:
     return _daily_log(
         "近四个月睡眠记录",
         "约 0 点 {n}5 分入睡,早上 7 点起床;睡前常看手机,夜里醒来一次,白天下午犯困。",
+        117,
+    )
+
+
+def _diet_log() -> str:
+    return _daily_log(
+        "近四个月饮食记录",
+        "早餐白粥配油条,午餐外卖盖饭,晚餐米饭两碗加红烧肉;下午喝一杯含糖奶茶(第 {n} 类口味)。",
+        97,
+    )
+
+
+def _followup_notes() -> str:
+    return _daily_log(
+        "近四个月随访记录",
+        "电话随访,客户自述无不适,血糖仪自测空腹 6.{n} mmol/L;提醒按时复查,客户表示知道了。",
+        117,
     )
 
 
@@ -347,6 +369,8 @@ def build() -> dict[str, str | bytes]:
         **{name: _checkup_part(n) for n, name in enumerate(C04_REPORT_PARTS, start=1)},
         "exercise-log.md": _exercise_log(),
         "sleep-log.md": _sleep_log(),
+        "diet-log.md": _diet_log(),
+        "followup-notes.md": _followup_notes(),
     }
 
 
