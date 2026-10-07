@@ -136,13 +136,16 @@ class CompactionStats:
     reclaimed amount is ``max(0, tokens_before - tokens_after)``.
     ``passes`` is the number of summarise-the-middle passes that ran;
     ``summary_chars`` is the length of the final ``<context-summary>``
-    block.
+    block. ``summary_input_chars`` (B-141) is the length of what the last
+    pass actually handed the summariser (the transcript, plus the previous
+    summary in update mode) — how much of the middle the summary could see.
     """
 
     passes: int
     tokens_before: int
     tokens_after: int
     summary_chars: int
+    summary_input_chars: int = 0
 
 
 #: Stream RT-2 PR-4 — compaction observability hook. Awaited once per
@@ -185,16 +188,24 @@ _MAX_CONSECUTIVE_SUMMARY_FAILURES: int = 3
 #: safe direction).
 _MAX_STREAK_KEYS: int = 1024
 
-#: RT-ADR-10 — per-message char cap inside the summariser transcript. A
-#: single 20k-char tool dump must not monopolise the summariser prompt;
-#: head 2/3 + tail keeps both the call's intent and its outcome visible.
-_SUMMARY_PER_MESSAGE_CHAR_CAP: int = 2_000
+#: RT-ADR-10 / B-141 — per-message char cap inside the summariser transcript,
+#: by role. A single 20k-char tool dump must not monopolise the summariser
+#: prompt (head 2/3 + tail keeps both the call's intent and its outcome);
+#: what the user and the assistant said is the cheapest, highest-value part
+#: of the history, so it gets the most room. Roles not listed use "default".
+_SUMMARY_ROLE_CHAR_CAPS: dict[str, int] = {
+    "user": 6_000,
+    "assistant": 4_000,
+    "tool": 1_500,
+    "default": 4_000,
+}
 
-#: RT-ADR-10 — hard char budget for the summariser's own input payload
-#: (~6k tokens at the chars//4 heuristic — comfortably inside any
-#: summariser window regardless of the agent's ``context_window``).
-#: Update mode halves it between PREVIOUS SUMMARY and NEW EVENTS.
-_SUMMARY_INPUT_CHAR_BUDGET: int = 24_000
+#: RT-ADR-10 / B-141 — hard char budget for the summariser's own input payload.
+#: B-141 raised it from 24k chars (~6k tokens, ~4% of a 200k-token middle) to
+#: 160k (~40k tokens at chars//4; at most ~100k for dense CJK) — still well
+#: inside the smallest summariser window in use (200k tokens). Update mode
+#: halves it between PREVIOUS SUMMARY and NEW EVENTS.
+_SUMMARY_INPUT_CHAR_BUDGET: int = 160_000
 
 #: Stream L.L2 — wrapping tags on the summary content so the agent can
 #: see at a glance that the middle of its conversation was compressed.
@@ -212,12 +223,18 @@ _SUMMARY_PREAMBLE: str = (
 
 #: Shared section + fidelity constraints (Mini-ADR CM-H2 — the stable
 #: three-section structure is what makes incremental updates mergeable).
+#: B-141 adds '## Progress': compression mostly hurts by making the model lose
+#: track of where it is, so the summary always carries that state explicitly.
 _SUMMARY_STRUCTURE_RULES: str = (
-    "Structure the summary as three markdown sections — '## Facts', "
-    "'## Decisions', '## Pending' — with short bullet points (use "
-    "'- (none)' for an empty section). Preserve specific names, paths, "
-    "and numerical values verbatim. Do not include any tool-call syntax "
-    "or speculation about future steps."
+    "Structure the summary as four markdown sections — '## Facts', "
+    "'## Decisions', '## Progress', '## Pending' — with short bullet points "
+    "(use '- (none)' for an empty section). In '## Progress' list every "
+    "completed step on its own line with its concrete result (file paths, "
+    "numbers, artifact names), then the step currently in progress and how "
+    "far it got, then the immediate next step. Preserve specific names, "
+    "paths, and numerical values verbatim. Do not include any tool-call "
+    "syntax. In '## Progress' and '## Pending' include only next steps the "
+    "conversation explicitly stated — never invent future steps."
 )
 
 _SUMMARISER_SYSTEM_PROMPT: str = (
@@ -233,7 +250,9 @@ _SUMMARY_UPDATER_SYSTEM_PROMPT: str = (
     "You maintain a running background summary of a long conversation. "
     "Merge the NEW EVENTS into the PREVIOUS SUMMARY: add new items, "
     "revise items the new events change, and drop Pending items that "
-    "were completed or superseded. Output ONLY the updated summary. " + _SUMMARY_STRUCTURE_RULES
+    "were completed or superseded. Rewrite '## Progress' entirely so it "
+    "reflects the latest state (do not keep stale 'in progress' or 'next' "
+    "lines from the previous summary). Output ONLY the updated summary. " + _SUMMARY_STRUCTURE_RULES
 )
 
 
@@ -465,13 +484,21 @@ def _format_middle_for_summary(
     LLM consumes. The format is intentionally simple — role: text —
     so the summariser doesn't get sidetracked by JSON wire format.
 
-    RT-ADR-10: each message is bounded to
-    ``_SUMMARY_PER_MESSAGE_CHAR_CAP`` (one oversized tool dump must not
+    RT-ADR-10: each message is bounded by its role's cap
+    (``_SUMMARY_ROLE_CHAR_CAPS`` — one oversized tool dump must not
     monopolise the transcript) and the joined transcript is bounded to
     ``char_budget`` so the summariser call itself can never overflow
     the summariser's window.
+
+    B-141: when the lines exceed ``char_budget``, tool results are collapsed
+    to one line each starting from the OLDEST, then assistant messages the
+    same way; user messages are never collapsed. Only if that still does not
+    fit does the old head 2/3 + tail 1/3 cut apply (defensive). The old cut
+    alone dropped the middle of the middle wholesale — exactly where "which
+    step are we on" usually sits.
     """
     lines: list[str] = []
+    collapsible: list[tuple[int, str]] = []  # (line index, one-line stub) in age order
     for msg in middle:
         # B-67 — hidden HumanMessages (inputs block, advisories) are platform
         # scaffolding; the summary is durable text, so they stay out of it.
@@ -490,7 +517,25 @@ def _format_middle_for_summary(
             continue
         text = _message_to_text(msg).strip()
         if text:
-            lines.append(f"{role}: {_bound_text(text, _SUMMARY_PER_MESSAGE_CHAR_CAP)}")
+            cap = _SUMMARY_ROLE_CHAR_CAPS.get(role, _SUMMARY_ROLE_CHAR_CAPS["default"])
+            if role in ("tool", "assistant"):
+                label = getattr(msg, "name", None) if role == "tool" else None
+                stub = (
+                    f"({label}, {len(text)} chars omitted)"
+                    if label
+                    else f"({len(text)} chars omitted)"
+                )
+                collapsible.append((len(lines), f"{role}: {stub}"))
+            lines.append(f"{role}: {_bound_text(text, cap)}")
+    total = sum(len(line) for line in lines) + 2 * max(len(lines) - 1, 0)
+    for wanted_role in ("tool", "assistant"):
+        for idx, stub in collapsible:
+            if total <= char_budget:
+                break
+            if not stub.startswith(f"{wanted_role}: ") or len(stub) >= len(lines[idx]):
+                continue
+            total -= len(lines[idx]) - len(stub)
+            lines[idx] = stub
     return _bound_text("\n\n".join(lines), char_budget)
 
 
@@ -739,6 +784,7 @@ class ContextCompressor:
                     on_cache_hit()
         tokens_before = self._estimate(current)
         passes_done = 0
+        input_chars = 0
         for pass_idx in range(self.max_passes):
             if self._estimate(current) + reserve < self.threshold_tokens:
                 if pass_idx > 0:
@@ -748,13 +794,13 @@ class ContextCompressor:
                         self._estimate(current),
                     )
                 return await self._finish_compaction(
-                    current, tokens_before, passes_done, on_compacted
+                    current, tokens_before, passes_done, on_compacted, input_chars
                 )
             try:
                 pending_through = _last_middle_id(
                     current, head_keep=self.head_keep, tail_keep=self.tail_keep
                 )
-                current, wrapped_summary = await self._compress_once(
+                current, wrapped_summary, input_chars = await self._compress_once(
                     current, on_pre_compaction=on_pre_compaction
                 )
                 if on_summary is not None and pending_through is not None:
@@ -764,7 +810,7 @@ class ContextCompressor:
             except ContextOverflowError as exc:
                 if reserve and self._estimate(current) < self.threshold_tokens:
                     return await self._finish_compaction(
-                        current, tokens_before, passes_done, on_compacted
+                        current, tokens_before, passes_done, on_compacted, input_chars
                     )
                 # 终审 #3 —— ``_compress_once`` 不知道这是第几遍,它报的 ``passes=0``
                 # 在第 2 遍撞上「中段只剩摘要」时是错的:RUN_FAILED 里会写「压了 0 遍」,
@@ -813,7 +859,7 @@ class ContextCompressor:
                 # (passes_done > 0) — fire the hook for what did land before
                 # this round's transient skip; passes_done == 0 emits nothing.
                 return await self._finish_compaction(
-                    current, tokens_before, passes_done, on_compacted
+                    current, tokens_before, passes_done, on_compacted, input_chars
                 )
             if streak_key:
                 self._summary_failures.clear(streak_key)
@@ -825,7 +871,9 @@ class ContextCompressor:
                 threshold=self.threshold_tokens,
                 passes=self.max_passes,
             )
-        return await self._finish_compaction(current, tokens_before, passes_done, on_compacted)
+        return await self._finish_compaction(
+            current, tokens_before, passes_done, on_compacted, input_chars
+        )
 
     async def _finish_compaction(
         self,
@@ -833,6 +881,7 @@ class ContextCompressor:
         tokens_before: int,
         passes_done: int,
         on_compacted: OnCompacted | None,
+        summary_input_chars: int = 0,
     ) -> list[BaseMessage]:
         """Stream RT-2 PR-4 — fire the tokens-saved counter + ``on_compacted``
         hook once, only when at least one pass produced a summary.
@@ -853,6 +902,7 @@ class ContextCompressor:
                     tokens_before=tokens_before,
                     tokens_after=tokens_after,
                     summary_chars=_summary_chars(result),
+                    summary_input_chars=summary_input_chars,
                 )
             )
         return result
@@ -862,10 +912,12 @@ class ContextCompressor:
         messages: list[BaseMessage],
         *,
         on_pre_compaction: PreCompactionHook | None = None,
-    ) -> tuple[list[BaseMessage], SystemMessage]:
+    ) -> tuple[list[BaseMessage], SystemMessage, int]:
         """One summarise-the-middle pass.
 
-        Returns ``(new_messages, wrapped)`` — ``wrapped`` is the EXACT
+        Returns ``(new_messages, wrapped, input_chars)`` — ``input_chars`` is
+        the length of the user content handed to the summariser (B-141);
+        ``wrapped`` is the EXACT
         ``<context-summary>`` message this pass just built. B-126 (fix
         round 2) — the caller uses ``wrapped`` directly for ``on_summary``
         instead of re-scanning ``new_messages`` for it: ``wrapped`` is
@@ -911,14 +963,16 @@ class ContextCompressor:
             # RT-ADR-10 — update mode splits the input budget evenly:
             # PREVIOUS SUMMARY and NEW EVENTS each get half, so neither
             # side can starve the other out of the summariser prompt.
-            summary_text = await self._summarise_update(
+            user_content = _update_user_content(
                 _bound_text(prior, _SUMMARY_INPUT_CHAR_BUDGET // 2),
                 _format_middle_for_summary(
                     fresh_middle, char_budget=_SUMMARY_INPUT_CHAR_BUDGET // 2
                 ),
             )
+            summary_text = await self._summarise_with(_SUMMARY_UPDATER_SYSTEM_PROMPT, user_content)
         else:
-            summary_text = await self._summarise(_format_middle_for_summary(split.middle))
+            user_content = _format_middle_for_summary(split.middle)
+            summary_text = await self._summarise_with(_SUMMARISER_SYSTEM_PROMPT, user_content)
         logger.info(
             "context_compressor.summary mode=%s middle=%d",
             "update" if prior is not None else "fresh",
@@ -929,24 +983,20 @@ class ContextCompressor:
                 f"{_SUMMARY_TAG_OPEN}\n{_SUMMARY_PREAMBLE}\n\n{summary_text}\n{_SUMMARY_TAG_CLOSE}"
             )
         )
-        return [*split.leading_systems, *split.head, wrapped, *split.tail], wrapped
+        return (
+            [*split.leading_systems, *split.head, wrapped, *split.tail],
+            wrapped,
+            len(user_content),
+        )
 
-    async def _summarise(self, transcript: str) -> str:
-        """Invoke the summariser LLM and return the summary body."""
-        prompt = [
-            SystemMessage(content=_SUMMARISER_SYSTEM_PROMPT),
-            HumanMessage(content=transcript),
-        ]
+    async def _summarise_with(self, system_prompt: str, user_content: str) -> str:
+        """Invoke the summariser LLM (fresh or CM-7 update prompt) and return the body."""
+        prompt = [SystemMessage(content=system_prompt), HumanMessage(content=user_content)]
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "compress"):
             response = await self.llm_caller(messages=prompt, tools=[])
         return _message_to_text(response).strip() or "(no summary produced)"
 
-    async def _summarise_update(self, prior: str, transcript: str) -> str:
-        """Merge new events into the previous running summary (CM-7)."""
-        prompt = [
-            SystemMessage(content=_SUMMARY_UPDATER_SYSTEM_PROMPT),
-            HumanMessage(content=f"PREVIOUS SUMMARY:\n{prior}\n\nNEW EVENTS:\n{transcript}"),
-        ]
-        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "compress"):
-            response = await self.llm_caller(messages=prompt, tools=[])
-        return _message_to_text(response).strip() or "(no summary produced)"
+
+def _update_user_content(prior: str, transcript: str) -> str:
+    """CM-7 — the update-mode user message: previous summary + new events."""
+    return f"PREVIOUS SUMMARY:\n{prior}\n\nNEW EVENTS:\n{transcript}"

@@ -26,7 +26,7 @@ from orchestrator.context import (
 )
 from orchestrator.context.compressor import (
     _SUMMARY_INPUT_CHAR_BUDGET,
-    _SUMMARY_PER_MESSAGE_CHAR_CAP,
+    _SUMMARY_ROLE_CHAR_CAPS,
     _bound_text,
     _format_middle_for_summary,
 )
@@ -506,10 +506,11 @@ def test_bound_text_keeps_head_two_thirds_and_tail() -> None:
 
 def test_format_middle_caps_single_oversized_message() -> None:
     """A single 3x-over-cap tool dump cannot monopolise the transcript."""
-    big = "x" * (_SUMMARY_PER_MESSAGE_CHAR_CAP * 3)
-    out = _format_middle_for_summary([HumanMessage(content=big)])
+    cap = _SUMMARY_ROLE_CHAR_CAPS["tool"]
+    big = "x" * (cap * 3)
+    out = _format_middle_for_summary([ToolMessage(content=big, tool_call_id="tc-1", name="bash")])
     # Small slack for the role prefix + elision marker.
-    assert len(out) <= _SUMMARY_PER_MESSAGE_CHAR_CAP + 100
+    assert len(out) <= cap + 100
     assert "truncated" in out
 
 
@@ -528,7 +529,7 @@ def test_format_middle_skips_hidden_scaffolding() -> None:
 
 def test_format_middle_enforces_total_budget() -> None:
     """Many under-cap messages still cannot exceed the total budget."""
-    msgs = [HumanMessage(content=f"m{i}-" + "y" * 1500) for i in range(30)]  # ~45k chars
+    msgs = [HumanMessage(content=f"m{i}-" + "y" * 5000) for i in range(40)]  # ~200k chars
     out = _format_middle_for_summary(msgs)
     assert len(out) <= _SUMMARY_INPUT_CHAR_BUDGET + 100
     assert "truncated" in out
@@ -545,7 +546,8 @@ async def test_update_mode_splits_budget_between_prior_and_events() -> None:
         HumanMessage(content="head-1"),
         HumanMessage(content="head-2"),
         SystemMessage(content=giant_prior),
-        *_conversation(head=0, middle=14, tail=0, char_per_msg=3000),
+        # B-141 —— 预算放大到 16 万后,新事件要超过一半(8 万)才会被截:30 条 × 每条封顶 4~6 千。
+        *_conversation(head=0, middle=30, tail=0, char_per_msg=7000),
         HumanMessage(content="tail-1"),
         HumanMessage(content="tail-2"),
     ]
@@ -647,7 +649,7 @@ async def test_summary_wrapper_carries_reference_only_preamble() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fresh_mode_prompt_requires_three_sections() -> None:
+async def test_fresh_mode_prompt_requires_four_sections() -> None:
     summariser = _RecordingSummariser()
     await _compressor(summariser).compress(
         _conversation(head=2, middle=16, tail=2, char_per_msg=80)
@@ -656,6 +658,7 @@ async def test_fresh_mode_prompt_requires_three_sections() -> None:
     user = str(summariser.prompts[0][1].content)
     assert "## Facts" in system
     assert "## Decisions" in system
+    assert "## Progress" in system
     assert "## Pending" in system
     assert "PREVIOUS SUMMARY" not in user
 
@@ -1109,3 +1112,98 @@ async def test_on_summary_text_is_the_pass_summary_not_a_tail_look_alike() -> No
     assert got, "no summary reported"
     assert "SUMMARY" in got[-1].text
     assert "DECOY" not in got[-1].text
+
+
+# ---------------------------------------------------------------------------
+# B-141 —— 摘要输入读得更全、固定保留进度
+# ---------------------------------------------------------------------------
+
+
+def _work_step(i: int, tool_chars: int) -> list[BaseMessage]:
+    return [
+        HumanMessage(content=f"user-step-{i:03d}"),
+        AIMessage(
+            content=f"assistant-step-{i:03d}",
+            tool_calls=[{"name": "bash", "args": {}, "id": f"tc-{i}", "type": "tool_call"}],
+        ),
+        ToolMessage(
+            content=f"tool-head-{i:03d} " + "z" * tool_chars + f" tool-tail-{i:03d}",
+            tool_call_id=f"tc-{i}",
+            name="bash",
+        ),
+    ]
+
+
+def test_format_middle_keeps_every_user_and_assistant_line_when_over_budget() -> None:
+    """B-141 —— 超预算时先收起旧工具结果,不再按「头 2/3 + 尾 1/3」把中段的中间整块丢掉:
+    每一步的用户与助手原话都还在(「做到哪一步」最常落在中段的中间)。"""
+    middle = [m for i in range(60) for m in _work_step(i, tool_chars=1_000)]  # ~65k chars
+    out = _format_middle_for_summary(middle, char_budget=20_000)
+    assert len(out) <= 20_000 + 100
+    for i in range(60):
+        assert f"user-step-{i:03d}" in out
+        assert f"assistant-step-{i:03d}" in out
+
+
+def test_format_middle_collapses_oldest_tool_results_first() -> None:
+    """B-141 —— 收起从最旧的工具结果开始:最新几步的工具结果原样保留,最旧的只剩一行。"""
+    middle = [m for i in range(60) for m in _work_step(i, tool_chars=1_000)]
+    out = _format_middle_for_summary(middle, char_budget=20_000)
+    assert "tool-head-059" in out and "tool-tail-059" in out
+    assert "tool-head-000" not in out
+    assert "tool: (bash, " in out and "chars omitted)" in out
+
+
+def test_format_middle_role_caps_keep_user_text_longer_than_tool_text() -> None:
+    """B-141 —— 每条上限按角色分:用户原话 6,000 字符内不截,工具结果 1,500 就截。"""
+    user_text = "u" * 5_000
+    tool_text = "t" * 5_000
+    out = _format_middle_for_summary(
+        [
+            HumanMessage(content=user_text),
+            ToolMessage(content=tool_text, tool_call_id="tc-1", name="bash"),
+        ]
+    )
+    assert user_text in out
+    assert tool_text not in out
+    assert _SUMMARY_ROLE_CHAR_CAPS["user"] >= 6_000
+    assert _SUMMARY_ROLE_CHAR_CAPS["tool"] <= 1_500
+
+
+def test_summary_input_budget_is_about_forty_thousand_tokens() -> None:
+    """B-141 —— 总预算从 2.4 万字符(约 6 千 token)放到 16 万字符(约 4 万 token)。"""
+    assert _SUMMARY_INPUT_CHAR_BUDGET == 160_000
+
+
+@pytest.mark.asyncio
+async def test_prompts_pin_progress_rules() -> None:
+    """B-141 —— 进度段规则写进提示词:全新总结要求写已完成步骤 + 正在做的 + 紧接着的一步
+    且不许推测;更新模式要求 Progress 整段按最新状态重写。"""
+    summariser = _RecordingSummariser()
+    compressor = _compressor(summariser)
+    first = await compressor.compress(_conversation(head=2, middle=16, tail=2, char_per_msg=80))
+    fresh_system = str(summariser.prompts[0][0].content)
+    assert "## Progress" in fresh_system
+    assert "step currently in progress" in fresh_system
+    assert "explicitly stated" in fresh_system
+    grown = [*first, *_conversation(head=0, middle=16, tail=0, char_per_msg=80)]
+    await compressor.compress(grown)
+    update_system = str(summariser.prompts[-1][0].content)
+    assert "Rewrite '## Progress' entirely" in update_system
+
+
+@pytest.mark.asyncio
+async def test_on_compacted_reports_summary_input_chars() -> None:
+    """B-141 —— COMPACTION 事件带上实际交给摘要模型的字符数,看得出摘要读了多少。"""
+    summariser = _RecordingSummariser()
+    seen: list[CompactionStats] = []
+
+    async def _hook(stats: CompactionStats) -> None:
+        seen.append(stats)
+
+    await _compressor(summariser).compress(
+        _conversation(head=2, middle=16, tail=2, char_per_msg=80), on_compacted=_hook
+    )
+    assert len(seen) == 1
+    transcript = str(summariser.prompts[0][1].content)
+    assert seen[0].summary_input_chars == len(transcript)
