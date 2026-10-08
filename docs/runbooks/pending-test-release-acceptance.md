@@ -66,10 +66,10 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 ## §3 沙箱镜像依赖(#1713)
 
-**注意**:沙箱镜像是手工钉 tag 的(`infra/k8s/sandbox/sandboxset.yaml`,当前 `sandbox:7ac31957`),`release.sh test` 不会重建它。这批依赖要生效,必须按 `docs/runbooks/sandbox-image-release.md` 重建镜像并刷新钉子;不重建,本节无从验,也不算通过。
+**注意**:沙箱镜像是手工钉 tag 的(`infra/k8s/sandbox/sandboxset.yaml`,10-08 起 `sandbox:d8a32812` = `7ac31957` + 本批四个依赖,CI 10-02 构建、单 amd64、`-vpc` host 不变;此前是 `7ac31957`),`release.sh test` 不会重建它。这批依赖要生效,必须按 `docs/runbooks/sandbox-image-release.md` 重建镜像并刷新钉子;不重建,本节无从验,也不算通过。
 
-- [ ] **3.0** 按沙箱镜像 runbook 重建并刷新钉子;池里的 pod 按新镜像 tag 过滤确认已换上(别 `head -1`)。 **本班不适用**:10-03 拍板 #1713 不进 10-08,沙箱镜像不重烤,本节不验、也不算通过;生产执行单里 smoke 的沙箱钉子 WARN「落后 1 个提交」是预期。
-- [ ] **3.1 版本**:`exec_python` 打印 `pandas` / `pypdf` / `markdown` / `imageio` 的 `__version__`,与 `infra/sandbox-image/requirements.txt` 一致。
+- [x] **3.0** 按沙箱镜像 runbook 重建并刷新钉子;池里的 pod 按新镜像 tag 过滤确认已换上(别 `head -1`)。 ~~**本班不适用**:10-03 拍板 #1713 不进 10-08,沙箱镜像不重烤,本节不验、也不算通过;生产执行单里 smoke 的沙箱钉子 WARN「落后 1 个提交」是预期。~~ **10-08 用户改拍板:10-12 前重钉 `d8a32812`(生产执行单第十八次重钉)。10-08 测试过**:apply 后池约 70 秒就绪,`smoke.sh test` 钉子检查 OK + VPC endpoint OK;B-140 g08 / h03 / h08 / h11 各一次 4/4 过。
+- [x] **3.1 版本**:`exec_python` 打印 `pandas` / `pypdf` / `markdown` / `imageio` 的 `__version__`,与 `infra/sandbox-image/requirements.txt` 一致。 **10-08 过(`d8a32812`)**:pod 内版本对得上。
 - [ ] **3.2 真用法**:health-plan-report 技能出一次 PDF 交付件;`read_document` 读一个 PDF;`exec_python` 用 pandas 读一个 xlsx。都成功。
 
 ## §4 admin-ui 依赖(#1714 / #1715)
