@@ -37,6 +37,7 @@ from orchestrator.graph_builder.builder import (
     budget_exit_reason,
 )
 from orchestrator.tools.error_classifier import ClassifiedToolError, ToolErrorClass
+from orchestrator.tools.file_ops import FileOpError
 
 # ---------------------------------------------------------------------------
 # 桩
@@ -528,6 +529,44 @@ async def test_a_read_only_lookup_that_finds_nothing_is_not_left_unfinished() ->
         )
     )
     registry.register(_ScriptedTool(name="skill_view", path_arg="path", read_only=True))
+
+    state = await _run(llm, registry)
+
+    assert state.get("exit_reason") == "text_response", "前提:模型是自然说完的"
+    assert _failure_keys(state) == []
+    assert _completed(state) is True
+
+
+@pytest.mark.asyncio
+async def test_reading_a_file_before_creating_it_is_not_left_unfinished() -> None:
+    """B-159 漏网(10-08 B-140 c02):``read_file`` 真实抛的是 ``FileOpError("read_file
+    failed: not_found")`` —— 下划线, 文本兜底只认「not found」, 被判成 ``unknown`` 记了账。
+    模型先读 ``notes.md``(还没有)、再把它建出来, 是正常做法, 这一轮被判成没做完。
+
+    上面那条 B-159 用例拿 ``FileNotFoundError`` 造失败, 走的是类型分支, 碰不到这个缺口。
+    """
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("read_file", "tc-1", {"path": "notes.md"})]),
+            AIMessage(
+                content="",
+                tool_calls=[_tc("write_file", "tc-2", {"path": "notes.md", "content": "x"})],
+            ),
+            AIMessage(content="已写入 notes.md"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(
+        _ScriptedTool(
+            name="read_file",
+            path_arg="path",
+            read_only=True,
+            fail_on=frozenset({0}),
+            exc=FileOpError,
+            error="read_file failed: not_found",
+        )
+    )
+    registry.register(_ScriptedTool(name="write_file", path_arg="path"))
 
     state = await _run(llm, registry)
 

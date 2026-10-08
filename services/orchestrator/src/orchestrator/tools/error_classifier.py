@@ -248,7 +248,10 @@ _TRANSIENT_NEEDLES = (
     " 529",
 )
 _PERMISSION_NEEDLES = ("permission denied", "forbidden", "unauthorized", " 401", " 403")
-_NOT_FOUND_NEEDLES = ("not found", "no such file", "does not exist", " 404")
+#: ``not_found`` —— 工作区文件工具的失败文本是 ``<tool> failed: not_found``(``file_ops``
+#: 的错误码, 下划线)。B-159 的豁免靠这一类;漏了它, 读一个还没建的文件就被记成欠账
+#: (10-08 B-140 c02)。
+_NOT_FOUND_NEEDLES = ("not found", "not_found", "no such file", "does not exist", " 404")
 _INVALID_NEEDLES = ("invalid", "validation", "is required", "must be", "bad request", " 400")
 
 

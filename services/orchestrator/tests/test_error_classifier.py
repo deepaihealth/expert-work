@@ -13,6 +13,7 @@ from orchestrator.tools.error_classifier import (
     classify_tool_error,
     render_recovery_advisory,
 )
+from orchestrator.tools.file_ops import FileOpError
 from orchestrator.tools.registry import ToolNotFoundError, ToolSpec
 from orchestrator.tools.sandbox import SandboxClaimTimeoutError
 
@@ -114,6 +115,14 @@ def test_text_unauthorized_is_permission_denied() -> None:
 
 def test_text_not_found_is_resource_not_found() -> None:
     err = classify_tool_error(tool_name="db", error=RuntimeError("row not found"))
+    assert err.error_class == "resource_not_found"
+
+
+def test_file_op_not_found_code_is_resource_not_found() -> None:
+    """B-159 漏网:工作区文件工具的失败文本是 ``<tool> failed: not_found``(下划线)。"""
+    err = classify_tool_error(
+        tool_name="read_file", error=FileOpError("read_file failed: not_found")
+    )
     assert err.error_class == "resource_not_found"
 
 
