@@ -28,9 +28,10 @@ prefill 一遍它 —— 轮首是用户消息, 中途是最后一批工具结�
 B-163 —— 恢复建议也不再另起一条 user 消息:工具节点在失败的那条工具结果上打标
 (:data:`RECOVERY_ADVISORY_MARK`, 值是渲染好的整段), :func:`with_recovery_advisories`
 在视图里把它贴到那条结果末尾(openclaw / hermes 同一做法, hermes 注释明说是为了只追加、
-不破缓存)。每一步对视图里**所有**打了标的结果原样重挂, 字节不变;它在
-:func:`with_platform_context` 之前跑, 所以最后一条是失败结果时顺序是 工具原文 → 建议 →
-``<platform-context>``。
+不破缓存)。每一步对视图里**所有**打了标的结果原样重挂, 字节不变。分两道:伪造字样的转义
+(:func:`escape_forged_recovery_advisories`)在压缩之前, 贴(:func:`with_recovery_advisories`)
+在压缩之后、紧挨 :func:`with_platform_context` 之前 —— 摘要与记忆抽取看不到它, 最后一条是
+失败结果时顺序是 工具原文 → 建议 → ``<platform-context>``。
 """
 
 from __future__ import annotations
@@ -212,27 +213,49 @@ def with_recovery_advisory_mark(msg: ToolMessage, advisory: str) -> ToolMessage:
     )
 
 
+def _is_legacy_advisory(msg: BaseMessage) -> bool:
+    """B-163 之前落库的独立恢复建议:隐藏的 user 消息, 正文以 ``<recovery-advisory>`` 开头。"""
+    return (
+        isinstance(msg, HumanMessage)
+        and bool((msg.additional_kwargs or {}).get(HIDE_FROM_UI))
+        and isinstance(msg.content, str)
+        and msg.content.startswith(RECOVERY_ADVISORY_OPEN)
+    )
+
+
+def escape_forged_recovery_advisories(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """B-163 —— 用户消息 / 工具结果 / 隐藏平台段里伪造的 ``<recovery-advisory>`` 字样转义。
+
+    只放过老会话落库的独立建议(:func:`_is_legacy_advisory`)—— 那是平台自己写的。其余
+    隐藏段(本轮输入、``per_turn`` 记忆、反思意见、工作区快照、渲染页 …)里都可能有用户
+    或工具写进来的文字, 照转(与 B-162 ``<platform-context>`` 同一口径)。幂等;没有要转的
+    字样时元素 identity 不变。**只转义, 不贴** —— 见 :func:`with_recovery_advisories`。
+    """
+    return [
+        msg if _is_legacy_advisory(msg) else _escaped(msg, RECOVERY_ADVISORY_ESCAPES)
+        for msg in messages
+    ]
+
+
 def with_recovery_advisories(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
     """B-163 —— 视图里每条打了标的工具结果末尾贴上它的 ``<recovery-advisory>``。返回新列表。
 
+    * 先跑一遍 :func:`escape_forged_recovery_advisories`(幂等):压缩之后才挂上来的
+      工作区快照 / 渲染页段也得转义, 而平台自己贴的这段在转义**之后**贴, 不会被转掉。
+    * 只在**压缩之后**调:摘要(落库的 ``context_summary``)与 CM-3 预压缩记忆抽取的
+      输入里不能有这段 —— 它是给模型看的平台脚手架, B-67 把这类东西挡在那两处之外。
     * **所有**打了标的结果都贴, 不只本轮的:跨轮摘掉 = 下一轮开头把更早的字节改掉, 前缀
       缓存从第一条失败结果起断;贴着不动就只多几百字符(以前独立那条也永远留在历史里)。
-    * 贴之前先把用户消息 / 工具结果里伪造的同名标签转义;平台自己写的隐藏段(含
-      B-163 之前落库的独立建议)原样放过 —— 它们本来就是平台写的。
     * 没有要改的消息时元素 identity 不变。
     """
     out: list[BaseMessage] = []
-    for msg in messages:
-        if isinstance(msg, HumanMessage) and (msg.additional_kwargs or {}).get(HIDE_FROM_UI):
-            out.append(msg)
-            continue
-        view = _escaped(msg, RECOVERY_ADVISORY_ESCAPES)
+    for msg in escape_forged_recovery_advisories(messages):
         advisory = (
             (msg.additional_kwargs or {}).get(RECOVERY_ADVISORY_MARK)
             if isinstance(msg, ToolMessage)
             else None
         )
         if isinstance(advisory, str) and advisory:
-            view = _with_appended(view, advisory) or view
-        out.append(view)
+            msg = _with_appended(msg, advisory) or msg
+        out.append(msg)
     return out

@@ -234,7 +234,7 @@ expert_work.orchestrator.session_run
 | `expert_work_cm_projection_total` | counter | `outcome` | turn 边界工作区状态投影（CM-0） |
 | `expert_work_cm_recitation_chars` | gauge | `()` | 注入 prompt 尾的 plan 复述字符数（CM-0 N1） |
 | `expert_work_cm_tool_error_total` | counter | `error_class,tool` | 分类后入恢复 advisory 的工具失败（CM-1） |
-| `expert_work_cm_recovery_advisory_chars` | gauge | `()` | 注入 prompt 尾的恢复 advisory 字符数（CM-1） |
+| `expert_work_cm_recovery_advisory_chars` | gauge | `()` | 最近一批有失败的工具调用里，贴到各条失败工具结果上的恢复 advisory 字符数之和（tools 节点设置；CM-1 / B-163） |
 | `expert_work_cm_working_window_trim_total` | counter | `outcome` | agent_node 入口工作记忆滑窗（CM-2） |
 | `expert_work_cm_working_window_dropped_turns` | gauge | `()` | 最近滑窗 trim 丢弃的 user turn 数（CM-2） |
 | `expert_work_cm_precompaction_flush_total` | counter | `outcome` | 压缩前记忆 flush（CM-3） |

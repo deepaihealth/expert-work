@@ -184,3 +184,13 @@ def test_no_case_regex_has_a_doubled_ascii_colon_class() -> None:
     # c03 曾把全角冒号 U+FF1A 写成第二个半角冒号:`[::]` 永远匹配不到全角冒号
     for path in Path(CASES_DIR).glob("*.yaml"):
         assert "[::]" not in path.read_text(encoding="utf-8"), path.name
+
+
+def test_g15_does_not_judge_completed() -> None:
+    """g15 的欠账按路径拼写与工具记键:改对了也可能留账(换了 ``./notes.md`` 写法或换了
+    工具), ``completed`` 会在正确的修改上变红。它只判文件内容。"""
+    [g15] = load_cases(CASES_DIR, only=["g15-edit-with-wrong-snippet"])
+    assert [c.type for c in g15.checks] == [
+        "workspace_file_contains",
+        "workspace_file_unchanged_lines",
+    ]

@@ -300,6 +300,10 @@ def prune_old_tool_results(
             out.append(message)
             continue
         content = message.content
+        # B-163 —— 收起后的副本(``_rebuild``)不带 ``additional_kwargs``, 失败结果上挂的恢复
+        # 建议标记(``RECOVERY_ADVISORY_MARK``)也就跟着没了:被去重 / 按年龄收起的那条失败
+        # 结果在视图里不再贴建议。可以接受 —— 去重时保留的是**最新**那条一模一样的失败,
+        # 它带着自己的建议;按年龄收起的是旧上下文, 正文都不留了, 建议也不必留。
         is_duplicate = isinstance(content, str) and last_occurrence.get(content, i) > i
         if is_duplicate:
             new_content = _collapsed_content(

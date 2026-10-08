@@ -166,6 +166,7 @@ from orchestrator.graph_builder.planner import (
 )
 from orchestrator.graph_builder.platform_context import (
     PROMPT_TAIL_MARK,
+    escape_forged_recovery_advisories,
     strip_platform_context,
     with_platform_context,
     with_recovery_advisories,
@@ -790,18 +791,17 @@ def build_react_graph(
             record_memory_inject_mode(mode=memory_recall_mode)
         # Stream CM-1 (generalising L.L4) / B-163 — the ``<recovery-advisory>``
         # for each failed tool call rides THAT tool result: the tools node
-        # marked it (``RECOVERY_ADVISORY_MARK``), and here every marked result
-        # in the view gets its block appended — every step, byte-identical, so
-        # the prompt-cache prefix holds (Mini-ADR CM-B4: never in the system
-        # block). Before B-163 this was its own hidden HumanMessage after the
-        # tool results, which GLM's chat template reads as a new user turn.
-        # It runs before the compressor so the attached text counts toward its
-        # estimate, and before ``with_platform_context`` so the order on the
-        # last result is tool text → advisory → ``<platform-context>``. The
+        # marked it (``RECOVERY_ADVISORY_MARK``), and the block is appended to
+        # every marked result after compression (``with_recovery_advisories``
+        # below, right before ``with_platform_context``). Before B-163 this was
+        # its own hidden HumanMessage after the tool results, which GLM's chat
+        # template reads as a new user turn. Here, before the compressor, only
+        # forged tags are escaped, so the summariser / pre-compaction flush see
+        # the raw tool result and never the platform's advisory. The
         # ``tool_failures`` channel still feeds CM-11 escalation below and is
         # reset to ``[]`` in this node's return dict (one batch per channel).
         tool_failures = list(state.get("tool_failures", []))
-        messages = with_recovery_advisories(messages)
+        messages = escape_forged_recovery_advisories(messages)
         # B-35(plan_first)— structured dispatch turn. When the plan carries
         # undone delegate-marked steps whose plan version has not been
         # dispatched yet, THIS turn narrows the tool bind to
@@ -1079,6 +1079,12 @@ def build_react_graph(
         # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
         # 提示词视图里可能残留的旧段剔掉。
         messages = with_figure_block(messages, figure_block)
+        # B-163 —— 失败的工具结果末尾贴上各自的恢复建议(每一步原样重挂, 字节不变)。放在
+        # 压缩之后:摘要与预压缩记忆抽取不该看到平台脚手架;放在工作区快照 / 渲染页段挂上
+        # 之后:它顺带把这两段里用户文件名带进来的伪造标签转义;放在平台段之前:最后一条是
+        # 失败结果时顺序是 工具原文 → 建议 → ``<platform-context>``。压缩器的估算不含这几百
+        # 字符(与工作区快照段同一处理)。
+        messages = with_recovery_advisories(messages)
         # B-162 —— 尾部平台段合成一条、包上 ``<platform-context>``, 明说不是用户。
         # 必须在压缩 / ``_keep_latest_inputs_block``(按 identity 认段)之后、
         # before chain 之前(缓存 lookup 与 store 的 key 要一致)。

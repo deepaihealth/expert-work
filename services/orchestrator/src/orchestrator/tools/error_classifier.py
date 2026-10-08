@@ -394,6 +394,20 @@ def escape_recovery_advisory_tags(text: str) -> str:
     return text
 
 
+#: 建议里引用模型给的值(工具名、路径)时的上限。超了留头尾、中间一个 ``…``。
+_QUOTED_MAX_CHARS = 200
+
+
+def _one_line(text: str) -> str:
+    """模型给的值压成一行(空白折叠)并限长:换行不能在建议里另起一行冒充平台的话。"""
+    flat = " ".join(text.split())
+    if len(flat) <= _QUOTED_MAX_CHARS:
+        return flat
+    head = _QUOTED_MAX_CHARS * 2 // 3
+    tail = _QUOTED_MAX_CHARS - head - 1
+    return f"{flat[:head]}…{flat[-tail:]}"
+
+
 def render_recovery_advisory(failure: ClassifiedToolError) -> str:
     """B-163 —— 把**一次**失败渲染成一段 ``<recovery-advisory>``, 贴在那条工具结果末尾。
 
@@ -402,11 +416,11 @@ def render_recovery_advisory(failure: ClassifiedToolError) -> str:
     错误原文就在这段正上方的工具结果里, 再抄一遍只是多花 token。
 
     确定性:同一次失败每次渲染的字节都一样(这段每一步都原样重挂, 字节一变前缀缓存
-    就断)。路径来自模型给的入参, 里面的同名标签先转义。
+    就断)。工具名与路径来自模型:先压成一行、限长(:func:`_one_line`), 再转义同名标签。
     """
-    head = f"{failure.tool_name} [{failure.error_class}]"
+    head = f"{_one_line(failure.tool_name)} [{failure.error_class}]"
     if failure.path:
-        head += f" path={failure.path}"
+        head += f" path={_one_line(failure.path)}"
     body = escape_recovery_advisory_tags(f"{head}: {failure.advice}")
     return "\n".join(
         [RECOVERY_ADVISORY_OPEN, RECOVERY_ADVISORY_LABEL, body, RECOVERY_ADVISORY_CLOSE]
