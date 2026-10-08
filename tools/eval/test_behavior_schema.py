@@ -168,6 +168,12 @@ def test_compression_cases_take_a_c_id_and_the_compress_agent(tmp_path: Path) ->
     assert load_case(_write(tmp_path, "g99-sample.yaml", _CASE)).requires_compaction is False
 
 
+def test_recovery_cases_can_require_a_tool_error(tmp_path: Path) -> None:
+    case = load_case(_write(tmp_path, "g99-sample.yaml", _CASE + "requires_tool_error: true\n"))
+    assert case.requires_tool_error is True
+    assert load_case(_write(tmp_path, "g99-sample.yaml", _CASE)).requires_tool_error is False
+
+
 @pytest.mark.parametrize(
     "check",
     [

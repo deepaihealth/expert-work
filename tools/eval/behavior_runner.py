@@ -146,9 +146,14 @@ def turn_metrics_of(record: RunRecord) -> list[dict[str, int | None]]:
 
 
 def indeterminate_reason(case: Case, record: RunRecord) -> str | None:
-    """B-141 —— 要求压缩的用例整次一次都没压缩:判据测不到它要测的东西,不判过 / 不过。"""
+    """B-141 —— 要求压缩的用例整次一次都没压缩:判据测不到它要测的东西,不判过 / 不过。
+
+    B-163 —— 要求工具失败的恢复用例同理:一次失败都没撞上就测不到恢复。
+    """
     if case.requires_compaction and not any(t.compactions for t in record.turns):
         return "no compaction in any turn (requires_compaction)"
+    if case.requires_tool_error and not any(t.tool_errors for t in record.turns):
+        return "no tool error in any turn (requires_tool_error)"
     return None
 
 

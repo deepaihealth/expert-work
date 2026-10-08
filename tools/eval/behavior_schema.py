@@ -230,6 +230,9 @@ class Case(_Strict):
     #: B-141 —— 用例测的是压缩之后的行为:整次运行一次 ``compaction`` 都没有就判「不可判」
     #: (不算过也不算不过)—— 在不可能失败的条件下验证等于没验证。
     requires_compaction: bool = False
+    #: B-163 —— 用例测的是工具中途失败之后怎么接着做:整次运行一次失败的工具调用都没有
+    #: (模型先列目录绕开了那次失败)就判「不可判」, 理由同上。
+    requires_tool_error: bool = False
 
 
 def load_case(path: Path) -> Case:

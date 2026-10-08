@@ -388,15 +388,16 @@ async def test_next_step_advisory_tells_the_model_to_fix_the_call() -> None:
     )
 
     assert tool.calls == []
+    # B-163 —— 建议贴在被拦下的那条工具结果末尾。
     advisories = [
         str(m.content)
         for m in llm.seen[1]
-        if isinstance(m, HumanMessage) and "<recovery-advisory>" in str(m.content)
+        if isinstance(m, ToolMessage) and "<recovery-advisory>" in str(m.content)
     ]
     assert len(advisories) == 1
-    advisory = advisories[0]
-    assert "- exec_python [invalid_arguments]: input_url_retyped" in advisory
-    assert "do not repeat the identical call" in advisory
+    advisory = advisories[0].split("<recovery-advisory>", 1)[1]
+    assert "exec_python [invalid_arguments]: The tool rejected the arguments" in advisory
+    assert "the identical call is rejected again" in advisory
     lowered = advisory.lower()
     for wrong in ("approval", "wait", "bypass", "blocked_by_policy"):
         assert wrong not in lowered

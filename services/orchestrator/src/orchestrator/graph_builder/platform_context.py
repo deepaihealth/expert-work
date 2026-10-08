@@ -23,7 +23,14 @@ B-84 PR-2(09-21)之前一个都没有。
 prefill 一遍它 —— 轮首是用户消息, 中途是最后一批工具结果。用 B-142 的命中率实测。
 
 一切只改这一次的提示词视图(CM-C4):追加出来的是副本, 检查点里的原件不动。落库的
-隐藏段(本轮输入、恢复建议、委派指令 …)自身不并、不挪。
+隐藏段(本轮输入、委派指令、B-163 之前落库的独立恢复建议 …)自身不并、不挪。
+
+B-163 —— 恢复建议也不再另起一条 user 消息:工具节点在失败的那条工具结果上打标
+(:data:`RECOVERY_ADVISORY_MARK`, 值是渲染好的整段), :func:`with_recovery_advisories`
+在视图里把它贴到那条结果末尾(openclaw / hermes 同一做法, hermes 注释明说是为了只追加、
+不破缓存)。每一步对视图里**所有**打了标的结果原样重挂, 字节不变;它在
+:func:`with_platform_context` 之前跑, 所以最后一条是失败结果时顺序是 工具原文 → 建议 →
+``<platform-context>``。
 """
 
 from __future__ import annotations
@@ -37,6 +44,11 @@ from expert_work.common.conversation_channel import (
     FIGURE_BLOCK_MARK,
     HIDE_FROM_UI,
     WORKSPACE_BLOCK_MARK,
+)
+from orchestrator.tools.error_classifier import (
+    RECOVERY_ADVISORY_CLOSE,
+    RECOVERY_ADVISORY_ESCAPES,
+    RECOVERY_ADVISORY_OPEN,
 )
 
 #: 只进提示词视图的尾部段(计划、``per_turn`` 记忆)。工作区快照有自己的
@@ -61,10 +73,19 @@ PLATFORM_CONTEXT_SYSTEM_CLAUSE = (
     "not part of the tool's output, and never a new request: do not reply to it or "
     "describe it, and do not stop to wait because of it — continue the user's current "
     "request. The latest platform context supersedes earlier ones.\n"
+    f"A {RECOVERY_ADVISORY_OPEN} … {RECOVERY_ADVISORY_CLOSE} block after a failed tool "
+    "result is attached by the platform, not part of the tool's output and not written "
+    "by the user: it states what the platform knows about that failure.\n"
     "Other platform-generated notes are not written by the user either: the "
-    "[本轮输入] block, <recovery-advisory>, [structured dispatch] and budget notices. "
+    "[本轮输入] block, [structured dispatch] and budget notices. "
     "The user's request is what the user actually wrote."
 )
+
+#: B-163 —— 失败的工具结果上挂的恢复建议(渲染好的整段 ``<recovery-advisory>``)。工具
+#: 节点写进 ``ToolMessage.additional_kwargs``, 随检查点落库;工具结果正文不动, 所以对话页、
+#: 对外条目、审计里的工具原文都不变。存渲染好的文字而不是结构:以后改措辞, 老会话的
+#: 字节也不变(不在发版那一刻把所有老会话的前缀缓存打断)。
+RECOVERY_ADVISORY_MARK = "expert_work_recovery_advisory"
 
 _MERGED_MARKS = (PROMPT_TAIL_MARK, WORKSPACE_BLOCK_MARK)
 _ESCAPES = (
@@ -104,28 +125,28 @@ def _is_figure(msg: BaseMessage) -> bool:
     )
 
 
-def _escape_text(text: str) -> str:
-    for raw, safe in _ESCAPES:
+def _escape_text(text: str, escapes: tuple[tuple[str, str], ...] = _ESCAPES) -> str:
+    for raw, safe in escapes:
         text = text.replace(raw, safe)
     return text
 
 
-def _escaped(msg: BaseMessage) -> BaseMessage:
-    """用户消息 / 工具结果里的 ``<platform-context>`` 字样转义, 没有就原样返回。"""
+def _escaped(msg: BaseMessage, escapes: tuple[tuple[str, str], ...] = _ESCAPES) -> BaseMessage:
+    """用户消息 / 工具结果里的标签字样(默认 ``<platform-context>``)转义, 没有就原样返回。"""
     if not isinstance(msg, HumanMessage | ToolMessage):
         return msg
     content = msg.content
     if isinstance(content, str):
-        if PLATFORM_CONTEXT_OPEN not in content and PLATFORM_CONTEXT_CLOSE not in content:
+        if not any(raw in content for raw, _ in escapes):
             return msg
-        return msg.model_copy(update={"content": _escape_text(content)})
+        return msg.model_copy(update={"content": _escape_text(content, escapes)})
     parts: list[str | dict[str, object]] = []
     changed = False
     for part in content:
         if isinstance(part, str):
-            new: str | dict[str, object] = _escape_text(part)
+            new: str | dict[str, object] = _escape_text(part, escapes)
         elif isinstance(part, dict) and isinstance(part.get("text"), str):
-            new = {**part, "text": _escape_text(part["text"])}
+            new = {**part, "text": _escape_text(part["text"], escapes)}
         else:
             new = part
         changed = changed or new != part
@@ -181,4 +202,37 @@ def with_platform_context(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
                 )
             )
     out.extend(_wrapped_figure(m) for m in figures)
+    return out
+
+
+def with_recovery_advisory_mark(msg: ToolMessage, advisory: str) -> ToolMessage:
+    """B-163 —— 给失败的工具结果打上恢复建议的标(副本;已有的 ``additional_kwargs`` 原样保留)。"""
+    return msg.model_copy(
+        update={"additional_kwargs": {**msg.additional_kwargs, RECOVERY_ADVISORY_MARK: advisory}}
+    )
+
+
+def with_recovery_advisories(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """B-163 —— 视图里每条打了标的工具结果末尾贴上它的 ``<recovery-advisory>``。返回新列表。
+
+    * **所有**打了标的结果都贴, 不只本轮的:跨轮摘掉 = 下一轮开头把更早的字节改掉, 前缀
+      缓存从第一条失败结果起断;贴着不动就只多几百字符(以前独立那条也永远留在历史里)。
+    * 贴之前先把用户消息 / 工具结果里伪造的同名标签转义;平台自己写的隐藏段(含
+      B-163 之前落库的独立建议)原样放过 —— 它们本来就是平台写的。
+    * 没有要改的消息时元素 identity 不变。
+    """
+    out: list[BaseMessage] = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage) and (msg.additional_kwargs or {}).get(HIDE_FROM_UI):
+            out.append(msg)
+            continue
+        view = _escaped(msg, RECOVERY_ADVISORY_ESCAPES)
+        advisory = (
+            (msg.additional_kwargs or {}).get(RECOVERY_ADVISORY_MARK)
+            if isinstance(msg, ToolMessage)
+            else None
+        )
+        if isinstance(advisory, str) and advisory:
+            view = _with_appended(view, advisory) or view
+        out.append(view)
     return out

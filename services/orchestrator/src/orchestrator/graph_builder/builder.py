@@ -168,6 +168,8 @@ from orchestrator.graph_builder.platform_context import (
     PROMPT_TAIL_MARK,
     strip_platform_context,
     with_platform_context,
+    with_recovery_advisories,
+    with_recovery_advisory_mark,
 )
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
@@ -337,11 +339,14 @@ _cm_tool_error_total = expert_work_counter(
     "Classified tool failures routed into the recovery advisory (Stream CM-1).",
     ("error_class", "tool"),
 )
-#: Stream CM-1 — size (chars) of the most recent recovery advisory
-#: injected into the prompt tail. Watches for advisory bloat.
+#: Stream CM-1 — size (chars) of the most recent recovery advisory. B-163:
+#: the advisories now ride the failed tool results, so this is the total of
+#: the blocks attached in the most recent failing tools batch. Watches for
+#: advisory bloat.
 _cm_recovery_advisory_chars = expert_work_gauge(
     "expert_work_cm_recovery_advisory_chars",
-    "Characters of the recovery advisory injected into the prompt tail (Stream CM-1).",
+    "Characters of the recovery advisories attached to the failed tool results of the "
+    "most recent failing tools batch (Stream CM-1 / B-163).",
 )
 #: Stream CM-2 — working-memory sliding window passes by outcome. A high
 #: ``trimmed`` rate vs ``noop`` shows how many compressor (LLM) calls the
@@ -783,20 +788,20 @@ def build_react_graph(
                 estimator=token_estimator,
             )
             record_memory_inject_mode(mode=memory_recall_mode)
-        # Stream CM-1 (generalising L.L4) — inject a ``<recovery-advisory>``
-        # HumanMessage listing every tool call that failed in the previous
-        # tools batch, with grounded per-tool recovery guidance. Mini-ADR
-        # CM-B4: the advisory is part of the conversation history (persists
-        # across turns) and lives in a HumanMessage, NOT the system block,
-        # so the L1 prompt-cache prefix invariant stays intact. Append once
-        # per failure batch — the channel is reset to ``[]`` in this node's
-        # return dict so a follow-on agent step does not double-inject.
+        # Stream CM-1 (generalising L.L4) / B-163 — the ``<recovery-advisory>``
+        # for each failed tool call rides THAT tool result: the tools node
+        # marked it (``RECOVERY_ADVISORY_MARK``), and here every marked result
+        # in the view gets its block appended — every step, byte-identical, so
+        # the prompt-cache prefix holds (Mini-ADR CM-B4: never in the system
+        # block). Before B-163 this was its own hidden HumanMessage after the
+        # tool results, which GLM's chat template reads as a new user turn.
+        # It runs before the compressor so the attached text counts toward its
+        # estimate, and before ``with_platform_context`` so the order on the
+        # last result is tool text → advisory → ``<platform-context>``. The
+        # ``tool_failures`` channel still feeds CM-11 escalation below and is
+        # reset to ``[]`` in this node's return dict (one batch per channel).
         tool_failures = list(state.get("tool_failures", []))
-        advisory_message: HumanMessage | None = None
-        if tool_failures:
-            advisory_message = _build_recovery_advisory(tool_failures)
-            messages = [*messages, advisory_message]
-            _cm_recovery_advisory_chars.set(len(str(advisory_message.content)))
+        messages = with_recovery_advisories(messages)
         # B-35(plan_first)— structured dispatch turn. When the plan carries
         # undone delegate-marked steps whose plan version has not been
         # dispatched yet, THIS turn narrows the tool bind to
@@ -1446,16 +1451,9 @@ def build_react_graph(
             ctx = MiddlewareContext(payload=after_payload)
             await after_llm_chain.invoke(ctx, _noop)
             new_messages = _extract_post_llm_messages(ctx, original=after_messages)
-            # Stream CM-1 — persist the advisory into history so the
-            # next agent step sees it even after this dict's reducer
-            # appends. The middleware path's ``new_messages`` is the
-            # full post-LLM delta; prepend the advisory in case the
-            # middleware filtered the prompt body.
             persisted_messages: list[BaseMessage] = list(new_messages)
-            if advisory_message is not None and advisory_message not in persisted_messages:
-                persisted_messages = [advisory_message, *persisted_messages]
             # B-35 — persist the dispatch instruction alongside (hidden from
-            # the UI but part of history, same contract as the advisory).
+            # the UI but part of history).
             if dispatch_message is not None and dispatch_message not in persisted_messages:
                 persisted_messages = [dispatch_message, *persisted_messages]
             # P2 — stamp last: everything above (DLP / structured resend /
@@ -1505,11 +1503,7 @@ def build_react_graph(
                     update_mw["plan_first_dispatched_steps"] = dispatched_steps
             return update_mw
 
-        # Stream CM-1 — persist the advisory in conversation history
-        # alongside the LLM response so the next agent step sees it.
-        emit_messages: list[BaseMessage] = (
-            [advisory_message, response] if advisory_message is not None else [response]
-        )
+        emit_messages: list[BaseMessage] = [response]
         # B-35 — same persistence contract as the middleware path above.
         if dispatch_message is not None:
             emit_messages = [dispatch_message, *emit_messages]
@@ -1880,10 +1874,10 @@ def build_react_graph(
         # Re-assemble in original tool_call order. L5 / K8 invariants
         # require a stable iteration order downstream.
         new_messages: list[BaseMessage] = []
-        # Stream CM-1 (generalising L.L4) — collect classified tool
-        # failures so the next agent step injects the recovery advisory.
-        # Two sources, in original tool_call order so the advisory lists
-        # failures in the sequence the ToolMessages appear:
+        # Stream CM-1 (generalising L.L4) — classify each tool failure; the
+        # failing ToolMessage is marked with its recovery advisory (B-163) and
+        # the failure goes into the ``tool_failures`` channel. Two sources, in
+        # original tool_call order:
         #   1. error path — ``_dispatch_tool`` already classified from the
         #      real exception (4th tuple element).
         #   2. success-but-didn't-land — L-4's mutation classifier on a
@@ -1892,8 +1886,11 @@ def build_react_graph(
         # B-84 第 3 条 —— 本批每一次**真跑过**的调用留下 (记账键, 失败或 None),
         # 按 tool_call 顺序,喂给 ``_apply_failure_ledger`` 去更新 run 级欠账。
         batch_outcomes: list[tuple[tuple[str, str], ClassifiedToolError | None]] = []
+        # B-163 — total chars of the advisories attached in this batch (gauge).
+        advisory_chars = 0
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
+            message_pos = len(new_messages)
             new_messages.append(tool_message)
             for key, value in tool_state.items():
                 if key not in TOOL_ALLOWED_STATE_KEYS:
@@ -1933,6 +1930,12 @@ def build_react_graph(
                 _cm_tool_error_total.labels(
                     error_class=failure.error_class, tool=failure.tool_name
                 ).inc()
+                # B-163 — the advisory rides THIS tool result: mark it with the
+                # rendered block (content stays raw); ``agent_node`` appends it
+                # in the prompt view via ``with_recovery_advisories``.
+                advisory = render_recovery_advisory(failure)
+                new_messages[message_pos] = with_recovery_advisory_mark(tool_message, advisory)
+                advisory_chars += len(advisory)
 
         # 动态子智能体委派增强(层 1)— plan-driven delegation nudge. When this
         # batch's ``update_plan`` created or replaced the plan (the only tool
@@ -1994,6 +1997,7 @@ def build_react_graph(
         # default fast-path active.
         if tool_failures:
             result_dict["tool_failures"] = tool_failures
+            _cm_recovery_advisory_chars.set(advisory_chars)
         # B-85 ③ / B-84 第 3 条 —— run 级欠账:拿上一轮结转的账,套上本批的成败。
         # **不是**「最后一批的情况」:批 1 的失败没被同键的成功抵消掉,就一直留着,
         # 哪怕后面几批全干净。这个节点只在真跑过一批工具时执行,所以「没跑工具的
@@ -2341,7 +2345,7 @@ async def _workspace_block_tail(
     dedup 就会从**历史中段**摘掉旧块 —— 那等于每轮改写前缀, 从那一点往后的缓存全作废,
     成本要重算。结构保证:本函数造出来的那条消息只进 ``agent_node`` 的局部 ``messages``,
     两条返回路径(``persisted_messages`` 走 ``_extract_post_llm_messages`` 的"原列表之后
-    的后缀"、``emit_messages`` 只装 advisory / dispatch / response)都够不着它。
+    的后缀"、``emit_messages`` 只装 dispatch / response)都够不着它。
     ``test_the_block_never_lands_in_the_checkpoint`` 钉住这一条。
 
     **挂尾部**, 与 :func:`_append_tail_human_message` 同一个位置口径:它是隐藏
@@ -2697,35 +2701,6 @@ def _apply_failure_ledger(
         elif failure.error_class != "transient":
             ledger.setdefault(key, failure)
     return list(ledger.values())
-
-
-def _build_recovery_advisory(failures: list[ClassifiedToolError]) -> HumanMessage:
-    """Stream CM-1 (generalising L.L4) — render a ``<recovery-advisory>``
-    HumanMessage from the classified tool failures of the previous tools
-    batch (Mini-ADR CM-B2/CM-B4).
-
-    Generalises L-4's ``<mutation-advisory>`` to every tool failure: each
-    line carries the error class + summary + grounded recovery guidance,
-    so the model neither claims success on failed calls nor retries them
-    blindly. Lives as a HumanMessage (not SystemMessage) so the L1
-    prompt-cache prefix invariant — ``system`` is build-once /
-    replay-verbatim — stays intact.
-
-    RT-2 PR-4 (RT-ADR-9) — this advisory is orchestrator-authored guidance
-    that IS persisted into ``state["messages"]`` (so the next agent step
-    sees it), unlike the plan / per_session-memory injections which ride
-    the prompt view only. Being a ``type=human`` message in the checkpoint,
-    it would otherwise surface as a spurious USER bubble in the conversation
-    detail (the known CM-1 leak). ``expert_work_hide_from_ui`` marks it so the UI
-    bubble view (``control_plane.transcript.read_turns`` with
-    ``include_hidden=False``) filters it, while the durable record + the
-    search/audit mirror stay faithful (RT-ADR-9, Option A) and it still
-    reaches the model.
-    """
-    return HumanMessage(
-        content=render_recovery_advisory(failures),
-        additional_kwargs={"expert_work_hide_from_ui": True},
-    )
 
 
 def _plan_identity_hash(plan: Plan) -> str:

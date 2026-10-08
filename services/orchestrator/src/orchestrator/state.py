@@ -157,9 +157,11 @@ class AgentState(TypedDict):
     rows for tool calls that failed in the most recent ``tools`` batch —
     both error-path failures (classified at the catch site from the real
     exception) and the success-path ``mutation_not_landed`` case folded
-    in from L-4's mutation classifier. The next ``agent_node`` reads the
-    list, emits a ``<recovery-advisory>`` ``HumanMessage`` with grounded
-    per-tool recovery guidance, and resets the channel to ``[]``.
+    in from L-4's mutation classifier. B-163: the per-call
+    ``<recovery-advisory>`` itself rides the failing ``ToolMessage`` (marked
+    by the tools node, appended in the prompt view); the next
+    ``agent_node`` reads this list for CM-11 escalation and resets the
+    channel to ``[]``.
     Defaults to empty; tools_node only writes when at least one tool
     failed.
 
@@ -258,7 +260,7 @@ class AgentState(TypedDict):
     #: 按首次出现的顺序排。
     #:
     #: 与 ``tool_failures`` 的区别是它**不按轮重置**:``tool_failures`` 被
-    #: ``agent_node`` 读完、发完 ``<recovery-advisory>`` 就清空,走到 END 时
+    #: ``agent_node`` 读完就清空,走到 END 时
     #: 恒为空,拿不到。
     #:
     #: 记账键是 ``(资源空间, 标识)``,**按写的是哪份东西记,不按哪个工具写的它**:

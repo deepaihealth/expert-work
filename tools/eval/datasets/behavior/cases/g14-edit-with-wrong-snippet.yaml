@@ -1,0 +1,16 @@
+id: g14-edit-with-wrong-snippet
+agent: eval-general
+shape: 工具中途失败一次后接着做完(B-163)
+fixtures: [product-notes.md]
+# 提示词里给的原文片段故意抄错(文件里是「第 3 条」,带空格):照抄去 edit_file 必然失败一次
+# (没落地,同一路径记一笔欠账);模型要读出真实原文再改,同一路径改成功就把欠账抵消,能判 completed。
+requires_tool_error: true
+turns:
+  - prompt: |
+      工作区的 uploads/product-notes.md 是产品更新说明。请先用 bash 执行 `cp uploads/product-notes.md notes.md`。
+      然后直接用 edit_file 修改 notes.md(不用先读):old_string 用「AlphaDesk 第3条更新说明:修复若干问题,提升稳定性。」,在这一行末尾加上「(已复核)」。
+      除了第 3 行末尾加的这几个字,其余内容一个字都不要动。
+checks:
+  - {type: completed}
+  - {type: workspace_file_contains, path: notes.md, all: ["003. AlphaDesk 第 3 条更新说明:修复若干问题,提升稳定性。(已复核)"]}
+  - {type: workspace_file_unchanged_lines, path: notes.md, fixture: product-notes.md, except_lines: [3]}

@@ -131,8 +131,10 @@ def test_list_content_gets_a_text_part_not_a_rewrite() -> None:
     ]
 
 
-def test_after_a_tool_failure_the_block_follows_the_advisory_without_a_new_message() -> None:
-    """恢复建议本身是落库的隐藏 user 段, 排在工具结果后面;平台段跟在它末尾, 不新增消息。"""
+def test_after_a_legacy_advisory_the_block_follows_it_without_a_new_message() -> None:
+    """B-163 之前落库的恢复建议是隐藏 user 段, 排在工具结果后面;尾部是它时平台段跟在它
+    末尾, 不新增消息。(B-163 之后不再产生这种消息, 建议贴在工具结果上, 见
+    ``test_recovery_advisory.py``。)"""
     result = ToolMessage(content="boom", tool_call_id="c1")
     advisory = HumanMessage(
         content="<recovery-advisory>retry</recovery-advisory>",
@@ -206,6 +208,20 @@ def test_the_tag_is_explained_once_in_every_system_prompt() -> None:
     prompt = _assemble_system_prompt(base="you are a test agent", skill_fragments=[])
     assert prompt.count(PLATFORM_CONTEXT_SYSTEM_CLAUSE) == 1
     assert "not written by the user" in PLATFORM_CONTEXT_SYSTEM_CLAUSE
+
+
+def test_the_system_prompt_says_where_the_recovery_advisory_now_sits() -> None:
+    """B-163 —— 建议贴在失败的工具结果末尾:系统提示词要说清它是平台贴的, 不是工具输出、
+    也不是用户写的。"""
+    sentence = next(
+        line
+        for line in PLATFORM_CONTEXT_SYSTEM_CLAUSE.splitlines()
+        if "<recovery-advisory>" in line
+    )
+    assert "after a failed tool result" in sentence
+    assert "attached by the platform" in sentence
+    assert "not part of the tool's output" in sentence
+    assert "not written by the user" in sentence
 
 
 @dataclass
