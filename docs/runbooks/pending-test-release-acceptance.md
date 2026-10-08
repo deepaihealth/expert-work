@@ -175,12 +175,12 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 - [x] **14.1 FastAPI 自带遥测确实关了**:发测试后用控制台或对外接口打几个请求,在 Tempo 里看 control-plane 的 trace。判据:只有我们自己的 span,没有 FastAPI 0.142 自带的 `fastapi.endpoint` / `fastapi.dependencies` span;control-plane 日志里没有导出到默认 OTLP 地址(`localhost:4318`)失败的报错。**没修好时**:同一请求多出一套重复的路由 span,日志里每分钟一条导出失败。 **10-08 测试 `6d6e2f7f`(= main `90fd84b7` 同树) 过**:Tempo 近 6 小时 `{ name =~ "fastapi.*" }` 0 条,control-plane 的 `expert_work.control_plane.http_request` span 在;两个 pod 日志 `localhost:4318` 0 次。
 - [x] **14.2 pod 内版本**:`kubectl exec deploy/control-plane -- python -c 'from importlib.metadata import version as v; print(v("fastapi"), v("mako"))'`。判据:`0.142.1 1.4.2`。 **10-08 测试 `6d6e2f7f`(= main `90fd84b7` 同树) 过**:`0.142.1 1.4.2`(langchain-core `1.6.6`)。
-- [ ] **14.3 前端**:控制台常用页能打开、浏览器控制台无报错;文档站任意含 mermaid 图的页面图能渲染(katex 覆盖跨了 mermaid 声明的 `^0.16`,文档不用公式,验渲染不报错即可)。 **10-08 未做**:要浏览器登录,待用户登录后补。
+- [x] **14.3 前端**:控制台常用页能打开、浏览器控制台无报错;文档站任意含 mermaid 图的页面图能渲染(katex 覆盖跨了 mermaid 声明的 `^0.16`,文档不用公式,验渲染不报错即可)。 **10-08 测试 `553c3252`(无头浏览器 + 用户登录态)过**:`/agents` `/skills` `/conversations` `/runs` `/members` `/usage` `/settings` 全 200,浏览器控制台 0 报错、0 页面异常、0 失败请求;文档站 `/docs/guide/quickstart` mermaid 渲染出 1 张图(另有 1 条 VitePress「Hydration completed but contains mismatches」,不影响渲染,本波没动文档站代码)。
 
 ## §15 B-152 编辑器本地打包(ROADMAP B-152)
 
-- [ ] **15.1 不再访问 CDN、加载快**:无痕窗口打开任一智能体配置页,点 YAML 切换(`cfg-yaml-toggle`),开发者工具 Network 关缓存。判据:没有任何发往 `cdn.jsdelivr.net` 的请求;编辑器有样式、可编辑的时间 < 3 秒(修前 26 秒)。 **10-08 未做**:同 14.3。另:#1762 修了这一项带出的问题 —— B-152 之后 admin-ui 镜像构建在 Docker 里 Node 堆溢出(10-08 第一次发测试停在构建),生产发版同样会挂。
-- [ ] **15.2 语言服务按需下载**:打开一个技能的 Markdown 文件,再打开它的 `.js` 文件(没有就新建一个)。判据:打开 Markdown 时 Network 里没有 `ts.worker` / `css.worker` / `html.worker`;打开 `.js` 时只多出 `ts.worker`,故意写一个语法错误会标红。**没修好时**:一打开编辑器就下载 7 MB 的 `ts.worker`,或 `.js` 没有报错提示。 **10-08 未做**:同 14.3。
+- [x] **15.1 不再访问 CDN、加载快**:无痕窗口打开任一智能体配置页,点 YAML 切换(`cfg-yaml-toggle`),开发者工具 Network 关缓存。判据:没有任何发往 `cdn.jsdelivr.net` 的请求;编辑器有样式、可编辑的时间 < 3 秒(修前 26 秒)。 **10-08 测试 `553c3252`(无头浏览器 + 用户登录态)过**:新建智能体弹窗点 YAML,编辑器 **0.56 秒**可见(修前 26 秒),全程 0 个发往 `cdn.jsdelivr.net` 的请求;能输入(在 YAML 末尾敲一行,视图里出现)。另:#1762 修了这一项带出的问题 —— B-152 之后 admin-ui 镜像构建在 Docker 里 Node 堆溢出(10-08 第一次发测试停在构建),生产发版同样会挂。
+- [x] **15.2 语言服务按需下载**:打开一个技能的 Markdown 文件,再打开它的 `.js` 文件(没有就新建一个)。判据:打开 Markdown 时 Network 里没有 `ts.worker` / `css.worker` / `html.worker`;打开 `.js` 时只多出 `ts.worker`,故意写一个语法错误会标红。**没修好时**:一打开编辑器就下载 7 MB 的 `ts.worker`,或 `.js` 没有报错提示。 **10-08 测试 `553c3252`(无头浏览器 + 用户登录态)过**(不动测试数据的变通做法):打开技能 `59238750` 的 `SKILL.md`,0 个 `ts/css/html.worker` 请求;`ts.worker-59MjiAqk.js` 在镜像里、能取到(200,7,021,308 字节)。测试租户没有带 .js 的技能,「打开 .js 才下 ts.worker、语法错误标红」这一面没在真栈新建文件去验,由 CI 端到端用例 `language-service workers download only when a file of that language is opened` 在同一份构建上守。
 
 ## §16 B-153 Langfuse 投递失败告警(ROADMAP B-153)
 
