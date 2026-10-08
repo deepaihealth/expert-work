@@ -274,7 +274,8 @@ class AgentState(TypedDict):
     #: 调工具 A 失败、批 2 调工具 B 成功、然后模型给出文字答复 —— 终局那一批是
     #: 干净的,于是判 ``completed=true``,而 A 从来没成功过。照 hermes-agent 的
     #: ``turn_explainers._record_file_mutation_result`` 改成按键记账 + 抵消
-    #: (差别是它只管文件变更类工具,这里管全部工具)。
+    #: (差别是它只管文件变更类工具,这里管声明只读以外的全部工具,
+    #: 见 B-164 ``_is_read_only_failure``)。
     #:
     #: **已知局限**:取不到路径的工具只有工具名这一层粒度 —— 一次失败的
     #: ``exec_python`` 会被另一次跑完全不相干脚本的 ``exec_python`` 抵消掉。

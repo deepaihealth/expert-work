@@ -2677,7 +2677,7 @@ def _apply_failure_ledger(
     """把一批工具调用的成败套到 run 级欠账上,返回还没被抵消的失败。
 
     照 hermes-agent ``turn_explainers._record_file_mutation_result`` 的记账法
-    (差别是它只管文件变更类工具,这里管全部工具):
+    (差别是它只管文件变更类工具,这里管声明只读以外的全部工具,见 B-164 ``_is_read_only_failure``):
 
     * 非瞬态失败 → 以该键记一条,**同键已有就保留先出现的那条** ——
       第一条错误信息比最后一条有用;
