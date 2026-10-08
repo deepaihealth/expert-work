@@ -111,18 +111,18 @@ def test_fixture_facts_the_cases_rely_on() -> None:
     assert "每周快走3次" in plan and "23:30前入睡" in plan
 
 
-def test_g13_g14_fixture_facts() -> None:
-    """B-163 恢复用例依赖的开局事实:g13 读的 A 组合计、g14 第 3 行原文(提示词里故意抄错)。"""
-    [g13] = load_cases(CASES_DIR, only=["g13-skip-missing-input"])
-    [g14] = load_cases(CASES_DIR, only=["g14-edit-with-wrong-snippet"])
-    assert g13.requires_tool_error and g14.requires_tool_error
+def test_g14_g15_fixture_facts() -> None:
+    """B-163 恢复用例依赖的开局事实:g14 读的 A 组合计、g15 第 3 行原文(提示词里故意抄错)。"""
+    [g14] = load_cases(CASES_DIR, only=["g14-skip-missing-input"])
+    [g15] = load_cases(CASES_DIR, only=["g15-edit-with-wrong-snippet"])
+    assert g14.requires_tool_error and g15.requires_tool_error
     rows = (FIXTURES_DIR / "sales.csv").read_text(encoding="utf-8").splitlines()[1:]
     assert sum(int(r.split(",")[1]) for r in rows if r.startswith("A,")) == 1045
-    assert not (FIXTURES_DIR / "sales-q4.csv").exists(), "g13 要的就是读一个不存在的文件"
+    assert not (FIXTURES_DIR / "sales-q4.csv").exists(), "g14 要的就是读一个不存在的文件"
     line3 = (FIXTURES_DIR / "product-notes.md").read_text(encoding="utf-8").splitlines()[2]
     assert line3 == "003. AlphaDesk 第 3 条更新说明:修复若干问题,提升稳定性。"
     wrong = "AlphaDesk 第3条更新说明:修复若干问题,提升稳定性。"
-    assert wrong in g14.turns[0].prompt and wrong not in line3, "抄错的片段必须真的对不上"
+    assert wrong in g15.turns[0].prompt and wrong not in line3, "抄错的片段必须真的对不上"
 
 
 def test_g02_fixture_has_the_three_outdated_lines_where_the_case_says() -> None:

@@ -1,4 +1,4 @@
-id: g14-edit-with-wrong-snippet
+id: g15-edit-with-wrong-snippet
 agent: eval-general
 shape: 工具中途失败一次后接着做完(B-163)
 fixtures: [product-notes.md]
