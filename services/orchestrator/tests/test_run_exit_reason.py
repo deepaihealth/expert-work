@@ -575,32 +575,115 @@ async def test_reading_a_file_before_creating_it_is_not_left_unfinished() -> Non
     assert _completed(state) is True
 
 
-@pytest.mark.asyncio
-async def test_a_read_only_failure_other_than_not_found_still_counts() -> None:
-    """收窄只收「找不到」:只读工具别的失败(权限、上游报错……)是**没读到**,
-    后面的内容可能就缺了这一块,照旧记账。"""
+async def _read_then_answer(
+    *,
+    exc: type[Exception],
+    error: str,
+    tool: str = "read_file",
+    read_only: bool = True,
+) -> AgentState:
+    """第一次调用 ``tool`` 失败(``exc(error)``),随后文字收尾。"""
     llm = _ScriptedLLM(
         responses=[
-            AIMessage(content="", tool_calls=[_tc("read_file", "tc-1", {"path": "a.md"})]),
+            AIMessage(content="", tool_calls=[_tc(tool, "tc-1", {"path": "a.md"})]),
             AIMessage(content="方案已交付"),
         ]
     )
     registry = ToolRegistry()
     registry.register(
         _ScriptedTool(
-            name="read_file",
+            name=tool,
             path_arg="path",
-            read_only=True,
+            read_only=read_only,
             fail_on=frozenset({0}),
-            exc=PermissionError,
-            error="permission denied",
+            exc=exc,
+            error=error,
         )
     )
+    return await _run(llm, registry)
+
+
+@pytest.mark.parametrize(
+    ("exc", "error"),
+    [
+        pytest.param(
+            ValueError,
+            "read_file path must be a relative workspace path without '..'",
+            id="invalid_arguments",
+        ),
+        pytest.param(PermissionError, "permission denied", id="permission_denied"),
+        pytest.param(OSError, "boom", id="unknown"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_read_only_failure_of_any_class_is_not_left_unfinished(
+    exc: type[Exception], error: str
+) -> None:
+    """B-164(10-08 B-140 h01 第 3 次):``read_file`` 带 ``..`` 路径被拒(``invalid_arguments``),
+    模型换 ``skill_view`` 读到同一份内容、正常交付 —— 只读工具的键是 ``("tool", 名)``,
+    换工具永远还不上, run 被判没做完。声明只读的工具,非瞬态失败**无论哪一类**都不进账。
+    """
+    state = await _read_then_answer(exc=exc, error=error)
+
+    assert state.get("exit_reason") == "text_response", "前提:模型是自然说完的"
+    assert _failure_keys(state) == []
+    assert _completed(state) is True
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_failure_still_reaches_the_error_count_and_advisory() -> None:
+    """只改账本成员资格:失败照样走分类、计数(``_cm_tool_error_total``)与恢复提示。"""
+    from orchestrator.graph_builder import builder as builder_mod
+
+    counter = builder_mod._cm_tool_error_total.labels(
+        error_class="invalid_arguments", tool="read_file"
+    )
+    before = counter._value.get()
+    state = await _read_then_answer(exc=ValueError, error="read_file path must be a relative path")
+
+    assert counter._value.get() == before + 1
+    advisories = [
+        m for m in state["messages"] if "recovery-advisory" in str(getattr(m, "content", ""))
+    ]
+    assert advisories, "恢复提示仍要注入"
+
+
+@pytest.mark.asyncio
+async def test_a_write_tool_invalid_arguments_still_counts() -> None:
+    """只收**声明为只读**的工具:写类工具的参数错意味着那次写没落地,照旧记账。"""
+    state = await _read_then_answer(
+        exc=ValueError, error="write_file path must be relative", tool="write_file", read_only=False
+    )
+
+    assert [k[0] for k in _failure_keys(state)] == ["write_file"]
+    assert _completed(state) is False
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_tool_still_counts() -> None:
+    """``spec is None``(模型调了没注册的工具)不是「声明只读」,照旧记账。"""
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_tc("ask_image", "tc-1", {"path": "a.png"})]),
+            AIMessage(content="方案已交付"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(_ScriptedTool(name="read_file", path_arg="path", read_only=True))
 
     state = await _run(llm, registry)
 
-    assert [k[0] for k in _failure_keys(state)] == ["read_file"]
+    assert _failure_classes(state) == ["unknown_tool"]
     assert _completed(state) is False
+
+
+@pytest.mark.asyncio
+async def test_a_transient_read_only_failure_is_unchanged() -> None:
+    """transient 既不进账也不抵消:账上本来就没有它,行为不变。"""
+    state = await _read_then_answer(exc=OSError, error="504 Gateway Time-out")
+
+    assert _failure_keys(state) == []
+    assert _completed(state) is True
 
 
 @pytest.mark.asyncio

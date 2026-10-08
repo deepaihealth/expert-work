@@ -34,6 +34,10 @@ class Completed(_Strict):
     type: Literal["completed"]
 
 
+class NotCompleted(_Strict):
+    type: Literal["not_completed"]
+
+
 class ExitReason(_Strict):
     type: Literal["exit_reason"]
     value: str
@@ -184,6 +188,7 @@ class TurnTokensMax(_Strict):
 
 Check = Annotated[
     Completed
+    | NotCompleted
     | ExitReason
     | FinalTextContains
     | FinalTextNotContains

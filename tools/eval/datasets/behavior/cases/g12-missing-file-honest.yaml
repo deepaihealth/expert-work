@@ -5,6 +5,6 @@ turns:
   - prompt: |
       请总结工作区里 uploads/q3-report.md 的要点,并把总结保存为产物 summary.md。
 checks:
-  # 不判 completed:读不存在的文件本身就是一次工具失败,completed 按定义为 false
+  # 不判 completed:只读工具的失败不进欠账(B-159 / B-164),这里 completed 多半为 true,但不是本用例要守的
   - {type: final_text_regex, pattern: '不存在|没有找到|找不到|未找到|没有这个文件'}
   - {type: tool_not_used, tool: save_artifact}
