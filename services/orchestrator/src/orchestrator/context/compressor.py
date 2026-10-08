@@ -70,8 +70,9 @@ Mini-ADR L-2 highlights:
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -200,6 +201,23 @@ _SUMMARY_ROLE_CHAR_CAPS: dict[str, int] = {
     "default": 4_000,
 }
 
+#: B-165 — per-call char cap on a tool call's rendered arguments (JSON), head
+#: 2/3 + tail like every other cap here. Same as the tool-result cap: a step's
+#: intent (the call) and its outcome (the result) get equal room, ~3k chars per
+#: step together. A single ``write_file`` can carry 20k+ chars; the summary
+#: needs WHAT was written WHERE (path + opening + ending), not the body — the
+#: file is in the workspace and re-readable. hermes uses the same 1,500.
+_SUMMARY_TOOL_ARGS_CHAR_CAP: int = 1_500
+
+#: B-165 — order in which over-budget lines collapse to one-line stubs, oldest
+#: first within each kind: tool results (re-obtainable, and the paired call
+#: line still says what was attempted), then tool-call arguments (the record
+#: of what the agent did — "which files changed" is what summaries lose most
+#: often, so it outlives the results), then assistant prose. User lines never
+#: collapse. Arguments sit after results and before ANY conversation text, so
+#: they can never crowd out what the user or the assistant said.
+_SUMMARY_COLLAPSE_ORDER: tuple[str, ...] = ("tool", "call", "assistant")
+
 #: RT-ADR-10 / B-141 — hard char budget for the summariser's own input payload.
 #: B-141 raised it from 24k chars (~6k tokens, ~4% of a 200k-token middle) to
 #: 160k (~40k tokens at chars//4; at most ~100k for dense CJK) — still well
@@ -237,10 +255,19 @@ _SUMMARY_STRUCTURE_RULES: str = (
     "conversation explicitly stated — never invent future steps."
 )
 
+#: B-165 — what the transcript lines look like now that tool calls are in it.
+_SUMMARY_INPUT_FORMAT_NOTE: str = (
+    "The excerpt has one line per message: 'user: ...', 'assistant: ...', "
+    "'assistant called <tool>: <arguments>' (a tool call the assistant made, "
+    "arguments as JSON, long ones truncated) and 'tool (<tool>): <result>'. "
+    "Record in plain words what the tool calls did — which files were written "
+    "or changed and what they contain, which commands ran and what came back. "
+)
+
 _SUMMARISER_SYSTEM_PROMPT: str = (
     "You are a context compressor. Summarise the conversation excerpt "
     "below, capturing the essential facts, decisions, and pending work "
-    "items. " + _SUMMARY_STRUCTURE_RULES
+    "items. " + _SUMMARY_INPUT_FORMAT_NOTE + _SUMMARY_STRUCTURE_RULES
 )
 
 #: Stream CM-7 (Mini-ADR CM-H2) — second and later passes update the
@@ -252,7 +279,9 @@ _SUMMARY_UPDATER_SYSTEM_PROMPT: str = (
     "revise items the new events change, and drop Pending items that "
     "were completed or superseded. Rewrite '## Progress' entirely so it "
     "reflects the latest state (do not keep stale 'in progress' or 'next' "
-    "lines from the previous summary). Output ONLY the updated summary. " + _SUMMARY_STRUCTURE_RULES
+    "lines from the previous summary). Output ONLY the updated summary. "
+    + _SUMMARY_INPUT_FORMAT_NOTE
+    + _SUMMARY_STRUCTURE_RULES
 )
 
 
@@ -490,53 +519,97 @@ def _format_middle_for_summary(
     ``char_budget`` so the summariser call itself can never overflow
     the summariser's window.
 
-    B-141: when the lines exceed ``char_budget``, tool results are collapsed
-    to one line each starting from the OLDEST, then assistant messages the
-    same way; user messages are never collapsed. Only if that still does not
-    fit does the old head 2/3 + tail 1/3 cut apply (defensive). The old cut
-    alone dropped the middle of the middle wholesale — exactly where "which
-    step are we on" usually sits.
+    B-141: when the lines exceed ``char_budget``, lines are collapsed to one
+    line each starting from the OLDEST, kind by kind in
+    ``_SUMMARY_COLLAPSE_ORDER``; user messages are never collapsed. Only if
+    that still does not fit does the old head 2/3 + tail 1/3 cut apply
+    (defensive). The old cut alone dropped the middle of the middle
+    wholesale — exactly where "which step are we on" usually sits.
+
+    B-165: an assistant message's tool calls render as one
+    ``assistant called <tool>: <JSON arguments>`` line each (arguments capped
+    by ``_SUMMARY_TOOL_ARGS_CHAR_CAP``), and tool results as
+    ``tool (<tool>): <text>`` — before this the summariser never saw what
+    ``write_file`` wrote or which command ran. No call-expression syntax
+    (``name(...)``), same reason as the RT-ADR-7 skill reference line.
     """
+    call_names = _tool_call_names(middle)
     lines: list[str] = []
-    collapsible: list[tuple[int, str]] = []  # (line index, one-line stub) in age order
+    collapsible: list[tuple[int, str, str]] = []  # (line index, kind, one-line stub) in age order
     for msg in middle:
         # B-67 — hidden HumanMessages (inputs block, advisories) are platform
         # scaffolding; the summary is durable text, so they stay out of it.
         if is_hidden(msg):
             continue
-        role = _role_label(msg)
-        # RT-2 PR-3 (RT-ADR-7) — a successful lazy-skill read is fed to the
-        # summariser as its one-line reference (name + path, no tool-call
-        # syntax), never its body: the summary keeps the skill identity and
-        # the input budget goes to the actual conversation. ``None`` (not a
-        # skill_view message, non-success result, or no skill_name) keeps
-        # the default path byte-identical.
-        reference = skill_view_reference(msg)
-        if reference is not None:
-            lines.append(f"{role}: {reference}")
-            continue
-        text = _message_to_text(msg).strip()
-        if text:
-            cap = _SUMMARY_ROLE_CHAR_CAPS.get(role, _SUMMARY_ROLE_CHAR_CAPS["default"])
-            if role in ("tool", "assistant"):
-                label = getattr(msg, "name", None) if role == "tool" else None
-                stub = (
-                    f"({label}, {len(text)} chars omitted)"
-                    if label
-                    else f"({len(text)} chars omitted)"
-                )
-                collapsible.append((len(lines), f"{role}: {stub}"))
-            lines.append(f"{role}: {_bound_text(text, cap)}")
+        for kind, line, stub in _summary_lines(msg, call_names):
+            if stub is not None:
+                collapsible.append((len(lines), kind, stub))
+            lines.append(line)
     total = sum(len(line) for line in lines) + 2 * max(len(lines) - 1, 0)
-    for wanted_role in ("tool", "assistant"):
-        for idx, stub in collapsible:
+    for wanted_kind in _SUMMARY_COLLAPSE_ORDER:
+        for idx, kind, stub in collapsible:
             if total <= char_budget:
                 break
-            if not stub.startswith(f"{wanted_role}: ") or len(stub) >= len(lines[idx]):
+            if kind != wanted_kind or len(stub) >= len(lines[idx]):
                 continue
             total -= len(lines[idx]) - len(stub)
             lines[idx] = stub
     return _bound_text("\n\n".join(lines), char_budget)
+
+
+def _tool_call_names(middle: Sequence[BaseMessage]) -> dict[str, str]:
+    """B-165 — ``tool_call_id`` → tool name, from the middle's assistant calls.
+
+    Some error-path ``ToolMessage``s (action-screening block, approval drift)
+    carry no ``name``; the id still pairs them with the call that made them.
+    """
+    names: dict[str, str] = {}
+    for msg in middle:
+        if isinstance(msg, AIMessage):
+            for call in msg.tool_calls:
+                if call.get("id") and call.get("name"):
+                    names[str(call["id"])] = str(call["name"])
+    return names
+
+
+def _summary_lines(
+    msg: BaseMessage, call_names: Mapping[str, str]
+) -> list[tuple[str, str, str | None]]:
+    """One message's transcript lines as ``(kind, line, collapse stub or None)``."""
+    role = _role_label(msg)
+    label = role
+    if isinstance(msg, ToolMessage):
+        name = msg.name or call_names.get(msg.tool_call_id)
+        label = f"tool ({name})" if name else role
+    # RT-2 PR-3 (RT-ADR-7) — a successful lazy-skill read is fed to the
+    # summariser as its one-line reference (name + path, no tool-call
+    # syntax), never its body: the summary keeps the skill identity and
+    # the input budget goes to the actual conversation. ``None`` (not a
+    # skill_view message, non-success result, or no skill_name) keeps
+    # the default path.
+    reference = skill_view_reference(msg)
+    if reference is not None:
+        return [(role, f"{label}: {reference}", None)]
+    out: list[tuple[str, str, str | None]] = []
+    text = _message_to_text(msg).strip()
+    if text:
+        cap = _SUMMARY_ROLE_CHAR_CAPS.get(role, _SUMMARY_ROLE_CHAR_CAPS["default"])
+        stub = f"{label}: ({len(text)} chars omitted)" if role in ("tool", "assistant") else None
+        out.append((role, f"{label}: {_bound_text(text, cap)}", stub))
+    if isinstance(msg, AIMessage):
+        for call in msg.tool_calls:
+            # Insertion order = the order the model emitted the arguments;
+            # json.dumps of the same dict is byte-identical every time.
+            args = json.dumps(call.get("args") or {}, ensure_ascii=False, default=str)
+            prefix = f"assistant called {call.get('name') or '?'}: "
+            out.append(
+                (
+                    "call",
+                    prefix + _bound_text(args, _SUMMARY_TOOL_ARGS_CHAR_CAP),
+                    f"{prefix}({len(args)} chars of arguments omitted)",
+                )
+            )
+    return out
 
 
 def _role_label(msg: BaseMessage) -> str:

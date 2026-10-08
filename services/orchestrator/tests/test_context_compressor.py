@@ -27,6 +27,7 @@ from orchestrator.context import (
 from orchestrator.context.compressor import (
     _SUMMARY_INPUT_CHAR_BUDGET,
     _SUMMARY_ROLE_CHAR_CAPS,
+    _SUMMARY_TOOL_ARGS_CHAR_CAP,
     _bound_text,
     _format_middle_for_summary,
 )
@@ -1151,7 +1152,7 @@ def test_format_middle_collapses_oldest_tool_results_first() -> None:
     out = _format_middle_for_summary(middle, char_budget=20_000)
     assert "tool-head-059" in out and "tool-tail-059" in out
     assert "tool-head-000" not in out
-    assert "tool: (bash, " in out and "chars omitted)" in out
+    assert "tool (bash): (" in out and "chars omitted)" in out  # B-165: 结果行带工具名
 
 
 def test_format_middle_role_caps_keep_user_text_longer_than_tool_text() -> None:
@@ -1207,3 +1208,241 @@ async def test_on_compacted_reports_summary_input_chars() -> None:
     assert len(seen) == 1
     transcript = str(summariser.prompts[0][1].content)
     assert seen[0].summary_input_chars == len(transcript)
+
+
+# ---------------------------------------------------------------------------
+# B-165 —— 摘要模型看得到工具调用(工具名 + 参数),工具结果行带工具名
+# ---------------------------------------------------------------------------
+
+
+def _call(name: str, args: dict[str, object], call_id: str) -> dict[str, object]:
+    return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
+
+
+def test_format_middle_renders_tool_call_name_and_args() -> None:
+    """B-165 —— 助手的工具调用以「工具名 + 参数」进摘要输入:写了哪个文件、写了什么,
+    摘要模型看得到。只调工具、没写正文的助手消息不再整条消失。"""
+    out = _format_middle_for_summary(
+        [
+            HumanMessage(content="draft the notes"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _call("write_file", {"path": "notes/a.md", "content": "body-B165"}, "tc-1")
+                ],
+            ),
+            ToolMessage(content="ok", tool_call_id="tc-1", name="write_file"),
+            AIMessage(
+                content="now checking",
+                tool_calls=[_call("read_file", {"path": "notes/a.md"}, "tc-2")],
+            ),
+        ]
+    )
+    assert 'assistant called write_file: {"path": "notes/a.md", "content": "body-B165"}' in out
+    assert "assistant: now checking" in out
+    assert 'assistant called read_file: {"path": "notes/a.md"}' in out
+    # 输入里不出现调用表达式的写法(RT-ADR-7:摘要里出现调用形状会诱导重跑)。
+    assert "write_file(" not in out
+
+
+def test_format_middle_caps_long_tool_args_head_and_tail() -> None:
+    """B-165 —— 一次 write_file 可以带 2 万字符以上;参数按每次调用的上限截,保留头和尾,
+    中间省略并留标记,同 ``_bound_text``。"""
+    content = "ARG-HEAD " + "m" * 10_000 + " ARG-MIDDLE " + "n" * 10_000 + " ARG-TAIL"
+    out = _format_middle_for_summary(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[_call("write_file", {"path": "big.md", "content": content}, "tc-1")],
+            )
+        ]
+    )
+    cap = _SUMMARY_TOOL_ARGS_CHAR_CAP
+    assert "ARG-HEAD" in out
+    assert "ARG-TAIL" in out
+    assert "ARG-MIDDLE" not in out
+    assert "chars truncated" in out
+    assert len(out) <= len("assistant called write_file: ") + cap + 100
+
+
+def test_format_middle_tool_result_lines_carry_tool_name() -> None:
+    """B-165 —— 工具结果行带上工具名;``ToolMessage`` 没带 name(拦截 / 审批漂移那几条)
+    时按 ``tool_call_id`` 从前面的调用里找回;两处都找不到才退回不带名字的老样子。"""
+    out = _format_middle_for_summary(
+        [
+            AIMessage(content="", tool_calls=[_call("bash", {"cmd": "ls"}, "tc-1")]),
+            ToolMessage(content="listing-result", tool_call_id="tc-1", name="bash"),
+            AIMessage(content="", tool_calls=[_call("edit_file", {"path": "x"}, "tc-2")]),
+            ToolMessage(content="blocked-result", tool_call_id="tc-2"),
+            ToolMessage(content="orphan-result", tool_call_id="tc-unknown"),
+        ]
+    )
+    assert "tool (bash): listing-result" in out
+    assert "tool (edit_file): blocked-result" in out
+    assert "tool: orphan-result" in out
+
+
+def _arg_step(i: int, *, args_chars: int, result_chars: int) -> list[BaseMessage]:
+    return [
+        HumanMessage(content=f"user-step-{i:03d}"),
+        AIMessage(
+            content=f"assistant-step-{i:03d} " + "p" * 300,
+            tool_calls=[
+                _call(
+                    "write_file",
+                    {"path": f"f{i:03d}.md", "content": f"args-{i:03d} " + "a" * args_chars},
+                    f"tc-{i}",
+                )
+            ],
+        ),
+        ToolMessage(
+            content=f"result-{i:03d} " + "r" * result_chars,
+            tool_call_id=f"tc-{i}",
+            name="write_file",
+        ),
+    ]
+
+
+def test_format_middle_collapses_tool_results_before_tool_args() -> None:
+    """B-165 —— 收起顺序:旧工具结果 → 旧工具参数 → 旧助手正文;用户原话不收。
+    预算只够收起工具结果时,每一次调用的参数都还在。"""
+    middle = [m for i in range(20) for m in _arg_step(i, args_chars=1_000, result_chars=1_000)]
+    out = _format_middle_for_summary(middle, char_budget=30_000)
+    assert len(out) <= 30_000 + 100
+    for i in range(20):
+        assert f"args-{i:03d}" in out
+        assert f"user-step-{i:03d}" in out
+        assert f"assistant-step-{i:03d}" in out
+    assert "result-000" not in out
+    assert "tool (write_file): (" in out
+
+
+def test_format_middle_collapses_oldest_tool_args_before_assistant_text() -> None:
+    """B-165 —— 工具结果全收完还超,先从最旧的工具参数收起(留工具名),助手正文和用户原话
+    一条不丢,总长不超预算。"""
+    middle = [m for i in range(20) for m in _arg_step(i, args_chars=1_000, result_chars=1_000)]
+    out = _format_middle_for_summary(middle, char_budget=12_000)
+    assert len(out) <= 12_000 + 100
+    for i in range(20):
+        assert f"user-step-{i:03d}" in out
+        assert f"assistant-step-{i:03d}" in out
+    assert "args-019" in out
+    assert "args-000" not in out
+    assert "assistant called write_file: (" in out and "chars of arguments omitted)" in out
+
+
+def test_format_middle_total_budget_respected_with_tool_args() -> None:
+    """B-165 —— 参数进来之后总预算照样守住(超大参数 + 超大结果 + 超长正文)。"""
+    middle = [
+        m
+        for i in range(80)
+        for m in [
+            HumanMessage(content=f"u{i}-" + "y" * 5_000),
+            AIMessage(
+                content="z" * 5_000,
+                tool_calls=[_call("write_file", {"content": "w" * 30_000}, f"tc-{i}")],
+            ),
+            ToolMessage(content="v" * 30_000, tool_call_id=f"tc-{i}", name="write_file"),
+        ]
+    ]
+    out = _format_middle_for_summary(middle)
+    assert len(out) <= _SUMMARY_INPUT_CHAR_BUDGET + 100
+
+
+#: B-165 第 0 层 —— 12 根针按中段 5%~95% 均匀摆;其中 2 根只出现在 write_file 的参数里。
+_NEEDLE_KINDS: tuple[str, ...] = (
+    "user",
+    "assistant",
+    "tool",
+    "user",
+    "args",
+    "assistant",
+    "user",
+    "tool",
+    "user",
+    "args",
+    "assistant",
+    "user",
+)
+
+
+def _needle_history(steps: int) -> tuple[list[BaseMessage], list[str]]:
+    """合成长历史:每步 = 用户要求 + 助手说明与一次工具调用 + 工具结果;针埋在中段。"""
+    filler = "这一段是合成的工作记录,用于填充上下文长度。" * 40  # ~880 字符
+    needle_at = {
+        round((0.05 + 0.90 * k / (len(_NEEDLE_KINDS) - 1)) * (steps - 1)): k
+        for k in range(len(_NEEDLE_KINDS))
+    }
+    needles: list[str] = []
+    msgs: list[BaseMessage] = [
+        HumanMessage(content="head-0"),
+        AIMessage(content="head-1"),
+        HumanMessage(content="head-2"),
+        AIMessage(content="head-3"),
+    ]
+    for i in range(steps):
+        k = needle_at.get(i)
+        code = f"NDL-{k:02d}-{7310 + 37 * k}" if k is not None else None
+        kind = _NEEDLE_KINDS[k] if k is not None else None
+        if code is not None:
+            needles.append(code)
+        user = f"第 {i} 步:请处理文件 data_{i:03d}.csv。" + (
+            f"批次号 {code}。" if kind == "user" else ""
+        )
+        prose = f"好的,处理 data_{i:03d}.csv。" + (
+            f"记录编号 {code}。" if kind == "assistant" else ""
+        )
+        content = (f"# 结果 {code}\n" if kind == "args" else "# 结果\n") + filler * 3
+        result = ("读取完成 " + (f"校验码 {code} " if kind == "tool" else "")) + filler * 3
+        msgs += [
+            HumanMessage(content=user + filler),
+            AIMessage(
+                content=prose + filler,
+                tool_calls=[
+                    _call("write_file", {"path": f"out_{i:03d}.md", "content": content}, f"tc-{i}")
+                ],
+            ),
+            ToolMessage(content=result, tool_call_id=f"tc-{i}", name="write_file"),
+        ]
+    msgs += [HumanMessage(content=f"tail-{j}") for j in range(6)]
+    return msgs, needles
+
+
+@pytest.mark.asyncio
+async def test_needles_across_long_middle_all_reach_summariser_input() -> None:
+    """B-165 第 0 层(零 LLM)—— 一段长历史(按角色截完约 14 万字符,旧版 2.4 万预算会把
+    中段的中间整块丢掉)里埋 12 根唯一编号,2 根只在 write_file 参数里:走真实的
+    ``compress``,全部到达摘要模型的输入,且输入不超预算。永久回归保护。"""
+    msgs, needles = _needle_history(steps=30)
+    assert len(needles) == 12
+    summariser = _RecordingSummariser()
+    compressor = ContextCompressor(
+        llm_caller=summariser,
+        context_window=1_000_000,
+        head_keep=4,
+        tail_keep=6,
+        absolute_cap_tokens=10_000,
+    )
+    await compressor.compress(msgs)
+    assert len(summariser.prompts) == 1
+    transcript = str(summariser.prompts[0][1].content)
+    # 这段历史确实「长」:比旧上限大好几倍,又在现行预算之内(不靠收起逻辑过关)。
+    assert 100_000 < len(transcript) <= _SUMMARY_INPUT_CHAR_BUDGET
+    missing = [n for n in needles if n not in transcript]
+    assert missing == []
+
+
+@pytest.mark.asyncio
+async def test_prompts_describe_tool_call_lines() -> None:
+    """B-165 —— 两份提示词都说明输入里有「assistant called <工具>: <参数>」行,要求用平常话
+    记下这些调用做了什么;输出仍不许带调用写法。"""
+    summariser = _RecordingSummariser()
+    compressor = _compressor(summariser)
+    first = await compressor.compress(_conversation(head=2, middle=16, tail=2, char_per_msg=80))
+    grown = [*first, *_conversation(head=0, middle=16, tail=0, char_per_msg=80)]
+    await compressor.compress(grown)
+    for prompt in (summariser.prompts[0], summariser.prompts[-1]):
+        system = str(prompt[0].content)
+        assert "assistant called <tool>: <arguments>" in system
+        assert "which files were written or changed" in system
+        assert "Do not include any tool-call syntax" in system
