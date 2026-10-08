@@ -37,6 +37,9 @@
 | #1757 | B-142 缓存命中指标(按厂商口径)+ 记录规则 + 看板;估算漂移分母不再重复计缓存 | 是 | §18 |
 | #1755、#1756、#1758 | B-141 摘要读得更全 + 进度段;B-143 摘要默认同一家便宜型号;压缩评测用例 c01–c04 | 是 | §19 |
 | #1761 | B-162 平台段包进 `<platform-context>` 追加到最后一条消息末尾,不再另起 user 消息;系统提示词统一说明 | 是 | §20 |
+| #1762 | admin-ui 镜像构建给 Node 4 GB 堆(B-152 之后 Docker 里构建 OOM,10-08 第一次发测试停在这里) | 是 | 发测试本身 |
+| #1763 | B-159 漏网:`<tool> failed: not_found`(下划线)判成 resource_not_found,读一个还没建的文件不再记欠账 | 是 | §19.3 对照组 c02 带出 |
+| #1764 | B-161 漏网:白名单补 asyncpg 的 UUID(10-08 已合 `a7df771a`) | 否(读取策略,字节不变) | §17.1 |
 
 ## §1 B-136 读文件分页(ROADMAP B-136)
 
@@ -170,51 +173,51 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 ## §14 依赖修复(#1746 / #1749 / #1750 / #1751)
 
-- [ ] **14.1 FastAPI 自带遥测确实关了**:发测试后用控制台或对外接口打几个请求,在 Tempo 里看 control-plane 的 trace。判据:只有我们自己的 span,没有 FastAPI 0.142 自带的 `fastapi.endpoint` / `fastapi.dependencies` span;control-plane 日志里没有导出到默认 OTLP 地址(`localhost:4318`)失败的报错。**没修好时**:同一请求多出一套重复的路由 span,日志里每分钟一条导出失败。
-- [ ] **14.2 pod 内版本**:`kubectl exec deploy/control-plane -- python -c 'from importlib.metadata import version as v; print(v("fastapi"), v("mako"))'`。判据:`0.142.1 1.4.2`。
-- [ ] **14.3 前端**:控制台常用页能打开、浏览器控制台无报错;文档站任意含 mermaid 图的页面图能渲染(katex 覆盖跨了 mermaid 声明的 `^0.16`,文档不用公式,验渲染不报错即可)。
+- [x] **14.1 FastAPI 自带遥测确实关了**:发测试后用控制台或对外接口打几个请求,在 Tempo 里看 control-plane 的 trace。判据:只有我们自己的 span,没有 FastAPI 0.142 自带的 `fastapi.endpoint` / `fastapi.dependencies` span;control-plane 日志里没有导出到默认 OTLP 地址(`localhost:4318`)失败的报错。**没修好时**:同一请求多出一套重复的路由 span,日志里每分钟一条导出失败。 **10-08 测试 `6d6e2f7f`(= main `90fd84b7` 同树) 过**:Tempo 近 6 小时 `{ name =~ "fastapi.*" }` 0 条,control-plane 的 `expert_work.control_plane.http_request` span 在;两个 pod 日志 `localhost:4318` 0 次。
+- [x] **14.2 pod 内版本**:`kubectl exec deploy/control-plane -- python -c 'from importlib.metadata import version as v; print(v("fastapi"), v("mako"))'`。判据:`0.142.1 1.4.2`。 **10-08 测试 `6d6e2f7f`(= main `90fd84b7` 同树) 过**:`0.142.1 1.4.2`(langchain-core `1.6.6`)。
+- [ ] **14.3 前端**:控制台常用页能打开、浏览器控制台无报错;文档站任意含 mermaid 图的页面图能渲染(katex 覆盖跨了 mermaid 声明的 `^0.16`,文档不用公式,验渲染不报错即可)。 **10-08 未做**:要浏览器登录,待用户登录后补。
 
 ## §15 B-152 编辑器本地打包(ROADMAP B-152)
 
-- [ ] **15.1 不再访问 CDN、加载快**:无痕窗口打开任一智能体配置页,点 YAML 切换(`cfg-yaml-toggle`),开发者工具 Network 关缓存。判据:没有任何发往 `cdn.jsdelivr.net` 的请求;编辑器有样式、可编辑的时间 < 3 秒(修前 26 秒)。
-- [ ] **15.2 语言服务按需下载**:打开一个技能的 Markdown 文件,再打开它的 `.js` 文件(没有就新建一个)。判据:打开 Markdown 时 Network 里没有 `ts.worker` / `css.worker` / `html.worker`;打开 `.js` 时只多出 `ts.worker`,故意写一个语法错误会标红。**没修好时**:一打开编辑器就下载 7 MB 的 `ts.worker`,或 `.js` 没有报错提示。
+- [ ] **15.1 不再访问 CDN、加载快**:无痕窗口打开任一智能体配置页,点 YAML 切换(`cfg-yaml-toggle`),开发者工具 Network 关缓存。判据:没有任何发往 `cdn.jsdelivr.net` 的请求;编辑器有样式、可编辑的时间 < 3 秒(修前 26 秒)。 **10-08 未做**:同 14.3。另:#1762 修了这一项带出的问题 —— B-152 之后 admin-ui 镜像构建在 Docker 里 Node 堆溢出(10-08 第一次发测试停在构建),生产发版同样会挂。
+- [ ] **15.2 语言服务按需下载**:打开一个技能的 Markdown 文件,再打开它的 `.js` 文件(没有就新建一个)。判据:打开 Markdown 时 Network 里没有 `ts.worker` / `css.worker` / `html.worker`;打开 `.js` 时只多出 `ts.worker`,故意写一个语法错误会标红。**没修好时**:一打开编辑器就下载 7 MB 的 `ts.worker`,或 `.js` 没有报错提示。 **10-08 未做**:同 14.3。
 
 ## §16 B-153 Langfuse 投递失败告警(ROADMAP B-153)
 
 前置:先起 `kubectl logs -f` 把两个 control-plane pod 的日志写进文件,再动手。
 
-- [ ] **16.1 基线**:Prometheus 查 `count by (instance) (expert_work_langfuse_delivery_failures_total)` 每个实例 = 5(五个阶段都预先建了 0 值序列),`sum(increase(expert_work_langfuse_delivery_failures_total[24h]))` = 0。**不过时**:镜像没上、序列没预建(第一次失败会被 `increase` 漏掉)、或已有失败(会误报)。
-- [ ] **16.2 制造投递失败**:记下 `langfuse-web` 副本数后缩到 0,约 3 分钟;期间跑一次金丝雀(提示词带随机串,避开 E.13 缓存)。判据:2 分钟内服务那个 run 的 pod 上 `increase(...{stage="export"}[15m]) >= 1`;`ALERTS{alertname="ExpertWorkLangfuseDeliveryFailing",stage="export"}` 触发;企微 P2 群收到告警。**不过时**:计数一直是 0(进程里实际没用上我们的导出器,例如 Langfuse 客户端构造顺序被改,SDK 先到先得)。
+- [x] **16.1 基线**:Prometheus 查 `count by (instance) (expert_work_langfuse_delivery_failures_total)` 每个实例 = 5(五个阶段都预先建了 0 值序列),`sum(increase(expert_work_langfuse_delivery_failures_total[24h]))` = 0。**不过时**:镜像没上、序列没预建(第一次失败会被 `increase` 漏掉)、或已有失败(会误报)。 **10-08 测试 `6d6e2f7f`(= main `90fd84b7` 同树) 过**:`count(expert_work_langfuse_delivery_failures_total)` = 10(2 个 pod × 5 个阶段),`sum(increase(...[12h]))` = 0;`ExpertWorkLangfuseDeliveryFailing` 规则已加载。
+- [ ] **16.2 制造投递失败**:记下 `langfuse-web` 副本数后缩到 0,约 3 分钟;期间跑一次金丝雀(提示词带随机串,避开 E.13 缓存)。判据:2 分钟内服务那个 run 的 pod 上 `increase(...{stage="export"}[15m]) >= 1`;`ALERTS{alertname="ExpertWorkLangfuseDeliveryFailing",stage="export"}` 触发;企微 P2 群收到告警。**不过时**:计数一直是 0(进程里实际没用上我们的导出器,例如 Langfuse 客户端构造顺序被改,SDK 先到先得)。 **10-08 未做**:要停测试环境 Langfuse 约 3 分钟 + 用户看企微 P2 群,待用户同意。
 - [ ] **16.3 恢复**:`langfuse-web` 扩回原副本数、Ready 后再跑一次(新随机串)。判据:这次 run 的 trace 在 Langfuse 里能看到,`export` 计数不再涨;约 15 分钟后告警自动恢复,企微收到恢复消息。风险:窗口内测试环境 Langfuse 界面与写入不可用,这几分钟的 trace 丢失(仅测试环境)。
 
 ## §17 B-161 检查点类型登记(ROADMAP B-161)
 
 前置同 §16:先起 `kubectl logs -f` 写文件。
 
-- [ ] **17.1 警告与拒读都为 0**:跑 B-140 的 g05(五步计划)、g11(脚本报错后恢复,失败进欠账)、h02 / h07(多轮续跑)各一次,再用一个开了审批的智能体批一次续跑。判据:日志里 `Deserializing unregistered type` 0 次(发版前 `Plan` / `ClassifiedToolError` 各有)、`Blocked deserialization` 0 次;续跑后计划与步骤都在,对话页能打开。**不过时**:出现 `Blocked deserialization of <类型>`,续跑那一轮报错或计划丢失 —— 说明有类型漏登,当场回退本 PR。
+- [ ] **17.1 警告与拒读都为 0**:跑 B-140 的 g05(五步计划)、g11(脚本报错后恢复,失败进欠账)、h02 / h07(多轮续跑)各一次,再用一个开了审批的智能体批一次续跑。判据:日志里 `Deserializing unregistered type` 0 次(发版前 `Plan` / `ClassifiedToolError` 各有)、`Blocked deserialization` 0 次;续跑后计划与步骤都在,对话页能打开。**不过时**:出现 `Blocked deserialization of <类型>`,续跑那一轮报错或计划丢失 —— 说明有类型漏登,当场回退本 PR。 **10-08 测试 `6d6e2f7f` 不过(判据设计如此,实际无数据损失)**:B-140 全量里 g05 / g11 / h02 / h07 都跑过,`Deserializing unregistered type` 0 次;但两个 pod 各 1 条 `Blocked deserialization of asyncpg.pgproto.pgproto.UUID`(每进程只打一次)—— 长期记忆从库里读出来 `MemoryItem.id` 是 asyncpg 的 UUID 子类,测试环境 87 个会话的 `recalled_memories` 里都有。被拦时退回十六进制串、`MemoryItem` 重建时转回 UUID,内容完整;是白名单漏登,**不回退 #1754**(回退只会换回另一种警告),补登记 #1764(10-08 已合 `a7df771a`)。审批续跑那一条未做。
 - [ ] **17.2(可选)严格开关**:给一个 control-plane pod 设 `LANGGRAPH_STRICT_MSGPACK=true` 重复 17.1,结果应相同。
 
 ## §18 B-142 缓存命中指标(ROADMAP B-142)
 
-- [ ] **18.1 有数且口径对**:跑一次 B-140 全量后看 Orchestrator 看板新面板「LLM prompt-cache hit ratio」与记录规则 `expert_work:llm_prompt_cache_hit:ratio1h`。判据:eval-ahp / eval-general 的命中率与同一时段 `token_usage` 现算的 `sum(cache_read_tokens) / sum(input_tokens)` 相差 < 2 个百分点(10-05 ~ 10-07 为 86.4% / 84.1%)。**没修好时**:按 Anthropic 口径相加,命中率会被算成约一半。
-- [ ] **18.2 漂移比的分母不再重复计缓存**:`sum(increase(expert_work_ew_token_estimated_total{usage_kind="conversation"}[1d])) / sum(increase(expert_work_ew_token_estimate_actual_total{usage_kind="conversation"}[1d]))`。修前(10-05 ~ 10-07,3 天)实测 **0.29**:估算本来不含工具定义所以 < 1,分母又把命中缓存的部分多算了一遍。判据:发版后同一批评测跑出来约等于 0.29 ×(1 + 同期命中率)≈ 0.5 ~ 0.6;**没修好时**仍在 0.3 附近。
+- [x] **18.1 有数且口径对**:跑一次 B-140 全量后看 Orchestrator 看板新面板「LLM prompt-cache hit ratio」与记录规则 `expert_work:llm_prompt_cache_hit:ratio1h`。判据:eval-ahp / eval-general 的命中率与同一时段 `token_usage` 现算的 `sum(cache_read_tokens) / sum(input_tokens)` 相差 < 2 个百分点(10-05 ~ 10-07 为 86.4% / 84.1%)。**没修好时**:按 Anthropic 口径相加,命中率会被算成约一半。 **10-08 测试 `6d6e2f7f`(= main `90fd84b7` 同树) 过**:记录规则 1 小时窗口与 `token_usage` 现算逐位相同 —— eval-ahp 0.901 / 0.901、eval-general 0.4787 / 0.4787。
+- [x] **18.2 漂移比的分母不再重复计缓存**:`sum(increase(expert_work_ew_token_estimated_total{usage_kind="conversation"}[1d])) / sum(increase(expert_work_ew_token_estimate_actual_total{usage_kind="conversation"}[1d]))`。修前(10-05 ~ 10-07,3 天)实测 **0.29**:估算本来不含工具定义所以 < 1,分母又把命中缓存的部分多算了一遍。判据:发版后同一批评测跑出来约等于 0.29 ×(1 + 同期命中率)≈ 0.5 ~ 0.6;**没修好时**仍在 0.3 附近。 **10-08 测试 `6d6e2f7f`(= main `90fd84b7` 同树) 过**:8 小时窗口 **0.70**(修前 0.29)。比预期 0.5~0.6 高,这批评测里长上下文的压缩用例占比大;「没修好时仍在 0.3 附近」那一面明确不成立。
 
 ## §19 B-141 / B-143 压缩摘要(ROADMAP B-141 / B-143)
 
 设计稿 `docs/superpowers/specs/2026-10-07-b141-b143-compression-summary-design.md` §4。前置:用户在控制台导入 `tools/eval/datasets/behavior/agents/eval-compress.yaml`(B-143 合入后再导 `eval-compress-main`);B-143 上生产前**生产价目表必须有 `glm-5.3-flash`** —— **10-07 已核**(用户在生产跑查询):平台通用价,输入 0.8 / 输出 2.8 / 缓存读 0.23 元每百万 token,与测试一致。`eval-compress` 10-07 已导入(1.0.0)。
 
-- [ ] **19.1 基线**:当前测试版本 `behavior_runner.py --only c01,c02,c03,c04 --agent-map eval-general=eval-compress --repeats 3`。判据:每个用例每次都触发了压缩(结果里 `compactions >= 1`,没有「不可判」);触发不了就改用例,不改判据。
-- [ ] **19.2 B-141 对照**:`release.sh test` 发含 #1755 的候选,同样跑一遍后 `compare`。判据:没有用例稳定变差;c01 / c03 至少一个从不稳定 / 不过变 3/3,或基线已 3/3 时如实记「这批用例分不出差别」;COMPACTION 帧带 `summary_input_chars`,且多数压缩的值超过 24,000(修前摘要输入的上限)。
-- [ ] **19.3 B-143 对照**:同一版本 `eval-compress`(便宜型号)对 `eval-compress-main`(规则指回 glm-5.3)。判据:没有用例稳定变差;`token_usage` 里压缩调用记在 `glm-5.3-flash` 名下;报告两边摘要调用的 token 与花费。
-- [ ] **19.4 原有 24 个用例不受影响**:候选版本上跑一遍原 g / h 用例。判据:与 `after-1006` 相比无稳定翻转,且它们都不触发压缩(生产配置门槛不变)。
+- [x] **19.1 基线**:当前测试版本 `behavior_runner.py --only c01,c02,c03,c04 --agent-map eval-general=eval-compress --repeats 3`。判据:每个用例每次都触发了压缩(结果里 `compactions >= 1`,没有「不可判」);触发不了就改用例,不改判据。 **10-07 过**:`c-base2-1007`(测试 `880b5a46`,用例 @`7738e466`)11/12,12 次全部触发压缩、0 不可判;唯一失败 c03 一次是第 2 轮多做一步(第一次压缩在第 4 轮,与压缩无关)。
+- [x] **19.2 B-141 对照**:`release.sh test` 发含 #1755 的候选,同样跑一遍后 `compare`。判据:没有用例稳定变差;c01 / c03 至少一个从不稳定 / 不过变 3/3,或基线已 3/3 时如实记「这批用例分不出差别」;COMPACTION 帧带 `summary_input_chars`,且多数压缩的值超过 24,000(修前摘要输入的上限)。 **10-08 测试 `6d6e2f7f`:不变差 —— 过;「摘要输入多数超过 24,000」—— 判据前提不成立**:`c-cand-1008b` **12/12**(基线 11/12;c03 2/3 → 3/3,但 B-162 同时在场,分不开归因),12 次全部触发压缩;COMPACTION 帧都带 `summary_input_chars`,但 16 次压缩 **0 次超过 24,000**(最小 5,943 / 中位 7,635 / 最大 11,211)—— 3 万 token 就压、工具结果先按每条 1,500 字符截,中段拼出来到不了旧上限。即:这组用例验得出「进度段」与「不变差」,**验不出放大上限有没有用**;那一半要等生产 20 万 token 门槛下的长对话。
+- [x] **19.3 B-143 对照**:同一版本 `eval-compress`(便宜型号)对 `eval-compress-main`(规则指回 glm-5.3)。判据:没有用例稳定变差;`token_usage` 里压缩调用记在 `glm-5.3-flash` 名下;报告两边摘要调用的 token 与花费。 **10-08 测试 `6d6e2f7f` 过**:`eval-compress`(flash 写摘要)12/12、`eval-compress-main`(glm-5.3 写摘要)11/12(失败那次是第 1 轮就把标题写成「## 二、饮食」,与摘要模型无关);flash 名下 16 次摘要调用,输入 91,247 / 输出 8,176 token ≈ **0.10 元**,同量按 glm-5.3 价 ≈ 0.96 元;这批会话总花费约 22.6 元,摘要约占 4%。
+- [x] **19.4 原有 24 个用例不受影响**:候选版本上跑一遍原 g / h 用例。判据:与 `after-1006` 相比无稳定翻转,且它们都不触发压缩(生产配置门槛不变)。 **10-08 测试 `6d6e2f7f` 过**:原 24 个用例 ×3 = **70/72**(`after-1006` 69/72);g03 1/3 → 3/3、h07 2/3 → 3/3;h01 / h10 各少 1 次,均与本波无关(h01:没配看图模型时 `read_page` 回「看不了图」被记成欠账;h10:判据正则不跨换行)。
 
 ## §20 B-162 平台段不再冒充用户消息(ROADMAP B-162)
 
 执行层改动,合并前跑 B-140 评测(用户规矩)。对照基线 = `eval-out/b140/c-base2-1007.jsonl`(测试 `880b5a46`,11/12)与 `after-1006`(原 24 个用例)。
 
-- [ ] **20.1 模型不再说「只有工作区快照」**:候选版本上 `behavior_runner.py --only c01,c02,c03,c04 --repeats 3` 后,在测试库按 10-07 同一条正则数这批会话里 AI 回复出现「(只有|仅有|只是|仅是)…工作区快照」「没有新指令…快照」的 run。判据:eval-compress 由 48 / 114(42%)降到个位数比例;**没修好时**仍在四成上下。
-- [ ] **20.2 压缩用例不变差**:同一批结果与 `c-base2-1007` `compare`。判据:没有用例稳定变差;c03 若再失败,逐次看是不是又多做了步、多做的那一轮模型有没有提平台段。
-- [ ] **20.3 带「本轮输入」的形态**:原 24 个用例里的 eval-ahp(h 系列,每轮带注入变量)在候选版本上跑一遍,与 `after-1006` 比无稳定翻转;同一正则再加「本轮输入 / 平台(自动)生成…没有指令」统计,判据同 20.1。
-- [ ] **20.4 原有 g 用例不受影响**:与 `after-1006` 比无稳定翻转。
-- [ ] **20.5 提示词形状**:任取一个 run 在 Langfuse 看 GENERATION 输入:系统提示词里有一段「# Platform context」;第一步的用户消息末尾带 `<platform-context>`;工具调到一半时它在最后一条工具结果末尾,工具结果之后**没有**另起的 user 消息(工具出错后的恢复建议除外,那条本来就有);检查点(`run_event` / 对话页)里的用户消息与工具结果是原文。
-- [ ] **20.6 缓存代价**:同一批评测的 `expert_work:llm_prompt_cache_hit:ratio1h`(B-142)与 `c-base2-1007` 那批的 `token_usage` 现算命中率比较,报告差值;下降超过 10 个百分点时把数摆给用户定。
+- [x] **20.1 模型不再说「只有工作区快照」**:候选版本上 `behavior_runner.py --only c01,c02,c03,c04 --repeats 3` 后,在测试库按 10-07 同一条正则数这批会话里 AI 回复出现「(只有|仅有|只是|仅是)…工作区快照」「没有新指令…快照」的 run。判据:eval-compress 由 48 / 114(42%)降到个位数比例;**没修好时**仍在四成上下。 **10-08 测试 `6d6e2f7f` 过**:改后 eval-compress **0/60**、eval-compress-main 0/65、eval-ahp 0/52、eval-general 0/50(同一条查询放到 10-07 10:00~11:00 UTC 窗口:eval-compress 25/60,证明查询本身能红)。
+- [x] **20.2 压缩用例不变差**:同一批结果与 `c-base2-1007` `compare`。判据:没有用例稳定变差;c03 若再失败,逐次看是不是又多做了步、多做的那一轮模型有没有提平台段。 **10-08 过**:同 19.2,12/12。
+- [x] **20.3 带「本轮输入」的形态**:原 24 个用例里的 eval-ahp(h 系列,每轮带注入变量)在候选版本上跑一遍,与 `after-1006` 比无稳定翻转;同一正则再加「本轮输入 / 平台(自动)生成…没有指令」统计,判据同 20.1。 **10-08 过**:h 系列见 19.4;「本轮输入 / 平台生成…没有指令」统计并进 20.1 的查询,eval-ahp 0/52。
+- [x] **20.4 原有 g 用例不受影响**:与 `after-1006` 比无稳定翻转。 **10-08 过**:g01~g12 **36/36**(上一版 `cecbd0f6` 跑过一次 g01 失败 —— 答对了但多提了一句旧编号;`6d6e2f7f` 上 g01 3/3)。
+- [x] **20.5 提示词形状**:任取一个 run 在 Langfuse 看 GENERATION 输入:系统提示词里有一段「# Platform context」;第一步的用户消息末尾带 `<platform-context>`;工具调到一半时它在最后一条工具结果末尾,工具结果之后**没有**另起的 user 消息(工具出错后的恢复建议除外,那条本来就有);检查点(`run_event` / 对话页)里的用户消息与工具结果是原文。 **10-08 过**(Langfuse 抽 c03 一个 run 的 GENERATION):系统提示词含「# Platform context」;第 1 步用户消息「继续做下一步。」末尾带 `<platform-context>`;工具调到一半时它在最后一条工具结果末尾、其后没有 user 消息;检查点原文不变由单测守(`test_the_model_never_sees_a_platform_only_user_message`)。
+- [x] **20.6 缓存代价**:同一批评测的 `expert_work:llm_prompt_cache_hit:ratio1h`(B-142)与 `c-base2-1007` 那批的 `token_usage` 现算命中率比较,报告差值;下降超过 10 个百分点时把数摆给用户定。 **10-08 过**:命中率不降反升 —— eval-compress 85.0% → 86.1%、eval-general 86.4% → 89.8%、eval-ahp 84.8% → 90.9%(`token_usage` 现算,前值为 10-07 / 10-06 同批评测)。
