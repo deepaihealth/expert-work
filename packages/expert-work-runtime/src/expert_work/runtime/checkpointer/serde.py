@@ -49,6 +49,12 @@ CHECKPOINT_MSGPACK_ALLOWLIST: Final[tuple[tuple[str, str], ...]] = (
     ("expert_work.protocol.subagent", "SubagentStatus"),
     # AgentState.tool_failures / unresolved_failures
     ("orchestrator.tools.error_classifier", "ClassifiedToolError"),
+    # Not ours, but it lands in state: ids read back from Postgres are
+    # asyncpg's own ``uuid.UUID`` subclass, pydantic keeps the instance, and
+    # msgpack records its real class (MemoryItem.id in recalled_memories —
+    # 87 test-cluster threads on 10-08). langgraph's safe set only covers
+    # the stdlib ``uuid.UUID``.
+    ("asyncpg.pgproto.pgproto", "UUID"),
 )
 
 

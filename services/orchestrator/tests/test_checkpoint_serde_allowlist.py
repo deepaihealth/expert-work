@@ -233,6 +233,27 @@ async def test_graph_turn_state_survives_strict_msgpack(blocked_types: list[str]
     assert blocked_types == []
 
 
+def test_ids_read_back_from_postgres_survive_strict_msgpack(blocked_types: list[str]) -> None:
+    """B-161 漏网(10-08 测试环境日志):记忆从库里读出来, ``MemoryItem.id`` 是 asyncpg
+    自己的 UUID(``asyncpg.pgproto.pgproto.UUID``, ``uuid.UUID`` 的子类), msgpack 照它
+    的真实类名落盘;读回时不在白名单里就被拦 —— 测试环境 87 个会话的检查点里都有。
+
+    上面几条用例的数据用标准库 ``UUID`` 造, 碰不到这个缺口。
+    """
+    pg_uuid_cls = importlib.import_module("asyncpg.pgproto.pgproto").UUID
+    pg_id = pg_uuid_cls(str(_UUID))
+    item = MemoryItem(
+        id=pg_id, tenant_id=pg_id, user_id=pg_id, kind="fact", content="x", embedding=()
+    )
+    assert type(item.id) is pg_uuid_cls, "前提:pydantic 原样保留了 asyncpg 的 UUID"
+    serde = make_checkpoint_serde()
+
+    loaded = serde.loads_typed(serde.dumps_typed([item]))
+
+    assert blocked_types == []
+    assert loaded == [item]
+
+
 def test_allowlist_covers_every_custom_type_in_agent_state() -> None:
     """Guard: a new typed ``AgentState`` field (or a nested model / enum in an
     existing one) must be registered. This is the same walk ``StateGraph.compile``
