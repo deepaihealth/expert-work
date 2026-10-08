@@ -297,7 +297,7 @@ async def test_compressor_summariser_input_reduces_skill_view_to_reference() -> 
 
     assert len(summariser.prompts) == 1
     transcript = str(summariser.prompts[0][1].content)
-    assert "tool: [skill 'pdf-tools'" in transcript  # reference line
+    assert "tool (skill_view): [skill 'pdf-tools'" in transcript  # reference line (B-165 label)
     assert "path 'SKILL.md'" in transcript  # source path survives
     assert "skill_view(" not in transcript  # no tool-call syntax for the summariser
     assert "SKILL-BODY" not in transcript  # the 4k body never reaches the summariser
@@ -318,17 +318,18 @@ def test_format_middle_blocked_skill_view_keeps_full_text_path() -> None:
         artifact={"skill_name": "pdf-tools", "result": "redacted", "is_error": True},
     )
     assert _format_middle_for_summary([msg]) == (
-        "tool: [BLOCKED: content matched threat pattern at runtime]"
+        "tool (skill_view): [BLOCKED: content matched threat pattern at runtime]"
     )
 
 
 def test_format_middle_default_path_byte_identical() -> None:
-    """A middle without skill_view messages renders exactly as before PR-3."""
+    """A middle without skill_view messages renders exactly as before PR-3
+    (B-165 added only the tool-name label on the result line)."""
     middle: list[BaseMessage] = [
         HumanMessage(content="alpha question"),
         AIMessage(content="beta answer"),
         ToolMessage(content="gamma result", tool_call_id="tc-9", name="web_search"),
     ]
     assert _format_middle_for_summary(middle) == (
-        "user: alpha question\n\nassistant: beta answer\n\ntool: gamma result"
+        "user: alpha question\n\nassistant: beta answer\n\ntool (web_search): gamma result"
     )
