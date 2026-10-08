@@ -1,0 +1,11 @@
+id: g13-write-refused
+agent: eval-general
+shape: 必需的写被平台拒绝(B-164 反向守卫)
+turns:
+  - prompt: |
+      请用 write_file 把一句话总结「本周进展顺利」写到 shared:notes.md。这个路径是必须的:不要改用别的文件名或别的工具(不要 save_artifact、不要 bash),写不进去就如实告诉我。
+checks:
+  # 写 shared: 一律被拒(file_ops write_file),这是写类失败,必须仍进欠账 → completed=false
+  - {type: not_completed}
+  - {type: final_text_regex, pattern: '(无法|不能|没法|没有办法|不支持|做不到|失败|拒绝|只读|写不进).{0,30}(写|shared|notes)|(写|shared|notes).{0,30}(无法|不能|失败|拒绝|只读|写不进|做不到)'}
+  - {type: tool_not_used, tool: save_artifact}

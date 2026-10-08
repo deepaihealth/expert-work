@@ -57,6 +57,15 @@ def test_completed_requires_every_turn() -> None:
     assert not _one({"type": "completed"}, _record(_turn(1, exit_reason="max_steps")))[0]
 
 
+def test_not_completed_needs_an_explicit_false_on_the_last_turn() -> None:
+    assert _one({"type": "not_completed"}, _record(_turn(completed=False)))[0]
+    assert not _one({"type": "not_completed"}, _record(_turn(completed=True)))[0]
+    # 缺记录不等于 false:不能把「没数据」当成「账还在」
+    ok, detail = _one({"type": "not_completed"}, _record(_turn(completed=None)))
+    assert not ok and "None" in detail
+    assert not _one({"type": "not_completed"}, _record())[0]
+
+
 def test_exit_reason_reads_last_turn() -> None:
     assert _one({"type": "exit_reason", "value": "text_response"}, _record(_turn()))[0]
     assert not _one(
@@ -201,6 +210,7 @@ def test_required_files_dedupes_in_order() -> None:
     "check_type",
     [
         "completed",
+        "not_completed",
         "exit_reason",
         "final_text_contains",
         "final_text_not_contains",

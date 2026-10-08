@@ -28,6 +28,7 @@ from behavior_schema import (
     FinalTextContains,
     FinalTextNotContains,
     FinalTextRegex,
+    NotCompleted,
     RunRecord,
     ToolCall,
     ToolCountMax,
@@ -150,6 +151,10 @@ def _one(
         return _verdict(
             check, bool(turns) and not bad, f"turns not completed: {bad}" if turns else "no turns"
         )
+    if isinstance(check, NotCompleted):
+        # 反向守卫:要求最后一轮的结束帧**明确记了** completed=false(缺记录不算)。
+        got = turns[-1].completed if turns else None
+        return _verdict(check, got is False, f"completed={got!r}")
     if isinstance(check, ExitReason):
         got = turns[-1].exit_reason if turns else None
         return _verdict(check, got == check.value, f"exit_reason={got!r}")

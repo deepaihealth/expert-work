@@ -1922,7 +1922,7 @@ def build_react_graph(
                 continue
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
             ledger_failure = _ledger_failure(failure, classified)
-            if not _is_answered_lookup(
+            if not _is_read_only_failure(
                 specs_by_name.get(str(tool_calls[idx].get("name", ""))), ledger_failure
             ):
                 batch_outcomes.append(
@@ -2645,21 +2645,28 @@ def _ledger_failure(
     return failure
 
 
-def _is_answered_lookup(spec: ToolSpec | None, failure: ClassifiedToolError | None) -> bool:
-    """B-159 —— 只读工具回「找不到」:查询有了答案(目标不在那里),不进欠账。
+def _is_read_only_failure(spec: ToolSpec | None, failure: ClassifiedToolError | None) -> bool:
+    """B-164(取代 B-159 只收 ``resource_not_found`` 的版本)—— 声明为只读的工具,
+    非瞬态失败一律不进欠账,不论错误类。
 
-    欠账回答的是「有没有东西没做成」。读不会产出交付件,找不到也就不会让交付件少
-    东西;模型换个工具读到同一份内容(10-05 B-140 h10:猜错技能路径 → ``read_file``
-    找不到 → ``skill_view`` 读到)按键永远抵消不掉,一次正常交付被判成没做完。
+    为什么:欠账回答的是「有没有东西没做成」,读失败不是没做完的活 —— 它不产出交付件,
+    模型常换条路拿到同一份内容(``read_file`` 被拒 → ``skill_view`` 读到)。只读工具的键
+    退化成 ``("tool", 名)``,换工具抵消不掉(多报),同名工具随便再读一次无关文件却又
+    抵消得掉(少报)—— 账上去留取决于模型后面碰巧调了什么,和需要的内容拿没拿到无关。
+    按错误类一格格豁免追不上错误文本(h10 not found → c02 not_found → h01 ``..`` 参数错,
+    三次同形假欠账)。
 
-    只收这一格:只读工具别的失败(权限、上游报错、参数错)是**没读到**,后面的内容
-    可能就缺了这块,照旧记账;写类工具的「找不到」是那次写没落地,也照旧。
+    失败本身照常分类、计 ``_cm_tool_error_total``、触发恢复提示,只是不进账本。
+
+    **明知放弃的一格**:纯问答 run 不写任何东西,读失败后模型照样作答 —— 现在记为
+    ``completed=true``。写类、exec、MCP、``spec is None``(未知工具)的失败仍照旧记账;
+    transient 本来就两个方向都不是证据,不在此列。
     """
     return (
         spec is not None
         and spec.resolved_side_effect == "read_only"
         and failure is not None
-        and failure.error_class == "resource_not_found"
+        and failure.error_class != "transient"
     )
 
 
@@ -2670,7 +2677,7 @@ def _apply_failure_ledger(
     """把一批工具调用的成败套到 run 级欠账上,返回还没被抵消的失败。
 
     照 hermes-agent ``turn_explainers._record_file_mutation_result`` 的记账法
-    (差别是它只管文件变更类工具,这里管全部工具):
+    (差别是它只管文件变更类工具,这里管声明只读以外的全部工具,见 B-164 ``_is_read_only_failure``):
 
     * 非瞬态失败 → 以该键记一条,**同键已有就保留先出现的那条** ——
       第一条错误信息比最后一条有用;
