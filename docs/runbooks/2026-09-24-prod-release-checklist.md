@@ -198,7 +198,7 @@
 > | B-141 压缩摘要读得更多 | #1755 | 摘要器读更多中段内容，摘要固定保留 `## Progress` 一节 | 压缩帧追加一个字段 `summary_input_chars`（追加字段，对外文档站 `sse-events.md` 同 PR 已写） |
 > | B-143 压缩摘要默认用同家便宜型号 | #1756 | 没写 `when: compression` 规则时，glm-5.3 / glm-5.2 的压缩摘要改用 `glm-5.3-flash`，主模型做备用；映射表外的厂商照旧用主模型，不换厂商 | 压缩摘要那次调用的用量记在 `glm-5.3-flash` 名下 |
 > | B-142 缓存命中指标 | #1757 | 新计数器 `expert_work_llm_prompt_tokens_total{cache}`（按厂商口径算提示词大小）+ 记录规则 `expert_work:llm_prompt_cache_hit:ratio1h` + Orchestrator 看板面板；顺带修漂移比分母重复计缓存 | 无 |
-> | B-153 投递失败告警 | #1753 | 计数器 `expert_work_langfuse_delivery_failures_total{stage}`（五个阶段启动即建 0 值序列）+ P2 告警 `ExpertWorkLangfuseDeliveryFailing` | 无 |
+> | B-153 投递失败告警 | #1753 | 计数器 `expert_work_langfuse_delivery_failures_total{stage}`（五个阶段启动即建 0 值序列）+ P2 告警 `ExpertWorkLangfuseDeliveryFailing`。**告警只进 wecom-adapter 日志**：生产没配企微 webhook，用户 10-08 拍板不配（测试 10-08 演练：告警触发与恢复都在 adapter 日志里） | 无 |
 > | B-152 编辑器本地打包 | #1752 / #1762 | 控制台 Monaco 编辑器从本地包加载，不再访问 jsdelivr；#1762 给 admin-ui 镜像构建 4 GB Node 堆 —— **不带它 admin-ui 镜像构建 OOM**（10-08 发测试时第 1 阶段就挂在这里） | 无 |
 > | B-159 漏网 | #1763 | `"<tool> failed: not_found"`（下划线）也归为 `resource_not_found` | `completed` 再少一类误报 |
 > | B-162 平台段并进最后一条消息 | #1761 | 平台上下文以 `<platform-context>` 附在最后一条消息末尾，不再单独成一条用户消息；系统提示词加一段说明 | 模型不再把平台段当成用户这一轮说的话 |
