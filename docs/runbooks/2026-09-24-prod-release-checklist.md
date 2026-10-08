@@ -186,7 +186,7 @@
 >
 > **对操作位的影响**：Step A 改回从检出树 `kubectl apply -f infra/k8s/sandbox/sandboxset.yaml`（先 `grep` 核是 `d8a32812`），不再 `git show origin/main:…`；Step B 的 smoke 沙箱钉子检查应为 `OK   sandbox image pin is current (d8a32812)`，第十八次重钉时预期的 WARN「落后 1 个提交」不再出现；Step C 的 B-161 日志核对改为 `Blocked deserialization` 也必须 0 次。
 >
-> **验证状态**：应用代码在测试 `6d6e2f7f`（= `90fd84b7` 代码树）验过，第十八次重钉的验收全部沿用。本次唯一的代码增量是 #1764，**还没上测试集群**（`553c3252` 发测试等用户指令）；它的测试环境核对 —— 跑一次会召回记忆的 run 后，control-plane 日志里 `Blocked deserialization` 0 次 —— **待做**。单测：新测试在补白名单前是红的；orchestrator + runtime 单测 4270 passed。
+> **验证状态**：应用代码在测试 `6d6e2f7f`（= `90fd84b7` 代码树）验过，第十八次重钉的验收全部沿用。本次唯一的代码增量是 #1764，**10-08 已发测试（`553c3252`，用户指令）并核过**：smoke + 金丝雀 PASS、沙箱钉子 `OK … (d8a32812)`；在新 pod 里用平台检查点读取器读 10 个 `recalled_memories` 带 asyncpg UUID 的会话，10 个全读出、serde 拦截事件 0 次；两个 control-plane pod 日志 `Blocked deserialization` / `Deserializing unregistered type` 均 0（修前每 pod 各 1 条）。单测：新测试在补白名单前是红的；orchestrator + runtime 单测 4270 passed。
 >
 > 下面第十八次重钉段里的 `90fd84b7` 从此是记账位（其中「待定（不钉）」那条 #1764 已随本次钉入）。
 >

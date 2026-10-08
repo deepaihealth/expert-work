@@ -194,7 +194,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 前置同 §16:先起 `kubectl logs -f` 写文件。
 
-- [ ] **17.1 警告与拒读都为 0**:跑 B-140 的 g05(五步计划)、g11(脚本报错后恢复,失败进欠账)、h02 / h07(多轮续跑)各一次,再用一个开了审批的智能体批一次续跑。判据:日志里 `Deserializing unregistered type` 0 次(发版前 `Plan` / `ClassifiedToolError` 各有)、`Blocked deserialization` 0 次;续跑后计划与步骤都在,对话页能打开。**不过时**:出现 `Blocked deserialization of <类型>`,续跑那一轮报错或计划丢失 —— 说明有类型漏登,当场回退本 PR。 **10-08 测试 `6d6e2f7f` 不过(判据设计如此,实际无数据损失)**:B-140 全量里 g05 / g11 / h02 / h07 都跑过,`Deserializing unregistered type` 0 次;但两个 pod 各 1 条 `Blocked deserialization of asyncpg.pgproto.pgproto.UUID`(每进程只打一次)—— 长期记忆从库里读出来 `MemoryItem.id` 是 asyncpg 的 UUID 子类,测试环境 87 个会话的 `recalled_memories` 里都有。被拦时退回十六进制串、`MemoryItem` 重建时转回 UUID,内容完整;是白名单漏登,**不回退 #1754**(回退只会换回另一种警告),补登记 #1764(10-08 已合 `a7df771a`)。审批续跑那一条未做。
+- [ ] **17.1 警告与拒读都为 0**:跑 B-140 的 g05(五步计划)、g11(脚本报错后恢复,失败进欠账)、h02 / h07(多轮续跑)各一次,再用一个开了审批的智能体批一次续跑。判据:日志里 `Deserializing unregistered type` 0 次(发版前 `Plan` / `ClassifiedToolError` 各有)、`Blocked deserialization` 0 次;续跑后计划与步骤都在,对话页能打开。**不过时**:出现 `Blocked deserialization of <类型>`,续跑那一轮报错或计划丢失 —— 说明有类型漏登,当场回退本 PR。 **10-08 测试 `6d6e2f7f` 不过(判据设计如此,实际无数据损失)**:B-140 全量里 g05 / g11 / h02 / h07 都跑过,`Deserializing unregistered type` 0 次;但两个 pod 各 1 条 `Blocked deserialization of asyncpg.pgproto.pgproto.UUID`(每进程只打一次)—— 长期记忆从库里读出来 `MemoryItem.id` 是 asyncpg 的 UUID 子类,测试环境 87 个会话的 `recalled_memories` 里都有。被拦时退回十六进制串、`MemoryItem` 重建时转回 UUID,内容完整;是白名单漏登,**不回退 #1754**(回退只会换回另一种警告),补登记 #1764(10-08 已合 `a7df771a`)。**10-08 复验(测试 `553c3252`)过**:10 个带 asyncpg UUID 的检查点全部读出、拦截 0 次,两个 pod 日志 `Blocked deserialization` 0。审批续跑那一条未做。
 - [ ] **17.2(可选)严格开关**:给一个 control-plane pod 设 `LANGGRAPH_STRICT_MSGPACK=true` 重复 17.1,结果应相同。
 
 ## §18 B-142 缓存命中指标(ROADMAP B-142)
