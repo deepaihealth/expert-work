@@ -52,7 +52,9 @@ ENV VITE_OIDC_ISSUER=${VITE_OIDC_ISSUER} \
     VITE_APP_ENV=${VITE_APP_ENV} \
     VITE_BUILD_TIME=${VITE_BUILD_TIME}
 
-RUN pnpm build
+# B-152 起 Monaco 与 JS/TS/HTML/CSS 语言服务打进包里, 构建峰值超过 Node 在容器里的默认堆上限
+# (约 2 GB;Docker Desktop 8 GB 虚拟机实测 10-08 在 ~2037 MB 处 OOM)。给到 4 GB。
+RUN NODE_OPTIONS=--max-old-space-size=4096 pnpm build
 
 # 公开 API 文档站(spec 2026-08-11):独立小站,产物挂到 nginx /docs/。
 RUN cd docs-site && pnpm install --frozen-lockfile && pnpm build
