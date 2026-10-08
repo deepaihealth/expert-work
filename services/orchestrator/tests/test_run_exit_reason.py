@@ -16,7 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.runtime.checkpointer import make_checkpointer
@@ -36,6 +36,7 @@ from orchestrator.graph_builder.builder import (
     _ledger_key_for,
     budget_exit_reason,
 )
+from orchestrator.graph_builder.platform_context import RECOVERY_ADVISORY_MARK
 from orchestrator.tools.error_classifier import ClassifiedToolError, ToolErrorClass
 from orchestrator.tools.file_ops import FileOpError
 
@@ -642,8 +643,11 @@ async def test_a_read_only_failure_still_reaches_the_error_count_and_advisory() 
     state = await _read_then_answer(exc=ValueError, error="read_file path must be a relative path")
 
     assert counter._value.get() == before + 1
+    # B-163:恢复提示挂在失败的那条 ToolMessage 上(拼提示词时贴到末尾),不再单独一条 user 消息
     advisories = [
-        m for m in state["messages"] if "recovery-advisory" in str(getattr(m, "content", ""))
+        m
+        for m in state["messages"]
+        if isinstance(m, ToolMessage) and m.additional_kwargs.get(RECOVERY_ADVISORY_MARK)
     ]
     assert advisories, "恢复提示仍要注入"
 
