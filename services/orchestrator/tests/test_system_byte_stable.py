@@ -268,9 +268,10 @@ async def test_system_message_byte_stable_with_mutation_advisory() -> None:
     hashes = [_hash_system(call) for call in llm.calls]
     assert len(llm.calls) == 2
     assert hashes[0] == hashes[1]
-    # Advisory appears on the second call (after the failure surfaced).
+    # Advisory appears on the second call (after the failure surfaced), at the
+    # end of the failed tool result (B-163).
     advisory_in_second = any(
-        isinstance(m, HumanMessage)
+        isinstance(m, ToolMessage)
         and isinstance(m.content, str)
         and "<recovery-advisory>" in m.content
         for m in llm.calls[1]

@@ -17,11 +17,10 @@ tool_calls 的回复下是纯直通)触发中间件分支。
 - ``test_screen_blocked_response_still_stamped`` —— output-screen block 时
   ``_screen_model_response`` 返回的是全新 ``AIMessage``(不走 ``model_copy``,
   kwargs 全空),证明盖戳确实晚于这次重绑才生效,而不是早绑上去被冲掉。
-- ``test_recovery_advisory_carries_stamp_and_hide_from_ui`` —— 之前引用的
-  31 个回归用例(``test_recovery_advisory.py`` 等)从没往
-  ``config["configurable"]`` 塞 ``run_id``,盖戳在那批里全程是 no-op;这里
-  带真实 ``run_id`` 跑出一条 CM-1 advisory,坐实 ``expert_work_hide_from_ui``
-  与两个 STAMP 键能同时共存(合并逻辑不互相顶替)。
+- ``test_step_after_a_tool_failure_persists_only_the_stamped_response`` ——
+  带真实 ``run_id`` 跑出一次工具失败。B-163 之前它测的是落库的 CM-1 advisory
+  同时带 ``expert_work_hide_from_ui`` 与两个 STAMP 键;B-163 之后那条消息不再
+  产生,改测失败之后的一步只落盖了章的回复。
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.message_stamp import STAMP_CREATED_AT, STAMP_RUN_ID
@@ -47,6 +46,7 @@ from orchestrator import (
     ToolSpec,
     build_react_graph,
 )
+from orchestrator.graph_builder.platform_context import RECOVERY_ADVISORY_MARK
 
 
 @dataclass
@@ -171,11 +171,10 @@ class _FailingSaveArtifact:
 
 
 @pytest.mark.asyncio
-async def test_recovery_advisory_carries_stamp_and_hide_from_ui() -> None:
-    """Important-2 —— a real CM-1 recovery advisory, with a real ``run_id``
-    threaded through config, must carry ``expert_work_hide_from_ui`` AND
-    both STAMP keys at once (``stamp_message`` merges into existing
-    ``additional_kwargs`` rather than replacing them)."""
+async def test_step_after_a_tool_failure_persists_only_the_stamped_response() -> None:
+    """B-163 —— 恢复建议不再是一条落库的隐藏 HumanMessage(以前这条测的是它同时带
+    ``expert_work_hide_from_ui`` 与两个 STAMP 键)。现在失败那一步之后, agent 节点落库的
+    只有盖了章的助手回复;建议作为标记留在那条失败的工具结果上, 且不顶掉别的 kwargs。"""
     run_id = "33333333-3333-3333-3333-333333333333"
     registry = ToolRegistry()
     registry.register(_FailingSaveArtifact())
@@ -203,15 +202,10 @@ async def test_recovery_advisory_carries_stamp_and_hide_from_ui() -> None:
             {"messages": [HumanMessage(content="start")], "step_count": 0, "max_steps": 5},
             config=cfg,
         )
-    advisory = next(
-        (
-            m
-            for m in state["messages"]
-            if isinstance(m, HumanMessage) and "<recovery-advisory>" in str(m.content)
-        ),
-        None,
-    )
-    assert advisory is not None, "没有触发 recovery advisory,测试本身无效"
-    assert advisory.additional_kwargs.get("expert_work_hide_from_ui") is True
-    assert advisory.additional_kwargs[STAMP_RUN_ID] == run_id
-    assert advisory.additional_kwargs[STAMP_CREATED_AT]
+    messages = state["messages"]
+    assert [type(m) for m in messages] == [HumanMessage, AIMessage, ToolMessage, AIMessage]
+    failed, reply = messages[2], messages[3]
+    assert RECOVERY_ADVISORY_MARK in failed.additional_kwargs, "没有触发恢复建议,测试本身无效"
+    assert reply.content == "done"
+    assert reply.additional_kwargs[STAMP_RUN_ID] == run_id
+    assert reply.additional_kwargs[STAMP_CREATED_AT]

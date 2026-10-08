@@ -652,9 +652,10 @@ _EDIT_ESCALATE_AFTER_TWO = (
 #:
 #: ⚠ 这段文字接在 ``msg`` 尾巴上, 而 ``builder._format_error`` 对 ``str(exc)``
 #: 有 500 字符硬截断 —— 超了就正好把新加的引导截没, 看起来像没加。最坏情况
-#: (``no_match`` 带满 80 字符的 near-line 提示)测试里钉着。另外 advisory 通道
-#: (``_SUMMARY_MAX_CHARS`` = 300)会更早截一刀, 所以**可执行的第一步排在最前面**,
-#: 第二级升级排在最后:被截掉的永远是阶梯的第二级, 不是第一级。
+#: (``no_match`` 带满 80 字符的 near-line 提示)测试里钉着。(B-163 之前 advisory
+#: 通道还会按 ``_SUMMARY_MAX_CHARS`` = 300 再截一刀;现在建议不抄原文, 只剩这一刀。)
+#: 所以**可执行的第一步排在最前面**, 第二级升级排在最后:被截掉的永远是阶梯的第二级,
+#: 不是第一级。
 _EDIT_RECOVERY: dict[str, str] = {
     "stale": (
         "The file changed after you read it, so NOTHING was written. Call read_file "

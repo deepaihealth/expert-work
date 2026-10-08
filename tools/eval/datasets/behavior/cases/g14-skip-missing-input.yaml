@@ -1,0 +1,16 @@
+id: g14-skip-missing-input
+agent: eval-general
+shape: 工具中途失败一次后接着做完(B-163)
+fixtures: [sales.csv]
+# 第一个文件故意不存在:read_file 必然失败一次,恢复建议贴在那条工具结果上;模型要跳过它、
+# 读第二个文件把题做完。只读工具的「找不到」不进欠账(B-159),所以能判 completed。
+requires_tool_error: true
+turns:
+  - prompt: |
+      请用 read_file 依次读取工作区的 uploads/sales-q4.csv 和 uploads/sales.csv。第一个文件可能不存在,不存在就跳过它,只用读到的数据。
+      算出 region 为 A 的 amount 合计。回复里写出这个合计,并说明哪个文件没有读到。
+checks:
+  - {type: completed}
+  - {type: tool_used, tool: read_file}
+  - {type: final_text_contains, all: ["1045"]}
+  - {type: final_text_regex, pattern: 'sales-q4'}

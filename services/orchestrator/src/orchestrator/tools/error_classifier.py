@@ -11,13 +11,14 @@ recovery lands >85% of the time vs ~17% for fuzzy signals).
 
 This module maps a failed tool call to a :class:`ClassifiedToolError`
 carrying an error class, a ``retryable`` hint and a templated, grounded
-recovery ``advice`` string, and renders a batch of failures into a
-``<recovery-advisory>`` block for tail injection. It lives in the
+recovery ``advice`` string, and renders each failure into a
+``<recovery-advisory>`` block that the prompt view appends to the failing
+tool result (B-163). It lives in the
 ``tools`` layer beside L-4's :mod:`~orchestrator.tools.mutation_classifier`
 (a lower layer than ``graph_builder``) so the ``AgentState`` channel can
 import :class:`ClassifiedToolError` at runtime without an import cycle.
-``builder.py`` wires it at the tool catch sites + the agent-node advisory
-injection.
+``builder.py`` wires it at the tool catch sites + the tools-node marking
+(``graph_builder.platform_context.with_recovery_advisories`` attaches it).
 
 Design anchors (STREAM-CM-DESIGN §3):
 
@@ -61,9 +62,10 @@ ToolErrorClass = Literal[
     "unknown",
 ]
 
-#: Per-failure summary cap inside the advisory — keeps a batch of
-#: failures from blowing the prompt-tail budget. Mirrors the 500-char
-#: cap ``builder._format_error`` already applies on the ToolMessage path.
+#: Per-failure summary cap. Mirrors the 500-char cap ``builder._format_error``
+#: already applies on the ToolMessage path. B-163: the advisory no longer
+#: quotes the summary (the error text sits right above it in the same tool
+#: result); the summary stays on the run-level failure ledger.
 _SUMMARY_MAX_CHARS = 300
 
 
@@ -306,51 +308,59 @@ def _is_retryable(error_class: ToolErrorClass, spec: ToolSpec | None) -> bool:
 #: (:mod:`orchestrator.tools.workspace_tree`)是这句话的**第二个落点**:模型在提示词
 #: 里和在错误消息里都该读到同一条规矩。两处引用同一个常量, 就结构上不可能各说各的 ——
 #: 抄一份措辞过去的话, 改其中一处时另一处不会跟着动。
+#:
+#: B-163 —— 改成陈述事实, 不下命令(与下面各类的模板同一口径, 理由见 ``_ADVICE``)。
 EXISTENCE_UNKNOWN = (
     "This says NOTHING about whether the target exists — the call never got "
-    "far enough to look. Do not treat it as absent and do not recreate it "
-    "from scratch; confirm with a separate read once the tool works again."
+    "far enough to look, so the target may well still be there. This error is "
+    "no reason to treat it as absent or to recreate it from scratch; a separate "
+    "read once the tool works again shows its actual state."
 )
 
 
+#: B-163 —— 每一类都写成**事实**:发生了什么、由此知道什么、同样的调用会怎样。不写
+#: 「Do not … / Verify … / Retry …」这类命令。建议现在贴在工具结果末尾, Claude Code
+#: hooks 文档明说带外文字写成命令口吻会触发模型的注入防御(anthropics/claude-code
+#: #52018 是实例);事实陈述同样能让模型自己得出下一步。
 _ADVICE: dict[ToolErrorClass, str] = {
     "unknown_tool": (
-        "This tool does not exist. Pick a tool from the available set; do not retry this name."
+        "No tool with this name is available, so the same name fails again; the "
+        "callable tools are the ones offered in this conversation."
     ),
     "invalid_arguments": (
-        "The arguments were rejected. Fix the arguments based on the error "
-        "above; do not repeat the identical call."
+        "The tool rejected the arguments before running (the reason is in the "
+        "result above), so the identical call is rejected again."
     ),
     "blocked_by_policy": (
-        "This call was blocked by a policy or approval gate. Wait for "
-        "approval or surface the situation to the user; do not try to "
-        "bypass it."
+        "A policy or approval gate stopped this call, so it did not run. The gate "
+        "is enforced by the platform, not by the tool: the same call is stopped "
+        "the same way until the user or an administrator changes it."
     ),
-    "resource_not_found": (
-        "The target (path or id) does not exist. Verify it exists before operating on it."
-    ),
+    "resource_not_found": ("The tool reported that the target (path or id) does not exist."),
     "permission_denied": (
-        "Permission was denied. Do not brute-force retry; surface this to "
-        "the user. " + EXISTENCE_UNKNOWN
+        "Permission was denied, so the identical call is denied again; only the "
+        "user or an administrator can change the permission. " + EXISTENCE_UNKNOWN
     ),
     "mutation_not_landed": (
-        "This mutation did NOT land — do not assume the target has the "
-        "requested content. Retry or surface the failure."
+        "This write did NOT land: the target does not have the requested content."
     ),
     "unknown": (
-        "This failed for an unclear reason. Inspect the error and consider "
-        "an alternative approach; avoid retrying the identical call. " + EXISTENCE_UNKNOWN
+        "The call failed for a reason the platform could not classify; the error "
+        "above is all that is known, and the identical call is likely to fail the "
+        "same way. " + EXISTENCE_UNKNOWN
     ),
 }
 
 _TRANSIENT_RETRYABLE = (
-    "A transient failure. This tool is safe to retry once; if it keeps "
-    "failing, surface the failure to the user. " + EXISTENCE_UNKNOWN
+    "A transient failure (timeout or temporary unavailability). This tool is "
+    "read-only or idempotent, so it is safe to retry once; repeated failures "
+    "point to an outage the user would need to know about. " + EXISTENCE_UNKNOWN
 )
 _TRANSIENT_UNSAFE = (
-    "A transient failure, but this tool is not safe to blindly replay "
-    "(not read-only or idempotent). Verify the current state before "
-    "retrying. " + EXISTENCE_UNKNOWN
+    "A transient failure (timeout or temporary unavailability). This tool "
+    "changes state and is not idempotent: the change may or may not have taken "
+    "effect, so a blind replay could apply it twice; the current state shows "
+    "which. " + EXISTENCE_UNKNOWN
 )
 
 
@@ -365,32 +375,56 @@ def _advice(error_class: ToolErrorClass, retryable: bool, spec: ToolSpec | None)
 # Advisory rendering
 # ---------------------------------------------------------------------------
 
-_ADVISORY_PREAMBLE = (
-    "The following tool calls from the previous batch did NOT succeed. "
-    "Do not assume their effects took place; act on the per-tool guidance "
-    "below rather than retrying blindly."
+RECOVERY_ADVISORY_OPEN = "<recovery-advisory>"
+RECOVERY_ADVISORY_CLOSE = "</recovery-advisory>"
+RECOVERY_ADVISORY_LABEL = (
+    "(Attached by the platform to this tool result; not part of the tool's output.)"
+)
+#: 用户 / 工具写的同名字样转义成这样, 冒充不了平台写的那段(照 B-162 ``<platform-context>``)。
+RECOVERY_ADVISORY_ESCAPES = (
+    (RECOVERY_ADVISORY_OPEN, "&lt;recovery-advisory&gt;"),
+    (RECOVERY_ADVISORY_CLOSE, "&lt;/recovery-advisory&gt;"),
 )
 
 
-def render_recovery_advisory(failures: list[ClassifiedToolError]) -> str:
-    """Render a batch of failures into a ``<recovery-advisory>`` block.
+def escape_recovery_advisory_tags(text: str) -> str:
+    """把 ``text`` 里的 ``<recovery-advisory>`` / ``</recovery-advisory>`` 字样转义。"""
+    for raw, safe in RECOVERY_ADVISORY_ESCAPES:
+        text = text.replace(raw, safe)
+    return text
 
-    Returns an empty string for an empty batch so the caller can skip
-    injection. Each line is
-    ``- {tool} [{class}]{ path=…}: {summary} → {advice}`` — the
-    ``path=`` segment appears only for failures that carry one (the
-    ``mutation_not_landed`` case), preserving L-4's path visibility.
+
+#: 建议里引用模型给的值(工具名、路径)时的上限。超了留头尾、中间一个 ``…``。
+_QUOTED_MAX_CHARS = 200
+
+
+def _one_line(text: str) -> str:
+    """模型给的值压成一行(空白折叠)并限长:换行不能在建议里另起一行冒充平台的话。"""
+    flat = " ".join(text.split())
+    if len(flat) <= _QUOTED_MAX_CHARS:
+        return flat
+    head = _QUOTED_MAX_CHARS * 2 // 3
+    tail = _QUOTED_MAX_CHARS - head - 1
+    return f"{flat[:head]}…{flat[-tail:]}"
+
+
+def render_recovery_advisory(failure: ClassifiedToolError) -> str:
+    """B-163 —— 把**一次**失败渲染成一段 ``<recovery-advisory>``, 贴在那条工具结果末尾。
+
+    正文一行 ``{tool} [{class}]{ path=…}: {advice}``。``path=`` 只在带路径的失败
+    (``mutation_not_landed``)上出现, 保留 L-4 的路径可见性。**不抄 summary**:
+    错误原文就在这段正上方的工具结果里, 再抄一遍只是多花 token。
+
+    确定性:同一次失败每次渲染的字节都一样(这段每一步都原样重挂, 字节一变前缀缓存
+    就断)。工具名与路径来自模型:先压成一行、限长(:func:`_one_line`), 再转义同名标签。
     """
-    if not failures:
-        return ""
-    lines = ["<recovery-advisory>", _ADVISORY_PREAMBLE]
-    for f in failures:
-        head = f"- {f.tool_name} [{f.error_class}]"
-        if f.path:
-            head += f" path={f.path}"
-        lines.append(f"{head}: {f.summary} → {f.advice}")
-    lines.append("</recovery-advisory>")
-    return "\n".join(lines)
+    head = f"{_one_line(failure.tool_name)} [{failure.error_class}]"
+    if failure.path:
+        head += f" path={_one_line(failure.path)}"
+    body = escape_recovery_advisory_tags(f"{head}: {failure.advice}")
+    return "\n".join(
+        [RECOVERY_ADVISORY_OPEN, RECOVERY_ADVISORY_LABEL, body, RECOVERY_ADVISORY_CLOSE]
+    )
 
 
 def _summarise(error: BaseException) -> str:

@@ -370,3 +370,46 @@ async def test_cases_without_the_flag_ignore_compaction(tmp_path: Path) -> None:
         CompactingClient(0), _case(), 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
     )
     assert res.passed is True and res.indeterminate is None
+
+
+class FailingToolClient(FakeClient):
+    """第 1 轮报 ``tool_errors`` 次失败的工具调用。"""
+
+    def __init__(self, tool_errors: int) -> None:
+        super().__init__()
+        self.tool_errors = tool_errors
+
+    async def run_turn(
+        self,
+        agent: str,
+        user_id: str,
+        session_id: str | None,
+        prompt: str,
+        upload_ids: list[str],
+        index: int,
+    ) -> tuple[TurnRecord, str | None]:
+        rec, sid = await super().run_turn(agent, user_id, session_id, prompt, upload_ids, index)
+        n = self.tool_errors if index == 1 else 0
+        return rec.model_copy(update={"tool_errors": n}), sid
+
+
+@pytest.mark.asyncio
+async def test_required_tool_error_that_never_happened_is_indeterminate(tmp_path: Path) -> None:
+    """B-163 —— 恢复用例要的是「中途失败一次」;模型没撞上失败(比如先列了目录)就测不到
+    恢复, 判不可判而不是判过。"""
+    case = _case(requires_tool_error=True)
+    res = await runner.run_one(
+        FailingToolClient(0), case, 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
+    )
+    assert res.passed is None and res.infra_error is None
+    assert res.indeterminate and "tool error" in res.indeterminate
+    assert [v.passed for v in res.verdicts] == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_required_tool_error_that_happened_is_scored(tmp_path: Path) -> None:
+    case = _case(requires_tool_error=True)
+    res = await runner.run_one(
+        FailingToolClient(1), case, 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
+    )
+    assert res.passed is True and res.indeterminate is None

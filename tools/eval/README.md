@@ -132,3 +132,7 @@ uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>
 在结果的 `turn_metrics` / `metrics` 的 `compactions` 里。fixtures 的尺寸算式在各用例文件开头,`test_behavior_compaction_sizing.py` 复核。
 某一轮才给的资料写在那一轮的 `fixtures` 里(该轮之前上传进同一会话、只附在该轮):用例级 `fixtures` 第 1 轮全都看得到,
 模型会一次并行读完,一轮盖满压缩器保留的头尾就压不了(c04 第一版的教训)。
+
+恢复用例(B-163,`g14` / `g15`):任务中途确定会有一次工具失败(读一个不存在的文件 / 照抄一段对不上的原文去 `edit_file`),
+看模型能不能接着把事做完。用例写了 `requires_tool_error: true`:整次一次失败的工具调用都没有(模型绕开了那次失败)
+就判「不可判」,与 `requires_compaction` 同一口径。

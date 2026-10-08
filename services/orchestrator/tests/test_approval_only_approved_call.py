@@ -519,11 +519,7 @@ async def test_withheld_call_is_not_a_failure_nor_audited_nor_guarded() -> None:
         ("tool:call", "tc-1")
     ]
     # 模型下一步看不到恢复提示;失败 / 拦截计数都没动。
-    assert not [
-        m
-        for m in out.llm.prompts[-1]
-        if isinstance(m, HumanMessage) and "<recovery-advisory>" in str(m.content)
-    ]
+    assert not [m for m in out.llm.prompts[-1] if "<recovery-advisory>" in str(m.content)]
     assert _sample("expert_work_cm_tool_error_total", not_landed) == not_landed_before
     assert _sample("expert_work_tool_call_total", blocked) == blocked_before
 
