@@ -164,6 +164,11 @@ from orchestrator.graph_builder.planner import (
     complete_open_steps,
     render_plan,
 )
+from orchestrator.graph_builder.platform_context import (
+    PROMPT_TAIL_MARK,
+    strip_platform_context,
+    with_platform_context,
+)
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
@@ -1069,6 +1074,10 @@ def build_react_graph(
         # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
         # 提示词视图里可能残留的旧段剔掉。
         messages = with_figure_block(messages, figure_block)
+        # B-162 —— 尾部平台段合成一条、包上 ``<platform-context>``, 明说不是用户。
+        # 必须在压缩 / ``_keep_latest_inputs_block``(按 identity 认段)之后、
+        # before chain 之前(缓存 lookup 与 store 的 key 要一致)。
+        messages = with_platform_context(messages)
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 
@@ -1146,7 +1155,10 @@ def build_react_graph(
             wrapup = (
                 _TOKEN_BUDGET_WRAPUP_INSTRUCTION if token_tripped else _MAX_STEPS_WRAPUP_INSTRUCTION
             )
-            messages = [*messages, HumanMessage(content=wrapup)]
+            messages = [
+                *messages,
+                HumanMessage(content=wrapup, additional_kwargs={HIDE_FROM_UI: True}),
+            ]
             # B3 — guard 可见化:每个触发的闸各发一条 tripped 帧(老盲区一起治)。
             if token_tripped and token_budget is not None:
                 await emit_guard_frame(
@@ -1203,7 +1215,8 @@ def build_react_graph(
                         f"{token_budget.limit} token budget ({token_budget.remaining} remaining). "
                         "Converge quickly: prefer finishing with what you have over further "
                         "tool exploration."
-                    )
+                    ),
+                    additional_kwargs={HIDE_FROM_UI: True},
                 ),
             ]
 
@@ -2242,7 +2255,7 @@ def _append_tail_human_message(messages: list[BaseMessage], block: str) -> list[
     injected context rides only in this per-call prompt, the same as
     the pre-L1 ``_merge_into_system`` helper.
     """
-    return [*messages, HumanMessage(content=block)]
+    return [*messages, HumanMessage(content=block, additional_kwargs={PROMPT_TAIL_MARK: True})]
 
 
 def _latest_inputs_block(messages: Sequence[BaseMessage]) -> BaseMessage | None:
@@ -3139,7 +3152,8 @@ def _latest_human_text(messages: Sequence[BaseMessage]) -> str:
     """
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage) and not is_hidden(msg):
-            return str(msg.content)
+            # B-162 —— 轮首平台段追加在用户消息末尾, 判官的基准要把它剥掉。
+            return strip_platform_context(str(msg.content))
     return ""
 
 

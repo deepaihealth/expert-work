@@ -135,7 +135,8 @@ async def test_system_message_byte_stable_with_plan_injection() -> None:
     for call in llm.calls:
         plan_text = "Execution plan"
         assert all(plan_text not in str(m.content) for m in call if isinstance(m, SystemMessage))
-        assert any(plan_text in str(m.content) for m in call if isinstance(m, HumanMessage))
+        # B-162 —— 追加在最后一条消息(用户消息 / 工具结果)末尾。
+        assert any(plan_text in str(m.content) for m in call if not isinstance(m, SystemMessage))
 
 
 @pytest.mark.asyncio
