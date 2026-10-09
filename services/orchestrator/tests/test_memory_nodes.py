@@ -1032,6 +1032,75 @@ async def test_before_store_runs_after_extraction_and_can_abort_the_write() -> N
     assert len(await store.list_for_user(tenant_id=tenant, user_id=user)) == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["UPDATE", "DELETE", "ADD"])
+async def test_before_store_guards_every_write_after_the_reconcile_call(op: str) -> None:
+    """B-168 —— 清除发生在去重合并那次模型调用期间(抽取之后、写入之前):每一次改记忆库
+    的操作(UPDATE 的 supersede、DELETE 的 expire、ADD 的 write)之前都要再问一次,
+    这时就整批放弃,记忆库保持原样。"""
+    from expert_work.runtime.cancellation import RunCancelledError
+    from orchestrator.graph_builder.memory import flush_messages_with_outcome
+
+    tenant, user = uuid4(), uuid4()
+    vector = (1.0, 0.0, 0.0, 0.0)
+    existing_id = uuid4()
+    store = InMemoryMemoryStore()
+    await store.write(
+        [
+            MemoryItem(
+                id=existing_id,
+                tenant_id=tenant,
+                user_id=user,
+                kind="fact",
+                content="lives in Paris",
+                embedding=vector,
+            )
+        ]
+    )
+    purged = False
+
+    async def llm(*, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]) -> AIMessage:
+        nonlocal purged
+        del tools
+        if "candidates" not in str(messages[-1].content):
+            return AIMessage(
+                content='{"memories": [{"kind": "fact", "content": "lives in Berlin", '
+                '"importance": 0.9, "confidence": 0.9}]}'
+            )
+        purged = True  # the user is purged while the reconcile call is in flight
+        return AIMessage(
+            content=f'{{"ops": [{{"index": 0, "op": "{op}", "target_id": "{existing_id}"}}]}}'
+        )
+
+    class _SameVector:
+        async def embed(
+            self, texts: Sequence[str], *, tenant_id: object
+        ) -> list[tuple[float, ...]]:
+            del tenant_id
+            return [vector for _ in texts]
+
+    async def guard() -> None:
+        if purged:
+            raise RunCancelledError("job purged")
+
+    with pytest.raises(RunCancelledError):
+        await flush_messages_with_outcome(
+            [HumanMessage(content="I moved to Berlin")],
+            memory_store=store,
+            embedder=_SameVector(),  # type: ignore[arg-type]
+            llm_caller=llm,
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=None,
+            token=CancellationToken(),
+            reconcile=True,
+            before_store=guard,
+        )
+    assert purged
+    current = await store.list_for_user(tenant_id=tenant, user_id=user)
+    assert [m.content for m in current] == ["lives in Paris"]
+
+
 # ---------------------------------------------------------------------------
 # P5b-2b ⑧ — reconcile correction hint
 # ---------------------------------------------------------------------------

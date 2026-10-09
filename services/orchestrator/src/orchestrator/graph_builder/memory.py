@@ -65,6 +65,9 @@ from orchestrator.tools.knowledge import Reranker
 
 logger = logging.getLogger(__name__)
 
+#: B-168 —— 后台写回在每次改记忆库之前调用的检查;抛 ``RunCancelledError`` = 放弃这批。
+BeforeStore = Callable[[], Awaitable[None]]
+
 #: 二期 P1.1 —— fire-and-forget bump_access 任务的强引用集合(RUF006:
 #: 裸 create_task 的返回值不被引用会被 GC 提前回收)。照 sse.py 的
 #: _BACKGROUND_CLEANUP_TASKS 范式。测试用它 drain。
@@ -757,6 +760,7 @@ async def _reconcile_and_apply(
     llm_caller: LLMCaller,
     token: CancellationToken,
     log_label: str,
+    before_store: BeforeStore | None = None,
 ) -> list[MemoryItem]:
     """Stream CM-7 (Mini-ADR CM-H4) — Mem0-style extract→update.
 
@@ -840,12 +844,16 @@ async def _reconcile_and_apply(
         if op == "NOOP":
             record_memory_reconcile(op="noop")
         elif op == "UPDATE" and target is not None:
-            updated = await _apply_update(item, target, memory_store=memory_store, token=token)
+            updated = await _apply_update(
+                item, target, memory_store=memory_store, token=token, before_store=before_store
+            )
             record_memory_reconcile(op="update" if updated else "degraded")
             if not updated:
                 direct.append(item)
         elif op == "DELETE" and target is not None:
-            deleted = await _apply_delete(item, target, memory_store=memory_store, token=token)
+            deleted = await _apply_delete(
+                item, target, memory_store=memory_store, token=token, before_store=before_store
+            )
             # The candidate is the retraction event — not stored either way.
             record_memory_reconcile(op="delete" if deleted else "degraded")
         elif op == "ADD":
@@ -859,10 +867,17 @@ async def _reconcile_and_apply(
 
 
 async def _apply_update(
-    item: MemoryItem, target: UUID, *, memory_store: MemoryStore, token: CancellationToken
+    item: MemoryItem,
+    target: UUID,
+    *,
+    memory_store: MemoryStore,
+    token: CancellationToken,
+    before_store: BeforeStore | None = None,
 ) -> bool:
     """Stream P5b — append-only UPDATE: supersede ``target`` with ``item``
     (close old row + open new versioned row) instead of overwriting in place."""
+    if before_store is not None:
+        await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
         written = await token.run_cancellable(
             memory_store.supersede(
@@ -881,10 +896,17 @@ async def _apply_update(
 
 
 async def _apply_delete(
-    item: MemoryItem, target: UUID, *, memory_store: MemoryStore, token: CancellationToken
+    item: MemoryItem,
+    target: UUID,
+    *,
+    memory_store: MemoryStore,
+    token: CancellationToken,
+    before_store: BeforeStore | None = None,
 ) -> bool:
     """Stream P5b — retraction: expire ``target`` (world no longer true, no
     successor) instead of soft-deleting it (which means user-forget)."""
+    if before_store is not None:
+        await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
         return await token.run_cancellable(
             memory_store.expire(tenant_id=item.tenant_id, user_id=item.user_id, memory_id=target)
@@ -960,7 +982,7 @@ async def flush_messages_with_outcome(
     reconcile: bool = False,
     agent_name: str | None = None,
     write_min_importance: float = 0.0,
-    before_store: Callable[[], Awaitable[None]] | None = None,
+    before_store: BeforeStore | None = None,
 ) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
 
@@ -994,9 +1016,11 @@ async def flush_messages_with_outcome(
     below passes ``source_run_id=run_id``, so the control-plane worker's
     reconstructed items keep the original run's provenance.
 
-    ``before_store`` (B-168) —— 后台写回传进来:抽取 / 嵌入完、第一次写记忆库之前
-    (去重合并也会写,所以在它之前)调用一次。它抛 ``RunCancelledError`` 就整批放弃
-    —— 不写、也不进 DLQ(任务行已被清除,DLQ 重试会把内容又写回去)。run 内的写回不传。
+    ``before_store`` (B-168) —— 后台写回传进来:**每一次**改记忆库之前都调用(写入,
+    以及去重合并里的 supersede / expire —— 去重合并还要调一次模型,清除可能就发生在那
+    几秒里)。它抛 ``RunCancelledError`` 就整批放弃 —— 不写、也不进 DLQ(任务行已被清除,
+    DLQ 重试会把内容又写回去)。它不许抛别的异常:下面的 ``except Exception`` 会把这批
+    送进 DLQ。run 内的写回不传。
     """
     prompt = [
         SystemMessage(content=_EXTRACT_SYSTEM),
@@ -1048,8 +1072,6 @@ async def flush_messages_with_outcome(
             )
             for mem, vector in zip(extracted, vectors, strict=True)
         ]
-        if before_store is not None:
-            await before_store()
         if reconcile:
             items = await _reconcile_and_apply(
                 items,
@@ -1058,8 +1080,11 @@ async def flush_messages_with_outcome(
                 llm_caller=llm_caller,
                 token=token,
                 log_label=log_label,
+                before_store=before_store,
             )
         if items:
+            if before_store is not None:
+                await before_store()
             await memory_store.write(items)
     except RunCancelledError:
         raise
