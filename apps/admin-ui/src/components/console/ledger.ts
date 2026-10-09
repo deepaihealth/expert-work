@@ -8,7 +8,13 @@
  * ui-trajectory(MIT)重写。
  */
 import i18n from "../../i18n";
-import { ledgerRowsOf, type TrajectoryInput, type TrajectoryRow } from "../../api/trajectory_rows";
+import type { MemoryWritebackResult } from "../../api/runs";
+import {
+  ledgerRowsOf,
+  withBackgroundWriteback,
+  type TrajectoryInput,
+  type TrajectoryRow,
+} from "../../api/trajectory_rows";
 import { cleanUntrusted } from "../../pages/agent_detail/playground/untrusted_clean";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import { absoluteSpans } from "./ledger_timing";
@@ -275,6 +281,9 @@ export function buildLedger(args: {
   /** 运行中尾块的 endedAt(调用方按 `lastKnownFrame` 校准过的服务端 now;
    *  没法校准传 `Date.now()`)。 */
   nowMs: number;
+  /** B-168 B2 —— runId → 后台记忆写回的任务结果(`useBackgroundWritebacks` 取来的);
+   *  挂到该轮「已排队」的写回行上。缺省 = 都没有。 */
+  backgroundWritebacks?: ReadonlyMap<string, MemoryWritebackResult>;
 }): Ledger {
   const records: LedgerRecord[] = [];
   const turns: LedgerTurn[] = [];
@@ -306,7 +315,10 @@ export function buildLedger(args: {
         placeholder: turn.loadState === "error" ? "error" : "loading",
       });
     } else {
-      let base = ledgerRowsOf(turn.turn.events, input);
+      let base = withBackgroundWriteback(
+        ledgerRowsOf(turn.turn.events, input),
+        turn.runId === null ? undefined : args.backgroundWritebacks?.get(turn.runId),
+      );
       // §十.1 —— 与上一条留下来的系统提示词相同就折掉这一轮的 SYSTEM 行(只留
       // 第一次出现与变化的那一轮);不同就更新「上一条」。终审 F4:比较必须
       // 连同派发入参 —— 缺省可选变量与显式空串渲染出同一份文本,但两轮的

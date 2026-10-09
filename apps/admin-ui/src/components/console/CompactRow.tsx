@@ -18,6 +18,7 @@ import type { FireNowResult } from "../../api/triggers";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { cleanUntrusted } from "../../pages/agent_detail/playground/untrusted_clean";
 import { ToolCallCard } from "../ToolTimeline";
+import { memoryRowText } from "./memory_row_text";
 import { firstSentence } from "./text_summary";
 
 type TFn = ReturnType<typeof useTranslation>["t"];
@@ -93,9 +94,7 @@ function rowLabel(row: CompactRowT, liveText: string | undefined, t: TFn): strin
       return t("console.row_plan_create", { n: row.stepsTotal });
     }
     case "memory":
-      return row.direction === "recall"
-        ? t("console.row_memory_recall", { n: row.count })
-        : t("console.row_memory_writeback", { n: row.count });
+      return memoryRowText(row, t);
     case "reflect":
       return row.verdict === "pass"
         ? t("console.row_reflect_pass")

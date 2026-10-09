@@ -2,7 +2,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import i18n from "../../i18n";
 import type { SseEvent } from "../sessions";
-import { compactRowsOf, ledgerRowsOf, promptInputsOf, resolveGanttKey, type AssistantRow } from "../trajectory_rows";
+import {
+  compactRowsOf,
+  ledgerRowsOf,
+  promptInputsOf,
+  resolveGanttKey,
+  withBackgroundWriteback,
+  type AssistantRow,
+} from "../trajectory_rows";
 
 // 标记行文案走语言包,断言按 zh-CN 写 —— 固定语言,别赌检测结果。
 let priorLang: string;
@@ -170,6 +177,41 @@ describe("compactRowsOf", () => {
       upd("memory_writeback", { written_memory_count: 0, memory_writeback_failed: true, _duration_ms: 5000 }),
     ]);
     expect(rows[0]).toMatchObject({ kind: "memory", direction: "writeback", count: 0, status: "warn" });
+  });
+
+  it("B-168 B2: a queued (background) writeback frame is a writeback row flagged queued, not a quiet 0", () => {
+    const rows = compactRowsOf([
+      upd("memory_writeback", {
+        written_memory_count: 0, memory_writeback_failed: false, memory_writeback_queued: true, _duration_ms: 4,
+      }),
+    ]);
+    expect(rows[0]).toMatchObject({ kind: "memory", direction: "writeback", status: "ok" });
+    expect(rows[0].kind === "memory" && rows[0].detail.queued).toBe(true);
+  });
+
+  it("B-168 B2: withBackgroundWriteback attaches the job result to the queued writeback row only", () => {
+    const rows = compactRowsOf([
+      upd("memory_recall", { recalled_memories: [{ id: "m1" }] }),
+      upd("memory_writeback", { written_memory_count: 0, memory_writeback_queued: true }),
+    ]);
+    const done = { status: "done", written_count: 2, failed: false, queued_ms: 800, exec_ms: 4100 } as const;
+    const out = withBackgroundWriteback(rows, done);
+    expect(out[0]).toBe(rows[0]);
+    expect(out[1]).toMatchObject({ kind: "memory", background: done, status: "ok" });
+    expect(rows[1]).not.toHaveProperty("background"); // input untouched
+    const failed = withBackgroundWriteback(rows, { ...done, status: "failed", written_count: null });
+    expect(failed[1]).toMatchObject({ status: "warn" });
+    const notWritten = withBackgroundWriteback(rows, { ...done, failed: true, written_count: 0 });
+    expect(notWritten[1]).toMatchObject({ status: "warn" });
+    expect(withBackgroundWriteback(rows, null)).toBe(rows);
+  });
+
+  it("B-168 B2: an inline writeback row never takes a background result", () => {
+    const rows = compactRowsOf([upd("memory_writeback", { written_memory_count: 1 })]);
+    const out = withBackgroundWriteback(rows, {
+      status: "done", written_count: 9, failed: false, queued_ms: 1, exec_ms: 1,
+    });
+    expect(out[0]).not.toHaveProperty("background");
   });
 
   it("a tool with worker sub-timelines gets one subagent row per worker right after it, carrying the worker frames' indexes", () => {
