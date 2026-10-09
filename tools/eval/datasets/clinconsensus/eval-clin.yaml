@@ -1,0 +1,43 @@
+# ClinConsensus 小测 —— 平台组用的健康咨询评测智能体。
+# 提示词与裸模型组逐字相同(tools/eval/clinconsensus.py 的 SYSTEM_PROMPT),两组只差「平台」这一个变量。
+# 工具与 B-140 的 eval-general 相同,不接知识库、不开外网。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-clin
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: ClinConsensus 健康问答小测用的评测智能体(内部评测专用)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 32768
+  system_prompt:
+    template: |
+      你是一名专业、严谨的医疗健康咨询助手。请根据用户提供的信息,给出准确、全面、可操作的回答;涉及诊断、用药或治疗时说明依据和注意事项,必要时建议就医。不要编造信息。
+  tools:
+    - { type: builtin, name: read_file }
+    - { type: builtin, name: write_file }
+    - { type: builtin, name: edit_file }
+    - { type: builtin, name: search_files }
+    - { type: builtin, name: exec_python }
+    - { type: builtin, name: bash }
+    - { type: builtin, name: save_artifact }
+  policies:
+    token_budget: 400000
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp
+      persistent_workspace: true

@@ -136,3 +136,29 @@ uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>
 恢复用例(B-163,`g14` / `g15`):任务中途确定会有一次工具失败(读一个不存在的文件 / 照抄一段对不上的原文去 `edit_file`),
 看模型能不能接着把事做完。用例写了 `requires_tool_error: true`:整次一次失败的工具调用都没有(模型绕开了那次失败)
 就判「不可判」,与 `requires_compaction` 同一口径。
+
+## ClinConsensus 健康问答小测(`clinconsensus.py`,2026-10-09)
+
+同一个模型(glm-5.3)、同一段提示词,对比「裸调用」和「放进平台的评测智能体」在中文健康问答上的得分。
+题目是 [ClinConsensus](https://arxiv.org/abs/2603.02097)(阿里,EMNLP 2026 Findings)公开的 900 例低难度档,
+数据 CC BY 4.0(引用须注明出处),不进仓库,`download` 现拉;每题 30 条判分项,判分提示词逐字取自官方
+`docs/judge_prompt.md`,计分与官方 `scripts/eval_cacs.py` 同一公式(判分项通过率 / Pass@10 / CACS@10)。
+
+```sh
+uv run --no-sync python tools/eval/clinconsensus.py download
+uv run --no-sync python tools/eval/clinconsensus.py select --n 10   # 普通人 / 专业人员各半,固定种子
+EXPERT_WORK_EVAL_LLM_API_KEY=... EXPERT_WORK_EVAL_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4 \
+  uv run --no-sync python tools/eval/clinconsensus.py bare
+EXPERT_WORK_API_TOKEN=... uv run --no-sync python tools/eval/clinconsensus.py platform
+EXPERT_WORK_EVAL_JUDGE_API_KEY=... EXPERT_WORK_EVAL_JUDGE_BASE_URL=https://api.deepseek.com \
+  uv run --no-sync python tools/eval/clinconsensus.py judge
+uv run --no-sync python tools/eval/clinconsensus.py score
+```
+
+平台组要先在控制台导入 `datasets/clinconsensus/eval-clin.yaml`(用完可删)。判分不要用被测模型同厂商的模型。
+
+**10-09 首次 10 题结果**(DeepSeek v4-pro 判分):裸调用 判分项 47.3% / CACS@10 27.6,平台 48.0% / 28.1,差距在 10 题的波动内;
+评测智能体只有基础文件工具、没接医学知识,平台在问答上没有可测增益。10 题里 2 题平台智能体去写文件 / 存产物,
+耗时与 token 翻几倍、一题分数更低。花费约 9 元(全量 900 题两组约 800 元);逐题串行裸调用 33 分钟、平台 63 分钟。
+与论文成绩对照只能作参考:论文主分数用 GPT-5.1 严格判分,两种判分模型的模型级平均差 8.72 个百分点;
+公开题全是低难度档,要对照论文图 5 的低难度档(11 个模型均值 28.5,GLM-5 约 24.0)。
