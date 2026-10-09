@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -229,3 +229,103 @@ async def test_stop_waits_for_the_in_flight_job_to_finish() -> None:
     await worker.stop()
 
     assert _only(store).status == "done"
+
+
+@pytest.mark.asyncio
+async def test_still_held_turns_false_once_another_worker_reclaims() -> None:
+    """(2a) —— 租约过期、被别的副本重新领走之后,旧持有者再问就是 False(不再写)。"""
+    store = InMemoryMemoryWritebackJobStore()
+    await _enqueue(store)
+    answers: list[bool] = []
+
+    async def reclaimed_mid_way(
+        job: MemoryWritebackJob, *, still_held: StillHeld
+    ) -> WritebackOutcome:
+        answers.append(await still_held())
+        later = datetime.now(UTC) + timedelta(hours=1)  # this worker's lease ran out
+        assert await store.claim_next(now=later, lease_s=300, max_attempts=3) is not None
+        answers.append(await still_held())
+        return WritebackOutcome(written_count=0, failed=False, discarded=True)
+
+    worker = MemoryWritebackWorker(store=store, processor=reclaimed_mid_way)
+    await worker.run_once()
+
+    assert answers == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_lease_cancels_the_processing() -> None:
+    """(2b) —— 续租发现租约已丢(被别的副本接手):取消正在做的处理,不等它做完。"""
+    store = InMemoryMemoryWritebackJobStore()
+    await _enqueue(store)
+    cancelled = asyncio.Event()
+
+    async def hangs(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
+        later = datetime.now(UTC) + timedelta(hours=1)
+        assert await store.claim_next(now=later, lease_s=3600, max_attempts=3) is not None
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return WritebackOutcome(written_count=0, failed=False)
+
+    worker = MemoryWritebackWorker(store=store, processor=hangs, lease_s=30, renew_every_s=0.02)
+    before = _settled("lost")
+    assert await asyncio.wait_for(worker.run_once(), timeout=5) is True
+
+    assert cancelled.is_set()
+    assert _settled("lost") == before + 1
+    job = _only(store)
+    assert (job.status, job.attempts) == ("running", 2)  # the new owner's claim is untouched
+
+
+@pytest.mark.asyncio
+async def test_an_attempt_ends_before_the_lease_can_lapse() -> None:
+    """(2c) —— 单次执行上限 = 租约 - 续租间隔:最后一次续租之后、租约到期之前就收手,
+    不会在别的副本能接手的时候还在写。"""
+    store = InMemoryMemoryWritebackJobStore()
+    await _enqueue(store)
+    worker = MemoryWritebackWorker(
+        store=store, processor=_Recorder(delay_s=0.4), lease_s=0.5, renew_every_s=0.2
+    )
+
+    await worker.run_once()
+
+    job = _only(store)
+    assert job.status == "pending"
+    assert job.last_error is not None and "TimeoutError" in job.last_error
+
+
+@pytest.mark.asyncio
+async def test_jobs_run_concurrently_up_to_the_limit() -> None:
+    """(1A) —— 一个副本同时处理多条(不同用户的)任务,上限 ``concurrency``。"""
+    store = InMemoryMemoryWritebackJobStore()
+    for _ in range(3):
+        await _enqueue(store)  # three different users
+    release = asyncio.Event()
+    started: list[UUID] = []
+
+    async def blocks(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
+        started.append(job.id)
+        await release.wait()
+        return WritebackOutcome(written_count=1, failed=False)
+
+    worker = MemoryWritebackWorker(store=store, processor=blocks, interval_s=0.01, concurrency=2)
+    worker.start()
+    try:
+        for _ in range(200):
+            if len(started) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        assert len(started) == 2  # two in flight, the third waits for a slot
+        release.set()
+        for _ in range(200):
+            if all(j.status == "done" for j in store._rows.values()):
+                break
+            await asyncio.sleep(0.01)
+        assert len(started) == 3
+        assert all(j.status == "done" for j in store._rows.values())
+    finally:
+        await worker.stop()

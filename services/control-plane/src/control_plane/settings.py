@@ -523,10 +523,14 @@ class Settings(BaseSettings):
     #: worker 的轮询间隔(慢路径:接住别的副本落的、重启前没做完的、租约过期的任务)。
     #: 本副本刚落的任务走 ``wake()`` 快路径,不等这个间隔。
     memory_writeback_worker_interval_s: float = Field(default=2.0, gt=0)
-    #: 领取租约秒数;处理中每 1/5 租约续一次。也是单条任务的执行上限 —— 超时算一次失败。
+    #: 领取租约秒数;处理中每 1/5 租约续一次。单次执行上限 = 租约 - 续租间隔(4/5 租约),
+    #: 超时算一次失败。
     memory_writeback_lease_s: float = Field(default=300.0, gt=0)
     #: 同一条任务最多执行几次(含租约过期被接手),之后 ``failed``。
     memory_writeback_max_attempts: int = Field(default=3, gt=0)
+    #: 每个副本同时处理几条任务(不同用户并行;同一用户由领取串行)。一个卡住的厂商只占
+    #: 一个空位,不会让整个副本的记忆写回停摆。
+    memory_writeback_worker_concurrency: int = Field(default=4, gt=0)
 
     # ------------------------------------------------------------------ trigger scheduler (J.10)
     #: Stream J.10 — how often the trigger scheduler sweeps the

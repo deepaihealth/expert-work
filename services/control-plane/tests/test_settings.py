@@ -62,6 +62,7 @@ def test_memory_writeback_defaults_inline() -> None:
     assert settings.memory_writeback_worker_interval_s == 2.0
     assert settings.memory_writeback_lease_s == 300.0
     assert settings.memory_writeback_max_attempts == 3
+    assert settings.memory_writeback_worker_concurrency == 4
 
 
 def test_memory_writeback_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:

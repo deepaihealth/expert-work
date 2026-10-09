@@ -7,18 +7,25 @@
 
 * **快路径**:本副本刚落了任务就 :meth:`MemoryWritebackWorker.wake`,不等轮询。
 * **慢路径**:每 ``interval_s`` 轮询一次,接住别的副本落的、重启前没做完的、租约过期的任务。
-* 一次领一条(``claim_next``,跨租户扫描在 bypass-RLS 下做),领到就接着领,领不到才等。
-  同一用户串行由领取条件保证(见 ``expert_work.persistence.memory.writeback_job``)。
+* **并发**:一个副本同时最多处理 ``concurrency`` 条,每领到一条就起一个任务去做,有空位就
+  接着领。同一用户串行由领取保证(见 ``expert_work.persistence.memory.writeback_job``),
+  不同用户并行 —— 一个卡住的厂商只占一个空位,不会让整个副本停摆。
 * 处理交给注入的处理器(生产是 :class:`~control_plane.memory.writeback_processor.
   MemoryWritebackProcessor`),在任务自己的租户 + 用户作用域里跑;处理中每
-  ``renew_every_s`` 续一次租约。单条执行上限 = 租约时长,超时算一次失败。
-* **清除**(设计稿 §3.6):处理器拿到 ``still_held``,在写记忆之前问一次任务行还在不在,
-  不在就放弃写入、回 ``discarded``。收尾的 ``finish`` 本身带持有凭证(``attempts``)+
-  ``status = 'running'`` 条件:行被清除或被别的副本重新领走时它不生效,不会把行写回来,
-  所以 worker 不在 ``finish`` 前另查一次。
+  ``renew_every_s`` 续一次租约。
+* **持有与围栏**:单次执行上限 = ``lease_s - renew_every_s``(最后一次续租之后、租约到期
+  之前收手),超时算一次失败。续租发现租约已丢(被别的副本接手、或行被清除)就取消正在
+  做的处理。处理器在**每次**改记忆库之前问 ``still_held``(这条任务是否仍在本次领取手上),
+  不在就整批放弃、回 ``discarded``。收尾的 ``finish`` / ``fail_attempt`` 同样带持有凭证
+  (``attempts``),迟到的旧持有者改不了行。
+* **至少一次(at-least-once)**:以上围栏缩小、但消不掉重复执行的窗口 —— 旧持有者在
+  ``still_held`` 返回 True 之后、那次写入落库之前恰好丢了租约,新持有者会把这一轮再抽取、
+  再写一遍。完全相同的内容由记忆库的内容哈希去重;改了措辞的同一件事可能写两条、去重合并
+  的增删改可能做两次。为此不做跨进程的写入事务:窗口只有一次库写入那么长。
+* **清除**(设计稿 §3.6):用户被清除 / 会话被删除时任务行被删,``still_held`` 随即为 False。
 * **收尾**:处理器正常返回 → ``finish``(``done``,结果记在行上);处理器抛错 / 超时 →
   ``fail_attempt``(未到上限退回 ``pending``,到上限 ``failed``)。
-* **关机**:先停止领新任务,再等手上这条做完,最多 ``stop_timeout_s``;做不完就放着,
+* **关机**:先停止领新任务,再等手上这几条做完,最多 ``stop_timeout_s``;做不完就取消,
   租约过期后别的副本接手。
 """
 
@@ -145,20 +152,29 @@ class MemoryWritebackWorker:
         interval_s: float = 2.0,
         lease_s: float = 300.0,
         max_attempts: int = 3,
+        concurrency: int = 4,
         stop_timeout_s: float = 300.0,
         renew_every_s: float | None = None,
     ) -> None:
-        if interval_s <= 0 or lease_s <= 0 or max_attempts <= 0:
-            msg = "interval_s, lease_s and max_attempts must be positive"
+        if interval_s <= 0 or lease_s <= 0 or max_attempts <= 0 or concurrency <= 0:
+            msg = "interval_s, lease_s, max_attempts and concurrency must be positive"
+            raise ValueError(msg)
+        renew = renew_every_s if renew_every_s is not None else lease_s / 5
+        if not 0 < renew < lease_s:
+            msg = "renew_every_s must be positive and shorter than lease_s"
             raise ValueError(msg)
         self._store = store
         self._processor = processor
         self._interval_s = interval_s
         self._lease_s = lease_s
         self._max_attempts = max_attempts
+        self._concurrency = concurrency
         self._stop_timeout_s = stop_timeout_s
-        self._renew_every_s = renew_every_s if renew_every_s is not None else lease_s / 5
+        self._renew_every_s = renew
+        #: 最后一次续租之后、租约到期之前收手 —— 不在别的副本可能接手的时候还在写。
+        self._attempt_timeout_s = lease_s - renew
         self._task: asyncio.Task[None] | None = None
+        self._inflight: set[asyncio.Task[None]] = set()
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()
 
@@ -178,37 +194,64 @@ class MemoryWritebackWorker:
         self._wake.set()
 
     async def stop(self) -> None:
-        """Stop claiming, wait up to ``stop_timeout_s`` for the in-flight job,
-        then cancel it (its lease expires and another replica takes over)."""
+        """Stop claiming, wait up to ``stop_timeout_s`` for the in-flight jobs,
+        then cancel them (their leases expire and another replica takes over)."""
         if self._task is None:
             return
         self._stop.set()
         self._wake.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stop_timeout_s
         try:
             await asyncio.wait_for(self._task, timeout=self._stop_timeout_s)
         except (TimeoutError, asyncio.CancelledError):
-            logger.warning("memory.writeback_worker.stop_abandoned_in_flight")
+            pass
         finally:
             self._task = None
+        if self._inflight:
+            _done, pending = await asyncio.wait(
+                set(self._inflight), timeout=max(0.0, deadline - loop.time())
+            )
+            if pending:
+                logger.warning(
+                    "memory.writeback_worker.stop_abandoned_in_flight count=%d", len(pending)
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
             # Cleared before the claim, so a wake() that lands while this cycle
             # runs is still seen by the wait below.
             self._wake.clear()
+            if len(self._inflight) >= self._concurrency:
+                await self._wait_for_slot()
+                continue
             try:
-                claimed = await self.run_once()
+                job = await self._claim()
             except Exception:
                 _cycle_errors.inc()
                 logger.exception("memory.writeback_worker.cycle_failed")
-                claimed = False
-            if claimed:
-                continue  # drain: there may be more ready jobs
+                job = None
+            if job is not None:
+                task = asyncio.create_task(self._run_claimed(job), name="memory-writeback-job")
+                self._inflight.add(task)
+                task.add_done_callback(self._inflight.discard)
+                continue  # fill the free slots: there may be more ready jobs
             await self._sample_backlog()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=self._interval_s)
             except TimeoutError:
                 continue
+
+    async def _wait_for_slot(self) -> None:
+        stopping = asyncio.ensure_future(self._stop.wait())
+        try:
+            await asyncio.wait({*self._inflight, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stopping.cancel()
+            await asyncio.gather(stopping, return_exceptions=True)
 
     async def _sample_backlog(self) -> None:
         try:
@@ -217,30 +260,54 @@ class MemoryWritebackWorker:
         except Exception:
             logger.warning("memory.writeback_worker.backlog_failed", exc_info=True)
 
-    async def run_once(self) -> bool:
-        """Claim and settle at most one job. ``True`` iff a job was claimed."""
+    async def _claim(self) -> MemoryWritebackJob | None:
         with _bypass_rls():
-            job = await self._store.claim_next(
+            return await self._store.claim_next(
                 now=_utcnow(), lease_s=self._lease_s, max_attempts=self._max_attempts
             )
+
+    async def run_once(self) -> bool:
+        """Claim and settle at most one job, inline. ``True`` iff a job was claimed."""
+        job = await self._claim()
         if job is None:
             return False
+        await self._settle(job)
+        return True
+
+    async def _run_claimed(self, job: MemoryWritebackJob) -> None:
+        try:
+            await self._settle(job)
+        except Exception:
+            # The claim stays behind; its lease expiry hands it to a later attempt.
+            _cycle_errors.inc()
+            logger.exception("memory.writeback_worker.job_failed job_id=%s", job.id)
+
+    async def _settle(self, job: MemoryWritebackJob) -> None:
         queued_ms = _ms((job.started_at or job.created_at) - job.created_at)
         _queue_lag.observe(queued_ms / 1000)
         with _tenant_scope(job.tenant_id, job.user_id):
             await self._process(job, queued_ms=queued_ms)
-        return True
 
     async def _process(self, job: MemoryWritebackJob, *, queued_ms: int) -> None:
         async def still_held() -> bool:
             return await self._store.still_held(job_id=job.id, attempt=job.attempts)
 
         started = time.monotonic()
-        renewer = asyncio.create_task(self._renew(job), name="memory-writeback-renew")
+        lease_lost = asyncio.Event()
+        work = asyncio.ensure_future(self._processor(job, still_held=still_held))
+        renewer = asyncio.create_task(
+            self._renew(job, work, lease_lost), name="memory-writeback-renew"
+        )
         try:
-            outcome = await asyncio.wait_for(
-                self._processor(job, still_held=still_held), timeout=self._lease_s
-            )
+            outcome = await asyncio.wait_for(work, timeout=self._attempt_timeout_s)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if lease_lost.is_set() and (current is None or current.cancelling() == 0):
+                # 续租发现租约已丢、取消了处理:行归新持有者(或已被清除),这里什么都不改。
+                _jobs.labels(outcome="lost").inc()
+                logger.warning("memory.writeback_worker.lease_lost_cancelled job_id=%s", job.id)
+                return
+            raise
         except Exception as exc:
             exec_ms = int((time.monotonic() - started) * 1000)
             _exec_duration.observe(exec_ms / 1000)
@@ -299,7 +366,9 @@ class MemoryWritebackWorker:
             type(exc).__name__,
         )
 
-    async def _renew(self, job: MemoryWritebackJob) -> None:
+    async def _renew(
+        self, job: MemoryWritebackJob, work: asyncio.Future[WritebackOutcome], lost: asyncio.Event
+    ) -> None:
         while True:
             await asyncio.sleep(self._renew_every_s)
             try:
@@ -312,7 +381,9 @@ class MemoryWritebackWorker:
                 logger.warning("memory.writeback_worker.renew_failed job_id=%s", job.id)
                 continue
             if not held:
-                logger.warning("memory.writeback_worker.lease_lost job_id=%s", job.id)
+                # 别的副本已接手(或行被清除):停下正在做的处理,别再写。
+                lost.set()
+                work.cancel()
                 return
 
 

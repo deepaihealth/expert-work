@@ -1858,6 +1858,7 @@ def create_app(
                         interval_s=resolved_settings.memory_writeback_worker_interval_s,
                         lease_s=resolved_settings.memory_writeback_lease_s,
                         max_attempts=resolved_settings.memory_writeback_max_attempts,
+                        concurrency=resolved_settings.memory_writeback_worker_concurrency,
                         # 设计稿 §3.2:关机时等手上这条的上限复用 run 收口的上限;两者并行等,
                         # 不叠加(见下方关机顺序)。
                         stop_timeout_s=resolved_settings.run_drain_timeout_s,
@@ -2413,6 +2414,15 @@ def create_app(
                 #    收口分支里的库写不可靠。
                 run_manager_for_drain = resolved_agent_runtime.run_manager
                 run_manager_for_drain.mark_shutting_down()
+                # B-168 —— 记忆后台写回 worker 最先停领新任务(下面每一步都可能要等几秒,
+                # 这期间它不该再领);手上那几条与下面的 run 收口并行等完(上限各自
+                # ``run_drain_timeout_s``,不叠加 —— 先后等会让最坏情形翻倍,超过 k8s 优雅期)。
+                # 做不完的留给租约过期后别的副本接手。
+                memory_writeback_stopping = (
+                    asyncio.create_task(memory_writeback_worker.stop())
+                    if memory_writeback_worker is not None
+                    else None
+                )
                 # PR-E3a — stop the subscriber before its Redis client is
                 # closed by the exit stack (LIFO callbacks run after this).
                 await invalidation_bus.stop()
@@ -2420,14 +2430,6 @@ def create_app(
                     await memory_consolidator.stop()
                 if memory_dlq_worker is not None:
                     await memory_dlq_worker.stop()
-                # B-168 —— 记忆后台写回 worker:这里就停领新任务,手上那条与下面的 run
-                # 收口并行等完(上限各自 ``run_drain_timeout_s``,不叠加 —— 先后等会让最坏
-                # 情形翻倍,超过 k8s 优雅期)。做不完的留给租约过期后别的副本接手。
-                memory_writeback_stopping = (
-                    asyncio.create_task(memory_writeback_worker.stop())
-                    if memory_writeback_worker is not None
-                    else None
-                )
                 if reaper is not None:
                     await reaper.stop()
                 if scheduler is not None:
