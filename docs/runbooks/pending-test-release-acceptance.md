@@ -221,3 +221,13 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [x] **20.4 原有 g 用例不受影响**:与 `after-1006` 比无稳定翻转。 **10-08 过**:g01~g12 **36/36**(上一版 `cecbd0f6` 跑过一次 g01 失败 —— 答对了但多提了一句旧编号;`6d6e2f7f` 上 g01 3/3)。
 - [x] **20.5 提示词形状**:任取一个 run 在 Langfuse 看 GENERATION 输入:系统提示词里有一段「# Platform context」;第一步的用户消息末尾带 `<platform-context>`;工具调到一半时它在最后一条工具结果末尾,工具结果之后**没有**另起的 user 消息(工具出错后的恢复建议除外,那条本来就有);检查点(`run_event` / 对话页)里的用户消息与工具结果是原文。 **10-08 过**(Langfuse 抽 c03 一个 run 的 GENERATION):系统提示词含「# Platform context」;第 1 步用户消息「继续做下一步。」末尾带 `<platform-context>`;工具调到一半时它在最后一条工具结果末尾、其后没有 user 消息;检查点原文不变由单测守(`test_the_model_never_sees_a_platform_only_user_message`)。
 - [x] **20.6 缓存代价**:同一批评测的 `expert_work:llm_prompt_cache_hit:ratio1h`(B-142)与 `c-base2-1007` 那批的 `token_usage` 现算命中率比较,报告差值;下降超过 10 个百分点时把数摆给用户定。 **10-08 过**:命中率不降反升 —— eval-compress 85.0% → 86.1%、eval-general 86.4% → 89.8%、eval-ahp 84.8% → 90.9%(`token_usage` 现算,前值为 10-07 / 10-06 同批评测)。
+
+## §21 B-163 / B-164 / B-165 执行层三个修复(ROADMAP B-163 / B-164 / B-165)
+
+**背景**:10-08 B-140 评测带出三处,用户 10-08 拍板随 10-12。B-164(#1772):声明只读的工具,非瞬态失败一律不进欠账(h01 一次 `read_file` 带 `..` 被拒,模型改用 `skill_view` 拿到同样内容,仍 `completed=false`)。B-165(#1773):压缩摘要输入渲染工具调用(工具名 + 参数,截到 1,500 字符)、工具结果行带工具名。B-163(#1774):恢复建议不再单独成一条隐藏用户消息,改为出错那条工具结果上的标记,拼提示词时贴到它末尾。三个 PR 在集成分支 `integ/b163-165`(测试镜像 `06a9def2`)上一起验,`git diff integ/b163-165 22673d9b -- . ':!docs'` 为空;生产执行单第二十次重钉到 `22673d9b`。
+
+- [x] **21.1 发测试**:`06a9def2` 10-08 按用户指令发测试。判据:smoke + 金丝雀 PASS,三个镜像 tag 都是 `06a9def2`。 **10-08 过**。
+- [x] **21.2 B-140 g / h 用例**:`behavior_runner.py --only h01-word-plan,h10-missing-weight,h12-cannot-send-to-client,g11-recover-from-script-error,g12-missing-file-honest,g13-write-refused,g14-skip-missing-input,g15-edit-with-wrong-snippet --repeats 3`(g13 = 必须写的文件被拒、仍应 `completed=false` 的反向用例;g14 / g15 = 中途必失败一次的恢复用例)。判据:没有因 `completed` 误判的;g13 仍判没做完。 **10-08 测试 `06a9def2` 过**:24/24。
+- [x] **21.3 B-140 压缩用例**:`behavior_runner.py --only c01-ten-ledgers-one-by-one,c02-constraints-survive-compaction,c03-where-are-we,c04-export-keeps-revisions --repeats 3`。判据:没有用例稳定变差。 **10-08 测试 `06a9def2` 过**:11/12。c02 第 1 次只差 `completed`(文件内容对),是已有的欠账局限 —— `edit_file` 失败后改用 `exec_python` 改好,这笔账还不上;三个 PR 都没碰它。
+- [x] **21.4 离线留存评测(B-165)**:`tools/eval/compaction_retention.py --repeats 3`,F1 / F2 两组。判据:B 组(现版)留下只在调用参数里的编号;A 组(B-141 之前的 24k 格式器)做对照。**没修好时**:只在参数里的编号进不了摘要。 **10-08 测试过**:F1(142k 字符)A 组 1/12、进度 0/3,B 组 12/12(含只在参数里的编号)、进度 3/3;F2(303k 字符,强制折叠)A 组 1/12,B 组 72%、进度 3/3。评测花费(21.2–21.4)约 43 元。
+- [ ] **21.5 `22673d9b` 发测试后 smoke + 金丝雀 + 三镜像 tag 核对**:10-09 按用户指令发,结果补在 chore(deploy) 记录 PR;同时在测试 pod 原样跑一次生产执行单 Step C 的符号 / 版本核对命令(第二十次重钉改过),期望 `ok`。
