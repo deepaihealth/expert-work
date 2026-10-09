@@ -1863,6 +1863,13 @@ def create_app(
                         # 不叠加(见下方关机顺序)。
                         stop_timeout_s=resolved_settings.run_drain_timeout_s,
                     )
+                    # B-168 —— 往下传给建图:写回节点据此只落任务、捅本副本 worker 的快路径。
+                    # worker 自己的处理器拿的是上面那份(它只用记忆库 / 嵌入 / DLQ)。
+                    memory_env = replace(
+                        memory_env,
+                        writeback_jobs=resolved_memory_writeback_jobs,
+                        wake_writeback=memory_writeback_worker.wake,
+                    )
                 # Stream J.4 — the ChildAgentBuilder lets a SubAgentTool
                 # resolve an agent_ref and recursively build the sub-agent;
                 # the top-level agent's ToolEnv carries it so delegation

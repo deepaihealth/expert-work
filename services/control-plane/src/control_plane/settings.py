@@ -518,8 +518,9 @@ class Settings(BaseSettings):
     #: B-168 —— 一轮结束时的长期记忆写回在哪儿跑。``inline`` = 本轮内同步写回(今天的
     #: 行为,也是逃生口);``background`` = 本轮只落一行任务(``memory_writeback_job``),
     #: 由每个副本上的 ``MemoryWritebackWorker`` 在 ``end`` 帧之后执行。只有 ``background``
-    #: 才起 worker。
-    memory_writeback_mode: Literal["inline", "background"] = "inline"
+    #: 才起 worker。B2 起默认 ``background``(设计稿 §8 问题 1 拍板);退回 inline 用环境变量
+    #: ``EXPERT_WORK_MEMORY_WRITEBACK_MODE=inline``。
+    memory_writeback_mode: Literal["inline", "background"] = "background"
     #: worker 的轮询间隔(慢路径:接住别的副本落的、重启前没做完的、租约过期的任务)。
     #: 本副本刚落的任务走 ``wake()`` 快路径,不等这个间隔。
     memory_writeback_worker_interval_s: float = Field(default=2.0, gt=0)
