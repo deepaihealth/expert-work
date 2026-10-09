@@ -967,6 +967,71 @@ async def test_flush_failure_enqueues_with_source_run_id() -> None:
     assert enqueued.source_run_id == str(run)
 
 
+@pytest.mark.asyncio
+async def test_before_store_runs_after_extraction_and_can_abort_the_write() -> None:
+    """B-168 —— 后台写回在写记忆之前问一次任务行还在不在(设计稿 §3.6)。
+
+    钩子在抽取 / 嵌入之后、任何写入(含去重合并)之前调用;它抛 ``RunCancelledError``
+    时这一批既不写进记忆库,也不进 DLQ(否则清除用户之后 DLQ 又把内容写回去)。
+    """
+    from expert_work.persistence.memory.dlq import InMemoryMemoryWritebackDLQ
+    from expert_work.runtime.cancellation import RunCancelledError
+    from orchestrator.graph_builder.memory import flush_messages_with_outcome
+
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(
+                content='{"memories": [{"kind": "fact", "content": "likes tea", '
+                '"importance": 0.9, "confidence": 0.9}]}'
+            )
+        ]
+        * 2
+    )
+    calls: list[int] = []
+
+    async def gone() -> None:
+        calls.append(len(llm.calls))
+        raise RunCancelledError("job purged")
+
+    store = InMemoryMemoryStore()
+    dlq = InMemoryMemoryWritebackDLQ()
+    with pytest.raises(RunCancelledError):
+        await flush_messages_with_outcome(
+            [HumanMessage(content="I like tea")],
+            memory_store=store,
+            embedder=FakeEmbedder(dim=_DIM),
+            llm_caller=llm,
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=None,
+            token=CancellationToken(),
+            dlq=dlq,
+            reconcile=True,
+            before_store=gone,
+        )
+    assert calls == [1]  # after the extraction call, before anything else
+    assert await store.list_for_user(tenant_id=tenant, user_id=user) == []
+    assert await dlq.count() == 0
+
+    async def still_there() -> None:
+        calls.append(len(llm.calls))
+
+    outcome = await flush_messages_with_outcome(
+        [HumanMessage(content="I like tea")],
+        memory_store=store,
+        embedder=FakeEmbedder(dim=_DIM),
+        llm_caller=llm,
+        tenant_id=tenant,
+        user_id=user,
+        thread_id=None,
+        token=CancellationToken(),
+        before_store=still_there,
+    )
+    assert outcome.written == 1
+    assert len(await store.list_for_user(tenant_id=tenant, user_id=user)) == 1
+
+
 # ---------------------------------------------------------------------------
 # P5b-2b ⑧ — reconcile correction hint
 # ---------------------------------------------------------------------------

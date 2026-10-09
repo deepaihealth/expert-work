@@ -960,6 +960,7 @@ async def flush_messages_with_outcome(
     reconcile: bool = False,
     agent_name: str | None = None,
     write_min_importance: float = 0.0,
+    before_store: Callable[[], Awaitable[None]] | None = None,
 ) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
 
@@ -992,6 +993,10 @@ async def flush_messages_with_outcome(
     DLQ-retry path now carries run_id (P5b-2a) too — the enqueue call
     below passes ``source_run_id=run_id``, so the control-plane worker's
     reconstructed items keep the original run's provenance.
+
+    ``before_store`` (B-168) —— 后台写回传进来:抽取 / 嵌入完、第一次写记忆库之前
+    (去重合并也会写,所以在它之前)调用一次。它抛 ``RunCancelledError`` 就整批放弃
+    —— 不写、也不进 DLQ(任务行已被清除,DLQ 重试会把内容又写回去)。run 内的写回不传。
     """
     prompt = [
         SystemMessage(content=_EXTRACT_SYSTEM),
@@ -1043,6 +1048,8 @@ async def flush_messages_with_outcome(
             )
             for mem, vector in zip(extracted, vectors, strict=True)
         ]
+        if before_store is not None:
+            await before_store()
         if reconcile:
             items = await _reconcile_and_apply(
                 items,

@@ -566,7 +566,7 @@ class RouteRule(BaseModel):
     #: 主模型同一家的便宜型号(见 ``orchestrator.agent_factory._compression_model``)。
     #: 生产 manifest 不要写它:回滚窗口里旧镜像的 Literal 不认识这个值,整份 manifest 会被拒。
     #: B-168 —— ``memory``:长期记忆的五处调用(写回抽取 / 去重合并 / 压缩前抢存 / 读时复核 /
-    #: 检索改写)。不写时默认同一家便宜型号 + 关思考(见 ``agent_factory._memory_model``);
+    #: 检索改写)。不写时默认同一家便宜型号 + 关思考(见 ``agent_factory.memory_model``);
     #: 回滚注意同上。
     when: Literal["planning", "reflection", "compression", "memory"]
     model: ModelSpec

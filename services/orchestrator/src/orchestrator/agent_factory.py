@@ -288,7 +288,7 @@ class StepRouters:
     ``default`` — except ``compression``, which defaults to the main model's
     same-vendor cheap sibling when there is one (:func:`_compression_model`) —
     and ``memory`` (B-168), the long-term memory calls, which default to the
-    cheap sibling with thinking off (:func:`_memory_model`).
+    cheap sibling with thinking off (:func:`memory_model`).
     """
 
     default: LLMRouter
@@ -969,11 +969,11 @@ async def build_agent(
     # Stream J.3 — long-term memory recall / write-back nodes when the
     # manifest declares ``memory.long_term``.
     # B-104 —— 记忆调用套一层记账。B-168 —— 读时校验 / 查询改写 / 写回抽取 / 写回归并 /
-    # 压缩前抢存走 ``memory`` 路由(默认同一家便宜型号 + 关思考,见 :func:`_memory_model`)。
+    # 压缩前抢存走 ``memory`` 路由(默认同一家便宜型号 + 关思考,见 :func:`memory_model`)。
     memory_recall_node, memory_writeback_node, pre_compaction_flush = _build_memory_nodes(
         spec,
         memory_env=memory_env,
-        llm_caller=_metered(routers.memory, conversation_usage, _memory_model(spec)),
+        llm_caller=_metered(routers.memory, conversation_usage, memory_model(spec)),
         rerank_usage=platform_usage,
     )
     # Stream L.L2 — context compressor preflight + summariser. The
@@ -2640,12 +2640,12 @@ async def build_step_routers(
     )
     # B-168 —— 只有开了长期记忆才有记忆调用;没开的不多建一条路由(也不多解析一次凭据)。
     long_term = spec.spec.memory.long_term if spec.spec.memory is not None else None
-    memory_model = _memory_model(spec)
+    mem_model = memory_model(spec)
     memory = (
         default
-        if long_term is None or memory_model == spec.spec.model
+        if long_term is None or mem_model == spec.spec.model
         else await build_llm_router(
-            memory_model,
+            mem_model,
             secret_store=secret_store,
             around_llm_chain=around_llm_chain,
             image_resolver=image_resolver,
@@ -2662,7 +2662,7 @@ async def build_step_routers(
     if routing is not None:
         for rule in routing.rules:
             if rule.when in ("compression", "memory"):
-                continue  # 已由 _compression_model / _memory_model 取到上面
+                continue  # 已由 _compression_model / memory_model 取到上面
             routed = await build_llm_router(
                 rule.model,
                 secret_store=secret_store,
@@ -2813,7 +2813,7 @@ def _compression_model(spec: AgentSpec) -> ModelSpec:
     )
 
 
-def _memory_model(spec: AgentSpec) -> ModelSpec:
+def memory_model(spec: AgentSpec) -> ModelSpec:
     """B-168 —— 长期记忆五处调用实际用的模型;路由与记账共用这一个取法。
 
     显式的 ``when: memory`` 规则:设了思考相关字段(``thinking_enabled`` / ``effort`` /
