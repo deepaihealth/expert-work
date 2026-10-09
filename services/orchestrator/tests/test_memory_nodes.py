@@ -511,7 +511,7 @@ async def test_writeback_drops_batch_when_llm_extracts_injection() -> None:
         _state("done"),
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
-    assert out == {}
+    assert out == {"written_memory_count": 0, "memory_writeback_failed": True}
     # Nothing persisted.
     stored = await store.retrieve(
         tenant_id=tenant, user_id=user, query_embedding=(0.0,) * _DIM, limit=10
@@ -664,7 +664,7 @@ async def test_memory_writeback_node_extracts_and_persists() -> None:
         _state("done"),
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
-    assert out == {}
+    assert out == {"written_memory_count": 1, "memory_writeback_failed": False}
     stored = await store.retrieve(
         tenant_id=tenant, user_id=user, query_embedding=(0.0,) * _DIM, limit=10
     )
@@ -773,14 +773,29 @@ async def test_memory_writeback_write_filter_drops_low_importance() -> None:
         llm_caller=llm,
         write_min_importance=0.3,
     )
-    await node(  # type: ignore[arg-type]
+    out = await node(  # type: ignore[arg-type]
         _state("done"),
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
+    assert out == {"written_memory_count": 1, "memory_writeback_failed": False}  # 被过滤掉的不算
     stored = await store.retrieve(
         tenant_id=tenant, user_id=user, query_embedding=(0.0,) * _DIM, limit=10
     )
     assert [m.content for m in stored] == ["keep me"]
+
+
+@pytest.mark.asyncio
+async def test_memory_writeback_node_nothing_to_remember_is_not_a_failure() -> None:
+    """B-168 —— 抽取结果为空是正常的 0 条,不能和出错没写成混在一起(轨迹按 failed 标警示)。"""
+    llm = _RecordingLLM(responses=[AIMessage(content='{"memories": []}')])
+    node = make_memory_writeback_node(
+        memory_store=InMemoryMemoryStore(), embedder=FakeEmbedder(dim=_DIM), llm_caller=llm
+    )
+    out = await node(  # type: ignore[arg-type]
+        _state("done"),
+        {"configurable": {"tenant_id": str(uuid4()), "user_id": str(uuid4())}},
+    )
+    assert out == {"written_memory_count": 0, "memory_writeback_failed": False}
 
 
 @pytest.mark.asyncio
@@ -814,7 +829,7 @@ async def test_memory_writeback_node_swallows_llm_failure() -> None:
         _state("done"),
         {"configurable": {"tenant_id": str(uuid4()), "user_id": str(uuid4())}},
     )
-    assert out == {}
+    assert out == {"written_memory_count": 0, "memory_writeback_failed": True}
 
 
 @pytest.mark.asyncio
@@ -848,8 +863,8 @@ async def test_memory_writeback_node_enqueues_dlq_on_embed_failure() -> None:
         _state("done"),
         {"configurable": {"tenant_id": str(uuid4()), "user_id": str(uuid4())}},
     )
-    # Node still returns {} — failure must not block the run.
-    assert out == {}
+    # Node still returns 0 written — failure must not block the run.
+    assert out == {"written_memory_count": 0, "memory_writeback_failed": True}
     # But the extracted pair landed in the DLQ for the retry worker.
     from datetime import UTC
     from datetime import datetime as _dt
@@ -1036,7 +1051,7 @@ async def test_memory_graph_recalls_and_writes_back() -> None:
     )
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(graph)
-        await compiled.ainvoke(
+        final = await compiled.ainvoke(
             {
                 "messages": [SystemMessage(content="help"), HumanMessage(content="ferns?")],
                 "step_count": 0,
@@ -1068,6 +1083,8 @@ async def test_memory_graph_recalls_and_writes_back() -> None:
     # Sprint #8 cache anchor flag rides the per_session memory block.
     assert memory_msg.additional_kwargs.get("expert_work_cache_anchor") is True
 
+    # B-168 —— 条数走真 graph 的状态通道(没声明的键会被 LangGraph 拒掉)。
+    assert final["written_memory_count"] == 1
     # Write-back persisted a new memory for the user.
     stored = await store.retrieve(
         tenant_id=tenant, user_id=user, query_embedding=(0.0,) * _DIM, limit=10

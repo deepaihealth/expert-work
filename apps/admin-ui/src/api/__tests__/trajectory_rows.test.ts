@@ -154,6 +154,24 @@ describe("compactRowsOf", () => {
     expect(rows[5]).toMatchObject({ kind: "error", text: "上游 502", status: "error" });
   });
 
+  it("B-168: backend writeback frame carries only a count — row drawn even at 0, with its duration", () => {
+    const rows = compactRowsOf([
+      upd("memory_writeback", { written_memory_count: 0, _duration_ms: 3100 }),
+      upd("memory_writeback", { written_memory_count: 2, _duration_ms: 900 }),
+    ]);
+    expect(rows.map((r) => r.kind)).toEqual(["memory", "memory"]);
+    expect(rows[0]).toMatchObject({ direction: "writeback", count: 0, durationMs: 3100 });
+    expect(rows[1]).toMatchObject({ direction: "writeback", count: 2, durationMs: 900 });
+    expect(rows[0]).toMatchObject({ status: "ok" });
+  });
+
+  it("B-168: a failed writeback (0 written because of an error) is a warn row, not a quiet 0", () => {
+    const rows = compactRowsOf([
+      upd("memory_writeback", { written_memory_count: 0, memory_writeback_failed: true, _duration_ms: 5000 }),
+    ]);
+    expect(rows[0]).toMatchObject({ kind: "memory", direction: "writeback", count: 0, status: "warn" });
+  });
+
   it("a tool with worker sub-timelines gets one subagent row per worker right after it, carrying the worker frames' indexes", () => {
     const events = workerFixtureEvents();
     const rows = compactRowsOf(events);

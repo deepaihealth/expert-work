@@ -233,6 +233,10 @@ class AgentState(TypedDict):
     plan: NotRequired[Plan | None]
     reflections: NotRequired[Annotated[list[Reflection], add]]
     recalled_memories: NotRequired[list[MemoryItem]]
+    #: B-168 —— 本轮 ``memory_writeback`` 写入的条数(只给控制台轨迹画行 + 耗时用)。
+    written_memory_count: NotRequired[int]
+    #: B-168 —— 本轮写回是否因故障 / 拦截没写成(区别于「没什么可记」的 0 条)。
+    memory_writeback_failed: NotRequired[bool]
     step_count_refund_pending: NotRequired[int]
     #: Stream CM-9 (Mini-ADR CM-J5) — transient escalation signal. Set by
     #: agent_node when the loop-detection middleware flags a repeat

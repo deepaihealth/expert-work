@@ -514,6 +514,30 @@ export const readReflectionEvaluator = (m: unknown): ModelFields | undefined =>
 export const readReflectionEvaluatorOn = (m: unknown): boolean =>
   readReflectionEvaluator(m) !== undefined;
 
+// ---- memory model (B-168 routing — the `when=memory` rule) ----
+// The long-term memory calls (write-back extraction / reconcile / pre-compaction
+// flush / read verify / query rewrite) route to this model. Empty = no rule =
+// the platform default: the main model's same-vendor cheap sibling with
+// thinking off (agent_factory ``_memory_model``).
+// Last rule wins — same as the backend's ``_step_model`` when YAML repeats it.
+export const readMemoryModel = (m: unknown): ModelFields | undefined =>
+  (specOf(m).routing?.rules ?? []).filter((r) => r.when === "memory").at(-1)?.model;
+
+export const readMemoryModelOn = (m: unknown): boolean =>
+  readMemoryModel(m) !== undefined;
+
+/** B-168 —— 记忆模型换了型号时,把选择器按厂商默认种下的「开思考」改成关:记忆调用是短任务,
+ *  开思考会让输出膨胀十倍。只在型号变化时种;用户之后自己打开思考的,原样保留。 */
+export function seedMemoryModelPick(
+  prev: ModelFields | undefined,
+  next: ModelFields,
+): ModelFields {
+  const modelChanged = next.name !== undefined && next.name !== prev?.name;
+  return modelChanged && next.thinking_enabled === true
+    ? { ...next, thinking_enabled: false }
+    : next;
+}
+
 // ---- vision fallback (Stream J.6 Path B — the ``vision:`` block) ----
 // When the main model is NOT vision-capable, a separate VL model handles image
 // understanding via the ``ask_image`` tool. Empty = no vision block = the agent
@@ -791,13 +815,26 @@ export function setReflectionEvaluator(
   m: unknown,
   model: ModelFields | null,
 ): AgentManifest {
+  return setRouteModel(m, "reflection", model);
+}
+export function setMemoryModel(
+  m: unknown,
+  model: ModelFields | null,
+): AgentManifest {
+  return setRouteModel(m, "memory", model);
+}
+function setRouteModel(
+  m: unknown,
+  when: string,
+  model: ModelFields | null,
+): AgentManifest {
   const routing = specOf(m).routing ?? {};
-  // Preserve any other route rules (e.g. a planning rule); only touch reflection.
-  const others = (routing.rules ?? []).filter((r) => r.when !== "reflection");
+  // Preserve any other route rules (e.g. a planning rule); only touch ``when``.
+  const others = (routing.rules ?? []).filter((r) => r.when !== when);
   const keep =
     model !== null &&
     (model.provider !== undefined || model.name !== undefined);
-  const rules = keep ? [...others, { when: "reflection", model }] : others;
+  const rules = keep ? [...others, { when, model }] : others;
   if (rules.length === 0) {
     // Drop ``rules`` entirely; if routing then has no other keys, drop routing
     // so the manifest stays clean (js-yaml omits ``undefined``).

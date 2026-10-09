@@ -198,9 +198,12 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
         const direction: MemoryRow["direction"] = item.kind === "memory_recall" ? "recall" : "writeback";
         const memories = item.detail.memories;
         rows.push({
-          id: `memory:${item.seq}`, kind: "memory", seq: item.seq, step: null, status: "ok",
+          id: `memory:${item.seq}`, kind: "memory", seq: item.seq, step: null,
+          status: item.tone === "warn" ? "warn" : "ok",
           durationMs: item.durationMs, eventIndexes: idx(item), serverMs: item.serverMs ?? null,
-          direction, count: Array.isArray(memories) ? memories.length : 0, detail: item.detail,
+          direction,
+          count: Array.isArray(memories) ? memories.length : typeof item.detail.count === "number" ? item.detail.count : 0,
+          detail: item.detail,
         });
         continue;
       }

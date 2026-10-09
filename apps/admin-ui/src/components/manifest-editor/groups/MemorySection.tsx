@@ -38,11 +38,14 @@
  * while memory is off would silently reactivate memory the instant either
  * field is touched.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Collapse, InputNumber, Select, Switch, Tabs, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
+import type { ModelCatalog } from "../../../api/model_catalog";
 import { FieldRow } from "../FieldRow";
+import { loadModelCatalog } from "../catalog";
+import { ModelSelect } from "../widgets/ModelSelect";
 import { PolicyFieldList, type FieldDef } from "./field_defs";
 import {
   patchConsolidation,
@@ -50,6 +53,7 @@ import {
   readAbstainThreshold,
   readConsolidation,
   readMemoryBudgets,
+  readMemoryModel,
   readMemoryOn,
   readReconcileWrites,
   readRecallMode,
@@ -58,7 +62,9 @@ import {
   readVerifyReads,
   readWriteBack,
   readWriteMinImportance,
+  seedMemoryModelPick,
   setAbstainThreshold,
+  setMemoryModel,
   setMemoryOn,
   setReconcileWrites,
   setRecallMode,
@@ -132,6 +138,23 @@ export function MemorySection({
     onSubTabChange?.(key);
   };
   const memoryOn = readMemoryOn(formData);
+  // B-168 —— 记忆模型选择器要自己的模型目录(同 ModelRoutingSection 的反思模型选择器)。
+  const [catalog, setCatalog] = useState<ModelCatalog | undefined>(undefined);
+  useEffect(() => {
+    let alive = true;
+    loadModelCatalog().then(
+      (c) => {
+        if (alive) setCatalog(c);
+      },
+      () => {
+        /* catalog optional — ModelSelect degrades to a disabled/loading select */
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const memoryModel = readMemoryModel(formData);
   const budgetValues = readMemoryBudgets(formData) as Record<
     string,
     number | undefined
@@ -216,6 +239,26 @@ export function MemorySection({
                         checked={writeBack}
                         aria-label={t("memory_group.write_back_label")}
                         onChange={(on) => onChange(setWriteBack(formData, on))}
+                      />
+                    </FieldRow>
+                    {/* B-168 —— routing.rules[when=memory];不选 = 平台默认(同一家便宜型号 + 关思考)。 */}
+                    <FieldRow
+                      fieldId="memory.model"
+                      label={t("memory_group.model_label")}
+                      brief={t("memory_group.model_brief")}
+                      help={t("memory_group.model_impact")}
+                      isDefault={memoryModel === undefined}
+                      onReset={() => onChange(setMemoryModel(formData, null))}
+                      resetHint={t("memory_group.model_clear")}
+                    >
+                      <ModelSelect
+                        value={memoryModel ?? {}}
+                        catalog={catalog}
+                        onChange={(mdl) =>
+                          onChange(
+                            setMemoryModel(formData, seedMemoryModelPick(memoryModel, mdl)),
+                          )
+                        }
                       />
                     </FieldRow>
                   </>

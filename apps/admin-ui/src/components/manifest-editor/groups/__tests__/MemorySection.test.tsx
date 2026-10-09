@@ -3,8 +3,11 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "../../../../i18n";
 
+import * as catalog from "../../catalog";
 import { MemorySection } from "../MemorySection";
 import type { AgentManifest } from "../../form_model";
+
+vi.spyOn(catalog, "loadModelCatalog").mockResolvedValue({ providers: [] });
 
 // Memory on (a declared, possibly-empty ``long_term`` block) / off (an
 // explicit ``null``) — same two fixtures the old FormView-embedding tests
@@ -103,6 +106,35 @@ describe("MemorySection", () => {
   it("no longer renders the deleted reserved-fields note", () => {
     renderSection();
     expect(screen.queryByTestId("memory-reserved-note")).not.toBeInTheDocument();
+  });
+
+  it("B-168: memory-model row renders only while memory is on", () => {
+    renderSection(OFF_SEED);
+    expect(rowFor("memory.model")).toBeNull();
+    renderSection(ON_SEED);
+    expect(rowFor("memory.model")).not.toBeNull();
+  });
+
+  it("B-168: resetting the memory model drops the when=memory rule but keeps others", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const seed: AgentManifest = {
+      spec: {
+        memory: { long_term: {} },
+        routing: {
+          rules: [
+            { when: "planning", model: { provider: "openai", name: "gpt-4o" } },
+            { when: "memory", model: { provider: "glm", name: "glm-5.3-flash" } },
+          ],
+        },
+      },
+    };
+    renderSection(seed, onChange);
+    await user.click(screen.getByTestId("field-reset-memory.model"));
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(last.spec?.routing?.rules).toEqual([
+      { when: "planning", model: { provider: "openai", name: "gpt-4o" } },
+    ]);
   });
 
   it("editing top_k to 8 writes spec.memory.long_term.retrieve_top_k", async () => {

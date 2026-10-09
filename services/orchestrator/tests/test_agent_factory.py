@@ -33,7 +33,12 @@ from orchestrator import (
     build_llm_router,
     build_step_routers,
 )
-from orchestrator.agent_factory import _build_provider, _chat_stream_deadline_s, _compression_model
+from orchestrator.agent_factory import (
+    _build_provider,
+    _chat_stream_deadline_s,
+    _compression_model,
+    _memory_model,
+)
 from orchestrator.context import ToolResultPruner
 from orchestrator.llm import FakeEmbedder, RateLimitedProvider
 from orchestrator.llm.providers.openai_compatible import OpenAICompatibleProvider
@@ -1112,6 +1117,119 @@ async def test_build_agent_wires_the_compressor_to_the_compression_router(monkey
         "glm:glm-5.3-flash",
         "glm:glm-5.3",
     ]
+
+
+def test_memory_model_defaults_to_cheap_sibling_with_thinking_off() -> None:
+    """B-168 —— 没写 ``when: memory`` 规则时,记忆调用换同一家的便宜型号并关思考;主模型挂在
+    备用链上,也关思考(备用时同样不该长思考)。glm-5.3 关不掉思考,由下发层落到最低档。"""
+    spec = _spec(provider="glm", name="glm-5.3", api_key_ref=f"secret://{_GLM_KEY_NAME}")
+    model = _memory_model(spec)
+    assert model.name == "glm-5.3-flash"
+    assert model.thinking_enabled is False
+    assert [(m.name, m.thinking_enabled) for m in model.fallback] == [("glm-5.3", False)]
+
+
+def test_memory_model_without_cheap_sibling_keeps_main_but_turns_thinking_off() -> None:
+    """B-168 —— 映射表里没有便宜型号时仍用主模型,但思考照样关(与压缩不同:压缩此时原样用主模型)。
+    10-09 测试环境实证:deepseek-v4-flash 开思考,记忆两次调用输出 248 至 4,738 token,
+    挡结束帧最多 36 秒。"""
+    spec = _spec(provider="deepseek", name="deepseek-v4-flash", thinking_enabled=True)
+    model = _memory_model(spec)
+    assert model.name == "deepseek-v4-flash"
+    assert model.thinking_enabled is False
+    assert model.fallback == []
+
+
+def test_memory_model_rule_with_thinking_settings_wins_verbatim() -> None:
+    """B-168 —— 显式的 ``when: memory`` 规则设了思考档位就原样使用,不换型号也不动思考。"""
+    doc = deepcopy(_MINIMAL_SPEC)
+    rule_model = {
+        "provider": "glm",
+        "name": "glm-5.3",
+        "api_key_ref": f"secret://{_GLM_KEY_NAME}",
+        "effort": "high",
+    }
+    doc["spec"]["routing"] = {"rules": [{"when": "memory", "model": rule_model}]}
+    model = _memory_model(AgentSpec.model_validate(doc))
+    assert model.name == "glm-5.3"
+    assert model.effort == "high"
+    assert model.thinking_enabled is None
+
+
+def test_memory_model_rule_without_thinking_settings_turns_thinking_off() -> None:
+    """B-168 —— 规则只写了型号(控制台的模型选择器只填厂商和型号)时,也照默认关思考;
+    否则选了模型反而按厂商默认开着思考。"""
+    doc = deepcopy(_MINIMAL_SPEC)
+    rule_model = {"provider": "deepseek", "name": "deepseek-v4-pro"}
+    doc["spec"]["routing"] = {"rules": [{"when": "memory", "model": rule_model}]}
+    model = _memory_model(AgentSpec.model_validate(doc))
+    assert model.name == "deepseek-v4-pro"
+    assert model.thinking_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_build_step_routers_memory_defaults_to_cheap_sibling() -> None:
+    """B-168 —— ``memory`` 路由按 :func:`_memory_model` 建:便宜型号在前、主模型在备用链上。"""
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["model"] = {
+        "provider": "glm",
+        "name": "glm-5.3",
+        "api_key_ref": f"secret://{_GLM_KEY_NAME}",
+    }
+    doc["spec"]["memory"] = {"long_term": {}}
+    routers = await build_step_routers(
+        AgentSpec.model_validate(doc), secret_store=_glm_secret_store()
+    )
+    assert [p.key for p in routers.memory.providers] == ["glm:glm-5.3-flash", "glm:glm-5.3"]
+    assert routers.default.providers[0].key == "glm:glm-5.3"
+
+
+@pytest.mark.asyncio
+async def test_build_step_routers_memory_without_sibling_is_its_own_router() -> None:
+    """B-168 —— 同型号但关了思考,也要单独建路由,不能复用主循环那条(那条带着思考)。"""
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["memory"] = {"long_term": {}}
+    routers = await build_step_routers(AgentSpec.model_validate(doc), secret_store=_secret_store())
+    assert routers.memory is not routers.default
+    assert routers.memory.providers[0].key == "anthropic:claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_build_step_routers_memory_reuses_default_without_long_term_memory() -> None:
+    """B-168 —— 没开长期记忆就没有记忆调用,不多建路由。"""
+    routers = await build_step_routers(_spec(), secret_store=_secret_store())
+    assert routers.memory is routers.default
+
+
+@pytest.mark.asyncio
+async def test_build_agent_wires_memory_nodes_to_the_memory_router(monkeypatch: Any) -> None:
+    """B-168 —— 记忆的召回 / 写回 / 压缩前抢存拿到的是 ``memory`` 路由,记账也记在记忆模型名下。"""
+    captured: dict[str, Any] = {}
+    from orchestrator.agent_factory import _build_memory_nodes as real
+
+    def _spy(spec: AgentSpec, **kwargs: Any) -> Any:
+        captured["llm_caller"] = kwargs["llm_caller"]
+        return real(spec, **kwargs)
+
+    monkeypatch.setattr("orchestrator.agent_factory._build_memory_nodes", _spy)
+    monkeypatch.setitem(_PROVIDER_KEY_NAMES, "glm", _GLM_KEY_NAME)
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["model"] = {
+        "provider": "glm",
+        "name": "glm-5.3",
+        "api_key_ref": f"secret://{_GLM_KEY_NAME}",
+    }
+    doc["spec"]["memory"] = {"long_term": {}}
+    async with make_checkpointer("memory") as cp:
+        await _build(
+            AgentSpec.model_validate(doc),
+            secret_store=_glm_secret_store(),
+            checkpointer=cp,
+            memory_env=_memory_env(),
+        )
+    caller = captured["llm_caller"]
+    assert [p.key for p in caller.inner.providers] == ["glm:glm-5.3-flash", "glm:glm-5.3"]
+    assert caller.meter.default == ("glm", "glm-5.3-flash")
 
 
 @pytest.mark.asyncio

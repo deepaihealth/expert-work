@@ -27,7 +27,7 @@ import logging
 import math
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, NamedTuple, cast
 from uuid import UUID, uuid4
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -896,6 +896,17 @@ async def _apply_delete(
         return False
 
 
+class FlushOutcome(NamedTuple):
+    """B-168 —— 一次记忆写回的结果:写了几条 + 是否因故障 / 拦截而没写成。
+
+    ``failed`` 把「出错了没写成」与「这轮没什么可记」分开(两者 ``written`` 都是 0),
+    控制台轨迹据此把前者标成警示。
+    """
+
+    written: int
+    failed: bool
+
+
 async def flush_messages_to_memory(
     messages: Sequence[BaseMessage],
     *,
@@ -913,13 +924,51 @@ async def flush_messages_to_memory(
     agent_name: str | None = None,
     write_min_importance: float = 0.0,
 ) -> int:
+    """:func:`flush_messages_with_outcome` 只取写入条数 —— 压缩前抢存与评测脚本用。"""
+    outcome = await flush_messages_with_outcome(
+        messages,
+        memory_store=memory_store,
+        embedder=embedder,
+        llm_caller=llm_caller,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        token=token,
+        dlq=dlq,
+        log_label=log_label,
+        reconcile=reconcile,
+        agent_name=agent_name,
+        write_min_importance=write_min_importance,
+    )
+    return outcome.written
+
+
+async def flush_messages_with_outcome(
+    messages: Sequence[BaseMessage],
+    *,
+    memory_store: MemoryStore,
+    embedder: Embedder,
+    llm_caller: LLMCaller,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID | None,
+    run_id: str | None = None,
+    token: CancellationToken,
+    dlq: MemoryWritebackDLQ | None = None,
+    log_label: str = "memory.writeback",
+    reconcile: bool = False,
+    agent_name: str | None = None,
+    write_min_importance: float = 0.0,
+) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
 
     The shared extraction core behind both the run-end ``memory_writeback``
     node and the Stream CM-3 pre-compaction flush. Makes one LLM extraction
     call, embeds the produced pairs, and writes :class:`MemoryItem`\\s tagged
-    with ``source_thread_id``. Returns the number of memories written
-    (``0`` on empty extraction / blocked content / any handled failure).
+    with ``source_thread_id``. Returns how many memories were written
+    (``0`` on empty extraction / blocked content / any handled failure) and
+    whether a blocked write or handled failure is why (B-168 ``failed``).
 
     Best-effort, mirroring the original write-back contract:
 
@@ -968,7 +1017,7 @@ async def flush_messages_to_memory(
                 )
             extracted = kept
         if not extracted:
-            return 0
+            return FlushOutcome(written=0, failed=False)
         vectors = await token.run_cancellable(
             embedder.embed([m.content for m in extracted], tenant_id=tenant_id)
         )
@@ -1018,7 +1067,7 @@ async def flush_messages_to_memory(
             log_label,
             len(exc.blocked),
         )
-        return 0
+        return FlushOutcome(written=0, failed=True)
     except Exception as exc:
         # Stream K.K7 — don't lose the work the LLM already did. If the
         # extraction produced pairs, hand them to the DLQ for a retry
@@ -1046,9 +1095,9 @@ async def flush_messages_to_memory(
                 logger.error("%s_dlq_enqueue_failed — pairs lost", log_label, exc_info=True)
         else:
             logger.warning("%s_failed — run unaffected", log_label, exc_info=True)
-        return 0
+        return FlushOutcome(written=0, failed=True)
     logger.info("%s count=%d", log_label, len(items))
-    return len(items)
+    return FlushOutcome(written=len(items), failed=False)
 
 
 #: Stream CM-3 — a config-bound pre-compaction flush callback. Awaited by
@@ -1146,7 +1195,7 @@ def make_memory_writeback_node(
         thread_id = configurable_uuid(config, "thread_id")
         run_id = current_run_id(config)
 
-        await flush_messages_to_memory(
+        outcome = await flush_messages_with_outcome(
             list(state["messages"]),
             memory_store=memory_store,
             embedder=embedder,
@@ -1162,6 +1211,13 @@ def make_memory_writeback_node(
             agent_name=agent_name,
             write_min_importance=write_min_importance,
         )
-        return {}
+        # B-168 —— 只回条数(不带记忆正文):空 dict 在 updates 流里是空帧,拿不到耗时,
+        # 控制台轨迹画不出「记忆写回」这一行;写 0 条也要回,才看得到它花了多久。
+        # 出错 / 被拦截没写成的另带一个标记,别和「这轮没什么可记」混在一起;两个键每轮都回,
+        # 检查点里不留上一轮的旧值。
+        return {
+            "written_memory_count": outcome.written,
+            "memory_writeback_failed": outcome.failed,
+        }
 
     return memory_writeback_node
