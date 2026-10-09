@@ -263,3 +263,40 @@ async def test_memory_turned_off_is_done_without_calling_the_model() -> None:
 
     assert outcome.written_count == 0 and outcome.note is not None
     assert h.caller.prompts == []
+
+
+class _StubResolver:
+    def __init__(self) -> None:
+        self.asked: list[tuple[UUID, str]] = []
+
+    async def resolve_provider(self, *, tenant_id: UUID, provider: str) -> str:
+        self.asked.append((tenant_id, provider))
+        return "secret://glm-key"
+
+
+@pytest.mark.asyncio
+async def test_router_caller_factory_builds_the_memory_chain_from_platform_credentials() -> None:
+    from control_plane.memory.writeback_processor import make_router_caller_factory
+    from expert_work.runtime.secret_store import LocalDevSecretStore
+    from orchestrator import LLMRouter
+
+    resolver = _StubResolver()
+    factory = make_router_caller_factory(
+        secret_store=LocalDevSecretStore.from_mapping({"glm-key": "sk-test"}),
+        credentials_resolver=resolver,  # type: ignore[arg-type]
+        middleware_env=None,
+        http_client=None,
+        rate_limiter_factory=None,
+    )
+    spec = _spec()
+    tenant = uuid4()
+
+    router = await factory(spec, memory_model(spec), tenant)
+
+    assert isinstance(router, LLMRouter)
+    # cheap sibling first, the main model as its fallback — same chain as in-run.
+    assert [h.group for h in router.providers] == ["glm:glm-5.3-flash", "glm:glm-5.3"]
+    assert {t for t, _ in resolver.asked} == {tenant}
+    # The served-by stamp wraps the chain, so usage lands on the model that answered.
+    assert router.around_llm_chain is not None
+    assert router.around_llm_chain.ordered_names == ("served_by",)
