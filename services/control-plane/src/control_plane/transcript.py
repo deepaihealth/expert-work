@@ -125,6 +125,8 @@ def extract_turns(
 async def read_messages(
     checkpointer: BaseCheckpointSaver[Any],
     thread_id: UUID,
+    *,
+    checkpoint_id: str | None = None,
 ) -> list[Any]:
     """读出一段会话检查点里 ``messages`` 通道的原始消息,没有检查点就是空列表。
 
@@ -132,10 +134,16 @@ async def read_messages(
     这份原始消息 —— 前者只取文本轮次,后者还要工具调用与结果。检查点的内部
     布局(``channel_values.messages``)因此只写在这一个地方。
 
+    ``checkpoint_id``(B-168)读那一个检查点而不是会话最新的 —— 后台记忆写回要的是
+    「本轮结束时」的对话,下一轮可能已经跑起来了。
+
     与 :func:`read_turns` 一样,checkpointer 出错时直接抛,由调用方选择怎么
     降级。
     """
-    config: RunnableConfig = {"configurable": {"thread_id": str(thread_id), "checkpoint_ns": ""}}
+    configurable: dict[str, Any] = {"thread_id": str(thread_id), "checkpoint_ns": ""}
+    if checkpoint_id is not None:
+        configurable["checkpoint_id"] = checkpoint_id
+    config: RunnableConfig = {"configurable": configurable}
     tup = await checkpointer.aget_tuple(config)
     if tup is None:
         return []
