@@ -1122,6 +1122,41 @@ async def test_purge_cascades_runs_events_and_approvals(
 
 
 @pytest.mark.asyncio
+async def test_purge_deletes_the_threads_memory_writeback_jobs(
+    session_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """B-168 —— 删会话把它没写完的记忆后台写回任务一起删掉(别的会话的不动)。"""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    jobs = app.state.memory_writeback_job_store
+
+    async def seed(thread_id: UUID) -> UUID:
+        job_id: UUID = await jobs.enqueue(
+            tenant_id=_DEFAULT_TENANT,
+            user_id=uuid4(),
+            agent_name="a",
+            agent_version="1",
+            thread_id=thread_id,
+            run_id=uuid4(),
+            trace_id=None,
+            now=datetime.now(UTC),
+        )
+        return job_id
+
+    mine = await seed(UUID(tid))
+    other = await seed(uuid4())
+
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["memory_writeback_jobs"] == 1
+
+    assert not await jobs.exists(job_id=mine)
+    assert await jobs.exists(job_id=other)
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    assert _purge_audit_details(page, tid)["memory_writeback_jobs"] == 1
+
+
+@pytest.mark.asyncio
 async def test_purge_run_delete_failure_is_audit_visible(
     session_client: AsyncClient,
     audit_store: InMemoryAuditLogStore,

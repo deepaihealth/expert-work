@@ -60,6 +60,7 @@ from expert_work.persistence import WORKSPACE_AGENTS_DIR
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.artifact import ArtifactStore
+from expert_work.persistence.memory import MemoryWritebackJobStore
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
@@ -152,6 +153,11 @@ def _get_agent_repo(request: Request) -> AgentSpecStore:
 
 def _get_approval_store(request: Request) -> ApprovalStore:
     return request.app.state.approval_store  # type: ignore[no-any-return]
+
+
+def _get_memory_writeback_jobs(request: Request) -> MemoryWritebackJobStore | None:
+    # B-168 —— 记忆后台写回任务表;create_app 总会挂上,测试里自建的 app 可能没有。
+    return getattr(request.app.state, "memory_writeback_job_store", None)
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -1010,6 +1016,9 @@ def build_sessions_router() -> APIRouter:
         approvals: Annotated[ApprovalStore, Depends(_get_approval_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
+        writeback_jobs: Annotated[
+            MemoryWritebackJobStore | None, Depends(_get_memory_writeback_jobs)
+        ],
     ) -> JSONResponse:
         """Hard-delete — irreversibly purge the whole conversation.
 
@@ -1031,7 +1040,19 @@ def build_sessions_router() -> APIRouter:
             "runs": 0,
             "approvals": 0,
             "threads_dir": False,
+            "memory_writeback_jobs": 0,
         }
+
+        # B-168 —— 先删这个会话没写完的记忆后台写回任务:worker 写记忆前会查任务行,
+        # 行没了就放弃,不会在删会话之后再从它的对话里抽记忆。
+        if writeback_jobs is not None:
+            try:
+                deleted["memory_writeback_jobs"] = await writeback_jobs.delete_for_thread(
+                    tenant_id=tenant_id, thread_id=thread_id
+                )
+            except Exception:
+                logger.warning("session_purge.memory_writeback_jobs_failed", exc_info=True)
+                deleted["memory_writeback_jobs_delete_failed"] = True
 
         checkpointer = runtime.durable_checkpointer
         adelete = getattr(checkpointer, "adelete_thread", None)
