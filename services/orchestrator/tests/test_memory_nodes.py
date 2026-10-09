@@ -30,6 +30,7 @@ from orchestrator import (
     make_memory_recall_node,
     make_memory_writeback_node,
 )
+from orchestrator.graph_builder import memory as memory_module
 from orchestrator.graph_builder.memory import (
     _reconcile_and_apply,
     _verify_memories,
@@ -772,8 +773,64 @@ async def test_background_enqueue_failure_falls_back_to_inline() -> None:
         _state("done"), _run_config(tenant, user, run_id=uuid4())
     )
 
-    assert out == {"written_memory_count": 1, "memory_writeback_failed": False}
+    # 配了后台却退回了 inline:``queued`` 明说 False,检查点里不留上一轮的 True。
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
     assert len(await store.list_for_user(tenant_id=tenant, user_id=user)) == 1
+
+
+class _HangingJobStore(InMemoryMemoryWritebackJobStore):
+    """连接池耗尽的样子:插入一直等不到连接。"""
+
+    async def enqueue(self, **kwargs: Any) -> UUID:
+        del kwargs
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_enqueue_is_capped_and_falls_back_to_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """落任务等不到数据库时不能把 ``end`` 拖住:到时限就照旧在本轮里写。"""
+    monkeypatch.setattr(memory_module, "_ENQUEUE_TIMEOUT_S", 0.05, raising=False)
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+
+    out = await asyncio.wait_for(
+        _background_node(store, llm, _HangingJobStore())(
+            _state("done"), _run_config(tenant, user, run_id=uuid4())
+        ),
+        timeout=5,
+    )
+
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_running_the_writeback_node_twice_for_one_turn_queues_one_job() -> None:
+    """孤儿复活会把写回节点再跑一遍:同一个指针只落一行,也不再在本轮里写。"""
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[])
+    config = _run_config(tenant, user, run_id=run)
+    node = _background_node(store, llm, jobs)
+
+    first = await node(_state("done"), config)
+    second = await node(_state("done"), config)
+
+    assert first["memory_writeback_queued"] is True
+    assert second["memory_writeback_queued"] is True
+    assert await jobs.count_backlog() == 1
+    assert llm.calls == []
 
 
 @pytest.mark.asyncio
@@ -786,7 +843,11 @@ async def test_background_without_a_run_id_falls_back_to_inline() -> None:
         _state("done"), _run_config(tenant, user, run_id=None)
     )
 
-    assert out == {"written_memory_count": 1, "memory_writeback_failed": False}
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
     assert await jobs.count_backlog() == 0
 
 

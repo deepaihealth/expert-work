@@ -1209,6 +1209,10 @@ def make_pre_compaction_flush(
 #: (委派的子代也是一张新的顶层图、自己的 thread),所以只取 ``""``。
 _CHECKPOINT_MAP_KEY = "checkpoint_map"
 
+#: B-168 —— 落任务的时限。连接池耗尽时插入会一直等连接,不设限就把 ``end`` 拖住;
+#: 到时限退回 inline,本轮照旧写(比 inline 写回本身还快得多)。
+_ENQUEUE_TIMEOUT_S = 3.0
+
 
 def _turn_end_checkpoint_id(config: RunnableConfig) -> str | None:
     checkpoint_map = (config.get("configurable") or {}).get(_CHECKPOINT_MAP_KEY)
@@ -1256,21 +1260,26 @@ async def _enqueue_writeback_job(
         return False
     try:
         with _job_tenant_scope(tenant_id, user_id):
-            await jobs.enqueue(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_name=agent_name,
-                agent_version=agent_version,
-                thread_id=thread_id,
-                run_id=run_id,
-                trace_id=current_trace_id_hex(),
-                checkpoint_id=_turn_end_checkpoint_id(config),
-                # 两样都存:处理器优先按检查点 id 读;没有 id 时读会话最新、截前 N 条。
-                message_count=len(state["messages"]),
-                now=datetime.now(UTC),
+            await asyncio.wait_for(
+                jobs.enqueue(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    agent_name=agent_name,
+                    agent_version=agent_version,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    trace_id=current_trace_id_hex(),
+                    checkpoint_id=_turn_end_checkpoint_id(config),
+                    # 两样都存:处理器优先按检查点 id 读;没有 id 时读会话最新、截前 N 条。
+                    message_count=len(state["messages"]),
+                    now=datetime.now(UTC),
+                ),
+                timeout=_ENQUEUE_TIMEOUT_S,
             )
     except Exception:
-        # 丢记忆比 ``end`` 帧慢几秒更糟:落不了任务就照旧在本轮里写。
+        # 丢记忆比 ``end`` 帧慢几秒更糟:落不了任务(含超时)就照旧在本轮里写。
+        # 超时那次插入若其实已经提交,后台也会写一遍 —— 窗口只在提交与超时恰好错开的
+        # 那一刻;同一指针的重复落任务由唯一索引挡住(0163)。
         logger.warning("memory.writeback.enqueue_failed_inline_fallback", exc_info=True)
         return False
     return True
@@ -1360,9 +1369,14 @@ def make_memory_writeback_node(
         # 控制台轨迹画不出「记忆写回」这一行;写 0 条也要回,才看得到它花了多久。
         # 出错 / 被拦截没写成的另带一个标记,别和「这轮没什么可记」混在一起;两个键每轮都回,
         # 检查点里不留上一轮的旧值。
-        return {
+        result: dict[str, Any] = {
             "written_memory_count": outcome.written,
             "memory_writeback_failed": outcome.failed,
         }
+        if writeback_jobs is not None:
+            # 配了后台却退回了 inline:明说没排队,检查点里不留上一轮的 ``True``。
+            # 纯 inline(没配任务表)不带这个键,与之前逐字一致。
+            result["memory_writeback_queued"] = False
+        return result
 
     return memory_writeback_node

@@ -379,6 +379,35 @@ async def a_job_needs_a_pointer_to_the_turn(store: MemoryWritebackJobStore) -> N
     assert await store.count_backlog() == 2
 
 
+async def a_repeated_enqueue_for_the_same_turn_is_a_no_op(store: MemoryWritebackJobStore) -> None:
+    """同一 run 的同一指针只落一行(唯一键 ``(run_id, checkpoint_id)``,空值也算相同):
+    写回节点等超时后那条插入其实已经提交、孤儿复活把写回节点再跑一遍,都不多出任务。
+    重复的那次返回已有那一行的 id。"""
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+    first = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0, run_id=run)
+    again = await _enqueue(
+        store, tenant_id=tenant, user_id=user, at=_T0 + timedelta(seconds=1), run_id=run
+    )
+    assert again == first
+    assert await store.count_backlog() == 1
+
+    base = {
+        "tenant_id": tenant,
+        "user_id": user,
+        "agent_name": "agent-a",
+        "agent_version": "1.0.0",
+        "thread_id": uuid4(),
+        "run_id": run,
+        "trace_id": None,
+        "now": _T0,
+    }
+    other_checkpoint = await store.enqueue(**base, checkpoint_id="ckpt-2")  # type: ignore[arg-type]
+    assert other_checkpoint != first
+    no_id = await store.enqueue(**base, message_count=4)  # type: ignore[arg-type]
+    assert await store.enqueue(**base, message_count=4) == no_id  # type: ignore[arg-type]
+    assert await store.count_backlog() == 3
+
+
 async def still_held_is_the_fencing_check(store: MemoryWritebackJobStore) -> None:
     """``still_held`` = 行还在、在跑、而且还是这一次领取(``attempts``)。"""
     tenant, user = uuid4(), uuid4()
@@ -414,6 +443,7 @@ async def still_held_is_the_fencing_check(store: MemoryWritebackJobStore) -> Non
 
 
 _SCENARIOS: tuple[Callable[[MemoryWritebackJobStore], Awaitable[None]], ...] = (
+    a_repeated_enqueue_for_the_same_turn_is_a_no_op,
     enqueue_then_claim_round_trips_the_pointer,
     one_user_runs_one_job_at_a_time,
     a_running_job_blocks_even_an_earlier_one,

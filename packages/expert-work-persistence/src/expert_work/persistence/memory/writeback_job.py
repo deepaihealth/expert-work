@@ -49,6 +49,7 @@ from typing import Any, Final
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, case, delete, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -145,6 +146,12 @@ class MemoryWritebackJobStore(abc.ABC):
         now: datetime,
     ) -> UUID:
         """Insert one ``pending`` job (``created_at = now``); return its id.
+
+        Idempotent per turn pointer: a job with the same ``(run_id, checkpoint_id)``
+        (NULL ``checkpoint_id`` counts as equal — migration 0163's unique index) is
+        not inserted again; its existing id comes back. The write-back node may
+        repeat an enqueue whose commit outlived its timeout, and orphan revival
+        replays the node.
 
         :raises ValueError: neither ``checkpoint_id`` nor ``message_count`` given.
         """
@@ -247,6 +254,9 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
         now: datetime,
     ) -> UUID:
         _require_pointer(checkpoint_id, message_count)
+        for existing in self._rows.values():
+            if (existing.run_id, existing.checkpoint_id) == (run_id, checkpoint_id):
+                return existing.id
         job = MemoryWritebackJob(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -515,25 +525,41 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
         now: datetime,
     ) -> UUID:
         _require_pointer(checkpoint_id, message_count)
-        row = MemoryWritebackJobRow(
-            id=uuid4(),
-            tenant_id=tenant_id,
-            user_id=user_id,
-            agent_name=agent_name,
-            agent_version=agent_version,
-            thread_id=thread_id,
-            checkpoint_id=checkpoint_id,
-            message_count=message_count,
-            run_id=run_id,
-            trace_id=trace_id,
-            status=PENDING,
-            attempts=0,
-            created_at=now,
+        insert_stmt = (
+            pg_insert(_Job)
+            .values(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_name=agent_name,
+                agent_version=agent_version,
+                thread_id=thread_id,
+                checkpoint_id=checkpoint_id,
+                message_count=message_count,
+                run_id=run_id,
+                trace_id=trace_id,
+                status=PENDING,
+                attempts=0,
+                created_at=now,
+            )
+            # 唯一索引 ``(run_id, checkpoint_id) NULLS NOT DISTINCT``(0163):同一个
+            # 指针已经有一行就不再插,回那一行的 id。
+            .on_conflict_do_nothing()
+            .returning(_Job.id)
         )
         async with self._sf() as session:
-            session.add(row)
+            job_id = (await session.execute(insert_stmt)).scalar_one_or_none()
+            if job_id is None:
+                job_id = (
+                    await session.execute(
+                        select(_Job.id).where(
+                            _Job.run_id == run_id,
+                            _Job.checkpoint_id.is_not_distinct_from(checkpoint_id),
+                        )
+                    )
+                ).scalar_one()
             await session.commit()
-        return row.id
+        return job_id
 
     async def claim_next(
         self, *, now: datetime, lease_s: float, max_attempts: int
