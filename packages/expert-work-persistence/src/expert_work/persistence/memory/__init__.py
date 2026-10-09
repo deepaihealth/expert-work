@@ -28,15 +28,31 @@ from expert_work.persistence.memory.memory import (
     InMemoryMemoryStore as InMemoryMemoryStore,
 )
 from expert_work.persistence.memory.sql import SqlMemoryStore as SqlMemoryStore
+from expert_work.persistence.memory.writeback_job import (
+    InMemoryMemoryWritebackJobStore as InMemoryMemoryWritebackJobStore,
+)
+from expert_work.persistence.memory.writeback_job import (
+    MemoryWritebackJob as MemoryWritebackJob,
+)
+from expert_work.persistence.memory.writeback_job import (
+    MemoryWritebackJobStore as MemoryWritebackJobStore,
+)
+from expert_work.persistence.memory.writeback_job import (
+    SqlMemoryWritebackJobStore as SqlMemoryWritebackJobStore,
+)
 
 __all__ = [
     "DLQRow",
     "InMemoryMemoryStore",
     "InMemoryMemoryWritebackDLQ",
+    "InMemoryMemoryWritebackJobStore",
     "MemoryStore",
     "MemoryWritebackDLQ",
+    "MemoryWritebackJob",
+    "MemoryWritebackJobStore",
     "SqlMemoryStore",
     "SqlMemoryWritebackDLQ",
+    "SqlMemoryWritebackJobStore",
     "hash_content",
     "normalise_content",
 ]
