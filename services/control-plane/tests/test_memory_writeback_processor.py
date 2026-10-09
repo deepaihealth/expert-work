@@ -398,7 +398,7 @@ async def test_router_caller_factory_uses_the_runs_stream_timeouts() -> None:
 
 @pytest.fixture
 def _fast_checkpoint_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(writeback_processor, "_CHECKPOINT_READ_DELAY_S", 0.0, raising=False)
+    monkeypatch.setattr(writeback_processor, "_CHECKPOINT_READ_DELAYS_S", (0.0,) * 4, raising=False)
 
 
 @pytest.mark.asyncio
@@ -425,8 +425,16 @@ async def test_a_checkpoint_that_never_shows_up_raises_instead_of_finishing_done
     with pytest.raises(LookupError, match="checkpoint"):
         await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
 
-    assert saver.reads == 3
+    assert saver.reads == 5
     assert h.caller.prompts == []
+
+
+def test_the_checkpoint_retry_backs_off_for_a_few_seconds() -> None:
+    """一次真失败要等租约过期才重领(而且烧掉一次尝试):进程内多等一会儿,通常就等到了。"""
+    delays = writeback_processor._CHECKPOINT_READ_DELAYS_S
+    assert len(delays) == 4  # 5 reads
+    assert list(delays) == sorted(delays) and delays[0] < delays[-1]  # backs off
+    assert 2.0 <= sum(delays) <= 4.0
 
 
 @pytest.mark.asyncio

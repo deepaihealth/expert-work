@@ -69,9 +69,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("expert_work.control_plane.memory.writeback_processor")
 
-#: 读不到任务指着的检查点时最多读几次、每次间隔多久(见 ``_read_turn_end``)。
-_CHECKPOINT_READ_ATTEMPTS = 3
-_CHECKPOINT_READ_DELAY_S = 0.2
+#: 读不到任务指着的检查点时,再读之前依次等多久(见 ``_read_turn_end``):共 5 次、
+#: 约 2.5 秒、逐次拉长。抛错就烧掉一次真尝试、要等租约过期才重领,所以进程内多等一会儿。
+_CHECKPOINT_READ_DELAYS_S: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
 
 #: ``(effective spec, memory model, tenant) → LLM caller`` —— 生产版建一条与 run 内同口径
 #: 的路由(:func:`make_router_caller_factory`),测试注入假 caller。
@@ -238,8 +238,8 @@ class MemoryWritebackProcessor:
         """本轮结束时的对话。
 
         有 ``checkpoint_id``:LangGraph 异步保存检查点,写回节点落任务时那个检查点可能还在
-        保存的路上,worker 又可能立刻被唤醒 —— 读不到(或读到空的)就隔
-        ``_CHECKPOINT_READ_DELAY_S`` 再读,共 ``_CHECKPOINT_READ_ATTEMPTS`` 次。仍然没有这个
+        保存的路上,worker 又可能立刻被唤醒 —— 读不到(或读到空的)就按
+        ``_CHECKPOINT_READ_DELAYS_S`` 逐次等一会儿再读。仍然没有这个
         检查点就抛 :class:`LookupError`,worker 记一次失败、任务退回 ``pending``;检查点在
         但确实没有消息,才回空(收成「没什么可记」)。没有 id 时读会话最新、截前
         ``message_count`` 条(B-126 跨轮清理可能改写早期消息,见模块说明)。
@@ -248,9 +248,9 @@ class MemoryWritebackProcessor:
             latest = await read_messages(self._checkpointer, job.thread_id)
             return latest[: job.message_count]
         found: list[Any] | None = None
-        for attempt in range(_CHECKPOINT_READ_ATTEMPTS):
-            if attempt:
-                await asyncio.sleep(_CHECKPOINT_READ_DELAY_S)
+        for delay in (0.0, *_CHECKPOINT_READ_DELAYS_S):
+            if delay:
+                await asyncio.sleep(delay)
             found = await read_checkpoint_messages(
                 self._checkpointer, job.thread_id, checkpoint_id=job.checkpoint_id
             )
