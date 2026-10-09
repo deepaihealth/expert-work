@@ -29,7 +29,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import secrets
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -67,7 +66,6 @@ if TYPE_CHECKING:
     from orchestrator.llm import RateLimiterFactory
     from orchestrator.tools.registry import ToolSpec
 
-logger = logging.getLogger("expert_work.control_plane.memory.writeback_processor")
 
 #: 读不到任务指着的检查点时,再读之前依次等多久(见 ``_read_turn_end``):共 5 次、
 #: 约 2.5 秒、逐次拉长。抛错就烧掉一次真尝试、要等租约过期才重领,所以进程内多等一会儿。

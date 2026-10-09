@@ -205,6 +205,7 @@ class MemoryWritebackWorker:
         try:
             await asyncio.wait_for(self._task, timeout=self._stop_timeout_s)
         except (TimeoutError, asyncio.CancelledError):
+            # 领取循环到点没退或被取消都照常往下走:下面会取消在飞任务,租约过期后由别的副本接手。
             pass
         finally:
             self._task = None
