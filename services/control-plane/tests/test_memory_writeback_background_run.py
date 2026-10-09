@@ -30,7 +30,7 @@ from expert_work.persistence.memory import (
     InMemoryMemoryWritebackJobStore,
     MemoryWritebackJob,
 )
-from expert_work.protocol import AgentSpec, ModelSpec
+from expert_work.protocol import AgentSpec, ModelSpec, Plan, PlanStep
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.runs import (
     InMemoryRunEventStore,
@@ -45,7 +45,9 @@ from orchestrator import (
     ToolRegistry,
     build_react_graph,
     make_memory_writeback_node,
+    make_reflect_node,
 )
+from orchestrator.graph_builder.platform_context import PLATFORM_CONTEXT_OPEN
 from orchestrator.llm import FakeEmbedder
 from orchestrator.sse import _BACKGROUND_PERSIST_WRITERS, run_agent
 from orchestrator.tools.registry import ToolSpec
@@ -91,7 +93,9 @@ class _AgentLLM:
     ) -> AIMessage:
         del tools, on_delta
         last_human = next(m for m in reversed(messages) if isinstance(m, HumanMessage))
-        return AIMessage(content=f"final answer to: {last_human.content}")
+        # The platform context (plan etc.) is appended to the last message per call.
+        said = str(last_human.content).split(PLATFORM_CONTEXT_OPEN, 1)[0].strip()
+        return AIMessage(content=f"final answer to: {said}")
 
 
 class _SlowExtractor:
@@ -137,8 +141,24 @@ async def _await_persist_writers() -> None:
         await asyncio.gather(*pending)
 
 
+class _AcceptingReflector:
+    """复查模型:一律通过,本轮从 ``reflect`` 出口走到写回。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(
+        self, *, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec], **_: Any
+    ) -> AIMessage:
+        del messages, tools
+        self.calls += 1
+        return AIMessage(content='{"verdict": "accept", "critique": "fine"}')
+
+
 class _Harness:
-    def __init__(self, checkpointer: BaseCheckpointSaver[Any]) -> None:
+    def __init__(
+        self, checkpointer: BaseCheckpointSaver[Any], *, reflect: _AcceptingReflector | None = None
+    ) -> None:
         self.tenant, self.user, self.thread = uuid4(), uuid4(), uuid4()
         self.checkpointer = checkpointer
         self.memory = InMemoryMemoryStore()
@@ -168,6 +188,7 @@ class _Harness:
                 llm_caller=_AgentLLM(),
                 tool_registry=ToolRegistry(),
                 memory_writeback_node=node,
+                reflect_node=make_reflect_node(reflect, budget=1) if reflect is not None else None,
             )
         )
 
@@ -179,7 +200,7 @@ class _Harness:
             created_by="t",
         )
 
-    async def run_turn(self, text: str) -> UUID:
+    async def run_turn(self, text: str, *, plan: Plan | None = None) -> UUID:
         """一轮:``run_agent`` 跑完(带时限)就返回 run id。"""
         record = await self.run_manager.create(
             run_id=uuid4(), thread_id=self.thread, tenant_id=self.tenant, user_id=self.user
@@ -194,6 +215,7 @@ class _Harness:
                     "messages": [SystemMessage(content="help"), HumanMessage(content=text)],
                     "step_count": 0,
                     "max_steps": 5,
+                    **({"plan": plan} if plan is not None else {}),
                 },
                 config={
                     "configurable": {
@@ -327,3 +349,49 @@ async def test_job_pointer_reads_the_turn_end_conversation() -> None:
         [item] = await h.memory.list_for_user(tenant_id=h.tenant, user_id=h.user)
         assert item.content == "likes green tea"
         assert item.source_run_id == str(first)
+
+
+def _nodes_in_order(frames: list[tuple[str, Any]]) -> list[str]:
+    return [
+        node
+        for event, data in frames
+        if event == "updates" and isinstance(data, dict)
+        for node in data
+    ]
+
+
+async def _assert_pointer_reads_the_final_answer(h: _Harness, run_id: UUID, text: str) -> None:
+    job = await h.job_for(run_id)
+    assert job.checkpoint_id is not None
+    turn_end = await read_messages(h.checkpointer, h.thread, checkpoint_id=job.checkpoint_id)
+    assert turn_end[-1].content == f"final answer to: {text}"
+    assert job.message_count == len(turn_end)
+
+
+@pytest.mark.asyncio
+async def test_pointer_reads_the_final_answer_after_a_reflect_exit() -> None:
+    """(c') —— 有复查时,写回前最后一步是 ``reflect``,不是 ``agent``。"""
+    async with make_checkpointer("memory") as cp:
+        reflector = _AcceptingReflector()
+        h = _Harness(cp, reflect=reflector)
+        run_id = await h.run_turn("I like green tea")
+
+        nodes = _nodes_in_order(await h.live_frames(run_id))
+        assert nodes[-2:] == ["reflect", "memory_writeback"]
+        assert reflector.calls == 1
+        await _assert_pointer_reads_the_final_answer(h, run_id, "I like green tea")
+
+
+@pytest.mark.asyncio
+async def test_pointer_reads_the_final_answer_after_a_plan_close_exit() -> None:
+    """(c'') —— 计划里还有没完成的步骤时,写回前最后一步是 ``plan_close``。"""
+    async with make_checkpointer("memory") as cp:
+        h = _Harness(cp)
+        plan = Plan(
+            goal="answer", steps=(PlanStep(id="1", description="answer", status="pending"),)
+        )
+        run_id = await h.run_turn("I like green tea", plan=plan)
+
+        nodes = _nodes_in_order(await h.live_frames(run_id))
+        assert nodes[-2:] == ["plan_close", "memory_writeback"]
+        await _assert_pointer_reads_the_final_answer(h, run_id, "I like green tea")
