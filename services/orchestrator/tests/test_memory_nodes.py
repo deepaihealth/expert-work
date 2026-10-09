@@ -14,6 +14,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.persistence import InMemoryMemoryStore
+from expert_work.persistence.memory import InMemoryMemoryWritebackJobStore
+from expert_work.persistence.rls import (
+    bypass_rls_var,
+    current_tenant_id_var,
+    current_user_id_var,
+)
 from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken
 from expert_work.runtime.checkpointer import make_checkpointer
@@ -669,6 +675,119 @@ async def test_memory_writeback_node_extracts_and_persists() -> None:
         tenant_id=tenant, user_id=user, query_embedding=(0.0,) * _DIM, limit=10
     )
     assert [m.content for m in stored] == ["likes tea"]
+
+
+class _BrokenJobStore(InMemoryMemoryWritebackJobStore):
+    async def enqueue(self, **kwargs: Any) -> UUID:
+        del kwargs
+        raise RuntimeError("db down")
+
+
+@dataclass
+class _ScopeSpyJobStore(InMemoryMemoryWritebackJobStore):
+    """记下落任务那一刻的 RLS 上下文(``WITH CHECK`` 按 ``app.tenant_id``)。"""
+
+    seen: list[tuple[UUID | None, UUID | None, bool]] = field(default_factory=list)
+
+    async def enqueue(self, **kwargs: Any) -> UUID:
+        self.seen.append(
+            (current_tenant_id_var.get(), current_user_id_var.get(), bypass_rls_var.get())
+        )
+        return await super().enqueue(**kwargs)
+
+
+def _background_node(
+    store: InMemoryMemoryStore, llm: _RecordingLLM, jobs: InMemoryMemoryWritebackJobStore
+) -> Any:
+    return make_memory_writeback_node(
+        memory_store=store,
+        embedder=FakeEmbedder(dim=_DIM),
+        llm_caller=llm,
+        agent_name="mem-agent",
+        agent_version="1.0.0",
+        writeback_jobs=jobs,
+    )
+
+
+def _run_config(tenant: UUID, user: UUID, *, run_id: UUID | None) -> dict[str, Any]:
+    configurable: dict[str, Any] = {
+        "tenant_id": str(tenant),
+        "user_id": str(user),
+        "thread_id": str(uuid4()),
+        "checkpoint_map": {"": "ckpt-1"},
+    }
+    if run_id is not None:
+        configurable["run_id"] = str(run_id)
+    return {"configurable": configurable}
+
+
+_EXTRACT_TEA = AIMessage(content='{"memories": [{"kind": "fact", "content": "likes tea"}]}')
+
+
+@pytest.mark.asyncio
+async def test_background_writeback_enqueues_the_pointer_without_calling_the_model() -> None:
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+    config = _run_config(tenant, user, run_id=run)
+
+    out = await _background_node(store, llm, jobs)(_state("done"), config)
+
+    assert out == {
+        "written_memory_count": 0,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": True,
+    }
+    assert llm.calls == []
+    job = await jobs.get_by_run(tenant_id=tenant, run_id=run)
+    assert job is not None
+    assert (job.checkpoint_id, job.message_count) == ("ckpt-1", 2)
+    assert str(job.thread_id) == config["configurable"]["thread_id"]
+
+
+@pytest.mark.asyncio
+async def test_background_enqueue_runs_under_the_runs_own_tenant_scope() -> None:
+    """RLS:run 的入口没设租户上下文时,落任务那一刻也带着本 run 的租户 / 用户。"""
+    store, jobs = InMemoryMemoryStore(), _ScopeSpyJobStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[])
+    assert current_tenant_id_var.get() is None
+
+    await _background_node(store, llm, jobs)(
+        _state("done"), _run_config(tenant, user, run_id=uuid4())
+    )
+
+    assert jobs.seen == [(tenant, user, False)]
+    assert current_tenant_id_var.get() is None  # reset afterwards
+
+
+@pytest.mark.asyncio
+async def test_background_enqueue_failure_falls_back_to_inline() -> None:
+    """(d) —— 落不了任务就在本轮里照旧写:丢记忆比 ``end`` 慢几秒更糟。"""
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+
+    out = await _background_node(store, llm, _BrokenJobStore())(
+        _state("done"), _run_config(tenant, user, run_id=uuid4())
+    )
+
+    assert out == {"written_memory_count": 1, "memory_writeback_failed": False}
+    assert len(await store.list_for_user(tenant_id=tenant, user_id=user)) == 1
+
+
+@pytest.mark.asyncio
+async def test_background_without_a_run_id_falls_back_to_inline() -> None:
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+
+    out = await _background_node(store, llm, jobs)(
+        _state("done"), _run_config(tenant, user, run_id=None)
+    )
+
+    assert out == {"written_memory_count": 1, "memory_writeback_failed": False}
+    assert await jobs.count_backlog() == 0
 
 
 @pytest.mark.asyncio

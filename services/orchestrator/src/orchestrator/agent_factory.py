@@ -58,7 +58,7 @@ from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import BoundDistilledSkill
 from expert_work.common.spotlight import SPOTLIGHT_SYSTEM_CLAUSE
 from expert_work.persistence import MemoryStore
-from expert_work.persistence.memory import MemoryWritebackDLQ
+from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.skill.base import SkillStore
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.persistence.trigger.base import TriggerStore
@@ -288,6 +288,13 @@ class MemoryEnv:
     #: passes the same ``DynamicResolvingReranker`` it builds for the
     #: knowledge tool; ``None`` keeps the pre-CM-4 RRF order (no rerank).
     reranker: Reranker | None = None
+    #: B-168 —— 后台写回的任务表。给了就是 ``background`` 模式:run 末的写回节点只落一行
+    #: 任务,由控制面的 ``MemoryWritebackWorker`` 在 ``end`` 之后写记忆;``None`` = inline
+    #: (本轮内同步写,与之前一致)。控制面只在 ``memory_writeback_mode == "background"``
+    #: 时填它。压缩前抢存不受影响,两种模式都在本轮内写。
+    writeback_jobs: MemoryWritebackJobStore | None = None
+    #: B-168 —— 落了任务就捅一下本副本 worker 的快路径(不等它下一次轮询)。
+    wake_writeback: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -2763,6 +2770,9 @@ def _build_memory_nodes(
             reconcile=long_term.reconcile_writes,  # CM-7 — Mem0-style run-end ops
             agent_name=agent_name,
             write_min_importance=long_term.write_min_importance,  # M-2 write-filter
+            agent_version=spec.metadata.version,
+            writeback_jobs=env.writeback_jobs,  # B-168 — None = inline
+            wake_writeback=env.wake_writeback,
         )
         if long_term.write_back
         else None

@@ -237,6 +237,8 @@ class AgentState(TypedDict):
     written_memory_count: NotRequired[int]
     #: B-168 —— 本轮写回是否因故障 / 拦截没写成(区别于「没什么可记」的 0 条)。
     memory_writeback_failed: NotRequired[bool]
+    #: B-168 —— 后台模式:本轮只落了任务,记忆在 ``end`` 之后由后台写(控制台画「已排队」)。
+    memory_writeback_queued: NotRequired[bool]
     step_count_refund_pending: NotRequired[int]
     #: Stream CM-9 (Mini-ADR CM-J5) — transient escalation signal. Set by
     #: agent_node when the loop-detection middleware flags a repeat

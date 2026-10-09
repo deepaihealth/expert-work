@@ -1416,6 +1416,62 @@ async def test_build_memory_nodes_passes_reranker_to_recall() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_memory_nodes_passes_background_writeback_from_memory_env() -> None:
+    """B-168 —— ``MemoryEnv.writeback_jobs`` / ``wake_writeback`` reach the write-back
+    node (background mode: it enqueues the agent's name + version and wakes the
+    worker); the pre-compaction flush stays inline."""
+    from uuid import uuid4
+
+    from langchain_core.messages import HumanMessage
+
+    from expert_work.persistence.memory import InMemoryMemoryWritebackJobStore
+    from orchestrator.agent_factory import _build_memory_nodes
+
+    async def _dummy_llm(*, messages: object, tools: object) -> object:
+        raise AssertionError("background write-back must not call the LLM in the run")
+
+    wakes: list[int] = []
+
+    def _wake() -> None:
+        wakes.append(1)
+
+    jobs = InMemoryMemoryWritebackJobStore()
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["memory"] = {"long_term": {"write_back": True}}
+    spec = AgentSpec.model_validate(doc)
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+
+    _recall, writeback, _flush = _build_memory_nodes(
+        spec,
+        memory_env=MemoryEnv(
+            store=InMemoryMemoryStore(),
+            embedder=FakeEmbedder(dim=16),
+            writeback_jobs=jobs,
+            wake_writeback=_wake,
+        ),
+        llm_caller=_dummy_llm,  # type: ignore[arg-type]
+    )
+    assert writeback is not None
+    out = await writeback(
+        {"messages": [HumanMessage(content="q")], "step_count": 0, "max_steps": 5},  # type: ignore[arg-type]
+        {
+            "configurable": {
+                "tenant_id": str(tenant),
+                "user_id": str(user),
+                "thread_id": str(uuid4()),
+                "run_id": str(run),
+                "checkpoint_map": {"": "ckpt"},
+            }
+        },
+    )
+    assert out["memory_writeback_queued"] is True
+    job = await jobs.get_by_run(tenant_id=tenant, run_id=run)
+    assert job is not None
+    assert (job.agent_name, job.agent_version) == (spec.metadata.name, spec.metadata.version)
+    assert wakes == [1]
+
+
+@pytest.mark.asyncio
 async def test_build_memory_nodes_passes_rewrite_reads_to_recall() -> None:
     """P5a assembly — ``long_term.rewrite_reads`` + the agent's chat model reach
     the recall node as ``rewrite_query`` + ``rewriter``, so an enabled manifest
