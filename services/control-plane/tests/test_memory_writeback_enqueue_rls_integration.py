@@ -25,6 +25,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DBAPIError
 from testcontainers.postgres import PostgresContainer
 
+from control_plane.advisory_locks import MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
 from expert_work.persistence import (
     DatabaseConfig,
     InMemoryMemoryStore,
@@ -95,7 +96,8 @@ async def app_role_jobs(
     )
     try:
         yield SqlMemoryWritebackJobStore(
-            build_rls_sessionmaker(create_async_session_factory(engine))
+            build_rls_sessionmaker(create_async_session_factory(engine)),
+            claim_lock_classid=MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID,
         )
     finally:
         await engine.dispose()
