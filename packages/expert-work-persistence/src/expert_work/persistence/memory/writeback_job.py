@@ -19,10 +19,18 @@
   增删改。
 * 每次领取先把「租约过期且已到上限」的 ``running`` 收成 ``failed``,否则它永远挡着
   同一用户后面的任务。
+* SQL 版只靠语句快照挡不住交错的领取者:A 已把 J1 改成 running 但未提交时,B 的快照里
+  J1 还是 pending,一条 ``created_at`` 更早(副本时钟偏差)的 J0 就不被任何规则挡住。
+  所以选出候选后先拿该 (租户, 用户) 的事务级 advisory lock,再用**新语句**重判上面两条
+  规则 —— 新语句的快照看得见刚释放锁的那位已提交的结果。
 
-**持有凭证**:``attempts`` 在领取时 +1,它同时是本次领取的凭证 —— :meth:`renew_lease` /
-:meth:`finish` / :meth:`fail_attempt` 都要带上领取时拿到的 ``attempts``,行已被别人
-重新领走(租约过期后)时这三个调用不生效,迟到的旧持有者不会覆盖新持有者的结果。
+**持有凭证**:``attempts`` 在领取时 +1,它同时是本次领取的凭证 —— :meth:`still_held` /
+:meth:`renew_lease` / :meth:`finish` / :meth:`fail_attempt` 都要带上领取时拿到的
+``attempts``,行已被别人重新领走(租约过期后)或已被清除时它们不生效,迟到的旧持有者
+不会覆盖新持有者的结果。
+
+**每条任务至少有一个指针**:``checkpoint_id`` 或 ``message_count``(表上有 CHECK,
+:meth:`~MemoryWritebackJobStore.enqueue` 也先拒)—— 处理器绝不去读整个会话。
 
 **收尾**分两种:
 
@@ -40,7 +48,7 @@ from datetime import datetime, timedelta
 from typing import Any, Final
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
@@ -108,6 +116,12 @@ def _row_to_job(row: MemoryWritebackJobRow) -> MemoryWritebackJob:
     )
 
 
+def _require_pointer(checkpoint_id: str | None, message_count: int | None) -> None:
+    if checkpoint_id is None and message_count is None:
+        msg = "a memory writeback job needs a checkpoint_id or message_count"
+        raise ValueError(msg)
+
+
 def _lease_expired_error(attempts: int) -> str:
     return f"lease expired after {attempts} attempt(s)"
 
@@ -130,7 +144,10 @@ class MemoryWritebackJobStore(abc.ABC):
         message_count: int | None = None,
         now: datetime,
     ) -> UUID:
-        """Insert one ``pending`` job (``created_at = now``); return its id."""
+        """Insert one ``pending`` job (``created_at = now``); return its id.
+
+        :raises ValueError: neither ``checkpoint_id`` nor ``message_count`` given.
+        """
 
     @abc.abstractmethod
     async def claim_next(
@@ -142,6 +159,12 @@ class MemoryWritebackJobStore(abc.ABC):
         Cross-tenant: the caller wraps it in a bypass-RLS scope. Exactly one
         concurrent caller wins each job (SQL: ``FOR UPDATE SKIP LOCKED`` + CAS).
         """
+
+    @abc.abstractmethod
+    async def still_held(self, *, job_id: UUID, attempt: int) -> bool:
+        """``True`` iff the row is still ``running`` under this claim (``attempts == attempt``)
+        —— the processor's check right before each memory write: ``False`` once the job was
+        purged, settled, or re-claimed by another worker after a lease expiry."""
 
     @abc.abstractmethod
     async def renew_lease(self, *, job_id: UUID, attempt: int, lease_until: datetime) -> bool:
@@ -223,6 +246,7 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
         message_count: int | None = None,
         now: datetime,
     ) -> UUID:
+        _require_pointer(checkpoint_id, message_count)
         job = MemoryWritebackJob(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -322,6 +346,9 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
         if job is None or job.status != RUNNING or job.attempts != attempt:
             return None
         return job
+
+    async def still_held(self, *, job_id: UUID, attempt: int) -> bool:
+        return self._held(job_id, attempt) is not None
 
     async def renew_lease(self, *, job_id: UUID, attempt: int, lease_until: datetime) -> bool:
         job = self._held(job_id, attempt)
@@ -460,10 +487,18 @@ def _held(job_id: UUID, attempt: int) -> Any:
 
 
 class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
-    """Postgres-backed store. One short transaction per call."""
+    """Postgres-backed store. One short transaction per call.
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    ``claim_lock_classid`` is the advisory-lock class for the per-(tenant, user) claim
+    lock. The control plane owns the registry (``control_plane.advisory_locks``) and
+    passes its value in — this package cannot import it.
+    """
+
+    def __init__(
+        self, session_factory: async_sessionmaker[AsyncSession], *, claim_lock_classid: int
+    ) -> None:
         self._sf = session_factory
+        self._claim_lock_classid = claim_lock_classid
 
     async def enqueue(
         self,
@@ -479,6 +514,7 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
         message_count: int | None = None,
         now: datetime,
     ) -> UUID:
+        _require_pointer(checkpoint_id, message_count)
         row = MemoryWritebackJobRow(
             id=uuid4(),
             tenant_id=tenant_id,
@@ -503,7 +539,8 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
         self, *, now: datetime, lease_s: float, max_attempts: int
     ) -> MemoryWritebackJob | None:
         async with self._sf() as session:
-            # 到上限的过期租约先收成 failed —— 否则它永远挡着同一用户后面的任务。
+            # 到上限的过期租约先收成 failed —— 否则它永远挡着同一用户后面的任务。单独一个
+            # 事务:不把这些行锁带进下面等 advisory lock 的那段。
             await session.execute(
                 update(_Job)
                 .where(
@@ -518,26 +555,34 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
                     last_error=func.concat("lease expired after ", _Job.attempts, " attempt(s)"),
                 )
             )
-            # ``FOR UPDATE SKIP LOCKED``:并发的领取者跳过别人已锁住的候选;UPDATE 再带
-            # 一遍同样的条件做 CAS(同 B-139 ``claim_queued``),条件与领取不留竞态。
+            await session.commit()
+        async with self._sf() as session:
+            # ``FOR UPDATE SKIP LOCKED``:并发的领取者跳过别人已锁住的候选。
             candidate = (
                 await session.execute(
-                    select(_Job.id)
+                    select(_Job.id, _Job.tenant_id, _Job.user_id)
                     .where(_claimable_self(now, max_attempts), ~_blocked(now))
                     .order_by(_Job.created_at.asc(), _Job.id.asc())
                     .limit(1)
                     .with_for_update(skip_locked=True)
                 )
-            ).scalar_one_or_none()
+            ).first()
             if candidate is None:
                 await session.commit()
                 return None
+            job_id, tenant_id, user_id = candidate
+            # 同一用户的领取者在这里排队(见模块 docstring);锁随事务提交释放。
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:cid, hashtext(:key))"),
+                {"cid": self._claim_lock_classid, "key": f"{tenant_id}:{user_id}"},
+            )
+            # 新语句、新快照:拿到锁之后重判,看得见上一位持锁者已提交的领取。
             row = (
                 (
                     await session.execute(
                         update(_Job)
                         .where(
-                            _Job.id == candidate,
+                            _Job.id == job_id,
                             _claimable_self(now, max_attempts),
                             ~_blocked(now),
                         )
@@ -555,6 +600,11 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
             )
             await session.commit()
         return _row_to_job(row) if row is not None else None
+
+    async def still_held(self, *, job_id: UUID, attempt: int) -> bool:
+        async with self._sf() as session:
+            found = (await session.execute(select(_Job.id).where(_held(job_id, attempt)))).first()
+        return found is not None
 
     async def renew_lease(self, *, job_id: UUID, attempt: int, lease_until: datetime) -> bool:
         async with self._sf() as session:

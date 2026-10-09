@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api import (
     build_agent_schema_router,
@@ -3111,7 +3112,9 @@ def _build_sql_stores(settings: Settings) -> _SqlStores:
         tenant_user=SqlTenantUserStore(session_factory),
         memory=SqlMemoryStore(session_factory),
         memory_dlq=SqlMemoryWritebackDLQ(session_factory),
-        memory_writeback_job=SqlMemoryWritebackJobStore(session_factory),
+        memory_writeback_job=SqlMemoryWritebackJobStore(
+            session_factory, claim_lock_classid=MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
+        ),
         knowledge=SqlKnowledgeStore(session_factory),
         skill=SqlSkillStore(session_factory),
         image_upload=SqlImageUploadStore(session_factory),

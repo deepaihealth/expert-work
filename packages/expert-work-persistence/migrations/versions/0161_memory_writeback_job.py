@@ -3,11 +3,13 @@
 一轮结束时只落一行指针(会话 + 检查点 + run),控制面的后台 worker 领走后读检查点、
 调记忆模型、写记忆,不再挡着本轮的 ``end`` 帧。行里不复制对话内容。
 
-纯新增一张表,不动存量数据。旧镜像不读它,回滚安全。
+每行至少带一个指针(``checkpoint_id`` 或 ``message_count``,CHECK 约束),处理器绝不去
+读整个会话。纯新增一张表,不动存量数据。旧镜像不读它,回滚安全。
 
 索引:
 
-* ``(status, created_at)`` —— 领取扫描按最早的可领任务找。
+* ``(created_at, id) WHERE status IN ('pending', 'running')`` —— 领取扫描按最早的未完成
+  任务找;部分索引只覆盖未完成的行,``done`` / ``failed`` 越积越多也不拖慢领取。
 * ``(tenant_id, user_id, status)`` —— 领取时判断同一用户有没有在跑 / 更早的任务;清除用户。
 * ``run_id`` —— 控制台按 run 读后台写回结果。
 * ``thread_id`` —— 删会话时删它的任务。
@@ -74,8 +76,18 @@ def upgrade() -> None:
             "status IN ('pending', 'running', 'done', 'failed')",
             name="memory_writeback_job_status_enum",
         ),
+        sa.CheckConstraint(
+            "checkpoint_id IS NOT NULL OR message_count IS NOT NULL",
+            name="memory_writeback_job_pointer",
+        ),
     )
-    op.create_index("ix_memory_writeback_job_claim", _TABLE, ["status", "created_at"])
+    op.execute(
+        f"""
+        CREATE INDEX ix_memory_writeback_job_claim
+          ON {_TABLE} (created_at, id)
+          WHERE status IN ('pending', 'running')
+        """
+    )
     op.create_index("ix_memory_writeback_job_user", _TABLE, ["tenant_id", "user_id", "status"])
     op.create_index("ix_memory_writeback_job_run", _TABLE, ["run_id"])
     op.create_index("ix_memory_writeback_job_thread", _TABLE, ["thread_id"])

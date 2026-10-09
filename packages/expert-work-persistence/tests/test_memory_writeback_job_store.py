@@ -25,6 +25,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -43,6 +44,8 @@ from expert_work.persistence.memory.writeback_job import (
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 
 _T0 = datetime(2026, 10, 9, 12, 0, 0, tzinfo=UTC)
+#: The control plane passes its registry value (``advisory_locks``); any int works here.
+_CLAIM_LOCK_CLASSID = 8622
 _LEASE_S = 300
 _MAX = 3
 
@@ -356,6 +359,60 @@ async def backlog_counts_unfinished_jobs(store: MemoryWritebackJobStore) -> None
     assert await store.count_backlog() == 2
 
 
+async def a_job_needs_a_pointer_to_the_turn(store: MemoryWritebackJobStore) -> None:
+    """没有 ``checkpoint_id`` 也没有 ``message_count`` 的任务不收 —— 处理器不能去读整个会话。"""
+    base = {
+        "tenant_id": uuid4(),
+        "user_id": uuid4(),
+        "agent_name": "a",
+        "agent_version": "1",
+        "thread_id": uuid4(),
+        "run_id": uuid4(),
+        "trace_id": None,
+        "now": _T0,
+    }
+    with pytest.raises(ValueError, match="checkpoint_id or message_count"):
+        await store.enqueue(**base)  # type: ignore[arg-type]
+    assert await store.count_backlog() == 0
+    await store.enqueue(**base, message_count=3)  # type: ignore[arg-type]
+    await store.enqueue(**base, checkpoint_id="c")  # type: ignore[arg-type]
+    assert await store.count_backlog() == 2
+
+
+async def still_held_is_the_fencing_check(store: MemoryWritebackJobStore) -> None:
+    """``still_held`` = 行还在、在跑、而且还是这一次领取(``attempts``)。"""
+    tenant, user = uuid4(), uuid4()
+    a1 = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0)
+    assert not await store.still_held(job_id=a1, attempt=0)  # pending, not held
+    await _claim(store, _T0)
+    assert await store.still_held(job_id=a1, attempt=1)
+    assert not await store.still_held(job_id=a1, attempt=2)
+
+    after = _T0 + timedelta(seconds=_LEASE_S)
+    reclaimed = await _claim(store, after)
+    assert reclaimed is not None and reclaimed.attempts == 2
+    assert not await store.still_held(job_id=a1, attempt=1)  # the stale owner lost it
+    assert await store.still_held(job_id=a1, attempt=2)
+
+    await store.finish(
+        job_id=a1,
+        attempt=2,
+        written_count=0,
+        failed=False,
+        queued_ms=0,
+        exec_ms=0,
+        error=None,
+        now=after,
+    )
+    assert not await store.still_held(job_id=a1, attempt=2)
+    other = uuid4()
+    b1 = await _enqueue(store, tenant_id=tenant, user_id=other, at=after)
+    await _claim(store, after)
+    assert await store.still_held(job_id=b1, attempt=1)
+    await store.delete_all_for_user(tenant_id=tenant, user_id=other)  # purged mid-flight
+    assert not await store.still_held(job_id=b1, attempt=1)
+
+
 _SCENARIOS: tuple[Callable[[MemoryWritebackJobStore], Awaitable[None]], ...] = (
     enqueue_then_claim_round_trips_the_pointer,
     one_user_runs_one_job_at_a_time,
@@ -369,6 +426,8 @@ _SCENARIOS: tuple[Callable[[MemoryWritebackJobStore], Awaitable[None]], ...] = (
     finish_records_the_result,
     purge_deletes_by_user_and_by_thread,
     backlog_counts_unfinished_jobs,
+    a_job_needs_a_pointer_to_the_turn,
+    still_held_is_the_fencing_check,
 )
 
 
@@ -406,7 +465,9 @@ async def _fresh_store(engine: AsyncEngine) -> SqlMemoryWritebackJobStore:
     # holds only its own rows.
     async with engine.begin() as conn:
         await conn.execute(text("TRUNCATE memory_writeback_job"))
-    return SqlMemoryWritebackJobStore(create_async_session_factory(engine))
+    return SqlMemoryWritebackJobStore(
+        create_async_session_factory(engine), claim_lock_classid=_CLAIM_LOCK_CLASSID
+    )
 
 
 @pytest.mark.integration
@@ -438,6 +499,7 @@ async def test_concurrent_claimers_never_share_a_job(engine: AsyncEngine) -> Non
                     thread_id=uuid4(),
                     run_id=uuid4(),
                     trace_id=None,
+                    checkpoint_id="c",
                     now=now,
                 )
 
@@ -451,5 +513,74 @@ async def test_concurrent_claimers_never_share_a_job(engine: AsyncEngine) -> Non
         assert len(per_user) == len(set(per_user))  # at most one running job per user
         assert set(per_user) == set(users)  # and every user got one
         assert all(j.attempts == 1 for j in jobs)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_the_table_rejects_a_job_without_a_pointer(engine: AsyncEngine) -> None:
+    try:
+        await _fresh_store(engine)
+        with pytest.raises(IntegrityError, match="memory_writeback_job_pointer"):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO memory_writeback_job "
+                        "(tenant_id, user_id, agent_name, agent_version, thread_id, run_id) "
+                        "VALUES (:t, :u, 'a', '1', :th, :r)"
+                    ),
+                    {"t": uuid4(), "u": uuid4(), "th": uuid4(), "r": uuid4()},
+                )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_a_racing_claimer_of_the_same_user_waits_and_rechecks(engine: AsyncEngine) -> None:
+    """(c) —— 同一用户的两个领取者交错执行时只有一个领到。
+
+    快照判断撑不住这种交错:领取者 A 已经把 J1 改成 running 但还没提交;领取者 B 的快照里
+    J1 还是 pending,而一条 ``created_at`` 更早(副本时钟偏差)的 J0 不被任何规则挡住 ——
+    B 就会领走 J0,同一用户两条同时在跑。按 (租户, 用户) 的事务级 advisory lock 让 B 等 A
+    提交,再用新语句重新判断。这里的 A 按同一协议手工执行(先拿锁、再改行、晚一点提交)。
+    """
+    try:
+        store = await _fresh_store(engine)
+        tenant, user = uuid4(), uuid4()
+        now = datetime.now(UTC)
+        j1 = await _enqueue(store, tenant_id=tenant, user_id=user, at=now)
+        await _enqueue(store, tenant_id=tenant, user_id=user, at=now - timedelta(seconds=10))
+
+        async with engine.connect() as conn:
+            claimer_a = await conn.begin()
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:cid, hashtext(:key))"),
+                {"cid": _CLAIM_LOCK_CLASSID, "key": f"{tenant}:{user}"},
+            )
+            await conn.execute(
+                text(
+                    "UPDATE memory_writeback_job SET status = 'running', "
+                    "attempts = attempts + 1, lease_until = :lease, started_at = :now "
+                    "WHERE id = :id"
+                ),
+                {"id": j1, "now": now, "lease": now + timedelta(seconds=300)},
+            )
+            claimer_b = asyncio.create_task(store.claim_next(now=now, lease_s=300, max_attempts=3))
+            await asyncio.sleep(0.5)  # B runs as far as it can while A is uncommitted
+            await claimer_a.commit()
+            got = await claimer_b
+
+        assert got is None
+        async with engine.connect() as conn:
+            running = await conn.scalar(
+                text(
+                    "SELECT count(*) FROM memory_writeback_job "
+                    "WHERE user_id = :u AND status = 'running'"
+                ),
+                {"u": user},
+            )
+        assert running == 1
     finally:
         await engine.dispose()

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, Integer, Text, func, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,6 +21,17 @@ class MemoryWritebackJobRow(Base):
     """One queued / running / settled background memory write-back."""
 
     __tablename__ = "memory_writeback_job"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'done', 'failed')",
+            name="memory_writeback_job_status_enum",
+        ),
+        # 每条任务至少一个指针 —— 处理器绝不去读整个会话。
+        CheckConstraint(
+            "checkpoint_id IS NOT NULL OR message_count IS NOT NULL",
+            name="memory_writeback_job_pointer",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True),
