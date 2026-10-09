@@ -140,6 +140,7 @@ from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import (
     APPROVAL_TURN_RESET,
     LLM_CACHE_BYPASS_KEY,
+    MEMORY_WRITEBACK_INLINE_KEY,
     AgentFactoryError,
     BuiltAgent,
     pending_request_binding,
@@ -1644,6 +1645,10 @@ async def _start_run(
     configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+    if payload.use_draft:
+        # B-168 —— 后台记忆写回按 (name, version) 取线上配置执行,而这一轮跑的是草稿:
+        # 草稿 run 的记忆写回留在本轮内,用的就是草稿自己的设置。
+        configurable[MEMORY_WRITEBACK_INLINE_KEY] = True
     if replay_messages is not None:
         # B-66 —— ``:regenerate`` 重放的 [System, Human, (本轮输入段)?] 与原轮字节
         # 相同,不绕开响应缓存就必然命中、把旧答案原样端回来。``:edit`` 输入是新的,

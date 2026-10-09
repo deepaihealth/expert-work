@@ -66,6 +66,7 @@ from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.protocol import MemoryItem, MemoryRecallMode
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator.graph_builder._config import (
+    MEMORY_WRITEBACK_INLINE_KEY,
     cancellation_token,
     configurable_uuid,
     current_run_id,
@@ -1328,15 +1329,20 @@ def make_memory_writeback_node(
         if tenant_id is None or user_id is None:
             return {}
         thread_id = configurable_uuid(config, "thread_id")
-        if writeback_jobs is not None and await _enqueue_writeback_job(
-            writeback_jobs,
-            state,
-            config,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            thread_id=thread_id,
-            agent_name=agent_name,
-            agent_version=agent_version,
+        inline_only = bool((config.get("configurable") or {}).get(MEMORY_WRITEBACK_INLINE_KEY))
+        if (
+            writeback_jobs is not None
+            and not inline_only
+            and await _enqueue_writeback_job(
+                writeback_jobs,
+                state,
+                config,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                agent_name=agent_name,
+                agent_version=agent_version,
+            )
         ):
             if wake_writeback is not None:
                 wake_writeback()

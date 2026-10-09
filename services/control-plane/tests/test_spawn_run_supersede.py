@@ -29,7 +29,7 @@ from expert_work.common.supersede import mark_superseded
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunStore
-from orchestrator import LLM_CACHE_BYPASS_KEY
+from orchestrator import LLM_CACHE_BYPASS_KEY, MEMORY_WRITEBACK_INLINE_KEY
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier
 
@@ -102,7 +102,9 @@ class _SpawnCtx:
         self.run_store = run_store
         self.runtime = app.state.agent_runtime
 
-    async def spawn(self, *, mode: str, supersede: SupersedeRequest | None) -> Any:
+    async def spawn(
+        self, *, mode: str, supersede: SupersedeRequest | None, use_draft: bool = False
+    ) -> Any:
         records = await self.app.state.agent_spec_repo.list_by_tenant(
             tenant_id=self.tenant_id, name="support-bot", limit=1
         )
@@ -140,7 +142,7 @@ class _SpawnCtx:
             actor_id="sa-test",
             effective_user_id=None,
             oauth_subject="sa-test",
-            payload=RunRequest(input="U", mode=mode),
+            payload=RunRequest(input="U", mode=mode, use_draft=use_draft),
             trace_id="0" * 32,
             supersede=supersede,
         )
@@ -303,6 +305,27 @@ async def test_stream_regenerate_bypasses_the_response_cache_and_edit_does_not(
     assert (LLM_CACHE_BYPASS_KEY in captured["configurable"]) is bypass
     if bypass:
         assert captured["configurable"][LLM_CACHE_BYPASS_KEY] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_draft", [True, False])
+async def test_a_draft_trial_run_keeps_memory_writeback_inline(
+    monkeypatch: pytest.MonkeyPatch, spawn_ctx: _SpawnCtx, use_draft: bool
+) -> None:
+    """B-168 —— 后台写回由 worker 按 (name, version) 取**线上**配置执行;草稿试跑的记忆
+    设置可能与线上不同,所以草稿 run 一律在本轮内写(run 带 ``MEMORY_WRITEBACK_INLINE_KEY``)。"""
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent(**kwargs: Any) -> None:
+        captured["configurable"] = kwargs["config"]["configurable"]
+
+    monkeypatch.setattr(runs_mod, "run_agent", fake_run_agent)
+    await spawn_ctx.spawn(mode="stream", supersede=None, use_draft=use_draft)
+    await asyncio.sleep(0)
+
+    assert captured["configurable"].get(MEMORY_WRITEBACK_INLINE_KEY) is (
+        True if use_draft else None
+    )
 
 
 @pytest.mark.asyncio

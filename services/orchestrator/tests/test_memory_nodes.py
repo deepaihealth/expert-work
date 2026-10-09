@@ -24,6 +24,7 @@ from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import (
+    MEMORY_WRITEBACK_INLINE_KEY,
     GraphRunner,
     ToolRegistry,
     build_react_graph,
@@ -831,6 +832,26 @@ async def test_running_the_writeback_node_twice_for_one_turn_queues_one_job() ->
     assert second["memory_writeback_queued"] is True
     assert await jobs.count_backlog() == 1
     assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_marked_inline_writes_in_the_run_even_in_background_mode() -> None:
+    """B-168 —— 草稿试跑(``MEMORY_WRITEBACK_INLINE_KEY``):worker 只认线上配置,这一轮在
+    本轮内写,不落任务。"""
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+    config = _run_config(tenant, user, run_id=uuid4())
+    config["configurable"][MEMORY_WRITEBACK_INLINE_KEY] = True
+
+    out = await _background_node(store, llm, jobs)(_state("done"), config)
+
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
+    assert await jobs.count_backlog() == 0
 
 
 @pytest.mark.asyncio
