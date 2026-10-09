@@ -108,6 +108,33 @@ async def one_user_runs_one_job_at_a_time(store: MemoryWritebackJobStore) -> Non
     assert third is not None and third.id == a2
 
 
+async def a_running_job_blocks_even_an_earlier_one(store: MemoryWritebackJobStore) -> None:
+    """跨副本时钟偏差:晚插进来、``created_at`` 却更早的任务也要等同一用户在跑的那条。
+
+    「更早的未完成任务」一条规则覆盖不到这种情况(在跑的那条反而更晚),所以领取条件里
+    单列了「该用户有租约有效的 running」。
+    """
+    tenant, user = uuid4(), uuid4()
+    later = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0 + timedelta(seconds=5))
+    now = _T0 + timedelta(seconds=6)
+    running = await _claim(store, now)
+    assert running is not None and running.id == later
+    skewed = await _enqueue(store, tenant_id=tenant, user_id=user, at=_T0)
+    assert await _claim(store, now) is None
+    assert await store.finish(
+        job_id=later,
+        attempt=1,
+        written_count=0,
+        failed=False,
+        queued_ms=0,
+        exec_ms=0,
+        error=None,
+        now=now,
+    )
+    nxt = await _claim(store, now)
+    assert nxt is not None and nxt.id == skewed
+
+
 async def same_user_same_user_in_another_tenant_is_independent(
     store: MemoryWritebackJobStore,
 ) -> None:
@@ -314,6 +341,7 @@ async def backlog_counts_unfinished_jobs(store: MemoryWritebackJobStore) -> None
 _SCENARIOS: tuple[Callable[[MemoryWritebackJobStore], Awaitable[None]], ...] = (
     enqueue_then_claim_round_trips_the_pointer,
     one_user_runs_one_job_at_a_time,
+    a_running_job_blocks_even_an_earlier_one,
     same_user_same_user_in_another_tenant_is_independent,
     same_instant_jobs_order_by_id,
     a_retried_job_keeps_its_place,
