@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from prometheus_client import REGISTRY
 
 from control_plane.memory.writeback_worker import MemoryWritebackWorker, WritebackOutcome
 from expert_work.persistence.memory import (
@@ -38,6 +39,13 @@ async def _enqueue(store: InMemoryMemoryWritebackJobStore, *, user_id: UUID | No
 def _only(store: InMemoryMemoryWritebackJobStore) -> MemoryWritebackJob:
     [job] = store._rows.values()
     return job
+
+
+def _settled(outcome: str) -> float:
+    value = REGISTRY.get_sample_value(
+        "expert_work_control_plane_memory_writeback_jobs_total", {"outcome": outcome}
+    )
+    return value or 0.0
 
 
 class _Recorder:
@@ -155,10 +163,12 @@ async def test_a_purged_job_is_discarded_not_finished() -> None:
         return WritebackOutcome(written_count=0, failed=False, discarded=True)
 
     worker = MemoryWritebackWorker(store=store, processor=purged_mid_way)
+    before = _settled("discarded")
     assert await worker.run_once() is True
 
     assert answers == [True, False]
     assert store._rows == {}
+    assert _settled("discarded") == before + 1
 
 
 @pytest.mark.asyncio
