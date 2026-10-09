@@ -282,13 +282,18 @@ async def test_router_caller_factory_builds_the_memory_chain_from_platform_crede
 
     resolver = _StubResolver()
     factory = make_router_caller_factory(
-        secret_store=LocalDevSecretStore.from_mapping({"glm-key": "sk-test"}),
+        secret_store=LocalDevSecretStore.from_mapping(
+            {"glm-key": "sk-test", "manifest-key": "sk-manifest"}
+        ),
         credentials_resolver=resolver,  # type: ignore[arg-type]
         middleware_env=None,
         http_client=None,
         rate_limiter_factory=None,
     )
-    spec = _spec()
+    doc = deepcopy(_SPEC)
+    # A manifest-pinned key is ignored (Stream Y-2): spend goes through the platform.
+    doc["spec"]["model"]["api_key_ref"] = "secret://manifest-key"
+    spec = AgentSpec.model_validate(doc)
     tenant = uuid4()
 
     router = await factory(spec, memory_model(spec), tenant)
