@@ -16,11 +16,13 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.memory import InMemorySaver
 
+from control_plane.memory import MemoryWritebackWorker, writeback_processor
 from control_plane.memory.writeback_processor import MemoryWritebackProcessor
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.persistence.memory import (
     InMemoryMemoryStore,
     InMemoryMemoryWritebackDLQ,
+    InMemoryMemoryWritebackJobStore,
     MemoryWritebackJob,
 )
 from expert_work.persistence.token_usage_store import (
@@ -81,14 +83,29 @@ class _FakeCaller:
         )
 
 
+class _HidingSaver(InMemorySaver):
+    """前 ``misses`` 次读不到检查点 —— 本轮结束时那个检查点还在异步保存的路上。"""
+
+    def __init__(self, misses: int) -> None:
+        super().__init__()
+        self.misses = misses
+        self.reads = 0
+
+    async def aget_tuple(self, config: Any) -> Any:
+        self.reads += 1
+        if self.reads <= self.misses:
+            return None
+        return await super().aget_tuple(config)
+
+
 class _Harness:
-    def __init__(self) -> None:
+    def __init__(self, saver: InMemorySaver | None = None) -> None:
         self.tenant, self.user, self.thread, self.run = uuid4(), uuid4(), uuid4(), uuid4()
         self.agents = InMemoryAgentSpecStore()
         self.memory = InMemoryMemoryStore()
         self.dlq = InMemoryMemoryWritebackDLQ()
         self.usage = InMemoryTokenUsageStore()
-        self.saver = InMemorySaver()
+        self.saver = saver if saver is not None else InMemorySaver()
         self.caller = _FakeCaller()
         self.factory_models: list[ModelSpec] = []
         self.checkpoint_ids: list[str] = []
@@ -372,3 +389,85 @@ async def test_router_caller_factory_uses_the_runs_stream_timeouts() -> None:
     assert isinstance(background, LLMRouter) and isinstance(in_run, LLMRouter)
     assert background.first_token_timeout_s == in_run.first_token_timeout_s == 240.0
     assert background.idle_timeout_s == in_run.idle_timeout_s == 30.0
+
+
+# ---------------------------------------------------------------------------
+# 检查点还没落:LangGraph 异步保存检查点,worker 可能比它先到
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _fast_checkpoint_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(writeback_processor, "_CHECKPOINT_READ_DELAY_S", 0.0, raising=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fast_checkpoint_retry")
+async def test_a_checkpoint_that_lands_late_is_read_after_a_short_retry() -> None:
+    h = _Harness(_HidingSaver(misses=2))
+    await h.add_agent(_spec())
+    await h.checkpoint(_TURN_1)
+
+    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
+
+    assert (outcome.written_count, outcome.failed) == (1, False)
+    assert "green tea" in h.prompt_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fast_checkpoint_retry")
+async def test_a_checkpoint_that_never_shows_up_raises_instead_of_finishing_done() -> None:
+    saver = _HidingSaver(misses=10_000)
+    h = _Harness(saver)
+    await h.add_agent(_spec())
+    await h.checkpoint(_TURN_1)
+
+    with pytest.raises(LookupError, match="checkpoint"):
+        await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
+
+    assert saver.reads == 3
+    assert h.caller.prompts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fast_checkpoint_retry")
+async def test_a_checkpoint_with_no_messages_is_still_done_with_nothing_to_read() -> None:
+    h = _Harness()
+    await h.add_agent(_spec())
+    await h.checkpoint([])
+
+    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
+
+    assert (outcome.written_count, outcome.failed, outcome.note) == (
+        0,
+        False,
+        "no messages to read",
+    )
+    assert h.caller.prompts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fast_checkpoint_retry")
+async def test_worker_puts_a_job_whose_checkpoint_is_missing_back_to_pending() -> None:
+    h = _Harness(_HidingSaver(misses=10_000))
+    await h.add_agent(_spec())
+    await h.checkpoint(_TURN_1)
+    jobs = InMemoryMemoryWritebackJobStore()
+    job_id = await jobs.enqueue(
+        tenant_id=h.tenant,
+        user_id=h.user,
+        agent_name="mem-agent",
+        agent_version="1.0.0",
+        thread_id=h.thread,
+        run_id=h.run,
+        trace_id=_TRACE,
+        checkpoint_id=h.checkpoint_ids[0],
+        now=datetime.now(UTC),
+    )
+
+    assert await MemoryWritebackWorker(store=jobs, processor=h.processor).run_once() is True
+
+    job = await jobs.get_by_run(tenant_id=h.tenant, run_id=h.run)
+    assert job is not None and job.id == job_id
+    assert job.status == "pending"
+    assert job.last_error is not None and "checkpoint" in job.last_error

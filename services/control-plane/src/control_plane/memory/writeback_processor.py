@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from collections.abc import Awaitable, Callable, Iterator, Sequence
@@ -42,7 +43,7 @@ from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
 from control_plane.memory.writeback_worker import WritebackOutcome
 from control_plane.runtime import make_provider_key_resolver
-from control_plane.transcript import read_messages
+from control_plane.transcript import read_checkpoint_messages, read_messages
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.memory import MemoryWritebackJob
 from expert_work.persistence.token_usage_store import (
@@ -67,6 +68,10 @@ if TYPE_CHECKING:
     from orchestrator.tools.registry import ToolSpec
 
 logger = logging.getLogger("expert_work.control_plane.memory.writeback_processor")
+
+#: 读不到任务指着的检查点时最多读几次、每次间隔多久(见 ``_read_turn_end``)。
+_CHECKPOINT_READ_ATTEMPTS = 3
+_CHECKPOINT_READ_DELAY_S = 0.2
 
 #: ``(effective spec, memory model, tenant) → LLM caller`` —— 生产版建一条与 run 内同口径
 #: 的路由(:func:`make_router_caller_factory`),测试注入假 caller。
@@ -170,11 +175,7 @@ class MemoryWritebackProcessor:
             # 表上有 CHECK、enqueue 也拒;这里再挡一道:绝不去读整个会话。
             msg = "a memory writeback job needs a checkpoint_id or message_count"
             raise ValueError(msg)
-        messages = await read_messages(
-            self._checkpointer, job.thread_id, checkpoint_id=job.checkpoint_id
-        )
-        if job.checkpoint_id is None and job.message_count is not None:
-            messages = messages[: job.message_count]
+        messages = await self._read_turn_end(job)
         if not messages:
             return WritebackOutcome(written_count=0, failed=False, note="no messages to read")
 
@@ -232,6 +233,33 @@ class MemoryWritebackProcessor:
                 raise RuntimeError(msg) from recheck_error[0]
             return WritebackOutcome(written_count=0, failed=False, discarded=True)
         return WritebackOutcome(written_count=outcome.written, failed=outcome.failed)
+
+    async def _read_turn_end(self, job: MemoryWritebackJob) -> list[Any]:
+        """本轮结束时的对话。
+
+        有 ``checkpoint_id``:LangGraph 异步保存检查点,写回节点落任务时那个检查点可能还在
+        保存的路上,worker 又可能立刻被唤醒 —— 读不到(或读到空的)就隔
+        ``_CHECKPOINT_READ_DELAY_S`` 再读,共 ``_CHECKPOINT_READ_ATTEMPTS`` 次。仍然没有这个
+        检查点就抛 :class:`LookupError`,worker 记一次失败、任务退回 ``pending``;检查点在
+        但确实没有消息,才回空(收成「没什么可记」)。没有 id 时读会话最新、截前
+        ``message_count`` 条(B-126 跨轮清理可能改写早期消息,见模块说明)。
+        """
+        if job.checkpoint_id is None:
+            latest = await read_messages(self._checkpointer, job.thread_id)
+            return latest[: job.message_count]
+        found: list[Any] | None = None
+        for attempt in range(_CHECKPOINT_READ_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_CHECKPOINT_READ_DELAY_S)
+            found = await read_checkpoint_messages(
+                self._checkpointer, job.thread_id, checkpoint_id=job.checkpoint_id
+            )
+            if found:
+                return found
+        if found is None:
+            msg = f"checkpoint {job.checkpoint_id} of thread {job.thread_id} is not visible yet"
+            raise LookupError(msg)
+        return found
 
 
 def make_router_caller_factory(

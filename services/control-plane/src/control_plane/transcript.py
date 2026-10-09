@@ -140,13 +140,26 @@ async def read_messages(
     与 :func:`read_turns` 一样,checkpointer 出错时直接抛,由调用方选择怎么
     降级。
     """
+    found = await read_checkpoint_messages(checkpointer, thread_id, checkpoint_id=checkpoint_id)
+    return found if found is not None else []
+
+
+async def read_checkpoint_messages(
+    checkpointer: BaseCheckpointSaver[Any],
+    thread_id: UUID,
+    *,
+    checkpoint_id: str | None = None,
+) -> list[Any] | None:
+    """同 :func:`read_messages`,但分得清「没有这个检查点」(``None``)与「检查点在、
+    ``messages`` 是空的」(``[]``)。B-168 后台写回要分:LangGraph 异步保存检查点,任务
+    指着的那个检查点可能还没落,不能当成「没什么可记」。"""
     configurable: dict[str, Any] = {"thread_id": str(thread_id), "checkpoint_ns": ""}
     if checkpoint_id is not None:
         configurable["checkpoint_id"] = checkpoint_id
     config: RunnableConfig = {"configurable": configurable}
     tup = await checkpointer.aget_tuple(config)
     if tup is None:
-        return []
+        return None
     raw = (tup.checkpoint.get("channel_values") or {}).get("messages", [])
     return list(raw) if raw else []
 
