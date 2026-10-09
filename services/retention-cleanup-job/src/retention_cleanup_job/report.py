@@ -43,6 +43,8 @@ class CleanupReport:
     tenant_users_hard_deleted: int = 0
     # 波 1 PR-E —— 沙箱出网审计的保留期清理。
     sandbox_egress_audit_deleted: int = 0
+    # B-168 —— 收尾满保留期的记忆后台写回任务行。
+    memory_writeback_jobs_deleted: int = 0
     duration_seconds: float = 0.0
     # Per-tenant breakdown of audit deletes (for observability).
     audit_deleted_by_tenant: dict[str, int] = field(default_factory=dict)

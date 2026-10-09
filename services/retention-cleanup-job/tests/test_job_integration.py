@@ -508,6 +508,77 @@ async def test_sandbox_egress_audit_retention_deletes_old_rows(
 
 
 @pytest.mark.asyncio
+async def test_memory_writeback_job_retention_deletes_old_finished_rows_only(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-168 —— 收尾满 30 天的 ``done`` / ``failed`` 任务行清掉;``pending`` / ``running``
+    不管多老都留着(还没写完的记忆),30 天内收尾的也留着(控制台还要看)。
+
+    表在 session 级容器里与 B-168 store 用例共用,所以只数本用例自造租户的行。"""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant = uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                insert = text(
+                    "INSERT INTO memory_writeback_job "
+                    "(tenant_id, user_id, agent_name, agent_version, thread_id, message_count, "
+                    " run_id, status, created_at, finished_at) "
+                    "VALUES (:t, :u, 'mem-agent', '1.0.0', :th, 2, :r, :status, "
+                    " now() - make_interval(days => :age), "
+                    " CASE WHEN :status IN ('done', 'failed') "
+                    "      THEN now() - make_interval(days => :age) END)"
+                )
+                for status, age in (
+                    ("done", 40),  # gone
+                    ("failed", 40),  # gone
+                    ("done", 5),  # recent: kept
+                    ("failed", 5),  # recent: kept
+                    ("pending", 40),  # unfinished: kept
+                    ("running", 40),  # unfinished: kept
+                ):
+                    conn.execute(
+                        insert,
+                        {
+                            "t": str(tenant),
+                            "u": str(uuid4()),
+                            "th": str(uuid4()),
+                            "r": str(uuid4()),
+                            "status": status,
+                            "age": age,
+                        },
+                    )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=create_async_session_factory(worker_engine),
+            batch_size=10000,
+            memory_writeback_job_retention_days=30,
+        )
+        report = await job.run_once()
+
+        async with worker_engine.begin() as conn:
+            remaining = sorted(
+                (row[0], int(row[1]))
+                for row in (
+                    await conn.execute(
+                        text(
+                            "SELECT status, extract(day FROM now() - created_at) "
+                            "FROM memory_writeback_job WHERE tenant_id = :t"
+                        ),
+                        {"t": str(tenant)},
+                    )
+                ).all()
+            )
+        assert remaining == [("done", 5), ("failed", 5), ("pending", 40), ("running", 40)]
+        assert report.memory_writeback_jobs_deleted >= 2
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_run_once_idempotent_on_empty_state(
     db_fixture: tuple[AsyncEngine, AsyncEngine, str],
 ) -> None:

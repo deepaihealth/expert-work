@@ -196,6 +196,7 @@ async def _amain() -> None:
             tenant_user_store=tenant_user_store,
             tenant_user_hard_delete_grace_days=settings.tenant_user_hard_delete_grace_days,
             sandbox_egress_audit_retention_days=settings.sandbox_egress_audit_retention_days,
+            memory_writeback_job_retention_days=settings.memory_writeback_job_retention_days,
             user_upload_store=user_upload_store,
             upload_retention_days=settings.upload_retention_days,
             thread_store=thread_store,
@@ -213,7 +214,7 @@ async def _amain() -> None:
             "uploads_expired=%d upload_files_removed=%d thread_dirs_removed=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
-            "sandbox_egress_audit=%d duration=%.2fs",
+            "sandbox_egress_audit=%d memory_writeback_jobs=%d duration=%.2fs",
             report.audit_deleted,
             report.audit_skipped_unacked,
             report.event_deleted,
@@ -234,6 +235,7 @@ async def _amain() -> None:
             report.workspaces_pending_archive,
             report.tenant_users_hard_deleted,
             report.sandbox_egress_audit_deleted,
+            report.memory_writeback_jobs_deleted,
             report.duration_seconds,
         )
         if report.audit_skipped_unacked > 0:

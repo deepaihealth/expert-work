@@ -44,6 +44,7 @@ def test_cleanup_report_default_is_all_zero() -> None:
     assert report.thread_dirs_removed == 0
     assert report.tenant_users_hard_deleted == 0
     assert report.sandbox_egress_audit_deleted == 0
+    assert report.memory_writeback_jobs_deleted == 0
     assert report.duration_seconds == 0.0
     assert report.audit_deleted_by_tenant == {}
 
@@ -54,6 +55,18 @@ def test_job_rejects_non_positive_batch_size() -> None:
         RetentionCleanupJob(
             db_session_factory=lambda: None,  # type: ignore[arg-type]
             batch_size=0,
+        )
+
+
+def _no_session() -> None:
+    """Placeholder session factory — the constructor validates before using it."""
+
+
+def test_job_rejects_non_positive_memory_writeback_job_retention_days() -> None:
+    with pytest.raises(ValueError, match="memory_writeback_job_retention_days"):
+        RetentionCleanupJob(
+            db_session_factory=_no_session,  # type: ignore[arg-type]
+            memory_writeback_job_retention_days=0,
         )
 
 

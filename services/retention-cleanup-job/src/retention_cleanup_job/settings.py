@@ -75,6 +75,12 @@ class RetentionCleanupSettings(BaseSettings):
     # ``backup_acked`` 之类的前置闸。
     sandbox_egress_audit_retention_days: int = Field(default=90, ge=1, le=3650)
 
+    # --------------------------------------------------- 记忆后台写回任务(B-168)
+    # ``memory_writeback_job`` 每轮一行(只存指针)。收尾(``done`` / ``failed``)满这个
+    # 天数就删;``pending`` / ``running`` 不按时间删(还没写完的记忆)。30 天内控制台
+    # 的 run 详情还看得到「后台记忆写回」那一行。
+    memory_writeback_job_retention_days: int = Field(default=30, ge=1, le=3650)
+
     # --------------------------------------------------- 留存链 PR2(波 3 线 R)
     # 用户拍板(2026-09-09):产物 90 天、上传 90 天、已删工作区库行 90 天销账。
     # 产物版本复用上面的 ``artifact_retention_days``,已删工作区复用
