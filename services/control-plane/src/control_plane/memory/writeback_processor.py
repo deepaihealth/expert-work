@@ -7,12 +7,14 @@
    取法展开)。配置已删、或已没有开 ``memory.long_term.write_back``,就不做,回一个带
    原因的结果(worker 收成 ``done``)。
 2. 读检查点:有 ``checkpoint_id`` 读那一个(本轮结束时);没有就读会话最新的,再按
-   ``message_count`` 截前 N 条(退路,B-126 跨轮清理改写早期消息时可能对不上)。
+   ``message_count`` 截前 N 条(退路,B-126 跨轮清理改写早期消息时可能对不上)。两个
+   指针都没有就报错,绝不读整个会话。
 3. 记忆模型与 run 内同一个取法(:func:`orchestrator.agent_factory.memory_model`),路由由
    注入的 caller 工厂建(生产见 :func:`make_router_caller_factory`)。
 4. 调 :func:`~orchestrator.graph_builder.memory.flush_messages_with_outcome`,参数取自配置,
-   与 run 内写回节点一致;写记忆之前经 ``before_store`` 问一次任务行还在不在(§3.6),
-   不在就整批放弃,回 ``discarded``。
+   与 run 内写回节点一致;**每一次**改记忆库之前经 ``before_store`` 问一次这条任务是否
+   仍在本次领取手上(``still_held``,§3.6):被清除 / 被别的副本重新领走就整批放弃,回
+   ``discarded``;查询本身出错也不写(fail closed),抛给 worker 记一次失败、重试。
 
 **记账**(§8 问题 3 拍板 (b)):后台记忆调用不归 run,按平台开销记 ——
 ``usage_kind = platform_overhead``,同重排序。run 内的记账靠 LangGraph 节点的 config
@@ -50,7 +52,7 @@ from expert_work.persistence.token_usage_store import (
 from expert_work.protocol import AgentSpec, ModelSpec
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator import MemoryEnv, MiddlewareEnv, build_llm_router, build_middleware_chains
-from orchestrator.agent_factory import memory_model
+from orchestrator.agent_factory import memory_model, step_stream_timeouts
 from orchestrator.graph_builder.memory import flush_messages_with_outcome
 from orchestrator.llm import LLMCaller
 from orchestrator.usage_metering import UsageIdentity, UsageMeter, chain_models, with_served_by
@@ -147,7 +149,7 @@ class MemoryWritebackProcessor:
         self._resolve_spec = resolve_spec
 
     async def __call__(
-        self, job: MemoryWritebackJob, *, still_queued: Callable[[], Awaitable[bool]]
+        self, job: MemoryWritebackJob, *, still_held: Callable[[], Awaitable[bool]]
     ) -> WritebackOutcome:
         record = await self._agents.get(
             tenant_id=job.tenant_id, name=job.agent_name, version=job.agent_version
@@ -164,6 +166,10 @@ class MemoryWritebackProcessor:
             msg = "memory store / embedder not wired"
             raise RuntimeError(msg)
 
+        if job.checkpoint_id is None and job.message_count is None:
+            # 表上有 CHECK、enqueue 也拒;这里再挡一道:绝不去读整个会话。
+            msg = "a memory writeback job needs a checkpoint_id or message_count"
+            raise ValueError(msg)
         messages = await read_messages(
             self._checkpointer, job.thread_id, checkpoint_id=job.checkpoint_id
         )
@@ -186,15 +192,20 @@ class MemoryWritebackProcessor:
             user_id=job.user_id,
         )
 
+        recheck_error: list[BaseException] = []
+
         async def before_store() -> None:
+            # 每次改记忆库之前调用。只许抛 RunCancelledError:别的异常会被
+            # flush 的 ``except Exception`` 接住、把这批送进 DLQ。
             try:
-                queued = await still_queued()
-            except Exception:
-                # 查不到就照常写:与今天「run 正在跑时被清除」同一类小窗口(§3.6)。
-                logger.warning("memory.writeback_background.recheck_failed", exc_info=True)
-                return
-            if not queued:
-                raise RunCancelledError("memory writeback job was purged")
+                held = await still_held()
+            except Exception as exc:
+                # 查不到 = 不写(fail closed);下面转成一次失败,任务退回 pending 重试。
+                recheck_error.append(exc)
+                raise RunCancelledError("memory writeback job recheck failed") from exc
+            if not held:
+                # 被清除、已收尾,或租约过期后被别的副本重新领走 —— 都不该再写。
+                raise RunCancelledError("memory writeback job is no longer held")
 
         try:
             with _under_run_trace(job.trace_id):
@@ -216,6 +227,9 @@ class MemoryWritebackProcessor:
                     before_store=before_store,
                 )
         except RunCancelledError:
+            if recheck_error:
+                msg = "memory writeback job recheck failed"
+                raise RuntimeError(msg) from recheck_error[0]
             return WritebackOutcome(written_count=0, failed=False, discarded=True)
         return WritebackOutcome(written_count=outcome.written, failed=outcome.failed)
 
@@ -232,15 +246,22 @@ def make_router_caller_factory(
 
     凭据只从平台解析(``ignore_api_key_ref=True``,同 Agent 构建);``around_llm_call``
     链(错误处理 / Langfuse)按该 Agent 的配置建,外面套「实际应答的模型」盖章层,记账
-    记在备用链上真正应答的那个模型名下。单次执行的上限由 worker 的租约兜住。
+    记在备用链上真正应答的那个模型名下。首 token / 空闲超时与 run 内步骤路由相同
+    (:func:`~orchestrator.agent_factory.step_stream_timeouts`)。
     """
 
     async def factory(spec: AgentSpec, model: ModelSpec, tenant_id: UUID) -> LLMCaller:
         chains = build_middleware_chains(spec, env=middleware_env)
+        first_token, idle = step_stream_timeouts(spec)
         return await build_llm_router(
             model,
             secret_store=secret_store,
             around_llm_chain=with_served_by(chains.around_llm_call),
+            # 与 run 内的步骤路由同一套首 token / 空闲超时(provider 的 httpx 超时也对齐
+            # 首 token 预算,同 ``build_step_routers``)。
+            first_token_timeout_s=first_token,
+            idle_timeout_s=idle,
+            provider_timeout_s=first_token,
             provider_key_resolver=(
                 make_provider_key_resolver(resolver=credentials_resolver, tenant_id=tenant_id)
                 if credentials_resolver is not None

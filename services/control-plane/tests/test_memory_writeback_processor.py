@@ -173,7 +173,7 @@ async def test_writes_memories_from_the_checkpoint_the_job_points_at() -> None:
     await h.checkpoint(_TURN_1)
     await h.checkpoint(_TURN_1 + _TURN_2)  # the next turn already ran
 
-    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_queued=_yes)
+    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
 
     assert (outcome.written_count, outcome.failed, outcome.discarded) == (1, False, False)
     text = h.prompt_text()
@@ -194,7 +194,7 @@ async def test_message_count_truncates_when_there_is_no_checkpoint_id() -> None:
     await h.add_agent(_spec())
     await h.checkpoint(_TURN_1 + _TURN_2)
 
-    await h.processor(h.job(checkpoint_id=None, message_count=2), still_queued=_yes)
+    await h.processor(h.job(checkpoint_id=None, message_count=2), still_held=_yes)
 
     text = h.prompt_text()
     assert "green tea" in text and "coffee" not in text
@@ -209,7 +209,7 @@ async def test_usage_is_platform_overhead_even_outside_a_run() -> None:
     await h.add_agent(_spec())
     await h.checkpoint(_TURN_1)
 
-    await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_queued=_yes)
+    await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
 
     [row] = h.usage._rows
     assert row.tenant_id == h.tenant
@@ -234,7 +234,7 @@ async def test_a_purged_job_discards_before_writing() -> None:
     await h.add_agent(_spec())
     await h.checkpoint(_TURN_1)
 
-    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_queued=_no)
+    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_no)
 
     assert outcome.discarded is True
     assert await h.memory.list_for_user(tenant_id=h.tenant, user_id=h.user) == []
@@ -246,7 +246,7 @@ async def test_a_gone_agent_is_done_without_calling_the_model() -> None:
     h = _Harness()
     await h.checkpoint(_TURN_1)
 
-    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_queued=_yes)
+    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
 
     assert (outcome.written_count, outcome.failed, outcome.discarded) == (0, False, False)
     assert outcome.note is not None and "agent" in outcome.note
@@ -259,7 +259,7 @@ async def test_memory_turned_off_is_done_without_calling_the_model() -> None:
     await h.add_agent(_spec(long_term={"retrieve_top_k": 5, "write_back": False}))
     await h.checkpoint(_TURN_1)
 
-    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_queued=_yes)
+    outcome = await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_yes)
 
     assert outcome.written_count == 0 and outcome.note is not None
     assert h.caller.prompts == []
@@ -305,3 +305,70 @@ async def test_router_caller_factory_builds_the_memory_chain_from_platform_crede
     # The served-by stamp wraps the chain, so usage lands on the model that answered.
     assert router.around_llm_chain is not None
     assert router.around_llm_chain.ordered_names == ("served_by",)
+
+
+async def _recheck_breaks() -> bool:
+    raise ConnectionError("db down")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recheck_fails_closed_and_retries() -> None:
+    """查不到任务行是不是还在手上 = 不写(fail closed),也不进 DLQ;抛给 worker 记一次失败,
+    任务退回 pending 重试 —— 不是「被清除」,不能当 discarded 吞掉。"""
+    h = _Harness()
+    await h.add_agent(_spec())
+    await h.checkpoint(_TURN_1)
+
+    with pytest.raises(RuntimeError, match="recheck"):
+        await h.processor(h.job(checkpoint_id=h.checkpoint_ids[0]), still_held=_recheck_breaks)
+
+    assert await h.memory.list_for_user(tenant_id=h.tenant, user_id=h.user) == []
+    assert await h.dlq.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_job_without_a_pointer_never_reads_the_whole_thread() -> None:
+    h = _Harness()
+    await h.add_agent(_spec())
+    await h.checkpoint(_TURN_1 + _TURN_2)
+
+    with pytest.raises(ValueError, match="checkpoint_id or message_count"):
+        await h.processor(h.job(checkpoint_id=None, message_count=None), still_held=_yes)
+
+    assert h.caller.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_router_caller_factory_uses_the_runs_stream_timeouts() -> None:
+    """后台记忆路由与 run 内同一套首 token / 空闲超时 —— 厂商卡住时不会占着 worker 到租约。"""
+    from control_plane.memory.writeback_processor import make_router_caller_factory
+    from expert_work.runtime.secret_store import LocalDevSecretStore
+    from orchestrator import build_step_routers
+    from orchestrator.llm import LLMRouter
+
+    secrets = LocalDevSecretStore.from_mapping({"glm-key": "sk-test"})
+    resolver = _StubResolver()
+    doc = deepcopy(_SPEC)
+    doc["spec"]["stream_deadline_s"] = 240
+    doc["spec"]["idle_timeout_s"] = 30
+    spec = AgentSpec.model_validate(doc)
+    tenant = uuid4()
+    factory = make_router_caller_factory(
+        secret_store=secrets,
+        credentials_resolver=resolver,  # type: ignore[arg-type]
+        middleware_env=None,
+        http_client=None,
+        rate_limiter_factory=None,
+    )
+
+    background = await factory(spec, memory_model(spec), tenant)
+
+    async def keys(provider: str) -> list[str]:
+        return ["secret://glm-key"]
+
+    in_run = (
+        await build_step_routers(spec, secret_store=secrets, provider_key_resolver=keys)
+    ).memory
+    assert isinstance(background, LLMRouter) and isinstance(in_run, LLMRouter)
+    assert background.first_token_timeout_s == in_run.first_token_timeout_s == 240.0
+    assert background.idle_timeout_s == in_run.idle_timeout_s == 30.0

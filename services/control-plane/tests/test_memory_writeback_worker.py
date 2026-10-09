@@ -20,7 +20,7 @@ from expert_work.persistence.memory import (
 )
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var, current_user_id_var
 
-StillQueued = Callable[[], Awaitable[bool]]
+StillHeld = Callable[[], Awaitable[bool]]
 
 
 async def _enqueue(store: InMemoryMemoryWritebackJobStore, *, user_id: UUID | None = None) -> UUID:
@@ -32,6 +32,7 @@ async def _enqueue(store: InMemoryMemoryWritebackJobStore, *, user_id: UUID | No
         thread_id=uuid4(),
         run_id=uuid4(),
         trace_id=None,
+        checkpoint_id="ckpt",
         now=datetime.now(UTC),
     )
 
@@ -57,9 +58,7 @@ class _Recorder:
         self.seen: list[MemoryWritebackJob] = []
         self.scope: list[tuple[object, object, bool]] = []
 
-    async def __call__(
-        self, job: MemoryWritebackJob, *, still_queued: StillQueued
-    ) -> WritebackOutcome:
+    async def __call__(self, job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
         self.seen.append(job)
         self.scope.append(
             (current_tenant_id_var.get(), current_user_id_var.get(), bypass_rls_var.get())
@@ -94,7 +93,7 @@ async def test_raising_processor_retries_then_fails() -> None:
     store = InMemoryMemoryWritebackJobStore()
     await _enqueue(store)
 
-    async def boom(job: MemoryWritebackJob, *, still_queued: StillQueued) -> WritebackOutcome:
+    async def boom(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
         raise RuntimeError("provider down")
 
     worker = MemoryWritebackWorker(store=store, processor=boom, max_attempts=2)
@@ -131,7 +130,7 @@ async def test_the_lease_is_renewed_while_processing() -> None:
     await _enqueue(store)
     leases: list[datetime | None] = []
 
-    async def slow(job: MemoryWritebackJob, *, still_queued: StillQueued) -> WritebackOutcome:
+    async def slow(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
         leases.append(_only(store).lease_until)
         await asyncio.sleep(0.2)
         leases.append(_only(store).lease_until)
@@ -148,18 +147,16 @@ async def test_the_lease_is_renewed_while_processing() -> None:
 
 @pytest.mark.asyncio
 async def test_a_purged_job_is_discarded_not_finished() -> None:
-    """(d) —— 执行中被清除:处理器问 ``still_queued`` 得到 False、放弃写入;worker 不把行
+    """(d) —— 执行中被清除:处理器问 ``still_held`` 得到 False、放弃写入;worker 不把行
     写回来,也不算失败重试。"""
     store = InMemoryMemoryWritebackJobStore()
     await _enqueue(store)
     answers: list[bool] = []
 
-    async def purged_mid_way(
-        job: MemoryWritebackJob, *, still_queued: StillQueued
-    ) -> WritebackOutcome:
-        answers.append(await still_queued())
+    async def purged_mid_way(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
+        answers.append(await still_held())
         await store.delete_all_for_user(tenant_id=job.tenant_id, user_id=job.user_id)
-        answers.append(await still_queued())
+        answers.append(await still_held())
         return WritebackOutcome(written_count=0, failed=False, discarded=True)
 
     worker = MemoryWritebackWorker(store=store, processor=purged_mid_way)
@@ -197,7 +194,7 @@ async def test_stop_abandons_an_unfinished_job_to_lease_expiry() -> None:
     await _enqueue(store)
     started = asyncio.Event()
 
-    async def hangs(job: MemoryWritebackJob, *, still_queued: StillQueued) -> WritebackOutcome:
+    async def hangs(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
         started.set()
         await asyncio.sleep(60)
         return WritebackOutcome(written_count=0, failed=False)
@@ -221,7 +218,7 @@ async def test_stop_waits_for_the_in_flight_job_to_finish() -> None:
     await _enqueue(store)
     started = asyncio.Event()
 
-    async def quick(job: MemoryWritebackJob, *, still_queued: StillQueued) -> WritebackOutcome:
+    async def quick(job: MemoryWritebackJob, *, still_held: StillHeld) -> WritebackOutcome:
         started.set()
         await asyncio.sleep(0.1)
         return WritebackOutcome(written_count=1, failed=False)

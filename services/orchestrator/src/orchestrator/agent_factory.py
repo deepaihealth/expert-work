@@ -214,6 +214,18 @@ def _chat_idle_timeout_s(manifest_idle_s: int) -> float | None:
     return float(manifest_idle_s) if manifest_idle_s > 0 else None
 
 
+def step_stream_timeouts(spec: AgentSpec) -> tuple[float | None, float | None]:
+    """``(first_token_timeout_s, idle_timeout_s)`` every step router of ``spec`` uses.
+
+    :func:`build_step_routers` and the control plane's background memory router
+    (B-168) take them from here, so a hung provider trips the same caps either way.
+    """
+    return (
+        _chat_stream_deadline_s(spec.spec.stream_deadline_s),
+        _chat_idle_timeout_s(spec.spec.idle_timeout_s),
+    )
+
+
 #: Default provider-client httpx wall-clock timeout (matches the per-vendor
 #: factory defaults). Used when no explicit ``timeout_s`` is threaded in.
 _PROVIDER_HTTP_TIMEOUT_DEFAULT_S = 60.0
@@ -2597,8 +2609,7 @@ async def build_step_routers(
     ``http_client`` (一期 Task 5) forwards the process-level shared ``httpx``
     client into every step's router.
     """
-    first_token: float | None = _chat_stream_deadline_s(spec.spec.stream_deadline_s)
-    idle: float | None = _chat_idle_timeout_s(spec.spec.idle_timeout_s)
+    first_token, idle = step_stream_timeouts(spec)
     default = await build_llm_router(
         spec.spec.model,
         secret_store=secret_store,

@@ -12,7 +12,7 @@
 * 处理交给注入的处理器(生产是 :class:`~control_plane.memory.writeback_processor.
   MemoryWritebackProcessor`),在任务自己的租户 + 用户作用域里跑;处理中每
   ``renew_every_s`` 续一次租约。单条执行上限 = 租约时长,超时算一次失败。
-* **清除**(设计稿 §3.6):处理器拿到 ``still_queued``,在写记忆之前问一次任务行还在不在,
+* **清除**(设计稿 §3.6):处理器拿到 ``still_held``,在写记忆之前问一次任务行还在不在,
   不在就放弃写入、回 ``discarded``。收尾的 ``finish`` 本身带持有凭证(``attempts``)+
   ``status = 'running'`` 条件:行被清除或被别的副本重新领走时它不生效,不会把行写回来,
   所以 worker 不在 ``finish`` 前另查一次。
@@ -92,10 +92,10 @@ class WritebackOutcome:
 
 
 class WritebackProcessor(Protocol):
-    """处理一条任务;``still_queued()`` 在写记忆之前调用,``False`` 就放弃写入。"""
+    """处理一条任务;``still_held()`` 在写记忆之前调用,``False`` 就放弃写入。"""
 
     def __call__(
-        self, job: MemoryWritebackJob, *, still_queued: Callable[[], Awaitable[bool]]
+        self, job: MemoryWritebackJob, *, still_held: Callable[[], Awaitable[bool]]
     ) -> Awaitable[WritebackOutcome]: ...
 
 
@@ -232,14 +232,14 @@ class MemoryWritebackWorker:
         return True
 
     async def _process(self, job: MemoryWritebackJob, *, queued_ms: int) -> None:
-        async def still_queued() -> bool:
-            return await self._store.exists(job_id=job.id)
+        async def still_held() -> bool:
+            return await self._store.still_held(job_id=job.id, attempt=job.attempts)
 
         started = time.monotonic()
         renewer = asyncio.create_task(self._renew(job), name="memory-writeback-renew")
         try:
             outcome = await asyncio.wait_for(
-                self._processor(job, still_queued=still_queued), timeout=self._lease_s
+                self._processor(job, still_held=still_held), timeout=self._lease_s
             )
         except Exception as exc:
             exec_ms = int((time.monotonic() - started) * 1000)
