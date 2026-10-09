@@ -21,6 +21,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY packages/ packages/
 COPY services/ services/
+# 与 services/control-plane/Dockerfile 同一处修法(2026-08-25):uv 默认并发 50 个下载、
+# 30 秒超时,从这个网络出去会集体超时。这里一直没跟上,2026-10-09 发测试时
+# credential-proxy 构建在这一行报 `operation timed out`(markupsafe),control-plane 同批成功。
+ENV UV_CONCURRENT_DOWNLOADS=8 \
+    UV_HTTP_TIMEOUT=120
 RUN uv sync --frozen --no-dev --no-editable --package expert-work-credential-proxy
 
 
