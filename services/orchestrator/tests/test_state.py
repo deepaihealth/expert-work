@@ -21,8 +21,8 @@ def test_required_keys_present() -> None:
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
     ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``,
     B-64 ``viewed_figures`` / ``figure_documents``,
-    B-126 ``context_summary``
-    (last twenty-five ``NotRequired``)。
+    B-126 ``context_summary``, B-168 ``written_memory_count`` / ``memory_writeback_failed``
+    (last twenty-seven ``NotRequired``)。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -36,6 +36,8 @@ def test_required_keys_present() -> None:
         "plan",
         "reflections",
         "recalled_memories",
+        "written_memory_count",
+        "memory_writeback_failed",
         "step_count_refund_pending",
         "escalate_next",
         "no_progress_streak",

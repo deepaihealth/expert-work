@@ -910,6 +910,11 @@ const zhCN: TranslationKeys = {
     write_back_brief: "自动记住新信息",
     write_back_impact:
       "开启后，每次对话结束会把新了解到的信息记下来，下次自动想起。\n关掉则只用已有记忆，不再新增。\n示例：开启",
+    model_label: "记忆使用的模型",
+    model_brief: "记住、整理、核对记忆时用的模型",
+    model_impact:
+      "用于抽取要记住的信息、去重合并，以及调取前的核对和改写。\n不选 = 平台默认：同一家的便宜型号，并关闭思考。\n这些都是短任务，开思考会慢好几倍、贵好几倍。",
+    model_clear: "改回平台默认",
     verify_reads_label: "回答前核对记忆",
     verify_reads_brief: "回答前核对记忆，更准更慢",
     verify_reads_impact:

@@ -275,6 +275,13 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
         push({ kind: "memory_writeback", receivedAt: at, node, tone: "normal",
           summary: i18n.t("console_runtime.memory_writeback", { n: ch.written_memories.length }),
           detail: { memories: ch.written_memories }, durationMs: durationOf(ch) });
+      } else if (typeof ch.written_memory_count === "number") {
+        // B-168 —— 后端写回帧只带条数(不带正文);写 0 条也画,才看得到它花了多久。
+        // 出错 / 被拦截没写成的标警示,别和「这轮没什么可记」看起来一样。
+        const failed = ch.memory_writeback_failed === true;
+        push({ kind: "memory_writeback", receivedAt: at, node, tone: failed ? "warn" : "normal",
+          summary: i18n.t("console_runtime.memory_writeback", { n: ch.written_memory_count }),
+          detail: { count: ch.written_memory_count, failed }, durationMs: durationOf(ch) });
       }
     }
   }

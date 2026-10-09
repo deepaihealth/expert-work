@@ -214,7 +214,8 @@ export function RowDetailPayload({ row, match, events }: RowDetailPayloadProps) 
         );
       break;
     case "memory":
-      body = <JsonBlock value={row.detail.memories ?? []} />;
+      // B-168 —— 后端写回帧只带条数,没有正文时展示条数 / 失败标记,别显示成空数组。
+      body = <JsonBlock value={row.detail.memories ?? row.detail} />;
       break;
     case "reflect":
     case "assistant":

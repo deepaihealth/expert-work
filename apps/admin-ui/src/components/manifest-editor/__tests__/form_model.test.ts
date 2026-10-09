@@ -16,6 +16,8 @@ import {
   readPromptJinja,
   readPromptVariables,
   readInjectCurrentDate,
+  readMemoryModel,
+  readMemoryModelOn,
   readReflectionEvaluator,
   readReflectionEvaluatorOn,
   readSystemPrompt,
@@ -39,6 +41,8 @@ import {
   setWorkerModel,
   readWorkerBudget,
   setWorkerBudgetField,
+  seedMemoryModelPick,
+  setMemoryModel,
   setReflectionEvaluator,
   setSkills,
   setSubagents,
@@ -650,6 +654,52 @@ describe("form_model preserve chain + immutability", () => {
   it("does not mutate the input manifest", () => {
     setName(seed, "mutated");
     expect(seed.metadata.name).toBe("my-agent");
+  });
+});
+
+describe("memory model (routing when=memory projection, B-168)", () => {
+  it("reads undefined when no rule (platform default applies)", () => {
+    expect(readMemoryModel(seed)).toBeUndefined();
+    expect(readMemoryModelOn(seed)).toBe(false);
+  });
+
+  it("writes a when=memory rule next to an existing reflection rule, and clearing removes only it", () => {
+    const withReflection = setReflectionEvaluator(seed, { provider: "openai", name: "gpt-4o-mini" });
+    const both = setMemoryModel(withReflection, { provider: "glm", name: "glm-5.3-flash" });
+    expect(both.spec?.routing?.rules).toEqual([
+      { when: "reflection", model: { provider: "openai", name: "gpt-4o-mini" } },
+      { when: "memory", model: { provider: "glm", name: "glm-5.3-flash" } },
+    ]);
+    expect(readMemoryModel(both)?.name).toBe("glm-5.3-flash");
+    const cleared = setMemoryModel(both, null);
+    expect(readMemoryModel(cleared)).toBeUndefined();
+    expect(readReflectionEvaluator(cleared)?.name).toBe("gpt-4o-mini");
+  });
+
+  it("reads the last when=memory rule, like the backend", () => {
+    const m: AgentManifest = {
+      spec: {
+        routing: {
+          rules: [
+            { when: "memory", model: { provider: "glm", name: "glm-5.3" } },
+            { when: "memory", model: { provider: "glm", name: "glm-5.3-flash" } },
+          ],
+        },
+      },
+    };
+    expect(readMemoryModel(m)?.name).toBe("glm-5.3-flash");
+  });
+
+  it("seedMemoryModelPick turns the vendor-default thinking ON off when the model changes", () => {
+    const next = { provider: "deepseek", name: "deepseek-v4-flash", thinking_enabled: true };
+    expect(seedMemoryModelPick(undefined, next).thinking_enabled).toBe(false);
+    expect(seedMemoryModelPick({ provider: "deepseek", name: "deepseek-v4-pro" }, next).thinking_enabled).toBe(false);
+  });
+
+  it("seedMemoryModelPick keeps thinking ON the user set on the same model", () => {
+    const prev = { provider: "deepseek", name: "deepseek-v4-flash", thinking_enabled: false };
+    const next = { ...prev, thinking_enabled: true };
+    expect(seedMemoryModelPick(prev, next).thinking_enabled).toBe(true);
   });
 });
 

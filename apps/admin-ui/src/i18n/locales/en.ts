@@ -887,6 +887,10 @@ export interface TranslationKeys {
     write_back_label: string;
     write_back_brief: string;
     write_back_impact: string;
+    model_label: string;
+    model_brief: string;
+    model_impact: string;
+    model_clear: string;
     verify_reads_label: string;
     verify_reads_brief: string;
     verify_reads_impact: string;
@@ -4151,6 +4155,11 @@ const en: TranslationKeys = {
     write_back_brief: "Automatically remembers new info from the chat",
     write_back_impact:
       "When on, each conversation ends by saving what it learned, recalled automatically next time.\nOff = only use existing memories, never add.\nExample: on",
+    model_label: "Memory model",
+    model_brief: "Model used to save and check memories",
+    model_impact:
+      "Used for saving memories, de-duplicating them, and checking/rewriting before recall.\nLeave empty = platform default: a cheaper model from the same vendor with thinking off.\nThese are short tasks — thinking makes them several times slower and costlier.",
+    model_clear: "Use the platform default",
     verify_reads_label: "Check memories before answering",
     verify_reads_brief: "Double-checks memories first — slower but more accurate",
     verify_reads_impact:
