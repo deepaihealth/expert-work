@@ -113,6 +113,53 @@ describe("useBackgroundWritebacks", () => {
     expect(result.current.get("r1")).toEqual(RESULT);
   });
 
+  it("a finished turn is scanned once, not again on every live frame", async () => {
+    getRunMock.mockImplementation(async (_thread, runId) => detail(runId));
+    const scans = vi.fn();
+    function counted(events: SseEvent[]): SseEvent[] {
+      const arr = [...events];
+      const some = arr.some.bind(arr);
+      Object.defineProperty(arr, "some", {
+        value: (...args: Parameters<typeof arr.some>) => {
+          scans();
+          return some(...args);
+        },
+      });
+      return arr;
+    }
+    const inline = turn("r2", counted([INLINE]));
+    const queued = turn("r1", counted([QUEUED]));
+    const live = turn("r3", [], "running");
+    const { rerender } = renderHook(
+      ({ ts }: { ts: ConsoleTurn[] }) => useBackgroundWritebacks("th-1", ts),
+      { initialProps: { ts: [queued, inline, live] } },
+    );
+    await flush();
+    const afterFirst = scans.mock.calls.length;
+    expect(afterFirst).toBe(2);
+
+    for (let i = 0; i < 3; i += 1) {
+      rerender({ ts: [queued, inline, { ...live }] }); // a live frame arrived
+      await flush();
+    }
+    expect(scans.mock.calls.length).toBe(afterFirst);
+  });
+
+  it("a history turn whose events are still loading is checked once they arrive", async () => {
+    getRunMock.mockImplementation(async (_thread, runId) => detail(runId));
+    const loading: ConsoleTurn = { ...turn("r1", []), loadState: "loading" };
+    const { result, rerender } = renderHook(
+      ({ ts }: { ts: ConsoleTurn[] }) => useBackgroundWritebacks("th-1", ts),
+      { initialProps: { ts: [loading] } },
+    );
+    await flush();
+    expect(getRunMock).not.toHaveBeenCalled();
+
+    rerender({ ts: [turn("r1", [QUEUED])] }); // replay landed
+    await flush();
+    expect(result.current.get("r1")).toEqual(RESULT);
+  });
+
   it("a failed lookup leaves the row on its queued text", async () => {
     getRunMock.mockRejectedValue(new Error("boom"));
     const { result } = renderHook(() => useBackgroundWritebacks("th-1", [turn("r1", [QUEUED])]));

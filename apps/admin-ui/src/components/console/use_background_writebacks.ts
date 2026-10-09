@@ -31,16 +31,18 @@ export function useBackgroundWritebacks(
 ): ReadonlyMap<string, MemoryWritebackResult> {
   const { apiTenantScope } = useTenantScope();
   const [results, setResults] = useState<ReadonlyMap<string, MemoryWritebackResult>>(EMPTY);
-  /** 已经发过请求的 run(成功与否都不再发)。换会话清空。 */
-  const requested = useRef<Set<string>>(new Set());
+  /** 已经看过的已结束轮(有没有排队的写回都记,发过请求的成功与否都不再发)。live 帧
+   *  每到一帧 `turns` 就换一次引用,不记的话每帧都把所有已结束轮的事件重扫一遍。
+   *  换会话清空。 */
+  const checked = useRef<Set<string>>(new Set());
   /** 当前会话。请求回来时会话已经换了就丢掉 —— 不能靠 effect 的清理来作废:
    *  live 帧每到一帧 `turns` 就换一次引用,清理会把还在路上的请求作废,而
-   *  `requested` 已经记过它,那一行就永远停在「已排队」。 */
+   *  `checked` 已经记过它,那一行就永远停在「已排队」。 */
   const currentThread = useRef(threadId);
 
   useEffect(() => {
     currentThread.current = threadId;
-    requested.current = new Set();
+    checked.current = new Set();
     setResults(EMPTY);
   }, [threadId]);
 
@@ -48,9 +50,11 @@ export function useBackgroundWritebacks(
     if (threadId === null) return;
     for (const t of turns) {
       const runId = t.runId;
-      if (runId === null || requested.current.has(runId)) continue;
-      if (t.turn.status === "running" || !hasQueuedWriteback(t.turn.events)) continue;
-      requested.current.add(runId);
+      if (runId === null || checked.current.has(runId)) continue;
+      // 还在跑 / 历史轮还没回放完:事件不全,下次再看。
+      if (t.turn.status === "running" || t.loadState !== "done") continue;
+      checked.current.add(runId);
+      if (!hasQueuedWriteback(t.turn.events)) continue;
       void getRun(threadId, runId, concreteTenantScope(apiTenantScope))
         .then((detail) => {
           const result = detail.memory_writeback;
