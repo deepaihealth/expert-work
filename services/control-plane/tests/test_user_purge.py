@@ -163,6 +163,7 @@ async def _seed_job(
         thread_id=thread,
         run_id=uuid4(),
         trace_id=None,
+        checkpoint_id="ckpt",
         now=datetime.now(UTC),
     )
 

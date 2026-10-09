@@ -328,4 +328,5 @@ async def test_jobs_run_concurrently_up_to_the_limit() -> None:
         assert len(started) == 3
         assert all(j.status == "done" for j in store._rows.values())
     finally:
+        release.set()
         await worker.stop()

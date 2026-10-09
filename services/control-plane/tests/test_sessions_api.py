@@ -1139,6 +1139,7 @@ async def test_purge_deletes_the_threads_memory_writeback_jobs(
             thread_id=thread_id,
             run_id=uuid4(),
             trace_id=None,
+            checkpoint_id="ckpt",
             now=datetime.now(UTC),
         )
         return job_id
