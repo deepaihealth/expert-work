@@ -314,4 +314,3 @@ describe("buildGanttRows — B-168 background memory writeback", () => {
     expect(m.rows.at(-1)?.kind).toBe("background");
   });
 });
-
