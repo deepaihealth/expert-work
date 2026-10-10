@@ -1574,6 +1574,7 @@ const zhCN: TranslationKeys = {
     reflect_pass: "反思 · 通过",
     reflect_revise: "反思 · 修订",
     gantt_step: "步骤 {{n}}",
+    gantt_background_writeback: "后台记忆写回",
     plan_steps: "{{n}} 步",
     subagent_result: "{{calls}} 次模型调用 · {{ms}}ms",
   },

@@ -179,6 +179,30 @@ describe("TrajectoryTimeline · 投影", () => {
     expect(blockAt(4).hasAttribute("data-ttft")).toBe(false);
   });
 
+  it("B-168: a background memory writeback block is marked data-background with its state; other blocks are not", () => {
+    const bg = (status: "done" | "failed" | "pending" | "running", failed: boolean | null = false) => ({
+      id: "memory:x", kind: "memory", direction: "writeback", seq: 9, step: null, status: "ok",
+      durationMs: null, eventIndexes: [], serverMs: null, detail: { queued: true },
+      background: { status, written_count: null, failed, queued_ms: null, exec_ms: null },
+    }) as unknown as TrajectoryRow;
+    const records = [
+      rec(0, 1, "assistant", 1000, 1400),
+      rec(1, 2, "memory", 1500, 1800, { row: bg("done") }),
+      rec(2, 2, "memory", 1800, 1900, { row: bg("failed") }),
+      rec(3, 2, "memory", 1900, 1950, { row: bg("done", true) }),
+      rec(4, 2, "memory", 1950, 1950, { row: bg("running", null) }),
+      rec(5, 2, "memory", 1950, 1950),
+    ];
+    render(<TrajectoryTimeline {...props({ records })} />);
+
+    expect(blockAt(0).hasAttribute("data-background")).toBe(false);
+    expect(blockAt(1)).toHaveAttribute("data-background", "done");
+    expect(blockAt(2)).toHaveAttribute("data-background", "failed");
+    expect(blockAt(3)).toHaveAttribute("data-background", "failed");
+    expect(blockAt(4)).toHaveAttribute("data-background", "pending");
+    expect(blockAt(5).hasAttribute("data-background")).toBe(false);
+  });
+
   it("运行中的记录标 data-live", () => {
     render(<TrajectoryTimeline {...props()} />);
 

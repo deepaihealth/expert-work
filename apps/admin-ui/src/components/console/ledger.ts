@@ -315,10 +315,8 @@ export function buildLedger(args: {
         placeholder: turn.loadState === "error" ? "error" : "loading",
       });
     } else {
-      let base = withBackgroundWriteback(
-        ledgerRowsOf(turn.turn.events, input),
-        turn.runId === null ? undefined : args.backgroundWritebacks?.get(turn.runId),
-      );
+      const background = turn.runId === null ? undefined : args.backgroundWritebacks?.get(turn.runId);
+      let base = withBackgroundWriteback(ledgerRowsOf(turn.turn.events, input), background);
       // §十.1 —— 与上一条留下来的系统提示词相同就折掉这一轮的 SYSTEM 行(只留
       // 第一次出现与变化的那一轮);不同就更新「上一条」。终审 F4:比较必须
       // 连同派发入参 —— 缺省可选变量与显式空串渲染出同一份文本,但两轮的
@@ -332,7 +330,7 @@ export function buildLedger(args: {
       const live = turn.key === args.streamTurnKey ? liveLedgerRows(turn.turn.events, args.liveByStep) : [];
       const rows = [...base, ...live];
       const liveFrom = base.length;
-      const spans = absoluteSpans(rows, turn.turn.events, createdMs);
+      const spans = absoluteSpans(rows, turn.turn.events, createdMs, background);
       // live 合成行没有自己的时序:从本轮**已知的最晚结束时刻**接着长到「现在」
       // —— 取 max 而不是「行序上的最后一条」,并行工具里后发的那条可能先回结果
       // (行序末尾那条结束得更早),按行序取会让 live 块往回缩。

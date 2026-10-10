@@ -173,6 +173,24 @@
    算错时露出渐变。 */
 .ew-traj-tl__block[data-error="true"][data-ttft="true"] { background: var(--ew-color-danger-500); }
 
+/* B-168 B2 —— 后台记忆写回在 run 结束后才跑:斜纹 + 虚线框,和轮内实心块区分;
+   失败走 danger;还在排队 / 执行的给一截呼吸短条。 */
+.ew-traj-tl__block[data-background] {
+  --traj-bg-color: var(--ew-color-success-500);
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--traj-bg-color) 60%, transparent) 0 3px,
+    transparent 3px 6px
+  );
+  outline: 1px dashed var(--traj-bg-color);
+  outline-offset: -1px;
+}
+.ew-traj-tl__block[data-background="failed"] { --traj-bg-color: var(--ew-color-danger-500); }
+.ew-traj-tl__block[data-background="pending"] {
+  min-width: 12px;
+  animation: ew-traj-tl-pulse 1.4s ease-in-out infinite;
+}
+
 .ew-traj-tl__block[data-selected="false"] { opacity: 0.2; }
 .ew-traj-tl__block[data-search-match="false"] { opacity: 0.14; }
 
@@ -203,7 +221,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ew-traj-tl__block[data-live="true"] { animation: none; }
+  .ew-traj-tl__block[data-live="true"],
+  .ew-traj-tl__block[data-background="pending"] { animation: none; }
 }
 
 /* 选区:定格 12% 底 + 3px 竖条,拖拽中 18% 底 + 2px 竖条;选区外整片压暗 58%。 */

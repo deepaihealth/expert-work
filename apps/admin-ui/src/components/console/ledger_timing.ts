@@ -10,6 +10,7 @@
  * `ledger.ts` 原样再导出,调用方按 `ledger` 引就行。
  */
 import { buildGanttRows } from "../../api/gantt_timeline";
+import type { MemoryWritebackResult } from "../../api/runs";
 import type { SseEvent } from "../../api/sessions";
 import { serverMsOf } from "../../api/sse_id";
 import { resolveGanttKey, type TrajectoryRow } from "../../api/trajectory_rows";
@@ -27,7 +28,11 @@ export interface AbsoluteSpan { start: number; end: number }
  *  一并进键:两轮共用一个空 `events` 时才不会互相串起点。 */
 const SPAN_CACHE = new WeakMap<
   readonly SseEvent[],
-  { fallbackStart: number | null; spans: ReadonlyMap<string, AbsoluteSpan> | null }
+  {
+    fallbackStart: number | null;
+    background: MemoryWritebackResult | undefined;
+    spans: ReadonlyMap<string, AbsoluteSpan> | null;
+  }
 >();
 
 /** 一轮的行 → 绝对起止(服务端 ms)。**返回的 Map 是缓存实例,调用方只读。**
@@ -38,16 +43,22 @@ const SPAN_CACHE = new WeakMap<
  *  - 没有 gantt 命中但有 `serverMs` 的行(标记行:gantt 把它们放进 `markers`
  *    而不是 `rows`)→ 点块 `[serverMs, serverMs]`;
  *  - `user` 行 → 本轮最早起点;一条有时序的行都没有时退到 `fallbackStart`
- *    (它也是 `null` 就不给 user 行落时序)。 */
+ *    (它也是 `null` 就不给 user 行落时序);
+ *  - B-168 B2:给了本轮的后台记忆写回结果(`background`)→ 那条「已排队」写回行的时序
+ *    换成 gantt 补的后台行(run 结束 + 排队起、执行时长止),不再是轮内那一瞬间。
+ *    结果也进缓存键(它不由 events 决定,取回来之后同一份 events 要重算)。 */
 export function absoluteSpans(
   rows: readonly TrajectoryRow[],
   events: readonly SseEvent[],
   fallbackStart: number | null,
+  background?: MemoryWritebackResult,
 ): ReadonlyMap<string, AbsoluteSpan> | null {
   const cached = SPAN_CACHE.get(events);
-  if (cached !== undefined && cached.fallbackStart === fallbackStart) return cached.spans;
-  const spans = computeSpans(rows, events, fallbackStart);
-  SPAN_CACHE.set(events, { fallbackStart, spans });
+  if (cached !== undefined && cached.fallbackStart === fallbackStart && cached.background === background) {
+    return cached.spans;
+  }
+  const spans = computeSpans(rows, events, fallbackStart, background);
+  SPAN_CACHE.set(events, { fallbackStart, background, spans });
   return spans;
 }
 
@@ -55,8 +66,9 @@ function computeSpans(
   rows: readonly TrajectoryRow[],
   events: readonly SseEvent[],
   fallbackStart: number | null,
+  background: MemoryWritebackResult | undefined,
 ): Map<string, AbsoluteSpan> | null {
-  const gantt = buildGanttRows(events);
+  const gantt = buildGanttRows(events, { backgroundWriteback: background });
   if (gantt.degraded) return null;
 
   const spans = new Map<string, AbsoluteSpan>();
@@ -66,9 +78,12 @@ function computeSpans(
     const start = gantt.originMs + g.startMs;
     const span: AbsoluteSpan = { start, end: start + (g.durationMs ?? 0) };
     const prev = spans.get(rowId);
+    // 后台写回行(gantt 里排在最后)整个替换掉同一条写回行的轮内那一瞬间,不取并集。
     spans.set(
       rowId,
-      prev === undefined ? span : { start: Math.min(prev.start, span.start), end: Math.max(prev.end, span.end) },
+      prev === undefined || g.kind === "background"
+        ? span
+        : { start: Math.min(prev.start, span.start), end: Math.max(prev.end, span.end) },
     );
   }
 

@@ -17,6 +17,7 @@
  * finished, so it is placed the same way as an in-progress agent/aux row.
  */
 import i18n from "../i18n";
+import type { MemoryWritebackResult } from "./runs";
 import type { SseEvent } from "./sessions";
 import { parseTimeline, type AuxNodeItem, type MarkerItem, type TimelineItem } from "./timeline";
 import type { WorkerStepSummary, WorkerTimeline } from "./worker_timeline";
@@ -30,7 +31,8 @@ export interface GanttRow {
   key: string;
   label: string;
   model?: string;
-  kind: "agent" | "aux" | "tool" | "worker" | "final";
+  /** `background` = B-168 后台记忆写回:run 结束之后才跑,排在本轮最后一行之后。 */
+  kind: "agent" | "aux" | "tool" | "worker" | "final" | "background";
   depth: 0 | 1 | 2;
   /** Relative to `t0` (the earliest row start), milliseconds. */
   startMs: number;
@@ -156,9 +158,45 @@ interface AbsRow {
   detail: GanttRow["detail"];
 }
 
+/** B-168 B2 —— 后台记忆写回在 `end` 之后才跑,事件流里只有一瞬间的「已排队」帧。拿到
+ *  任务结果时在本轮最后补一行:起点 = run 结束(此前轴的末端,含 `end` 标记)+ 排队时长,
+ *  时长 = 执行时长;还在排队 / 执行(没有 `exec_ms`)→ 时长 null(进行中)。本轮没有
+ *  「已排队」帧(结果对不上号)或一行都没有 → 不补。 */
+function backgroundWritebackRow(
+  items: readonly TimelineItem[],
+  absRows: readonly AbsRow[],
+  absMarkers: readonly GanttMarker[],
+  result: MemoryWritebackResult | null | undefined,
+): AbsRow | null {
+  if (result === null || result === undefined || absRows.length === 0) return null;
+  const queued = items.filter(
+    (i): i is AuxNodeItem => i.kind === "memory_writeback" && i.detail.queued === true,
+  ).at(-1);
+  if (queued === undefined) return null;
+  const runEnd = Math.max(...absRows.map((r) => r.absEnd), ...absMarkers.map((m) => m.atMs));
+  const start = runEnd + (result.queued_ms ?? 0);
+  const finished = result.status === "done" || result.status === "failed";
+  const durationMs = finished ? result.exec_ms : null;
+  return {
+    key: `background-${queued.seq}`,
+    label: i18n.t("console_runtime.gantt_background_writeback"),
+    kind: "background",
+    depth: 0,
+    absStart: start,
+    absEnd: start + (durationMs ?? 0),
+    durationMs,
+    hasError: result.status === "failed" || result.failed === true,
+    detail: { type: "item", item: queued },
+  };
+}
+
 export function buildGanttRows(
   events: readonly SseEvent[],
-  opts?: { settled?: boolean },
+  opts?: {
+    settled?: boolean;
+    /** B-168 B2 —— 本轮 run 的后台记忆写回结果(控制台 run 详情的 `memory_writeback`)。 */
+    backgroundWriteback?: MemoryWritebackResult | null;
+  },
 ): GanttModel {
   const items = parseTimeline(events);
   const absRows: AbsRow[] = [];
@@ -258,6 +296,9 @@ export function buildGanttRows(
     prevEnd = markerPlaced.endMs;
     absMarkers.push({ atMs: markerPlaced.startMs, kind: item.kind, text: item.text });
   }
+
+  const background = backgroundWritebackRow(items, absRows, absMarkers, opts?.backgroundWriteback);
+  if (background !== null) absRows.push(background);
 
   const t0 = absRows.length > 0 ? Math.min(...absRows.map((r) => r.absStart)) : 0;
   const totalMs = absRows.length > 0 ? Math.max(...absRows.map((r) => r.absEnd)) - t0 : 0;

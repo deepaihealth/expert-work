@@ -1482,6 +1482,7 @@ export interface TranslationKeys {
     reflect_pass: string;
     reflect_revise: string;
     gantt_step: string;
+    gantt_background_writeback: string;
     plan_steps: string;
     subagent_result: string;
   };
@@ -4853,6 +4854,7 @@ const en: TranslationKeys = {
     reflect_pass: "Reflection · pass",
     reflect_revise: "Reflection · revise",
     gantt_step: "Step {{n}}",
+    gantt_background_writeback: "Background memory writeback",
     plan_steps: "{{n}} steps",
     subagent_result: "{{calls}} LLM calls · {{ms}}ms",
   },
