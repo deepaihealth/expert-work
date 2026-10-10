@@ -39,15 +39,16 @@
  * field is touched.
  */
 import { useEffect, useState } from "react";
-import { Collapse, InputNumber, Select, Switch, Tabs, Typography } from "antd";
+import { Collapse, InputNumber, Radio, Select, Switch, Tabs, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import type { ModelCatalog } from "../../../api/model_catalog";
 import { FieldRow } from "../FieldRow";
-import { loadModelCatalog } from "../catalog";
+import { loadModelCatalog, lookupModel, thinkingCannotFullyDisable } from "../catalog";
 import { ModelSelect } from "../widgets/ModelSelect";
 import { PolicyFieldList, type FieldDef } from "./field_defs";
 import {
+  defaultMemoryModel,
   patchConsolidation,
   patchMemoryBudgets,
   readAbstainThreshold,
@@ -155,6 +156,22 @@ export function MemorySection({
     };
   }, []);
   const memoryModel = readMemoryModel(formData);
+  // B-168 —— 「指定模型」选了但还没挑型号时不写规则,靠这个本地态留在「指定模型」。
+  const [customPicked, setCustomPicked] = useState(false);
+  const memoryModelMode =
+    memoryModel !== undefined || customPicked ? "custom" : "default";
+  const clearMemoryModel = (): void => {
+    setCustomPicked(false);
+    if (memoryModel !== undefined) onChange(setMemoryModel(formData, null));
+  };
+  const effectiveMemoryModel = defaultMemoryModel(formData);
+  const effectiveFloors =
+    effectiveMemoryModel !== null &&
+    catalog !== undefined &&
+    thinkingCannotFullyDisable(
+      lookupModel(catalog, effectiveMemoryModel.provider, effectiveMemoryModel.name),
+      effectiveMemoryModel.provider,
+    );
   const budgetValues = readMemoryBudgets(formData) as Record<
     string,
     number | undefined
@@ -248,18 +265,58 @@ export function MemorySection({
                       brief={t("memory_group.model_brief")}
                       help={t("memory_group.model_impact")}
                       isDefault={memoryModel === undefined}
-                      onReset={() => onChange(setMemoryModel(formData, null))}
+                      onReset={clearMemoryModel}
                       resetHint={t("memory_group.model_clear")}
+                      align="start"
                     >
-                      <ModelSelect
-                        value={memoryModel ?? {}}
-                        catalog={catalog}
-                        onChange={(mdl) =>
-                          onChange(
-                            setMemoryModel(formData, seedMemoryModelPick(memoryModel, mdl)),
-                          )
-                        }
-                      />
+                      <div style={{ width: 320 }}>
+                        <Radio.Group
+                          value={memoryModelMode}
+                          aria-label={t("memory_group.model_mode_aria")}
+                          onChange={(e) =>
+                            e.target.value === "default"
+                              ? clearMemoryModel()
+                              : setCustomPicked(true)
+                          }
+                          style={{ marginBottom: 8 }}
+                        >
+                          <Radio value="default" data-testid="memory-model-mode-default">
+                            {t("memory_group.model_mode_default")}
+                          </Radio>
+                          <Radio value="custom" data-testid="memory-model-mode-custom">
+                            {t("memory_group.model_mode_custom")}
+                          </Radio>
+                        </Radio.Group>
+                        {memoryModelMode === "default" ? (
+                          <div data-testid="memory-model-effective">
+                            <div>
+                              {effectiveMemoryModel === null
+                                ? t("memory_group.model_effective_unknown")
+                                : t(
+                                    effectiveFloors
+                                      ? "memory_group.model_effective_floor"
+                                      : "memory_group.model_effective",
+                                    { model: effectiveMemoryModel.name },
+                                  )}
+                            </div>
+                            <Text type="secondary" style={{ fontSize: 12 }}>
+                              {t("memory_group.model_effective_note")}
+                            </Text>
+                          </div>
+                        ) : (
+                          <ModelSelect
+                            variant="compact"
+                            value={memoryModel ?? {}}
+                            catalog={catalog}
+                            thinkingNote={t("memory_group.model_thinking_note")}
+                            onChange={(mdl) =>
+                              onChange(
+                                setMemoryModel(formData, seedMemoryModelPick(memoryModel, mdl)),
+                              )
+                            }
+                          />
+                        )}
+                      </div>
                     </FieldRow>
                   </>
                 )}

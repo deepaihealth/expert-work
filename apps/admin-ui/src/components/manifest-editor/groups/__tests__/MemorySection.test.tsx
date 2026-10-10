@@ -6,6 +6,7 @@ import "../../../../i18n";
 import * as catalog from "../../catalog";
 import { MemorySection } from "../MemorySection";
 import type { AgentManifest } from "../../form_model";
+import type { ModelCatalog } from "../../../../api/model_catalog";
 
 vi.spyOn(catalog, "loadModelCatalog").mockResolvedValue({ providers: [] });
 
@@ -176,5 +177,106 @@ describe("MemorySection", () => {
 
     const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
     expect(last.spec?.memory?.long_term?.verify_reads).toBe(false);
+  });
+});
+
+describe("MemorySection — B-168 memory model picker", () => {
+  const MEMORY_CATALOG: ModelCatalog = {
+    providers: [
+      {
+        provider: "glm",
+        models: [
+          { name: "glm-5.3", vision: false, embeddings: false, context_window: 1000000, deprecated: false,
+            thinking: "effort", thinking_default: true },
+          { name: "glm-5.3-flash", vision: true, embeddings: false, context_window: 1000000, deprecated: false,
+            thinking: "effort", thinking_default: true, always_thinking: true },
+        ],
+      },
+      {
+        provider: "deepseek",
+        models: [
+          { name: "deepseek-v4-pro", vision: false, embeddings: false, context_window: 1000000, deprecated: false,
+            thinking: "effort", thinking_default: true },
+        ],
+      },
+    ],
+  };
+  const seedWith = (spec: Record<string, unknown>): AgentManifest =>
+    ({ spec: { memory: { long_term: {} }, ...spec } }) as AgentManifest;
+  const withCatalog = (): void => {
+    vi.mocked(catalog.loadModelCatalog).mockResolvedValueOnce(MEMORY_CATALOG);
+  };
+  const modeRadio = (mode: "default" | "custom"): HTMLInputElement =>
+    screen.getByRole("radio", {
+      name: mode === "default" ? "Platform default (recommended)" : "Choose a model",
+    }) as HTMLInputElement;
+
+  it("no rule → platform default is selected, no picker, and the effective model is named (always-thinking floors)", async () => {
+    withCatalog();
+    renderSection(seedWith({ model: { provider: "glm", name: "glm-5.3" } }));
+    expect(modeRadio("default").checked).toBe(true);
+    expect(screen.queryByTestId("model-select-field")).toBeNull();
+    expect(await screen.findByText("Uses glm-5.3-flash, thinking at its lowest level")).toBeInTheDocument();
+  });
+
+  it("a main model outside the cheap-sibling map is used as-is, thinking off", async () => {
+    withCatalog();
+    renderSection(seedWith({ model: { provider: "deepseek", name: "deepseek-v4-pro" } }));
+    expect(await screen.findByText("Uses deepseek-v4-pro, thinking off")).toBeInTheDocument();
+  });
+
+  it("no main model yet → a neutral line instead of a model name", () => {
+    renderSection(seedWith({}));
+    expect(screen.getByTestId("memory-model-effective")).toHaveTextContent(
+      "A cheaper model from the main model's vendor, thinking off",
+    );
+  });
+
+  it("choosing 'choose a model' with no rule shows an empty compact picker and writes nothing yet", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSection(seedWith({ model: { provider: "glm", name: "glm-5.3" } }), onChange);
+    await user.click(modeRadio("custom"));
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("model-select-field")).toBeInTheDocument();
+    expect(screen.queryByTestId("model-select-temperature")).toBeNull();
+    expect(screen.queryByTestId("model-select-advanced")).toBeNull();
+    expect(screen.queryByTestId("memory-model-effective")).toBeNull();
+  });
+
+  it("an existing rule → 'choose a model' is selected with the thinking note beside the switch", async () => {
+    withCatalog();
+    renderSection(
+      seedWith({ routing: { rules: [{ when: "memory", model: { provider: "glm", name: "glm-5.3-flash" } }] } }),
+    );
+    expect(modeRadio("custom").checked).toBe(true);
+    const thinking = await screen.findByTestId("model-select-thinking");
+    expect(
+      within(thinking).getByText("Memory calls are short tasks — thinking makes them several times slower and costlier"),
+    ).toBeInTheDocument();
+  });
+
+  it("switching back to platform default removes the when=memory rule", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    renderSection(
+      seedWith({
+        routing: {
+          rules: [
+            { when: "planning", model: { provider: "openai", name: "gpt-4o" } },
+            { when: "memory", model: { provider: "glm", name: "glm-5.3-flash" } },
+          ],
+        },
+      }),
+      onChange,
+    );
+    await user.click(modeRadio("default"));
+    const last = onChange.mock.calls.at(-1)?.[0] as AgentManifest;
+    expect(last.spec?.routing?.rules).toEqual([{ when: "planning", model: { provider: "openai", name: "gpt-4o" } }]);
+  });
+
+  it("the memory-model FieldRow top-aligns so the label stays beside the first line of the control", () => {
+    renderSection(seedWith({}));
+    expect((rowFor("memory.model") as HTMLElement).style.alignItems).toBe("flex-start");
   });
 });

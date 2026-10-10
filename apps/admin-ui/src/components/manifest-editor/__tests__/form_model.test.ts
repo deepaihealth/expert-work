@@ -42,6 +42,7 @@ import {
   readWorkerBudget,
   setWorkerBudgetField,
   seedMemoryModelPick,
+  defaultMemoryModel,
   setMemoryModel,
   setReflectionEvaluator,
   setSkills,
@@ -2467,5 +2468,29 @@ describe("plan_first (B-35 — workflow.execution_mode + 三字段联动)", () =
     const next = disablePlanFirst(m);
     expect(next.spec?.workflow?.execution_mode).toBeUndefined();
     expect(next.spec?.workflow?.type).toBe("plan_execute");
+  });
+});
+
+describe("defaultMemoryModel (B-168 — mirrors agent_factory.memory_model)", () => {
+  const withMain = (provider?: string, name?: string): AgentManifest => ({
+    spec: { model: { provider, name } },
+  });
+
+  it("maps glm-5.3 / glm-5.2 to the same-vendor cheap sibling glm-5.3-flash", () => {
+    expect(defaultMemoryModel(withMain("glm", "glm-5.3"))).toEqual({ provider: "glm", name: "glm-5.3-flash" });
+    expect(defaultMemoryModel(withMain("glm", "glm-5.2"))).toEqual({ provider: "glm", name: "glm-5.3-flash" });
+  });
+
+  it("any other main model is used as-is", () => {
+    expect(defaultMemoryModel(withMain("glm", "glm-5.3-flash"))).toEqual({ provider: "glm", name: "glm-5.3-flash" });
+    expect(defaultMemoryModel(withMain("deepseek", "deepseek-v4-pro"))).toEqual({
+      provider: "deepseek",
+      name: "deepseek-v4-pro",
+    });
+  });
+
+  it("returns null until the main model has both provider and name", () => {
+    expect(defaultMemoryModel({ spec: {} })).toBeNull();
+    expect(defaultMemoryModel(withMain("glm", undefined))).toBeNull();
   });
 });

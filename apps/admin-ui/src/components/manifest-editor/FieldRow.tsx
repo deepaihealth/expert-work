@@ -21,6 +21,8 @@ export interface FieldRowProps {
   onReset?: () => void;
   /** 恢复默认按钮的 Tooltip:「恢复默认:{resetHint}」;缺省只显按钮 */
   resetHint?: string;
+  /** 行内对齐:默认 `center`(单行控件);控件多行高时传 `start`,标签与说明贴在控件首行旁,不漂到中间 */
+  align?: "center" | "start";
   children: ReactNode;
 }
 
@@ -32,6 +34,7 @@ export function FieldRow({
   isDefault,
   onReset,
   resetHint,
+  align = "center",
   children,
 }: FieldRowProps) {
   const { t } = useTranslation();
@@ -53,7 +56,7 @@ export function FieldRow({
       data-field-id={fieldId}
       style={{
         display: "flex",
-        alignItems: "center",
+        alignItems: align === "start" ? "flex-start" : "center",
         flexWrap: "wrap",
         columnGap: 12,
         rowGap: 4,

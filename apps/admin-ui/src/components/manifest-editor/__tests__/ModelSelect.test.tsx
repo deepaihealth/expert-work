@@ -863,4 +863,42 @@ describe("ModelSelect", () => {
     await openAdvanced(user);
     expect(screen.queryByTestId("model-select-thinking-max-clear")).toBeNull();
   });
+  it("variant=compact keeps provider / model / thinking but drops vision, temperature and the advanced panel", () => {
+    render(
+      <ModelSelect
+        value={{ provider: "glm", name: "glm-5.3-flash" }}
+        catalog={CATALOG}
+        onChange={() => {}}
+        variant="compact"
+      />,
+    );
+    expect(screen.getByTestId("model-select-provider")).toBeInTheDocument();
+    expect(screen.getByTestId("model-select-name")).toBeInTheDocument();
+    expect(screen.getByTestId("model-select-thinking")).toBeInTheDocument();
+    expect(screen.getByTestId("model-select-thinking-hint")).toBeInTheDocument();
+    expect(screen.queryByTestId("model-select-vision")).toBeNull();
+    expect(screen.queryByTestId("model-select-temperature")).toBeNull();
+    expect(screen.queryByTestId("model-select-advanced")).toBeNull();
+  });
+
+  it("the default variant still renders vision, temperature and the advanced panel", () => {
+    render(<ModelSelect value={{ provider: "glm", name: "glm-5.3-flash" }} catalog={CATALOG} onChange={() => {}} />);
+    expect(screen.getByTestId("model-select-vision")).toBeInTheDocument();
+    expect(screen.getByTestId("model-select-temperature")).toBeInTheDocument();
+    expect(screen.getByTestId("model-select-advanced")).toBeInTheDocument();
+  });
+
+  it("thinkingNote renders beside the thinking switch only when given and the model has a thinking knob", () => {
+    const { rerender } = render(
+      <ModelSelect
+        value={{ provider: "glm", name: "glm-5.3" }}
+        catalog={CATALOG}
+        onChange={() => {}}
+        thinkingNote="short tasks"
+      />,
+    );
+    expect(within(screen.getByTestId("model-select-thinking")).getByText("short tasks")).toBeInTheDocument();
+    rerender(<ModelSelect value={{ provider: "glm", name: "glm-5.3" }} catalog={CATALOG} onChange={() => {}} />);
+    expect(screen.queryByText("short tasks")).toBeNull();
+  });
 });

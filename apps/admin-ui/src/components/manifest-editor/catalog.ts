@@ -36,3 +36,19 @@ export function lookupModel(
 ): CatalogModel | undefined {
   return modelsFor(catalog, provider).find((m) => m.name === name);
 }
+
+/** reasoning_effort vendors without a real off — off degrades to the lowest
+ *  level (OpenAI/Azure "minimal", kimi-k3 "low"). GLM 5.2+ and DeepSeek keep
+ *  a real off via thinking.type=disabled, so no hint there — except entries
+ *  the catalog marks always_thinking (glm-5.3-flash: thinking.type only
+ *  supports enabled, off floors at reasoning_effort=low). */
+export function thinkingCannotFullyDisable(
+  entry: CatalogModel | undefined,
+  provider: string | undefined,
+): boolean {
+  return (
+    entry?.thinking === "effort" &&
+    (entry?.always_thinking === true ||
+      (provider !== "anthropic" && provider !== "glm" && provider !== "deepseek"))
+  );
+}
