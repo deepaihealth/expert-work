@@ -891,6 +891,14 @@ export interface TranslationKeys {
     model_brief: string;
     model_impact: string;
     model_clear: string;
+    model_mode_aria: string;
+    model_mode_default: string;
+    model_mode_custom: string;
+    model_effective: string;
+    model_effective_floor: string;
+    model_effective_unknown: string;
+    model_effective_note: string;
+    model_thinking_note: string;
     verify_reads_label: string;
     verify_reads_brief: string;
     verify_reads_impact: string;
@@ -1474,6 +1482,7 @@ export interface TranslationKeys {
     reflect_pass: string;
     reflect_revise: string;
     gantt_step: string;
+    gantt_background_writeback: string;
     plan_steps: string;
     subagent_result: string;
   };
@@ -4168,6 +4177,14 @@ const en: TranslationKeys = {
     model_impact:
       "Used for saving memories, de-duplicating them, and checking/rewriting before recall.\nLeave empty = platform default: a cheaper model from the same vendor with thinking off.\nThese are short tasks — thinking makes them several times slower and costlier.",
     model_clear: "Use the platform default",
+    model_mode_aria: "Where the memory model comes from",
+    model_mode_default: "Platform default (recommended)",
+    model_mode_custom: "Choose a model",
+    model_effective: "Uses {{model}}, thinking off",
+    model_effective_floor: "Uses {{model}}, thinking at its lowest level",
+    model_effective_unknown: "A cheaper model from the main model's vendor, thinking off",
+    model_effective_note: "Follows the main model: a cheaper model from the same vendor when there is one, otherwise the main model itself.",
+    model_thinking_note: "Memory calls are short tasks — thinking makes them several times slower and costlier",
     verify_reads_label: "Check memories before answering",
     verify_reads_brief: "Double-checks memories first — slower but more accurate",
     verify_reads_impact:
@@ -4837,6 +4854,7 @@ const en: TranslationKeys = {
     reflect_pass: "Reflection · pass",
     reflect_revise: "Reflection · revise",
     gantt_step: "Step {{n}}",
+    gantt_background_writeback: "Background memory writeback",
     plan_steps: "{{n}} steps",
     subagent_result: "{{calls}} LLM calls · {{ms}}ms",
   },

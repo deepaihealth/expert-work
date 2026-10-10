@@ -12,7 +12,12 @@ import { useTranslation } from "react-i18next";
 
 import type { ModelCatalog } from "../../../api/model_catalog";
 import type { ModelFields } from "../form_model";
-import { lookupModel, modelsFor, providerNames } from "../catalog";
+import {
+  lookupModel,
+  modelsFor,
+  providerNames,
+  thinkingCannotFullyDisable,
+} from "../catalog";
 
 // B-105 — Anthropic requires max_tokens; an empty cap is sent as 4096
 // (agent_factory / truncation ANTHROPIC_DEFAULT_MAX_TOKENS), not a vendor default.
@@ -25,6 +30,11 @@ interface ModelSelectProps {
   /** Restrict to vision-capable models — hides providers with no vision model
    *  and non-vision models within a provider. Used by the VL fallback picker. */
   visionOnly?: boolean;
+  /** `compact` = provider / model / thinking only (no vision tag, temperature
+   *  or advanced panel) — for auxiliary-call pickers such as the memory model. */
+  variant?: "full" | "compact";
+  /** Short note rendered beside the thinking switch (only when the model has one). */
+  thinkingNote?: string;
 }
 
 export function ModelSelect({
@@ -32,6 +42,8 @@ export function ModelSelect({
   catalog,
   onChange,
   visionOnly = false,
+  variant = "full",
+  thinkingNote,
 }: ModelSelectProps) {
   const { t } = useTranslation();
   const allProviders = catalog ? providerNames(catalog) : [];
@@ -85,17 +97,7 @@ export function ModelSelect({
       ? lookupModel(catalog, value.provider, value.name)
       : undefined;
   const hasThinkingKnob = !!currentEntry?.thinking;
-  // reasoning_effort vendors without a real off — off degrades to the lowest
-  // level (OpenAI/Azure "minimal", kimi-k3 "low"). GLM 5.2+ and DeepSeek keep
-  // a real off via thinking.type=disabled, so no hint there — except entries
-  // the catalog marks always_thinking (glm-5.3-flash: thinking.type only
-  // supports enabled, off floors at reasoning_effort=low).
-  const cannotFullyDisable =
-    currentEntry?.thinking === "effort" &&
-    (currentEntry?.always_thinking === true ||
-      (value.provider !== "anthropic" &&
-        value.provider !== "glm" &&
-        value.provider !== "deepseek"));
+  const cannotFullyDisable = thinkingCannotFullyDisable(currentEntry, value.provider);
   const thinkingOn = value.thinking_enabled ?? currentEntry?.thinking_default ?? false;
   // B-105 — a stored thinking cap on a model without one (YAML, or saved
   // before the catalog changed) makes the backend reject the build. The input
@@ -130,13 +132,15 @@ export function ModelSelect({
           style={{ width: "100%" }}
         />
       </div>
-      <div data-testid="model-select-vision" style={{ marginBottom: 8 }}>
-        <Tag color={value.supports_vision ? "cyan" : "default"}>
-          {value.supports_vision
-            ? t("model_select.vision_on")
-            : t("model_select.vision_off")}
-        </Tag>
-      </div>
+      {variant === "full" && (
+        <div data-testid="model-select-vision" style={{ marginBottom: 8 }}>
+          <Tag color={value.supports_vision ? "cyan" : "default"}>
+            {value.supports_vision
+              ? t("model_select.vision_on")
+              : t("model_select.vision_off")}
+          </Tag>
+        </div>
+      )}
       {hasThinkingKnob && (
         <div
           data-testid="model-select-thinking"
@@ -167,274 +171,283 @@ export function ModelSelect({
               </span>
             </Tooltip>
           )}
+          {thinkingNote !== undefined && (
+            <span style={{ fontSize: 12, color: "var(--ew-text-muted, #888)" }}>
+              {thinkingNote}
+            </span>
+          )}
         </div>
       )}
-      <label
-        data-testid="model-select-temperature"
-        style={{ display: "block", marginBottom: 8 }}
-      >
-        <span style={{ display: "block", marginBottom: 4 }}>
-          {t("model_select.temperature")}: {temperature}
-        </span>
-        <Slider
-          min={0}
-          max={2}
-          step={0.1}
-          value={temperature}
-          ariaLabelForHandle={t("model_select.temperature")}
-          onChange={(v) => onChange({ ...value, temperature: v })}
-        />
-      </label>
-      <Collapse
-        data-testid="model-select-advanced"
-        defaultActiveKey={[]}
-        items={[
-          {
-            key: "advanced",
-            label: t("model_select.advanced"),
-            children: (
-              <>
-                <label style={{ display: "block", marginBottom: 8 }}>
-                  <span style={{ display: "block", marginBottom: 4 }}>
-                    {t("model_select.max_tokens_label")}
-                  </span>
-                  <InputNumber
-                    value={value.max_tokens}
-                    min={1}
-                    // No ``max`` — rc-input-number clamps ON BLUR even with
-                    // no typing (flushInputValue), which would silently
-                    // rewrite a manifest that already stores an
-                    // over-ceiling value down to the catalog ceiling. The
-                    // backend's dry-run build already rejects an
-                    // over-ceiling max_tokens with an explicit message; the
-                    // placeholder below still names the ceiling as a hint.
-                    placeholder={
-                      value.provider === "anthropic"
-                        ? t("model_select.max_tokens_placeholder_anthropic", {
-                            n: ANTHROPIC_DEFAULT_MAX_TOKENS,
-                          })
-                        : currentEntry?.max_output_tokens != null
-                        ? t("model_select.max_tokens_placeholder_max", {
-                            n: currentEntry.max_output_tokens,
-                          })
-                        : t("model_select.max_tokens_placeholder")
-                    }
-                    onChange={(v) =>
-                      onChange({ ...value, max_tokens: v ?? undefined })
-                    }
-                    style={{ width: "100%" }}
-                    aria-label={t("model_select.max_tokens_label")}
-                    data-testid="model-select-max-tokens"
-                  />
-                  <span
-                    style={{
-                      display: "block",
-                      marginTop: 4,
-                      fontSize: 12,
-                      color: "var(--ew-text-muted, #888)",
-                    }}
-                  >
-                    {t("model_select.max_tokens_hint")}
-                  </span>
-                </label>
-                <label style={{ display: "block", marginBottom: 8 }}>
-                  <span style={{ display: "block", marginBottom: 4 }}>
-                    rate_limit_rpm
-                  </span>
-                  <InputNumber
-                    value={value.rate_limit_rpm}
-                    onChange={(v) =>
-                      onChange({ ...value, rate_limit_rpm: v ?? undefined })
-                    }
-                    style={{ width: "100%" }}
-                  />
-                  <span
-                    style={{
-                      display: "block",
-                      marginTop: 4,
-                      fontSize: 12,
-                      color: "var(--ew-text-muted, #888)",
-                    }}
-                  >
-                    {t("model_select.rate_limit_hint")}
-                  </span>
-                </label>
-                <label style={{ display: "block", marginBottom: 8 }}>
-                  <span style={{ display: "block", marginBottom: 4 }}>
-                    {t("model_select.context_window")}
-                  </span>
-                  <InputNumber
-                    value={value.context_window}
-                    min={1}
-                    onChange={(v) =>
-                      onChange({ ...value, context_window: v ?? undefined })
-                    }
-                    style={{ width: "100%" }}
-                    aria-label={t("model_select.context_window")}
-                    data-testid="model-select-context-window"
-                  />
-                  <span
-                    style={{
-                      display: "block",
-                      marginTop: 4,
-                      fontSize: 12,
-                      color: "var(--ew-text-muted, #888)",
-                    }}
-                  >
-                    {t("model_select.context_window_hint")}
-                  </span>
-                </label>
-                {hasThinkingKnob && (
-                  <label
-                    data-testid="model-select-effort"
-                    style={{ display: "block", marginBottom: 8 }}
-                  >
-                    <span style={{ display: "block", marginBottom: 4 }}>
-                      {t("model_select.effort_label")}
-                    </span>
-                    <Select
-                      allowClear
-                      aria-label={t("model_select.effort_label")}
-                      value={value.effort}
-                      onChange={(v) =>
-                        onChange({ ...value, effort: v ?? undefined })
-                      }
-                      options={[
-                        { label: "low", value: "low" },
-                        { label: "medium", value: "medium" },
-                        { label: "high", value: "high" },
-                        { label: "max", value: "max" },
-                      ]}
-                      style={{ width: "100%" }}
-                    />
-                    <span
-                      style={{
-                        display: "block",
-                        marginTop: 4,
-                        fontSize: 12,
-                        color: "var(--ew-text-muted, #888)",
-                      }}
-                    >
-                      {t("model_select.effort_hint")}
-                    </span>
-                  </label>
-                )}
-                {(hasThinkingKnob || staleThinkingMax) && (
-                  <label
-                    data-testid="model-select-thinking-max"
-                    style={{ display: "block", marginBottom: 8 }}
-                  >
-                    <span style={{ display: "block", marginBottom: 4 }}>
-                      {t("model_select.thinking_max_label")}
-                    </span>
-                    <InputNumber
-                      value={value.thinking_max_tokens}
-                      min={1}
-                      disabled={!currentEntry?.thinking_cap}
-                      onChange={(v) =>
-                        onChange({ ...value, thinking_max_tokens: v ?? undefined })
-                      }
-                      style={{ width: "100%" }}
-                      aria-label={t("model_select.thinking_max_label")}
-                    />
-                    {staleThinkingMax && (
-                      <Button
-                        type="link"
-                        size="small"
-                        style={{ padding: 0 }}
-                        onClick={() =>
-                          onChange({ ...value, thinking_max_tokens: undefined })
+      {variant === "full" && (
+        <>
+          <label
+            data-testid="model-select-temperature"
+            style={{ display: "block", marginBottom: 8 }}
+          >
+            <span style={{ display: "block", marginBottom: 4 }}>
+              {t("model_select.temperature")}: {temperature}
+            </span>
+            <Slider
+              min={0}
+              max={2}
+              step={0.1}
+              value={temperature}
+              ariaLabelForHandle={t("model_select.temperature")}
+              onChange={(v) => onChange({ ...value, temperature: v })}
+            />
+          </label>
+          <Collapse
+            data-testid="model-select-advanced"
+            defaultActiveKey={[]}
+            items={[
+              {
+                key: "advanced",
+                label: t("model_select.advanced"),
+                children: (
+                  <>
+                    <label style={{ display: "block", marginBottom: 8 }}>
+                      <span style={{ display: "block", marginBottom: 4 }}>
+                        {t("model_select.max_tokens_label")}
+                      </span>
+                      <InputNumber
+                        value={value.max_tokens}
+                        min={1}
+                        // No ``max`` — rc-input-number clamps ON BLUR even with
+                        // no typing (flushInputValue), which would silently
+                        // rewrite a manifest that already stores an
+                        // over-ceiling value down to the catalog ceiling. The
+                        // backend's dry-run build already rejects an
+                        // over-ceiling max_tokens with an explicit message; the
+                        // placeholder below still names the ceiling as a hint.
+                        placeholder={
+                          value.provider === "anthropic"
+                            ? t("model_select.max_tokens_placeholder_anthropic", {
+                                n: ANTHROPIC_DEFAULT_MAX_TOKENS,
+                              })
+                            : currentEntry?.max_output_tokens != null
+                            ? t("model_select.max_tokens_placeholder_max", {
+                                n: currentEntry.max_output_tokens,
+                              })
+                            : t("model_select.max_tokens_placeholder")
                         }
-                        data-testid="model-select-thinking-max-clear"
+                        onChange={(v) =>
+                          onChange({ ...value, max_tokens: v ?? undefined })
+                        }
+                        style={{ width: "100%" }}
+                        aria-label={t("model_select.max_tokens_label")}
+                        data-testid="model-select-max-tokens"
+                      />
+                      <span
+                        style={{
+                          display: "block",
+                          marginTop: 4,
+                          fontSize: 12,
+                          color: "var(--ew-text-muted, #888)",
+                        }}
                       >
-                        {t("model_select.thinking_max_clear")}
-                      </Button>
+                        {t("model_select.max_tokens_hint")}
+                      </span>
+                    </label>
+                    <label style={{ display: "block", marginBottom: 8 }}>
+                      <span style={{ display: "block", marginBottom: 4 }}>
+                        rate_limit_rpm
+                      </span>
+                      <InputNumber
+                        value={value.rate_limit_rpm}
+                        onChange={(v) =>
+                          onChange({ ...value, rate_limit_rpm: v ?? undefined })
+                        }
+                        style={{ width: "100%" }}
+                      />
+                      <span
+                        style={{
+                          display: "block",
+                          marginTop: 4,
+                          fontSize: 12,
+                          color: "var(--ew-text-muted, #888)",
+                        }}
+                      >
+                        {t("model_select.rate_limit_hint")}
+                      </span>
+                    </label>
+                    <label style={{ display: "block", marginBottom: 8 }}>
+                      <span style={{ display: "block", marginBottom: 4 }}>
+                        {t("model_select.context_window")}
+                      </span>
+                      <InputNumber
+                        value={value.context_window}
+                        min={1}
+                        onChange={(v) =>
+                          onChange({ ...value, context_window: v ?? undefined })
+                        }
+                        style={{ width: "100%" }}
+                        aria-label={t("model_select.context_window")}
+                        data-testid="model-select-context-window"
+                      />
+                      <span
+                        style={{
+                          display: "block",
+                          marginTop: 4,
+                          fontSize: 12,
+                          color: "var(--ew-text-muted, #888)",
+                        }}
+                      >
+                        {t("model_select.context_window_hint")}
+                      </span>
+                    </label>
+                    {hasThinkingKnob && (
+                      <label
+                        data-testid="model-select-effort"
+                        style={{ display: "block", marginBottom: 8 }}
+                      >
+                        <span style={{ display: "block", marginBottom: 4 }}>
+                          {t("model_select.effort_label")}
+                        </span>
+                        <Select
+                          allowClear
+                          aria-label={t("model_select.effort_label")}
+                          value={value.effort}
+                          onChange={(v) =>
+                            onChange({ ...value, effort: v ?? undefined })
+                          }
+                          options={[
+                            { label: "low", value: "low" },
+                            { label: "medium", value: "medium" },
+                            { label: "high", value: "high" },
+                            { label: "max", value: "max" },
+                          ]}
+                          style={{ width: "100%" }}
+                        />
+                        <span
+                          style={{
+                            display: "block",
+                            marginTop: 4,
+                            fontSize: 12,
+                            color: "var(--ew-text-muted, #888)",
+                          }}
+                        >
+                          {t("model_select.effort_hint")}
+                        </span>
+                      </label>
                     )}
-                    <span
-                      style={{
-                        display: "block",
-                        marginTop: 4,
-                        fontSize: 12,
-                        color: "var(--ew-text-muted, #888)",
-                      }}
-                    >
-                      {currentEntry?.thinking_cap
-                        ? t("model_select.thinking_max_hint")
-                        : t("model_select.thinking_max_unsupported")}
-                    </span>
-                  </label>
-                )}
-                {value.provider === "anthropic" && (
-                  <div
-                    data-testid="model-select-adaptive"
-                    style={{ marginBottom: 8 }}
-                  >
-                    <div
-                      style={{ display: "flex", alignItems: "center", gap: 8 }}
-                    >
-                      <Switch
-                        size="small"
-                        checked={value.adaptive_thinking === true}
-                        aria-label={t("model_select.adaptive_label")}
-                        onChange={(checked) =>
-                          onChange({
-                            ...value,
-                            adaptive_thinking: checked ? true : undefined,
-                          })
-                        }
-                      />
-                      <span>{t("model_select.adaptive_label")}</span>
-                    </div>
-                    <span
-                      style={{
-                        display: "block",
-                        marginTop: 4,
-                        fontSize: 12,
-                        color: "var(--ew-text-muted, #888)",
-                      }}
-                    >
-                      {t("model_select.adaptive_hint")}
-                    </span>
-                  </div>
-                )}
-                {value.provider === "anthropic" && (
-                  <div
-                    data-testid="model-select-cache"
-                    style={{ marginBottom: 8 }}
-                  >
-                    <div
-                      style={{ display: "flex", alignItems: "center", gap: 8 }}
-                    >
-                      <Switch
-                        size="small"
-                        checked={value.cache_enabled !== false}
-                        aria-label={t("model_select.cache_label")}
-                        onChange={(checked) =>
-                          onChange({
-                            ...value,
-                            cache_enabled: checked ? undefined : false,
-                          })
-                        }
-                      />
-                      <span>{t("model_select.cache_label")}</span>
-                    </div>
-                    <span
-                      style={{
-                        display: "block",
-                        marginTop: 4,
-                        fontSize: 12,
-                        color: "var(--ew-text-muted, #888)",
-                      }}
-                    >
-                      {t("model_select.cache_hint")}
-                    </span>
-                  </div>
-                )}
-              </>
-            ),
-          },
-        ]}
-      />
+                    {(hasThinkingKnob || staleThinkingMax) && (
+                      <label
+                        data-testid="model-select-thinking-max"
+                        style={{ display: "block", marginBottom: 8 }}
+                      >
+                        <span style={{ display: "block", marginBottom: 4 }}>
+                          {t("model_select.thinking_max_label")}
+                        </span>
+                        <InputNumber
+                          value={value.thinking_max_tokens}
+                          min={1}
+                          disabled={!currentEntry?.thinking_cap}
+                          onChange={(v) =>
+                            onChange({ ...value, thinking_max_tokens: v ?? undefined })
+                          }
+                          style={{ width: "100%" }}
+                          aria-label={t("model_select.thinking_max_label")}
+                        />
+                        {staleThinkingMax && (
+                          <Button
+                            type="link"
+                            size="small"
+                            style={{ padding: 0 }}
+                            onClick={() =>
+                              onChange({ ...value, thinking_max_tokens: undefined })
+                            }
+                            data-testid="model-select-thinking-max-clear"
+                          >
+                            {t("model_select.thinking_max_clear")}
+                          </Button>
+                        )}
+                        <span
+                          style={{
+                            display: "block",
+                            marginTop: 4,
+                            fontSize: 12,
+                            color: "var(--ew-text-muted, #888)",
+                          }}
+                        >
+                          {currentEntry?.thinking_cap
+                            ? t("model_select.thinking_max_hint")
+                            : t("model_select.thinking_max_unsupported")}
+                        </span>
+                      </label>
+                    )}
+                    {value.provider === "anthropic" && (
+                      <div
+                        data-testid="model-select-adaptive"
+                        style={{ marginBottom: 8 }}
+                      >
+                        <div
+                          style={{ display: "flex", alignItems: "center", gap: 8 }}
+                        >
+                          <Switch
+                            size="small"
+                            checked={value.adaptive_thinking === true}
+                            aria-label={t("model_select.adaptive_label")}
+                            onChange={(checked) =>
+                              onChange({
+                                ...value,
+                                adaptive_thinking: checked ? true : undefined,
+                              })
+                            }
+                          />
+                          <span>{t("model_select.adaptive_label")}</span>
+                        </div>
+                        <span
+                          style={{
+                            display: "block",
+                            marginTop: 4,
+                            fontSize: 12,
+                            color: "var(--ew-text-muted, #888)",
+                          }}
+                        >
+                          {t("model_select.adaptive_hint")}
+                        </span>
+                      </div>
+                    )}
+                    {value.provider === "anthropic" && (
+                      <div
+                        data-testid="model-select-cache"
+                        style={{ marginBottom: 8 }}
+                      >
+                        <div
+                          style={{ display: "flex", alignItems: "center", gap: 8 }}
+                        >
+                          <Switch
+                            size="small"
+                            checked={value.cache_enabled !== false}
+                            aria-label={t("model_select.cache_label")}
+                            onChange={(checked) =>
+                              onChange({
+                                ...value,
+                                cache_enabled: checked ? undefined : false,
+                              })
+                            }
+                          />
+                          <span>{t("model_select.cache_label")}</span>
+                        </div>
+                        <span
+                          style={{
+                            display: "block",
+                            marginTop: 4,
+                            fontSize: 12,
+                            color: "var(--ew-text-muted, #888)",
+                          }}
+                        >
+                          {t("model_select.cache_hint")}
+                        </span>
+                      </div>
+                    )}
+                  </>
+                ),
+              },
+            ]}
+          />
+        </>
+      )}
     </div>
   );
 }

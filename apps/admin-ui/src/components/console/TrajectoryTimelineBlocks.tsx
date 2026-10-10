@@ -14,6 +14,15 @@ import type { TimelineModel } from "./ledger_timeline";
 import type { LedgerRecord } from "./ledger_types";
 import { tooltipLines, TOOLTIP_DELAY_S, type DomainProjection } from "./trajectory_timeline_pointer";
 
+/** B-168 B2 —— 后台记忆写回块的状态(run 结束后才跑,画成区别于轮内的块);其它块 undefined。 */
+function backgroundState(record: LedgerRecord | undefined): "done" | "failed" | "pending" | undefined {
+  const row = record?.row;
+  if (row?.kind !== "memory" || row.background === undefined) return undefined;
+  const bg = row.background;
+  if (bg.status === "failed" || bg.failed === true) return "failed";
+  return bg.status === "done" ? "done" : "pending";
+}
+
 export interface TrajectoryTimelineBlocksProps {
   model: TimelineModel;
   records: readonly LedgerRecord[];
@@ -55,6 +64,7 @@ export const TrajectoryTimelineBlocks = memo(function TrajectoryTimelineBlocks({
                 data-error={span.isError ? "true" : undefined}
                 data-ttft={span.kind === "assistant" && !span.isError && span.ttft !== null ? "true" : undefined}
                 data-live={span.running ? "true" : undefined}
+                data-background={backgroundState(records[span.index])}
                 data-current={span.index === selectedIndex ? "true" : undefined}
                 data-hovered={span.index === hoveredIndex ? "true" : undefined}
                 data-search-match={searchMatches === null ? undefined : String(searchMatches.has(span.index))}

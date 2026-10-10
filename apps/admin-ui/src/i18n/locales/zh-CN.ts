@@ -915,6 +915,14 @@ const zhCN: TranslationKeys = {
     model_impact:
       "用于抽取要记住的信息、去重合并，以及调取前的核对和改写。\n不选 = 平台默认：同一家的便宜型号，并关闭思考。\n这些都是短任务，开思考会慢好几倍、贵好几倍。",
     model_clear: "改回平台默认",
+    model_mode_aria: "记忆模型来源",
+    model_mode_default: "平台默认（推荐）",
+    model_mode_custom: "指定模型",
+    model_effective: "实际使用：{{model}}，思考关闭",
+    model_effective_floor: "实际使用：{{model}}，思考降到最低档",
+    model_effective_unknown: "与主模型同一家的便宜型号，思考关闭",
+    model_effective_note: "跟着主模型走：同一家有更便宜的型号就换成它，没有就用主模型本身。",
+    model_thinking_note: "记忆是短任务，开思考会慢好几倍、贵好几倍",
     verify_reads_label: "回答前核对记忆",
     verify_reads_brief: "回答前核对记忆，更准更慢",
     verify_reads_impact:
@@ -1566,6 +1574,7 @@ const zhCN: TranslationKeys = {
     reflect_pass: "反思 · 通过",
     reflect_revise: "反思 · 修订",
     gantt_step: "步骤 {{n}}",
+    gantt_background_writeback: "后台记忆写回",
     plan_steps: "{{n}} 步",
     subagent_result: "{{calls}} 次模型调用 · {{ms}}ms",
   },

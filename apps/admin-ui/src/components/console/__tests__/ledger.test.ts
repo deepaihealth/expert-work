@@ -262,6 +262,27 @@ describe("buildLedger", () => {
     expect(without.records.find((r) => r.kind === "memory")?.row).not.toHaveProperty("background");
   });
 
+  it("B-168 B2: the background writeback record is timed after the run — run end + queued_ms, lasting exec_ms", () => {
+    const events = [
+      upd("agent", { step_count: 1, _duration_ms: 50, messages: [{ type: "ai", content: "结论" }] }, 100),
+      upd("memory_writeback", { written_memory_count: 0, memory_writeback_queued: true }, 120),
+      ev("end", { status: "success" }, 150),
+    ];
+    const turns = [turnOf({ key: "A", seq: 0, turn: { ...turnOf({ key: "A", seq: 0 }).turn, events } })];
+    const result = { status: "done", written_count: 3, failed: false, queued_ms: 700, exec_ms: 2500 } as const;
+
+    const ledger = buildLedger({
+      turns, streamTurnKey: null, nowMs: NOW, backgroundWritebacks: new Map([["run-0", result]]),
+    });
+    const memory = ledger.records.find((r) => r.kind === "memory");
+    expect(memory).toMatchObject({ startedAt: BASE + 150 + 700, endedAt: BASE + 150 + 700 + 2500 });
+    expect(ledger.timed).toBe(true);
+
+    // 没取到结果:仍是轮内那一瞬间的「已排队」点块(gantt 把无时长的辅助行钉在上一行末尾),在 run 结束之前。
+    const without = buildLedger({ turns, streamTurnKey: null, nowMs: NOW });
+    expect(without.records.find((r) => r.kind === "memory")).toMatchObject({ startedAt: BASE + 100, endedAt: BASE + 100 });
+  });
+
   it("memory 写回与 reflect 挂在同轮之前最近的 assistant 上(它之前没有 → null)", () => {
     const events: SseEvent[] = [
       upd("memory_recall", { recalled_memories: [{ id: "m1", content: "老客户 A" }] }, 100),

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { buildGanttRows } from "../gantt_timeline";
+import type { MemoryWritebackResult } from "../runs";
 import type { SseEvent } from "../sessions";
 
 let seqCounter = 0;
@@ -253,5 +254,63 @@ describe("buildGanttRows", () => {
     const m = buildGanttRows(fx.firstDegradedThenValid);
     expect(m.degraded).toBe(true);
     expect(m.totalMs).toBeLessThan(24 * 60 * 60 * 1000);
+  });
+});
+
+describe("buildGanttRows — B-168 background memory writeback", () => {
+  // step 1 runs 500→1000; the writeback task is queued at 1100; the run's
+  // `end` frame lands at 1200 (= run end, the axis end before the extra row).
+  const queuedRun = (): SseEvent[] => [
+    upd("agent", agentChannel(1, 500), 1000),
+    upd("memory_writeback", { written_memory_count: 0, memory_writeback_queued: true }, 1100),
+    ev("end", { status: "success" }, 1200),
+  ];
+  const result = (over: Partial<MemoryWritebackResult> = {}): MemoryWritebackResult => ({
+    status: "done", written_count: 3, failed: false, queued_ms: 700, exec_ms: 2500, ...over,
+  });
+
+  it("appends one background row after the run: start = run end + queued_ms, duration = exec_ms; the axis grows to include it", () => {
+    const m = buildGanttRows(queuedRun(), { backgroundWriteback: result() });
+    const last = m.rows.at(-1);
+    expect(last).toMatchObject({ kind: "background", label: "Background memory writeback", depth: 0, hasError: false });
+    expect(m.originMs + (last?.startMs ?? 0)).toBe(BASE_MS + 1200 + 700);
+    expect(last?.durationMs).toBe(2500);
+    expect(m.totalMs).toBe((last?.startMs ?? 0) + 2500);
+    expect(m.rows.filter((r) => r.kind === "background")).toHaveLength(1);
+  });
+
+  it("failed (status or flag) tints the row as an error", () => {
+    expect(buildGanttRows(queuedRun(), { backgroundWriteback: result({ status: "failed" }) }).rows.at(-1)?.hasError).toBe(true);
+    expect(buildGanttRows(queuedRun(), { backgroundWriteback: result({ failed: true }) }).rows.at(-1)?.hasError).toBe(true);
+  });
+
+  it("pending / running (no exec_ms yet) → an in-progress row at run end + queued, no crash", () => {
+    for (const status of ["pending", "running"] as const) {
+      const m = buildGanttRows(queuedRun(), {
+        backgroundWriteback: result({ status, written_count: null, failed: null, queued_ms: null, exec_ms: null }),
+      });
+      const last = m.rows.at(-1);
+      expect(last?.kind).toBe("background");
+      expect(last?.durationMs).toBeNull();
+      expect(m.originMs + (last?.startMs ?? 0)).toBe(BASE_MS + 1200);
+      expect(m.totalMs).toBe(last?.startMs);
+    }
+  });
+
+  it("no queued writeback frame, or no result → no background row", () => {
+    const plain = [upd("agent", agentChannel(1, 500), 1000), ev("end", { status: "success" }, 1200)];
+    expect(buildGanttRows(plain, { backgroundWriteback: result() }).rows.some((r) => r.kind === "background")).toBe(false);
+    expect(buildGanttRows(queuedRun()).rows.some((r) => r.kind === "background")).toBe(false);
+    expect(buildGanttRows([], { backgroundWriteback: result() }).rows).toEqual([]);
+  });
+
+  it("frames without ids (degraded) still place the background row without crashing", () => {
+    const noIds = [
+      upd("agent", agentChannel(1, 500), null),
+      upd("memory_writeback", { written_memory_count: 0, memory_writeback_queued: true }, null),
+    ];
+    const m = buildGanttRows(noIds, { backgroundWriteback: result() });
+    expect(m.degraded).toBe(true);
+    expect(m.rows.at(-1)?.kind).toBe("background");
   });
 });

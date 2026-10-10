@@ -2806,6 +2806,8 @@ def _step_model(spec: AgentSpec, when: str) -> ModelSpec:
 #: B-143 —— 压缩摘要(B-168 起也给记忆调用)的「同一家便宜型号」映射。只在同一厂商内换型号:
 #: 凭据、地域与主模型一致,不把租户的对话发给它没选的厂商。
 #: 新增条目前先核生产价目表有这个型号(B-132)。
+#: 控制台有一份镜像(改这里要一起改):
+#: apps/admin-ui/src/components/manifest-editor/form_model.ts 的 MEMORY_CHEAP_SIBLING。
 _CHEAP_SIBLING: dict[tuple[str, str], str] = {
     ("glm", "glm-5.3"): "glm-5.3-flash",
     ("glm", "glm-5.2"): "glm-5.3-flash",

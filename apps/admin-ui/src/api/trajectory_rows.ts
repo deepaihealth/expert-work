@@ -351,6 +351,12 @@ export function resolveGanttKey(rows: readonly TrajectoryRow[], key: string): st
     const viaPlanner = rows.find((r) => r.kind === "plan" && r.plannerSeq === seq);
     return viaPlanner ? viaPlanner.id : null;
   }
+  // B-168 B2 —— 后台记忆写回行落回它那条「已排队」的写回行。
+  const backgroundMatch = /^background-(\d+)$/.exec(key);
+  if (backgroundMatch) {
+    const seq = Number(backgroundMatch[1]);
+    return rows.find((r) => r.kind === "memory" && r.seq === seq)?.id ?? null;
+  }
   const toolMatch = /^tool-(.+)$/.exec(key);
   if (toolMatch) {
     const id = toolMatch[1];

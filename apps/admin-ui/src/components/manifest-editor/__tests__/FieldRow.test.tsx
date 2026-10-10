@@ -175,4 +175,19 @@ describe("FieldRow", () => {
 
     expect(await screen.findByText("Reset to default: 30")).toBeInTheDocument();
   });
+  it("centers the row's items by default; align=\"start\" top-aligns them for a tall control", () => {
+    const { container, rerender } = render(
+      <FieldRow fieldId="a.b" label="L" brief="B" isDefault>
+        <input />
+      </FieldRow>,
+    );
+    const row = (): HTMLElement => container.querySelector('[data-field-id="a.b"]') as HTMLElement;
+    expect(row().style.alignItems).toBe("center");
+    rerender(
+      <FieldRow fieldId="a.b" label="L" brief="B" isDefault align="start">
+        <input />
+      </FieldRow>,
+    );
+    expect(row().style.alignItems).toBe("flex-start");
+  });
 });

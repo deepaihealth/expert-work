@@ -526,6 +526,23 @@ export const readMemoryModel = (m: unknown): ModelFields | undefined =>
 export const readMemoryModelOn = (m: unknown): boolean =>
   readMemoryModel(m) !== undefined;
 
+/** B-168 —— 平台默认记忆模型的「同一家便宜型号」映射,`主模型 provider/name → 便宜型号名`。
+ *  是 services/orchestrator/src/orchestrator/agent_factory.py `_CHEAP_SIBLING`(由
+ *  `memory_model()` 使用)的镜像 —— 两边必须一起改,否则配置页报的「实际使用」与后端真用的对不上。 */
+export const MEMORY_CHEAP_SIBLING: Readonly<Record<string, string>> = {
+  "glm/glm-5.3": "glm-5.3-flash",
+  "glm/glm-5.2": "glm-5.3-flash",
+};
+
+/** B-168 —— 没有 `when: memory` 规则时记忆调用实际用的模型(同 agent_factory `memory_model()`):
+ *  主模型在映射表里就换成同一家的便宜型号,否则就是主模型本身。主模型还没选全 → null。
+ *  思考一律关(关不掉的由后端落到最低档),由调用方按目录判断怎么说。 */
+export function defaultMemoryModel(m: unknown): { provider: string; name: string } | null {
+  const { provider, name } = readModel(m);
+  if (!provider || !name) return null;
+  return { provider, name: MEMORY_CHEAP_SIBLING[`${provider}/${name}`] ?? name };
+}
+
 /** B-168 —— 记忆模型换了型号时,把选择器按厂商默认种下的「开思考」改成关:记忆调用是短任务,
  *  开思考会让输出膨胀十倍。只在型号变化时种;用户之后自己打开思考的,原样保留。 */
 export function seedMemoryModelPick(
