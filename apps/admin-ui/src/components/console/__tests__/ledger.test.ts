@@ -244,6 +244,24 @@ describe("buildLedger", () => {
 
   // 终审 M13 —— 记忆写回 / 反思是某一步 agent 之后发生的事,详情里那条
   // 「Assistant Message ›」靠 `parentId` 出;原先一律 null,链接永远不出现。
+  it("B-168 B2: a turn's background writeback result lands on its queued writeback record", () => {
+    const events = [
+      upd("agent", { step_count: 1, messages: [{ type: "ai", content: "结论" }] }, 100),
+      upd("memory_writeback", { written_memory_count: 0, memory_writeback_queued: true }, 120),
+    ];
+    const turns = [turnOf({ key: "A", seq: 0, turn: { ...turnOf({ key: "A", seq: 0 }).turn, events } })];
+    const result = { status: "done", written_count: 3, failed: false, queued_ms: 700, exec_ms: 2500 } as const;
+
+    const ledger = buildLedger({
+      turns, streamTurnKey: null, nowMs: NOW, backgroundWritebacks: new Map([["run-0", result]]),
+    });
+    const memory = ledger.records.find((r) => r.kind === "memory");
+    expect(memory?.row).toMatchObject({ direction: "writeback", background: result });
+
+    const without = buildLedger({ turns, streamTurnKey: null, nowMs: NOW });
+    expect(without.records.find((r) => r.kind === "memory")?.row).not.toHaveProperty("background");
+  });
+
   it("memory 写回与 reflect 挂在同轮之前最近的 assistant 上(它之前没有 → null)", () => {
     const events: SseEvent[] = [
       upd("memory_recall", { recalled_memories: [{ id: "m1", content: "老客户 A" }] }, 100),

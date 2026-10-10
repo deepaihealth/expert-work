@@ -136,6 +136,7 @@ class RetentionCleanupJob:
         tenant_user_store: TenantUserStore | None = None,
         tenant_user_hard_delete_grace_days: int = 90,
         sandbox_egress_audit_retention_days: int = 90,
+        memory_writeback_job_retention_days: int = 30,
         user_upload_store: UserUploadStore | None = None,
         upload_retention_days: int = 90,
         thread_store: ThreadMetaStore | None = None,
@@ -167,6 +168,9 @@ class RetentionCleanupJob:
         if sandbox_egress_audit_retention_days < 1:
             msg = "sandbox_egress_audit_retention_days must be >= 1"
             raise ValueError(msg)
+        if memory_writeback_job_retention_days < 1:
+            msg = "memory_writeback_job_retention_days must be >= 1"
+            raise ValueError(msg)
         if upload_retention_days < 1:
             msg = "upload_retention_days must be >= 1"
             raise ValueError(msg)
@@ -185,6 +189,7 @@ class RetentionCleanupJob:
         self._tenant_user_store = tenant_user_store
         self._tenant_user_grace_days = tenant_user_hard_delete_grace_days
         self._sandbox_egress_audit_retention_days = sandbox_egress_audit_retention_days
+        self._memory_writeback_job_retention_days = memory_writeback_job_retention_days
         self._user_upload_store = user_upload_store
         self._upload_retention_days = upload_retention_days
         self._thread_store = thread_store
@@ -214,6 +219,7 @@ class RetentionCleanupJob:
             audit_skipped = await self._count_unacked_past_retention()
             event_deleted = await self._delete_event_log()
             sandbox_egress_audit_deleted = await self._delete_sandbox_egress_audit()
+            memory_writeback_jobs_deleted = await self._delete_finished_memory_writeback_jobs()
             jwt_deleted = await self._delete_expired_jwt_blacklist()
             image_rows, image_keys_ok, image_keys_failed = await self._delete_expired_images()
             # 版本 pass 先于逻辑产物 pass:文件先按版本清掉,后面的 hard-delete
@@ -254,6 +260,7 @@ class RetentionCleanupJob:
             workspaces_pending_archive=workspaces_pending_archive,
             tenant_users_hard_deleted=tenant_users_hard_deleted,
             sandbox_egress_audit_deleted=sandbox_egress_audit_deleted,
+            memory_writeback_jobs_deleted=memory_writeback_jobs_deleted,
             duration_seconds=time.monotonic() - started,
         )
 
@@ -780,6 +787,32 @@ class RetentionCleanupJob:
         # ``Result`` mypy sees from ``session.execute(text(...))`` exposes
         # it at runtime but not at the type level (same as
         # ``expert_work.persistence.workspace.sql`` / ``skill.sql``).
+        return result.rowcount or 0  # type: ignore[attr-defined]
+
+    async def _delete_finished_memory_writeback_jobs(self) -> int:
+        """B-168 —— 删掉收尾满保留期的记忆后台写回任务行(``done`` / ``failed``)。
+
+        ``pending`` / ``running`` 不按时间删:那是还没写完的记忆,删了就丢。与
+        :meth:`_delete_sandbox_egress_audit` 同款 ``ctid`` 限批;全局窗口。表级授权见
+        迁移 0162(``retention_cleanup_worker`` 是 BYPASSRLS,表上的租户策略不挡它)。
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                text(
+                    """
+                    DELETE FROM memory_writeback_job
+                    WHERE ctid IN (
+                        SELECT j.ctid
+                        FROM memory_writeback_job j
+                        WHERE j.status IN ('done', 'failed')
+                          AND j.finished_at < now() - make_interval(days => :days)
+                        LIMIT :batch
+                    )
+                    """
+                ),
+                {"days": self._memory_writeback_job_retention_days, "batch": self._batch_size},
+            )
+            await session.commit()
         return result.rowcount or 0  # type: ignore[attr-defined]
 
     async def _read_event_retentions(self) -> list[tuple[str, int]]:

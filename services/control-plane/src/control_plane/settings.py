@@ -514,6 +514,25 @@ class Settings(BaseSettings):
     #: promptly.
     memory_dlq_worker_interval_s: int = Field(default=30, gt=0)
 
+    # ------------------------------------------------------------------ memory writeback (B-168)
+    #: B-168 —— 一轮结束时的长期记忆写回在哪儿跑。``inline`` = 本轮内同步写回(今天的
+    #: 行为,也是逃生口);``background`` = 本轮只落一行任务(``memory_writeback_job``),
+    #: 由每个副本上的 ``MemoryWritebackWorker`` 在 ``end`` 帧之后执行。只有 ``background``
+    #: 才起 worker。B2 起默认 ``background``(设计稿 §8 问题 1 拍板);退回 inline 用环境变量
+    #: ``EXPERT_WORK_MEMORY_WRITEBACK_MODE=inline``。
+    memory_writeback_mode: Literal["inline", "background"] = "background"
+    #: worker 的轮询间隔(慢路径:接住别的副本落的、重启前没做完的、租约过期的任务)。
+    #: 本副本刚落的任务走 ``wake()`` 快路径,不等这个间隔。
+    memory_writeback_worker_interval_s: float = Field(default=2.0, gt=0)
+    #: 领取租约秒数;处理中每 1/5 租约续一次。单次执行上限 = 租约 - 续租间隔(4/5 租约),
+    #: 超时算一次失败。
+    memory_writeback_lease_s: float = Field(default=300.0, gt=0)
+    #: 同一条任务最多执行几次(含租约过期被接手),之后 ``failed``。
+    memory_writeback_max_attempts: int = Field(default=3, gt=0)
+    #: 每个副本同时处理几条任务(不同用户并行;同一用户由领取串行)。一个卡住的厂商只占
+    #: 一个空位,不会让整个副本的记忆写回停摆。
+    memory_writeback_worker_concurrency: int = Field(default=4, gt=0)
+
     # ------------------------------------------------------------------ trigger scheduler (J.10)
     #: Stream J.10 — how often the trigger scheduler sweeps the
     #: ``agent_trigger`` table for due cron triggers. Cron granularity

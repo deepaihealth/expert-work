@@ -36,6 +36,12 @@ def test_retention_chain_defaults() -> None:
     assert settings.workspace_root is None
 
 
+def test_memory_writeback_job_retention_defaults_to_30_days() -> None:
+    """B-168 —— 记忆后台写回任务行收尾后留 30 天(控制台看得到),之后清掉。"""
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.memory_writeback_job_retention_days == 30
+
+
 def test_retention_chain_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS", "30")
     monkeypatch.setenv("EXPERT_WORK_RETENTION_WORKSPACE_ROOT", "/mnt/workspaces")

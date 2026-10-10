@@ -24,7 +24,9 @@ def _sync_dsn(c: PostgresContainer) -> str:
     return url.replace("+psycopg2", "+psycopg").replace("postgresql://", "postgresql+psycopg://", 1)
 
 
-@pytest.mark.parametrize("table_name", ["memory_item", "user_workspace", "tenant_user"])
+@pytest.mark.parametrize(
+    "table_name", ["memory_item", "user_workspace", "tenant_user", "memory_writeback_job"]
+)
 def test_retention_cleanup_worker_has_sweep_grants(
     postgres_container: PostgresContainer, table_name: str
 ) -> None:

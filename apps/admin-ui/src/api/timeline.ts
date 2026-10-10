@@ -279,9 +279,13 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
         // B-168 —— 后端写回帧只带条数(不带正文);写 0 条也画,才看得到它花了多久。
         // 出错 / 被拦截没写成的标警示,别和「这轮没什么可记」看起来一样。
         const failed = ch.memory_writeback_failed === true;
+        // B-168 B2 —— 后台模式:本轮只落了任务,记忆在 ``end`` 之后写;别画成「写了 0 条」。
+        const queued = ch.memory_writeback_queued === true;
         push({ kind: "memory_writeback", receivedAt: at, node, tone: failed ? "warn" : "normal",
-          summary: i18n.t("console_runtime.memory_writeback", { n: ch.written_memory_count }),
-          detail: { count: ch.written_memory_count, failed }, durationMs: durationOf(ch) });
+          summary: queued
+            ? i18n.t("console_runtime.memory_writeback_queued")
+            : i18n.t("console_runtime.memory_writeback", { n: ch.written_memory_count }),
+          detail: { count: ch.written_memory_count, failed, queued }, durationMs: durationOf(ch) });
       }
     }
   }

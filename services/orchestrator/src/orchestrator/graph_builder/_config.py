@@ -41,6 +41,11 @@ TOKEN_SINK_KEY = "token_event_sink"  # noqa: S105 — a config dict key name, no
 #: control-plane 的两个 regenerate 入口(``spawn_run`` / ``RunQueueWorker``)。
 LLM_CACHE_BYPASS_KEY = "llm_cache_bypass"
 
+#: B-168 —— 这一轮的长期记忆写回在本轮内做,不交给后台。后台 worker 按 (name, version)
+#: 取**线上**配置执行;草稿试跑(``use_draft``)的记忆设置可能与线上不同,所以 run 入口
+#: 给草稿 run 设它。设置方:control-plane ``spawn_run``。
+MEMORY_WRITEBACK_INLINE_KEY = "memory_writeback_inline"
+
 #: An async callable that ships one token frame ``{step, channel, text}`` to the
 #: SSE bridge.
 TokenEventSink = Callable[[dict[str, Any]], Awaitable[None]]

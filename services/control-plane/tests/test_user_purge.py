@@ -41,6 +41,7 @@ from expert_work.persistence.agent_instance.memory import InMemoryAgentInstanceS
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.feedback_store import FeedbackRecord, InMemoryFeedbackStore
 from expert_work.persistence.image_upload import InMemoryImageUploadStore
+from expert_work.persistence.memory import InMemoryMemoryWritebackJobStore
 from expert_work.persistence.memory.dlq import InMemoryMemoryWritebackDLQ
 from expert_work.persistence.skill import InMemorySkillStore
 from expert_work.persistence.token_usage_store import InMemoryTokenUsageStore, TokenUsageRecord
@@ -128,11 +129,51 @@ def _approval(*, tenant: UUID, thread: UUID) -> ApprovalRecord:
     )
 
 
+class _JobsBeforeMemoryStore(InMemoryMemoryStore):
+    """B-168 —— 记下清记忆那一刻,该用户还剩几条后台写回任务。
+
+    任务必须先删:后台 worker 写记忆之前查任务行还在不在,行先没了它才会放弃;反过来
+    (先清记忆、后删任务)中间那段时间 worker 照样会写,清除之后记忆又冒出来。
+    """
+
+    def __init__(self, jobs: InMemoryMemoryWritebackJobStore) -> None:
+        super().__init__()
+        self.jobs = jobs
+        self.jobs_left_at_delete: list[int] = []
+
+    async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        self.jobs_left_at_delete.append(
+            sum(
+                1
+                for j in self.jobs._rows.values()
+                if (j.tenant_id, j.user_id) == (tenant_id, user_id)
+            )
+        )
+        return await super().delete_all_for_user(tenant_id=tenant_id, user_id=user_id)
+
+
+async def _seed_job(
+    jobs: InMemoryMemoryWritebackJobStore, *, tenant: UUID, user: UUID, thread: UUID
+) -> UUID:
+    return await jobs.enqueue(
+        tenant_id=tenant,
+        user_id=user,
+        agent_name="alpha",
+        agent_version="1.0.0",
+        thread_id=thread,
+        run_id=uuid4(),
+        trace_id=None,
+        checkpoint_id="ckpt",
+        now=datetime.now(UTC),
+    )
+
+
 @pytest.mark.asyncio
 async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempotent() -> None:
     t1, t2 = uuid4(), uuid4()
     threads = InMemoryThreadMetaStore()
-    memory = InMemoryMemoryStore()
+    writeback_jobs = InMemoryMemoryWritebackJobStore()
+    memory = _JobsBeforeMemoryStore(writeback_jobs)
     memory_dlq = InMemoryMemoryWritebackDLQ()
     artifacts = InMemoryArtifactStore()
     mcp_oauth = InMemoryMcpOAuthConnectionStore()
@@ -176,6 +217,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
     orphan_thread = uuid4()  # no thread_meta row → survives thread purge → anonymized
     await runs.create(_run(tenant=t1, user=a.id, thread=orphan_thread))
     await memory.write([_mem(tenant=t1, user=a.id, content="a-secret")])
+    a_job = await _seed_job(writeback_jobs, tenant=t1, user=a.id, thread=t_a)
     await token_usage.insert(_tok(tenant=t1, user=a.id))
     await artifacts.save_version(
         tenant_id=t1,
@@ -223,6 +265,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
 
     # --- User B (same tenant) + User C (other tenant) — must survive intact. ---
     await memory.write([_mem(tenant=t1, user=b.id, content="b-keep")])
+    b_job = await _seed_job(writeback_jobs, tenant=t1, user=b.id, thread=uuid4())
     await token_usage.insert(_tok(tenant=t1, user=b.id))
     await memory.write([_mem(tenant=t2, user=c.id, content="c-keep")])
     await token_usage.insert(_tok(tenant=t2, user=c.id))
@@ -244,6 +287,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
         runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
         memory=memory,
         memory_dlq=memory_dlq,
+        memory_writeback_jobs=writeback_jobs,
         artifacts=artifacts,
         mcp_oauth=mcp_oauth,
         agent_instances=agent_instances,
@@ -273,6 +317,11 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
 
     # --- A's high-PII rows are gone. ---
     assert summary.threads_purged == 1
+    # B-168 —— A 的后台记忆写回任务删了,而且删在清记忆之前;B 的还在。
+    assert summary.deleted["memory_writeback_job"] == 1
+    assert not await writeback_jobs.exists(job_id=a_job)
+    assert await writeback_jobs.exists(job_id=b_job)
+    assert memory.jobs_left_at_delete == [0]
     assert await threads.get(t_a, tenant_id=t1) is None
     assert await memory.list_for_user(tenant_id=t1, user_id=a.id) == []
     assert (
@@ -389,6 +438,7 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
         runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
         memory=memory,
         memory_dlq=memory_dlq,
+        memory_writeback_jobs=InMemoryMemoryWritebackJobStore(),
         artifacts=artifacts,
         mcp_oauth=mcp_oauth,
         agent_instances=agent_instances,
@@ -499,6 +549,7 @@ async def test_purge_user_deletes_user_upload_rows() -> None:
         runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
         memory=memory,
         memory_dlq=memory_dlq,
+        memory_writeback_jobs=InMemoryMemoryWritebackJobStore(),
         artifacts=artifacts,
         mcp_oauth=mcp_oauth,
         agent_instances=agent_instances,
@@ -605,6 +656,7 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
         runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
         memory=memory,
         memory_dlq=memory_dlq,
+        memory_writeback_jobs=InMemoryMemoryWritebackJobStore(),
         artifacts=artifacts,
         mcp_oauth=mcp_oauth,
         agent_instances=agent_instances,
@@ -705,6 +757,7 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
         runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
         memory=memory,
         memory_dlq=memory_dlq,
+        memory_writeback_jobs=InMemoryMemoryWritebackJobStore(),
         artifacts=artifacts,
         mcp_oauth=mcp_oauth,
         agent_instances=agent_instances,
@@ -847,6 +900,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
         runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
         memory=memory,
         memory_dlq=memory_dlq,
+        memory_writeback_jobs=InMemoryMemoryWritebackJobStore(),
         artifacts=artifacts,
         mcp_oauth=mcp_oauth,
         agent_instances=agent_instances,

@@ -88,6 +88,16 @@ export interface RunTokens {
   usage_by_model?: RunTokensBucket[];
 }
 
+/** B-168 —— 后台记忆写回任务的结果(控制台 run 详情专有,不进事件流)。
+ *  排队中 / 执行中时后四项为 ``null``;``failed`` = 写回跑完了但出错 / 被拦截没写成。 */
+export interface MemoryWritebackResult {
+  status: "pending" | "running" | "done" | "failed";
+  written_count: number | null;
+  failed: boolean | null;
+  queued_ms: number | null;
+  exec_ms: number | null;
+}
+
 export interface RunDetail {
   run_id: string;
   thread_id: string;
@@ -105,6 +115,9 @@ export interface RunDetail {
   agent_spec_sha256?: string | null;
   /** Runs-enrichment — per-run token summary (``null`` = no usage). */
   tokens?: RunTokens | null;
+  /** B-168 —— 这一轮的后台记忆写回结果;``null`` = 没落过任务(inline 模式 /
+   *  没开长期记忆 / 老 run)。老后端没有这个字段。 */
+  memory_writeback?: MemoryWritebackResult | null;
   /** Runs-enrichment — durable-row timestamps (``null`` when the run is
    *  only in the in-memory RunManager); the summary derives duration. */
   created_at?: string | null;

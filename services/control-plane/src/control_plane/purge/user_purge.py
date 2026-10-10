@@ -47,7 +47,7 @@ from expert_work.persistence.curation import CurationCandidateStore, EvalDataset
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.mcp_oauth_connection.base import McpOAuthConnectionStore
-from expert_work.persistence.memory import MemoryStore, MemoryWritebackDLQ
+from expert_work.persistence.memory import MemoryStore, MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
@@ -80,6 +80,8 @@ class PurgeUserDeps:
     runtime: AgentRuntime
     memory: MemoryStore
     memory_dlq: MemoryWritebackDLQ
+    #: B-168 —— 记忆后台写回任务(只存指针,但没删的话 worker 会在清除后把记忆写回去)。
+    memory_writeback_jobs: MemoryWritebackJobStore
     artifacts: ArtifactStore
     mcp_oauth: McpOAuthConnectionStore
     agent_instances: AgentInstanceStore
@@ -354,6 +356,14 @@ async def purge_user(
     )
 
     # 2) HARD-DELETE the high-PII per-user stores.
+    # B-168 —— 后台记忆写回任务删在清记忆之前:worker 写记忆前会查任务行还在不在,
+    # 行先没了它就放弃;反过来,两步之间 worker 照样能写,清除之后记忆又冒出来。
+    summary.deleted["memory_writeback_job"] = await _step(
+        summary,
+        "memory_writeback_job",
+        deps.memory_writeback_jobs.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
+        default=0,
+    )
     summary.deleted["memory_item"] = await _step(
         summary,
         "memory_item",

@@ -37,7 +37,7 @@ from orchestrator.agent_factory import (
     _build_provider,
     _chat_stream_deadline_s,
     _compression_model,
-    _memory_model,
+    memory_model,
 )
 from orchestrator.context import ToolResultPruner
 from orchestrator.llm import FakeEmbedder, RateLimitedProvider
@@ -1119,28 +1119,28 @@ async def test_build_agent_wires_the_compressor_to_the_compression_router(monkey
     ]
 
 
-def test_memory_model_defaults_to_cheap_sibling_with_thinking_off() -> None:
+def testmemory_model_defaults_to_cheap_sibling_with_thinking_off() -> None:
     """B-168 —— 没写 ``when: memory`` 规则时,记忆调用换同一家的便宜型号并关思考;主模型挂在
     备用链上,也关思考(备用时同样不该长思考)。glm-5.3 关不掉思考,由下发层落到最低档。"""
     spec = _spec(provider="glm", name="glm-5.3", api_key_ref=f"secret://{_GLM_KEY_NAME}")
-    model = _memory_model(spec)
+    model = memory_model(spec)
     assert model.name == "glm-5.3-flash"
     assert model.thinking_enabled is False
     assert [(m.name, m.thinking_enabled) for m in model.fallback] == [("glm-5.3", False)]
 
 
-def test_memory_model_without_cheap_sibling_keeps_main_but_turns_thinking_off() -> None:
+def testmemory_model_without_cheap_sibling_keeps_main_but_turns_thinking_off() -> None:
     """B-168 —— 映射表里没有便宜型号时仍用主模型,但思考照样关(与压缩不同:压缩此时原样用主模型)。
     10-09 测试环境实证:deepseek-v4-flash 开思考,记忆两次调用输出 248 至 4,738 token,
     挡结束帧最多 36 秒。"""
     spec = _spec(provider="deepseek", name="deepseek-v4-flash", thinking_enabled=True)
-    model = _memory_model(spec)
+    model = memory_model(spec)
     assert model.name == "deepseek-v4-flash"
     assert model.thinking_enabled is False
     assert model.fallback == []
 
 
-def test_memory_model_rule_with_thinking_settings_wins_verbatim() -> None:
+def testmemory_model_rule_with_thinking_settings_wins_verbatim() -> None:
     """B-168 —— 显式的 ``when: memory`` 规则设了思考档位就原样使用,不换型号也不动思考。"""
     doc = deepcopy(_MINIMAL_SPEC)
     rule_model = {
@@ -1150,26 +1150,26 @@ def test_memory_model_rule_with_thinking_settings_wins_verbatim() -> None:
         "effort": "high",
     }
     doc["spec"]["routing"] = {"rules": [{"when": "memory", "model": rule_model}]}
-    model = _memory_model(AgentSpec.model_validate(doc))
+    model = memory_model(AgentSpec.model_validate(doc))
     assert model.name == "glm-5.3"
     assert model.effort == "high"
     assert model.thinking_enabled is None
 
 
-def test_memory_model_rule_without_thinking_settings_turns_thinking_off() -> None:
+def testmemory_model_rule_without_thinking_settings_turns_thinking_off() -> None:
     """B-168 —— 规则只写了型号(控制台的模型选择器只填厂商和型号)时,也照默认关思考;
     否则选了模型反而按厂商默认开着思考。"""
     doc = deepcopy(_MINIMAL_SPEC)
     rule_model = {"provider": "deepseek", "name": "deepseek-v4-pro"}
     doc["spec"]["routing"] = {"rules": [{"when": "memory", "model": rule_model}]}
-    model = _memory_model(AgentSpec.model_validate(doc))
+    model = memory_model(AgentSpec.model_validate(doc))
     assert model.name == "deepseek-v4-pro"
     assert model.thinking_enabled is False
 
 
 @pytest.mark.asyncio
 async def test_build_step_routers_memory_defaults_to_cheap_sibling() -> None:
-    """B-168 —— ``memory`` 路由按 :func:`_memory_model` 建:便宜型号在前、主模型在备用链上。"""
+    """B-168 —— ``memory`` 路由按 :func:`memory_model` 建:便宜型号在前、主模型在备用链上。"""
     doc = deepcopy(_MINIMAL_SPEC)
     doc["spec"]["model"] = {
         "provider": "glm",
@@ -1413,6 +1413,62 @@ async def test_build_memory_nodes_passes_reranker_to_recall() -> None:
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
     assert spy.calls == 1  # the reranker was invoked → passthrough wired
+
+
+@pytest.mark.asyncio
+async def test_build_memory_nodes_passes_background_writeback_from_memory_env() -> None:
+    """B-168 —— ``MemoryEnv.writeback_jobs`` / ``wake_writeback`` reach the write-back
+    node (background mode: it enqueues the agent's name + version and wakes the
+    worker); the pre-compaction flush stays inline."""
+    from uuid import uuid4
+
+    from langchain_core.messages import HumanMessage
+
+    from expert_work.persistence.memory import InMemoryMemoryWritebackJobStore
+    from orchestrator.agent_factory import _build_memory_nodes
+
+    async def _dummy_llm(*, messages: object, tools: object) -> object:
+        raise AssertionError("background write-back must not call the LLM in the run")
+
+    wakes: list[int] = []
+
+    def _wake() -> None:
+        wakes.append(1)
+
+    jobs = InMemoryMemoryWritebackJobStore()
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["memory"] = {"long_term": {"write_back": True}}
+    spec = AgentSpec.model_validate(doc)
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+
+    _recall, writeback, _flush = _build_memory_nodes(
+        spec,
+        memory_env=MemoryEnv(
+            store=InMemoryMemoryStore(),
+            embedder=FakeEmbedder(dim=16),
+            writeback_jobs=jobs,
+            wake_writeback=_wake,
+        ),
+        llm_caller=_dummy_llm,  # type: ignore[arg-type]
+    )
+    assert writeback is not None
+    out = await writeback(
+        {"messages": [HumanMessage(content="q")], "step_count": 0, "max_steps": 5},  # type: ignore[arg-type]
+        {
+            "configurable": {
+                "tenant_id": str(tenant),
+                "user_id": str(user),
+                "thread_id": str(uuid4()),
+                "run_id": str(run),
+                "checkpoint_map": {"": "ckpt"},
+            }
+        },
+    )
+    assert out["memory_writeback_queued"] is True
+    job = await jobs.get_by_run(tenant_id=tenant, run_id=run)
+    assert job is not None
+    assert (job.agent_name, job.agent_version) == (spec.metadata.name, spec.metadata.version)
+    assert wakes == [1]
 
 
 @pytest.mark.asyncio

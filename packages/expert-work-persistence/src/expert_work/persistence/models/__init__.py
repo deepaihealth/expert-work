@@ -31,6 +31,7 @@ from expert_work.persistence.models.mcp_connector_catalog import McpConnectorCat
 from expert_work.persistence.models.mcp_oauth_connection import McpOAuthConnectionRow
 from expert_work.persistence.models.memory_item import MemoryItemRow
 from expert_work.persistence.models.memory_writeback_dlq import MemoryWritebackDLQRow
+from expert_work.persistence.models.memory_writeback_job import MemoryWritebackJobRow
 from expert_work.persistence.models.model_rate_card import ModelRateCardRow
 from expert_work.persistence.models.platform_agent_template import (
     PlatformAgentTemplateRow,
@@ -128,6 +129,7 @@ __all__ = [
     "McpOAuthConnectionRow",
     "MemoryItemRow",
     "MemoryWritebackDLQRow",
+    "MemoryWritebackJobRow",
     "ModelRateCardRow",
     "PlatformAgentTemplateRow",
     "PlatformBillingConfigRow",

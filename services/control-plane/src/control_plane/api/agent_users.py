@@ -312,6 +312,7 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         runtime=state.agent_runtime,
         memory=state.memory_repo,
         memory_dlq=state.memory_writeback_dlq,
+        memory_writeback_jobs=state.memory_writeback_job_store,
         artifacts=state.artifact_store,
         mcp_oauth=state.mcp_oauth_connection_store,
         agent_instances=state.agent_instance_store,

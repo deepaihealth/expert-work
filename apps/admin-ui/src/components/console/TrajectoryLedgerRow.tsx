@@ -14,6 +14,7 @@ import { fmtDuration } from "../../pages/agent_detail/playground/duration_format
 import { kindLabel } from "./kind_label";
 import type { DisplayRow } from "./ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
+import { memoryRowText } from "./memory_row_text";
 import { processHeadline } from "./process_summary";
 
 // 标签文案搬去了共享的 `kind_label.ts`(详情头部、时间轴提示同一份);从这里
@@ -60,7 +61,7 @@ export function contentPartsOf(record: LedgerRecord, t: TFunction): ContentParts
   const body = toolCallOnly
     ? t("console.ledger_tool_call_only")
     : memory !== null
-      ? t(memory.direction === "recall" ? "console.row_memory_recall" : "console.row_memory_writeback", { n: memory.count })
+      ? memoryRowText(memory, t)
       : subagent !== null
         ? subagent.worker.taskExcerpt
         : named

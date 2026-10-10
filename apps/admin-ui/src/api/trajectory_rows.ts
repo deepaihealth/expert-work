@@ -11,6 +11,7 @@
  * 与 .superpowers/sdd/2026-08-19-debug-console-pr-a2-trajectory/task-2-brief.md.
  */
 import type { ThreadPlan } from "./plan";
+import type { MemoryWritebackResult } from "./runs";
 import { isPlan } from "./plan_reducer";
 import type { SseEvent } from "./sessions";
 import { serverMsOf } from "./sse_id";
@@ -45,7 +46,12 @@ export type PlanRow = RowBase & {
   plannerSeq: number | null;
   stepsTotal: number; goal: string | null; reason: string | null; plan: ThreadPlan | null;
 };
-export type MemoryRow = RowBase & { kind: "memory"; direction: "recall" | "writeback"; count: number; detail: Record<string, unknown> };
+export type MemoryRow = RowBase & {
+  kind: "memory"; direction: "recall" | "writeback"; count: number; detail: Record<string, unknown>;
+  /** B-168 B2 —— 后台写回(`detail.queued`)那一行的任务结果,来自控制台 run 详情
+   *  (`withBackgroundWriteback`);事件流里没有它。 */
+  background?: MemoryWritebackResult;
+};
 export type ReflectRow = RowBase & { kind: "reflect"; verdict: "pass" | "revise"; detail: Record<string, unknown> };
 export type MarkerRow = RowBase & { kind: "compaction" | "retry" | "error" | "approval" | "guard" | "gap"; text: string };
 export type CompactRow = ThinkRow | ToolRow | SubagentRow | PlanRow | MemoryRow | ReflectRow | MarkerRow;
@@ -318,6 +324,21 @@ export function promptInputsOf(data: unknown): Record<string, string> | null {
 export function ledgerRowsOf(events: readonly SseEvent[], input: TrajectoryInput): TrajectoryRow[] {
   const system = systemRowOf(events);
   return [...(system === null ? [] : [system]), userRowOf(input), ...rowsOf(events, { projection: "ledger" })];
+}
+
+/** B-168 B2 —— 把这一轮后台记忆写回的任务结果挂到「已排队」的写回行上(返回新数组,
+ *  不改入参)。inline 写回行不认它;`result` 为 null 原样返回。失败 / 没写成的标 warn。 */
+export function withBackgroundWriteback<R extends TrajectoryRow>(
+  rows: readonly R[],
+  result: MemoryWritebackResult | null | undefined,
+): readonly R[] {
+  if (result === null || result === undefined) return rows;
+  const bad = result.status === "failed" || result.failed === true;
+  return rows.map((row) =>
+    row.kind === "memory" && row.direction === "writeback" && row.detail.queued === true
+      ? { ...row, background: result, status: bad ? "warn" : row.status }
+      : row,
+  );
 }
 
 /** `GanttRow.key` → 轨迹行 id(泳道块点击定位用);找不到 → null。 */

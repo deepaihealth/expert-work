@@ -56,6 +56,9 @@ from orchestrator.graph_builder import make_reflect_node as make_reflect_node
 from orchestrator.graph_builder._config import (
     LLM_CACHE_BYPASS_KEY as LLM_CACHE_BYPASS_KEY,
 )
+from orchestrator.graph_builder._config import (
+    MEMORY_WRITEBACK_INLINE_KEY as MEMORY_WRITEBACK_INLINE_KEY,
+)
 from orchestrator.llm import (
     AllProvidersExhaustedError as AllProvidersExhaustedError,
 )
@@ -167,6 +170,7 @@ __all__ = [
     "DEFAULT_MAX_STEPS",
     "DEFAULT_STREAM_MODE",
     "LLM_CACHE_BYPASS_KEY",
+    "MEMORY_WRITEBACK_INLINE_KEY",
     "PLACEHOLDER_CONTENT",
     "ActionJudge",
     "ActionVerdict",

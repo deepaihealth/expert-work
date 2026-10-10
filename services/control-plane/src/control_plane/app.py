@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse
 from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from control_plane.advisory_locks import MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api import (
     build_agent_schema_router,
@@ -167,7 +168,11 @@ from control_plane.mcp_oauth import default_http_client
 from control_plane.mcp_oauth_refresh import McpOAuthRefresher
 from control_plane.mcp_oauth_refresh_lock import PgMcpOAuthRefreshLock
 from control_plane.member_activation import MemberActivationMiddleware
-from control_plane.memory import MemoryDLQWorker
+from control_plane.memory import MemoryDLQWorker, MemoryWritebackWorker
+from control_plane.memory.writeback_processor import (
+    MemoryWritebackProcessor,
+    make_router_caller_factory,
+)
 from control_plane.memory_consolidator import (
     ConsolidatorAuxModel,
     MemoryConsolidator,
@@ -222,6 +227,7 @@ from control_plane.runtime import (
     DynamicResolvingEmbedder,
     DynamicResolvingReranker,
     _build_mcp_client,
+    _resolve_template_extends,
     build_mcp_pool,
     build_middleware_env,
     build_sandbox_runtime,
@@ -358,10 +364,13 @@ from expert_work.persistence.mcp_oauth_connection import (
 from expert_work.persistence.memory import (
     InMemoryMemoryStore,
     InMemoryMemoryWritebackDLQ,
+    InMemoryMemoryWritebackJobStore,
     MemoryStore,
     MemoryWritebackDLQ,
+    MemoryWritebackJobStore,
     SqlMemoryStore,
     SqlMemoryWritebackDLQ,
+    SqlMemoryWritebackJobStore,
 )
 from expert_work.persistence.platform_agent_template import (
     InMemoryPlatformAgentTemplateStore,
@@ -658,6 +667,11 @@ def create_app(
     # memory store's backing (SQL when sql_stores is set, else in-memory).
     resolved_memory_dlq: MemoryWritebackDLQ = (
         sql_stores.memory_dlq if sql_stores else InMemoryMemoryWritebackDLQ()
+    )
+    # B-168 —— 记忆后台写回的任务表。不管当前是哪种模式都建:清除用户 / 删会话要删
+    # 它的行(从 background 切回 inline 之前落下的行还在)。
+    resolved_memory_writeback_jobs: MemoryWritebackJobStore = (
+        sql_stores.memory_writeback_job if sql_stores else InMemoryMemoryWritebackJobStore()
     )
     # Stream J.9 — artifact registry backing save_artifact / list_artifacts
     # and the artifact API. The sandbox runtime backs artifact content
@@ -1393,6 +1407,7 @@ def create_app(
             # agent cache is still empty — swapping the builder is
             # race-free. An injected runtime (tests) is left untouched.
             curation_worker: CurationWorker | None = None
+            memory_writeback_worker: MemoryWritebackWorker | None = None
             skill_evolution_worker: SkillEvolutionWorker | None = None
             skill_rollback_monitor: RollbackMonitor | None = None
             feedback_consumer: FeedbackConsumerWorker | None = None
@@ -1815,6 +1830,46 @@ def create_app(
                     # RRF order when rerank is unconfigured.
                     reranker=reranker,
                 )
+                # B-168 —— 记忆后台写回 worker,只在 ``background`` 模式下建(默认
+                # ``inline`` 不起,run 的行为不变)。它要的依赖(记忆库 / 嵌入 / DLQ、平台
+                # 凭据、共享 HTTP、全局限流、检查点)都只在这个分支里有。
+                if resolved_settings.memory_writeback_mode == "background":
+                    _memory_template_resolver = _platform_template_resolver
+
+                    async def _resolve_memory_spec(spec: AgentSpec) -> AgentSpec:
+                        return await _resolve_template_extends(spec, _memory_template_resolver)
+
+                    memory_writeback_worker = MemoryWritebackWorker(
+                        store=resolved_memory_writeback_jobs,
+                        processor=MemoryWritebackProcessor(
+                            agent_specs=resolved_repo,
+                            memory_env=memory_env,
+                            checkpointer=checkpointer,
+                            caller_factory=make_router_caller_factory(
+                                secret_store=resolved_secret_store,
+                                credentials_resolver=credentials_resolver,
+                                middleware_env=middleware_env,
+                                http_client=shared_http,
+                                rate_limiter_factory=llm_rate_limiter_factory,
+                            ),
+                            usage_store=resolved_token_usage,
+                            resolve_spec=_resolve_memory_spec,
+                        ),
+                        interval_s=resolved_settings.memory_writeback_worker_interval_s,
+                        lease_s=resolved_settings.memory_writeback_lease_s,
+                        max_attempts=resolved_settings.memory_writeback_max_attempts,
+                        concurrency=resolved_settings.memory_writeback_worker_concurrency,
+                        # 设计稿 §3.2:关机时等手上这条的上限复用 run 收口的上限;两者并行等,
+                        # 不叠加(见下方关机顺序)。
+                        stop_timeout_s=resolved_settings.run_drain_timeout_s,
+                    )
+                    # B-168 —— 往下传给建图:写回节点据此只落任务、捅本副本 worker 的快路径。
+                    # worker 自己的处理器拿的是上面那份(它只用记忆库 / 嵌入 / DLQ)。
+                    memory_env = replace(
+                        memory_env,
+                        writeback_jobs=resolved_memory_writeback_jobs,
+                        wake_writeback=memory_writeback_worker.wake,
+                    )
                 # Stream J.4 — the ChildAgentBuilder lets a SubAgentTool
                 # resolve an agent_ref and recursively build the sub-agent;
                 # the top-level agent's ToolEnv carries it so delegation
@@ -2045,6 +2100,9 @@ def create_app(
             )
             memory_dlq_worker.start()
             _app.state.memory_dlq_worker = memory_dlq_worker
+            if memory_writeback_worker is not None:
+                memory_writeback_worker.start()
+                _app.state.memory_writeback_worker = memory_writeback_worker
             # Capability Uplift Sprint #7 (Mini-ADRs U-34 / U-39) —
             # MemoryConsolidator. Started whenever the scheduler is enabled
             # (the always-present dynamic embedder embeds the consolidated
@@ -2363,6 +2421,15 @@ def create_app(
                 #    收口分支里的库写不可靠。
                 run_manager_for_drain = resolved_agent_runtime.run_manager
                 run_manager_for_drain.mark_shutting_down()
+                # B-168 —— 记忆后台写回 worker 最先停领新任务(下面每一步都可能要等几秒,
+                # 这期间它不该再领);手上那几条与下面的 run 收口并行等完(上限各自
+                # ``run_drain_timeout_s``,不叠加 —— 先后等会让最坏情形翻倍,超过 k8s 优雅期)。
+                # 做不完的留给租约过期后别的副本接手。
+                memory_writeback_stopping = (
+                    asyncio.create_task(memory_writeback_worker.stop())
+                    if memory_writeback_worker is not None
+                    else None
+                )
                 # PR-E3a — stop the subscriber before its Redis client is
                 # closed by the exit stack (LIFO callbacks run after this).
                 await invalidation_bus.stop()
@@ -2416,6 +2483,8 @@ def create_app(
                         resolved_audit, run_manager_for_drain.instance_id
                     ),
                 )
+                if memory_writeback_stopping is not None:
+                    await memory_writeback_stopping
                 # Stream HX-7 — drain the Langfuse SDK's background queue
                 # before the process exits; the recording stub has no
                 # shutdown, hence the duck-typed lookup.
@@ -2597,6 +2666,8 @@ def create_app(
     # Phase 3a (purge_user) — expose the writeback DLQ so the cascade purge can
     # drop a purged user's pending memory writebacks (they carry extracted PII).
     app.state.memory_writeback_dlq = resolved_memory_dlq
+    # B-168 —— 同理:清除用户 / 删会话删记忆后台写回任务;B2 的控制台按 run 读它。
+    app.state.memory_writeback_job_store = resolved_memory_writeback_jobs
     if not hasattr(app.state, "embedder"):
         app.state.embedder = None
 
@@ -2825,6 +2896,7 @@ class _SqlStores:
     tenant_user: TenantUserStore
     memory: MemoryStore
     memory_dlq: MemoryWritebackDLQ  # Stream K.K7
+    memory_writeback_job: MemoryWritebackJobStore  # B-168
     knowledge: KnowledgeStore
     skill: SkillStore
     image_upload: ImageUploadStore  # Stream J.6.补强-3 (Mini-ADR J-32)
@@ -3049,6 +3121,9 @@ def _build_sql_stores(settings: Settings) -> _SqlStores:
         tenant_user=SqlTenantUserStore(session_factory),
         memory=SqlMemoryStore(session_factory),
         memory_dlq=SqlMemoryWritebackDLQ(session_factory),
+        memory_writeback_job=SqlMemoryWritebackJobStore(
+            session_factory, claim_lock_classid=MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
+        ),
         knowledge=SqlKnowledgeStore(session_factory),
         skill=SqlSkillStore(session_factory),
         image_upload=SqlImageUploadStore(session_factory),

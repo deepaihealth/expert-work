@@ -1263,6 +1263,13 @@ export interface TranslationKeys {
     row_plan_create: string;
     row_memory_recall: string;
     row_memory_writeback: string;
+    row_memory_writeback_queued: string;
+    row_memory_writeback_bg_status: string;
+    row_memory_writeback_bg_done: string;
+    row_memory_writeback_bg_not_written: string;
+    memory_writeback_status_pending: string;
+    memory_writeback_status_running: string;
+    memory_writeback_status_failed: string;
     row_reflect_pass: string;
     row_reflect_revise: string;
     row_subagent: string;
@@ -1462,6 +1469,7 @@ export interface TranslationKeys {
     gap_frames: string;
     memory_recall: string;
     memory_writeback: string;
+    memory_writeback_queued: string;
     planner: string;
     reflect_pass: string;
     reflect_revise: string;
@@ -4618,6 +4626,13 @@ const en: TranslationKeys = {
     row_plan_create: "Plan drafted · {{n}} steps",
     row_memory_recall: "Memory recall · {{n}}",
     row_memory_writeback: "Memory written · {{n}}",
+    row_memory_writeback_queued: "Background memory write · queued",
+    row_memory_writeback_bg_status: "Background memory write · {{status}}",
+    row_memory_writeback_bg_done: "Background memory write · {{n}} · queued {{queued}} · ran {{exec}}",
+    row_memory_writeback_bg_not_written: "Background memory write · not written · queued {{queued}} · ran {{exec}}",
+    memory_writeback_status_pending: "queued",
+    memory_writeback_status_running: "running",
+    memory_writeback_status_failed: "failed",
     row_reflect_pass: "Reflection · pass",
     row_reflect_revise: "Reflection · revise",
     row_subagent: "Sub-agent · {{name}}",
@@ -4817,6 +4832,7 @@ const en: TranslationKeys = {
     gap_frames: "Frames {{from}}–{{to}} missing (unrecoverable on this connection; replaying usually restores them)",
     memory_recall: "Memory recall · {{n}}",
     memory_writeback: "Memory written · {{n}}",
+    memory_writeback_queued: "Background memory write · queued",
     planner: "Plan drafted · goal + {{n}} steps",
     reflect_pass: "Reflection · pass",
     reflect_revise: "Reflection · revise",

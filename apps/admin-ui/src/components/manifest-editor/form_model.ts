@@ -518,7 +518,7 @@ export const readReflectionEvaluatorOn = (m: unknown): boolean =>
 // The long-term memory calls (write-back extraction / reconcile / pre-compaction
 // flush / read verify / query rewrite) route to this model. Empty = no rule =
 // the platform default: the main model's same-vendor cheap sibling with
-// thinking off (agent_factory ``_memory_model``).
+// thinking off (agent_factory ``memory_model``).
 // Last rule wins — same as the backend's ``_step_model`` when YAML repeats it.
 export const readMemoryModel = (m: unknown): ModelFields | undefined =>
   (specOf(m).routing?.rules ?? []).filter((r) => r.when === "memory").at(-1)?.model;

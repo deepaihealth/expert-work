@@ -103,6 +103,7 @@ from expert_work.common.observability import (
 from expert_work.common.spotlight import spotlight_untrusted
 from expert_work.persistence import ApprovalStore
 from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.memory import MemoryWritebackJob, MemoryWritebackJobStore
 from expert_work.persistence.rls import current_user_id_var
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
@@ -139,6 +140,7 @@ from expert_work.runtime.runs.store import MAX_LIST_LIMIT, _clamp_limit
 from orchestrator import (
     APPROVAL_TURN_RESET,
     LLM_CACHE_BYPASS_KEY,
+    MEMORY_WRITEBACK_INLINE_KEY,
     AgentFactoryError,
     BuiltAgent,
     pending_request_binding,
@@ -649,6 +651,10 @@ def _get_run_store(request: Request) -> RunStore:
 
 def _get_token_usage_store(request: Request) -> TokenUsageStore:
     return request.app.state.token_usage_store  # type: ignore[no-any-return]
+
+
+def _get_memory_writeback_jobs(request: Request) -> MemoryWritebackJobStore:
+    return request.app.state.memory_writeback_job_store  # type: ignore[no-any-return]
 
 
 def _get_run_event_store(request: Request) -> RunEventStore | None:
@@ -1639,6 +1645,10 @@ async def _start_run(
     configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+    if payload.use_draft:
+        # B-168 —— 后台记忆写回按 (name, version) 取线上配置执行,而这一轮跑的是草稿:
+        # 草稿 run 的记忆写回留在本轮内,用的就是草稿自己的设置。
+        configurable[MEMORY_WRITEBACK_INLINE_KEY] = True
     if replay_messages is not None:
         # B-66 —— ``:regenerate`` 重放的 [System, Human, (本轮输入段)?] 与原轮字节
         # 相同,不绕开响应缓存就必然命中、把旧答案原样端回来。``:edit`` 输入是新的,
@@ -1916,6 +1926,7 @@ def build_runs_router() -> APIRouter:
         approvals: Annotated[ApprovalStore, Depends(_get_approval_store)],
         runs: Annotated[RunStore, Depends(_get_run_store)],
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
+        memory_jobs: Annotated[MemoryWritebackJobStore, Depends(_get_memory_writeback_jobs)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # W2 read scope — a concrete id lets a system_admin drill into a
         # foreign tenant's run from the tenant switcher; "*" is meaningless
@@ -2007,6 +2018,10 @@ def build_runs_router() -> APIRouter:
                     [trace_id], exclude_usage_kinds=NON_BILLABLE_USAGE_KINDS
                 )
                 tokens = _tokens_to_dict(totals.get(trace_id))
+            # B-168 —— 后台记忆写回在 ``end`` 之后才跑,结果记在任务行上、不进事件流;
+            # 控制台的轨迹从这里拼「后台记忆写回」那一行。本接口 ``console_only``,
+            # API Key 平面看不到。
+            memory_job = await memory_jobs.get_by_run(tenant_id=target_tenant, run_id=run_id)
         return JSONResponse(
             content={
                 "run_id": str(run_id),
@@ -2023,6 +2038,7 @@ def build_runs_router() -> APIRouter:
                     persisted.agent_spec_sha256 if persisted is not None else None
                 ),
                 "tokens": tokens,
+                "memory_writeback": _memory_writeback_to_dict(memory_job),
                 # Timestamps from the durable row (None when the run is only in
                 # the in-memory RunManager) — the detail summary derives duration.
                 "created_at": (persisted.created_at.isoformat() if persisted is not None else None),
@@ -2706,6 +2722,20 @@ def _bucket_to_dict(bucket: ModelTokenTotals) -> dict[str, Any]:
         "cache_read_tokens": bucket.cache_read_tokens,
         "total_tokens": bucket.total_tokens,
         "llm_calls": bucket.llm_calls,
+    }
+
+
+def _memory_writeback_to_dict(job: MemoryWritebackJob | None) -> dict[str, Any] | None:
+    """B-168 —— 控制台 run 详情里的后台记忆写回结果;``None`` = 这个 run 没落过任务
+    (inline 模式、没开长期记忆,或 B-168 之前的 run)。排队中 / 执行中时后四项是 ``None``。"""
+    if job is None:
+        return None
+    return {
+        "status": job.status,
+        "written_count": job.written_count,
+        "failed": job.failed,
+        "queued_ms": job.queued_ms,
+        "exec_ms": job.exec_ms,
     }
 
 

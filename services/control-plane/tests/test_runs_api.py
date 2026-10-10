@@ -1068,6 +1068,106 @@ async def test_get_run_includes_token_summary(runs_client: AsyncClient) -> None:
     assert tokens["models"] == ["claude-sonnet-4-6"]
 
 
+async def _seed_success_run(runs_client: AsyncClient, thread_id: str) -> UUID:
+    from expert_work.runtime.runs import RunInfo, RunStatus
+
+    run_id = uuid4()
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    await app.state.run_store.create(
+        RunInfo(
+            run_id=run_id,
+            tenant_id=DEFAULT_DEV_TENANT_ID,
+            thread_id=UUID(thread_id),
+            user_id=None,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CANCEL,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+        )
+    )
+    return run_id
+
+
+@pytest.mark.asyncio
+async def test_get_run_carries_the_background_memory_writeback_result(
+    runs_client: AsyncClient,
+) -> None:
+    """B-168 —— 控制台的 run 详情带上后台记忆写回的结果(来自任务表,不进事件流);
+    API Key 平面摸不到这个接口(``console_only``)。"""
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_success_run(runs_client, thread_id)
+    jobs = runs_client._transport.app.state.memory_writeback_job_store  # type: ignore[attr-defined,union-attr]
+    t0 = datetime.now(UTC)
+    await jobs.enqueue(
+        tenant_id=DEFAULT_DEV_TENANT_ID,
+        user_id=uuid4(),
+        agent_name="code-reviewer",
+        agent_version="1.0.0",
+        thread_id=UUID(thread_id),
+        run_id=run_id,
+        trace_id=None,
+        message_count=4,
+        now=t0,
+    )
+
+    queued = (await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")).json()
+    assert queued["memory_writeback"] == {
+        "status": "pending",
+        "written_count": None,
+        "failed": None,
+        "queued_ms": None,
+        "exec_ms": None,
+    }
+
+    job = await jobs.claim_next(now=t0, lease_s=60, max_attempts=3)
+    assert job is not None
+    await jobs.finish(
+        job_id=job.id,
+        attempt=job.attempts,
+        written_count=2,
+        failed=False,
+        queued_ms=850,
+        exec_ms=4200,
+        error=None,
+        now=t0,
+    )
+    done = await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")
+    assert done.status_code == 200
+    assert done.json()["memory_writeback"] == {
+        "status": "done",
+        "written_count": 2,
+        "failed": False,
+        "queued_ms": 850,
+        "exec_ms": 4200,
+    }
+
+    sa_jwt = make_test_jwt(
+        tenant_id=_DEFAULT_TENANT, subject="sa-1", sub_type="service_account", roles=("admin",)
+    )
+    denied = await runs_client.get(
+        f"/v1/sessions/{thread_id}/runs/{run_id}",
+        headers={"Authorization": f"Bearer {sa_jwt}"},
+    )
+    assert denied.status_code == 403
+    assert "memory_writeback" not in denied.text
+
+
+@pytest.mark.asyncio
+async def test_get_run_without_a_background_job_has_null_memory_writeback(
+    runs_client: AsyncClient,
+) -> None:
+    thread_id = await _create_session(runs_client)
+    run_id = await _seed_success_run(runs_client, thread_id)
+
+    body = (await runs_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}")).json()
+
+    assert body["memory_writeback"] is None
+
+
 @pytest.mark.asyncio
 async def test_get_run_tokens_buckets_main_and_worker_by_model(runs_client: AsyncClient) -> None:
     """B-42 —— ``tokens.usage_by_model``:主 Agent 模型 A 与 worker 模型 B 各一桶。

@@ -14,16 +14,24 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.conversation_channel import HIDE_FROM_UI
 from expert_work.persistence import InMemoryMemoryStore
+from expert_work.persistence.memory import InMemoryMemoryWritebackJobStore
+from expert_work.persistence.rls import (
+    bypass_rls_var,
+    current_tenant_id_var,
+    current_user_id_var,
+)
 from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import (
+    MEMORY_WRITEBACK_INLINE_KEY,
     GraphRunner,
     ToolRegistry,
     build_react_graph,
     make_memory_recall_node,
     make_memory_writeback_node,
 )
+from orchestrator.graph_builder import memory as memory_module
 from orchestrator.graph_builder.memory import (
     _reconcile_and_apply,
     _verify_memories,
@@ -671,6 +679,199 @@ async def test_memory_writeback_node_extracts_and_persists() -> None:
     assert [m.content for m in stored] == ["likes tea"]
 
 
+class _BrokenJobStore(InMemoryMemoryWritebackJobStore):
+    async def enqueue(self, **kwargs: Any) -> UUID:
+        del kwargs
+        raise RuntimeError("db down")
+
+
+@dataclass
+class _ScopeSpyJobStore(InMemoryMemoryWritebackJobStore):
+    """记下落任务那一刻的 RLS 上下文(``WITH CHECK`` 按 ``app.tenant_id``)。"""
+
+    seen: list[tuple[UUID | None, UUID | None, bool]] = field(default_factory=list)
+
+    async def enqueue(self, **kwargs: Any) -> UUID:
+        self.seen.append(
+            (current_tenant_id_var.get(), current_user_id_var.get(), bypass_rls_var.get())
+        )
+        return await super().enqueue(**kwargs)
+
+
+def _background_node(
+    store: InMemoryMemoryStore, llm: _RecordingLLM, jobs: InMemoryMemoryWritebackJobStore
+) -> Any:
+    return make_memory_writeback_node(
+        memory_store=store,
+        embedder=FakeEmbedder(dim=_DIM),
+        llm_caller=llm,
+        agent_name="mem-agent",
+        agent_version="1.0.0",
+        writeback_jobs=jobs,
+    )
+
+
+def _run_config(tenant: UUID, user: UUID, *, run_id: UUID | None) -> dict[str, Any]:
+    configurable: dict[str, Any] = {
+        "tenant_id": str(tenant),
+        "user_id": str(user),
+        "thread_id": str(uuid4()),
+        "checkpoint_map": {"": "ckpt-1"},
+    }
+    if run_id is not None:
+        configurable["run_id"] = str(run_id)
+    return {"configurable": configurable}
+
+
+_EXTRACT_TEA = AIMessage(content='{"memories": [{"kind": "fact", "content": "likes tea"}]}')
+
+
+@pytest.mark.asyncio
+async def test_background_writeback_enqueues_the_pointer_without_calling_the_model() -> None:
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+    config = _run_config(tenant, user, run_id=run)
+
+    out = await _background_node(store, llm, jobs)(_state("done"), config)
+
+    assert out == {
+        "written_memory_count": 0,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": True,
+    }
+    assert llm.calls == []
+    job = await jobs.get_by_run(tenant_id=tenant, run_id=run)
+    assert job is not None
+    assert (job.checkpoint_id, job.message_count) == ("ckpt-1", 2)
+    assert str(job.thread_id) == config["configurable"]["thread_id"]
+
+
+@pytest.mark.asyncio
+async def test_background_enqueue_runs_under_the_runs_own_tenant_scope() -> None:
+    """RLS:run 的入口没设租户上下文时,落任务那一刻也带着本 run 的租户 / 用户。"""
+    store, jobs = InMemoryMemoryStore(), _ScopeSpyJobStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[])
+    assert current_tenant_id_var.get() is None
+
+    await _background_node(store, llm, jobs)(
+        _state("done"), _run_config(tenant, user, run_id=uuid4())
+    )
+
+    assert jobs.seen == [(tenant, user, False)]
+    assert current_tenant_id_var.get() is None  # reset afterwards
+
+
+@pytest.mark.asyncio
+async def test_background_enqueue_failure_falls_back_to_inline() -> None:
+    """(d) —— 落不了任务就在本轮里照旧写:丢记忆比 ``end`` 慢几秒更糟。"""
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+
+    out = await _background_node(store, llm, _BrokenJobStore())(
+        _state("done"), _run_config(tenant, user, run_id=uuid4())
+    )
+
+    # 配了后台却退回了 inline:``queued`` 明说 False,检查点里不留上一轮的 True。
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
+    assert len(await store.list_for_user(tenant_id=tenant, user_id=user)) == 1
+
+
+class _HangingJobStore(InMemoryMemoryWritebackJobStore):
+    """连接池耗尽的样子:插入一直等不到连接。"""
+
+    async def enqueue(self, **kwargs: Any) -> UUID:
+        del kwargs
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_enqueue_is_capped_and_falls_back_to_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """落任务等不到数据库时不能把 ``end`` 拖住:到时限就照旧在本轮里写。"""
+    monkeypatch.setattr(memory_module, "_ENQUEUE_TIMEOUT_S", 0.05, raising=False)
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+
+    out = await asyncio.wait_for(
+        _background_node(store, llm, _HangingJobStore())(
+            _state("done"), _run_config(tenant, user, run_id=uuid4())
+        ),
+        timeout=5,
+    )
+
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_running_the_writeback_node_twice_for_one_turn_queues_one_job() -> None:
+    """孤儿复活会把写回节点再跑一遍:同一个指针只落一行,也不再在本轮里写。"""
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user, run = uuid4(), uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[])
+    config = _run_config(tenant, user, run_id=run)
+    node = _background_node(store, llm, jobs)
+
+    first = await node(_state("done"), config)
+    second = await node(_state("done"), config)
+
+    assert first["memory_writeback_queued"] is True
+    assert second["memory_writeback_queued"] is True
+    assert await jobs.count_backlog() == 1
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_marked_inline_writes_in_the_run_even_in_background_mode() -> None:
+    """B-168 —— 草稿试跑(``MEMORY_WRITEBACK_INLINE_KEY``):worker 只认线上配置,这一轮在
+    本轮内写,不落任务。"""
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+    config = _run_config(tenant, user, run_id=uuid4())
+    config["configurable"][MEMORY_WRITEBACK_INLINE_KEY] = True
+
+    out = await _background_node(store, llm, jobs)(_state("done"), config)
+
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
+    assert await jobs.count_backlog() == 0
+
+
+@pytest.mark.asyncio
+async def test_background_without_a_run_id_falls_back_to_inline() -> None:
+    store, jobs = InMemoryMemoryStore(), InMemoryMemoryWritebackJobStore()
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(responses=[_EXTRACT_TEA])
+
+    out = await _background_node(store, llm, jobs)(
+        _state("done"), _run_config(tenant, user, run_id=None)
+    )
+
+    assert out == {
+        "written_memory_count": 1,
+        "memory_writeback_failed": False,
+        "memory_writeback_queued": False,
+    }
+    assert await jobs.count_backlog() == 0
+
+
 @pytest.mark.asyncio
 async def test_writeback_trajectory_omits_agent_system_prompt() -> None:
     # The extraction trajectory must not echo the agent's own system prompt: it
@@ -965,6 +1166,140 @@ async def test_flush_failure_enqueues_with_source_run_id() -> None:
     assert await dlq.count() == 1
     enqueued = next(iter(dlq._rows.values()))  # type: ignore[attr-defined]
     assert enqueued.source_run_id == str(run)
+
+
+@pytest.mark.asyncio
+async def test_before_store_runs_after_extraction_and_can_abort_the_write() -> None:
+    """B-168 —— 后台写回在写记忆之前问一次任务行还在不在(设计稿 §3.6)。
+
+    钩子在抽取 / 嵌入之后、任何写入(含去重合并)之前调用;它抛 ``RunCancelledError``
+    时这一批既不写进记忆库,也不进 DLQ(否则清除用户之后 DLQ 又把内容写回去)。
+    """
+    from expert_work.persistence.memory.dlq import InMemoryMemoryWritebackDLQ
+    from expert_work.runtime.cancellation import RunCancelledError
+    from orchestrator.graph_builder.memory import flush_messages_with_outcome
+
+    tenant, user = uuid4(), uuid4()
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(
+                content='{"memories": [{"kind": "fact", "content": "likes tea", '
+                '"importance": 0.9, "confidence": 0.9}]}'
+            )
+        ]
+        * 2
+    )
+    calls: list[int] = []
+
+    async def gone() -> None:
+        calls.append(len(llm.calls))
+        raise RunCancelledError("job purged")
+
+    store = InMemoryMemoryStore()
+    dlq = InMemoryMemoryWritebackDLQ()
+    with pytest.raises(RunCancelledError):
+        await flush_messages_with_outcome(
+            [HumanMessage(content="I like tea")],
+            memory_store=store,
+            embedder=FakeEmbedder(dim=_DIM),
+            llm_caller=llm,
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=None,
+            token=CancellationToken(),
+            dlq=dlq,
+            reconcile=True,
+            before_store=gone,
+        )
+    assert calls == [1]  # after the extraction call, before anything else
+    assert await store.list_for_user(tenant_id=tenant, user_id=user) == []
+    assert await dlq.count() == 0
+
+    async def still_there() -> None:
+        calls.append(len(llm.calls))
+
+    outcome = await flush_messages_with_outcome(
+        [HumanMessage(content="I like tea")],
+        memory_store=store,
+        embedder=FakeEmbedder(dim=_DIM),
+        llm_caller=llm,
+        tenant_id=tenant,
+        user_id=user,
+        thread_id=None,
+        token=CancellationToken(),
+        before_store=still_there,
+    )
+    assert outcome.written == 1
+    assert len(await store.list_for_user(tenant_id=tenant, user_id=user)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["UPDATE", "DELETE", "ADD"])
+async def test_before_store_guards_every_write_after_the_reconcile_call(op: str) -> None:
+    """B-168 —— 清除发生在去重合并那次模型调用期间(抽取之后、写入之前):每一次改记忆库
+    的操作(UPDATE 的 supersede、DELETE 的 expire、ADD 的 write)之前都要再问一次,
+    这时就整批放弃,记忆库保持原样。"""
+    from expert_work.runtime.cancellation import RunCancelledError
+    from orchestrator.graph_builder.memory import flush_messages_with_outcome
+
+    tenant, user = uuid4(), uuid4()
+    vector = (1.0, 0.0, 0.0, 0.0)
+    existing_id = uuid4()
+    store = InMemoryMemoryStore()
+    await store.write(
+        [
+            MemoryItem(
+                id=existing_id,
+                tenant_id=tenant,
+                user_id=user,
+                kind="fact",
+                content="lives in Paris",
+                embedding=vector,
+            )
+        ]
+    )
+    purged = False
+
+    async def llm(*, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]) -> AIMessage:
+        nonlocal purged
+        del tools
+        if "candidates" not in str(messages[-1].content):
+            return AIMessage(
+                content='{"memories": [{"kind": "fact", "content": "lives in Berlin", '
+                '"importance": 0.9, "confidence": 0.9}]}'
+            )
+        purged = True  # the user is purged while the reconcile call is in flight
+        return AIMessage(
+            content=f'{{"ops": [{{"index": 0, "op": "{op}", "target_id": "{existing_id}"}}]}}'
+        )
+
+    class _SameVector:
+        async def embed(
+            self, texts: Sequence[str], *, tenant_id: object
+        ) -> list[tuple[float, ...]]:
+            del tenant_id
+            return [vector for _ in texts]
+
+    async def guard() -> None:
+        if purged:
+            raise RunCancelledError("job purged")
+
+    with pytest.raises(RunCancelledError):
+        await flush_messages_with_outcome(
+            [HumanMessage(content="I moved to Berlin")],
+            memory_store=store,
+            embedder=_SameVector(),  # type: ignore[arg-type]
+            llm_caller=llm,
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=None,
+            token=CancellationToken(),
+            reconcile=True,
+            before_store=guard,
+        )
+    assert purged
+    current = await store.list_for_user(tenant_id=tenant, user_id=user)
+    assert [m.content for m in current] == ["lives in Paris"]
 
 
 # ---------------------------------------------------------------------------

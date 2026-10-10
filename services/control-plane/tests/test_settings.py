@@ -55,6 +55,25 @@ def test_background_task_switches_env_override(monkeypatch: pytest.MonkeyPatch) 
     assert settings.enable_reaper is False
 
 
+def test_memory_writeback_defaults_background() -> None:
+    """B-168 —— 默认 background(设计稿 §8 问题 1 拍板):``end`` 帧不等记忆写回。"""
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.memory_writeback_mode == "background"
+    assert settings.memory_writeback_worker_interval_s == 2.0
+    assert settings.memory_writeback_lease_s == 300.0
+    assert settings.memory_writeback_max_attempts == 3
+    assert settings.memory_writeback_worker_concurrency == 4
+
+
+def test_memory_writeback_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 逃生口:一个环境变量退回 inline。
+    monkeypatch.setenv("EXPERT_WORK_MEMORY_WRITEBACK_MODE", "inline")
+    assert Settings(_env_file=None).memory_writeback_mode == "inline"  # type: ignore[call-arg]
+    monkeypatch.setenv("EXPERT_WORK_MEMORY_WRITEBACK_MODE", "later")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
 def test_invalid_auth_mode_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXPERT_WORK_AUTH_MODE", "wat")
     with pytest.raises(ValidationError):

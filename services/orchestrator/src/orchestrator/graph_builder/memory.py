@@ -25,8 +25,10 @@ import asyncio
 import json
 import logging
 import math
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, NamedTuple, cast
 from uuid import UUID, uuid4
 
@@ -34,7 +36,11 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.conversation_channel import is_hidden
-from expert_work.common.observability import ExpertWorkComponent, expert_work_span
+from expert_work.common.observability import (
+    ExpertWorkComponent,
+    current_trace_id_hex,
+    expert_work_span,
+)
 from expert_work.common.search import mmr_select
 from expert_work.common.threat_patterns import scan_for_threats
 from expert_work.common.uplift_metrics import (
@@ -49,12 +55,18 @@ from expert_work.common.uplift_metrics import (
     record_memory_verify,
 )
 from expert_work.persistence import MemoryStore
-from expert_work.persistence.memory import MemoryWritebackDLQ
+from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.memory.base import MemoryInjectionBlockedError
+from expert_work.persistence.rls import (
+    bypass_rls_var,
+    current_tenant_id_var,
+    current_user_id_var,
+)
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.protocol import MemoryItem, MemoryRecallMode
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator.graph_builder._config import (
+    MEMORY_WRITEBACK_INLINE_KEY,
     cancellation_token,
     configurable_uuid,
     current_run_id,
@@ -64,6 +76,9 @@ from orchestrator.state import AgentState
 from orchestrator.tools.knowledge import Reranker
 
 logger = logging.getLogger(__name__)
+
+#: B-168 —— 后台写回在每次改记忆库之前调用的检查;抛 ``RunCancelledError`` = 放弃这批。
+BeforeStore = Callable[[], Awaitable[None]]
 
 #: 二期 P1.1 —— fire-and-forget bump_access 任务的强引用集合(RUF006:
 #: 裸 create_task 的返回值不被引用会被 GC 提前回收)。照 sse.py 的
@@ -757,6 +772,7 @@ async def _reconcile_and_apply(
     llm_caller: LLMCaller,
     token: CancellationToken,
     log_label: str,
+    before_store: BeforeStore | None = None,
 ) -> list[MemoryItem]:
     """Stream CM-7 (Mini-ADR CM-H4) — Mem0-style extract→update.
 
@@ -840,12 +856,16 @@ async def _reconcile_and_apply(
         if op == "NOOP":
             record_memory_reconcile(op="noop")
         elif op == "UPDATE" and target is not None:
-            updated = await _apply_update(item, target, memory_store=memory_store, token=token)
+            updated = await _apply_update(
+                item, target, memory_store=memory_store, token=token, before_store=before_store
+            )
             record_memory_reconcile(op="update" if updated else "degraded")
             if not updated:
                 direct.append(item)
         elif op == "DELETE" and target is not None:
-            deleted = await _apply_delete(item, target, memory_store=memory_store, token=token)
+            deleted = await _apply_delete(
+                item, target, memory_store=memory_store, token=token, before_store=before_store
+            )
             # The candidate is the retraction event — not stored either way.
             record_memory_reconcile(op="delete" if deleted else "degraded")
         elif op == "ADD":
@@ -859,10 +879,17 @@ async def _reconcile_and_apply(
 
 
 async def _apply_update(
-    item: MemoryItem, target: UUID, *, memory_store: MemoryStore, token: CancellationToken
+    item: MemoryItem,
+    target: UUID,
+    *,
+    memory_store: MemoryStore,
+    token: CancellationToken,
+    before_store: BeforeStore | None = None,
 ) -> bool:
     """Stream P5b — append-only UPDATE: supersede ``target`` with ``item``
     (close old row + open new versioned row) instead of overwriting in place."""
+    if before_store is not None:
+        await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
         written = await token.run_cancellable(
             memory_store.supersede(
@@ -881,10 +908,17 @@ async def _apply_update(
 
 
 async def _apply_delete(
-    item: MemoryItem, target: UUID, *, memory_store: MemoryStore, token: CancellationToken
+    item: MemoryItem,
+    target: UUID,
+    *,
+    memory_store: MemoryStore,
+    token: CancellationToken,
+    before_store: BeforeStore | None = None,
 ) -> bool:
     """Stream P5b — retraction: expire ``target`` (world no longer true, no
     successor) instead of soft-deleting it (which means user-forget)."""
+    if before_store is not None:
+        await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
         return await token.run_cancellable(
             memory_store.expire(tenant_id=item.tenant_id, user_id=item.user_id, memory_id=target)
@@ -960,6 +994,7 @@ async def flush_messages_with_outcome(
     reconcile: bool = False,
     agent_name: str | None = None,
     write_min_importance: float = 0.0,
+    before_store: BeforeStore | None = None,
 ) -> FlushOutcome:
     """Extract durable memories from ``messages``, embed, and persist them.
 
@@ -992,6 +1027,12 @@ async def flush_messages_with_outcome(
     DLQ-retry path now carries run_id (P5b-2a) too — the enqueue call
     below passes ``source_run_id=run_id``, so the control-plane worker's
     reconstructed items keep the original run's provenance.
+
+    ``before_store`` (B-168) —— 后台写回传进来:**每一次**改记忆库之前都调用(写入,
+    以及去重合并里的 supersede / expire —— 去重合并还要调一次模型,清除可能就发生在那
+    几秒里)。它抛 ``RunCancelledError`` 就整批放弃 —— 不写、也不进 DLQ(任务行已被清除,
+    DLQ 重试会把内容又写回去)。它不许抛别的异常:下面的 ``except Exception`` 会把这批
+    送进 DLQ。run 内的写回不传。
     """
     prompt = [
         SystemMessage(content=_EXTRACT_SYSTEM),
@@ -1051,8 +1092,11 @@ async def flush_messages_with_outcome(
                 llm_caller=llm_caller,
                 token=token,
                 log_label=log_label,
+                before_store=before_store,
             )
         if items:
+            if before_store is not None:
+                await before_store()
             await memory_store.write(items)
     except RunCancelledError:
         raise
@@ -1158,6 +1202,90 @@ def make_pre_compaction_flush(
     return flush
 
 
+#: B-168 —— 节点的 config 里「本步开始时的检查点」放在 ``configurable["checkpoint_map"]``,
+#: 按命名空间存,顶层图是 ``""``(LangGraph 在节点里把 ``configurable["checkpoint_id"]``
+#: 置成 ``None``)。写回节点是 ``END`` 前最后一步、不改 ``messages``,所以这个检查点的
+#: ``messages`` 就是本轮结束时的完整对话(含最后的回答)——
+#: ``test_memory_writeback_background_run`` 用真图 + 真检查点钉住。run 都在顶层图里跑
+#: (委派的子代也是一张新的顶层图、自己的 thread),所以只取 ``""``。
+_CHECKPOINT_MAP_KEY = "checkpoint_map"
+
+#: B-168 —— 落任务的时限。连接池耗尽时插入会一直等连接,不设限就把 ``end`` 拖住;
+#: 到时限退回 inline,本轮照旧写(比 inline 写回本身还快得多)。
+_ENQUEUE_TIMEOUT_S = 3.0
+
+
+def _turn_end_checkpoint_id(config: RunnableConfig) -> str | None:
+    checkpoint_map = (config.get("configurable") or {}).get(_CHECKPOINT_MAP_KEY)
+    raw = checkpoint_map.get("") if isinstance(checkpoint_map, dict) else None
+    return raw if isinstance(raw, str) and raw else None
+
+
+@contextmanager
+def _job_tenant_scope(tenant_id: UUID, user_id: UUID) -> Iterator[None]:
+    """B-168 —— 落任务行时显式带上本 run 的租户(``memory_writeback_job`` 的 RLS
+    ``WITH CHECK`` 按 ``app.tenant_id``)。run 的入口不止一个(请求 / 排队 worker /
+    孤儿复活 / 触发器),不赌每个入口都设好了;这里设的就是节点自己读到的那个租户。"""
+    tenant = current_tenant_id_var.set(tenant_id)
+    bypass = bypass_rls_var.set(False)
+    user = current_user_id_var.set(user_id)
+    try:
+        yield
+    finally:
+        current_user_id_var.reset(user)
+        bypass_rls_var.reset(bypass)
+        current_tenant_id_var.reset(tenant)
+
+
+async def _enqueue_writeback_job(
+    jobs: MemoryWritebackJobStore,
+    state: AgentState,
+    config: RunnableConfig,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID | None,
+    agent_name: str | None,
+    agent_version: str | None,
+) -> bool:
+    """B-168 后台模式:落一行任务(只存指针)。``False`` = 没落成,调用方改走 inline。"""
+    run_id = configurable_uuid(config, "run_id")
+    if thread_id is None or run_id is None or agent_name is None or agent_version is None:
+        logger.warning(
+            "memory.writeback.enqueue_skipped_inline_fallback thread=%s run=%s agent=%s/%s",
+            thread_id,
+            run_id,
+            agent_name,
+            agent_version,
+        )
+        return False
+    try:
+        with _job_tenant_scope(tenant_id, user_id):
+            await asyncio.wait_for(
+                jobs.enqueue(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    agent_name=agent_name,
+                    agent_version=agent_version,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    trace_id=current_trace_id_hex(),
+                    checkpoint_id=_turn_end_checkpoint_id(config),
+                    # 两样都存:处理器优先按检查点 id 读;没有 id 时读会话最新、截前 N 条。
+                    message_count=len(state["messages"]),
+                    now=datetime.now(UTC),
+                ),
+                timeout=_ENQUEUE_TIMEOUT_S,
+            )
+    except Exception:
+        # 丢记忆比 ``end`` 帧慢几秒更糟:落不了任务(含超时)就照旧在本轮里写。
+        # 超时那次插入若其实已经提交,后台也会写一遍 —— 窗口只在提交与超时恰好错开的
+        # 那一刻;同一指针的重复落任务由唯一索引挡住(0163)。
+        logger.warning("memory.writeback.enqueue_failed_inline_fallback", exc_info=True)
+        return False
+    return True
+
+
 def make_memory_writeback_node(
     *,
     memory_store: MemoryStore,
@@ -1167,6 +1295,9 @@ def make_memory_writeback_node(
     reconcile: bool = False,
     agent_name: str | None = None,
     write_min_importance: float = 0.0,
+    agent_version: str | None = None,
+    writeback_jobs: MemoryWritebackJobStore | None = None,
+    wake_writeback: Callable[[], None] | None = None,
 ) -> MemoryNode:
     """Build the ``memory_writeback`` node bound to the store + embedder.
 
@@ -1182,6 +1313,11 @@ def make_memory_writeback_node(
 
     Stream CM-7 — ``reconcile`` forwards to the flush so run-end writes
     go through the Mem0-style ADD / UPDATE / DELETE / NOOP decision.
+
+    B-168 —— ``writeback_jobs`` 给了就是后台模式:节点只落一行任务(指针:会话 + 本轮
+    结束时的检查点 + run),捅一下本副本 worker 的 ``wake_writeback`` 就返回,记忆由
+    控制面的 worker 在 ``end`` 帧之后写。落不成(缺 run / 会话 / agent 版本,或 store
+    报错)就退回 inline,本轮照旧同步写。``None`` 时与之前逐字一致。
     """
 
     async def memory_writeback_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -1193,6 +1329,30 @@ def make_memory_writeback_node(
         if tenant_id is None or user_id is None:
             return {}
         thread_id = configurable_uuid(config, "thread_id")
+        inline_only = bool((config.get("configurable") or {}).get(MEMORY_WRITEBACK_INLINE_KEY))
+        if (
+            writeback_jobs is not None
+            and not inline_only
+            and await _enqueue_writeback_job(
+                writeback_jobs,
+                state,
+                config,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                agent_name=agent_name,
+                agent_version=agent_version,
+            )
+        ):
+            if wake_writeback is not None:
+                wake_writeback()
+            # 三个键都回:检查点里不留上一轮 inline 写回的条数 / 失败标记。``queued`` 告诉
+            # 控制台与对接方「已排队、``end`` 之后后台写」,别读成「写了 0 条」。
+            return {
+                "written_memory_count": 0,
+                "memory_writeback_failed": False,
+                "memory_writeback_queued": True,
+            }
         run_id = current_run_id(config)
 
         outcome = await flush_messages_with_outcome(
@@ -1215,9 +1375,14 @@ def make_memory_writeback_node(
         # 控制台轨迹画不出「记忆写回」这一行;写 0 条也要回,才看得到它花了多久。
         # 出错 / 被拦截没写成的另带一个标记,别和「这轮没什么可记」混在一起;两个键每轮都回,
         # 检查点里不留上一轮的旧值。
-        return {
+        result: dict[str, Any] = {
             "written_memory_count": outcome.written,
             "memory_writeback_failed": outcome.failed,
         }
+        if writeback_jobs is not None:
+            # 配了后台却退回了 inline:明说没排队,检查点里不留上一轮的 ``True``。
+            # 纯 inline(没配任务表)不带这个键,与之前逐字一致。
+            result["memory_writeback_queued"] = False
+        return result
 
     return memory_writeback_node

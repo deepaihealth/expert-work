@@ -13,6 +13,7 @@ import type { SseEvent } from "../../api/sessions";
 import type { LiveStep } from "../../pages/agent_detail/playground/useTokenStream";
 import type { TurnStatus } from "../turn/types";
 import { buildLedger, lastKnownFrame, ledgerRecordId } from "./ledger";
+import { useBackgroundWritebacks } from "./use_background_writebacks";
 import {
   collapsibleOwnerIds, collapsibleTurnKeys, displayRowsOf, type DisplayRow,
 } from "./ledger_collapse";
@@ -193,9 +194,13 @@ export function useTrajectoryState(args: TrajectoryStateArgs): TrajectoryState {
 
   // 账本一次构建就把 gantt 跑一轮(`absoluteSpans` 每轮一次),所以这层 memo 是
   // 性能命门,不是锦上添花。
+  // B-168 B2 —— 后台记忆写回的结果不在事件流里,按 run 从控制台 run 详情取。
+  const backgroundWritebacks = useBackgroundWritebacks(threadId, windowTurns);
   const ledger = useMemo(
-    () => buildLedger({ turns: windowTurns, streamTurnKey, liveByStep: effectiveLive, nowMs }),
-    [windowTurns, streamTurnKey, effectiveLive, nowMs],
+    () => buildLedger({
+      turns: windowTurns, streamTurnKey, liveByStep: effectiveLive, nowMs, backgroundWritebacks,
+    }),
+    [windowTurns, streamTurnKey, effectiveLive, nowMs, backgroundWritebacks],
   );
   const timeline = useMemo(() => deriveTimeline(ledger.records, mode), [ledger.records, mode]);
   const matches = useMemo(() => searchLedger(ledger.records, query), [ledger.records, query]);
