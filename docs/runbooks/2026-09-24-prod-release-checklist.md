@@ -1,5 +1,7 @@
 # 班车 2 生产发布执行单（2026-10-12 发；原定 09-24，后改 09-28、10-08）
 
+> **✅ 2026-10-12 已上线 `94dc73ba`**（19:04 ~ 19:31 北京时间；A0 ~ D 全部完成，Step E 次日补，见 §6）。执行中发现本单五处与实况不符，已在原位改正并在 §6「与执行单不符之处」列出。
+
 > **⚠️ 2026-09-29 再次改期**：09-28 没有发，**用户 09-29 拍板推迟到 2026-10-08**，并把 **B-125 健康方案交付件技能**（`health-plan-report` 导入 + ai-health-plan 提示词 rev39）一起带上，见 §0.2 与 Step A3 / A4。钉子当时未变（`c0789ca6`），B-125 不进镜像（`platform-skills/` 只由导入脚本上线）。**同日用户再拍板：B-126（跨轮上下文降本）也随本班上生产；钉子等 B-126 合入后一次性前移到 main**（届时连同 #1690 fast-uri / #1691 MinIO 一起带上），前移后先发测试环境验过再重钉，本单操作位随之改。**✅ 09-29 已前移（第十一次重钉）到 main `ab4097cf`**：带 B-126 / B-127 / B-128 与 #1690 / #1691，测试环境验过，操作位已全部改到新钉子，见 §0.1 第十一次重钉。**✅ 09-30 第十二次重钉到 main `39c93912`**：用户 09-30 拍板 B-131（减少修改轮的额外调用，平台部分）随本班上，同时带上 pyjwt 2.14.0 安全升级（#1701）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十二次重钉。**✅ 10-01 第十三次重钉到 main `31f22602`**：用户 09-30 拍板新模型 glm-5.3-flashx（#1702）随本班上，同时带上三个依赖安全升级（urllib3 #1703、pyjwt 2.15.1 #1705、virtualenv #1706）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十三次重钉。**✅ 10-01 第十四次重钉到 main `54d1ed70`**：用户 10-01 拍板子智能体委派三项修复（#1710 计划不再被旧 PLAN.md 盖掉 + 委派标记保留；#1709 子代容错；#1708 委派说明对齐事实）随本班上；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十四次重钉。**✅ 10-03 第十五次重钉到 main `fc07b8b1`**：用户 10-03 拍板主干上做完的全部随本班上（harness 质量批 B-136 / B-137 / B-139 / B-149 / B-151 + 依赖三批），先统一发测试跑真栈清单，首轮发现的问题修在 #1732 / #1733（B-153）/ #1734（B-154）；**10-07 判定，不过就退回 `54d1ed70`**；操作位已全部改到新钉子，见 §0.1 第十五次重钉。**✅ 10-04 第十六次重钉到 main `5091938c`**：测试环境 24h 复查发现的三个问题修在 #1736（B-156 平台辅助模型默认改 `glm` / `glm-5.3-flash` + 记忆整理锁超时）/ #1737（B-157 204 不带响应体）/ #1738（B-155 MCP 会话 cancel scope，**必须随本班**：本班带 anyio 4.14，不修则生产一上线就开始发作）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十六次重钉。 **✅ 10-07 第十七次重钉到 main `85af5304`**：用户 10-06 拍板 B-158 / B-159 与依赖安全升级（#1745）随本班，10-07 拍板 B-160 随车；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十七次重钉。 **⚠️ 10-07 再次改期 + ✅ 10-08 第十八次重钉到 main `90fd84b7`**：用户 10-07 拍板生产推迟到 **2026-10-12（周一）**，周末赶工、这一波尽量全上，**10-11 周日 12:00 前没过验收的项撤出本单**；带上 B-141 / B-143 压缩摘要、B-142 缓存命中指标、B-152 编辑器本地打包、B-153 投递失败告警、B-161 检查点类型登记、B-162 平台段并进最后一条消息、B-159 漏网与四批依赖修复；**沙箱镜像钉子改为 `d8a32812`**（= `7ac31957` + #1713，用户 10-08 拍板重烤重钉，推翻此前「#1713 不进本班」）；测试环境验过，操作位已全部改到新钉子，见 §0.1 第十八次重钉。 **✅ 10-08 第十九次重钉到 main `553c3252`**：让检出树自带沙箱钉子 `d8a32812`（#1766），Step A 直接从检出树 apply、smoke 的沙箱钉子检查不再 WARN；顺带 #1764（B-161 白名单补 asyncpg 的 UUID）。#1764 的测试环境核对待发测试（等用户指令），见 §0.1 第十九次重钉。 **✅ 10-09 第二十次重钉到 main `22673d9b`**：用户 10-08 拍板 B-163（工具出错后的恢复建议贴在出错的工具结果上，不再单独成一条用户消息）/ B-164（只读工具失败不进欠账）/ B-165（压缩摘要看得到工具调用与工具名）随本班；代码与 10-08 发测试的 `06a9def2` 逐字相同，测试环境验过；`22673d9b` 本身 10-09 按用户指令发测试，见 §0.1 第二十次重钉。 **✅ 10-10 第二十一次重钉到 main `94dc73ba`**：用户拍板 B-168（长期记忆专用模型、默认关思考 #1779；长期记忆写回改到 `end` 帧之后由后台任务做 #1783，**带三条迁移 `0161` ~ `0163`**；控制台记忆模型选择与后台写回时间条 #1784）随 10-12，同时带上 credential-proxy 构建修复 #1781（10-09 发测试时它的 `uv sync` 超时）；**前置：project-service 1.5.2 必须先于 Step B 上线**（§1）；测试环境 `4dfce2aa`（= main `e2a2860d` + #1784）三个镜像验过，操作位已全部改到新钉子，见 §0.1 第二十一次重钉。
 >
 > **⚠️ 2026-09-25 改期说明**：本班 09-24 **没有发**（用户 09-20 拍板等 B-84 本波做完一起发，
@@ -619,7 +621,7 @@
       ```
 
       打印的路径必须在**主仓库目录**下（不是 `.worktrees/...` 或 `.claude/worktrees/...`）。报 `ModuleNotFoundError` 或路径在别的 worktree 里，说明共享 venv 的 editable 安装被某个 worktree 改指过（2026-10-02 本机实测就是这样：指向一个已删除的 worktree），在主仓库目录跑一次 `uv sync` 修复后再核一次。
-- [ ] **overlay 无占位符**：`grep -rn PROD_PLACEHOLDER infra/k8s/overlays/prod/` 无输出。
+- [ ] **overlay 无占位符**：`grep -rn PROD_PLACEHOLDER infra/k8s/overlays/prod/ | grep -v '^infra/k8s/overlays/prod/secrets.env.example:' | grep -v ':[0-9]*:#'` 无输出。（10-12 改：原写法「直接 grep 无输出」必然不成立 —— `secrets.env.example` 与 `kustomization.yaml` 头部注释里本来就有这个词；真正的判据是 `release.sh` 在构建前对**渲染后的** overlay 扫的那一次，它扫不到才会往下走。）
 - [ ] **金丝雀还在**：班车 1 已 seed 过（`release-canary` 有会话行、工作区里有 `canary-check.txt`）。
       smoke 阶段 6 报 WARNING 而不是 PASS，就说明它没了，按
       [`production-release.md` §1.6.7](./production-release.md) 补种，**不要带着 WARNING 往下发**。
@@ -950,7 +952,9 @@ kubectl get albconfig alb -o jsonpath='{.spec.listeners}{"\n"}'
 > `listeners` 是整段替换的，所以那份文件必须带齐所有监听 —— 包括 80，那是沙箱网关用的。
 > 生效是秒级的，不重启任何 pod，不影响在途请求。
 
-### Step A — 沙箱镜像钉子（`e8aac104` → `<新 tag>`，且 host 改成 `-vpc`）
+### Step A — 沙箱镜像钉子（`621249f6` → `d8a32812`，且 host 改成 `-vpc`）
+
+> **10-12 勘误**：生产发前实际是公网 host 的 `621249f6`，不是本单原写的 `e8aac104` —— 09-16 晚 B-59 已把生产从 `e8aac104` 刷到 `621249f6`（#1568），本单一直没跟着改。回滚沙箱也回 `621249f6`（见 §4）。
 
 ⚠️ **本版这一步同时换两样东西**：tag（新镜像，砍掉了 ffmpeg / npm）和 **host**（公网 → `-vpc`）。
 `sandboxset.yaml` 里两样都改好了，照常 `apply -f` 即可，但发后核对要**两样都看**。
@@ -958,7 +962,7 @@ kubectl get albconfig alb -o jsonpath='{.spec.listeners}{"\n"}'
 ```sh
 export KUBECONFIG=~/.kube/expert-work-prod.yaml
 
-# 发前值（留档）。期望 crpi-….personal.cr.aliyuncs.com/expert-work/sandbox:e8aac104
+# 发前值（留档）。期望 crpi-….personal.cr.aliyuncs.com/expert-work/sandbox:621249f6（10-12 实测；原写 e8aac104 是错的）
 # —— 公网 host + 老 tag。对不上说明中间有人动过，停下来先弄清楚
 kubectl -n default get sandboxset expert-work-sandbox \
   -o jsonpath='{.spec.template.spec.containers[*].image}{"  replicas="}{.spec.replicas}{"\n"}'
@@ -1283,7 +1287,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
   | kubectl -n expert-work exec -i "$POD" -- python3 -
 ```
 
-- [ ] dry-run 输出 `"status":"dry-run"`；生产上是**首次导入**，应为 `"created": true` 的新建（不是版本递增）
+- [ ] dry-run 输出 `"status":"dry-run"`；生产上是**首次导入**，应为 `"would_create_version": 1`（10-12 改：dry-run 不建任何东西，`created` 在 dry-run 里恒为 `false`，原写「`created: true`」不成立；正式导入那一行才是 `"created": true`）
 - [ ] 打包出的 `content_hash` 应为 `786d30fe…`（测试环境 v6，B-131 加「改稿速查」；v5 是 `cc2df66a`）；不同说明 checkout 的不是 `94dc73ba`，或本机 venv 不对（见 §1「本机 venv 能跑打包导入」），停下来先查
 
 正式导入去掉 `--dry-run`：
@@ -1338,7 +1342,7 @@ uv run --no-sync python $PS/import_in_pod.py bundle --dry-run $PS/dist/health-pl
       done
       ```
 
-      期望：只有**一个** pod 打出 `sweep_complete … errors=0`（单飞锁生效，另一个 pod 没有并发跑），两个 pod 都没有 `cycle_failed`。`errors` 非 0 时看同 pod 的 `lone_review_failed` / `cluster_failed`：零星 `LLMNetworkError` 是模型侧抖动（测试 10-04 一轮里 1 次），成片 `CredentialsResolverError` 是 glm 平台凭据没启用。
+      期望：每条 `sweep_complete` 都是 `errors=0`，两个 pod 都没有 `cycle_failed`。**两个 pod 都打出 `sweep_complete` 是正常的**（10-12 改：原写「只有一个 pod 打出」不成立）—— advisory lock 只防两轮**重叠**，两个 pod 的 4 小时定时器各自从启动起算，错开几分钟就各扫一轮（测试 10-11 ~ 10-12 实测两 pod 错开 4 分钟、各扫各的）。`errors` 非 0 时看同 pod 的 `lone_review_failed` / `cluster_failed`：零星 `LLMNetworkError` 是模型侧抖动（测试 10-04 一轮里 1 次），成片 `CredentialsResolverError` 是 glm 平台凭据没启用。
 - [ ] **留存清理首跑**：
 
       ```sh
@@ -1403,8 +1407,8 @@ tools/deploy/rollback.sh prod 5775fbf3
 见 ROADMAP B-117），再逐个上传导入（平台存成新版本，内容等同原版）。导入后用 Step A2 的 SQL ① 核对
 `content_hash` 回到了 A2 导入前的基线值。只导入了其中几个就只回那几个。
 
-沙箱钉子单独回：`git checkout 5775fbf3 -- infra/k8s/sandbox/sandboxset.yaml && kubectl apply -f infra/k8s/sandbox/sandboxset.yaml`
-（回到 `e8aac104`）。
+沙箱钉子单独回：`git show f5f624e6:infra/k8s/sandbox/sandboxset.yaml | kubectl apply -f -`
+（回到发前的公网 host + `621249f6`，即 #1568 那一版。10-12 改：原写 `git checkout 5775fbf3 -- …` 会回到 `e8aac104`，比生产发前还旧；而且 `git checkout -- 路径` 会覆盖工作区未提交的改动。）
 
 其它回滚事实：
 
@@ -1440,24 +1444,24 @@ tools/deploy/rollback.sh prod 5775fbf3
 
 | 项 | 实况 |
 |---|---|
-| 窗口 | `___ : ___` ~ `___ : ___` |
-| 发布前在跑 / 排队 / 待审批 | `___` |
-| Step A 沙箱钉子 | 发前 `________` → 发后 `________` |
-| Step B smoke / 金丝雀 | `________` |
-| Step A2 office 技能导入（B、C 之后） | go/no-go(docx/pptx/xlsx/pdf)**全部 GO**（09-27 测试环境验收，见下）；导入前 latest_version `________` → 导入后 `________`；失效 published(N=`__`) / skipped → restart 或等 1800s `________` |
-| Step A3 health-plan-report 导入 + 启用 | dry-run `created`/hash `________`；导入 `201` + published(N=`__`)；控制台启用 `____` |
-| Step A4 ai-health-plan rev39 | 生产 vs 测试 rev38 比对 `一致 / 有差异（已合并）`；备份位置 `________`；发布后版本号 `____`、技能绑定 `____`；删掉的工具 `________`（生产原本没有而跳过的 `____`）；工具清单总数 `____` |
-| B-125 发后验证 | 用户指定的测试客户跑一轮出方案：PPTX `____` / PDF `____`（`ok:true`、打开正常） |
-| migrate Job | 期望跑八条（`0156` ~ `0163`；第二十一次重钉起，原写四条），实况 `________`；alembic 头 `________`（期望 `0163_writeback_job_dedup`） |
-| CronJob 创建 | `________` |
+| 窗口 | 2026-10-12（北京时间）：前置核对 ~18:50；A0 / A 19:00 前后；Step B **19:04 ~ 19:31**（含一次重跑，见「与执行单不符之处」）；C / A2 / A3 19:35 ~ 19:50；A4 发布 **20:03:02**；D 20:10 前后 |
+| 发布前在跑 / 排队 / 待审批 | 未单独统计；已通知对接方窗口内不处理待审批 |
+| Step A 沙箱钉子 | 发前 公网 host `…/sandbox:621249f6`（**不是**本单原写的 `e8aac104`）→ 发后 `-vpc` host `…/sandbox:d8a32812`；池 pod 95 秒 4/4 Running、`availableReplicas=1`。A0：`acr-pull` 两个 namespace 都写入公网 + `-vpc` 两个 host（凭据取自现有 Secret 的公网条目、管道喂给 `acr-pull-secret.sh`，不落盘不进 argv）；ALB 80 端口补上 `idleTimeout 60 / requestTimeout 180`，443 证书 `25878622-cn-hangzhou` 未变；SA `default` 本就带 `acr-pull` |
+| Step B smoke / 金丝雀 | 三个镜像 control-plane / credential-proxy `5775fbf3 → 94dc73ba`、admin-ui `5775fbf3-prod → 94dc73ba-prod`；全部 Deployment rollout 完成；**SMOKE PASS**（沙箱钉子 `OK … (d8a32812)` + VPC endpoint OK、`clickhouse data disk 33% used`、`memory_consolidator aux provider glm has a platform credential`）；金丝雀**首跑 PASS**（56.1 秒，`CANARY_OK` 产物链通过） |
+| Step A2 office 技能导入（B、C 之后） | go/no-go(docx/pptx/xlsx/pdf)**全部 GO**（09-27 测试环境验收，见下）；导入前 latest_version 四个都是 `1`（Anthropic 原版），绑定只有 xlsx × 1 个 Agent → 导入后四个都是 `2`，`content_hash` docx `9b1ccd14…` / pptx `474c3699…` / xlsx `18898342…` / pdf `f629717e…`（与测试 v3 相同），绑定不变；失效 **published(N=3)**；打包源 `58c0f2a9` |
+| Step A3 health-plan-report 导入 + 启用 | dry-run `would_create_version: 1`、hash `786d30fe…`；导入 `201`（`created: true`, v1）+ published(N=3)；控制台启用后 `status=active` |
+| Step A4 ai-health-plan rev39 | 生产 vs 测试 rev38 比对**有差异且很大**：生产是更早的一版（自写 `render_plan.py` 出稿、8 个租户技能、MCP `deep-ai-health-mcp` + `amap-maps` 全放开无绑定、温度 0.9、`workflow.max_iterations` **3060**）。用户拍板：**以测试终版 rev39（`28eb1ba5`）为准**，只把 MCP 服务名 `deep-ai-health-mcp-test` 改为 `deep-ai-health-mcp`，去掉 `amap-maps`，温度 0.7、最大步数 60；控制台 YAML 整份替换，草稿与目标逐字一致后发布。备份：发布前导出的生产配置（本机，未入库）。发布后线上**第 4 版**，与目标逐字一致；技能 `pptx / pdf / docx / health-plan-report`；删掉的工具 `list_artifacts / remember / web_search / http / note_behavior_patch / clarify_tool_usage`（MCP 允许列表里的两个 cpwx 工具与 amap 随新配置一并去掉）；工具清单 8 个内置 + MCP（9 个工具、9 条绑定）。**`org_name`**：rev39 声明了它（选填），但深护智康测试、生产两端都没传，封面暂无机构名（与发前相同），需对方在 run `inputs` 里加 |
+| B-125 发后验证 | 未做（对接方 Agent 不做实验；等对方真实使用后只读观察） |
+| migrate Job | 期望跑八条（`0156` ~ `0163`；第二十一次重钉起，原写四条），实况**恰好八条** `0155→0156` … `0162→0163`；alembic 头 `0163_writeback_job_dedup` |
+| CronJob 创建 | `23 3 * * *  tz=Asia/Shanghai  suspend=false` |
 | 次日首跑删除计数 | `________` |
 | §1 ① 价目表缺的模型 / 处理方式 | 09-27 核对 8 个全缺 → 用户拍板按官网标价补 7 个（DeepSeek 取高峰价），已写入生产（审计 actor `rate-card-bootstrap-2026-09-27`），复核 7 有；`qwen-plus`（重排序）不在模型目录、价目表拒收，接受记 0（ROADMAP B-120） |
 | §1 ② 会变化的上限（Agent / 值） | 09-27 核对：ai-health-plan 的 glm-5.3 / qwen3.8-max 与 deepseek-v4-pro 的 40960 开始生效（≥16000，测试已验）；豆包看图 medium 档位开始生效；4096 的 glm-5.3 / kimi-k3 不变；无「豆包开思考无档位」行。无需动作 |
-| Step C B-126 / B-128 / B-131 在位 + flashx 在目录 + pyjwt 2.15.1 / urllib3 2.8.0 + 委派修复在位 | `____`（期望 `ok`） |
-| project-service 计费改动（豆包补价 / 未定价桶 / 缓存价） | 上线时间 `________`、版本 `________`（期望 **1.5.2**，第二十一次重钉更新：10-10 生产仍是 1.5.1；必须早于 Step B） |
-| Step C B-168 后台写回（第二十一次重钉） | 两个 pod `cycle_errors` / `backlog` / 失败日志 `____ / ____ / ____`（期望 `0.0 / 0.0 / 0`）；任务表 `________`（期望发完时 0 行，之后只有 `done`、`stuck_over_10m` 0）；§1 `when: memory` 盘点 `____`（期望 0 行） |
+| Step C B-126 / B-128 / B-131 在位 + flashx 在目录 + pyjwt 2.15.1 / urllib3 2.8.0 + 委派修复在位 | 两个 pod 都是 `ok`；cancel scope / `Deserializing unregistered type` / `Blocked deserialization` 计数全 0；ClickHouse 新配置生效（pod 重启），删掉 `system` 库 9 张旧日志表（其中 `text_log_0` 5.06 GiB），`df` 35% → 0%；`default` 库 12 张表完好，Langfuse 收到生产第一条 trace（金丝雀）；Prometheus：`expert_work_langfuse_delivery_failures_total` 每实例 5 条序列、1h 增量 0，`expert_work:llm_prompt_cache_hit:ratio1h` 有序列；B-152 编辑器只从自家 `/assets/` 加载、无 `cdn.jsdelivr.net` 请求 |
+| project-service 计费改动（豆包补价 / 未定价桶 / 缓存价） | 用户确认 Step B 之前已上线（版本号与时间待补） |
+| Step C B-168 后台写回（第二十一次重钉） | 两个 pod `0.0 / 0.0 / 0`；任务表发完时 0 行、`stuck_over_10m` 0；§1 `when: memory` / `when: compression` 盘点都是 0 行 |
 | Step E B-168 `sop2-designer` 写回 | `________`（有流量：`done` 行数 / `failed` 数；无流量记「未验」） |
-| Step A4 `detail_level` 固定值 | 保存时是否提示绑定落空 `____`（对方生产 MCP 未上 brief 时预期提示） |
-| Step C B-122 阀 / B-119 文案 | `set= ___ enabled= ___` / `____ ____`（期望 `False True` / `True False`） |
+| Step A4 `detail_level` 固定值 | 构建日志 `mcp.binding_param_absent server=deep-ai-health-mcp tool='form_get_field_detail' params=['detail_level']` —— 对方生产 MCP 尚未上 brief 版本，预期内 |
+| Step C B-122 阀 / B-119 文案 | `set= False enabled= True`（两个 pod）/ `True False` → B-119 销案 |
 | B-124 首个带子智能体的会话 | 父 `read_file` 子代文件 `____`（期望无 `not_found`） |
-| 与执行单不符之处 | `________` |
+| 与执行单不符之处 | ① 沙箱发前是 `621249f6` 不是 `e8aac104`，§4 回滚命令也指错了 → 已改。② §1 `grep PROD_PLACEHOLDER` 「无输出」必然不成立（example 文件与注释）→ 已改。③ A3 dry-run 的 `created` 恒为 `false`，原判据「`created: true`」不成立 → 已改。④ Step E「只有一个 pod 打出 `sweep_complete`」不成立（测试实测两 pod 各扫一轮）→ 已改。⑤ Step B 首跑：admin-ui 构建第 11 步 `pnpm` 下载 472 个包停在 470，10 分钟无输出；杀掉 `docker build`，确认失败停在 `stage 1 build-push`（未动集群）后原地重跑，第二次正常。⑥ A4 第一次点「发布」请求挂住、再点一次成功：`nbftv` 上缓存的深护智康 MCP 会话 19:57 已断，20:03:02 `mcp.session_restarted` 后构建校验 933ms 通过、发布 `200`；两 pod 0 重启（登记 B-177）。⑦ Prometheus 有一条 P2 `ExpertWorkUpliftConsolidatorIdle` 在触发 —— 条件「3 天 0 合并」早于本次发布，生产只有 `sop2-designer` 开长期记忆、流量低（登记 B-178）。⑧ 发前 §1 ① 只缺 `qwen-plus`（重排序，近 30 天无用量），沿用 B-120 记 0 |
