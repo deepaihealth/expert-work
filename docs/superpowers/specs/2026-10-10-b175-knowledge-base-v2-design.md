@@ -3,6 +3,7 @@
 - **状态**:设计稿,**登记不排期**(2026-10-10 用户拍板:先出完整方案与计划,开工时间等指令)。
 - **配套计划**:[`docs/superpowers/plans/2026-10-10-b175-knowledge-base-v2-plan.md`](../plans/2026-10-10-b175-knowledge-base-v2-plan.md)。
 - **取代**:[B-171 设计](2026-10-10-b171-knowledge-base-optimization-design.md)(知识库优化)与 [B-172 设计](2026-10-10-b172-material-library-design.md)(物料库)并入本方案;两份旧稿保留作背景,结论以本文为准。B-174(跨副本取消缺租户上下文)与本方案无关,单列。
+- **10-12 补充**:读字节 OpenViking 团队 10-09 文章(VikingRAG / TrieHI)后,§9「到对应阶段再拍」加第 16 项「检索经验路线」;按目录树索引(TrieHI)不跟,理由见该项。
 - **依据**(2026-10-10 同日四路调研 + 此前评估,关键结论均已回到原文 / 源码抽查):
   1. 著名开源项目:RAGFlow、Dify、FastGPT、MaxKB、AnythingLLM、Onyx、LightRAG(读官方文档原文与源码);
   2. 本地仓库:WeKnora(后端四路深挖 + 管理端 / 开放 API)、OpenViking(后端 + Studio / API)、PageIndex;
@@ -450,6 +451,7 @@ URL 导入(到期重新抓取,别学 WeKnora「URL 永不刷新」);OSS 前缀�
 | 13 | 上下文化切块默认开关 | 默认关,评测证明收益后按库开 |
 | 14 | 物料库对客模式判定、语音识别供应商、预置类型 | 见原 B-172 §10 |
 | 15 | 回调与 MCP 是否做 | 回调随二期,MCP 三期 |
+| 16 | 检索经验路线(VikingRAG-E 的 Experience Edge:记下「这类问题上次在哪份文档 / 哪一节命中」,相似问题直接带出)是否做 | P2 之后、`knowledge_retrieval_log` 积累足量真实检索后,用评测集验证收益再定;默认不做。按目录树索引(TrieHI)不跟:我们按库 + 元数据过滤,pgvector 0.8 迭代扫描已够,没有它那个量级的目录规模 |
 
 ---
 
@@ -485,4 +487,5 @@ URL 导入(到期重新抓取,别学 WeKnora「URL 永不刷新」);OSS 前缀�
 - MaxKB:https://docs.fit2cloud.com/maxkb/
 - Onyx:https://docs.onyx.app/developers/guides/search_api_guide
 - RAGAS 指标:https://github.com/explodinggradients/ragas
+- OpenViking 团队文章《三篇重磅论文,拆解 OpenViking 核心技术》(2026-10-09,mp.weixin.qq.com/s/-7LmtflPn2xyTlwhqI2szw);TrieHI arXiv 2606.16903;VikingRAG arXiv 2609.11390(文中自述「证据足够即停」仍有 >5% 误判,先快后全仍在实验)
 - 本地:WeKnora(`internal/agent/tools/`、`internal/middleware/api_key_gate.go`、`internal/types/tenant_api_key.go`、`docreader/parser/pdf_parser.py`)、OpenViking(`openviking/server/routers/`)、PageIndex(`pageindex/agent_tools.py`)
