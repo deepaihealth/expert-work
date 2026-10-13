@@ -495,16 +495,28 @@ class Settings(BaseSettings):
     #: How often the recovery worker scans for stuck documents.
     knowledge_recovery_interval_s: int = Field(default=30, gt=0)
 
-    #: Max documents claimed per recovery cycle.
-    knowledge_recovery_batch_size: int = Field(default=20, gt=0)
+    #: Documents ingested at once, per process — bounds both the fast path
+    #: (upload → background task) and the recovery worker (which claims at
+    #: most this many per cycle and drives them concurrently). A 200-file
+    #: folder upload no longer fans out 200 parses + embedding batches.
+    knowledge_ingest_concurrency: int = Field(default=4, gt=0)
 
     #: Ingestion lease — a claimed document past this with no terminal state is
-    #: treated as crashed and re-claimable. Generous: longer than any single
-    #: document's ingest so the fast path is not pre-empted.
+    #: treated as crashed and re-claimable. Renewed every third of it while a
+    #: document is being processed, so only genuinely dead work expires.
     knowledge_ingest_lease_s: int = Field(default=300, gt=0)
 
     #: Bounded ingest attempts before a document goes terminally failed.
     knowledge_ingest_max_attempts: int = Field(default=5, gt=0)
+
+    #: Upload size cap for one knowledge document (bytes). Over the cap the
+    #: upload endpoint answers 413 ``{"error": "file_too_large", "limit_bytes": N}``.
+    knowledge_document_max_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+
+    #: Document parsing runs in a spawned process pool (PyMuPDF is not
+    #: thread-safe): worker processes, and the per-document parse timeout.
+    knowledge_parse_workers: int = Field(default=2, gt=0)
+    knowledge_parse_timeout_s: int = Field(default=600, gt=0)
 
     # ------------------------------------------------------------------ memory DLQ (K.K7)
     #: Stream K.K7 — how often the memory writeback DLQ worker scans

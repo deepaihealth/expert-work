@@ -246,6 +246,17 @@ class AuditAction(StrEnum):
     # RT-6 Tier A (RT-ADR-19) — the approved args digest failed re-verification
     # before dispatch: the checkpointed tool_call drifted from what was approved.
     APPROVAL_BINDING_DRIFT = "approval:binding_drift"
+    # knowledge base — B-175 L2-PR2: every console write on a base / document
+    # is audited (there was none before). Mirrors the control-plane
+    # ``ResourceType`` additions ``knowledge_base`` / ``knowledge_document``.
+    KNOWLEDGE_BASE_CREATE = "knowledge:base_create"
+    KNOWLEDGE_BASE_UPDATE = "knowledge:base_update"
+    KNOWLEDGE_BASE_DELETE = "knowledge:base_delete"
+    KNOWLEDGE_BASE_REINDEX = "knowledge:base_reindex"
+    KNOWLEDGE_DOCUMENT_UPLOAD = "knowledge:document_upload"
+    KNOWLEDGE_DOCUMENT_DELETE = "knowledge:document_delete"
+    KNOWLEDGE_DOCUMENT_REINGEST = "knowledge:document_reingest"
+    KNOWLEDGE_DOCUMENT_DISCARD_PENDING = "knowledge:document_discard_pending"
     # triggers (Stream J.10 — Mini-ADR J-26 / J-42)
     TRIGGER_CREATE = "trigger:create"
     TRIGGER_UPDATE = "trigger:update"
@@ -477,6 +488,10 @@ ResourceType = Literal[
     # services/control-plane/src/control_plane/audit.py per
     # [memory:audit-literal-drift] (both must stay in sync).
     "mcp_oauth_connection",
+    # B-175 L2-PR2 — knowledge base / document console writes. Mirrors the
+    # control-plane ``ResourceType`` Literal per [memory:audit-literal-drift].
+    "knowledge_base",
+    "knowledge_document",
 ]
 """Canonical resource type strings used in audit log entries.
 

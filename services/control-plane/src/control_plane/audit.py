@@ -189,6 +189,10 @@ ResourceType = Literal[
     # "tenant_mcp_server"). Mirrors the protocol-side ``ResourceType`` Literal
     # per [memory:audit-literal-drift].
     "mcp_oauth_connection",
+    # B-175 L2-PR2 — knowledge base / document console writes. Mirrors the
+    # protocol-side ``ResourceType`` Literal per [memory:audit-literal-drift].
+    "knowledge_base",
+    "knowledge_document",
 ]
 
 

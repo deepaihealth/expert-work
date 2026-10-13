@@ -114,7 +114,12 @@ async def chunk_markdown_semantic(
     heading-less section otherwise sliced at arbitrary size points is
     instead split where its content actually changes subject.
     """
-    blocks = _parse_blocks(markdown)
+    # Oversized blocks (a whole spreadsheet sheet parses to one table block —
+    # up to 85k characters in real material) are cut to the chunk cap *before*
+    # they are embedded for topic detection, so no single embedding input ever
+    # exceeds the cap (the embedding API rejects inputs past its token limit
+    # and the whole document would fail).
+    blocks = _presplit_blocks(_parse_blocks(markdown), max_tokens)
     semantic_breaks: frozenset[int] = frozenset()
     if len(blocks) >= 2:
         embeddings = await embedder.embed([block.text for block in blocks], tenant_id=tenant_id)
@@ -218,6 +223,16 @@ def _parse_blocks(markdown: str) -> list[_Block]:
         elif token.type in _CONTENT_OPENERS or token.type in _CONTENT_STANDALONE:
             blocks.append(_Block("content", block_text, trail))
     return blocks
+
+
+def _presplit_blocks(blocks: list[_Block], max_tokens: int) -> list[_Block]:
+    """Cut every block over ``max_tokens`` into cap-sized pieces that keep its
+    kind and heading trail; blocks within the cap pass through untouched."""
+    return [
+        _Block(block.kind, piece, block.heading_trail)
+        for block in blocks
+        for piece in _prepare_block(block, max_tokens)
+    ]
 
 
 def _prepare_block(block: _Block, max_tokens: int) -> list[str]:

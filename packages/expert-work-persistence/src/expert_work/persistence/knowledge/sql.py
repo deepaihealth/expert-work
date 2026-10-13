@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import Select, and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -44,6 +44,26 @@ _TS_CONFIG = "simple"
 #: Terminal ingestion states — reaching one clears the durability lease so the
 #: document is never re-claimed.
 _TERMINAL_STATUSES = (DocumentStatus.READY.value, DocumentStatus.FAILED.value)
+
+#: ``error`` written by :meth:`SqlKnowledgeStore.sweep_terminal` — same text as
+#: the in-memory store so operators see one message.
+_EXHAUSTED_ERROR = "ingest attempts exhausted"
+#: ``error`` after discarding a pending upload when nothing was serving.
+_DISCARDED_ERROR = "pending upload discarded; nothing is serving"
+
+
+def _fence(
+    generation: int | None, status: DocumentStatus = DocumentStatus.PROCESSING
+) -> list[ColumnElement[bool]]:
+    """Extra predicates for a fenced write-back: the document must still be
+    in ``status`` with the exact generation the worker claimed. Empty (no
+    fence) when ``generation`` is ``None`` — legacy callers."""
+    if generation is None:
+        return []
+    return [
+        KnowledgeDocumentRow.status == status.value,
+        KnowledgeDocumentRow.ingest_generation == generation,
+    ]
 
 
 def _claimable(now: datetime, max_attempts: int) -> ColumnElement[bool]:
@@ -94,6 +114,9 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         status=DocumentStatus(row.status),
         error=row.error,
         chunk_count=row.chunk_count,
+        attempts=row.attempts,
+        ingest_generation=row.ingest_generation,
+        has_pending=row.pending_content is not None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -367,34 +390,46 @@ class SqlKnowledgeStore(KnowledgeStore):
         filename: str,
         content: bytes | None = None,
         content_sha256: str | None = None,
+        force: bool = False,
     ) -> KnowledgeDocument:
         async with self._sf() as session:
             existing = (
                 await session.execute(
-                    select(KnowledgeDocumentRow).where(
+                    select(KnowledgeDocumentRow)
+                    .where(
                         KnowledgeDocumentRow.tenant_id == tenant_id,
                         KnowledgeDocumentRow.kb_id == kb_id,
                         KnowledgeDocumentRow.filename == filename,
                     )
+                    .with_for_update()
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                if (
+                    not force
+                    and content_sha256 is not None
+                    and existing.status == DocumentStatus.READY.value
+                    and existing.content_sha256 == content_sha256
+                ):
+                    await session.commit()
+                    return _to_document(existing)  # unchanged re-upload: nothing to do
                 existing.status = DocumentStatus.PENDING.value
                 existing.error = None
-                existing.chunk_count = 0
                 existing.attempts = 0
+                existing.ingest_generation = existing.ingest_generation + 1
                 existing.claimed_at = None
                 existing.lease_until = None
                 if content is not None:
-                    existing.content = content
-                    existing.content_sha256 = content_sha256
+                    if existing.content is None and existing.chunk_count == 0:
+                        existing.content = content  # nothing serving yet
+                        existing.content_sha256 = content_sha256
+                    else:
+                        # New bytes wait in the pending slot; the serving
+                        # version (content + chunks) stays until the new
+                        # ingest's fenced READY promotes it.
+                        existing.pending_content = content
+                        existing.pending_content_sha256 = content_sha256
                 existing.updated_at = datetime.now(UTC)
-                await session.execute(
-                    delete(KnowledgeChunkRow).where(
-                        KnowledgeChunkRow.tenant_id == tenant_id,
-                        KnowledgeChunkRow.document_id == existing.id,
-                    )
-                )
                 await session.commit()
                 await session.refresh(existing)
                 return _to_document(existing)
@@ -539,50 +574,173 @@ class SqlKnowledgeStore(KnowledgeStore):
             if params is not None
             else (DEFAULT_CHUNK_MAX_TOKENS, DEFAULT_CHUNK_OVERLAP_TOKENS)
         )
+        pending = row.pending_content is not None
         return ClaimedIngestion(
             tenant_id=tenant_id,
             document_id=row.id,
             kb_id=row.kb_id,
             filename=row.filename,
-            content=row.content,
-            content_sha256=row.content_sha256,
+            content=row.pending_content if pending else row.content,
+            content_sha256=row.pending_content_sha256 if pending else row.content_sha256,
             chunk_max_tokens=chunk_max,
             chunk_overlap_tokens=chunk_overlap,
             attempts=row.attempts,
+            generation=row.ingest_generation,
         )
 
     async def mark_document_failed_terminal(
-        self, *, tenant_id: UUID, document_id: UUID, error: str
-    ) -> None:
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        error: str,
+        generation: int | None = None,
+    ) -> bool:
         async with self._sf() as session:
-            await session.execute(
+            failed_ids = (
+                (
+                    await session.execute(
+                        update(KnowledgeDocumentRow)
+                        .where(
+                            KnowledgeDocumentRow.tenant_id == tenant_id,
+                            KnowledgeDocumentRow.id == document_id,
+                            *_fence(generation),
+                        )
+                        .values(
+                            status=DocumentStatus.FAILED.value,
+                            error=error,
+                            claimed_at=None,
+                            lease_until=None,
+                            updated_at=datetime.now(UTC),
+                        )
+                        .returning(KnowledgeDocumentRow.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.commit()
+        return bool(failed_ids)
+
+    async def discard_pending(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> KnowledgeDocument | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(KnowledgeDocumentRow)
+                    .where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id == document_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if row.pending_content is None:
+                await session.commit()
+                return _to_document(row)
+            serving = row.chunk_count > 0
+            row.pending_content = None
+            row.pending_content_sha256 = None
+            row.status = (DocumentStatus.READY if serving else DocumentStatus.FAILED).value
+            row.error = None if serving else _DISCARDED_ERROR
+            row.ingest_generation = row.ingest_generation + 1
+            row.attempts = 0
+            row.claimed_at = None
+            row.lease_until = None
+            row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return _to_document(row)
+
+    async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
+        async with self._sf() as session:
+            failed_ids = (
+                (
+                    await session.execute(
+                        update(KnowledgeDocumentRow)
+                        .where(
+                            KnowledgeDocumentRow.status == DocumentStatus.PROCESSING.value,
+                            KnowledgeDocumentRow.attempts >= max_attempts,
+                            or_(
+                                KnowledgeDocumentRow.lease_until.is_(None),
+                                KnowledgeDocumentRow.lease_until < now,
+                            ),
+                        )
+                        .values(
+                            status=DocumentStatus.FAILED.value,
+                            error=_EXHAUSTED_ERROR,
+                            claimed_at=None,
+                            lease_until=None,
+                            updated_at=now,
+                        )
+                        .returning(KnowledgeDocumentRow.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.commit()
+        return len(failed_ids)
+
+    async def renew_lease(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        generation: int,
+        now: datetime,
+        lease_seconds: int,
+    ) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
                 update(KnowledgeDocumentRow)
                 .where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
                     KnowledgeDocumentRow.id == document_id,
+                    *_fence(generation),
                 )
-                .values(
-                    status=DocumentStatus.FAILED.value,
-                    error=error,
-                    claimed_at=None,
-                    lease_until=None,
-                    updated_at=datetime.now(UTC),
-                )
+                .values(lease_until=now + timedelta(seconds=lease_seconds))
             )
             await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def list_documents(self, *, tenant_id: UUID, kb_id: UUID) -> list[KnowledgeDocument]:
-        stmt = (
+        async with self._sf() as session:
+            rows = (await session.execute(self._documents_stmt(tenant_id, kb_id))).scalars().all()
+        return [_to_document(row) for row in rows]
+
+    async def list_documents_page(
+        self, *, tenant_id: UUID, kb_id: UUID, limit: int, offset: int
+    ) -> tuple[list[KnowledgeDocument], int]:
+        page_stmt = self._documents_stmt(tenant_id, kb_id).offset(offset).limit(limit)
+        count_stmt = (
+            select(func.count())
+            .select_from(KnowledgeDocumentRow)
+            .where(
+                KnowledgeDocumentRow.tenant_id == tenant_id,
+                KnowledgeDocumentRow.kb_id == kb_id,
+            )
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(page_stmt)).scalars().all()
+            total = (await session.execute(count_stmt)).scalar_one()
+        return [_to_document(row) for row in rows], int(total)
+
+    @staticmethod
+    def _documents_stmt(tenant_id: UUID, kb_id: UUID) -> Select[tuple[KnowledgeDocumentRow]]:
+        # ``id`` tiebreak keeps pages stable when several documents share a
+        # ``created_at`` (batch upload).
+        return (
             select(KnowledgeDocumentRow)
             .where(
                 KnowledgeDocumentRow.tenant_id == tenant_id,
                 KnowledgeDocumentRow.kb_id == kb_id,
             )
-            .order_by(KnowledgeDocumentRow.created_at.desc())
+            .order_by(KnowledgeDocumentRow.created_at.desc(), KnowledgeDocumentRow.id.desc())
         )
-        async with self._sf() as session:
-            rows = (await session.execute(stmt)).scalars().all()
-        return [_to_document(row) for row in rows]
 
     async def set_document_status(
         self,
@@ -592,6 +750,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         status: DocumentStatus,
         error: str | None = None,
         chunk_count: int | None = None,
+        generation: int | None = None,
     ) -> bool:
         values: dict[str, object] = {
             "status": status.value,
@@ -605,12 +764,24 @@ class SqlKnowledgeStore(KnowledgeStore):
         if status.value in _TERMINAL_STATUSES:
             values["claimed_at"] = None
             values["lease_until"] = None
+        if status is DocumentStatus.READY and generation is not None:
+            # The new version is now serving: promote pending → content in
+            # the same (fenced) statement.
+            values["content"] = func.coalesce(
+                KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content
+            )
+            values["content_sha256"] = func.coalesce(
+                KnowledgeDocumentRow.pending_content_sha256, KnowledgeDocumentRow.content_sha256
+            )
+            values["pending_content"] = None
+            values["pending_content_sha256"] = None
         async with self._sf() as session:
             result = await session.execute(
                 update(KnowledgeDocumentRow)
                 .where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
                     KnowledgeDocumentRow.id == document_id,
+                    *_fence(generation),
                 )
                 .values(**values)
             )
@@ -619,12 +790,17 @@ class SqlKnowledgeStore(KnowledgeStore):
 
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         async with self._sf() as session:
+            # Lock the document row first — the same order as a fenced
+            # ``replace_chunks`` (row, then its chunks), so the two never
+            # deadlock against each other.
             exists = (
                 await session.execute(
-                    select(KnowledgeDocumentRow.id).where(
+                    select(KnowledgeDocumentRow.id)
+                    .where(
                         KnowledgeDocumentRow.tenant_id == tenant_id,
                         KnowledgeDocumentRow.id == document_id,
                     )
+                    .with_for_update()
                 )
             ).scalar_one_or_none()
             if exists is None:
@@ -647,9 +823,33 @@ class SqlKnowledgeStore(KnowledgeStore):
     # -- chunks -------------------------------------------------------------
 
     async def replace_chunks(
-        self, *, tenant_id: UUID, document_id: UUID, chunks: Sequence[KnowledgeChunk]
-    ) -> None:
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        chunks: Sequence[KnowledgeChunk],
+        generation: int | None = None,
+        expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+    ) -> bool:
         async with self._sf() as session:
+            if generation is not None:
+                # Lock the document row for the length of the swap so a
+                # concurrent fenced status write on the same document
+                # serialises behind it; the fence itself is the predicate.
+                owner = (
+                    await session.execute(
+                        select(KnowledgeDocumentRow.id)
+                        .where(
+                            KnowledgeDocumentRow.tenant_id == tenant_id,
+                            KnowledgeDocumentRow.id == document_id,
+                            *_fence(generation, expect_status),
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if owner is None:
+                    await session.rollback()
+                    return False
             await session.execute(
                 delete(KnowledgeChunkRow).where(
                     KnowledgeChunkRow.tenant_id == tenant_id,
@@ -676,6 +876,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                 ]
             )
             await session.commit()
+        return True
 
     async def list_chunks(
         self, *, tenant_id: UUID, document_id: UUID, offset: int = 0, limit: int = 50
