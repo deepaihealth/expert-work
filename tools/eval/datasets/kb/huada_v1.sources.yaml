@@ -1,0 +1,29 @@
+# huada_v1 评测集的问答来源(给 kb_build_dataset.py --spec 用)。
+# 只有表名 / 表头 / 目录通配,不含任何问答内容;资料本身在仓库外。
+name: huada_v1
+corpus:
+  manifest: ~/kb-eval/huada/manifest.csv   # 仓库外;运行时可用 --manifest 覆盖
+  tiers: [A, D-A]
+max_pdf_pages: 150          # 教材 / 书不解析(答案不出自它们)
+max_docs: 3
+sources:
+  - type: xlsx_qa           # 产品 FAQ 总表:类型 / 问题 / 专业参考回复
+    source: faq_xlsx
+    file: 华大营养产品知识库.xlsx
+    sheets: [产品FAQ]
+    question_headers: [问题]
+    answer_headers: [专业参考回复]
+    tag_header: 类型
+  - type: xlsx_qa           # 2026 版 FAQ:每个产品一张表,表头 问题 / 回答(通用表是 问题 / 参考回复)
+    source: faq_2026
+    file: 华大营养益生菌FAQ-2026.xlsx
+    skip_sheets: ["【补充问题+好的回答】"]
+    question_headers: [问题]
+    answer_headers: [参考回复, 回答]
+  - type: docx_qa           # 产品说明书末尾的「产品常见QandA」
+    source: manual_qa
+    glob: "**/产品说明书*.docx"
+    section: 常见Q
+    tag_from_parent_dir: true
+extra_cases:
+  - huada_v1.hard.yaml      # 手写困难样本(跨文档 / 精确标识 / 表格 / 无答案),相对本文件目录

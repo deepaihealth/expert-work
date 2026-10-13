@@ -1,0 +1,347 @@
+# huada_v1 手写困难样本(2026-10-13):跨文档 / 精确标识 / 表格 / 无答案。
+# 锚文本逐字取自语料解析文本(kb_build_dataset.py 同一解析器),由 tools/eval/kb_check_dataset.py 核对。
+# 无答案题的「应当不存在」关键词见本文件末尾注释,核对脚本同样检查。
+cases:
+  # ---------- 跨文档(hard_cross) ----------
+  - id: hard_cross-0001
+    query: 哪些产品里含有动物双歧杆菌乳亚种BGI-N3？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 菌株]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "动物双歧杆菌乳亚种BGI-N3", page: null}
+      - {document: "产品说明书：畅青.docx", anchor: "动物双歧杆菌乳亚种BGI-N3", page: null}
+      - {document: "产品说明书：益舒.docx", anchor: "动物双歧杆菌乳亚种BGI-N3", page: null}
+      - {document: "产品说明书 ：益衡（血糖管理）.docx", anchor: "动物双歧杆菌乳亚种BGI-N3", page: null}
+      - {document: "产品说明书：益畅（珠峰版）.docx", anchor: "动物双歧杆菌乳亚种BGI-N3", page: null}
+    answer: null
+  - id: hard_cross-0002
+    query: 鼠李糖乳酪杆菌OF44用在了哪几款产品里？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 菌株]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "鼠李糖乳酪杆菌OF44", page: null}
+      - {document: "产品说明书：益舒.docx", anchor: "鼠李糖乳酪杆菌OF44", page: null}
+      - {document: "产品说明书：益顺.docx", anchor: "鼠李糖乳酪杆菌OF44", page: null}
+      - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "鼠李糖乳酪杆菌OF44", page: null}
+      - {document: "产品说明书：益畅（珠峰版）.docx", anchor: "鼠李糖乳酪杆菌OF44", page: null}
+    answer: null
+  - id: hard_cross-0003
+    query: 益畅珠峰版和普通版益畅的活菌数差多少？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 益畅]
+    expected:
+      - {document: "产品说明书：益畅（珠峰版）.docx", anchor: "益畅每袋180亿CFU，珠峰版每袋500亿CFU", page: null}
+      - {document: "产品说明书：益畅.docx", anchor: "180亿CFU/袋", page: null}
+    answer: null
+  - id: hard_cross-0004
+    query: 益顺和基础版益畅相比活菌数提升了多少？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 益顺]
+    expected:
+      - {document: "产品说明书：益顺.docx", anchor: "活菌数拉升至300亿CFU（相当于1.7倍基础版益畅活菌量）", page: null}
+    answer: null
+  - id: hard_cross-0005
+    query: 清风和益衡可以一起吃吗？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 搭配]
+    expected:
+      - {document: "产品说明书 ：清风（尿酸管理）.docx", anchor: "优美达系列的益生菌“各有所长”", page: null}
+      - {document: "产品说明书 ：益衡（血糖管理）.docx", anchor: "优美达系列的益生菌“各有所长”", page: null}
+    answer: null
+  - id: hard_cross-0006
+    query: 益休和晚安饮用的是同一个陈皮粉专利吗？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 专利]
+    expected:
+      - {document: "产品说明书 ：益休.docx", anchor: "陈皮粉专利号：ZL202410048761.8", page: null}
+      - {document: "产品说明书 ：晚安饮.docx", anchor: "陈皮粉专利号：ZL202410048761.8", page: null}
+    answer: null
+  - id: hard_cross-0007
+    query: 镜脂轻可以和轻路一起吃吗？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 搭配]
+    expected:
+      - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "还可以搭配轻路和菊粉膳食纤维餐前食用", page: null}
+    answer: null
+  - id: hard_cross-0008
+    query: 华大有哪几款益生菌是压片糖果？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 剂型]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "益畅益生菌压片糖果", page: null}
+      - {document: "产品说明书：畅青.docx", anchor: "0.6g/片x4片/袋x15袋", page: null}
+    answer: null
+  - id: hard_cross-0009
+    query: 哪些产品3岁以下婴幼儿不能吃？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 人群]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "不适宜人群：3岁以下婴幼儿", page: null}
+      - {document: "产品说明书：畅青.docx", anchor: "不适宜人群：3岁以下婴幼儿", page: null}
+      - {document: "产品说明书：益舒.docx", anchor: "不适宜人群：3岁以下婴幼儿", page: null}
+    answer: null
+  - id: hard_cross-0010
+    query: 格氏乳杆菌TF08-1在哪些产品里？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 菌株]
+    expected:
+      - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "格氏乳杆菌TF08-1", page: null}
+      - {document: "产品说明书：益舒.docx", anchor: "格氏乳杆菌TF08-1", page: null}
+      - {document: "产品说明书：益净（护肝）.docx", anchor: "格氏乳杆菌TF-08", page: null}
+    answer: null
+  - id: hard_cross-0011
+    query: 胃反酸、灼痛应该选哪款产品？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 选品]
+    expected:
+      - {document: "产品说明书：益舒.docx", anchor: "快速缓解胃反酸、灼痛和酒后胃不适", page: null}
+    answer: null
+  - id: hard_cross-0012
+    query: 尿酸高应该推荐哪款产品？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 选品]
+    expected:
+      - {document: "产品说明书 ：清风（尿酸管理）.docx", anchor: "优美达清风益生菌固体饮料", page: null}
+    answer: null
+  - id: hard_cross-0013
+    query: 青春双歧杆菌95用在哪些产品里？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 菌株]
+    expected:
+      - {document: "产品说明书：畅青.docx", anchor: "青春双歧杆菌95", page: null}
+      - {document: "产品说明书 ：益家人.docx", anchor: "青春双歧杆菌95", page: null}
+    answer: null
+  - id: hard_cross-0014
+    query: 晚安饮和灵芝百合晚安饮的专利原料一样吗？
+    source: hard_cross
+    match: all
+    tags: [跨文档, 专利]
+    expected:
+      - {document: "产品说明书 ：晚安饮.docx", anchor: "槐米粉专利号：ZL202211480228.6", page: null}
+      - {document: "产品说明书 ：灵芝百合晚安饮（入夜）.docx", anchor: "槐米粉专利号：ZL202211480228.6", page: null}
+    answer: null
+
+  # ---------- 精确标识(hard_exact) ----------
+  - id: hard_exact-0001
+    query: 益畅里鼠李糖乳酪杆菌OF44的专利号是多少？
+    source: hard_exact
+    tags: [专利号, 益畅]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "鼠李糖乳酪杆菌OF44 专利号：ZL202011248842.0", page: null}
+    answer: ZL202011248842.0
+  - id: hard_exact-0002
+    query: 植物乳植杆菌BGI-N6的专利申请号？
+    source: hard_exact
+    tags: [专利号, 菌株]
+    expected:
+      - {document: "产品说明书 ：益衡（血糖管理）.docx", anchor: "专利申请号：202411264682.7", page: null}
+      - {document: "产品说明书 ：益家人.docx", anchor: "专利申请号：202411264682.7", page: null}
+    answer: "202411264682.7"
+  - id: hard_exact-0003
+    query: 格氏乳杆菌TF08-1的专利号是什么？
+    source: hard_exact
+    tags: [专利号, 菌株]
+    expected:
+      - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "格氏乳杆菌TF08-1 专利号ZL201811514219.8", page: null}
+    answer: ZL201811514219.8
+  - id: hard_exact-0004
+    query: 动物双歧杆菌乳亚种A6的专利号？
+    source: hard_exact
+    tags: [专利号, 菌株]
+    expected:
+      - {document: "产品说明书 ：益休.docx", anchor: "动物双歧杆菌乳亚种A6 专利号：ZL201410403251.4", page: null}
+    answer: ZL201410403251.4
+  - id: hard_exact-0005
+    query: 槐米粉的专利号是多少？
+    source: hard_exact
+    tags: [专利号, 原料]
+    expected:
+      - {document: "产品说明书 ：晚安饮.docx", anchor: "槐米粉专利号：ZL202211480228.6", page: null}
+    answer: ZL202211480228.6
+  - id: hard_exact-0006
+    query: 副干酪乳酪杆菌BGI-N2的专利申请号？
+    source: hard_exact
+    tags: [专利号, 菌株]
+    expected:
+      - {document: "产品说明书：益顺.docx", anchor: "副干酪乳酪杆菌BGI-N2 专利申请号：2023114043622", page: null}
+    answer: "2023114043622"
+  - id: hard_exact-0007
+    query: 戊糖片球菌BGI-N8的专利申请号是多少？
+    source: hard_exact
+    tags: [专利号, 菌株]
+    expected:
+      - {document: "产品说明书：玖伴益生菌（解酒）.docx", anchor: "戊糖片球菌BGI-N8  专利申请号：2024105902551", page: null}
+    answer: "2024105902551"
+  - id: hard_exact-0008
+    query: 青春双歧杆菌95的专利号？
+    source: hard_exact
+    tags: [专利号, 菌株]
+    expected:
+      - {document: "产品说明书：畅青.docx", anchor: "ZL202010520225.5", page: null}
+    answer: ZL202010520225.5
+  - id: hard_exact-0009
+    query: ZL202011248842.0是哪个菌株的专利？
+    source: hard_exact
+    tags: [专利号, 反查]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "鼠李糖乳酪杆菌OF44 专利号：ZL202011248842.0", page: null}
+      - {document: "产品说明书：益畅（珠峰版）.docx", anchor: "鼠李糖乳酪杆菌OF44 专利号：ZL202011248842.0", page: null}
+    answer: 鼠李糖乳酪杆菌OF44
+  - id: hard_exact-0010
+    query: 动物双歧杆菌乳亚种BGI-N3的专利号是多少？
+    source: hard_exact
+    tags: [专利号, 菌株]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "动物双歧杆菌乳亚种BGI-N3 专利号：ZL202411622228.4", page: null}
+      - {document: "产品说明书：益畅（珠峰版）.docx", anchor: "动物双歧杆菌乳亚种BGI-N3 专利号：ZL202411622228.4", page: null}
+    answer: ZL202411622228.4
+  - id: hard_exact-0011
+    query: 镜脂轻里有哪几株菌？
+    source: hard_exact
+    tags: [菌株, 镜脂轻]
+    expected:
+      - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "植物乳植杆菌BGI-N6、抗坏血酸（维生素C）、鼠李糖乳酪杆菌OF44、格氏乳杆菌TF08-1、乳酸片球菌BGI-N9、戊糖片球菌BGI-N8", page: null}
+    answer: null
+  - id: hard_exact-0012
+    query: 清风里的干酪乳杆菌编号是什么？
+    source: hard_exact
+    tags: [菌株, 清风]
+    expected:
+      - {document: "产品说明书 ：清风（尿酸管理）.docx", anchor: "干酪乳杆菌LCS85", page: null}
+    answer: LCS85
+
+  # ---------- 表格(hard_table) ----------
+  - id: hard_table-0001
+    query: 益畅正装一盒多少钱，一盒多少袋？
+    source: hard_table
+    tags: [表格, 价格, 益畅]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "| 正装 | 258元/盒 | 0.6g/片×4片/袋×30袋/盒 |", page: null}
+    answer: 258元/盒，30袋/盒
+  - id: hard_table-0002
+    query: 益畅珠峰版的零售价和保质期？
+    source: hard_table
+    tags: [表格, 价格, 益畅]
+    expected:
+      - {document: "产品说明书：益畅（珠峰版）.docx", anchor: "| 正装 | 599元/盒 | 5g/袋×30袋/盒 | 500亿CFU/袋 | 24个月 |", page: null}
+    answer: 599元/盒，24个月
+  - id: hard_table-0003
+    query: 清风一袋多少活菌，一盒几袋？
+    source: hard_table
+    tags: [表格, 规格, 清风]
+    expected:
+      - {document: "产品说明书 ：清风（尿酸管理）.docx", anchor: "| 288/盒 | 净含量75g（5g/袋x15袋） | 300亿CFU/袋 | 18个月 |", page: null}
+    answer: 300亿CFU/袋，15袋
+  - id: hard_table-0004
+    query: 畅青的体验装多少钱？
+    source: hard_table
+    tags: [表格, 价格, 畅青]
+    expected:
+      - {document: "产品说明书：畅青.docx", anchor: "| 38/盒 | 净含量7.2g", page: null}
+    answer: 38/盒
+  - id: hard_table-0005
+    query: 益舒的保质期多长？
+    source: hard_table
+    tags: [表格, 保质期, 益舒]
+    expected:
+      - {document: "产品说明书：益舒.docx", anchor: "| 258/盒 | 净含量60g（2g/袋x30袋） | 150亿CFU/袋 | 18个月 |", page: null}
+    answer: 18个月
+  - id: hard_table-0006
+    query: 晚安饮一盒有几袋，每袋多少毫升？
+    source: hard_table
+    tags: [表格, 规格, 晚安饮]
+    expected:
+      - {document: "产品说明书 ：晚安饮.docx", anchor: "| 139元/盒 | 30ml/袋\\*7袋/盒 | 24个月 |", page: null}
+    answer: 7袋，30ml/袋
+  - id: hard_table-0007
+    query: 镜脂轻每100克的能量是多少？
+    source: hard_table
+    tags: [表格, 营养成分, 镜脂轻]
+    expected:
+      - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "| **能量** | 1616kJ | 19% |", page: null}
+    answer: 1616kJ
+  - id: hard_table-0008
+    query: 益畅每100克含多少膳食纤维？
+    source: hard_table
+    tags: [表格, 营养成分, 益畅]
+    expected:
+      - {document: "产品说明书：益畅.docx", anchor: "| **碳水化合物**  膳食纤维 | 59.5g  23.2g | 20%  93% |", page: null}
+    answer: 23.2g
+
+  # ---------- 无答案(no_answer):资料里应当没有 ----------
+  - id: no_answer-0001
+    query: 益畅可以带上飞机托运吗？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0002
+    query: 益畅有清真认证吗？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0003
+    query: 益畅在美国亚马逊卖多少钱？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0004
+    query: 华大营养的股票代码是多少？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0005
+    query: 益畅的碳足迹是多少？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0006
+    query: 清风有素食认证吗？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0007
+    query: 益畅的HS编码是多少？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0008
+    query: 买益畅能开增值税专用发票吗？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0009
+    query: 镜脂轻在日本的售价是多少日元？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+  - id: no_answer-0010
+    query: 买益畅可以用花呗分期吗？
+    source: no_answer
+    tags: [无答案]
+    expected: []
+    answer: null
+# 无答案核对关键词(每题至少一个应在全部语料里不出现):
+# 0001 托运 | 0002 清真 | 0003 亚马逊 | 0004 股票代码 | 0005 碳足迹 | 0006 素食认证
+# 0007 HS编码 | 0008 增值税专用发票 | 0009 日元 | 0010 花呗

@@ -217,3 +217,28 @@ def test_check_corpus_reports_unknown_and_non_text_tier_documents(tmp_path: Path
 def test_check_corpus_ignores_no_answer_cases(tmp_path: Path) -> None:
     ds = load_dataset(_write(tmp_path, [_case("na", source="no_answer", expected=[])]))
     assert check_corpus(ds, _manifest(tmp_path)) == []
+
+
+def test_match_defaults_to_any_and_rejects_unknown(tmp_path: Path) -> None:
+    def write(match: object) -> Path:
+        case: dict[str, object] = {
+            "id": "c1",
+            "query": "哪些产品含有 BGI-N3?",
+            "source": "hard_cross",
+            "expected": [{"document": "a.docx", "anchor": "动物双歧杆菌乳亚种BGI-N3"}],
+        }
+        if match is not None:
+            case["match"] = match
+        path = tmp_path / "d.yaml"
+        path.write_text(
+            yaml.safe_dump({"name": "d", "cases": [case]}, allow_unicode=True), encoding="utf-8"
+        )
+        return path
+
+    default_path = write(None)
+    assert load_dataset(default_path).cases[0].match == "any"
+    all_path = write("all")
+    assert load_dataset(all_path).cases[0].match == "all"
+    bad_path = write("some")
+    with pytest.raises(KbDatasetError, match="'match'"):
+        load_dataset(bad_path)
