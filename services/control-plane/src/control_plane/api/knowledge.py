@@ -25,8 +25,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from control_plane.api._authz import console_only, require
+from control_plane.audit import emit
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
+from control_plane.settings import Settings
 from control_plane.tenant_scope import (
     CrossTenant,
     applied_scope,
@@ -45,6 +47,8 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    AuditAction,
+    DocumentStatus,
     KnowledgeBase,
     KnowledgeDocument,
     RetrievalMethod,
@@ -61,6 +65,16 @@ logger = logging.getLogger("expert_work.control_plane.knowledge")
 # W4 cap for the ``tenant_id=*`` aggregate: ``ALL_TENANTS_BASES_LIMIT`` is the
 # store-side constant (single source — the store default and the ``truncated``
 # flag below must never drift).
+
+#: Document list paging. Without ``limit`` the whole list is returned (the
+#: admin UI still pages client-side — L3's second PR switches it over); an
+#: explicit ``limit`` is clamped to the maximum.
+DOCUMENTS_PAGE_MAX = 200
+
+#: Upload is read in slices this large and rejected (413) as soon as the
+#: running total passes the configured cap — the whole file is never buffered
+#: before the size check.
+_UPLOAD_READ_SLICE = 1024 * 1024
 
 
 class _CreateBaseBody(BaseModel):
@@ -122,6 +136,47 @@ def _get_embedding_config_service(request: Request) -> Any | None:
 
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
+
+
+def _get_settings(request: Request) -> Settings:
+    return request.app.state.settings  # type: ignore[no-any-return]
+
+
+async def _audit_write(
+    audit: AuditLogger,
+    request: Request,
+    *,
+    action: AuditAction,
+    resource_type: Literal["knowledge_base", "knowledge_document"],
+    resource_id: str,
+    details: dict[str, object] | None = None,
+) -> None:
+    await emit(
+        audit,
+        tenant_id=request.state.tenant_id,
+        actor_id=request.state.principal.subject_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        trace_id=current_trace_id_hex(),
+        details=details,
+    )
+
+
+async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
+    """Read the upload in slices; 413 as soon as it exceeds ``limit_bytes``.
+
+    The 413 payload shape is a contract with the admin UI (it reads
+    ``detail.limit_bytes`` to print the cap): ``{"error": "file_too_large",
+    "limit_bytes": N}``."""
+    buffer = bytearray()
+    while chunk := await file.read(_UPLOAD_READ_SLICE):
+        buffer.extend(chunk)
+        if len(buffer) > limit_bytes:
+            raise HTTPException(
+                status_code=413, detail={"error": "file_too_large", "limit_bytes": limit_bytes}
+            )
+    return bytes(buffer)
 
 
 async def _current_embedding_model(config_service: Any | None) -> tuple[str, str] | None:
@@ -210,6 +265,7 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         config_service: Annotated[Any | None, Depends(_get_embedding_config_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         max_tokens = body.chunk_max_tokens or DEFAULT_CHUNK_MAX_TOKENS
@@ -244,6 +300,14 @@ def build_knowledge_router() -> APIRouter:
             )
         except DuplicateKnowledgeBaseError as exc:
             raise HTTPException(status_code=409, detail="knowledge base already exists") from exc
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_BASE_CREATE,
+            resource_type="knowledge_base",
+            resource_id=str(base.id),
+            details={"name": base.name},
+        )
         return JSONResponse(
             status_code=201, content=_base_dict(base, needs_reindex=_needs_reindex(base, current))
         )
@@ -334,6 +398,7 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         config_service: Annotated[Any | None, Depends(_get_embedding_config_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
@@ -373,6 +438,14 @@ def build_knowledge_router() -> APIRouter:
         )
         if updated is None:  # pragma: no cover - guarded by _require_base above
             raise HTTPException(status_code=404, detail="knowledge base not found")
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_BASE_UPDATE,
+            resource_type="knowledge_base",
+            resource_id=str(updated.id),
+            details={"name": updated.name, "fields": sorted(sent)},
+        )
         stats = await store.base_stats(tenant_id=tenant_id, kb_id=updated.id)
         current = await _current_embedding_model(config_service)
         return JSONResponse(
@@ -390,6 +463,7 @@ def build_knowledge_router() -> APIRouter:
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
         config_service: Annotated[Any | None, Depends(_get_embedding_config_service)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
@@ -414,6 +488,14 @@ def build_knowledge_router() -> APIRouter:
             embedding_provider=provider,
             embedding_model=model,
         )
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_BASE_REINDEX,
+            resource_type="knowledge_base",
+            resource_id=str(base.id),
+            details={"name": base.name, "embedding_provider": provider, "embedding_model": model},
+        )
         return JSONResponse(status_code=202, content={"status": "reindexing", "name": base.name})
 
     @router.delete(
@@ -426,10 +508,19 @@ def build_knowledge_router() -> APIRouter:
         name: str,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> Response:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         await store.delete_base(tenant_id=tenant_id, kb_id=base.id)
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_BASE_DELETE,
+            resource_type="knowledge_base",
+            resource_id=str(base.id),
+            details={"name": base.name},
+        )
         return Response(status_code=204)
 
     @router.post(
@@ -443,6 +534,8 @@ def build_knowledge_router() -> APIRouter:
         file: Annotated[UploadFile, File()],
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
+        settings: Annotated[Settings, Depends(_get_settings)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
@@ -456,7 +549,7 @@ def build_knowledge_router() -> APIRouter:
             raise HTTPException(status_code=400, detail="uploaded file has no filename")
         if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
             raise HTTPException(status_code=400, detail=f"unsupported document type: {filename!r}")
-        raw = await file.read()
+        raw = await _read_upload_capped(file, settings.knowledge_document_max_bytes)
         # Retain the original bytes so a crashed/failed document can be
         # re-driven (crash recovery + re-ingest) without a re-upload.
         document = await store.upsert_document(
@@ -466,18 +559,32 @@ def build_knowledge_router() -> APIRouter:
             content=raw,
             content_sha256=hashlib.sha256(raw).hexdigest(),
         )
-        runner.submit(
-            tenant_id=tenant_id,
-            document_id=document.id,
-            kb_id=base.id,
-            filename=filename,
-            raw=raw,
-            chunk_max_tokens=base.chunk_max_tokens,
-            chunk_overlap_tokens=base.chunk_overlap_tokens,
+        # Same bytes as the READY document already there → nothing to ingest:
+        # 200 + ``unchanged`` (the store left status / chunks untouched).
+        unchanged = document.status is DocumentStatus.READY
+        if not unchanged:
+            # The runner re-reads bytes + chunking parameters at claim time,
+            # so a re-upload that lands while this task is queued wins.
+            runner.submit(tenant_id=tenant_id, document_id=document.id)
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_DOCUMENT_UPLOAD,
+            resource_type="knowledge_document",
+            resource_id=str(document.id),
+            details={
+                "kb": base.name,
+                "filename": filename,
+                "size_bytes": len(raw),
+                "unchanged": unchanged,
+            },
         )
         # 202 Accepted — ingestion runs in the background; poll the
-        # document list for its status.
-        return JSONResponse(status_code=202, content=_document_dict(document))
+        # document list for its status. 200 when nothing changed.
+        return JSONResponse(
+            status_code=200 if unchanged else 202,
+            content={**_document_dict(document), "unchanged": unchanged},
+        )
 
     @router.get(
         "/bases/{name}/documents",
@@ -489,6 +596,8 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        limit: int | None = None,
+        offset: int = 0,
         # W3 read scope — subordinate detail read: concrete tenant only.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
@@ -500,10 +609,25 @@ def build_knowledge_router() -> APIRouter:
             endpoint="GET /v1/knowledge/bases/{name}/documents",
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        safe_offset = max(0, offset)
+        safe_limit = max(1, min(limit, DOCUMENTS_PAGE_MAX)) if limit is not None else None
         async with applied_scope(scope):
             base = await _require_base(store, scope.tenant_id, name)
-            documents = await store.list_documents(tenant_id=scope.tenant_id, kb_id=base.id)
-        return JSONResponse(content={"documents": [_document_dict(doc) for doc in documents]})
+            if safe_limit is None:
+                everything = await store.list_documents(tenant_id=scope.tenant_id, kb_id=base.id)
+                documents, total = everything[safe_offset:], len(everything)
+            else:
+                documents, total = await store.list_documents_page(
+                    tenant_id=scope.tenant_id, kb_id=base.id, limit=safe_limit, offset=safe_offset
+                )
+        return JSONResponse(
+            content={
+                "documents": [_document_dict(doc) for doc in documents],
+                "total": total,
+                "offset": safe_offset,
+                "limit": safe_limit,
+            }
+        )
 
     @router.delete(
         "/bases/{name}/documents/{document_id}",
@@ -516,12 +640,21 @@ def build_knowledge_router() -> APIRouter:
         document_id: UUID,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> Response:
         tenant_id: UUID = request.state.tenant_id
-        await _require_base(store, tenant_id, name)
+        base = await _require_base(store, tenant_id, name)
         deleted = await store.delete_document(tenant_id=tenant_id, document_id=document_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="document not found")
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_DOCUMENT_DELETE,
+            resource_type="knowledge_document",
+            resource_id=str(document_id),
+            details={"kb": base.name},
+        )
         return Response(status_code=204)
 
     @router.post(
@@ -535,6 +668,7 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
@@ -554,21 +688,24 @@ def build_knowledge_router() -> APIRouter:
                 detail="original file not retained; please re-upload this document",
             )
         # Reset to pending (keeps the same bytes) and re-drive the fast path.
+        # ``force``: an explicit re-ingest must run even though the bytes are
+        # unchanged (that is the point of the button).
         reset = await store.upsert_document(
             tenant_id=tenant_id,
             kb_id=base.id,
             filename=document.filename,
             content=content,
             content_sha256=hashlib.sha256(content).hexdigest(),
+            force=True,
         )
-        runner.submit(
-            tenant_id=tenant_id,
-            document_id=reset.id,
-            kb_id=base.id,
-            filename=document.filename,
-            raw=content,
-            chunk_max_tokens=base.chunk_max_tokens,
-            chunk_overlap_tokens=base.chunk_overlap_tokens,
+        runner.submit(tenant_id=tenant_id, document_id=reset.id)
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_DOCUMENT_REINGEST,
+            resource_type="knowledge_document",
+            resource_id=str(reset.id),
+            details={"kb": base.name, "filename": document.filename},
         )
         return JSONResponse(status_code=202, content=_document_dict(reset))
 

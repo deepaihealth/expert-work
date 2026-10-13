@@ -18,6 +18,7 @@ from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -117,6 +118,11 @@ class KnowledgeDocumentRow(Base):
     #: ``attempts`` bounds retries. ``content`` retains the original bytes so a
     #: failed/crashed/re-ingested document can be re-driven without re-upload.
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    #: Re-ingest generation (migration ``0164``) — bumped by ``upsert_document``
+    #: on every reset; fenced write-backs carry the generation they claimed.
+    ingest_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)

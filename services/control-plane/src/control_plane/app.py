@@ -161,7 +161,7 @@ from control_plane.keycloak import (
     KeycloakAdminClient,
     ServiceAccountTokenProvider,
 )
-from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
+from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from control_plane.manifest import ManifestLoader
 from control_plane.mcp_oauth import default_http_client
@@ -2044,11 +2044,16 @@ def create_app(
                 # uploaded knowledge documents. Lease + attempt bounds match the
                 # recovery worker so the fast path and the reaper share one
                 # exactly-once claim contract (Stream KB durability).
+                configure_parse_pool(
+                    workers=resolved_settings.knowledge_parse_workers,
+                    timeout_s=resolved_settings.knowledge_parse_timeout_s,
+                )
                 _app.state.knowledge_ingestion_runner = KnowledgeIngestionRunner(
                     store=resolved_knowledge_store,
                     embedder=embedder,
                     lease_seconds=resolved_settings.knowledge_ingest_lease_s,
                     max_attempts=resolved_settings.knowledge_ingest_max_attempts,
+                    concurrency=resolved_settings.knowledge_ingest_concurrency,
                 )
                 # Stream KB — durable crash recovery for ingestion: claims stuck
                 # documents (pending / lease-expired processing) and re-drives
@@ -2058,7 +2063,7 @@ def create_app(
                         store=resolved_knowledge_store,
                         embedder=embedder,
                         interval_s=resolved_settings.knowledge_recovery_interval_s,
-                        batch_size=resolved_settings.knowledge_recovery_batch_size,
+                        concurrency=resolved_settings.knowledge_ingest_concurrency,
                         lease_seconds=resolved_settings.knowledge_ingest_lease_s,
                         max_attempts=resolved_settings.knowledge_ingest_max_attempts,
                     )

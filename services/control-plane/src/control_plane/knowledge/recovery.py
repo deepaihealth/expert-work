@@ -20,7 +20,11 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 
-from control_plane.knowledge.ingestion import ingest_document_bytes
+from control_plane.knowledge.ingestion import (
+    StaleIngestionError,
+    ingest_document_bytes,
+    renew_lease_periodically,
+)
 from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
@@ -59,7 +63,7 @@ class KnowledgeIngestRecoveryWorker:
         store: KnowledgeStore,
         embedder: Embedder,
         interval_s: int,
-        batch_size: int,
+        concurrency: int,
         lease_seconds: int,
         max_attempts: int,
     ) -> None:
@@ -69,7 +73,10 @@ class KnowledgeIngestRecoveryWorker:
         self._store = store
         self._embedder = embedder
         self._interval_s = interval_s
-        self._batch_size = batch_size
+        # One cycle claims at most ``concurrency`` documents and drives them
+        # all at once — never more claims than can be worked, so no lease
+        # sits idle long enough to expire and be re-claimed elsewhere.
+        self._concurrency = max(1, concurrency)
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._task: asyncio.Task[None] | None = None
@@ -99,38 +106,69 @@ class KnowledgeIngestRecoveryWorker:
             self._task = None
 
     async def run_once(self) -> int:
-        """Claim + re-drive one batch of stuck documents; return how many
-        reached a terminal state (ready or failed) this pass."""
-        # The claim scan is cross-tenant — bypass RLS to see every tenant's
-        # stuck rows (mirrors quota/reaper.py).
+        """Sweep exhausted documents to ``failed``, then claim + re-drive one
+        batch of stuck documents concurrently; return how many of the driven
+        documents reached a terminal state (ready or failed) this pass."""
+        # The sweep and the claim scan are cross-tenant — bypass RLS to see
+        # every tenant's stuck rows (mirrors quota/reaper.py).
         token_bypass = bypass_rls_var.set(True)
         token_tenant = current_tenant_id_var.set(None)
         try:
+            now = datetime.now(UTC)
+            swept = await self._store.sweep_terminal(now=now, max_attempts=self._max_attempts)
+            if swept:
+                _failed_terminal.inc(swept)
+                logger.warning("knowledge.recovery.swept_exhausted count=%d", swept)
             claims = await self._store.claim_documents_for_ingest(
-                now=datetime.now(UTC),
+                now=now,
                 lease_seconds=self._lease_seconds,
-                limit=self._batch_size,
+                limit=self._concurrency,
                 max_attempts=self._max_attempts,
             )
         finally:
             current_tenant_id_var.reset(token_tenant)
             bypass_rls_var.reset(token_bypass)
 
-        if claims:
-            _claimed.inc(len(claims))
+        if not claims:
+            return 0
+        _claimed.inc(len(claims))
+        outcomes = await asyncio.gather(
+            *(self._drive_in_tenant_scope(claim) for claim in claims), return_exceptions=True
+        )
         settled = 0
-        for claim in claims:
-            # Each re-drive runs in its owning tenant's RLS context so the
-            # store writes (chunks, status) pass row-level security.
-            token_tenant_drive = current_tenant_id_var.set(claim.tenant_id)
-            token_bypass_drive = bypass_rls_var.set(False)
-            try:
-                if await self._drive(claim):
-                    settled += 1
-            finally:
-                current_tenant_id_var.reset(token_tenant_drive)
-                bypass_rls_var.reset(token_bypass_drive)
+        for claim, outcome in zip(claims, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                _cycle_errors.inc()
+                logger.error(
+                    "knowledge.recovery.drive_crashed document=%s",
+                    claim.document_id,
+                    exc_info=outcome,
+                )
+            elif outcome:
+                settled += 1
         return settled
+
+    async def _drive_in_tenant_scope(self, claim: ClaimedIngestion) -> bool:
+        # Each re-drive runs in its owning tenant's RLS context so the store
+        # writes (chunks, status) pass row-level security. Set inside the
+        # coroutine: ``gather`` copies the context at task creation.
+        token_tenant = current_tenant_id_var.set(claim.tenant_id)
+        token_bypass = bypass_rls_var.set(False)
+        renewer = asyncio.create_task(
+            renew_lease_periodically(
+                self._store,
+                tenant_id=claim.tenant_id,
+                document_id=claim.document_id,
+                generation=claim.generation,
+                lease_seconds=self._lease_seconds,
+            )
+        )
+        try:
+            return await self._drive(claim)
+        finally:
+            renewer.cancel()
+            current_tenant_id_var.reset(token_tenant)
+            bypass_rls_var.reset(token_bypass)
 
     async def _drive(self, claim: ClaimedIngestion) -> bool:
         if claim.content is None:
@@ -139,6 +177,7 @@ class KnowledgeIngestRecoveryWorker:
                 tenant_id=claim.tenant_id,
                 document_id=claim.document_id,
                 error="original file not retained; re-upload required",
+                generation=claim.generation,
             )
             _failed_terminal.inc()
             return True
@@ -153,7 +192,25 @@ class KnowledgeIngestRecoveryWorker:
                 raw=claim.content,
                 chunk_max_tokens=claim.chunk_max_tokens,
                 chunk_overlap_tokens=claim.chunk_overlap_tokens,
+                generation=claim.generation,
             )
+            settled = await self._store.set_document_status(
+                tenant_id=claim.tenant_id,
+                document_id=claim.document_id,
+                status=DocumentStatus.READY,
+                chunk_count=chunk_count,
+                generation=claim.generation,
+            )
+            if not settled:
+                raise StaleIngestionError(claim.document_id)
+        except StaleIngestionError:
+            # 重传 / 已被别的认领收尾 —— 本次驱动的结果作废,什么都不写。
+            logger.info(
+                "knowledge.recovery_stale document=%s generation=%d",
+                claim.document_id,
+                claim.generation,
+            )
+            return False
         except Exception as exc:
             gone = False
             try:
@@ -173,6 +230,7 @@ class KnowledgeIngestRecoveryWorker:
                     tenant_id=claim.tenant_id,
                     document_id=claim.document_id,
                     error=str(exc)[:_ERROR_CAP],
+                    generation=claim.generation,
                 )
                 _failed_terminal.inc()
                 logger.warning(
@@ -191,12 +249,6 @@ class KnowledgeIngestRecoveryWorker:
                 exc_info=True,
             )
             return False
-        await self._store.set_document_status(
-            tenant_id=claim.tenant_id,
-            document_id=claim.document_id,
-            status=DocumentStatus.READY,
-            chunk_count=chunk_count,
-        )
         _recovered.inc()
         return True
 

@@ -18,7 +18,15 @@ from expert_work.protocol import (
 
 
 def test_document_status_values() -> None:
-    assert {s.value for s in DocumentStatus} == {"pending", "processing", "ready", "failed"}
+    assert {s.value for s in DocumentStatus} == {
+        "pending",
+        "processing",
+        "ready",
+        "failed",
+        # Reserved for B-179 content safety; nothing writes them yet.
+        "blocked",
+        "disabled",
+    }
 
 
 def test_knowledge_base_constructs() -> None:

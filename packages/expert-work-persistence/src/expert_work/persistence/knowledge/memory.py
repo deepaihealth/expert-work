@@ -50,6 +50,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         # store keeps these on the row. ``_lease`` holds the lease expiry; CAS
         # races are only meaningfully testable against real Postgres.
         self._content: dict[UUID, bytes | None] = {}
+        self._sha256: dict[UUID, str | None] = {}
         self._lease: dict[UUID, datetime | None] = {}
 
     # -- knowledge bases ----------------------------------------------------
@@ -215,8 +216,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         filename: str,
         content: bytes | None = None,
         content_sha256: str | None = None,
+        force: bool = False,
     ) -> KnowledgeDocument:
-        del content_sha256  # tracked alongside bytes in SQL; unused in-memory
         now = datetime.now(UTC)
         existing = next(
             (
@@ -227,20 +228,29 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             None,
         )
         if existing is not None:
+            if (
+                not force
+                and content_sha256 is not None
+                and existing.status is DocumentStatus.READY
+                and self._sha256.get(existing.id) == content_sha256
+            ):
+                return existing  # unchanged re-upload: nothing to do
             reset = existing.model_copy(
                 update={
                     "status": DocumentStatus.PENDING,
                     "error": None,
                     "chunk_count": 0,
                     "attempts": 0,
+                    "ingest_generation": existing.ingest_generation + 1,
                     "updated_at": now,
                 }
             )
             self._documents[self._documents.index(existing)] = reset
-            self._chunks = [c for c in self._chunks if c.document_id != existing.id]
+            # Chunks are kept until the new ingest replaces them (fenced).
             self._lease[existing.id] = None
             if content is not None:
                 self._content[existing.id] = content
+                self._sha256[existing.id] = content_sha256
             return reset
         document = KnowledgeDocument(
             id=uuid4(),
@@ -253,6 +263,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
         self._documents.append(document)
         self._content[document.id] = content
+        self._sha256[document.id] = content_sha256
         self._lease[document.id] = None
         return document
 
@@ -326,21 +337,66 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             chunk_max_tokens=chunk_max,
             chunk_overlap_tokens=chunk_overlap,
             attempts=claimed.attempts,
+            generation=claimed.ingest_generation,
         )
 
     async def mark_document_failed_terminal(
-        self, *, tenant_id: UUID, document_id: UUID, error: str
-    ) -> None:
-        await self.set_document_status(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        error: str,
+        generation: int | None = None,
+    ) -> bool:
+        return await self.set_document_status(
             tenant_id=tenant_id,
             document_id=document_id,
             status=DocumentStatus.FAILED,
             error=error,
+            generation=generation,
         )
+
+    async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
+        swept = 0
+        for doc in list(self._documents):
+            if doc.status is not DocumentStatus.PROCESSING or doc.attempts < max_attempts:
+                continue
+            lease = self._lease.get(doc.id)
+            if lease is not None and lease >= now:
+                continue
+            await self.set_document_status(
+                tenant_id=doc.tenant_id,
+                document_id=doc.id,
+                status=DocumentStatus.FAILED,
+                error=_EXHAUSTED_ERROR,
+            )
+            swept += 1
+        return swept
+
+    async def renew_lease(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        generation: int,
+        now: datetime,
+        lease_seconds: int,
+    ) -> bool:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None or not _fence_matches(document, generation):
+            return False
+        self._lease[document_id] = now + timedelta(seconds=lease_seconds)
+        return True
 
     async def list_documents(self, *, tenant_id: UUID, kb_id: UUID) -> list[KnowledgeDocument]:
         docs = [d for d in self._documents if d.tenant_id == tenant_id and d.kb_id == kb_id]
         return sorted(docs, key=_created_key, reverse=True)
+
+    async def list_documents_page(
+        self, *, tenant_id: UUID, kb_id: UUID, limit: int, offset: int
+    ) -> tuple[list[KnowledgeDocument], int]:
+        docs = await self.list_documents(tenant_id=tenant_id, kb_id=kb_id)
+        return docs[offset : offset + limit], len(docs)
 
     async def set_document_status(
         self,
@@ -350,9 +406,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         status: DocumentStatus,
         error: str | None = None,
         chunk_count: int | None = None,
+        generation: int | None = None,
     ) -> bool:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
         if document is None:
+            return False
+        if generation is not None and not _fence_matches(document, generation):
             return False
         update: dict[str, object] = {
             "status": status,
@@ -363,6 +422,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             update["chunk_count"] = chunk_count
         if status in (DocumentStatus.READY, DocumentStatus.FAILED):
             self._lease[document_id] = None  # terminal → release lease
+        if status is DocumentStatus.FAILED:
+            # A failed document is never searchable — drop whatever chunks
+            # the previous upload left behind (mirrors the SQL store).
+            self._chunks = [c for c in self._chunks if c.document_id != document_id]
+            update["chunk_count"] = 0
         self._documents[self._documents.index(document)] = document.model_copy(update=update)
         return True
 
@@ -377,11 +441,22 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     # -- chunks -------------------------------------------------------------
 
     async def replace_chunks(
-        self, *, tenant_id: UUID, document_id: UUID, chunks: Sequence[KnowledgeChunk]
-    ) -> None:
-        # Mirror the SQL side's FK (0136): writing chunks back to a deleted
-        # document must fail loudly instead of recreating orphan vectors.
-        if await self.get_document(tenant_id=tenant_id, document_id=document_id) is None:
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        chunks: Sequence[KnowledgeChunk],
+        generation: int | None = None,
+        expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+    ) -> bool:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if generation is not None:
+            # Fenced: a missing document is just "not ours any more".
+            if document is None or not _fence_matches(document, generation, expect_status):
+                return False
+        elif document is None:
+            # Mirror the SQL side's FK (0136): writing chunks back to a deleted
+            # document must fail loudly instead of recreating orphan vectors.
             raise KeyError(document_id)
         self._chunks = [
             c
@@ -389,6 +464,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if not (c.tenant_id == tenant_id and c.document_id == document_id)
         ]
         self._chunks.extend(chunks)
+        return True
 
     async def list_chunks(
         self, *, tenant_id: UUID, document_id: UUID, offset: int = 0, limit: int = 50
@@ -479,3 +555,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
 
 def _created_key(record: KnowledgeBase | KnowledgeDocument) -> datetime:
     return record.created_at or datetime.min.replace(tzinfo=UTC)
+
+
+#: ``error`` written by :meth:`InMemoryKnowledgeStore.sweep_terminal` — same
+#: text as the SQL store so operators see one message.
+_EXHAUSTED_ERROR = "ingest attempts exhausted"
+
+
+def _fence_matches(
+    document: KnowledgeDocument,
+    generation: int,
+    status: DocumentStatus = DocumentStatus.PROCESSING,
+) -> bool:
+    """The generation fence: the write-back belongs to the claim that still
+    owns this exact generation of the document in the expected status."""
+    return document.status is status and document.ingest_generation == generation

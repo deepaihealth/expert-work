@@ -676,3 +676,297 @@ def _make_chunk(
         content=content,
         embedding=embedding,
     )
+
+
+# ---------------------------------------------------------------------------
+# L2-PR2 入库可靠性:同哈希不动 / 代际围栏(真并发)/ 终态巡检 / 续约 / 分页
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_hash_ready_is_unchanged_and_keeps_chunks(
+    sql_store: SqlStoreFixture,
+) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v1", content_sha256="s1"
+        )
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[_make_chunk(tenant, base.id, doc.id, 0, "old", _vec(1.0))],
+        )
+        await store.set_document_status(
+            tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=1
+        )
+        same = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v1", content_sha256="s1"
+        )
+        assert same.status is DocumentStatus.READY
+        assert same.chunk_count == 1
+        assert same.ingest_generation == 0
+        # Different bytes → reset, generation bumped, old chunks still there.
+        changed = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v2", content_sha256="s2"
+        )
+        assert changed.status is DocumentStatus.PENDING
+        assert changed.ingest_generation == 1
+        hits = await store.search(tenant_id=tenant, kb_ids=[base.id], query_embedding=_vec(1.0))
+        assert [h.content for h in hits] == ["old"]
+        forced = await store.upsert_document(
+            tenant_id=tenant,
+            kb_id=base.id,
+            filename="d.md",
+            content=b"v2",
+            content_sha256="s2",
+            force=True,
+        )
+        assert forced.ingest_generation == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_generation_fence_under_concurrent_writeback(sql_store: SqlStoreFixture) -> None:
+    """A 认领 gen=0 → 重传 gen=1 → B 认领 gen=1;A/B 并发写回,只有 B 的落库."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v1", content_sha256="s1"
+        )
+        now = datetime.now(UTC)
+        a = await store.claim_document(
+            tenant_id=tenant, document_id=doc.id, now=now, lease_seconds=300, max_attempts=5
+        )
+        assert a is not None and a.generation == 0
+        await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v2", content_sha256="s2"
+        )
+        b = await store.claim_document(
+            tenant_id=tenant, document_id=doc.id, now=now, lease_seconds=300, max_attempts=5
+        )
+        assert b is not None and b.generation == 1
+
+        async def _writeback(claim_generation: int, label: str) -> tuple[bool, bool]:
+            wrote = await store.replace_chunks(
+                tenant_id=tenant,
+                document_id=doc.id,
+                chunks=[_make_chunk(tenant, base.id, doc.id, 0, label, _vec(1.0))],
+                generation=claim_generation,
+            )
+            settled = await store.set_document_status(
+                tenant_id=tenant,
+                document_id=doc.id,
+                status=DocumentStatus.READY,
+                chunk_count=1,
+                generation=claim_generation,
+            )
+            return wrote, settled
+
+        results = await asyncio.gather(
+            _writeback(a.generation, "from-a"), _writeback(b.generation, "from-b")
+        )
+        assert results[0] == (False, False)
+        assert results[1] == (True, True)
+        fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert fetched is not None
+        assert fetched.status is DocumentStatus.READY
+        assert fetched.attempts == 1  # _to_document now carries attempts
+        hits = await store.search(tenant_id=tenant, kb_ids=[base.id], query_embedding=_vec(1.0))
+        assert [h.content for h in hits] == ["from-b"]
+        assert not await store.mark_document_failed_terminal(
+            tenant_id=tenant, document_id=doc.id, error="stale", generation=a.generation
+        )
+        fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert fetched is not None and fetched.error is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sweep_terminal_and_renew_lease(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        exhausted = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="x.md", content=b"x"
+        )
+        past = datetime.now(UTC) - timedelta(seconds=10)
+        # Each claim is made strictly after the previous (0 s) lease expired.
+        for step in range(3):
+            assert (
+                await store.claim_document(
+                    tenant_id=tenant,
+                    document_id=exhausted.id,
+                    now=past + timedelta(seconds=step),
+                    lease_seconds=0,
+                    max_attempts=3,
+                )
+                is not None
+            )
+        live = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="y.md", content=b"y"
+        )
+        claim = await store.claim_document(
+            tenant_id=tenant, document_id=live.id, now=past, lease_seconds=0, max_attempts=3
+        )
+        assert claim is not None
+        now = datetime.now(UTC)
+        # The container is shared across tests and the sweep is cross-tenant:
+        # assert on this test's own document, not on an exact count.
+        assert await store.sweep_terminal(now=now, max_attempts=3) >= 1
+        swept = await store.get_document(tenant_id=tenant, document_id=exhausted.id)
+        assert swept is not None
+        assert swept.status is DocumentStatus.FAILED
+        assert swept.error == "ingest attempts exhausted"
+        assert await store.sweep_terminal(now=now, max_attempts=3) == 0
+
+        # Renewing the live claim's lease keeps it away from the recovery scan.
+        assert await store.renew_lease(
+            tenant_id=tenant,
+            document_id=live.id,
+            generation=claim.generation,
+            now=now,
+            lease_seconds=600,
+        )
+        claims = await store.claim_documents_for_ingest(
+            now=now, lease_seconds=60, limit=10, max_attempts=3
+        )
+        assert live.id not in {c.document_id for c in claims}
+        assert not await store.renew_lease(
+            tenant_id=tenant,
+            document_id=live.id,
+            generation=claim.generation + 1,
+            now=now,
+            lease_seconds=600,
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_documents_page_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        for i in range(5):
+            await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename=f"{i}.md")
+        full = await store.list_documents(tenant_id=tenant, kb_id=base.id)
+        page, total = await store.list_documents_page(
+            tenant_id=tenant, kb_id=base.id, limit=2, offset=2
+        )
+        assert total == 5
+        assert [d.id for d in page] == [d.id for d in full[2:4]]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fence_requires_processing_status_sql(sql_store: SqlStoreFixture) -> None:
+    """围栏的状态谓词(不只是代际)在 SQL 侧也钉住:已收尾的文档拒绝同代际的写回."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v1"
+        )
+        claim = await store.claim_document(
+            tenant_id=tenant,
+            document_id=doc.id,
+            now=datetime.now(UTC),
+            lease_seconds=300,
+            max_attempts=5,
+        )
+        assert claim is not None
+        assert await store.mark_document_failed_terminal(
+            tenant_id=tenant, document_id=doc.id, error="first", generation=claim.generation
+        )
+        chunk = _make_chunk(tenant, base.id, doc.id, 0, "late", _vec(1.0))
+        assert not await store.replace_chunks(
+            tenant_id=tenant, document_id=doc.id, chunks=[chunk], generation=claim.generation
+        )
+        assert not await store.set_document_status(
+            tenant_id=tenant,
+            document_id=doc.id,
+            status=DocumentStatus.READY,
+            chunk_count=1,
+            generation=claim.generation,
+        )
+        assert not await store.renew_lease(
+            tenant_id=tenant,
+            document_id=doc.id,
+            generation=claim.generation,
+            now=datetime.now(UTC),
+            lease_seconds=60,
+        )
+        fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert fetched is not None and fetched.status is DocumentStatus.FAILED
+        # Re-index fence: READY + current generation only.
+        await store.set_document_status(
+            tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=0
+        )
+        assert await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[chunk],
+            generation=0,
+            expect_status=DocumentStatus.READY,
+        )
+        assert not await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[chunk],
+            generation=1,
+            expect_status=DocumentStatus.READY,
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_document_loses_chunks_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v1", content_sha256="s1"
+        )
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[_make_chunk(tenant, base.id, doc.id, 0, "old", _vec(1.0))],
+        )
+        await store.set_document_status(
+            tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=1
+        )
+        await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v2", content_sha256="s2"
+        )
+        claim = await store.claim_document(
+            tenant_id=tenant,
+            document_id=doc.id,
+            now=datetime.now(UTC),
+            lease_seconds=300,
+            max_attempts=5,
+        )
+        assert claim is not None
+        assert await store.mark_document_failed_terminal(
+            tenant_id=tenant, document_id=doc.id, error="parse failed", generation=claim.generation
+        )
+        fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert fetched is not None
+        assert fetched.status is DocumentStatus.FAILED
+        assert fetched.chunk_count == 0
+        hits = await store.search(tenant_id=tenant, kb_ids=[base.id], query_embedding=_vec(1.0))
+        assert hits == []
+    finally:
+        await engine.dispose()

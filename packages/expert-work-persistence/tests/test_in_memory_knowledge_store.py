@@ -300,7 +300,7 @@ async def test_upsert_document_creates_pending() -> None:
 
 
 @pytest.mark.asyncio
-async def test_upsert_existing_document_resets_and_clears_chunks() -> None:
+async def test_upsert_existing_document_resets_and_keeps_chunks_until_replaced() -> None:
     store = InMemoryKnowledgeStore()
     tenant, kb_id = uuid4(), uuid4()
     doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")
@@ -326,7 +326,10 @@ async def test_upsert_existing_document_resets_and_clears_chunks() -> None:
     assert reset.id == doc.id  # same logical document
     assert reset.status is DocumentStatus.PENDING
     assert reset.chunk_count == 0
-    assert await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,)) == []
+    # L2-PR2:重传不再立刻删分段 —— 旧分段一直可检索,直到新分段整体替换。
+    hits = await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,))
+    assert [h.content for h in hits] == ["c"]
+    assert reset.ingest_generation == doc.ingest_generation + 1
 
 
 @pytest.mark.asyncio
@@ -839,3 +842,404 @@ async def test_get_documents_batches_and_scopes() -> None:
 async def test_get_documents_empty_input_returns_empty() -> None:
     store = InMemoryKnowledgeStore()
     assert await store.get_documents(tenant_id=uuid4(), document_ids=[]) == {}
+
+
+# ---------------------------------------------------------------------------
+# L2-PR2 入库可靠性:同哈希不动 / 代际围栏 / 终态巡检 / 续约 / 分页
+# ---------------------------------------------------------------------------
+
+
+async def _ready_document(
+    store: InMemoryKnowledgeStore, *, content: bytes = b"v1", sha: str = "sha-v1"
+) -> tuple[UUID, UUID, UUID]:
+    """One READY document with one chunk; returns (tenant, kb, document)."""
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=content, content_sha256=sha
+    )
+    await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=doc.id,
+        chunks=[
+            _chunk(
+                tenant_id=tenant,
+                kb_id=kb_id,
+                document_id=doc.id,
+                index=0,
+                content="old",
+                embedding=(1.0,),
+            )
+        ],
+    )
+    await store.set_document_status(
+        tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=1
+    )
+    return tenant, kb_id, doc.id
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_hash_on_ready_document_is_unchanged() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    before = await store.get_document(tenant_id=tenant, document_id=doc_id)
+    assert before is not None
+
+    same = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v1", content_sha256="sha-v1"
+    )
+    assert same.status is DocumentStatus.READY  # the "unchanged" signal
+    assert same.chunk_count == 1
+    assert same.ingest_generation == before.ingest_generation
+    hits = await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,))
+    assert [h.content for h in hits] == ["old"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_hash_with_force_resets() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    forced = await store.upsert_document(
+        tenant_id=tenant,
+        kb_id=kb_id,
+        filename="d.md",
+        content=b"v1",
+        content_sha256="sha-v1",
+        force=True,
+    )
+    assert forced.id == doc_id
+    assert forced.status is DocumentStatus.PENDING
+    assert forced.ingest_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_same_hash_on_failed_document_resets() -> None:
+    # Only READY + same hash is "unchanged"; a failed document with the same
+    # bytes must be re-driven.
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    await store.set_document_status(
+        tenant_id=tenant, document_id=doc_id, status=DocumentStatus.FAILED, error="boom"
+    )
+    again = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v1", content_sha256="sha-v1"
+    )
+    assert again.status is DocumentStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_claim_carries_generation() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"x")
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc.id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert claim is not None
+    assert claim.generation == 0
+    await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"y")
+    second = await store.claim_document(
+        tenant_id=tenant, document_id=doc.id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert second is not None
+    assert second.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_generation_fence_rejects_stale_writer() -> None:
+    """worker A 认领 gen=0 → 重传 gen=1 → worker B 认领并写回 → A 再写回不生效."""
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v1")
+    a = await store.claim_document(
+        tenant_id=tenant, document_id=doc.id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert a is not None and a.generation == 0
+    await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2")
+    b = await store.claim_document(
+        tenant_id=tenant, document_id=doc.id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert b is not None and b.generation == 1
+
+    def _c(content: str) -> KnowledgeChunk:
+        return _chunk(
+            tenant_id=tenant,
+            kb_id=kb_id,
+            document_id=doc.id,
+            index=0,
+            content=content,
+            embedding=(1.0,),
+        )
+
+    assert await store.replace_chunks(
+        tenant_id=tenant, document_id=doc.id, chunks=[_c("from-b")], generation=b.generation
+    )
+    assert await store.set_document_status(
+        tenant_id=tenant,
+        document_id=doc.id,
+        status=DocumentStatus.READY,
+        chunk_count=1,
+        generation=b.generation,
+    )
+    # Stale worker A: both write-backs are rejected, nothing changes.
+    assert not await store.replace_chunks(
+        tenant_id=tenant, document_id=doc.id, chunks=[_c("from-a")], generation=a.generation
+    )
+    assert not await store.set_document_status(
+        tenant_id=tenant,
+        document_id=doc.id,
+        status=DocumentStatus.READY,
+        chunk_count=7,
+        generation=a.generation,
+    )
+    assert not await store.mark_document_failed_terminal(
+        tenant_id=tenant, document_id=doc.id, error="stale", generation=a.generation
+    )
+    fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+    assert fetched is not None
+    assert fetched.status is DocumentStatus.READY
+    assert fetched.chunk_count == 1
+    assert fetched.error is None
+    hits = await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,))
+    assert [h.content for h in hits] == ["from-b"]
+
+
+@pytest.mark.asyncio
+async def test_fenced_write_requires_processing_status() -> None:
+    # Right generation but the document is no longer processing (already
+    # settled) → the fence rejects the write.
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v1")
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc.id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert claim is not None
+    assert await store.mark_document_failed_terminal(
+        tenant_id=tenant, document_id=doc.id, error="first", generation=claim.generation
+    )
+    assert not await store.set_document_status(
+        tenant_id=tenant,
+        document_id=doc.id,
+        status=DocumentStatus.READY,
+        chunk_count=1,
+        generation=claim.generation,
+    )
+    fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+    assert fetched is not None and fetched.status is DocumentStatus.FAILED
+    # Unfenced writes (legacy callers / re-index) still go through.
+    assert await store.set_document_status(
+        tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=1
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_terminal_fails_exhausted_processing_documents() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    exhausted = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="x.md", content=b"x"
+    )
+    for _ in range(3):
+        assert (
+            await store.claim_document(
+                tenant_id=tenant,
+                document_id=exhausted.id,
+                now=_now(),
+                lease_seconds=0,
+                max_attempts=3,
+            )
+            is not None
+        )
+    # Under budget: must survive the sweep.
+    live = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="y.md", content=b"y")
+    assert (
+        await store.claim_document(
+            tenant_id=tenant, document_id=live.id, now=_now(), lease_seconds=0, max_attempts=3
+        )
+        is not None
+    )
+    # Exhausted but lease still held: the worker may still finish — not swept.
+    held = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="z.md", content=b"z")
+    for lease in (0, 0, 600):
+        assert (
+            await store.claim_document(
+                tenant_id=tenant,
+                document_id=held.id,
+                now=_now(),
+                lease_seconds=lease,
+                max_attempts=3,
+            )
+            is not None
+        )
+    assert await store.sweep_terminal(now=_now(), max_attempts=3) == 1
+    swept = await store.get_document(tenant_id=tenant, document_id=exhausted.id)
+    assert swept is not None
+    assert swept.status is DocumentStatus.FAILED
+    assert swept.error == "ingest attempts exhausted"
+    for untouched in (live.id, held.id):
+        row = await store.get_document(tenant_id=tenant, document_id=untouched)
+        assert row is not None and row.status is DocumentStatus.PROCESSING
+    # Only the under-budget, lease-expired one is claimable afterwards.
+    claims = await store.claim_documents_for_ingest(
+        now=_now(), lease_seconds=60, limit=10, max_attempts=3
+    )
+    assert [c.document_id for c in claims] == [live.id]
+    # Idempotent: a second sweep finds nothing.
+    assert await store.sweep_terminal(now=_now(), max_attempts=3) == 0
+
+
+@pytest.mark.asyncio
+async def test_renew_lease_extends_and_is_fenced() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"x")
+    now = _now()
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc.id, now=now, lease_seconds=0, max_attempts=5
+    )
+    assert claim is not None
+    # Expired lease → claimable again; renewing pushes it out of reach.
+    assert await store.renew_lease(
+        tenant_id=tenant,
+        document_id=doc.id,
+        generation=claim.generation,
+        now=now,
+        lease_seconds=600,
+    )
+    assert (
+        await store.claim_documents_for_ingest(now=now, lease_seconds=60, limit=10, max_attempts=5)
+        == []
+    )
+    # Wrong generation / settled document → not renewed.
+    assert not await store.renew_lease(
+        tenant_id=tenant,
+        document_id=doc.id,
+        generation=claim.generation + 1,
+        now=now,
+        lease_seconds=600,
+    )
+    await store.set_document_status(
+        tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=0
+    )
+    assert not await store.renew_lease(
+        tenant_id=tenant,
+        document_id=doc.id,
+        generation=claim.generation,
+        now=now,
+        lease_seconds=600,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_documents_page() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    for i in range(5):
+        await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename=f"{i}.md")
+    full = await store.list_documents(tenant_id=tenant, kb_id=kb_id)
+    page, total = await store.list_documents_page(tenant_id=tenant, kb_id=kb_id, limit=2, offset=2)
+    assert total == 5
+    assert [d.id for d in page] == [d.id for d in full[2:4]]
+    tail, _ = await store.list_documents_page(tenant_id=tenant, kb_id=kb_id, limit=10, offset=4)
+    assert len(tail) == 1
+    assert await store.list_documents_page(tenant_id=uuid4(), kb_id=kb_id, limit=2, offset=0) == (
+        [],
+        0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_document_loses_its_chunks() -> None:
+    """重传 v2 失败 → 文档 FAILED,v1 的旧分段一并删掉(failed 的文档不可检索)."""
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2", content_sha256="sha-v2"
+    )
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc_id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert claim is not None
+    assert await store.mark_document_failed_terminal(
+        tenant_id=tenant, document_id=doc_id, error="parse failed", generation=claim.generation
+    )
+    fetched = await store.get_document(tenant_id=tenant, document_id=doc_id)
+    assert fetched is not None
+    assert fetched.status is DocumentStatus.FAILED
+    assert fetched.chunk_count == 0
+    assert await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,)) == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_terminal_drops_chunks_too() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2")
+    for _ in range(2):
+        await store.claim_document(
+            tenant_id=tenant, document_id=doc_id, now=_now(), lease_seconds=0, max_attempts=2
+        )
+    assert await store.sweep_terminal(now=_now(), max_attempts=2) == 1
+    assert await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,)) == []
+
+
+@pytest.mark.asyncio
+async def test_fenced_replace_on_deleted_document_returns_false() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"x")
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc.id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert claim is not None
+    await store.delete_document(tenant_id=tenant, document_id=doc.id)
+    chunk = _chunk(
+        tenant_id=tenant, kb_id=kb_id, document_id=doc.id, index=0, content="c", embedding=(1.0,)
+    )
+    assert not await store.replace_chunks(
+        tenant_id=tenant, document_id=doc.id, chunks=[chunk], generation=claim.generation
+    )
+    with pytest.raises(KeyError):  # unfenced keeps the loud failure
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=[chunk])
+
+
+@pytest.mark.asyncio
+async def test_reindex_fence_expects_ready_and_current_generation() -> None:
+    """重建索引的写回:文档必须仍是 READY 且代际没变,否则不写(重传期间不许把旧分段放回去)."""
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    chunk = _chunk(
+        tenant_id=tenant, kb_id=kb_id, document_id=doc_id, index=0, content="re", embedding=(1.0,)
+    )
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=doc_id,
+        chunks=[chunk],
+        generation=0,
+        expect_status=DocumentStatus.READY,
+    )
+    # Same generation but no longer READY → refused: the status half of the
+    # fence, not just the generation (contract pin; set directly).
+    assert await store.set_document_status(
+        tenant_id=tenant, document_id=doc_id, status=DocumentStatus.PROCESSING
+    )
+    assert not await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=doc_id,
+        chunks=[chunk],
+        generation=0,
+        expect_status=DocumentStatus.READY,
+    )
+    # Re-uploaded meanwhile: generation 1, pending → refused on both halves.
+    await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2")
+    assert not await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=doc_id,
+        chunks=[chunk],
+        generation=0,
+        expect_status=DocumentStatus.READY,
+    )
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)

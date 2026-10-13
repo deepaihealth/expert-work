@@ -34,19 +34,13 @@ async def test_ingest_then_knowledge_search_round_trip() -> None:
     embedder = FakeEmbedder()
     tenant = uuid4()
     base = await store.create_base(tenant_id=tenant, name="benefits")
-    document = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="handbook.md")
-
-    # Ingest the document through the async runner.
-    runner = KnowledgeIngestionRunner(store=store, embedder=embedder)
-    await runner.submit(
-        tenant_id=tenant,
-        document_id=document.id,
-        kb_id=base.id,
-        filename="handbook.md",
-        raw=_DOCUMENT,
-        chunk_max_tokens=512,
-        chunk_overlap_tokens=64,
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=base.id, filename="handbook.md", content=_DOCUMENT
     )
+
+    # Ingest the document through the async runner (bytes come from the claim).
+    runner = KnowledgeIngestionRunner(store=store, embedder=embedder)
+    await runner.submit(tenant_id=tenant, document_id=document.id)
     ready = await store.get_document(tenant_id=tenant, document_id=document.id)
     assert ready is not None
     assert ready.status is DocumentStatus.READY

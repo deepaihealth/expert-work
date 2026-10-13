@@ -63,3 +63,15 @@ def test_empty_pdf_rejected() -> None:
 )
 def test_is_sparse(markdown: str, page_count: int, expected: bool) -> None:
     assert _is_sparse(markdown, page_count) is expected
+
+
+def test_parse_document_drops_lone_surrogates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """docx 里半个 emoji 解析成孤立代理项(``\\ud83d``);之后任何 UTF-8 编码都会炸.
+
+    清洗掉它,分段正文保证可以 ``encode("utf-8")``。"""
+    from control_plane.knowledge import parsing
+
+    monkeypatch.setattr(parsing, "_parse_with_markitdown", lambda raw, ext: "好\ud83d评\udc4d!")
+    markdown = parse_document("review.docx", b"irrelevant")
+    assert markdown == "好评!"
+    markdown.encode("utf-8")  # must not raise

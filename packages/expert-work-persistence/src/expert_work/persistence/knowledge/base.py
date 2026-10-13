@@ -64,6 +64,10 @@ class ClaimedIngestion:
     chunk_max_tokens: int
     chunk_overlap_tokens: int
     attempts: int
+    #: The document's ``ingest_generation`` at claim time. Every write-back the
+    #: worker makes (``replace_chunks`` / ``set_document_status`` /
+    #: ``mark_document_failed_terminal``) passes it as the fence.
+    generation: int
 
 
 class DuplicateKnowledgeBaseError(Exception):
@@ -209,12 +213,21 @@ class KnowledgeStore(abc.ABC):
         filename: str,
         content: bytes | None = None,
         content_sha256: str | None = None,
+        force: bool = False,
     ) -> KnowledgeDocument:
         """Create a document at ``PENDING``, or — if ``(kb_id, filename)``
         already exists — reset it to ``PENDING`` (clearing ``error`` /
-        ``chunk_count`` and the durability lease + ``attempts``) for
-        re-ingestion. ``content`` retains the original bytes so the document
-        can be re-driven after a crash / for re-ingest. Returns the document."""
+        ``chunk_count`` and the durability lease + ``attempts``, bumping
+        ``ingest_generation``) for re-ingestion. The existing chunks are
+        **kept** until the new ingest replaces them, so the document stays
+        searchable across a re-upload. ``content`` retains the original bytes
+        so the document can be re-driven after a crash / for re-ingest.
+
+        Unchanged re-upload: when the existing document is ``READY`` and
+        ``content_sha256`` equals its stored hash, nothing is touched and the
+        document is returned as is (status still ``READY`` — the caller's
+        signal to skip ingestion). ``force=True`` (explicit re-ingest)
+        resets regardless."""
 
     @abc.abstractmethod
     async def get_document(self, *, tenant_id: UUID, document_id: UUID) -> KnowledgeDocument | None:
@@ -261,14 +274,51 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def mark_document_failed_terminal(
-        self, *, tenant_id: UUID, document_id: UUID, error: str
-    ) -> None:
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        error: str,
+        generation: int | None = None,
+    ) -> bool:
         """Mark a document ``FAILED`` and clear its lease — used when retries
-        are exhausted or the original bytes are unavailable."""
+        are exhausted or the original bytes are unavailable. With
+        ``generation`` the write is fenced (see :meth:`set_document_status`).
+        Returns whether a row was written."""
+
+    @abc.abstractmethod
+    async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
+        """Cross-tenant: every ``processing`` document that has used up
+        ``max_attempts`` and whose lease has expired goes ``FAILED``
+        (``error='ingest attempts exhausted'``). Such a document is no longer
+        claimable, so without this sweep it would sit in ``processing``
+        forever (a crash on the last attempt). Returns the number swept.
+        Caller wraps the call in a bypass-RLS scope."""
+
+    @abc.abstractmethod
+    async def renew_lease(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        generation: int,
+        now: datetime,
+        lease_seconds: int,
+    ) -> bool:
+        """Extend the lease of a document this worker is processing
+        (``status='processing' AND ingest_generation=generation``) to
+        ``now + lease_seconds``. ``False`` when the document is no longer
+        ours (settled, re-uploaded, deleted)."""
 
     @abc.abstractmethod
     async def list_documents(self, *, tenant_id: UUID, kb_id: UUID) -> list[KnowledgeDocument]:
         """The base's documents, newest first."""
+
+    @abc.abstractmethod
+    async def list_documents_page(
+        self, *, tenant_id: UUID, kb_id: UUID, limit: int, offset: int
+    ) -> tuple[list[KnowledgeDocument], int]:
+        """A page of :meth:`list_documents` (same order) plus the total count."""
 
     @abc.abstractmethod
     async def set_document_status(
@@ -279,11 +329,22 @@ class KnowledgeStore(abc.ABC):
         status: DocumentStatus,
         error: str | None = None,
         chunk_count: int | None = None,
+        generation: int | None = None,
     ) -> bool:
         """Update a document's ingestion status. ``chunk_count`` is set
         only when supplied (on a successful ingest). Returns ``True`` if a
         document matched, ``False`` if it no longer exists (e.g. deleted
-        concurrently while its ingest was in flight)."""
+        concurrently while its ingest was in flight).
+
+        ``generation`` fences the write: it only lands when the document is
+        still ``processing`` **and** its ``ingest_generation`` equals
+        ``generation`` — a worker from an earlier upload (or one whose claim
+        was already settled) gets ``False`` and changes nothing.
+
+        A write that lands ``FAILED`` also deletes the document's chunks in
+        the same transaction: a failed document is never searchable (the
+        chunks of the previous upload are kept only while the new ingest is
+        in flight — see :meth:`upsert_document`)."""
 
     @abc.abstractmethod
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
@@ -294,14 +355,30 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def replace_chunks(
-        self, *, tenant_id: UUID, document_id: UUID, chunks: Sequence[KnowledgeChunk]
-    ) -> None:
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        chunks: Sequence[KnowledgeChunk],
+        generation: int | None = None,
+        expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+    ) -> bool:
         """Replace all of a document's chunks with ``chunks`` — deletes
-        the document's existing chunks, then inserts the new set. If the
-        document no longer exists (deleted while an ingest was in flight)
-        the write-back is rejected instead of recreating orphan chunks:
-        the SQL store raises ``IntegrityError`` (FK, migration ``0136``),
-        the in-memory store raises :class:`KeyError`."""
+        the document's existing chunks, then inserts the new set, in one
+        transaction.
+
+        Unfenced (``generation is None``): if the document no longer exists
+        (deleted while an ingest was in flight) the write-back is rejected
+        instead of recreating orphan chunks — the SQL store raises
+        ``IntegrityError`` (FK, migration ``0136``), the in-memory store
+        raises :class:`KeyError`.
+
+        Fenced (``generation`` given): the swap only lands when the document
+        is in ``expect_status`` **and** its ``ingest_generation`` equals
+        ``generation`` (``processing`` for an ingest write-back; ``ready``
+        for a re-index, which swaps vectors under a settled document);
+        otherwise — including a deleted document — nothing is written and
+        ``False`` is returned. ``True`` when the chunks landed."""
 
     @abc.abstractmethod
     async def list_chunks(

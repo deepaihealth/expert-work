@@ -36,6 +36,11 @@ class DocumentStatus(StrEnum):
     PROCESSING = "processing"
     READY = "ready"
     FAILED = "failed"
+    #: Reserved for B-179 content safety (L2-PR2 only declares them; nothing
+    #: writes these yet): ``blocked`` = rejected by a safety check, ``disabled``
+    #: = kept but excluded from retrieval by an operator.
+    BLOCKED = "blocked"
+    DISABLED = "disabled"
 
 
 class RetrievalMethod(StrEnum):
@@ -127,6 +132,10 @@ class KnowledgeDocument(BaseModel):
     error: str | None = Field(default=None, description="failure detail when status is FAILED")
     chunk_count: int = Field(default=0, ge=0, description="chunks produced by the latest ingest")
     attempts: int = Field(default=0, ge=0, description="ingestion attempts so far (durability)")
+    #: Bumped on every re-upload / re-ingest. A worker carries the generation
+    #: it claimed and its write-backs are fenced on it, so a stale worker from
+    #: a previous upload can never overwrite the chunks of a newer one.
+    ingest_generation: int = Field(default=0, ge=0, description="re-ingest generation (fence)")
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

@@ -11,6 +11,7 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 12.
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 
 import pymupdf
@@ -26,6 +27,12 @@ SUPPORTED_EXTENSIONS = frozenset(
 #: page is treated as a failed text extraction (scanned / image-only
 #: PDF) and retried with MarkItDown's extractor.
 _MIN_CHARS_PER_PAGE = 50
+
+#: Lone UTF-16 surrogates. A docx that holds half of an emoji (seen in real
+#: customer material) parses to a ``str`` containing one; every later UTF-8
+#: encode (chunk insert, cache write) then raises ``UnicodeEncodeError`` and
+#: the whole document fails with an opaque error. Dropped at the source.
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 
 class DocumentParseError(Exception):
@@ -44,11 +51,20 @@ def parse_document(filename: str, raw: bytes) -> str:
     if ext not in SUPPORTED_EXTENSIONS:
         msg = f"unsupported document type: {ext or filename!r}"
         raise DocumentParseError(msg)
-    markdown = _parse_pdf(raw) if ext == ".pdf" else _parse_with_markitdown(raw, ext)
+    markdown = strip_lone_surrogates(
+        _parse_pdf(raw) if ext == ".pdf" else _parse_with_markitdown(raw, ext)
+    )
     if not markdown.strip():
         msg = f"document {filename!r} parsed to empty content (a scanned PDF?)"
         raise DocumentParseError(msg)
     return markdown
+
+
+def strip_lone_surrogates(text: str) -> str:
+    """Drop lone UTF-16 surrogates so ``text`` can always be UTF-8 encoded.
+    Applied to every parser's output and to pre-parsed Markdown handed to
+    the ingestion pipeline directly."""
+    return _LONE_SURROGATE.sub("", text)
 
 
 def _parse_pdf(raw: bytes) -> str:
