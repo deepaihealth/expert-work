@@ -835,7 +835,9 @@ def fingerprint(
     return {
         "dataset_sha256": file_sha256(dataset_path),
         "manifest_sha256": file_sha256(manifest_path),
-        "corpus_root": str(corpus_root.resolve()),
+        # Directory name only: the baseline is checked in, a machine-local
+        # absolute path is not part of what makes two runs comparable.
+        "corpus_root": corpus_root.resolve().name,
         "embedder": embedder,
         "embed_base_url": embed_base_url,
         "embedding_dim": EMBEDDING_DIM,
