@@ -4327,6 +4327,7 @@ cases:
 - id: hard_cross-0001
   query: 哪些产品里含有动物双歧杆菌乳亚种BGI-N3？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 菌株
@@ -4350,6 +4351,7 @@ cases:
 - id: hard_cross-0002
   query: 鼠李糖乳酪杆菌OF44用在了哪几款产品里？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 菌株
@@ -4373,6 +4375,7 @@ cases:
 - id: hard_cross-0003
   query: 益畅珠峰版和普通版益畅的活菌数差多少？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 益畅
@@ -4387,6 +4390,7 @@ cases:
 - id: hard_cross-0004
   query: 益顺和基础版益畅相比活菌数提升了多少？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 益顺
@@ -4398,6 +4402,7 @@ cases:
 - id: hard_cross-0005
   query: 清风和益衡可以一起吃吗？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 搭配
@@ -4412,6 +4417,7 @@ cases:
 - id: hard_cross-0006
   query: 益休和晚安饮用的是同一个陈皮粉专利吗？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 专利
@@ -4426,6 +4432,7 @@ cases:
 - id: hard_cross-0007
   query: 镜脂轻可以和轻路一起吃吗？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 搭配
@@ -4437,6 +4444,7 @@ cases:
 - id: hard_cross-0008
   query: 华大有哪几款益生菌是压片糖果？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 剂型
@@ -4451,6 +4459,7 @@ cases:
 - id: hard_cross-0009
   query: 哪些产品3岁以下婴幼儿不能吃？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 人群
@@ -4468,6 +4477,7 @@ cases:
 - id: hard_cross-0010
   query: 格氏乳杆菌TF08-1在哪些产品里？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 菌株
@@ -4485,6 +4495,7 @@ cases:
 - id: hard_cross-0011
   query: 胃反酸、灼痛应该选哪款产品？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 选品
@@ -4496,6 +4507,7 @@ cases:
 - id: hard_cross-0012
   query: 尿酸高应该推荐哪款产品？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 选品
@@ -4507,6 +4519,7 @@ cases:
 - id: hard_cross-0013
   query: 青春双歧杆菌95用在哪些产品里？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 菌株
@@ -4521,6 +4534,7 @@ cases:
 - id: hard_cross-0014
   query: 晚安饮和灵芝百合晚安饮的专利原料一样吗？
   source: hard_cross
+  match: all
   tags:
   - 跨文档
   - 专利

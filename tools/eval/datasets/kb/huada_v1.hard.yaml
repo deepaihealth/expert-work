@@ -6,6 +6,7 @@ cases:
   - id: hard_cross-0001
     query: 哪些产品里含有动物双歧杆菌乳亚种BGI-N3？
     source: hard_cross
+    match: all
     tags: [跨文档, 菌株]
     expected:
       - {document: "产品说明书：益畅.docx", anchor: "动物双歧杆菌乳亚种BGI-N3", page: null}
@@ -17,6 +18,7 @@ cases:
   - id: hard_cross-0002
     query: 鼠李糖乳酪杆菌OF44用在了哪几款产品里？
     source: hard_cross
+    match: all
     tags: [跨文档, 菌株]
     expected:
       - {document: "产品说明书：益畅.docx", anchor: "鼠李糖乳酪杆菌OF44", page: null}
@@ -28,6 +30,7 @@ cases:
   - id: hard_cross-0003
     query: 益畅珠峰版和普通版益畅的活菌数差多少？
     source: hard_cross
+    match: all
     tags: [跨文档, 益畅]
     expected:
       - {document: "产品说明书：益畅（珠峰版）.docx", anchor: "益畅每袋180亿CFU，珠峰版每袋500亿CFU", page: null}
@@ -36,6 +39,7 @@ cases:
   - id: hard_cross-0004
     query: 益顺和基础版益畅相比活菌数提升了多少？
     source: hard_cross
+    match: all
     tags: [跨文档, 益顺]
     expected:
       - {document: "产品说明书：益顺.docx", anchor: "活菌数拉升至300亿CFU（相当于1.7倍基础版益畅活菌量）", page: null}
@@ -43,6 +47,7 @@ cases:
   - id: hard_cross-0005
     query: 清风和益衡可以一起吃吗？
     source: hard_cross
+    match: all
     tags: [跨文档, 搭配]
     expected:
       - {document: "产品说明书 ：清风（尿酸管理）.docx", anchor: "优美达系列的益生菌“各有所长”", page: null}
@@ -51,6 +56,7 @@ cases:
   - id: hard_cross-0006
     query: 益休和晚安饮用的是同一个陈皮粉专利吗？
     source: hard_cross
+    match: all
     tags: [跨文档, 专利]
     expected:
       - {document: "产品说明书 ：益休.docx", anchor: "陈皮粉专利号：ZL202410048761.8", page: null}
@@ -59,6 +65,7 @@ cases:
   - id: hard_cross-0007
     query: 镜脂轻可以和轻路一起吃吗？
     source: hard_cross
+    match: all
     tags: [跨文档, 搭配]
     expected:
       - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "还可以搭配轻路和菊粉膳食纤维餐前食用", page: null}
@@ -66,6 +73,7 @@ cases:
   - id: hard_cross-0008
     query: 华大有哪几款益生菌是压片糖果？
     source: hard_cross
+    match: all
     tags: [跨文档, 剂型]
     expected:
       - {document: "产品说明书：益畅.docx", anchor: "益畅益生菌压片糖果", page: null}
@@ -74,6 +82,7 @@ cases:
   - id: hard_cross-0009
     query: 哪些产品3岁以下婴幼儿不能吃？
     source: hard_cross
+    match: all
     tags: [跨文档, 人群]
     expected:
       - {document: "产品说明书：益畅.docx", anchor: "不适宜人群：3岁以下婴幼儿", page: null}
@@ -83,6 +92,7 @@ cases:
   - id: hard_cross-0010
     query: 格氏乳杆菌TF08-1在哪些产品里？
     source: hard_cross
+    match: all
     tags: [跨文档, 菌株]
     expected:
       - {document: "产品说明书：镜脂轻（体重管理）.docx", anchor: "格氏乳杆菌TF08-1", page: null}
@@ -92,6 +102,7 @@ cases:
   - id: hard_cross-0011
     query: 胃反酸、灼痛应该选哪款产品？
     source: hard_cross
+    match: all
     tags: [跨文档, 选品]
     expected:
       - {document: "产品说明书：益舒.docx", anchor: "快速缓解胃反酸、灼痛和酒后胃不适", page: null}
@@ -99,6 +110,7 @@ cases:
   - id: hard_cross-0012
     query: 尿酸高应该推荐哪款产品？
     source: hard_cross
+    match: all
     tags: [跨文档, 选品]
     expected:
       - {document: "产品说明书 ：清风（尿酸管理）.docx", anchor: "优美达清风益生菌固体饮料", page: null}
@@ -106,6 +118,7 @@ cases:
   - id: hard_cross-0013
     query: 青春双歧杆菌95用在哪些产品里？
     source: hard_cross
+    match: all
     tags: [跨文档, 菌株]
     expected:
       - {document: "产品说明书：畅青.docx", anchor: "青春双歧杆菌95", page: null}
@@ -114,6 +127,7 @@ cases:
   - id: hard_cross-0014
     query: 晚安饮和灵芝百合晚安饮的专利原料一样吗？
     source: hard_cross
+    match: all
     tags: [跨文档, 专利]
     expected:
       - {document: "产品说明书 ：晚安饮.docx", anchor: "槐米粉专利号：ZL202211480228.6", page: null}

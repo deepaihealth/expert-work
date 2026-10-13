@@ -72,6 +72,7 @@ cases:
         anchor: 常温密封保存即可        # 期望段落里一段原文子串(≥8 字),用来判「命中到段」
         page: null                    # P5 之后补
     answer: ...                       # 参考答案(客户给的),只用于 Faithfulness 抽检,不参与检索打分
+      match: any                        # any(默认)= expected 里命中任一即算对;all = 要找全(跨文档题),按覆盖率算
 ```
 
 字段:

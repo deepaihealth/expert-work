@@ -23,6 +23,10 @@ SOURCES = frozenset(
 )
 #: 锚文本下限(字符数,去首尾空白后)。短于这个值的子串在长文档里到处都能 ``in`` 到。
 MIN_ANCHOR_CHARS = 8
+#: 期望文档的命中规则:``any`` = 列出的文档都含答案,命中任一即算对(FAQ 表 + 说明书那种);
+#: ``all`` = 问题本身要求找全(「哪些产品含 X」),按覆盖率算。
+MATCH_MODES = frozenset({"any", "all"})
+DEFAULT_MATCH = "any"
 #: ``check_corpus`` 只认这两层:有文字层、会进评测库的文档。
 CORPUS_CHECK_TIERS = frozenset({"A", "D-A"})
 
@@ -48,6 +52,7 @@ class KbCase:
     tags: tuple[str, ...]
     expected: tuple[KbExpected, ...]  # 空元组 = 应「无答案」
     answer: str | None
+    match: str = DEFAULT_MATCH  # any | all,见 MATCH_MODES
 
 
 @dataclass(frozen=True)
@@ -123,6 +128,9 @@ def _parse_case(entry: Any, *, index: int) -> KbCase:
     answer = entry.get("answer")
     if answer is not None and not isinstance(answer, str):
         raise KbDatasetError(f"{case_id}: 'answer' must be a string or null")
+    match = entry.get("match", DEFAULT_MATCH)
+    if match not in MATCH_MODES:
+        raise KbDatasetError(f"{case_id}: 'match' {match!r} not in {sorted(MATCH_MODES)}")
     return KbCase(
         id=case_id,
         query=query,
@@ -130,6 +138,7 @@ def _parse_case(entry: Any, *, index: int) -> KbCase:
         tags=_parse_tags(entry.get("tags"), case_id=case_id),
         expected=tuple(_parse_expected(e, case_id=case_id) for e in expected_raw),
         answer=answer,
+        match=str(match),
     )
 
 
@@ -175,6 +184,8 @@ def _manifest_basenames(manifest_csv: Path) -> Iterator[str]:
 
 __all__ = [
     "CORPUS_CHECK_TIERS",
+    "DEFAULT_MATCH",
+    "MATCH_MODES",
     "MIN_ANCHOR_CHARS",
     "SOURCES",
     "KbCase",
