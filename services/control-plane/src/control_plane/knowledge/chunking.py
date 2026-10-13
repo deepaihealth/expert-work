@@ -30,6 +30,7 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Literal
 from uuid import UUID
 
@@ -50,10 +51,16 @@ _CONTENT_OPENERS = frozenset(
 #: markdown-it standalone block tokens that are content.
 _CONTENT_STANDALONE = frozenset({"fence", "code_block", "html_block"})
 
-#: Sentence-ish boundary for hard-splitting an oversized paragraph —
-#: after an ASCII or CJK sentence-ending punctuation mark, or a newline.
-#: The CJK marks in the class are intentional (noqa: ambiguous-unicode).
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？\n])\s+")  # noqa: RUF001
+#: Sentence-ish boundary for hard-splitting an oversized paragraph. Zero
+#: width, so splitting is lossless: after a CJK sentence mark always (CJK
+#: prose has no space after 。), after an ASCII mark or a newline only when
+#: whitespace follows. The CJK marks are intentional (noqa: ambiguous-unicode).
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？])|(?<=[.!?\n])(?=\s)")  # noqa: RUF001
+
+#: Where an overlap tail may start: a paragraph break, a newline, or the
+#: position right after a sentence mark. The earliest one inside the tail
+#: window wins, so the carried context is clean *and* as long as possible.
+_OVERLAP_START = re.compile(r"\n\n|\n|(?<=[。！？.!?])")  # noqa: RUF001
 
 #: Cosine distance above which two adjacent blocks in the same section
 #: are treated as a topic shift — a semantic chunk boundary. Conservative
@@ -255,37 +262,51 @@ def _hard_split(text: str, max_tokens: int) -> list[str]:
         unit_tokens = count_tokens(unit)
         if unit_tokens > max_tokens:
             if current:
-                parts.append(" ".join(current))
+                parts.append("".join(current).strip())
                 current, current_tokens = [], 0
             parts.extend(_split_by_tokens(unit, max_tokens))
             continue
         if current and current_tokens + unit_tokens > max_tokens:
-            parts.append(" ".join(current))
+            parts.append("".join(current).strip())
             current, current_tokens = [], 0
         current.append(unit)
         current_tokens += unit_tokens
     if current:
-        parts.append(" ".join(current))
+        parts.append("".join(current).strip())
     return parts
 
 
 def _split_by_tokens(text: str, max_tokens: int) -> list[str]:
-    """Last-resort split of an unbreakable run on raw token windows."""
+    """Last-resort split of an unbreakable run on token windows, cut at
+    character offsets so a multi-byte character is never torn in two
+    (a plain ``decode`` of a token slice yields U+FFFD for CJK)."""
     token_ids = _encoding.encode(text)
-    return [
-        _encoding.decode(token_ids[i : i + max_tokens])
-        for i in range(0, len(token_ids), max_tokens)
-    ]
+    decoded, offsets = _encoding.decode_with_offsets(token_ids)
+    bounds = [offsets[i] for i in range(0, len(token_ids), max_tokens)] + [len(decoded)]
+    return [decoded[a:b] for a, b in pairwise(bounds) if decoded[a:b]]
 
 
 def _tail_text(text: str, overlap_tokens: int) -> str:
-    """The last ``overlap_tokens`` tokens of ``text`` as text."""
+    """The overlap carried into the next chunk: the last ``overlap_tokens``
+    tokens of ``text``, cut at a character offset and then advanced to the
+    earliest paragraph / line / sentence boundary inside that window."""
     if overlap_tokens <= 0:
         return ""
     token_ids = _encoding.encode(text)
     if len(token_ids) <= overlap_tokens:
         return text
-    return _encoding.decode(token_ids[-overlap_tokens:])
+    decoded, offsets = _encoding.decode_with_offsets(token_ids)
+    return _start_at_boundary(decoded[offsets[-overlap_tokens] :])
+
+
+def _start_at_boundary(tail: str) -> str:
+    """Drop the partial sentence a token window starts with; keep the whole
+    window when it holds no boundary at all."""
+    for match in _OVERLAP_START.finditer(tail):
+        rest = tail[match.end() :].lstrip()
+        if rest:
+            return rest
+    return tail
 
 
 def _with_prefix(trail: tuple[str, ...], body: str) -> str:

@@ -231,3 +231,9 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [x] **21.3 B-140 压缩用例**:`behavior_runner.py --only c01-ten-ledgers-one-by-one,c02-constraints-survive-compaction,c03-where-are-we,c04-export-keeps-revisions --repeats 3`。判据:没有用例稳定变差。 **10-08 测试 `06a9def2` 过**:11/12。c02 第 1 次只差 `completed`(文件内容对),是已有的欠账局限 —— `edit_file` 失败后改用 `exec_python` 改好,这笔账还不上;三个 PR 都没碰它。
 - [x] **21.4 离线留存评测(B-165)**:`tools/eval/compaction_retention.py --repeats 3`,F1 / F2 两组。判据:B 组(现版)留下只在调用参数里的编号;A 组(B-141 之前的 24k 格式器)做对照。**没修好时**:只在参数里的编号进不了摘要。 **10-08 测试过**:F1(142k 字符)A 组 1/12、进度 0/3,B 组 12/12(含只在参数里的编号)、进度 3/3;F2(303k 字符,强制折叠)A 组 1/12,B 组 72%、进度 3/3。评测花费(21.2–21.4)约 43 元。
 - [x] **21.5 `22673d9b` 发测试后 smoke + 金丝雀 + 三镜像 tag 核对**:10-09 按用户指令发,结果补在 chore(deploy) 记录 PR;同时在测试 pod 原样跑一次生产执行单 Step C 的符号 / 版本核对命令(第二十次重钉改过),期望 `ok`。 **10-09 过**:`release.sh test` 从 `22673d9b` 检出树发;`SMOKE PASS`,沙箱钉子 `OK   sandbox image pin is current (d8a32812)`;金丝雀 5 项全 PASS;三镜像 `control-plane:22673d9b` / `admin-ui:22673d9b-test` / `credential-proxy:22673d9b`;Step C 命令(从 main 上执行单原文抽出)在两个 control-plane pod 各跑一次,均输出 `ok`。
+
+## §22 B-175 知识库 v2 波 1(ROADMAP B-175;逐 task 计划 `docs/superpowers/plans/2026-10-13-b175-wave1-plan.md`)
+
+**背景**:10-13 开工。波 1 = 评测基准(L1)‖ 入库可靠性与数据模型(L2)‖ 批量导入(L3)。每个 PR 合入时往本节补一条;生产 0 库 0 调用,这些用例全部在测试环境**专用知识库租户**里做,不碰对接方 Agent。
+
+- [ ] **22.1 切块不再出 U+FFFD(L2-PR1)**:控制台建一个库(默认切块参数 512 / 64),上传一份含中文长段落(句号后无空格、单段 > 512 token)+ 一张 Markdown 表格的 docx;等 `ready` 后 `GET /v1/knowledge/bases/{name}/documents/{id}/chunks?limit=200` 翻完全部分段。判据:任一分段正文不含 `�`;相邻两段的重叠部分以完整句子开头(不以半个词 / 半句开头)。**没修好时**:中文长段按 token 窗口硬切,10-10 实测约 1/3 的分段开头或结尾带 `�`。
