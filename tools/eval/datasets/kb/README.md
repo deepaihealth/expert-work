@@ -34,6 +34,29 @@ material_dirs: [...]              # 顶层目录名 → D / D-A / D-B
 四个键都可省。命令行的 `--exclude-dir` / `--exclude-name` / `--material-dir`(可重复)**叠加**在 layout 之上,
 `--chat-dir` 覆盖 layout 里的值。换一套语料就新写一份 `<name>.layout.yaml`,不改代码。
 
+## 生成评测集(L1-T2)
+
+```sh
+uv run --no-sync python -I tools/eval/kb_build_dataset.py \
+    --spec tools/eval/datasets/kb/huada_v1.sources.yaml \
+    --corpus-root <资料根目录> --manifest <清单目录>/manifest.csv \
+    --parsed-cache <仓库外目录> \
+    --out tools/eval/datasets/kb/huada_v1.yaml --review tools/eval/datasets/kb/huada_v1.review.md
+```
+
+- `<name>.sources.yaml`:问答来源(哪张表、哪些 sheet、表头叫什么、说明书 Q&A 的通配与节名)—— 只有结构,没有内容。
+- `<name>.hard.yaml`:手写困难样本(跨文档 / 精确标识 / 表格 / 无答案),由 `sources.yaml` 的 `extra_cases` 并入;
+  生成时逐条核对「期望文档在解析文本里、锚文本逐字 `in` 得到」,不过的写进 review 文件。
+- 自动用例的锚文本:参考答案按句切开、长的先试,在**解析后文本**(与入库同一个 `parse_document`)里做子串查找,
+  所以配到的锚在分段正文里也 `in` 得到;出处文档(问答表自己)排最后,说明书 Q&A 的出处(说明书)排最前。
+- 产品分表里的短问题(「产品作用?」)离开表没了主语,归一化后短于 8 字的补上产品名作前缀;短于 5 字的丢掉(栏目名)。
+- 脱敏:问题 / 答案里出现手机号、邮箱、微信号的整条剔除(只计数不列内容);人名查不出来,靠人看 review。
+- 解析走进程池(`--workers`,默认 CPU 数),解析文本缓存在 `--parsed-cache`(仓库外),第二次秒级。
+- `review.md` 还列:解析失败的文件、同名不同内容的文件(只保留先到的那份 —— 这是 P7「矛盾」的素材)。
+
+**huada_v1(2026-10-13)**:自动 259 条(产品 FAQ 表 148 / FAQ-2026 表 10 / 说明书 Q&A 101)+ 手写 44 条
+(跨文档 14 / 精确标识 12 / 表格 8 / 无答案 10)= **303 条**;0 条配不出锚、0 条含个人信息。
+
 ## 格式(YAML)
 
 ```yaml
