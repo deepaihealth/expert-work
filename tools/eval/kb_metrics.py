@@ -57,20 +57,28 @@ class ResultLike(Protocol):
     """``orchestrator.tools.knowledge.RetrievedChunk`` 的结构镜像(只用到这三个字段)。"""
 
     @property
-    def filename(self) -> str: ...
+    def filename(self) -> str:
+        """Source document filename of the hit."""
+
     @property
-    def content(self) -> str: ...
+    def content(self) -> str:
+        """Chunk text of the hit."""
+
     @property
-    def score(self) -> float | None: ...
+    def score(self) -> float | None:
+        """Recall score (vector similarity when available)."""
 
 
 class ExpectedLike(Protocol):
     """``kb_dataset.KbExpected`` 的结构镜像。"""
 
     @property
-    def document(self) -> str: ...
+    def document(self) -> str:
+        """Expected document filename."""
+
     @property
-    def anchor(self) -> str: ...
+    def anchor(self) -> str:
+        """Expected anchor text inside that document."""
 
 
 @dataclass(frozen=True)
