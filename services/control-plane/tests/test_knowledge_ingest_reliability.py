@@ -182,7 +182,7 @@ async def test_stale_worker_after_reupload_does_not_overwrite() -> None:
     )
     assert reset.ingest_generation == 1
     gate.release.set()
-    await task
+    await asyncio.gather(task)
     fetched = await store.get_document(tenant_id=_TENANT, document_id=doc_id)
     assert fetched is not None
     assert fetched.status is DocumentStatus.PENDING  # A neither readied nor failed it

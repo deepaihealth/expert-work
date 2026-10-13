@@ -217,21 +217,20 @@ async def test_list_documents_paginates(harness: Harness) -> None:
 async def test_every_write_endpoint_emits_an_audit_row(harness: Harness) -> None:
     created = await harness.client.post("/v1/knowledge/bases", json={"name": "kb"})
     base_id = created.json()["id"]
-    assert (
-        await harness.client.patch("/v1/knowledge/bases/kb", json={"description": "d"})
-    ).status_code == 200
+    patched = await harness.client.patch("/v1/knowledge/bases/kb", json={"description": "d"})
+    assert patched.status_code == 200
     uploaded = await harness.upload("kb", "h.md", _MD)
     doc_id = str(uploaded["id"])
-    assert (
-        await harness.client.post(f"/v1/knowledge/bases/kb/documents/{doc_id}/reingest")
-    ).status_code == 202
+    reingested = await harness.client.post(f"/v1/knowledge/bases/kb/documents/{doc_id}/reingest")
+    assert reingested.status_code == 202
     await harness.runner.drain()
-    assert (await harness.client.post("/v1/knowledge/bases/kb/reindex")).status_code == 202
+    reindexed = await harness.client.post("/v1/knowledge/bases/kb/reindex")
+    assert reindexed.status_code == 202
     await harness.runner.drain()
-    assert (
-        await harness.client.delete(f"/v1/knowledge/bases/kb/documents/{doc_id}")
-    ).status_code == 204
-    assert (await harness.client.delete("/v1/knowledge/bases/kb")).status_code == 204
+    doc_deleted = await harness.client.delete(f"/v1/knowledge/bases/kb/documents/{doc_id}")
+    assert doc_deleted.status_code == 204
+    base_deleted = await harness.client.delete("/v1/knowledge/bases/kb")
+    assert base_deleted.status_code == 204
 
     rows = await harness.audit_rows()
     assert rows == [
