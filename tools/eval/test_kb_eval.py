@@ -269,6 +269,7 @@ async def test_build_corpus_ingests_once_per_dup_group_and_records_failures(
     assert status == {
         "manual_a.md": DocumentStatus.READY,
         "manual_b.txt": DocumentStatus.READY,
+        "other/manual_b.txt": DocumentStatus.READY,  # same basename, ingested under its dir
         "broken.xyz": DocumentStatus.FAILED,
     }
     assert "manual_a_copy.md" not in status
