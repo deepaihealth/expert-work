@@ -3,11 +3,14 @@
 分层:A 有文字层可直接入库 / B 扫描件或图片(要 OCR)/ D 物料目录下的图片 /
 D-A、D-B 物料目录下的文档 / Q 聊天记录(问题来源,不入库)/ X、X-zip、X-other 排除。
 只记路径、类型、大小、页数、扫描页数、文字字符数、重复组、版本标记 —— **不记任何内容**。
-原文档在仓库外,CI 不碰;默认目录名按 10-13 清点的那份语料给,别的语料用参数改。
+原文档在仓库外,CI 不碰。代码里的默认值不带任何客户目录名:哪个顶层目录是聊天记录 / 物料、
+要跳过哪些目录和文件,写在一份 layout YAML 里(例:``datasets/kb/huada_v1.layout.yaml``),
+命令行参数在它之上**叠加**。
 
 用法(仓库根目录)::
 
-    uv run --no-sync python -I tools/eval/kb_corpus_inventory.py <资料根目录> <输出目录>
+    uv run --no-sync python -I tools/eval/kb_corpus_inventory.py <资料根目录> <输出目录> \\
+        --layout tools/eval/datasets/kb/huada_v1.layout.yaml
 """
 
 from __future__ import annotations
@@ -18,22 +21,20 @@ import hashlib
 import os
 import re
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import pymupdf
+import yaml
 
-DEFAULT_EXCLUDE_DIRS: tuple[str, ...] = (".workbuddy", "体育冠军代言")
-DEFAULT_EXCLUDE_NAMES: tuple[str, ...] = ("华大用户群数据（总覆盖：1535 人）.doc",)  # noqa: RUF001 — 真实文件名(个人数据表,不入评测)
-DEFAULT_CHAT_DIR = "聊天记录"
-DEFAULT_MATERIAL_DIRS: tuple[str, ...] = (
-    "（重要！）在售产品上架资料【2026】",  # noqa: RUF001 — 真实目录名,全角标点照抄
-    "31护肤品产品",
-    "32检测类产品",
-    "30健康管理项目",
-    "华大营养产品折页",
-)
+#: 代码默认值只有工具自己的垃圾目录;客户语料的目录名一律进 layout 文件。
+DEFAULT_EXCLUDE_DIRS: tuple[str, ...] = (".workbuddy",)
+DEFAULT_EXCLUDE_NAMES: tuple[str, ...] = ()
+DEFAULT_CHAT_DIR: str | None = None
+DEFAULT_MATERIAL_DIRS: tuple[str, ...] = ()
+LAYOUT_KEYS = frozenset({"exclude_dirs", "exclude_names", "chat_dir", "material_dirs"})
 EXCLUDE_EXT = frozenset({".ini", ".drivedownload", ".url", ".psd", ".eps"})
 EXCLUDE_BASENAMES = frozenset({".DS_Store"})  # 没有扩展名,按文件名整个匹配
 TEXT_EXT = frozenset({".docx", ".doc", ".xlsx", ".pptx", ".md", ".csv", ".txt"})
@@ -65,12 +66,59 @@ MANIFEST_FIELDS: tuple[str, ...] = (
 )
 
 
+class LayoutError(ValueError):
+    """layout YAML 不合格式。"""
+
+
 @dataclass(frozen=True)
 class InventoryConfig:
-    exclude_dirs: frozenset[str]
-    exclude_names: frozenset[str]
-    chat_dir: str
-    material_dirs: frozenset[str]
+    exclude_dirs: frozenset[str] = frozenset(DEFAULT_EXCLUDE_DIRS)
+    exclude_names: frozenset[str] = frozenset(DEFAULT_EXCLUDE_NAMES)
+    chat_dir: str | None = DEFAULT_CHAT_DIR
+    material_dirs: frozenset[str] = frozenset(DEFAULT_MATERIAL_DIRS)
+
+    def extend(
+        self,
+        *,
+        exclude_dirs: Sequence[str] = (),
+        exclude_names: Sequence[str] = (),
+        chat_dir: str | None = None,
+        material_dirs: Sequence[str] = (),
+    ) -> InventoryConfig:
+        """命令行参数叠加:集合取并,``chat_dir`` 给了就覆盖。"""
+        return InventoryConfig(
+            exclude_dirs=self.exclude_dirs | frozenset(exclude_dirs),
+            exclude_names=self.exclude_names | frozenset(exclude_names),
+            chat_dir=chat_dir if chat_dir is not None else self.chat_dir,
+            material_dirs=self.material_dirs | frozenset(material_dirs),
+        )
+
+
+def load_layout(path: Path) -> InventoryConfig:
+    """读 layout YAML:``{exclude_dirs: [...], exclude_names: [...], chat_dir: str|null,
+    material_dirs: [...]}``,键都可省;省掉的用代码默认值。"""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        raise LayoutError(f"{path}: top level must be a mapping")
+    unknown = set(raw) - LAYOUT_KEYS
+    if unknown:
+        raise LayoutError(f"{path}: unknown keys {sorted(unknown)}; allowed {sorted(LAYOUT_KEYS)}")
+    chat_dir = raw.get("chat_dir")
+    if chat_dir is not None and not isinstance(chat_dir, str):
+        raise LayoutError(f"{path}: 'chat_dir' must be a string or null")
+    return InventoryConfig().extend(
+        exclude_dirs=_str_list(raw, "exclude_dirs", path=path),
+        exclude_names=_str_list(raw, "exclude_names", path=path),
+        chat_dir=chat_dir,
+        material_dirs=_str_list(raw, "material_dirs", path=path),
+    )
+
+
+def _str_list(raw: Mapping[str, Any], key: str, *, path: Path) -> tuple[str, ...]:
+    value = raw.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise LayoutError(f"{path}: '{key}' must be a list of strings")
+    return tuple(value)
 
 
 @dataclass(frozen=True)
@@ -117,7 +165,7 @@ def classify(path: Path, *, top: str, cfg: InventoryConfig) -> tuple[str, PdfSta
     stats = PdfStats()
     if ext in EXCLUDE_EXT or name in cfg.exclude_names or name in EXCLUDE_BASENAMES:
         tier = "X"
-    elif top == cfg.chat_dir:
+    elif cfg.chat_dir is not None and top == cfg.chat_dir:
         tier = "Q"
     elif ext == ".zip":
         tier = "X-zip"
@@ -244,33 +292,43 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("root", type=Path, help="资料根目录(仓库外)")
     parser.add_argument("out", type=Path, help="输出目录,写 manifest.csv + summary.txt")
     parser.add_argument(
+        "--layout",
+        type=Path,
+        metavar="YAML",
+        help="语料目录布局文件(exclude_dirs / exclude_names / chat_dir / material_dirs)",
+    )
+    parser.add_argument(
         "--exclude-dir",
         action="append",
+        default=[],
         metavar="NAME",
-        help=f"跳过的目录名(可重复;给了就整体替换默认值 {list(DEFAULT_EXCLUDE_DIRS)})",
+        help="跳过的目录名(可重复;叠加到 layout 上)",
     )
     parser.add_argument(
         "--exclude-name",
         action="append",
+        default=[],
         metavar="FILENAME",
-        help="按文件名整个排除(可重复;给了就整体替换默认值)",
+        help="按文件名整个排除(可重复;叠加到 layout 上)",
     )
-    parser.add_argument("--chat-dir", default=DEFAULT_CHAT_DIR, help="聊天记录顶层目录名 → Q 层")
+    parser.add_argument("--chat-dir", help="聊天记录顶层目录名 → Q 层(覆盖 layout 里的)")
     parser.add_argument(
         "--material-dir",
         action="append",
+        default=[],
         metavar="NAME",
-        help="物料顶层目录名 → D / D-A / D-B(可重复;给了就整体替换默认值)",
+        help="物料顶层目录名 → D / D-A / D-B(可重复;叠加到 layout 上)",
     )
     return parser
 
 
 def _config(args: argparse.Namespace) -> InventoryConfig:
-    return InventoryConfig(
-        exclude_dirs=frozenset(args.exclude_dir or DEFAULT_EXCLUDE_DIRS),
-        exclude_names=frozenset(args.exclude_name or DEFAULT_EXCLUDE_NAMES),
+    base = load_layout(args.layout) if args.layout is not None else InventoryConfig()
+    return base.extend(
+        exclude_dirs=args.exclude_dir,
+        exclude_names=args.exclude_name,
         chat_dir=args.chat_dir,
-        material_dirs=frozenset(args.material_dir or DEFAULT_MATERIAL_DIRS),
+        material_dirs=args.material_dir,
     )
 
 
@@ -280,7 +338,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     out: Path = args.out
     if not root.is_dir():
         raise SystemExit(f"root is not a directory: {root}")
-    records = scan(root, _config(args))
+    try:
+        cfg = _config(args)
+    except LayoutError as exc:
+        raise SystemExit(str(exc)) from exc
+    records = scan(root, cfg)
     out.mkdir(parents=True, exist_ok=True)
     write_manifest(records, out / "manifest.csv")
     summary = summarize(records, root=root)

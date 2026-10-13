@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import csv
+import os
 import zipfile
 from pathlib import Path
 
 import pymupdf
 import pytest
+import yaml
 from kb_corpus_inventory import (  # type: ignore[import-not-found]
     DEFAULT_CHAT_DIR,
     DEFAULT_EXCLUDE_DIRS,
+    DEFAULT_EXCLUDE_NAMES,
     DEFAULT_MATERIAL_DIRS,
     MANIFEST_FIELDS,
+    InventoryConfig,
+    LayoutError,
+    load_layout,
     main,
 )
+
+_HUADA_LAYOUT = Path(__file__).resolve().parent / "datasets" / "kb" / "huada_v1.layout.yaml"
 
 _TEXT = "这一页有文字层,字数肯定超过二十个字,用来判成有文字层的页。"
 _BIG = ("重复内容" * 400).encode("utf-8")  # > 1024 字节才参与 md5 去重
@@ -59,9 +67,32 @@ def _build_corpus(root: Path) -> None:
     (material / "leaflet.jpg").write_bytes(b"\xff\xd8\xff" + _BIG)
     _pdf(material / "sheet.pdf", (True,))
     _pdf(material / "photo.pdf", (False,))
-    skipped = root / "skipme"
+    material2 = root / "物料2"  # 只在 CLI 上加,证明 CLI 是叠加到 layout 上
+    material2.mkdir()
+    (material2 / "poster.png").write_bytes(b"\x89PNG" + _BIG)
+    skipped = root / "skipme"  # layout 里排除
     skipped.mkdir()
     (skipped / "ignored.txt").write_bytes(_BIG)
+    skipped2 = root / "skipme2"  # CLI 上排除
+    skipped2.mkdir()
+    (skipped2 / "ignored.txt").write_bytes(_BIG)
+    (root / "名单.doc").write_bytes(_BIG + b"doc")  # layout exclude_names → X
+
+
+def _write_layout(path: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "exclude_dirs": ["skipme"],
+                "exclude_names": ["名单.doc"],
+                "chat_dir": "聊天记录",
+                "material_dirs": ["物料"],
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 @pytest.fixture(scope="module")
@@ -69,15 +100,16 @@ def inventory(tmp_path_factory: pytest.TempPathFactory) -> tuple[dict[str, dict[
     root = tmp_path_factory.mktemp("corpus")
     out = tmp_path_factory.mktemp("out")
     _build_corpus(root)
+    layout = _write_layout(tmp_path_factory.mktemp("layout") / "layout.yaml")
     argv = [
         str(root),
         str(out),
+        "--layout",
+        str(layout),
         "--exclude-dir",
-        "skipme",
-        "--chat-dir",
-        "聊天记录",
+        "skipme2",
         "--material-dir",
-        "物料",
+        "物料2",
     ]
     assert main(argv) == 0
     with (out / "manifest.csv").open(encoding="utf-8", newline="") as fh:
@@ -104,11 +136,15 @@ def test_tiers(inventory: tuple[dict[str, dict[str, str]], str]) -> None:
     assert _tier(rows, "物料/leaflet.jpg") == "D"
     assert _tier(rows, "物料/sheet.pdf") == "D-A"
     assert _tier(rows, "物料/photo.pdf") == "D-B"
+    assert _tier(rows, "名单.doc") == "X"  # layout exclude_names
 
 
-def test_excluded_dir_is_not_walked(inventory: tuple[dict[str, dict[str, str]], str]) -> None:
+def test_cli_flags_add_to_layout(inventory: tuple[dict[str, dict[str, str]], str]) -> None:
     rows, _ = inventory
-    assert not any(p.startswith("skipme") for p in rows)
+    assert _tier(rows, "物料2/poster.png") == "D"  # CLI --material-dir 叠加在 layout 的「物料」上
+    assert _tier(rows, "物料/leaflet.jpg") == "D"  # layout 的那条没被 CLI 替换掉
+    assert not any(p.startswith("skipme2") for p in rows)  # CLI --exclude-dir
+    assert not any(p.startswith(f"skipme{os.sep}") for p in rows)  # layout exclude_dirs
 
 
 def test_pdf_page_stats(inventory: tuple[dict[str, dict[str, str]], str]) -> None:
@@ -146,7 +182,7 @@ def test_manifest_has_no_document_content(inventory: tuple[dict[str, dict[str, s
 def test_summary_counts(inventory: tuple[dict[str, dict[str, str]], str]) -> None:
     rows, summary = inventory
     assert f"files={len(rows)}" in summary
-    assert len(rows) == 14
+    assert len(rows) == 16
     assert "dup_groups=1" in summary
     assert "dup_extra=1" in summary
     lines = {line.split()[0]: line.split() for line in summary.splitlines() if line.strip()}
@@ -154,9 +190,9 @@ def test_summary_counts(inventory: tuple[dict[str, dict[str, str]], str]) -> Non
     assert lines["A"][1] == "5"  # text.pdf 手册V2.docx dup_a dup_b unique
     assert lines["B"][1] == "1"
     assert lines["B"][3:5] == ["2", "1"]
-    assert lines["X"][1] == "2"
+    assert lines["X"][1] == "3"  # link.url .DS_Store 名单.doc
     assert lines["Q"][1] == "1"
-    assert lines["D"][1] == "1"
+    assert lines["D"][1] == "2"  # leaflet.jpg poster.png
     assert lines["D-A"][1] == "1"
     assert lines["D-B"][1] == "1"
     assert lines["X-zip"][1] == "1"
@@ -165,10 +201,77 @@ def test_summary_counts(inventory: tuple[dict[str, dict[str, str]], str]) -> Non
     assert "pdf errors: 0" in summary
 
 
-def test_defaults_are_the_huada_layout() -> None:
-    assert DEFAULT_CHAT_DIR == "聊天记录"
-    assert ".workbuddy" in DEFAULT_EXCLUDE_DIRS
-    assert len(DEFAULT_MATERIAL_DIRS) == 5
+def test_code_defaults_are_tenant_neutral() -> None:
+    """客户目录名只能在 layout 数据文件里,代码默认值不带任何租户内容。"""
+    assert DEFAULT_EXCLUDE_DIRS == (".workbuddy",)
+    assert DEFAULT_EXCLUDE_NAMES == ()
+    assert DEFAULT_MATERIAL_DIRS == ()
+    assert DEFAULT_CHAT_DIR is None
+
+
+def test_without_layout_or_flags_nothing_is_q_or_d(tmp_path: Path) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "聊天记录").mkdir()
+    (root / "聊天记录" / "x.xlsx").write_bytes(b"PK\x03\x04" + _BIG)
+    (root / "物料").mkdir()
+    (root / "物料" / "a.jpg").write_bytes(b"\xff\xd8\xff" + _BIG)
+    out = tmp_path / "out"
+    assert main([str(root), str(out)]) == 0
+    with (out / "manifest.csv").open(encoding="utf-8", newline="") as fh:
+        tiers = {row["path"]: row["tier"] for row in csv.DictReader(fh)}
+    assert tiers == {str(Path("聊天记录/x.xlsx")): "A", str(Path("物料/a.jpg")): "B"}
+
+
+def test_huada_layout_file_loads() -> None:
+    cfg = load_layout(_HUADA_LAYOUT)
+    assert isinstance(cfg, InventoryConfig)
+    assert cfg.chat_dir == "聊天记录"
+    assert ".workbuddy" in cfg.exclude_dirs
+    assert len(cfg.material_dirs) == 5
+    assert len(cfg.exclude_names) == 1
+
+
+def test_layout_file_partial_keys_fall_back_to_neutral_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "layout.yaml"
+    path.write_text(yaml.safe_dump({"material_dirs": ["m"]}), encoding="utf-8")
+    cfg = load_layout(path)
+    assert cfg == InventoryConfig(
+        exclude_dirs=frozenset({".workbuddy"}),
+        exclude_names=frozenset(),
+        chat_dir=None,
+        material_dirs=frozenset({"m"}),
+    )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"material_dirs": "m"},  # 不是列表
+        {"chat_dir": ["a"]},  # 不是字符串
+        {"exclude_dirs": [1]},  # 列表元素不是字符串
+        {"unknown_key": []},  # 未知键
+        [],  # 顶层不是映射
+    ],
+)
+def test_layout_file_validation(tmp_path: Path, bad: object) -> None:
+    path = tmp_path / "layout.yaml"
+    path.write_text(yaml.safe_dump(bad), encoding="utf-8")
+    with pytest.raises(LayoutError):
+        load_layout(path)
+
+
+def test_cli_chat_dir_overrides_layout(tmp_path: Path) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / "群聊").mkdir()
+    (root / "群聊" / "x.xlsx").write_bytes(b"PK\x03\x04" + _BIG)
+    layout = _write_layout(tmp_path / "layout.yaml")
+    out = tmp_path / "out"
+    assert main([str(root), str(out), "--layout", str(layout), "--chat-dir", "群聊"]) == 0
+    with (out / "manifest.csv").open(encoding="utf-8", newline="") as fh:
+        tiers = {row["path"]: row["tier"] for row in csv.DictReader(fh)}
+    assert tiers == {str(Path("群聊/x.xlsx")): "Q"}
 
 
 def test_empty_root_writes_header_only(tmp_path: Path) -> None:

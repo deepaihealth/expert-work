@@ -8,10 +8,31 @@
 
 ```
 datasets/kb/
-├── README.md            # 本文
-├── <name>.yaml          # 评测集(L1-T2 生成,如 huada_v1.yaml)
-└── <name>.review.md     # 待人工确认清单(自动配不出锚文本的条目)
+├── README.md              # 本文
+├── <name>.layout.yaml     # 语料目录布局(给清点脚本 --layout 用,只有目录 / 文件名)
+├── <name>.yaml            # 评测集(L1-T2 生成,如 huada_v1.yaml)
+└── <name>.review.md       # 待人工确认清单(自动配不出锚文本的条目)
 ```
+
+## 清点语料
+
+```sh
+uv run --no-sync python -I tools/eval/kb_corpus_inventory.py <资料根目录> <输出目录> \
+    --layout tools/eval/datasets/kb/huada_v1.layout.yaml
+```
+
+输出 `manifest.csv` + `summary.txt` 到 `<输出目录>`(仓库外)。脚本代码里**没有任何客户目录名**:
+哪个顶层目录是聊天记录(Q 层)、哪些是物料(D / D-A / D-B)、要跳过哪些目录和文件,全在 layout 文件里:
+
+```yaml
+exclude_dirs: [.workbuddy, ...]   # 不遍历的目录名
+exclude_names: [...]              # 按文件名整个排除(→ X)
+chat_dir: 聊天记录                 # 顶层目录名 → Q;null = 没有
+material_dirs: [...]              # 顶层目录名 → D / D-A / D-B
+```
+
+四个键都可省。命令行的 `--exclude-dir` / `--exclude-name` / `--material-dir`(可重复)**叠加**在 layout 之上,
+`--chat-dir` 覆盖 layout 里的值。换一套语料就新写一份 `<name>.layout.yaml`,不改代码。
 
 ## 格式(YAML)
 
@@ -67,6 +88,6 @@ cases:
 
 ## 语料不进仓库
 
-- 原文档与 `manifest.csv` 都在仓库外(`~/kb-eval/<语料>/`),**CI 永远不读它们**。
+- 原文档与 `manifest.csv` 都在仓库外(`~/kb-eval/<语料>/`),**CI 永远不读它们**。仓库里只有 layout(目录名)和评测集(问题 / 答案 / 文件名 / 锚文本)。
 - 进 CI 的只有 `test_kb_dataset.py` / `test_kb_corpus_inventory.py`,它们用 `tmp_path` 现造几个小文件。
 - 「期望文档在不在语料里」用 `kb_dataset.check_corpus(dataset, manifest_csv)` 本机核一次(只看 A / D-A 层的文件名),结果写进 PR,不进 CI。
