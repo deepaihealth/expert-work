@@ -138,6 +138,12 @@ export const SUPPORTED_DOCUMENT_EXTENSIONS = [
   ".csv",
 ] as const;
 
+/** Client-side upload size cap — B-175 L3. Same value as the backend's
+ *  ``settings.knowledge_document_max_bytes`` default (50 MiB); files over it
+ *  are skipped before any request. A server 413 (different configured cap)
+ *  still surfaces per file as ``failed`` with the server's limit. */
+export const KNOWLEDGE_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024;
+
 export function isSupportedDocument(filename: string): boolean {
   const dot = filename.lastIndexOf(".");
   if (dot < 0) return false;
@@ -204,15 +210,36 @@ export async function reindexBase(name: string): Promise<void> {
   await apiClient.post(`/v1/knowledge/bases/${encodeURIComponent(name)}/reindex`);
 }
 
+export interface UploadDocumentOptions {
+  /** Aborts the request (axios ``signal``); the rejection is an ``ApiError``
+   *  with status 0 — callers that cancel check ``signal.aborted`` first. */
+  signal?: AbortSignal;
+  /** Upload progress in whole percent (0–100), from axios ``onUploadProgress``. */
+  onProgress?: (percent: number) => void;
+}
+
 /** POST multipart — 202 Accepted; ingestion runs in the background and
  *  the caller polls ``listDocuments`` for the status (Mini-ADR H-18). */
-export async function uploadDocument(baseName: string, file: File): Promise<KnowledgeDocument> {
+export async function uploadDocument(
+  baseName: string,
+  file: File,
+  { signal, onProgress }: UploadDocumentOptions = {},
+): Promise<KnowledgeDocument> {
   const form = new FormData();
   form.append("file", file);
   const response = await apiClient.post<KnowledgeDocument>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
     form,
-    { headers: { "Content-Type": "multipart/form-data" } },
+    {
+      headers: { "Content-Type": "multipart/form-data" },
+      signal,
+      onUploadProgress: onProgress
+        ? (event) => {
+            const total = event.total ?? file.size;
+            if (total > 0) onProgress(Math.min(100, Math.round((event.loaded / total) * 100)));
+          }
+        : undefined,
+    },
   );
   return response.data;
 }

@@ -476,7 +476,6 @@ export interface TranslationKeys {
     documents_empty: string;
     select_hint: string;
     upload: string;
-    unsupported_type: string;
     embedder_missing: string;
     col_filename: string;
     col_status: string;
@@ -520,7 +519,31 @@ export interface TranslationKeys {
     reindex_button: string;
     reindex_started: string;
     upload_dragger_hint: string;
+    upload_dragger_hint_folder: string;
     upload_dragger_sub: string;
+    upload_folder_toggle: string;
+    upload_queue_title: string;
+    upload_queue_progress: string;
+    upload_queue_status_queued: string;
+    upload_queue_status_uploading: string;
+    upload_queue_status_done: string;
+    upload_queue_status_failed: string;
+    upload_queue_status_skipped: string;
+    upload_queue_cancelled: string;
+    upload_queue_cancel: string;
+    upload_queue_retry: string;
+    upload_queue_cancel_all: string;
+    upload_queue_clear_done: string;
+    upload_queue_skipped_summary: string;
+    upload_queue_skipped_unsupported: string;
+    upload_queue_skipped_too_large: string;
+    upload_queue_skipped_sep: string;
+    upload_queue_show_skipped: string;
+    upload_queue_hide_skipped: string;
+    upload_queue_reason_unsupported: string;
+    upload_queue_reason_too_large: string;
+    upload_queue_err_too_large_server: string;
+    doc_table_total: string;
     col_attempts: string;
     reingest: string;
     reingest_started: string;
@@ -3731,7 +3754,6 @@ const en: TranslationKeys = {
     documents_empty: "No documents in this base yet.",
     select_hint: "Select a base on the left to manage its documents.",
     upload: "Upload",
-    unsupported_type: "Unsupported document type: {{name}}",
     embedder_missing:
       "Document ingestion is unavailable — no embedding model is configured on the platform.",
     col_filename: "Filename",
@@ -3780,8 +3802,32 @@ const en: TranslationKeys = {
     reindex_button: "Re-index",
     reindex_started: "Re-indexing started; it runs in the background.",
     upload_dragger_hint: "Click or drag files here to upload",
+    upload_dragger_hint_folder: "Click to pick a folder, or drag files / folders here",
     upload_dragger_sub:
       "PDF, Office, Markdown, HTML, CSV, TXT — multiple files supported.",
+    upload_folder_toggle: "Pick a folder",
+    upload_queue_title: "Upload queue",
+    upload_queue_progress: "{{done}} / {{total}} uploaded",
+    upload_queue_status_queued: "Queued",
+    upload_queue_status_uploading: "Uploading",
+    upload_queue_status_done: "Done",
+    upload_queue_status_failed: "Failed",
+    upload_queue_status_skipped: "Skipped",
+    upload_queue_cancelled: "Cancelled",
+    upload_queue_cancel: "Cancel",
+    upload_queue_retry: "Retry",
+    upload_queue_cancel_all: "Cancel all",
+    upload_queue_clear_done: "Clear finished",
+    upload_queue_skipped_summary: "Skipped {{parts}}",
+    upload_queue_skipped_unsupported: "{{n}} unsupported file(s)",
+    upload_queue_skipped_too_large: "{{n}} over {{limit}}",
+    upload_queue_skipped_sep: ", ",
+    upload_queue_show_skipped: "Show list",
+    upload_queue_hide_skipped: "Hide list",
+    upload_queue_reason_unsupported: "Unsupported type",
+    upload_queue_reason_too_large: "Over {{limit}}",
+    upload_queue_err_too_large_server: "Rejected by the server: over {{limit}}",
+    doc_table_total: "{{total}} documents",
     col_attempts: "Attempts",
     reingest: "Re-ingest",
     reingest_started: "Re-ingestion started.",
