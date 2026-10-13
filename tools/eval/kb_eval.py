@@ -11,7 +11,7 @@
    ``control_plane.knowledge.ingestion.ingest_markdown``(语义切块 → 嵌入 → 落段,与上传后的
    入库链路同一段代码)→ ``set_document_status(READY, chunk_count)``;失败按阶段
    ``parse|embed|store|other`` 记进 ``ingest_failures``,文档标 FAILED,不中断;同名不同内容的
-   文件只入第一份,其余带路径记进 ``name_collisions``;
+   文件后到的一份以「上级目录/文件名」入库,记进 ``name_collisions``;0 字节文件直接跳过;
 3. 入库后核「锚文本存活」:每条 expected 的 anchor 至少出现在其文档的某一段里,不存活的 case
    单列(是数据集 / 切块的问题,不是检索的问题);
 4. 每条 case 调 ``KnowledgeRetriever.search(limit=top_k)``,按 ``kb_metrics`` 打分(``match``
@@ -145,6 +145,7 @@ class CorpusSelection:
     skipped_dup: int
     skipped_tier: int
     skipped_limit: int
+    skipped_empty: int = 0
 
 
 @dataclass(frozen=True)
@@ -158,9 +159,16 @@ class IngestFailure:
 
 @dataclass(frozen=True)
 class NameCollision:
+    """A later file with the same basename as an earlier one (different
+    directory, not the same ``dup_group``). It is still ingested — under
+    ``ingested_as`` (``<parent dir>/<basename>``), since ``(kb_id, filename)``
+    is unique per base — so the dataset's basename-keyed expectations keep
+    pointing at the first one while nothing is dropped from the corpus."""
+
     filename: str
     path: str
     kept_path: str
+    ingested_as: str
 
 
 @dataclass(frozen=True)
@@ -178,6 +186,7 @@ class CorpusReport:
     docs_ingested: int
     docs_skipped_dup: int
     docs_skipped_limit: int
+    docs_skipped_empty: int
     docs_name_collision: int
     docs_failed: int
     failed_by_stage: dict[str, int]
@@ -321,7 +330,11 @@ def select_rows(
     seen_groups: set[str] = set()
     kept: list[Mapping[str, str]] = []
     skipped_dup = 0
+    skipped_empty = 0
     for row in in_tier:
+        if (row.get("size") or "").strip() == "0":
+            skipped_empty += 1  # a 0-byte file cannot parse; not a retrieval problem
+            continue
         group = row.get("dup_group") or ""
         if group and group in seen_groups:
             skipped_dup += 1
@@ -338,6 +351,7 @@ def select_rows(
         skipped_dup=skipped_dup,
         skipped_tier=len(rows) - len(in_tier),
         skipped_limit=skipped_limit,
+        skipped_empty=skipped_empty,
     )
 
 
@@ -418,14 +432,22 @@ async def build_corpus(
         path = row["path"]
         filename = _basename(path)
         if filename in claimed:
+            # Same basename, different file: ingest under a directory-qualified
+            # name (full relative path if even that collides).
+            qualified = f"{Path(path).parent.name}/{filename}"
+            if qualified in claimed:
+                qualified = path
             collisions.append(
-                NameCollision(filename=filename, path=path, kept_path=claimed[filename])
+                NameCollision(
+                    filename=filename, path=path, kept_path=claimed[filename], ingested_as=qualified
+                )
             )
             print(
-                f"[ingest {index}/{total}] {path}: same filename as {claimed[filename]}, skipped",
+                f"[ingest {index}/{total}] {path}: same filename as {claimed[filename]}, "
+                f"ingested as {qualified!r}",
                 file=sys.stderr,
             )
-            return 0, None
+            filename = qualified
         claimed[filename] = path
         async with sem:
             doc = await store.upsert_document(
@@ -495,9 +517,10 @@ async def build_corpus(
         by_stage[failure.stage] = by_stage.get(failure.stage, 0) + 1
     return CorpusReport(
         base_id=base.id,
-        docs_ingested=total - len(failures) - len(collisions),
+        docs_ingested=total - len(failures),
         docs_skipped_dup=selection.skipped_dup,
         docs_skipped_limit=selection.skipped_limit,
+        docs_skipped_empty=selection.skipped_empty,
         docs_name_collision=len(collisions),
         docs_failed=len(failures),
         failed_by_stage=by_stage,
@@ -776,6 +799,7 @@ def format_summary_table(summary: Mapping[str, Any]) -> str:
         lines.append(
             f"corpus: ingested={corpus['docs_ingested']} skipped_dup={corpus['docs_skipped_dup']} "
             f"skipped_limit={corpus['docs_skipped_limit']} "
+            f"skipped_empty={corpus['docs_skipped_empty']} "
             f"name_collision={corpus['docs_name_collision']} failed={corpus['docs_failed']} "
             f"{corpus['failed_by_stage']} chunks={corpus['chunk_total']} "
             f"elapsed={corpus['elapsed_s']}s embedder={corpus['embedder']}"
@@ -1037,7 +1061,8 @@ async def _run(
     print(
         f"corpus: {len(selection.rows)} docs selected (tiers={','.join(tiers)}, "
         f"skipped_dup={selection.skipped_dup}, skipped_tier={selection.skipped_tier}, "
-        f"skipped_limit={selection.skipped_limit}; limit counts after dedup)",
+        f"skipped_limit={selection.skipped_limit}, skipped_empty={selection.skipped_empty}; "
+        f"limit counts after dedup)",
         file=sys.stderr,
     )
     async with open_store(args.store) as store:
@@ -1127,11 +1152,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_summary_table(summary))
     print(f"results: {out}")
     if args.update_baseline:
-        if report.docs_failed or report.docs_name_collision:
+        if report.docs_failed:
             raise SystemExit(
                 f"refusing to update baseline: failed={report.docs_failed} "
-                f"{report.failed_by_stage} name_collision={report.docs_name_collision} — "
-                f"a run with ingest failures is not a baseline; see {out}"
+                f"{report.failed_by_stage} — a run with ingest failures is not a baseline; "
+                f"see {out}"
             )
         update_baseline(
             baseline_out,

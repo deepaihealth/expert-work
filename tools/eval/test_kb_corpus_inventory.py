@@ -283,3 +283,24 @@ def test_empty_root_writes_header_only(tmp_path: Path) -> None:
         ",".join(MANIFEST_FIELDS)
     ]
     assert "files=0" in (out / "summary.txt").read_text(encoding="utf-8")
+
+
+def test_empty_file_is_tier_x_with_error(tmp_path: Path) -> None:
+    """0 字节的 PDF / docx 归 X 层并记 ``EmptyFile``:语料里真有一对这样的质检报告,
+    入库必失败,不该算进 A 层拖累基线。"""
+    from kb_corpus_inventory import InventoryConfig, classify  # type: ignore[import-not-found]
+
+    cfg = InventoryConfig(
+        exclude_dirs=frozenset(),
+        exclude_names=frozenset(),
+        chat_dir=None,
+        material_dirs=frozenset(),
+    )
+    empty = tmp_path / "report.pdf"
+    empty.write_bytes(b"")
+    tier, stats = classify(empty, top=".", cfg=cfg)
+    assert tier == "X"
+    assert stats.error == "EmptyFile"
+    real = tmp_path / "note.md"
+    real.write_text("x", encoding="utf-8")
+    assert classify(real, top=".", cfg=cfg)[0] == "A"

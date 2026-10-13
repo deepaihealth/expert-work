@@ -199,6 +199,12 @@ def test_select_rows_filters_tier_dedupes_first_wins_and_limits(
     assert selection.skipped_dup == 1
     assert selection.skipped_tier == 1
     assert selection.skipped_limit == 0
+    assert selection.skipped_empty == 0
+    # 0 字节的文件(清单 size=0)不入库也不算失败 —— 它解析不了是语料问题,不是检索问题。
+    with_empty = [*rows, {**rows[0], "path": "docs/empty.pdf", "size": "0", "dup_group": ""}]
+    empties = select_rows(with_empty, tiers=("A", "D-A"), limit_docs=0)
+    assert "docs/empty.pdf" not in [r["path"] for r in empties.rows]
+    assert empties.skipped_empty == 1
     # #17:limit 在去重之后数 —— 重复的那份不占名额,被 limit 砍掉的另计。
     limited = select_rows(rows, tiers=("A",), limit_docs=2)
     assert [r["path"] for r in limited.rows] == ["docs/manual_a.md", "docs/manual_b.txt"]
@@ -248,7 +254,7 @@ async def test_build_corpus_ingests_once_per_dup_group_and_records_failures(
     store = InMemoryKnowledgeStore()
     tenant = uuid4()
     report = await _build(corpus, store=store, tenant=tenant)
-    assert report.docs_ingested == 2
+    assert report.docs_ingested == 3  # manual_a, manual_b, other/manual_b (renamed)
     assert report.docs_skipped_dup == 1
     assert report.docs_failed == 1
     assert report.chunk_total >= 2
@@ -271,17 +277,18 @@ async def test_build_corpus_ingests_once_per_dup_group_and_records_failures(
 
 
 @pytest.mark.asyncio
-async def test_build_corpus_same_basename_different_content_keeps_first_and_reports_path(
+async def test_build_corpus_same_basename_different_content_ingests_both_under_qualified_name(
     corpus: tuple[Path, Path],
 ) -> None:
     # #10a:``other/manual_b.txt`` 与 ``docs/manual_b.txt`` 同名不同内容、不是同一 dup_group。
-    # 库内 (kb_id, filename) 唯一,放进去会把先入的那份重置掉 —— 必须拦下并带路径单独计数。
+    # 库内 (kb_id, filename) 唯一,直接放进去会把先入的那份重置掉 —— 后到的改以
+    # 「上级目录/文件名」入库:两份都在,评测集按文件名指向的仍是先到的那份。
     store = InMemoryKnowledgeStore()
     tenant = uuid4()
     report = await _build(corpus, store=store, tenant=tenant)
     assert report.docs_name_collision == 1
-    assert [(c.filename, c.path, c.kept_path) for c in report.name_collisions] == [
-        ("manual_b.txt", "other/manual_b.txt", "docs/manual_b.txt")
+    assert [(c.filename, c.path, c.kept_path, c.ingested_as) for c in report.name_collisions] == [
+        ("manual_b.txt", "other/manual_b.txt", "docs/manual_b.txt", "other/manual_b.txt")
     ]
     assert "manual_b.txt" not in {f.filename for f in report.ingest_failures}
     docs = {
@@ -290,6 +297,8 @@ async def test_build_corpus_same_basename_different_content_keeps_first_and_repo
     texts = await _chunk_texts(store, tenant, docs["manual_b.txt"].id)
     assert any(_ANCHOR_B in t for t in texts)  # 先入的那份原样还在
     assert not any("维生素 C 咀嚼片" in t for t in texts)
+    later = await _chunk_texts(store, tenant, docs["other/manual_b.txt"].id)
+    assert any("维生素 C 咀嚼片" in t for t in later)  # 后到的那份也在,只是换了名
 
 
 def _slow_parser(filename: str, raw: bytes) -> str:
@@ -312,7 +321,7 @@ async def test_build_corpus_parse_timeout_is_a_parse_failure(corpus: tuple[Path,
             parse_timeout_s=0.05,
         )
     assert report.docs_ingested == 0
-    assert report.failed_by_stage == {"parse": 3}
+    assert report.failed_by_stage == {"parse": 4}  # incl. the renamed collision
     assert {f.error_type for f in report.ingest_failures} == {"TimeoutError"}
     docs = await store.list_documents(tenant_id=tenant, kb_id=report.base_id)
     assert {d.status for d in docs} == {DocumentStatus.FAILED}
@@ -333,7 +342,7 @@ async def test_build_corpus_embed_failure_is_embed_stage(corpus: tuple[Path, Pat
     embedder = CountingEmbedder(_ExplodingEmbedder(), expected_dim=EMBEDDING_DIM)
     report = await _build(corpus, store=store, tenant=tenant, embedder=embedder)
     assert report.docs_ingested == 0
-    assert report.failed_by_stage == {"parse": 1, "embed": 2}
+    assert report.failed_by_stage == {"parse": 1, "embed": 3}  # incl. the renamed collision
     embed_failures = [f for f in report.ingest_failures if f.stage == "embed"]
     assert {f.error_type for f in embed_failures} == {"ConnectionError"}
     docs = await store.list_documents(tenant_id=tenant, kb_id=report.base_id)
@@ -594,8 +603,9 @@ async def test_summary_groups_by_source_and_tag(
     assert set(summary["by_tag"]) == {"通用", "保存", "专利"}
     assert summary["by_tag"]["通用"]["n"] == 3  # q-storage + q-ghost + q-none
     assert summary["by_tag"]["通用"]["doc_hit@20"] == 0.5  # 两条有答案的一中一不中
-    assert summary["corpus"]["docs_ingested"] == 2
+    assert summary["corpus"]["docs_ingested"] == 3  # incl. the renamed collision
     assert summary["corpus"]["docs_name_collision"] == 1
+    assert summary["corpus"]["docs_skipped_empty"] == 0
     assert summary["corpus"]["ingest_failures"] == [
         {
             "filename": "broken.xyz",
@@ -774,7 +784,8 @@ def test_main_writes_jsonl_and_baseline_fingerprint(
 def test_main_refuses_baseline_when_any_document_failed(
     tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
 ) -> None:
-    # #7:有失败 / 同名冲突的跑不是基线 —— 结果照写、表照打,但基线不动、退出码非 0。
+    # #7:有入库失败的跑不是基线 —— 结果照写、表照打,但基线不动、退出码非 0。
+    # (同名冲突已改名入库,不再算失败。)
     _manifest, root = corpus
     out = tmp_path / "unit.jsonl"
     baseline = tmp_path / "baseline.yaml"
@@ -783,7 +794,7 @@ def test_main_refuses_baseline_when_any_document_failed(
     message = str(info.value)
     assert "refusing to update baseline" in message
     assert "failed=1" in message
-    assert "name_collision=1" in message
+    assert "name_collision" not in message
     assert out.exists()
     assert not baseline.exists()
 

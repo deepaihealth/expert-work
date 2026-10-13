@@ -189,7 +189,8 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   解析在进程池里跑(PyMuPDF 非线程安全),每份 `--parse-timeout`(默认 120 s),解析完的 Markdown 走
   `ingest_markdown`(与上传入库同一段切块 → 嵌入 → 落段代码);失败按阶段 `parse|embed|store|other` 记进
   `corpus.ingest_failures[]`(文件名、路径、异常类型),文档标 FAILED,整轮继续;同名不同内容的文件(不同目录、不是同一
-  `dup_group`)只入第一份,其余带路径记进 `corpus.name_collisions[]`;一份都没入成功直接退出,不产出全零的「基线」。
+  `dup_group`)后到的一份以「上级目录/文件名」入库(库内 `(kb_id, filename)` 唯一;评测集按文件名指向的仍是先到的那份),记进
+  `corpus.name_collisions[]`(含 `ingested_as`);清单里 0 字节的文件直接跳过(`skipped_empty`);一份都没入成功直接退出,不产出全零的「基线」。
   嵌入器外面包一层计数 / 校维度:返回维度 ≠ `EXPERT_WORK_EMBEDDING_DIM` 直接报错退出;真嵌入**不截断**输入(让 API 自己报错),
   汇总 `corpus.embed` 报送入的文本数 / 字符数 / 超过 8000 字符的条数 / token 数与估算费用(单价 `EXPERT_WORK_EVAL_EMBED_PRICE_CNY_PER_1K`,
   默认 text-embedding-v4 的 0.0005 元/千 token;假嵌入 token 与费用报 0);token 按送入嵌入器的文本算,含缓存命中。
@@ -209,7 +210,7 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   命中名次、指标;末尾一行汇总;已存在就拒绝覆盖)、终端一张汇总表;`--update-baseline` 把汇总(去掉 `base_id` / `elapsed_s` / `label`
   这些每次都变的字段)与指纹(评测集 sha256、清单 sha256、`corpus_root`、嵌入模型 / base URL / 维度、store、git commit + dirty 标记、
   tiers、limit_docs、method、top_k、threshold、rerank)并进 `tools/eval/baselines/kb_<name>_baseline.yaml`(`--baseline-out` 可改);
-  **有任何入库失败或同名冲突时拒绝更新基线**(退出码非 0,结果 JSONL 照写)。评测集里 `corpus.manifest` 的相对路径相对评测集文件所在目录解析。
+  **有任何入库失败时拒绝更新基线**(退出码非 0,结果 JSONL 照写;同名冲突已改名入库,不算失败)。评测集里 `corpus.manifest` 的相对路径相对评测集文件所在目录解析。
 - **凭据只走环境变量**:嵌入 `EXPERT_WORK_EVAL_EMBED_API_KEY` / `_MODEL` / `_BASE_URL`;`--rerank on` 另要
   `EXPERT_WORK_EVAL_LLM_API_KEY` / `_MODEL` / `_BASE_URL`,缺了直接报错退出。真嵌入包在 `CachedEmbedder`
   里(`eval-out/kb/embed_cache.sqlite`,按模型 + 内容哈希缓存),第二次跑近零费用。
