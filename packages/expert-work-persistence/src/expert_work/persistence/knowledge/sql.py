@@ -48,6 +48,8 @@ _TERMINAL_STATUSES = (DocumentStatus.READY.value, DocumentStatus.FAILED.value)
 #: ``error`` written by :meth:`SqlKnowledgeStore.sweep_terminal` — same text as
 #: the in-memory store so operators see one message.
 _EXHAUSTED_ERROR = "ingest attempts exhausted"
+#: ``error`` after discarding a pending upload when nothing was serving.
+_DISCARDED_ERROR = "pending upload discarded; nothing is serving"
 
 
 def _fence(
@@ -79,15 +81,6 @@ def _claimable(now: datetime, max_attempts: int) -> ColumnElement[bool]:
                 ),
             ),
         ),
-    )
-
-
-async def _drop_chunks_of(session: AsyncSession, document_ids: Sequence[UUID]) -> None:
-    """Delete every chunk of ``document_ids`` inside the caller's transaction."""
-    if not document_ids:
-        return
-    await session.execute(
-        delete(KnowledgeChunkRow).where(KnowledgeChunkRow.document_id.in_(list(document_ids)))
     )
 
 
@@ -123,6 +116,7 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         chunk_count=row.chunk_count,
         attempts=row.attempts,
         ingest_generation=row.ingest_generation,
+        has_pending=row.pending_content is not None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -421,17 +415,21 @@ class SqlKnowledgeStore(KnowledgeStore):
                     return _to_document(existing)  # unchanged re-upload: nothing to do
                 existing.status = DocumentStatus.PENDING.value
                 existing.error = None
-                existing.chunk_count = 0
                 existing.attempts = 0
                 existing.ingest_generation = existing.ingest_generation + 1
                 existing.claimed_at = None
                 existing.lease_until = None
                 if content is not None:
-                    existing.content = content
-                    existing.content_sha256 = content_sha256
+                    if existing.content is None and existing.chunk_count == 0:
+                        existing.content = content  # nothing serving yet
+                        existing.content_sha256 = content_sha256
+                    else:
+                        # New bytes wait in the pending slot; the serving
+                        # version (content + chunks) stays until the new
+                        # ingest's fenced READY promotes it.
+                        existing.pending_content = content
+                        existing.pending_content_sha256 = content_sha256
                 existing.updated_at = datetime.now(UTC)
-                # Chunks are kept until the new (fenced) ingest replaces them,
-                # so the document stays searchable across a re-upload.
                 await session.commit()
                 await session.refresh(existing)
                 return _to_document(existing)
@@ -576,13 +574,14 @@ class SqlKnowledgeStore(KnowledgeStore):
             if params is not None
             else (DEFAULT_CHUNK_MAX_TOKENS, DEFAULT_CHUNK_OVERLAP_TOKENS)
         )
+        pending = row.pending_content is not None
         return ClaimedIngestion(
             tenant_id=tenant_id,
             document_id=row.id,
             kb_id=row.kb_id,
             filename=row.filename,
-            content=row.content,
-            content_sha256=row.content_sha256,
+            content=row.pending_content if pending else row.content,
+            content_sha256=row.pending_content_sha256 if pending else row.content_sha256,
             chunk_max_tokens=chunk_max,
             chunk_overlap_tokens=chunk_overlap,
             attempts=row.attempts,
@@ -610,7 +609,6 @@ class SqlKnowledgeStore(KnowledgeStore):
                         .values(
                             status=DocumentStatus.FAILED.value,
                             error=error,
-                            chunk_count=0,
                             claimed_at=None,
                             lease_until=None,
                             updated_at=datetime.now(UTC),
@@ -621,9 +619,41 @@ class SqlKnowledgeStore(KnowledgeStore):
                 .scalars()
                 .all()
             )
-            await _drop_chunks_of(session, failed_ids)
             await session.commit()
         return bool(failed_ids)
+
+    async def discard_pending(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> KnowledgeDocument | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(KnowledgeDocumentRow)
+                    .where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id == document_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if row.pending_content is None:
+                await session.commit()
+                return _to_document(row)
+            serving = row.chunk_count > 0
+            row.pending_content = None
+            row.pending_content_sha256 = None
+            row.status = (DocumentStatus.READY if serving else DocumentStatus.FAILED).value
+            row.error = None if serving else _DISCARDED_ERROR
+            row.ingest_generation = row.ingest_generation + 1
+            row.attempts = 0
+            row.claimed_at = None
+            row.lease_until = None
+            row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return _to_document(row)
 
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
         async with self._sf() as session:
@@ -642,7 +672,6 @@ class SqlKnowledgeStore(KnowledgeStore):
                         .values(
                             status=DocumentStatus.FAILED.value,
                             error=_EXHAUSTED_ERROR,
-                            chunk_count=0,
                             claimed_at=None,
                             lease_until=None,
                             updated_at=now,
@@ -653,7 +682,6 @@ class SqlKnowledgeStore(KnowledgeStore):
                 .scalars()
                 .all()
             )
-            await _drop_chunks_of(session, failed_ids)
             await session.commit()
         return len(failed_ids)
 
@@ -736,31 +764,29 @@ class SqlKnowledgeStore(KnowledgeStore):
         if status.value in _TERMINAL_STATUSES:
             values["claimed_at"] = None
             values["lease_until"] = None
-        if status is DocumentStatus.FAILED:
-            values["chunk_count"] = 0
-        async with self._sf() as session:
-            matched = (
-                (
-                    await session.execute(
-                        update(KnowledgeDocumentRow)
-                        .where(
-                            KnowledgeDocumentRow.tenant_id == tenant_id,
-                            KnowledgeDocumentRow.id == document_id,
-                            *_fence(generation),
-                        )
-                        .values(**values)
-                        .returning(KnowledgeDocumentRow.id)
-                    )
-                )
-                .scalars()
-                .all()
+        if status is DocumentStatus.READY and generation is not None:
+            # The new version is now serving: promote pending → content in
+            # the same (fenced) statement.
+            values["content"] = func.coalesce(
+                KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content
             )
-            if status is DocumentStatus.FAILED:
-                # A failed document is never searchable — drop whatever chunks
-                # the previous upload left behind, in the same transaction.
-                await _drop_chunks_of(session, matched)
+            values["content_sha256"] = func.coalesce(
+                KnowledgeDocumentRow.pending_content_sha256, KnowledgeDocumentRow.content_sha256
+            )
+            values["pending_content"] = None
+            values["pending_content_sha256"] = None
+        async with self._sf() as session:
+            result = await session.execute(
+                update(KnowledgeDocumentRow)
+                .where(
+                    KnowledgeDocumentRow.tenant_id == tenant_id,
+                    KnowledgeDocumentRow.id == document_id,
+                    *_fence(generation),
+                )
+                .values(**values)
+            )
             await session.commit()
-        return bool(matched)
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         async with self._sf() as session:

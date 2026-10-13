@@ -51,6 +51,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         # races are only meaningfully testable against real Postgres.
         self._content: dict[UUID, bytes | None] = {}
         self._sha256: dict[UUID, str | None] = {}
+        self._pending: dict[UUID, tuple[bytes, str | None]] = {}
         self._lease: dict[UUID, datetime | None] = {}
 
     # -- knowledge bases ----------------------------------------------------
@@ -235,22 +236,26 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 and self._sha256.get(existing.id) == content_sha256
             ):
                 return existing  # unchanged re-upload: nothing to do
+            # New bytes go to the pending slot; the serving version (content +
+            # chunks) stays until the new ingest's fenced READY promotes it.
+            if content is not None:
+                if self._content.get(existing.id) is None and existing.chunk_count == 0:
+                    self._content[existing.id] = content  # nothing serving yet
+                    self._sha256[existing.id] = content_sha256
+                else:
+                    self._pending[existing.id] = (content, content_sha256)
             reset = existing.model_copy(
                 update={
                     "status": DocumentStatus.PENDING,
                     "error": None,
-                    "chunk_count": 0,
                     "attempts": 0,
                     "ingest_generation": existing.ingest_generation + 1,
+                    "has_pending": existing.id in self._pending,
                     "updated_at": now,
                 }
             )
             self._documents[self._documents.index(existing)] = reset
-            # Chunks are kept until the new ingest replaces them (fenced).
             self._lease[existing.id] = None
-            if content is not None:
-                self._content[existing.id] = content
-                self._sha256[existing.id] = content_sha256
             return reset
         document = KnowledgeDocument(
             id=uuid4(),
@@ -327,13 +332,15 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         base = next((b for b in self._bases if b.id == doc.kb_id), None)
         chunk_max = base.chunk_max_tokens if base else DEFAULT_CHUNK_MAX_TOKENS
         chunk_overlap = base.chunk_overlap_tokens if base else DEFAULT_CHUNK_OVERLAP_TOKENS
+        pending = self._pending.get(doc.id)
+        content, sha = pending if pending is not None else (self._content.get(doc.id), None)
         return ClaimedIngestion(
             tenant_id=doc.tenant_id,
             document_id=doc.id,
             kb_id=doc.kb_id,
             filename=doc.filename,
-            content=self._content.get(doc.id),
-            content_sha256=None,
+            content=content,
+            content_sha256=sha,
             chunk_max_tokens=chunk_max,
             chunk_overlap_tokens=chunk_overlap,
             attempts=claimed.attempts,
@@ -355,6 +362,30 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             error=error,
             generation=generation,
         )
+
+    async def discard_pending(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> KnowledgeDocument | None:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None:
+            return None
+        if document_id not in self._pending:
+            return document
+        del self._pending[document_id]
+        serving = document.chunk_count > 0
+        restored = document.model_copy(
+            update={
+                "status": DocumentStatus.READY if serving else DocumentStatus.FAILED,
+                "error": None if serving else _DISCARDED_ERROR,
+                "has_pending": False,
+                "ingest_generation": document.ingest_generation + 1,
+                "attempts": 0,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self._documents[self._documents.index(document)] = restored
+        self._lease[document_id] = None
+        return restored
 
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
         swept = 0
@@ -422,11 +453,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             update["chunk_count"] = chunk_count
         if status in (DocumentStatus.READY, DocumentStatus.FAILED):
             self._lease[document_id] = None  # terminal → release lease
-        if status is DocumentStatus.FAILED:
-            # A failed document is never searchable — drop whatever chunks
-            # the previous upload left behind (mirrors the SQL store).
-            self._chunks = [c for c in self._chunks if c.document_id != document_id]
-            update["chunk_count"] = 0
+        if status is DocumentStatus.READY and generation is not None:
+            # The new version is now serving: promote pending → content.
+            pending = self._pending.pop(document_id, None)
+            if pending is not None:
+                self._content[document_id], self._sha256[document_id] = pending
+            update["has_pending"] = False
         self._documents[self._documents.index(document)] = document.model_copy(update=update)
         return True
 
@@ -560,6 +592,8 @@ def _created_key(record: KnowledgeBase | KnowledgeDocument) -> datetime:
 #: ``error`` written by :meth:`InMemoryKnowledgeStore.sweep_terminal` — same
 #: text as the SQL store so operators see one message.
 _EXHAUSTED_ERROR = "ingest attempts exhausted"
+#: ``error`` after discarding a pending upload when nothing was serving.
+_DISCARDED_ERROR = "pending upload discarded; nothing is serving"
 
 
 def _fence_matches(

@@ -251,3 +251,64 @@ async def test_rejected_upload_emits_no_audit_row(small_cap: Harness) -> None:
         "/v1/knowledge/bases/kb/documents", files={"file": ("big.md", b"x" * 2048, "text/markdown")}
     )
     assert [r[0] for r in await small_cap.audit_rows()] == ["knowledge:base_create"]
+
+
+# ---------------------------------------------------------------------------
+# 重传失败:上一版继续服务 / 丢弃新版 / 重试新版
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_reupload_keeps_previous_version_serving(harness: Harness) -> None:
+    await harness.client.post("/v1/knowledge/bases", json={"name": "kb"})
+    first = await harness.upload("kb", "h.md", _MD)
+    doc_id = UUID(str(first["id"]))
+    # A bad v2 (parses to nothing) → failed, but v1's chunks still serve.
+    bad = await harness.upload("kb", "h.md", b"   ")
+    assert bad["_status"] == 202
+    row = (await harness.client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert row["status"] == "failed"
+    assert row["has_pending"] is True
+    assert row["chunk_count"] >= 1
+    _, serving = await harness.store.list_chunks(tenant_id=_TENANT, document_id=doc_id)
+    assert serving >= 1
+    assert await harness.store.get_document_content(tenant_id=_TENANT, document_id=doc_id) == _MD
+
+    # Retry the pending v2 → still bad → still failed, still serving v1.
+    retried = await harness.client.post(f"/v1/knowledge/bases/kb/documents/{doc_id}/reingest")
+    assert retried.status_code == 202
+    await harness.runner.drain()
+    row = (await harness.client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert row["status"] == "failed" and row["has_pending"] is True
+
+    # Discard v2 → ready on v1.
+    discarded = await harness.client.post(
+        f"/v1/knowledge/bases/kb/documents/{doc_id}/discard-pending"
+    )
+    assert discarded.status_code == 200
+    assert discarded.json()["status"] == "ready"
+    assert discarded.json()["has_pending"] is False
+    again = await harness.client.post(f"/v1/knowledge/bases/kb/documents/{doc_id}/discard-pending")
+    assert again.status_code == 409
+    rows = await harness.audit_rows()
+    assert rows[-1][0] == "knowledge:document_discard_pending"
+    assert rows[-1][2] == str(doc_id)
+
+    # A good v2 later promotes: serving bytes become v2.
+    good = await harness.upload("kb", "h.md", _MD + b"\n\nMore.")
+    assert good["_status"] == 202
+    row = (await harness.client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert row["status"] == "ready" and row["has_pending"] is False
+    assert (
+        await harness.store.get_document_content(tenant_id=_TENANT, document_id=doc_id)
+        == _MD + b"\n\nMore."
+    )
+
+
+@pytest.mark.asyncio
+async def test_discard_pending_unknown_document_404(harness: Harness) -> None:
+    await harness.client.post("/v1/knowledge/bases", json={"name": "kb"})
+    response = await harness.client.post(
+        f"/v1/knowledge/bases/kb/documents/{UUID(int=1)}/discard-pending"
+    )
+    assert response.status_code == 404

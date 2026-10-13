@@ -127,6 +127,11 @@ class KnowledgeDocumentRow(Base):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     content_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: The new version being ingested (migration ``0164``). ``content`` keeps
+    #: the version whose chunks are serving; a successful ingest promotes the
+    #: pending bytes into it, a failed one leaves both untouched.
+    pending_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    pending_content_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

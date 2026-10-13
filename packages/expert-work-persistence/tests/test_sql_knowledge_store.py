@@ -93,7 +93,7 @@ async def test_document_upsert_resets_existing(sql_store: SqlStoreFixture) -> No
         reset = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
         assert reset.id == doc.id
         assert reset.status is DocumentStatus.PENDING
-        assert reset.chunk_count == 0
+        assert reset.chunk_count == 5  # the serving count stays until replaced
     finally:
         await engine.dispose()
 
@@ -932,7 +932,10 @@ async def test_fence_requires_processing_status_sql(sql_store: SqlStoreFixture) 
 
 
 @pytest.mark.asyncio
-async def test_failed_document_loses_chunks_sql(sql_store: SqlStoreFixture) -> None:
+async def test_pending_slot_failure_keeps_serving_and_ready_promotes_sql(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """重传进 pending;失败 → v1 原件 + 分段仍在服务;成功 → pending 提升为 content;可丢弃."""
     store, engine = sql_store
     try:
         tenant = uuid4()
@@ -948,9 +951,12 @@ async def test_failed_document_loses_chunks_sql(sql_store: SqlStoreFixture) -> N
         await store.set_document_status(
             tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=1
         )
-        await store.upsert_document(
+        # v2 → pending slot; v1 stays serving.
+        reset = await store.upsert_document(
             tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v2", content_sha256="s2"
         )
+        assert reset.has_pending and reset.chunk_count == 1
+        assert await store.get_document_content(tenant_id=tenant, document_id=doc.id) == b"v1"
         claim = await store.claim_document(
             tenant_id=tenant,
             document_id=doc.id,
@@ -959,14 +965,57 @@ async def test_failed_document_loses_chunks_sql(sql_store: SqlStoreFixture) -> N
             max_attempts=5,
         )
         assert claim is not None
+        assert claim.content == b"v2" and claim.content_sha256 == "s2"
+        # v2 fails: nothing moves, v1 still answers.
         assert await store.mark_document_failed_terminal(
             tenant_id=tenant, document_id=doc.id, error="parse failed", generation=claim.generation
         )
         fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
         assert fetched is not None
-        assert fetched.status is DocumentStatus.FAILED
-        assert fetched.chunk_count == 0
+        assert fetched.status is DocumentStatus.FAILED and fetched.has_pending
+        assert fetched.chunk_count == 1
         hits = await store.search(tenant_id=tenant, kb_ids=[base.id], query_embedding=_vec(1.0))
-        assert hits == []
+        assert [h.content for h in hits] == ["old"]
+        assert await store.get_document_content(tenant_id=tenant, document_id=doc.id) == b"v1"
+        # Discard v2 → back to READY on v1, generation bumped.
+        restored = await store.discard_pending(tenant_id=tenant, document_id=doc.id)
+        assert restored is not None
+        assert restored.status is DocumentStatus.READY and not restored.has_pending
+        assert restored.ingest_generation == claim.generation + 1
+        # Upload v2 again, ingest it successfully: READY promotes pending → content.
+        await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v2", content_sha256="s2"
+        )
+        claim2 = await store.claim_document(
+            tenant_id=tenant,
+            document_id=doc.id,
+            now=datetime.now(UTC),
+            lease_seconds=300,
+            max_attempts=5,
+        )
+        assert claim2 is not None and claim2.content == b"v2"
+        assert await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[_make_chunk(tenant, base.id, doc.id, 0, "new", _vec(1.0))],
+            generation=claim2.generation,
+        )
+        assert await store.set_document_status(
+            tenant_id=tenant,
+            document_id=doc.id,
+            status=DocumentStatus.READY,
+            chunk_count=1,
+            generation=claim2.generation,
+        )
+        promoted = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert promoted is not None
+        assert promoted.status is DocumentStatus.READY and not promoted.has_pending
+        assert await store.get_document_content(tenant_id=tenant, document_id=doc.id) == b"v2"
+        same = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"v2", content_sha256="s2"
+        )
+        assert same.status is DocumentStatus.READY  # v2 is the serving hash now
+        hits = await store.search(tenant_id=tenant, kb_ids=[base.id], query_embedding=_vec(1.0))
+        assert [h.content for h in hits] == ["new"]
     finally:
         await engine.dispose()

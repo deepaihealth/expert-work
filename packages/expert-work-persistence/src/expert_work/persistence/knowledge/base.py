@@ -59,6 +59,8 @@ class ClaimedIngestion:
     document_id: UUID
     kb_id: UUID
     filename: str
+    #: Bytes to ingest: the pending upload when there is one, else the
+    #: serving version (explicit re-ingest / crash recovery).
     content: bytes | None
     content_sha256: str | None
     chunk_max_tokens: int
@@ -216,15 +218,22 @@ class KnowledgeStore(abc.ABC):
         force: bool = False,
     ) -> KnowledgeDocument:
         """Create a document at ``PENDING``, or — if ``(kb_id, filename)``
-        already exists — reset it to ``PENDING`` (clearing ``error`` /
-        ``chunk_count`` and the durability lease + ``attempts``, bumping
-        ``ingest_generation``) for re-ingestion. The existing chunks are
-        **kept** until the new ingest replaces them, so the document stays
-        searchable across a re-upload. ``content`` retains the original bytes
-        so the document can be re-driven after a crash / for re-ingest.
+        already exists — reset it to ``PENDING`` (clearing ``error`` and the
+        durability lease + ``attempts``, bumping ``ingest_generation``) for
+        re-ingestion.
+
+        Two byte slots: ``content`` holds the version whose chunks are
+        serving; a re-upload's bytes go to the **pending** slot. The serving
+        chunks and ``content`` are kept until the new ingest succeeds (its
+        fenced ``READY`` write promotes pending → content), so the document
+        stays searchable across a re-upload and a *failed* re-upload leaves
+        the previous version intact (retry with re-ingest, or drop it with
+        :meth:`discard_pending`). A brand-new document's bytes go straight to
+        ``content``. ``content=None`` (explicit re-ingest) keeps the slots as
+        they are and re-drives whichever is pending, else the serving one.
 
         Unchanged re-upload: when the existing document is ``READY`` and
-        ``content_sha256`` equals its stored hash, nothing is touched and the
+        ``content_sha256`` equals the serving hash, nothing is touched and the
         document is returned as is (status still ``READY`` — the caller's
         signal to skip ingestion). ``force=True`` (explicit re-ingest)
         resets regardless."""
@@ -287,6 +296,17 @@ class KnowledgeStore(abc.ABC):
         Returns whether a row was written."""
 
     @abc.abstractmethod
+    async def discard_pending(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> KnowledgeDocument | None:
+        """Drop the pending upload and go back to the serving version: clears
+        the pending slot and ``error``, bumps ``ingest_generation`` (an
+        in-flight ingest of the dropped version is fenced out) and sets the
+        status to ``READY`` when serving chunks exist, else ``FAILED`` with a
+        note. ``None`` when the document does not exist; the document
+        unchanged when nothing was pending."""
+
+    @abc.abstractmethod
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
         """Cross-tenant: every ``processing`` document that has used up
         ``max_attempts`` and whose lease has expired goes ``FAILED``
@@ -341,10 +361,10 @@ class KnowledgeStore(abc.ABC):
         ``generation`` — a worker from an earlier upload (or one whose claim
         was already settled) gets ``False`` and changes nothing.
 
-        A write that lands ``FAILED`` also deletes the document's chunks in
-        the same transaction: a failed document is never searchable (the
-        chunks of the previous upload are kept only while the new ingest is
-        in flight — see :meth:`upsert_document`)."""
+        A fenced write that lands ``READY`` promotes the pending bytes into
+        the serving slot (``content``) in the same statement. A write that
+        lands ``FAILED`` touches neither slot nor the chunks: whatever was
+        serving keeps serving (see :meth:`upsert_document`)."""
 
     @abc.abstractmethod
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:

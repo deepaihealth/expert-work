@@ -240,6 +240,7 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "error": document.error,
         "chunk_count": document.chunk_count,
         "attempts": document.attempts,
+        "has_pending": document.has_pending,
         "created_at": _iso(document.created_at),
         "updated_at": _iso(document.updated_at),
     }
@@ -681,21 +682,20 @@ def build_knowledge_router() -> APIRouter:
         if document is None or document.kb_id != base.id:
             raise HTTPException(status_code=404, detail="document not found")
         content = await store.get_document_content(tenant_id=tenant_id, document_id=document_id)
-        if content is None:
+        if content is None and not document.has_pending:
             # Legacy document predating retained bytes — cannot re-drive.
             raise HTTPException(
                 status_code=409,
                 detail="original file not retained; please re-upload this document",
             )
-        # Reset to pending (keeps the same bytes) and re-drive the fast path.
-        # ``force``: an explicit re-ingest must run even though the bytes are
-        # unchanged (that is the point of the button).
+        # Reset to pending without touching either byte slot and re-drive the
+        # fast path: the claim picks the pending upload if there is one (retry
+        # a failed new version), else the serving bytes. ``force``: an explicit
+        # re-ingest must run even though the bytes are unchanged.
         reset = await store.upsert_document(
             tenant_id=tenant_id,
             kb_id=base.id,
             filename=document.filename,
-            content=content,
-            content_sha256=hashlib.sha256(content).hexdigest(),
             force=True,
         )
         runner.submit(tenant_id=tenant_id, document_id=reset.id)
@@ -708,6 +708,40 @@ def build_knowledge_router() -> APIRouter:
             details={"kb": base.name, "filename": document.filename},
         )
         return JSONResponse(status_code=202, content=_document_dict(reset))
+
+    @router.post(
+        "/bases/{name}/documents/{document_id}/discard-pending",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
+    async def discard_pending(
+        name: str,
+        document_id: UUID,
+        request: Request,
+        store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> JSONResponse:
+        """Drop a pending (failed or in-flight) upload and keep serving the
+        previous version — the way back when a re-upload turned out bad."""
+        tenant_id: UUID = request.state.tenant_id
+        base = await _require_base(store, tenant_id, name)
+        document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None or document.kb_id != base.id:
+            raise HTTPException(status_code=404, detail="document not found")
+        if not document.has_pending:
+            raise HTTPException(status_code=409, detail="document has no pending upload")
+        restored = await store.discard_pending(tenant_id=tenant_id, document_id=document_id)
+        if restored is None:  # pragma: no cover - checked just above
+            raise HTTPException(status_code=404, detail="document not found")
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_DOCUMENT_DISCARD_PENDING,
+            resource_type="knowledge_document",
+            resource_id=str(document_id),
+            details={"kb": base.name, "filename": document.filename},
+        )
+        return JSONResponse(content=_document_dict(restored))
 
     @router.get(
         "/bases/{name}/documents/{document_id}/chunks",

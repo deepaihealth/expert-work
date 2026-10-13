@@ -325,7 +325,7 @@ async def test_upsert_existing_document_resets_and_keeps_chunks_until_replaced()
     reset = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.pdf")
     assert reset.id == doc.id  # same logical document
     assert reset.status is DocumentStatus.PENDING
-    assert reset.chunk_count == 0
+    assert reset.chunk_count == 3  # the serving version's count stays until replaced
     # L2-PR2:重传不再立刻删分段 —— 旧分段一直可检索,直到新分段整体替换。
     hits = await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,))
     assert [h.content for h in hits] == ["c"]
@@ -1149,8 +1149,36 @@ async def test_list_documents_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_document_loses_its_chunks() -> None:
-    """重传 v2 失败 → 文档 FAILED,v1 的旧分段一并删掉(failed 的文档不可检索)."""
+async def test_reupload_goes_to_pending_slot_and_failure_keeps_serving_version() -> None:
+    """重传 v2 进 pending 格子;v2 失败 → 文档 failed,但 v1 原件 + 分段都还在、仍可检索."""
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    reset = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2", content_sha256="sha-v2"
+    )
+    assert reset.has_pending
+    assert reset.chunk_count == 1  # serving count untouched
+    assert await store.get_document_content(tenant_id=tenant, document_id=doc_id) == b"v1"
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc_id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert claim is not None
+    assert claim.content == b"v2" and claim.content_sha256 == "sha-v2"  # ingests the pending one
+    assert await store.mark_document_failed_terminal(
+        tenant_id=tenant, document_id=doc_id, error="parse failed", generation=claim.generation
+    )
+    fetched = await store.get_document(tenant_id=tenant, document_id=doc_id)
+    assert fetched is not None
+    assert fetched.status is DocumentStatus.FAILED
+    assert fetched.has_pending
+    assert fetched.chunk_count == 1
+    assert await store.get_document_content(tenant_id=tenant, document_id=doc_id) == b"v1"
+    hits = await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,))
+    assert [h.content for h in hits] == ["old"]
+
+
+@pytest.mark.asyncio
+async def test_fenced_ready_promotes_pending_to_serving() -> None:
     store = InMemoryKnowledgeStore()
     tenant, kb_id, doc_id = await _ready_document(store)
     await store.upsert_document(
@@ -1160,18 +1188,108 @@ async def test_failed_document_loses_its_chunks() -> None:
         tenant_id=tenant, document_id=doc_id, now=_now(), lease_seconds=60, max_attempts=5
     )
     assert claim is not None
-    assert await store.mark_document_failed_terminal(
-        tenant_id=tenant, document_id=doc_id, error="parse failed", generation=claim.generation
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=doc_id,
+        chunks=[
+            _chunk(
+                tenant_id=tenant,
+                kb_id=kb_id,
+                document_id=doc_id,
+                index=0,
+                content="new",
+                embedding=(1.0,),
+            )
+        ],
+        generation=claim.generation,
+    )
+    assert await store.set_document_status(
+        tenant_id=tenant,
+        document_id=doc_id,
+        status=DocumentStatus.READY,
+        chunk_count=1,
+        generation=claim.generation,
     )
     fetched = await store.get_document(tenant_id=tenant, document_id=doc_id)
     assert fetched is not None
-    assert fetched.status is DocumentStatus.FAILED
-    assert fetched.chunk_count == 0
-    assert await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,)) == []
+    assert fetched.status is DocumentStatus.READY and not fetched.has_pending
+    assert await store.get_document_content(tenant_id=tenant, document_id=doc_id) == b"v2"
+    # Now v2 is the serving hash: re-uploading v2 is "unchanged".
+    same = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2", content_sha256="sha-v2"
+    )
+    assert same.status is DocumentStatus.READY
 
 
 @pytest.mark.asyncio
-async def test_sweep_terminal_drops_chunks_too() -> None:
+async def test_discard_pending_restores_serving_version() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2", content_sha256="sha-v2"
+    )
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc_id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert claim is not None
+    await store.mark_document_failed_terminal(
+        tenant_id=tenant, document_id=doc_id, error="bad", generation=claim.generation
+    )
+    restored = await store.discard_pending(tenant_id=tenant, document_id=doc_id)
+    assert restored is not None
+    assert restored.status is DocumentStatus.READY
+    assert restored.error is None and not restored.has_pending
+    assert restored.ingest_generation == claim.generation + 1  # in-flight v2 work is fenced out
+    assert await store.get_document_content(tenant_id=tenant, document_id=doc_id) == b"v1"
+    # Idempotent: nothing pending → document returned unchanged.
+    again = await store.discard_pending(tenant_id=tenant, document_id=doc_id)
+    assert again == restored
+    assert await store.discard_pending(tenant_id=uuid4(), document_id=doc_id) is None
+
+
+@pytest.mark.asyncio
+async def test_discard_pending_with_nothing_serving_stays_failed() -> None:
+    # First upload failed (no chunks), then a second upload also failed:
+    # discarding the second leaves a failed document, not a phantom READY.
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id = uuid4(), uuid4()
+    doc = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v1", content_sha256="s1"
+    )
+    await store.set_document_status(
+        tenant_id=tenant, document_id=doc.id, status=DocumentStatus.FAILED, error="bad v1"
+    )
+    reset = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2", content_sha256="s2"
+    )
+    assert reset.has_pending
+    await store.set_document_status(
+        tenant_id=tenant, document_id=doc.id, status=DocumentStatus.FAILED, error="bad v2"
+    )
+    restored = await store.discard_pending(tenant_id=tenant, document_id=doc.id)
+    assert restored is not None
+    assert restored.status is DocumentStatus.FAILED
+    assert restored.error == "pending upload discarded; nothing is serving"
+
+
+@pytest.mark.asyncio
+async def test_force_reingest_without_bytes_keeps_both_slots() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant, kb_id, doc_id = await _ready_document(store)
+    await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2", content_sha256="sha-v2"
+    )
+    reset = await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", force=True)
+    assert reset.has_pending  # retry the pending v2, serving v1 untouched
+    claim = await store.claim_document(
+        tenant_id=tenant, document_id=doc_id, now=_now(), lease_seconds=60, max_attempts=5
+    )
+    assert claim is not None and claim.content == b"v2"
+    assert await store.get_document_content(tenant_id=tenant, document_id=doc_id) == b"v1"
+
+
+@pytest.mark.asyncio
+async def test_sweep_terminal_keeps_serving_chunks() -> None:
     store = InMemoryKnowledgeStore()
     tenant, kb_id, doc_id = await _ready_document(store)
     await store.upsert_document(tenant_id=tenant, kb_id=kb_id, filename="d.md", content=b"v2")
@@ -1180,7 +1298,8 @@ async def test_sweep_terminal_drops_chunks_too() -> None:
             tenant_id=tenant, document_id=doc_id, now=_now(), lease_seconds=0, max_attempts=2
         )
     assert await store.sweep_terminal(now=_now(), max_attempts=2) == 1
-    assert await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,)) == []
+    hits = await store.search(tenant_id=tenant, kb_ids=[kb_id], query_embedding=(1.0,))
+    assert [h.content for h in hits] == ["old"]
 
 
 @pytest.mark.asyncio

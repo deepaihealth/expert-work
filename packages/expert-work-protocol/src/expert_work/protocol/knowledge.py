@@ -136,6 +136,10 @@ class KnowledgeDocument(BaseModel):
     #: it claimed and its write-backs are fenced on it, so a stale worker from
     #: a previous upload can never overwrite the chunks of a newer one.
     ingest_generation: int = Field(default=0, ge=0, description="re-ingest generation (fence)")
+    #: A newer upload is waiting in the pending slot (being ingested, or its
+    #: ingest failed). ``status == failed`` with ``chunk_count > 0`` and
+    #: ``has_pending`` means: the previous version is still serving.
+    has_pending: bool = Field(default=False, description="a newer upload is pending / failed")
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

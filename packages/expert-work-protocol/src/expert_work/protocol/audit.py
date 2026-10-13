@@ -256,6 +256,7 @@ class AuditAction(StrEnum):
     KNOWLEDGE_DOCUMENT_UPLOAD = "knowledge:document_upload"
     KNOWLEDGE_DOCUMENT_DELETE = "knowledge:document_delete"
     KNOWLEDGE_DOCUMENT_REINGEST = "knowledge:document_reingest"
+    KNOWLEDGE_DOCUMENT_DISCARD_PENDING = "knowledge:document_discard_pending"
     # triggers (Stream J.10 — Mini-ADR J-26 / J-42)
     TRIGGER_CREATE = "trigger:create"
     TRIGGER_UPDATE = "trigger:update"
