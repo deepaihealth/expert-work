@@ -149,14 +149,18 @@ class CachedEmbedder:
 _EMBED_ENV = ("EXPERT_WORK_EVAL_EMBED_API_KEY", "EXPERT_WORK_EVAL_EMBED_MODEL")
 
 
-def build_real_embedder(*, cache_db: Path | None = None, concurrency: int = 4) -> object:
+def build_real_embedder(
+    *, cache_db: Path | None = None, concurrency: int = 4, max_text_chars: int = 8000
+) -> object:
     """OpenAI-compatible embedder from ``EXPERT_WORK_EVAL_EMBED_*`` env.
 
     Required: ``EXPERT_WORK_EVAL_EMBED_API_KEY`` + ``EXPERT_WORK_EVAL_EMBED_MODEL``;
     optional ``EXPERT_WORK_EVAL_EMBED_BASE_URL`` (defaults to the orchestrator
     default endpoint). Imported lazily so the fake arm never pays the
     orchestrator import. With ``cache_db`` set the backend is wrapped in
-    :class:`CachedEmbedder` (multi-arm runs embed each corpus once).
+    :class:`CachedEmbedder` (multi-arm runs embed each corpus once);
+    ``max_text_chars`` is its truncation cap (the kb eval raises it so the
+    vendor reports over-long inputs instead of silently embedding a head).
     """
     missing = [name for name in _EMBED_ENV if not os.environ.get(name)]
     if missing:
@@ -176,4 +180,10 @@ def build_real_embedder(*, cache_db: Path | None = None, concurrency: int = 4) -
     backend = OpenAICompatibleEmbedder(client=client, model=model)
     if cache_db is None:
         return backend
-    return CachedEmbedder(backend, model_key=model, db_path=cache_db, concurrency=concurrency)
+    return CachedEmbedder(
+        backend,
+        model_key=model,
+        db_path=cache_db,
+        concurrency=concurrency,
+        max_text_chars=max_text_chars,
+    )

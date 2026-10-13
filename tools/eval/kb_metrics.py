@@ -1,0 +1,387 @@
+"""知识库检索评测指标(B-175 L1-T3):纯函数,不碰库、不碰网络。
+
+命中有两级:文档级 = ``filename == expected.document``;段级 = 同一文档 **且**
+``expected.anchor in content``。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
+哪些期望条目(:func:`document_coverage` / :func:`chunk_coverage`):
+
+* 每条期望只在最早命中它的那一名记一次,后面再命中(相邻段重叠都含锚)记空,
+  所以 nDCG 不会超过 1;
+* 一段同时含两条锚文本 → 两条期望同一名次一起记命中;
+* 文档级按**结果名次**切 k(前 k 条结果里出现了哪些期望文档),不按去重后的文档序列。
+
+在覆盖集上算的指标(``expected`` 非空的 case 才算;无答案 case 这些字段为 ``None``):
+
+* ``hit@k``:``match=any`` → 任一期望进前 k 即 1;``match=all`` → 全部期望进前 k 才 1;
+* ``coverage@k``:进前 k 的期望条目数 / 期望总数(两种 match 都报);
+* ``mrr@10``:首个相关结果名次的倒数;
+* ``ndcg@10``:``any`` → 理想序只有 1 条相关;``all`` → 理想序 = 全部期望依次在前 n 名;
+  同一名次覆盖两条期望时第二条按「下一名次」记(与连续两段命中等价),保证 ≤ 1。
+
+「拒答」只在给了阈值时有定义:结果为空,或每条结果都带分数且都低于阈值;``score is None``
+(只被关键词路召回)的结果会被工具原样返回给模型,算作「给出了结果」。阈值未设时
+``refused`` / 两个拒答率都是 ``None``;每条 case 的 ``best_score``(最佳向量分数)另存,
+便于离线扫阈值。
+"""
+
+from __future__ import annotations
+
+import math
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import asdict, dataclass
+from typing import Protocol
+
+#: 两个截断点;``mrr`` / ``ndcg`` 只算 @10。
+RECALL_KS: tuple[int, int] = (10, 20)
+RANK_K = 10
+MATCH_MODES = frozenset({"any", "all"})
+#: 聚合里的均值字段(对无答案 case 为 ``None``,聚合时跳过)。
+MEAN_FIELDS: tuple[tuple[str, str], ...] = (
+    ("doc_hit@10", "doc_hit_10"),
+    ("doc_hit@20", "doc_hit_20"),
+    ("doc_coverage@10", "doc_coverage_10"),
+    ("doc_coverage@20", "doc_coverage_20"),
+    ("chunk_hit@10", "chunk_hit_10"),
+    ("chunk_hit@20", "chunk_hit_20"),
+    ("chunk_coverage@10", "chunk_coverage_10"),
+    ("chunk_coverage@20", "chunk_coverage_20"),
+    ("mrr@10", "mrr_10"),
+    ("ndcg@10", "ndcg_10"),
+)
+
+#: 逐名次覆盖集:第 i 项 = 第 i+1 名结果首次覆盖到的期望条目索引。
+Coverage = Sequence[frozenset[int]]
+
+
+class ResultLike(Protocol):
+    """``orchestrator.tools.knowledge.RetrievedChunk`` 的结构镜像(只用到这三个字段)。"""
+
+    @property
+    def filename(self) -> str:
+        """Source document filename of the hit."""
+
+    @property
+    def content(self) -> str:
+        """Chunk text of the hit."""
+
+    @property
+    def score(self) -> float | None:
+        """Recall score (vector similarity when available)."""
+
+
+class ExpectedLike(Protocol):
+    """``kb_dataset.KbExpected`` 的结构镜像。"""
+
+    @property
+    def document(self) -> str:
+        """Expected document filename."""
+
+    @property
+    def anchor(self) -> str:
+        """Expected anchor text inside that document."""
+
+
+@dataclass(frozen=True)
+class CaseScore:
+    """一条 case 的打分;``answerable=False`` 时十个排名指标全为 ``None``。"""
+
+    answerable: bool
+    match: str
+    zero_hit: bool
+    refused: bool | None  # 阈值未设时 None
+    best_score: float | None  # 结果里最高的向量分数;空结果 / 全关键词路时 None
+    doc_hit_10: float | None
+    doc_hit_20: float | None
+    doc_coverage_10: float | None
+    doc_coverage_20: float | None
+    chunk_hit_10: float | None
+    chunk_hit_20: float | None
+    chunk_coverage_10: float | None
+    chunk_coverage_20: float | None
+    mrr_10: float | None
+    ndcg_10: float | None
+    doc_hit_ranks: tuple[int, ...]  # 1-based 结果名次,每个期望文档首次出现的那名
+    chunk_hit_ranks: tuple[int, ...]  # 1-based 结果名次,首次覆盖到某条期望的那些名
+
+    def metrics(self) -> dict[str, float | None]:
+        data = asdict(self)
+        return {label: data[field] for label, field in MEAN_FIELDS}
+
+
+# ---------------------------------------------------------------------------
+# 命中判定
+# ---------------------------------------------------------------------------
+
+
+def document_hits(results: Sequence[ResultLike], expected: Sequence[ExpectedLike]) -> list[bool]:
+    """逐名次:结果文件名是否等于某条期望的文档名。"""
+    docs = {e.document for e in expected}
+    return [r.filename in docs for r in results]
+
+
+def chunk_hits(results: Sequence[ResultLike], expected: Sequence[ExpectedLike]) -> list[bool]:
+    """逐名次:是否命中某条期望(同一文档 **且** 锚文本是内容的子串)。"""
+    return [bool(_matching_expected(r, expected)) for r in results]
+
+
+def document_coverage(
+    results: Sequence[ResultLike], expected: Sequence[ExpectedLike]
+) -> list[frozenset[int]]:
+    """逐名次首次覆盖到的**期望文档**索引(同一文档的多条期望合成一个,按首次出现顺序编号)。"""
+    docs: dict[str, int] = {}
+    for exp in expected:
+        docs.setdefault(exp.document, len(docs))
+    return _first_coverage(results, lambda r: [docs[r.filename]] if r.filename in docs else [])
+
+
+def chunk_coverage(
+    results: Sequence[ResultLike], expected: Sequence[ExpectedLike]
+) -> list[frozenset[int]]:
+    """逐名次首次覆盖到的期望条目索引;一段含两锚则两条一起记。"""
+    return _first_coverage(results, lambda r: _matching_expected(r, expected))
+
+
+def _matching_expected(result: ResultLike, expected: Sequence[ExpectedLike]) -> list[int]:
+    return [
+        index
+        for index, exp in enumerate(expected)
+        if exp.document == result.filename and exp.anchor in result.content
+    ]
+
+
+def _first_coverage(
+    results: Sequence[ResultLike], matcher: Callable[[ResultLike], Iterable[int]]
+) -> list[frozenset[int]]:
+    seen: set[int] = set()
+    out: list[frozenset[int]] = []
+    for result in results:
+        new = frozenset(j for j in matcher(result) if j not in seen)
+        seen |= new
+        out.append(new)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 覆盖集上的排名指标
+# ---------------------------------------------------------------------------
+
+
+def _covered_within(coverage: Coverage, k: int) -> set[int]:
+    return set().union(*coverage[:k]) if k > 0 else set()
+
+
+def hit_at_k(coverage: Coverage, *, n_expected: int, k: int, match: str) -> float:
+    """``any``:前 k 名覆盖到任一期望;``all``:前 k 名覆盖到全部期望。"""
+    _check_match(match)
+    covered = _covered_within(coverage, k)
+    hit = len(covered) == n_expected if match == "all" else bool(covered)
+    return 1.0 if hit else 0.0
+
+
+def coverage_at_k(coverage: Coverage, *, n_expected: int, k: int) -> float:
+    """前 k 名覆盖到的期望条目数 / 期望总数。"""
+    if n_expected <= 0:
+        return 0.0
+    return len(_covered_within(coverage, k)) / n_expected
+
+
+def mrr_at_k(coverage: Coverage, *, k: int) -> float:
+    for rank, covered in enumerate(coverage[:k], start=1):
+        if covered:
+            return 1.0 / rank
+    return 0.0
+
+
+def ndcg_at_k(coverage: Coverage, *, n_expected: int, k: int, match: str) -> float:
+    """二元增益 nDCG。``any`` 只给首个相关记分、理想序 1 条;``all`` 每条期望按首次覆盖名次记分、
+    理想序 ``n_expected`` 条;同一名次覆盖多条时后面的按「下一名次」记,所以永远 ≤ 1。"""
+    _check_match(match)
+    positions = _hit_positions(coverage, first_only=match == "any")
+    ideal_n = 1 if match == "any" else n_expected
+    idcg = sum(_discount(p) for p in range(1, min(k, ideal_n) + 1))
+    if idcg == 0.0:
+        return 0.0
+    dcg = sum(_discount(p) for p in positions if p <= k)
+    return dcg / idcg
+
+
+def _hit_positions(coverage: Coverage, *, first_only: bool) -> list[int]:
+    positions: list[int] = []
+    for rank, covered in enumerate(coverage, start=1):
+        for _ in covered:
+            positions.append(rank if not positions else max(rank, positions[-1] + 1))
+            if first_only:
+                return positions
+    return positions
+
+
+def _discount(position: int) -> float:
+    return 1.0 / math.log2(position + 1.0)
+
+
+def _check_match(match: str) -> None:
+    if match not in MATCH_MODES:
+        raise ValueError(f"match must be one of {sorted(MATCH_MODES)}, got {match!r}")
+
+
+# ---------------------------------------------------------------------------
+# 拒答判定 / 最佳分数
+# ---------------------------------------------------------------------------
+
+
+def is_refused(results: Sequence[ResultLike], *, threshold: float | None) -> bool | None:
+    """阈值未设 → ``None``;空结果 = 拒答;每条都有分数且都低于阈值 = 拒答;其余算给出了结果。"""
+    if threshold is None:
+        return None
+    if not results:
+        return True
+    return all(r.score is not None and r.score < threshold for r in results)
+
+
+def best_score(results: Sequence[ResultLike]) -> float | None:
+    """结果里最高的向量分数(关键词路 ``None`` 不算);没有带分数的结果时 ``None``。"""
+    scores = [r.score for r in results if r.score is not None]
+    return max(scores) if scores else None
+
+
+# ---------------------------------------------------------------------------
+# 单 case 打分
+# ---------------------------------------------------------------------------
+
+
+def score_case(
+    results: Sequence[ResultLike],
+    expected: Sequence[ExpectedLike],
+    *,
+    threshold: float | None,
+    match: str = "any",
+) -> CaseScore:
+    _check_match(match)
+    refused = is_refused(results, threshold=threshold)
+    zero_hit = not results
+    best = best_score(results)
+    if not expected:
+        return CaseScore(
+            answerable=False,
+            match=match,
+            zero_hit=zero_hit,
+            refused=refused,
+            best_score=best,
+            doc_hit_10=None,
+            doc_hit_20=None,
+            doc_coverage_10=None,
+            doc_coverage_20=None,
+            chunk_hit_10=None,
+            chunk_hit_20=None,
+            chunk_coverage_10=None,
+            chunk_coverage_20=None,
+            mrr_10=None,
+            ndcg_10=None,
+            doc_hit_ranks=(),
+            chunk_hit_ranks=(),
+        )
+    doc_cov = document_coverage(results, expected)
+    n_docs = len({e.document for e in expected})
+    chunk_cov = chunk_coverage(results, expected)
+    n_exp = len(expected)
+    k10, k20 = RECALL_KS
+    return CaseScore(
+        answerable=True,
+        match=match,
+        zero_hit=zero_hit,
+        refused=refused,
+        best_score=best,
+        doc_hit_10=hit_at_k(doc_cov, n_expected=n_docs, k=k10, match=match),
+        doc_hit_20=hit_at_k(doc_cov, n_expected=n_docs, k=k20, match=match),
+        doc_coverage_10=coverage_at_k(doc_cov, n_expected=n_docs, k=k10),
+        doc_coverage_20=coverage_at_k(doc_cov, n_expected=n_docs, k=k20),
+        chunk_hit_10=hit_at_k(chunk_cov, n_expected=n_exp, k=k10, match=match),
+        chunk_hit_20=hit_at_k(chunk_cov, n_expected=n_exp, k=k20, match=match),
+        chunk_coverage_10=coverage_at_k(chunk_cov, n_expected=n_exp, k=k10),
+        chunk_coverage_20=coverage_at_k(chunk_cov, n_expected=n_exp, k=k20),
+        mrr_10=mrr_at_k(chunk_cov, k=RANK_K),
+        ndcg_10=ndcg_at_k(chunk_cov, n_expected=n_exp, k=RANK_K, match=match),
+        doc_hit_ranks=tuple(i + 1 for i, covered in enumerate(doc_cov) if covered),
+        chunk_hit_ranks=tuple(i + 1 for i, covered in enumerate(chunk_cov) if covered),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 比率与聚合
+# ---------------------------------------------------------------------------
+
+
+def zero_hit_rate(scores: Sequence[CaseScore]) -> float:
+    """返回为空的 case 占比(全部 case,含无答案的)。"""
+    if not scores:
+        return 0.0
+    return sum(1 for s in scores if s.zero_hit) / len(scores)
+
+
+def no_answer_refusal_rate(scores: Sequence[CaseScore]) -> float | None:
+    """无答案 case 里被判拒答的占比;没有无答案 case 或阈值未设(``refused is None``)时 ``None``。"""
+    rows = [s.refused for s in scores if not s.answerable and s.refused is not None]
+    if not rows:
+        return None
+    return sum(1 for r in rows if r) / len(rows)
+
+
+def false_refusal_rate(scores: Sequence[CaseScore]) -> float | None:
+    """有答案 case 里被判拒答的占比;没有有答案 case 或阈值未设时 ``None``。"""
+    rows = [s.refused for s in scores if s.answerable and s.refused is not None]
+    if not rows:
+        return None
+    return sum(1 for r in rows if r) / len(rows)
+
+
+def aggregate(scores: Sequence[CaseScore]) -> dict[str, float | int | None]:
+    """一组 case 的汇总:计数、十个排名指标的均值(只算有答案的)、三个比率。"""
+    answerable = [s for s in scores if s.answerable]
+    out: dict[str, float | int | None] = {
+        "n": len(scores),
+        "n_answerable": len(answerable),
+        "n_no_answer": len(scores) - len(answerable),
+    }
+    for label, field in MEAN_FIELDS:
+        values = [v for s in answerable if (v := getattr(s, field)) is not None]
+        out[label] = sum(values) / len(values) if values else None
+    out["zero_hit_rate"] = zero_hit_rate(scores)
+    out["no_answer_refusal_rate"] = no_answer_refusal_rate(scores)
+    out["false_refusal_rate"] = false_refusal_rate(scores)
+    return out
+
+
+def grouped(pairs: Iterable[tuple[str, CaseScore]]) -> dict[str, dict[str, float | int | None]]:
+    """``(分组键, 打分)`` 对 → 每个键一份 :func:`aggregate`,键按字典序。"""
+    buckets: dict[str, list[CaseScore]] = defaultdict(list)
+    for key, score in pairs:
+        buckets[key].append(score)
+    return {key: aggregate(buckets[key]) for key in sorted(buckets)}
+
+
+__all__ = [
+    "MATCH_MODES",
+    "MEAN_FIELDS",
+    "RANK_K",
+    "RECALL_KS",
+    "CaseScore",
+    "Coverage",
+    "ExpectedLike",
+    "ResultLike",
+    "aggregate",
+    "best_score",
+    "chunk_coverage",
+    "chunk_hits",
+    "coverage_at_k",
+    "document_coverage",
+    "document_hits",
+    "false_refusal_rate",
+    "grouped",
+    "hit_at_k",
+    "is_refused",
+    "mrr_at_k",
+    "ndcg_at_k",
+    "no_answer_refusal_rate",
+    "score_case",
+    "zero_hit_rate",
+]

@@ -165,6 +165,9 @@ def classify(path: Path, *, top: str, cfg: InventoryConfig) -> tuple[str, PdfSta
     stats = PdfStats()
     if ext in EXCLUDE_EXT or name in cfg.exclude_names or name in EXCLUDE_BASENAMES:
         tier = "X"
+    elif path.stat().st_size == 0:
+        tier = "X"  # a 0-byte file has nothing to parse; keep it out of the corpus tiers
+        stats = PdfStats(error="EmptyFile")
     elif cfg.chat_dir is not None and top == cfg.chat_dir:
         tier = "Q"
     elif ext == ".zip":
