@@ -4,13 +4,21 @@
 一次跑 = 建库 + 打分:
 
 1. 读评测集(``kb_dataset.load_dataset``)与语料清单(``kb_corpus_inventory.py`` 产出的
-   ``manifest.csv``);按 ``--tiers`` 选行,同一 ``dup_group`` 只入第一份;
-2. 单库,库名 = 评测集 ``name``;每份文档 ``upsert_document(content=None)`` →
-   ``control_plane.knowledge.ingestion.ingest_document_bytes``(解析 → 语义切块 → 嵌入 → 落段)→
-   ``set_document_status(READY, chunk_count)``;解析失败记进 ``ingest_failures``,不中断;
-3. 每条 case 调 ``KnowledgeRetriever.search(limit=top_k)``,按 ``kb_metrics`` 打分;
-   总体 / 按 ``source`` / 按 ``tag`` 各出一份汇总;结果 JSONL 每 case 一行 + 末尾一行汇总;
-   ``--update-baseline`` 把汇总与指纹并进基线 YAML(复用 ``longmem.runner.update_baseline``)。
+   ``manifest.csv``);按 ``--tiers`` 选行,同一 ``dup_group`` 只入第一份,``--limit-docs``
+   在去重之后截头;
+2. 单库,库名 = 评测集 ``name``;每份文档 ``upsert_document(content=None)`` → 解析在**进程池**
+   里跑(PyMuPDF 非线程安全;每份有 ``--parse-timeout``)→
+   ``control_plane.knowledge.ingestion.ingest_markdown``(语义切块 → 嵌入 → 落段,与上传后的
+   入库链路同一段代码)→ ``set_document_status(READY, chunk_count)``;失败按阶段
+   ``parse|embed|store|other`` 记进 ``ingest_failures``,文档标 FAILED,不中断;同名不同内容的
+   文件只入第一份,其余带路径记进 ``name_collisions``;
+3. 入库后核「锚文本存活」:每条 expected 的 anchor 至少出现在其文档的某一段里,不存活的 case
+   单列(是数据集 / 切块的问题,不是检索的问题);
+4. 每条 case 调 ``KnowledgeRetriever.search(limit=top_k)``,按 ``kb_metrics`` 打分(``match``
+   取 case 自己的 any|all);总体 / 按 ``source`` / 按 ``tag`` 各出一份汇总;结果 JSONL 每 case
+   一行(含 ``best_score`` 便于离线扫阈值)+ 末尾一行汇总;``--update-baseline`` 把汇总与指纹
+   并进基线 YAML(复用 ``longmem.runner.update_baseline``);**有任何失败 / 同名冲突时拒绝
+   更新基线**(退出码非 0)。
 
 用法(仓库根目录)::
 
@@ -26,7 +34,8 @@
 凭据只从环境变量读(``EXPERT_WORK_EVAL_EMBED_API_KEY`` / ``_MODEL`` / ``_BASE_URL``;
 ``--rerank on`` 另要 ``EXPERT_WORK_EVAL_LLM_API_KEY`` / ``_MODEL`` / ``_BASE_URL``),没有命令行开关。
 真嵌入包在 ``longmem.embedders.CachedEmbedder`` 里(``eval-out/kb/embed_cache.sqlite``),
-第二次跑近零费用。
+第二次跑近零费用;这里不截断输入(上限设到 1M 字符,超长文本让嵌入 API 自己报错),
+汇总里报送入嵌入器的文本数 / 超过 8000 字符的条数 / token 数与估算费用(假嵌入报 0)。
 
 **测试覆盖的只有内存库 + 假嵌入 + ``tmp_path`` 小语料那条路**(``test_kb_eval.py``);
 ``--store sql`` 与 ``--embedder real`` 在仓库外手工跑,CI 不碰真语料、不建容器、不调嵌入 API。
@@ -43,9 +52,10 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from concurrent.futures import Executor, ProcessPoolExecutor
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -70,11 +80,15 @@ from longmem.embedders import (  # type: ignore[import-not-found]
 )
 from longmem.runner import update_baseline  # type: ignore[import-not-found]
 
-from control_plane.knowledge.ingestion import ingest_document_bytes
+from control_plane.knowledge.chunking import count_tokens
+from control_plane.knowledge.ingestion import ingest_markdown
+from control_plane.knowledge.parsing import parse_document
 from expert_work.persistence import InMemoryKnowledgeStore, KnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
+from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import DocumentStatus, RetrievalMethod
 from orchestrator.llm import Embedder, LLMCaller
+from orchestrator.llm.embedder import QWEN_EMBEDDING_BASE_URL
 from orchestrator.tools.knowledge import KnowledgeRetriever, Reranker, RetrievedChunk
 
 _EVAL_DIR = Path(__file__).resolve().parent
@@ -85,14 +99,29 @@ EVAL_TENANT_ID = uuid5(NAMESPACE_URL, "expert-work-eval://kb/tenant")
 DEFAULT_TIERS: tuple[str, ...] = ("A", "D-A")
 DEFAULT_TOP_K = 20
 DEFAULT_CONCURRENCY = 4
+#: 单份文档解析超时(秒)。超时记 parse 失败;进程池里那个 worker 会继续占着直到解析完。
+DEFAULT_PARSE_TIMEOUT_S = 120.0
 #: 与根 ``conftest.py`` 的 ``postgres_container`` 同一镜像(GHCR 镜像站,CI 卫兵只放行这个源)。
 PGVECTOR_IMAGE = "ghcr.io/deepaihealth/mirror/pgvector:pg16"
 ALEMBIC_INI = _REPO_ROOT / "packages" / "expert-work-persistence" / "alembic.ini"
 EVAL_OUT_DIR = Path("eval-out") / "kb"
 EMBED_CACHE_DB = EVAL_OUT_DIR / "embed_cache.sqlite"
+#: 不让 ``CachedEmbedder`` 截断输入:超长文本由真嵌入 API 报错,这边只计数。
+EMBED_MAX_TEXT_CHARS = 1_000_000
+#: 「超长」计数线 = ``CachedEmbedder`` 原来的截断线(DashScope 单条 8192 token)。
+EMBED_OVERLONG_CHARS = 8000
+#: 真嵌入估算费用的单价(元 / 千 token);默认按 DashScope text-embedding-v4 价目,
+#: 换模型用环境变量覆盖。
+EMBED_PRICE_ENV = "EXPERT_WORK_EVAL_EMBED_PRICE_CNY_PER_1K"
+DEFAULT_EMBED_PRICE_CNY_PER_1K = 0.0005
 #: 失败文档 ``error`` 字段截断长度(与入库 runner 的 ``_ERROR_CAP`` 同口径)。
 _ERROR_CAP = 500
 _RERANK_ENV = ("EXPERT_WORK_EVAL_LLM_API_KEY", "EXPERT_WORK_EVAL_LLM_MODEL")
+#: 失败阶段。``store`` 按异常所属模块判(数据库驱动 / 持久化层),``other`` 是剩下的(读文件等)。
+FAILURE_STAGES: tuple[str, ...] = ("parse", "embed", "store", "other")
+_STORE_EXC_MODULES = ("sqlalchemy", "asyncpg", "psycopg", "expert_work.persistence")
+#: ``list_chunks`` 翻页大小(锚文本存活检查)。
+_CHUNK_PAGE = 200
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +144,32 @@ class CorpusSelection:
     rows: tuple[Mapping[str, str], ...]
     skipped_dup: int
     skipped_tier: int
+    skipped_limit: int
 
 
 @dataclass(frozen=True)
 class IngestFailure:
     filename: str
+    path: str
+    stage: str  # FAILURE_STAGES 之一
     error_type: str
+    error: str
+
+
+@dataclass(frozen=True)
+class NameCollision:
+    filename: str
+    path: str
+    kept_path: str
+
+
+@dataclass(frozen=True)
+class EmbedStats:
+    texts: int
+    chars: int
+    overlong: int  # 超过 EMBED_OVERLONG_CHARS 的条数
+    tokens: int  # 只有真嵌入计;含缓存命中(按送入嵌入器的文本算)
+    cost_cny: float
 
 
 @dataclass(frozen=True)
@@ -128,10 +177,33 @@ class CorpusReport:
     base_id: UUID
     docs_ingested: int
     docs_skipped_dup: int
+    docs_skipped_limit: int
+    docs_name_collision: int
     docs_failed: int
+    failed_by_stage: dict[str, int]
     chunk_total: int
     elapsed_s: float
     ingest_failures: tuple[IngestFailure, ...]
+    name_collisions: tuple[NameCollision, ...]
+    embed: EmbedStats | None
+
+
+@dataclass(frozen=True)
+class DeadAnchor:
+    case_id: str
+    document: str
+    reason: str  # document_missing | anchor_not_in_any_chunk
+
+
+@dataclass(frozen=True)
+class AnchorReport:
+    checked: int  # 核过的 expected 条数
+    alive_cases: frozenset[str]  # 全部 expected 都存活的 case
+    dead: tuple[DeadAnchor, ...]
+
+    @property
+    def dead_cases(self) -> frozenset[str]:
+        return frozenset(d.case_id for d in self.dead)
 
 
 @dataclass(frozen=True)
@@ -149,6 +221,16 @@ class CaseRow:
     tags: tuple[str, ...]
     results: tuple[ResultRow, ...]
     score: CaseScore
+    match: str = "any"
+    anchors_alive: bool | None = None  # 无答案 case 为 None
+
+
+class EmbeddingDimensionError(RuntimeError):
+    """嵌入器返回的维度与库的向量列不一致 —— 配置错,整轮退出。"""
+
+
+class EmbedStageError(RuntimeError):
+    """嵌入器抛出的任何异常都包成它,让建库那边把失败归到 ``embed`` 阶段。"""
 
 
 class FakeKbEmbedder(KeywordEmbedder):  # type: ignore[misc]
@@ -166,6 +248,60 @@ def build_fake_embedder() -> FakeKbEmbedder:
     return FakeKbEmbedder()
 
 
+class CountingEmbedder:
+    """包在任何嵌入器外面:校维度、计数、把嵌入失败归到 ``embed`` 阶段。
+
+    计数是进程内累计(文本数 / 字符数 / 超长条数 / token / 费用),``stats()`` 取快照。
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        expected_dim: int,
+        count_tokens: bool = False,
+        price_cny_per_1k_tokens: float = 0.0,
+        overlong_chars: int = EMBED_OVERLONG_CHARS,
+    ) -> None:
+        self._inner = inner
+        self._expected_dim = expected_dim
+        self._count_tokens = count_tokens
+        self._price = price_cny_per_1k_tokens
+        self._overlong_chars = overlong_chars
+        self._texts = 0
+        self._chars = 0
+        self._overlong = 0
+        self._tokens = 0
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        try:
+            vectors = await self._inner.embed(texts, tenant_id=tenant_id)
+        except Exception as exc:
+            raise EmbedStageError(f"{type(exc).__name__}: {exc}") from exc
+        for vector in vectors:
+            if len(vector) != self._expected_dim:
+                raise EmbeddingDimensionError(
+                    f"embedder returned {len(vector)} dims but the store's vector column is "
+                    f"{self._expected_dim} (EXPERT_WORK_EMBEDDING_DIM) — pick a matching model "
+                    "or re-create the store with the model's dimension"
+                )
+        self._texts += len(texts)
+        self._chars += sum(len(t) for t in texts)
+        self._overlong += sum(1 for t in texts if len(t) > self._overlong_chars)
+        if self._count_tokens:
+            self._tokens += sum(count_tokens(t) for t in texts)
+        return cast(list[tuple[float, ...]], vectors)
+
+    def stats(self) -> EmbedStats:
+        return EmbedStats(
+            texts=self._texts,
+            chars=self._chars,
+            overlong=self._overlong,
+            tokens=self._tokens,
+            cost_cny=round(self._tokens / 1000 * self._price, 6),
+        )
+
+
 # ---------------------------------------------------------------------------
 # 选文档
 # ---------------------------------------------------------------------------
@@ -179,7 +315,7 @@ def read_manifest(path: Path) -> list[dict[str, str]]:
 def select_rows(
     rows: Sequence[Mapping[str, str]], *, tiers: Sequence[str], limit_docs: int
 ) -> CorpusSelection:
-    """按层过滤 → 同 ``dup_group`` 只留第一份 → ``limit_docs`` 截头(0 = 不限)。"""
+    """按层过滤 → 同 ``dup_group`` 只留第一份 → ``limit_docs`` 截头(0 = 不限;在去重之后数)。"""
     wanted = set(tiers)
     in_tier = [r for r in rows if r.get("tier") in wanted]
     seen_groups: set[str] = set()
@@ -193,16 +329,36 @@ def select_rows(
         if group:
             seen_groups.add(group)
         kept.append(row)
+    skipped_limit = 0
     if limit_docs > 0:
+        skipped_limit = max(0, len(kept) - limit_docs)
         kept = kept[:limit_docs]
     return CorpusSelection(
-        rows=tuple(kept), skipped_dup=skipped_dup, skipped_tier=len(rows) - len(in_tier)
+        rows=tuple(kept),
+        skipped_dup=skipped_dup,
+        skipped_tier=len(rows) - len(in_tier),
+        skipped_limit=skipped_limit,
     )
 
 
 # ---------------------------------------------------------------------------
 # 建库
 # ---------------------------------------------------------------------------
+
+
+def _basename(path: str) -> str:
+    return path.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def classify_failure(exc: BaseException) -> tuple[str, str]:
+    """``(阶段, 异常类型名)``。``EmbedStageError`` 解包出原始异常类型。"""
+    if isinstance(exc, EmbedStageError):
+        cause = exc.__cause__
+        return "embed", type(cause).__name__ if cause is not None else "EmbedStageError"
+    module = type(exc).__module__ or ""
+    if module.startswith(_STORE_EXC_MODULES):
+        return "store", type(exc).__name__
+    return "other", type(exc).__name__
 
 
 async def build_corpus(
@@ -214,75 +370,216 @@ async def build_corpus(
     corpus_root: Path,
     selection: CorpusSelection,
     concurrency: int,
+    executor: Executor | None = None,
+    parser: Callable[[str, bytes], str] = parse_document,
+    parse_timeout_s: float = DEFAULT_PARSE_TIMEOUT_S,
 ) -> CorpusReport:
     """一次性建单库并把 ``selection`` 里的文档全部走真实入库链路。
 
+    解析在 ``executor`` 里跑(默认进程池,``min(concurrency, CPU)`` 个 worker),每份
+    ``parse_timeout_s`` 秒超时;解析完的 Markdown 直接进 ``ingest_markdown``(切块 → 嵌入 → 落段)。
     同名文件(不同目录、同 basename、又不是同一 ``dup_group``)只入第一份:库内
-    ``(kb_id, filename)`` 唯一,再 upsert 会把前一份重置并删段;这种情况记作
-    ``DuplicateFilename`` 失败,让人去看清单。
+    ``(kb_id, filename)`` 唯一,再 upsert 会把前一份重置并删段;后到的记进 ``name_collisions``。
+    ``EmbeddingDimensionError`` 不按文档失败记,直接抛出 —— 那是配置错。
     """
     started = time.monotonic()
     base = await store.create_base(tenant_id=tenant_id, name=base_name, rerank_enabled=False)
     sem = asyncio.Semaphore(max(1, concurrency))
-    claimed: set[str] = set()
+    claimed: dict[str, str] = {}
+    collisions: list[NameCollision] = []
     total = len(selection.rows)
+    loop = asyncio.get_running_loop()
 
-    async def _one(index: int, row: Mapping[str, str]) -> tuple[int, IngestFailure | None]:
-        filename = row["path"].replace("\\", "/").rsplit("/", 1)[-1]
+    async def _parse(pool: Executor, filename: str, raw: bytes) -> str:
+        future = loop.run_in_executor(pool, parser, filename, raw)
+        return await asyncio.wait_for(future, timeout=parse_timeout_s)
+
+    async def _ingest(pool: Executor, doc_id: UUID, filename: str, path: str) -> int:
+        raw = (corpus_root / path).read_bytes()
+        try:
+            markdown = await _parse(pool, filename, raw)
+            markdown.encode("utf-8")  # 孤立代理项在这里炸,算解析失败
+        except Exception as exc:
+            raise _ParseStageError(exc) from exc
+        return await ingest_markdown(
+            store=store,
+            embedder=embedder,
+            tenant_id=tenant_id,
+            document_id=doc_id,
+            kb_id=base.id,
+            markdown=markdown,
+            chunk_max_tokens=base.chunk_max_tokens,
+            chunk_overlap_tokens=base.chunk_overlap_tokens,
+        )
+
+    async def _one(
+        pool: Executor, index: int, row: Mapping[str, str]
+    ) -> tuple[int, IngestFailure | None]:
+        path = row["path"]
+        filename = _basename(path)
         if filename in claimed:
+            collisions.append(
+                NameCollision(filename=filename, path=path, kept_path=claimed[filename])
+            )
             print(
-                f"[ingest {index}/{total}] {filename}: duplicate filename, skipped",
+                f"[ingest {index}/{total}] {path}: same filename as {claimed[filename]}, skipped",
                 file=sys.stderr,
             )
-            return 0, IngestFailure(filename=filename, error_type="DuplicateFilename")
-        claimed.add(filename)
+            return 0, None
+        claimed[filename] = path
         async with sem:
             doc = await store.upsert_document(
                 tenant_id=tenant_id, kb_id=base.id, filename=filename, content=None
             )
             try:
-                raw = (corpus_root / row["path"]).read_bytes()
-                count = await ingest_document_bytes(
-                    store=store,
-                    embedder=embedder,
-                    tenant_id=tenant_id,
-                    document_id=doc.id,
-                    kb_id=base.id,
-                    filename=filename,
-                    raw=raw,
-                    chunk_max_tokens=base.chunk_max_tokens,
-                    chunk_overlap_tokens=base.chunk_overlap_tokens,
-                )
-            except Exception as exc:  # 解析 / 嵌入失败只记账,整轮继续
-                error = f"{type(exc).__name__}: {exc}"[:_ERROR_CAP]
+                count = await _ingest(pool, doc.id, filename, path)
                 await store.set_document_status(
                     tenant_id=tenant_id,
                     document_id=doc.id,
-                    status=DocumentStatus.FAILED,
-                    error=error,
+                    status=DocumentStatus.READY,
+                    chunk_count=count,
                 )
-                print(f"[ingest {index}/{total}] {filename}: FAILED {error}", file=sys.stderr)
-                return 0, IngestFailure(filename=filename, error_type=type(exc).__name__)
-            await store.set_document_status(
-                tenant_id=tenant_id,
-                document_id=doc.id,
-                status=DocumentStatus.READY,
-                chunk_count=count,
-            )
+            except EmbeddingDimensionError:
+                raise
+            except Exception as exc:  # 解析 / 嵌入 / 落段失败只记账,整轮继续
+                stage, error_type = _stage_of(exc)
+                error = f"{error_type}: {exc.__cause__ or exc}"[:_ERROR_CAP]
+                await store.mark_document_failed_terminal(
+                    tenant_id=tenant_id, document_id=doc.id, error=error
+                )
+                print(
+                    f"[ingest {index}/{total}] {filename}: FAILED ({stage}) {error}",
+                    file=sys.stderr,
+                )
+                return 0, IngestFailure(
+                    filename=filename, path=path, stage=stage, error_type=error_type, error=error
+                )
             print(f"[ingest {index}/{total}] {filename}: {count} chunks", file=sys.stderr)
             return count, None
 
-    outcomes = await asyncio.gather(*(_one(i + 1, r) for i, r in enumerate(selection.rows)))
-    failures = tuple(f for _count, f in outcomes if f is not None)
+    async def _all(pool: Executor) -> list[tuple[int, IngestFailure | None] | BaseException]:
+        return await asyncio.gather(
+            *(_one(pool, i + 1, r) for i, r in enumerate(selection.rows)), return_exceptions=True
+        )
+
+    if executor is None:
+        workers = max(1, min(concurrency, os.cpu_count() or 1))
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            outcomes = await _all(pool)
+    else:
+        outcomes = await _all(executor)
+
+    counts: list[int] = []
+    failures: list[IngestFailure] = []
+    for row, outcome in zip(selection.rows, outcomes, strict=True):
+        if isinstance(outcome, EmbeddingDimensionError):
+            raise outcome
+        if isinstance(outcome, BaseException):  # _one 自己没兜住的(写状态失败等)
+            stage, error_type = classify_failure(outcome)
+            failures.append(
+                IngestFailure(
+                    filename=_basename(row["path"]),
+                    path=row["path"],
+                    stage=stage,
+                    error_type=error_type,
+                    error=f"{error_type}: {outcome}"[:_ERROR_CAP],
+                )
+            )
+            continue
+        count, failure = outcome
+        counts.append(count)
+        if failure is not None:
+            failures.append(failure)
+    by_stage: dict[str, int] = {}
+    for failure in failures:
+        by_stage[failure.stage] = by_stage.get(failure.stage, 0) + 1
     return CorpusReport(
         base_id=base.id,
-        docs_ingested=total - len(failures),
+        docs_ingested=total - len(failures) - len(collisions),
         docs_skipped_dup=selection.skipped_dup,
+        docs_skipped_limit=selection.skipped_limit,
+        docs_name_collision=len(collisions),
         docs_failed=len(failures),
-        chunk_total=sum(count for count, _f in outcomes),
+        failed_by_stage=by_stage,
+        chunk_total=sum(counts),
         elapsed_s=round(time.monotonic() - started, 3),
-        ingest_failures=failures,
+        ingest_failures=tuple(failures),
+        name_collisions=tuple(collisions),
+        embed=embedder.stats() if isinstance(embedder, CountingEmbedder) else None,
     )
+
+
+class _ParseStageError(Exception):
+    """解析阶段(进程池 / 超时 / 编码)的失败标记;``__cause__`` 是原始异常。"""
+
+
+def _stage_of(exc: BaseException) -> tuple[str, str]:
+    if isinstance(exc, _ParseStageError):
+        cause = exc.__cause__
+        return "parse", type(cause).__name__ if cause is not None else "ParseStageError"
+    return classify_failure(exc)
+
+
+# ---------------------------------------------------------------------------
+# 锚文本存活
+# ---------------------------------------------------------------------------
+
+
+async def check_anchors(
+    *, store: KnowledgeStore, tenant_id: UUID, kb_id: UUID, dataset: KbDataset
+) -> AnchorReport:
+    """每条 expected 的 anchor 要能在其文档的**某一段**里 ``in`` 到;否则检索再好也命不中段级。
+
+    两种不存活分开报:``document_missing``(文档没入库 / 不在清单)与
+    ``anchor_not_in_any_chunk``(切块把锚文本切断了,或评测集抄错)。
+    """
+    docs = {
+        d.filename: d
+        for d in await store.list_documents(tenant_id=tenant_id, kb_id=kb_id)
+        if d.status is DocumentStatus.READY
+    }
+    chunk_cache: dict[str, list[str]] = {}
+
+    async def _chunks(filename: str) -> list[str]:
+        if filename not in chunk_cache:
+            chunk_cache[filename] = await _all_chunk_texts(
+                store, tenant_id=tenant_id, document_id=docs[filename].id
+            )
+        return chunk_cache[filename]
+
+    checked = 0
+    dead: list[DeadAnchor] = []
+    alive: set[str] = set()
+    for case in dataset.cases:
+        if not case.expected:
+            continue
+        case_dead = False
+        for exp in case.expected:
+            checked += 1
+            if exp.document not in docs:
+                dead.append(DeadAnchor(case.id, exp.document, "document_missing"))
+                case_dead = True
+            elif not any(exp.anchor in text for text in await _chunks(exp.document)):
+                dead.append(DeadAnchor(case.id, exp.document, "anchor_not_in_any_chunk"))
+                case_dead = True
+        if not case_dead:
+            alive.add(case.id)
+    return AnchorReport(checked=checked, alive_cases=frozenset(alive), dead=tuple(dead))
+
+
+async def _all_chunk_texts(
+    store: KnowledgeStore, *, tenant_id: UUID, document_id: UUID
+) -> list[str]:
+    texts: list[str] = []
+    offset = 0
+    while True:
+        page, total = await store.list_chunks(
+            tenant_id=tenant_id, document_id=document_id, offset=offset, limit=_CHUNK_PAGE
+        )
+        texts.extend(c.content for c in page)
+        offset += len(page)
+        if not page or offset >= total:
+            return texts
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +608,7 @@ async def run_eval(
     tenant_id: UUID,
     cfg: EvalConfig,
     concurrency: int,
+    anchors: AnchorReport | None = None,
 ) -> list[CaseRow]:
     sem = asyncio.Semaphore(max(1, concurrency))
 
@@ -325,12 +623,17 @@ async def run_eval(
                 score_threshold=cfg.threshold,
                 rerank=cfg.rerank,
             )
+        alive: bool | None = None
+        if anchors is not None and case.expected:
+            alive = case.id in anchors.alive_cases
         return CaseRow(
             case_id=case.id,
             source=case.source,
             tags=case.tags,
             results=tuple(_result_row(r) for r in results),
-            score=score_case(results, case.expected, threshold=cfg.threshold),
+            score=score_case(results, case.expected, threshold=cfg.threshold, match=case.match),
+            match=case.match,
+            anchors_alive=alive,
         )
 
     return list(await asyncio.gather(*(_one(c) for c in dataset.cases)))
@@ -354,6 +657,7 @@ def summarise(
     rows: Sequence[CaseRow],
     *,
     corpus: CorpusReport | None,
+    anchors: AnchorReport | None = None,
     embedder: str = "unknown",
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -363,14 +667,41 @@ def summarise(
         corpus_block = asdict(corpus)
         corpus_block["base_id"] = str(corpus.base_id)
         corpus_block["ingest_failures"] = [asdict(f) for f in corpus.ingest_failures]
+        corpus_block["name_collisions"] = [asdict(c) for c in corpus.name_collisions]
         corpus_block["embedder"] = embedder
+    anchors_block: dict[str, Any] | None = None
+    if anchors is not None:
+        anchors_block = {
+            "checked": anchors.checked,
+            "dead_cases": len(anchors.dead_cases),
+            "dead": [asdict(d) for d in anchors.dead],
+        }
     return {
         "overall": aggregate(scores),
         "by_source": grouped((r.source, r.score) for r in rows),
-        "by_tag": grouped((tag, r.score) for r in rows for tag in r.tags),
+        # 同一 case 重复写的 tag 只算一次(dict.fromkeys 保序去重)。
+        "by_tag": grouped((tag, r.score) for r in rows for tag in dict.fromkeys(r.tags)),
         "corpus": corpus_block,
+        "anchors": anchors_block,
         "config": dict(config or {}),
     }
+
+
+#: 写进基线时剔掉的、每次跑都会变的字段(``(块, 键)``)。
+_BASELINE_VOLATILE: tuple[tuple[str, str], ...] = (
+    ("corpus", "base_id"),
+    ("corpus", "elapsed_s"),
+    ("config", "label"),
+)
+
+
+def baseline_section(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """基线里存的汇总 = ``summary`` 去掉会抖的字段。"""
+    section = {k: (dict(v) if isinstance(v, Mapping) else v) for k, v in summary.items()}
+    for block, key in _BASELINE_VOLATILE:
+        if isinstance(section.get(block), dict):
+            section[block].pop(key, None)
+    return section
 
 
 def case_to_json(row: CaseRow) -> dict[str, Any]:
@@ -378,9 +709,12 @@ def case_to_json(row: CaseRow) -> dict[str, Any]:
         "id": row.case_id,
         "source": row.source,
         "tags": list(row.tags),
+        "match": row.match,
         "answerable": row.score.answerable,
         "refused": row.score.refused,
         "zero_hit": row.score.zero_hit,
+        "best_score": row.score.best_score,
+        "anchors_alive": row.anchors_alive,
         "results": [asdict(r) for r in row.results],
         "hits": {
             "doc_ranks": list(row.score.doc_hit_ranks),
@@ -406,10 +740,12 @@ def write_jsonl(path: Path, rows: Sequence[CaseRow], summary: Mapping[str, Any])
 
 _TABLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("n", "n"),
-    ("doc_r@10", "doc_recall@10"),
-    ("doc_r@20", "doc_recall@20"),
-    ("chunk_r@10", "chunk_recall@10"),
-    ("chunk_r@20", "chunk_recall@20"),
+    ("doc_hit@10", "doc_hit@10"),
+    ("doc_hit@20", "doc_hit@20"),
+    ("doc_cov@20", "doc_coverage@20"),
+    ("chk_hit@10", "chunk_hit@10"),
+    ("chk_hit@20", "chunk_hit@20"),
+    ("chk_cov@20", "chunk_coverage@20"),
     ("mrr@10", "mrr@10"),
     ("ndcg@10", "ndcg@10"),
     ("zero_hit", "zero_hit_rate"),
@@ -439,8 +775,23 @@ def format_summary_table(summary: Mapping[str, Any]) -> str:
     if corpus:
         lines.append(
             f"corpus: ingested={corpus['docs_ingested']} skipped_dup={corpus['docs_skipped_dup']} "
-            f"failed={corpus['docs_failed']} chunks={corpus['chunk_total']} "
+            f"skipped_limit={corpus['docs_skipped_limit']} "
+            f"name_collision={corpus['docs_name_collision']} failed={corpus['docs_failed']} "
+            f"{corpus['failed_by_stage']} chunks={corpus['chunk_total']} "
             f"elapsed={corpus['elapsed_s']}s embedder={corpus['embedder']}"
+        )
+        embed = corpus.get("embed")
+        if embed:
+            lines.append(
+                f"embed: texts={embed['texts']} chars={embed['chars']} "
+                f"overlong(>{EMBED_OVERLONG_CHARS})={embed['overlong']} tokens={embed['tokens']} "
+                f"cost_cny={embed['cost_cny']}"
+            )
+    anchors = summary.get("anchors")
+    if anchors:
+        lines.append(
+            f"anchors: checked={anchors['checked']} dead_cases={anchors['dead_cases']} "
+            f"(dead anchors are dataset / chunking problems, not retrieval misses)"
         )
     return "\n".join(lines)
 
@@ -449,7 +800,9 @@ def fingerprint(
     *,
     dataset_path: Path,
     manifest_path: Path,
+    corpus_root: Path,
     embedder: str,
+    embed_base_url: str | None,
     store: str,
     tiers: Sequence[str],
     limit_docs: int,
@@ -458,9 +811,13 @@ def fingerprint(
     return {
         "dataset_sha256": file_sha256(dataset_path),
         "manifest_sha256": file_sha256(manifest_path),
+        "corpus_root": str(corpus_root.resolve()),
         "embedder": embedder,
+        "embed_base_url": embed_base_url,
+        "embedding_dim": EMBEDDING_DIM,
         "store": store,
-        "commit": _git_commit(),
+        "commit": _git(["rev-parse", "--short", "HEAD"]) or "unknown",
+        "git_dirty": bool(_git(["status", "--porcelain"])),
         "tiers": list(tiers),
         "limit_docs": limit_docs,
         "method": cfg.method.value,
@@ -470,21 +827,17 @@ def fingerprint(
     }
 
 
-def _git_commit() -> str:
+def _git(args: Sequence[str]) -> str | None:
     git = shutil.which("git")
     if git is None:
-        return "unknown"
+        return None
     try:
         # 固定 argv、二进制经 shutil.which 解析 —— 只为指纹。
         return subprocess.run(  # noqa: S603
-            [git, "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=_EVAL_DIR,
+            [git, *args], capture_output=True, text=True, check=True, cwd=_EVAL_DIR
         ).stdout.strip()
     except (subprocess.CalledProcessError, OSError):
-        return "unknown"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -492,12 +845,24 @@ def _git_commit() -> str:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def rls_tenant(tenant_id: UUID) -> Iterator[None]:
+    """像应用层(入库 runner / 各 job)一样把租户放进 ContextVar:SQL 库经 ``build_rls_sessionmaker``
+    后每个事务 ``set_config('app.tenant_id', …)``,RLS 真开着时才查得到自己的行。"""
+    token = current_tenant_id_var.set(tenant_id)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(token)
+
+
 @asynccontextmanager
 async def open_store(kind: str) -> AsyncIterator[KnowledgeStore]:
     """``memory`` → ``InMemoryKnowledgeStore``;``sql`` → testcontainers 起 pgvector 并迁移到 head。
 
     SQL 那条路与 ``packages/expert-work-persistence/tests/test_sql_knowledge_store.py`` 的 fixture
-    同一套做法:同步 DSN 跑迁移,异步 DSN 建 engine / session factory。关键词路的语义
+    同一套做法:同步 DSN 跑迁移,异步 DSN 建 engine / session factory,再按应用层的样子包一层
+    ``build_rls_sessionmaker``(配合 :func:`rls_tenant`)。关键词路的语义
     (``plainto_tsquery`` 全 AND)只有这条路量得到。
     """
     if kind == "memory":
@@ -518,6 +883,7 @@ async def open_store(kind: str) -> AsyncIterator[KnowledgeStore]:
         create_async_engine_from_config,
         create_async_session_factory,
     )
+    from expert_work.persistence.rls import build_rls_sessionmaker
 
     container = PostgresContainer(PGVECTOR_IMAGE)
     with container:
@@ -533,17 +899,38 @@ async def open_store(kind: str) -> AsyncIterator[KnowledgeStore]:
         command.upgrade(alembic_cfg, "head")
         engine = create_async_engine_from_config(DatabaseConfig(dsn=async_dsn))
         try:
-            yield SqlKnowledgeStore(create_async_session_factory(engine))
+            yield SqlKnowledgeStore(build_rls_sessionmaker(create_async_session_factory(engine)))
         finally:
             await engine.dispose()
 
 
-def build_embedder(kind: str, *, concurrency: int) -> tuple[Embedder, str]:
-    """返回 ``(embedder, 标签)``;``real`` 的凭据只从 ``EXPERT_WORK_EVAL_EMBED_*`` 读,缺了就退出。"""
+@dataclass(frozen=True)
+class EmbedderBundle:
+    embedder: CountingEmbedder
+    tag: str  # fake | 模型名
+    base_url: str | None  # 假嵌入 None
+
+
+def build_embedder(kind: str, *, concurrency: int) -> EmbedderBundle:
+    """``real`` 的凭据只从 ``EXPERT_WORK_EVAL_EMBED_*`` 读,缺了就退出;两种都包进
+    :class:`CountingEmbedder`(校维度 / 计数 / 失败归阶段)。"""
     if kind == "fake":
-        return build_fake_embedder(), "fake"
-    backend = build_real_embedder(cache_db=EMBED_CACHE_DB, concurrency=concurrency)
-    return cast(Embedder, backend), os.environ["EXPERT_WORK_EVAL_EMBED_MODEL"]
+        return EmbedderBundle(
+            embedder=CountingEmbedder(build_fake_embedder(), expected_dim=EMBEDDING_DIM),
+            tag="fake",
+            base_url=None,
+        )
+    backend = build_real_embedder(
+        cache_db=EMBED_CACHE_DB, concurrency=concurrency, max_text_chars=EMBED_MAX_TEXT_CHARS
+    )
+    price = float(os.environ.get(EMBED_PRICE_ENV, DEFAULT_EMBED_PRICE_CNY_PER_1K))
+    return EmbedderBundle(
+        embedder=CountingEmbedder(
+            backend, expected_dim=EMBEDDING_DIM, count_tokens=True, price_cny_per_1k_tokens=price
+        ),
+        tag=os.environ["EXPERT_WORK_EVAL_EMBED_MODEL"],
+        base_url=os.environ.get("EXPERT_WORK_EVAL_EMBED_BASE_URL") or QWEN_EMBEDDING_BASE_URL,
+    )
 
 
 def build_reranker(enabled: bool) -> Reranker | None:
@@ -590,7 +977,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="清单里 path 的根目录(默认 = manifest.csv 所在目录)",
     )
     parser.add_argument("--tiers", help="逗号分隔;默认评测集 corpus.tiers,再默认 A,D-A")
-    parser.add_argument("--limit-docs", type=int, default=0, help="只入前 N 份文档;0 = 全部")
+    parser.add_argument("--limit-docs", type=int, default=0, help="去重后只入前 N 份文档;0 = 全部")
     parser.add_argument("--store", default="sql", choices=("memory", "sql"))
     parser.add_argument("--embedder", default="fake", choices=("fake", "real"))
     parser.add_argument(
@@ -600,6 +987,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold", type=float, default=None, help="向量路相似度下限")
     parser.add_argument("--rerank", default="off", choices=("off", "on"))
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    parser.add_argument(
+        "--parse-timeout",
+        type=float,
+        default=DEFAULT_PARSE_TIMEOUT_S,
+        help="单份文档解析超时(秒);超时记 parse 失败",
+    )
     parser.add_argument("--label", default="run", help="结果文件名;--out 未给时用它")
     parser.add_argument("--out", type=Path, help=f"结果 JSONL(默认 {EVAL_OUT_DIR}/<label>.jsonl)")
     parser.add_argument(
@@ -618,11 +1011,15 @@ def _resolve_tiers(raw: str | None, dataset: KbDataset) -> tuple[str, ...]:
 
 
 def _resolve_manifest(args: argparse.Namespace, dataset: KbDataset) -> Path:
+    """``--corpus`` 优先;评测集里的相对路径相对**评测集文件所在目录**解析,不随 cwd 变。"""
     if args.corpus is not None:
         return cast(Path, args.corpus)
     if dataset.corpus_manifest is None:
         raise SystemExit("dataset has no corpus.manifest; pass --corpus <manifest.csv>")
-    return Path(dataset.corpus_manifest).expanduser()
+    manifest = Path(dataset.corpus_manifest).expanduser()
+    if manifest.is_absolute():
+        return manifest
+    return (cast(Path, args.dataset).resolve().parent / manifest).resolve()
 
 
 async def _run(
@@ -633,41 +1030,49 @@ async def _run(
     corpus_root: Path,
     tiers: Sequence[str],
     cfg: EvalConfig,
-    embedder: Embedder,
-    embedder_tag: str,
+    bundle: EmbedderBundle,
     reranker: Reranker | None,
-) -> tuple[list[CaseRow], dict[str, Any]]:
+) -> tuple[list[CaseRow], dict[str, Any], CorpusReport]:
     selection = select_rows(read_manifest(manifest), tiers=tiers, limit_docs=args.limit_docs)
     print(
         f"corpus: {len(selection.rows)} docs selected (tiers={','.join(tiers)}, "
-        f"skipped_dup={selection.skipped_dup}, skipped_tier={selection.skipped_tier})",
+        f"skipped_dup={selection.skipped_dup}, skipped_tier={selection.skipped_tier}, "
+        f"skipped_limit={selection.skipped_limit}; limit counts after dedup)",
         file=sys.stderr,
     )
     async with open_store(args.store) as store:
-        report = await build_corpus(
-            store=store,
-            embedder=embedder,
-            tenant_id=EVAL_TENANT_ID,
-            base_name=dataset.name,
-            corpus_root=corpus_root,
-            selection=selection,
-            concurrency=args.concurrency,
-        )
-        if report.docs_ingested == 0:
-            raise SystemExit(
-                f"no document ingested ({report.docs_failed} failed) — check --corpus-root "
-                f"({corpus_root}) against the manifest's path column"
+        with rls_tenant(EVAL_TENANT_ID):
+            report = await build_corpus(
+                store=store,
+                embedder=bundle.embedder,
+                tenant_id=EVAL_TENANT_ID,
+                base_name=dataset.name,
+                corpus_root=corpus_root,
+                selection=selection,
+                concurrency=args.concurrency,
+                parse_timeout_s=args.parse_timeout,
             )
-        retriever = build_retriever(
-            store=store, embedder=embedder, reranker=reranker, top_k=cfg.top_k
-        )
-        rows = await run_eval(
-            dataset=dataset,
-            retriever=retriever,
-            tenant_id=EVAL_TENANT_ID,
-            cfg=cfg,
-            concurrency=args.concurrency,
-        )
+            if report.docs_ingested == 0:
+                raise SystemExit(
+                    f"no document ingested ({report.docs_failed} failed) — check --corpus-root "
+                    f"({corpus_root}) against the manifest's path column"
+                )
+            anchors = await check_anchors(
+                store=store, tenant_id=EVAL_TENANT_ID, kb_id=report.base_id, dataset=dataset
+            )
+            retriever = build_retriever(
+                store=store, embedder=bundle.embedder, reranker=reranker, top_k=cfg.top_k
+            )
+            rows = await run_eval(
+                dataset=dataset,
+                retriever=retriever,
+                tenant_id=EVAL_TENANT_ID,
+                cfg=cfg,
+                concurrency=args.concurrency,
+                anchors=anchors,
+            )
+    # 建库报告里的嵌入计数在打分前取的快照;这里换成含 query 嵌入的最终值。
+    report = replace(report, embed=bundle.embedder.stats())
     config = {
         "store": args.store,
         "tiers": list(tiers),
@@ -678,7 +1083,8 @@ async def _run(
         "rerank": cfg.rerank,
         "label": args.label,
     }
-    return rows, summarise(rows, corpus=report, embedder=embedder_tag, config=config)
+    summary = summarise(rows, corpus=report, anchors=anchors, embedder=bundle.tag, config=config)
+    return rows, summary, report
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -702,10 +1108,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         threshold=args.threshold,
         rerank=args.rerank == "on",
     )
-    embedder, embedder_tag = build_embedder(args.embedder, concurrency=args.concurrency)
+    bundle = build_embedder(args.embedder, concurrency=args.concurrency)
     reranker = build_reranker(cfg.rerank)
 
-    rows, summary = asyncio.run(
+    rows, summary, report = asyncio.run(
         _run(
             args=args,
             dataset=dataset,
@@ -713,8 +1119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             corpus_root=corpus_root,
             tiers=tiers,
             cfg=cfg,
-            embedder=embedder,
-            embedder_tag=embedder_tag,
+            bundle=bundle,
             reranker=reranker,
         )
     )
@@ -722,15 +1127,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_summary_table(summary))
     print(f"results: {out}")
     if args.update_baseline:
+        if report.docs_failed or report.docs_name_collision:
+            raise SystemExit(
+                f"refusing to update baseline: failed={report.docs_failed} "
+                f"{report.failed_by_stage} name_collision={report.docs_name_collision} — "
+                f"a run with ingest failures is not a baseline; see {out}"
+            )
         update_baseline(
             baseline_out,
             tier="kb",
             benchmark=dataset.name,
-            section=summary,
+            section=baseline_section(summary),
             fingerprint=fingerprint(
                 dataset_path=args.dataset,
                 manifest_path=manifest,
-                embedder=embedder_tag,
+                corpus_root=corpus_root,
+                embedder=bundle.tag,
+                embed_base_url=bundle.base_url,
                 store=args.store,
                 tiers=tiers,
                 limit_docs=args.limit_docs,

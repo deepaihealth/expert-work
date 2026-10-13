@@ -185,18 +185,35 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
 - **为什么基线必须 `--store sql`**:关键词路 SQL 是 `plainto_tsquery` 全 AND,内存库是任一词重叠打分,两套语义不同;
   中文长问句关键词路命中率(设计 §1.3 的固定回归用例)只有 SQL 库量得到。再跑一次 `--method keyword` 单独记这个数。
 - **建库规则**:单库,库名 = 评测集 `name`;只入 `--tiers` 里的层(默认评测集 `corpus.tiers`,再默认 `A,D-A`);
-  同一 `dup_group` 只入第一份;解析失败记进结果头 `corpus.ingest_failures[]`(文件名 + 异常类型),整轮继续;
-  一份都没入成功直接退出,不产出全零的「基线」。
-- **指标**:文档级命中 = `filename` 相等,段级命中 = `anchor in content`;`doc_recall@10/@20`、`chunk_recall@10/@20`、
-  `mrr@10`、`ndcg@10`(只算有答案的 case)、`zero_hit_rate`、`no_answer_refusal_rate`(`expected: []` 的 case:
-  结果为空或全部低于 `--threshold` 算拒答)、`false_refusal_rate`;总体 / 按 `source` / 按每个 `tag` 各一份。
+  同一 `dup_group` 只入第一份,`--limit-docs` 在去重**之后**截头(汇总里 `skipped_dup` / `skipped_limit` 分开记);
+  解析在进程池里跑(PyMuPDF 非线程安全),每份 `--parse-timeout`(默认 120 s),解析完的 Markdown 走
+  `ingest_markdown`(与上传入库同一段切块 → 嵌入 → 落段代码);失败按阶段 `parse|embed|store|other` 记进
+  `corpus.ingest_failures[]`(文件名、路径、异常类型),文档标 FAILED,整轮继续;同名不同内容的文件(不同目录、不是同一
+  `dup_group`)只入第一份,其余带路径记进 `corpus.name_collisions[]`;一份都没入成功直接退出,不产出全零的「基线」。
+  嵌入器外面包一层计数 / 校维度:返回维度 ≠ `EXPERT_WORK_EMBEDDING_DIM` 直接报错退出;真嵌入**不截断**输入(让 API 自己报错),
+  汇总 `corpus.embed` 报送入的文本数 / 字符数 / 超过 8000 字符的条数 / token 数与估算费用(单价 `EXPERT_WORK_EVAL_EMBED_PRICE_CNY_PER_1K`,
+  默认 text-embedding-v4 的 0.0005 元/千 token;假嵌入 token 与费用报 0);token 按送入嵌入器的文本算,含缓存命中。
+  SQL 库那条路像应用层一样设租户上下文(`build_rls_sessionmaker` + `current_tenant_id_var`),RLS 真开着时也查得到自己的行。
+- **锚文本存活检查**:入库后核每条 `expected` 的 `anchor` 是否出现在其文档的某一段里;不存活的 case 单列在汇总 `anchors.dead[]`
+  (`document_missing` = 文档没入库,`anchor_not_in_any_chunk` = 切块切断了锚 / 评测集抄错),每行 case 带 `anchors_alive`。
+  这些是数据集 / 切块的问题,不是检索的问题,看检索指标时要把它们剔开。
+- **指标**:文档级命中 = `filename` 相等,段级命中 = `anchor in content`;每条期望只在**最早**命中它的那一名记一次(重叠段重复命中不再加分,
+  nDCG ≤ 1),一段含两条锚时两条一起记。按 case 的 `match`(`any` 默认 / `all`,见 `datasets/kb/README.md`)分:
+  `doc_hit@10/@20`、`chunk_hit@10/@20`(`any` = 任一期望进前 k;`all` = 全部进前 k)、`doc_coverage@10/@20`、`chunk_coverage@10/@20`
+  (进前 k 的期望数 / 期望总数,两种 match 都报;文档级按结果名次切 k)、`mrr@10`、`ndcg@10`(`any` 理想序 1 条相关,`all` 理想序全部期望;
+  只算有答案的 case)、`zero_hit_rate`;`no_answer_refusal_rate` / `false_refusal_rate` **只在给了 `--threshold` 时有值**
+  (结果为空或全部低于阈值算拒答),没给阈值报 `-`,每行 case 的 `best_score`(最佳向量分数)落在 JSONL 里便于离线扫阈值。
+  总体 / 按 `source` / 按每个 `tag`(同一 case 重复 tag 只算一次)各一份。
   注意混合模式下关键词命中总会进融合,所以「无答案」判定要配 `--method vector --threshold <x>`。
-- **产出**:`eval-out/kb/<label>.jsonl`(每 case 一行:返回的 (filename, chunk_index, score, recall_source)、命中名次、指标;
-  末尾一行汇总;已存在就拒绝覆盖)、终端一张汇总表;`--update-baseline` 把汇总与指纹(评测集 sha256、清单 sha256、
-  嵌入模型、git commit、tiers、limit_docs、method、top_k)并进 `tools/eval/baselines/kb_<name>_baseline.yaml`(`--baseline-out` 可改)。
+- **产出**:`eval-out/kb/<label>.jsonl`(每 case 一行:`match`、`best_score`、`anchors_alive`、返回的 (filename, chunk_index, score, recall_source)、
+  命中名次、指标;末尾一行汇总;已存在就拒绝覆盖)、终端一张汇总表;`--update-baseline` 把汇总(去掉 `base_id` / `elapsed_s` / `label`
+  这些每次都变的字段)与指纹(评测集 sha256、清单 sha256、`corpus_root`、嵌入模型 / base URL / 维度、store、git commit + dirty 标记、
+  tiers、limit_docs、method、top_k、threshold、rerank)并进 `tools/eval/baselines/kb_<name>_baseline.yaml`(`--baseline-out` 可改);
+  **有任何入库失败或同名冲突时拒绝更新基线**(退出码非 0,结果 JSONL 照写)。评测集里 `corpus.manifest` 的相对路径相对评测集文件所在目录解析。
 - **凭据只走环境变量**:嵌入 `EXPERT_WORK_EVAL_EMBED_API_KEY` / `_MODEL` / `_BASE_URL`;`--rerank on` 另要
   `EXPERT_WORK_EVAL_LLM_API_KEY` / `_MODEL` / `_BASE_URL`,缺了直接报错退出。真嵌入包在 `CachedEmbedder`
   里(`eval-out/kb/embed_cache.sqlite`,按模型 + 内容哈希缓存),第二次跑近零费用。
 - **测试覆盖的边界**:`test_kb_eval.py` / `test_kb_metrics.py` 只跑**内存库 + 假嵌入 + `tmp_path` 现造的小语料**那条路
-  (选文档 / 去重 / 失败记账 / 两级命中 / 拒答 / 分组 / 拒绝覆盖 / 指纹字段)。`--store sql`、`--embedder real`、
-  `--rerank on` 三条路**没有测试**,在仓库外手工跑;CI 不读真语料、不起容器、不调嵌入 API。
+  (选文档 / 去重 / 同名冲突 / 失败分阶段 / 解析超时 / 维度校验 / 嵌入计数 / 锚存活 / any|all 两级命中 / 拒答 / 分组 / 拒绝覆盖 /
+  拒绝写基线 / 指纹字段)。`--store sql`、`--embedder real`、`--rerank on` 三条路**没有测试**,在仓库外手工跑;
+  CI 不读真语料、不起容器、不调嵌入 API。
