@@ -100,6 +100,71 @@ test("retrieval test runs a query and renders scored results", async ({ page }) 
   await expect(page.getByText("The deductible is 500 dollars.")).toBeVisible();
 });
 
+// B-175 L3 — batch upload queue: one row per file, a server 413 lands as a
+// failed row carrying the server's limit, an unsupported pick is skipped up
+// front and reported on the summary line.
+test("batch upload: queue rows, 413 → failed row, unsupported → skipped summary", async ({
+  page,
+}) => {
+  const UPLOADED = {
+    id: "22222222-2222-2222-2222-222222222229",
+    filename: "a.txt",
+    status: "pending",
+    error: null,
+    chunk_count: 0,
+    attempts: 0,
+    created_at: "2026-10-13T00:00:00Z",
+    updated_at: null,
+  };
+  // Most-recently-added handler wins; GETs fall through to the list stub.
+  await page.route("**/v1/knowledge/bases/*/documents", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    const body = route.request().postDataBuffer()?.toString("latin1") ?? "";
+    if (body.includes('filename="too-big.txt"')) {
+      return route.fulfill({
+        status: 413,
+        json: { detail: { error: "file_too_large", limit_bytes: 1024 * 1024 } },
+      });
+    }
+    return route.fulfill({ status: 202, json: UPLOADED });
+  });
+
+  await page.goto("/knowledge/support-docs");
+  await expect(page.getByTestId("knowledge-documents-tab")).toBeVisible();
+
+  // The dragger's testid sits on rc-upload's hidden <input type=file>.
+  await page.getByTestId("doc-upload-dragger").setInputFiles([
+    { name: "a.txt", mimeType: "text/plain", buffer: Buffer.from("alpha") },
+    { name: "b.md", mimeType: "text/markdown", buffer: Buffer.from("# beta") },
+    { name: "too-big.txt", mimeType: "text/plain", buffer: Buffer.from("gamma") },
+    { name: "setup.exe", mimeType: "application/octet-stream", buffer: Buffer.from([0x4d, 0x5a]) },
+  ]);
+
+  const queue = page.getByTestId("doc-upload-queue");
+  await expect(queue).toBeVisible();
+  const rows = queue.locator('[data-testid^="doc-upload-queue-row-"]');
+  await expect(rows).toHaveCount(3); // skipped rows stay behind the summary toggle
+  await expect(queue.locator('[data-status="done"]')).toHaveCount(2);
+  await expect(queue.locator('[data-status="failed"]')).toHaveCount(1);
+  const failed = queue.locator('[data-status="failed"]');
+  await expect(failed).toContainText("too-big.txt");
+  await expect(failed).toContainText("1.0 MB"); // the server's limit, not ours
+  await expect(failed.getByRole("button", { name: "Retry" })).toBeVisible();
+  await expect(queue).toContainText("2 / 3 uploaded");
+
+  const summary = page.getByTestId("doc-upload-summary");
+  await expect(summary).toContainText("Skipped 1 unsupported file");
+  await summary.getByRole("button", { name: "Show list" }).click();
+  await expect(rows).toHaveCount(4);
+  await expect(queue.locator('[data-status="skipped"]')).toContainText("setup.exe");
+
+  // the table paginates client-side and shows the total
+  await expect(page.getByTestId("doc-table-pagination")).toContainText("1 documents");
+
+  // the queue panel (rows, progress bars, per-file buttons) must pass axe too
+  await expectNoA11yViolations(page, "knowledge-batch-upload");
+});
+
 test("knowledge detail passes axe (serious + critical)", async ({ page }) => {
   await page.goto("/knowledge/support-docs");
   await expect(page.getByTestId("knowledge-detail-root")).toBeVisible();

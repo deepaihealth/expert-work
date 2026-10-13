@@ -6,13 +6,14 @@
  * retrieval-test tab (run → scored results), and the settings tab (PATCH).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import "../../i18n";
 
 import * as knowledgeSdk from "../../api/knowledge";
+import { ApiError } from "../../api/client";
 import { KnowledgeDetail } from "../KnowledgeDetail";
 
 // Cross-tenant W3 — the page reads the ambient tenant scope; these tests
@@ -96,8 +97,8 @@ const DOCS: knowledgeSdk.KnowledgeDocument[] = [
   },
 ];
 
-function renderDetail(initial = "/knowledge/support-docs") {
-  return render(
+function detailTree(initial: string) {
+  return (
     <MemoryRouter initialEntries={[initial]}>
       <App>
         <Routes>
@@ -105,8 +106,12 @@ function renderDetail(initial = "/knowledge/support-docs") {
           <Route path="/knowledge/:name/:tab" element={<KnowledgeDetail />} />
         </Routes>
       </App>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderDetail(initial = "/knowledge/support-docs") {
+  return render(detailTree(initial));
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -343,5 +348,359 @@ describe("KnowledgeDetail — cross-tenant W4 (review C-2)", () => {
         FOREIGN_TENANT,
       ),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-175 L3 — upload queue (batch / folder import) + client-side pagination.
+// ---------------------------------------------------------------------------
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function fileOf(name: string, size?: number): File {
+  const file = new File(["abc"], name);
+  if (size !== undefined) Object.defineProperty(file, "size", { value: size });
+  return file;
+}
+
+const MIB = 1024 * 1024;
+
+/** 6 picks: 4 supported + 1 ``.exe`` + 1 oversized → with concurrency 3 the
+ *  queue reads 3 uploading / 1 queued / 2 skipped. */
+const BATCH = [
+  fileOf("a.pdf"),
+  fileOf("setup.exe"),
+  fileOf("b.docx"),
+  fileOf("huge.pdf", 60 * MIB),
+  fileOf("c.md"),
+  fileOf("d.txt"),
+];
+
+function pickFiles(files: File[]) {
+  // rc-upload's hidden <input type=file> carries the dragger's data-testid.
+  fireEvent.change(screen.getByTestId("doc-upload-dragger"), { target: { files } });
+}
+
+function rowStatuses(): string[] {
+  return screen
+    .getAllByTestId(/^doc-upload-queue-row-/)
+    .map((row) => row.getAttribute("data-status") ?? "");
+}
+
+function countBy(values: string[]): Record<string, number> {
+  return values.reduce<Record<string, number>>(
+    (acc, v) => ({ ...acc, [v]: (acc[v] ?? 0) + 1 }),
+    {},
+  );
+}
+
+describe("DocumentsTab — upload queue (B-175 L3)", () => {
+  it("a 6-file pick reads 3 uploading / 1 queued / 2 skipped and refreshes once after settling", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    const listSpy = vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const pending: Deferred<knowledgeSdk.KnowledgeDocument>[] = [];
+    const uploadSpy = vi.spyOn(knowledgeSdk, "uploadDocument").mockImplementation(() => {
+      const d = deferred<knowledgeSdk.KnowledgeDocument>();
+      pending.push(d);
+      return d.promise;
+    });
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    const listCallsBefore = listSpy.mock.calls.length;
+
+    pickFiles(BATCH);
+
+    await waitFor(() => expect(uploadSpy).toHaveBeenCalledTimes(3));
+    expect(uploadSpy.mock.calls.map((c) => c[1].name)).toEqual(["a.pdf", "b.docx", "c.md"]);
+    // signal + onProgress are threaded through to the SDK
+    expect(uploadSpy.mock.calls[0][2]).toEqual(
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        onProgress: expect.any(Function),
+      }),
+    );
+    expect(screen.getByTestId("doc-upload-queue")).toBeInTheDocument();
+    expect(countBy(rowStatuses())).toEqual({ uploading: 3, queued: 1 });
+    const summary = screen.getByTestId("doc-upload-summary");
+    expect(summary).toHaveTextContent(/1 unsupported/);
+    expect(summary).toHaveTextContent(/1 over 50\.0 MB/);
+    // the skipped rows live behind the summary's expand toggle
+    await userEvent.click(within(summary).getByRole("button", { name: /show list/i }));
+    expect(countBy(rowStatuses())).toEqual({ uploading: 3, queued: 1, skipped: 2 });
+    // nothing settled yet → no refresh
+    expect(listSpy).toHaveBeenCalledTimes(listCallsBefore);
+
+    await act(async () => {
+      pending[0].resolve(DOCS[0]);
+      pending[1].resolve(DOCS[0]);
+      pending[2].resolve(DOCS[0]);
+    });
+    await waitFor(() => expect(uploadSpy).toHaveBeenCalledTimes(4));
+    expect(uploadSpy.mock.calls[3][1].name).toBe("d.txt");
+    expect(listSpy).toHaveBeenCalledTimes(listCallsBefore);
+
+    await act(async () => {
+      pending[3].resolve(DOCS[0]);
+    });
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(listCallsBefore + 1));
+    expect(countBy(rowStatuses())).toEqual({ done: 4, skipped: 2 });
+    // and no second refresh trails in
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(listSpy).toHaveBeenCalledTimes(listCallsBefore + 1);
+  });
+
+  it("a server 413 lands the row in failed with the server's limit; retry re-sends", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi
+      .spyOn(knowledgeSdk, "uploadDocument")
+      .mockRejectedValueOnce(
+        new ApiError("Request failed with status code 413", "HTTP_413", 413, {
+          error: "file_too_large",
+          limit_bytes: 10 * MIB,
+        }),
+      )
+      .mockResolvedValue(DOCS[0]);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+
+    pickFiles([fileOf("a.pdf")]);
+
+    await waitFor(() => expect(countBy(rowStatuses())).toEqual({ failed: 1 }));
+    const row = screen.getAllByTestId(/^doc-upload-queue-row-/)[0];
+    expect(row).toHaveTextContent(/10\.0 MB/);
+
+    await userEvent.click(within(row).getByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(uploadSpy).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(countBy(rowStatuses())).toEqual({ done: 1 }));
+  });
+
+  it("cancel aborts the in-flight upload", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const signals: AbortSignal[] = [];
+    vi.spyOn(knowledgeSdk, "uploadDocument").mockImplementation((_b, _f, opts) => {
+      if (opts?.signal) signals.push(opts.signal);
+      return new Promise(() => {});
+    });
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    pickFiles([fileOf("a.pdf")]);
+    await waitFor(() => expect(signals).toHaveLength(1));
+
+    const row = screen.getAllByTestId(/^doc-upload-queue-row-/)[0];
+    // per-row controls are labelled with the file's path (review #11)
+    await userEvent.click(within(row).getByRole("button", { name: "Cancel a.pdf" }));
+
+    expect(signals[0].aborted).toBe(true);
+    await waitFor(() => expect(countBy(rowStatuses())).toEqual({ failed: 1 }));
+    // the header counts it as cancelled, not failed (review #9)
+    const header = screen.getByTestId("doc-upload-queue-header");
+    expect(header).toHaveTextContent(/Cancelled 1/);
+    expect(header).not.toHaveTextContent(/Failed/);
+    // "Clear finished" dismisses the cancelled row (review #9)
+    await userEvent.click(within(header).getByRole("button", { name: /clear finished/i }));
+    expect(screen.queryByTestId("doc-upload-queue")).not.toBeInTheDocument();
+  });
+
+  it("a server 413 without limit_bytes says 'too large' without inventing a number (review #8)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "uploadDocument").mockRejectedValue(
+      new ApiError("Request failed with status code 413", "HTTP_413", 413),
+    );
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    pickFiles([fileOf("a.pdf")]);
+
+    await waitFor(() => expect(countBy(rowStatuses())).toEqual({ failed: 1 }));
+    const row = screen.getAllByTestId(/^doc-upload-queue-row-/)[0];
+    expect(row).toHaveTextContent(/file too large/i);
+    expect(row).not.toHaveTextContent(/MB/);
+  });
+
+  it("readonly after the fact: Retry on a failed row is disabled and never re-sends (review #3)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi
+      .spyOn(knowledgeSdk, "uploadDocument")
+      .mockRejectedValue(new Error("boom"));
+
+    const view = renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    pickFiles([fileOf("a.pdf")]);
+    await waitFor(() => expect(countBy(rowStatuses())).toEqual({ failed: 1 }));
+    expect(uploadSpy).toHaveBeenCalledTimes(1);
+
+    // the page flips to readonly (e.g. the admin switches tenant) while the
+    // failed row is still on screen
+    isTenantSwitchedMock.mockReturnValue(true);
+    view.rerender(detailTree("/knowledge/support-docs"));
+    await waitFor(() => expect(screen.getByTestId("doc-upload-dragger")).toBeDisabled());
+
+    const row = screen.getAllByTestId(/^doc-upload-queue-row-/)[0];
+    const retry = within(row).getByRole("button", { name: "Retry a.pdf" });
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(uploadSpy).toHaveBeenCalledTimes(1);
+    expect(countBy(rowStatuses())).toEqual({ failed: 1 });
+  });
+
+  it("a pick whose name matches an existing document is skipped as a duplicate (review #1)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi.spyOn(knowledgeSdk, "uploadDocument").mockResolvedValue(DOCS[0]);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    pickFiles([fileOf("faq.pdf")]); // DOCS[0].filename
+
+    const summary = await screen.findByTestId("doc-upload-summary");
+    expect(summary).toHaveTextContent(/Skipped 1 duplicate name/);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(uploadSpy).not.toHaveBeenCalled();
+  });
+
+  it("a dropped folder is expanded and its unsupported files are counted as skipped (review #4)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi
+      .spyOn(knowledgeSdk, "uploadDocument")
+      .mockImplementation(() => new Promise(() => {}));
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+
+    // Minimal FileSystem*Entry fakes, shaped as rc-upload's traverseFileTree
+    // consumes them: a directory "docs" holding a.pdf and setup.exe.
+    const fileEntry = (name: string) => ({
+      isFile: true,
+      isDirectory: false,
+      fullPath: `/docs/${name}`,
+      file: (cb: (f: File) => void) => cb(fileOf(name)),
+    });
+    const children = [fileEntry("a.pdf"), fileEntry("setup.exe")];
+    const dirEntry = {
+      isFile: false,
+      isDirectory: true,
+      fullPath: "/docs",
+      createReader: () => {
+        let drained = false;
+        return {
+          readEntries: (ok: (entries: unknown[]) => void) => {
+            if (drained) return ok([]);
+            drained = true;
+            return ok(children);
+          },
+        };
+      },
+    };
+    const dataTransfer = {
+      items: [{ kind: "file", webkitGetAsEntry: () => dirEntry }],
+      files: [],
+      types: ["Files"],
+    };
+
+    const input = screen.getByTestId("doc-upload-dragger");
+    // dragover flips the Dragger to directory mode so rc-upload walks entries
+    fireEvent.dragOver(input, { dataTransfer });
+    expect(input).toHaveAttribute("webkitdirectory");
+    fireEvent.drop(input, { dataTransfer });
+
+    await waitFor(() => expect(uploadSpy).toHaveBeenCalledTimes(1));
+    expect(uploadSpy.mock.calls[0][1].name).toBe("a.pdf");
+    expect(screen.getByText("docs/a.pdf")).toBeInTheDocument();
+    const summary = screen.getByTestId("doc-upload-summary");
+    expect(summary).toHaveTextContent(/Skipped 1 unsupported file/);
+    await userEvent.click(within(summary).getByRole("button", { name: /show list/i }));
+    expect(countBy(rowStatuses())).toEqual({ uploading: 1, skipped: 1 });
+    expect(screen.getByText("docs/setup.exe")).toBeInTheDocument();
+    // the drop ended the drag → back to file mode
+    expect(input).not.toHaveAttribute("webkitdirectory");
+  });
+
+  it("readonly (switched tenant): a pick never reaches the SDK and no queue renders", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi.spyOn(knowledgeSdk, "uploadDocument").mockResolvedValue(DOCS[0]);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    expect(screen.getByTestId("doc-upload-dragger")).toBeDisabled();
+
+    // fireEvent bypasses the disabled attribute — proves enqueue itself is a no-op.
+    pickFiles([fileOf("a.pdf"), fileOf("b.pdf")]);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+
+    expect(uploadSpy).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("doc-upload-queue")).not.toBeInTheDocument();
+  });
+
+  it("folder toggle flips the input to directory mode", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    const input = screen.getByTestId("doc-upload-dragger");
+    expect(input).not.toHaveAttribute("webkitdirectory");
+    // No ``accept`` on any path: rc-upload would filter unsupported files
+    // before the queue can count them (antd defaults the attr to "", which
+    // attrAccept treats as "accept all").
+    expect(input.getAttribute("accept") ?? "").toBe("");
+
+    await userEvent.click(screen.getByTestId("doc-upload-folder-toggle"));
+
+    const dirInput = screen.getByTestId("doc-upload-dragger");
+    expect(dirInput).toHaveAttribute("webkitdirectory");
+    expect(dirInput.getAttribute("accept") ?? "").toBe("");
+  });
+
+  it("documents table paginates client-side at 50 with a total", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    const many = Array.from({ length: 60 }, (_, i) => ({
+      ...DOCS[0],
+      id: `33333333-3333-3333-3333-${String(i).padStart(12, "0")}`,
+      filename: `doc-${i}.pdf`,
+    }));
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(many);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
+
+    expect(screen.getAllByText(/^doc-\d+\.pdf$/)).toHaveLength(50);
+    expect(screen.queryByText("doc-59.pdf")).not.toBeInTheDocument();
+    const pager = screen.getByTestId("doc-table-pagination");
+    expect(pager).toHaveTextContent(/60/);
+    await userEvent.click(within(pager).getByTitle("2"));
+    await waitFor(() => expect(screen.getByText("doc-59.pdf")).toBeInTheDocument());
   });
 });

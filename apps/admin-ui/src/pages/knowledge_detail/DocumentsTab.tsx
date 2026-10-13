@@ -5,25 +5,53 @@
  * updated) + drag-drop multi-file upload + per-document actions (view chunks /
  * re-ingest / delete). Ingest progress is a conditional 5s poll (Mini-ADR
  * H-18): poll while any document is non-terminal, stop once all settle.
+ *
+ * B-175 L3: uploads go through ``useUploadQueue`` (concurrency 3, per-file
+ * progress / cancel / retry, unsupported + oversized + duplicate-name files
+ * skipped up front). ``beforeUpload`` enqueues the whole antd batch once and
+ * returns ``LIST_IGNORE`` so antd keeps no list of its own; the table
+ * refreshes at most every 15 s while a batch runs and once more when it
+ * settles. The Dragger carries no ``accept`` — rc-upload would filter
+ * unsupported files before the queue can count them. Folders: the toggle
+ * flips the picker to ``webkitdirectory``; while a drag is over the dropzone
+ * the Dragger is switched to directory mode too, so rc-upload expands dropped
+ * folders via ``webkitGetAsEntry``. The drag flag is set on ``dragover`` and
+ * cleared by an enter/leave counter plus a window-level ``drop`` / ``dragend``
+ * listener (Safari leaves ``relatedTarget`` null on leave).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { App, Button, Empty, Popconfirm, Space, Table, Tag, Tooltip, Typography, Upload } from "antd";
-import type { TableColumnsType } from "antd";
+import {
+  App,
+  Button,
+  Empty,
+  Popconfirm,
+  Space,
+  Switch,
+  Table,
+  Tag,
+  Tooltip,
+  Typography,
+  Upload,
+} from "antd";
+import type { TableColumnsType, TablePaginationConfig } from "antd";
 import { Eye, RefreshCw, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
   deleteDocument,
-  isSupportedDocument,
+  KNOWLEDGE_DOCUMENT_MAX_BYTES,
   listDocuments,
   reingestDocument,
-  SUPPORTED_DOCUMENT_EXTENSIONS,
   uploadDocument,
   type DocumentStatus,
   type KnowledgeDocument,
+  type UploadDocumentOptions,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { formatBytes } from "../../components/console/workspace_format";
+import { DEFAULT_UPLOAD_STALL_TIMEOUT_MS, useUploadQueue } from "../../hooks/useUploadQueue";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
+import { UploadQueuePanel } from "./UploadQueuePanel";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
@@ -36,6 +64,10 @@ const STATUS_COLOR: Record<DocumentStatus, string> = {
 };
 
 const POLL_INTERVAL_MS = 5_000;
+const DOC_TABLE_PAGE_SIZE = 50;
+// Spread into the pagination config: ``data-*`` isn't in antd's prop type,
+// but rc-pagination forwards it onto the <ul> (``pickAttrs`` data:true).
+const DOC_TABLE_PAGINATION_TESTID = { "data-testid": "doc-table-pagination" };
 
 function errMessage(err: unknown): string {
   return err instanceof ApiError
@@ -62,9 +94,15 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
 
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [loading, setLoading] = useState(false);
-  const [uploading, setUploading] = useState(false);
   const [previewDoc, setPreviewDoc] = useState<KnowledgeDocument | null>(null);
+  const [folderMode, setFolderMode] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  /** Nested dragenter/dragleave pairs over the dropzone's children. */
+  const dragDepthRef = useRef(0);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** antd calls ``beforeUpload`` once per file with the same batch array —
+   *  remember the last batch so the whole pick is enqueued exactly once. */
+  const lastBatchRef = useRef<readonly File[] | null>(null);
 
   const refresh = useCallback(
     async ({ quiet = false }: { quiet?: boolean } = {}) => {
@@ -92,6 +130,9 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
   useEffect(() => {
     if (hasActiveIngest) {
       pollTimer.current = setInterval(() => {
+        // Same page-visibility gate as ``useStatusPolling``: a backgrounded
+        // tab keeps the timer but skips the fetch until the user is back.
+        if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
         void refresh({ quiet: true });
       }, POLL_INTERVAL_MS);
       return () => {
@@ -102,29 +143,101 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     return undefined;
   }, [hasActiveIngest, refresh]);
 
-  const handleUpload = useCallback(
-    async (file: File) => {
-      if (!isSupportedDocument(file.name)) {
-        message.error(t("knowledge_page.unsupported_type", { name: file.name }));
-        return false;
-      }
-      setUploading(true);
+  /** Queue adapter: one upload with the request-level errors turned into
+   *  the row's message (503 → embedder missing, 413 → server's own cap). An
+   *  abort rejection is rethrown as-is; the queue ignores it. */
+  const uploadOne = useCallback(
+    async (file: File, opts: Required<UploadDocumentOptions>) => {
       try {
-        await uploadDocument(baseName, file);
-        await refresh();
+        return await uploadDocument(baseName, file, opts);
       } catch (err) {
-        const detail =
-          err instanceof ApiError && err.status === 503
-            ? t("knowledge_page.embedder_missing")
-            : errMessage(err);
-        message.error(detail);
-      } finally {
-        setUploading(false);
+        if (opts.signal.aborted) throw err;
+        if (err instanceof ApiError && err.status === 503) {
+          throw new Error(t("knowledge_page.embedder_missing"));
+        }
+        if (err instanceof ApiError && err.status === 413) {
+          const serverLimit = err.details?.limit_bytes;
+          // Only quote a number the server actually sent — the client cap
+          // is not the server's.
+          throw new Error(
+            typeof serverLimit === "number"
+              ? t("knowledge_page.upload_queue_err_too_large_server", {
+                  limit: formatBytes(serverLimit),
+                })
+              : t("knowledge_page.upload_queue_err_too_large_server_unknown"),
+          );
+        }
+        throw new Error(errMessage(err));
       }
-      return false; // handled manually
     },
-    [t, baseName, message, refresh],
+    [baseName, t],
   );
+
+  const quietRefresh = useCallback(() => {
+    void refresh({ quiet: true });
+  }, [refresh]);
+
+  const queue = useUploadQueue<KnowledgeDocument>({
+    upload: uploadOne,
+    onSettled: quietRefresh,
+    onBatchProgress: quietRefresh,
+    stallMessage: t("knowledge_page.upload_queue_err_stalled", {
+      seconds: DEFAULT_UPLOAD_STALL_TIMEOUT_MS / 1000,
+    }),
+  });
+  const { enqueue, retry } = queue;
+
+  // Names already on the server: a pick with the same basename would upsert
+  // over the existing document, so the queue skips it as a duplicate.
+  const existingNames = useMemo(() => new Set(documents.map((d) => d.filename)), [documents]);
+
+  const handleBeforeUpload = useCallback(
+    (_file: File, batch: File[]) => {
+      if (batch !== lastBatchRef.current) {
+        lastBatchRef.current = batch;
+        if (!readonly) enqueue(batch, { existingNames });
+      }
+      // The queue owns the file; keep it out of antd's own fileList.
+      return Upload.LIST_IGNORE;
+    },
+    [enqueue, existingNames, readonly],
+  );
+
+  const handleRetry = useCallback(
+    (id: string) => {
+      if (!readonly) retry(id);
+    },
+    [readonly, retry],
+  );
+
+  // A drag over the zone switches the Dragger to directory mode so dropped
+  // folders are expanded (rc-upload reads ``directory`` at drop time).
+  // ``dragover`` keeps the flag set (React bails out when it is unchanged);
+  // an enter/leave depth counter clears it when the drag really leaves, and
+  // the window listeners catch a drop / dragend anywhere else.
+  const resetDrag = useCallback(() => {
+    dragDepthRef.current = 0;
+    setDragging(false);
+  }, []);
+  const onDragEnter = useCallback(() => {
+    dragDepthRef.current += 1;
+    setDragging(true);
+  }, []);
+  const onDragOver = useCallback(() => setDragging(true), []);
+  const onDragLeave = useCallback(() => {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  }, []);
+  useEffect(() => {
+    if (!dragging) return undefined;
+    window.addEventListener("drop", resetDrag);
+    window.addEventListener("dragend", resetDrag);
+    return () => {
+      window.removeEventListener("drop", resetDrag);
+      window.removeEventListener("dragend", resetDrag);
+    };
+  }, [dragging, resetDrag]);
+  const directoryMode = folderMode || dragging;
 
   const handleReingest = useCallback(
     async (documentId: string) => {
@@ -263,23 +376,79 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     [t, handleReingest, handleDelete, readonly],
   );
 
+  // Client-side for now (L3-T4 step 1); the server-side cut-over lands with
+  // the paginated list API (wave-1 PR #8) and must not change the API calls here.
+  const pagination = useMemo<TablePaginationConfig>(
+    () => ({
+      pageSize: DOC_TABLE_PAGE_SIZE,
+      showSizeChanger: false,
+      showTotal: (total: number) => t("knowledge_page.doc_table_total", { total }),
+      ...DOC_TABLE_PAGINATION_TESTID,
+    }),
+    [t],
+  );
+
   return (
     <div data-testid="knowledge-documents-tab">
       <ReadonlyTooltip on={readonly} block>
-        <div style={{ marginBottom: 16 }}>
+        <div
+          style={{ marginBottom: 16 }}
+          onDragEnter={onDragEnter}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={resetDrag}
+        >
           <Upload.Dragger
-            accept={SUPPORTED_DOCUMENT_EXTENSIONS.join(",")}
+            directory={directoryMode}
             showUploadList={false}
             multiple
-            beforeUpload={(file) => handleUpload(file)}
-            disabled={uploading || readonly}
+            beforeUpload={handleBeforeUpload}
+            disabled={readonly}
             data-testid="doc-upload-dragger"
           >
-            <p className="ant-upload-text">{t("knowledge_page.upload_dragger_hint")}</p>
+            <p className="ant-upload-text">
+              {t(
+                folderMode
+                  ? "knowledge_page.upload_dragger_hint_folder"
+                  : "knowledge_page.upload_dragger_hint",
+              )}
+            </p>
             <p className="ant-upload-hint">{t("knowledge_page.upload_dragger_sub")}</p>
           </Upload.Dragger>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              alignItems: "center",
+              gap: 8,
+              marginTop: 8,
+            }}
+          >
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {t("knowledge_page.upload_folder_toggle")}
+            </Text>
+            <Switch
+              size="small"
+              checked={folderMode}
+              disabled={readonly}
+              onChange={setFolderMode}
+              aria-label={t("knowledge_page.upload_folder_toggle")}
+              data-testid="doc-upload-folder-toggle"
+            />
+          </div>
         </div>
       </ReadonlyTooltip>
+
+      <UploadQueuePanel
+        items={queue.items}
+        summary={queue.summary}
+        maxBytes={KNOWLEDGE_DOCUMENT_MAX_BYTES}
+        readonly={readonly}
+        onCancel={queue.cancel}
+        onRetry={handleRetry}
+        onCancelAll={queue.cancelAll}
+        onClearDone={queue.clearDone}
+      />
 
       <Table<KnowledgeDocument>
         size="small"
@@ -287,7 +456,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         dataSource={documents}
         rowKey="id"
         loading={loading}
-        pagination={false}
+        pagination={pagination}
         locale={{ emptyText: <Empty description={t("knowledge_page.documents_empty")} /> }}
         data-testid="doc-table"
       />
