@@ -235,7 +235,10 @@ def test_match_defaults_to_any_and_rejects_unknown(tmp_path: Path) -> None:
         )
         return path
 
-    assert load_dataset(write(None)).cases[0].match == "any"
-    assert load_dataset(write("all")).cases[0].match == "all"
+    default_path = write(None)
+    assert load_dataset(default_path).cases[0].match == "any"
+    all_path = write("all")
+    assert load_dataset(all_path).cases[0].match == "all"
+    bad_path = write("some")
     with pytest.raises(KbDatasetError, match="'match'"):
-        load_dataset(write("some"))
+        load_dataset(bad_path)
