@@ -162,3 +162,41 @@ uv run --no-sync python tools/eval/clinconsensus.py score
 耗时与 token 翻几倍、一题分数更低。花费约 9 元(全量 900 题两组约 800 元);逐题串行裸调用 33 分钟、平台 63 分钟。
 与论文成绩对照只能作参考:论文主分数用 GPT-5.1 严格判分,两种判分模型的模型级平均差 8.72 个百分点;
 公开题全是低难度档,要对照论文图 5 的低难度档(11 个模型均值 28.5,GLM-5 约 24.0)。
+
+## B-175 知识库检索评测(`kb_eval.py`,走真实入库链路,不进 CI)
+
+计划:`docs/superpowers/plans/2026-10-13-b175-wave1-plan.md` §L1-T3。评测集格式与语料清点见
+[`datasets/kb/README.md`](./datasets/kb/README.md)。与老的 `rag.py`(读预切好的段、假嵌入、M0 闸门的一部分)不同,
+`kb_eval.py` 把清单里的原文档**原样走一遍上传后的入库链路**(`ingest_document_bytes`:解析 → 语义切块 → 嵌入 → 落段),
+再对每条 case 调 `KnowledgeRetriever.search`,所以量到的是产品真实的切块与检索,不是评测自己的近似。
+
+```sh
+# 冒烟:内存库 + 假嵌入(关键词桶向量,维度跟 EXPERT_WORK_EMBEDDING_DIM),几秒
+uv run --no-sync python tools/eval/kb_eval.py --dataset tools/eval/datasets/kb/<name>.yaml \
+    --corpus <清单目录>/manifest.csv --corpus-root <资料根目录> --store memory --embedder fake
+
+# 基线:pgvector 容器(testcontainers,需 DOCKER_HOST)+ 真嵌入;先 --limit-docs 100 跑通再全量
+export DOCKER_HOST=unix:///Users/<you>/.docker/run/docker.sock
+EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v4 \
+  uv run --no-sync python tools/eval/kb_eval.py --dataset tools/eval/datasets/kb/<name>.yaml \
+    --store sql --embedder real --tiers A,D-A --label baseline-$(git rev-parse --short HEAD) --update-baseline
+```
+
+- **为什么基线必须 `--store sql`**:关键词路 SQL 是 `plainto_tsquery` 全 AND,内存库是任一词重叠打分,两套语义不同;
+  中文长问句关键词路命中率(设计 §1.3 的固定回归用例)只有 SQL 库量得到。再跑一次 `--method keyword` 单独记这个数。
+- **建库规则**:单库,库名 = 评测集 `name`;只入 `--tiers` 里的层(默认评测集 `corpus.tiers`,再默认 `A,D-A`);
+  同一 `dup_group` 只入第一份;解析失败记进结果头 `corpus.ingest_failures[]`(文件名 + 异常类型),整轮继续;
+  一份都没入成功直接退出,不产出全零的「基线」。
+- **指标**:文档级命中 = `filename` 相等,段级命中 = `anchor in content`;`doc_recall@10/@20`、`chunk_recall@10/@20`、
+  `mrr@10`、`ndcg@10`(只算有答案的 case)、`zero_hit_rate`、`no_answer_refusal_rate`(`expected: []` 的 case:
+  结果为空或全部低于 `--threshold` 算拒答)、`false_refusal_rate`;总体 / 按 `source` / 按每个 `tag` 各一份。
+  注意混合模式下关键词命中总会进融合,所以「无答案」判定要配 `--method vector --threshold <x>`。
+- **产出**:`eval-out/kb/<label>.jsonl`(每 case 一行:返回的 (filename, chunk_index, score, recall_source)、命中名次、指标;
+  末尾一行汇总;已存在就拒绝覆盖)、终端一张汇总表;`--update-baseline` 把汇总与指纹(评测集 sha256、清单 sha256、
+  嵌入模型、git commit、tiers、limit_docs、method、top_k)并进 `tools/eval/baselines/kb_<name>_baseline.yaml`(`--baseline-out` 可改)。
+- **凭据只走环境变量**:嵌入 `EXPERT_WORK_EVAL_EMBED_API_KEY` / `_MODEL` / `_BASE_URL`;`--rerank on` 另要
+  `EXPERT_WORK_EVAL_LLM_API_KEY` / `_MODEL` / `_BASE_URL`,缺了直接报错退出。真嵌入包在 `CachedEmbedder`
+  里(`eval-out/kb/embed_cache.sqlite`,按模型 + 内容哈希缓存),第二次跑近零费用。
+- **测试覆盖的边界**:`test_kb_eval.py` / `test_kb_metrics.py` 只跑**内存库 + 假嵌入 + `tmp_path` 现造的小语料**那条路
+  (选文档 / 去重 / 失败记账 / 两级命中 / 拒答 / 分组 / 拒绝覆盖 / 指纹字段)。`--store sql`、`--embedder real`、
+  `--rerank on` 三条路**没有测试**,在仓库外手工跑;CI 不读真语料、不起容器、不调嵌入 API。
