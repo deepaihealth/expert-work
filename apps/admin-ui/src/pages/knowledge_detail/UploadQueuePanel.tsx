@@ -3,10 +3,12 @@
  *
  * Presentational: renders the ``useUploadQueue`` items. Overall progress,
  * one row per real upload (relative path, size, status, progress, cancel /
- * retry), and a summary line for the files skipped up front (unsupported
- * type / over the size cap) with an expandable list of those rows.
+ * retry) in a scroll box, and a summary line for the files skipped up front
+ * (unsupported type / over the size cap / duplicate name) with an
+ * expandable list of those rows. Rows are memoised so a progress tick on
+ * one upload does not re-render the other few hundred.
  */
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Button, Progress, Space, Tag, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -27,58 +29,55 @@ const STATUS_COLOR: Record<UploadQueueStatus, string> = {
   skipped: "warning",
 };
 
+/** Row list height before it scrolls (≈ 10 rows). */
+const ROW_LIST_MAX_HEIGHT = 320;
+
 interface UploadQueuePanelProps {
   items: UploadQueueItem<unknown>[];
   summary: UploadQueueSummary;
   /** Client-side cap, for the "over {{limit}}" copy. */
   maxBytes: number;
+  /** Read-only page state: retry / cancel-all are disabled. */
+  readonly: boolean;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
   onCancelAll: () => void;
   onClearDone: () => void;
 }
 
-export function UploadQueuePanel({
-  items,
-  summary,
-  maxBytes,
+interface UploadQueueRowProps {
+  item: UploadQueueItem<unknown>;
+  limitLabel: string;
+  readonly: boolean;
+  onCancel: (id: string) => void;
+  onRetry: (id: string) => void;
+}
+
+function skipReasonCopy(
+  item: UploadQueueItem<unknown>,
+  limitLabel: string,
+  t: ReturnType<typeof useTranslation>["t"],
+): string {
+  switch (item.skipReason) {
+    case "too_large":
+      return t("knowledge_page.upload_queue_reason_too_large", { limit: limitLabel });
+    case "duplicate_name":
+      return t("knowledge_page.upload_queue_reason_duplicate");
+    default:
+      return t("knowledge_page.upload_queue_reason_unsupported");
+  }
+}
+
+const UploadQueueRow = memo(function UploadQueueRow({
+  item,
+  limitLabel,
+  readonly,
   onCancel,
   onRetry,
-  onCancelAll,
-  onClearDone,
-}: UploadQueuePanelProps) {
+}: UploadQueueRowProps) {
   const { t } = useTranslation();
-  const [showSkipped, setShowSkipped] = useState(false);
-
-  const uploads = useMemo(() => items.filter((i) => i.status !== "skipped"), [items]);
-  const skipped = useMemo(() => items.filter((i) => i.status === "skipped"), [items]);
-  const overallPercent = useMemo(() => {
-    if (uploads.length === 0) return 0;
-    const sum = uploads.reduce((acc, i) => acc + (i.status === "done" ? 100 : i.progress), 0);
-    return Math.round(sum / uploads.length);
-  }, [uploads]);
-
-  if (items.length === 0) return null;
-
-  const active = summary.queued + summary.uploading > 0;
-  const limitLabel = formatBytes(maxBytes);
-  const skippedParts = [
-    skipped.some((i) => i.skipReason === "unsupported")
-      ? t("knowledge_page.upload_queue_skipped_unsupported", {
-          n: skipped.filter((i) => i.skipReason === "unsupported").length,
-        })
-      : null,
-    skipped.some((i) => i.skipReason === "too_large")
-      ? t("knowledge_page.upload_queue_skipped_too_large", {
-          n: skipped.filter((i) => i.skipReason === "too_large").length,
-          limit: limitLabel,
-        })
-      : null,
-  ].filter((part): part is string => part !== null);
-
-  const renderRow = (item: UploadQueueItem<unknown>) => (
+  return (
     <div
-      key={item.id}
       data-testid={`doc-upload-queue-row-${item.id}`}
       data-status={item.status}
       style={{
@@ -104,9 +103,7 @@ export function UploadQueuePanel({
       <div style={{ minWidth: 0 }}>
         {item.status === "skipped" ? (
           <Text type="secondary" style={{ fontSize: 12 }}>
-            {item.skipReason === "too_large"
-              ? t("knowledge_page.upload_queue_reason_too_large", { limit: limitLabel })
-              : t("knowledge_page.upload_queue_reason_unsupported")}
+            {skipReasonCopy(item, limitLabel, t)}
           </Text>
         ) : item.status === "failed" && !item.cancelled && item.error ? (
           <Text type="danger" ellipsis={{ tooltip: item.error }} style={{ fontSize: 12 }}>
@@ -117,6 +114,9 @@ export function UploadQueuePanel({
             percent={item.status === "done" ? 100 : item.progress}
             size="small"
             showInfo={item.status === "uploading"}
+            aria-label={t("knowledge_page.upload_queue_progress_label", {
+              name: item.relativePath,
+            })}
             status={
               item.status === "failed"
                 ? "exception"
@@ -129,17 +129,83 @@ export function UploadQueuePanel({
       </div>
       <Space size={4} style={{ justifyContent: "flex-end" }}>
         {item.status === "queued" || item.status === "uploading" ? (
-          <Button size="small" type="link" onClick={() => onCancel(item.id)}>
+          <Button
+            size="small"
+            type="link"
+            onClick={() => onCancel(item.id)}
+            aria-label={t("knowledge_page.upload_queue_cancel_file", { name: item.relativePath })}
+          >
             {t("knowledge_page.upload_queue_cancel")}
           </Button>
         ) : null}
         {item.status === "failed" ? (
-          <Button size="small" type="link" onClick={() => onRetry(item.id)}>
+          <Button
+            size="small"
+            type="link"
+            disabled={readonly}
+            onClick={() => onRetry(item.id)}
+            aria-label={t("knowledge_page.upload_queue_retry_file", { name: item.relativePath })}
+          >
             {t("knowledge_page.upload_queue_retry")}
           </Button>
         ) : null}
       </Space>
     </div>
+  );
+});
+
+export function UploadQueuePanel({
+  items,
+  summary,
+  maxBytes,
+  readonly,
+  onCancel,
+  onRetry,
+  onCancelAll,
+  onClearDone,
+}: UploadQueuePanelProps) {
+  const { t } = useTranslation();
+  const [showSkipped, setShowSkipped] = useState(false);
+
+  const uploads = useMemo(() => items.filter((i) => i.status !== "skipped"), [items]);
+  const skipped = useMemo(() => items.filter((i) => i.status === "skipped"), [items]);
+  const overallPercent = useMemo(() => {
+    if (uploads.length === 0) return 0;
+    const sum = uploads.reduce((acc, i) => acc + (i.status === "done" ? 100 : i.progress), 0);
+    return Math.round(sum / uploads.length);
+  }, [uploads]);
+
+  if (items.length === 0) return null;
+
+  const active = summary.queued + summary.uploading > 0;
+  const limitLabel = formatBytes(maxBytes);
+  const unsupportedCount = skipped.filter((i) => i.skipReason === "unsupported").length;
+  const tooLargeCount = skipped.filter((i) => i.skipReason === "too_large").length;
+  const duplicateCount = skipped.filter((i) => i.skipReason === "duplicate_name").length;
+  const skippedParts = [
+    unsupportedCount > 0
+      ? t("knowledge_page.upload_queue_skipped_unsupported", { count: unsupportedCount })
+      : null,
+    tooLargeCount > 0
+      ? t("knowledge_page.upload_queue_skipped_too_large", {
+          n: tooLargeCount,
+          limit: limitLabel,
+        })
+      : null,
+    duplicateCount > 0
+      ? t("knowledge_page.upload_queue_skipped_duplicate", { count: duplicateCount })
+      : null,
+  ].filter((part): part is string => part !== null);
+
+  const renderRow = (item: UploadQueueItem<unknown>) => (
+    <UploadQueueRow
+      key={item.id}
+      item={item}
+      limitLabel={limitLabel}
+      readonly={readonly}
+      onCancel={onCancel}
+      onRetry={onRetry}
+    />
   );
 
   return (
@@ -152,7 +218,10 @@ export function UploadQueuePanel({
         marginBottom: 16,
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+      <div
+        data-testid="doc-upload-queue-header"
+        style={{ display: "flex", alignItems: "center", gap: 12 }}
+      >
         <Text strong>{t("knowledge_page.upload_queue_title")}</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>
           {t("knowledge_page.upload_queue_progress", {
@@ -162,21 +231,25 @@ export function UploadQueuePanel({
           {summary.failed > 0
             ? ` · ${t("knowledge_page.upload_queue_status_failed")} ${summary.failed}`
             : ""}
+          {summary.cancelled > 0
+            ? ` · ${t("knowledge_page.upload_queue_cancelled")} ${summary.cancelled}`
+            : ""}
         </Text>
         <div style={{ flex: 1, minWidth: 120 }}>
           <Progress
             percent={overallPercent}
             size="small"
+            aria-label={t("knowledge_page.upload_queue_overall_progress_label")}
             status={active ? "active" : summary.failed > 0 ? "exception" : undefined}
           />
         </div>
         <Space size={4}>
-          <Button size="small" disabled={!active} onClick={onCancelAll}>
+          <Button size="small" disabled={!active || readonly} onClick={onCancelAll}>
             {t("knowledge_page.upload_queue_cancel_all")}
           </Button>
           <Button
             size="small"
-            disabled={summary.done + summary.skipped === 0}
+            disabled={summary.done + summary.skipped + summary.cancelled === 0}
             onClick={onClearDone}
           >
             {t("knowledge_page.upload_queue_clear_done")}
@@ -184,7 +257,11 @@ export function UploadQueuePanel({
         </Space>
       </div>
 
-      {uploads.length > 0 ? <div style={{ marginTop: 8 }}>{uploads.map(renderRow)}</div> : null}
+      {uploads.length > 0 ? (
+        <div style={{ marginTop: 8, maxHeight: ROW_LIST_MAX_HEIGHT, overflowY: "auto" }}>
+          {uploads.map(renderRow)}
+        </div>
+      ) : null}
 
       {skipped.length > 0 ? (
         <div style={{ marginTop: 8, borderTop: "1px dashed var(--ant-color-border, #d9d9d9)" }}>
@@ -203,7 +280,11 @@ export function UploadQueuePanel({
                 : t("knowledge_page.upload_queue_show_skipped")}
             </Button>
           </div>
-          {showSkipped ? <div>{skipped.map(renderRow)}</div> : null}
+          {showSkipped ? (
+            <div style={{ maxHeight: ROW_LIST_MAX_HEIGHT, overflowY: "auto" }}>
+              {skipped.map(renderRow)}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

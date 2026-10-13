@@ -7,13 +7,17 @@
  * H-18): poll while any document is non-terminal, stop once all settle.
  *
  * B-175 L3: uploads go through ``useUploadQueue`` (concurrency 3, per-file
- * progress / cancel / retry, unsupported + oversized files skipped up front).
- * ``beforeUpload`` enqueues the whole antd batch once; the table refreshes
- * once per settled batch, not per file. Folders: the toggle flips the picker
- * to ``webkitdirectory``; while a drag is over the dropzone the Dragger is
- * switched to directory mode too, so rc-upload expands dropped folders via
- * ``webkitGetAsEntry`` (``accept`` is dropped in that mode because rc-upload
- * would otherwise filter unsupported files before they can be counted).
+ * progress / cancel / retry, unsupported + oversized + duplicate-name files
+ * skipped up front). ``beforeUpload`` enqueues the whole antd batch once and
+ * returns ``LIST_IGNORE`` so antd keeps no list of its own; the table
+ * refreshes at most every 15 s while a batch runs and once more when it
+ * settles. The Dragger carries no ``accept`` — rc-upload would filter
+ * unsupported files before the queue can count them. Folders: the toggle
+ * flips the picker to ``webkitdirectory``; while a drag is over the dropzone
+ * the Dragger is switched to directory mode too, so rc-upload expands dropped
+ * folders via ``webkitGetAsEntry``. The drag flag is set on ``dragover`` and
+ * cleared by an enter/leave counter plus a window-level ``drop`` / ``dragend``
+ * listener (Safari leaves ``relatedTarget`` null on leave).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -30,7 +34,6 @@ import {
   Upload,
 } from "antd";
 import type { TableColumnsType, TablePaginationConfig } from "antd";
-import type { DragEvent } from "react";
 import { Eye, RefreshCw, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -39,7 +42,6 @@ import {
   KNOWLEDGE_DOCUMENT_MAX_BYTES,
   listDocuments,
   reingestDocument,
-  SUPPORTED_DOCUMENT_EXTENSIONS,
   uploadDocument,
   type DocumentStatus,
   type KnowledgeDocument,
@@ -47,7 +49,7 @@ import {
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
 import { formatBytes } from "../../components/console/workspace_format";
-import { useUploadQueue } from "../../hooks/useUploadQueue";
+import { DEFAULT_UPLOAD_STALL_TIMEOUT_MS, useUploadQueue } from "../../hooks/useUploadQueue";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
 import { UploadQueuePanel } from "./UploadQueuePanel";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
@@ -63,7 +65,6 @@ const STATUS_COLOR: Record<DocumentStatus, string> = {
 
 const POLL_INTERVAL_MS = 5_000;
 const DOC_TABLE_PAGE_SIZE = 50;
-const UPLOAD_ACCEPT = SUPPORTED_DOCUMENT_EXTENSIONS.join(",");
 // Spread into the pagination config: ``data-*`` isn't in antd's prop type,
 // but rc-pagination forwards it onto the <ul> (``pickAttrs`` data:true).
 const DOC_TABLE_PAGINATION_TESTID = { "data-testid": "doc-table-pagination" };
@@ -96,6 +97,8 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
   const [previewDoc, setPreviewDoc] = useState<KnowledgeDocument | null>(null);
   const [folderMode, setFolderMode] = useState(false);
   const [dragging, setDragging] = useState(false);
+  /** Nested dragenter/dragleave pairs over the dropzone's children. */
+  const dragDepthRef = useRef(0);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   /** antd calls ``beforeUpload`` once per file with the same batch array —
    *  remember the last batch so the whole pick is enqueued exactly once. */
@@ -154,10 +157,14 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         }
         if (err instanceof ApiError && err.status === 413) {
           const serverLimit = err.details?.limit_bytes;
-          const limit =
-            typeof serverLimit === "number" ? serverLimit : KNOWLEDGE_DOCUMENT_MAX_BYTES;
+          // Only quote a number the server actually sent — the client cap
+          // is not the server's.
           throw new Error(
-            t("knowledge_page.upload_queue_err_too_large_server", { limit: formatBytes(limit) }),
+            typeof serverLimit === "number"
+              ? t("knowledge_page.upload_queue_err_too_large_server", {
+                  limit: formatBytes(serverLimit),
+                })
+              : t("knowledge_page.upload_queue_err_too_large_server_unknown"),
           );
         }
         throw new Error(errMessage(err));
@@ -166,38 +173,70 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     [baseName, t],
   );
 
-  const onBatchSettled = useCallback(() => {
+  const quietRefresh = useCallback(() => {
     void refresh({ quiet: true });
   }, [refresh]);
 
   const queue = useUploadQueue<KnowledgeDocument>({
     upload: uploadOne,
-    onSettled: onBatchSettled,
+    onSettled: quietRefresh,
+    onBatchProgress: quietRefresh,
+    stallMessage: t("knowledge_page.upload_queue_err_stalled", {
+      seconds: DEFAULT_UPLOAD_STALL_TIMEOUT_MS / 1000,
+    }),
   });
-  const { enqueue } = queue;
+  const { enqueue, retry } = queue;
+
+  // Names already on the server: a pick with the same basename would upsert
+  // over the existing document, so the queue skips it as a duplicate.
+  const existingNames = useMemo(() => new Set(documents.map((d) => d.filename)), [documents]);
 
   const handleBeforeUpload = useCallback(
     (_file: File, batch: File[]) => {
       if (batch !== lastBatchRef.current) {
         lastBatchRef.current = batch;
-        if (!readonly) enqueue(batch);
+        if (!readonly) enqueue(batch, { existingNames });
       }
-      return false; // handled by the queue
+      // The queue owns the file; keep it out of antd's own fileList.
+      return Upload.LIST_IGNORE;
     },
-    [enqueue, readonly],
+    [enqueue, existingNames, readonly],
   );
 
-  // Drag-over switches the Dragger to directory mode so dropped folders are
-  // expanded (rc-upload reads ``directory`` at drop time); reset after the
-  // drop has been handled (bubble phase, after rc-upload) or when the drag
-  // leaves the dropzone for good.
-  const onDragEnter = useCallback(() => setDragging(true), []);
-  const onDragLeave = useCallback((event: DragEvent<HTMLDivElement>) => {
-    const next = event.relatedTarget;
-    if (next instanceof Node && event.currentTarget.contains(next)) return;
+  const handleRetry = useCallback(
+    (id: string) => {
+      if (!readonly) retry(id);
+    },
+    [readonly, retry],
+  );
+
+  // A drag over the zone switches the Dragger to directory mode so dropped
+  // folders are expanded (rc-upload reads ``directory`` at drop time).
+  // ``dragover`` keeps the flag set (React bails out when it is unchanged);
+  // an enter/leave depth counter clears it when the drag really leaves, and
+  // the window listeners catch a drop / dragend anywhere else.
+  const resetDrag = useCallback(() => {
+    dragDepthRef.current = 0;
     setDragging(false);
   }, []);
-  const onDrop = useCallback(() => setDragging(false), []);
+  const onDragEnter = useCallback(() => {
+    dragDepthRef.current += 1;
+    setDragging(true);
+  }, []);
+  const onDragOver = useCallback(() => setDragging(true), []);
+  const onDragLeave = useCallback(() => {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  }, []);
+  useEffect(() => {
+    if (!dragging) return undefined;
+    window.addEventListener("drop", resetDrag);
+    window.addEventListener("dragend", resetDrag);
+    return () => {
+      window.removeEventListener("drop", resetDrag);
+      window.removeEventListener("dragend", resetDrag);
+    };
+  }, [dragging, resetDrag]);
   const directoryMode = folderMode || dragging;
 
   const handleReingest = useCallback(
@@ -355,11 +394,11 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         <div
           style={{ marginBottom: 16 }}
           onDragEnter={onDragEnter}
+          onDragOver={onDragOver}
           onDragLeave={onDragLeave}
-          onDrop={onDrop}
+          onDrop={resetDrag}
         >
           <Upload.Dragger
-            accept={directoryMode ? undefined : UPLOAD_ACCEPT}
             directory={directoryMode}
             showUploadList={false}
             multiple
@@ -404,8 +443,9 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         items={queue.items}
         summary={queue.summary}
         maxBytes={KNOWLEDGE_DOCUMENT_MAX_BYTES}
+        readonly={readonly}
         onCancel={queue.cancel}
-        onRetry={queue.retry}
+        onRetry={handleRetry}
         onCancelAll={queue.cancelAll}
         onClearDone={queue.clearDone}
       />

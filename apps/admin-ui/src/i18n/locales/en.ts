@@ -535,14 +535,24 @@ export interface TranslationKeys {
     upload_queue_cancel_all: string;
     upload_queue_clear_done: string;
     upload_queue_skipped_summary: string;
-    upload_queue_skipped_unsupported: string;
+    upload_queue_skipped_unsupported_one: string;
+    upload_queue_skipped_unsupported_other: string;
     upload_queue_skipped_too_large: string;
+    upload_queue_skipped_duplicate_one: string;
+    upload_queue_skipped_duplicate_other: string;
     upload_queue_skipped_sep: string;
     upload_queue_show_skipped: string;
     upload_queue_hide_skipped: string;
     upload_queue_reason_unsupported: string;
     upload_queue_reason_too_large: string;
+    upload_queue_reason_duplicate: string;
     upload_queue_err_too_large_server: string;
+    upload_queue_err_too_large_server_unknown: string;
+    upload_queue_err_stalled: string;
+    upload_queue_cancel_file: string;
+    upload_queue_retry_file: string;
+    upload_queue_progress_label: string;
+    upload_queue_overall_progress_label: string;
     doc_table_total: string;
     col_attempts: string;
     reingest: string;
@@ -3819,14 +3829,24 @@ const en: TranslationKeys = {
     upload_queue_cancel_all: "Cancel all",
     upload_queue_clear_done: "Clear finished",
     upload_queue_skipped_summary: "Skipped {{parts}}",
-    upload_queue_skipped_unsupported: "{{n}} unsupported file(s)",
+    upload_queue_skipped_unsupported_one: "{{count}} unsupported file",
+    upload_queue_skipped_unsupported_other: "{{count}} unsupported files",
     upload_queue_skipped_too_large: "{{n}} over {{limit}}",
+    upload_queue_skipped_duplicate_one: "{{count}} duplicate name",
+    upload_queue_skipped_duplicate_other: "{{count}} duplicate names",
     upload_queue_skipped_sep: ", ",
     upload_queue_show_skipped: "Show list",
     upload_queue_hide_skipped: "Hide list",
     upload_queue_reason_unsupported: "Unsupported type",
     upload_queue_reason_too_large: "Over {{limit}}",
+    upload_queue_reason_duplicate: "Same name as another file in this batch or an existing document",
     upload_queue_err_too_large_server: "Rejected by the server: over {{limit}}",
+    upload_queue_err_too_large_server_unknown: "Rejected by the server: file too large",
+    upload_queue_err_stalled: "Upload stalled: no progress for {{seconds}} s",
+    upload_queue_cancel_file: "Cancel {{name}}",
+    upload_queue_retry_file: "Retry {{name}}",
+    upload_queue_progress_label: "Upload progress: {{name}}",
+    upload_queue_overall_progress_label: "Overall upload progress",
     doc_table_total: "{{total}} documents",
     col_attempts: "Attempts",
     reingest: "Re-ingest",

@@ -5,7 +5,7 @@
  * controls exactly when an upload finishes; ``calls`` records the file,
  * the AbortSignal and the progress callback the hook passed in.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
 import { useUploadQueue, type UploadQueueItem } from "../useUploadQueue";
@@ -86,6 +86,7 @@ describe("useUploadQueue", () => {
       uploading: 3,
       done: 0,
       failed: 0,
+      cancelled: 0,
       skipped: 0,
       total: 5,
     });
@@ -233,6 +234,7 @@ describe("useUploadQueue", () => {
       uploading: 3,
       done: 0,
       failed: 0,
+      cancelled: 0,
       skipped: 2,
       total: 6,
     });
@@ -278,22 +280,31 @@ describe("useUploadQueue", () => {
       "failed",
       "skipped",
     ]);
+    // cancelled rows are counted apart from real failures (review #9)
     expect(result.current.summary).toEqual({
       queued: 0,
       uploading: 0,
       done: 0,
-      failed: 4,
+      failed: 0,
+      cancelled: 4,
       skipped: 1,
       total: 5,
     });
   });
 
-  it("clearDone removes done and skipped rows and keeps the rest", async () => {
+  it("clearDone removes done, skipped and cancelled rows and keeps the rest", async () => {
     const { calls, upload } = makeUpload();
     const { result } = renderHook(() => useUploadQueue({ upload }));
-    act(() => result.current.enqueue(["a.pdf", "b.exe", "c.pdf", "d.pdf", "e.pdf"].map((n) => pdf(n))));
+    act(() =>
+      result.current.enqueue(
+        ["a.pdf", "b.exe", "c.pdf", "d.pdf", "e.pdf", "f.pdf"].map((n) => pdf(n)),
+      ),
+    );
     await settle(() => calls[0].d.resolve({ id: "doc-a" }));
     await settle(() => calls[1].d.reject(new Error("boom")));
+    // f.pdf is queued (4th real file, cap 3) → cancel pulls it from the queue
+    act(() => result.current.cancel(result.current.items[5].id));
+    expect(result.current.items[5]).toMatchObject({ status: "failed", cancelled: true });
 
     act(() => result.current.clearDone());
 
@@ -340,5 +351,231 @@ describe("useUploadQueue", () => {
     const { result } = renderHook(() => useUploadQueue({ upload, concurrency: 1 }));
     act(() => result.current.enqueue(["a.pdf", "b.pdf"].map((n) => pdf(n))));
     expect(calls).toHaveLength(1);
+  });
+
+  // ── review fixes (PR #1802) ────────────────────────────────────────────
+
+  describe("duplicate basenames (review #1 — the server upserts on (kb, filename))", () => {
+    it("the second file with the same basename in a batch is skipped as duplicate_name", () => {
+      const { calls, upload } = makeUpload();
+      const { result } = renderHook(() => useUploadQueue({ upload }));
+      const a = pdf("x.pdf");
+      Object.defineProperty(a, "webkitRelativePath", { value: "a/x.pdf" });
+      const b = pdf("x.pdf");
+      Object.defineProperty(b, "webkitRelativePath", { value: "b/x.pdf" });
+
+      act(() => result.current.enqueue([a, b]));
+
+      expect(statuses(result.current.items)).toEqual(["uploading", "skipped"]);
+      expect(result.current.items[1]).toMatchObject({
+        relativePath: "b/x.pdf",
+        skipReason: "duplicate_name",
+      });
+      expect(calls).toHaveLength(1);
+      expect(result.current.summary.skipped).toBe(1);
+    });
+
+    it("a basename already present in `existingNames` is skipped", () => {
+      const { calls, upload } = makeUpload();
+      const { result } = renderHook(() => useUploadQueue({ upload }));
+
+      act(() =>
+        result.current.enqueue([pdf("faq.pdf"), pdf("new.pdf")], {
+          existingNames: new Set(["faq.pdf"]),
+        }),
+      );
+
+      expect(statuses(result.current.items)).toEqual(["skipped", "uploading"]);
+      expect(result.current.items[0].skipReason).toBe("duplicate_name");
+      expect(calls.map((c) => c.file.name)).toEqual(["new.pdf"]);
+    });
+
+    it("a basename still queued / uploading from an earlier batch is never started twice", () => {
+      const { calls, upload } = makeUpload();
+      const { result } = renderHook(() => useUploadQueue({ upload, concurrency: 1 }));
+      act(() => result.current.enqueue([pdf("a.pdf"), pdf("b.pdf")]));
+
+      act(() => result.current.enqueue([pdf("a.pdf"), pdf("b.pdf"), pdf("c.pdf")]));
+
+      expect(statuses(result.current.items)).toEqual([
+        "uploading",
+        "queued",
+        "skipped",
+        "skipped",
+        "queued",
+      ]);
+      expect(calls).toHaveLength(1);
+    });
+
+    it("the duplicate check only applies to files that would otherwise be queued", () => {
+      const { upload } = makeUpload();
+      const { result } = renderHook(() => useUploadQueue({ upload }));
+
+      act(() => result.current.enqueue([pdf("x.exe"), pdf("x.exe"), pdf("y.pdf")]));
+
+      expect(result.current.items.map((i) => i.skipReason)).toEqual([
+        "unsupported",
+        "unsupported",
+        undefined,
+      ]);
+    });
+  });
+
+  describe("lifetime (review #2 — the queue must not outlive its tab)", () => {
+    it("unmount aborts in-flight uploads and starts nothing afterwards", async () => {
+      const { calls, upload } = makeUpload();
+      const { result, unmount } = renderHook(() => useUploadQueue({ upload, concurrency: 1 }));
+      act(() => result.current.enqueue([pdf("a.pdf"), pdf("b.pdf")]));
+      expect(calls).toHaveLength(1);
+
+      unmount();
+
+      expect(calls[0].signal.aborted).toBe(true);
+      await act(async () => {
+        calls[0].d.resolve({ id: "doc-a" });
+        await Promise.resolve();
+      });
+      expect(calls).toHaveLength(1);
+    });
+
+    it("an item keeps the `upload` it was enqueued with, also on retry", async () => {
+      const first = makeUpload();
+      const second = makeUpload();
+      const { result, rerender } = renderHook(
+        ({ upload }: { upload: typeof first.upload }) => useUploadQueue({ upload }),
+        { initialProps: { upload: first.upload } },
+      );
+      act(() => result.current.enqueue([pdf("a.pdf")]));
+      expect(first.calls).toHaveLength(1);
+
+      // e.g. the page switched to another knowledge base
+      rerender({ upload: second.upload });
+      await settle(() => first.calls[0].d.reject(new Error("boom")));
+
+      act(() => result.current.retry(result.current.items[0].id));
+      expect(first.calls).toHaveLength(2);
+      expect(second.calls).toHaveLength(0);
+
+      act(() => result.current.enqueue([pdf("b.pdf")]));
+      expect(second.calls).toHaveLength(1);
+      expect(second.calls[0].file.name).toBe("b.pdf");
+    });
+
+    it("registers a beforeunload guard only while something is queued or uploading", async () => {
+      const added = vi.spyOn(window, "addEventListener");
+      const removed = vi.spyOn(window, "removeEventListener");
+      const { calls, upload } = makeUpload();
+      const { result } = renderHook(() => useUploadQueue({ upload }));
+      const beforeunloadAdds = () => added.mock.calls.filter((c) => c[0] === "beforeunload").length;
+      const beforeunloadRemoves = () =>
+        removed.mock.calls.filter((c) => c[0] === "beforeunload").length;
+      expect(beforeunloadAdds()).toBe(0);
+
+      act(() => result.current.enqueue([pdf("a.pdf")]));
+      expect(beforeunloadAdds()).toBe(1);
+      const handler = added.mock.calls.find((c) => c[0] === "beforeunload")?.[1] as (
+        e: Event,
+      ) => void;
+      const event = new Event("beforeunload", { cancelable: true });
+      handler(event);
+      expect(event.defaultPrevented).toBe(true);
+
+      await settle(() => calls[0].d.resolve({ id: "doc-a" }));
+      expect(beforeunloadRemoves()).toBe(1);
+    });
+  });
+
+  describe("timers (review #5 — batches must settle; stalled uploads must fail)", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("onBatchProgress fires at most once per interval, and only after a completion", async () => {
+      vi.useFakeTimers();
+      const { calls, upload } = makeUpload();
+      const onBatchProgress = vi.fn();
+      const onSettled = vi.fn();
+      const { result } = renderHook(() =>
+        useUploadQueue({
+          upload,
+          concurrency: 1,
+          onBatchProgress,
+          onSettled,
+          batchProgressIntervalMs: 15_000,
+        }),
+      );
+      act(() => result.current.enqueue(["a.pdf", "b.pdf", "c.pdf"].map((n) => pdf(n))));
+
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(onBatchProgress).not.toHaveBeenCalled(); // nothing completed yet
+
+      await settle(() => calls[0].d.resolve({ id: "a" }));
+      expect(onBatchProgress).not.toHaveBeenCalled(); // not immediately
+      act(() => vi.advanceTimersByTime(15_000));
+      expect(onBatchProgress).toHaveBeenCalledTimes(1);
+
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(onBatchProgress).toHaveBeenCalledTimes(1); // no completion → no tick
+
+      await settle(() => calls[1].d.resolve({ id: "b" }));
+      act(() => vi.advanceTimersByTime(15_000));
+      expect(onBatchProgress).toHaveBeenCalledTimes(2);
+
+      await settle(() => calls[2].d.resolve({ id: "c" }));
+      expect(onSettled).toHaveBeenCalledTimes(1);
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(onBatchProgress).toHaveBeenCalledTimes(2); // settle supersedes the tick
+    });
+
+    it("an upload with no progress event for `stallTimeoutMs` is aborted and marked failed", () => {
+      vi.useFakeTimers();
+      const { calls, upload } = makeUpload();
+      const { result } = renderHook(() =>
+        useUploadQueue({ upload, stallTimeoutMs: 120_000, stallMessage: "stalled!" }),
+      );
+      act(() => result.current.enqueue([pdf("a.pdf"), pdf("b.pdf")]));
+
+      act(() => vi.advanceTimersByTime(100_000));
+      act(() => calls[0].onProgress(10)); // a is alive → its clock restarts
+      act(() => vi.advanceTimersByTime(100_000));
+      expect(result.current.items[0].status).toBe("uploading");
+      expect(result.current.items[1]).toMatchObject({ status: "failed", error: "stalled!" });
+      expect(calls[1].signal.aborted).toBe(true);
+      expect(calls[0].signal.aborted).toBe(false);
+
+      act(() => vi.advanceTimersByTime(20_000));
+      expect(result.current.items[0]).toMatchObject({ status: "failed", error: "stalled!" });
+      expect(calls[0].signal.aborted).toBe(true);
+    });
+  });
+
+  it("ignores progress callbacks that do not change the rounded percent (review #6)", () => {
+    const { calls, upload } = makeUpload();
+    const { result } = renderHook(() => useUploadQueue({ upload }));
+    act(() => result.current.enqueue([pdf("a.pdf")]));
+
+    act(() => calls[0].onProgress(42.4));
+    const before = result.current.items;
+    act(() => calls[0].onProgress(42));
+    act(() => calls[0].onProgress(41.6));
+
+    expect(result.current.items).toBe(before); // no re-render
+    expect(result.current.items[0].progress).toBe(42);
+  });
+
+  it("a synchronous throw from `upload` fails the row and frees its slot (review #10)", async () => {
+    const upload = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("sync boom");
+      })
+      .mockImplementation(() => new Promise(() => {}));
+    const { result } = renderHook(() => useUploadQueue({ upload, concurrency: 1 }));
+
+    await settle(() => result.current.enqueue([pdf("a.pdf"), pdf("b.pdf")]));
+
+    expect(result.current.items[0]).toMatchObject({ status: "failed", error: "sync boom" });
+    expect(result.current.items[1].status).toBe("uploading");
+    expect(upload).toHaveBeenCalledTimes(2);
   });
 });

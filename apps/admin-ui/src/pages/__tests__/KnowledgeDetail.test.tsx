@@ -97,8 +97,8 @@ const DOCS: knowledgeSdk.KnowledgeDocument[] = [
   },
 ];
 
-function renderDetail(initial = "/knowledge/support-docs") {
-  return render(
+function detailTree(initial: string) {
+  return (
     <MemoryRouter initialEntries={[initial]}>
       <App>
         <Routes>
@@ -106,8 +106,12 @@ function renderDetail(initial = "/knowledge/support-docs") {
           <Route path="/knowledge/:name/:tab" element={<KnowledgeDetail />} />
         </Routes>
       </App>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderDetail(initial = "/knowledge/support-docs") {
+  return render(detailTree(initial));
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -504,10 +508,140 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     await waitFor(() => expect(signals).toHaveLength(1));
 
     const row = screen.getAllByTestId(/^doc-upload-queue-row-/)[0];
-    await userEvent.click(within(row).getByRole("button", { name: /cancel/i }));
+    // per-row controls are labelled with the file's path (review #11)
+    await userEvent.click(within(row).getByRole("button", { name: "Cancel a.pdf" }));
 
     expect(signals[0].aborted).toBe(true);
     await waitFor(() => expect(countBy(rowStatuses())).toEqual({ failed: 1 }));
+    // the header counts it as cancelled, not failed (review #9)
+    const header = screen.getByTestId("doc-upload-queue-header");
+    expect(header).toHaveTextContent(/Cancelled 1/);
+    expect(header).not.toHaveTextContent(/Failed/);
+    // "Clear finished" dismisses the cancelled row (review #9)
+    await userEvent.click(within(header).getByRole("button", { name: /clear finished/i }));
+    expect(screen.queryByTestId("doc-upload-queue")).not.toBeInTheDocument();
+  });
+
+  it("a server 413 without limit_bytes says 'too large' without inventing a number (review #8)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "uploadDocument").mockRejectedValue(
+      new ApiError("Request failed with status code 413", "HTTP_413", 413),
+    );
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    pickFiles([fileOf("a.pdf")]);
+
+    await waitFor(() => expect(countBy(rowStatuses())).toEqual({ failed: 1 }));
+    const row = screen.getAllByTestId(/^doc-upload-queue-row-/)[0];
+    expect(row).toHaveTextContent(/file too large/i);
+    expect(row).not.toHaveTextContent(/MB/);
+  });
+
+  it("readonly after the fact: Retry on a failed row is disabled and never re-sends (review #3)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi
+      .spyOn(knowledgeSdk, "uploadDocument")
+      .mockRejectedValue(new Error("boom"));
+
+    const view = renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    pickFiles([fileOf("a.pdf")]);
+    await waitFor(() => expect(countBy(rowStatuses())).toEqual({ failed: 1 }));
+    expect(uploadSpy).toHaveBeenCalledTimes(1);
+
+    // the page flips to readonly (e.g. the admin switches tenant) while the
+    // failed row is still on screen
+    isTenantSwitchedMock.mockReturnValue(true);
+    view.rerender(detailTree("/knowledge/support-docs"));
+    await waitFor(() => expect(screen.getByTestId("doc-upload-dragger")).toBeDisabled());
+
+    const row = screen.getAllByTestId(/^doc-upload-queue-row-/)[0];
+    const retry = within(row).getByRole("button", { name: "Retry a.pdf" });
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(uploadSpy).toHaveBeenCalledTimes(1);
+    expect(countBy(rowStatuses())).toEqual({ failed: 1 });
+  });
+
+  it("a pick whose name matches an existing document is skipped as a duplicate (review #1)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi.spyOn(knowledgeSdk, "uploadDocument").mockResolvedValue(DOCS[0]);
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    pickFiles([fileOf("faq.pdf")]); // DOCS[0].filename
+
+    const summary = await screen.findByTestId("doc-upload-summary");
+    expect(summary).toHaveTextContent(/Skipped 1 duplicate name/);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(uploadSpy).not.toHaveBeenCalled();
+  });
+
+  it("a dropped folder is expanded and its unsupported files are counted as skipped (review #4)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const uploadSpy = vi
+      .spyOn(knowledgeSdk, "uploadDocument")
+      .mockImplementation(() => new Promise(() => {}));
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+
+    // Minimal FileSystem*Entry fakes, shaped as rc-upload's traverseFileTree
+    // consumes them: a directory "docs" holding a.pdf and setup.exe.
+    const fileEntry = (name: string) => ({
+      isFile: true,
+      isDirectory: false,
+      fullPath: `/docs/${name}`,
+      file: (cb: (f: File) => void) => cb(fileOf(name)),
+    });
+    const children = [fileEntry("a.pdf"), fileEntry("setup.exe")];
+    const dirEntry = {
+      isFile: false,
+      isDirectory: true,
+      fullPath: "/docs",
+      createReader: () => {
+        let drained = false;
+        return {
+          readEntries: (ok: (entries: unknown[]) => void) => {
+            if (drained) return ok([]);
+            drained = true;
+            return ok(children);
+          },
+        };
+      },
+    };
+    const dataTransfer = {
+      items: [{ kind: "file", webkitGetAsEntry: () => dirEntry }],
+      files: [],
+      types: ["Files"],
+    };
+
+    const input = screen.getByTestId("doc-upload-dragger");
+    // dragover flips the Dragger to directory mode so rc-upload walks entries
+    fireEvent.dragOver(input, { dataTransfer });
+    expect(input).toHaveAttribute("webkitdirectory");
+    fireEvent.drop(input, { dataTransfer });
+
+    await waitFor(() => expect(uploadSpy).toHaveBeenCalledTimes(1));
+    expect(uploadSpy.mock.calls[0][1].name).toBe("a.pdf");
+    expect(screen.getByText("docs/a.pdf")).toBeInTheDocument();
+    const summary = screen.getByTestId("doc-upload-summary");
+    expect(summary).toHaveTextContent(/Skipped 1 unsupported file/);
+    await userEvent.click(within(summary).getByRole("button", { name: /show list/i }));
+    expect(countBy(rowStatuses())).toEqual({ uploading: 1, skipped: 1 });
+    expect(screen.getByText("docs/setup.exe")).toBeInTheDocument();
+    // the drop ended the drag → back to file mode
+    expect(input).not.toHaveAttribute("webkitdirectory");
   });
 
   it("readonly (switched tenant): a pick never reaches the SDK and no queue renders", async () => {
@@ -538,16 +672,16 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
     const input = screen.getByTestId("doc-upload-dragger");
     expect(input).not.toHaveAttribute("webkitdirectory");
-    expect(input).toHaveAttribute("accept", expect.stringContaining(".pdf"));
+    // No ``accept`` on any path: rc-upload would filter unsupported files
+    // before the queue can count them (antd defaults the attr to "", which
+    // attrAccept treats as "accept all").
+    expect(input.getAttribute("accept") ?? "").toBe("");
 
     await userEvent.click(screen.getByTestId("doc-upload-folder-toggle"));
 
     const dirInput = screen.getByTestId("doc-upload-dragger");
     expect(dirInput).toHaveAttribute("webkitdirectory");
-    // rc-upload filters by ``accept`` itself in directory mode, which would
-    // hide unsupported files from the skipped count — so accept is emptied
-    // (antd defaults it to "", which attrAccept treats as "accept all").
-    expect(dirInput).toHaveAttribute("accept", "");
+    expect(dirInput.getAttribute("accept") ?? "").toBe("");
   });
 
   it("documents table paginates client-side at 50 with a total", async () => {

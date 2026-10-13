@@ -123,8 +123,10 @@ export interface RetrievalTestBody {
 }
 
 /** Upload whitelist — mirrors the backend's SUPPORTED_EXTENSIONS
- *  (``knowledge/parsing.py``); used for the Upload ``accept`` attr and
- *  a pre-flight check so unsupported files fail before the request. */
+ *  (``knowledge/parsing.py``); the upload queue's pre-flight check so
+ *  unsupported files are skipped before any request. Deliberately not an
+ *  Upload ``accept`` attr: rc-upload would filter those files out before
+ *  the queue can count them. */
 export const SUPPORTED_DOCUMENT_EXTENSIONS = [
   ".pdf",
   ".docx",

@@ -153,13 +153,16 @@ test("batch upload: queue rows, 413 → failed row, unsupported → skipped summ
   await expect(queue).toContainText("2 / 3 uploaded");
 
   const summary = page.getByTestId("doc-upload-summary");
-  await expect(summary).toContainText("Skipped 1 unsupported file(s)");
+  await expect(summary).toContainText("Skipped 1 unsupported file");
   await summary.getByRole("button", { name: "Show list" }).click();
   await expect(rows).toHaveCount(4);
   await expect(queue.locator('[data-status="skipped"]')).toContainText("setup.exe");
 
   // the table paginates client-side and shows the total
   await expect(page.getByTestId("doc-table-pagination")).toContainText("1 documents");
+
+  // the queue panel (rows, progress bars, per-file buttons) must pass axe too
+  await expectNoA11yViolations(page, "knowledge-batch-upload");
 });
 
 test("knowledge detail passes axe (serious + critical)", async ({ page }) => {
