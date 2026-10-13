@@ -772,7 +772,7 @@ def test_main_writes_jsonl_and_baseline_fingerprint(
     assert fingerprint["embed_base_url"] is None
     assert fingerprint["embedding_dim"] == EMBEDDING_DIM
     assert isinstance(fingerprint["git_dirty"], bool)
-    assert fingerprint["corpus_root"] == str(root.resolve())
+    assert fingerprint["corpus_root"] == root.resolve().name  # no machine-local path
     assert len(fingerprint["dataset_sha256"]) == 64
     assert len(fingerprint["manifest_sha256"]) == 64
 
