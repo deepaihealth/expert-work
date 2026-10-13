@@ -9,6 +9,9 @@ import pytest
 
 from control_plane.knowledge.chunking import (
     _cosine_distance,
+    _hard_split,
+    _split_by_tokens,
+    _tail_text,
     chunk_markdown,
     chunk_markdown_semantic,
     count_tokens,
@@ -131,6 +134,73 @@ def test_consecutive_paragraphs_pack_into_one_chunk() -> None:
     assert len(chunks) == 1
     assert "first short paragraph" in chunks[0]
     assert "second short paragraph" in chunks[0]
+
+
+# ---------------------------------------------------------------------------
+# 中文 / 多字节边界 —— 切片不许落在一个字符中间(B-175 L2-PR1)
+# ---------------------------------------------------------------------------
+
+_ZH = (
+    "益生菌需要放冰箱冷藏吗？常温密封保存即可，开袋后尽快食用。"  # noqa: RUF001
+    "每日一袋，温水冲服，建议餐后半小时内服用效果更佳。"  # noqa: RUF001
+) * 6
+
+
+@pytest.mark.parametrize("overlap", range(1, 40))
+def test_tail_overlap_never_cuts_inside_a_character(overlap: int) -> None:
+    # 10-10 实测:按 token 截尾,39 种重叠长度里 13 种带 U+FFFD。
+    assert "\ufffd" not in _tail_text(_ZH, overlap)
+
+
+def test_tail_overlap_starts_at_the_earliest_sentence_boundary() -> None:
+    text = "第一句话在这里。第二句话在这里。第三句话在这里。"
+    overlap = count_tokens("句话在这里。第三句话在这里。")  # 原始窗口从第二句中间开始
+    assert _tail_text(text, overlap) == "第三句话在这里。"
+
+
+def test_tail_overlap_treats_paragraph_break_as_a_boundary() -> None:
+    text = "甲段第一句。甲段第二句。\n\n乙段第一句。乙段第二句。"
+    overlap = count_tokens("第二句。\n\n乙段第一句。乙段第二句。")
+    assert _tail_text(text, overlap) == "乙段第一句。乙段第二句。"
+
+
+def test_tail_overlap_without_any_boundary_falls_back_to_character_boundary() -> None:
+    text = "无标点无空格" * 20
+    tail = _tail_text(text, 5)
+    assert tail
+    assert "\ufffd" not in tail
+    assert text.endswith(tail)
+
+
+def test_split_by_tokens_is_lossless_and_never_cuts_inside_a_character() -> None:
+    text = "无标点" * 50
+    parts = _split_by_tokens(text, 7)
+    assert len(parts) > 1
+    assert "".join(parts) == text
+    assert all("\ufffd" not in part for part in parts)
+
+
+def test_chinese_paragraph_hard_splits_on_sentence_marks_without_spaces() -> None:
+    # 中文句号后面没有空格,老的边界正则一刀都切不下去,整段落到 token 窗口。
+    parts = _hard_split(_ZH, 40)
+    assert len(parts) > 1
+    assert all("\ufffd" not in part for part in parts)
+    assert all(part.endswith(("。", "？")) for part in parts)  # noqa: RUF001
+    assert "".join(parts) == _ZH
+
+
+def test_hard_split_keeps_english_words_and_spacing_intact() -> None:
+    paragraph = " ".join(f"sentence number {i} of the paragraph." for i in range(60))
+    parts = _hard_split(paragraph, 30)
+    assert len(parts) > 1
+    assert " ".join(parts).split() == paragraph.split()
+    assert not any("  " in part for part in parts)
+
+
+def test_chunk_markdown_chinese_section_has_no_replacement_characters() -> None:
+    chunks = chunk_markdown("# 产品\n\n" + _ZH, max_tokens=40, overlap_tokens=10)
+    assert len(chunks) > 1
+    assert all("\ufffd" not in chunk for chunk in chunks)
 
 
 # ---------------------------------------------------------------------------
