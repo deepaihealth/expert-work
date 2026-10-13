@@ -223,7 +223,7 @@ def test_match_defaults_to_any_and_rejects_unknown(tmp_path: Path) -> None:
     def write(match: object) -> Path:
         case: dict[str, object] = {
             "id": "c1",
-            "query": "哪些产品含有 BGI-N3？",
+            "query": "哪些产品含有 BGI-N3?",
             "source": "hard_cross",
             "expected": [{"document": "a.docx", "anchor": "动物双歧杆菌乳亚种BGI-N3"}],
         }
