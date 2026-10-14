@@ -98,6 +98,10 @@ const DOCS: knowledgeSdk.KnowledgeDocument[] = [
   },
 ];
 
+/** Cases that render a full 50-row page more than once: ~1.8 s locally,
+ *  3–6 s on the CI runner — over vitest's 5 s default. */
+const FULL_PAGE_TIMEOUT_MS = 15_000;
+
 /** Click a Popconfirm's OK button — it shares the trigger's label and
  *  mounts last (portal). */
 async function confirmPopover(label: string) {
@@ -731,7 +735,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     await waitFor(() => expect(screen.getByText("doc-59.pdf")).toBeInTheDocument());
     expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 50 }, undefined);
     expect(screen.getAllByText(/^doc-\d+\.pdf$/)).toHaveLength(10);
-  });
+  }, FULL_PAGE_TIMEOUT_MS);
 
   it("a page emptied under us steps back to the last page with rows", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
@@ -760,7 +764,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
 
     await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
     expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 0 }, undefined);
-  });
+  }, FULL_PAGE_TIMEOUT_MS);
 });
 
 // ---------------------------------------------------------------------------
@@ -900,7 +904,7 @@ describe("DocumentsTab — server paging edges (B-175 L3)", () => {
     rerender(tabTree("beta"));
     await waitFor(() => expect(screen.getByText("beta-0.pdf")).toBeInTheDocument());
     expect(listSpy).not.toHaveBeenCalledWith("beta", { limit: 50, offset: 50 }, undefined);
-  });
+  }, FULL_PAGE_TIMEOUT_MS);
 
   it("a slow response for the previous page never overwrites the current page", async () => {
     const many = sixtyDocs("doc");
@@ -934,5 +938,5 @@ describe("DocumentsTab — server paging edges (B-175 L3)", () => {
     });
     expect(screen.queryByText("doc-0.pdf")).not.toBeInTheDocument();
     expect(screen.getByText("doc-59.pdf")).toBeInTheDocument();
-  });
+  }, FULL_PAGE_TIMEOUT_MS);
 });
