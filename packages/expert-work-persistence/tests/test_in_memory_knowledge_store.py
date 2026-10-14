@@ -1362,3 +1362,49 @@ async def test_reindex_fence_expects_ready_and_current_generation() -> None:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+@pytest.mark.asyncio
+async def test_list_bases_page() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    for i in range(5):
+        await store.create_base(tenant_id=tenant, name=f"kb-{i}")
+    await store.create_base(tenant_id=uuid4(), name="foreign")
+    full = await store.list_bases(tenant_id=tenant)
+    page, total = await store.list_bases_page(tenant_id=tenant, limit=2, offset=2)
+    assert total == 5
+    assert [b.id for b in page] == [b.id for b in full[2:4]]
+    tail, _ = await store.list_bases_page(tenant_id=tenant, limit=10, offset=4)
+    assert len(tail) == 1
+    assert await store.list_bases_page(tenant_id=uuid4(), limit=2, offset=0) == ([], 0)
+
+
+@pytest.mark.asyncio
+async def test_list_bases_all_tenants_page() -> None:
+    store = InMemoryKnowledgeStore()
+    for i in range(3):
+        await store.create_base(tenant_id=uuid4(), name=f"kb-{i}")
+    full = await store.list_bases_all_tenants()
+    page, total = await store.list_bases_all_tenants_page(limit=2, offset=1)
+    assert total == 3
+    assert [b.id for b in page] == [b.id for b in full[1:3]]
+
+
+@pytest.mark.asyncio
+async def test_list_bases_created_at_tie_orders_like_sql() -> None:
+    """Same ``created_at``: single-tenant id DESC, all-tenants id ASC — the
+    SQL twin pins the same order (``test_sql_knowledge_store``)."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    for i in range(4):
+        await store.create_base(tenant_id=tenant, name=f"tie-{i}")
+    stamp = datetime(2026, 1, 1, tzinfo=UTC)
+    store._bases = [b.model_copy(update={"created_at": stamp}) for b in store._bases]
+    ids = [b.id for b in store._bases]
+    full = await store.list_bases(tenant_id=tenant)
+    assert [b.id for b in full] == sorted(ids, key=lambda u: u.int, reverse=True)
+    page, _ = await store.list_bases_page(tenant_id=tenant, limit=2, offset=2)
+    assert [b.id for b in page] == [b.id for b in full[2:4]]
+    everyone = await store.list_bases_all_tenants()
+    assert [b.id for b in everyone] == sorted(ids, key=lambda u: u.int)

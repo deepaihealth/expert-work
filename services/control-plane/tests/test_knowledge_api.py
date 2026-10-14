@@ -328,6 +328,38 @@ async def test_list_bases_includes_stats(setup: Setup) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_bases_paginates(setup: Setup) -> None:
+    client, runner = setup
+    for i in range(4):
+        await client.post("/v1/knowledge/bases", json={"name": f"kb-{i}"})
+    await client.post(
+        "/v1/knowledge/bases/kb-0/documents",
+        files={"file": ("d.md", b"# D\n\nbody text here.", "text/markdown")},
+    )
+    await runner.drain()
+    # No ``limit`` → the whole list (the knowledge picker still reads all).
+    everything = (await client.get("/v1/knowledge/bases")).json()
+    assert everything["total"] == 4
+    assert everything["limit"] is None and everything["offset"] == 0
+    assert len(everything["bases"]) == 4
+
+    page = (await client.get("/v1/knowledge/bases?limit=2&offset=2")).json()
+    assert page["total"] == 4
+    assert [b["name"] for b in page["bases"]] == [b["name"] for b in everything["bases"][2:4]]
+    assert page["limit"] == 2 and page["offset"] == 2
+    assert page["truncated"] is False
+    # Stats still attach on a page that holds the base with the document.
+    by_name = {b["name"]: b for b in everything["bases"]}
+    assert by_name["kb-0"]["stats"]["document_count"] == 1
+    tail = (await client.get("/v1/knowledge/bases?limit=2&offset=0")).json()["bases"]
+    tail += (await client.get("/v1/knowledge/bases?limit=2&offset=2")).json()["bases"]
+    assert next(b for b in tail if b["name"] == "kb-0")["stats"]["document_count"] == 1
+
+    clamped = (await client.get("/v1/knowledge/bases?limit=500&offset=-3")).json()
+    assert clamped["limit"] == 200 and clamped["offset"] == 0
+
+
+@pytest.mark.asyncio
 async def test_patch_base_updates_config(setup: Setup) -> None:
     client, _ = setup
     await client.post("/v1/knowledge/bases", json={"name": "kb", "description": "orig"})
@@ -677,6 +709,29 @@ async def test_knowledge_list_bases_star_truncated_flag(
     plain = await client.get("/v1/knowledge/bases")
     assert plain.status_code == 200, plain.text
     assert plain.json()["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_knowledge_list_bases_star_paginates(full_setup: FullSetup) -> None:
+    """``tenant_id=*`` + ``limit``:真分页,``total`` 是全租户总数,不打 truncated。"""
+    client, _runner, store = full_setup
+    for i in range(3):
+        await store.create_base(tenant_id=uuid4(), name=f"kb-{i}")
+    headers = await grant_system_admin(client)
+    everything = await client.get("/v1/knowledge/bases", params={"tenant_id": "*"}, headers=headers)
+    full = everything.json()["bases"]
+    page = await client.get(
+        "/v1/knowledge/bases",
+        params={"tenant_id": "*", "limit": 2, "offset": 1},
+        headers=headers,
+    )
+    assert page.status_code == 200, page.text
+    body = page.json()
+    assert body["total"] == len(full)
+    assert [(b["tenant_id"], b["name"]) for b in body["bases"]] == [
+        (b["tenant_id"], b["name"]) for b in full[1:3]
+    ]
+    assert body["cross_tenant"] is True and body["truncated"] is False
 
 
 _KNOWLEDGE_SCOPE_GETS: list[tuple[str, str]] = [

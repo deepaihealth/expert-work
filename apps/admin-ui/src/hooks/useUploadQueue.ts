@@ -6,11 +6,11 @@
  *
  * - ``enqueue`` classifies every file once: unsupported extension or over
  *   ``maxBytes`` → ``skipped`` (never takes a slot, never retried); a
- *   basename that repeats within the batch, is already queued / uploading,
- *   or is in the caller's ``existingNames`` → ``skipped`` with
- *   ``duplicate_name`` (the server upserts on ``(kb, filename)``, so two
- *   uploads with one name would silently replace each other); the rest →
- *   ``queued`` in input order.
+ *   basename that repeats within the batch or is already queued / uploading
+ *   → ``skipped`` with ``duplicate_name`` (the server upserts on
+ *   ``(kb, filename)``, so two uploads with one name in flight would race
+ *   to replace each other; a name already on the server is an update and
+ *   goes through); the rest → ``queued`` in input order.
  * - Each item keeps the ``upload`` function that was current when it was
  *   enqueued (also for ``retry``), so a batch keeps going to the base it
  *   was picked for even if the page re-renders with another one.
@@ -81,12 +81,6 @@ export interface UploadQueueInput {
   relativePath?: string;
 }
 
-export interface EnqueueOptions {
-  /** Document names already on the server; a pick with one of these
-   *  basenames is skipped as ``duplicate_name``. */
-  existingNames?: ReadonlySet<string>;
-}
-
 export type UploadFn<T> = (
   file: File,
   opts: { signal: AbortSignal; onProgress: (percent: number) => void },
@@ -115,7 +109,7 @@ export interface UseUploadQueueOptions<T> {
 
 export interface UseUploadQueueResult<T> {
   items: UploadQueueItem<T>[];
-  enqueue: (files: ReadonlyArray<File | UploadQueueInput>, opts?: EnqueueOptions) => void;
+  enqueue: (files: ReadonlyArray<File | UploadQueueInput>) => void;
   cancel: (id: string) => void;
   cancelAll: () => void;
   retry: (id: string) => void;
@@ -342,10 +336,10 @@ export function useUploadQueue<T = unknown>({
   }, [pump]);
 
   const enqueue = useCallback(
-    (files: ReadonlyArray<File | UploadQueueInput>, opts: EnqueueOptions = {}) => {
+    (files: ReadonlyArray<File | UploadQueueInput>) => {
       if (files.length === 0 || disposedRef.current) return;
       const batchUpload = uploadRef.current;
-      const taken = new Set<string>(opts.existingNames ?? []);
+      const taken = new Set<string>();
       for (const item of itemsRef.current) if (isActive(item)) taken.add(item.file.name);
 
       const added: UploadQueueItem<T>[] = [];

@@ -65,8 +65,37 @@ export interface KnowledgeDocument {
   chunk_count: number;
   /** Ingestion attempts so far (durability). */
   attempts?: number;
+  /** A re-upload is waiting in the pending slot (ingesting, or failed); the
+   *  previous version's chunks keep serving until it lands or is discarded. */
+  has_pending?: boolean;
   created_at: string | null;
   updated_at: string | null;
+}
+
+/** Upload response — ``unchanged`` is true when the bytes matched the
+ *  ready document already there (200, nothing re-ingested). */
+export interface UploadedDocument extends KnowledgeDocument {
+  unchanged?: boolean;
+}
+
+/** One page of a list endpoint called with ``limit`` / ``offset``. */
+export interface PageParams {
+  limit: number;
+  offset: number;
+}
+
+export interface DocumentsPage {
+  documents: KnowledgeDocument[];
+  total: number;
+  offset: number;
+  limit: number | null;
+}
+
+export interface BasesPage {
+  bases: KnowledgeBase[];
+  total: number;
+  offset: number;
+  limit: number | null;
 }
 
 /** One chunk in the segment-preview list (embedding intentionally omitted). */
@@ -160,6 +189,18 @@ export async function listBases(tenantScope?: TenantScope): Promise<KnowledgeBas
   return response.data.bases;
 }
 
+/** One page of bases (the list page); ``listBases`` stays the whole list
+ *  for the knowledge picker. */
+export async function listBasesPage(
+  page: PageParams,
+  tenantScope?: TenantScope,
+): Promise<BasesPage> {
+  const response = await apiClient.get<BasesPage>("/v1/knowledge/bases", {
+    params: withTenantScope({ limit: page.limit, offset: page.offset }, tenantScope),
+  });
+  return response.data;
+}
+
 export async function getBase(
   name: string,
   tenantScope?: TenantScope,
@@ -221,15 +262,18 @@ export interface UploadDocumentOptions {
 }
 
 /** POST multipart — 202 Accepted; ingestion runs in the background and
- *  the caller polls ``listDocuments`` for the status (Mini-ADR H-18). */
+ *  the caller polls ``listDocuments`` for the status (Mini-ADR H-18). 200
+ *  with ``unchanged: true`` when the same bytes are already ready. A name
+ *  already in the base is an update: the new bytes wait in the pending slot
+ *  while the previous version keeps serving. */
 export async function uploadDocument(
   baseName: string,
   file: File,
   { signal, onProgress }: UploadDocumentOptions = {},
-): Promise<KnowledgeDocument> {
+): Promise<UploadedDocument> {
   const form = new FormData();
   form.append("file", file);
-  const response = await apiClient.post<KnowledgeDocument>(
+  const response = await apiClient.post<UploadedDocument>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
     form,
     {
@@ -248,13 +292,14 @@ export async function uploadDocument(
 
 export async function listDocuments(
   baseName: string,
+  page: PageParams,
   tenantScope?: TenantScope,
-): Promise<KnowledgeDocument[]> {
-  const response = await apiClient.get<{ documents: KnowledgeDocument[] }>(
+): Promise<DocumentsPage> {
+  const response = await apiClient.get<DocumentsPage>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
-    { params: withTenantScope({}, tenantScope) },
+    { params: withTenantScope({ limit: page.limit, offset: page.offset }, tenantScope) },
   );
-  return response.data.documents;
+  return response.data;
 }
 
 export async function deleteDocument(baseName: string, documentId: string): Promise<void> {
@@ -271,6 +316,18 @@ export async function reingestDocument(
 ): Promise<KnowledgeDocument> {
   const response = await apiClient.post<KnowledgeDocument>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/reingest`,
+  );
+  return response.data;
+}
+
+/** Drop a re-upload waiting in the pending slot and keep serving the
+ *  previous version. Throws (HTTP 409) when nothing is pending. */
+export async function discardPendingDocument(
+  baseName: string,
+  documentId: string,
+): Promise<KnowledgeDocument> {
+  const response = await apiClient.post<KnowledgeDocument>(
+    `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/discard-pending`,
   );
   return response.data;
 }

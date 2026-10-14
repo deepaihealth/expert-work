@@ -38,6 +38,9 @@ const DOCUMENTS_RESPONSE = {
       updated_at: "2026-06-12T00:05:00Z",
     },
   ],
+  total: 1,
+  offset: 0,
+  limit: 50,
 };
 
 const TEST_RESPONSE = {
@@ -56,10 +59,16 @@ const TEST_RESPONSE = {
 };
 
 test.beforeEach(async ({ page }) => {
-  await page.route("**/v1/knowledge/bases", (route) => route.fulfill({ json: { bases: [BASE] } }));
+  // Predicates, not globs: the list reads carry ``?limit=&offset=`` and a
+  // glob has to match the whole URL, query included.
+  await page.route(
+    (url) => url.pathname === "/v1/knowledge/bases",
+    (route) => route.fulfill({ json: { bases: [BASE], total: 1, offset: 0, limit: 20 } }),
+  );
   await page.route("**/v1/knowledge/bases/support-docs", (route) => route.fulfill({ json: BASE }));
-  await page.route("**/v1/knowledge/bases/*/documents", (route) =>
-    route.fulfill({ json: DOCUMENTS_RESPONSE }),
+  await page.route(
+    (url) => /^\/v1\/knowledge\/bases\/[^/]+\/documents$/.test(url.pathname),
+    (route) => route.fulfill({ json: DOCUMENTS_RESPONSE }),
   );
   await page.route("**/v1/knowledge/bases/*/test", (route) =>
     route.fulfill({ json: TEST_RESPONSE }),
@@ -169,4 +178,44 @@ test("knowledge detail passes axe (serious + critical)", async ({ page }) => {
   await page.goto("/knowledge/support-docs");
   await expect(page.getByTestId("knowledge-detail-root")).toBeVisible();
   await expectNoA11yViolations(page, "knowledge-detail");
+});
+
+// B-175 L3 — a failed re-upload: the row says the previous version is still
+// in use and "discard new version" posts discard-pending after confirming.
+test("pending re-upload: previous-version marker + discard", async ({ page }) => {
+  const doc = DOCUMENTS_RESPONSE.documents[0];
+  let discarded = false;
+  await page.route(
+    (url) => /^\/v1\/knowledge\/bases\/[^/]+\/documents$/.test(url.pathname),
+    (route) =>
+      route.fulfill({
+        json: {
+          ...DOCUMENTS_RESPONSE,
+          documents: [
+            discarded
+              ? doc
+              : { ...doc, status: "failed", error: "parse failed", has_pending: true },
+          ],
+        },
+      }),
+  );
+  await page.route(
+    `**/v1/knowledge/bases/support-docs/documents/${doc.id}/discard-pending`,
+    (route) => {
+      discarded = true;
+      return route.fulfill({ json: doc });
+    },
+  );
+
+  await page.goto("/knowledge/support-docs");
+  await expect(page.getByTestId(`doc-pending-${doc.id}`)).toHaveText(
+    "Previous version still in use",
+  );
+  await page.getByTestId(`doc-discard-pending-${doc.id}`).click();
+  await page
+    .locator(".ant-popconfirm")
+    .getByRole("button", { name: "Discard new version" })
+    .click();
+  await expect(page.getByTestId(`doc-pending-${doc.id}`)).toHaveCount(0);
+  expect(discarded).toBe(true);
 });

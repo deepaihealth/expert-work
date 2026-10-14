@@ -375,19 +375,16 @@ describe("useUploadQueue", () => {
       expect(result.current.summary.skipped).toBe(1);
     });
 
-    it("a basename already present in `existingNames` is skipped", () => {
+    it("a basename that already finished uploading goes through again (re-upload = update)", async () => {
       const { calls, upload } = makeUpload();
       const { result } = renderHook(() => useUploadQueue({ upload }));
 
-      act(() =>
-        result.current.enqueue([pdf("faq.pdf"), pdf("new.pdf")], {
-          existingNames: new Set(["faq.pdf"]),
-        }),
-      );
+      act(() => result.current.enqueue([pdf("faq.pdf")]));
+      await settle(() => calls[0].d.resolve({ id: "doc-faq" }));
+      act(() => result.current.enqueue([pdf("faq.pdf")]));
 
-      expect(statuses(result.current.items)).toEqual(["skipped", "uploading"]);
-      expect(result.current.items[0].skipReason).toBe("duplicate_name");
-      expect(calls.map((c) => c.file.name)).toEqual(["new.pdf"]);
+      expect(statuses(result.current.items)).toEqual(["done", "uploading"]);
+      expect(calls.map((c) => c.file.name)).toEqual(["faq.pdf", "faq.pdf"]);
     });
 
     it("a basename still queued / uploading from an earlier batch is never started twice", () => {

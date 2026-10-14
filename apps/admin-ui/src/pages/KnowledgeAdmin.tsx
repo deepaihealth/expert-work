@@ -10,15 +10,17 @@
  * aggregates every tenant under ``"*"`` (W4). Writes still bind by name to the
  * caller's own tenant, so they are greyed out in both the switched-in and the
  * aggregate view — see ``writeDisabled`` below.
+ *
+ * B-175 L3: the table pages server-side (``BASES_PAGE_SIZE`` per page).
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { App, Alert, Button, Empty, Popconfirm, Space, Table, Tag, Tooltip, Typography } from "antd";
-import type { TableColumnsType } from "antd";
+import type { TableColumnsType, TablePaginationConfig } from "antd";
 import { BookOpen, Plus, RefreshCcw, Trash2 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
-import { deleteBase, listBases, type KnowledgeBase } from "../api/knowledge";
+import { deleteBase, listBasesPage, type KnowledgeBase } from "../api/knowledge";
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
@@ -29,6 +31,10 @@ import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 import { tenantRowKey } from "../utils/tenantRowKey";
 
 const { Text } = Typography;
+
+const BASES_PAGE_SIZE = 20;
+// ``data-*`` isn't in antd's pagination prop type; rc-pagination forwards it.
+const BASES_PAGINATION_TESTID = { "data-testid": "kb-table-pagination" };
 
 function errMessage(err: unknown): string {
   return err instanceof ApiError
@@ -57,6 +63,18 @@ export function KnowledgeAdmin() {
   const navigate = useNavigate();
 
   const [bases, setBases] = useState<KnowledgeBase[]>([]);
+  const [total, setTotal] = useState(0);
+  /** 1-based page; a scope switch starts again on page 1 (reset in render
+   *  so the fetch never runs with the previous scope's page). */
+  const [page, setPage] = useState(1);
+  const [scopeSeen, setScopeSeen] = useState(apiTenantScope);
+  if (scopeSeen !== apiTenantScope) {
+    setScopeSeen(apiTenantScope);
+    setPage(1);
+  }
+  /** Only the latest list request may write the table (a scope switch or
+   *  page flip can overtake a slow one). */
+  const requestSeqRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -64,14 +82,27 @@ export function KnowledgeAdmin() {
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
+    const seq = ++requestSeqRef.current;
     try {
-      setBases(await listBases(apiTenantScope));
+      const result = await listBasesPage(
+        { limit: BASES_PAGE_SIZE, offset: (page - 1) * BASES_PAGE_SIZE },
+        apiTenantScope,
+      );
+      if (seq !== requestSeqRef.current) return;
+      // The page emptied (its last base deleted) → step back; that refetches.
+      const lastPage = Math.max(1, Math.ceil(result.total / BASES_PAGE_SIZE));
+      if (result.bases.length === 0 && page > lastPage) {
+        setPage(lastPage);
+        return;
+      }
+      setBases(result.bases);
+      setTotal(result.total);
     } catch (err) {
-      setError(errMessage(err));
+      if (seq === requestSeqRef.current) setError(errMessage(err));
     } finally {
-      setLoading(false);
+      if (seq === requestSeqRef.current) setLoading(false);
     }
-  }, [apiTenantScope]);
+  }, [apiTenantScope, page]);
 
   useEffect(() => {
     void refresh();
@@ -198,6 +229,20 @@ export function KnowledgeAdmin() {
     [t, handleDelete, writeDisabled, isAggregate],
   );
 
+  const pagination = useMemo<TablePaginationConfig>(
+    () => ({
+      current: page,
+      pageSize: BASES_PAGE_SIZE,
+      total,
+      showSizeChanger: false,
+      hideOnSinglePage: true,
+      showTotal: (count: number) => t("knowledge_page.bases_table_total", { total: count }),
+      onChange: setPage,
+      ...BASES_PAGINATION_TESTID,
+    }),
+    [page, t, total],
+  );
+
   return (
     <div data-testid="knowledge-root">
       <PageHeader
@@ -255,7 +300,7 @@ export function KnowledgeAdmin() {
         rowKey={(r) => tenantRowKey(r.tenant_id, r.name)}
         dataSource={bases}
         loading={loading}
-        pagination={false}
+        pagination={pagination}
         onRow={(record) => ({
           onClick: () => {
             // Cross-tenant W4 — in the "*" aggregate a foreign-tenant row

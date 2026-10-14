@@ -558,6 +558,18 @@ export interface TranslationKeys {
     reingest: string;
     reingest_started: string;
     reingest_no_bytes: string;
+    upload_queue_unchanged: string;
+    pending_previous_serving: string;
+    pending_nothing_serving: string;
+    pending_ingesting_hint: string;
+    pending_failed_hint: string;
+    discard_pending: string;
+    discard_pending_confirm_title: string;
+    discard_pending_confirm_body: string;
+    discard_pending_confirm_body_nothing_serving: string;
+    discard_pending_done: string;
+    discard_pending_none: string;
+    bases_table_total: string;
     view_chunks: string;
     chunks_drawer_title: string;
     chunks_empty: string;
@@ -3839,7 +3851,7 @@ const en: TranslationKeys = {
     upload_queue_hide_skipped: "Hide list",
     upload_queue_reason_unsupported: "Unsupported type",
     upload_queue_reason_too_large: "Over {{limit}}",
-    upload_queue_reason_duplicate: "Same name as another file in this batch or an existing document",
+    upload_queue_reason_duplicate: "Same name as another file in this batch or still in the queue",
     upload_queue_err_too_large_server: "Rejected by the server: over {{limit}}",
     upload_queue_err_too_large_server_unknown: "Rejected by the server: file too large",
     upload_queue_err_stalled: "Upload stalled: no progress for {{seconds}} s",
@@ -3853,6 +3865,18 @@ const en: TranslationKeys = {
     reingest_started: "Re-ingestion started.",
     reingest_no_bytes:
       "The original file was not retained for this document — please re-upload it.",
+    upload_queue_unchanged: "Unchanged — not re-ingested",
+    pending_previous_serving: "Previous version still in use",
+    pending_nothing_serving: "New version pending, nothing in use yet",
+    pending_ingesting_hint: "The newly uploaded version is being ingested; retrieval keeps using the previous version until it finishes.",
+    pending_failed_hint: "The newly uploaded version failed to ingest; retrieval still uses the previous version. Re-ingest it, or discard the new version.",
+    discard_pending: "Discard new version",
+    discard_pending_confirm_title: "Discard the new version of \"{{name}}\"?",
+    discard_pending_confirm_body: "The newly uploaded file is deleted and retrieval keeps using the previous version.",
+    discard_pending_confirm_body_nothing_serving: "The newly uploaded file is deleted. This document has no previous version in use, so it will show as failed until you upload it again.",
+    discard_pending_done: "New version discarded; the previous version stays in use.",
+    discard_pending_none: "This document has no pending new version (it may have finished ingesting). The list was refreshed.",
+    bases_table_total: "{{total}} knowledge bases",
     view_chunks: "View chunks",
     chunks_drawer_title: "Chunks · {{name}}",
     chunks_empty: "No chunks (the document may still be processing).",

@@ -66,10 +66,11 @@ logger = logging.getLogger("expert_work.control_plane.knowledge")
 # store-side constant (single source — the store default and the ``truncated``
 # flag below must never drift).
 
-#: Document list paging. Without ``limit`` the whole list is returned (the
-#: admin UI still pages client-side — L3's second PR switches it over); an
+#: Document / base list paging. Without ``limit`` the whole list is returned
+#: (the manifest editor's knowledge picker still reads every base); an
 #: explicit ``limit`` is clamped to the maximum.
 DOCUMENTS_PAGE_MAX = 200
+BASES_PAGE_MAX = 200
 
 #: Upload is read in slices this large and rejected (413) as soon as the
 #: running total passes the configured cap — the whole file is never buffered
@@ -322,6 +323,8 @@ def build_knowledge_router() -> APIRouter:
         # W3 read scope — a concrete id lets a system_admin read a foreign
         # tenant's knowledge bases from the tenant switcher.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> JSONResponse:
         # W4 — real cross-tenant aggregate: "*" reads every tenant via the
         # store's all-tenants readers; a concrete id keeps the W3 single-tenant
@@ -334,12 +337,26 @@ def build_knowledge_router() -> APIRouter:
             endpoint="GET /v1/knowledge/bases",
             cross_tenant_enabled=cross_tenant_query_enabled(request),
         )
+        safe_offset = max(0, offset)
+        safe_limit = max(1, min(limit, BASES_PAGE_MAX)) if limit is not None else None
         async with applied_scope(scope):
             if isinstance(scope, CrossTenant):
-                bases = await store.list_bases_all_tenants(limit=ALL_TENANTS_BASES_LIMIT)
+                if safe_limit is None:
+                    bases = await store.list_bases_all_tenants(limit=ALL_TENANTS_BASES_LIMIT)
+                    total = len(bases)
+                else:
+                    bases, total = await store.list_bases_all_tenants_page(
+                        limit=safe_limit, offset=safe_offset
+                    )
                 stats = await store.base_stats_many_all_tenants(kb_ids=[b.id for b in bases])
             else:
-                bases = await store.list_bases(tenant_id=scope.tenant_id)
+                if safe_limit is None:
+                    bases = await store.list_bases(tenant_id=scope.tenant_id)
+                    total = len(bases)
+                else:
+                    bases, total = await store.list_bases_page(
+                        tenant_id=scope.tenant_id, limit=safe_limit, offset=safe_offset
+                    )
                 stats = await store.base_stats_many(tenant_id=scope.tenant_id)
         current = await _current_embedding_model(config_service)
         return JSONResponse(
@@ -355,10 +372,15 @@ def build_knowledge_router() -> APIRouter:
                 # W4 response contract — aggregate branch flagged for the UI.
                 "cross_tenant": isinstance(scope, CrossTenant),
                 # W4 review #3 — a full aggregate page signals the cap was hit
-                # (the single-tenant branch has no cap, so it is never
-                # truncated).
+                # (the single-tenant branch has no cap, and a paged read
+                # carries the real ``total``, so neither is ever truncated).
                 "truncated": isinstance(scope, CrossTenant)
+                and safe_limit is None
                 and len(bases) == ALL_TENANTS_BASES_LIMIT,
+                "total": total,
+                # Unpaged reads ignore ``offset`` (always the whole list).
+                "offset": safe_offset if safe_limit is not None else 0,
+                "limit": safe_limit,
             }
         )
 

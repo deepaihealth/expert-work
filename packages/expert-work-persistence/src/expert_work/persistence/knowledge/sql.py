@@ -238,7 +238,8 @@ class SqlKnowledgeStore(KnowledgeStore):
         stmt = (
             select(KnowledgeBaseRow)
             .where(KnowledgeBaseRow.tenant_id == tenant_id)
-            .order_by(KnowledgeBaseRow.created_at.desc())
+            # ``id`` tiebreak — same order as ``list_bases_page``.
+            .order_by(KnowledgeBaseRow.created_at.desc(), KnowledgeBaseRow.id.desc())
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
@@ -256,6 +257,42 @@ class SqlKnowledgeStore(KnowledgeStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_to_base(row) for row in rows]
+
+    async def list_bases_page(
+        self, *, tenant_id: UUID, limit: int, offset: int
+    ) -> tuple[list[KnowledgeBase], int]:
+        page_stmt = (
+            select(KnowledgeBaseRow)
+            .where(KnowledgeBaseRow.tenant_id == tenant_id)
+            .order_by(KnowledgeBaseRow.created_at.desc(), KnowledgeBaseRow.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        count_stmt = (
+            select(func.count())
+            .select_from(KnowledgeBaseRow)
+            .where(KnowledgeBaseRow.tenant_id == tenant_id)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(page_stmt)).scalars().all()
+            total = (await session.execute(count_stmt)).scalar_one()
+        return [_to_base(row) for row in rows], int(total)
+
+    async def list_bases_all_tenants_page(
+        self, *, limit: int, offset: int
+    ) -> tuple[list[KnowledgeBase], int]:
+        # W4 — no tenant filter; caller must wrap in bypass_rls_session().
+        page_stmt = (
+            select(KnowledgeBaseRow)
+            .order_by(KnowledgeBaseRow.created_at.desc(), KnowledgeBaseRow.id)
+            .offset(offset)
+            .limit(limit)
+        )
+        count_stmt = select(func.count()).select_from(KnowledgeBaseRow)
+        async with self._sf() as session:
+            rows = (await session.execute(page_stmt)).scalars().all()
+            total = (await session.execute(count_stmt)).scalar_one()
+        return [_to_base(row) for row in rows], int(total)
 
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
         stmt = select(

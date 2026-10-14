@@ -13,7 +13,14 @@ import { getAgent, getRevision, listRevisions } from "../agents";
 import { downloadArtifact, listArtifactVersions } from "../artifacts";
 import { getRun, streamRunEvents } from "../runs";
 import { getRunTrace } from "../trace_facade";
-import { getBase, listBases, listChunks, listDocuments, testRetrieval } from "../knowledge";
+import {
+  getBase,
+  listBases,
+  listBasesPage,
+  listChunks,
+  listDocuments,
+  testRetrieval,
+} from "../knowledge";
 import {
   exportSkillVersion,
   getSkill,
@@ -199,11 +206,18 @@ describe("knowledge SDK — tenantScope passthrough", () => {
     expect(calls[0].params?.tenant_id).toBe(TENANT);
   });
 
-  it("listDocuments threads tenant_id", async () => {
-    const calls = captureAdapter({ documents: [] });
-    await listDocuments("kb", TENANT);
+  it("listBasesPage threads tenant_id alongside paging params", async () => {
+    const calls = captureAdapter({ bases: [], total: 0, offset: 20, limit: 20 });
+    await listBasesPage({ limit: 20, offset: 20 }, TENANT);
+    expect(calls[0].url).toBe("/v1/knowledge/bases");
+    expect(calls[0].params).toMatchObject({ limit: 20, offset: 20, tenant_id: TENANT });
+  });
+
+  it("listDocuments threads tenant_id alongside paging params", async () => {
+    const calls = captureAdapter({ documents: [], total: 0, offset: 50, limit: 50 });
+    await listDocuments("kb", { limit: 50, offset: 50 }, TENANT);
     expect(calls[0].url).toBe("/v1/knowledge/bases/kb/documents");
-    expect(calls[0].params?.tenant_id).toBe(TENANT);
+    expect(calls[0].params).toMatchObject({ limit: 50, offset: 50, tenant_id: TENANT });
   });
 
   it("listChunks threads tenant_id alongside paging params", async () => {
