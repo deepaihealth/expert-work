@@ -6,12 +6,15 @@
 1. 读评测集(``kb_dataset.load_dataset``)与语料清单(``kb_corpus_inventory.py`` 产出的
    ``manifest.csv``);按 ``--tiers`` 选行,同一 ``dup_group`` 只入第一份,``--limit-docs``
    在去重之后截头;
-2. 单库,库名 = 评测集 ``name``;每份文档 ``upsert_document(content=None)`` → 解析在**进程池**
-   里跑(PyMuPDF 非线程安全;每份有 ``--parse-timeout``)→
+2. 单库,库名 = 评测集 ``name``;解析在**进程池**里并发跑(PyMuPDF 非线程安全;每份有
+   ``--parse-timeout``),落库按清单顺序逐份串行:``upsert_document(content=None)`` →
    ``control_plane.knowledge.ingestion.ingest_markdown``(语义切块 → 嵌入 → 落段,与上传后的
    入库链路同一段代码)→ ``set_document_status(READY, chunk_count)``;失败按阶段
    ``parse|embed|store|other`` 记进 ``ingest_failures``,文档标 FAILED,不中断;同名不同内容的
    文件后到的一份以「上级目录/文件名」入库,记进 ``name_collisions``;0 字节文件直接跳过;
+   **可复现**:SQL 库默认固定读行顺序(关掉索引扫描、并行扫描、同步顺序扫描与
+   autovacuum,向量路走精确检索),加上串行落库,同一份代码两次跑出逐条相同的结果;
+   ``--ann`` 改走生产同款 HNSW(量近似检索的召回损失时用,不可复现);
 3. 入库后核「锚文本存活」:每条 expected 的 anchor 至少出现在其文档的某一段里,不存活的 case
    单列(是数据集 / 切块的问题,不是检索的问题);
 4. 每条 case 调 ``KnowledgeRetriever.search(limit=top_k)``,按 ``kb_metrics`` 打分(``match``
@@ -390,8 +393,10 @@ async def build_corpus(
 ) -> CorpusReport:
     """一次性建单库并把 ``selection`` 里的文档全部走真实入库链路。
 
-    解析在 ``executor`` 里跑(默认进程池,``min(concurrency, CPU)`` 个 worker),每份
-    ``parse_timeout_s`` 秒超时;解析完的 Markdown 直接进 ``ingest_markdown``(切块 → 嵌入 → 落段)。
+    解析在 ``executor`` 里**并发**跑(默认进程池,``min(concurrency, CPU)`` 个 worker),每份
+    ``parse_timeout_s`` 秒超时;落库(建文档行 → ``ingest_markdown`` 切块 / 嵌入 / 落段 → 置状态)
+    **按清单顺序逐份串行**:行的物理顺序每次都一样,检索并列分数时谁排前面才不随并发抖动
+    (10-14 实测:并发落库时同一份代码连跑两次,303 题里 28 题排序不同)。
     同名文件(不同目录、同 basename、又不是同一 ``dup_group``)只入第一份:库内
     ``(kb_id, filename)`` 唯一,再 upsert 会把前一份重置并删段;后到的记进 ``name_collisions``。
     ``EmbeddingDimensionError`` 不按文档失败记,直接抛出 —— 那是配置错。
@@ -408,13 +413,19 @@ async def build_corpus(
         future = loop.run_in_executor(pool, parser, filename, raw)
         return await asyncio.wait_for(future, timeout=parse_timeout_s)
 
-    async def _ingest(pool: Executor, doc_id: UUID, filename: str, path: str) -> int:
+    async def _parse_row(pool: Executor, row: Mapping[str, str]) -> str:
+        path = row["path"]
         raw = (corpus_root / path).read_bytes()
-        try:
-            markdown = await _parse(pool, filename, raw)
-            markdown.encode("utf-8")  # 孤立代理项在这里炸,算解析失败
-        except Exception as exc:
-            raise _ParseStageError(exc) from exc
+        async with sem:
+            try:
+                markdown = await _parse(pool, _basename(path), raw)
+                markdown.encode("utf-8")  # 孤立代理项在这里炸,算解析失败
+            except Exception as exc:
+                raise _ParseStageError(exc) from exc
+        return markdown
+
+    async def _ingest(doc_id: UUID, parsed: asyncio.Task[str]) -> int:
+        markdown = await parsed
         return await ingest_markdown(
             store=store,
             embedder=embedder,
@@ -427,7 +438,7 @@ async def build_corpus(
         )
 
     async def _one(
-        pool: Executor, index: int, row: Mapping[str, str]
+        index: int, row: Mapping[str, str], parsed: asyncio.Task[str]
     ) -> tuple[int, IngestFailure | None]:
         path = row["path"]
         filename = _basename(path)
@@ -449,40 +460,52 @@ async def build_corpus(
             )
             filename = qualified
         claimed[filename] = path
-        async with sem:
-            doc = await store.upsert_document(
-                tenant_id=tenant_id, kb_id=base.id, filename=filename, content=None
+        doc = await store.upsert_document(
+            tenant_id=tenant_id, kb_id=base.id, filename=filename, content=None
+        )
+        try:
+            count = await _ingest(doc.id, parsed)
+            await store.set_document_status(
+                tenant_id=tenant_id,
+                document_id=doc.id,
+                status=DocumentStatus.READY,
+                chunk_count=count,
             )
-            try:
-                count = await _ingest(pool, doc.id, filename, path)
-                await store.set_document_status(
-                    tenant_id=tenant_id,
-                    document_id=doc.id,
-                    status=DocumentStatus.READY,
-                    chunk_count=count,
-                )
-            except EmbeddingDimensionError:
-                raise
-            except Exception as exc:  # 解析 / 嵌入 / 落段失败只记账,整轮继续
-                stage, error_type = _stage_of(exc)
-                error = f"{error_type}: {exc.__cause__ or exc}"[:_ERROR_CAP]
-                await store.mark_document_failed_terminal(
-                    tenant_id=tenant_id, document_id=doc.id, error=error
-                )
-                print(
-                    f"[ingest {index}/{total}] {filename}: FAILED ({stage}) {error}",
-                    file=sys.stderr,
-                )
-                return 0, IngestFailure(
-                    filename=filename, path=path, stage=stage, error_type=error_type, error=error
-                )
-            print(f"[ingest {index}/{total}] {filename}: {count} chunks", file=sys.stderr)
-            return count, None
+        except EmbeddingDimensionError:
+            raise
+        except Exception as exc:  # 解析 / 嵌入 / 落段失败只记账,整轮继续
+            stage, error_type = _stage_of(exc)
+            error = f"{error_type}: {exc.__cause__ or exc}"[:_ERROR_CAP]
+            await store.mark_document_failed_terminal(
+                tenant_id=tenant_id, document_id=doc.id, error=error
+            )
+            print(
+                f"[ingest {index}/{total}] {filename}: FAILED ({stage}) {error}",
+                file=sys.stderr,
+            )
+            return 0, IngestFailure(
+                filename=filename, path=path, stage=stage, error_type=error_type, error=error
+            )
+        print(f"[ingest {index}/{total}] {filename}: {count} chunks", file=sys.stderr)
+        return count, None
 
     async def _all(pool: Executor) -> list[tuple[int, IngestFailure | None] | BaseException]:
-        return await asyncio.gather(
-            *(_one(pool, i + 1, r) for i, r in enumerate(selection.rows)), return_exceptions=True
-        )
+        # Parse ahead concurrently; write strictly in manifest order.
+        parses = [asyncio.create_task(_parse_row(pool, row)) for row in selection.rows]
+        outcomes: list[tuple[int, IngestFailure | None] | BaseException] = []
+        try:
+            for i, (row, parsed) in enumerate(zip(selection.rows, parses, strict=True)):
+                try:
+                    outcomes.append(await _one(i + 1, row, parsed))
+                except EmbeddingDimensionError:
+                    raise
+                except Exception as exc:  # _one 自己没兜住的(写状态失败等)
+                    outcomes.append(exc)
+        finally:
+            for task in parses:
+                task.cancel()
+            await asyncio.gather(*parses, return_exceptions=True)
+        return outcomes
 
     if executor is None:
         workers = max(1, min(concurrency, os.cpu_count() or 1))
@@ -832,6 +855,7 @@ def fingerprint(
     tiers: Sequence[str],
     limit_docs: int,
     cfg: EvalConfig,
+    ann: bool = False,
 ) -> dict[str, Any]:
     return {
         "dataset_sha256": file_sha256(dataset_path),
@@ -843,6 +867,8 @@ def fingerprint(
         "embed_base_url": embed_base_url,
         "embedding_dim": EMBEDDING_DIM,
         "store": store,
+        # exact = reproducible (serial writes + exact KNN); ann = production HNSW.
+        "vector_search": "ann" if ann else "exact",
         "commit": _git(["rev-parse", "--short", "HEAD"]) or "unknown",
         "git_dirty": bool(_git(["status", "--porcelain"])),
         "tiers": list(tiers),
@@ -884,8 +910,14 @@ def rls_tenant(tenant_id: UUID) -> Iterator[None]:
 
 
 @asynccontextmanager
-async def open_store(kind: str) -> AsyncIterator[KnowledgeStore]:
+async def open_store(kind: str, *, ann: bool = False) -> AsyncIterator[KnowledgeStore]:
     """``memory`` → ``InMemoryKnowledgeStore``;``sql`` → testcontainers 起 pgvector 并迁移到 head。
+
+    默认(``ann=False``)这个一次性库固定读行顺序(见 :func:`_exact_search_defaults`),
+    向量路走精确检索。pgvector 的 HNSW 建图带随机层级,同样的插入顺序也建不出同一张图,
+    近似结果每次可能不同;评测要的是同一份代码两次跑出同一份结果(10-14 实测:开着 HNSW 时
+    303 题里 17 题结果集不同)。
+    ``ann=True`` 走生产同款 HNSW,量近似检索本身的召回损失时用,结果不保证可复现。
 
     SQL 那条路与 ``packages/expert-work-persistence/tests/test_sql_knowledge_store.py`` 的 fixture
     同一套做法:同步 DSN 跑迁移,异步 DSN 建 engine / session factory,再按应用层的样子包一层
@@ -924,11 +956,50 @@ async def open_store(kind: str) -> AsyncIterator[KnowledgeStore]:
         alembic_cfg = Config(str(ALEMBIC_INI))
         alembic_cfg.set_main_option("sqlalchemy.url", sync_dsn)
         command.upgrade(alembic_cfg, "head")
+        if not ann:
+            _exact_search_defaults(sync_dsn)
         engine = create_async_engine_from_config(DatabaseConfig(dsn=async_dsn))
         try:
             yield SqlKnowledgeStore(build_rls_sessionmaker(create_async_session_factory(engine)))
         finally:
             await engine.dispose()
+
+
+def _exact_search_defaults(sync_dsn: str) -> None:
+    """Make this throwaway database return ties in the same order every run.
+
+    Equal scores are common (duplicate documents embed to identical vectors),
+    and Postgres hands ties back in the order it reads rows, so the read
+    order itself has to be fixed:
+
+    * no index scan — HNSW never used, the vector side is exact KNN (GIN still
+      serves keyword search through bitmap scans, which read in table order);
+    * no parallel workers — gather order would vary;
+    * no synchronized seq scans — a scan of the big chunk table would join a
+      concurrent one mid-table (10-14: 203 of 303 cases differed);
+    * no autovacuum — a vacuum during the build records the gaps left in
+      earlier pages and later inserts fill them, so rows land in a different
+      table order depending on when it ran (10-14: still 103 of 303 reordered
+      with only the three settings above).
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+
+    database = make_url(sync_dsn).database
+    engine = create_engine(sync_dsn, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as conn:
+            for setting in (
+                "enable_indexscan = off",
+                "max_parallel_workers_per_gather = 0",
+                "synchronize_seqscans = off",
+            ):
+                conn.execute(text(f'ALTER DATABASE "{database}" SET {setting}'))
+            # Server-wide only; the container is ours alone.
+            conn.execute(text("ALTER SYSTEM SET autovacuum = off"))
+            conn.execute(text("SELECT pg_reload_conf()"))
+    finally:
+        engine.dispose()
 
 
 @dataclass(frozen=True)
@@ -1013,6 +1084,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--threshold", type=float, default=None, help="向量路相似度下限")
     parser.add_argument("--rerank", default="off", choices=("off", "on"))
+    parser.add_argument(
+        "--ann",
+        action="store_true",
+        help="向量路走生产同款 HNSW 近似检索(默认精确检索,结果可复现;ANN 不保证)",
+    )
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument(
         "--parse-timeout",
@@ -1068,7 +1144,7 @@ async def _run(
         f"limit counts after dedup)",
         file=sys.stderr,
     )
-    async with open_store(args.store) as store:
+    async with open_store(args.store, ann=args.ann) as store:
         with rls_tenant(EVAL_TENANT_ID):
             report = await build_corpus(
                 store=store,
@@ -1103,6 +1179,7 @@ async def _run(
     report = replace(report, embed=bundle.embedder.stats())
     config = {
         "store": args.store,
+        "vector_search": "ann" if args.ann else "exact",
         "tiers": list(tiers),
         "limit_docs": args.limit_docs,
         "method": cfg.method.value,
@@ -1176,6 +1253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tiers=tiers,
                 limit_docs=args.limit_docs,
                 cfg=cfg,
+                ann=args.ann,
             ),
         )
         print(f"baseline updated: {baseline_out}")
