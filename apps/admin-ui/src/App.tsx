@@ -15,6 +15,7 @@ import { AuthCallback } from "./pages/AuthCallback";
 import { AuthSilent } from "./pages/AuthSilent";
 import { Login } from "./pages/Login";
 import { SetupWizard } from "./pages/SetupWizard";
+import { TenantScopeGate } from "./tenant/TenantScopeContext";
 
 export default function App() {
   const { mode } = useTheme();
@@ -46,7 +47,12 @@ export default function App() {
                 <ProtectedRoute>
                   <CommandPaletteProvider>
                     <Shell>
-                      <AppRouter />
+                      {/* Pages mount once the tenant scope has settled —
+                          never on home first after a switched-in reload
+                          (B-183). */}
+                      <TenantScopeGate>
+                        <AppRouter />
+                      </TenantScopeGate>
                     </Shell>
                   </CommandPaletteProvider>
                 </ProtectedRoute>

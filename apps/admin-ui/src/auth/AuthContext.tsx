@@ -57,8 +57,9 @@ export interface AuthIdentity {
   /** Short string for the user menu — JWT subject head or API key prefix. */
   displayName: string;
   /** ``true`` once :func:`getMe` has replaced the optimistic identity
-   *  with the server-truth view. Components that gate destructive
-   *  actions on ``isSystemAdmin`` should wait for this. */
+   *  with the server-truth view (kept across a silent renew of the same
+   *  subject). Components that gate destructive actions on
+   *  ``isSystemAdmin`` should wait for this. */
   serverResolved: boolean;
 }
 
@@ -66,6 +67,12 @@ export interface AuthState {
   status: "loading" | "anonymous" | "authenticated";
   identity: AuthIdentity | null;
   token: string | null;
+  /** ``true`` once this session's ``/v1/me`` has answered — resolved, or
+   *  failed with anything but 401 (the optimistic identity then stays, see
+   *  the module docstring). Lets a consumer that must not act on the
+   *  optimistic identity wait for the server without hanging when
+   *  ``/v1/me`` is down. A silent renew of the same subject keeps it. */
+  identitySettled: boolean;
 }
 
 interface AuthContextValue extends AuthState {
@@ -184,11 +191,30 @@ function identityFromMe(me: MeResponse, token: string): AuthIdentity {
   };
 }
 
+const ANONYMOUS: AuthState = {
+  status: "anonymous",
+  identity: null,
+  token: null,
+  identitySettled: false,
+};
+
+/** A session that just got its token: the optimistic decode until
+ *  ``/v1/me`` answers. */
+function newSession(token: string): AuthState {
+  return {
+    status: "authenticated",
+    identity: optimisticIdentityFromToken(token),
+    token,
+    identitySettled: false,
+  };
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AuthState>({
     status: "loading",
     identity: null,
     token: null,
+    identitySettled: false,
   });
 
   // The token doesn't authenticate any more — drop the local session. The
@@ -196,7 +222,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // ``state.from`` so a re-login lands back where the user was.
   const clearSession = useCallback(() => {
     setStoredToken(null);
-    setState({ status: "anonymous", identity: null, token: null });
+    setState(ANONYMOUS);
   }, []);
 
   const resolveServerIdentity = useCallback(
@@ -211,14 +237,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             status: "authenticated",
             identity: identityFromMe(me, token),
             token,
+            identitySettled: true,
           };
         });
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           clearSession();
+          return;
         }
         // Other errors leave the optimistic identity in place; the user
-        // still re-authenticates on every API call.
+        // still re-authenticates on every API call. The answer is in all
+        // the same — nothing should keep waiting for a better one.
+        setState((prev) =>
+          prev.token !== token || prev.identitySettled
+            ? prev
+            : { ...prev, identitySettled: true },
+        );
       }
     },
     [clearSession],
@@ -235,14 +269,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const stored = getStoredToken();
     if (stored) {
-      setState({
-        status: "authenticated",
-        identity: optimisticIdentityFromToken(stored),
-        token: stored,
-      });
+      setState(newSession(stored));
       void resolveServerIdentity(stored);
     } else {
-      setState({ status: "anonymous", identity: null, token: null });
+      setState(ANONYMOUS);
     }
   }, [resolveServerIdentity]);
 
@@ -253,20 +283,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const unsubscribe = registerEvents({
       onUserLoaded: (idToken) => {
         setStoredToken(idToken);
-        setState((prev) => ({
-          ...prev,
-          status: "authenticated",
-          token: idToken,
-          identity:
-            prev.identity !== null
-              ? { ...prev.identity, serverResolved: false }
-              : optimisticIdentityFromToken(idToken),
-        }));
+        setState((prev) => {
+          // A renew of the same subject keeps the identity /v1/me gave us
+          // while the re-check runs. Dropping it back to the optimistic
+          // decode would flip ``apiTenantScope`` to home and back, so every
+          // switched-in page re-read twice per renew — and a page without a
+          // stale-response guard could keep the wrong answer (B-183).
+          // Anything else (no session yet, another subject) starts over.
+          const sameSubject =
+            prev.identity !== null &&
+            prev.identity.subject === optimisticIdentityFromToken(idToken).subject;
+          return sameSubject
+            ? { ...prev, status: "authenticated", token: idToken }
+            : newSession(idToken);
+        });
         void resolveServerIdentity(idToken);
       },
       onExpired: () => {
         setStoredToken(null);
-        setState({ status: "anonymous", identity: null, token: null });
+        setState(ANONYMOUS);
       },
       onSilentRenewError: () => {
         // Soft failure — keep the existing token, surface only via
@@ -279,11 +314,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = useCallback(
     (token: string) => {
       setStoredToken(token);
-      setState({
-        status: "authenticated",
-        identity: optimisticIdentityFromToken(token),
-        token,
-      });
+      setState(newSession(token));
       void resolveServerIdentity(token);
     },
     [resolveServerIdentity],
@@ -291,7 +322,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     setStoredToken(null);
-    setState({ status: "anonymous", identity: null, token: null });
+    setState(ANONYMOUS);
     // Best-effort IdP-side end-session; the local session is already
     // cleared either way, so a failed remote signout doesn't strand the
     // user as half-logged-in.
