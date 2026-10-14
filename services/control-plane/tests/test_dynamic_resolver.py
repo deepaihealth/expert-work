@@ -66,6 +66,35 @@ async def test_embedder_reads_current_config_each_call(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pin_fixes_one_model_for_the_whole_unit_of_work(monkeypatch):
+    """B-175 L2-PR3 — a knowledge ingest pins the model once: an admin switch
+    in the middle does not change the embedder it already holds, and the
+    returned key names provider and model (chunks are tagged with it)."""
+    captured: list[str] = []
+
+    class _FakeDelegate:
+        def __init__(self, *, client, model):
+            self.model = model
+
+        async def embed(self, texts, *, tenant_id):
+            captured.append(self.model)
+            return [(0.0,) for _ in texts]
+
+    monkeypatch.setattr("control_plane.runtime.OpenAICompatibleEmbedder", _FakeDelegate)
+    monkeypatch.setattr("control_plane.runtime.HTTPEmbeddingClient", lambda **kw: object())
+
+    cfg = _Cfg()
+    emb = DynamicResolvingEmbedder(
+        config_service=cfg, resolver=_Resolver(), secret_store=_SecretStore()
+    )
+    model_key, pinned = await emb.pin(tenant_id=uuid4())
+    assert model_key == "qwen/text-embedding-v4"
+    cfg.embedding = ("glm", "embedding-3")  # admin changes config mid-ingest
+    await pinned.embed(["a"], tenant_id=uuid4())
+    assert captured == ["text-embedding-v4"]
+
+
+@pytest.mark.asyncio
 async def test_embedder_raises_when_unconfigured():
     cfg = _Cfg()
     cfg.embedding = None

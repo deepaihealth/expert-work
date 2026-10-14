@@ -31,7 +31,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence import KnowledgeStore
-from expert_work.protocol import KnowledgeBase, KnowledgeChunk, RetrievalMethod
+from expert_work.protocol import (
+    KnowledgeBase,
+    KnowledgeChunk,
+    RetrievalMethod,
+    chunk_retrieval_text,
+)
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
 if TYPE_CHECKING:
@@ -79,6 +84,10 @@ class RetrievedChunk:
     which recall path(s) found it. Both default to ``None`` so the tool's
     formatted output is unaffected — they exist for the retrieval-test
     endpoint's transparency.
+
+    ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
+    The agent sees (and the reranker / eval match against)
+    :attr:`retrieval_text`, the two joined.
     """
 
     content: str
@@ -86,6 +95,11 @@ class RetrievedChunk:
     chunk_index: int
     score: float | None = None
     recall_source: str | None = None
+    heading_path: tuple[str, ...] = ()
+
+    @property
+    def retrieval_text(self) -> str:
+        return chunk_retrieval_text(self.heading_path, self.content)
 
 
 @dataclass(frozen=True)
@@ -239,7 +253,7 @@ class KnowledgeRetriever:
         candidates = fused[: self.recall_limit]
         order = await self.reranker.rerank(
             query=query,
-            documents=[chunk.content for chunk in candidates],
+            documents=[chunk.retrieval_text for chunk in candidates],
             top_k=limit,
             tenant_id=tenant_id,
         )
@@ -266,6 +280,7 @@ class KnowledgeRetriever:
                 chunk_index=chunk.chunk_index,
                 score=vector_score.get(chunk.id),
                 recall_source=_recall_source(sources.get(chunk.id, set())),
+                heading_path=chunk.heading_path,
             )
             for chunk in chunks
         ]
@@ -386,5 +401,7 @@ def _coerce_limit(raw: object) -> int:
 
 
 def _format_results(results: Sequence[RetrievedChunk]) -> str:
-    blocks = [f"[{result.filename}#{result.chunk_index}]\n{result.content}" for result in results]
+    blocks = [
+        f"[{result.filename}#{result.chunk_index}]\n{result.retrieval_text}" for result in results
+    ]
     return "\n\n---\n\n".join(blocks)

@@ -18,7 +18,7 @@ import pytest
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
-from expert_work.protocol import DocumentStatus, KnowledgeChunk
+from expert_work.protocol import DocumentStatus, IngestErrorCode, KnowledgeChunk
 from orchestrator.llm import FakeEmbedder
 
 _DOC = b"# Handbook\n\nThe deductible is 500 dollars per year."
@@ -124,11 +124,16 @@ class _RecordingStore(InMemoryKnowledgeStore):
         tenant_id: UUID,
         document_id: UUID,
         error: str,
+        error_code: IngestErrorCode | None = None,
         generation: int | None = None,
     ) -> bool:
         self.failed_terminal.append(document_id)
         return await super().mark_document_failed_terminal(
-            tenant_id=tenant_id, document_id=document_id, error=error, generation=generation
+            tenant_id=tenant_id,
+            document_id=document_id,
+            error=error,
+            error_code=error_code,
+            generation=generation,
         )
 
 

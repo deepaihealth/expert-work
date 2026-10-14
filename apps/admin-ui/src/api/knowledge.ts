@@ -68,6 +68,20 @@ export interface KnowledgeDocument {
   /** A re-upload is waiting in the pending slot (ingesting, or failed); the
    *  previous version's chunks keep serving until it lands or is discarded. */
   has_pending?: boolean;
+  /** Tenant-wide document number (short id ``D{doc_seq}``); ``null`` only
+   *  for documents from before it existed. */
+  doc_seq?: number | null;
+  title?: string | null;
+  source_type?: string;
+  /** Furthest pipeline step reached — ``queued`` / ``parsing`` /
+   *  ``chunking`` / ``embedding`` / ``indexing`` / ``ready``. */
+  stage?: string | null;
+  /** Machine-readable failure reason next to ``error``. */
+  error_code?: string | null;
+  size_bytes?: number | null;
+  mime?: string | null;
+  page_count?: number | null;
+  enabled?: boolean;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -102,7 +116,14 @@ export interface BasesPage {
 export interface KnowledgeChunk {
   id: string;
   chunk_index: number;
+  /** The chunk body (legacy chunks still carry a ``[Section: …]`` prefix). */
   content: string;
+  /** Section breadcrumb, outermost first; empty for legacy chunks. */
+  heading_path?: string[];
+  chunk_type?: string;
+  enabled?: boolean;
+  edited?: boolean;
+  revision?: number;
 }
 
 export interface ChunksPage {
@@ -123,6 +144,8 @@ export interface RetrievalTestResult {
   score: number | null;
   /** Which recall path surfaced it: ``vector`` | ``keyword`` | ``both``. */
   recall_source: string | null;
+  /** Section breadcrumb of the hit, outermost first. */
+  heading_path?: string[];
 }
 
 export interface RetrievalTestResponse {

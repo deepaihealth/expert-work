@@ -14,23 +14,28 @@ ingest race — the app-layer cascade remains the primary path.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     LargeBinary,
+    PrimaryKeyConstraint,
+    SmallInteger,
     Text,
     UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -78,6 +83,15 @@ class KnowledgeBaseRow(Base):
     #: base's retained chunk text with the current model, then clears it.
     reindex_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    #: Model v2 (migration ``0165``): base kind, declared metadata fields,
+    #: open-API switch.
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'document'"))
+    metadata_schema: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    api_access_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -132,6 +146,25 @@ class KnowledgeDocumentRow(Base):
     #: pending bytes into it, a failed one leaves both untouched.
     pending_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     pending_content_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Model v2 (migration ``0165``). ``doc_seq`` comes from the per-tenant
+    #: ``knowledge_doc_seq`` counter on insert and survives re-uploads.
+    doc_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_type: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'file'"))
+    source_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: ``metadata`` is reserved on a declarative class — the attribute is
+    #: ``doc_metadata``, the column keeps the plain name.
+    doc_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    stage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    mime: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -149,6 +182,15 @@ class KnowledgeDocumentRow(Base):
             "knowledge_document_recovery_idx",
             "lease_until",
             postgresql_where=text("status IN ('pending', 'processing')"),
+        ),
+        UniqueConstraint("tenant_id", "doc_seq", name="knowledge_document_doc_seq_uniq"),
+        Index(
+            "knowledge_document_external_id_uniq",
+            "tenant_id",
+            "kb_id",
+            "external_id",
+            unique=True,
+            postgresql_where=text("external_id IS NOT NULL"),
         ),
     )
 
@@ -172,6 +214,22 @@ class KnowledgeChunkRow(Base):
     #: Full-text vector for the keyword side of hybrid search — populated
     #: by the store from jieba-segmented ``content`` (Stream J.5).
     content_tsv: Mapped[str | None] = mapped_column(TSVECTOR(), nullable=True)
+    #: Model v2 (migration ``0165``). ``content`` is the clean body;
+    #: ``heading_path`` holds the section breadcrumb that the embedding /
+    #: keyword text prepend (``chunk_retrieval_text``).
+    chunk_type: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'text'"))
+    parent_chunk_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    #: ``none_as_null`` — Python ``None`` must be SQL NULL, not a JSON ``null``
+    #: scalar (array functions on a scalar raise; see migration 0165).
+    heading_path: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    source_locator: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    edited: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    content_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -182,4 +240,145 @@ class KnowledgeChunkRow(Base):
         Index("knowledge_chunk_kb_idx", "tenant_id", "kb_id"),
         Index("knowledge_chunk_document_idx", "document_id"),
         Index("knowledge_chunk_tsv_idx", "content_tsv", postgresql_using="gin"),
+        UniqueConstraint("document_id", "chunk_index", name="knowledge_chunk_document_index_uniq"),
+    )
+
+
+class KnowledgeDocSeqRow(Base):
+    """Per-tenant ``doc_seq`` counter (migration ``0165``) — bumped with
+    ``INSERT … ON CONFLICT DO UPDATE … RETURNING`` in the document's own
+    insert transaction, so numbers never repeat and a rolled-back insert
+    gives its number back."""
+
+    __tablename__ = "knowledge_doc_seq"
+
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class KnowledgeTaskRow(Base):
+    """``knowledge_task`` (migration ``0165``) — one asynchronous knowledge
+    job (import batch, re-parse, delete, re-index, curation, FAQ import),
+    shared by the admin UI's progress view and the open API's ``/tasks``.
+    Nothing writes it yet (P3-PR2)."""
+
+    __tablename__ = "knowledge_task"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    kb_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    task_type: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
+    progress: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    params: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    stats: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="knowledge_task_status_enum",
+        ),
+        Index("knowledge_task_kb_idx", "tenant_id", "kb_id", "created_at"),
+        Index(
+            "knowledge_task_active_idx",
+            "created_at",
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+    )
+
+
+class KnowledgeChunkRevisionRow(Base):
+    """``knowledge_chunk_revision`` (migration ``0165``) — a chunk's edit
+    history for review / rollback. Nothing writes it yet (P3-PR2)."""
+
+    __tablename__ = "knowledge_chunk_revision"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    kb_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    chunk_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    heading_path: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    edited_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("chunk_id", "revision", name="knowledge_chunk_revision_uniq"),
+        Index("knowledge_chunk_revision_document_idx", "document_id"),
+    )
+
+
+class KnowledgeTagRow(Base):
+    """``knowledge_tag`` (migration ``0165``) — a base-scoped document tag.
+    Deleting the base deletes its tags (FK cascade). Nothing writes it yet."""
+
+    __tablename__ = "knowledge_tag"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    kb_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("knowledge_base.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    color: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "kb_id", "name", name="knowledge_tag_name_uniq"),
+    )
+
+
+class KnowledgeDocumentTagRow(Base):
+    """``knowledge_document_tag`` (migration ``0165``) — document ↔ tag.
+    Deleting either side deletes the link (FK cascade)."""
+
+    __tablename__ = "knowledge_document_tag"
+
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("knowledge_document.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tag_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("knowledge_tag.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("document_id", "tag_id", name="knowledge_document_tag_pkey"),
+        Index("knowledge_document_tag_tag_idx", "tag_id"),
     )

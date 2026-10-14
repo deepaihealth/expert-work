@@ -24,7 +24,13 @@ from expert_work.persistence import (
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge import DuplicateKnowledgeBaseError
 from expert_work.persistence.models import KnowledgeBaseRow
-from expert_work.protocol import DocumentStatus, KnowledgeChunk, RetrievalMethod
+from expert_work.protocol import (
+    ChunkType,
+    DocumentStatus,
+    IngestErrorCode,
+    KnowledgeChunk,
+    RetrievalMethod,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -915,6 +921,112 @@ async def test_list_bases_pages_follow_unpaged_order_on_created_at_tie_sql(
         assert [b.id for b in everyone] == sorted((b.id for b in everyone), key=lambda u: u.int)
         page, _ = await store.list_bases_all_tenants_page(limit=2, offset=1)
         assert [b.id for b in page] == [b.id for b in everyone[1:3]]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_enum_values_read_without_failing_sql(sql_store: SqlStoreFixture) -> None:
+    """A newer release may write values this one does not know; after a
+    rollback every document list must still load (unknown → default)."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"d"
+        )
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[
+                KnowledgeChunk(
+                    id=uuid4(),
+                    tenant_id=tenant,
+                    kb_id=base.id,
+                    document_id=doc.id,
+                    chunk_index=0,
+                    content="body",
+                    embedding=_vec(1.0),
+                )
+            ],
+        )
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE knowledge_document SET stage = 'ocr', error_code = 'ocr_failed', "
+                    "source_type = 'webhook' WHERE id = :id"
+                ),
+                {"id": doc.id},
+            )
+            await conn.execute(
+                text("UPDATE knowledge_chunk SET chunk_type = 'image' WHERE document_id = :id"),
+                {"id": doc.id},
+            )
+            await conn.execute(
+                text("UPDATE knowledge_base SET kind = 'graph' WHERE id = :id"), {"id": base.id}
+            )
+        read = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert read is not None
+        assert read.stage is None
+        assert read.error_code is IngestErrorCode.INTERNAL_ERROR
+        (chunk,), _ = await store.list_chunks(tenant_id=tenant, document_id=doc.id)
+        assert chunk.chunk_type is ChunkType.TEXT
+        assert await store.get_base(tenant_id=tenant, name="kb") is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_shaped_chunks_keep_working_sql(sql_store: SqlStoreFixture) -> None:
+    """Chunks from before 0165 carry the breadcrumb inside ``content`` and no
+    heading path / hash: their retrieval text is the content as is, keyword
+    search still finds the heading words, and they are never offered for
+    vector reuse."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename="old.md", content=b"o"
+        )
+        legacy = KnowledgeChunk(
+            id=uuid4(),
+            tenant_id=tenant,
+            kb_id=base.id,
+            document_id=doc.id,
+            chunk_index=0,
+            content="[Section: 免赔额]\n\n金额是 500 元。",
+            embedding=_vec(1.0),
+        )
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=[legacy])
+        (read,), _ = await store.list_chunks(tenant_id=tenant, document_id=doc.id)
+        assert read.heading_path == ()
+        assert read.retrieval_text == legacy.content
+        # An empty path is SQL NULL, not a JSON ``null`` scalar (array
+        # functions on a scalar raise — migration 0165's downgrade uses them).
+        async with engine.begin() as conn:
+            stored = (
+                await conn.execute(
+                    text(
+                        "SELECT heading_path IS NULL, source_locator IS NULL "
+                        "FROM knowledge_chunk WHERE id = :id"
+                    ),
+                    {"id": legacy.id},
+                )
+            ).one()
+        assert tuple(stored) == (True, True)
+        hits = await store.keyword_search_scored(tenant_id=tenant, kb_ids=[base.id], query="免赔额")
+        assert [hit.chunk.id for hit in hits] == [legacy.id]
+        assert (
+            await store.chunk_embeddings_by_hash(
+                tenant_id=tenant,
+                document_id=doc.id,
+                content_hashes=["anything"],
+                embedding_model="qwen/text-embedding-v4",
+            )
+            == {}
+        )
     finally:
         await engine.dispose()
 

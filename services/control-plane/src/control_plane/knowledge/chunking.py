@@ -8,9 +8,10 @@ A parsed document (Markdown text) is sliced into retrieval chunks that:
   mislead badly for CJK);
 * never straddle two document sections — a heading change flushes the
   current chunk;
-* carry a **heading-path prefix** — each chunk is prefixed with the
-  breadcrumb of the section it came from, so a short factual chunk is
-  still findable ("免赔额是 500 元" → prefixed "[Section: 健康保险 > 免赔额]");
+* carry their **heading path** — the breadcrumb of the section a chunk came
+  from travels with it (:class:`TextChunk`), so a short factual chunk is
+  still findable ("免赔额是 500 元" is embedded / indexed as
+  "[Section: 健康保险 > 免赔额]" + body) while the stored body stays clean;
 * **overlap** within a section so content near a chunk boundary is not
   lost;
 * keep tables whole, splitting an oversized table by rows (header
@@ -37,6 +38,7 @@ from uuid import UUID
 import tiktoken
 from markdown_it import MarkdownIt
 
+from expert_work.protocol import chunk_retrieval_text
 from orchestrator.llm import Embedder
 
 #: tiktoken encoding for the token budget. An approximation of the
@@ -82,9 +84,24 @@ class _Block:
     heading_trail: tuple[str, ...]
 
 
-def chunk_markdown(markdown: str, *, max_tokens: int, overlap_tokens: int) -> list[str]:
-    """Slice ``markdown`` into heading-prefixed retrieval chunks — the
-    structural chunker (no semantic refinement).
+@dataclass(frozen=True)
+class TextChunk:
+    """One retrieval chunk: its clean ``body`` and the ``heading_path`` of the
+    section it came from (outermost heading first)."""
+
+    body: str
+    heading_path: tuple[str, ...]
+
+    @property
+    def text(self) -> str:
+        """Breadcrumb + body — what is embedded and keyword-indexed
+        (:func:`expert_work.protocol.chunk_retrieval_text`)."""
+        return chunk_retrieval_text(self.heading_path, self.body)
+
+
+def chunk_markdown(markdown: str, *, max_tokens: int, overlap_tokens: int) -> list[TextChunk]:
+    """Slice ``markdown`` into retrieval chunks — the structural chunker (no
+    semantic refinement).
 
     ``max_tokens`` bounds a chunk's body; ``overlap_tokens`` of the
     previous chunk's tail is carried into the next chunk *within the
@@ -106,7 +123,7 @@ async def chunk_markdown_semantic(
     overlap_tokens: int,
     embedder: Embedder,
     tenant_id: UUID,
-) -> list[str]:
+) -> list[TextChunk]:
     """Like :func:`chunk_markdown`, but additionally splits a section at
     *topic shifts* — adjacent blocks whose embeddings are far apart.
 
@@ -138,10 +155,10 @@ def _pack_blocks(
     max_tokens: int,
     overlap_tokens: int,
     semantic_breaks: frozenset[int],
-) -> list[str]:
+) -> list[TextChunk]:
     """Pack blocks into chunks. Flush on a heading change, on a
     ``semantic_breaks`` index (a topic shift), and on the token cap."""
-    chunks: list[str] = []
+    chunks: list[TextChunk] = []
     trail: tuple[str, ...] = ()
     buffer: list[str] = []
     buffer_tokens = 0
@@ -151,7 +168,7 @@ def _pack_blocks(
         if not buffer:
             return
         body = "\n\n".join(buffer)
-        chunks.append(_with_prefix(trail, body))
+        chunks.append(TextChunk(body=body, heading_path=trail))
         tail = _tail_text(body, overlap_tokens) if carry_overlap else ""
         buffer = [tail] if tail.strip() else []
         buffer_tokens = count_tokens(tail) if buffer else 0
@@ -322,10 +339,3 @@ def _start_at_boundary(tail: str) -> str:
         if rest:
             return rest
     return tail
-
-
-def _with_prefix(trail: tuple[str, ...], body: str) -> str:
-    """Prefix ``body`` with its section breadcrumb for retrieval context."""
-    if not trail:
-        return body
-    return f"[Section: {' > '.join(trail)}]\n\n{body}"

@@ -30,7 +30,7 @@ from kb_metrics import (  # type: ignore[import-not-found]
 @dataclass(frozen=True)
 class _Result:
     filename: str
-    content: str
+    retrieval_text: str
     chunk_index: int = 0
     score: float | None = None
     recall_source: str | None = None
@@ -50,7 +50,7 @@ _EXP_A2 = _Expected(document="a.md", anchor="菌株编号 BL-99")
 
 
 def _r(filename: str, content: str, score: float | None = 0.5) -> _Result:
-    return _Result(filename=filename, content=content, score=score)
+    return _Result(filename=filename, retrieval_text=content, score=score)
 
 
 def _miss(n: int) -> list[_Result]:

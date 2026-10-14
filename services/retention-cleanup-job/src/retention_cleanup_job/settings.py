@@ -81,6 +81,12 @@ class RetentionCleanupSettings(BaseSettings):
     # 的 run 详情还看得到「后台记忆写回」那一行。
     memory_writeback_job_retention_days: int = Field(default=30, ge=1, le=3650)
 
+    # --------------------------------------------------- 知识库任务(B-175 L2-PR3)
+    # ``knowledge_task`` 一次导入 / 重解析 / 重建索引一行。收尾(``succeeded`` /
+    # ``failed`` / ``cancelled``)满这个天数就删;``queued`` / ``running`` 不按时间删。
+    # 全局旋钮(与上面几个窗口一样),没有按租户覆盖。
+    knowledge_task_retention_days: int = Field(default=90, ge=1, le=3650)
+
     # --------------------------------------------------- 留存链 PR2(波 3 线 R)
     # 用户拍板(2026-09-09):产物 90 天、上传 90 天、已删工作区库行 90 天销账。
     # 产物版本复用上面的 ``artifact_retention_days``,已删工作区复用

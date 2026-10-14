@@ -54,3 +54,9 @@ def test_upload_retention_days_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS", "0")
     with pytest.raises(ValueError, match="upload_retention_days"):
         RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_knowledge_task_retention_defaults_to_90_days() -> None:
+    """B-175 L2-PR3 —— 知识库任务行收尾后留 90 天。"""
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.knowledge_task_retention_days == 90

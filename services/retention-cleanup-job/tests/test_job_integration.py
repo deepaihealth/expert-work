@@ -822,3 +822,70 @@ async def test_workspace_rules_end_to_end_against_postgres(
         assert count == len(rows)
     finally:
         await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_task_retention_deletes_old_finished_rows_only(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-175 L2-PR3 —— 收尾满 90 天的 ``succeeded`` / ``failed`` / ``cancelled`` 任务行
+    清掉;``queued`` / ``running`` 不管多老都留着,90 天内收尾的也留着。迁移 0165 的
+    授权缺了这里会 permission denied。只数本用例自造租户的行。"""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant = uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                insert = text(
+                    "INSERT INTO knowledge_task (tenant_id, task_type, status, created_at, "
+                    " finished_at) "
+                    "VALUES (:t, 'import_batch', :status, now() - make_interval(days => :age), "
+                    " CASE WHEN :status IN ('succeeded', 'failed', 'cancelled') "
+                    "      THEN now() - make_interval(days => :age) END)"
+                )
+                for status, age in (
+                    ("succeeded", 120),  # gone
+                    ("failed", 120),  # gone
+                    ("cancelled", 120),  # gone
+                    ("succeeded", 10),  # recent: kept
+                    ("queued", 120),  # unfinished: kept
+                    ("running", 120),  # unfinished: kept
+                ):
+                    conn.execute(insert, {"t": str(tenant), "status": status, "age": age})
+                # Finished but ``finished_at`` never written: aged by updated_at.
+                conn.execute(
+                    text(
+                        "INSERT INTO knowledge_task (tenant_id, task_type, status, created_at, "
+                        " updated_at) VALUES (:t, 'reindex', 'failed', "
+                        " now() - make_interval(days => 120), now() - make_interval(days => 120))"
+                    ),
+                    {"t": str(tenant)},
+                )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=create_async_session_factory(worker_engine),
+            batch_size=10000,
+            knowledge_task_retention_days=90,
+        )
+        report = await job.run_once()
+
+        async with worker_engine.begin() as conn:
+            remaining = sorted(
+                (row[0], int(row[1]))
+                for row in (
+                    await conn.execute(
+                        text(
+                            "SELECT status, extract(day FROM now() - created_at) "
+                            "FROM knowledge_task WHERE tenant_id = :t"
+                        ),
+                        {"t": str(tenant)},
+                    )
+                ).all()
+            )
+        assert remaining == [("queued", 120), ("running", 120), ("succeeded", 10)]
+        assert report.knowledge_tasks_deleted >= 4
+    finally:
+        await worker_engine.dispose()

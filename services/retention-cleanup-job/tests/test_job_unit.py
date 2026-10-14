@@ -45,6 +45,7 @@ def test_cleanup_report_default_is_all_zero() -> None:
     assert report.tenant_users_hard_deleted == 0
     assert report.sandbox_egress_audit_deleted == 0
     assert report.memory_writeback_jobs_deleted == 0
+    assert report.knowledge_tasks_deleted == 0
     assert report.duration_seconds == 0.0
     assert report.audit_deleted_by_tenant == {}
 
@@ -67,6 +68,14 @@ def test_job_rejects_non_positive_memory_writeback_job_retention_days() -> None:
         RetentionCleanupJob(
             db_session_factory=_no_session,  # type: ignore[arg-type]
             memory_writeback_job_retention_days=0,
+        )
+
+
+def test_job_rejects_non_positive_knowledge_task_retention_days() -> None:
+    with pytest.raises(ValueError, match="knowledge_task_retention_days"):
+        RetentionCleanupJob(
+            db_session_factory=_no_session,  # type: ignore[arg-type]
+            knowledge_task_retention_days=0,
         )
 
 

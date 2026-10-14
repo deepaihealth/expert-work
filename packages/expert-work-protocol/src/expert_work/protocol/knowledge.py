@@ -12,9 +12,10 @@ tenant-shared, not per-user (unlike J.3 memory). See
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
-from typing import Final, Literal
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -41,6 +42,84 @@ class DocumentStatus(StrEnum):
     #: = kept but excluded from retrieval by an operator.
     BLOCKED = "blocked"
     DISABLED = "disabled"
+
+
+class IngestStage(StrEnum):
+    """``knowledge_document.stage`` — the furthest pipeline step an ingest
+    reached. ``READY`` on success; a failed ingest stays on the step that
+    failed (``status`` says it failed, ``error_code`` says why)."""
+
+    QUEUED = "queued"
+    PARSING = "parsing"
+    CHUNKING = "chunking"
+    EMBEDDING = "embedding"
+    INDEXING = "indexing"
+    READY = "ready"
+
+
+class IngestErrorCode(StrEnum):
+    """``knowledge_document.error_code`` — machine-readable failure reason
+    next to the human-readable ``error``."""
+
+    UNSUPPORTED_FILE = "unsupported_file"
+    INVALID_FILE = "invalid_file"
+    PARSE_FAILED = "parse_failed"
+    EMBEDDING_FAILED = "embedding_failed"
+    #: Reserved — written once per-tenant knowledge quotas exist.
+    QUOTA_EXCEEDED = "quota_exceeded"
+    #: A legacy document whose original bytes were not retained.
+    CONTENT_MISSING = "content_missing"
+    #: Crash recovery used up its retry budget.
+    ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+    INTERNAL_ERROR = "internal_error"
+
+
+class KnowledgeBaseKind(StrEnum):
+    """``knowledge_base.kind`` — decides the import / index / retrieval
+    branch. Only ``DOCUMENT`` exists today; the others are reserved."""
+
+    DOCUMENT = "document"
+    FAQ = "faq"
+    MATERIAL = "material"
+
+
+class DocumentSourceType(StrEnum):
+    """``knowledge_document.source_type`` — where the document came from.
+    Uploads are ``FILE``; the others are reserved for later importers."""
+
+    FILE = "file"
+    URL = "url"
+    OSS = "oss"
+    MANUAL = "manual"
+    FAQ = "faq"
+    ENTRY = "entry"
+
+
+class ChunkType(StrEnum):
+    """``knowledge_chunk.chunk_type``. The ingestion pipeline writes
+    ``TEXT``; the others are reserved for FAQ / entries / materials."""
+
+    TEXT = "text"
+    QUESTION = "question"
+    SUMMARY = "summary"
+    FAQ = "faq"
+    FAQ_QUESTION = "faq_question"
+    ENTRY = "entry"
+    MATERIAL = "material"
+    MATERIAL_PHRASE = "material_phrase"
+
+
+def chunk_retrieval_text(heading_path: Sequence[str], content: str) -> str:
+    """The text a chunk is embedded, keyword-indexed, reranked and shown to
+    an agent as: its section breadcrumb, then its body. The single source of
+    the ``[Section: a > b]`` prefix — the body itself is stored clean.
+
+    Legacy chunks (ingested before the heading path was stored separately)
+    carry the prefix inside ``content`` and an empty ``heading_path``, so
+    they pass through unchanged."""
+    if not heading_path:
+        return content
+    return f"[Section: {' > '.join(heading_path)}]\n\n{content}"
 
 
 class RetrievalMethod(StrEnum):
@@ -104,6 +183,15 @@ class KnowledgeBase(BaseModel):
     #: base's retained chunk text), cleared on completion. Surfaced so the UI
     #: can show a "re-indexing" state.
     reindex_requested_at: datetime | None = None
+    kind: KnowledgeBaseKind = Field(
+        default=KnowledgeBaseKind.DOCUMENT, description="document / faq / material"
+    )
+    #: Declared metadata fields (name, type, filterable, description) that
+    #: documents' ``metadata`` is validated against. Reserved (P3-PR2).
+    metadata_schema: dict[str, Any] | None = None
+    api_access_enabled: bool = Field(
+        default=False, description="whether the open API may read this base"
+    )
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -140,6 +228,25 @@ class KnowledgeDocument(BaseModel):
     #: ingest failed). ``status == failed`` with ``chunk_count > 0`` and
     #: ``has_pending`` means: the previous version is still serving.
     has_pending: bool = Field(default=False, description="a newer upload is pending / failed")
+    #: Tenant-wide monotonic number (short id ``D{doc_seq}``); kept across
+    #: re-uploads, never reused. ``None`` only for rows from before it existed.
+    doc_seq: int | None = Field(default=None, ge=1, description="tenant-wide document number")
+    title: str | None = Field(default=None, description="display title (filename by default)")
+    source_type: DocumentSourceType = DocumentSourceType.FILE
+    source_uri: str | None = None
+    external_id: str | None = Field(default=None, description="caller's id for idempotent sync")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="user metadata")
+    enabled: bool = Field(default=True, description="document-level on / off switch")
+    stage: IngestStage | None = Field(default=None, description="furthest pipeline step reached")
+    progress: int | None = Field(default=None, ge=0, le=100)
+    error_code: IngestErrorCode | None = Field(
+        default=None, description="machine-readable failure reason"
+    )
+    page_count: int | None = Field(default=None, ge=0)
+    size_bytes: int | None = Field(
+        default=None, ge=0, description="size of the serving version's original file"
+    )
+    mime: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -154,11 +261,34 @@ class KnowledgeChunk(BaseModel):
     kb_id: UUID
     document_id: UUID
     chunk_index: int = Field(ge=0, description="0-based position within the source document")
-    content: str
+    content: str = Field(description="the chunk body, without its section breadcrumb")
     embedding: tuple[float, ...] = Field(
-        repr=False, description="semantic embedding vector of ``content``"
+        repr=False, description="semantic embedding vector of ``retrieval_text``"
     )
+    chunk_type: ChunkType = ChunkType.TEXT
+    #: Section breadcrumb (outermost heading first), stored apart from the
+    #: body; :attr:`retrieval_text` joins the two.
+    heading_path: tuple[str, ...] = ()
+    #: sha256 of :attr:`retrieval_text` — an unchanged chunk keeps its vector
+    #: across re-ingests instead of being embedded again.
+    content_hash: str | None = None
+    #: ``provider/model`` that produced :attr:`embedding` — a re-ingest only
+    #: reuses a stored vector made by the model it is embedding with now.
+    #: ``None`` for chunks written before it was recorded (never reused).
+    embedding_model: str | None = None
+    enabled: bool = True
+    edited: bool = False
+    revision: int = Field(default=1, ge=1)
+    parent_chunk_id: UUID | None = None
+    #: Where the chunk sits in the source: ``[{"type": "pdf", "page": 3}]``,
+    #: a sheet + row range, a slide. Reserved (P5).
+    source_locator: list[dict[str, Any]] | None = None
     created_at: datetime | None = None
+
+    @property
+    def retrieval_text(self) -> str:
+        """Breadcrumb + body — see :func:`chunk_retrieval_text`."""
+        return chunk_retrieval_text(self.heading_path, self.content)
 
 
 class ScoredChunk(BaseModel):

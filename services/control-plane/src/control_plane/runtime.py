@@ -1257,6 +1257,17 @@ class DynamicResolvingEmbedder:
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
             return []
+        _, delegate = await self._resolve(tenant_id)
+        return await delegate.embed(texts, tenant_id=tenant_id)
+
+    async def pin(self, *, tenant_id: UUID) -> tuple[str, OpenAICompatibleEmbedder]:
+        """Resolve the live config once: ``provider/model`` plus an embedder
+        bound to it. A knowledge ingest / re-index embeds every chunk with the
+        one model it pinned (and tags the chunks with it) even if an admin
+        switches the platform model meanwhile."""
+        return await self._resolve(tenant_id)
+
+    async def _resolve(self, tenant_id: UUID) -> tuple[str, OpenAICompatibleEmbedder]:
         # 一期 Task 1 —— 同 ResolvingEmbedder.embed,但这条路径每次调用还多一次
         # DB 读(平台配置),所以是三段计时。挂到调用方的 ``memory.embed`` span
         # 上。``cfg is None`` 的早退直接抛错,没有 embed 可言,不打属性。
@@ -1279,7 +1290,7 @@ class DynamicResolvingEmbedder:
         delegate = OpenAICompatibleEmbedder(
             client=HTTPEmbeddingClient(api_key=api_key, http=self.http), model=model
         )
-        return await delegate.embed(texts, tenant_id=tenant_id)
+        return f"{provider}/{model}", delegate
 
 
 @dataclass(frozen=True)

@@ -66,6 +66,7 @@ def _stub_sql_passes(job: RetentionCleanupJob) -> None:
     job._delete_event_log = _zero  # type: ignore[method-assign]
     job._delete_sandbox_egress_audit = _zero  # type: ignore[method-assign]
     job._delete_finished_memory_writeback_jobs = _zero  # type: ignore[method-assign]
+    job._delete_finished_knowledge_tasks = _zero  # type: ignore[method-assign]
     job._delete_expired_jwt_blacklist = _zero  # type: ignore[method-assign]
 
 
