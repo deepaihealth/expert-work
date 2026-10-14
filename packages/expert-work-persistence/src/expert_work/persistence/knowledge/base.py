@@ -137,7 +137,15 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def list_bases(self, *, tenant_id: UUID) -> list[KnowledgeBase]:
-        """The tenant's knowledge bases, newest first."""
+        """The tenant's knowledge bases, newest first (``id`` DESC tiebreak,
+        the same order :meth:`list_bases_page` pages through)."""
+
+    @abc.abstractmethod
+    async def list_bases_page(
+        self, *, tenant_id: UUID, limit: int, offset: int
+    ) -> tuple[list[KnowledgeBase], int]:
+        """One page of the tenant's bases, newest first (``id`` tiebreak so
+        pages stay stable), plus the tenant's total base count."""
 
     @abc.abstractmethod
     async def list_bases_all_tenants(
@@ -158,6 +166,14 @@ class KnowledgeStore(abc.ABC):
         because the app connects with a BYPASSRLS role today. When RLS is
         un-parked, this read needs the ``SET LOCAL ROLE audit_reader`` +
         GRANT treatment that ``token_usage`` already has (migration 0140)."""
+
+    @abc.abstractmethod
+    async def list_bases_all_tenants_page(
+        self, *, limit: int, offset: int
+    ) -> tuple[list[KnowledgeBase], int]:
+        """One page of the ``tenant_id=*`` aggregate (same order as
+        :meth:`list_bases_all_tenants`) plus the all-tenants total. Same
+        bypass posture as :meth:`list_bases_all_tenants`."""
 
     @abc.abstractmethod
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:

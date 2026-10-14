@@ -6,7 +6,7 @@
  * (createBase + 409 duplicate), and the H-19 scope note.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
@@ -60,10 +60,15 @@ function LocationProbe() {
   return <div data-testid="loc">{loc.pathname + loc.search}</div>;
 }
 
-function renderPage() {
-  // W4 — the page reads useAuth() (home tenant for the aggregate row-jump).
-  setStoredToken(makeJwt({ sub: "u1", tenant_id: "t1", roles: ["admin"] }));
-  return render(
+/** ``listBasesPage`` answering with one page holding ``bases``. */
+function mockBases(bases: knowledgeSdk.KnowledgeBase[]) {
+  return vi
+    .spyOn(knowledgeSdk, "listBasesPage")
+    .mockResolvedValue({ bases, total: bases.length, offset: 0, limit: 20 });
+}
+
+function knowledgeTree() {
+  return (
     <MemoryRouter initialEntries={["/knowledge"]}>
       <AuthProvider>
         <App>
@@ -73,8 +78,14 @@ function renderPage() {
           </Routes>
         </App>
       </AuthProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderPage() {
+  // W4 — the page reads useAuth() (home tenant for the aggregate row-jump).
+  setStoredToken(makeJwt({ sub: "u1", tenant_id: "t1", roles: ["admin"] }));
+  return render(knowledgeTree());
 }
 
 beforeEach(() => {
@@ -87,7 +98,7 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("KnowledgeAdmin (list)", () => {
   it("renders bases with stats + needs-reindex tag", async () => {
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+    mockBases(BASES);
 
     renderPage();
 
@@ -98,7 +109,7 @@ describe("KnowledgeAdmin (list)", () => {
   });
 
   it("navigates to the detail page on row click", async () => {
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+    mockBases(BASES);
 
     renderPage();
     await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
@@ -110,7 +121,7 @@ describe("KnowledgeAdmin (list)", () => {
   });
 
   it("create modal posts the base", async () => {
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
+    mockBases([]);
     const createSpy = vi.spyOn(knowledgeSdk, "createBase").mockResolvedValue(BASES[0]);
 
     renderPage();
@@ -124,18 +135,20 @@ describe("KnowledgeAdmin (list)", () => {
     );
   });
 
-  it("threads the ambient tenant scope into listBases (W3)", async () => {
+  it("threads the ambient tenant scope into listBasesPage (W3)", async () => {
     scopeRef.current = "22222222-2222-2222-2222-222222222222";
-    const listSpy = vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
+    const listSpy = mockBases([]);
 
     renderPage();
 
-    await waitFor(() => expect(listSpy).toHaveBeenCalledWith(scopeRef.current));
+    await waitFor(() =>
+      expect(listSpy).toHaveBeenCalledWith({ limit: 20, offset: 0 }, scopeRef.current),
+    );
   });
 
   it("shows the empty state on the home scope", async () => {
     scopeRef.current = undefined;
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([]);
+    mockBases([]);
 
     renderPage();
 
@@ -145,7 +158,7 @@ describe("KnowledgeAdmin (list)", () => {
   });
 
   it("home 态创建/删库按钮可用(两态其一)", async () => {
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+    mockBases(BASES);
 
     renderPage();
 
@@ -156,7 +169,7 @@ describe("KnowledgeAdmin (list)", () => {
 
   it("切入态置灰创建/删库按钮(两态其二)", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue(BASES);
+    mockBases(BASES);
 
     renderPage();
 
@@ -178,7 +191,7 @@ describe("KnowledgeAdmin (list)", () => {
 describe("KnowledgeAdmin — cross-tenant W4 aggregate", () => {
   it("shows the tenant column and carries a foreign tenant into the row-jump", async () => {
     scopeRef.current = "*";
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+    mockBases([
       { ...BASES[0], tenant_id: "tenant-2-xxxx" },
     ]);
 
@@ -199,7 +212,7 @@ describe("KnowledgeAdmin — cross-tenant W4 aggregate", () => {
 
   it("row-jump keeps the plain URL for a home-tenant row", async () => {
     scopeRef.current = "*";
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+    mockBases([
       { ...BASES[0], tenant_id: "t1" },
     ]);
 
@@ -217,7 +230,7 @@ describe("KnowledgeAdmin — cross-tenant W4 aggregate", () => {
   // same-named base. Both write controls must grey out under "*".
   it("聚合态置灰创建/删库按钮(写接口按 name 绑归属租户)", async () => {
     scopeRef.current = "*";
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+    mockBases([
       { ...BASES[0], tenant_id: "tenant-2-xxxx" },
     ]);
 
@@ -232,7 +245,7 @@ describe("KnowledgeAdmin — cross-tenant W4 aggregate", () => {
   // same-named base and both rows must render (a bare name key collides).
   it("renders same-named bases from two tenants as two rows", async () => {
     scopeRef.current = "*";
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+    mockBases([
       { ...BASES[0], tenant_id: "t1" },
       { ...BASES[0], id: "22222222-2222-2222-2222-222222222222", tenant_id: "tenant-2-xxxx" },
     ]);
@@ -244,12 +257,86 @@ describe("KnowledgeAdmin — cross-tenant W4 aggregate", () => {
 
   it("home scope hides the tenant column", async () => {
     scopeRef.current = undefined;
-    vi.spyOn(knowledgeSdk, "listBases").mockResolvedValue([
+    mockBases([
       { ...BASES[0], tenant_id: "t1" },
     ]);
 
     renderPage();
     await waitFor(() => expect(screen.getByText("support-docs")).toBeInTheDocument());
     expect(screen.queryByText("t1…")).not.toBeInTheDocument();
+  });
+});
+
+describe("KnowledgeAdmin — server-side pagination (B-175 L3)", () => {
+  const many: knowledgeSdk.KnowledgeBase[] = Array.from({ length: 25 }, (_, i) => ({
+    ...BASES[0],
+    id: `base-${i}`,
+    name: `kb-${i}`,
+  }));
+
+  function mockPaged() {
+    return vi
+      .spyOn(knowledgeSdk, "listBasesPage")
+      .mockImplementation(async ({ limit, offset }) => ({
+        bases: many.slice(offset, offset + limit),
+        total: many.length,
+        offset,
+        limit,
+      }));
+  }
+
+  it("page 2 asks the server for offset 20", async () => {
+    const listSpy = mockPaged();
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("kb-0")).toBeInTheDocument());
+    expect(screen.queryByText("kb-20")).not.toBeInTheDocument();
+    const pager = screen.getByTestId("kb-table-pagination");
+    expect(pager).toHaveTextContent(/25/);
+
+    await userEvent.click(within(pager).getByTitle("2"));
+    await waitFor(() => expect(screen.getByText("kb-24")).toBeInTheDocument());
+    expect(listSpy).toHaveBeenLastCalledWith({ limit: 20, offset: 20 }, undefined);
+  });
+
+  it("a tenant-scope switch starts again on page 1", async () => {
+    const listSpy = mockPaged();
+
+    const { rerender } = renderPage();
+    await waitFor(() => expect(screen.getByText("kb-0")).toBeInTheDocument());
+    await userEvent.click(within(screen.getByTestId("kb-table-pagination")).getByTitle("2"));
+    await waitFor(() => expect(screen.getByText("kb-24")).toBeInTheDocument());
+
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
+    rerender(knowledgeTree());
+
+    await waitFor(() =>
+      expect(listSpy).toHaveBeenLastCalledWith({ limit: 20, offset: 0 }, scopeRef.current),
+    );
+    // never asked the new scope for the old scope's page
+    expect(listSpy).not.toHaveBeenCalledWith({ limit: 20, offset: 20 }, scopeRef.current);
+  });
+
+  it("a slow response for the old scope never overwrites the new scope's rows", async () => {
+    let releaseOld!: (page: knowledgeSdk.BasesPage) => void;
+    const homeRows = [{ ...BASES[0], name: "home-kb" }];
+    const foreignRows = [{ ...BASES[0], name: "foreign-kb" }];
+    vi.spyOn(knowledgeSdk, "listBasesPage").mockImplementation((_page, scope) =>
+      scope === undefined
+        ? new Promise((resolve) => {
+            releaseOld = resolve;
+          })
+        : Promise.resolve({ bases: foreignRows, total: 1, offset: 0, limit: 20 }),
+    );
+
+    const { rerender } = renderPage();
+    scopeRef.current = "22222222-2222-2222-2222-222222222222";
+    rerender(knowledgeTree());
+    await waitFor(() => expect(screen.getByText("foreign-kb")).toBeInTheDocument());
+
+    releaseOld({ bases: homeRows, total: 1, offset: 0, limit: 20 });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(screen.queryByText("home-kb")).not.toBeInTheDocument();
+    expect(screen.getByText("foreign-kb")).toBeInTheDocument();
   });
 });

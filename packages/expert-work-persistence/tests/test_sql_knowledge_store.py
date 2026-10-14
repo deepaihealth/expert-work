@@ -11,7 +11,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import update
+from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -864,6 +864,57 @@ async def test_list_documents_page_sql(sql_store: SqlStoreFixture) -> None:
         )
         assert total == 5
         assert [d.id for d in page] == [d.id for d in full[2:4]]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_bases_page_sql(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        for i in range(5):
+            await store.create_base(tenant_id=tenant, name=f"kb-{i}")
+        await store.create_base(tenant_id=uuid4(), name="foreign")
+        full = await store.list_bases(tenant_id=tenant)
+        page, total = await store.list_bases_page(tenant_id=tenant, limit=2, offset=2)
+        assert total == 5
+        assert [b.id for b in page] == [b.id for b in full[2:4]]
+        everyone, all_total = await store.list_bases_all_tenants_page(limit=100, offset=0)
+        assert all_total >= 6
+        assert {b.id for b in full} <= {b.id for b in everyone}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_bases_pages_follow_unpaged_order_on_created_at_tie_sql(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """同一 ``created_at``(批量建库)时,分页与不分页同序 —— SQL 与内存两版的
+    ``id`` 决胜方向钉在一起(单租户 id DESC、全租户 id ASC)。"""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        for i in range(4):
+            await store.create_base(tenant_id=tenant, name=f"tie-{i}")
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE knowledge_base SET created_at = :ts"),
+                {"ts": datetime(2026, 1, 1, tzinfo=UTC)},
+            )
+        full = await store.list_bases(tenant_id=tenant)
+        assert [b.id for b in full] == sorted(
+            (b.id for b in full), key=lambda u: u.int, reverse=True
+        )
+        first, _ = await store.list_bases_page(tenant_id=tenant, limit=2, offset=0)
+        second, _ = await store.list_bases_page(tenant_id=tenant, limit=2, offset=2)
+        assert [b.id for b in first + second] == [b.id for b in full]
+
+        everyone = await store.list_bases_all_tenants()
+        assert [b.id for b in everyone] == sorted((b.id for b in everyone), key=lambda u: u.int)
+        page, _ = await store.list_bases_all_tenants_page(limit=2, offset=1)
+        assert [b.id for b in page] == [b.id for b in everyone[1:3]]
     finally:
         await engine.dispose()
 

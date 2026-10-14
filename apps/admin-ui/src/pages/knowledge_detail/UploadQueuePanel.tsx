@@ -4,14 +4,17 @@
  * Presentational: renders the ``useUploadQueue`` items. Overall progress,
  * one row per real upload (relative path, size, status, progress, cancel /
  * retry) in a scroll box, and a summary line for the files skipped up front
- * (unsupported type / over the size cap / duplicate name) with an
- * expandable list of those rows. Rows are memoised so a progress tick on
- * one upload does not re-render the other few hundred.
+ * (unsupported type / over the size cap / name repeated in the batch) with
+ * an expandable list of those rows. A done row whose bytes matched the
+ * ready document already there says so instead of a full progress bar.
+ * Rows are memoised so a progress tick on one upload does not re-render the
+ * other few hundred.
  */
 import { memo, useMemo, useState } from "react";
 import { Button, Progress, Space, Tag, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
+import type { UploadedDocument } from "../../api/knowledge";
 import { formatBytes } from "../../components/console/workspace_format";
 import type {
   UploadQueueItem,
@@ -33,7 +36,7 @@ const STATUS_COLOR: Record<UploadQueueStatus, string> = {
 const ROW_LIST_MAX_HEIGHT = 320;
 
 interface UploadQueuePanelProps {
-  items: UploadQueueItem<unknown>[];
+  items: UploadQueueItem<UploadedDocument>[];
   summary: UploadQueueSummary;
   /** Client-side cap, for the "over {{limit}}" copy. */
   maxBytes: number;
@@ -46,7 +49,7 @@ interface UploadQueuePanelProps {
 }
 
 interface UploadQueueRowProps {
-  item: UploadQueueItem<unknown>;
+  item: UploadQueueItem<UploadedDocument>;
   limitLabel: string;
   readonly: boolean;
   onCancel: (id: string) => void;
@@ -54,7 +57,7 @@ interface UploadQueueRowProps {
 }
 
 function skipReasonCopy(
-  item: UploadQueueItem<unknown>,
+  item: UploadQueueItem<UploadedDocument>,
   limitLabel: string,
   t: ReturnType<typeof useTranslation>["t"],
 ): string {
@@ -104,6 +107,14 @@ const UploadQueueRow = memo(function UploadQueueRow({
         {item.status === "skipped" ? (
           <Text type="secondary" style={{ fontSize: 12 }}>
             {skipReasonCopy(item, limitLabel, t)}
+          </Text>
+        ) : item.status === "done" && item.result?.unchanged ? (
+          <Text
+            type="secondary"
+            style={{ fontSize: 12 }}
+            data-testid={`doc-upload-unchanged-${item.id}`}
+          >
+            {t("knowledge_page.upload_queue_unchanged")}
           </Text>
         ) : item.status === "failed" && !item.cancelled && item.error ? (
           <Text type="danger" ellipsis={{ tooltip: item.error }} style={{ fontSize: 12 }}>
@@ -197,7 +208,7 @@ export function UploadQueuePanel({
       : null,
   ].filter((part): part is string => part !== null);
 
-  const renderRow = (item: UploadQueueItem<unknown>) => (
+  const renderRow = (item: UploadQueueItem<UploadedDocument>) => (
     <UploadQueueRow
       key={item.id}
       item={item}

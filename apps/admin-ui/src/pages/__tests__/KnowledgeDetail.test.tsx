@@ -15,6 +15,7 @@ import "../../i18n";
 import * as knowledgeSdk from "../../api/knowledge";
 import { ApiError } from "../../api/client";
 import { KnowledgeDetail } from "../KnowledgeDetail";
+import { DocumentsTab } from "../knowledge_detail/DocumentsTab";
 
 // Cross-tenant W3 — the page reads the ambient tenant scope; these tests
 // don't mount a TenantScopeProvider, so mock it (home state: no scope).
@@ -97,6 +98,22 @@ const DOCS: knowledgeSdk.KnowledgeDocument[] = [
   },
 ];
 
+/** Click a Popconfirm's OK button — it shares the trigger's label and
+ *  mounts last (portal). */
+async function confirmPopover(label: string) {
+  const buttons = await screen.findAllByRole("button", { name: label });
+  await userEvent.click(buttons[buttons.length - 1]);
+}
+
+/** A one-page ``listDocuments`` response. */
+function docPage(
+  documents: knowledgeSdk.KnowledgeDocument[],
+  total = documents.length,
+  offset = 0,
+): knowledgeSdk.DocumentsPage {
+  return { documents, total, offset, limit: 50 };
+}
+
 function detailTree(initial: string) {
   return (
     <MemoryRouter initialEntries={[initial]}>
@@ -125,7 +142,7 @@ beforeEach(() => {
 describe("KnowledgeDetail", () => {
   it("loads the base, shows stats + localized doc status", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail();
 
@@ -140,7 +157,7 @@ describe("KnowledgeDetail", () => {
 
   it("re-index banner triggers reindexBase", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const reindexSpy = vi.spyOn(knowledgeSdk, "reindexBase").mockResolvedValue();
 
     renderDetail();
@@ -152,7 +169,7 @@ describe("KnowledgeDetail", () => {
 
   it("re-ingest calls the SDK", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const reingestSpy = vi
       .spyOn(knowledgeSdk, "reingestDocument")
       .mockResolvedValue(DOCS[0]);
@@ -173,7 +190,7 @@ describe("KnowledgeDetail", () => {
 
   it("retrieval test runs the query and renders scored results", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const testSpy = vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue({
       query: "deductible",
       count: 1,
@@ -207,7 +224,7 @@ describe("KnowledgeDetail", () => {
 
   it("settings save calls updateBase", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const updateSpy = vi.spyOn(knowledgeSdk, "updateBase").mockResolvedValue(BASE);
 
     renderDetail("/knowledge/support-docs/settings");
@@ -221,7 +238,7 @@ describe("KnowledgeDetail", () => {
   it("切入态置灰重建索引/文档删除(两态:home 态由上方用例覆盖)", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail();
     await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
@@ -235,7 +252,7 @@ describe("KnowledgeDetail", () => {
   it("切入态置灰设置保存(两态:home 态由上方用例覆盖)", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail("/knowledge/support-docs/settings");
     await waitFor(() => expect(screen.getByTestId("knowledge-settings-tab")).toBeInTheDocument());
@@ -250,7 +267,7 @@ describe("KnowledgeDetail", () => {
     // param must still win (it names the row's owning tenant).
     scopeRef.current = "33333333-3333-3333-3333-333333333333";
     const getBaseSpy = vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail("/knowledge/support-docs?tenant_id=tenant-2-xxxx");
     await waitFor(() =>
@@ -265,21 +282,25 @@ describe("KnowledgeDetail — cross-tenant W4 (review C-2)", () => {
   it("deep-link ?tenant_id= threads into the documents read (readScope prop)", async () => {
     scopeRef.current = "*";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    const listSpy = vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const listSpy = vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail(`/knowledge/support-docs?tenant_id=${FOREIGN_TENANT}`);
 
     // 把 DocumentsTab 的 readScope prop 换回 ambient("*" 折叠 undefined)
     // 这里必须红。
     await waitFor(() =>
-      expect(listSpy).toHaveBeenCalledWith("support-docs", FOREIGN_TENANT),
+      expect(listSpy).toHaveBeenCalledWith(
+        "support-docs",
+        { limit: 50, offset: 0 },
+        FOREIGN_TENANT,
+      ),
     );
   });
 
   it('"*" 聚合 + 外租户深链 → 写控件置灰(readonly 跟随读目标)', async () => {
     scopeRef.current = "*";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail(`/knowledge/support-docs?tenant_id=${FOREIGN_TENANT}`);
     await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
@@ -295,7 +316,7 @@ describe("KnowledgeDetail — cross-tenant W4 (review C-2)", () => {
   it('"*" 聚合无深链(读归属租户)→ 保持可写(防"一律置灰"退化)', async () => {
     scopeRef.current = "*";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail();
     await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
@@ -309,7 +330,7 @@ describe("KnowledgeDetail — cross-tenant W4 (review C-2)", () => {
   it("settings 外租户深链置灰保存/重建索引(readonly prop 下传)", async () => {
     scopeRef.current = "*";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail(`/knowledge/support-docs/settings?tenant_id=${FOREIGN_TENANT}`);
     await waitFor(() =>
@@ -324,7 +345,7 @@ describe("KnowledgeDetail — cross-tenant W4 (review C-2)", () => {
   it("换 tab 保留 ?tenant_id=:documents→test 后检索测试仍读外租户(MUT-11)", async () => {
     scopeRef.current = "*";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const testSpy = vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue({
       query: "q",
       count: 0,
@@ -411,7 +432,7 @@ function countBy(values: string[]): Record<string, number> {
 describe("DocumentsTab — upload queue (B-175 L3)", () => {
   it("a 6-file pick reads 3 uploading / 1 queued / 2 skipped and refreshes once after settling", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    const listSpy = vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    const listSpy = vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const pending: Deferred<knowledgeSdk.KnowledgeDocument>[] = [];
     const uploadSpy = vi.spyOn(knowledgeSdk, "uploadDocument").mockImplementation(() => {
       const d = deferred<knowledgeSdk.KnowledgeDocument>();
@@ -468,7 +489,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
 
   it("a server 413 lands the row in failed with the server's limit; retry re-sends", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const uploadSpy = vi
       .spyOn(knowledgeSdk, "uploadDocument")
       .mockRejectedValueOnce(
@@ -495,7 +516,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
 
   it("cancel aborts the in-flight upload", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const signals: AbortSignal[] = [];
     vi.spyOn(knowledgeSdk, "uploadDocument").mockImplementation((_b, _f, opts) => {
       if (opts?.signal) signals.push(opts.signal);
@@ -524,7 +545,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
 
   it("a server 413 without limit_bytes says 'too large' without inventing a number (review #8)", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     vi.spyOn(knowledgeSdk, "uploadDocument").mockRejectedValue(
       new ApiError("Request failed with status code 413", "HTTP_413", 413),
     );
@@ -541,7 +562,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
 
   it("readonly after the fact: Retry on a failed row is disabled and never re-sends (review #3)", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const uploadSpy = vi
       .spyOn(knowledgeSdk, "uploadDocument")
       .mockRejectedValue(new Error("boom"));
@@ -569,26 +590,28 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     expect(countBy(rowStatuses())).toEqual({ failed: 1 });
   });
 
-  it("a pick whose name matches an existing document is skipped as a duplicate (review #1)", async () => {
+  it("a pick whose name matches an existing document uploads as an update; unchanged bytes say so", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
-    const uploadSpy = vi.spyOn(knowledgeSdk, "uploadDocument").mockResolvedValue(DOCS[0]);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    const uploadSpy = vi
+      .spyOn(knowledgeSdk, "uploadDocument")
+      .mockResolvedValue({ ...DOCS[0], unchanged: true });
 
     renderDetail();
     await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
     pickFiles([fileOf("faq.pdf")]); // DOCS[0].filename
 
-    const summary = await screen.findByTestId("doc-upload-summary");
-    expect(summary).toHaveTextContent(/Skipped 1 duplicate name/);
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 30));
-    });
-    expect(uploadSpy).not.toHaveBeenCalled();
+    await waitFor(() => expect(uploadSpy).toHaveBeenCalledTimes(1));
+    expect(uploadSpy.mock.calls[0][1].name).toBe("faq.pdf");
+    expect(await screen.findByTestId(/^doc-upload-unchanged-/)).toHaveTextContent(
+      /Unchanged/,
+    );
+    expect(screen.queryByTestId("doc-upload-summary")).not.toBeInTheDocument();
   });
 
   it("a dropped folder is expanded and its unsupported files are counted as skipped (review #4)", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const uploadSpy = vi
       .spyOn(knowledgeSdk, "uploadDocument")
       .mockImplementation(() => new Promise(() => {}));
@@ -647,7 +670,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
   it("readonly (switched tenant): a pick never reaches the SDK and no queue renders", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
     const uploadSpy = vi.spyOn(knowledgeSdk, "uploadDocument").mockResolvedValue(DOCS[0]);
 
     renderDetail();
@@ -666,7 +689,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
 
   it("folder toggle flips the input to directory mode", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(DOCS);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
 
     renderDetail();
     await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
@@ -684,23 +707,232 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     expect(dirInput.getAttribute("accept") ?? "").toBe("");
   });
 
-  it("documents table paginates client-side at 50 with a total", async () => {
+  it("documents table pages server-side: page 2 asks for offset 50", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
     const many = Array.from({ length: 60 }, (_, i) => ({
       ...DOCS[0],
       id: `33333333-3333-3333-3333-${String(i).padStart(12, "0")}`,
       filename: `doc-${i}.pdf`,
     }));
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(many);
+    const listSpy = vi
+      .spyOn(knowledgeSdk, "listDocuments")
+      .mockImplementation(async (_base, { limit, offset }) =>
+        docPage(many.slice(offset, offset + limit), many.length, offset),
+      );
 
     renderDetail();
     await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
 
+    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 0 }, undefined);
     expect(screen.getAllByText(/^doc-\d+\.pdf$/)).toHaveLength(50);
-    expect(screen.queryByText("doc-59.pdf")).not.toBeInTheDocument();
     const pager = screen.getByTestId("doc-table-pagination");
     expect(pager).toHaveTextContent(/60/);
     await userEvent.click(within(pager).getByTitle("2"));
     await waitFor(() => expect(screen.getByText("doc-59.pdf")).toBeInTheDocument());
+    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 50 }, undefined);
+    expect(screen.getAllByText(/^doc-\d+\.pdf$/)).toHaveLength(10);
+  });
+
+  it("a page emptied under us steps back to the last page with rows", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    const many = Array.from({ length: 51 }, (_, i) => ({
+      ...DOCS[0],
+      id: `44444444-4444-4444-4444-${String(i).padStart(12, "0")}`,
+      filename: `doc-${i}.pdf`,
+    }));
+    let rows = many;
+    const listSpy = vi
+      .spyOn(knowledgeSdk, "listDocuments")
+      .mockImplementation(async (_base, { limit, offset }) =>
+        docPage(rows.slice(offset, offset + limit), rows.length, offset),
+      );
+    vi.spyOn(knowledgeSdk, "deleteDocument").mockImplementation(async () => {
+      rows = many.slice(0, 50);
+    });
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
+    await userEvent.click(within(screen.getByTestId("doc-table-pagination")).getByTitle("2"));
+    await waitFor(() => expect(screen.getByText("doc-50.pdf")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByTestId(`doc-delete-${many[50].id}`));
+    await confirmPopover("Delete");
+
+    await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
+    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 0 }, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-175 L3 — pending slot: "previous version still in use" + discard.
+// ---------------------------------------------------------------------------
+
+const PENDING_FAILED: knowledgeSdk.KnowledgeDocument = {
+  ...DOCS[0],
+  status: "failed",
+  error: "parse failed",
+  has_pending: true,
+};
+
+describe("DocumentsTab — pending re-upload (B-175 L3)", () => {
+  it("a failed re-upload says the previous version is still in use", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([PENDING_FAILED]));
+
+    renderDetail();
+    const marker = await screen.findByTestId(`doc-pending-${PENDING_FAILED.id}`);
+    expect(marker).toHaveTextContent("Previous version still in use");
+    expect(screen.getByTestId(`doc-discard-pending-${PENDING_FAILED.id}`)).toBeEnabled();
+  });
+
+  it("no marker and no discard button without a pending upload", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
+    expect(screen.queryByTestId(`doc-pending-${DOCS[0].id}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`doc-discard-pending-${DOCS[0].id}`)).not.toBeInTheDocument();
+  });
+
+  it("with no chunks serving the marker says nothing is in use yet", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(
+      docPage([{ ...PENDING_FAILED, chunk_count: 0 }]),
+    );
+
+    renderDetail();
+    const marker = await screen.findByTestId(`doc-pending-${PENDING_FAILED.id}`);
+    expect(marker).toHaveTextContent("New version pending, nothing in use yet");
+  });
+
+  it("discard calls the SDK after confirming and refreshes the table", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    const listSpy = vi
+      .spyOn(knowledgeSdk, "listDocuments")
+      .mockResolvedValueOnce(docPage([PENDING_FAILED]))
+      .mockResolvedValue(docPage(DOCS));
+    const discardSpy = vi
+      .spyOn(knowledgeSdk, "discardPendingDocument")
+      .mockResolvedValue(DOCS[0]);
+
+    renderDetail();
+    await userEvent.click(await screen.findByTestId(`doc-discard-pending-${PENDING_FAILED.id}`));
+    expect(discardSpy).not.toHaveBeenCalled(); // behind the confirm
+    await confirmPopover("Discard new version");
+
+    await waitFor(() =>
+      expect(discardSpy).toHaveBeenCalledWith("support-docs", PENDING_FAILED.id),
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId(`doc-pending-${PENDING_FAILED.id}`)).not.toBeInTheDocument(),
+    );
+    expect(listSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("a 409 (nothing pending any more) still refreshes the table", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    const listSpy = vi
+      .spyOn(knowledgeSdk, "listDocuments")
+      .mockResolvedValueOnce(docPage([PENDING_FAILED]))
+      .mockResolvedValue(docPage(DOCS));
+    vi.spyOn(knowledgeSdk, "discardPendingDocument").mockRejectedValue(
+      new ApiError("document has no pending upload", "HTTP_409", 409),
+    );
+
+    renderDetail();
+    await userEvent.click(await screen.findByTestId(`doc-discard-pending-${PENDING_FAILED.id}`));
+    await confirmPopover("Discard new version");
+
+    expect(await screen.findByText(/has no pending new version/)).toBeInTheDocument();
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(2));
+  });
+
+  it("readonly (switched tenant): discard is disabled", async () => {
+    isTenantSwitchedMock.mockReturnValue(true);
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([PENDING_FAILED]));
+
+    renderDetail();
+    expect(
+      await screen.findByTestId(`doc-discard-pending-${PENDING_FAILED.id}`),
+    ).toBeDisabled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-175 L3 — server paging edge cases on the tab itself.
+// ---------------------------------------------------------------------------
+
+function sixtyDocs(prefix: string): knowledgeSdk.KnowledgeDocument[] {
+  return Array.from({ length: 60 }, (_, i) => ({
+    ...DOCS[0],
+    id: `55555555-5555-5555-5555-${String(i).padStart(12, "0")}`,
+    filename: `${prefix}-${i}.pdf`,
+  }));
+}
+
+function tabTree(baseName: string) {
+  return (
+    <App>
+      <DocumentsTab baseName={baseName} readScope={undefined} readonly={false} />
+    </App>
+  );
+}
+
+describe("DocumentsTab — server paging edges (B-175 L3)", () => {
+  it("switching to another base starts again on page 1", async () => {
+    const rows: Record<string, knowledgeSdk.KnowledgeDocument[]> = {
+      alpha: sixtyDocs("alpha"),
+      beta: sixtyDocs("beta"),
+    };
+    const listSpy = vi
+      .spyOn(knowledgeSdk, "listDocuments")
+      .mockImplementation(async (base, { limit, offset }) =>
+        docPage(rows[base].slice(offset, offset + limit), rows[base].length, offset),
+      );
+
+    const { rerender } = render(tabTree("alpha"));
+    await waitFor(() => expect(screen.getByText("alpha-0.pdf")).toBeInTheDocument());
+    await userEvent.click(within(screen.getByTestId("doc-table-pagination")).getByTitle("2"));
+    await waitFor(() => expect(screen.getByText("alpha-59.pdf")).toBeInTheDocument());
+
+    rerender(tabTree("beta"));
+    await waitFor(() => expect(screen.getByText("beta-0.pdf")).toBeInTheDocument());
+    expect(listSpy).not.toHaveBeenCalledWith("beta", { limit: 50, offset: 50 }, undefined);
+  });
+
+  it("a slow response for the previous page never overwrites the current page", async () => {
+    const many = sixtyDocs("doc");
+    let releasePage1!: (page: knowledgeSdk.DocumentsPage) => void;
+    let first = true;
+    vi.spyOn(knowledgeSdk, "listDocuments").mockImplementation((_base, { limit, offset }) => {
+      const page = docPage(many.slice(offset, offset + limit), many.length, offset);
+      if (offset === 0 && !first) {
+        // the second page-1 read hangs until released
+        return new Promise((resolve) => {
+          releasePage1 = resolve;
+        });
+      }
+      first = false;
+      return Promise.resolve(page);
+    });
+
+    render(tabTree("alpha"));
+    await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
+    const pager = screen.getByTestId("doc-table-pagination");
+    await userEvent.click(within(pager).getByTitle("2"));
+    await waitFor(() => expect(screen.getByText("doc-59.pdf")).toBeInTheDocument());
+    // fireEvent: the loading mask sets pointer-events:none, which userEvent honours.
+    fireEvent.click(within(pager).getByTitle("1")); // hangs
+    fireEvent.click(within(pager).getByTitle("2"));
+    await waitFor(() => expect(screen.getByText("doc-59.pdf")).toBeInTheDocument());
+
+    await act(async () => {
+      releasePage1(docPage(many.slice(0, 50), many.length, 0));
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(screen.queryByText("doc-0.pdf")).not.toBeInTheDocument();
+    expect(screen.getByText("doc-59.pdf")).toBeInTheDocument();
   });
 });

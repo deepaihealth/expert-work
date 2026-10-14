@@ -134,8 +134,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         return next((b for b in self._bases if b.tenant_id == tenant_id and b.name == name), None)
 
     async def list_bases(self, *, tenant_id: UUID) -> list[KnowledgeBase]:
-        bases = [b for b in self._bases if b.tenant_id == tenant_id]
-        return sorted(bases, key=_created_key, reverse=True)
+        bases = await self.list_bases_page(tenant_id=tenant_id, limit=len(self._bases), offset=0)
+        return bases[0]
 
     async def list_bases_all_tenants(
         self, *, limit: int = ALL_TENANTS_BASES_LIMIT
@@ -144,6 +144,24 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         # sorts) matching the SQL implementation byte-for-byte.
         bases = sorted(self._bases, key=lambda b: b.id.int)
         return sorted(bases, key=_created_key, reverse=True)[:limit]
+
+    async def list_bases_page(
+        self, *, tenant_id: UUID, limit: int, offset: int
+    ) -> tuple[list[KnowledgeBase], int]:
+        # created_at DESC, id DESC (two stable sorts) — the SQL page order.
+        bases = sorted(
+            (b for b in self._bases if b.tenant_id == tenant_id),
+            key=lambda b: b.id.int,
+            reverse=True,
+        )
+        bases = sorted(bases, key=_created_key, reverse=True)
+        return bases[offset : offset + limit], len(bases)
+
+    async def list_bases_all_tenants_page(
+        self, *, limit: int, offset: int
+    ) -> tuple[list[KnowledgeBase], int]:
+        bases = await self.list_bases_all_tenants(limit=len(self._bases))
+        return bases[offset : offset + limit], len(bases)
 
     async def base_stats(self, *, tenant_id: UUID, kb_id: UUID) -> tuple[int, int]:
         docs = [d for d in self._documents if d.tenant_id == tenant_id and d.kb_id == kb_id]

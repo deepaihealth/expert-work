@@ -7,11 +7,16 @@
  * H-18): poll while any document is non-terminal, stop once all settle.
  *
  * B-175 L3: uploads go through ``useUploadQueue`` (concurrency 3, per-file
- * progress / cancel / retry, unsupported + oversized + duplicate-name files
- * skipped up front). ``beforeUpload`` enqueues the whole antd batch once and
- * returns ``LIST_IGNORE`` so antd keeps no list of its own; the table
- * refreshes at most every 15 s while a batch runs and once more when it
- * settles. The Dragger carries no ``accept`` — rc-upload would filter
+ * progress / cancel / retry, unsupported + oversized files and names
+ * repeated inside the batch skipped up front). A name already in the base is
+ * an update, not a duplicate: the new bytes wait in the pending slot while
+ * the previous version keeps serving, and the row shows that marker plus a
+ * "discard new version" action. The table pages server-side (50 per page;
+ * the poll refetches only the current page, so a row ingesting on another
+ * page shows its new status only once the user turns to that page). ``beforeUpload`` enqueues the
+ * whole antd batch once and returns ``LIST_IGNORE`` so antd keeps no list
+ * of its own; the table refreshes at most every 15 s while a batch runs and
+ * once more when it settles. The Dragger carries no ``accept`` — rc-upload would filter
  * unsupported files before the queue can count them. Folders: the toggle
  * flips the picker to ``webkitdirectory``; while a drag is over the dropzone
  * the Dragger is switched to directory mode too, so rc-upload expands dropped
@@ -34,11 +39,12 @@ import {
   Upload,
 } from "antd";
 import type { TableColumnsType, TablePaginationConfig } from "antd";
-import { Eye, RefreshCw, Trash2 } from "lucide-react";
+import { Eye, RefreshCw, Trash2, Undo2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
   deleteDocument,
+  discardPendingDocument,
   KNOWLEDGE_DOCUMENT_MAX_BYTES,
   listDocuments,
   reingestDocument,
@@ -46,6 +52,7 @@ import {
   type DocumentStatus,
   type KnowledgeDocument,
   type UploadDocumentOptions,
+  type UploadedDocument,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
 import { formatBytes } from "../../components/console/workspace_format";
@@ -93,6 +100,20 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
   const { message } = App.useApp();
 
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [total, setTotal] = useState(0);
+  /** 1-based page of the server-side paged table. */
+  const [page, setPage] = useState(1);
+  // Another base (or tenant scope) starts again on page 1 — reset during
+  // render so the fetch below never runs with the previous base's page.
+  const pageOwner = `${readScope ?? ""}|${baseName}`;
+  const [pageOwnerSeen, setPageOwnerSeen] = useState(pageOwner);
+  if (pageOwnerSeen !== pageOwner) {
+    setPageOwnerSeen(pageOwner);
+    setPage(1);
+  }
+  /** Only the latest list request may write the table (page flips and the
+   *  poll can overlap). */
+  const requestSeqRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [previewDoc, setPreviewDoc] = useState<KnowledgeDocument | null>(null);
   const [folderMode, setFolderMode] = useState(false);
@@ -107,20 +128,38 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
   const refresh = useCallback(
     async ({ quiet = false }: { quiet?: boolean } = {}) => {
       if (!quiet) setLoading(true);
+      const seq = ++requestSeqRef.current;
       try {
-        setDocuments(await listDocuments(baseName, readScope));
+        const result = await listDocuments(
+          baseName,
+          { limit: DOC_TABLE_PAGE_SIZE, offset: (page - 1) * DOC_TABLE_PAGE_SIZE },
+          readScope,
+        );
+        if (seq !== requestSeqRef.current) return;
+        // The page emptied under us (last rows deleted elsewhere) → step
+        // back to the last page that still has rows; that refetches.
+        const lastPage = Math.max(1, Math.ceil(result.total / DOC_TABLE_PAGE_SIZE));
+        if (result.documents.length === 0 && page > lastPage) {
+          setPage(lastPage);
+          return;
+        }
+        setDocuments(result.documents);
+        setTotal(result.total);
       } catch (err) {
-        message.error(errMessage(err));
+        if (seq === requestSeqRef.current) message.error(errMessage(err));
       } finally {
-        if (!quiet) setLoading(false);
+        // Whichever request is latest clears the spinner — a quiet poll that
+        // overtook a loud fetch must not leave it spinning.
+        if (seq === requestSeqRef.current) setLoading(false);
       }
     },
-    [baseName, message, readScope],
+    [baseName, message, page, readScope],
   );
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
 
   const hasActiveIngest = useMemo(
     () => documents.some((d) => d.status === "pending" || d.status === "processing"),
@@ -147,7 +186,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
    *  the row's message (503 → embedder missing, 413 → server's own cap). An
    *  abort rejection is rethrown as-is; the queue ignores it. */
   const uploadOne = useCallback(
-    async (file: File, opts: Required<UploadDocumentOptions>) => {
+    async (file: File, opts: Required<UploadDocumentOptions>): Promise<UploadedDocument> => {
       try {
         return await uploadDocument(baseName, file, opts);
       } catch (err) {
@@ -177,7 +216,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     void refresh({ quiet: true });
   }, [refresh]);
 
-  const queue = useUploadQueue<KnowledgeDocument>({
+  const queue = useUploadQueue<UploadedDocument>({
     upload: uploadOne,
     onSettled: quietRefresh,
     onBatchProgress: quietRefresh,
@@ -187,20 +226,16 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
   });
   const { enqueue, retry } = queue;
 
-  // Names already on the server: a pick with the same basename would upsert
-  // over the existing document, so the queue skips it as a duplicate.
-  const existingNames = useMemo(() => new Set(documents.map((d) => d.filename)), [documents]);
-
   const handleBeforeUpload = useCallback(
     (_file: File, batch: File[]) => {
       if (batch !== lastBatchRef.current) {
         lastBatchRef.current = batch;
-        if (!readonly) enqueue(batch, { existingNames });
+        if (!readonly) enqueue(batch);
       }
       // The queue owns the file; keep it out of antd's own fileList.
       return Upload.LIST_IGNORE;
     },
-    [enqueue, existingNames, readonly],
+    [enqueue, readonly],
   );
 
   const handleRetry = useCallback(
@@ -256,6 +291,23 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     [t, baseName, message, refresh],
   );
 
+  const handleDiscardPending = useCallback(
+    async (documentId: string) => {
+      try {
+        await discardPendingDocument(baseName, documentId);
+        message.success(t("knowledge_page.discard_pending_done"));
+      } catch (err) {
+        message.error(
+          err instanceof ApiError && err.status === 409
+            ? t("knowledge_page.discard_pending_none")
+            : errMessage(err),
+        );
+      }
+      await refresh();
+    },
+    [t, baseName, message, refresh],
+  );
+
   const handleDelete = useCallback(
     async (documentId: string) => {
       try {
@@ -281,13 +333,43 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         title: t("knowledge_page.col_status"),
         dataIndex: "status",
         key: "status",
-        width: 120,
+        width: 220,
         render: (status: DocumentStatus, record) => {
           const tag = <Tag color={STATUS_COLOR[status]}>{t(`knowledge_page.status_${status}`)}</Tag>;
-          return status === "failed" && record.error ? (
-            <Tooltip title={record.error}>{tag}</Tooltip>
-          ) : (
-            tag
+          const statusTag =
+            status === "failed" && record.error ? (
+              <Tooltip title={record.error}>{tag}</Tooltip>
+            ) : (
+              tag
+            );
+          if (!record.has_pending) return statusTag;
+          // A re-upload is pending: say which version retrieval uses now.
+          const serving = record.chunk_count > 0;
+          return (
+            <Space size={4} wrap>
+              {statusTag}
+              <Tooltip
+                title={t(
+                  status === "failed"
+                    ? "knowledge_page.pending_failed_hint"
+                    : "knowledge_page.pending_ingesting_hint",
+                )}
+              >
+                <Tag
+                  color={serving ? "gold" : "default"}
+                  bordered={false}
+                  // Focusable so keyboard users reach the hint tooltip.
+                  tabIndex={0}
+                  data-testid={`doc-pending-${record.id}`}
+                >
+                  {t(
+                    serving
+                      ? "knowledge_page.pending_previous_serving"
+                      : "knowledge_page.pending_nothing_serving",
+                  )}
+                </Tag>
+              </Tooltip>
+            </Space>
           );
         },
       },
@@ -324,7 +406,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
       {
         title: "",
         key: "actions",
-        width: 130,
+        width: 160,
         render: (_: unknown, record) => (
           <Space size={4}>
             <Tooltip title={t("knowledge_page.view_chunks")}>
@@ -350,6 +432,34 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
                 />
               </Tooltip>
             </ReadonlyTooltip>
+            {record.has_pending && (
+              <ReadonlyTooltip on={readonly}>
+                <Popconfirm
+                  title={t("knowledge_page.discard_pending_confirm_title", {
+                    name: record.filename,
+                  })}
+                  description={t(
+                    record.chunk_count > 0
+                      ? "knowledge_page.discard_pending_confirm_body"
+                      : "knowledge_page.discard_pending_confirm_body_nothing_serving",
+                  )}
+                  onConfirm={() => void handleDiscardPending(record.id)}
+                  okText={t("knowledge_page.discard_pending")}
+                  disabled={readonly}
+                >
+                  <Tooltip title={t("knowledge_page.discard_pending")}>
+                    <Button
+                      size="small"
+                      type="text"
+                      disabled={readonly}
+                      icon={<Undo2 size={14} strokeWidth={1.5} />}
+                      aria-label={t("knowledge_page.discard_pending")}
+                      data-testid={`doc-discard-pending-${record.id}`}
+                    />
+                  </Tooltip>
+                </Popconfirm>
+              </ReadonlyTooltip>
+            )}
             <ReadonlyTooltip on={readonly}>
               <Popconfirm
                 title={t("knowledge_page.delete_doc_confirm_title", { name: record.filename })}
@@ -373,19 +483,20 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         ),
       },
     ],
-    [t, handleReingest, handleDelete, readonly],
+    [t, handleReingest, handleDiscardPending, handleDelete, readonly],
   );
 
-  // Client-side for now (L3-T4 step 1); the server-side cut-over lands with
-  // the paginated list API (wave-1 PR #8) and must not change the API calls here.
   const pagination = useMemo<TablePaginationConfig>(
     () => ({
+      current: page,
       pageSize: DOC_TABLE_PAGE_SIZE,
+      total,
       showSizeChanger: false,
-      showTotal: (total: number) => t("knowledge_page.doc_table_total", { total }),
+      showTotal: (count: number) => t("knowledge_page.doc_table_total", { total: count }),
+      onChange: setPage,
       ...DOC_TABLE_PAGINATION_TESTID,
     }),
-    [t],
+    [page, t, total],
   );
 
   return (
