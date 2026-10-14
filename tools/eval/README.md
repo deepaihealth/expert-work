@@ -182,6 +182,11 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
     --store sql --embedder real --tiers A,D-A --label baseline-$(git rev-parse --short HEAD) --update-baseline
 ```
 
+- **可复现**:`--store sql` 默认走精确检索并固定读行顺序 —— 一次性库关掉索引扫描(不用 HNSW)、并行扫描、
+  同步顺序扫描与 autovacuum,落库按清单顺序串行。重复文档大量同分,同分谁在前取决于 Postgres 读行的顺序,四样少一样
+  结果就会抖(10-14:只关前两样时 303 题里 203 题排序不同,再关同步扫描剩 103 题,再关 autovacuum 为 0)。同一份代码
+  连跑两次结果逐条一致(含分数),比较改动前后就用这个默认模式。`--ann` 走生产同款 HNSW,只在要量近似检索本身的召回
+  损失时用,结果不保证可复现;指纹里 `vector_search` 记 `exact` / `ann`。
 - **为什么基线必须 `--store sql`**:关键词路 SQL 是 `plainto_tsquery` 全 AND,内存库是任一词重叠打分,两套语义不同;
   中文长问句关键词路命中率(设计 §1.3 的固定回归用例)只有 SQL 库量得到。再跑一次 `--method keyword` 单独记这个数。
 - **建库规则**:单库,库名 = 评测集 `name`;只入 `--tiers` 里的层(默认评测集 `corpus.tiers`,再默认 `A,D-A`);

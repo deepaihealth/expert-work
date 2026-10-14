@@ -29,6 +29,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     build_fake_embedder,
     build_retriever,
     check_anchors,
+    fingerprint,
     main,
     rls_tenant,
     run_eval,
@@ -300,6 +301,61 @@ async def test_build_corpus_same_basename_different_content_ingests_both_under_q
     assert not any("维生素 C 咀嚼片" in t for t in texts)
     later = await _chunk_texts(store, tenant, docs["other/manual_b.txt"].id)
     assert any("维生素 C 咀嚼片" in t for t in later)  # 后到的那份也在,只是换了名
+
+
+def _first_is_slowest_parser(filename: str, raw: bytes) -> str:
+    # The manifest's first document finishes parsing last.
+    time.sleep(0.3 if filename == "manual_a.md" else 0.0)
+    return raw.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_build_corpus_writes_in_manifest_order_whatever_parse_order(
+    corpus: tuple[Path, Path],
+) -> None:
+    """Parsing runs concurrently but documents land in manifest order — the
+    physical row order (which breaks retrieval ties) must not depend on which
+    parse happened to finish first."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    manifest, _root = corpus
+    expected = [
+        r["path"]
+        for r in select_rows(_manifest_rows(manifest), tiers=("A", "D-A"), limit_docs=0).rows
+    ]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        report = await _build(
+            corpus, store=store, tenant=tenant, executor=pool, parser=_first_is_slowest_parser
+        )
+    docs = await store.list_documents(tenant_id=tenant, kb_id=report.base_id)
+    names = {d.id: d.filename for d in docs}
+    # Chunk write order (what breaks retrieval ties) follows the manifest.
+    written: list[str] = []
+    for chunk in store._chunks:
+        name = names[chunk.document_id]
+        if name not in written:
+            written.append(name)
+    assert [Path(p).name for p in expected] == [Path(f).name for f in written]
+
+
+def test_fingerprint_records_vector_search_mode(tmp_path: Path) -> None:
+    dataset = tmp_path / "d.yaml"
+    manifest = tmp_path / "m.csv"
+    dataset.write_text("x", encoding="utf-8")
+    manifest.write_text("y", encoding="utf-8")
+    common = {
+        "dataset_path": dataset,
+        "manifest_path": manifest,
+        "corpus_root": tmp_path,
+        "embedder": "fake",
+        "embed_base_url": None,
+        "store": "sql",
+        "tiers": ("A",),
+        "limit_docs": 0,
+        "cfg": EvalConfig(),
+    }
+    assert fingerprint(**common)["vector_search"] == "exact"
+    assert fingerprint(**common, ann=True)["vector_search"] == "ann"
 
 
 def _slow_parser(filename: str, raw: bytes) -> str:
