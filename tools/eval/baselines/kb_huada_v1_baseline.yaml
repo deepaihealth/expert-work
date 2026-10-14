@@ -7,10 +7,190 @@ kb:
         document: 华大营养产品详情检索.xlsx
         reason: anchor_not_in_any_chunk
       dead_cases: 1
+      expanded: 563
+      expanded_cases: 205
+      too_common:
+      - case_id: faq_xlsx-0014
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: faq_xlsx-0014
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: faq_xlsx-0014
+        document: 华大营养产品知识库.xlsx
+        n_docs: 14
+      - case_id: faq_xlsx-0035
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0035
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0035
+        document: 华大营养产品知识库.xlsx
+        n_docs: 7
+      - case_id: faq_xlsx-0040
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0040
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0040
+        document: 华大营养产品知识库.xlsx
+        n_docs: 7
+      - case_id: faq_xlsx-0060
+        document: 产品说明书：益舒.docx
+        n_docs: 6
+      - case_id: faq_xlsx-0060
+        document: 华大产品汇总.xlsx
+        n_docs: 6
+      - case_id: faq_xlsx-0060
+        document: 华大营养产品知识库.xlsx
+        n_docs: 6
+      - case_id: manual_qa-0002
+        document: 产品说明书 ：益休.docx
+        n_docs: 10
+      - case_id: manual_qa-0003
+        document: 产品说明书 ：益家人.docx
+        n_docs: 14
+      - case_id: manual_qa-0003
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: manual_qa-0003
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: manual_qa-0056
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: manual_qa-0056
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: manual_qa-0056
+        document: 产品说明书：益顺.docx
+        n_docs: 7
+      - case_id: manual_qa-0062
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 10
+      - case_id: manual_qa-0063
+        document: 产品说明书：益畅.docx
+        n_docs: 14
+      - case_id: manual_qa-0063
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: manual_qa-0063
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: manual_qa-0065
+        document: 产品说明书：益顺.docx
+        n_docs: 7
+      - case_id: manual_qa-0065
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: manual_qa-0065
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: manual_qa-0067
+        document: 产品说明书：益顺.docx
+        n_docs: 7
+      - case_id: manual_qa-0067
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: manual_qa-0067
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: manual_qa-0068
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 10
+      - case_id: manual_qa-0069
+        document: 产品说明书：益顺.docx
+        n_docs: 14
+      - case_id: manual_qa-0069
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: manual_qa-0069
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: hard_cross-0001
+        document: 产品说明书：益畅.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书：畅青.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书：益舒.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书 ：益衡（血糖管理）.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 27
+      - case_id: hard_cross-0002
+        document: 产品说明书：益畅.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：益舒.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：益顺.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：镜脂轻（体重管理）.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 30
+      - case_id: hard_cross-0005
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: hard_cross-0005
+        document: 产品说明书 ：益衡（血糖管理）.docx
+        n_docs: 14
+      - case_id: hard_cross-0008
+        document: 产品说明书：益畅.docx
+        n_docs: 40
+      - case_id: hard_cross-0009
+        document: 产品说明书：益畅.docx
+        n_docs: 14
+      - case_id: hard_cross-0009
+        document: 产品说明书：畅青.docx
+        n_docs: 14
+      - case_id: hard_cross-0009
+        document: 产品说明书：益舒.docx
+        n_docs: 14
+      - case_id: hard_cross-0010
+        document: 产品说明书：镜脂轻（体重管理）.docx
+        n_docs: 26
+      - case_id: hard_cross-0010
+        document: 产品说明书：益舒.docx
+        n_docs: 26
+      - case_id: hard_cross-0011
+        document: 产品说明书：益舒.docx
+        n_docs: 7
+      - case_id: hard_cross-0012
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 6
+      - case_id: hard_cross-0013
+        document: 产品说明书：畅青.docx
+        n_docs: 15
+      - case_id: hard_cross-0013
+        document: 产品说明书 ：益家人.docx
+        n_docs: 15
+      - case_id: hard_exact-0008
+        document: 产品说明书：畅青.docx
+        n_docs: 8
+      - case_id: hard_exact-0010
+        document: 产品说明书：益畅.docx
+        n_docs: 6
+      - case_id: hard_exact-0010
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 6
+      - case_id: hard_exact-0012
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 7
     by_source:
       faq_2026:
-        chunk_coverage@10: 0.8
-        chunk_coverage@20: 0.8
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
         chunk_hit@10: 1.0
         chunk_hit@20: 1.0
         doc_coverage@10: 1.0
@@ -18,62 +198,62 @@ kb:
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.5666666666666667
+        mrr@10: 0.95
         n: 10
         n_answerable: 10
         n_no_answer: 0
-        ndcg@10: 0.6785578521428745
+        ndcg@10: 0.9630929753571458
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       faq_xlsx:
-        chunk_coverage@10: 0.954954954954955
-        chunk_coverage@20: 0.9707207207207207
+        chunk_coverage@10: 0.9864864864864865
+        chunk_coverage@20: 0.9864864864864865
         chunk_hit@10: 0.9932432432432432
         chunk_hit@20: 0.9932432432432432
-        doc_coverage@10: 0.9662162162162162
-        doc_coverage@20: 0.9842342342342342
+        doc_coverage@10: 0.9887387387387389
+        doc_coverage@20: 0.9954954954954955
         doc_hit@10: 0.9932432432432432
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.7963400900900901
+        mrr@10: 0.9126689189189189
         n: 148
         n_answerable: 148
         n_no_answer: 0
-        ndcg@10: 0.8467475912421037
+        ndcg@10: 0.9330874361193616
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       hard_cross:
-        chunk_coverage@10: 0.37857142857142856
-        chunk_coverage@20: 0.41666666666666663
+        chunk_coverage@10: 0.41428571428571426
+        chunk_coverage@20: 0.4523809523809524
         chunk_hit@10: 0.21428571428571427
         chunk_hit@20: 0.2857142857142857
-        doc_coverage@10: 0.5928571428571429
-        doc_coverage@20: 0.7023809523809524
+        doc_coverage@10: 0.6523809523809524
+        doc_coverage@20: 0.7976190476190476
         doc_hit@10: 0.35714285714285715
-        doc_hit@20: 0.5
+        doc_hit@20: 0.5714285714285714
         false_refusal_rate: null
-        mrr@10: 0.3630952380952381
+        mrr@10: 0.3773809523809524
         n: 14
         n_answerable: 14
         n_no_answer: 0
-        ndcg@10: 0.30903765182714554
+        ndcg@10: 0.32598034559638095
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       hard_exact:
-        chunk_coverage@10: 0.5
-        chunk_coverage@20: 0.6666666666666666
-        chunk_hit@10: 0.5833333333333334
-        chunk_hit@20: 0.6666666666666666
-        doc_coverage@10: 0.7916666666666666
-        doc_coverage@20: 0.8333333333333334
+        chunk_coverage@10: 0.6666666666666666
+        chunk_coverage@20: 0.75
+        chunk_hit@10: 0.6666666666666666
+        chunk_hit@20: 0.75
+        doc_coverage@10: 0.8333333333333334
+        doc_coverage@20: 0.9166666666666666
         doc_hit@10: 0.8333333333333334
-        doc_hit@20: 0.8333333333333334
+        doc_hit@20: 0.9166666666666666
         false_refusal_rate: null
-        mrr@10: 0.33134920634920634
+        mrr@10: 0.41944444444444445
         n: 12
         n_answerable: 12
         n_no_answer: 0
-        ndcg@10: 0.39384354950397554
+        ndcg@10: 0.48163683899574283
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       hard_table:
@@ -94,20 +274,20 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       manual_qa:
-        chunk_coverage@10: 0.7343234323432344
-        chunk_coverage@20: 0.7640264026402641
+        chunk_coverage@10: 0.8250825082508251
+        chunk_coverage@20: 0.8547854785478547
         chunk_hit@10: 0.8514851485148515
         chunk_hit@20: 0.8811881188118812
-        doc_coverage@10: 0.8531353135313532
-        doc_coverage@20: 0.8762376237623762
+        doc_coverage@10: 0.9801980198019802
+        doc_coverage@20: 0.9834983498349834
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.8138613861386139
+        mrr@10: 0.8188118811881189
         n: 101
         n_answerable: 101
         n_no_answer: 0
-        ndcg@10: 0.8234894190956762
+        ndcg@10: 0.8271435799514042
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       no_answer:
@@ -134,9 +314,9 @@ kb:
         chunk_hit@10: 0.0
         chunk_hit@20: 0.0
         doc_coverage@10: 0.5
-        doc_coverage@20: 0.75
+        doc_coverage@20: 1.0
         doc_hit@10: 0.5
-        doc_hit@20: 0.5
+        doc_hit@20: 1.0
         false_refusal_rate: null
         mrr@10: 0.0
         n: 2
@@ -146,20 +326,20 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       专利号:
-        chunk_coverage@10: 0.5
-        chunk_coverage@20: 0.7
-        chunk_hit@10: 0.6
-        chunk_hit@20: 0.7
-        doc_coverage@10: 0.75
-        doc_coverage@20: 0.8
+        chunk_coverage@10: 0.7
+        chunk_coverage@20: 0.8
+        chunk_hit@10: 0.7
+        chunk_hit@20: 0.8
+        doc_coverage@10: 0.8
+        doc_coverage@20: 0.9
         doc_hit@10: 0.8
-        doc_hit@20: 0.8
+        doc_hit@20: 0.9
         false_refusal_rate: null
-        mrr@10: 0.2976190476190476
+        mrr@10: 0.4033333333333333
         n: 10
         n_answerable: 10
         n_no_answer: 0
-        ndcg@10: 0.3726122594047706
+        ndcg@10: 0.4779642067948914
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       人参玫瑰早安饮:
@@ -231,20 +411,20 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       剂型:
-        chunk_coverage@10: 0.0
-        chunk_coverage@20: 0.0
+        chunk_coverage@10: 0.5
+        chunk_coverage@20: 0.5
         chunk_hit@10: 0.0
         chunk_hit@20: 0.0
-        doc_coverage@10: 0.0
-        doc_coverage@20: 0.0
+        doc_coverage@10: 0.5
+        doc_coverage@20: 0.5
         doc_hit@10: 0.0
         doc_hit@20: 0.0
         false_refusal_rate: null
-        mrr@10: 0.0
+        mrr@10: 0.2
         n: 1
         n_answerable: 1
         n_no_answer: 0
-        ndcg@10: 0.0
+        ndcg@10: 0.23719771276929622
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       华大常青-鱼油磷虾油:
@@ -282,7 +462,7 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       反查:
-        chunk_coverage@10: 0.5
+        chunk_coverage@10: 1.0
         chunk_coverage@20: 1.0
         chunk_hit@10: 1.0
         chunk_hit@20: 1.0
@@ -308,11 +488,11 @@ kb:
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.8145833333333333
+        mrr@10: 0.8958333333333334
         n: 16
         n_answerable: 16
         n_no_answer: 0
-        ndcg@10: 0.8612276292468072
+        ndcg@10: 0.9226162191964322
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       搭配:
@@ -354,8 +534,8 @@ kb:
         chunk_coverage@20: 0.8571428571428571
         chunk_hit@10: 0.7142857142857143
         chunk_hit@20: 0.8571428571428571
-        doc_coverage@10: 0.9523809523809524
-        doc_coverage@20: 0.9523809523809524
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
@@ -384,20 +564,20 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       清风:
-        chunk_coverage@10: 0.8
-        chunk_coverage@20: 0.8166666666666667
+        chunk_coverage@10: 0.85
+        chunk_coverage@20: 0.9
         chunk_hit@10: 0.85
         chunk_hit@20: 0.9
-        doc_coverage@10: 0.8833333333333334
-        doc_coverage@20: 0.9
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.75
+        mrr@10: 0.825
         n: 20
         n_answerable: 20
         n_no_answer: 0
-        ndcg@10: 0.7761859507142915
+        ndcg@10: 0.8315464876785729
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       玖伴:
@@ -405,84 +585,84 @@ kb:
         chunk_coverage@20: 0.8333333333333334
         chunk_hit@10: 0.8333333333333334
         chunk_hit@20: 0.8333333333333334
-        doc_coverage@10: 0.8888888888888888
-        doc_coverage@20: 0.8888888888888888
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.75
+        mrr@10: 0.8333333333333334
         n: 6
         n_answerable: 6
         n_no_answer: 0
-        ndcg@10: 0.7718216255952429
+        ndcg@10: 0.8333333333333334
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       畅青:
-        chunk_coverage@10: 0.9298245614035089
-        chunk_coverage@20: 0.9298245614035089
+        chunk_coverage@10: 0.9473684210526315
+        chunk_coverage@20: 0.9473684210526315
         chunk_hit@10: 0.9473684210526315
         chunk_hit@20: 0.9473684210526315
-        doc_coverage@10: 0.9298245614035089
+        doc_coverage@10: 0.9473684210526315
         doc_coverage@20: 0.9473684210526315
         doc_hit@10: 0.9473684210526315
         doc_hit@20: 0.9473684210526315
         false_refusal_rate: null
-        mrr@10: 0.868421052631579
+        mrr@10: 0.9210526315789473
         n: 19
         n_answerable: 19
         n_no_answer: 0
-        ndcg@10: 0.8890941716165459
+        ndcg@10: 0.9279436712406031
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益休:
-        chunk_coverage@10: 0.8055555555555556
-        chunk_coverage@20: 0.8425925925925926
+        chunk_coverage@10: 0.9444444444444444
+        chunk_coverage@20: 1.0
         chunk_hit@10: 0.9444444444444444
         chunk_hit@20: 1.0
-        doc_coverage@10: 0.8611111111111112
-        doc_coverage@20: 0.8796296296296297
-        doc_hit@10: 1.0
-        doc_hit@20: 1.0
-        false_refusal_rate: null
-        mrr@10: 0.8055555555555556
-        n: 18
-        n_answerable: 18
-        n_no_answer: 0
-        ndcg@10: 0.841924931547627
-        no_answer_refusal_rate: null
-        zero_hit_rate: 0.0
-      益健:
-        chunk_coverage@10: 0.925925925925926
-        chunk_coverage@20: 1.0
-        chunk_hit@10: 1.0
-        chunk_hit@20: 1.0
-        doc_coverage@10: 0.9629629629629629
+        doc_coverage@10: 1.0
         doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
         mrr@10: 0.8888888888888888
-        n: 9
-        n_answerable: 9
+        n: 18
+        n_answerable: 18
         n_no_answer: 0
-        ndcg@10: 0.9179843896825461
+        ndcg@10: 0.9034366392857175
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
-      益净:
-        chunk_coverage@10: 0.875
-        chunk_coverage@20: 0.9375
-        chunk_hit@10: 0.9375
+      益健:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
         chunk_hit@20: 1.0
-        doc_coverage@10: 0.8958333333333334
-        doc_coverage@20: 0.9583333333333334
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.71875
+        mrr@10: 0.9444444444444444
+        n: 9
+        n_answerable: 9
+        n_no_answer: 0
+        ndcg@10: 0.9589921948412731
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益净:
+        chunk_coverage@10: 0.9375
+        chunk_coverage@20: 0.9791666666666666
+        chunk_hit@10: 0.9375
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.84375
         n: 16
         n_answerable: 16
         n_no_answer: 0
-        ndcg@10: 0.7760317671875127
+        ndcg@10: 0.8682993287946483
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益家人:
@@ -490,16 +670,16 @@ kb:
         chunk_coverage@20: 0.7777777777777778
         chunk_hit@10: 1.0
         chunk_hit@20: 1.0
-        doc_coverage@10: 0.7777777777777778
-        doc_coverage@20: 0.7777777777777778
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.8333333333333334
+        mrr@10: 1.0
         n: 3
         n_answerable: 3
         n_no_answer: 0
-        ndcg@10: 0.8769765845238192
+        ndcg@10: 1.0
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益生菌:
@@ -512,11 +692,11 @@ kb:
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.7694444444444444
+        mrr@10: 0.95
         n: 30
         n_answerable: 30
         n_no_answer: 0
-        ndcg@10: 0.8290301282453142
+        ndcg@10: 0.9630929753571458
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益生菌政策:
@@ -529,11 +709,11 @@ kb:
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.75
+        mrr@10: 1.0
         n: 7
         n_answerable: 7
         n_no_answer: 0
-        ndcg@10: 0.8132194378880441
+        ndcg@10: 1.0
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益生菌通用:
@@ -546,28 +726,28 @@ kb:
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.7753623188405797
+        mrr@10: 0.9347826086956522
         n: 23
         n_answerable: 23
         n_no_answer: 0
-        ndcg@10: 0.8338420774844834
+        ndcg@10: 0.9518604026397554
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益畅:
-        chunk_coverage@10: 0.6730769230769231
-        chunk_coverage@20: 0.7243589743589743
+        chunk_coverage@10: 0.75
+        chunk_coverage@20: 0.7628205128205128
         chunk_hit@10: 0.7692307692307693
         chunk_hit@20: 0.7692307692307693
-        doc_coverage@10: 0.9038461538461539
-        doc_coverage@20: 0.9294871794871795
+        doc_coverage@10: 0.9423076923076923
+        doc_coverage@20: 0.9551282051282051
         doc_hit@10: 0.9615384615384616
         doc_hit@20: 0.9615384615384616
         false_refusal_rate: null
-        mrr@10: 0.635897435897436
+        mrr@10: 0.6935897435897437
         n: 26
         n_answerable: 26
         n_no_answer: 0
-        ndcg@10: 0.6648299431318748
+        ndcg@10: 0.7074149715659375
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益舒:
@@ -575,33 +755,33 @@ kb:
         chunk_coverage@20: 0.8666666666666667
         chunk_hit@10: 0.88
         chunk_hit@20: 0.88
-        doc_coverage@10: 0.9733333333333333
-        doc_coverage@20: 0.9733333333333333
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.6583333333333333
+        mrr@10: 0.7983333333333333
         n: 25
         n_answerable: 25
         n_no_answer: 0
-        ndcg@10: 0.7135673556428624
+        ndcg@10: 0.8178557852142875
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益衡:
-        chunk_coverage@10: 0.75
-        chunk_coverage@20: 0.7833333333333333
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
         chunk_hit@10: 1.0
         chunk_hit@20: 1.0
-        doc_coverage@10: 0.7833333333333333
-        doc_coverage@20: 0.8166666666666667
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.95
+        mrr@10: 1.0
         n: 10
         n_answerable: 10
         n_no_answer: 0
-        ndcg@10: 0.9630929753571458
+        ndcg@10: 1.0
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益顺:
@@ -622,11 +802,11 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       益顺（京东定制）:
-        chunk_coverage@10: 0.5714285714285714
-        chunk_coverage@20: 0.6666666666666667
+        chunk_coverage@10: 0.7142857142857143
+        chunk_coverage@20: 0.7142857142857143
         chunk_hit@10: 0.8571428571428571
         chunk_hit@20: 0.8571428571428571
-        doc_coverage@10: 0.7619047619047619
+        doc_coverage@10: 0.8571428571428571
         doc_coverage@20: 0.8571428571428571
         doc_hit@10: 1.0
         doc_hit@20: 1.0
@@ -656,20 +836,20 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       菌株:
-        chunk_coverage@10: 0.3564102564102564
-        chunk_coverage@20: 0.48717948717948717
-        chunk_hit@10: 0.3076923076923077
-        chunk_hit@20: 0.38461538461538464
-        doc_coverage@10: 0.6256410256410256
-        doc_coverage@20: 0.6794871794871795
+        chunk_coverage@10: 0.47179487179487184
+        chunk_coverage@20: 0.5641025641025641
+        chunk_hit@10: 0.38461538461538464
+        chunk_hit@20: 0.46153846153846156
+        doc_coverage@10: 0.6897435897435897
+        doc_coverage@20: 0.782051282051282
         doc_hit@10: 0.5384615384615384
-        doc_hit@20: 0.5384615384615384
+        doc_hit@20: 0.6153846153846154
         false_refusal_rate: null
-        mrr@10: 0.31227106227106227
+        mrr@10: 0.3551282051282051
         n: 13
         n_answerable: 13
         n_no_answer: 0
-        ndcg@10: 0.295961913475331
+        ndcg@10: 0.3486118540501515
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       营养-甘油二酯食用油:
@@ -741,46 +921,46 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       跨文档:
-        chunk_coverage@10: 0.37857142857142856
-        chunk_coverage@20: 0.41666666666666663
+        chunk_coverage@10: 0.41428571428571426
+        chunk_coverage@20: 0.4523809523809524
         chunk_hit@10: 0.21428571428571427
         chunk_hit@20: 0.2857142857142857
-        doc_coverage@10: 0.5928571428571429
-        doc_coverage@20: 0.7023809523809524
+        doc_coverage@10: 0.6523809523809524
+        doc_coverage@20: 0.7976190476190476
         doc_hit@10: 0.35714285714285715
-        doc_hit@20: 0.5
+        doc_hit@20: 0.5714285714285714
         false_refusal_rate: null
-        mrr@10: 0.3630952380952381
+        mrr@10: 0.3773809523809524
         n: 14
         n_answerable: 14
         n_no_answer: 0
-        ndcg@10: 0.30903765182714554
+        ndcg@10: 0.32598034559638095
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       轻:
-        chunk_coverage@10: 0.8125
-        chunk_coverage@20: 0.8541666666666666
+        chunk_coverage@10: 0.9375
+        chunk_coverage@20: 0.9375
         chunk_hit@10: 0.9375
         chunk_hit@20: 0.9375
-        doc_coverage@10: 0.8125
-        doc_coverage@20: 0.8958333333333334
+        doc_coverage@10: 0.9375
+        doc_coverage@20: 1.0
         doc_hit@10: 0.9375
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.734375
+        mrr@10: 0.828125
         n: 16
         n_answerable: 16
         n_no_answer: 0
-        ndcg@10: 0.7865828328706675
+        ndcg@10: 0.8557835040760192
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       轻路:
-        chunk_coverage@10: 0.5833333333333334
-        chunk_coverage@20: 0.5833333333333334
+        chunk_coverage@10: 0.6666666666666666
+        chunk_coverage@20: 0.6666666666666666
         chunk_hit@10: 0.6666666666666666
         chunk_hit@20: 0.6666666666666666
-        doc_coverage@10: 0.9166666666666666
-        doc_coverage@20: 0.9166666666666666
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
@@ -809,8 +989,8 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       镜脂:
-        chunk_coverage@10: 0.875
-        chunk_coverage@20: 0.875
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
         chunk_hit@10: 1.0
         chunk_hit@20: 1.0
         doc_coverage@10: 1.0
@@ -818,11 +998,11 @@ kb:
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.6666666666666666
+        mrr@10: 0.96875
         n: 16
         n_answerable: 16
         n_no_answer: 0
-        ndcg@10: 0.7529648767857288
+        ndcg@10: 0.9769331095982161
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       镜脂轻:
@@ -843,26 +1023,27 @@ kb:
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
       镜脂轻益生菌:
-        chunk_coverage@10: 0.9047619047619048
-        chunk_coverage@20: 0.9047619047619048
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
         chunk_hit@10: 1.0
         chunk_hit@20: 1.0
-        doc_coverage@10: 0.9047619047619048
-        doc_coverage@20: 0.9047619047619048
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
         doc_hit@10: 1.0
         doc_hit@20: 1.0
         false_refusal_rate: null
-        mrr@10: 0.9285714285714286
+        mrr@10: 1.0
         n: 7
         n_answerable: 7
         n_no_answer: 0
-        ndcg@10: 0.9472756790816368
+        ndcg@10: 1.0
         no_answer_refusal_rate: null
         zero_hit_rate: 0.0
     config:
+      doc_match: anchor
       limit_docs: 0
       method: hybrid
-      rerank: false
+      rerank: 'off'
       store: sql
       threshold: null
       tiers:
@@ -953,26 +1134,1179 @@ kb:
         kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达清风益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
         path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达清风益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
     overall:
-      chunk_coverage@10: 0.8013651877133107
-      chunk_coverage@20: 0.8316268486916951
-      chunk_hit@10: 0.863481228668942
-      chunk_hit@20: 0.8839590443686007
-      doc_coverage@10: 0.8974971558589305
-      doc_coverage@20: 0.9249146757679181
+      chunk_coverage@10: 0.8639362912400455
+      chunk_coverage@20: 0.882821387940842
+      chunk_hit@10: 0.8668941979522184
+      chunk_hit@20: 0.8873720136518771
+      doc_coverage@10: 0.9572241183162684
+      doc_coverage@20: 0.9755403868031853
       doc_hit@10: 0.9522184300341296
-      doc_hit@20: 0.9658703071672355
+      doc_hit@20: 0.9726962457337884
       false_refusal_rate: null
-      mrr@10: 0.7330529822850642
+      mrr@10: 0.8108930602957907
       n: 303
       n_answerable: 293
       n_no_answer: 10
-      ndcg@10: 0.7656290207288434
+      ndcg@10: 0.8246168559065771
       no_answer_refusal_rate: null
       zero_hit_rate: 0.0
+  huada_v1@rerank-dashscope:
+    anchors:
+      checked: 706
+      dead:
+      - case_id: manual_qa-0024
+        document: 华大营养产品详情检索.xlsx
+        reason: anchor_not_in_any_chunk
+      dead_cases: 1
+      expanded: 563
+      expanded_cases: 205
+      too_common:
+      - case_id: faq_xlsx-0014
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: faq_xlsx-0014
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: faq_xlsx-0014
+        document: 华大营养产品知识库.xlsx
+        n_docs: 14
+      - case_id: faq_xlsx-0035
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0035
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0035
+        document: 华大营养产品知识库.xlsx
+        n_docs: 7
+      - case_id: faq_xlsx-0040
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0040
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: faq_xlsx-0040
+        document: 华大营养产品知识库.xlsx
+        n_docs: 7
+      - case_id: faq_xlsx-0060
+        document: 产品说明书：益舒.docx
+        n_docs: 6
+      - case_id: faq_xlsx-0060
+        document: 华大产品汇总.xlsx
+        n_docs: 6
+      - case_id: faq_xlsx-0060
+        document: 华大营养产品知识库.xlsx
+        n_docs: 6
+      - case_id: manual_qa-0002
+        document: 产品说明书 ：益休.docx
+        n_docs: 10
+      - case_id: manual_qa-0003
+        document: 产品说明书 ：益家人.docx
+        n_docs: 14
+      - case_id: manual_qa-0003
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: manual_qa-0003
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: manual_qa-0056
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: manual_qa-0056
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: manual_qa-0056
+        document: 产品说明书：益顺.docx
+        n_docs: 7
+      - case_id: manual_qa-0062
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 10
+      - case_id: manual_qa-0063
+        document: 产品说明书：益畅.docx
+        n_docs: 14
+      - case_id: manual_qa-0063
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: manual_qa-0063
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: manual_qa-0065
+        document: 产品说明书：益顺.docx
+        n_docs: 7
+      - case_id: manual_qa-0065
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: manual_qa-0065
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: manual_qa-0067
+        document: 产品说明书：益顺.docx
+        n_docs: 7
+      - case_id: manual_qa-0067
+        document: 产品说明书：益畅.docx
+        n_docs: 7
+      - case_id: manual_qa-0067
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 7
+      - case_id: manual_qa-0068
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 10
+      - case_id: manual_qa-0069
+        document: 产品说明书：益顺.docx
+        n_docs: 14
+      - case_id: manual_qa-0069
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: manual_qa-0069
+        document: 产品说明书 ：益休.docx
+        n_docs: 14
+      - case_id: hard_cross-0001
+        document: 产品说明书：益畅.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书：畅青.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书：益舒.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书 ：益衡（血糖管理）.docx
+        n_docs: 27
+      - case_id: hard_cross-0001
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 27
+      - case_id: hard_cross-0002
+        document: 产品说明书：益畅.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：益舒.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：益顺.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：镜脂轻（体重管理）.docx
+        n_docs: 30
+      - case_id: hard_cross-0002
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 30
+      - case_id: hard_cross-0005
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 14
+      - case_id: hard_cross-0005
+        document: 产品说明书 ：益衡（血糖管理）.docx
+        n_docs: 14
+      - case_id: hard_cross-0008
+        document: 产品说明书：益畅.docx
+        n_docs: 40
+      - case_id: hard_cross-0009
+        document: 产品说明书：益畅.docx
+        n_docs: 14
+      - case_id: hard_cross-0009
+        document: 产品说明书：畅青.docx
+        n_docs: 14
+      - case_id: hard_cross-0009
+        document: 产品说明书：益舒.docx
+        n_docs: 14
+      - case_id: hard_cross-0010
+        document: 产品说明书：镜脂轻（体重管理）.docx
+        n_docs: 26
+      - case_id: hard_cross-0010
+        document: 产品说明书：益舒.docx
+        n_docs: 26
+      - case_id: hard_cross-0011
+        document: 产品说明书：益舒.docx
+        n_docs: 7
+      - case_id: hard_cross-0012
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 6
+      - case_id: hard_cross-0013
+        document: 产品说明书：畅青.docx
+        n_docs: 15
+      - case_id: hard_cross-0013
+        document: 产品说明书 ：益家人.docx
+        n_docs: 15
+      - case_id: hard_exact-0008
+        document: 产品说明书：畅青.docx
+        n_docs: 8
+      - case_id: hard_exact-0010
+        document: 产品说明书：益畅.docx
+        n_docs: 6
+      - case_id: hard_exact-0010
+        document: 产品说明书：益畅（珠峰版）.docx
+        n_docs: 6
+      - case_id: hard_exact-0012
+        document: 产品说明书 ：清风（尿酸管理）.docx
+        n_docs: 7
+    by_source:
+      faq_2026:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 1.0
+        n: 10
+        n_answerable: 10
+        n_no_answer: 0
+        ndcg@10: 1.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      faq_xlsx:
+        chunk_coverage@10: 0.9864864864864865
+        chunk_coverage@20: 0.9864864864864865
+        chunk_hit@10: 0.9932432432432432
+        chunk_hit@20: 0.9932432432432432
+        doc_coverage@10: 0.9932432432432432
+        doc_coverage@20: 0.9954954954954955
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9583333333333334
+        n: 148
+        n_answerable: 148
+        n_no_answer: 0
+        ndcg@10: 0.9670487339411467
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      hard_cross:
+        chunk_coverage@10: 0.3952380952380952
+        chunk_coverage@20: 0.4523809523809524
+        chunk_hit@10: 0.2857142857142857
+        chunk_hit@20: 0.2857142857142857
+        doc_coverage@10: 0.6833333333333333
+        doc_coverage@20: 0.7976190476190476
+        doc_hit@10: 0.5
+        doc_hit@20: 0.5714285714285714
+        false_refusal_rate: null
+        mrr@10: 0.2787698412698413
+        n: 14
+        n_answerable: 14
+        n_no_answer: 0
+        ndcg@10: 0.2612958226141479
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      hard_exact:
+        chunk_coverage@10: 0.75
+        chunk_coverage@20: 0.75
+        chunk_hit@10: 0.75
+        chunk_hit@20: 0.75
+        doc_coverage@10: 0.9166666666666666
+        doc_coverage@20: 0.9166666666666666
+        doc_hit@10: 0.9166666666666666
+        doc_hit@20: 0.9166666666666666
+        false_refusal_rate: null
+        mrr@10: 0.5694444444444444
+        n: 12
+        n_answerable: 12
+        n_no_answer: 0
+        ndcg@10: 0.6160657717261977
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      hard_table:
+        chunk_coverage@10: 0.125
+        chunk_coverage@20: 0.125
+        chunk_hit@10: 0.125
+        chunk_hit@20: 0.125
+        doc_coverage@10: 0.75
+        doc_coverage@20: 0.875
+        doc_hit@10: 0.75
+        doc_hit@20: 0.875
+        false_refusal_rate: null
+        mrr@10: 0.041666666666666664
+        n: 8
+        n_answerable: 8
+        n_no_answer: 0
+        ndcg@10: 0.0625
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      manual_qa:
+        chunk_coverage@10: 0.8415841584158416
+        chunk_coverage@20: 0.8547854785478547
+        chunk_hit@10: 0.8712871287128713
+        chunk_hit@20: 0.8811881188118812
+        doc_coverage@10: 0.976897689768977
+        doc_coverage@20: 0.9834983498349834
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.8270627062706271
+        n: 101
+        n_answerable: 101
+        n_no_answer: 0
+        ndcg@10: 0.838340904244191
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      no_answer:
+        chunk_coverage@10: null
+        chunk_coverage@20: null
+        chunk_hit@10: null
+        chunk_hit@20: null
+        doc_coverage@10: null
+        doc_coverage@20: null
+        doc_hit@10: null
+        doc_hit@20: null
+        false_refusal_rate: null
+        mrr@10: null
+        n: 10
+        n_answerable: 0
+        n_no_answer: 10
+        ndcg@10: null
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+    by_tag:
+      专利:
+        chunk_coverage@10: 0.0
+        chunk_coverage@20: 0.0
+        chunk_hit@10: 0.0
+        chunk_hit@20: 0.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.0
+        n: 2
+        n_answerable: 2
+        n_no_answer: 0
+        ndcg@10: 0.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      专利号:
+        chunk_coverage@10: 0.8
+        chunk_coverage@20: 0.8
+        chunk_hit@10: 0.8
+        chunk_hit@20: 0.8
+        doc_coverage@10: 0.9
+        doc_coverage@20: 0.9
+        doc_hit@10: 0.9
+        doc_hit@20: 0.9
+        false_refusal_rate: null
+        mrr@10: 0.65
+        n: 10
+        n_answerable: 10
+        n_no_answer: 0
+        ndcg@10: 0.6892789260714373
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      人参玫瑰早安饮:
+        chunk_coverage@10: 0.0
+        chunk_coverage@20: 0.0
+        chunk_hit@10: 0.0
+        chunk_hit@20: 0.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.0
+        n: 1
+        n_answerable: 1
+        n_no_answer: 0
+        ndcg@10: 0.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      人群:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 1.0
+        n: 1
+        n_answerable: 1
+        n_no_answer: 0
+        ndcg@10: 0.7529716549381368
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      价格:
+        chunk_coverage@10: 0.0
+        chunk_coverage@20: 0.0
+        chunk_hit@10: 0.0
+        chunk_hit@20: 0.0
+        doc_coverage@10: 0.3333333333333333
+        doc_coverage@20: 0.6666666666666666
+        doc_hit@10: 0.3333333333333333
+        doc_hit@20: 0.6666666666666666
+        false_refusal_rate: null
+        mrr@10: 0.0
+        n: 3
+        n_answerable: 3
+        n_no_answer: 0
+        ndcg@10: 0.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      保质期:
+        chunk_coverage@10: 0.0
+        chunk_coverage@20: 0.0
+        chunk_hit@10: 0.0
+        chunk_hit@20: 0.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.0
+        n: 1
+        n_answerable: 1
+        n_no_answer: 0
+        ndcg@10: 0.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      剂型:
+        chunk_coverage@10: 0.5
+        chunk_coverage@20: 0.5
+        chunk_hit@10: 0.0
+        chunk_hit@20: 0.0
+        doc_coverage@10: 0.5
+        doc_coverage@20: 0.5
+        doc_hit@10: 0.0
+        doc_hit@20: 0.0
+        false_refusal_rate: null
+        mrr@10: 0.125
+        n: 1
+        n_answerable: 1
+        n_no_answer: 0
+        ndcg@10: 0.19342640361727081
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      华大常青-鱼油磷虾油:
+        chunk_coverage@10: 0.7142857142857143
+        chunk_coverage@20: 0.7142857142857143
+        chunk_hit@10: 0.7142857142857143
+        chunk_hit@20: 0.7142857142857143
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.7142857142857143
+        n: 7
+        n_answerable: 7
+        n_no_answer: 0
+        ndcg@10: 0.7142857142857143
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      原料:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 1.0
+        n: 1
+        n_answerable: 1
+        n_no_answer: 0
+        ndcg@10: 1.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      反查:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.5
+        n: 1
+        n_answerable: 1
+        n_no_answer: 0
+        ndcg@10: 0.6309297535714575
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      密蜜:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9166666666666666
+        n: 16
+        n_answerable: 16
+        n_no_answer: 0
+        ndcg@10: 0.9375
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      搭配:
+        chunk_coverage@10: 0.5
+        chunk_coverage@20: 0.5
+        chunk_hit@10: 0.5
+        chunk_hit@20: 0.5
+        doc_coverage@10: 0.75
+        doc_coverage@20: 1.0
+        doc_hit@10: 0.5
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.25
+        n: 2
+        n_answerable: 2
+        n_no_answer: 0
+        ndcg@10: 0.31546487678572877
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      无答案:
+        chunk_coverage@10: null
+        chunk_coverage@20: null
+        chunk_hit@10: null
+        chunk_hit@20: null
+        doc_coverage@10: null
+        doc_coverage@20: null
+        doc_hit@10: null
+        doc_hit@20: null
+        false_refusal_rate: null
+        mrr@10: null
+        n: 10
+        n_answerable: 0
+        n_no_answer: 10
+        ndcg@10: null
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      晚安饮:
+        chunk_coverage@10: 0.8571428571428571
+        chunk_coverage@20: 0.8571428571428571
+        chunk_hit@10: 0.8571428571428571
+        chunk_hit@20: 0.8571428571428571
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.7619047619047619
+        n: 7
+        n_answerable: 7
+        n_no_answer: 0
+        ndcg@10: 0.7857142857142857
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      每日清晨-多维复合营养包:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.95
+        n: 10
+        n_answerable: 10
+        n_no_answer: 0
+        ndcg@10: 0.9630929753571458
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      清风:
+        chunk_coverage@10: 0.9
+        chunk_coverage@20: 0.9
+        chunk_hit@10: 0.9
+        chunk_hit@20: 0.9
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.8333333333333334
+        n: 20
+        n_answerable: 20
+        n_no_answer: 0
+        ndcg@10: 0.85
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      玖伴:
+        chunk_coverage@10: 0.8333333333333334
+        chunk_coverage@20: 0.8333333333333334
+        chunk_hit@10: 0.8333333333333334
+        chunk_hit@20: 0.8333333333333334
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.7222222222222222
+        n: 6
+        n_answerable: 6
+        n_no_answer: 0
+        ndcg@10: 0.75
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      畅青:
+        chunk_coverage@10: 0.9473684210526315
+        chunk_coverage@20: 0.9473684210526315
+        chunk_hit@10: 0.9473684210526315
+        chunk_hit@20: 0.9473684210526315
+        doc_coverage@10: 0.9473684210526315
+        doc_coverage@20: 0.9473684210526315
+        doc_hit@10: 0.9473684210526315
+        doc_hit@20: 0.9473684210526315
+        false_refusal_rate: null
+        mrr@10: 0.9210526315789473
+        n: 19
+        n_answerable: 19
+        n_no_answer: 0
+        ndcg@10: 0.9279436712406031
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益休:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.8907407407407408
+        n: 18
+        n_answerable: 18
+        n_no_answer: 0
+        ndcg@10: 0.9176545867114443
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益健:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9444444444444444
+        n: 9
+        n_answerable: 9
+        n_no_answer: 0
+        ndcg@10: 0.9589921948412731
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益净:
+        chunk_coverage@10: 0.9375
+        chunk_coverage@20: 0.9791666666666666
+        chunk_hit@10: 0.9375
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.8958333333333334
+        n: 16
+        n_answerable: 16
+        n_no_answer: 0
+        ndcg@10: 0.90625
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益家人:
+        chunk_coverage@10: 0.7777777777777778
+        chunk_coverage@20: 0.7777777777777778
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.7777777777777778
+        n: 3
+        n_answerable: 3
+        n_no_answer: 0
+        ndcg@10: 0.8333333333333334
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益生菌:
+        chunk_coverage@10: 0.9777777777777777
+        chunk_coverage@20: 0.9777777777777777
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 0.9777777777777777
+        doc_coverage@20: 0.9777777777777777
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9777777777777777
+        n: 30
+        n_answerable: 30
+        n_no_answer: 0
+        ndcg@10: 0.9833333333333333
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益生菌政策:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 1.0
+        n: 7
+        n_answerable: 7
+        n_no_answer: 0
+        ndcg@10: 1.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益生菌通用:
+        chunk_coverage@10: 0.9710144927536232
+        chunk_coverage@20: 0.9710144927536232
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 0.9710144927536232
+        doc_coverage@20: 0.9710144927536232
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9710144927536232
+        n: 23
+        n_answerable: 23
+        n_no_answer: 0
+        ndcg@10: 0.9782608695652174
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益畅:
+        chunk_coverage@10: 0.75
+        chunk_coverage@20: 0.7628205128205128
+        chunk_hit@10: 0.7692307692307693
+        chunk_hit@20: 0.7692307692307693
+        doc_coverage@10: 0.9038461538461539
+        doc_coverage@20: 0.9551282051282051
+        doc_hit@10: 0.9230769230769231
+        doc_hit@20: 0.9615384615384616
+        false_refusal_rate: null
+        mrr@10: 0.7339743589743589
+        n: 26
+        n_answerable: 26
+        n_no_answer: 0
+        ndcg@10: 0.7374905194003964
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益舒:
+        chunk_coverage@10: 0.8666666666666667
+        chunk_coverage@20: 0.8666666666666667
+        chunk_hit@10: 0.88
+        chunk_hit@20: 0.88
+        doc_coverage@10: 0.9866666666666667
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.83
+        n: 25
+        n_answerable: 25
+        n_no_answer: 0
+        ndcg@10: 0.842464252465794
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益衡:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9333333333333333
+        n: 10
+        n_answerable: 10
+        n_no_answer: 0
+        ndcg@10: 0.95
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益顺:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.5
+        n: 1
+        n_answerable: 1
+        n_no_answer: 0
+        ndcg@10: 0.6309297535714575
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      益顺（京东定制）:
+        chunk_coverage@10: 0.6666666666666667
+        chunk_coverage@20: 0.7142857142857143
+        chunk_hit@10: 0.8571428571428571
+        chunk_hit@20: 0.8571428571428571
+        doc_coverage@10: 0.8095238095238095
+        doc_coverage@20: 0.8571428571428571
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.8571428571428571
+        n: 7
+        n_answerable: 7
+        n_no_answer: 0
+        ndcg@10: 0.8571428571428571
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      菊粉:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 1.0
+        n: 7
+        n_answerable: 7
+        n_no_answer: 0
+        ndcg@10: 1.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      菌株:
+        chunk_coverage@10: 0.5025641025641026
+        chunk_coverage@20: 0.5641025641025641
+        chunk_hit@10: 0.46153846153846156
+        chunk_hit@20: 0.46153846153846156
+        doc_coverage@10: 0.6974358974358974
+        doc_coverage@20: 0.782051282051282
+        doc_hit@10: 0.6153846153846154
+        doc_hit@20: 0.6153846153846154
+        false_refusal_rate: null
+        mrr@10: 0.3675213675213675
+        n: 13
+        n_answerable: 13
+        n_no_answer: 0
+        ndcg@10: 0.3921997127136312
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      营养-甘油二酯食用油:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.875
+        n: 8
+        n_answerable: 8
+        n_no_answer: 0
+        ndcg@10: 0.9077324383928644
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      营养成分:
+        chunk_coverage@10: 0.0
+        chunk_coverage@20: 0.0
+        chunk_hit@10: 0.0
+        chunk_hit@20: 0.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.0
+        n: 2
+        n_answerable: 2
+        n_no_answer: 0
+        ndcg@10: 0.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      表格:
+        chunk_coverage@10: 0.125
+        chunk_coverage@20: 0.125
+        chunk_hit@10: 0.125
+        chunk_hit@20: 0.125
+        doc_coverage@10: 0.75
+        doc_coverage@20: 0.875
+        doc_hit@10: 0.75
+        doc_hit@20: 0.875
+        false_refusal_rate: null
+        mrr@10: 0.041666666666666664
+        n: 8
+        n_answerable: 8
+        n_no_answer: 0
+        ndcg@10: 0.0625
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      规格:
+        chunk_coverage@10: 0.5
+        chunk_coverage@20: 0.5
+        chunk_hit@10: 0.5
+        chunk_hit@20: 0.5
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.16666666666666666
+        n: 2
+        n_answerable: 2
+        n_no_answer: 0
+        ndcg@10: 0.25
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      跨文档:
+        chunk_coverage@10: 0.3952380952380952
+        chunk_coverage@20: 0.4523809523809524
+        chunk_hit@10: 0.2857142857142857
+        chunk_hit@20: 0.2857142857142857
+        doc_coverage@10: 0.6833333333333333
+        doc_coverage@20: 0.7976190476190476
+        doc_hit@10: 0.5
+        doc_hit@20: 0.5714285714285714
+        false_refusal_rate: null
+        mrr@10: 0.2787698412698413
+        n: 14
+        n_answerable: 14
+        n_no_answer: 0
+        ndcg@10: 0.2612958226141479
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      轻:
+        chunk_coverage@10: 0.9375
+        chunk_coverage@20: 0.9375
+        chunk_hit@10: 0.9375
+        chunk_hit@20: 0.9375
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9375
+        n: 16
+        n_answerable: 16
+        n_no_answer: 0
+        ndcg@10: 0.9375
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      轻路:
+        chunk_coverage@10: 0.6666666666666666
+        chunk_coverage@20: 0.6666666666666666
+        chunk_hit@10: 0.6666666666666666
+        chunk_hit@20: 0.6666666666666666
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.6666666666666666
+        n: 6
+        n_answerable: 6
+        n_no_answer: 0
+        ndcg@10: 0.6666666666666666
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      选品:
+        chunk_coverage@10: 0.5
+        chunk_coverage@20: 0.5
+        chunk_hit@10: 0.5
+        chunk_hit@20: 0.5
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.16666666666666666
+        n: 2
+        n_answerable: 2
+        n_no_answer: 0
+        ndcg@10: 0.25
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      镜脂:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 1.0
+        n: 16
+        n_answerable: 16
+        n_no_answer: 0
+        ndcg@10: 1.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      镜脂轻:
+        chunk_coverage@10: 0.0
+        chunk_coverage@20: 0.0
+        chunk_hit@10: 0.0
+        chunk_hit@20: 0.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.0
+        n: 2
+        n_answerable: 2
+        n_no_answer: 0
+        ndcg@10: 0.0
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+      镜脂轻益生菌:
+        chunk_coverage@10: 1.0
+        chunk_coverage@20: 1.0
+        chunk_hit@10: 1.0
+        chunk_hit@20: 1.0
+        doc_coverage@10: 1.0
+        doc_coverage@20: 1.0
+        doc_hit@10: 1.0
+        doc_hit@20: 1.0
+        false_refusal_rate: null
+        mrr@10: 0.9047619047619048
+        n: 7
+        n_answerable: 7
+        n_no_answer: 0
+        ndcg@10: 0.9285714285714286
+        no_answer_refusal_rate: null
+        zero_hit_rate: 0.0
+    config:
+      doc_match: anchor
+      limit_docs: 0
+      method: hybrid
+      rerank: dashscope
+      store: sql
+      threshold: null
+      tiers:
+      - A
+      - D-A
+      top_k: 20
+      vector_search: exact
+    corpus:
+      chunk_total: 42089
+      docs_failed: 0
+      docs_ingested: 597
+      docs_name_collision: 16
+      docs_skipped_dup: 81
+      docs_skipped_empty: 2
+      docs_skipped_limit: 0
+      embed:
+        chars: 22280839
+        cost_cny: 9.189475
+        overlong: 0
+        texts: 95348
+        tokens: 18378950
+      embedder: text-embedding-v4
+      failed_by_stage: {}
+      ingest_failures: []
+      name_collisions:
+      - filename: 4.2赠品规则.docx
+        ingested_as: 华大资料/4.2赠品规则.docx
+        kept_path: 制度/4.2赠品规则.docx
+        path: 华大资料/4.2赠品规则.docx
+      - filename: 镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        ingested_as: 2. 2025年外检报告/优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+      - filename: 优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 优美达益舒益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达益舒益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益舒益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益舒益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 优美达玖伴益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达玖伴益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达玖伴益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达玖伴益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        ingested_as: 2. 2025年外检报告/优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+      - filename: 优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益休益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        ingested_as: 2. 2025年外检报告/优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达密蜜益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+      - filename: 优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益畅益生菌压片糖果_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        ingested_as: 2. 2025年外检报告/优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_活菌数.pdf
+      - filename: 优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益健益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+      - filename: 镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        ingested_as: 2. 2025年外检报告/镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/镜脂益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+      - filename: 优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        ingested_as: 2. 2025年外检报告/优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达益净益生菌压片糖果_华大精准营养（深圳）科技有限公司_活菌数.pdf
+      - filename: 优美达清风益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        ingested_as: 2. 2025年外检报告/优美达清风益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        kept_path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2026年外检报告/优美达清风益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+        path: 产品质检报告/产品第三方外检报告（不建议直接发给C端客户，发出厂检验报告）/2. 2025年外检报告/优美达清风益生菌固体饮料_华大精准营养（深圳）科技有限公司_全检.pdf
+    overall:
+      chunk_coverage@10: 0.8755403868031856
+      chunk_coverage@20: 0.882821387940842
+      chunk_hit@10: 0.8839590443686007
+      chunk_hit@20: 0.8873720136518771
+      doc_coverage@10: 0.9632536973833903
+      doc_coverage@20: 0.9755403868031853
+      doc_hit@10: 0.9658703071672355
+      doc_hit@20: 0.9726962457337884
+      false_refusal_rate: null
+      mrr@10: 0.8410788775123246
+      n: 303
+      n_answerable: 293
+      n_no_answer: 10
+      ndcg@10: 0.851012200441179
+      no_answer_refusal_rate: null
+      zero_hit_rate: 0.0
+    rerank:
+      model: qwen3-vl-rerank
 meta:
   fingerprints:
     kb/huada_v1:
-      commit: 2a026753
+      commit: 64f3b8e1
       corpus_root: AI知识库
       dataset_sha256: 963d8b230a4665f154c4b8de7a266c3315dde0c07c9d49ca9d804e6e0aaaa4b2
       embed_base_url: https://dashscope.aliyuncs.com/compatible-mode
@@ -982,7 +2316,7 @@ meta:
       limit_docs: 0
       manifest_sha256: 3d288685c49937da7d8d4bd77ec054c5069f7d47d9aa4b343a3c16ee1f66668c
       method: hybrid
-      rerank: false
+      rerank: 'off'
       store: sql
       threshold: null
       tiers:
@@ -990,4 +2324,23 @@ meta:
       - D-A
       top_k: 20
       vector_search: exact
-  updated_at: '2026-10-14T05:30:31+00:00'
+    kb/huada_v1@rerank-dashscope:
+      commit: 64f3b8e1
+      corpus_root: AI知识库
+      dataset_sha256: 963d8b230a4665f154c4b8de7a266c3315dde0c07c9d49ca9d804e6e0aaaa4b2
+      embed_base_url: https://dashscope.aliyuncs.com/compatible-mode
+      embedder: text-embedding-v4
+      embedding_dim: 1024
+      git_dirty: true
+      limit_docs: 0
+      manifest_sha256: 3d288685c49937da7d8d4bd77ec054c5069f7d47d9aa4b343a3c16ee1f66668c
+      method: hybrid
+      rerank: dashscope
+      store: sql
+      threshold: null
+      tiers:
+      - A
+      - D-A
+      top_k: 20
+      vector_search: exact
+  updated_at: '2026-10-14T09:53:22+00:00'

@@ -1,0 +1,122 @@
+"""评测里的生产同款重排 + 结果缓存(B-175 波 2 PR0)。
+
+生产知识库重排用 DashScope 原生接口的 ``qwen3-vl-rerank``(测试、生产都是它);评测原来的
+``--rerank on`` 走聊天模型排序(``LLMReranker``),量的不是生产那条路。这里用生产同一个
+``DashScopeReranker`` / ``HTTPDashScopeRerankClient``,外面套一层 sqlite 缓存:
+
+* 键 = (模型, 查询, 候选全文按序, ``top_n``) 的 sha256 —— 任一变化都是新请求,候选顺序变了也算;
+* 值 = 接口返回的整个 JSON;复跑同样的候选不再花钱,结果也逐条一致(评测可复现,见 #1811);
+* 密钥为 :data:`OFFLINE_KEY` 时不建网络客户端,缓存没命中直接 :class:`RerankCacheMissError`
+  —— 与嵌入缓存的零成本复跑同一个约定。
+
+计费:``qwen3-vl-rerank`` 文本输入 ¥0.5 / 百万 token(百炼控制台,2026-10-14);按接口返回的
+``usage.total_tokens`` 累计,只算真发出去的请求。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from orchestrator.llm.rerank import DashScopeReranker, HTTPDashScopeRerankClient, RerankClient
+
+#: 生产知识库重排模型(测试 / 生产平台配置均为它,10-14 核对)。
+DEFAULT_RERANK_MODEL = "qwen3-vl-rerank"
+RERANK_KEY_ENV = "EXPERT_WORK_EVAL_EMBED_API_KEY"  # 同一个 DashScope key
+RERANK_MODEL_ENV = "EXPERT_WORK_EVAL_RERANK_MODEL"
+RERANK_PRICE_ENV = "EXPERT_WORK_EVAL_RERANK_PRICE_CNY_PER_M"
+DEFAULT_RERANK_PRICE_CNY_PER_M = 0.5
+#: 与嵌入缓存同一个假密钥约定:只读缓存,未命中即报错。
+OFFLINE_KEY = "offline-cache-only"
+
+
+class RerankCacheMissError(RuntimeError):
+    """Offline mode and the rerank cache has no entry for this request."""
+
+
+@dataclass
+class CachedRerankClient:
+    """:class:`RerankClient` that answers from a sqlite cache before calling ``inner``."""
+
+    inner: RerankClient | None
+    path: Path
+    price_cny_per_m: float = DEFAULT_RERANK_PRICE_CNY_PER_M
+    _calls: int = field(default=0, init=False)
+    _hits: int = field(default=0, init=False)
+    _tokens: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rerank_cache (key TEXT PRIMARY KEY, body TEXT)"
+            )
+
+    async def rerank(
+        self, *, model: str, query: str, documents: Sequence[str], top_n: int
+    ) -> Mapping[str, Any]:
+        self._calls += 1
+        key = _cache_key(model=model, query=query, documents=documents, top_n=top_n)
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute("SELECT body FROM rerank_cache WHERE key = ?", (key,)).fetchone()
+        if row is not None:
+            self._hits += 1
+            cached: Mapping[str, Any] = json.loads(row[0])
+            return cached
+        if self.inner is None:
+            msg = f"rerank cache miss in offline mode (model={model!r}, query={query[:40]!r})"
+            raise RerankCacheMissError(msg)
+        body = await self.inner.rerank(model=model, query=query, documents=documents, top_n=top_n)
+        usage = body.get("usage")
+        if isinstance(usage, Mapping) and isinstance(usage.get("total_tokens"), int):
+            self._tokens += usage["total_tokens"]
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO rerank_cache (key, body) VALUES (?, ?)",
+                (key, json.dumps(body, ensure_ascii=False)),
+            )
+        return body
+
+    def stats(self) -> dict[str, float | int]:
+        return {
+            "calls": self._calls,
+            "cache_hits": self._hits,
+            "tokens": self._tokens,
+            "cost_cny": round(self._tokens / 1_000_000 * self.price_cny_per_m, 6),
+        }
+
+
+def _cache_key(*, model: str, query: str, documents: Sequence[str], top_n: int) -> str:
+    payload = json.dumps(
+        {"model": model, "query": query, "documents": list(documents), "top_n": top_n},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_dashscope_reranker(*, cache_path: Path) -> tuple[DashScopeReranker, CachedRerankClient]:
+    """``--rerank dashscope``:生产同款重排器 + 缓存客户端(后者用于汇总里的调用 / 费用统计)。"""
+    key = os.environ.get(RERANK_KEY_ENV)
+    if not key:
+        raise SystemExit(f"--rerank dashscope requires env {RERANK_KEY_ENV} (the DashScope key)")
+    inner = None if key == OFFLINE_KEY else HTTPDashScopeRerankClient(api_key=key)
+    price = float(os.environ.get(RERANK_PRICE_ENV, DEFAULT_RERANK_PRICE_CNY_PER_M))
+    client = CachedRerankClient(inner=inner, path=cache_path, price_cny_per_m=price)
+    model = os.environ.get(RERANK_MODEL_ENV) or DEFAULT_RERANK_MODEL
+    return DashScopeReranker(client=client, model=model), client
+
+
+__all__ = [
+    "DEFAULT_RERANK_MODEL",
+    "OFFLINE_KEY",
+    "CachedRerankClient",
+    "RerankCacheMissError",
+    "build_dashscope_reranker",
+]

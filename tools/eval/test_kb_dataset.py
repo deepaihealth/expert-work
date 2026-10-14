@@ -242,3 +242,17 @@ def test_match_defaults_to_any_and_rejects_unknown(tmp_path: Path) -> None:
     bad_path = write("some")
     with pytest.raises(KbDatasetError, match="'match'"):
         load_dataset(bad_path)
+
+
+_KB_DATASETS = Path(__file__).resolve().parent / "datasets" / "kb"
+
+
+def test_committed_holdout_set_loads_and_stays_apart_from_the_main_set() -> None:
+    """The holdout set must load like the main set, and share no case id or
+    question with it — otherwise it is not held out."""
+    main = load_dataset(_KB_DATASETS / "huada_v1.yaml")
+    holdout = load_dataset(_KB_DATASETS / "huada_v1.holdout.yaml")
+    assert len(holdout.cases) >= 20
+    assert {c.id for c in main.cases}.isdisjoint({c.id for c in holdout.cases})
+    assert {c.query for c in main.cases}.isdisjoint({c.query for c in holdout.cases})
+    assert all("留出" in c.tags for c in holdout.cases)

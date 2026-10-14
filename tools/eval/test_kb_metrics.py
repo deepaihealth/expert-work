@@ -40,6 +40,11 @@ class _Result:
 class _Expected:
     document: str
     anchor: str
+    also: frozenset[str] = frozenset()
+
+    @property
+    def documents(self) -> frozenset[str]:
+        return frozenset({self.document}) | self.also
 
 
 _ANCHOR = "常温密封保存即可"
@@ -410,3 +415,47 @@ def test_grouped_aggregates_per_key_sorted() -> None:
     assert out["faq"]["n"] == 2
     assert out["faq"]["doc_hit@10"] == 0.5
     assert out["manual"]["doc_hit@10"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 锚文本判对:手列文档之外,含同一锚文本的文档也算对(B-175 波 2 PR0)
+# ---------------------------------------------------------------------------
+
+_EXP_A_ALSO = _Expected(document="a.md", anchor=_ANCHOR, also=frozenset({"a2.md"}))
+
+
+def test_document_hit_counts_an_alternate_document() -> None:
+    assert document_hits([_r("a2.md", "无关")], [_EXP_A_ALSO]) == [True]
+    assert document_hits([_r("a2.md", "无关")], [_EXP_A]) == [False]
+
+
+def test_chunk_hit_counts_the_anchor_in_an_alternate_document() -> None:
+    results = [_r("a2.md", f"第二版:{_ANCHOR}"), _r("a.md", _ANCHOR)]
+    score = score_case(results, [_EXP_A_ALSO], threshold=None)
+    assert score.chunk_hit_ranks == (1,)
+    assert score.mrr_10 == 1.0
+
+
+def test_alternate_document_without_the_anchor_is_not_a_chunk_hit() -> None:
+    score = score_case(
+        [_r("a2.md", "别的段落"), _r("a.md", _ANCHOR)], [_EXP_A_ALSO], threshold=None
+    )
+    assert score.doc_hit_ranks == (1,)
+    assert score.chunk_hit_ranks == (2,)
+    assert score.mrr_10 == 0.5
+
+
+def test_alternate_document_covers_only_its_own_expectation_under_all() -> None:
+    """``match=all`` must not loosen: an alternate of A says nothing about B."""
+    score = score_case([_r("a2.md", _ANCHOR)], [_EXP_A_ALSO, _EXP_B], threshold=None, match="all")
+    assert score.chunk_hit_10 == 0.0
+    assert score.chunk_coverage_10 == 0.5
+    assert score.doc_coverage_10 == 0.5
+
+
+def test_document_coverage_groups_alternates_under_the_listed_document() -> None:
+    """Two entries listed under a.md stay one expected document, whichever of
+    their acceptable files covers them."""
+    exp_a2_also = _Expected(document="a.md", anchor="菌株编号 BL-99", also=frozenset({"a2.md"}))
+    coverage = document_coverage([_r("a2.md", "x")], [_EXP_A_ALSO, exp_a2_also])
+    assert coverage == [frozenset({0})]

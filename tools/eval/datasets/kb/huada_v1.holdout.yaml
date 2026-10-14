@@ -1,0 +1,259 @@
+# B-175 波 2 留出集(2026-10-14):精确编号 16 道 + 无答案 6 道,只用主评测集没出过题的条目。
+# 纪律:波 2 期间不看它的结果、不针对它调参,收官 PR 跑一次。无答案题每道都在解析后的
+# A / D-A 语料里全文检索确认无答案原文后才收(命中的同名词逐条看过上下文)。
+name: huada_v1_holdout
+corpus:
+  manifest: ~/kb-eval/huada/manifest.csv
+  tiers:
+  - A
+  - D-A
+cases:
+- id: holdout_exact-0001
+  query: 玖伴里的植物乳植杆菌BGI-J9，专利申请公布号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 玖伴
+  expected:
+  - document: 玖伴专利-植物乳植杆菌BGI-J9 CN120682999A-一种具有解酒护肝醒脑功效的植物乳植杆菌及其应用.pdf
+    anchor: CN 120682999 A
+    page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: CN120682999A
+    page: null
+  answer: CN120682999A
+- id: holdout_exact-0002
+  query: 益家人用的植物乳植杆菌LH-511，专利授权公告号是什么？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 益家人
+  expected:
+  - document: 益家人专利-植物乳植杆菌LH-511 专利证书.pdf
+    anchor: CN 109810912 B
+    page: null
+  answer: CN109810912B
+- id: holdout_exact-0003
+  query: 鼠李糖乳杆菌ASD-9的专利授权公告号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 益家人
+  expected:
+  - document: 益家人专利-鼠李糖乳杆菌ASD-9  降血糖 专利证书  CN201711168215_.pdf
+    anchor: CN 109810913 B
+    page: null
+  answer: CN109810913B
+- id: holdout_exact-0004
+  query: 鼠李糖乳杆菌ASD-9那份发明专利申请的公布号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 益衡
+  expected:
+  - document: 益衡专利-鼠李糖乳杆菌ASD-9  CN201810136500.pdf
+    anchor: CN 110122877 A
+    page: null
+  answer: CN110122877A
+- id: holdout_exact-0005
+  query: 密蜜里的格氏乳杆菌TM13，专利申请公布号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 密蜜
+  expected:
+  - document: 密蜜专利-格氏乳杆菌TM13-16   CN202011250419.pdf
+    anchor: CN 112458006 A
+    page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: CN112458006A
+    page: null
+  answer: CN112458006A
+- id: holdout_exact-0006
+  query: 速唐轻的中国专利申请公布号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 益衡
+  expected:
+  - document: CN113797244A速唐轻降糖降尿酸专利-大陆.pdf
+    anchor: CN 113797244 A
+    page: null
+  answer: CN113797244A
+- id: holdout_exact-0007
+  query: 玖伴里复合发酵醋粉的专利申请公布号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 玖伴
+  expected:
+  - document: 玖伴-发酵醋粉专利CN109718255A.PDF
+    anchor: CN 109718255 A
+    page: null
+  answer: CN109718255A
+- id: holdout_exact-0008
+  query: 甘油二酯油酶法生产方法那项专利的授权公告号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 甘油二酯油
+  expected:
+  - document: 甘油二酯油-专利 202310164198.6 一种甘油二酯油的酶法生产方法.pdf
+    anchor: CN 116042736 B
+    page: null
+  answer: CN116042736B
+- id: holdout_exact-0009
+  query: 抗糖化槐米粉那项发明专利的授权公告号是什么？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 槐米粉
+  expected:
+  - document: 一种抗糖化的槐米粉及其制备方法和应用-发明专利证书-202211480228.6.pdf
+    anchor: CN 116114867 B
+    page: null
+  answer: CN116114867B
+- id: holdout_exact-0010
+  query: 改善睡眠、缓解焦虑的槐米陈皮组合物，授权公告号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 晚安饮
+  expected:
+  - document: 一种改善睡眠缓解焦虑的槐米陈皮组合物及其制备方法.pdf
+    anchor: CN 117562958 B
+    page: null
+  answer: CN117562958B
+- id: holdout_exact-0011
+  query: 益舒那项治疗幽门螺杆菌的复合益生菌剂专利，申请公布号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 益舒
+  expected:
+  - document: 益舒专利-一种复合益生菌剂及其在治疗幽门螺杆菌CN202410181198.1.pdf
+    anchor: CN 120505218 A
+    page: null
+  answer: CN120505218A
+- id: holdout_exact-0012
+  query: 含柑橘多酚、用于燃脂减肥的组合物专利，授权公告号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 专利号
+  - 轻路
+  expected:
+  - document: CN119770617B-一种用于燃脂减肥的含柑橘多酚、柑橘粉的组合物及其制备方法和应用.pdf
+    anchor: CN 119770617 B
+    page: null
+  answer: CN119770617B
+- id: holdout_exact-0013
+  query: 清风里哪株菌的基因组中含有尿酸氧化酶基因？
+  source: hard_exact
+  tags:
+  - 留出
+  - 菌株编号
+  - 清风
+  expected:
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: BGI-AF16 基因组中包含尿酸氧化酶基因
+    page: null
+  answer: 发酵粘液乳杆菌BGI-AF16
+- id: holdout_exact-0014
+  query: 畅青里的两歧双歧杆菌，菌株编号是什么？
+  source: hard_exact
+  tags:
+  - 留出
+  - 菌株编号
+  - 畅青
+  expected:
+  - document: 产品说明书：畅青.docx
+    anchor: 两歧双歧杆菌BGI-AF45，长双歧杆菌
+    page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 长双歧杆菌BB68S、两歧双歧杆菌BGI-AF45
+    page: null
+  answer: BGI-AF45
+- id: holdout_exact-0015
+  query: 清风里的罗伊氏乳杆菌，菌株编号是多少？
+  source: hard_exact
+  tags:
+  - 留出
+  - 菌株编号
+  - 清风
+  expected:
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 罗伊氏乳杆菌BGI-AM60、发酵粘液乳杆菌BGI-AF16
+    page: null
+  answer: BGI-AM60
+- id: holdout_exact-0016
+  query: 益净的护肝菌里，植物乳植杆菌是哪一株？
+  source: hard_exact
+  tags:
+  - 留出
+  - 菌株编号
+  - 益净
+  expected:
+  - document: 产品说明书：益净（护肝）.docx
+    anchor: 鼠李糖乳酪杆菌OF44、植物乳植杆菌BGI-N1
+    page: null
+  answer: BGI-N1
+- id: holdout_no_answer-0001
+  query: 华大有没有给猫狗吃的宠物益生菌？
+  source: no_answer
+  tags:
+  - 留出
+  - 无答案
+  expected: []
+  answer: null
+- id: holdout_no_answer-0002
+  query: 华大的益生菌能用医保卡报销吗？
+  source: no_answer
+  tags:
+  - 留出
+  - 无答案
+  expected: []
+  answer: null
+- id: holdout_no_answer-0003
+  query: 嗜酸乳杆菌NCFM的专利号是多少？
+  source: no_answer
+  tags:
+  - 留出
+  - 无答案
+  expected: []
+  answer: null
+- id: holdout_no_answer-0004
+  query: 益畅能寄到美国吗？国际运费怎么算？
+  source: no_answer
+  tags:
+  - 留出
+  - 无答案
+  expected: []
+  answer: null
+- id: holdout_no_answer-0005
+  query: 华大营养招加盟商吗？加盟费多少？
+  source: no_answer
+  tags:
+  - 留出
+  - 无答案
+  expected: []
+  answer: null
+- id: holdout_no_answer-0006
+  query: 益家人的批发价是多少？
+  source: no_answer
+  tags:
+  - 留出
+  - 无答案
+  expected: []
+  answer: null

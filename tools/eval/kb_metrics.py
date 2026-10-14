@@ -1,6 +1,7 @@
 """知识库检索评测指标(B-175 L1-T3):纯函数,不碰库、不碰网络。
 
-命中有两级:文档级 = ``filename == expected.document``;段级 = 同一文档 **且**
+命中有两级:文档级 = ``filename in expected.documents``(手列文档 + 运行器找出的含同一锚文本的
+文档);段级 = 文件在其中 **且**
 ``expected.anchor in retrieval_text``(检索文本 = 标题路径 + 正文,与嵌入 / 关键词索引、
 智能体看到的是同一段字)。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
 哪些期望条目(:func:`document_coverage` / :func:`chunk_coverage`):
@@ -81,6 +82,12 @@ class ExpectedLike(Protocol):
     def anchor(self) -> str:
         """Expected anchor text inside that document."""
 
+    @property
+    def documents(self) -> frozenset[str]:
+        """Every filename that counts as this expectation's document: the
+        listed one plus any other ingested document that contains the same
+        anchor text (resolved by the runner; just the listed one otherwise)."""
+
 
 @dataclass(frozen=True)
 class CaseScore:
@@ -115,8 +122,10 @@ class CaseScore:
 
 
 def document_hits(results: Sequence[ResultLike], expected: Sequence[ExpectedLike]) -> list[bool]:
-    """逐名次:结果文件名是否等于某条期望的文档名。"""
-    docs = {e.document for e in expected}
+    """逐名次:结果文件名是否是某条期望可接受的文档(手列的 + 含同一锚文本的)。"""
+    docs: set[str] = set()
+    for exp in expected:
+        docs |= exp.documents
     return [r.filename in docs for r in results]
 
 
@@ -128,11 +137,15 @@ def chunk_hits(results: Sequence[ResultLike], expected: Sequence[ExpectedLike]) 
 def document_coverage(
     results: Sequence[ResultLike], expected: Sequence[ExpectedLike]
 ) -> list[frozenset[int]]:
-    """逐名次首次覆盖到的**期望文档**索引(同一文档的多条期望合成一个,按首次出现顺序编号)。"""
-    docs: dict[str, int] = {}
+    """逐名次首次覆盖到的**期望文档**索引(同一手列文档的多条期望合成一个,按首次出现顺序
+    编号);某一组的任一条期望可接受该结果的文件,就算覆盖这一组。"""
+    groups: dict[str, int] = {}
     for exp in expected:
-        docs.setdefault(exp.document, len(docs))
-    return _first_coverage(results, lambda r: [docs[r.filename]] if r.filename in docs else [])
+        groups.setdefault(exp.document, len(groups))
+    return _first_coverage(
+        results,
+        lambda r: sorted({groups[e.document] for e in expected if r.filename in e.documents}),
+    )
 
 
 def chunk_coverage(
@@ -146,7 +159,7 @@ def _matching_expected(result: ResultLike, expected: Sequence[ExpectedLike]) -> 
     return [
         index
         for index, exp in enumerate(expected)
-        if exp.document == result.filename and exp.anchor in result.retrieval_text
+        if result.filename in exp.documents and exp.anchor in result.retrieval_text
     ]
 
 

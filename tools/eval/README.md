@@ -187,6 +187,18 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   结果就会抖(10-14:只关前两样时 303 题里 203 题排序不同,再关同步扫描剩 103 题,再关 autovacuum 为 0)。同一份代码
   连跑两次结果逐条一致(含分数),比较改动前后就用这个默认模式。`--ann` 走生产同款 HNSW,只在要量近似检索本身的召回
   损失时用,结果不保证可复现;指纹里 `vector_search` 记 `exact` / `ann`。
+- **判对规则(`--doc-match`,B-175 波 2 PR0)**:默认 `anchor` —— 一条期望 `{document, anchor}` 的可接受文档 =
+  手列的那份 + 入库后任一段含同一锚文本的其他文档(同一份 FAQ 的两个版本之类;10-14 实测产品 FAQ 题有 33 道排第一的
+  是没手列的 FAQ-2026,按文件名判就被算错)。锚文本出现在 5 份以上文档里算「太常见」,不扩展、只在汇总
+  `anchors.too_common` 里报。`listed` = 只认手列文档(旧规则,对照用)。指纹记 `doc_match`。
+- **重排(`--rerank`)**:`dashscope` = 生产同款 `qwen3-vl-rerank`(DashScope 原生接口,密钥沿用
+  `EXPERT_WORK_EVAL_EMBED_API_KEY`,模型可用 `EXPERT_WORK_EVAL_RERANK_MODEL` 覆盖),结果缓存在
+  `eval-out/kb/rerank_cache.sqlite`(键 = 模型 + 查询 + 候选全文按序 + `top_n`),复跑同样的候选零成本;密钥为
+  `offline-cache-only` 时缓存没命中直接报错。按 ¥0.5 / 百万 token 记费用,汇总 `rerank` 块里有调用数 / 命中 / token /
+  金额。`llm` = 聊天模型排序(`on` 是它的旧名)。**基线分两条**:不开重排写在评测集名下(召回层),开了重排写在
+  `<评测集名>@rerank-<模式>` 下(最终排序),互不覆盖。
+- **留出集** `datasets/kb/huada_v1.holdout.yaml`(精确编号 16 + 无答案 6,只用主评测集没出过题的条目):波 2 期间
+  不看结果、不针对它调参,收官时跑一次。
 - **为什么基线必须 `--store sql`**:关键词路 SQL 是 `plainto_tsquery` 全 AND,内存库是任一词重叠打分,两套语义不同;
   中文长问句关键词路命中率(设计 §1.3 的固定回归用例)只有 SQL 库量得到。再跑一次 `--method keyword` 单独记这个数。
 - **建库规则**:单库,库名 = 评测集 `name`;只入 `--tiers` 里的层(默认评测集 `corpus.tiers`,再默认 `A,D-A`);
