@@ -52,10 +52,26 @@ UNSET: Final = _Unset()
 ALL_TENANTS_BASES_LIMIT: Final = 200
 
 
-#: Python's built-in extension map only — ``mimetypes.guess_type`` also reads
-#: the host's ``mime.types``, so the same upload would get a different mime on
-#: a laptop, in CI and in the production image.
-_MIME_TYPES: Final = mimetypes.MimeTypes(filenames=())
+#: Office Open XML types — absent from Python's built-in map (3.12 / 3.13),
+#: so without them every ``.docx`` / ``.pptx`` / ``.xlsx`` upload got ``None``.
+_OOXML_TYPES: Final = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _fixed_mime_types() -> mimetypes.MimeTypes:
+    """Python's built-in extension map plus :data:`_OOXML_TYPES` — never the
+    host's ``mime.types`` (``mimetypes.guess_type`` reads it), so the same
+    upload gets the same mime on a laptop, in CI and in the production image."""
+    table = mimetypes.MimeTypes(filenames=())
+    for ext, mime in _OOXML_TYPES.items():
+        table.add_type(mime, ext)
+    return table
+
+
+_MIME_TYPES: Final = _fixed_mime_types()
 
 
 @dataclass(frozen=True)
