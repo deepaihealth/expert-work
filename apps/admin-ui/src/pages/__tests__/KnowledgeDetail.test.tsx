@@ -301,6 +301,37 @@ describe("KnowledgeDetail", () => {
       expect(getBaseSpy).toHaveBeenCalledWith("support-docs", "tenant-2-xxxx"),
     );
   });
+
+  it("a superseded read that fails late does not override the current one (B-183)", async () => {
+    // The read scope changes under a read in flight (home → switched-in
+    // tenant). The first read 404s *after* the second one succeeded; the
+    // page must stay on the second one, not end on the error card.
+    const SWITCHED = "dd068302-0000-4000-8000-000000000001";
+    let failFirst: (err: unknown) => void = () => {};
+    const getBaseSpy = vi
+      .spyOn(knowledgeSdk, "getBase")
+      .mockImplementation((_name, scope) =>
+        scope === SWITCHED
+          ? Promise.resolve(BASE)
+          : new Promise((_res, rej) => {
+              failFirst = rej;
+            }),
+      );
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+
+    const view = renderDetail("/knowledge/support-docs/documents");
+    await waitFor(() => expect(getBaseSpy).toHaveBeenCalledWith("support-docs", undefined));
+
+    scopeRef.current = SWITCHED;
+    view.rerender(detailTree("/knowledge/support-docs/documents"));
+    await waitFor(() => expect(screen.getByTestId("knowledge-detail-root")).toBeInTheDocument());
+
+    await act(async () => {
+      failFirst(new ApiError("knowledge base not found", "HTTP_404", 404));
+    });
+    expect(screen.queryByTestId("knowledge-detail-error")).toBeNull();
+    expect(screen.getByTestId("knowledge-detail-root")).toBeInTheDocument();
+  });
 });
 
 // ─── Cross-tenant W4(review C-2)— 子 tab readScope 接线 + readonly 跟随读目标 ───

@@ -18,7 +18,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
-import { useAuth } from "../auth/AuthContext";
+import { useAuth, type AuthIdentity } from "../auth/AuthContext";
 
 export const SCOPE_HOME = "home" as const;
 export const SCOPE_ALL = "*" as const;
@@ -60,6 +60,23 @@ function writeStored(scope: TenantScopeValue): void {
   window.sessionStorage.setItem(STORAGE_KEY, scope);
 }
 
+/** /v1/me says non-admin, but a non-home scope is parked — the provider
+ *  demotes it to home. */
+function needsDemotion(identity: AuthIdentity | null, scope: TenantScopeValue): boolean {
+  return Boolean(identity?.serverResolved && !identity.isSystemAdmin && scope !== SCOPE_HOME);
+}
+
+/** /v1/me says platform-homed system_admin on the (hidden) home scope — the
+ *  provider promotes it to ``"*"``. */
+function needsPromotion(identity: AuthIdentity | null, scope: TenantScopeValue): boolean {
+  return Boolean(
+    identity?.serverResolved &&
+      identity.isSystemAdmin &&
+      identity.homeIsPlatform &&
+      scope === SCOPE_HOME,
+  );
+}
+
 export function TenantScopeProvider({ children }: { children: ReactNode }) {
   const { identity } = useAuth();
   const isSystemAdmin = identity?.isSystemAdmin ?? false;
@@ -82,7 +99,7 @@ export function TenantScopeProvider({ children }: { children: ReactNode }) {
   // real system_admin who reloaded on a non-home scope (scope flashes /
   // is lost). Only demote once the server truth confirms a non-admin.
   useEffect(() => {
-    if (identity?.serverResolved && !identity.isSystemAdmin && scope !== SCOPE_HOME) {
+    if (needsDemotion(identity, scope)) {
       setScopeState(SCOPE_HOME);
       writeStored(SCOPE_HOME);
     }
@@ -94,12 +111,7 @@ export function TenantScopeProvider({ children }: { children: ReactNode }) {
   // The platform level is the ``"*"`` scope; land there. Gate on
   // ``serverResolved``: ``homeIsPlatform`` is only authoritative post-/v1/me.
   useEffect(() => {
-    if (
-      identity?.serverResolved &&
-      identity.isSystemAdmin &&
-      identity.homeIsPlatform &&
-      scope === SCOPE_HOME
-    ) {
+    if (needsPromotion(identity, scope)) {
       setScopeState(SCOPE_ALL);
       writeStored(SCOPE_ALL);
     }
@@ -128,8 +140,9 @@ export function TenantScopeProvider({ children }: { children: ReactNode }) {
     // otherwise a stale scope left in sessionStorage by a prior admin session
     // races ahead of identity resolution and fires e.g. ?tenant_id=* → a
     // transient 403. (The demotion effect above corrects the persisted scope a
-    // beat later, which is why a refresh "fixes" it.) A confirmed admin's page
-    // fetches key on apiTenantScope, so they re-fetch when it flips to "*".
+    // beat later, which is why a refresh "fixes" it.) The interim home value
+    // must not reach a page either: TenantScopeGate holds the routed pages
+    // back until it is settled (B-183).
     if (!(identity?.serverResolved && identity.isSystemAdmin)) return undefined;
     return scope;
   }, [scope, identity]);
@@ -142,6 +155,55 @@ export function TenantScopeProvider({ children }: { children: ReactNode }) {
   return (
     <TenantScopeContext.Provider value={value}>{children}</TenantScopeContext.Provider>
   );
+}
+
+/** Whether the scope pages would read with right now is about to change. */
+function scopeSettling(
+  identity: AuthIdentity | null,
+  identitySettled: boolean,
+  scope: TenantScopeValue,
+): boolean {
+  // Before /v1/me answers, ``apiTenantScope`` reports home whatever was
+  // persisted (see above) — a non-home scope can only go on the wire after.
+  // Home itself needs no wait: that's every tenant user's optimistic paint.
+  if (!identitySettled) return scope !== SCOPE_HOME;
+  // /v1/me is in and an effect above is about to move the scope: hold for
+  // that one commit.
+  return needsDemotion(identity, scope) || needsPromotion(identity, scope);
+}
+
+/**
+ * Holds the routed pages back while the tenant scope is still settling
+ * (B-183). Without it, a reload on a switched-in scope mounted every page
+ * on home first (``apiTenantScope`` waits for /v1/me) and re-read once the
+ * scope flipped; a page with no stale-response guard then showed whichever
+ * answer landed last — e.g. the knowledge detail page stuck on a home-tenant
+ * 404. Behind the gate a page mounts once, on the scope it should read with.
+ *
+ *   - persisted non-home scope, /v1/me pending → placeholder until it
+ *     answers. If /v1/me fails (non-401) the gate opens on home, exactly as
+ *     before; a 401 ends the session.
+ *   - home scope → no wait. The one case that still reads before /v1/me is
+ *     a platform-homed system_admin's first load in a tab (nothing persisted
+ *     yet, indistinguishable from a tenant user until /v1/me): when the
+ *     promotion to ``"*"`` lands the page is unmounted and mounted afresh,
+ *     so the home answer has nowhere to land.
+ *
+ * Mounted inside the Shell: the chrome reads no tenant-scoped data on mount.
+ */
+export function TenantScopeGate({ children }: { children: ReactNode }) {
+  const { identity, identitySettled } = useAuth();
+  const { scope } = useTenantScope();
+  if (scopeSettling(identity, identitySettled, scope)) {
+    return (
+      <div
+        aria-hidden
+        data-testid="tenant-scope-settling"
+        style={{ minHeight: 120, padding: 24, opacity: 0.4 }}
+      />
+    );
+  }
+  return <>{children}</>;
 }
 
 export function useTenantScope(): TenantScopeContextValue {

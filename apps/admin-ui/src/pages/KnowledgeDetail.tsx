@@ -6,7 +6,7 @@
  * the base's embedding model is stale; tabs for Documents / Retrieval test /
  * Settings.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Alert, App, Button, Empty, Skeleton, Space, Tabs, Tag, Typography } from "antd";
 import { BookOpen, RefreshCcw } from "lucide-react";
@@ -62,16 +62,22 @@ export function KnowledgeDetail() {
   const [error, setError] = useState<string | null>(null);
   const [reindexing, setReindexing] = useState(false);
 
+  // Only the latest read may land: a read superseded by a new name/scope
+  // that answers late (e.g. a 404 from the previous scope) must not
+  // overwrite the current one (B-183).
+  const readSeq = useRef(0);
   const refresh = useCallback(async () => {
     if (!name) return;
+    const seq = ++readSeq.current;
     setLoading(true);
     setError(null);
     try {
-      setBase(await getBase(name, readScope));
+      const next = await getBase(name, readScope);
+      if (seq === readSeq.current) setBase(next);
     } catch (err) {
-      setError(errMessage(err));
+      if (seq === readSeq.current) setError(errMessage(err));
     } finally {
-      setLoading(false);
+      if (seq === readSeq.current) setLoading(false);
     }
   }, [name, readScope]);
 
