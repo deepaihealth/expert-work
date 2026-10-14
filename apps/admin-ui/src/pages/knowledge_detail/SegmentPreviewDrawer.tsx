@@ -10,6 +10,7 @@ import { useTranslation } from "react-i18next";
 
 import { listChunks, type KnowledgeChunk, type KnowledgeDocument } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { HeadingPath } from "./HeadingPath";
 
 const { Text, Paragraph } = Typography;
 
@@ -109,6 +110,7 @@ export function SegmentPreviewDrawer({
                   </Text>
                 }
               >
+                <HeadingPath path={chunk.heading_path} testId={`kb-chunk-heading-${chunk.id}`} />
                 <Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0, fontSize: 13 }}>
                   {chunk.content}
                 </Paragraph>

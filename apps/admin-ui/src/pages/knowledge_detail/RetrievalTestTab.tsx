@@ -31,6 +31,7 @@ import {
   type RetrievalTestResult,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { HeadingPath } from "./HeadingPath";
 
 const { Text, Paragraph } = Typography;
 
@@ -206,6 +207,7 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
                   />
                 )}
               </Space>
+              <HeadingPath path={result.heading_path} testId={`kb-test-heading-${idx}`} />
               <Paragraph
                 style={{ whiteSpace: "pre-wrap", marginBottom: 0, fontSize: 13 }}
                 ellipsis={{ rows: 4, expandable: true }}

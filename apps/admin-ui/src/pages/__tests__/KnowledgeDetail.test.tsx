@@ -206,6 +206,7 @@ describe("KnowledgeDetail", () => {
           chunk_index: 0,
           score: 0.91,
           recall_source: "both",
+          heading_path: ["Benefits", "Deductible"],
         },
       ],
     });
@@ -224,6 +225,28 @@ describe("KnowledgeDetail", () => {
     );
     expect(screen.getByText("faq.pdf#0")).toBeInTheDocument();
     expect(screen.getByText("The deductible is 500.")).toBeInTheDocument();
+    expect(screen.getByTestId("kb-test-heading-0")).toHaveTextContent("Benefits › Deductible");
+  });
+
+  it("segment preview shows each chunk's heading path above its body", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue({
+      chunks: [
+        { id: "c1", chunk_index: 0, content: "500 per year.", heading_path: ["Benefits"] },
+        // A legacy chunk: prefix still in the body, no path → no breadcrumb row.
+        { id: "c2", chunk_index: 1, content: "[Section: Old]\n\nlegacy body", heading_path: [] },
+      ],
+      total: 2,
+      offset: 0,
+      limit: 20,
+    });
+
+    renderDetail();
+    await userEvent.click(await screen.findByTestId(`doc-chunks-${DOCS[0].id}`));
+    expect(await screen.findByTestId("kb-chunk-heading-c1")).toHaveTextContent("Benefits");
+    expect(screen.getByText("500 per year.")).toBeInTheDocument();
+    expect(screen.queryByTestId("kb-chunk-heading-c2")).not.toBeInTheDocument();
   });
 
   it("settings save calls updateBase", async () => {

@@ -18,6 +18,8 @@ import pymupdf
 import pymupdf4llm
 from markitdown import MarkItDown
 
+from expert_work.protocol import IngestErrorCode
+
 #: Document extensions the knowledge pipeline accepts.
 SUPPORTED_EXTENSIONS = frozenset(
     {".pdf", ".docx", ".pptx", ".xlsx", ".md", ".markdown", ".txt", ".html", ".htm", ".csv"}
@@ -38,7 +40,17 @@ _LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 class DocumentParseError(Exception):
     """Raised when an uploaded document cannot be parsed to Markdown —
     an unsupported extension, a corrupt file, or an empty extraction
-    (e.g. a scanned PDF with no text layer)."""
+    (e.g. a scanned PDF with no text layer). ``code`` is the document's
+    ``error_code``; ``str(exc)`` stays the human-readable message."""
+
+    def __init__(self, message: str, code: IngestErrorCode = IngestErrorCode.PARSE_FAILED) -> None:
+        super().__init__(message)
+        self.code = code
+
+    def __reduce__(self) -> tuple[type[DocumentParseError], tuple[str, IngestErrorCode]]:
+        # Raised inside the parse process pool: the default pickling only
+        # carries ``args`` and would drop ``code`` on the way back.
+        return (type(self), (str(self), self.code))
 
 
 def parse_document(filename: str, raw: bytes) -> str:
@@ -50,7 +62,7 @@ def parse_document(filename: str, raw: bytes) -> str:
     ext = Path(filename).suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
         msg = f"unsupported document type: {ext or filename!r}"
-        raise DocumentParseError(msg)
+        raise DocumentParseError(msg, IngestErrorCode.UNSUPPORTED_FILE)
     markdown = strip_lone_surrogates(
         _parse_pdf(raw) if ext == ".pdf" else _parse_with_markitdown(raw, ext)
     )
@@ -72,7 +84,7 @@ def _parse_pdf(raw: bytes) -> str:
         doc = pymupdf.open(stream=raw, filetype="pdf")
     except Exception as exc:
         msg = f"could not open PDF: {exc}"
-        raise DocumentParseError(msg) from exc
+        raise DocumentParseError(msg, IngestErrorCode.INVALID_FILE) from exc
     try:
         markdown: str = pymupdf4llm.to_markdown(doc)
         page_count: int = doc.page_count

@@ -1,7 +1,8 @@
 """知识库检索评测指标(B-175 L1-T3):纯函数,不碰库、不碰网络。
 
 命中有两级:文档级 = ``filename == expected.document``;段级 = 同一文档 **且**
-``expected.anchor in content``。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
+``expected.anchor in retrieval_text``(检索文本 = 标题路径 + 正文,与嵌入 / 关键词索引、
+智能体看到的是同一段字)。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
 哪些期望条目(:func:`document_coverage` / :func:`chunk_coverage`):
 
 * 每条期望只在最早命中它的那一名记一次,后面再命中(相邻段重叠都含锚)记空,
@@ -61,8 +62,8 @@ class ResultLike(Protocol):
         """Source document filename of the hit."""
 
     @property
-    def content(self) -> str:
-        """Chunk text of the hit."""
+    def retrieval_text(self) -> str:
+        """Text the hit was retrieved as — section breadcrumb + chunk body."""
 
     @property
     def score(self) -> float | None:
@@ -145,7 +146,7 @@ def _matching_expected(result: ResultLike, expected: Sequence[ExpectedLike]) -> 
     return [
         index
         for index, exp in enumerate(expected)
-        if exp.document == result.filename and exp.anchor in result.content
+        if exp.document == result.filename and exp.anchor in result.retrieval_text
     ]
 
 

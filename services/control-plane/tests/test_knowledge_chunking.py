@@ -3,19 +3,35 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
 from control_plane.knowledge.chunking import (
+    TextChunk,
     _cosine_distance,
     _hard_split,
     _split_by_tokens,
     _tail_text,
-    chunk_markdown,
-    chunk_markdown_semantic,
     count_tokens,
 )
+from control_plane.knowledge.chunking import chunk_markdown as _chunk_markdown
+from control_plane.knowledge.chunking import chunk_markdown_semantic as _chunk_markdown_semantic
+
+
+# The cases below assert on the retrieval text (breadcrumb + body) — the exact
+# strings the chunker returned before the heading path was stored apart, so
+# they double as the proof that embedding / keyword input did not change.
+def chunk_markdown(markdown: str, *, max_tokens: int, overlap_tokens: int) -> list[str]:
+    return [
+        c.text
+        for c in _chunk_markdown(markdown, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+    ]
+
+
+async def chunk_markdown_semantic(markdown: str, **kwargs: Any) -> list[str]:
+    return [c.text for c in await _chunk_markdown_semantic(markdown, **kwargs)]
 
 
 class _ScriptedEmbedder:
@@ -41,6 +57,16 @@ class _FailEmbedder:
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         del tenant_id
         raise AssertionError("embedder must not be called")
+
+
+def test_chunk_carries_clean_body_and_heading_path() -> None:
+    src = "# 健康保险\n\n## 免赔额\n\n免赔额是每年五百元。\n\n# 其它\n\n无标题的段。"
+    chunks = _chunk_markdown(src, max_tokens=512, overlap_tokens=0)
+    assert chunks == [
+        TextChunk(body="免赔额是每年五百元。", heading_path=("健康保险", "免赔额")),
+        TextChunk(body="无标题的段。", heading_path=("其它",)),
+    ]
+    assert chunks[0].text == "[Section: 健康保险 > 免赔额]\n\n免赔额是每年五百元。"
 
 
 def test_count_tokens() -> None:

@@ -9,7 +9,14 @@ import pytest
 
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from expert_work.persistence import InMemoryKnowledgeStore
-from expert_work.protocol import DocumentStatus, KnowledgeBase, KnowledgeChunk, KnowledgeDocument
+from expert_work.protocol import (
+    DocumentStatus,
+    IngestErrorCode,
+    IngestStage,
+    KnowledgeBase,
+    KnowledgeChunk,
+    KnowledgeDocument,
+)
 from orchestrator.llm import FakeEmbedder
 
 
@@ -73,11 +80,16 @@ class _RecordingStore(InMemoryKnowledgeStore):
         tenant_id: UUID,
         document_id: UUID,
         error: str,
+        error_code: IngestErrorCode | None = None,
         generation: int | None = None,
     ) -> bool:
         self.failed_terminal.append(document_id)
         return await super().mark_document_failed_terminal(
-            tenant_id=tenant_id, document_id=document_id, error=error, generation=generation
+            tenant_id=tenant_id,
+            document_id=document_id,
+            error=error,
+            error_code=error_code,
+            generation=generation,
         )
 
 
@@ -135,6 +147,10 @@ async def test_ingest_failure_with_document_still_present_marks_failed() -> None
     assert fetched is not None
     assert fetched.status is DocumentStatus.FAILED
     assert fetched.error == "replace_chunks exploded"
+    # Not a parse / embedding failure → the catch-all code; the stage shows
+    # where it broke (writing the chunks).
+    assert fetched.error_code is IngestErrorCode.INTERNAL_ERROR
+    assert fetched.stage is IngestStage.INDEXING
 
 
 @pytest.mark.asyncio

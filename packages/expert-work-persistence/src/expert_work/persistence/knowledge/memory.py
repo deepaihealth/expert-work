@@ -11,6 +11,7 @@ from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
     UNSET,
     ClaimedIngestion,
+    DocumentFileFacts,
     DuplicateKnowledgeBaseError,
     KnowledgeStore,
     _Unset,
@@ -20,7 +21,10 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    DocumentSourceType,
     DocumentStatus,
+    IngestErrorCode,
+    IngestStage,
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeDocument,
@@ -53,6 +57,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._sha256: dict[UUID, str | None] = {}
         self._pending: dict[UUID, tuple[bytes, str | None]] = {}
         self._lease: dict[UUID, datetime | None] = {}
+        #: Per-tenant ``doc_seq`` counter — the SQL ``knowledge_doc_seq`` table.
+        self._doc_seq: dict[UUID, int] = {}
 
     # -- knowledge bases ----------------------------------------------------
 
@@ -256,31 +262,43 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 return existing  # unchanged re-upload: nothing to do
             # New bytes go to the pending slot; the serving version (content +
             # chunks) stays until the new ingest's fenced READY promotes it.
+            update: dict[str, object] = {
+                "status": DocumentStatus.PENDING,
+                "error": None,
+                "error_code": None,
+                "stage": IngestStage.QUEUED,
+                "attempts": 0,
+                "ingest_generation": existing.ingest_generation + 1,
+                "updated_at": now,
+            }
             if content is not None:
                 if self._content.get(existing.id) is None and existing.chunk_count == 0:
                     self._content[existing.id] = content  # nothing serving yet
                     self._sha256[existing.id] = content_sha256
+                    update["size_bytes"] = len(content)
                 else:
                     self._pending[existing.id] = (content, content_sha256)
-            reset = existing.model_copy(
-                update={
-                    "status": DocumentStatus.PENDING,
-                    "error": None,
-                    "attempts": 0,
-                    "ingest_generation": existing.ingest_generation + 1,
-                    "has_pending": existing.id in self._pending,
-                    "updated_at": now,
-                }
-            )
+            update["has_pending"] = existing.id in self._pending
+            if existing.doc_seq is None:  # a row from before doc_seq existed
+                update["doc_seq"] = self._bump_doc_seq(tenant_id)
+            reset = existing.model_copy(update=update)
             self._documents[self._documents.index(existing)] = reset
             self._lease[existing.id] = None
             return reset
+        facts = DocumentFileFacts.of(filename, content)
+        doc_seq = self._bump_doc_seq(tenant_id)
         document = KnowledgeDocument(
             id=uuid4(),
             tenant_id=tenant_id,
             kb_id=kb_id,
             filename=filename,
             status=DocumentStatus.PENDING,
+            doc_seq=doc_seq,
+            title=facts.title,
+            mime=facts.mime,
+            size_bytes=facts.size_bytes,
+            source_type=DocumentSourceType.FILE,
+            stage=IngestStage.QUEUED,
             created_at=now,
             updated_at=now,
         )
@@ -289,6 +307,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._sha256[document.id] = content_sha256
         self._lease[document.id] = None
         return document
+
+    def _bump_doc_seq(self, tenant_id: UUID) -> int:
+        self._doc_seq[tenant_id] = self._doc_seq.get(tenant_id, 0) + 1
+        return self._doc_seq[tenant_id]
 
     async def get_document(self, *, tenant_id: UUID, document_id: UUID) -> KnowledgeDocument | None:
         return next(
@@ -371,15 +393,41 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         tenant_id: UUID,
         document_id: UUID,
         error: str,
+        error_code: IngestErrorCode | None = None,
         generation: int | None = None,
     ) -> bool:
-        return await self.set_document_status(
+        failed = await self.set_document_status(
             tenant_id=tenant_id,
             document_id=document_id,
             status=DocumentStatus.FAILED,
             error=error,
             generation=generation,
         )
+        if failed:
+            self._patch(tenant_id, document_id, {"error_code": error_code})
+        return failed
+
+    async def set_document_stage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        stage: IngestStage,
+        generation: int | None = None,
+    ) -> bool:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None:
+            return False
+        if generation is not None and not _fence_matches(document, generation):
+            return False
+        self._patch(tenant_id, document_id, {"stage": stage, "updated_at": datetime.now(UTC)})
+        return True
+
+    def _patch(self, tenant_id: UUID, document_id: UUID, update: dict[str, object]) -> None:
+        document = next(
+            d for d in self._documents if d.tenant_id == tenant_id and d.id == document_id
+        )
+        self._documents[self._documents.index(document)] = document.model_copy(update=update)
 
     async def discard_pending(
         self, *, tenant_id: UUID, document_id: UUID
@@ -395,6 +443,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             update={
                 "status": DocumentStatus.READY if serving else DocumentStatus.FAILED,
                 "error": None if serving else _DISCARDED_ERROR,
+                "error_code": None,
+                "stage": IngestStage.READY if serving else document.stage,
                 "has_pending": False,
                 "ingest_generation": document.ingest_generation + 1,
                 "attempts": 0,
@@ -413,11 +463,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             lease = self._lease.get(doc.id)
             if lease is not None and lease >= now:
                 continue
-            await self.set_document_status(
+            await self.mark_document_failed_terminal(
                 tenant_id=doc.tenant_id,
                 document_id=doc.id,
-                status=DocumentStatus.FAILED,
                 error=_EXHAUSTED_ERROR,
+                error_code=IngestErrorCode.ATTEMPTS_EXHAUSTED,
             )
             swept += 1
         return swept
@@ -471,11 +521,16 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             update["chunk_count"] = chunk_count
         if status in (DocumentStatus.READY, DocumentStatus.FAILED):
             self._lease[document_id] = None  # terminal → release lease
+        if status is DocumentStatus.READY:
+            update["stage"] = IngestStage.READY
+            update["error_code"] = None
         if status is DocumentStatus.READY and generation is not None:
             # The new version is now serving: promote pending → content.
             pending = self._pending.pop(document_id, None)
             if pending is not None:
                 self._content[document_id], self._sha256[document_id] = pending
+            serving = self._content.get(document_id)
+            update["size_bytes"] = len(serving) if serving is not None else None
             update["has_pending"] = False
         self._documents[self._documents.index(document)] = document.model_copy(update=update)
         return True
@@ -508,6 +563,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             # Mirror the SQL side's FK (0136): writing chunks back to a deleted
             # document must fail loudly instead of recreating orphan vectors.
             raise KeyError(document_id)
+        indices = [c.chunk_index for c in chunks]
+        if len(indices) != len(set(indices)):
+            # Mirror the SQL unique (document_id, chunk_index) (0165).
+            msg = f"duplicate chunk_index in replace_chunks for document {document_id}"
+            raise ValueError(msg)
         self._chunks = [
             c
             for c in self._chunks
@@ -526,6 +586,25 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         # Mirror the SQL projection: embedding omitted from preview rows.
         page = [c.model_copy(update={"embedding": ()}) for c in matching[offset : offset + limit]]
         return page, len(matching)
+
+    async def chunk_embeddings_by_hash(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        content_hashes: Sequence[str],
+        embedding_model: str,
+    ) -> dict[str, tuple[float, ...]]:
+        wanted = set(content_hashes)
+        return {
+            c.content_hash: c.embedding
+            for c in self._chunks
+            if c.tenant_id == tenant_id
+            and c.document_id == document_id
+            and c.embedding_model == embedding_model
+            and c.content_hash is not None
+            and c.content_hash in wanted
+        }
 
     async def search(
         self,
@@ -593,7 +672,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         for chunk in self._chunks:
             if chunk.tenant_id != tenant_id or chunk.kb_id not in kb_set:
                 continue
-            overlap = len(terms & set(tokenize_for_search(chunk.content).split()))
+            overlap = len(terms & set(tokenize_for_search(chunk.retrieval_text).split()))
             if overlap > 0:
                 scored.append((overlap, chunk))
         scored.sort(key=lambda pair: pair[0], reverse=True)

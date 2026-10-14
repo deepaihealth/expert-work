@@ -599,7 +599,8 @@ async def _all_chunk_texts(
         page, total = await store.list_chunks(
             tenant_id=tenant_id, document_id=document_id, offset=offset, limit=_CHUNK_PAGE
         )
-        texts.extend(c.content for c in page)
+        # Same text retrieval matches against: breadcrumb + body.
+        texts.extend(c.retrieval_text for c in page)
         offset += len(page)
         if not page or offset >= total:
             return texts

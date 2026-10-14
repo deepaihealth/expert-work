@@ -50,6 +50,7 @@ from expert_work.protocol import (
     AuditAction,
     DocumentStatus,
     KnowledgeBase,
+    KnowledgeChunk,
     KnowledgeDocument,
     RetrievalMethod,
 )
@@ -242,8 +243,33 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "chunk_count": document.chunk_count,
         "attempts": document.attempts,
         "has_pending": document.has_pending,
+        "doc_seq": document.doc_seq,
+        "title": document.title,
+        "source_type": document.source_type.value,
+        "stage": document.stage.value if document.stage is not None else None,
+        "error_code": document.error_code.value if document.error_code is not None else None,
+        "size_bytes": document.size_bytes,
+        "mime": document.mime,
+        "page_count": document.page_count,
+        "enabled": document.enabled,
         "created_at": _iso(document.created_at),
         "updated_at": _iso(document.updated_at),
+    }
+
+
+def _chunk_dict(chunk: KnowledgeChunk) -> dict[str, Any]:
+    """Segment-preview row. ``content`` is the clean body; ``heading_path``
+    the section breadcrumb (empty for chunks ingested before it was stored
+    apart — their body still carries the ``[Section: …]`` prefix)."""
+    return {
+        "id": str(chunk.id),
+        "chunk_index": chunk.chunk_index,
+        "content": chunk.content,
+        "heading_path": list(chunk.heading_path),
+        "chunk_type": chunk.chunk_type.value,
+        "enabled": chunk.enabled,
+        "edited": chunk.edited,
+        "revision": chunk.revision,
     }
 
 
@@ -804,10 +830,7 @@ def build_knowledge_router() -> APIRouter:
             )
         return JSONResponse(
             content={
-                "chunks": [
-                    {"id": str(c.id), "chunk_index": c.chunk_index, "content": c.content}
-                    for c in chunks
-                ],
+                "chunks": [_chunk_dict(c) for c in chunks],
                 "total": total,
                 "offset": safe_offset,
                 "limit": safe_limit,
@@ -865,6 +888,7 @@ def build_knowledge_router() -> APIRouter:
                 "results": [
                     {
                         "content": r.content,
+                        "heading_path": list(r.heading_path),
                         "source": f"{r.filename}#{r.chunk_index}",
                         "filename": r.filename,
                         "chunk_index": r.chunk_index,

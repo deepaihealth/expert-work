@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, and_, delete, func, or_, select, update
+from sqlalchemy import Select, Text, and_, any_, delete, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -15,6 +19,7 @@ from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
     UNSET,
     ClaimedIngestion,
+    DocumentFileFacts,
     DuplicateKnowledgeBaseError,
     KnowledgeStore,
     _Unset,
@@ -23,14 +28,20 @@ from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.models import (
     KnowledgeBaseRow,
     KnowledgeChunkRow,
+    KnowledgeDocSeqRow,
     KnowledgeDocumentRow,
 )
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    ChunkType,
+    DocumentSourceType,
     DocumentStatus,
+    IngestErrorCode,
+    IngestStage,
     KnowledgeBase,
+    KnowledgeBaseKind,
     KnowledgeChunk,
     KnowledgeDocument,
     RetrievalMethod,
@@ -84,6 +95,18 @@ def _claimable(now: datetime, max_attempts: int) -> ColumnElement[bool]:
     )
 
 
+def _enum_or[E: StrEnum](enum: type[E], value: str | None, default: E | None) -> E | None:
+    """Read a free-text enum column without failing on a value this version
+    does not know (written by a newer release before a rollback): unknown →
+    ``default`` instead of a 500 on every list call. ``None`` stays ``None``."""
+    if value is None:
+        return None
+    try:
+        return enum(value)
+    except ValueError:
+        return default
+
+
 def _to_base(row: KnowledgeBaseRow) -> KnowledgeBase:
     return KnowledgeBase(
         id=row.id,
@@ -100,6 +123,10 @@ def _to_base(row: KnowledgeBaseRow) -> KnowledgeBase:
         embedding_provider=row.embedding_provider,
         embedding_model=row.embedding_model,
         reindex_requested_at=row.reindex_requested_at,
+        kind=_enum_or(KnowledgeBaseKind, row.kind, KnowledgeBaseKind.DOCUMENT)
+        or KnowledgeBaseKind.DOCUMENT,
+        metadata_schema=row.metadata_schema,
+        api_access_enabled=row.api_access_enabled,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -117,12 +144,50 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         attempts=row.attempts,
         ingest_generation=row.ingest_generation,
         has_pending=row.pending_content is not None,
+        doc_seq=row.doc_seq,
+        title=row.title,
+        source_type=_enum_or(DocumentSourceType, row.source_type, DocumentSourceType.FILE)
+        or DocumentSourceType.FILE,
+        source_uri=row.source_uri,
+        external_id=row.external_id,
+        metadata=row.doc_metadata,
+        enabled=row.enabled,
+        stage=_enum_or(IngestStage, row.stage, None),
+        progress=row.progress,
+        error_code=_enum_or(IngestErrorCode, row.error_code, IngestErrorCode.INTERNAL_ERROR),
+        page_count=row.page_count,
+        size_bytes=row.size_bytes,
+        mime=row.mime,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
 
 
-def _to_chunk(row: KnowledgeChunkRow) -> KnowledgeChunk:
+#: ``knowledge_chunk`` columns a chunk DTO is built from, minus the embedding
+#: (preview reads must never SELECT the large vector).
+_CHUNK_COLUMNS = (
+    KnowledgeChunkRow.id,
+    KnowledgeChunkRow.tenant_id,
+    KnowledgeChunkRow.kb_id,
+    KnowledgeChunkRow.document_id,
+    KnowledgeChunkRow.chunk_index,
+    KnowledgeChunkRow.content,
+    KnowledgeChunkRow.chunk_type,
+    KnowledgeChunkRow.heading_path,
+    KnowledgeChunkRow.content_hash,
+    KnowledgeChunkRow.embedding_model,
+    KnowledgeChunkRow.enabled,
+    KnowledgeChunkRow.edited,
+    KnowledgeChunkRow.revision,
+    KnowledgeChunkRow.parent_chunk_id,
+    KnowledgeChunkRow.source_locator,
+    KnowledgeChunkRow.created_at,
+)
+
+
+def _to_chunk(row: Any, embedding: tuple[float, ...] = ()) -> KnowledgeChunk:
+    """Build a chunk DTO from a ``KnowledgeChunkRow`` or a ``_CHUNK_COLUMNS``
+    projection row (same attribute names)."""
     return KnowledgeChunk(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -130,9 +195,22 @@ def _to_chunk(row: KnowledgeChunkRow) -> KnowledgeChunk:
         document_id=row.document_id,
         chunk_index=row.chunk_index,
         content=row.content,
-        embedding=tuple(float(value) for value in row.embedding),
+        embedding=embedding,
+        chunk_type=_enum_or(ChunkType, row.chunk_type, ChunkType.TEXT) or ChunkType.TEXT,
+        heading_path=tuple(row.heading_path or ()),
+        content_hash=row.content_hash,
+        embedding_model=row.embedding_model,
+        enabled=row.enabled,
+        edited=row.edited,
+        revision=row.revision,
+        parent_chunk_id=row.parent_chunk_id,
+        source_locator=row.source_locator,
         created_at=row.created_at,
     )
+
+
+def _to_chunk_with_embedding(row: KnowledgeChunkRow) -> KnowledgeChunk:
+    return _to_chunk(row, tuple(float(value) for value in row.embedding))
 
 
 class SqlKnowledgeStore(KnowledgeStore):
@@ -452,14 +530,19 @@ class SqlKnowledgeStore(KnowledgeStore):
                     return _to_document(existing)  # unchanged re-upload: nothing to do
                 existing.status = DocumentStatus.PENDING.value
                 existing.error = None
+                existing.error_code = None
+                existing.stage = IngestStage.QUEUED.value
                 existing.attempts = 0
                 existing.ingest_generation = existing.ingest_generation + 1
+                if existing.doc_seq is None:  # a row from before doc_seq existed
+                    existing.doc_seq = await self._next_doc_seq(session, tenant_id)
                 existing.claimed_at = None
                 existing.lease_until = None
                 if content is not None:
                     if existing.content is None and existing.chunk_count == 0:
                         existing.content = content  # nothing serving yet
                         existing.content_sha256 = content_sha256
+                        existing.size_bytes = len(content)
                     else:
                         # New bytes wait in the pending slot; the serving
                         # version (content + chunks) stays until the new
@@ -470,6 +553,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                 await session.commit()
                 await session.refresh(existing)
                 return _to_document(existing)
+            facts = DocumentFileFacts.of(filename, content)
             row = KnowledgeDocumentRow(
                 tenant_id=tenant_id,
                 kb_id=kb_id,
@@ -477,11 +561,33 @@ class SqlKnowledgeStore(KnowledgeStore):
                 status=DocumentStatus.PENDING.value,
                 content=content,
                 content_sha256=content_sha256,
+                doc_seq=await self._next_doc_seq(session, tenant_id),
+                title=facts.title,
+                mime=facts.mime,
+                size_bytes=facts.size_bytes,
+                source_type=DocumentSourceType.FILE.value,
+                stage=IngestStage.QUEUED.value,
             )
             session.add(row)
             await session.commit()
             await session.refresh(row)
             return _to_document(row)
+
+    @staticmethod
+    async def _next_doc_seq(session: AsyncSession, tenant_id: UUID) -> int:
+        """Bump the tenant's counter inside the caller's transaction: the row
+        lock serialises concurrent inserts, and a rolled-back insert returns
+        its number."""
+        bumped = await session.execute(
+            pg_insert(KnowledgeDocSeqRow)
+            .values(tenant_id=tenant_id, last_seq=1)
+            .on_conflict_do_update(
+                index_elements=[KnowledgeDocSeqRow.tenant_id],
+                set_={"last_seq": KnowledgeDocSeqRow.last_seq + 1},
+            )
+            .returning(KnowledgeDocSeqRow.last_seq)
+        )
+        return int(bumped.scalar_one())
 
     async def get_document(self, *, tenant_id: UUID, document_id: UUID) -> KnowledgeDocument | None:
         stmt = select(KnowledgeDocumentRow).where(
@@ -631,6 +737,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         tenant_id: UUID,
         document_id: UUID,
         error: str,
+        error_code: IngestErrorCode | None = None,
         generation: int | None = None,
     ) -> bool:
         async with self._sf() as session:
@@ -646,6 +753,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                         .values(
                             status=DocumentStatus.FAILED.value,
                             error=error,
+                            error_code=error_code.value if error_code is not None else None,
                             claimed_at=None,
                             lease_until=None,
                             updated_at=datetime.now(UTC),
@@ -658,6 +766,27 @@ class SqlKnowledgeStore(KnowledgeStore):
             )
             await session.commit()
         return bool(failed_ids)
+
+    async def set_document_stage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        stage: IngestStage,
+        generation: int | None = None,
+    ) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(KnowledgeDocumentRow)
+                .where(
+                    KnowledgeDocumentRow.tenant_id == tenant_id,
+                    KnowledgeDocumentRow.id == document_id,
+                    *_fence(generation),
+                )
+                .values(stage=stage.value, updated_at=datetime.now(UTC))
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def discard_pending(
         self, *, tenant_id: UUID, document_id: UUID
@@ -683,6 +812,9 @@ class SqlKnowledgeStore(KnowledgeStore):
             row.pending_content_sha256 = None
             row.status = (DocumentStatus.READY if serving else DocumentStatus.FAILED).value
             row.error = None if serving else _DISCARDED_ERROR
+            row.error_code = None
+            if serving:
+                row.stage = IngestStage.READY.value
             row.ingest_generation = row.ingest_generation + 1
             row.attempts = 0
             row.claimed_at = None
@@ -709,6 +841,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                         .values(
                             status=DocumentStatus.FAILED.value,
                             error=_EXHAUSTED_ERROR,
+                            error_code=IngestErrorCode.ATTEMPTS_EXHAUSTED.value,
                             claimed_at=None,
                             lease_until=None,
                             updated_at=now,
@@ -801,6 +934,9 @@ class SqlKnowledgeStore(KnowledgeStore):
         if status.value in _TERMINAL_STATUSES:
             values["claimed_at"] = None
             values["lease_until"] = None
+        if status is DocumentStatus.READY:
+            values["stage"] = IngestStage.READY.value
+            values["error_code"] = None
         if status is DocumentStatus.READY and generation is not None:
             # The new version is now serving: promote pending → content in
             # the same (fenced) statement.
@@ -809,6 +945,9 @@ class SqlKnowledgeStore(KnowledgeStore):
             )
             values["content_sha256"] = func.coalesce(
                 KnowledgeDocumentRow.pending_content_sha256, KnowledgeDocumentRow.content_sha256
+            )
+            values["size_bytes"] = func.octet_length(
+                func.coalesce(KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content)
             )
             values["pending_content"] = None
             values["pending_content_sha256"] = None
@@ -903,11 +1042,21 @@ class SqlKnowledgeStore(KnowledgeStore):
                         chunk_index=chunk.chunk_index,
                         content=chunk.content,
                         embedding=list(chunk.embedding),
-                        # Keyword-search vector — segmented app-side so it
-                        # is correct for CJK (see text_search).
+                        # Keyword-search vector over breadcrumb + body —
+                        # segmented app-side so it is correct for CJK (see
+                        # text_search).
                         content_tsv=func.to_tsvector(
-                            _TS_CONFIG, tokenize_for_search(chunk.content)
+                            _TS_CONFIG, tokenize_for_search(chunk.retrieval_text)
                         ),
+                        chunk_type=chunk.chunk_type.value,
+                        heading_path=list(chunk.heading_path) or None,
+                        content_hash=chunk.content_hash,
+                        embedding_model=chunk.embedding_model,
+                        enabled=chunk.enabled,
+                        edited=chunk.edited,
+                        revision=chunk.revision,
+                        parent_chunk_id=chunk.parent_chunk_id,
+                        source_locator=chunk.source_locator,
                     )
                     for chunk in chunks
                 ]
@@ -921,15 +1070,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         # Explicit column projection — never SELECT the large embedding vector
         # for a preview. The returned chunks carry ``embedding == ()``.
         page_stmt = (
-            select(
-                KnowledgeChunkRow.id,
-                KnowledgeChunkRow.tenant_id,
-                KnowledgeChunkRow.kb_id,
-                KnowledgeChunkRow.document_id,
-                KnowledgeChunkRow.chunk_index,
-                KnowledgeChunkRow.content,
-                KnowledgeChunkRow.created_at,
-            )
+            select(*_CHUNK_COLUMNS)
             .where(
                 KnowledgeChunkRow.tenant_id == tenant_id,
                 KnowledgeChunkRow.document_id == document_id,
@@ -949,20 +1090,34 @@ class SqlKnowledgeStore(KnowledgeStore):
         async with self._sf() as session:
             rows = (await session.execute(page_stmt)).all()
             total = (await session.execute(count_stmt)).scalar_one()
-        chunks = [
-            KnowledgeChunk(
-                id=row.id,
-                tenant_id=row.tenant_id,
-                kb_id=row.kb_id,
-                document_id=row.document_id,
-                chunk_index=row.chunk_index,
-                content=row.content,
-                embedding=(),
-                created_at=row.created_at,
-            )
+        return [_to_chunk(row) for row in rows], int(total)
+
+    async def chunk_embeddings_by_hash(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        content_hashes: Sequence[str],
+        embedding_model: str,
+    ) -> dict[str, tuple[float, ...]]:
+        if not content_hashes:
+            return {}
+        # One ``text[]`` bind (``= ANY``), not one bind per hash: a large
+        # document can have more chunks than asyncpg's 32767-parameter cap.
+        hashes = literal(sorted(set(content_hashes)), ARRAY(Text))
+        stmt = select(KnowledgeChunkRow.content_hash, KnowledgeChunkRow.embedding).where(
+            KnowledgeChunkRow.tenant_id == tenant_id,
+            KnowledgeChunkRow.document_id == document_id,
+            KnowledgeChunkRow.embedding_model == embedding_model,
+            KnowledgeChunkRow.content_hash == any_(hashes),
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).all()
+        return {
+            row.content_hash: tuple(float(value) for value in row.embedding)
             for row in rows
-        ]
-        return chunks, int(total)
+            if row.content_hash is not None
+        }
 
     async def search(
         self,
@@ -1003,7 +1158,9 @@ class SqlKnowledgeStore(KnowledgeStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
         return [
-            ScoredChunk(chunk=_to_chunk(row), score=1.0 - float(dist), source="vector")
+            ScoredChunk(
+                chunk=_to_chunk_with_embedding(row), score=1.0 - float(dist), source="vector"
+            )
             for row, dist in rows
         ]
 
@@ -1048,6 +1205,8 @@ class SqlKnowledgeStore(KnowledgeStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
         return [
-            ScoredChunk(chunk=_to_chunk(row), score=float(rank_value), source="keyword")
+            ScoredChunk(
+                chunk=_to_chunk_with_embedding(row), score=float(rank_value), source="keyword"
+            )
             for row, rank_value in rows
         ]

@@ -24,8 +24,13 @@ from expert_work.persistence.models.feedback import FeedbackRow
 from expert_work.persistence.models.image_upload import ImageUploadRow
 from expert_work.persistence.models.knowledge import (
     KnowledgeBaseRow,
+    KnowledgeChunkRevisionRow,
     KnowledgeChunkRow,
+    KnowledgeDocSeqRow,
     KnowledgeDocumentRow,
+    KnowledgeDocumentTagRow,
+    KnowledgeTagRow,
+    KnowledgeTaskRow,
 )
 from expert_work.persistence.models.mcp_connector_catalog import McpConnectorCatalogRow
 from expert_work.persistence.models.mcp_oauth_connection import McpOAuthConnectionRow
@@ -123,8 +128,13 @@ __all__ = [
     "FeedbackRow",
     "ImageUploadRow",
     "KnowledgeBaseRow",
+    "KnowledgeChunkRevisionRow",
     "KnowledgeChunkRow",
+    "KnowledgeDocSeqRow",
     "KnowledgeDocumentRow",
+    "KnowledgeDocumentTagRow",
+    "KnowledgeTagRow",
+    "KnowledgeTaskRow",
     "McpConnectorCatalogRow",
     "McpOAuthConnectionRow",
     "MemoryItemRow",

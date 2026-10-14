@@ -21,7 +21,9 @@ import logging
 from datetime import UTC, datetime
 
 from control_plane.knowledge.ingestion import (
+    CONTENT_MISSING_ERROR,
     StaleIngestionError,
+    failure_code,
     ingest_document_bytes,
     renew_lease_periodically,
 )
@@ -29,7 +31,7 @@ from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
-from expert_work.protocol import DocumentStatus
+from expert_work.protocol import DocumentStatus, IngestErrorCode
 from orchestrator.llm import Embedder
 
 logger = logging.getLogger("expert_work.control_plane.knowledge.recovery")
@@ -176,7 +178,8 @@ class KnowledgeIngestRecoveryWorker:
             await self._store.mark_document_failed_terminal(
                 tenant_id=claim.tenant_id,
                 document_id=claim.document_id,
-                error="original file not retained; re-upload required",
+                error=CONTENT_MISSING_ERROR,
+                error_code=IngestErrorCode.CONTENT_MISSING,
                 generation=claim.generation,
             )
             _failed_terminal.inc()
@@ -230,6 +233,7 @@ class KnowledgeIngestRecoveryWorker:
                     tenant_id=claim.tenant_id,
                     document_id=claim.document_id,
                     error=str(exc)[:_ERROR_CAP],
+                    error_code=failure_code(exc),
                     generation=claim.generation,
                 )
                 _failed_terminal.inc()

@@ -137,6 +137,7 @@ class RetentionCleanupJob:
         tenant_user_hard_delete_grace_days: int = 90,
         sandbox_egress_audit_retention_days: int = 90,
         memory_writeback_job_retention_days: int = 30,
+        knowledge_task_retention_days: int = 90,
         user_upload_store: UserUploadStore | None = None,
         upload_retention_days: int = 90,
         thread_store: ThreadMetaStore | None = None,
@@ -171,6 +172,9 @@ class RetentionCleanupJob:
         if memory_writeback_job_retention_days < 1:
             msg = "memory_writeback_job_retention_days must be >= 1"
             raise ValueError(msg)
+        if knowledge_task_retention_days < 1:
+            msg = "knowledge_task_retention_days must be >= 1"
+            raise ValueError(msg)
         if upload_retention_days < 1:
             msg = "upload_retention_days must be >= 1"
             raise ValueError(msg)
@@ -190,6 +194,7 @@ class RetentionCleanupJob:
         self._tenant_user_grace_days = tenant_user_hard_delete_grace_days
         self._sandbox_egress_audit_retention_days = sandbox_egress_audit_retention_days
         self._memory_writeback_job_retention_days = memory_writeback_job_retention_days
+        self._knowledge_task_retention_days = knowledge_task_retention_days
         self._user_upload_store = user_upload_store
         self._upload_retention_days = upload_retention_days
         self._thread_store = thread_store
@@ -220,6 +225,7 @@ class RetentionCleanupJob:
             event_deleted = await self._delete_event_log()
             sandbox_egress_audit_deleted = await self._delete_sandbox_egress_audit()
             memory_writeback_jobs_deleted = await self._delete_finished_memory_writeback_jobs()
+            knowledge_tasks_deleted = await self._delete_finished_knowledge_tasks()
             jwt_deleted = await self._delete_expired_jwt_blacklist()
             image_rows, image_keys_ok, image_keys_failed = await self._delete_expired_images()
             # 版本 pass 先于逻辑产物 pass:文件先按版本清掉,后面的 hard-delete
@@ -261,6 +267,7 @@ class RetentionCleanupJob:
             tenant_users_hard_deleted=tenant_users_hard_deleted,
             sandbox_egress_audit_deleted=sandbox_egress_audit_deleted,
             memory_writeback_jobs_deleted=memory_writeback_jobs_deleted,
+            knowledge_tasks_deleted=knowledge_tasks_deleted,
             duration_seconds=time.monotonic() - started,
         )
 
@@ -811,6 +818,32 @@ class RetentionCleanupJob:
                     """
                 ),
                 {"days": self._memory_writeback_job_retention_days, "batch": self._batch_size},
+            )
+            await session.commit()
+        return result.rowcount or 0  # type: ignore[attr-defined]
+
+    async def _delete_finished_knowledge_tasks(self) -> int:
+        """B-175 L2-PR3 —— 删掉收尾满保留期的知识库任务行(``succeeded`` / ``failed`` /
+        ``cancelled``);``queued`` / ``running`` 不按时间删。没写 ``finished_at`` 的收尾行
+        按 ``updated_at`` 算。与
+        :meth:`_delete_finished_memory_writeback_jobs` 同款 ``ctid`` 限批;授权见迁移 0165。
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                text(
+                    """
+                    DELETE FROM knowledge_task
+                    WHERE ctid IN (
+                        SELECT t.ctid
+                        FROM knowledge_task t
+                        WHERE t.status IN ('succeeded', 'failed', 'cancelled')
+                          AND coalesce(t.finished_at, t.updated_at)
+                              < now() - make_interval(days => :days)
+                        LIMIT :batch
+                    )
+                    """
+                ),
+                {"days": self._knowledge_task_retention_days, "batch": self._batch_size},
             )
             await session.commit()
         return result.rowcount or 0  # type: ignore[attr-defined]

@@ -13,9 +13,11 @@ All methods are tenant-scoped; knowledge bases are tenant-shared.
 from __future__ import annotations
 
 import abc
+import mimetypes
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Final
 from uuid import UUID
 
@@ -24,6 +26,8 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
     DocumentStatus,
+    IngestErrorCode,
+    IngestStage,
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeDocument,
@@ -46,6 +50,32 @@ UNSET: Final = _Unset()
 #: ``GET /v1/knowledge/bases`` endpoint (which also derives its ``truncated``
 #: response flag from it, so the two must never drift).
 ALL_TENANTS_BASES_LIMIT: Final = 200
+
+
+#: Python's built-in extension map only — ``mimetypes.guess_type`` also reads
+#: the host's ``mime.types``, so the same upload would get a different mime on
+#: a laptop, in CI and in the production image.
+_MIME_TYPES: Final = mimetypes.MimeTypes(filenames=())
+
+
+@dataclass(frozen=True)
+class DocumentFileFacts:
+    """What a store records about an uploaded file on insert — one helper so
+    the SQL and in-memory stores derive exactly the same values."""
+
+    title: str
+    mime: str | None
+    size_bytes: int | None
+
+    @classmethod
+    def of(cls, filename: str, content: bytes | None) -> DocumentFileFacts:
+        """Title = filename without its last extension; mime from the
+        extension (never the client's ``Content-Type``); size of ``content``
+        (``None`` when the caller passed no bytes, e.g. a pre-parsed corpus)."""
+        suffix = PurePosixPath(filename).suffix
+        title = filename[: -len(suffix)] if suffix and len(suffix) < len(filename) else filename
+        mime, _ = _MIME_TYPES.guess_type(filename, strict=False)
+        return cls(title=title, mime=mime, size_bytes=len(content) if content is not None else None)
 
 
 @dataclass(frozen=True)
@@ -252,7 +282,14 @@ class KnowledgeStore(abc.ABC):
         ``content_sha256`` equals the serving hash, nothing is touched and the
         document is returned as is (status still ``READY`` — the caller's
         signal to skip ingestion). ``force=True`` (explicit re-ingest)
-        resets regardless."""
+        resets regardless.
+
+        Model v2: a new document gets the tenant's next ``doc_seq`` (kept for
+        good — re-uploads keep it, deleted numbers are never reused; a row
+        from before ``doc_seq`` existed gets one on its next reset) and its
+        :class:`DocumentFileFacts`; any create or reset sets ``stage=queued``
+        and clears ``error_code``. ``size_bytes`` describes the serving
+        version, so a re-upload's bytes only count once they are promoted."""
 
     @abc.abstractmethod
     async def get_document(self, *, tenant_id: UUID, document_id: UUID) -> KnowledgeDocument | None:
@@ -304,12 +341,28 @@ class KnowledgeStore(abc.ABC):
         tenant_id: UUID,
         document_id: UUID,
         error: str,
+        error_code: IngestErrorCode | None = None,
         generation: int | None = None,
     ) -> bool:
-        """Mark a document ``FAILED`` and clear its lease — used when retries
-        are exhausted or the original bytes are unavailable. With
+        """Mark a document ``FAILED`` with ``error`` / ``error_code`` and clear
+        its lease — a terminal ingest failure, exhausted retries, or missing
+        original bytes. ``stage`` is left on the step that failed. With
         ``generation`` the write is fenced (see :meth:`set_document_status`).
         Returns whether a row was written."""
+
+    @abc.abstractmethod
+    async def set_document_stage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        stage: IngestStage,
+        generation: int | None = None,
+    ) -> bool:
+        """Record the pipeline step an ingest has reached. Fenced like
+        :meth:`set_document_status` when ``generation`` is given (``False`` =
+        the document is no longer this worker's — stop); unfenced otherwise
+        (a caller that owns the document outright, e.g. the eval runner)."""
 
     @abc.abstractmethod
     async def discard_pending(
@@ -318,15 +371,17 @@ class KnowledgeStore(abc.ABC):
         """Drop the pending upload and go back to the serving version: clears
         the pending slot and ``error``, bumps ``ingest_generation`` (an
         in-flight ingest of the dropped version is fenced out) and sets the
-        status to ``READY`` when serving chunks exist, else ``FAILED`` with a
-        note. ``None`` when the document does not exist; the document
-        unchanged when nothing was pending."""
+        status to ``READY`` (and ``stage=ready``) when serving chunks exist,
+        else ``FAILED`` with a note; ``error_code`` is cleared either way.
+        ``None`` when the document does not exist; the document unchanged
+        when nothing was pending."""
 
     @abc.abstractmethod
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
         """Cross-tenant: every ``processing`` document that has used up
         ``max_attempts`` and whose lease has expired goes ``FAILED``
-        (``error='ingest attempts exhausted'``). Such a document is no longer
+        (``error='ingest attempts exhausted'``,
+        ``error_code=attempts_exhausted``). Such a document is no longer
         claimable, so without this sweep it would sit in ``processing``
         forever (a crash on the last attempt). Returns the number swept.
         Caller wraps the call in a bypass-RLS scope."""
@@ -378,9 +433,10 @@ class KnowledgeStore(abc.ABC):
         was already settled) gets ``False`` and changes nothing.
 
         A fenced write that lands ``READY`` promotes the pending bytes into
-        the serving slot (``content``) in the same statement. A write that
-        lands ``FAILED`` touches neither slot nor the chunks: whatever was
-        serving keeps serving (see :meth:`upsert_document`)."""
+        the serving slot (``content``, and ``size_bytes``) in the same
+        statement. A write that lands ``FAILED`` touches neither slot nor the
+        chunks: whatever was serving keeps serving (see :meth:`upsert_document`).
+        ``READY`` also sets ``stage=ready`` and clears ``error_code``."""
 
     @abc.abstractmethod
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
@@ -401,7 +457,10 @@ class KnowledgeStore(abc.ABC):
     ) -> bool:
         """Replace all of a document's chunks with ``chunks`` — deletes
         the document's existing chunks, then inserts the new set, in one
-        transaction.
+        transaction. Every chunk column round-trips (heading path, content
+        hash, type, flags); the keyword index is built from each chunk's
+        ``retrieval_text`` (breadcrumb + body), so heading words stay
+        searchable while ``content`` is stored clean.
 
         Unfenced (``generation is None``): if the document no longer exists
         (deleted while an ingest was in flight) the write-back is rejected
@@ -423,6 +482,22 @@ class KnowledgeStore(abc.ABC):
         """A page of a document's chunks ordered by ``chunk_index`` plus the
         total count — for segment preview. The (large) embedding vector is
         omitted from the returned chunks (``embedding == ()``)."""
+
+    @abc.abstractmethod
+    async def chunk_embeddings_by_hash(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        content_hashes: Sequence[str],
+        embedding_model: str,
+    ) -> dict[str, tuple[float, ...]]:
+        """The stored vectors of this document's chunks whose ``content_hash``
+        is in ``content_hashes`` **and** that ``embedding_model`` produced — a
+        re-ingest reuses them instead of embedding unchanged chunks again,
+        never across a model change. Only the given document's chunks
+        (another document's identical text is not borrowed); hashes with no
+        matching chunk are absent."""
 
     @abc.abstractmethod
     async def search(

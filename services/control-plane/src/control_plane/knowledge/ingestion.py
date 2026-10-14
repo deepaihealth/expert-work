@@ -29,6 +29,7 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 12.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import multiprocessing
 from collections.abc import Callable, Sequence
@@ -48,7 +49,13 @@ from control_plane.knowledge.parsing import (
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
 from expert_work.persistence.rls import current_tenant_id_var
-from expert_work.protocol import DocumentStatus, KnowledgeChunk, KnowledgeDocument
+from expert_work.protocol import (
+    DocumentStatus,
+    IngestErrorCode,
+    IngestStage,
+    KnowledgeChunk,
+    KnowledgeDocument,
+)
 from orchestrator.llm import Embedder
 
 logger = logging.getLogger(__name__)
@@ -94,6 +101,23 @@ class StaleIngestionError(Exception):
     ``ingest_generation``) or already settled while this worker was busy.
     Nothing was written; the worker must stop quietly — the document now
     belongs to another claim."""
+
+
+#: ``error`` for a legacy document whose original bytes were not retained.
+CONTENT_MISSING_ERROR = "original file not retained; re-upload required"
+
+#: Attribute an exception is tagged with on its way out of a pipeline step,
+#: so the failure handler can record *why* without the exception changing
+#: type (callers such as the eval runner match on the original type).
+_ERROR_CODE_ATTR = "knowledge_error_code"
+
+
+def failure_code(exc: BaseException) -> IngestErrorCode:
+    """The ``error_code`` recorded for an ingest that failed with ``exc``."""
+    if isinstance(exc, DocumentParseError):
+        return exc.code
+    tagged = getattr(exc, _ERROR_CODE_ATTR, None)
+    return tagged if isinstance(tagged, IngestErrorCode) else IngestErrorCode.INTERNAL_ERROR
 
 
 def configure_parse_pool(*, workers: int, timeout_s: float) -> None:
@@ -241,13 +265,58 @@ async def _embed_slice_with_backoff(
 
 class _BackoffEmbedder:
     """Wraps an :class:`Embedder` so the semantic chunker's block embeddings
-    get the same retry policy as the chunk embeddings."""
+    get the same retry policy as the chunk embeddings. A final failure is
+    re-raised as is, tagged ``embedding_failed`` (see :func:`failure_code`)."""
 
     def __init__(self, inner: Embedder) -> None:
         self._inner = inner
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
-        return await embed_with_backoff(self._inner, texts, tenant_id=tenant_id)
+        try:
+            return await embed_with_backoff(self._inner, texts, tenant_id=tenant_id)
+        except Exception as exc:
+            setattr(exc, _ERROR_CODE_ATTR, IngestErrorCode.EMBEDDING_FAILED)
+            raise
+
+
+async def _advance(
+    store: KnowledgeStore,
+    *,
+    tenant_id: UUID,
+    document_id: UUID,
+    stage: IngestStage,
+    generation: int | None,
+) -> None:
+    """Record the stage the ingest reached; a refused (fenced) write means
+    the document is no longer ours — stop before doing the next step."""
+    if not await store.set_document_stage(
+        tenant_id=tenant_id, document_id=document_id, stage=stage, generation=generation
+    ):
+        msg = f"document {document_id} was re-uploaded or settled by another claim"
+        raise StaleIngestionError(msg)
+
+
+async def pin_embedder(embedder: Embedder, *, tenant_id: UUID) -> tuple[str | None, Embedder]:
+    """Fix one embedding model for a whole ingest / re-index: an embedder with
+    ``pin`` (the live-config ``DynamicResolvingEmbedder``) resolves once and
+    returns ``provider/model`` + an embedder bound to it; one with a
+    ``model_key`` attribute is already fixed; anything else (eval / test
+    doubles) has no known model → ``None``, and its chunks are never reused."""
+    pin = getattr(embedder, "pin", None)
+    if pin is not None:
+        try:
+            pinned: tuple[str, Embedder] = await pin(tenant_id=tenant_id)
+        except Exception as exc:
+            setattr(exc, _ERROR_CODE_ATTR, IngestErrorCode.EMBEDDING_FAILED)
+            raise
+        return pinned
+    model_key = getattr(embedder, "model_key", None)
+    return (model_key if isinstance(model_key, str) else None), embedder
+
+
+def content_hash(text: str) -> str:
+    """``knowledge_chunk.content_hash`` — sha256 of the retrieval text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 async def ingest_document_bytes(
@@ -275,11 +344,17 @@ async def ingest_document_bytes(
 
     :raises StaleIngestionError: the fenced write-back was rejected.
     """
-    markdown = (
-        parsed_markdown
-        if parsed_markdown is not None
-        else await parse_document_in_pool(filename, raw)
-    )
+    if parsed_markdown is not None:
+        markdown = parsed_markdown
+    else:
+        await _advance(
+            store,
+            tenant_id=tenant_id,
+            document_id=document_id,
+            stage=IngestStage.PARSING,
+            generation=generation,
+        )
+        markdown = await parse_document_in_pool(filename, raw)
     return await ingest_markdown(
         store=store,
         embedder=embedder,
@@ -310,16 +385,25 @@ async def ingest_markdown(
     The post-parse half of :func:`ingest_document_bytes`, exposed so a caller
     that parses elsewhere (the eval runner, an OCR path) still runs the exact
     production chunk / embed / store path. Same fence semantics.
+
+    Chunks are stored with a clean body plus their heading path; the embedded
+    / indexed text is the two joined (``KnowledgeChunk.retrieval_text``). A
+    chunk whose retrieval text is unchanged from the version being replaced
+    keeps its stored vector (matched by ``content_hash`` **and** the pinned
+    embedding model) instead of being embedded again.
     """
-    retrying = _BackoffEmbedder(embedder)
-    chunk_texts = await chunk_markdown_semantic(
+    model_key, pinned = await pin_embedder(embedder, tenant_id=tenant_id)
+    retrying = _BackoffEmbedder(pinned)
+    stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
+    await _advance(store, stage=IngestStage.CHUNKING, **stage_args)
+    pieces = await chunk_markdown_semantic(
         strip_lone_surrogates(markdown),
         max_tokens=chunk_max_tokens,
         overlap_tokens=chunk_overlap_tokens,
         embedder=retrying,
         tenant_id=tenant_id,
     )
-    if not chunk_texts:
+    if not pieces:
         _ensure_written(
             await store.replace_chunks(
                 tenant_id=tenant_id, document_id=document_id, chunks=[], generation=generation
@@ -327,7 +411,18 @@ async def ingest_markdown(
             document_id,
         )
         return 0
-    embeddings = await retrying.embed(chunk_texts, tenant_id=tenant_id)
+    await _advance(store, stage=IngestStage.EMBEDDING, **stage_args)
+    texts = [piece.text for piece in pieces]
+    hashes = [content_hash(text) for text in texts]
+    vectors = await _vectors_for(
+        store,
+        retrying,
+        tenant_id=tenant_id,
+        document_id=document_id,
+        texts=texts,
+        hashes=hashes,
+        model_key=model_key,
+    )
     chunks = [
         KnowledgeChunk(
             id=uuid4(),
@@ -335,11 +430,15 @@ async def ingest_markdown(
             kb_id=kb_id,
             document_id=document_id,
             chunk_index=index,
-            content=text,
-            embedding=embedding,
+            content=piece.body,
+            heading_path=piece.heading_path,
+            content_hash=digest,
+            embedding=vectors[digest],
+            embedding_model=model_key,
         )
-        for index, (text, embedding) in enumerate(zip(chunk_texts, embeddings, strict=True))
+        for index, (piece, digest) in enumerate(zip(pieces, hashes, strict=True))
     ]
+    await _advance(store, stage=IngestStage.INDEXING, **stage_args)
     _ensure_written(
         await store.replace_chunks(
             tenant_id=tenant_id, document_id=document_id, chunks=chunks, generation=generation
@@ -347,6 +446,46 @@ async def ingest_markdown(
         document_id,
     )
     return len(chunks)
+
+
+async def _vectors_for(
+    store: KnowledgeStore,
+    embedder: Embedder,
+    *,
+    tenant_id: UUID,
+    document_id: UUID,
+    texts: Sequence[str],
+    hashes: Sequence[str],
+    model_key: str | None,
+) -> dict[str, tuple[float, ...]]:
+    """One vector per distinct hash: the document's stored vectors for
+    unchanged chunks made by the same model, fresh embeddings for the rest
+    (each distinct text once). No known model → nothing is reused."""
+    vectors = (
+        await store.chunk_embeddings_by_hash(
+            tenant_id=tenant_id,
+            document_id=document_id,
+            content_hashes=hashes,
+            embedding_model=model_key,
+        )
+        if model_key is not None
+        else {}
+    )
+    missing = dict(zip(hashes, texts, strict=True))
+    for digest in vectors:
+        missing.pop(digest, None)
+    if missing:
+        fresh = await embedder.embed(list(missing.values()), tenant_id=tenant_id)
+        vectors.update(zip(missing, fresh, strict=True))
+    # The only place a live check can see reuse: an embedding API returns the
+    # same vector for the same text, so comparing stored vectors cannot tell.
+    logger.info(
+        "knowledge.ingest_vectors document=%s reused=%d embedded=%d",
+        document_id,
+        len(set(hashes)) - len(missing),
+        len(missing),
+    )
+    return vectors
 
 
 def _ensure_written(written: bool, document_id: UUID) -> None:
@@ -501,7 +640,8 @@ class KnowledgeIngestionRunner:
                     await self._store.mark_document_failed_terminal(
                         tenant_id=tenant_id,
                         document_id=document_id,
-                        error="original file not retained; re-upload required",
+                        error=CONTENT_MISSING_ERROR,
+                        error_code=IngestErrorCode.CONTENT_MISSING,
                         generation=claim.generation,
                     )
                     return
@@ -588,6 +728,7 @@ class KnowledgeIngestionRunner:
                 tenant_id=tenant_id,
                 document_id=document_id,
                 error=str(exc)[:_ERROR_CAP],
+                error_code=failure_code(exc),
                 generation=claim.generation,
             )
         finally:
@@ -605,12 +746,23 @@ class KnowledgeIngestionRunner:
         token = current_tenant_id_var.set(tenant_id)
         failed = False
         try:
+            # One model for the whole base; every rebuilt chunk is tagged with it.
+            try:
+                model_key, pinned = await pin_embedder(self._embedder, tenant_id=tenant_id)
+            except Exception:
+                logger.warning("knowledge.reindex_pin_failed kb=%s", kb_id, exc_info=True)
+                return  # nothing re-embedded; the model stays unstamped
             documents = await self._store.list_documents(tenant_id=tenant_id, kb_id=kb_id)
             for document in documents:
                 if document.status is not DocumentStatus.READY:
                     continue  # only documents with chunks can be re-embedded
                 try:
-                    await self._reindex_document(tenant_id=tenant_id, document=document)
+                    await self._reindex_document(
+                        tenant_id=tenant_id,
+                        document=document,
+                        embedder=pinned,
+                        model_key=model_key,
+                    )
                 except Exception:
                     # replace_chunks is transactional — a failed re-embed (e.g.
                     # a model whose dimension differs from the fixed column) rolls
@@ -636,23 +788,25 @@ class KnowledgeIngestionRunner:
             await self._store.clear_reindex(tenant_id=tenant_id, kb_id=kb_id)
             current_tenant_id_var.reset(token)
 
-    async def _reindex_document(self, *, tenant_id: UUID, document: KnowledgeDocument) -> None:
+    async def _reindex_document(
+        self,
+        *,
+        tenant_id: UUID,
+        document: KnowledgeDocument,
+        embedder: Embedder,
+        model_key: str | None,
+    ) -> None:
         document_id = document.id
         existing = await self._collect_chunks(tenant_id=tenant_id, document_id=document_id)
         if not existing:
             return
-        texts = [chunk.content for chunk in existing]
-        embeddings = await embed_with_backoff(self._embedder, texts, tenant_id=tenant_id)
+        # The retrieval text (breadcrumb + body) is what the vectors encode.
+        texts = [chunk.retrieval_text for chunk in existing]
+        embeddings = await embed_with_backoff(embedder, texts, tenant_id=tenant_id)
+        # Only the vector (and the model that made it) changes — heading path,
+        # hash, type and flags stay.
         rebuilt = [
-            KnowledgeChunk(
-                id=chunk.id,
-                tenant_id=tenant_id,
-                kb_id=chunk.kb_id,
-                document_id=document_id,
-                chunk_index=chunk.chunk_index,
-                content=chunk.content,
-                embedding=embedding,
-            )
+            chunk.model_copy(update={"embedding": embedding, "embedding_model": model_key})
             for chunk, embedding in zip(existing, embeddings, strict=True)
         ]
         # Fenced on the generation we read: a re-upload that landed while we
