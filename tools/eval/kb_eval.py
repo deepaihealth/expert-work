@@ -68,6 +68,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from kb_dataset import (  # type: ignore[import-not-found]
     KbCase,
     KbDataset,
+    KbExpected,
     load_dataset,
 )
 from kb_metrics import (  # type: ignore[import-not-found]
@@ -75,6 +76,10 @@ from kb_metrics import (  # type: ignore[import-not-found]
     aggregate,
     grouped,
     score_case,
+)
+from kb_rerank import (  # type: ignore[import-not-found]
+    CachedRerankClient,
+    build_dashscope_reranker,
 )
 from longmem.download import file_sha256  # type: ignore[import-not-found]
 from longmem.embedders import (  # type: ignore[import-not-found]
@@ -109,6 +114,7 @@ PGVECTOR_IMAGE = "ghcr.io/deepaihealth/mirror/pgvector:pg16"
 ALEMBIC_INI = _REPO_ROOT / "packages" / "expert-work-persistence" / "alembic.ini"
 EVAL_OUT_DIR = Path("eval-out") / "kb"
 EMBED_CACHE_DB = EVAL_OUT_DIR / "embed_cache.sqlite"
+RERANK_CACHE_DB = EVAL_OUT_DIR / "rerank_cache.sqlite"
 #: 不让 ``CachedEmbedder`` 截断输入:超长文本由真嵌入 API 报错,这边只计数。
 EMBED_MAX_TEXT_CHARS = 1_000_000
 #: 「超长」计数线 = ``CachedEmbedder`` 原来的截断线(DashScope 单条 8192 token)。
@@ -140,6 +146,8 @@ class EvalConfig:
     top_k: int = DEFAULT_TOP_K
     threshold: float | None = None
     rerank: bool = False
+    #: off | llm(聊天模型排序)| dashscope(生产同款 ``qwen3-vl-rerank``,带缓存)
+    rerank_mode: str = "off"
 
 
 @dataclass(frozen=True)
@@ -216,6 +224,22 @@ class AnchorReport:
     @property
     def dead_cases(self) -> frozenset[str]:
         return frozenset(d.case_id for d in self.dead)
+
+
+@dataclass(frozen=True)
+class TooCommonAnchor:
+    case_id: str
+    document: str
+    n_docs: int  # 含该锚文本的已入库文档数
+
+
+@dataclass(frozen=True)
+class AnchorDocsReport:
+    """锚文本判对的扩展记账:多少条期望 / 多少道题多了可接受文档,哪些锚文本太常见没扩展。"""
+
+    expanded: int
+    expanded_cases: int
+    too_common: tuple[TooCommonAnchor, ...]
 
 
 @dataclass(frozen=True)
@@ -629,6 +653,56 @@ async def _all_chunk_texts(
             return texts
 
 
+#: 一段锚文本出现在超过这么多份已入库文档里,就太常见 —— 拿它判对会把不相干的文档也算对,
+#: 只报告、不扩展。
+MAX_ANCHOR_DOCS = 5
+
+
+async def resolve_anchor_documents(
+    *,
+    store: KnowledgeStore,
+    tenant_id: UUID,
+    kb_id: UUID,
+    dataset: KbDataset,
+    max_docs: int = MAX_ANCHOR_DOCS,
+) -> tuple[KbDataset, AnchorDocsReport]:
+    """把「含同一锚文本的其他已入库文档」填进每条期望的 ``also``。
+
+    评测集只手列了答案所在的几份文档;内容重复的文档(同一份 FAQ 的两个版本)排在前面时,
+    按文件名判就会算错 —— 10-14 实测产品 FAQ 题里 33 道排第一的是没列的 FAQ-2026。
+    一份文档的各段用 ``\x00`` 连起来再查,锚文本不会跨段误配。
+    """
+    texts: dict[str, str] = {}
+    for doc in await store.list_documents(tenant_id=tenant_id, kb_id=kb_id):
+        if doc.status is DocumentStatus.READY:
+            chunks = await _all_chunk_texts(store, tenant_id=tenant_id, document_id=doc.id)
+            texts[doc.filename] = "\x00".join(chunks)
+    expanded = 0
+    expanded_cases = 0
+    too_common: list[TooCommonAnchor] = []
+    cases: list[KbCase] = []
+    for case in dataset.cases:
+        resolved: list[KbExpected] = []
+        for exp in case.expected:
+            holders = {name for name, text in texts.items() if exp.anchor in text}
+            others = holders - {exp.document}
+            if others and len(holders) > max_docs:
+                too_common.append(TooCommonAnchor(case.id, exp.document, len(holders)))
+                resolved.append(exp)
+            elif others:
+                resolved.append(replace(exp, also=frozenset(others)))
+                expanded += 1
+            else:
+                resolved.append(exp)
+        if tuple(resolved) != case.expected:
+            expanded_cases += 1
+        cases.append(replace(case, expected=tuple(resolved)))
+    report = AnchorDocsReport(
+        expanded=expanded, expanded_cases=expanded_cases, too_common=tuple(too_common)
+    )
+    return replace(dataset, cases=tuple(cases)), report
+
+
 # ---------------------------------------------------------------------------
 # 打分
 # ---------------------------------------------------------------------------
@@ -705,6 +779,7 @@ def summarise(
     *,
     corpus: CorpusReport | None,
     anchors: AnchorReport | None = None,
+    anchor_docs: AnchorDocsReport | None = None,
     embedder: str = "unknown",
     config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -723,6 +798,11 @@ def summarise(
             "dead_cases": len(anchors.dead_cases),
             "dead": [asdict(d) for d in anchors.dead],
         }
+    if anchor_docs is not None:
+        anchors_block = dict(anchors_block or {})
+        anchors_block["expanded"] = anchor_docs.expanded
+        anchors_block["expanded_cases"] = anchor_docs.expanded_cases
+        anchors_block["too_common"] = [asdict(t) for t in anchor_docs.too_common]
     return {
         "overall": aggregate(scores),
         "by_source": grouped((r.source, r.score) for r in rows),
@@ -739,6 +819,10 @@ _BASELINE_VOLATILE: tuple[tuple[str, str], ...] = (
     ("corpus", "base_id"),
     ("corpus", "elapsed_s"),
     ("config", "label"),
+    ("rerank", "calls"),
+    ("rerank", "cache_hits"),
+    ("rerank", "tokens"),
+    ("rerank", "cost_cny"),
 )
 
 
@@ -876,7 +960,7 @@ def fingerprint(
         "method": cfg.method.value,
         "top_k": cfg.top_k,
         "threshold": cfg.threshold,
-        "rerank": cfg.rerank,
+        "rerank": cfg.rerank_mode,
     }
 
 
@@ -1058,6 +1142,20 @@ def build_reranker(enabled: bool) -> Reranker | None:
     return LLMReranker(llm_caller=cast(LLMCaller, caller))
 
 
+def baseline_benchmark(dataset_name: str, rerank_mode: str) -> str:
+    """基线文件里的条目名:不开重排(召回层)用评测集名;开了重排(最终排序)另起一条,
+    两层口径互不覆盖。"""
+    return dataset_name if rerank_mode == "off" else f"{dataset_name}@rerank-{rerank_mode}"
+
+
+def build_rerank_mode(mode: str) -> tuple[Reranker | None, CachedRerankClient | None]:
+    """``--rerank`` 的三种取法;``dashscope`` 另返回缓存客户端,汇总里记调用与费用。"""
+    if mode == "dashscope":
+        reranker, client = build_dashscope_reranker(cache_path=RERANK_CACHE_DB)
+        return reranker, client
+    return build_reranker(mode == "llm"), None
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1083,7 +1181,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--threshold", type=float, default=None, help="向量路相似度下限")
-    parser.add_argument("--rerank", default="off", choices=("off", "on"))
+    parser.add_argument(
+        "--rerank",
+        default="off",
+        choices=("off", "on", "llm", "dashscope"),
+        help="dashscope = 生产同款 qwen3-vl-rerank(带缓存);llm = 聊天模型排序(on 是它的旧名)",
+    )
+    parser.add_argument(
+        "--doc-match",
+        default="anchor",
+        choices=("anchor", "listed"),
+        help="anchor = 含同一锚文本的已入库文档都算对(默认);listed = 只认评测集手列的文档",
+    )
     parser.add_argument(
         "--ann",
         action="store_true",
@@ -1164,6 +1273,17 @@ async def _run(
             anchors = await check_anchors(
                 store=store, tenant_id=EVAL_TENANT_ID, kb_id=report.base_id, dataset=dataset
             )
+            anchor_docs: AnchorDocsReport | None = None
+            if args.doc_match == "anchor":
+                dataset, anchor_docs = await resolve_anchor_documents(
+                    store=store, tenant_id=EVAL_TENANT_ID, kb_id=report.base_id, dataset=dataset
+                )
+                print(
+                    f"anchor docs: {anchor_docs.expanded} expectations in "
+                    f"{anchor_docs.expanded_cases} cases gained other documents holding the "
+                    f"anchor; {len(anchor_docs.too_common)} anchors too common to use",
+                    file=sys.stderr,
+                )
             retriever = build_retriever(
                 store=store, embedder=bundle.embedder, reranker=reranker, top_k=cfg.top_k
             )
@@ -1180,15 +1300,23 @@ async def _run(
     config = {
         "store": args.store,
         "vector_search": "ann" if args.ann else "exact",
+        "doc_match": args.doc_match,
         "tiers": list(tiers),
         "limit_docs": args.limit_docs,
         "method": cfg.method.value,
         "top_k": cfg.top_k,
         "threshold": cfg.threshold,
-        "rerank": cfg.rerank,
+        "rerank": cfg.rerank_mode,
         "label": args.label,
     }
-    summary = summarise(rows, corpus=report, anchors=anchors, embedder=bundle.tag, config=config)
+    summary = summarise(
+        rows,
+        corpus=report,
+        anchors=anchors,
+        anchor_docs=anchor_docs,
+        embedder=bundle.tag,
+        config=config,
+    )
     return rows, summary, report
 
 
@@ -1207,14 +1335,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.baseline_out is not None
         else _EVAL_DIR / "baselines" / f"kb_{dataset.name}_baseline.yaml"
     )
+    rerank_mode = "llm" if args.rerank == "on" else args.rerank
     cfg = EvalConfig(
         method=RetrievalMethod(args.method),
         top_k=args.top_k,
         threshold=args.threshold,
-        rerank=args.rerank == "on",
+        rerank=rerank_mode != "off",
+        rerank_mode=rerank_mode,
     )
     bundle = build_embedder(args.embedder, concurrency=args.concurrency)
-    reranker = build_reranker(cfg.rerank)
+    reranker, rerank_client = build_rerank_mode(rerank_mode)
 
     rows, summary, report = asyncio.run(
         _run(
@@ -1228,6 +1358,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             reranker=reranker,
         )
     )
+    if rerank_client is not None:
+        summary["rerank"] = {"model": cast(Any, reranker).model, **rerank_client.stats()}
+        print(f"rerank: {summary['rerank']}", file=sys.stderr)
     write_jsonl(out, rows, summary)
     print(format_summary_table(summary))
     print(f"results: {out}")
@@ -1241,7 +1374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         update_baseline(
             baseline_out,
             tier="kb",
-            benchmark=dataset.name,
+            benchmark=baseline_benchmark(dataset.name, cfg.rerank_mode),
             section=baseline_section(summary),
             fingerprint=fingerprint(
                 dataset_path=args.dataset,

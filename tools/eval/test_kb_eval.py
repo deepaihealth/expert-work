@@ -18,19 +18,22 @@ from uuid import UUID, uuid4
 import pytest
 import yaml
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
-from kb_dataset import load_dataset  # type: ignore[import-not-found]
+from kb_dataset import KbCase, KbDataset, KbExpected, load_dataset  # type: ignore[import-not-found]
 from kb_eval import (  # type: ignore[import-not-found]
     EMBED_OVERLONG_CHARS,
     CaseRow,
     CountingEmbedder,
     EmbeddingDimensionError,
     EvalConfig,
+    _build_parser,
+    baseline_benchmark,
     build_corpus,
     build_fake_embedder,
     build_retriever,
     check_anchors,
     fingerprint,
     main,
+    resolve_anchor_documents,
     rls_tenant,
     run_eval,
     select_rows,
@@ -922,3 +925,111 @@ def test_main_real_embedder_needs_env(
     )
     with pytest.raises(SystemExit, match="EXPERT_WORK_EVAL_EMBED"):
         main(argv)
+
+
+# ---------------------------------------------------------------------------
+# 锚文本判对(B-175 波 2 PR0):含同一锚文本的其他文档也算对
+# ---------------------------------------------------------------------------
+
+_SHARED = "益生菌可通过正常饮食摄入"
+_COMMON = "请遵医嘱"
+
+
+async def _seed_docs(store: InMemoryKnowledgeStore, tenant: UUID, docs: dict[str, str]) -> UUID:
+    from control_plane.knowledge.ingestion import ingest_markdown
+
+    embedder = build_fake_embedder()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    for filename, text in docs.items():
+        doc = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename=filename, content=None
+        )
+        count = await ingest_markdown(
+            store=store,
+            embedder=embedder,
+            tenant_id=tenant,
+            document_id=doc.id,
+            kb_id=base.id,
+            markdown=text,
+            chunk_max_tokens=base.chunk_max_tokens,
+            chunk_overlap_tokens=base.chunk_overlap_tokens,
+        )
+        await store.set_document_status(
+            tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=count
+        )
+    return base.id
+
+
+def _one_case_dataset(*expected: tuple[str, str]) -> KbDataset:
+    return KbDataset(
+        name="kb",
+        corpus_manifest=None,
+        corpus_tiers=("A",),
+        cases=(
+            KbCase(
+                id="q1",
+                query="益生菌怎么补",
+                source="faq",
+                tags=(),
+                expected=tuple(KbExpected(document=d, anchor=a, page=None) for d, a in expected),
+                answer=None,
+            ),
+        ),
+    )
+
+
+async def test_resolve_anchor_documents_adds_other_documents_holding_the_anchor() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with rls_tenant(tenant):
+        kb_id = await _seed_docs(
+            store,
+            tenant,
+            {
+                "faq-2025.md": f"# 问答\n\n{_SHARED},不必额外补充。\n",
+                "faq-2026.md": f"# 问答\n\n{_SHARED},不必额外补充。\n",
+                "notes.md": "# 其他\n\n只有这里写了冷藏保存。\n",
+            },
+        )
+        resolved, report = await resolve_anchor_documents(
+            store=store,
+            tenant_id=tenant,
+            kb_id=kb_id,
+            dataset=_one_case_dataset(("faq-2025.md", _SHARED), ("notes.md", "冷藏保存")),
+        )
+    shared, unique = resolved.cases[0].expected
+    assert shared.documents == frozenset({"faq-2025.md", "faq-2026.md"})
+    assert unique.documents == frozenset({"notes.md"})
+    assert (report.expanded, report.expanded_cases, report.too_common) == (1, 1, ())
+
+
+async def test_resolve_anchor_documents_leaves_a_too_common_anchor_alone() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with rls_tenant(tenant):
+        kb_id = await _seed_docs(
+            store,
+            tenant,
+            {f"doc{i}.md": f"# 说明\n\n第 {i} 款,{_COMMON}。\n" for i in range(3)},
+        )
+        resolved, report = await resolve_anchor_documents(
+            store=store,
+            tenant_id=tenant,
+            kb_id=kb_id,
+            dataset=_one_case_dataset(("doc0.md", _COMMON)),
+            max_docs=2,
+        )
+    assert resolved.cases[0].expected[0].documents == frozenset({"doc0.md"})
+    assert report.expanded == 0
+    assert [(t.case_id, t.document, t.n_docs) for t in report.too_common] == [("q1", "doc0.md", 3)]
+
+
+def test_main_records_doc_match_mode_in_config(tmp_path: Path) -> None:
+    parser = _build_parser()
+    assert parser.parse_args(["--dataset", "x.yaml"]).doc_match == "anchor"
+    assert parser.parse_args(["--dataset", "x.yaml", "--doc-match", "listed"]).doc_match == "listed"
+
+
+def test_baseline_keeps_recall_and_final_ranking_apart() -> None:
+    assert baseline_benchmark("huada_v1", "off") == "huada_v1"
+    assert baseline_benchmark("huada_v1", "dashscope") == "huada_v1@rerank-dashscope"

@@ -37,11 +37,19 @@ class KbDatasetError(ValueError):
 
 @dataclass(frozen=True)
 class KbExpected:
-    """一条期望命中:文档名 + 期望段落里的原文子串 + 页码(P5 之前恒为 None)。"""
+    """一条期望命中:文档名 + 期望段落里的原文子串 + 页码(P5 之前恒为 None)。
+
+    ``also`` 不来自评测集文件,由运行器入库后填:含同一锚文本的其他文档(同一份 FAQ 的两个
+    版本之类),它们排在前面也算对。"""
 
     document: str
     anchor: str
     page: int | None
+    also: frozenset[str] = frozenset()
+
+    @property
+    def documents(self) -> frozenset[str]:
+        return frozenset({self.document}) | self.also
 
 
 @dataclass(frozen=True)
