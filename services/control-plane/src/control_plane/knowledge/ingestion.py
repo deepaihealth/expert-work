@@ -142,6 +142,16 @@ def shutdown_parse_pool(*, kill: bool = False) -> None:
     executor.shutdown(wait=False, cancel_futures=True)
 
 
+def _discard_parse_pool(executor: Executor) -> None:
+    """Kill and drop ``executor`` — but only while it is still the current
+    pool. Concurrent parses all see the same broken (or wedged) pool; the
+    first to react replaces it, and a later one must not kill the
+    replacement, which would break the parses already resubmitted to it
+    (B-184: one dead worker failed several documents for good)."""
+    if _parse_executor is executor:
+        shutdown_parse_pool(kill=True)
+
+
 def _terminate_workers(executor: Executor) -> None:
     # ``ProcessPoolExecutor`` has no public kill; its ``_processes`` map is
     # the stable-enough way to reach the workers (guarded: a thread pool or a
@@ -184,14 +194,16 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
       otherwise hold its slot until the pod restarts.
     * A pool broken by a crashed worker (PyMuPDF segfault, OOM kill) is
       rebuilt and the parse retried once — the crash is the pool's, not
-      necessarily this document's.
+      necessarily this document's. Only the parse that finds the broken pool
+      still current rebuilds it; the others retry on the replacement.
     """
     async with _get_parse_slots():
         for attempt in (1, 2):
             loop = asyncio.get_running_loop()
+            executor = _get_parse_executor()
             try:
                 # ``submit`` itself raises on a broken pool — keep it in the try.
-                future = loop.run_in_executor(_get_parse_executor(), parse_document, filename, raw)
+                future = loop.run_in_executor(executor, parse_document, filename, raw)
                 return await asyncio.wait_for(future, timeout=_parse_timeout_s)
             except TimeoutError as exc:
                 logger.warning(
@@ -199,7 +211,7 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
                     filename,
                     _parse_timeout_s,
                 )
-                shutdown_parse_pool(kill=True)
+                _discard_parse_pool(executor)
                 msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
                 raise DocumentParseError(msg) from exc
             except BrokenProcessPool:
@@ -208,7 +220,7 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
                     filename,
                     attempt,
                 )
-                shutdown_parse_pool(kill=True)
+                _discard_parse_pool(executor)
                 if attempt == 2:
                     raise
     raise AssertionError("unreachable")  # pragma: no cover
