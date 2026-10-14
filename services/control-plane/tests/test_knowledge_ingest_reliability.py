@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
-from typing import cast
+from typing import ClassVar, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -657,3 +659,63 @@ async def test_concurrent_pdf_ingests_all_ready() -> None:
         assert fetched is not None
         assert fetched.status is DocumentStatus.READY, fetched.error
         assert fetched.chunk_count >= 1
+
+
+class _KillablePool:
+    """Executor double for a pool shared by concurrent parses: each parse
+    resolves a beat after submit unless the pool's workers are killed first,
+    which breaks every parse still pending in it (as a real terminate does)."""
+
+    created: ClassVar[list[_KillablePool]] = []
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._processes = {1: _FakeProcess(), 2: _FakeProcess()}
+        self.pending: list[concurrent.futures.Future[str]] = []
+        _KillablePool.created.append(self)
+
+    def submit(self, fn: object, *args: object) -> concurrent.futures.Future[str]:
+        future: concurrent.futures.Future[str] = concurrent.futures.Future()
+        self.pending.append(future)
+
+        def _finish() -> None:
+            if not future.done():
+                future.set_result("# 标题\n\n正文")
+
+        asyncio.get_running_loop().call_later(0.05, _finish)
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        if any(p.terminated for p in self._processes.values()):
+            for future in self.pending:
+                if not future.done():
+                    future.set_exception(BrokenProcessPool("worker terminated"))
+
+    def break_all(self) -> None:
+        for future in self.pending:
+            future.set_exception(BrokenProcessPool("a child process terminated abruptly"))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_parses_survive_one_broken_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two parses share a pool when a worker dies: both get BrokenProcessPool.
+    The first to react rebuilds the pool and resubmits; the second must retry
+    on that new pool, not kill it — killing it broke the first one's retry and
+    failed both documents for good (B-184, 10-14 test stack: 3 of 200 real
+    PDFs failed this way and all three ingested fine when re-run)."""
+    _KillablePool.created = []
+    monkeypatch.setattr(ingestion, "ProcessPoolExecutor", _KillablePool)
+    monkeypatch.setattr(ingestion, "_parse_workers", 2)
+    monkeypatch.setattr(ingestion, "_parse_slots", None)
+    broken = _KillablePool()
+    monkeypatch.setattr(ingestion, "_parse_executor", broken)
+
+    first = asyncio.create_task(ingestion.parse_document_in_pool("a.pdf", b"a"))
+    second = asyncio.create_task(ingestion.parse_document_in_pool("b.pdf", b"b"))
+    while len(broken.pending) < 2:
+        await asyncio.sleep(0)
+    broken.break_all()
+
+    assert list(await asyncio.gather(first, second)) == ["# 标题\n\n正文", "# 标题\n\n正文"]
+    assert len(_KillablePool.created) == 2  # the broken pool + exactly one rebuild
