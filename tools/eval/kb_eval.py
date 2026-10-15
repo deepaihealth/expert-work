@@ -99,7 +99,12 @@ from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import DocumentStatus, RetrievalMethod
 from orchestrator.llm import Embedder, LLMCaller
 from orchestrator.llm.embedder import QWEN_EMBEDDING_BASE_URL
-from orchestrator.tools.knowledge import KnowledgeRetriever, Reranker, RetrievedChunk
+from orchestrator.tools.knowledge import (
+    KnowledgeRetriever,
+    Reranker,
+    RetrievedChunk,
+    default_recall_depth,
+)
 
 _EVAL_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _EVAL_DIR.parents[1]
@@ -733,8 +738,9 @@ def build_retriever(
     reranker: Reranker | None,
     top_k: int = DEFAULT_TOP_K,
 ) -> KnowledgeRetriever:
-    """两路各召回 ``recall_limit`` 再融合;``top_k`` 大于默认召回宽度时把宽度抬到 ``top_k``。"""
-    recall_limit = max(KnowledgeRetriever.recall_limit, top_k)
+    """两路召回深度跟生产同一个默认(:func:`default_recall_depth`);只有 ``top_k`` 超过它时
+    才把深度抬到 ``top_k``,否则前 k 名凑不满。"""
+    recall_limit = top_k if top_k > default_recall_depth(top_k) else None
     return KnowledgeRetriever(
         store=store, embedder=embedder, reranker=reranker, recall_limit=recall_limit
     )

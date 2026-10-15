@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import operator
+import re
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -11,6 +13,7 @@ from uuid import UUID
 
 from sqlalchemy import (
     Float,
+    Row,
     Select,
     Text,
     and_,
@@ -22,11 +25,12 @@ from sqlalchemy import (
     literal_column,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import CTE
@@ -70,9 +74,32 @@ from expert_work.protocol import (
     ScoredChunk,
 )
 
+logger = logging.getLogger(__name__)
+
 #: Postgres text-search config — chunks are pre-segmented app-side, so
 #: ``simple`` (no stemming / stopwords) is the correct universal config.
 _TS_CONFIG = "simple"
+
+#: ``hnsw.ef_search`` for vector recall (raised to the request's ``limit`` when
+#: deeper). An HNSW scan returns at most ef_search rows *before* the tenant /
+#: base filter, and the server default (40) is below the retriever's default
+#: recall depth (50). 200 = twice the deepest default recall (100), so even
+#: without iterative scan a filtered scan has headroom; it is still far below
+#: pgvector's cap (1000) and costs a few ms per query.
+_HNSW_EF_SEARCH = 200
+#: pgvector rejects ``hnsw.ef_search`` above this.
+_HNSW_EF_SEARCH_MAX = 1000
+#: pgvector >= 0.8: keep scanning the index until ``limit`` rows survive the
+#: filter (a small tenant in a big table), in exact distance order.
+_HNSW_ITERATIVE_SCAN_GUC = "hnsw.iterative_scan"
+_HNSW_ITERATIVE_SCAN = "strict_order"
+_ITERATIVE_SCAN_MIN_VERSION = (0, 8)
+#: SQLSTATEs that mean the server refused the setting itself — the only
+#: failures that turn iterative scan off: 22023 invalid value, 42602 a name
+#: under an extension's reserved prefix that this build does not define (what
+#: pgvector < 0.8 answers for ``hnsw.iterative_scan``), 42704 unrecognized
+#: parameter. Anything else (dropped connection, timeout, ...) propagates.
+_SETTING_REJECTED_SQLSTATES = frozenset({"22023", "42602", "42704"})
 
 #: Terminal ingestion states — reaching one clears the durability lease so the
 #: document is never re-claimed.
@@ -331,11 +358,41 @@ def _kb_hits(
     return select(matched.c.id, *hits, base.label("base")).cte("hits").prefix_with("MATERIALIZED")
 
 
+def _parse_vector_version(raw: str | None) -> tuple[int, ...]:
+    """pgvector version as integers (``"0.8.0.2"`` → ``(0, 8, 0, 2)``) so it
+    compares numerically; ``()`` when missing, which never enables
+    version-gated settings."""
+    return tuple(int(part) for part in re.findall(r"\d+", raw or ""))
+
+
+async def _read_vector_version(session: AsyncSession) -> tuple[int, ...]:
+    raw = (
+        await session.execute(text("SELECT extversion FROM pg_extension WHERE extname = 'vector'"))
+    ).scalar_one_or_none()
+    return _parse_vector_version(raw)
+
+
+async def _set_hnsw_scan(session: AsyncSession, limit: int, *, iterative: bool) -> None:
+    """HNSW scan settings for the vector SELECT that follows in this session's
+    transaction — ``set_config(..., true)`` is transaction-local, so nothing
+    leaks into pooled connections. One statement, one round trip."""
+    sql = "SELECT set_config('hnsw.ef_search', :ef_search, true)"
+    params = {"ef_search": str(min(max(_HNSW_EF_SEARCH, limit), _HNSW_EF_SEARCH_MAX))}
+    if iterative:
+        sql += f", set_config('{_HNSW_ITERATIVE_SCAN_GUC}', :iterative_scan, true)"
+        params["iterative_scan"] = _HNSW_ITERATIVE_SCAN
+    await session.execute(text(sql), params)
+
+
 class SqlKnowledgeStore(KnowledgeStore):
     """Postgres-backed knowledge repository (pgvector)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sf = session_factory
+        #: Installed pgvector version, read on the first vector search.
+        self._vector_version: tuple[int, ...] | None = None
+        #: Set when the server refused ``hnsw.iterative_scan``; never sent again.
+        self._iterative_scan_rejected = False
 
     # -- knowledge bases ----------------------------------------------------
 
@@ -1273,14 +1330,48 @@ class SqlKnowledgeStore(KnowledgeStore):
             .order_by(distance)
             .limit(limit)
         )
-        async with self._sf() as session:
-            rows = (await session.execute(stmt)).all()
+        rows = await self._vector_rows(stmt, limit)
         return [
             ScoredChunk(
                 chunk=_to_chunk_with_embedding(row), score=1.0 - float(dist), source="vector"
             )
             for row, dist in rows
         ]
+
+    async def _vector_rows(self, stmt: Select[Any], limit: int) -> Sequence[Row[Any]]:
+        """Run the vector SELECT after the HNSW scan settings, in one transaction.
+
+        ``hnsw.ef_search`` is always safe (the HNSW index exists, so pgvector
+        >= 0.5). ``hnsw.iterative_scan`` is sent on pgvector >= 0.8; if the
+        server still refuses it (:data:`_SETTING_REJECTED_SQLSTATES`), that
+        transaction is aborted: warn once, stop sending it for this store, and
+        redo the search in a fresh transaction with ef_search only. Any other
+        error propagates and turns nothing off.
+        """
+        async with self._sf() as session:
+            version = self._vector_version
+            if version is None:
+                version = self._vector_version = await _read_vector_version(session)
+            iterative = not self._iterative_scan_rejected and version >= _ITERATIVE_SCAN_MIN_VERSION
+            try:
+                await _set_hnsw_scan(session, limit, iterative=iterative)
+            except DBAPIError as exc:
+                sqlstate = getattr(exc.orig, "sqlstate", None)
+                if not iterative or sqlstate not in _SETTING_REJECTED_SQLSTATES:
+                    raise
+                if not self._iterative_scan_rejected:
+                    self._iterative_scan_rejected = True
+                    logger.warning(
+                        "knowledge.hnsw_iterative_scan_rejected — vector search continues "
+                        "with hnsw.ef_search only (pgvector %s)",
+                        version,
+                        exc_info=True,
+                    )
+            else:
+                return (await session.execute(stmt)).all()
+        async with self._sf() as session:
+            await _set_hnsw_scan(session, limit, iterative=False)
+            return (await session.execute(stmt)).all()
 
     async def keyword_search(
         self,

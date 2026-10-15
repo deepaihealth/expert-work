@@ -11,7 +11,7 @@ from expert_work.common.search.decay import (
     temporal_decay_factor,
 )
 from expert_work.common.search.mmr import DEFAULT_MMR_LAMBDA, mmr_select
-from expert_work.common.search.rrf import rrf_fuse, rrf_fuse_scored
+from expert_work.common.search.rrf import rrf_fuse, rrf_fuse_scored, weighted_rrf_fuse_scored
 
 __all__ = [
     "DECAY_FLOOR",
@@ -21,4 +21,5 @@ __all__ = [
     "rrf_fuse",
     "rrf_fuse_scored",
     "temporal_decay_factor",
+    "weighted_rrf_fuse_scored",
 ]

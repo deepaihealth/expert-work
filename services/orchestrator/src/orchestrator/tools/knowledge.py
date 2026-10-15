@@ -7,7 +7,7 @@ the tenant's uploaded documents. Retrieval is **hybrid**:
    similarity against ``knowledge_chunk`` embeddings;
 2. **keyword recall** — the query is matched by Postgres full-text
    relevance (jieba-segmented, so it is correct for CJK);
-3. the two ranked lists are fused by **Reciprocal Rank Fusion**; and
+3. the two ranked lists are fused by (weighted) **Reciprocal Rank Fusion**; and
 4. an optional **LLM reranker** reorders the fused candidates by
    judged relevance before the top-k is returned.
 
@@ -22,14 +22,14 @@ import json
 import logging
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from uuid import UUID
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
-from expert_work.common.search.rrf import rrf_fuse_scored
+from expert_work.common.search.rrf import weighted_rrf_fuse_scored
 from expert_work.persistence import KnowledgeStore
 from expert_work.protocol import (
     KnowledgeBase,
@@ -46,9 +46,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Per-side recall depth fetched before fusion / rerank — wider than the
-#: final top-k so fusion and the reranker have candidates to work with.
-_DEFAULT_RECALL_LIMIT = 20
+#: Default per-path recall depth = ``limit`` x this, clamped to
+#: [``_MIN_RECALL_DEPTH``, ``_MAX_RERANK_CANDIDATES``] — wider than the final
+#: top-k so fusion and the reranker have candidates to work with.
+_RECALL_DEPTH_FACTOR = 2
+_MIN_RECALL_DEPTH = 50
+#: ``qwen3-vl-rerank`` takes at most 100 documents per request: the ceiling of
+#: the default recall depth and a hard cap on rerank candidates.
+_MAX_RERANK_CANDIDATES = 100
 #: Each candidate is truncated to this many characters in the rerank
 #: prompt — enough to judge relevance without an enormous prompt.
 _RERANK_DOC_CHARS = 600
@@ -85,6 +90,11 @@ class RetrievedChunk:
     formatted output is unaffected — they exist for the retrieval-test
     endpoint's transparency.
 
+    The per-path sub-scores (B-175 wave 2) are kept for diagnostics and are
+    ``None`` when a path did not surface the chunk: ``vector_score`` (same
+    value as ``score``), ``keyword_score`` (the keyword path's rank value)
+    and ``fused_score`` (the weighted RRF score that ordered the fusion).
+
     ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
     The agent sees (and the reranker / eval match against)
     :attr:`retrieval_text`, the two joined.
@@ -96,10 +106,29 @@ class RetrievedChunk:
     score: float | None = None
     recall_source: str | None = None
     heading_path: tuple[str, ...] = ()
+    chunk_id: UUID | None = None
+    vector_score: float | None = None
+    keyword_score: float | None = None
+    fused_score: float | None = None
 
     @property
     def retrieval_text(self) -> str:
         return chunk_retrieval_text(self.heading_path, self.content)
+
+
+@dataclass(frozen=True)
+class _SubScores:
+    """Per-chunk scores from one search, keyed by chunk id."""
+
+    vector: Mapping[UUID, float]
+    keyword: Mapping[UUID, float]
+    fused: Mapping[UUID, float]
+
+
+def default_recall_depth(limit: int) -> int:
+    """Production per-path recall depth for a ``limit``-result search:
+    ``2 x limit`` clamped to [50, 100] (100 = the reranker's per-request cap)."""
+    return max(_MIN_RECALL_DEPTH, min(_RECALL_DEPTH_FACTOR * limit, _MAX_RERANK_CANDIDATES))
 
 
 @dataclass(frozen=True)
@@ -153,12 +182,23 @@ class KnowledgeRetriever:
     an optional :class:`Reranker`. Injected into the orchestrator's
     ``ToolEnv`` by the control-plane (which configures the embedder /
     rerank LLM). With no reranker the fused order is returned directly.
+
+    ``recall_limit`` fixes the per-path recall depth; ``None`` (production)
+    derives it per call (:func:`default_recall_depth`). ``vector_weight`` /
+    ``keyword_weight`` weight the two paths in the fusion; equal weights
+    give plain RRF.
     """
 
     store: KnowledgeStore
     embedder: Embedder
     reranker: Reranker | None = None
-    recall_limit: int = field(default=_DEFAULT_RECALL_LIMIT)
+    recall_limit: int | None = None
+    vector_weight: float = 1.0
+    keyword_weight: float = 1.0
+
+    def recall_depth(self, limit: int) -> int:
+        """Per-path recall depth for a ``limit``-result search."""
+        return self.recall_limit if self.recall_limit is not None else default_recall_depth(limit)
 
     async def search(
         self,
@@ -185,12 +225,17 @@ class KnowledgeRetriever:
         if not bases:
             return []
         query_embedding = (await self.embedder.embed([query], tenant_id=tenant_id))[0]
+        depth = self.recall_depth(limit)
 
-        # Per-base recall, honouring each base's method + threshold. Vector
-        # similarity (the only [0, 1] score) is recorded per chunk; keyword
-        # hits only contribute to fusion + recall_source.
-        rankings: list[list[KnowledgeChunk]] = []
+        # Per-base recall, honouring each base's method + threshold. Each
+        # path's score is recorded per chunk for diagnostics; only the vector
+        # similarity is a comparable [0, 1] score. Fusion keys on the chunk id
+        # (the chunk value need not be hashable, and the two paths may return
+        # unequal copies of one chunk); the first copy seen is kept.
+        rankings: list[tuple[float, list[UUID]]] = []
+        chunk_by_id: dict[UUID, KnowledgeChunk] = {}
         vector_score: dict[UUID, float] = {}
+        keyword_score: dict[UUID, float] = {}
         sources: dict[UUID, set[str]] = {}
         for base in bases:
             eff_method = method if method is not None else base.retrieval_method
@@ -202,12 +247,13 @@ class KnowledgeRetriever:
                     tenant_id=tenant_id,
                     kb_ids=[base.id],
                     query_embedding=query_embedding,
-                    limit=self.recall_limit,
+                    limit=depth,
                 )
                 if eff_threshold is not None:
                     vector = [hit for hit in vector if hit.score >= eff_threshold]
-                rankings.append([hit.chunk for hit in vector])
+                rankings.append((self.vector_weight, [hit.chunk.id for hit in vector]))
                 for hit in vector:
+                    chunk_by_id.setdefault(hit.chunk.id, hit.chunk)
                     vector_score[hit.chunk.id] = max(vector_score.get(hit.chunk.id, 0.0), hit.score)
                     sources.setdefault(hit.chunk.id, set()).add("vector")
             if eff_method in (RetrievalMethod.HYBRID, RetrievalMethod.KEYWORD):
@@ -215,20 +261,30 @@ class KnowledgeRetriever:
                     tenant_id=tenant_id,
                     kb_ids=[base.id],
                     query=query,
-                    limit=self.recall_limit,
+                    limit=depth,
                 )
-                rankings.append([hit.chunk for hit in keyword])
+                rankings.append((self.keyword_weight, [hit.chunk.id for hit in keyword]))
                 for hit in keyword:
+                    chunk_by_id.setdefault(hit.chunk.id, hit.chunk)
+                    keyword_score[hit.chunk.id] = max(
+                        keyword_score.get(hit.chunk.id, hit.score), hit.score
+                    )
                     sources.setdefault(hit.chunk.id, set()).add("keyword")
 
-        fused = [chunk for chunk, _score in rrf_fuse_scored(rankings)]
-        if not fused:
+        fused_scored = weighted_rrf_fuse_scored(rankings)
+        if not fused_scored:
             return []
+        fused = [chunk_by_id[chunk_id] for chunk_id, _score in fused_scored]
         rerank_enabled = rerank if rerank is not None else any(b.rerank_enabled for b in bases)
         chunks = await self._rerank(
             query, fused, limit, tenant_id=tenant_id, enabled=rerank_enabled
         )
-        return await self._attribute(tenant_id, chunks, vector_score, sources)
+        scores = _SubScores(
+            vector=vector_score,
+            keyword=keyword_score,
+            fused=dict(fused_scored),
+        )
+        return await self._attribute(tenant_id, chunks, scores, sources)
 
     async def _resolve_bases(
         self, tenant_id: UUID, base_names: Sequence[str]
@@ -250,7 +306,9 @@ class KnowledgeRetriever:
     ) -> list[KnowledgeChunk]:
         if self.reranker is None or not enabled:
             return fused[:limit]
-        candidates = fused[: self.recall_limit]
+        # Capped after fusion: several bases (and an explicit recall_limit) can
+        # fuse into more than one rerank request takes.
+        candidates = fused[: min(self.recall_depth(limit), _MAX_RERANK_CANDIDATES)]
         order = await self.reranker.rerank(
             query=query,
             documents=[chunk.retrieval_text for chunk in candidates],
@@ -263,7 +321,7 @@ class KnowledgeRetriever:
         self,
         tenant_id: UUID,
         chunks: Sequence[KnowledgeChunk],
-        vector_score: Mapping[UUID, float],
+        scores: _SubScores,
         sources: Mapping[UUID, set[str]],
     ) -> list[RetrievedChunk]:
         # One batched lookup for every source document instead of a per-document
@@ -278,9 +336,13 @@ class KnowledgeRetriever:
                 content=chunk.content,
                 filename=filenames[chunk.document_id],
                 chunk_index=chunk.chunk_index,
-                score=vector_score.get(chunk.id),
+                score=scores.vector.get(chunk.id),
                 recall_source=_recall_source(sources.get(chunk.id, set())),
                 heading_path=chunk.heading_path,
+                chunk_id=chunk.id,
+                vector_score=scores.vector.get(chunk.id),
+                keyword_score=scores.keyword.get(chunk.id),
+                fused_score=scores.fused.get(chunk.id),
             )
             for chunk in chunks
         ]

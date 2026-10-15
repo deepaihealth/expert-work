@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
@@ -10,8 +11,9 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from expert_work.common.search.rrf import rrf_fuse as _rrf_fuse
+from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence import InMemoryKnowledgeStore
-from expert_work.protocol import KnowledgeChunk, RetrievalMethod
+from expert_work.protocol import KnowledgeChunk, RetrievalMethod, ScoredChunk
 from orchestrator.tools import (
     KnowledgeRetriever,
     KnowledgeSearchTool,
@@ -370,3 +372,383 @@ async def test_knowledge_search_tool_no_hits_message() -> None:
     result = await _tool(store).call({"query": "anything"}, ctx=ToolContext(tenant_id=tenant))
     assert "no relevant knowledge" in result.content
     assert result.meta["hits"] == 0
+
+
+# ---------------------------------------------------------------------------
+# B-175 W2 PR2 — recall depth, rerank candidate cap, weighted fusion, sub-scores
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStore(InMemoryKnowledgeStore):
+    """Records the ``limit`` each recall path is asked for."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.vector_limits: list[int] = []
+        self.keyword_limits: list[int] = []
+
+    async def search_scored(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        query_embedding: Sequence[float],
+        limit: int = 5,
+    ) -> list[ScoredChunk]:
+        self.vector_limits.append(limit)
+        return await super().search_scored(
+            tenant_id=tenant_id, kb_ids=kb_ids, query_embedding=query_embedding, limit=limit
+        )
+
+    async def keyword_search_scored(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        query: str,
+        limit: int = 5,
+    ) -> list[ScoredChunk]:
+        self.keyword_limits.append(limit)
+        return await super().keyword_search_scored(
+            tenant_id=tenant_id, kb_ids=kb_ids, query=query, limit=limit
+        )
+
+
+class _CountingReranker:
+    """Records how many candidates each rerank call received; keeps their order."""
+
+    def __init__(self) -> None:
+        self.sizes: list[int] = []
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        del query, tenant_id
+        self.sizes.append(len(documents))
+        return list(range(len(documents)))[:top_k]
+
+
+async def _seed_bases(store: InMemoryKnowledgeStore, *, bases: int, per_base: int) -> UUID:
+    """``bases`` bases ``kb0``.. with ``per_base`` chunks each; every chunk
+    mentions "policy" (keyword hit) and has a distinct vector."""
+    tenant = uuid4()
+    for b in range(bases):
+        base = await store.create_base(tenant_id=tenant, name=f"kb{b}")
+        document = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename=f"d{b}.pdf"
+        )
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=document.id,
+            chunks=[
+                _chunk(
+                    tenant=tenant,
+                    kb=base.id,
+                    doc=document.id,
+                    index=i,
+                    content=f"policy clause {i}",
+                    embedding=(1.0, i / per_base),
+                )
+                for i in range(per_base)
+            ],
+        )
+    return tenant
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit", "depth"),
+    [(1, 50), (5, 50), (10, 50), (25, 50), (30, 60), (50, 100), (60, 100)],
+)
+async def test_default_recall_depth_is_twice_limit_clamped_to_50_100(
+    limit: int, depth: int
+) -> None:
+    store = _RecordingStore()
+    tenant = await _seed_bases(store, bases=1, per_base=3)
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0, 0.0)))
+    await retriever.search(tenant_id=tenant, base_names=["kb0"], query="policy", limit=limit)
+    assert store.vector_limits == [depth]
+    assert store.keyword_limits == [depth]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recall_limit", [7, 150])
+async def test_explicit_recall_limit_is_respected(recall_limit: int) -> None:
+    store = _RecordingStore()
+    tenant = await _seed_bases(store, bases=1, per_base=3)
+    retriever = KnowledgeRetriever(
+        store=store, embedder=_FixedEmbedder((1.0, 0.0)), recall_limit=recall_limit
+    )
+    await retriever.search(tenant_id=tenant, base_names=["kb0"], query="policy", limit=5)
+    assert store.vector_limits == [recall_limit]
+    assert store.keyword_limits == [recall_limit]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit", "recall_limit", "candidates"),
+    [(5, None, 50), (60, None, 100), (5, 150, 100)],
+)
+async def test_rerank_candidates_follow_recall_depth_capped_at_100(
+    limit: int, recall_limit: int | None, candidates: int
+) -> None:
+    # Two bases x 120 chunks: fusion yields up to 240 candidates; the
+    # reranker (qwen3-vl-rerank: <= 100 documents per request) never gets more
+    # than 100, however many bases are searched or how deep recall goes.
+    store = InMemoryKnowledgeStore()
+    tenant = await _seed_bases(store, bases=2, per_base=120)
+    reranker = _CountingReranker()
+    retriever = KnowledgeRetriever(
+        store=store,
+        embedder=_FixedEmbedder((1.0, 0.0)),
+        reranker=reranker,
+        recall_limit=recall_limit,
+    )
+    await retriever.search(tenant_id=tenant, base_names=["kb0", "kb1"], query="policy", limit=limit)
+    assert reranker.sizes == [candidates]
+
+
+@pytest.mark.asyncio
+async def test_without_rerank_the_candidate_cap_does_not_cut_results() -> None:
+    # The 100 cap is the reranker's request limit; a fused-order search still
+    # returns its full ``limit`` beyond it.
+    store = InMemoryKnowledgeStore()
+    tenant = await _seed_bases(store, bases=2, per_base=120)
+    retriever = KnowledgeRetriever(
+        store=store, embedder=_FixedEmbedder((1.0, 0.0)), recall_limit=130
+    )
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb0", "kb1"], query="policy", limit=130, rerank=False
+    )
+    assert len(results) == 130
+
+
+@pytest.mark.asyncio
+async def test_default_weights_reproduce_plain_rrf_order_and_scores() -> None:
+    """Regression lock: with default weights the fused order AND scores are
+    exactly what ``rrf_fuse_scored`` gives over the same per-path rankings
+    (the pre-PR2 fusion), across several bases."""
+    rng = random.Random(20261014)  # noqa: S311 — reproducible test data, not crypto
+    words = ["claim", "policy", "refund", "premium", "deductible", "network", "provider"]
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    bases = []
+    for b in range(3):
+        base = await store.create_base(tenant_id=tenant, name=f"kb{b}")
+        document = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename=f"d{b}.pdf"
+        )
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=document.id,
+            chunks=[
+                _chunk(
+                    tenant=tenant,
+                    kb=base.id,
+                    doc=document.id,
+                    index=i,
+                    content=" ".join(rng.sample(words, 3)),
+                    embedding=(rng.random(), rng.random(), rng.random()),
+                )
+                for i in range(30)
+            ],
+        )
+        bases.append(base)
+    query, embedding = "refund premium", (0.3, 0.9, 0.1)
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder(embedding))
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb0", "kb1", "kb2"], query=query, limit=60, rerank=False
+    )
+
+    rankings: list[list[KnowledgeChunk]] = []
+    for base in bases:
+        vector = await store.search_scored(
+            tenant_id=tenant, kb_ids=[base.id], query_embedding=embedding, limit=100
+        )
+        keyword = await store.keyword_search_scored(
+            tenant_id=tenant, kb_ids=[base.id], query=query, limit=100
+        )
+        rankings += [[hit.chunk for hit in vector], [hit.chunk for hit in keyword]]
+    expected = [(chunk.id, score) for chunk, score in rrf_fuse_scored(rankings)][:60]
+    assert len(expected) == 60
+    assert [(r.chunk_id, r.fused_score) for r in results] == expected
+
+
+async def _fused_indices(
+    store: InMemoryKnowledgeStore,
+    tenant: UUID,
+    *,
+    vector_weight: float = 1.0,
+    keyword_weight: float = 1.0,
+) -> list[int]:
+    # Threshold 0.5 keeps only chunk 0 on the vector path; "vacation" matches
+    # only chunk 1 by keyword — one rank-0 hit per path, tied at equal weights.
+    retriever = KnowledgeRetriever(
+        store=store,
+        embedder=_FixedEmbedder((1.0, 0.0)),
+        vector_weight=vector_weight,
+        keyword_weight=keyword_weight,
+    )
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb"], query="vacation", limit=5, score_threshold=0.5
+    )
+    return [r.chunk_index for r in results]
+
+
+@pytest.mark.asyncio
+async def test_path_weights_reorder_fusion() -> None:
+    store, tenant = await _seed_store()
+    assert await _fused_indices(store, tenant) == [0, 1]  # tie → vector list fused first
+    assert await _fused_indices(store, tenant, keyword_weight=1.5) == [1, 0]
+    assert await _fused_indices(store, tenant, vector_weight=0.5) == [1, 0]
+    assert await _fused_indices(store, tenant, vector_weight=1.5) == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_sub_scores_for_vector_only_keyword_only_and_both() -> None:
+    store, tenant = await _seed_store()
+    base = await store.get_base(tenant_id=tenant, name="kb")
+    assert base is not None
+    document = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="b.pdf")
+    await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=document.id,
+        chunks=[
+            _chunk(
+                tenant=tenant,
+                kb=base.id,
+                doc=document.id,
+                index=0,
+                content="vacation carryover rules",
+                embedding=(0.9, 0.1),
+            )
+        ],
+    )
+    query, embedding = "vacation carryover", (1.0, 0.0)
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder(embedding))
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb"], query=query, limit=5, score_threshold=0.5
+    )
+
+    vector = [
+        hit
+        for hit in await store.search_scored(
+            tenant_id=tenant, kb_ids=[base.id], query_embedding=embedding, limit=50
+        )
+        if hit.score >= 0.5
+    ]
+    keyword = await store.keyword_search_scored(
+        tenant_id=tenant, kb_ids=[base.id], query=query, limit=50
+    )
+    fused = {
+        chunk.id: score
+        for chunk, score in rrf_fuse_scored(
+            [[hit.chunk for hit in vector], [hit.chunk for hit in keyword]]
+        )
+    }
+    vector_by_id = {hit.chunk.id: hit.score for hit in vector}
+    keyword_by_id = {hit.chunk.id: hit.score for hit in keyword}
+    by_source = {r.recall_source: r for r in results}
+    assert set(by_source) == {"vector", "keyword", "both"}
+
+    for result in results:
+        assert result.chunk_id is not None
+        assert result.vector_score == vector_by_id.get(result.chunk_id)
+        assert result.keyword_score == keyword_by_id.get(result.chunk_id)
+        assert result.fused_score == fused[result.chunk_id]
+        assert result.score == result.vector_score  # ``score`` keeps its meaning
+
+    vector_only, keyword_only, both = by_source["vector"], by_source["keyword"], by_source["both"]
+    assert "deductible" in vector_only.content
+    assert vector_only.vector_score is not None
+    assert vector_only.keyword_score is None
+    assert "vacation policy" in keyword_only.content
+    assert keyword_only.vector_score is None
+    assert keyword_only.keyword_score is not None
+    assert "carryover" in both.content
+    assert both.vector_score is not None
+    assert both.keyword_score is not None
+    # Found by both paths → the highest fused score.
+    assert both.fused_score is not None
+    assert vector_only.fused_score is not None
+    assert both.fused_score > vector_only.fused_score
+
+
+class _EditedBetweenPathsStore(InMemoryKnowledgeStore):
+    """The keyword path returns the chunk as edited after the vector path read
+    it: same id, different content — two unequal objects."""
+
+    async def keyword_search_scored(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        query: str,
+        limit: int = 5,
+    ) -> list[ScoredChunk]:
+        hits = await super().keyword_search_scored(
+            tenant_id=tenant_id, kb_ids=kb_ids, query=query, limit=limit
+        )
+        return [
+            hit.model_copy(
+                update={"chunk": hit.chunk.model_copy(update={"content": hit.chunk.content + "!"})}
+            )
+            for hit in hits
+        ]
+
+
+@pytest.mark.asyncio
+async def test_fusion_keys_on_chunk_id_not_the_chunk_value() -> None:
+    # Chunk 0 matches by vector and keyword, but the two paths return unequal
+    # objects for it. Fusion counts it once (both paths) and keeps the first
+    # object seen (the vector path's).
+    store = _EditedBetweenPathsStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
+    await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=document.id,
+        chunks=[
+            _chunk(
+                tenant=tenant,
+                kb=base.id,
+                doc=document.id,
+                index=0,
+                content="the deductible is 500 dollars",
+                embedding=(1.0, 0.0),
+            )
+        ],
+    )
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0, 0.0)))
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb"], query="deductible", limit=5
+    )
+    assert len(results) == 1
+    assert results[0].recall_source == "both"
+    assert results[0].content == "the deductible is 500 dollars"
+    assert results[0].fused_score == pytest.approx(2 / 61)
+
+
+@pytest.mark.asyncio
+async def test_chunk_with_unhashable_source_locator_is_retrievable() -> None:
+    # ``source_locator`` is a list of dicts, so the chunk value is unhashable;
+    # fusion must not need to hash it.
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
+    chunk = _chunk(
+        tenant=tenant,
+        kb=base.id,
+        doc=document.id,
+        index=0,
+        content="the deductible is 500 dollars",
+        embedding=(1.0, 0.0),
+    ).model_copy(update={"source_locator": [{"type": "pdf", "page": 3}]})
+    await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=[chunk])
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0, 0.0)))
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb"], query="deductible", limit=5
+    )
+    assert [r.chunk_id for r in results] == [chunk.id]
