@@ -17,9 +17,18 @@ import yaml
 
 #: 用例来源。``faq_xlsx`` 产品 FAQ 表 / ``faq_2026`` FAQ-2026 表 / ``manual_qa`` 说明书 Q&A /
 #: ``hard_cross`` 跨文档 / ``hard_exact`` 精确标识 / ``hard_table`` 表格 /
-#: ``no_answer`` 资料里没有(应拒答)。
+#: ``no_answer`` 资料里没有(应拒答)/ ``chat_qa`` 客户聊天里的真实问法(脱敏改写)。
 SOURCES = frozenset(
-    {"faq_xlsx", "faq_2026", "manual_qa", "hard_cross", "hard_exact", "hard_table", "no_answer"}
+    {
+        "faq_xlsx",
+        "faq_2026",
+        "manual_qa",
+        "hard_cross",
+        "hard_exact",
+        "hard_table",
+        "no_answer",
+        "chat_qa",
+    }
 )
 #: 锚文本下限(字符数,去首尾空白后)。短于这个值的子串在长文档里到处都能 ``in`` 到。
 MIN_ANCHOR_CHARS = 8

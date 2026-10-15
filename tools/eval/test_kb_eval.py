@@ -11,6 +11,7 @@ import json
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -30,8 +31,10 @@ from kb_eval import (  # type: ignore[import-not-found]
     build_corpus,
     build_fake_embedder,
     build_retriever,
+    case_to_json,
     check_anchors,
     fingerprint,
+    format_summary_table,
     main,
     resolve_anchor_documents,
     rls_tenant,
@@ -386,6 +389,61 @@ async def test_build_corpus_parse_timeout_is_a_parse_failure(corpus: tuple[Path,
     docs = await store.list_documents(tenant_id=tenant, kb_id=report.base_id)
     assert {d.status for d in docs} == {DocumentStatus.FAILED}
     assert all(d.error and "TimeoutError" in d.error for d in docs)
+
+
+def _somewhat_slow_parser(filename: str, raw: bytes) -> str:
+    time.sleep(0.12)
+    return raw.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_build_corpus_waits_out_a_parse_slower_than_the_timeout(
+    corpus: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 10-15:两条评测并行时一份大 PDF 解析超过时限被跳过,语料静默少了 4,130 段。
+    # 超时后接着等同一个解析(不重提交),总共最多等 SLOW_PARSE_GRACE 倍时限。
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        report = await _build(
+            corpus,
+            store=store,
+            tenant=tenant,
+            executor=pool,
+            parser=_somewhat_slow_parser,
+            parse_timeout_s=0.05,
+        )
+    assert report.docs_failed == 0
+    assert report.docs_ingested == 4
+    assert "slower than" in capsys.readouterr().err
+
+
+def _summary_with_corpus(failures: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "overall": {},
+        "by_source": {},
+        "by_tag": {},
+        "corpus": {
+            "docs_ingested": 3,
+            "docs_skipped_dup": 0,
+            "docs_skipped_limit": 0,
+            "docs_skipped_empty": 0,
+            "docs_name_collision": 0,
+            "docs_failed": len(failures),
+            "failed_by_stage": {"parse": len(failures)} if failures else {},
+            "chunk_total": 30,
+            "elapsed_s": 1.0,
+            "embedder": "fake",
+            "ingest_failures": failures,
+        },
+    }
+
+
+def test_summary_table_warns_when_the_corpus_is_incomplete() -> None:
+    failed = [{"filename": "big.pdf", "path": "a/big.pdf", "stage": "parse"}]
+    table = format_summary_table(_summary_with_corpus(failed))
+    assert "WARNING corpus incomplete: 1 document(s) failed (big.pdf)" in table
+    assert "WARNING" not in format_summary_table(_summary_with_corpus([]))
 
 
 class _ExplodingEmbedder:
@@ -1024,6 +1082,32 @@ async def test_resolve_anchor_documents_leaves_a_too_common_anchor_alone() -> No
     assert [(t.case_id, t.document, t.n_docs) for t in report.too_common] == [("q1", "doc0.md", 3)]
 
 
+async def test_resolve_anchor_documents_matches_through_spacing_and_markup() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with rls_tenant(tenant):
+        kb_id = await _seed_docs(
+            store,
+            tenant,
+            {
+                "a.md": "# 菌株\n\n菌株QX-01 专利号ZL201900001234.5\n",
+                "b.md": "# 菌株\n\n**菌株QX-01** 专利号：ZL 2019 0 0001234.5\n",  # noqa: RUF001
+            },
+        )
+        dataset = _one_case_dataset(("a.md", "菌株QX-01 专利号ZL201900001234.5"))
+        resolved, _report = await resolve_anchor_documents(
+            store=store, tenant_id=tenant, kb_id=kb_id, dataset=dataset
+        )
+        anchors = await check_anchors(
+            store=store,
+            tenant_id=tenant,
+            kb_id=kb_id,
+            dataset=_one_case_dataset(("b.md", "菌株QX-01 专利号ZL201900001234.5")),
+        )
+    assert resolved.cases[0].expected[0].documents == frozenset({"a.md", "b.md"})
+    assert anchors.alive_cases == frozenset({"q1"})
+
+
 def test_main_records_doc_match_mode_in_config(tmp_path: Path) -> None:
     parser = _build_parser()
     assert parser.parse_args(["--dataset", "x.yaml"]).doc_match == "anchor"
@@ -1033,3 +1117,25 @@ def test_main_records_doc_match_mode_in_config(tmp_path: Path) -> None:
 def test_baseline_keeps_recall_and_final_ranking_apart() -> None:
     assert baseline_benchmark("huada_v1", "off") == "huada_v1"
     assert baseline_benchmark("huada_v1", "dashscope") == "huada_v1@rerank-dashscope"
+
+
+@pytest.mark.asyncio
+async def test_with_text_keeps_the_retrieved_text_and_default_leaves_it_out(
+    corpus: tuple[Path, Path], dataset_path: Path
+) -> None:
+    """``--with-text`` writes each result's retrieval text (pooled relevance labelling needs
+    it); without the flag the results file keeps its old shape — no ``text`` key."""
+    dataset, retriever, _store, (tenant, _report) = await _built(corpus, dataset_path)
+    plain = EvalConfig(method=RetrievalMethod.HYBRID, top_k=5, threshold=None, rerank=False)
+    with_text = replace(plain, with_text=True)
+    rows_plain = await run_eval(
+        dataset=dataset, retriever=retriever, tenant_id=tenant, cfg=plain, concurrency=1
+    )
+    rows_text = await run_eval(
+        dataset=dataset, retriever=retriever, tenant_id=tenant, cfg=with_text, concurrency=1
+    )
+    hit = next(r for r in rows_text if r.results)
+    assert all(res.text for res in hit.results)
+    assert any(_ANCHOR_A in (res.text or "") for r in rows_text for res in r.results)
+    assert all("text" not in res for r in rows_plain for res in case_to_json(r)["results"])
+    assert all("text" in res for res in case_to_json(hit)["results"])

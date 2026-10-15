@@ -74,6 +74,8 @@ from kb_dataset import (  # type: ignore[import-not-found]
 from kb_metrics import (  # type: ignore[import-not-found]
     CaseScore,
     aggregate,
+    anchor_in,
+    anchor_key,
     grouped,
     score_case,
 )
@@ -109,6 +111,9 @@ DEFAULT_TOP_K = 20
 DEFAULT_CONCURRENCY = 4
 #: 单份文档解析超时(秒)。超时记 parse 失败;进程池里那个 worker 会继续占着直到解析完。
 DEFAULT_PARSE_TIMEOUT_S = 120.0
+#: 解析超过时限后接着等同一个解析,总共最多等这么多倍时限才记失败。时限是防卡死的,不是判慢:
+#: 10-15 两条评测并行跑时一份大 PDF 超过 120 秒被跳过,语料静默少了 4,130 段,结果照常输出。
+SLOW_PARSE_GRACE = 4
 #: 与根 ``conftest.py`` 的 ``postgres_container`` 同一镜像(GHCR 镜像站,CI 卫兵只放行这个源)。
 PGVECTOR_IMAGE = "ghcr.io/deepaihealth/mirror/pgvector:pg16"
 ALEMBIC_INI = _REPO_ROOT / "packages" / "expert-work-persistence" / "alembic.ini"
@@ -148,6 +153,8 @@ class EvalConfig:
     rerank: bool = False
     #: off | llm(聊天模型排序)| dashscope(生产同款 ``qwen3-vl-rerank``,带缓存)
     rerank_mode: str = "off"
+    #: 结果里带上每段的 retrieval 文本(``--with-text``,汇集标注要用;默认不带,结果文件形状不变)
+    with_text: bool = False
 
 
 @dataclass(frozen=True)
@@ -248,6 +255,7 @@ class ResultRow:
     chunk_index: int
     score: float | None
     recall_source: str | None
+    text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -435,7 +443,15 @@ async def build_corpus(
 
     async def _parse(pool: Executor, filename: str, raw: bytes) -> str:
         future = loop.run_in_executor(pool, parser, filename, raw)
-        return await asyncio.wait_for(future, timeout=parse_timeout_s)
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=parse_timeout_s)
+        except TimeoutError:
+            print(
+                f"[parse] {filename}: slower than {parse_timeout_s:g}s, "
+                f"waiting up to {SLOW_PARSE_GRACE}x in total",
+                file=sys.stderr,
+            )
+        return await asyncio.wait_for(future, timeout=parse_timeout_s * (SLOW_PARSE_GRACE - 1))
 
     async def _parse_row(pool: Executor, row: Mapping[str, str]) -> str:
         path = row["path"]
@@ -629,7 +645,7 @@ async def check_anchors(
             if exp.document not in docs:
                 dead.append(DeadAnchor(case.id, exp.document, "document_missing"))
                 case_dead = True
-            elif not any(exp.anchor in text for text in await _chunks(exp.document)):
+            elif not any(anchor_in(exp.anchor, text) for text in await _chunks(exp.document)):
                 dead.append(DeadAnchor(case.id, exp.document, "anchor_not_in_any_chunk"))
                 case_dead = True
         if not case_dead:
@@ -670,13 +686,14 @@ async def resolve_anchor_documents(
 
     评测集只手列了答案所在的几份文档;内容重复的文档(同一份 FAQ 的两个版本)排在前面时,
     按文件名判就会算错 —— 10-14 实测产品 FAQ 题里 33 道排第一的是没列的 FAQ-2026。
-    一份文档的各段用 ``\x00`` 连起来再查,锚文本不会跨段误配。
+    比对用 :func:`kb_metrics.anchor_key` 的归一形;一份文档的各段分别归一后用 ``\x00`` 连起来
+    再查(归一形只有字母与数字),锚文本不会跨段误配。
     """
     texts: dict[str, str] = {}
     for doc in await store.list_documents(tenant_id=tenant_id, kb_id=kb_id):
         if doc.status is DocumentStatus.READY:
             chunks = await _all_chunk_texts(store, tenant_id=tenant_id, document_id=doc.id)
-            texts[doc.filename] = "\x00".join(chunks)
+            texts[doc.filename] = "\x00".join(anchor_key(chunk) for chunk in chunks)
     expanded = 0
     expanded_cases = 0
     too_common: list[TooCommonAnchor] = []
@@ -684,7 +701,8 @@ async def resolve_anchor_documents(
     for case in dataset.cases:
         resolved: list[KbExpected] = []
         for exp in case.expected:
-            holders = {name for name, text in texts.items() if exp.anchor in text}
+            key = anchor_key(exp.anchor)
+            holders = {name for name, text in texts.items() if key in text}
             others = holders - {exp.document}
             if others and len(holders) > max_docs:
                 too_common.append(TooCommonAnchor(case.id, exp.document, len(holders)))
@@ -751,7 +769,7 @@ async def run_eval(
             case_id=case.id,
             source=case.source,
             tags=case.tags,
-            results=tuple(_result_row(r) for r in results),
+            results=tuple(_result_row(r, with_text=cfg.with_text) for r in results),
             score=score_case(results, case.expected, threshold=cfg.threshold, match=case.match),
             match=case.match,
             anchors_alive=alive,
@@ -760,12 +778,13 @@ async def run_eval(
     return list(await asyncio.gather(*(_one(c) for c in dataset.cases)))
 
 
-def _result_row(result: RetrievedChunk) -> ResultRow:
+def _result_row(result: RetrievedChunk, *, with_text: bool = False) -> ResultRow:
     return ResultRow(
         filename=result.filename,
         chunk_index=result.chunk_index,
         score=result.score,
         recall_source=result.recall_source,
+        text=result.retrieval_text if with_text else None,
     )
 
 
@@ -835,6 +854,13 @@ def baseline_section(summary: Mapping[str, Any]) -> dict[str, Any]:
     return section
 
 
+def _result_json(result: ResultRow) -> dict[str, Any]:
+    out = asdict(result)
+    if out["text"] is None:
+        del out["text"]
+    return out
+
+
 def case_to_json(row: CaseRow) -> dict[str, Any]:
     return {
         "id": row.case_id,
@@ -846,7 +872,7 @@ def case_to_json(row: CaseRow) -> dict[str, Any]:
         "zero_hit": row.score.zero_hit,
         "best_score": row.score.best_score,
         "anchors_alive": row.anchors_alive,
-        "results": [asdict(r) for r in row.results],
+        "results": [_result_json(r) for r in row.results],
         "hits": {
             "doc_ranks": list(row.score.doc_hit_ranks),
             "chunk_ranks": list(row.score.chunk_hit_ranks),
@@ -912,6 +938,12 @@ def format_summary_table(summary: Mapping[str, Any]) -> str:
             f"{corpus['failed_by_stage']} chunks={corpus['chunk_total']} "
             f"elapsed={corpus['elapsed_s']}s embedder={corpus['embedder']}"
         )
+        if corpus["docs_failed"]:
+            names = ", ".join(f["filename"] for f in corpus.get("ingest_failures", []))
+            lines.append(
+                f"WARNING corpus incomplete: {corpus['docs_failed']} document(s) failed ({names}) "
+                f"— not comparable with a run whose chunks= differs"
+            )
         embed = corpus.get("embed")
         if embed:
             lines.append(
@@ -1198,6 +1230,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="向量路走生产同款 HNSW 近似检索(默认精确检索,结果可复现;ANN 不保证)",
     )
+    parser.add_argument(
+        "--with-text",
+        action="store_true",
+        help="结果文件里带上每段的检索文本(汇集标注用;含语料原文,结果文件只留在仓库外)",
+    )
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument(
         "--parse-timeout",
@@ -1342,6 +1379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         threshold=args.threshold,
         rerank=rerank_mode != "off",
         rerank_mode=rerank_mode,
+        with_text=args.with_text,
     )
     bundle = build_embedder(args.embedder, concurrency=args.concurrency)
     reranker, rerank_client = build_rerank_mode(rerank_mode)

@@ -71,9 +71,18 @@ def test_corpus_block_is_optional(tmp_path: Path) -> None:
     assert ds.corpus_tiers == ()
 
 
-def test_sources_enum_is_the_documented_seven() -> None:
+def test_sources_enum_is_the_documented_eight() -> None:
     assert SOURCES == frozenset(
-        {"faq_xlsx", "faq_2026", "manual_qa", "hard_cross", "hard_exact", "hard_table", "no_answer"}
+        {
+            "faq_xlsx",
+            "faq_2026",
+            "manual_qa",
+            "hard_cross",
+            "hard_exact",
+            "hard_table",
+            "no_answer",
+            "chat_qa",
+        }
     )
 
 
@@ -256,3 +265,16 @@ def test_committed_holdout_set_loads_and_stays_apart_from_the_main_set() -> None
     assert {c.id for c in main.cases}.isdisjoint({c.id for c in holdout.cases})
     assert {c.query for c in main.cases}.isdisjoint({c.query for c in holdout.cases})
     assert all("留出" in c.tags for c in holdout.cases)
+
+
+def test_committed_chat_set_loads_and_stays_apart_from_the_other_sets() -> None:
+    """The real-phrasing set (questions rewritten from customer chats) loads, carries its
+    tag on every case, and shares no case id or question with the main / holdout sets."""
+    chat = load_dataset(_KB_DATASETS / "huada_v1.chat.yaml")
+    others = [load_dataset(_KB_DATASETS / n) for n in ("huada_v1.yaml", "huada_v1.holdout.yaml")]
+    assert len(chat.cases) >= 50
+    for other in others:
+        assert {c.id for c in other.cases}.isdisjoint({c.id for c in chat.cases})
+        assert {c.query for c in other.cases}.isdisjoint({c.query for c in chat.cases})
+    assert all("真实问法" in c.tags for c in chat.cases)
+    assert {c.source for c in chat.cases} == {"chat_qa", "no_answer"}

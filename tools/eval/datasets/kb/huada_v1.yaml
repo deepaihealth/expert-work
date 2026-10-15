@@ -21,6 +21,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 正常情况下，人们摄入的食物会给肠道带来一定的益生菌，也就是说益生菌可通过正常饮食
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 华大益生菌均属于功能性食品，所有原料温和安心，不具有依赖性或毒副作用
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 华大益生菌均属于功能性食品，所有原料温和安心，不具有依赖性或毒副作用
+    page: null
+    via: pool-judge
   answer: '不会。正常情况下，人们摄入的食物会给肠道带来一定的益生菌，也就是说益生菌可通过正常饮食由外界获得。当今社会，人们的生活和工作压力逐渐增大，食品中存在的防腐剂、香精、香料等人工合成添加剂均会影响体内益生菌的生存与繁殖。因此，现代人需要另外补充益生菌来维持菌群平衡。人体的肠道器官为益生菌提供了适合的繁殖环境，不管从哪个途径获得益生菌，对人来说都不会改变生存的本质，即靠食物和营养维持生存。所以，机体不会对获得益生菌的方式产生依赖性，也不会对益生菌产生依赖性。不仅如此，很多益生菌产品也可以经常食用。同时，随着年龄的增长，体内益生菌的数量会慢慢较少，因此也需要经常补充益生菌。
 
     华大益生菌来自健康同胞或国内发酵食品，帮助补充我们身体需要但缺少的菌，且华大益生菌与国人遗传背景、饮食习惯有很好的契合度，长期食用可建立新的菌群平衡，不会产生依赖性。'
@@ -40,6 +48,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 成年人肠道菌群“脱胎换骨”需要3～6个月左右，如果以往有长期肠胃困扰的人，可能需
     page: null
+  - document: 产品说明书：多维复合营养包（40+）.docx
+    anchor: 肾功能正常的健康人群，在推荐剂量下长期服用是安全的，不会造成肾脏负担
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 可以。本品成分为天然植物提取膳食纤维，每袋膳食纤维含量为日常推荐1/3，适合长期膳食纤维摄入不足，肠道菌群失衡人群，且不产生依赖性
+    page: null
+    via: pool-judge
   answer: 建议起效后继续食用，巩固3个月左右。成年人肠道菌群“脱胎换骨”需要3～6个月左右，如果以往有长期肠胃困扰的人，可能需要更久；每日摄入的益生菌对于成年人肚子里2斤重的菌群来说，非常少量，所以前期基本是调理作用，想要这些益生菌真正数量充足活在肠道中，需要持续补充巩固一段时间才可，不然确实可能打回原形，同时注意饮食、睡眠健康，助力益生菌更快更好繁衍生息。
 - id: faq_xlsx-0003
   query: 液态益生菌比益生菌冻干粉好?
@@ -74,6 +90,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 如果是身体各项指标均非常健康的人群，可根据自身情况在差旅、节假日大餐期间选择益生
     page: null
+  - document: 益生菌益生元常见问题.docx
+    anchor: 对于普通人群，可以根据自己的情况或咨询专业人员来决定是否需要补充益生菌
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 随着年龄的增长，体内益生菌的数量会慢慢较少，因此也需要经常补充益生菌。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 随着年龄的增长，体内益生菌的数量会慢慢较少，因此也需要经常补充益生菌。
+    page: null
+    via: pool-judge
   answer: 如果是身体各项指标均非常健康的人群，可根据自身情况在差旅、节假日大餐期间选择益生菌来维护肠道功能、预防不适；如果既往有长期的肠道不适（腹泻、便秘）、肥胖、三高的人群，即便自己感觉身体没有大问题，其实肠道菌群早已与健康人群拉开差距，还是需要补充适合自己的益生菌。
 - id: faq_xlsx-0005
   query: 吃益生菌后前期会不会加重症状？
@@ -133,6 +161,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 多数人在服用益生菌时，基本不会有什么副反应的感觉，最多是肚子有些“咕噜咕噜”的声
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 不会。少数人刚开始摄入益生菌产品后，会觉得有轻微的肠道不适
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 不会。少数人刚开始摄入益生菌产品后，会觉得有轻微的肠道不适
+    page: null
+    via: pool-judge
   answer: '多数人在服用益生菌时，基本不会有什么副反应的感觉，最多是肚子有些“咕噜咕噜”的声音，产气比平常稍多一点而已。然而，对于一些肠道菌群已经失调的人，在服用益生菌的过程中，特别在补充益生菌的前1~4周，会出现病症加重的现象(如腹痛、多气、腹泻加重、皮肤出痘比之前更厉害等)，这是为什么呢?这种现象叫作赫氏消亡反应。
 
     出现该症状是因为在人体消化系统中，益生菌和有害菌正在展开剧烈的斗争。有害菌为了存活会释放比平时更多的毒素，或者通过改变代谢途径生成新毒素来对抗益生菌。而这些毒素在作用于益生菌的同时，也使人体出现了副反应，导致了一系列症状。所以这些副反应不是来自益生菌，而是来自已经占据体内肠道的那些有害菌。有时这些副反应反倒是一个好信号，说明益生菌已发挥作用，有害菌正在消亡。随着坚持服用益生菌，病情就会逐渐好转，益生菌逐渐战胜有害菌，直至身体完全建复。所以，有人形象地说赫氏消亡反应是“治愈疾病过程中黎明前的黑暗”。'
@@ -169,6 +205,38 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 抗生素治疗会破坏体内菌群平衡，需要坚持补充益生菌，在抗生素治疗结束后可适当加量补
     page: null
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 益生菌与抗生素服用间隔
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 益生菌益生元常见问题.docx
+    anchor: 在接受抗生素治疗期间，不但可以吃益生菌，而且某些益生菌经临床研究证实，有助于降低抗生素相关腹泻的风险。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 服用抗生素期间需间隔2小时食用益生菌
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 切忌与抗生素同时服用。抗生素能够杀灭人体内的细菌，破坏肠道菌群平衡，通过补充益生菌可以恢复肠道菌群平衡，但是两者服用的时间最好间隔两个小时以上
+    page: null
+    via: pool-judge
   answer: 活性益生菌与抗生素使用间隔2小时即可。抗生素治疗会破坏体内菌群平衡，需要坚持补充益生菌，在抗生素治疗结束后可适当加量补充，帮助菌群恢复新平衡。
 - id: faq_xlsx-0010
   query: 瘦人想吃胖推荐哪款益生菌？
@@ -254,6 +322,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 优美达系列的益生菌“各有所长”，如果您需要改善不止一种情况的时候，是可以同时食用
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
   answer: 优美达系列的益生菌“各有所长”，如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可。如担心一次摄入太多活菌会使肠道不适应，则可分别间隔数个小时食用；如尝试同时食用后没有任何不适应，则放心同时食用。
 - id: faq_xlsx-0015
   query: “四高”人群可以吃益生菌吗？
@@ -381,6 +461,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 一般来说优美达的所有产品常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季
     page: null
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 一般来说常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季节），收到产品后
+    page: null
+    via: pool-judge
+  - document: 益生菌益生元常见问题.docx
+    anchor: 在家庭环境中，应该将益生菌在密闭，低温，避光相对干燥的环境中进行保存。具体储存条件，参考产品标签上的要求。
+    page: null
+    via: pool-judge
   answer: 一般来说优美达的所有产品常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季节），收到产品后放冰箱保存更佳。产品盒子开封后请尽快食用，益生菌独立包装开袋后也应及时食用，以免活菌长时间接触空气中水分影响活性。
 - id: faq_xlsx-0022
   query: 益生菌在夏日高温运输途中活性是否受影响？
@@ -432,6 +520,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 根据中国食品科学技术学会制定的《食品用益生菌通则》团体标准规定，益生菌食品是指“
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 食品用益生菌为可用于食品中的一种或多种益生菌，经发酵、富集、干燥或不干燥、混合或不混合、包装等工序制成的食品原料。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 食品用益生菌为可用于食品中的一种或多种益生菌，经发酵、富集、干燥或不干燥、混合或不混合、包装等工序制成的食品原料。
+    page: null
+    via: pool-judge
   answer: 根据中国食品科学技术学会制定的《食品用益生菌通则》团体标准规定，益生菌食品是指“添加了益生菌，并且在保质期内益生菌活菌数量符合一定要求的食品”。
 - id: faq_xlsx-0025
   query: 食品用益生菌是什么？
@@ -449,6 +545,22 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 食品用益生菌为可用于食品中的一种或多种益生菌，经发酵、富集、干燥或不干燥、混合或
     page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 益生菌食品是指“添加了益生菌，并且在保质期内益生菌活菌数量符合一定要求的食品”
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 益生菌食品是指“添加了益生菌，并且在保质期内益生菌活菌数量符合一定要求的食品”
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 益生菌食品是指“添加了益生菌，并且在保质期内益生菌活菌数量符合一定要求的食品”
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 益生菌食品是指“添加了益生菌，并且在保质期内益生菌活菌数量符合一定要求的食品”
+    page: null
+    via: pool-judge
   answer: 食品用益生菌为可用于食品中的一种或多种益生菌，经发酵、富集、干燥或不干燥、混合或不混合、包装等工序制成的食品原料。
 - id: faq_xlsx-0026
   query: 国家对于益生菌食品的政策？
@@ -550,6 +662,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 长期食用帮助改善因肠道“垃圾”引起的肠动力差、肠道早衰、营养吸收不佳等问题
     page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 优美达「益畅 」益生菌压片糖果
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 优美达「益畅 」益生菌压片糖果 | 益畅产品说明书 | 通便
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 通过肠道菌群重建，可以实现血糖、血压和血脂的整体改善，同时逆转糖尿病到前期甚至正常水平
+    page: null
+    via: pool-judge
   answer: 原创咀嚼片益生菌配方，适合日常餐后食用；经验证适合有助改善长期排便不畅；长期食用帮助改善因肠道“垃圾”引起的肠动力差、肠道早衰、营养吸收不佳等问题。
 - id: faq_xlsx-0032
   query: 优美达益畅的功能成分有什么？
@@ -566,6 +690,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 鼠李糖乳酪杆菌OF44（专利号ZL202011248842.0）
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: \n动物双歧杆菌乳亚种BGI-N3\n副干酪乳酪杆菌BGI-N2
+    page: null
+    via: pool-judge
   answer: '五株华大畅活益生菌（一畅到底）:
 
     鼠李糖乳酪杆菌OF44（专利号ZL202011248842.0）
@@ -597,6 +725,30 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 华大自有益生菌，直接补充国人肠道常见缺少的有益菌种，益生元高效助力有益菌增殖，在
     page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 含有的益生菌在体内生长代谢过程中产生多种有机酸，使肠腔pH下降，电势降低，进而调节肠道的正常蠕动，缓解便秘症状
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 含有的益生菌在体内生长代谢过程中产生多种有机酸，使肠腔pH下降，电势降低，进而调节肠道的正常蠕动，缓解便秘症状
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 含有的益生菌在体内生长代谢过程中产生多种有机酸，使肠腔pH下降，电势降低，进而调节肠道的正常蠕动，缓解便秘症状
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 含有的益生菌在体内生长代谢过程中产生多种有机酸，使肠腔pH下降，电势降低，进而调节肠道的正常蠕动，缓解便秘症状
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益顺.docx
+    anchor: 7倍基础版益畅活菌量）。以压倒性的兵力优势，强效润肠通便，雷霆改善肠道拥堵环境。
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 专利：5株专利菌株，作用有保障，功能细分且精准“靶向”，可专利改善便秘情况
+    page: null
+    via: pool-judge
   answer: 华大自有益生菌，直接补充国人肠道常见缺少的有益菌种，益生元高效助力有益菌增殖，在肠道内产生多种有机酸和营养素，滋养和修复肠细胞，形成良好的肠道屏障作用，阻止多种有害菌滋生和有害物质侵蚀，帮助肠道逐渐恢复健康、规律排便。
 - id: faq_xlsx-0034
   query: 为什么有效改善便秘？
@@ -613,6 +765,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 便秘和肠内微生态有着密切的联系，肠道内菌群既可以诱发便秘，也能借助便秘产生各种危
     page: null
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 益生菌分解益生元，生成有机酸，进而降低肠道pH值，促进肠道蠕动；
+    page: null
+    via: pool-judge
   answer: '便秘和肠内微生态有着密切的联系，肠道内菌群既可以诱发便秘，也能借助便秘产生各种危害机体的物质。现代医学研究证实，长期便秘会诱发不同的疾病而导致人体提早老化。粪便长期积存在肠道中，使有害菌大量繁殖，产生的有害物质进入循环代谢，引起机体多个器官的损害。
 
     华大自有益生菌调节肠道菌群，对缓解便秘有着较好的效果。便秘人群在服用益畅时，含有的益生菌在体内生长代谢过程中产生多种有机酸，使肠腔pH下降，电势降低，进而调节肠道的正常蠕动，缓解便秘症状。同时产生的有机酸还可使肠腔内渗透压增高、水分分泌增加，粪便中水分增多可缓解便秘。且大量研究证实，益生元、合生元均有缓解便秘的效果，宜于长期服用，且无依赖性，所以益畅可以有效改善有望便秘。'
@@ -631,6 +787,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 尤其适合难以兼顾三餐健康、生活节奏快的人群（压力大、久坐、应酬多、三餐将就、蔬果
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 覆盖3岁以上儿童（咀嚼能力良好）、成年人（包括孕产妇）、老年人。尤其适合难以兼顾三餐健康、生活节奏快的人群
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 覆盖3岁以上儿童（咀嚼能力良好）、成年人（包括孕产妇）、老年人。尤其适合难以兼顾三餐健康、生活节奏快的人群
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 覆盖3岁以上儿童（咀嚼能力良好）、成年人（包括孕产妇）、老年人。尤其适合难以兼顾三餐健康、生活节奏快的人群
+    page: null
+    via: pool-judge
   answer: 覆盖3岁以上儿童（咀嚼能力良好）、成年人（包括孕产妇）、老年人。尤其适合难以兼顾三餐健康、生活节奏快的人群（压力大、久坐、应酬多、三餐将就、蔬果摄入少、长期排便困扰、经常出差）。
 - id: faq_xlsx-0036
   query: 益畅食用方法？
@@ -647,6 +815,22 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 直接口服，一天1~2袋，餐后半小时内嚼服
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 益畅 | 便秘 | 婴幼儿 | 180.0 | 18 | 30 | 258 | 奶味 | 压片糖果 | 餐后30分钟左右咀嚼
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 长期便秘/肠道紊乱，每天2-3包，分开服用
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益顺.docx
+    anchor: 益畅是片剂(压片糖果)：优点是便携、免冲泡，咀嚼食用方便。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 直接嚼食，每日食用1~2袋，餐后半小时食用更佳；服用抗生素期间需间隔2小时食用益生菌
+    page: null
+    via: pool-judge
   answer: 直接口服，一天1~2袋，餐后半小时内嚼服
 - id: faq_xlsx-0037
   query: 益畅营养指导
@@ -693,6 +877,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 效果因人而异，如果客户只是偶尔会便秘或者是想排便更通畅，可能1~2天就有改善，坚
     page: null
+  - document: 产品说明书：益畅.docx
+    anchor: 通常连续食用1-2天就能感受到变化。建议坚持服用1个月，帮助肠道环境稳定下来
+    page: null
+    via: pool-judge
   answer: 效果因人而异，如果客户只是偶尔会便秘或者是想排便更通畅，可能1~2天就有改善，坚持吃1个月调理后更佳；如果客户是长期便秘问题，建议每天加量至2~3袋，建议至少调理3个月，让肠道菌群“脱胎换骨”。
 - id: faq_xlsx-0039
   query: 吃益畅需要注意什么？
@@ -709,6 +897,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 益畅中活菌也需要合适的生存环境和“食物”才能更好发挥作用，想快速增殖平衡肠道的话
     page: null
+  - document: 产品说明书：益畅.docx
+    anchor: 长期便秘/肠道紊乱，每天2-3包，分开服用。过程观察身体变化调整
+    page: null
+    via: pool-judge
   answer: 益畅中活菌也需要合适的生存环境和“食物”才能更好发挥作用，想快速增殖平衡肠道的话，需要给益生菌充足的食物，所以应注意多吃粗粮和蔬果，补充多一些益生元（例如搭配菊粉片），而且注意增加饮水，助力肠道逆龄、排便通畅。
 - id: faq_xlsx-0040
   query: 益畅与通便的药物或者酵素类产品有什么区别？
@@ -725,6 +917,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 市面上通便产品（含番泻叶、大黄、芦荟成分的泻剂）或药物大多是“强迫”肠道蠕动，从
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 益畅的配方设计就是为了兼顾肠道健康恢复和排便顺利，从调理肠道功能的根本上解决问题
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 益畅的配方设计就是为了兼顾肠道健康恢复和排便顺利，从调理肠道功能的根本上解决问题
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 益畅的配方设计就是为了兼顾肠道健康恢复和排便顺利，从调理肠道功能的根本上解决问题
+    page: null
+    via: pool-judge
   answer: 市面上通便产品（含番泻叶、大黄、芦荟成分的泻剂）或药物大多是“强迫”肠道蠕动，从而快速排便，但便秘的发生就因为肠道“不舒服”了，如果还强行刺激蠕动，虽然能排便但对肠道健康无益，益畅的配方设计就是为了兼顾肠道健康恢复和排便顺利，从调理肠道功能的根本上解决问题，客户肠道恢复健康以后，排便自然无需借助外力。
 - id: faq_xlsx-0041
   query: 常年喝肠润茶的人可以吃益畅来恢复自主排便吗？
@@ -757,6 +961,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 补充人体肠道所需四大双歧杆菌，重塑菌群平衡，提升肠道青春健康
     page: null
+  - document: 畅青产品课件.pdf
+    anchor: 容易拉肚子、大便不成形、腹痛、腹胀、抗生素治疗期间
+    page: null
+    via: pool-judge
   answer: 补充人体肠道所需四大双歧杆菌，重塑菌群平衡，提升肠道青春健康
 - id: faq_xlsx-0043
   query: 优美达畅青产品成分？
@@ -822,6 +1030,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 3岁以上可食用，肠道早衰、消化难、经常使用抗生素治疗、消化不良食欲不振、消瘦、腹
     page: null
+  - document: 畅青产品课件.pdf
+    anchor: 容易拉肚子、大便不成形、腹痛、腹胀、抗生素治疗期间、乳
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 3岁以上可食用，适合热爱高热量饮食、肠道早衰、消化难、经常使用抗生素治疗、消化不良食欲不振、消瘦或肥胖等代谢障碍人群
+    page: null
+    via: pool-judge
+  - document: 产品说明书：畅青.docx
+    anchor: 非常适合。双歧杆菌，尤其是青春双歧杆菌，会随着年龄增长而大幅减少。补充畅青可以直接补充这些核心有益菌
+    page: null
+    via: pool-judge
   answer: 3岁以上可食用，肠道早衰、消化难、经常使用抗生素治疗、消化不良食欲不振、消瘦、腹泻、腹痛、腹泻便秘交替、肠易激综合征、日常肠道养护
 - id: faq_xlsx-0046
   query: 畅青食用方法？
@@ -838,6 +1058,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 每日1次，每次1～2袋，餐后半小时内咀嚼食用
     page: null
+  - document: 畅青产品课件.pdf
+    anchor: 餐后半小时食用1袋（直接咀嚼），症状严重者可加量至
+    page: null
+    via: pool-judge
   answer: 每日1次，每次1～2袋，餐后半小时内咀嚼食用
 - id: faq_xlsx-0047
   query: 畅青营养指导
@@ -900,6 +1124,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 不管是感染性腹泻，还是非感染性腹泻，都可以通过补充益生菌来恢复和改善人体肠道内的
     page: null
+  - document: 产品说明书：畅青.docx
+    anchor: 畅青干预后腹泻改善率可达67%
+    page: null
+    via: pool-judge
   answer: 不管是感染性腹泻，还是非感染性腹泻，都可以通过补充益生菌来恢复和改善人体肠道内的微生态环境，缓解腹泻。
 - id: faq_xlsx-0050
   query: 肠炎人群可以吃畅青吗？
@@ -1076,6 +1304,42 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 快速缓解胃反酸、灼痛和酒后胃不适，长期食用可辅助胃粘膜消炎、修复，提升胃部健康和
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 快速缓解胃反酸、灼痛和酒后胃不适，长期食用可辅助胃粘膜消炎、修复，提升胃部健康和消化功能。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 快速缓解胃反酸、灼痛和酒后胃不适，长期食用可辅助胃粘膜消炎、修复，提升胃部健康和消化功能。
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 益舒都采用食品级成分，无依赖无副作用，舒缓&修复&调节三合一，长期食用还能减轻病情
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 益舒都采用食品级成分，无依赖无副作用，舒缓&修复&调节三合一，长期食用还能减轻病情
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: 快速缓解胃反酸、灼痛和酒后胃不适，⻓期⻝⽤可辅助胃粘膜消炎、修复，提升胃部健康和消化
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: 有效性：每袋150亿CFU活菌，有效改善肠胃健康，温和养胃
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: ⻝⽤益舒改善率为：消化不良84.57%，胃部胀⽓75.84%，胃部热
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 一方面覆盖胃受伤的地方保护起来，一方面给胃黏膜修复提供了原料
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 一方面覆盖胃受伤的地方保护起来，一方面给胃黏膜修复提供了原料
+    page: null
+    via: pool-judge
   answer: 快速缓解胃反酸、灼痛和酒后胃不适，长期食用可辅助胃粘膜消炎、修复，提升胃部健康和消化功能。
 - id: faq_xlsx-0061
   query: 优美达益舒功能成分有什么？
@@ -1092,6 +1356,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 动物双歧杆菌乳亚种BGI-N3（专利号：:ZL2024 11622228.4）
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: G-AD发酵大豆粉（含多种营养的后生元）
+    page: null
+    via: pool-judge
   answer: '主要成分：
 
     四株华大益舒菌（挑战胃酸）
@@ -1122,6 +1390,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 发酵大豆粉直接中和胃酸和阻止胃蛋白酶，牢牢护住粘膜病损部位，其中的营养成分能修复
     page: null
+  - document: 83_益舒益生菌带货-艾丽-.docx
+    anchor: 益舒里的4种专利菌，就是华大专门为咱们国人挑的‘精英部队’，更懂咱们的身体
+    page: null
+    via: pool-judge
+  - document: 85_益舒益生菌脚本策划20260104aili.docx
+    anchor: 六步，工艺保障（专利冻干保护技术、十万级洁净车间）；第七步，文献支持（核心成分有临床研究背书）。
+    page: null
+    via: pool-judge
   answer: 四株华大益生菌帮助恢复胃部菌群平衡，提升免疫、给胃粘膜舒缓炎症；发酵大豆粉直接中和胃酸和阻止胃蛋白酶，牢牢护住粘膜病损部位，其中的营养成分能修复胃粘膜。
 - id: faq_xlsx-0063
   query: 益舒适用人群
@@ -1154,6 +1430,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 胃不适时及时口服2～3袋（空腹也可），巩固期每天1～2袋，随餐食用
     page: null
+  - document: 82_益舒口播稿菌株+带货-12月30日.docx
+    anchor: 你根本不用冲水，直接撕开，倒进嘴里。瞬间，在嘴里化开
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.docx
+    anchor: 餐后半小时食用1袋(直接口服)胃不舒服时及酒前酒后随时食用(适当加量)
+    page: null
+    via: pool-judge
   answer: 胃不适时及时口服2～3袋（空腹也可），巩固期每天1～2袋，随餐食用；饮酒人群酒前酒后各食用2袋以上更佳
 - id: faq_xlsx-0065
   query: 益舒营养指导
@@ -1186,6 +1470,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 胃反酸、烧心、嘴里发酸发苦、恶心这些胃不适发作的情况，及时吃2~3袋益舒可以在1
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 及时吃2~3袋益舒可以在10分钟内缓解不适，如果想减少胃不适的发生或减轻相关症状，建议每天1~2袋，调理3~6个月
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 及时吃2~3袋益舒可以在10分钟内缓解不适，如果想减少胃不适的发生或减轻相关症状，建议每天1~2袋，调理3~6个月
+    page: null
+    via: pool-judge
   answer: 胃反酸、烧心、嘴里发酸发苦、恶心这些胃不适发作的情况，及时吃2~3袋益舒可以在10分钟内缓解不适，如果想减少胃不适的发生或减轻相关症状，建议每天1~2袋，调理3~6个月，这期间胃不适的情况会逐渐减少减轻。
 - id: faq_xlsx-0067
   query: 益舒为什么能修补胃黏膜？
@@ -1218,6 +1510,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 胃药是用抑制胃酸、中和胃酸的方式消除胃不适，并不是“治疗”胃病，还会有药物副作用
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 胃药是用抑制胃酸、中和胃酸的方式消除胃不适，并不是“治疗”胃病，还会有药物副作用
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 胃药是用抑制胃酸、中和胃酸的方式消除胃不适，并不是“治疗”胃病，还会有药物副作用
+    page: null
+    via: pool-judge
   answer: 胃药是用抑制胃酸、中和胃酸的方式消除胃不适，并不是“治疗”胃病，还会有药物副作用，长期用药甚至可能药效减弱，使胃病患者非常痛苦；益舒都采用食品级成分，无依赖无副作用，舒缓&修复&调节三合一，长期食用还能减轻病情。
 - id: faq_xlsx-0069
   query: 益舒对胃胀气，菌群失调有帮助吗？
@@ -1234,6 +1534,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 益舒的配方设计就是针对胃病不适和胃肠菌群失调，胃部长期胀气可能是消化不良、慢性胃
     page: null
+  - document: 话术.docx
+    anchor: 益舒是针对胃部菌群和黏膜修护的，不是立马压胃酸的药，修护需要一个过程
+    page: null
+    via: pool-judge
   answer: 有。益舒的配方设计就是针对胃病不适和胃肠菌群失调，胃部长期胀气可能是消化不良、慢性胃炎、胃肠菌群失衡，益舒针对这些情况均有调理作用。
 - id: faq_xlsx-0070
   query: 腹痛胃痛吃益畅还是益舒？
@@ -1266,6 +1570,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 益舒甜味基本就是来自木糖醇和菊粉，因为原料发酵大豆粉本身的气味和味道并不愉快，所
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 不影响血糖、辅助调节血清总胆固醇、低密度胆固醇
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 不影响血糖、辅助调节血清总胆固醇、低密度胆固醇
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: 益舒甜味基本就是来⾃⽊糖醇和菊粉，因为原料发酵⼤⾖粉本⾝的⽓味和味道并不愉快，所以加 ⼤了健康甜味成分的量
+    page: null
+    via: pool-judge
   answer: '益舒甜味基本就是来自木糖醇和菊粉，因为原料发酵大豆粉本身的气味和味道并不愉快，所以加大了健康甜味成分的量，所以口感有甜味，为了让大家更愉快吃益生菌：
 
     1、菊粉：提取自天然菊苣根，促进肠道内双歧杆增殖、帮助促进钙的吸收、不影响血糖、辅助调节血清总胆固醇、低密度胆固醇；2、木糖醇：自然界分布十分广泛→各类水果、蔬菜、谷类、菌类等，可促进肠道有益菌生长、不影响血糖、抗龋齿、减慢血浆中生成脂肪酸的速度、减少脂肪组织生成'
@@ -1358,6 +1674,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 华大女性益生菌是根据中国女性所需优势菌种，专门筛选的卷曲乳杆菌、格氏乳杆菌和鼠李
     page: null
+  - document: 产品说明书：密蜜（女性闺蜜菌） V2.docx
+    anchor: 其核心有效性在于真正打通了“肠道–生殖道–内分泌”的底层闭环，对雌激素进行双向靶向调节
+    page: null
+    via: pool-judge
+  - document: 产品说明书：密蜜（女性闺蜜菌） V2.docx
+    anchor: 口服密蜜益生菌改善女性内分泌与雌激素，核心在于打通“肠道–生殖道”的底层联动
+    page: null
+    via: pool-judge
   answer: 华大女性益生菌是根据中国女性所需优势菌种，专门筛选的卷曲乳杆菌、格氏乳杆菌和鼠李糖乳杆菌，耐胃酸胆汁、高产乳酸和过氧化氢、定植能力强，更适合国人女性体质，不仅路过消化道时就能调节肠道菌群，到达阴道还可更快重建私处菌群平衡。密蜜帮助快速清扫阴道中的有害菌，增加好的乳酸菌，从而缓解炎症、修复阴道内环境、平衡内分泌。搭配的蔓越莓精华可抗氧化、预防/改善泌尿道健康，全方位呵护私处器官。
 - id: faq_xlsx-0077
   query: 密蜜适用人群
@@ -1454,6 +1778,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 密蜜益生菌可通过调节阴道菌群、增加阴道精英益生菌、增强生殖系统免疫健康，来综合辅
     page: null
+  - document: 产品说明书：密蜜（女性闺蜜菌） V2.docx
+    anchor: 使用阴道微生态调节剂(乳杆菌类)重建失衡的阴道微生态，可以减少细菌性阴道病的发生，维护阴道微生态平衡，从而有效地降低高危型HPV的感染。
+    page: null
+    via: pool-judge
   answer: 有一定辅助效果。密蜜益生菌可通过调节阴道菌群、增加阴道精英益生菌、增强生殖系统免疫健康，来综合辅助女性对HPV的预防或清除。
 - id: faq_xlsx-0083
   query: 密蜜对hpv有效果吗？
@@ -1470,6 +1798,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 研究表明，阴道微生态失衡与高危型HPV感染密切相关，微生态失衡后，致病菌肆意破坏
     page: null
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 有一定辅助效果。密蜜益生菌可通过调节阴道菌群、增加阴道精英益生菌、增强生殖系统免疫健康，来综合辅助女性对HPV的预防或清除。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 有一定辅助效果。密蜜益生菌可通过调节阴道菌群、增加阴道精英益生菌、增强生殖系统免疫健康，来综合辅助女性对HPV的预防或清除。
+    page: null
+    via: pool-judge
   answer: 研究表明，阴道微生态失衡与高危型HPV感染密切相关，微生态失衡后，致病菌肆意破坏生殖道黏膜组织，从而给HPV病毒提供可乘之机;HPV感染可能通过改变人体的免疫功能，导致阴道菌群结构变化，进而打破微生态平衡，造成阴道炎发生，其中合并细菌性阴道病比较常见。使用阴道微生态调节剂(乳杆菌类)重建失衡的阴道微生态，可以减少细菌性阴道病的发生，维护阴道微生态平衡，从而有效地降低高危型HPV的感染。
 - id: faq_xlsx-0084
   query: 密蜜对宫颈癌有效果吗？
@@ -1612,6 +1948,22 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: γ-氨基丁酸、茶叶茶氨酸、酪蛋白肽，对脑部有安定作用、促进放松和消除神经紧张、保
     page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 益休不会直接让你困，但会从舒缓大脑方面保护大脑健康、放松情绪，从而促进入睡，提高睡眠质量
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 益休不会直接让你困，但会从舒缓大脑方面保护大脑健康、放松情绪，从而促进入睡，提高睡眠质量
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 通过多种功能营养成分调理睡眠和情绪健康，放松大脑、促进深睡眠、缓解负情绪。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 通过多种功能营养成分调理睡眠和情绪健康，放松大脑、促进深睡眠、缓解负情绪。
+    page: null
+    via: pool-judge
   answer: γ-氨基丁酸、茶叶茶氨酸、酪蛋白肽，对脑部有安定作用、促进放松和消除神经紧张、保护神经、镇静、调节情绪、提高认知能力等方面有良好的保健作用；添加以助眠闻名的药膳成分酸枣仁，含有酸枣仁皂苷、黄酮苷类、维生素E等营养；“华大晚安菌组合”双歧杆菌+乳酸杆菌合成营养素和神经递质，调节脑肠轴，增强“情绪抵抗力”。
 - id: faq_xlsx-0092
   query: 益休适用人群
@@ -1644,6 +1996,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 粉剂益休：睡前半小时1～2袋，直接口服或少量常温水冲饮
     page: null
+  - document: 益休产品课件.pdf
+    anchor: 匹兹堡睡眠质量评估为“一般”：睡前半小时食用1袋
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益休.docx
+    anchor: 益休舒缓情绪食用：餐后半小时1-2袋，直接口服或少量常温水冲饮
+    page: null
+    via: pool-judge
   answer: 粉剂益休：睡前半小时1～2袋，直接口服或少量常温水冲饮
 - id: faq_xlsx-0094
   query: 吃多久能改善睡眠？
@@ -1782,6 +2142,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: （本品含有果粉成分，如有对此类成分过敏/不耐受者，请勿食用）
     page: null
+  - document: 益健产品课件.pdf
+    anchor: 日常养护、易过敏、免疫功能低下或重症人群如需使用益生菌
+    page: null
+    via: pool-judge
   answer: 3岁以上儿童、成年人、老年人。适合肠道敏感、免疫力低下、易过敏、易感冒发烧、易疲劳人群。（本品含有果粉成分，如有对此类成分过敏/不耐受者，请勿食用）
 - id: faq_xlsx-0101
   query: 益健食用方法？
@@ -1798,6 +2162,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 直接口服，一天1~2袋，餐后半小时内食用
     page: null
+  - document: 益健产品课件.pdf
+    anchor: 餐后半小时食用1袋（直接口服）
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益健.docx
+    anchor: 搭配菊粉固体饮料，每天1-2次，每次1勺，少量常温水冲泡
+    page: null
+    via: pool-judge
   answer: 直接口服，一天1~2袋，餐后半小时内食用
 - id: faq_xlsx-0102
   query: 益健营养指导
@@ -1862,6 +2234,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 益健配方属于温和、调理、通用型益生菌，适合肠道敏感、免疫力低下、易过敏、易感冒发
     page: null
+  - document: 益健产品课件.pdf
+    anchor: 作为日常养护者，建议食用3个月作为调理期
+    page: null
+    via: pool-judge
   answer: 益健配方属于温和、调理、通用型益生菌，适合肠道敏感、免疫力低下、易过敏、易感冒发烧、易疲劳人群，尤其肠胃功能和体质弱的老人、小孩。以上情况都是需要长期调理的，建议至少吃3~6个月，期间消化和免疫情况会逐步改善。
 - id: faq_xlsx-0105
   query: 肠道菌群跟免疫功能有什么关系？
@@ -1974,6 +2350,30 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 高嘌呤饮食可导致肠道微生态失衡，继而加重嘌呤和尿酸代谢异常，使尿酸水平升高，并引
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 清风是功能性益生菌食品，通过食养调理的方式帮助身体清酸、抗氧化以及提升代谢健康
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 清风是功能性益生菌食品，通过食养调理的方式帮助身体清酸、抗氧化以及提升代谢健康
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 直接“减少尿酸积累”和“增加尿酸排出”，食养配方温和清酸，安心可靠无依赖
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 直接“减少尿酸积累”和“增加尿酸排出”，食养配方温和清酸，安心可靠无依赖
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 通过食养调理的方式帮助身体清酸、抗氧化以及提升代谢健康
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 通过食养调理的方式帮助身体清酸、抗氧化以及提升代谢健康
+    page: null
+    via: pool-judge
   answer: '肠道微生态系统参与机体嘌呤和尿酸代谢，已被大量研究证实。高嘌呤饮食可导致肠道微生态失衡，继而加重嘌呤和尿酸代谢异常，使尿酸水平升高，并引起痛风的发生、发展。既然肠道微生态系统是嘌呤、尿酸代谢的重要环节，那么通过补充益生菌就可以起到预防或改善高尿酸血症及痛风的作用。
 
     清风作用机理：
@@ -2122,6 +2522,22 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 帮助超重/肥胖人群控制食欲，加快燃脂代谢，清除胆固醇，恢复健康体重
     page: null
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 纤维增加饱腹感、延缓糖类吸收
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 益动里添加的格氏乳杆菌TF08
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 益动里添加的格氏乳杆菌TF08
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 体重管理：轻路 + 镜脂轻
+    page: null
+    via: pool-judge
   answer: 帮助超重/肥胖人群控制食欲，加快燃脂代谢，清除胆固醇，恢复健康体重
 - id: faq_xlsx-0118
   query: 轻产品成分？
@@ -2248,6 +2664,14 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 调理期（2~3个月）每天1次，每次1~2袋
     page: null
+  - document: 镜脂系列产品课件.pdf
+    anchor: 餐后半小时食用1袋（直接咀嚼），肥胖者可加量至2~3袋，
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 镜脂·轻是餐后半小时吃1袋，比较胖的可以加到2-3袋分开吃
+    page: null
+    via: pool-judge
   answer: '调理期（2~3个月）每天1次，每次1~2袋
 
     ； 餐后半小时至1小时，咀嚼食用'
@@ -2382,6 +2806,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 有害菌为了存活会释放比平时更多的毒素，或者通过改变代谢途径生成新毒素来对抗益生菌
     page: null
+  - document: 减脂客户沟通SOP-ella.docx
+    anchor: ；恢复正常饮食，坏菌立刻把热量转脂肪。炎症还抑制脂肪分解，越饿身体越不肯动脂肪
+    page: null
+    via: pool-judge
   answer: '首先评估饮食、生活方式、精神压力有无变化，以及激素水平如甲状腺激素等有无问题。（从各个方面来分析原因，给到客户建议）
 
     第一：出现体重增加的现象，叫作赫氏消亡反应。出现该症状是因为在人体消化系统中，益生菌和有害菌正在展开剧烈的斗争。有害菌为了存活会释放比平时更多的毒素，或者通过改变代谢途径生成新毒素来对抗益生菌。而这些毒素在作用于益生菌的同时，也使人体出现了副反应，导致了一系列症状。所以这些副反应不是来自益生菌，而是来自已经占据体内肠道的那些有害菌。有时这些副反应反倒是一个好信号，说明益生菌已发挥作用，有害菌正在消亡。随着坚持服用益生菌，病情就会逐渐好转，益生菌逐渐战胜有害菌，直至身体完全建复。所以，有人形象地说赫氏消亡反应是“治愈疾病过程中黎明前的黑暗”。
@@ -2425,6 +2853,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 经肠养肝，通过补充华大益生菌、姜黄、益生元、葡聚糖等功能成分达到提升肝脏健康、减
     page: null
+  - document: 益净产品课件.pdf
+    anchor: 减法：减少危险因素 除法：清除毒素、修复损伤
+    page: null
+    via: pool-judge
   answer: 经肠养肝，通过补充华大益生菌、姜黄、益生元、葡聚糖等功能成分达到提升肝脏健康、减少肝细胞炎症和促进修复的作用。
 - id: faq_xlsx-0134
   query: 益净产品成分
@@ -2477,6 +2909,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 调节肠道菌群，提升肠屏障功能，提高机体免疫力
     page: null
+  - document: 益净产品课件.pdf
+    anchor: 加法：增加保护因子 乘法：多成分协同，高效护肝
+    page: null
+    via: pool-judge
   answer: '干预机制：➕➖✖➗ 四段式护肝
 
 
@@ -2513,6 +2949,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 有养护肝脏需求的人群：长期高脂高糖饮食、腹型肥胖/高血脂、饮酒应酬、长期使用药物
     page: null
+  - document: 益净产品课件.pdf
+    anchor: 高脂高糖饮食、腹型肥胖/高血脂、饮酒应酬、长期使用药物或
+    page: null
+    via: pool-judge
   answer: '有养护肝脏需求的人群：长期高脂高糖饮食、腹型肥胖/高血脂、饮酒应酬、长期使用药物或保健品、熬夜、肝功检查异常、肝炎愈后
 
     （注意：婴幼儿、孕期、哺乳期不建议食用）'
@@ -2603,6 +3043,46 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 3、配方兼顾调节肠-肝轴、抗炎、降脂、抗氧化、促修复、排“毒素”
     page: null
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 干预机制：➕➖✖➗ 四段式护肝
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 干预机制：➕➖✖➗ 四段式护肝
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 干预机制：➕➖✖➗ 四段式护肝
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 干预机制：➕➖✖➗ 四段式护肝
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 我们的优势是兼顾安全、多重协同、全方位，从肠出发新一代护肝方式
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 我们的优势是兼顾安全、多重协同、全方位，从肠出发新一代护肝方式
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 我们的优势是兼顾安全、多重协同、全方位，从肠出发新一代护肝方式
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 我们的优势是兼顾安全、多重协同、全方位，从肠出发新一代护肝方式
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益净（护肝）.docx
+    anchor: 益净益生菌产品基于“肠-肝轴”前沿生物机理，利用4株核心专研菌在肠道构建生物拦截网，源头阻断内毒素
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益净（护肝）.docx
+    anchor: 复配β-葡聚糖，采用创新的“三明治夹心技术”将活性姜黄素吸收率提升10倍
+    page: null
+    via: pool-judge
   answer: '1、原料均为食品原料，含多种营养成分，不给肝肾造成额外负担；
 
     2、通过多种机制养护肝脏，一次提升肝脏多方面的健康；
@@ -2743,6 +3223,22 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 因为这三种益生元经过益生菌利用后，会产生一些气体，是益生元起作用的正常现象（被益
     page: null
+  - document: 中国营养师培训教材.pdf
+    anchor: 因为个体间需要量的差异相当大，推荐
+    page: null
+    via: pool-judge
+  - document: 中国营养师培训教材.pdf
+    anchor: 上可以达到某一水平，机体出现毒副反应的概率等于1．0。
+    page: null
+    via: pool-judge
+  - document: 中国营养师培训教材.pdf
+    anchor: 产生相应的营养缺乏的危害；如果长期摄入某种营养素过多就可能产生相应的毒副作用。
+    page: null
+    via: pool-judge
+  - document: 中国营养师培训教材.pdf
+    anchor: 证这一个群体中在绝大多数情况下摄人不足的概率和摄人量过多的概率都很低。
+    page: null
+    via: pool-judge
   answer: 因为这三种益生元经过益生菌利用后，会产生一些气体，是益生元起作用的正常现象（被益生菌发酵利用），但吃太多膳食纤维片会导致短时间内肠道内产气较多，可能给日常生活带来不便，容易胀气的客户建议从一天1~2片开始尝试；不怎么吃蔬果杂粮的客户则可以一天吃4~6片。
 - id: faq_2026-0001
   query: 镜脂产品作用？
@@ -2759,6 +3255,46 @@ cases:
   - document: 华大营养益生菌FAQ-2026.xlsx
     anchor: 帮助超重/肥胖人群控制食欲，加快燃脂代谢，清除胆固醇，恢复健康体重
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 镜脂里添加的菌能延缓在高脂饮食下的体重增加，可辅助减重降脂，同时添加的栗子粉和海藻粉还能促进代谢消耗
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 镜脂里添加的菌能延缓在高脂饮食下的体重增加，可辅助减重降脂，同时添加的栗子粉和海藻粉还能促进代谢消耗
+    page: null
+    via: pool-judge
+  - document: 镜脂阻 美藤果餐前片产品介绍aili2026.pdf
+    anchor: 美藤果蛋白肽在降血糖降血脂
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 功能细分且精准“靶向”，可专利为肝脏减负
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 益动里添加的格氏乳杆菌TF08
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 镜脂里面除了添加可以辅助减重降脂的益生菌外，还添加了会吸附水分的益生元
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 镜脂里面除了添加可以辅助减重降脂的益生菌外，还添加了会吸附水分的益生元
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 镜脂不是减肥药，是帮助超重/肥胖/高血脂人群尽快恢复肠道菌群平衡、提升糖脂代谢能力、一定程度加速燃脂和排出肠垃圾
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 镜脂不是减肥药，是帮助超重/肥胖/高血脂人群尽快恢复肠道菌群平衡、提升糖脂代谢能力、一定程度加速燃脂和排出肠垃圾
+    page: null
+    via: pool-judge
+  - document: 销售知识：减脂客户沟通SOP.docx
+    anchor: 专门调理因为饮食不规律而紊乱的肠道环境，改善食欲。肠道健康了，代谢才能提上来，脂肪也不容易囤积
+    page: null
+    via: pool-judge
   answer: 帮助超重/肥胖人群控制食欲，加快燃脂代谢，清除胆固醇，恢复健康体重
 - id: faq_2026-0002
   query: 镜脂产品成分？
@@ -2775,6 +3311,18 @@ cases:
   - document: 华大营养益生菌FAQ-2026.xlsx
     anchor: 鼠李糖乳酪杆菌OF44专利号：ZL202011248842.0
     page: null
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 动物双歧杆菌乳亚种BGI-N3 专利号：:ZL2024 11622228.4
+    page: null
+    via: pool-judge
+  - document: 销售知识：减脂客户沟通SOP.docx
+    anchor: 它里面的姜辣素和茶多酚复合物，能激活人体关键的AMPK代谢开关；柑橘果粉和二氢杨梅素能促进脂肪分解
+    page: null
+    via: pool-judge
+  - document: 镜脂系列产品课件.pdf
+    anchor: 动物双歧杆菌乳亚种BGI-N3
+    page: null
+    via: pool-judge
   answer: "六株华大“燃动”菌\n动物双歧杆菌乳亚种BGI-N3   专利号：:ZL2024 11622228.4\n植物乳植杆菌BGI-N6\n格氏乳杆菌TF08  专利号：ZL201811514219.8\n鼠李糖乳酪杆菌OF44专利号：ZL202011248842.0 \n乳酸片球菌BGI-N9 \n戊糖片球菌BGI-N8\n\n“燃料”益生元组合\n⽔溶性膳⻝纤维（聚葡萄糖）、乳糖醇、\n低聚半乳糖、低聚果糖、抗性糊精\n\n糖油“阻”合\n栗⼦粉、海藻粉、柑橘纤维粉"
 - id: faq_2026-0003
   query: 镜脂营养指导
@@ -2833,6 +3381,18 @@ cases:
   - document: 华大营养益生菌FAQ-2026.xlsx
     anchor: 3岁以上可食用，更适合超重/肥胖、减脂健身、控制体重、肤色暗黄人群、爱好高脂饮食
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: BMI≥24、血脂异常、高糖高脂饮食、暴饮暴食
+    page: null
+    via: pool-judge
+  - document: 镜脂系列产品课件.pdf
+    anchor: 超重肥胖（BMI＞24，体质指数(BMI)=体重(kg)÷身高^2(m)）、
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 3岁以上均可食用，有减肥体重管理需求的人群适合食用。镜脂益生菌拥有专利菌株和经过人群实证效果，适合3岁以上所有人群（包括三高人群）
+    page: null
+    via: pool-judge
   answer: 3岁以上可食用，更适合超重/肥胖、减脂健身、控制体重、肤色暗黄人群、爱好高脂饮食、血脂异常人群
 - id: faq_2026-0005
   query: 镜脂食用方法？
@@ -2849,6 +3409,18 @@ cases:
   - document: 华大营养益生菌FAQ-2026.xlsx
     anchor: 调理期（2~3个月）每天1次，每次1~2袋
     page: null
+  - document: 镜脂系列产品课件.pdf
+    anchor: 餐后半小时食用1袋（直接咀嚼），肥胖者可加量至2~3袋，
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 中餐或晚餐餐前30分钟左右，用250ml温热水冲饮
+    page: null
+    via: pool-judge
+  - document: 镜脂阻 美藤果餐前片产品介绍aili2026.pdf
+    anchor: 开袋即食 ，直接温水吞食 ，餐前食用
+    page: null
+    via: pool-judge
   answer: '调理期（2~3个月）每天1次，每次1~2袋
 
     ； 餐后半小时至1小时，咀嚼食用'
@@ -2957,6 +3529,10 @@ cases:
   - document: 产品说明书 ：益休.docx
     anchor: '**答：**多数人服用益生菌后不会出现明显不良反应，可能仅感觉肚子有“咕噜”声或'
     page: null
+  - document: 话术.docx
+    anchor: 益家人是一款专为肠道健康设计的复合益生菌
+    page: null
+    via: pool-judge
   answer: '优美达益衡益生菌产品采用“四大华大专研糖友益生菌+专配益生元 + 药食同源植物成分 ”三重复合配方，从阻（竞争性抑制 α‑淀粉酶、α-葡萄糖苷酶，阻断淀粉、葡萄糖的吸收）、促（激活AMPK 和 AKT 代谢通路，促进能量消耗，促进人体自身 GLP-1 与胰岛素分泌，促进短链脂肪酸生成，提升胰岛素敏感性）、衡稳（调节肠道菌群失衡，修复肠道屏障，缓解慢性炎症，减轻胰岛素抵抗，稳住血糖波动），最终把血糖曲线从‘过山车’变成‘平缓步道’。
 
 
@@ -3069,6 +3645,10 @@ cases:
   - document: 产品说明书 ：晚安饮.docx
     anchor: 无添加糖，碳水化合物NRV仅2%，血糖不稳定可食用后监测其反应情况
     page: null
+  - document: 产品说明书 ：灵芝百合晚安饮（入夜）.docx
+    anchor: ，最好在医生或营养师的指导下决定是否饮用及饮用量
+    page: null
+    via: pool-judge
   answer: 可以。无添加糖，碳水化合物NRV仅2%，血糖不稳定可食用后监测其反应情况
 - id: manual_qa-0009
   query: 晚安饮和益休喝完拉肚子，是不是产品不适合？
@@ -3104,6 +3684,42 @@ cases:
   - document: 产品说明书 ：畅爽.docx
     anchor: 适合不爱吃蔬菜、膳食纤维摄入不足、经常外食、便秘倾向、希望温和通便的人群
     page: null
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 经常外卖、应酬、聚餐，膳
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 纤维增加饱腹感、延缓糖类吸收
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 适⽤于关注⾎糖稳定的 ⼈群，轻路延缓餐后糖类吸收，益衡从菌群层⾯辅助⾎糖平衡。
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 偏精细、常吃外卖应酬聚餐、有膳
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 适用于关注体重管理和体脂控制的人群，轻路提供膳食纤维增加饱腹感、延缓糖类吸收
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 适合长期膳食纤维摄入不足，肠道菌群失衡人群
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 轻路未额外添加糖，主要是膳食纤维，通常不会引起血糖波动。同时混合食物还能降低食物GI值，所以适合高血糖人员食用。
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 经常聚餐、饮食油腻、蔬菜摄入少、易腹胀便秘的人群
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 轻路 | 吃蔬果少、吃益生菌期、便秘或性状不佳、BMI≥24、高糖高脂饮食、暴饮暴食、代餐
+    page: null
+    via: pool-judge
   answer: 适合不爱吃蔬菜、膳食纤维摄入不足、经常外食、便秘倾向、希望温和通便的人群。血糖波动大人群，混合食物降低食物升糖指数。也适合作为益生菌辅助食用，增强肠道调理效果。
 - id: manual_qa-0011
   query: 轻路可以长期喝吗？
@@ -3523,6 +4139,10 @@ cases:
   - document: 产品说明书：甘油二酯油.docx
     anchor: ，长期使用对高血脂高尿酸、高血糖、高体脂有显著改善作用，30多年来全球有100+
     page: null
+  - document: 产品说明书：甘油二酯油.docx
+    anchor: 甘油二酯是油脂的一种天然成分，其分子结构是由一个甘油分子和两个脂肪酸分子结合而成
+    page: null
+    via: pool-judge
   answer: 甘油二酯油是油脂的一种天然成分，也存在于天然油脂中，但含量通常较低。它是由一个甘油分子和两个脂肪酸分子构成。，长期使用对高血脂高尿酸、高血糖、高体脂有显著改善作用，30多年来全球有100+国际权威科学家及机构功效验证，制备技术荣获国家科学进步奖
 - id: manual_qa-0048
   query: 甘油二酯油和普通食用油（大豆油、橄榄油等）有什么区别
@@ -3599,6 +4219,10 @@ cases:
   - document: 产品说明书：益畅（珠峰版）.docx
     anchor: 便秘与肠道微生态密切相关：菌群失调不仅可诱发便秘，还会在便秘时产生有害物质，长期
     page: null
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 益生菌可影响肠神经系统的兴奋性神经递质
+    page: null
+    via: pool-judge
   answer: '便秘与肠道微生态密切相关：菌群失调不仅可诱发便秘，还会在便秘时产生有害物质，长期积累可能引发多种疾病，加速机体老化。华大益畅益生菌通过调节菌群，有效缓解便秘。其作用机制包括：
 
 
@@ -3615,6 +4239,34 @@ cases:
   - document: 产品说明书：益畅.docx
     anchor: 如果困扰您的是长期、顽固的便秘，我们建议您加量至每天2-3袋，并至少坚持调理3个
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 效果因人而异，如果客户只是偶尔会便秘或者是想排便更通畅，可能1~2天就有改善，坚持吃1个月调理后更佳
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 效果因人而异，如果客户只是偶尔会便秘或者是想排便更通畅，可能1~2天就有改善，坚持吃1个月调理后更佳
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 日常改善偶尔便秘情况，每天1包。1～2天就能感受到变化，坚持1个月对肠道更好
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 效果因人而异，如果客户只是偶尔会便秘或者是想排便更通畅，可能1~2天就有改善，坚持吃1个月调理后更佳
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 效果因人而异，如果客户只是偶尔会便秘或者是想排便更通畅，可能1~2天就有改善，坚持吃1个月调理后更佳
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 通常连续食用1-2天就能感受到变化。建议坚持服用1个月，帮助肠道环境稳定下来
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 益生菌干预1周后，平均周完全自主排便次数得到显著提升，干预4周后，
+    page: null
+    via: pool-judge
   answer: '服用效果因人而异，取决于您的肠道原有基础情况。如果您只是偶尔便秘或希望排便更通畅，通常连续食用1-2天就能感受到变化。建议坚持服用1个月，帮助肠道环境稳定下来。
 
 
@@ -3667,6 +4319,22 @@ cases:
   - document: 产品说明书：益顺.docx
     anchor: 在补充益生菌的同时，采取6个小妙招可以进一步促进益生菌在肠道中的作用，帮助它们更
     page: null
+  - document: 产品说明书：益畅.docx
+    anchor: 可以改善排便的整体症状、排便费力情况、疼痛、大便性状
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益顺.docx
+    anchor: 可以改善排便的整体症状、排便费力情况、疼痛、大便性状
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 多吃纤维：多摄入富含纤维的蔬菜（如菠菜、芹菜）、水果（如木瓜、梨）以及粗粮（如玉米、糙米），以增加粪便体积。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 多吃纤维：多摄入富含纤维的蔬菜（如菠菜、芹菜）、水果（如木瓜、梨）以及粗粮（如玉米、糙米），以增加粪便体积。
+    page: null
+    via: pool-judge
   answer: '在补充益生菌的同时，采取6个小妙招可以进一步促进益生菌在肠道中的作用，帮助它们更快地发挥作用。**
 
 
@@ -3705,6 +4373,14 @@ cases:
   - document: 产品说明书：益畅.docx
     anchor: 益生菌发挥作用并非完全取决于菌株添加量，关键在于能否活着进入肠道并发挥作用，华大
     page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 4层锁活：保护菌株活性，活着到肠道
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: ，表明这5株菌能够互相协同生长
+    page: null
+    via: pool-judge
   answer: '益生菌发挥作用并非完全取决于菌株添加量，关键在于能否活着进入肠道并发挥作用，华大益生菌用3步保证益生菌添加量是科学搭配，适合你的肠道添加量。**
 
 
@@ -3759,6 +4435,10 @@ cases:
   - document: 产品说明书 ：益休.docx
     anchor: 优美达系列的益生菌“各有所长”，如果您需要改善不止一种情况的时候，是可以同时食用
     page: null
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 是可以同时食用2～3种的，根据自身情况选择即可。如担心一次摄入太多活菌会使肠道不适应，则可分别间隔数个小时食用
+    page: null
+    via: pool-judge
   answer: 优美达系列的益生菌“各有所长”，如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可。如担心一次摄入太多活菌会使肠道不适应，则可分别间隔数个小时食用；如尝试同时食用后没有任何不适应，则放心同时食用。
 - id: manual_qa-0064
   query: 为什么益顺益生菌能有效改善便秘？
@@ -3851,6 +4531,10 @@ cases:
   - document: 产品说明书 ：益休.docx
     anchor: 华大益生菌包装通过4层锁活技术，冻干保护技术、多层包埋技术（微囊）、高阻隔内袋（
     page: null
+  - document: 产品说明书：益顺.docx
+    anchor: 如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
   answer: 华大益生菌包装通过4层锁活技术，冻干保护技术、多层包埋技术（微囊）、高阻隔内袋（隔氧隔水遮光）、锁活。产品经过严格的稳定性试验和严苛的检测，在保质期内保证可达到标示的活菌数，保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
 - id: manual_qa-0069
   query: 益顺可以和华大其他益生菌一起吃吗？怎么吃？
@@ -3916,6 +4600,18 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: γ-氨基丁酸、茶叶茶氨酸、酪蛋白肽，对脑部有安定作用、促进放松和消除神经紧张、保
     page: null
+  - document: 产品说明书 ：益休.docx
+    anchor: 益生菌促进肠道产生GABA、5-羟色胺、褪黑素等睡眠相关神经递质，例如乳杆菌和双歧杆菌可代谢谷氨酸生成GABA，从而调节睡眠-觉醒周期
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益休.docx
+    anchor: 益生菌通过调节脑肠轴功能、优化肠道菌群结构、影响神经递质与免疫反应，从而有效改善睡眠
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益休.docx
+    anchor: 可恢复菌群平衡，显著改善睡眠潜伏期、睡眠深度及总睡眠时间
+    page: null
+    via: pool-judge
   answer: 益休不单单靠益生菌改善睡眠，“华大晚安菌组合”中植物乳植杆菌BGI-N6高产褪黑素和γ氨基丁酸，调节脑肠轴，增强“情绪抵抗力”，动物双歧杆菌乳亚种A6 ，具有良好的抗氧化能力，高效清除自由基。γ-氨基丁酸、茶叶茶氨酸、酪蛋白肽，对脑部有安定作用、促进放松和消除神经紧张、保护神经、镇静、调节情绪、提高认知能力等方面有良好的保健作用；添加以助眠闻名的药膳成分酸枣仁，含有酸枣仁皂苷、黄酮苷类、维生素E等，多种成分组合起到舒缓情绪，达到改善睡眠作用。
 - id: manual_qa-0071
   query: 益休益生菌如何服用比较好，睡不着可以多加几袋吃吗？
@@ -3932,6 +4628,18 @@ cases:
   - document: 产品说明书 ：益衡（血糖管理）.docx
     anchor: 对于食用量调整，可咨询营养师结合自身情况调整用量，不建议自己单独大量服用，建议每
     page: null
+  - document: 产品说明书 ：益休.docx
+    anchor: 益休改善睡眠：睡前半小时1～2袋，直接口服或少量常温水冲饮
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 每天一次，睡前半小时到一小时服用就可以了，要是半夜突然醒了睡不着，可以加服一袋
+    page: null
+    via: pool-judge
+  - document: 益休产品课件.pdf
+    anchor: 匹兹堡睡眠质量评估为“很差”，睡前半小时食用2袋
+    page: null
+    via: pool-judge
   answer: '益休改善睡眠：睡前半小时1～2袋，直接口服或少量常温水冲饮
 
 
@@ -4250,6 +4958,42 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 3岁以上均可食用，考虑情况是否适合即可
     page: null
+  - document: 益净产品课件.pdf
+    anchor: 减重 | 降脂 | 控糖
+    page: null
+    via: pool-judge
+  - document: 益净产品课件.pdf
+    anchor: 高脂高糖饮食、腹型肥胖/高血脂、饮酒应酬、长期使用药物或
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 有养护肝脏需求的人群：长期高脂高糖饮食、腹型肥胖/高血脂、饮酒应酬、长期使用药物或保健品、熬夜、肝功检查异常、肝炎愈后
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 有养护肝脏需求的人群：长期高脂高糖饮食、腹型肥胖/高血脂、饮酒应酬、长期使用药物或保健品、熬夜、肝功检查异常、肝炎愈后
+    page: null
+    via: pool-judge
+  - document: 减脂客户沟通SOP-ella.docx
+    anchor: 特别适合应酬多、饮食油腻、感觉疲劳或有脂肪肝倾向的朋友。
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 建议无需治疗的肝脏问题、偶尔饮酒、熬夜、长期遵医嘱服用药物的人群，食用益酐调理3-6个月为佳
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 建议无需治疗的肝脏问题、偶尔饮酒、熬夜、长期遵医嘱服用药物的人群，食用益酐调理3-6个月为佳
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 建议无需治疗的肝脏问题、偶尔饮酒、熬夜、长期遵医嘱服用药物的人群，食用益酐调理3-6个月为佳
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 建议无需治疗的肝脏问题、偶尔饮酒、熬夜、长期遵医嘱服用药物的人群，食用益酐调理3-6个月为佳
+    page: null
+    via: pool-judge
   answer: 3岁以上均可食用，考虑情况是否适合即可。适合怕并发症和担心药物副作用的护肝管理强需求人群。
 - id: manual_qa-0096
   query: 益净益生菌与谷胱甘肽等护肝药物的区别？
@@ -4306,6 +5050,22 @@ cases:
   - document: 产品说明书 ：益衡（血糖管理）.docx
     anchor: 是否作息不规律熬夜等这些外在因素影响
     page: null
+  - document: 话术.docx
+    anchor: 玖伴是帮身体加快酒精代谢、保护肠胃和肝脏的，不是喝了就不醉，效果也和喝酒的量、酒的种类有关
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 23人反馈酒后不适得到显著改善（有效率92.00%），53.33%受试者反馈“睡眠良好，无不良症状困扰”
+    page: null
+    via: pool-judge
+  - document: 玖伴产品课件.pdf
+    anchor: 00%），53.33%受试者反馈“睡眠
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 23人反馈酒后不适得到显著改善（有效率92.00%），53.33%受试者反馈“睡眠良好，无不良症状困扰”
+    page: null
+    via: pool-judge
   answer: 需要详细了解自身情况再综合判断，主要关注几个方面:否用药；是否食用过高毒素和过高含量的酒精等影响因素；是否作息不规律熬夜等这些外在因素影响；服用量不够或太多。
 - id: manual_qa-0101
   query: 不同血糖状态（如糖调节受损、糖尿病不同分期、是否在用药）差异很大，**不能一概而论**。
@@ -4316,6 +5076,10 @@ cases:
   - document: 产品说明书 ：人参玫瑰早安饮【晨苏】 .docx
     anchor: '| 若仅是**轻度血糖偏高且控制良好**的人群，可以**试饮用，观察血糖波动水平'
     page: null
+  - document: 产品说明书 ：人参玫瑰早安饮【晨苏】 .docx
+    anchor: 不同血糖状态（如糖调节受损、糖尿病不同分期、是否在用药）差异很大，
+    page: null
+    via: pool-judge
   answer: '因此建议：
 
 
@@ -4556,6 +5320,14 @@ cases:
   - document: 产品说明书：益畅.docx
     anchor: 鼠李糖乳酪杆菌OF44 专利号：ZL202011248842.0
     page: null
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 鼠李糖乳酪杆菌OF44 专利号：ZL202011248842.0
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: （专利号：ZL202011248842.0）
+    page: null
+    via: pool-judge
   answer: ZL202011248842.0
 - id: hard_exact-0002
   query: 植物乳植杆菌BGI-N6的专利申请号？
@@ -4570,6 +5342,30 @@ cases:
   - document: 产品说明书 ：益家人.docx
     anchor: 专利申请号：202411264682.7
     page: null
+  - document: 益衡专利-植物乳植杆菌BGI-N6专利-申请受理通知书.pdf
+    anchor: 申请号：2024112646827 申请日：2024 年09 月10 日 申请人：华大精准营养（深圳）科技有限公司
+    page: null
+    via: pool-judge
+  - document: 益健专利-植物乳植杆菌 BGI-N6 2024112646827-专利申请受理通知书.pdf
+    anchor: 申请号：2024112646827 申请日：2024 年09 月10 日 申请人：华大精准营养（深圳）科技有限公司
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 植物乳植杆菌BGI-N6 申请号：2025107348945
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 申请号：2025107348945
+    page: null
+    via: pool-judge
+  - document: 益休产品课件.pdf
+    anchor: 植物乳植杆菌BGI-N6（快乐菌） 专利申请号：2025107348945
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益家人.docx
+    anchor: 专利申请号：2025107348945
+    page: null
+    via: pool-judge
   answer: '202411264682.7'
 - id: hard_exact-0003
   query: 格氏乳杆菌TF08-1的专利号是什么？
@@ -4581,6 +5377,22 @@ cases:
   - document: 产品说明书：镜脂轻（体重管理）.docx
     anchor: 格氏乳杆菌TF08-1 专利号ZL201811514219.8
     page: null
+  - document: 益舒产品课件.pdf
+    anchor: 格氏乳杆菌TF08-1 （专利号：ZL201811514219.8）
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.docx
+    anchor: 专利号：ZL 2018 1 1514219.8
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益净（护肝）.docx
+    anchor: 专利号：ZL 2018 1 1514219.8
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 格氏乳杆菌TF08-1 专利号：ZL201811514219.8
+    page: null
+    via: pool-judge
   answer: ZL201811514219.8
 - id: hard_exact-0004
   query: 动物双歧杆菌乳亚种A6的专利号？
@@ -4592,6 +5404,14 @@ cases:
   - document: 产品说明书 ：益休.docx
     anchor: 动物双歧杆菌乳亚种A6 专利号：ZL201410403251.4
     page: null
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 专利号：ZL 2014 1 0403251.4
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 专利号：ZL201410403251.4
+    page: null
+    via: pool-judge
   answer: ZL201410403251.4
 - id: hard_exact-0005
   query: 槐米粉的专利号是多少？
@@ -4603,6 +5423,10 @@ cases:
   - document: 产品说明书 ：晚安饮.docx
     anchor: 槐米粉专利号：ZL202211480228.6
     page: null
+  - document: 一种抗糖化的槐米粉及其制备方法和应用-发明专利证书-202211480228.6.pdf
+    anchor: 一种抗糖化的槐米粉及其制备方法和应用
+    page: null
+    via: pool-judge
   answer: ZL202211480228.6
 - id: hard_exact-0006
   query: 副干酪乳酪杆菌BGI-N2的专利申请号？
@@ -4614,6 +5438,14 @@ cases:
   - document: 产品说明书：益顺.docx
     anchor: 副干酪乳酪杆菌BGI-N2 专利申请号：2023114043622
     page: null
+  - document: 益家人产品课件.pdf
+    anchor: 副干酪乳酪杆菌 **BGI-N2** 能够预防便秘（斑马鱼实验）（斑马鱼实验） （专利申请号：202311404362.2）
+    page: null
+    via: pool-judge
+  - document: 益畅产品课件.pdf
+    anchor: 副干酪乳酪杆菌BGI-N2 申请号：202311404362.2
+    page: null
+    via: pool-judge
   answer: '2023114043622'
 - id: hard_exact-0007
   query: 戊糖片球菌BGI-N8的专利申请号是多少？
@@ -4636,6 +5468,26 @@ cases:
   - document: 产品说明书：畅青.docx
     anchor: ZL202010520225.5
     page: null
+  - document: 产品说明书 ：益家人.docx
+    anchor: （专利号：ZL202010520225.5）
+    page: null
+    via: pool-judge
+  - document: 产品知识：肠胃+睡眠专业干预.docx
+    anchor: 青春双歧杆菌95（专利号：ZL202010520225.5）
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 专利号：ZL202010520225.5
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: （专利号：ZL202010520225.5）
+    page: null
+    via: pool-judge
+  - document: 优美达益家人产品介绍2026.pdf
+    anchor: ü 专利可证青春95具有优异的产γ-氨 基丁酸GABA的能力
+    page: null
+    via: pool-judge
   answer: ZL202010520225.5
 - id: hard_exact-0009
   query: ZL202011248842.0是哪个菌株的专利？
@@ -4650,6 +5502,10 @@ cases:
   - document: 产品说明书：益畅（珠峰版）.docx
     anchor: 鼠李糖乳酪杆菌OF44 专利号：ZL202011248842.0
     page: null
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 清风专利-鼠李糖乳杆菌OF44 ZL202011248842.0.pdf
+    page: null
+    via: pool-judge
   answer: 鼠李糖乳酪杆菌OF44
 - id: hard_exact-0010
   query: 动物双歧杆菌乳亚种BGI-N3的专利号是多少？
@@ -4664,6 +5520,50 @@ cases:
   - document: 产品说明书：益畅（珠峰版）.docx
     anchor: 动物双歧杆菌乳亚种BGI-N3 专利号：ZL202411622228.4
     page: null
+  - document: 产品说明书：畅青.docx
+    anchor: （专利号：ZL 202411622228.4）
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 来源于专利说明书益衡-动物双歧杆菌乳亚种BGI‑N3 2024116222284.pdf
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 动物双歧杆菌乳亚种BGI-N3 专利号：ZL202411622228.4
+    page: null
+    via: pool-judge
+  - document: 益畅产品课件.pdf
+    anchor: 动物双歧杆菌乳亚种BGI-N3 专利号：ZL202311404362.2
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.docx
+    anchor: 专利号：ZL 2024 1 1622228.4
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 动物双歧杆菌乳亚种BGI-N3 专利号：ZL202411622228.4
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益家人.docx
+    anchor: 动物双歧杆菌乳亚种BGI-N3 专利号：ZL202411622228.4
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益健.docx
+    anchor: 专利号：ZL 2024 1 1622228.4
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 动物双歧杆菌乳亚种BGI-N3 专利号ZL20241162228.4
+    page: null
+    via: pool-judge
+  - document: 优美达益家人产品介绍2026.pdf
+    anchor: 中国发明专利（专利号：ZL202010520225.5） 《动物双歧杆菌乳亚种BGI-N3改善肥胖症的益生机制研究》
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: （专利号：ZL20241162228.4）
+    page: null
+    via: pool-judge
   answer: ZL202411622228.4
 - id: hard_exact-0011
   query: 镜脂轻里有哪几株菌？
@@ -4675,6 +5575,14 @@ cases:
   - document: 产品说明书：镜脂轻（体重管理）.docx
     anchor: 植物乳植杆菌BGI-N6、抗坏血酸（维生素C）、鼠李糖乳酪杆菌OF44、格氏乳杆菌TF08-1、乳酸片球菌BGI-N9、戊糖片球菌BGI-N8
     page: null
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: BGI-N3、TF08-1、BGI-N6、OF44、BGI-N8、BGI-N9能够高效抑制金黄色葡萄球菌
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 5株专利菌株（植物乳植杆菌BGI-N6、鼠李糖乳酪杆菌OF44、动物双歧杆菌乳亚种BGI-N3、格氏乳杆菌TF08-1、戊糖片球菌BGI-N8）
+    page: null
+    via: pool-judge
   answer: null
 - id: hard_exact-0012
   query: 清风里的干酪乳杆菌编号是什么？
@@ -4686,6 +5594,18 @@ cases:
   - document: 产品说明书 ：清风（尿酸管理）.docx
     anchor: 干酪乳杆菌LCS85
     page: null
+  - document: 产品菌株专利检索.xlsx
+    anchor: 清风 | 4 | 干酪乳杆菌LCS85
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 干酪乳杆菌LCS85、发酵粘液乳杆菌BG1-AF16、罗伊氏粘液乳杆菌BG1-AM60），更适配国人肠道
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 干酪乳杆菌LCS85、鼠李糖乳杆菌OF44、罗伊氏乳杆菌BGI-AM60
+    page: null
+    via: pool-judge
   answer: LCS85
 - id: hard_table-0001
   query: 益畅正装一盒多少钱，一盒多少袋？
@@ -4698,6 +5618,14 @@ cases:
   - document: 产品说明书：益畅.docx
     anchor: '| 正装 | 258元/盒 | 0.6g/片×4片/袋×30袋/盒 |'
     page: null
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 正装 | 599元/盒 | 5g/袋×30袋/盒
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 主推【优美达·益畅益生菌】（30袋/盒），3件到手一共9盒，354.45元，平均下来一盒大概39元
+    page: null
+    via: pool-judge
   answer: 258元/盒，30袋/盒
 - id: hard_table-0002
   query: 益畅珠峰版的零售价和保质期？
@@ -4710,6 +5638,10 @@ cases:
   - document: 产品说明书：益畅（珠峰版）.docx
     anchor: '| 正装 | 599元/盒 | 5g/袋×30袋/盒 | 500亿CFU/袋 | 24个月 |'
     page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 益畅珠峰版 | 严重便秘 | 婴幼儿 | 500.0 | 24 | 30 | 599
+    page: null
+    via: pool-judge
   answer: 599元/盒，24个月
 - id: hard_table-0003
   query: 清风一袋多少活菌，一盒几袋？
@@ -4734,6 +5666,26 @@ cases:
   - document: 产品说明书：畅青.docx
     anchor: '| 38/盒 | 净含量7.2g'
     page: null
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 优美达「畅青 」益生菌压片糖果体验装
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 总价值240元：畅青体验装
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 畅青体验装 | 3袋/包 | 38
+    page: null
+    via: pool-judge
+  - document: 华大资料/4.2赠品规则.docx
+    anchor: 畅青体验装 | 3袋/包 | 38 | 有
+    page: null
+    via: pool-judge
+  - document: 4.2赠品规则.docx
+    anchor: 畅青体验装 | 3袋/包 | 38 | 有
+    page: null
+    via: pool-judge
   answer: 38/盒
 - id: hard_table-0005
   query: 益舒的保质期多长？
@@ -4746,6 +5698,14 @@ cases:
   - document: 产品说明书：益舒.docx
     anchor: '| 258/盒 | 净含量60g（2g/袋x30袋） | 150亿CFU/袋 | 18个月 |'
     page: null
+  - document: 76_海峰总录制-1月7日【-益舒-】.docx
+    anchor: 如何确保你拿到的产品在18个月保质期内依然有高活性菌
+    page: null
+    via: pool-judge
+  - document: 84_益舒口播稿菌株+带货-李晓霞.docx
+    anchor: 从而推演出在正常条件下18个月保质期内的活性保障
+    page: null
+    via: pool-judge
   answer: 18个月
 - id: hard_table-0006
   query: 晚安饮一盒有几袋，每袋多少毫升？
@@ -4758,6 +5718,14 @@ cases:
   - document: 产品说明书 ：晚安饮.docx
     anchor: '| 139元/盒 | 30ml/袋\*7袋/盒 | 24个月 |'
     page: null
+  - document: 产品说明书 ：灵芝百合晚安饮（入夜）.docx
+    anchor: 30ml/袋x10袋
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: γ-氨基丁酸(GABA)灵芝晚安饮
+    page: null
+    via: pool-judge
   answer: 7袋，30ml/袋
 - id: hard_table-0007
   query: 镜脂轻每100克的能量是多少？
