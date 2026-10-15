@@ -1,0 +1,1828 @@
+# B-175 波 2 真实问法集(2026-10-14):题目来自企微客户聊天(三诺 × 华大控糖咨询)里客户问过的问题,
+# 脱敏后改写成可单独理解的问法(不留原句、不留个人信息),用户逐题确认。55 道有答案 + 5 道无答案。
+# 标准答案 = 人工首标(1~3 份出处)+ 汇集标注:主干 / PR1 的混合、向量、关键词四种检索各取前 20 段
+# 汇成候选池(2168 对),qwen3.7-max 逐段判「能否回答」并逐字摘引原文;摘引不是逐字的取最长公共片段
+# (≥12 字);问题点了产品名的,段落或文件名须出现该产品(抽查 40 条判「能」错 7 条,多为张冠李戴到
+# 别的产品,加此规则后约 92%)。标为 via: pool-judge。无答案题:候选池里无一段被判能回答,并在全语料
+# (含 10-13 解析缓存漏掉的文档)核对过关键词。原始聊天与中间文件只在本机 ~/kb-eval/chat/。
+# 10-15 补标(T0.5):PR0 / PR1 / PR1+PR2 召回层与带重排结果里排在首个正确段之前的段再判一轮(新增 79 对),
+# 同样的摘引与产品名规则(问句同时含长短两个产品名时按更具体的查),另允许同一文档的其他段;抽查 40 条约 36 条对。
+name: huada_v1_chat
+corpus:
+  manifest: ~/kb-eval/huada/manifest.csv
+  tiers:
+  - A
+  - D-A
+cases:
+- id: chat_qa-0001
+  query: 这个益生菌要放在冰箱里冷藏不？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 保存
+  expected:
+  - document: 产品说明书 ：益休.docx
+    anchor: 华大益生菌包装通过4层锁活技术
+    page: null
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 华大益生菌包装通过4层锁活技术
+    page: null
+  - document: 产品说明书 ：益家人.docx
+    anchor: 华大益生菌包装通过4层锁活技术
+    page: null
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 一般来说常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季节），收到产品后
+    page: null
+    via: pool-judge
+  - document: 益生菌益生元常见问题.docx
+    anchor: 般来说，粉剂和油剂的益生菌产品在其出厂包装未拆封的情况下都是可以常温保存的，添加于酸奶或其他或其它液体或半固体食品中的益生菌需要冷藏。
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益净（护肝）.docx
+    anchor: 保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：玖伴益生菌（解酒）.docx
+    anchor: 保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 一般来说优美达的所有产品常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季节），收到产品后放冰箱保存更佳。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 一般来说优美达的所有产品常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季节），收到产品后放冰箱保存更佳。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: ：置于阴凉、干燥处，避免阳光直射和高温。
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 一般来说优美达的所有产品常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季节），收到产品后放冰箱保存更佳。
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 一般来说优美达的所有产品常温避光保存即可，但考虑到不同地区的差异（温度、湿度、季节），收到产品后放冰箱保存更佳。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益顺.docx
+    anchor: 保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 保证产品常温下保存即可保留活性。如果有条件也可放冰箱，对其活性有正向影响。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0002
+  query: 益休是饭后吃还是睡前吃？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 益休
+  expected:
+  - document: 产品说明书 ：益休.docx
+    anchor: 晚餐后30分钟/睡前30分钟左右
+    page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 粉剂益休：睡前半小时1～2袋，直接口服或少量常温水冲饮
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 粉剂益休：睡前半小时1～2袋，直接口服或少量常温水冲饮
+    page: null
+    via: pool-judge
+  - document: 益休产品课件.pdf
+    anchor: 匹兹堡睡眠质量评估为“一般”：睡前半小时食用1袋
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 粉剂益休：睡前半小时1～2袋，直接口服或少量常温水冲饮
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 粉剂益休：睡前半小时1～2袋，直接口服或少量常温水冲饮
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 时间 ：睡前半小时饮用，吸收最佳
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 益休建议睡前30分钟左右吃，可以直接嚼服，也可以用100ml左右40度以下的温水冲开喝
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0003
+  query: 畅青是冲剂吗？要冲开来喝吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 畅青
+  expected:
+  - document: 产品说明书：畅青.docx
+    anchor: 餐后半小时食用1袋(直接咀嚼)，症状严重者可加量至2~3袋
+    page: null
+  - document: 畅青产品课件.pdf
+    anchor: 餐后半小时食用1袋（直接咀嚼），症状严重者可加量至
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 每日1次，每次1～2袋，餐后半小时内咀嚼食用
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 每日1次，每次1～2袋，餐后半小时内咀嚼食用
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 每日1次，每次1～2袋，餐后半小时内咀嚼食用
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 优美达「畅青 」益生菌压片糖果 | 0.6g/片
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0004
+  query: 清风是饭前吃还是饭后吃？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 清风
+  expected:
+  - document: 清风产品课件.pdf
+    anchor: 餐前半小时食用1袋，尿酸超过500者可加量至2袋
+    page: null
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 餐前30分钟左右
+    page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 推荐食用方法是1次/日，餐前空腹1~2袋，少量常温水冲调饮用即可
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 推荐食用方法是1次/日，餐前空腹1~2袋，少量常温水冲调饮用即可
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 时间 ：餐前半小时食用，吸收效果更佳
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 推荐食用方法是1次/日，餐前空腹1~2袋，少量常温水冲调饮用即可
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 推荐食用方法是1次/日，餐前空腹1~2袋，少量常温水冲调饮用即可
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0005
+  query: 益衡一天要吃几次？饭前吃吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 益衡
+  expected:
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 餐前食用，每日3次，每次1袋
+    page: null
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 益衡建议早晚餐前30分钟各1袋温水冲泡
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0006
+  query: 益畅能直接嚼着吃吗，一天吃几袋？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 益畅
+  expected:
+  - document: 产品说明书：益畅.docx
+    anchor: 直接嚼食，每日食用1~2袋
+    page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 直接口服，一天1~2袋，餐后半小时内嚼服
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 直接口服，一天1~2袋，餐后半小时内嚼服
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 一天1~2袋，餐后半小时内嚼服
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 一天1~2袋，餐后半小时内嚼服
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 益畅直接嚼食，每日1-2袋，餐后半小时食用更佳；便秘严重可以加量到2-3袋分开吃。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0007
+  query: 镜脂轻是饭后吃吗？想减得快能多吃几袋吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 镜脂轻
+  expected:
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 餐后半小时食用1袋(直接咀嚼)，肥胖者可加量至2~3袋
+    page: null
+  - document: 镜脂系列产品课件.pdf
+    anchor: 餐后半小时食用1袋（直接咀嚼），肥胖者可加量至2~3袋，
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 镜脂·轻是餐后半小时吃1袋，比较胖的可以加到2-3袋分开吃
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 每日食用1~2袋，餐后半小时食用更佳。还可以搭配轻路和菊粉膳食纤维餐前食用
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0008
+  query: 晚上要喝酒，玖伴提前多久吃？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 玖伴
+  expected:
+  - document: 产品说明书：玖伴益生菌（解酒）.docx
+    anchor: 饮酒前15分钟口服1袋
+    page: null
+  - document: 玖伴产品课件.pdf
+    anchor: 聚会前15分钟内用水送服
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 时间 ：酒前 15 分钟服用 1 袋，大量饮酒前可服用 2 袋
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 在饮酒前10~15min内服用一袋解酒产品
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 在饮酒前10~15min内服用一袋解酒产品
+    page: null
+    via: pool-judge
+  - document: 产品说明书：玖伴益生菌（解酒）.docx
+    anchor: 在饮酒前10~15min内服用一袋玖伴产品
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0009
+  query: 益舒饭前吃还是饭后吃？胃不舒服的时候能吃吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 益舒
+  expected:
+  - document: 产品说明书：益舒.docx
+    anchor: 餐后半小时食用1袋(直接口服)胃不舒服时及酒前酒后随时食用
+    page: null
+  - document: 产品说明书：益舒.pdf
+    anchor: 建议餐后半⼩时服⽤。此时胃酸浓度有所降低，有利于更多活菌通过胃部抵达肠道。若反酸不适 时随时可⻝⽤
+    page: null
+    via: pool-judge
+  - document: 益舒产品课件.pdf
+    anchor: 餐后半小时食用1袋（直接口服）
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 胃不适时及时口服2～3袋（空腹也可），巩固期每天1～2袋，随餐食用
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 胃不适时及时口服2～3袋（空腹也可），巩固期每天1～2袋，随餐食用
+    page: null
+    via: pool-judge
+  - document: 85_益舒益生菌脚本策划20260104aili.docx
+    anchor: 听我的，你别再硬扛了！饭后赶紧来一条华大益舒，它就是来解决这个问题的。
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 做日常调理的话，一天一次，一次一袋，饭后半小时温水冲服即可
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: 餐后半⼩时⻝⽤1袋(直接⼝服)胃不 舒服时及酒前酒后随时⻝⽤(适当加 量)
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0010
+  query: 镜脂阻是饭前吃还是饭后吃？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 吃法
+  - 镜脂阻
+  expected:
+  - document: 话术.docx
+    anchor: 镜脂阻餐前阻断糖脂吸收
+    page: null
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 可搭配镜脂·阻美藤果肽压片糖果，餐前半小时食用1袋
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 镜脂「阻」 美藤果肽压片糖果（餐前食用）
+    page: null
+    via: pool-judge
+  - document: 镜脂阻 美藤果餐前片产品介绍aili2026.pdf
+    anchor: 开袋即食 ，直接温水吞食 ，餐前食用
+    page: null
+    via: pool-judge
+  - document: 销售知识：减脂客户沟通SOP.docx
+    anchor: 或者您也可以在吃零食前吃1袋镜脂阻断片，阻断多余的热量被身体吸收转化为脂肪囤积
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0011
+  query: 益家人一盒吃多久？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 规格
+  - 益家人
+  expected:
+  - document: 话术.docx
+    anchor: 一盒是15袋，3个月一天一袋
+    page: null
+  answer: null
+- id: chat_qa-0012
+  query: 益休多少钱一盒，一盒几袋？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 价格
+  - 益休
+  expected:
+  - document: 产品说明书 ：益休.docx
+    anchor: 2g/袋x15袋/盒
+    page: null
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 益休益生菌升级版298元一盒（30袋），含GABA和茶氨酸，能帮助舒缓神经、缩短入睡时间。
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 优美达「益休」益生菌固体饮料
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0013
+  query: 轻路多少钱一盒？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 价格
+  - 轻路
+  expected:
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 169元/盒 | 18 个月
+    page: null
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 咱们可以先选轻路复合膳食纤维益生元，139元买一送一
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 总价值267元：89元轻路膳食纤维
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0014
+  query: 晚安饮多少钱一盒？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 价格
+  - 晚安饮
+  expected:
+  - document: 产品说明书 ：晚安饮.docx
+    anchor: 139元/盒 | 30ml/袋
+    page: null
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: γ-氨基丁酸(GABA)灵芝晚安饮
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 可以搭配晚安饮一起用，139元一盒，现在1件85折是118.15元
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0015
+  query: 益畅正装一盒多少钱？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 价格
+  - 益畅
+  expected:
+  - document: 产品说明书：益畅.docx
+    anchor: 正装 | 258元/盒
+    page: null
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: '| NaN | NaN | NaN | NaN | NaN | 益畅 | 258 | 1 | 258 | NaN |'
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 主推【优美达·益畅益生菌】（30袋/盒），3件到手一共9盒，354.45元，平均下来一盒大概39元
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 正装 | 599元/盒
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 0.6g/片×4片/袋×30袋
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0016
+  query: 这个小孩能吃吗？轻路几岁以上能喝？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 人群
+  - 轻路
+  expected:
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 不适宜人群：3岁以下婴幼儿
+    page: null
+  - document: 产品说明书 ：轻路.docx
+    anchor: 不适宜人群：3岁以下婴幼儿
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: • 3岁以上人群，尤其是：
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0017
+  query: 备孕、怀孕期间能喝轻路吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 人群
+  - 轻路
+  expected:
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 孕期和哺乳期人群：在合理用量范围内通常可以适量食用
+    page: null
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 孕期和哺乳期⼈群：在合理⽤量范围内通常可以适量⻝⽤，如有特殊体质或疑虑，建议先咨询营养
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0018
+  query: 怀孕了能喝早安饮吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 人群
+  - 晨苏
+  expected:
+  - document: 产品说明书 ：人参玫瑰早安饮【晨苏】 .docx
+    anchor: 孕妇、哺乳期妇女、14周岁以下儿童及婴幼儿等特殊人群
+    page: null
+  - document: 华大产品汇总.xlsx
+    anchor: 早安饮 | 白天没精神 | 婴幼儿、孕妇、哺乳期
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0019
+  query: 家里人尿酸有点偏高，适合吃清风吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 人群
+  - 清风
+  expected:
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 尿酸指标超标人群
+    page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 更适合高尿酸/痛风人群、喜爱食用动物内脏、海鲜、高糖、饮酒人群
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 更适合高尿酸/痛风人群、喜爱食用动物内脏、海鲜、高糖、饮酒人群
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 更适合高尿酸/痛风人群、喜爱食用动物内脏、海鲜、高糖、饮酒人群
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 更适合高尿酸/痛风人群、喜爱食用动物内脏、海鲜、高糖、饮酒人群
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 含罗伊氏乳杆菌BGI-AM60等4大菌株，主要减少食物中嘌呤的吸收，帮助抑制体内多余的尿酸合成，促进尿酸通过肠道和肾脏排泄
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 高尿酸血症（血尿酸>420μmol/L）
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 清风益生菌产品采用“益生菌降解+植物协同”方式，从而帮助尿酸值稳定。
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 清风是功能性益生菌食品，通过食养调理的方式帮助身体清酸、抗氧化以及提升代谢健康
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 清风是功能性益生菌食品，通过食养调理的方式帮助身体清酸、抗氧化以及提升代谢健康
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: ，考虑情况是否适合即可。适合怕并发症和担心药物副作用的尿酸管理强需求人群。
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 您的高尿酸、痛风、关节不适问题，适合用优美达清风，能抑制尿酸合成、促进尿酸排泄
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 直接“减少尿酸积累”和“增加尿酸排出”，食养配方温和清酸，安心可靠无依赖，适合长期调理食用。
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 直接“减少尿酸积累”和“增加尿酸排出”，食养配方温和清酸，安心可靠无依赖，适合长期调理食用。
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 直接“减少尿酸积累”和“增加尿酸排出”，食养配方温和清酸，安心可靠无依赖，适合长期调理食用。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 直接“减少尿酸积累”和“增加尿酸排出”，食养配方温和清酸，安心可靠无依赖，适合长期调理食用。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0020
+  query: 在吃抗生素，益生菌要隔多久再吃？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 搭配用药
+  expected:
+  - document: 产品说明书：益畅.docx
+    anchor: 服用抗生素期间需间隔2小时食用益生菌
+    page: null
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 活性益生菌与抗生素使用间隔 2 小时即可。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 服用抗生素期间需间隔2小时食用益生菌
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 如果吃了抗生素，要间隔2小时再吃益生菌。
+    page: null
+    via: pool-judge
+  - document: 减重客户沟通SOP-济南.xlsx
+    anchor: 如果有服用抗生素类药物，要和药物间隔两小时。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0021
+  query: 益生菌和中药一起吃冲突吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 搭配用药
+  expected:
+  - document: 82_益舒口播稿菌株+带货-12月30日.docx
+    anchor: 和大多数熬制饮品或营养补充剂，间隔30分钟以上服用即可
+    page: null
+  - document: 药食同源食物筛选及分类.pdf
+    anchor: 部分药食同源食材具有广谱抗菌/抗真菌活性，若与活菌直接混合，可能降低活菌数
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.docx
+    anchor: 可以。建议间隔30分钟以上服用，以避免药物对益生菌活性的潜在影响
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0022
+  query: 华大的两种益生菌可以同时配合着吃吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 搭配用药
+  expected:
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 如果您需要改善不止一种情况的时候
+    page: null
+  - document: 产品说明书 ：益休.docx
+    anchor: 如果您需要改善不止一种情况的时候
+    page: null
+  - document: 产品说明书 ：益家人.docx
+    anchor: 如果您需要改善不止一种情况的时候
+    page: null
+  - document: 产品说明书：益顺.docx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 产品说明书：玖伴益生菌（解酒）.docx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益净（护肝）.docx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 作为我们华大的基础益生菌，可以搭配其它益生菌同时服用，效果更好。
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 基础益生菌 + 靶向益生菌
+    page: null
+    via: pool-judge
+  - document: 减脂客户沟通SOP-ella.docx
+    anchor: 镜脂轻益生菌+益净益生菌就是帮您同时解决这2个问题
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0023
+  query: 益生菌是药吗？能治病吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 成分性质
+  expected:
+  - document: 益生菌益生元常见问题.docx
+    anchor: 不是药物，也不能代替药物治疗疾病
+    page: null
+  - document: 益生菌与抗菌治疗_赵丹.pdf
+    anchor: 年抗生素的替代疗法已经受到人们的高度重视
+    page: null
+    via: pool-judge
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: 明确告知：益生菌不能替代降尿酸药（别嘌醇、非布司他、苯溴马隆等）。
+    page: null
+    via: pool-judge
+  - document: 益生菌益生元常见问题.docx
+    anchor: 主要用于治疗腹泻、肠道功能紊乱等疾病
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0024
+  query: 益休是活菌吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 成分性质
+  - 益休
+  expected:
+  - document: 产品说明书 ：益休.docx
+    anchor: 100亿CFU/袋
+    page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 每袋150亿CFU活菌，直接添加GABA200mg/袋，酪蛋白肽，和4种
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: （植物乳植杆菌BGI-N6、动物双歧杆菌A6专利号：ZL201410403251.4）
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: （植物乳植杆菌BGI-N6、动物双歧杆菌A6专利号：ZL201410403251.4）
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 益休益生菌适合当做“放松补品”“助眠帮手”，但不能当做“药物”
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 每袋100亿CFU活菌，直接添加GAMA，酪蛋白肽，和4种植萃营养
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0025
+  query: 畅青主要是什么成分？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 成分性质
+  - 畅青
+  expected:
+  - document: 产品说明书：畅青.docx
+    anchor: 山梨糖醇、异麦芽酮糖醇、低聚半乳糖、水苏糖
+    page: null
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: （青春双歧杆菌95、长双歧杆菌BB68S、两歧双歧杆菌BGI-AF45
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: （青春双歧杆菌95、长双歧杆菌BB68S、两歧双歧杆菌BGI-AF45
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: （青春双歧杆菌95、长双歧杆菌BB68S、两歧双歧杆菌BGI-AF45
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: （青春双歧杆菌95、长双歧杆菌BB68S、两歧双歧杆菌BGI-AF45
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0026
+  query: 轻路是什么东西？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 成分性质
+  - 轻路
+  expected:
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 优美达轻路复合益生元膳食纤维固体饮料
+    page: null
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 优美达轻路由抗性糊精、圆苞⻋前⼦壳粉、⽔苏糖、低聚⽊糖、海藻粉五种原料组成
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 本品成分为天然植物提取膳食纤维，每袋膳食纤维含量为日常推荐1/3，适合长期膳食纤维摄入不足，肠道菌群失衡人群
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 轻路 膳食纤维代餐粉
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 优美达「轻路」 膳食纤维粉
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 优美达轻路由抗性糊精、圆苞车前子壳粉、水苏糖、低聚木糖、海藻粉五种原料组成
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 轻路为纯膳食纤维产品
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 纤维增加饱腹感、延缓糖类吸收
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 优美达轻路复合益⽣元膳⻝纤维固体饮料（BGI五轻粉）
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 轻路直接补充膳食纤维，每袋提供6.79g膳食纤维，达到摄入量的1/3
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 轻路作为益生元，为益生菌提供「食物和养分」
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 轻负饮食 + 活力菌群 = 轻松管理数字。适用于关注体重管理和体脂控制的人群
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0027
+  query: 畅爽和益生菌有什么区别？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 成分性质
+  - 畅爽
+  expected:
+  - document: 产品说明书 ：畅爽.docx
+    anchor: 畅爽和益生菌有什么区别
+    page: null
+  answer: null
+- id: chat_qa-0028
+  query: 益生菌是不是从粪便里提取出来的？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 成分性质
+  expected:
+  - document: 基于宏基因组测序探究格氏乳杆菌TF08-1对肥胖症大鼠脂质代谢及肠道菌群的影响_罗强.pdf
+    anchor: 是一株分离自健康女性肠道样本的益生菌株
+    page: null
+  - document: 82_益舒口播稿菌株+带货-12月30日.docx
+    anchor: 它们是科学家们从咱们中国本土健康人群肠道中分离出的6万多菌株库里头挑的
+    page: null
+    via: pool-judge
+  - document: 长寿老人源两歧双歧杆菌益生特性及其抗衰老作用研究_周樊.pdf
+    anchor: 番地区长寿老人粪便中筛选得到的
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0029
+  query: 益衡的效果比二甲双胍好吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 益衡
+  expected:
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 效果优于同剂量二甲双胍对照组
+    page: null
+  - document: 产品说明书 ：益家人.docx
+    anchor: 效果优于同剂量二甲双胍对照组
+    page: null
+  - document: 益衡专利-格氏乳杆菌TF-08 CN111281894A.PDF
+    anchor: 同时TF08-1组小鼠的血糖值比二甲双胍组的血糖值更
+    page: null
+    via: pool-judge
+  - document: 益衡专利-格氏乳杆菌TF-08 CN111281894A.PDF
+    anchor: 程中，TF08-1在各个时间点的血糖值比二甲双胍的低，由此可见TF08-1对糖尿病小鼠葡萄
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0030
+  query: 益生菌真的能稳定血糖吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 益衡
+  expected:
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 提高胰岛素敏感性，帮助维持血糖稳态
+    page: null
+  - document: 产品说明书 ：益家人.docx
+    anchor: 提高胰岛素敏感性，帮助维持血糖稳态
+    page: null
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: 药物是控糖核心，益生菌是辅助手段，通过改善菌群提升胰岛素敏感性、减少血糖波动
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: ：可有效降低食物热量转化率，改善代谢，减轻胰岛素抵抗，从而降低餐后血糖
+    page: null
+    via: pool-judge
+  - document: 华大营养健康管理项目介绍20260326.pdf
+    anchor: 益衡——益生守护，血糖衡稳血糖衡稳： 四大专利控糖菌，调节糖代谢
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 益生菌对于糖尿病以及糖前期的人群，主要是帮着改善胰岛素敏感性，让餐后血糖更平稳，同时减少身体的糖吸收。
+    page: null
+    via: pool-judge
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: 四大专利控糖菌，调节糖代谢
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 适用于关注血糖稳定的人群，轻路延缓餐后糖类吸收，益衡从菌群层面辅助血糖平衡。
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：灵芝百合晚安饮（入夜）.docx
+    anchor: 如血糖控制较差，建议需要同步进行血糖管理，如益衡益生菌+轻路益生元，帮助日常血糖稳定
+    page: null
+    via: pool-judge
+  - document: 益家人专利-植物乳植杆菌LH-511  CN201711168190.pdf
+    anchor: 制也成了益生菌降糖功能筛选的重要指标
+    page: null
+    via: pool-judge
+  - document: 益家人专利-鼠李糖乳杆菌ASD-9  降血糖 专利说明书  CN201711168215_.pdf
+    anchor: 制也成了益生菌降糖功能筛选的重要指标
+    page: null
+    via: pool-judge
+  - document: 益生菌、益生元和合生元治疗糖尿病及其并发症的研究进展_沈子豪.pdf
+    anchor: 益生菌通过调节代谢、改善胰岛素敏感度、降
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 益生菌与血糖管理之间的联系主要体现在其对肠道微生物群的调节作用，以及由此带来的对胰岛素敏感性、糖代谢和全身炎症状态的多种影响，从而有效调节血糖。
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 多项随机对照试验表明，益生菌干预能够有效降低餐后血糖
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 优美达益衡益生菌产品采用
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 益家人益生菌产品成分经过体外实验、动物实验、人群实验、临床实验验证可有效稳定血糖，达到科学控糖
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 益衡益生菌产品成分经过体外实验、动物实验、人群实验、临床实验验证可有效稳定血糖，达到科学控糖
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 抑制肠道 α-葡萄糖苷酶与 DPP-4，延长内源 GLP-1 半衰期，降低餐后血糖峰值
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 益生菌能产生细菌素等物质，保护胰岛，促进胰岛功能，抑制a-葡萄糖苷酶，在调节血糖中起关键作用。
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益家人.docx
+    anchor: 益家人益生菌产品成分经过体外实验、动物实验、人群实验、临床实验验证可有效稳定血糖，达到科学控糖
+    page: null
+    via: pool-judge
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: ：显著降低空腹血糖（平均降低0.58 mmol/L）和空腹胰岛素水平。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0031
+  query: 买一盒益休试试，多久能改善睡眠？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 益休
+  expected:
+  - document: 产品说明书 ：益休.docx
+    anchor: 益休吃多久能改善睡眠
+    page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 如果是长期失眠甚至已经引起情绪异常和身体问题，
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果是长期失眠甚至已经引起情绪异常和身体问题，
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 建议至少调理1~3个月，这个期间会有逐步改善的感觉
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 建议至少调理1~3个月，这个期间会有逐步改善的感觉
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0032
+  query: 吃清风多久能看到尿酸降下来？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 清风
+  expected:
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 吃清风益生菌多久后可见高尿酸改善
+    page: null
+  - document: 华大营养产品知识库.xlsx
+    anchor: 根据以往用户反馈数据显示，需要坚持至少一个月可见一定降酸效果。
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 根据以往用户反馈数据显示，需要坚持至少一个月可见一定降酸效果。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 根据以往用户反馈数据显示，需要坚持至少一个月可见一定降酸效果。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 根据以往用户反馈数据显示，需要坚持至少一个月可见一定降酸效果。
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 天效果 ：总体有效率 78%，平均尿酸下降 47.82μmol/L
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 清风配合着饮食，坚持 1 个月，尿酸肯定会慢慢降
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0033
+  query: 晚安饮一天喝几次，要喝多久？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 晚安饮
+  expected:
+  - document: 产品说明书 ：灵芝百合晚安饮（入夜）.docx
+    anchor: 每天喝多少合适？什么时候喝最好？要喝多久？
+    page: null
+  - document: 产品说明书 ：灵芝百合晚安饮（入夜）.docx
+    anchor: 每日 1 次，每次 1 袋
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0034
+  query: 密蜜要吃多久才有效果？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 密蜜
+  expected:
+  - document: 产品说明书：密蜜（女性闺蜜菌） V2.docx
+    anchor: 一般建议坚持食用至少3个月作为一个完整的调理周期
+    page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 轻微不适，加量食用密蜜3天左右可感觉好转，连续食用半个月～1个月可感觉明显清爽舒适
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 轻微不适，加量食用密蜜3天左右可感觉好转，连续食用半个月～1个月可感觉明显清爽舒适
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果轻微不适，加量食用密蜜3天左右可感觉好转，连续食用半个月～1个月可感觉明显清爽舒适
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 轻微不适，加量食用密蜜3天左右可感觉好转，连续食用半个月～1个月可感觉明显清爽舒适
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 周期 ：建议连续食用 3-6 个月，维持菌群平衡
+    page: null
+    via: pool-judge
+  - document: 密蜜产品课件.pdf
+    anchor: 细菌性阴道炎和激素紊乱者建议食用6个月及以上
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0035
+  query: 刚吃益生菌几天，肚子有点胀、会拉肚子，正常吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  expected:
+  - document: 产品说明书 ：益休.docx
+    anchor: 菌群失调越严重，赫氏反应可能越大
+    page: null
+  - document: 产品说明书 ：益家人.docx
+    anchor: 菌群失调越严重，赫氏反应可能越大
+    page: null
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 在服用初期（特别是前1-4周），可能出现症状暂时加重的情况，如便秘、腹痛、腹泻、胀气或皮肤痘痘增多
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 特别是前1-4周），可能出现症状暂时加重的情况，如便秘、腹痛、腹泻、胀气或皮肤痘痘增多。
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：晚安饮.docx
+    anchor: 在服用初期（特别是前1-4周），可能出现症状暂时加重的情况，如便秘、腹痛、腹泻、胀气或皮肤痘痘增多
+    page: null
+    via: pool-judge
+  - document: 83_益舒益生菌带货-艾丽-.docx
+    anchor: 这可能是在“做好事”！这叫“赫氏反应”，是新来的“好兵”（益生菌）和原来的“坏蛋”在打架
+    page: null
+    via: pool-judge
+  - document: 产品说明书：密蜜（女性闺蜜菌） V2.docx
+    anchor: 极少数人在初期（1-4周）可能出现轻微胃肠道反应，如腹胀、排气增多，这可能是益生菌在肠道内定植、菌群调整过程中的暂时现象
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 少数人刚开始摄入益生菌产品后，会觉得有轻微的肠道不适，如排便次数增加/减少、排气增加等
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 少数人刚开始摄入益生菌产品后，会觉得有轻微的肠道不适，如排便次数增加/减少、排气增加等
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 在补充益生菌的前1~4周，会出现病症加重的现象(如腹痛、多气、腹泻加重
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 在补充益生菌的前1~4周，会出现病症加重的现象(如腹痛、多气、腹泻加重
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 前面7天是竞争期，可能会有赫氏消亡反应，比如腹泻，腹胀，腹痛等属于正常反应
+    page: null
+    via: pool-judge
+  - document: 82_益舒口播稿菌株+带货-12月30日.docx
+    anchor: 有极少数家人，在刚开始吃益舒的头几天，可能会感觉肚子咕噜咕噜叫，或者有轻微的胀气。别紧张，这很可能是一个积极的信号
+    page: null
+    via: pool-judge
+  - document: 77_益舒口播-曦曦.docx
+    anchor: 很多人吃完酸溜溜的、肚子上面鼓鼓胀胀的、嘴巴苦苦的，就想抓根救命稻草，这种‘突击式养护’
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 初期可能出现轻微的排气增多或肚子
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0036
+  query: 吃了两三个月感觉好多了，停了会不会反弹？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 益舒
+  expected:
+  - document: 82_益舒口播稿菌株+带货-12月30日.docx
+    anchor: 益舒是食品，不存在依赖性
+    page: null
+  - document: 产品说明书：益舒.docx
+    anchor: 停用后，补充的益生菌会逐渐随代谢排出，但通过调理已改善的肠道环境和部分定植的菌株有助于维持长期效果。
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: 会逐渐随代谢排出，但通过调理已改善的肠道环境和部分定植的菌株有助于维持⻓期效果。
+    page: null
+    via: pool-judge
+  - document: 基层心血管病综合管理实践指南2020.pdf
+    anchor: 一般停药过程不应短于2周，以防
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益休.docx
+    anchor: 建议继续食用，干预3-6个月巩固后，再尝试减少食用。
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 益生菌不是特效药，服用安全，没有副作用，也没有依赖性的
+    page: null
+    via: pool-judge
+  - document: 减脂客户沟通SOP-ella.docx
+    anchor: 肝脏代谢好了，您才容易健康地瘦、不易反弹。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 后期食用密蜜巩固1～3个月可预防复发
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 后期食用密蜜巩固1～3个月可预防复发
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 后期食用密蜜巩固1～3个月可预防复发
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 想要这些益生菌真正数量充足活在肠道中，需要持续补充巩固一段时间才可，不然确实可能打回原形
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0037
+  query: 畅爽可以长期喝吗？会不会有依赖？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 效果
+  - 畅爽
+  expected:
+  - document: 产品说明书 ：畅爽.docx
+    anchor: 无化学泻剂，不产生依赖性
+    page: null
+  answer: null
+- id: chat_qa-0038
+  query: 胃不舒服、老反酸，吃哪个益生菌？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 选品
+  - 益舒
+  expected:
+  - document: 产品说明书：益舒.docx
+    anchor: 饮食辛辣不敢吃、反酸嗳气止不住
+    page: null
+  - document: 话术.docx
+    anchor: 益舒（黄色包装-消化不好、胃闹情绪）：含 4株专利菌 + 发酵大豆粉（后生元），快速 缓解胃反酸、灼痛
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 腹痛、上腹胀气、嗳气、恶心、反酸、灼痛；胃炎、胃溃疡、经常饮酒应酬、
+    page: null
+    via: pool-judge
+  - document: 83_益舒益生菌带货-艾丽-.docx
+    anchor: 益舒里有个叫G-AD（发酵大豆粉）的“后生元”成分，它就像“消防员”，能快速地提供缓冲，那种火烧火燎的感觉很快就妥帖了。
+    page: null
+    via: pool-judge
+  - document: 82_益舒口播稿菌株+带货-12月30日.docx
+    anchor: 可以在晚餐后半小时，吃一袋益舒。它能帮助舒缓夜间的不适感，辅助身体夜间进行修复和休息
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 快速缓解胃反酸、灼痛和酒后胃不适，长期食用可辅助胃粘膜消炎、修复，提升胃部健康和消化功能。
+    page: null
+    via: pool-judge
+  - document: 84_益舒口播稿菌株+带货-李晓霞.docx
+    anchor: 益生菌如园丁，一边用温和水雾（缓冲）降低火势，一边修补、绿化胃壁（修复黏膜）
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 快速缓解胃反酸、灼痛和酒后胃不适，长期食用可辅助胃粘膜消炎、修复，提升胃部健康和消化功能。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0039
+  query: 改善便秘有什么方法？推荐吃哪个？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 选品
+  - 畅爽
+  expected:
+  - document: 产品说明书 ：畅爽.docx
+    anchor: 排便费力、排出困难
+    page: null
+  - document: 产品说明书：益顺.docx
+    anchor: 可以改善排便的整体症状、排便费力情况、疼痛、大便性状，并增加每周大便次数、缩短排便间隔时间
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅.docx
+    anchor: 可以改善排便的整体症状、排便费力情况、疼痛、大便性状，并增加每周大便次数、缩短排便间隔时间
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 6个小妙招 排便通畅无忧
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 6个小妙招 排便通畅无忧
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 6个小妙招 排便通畅无忧
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 6个小妙招 排便通畅无忧
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益畅（珠峰版）.docx
+    anchor: 多吃纤维：多摄入富含纤维的蔬菜（如菠菜、芹菜）、水果（如木瓜、梨）以及粗粮（如玉米、糙米），以增加粪便体积。
+    page: null
+    via: pool-judge
+  - document: 产品知识：肠胃+睡眠专业干预.docx
+    anchor: 顽固型可短期加至50克/日，晨起空腹
+    page: null
+    via: pool-judge
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: /轻路（6.79g/10g）/
+    page: null
+    via: pool-judge
+  - document: 慢性便秘肠道微生态临床应用中国专家共识2024版.pdf
+    anchor: 肠道微生态制剂益生菌和合生元能显著改善
+    page: null
+    via: pool-judge
+  - document: 复合益生菌对便秘人群肠道功能的影响及其调控机制研究_张霄翎.pdf
+    anchor: 种益生菌产品制成的乳酸菌粉，
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 针对您的功能性便秘、排便不畅问题，我推荐优美达益畅，它含有
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益顺.docx
+    anchor: 如果是普通、偶发的排便不畅，推荐益畅。
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 建议每天加量至2~3袋，建议至少调理3个月，让肠道菌群“脱胎换骨”
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果客户是长期便秘问题，建议每天加量至2~3袋，建议至少调理3个月
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 建议每天加量至2~3袋，建议至少调理3个月，让肠道菌群“脱胎换骨”
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 建议每天加量至2~3袋，建议至少调理3个月，让肠道菌群“脱胎换骨”
+    page: null
+    via: pool-judge
+  - document: 慢性便秘肠道微生态临床应用中国专家共识2024版.pdf
+    anchor: 便性状，并增加每周大便次数、缩短排便间隔时
+    page: null
+    via: pool-judge
+  - document: 6-50轮模拟对话测试.xlsx
+    anchor: 益畅直接嚼食，每日1-2袋，餐后半小时食用更佳；便秘严重可以加量到2-3袋分开吃。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0040
+  query: 容易拉肚子、大便不成形，吃哪个？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 选品
+  - 畅青
+  expected:
+  - document: 畅青产品课件.pdf
+    anchor: 容易拉肚子、大便不成形、腹痛、腹胀
+    page: null
+  - document: 产品说明书：畅青.docx
+    anchor: 平常吃易消化的谷类食物，如粥类、挂面、面片、面包类，多选用低脂易消化的高蛋白质食品
+    page: null
+    via: pool-judge
+  - document: 83_益舒益生菌带货-艾丽-.docx
+    anchor: 还好我有秘密武器——益舒。赶紧冲一条，能很好地安抚我躁动的肚子
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: '**1拉稀 / 便稀（畅青）**：吃了几天还是拉，甚至更频繁'
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益健.docx
+    anchor: 肠道功能紊乱伴随腹泻或便秘：益健+畅青+菊粉/益健+益畅+菊粉
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 慢性腹泻期，平常吃易消化的谷类食物，如粥类、挂面、面片、面包类，多选用低脂易消化的高蛋白质食品
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 慢性腹泻期，平常吃易消化的谷类食物，如粥类、挂面、面片、面包类，多选用低脂易消化的高蛋白质食品
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 优美达「畅青 」益生菌压片糖果
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: '| 肠道调理-腹泻 | 容易拉肚子、大便不成形、腹痛、腹胀'
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 畅青（青色包装-肠道娇气、便便不成形、不尽感，吸收差
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0041
+  query: 用了半个月没效果，可以退款吗？怎么退？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 售后
+  expected:
+  - document: 3.8有赞客户售后申请流程.docx
+    anchor: 找到要退款订单→点进订单
+    page: null
+  - document: 华大营养健康顾问工作手册V0.3.pdf
+    anchor: 如果 90 天内效果不满意， 可以无理由退款（？） 。您完全没有任何风险。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0042
+  query: 糖化血红蛋白反映的是什么？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 反映 2~3 个月平均血糖
+    page: null
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: ）是反映血糖控制状况的最主要指标
+    page: null
+    via: pool-judge
+  - document: 基层心血管病综合管理实践指南2020.pdf
+    anchor: 3个月内（红细胞寿命120 d）的血糖平均水平和糖
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0043
+  query: 血糖多少算低血糖？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 认识慢病-5月12日.pdf
+    anchor: 糖尿病人血糖＜3.9时，可诊断为低血糖
+    page: null
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 3.0 mmol/L≤血糖<3.9 mmol/L
+    page: null
+    via: pool-judge
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 1 级低血糖，血糖 <3.9 mmol/L 且 ≥3.0 mmol/L ； 2 级低血糖，血糖 <3.0 mmol/L
+    page: null
+    via: pool-judge
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 接受药物治疗的糖尿病患者，只要血糖 < 3.9 mmol/L 就属于低血糖
+    page: null
+    via: pool-judge
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 糖尿病患者血糖 <3.9 mmol/L ，即需要补充葡萄 糖或含糖食物
+    page: null
+    via: pool-judge
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 血糖 <3.9 mmol/L 时应采取措施或改
+    page: null
+    via: pool-judge
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 孕期血糖 <3.3 mmol/L ，需调整
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0044
+  query: 空腹和餐后血糖要控制在多少？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 中国 2 型糖尿病的综合控制目标
+    page: null
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 空腹血糖：4.4 - 6.1 mmol/L
+    page: null
+    via: pool-judge
+  - document: 基层心血管病综合管理实践指南2020.pdf
+    anchor: 一般患者空腹 血糖5.0 ～ 7.0 mmol/L，非空腹血糖＜ 10.0 mmol/L （Ⅰ，A）。
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0045
+  query: 喝酒对血糖影响大吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: 不推荐糖尿病患者饮酒
+    page: null
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: 不推荐饮酒，若饮需避免空腹并严密监测血糖
+    page: null
+  - document: 成人糖尿病食养指南（2023版）.pdf
+    anchor: 尿病患者的正常膳食和用药，导致血糖波动，如可能会使患
+    page: null
+    via: pool-judge
+  - document: 产品说明书：玖伴益生菌（解酒）.docx
+    anchor: 酒精会抑制肝脏糖原输出，容易导致酒后低血糖（心慌、出冷汗），补糖是防止“宕机”的关键
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0046
+  query: 胰岛素抵抗是怎么形成的？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: 引发慢性低度炎症，导致胰岛素抵抗
+    page: null
+  - document: 中国营养师培训教材.pdf
+    anchor: 引起胰岛素抵抗的原因除遗传因素外，环境因素亦非常重要，如激素紊乱、药物影
+    page: null
+    via: pool-judge
+  - document: 减脂客户沟通SOP-ella.docx
+    anchor: 坏菌多了→肠漏→内毒素入血→慢性炎症→胰岛素抵抗
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 可能导致肠道屏障功能障碍，细菌内毒素（LPS）的释放增加，这会引发系统性炎症，从而加剧胰岛素抵抗
+    page: null
+    via: pool-judge
+  - document: 镜脂益生菌_减重客户沟通 SOP_长沙.docx
+    anchor: 长期不好的饮食习惯诱导高胰岛素血症，胰岛素水平长期偏高会抑制脂肪分解、促进脂肪合成，形成恶性循环
+    page: null
+    via: pool-judge
+  - document: 肠道菌群及其代谢产物在妊娠期糖尿病研究进展_李晓燕.pdf
+    anchor: 血液中游离脂肪酸和甘油三酯的水平升高进
+    page: null
+    via: pool-judge
+  - document: 产品说明书：甘油二酯油.docx
+    anchor: 内脏脂肪堆积释放游离脂肪酸和炎症因子，干扰胰岛素信号通路，促进2型糖尿病发生
+    page: null
+    via: pool-judge
+  - document: 高尿酸血症与代谢综合征双向关系研究进展_王雪萌.pdf
+    anchor: 细胞中的氧化应激，这种促氧化作用可能有助于脂肪组织的蓄积,进而导致
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 长期不健康的饮食（尤其是高糖、高精制碳水）→ 导致胰岛素抵抗 → 血糖升高
+    page: null
+    via: pool-judge
+  - document: 话术.docx
+    anchor: 长期高糖高脂饮食和缺乏运动导致细胞对胰岛素不敏感；胰岛β细胞功能受损；肠道菌群紊乱会产生炎症物质，加剧胰岛素抵抗
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0047
+  query: 米饭面条一吃血糖就高，主食该怎么吃？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 营养师教你【控糖怎么吃】.pdf
+    anchor: 粗粮中膳食纤维含量高
+    page: null
+  - document: 成人糖尿病食养指南（2023版）.pdf
+    anchor: 主食定量，不宜过多，多选全谷物和低GI
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 吃杂粮饭、全麦馒头的餐后血糖也要比吃白米饭、白馒头等低一些。这主要是因为杂粮饭、全麦馒头的消化吸收速度较慢
+    page: null
+    via: pool-judge
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: 大米为基础，混合粗杂粮以提升营养价值
+    page: null
+    via: pool-judge
+  - document: 认识慢病-5月12日.pdf
+    anchor: 不推荐全部为精米白面，宜粗细搭配（粗细比为1:1或者1:3)，
+    page: null
+    via: pool-judge
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: 主食1/3换为全谷物；控制份量；按“蔬菜→蛋白→主食”顺序吃
+    page: null
+    via: pool-judge
+  - document: 中国营养师培训教材.pdf
+    anchor: 的食品，以避免餐后高血糖
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0048
+  query: 早上醒来空腹血糖反而高，是怎么回事？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: 基础胰岛素分泌不足，无法抑制夜间肝糖输出
+    page: null
+  answer: null
+- id: chat_qa-0049
+  query: 血糖高会不会让人瘦下来？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 成人糖尿病食养指南（2023版）.pdf
+    anchor: 多饮、多食、多尿和体重减少
+    page: null
+  - document: 中国营养师培训教材.pdf
+    anchor: 糖尿病的典型症状为多饮、多尿、多食、体重下降及疲乏。
+    page: null
+    via: pool-judge
+  - document: 认识慢病-5月12日.pdf
+    anchor: 多尿 多饮 多食 体重下降
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0050
+  query: 怎么判断自己是不是糖尿病前期？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: 只要满足上述任意一项，即可诊断为糖尿病前期
+    page: null
+  - document: 基层心血管病综合管理实践指南2020.pdf
+    anchor: 7.8～＜11.1 mmol/L
+    page: null
+    via: pool-judge
+  - document: 中国营养师培训教材.pdf
+    anchor: 其诊断标准为在口服75g葡萄糖的糖耐量试验中，
+    page: null
+    via: pool-judge
+  - document: 中国糖尿病防治指南（2024版）.pdf
+    anchor: ADA 2010 糖尿病前期诊断标准为空腹血糖为 5.6 ～ 6.9 mmol/L ，或 OGTT 2 h 血糖为 7.8 ～ 11.0 mmol/L ，或 HbA1c 为 5.7% ～ 6.4%
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益衡（血糖管理）.docx
+    anchor: mmol/L；糖尿病前期（糖耐量减低）：7.8~11.0mmol/L；
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0051
+  query: 饭后要运动多久比较好？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: 每天增加30分钟活动（如餐后散步）
+    page: null
+  - document: 80_养胃护卫健康科普-益舒.docx
+    anchor: 建议饭后静坐或站立15-30分钟，然后进行
+    page: null
+    via: pool-judge
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: 于每餐(早、午、晚餐)结束后，立即或休
+    page: null
+    via: pool-judge
+  - document: 认识慢病-5月12日.pdf
+    anchor: 餐后1h，每次争取30分
+    page: null
+    via: pool-judge
+  - document: 销售知识：减脂客户沟通SOP.docx
+    anchor: 如果没时间专门运动，可以尝试饭后靠墙站15分钟，对姿态和腹部收紧都有好处
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0052
+  query: 控糖期间还能吃水果吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 控糖知识
+  expected:
+  - document: 营养师教你【控糖怎么吃】.pdf
+    anchor: 适时、适量选择合适的水果加餐
+    page: null
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: 餐之间(上午10点、下午4点)或睡前一小时
+    page: null
+    via: pool-judge
+  - document: 认识慢病-5月12日.pdf
+    anchor: 两餐之间可加餐水果，以低含糖量低GI水果为宜
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 建议正常饮食，适当增加主食量，也可以吃水果、原味坚果、小饼干、无糖酸奶之类的健康零食
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 建议正常饮食，适当增加主食量，也可以吃水果、原味坚果、小饼干、无糖酸奶之类的健康零食
+    page: null
+    via: pool-judge
+  - document: 营养师教你【控糖怎么吃】.pdf
+    anchor: 血糖稳定达标的情况下，两餐之间
+    page: null
+    via: pool-judge
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: 若血糖水平持续较高或波动大，暂用圣女果、
+    page: null
+    via: pool-judge
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: '|猕猴桃|二米饭<br>小鸡蘑菇炖粉条<br>芹菜炒香干|西瓜籽'
+    page: null
+    via: pool-judge
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: 低糖水果(草莓、柚子等)约100克
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0053
+  query: 动态血糖仪能戴着洗澡吗？是防水的吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 设备
+  expected:
+  - document: 三诺多品类产品.pdf
+    anchor: IP28级防水，支持浸入水下2米2小时
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0054
+  query: 长沙的三诺智慧糖尿病门诊是你们开的吗？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 设备
+  expected:
+  - document: 三诺多品类产品.pdf
+    anchor: 优于行业标准 100+专业健管师指导控糖
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_qa-0055
+  query: 你们最先进的动态血糖仪是哪一款？
+  source: chat_qa
+  tags:
+  - 真实问法
+  - 设备
+  expected:
+  - document: 三诺多品类产品.pdf
+    anchor: Ø 更小巧轻薄（升级1角硬币大小） Ø 操作更简单（4步→2步） Ø 工艺优化准确度提升
+    page: null
+    via: pool-judge
+  answer: null
+- id: chat_no_answer-0001
+  query: 血糖仪能以旧换新吗？
+  source: no_answer
+  tags:
+  - 真实问法
+  - 无答案
+  expected: []
+  answer: null
+- id: chat_no_answer-0002
+  query: 动态血糖仪的蓝牙连接距离是多少米？
+  source: no_answer
+  tags:
+  - 真实问法
+  - 无答案
+  expected: []
+  answer: null
+- id: chat_no_answer-0003
+  query: 羽衣甘蓝粉可以每天冲着喝吗？
+  source: no_answer
+  tags:
+  - 真实问法
+  - 无答案
+  expected: []
+  answer: null
+- id: chat_no_answer-0004
+  query: 戴了四天测糖设备，贴的地方有点痒是怎么回事？
+  source: no_answer
+  tags:
+  - 真实问法
+  - 无答案
+  expected: []
+  answer: null
+- id: chat_no_answer-0005
+  query: 三诺为什么卖华大的益生菌，你们两家是什么关系？
+  source: no_answer
+  tags:
+  - 真实问法
+  - 无答案
+  expected: []
+  answer: null

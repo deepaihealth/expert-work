@@ -90,6 +90,25 @@ def test_chunk_hit_any_of_several_expected() -> None:
     assert chunk_hits(results, [_EXP_A, _EXP_B]) == [True]
 
 
+# 锚文本比对归一(B-175 波 2 T0.5):原文里的空格、加粗、全角、换行标记不该让同一段字认不出。
+_SPACED = _Expected(document="a.md", anchor="菌株QX-01 专利号ZL201900001234.5")
+
+
+def test_chunk_hit_ignores_spaces_markup_and_width_inside_the_text() -> None:
+    results = [_r("a.md", "**菌株ＱＸ－01**  **专利号：ZL 2019 0 0001234.5**")]  # noqa: RUF001
+    assert chunk_hits(results, [_SPACED]) == [True]
+
+
+def test_chunk_hit_ignores_html_line_breaks() -> None:
+    exp = _Expected(document="a.md", anchor="适用人群 日常养护、易过敏")
+    assert chunk_hits([_r("a.md", "适用人群<br>日常养护、易过敏、易疲劳")], [exp]) == [True]
+
+
+def test_chunk_hit_after_normalizing_still_needs_the_same_characters() -> None:
+    results = [_r("a.md", "菌株QX-01 专利号：ZL 2019 0 0001234.6")]  # noqa: RUF001
+    assert chunk_hits(results, [_SPACED]) == [False]
+
+
 # ---------------------------------------------------------------------------
 # document_coverage / chunk_coverage(逐名次「新覆盖到的期望」)
 # ---------------------------------------------------------------------------

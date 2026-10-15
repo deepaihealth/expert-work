@@ -3,7 +3,8 @@
 命中有两级:文档级 = ``filename in expected.documents``(手列文档 + 运行器找出的含同一锚文本的
 文档);段级 = 文件在其中 **且**
 ``expected.anchor in retrieval_text``(检索文本 = 标题路径 + 正文,与嵌入 / 关键词索引、
-智能体看到的是同一段字)。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
+智能体看到的是同一段字;两侧先过 :func:`anchor_key` 归一,
+见 :func:`anchor_in`)。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
 哪些期望条目(:func:`document_coverage` / :func:`chunk_coverage`):
 
 * 每条期望只在最早命中它的那一名记一次,后面再命中(相邻段重叠都含锚)记空,
@@ -27,7 +28,10 @@
 
 from __future__ import annotations
 
+import functools
 import math
+import re
+import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
@@ -50,6 +54,26 @@ MEAN_FIELDS: tuple[tuple[str, str], ...] = (
     ("mrr@10", "mrr_10"),
     ("ndcg@10", "ndcg_10"),
 )
+
+#: 归一时去掉的 HTML 标签(``<br>``、``<u>`` 之类;PDF / 表格转出来的文字里常见)。
+_HTML_TAG = re.compile(r"</?[A-Za-z][^<>]{0,40}>")
+
+
+@functools.lru_cache(maxsize=200_000)
+def anchor_key(text: str) -> str:
+    """锚文本比对用的归一形:去 HTML 标签,NFKC + 小写,只留字母与数字。
+
+    同一段字在原文里常带空格、加粗、全角标点、``<br>`` 断行(``**专利号 ZL 2019 1 1234.5**``),
+    评测集里的锚文本是连写的;逐字子串比对认不出,检索命中了也记成没中(B-175 波 2 T0.5)。
+    字母与数字本身一个不改,所以只差一位数字的两段仍然对不上。"""
+    folded = unicodedata.normalize("NFKC", _HTML_TAG.sub(" ", text)).lower()
+    return "".join(ch for ch in folded if unicodedata.category(ch)[0] in "LN")
+
+
+def anchor_in(anchor: str, text: str) -> bool:
+    """``anchor`` 归一后是否是 ``text`` 归一后的子串。"""
+    return anchor_key(anchor) in anchor_key(text)
+
 
 #: 逐名次覆盖集:第 i 项 = 第 i+1 名结果首次覆盖到的期望条目索引。
 Coverage = Sequence[frozenset[int]]
@@ -159,7 +183,7 @@ def _matching_expected(result: ResultLike, expected: Sequence[ExpectedLike]) -> 
     return [
         index
         for index, exp in enumerate(expected)
-        if result.filename in exp.documents and exp.anchor in result.retrieval_text
+        if result.filename in exp.documents and anchor_in(exp.anchor, result.retrieval_text)
     ]
 
 
