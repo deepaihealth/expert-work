@@ -2,18 +2,34 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import operator
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, Text, and_, any_, delete, func, literal, or_, select, update
+from sqlalchemy import (
+    Float,
+    Select,
+    Text,
+    and_,
+    any_,
+    case,
+    delete,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import CTE
 
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
@@ -24,7 +40,13 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     _Unset,
 )
-from expert_work.persistence.knowledge.text_search import tokenize_for_search
+from expert_work.persistence.knowledge.text_search import (
+    KB_KEYWORD_PHRASE_BOOST,
+    KB_KEYWORD_QUERY_PHRASE_BOOST,
+    KbKeywordQuery,
+    build_kb_keyword_query,
+    tokenize_for_search,
+)
 from expert_work.persistence.models import (
     KnowledgeBaseRow,
     KnowledgeChunkRow,
@@ -211,6 +233,102 @@ def _to_chunk(row: Any, embedding: tuple[float, ...] = ()) -> KnowledgeChunk:
 
 def _to_chunk_with_embedding(row: KnowledgeChunkRow) -> KnowledgeChunk:
     return _to_chunk(row, tuple(float(value) for value in row.embedding))
+
+
+def _balanced(
+    parts: Sequence[ColumnElement[Any]],
+    combine: Callable[[ColumnElement[Any], ColumnElement[Any]], ColumnElement[Any]],
+) -> ColumnElement[Any]:
+    """Combine ``parts`` pairwise as a balanced tree. A left-deep chain as long
+    as the query overflows the recursion of SQLAlchemy's compiler and
+    cache-key walk (~160 terms); a balanced tree is log2(n) deep."""
+    if len(parts) == 1:
+        return parts[0]
+    middle = len(parts) // 2
+    return combine(_balanced(parts[:middle], combine), _balanced(parts[middle:], combine))
+
+
+def _any_tsquery(parts: Sequence[ColumnElement[Any]]) -> ColumnElement[Any]:
+    """``parts[0] || parts[1] || ...`` — the tsquery OR operator."""
+    return _balanced(parts, lambda left, right: left.op("||")(right))
+
+
+def _kb_unit_tsquery(query: KbKeywordQuery, unit: str, *, phrase: bool) -> ColumnElement[Any]:
+    """A unit's NFKC form — ``plainto_tsquery`` for a term, ``phraseto_tsquery``
+    for an identifier phrase — OR its raw form (``phraseto_tsquery``, tokens
+    adjacent) where the raw query text differs: chunks are indexed raw."""
+    parse = func.phraseto_tsquery if phrase else func.plainto_tsquery
+    nfkc = parse(_TS_CONFIG, unit)
+    raw = query.unit_raw_form(unit)
+    return nfkc if raw is None else nfkc.op("||")(func.phraseto_tsquery(_TS_CONFIG, raw))
+
+
+def _kb_phrase_tsqueries(query: KbKeywordQuery) -> list[ColumnElement[Any]]:
+    return [_kb_unit_tsquery(query, phrase, phrase=True) for phrase in query.phrases]
+
+
+def _kb_unit_tsqueries(query: KbKeywordQuery) -> list[ColumnElement[Any]]:
+    """One tsquery per term (``plainto_tsquery``) and per identifier phrase
+    (``phraseto_tsquery``). Every term and phrase is a bound value parsed by
+    Postgres — no tsquery syntax is assembled from query text, so operators a
+    user types stay plain text."""
+    terms = [_kb_unit_tsquery(query, term, phrase=False) for term in query.terms]
+    return [*terms, *_kb_phrase_tsqueries(query)]
+
+
+def _kb_keyword_tsquery(query: KbKeywordQuery) -> ColumnElement[Any]:
+    """Any term or any identifier phrase of ``query``."""
+    return _any_tsquery(_kb_unit_tsqueries(query))
+
+
+def _bm25_idf(in_scope: ColumnElement[Any], with_unit: ColumnElement[Any]) -> ColumnElement[Any]:
+    """Lucene's BM25 idf, ln(1 + (N - df + 0.5) / (df + 0.5)): above zero for
+    every 0 ≤ df ≤ N, so the weights never sum to zero."""
+    return func.ln(
+        literal(1.0) + (in_scope - with_unit + literal(0.5)) / (with_unit + literal(0.5)),
+        type_=Float,
+    )
+
+
+def _kb_hits(
+    query: KbKeywordQuery, in_scope: Sequence[ColumnElement[bool]], ts_query: ColumnElement[Any]
+) -> CTE:
+    """The chunks the query matches: per row ``hit_i`` (0/1) for each unit
+    (term or identifier phrase) and ``base`` = the boosts that apply plus the
+    ``ts_rank`` tie-break.
+
+    Each row's tsvector is copied once (``setweight(…, 'D')`` — our vectors
+    are all unlabelled D already, and it pins ``ts_rank`` below D's 0.1): on
+    the stored value every ``@@`` unpacks it again, about 3x slower for a
+    40-term query. OFFSET 0 stops the planner from inlining the copy back into
+    each use. ``ts_rank``, not ``ts_rank_cd``: on an OR query ``ts_rank_cd``
+    counts every occurrence of a common word."""
+    matched = (
+        select(
+            KnowledgeChunkRow.id.label("id"),
+            func.setweight(KnowledgeChunkRow.content_tsv, literal_column("'D'")).label("tsv"),
+        )
+        .where(*in_scope, KnowledgeChunkRow.content_tsv.op("@@")(ts_query))
+        .offset(0)
+        .subquery("matched")
+    )
+    tsv = matched.c.tsv
+    hits = [
+        case((tsv.op("@@")(unit), literal(1)), else_=literal(0)).label(f"hit_{index}")
+        for index, unit in enumerate(_kb_unit_tsqueries(query))
+    ]
+    base: ColumnElement[Any] = func.ts_rank(tsv, _kb_keyword_tsquery(query))
+    if query.phrases:
+        identifier_hit = tsv.op("@@")(_any_tsquery(_kb_phrase_tsqueries(query)))
+        base = base + case((identifier_hit, literal(KB_KEYWORD_PHRASE_BOOST)), else_=literal(0.0))
+    if questions := query.question_phrases():
+        question_hit = tsv.op("@@")(
+            _any_tsquery([func.phraseto_tsquery(_TS_CONFIG, q) for q in questions])
+        )
+        base = base + case(
+            (question_hit, literal(KB_KEYWORD_QUERY_PHRASE_BOOST)), else_=literal(0.0)
+        )
+    return select(matched.c.id, *hits, base.label("base")).cte("hits").prefix_with("MATERIALIZED")
 
 
 class SqlKnowledgeStore(KnowledgeStore):
@@ -1187,20 +1305,64 @@ class SqlKnowledgeStore(KnowledgeStore):
     ) -> list[ScoredChunk]:
         if not kb_ids:
             return []
-        tokenized = tokenize_for_search(query)
-        if not tokenized:
+        kb_query = build_kb_keyword_query(query)
+        if kb_query is None:
             return []
-        ts_query = func.plainto_tsquery(_TS_CONFIG, tokenized)
-        rank = func.ts_rank(KnowledgeChunkRow.content_tsv, ts_query)
-        stmt = (
-            select(KnowledgeChunkRow, rank.label("rank"))
-            .where(
-                KnowledgeChunkRow.tenant_id == tenant_id,
-                KnowledgeChunkRow.kb_id.in_(list(kb_ids)),
-                KnowledgeChunkRow.content_tsv.op("@@")(ts_query),
+        in_scope = (
+            KnowledgeChunkRow.tenant_id == tenant_id,
+            KnowledgeChunkRow.kb_id.in_(list(kb_ids)),
+        )
+        hits = _kb_hits(kb_query, in_scope, _kb_keyword_tsquery(kb_query))
+        units = len(kb_query.terms) + len(kb_query.phrases)
+        # One row: each unit's BM25 idf. N = chunks in scope; df = matched
+        # chunks holding the unit — exact, since every chunk holding a unit
+        # matches the any-unit predicate. Every part is a MATERIALIZED CTE, so
+        # it runs exactly once whatever plan is chosen: without statistics the
+        # planner put these one-row aggregates inside a nested loop and re-ran
+        # them per matching row (10 to 44 s a query); a CTE there re-reads its
+        # stored row. It also keeps ``ln`` out of the per-row expression.
+        scope = (
+            select(func.count().label("chunks"))
+            .select_from(KnowledgeChunkRow)
+            .where(*in_scope)
+            .cte("scope")
+            .prefix_with("MATERIALIZED")
+        )
+        dfs = (
+            select(*(func.sum(hits.c[f"hit_{i}"]).label(f"df_{i}") for i in range(units)))
+            .cte("dfs")
+            .prefix_with("MATERIALIZED")
+        )
+        idf = [_bm25_idf(scope.c.chunks, dfs.c[f"df_{i}"]) for i in range(units)]
+        weights = (
+            select(
+                *(weight.label(f"idf_{i}") for i, weight in enumerate(idf)),
+                _balanced(idf, operator.add).label("idf_total"),
             )
+            .select_from(dfs.join(scope, literal(True)))
+            .cte("weights")
+            .prefix_with("MATERIALIZED")
+        )
+        # Score = boosts + coverage (idf-weighted share of the query's terms and
+        # identifier phrases present, in [0, 1]) + ``ts_rank`` (< 0.1, only
+        # breaks coverage ties).
+        weighted_hits = [weights.c[f"idf_{i}"] * hits.c[f"hit_{i}"] for i in range(units)]
+        coverage = _balanced(weighted_hits, operator.add) / weights.c.idf_total
+        rank = (coverage + hits.c.base).label("rank")
+        # No id tie-break: chunk ids are random per ingest, so it would reorder
+        # ties from one evaluation run to the next; ties keep the scan order.
+        top = (
+            select(hits.c.id, rank)
+            .select_from(hits.join(weights, literal(True)))
             .order_by(rank.desc())
             .limit(limit)
+            .cte("top")
+            .prefix_with("MATERIALIZED")
+        )
+        stmt = (
+            select(KnowledgeChunkRow, top.c.rank)
+            .join(top, KnowledgeChunkRow.id == top.c.id)
+            .order_by(top.c.rank.desc())
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()

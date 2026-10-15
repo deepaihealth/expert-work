@@ -257,6 +257,22 @@ async def test_hybrid_lifts_exact_keyword_match_above_vector_loser() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hybrid_keyword_side_still_matches_function_words() -> None:
+    """Lock (B-175 wave 2 PR1): the knowledge base drops function words from
+    keyword queries; long-term memory does not. A memory sharing only ``的``
+    with the query still earns keyword credit and outranks the vector winner."""
+    store = InMemoryMemoryStore()
+    tenant, user = uuid4(), uuid4()
+    shares_particle = _item(tenant=tenant, user=user, embedding=(0.0, 1.0), content="我的血压偏高")
+    vector_winner = _item(tenant=tenant, user=user, embedding=(1.0, 0.0), content="血压 记录")
+    await store.write([shares_particle, vector_winner])
+    hits = await store.retrieve(
+        tenant_id=tenant, user_id=user, query_embedding=(1.0, 0.0), query_text="的", limit=2
+    )
+    assert [hit.id for hit in hits] == [shares_particle.id, vector_winner.id]
+
+
+@pytest.mark.asyncio
 async def test_hybrid_empty_query_text_degrades_to_vector() -> None:
     """An empty or whitespace-only ``query_text`` reduces to vector-only
     — no keyword path can contribute, no fusion is meaningful."""

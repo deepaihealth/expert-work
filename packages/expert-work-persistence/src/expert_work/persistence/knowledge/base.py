@@ -553,9 +553,20 @@ class KnowledgeStore(abc.ABC):
     ) -> list[KnowledgeChunk]:
         """Return the ``limit`` chunks across ``kb_ids`` most relevant to
         ``query`` by full-text rank — the keyword side of hybrid search.
-        ``query`` is segmented the same way the chunks were indexed
-        (:func:`~expert_work.persistence.knowledge.text_search.tokenize_for_search`).
-        An empty ``kb_ids`` yields an empty list."""
+
+        ``query`` becomes a
+        :class:`~expert_work.persistence.knowledge.text_search.KbKeywordQuery`
+        (:func:`~expert_work.persistence.knowledge.text_search.build_kb_keyword_query`):
+        segmented the same way the chunks were indexed, function words and
+        punctuation dropped, identifiers such as ``QXA-N7`` kept as phrases.
+        Chunks are indexed as written (no NFKC); each unit also tries its raw
+        form where NFKC changed the query.
+        A chunk matches when it contains **any** term, or any identifier
+        phrase as adjacent tokens. Chunks holding an identifier rank first;
+        then chunks holding the whole question verbatim; then chunks covering
+        more of the query, rarer terms weighing more (BM25 idf); ``ts_rank``
+        breaks the remaining ties. A query with nothing searchable left, or an
+        empty ``kb_ids``, yields an empty list."""
 
     @abc.abstractmethod
     async def keyword_search_scored(
@@ -566,6 +577,15 @@ class KnowledgeStore(abc.ABC):
         query: str,
         limit: int = 5,
     ) -> list[ScoredChunk]:
-        """Like :meth:`keyword_search` but each hit carries its ``ts_rank``
-        relevance (unbounded — NOT a [0, 1] similarity) and
-        ``source == "keyword"``."""
+        """Like :meth:`keyword_search` but each hit carries its keyword
+        score and ``source == "keyword"`` — NOT a [0, 1] similarity:
+        coverage (Σ idf·hit / Σ idf over the query's terms and identifier
+        phrases, idf = ln(1 + (N - df + 0.5) / (df + 0.5)) with N the chunks in
+        scope and df those holding the unit; ≤ 1) plus ``ts_rank`` (< 0.1, a
+        tie-break), plus
+        :data:`~expert_work.persistence.knowledge.text_search.KB_KEYWORD_PHRASE_BOOST`
+        when an identifier phrase matched and
+        :data:`~expert_work.persistence.knowledge.text_search.KB_KEYWORD_QUERY_PHRASE_BOOST`
+        when the whole question appears verbatim. SQL and in-memory stores share the
+        match predicate and the ordering intent; their exact scores (and so
+        the order of near-ties) can differ."""
