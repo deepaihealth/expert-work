@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -16,7 +17,14 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     _Unset,
 )
-from expert_work.persistence.knowledge.text_search import tokenize_for_search
+from expert_work.persistence.knowledge.text_search import (
+    KB_KEYWORD_PHRASE_BOOST,
+    KB_KEYWORD_QUERY_PHRASE_BOOST,
+    KbKeywordQuery,
+    build_kb_keyword_query,
+    is_searchable_token,
+    tokenize_for_search,
+)
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -31,6 +39,80 @@ from expert_work.protocol import (
     RetrievalMethod,
     ScoredChunk,
 )
+
+
+def _searchable_tokens(text: str) -> list[str]:
+    """Tokens as Postgres positions them: punctuation-only tokens dropped
+    (assumes a non-C database ctype — see ``is_searchable_token``)."""
+    return [token for token in text.split() if is_searchable_token(token)]
+
+
+def _contains_run(tokens: Sequence[str], run: Sequence[str]) -> bool:
+    width = len(run)
+    return any(tokens[i : i + width] == run for i in range(len(tokens) - width + 1))
+
+
+#: ``ts_rank``'s weight for unlabelled positions (label D): ``content_tsv`` is
+#: built by ``to_tsvector`` without ``setweight``.
+_TS_RANK_WEIGHT = 0.1
+#: π²/6 — ``ts_rank`` divides each lexeme's Σ 1/j² over its occurrences by it.
+_TS_RANK_NORMALISER = math.pi**2 / 6
+
+
+def _ts_rank_or(tokens: Sequence[str], lexemes: Sequence[str]) -> float:
+    """Approximates Postgres ``ts_rank`` of an OR query over unlabelled
+    positions: a query lexeme occurring n times adds
+    weight * Σ_{j≤n} 1/j² / (π²/6), averaged over the query's distinct lexemes
+    (phrase tokens count as lexemes too). Not exact in general: Postgres ranks
+    a query that is one bare phrase by proximity, and its parser may split a
+    token into different lexemes than jieba produced."""
+    counts = Counter(tokens)
+    total = sum(sum(1 / j**2 for j in range(1, counts[lexeme] + 1)) for lexeme in lexemes)
+    return _TS_RANK_WEIGHT * total / _TS_RANK_NORMALISER / len(lexemes)
+
+
+def _bm25_idf(in_scope: int, with_unit: int) -> float:
+    """Lucene's BM25 idf, ln(1 + (N - df + 0.5) / (df + 0.5)) — as in SQL;
+    above zero for every 0 ≤ df ≤ N."""
+    return math.log(1 + (in_scope - with_unit + 0.5) / (with_unit + 0.5))
+
+
+def _keyword_scores(query: KbKeywordQuery, texts: Sequence[str]) -> list[float | None]:
+    """The SQL store's match predicate and score over the chunks in scope:
+    ``None`` for a text holding none of the units (terms, identifier phrases);
+    otherwise :data:`KB_KEYWORD_PHRASE_BOOST` when an identifier phrase hit,
+    plus :data:`KB_KEYWORD_QUERY_PHRASE_BOOST` when the whole question
+    appears verbatim, plus coverage (idf-weighted share of the units hit),
+    plus an approximate ``ts_rank`` tie-break. Same predicate and ordering
+    intent as SQL; exact scores — and so the order of near-ties — can
+    differ."""
+    # Each unit as its token runs: the NFKC form, plus the raw form if any.
+    units = [
+        [_searchable_tokens(unit)]
+        + ([_searchable_tokens(raw)] if (raw := query.unit_raw_form(unit)) else [])
+        for unit in (*query.terms, *query.phrases)
+    ]
+    lexemes = list(dict.fromkeys(token for runs in units for run in runs for token in run))
+    questions = [_searchable_tokens(phrase) for phrase in query.question_phrases()]
+    analysed = [_searchable_tokens(tokenize_for_search(text)) for text in texts]
+    hits = [
+        [any(_contains_run(tokens, run) for run in runs) for runs in units] for tokens in analysed
+    ]
+    idf = [_bm25_idf(len(texts), sum(row[index] for row in hits)) for index in range(len(units))]
+    scores: list[float | None] = []
+    for tokens, row in zip(analysed, hits, strict=True):
+        if not any(row):
+            scores.append(None)
+            continue
+        coverage = sum(weight for weight, hit in zip(idf, row, strict=True) if hit) / sum(idf)
+        identifier = KB_KEYWORD_PHRASE_BOOST if any(row[len(query.terms) :]) else 0.0
+        verbatim = (
+            KB_KEYWORD_QUERY_PHRASE_BOOST
+            if any(_contains_run(tokens, question) for question in questions)
+            else 0.0
+        )
+        scores.append(identifier + verbatim + coverage + _ts_rank_or(tokens, lexemes))
+    return scores
 
 
 def _cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
@@ -664,21 +746,24 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> list[ScoredChunk]:
         if not kb_ids:
             return []
-        terms = set(tokenize_for_search(query).split())
-        if not terms:
+        kb_query = build_kb_keyword_query(query)
+        if kb_query is None:
             return []
         kb_set = set(kb_ids)
-        scored: list[tuple[int, KnowledgeChunk]] = []
-        for chunk in self._chunks:
-            if chunk.tenant_id != tenant_id or chunk.kb_id not in kb_set:
-                continue
-            overlap = len(terms & set(tokenize_for_search(chunk.retrieval_text).split()))
-            if overlap > 0:
-                scored.append((overlap, chunk))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+        in_scope = [c for c in self._chunks if c.tenant_id == tenant_id and c.kb_id in kb_set]
+        scores = _keyword_scores(kb_query, [chunk.retrieval_text for chunk in in_scope])
+        scored = sorted(
+            (
+                (score, chunk)
+                for score, chunk in zip(scores, in_scope, strict=True)
+                if score is not None
+            ),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
         return [
-            ScoredChunk(chunk=chunk, score=float(overlap), source="keyword")
-            for overlap, chunk in scored[:limit]
+            ScoredChunk(chunk=chunk, score=score, source="keyword")
+            for score, chunk in scored[:limit]
         ]
 
 

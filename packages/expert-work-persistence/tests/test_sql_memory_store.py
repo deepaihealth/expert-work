@@ -327,6 +327,39 @@ async def test_hybrid_lifts_exact_keyword_match(sql_store: SqlStoreFixture) -> N
 
 
 @pytest.mark.asyncio
+async def test_hybrid_keyword_side_still_requires_every_query_word(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """Lock (B-175 wave 2 PR1): the knowledge base moved to any-word keyword
+    queries; long-term memory did not. Its keyword side still needs every
+    query word in one memory, so ``alpha delta`` (missing ``beta``) gets no
+    keyword credit and the full match leads despite the worst vector.
+
+    Under any-word matching ``alpha delta`` would earn keyword rank 2 on top
+    of vector rank 1 (1/61 + 1/62) and overtake the full match (1/61 + 1/63).
+    """
+    store, engine = sql_store
+    try:
+        tenant, user = uuid4(), uuid4()
+        full = _item(tenant=tenant, user=user, embedding=_vec(0.0, 1.0), content="alpha beta gamma")
+        partial = _item(tenant=tenant, user=user, embedding=_vec(1.0), content="alpha delta")
+        unrelated = _item(
+            tenant=tenant, user=user, embedding=_vec(0.9, 0.1), content="epsilon zeta"
+        )
+        await store.write([full, partial, unrelated])
+        hits = await store.retrieve(
+            tenant_id=tenant,
+            user_id=user,
+            query_embedding=_vec(1.0),
+            query_text="alpha beta",
+            limit=3,
+        )
+        assert [hit.id for hit in hits] == [full.id, partial.id, unrelated.id]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_hybrid_user_isolation(sql_store: SqlStoreFixture) -> None:
     store, engine = sql_store
     try:

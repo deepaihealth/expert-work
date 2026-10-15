@@ -11,7 +11,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text, update
+from sqlalchemy import Text, cast, select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -22,7 +22,9 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
-from expert_work.persistence.knowledge import DuplicateKnowledgeBaseError
+from expert_work.persistence.knowledge import DuplicateKnowledgeBaseError, text_search
+from expert_work.persistence.knowledge.sql import _kb_keyword_tsquery
+from expert_work.persistence.knowledge.text_search import KbKeywordQuery
 from expert_work.persistence.models import KnowledgeBaseRow
 from expert_work.protocol import (
     ChunkType,
@@ -427,6 +429,65 @@ async def test_keyword_search_scored_surfaces_rank(sql_store: SqlStoreFixture) -
         assert len(hits) == 1
         assert hits[0].source == "keyword"
         assert hits[0].score > 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_kb_keyword_tsquery_binds_every_term_as_a_value(sql_store: SqlStoreFixture) -> None:
+    """Terms and phrases reach Postgres as bound values parsed by
+    ``plainto_tsquery`` / ``phraseto_tsquery`` — tsquery operators inside them
+    are plain text, never syntax — and the parser drops the ``-`` of
+    ``qxa - n7`` without spending a position on it, so the identifier becomes
+    the adjacent pair ``'qxa' <-> 'n7'``."""
+    _store, engine = sql_store
+    try:
+        query = KbKeywordQuery(
+            terms=("a & b", "x:*", "<->", "'q'"), phrases=("qxa - n7", "(n7 | z)")
+        )
+        async with engine.connect() as conn:
+            rendered = (
+                await conn.execute(select(cast(_kb_keyword_tsquery(query), Text)))
+            ).scalar_one()
+            adjacent = (
+                await conn.execute(
+                    select(
+                        text(
+                            "to_tsvector('simple', 'x qxa - n7 y') "
+                            "@@ phraseto_tsquery('simple', 'qxa - n7')"
+                        )
+                    )
+                )
+            ).scalar_one()
+        assert rendered == "'a' & 'b' | 'x' | 'q' | 'qxa' <-> 'n7' | 'n7' <-> 'z'"
+        assert adjacent is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_keyword_statement_survives_hundreds_of_query_units(
+    sql_store: SqlStoreFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the term cap lifted, a 201-unit query still compiles and runs: the
+    ``||`` chain and the coverage sum are balanced trees, not left-deep chains
+    that blow SQLAlchemy's recursion limit."""
+    store, engine = sql_store
+    try:
+        monkeypatch.setattr(text_search, "KB_QUERY_MAX_TERMS", 10_000)
+        words = ["w" + chr(97 + i // 26) + chr(97 + i % 26) for i in range(200)]
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[_make_chunk(tenant, base.id, doc.id, 0, f"{words[150]} 内容", _vec(1.0))],
+        )
+        hits = await store.keyword_search_scored(
+            tenant_id=tenant, kb_ids=[base.id], query=" ".join(words) + " QXA-N7"
+        )
+        assert [hit.chunk.chunk_index for hit in hits] == [0]
     finally:
         await engine.dispose()
 
