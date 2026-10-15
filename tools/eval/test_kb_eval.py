@@ -577,16 +577,18 @@ async def _built(
     return dataset, retriever, store, (tenant, report)
 
 
-def test_build_retriever_widens_recall_to_top_k() -> None:
-    # #10b:top_k 大于默认召回宽度时两路各召回 top_k,否则前 k 名根本凑不满。
+def test_build_retriever_uses_production_recall_depth() -> None:
+    # B-175 W2 PR2:评测的召回深度与生产同一个默认(两路各 clamp(2*top_k, 50, 100)),
+    # 不另设宽度;只有 top_k 超过生产深度时才抬到 top_k(#10b,否则前 k 名凑不满)。
     store = InMemoryKnowledgeStore()
     embedder = build_fake_embedder()
-    default = KnowledgeRetriever.recall_limit
-    assert build_retriever(store=store, embedder=embedder, reranker=None, top_k=5).recall_limit == (
-        default
-    )
-    wide = build_retriever(store=store, embedder=embedder, reranker=None, top_k=default + 30)
-    assert wide.recall_limit == default + 30
+    production = KnowledgeRetriever(store=store, embedder=embedder)
+    for top_k in (5, 20, 50, 100):
+        retriever = build_retriever(store=store, embedder=embedder, reranker=None, top_k=top_k)
+        assert retriever.recall_limit is None
+        assert retriever.recall_depth(top_k) == production.recall_depth(top_k)
+    wide = build_retriever(store=store, embedder=embedder, reranker=None, top_k=130)
+    assert wide.recall_depth(130) == 130
 
 
 @pytest.mark.asyncio

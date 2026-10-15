@@ -17,6 +17,7 @@ The function is generic over the item type — any hashable type works
 
 from __future__ import annotations
 
+import math
 from collections.abc import Hashable, Sequence
 
 #: Canonical RRF dampener — Cormack/Clarke/Buettcher 2009 baseline.
@@ -59,6 +60,36 @@ def rrf_fuse_scored[T: Hashable](
     return sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
 
 
+def weighted_rrf_fuse_scored[T: Hashable](
+    rankings: Sequence[tuple[float, Sequence[T]]], *, k: int = DEFAULT_K
+) -> list[tuple[T, float]]:
+    """Weighted RRF: like :func:`rrf_fuse_scored`, but each input list
+    carries a weight and contributes ``weight / (k + rank)`` per item (rank
+    counted from 1).
+
+    Knowledge retrieval only (B-175 wave 2) — it lets the vector and
+    keyword paths count differently. With every weight ``1.0`` the result
+    is identical to :func:`rrf_fuse_scored` (same items, scores and tie
+    order), which long-term memory keeps using unchanged.
+
+    ``rankings`` is a sequence of ``(weight, ranked_list)``; weights must
+    be finite and non-negative. Duplicates inside one list collapse to the first
+    occurrence, as in :func:`rrf_fuse_scored`.
+    """
+    scores: dict[T, float] = {}
+    for weight, ranking in rankings:
+        if not math.isfinite(weight) or weight < 0:
+            msg = f"RRF list weight must be finite and non-negative, got {weight}"
+            raise ValueError(msg)
+        seen: set[T] = set()
+        for rank, item in enumerate(ranking):
+            if item in seen:
+                continue
+            seen.add(item)
+            scores[item] = scores.get(item, 0.0) + weight / (k + rank + 1)
+    return sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+
+
 def rrf_fuse[T: Hashable](rankings: Sequence[Sequence[T]], *, k: int = DEFAULT_K) -> list[T]:
     """Fuse several ranked lists by Reciprocal Rank Fusion.
 
@@ -68,4 +99,4 @@ def rrf_fuse[T: Hashable](rankings: Sequence[Sequence[T]], *, k: int = DEFAULT_K
     return [item for item, _score in rrf_fuse_scored(rankings, k=k)]
 
 
-__all__ = ["DEFAULT_K", "rrf_fuse", "rrf_fuse_scored"]
+__all__ = ["DEFAULT_K", "rrf_fuse", "rrf_fuse_scored", "weighted_rrf_fuse_scored"]

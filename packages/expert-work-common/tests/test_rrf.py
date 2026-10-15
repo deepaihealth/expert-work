@@ -13,10 +13,19 @@ edge-case scenarios that come with extraction:
 
 from __future__ import annotations
 
+import math
+import random
 from dataclasses import dataclass
 from uuid import uuid4
 
-from expert_work.common.search.rrf import DEFAULT_K, rrf_fuse
+import pytest
+
+from expert_work.common.search.rrf import (
+    DEFAULT_K,
+    rrf_fuse,
+    rrf_fuse_scored,
+    weighted_rrf_fuse_scored,
+)
 
 
 def test_default_k_matches_knowledge_subsystem_constant() -> None:
@@ -115,3 +124,51 @@ def test_rrf_fuse_zero_intersection_preserves_relative_order() -> None:
     # for rank-1, etc. So "a" and "x" tie, "b" and "y" tie, etc.
     # All 6 items present.
     assert set(fused) == {"a", "b", "c", "x", "y", "z"}
+
+
+# ---------------------------------------------------------------------------
+# weighted_rrf_fuse_scored — B-175 W2 PR2 (knowledge base only)
+# ---------------------------------------------------------------------------
+
+
+def test_weighted_rrf_equal_weights_match_plain_rrf_exactly() -> None:
+    """Regression lock: weight 1.0 on every list reproduces ``rrf_fuse_scored``
+    item for item, score for score (exact float equality, tie order included)."""
+    rng = random.Random(20261014)  # noqa: S311 — reproducible test data, not crypto
+    pool = [f"c{i}" for i in range(40)]
+    for _ in range(200):
+        rankings = [
+            rng.sample(pool, rng.randint(0, 25)) + rng.sample(pool, rng.randint(0, 3))
+            for _ in range(rng.randint(1, 4))
+        ]
+        weighted = weighted_rrf_fuse_scored([(1.0, ranking) for ranking in rankings])
+        assert weighted == rrf_fuse_scored(rankings)
+
+
+def test_weighted_rrf_score_is_weight_over_k_plus_rank() -> None:
+    fused = dict(weighted_rrf_fuse_scored([(2.0, ["a", "b"]), (0.5, ["b"])], k=10))
+    assert fused["a"] == pytest.approx(2.0 / 11)
+    assert fused["b"] == pytest.approx(2.0 / 12 + 0.5 / 11)
+
+
+def test_weighted_rrf_heavier_list_wins_the_top_spot() -> None:
+    # Same shape both ways round: whichever list carries more weight puts its
+    # first item on top.
+    vector, keyword = ["v", "x"], ["k", "y"]
+    assert weighted_rrf_fuse_scored([(1.0, vector), (1.0, keyword)])[0][0] == "v"
+    assert weighted_rrf_fuse_scored([(1.0, vector), (1.5, keyword)])[0][0] == "k"
+    assert weighted_rrf_fuse_scored([(1.5, vector), (1.0, keyword)])[0][0] == "v"
+
+
+def test_weighted_rrf_collapses_duplicates_and_handles_empty() -> None:
+    assert weighted_rrf_fuse_scored([]) == []
+    assert weighted_rrf_fuse_scored([(1.0, [])]) == []
+    # The repeated "a" counts once, at its first (higher) rank.
+    fused = weighted_rrf_fuse_scored([(2.0, ["a", "b", "a"])], k=10)
+    assert fused == [("a", 2.0 / 11), ("b", 2.0 / 12)]
+
+
+@pytest.mark.parametrize("weight", [-0.1, math.nan, math.inf, -math.inf])
+def test_weighted_rrf_rejects_negative_or_non_finite_weight(weight: float) -> None:
+    with pytest.raises(ValueError, match="weight"):
+        weighted_rrf_fuse_scored([(weight, ["a"])])
