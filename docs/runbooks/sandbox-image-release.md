@@ -115,7 +115,7 @@ smoke 的 `sandbox image cache (warn-only)` 一行做的是同一件事:待命�
 2. apply 带注解的 `sandboxset.yaml`(生产池 replicas 保持 1)。
 3. 等 `kubectl get imagecaches.image.alibabacloud.com` 里沙箱镜像那行 `Ready`。
    测试与生产同在杭州、同一个镜像地址;若两边是同一阿里云账号,测试已做好的
-   缓存会被生产直接命中(这一点以生产上的 `ImageCacheHit` 为准,还没实测过)。
+   缓存会被生产直接命中 —— 10-16 生产开启时实测证实:生产直接用上测试建好的 `imc-bp174l8g5l37jfgkqpg7`,待命沙箱从创建到运行 14 s(`ImageCacheHit … main matched`)。
 4. 按上面「验证」删一台待命沙箱,看 `ImageCacheHit` 与开机秒数;再跑
    `tools/deploy/smoke.sh prod`,`sandbox image cache` 一行应为 OK。
 
