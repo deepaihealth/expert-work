@@ -292,3 +292,11 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 - [x] **26.1 正常对话不受影响**:发测试后金丝雀 `RESULT: PASS`;调试台用任一思考模型的 Agent 发一条需要先想再答的问题。判据:正常回答,run 状态成功。**没修好时**:不适用(防回归:改动只在停顿超时分支,正常收尾不经过它)。 **10-16 测试 `93c8a246` 过**:发布金丝雀 `RESULT: PASS`;思考模型 `deepseek-flash`(eval-ssb)真跑一道表格题,run `success` / `text_response`,每轮都带思考、末轮 `finish_reason = stop`,47.8 s;smoke 新增的沙箱镜像缓存检查 OK。
 - [ ] **26.2 发生了就可见**:发测试一周后只读查 `SELECT status, created_at FROM agent_run WHERE error LIKE '%还没给出回答就中断了%'`,并在两个控制面 pod 日志里 `grep agent_node.stalled_without_answer`。判据:查到的 run 状态都是 `error`;同期不再有「状态成功、最后一轮只有思考、因停顿超时结束」的 run(`run_event` 里 `event_name = 'updates'` 且 `data::text LIKE '%stream_idle_timeout%'` 的帧,逐条看都带回答文字或工具调用)。一周内一次都没发生也算过(写明 0 次)。**没修好时**:停顿只有思考的 run 状态成功、回复为空。**分辨修没修好靠自动测试**(10-16 逐条变异验过):`test_react_graph.py::test_stall_after_reasoning_only_fails_the_run_visibly`(真路由 + 真图走 `run_agent`)撤掉主循环的判定 → 0 条错误帧、红;`test_stall_without_answer_is_metered_but_not_cached` 去掉记账 → 用量 0 行、红;`test_llm_stall.py::test_planner_still_falls_back_to_a_single_step_plan_on_a_stall` 把判定挪回路由直接报错 → 规划跟着报错、红。
+
+## §27 沙箱镜像加 7 个工具 + CI 改走 GHCR 镜像(#1832)
+
+**背景**:测试环境 90 天 2663 个 run 里模型真撞过的缺失工具(unzip 36 个 run、curl 21、pytz 3、requests 1),加上两个公开测评集都用到的 PyYAML、beautifulsoup4、sqlite3,一起加进沙箱镜像;工具说明里的「已预装」清单同步列出。镜像不随 `release.sh` 走,要按 `sandbox-image-release.md` 单独换 tag,**必须与控制面同一次发布**,否则工具说明会列出旧镜像里没有的工具。CI 部分(官方镜像改从 GHCR 拉)不影响测试环境。
+
+- [x] **27.1 新镜像里工具都在**:换 tag 后进一台待命沙箱只读检查 `command -v unzip sqlite3 curl` 与 `python3 -c "import yaml, pytz, bs4, requests"`。判据:都在、版本与 `requirements.txt` 钉的一致。**没修好时**:`command not found` / `ModuleNotFoundError`。 **10-17 测试沙箱 `5fd494fe` 过**:三个命令都在(sqlite3 3.46.1),PyYAML 6.0.3 / pytz 2026.5 / bs4 4.15.0 / requests 2.34.2;池 2 台都是新 tag。
+- [x] **27.2 工具说明与镜像一致**:控制面 pod 里调 `orchestrator.tools.sandbox_image_contract.preinstalled_note()`。判据:7 个名字都在。**没修好时**:说明里缺新工具(模型会再去 pip / apt 装),或镜像没换而说明先换了(模型被告知有、实际没有)。 **10-17 测试 `5fd494fe` 过**:7 个都在;发布 smoke `SMOKE PASS`、金丝雀 5 项 PASS。
+- [ ] **27.3 一周后看缺失工具是否下降**:只读统计(`run_event` 里工具输出的空格存成 `\u2581` 转义,`LIKE '%No module named%'` 一条都匹配不到,要先把各种转义归一成空格再正则)发布后 7 天的 `No module named` / `command not found`。判据:unzip / curl / pytz / requests / yaml / bs4 不再出现。
