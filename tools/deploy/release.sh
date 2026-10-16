@@ -475,14 +475,30 @@ if [[ "${dry_run}" -eq 0 && "${canary_skipped}" -eq 0 ]]; then
         exit 1
     fi
     echo "==> canary run via ${CANARY_POD} (agent=${canary_agent:-release-canary})"
-    # canary.py 与 key 一起走 stdin(第一行 key,其余是脚本):单次 exec、
-    # 无临时文件、无 tar 依赖;in-pod 的 python 即 /app/.venv(httpx 可用)。
-    if ! { printf '%s\n' "${canary_key}"; cat "${SCRIPT_DIR}/canary.py"; } \
+    # key 走 stdin 第一行(绝不进 argv),canary.py 以 base64 走 argv(不是机密):单次
+    # exec、无临时文件、无 tar 依赖;in-pod 的 python 即 /app/.venv(httpx 可用)。
+    # stdin 发完 key 不能 EOF:测试集群 10-16 实测,stdin 一关,pod 之后的输出全被丢
+    # (退出码照传),判词和失败原因都看不到。所以每秒补一个空行撑着,kubectl 退出后
+    # 下一次写触发 SIGPIPE,写端自己结束。判据也不只认退出码:没看到 RESULT: PASS 一律算红。
+    canary_src="$(base64 <"${SCRIPT_DIR}/canary.py" | tr -d '\n')"
+    canary_log="$(mktemp)"
+    set +e
+    { printf '%s\n' "${canary_key}"; while sleep 1; do printf '\n' || exit 0; done; } 2>/dev/null \
         | kubectl -n expert-work exec -i "${CANARY_POD}" -- \
             env "EXPERT_WORK_CANARY_AGENT_CODE=${canary_agent:-release-canary}" \
-            python -c 'import os, sys
-os.environ["EXPERT_WORK_CANARY_API_KEY"] = sys.stdin.readline().rstrip("\n")
-exec(compile(sys.stdin.read(), "canary.py", "exec"))'; then
+            python -c "import base64, os, sys
+os.environ['EXPERT_WORK_CANARY_API_KEY'] = sys.stdin.readline().rstrip('\n')
+exec(compile(base64.b64decode('${canary_src}').decode(), 'canary.py', 'exec'))" 2>&1 \
+        | tee "${canary_log}"
+    canary_rc="${PIPESTATUS[1]}"
+    set -e
+    canary_verdict=0
+    grep -q '^RESULT: PASS' "${canary_log}" && canary_verdict=1
+    rm -f "${canary_log}"
+    if [[ "${canary_rc}" -ne 0 || "${canary_verdict}" -ne 1 ]]; then
+        if [[ "${canary_rc}" -eq 0 ]]; then
+            echo "canary exited 0 but printed no 'RESULT: PASS' verdict — its output was cut off." >&2
+        fi
         # The rollback command itself comes from the EXIT trap (stage 6).
         echo "CANARY FAILED — the release is NOT good." >&2
         exit 1

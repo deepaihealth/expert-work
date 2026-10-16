@@ -45,7 +45,7 @@ case " $* " in
     *" get secret canary-credentials --ignore-not-found -o name "*)
         [[ "${STUB_CANARY_UNSEEDED:-}" == "1" ]] || echo secret/canary-credentials
         ;;
-    *"jsonpath={.data.api-key}"*) printf 'c2VjcmV0' ;;              # base64 "secret"
+    *"jsonpath={.data.api-key}"*) printf 'Y2FuYXJ5LWtleS03ZjNh' ;;  # base64 "canary-key-7f3a"
     *"jsonpath={.data.agent-code}"*) printf 'cmVsZWFzZS1jYW5hcnk=' ;;  # base64 "release-canary"
     *" get deployment.apps/"*" -o wide "*)
         printf 'NAME            READY   UP-TO-DATE   AVAILABLE\n'
@@ -68,8 +68,22 @@ case " $* " in
         ;;
     *" get pods "*) printf 'True||control-plane-stub\n' ;;
     *" exec -i "*)
-        cat >/dev/null
-        [[ "${STUB_FAIL:-}" == "canary" ]] && fail canary
+        # The canary's stdin: the key on the first line, then the line release.sh keeps
+        # sending so the stream stays open while the canary runs (an EOF there makes the
+        # cluster drop the rest of the canary's output). Record what arrived.
+        IFS= read -r key
+        printf '%s' "${key}" >"${STUB_CANARY_KEY_FILE:-/dev/null}"
+        if IFS= read -r -t 5 next; then
+            if [[ -z "${next}" ]]; then echo open; else echo script-on-stdin; fi
+        else
+            echo closed
+        fi >"${STUB_CANARY_STDIN_FILE:-/dev/null}"
+        if [[ "${STUB_FAIL:-}" == "canary" ]]; then
+            echo "RESULT: FAIL — the release is NOT good."
+            exit 1
+        fi
+        [[ "${STUB_CANARY_SILENT:-}" == "1" ]] && exit 0
+        echo "RESULT: PASS — real run + artifact chain verified."
         ;;
 esac
 exit 0
@@ -325,6 +339,29 @@ def test_canary_failure_is_red_with_the_real_previous_tag(harness: Harness) -> N
     assert f"tools/deploy/rollback.sh test {PREV_TAG}" in r.stderr
     assert "<上一版 tag>" not in r.stderr
     assert f"Release {NEW_TAG} done" not in r.stdout
+
+
+def test_canary_without_a_verdict_is_red(harness: Harness) -> None:
+    """kubectl exec can return 0 with the canary's output cut off (10-16 on the test
+    cluster: after stdin closed, the pod's stdout was dropped while the exit code still
+    came back). A release must not pass on a canary nobody saw judge."""
+    r = harness.run(STUB_CANARY_SILENT="1")
+    assert r.returncode != 0
+    assert "no 'RESULT: PASS' verdict" in r.stderr
+    assert "CANARY FAILED" in r.stderr
+    assert f"Release {NEW_TAG} done" not in r.stdout
+
+
+def test_canary_key_goes_over_stdin_which_stays_open(harness: Harness, tmp_path: Path) -> None:
+    key_file, stdin_file = tmp_path / "key", tmp_path / "stdin"
+    r = harness.run(STUB_CANARY_KEY_FILE=str(key_file), STUB_CANARY_STDIN_FILE=str(stdin_file))
+    assert r.returncode == 0, r.stderr
+    assert "RESULT: PASS" in r.stdout
+    assert key_file.read_text() == "canary-key-7f3a"  # base64-decoded api-key from the stub Secret
+    # Never in argv: the calls log records every argv the stubs saw.
+    assert "canary-key-7f3a" not in harness.calls()
+    # After the key, stdin carries keep-alive blank lines, not the script, and no EOF.
+    assert stdin_file.read_text().strip() == "open"
 
 
 def test_unseeded_canary_is_a_warning_not_a_failure(harness: Harness) -> None:
