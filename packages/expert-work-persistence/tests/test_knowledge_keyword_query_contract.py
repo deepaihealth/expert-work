@@ -231,7 +231,7 @@ _WIDTHS = [
     pytest.param("hw", "hw", True, id="query-hw-chunk-hw"),
     pytest.param("fw", "fw", True, id="query-fw-chunk-fw"),
     pytest.param("fw", "hw", True, id="query-fw-chunk-hw"),
-    pytest.param("hw", "fw", False, id="query-hw-chunk-fw"),
+    pytest.param("hw", "fw", True, id="query-hw-chunk-fw"),
 ]
 _TERM = {"hw": "VC", "fw": "ＶＣ"}
 _IDENTIFIER = {"hw": "QXA-N7", "fw": "ＱＸＡ－Ｎ７"}
@@ -242,9 +242,9 @@ _QUESTION = {"hw": "2号苹果可以生吃吗？", "fw": "２号苹果可以生�
 async def test_term_matches_across_widths(
     store: KnowledgeStore, query_width: str, chunk_width: str, found: bool
 ) -> None:
-    """Chunks are indexed as written (no NFKC). A term typed the way the chunk
-    writes it matches (as before NFKC came in); a fullwidth term also finds
-    halfwidth text through its NFKC form; halfwidth never finds fullwidth."""
+    """Both sides are NFKC-normalised (B-175 wave 2 PR2b; before it chunks
+    were indexed as written and halfwidth never found fullwidth), so every
+    width combination matches."""
     chunk = f"维生素 {_TERM[chunk_width]} 含量"
     tenant, kb_id = await _seed(store, [chunk])
     found_chunks = await _contents(store, tenant, kb_id, _TERM[query_width])

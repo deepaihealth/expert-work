@@ -45,10 +45,12 @@ from expert_work.persistence.knowledge.base import (
     _Unset,
 )
 from expert_work.persistence.knowledge.text_search import (
+    KB_DOC_TITLE_HIT_WEIGHT,
     KB_KEYWORD_PHRASE_BOOST,
     KB_KEYWORD_QUERY_PHRASE_BOOST,
     KbKeywordQuery,
     build_kb_keyword_query,
+    kb_index_text,
     tokenize_for_search,
 )
 from expert_work.persistence.models import (
@@ -72,6 +74,7 @@ from expert_work.protocol import (
     KnowledgeDocument,
     RetrievalMethod,
     ScoredChunk,
+    chunk_retrieval_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -231,6 +234,7 @@ _CHUNK_COLUMNS = (
     KnowledgeChunkRow.parent_chunk_id,
     KnowledgeChunkRow.source_locator,
     KnowledgeChunkRow.created_at,
+    KnowledgeChunkRow.doc_title,
 )
 
 
@@ -247,6 +251,7 @@ def _to_chunk(row: Any, embedding: tuple[float, ...] = ()) -> KnowledgeChunk:
         embedding=embedding,
         chunk_type=_enum_or(ChunkType, row.chunk_type, ChunkType.TEXT) or ChunkType.TEXT,
         heading_path=tuple(row.heading_path or ()),
+        doc_title=row.doc_title,
         content_hash=row.content_hash,
         embedding_model=row.embedding_model,
         enabled=row.enabled,
@@ -317,34 +322,74 @@ def _bm25_idf(in_scope: ColumnElement[Any], with_unit: ColumnElement[Any]) -> Co
     )
 
 
+def _kb_chunk_tsvector(chunk: KnowledgeChunk) -> ColumnElement[Any]:
+    """``content_tsv`` of a chunk: its document title as weight A, then the
+    breadcrumb + body as unlabelled D — both as :func:`kb_index_text`
+    normalises them and :func:`tokenize_for_search` segments them. Without a
+    title only the D part (as before titles were stored)."""
+    body = func.to_tsvector(
+        _TS_CONFIG,
+        tokenize_for_search(kb_index_text(chunk_retrieval_text(chunk.heading_path, chunk.content))),
+    )
+    if not chunk.doc_title:
+        return body
+    title = func.setweight(
+        func.to_tsvector(_TS_CONFIG, tokenize_for_search(kb_index_text(chunk.doc_title))),
+        literal_column("'A'"),
+    )
+    return title.op("||")(body)
+
+
 def _kb_hits(
     query: KbKeywordQuery, in_scope: Sequence[ColumnElement[bool]], ts_query: ColumnElement[Any]
 ) -> CTE:
-    """The chunks the query matches: per row ``hit_i`` (0/1) for each unit
-    (term or identifier phrase) and ``base`` = the boosts that apply plus the
-    ``ts_rank`` tie-break.
+    """The chunks the query matches: per row ``hit_i`` for each unit (term or
+    identifier phrase) — 1 when the body holds it, :data:`KB_DOC_TITLE_HIT_WEIGHT`
+    when only the document title (weight A) does, else 0 — and ``base`` = the
+    boosts that apply plus the ``ts_rank`` tie-break.
 
-    Each row's tsvector is copied once (``setweight(…, 'D')`` — our vectors
-    are all unlabelled D already, and it pins ``ts_rank`` below D's 0.1): on
-    the stored value every ``@@`` unpacks it again, about 3x slower for a
-    40-term query. OFFSET 0 stops the planner from inlining the copy back into
-    each use. ``ts_rank``, not ``ts_rank_cd``: on an OR query ``ts_rank_cd``
-    counts every occurrence of a common word."""
-    matched = (
+    Each row's tsvector is copied once (``tsv``, labels kept), then its body
+    is filtered out of that copy (``body``, label D): on the stored value every
+    ``@@`` unpacks it again, about 3x slower for a 40-term query. OFFSET 0
+    stops the planner from inlining the copies back into each use. ``ts_rank``
+    runs on the body, all D, which pins it below D's 0.1. ``ts_rank``, not
+    ``ts_rank_cd``: on an OR query ``ts_rank_cd`` counts every occurrence of a
+    common word."""
+    copied = (
         select(
             KnowledgeChunkRow.id.label("id"),
-            func.setweight(KnowledgeChunkRow.content_tsv, literal_column("'D'")).label("tsv"),
+            func.ts_filter(KnowledgeChunkRow.content_tsv, literal_column("'{a,b,c,d}'")).label(
+                "tsv"
+            ),
         )
         .where(*in_scope, KnowledgeChunkRow.content_tsv.op("@@")(ts_query))
         .offset(0)
+        .subquery("copied")
+    )
+    matched = (
+        select(
+            copied.c.id,
+            copied.c.tsv,
+            func.ts_filter(copied.c.tsv, literal_column("'{d}'")).label("body"),
+        )
+        .offset(0)
         .subquery("matched")
     )
-    tsv = matched.c.tsv
+    tsv, body = matched.c.tsv, matched.c.body
     hits = [
-        case((tsv.op("@@")(unit), literal(1)), else_=literal(0)).label(f"hit_{index}")
+        case(
+            (
+                tsv.op("@@")(unit),
+                case(
+                    (body.op("@@")(unit), literal(1.0)),
+                    else_=literal(KB_DOC_TITLE_HIT_WEIGHT),
+                ),
+            ),
+            else_=literal(0.0),
+        ).label(f"hit_{index}")
         for index, unit in enumerate(_kb_unit_tsqueries(query))
     ]
-    base: ColumnElement[Any] = func.ts_rank(tsv, _kb_keyword_tsquery(query))
+    base: ColumnElement[Any] = func.ts_rank(body, _kb_keyword_tsquery(query))
     if query.phrases:
         identifier_hit = tsv.op("@@")(_any_tsquery(_kb_phrase_tsqueries(query)))
         base = base + case((identifier_hit, literal(KB_KEYWORD_PHRASE_BOOST)), else_=literal(0.0))
@@ -1217,14 +1262,13 @@ class SqlKnowledgeStore(KnowledgeStore):
                         chunk_index=chunk.chunk_index,
                         content=chunk.content,
                         embedding=list(chunk.embedding),
-                        # Keyword-search vector over breadcrumb + body —
-                        # segmented app-side so it is correct for CJK (see
-                        # text_search).
-                        content_tsv=func.to_tsvector(
-                            _TS_CONFIG, tokenize_for_search(chunk.retrieval_text)
-                        ),
+                        # Keyword-search vector over title + breadcrumb +
+                        # body — segmented app-side so it is correct for CJK
+                        # (see text_search).
+                        content_tsv=_kb_chunk_tsvector(chunk),
                         chunk_type=chunk.chunk_type.value,
                         heading_path=list(chunk.heading_path) or None,
+                        doc_title=chunk.doc_title,
                         content_hash=chunk.content_hash,
                         embedding_model=chunk.embedding_model,
                         enabled=chunk.enabled,
@@ -1406,12 +1450,13 @@ class SqlKnowledgeStore(KnowledgeStore):
         hits = _kb_hits(kb_query, in_scope, _kb_keyword_tsquery(kb_query))
         units = len(kb_query.terms) + len(kb_query.phrases)
         # One row: each unit's BM25 idf. N = chunks in scope; df = matched
-        # chunks holding the unit — exact, since every chunk holding a unit
-        # matches the any-unit predicate. Every part is a MATERIALIZED CTE, so
-        # it runs exactly once whatever plan is chosen: without statistics the
-        # planner put these one-row aggregates inside a nested loop and re-ran
-        # them per matching row (10 to 44 s a query); a CTE there re-reads its
-        # stored row. It also keeps ``ln`` out of the per-row expression.
+        # chunks holding the unit, in the body or the title — exact, since
+        # every chunk holding a unit matches the any-unit predicate. Every
+        # part is a MATERIALIZED CTE, so it runs exactly once whatever plan is
+        # chosen: without statistics the planner put these one-row aggregates
+        # inside a nested loop and re-ran them per matching row (10 to 44 s a
+        # query); a CTE there re-reads its stored row. It also keeps ``ln``
+        # out of the per-row expression.
         scope = (
             select(func.count().label("chunks"))
             .select_from(KnowledgeChunkRow)
@@ -1420,7 +1465,14 @@ class SqlKnowledgeStore(KnowledgeStore):
             .prefix_with("MATERIALIZED")
         )
         dfs = (
-            select(*(func.sum(hits.c[f"hit_{i}"]).label(f"df_{i}") for i in range(units)))
+            select(
+                *(
+                    func.sum(case((hits.c[f"hit_{i}"] > 0, literal(1)), else_=literal(0))).label(
+                        f"df_{i}"
+                    )
+                    for i in range(units)
+                )
+            )
             .cte("dfs")
             .prefix_with("MATERIALIZED")
         )
@@ -1435,8 +1487,9 @@ class SqlKnowledgeStore(KnowledgeStore):
             .prefix_with("MATERIALIZED")
         )
         # Score = boosts + coverage (idf-weighted share of the query's terms and
-        # identifier phrases present, in [0, 1]) + ``ts_rank`` (< 0.1, only
-        # breaks coverage ties).
+        # identifier phrases present, in [0, 1]; a unit only in the document
+        # title counts KB_DOC_TITLE_HIT_WEIGHT of its share) + ``ts_rank``
+        # (< 0.1, only breaks coverage ties).
         weighted_hits = [weights.c[f"idf_{i}"] * hits.c[f"hit_{i}"] for i in range(units)]
         coverage = _balanced(weighted_hits, operator.add) / weights.c.idf_total
         rank = (coverage + hits.c.base).label("rank")
@@ -1456,6 +1509,13 @@ class SqlKnowledgeStore(KnowledgeStore):
             .order_by(top.c.rank.desc())
         )
         async with self._sf() as session:
+            # A custom plan every time, for this transaction only: asyncpg keeps
+            # the statement prepared, and a generic plan (Postgres' choice from
+            # the sixth run on a connection) re-evaluates every unit's tsquery
+            # per matching row — about 4x slower.
+            await session.execute(
+                text("SELECT set_config('plan_cache_mode', 'force_custom_plan', true)")
+            )
             rows = (await session.execute(stmt)).all()
         return [
             ScoredChunk(

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001 —— 文件名里的中文全角标点是被测输入
 """Schema tests for the J.5 knowledge DTOs."""
 
 from __future__ import annotations
@@ -8,12 +9,15 @@ import pytest
 from pydantic import ValidationError
 
 from expert_work.protocol import (
+    KB_DOCUMENT_TITLE_MAX_CHARS,
     DocumentStatus,
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeDocument,
     RetrievalMethod,
     ScoredChunk,
+    chunk_retrieval_text,
+    knowledge_document_title,
 )
 
 
@@ -183,3 +187,73 @@ def test_knowledge_dtos_are_frozen() -> None:
     kb = KnowledgeBase(id=uuid4(), tenant_id=uuid4(), name="kb")
     with pytest.raises(ValidationError):
         kb.name = "other"
+
+
+# -- document title in the retrieval text (B-175 wave 2 PR2b) -----------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "title"),
+    [
+        ("产品说明书：益休.docx", "产品说明书：益休"),
+        ("folder/sub/guide.md", "guide"),
+        ("a_b__c.PDF", "a b c"),
+        ("  spaced   name  .txt", "spaced name"),
+        ("v1.2 release notes.md", "v1.2 release notes"),
+        ("README", "README"),
+        (".bashrc", ".bashrc"),
+        ("v1.2 report", "v1.2 report"),
+        ("ZL202410048761.8", "ZL202410048761.8"),
+        ("专利 202211480228.6.pdf", "专利 202211480228.6"),
+        ("C:\\docs\\guide.pdf", "guide"),
+        ("notes.tar.gz", "notes.tar"),
+    ],
+)
+def test_document_title_is_the_cleaned_file_name(filename: str, title: str) -> None:
+    assert knowledge_document_title(filename) == title
+
+
+@pytest.mark.parametrize("filename", ["", "   ", "dir/", "__.md"])
+def test_document_title_of_an_empty_name_is_none(filename: str) -> None:
+    """Nothing left after cleaning: no title, so no ``[Document: ]`` line."""
+    assert knowledge_document_title(filename) is None
+
+
+def test_document_title_is_capped() -> None:
+    """Long, noisy titles hurt retrieval (DAPR): cut to a fixed length."""
+    title = knowledge_document_title("x" * 200 + ".pdf")
+    assert title == "x" * KB_DOCUMENT_TITLE_MAX_CHARS
+
+
+def test_retrieval_text_puts_the_document_before_the_section() -> None:
+    assert (
+        chunk_retrieval_text(("A", "B"), "body", "Guide")
+        == "[Document: Guide]\n[Section: A > B]\n\nbody"
+    )
+    assert chunk_retrieval_text((), "body", "Guide") == "[Document: Guide]\n\nbody"
+
+
+@pytest.mark.parametrize("doc_title", [None, ""])
+def test_retrieval_text_without_a_title_is_unchanged(doc_title: str | None) -> None:
+    """Chunks ingested before titles were stored read exactly as before."""
+    assert chunk_retrieval_text(("A",), "body", doc_title) == "[Section: A]\n\nbody"
+    assert chunk_retrieval_text((), "body", doc_title) == "body"
+
+
+def test_knowledge_chunk_retrieval_text_carries_its_document_title() -> None:
+    def chunk(**extra: object) -> KnowledgeChunk:
+        return KnowledgeChunk(
+            id=uuid4(),
+            tenant_id=uuid4(),
+            kb_id=uuid4(),
+            document_id=uuid4(),
+            chunk_index=0,
+            content="body",
+            embedding=(0.0,),
+            heading_path=("A",),
+            **extra,  # type: ignore[arg-type]
+        )
+
+    assert chunk().doc_title is None
+    assert chunk().retrieval_text == "[Section: A]\n\nbody"
+    assert chunk(doc_title="Guide").retrieval_text == "[Document: Guide]\n[Section: A]\n\nbody"

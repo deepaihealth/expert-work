@@ -148,6 +148,11 @@ class _FakeDashScopeReranker:
     ) -> list[int]:
         return list(range(len(documents)))[:top_k]
 
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        return [(index, 1.0) for index in range(min(len(documents), top_k))]
+
 
 class _FakeLLMReranker:
     def __init__(self, *, llm_caller: Any) -> None:

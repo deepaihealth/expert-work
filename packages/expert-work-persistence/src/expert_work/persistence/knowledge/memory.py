@@ -18,11 +18,13 @@ from expert_work.persistence.knowledge.base import (
     _Unset,
 )
 from expert_work.persistence.knowledge.text_search import (
+    KB_DOC_TITLE_HIT_WEIGHT,
     KB_KEYWORD_PHRASE_BOOST,
     KB_KEYWORD_QUERY_PHRASE_BOOST,
     KbKeywordQuery,
     build_kb_keyword_query,
     is_searchable_token,
+    kb_index_text,
     tokenize_for_search,
 )
 from expert_work.protocol import (
@@ -38,6 +40,7 @@ from expert_work.protocol import (
     KnowledgeDocument,
     RetrievalMethod,
     ScoredChunk,
+    chunk_retrieval_text,
 )
 
 
@@ -77,15 +80,31 @@ def _bm25_idf(in_scope: int, with_unit: int) -> float:
     return math.log(1 + (in_scope - with_unit + 0.5) / (with_unit + 0.5))
 
 
-def _keyword_scores(query: KbKeywordQuery, texts: Sequence[str]) -> list[float | None]:
+def _index_tokens(text: str) -> list[str]:
+    """``text`` as the SQL store indexes it (:func:`kb_index_text`, segmented)."""
+    return _searchable_tokens(tokenize_for_search(kb_index_text(text)))
+
+
+def _unit_hit(title: Sequence[str], body: Sequence[str], runs: Sequence[Sequence[str]]) -> float:
+    """1 when the body holds the unit, :data:`KB_DOC_TITLE_HIT_WEIGHT` when
+    only title + body do (title positions come first, as in the SQL
+    ``tsvector``), else 0."""
+    if any(_contains_run(body, run) for run in runs):
+        return 1.0
+    whole = [*title, *body]
+    return KB_DOC_TITLE_HIT_WEIGHT if any(_contains_run(whole, run) for run in runs) else 0.0
+
+
+def _keyword_scores(query: KbKeywordQuery, chunks: Sequence[KnowledgeChunk]) -> list[float | None]:
     """The SQL store's match predicate and score over the chunks in scope:
-    ``None`` for a text holding none of the units (terms, identifier phrases);
-    otherwise :data:`KB_KEYWORD_PHRASE_BOOST` when an identifier phrase hit,
-    plus :data:`KB_KEYWORD_QUERY_PHRASE_BOOST` when the whole question
-    appears verbatim, plus coverage (idf-weighted share of the units hit),
-    plus an approximate ``ts_rank`` tie-break. Same predicate and ordering
-    intent as SQL; exact scores — and so the order of near-ties — can
-    differ."""
+    ``None`` for a chunk holding none of the units (terms, identifier phrases)
+    in its title or body; otherwise :data:`KB_KEYWORD_PHRASE_BOOST` when an
+    identifier phrase hit, plus :data:`KB_KEYWORD_QUERY_PHRASE_BOOST` when the
+    whole question appears verbatim, plus coverage (idf-weighted share of the
+    units hit, a title-only hit weighing :data:`KB_DOC_TITLE_HIT_WEIGHT`),
+    plus an approximate ``ts_rank`` tie-break over the body. Same predicate
+    and ordering intent as SQL; exact scores — and so the order of near-ties
+    — can differ."""
     # Each unit as its token runs: the NFKC form, plus the raw form if any.
     units = [
         [_searchable_tokens(unit)]
@@ -94,24 +113,32 @@ def _keyword_scores(query: KbKeywordQuery, texts: Sequence[str]) -> list[float |
     ]
     lexemes = list(dict.fromkeys(token for runs in units for run in runs for token in run))
     questions = [_searchable_tokens(phrase) for phrase in query.question_phrases()]
-    analysed = [_searchable_tokens(tokenize_for_search(text)) for text in texts]
-    hits = [
-        [any(_contains_run(tokens, run) for run in runs) for runs in units] for tokens in analysed
+    analysed = [
+        (
+            _index_tokens(chunk.doc_title) if chunk.doc_title else [],
+            _index_tokens(chunk_retrieval_text(chunk.heading_path, chunk.content)),
+        )
+        for chunk in chunks
     ]
-    idf = [_bm25_idf(len(texts), sum(row[index] for row in hits)) for index in range(len(units))]
+    hits = [[_unit_hit(title, body, runs) for runs in units] for title, body in analysed]
+    idf = [
+        _bm25_idf(len(chunks), sum(1 for row in hits if row[index] > 0))
+        for index in range(len(units))
+    ]
     scores: list[float | None] = []
-    for tokens, row in zip(analysed, hits, strict=True):
+    for (title, body), row in zip(analysed, hits, strict=True):
         if not any(row):
             scores.append(None)
             continue
-        coverage = sum(weight for weight, hit in zip(idf, row, strict=True) if hit) / sum(idf)
+        coverage = sum(weight * hit for weight, hit in zip(idf, row, strict=True)) / sum(idf)
         identifier = KB_KEYWORD_PHRASE_BOOST if any(row[len(query.terms) :]) else 0.0
+        whole = [*title, *body]
         verbatim = (
             KB_KEYWORD_QUERY_PHRASE_BOOST
-            if any(_contains_run(tokens, question) for question in questions)
+            if any(_contains_run(whole, question) for question in questions)
             else 0.0
         )
-        scores.append(identifier + verbatim + coverage + _ts_rank_or(tokens, lexemes))
+        scores.append(identifier + verbatim + coverage + _ts_rank_or(body, lexemes))
     return scores
 
 
@@ -751,7 +778,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return []
         kb_set = set(kb_ids)
         in_scope = [c for c in self._chunks if c.tenant_id == tenant_id and c.kb_id in kb_set]
-        scores = _keyword_scores(kb_query, [chunk.retrieval_text for chunk in in_scope])
+        scores = _keyword_scores(kb_query, in_scope)
         scored = sorted(
             (
                 (score, chunk)

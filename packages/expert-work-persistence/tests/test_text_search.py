@@ -10,6 +10,7 @@ from expert_work.persistence.knowledge.text_search import (
     KbKeywordQuery,
     build_kb_keyword_query,
     is_searchable_token,
+    kb_index_text,
     tokenize_for_search,
 )
 
@@ -133,9 +134,10 @@ def test_kb_query_normalises_dashes(raw: str) -> None:
 
 
 def test_kb_query_keeps_the_raw_form_where_nfkc_changes_it() -> None:
-    """Chunks are indexed as written (no NFKC), so a unit whose raw text NFKC
-    changes keeps that raw form too — a fullwidth query still finds fullwidth
-    text — while the NFKC form finds halfwidth text."""
+    """Chunks ingested before the write side normalised are indexed as
+    written, so a unit whose raw text NFKC changes keeps that raw form too — a
+    fullwidth query still finds such fullwidth text — while the NFKC form
+    finds halfwidth text and every chunk indexed since."""
     assert build_kb_keyword_query("ＱＸＡ－Ｎ７的专利") == KbKeywordQuery(
         terms=("专利",),
         phrases=("qxa - n7",),
@@ -230,3 +232,107 @@ def test_is_searchable_token() -> None:
 )
 def test_is_searchable_token_follows_the_postgres_parser(token: str, searchable: bool) -> None:
     assert is_searchable_token(token) is searchable
+
+
+# -- write-side normalisation (B-175 wave 2 PR2b) -----------------------------
+
+
+def test_kb_index_text_folds_widths_and_dashes() -> None:
+    """The keyword index sees the text the way queries are normalised: NFKC
+    plus dash folding, so halfwidth questions find fullwidth text."""
+    assert kb_index_text("２型糖尿病 ＱＸＡ－Ｎ７ QXA\u2013N7") == "2型糖尿病 QXA-N7 QXA-N7"
+
+
+def test_kb_index_text_leaves_plain_text_alone() -> None:
+    assert kb_index_text("每天吃 100 毫克,共 30 天") == "每天吃 100 毫克,共 30 天"
+
+
+@pytest.mark.parametrize(
+    ("written", "joined"),
+    [
+        ("ZL 2024 1 0048761.8", "ZL202410048761.8"),
+        ("ZL2020 1 1248842.0", "ZL202011248842.0"),
+        ("ZL 2021116309138", "ZL2021116309138"),
+        ("2024 1 0048761.8", "202410048761.8"),
+        ("ＺＬ　２０２４　１　００４８７６１．８", "ZL202410048761.8"),
+    ],
+)
+def test_kb_index_text_adds_the_joined_form_of_a_spaced_number(written: str, joined: str) -> None:
+    """Some documents print patent numbers with spaces; the index keeps the
+    text as written and adds the number without spaces on a line of its own,
+    so both ways of typing it match."""
+    indexed = kb_index_text(f"专利号 {written} 授权")
+    body, _, added = indexed.partition("\n")
+    assert body.startswith("专利号 ")
+    assert joined in added.split()
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "ZL 2024 1 0048761.8 2 页",
+        "ZL 2024 1 0048761.8 2025 3 1 授权",
+        "1 2024 1 0048761.8 一种组合物",
+    ],
+)
+def test_kb_index_text_joins_the_number_inside_a_longer_run(written: str) -> None:
+    """A flattened table puts a page count or a date next to the number: every
+    identifier-shaped stretch of the run gets its joined form, so the number
+    itself is among them."""
+    added = kb_index_text(f"专利号 {written}").partition("\n")[2].split()
+    assert "202410048761.8" in added
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2024 年 1 月",
+        "第 3 2 章",
+        "共 120 135 人",
+        "A 1 2",
+        "版本 1.2 3.4",
+        "血糖 120 135 150 165 180",
+        "1.0 10 1.0 10 1.0 10 1.0 10",
+        "C 200 0.012 200 0.012",
+        "电话 138 1234 5678",
+    ],
+)
+def test_kb_index_text_does_not_join_number_lists(text: str) -> None:
+    """Not identifier-shaped — under ten digits, or neither a two-letter
+    prefix nor a group of five or more digits: counts, dates, versions and
+    table columns stay as they are."""
+    assert kb_index_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "written", ["ZL 2024 1 0048761.8", "ZL202410048761.8", "ＺＬ２０２４１００４８７６１．８"]
+)
+def test_kb_query_joins_a_spaced_number_into_one_identifier(written: str) -> None:
+    query = build_kb_keyword_query(f"{written}的专利")
+    assert query is not None
+    assert query.phrases == ("zl202410048761.8",)
+    assert query.terms == ("专利",)
+
+
+def test_kb_query_spaced_number_keeps_its_raw_form() -> None:
+    """Chunks indexed before the write side added joined forms hold only the
+    spaced tokens: the raw form still finds them."""
+    query = build_kb_keyword_query("ZL 2024 1 0048761.8的专利")
+    assert query is not None
+    assert query.unit_raw_form("zl202410048761.8") == "zl 2024 1 0048761.8"
+
+
+@pytest.mark.parametrize(
+    ("query", "numbers"),
+    [
+        ("维生素C 100 200 500 1000 毫克有什么区别", ("100", "200", "500", "1000")),
+        ("血压 140 90 120 80 正常吗", ("140", "120")),
+        ("2024 2025 2026 年的销量", ("2024", "2025", "2026")),
+    ],
+)
+def test_kb_query_keeps_a_number_list_as_terms(query: str, numbers: tuple[str, ...]) -> None:
+    """Only identifier-shaped runs are joined; a list of numbers stays a list."""
+    built = build_kb_keyword_query(query)
+    assert built is not None
+    assert built.phrases == ()
+    assert set(numbers) <= set(built.terms)

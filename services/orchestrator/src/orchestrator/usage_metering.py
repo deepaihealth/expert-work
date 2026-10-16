@@ -60,6 +60,7 @@ from expert_work.runtime.middleware import (
     TokenUsageMiddleware,
 )
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget, usage_total
+from orchestrator.tools.knowledge import ScoredReranker
 
 if TYPE_CHECKING:
     from expert_work.protocol import ModelSpec, StructuredOutputSpec
@@ -371,3 +372,16 @@ class ScopedReranker:
             return await self.inner.rerank(
                 query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
             )
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        with usage_identity_scope(self.identity):
+            if isinstance(self.inner, ScoredReranker):
+                return await self.inner.rerank_scored(
+                    query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+                )
+            order = await self.inner.rerank(
+                query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+            )
+            return [(index, None) for index in order]

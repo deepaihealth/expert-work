@@ -12,6 +12,7 @@ tenant-shared, not per-user (unlike J.3 memory). See
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
@@ -24,6 +25,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 #: override them at creation to tune chunk granularity to its content.
 DEFAULT_CHUNK_MAX_TOKENS: Final = 512
 DEFAULT_CHUNK_OVERLAP_TOKENS: Final = 64
+
+#: A document title in a chunk's retrieval text is cut to this many
+#: characters: long, noisy titles hurt retrieval more than they help.
+KB_DOCUMENT_TITLE_MAX_CHARS: Final = 64
 
 #: Default per-base retrieval parameters. Surfaced (not hardcoded) so a
 #: base can tune how its ``knowledge_search`` recall behaves.
@@ -109,17 +114,38 @@ class ChunkType(StrEnum):
     MATERIAL_PHRASE = "material_phrase"
 
 
-def chunk_retrieval_text(heading_path: Sequence[str], content: str) -> str:
-    """The text a chunk is embedded, keyword-indexed, reranked and shown to
-    an agent as: its section breadcrumb, then its body. The single source of
-    the ``[Section: a > b]`` prefix — the body itself is stored clean.
+#: A file extension: up to five letters / digits, at least one a letter — so a
+#: dotted number (``ZL202410048761.8``) or version (``v1.2 report``) stays.
+_FILE_EXTENSION_RE = re.compile(r"(?<=.)\.(?=[A-Za-z0-9]{0,4}[A-Za-z])[A-Za-z0-9]{1,5}$")
+
+
+def knowledge_document_title(filename: str) -> str | None:
+    """The document title a chunk's retrieval text carries: the file name
+    without its directory (``/`` or ``\\``) and extension, ``_`` and
+    whitespace runs folded to one space, cut to
+    :data:`KB_DOCUMENT_TITLE_MAX_CHARS`. ``None`` when nothing is left."""
+    name = _FILE_EXTENSION_RE.sub("", re.split(r"[/\\]", filename)[-1])
+    title = re.sub(r"[_\s]+", " ", name).strip()[:KB_DOCUMENT_TITLE_MAX_CHARS].rstrip()
+    return title or None
+
+
+def chunk_retrieval_text(
+    heading_path: Sequence[str], content: str, doc_title: str | None = None
+) -> str:
+    """The text a chunk is embedded, keyword-indexed and reranked as: its
+    document title, its section breadcrumb, then its body. The single source
+    of the ``[Document: …]`` and ``[Section: a > b]`` prefixes — the body
+    itself is stored clean.
 
     Legacy chunks (ingested before the heading path was stored separately)
-    carry the prefix inside ``content`` and an empty ``heading_path``, so
-    they pass through unchanged."""
-    if not heading_path:
-        return content
-    return f"[Section: {' > '.join(heading_path)}]\n\n{content}"
+    carry the prefix inside ``content`` and an empty ``heading_path``, and
+    chunks ingested before titles were stored have no ``doc_title``; both
+    read exactly as they did."""
+    text = content if not heading_path else f"[Section: {' > '.join(heading_path)}]\n\n{content}"
+    if not doc_title:
+        return text
+    separator = "\n" if heading_path else "\n\n"
+    return f"[Document: {doc_title}]{separator}{text}"
 
 
 class RetrievalMethod(StrEnum):
@@ -269,6 +295,11 @@ class KnowledgeChunk(BaseModel):
     #: Section breadcrumb (outermost heading first), stored apart from the
     #: body; :attr:`retrieval_text` joins the two.
     heading_path: tuple[str, ...] = ()
+    #: The document's title when the chunk was ingested
+    #: (:func:`knowledge_document_title`) — part of :attr:`retrieval_text`.
+    #: ``None`` for chunks ingested before titles were stored. Renaming a
+    #: document leaves it stale until the document is ingested again.
+    doc_title: str | None = None
     #: sha256 of :attr:`retrieval_text` — an unchanged chunk keeps its vector
     #: across re-ingests instead of being embedded again.
     content_hash: str | None = None
@@ -287,8 +318,8 @@ class KnowledgeChunk(BaseModel):
 
     @property
     def retrieval_text(self) -> str:
-        """Breadcrumb + body — see :func:`chunk_retrieval_text`."""
-        return chunk_retrieval_text(self.heading_path, self.content)
+        """Title + breadcrumb + body — see :func:`chunk_retrieval_text`."""
+        return chunk_retrieval_text(self.heading_path, self.content, self.doc_title)
 
 
 class ScoredChunk(BaseModel):

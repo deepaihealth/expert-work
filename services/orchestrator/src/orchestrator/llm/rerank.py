@@ -96,10 +96,10 @@ class HTTPDashScopeRerankClient:
 
 @dataclass(frozen=True)
 class DashScopeReranker:
-    """:class:`orchestrator.tools.knowledge.Reranker` over DashScope's native
-    rerank API. Returns candidate indices in best-first order, truncated to
-    ``top_k``; a malformed body degrades to the input order (rerank is an
-    optional quality pass — never break search)."""
+    """:class:`orchestrator.tools.knowledge.Reranker` (and ``ScoredReranker``)
+    over DashScope's native rerank API. Returns candidate indices in best-first
+    order, truncated to ``top_k``; a malformed body degrades to the input order
+    without scores (rerank is an optional quality pass — never break search)."""
 
     client: RerankClient
     model: str
@@ -107,6 +107,14 @@ class DashScopeReranker:
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
     ) -> list[int]:
+        ranked = await self.rerank_scored(
+            query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+        )
+        return [index for index, _score in ranked]
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
         del tenant_id  # credential is baked into ``client``
         items = list(documents)
         if not items:
@@ -115,13 +123,20 @@ class DashScopeReranker:
         output = body.get("output")
         results = output.get("results") if isinstance(output, Mapping) else None
         if not isinstance(results, list):
-            return list(range(len(items)))[:top_k]
-        order = [
-            row["index"]
+            return [(index, None) for index in range(min(len(items), top_k))]
+        ranked = [
+            (row["index"], _relevance(row.get("relevance_score")))
             for row in results
             if isinstance(row, Mapping)
             and isinstance(row.get("index"), int)
             and not isinstance(row.get("index"), bool)
             and 0 <= row["index"] < len(items)
         ]
-        return order[:top_k]
+        return ranked[:top_k]
+
+
+def _relevance(value: object) -> float | None:
+    """A result row's ``relevance_score``; ``None`` when missing or not a number."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None

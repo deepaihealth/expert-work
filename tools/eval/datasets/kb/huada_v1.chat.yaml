@@ -489,6 +489,10 @@ cases:
     anchor: • 3岁以上人群，尤其是：
     page: null
     via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 有膳⻝纤维补充需求的3岁以上⼈群
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0017
   query: 备孕、怀孕期间能喝轻路吗？
@@ -728,6 +732,14 @@ cases:
     anchor: 如果您需要改善不止一种情况的时候，是可以同时食用2～3种的，根据自身情况选择即可
     page: null
     via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 如果您存在多种情况可以选择多种款式，分开不同餐后/前吃哦(比如清风要餐前吃)
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 如果您存在多种情况可以选择多种款式，分开不同餐后/前吃哦(比如清风要餐前吃)
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0023
   query: 益生菌是药吗？能治病吗？
@@ -781,6 +793,14 @@ cases:
     via: pool-judge
   - document: 华大营养产品详情检索.xlsx
     anchor: 每袋100亿CFU活菌，直接添加GAMA，酪蛋白肽，和4种植萃营养
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益休.docx
+    anchor: 保护菌株活性，活着到肠道（专利冻干保护技术、多层包埋技术、高阻隔小U顿内袋（隔氧隔水遮光））
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：益休.docx
+    anchor: 每袋100亿CFU活菌，直接添加GABA，酪蛋白肽，和4种植萃营养
     page: null
     via: pool-judge
   answer: null
@@ -1298,6 +1318,22 @@ cases:
     anchor: 快速缓解胃反酸、灼痛和酒后胃不适，长期食用可辅助胃粘膜消炎、修复，提升胃部健康和消化功能。
     page: null
     via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 胃反酸、烧心、嘴里发酸发苦、恶心这些胃不适发作的情况，及时吃2~3袋益舒可以在10分钟内缓解不适
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 胃反酸、烧心、嘴里发酸发苦、恶心这些胃不适发作的情况，及时吃2~3袋益舒可以在10分钟内缓解不适
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: 胃反酸、烧⼼、嘴⾥发酸发苦、恶⼼这些胃不适发作的情况，及时吃2~3袋益舒可以在10分钟内缓
+    page: null
+    via: pool-judge
+  - document: 77_益舒口播-曦曦.docx
+    anchor: 华大专研的益舒小黄盒，核心就是这四株专利护卫菌，专门去修补那层被你的外卖、烧烤折磨得稀碎的黏膜
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0039
   query: 改善便秘有什么方法？推荐吃哪个？
@@ -1753,6 +1789,10 @@ cases:
     anchor: 低糖水果(草莓、柚子等)约100克
     page: null
     via: pool-judge
+  - document: 华大血糖管理手册【血糖营专享】.pdf
+    anchor: 每天建议摄入100-200克（约一个拳头大小）的新鲜水果
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0053
   query: 动态血糖仪能戴着洗澡吗？是防水的吗？
@@ -2145,6 +2185,10 @@ cases:
     anchor: 益顺是粉剂(固体饮料):可以用40°C以下温水冲饮或直接干吃。
     page: null
     via: pool-judge
+  - document: 产品说明书：益顺.docx
+    anchor: 建议每日餐后食用1袋，在餐后30分钟食用更佳，每次用100mL左右40°C以下温水冲饮或者直接干吃再配合喝水送服也可
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0067
   query: 益生菌能和二甲双胍一起吃吗？
@@ -2193,6 +2237,14 @@ cases:
     anchor: 要是喝酒，酒前酒后吃一袋，总的来说它能快速缓解胃反酸、灼痛和酒后胃不适
     page: null
     via: pool-judge
+  - document: 82_益舒口播稿菌株+带货-12月30日.docx
+    anchor: 酒前让他冲一袋，它里面的成分能给胃先贴一层膜，迎接食物时候更从容
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 饮酒人群酒前酒后各食用2袋以上更佳
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0070
   query: 轻路是药吗？
@@ -2227,6 +2279,10 @@ cases:
     via: pool-judge
   - document: 华大营养产品知识库.xlsx
     anchor: 优美达「轻路」 膳食纤维粉
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 轻路 膳食纤维代餐粉
     page: null
     via: pool-judge
   answer: null
@@ -2577,6 +2633,26 @@ cases:
     anchor: 5大优质益生元，打造“养菌”环境：L-阿拉伯糖、低聚木糖、低聚果糖、抗性糊精、菊粉。同时也是水溶性膳食纤维
     page: null
     via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 五元复配： 抗性糊精、圆苞车前子壳粉、水苏糖、低聚木糖、海藻粉
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.docx
+    anchor: 抗性糊精、圆苞车前子壳粉、水苏糖、低聚木糖、海藻粉五种益生元协同作用，覆盖肠道不同区段
+    page: null
+    via: pool-judge
+  - document: 华大营养产品详情检索.xlsx
+    anchor: 菊粉、半乳甘露聚糖、多元膳食纤维复配粉(膳食纤维谷物粉(麦麸粉、燕麦麸皮粉、薏苡仁粉、苦荞粉)、抗性糊精、谷物混合粉
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：升级版【轻路】.pdf
+    anchor: 抗性糊精，圆苞⻋前⼦壳粉，⽔苏糖，低聚⽊糖，海藻粉
+    page: null
+    via: pool-judge
+  - document: 私域电商运营活动计划表-老版.xlsx
+    anchor: 多元膳食纤维复配粉：多种膳食纤维组合，综合发挥增加饱腹感、促进肠道蠕动、调节肠道菌群、降低胆固醇吸收、稳定血糖等作用
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0084
   query: 轻路吃了会有饱腹感吗？
@@ -2731,6 +2807,10 @@ cases:
     via: pool-judge
   - document: 镜脂益生菌_减重客户沟通 SOP_长沙.docx
     anchor: 镜脂益生菌减重客户专属沟通SOP
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 镜脂「轻」益生菌压片糖果
     page: null
     via: pool-judge
   answer: null
@@ -2997,6 +3077,10 @@ cases:
     anchor: 优美达「畅爽」西梅EGCG植萃特膳益生元饮
     page: null
     via: pool-judge
+  - document: 产品说明书 ：畅爽.docx
+    anchor: 西梅EGCG植萃特膳益生元饮
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0091
   query: 益生菌是怎么帮助控制体重的？
@@ -3193,6 +3277,10 @@ cases:
     anchor: 左右比较好，这是因为益生菌进入人体后，一般会经历以下四个阶段
     page: null
     via: pool-judge
+  - document: 产品说明书：密蜜（女性闺蜜菌） V2.docx
+    anchor: 一般建议坚持食用至少3个月作为一个完整的调理周期
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0094
   query: 吃一盒（30 天）会有效果吗？
@@ -3235,6 +3323,14 @@ cases:
     via: pool-judge
   - document: 产品说明书：益畅.docx
     anchor: 建议坚持服用1个月，帮助肠道环境稳定下来。
+    page: null
+    via: pool-judge
+  - document: 华大产品汇总.xlsx
+    anchor: 坚持吃1个月调理后更佳；如果客户是长期便秘问题，建议每天加量至2~3袋，建议至少调理3个月
+    page: null
+    via: pool-judge
+  - document: 华大营养产品知识库.xlsx
+    anchor: 效果因人而异，如果客户只是偶尔会便秘或者是想排便更通畅，可能1~2天就有改善，坚持吃1个月调理后更佳
     page: null
     via: pool-judge
   answer: null
@@ -3641,6 +3737,10 @@ cases:
     anchor: 多数人在服用益生菌时，基本不会有什么副反应的感觉，最多是肚子有些“咕噜咕噜”的声音，产气比平常稍多一点而已。
     page: null
     via: pool-judge
+  - document: 产品说明书 ：轻路.docx
+    anchor: 正常。这是益生元在肠道中被发酵产气的自然现象
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0102
   query: 益生菌一次吃多了会怎么样？
@@ -3663,6 +3763,18 @@ cases:
     via: pool-judge
   - document: 华大产品汇总.xlsx
     anchor: 可以适当调整饮食、增加饮水，适当增加/减少益生菌食用频率，完全不用担心会造成损害。
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 如担心一次摄入太多活菌会使肠道不适应，则可分别间隔数个小时食用；如尝试同时食用后没有任何不适应，则放心同时食用
+    page: null
+    via: pool-judge
+  - document: 华大营养益生菌FAQ-2025.xlsx
+    anchor: 如担心一次摄入太多活菌会使肠道不适应，则可分别间隔数个小时食用；如尝试同时食用后没有任何不适应，则放心同时食用
+    page: null
+    via: pool-judge
+  - document: 益生菌益生元常见问题.docx
+    anchor: 当实际服用量超过产品的推荐日服用量时，一般也不会导致安全问题
     page: null
     via: pool-judge
   answer: null
@@ -3783,6 +3895,18 @@ cases:
     via: pool-judge
   - document: 三诺多品类产品.pdf
     anchor: 进入应用【监测】首页，点击右上角客服图标即可24小时联系客服。
+    page: null
+    via: pool-judge
+  - document: 制度：销售日常操作及权限（需更新）.docx
+    anchor: '电话: 18102570300'
+    page: null
+    via: pool-judge
+  - document: 3.4销售日常操作及权限.docx
+    anchor: 收到货后订单群对接客服主动处理退差事宜，需在群内艾特客服处理
+    page: null
+    via: pool-judge
+  - document: 3.4销售日常操作及权限.docx
+    anchor: '电话: 18102570300'
     page: null
     via: pool-judge
   answer: null
@@ -4603,6 +4727,10 @@ cases:
     anchor: CGM 颠覆传统血糖监测 腹部佩戴 24小时监测 监测15天
     page: null
     via: pool-judge
+  - document: 三诺多品类产品.pdf
+    anchor: 植入性皮下传感器（一次佩戴，监测 7~16天）
+    page: null
+    via: pool-judge
   answer: null
 - id: chat_qa-0141
   query: 三诺有不用扎手指的血糖仪吗？
@@ -4813,6 +4941,10 @@ cases:
     via: pool-judge
   - document: 产品说明书：畅青.docx
     anchor: 口服青春双歧杆菌组缓解慢性结肠炎的发展
+    page: null
+    via: pool-judge
+  - document: 双歧杆菌缓解溃疡性结肠炎的作用机制研究进展_程欣钰.pdf
+    anchor: 总地来说，口服双歧杆菌是一种安全有
     page: null
     via: pool-judge
   answer: null

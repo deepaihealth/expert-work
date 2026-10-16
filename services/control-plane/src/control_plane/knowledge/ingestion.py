@@ -55,6 +55,8 @@ from expert_work.protocol import (
     IngestStage,
     KnowledgeChunk,
     KnowledgeDocument,
+    chunk_retrieval_text,
+    knowledge_document_title,
 )
 from orchestrator.llm import Embedder
 
@@ -377,6 +379,7 @@ async def ingest_document_bytes(
         chunk_max_tokens=chunk_max_tokens,
         chunk_overlap_tokens=chunk_overlap_tokens,
         generation=generation,
+        doc_title=knowledge_document_title(filename),
     )
 
 
@@ -391,6 +394,7 @@ async def ingest_markdown(
     chunk_max_tokens: int,
     chunk_overlap_tokens: int,
     generation: int | None = None,
+    doc_title: str | None = None,
 ) -> int:
     """Chunk → embed → store already-parsed Markdown; return the chunk count.
 
@@ -398,8 +402,10 @@ async def ingest_markdown(
     that parses elsewhere (the eval runner, an OCR path) still runs the exact
     production chunk / embed / store path. Same fence semantics.
 
-    Chunks are stored with a clean body plus their heading path; the embedded
-    / indexed text is the two joined (``KnowledgeChunk.retrieval_text``). A
+    Chunks are stored with a clean body plus their heading path and
+    ``doc_title`` (the document's cleaned name, see
+    ``knowledge_document_title``; ``None`` adds none); the embedded / indexed
+    text is the three joined (``KnowledgeChunk.retrieval_text``). A
     chunk whose retrieval text is unchanged from the version being replaced
     keeps its stored vector (matched by ``content_hash`` **and** the pinned
     embedding model) instead of being embedded again.
@@ -424,7 +430,7 @@ async def ingest_markdown(
         )
         return 0
     await _advance(store, stage=IngestStage.EMBEDDING, **stage_args)
-    texts = [piece.text for piece in pieces]
+    texts = [chunk_retrieval_text(piece.heading_path, piece.body, doc_title) for piece in pieces]
     hashes = [content_hash(text) for text in texts]
     vectors = await _vectors_for(
         store,
@@ -444,6 +450,7 @@ async def ingest_markdown(
             chunk_index=index,
             content=piece.body,
             heading_path=piece.heading_path,
+            doc_title=doc_title,
             content_hash=digest,
             embedding=vectors[digest],
             embedding_model=model_key,
@@ -812,11 +819,12 @@ class KnowledgeIngestionRunner:
         existing = await self._collect_chunks(tenant_id=tenant_id, document_id=document_id)
         if not existing:
             return
-        # The retrieval text (breadcrumb + body) is what the vectors encode.
+        # The retrieval text (title + breadcrumb + body) is what the vectors
+        # encode.
         texts = [chunk.retrieval_text for chunk in existing]
         embeddings = await embed_with_backoff(embedder, texts, tenant_id=tenant_id)
-        # Only the vector (and the model that made it) changes — heading path,
-        # hash, type and flags stay.
+        # Only the vector (and the model that made it) changes — title,
+        # heading path, hash, type and flags stay.
         rebuilt = [
             chunk.model_copy(update={"embedding": embedding, "embedding_model": model_key})
             for chunk, embedding in zip(existing, embeddings, strict=True)

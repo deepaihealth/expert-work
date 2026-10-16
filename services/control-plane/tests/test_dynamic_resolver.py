@@ -151,6 +151,34 @@ async def test_reranker_routes_dashscope_rerank_model_to_native_api(monkeypatch)
     assert out == [1, 0]  # native rerank order
 
 
+@pytest.mark.asyncio
+async def test_reranker_scored_keeps_the_native_api_scores(monkeypatch):
+    """The two-view rerank (B-175 wave 2 PR2b) needs the native API's scores."""
+
+    class _FakeRerankClient:
+        def __init__(self, **_kw):
+            pass
+
+        async def rerank(self, *, model, query, documents, top_n):
+            return {
+                "output": {
+                    "results": [
+                        {"index": 1, "relevance_score": 0.8},
+                        {"index": 0, "relevance_score": 0.3},
+                    ]
+                }
+            }
+
+    monkeypatch.setattr("control_plane.runtime.HTTPDashScopeRerankClient", _FakeRerankClient)
+    cfg = _Cfg()
+    cfg.rerank = ("qwen", "qwen3-vl-rerank")
+    rr = DynamicResolvingReranker(
+        config_service=cfg, resolver=_Resolver(), secret_store=_SecretStore()
+    )
+    out = await rr.rerank_scored(query="q", documents=["a", "b"], top_k=2, tenant_id=uuid4())
+    assert out == [(1, 0.8), (0, 0.3)]
+
+
 class _RaisingResolver:
     async def resolve_provider(self, *, tenant_id, provider):
         raise CredentialsResolverError(
@@ -167,3 +195,7 @@ async def test_reranker_degrades_to_identity_when_credential_missing():
     )
     out = await rr.rerank(query="q", documents=["a", "b", "c"], top_k=2, tenant_id=uuid4())
     assert out == [0, 1]  # identity order, no error
+    scored = await rr.rerank_scored(
+        query="q", documents=["a", "b", "c"], top_k=2, tenant_id=uuid4()
+    )
+    assert scored == [(0, None), (1, None)]  # no scores: the retriever keeps this order

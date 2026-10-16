@@ -32,10 +32,10 @@ def tokenize_for_search(text: str) -> str:
 # -- knowledge-base keyword query (B-175 wave 2) ------------------------------
 #
 # Knowledge-base keyword search only — long-term memory keeps querying with
-# ``tokenize_for_search`` and its all-words semantics. The write side
-# (``content_tsv``) is unchanged: queries are still segmented by
-# ``tokenize_for_search``, only which tokens are searched for, and how they
-# combine, differ.
+# ``tokenize_for_search`` and its all-words semantics. Both sides are segmented
+# by ``tokenize_for_search``; the knowledge-base write side indexes
+# :func:`kb_index_text` (NFKC, dashes folded, spaced numbers also joined), and
+# queries are normalised the same way.
 
 #: Function words, interrogatives and particles dropped from knowledge-base
 #: keyword queries: they appear in nearly every chunk, so matching on them
@@ -121,6 +121,31 @@ _IDENTIFIER_JOINERS = "-_./"
 #: ``ZL201900001234.5``, ``CN100000001A``).
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9]+(?:[-_./][A-Za-z0-9]+)*")
 
+#: A run of number groups with spaces inside or after a short letter prefix —
+#: how some documents print patent and application numbers
+#: (``ZL 2024 1 0048761.8``, ``ZL 2021116309138``). Matched on NFKC text.
+_SPACED_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9.])(?:[A-Za-z]{1,4} *)?[0-9]+(?:\.[0-9]+)*(?: +[0-9]+(?:\.[0-9]+)*)*"
+    r"(?![A-Za-z0-9])(?!\.[0-9])"
+)
+
+#: A spaced stretch reads as one identifier only from this many digits on:
+#: below it are counts, dates and versions (``2024 年 1 月``, ``1.2 3.4``).
+KB_SPACED_IDENTIFIER_MIN_DIGITS = 10
+
+#: …and only with a prefix of at least two letters (``ZL`` / ``CN``) or a
+#: group of at least this many digits (``0048761.8``): a list of short numbers
+#: — a table row, doses, years — is not an identifier, however many digits.
+KB_SPACED_IDENTIFIER_MIN_GROUP_DIGITS = 5
+
+#: Longest stretch of groups the write side joins: a flattened table can put a
+#: page count or a date beside a number, so every identifier-shaped stretch of
+#: a run up to this many groups is indexed joined.
+KB_SPACED_IDENTIFIER_MAX_GROUPS = 8
+
+#: A group of a spaced run: its letter prefix, then its integer digits.
+_GROUP_PARTS_RE = re.compile(r"([A-Za-z]*)([0-9]*)")
+
 #: A number with a unit (``2g`` / ``500mg`` / ``3.5g``) is a dose, not an
 #: identifier.
 _NUMBER_WITH_UNIT_RE = re.compile(r"\d+(?:\.\d+)?[a-z]{1,3}", re.IGNORECASE)
@@ -128,6 +153,12 @@ _NUMBER_WITH_UNIT_RE = re.compile(r"\d+(?:\.\d+)?[a-z]{1,3}", re.IGNORECASE)
 #: A digits-only run counts as an identifier from this many digits on
 #: (``201800005678.9`` and dates yes; ``2`` / ``30`` / ``2024`` no).
 KB_IDENTIFIER_MIN_DIGITS_ONLY_LENGTH = 6
+
+#: Share of a unit's coverage weight a chunk gets when the unit is only in
+#: its document title (a body hit gets all of it). A manual's body rarely
+#: names its product, so the title has to count; the same word in a body is
+#: still the stronger signal.
+KB_DOC_TITLE_HIT_WEIGHT = 0.5
 
 #: Added to the score of a chunk that contains any identifier phrase of the
 #: query. Without it a chunk scores below 1.1 + KB_KEYWORD_QUERY_PHRASE_BOOST
@@ -160,12 +191,13 @@ class KbKeywordQuery:
     whose segmentation agrees with the question's. ``None`` for a one-token
     question or one longer than :data:`KB_QUERY_MAX_TERMS` tokens.
 
-    The query is NFKC-normalised, but chunks are indexed as written (the write
-    side is raw). So a unit whose raw query text NFKC changes keeps that raw
-    form as well (``raw_forms``: unit → its raw tokens, matched adjacent), and
-    so does the question phrase (``raw_query_phrase``): text typed the way the
-    chunk writes it still matches, and the NFKC form finds halfwidth text.
-    Either form hitting counts as the unit hitting, once.
+    The query is NFKC-normalised and its spaced number runs are joined, as the
+    write side indexes chunks (:func:`kb_index_text`); chunks ingested before
+    that are indexed as written. So a unit whose raw query text normalising
+    changed keeps that raw form as well (``raw_forms``: unit → its raw
+    tokens, matched adjacent), and so does the question phrase
+    (``raw_query_phrase``): text typed the way such a chunk writes it still
+    matches. Either form hitting counts as the unit hitting, once.
     """
 
     terms: tuple[str, ...]
@@ -223,7 +255,7 @@ def _is_query_term(token: str) -> bool:
 def _normalise(text: str) -> tuple[str, list[int]]:
     """NFKC plus dash folding, character by character, with the index in
     ``text`` each output character came from — so a unit found in the
-    normalised text can be traced back to the raw text chunks are indexed by."""
+    normalised text can be traced back to the raw text it was typed as."""
     chars: list[str] = []
     origin: list[int] = []
     for index, char in enumerate(text):
@@ -231,6 +263,65 @@ def _normalise(text: str) -> tuple[str, list[int]]:
         chars.append(folded)
         origin.extend([index] * len(folded))
     return "".join(chars), origin
+
+
+def _identifier_shaped(groups: list[str]) -> bool:
+    """Whether space-separated ``groups`` read as one identifier: at least
+    :data:`KB_SPACED_IDENTIFIER_MIN_DIGITS` digits, and a two-letter prefix or
+    a group of :data:`KB_SPACED_IDENTIFIER_MIN_GROUP_DIGITS` or more digits."""
+    if sum(char.isdigit() for group in groups for char in group) < KB_SPACED_IDENTIFIER_MIN_DIGITS:
+        return False
+    parts = [_GROUP_PARTS_RE.match(group) for group in groups]
+    if parts[0] is not None and len(parts[0].group(1)) >= 2:
+        return True
+    return any(
+        part is not None and len(part.group(2)) >= KB_SPACED_IDENTIFIER_MIN_GROUP_DIGITS
+        for part in parts
+    )
+
+
+def _spaced_runs(normalised: str) -> list[re.Match[str]]:
+    """The runs of ``normalised`` that have a space inside."""
+    return [match for match in _SPACED_NUMBER_RE.finditer(normalised) if " " in match.group()]
+
+
+def _join_spaced_numbers(normalised: str, origin: list[int]) -> tuple[str, list[int]]:
+    """``normalised`` with the spaces of each identifier-shaped run (as a whole,
+    at most :data:`KB_SPACED_IDENTIFIER_MAX_GROUPS` groups) removed, and the
+    origin of every character kept."""
+    drop: set[int] = set()
+    for match in _spaced_runs(normalised):
+        groups = match.group().split()
+        if len(groups) <= KB_SPACED_IDENTIFIER_MAX_GROUPS and _identifier_shaped(groups):
+            drop.update(i for i in range(match.start(), match.end()) if normalised[i] == " ")
+    kept = [i for i in range(len(normalised)) if i not in drop]
+    return "".join(normalised[i] for i in kept), [origin[i] for i in kept]
+
+
+def _joined_forms(normalised: str) -> list[str]:
+    """Every identifier-shaped stretch (two to
+    :data:`KB_SPACED_IDENTIFIER_MAX_GROUPS` groups) of each spaced run, joined,
+    in order of first appearance."""
+    forms: dict[str, None] = {}
+    for match in _spaced_runs(normalised):
+        groups = match.group().split()
+        for start in range(len(groups)):
+            stop_max = min(len(groups), start + KB_SPACED_IDENTIFIER_MAX_GROUPS)
+            for stop in range(start + 2, stop_max + 1):
+                if _identifier_shaped(groups[start:stop]):
+                    forms.setdefault("".join(groups[start:stop]))
+    return list(forms)
+
+
+def kb_index_text(text: str) -> str:
+    """The text a knowledge-base chunk is keyword-indexed as: NFKC plus dash
+    folding (as queries are normalised), then the joined form of every
+    identifier-shaped stretch of a spaced number run on a line of its own —
+    the text as written stays indexed, so either way of typing the number
+    matches, even with a page count or a date printed beside it."""
+    normalised, _ = _normalise(text)
+    joined = _joined_forms(normalised)
+    return "\n".join([normalised, " ".join(joined)]) if joined else normalised
 
 
 def _searchable_words(text: str) -> list[str]:
@@ -253,8 +344,10 @@ def _raw_form(unit: str, raw_text: str) -> str | None:
 def build_kb_keyword_query(query: str) -> KbKeywordQuery | None:
     """Turn a natural-language question into a knowledge-base keyword query.
 
-    The query is NFKC-normalised and dash look-alikes become ``-`` (units keep
-    their raw form where that changed them, see :class:`KbKeywordQuery`).
+    The query is NFKC-normalised, dash look-alikes become ``-`` and spaced
+    number runs are joined (``ZL 2024 1 0048761.8`` → ``ZL202410048761.8``);
+    units keep their raw form where that changed them, see
+    :class:`KbKeywordQuery`.
     Identifiers become phrases and are cut out of the text, so their
     fragments (``qxa`` / ``n7`` of ``QXA-N7``) are not searched on their own;
     the rest is segmented by :func:`tokenize_for_search`, minus
@@ -264,7 +357,7 @@ def build_kb_keyword_query(query: str) -> KbKeywordQuery | None:
     ``query_phrase``. Returns ``None`` when nothing searchable is left —
     callers return no hits without querying.
     """
-    normalised, origin = _normalise(query)
+    normalised, origin = _join_spaced_numbers(*_normalise(query))
     # Spans in ``normalised`` of each unit's first occurrence; identifiers are
     # blanked out (same length) before the rest is segmented.
     phrase_spans: dict[str, tuple[int, int]] = {}

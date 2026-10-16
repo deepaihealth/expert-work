@@ -2,8 +2,8 @@
 
 命中有两级:文档级 = ``filename in expected.documents``(手列文档 + 运行器找出的含同一锚文本的
 文档);段级 = 文件在其中 **且**
-``expected.anchor in retrieval_text``(检索文本 = 标题路径 + 正文,与嵌入 / 关键词索引、
-智能体看到的是同一段字;两侧先过 :func:`anchor_key` 归一,
+``expected.anchor in retrieval_text``(检索文本 = 标题路径 + 正文,智能体看到的那段字;
+嵌入 / 关键词索引另在前面加了文档名,判对不算文档名;两侧先过 :func:`anchor_key` 归一,
 见 :func:`anchor_in`)。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
 哪些期望条目(:func:`document_coverage` / :func:`chunk_coverage`):
 
@@ -88,7 +88,8 @@ class ResultLike(Protocol):
 
     @property
     def retrieval_text(self) -> str:
-        """Text the hit was retrieved as — section breadcrumb + chunk body."""
+        """Text the agent sees for the hit — section breadcrumb + chunk body
+        (the index also carries the document title; hits are not judged on it)."""
 
     @property
     def score(self) -> float | None:
