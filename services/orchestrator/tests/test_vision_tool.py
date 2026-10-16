@@ -779,6 +779,7 @@ class _LocalRenderRuntime(RecordingSandboxRuntime):
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,
@@ -786,6 +787,7 @@ class _LocalRenderRuntime(RecordingSandboxRuntime):
             timeout_s=timeout_s,
             agent_key=agent_key,
             run_id=run_id,
+            has_skills=has_skills,
         )
         params = _snippet_params(code)
         env = _run_render(self.ws, params["rel"], units=params["units"], out_rel=params["out_rel"])

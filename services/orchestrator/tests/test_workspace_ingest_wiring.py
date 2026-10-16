@@ -192,8 +192,9 @@ class _FsSandbox(RecordingSandboxRuntime):
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
-        del timeout_s, agent_key, run_id
+        del timeout_s, agent_key, run_id, has_skills
         self.execs.append((sandbox_id, code))
         for rel, content in self.files.items():
             if json.dumps(rel) in code:

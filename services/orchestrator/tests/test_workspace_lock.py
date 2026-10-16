@@ -63,6 +63,7 @@ class _LockProbeClient:
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         self.active_at_exec = self.lock.active
         return SandboxOutcome(stdout=self.envelope, stderr="", exit_code=0, timed_out=False)

@@ -670,7 +670,8 @@ async def test_a_non_jinja_agent_resumes_exactly_as_before() -> None:
         assert ctx.run_id == c1
         assert ctx.inputs_run_id is None, "没有 inputs 的 run 不该多出 inputs_run_id"
         assert dict(ctx.prompt_inputs or {}) == {}
-        assert s.sandbox.exec_run_ids == [c1]
+        # 没有 inputs 就没有 inputs.json,沙箱里也就不该有指向它的 EXPERT_WORK_INPUTS。
+        assert s.sandbox.exec_run_ids == [None]
         assert s.writer.execs == []
         frame = await s.prompt_frame(r0)
         assert frame is not None and "inputs" not in frame

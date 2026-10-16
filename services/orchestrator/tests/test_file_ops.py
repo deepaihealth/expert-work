@@ -1370,6 +1370,7 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)

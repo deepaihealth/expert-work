@@ -741,7 +741,10 @@ async def test_worker_build_skill_seeds_follow_the_parent_key_at_exec(
     await tool.call({"path": "x.md", "content": "hi"}, ctx=ctx)
 
     assert runtime.exec_agent_keys == [parent_key]
-    skills_dir = agent_key_envs(runtime.exec_agent_keys[0])["EXPERT_WORK_SKILLS_DIR"]
+    assert runtime.exec_has_skills == [True], "worker 自己绑了技能 → exec 要带上技能目录"
+    skills_dir = agent_key_envs(runtime.exec_agent_keys[0], has_skills=True)[
+        "EXPERT_WORK_SKILLS_DIR"
+    ]
     assert skills_dir == f"{SANDBOX_SKILLS_ROOT}/{parent_key}"
     seeded = [rel for rel, _ in runtime.acquired[0][3]]
     assert f"{parent_key}/foo/SKILL.md" in seeded

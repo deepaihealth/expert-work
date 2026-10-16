@@ -97,7 +97,9 @@ class EgressContext:
     denylist: tuple[str, ...] = ()
 
 
-def agent_key_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, str]:
+def agent_key_envs(
+    agent_key: str, *, run_id: UUID | None = None, has_skills: bool = False
+) -> dict[str, str]:
     """Per-agent env overrides for an ``exec`` call (spec 决策 10 + B-61 §4.4).
 
     Currently just ``PYTHONUSERBASE`` isolation: two agents sharing one warm
@@ -114,10 +116,20 @@ def agent_key_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, s
     :func:`orchestrator.tools.inputs_doc.inputs_abs_dir`)。选环境变量而不是把路径写进
     提示词:``os.environ["EXPERT_WORK_INPUTS"]`` 是固定写法,而路径里的 run_id 仍然是
     一个要模型手抄的串,那与 B-61 的目的自相矛盾。
+
+    **这几个变量只在它们指向真东西时才出现**(2026-10-16 测试集群:一个既没绑技能、
+    也没声明变量的 agent ``env | grep -i expert`` 看到了它们,花几分钟去两个不存在的
+    目录里找「藏起来的任务数据」)。两个事实都由调用方判定后显式传进来,本函数不猜:
+
+    * ``run_id`` —— 只在那个 run 名下真有 ``inputs.json`` 时才给,否则 ``None``
+      (判定在 :func:`run_in_sandbox`);
+    * ``has_skills`` —— 这个 agent 真绑了技能、``/opt/skills/<agent_key>/`` 会被种上
+      时才是 ``True``(同样在 :func:`run_in_sandbox`,按技能种子有无)。
     """
     envs: dict[str, str] = {}
     if agent_key:
         envs["PYTHONUSERBASE"] = f"{SANDBOX_AGENTS_ROOT}/{agent_key}"
+    if agent_key and has_skills:
         # B-84 —— 技能文件的根。此前每个 ``<skill>`` 摘要都带一个 ``dir=``,
         # 19 个技能就重复 19 遍同一个前缀;换成一个环境变量,系统提示词里只说
         # 一次。**不能直接删掉不说** —— wave 2 之后技能落在
@@ -174,7 +186,9 @@ def platform_exec_envs() -> dict[str, str]:
     return out
 
 
-def exec_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, str]:
+def exec_envs(
+    agent_key: str, *, run_id: UUID | None = None, has_skills: bool = False
+) -> dict[str, str]:
     """一次 exec 真正注入的全部环境变量 —— **两个后端唯一的来源**。
 
     = 平台级(:func:`platform_exec_envs`)+ 每 agent / 每 run
@@ -182,7 +196,7 @@ def exec_envs(agent_key: str, *, run_id: UUID | None = None) -> dict[str, str]:
     ``PYTHONUSERBASE`` 被一个部署配置覆盖掉,就是两个 agent 重新共享 ``.local``。
     """
     envs = platform_exec_envs()
-    envs.update(agent_key_envs(agent_key, run_id=run_id))
+    envs.update(agent_key_envs(agent_key, run_id=run_id, has_skills=has_skills))
     return envs
 
 
@@ -337,6 +351,7 @@ class SandboxRuntime(Protocol):
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -350,8 +365,9 @@ class SandboxRuntime(Protocol):
 
         ``run_id``(B-61 §4.4)非 ``None`` 时同样经 :func:`agent_key_envs` 注入
         ``EXPERT_WORK_INPUTS``。与 ``agent_key`` 不同,它不经过任何 binding
-        wrapper 预绑定 —— ``run_in_sandbox`` 每次调用直接把 ``ctx.run_id``
-        原样带下来(run 是一次性的,没有"跨多次 exec 复用"这回事)。
+        wrapper 预绑定 —— ``run_in_sandbox`` 每次调用自己判定(那个 run 名下真有
+        ``inputs.json`` 才给,否则 ``None``)。``has_skills`` 同理:每次调用的事实,
+        ``True`` 时才注入 ``EXPERT_WORK_SKILLS_DIR``,wrapper 一律原样透传。
         """
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -432,6 +448,7 @@ class HTTPSupervisorRuntime:
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         payload: dict[str, Any] = {"code": code}
         if timeout_s is not None:
@@ -441,7 +458,7 @@ class HTTPSupervisorRuntime:
         # (agent_key_envs is the single source both backends call), sent over
         # the supervisor's own exec envs channel (ExecRequest.envs,
         # sandbox_supervisor/schemas.py).
-        envs = exec_envs(agent_key, run_id=run_id)
+        envs = exec_envs(agent_key, run_id=run_id, has_skills=has_skills)
         if envs:
             payload["envs"] = envs
         # B-60 —— 绑了 agent 时把它在 NAS 上的真实目录发给 supervisor,runner 在每次 exec
@@ -559,6 +576,8 @@ class RecordingSandboxRuntime:
     #: B-61 §4.4 — the ``run_id`` passed to each exec, kept out of ``execs``
     #: for the same reason ``exec_agent_keys`` is kept separate.
     exec_run_ids: list[UUID | None] = field(default_factory=list)
+    #: B-84 — the ``has_skills`` passed to each exec (same reasoning).
+    exec_has_skills: list[bool] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
     reaped: list[bool] = field(default_factory=list)
@@ -587,11 +606,13 @@ class RecordingSandboxRuntime:
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         del timeout_s
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)
         self.exec_run_ids.append(run_id)
+        self.exec_has_skills.append(has_skills)
         if self.exec_error is not None:
             raise self.exec_error
         return self.outcome
@@ -649,9 +670,10 @@ class _EgressBindingClient:
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
-        # This wrapper doesn't own agent_key or run_id — it's a pure passthrough
-        # here so a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
+        # This wrapper doesn't own agent_key, run_id or has_skills — it's a pure
+        # passthrough here so a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
         # still reaches the real backend (spec 决策 10 + B-61 §4.4; see bind_agent_key).
         return await self.inner.exec(
             sandbox_id=sandbox_id,
@@ -659,6 +681,7 @@ class _EgressBindingClient:
             timeout_s=timeout_s,
             agent_key=agent_key,
             run_id=run_id,
+            has_skills=has_skills,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -723,20 +746,22 @@ class _AgentKeyBindingClient:
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         # B-124 —— 调用方给了 key 就用调用方的:``run_in_sandbox`` 传 ``ctx.agent_key``,
         # 委派出去的子代那里是**父的** key(``_child_run._child_config``),与宿主侧
         # read_file / list_dir 同一个口径;绑定的 key 是子代自己 spec 名算出来的,
         # 用它 exec 就把子代的写落进一个父看不见的目录。绑定的 key 只做兜底,留给
         # 没有 ctx.agent_key 的调用方(inputs 节点 / 合成评测);主 run 两者相等。
-        # run_id isn't owned by this wrapper (it's per-call, not per-agent-build) —
-        # passthrough, same reasoning as _EgressBindingClient (B-61 §4.4).
+        # run_id / has_skills aren't owned by this wrapper (they're per-call, not
+        # per-agent-build) — passthrough, same reasoning as _EgressBindingClient (B-61 §4.4).
         return await self.inner.exec(
             sandbox_id=sandbox_id,
             code=code,
             timeout_s=timeout_s,
             agent_key=agent_key or self.agent_key,
             run_id=run_id,
+            has_skills=has_skills,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -797,12 +822,16 @@ async def run_in_sandbox(
     survive idle-reclaim and restore on the next acquire — no manifest opt-in.
     A run with no ``user_id`` falls back to an ephemeral tmpfs.
 
-    ``ctx.inputs_run_id or ctx.run_id`` 传给 ``client.exec``(B-61 §4.4)—— 非
-    ``None`` 时两个后端都会经 :func:`agent_key_envs` 注入 ``EXPERT_WORK_INPUTS``。
-    取 ``inputs_run_id`` 优先是为了委派:子代自己的 ``run_id`` 下**没有**
-    ``inputs.json``(inputs 节点故意跳过子 run),指向它等于给模型一条悬空路径;
-    子代与父共用同一个 ``/workspace``,所以指父的那份(见
-    ``ToolContext.inputs_run_id``)。
+    本轮有 inputs 时把 ``ctx.inputs_run_id or ctx.run_id`` 传给 ``client.exec``
+    (B-61 §4.4)—— 非 ``None`` 时两个后端都会经 :func:`agent_key_envs` 注入
+    ``EXPERT_WORK_INPUTS``。取 ``inputs_run_id`` 优先是为了委派:子代自己的 ``run_id``
+    下**没有** ``inputs.json``(inputs 节点故意跳过子 run),指向它等于给模型一条悬空
+    路径;子代与父共用同一个 ``/workspace``,所以指父的那份(见
+    ``ToolContext.inputs_run_id``)。本轮没有 inputs 时传 ``None``:那一轮根本没写过
+    ``inputs.json``,给变量就是给一条悬空路径(2026-10-16 测试集群)。
+
+    ``has_skills`` 同一个道理:技能种子非空才是 ``True``,两后端据此才注入
+    ``EXPERT_WORK_SKILLS_DIR``。
     """
     if ctx.tenant_id is None:
         msg = f"{tool_label} requires a tenant binding (ctx.tenant_id)"
@@ -828,6 +857,12 @@ async def run_in_sandbox(
             "ask the user to delete files from their workspace, then retry"
         )
         raise ToolBlockedError(msg) from exc
+    # 沙箱变量只指真东西 —— 两个事实在这里判定一次,两后端经 exec_envs 落成同一份 env。
+    # inputs:inputs 节点只在本轮真有值时才写 inputs.json(没声明变量的 agent 不装节点,
+    # 声明了但一个都没传时跳过;多出来的键 control-plane 早已拒掉)。ctx.prompt_inputs
+    # 就是「本轮有值」:主 run 来自入口,审批续跑 / 孤儿复活 / 重新生成由入口取回,子代由
+    # _child_config 从父那里带下来(父有才带)—— 与 sse.run_agent 写 inputs_run_id 同一口径。
+    inputs_run_id = (ctx.inputs_run_id or ctx.run_id) if ctx.prompt_inputs else None
     cancelled = False
     try:
         return await client.exec(
@@ -835,7 +870,9 @@ async def run_in_sandbox(
             code=code,
             timeout_s=timeout_s,
             agent_key=ctx.agent_key,
-            run_id=ctx.inputs_run_id or ctx.run_id,
+            run_id=inputs_run_id,
+            # 技能:种子非空 = 这次 acquire 把技能落到了 /opt/skills/<agent_key>/。
+            has_skills=bool(seed_files),
         )
     except asyncio.CancelledError:
         cancelled = True
