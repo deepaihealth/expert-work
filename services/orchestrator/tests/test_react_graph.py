@@ -20,6 +20,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import (
     AgentState,
     GraphRunner,
+    LLMCaller,
     ToolContext,
     ToolRegistry,
     ToolResult,
@@ -356,7 +357,7 @@ def _served_caps() -> Any:
 _GLM_CAPS = _served_caps()
 
 
-async def _run_through_sse(llm: _ScriptedLLM, registry: ToolRegistry) -> tuple[list[Any], Any]:
+async def _run_through_sse(llm: LLMCaller, registry: ToolRegistry) -> tuple[list[Any], Any]:
     """真 graph 过 ``run_agent``:断言落在用户看得见的 error 帧与 run 行上。"""
     from uuid import uuid4
 
@@ -414,6 +415,41 @@ async def test_truncated_empty_reply_fails_the_run_visibly() -> None:
     assert row is not None and row.error is not None and "模型输出被截断" in row.error
     assert _truncated_count("false") == before + 2, "两次截断各计一次"
     assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stall_after_reasoning_only_fails_the_run_visibly() -> None:
+    # B-186:思考完停住、一个字的回答都没有。原来这一轮当成空回答收尾,run 记成功。
+    # 真路由(盖章)→ 真图(主循环判失败)→ run_agent。
+    import asyncio
+
+    from orchestrator.llm.providers._streaming import LLMDelta, OpenAIStreamAssembler
+    from orchestrator.llm.router import LLMRouter, ProviderHandle
+
+    class _ThinksThenStalls:
+        async def stream(self, *, messages: Any, tools: Any, output_schema: Any = None) -> Any:
+            del messages, tools, output_schema
+            yield LLMDelta(reasoning="让我想想")
+            await asyncio.sleep(0.3)
+
+        def new_stream_assembler(self) -> OpenAIStreamAssembler:
+            return OpenAIStreamAssembler()
+
+    router = LLMRouter(
+        providers=[ProviderHandle(provider=_ThinksThenStalls(), key="deepseek:deepseek-flash")],
+        first_token_timeout_s=0.5,
+        idle_timeout_s=0.1,
+    )
+
+    events, row = await _run_through_sse(router, ToolRegistry())
+
+    errors = [e for e in events if e.event == "error"]
+    assert len(errors) == 1
+    assert errors[0].data["name"] == "StalledWithoutAnswerError"
+    assert "还没给出回答就中断了" in errors[0].data["message"]
+    assert "deepseek" not in errors[0].data["message"], "不暴露模型与凭据序号"
+    assert row is not None and row.status.value == "error"
+    assert row.error is not None and "token 间隔超时" in row.error
 
 
 @pytest.mark.asyncio
@@ -593,6 +629,36 @@ async def test_unusable_truncation_is_metered_but_not_cached() -> None:
     assert [(r.model, r.input_tokens, r.output_tokens, r.usage_kind) for r in rows] == [
         ("glm-5.3", 100, 2048, "conversation")
     ] * 2, "B-158:原调用与重试各计一行"
+    assert cache.puts == []
+
+
+@pytest.mark.asyncio
+async def test_stall_without_answer_is_metered_but_not_cached() -> None:
+    # B-186:停住那次调用照样计费(Anthropic 的半截带着输入用量),但空的半截不进响应缓存。
+    from orchestrator.llm.stall import STALLED_AFTER_S, StalledWithoutAnswerError
+
+    rows, cache, raised = await _run_with_usage(
+        AIMessage(content="", usage_metadata=_USAGE, response_metadata={STALLED_AFTER_S: 45.0})
+    )
+
+    assert isinstance(raised, StalledWithoutAnswerError)
+    assert [(r.input_tokens, r.output_tokens) for r in rows] == [(100, 2048)]
+    assert cache.puts == []
+
+
+@pytest.mark.asyncio
+async def test_stall_after_answer_text_is_delivered_but_not_cached() -> None:
+    # 停住前已经有回答文字:照旧交付、记账,但半句回答不进响应缓存。
+    from orchestrator.llm.stall import STALLED_AFTER_S
+
+    rows, cache, raised = await _run_with_usage(
+        AIMessage(
+            content="半句回答", usage_metadata=_USAGE, response_metadata={STALLED_AFTER_S: 45.0}
+        )
+    )
+
+    assert raised is None
+    assert len(rows) == 1
     assert cache.puts == []
 
 

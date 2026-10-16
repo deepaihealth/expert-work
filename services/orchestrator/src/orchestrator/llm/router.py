@@ -69,6 +69,7 @@ from orchestrator.llm.providers._streaming import (
     StreamAssembler,
     supports_streaming,
 )
+from orchestrator.llm.stall import STALLED_AFTER_S
 from orchestrator.llm.structured_output import (
     MAX_VALIDATION_RETRIES,
     correction_message,
@@ -646,11 +647,13 @@ class LLMRouter:
         ``first_token_timeout_s``; a stall or error is retryable →
         fallback. Phase 2 (after the first progress delta): bounded by
         ``idle_timeout_s``; a stall ends the turn with the partial
-        output; an error is terminal (:class:`LLMStreamInterruptedError`,
-        no fallback)."""
+        output, stamped :data:`~orchestrator.llm.stall.STALLED_AFTER_S`
+        unless a finish reason already arrived (B-186); an error is
+        terminal (:class:`LLMStreamInterruptedError`, no fallback)."""
         it = stream.__aiter__()
         sink = _delta_sink.get()
         first_progress = False
+        finished = False
 
         # Phase 1 — wait for the first progress delta.
         while not first_progress:
@@ -673,6 +676,7 @@ class LLMRouter:
             if sink is not None:
                 await sink(delta)
             first_progress = delta.has_progress
+            finished = finished or delta.finish_reason is not None
 
         # Phase 2 — consume the rest under the idle timeout.
         while True:
@@ -686,7 +690,13 @@ class LLMRouter:
                     handle.key,
                     self.idle_timeout_s,
                 )
-                return assembler.build(interrupted=True)
+                partial = assembler.build(interrupted=True)
+                if finished or self.idle_timeout_s is None:
+                    return partial
+                # B-186 — the agent loop fails a reasoning-only partial;
+                # planner / reflection keep treating it as an empty reply.
+                metadata = {**partial.response_metadata, STALLED_AFTER_S: self.idle_timeout_s}
+                return partial.model_copy(update={"response_metadata": metadata})
             except LLMError as exc:
                 # Post-first-token hard error → terminal, no fallback.
                 raise LLMStreamInterruptedError(
@@ -696,6 +706,7 @@ class LLMRouter:
             assembler.add(delta)
             if sink is not None:
                 await sink(delta)
+            finished = finished or delta.finish_reason is not None
 
     async def _handle_unauthorized(
         self,

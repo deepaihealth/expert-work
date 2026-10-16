@@ -1609,7 +1609,10 @@ class AgentSpecBody(BaseModel):
             "Stream L (P1) — inter-token idle cap for a STREAMING provider "
             "call. After the first token, a gap between deltas longer than "
             "this ends the turn with the partial output (the model went "
-            "silent mid-stream). Distinct from ``stream_deadline_s`` (the "
+            "silent mid-stream); if that partial is reasoning only, with no "
+            "answer text and no complete tool call, the agent loop fails the "
+            "run instead (B-186; planner / reflection still get the partial). "
+            "Distinct from ``stream_deadline_s`` (the "
             "time-to-first-token budget). Set ``0`` to disable the idle "
             "timer (dev / long-batch). Non-streaming providers ignore this."
         ),

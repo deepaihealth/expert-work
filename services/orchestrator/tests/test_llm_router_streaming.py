@@ -8,8 +8,9 @@ from expert_work.runtime.middleware import (
     LLMServerError,
     LLMStreamInterruptedError,
 )
-from orchestrator.llm.providers._streaming import LLMDelta
+from orchestrator.llm.providers._streaming import LLMDelta, ToolCallChunk
 from orchestrator.llm.router import AllProvidersExhaustedError, LLMRouter, ProviderHandle
+from orchestrator.llm.stall import STALLED_AFTER_S, stalled_without_answer
 
 
 class _StreamProvider:
@@ -74,6 +75,79 @@ async def test_idle_after_first_token_ends_turn_with_partial() -> None:
     msg = await router(messages=[], tools=[])
     assert msg.content == "partial answer"
     assert msg.response_metadata.get("finish_reason") == "stream_idle_timeout"
+
+
+@pytest.mark.asyncio
+async def test_idle_after_reasoning_only_returns_a_stamped_partial() -> None:
+    # B-186: the model thinks, then goes silent before any answer. The router
+    # still hands back the partial (no fallback: the thinking has already
+    # streamed), stamped so the agent loop can fail the run. Planner and
+    # reflection share this router and keep treating it as an empty reply.
+    slow = _handle(
+        [LLMDelta(reasoning="let me think "), LLMDelta(reasoning="some more"), 0.3], key="glm:a"
+    )
+    never = _handle([LLMDelta(content="SHOULD NOT REACH")], key="glm:b")
+    router = LLMRouter(providers=[slow, never], first_token_timeout_s=0.5, idle_timeout_s=0.1)
+    msg = await router(messages=[], tools=[])
+    assert msg.content == ""
+    assert msg.additional_kwargs.get("reasoning_content") == "let me think some more"
+    assert msg.response_metadata.get(STALLED_AFTER_S) == 0.1
+    assert stalled_without_answer(msg) == 0.1
+
+
+@pytest.mark.asyncio
+async def test_idle_with_whitespace_and_an_unfinished_tool_call_counts_as_no_answer() -> None:
+    # The unfinished call is dropped from the partial (its arguments never
+    # completed) and whitespace is not an answer, so nothing usable is left.
+    script = [
+        LLMDelta(reasoning="plan"),
+        LLMDelta(content="\n "),
+        LLMDelta(
+            tool_calls=(ToolCallChunk(index=0, id="call_1", name="search", args_fragment='{"q":'),)
+        ),
+        0.3,
+    ]
+    router = LLMRouter(providers=[_handle(script)], first_token_timeout_s=0.5, idle_timeout_s=0.1)
+    msg = await router(messages=[], tools=[])
+    assert msg.tool_calls == []
+    assert stalled_without_answer(msg) == 0.1
+
+
+@pytest.mark.asyncio
+async def test_idle_after_a_complete_tool_call_still_ends_turn_with_partial() -> None:
+    script = [
+        LLMDelta(reasoning="plan"),
+        LLMDelta(
+            tool_calls=(
+                ToolCallChunk(index=0, id="call_1", name="search", args_fragment='{"q": "x"}'),
+            )
+        ),
+        0.3,
+    ]
+    router = LLMRouter(providers=[_handle(script)], first_token_timeout_s=0.5, idle_timeout_s=0.1)
+    msg = await router(messages=[], tools=[])
+    assert [call["name"] for call in msg.tool_calls] == ["search"]
+    assert msg.response_metadata.get("finish_reason") == "stream_idle_timeout"
+    assert stalled_without_answer(msg) is None
+
+
+@pytest.mark.asyncio
+async def test_idle_after_a_finish_reason_is_not_stamped() -> None:
+    # The vendor already said why it stopped (here: output cap, B-105's case);
+    # only the trailing usage chunk / [DONE] went missing. Not a stall.
+    script = [LLMDelta(reasoning="plan"), LLMDelta(finish_reason="length"), 0.3]
+    router = LLMRouter(providers=[_handle(script)], first_token_timeout_s=0.5, idle_timeout_s=0.1)
+    msg = await router(messages=[], tools=[])
+    assert msg.response_metadata.get("finish_reason") == "length"
+    assert STALLED_AFTER_S not in msg.response_metadata
+
+
+@pytest.mark.asyncio
+async def test_timeout_raised_by_the_provider_with_the_idle_timer_off_is_not_stamped() -> None:
+    script = [LLMDelta(reasoning="plan"), TimeoutError("read timeout")]
+    router = LLMRouter(providers=[_handle(script)], first_token_timeout_s=0.5, idle_timeout_s=None)
+    msg = await router(messages=[], tools=[])
+    assert STALLED_AFTER_S not in msg.response_metadata
 
 
 @pytest.mark.asyncio
