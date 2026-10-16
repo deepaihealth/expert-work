@@ -29,7 +29,11 @@ import numpy as np
 import pandas as pd
 import pdfplumber
 import pypdf
+import pytz
+import requests
 import weasyprint
+import yaml
+from bs4 import BeautifulSoup
 from docx import Document
 from matplotlib import font_manager
 from matplotlib import pyplot as plt
@@ -117,9 +121,28 @@ if not sys.flags.safe_path:
 
 # The system binaries skills shell out to. Having the Python lib is not enough;
 # assert the binary is present AND does real work.
-for _bin in ("soffice", "pdftoppm", "ffmpeg", "node"):
+for _bin in ("soffice", "pdftoppm", "ffmpeg", "node", "unzip", "sqlite3", "curl"):
     if shutil.which(_bin) is None:
         raise RuntimeError(f"system binary missing from PATH: {_bin}")
+
+# 2026-10-16 additions — each one imports AND does one real thing.
+if yaml.safe_load("a: [1, 2]") != {"a": [1, 2]}:
+    raise RuntimeError("PyYAML round-trip failed")
+if BeautifulSoup("<p>x</p>", "html.parser").get_text() != "x":
+    raise RuntimeError("beautifulsoup4 parse failed")
+if pytz.timezone("Asia/Shanghai").zone != "Asia/Shanghai":
+    raise RuntimeError("pytz zone lookup failed")
+if requests.Request("GET", "https://example.com/a b").prepare().url != "https://example.com/a%20b":
+    raise RuntimeError("requests URL preparation failed")
+_sqlite = subprocess.run(
+    ["sqlite3", ":memory:", "select 1 + 1;"],
+    capture_output=True,
+    text=True,
+    timeout=30,
+    check=False,
+)
+if _sqlite.stdout.strip() != "2":
+    raise RuntimeError(f"sqlite3 CLI failed rc={_sqlite.returncode} stderr={_sqlite.stderr!r}")
 
 # Real conversion: pptx → pdf via LibreOffice headless (the xlsx-recalc /
 # pptx-thumbnail / docx-accept-changes paths all run soffice this way). A

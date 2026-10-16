@@ -212,6 +212,9 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         libreoffice-impress-nogui \
         poppler-utils \
         nodejs \
+        unzip \
+        sqlite3 \
+        curl \
         libpango-1.0-0 \
         libpangocairo-1.0-0 \
         libpangoft2-1.0-0 \

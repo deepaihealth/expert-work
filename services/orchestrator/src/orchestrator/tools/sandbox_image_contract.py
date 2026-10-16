@@ -174,6 +174,10 @@ SANDBOX_PREINSTALLED_PYTHON: tuple[str, ...] = (
     "imageio",
     "imageio-ffmpeg",
     "defusedxml",
+    "PyYAML",
+    "pytz",
+    "beautifulsoup4",
+    "requests",
 )
 
 
@@ -214,6 +218,12 @@ SANDBOX_PREINSTALLED_BINARIES: tuple[PreinstalledBinary, ...] = (
     PreinstalledBinary("pdftoppm", "apt", "poppler-utils"),
     PreinstalledBinary("ffmpeg", "wheel", "imageio-ffmpeg"),
     PreinstalledBinary("node", "apt", "nodejs"),
+    # 2026-10-16:测试环境 90 天里模型敲过却 not found 的 —— unzip 36 个 run、curl 21 个
+    # (curl 只在 Agent 开了出网时有用,出网走平台代理,curl 读 HTTPS_PROXY 自带鉴权);
+    # sqlite3 很小,看 .db 文件比写 Python 顺手。
+    PreinstalledBinary("unzip", "apt", "unzip"),
+    PreinstalledBinary("sqlite3", "apt", "sqlite3"),
+    PreinstalledBinary("curl", "apt", "curl"),
 )
 
 #: 一句**否定**断言,和上面那份肯定清单一起进工具描述。

@@ -32,6 +32,14 @@ ECR Public 的 ``docker/library`` 是 AWS 对 Docker 官方镜像的镜像站,�
 裸引用(含 ``docker.io/`` 全称)同样违规;唯一合法提到上游的地方是那个
 workflow,它把名字和 tag 拆成两个字段在运行时拼,所以卫兵仍然零豁免。
 
+**第三条(2026-10-16)**:ECR Public 的匿名拉取也开始按出口 IP 卡流量
+(``toomanyrequests: Data limit exceeded``,一天三次 integration 假红),所以官方镜像
+**也**复制到了 GHCR mirror。但源码里的引用**不改**,仍写 ``public.ecr.aws/docker/library/``
+—— 从国内构建,ECR 快;只有 CI 换源(``tools/ci/prepull_images.py`` 拉 GHCR 再 tag 成
+ECR 名,ci.yml 的沙箱预构建用 build-contexts)。所以本卫兵的第一条规矩不变;
+``tests/test_mirror_images_workflow.py`` 负责「仓库里每个 ECR 官方引用都在 mirror 的
+matrix 里」。
+
 其余非官方镜像(``minio/`` ``grafana/`` ``prom/`` ``searxng/``
 ``clickhouse/`` ``langfuse/`` 等)不在本卫兵管辖内 —— 它们各有各的上游,
 统一搬运是另一件事。

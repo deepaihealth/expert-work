@@ -70,7 +70,11 @@ def compose_stack() -> Iterator[DockerCompose]:
     stack = DockerCompose(
         context=str(_INFRA_DIR),
         compose_file_name="docker-compose.yml",
-        pull=True,
+        # ``pull=False``:镜像由 CI 的预拉步骤(tools/ci/prepull_images.py,GHCR mirror
+        # 优先、ECR 退避兜底)先放进本机;``pull=True`` 会再去 registry 核对 manifest,
+        # 限流一到照样失败(10-16 两次 integration 假红就红在这一步)。本机没有的,
+        # ``up`` 照样会拉。
+        pull=False,
         wait=True,
     )
     with stack:

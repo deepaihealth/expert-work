@@ -37,6 +37,16 @@ name: Mirror images (GHCR)
 # compose 升级 tag 必须同一个 PR 改这里的 matrix,否则 integration 会在
 # 40 分钟后用一句 `manifest unknown` 告诉你。
 #
+# 2026-10-16 起也复制 **Docker 官方镜像**(redis / python / nginx / debian / node /
+# postgres)。源码里这些仍写 `public.ecr.aws/docker/library/…`(从国内构建,ECR 约 1 秒,
+# GHCR 不一定),只有 CI 改拉这里:tools/ci/prepull_images.py 先拉 GHCR 再 `docker tag`
+# 成 ECR 的名字,ci.yml 的沙箱镜像预构建用 build-contexts 把 FROM 指过来。起因:ECR
+# Public 的匿名拉取开始报 `toomanyrequests: Data limit exceeded`(按 runner 出口 IP 的
+# 流量配额,10-16 一天三次 integration 假红,每次 6 轮退避都拉不动)。官方镜像的源用
+# Docker Hub 而不是 ECR —— 一周一次的 manifest 复制在 Docker Hub 匿名额度内,而 ECR 那份
+# 流量配额正是 CI 被卡的那一份。tests/test_mirror_images_workflow.py 保证仓库里每个
+# `public.ecr.aws/docker/library/` 引用都在下面的 matrix 里。
+#
 # 上游引用刻意拆成 `upstream` + `tag` 两个字段在 run 里拼:镜像来源卫兵
 # (tools/ci/check_image_registry.py)把这两个名字的 `name:tag` 裸引用视为
 # 违规,本文件是唯一合法提到上游的地方,拼接而不是字面量,卫兵才能零豁免。
@@ -45,6 +55,10 @@ on:
   schedule:
     - cron: "43 2 * * 1" # Mondays 02:43 UTC — 避开整点高峰
   workflow_dispatch:
+  # matrix 加了新镜像时合进 main 就复制一次,不等周一、不用人去点。
+  push:
+    branches: [main]
+    paths: [".github/workflows/mirror-images.yml"]
 
 concurrency:
   group: ${{ github.workflow }}
@@ -82,6 +96,32 @@ jobs:
             registry: cgr.dev
             upstream: chainguard/minio-client
             tag: latest-dev
+          # Docker 官方镜像(2026-10-16,见文件头)。源码里写的是 ECR 名,
+          # 这里的 name/tag 与之一一对应:public.ecr.aws/docker/library/<name>:<tag>。
+          - name: redis
+            upstream: library/redis
+            tag: 7-alpine
+          - name: python
+            upstream: library/python
+            tag: 3.12-slim
+          - name: python
+            upstream: library/python
+            tag: 3.12-slim-bookworm
+          - name: python
+            upstream: library/python
+            tag: 3.12-alpine
+          - name: nginx
+            upstream: library/nginx
+            tag: 1.27-alpine
+          - name: debian
+            upstream: library/debian
+            tag: bookworm-slim
+          - name: node
+            upstream: library/node
+            tag: 22-alpine
+          - name: postgres
+            upstream: library/postgres
+            tag: 16-alpine
     steps:
       # Actions SHA-pinned —— 这个 workflow 持有能往 org 包仓写入的 token,
       # 可变 tag 被重指向恶意代码的风险不能留(与 sandbox-image.yml 同一规矩)。
@@ -105,6 +145,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "== $SRC -> $DST"
-          docker buildx imagetools create --tag "$DST" "$SRC"
+          # 源端是匿名读,偶尔被限流:退避重试,别让一次 429 把这一格留到下周一。
+          for delay in 0 30 90 180; do
+            sleep "$delay"
+            if docker buildx imagetools create --tag "$DST" "$SRC"; then
+              break
+            fi
+            [ "$delay" = 180 ] && { echo "::error::copy failed after retries: $SRC"; exit 1; }
+          done
           echo "== 目标上现在是:"
           docker buildx imagetools inspect "$DST"

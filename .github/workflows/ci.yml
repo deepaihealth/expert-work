@@ -209,8 +209,16 @@ jobs:
     # public source) now come from ghcr.io/deepaihealth/mirror/ — copied weekly
     # by .github/workflows/mirror-images.yml, pulled here with GITHUB_TOKEN
     # (credentialed quota, not the anonymous per-IP one). Docker Hub pull
-    # still left: searxng/searxng. ECR Public official images stay anonymous,
-    # so the pre-pull backoff stays.
+    # still left: searxng/searxng.
+    #
+    # 2026-10-16: the ECR Public official images are mirrored to GHCR too.
+    # ECR's anonymous pulls started failing with `toomanyrequests: Data limit
+    # exceeded` (a per-IP traffic quota; three red integration runs in one
+    # day, all six backoff rounds exhausted). Source refs stay on ECR — local
+    # builds from mainland China are fast there — and CI swaps the source:
+    # prepull_images.py pulls the GHCR copy and `docker tag`s it to the ECR
+    # name, and the sandbox prebuild below overrides its FROM with
+    # build-contexts. Anything not mirrored still falls back to ECR + backoff.
     #
     # 40 → 60(2026-09-13)。预算原本只给套件本身留余量(基线 9-15 分钟),
     # 默认下面那步的沙箱镜像预构建是缓存命中的。改 `infra/sandbox-image/` 的
@@ -297,6 +305,12 @@ jobs:
           file: infra/sandbox-image/Dockerfile
           load: true
           tags: expert-work-sandbox:ci
+          # The docker-container builder cannot see images pre-pulled into the
+          # local daemon, so without this it resolves FROM anonymously against
+          # ECR. Same digest from GHCR; tests/test_mirror_images_workflow.py
+          # keeps this key equal to the Dockerfile's FROM.
+          build-contexts: |
+            public.ecr.aws/docker/library/python:3.12-slim=docker-image://ghcr.io/deepaihealth/mirror/python:3.12-slim
           cache-from: type=gha
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
