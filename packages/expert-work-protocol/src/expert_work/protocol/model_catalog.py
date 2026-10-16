@@ -10,8 +10,8 @@ provider's official docs — do NOT carry stale names. Mark retired models
 ``deprecated=True`` so they stay referenceable but drop out of the dropdown
 (``models_for_provider``).
 
-Last verified: 2026-08 (glm/qwen additions) against each provider's official
-API docs; other providers 2026-07.
+Last verified: 2026-10 (deepseek-flash) / 2026-08 (glm/qwen additions) against
+each provider's official API docs; other providers 2026-07.
 
 B-105 上架规矩(2026-09-24 测试集群实调建立)—— 新增或修改带思考 / 视觉能力的模型,
 提交前必须在条目上写明:思考形态(``thinking``)、默认开关(``thinking_default`` /
@@ -182,13 +182,19 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ModelEntry(name="gpt-4o", vision=True, context_window=128_000, deprecated=True),
         ModelEntry(name="gpt-4o-mini", vision=True, context_window=128_000, deprecated=True),
     ),
-    # DeepSeek — api-docs.deepseek.com (2026-07)
-    # deepseek-v4-pro / deepseek-v4-flash are current (1M context, dual mode).
-    # deepseek-chat / deepseek-reasoner are the retired legacy aliases (map to
-    # deepseek-v4-flash non-thinking / thinking; vendor retirement 2026-07-24) —
-    # marked deprecated so they drop out of the dropdown but existing manifests
-    # still resolve during the transition. Their published 64K window is the old
-    # V3-era value (V4 is 1M); left as-is since they are on the way out.
+    # DeepSeek — api-docs.deepseek.com (2026-10)
+    # deepseek-v4-pro (DeepSeek-V4-Pro-0813, text only) / deepseek-flash
+    # (DeepSeek-V4.1-Flash, image understanding) are current (1M context, dual
+    # mode, thinking on by default). deepseek-v4-flash is the retired V4-Flash
+    # name: the vendor still accepts it but serves DeepSeek-V4.1-Flash at the
+    # Flash price (2026-10-16 实调:回显 model=deepseek-flash,看图也能答) —
+    # deprecated, and vision stays False on it so a new vision setup is made on
+    # deepseek-flash rather than on a name the vendor is dropping.
+    # deepseek-chat / deepseek-reasoner are the retired V3-era aliases (vendor
+    # retirement 2026-07-24) — marked deprecated so they drop out of the
+    # dropdown but existing manifests still resolve during the transition. Their
+    # published 64K window is the old V3-era value (V4 is 1M); left as-is since
+    # they are on the way out.
     "deepseek": (
         ModelEntry(
             name="deepseek-v4-pro",
@@ -201,9 +207,22 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             max_output_tokens=393_216,
         ),
         ModelEntry(
+            name="deepseek-flash",
+            vision=True,
+            context_window=1_000_000,
+            thinking="effort",
+            thinking_default=True,
+            # B-105(2026-10-16 实调)—— max_tokens 是含思考的合计上限(300 → length,
+            # 思考 300);max_completion_tokens 被忽略;厂商上限 393_216;low / medium /
+            # high / max 都接受,thinking.type=disabled 真关;看图(image_url)能答。
+            output_cap_field="max_tokens",
+            max_output_tokens=393_216,
+        ),
+        ModelEntry(
             name="deepseek-v4-flash",
             vision=False,
             context_window=1_000_000,
+            deprecated=True,
             thinking="effort",
             thinking_default=True,
             output_cap_field="max_tokens",

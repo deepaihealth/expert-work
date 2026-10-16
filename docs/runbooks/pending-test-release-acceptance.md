@@ -267,3 +267,15 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [ ] **24.4 长问句不报错、速度正常(PR1)**:方式选「关键词」,粘贴一段 200 字以上的中文(比如把整条 FAQ 回答当问题)。看 DevTools Network 里 `POST …/test` 的耗时。判据:① 正常返回,不是 500;② 耗时与查一个短问句同一量级(百毫秒级,不是几秒到几十秒)。顺带用短问句查 3 次记下耗时,作为后续对比。**没修好时**:约 160 个词以上整次检索报错(SQLAlchemy 递归溢出);中途一版在数据库没有统计信息时每次查询 10~44 秒。
 - [ ] **24.5 向量检索带上 HNSW 参数、不降级(PR2)**:发测试后,先只读查 `SELECT extversion FROM pg_extension WHERE extname = 'vector'`(测试 RDS 10-10 是 `0.8.0.2`)。临时库上传几份文档,控制台「检索测试」方式选「向量」查 3 次,再选「混合」查 3 次。判据:① 每次都返回结果,条数 = 设定的 top_k(库里段数够时);② 两个控制面 pod 的日志 `grep knowledge.hnsw_iterative_scan_rejected` 为 0 行(0.8 及以上不该被拒;若出现,说明这台 RDS 不认 `hnsw.iterative_scan`,检索仍正常但只带 `ef_search`,记下版本反馈);③ 若 RDS 开了 `pg_stat_statements`:`SELECT calls FROM pg_stat_statements WHERE query LIKE '%hnsw.ef_search%'` 的 `calls` 随向量 / 混合检索次数增长。**没修好时**:向量检索用 HNSW 默认 `ef_search = 40`、不开迭代扫描,大表里的小库过滤后可能凑不够 top_k 条(10-14 评测近似检索比精确检索 MRR 低 1.3~1.8 个百分点)。
 - [ ] **24.6 重排候选加深后耗时正常(PR2)**:库里至少放够 60 段(一份几十页的文档即可),「检索测试」方式选「混合」并打开重排,同一个问句查 3 次,看 DevTools 里 `POST …/test` 的耗时。判据:① 正常返回、无 500;② 记下 3 次耗时的中位数,作为 PR3 的对比基线;超过 5 秒算失败。说明:送去重排的候选从 20 段加到 50 段(`clamp(2 × top_k, 50, 100)`),每次检索的重排费用约为原来的 2.5 倍;请求体不落日志,候选数本身没有真栈可观测点,由单测与评测覆盖。
+
+## §25 DeepSeek 新模型名 `deepseek-flash`(DeepSeek-V4.1-Flash)上架
+
+**背景**:DeepSeek 2026-10 把 Flash 换成 V4.1,新模型名 `deepseek-flash`,能看图;旧名 `deepseek-v4-flash` 仍可调用,但实际由 V4.1-Flash 应答、按 Flash 价计费(10-16 实调:旧名请求回显 `model=deepseek-flash`)。模型目录新增 `deepseek-flash`(看图、1M 上下文、默认开思考、输出上限字段 `max_tokens`、上限 393,216,均已实调),旧名标为已下线:下拉框不再列出,已有配置照常运行。
+
+**价目表随发布自动补,没有手工步骤**:迁移 `0166` 照抄平台 `deepseek-v4-flash` 那一行的四个价,补一行 `deepseek / deepseek-flash`(两个名字是同一个模型、同一个价;测试 / 生产现行都是高峰价 输入 2 元、输出 8 元、缓存命中 0.04 元每百万 token)。旧名没有价目行就不补,新名已有价目行就不动。用量按配置里的模型名记账,缺这一行新模型的用量会在月度计费里记为「未定价」;价目表写接口只收模型目录里有的名字,所以没法在镜像上线前手工加。
+
+- [ ] **25.0 价目表已补**:发布后只读查 `SELECT model, input_per_mtok_micros, output_per_mtok_micros, cache_read_per_mtok_micros FROM model_rate_card WHERE tenant_id IS NULL AND provider = 'deepseek'`。判据:有 `deepseek-flash` 一行,三个价与 `deepseek-v4-flash` 那行逐个相等(测试 10-16 现行 2,000,000 / 8,000,000 / 40,000)。**没修好时**:没有 `deepseek-flash` 这一行。
+
+- [ ] **25.1 下拉框与能力标签**:Agent 配置页供应商选 deepseek。判据:① 模型列表有 `deepseek-flash`,没有 `deepseek-v4-flash`;② 选 `deepseek-flash` 后看图标签为开、思考开关默认开;③ 选 `deepseek-v4-pro` 看图标签为关。**没修好时**:列表只有 `deepseek-v4-flash`,看图为关。
+- [ ] **25.2 看图真跑 + 记账**:临时 Agent(`dsflash-probe`),主模型 `deepseek-flash`,调试台发一张图问「图里是什么」。判据:① 回答描述了图片内容;② 这次运行的用量行模型名为 `deepseek/deepseek-flash`,费用按价目表那一行算出(不是未定价)。验完删 Agent。**没修好时**:选不到这个模型;价目表没加时记为未定价。
+- [ ] **25.3 用旧名的配置不受影响**:测试环境 `test-headphones`(主模型 `deepseek-v4-flash`)和平台判分配置(10-16 只读查到引用旧名)各跑一次。判据:运行正常结束;配置页模型框仍显示 `deepseek-v4-flash`(旧名不在下拉里,思考开关可能不显示,属预期,改选 `deepseek-flash` 即恢复)。**没修好时**:不适用(防止标已下线后旧配置跑不起来)。

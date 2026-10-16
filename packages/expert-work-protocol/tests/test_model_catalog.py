@@ -25,16 +25,35 @@ def test_entries_are_model_entry_with_required_fields() -> None:
 
 def test_deepseek_legacy_aliases_deprecated_but_resolvable() -> None:
     # deepseek-chat / deepseek-reasoner are the retired V3-era aliases (vendor
-    # retirement 2026-07-24): dropped from the dropdown but still resolvable via
-    # catalog_entry so in-flight manifests keep working through the transition.
+    # retirement 2026-07-24), and deepseek-v4-flash the retired V4-Flash name
+    # (vendor docs 2026-10: still callable, served by DeepSeek-V4.1-Flash):
+    # dropped from the dropdown but still resolvable via catalog_entry so
+    # in-flight manifests keep working through the transition.
     dropdown = {e.name for e in models_for_provider("deepseek")}
     assert "deepseek-chat" not in dropdown
     assert "deepseek-reasoner" not in dropdown
-    # The current versioned models are what the dropdown offers.
-    assert {"deepseek-v4-pro", "deepseek-v4-flash"} <= dropdown
-    for alias in ("deepseek-chat", "deepseek-reasoner"):
+    assert "deepseek-v4-flash" not in dropdown
+    # The current models are what the dropdown offers.
+    assert {"deepseek-v4-pro", "deepseek-flash"} <= dropdown
+    for alias in ("deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"):
         entry = catalog_entry("deepseek", alias)
         assert entry is not None and entry.deprecated is True and entry.vision is False
+
+
+def test_deepseek_flash_capability_bits() -> None:
+    """deepseek-flash = DeepSeek-V4.1-Flash (vendor docs 2026-10; probe
+    2026-10-16): 1M context, thinking on by default with reasoning_effort,
+    image understanding (deepseek-v4-pro has none)."""
+    flash = catalog_entry("deepseek", "deepseek-flash")
+    assert flash is not None
+    assert flash.vision is True
+    assert flash.context_window == 1_000_000
+    assert flash.thinking == "effort"
+    assert flash.thinking_default is True
+    assert flash.always_thinking is False
+    assert flash.deprecated is False
+    pro = catalog_entry("deepseek", "deepseek-v4-pro")
+    assert pro is not None and pro.vision is False
 
 
 def test_models_for_provider_excludes_deprecated() -> None:
@@ -95,6 +114,7 @@ def test_current_context_windows() -> None:
         ("openai", "gpt-5.4-mini"): 400_000,
         ("deepseek", "deepseek-v4-pro"): 1_000_000,
         ("deepseek", "deepseek-v4-flash"): 1_000_000,
+        ("deepseek", "deepseek-flash"): 1_000_000,
         # GLM-5.3: 1M per the bigmodel pricing page (2026-08). GLM-5V-Turbo:
         # 200K per the bigmodel VLM docs (2026-08).
         ("glm", "glm-5.3"): 1_000_000,
@@ -318,7 +338,9 @@ def test_output_cap_fields_match_live_probe_2026_09_24() -> None:
         "glm-4.5v",
     ):
         assert _e("glm", name).output_cap_field == "max_tokens"
-    for name in ("deepseek-v4-pro", "deepseek-v4-flash"):
+    # deepseek-flash: 2026-10-16 实调同 v4(max_tokens=300 → length 且思考计入;
+    # max_completion_tokens=300 被忽略)。
+    for name in ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash"):
         assert _e("deepseek", name).output_cap_field == "max_tokens"
     for name in ("kimi-k3", "kimi-k2.6", "kimi-k2.5"):
         assert _e("kimi", name).output_cap_field == "max_completion_tokens"
@@ -348,6 +370,7 @@ def test_max_output_tokens_match_vendor_ranges() -> None:
     assert _e("glm", "glm-4.5v").max_output_tokens == 16_384
     assert _e("deepseek", "deepseek-v4-pro").max_output_tokens == 393_216
     assert _e("deepseek", "deepseek-v4-flash").max_output_tokens == 393_216
+    assert _e("deepseek", "deepseek-flash").max_output_tokens == 393_216
     assert _e("doubao", "doubao-seed-2-1-pro-260628").max_output_tokens == 262_144
     assert _e("kimi", "kimi-k3").max_output_tokens is None
     assert _e("qwen", "qwen3.8-max").max_output_tokens is None
