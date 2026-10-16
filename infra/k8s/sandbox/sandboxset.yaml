@@ -64,6 +64,27 @@ spec:
     metadata:
       labels:
         alibabacloud.com/compute-class: agent-sandbox
+      # ACS image cache (2026-10-16). A cold sandbox took ~66s, 42s of it pulling
+      # this 1.7GB image: ACS forces imagePullPolicy Always, so IfNotPresent below
+      # never saves a pull. With a cache, measured on the test cluster twice:
+      # creation -> running in 11s (main, csi-agent and csi-plugin images hit).
+      #
+      #   enable-image-cache   the pod starts from a matching cache when one
+      #                        exists (exact image name; the newest Ready wins)
+      #   auto-image-cache     image-cache-operator builds a cache for every
+      #                        container image the first time a pod with it
+      #                        starts, so a new tag needs no manual step: the
+      #                        first sandbox after a tag change still pulls,
+      #                        later ones hit once the cache is Ready (minutes)
+      #
+      # Needs, once per cluster: the image-cache-operator component installed
+      # with rbac.secret=true (without it the operator never starts working —
+      # it lists Secrets cluster-wide at startup). smoke.sh warns when the pool's
+      # sandboxes do not hit the pinned image's cache. Steps and quirks:
+      # docs/runbooks/sandbox-image-release.md § 镜像缓存.
+      annotations:
+        image.alibabacloud.com/enable-image-cache: "true"
+        image.alibabacloud.com/auto-image-cache: controller
     spec:
       automountServiceAccountToken: false
       dnsPolicy: ClusterFirst
