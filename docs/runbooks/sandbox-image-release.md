@@ -41,8 +41,18 @@
    export KUBECONFIG=~/.kube/expert-work-test.yaml
    kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
    kubectl get sandboxset expert-work-sandbox -n default -w
-   # 到 UPDATEDAVAILABLEREPLICAS=1 为止(池空冷启约 30s)
+   # 到 UPDATEDAVAILABLEREPLICAS 等于池大小为止
    ```
+
+   **池大小按环境手设,文件里是 1**:测试集群 10-16 起是 2(评测并发,用户定),
+   apply 会把它改回 1,apply 后补一句
+   `kubectl -n default patch sandboxset expert-work-sandbox --type merge -p '{"spec":{"replicas":2}}'`。
+   生产是 1(30 天内任意 66 s 最多新开 1 台,不用加)。
+
+   **新 tag 的镜像缓存是自动做的**(见下文「镜像缓存」):换 tag 后第一批开机的沙箱
+   照常拉镜像,同时触发制作,几分钟后 `kubectl get imagecaches.image.alibabacloud.com`
+   里新 tag 那一行 `Ready`,之后开机的沙箱命中。这几分钟里 smoke 的
+   `sandbox image cache` 一行是 WARN,属正常;一直 WARN 再按下文排查。
 
 4. **验证**:CI 的「Contract suite against the real E2B test cluster」连的就是这个集群,
    最近一次 main 全绿即为验证;要单独验证可本地跑契约测试的 e2b 侧。
@@ -53,6 +63,61 @@
 ## 回滚
 
 换回上一个 sha tag,重跑第 3 步。镜像无状态,池滚动替换即完成。
+
+## 镜像缓存(冷启动 66 s → 11 s,2026-10-16)
+
+**为什么**:冷启动一台沙箱约 66 s,其中 42 s 在拉 1.7 GB 的沙箱镜像。ACS 强制
+`imagePullPolicy: Always`,每次开机都远端拉一遍。开了 ACS 镜像缓存后测试集群
+实测两次都是 **11 s**(沙箱镜像、csi-agent、csi-plugin 都命中;剩下约 10 s 是
+分配机器,只有待命池省得掉)。
+
+**怎么生效的**:
+- `sandboxset.yaml` 池模板上两条注解:`enable-image-cache: "true"`(开机找同名
+  缓存)、`auto-image-cache: controller`(image-cache-operator 在某个镜像第一次被
+  Pod 用到时自动做缓存)。**换 tag 不需要手动步骤。**
+- 缓存是阿里云账号 + 地域级的资源(配额、免费额度都按地域算),按镜像全名匹配。
+- 费用:每地域前 20 个缓存免存储费;加速费按「缓存大小 × 用了缓存的 Pod 存活时长」,
+  测试池 2 台常驻估算每月十几元。
+
+**每个集群一次性的前提**(测试集群 10-16 已做):
+1. 集群「组件管理」装 **image-cache-operator**,参数 **`rbac.secret: true`**。
+   不开它不会工作:组件启动时要列全集群的 Secret,没权限就一直卡在这一步,日志
+   反复报 `secrets is forbidden`,缓存记录生成了但从不开工。代价是这个组件能读
+   集群里所有 Secret(用户 10-16 拍板接受)。
+2. 账号里要有服务关联角色 `AliyunServiceRoleForAccImc`。第一次制作缓存时自动建,
+   不用手动建;但**第一条**请求可能抢在角色生效前失败(见下面「已知怪癖」)。
+3. 池模板带上那两条注解(apply `sandboxset.yaml` 即可)。
+
+**验证**:
+```bash
+kubectl get imagecaches.image.alibabacloud.com          # 当前沙箱 tag 那一行 Ready、有 IMAGECACHEID
+kubectl -n default delete sandbox <一台 CLAIMED=false 的待命沙箱> --wait=false
+kubectl -n default get events --field-selector involvedObject.name=<补上来的新沙箱> | grep -E 'ImageCacheHit|SandboxRunning'
+# 应有 ImageCacheHit「containers[csi-sidecar,main,csi-agent-sidecar] matched」,
+# 创建到 SandboxRunning 约 10 s 出头
+```
+smoke 的 `sandbox image cache (warn-only)` 一行做的是同一件事:待命沙箱的
+`image.alibabacloud.com/matched-image-caches` 注解里要有当前钉的那个镜像的缓存 id。
+
+**已知怪癖**(10-16 测试集群实测):
+- **ImageCache 记录的状态不可信**:csi-plugin / agent-runtime 两条记录显示 `Failed`
+  (`Idempotence.Processing`),控制台里这两份缓存却是「制作完成」。看真实状态以
+  ACS 控制台「镜像缓存」页或 Pod 上的 `ImageCacheHit` 事件为准。
+- **失败的记录不会自己重试**:沙箱镜像那条首发请求报 `EntityNotExist.Role`(服务
+  角色还没生效),此后十几分钟一直停在 `Failed`。处理:删掉那条记录
+  (`kubectl delete imagecache.image.alibabacloud.com <名字>`,它只是集群里的记录,
+  带 `auto-generated-imc` 注解、不会级联删云上的缓存),再删一台待命沙箱,补位的
+  新沙箱开机时组件会重新提交。
+
+### 生产首次开启(一次性,用户操作)
+
+1. 生产集群「组件管理」装 image-cache-operator,`rbac.secret: true`。
+2. apply 带注解的 `sandboxset.yaml`(生产池 replicas 保持 1)。
+3. 等 `kubectl get imagecaches.image.alibabacloud.com` 里沙箱镜像那行 `Ready`。
+   测试与生产同在杭州、同一个镜像地址;若两边是同一阿里云账号,测试已做好的
+   缓存会被生产直接命中(这一点以生产上的 `ImageCacheHit` 为准,还没实测过)。
+4. 按上面「验证」删一台待命沙箱,看 `ImageCacheHit` 与开机秒数;再跑
+   `tools/deploy/smoke.sh prod`,`sandbox image cache` 一行应为 OK。
 
 ## 波 2 首发步骤(NAS 工作区上线,一次性)
 

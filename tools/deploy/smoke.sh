@@ -271,6 +271,52 @@ if [[ -n "${pinned_tag}" ]]; then
     esac
 fi
 
+# 沙箱镜像缓存(2026-10-16)—— 冷启动一台沙箱约 66 s,其中 42 s 是拉 1.7 GB 的沙箱
+# 镜像(ACS 强制每次远端拉取,IfNotPresent 不生效)。沙箱池开了 ACS 镜像缓存后测试
+# 集群实测 11 s。缓存由 image-cache-operator 在换镜像后第一台沙箱开机时自动制作,
+# 要的前提是:组件装着、它能读 Secret、池模板带两条注解(见 sandboxset.yaml)。任何
+# 一条丢了,冷启动就悄悄回到一分多钟 —— 没有报错,只有用户在等。
+#
+# 判据只认「待命沙箱真的命中了钉住的那个镜像的缓存」:看 Pod 上 ACS 写的
+# matched-image-caches 里有没有那条缓存的 id。只 WARN,同 B-57:慢不是坏,不值得
+# 让 release.sh 建议回滚一个健康的发布。
+#
+# 纯函数,输入全是 kubectl 的输出,test_smoke_sandbox_cache.py 直接驱动它:
+#   $1 池模板的 enable-image-cache 注解值
+#   $2 ImageCache 记录,每行「镜像|缓存 id|状态」
+#   $3 待命沙箱 Pod 的 matched-image-caches 注解,每行一个
+#   $4 池模板钉的沙箱镜像
+sandbox_cache_verdict() {
+    local enabled="$1" caches="$2" matched="$3" image="$4" id
+    if [[ "${enabled}" != "true" ]]; then
+        echo "WARN sandbox image cache: 沙箱池没开 image.alibabacloud.com/enable-image-cache,每台冷启动都重拉沙箱镜像(约 42 s)"
+        return 0
+    fi
+    id="$(awk -F'|' -v img="${image}" '$1 == img && $2 != "" {print $2; exit}' <<<"${caches}")"
+    if [[ -z "${id}" ]]; then
+        echo "WARN sandbox image cache: ${image##*/} 还没有镜像缓存 —— 刚换镜像时第一台沙箱开机才开始制作,几分钟后再看;"
+        echo "     一直没有就查 kube-system/image-cache-operator 的日志和 kubectl get imagecaches.image.alibabacloud.com"
+    elif grep -qF "\"${id}\"" <<<"${matched}"; then
+        echo "OK   sandbox image cache hit (${image##*/}, ${id})"
+    else
+        echo "WARN sandbox image cache: ${image##*/} 的缓存 ${id} 已有,但待命沙箱都没命中 —— 多半是缓存做好前开的机,下次补位就会命中"
+    fi
+}
+
+echo "== sandbox image cache (warn-only) =="
+pool_json_path='{.spec.template.metadata.annotations.image\.alibabacloud\.com/enable-image-cache}'
+cache_enabled="$(kubectl -n default get sandboxset expert-work-sandbox -o jsonpath="${pool_json_path}" 2>/dev/null || true)"
+pool_image="$(kubectl -n default get sandboxset expert-work-sandbox \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+cache_lines="$(kubectl get imagecaches.image.alibabacloud.com \
+    -o jsonpath='{range .items[*]}{.spec.images[0]}{"|"}{.status.imageCacheId}{"|"}{.status.phase}{"\n"}{end}' \
+    2>/dev/null || true)"
+matched_lines="$(kubectl -n default get pods \
+    -l agents.kruise.io/sandbox-pool=expert-work-sandbox,agents.kruise.io/sandbox-claimed=false \
+    -o jsonpath='{range .items[*]}{.metadata.annotations.image\.alibabacloud\.com/matched-image-caches}{"\n"}{end}' \
+    2>/dev/null || true)"
+sandbox_cache_verdict "${cache_enabled}" "${cache_lines}" "${matched_lines}" "${pool_image}"
+
 # B-154 —— Langfuse 的 ClickHouse 数据盘。它满了的失败形态是**无声的**:
 # Langfuse 的 web 照样 200(上面那两条 langfuse 检查照过),worker 每次写入
 # NOT_ENOUGH_SPACE 后重试三次就把记录丢掉,只在 worker 日志里留一行 error。
