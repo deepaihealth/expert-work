@@ -175,7 +175,11 @@ from orchestrator.graph_builder.platform_context import (
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
-from orchestrator.llm.stall import StalledWithoutAnswerError, stalled_without_answer
+from orchestrator.llm.stall import (
+    STALLED_AFTER_S,
+    StalledWithoutAnswerError,
+    stalled_without_answer,
+)
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
 from orchestrator.llm.truncation import (
     OutputTruncatedError,
@@ -1319,8 +1323,10 @@ def build_react_graph(
                 }
 
         # B-186 —— 思考完停住、一个字的回答都没有。路由照旧交回半截(规划 / 复盘把空回复
-        # 当 fail-open),主循环在这里让 run 可见地失败;照样记账,不进响应缓存。
-        if cache_hit_response is None:
+        # 当 fail-open),主循环在这里让 run 可见地失败;照样记账,不进响应缓存。结构化输出
+        # (下面那次按格式重发走非流式、不会停顿)和分发轮(B-35 重试一次再降级)自带空回复的
+        # 补救,先让它们处理;降级轮不再是分发轮,再停住就落到这里。
+        if cache_hit_response is None and output_schema is None and not dispatch_active:
             stalled_s = stalled_without_answer(response)
             if stalled_s is not None:
                 await _meter_without_caching(
@@ -1459,6 +1465,10 @@ def build_react_graph(
                     else cache_hit_response is not None
                 ),
             }
+            if STALLED_AFTER_S in response.response_metadata:
+                # B-186 —— 停住前已有的半句回答照常交付,但不进响应缓存:同样的问题不该
+                # 在缓存有效期里一直重放这半句。
+                after_payload[SKIP_STORE_KEY] = True
             if structured_prompt is not None and "parsed" in response.additional_kwargs:
                 # Store-side pollution guard (suspenders half; the lookup
                 # self-heal in ``_finalize_structured_response`` is the

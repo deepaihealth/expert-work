@@ -300,6 +300,47 @@ async def test_dispatch_refusal_retries_once_then_degrades() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stall_on_a_dispatch_turn_takes_the_dispatch_retry() -> None:
+    # B-186:分发轮停住、只拿到思考,仍走 B-35 的重试,不在分发轮判失败;之后的轮次
+    # 不再是分发轮,run 照常收尾。
+    from orchestrator.llm.stall import STALLED_AFTER_S
+
+    stalled = AIMessage(content="", response_metadata={STALLED_AFTER_S: 45.0})
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            stalled,
+            stalled,
+            AIMessage(content="final answer"),
+        ]
+    )
+    state = await _run(llm, thread_id="dispatch-stall")
+
+    assert len(_hidden_with(state, _RETRY_MARKER)) == 1
+    assert str(state["messages"][-1].content) == "final answer"
+    assert llm.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_stall_on_the_degraded_turn_fails_the_run() -> None:
+    # 降级轮已经不是分发轮:再停住就照常判失败,run 不会以空回复收尾。
+    from orchestrator.llm.stall import STALLED_AFTER_S, StalledWithoutAnswerError
+
+    stalled = AIMessage(content="", response_metadata={STALLED_AFTER_S: 45.0})
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            stalled,
+            stalled,
+            stalled,
+        ]
+    )
+    with pytest.raises(StalledWithoutAnswerError):
+        await _run(llm, thread_id="dispatch-stall-degraded")
+    assert llm.calls == 4
+
+
+@pytest.mark.asyncio
 async def test_dispatch_refusal_does_not_auto_complete_an_in_progress_delegate_step() -> None:
     """B-131 review round 1, finding 2 —— 派发打回的那一轮不是真正结束。要是在这里把
     「进行中」的委派步骤自动标完成,``pending_delegate`` 就空了,重试不会发生。"""

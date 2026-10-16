@@ -267,6 +267,24 @@ async def test_nonconforming_candidate_triggers_one_structured_resend() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stalled_empty_candidate_goes_to_the_structured_resend() -> None:
+    # B-186:结构化智能体停住时只拿到思考 —— 交给本来就有的按格式重发(非流式,不会停顿),
+    # 不在主循环直接判失败。
+    from orchestrator.llm.stall import STALLED_AFTER_S
+
+    stalled = AIMessage(content="", response_metadata={STALLED_AFTER_S: 45.0})
+    caller = _RecordingCaller(responses=[stalled, AIMessage(content=_VALID)])
+
+    final = await _run(caller, output_schema=_SPEC)
+
+    assert len(caller.calls) == 2
+    assert caller.calls[1]["output_schema"] is _SPEC
+    last = final["messages"][-1]
+    assert isinstance(last, AIMessage)
+    assert last.additional_kwargs["parsed"] == {"score": 4}
+
+
+@pytest.mark.asyncio
 async def test_resend_still_invalid_propagates_validation_error() -> None:
     caller = _RecordingCaller(
         responses=[AIMessage(content=_INVALID)],

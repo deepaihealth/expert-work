@@ -647,8 +647,8 @@ async def test_stall_without_answer_is_metered_but_not_cached() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stall_after_answer_text_is_delivered_as_before() -> None:
-    # 对照:停住前已经有回答文字,照旧交付并走正常的 after-chain(落缓存)。
+async def test_stall_after_answer_text_is_delivered_but_not_cached() -> None:
+    # 停住前已经有回答文字:照旧交付、记账,但半句回答不进响应缓存。
     from orchestrator.llm.stall import STALLED_AFTER_S
 
     rows, cache, raised = await _run_with_usage(
@@ -659,7 +659,7 @@ async def test_stall_after_answer_text_is_delivered_as_before() -> None:
 
     assert raised is None
     assert len(rows) == 1
-    assert len(cache.puts) == 1
+    assert cache.puts == []
 
 
 @pytest.mark.asyncio
