@@ -341,11 +341,16 @@ class ToolContext:
     #: 的悬空路径,工具描述又告诉模型那个文件在,模型读不到就退回手抄 URL:正是
     #: B-61 要消灭的那个失败。子代与父共用同一个 agent_key、同一个
     #: ``/workspace``,所以把**父的** run id 传下来,指针就落在父那份真文件上
-    #: (与 agent_key / 技能种子路径同一个取值口径:用父的)。
+    #: (与 agent_key / 技能种子路径同一个取值口径:用父的)。指针本身总会往下传,
+    #: 但只在本轮真有 inputs(``prompt_inputs`` 非空)时才被 ``run_in_sandbox`` 用上。
     inputs_run_id: UUID | None = None
     #: B-61 §5.3 —— 本轮声明变量的值(变量名 → 值)。
     #:
-    #: 唯一用途是 ``_child_config`` 把它往子代传:委派出去的 worker / 静态子
+    #: 两个用途。其一,``run_in_sandbox`` 拿它判「本轮有没有 ``inputs.json``」:
+    #: 空 = inputs 节点没写文件,``EXPERT_WORK_INPUTS`` 就不注入(否则指向一条悬空
+    #: 路径);非空才按 ``inputs_run_id or run_id`` 指过去。
+    #:
+    #: 其二,``_child_config`` 把它往子代传:委派出去的 worker / 静态子
     #: Agent 跑的是同一个 ``tools_node``,子代的 config 里没有 ``prompt_inputs``
     #: 时,``apply_arg_bindings`` 对每个被绑参数走「本轮没给值 → 删掉」那条分支,
     #: 而该参数已经从子代的 schema 里剥掉、模型也补不上 —— 那个工具在子代身上

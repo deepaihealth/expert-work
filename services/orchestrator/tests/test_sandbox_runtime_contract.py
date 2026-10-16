@@ -1028,15 +1028,17 @@ def test_exec_envs_carry_the_inputs_path_when_a_run_is_bound() -> None:
     assert envs["PYTHONUSERBASE"].endswith("ai-health-plan-30817804"), "原有隔离不能丢"
 
 
-def test_exec_envs_without_a_run_are_unchanged() -> None:
-    """未绑 run(``run_id=None``,``agent_key_envs`` 的默认值)时不该多出
-    ``EXPERT_WORK_INPUTS`` —— 沙箱内没有 run_id 就没有对应的 ``inputs.json``。
+def test_exec_envs_without_a_run_or_skills_carry_only_the_isolation() -> None:
+    """未绑 run(``run_id=None``)、也没绑技能(``has_skills=False``,两者都是
+    ``agent_key_envs`` 的默认值)时只剩 ``PYTHONUSERBASE``。
 
-    ``EXPERT_WORK_SKILLS_DIR``(B-84)与 run 无关、只跟 agent 绑,所以它**在**
-    这一档里 —— 技能文件在沙箱里的位置不随某一轮变化。"""
+    2026-10-16 测试集群:一个既没绑技能、也没声明变量的 agent ``env | grep -i expert``
+    看到了 ``EXPERT_WORK_SKILLS_DIR`` 与 ``EXPERT_WORK_INPUTS(_DIR)``,于是花了几分钟去
+    ``/opt/skills/...``、``/workspace/inputs/...`` 里找「藏起来的任务数据」—— 两个目录都
+    不存在。变量只在它指向真东西时才该出现。"""
     from orchestrator.tools.sandbox import agent_key_envs
 
-    assert set(agent_key_envs("k")) == {"PYTHONUSERBASE", "EXPERT_WORK_SKILLS_DIR"}
+    assert set(agent_key_envs("k")) == {"PYTHONUSERBASE"}
 
 
 def test_skills_dir_env_matches_the_seed_root() -> None:
@@ -1050,13 +1052,26 @@ def test_skills_dir_env_matches_the_seed_root() -> None:
 
     没绑 agent 就不该有这个变量:没有 ``agent_key`` 就没有 per-agent 的技能
     目录,给一个指向整个 ``/opt/skills`` 的值等于让它看别的 agent 的技能。
+    没绑技能也不该有:那个目录根本没有被种过,变量指向的是一个不存在的路径。
     """
     from expert_work.persistence import SANDBOX_SKILLS_ROOT
     from orchestrator.tools.sandbox import agent_key_envs
 
-    envs = agent_key_envs("ag-0badf00d")
+    envs = agent_key_envs("ag-0badf00d", has_skills=True)
     assert envs["EXPERT_WORK_SKILLS_DIR"] == f"{SANDBOX_SKILLS_ROOT}/ag-0badf00d"
-    assert "EXPERT_WORK_SKILLS_DIR" not in agent_key_envs("")
+    assert "EXPERT_WORK_SKILLS_DIR" not in agent_key_envs("ag-0badf00d"), "没绑技能"
+    assert "EXPERT_WORK_SKILLS_DIR" not in agent_key_envs("", has_skills=True), "没绑 agent"
+
+
+def test_skills_flag_does_not_touch_the_isolation() -> None:
+    """``has_skills`` 只管技能目录那一项;``PYTHONUSERBASE`` 在有无技能两档逐字节相同,
+    没绑 agent 时两档都是空(「空 key = 不注入」的既有语义)。"""
+    from orchestrator.tools.sandbox import agent_key_envs
+
+    with_skills = agent_key_envs("k", has_skills=True)
+    assert with_skills.pop("EXPERT_WORK_SKILLS_DIR")
+    assert with_skills == agent_key_envs("k")
+    assert agent_key_envs("", has_skills=True) == agent_key_envs("") == {}
 
 
 @pytest.mark.asyncio
@@ -1091,6 +1106,59 @@ async def test_supervisor_exec_forwards_run_id_to_agent_key_envs() -> None:
     from orchestrator.tools.inputs_doc import inputs_abs_dir
 
     assert body["envs"]["EXPERT_WORK_INPUTS_DIR"] == inputs_abs_dir(run_id)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_exec_forwards_has_skills_to_agent_key_envs() -> None:
+    """同上一条,钉 ``has_skills``:``HTTPSupervisorRuntime.exec`` 不把它转手给
+    ``exec_envs`` 时,有技能的 agent 就拿不到 ``EXPERT_WORK_SKILLS_DIR``,这里必须红;
+    反过来没技能时也不许多出这一项。"""
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+    from orchestrator.tools.sandbox import HTTPSupervisorRuntime
+
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        bodies.append(_json.loads(request.content))
+        return httpx.Response(200, json={"stdout": "", "stderr": "", "exit_code": 0})
+
+    client = HTTPSupervisorRuntime(
+        base_url="http://supervisor", transport=httpx.MockTransport(handler)
+    )
+
+    await client.exec(sandbox_id=uuid4(), code="p", timeout_s=5, agent_key="k", has_skills=True)
+    await client.exec(sandbox_id=uuid4(), code="p", timeout_s=5, agent_key="k")
+
+    with_skills, without = (b["envs"] for b in bodies)
+    assert isinstance(with_skills, dict) and isinstance(without, dict)
+    assert with_skills["EXPERT_WORK_SKILLS_DIR"] == f"{SANDBOX_SKILLS_ROOT}/k"
+    assert "EXPERT_WORK_SKILLS_DIR" not in without
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_both_backends_send_the_skills_dir_only_when_skills_are_bound(
+    runtime: SandboxRuntime,
+) -> None:
+    """两后端对拍(同 :func:`test_both_backends_send_byte_identical_inputs_env`):
+    ``has_skills=True`` 时两边都等于 ``agent_key_envs`` 算出的同一个值,不传时两边都没有。"""
+    from expert_work.persistence import SANDBOX_SKILLS_ROOT
+
+    probe = "import os; print(os.environ.get('EXPERT_WORK_SKILLS_DIR'))"
+    sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c19")
+    try:
+        bound = await runtime.exec(
+            sandbox_id=sid, code=probe, timeout_s=30, agent_key="contract-agent", has_skills=True
+        )
+        unbound = await runtime.exec(
+            sandbox_id=sid, code=probe, timeout_s=30, agent_key="contract-agent"
+        )
+        assert bound.stdout.strip() == f"{SANDBOX_SKILLS_ROOT}/contract-agent"
+        assert unbound.stdout.strip() == "None"
+    finally:
+        await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
 
 @pytest.mark.integration
@@ -1960,5 +2028,7 @@ def test_both_backends_read_the_same_env_source() -> None:
 
     for module in (sandbox, agent_sandbox):
         src = inspect.getsource(module)
-        assert "envs = exec_envs(agent_key, run_id=run_id)" in src, module.__name__
-        assert "envs = agent_key_envs(agent_key, run_id=run_id)" not in src, module.__name__
+        assert "envs = exec_envs(agent_key, run_id=run_id, has_skills=has_skills)" in src, (
+            module.__name__
+        )
+        assert "envs = agent_key_envs(" not in src, module.__name__

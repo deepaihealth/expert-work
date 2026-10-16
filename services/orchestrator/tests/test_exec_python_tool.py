@@ -11,6 +11,7 @@ docs/design/sandbox-audit-evaluation.md).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 import pytest
@@ -61,16 +62,75 @@ async def test_exec_python_runs_code_and_returns_output() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_python_passes_run_id_to_exec() -> None:
-    """B-61 §4.4 —— ``run_in_sandbox`` 把 ``ctx.run_id`` 原样带给
+    """B-61 §4.4 —— 本轮有 inputs 时 ``run_in_sandbox`` 把 ``ctx.run_id`` 带给
     ``client.exec``,这是唯一的生产调用点(``exec_python``/``bash``/
     ``read_file``/``write_file`` 等共用)。忘了传的话两个真实后端都拿不到
     ``EXPERT_WORK_INPUTS`` 该有的 ``run_id`` —— 这条钉住这一层不被静默丢掉。"""
     client = RecordingSandboxRuntime()
-    ctx = _ctx()
+    ctx = replace(_ctx(), prompt_inputs={"org_logo": "https://x.invalid/a.png"})
 
     await ExecPythonTool(client=client).call({"code": "print(1)"}, ctx=ctx)
 
     assert client.exec_run_ids == [ctx.run_id]
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_inputs_gets_no_inputs_pointer() -> None:
+    """本轮没有 inputs(agent 没声明变量,或声明了但一个都没传)→ inputs 节点不写
+    ``inputs.json``,``EXPERT_WORK_INPUTS`` 就不该出现 —— 否则它指向一个不存在的文件,
+    模型会去 ``/workspace/inputs/...`` 里找「藏起来的任务数据」(2026-10-16 测试集群)。"""
+    client = RecordingSandboxRuntime()
+
+    await ExecPythonTool(client=client).call({"code": "print(1)"}, ctx=_ctx())
+    await ExecPythonTool(client=client).call(
+        {"code": "print(1)"}, ctx=replace(_ctx(), prompt_inputs={})
+    )
+
+    assert client.exec_run_ids == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_segment_points_at_the_turns_first_run() -> None:
+    """审批续跑段是新 run_id,inputs.json 在这一轮首段名下(``ctx.inputs_run_id``)。"""
+    client = RecordingSandboxRuntime()
+    first = uuid4()
+    ctx = replace(_ctx(), inputs_run_id=first, prompt_inputs={"v": "x"})
+
+    await ExecPythonTool(client=client).call({"code": "print(1)"}, ctx=ctx)
+
+    assert client.exec_run_ids == [first]
+
+
+@pytest.mark.asyncio
+async def test_a_child_of_a_run_without_inputs_gets_no_inputs_pointer() -> None:
+    """委派链上 ``_child_config`` 总会带一个 ``inputs_run_id``(父的 run id);父那一轮
+    没有 inputs 时那里同样没有 ``inputs.json``,子代不能因为「有指针」就拿到变量。"""
+    from orchestrator.graph_builder.builder import _build_tool_context
+    from orchestrator.tools._child_run import _child_config
+
+    parent_ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4(), agent_key="plain-agent-1234")
+    child_ctx = _build_tool_context(
+        _child_config(parent_ctx, sub_thread_id=uuid4(), sub_run_id=uuid4())
+    )
+    assert child_ctx.inputs_run_id == parent_ctx.run_id, "前提:指针本身仍然往下传"
+
+    client = RecordingSandboxRuntime()
+    await ExecPythonTool(client=client).call({"code": "print(1)"}, ctx=child_ctx)
+
+    assert client.exec_run_ids == [None]
+
+
+@pytest.mark.asyncio
+async def test_exec_reports_skills_only_when_skill_files_are_seeded() -> None:
+    """``EXPERT_WORK_SKILLS_DIR`` 只在这个 agent 真绑了技能(构建期种子非空)时注入:
+    ``run_in_sandbox`` 按种子有无给 ``has_skills``,两后端再经 ``exec_envs`` 落成变量。"""
+    client = RecordingSandboxRuntime()
+    seed = (("agent-1/pptx/SKILL.md", b"---\nname: pptx\n---\n"),)
+
+    await ExecPythonTool(client=client, skill_seed_files=seed).call({"code": "1"}, ctx=_ctx())
+    await ExecPythonTool(client=client).call({"code": "1"}, ctx=_ctx())
+
+    assert client.exec_has_skills == [True, False]
 
 
 @pytest.mark.asyncio
@@ -89,7 +149,12 @@ async def test_a_child_exec_points_at_the_parents_inputs_file() -> None:
     from orchestrator.tools.inputs_doc import inputs_abs_path
     from orchestrator.tools.sandbox import agent_key_envs
 
-    parent_ctx = ToolContext(tenant_id=uuid4(), run_id=uuid4(), agent_key="ai-health-plan-3081")
+    parent_ctx = ToolContext(
+        tenant_id=uuid4(),
+        run_id=uuid4(),
+        agent_key="ai-health-plan-3081",
+        prompt_inputs={"org_logo": "https://x.invalid/a.png"},
+    )
     sub_run_id = uuid4()
     child_ctx = _build_tool_context(
         _child_config(parent_ctx, sub_thread_id=uuid4(), sub_run_id=sub_run_id)

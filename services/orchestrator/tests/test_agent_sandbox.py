@@ -1611,7 +1611,25 @@ async def test_exec_injects_pythonuserbase_when_agent_key_set() -> None:
         # 平台级,每次 exec 都带(与提示词「当前日期」行同源)
         "TZ": resolve_agent_timezone().key,
         "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
-        # B-84 —— 同一条 per-agent 通道里的第二个值(技能文件根)
+    }
+
+
+@pytest.mark.asyncio
+async def test_exec_injects_the_skills_dir_only_when_skills_are_bound() -> None:
+    """B-84 —— 技能文件根走同一条 per-agent 通道,但只在调用方说「这个 agent 绑了技能」
+    (``has_skills=True``,``run_in_sandbox`` 按有没有技能种子给)时才带;精确比对整个
+    dict。``AgentSandboxClient.exec`` 不把 ``has_skills`` 转手给 ``exec_envs`` 时这里红。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+
+    await client.exec(
+        sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="my-agent", has_skills=True
+    )
+
+    assert sdk.sandbox.commands.envs_calls[-1] == {
+        "TZ": resolve_agent_timezone().key,
+        "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
         "EXPERT_WORK_SKILLS_DIR": f"{SANDBOX_SKILLS_ROOT}/my-agent",
     }
 

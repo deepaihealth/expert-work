@@ -184,11 +184,18 @@ async def test_exec_injects_agent_key_env_when_set() -> None:
         base_url="http://supervisor", transport=httpx.MockTransport(handler)
     )
     await client.exec(sandbox_id=uuid4(), code="pass", timeout_s=5, agent_key="my-agent")
-
     assert body["envs"] == {
         "TZ": resolve_agent_timezone().key,
         "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
-        # B-84 —— 两个后端送同一份 per-agent env,这条与
+    }
+
+    await client.exec(
+        sandbox_id=uuid4(), code="pass", timeout_s=5, agent_key="my-agent", has_skills=True
+    )
+    assert body["envs"] == {
+        "TZ": resolve_agent_timezone().key,
+        "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
+        # B-84 —— 绑了技能才带;两个后端送同一份 per-agent env,这条与
         # ``test_agent_sandbox.py`` 的云侧断言是一对
         "EXPERT_WORK_SKILLS_DIR": f"{SANDBOX_SKILLS_ROOT}/my-agent",
     }

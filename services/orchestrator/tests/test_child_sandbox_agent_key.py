@@ -132,6 +132,7 @@ class _ViewRuntime(RecordingSandboxRuntime):
         timeout_s: int | None,
         agent_key: str = "",
         run_id: UUID | None = None,
+        has_skills: bool = False,
     ) -> SandboxOutcome:
         self.exec_agent_keys.append(agent_key)
         view = self.user_root / "agents" / agent_key
@@ -227,7 +228,8 @@ async def test_child_skill_seeds_land_where_its_skills_dir_points() -> None:
         {"path": "x.md", "content": "hi"}, ctx=_child_ctx()
     )
 
-    skills_dir = _skills_dir(agent_key_envs(inner.exec_agent_keys[0]))
+    assert inner.exec_has_skills == [True]
+    skills_dir = _skills_dir(agent_key_envs(inner.exec_agent_keys[0], has_skills=True))
     assert skills_dir == f"{SANDBOX_SKILLS_ROOT}/{_PARENT_KEY}"
     assert inner.acquired[0][3] == (
         (f"{_PARENT_KEY}/pptx/SKILL.md", b"s"),
