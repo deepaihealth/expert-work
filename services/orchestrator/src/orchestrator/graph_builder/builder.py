@@ -175,6 +175,7 @@ from orchestrator.graph_builder.platform_context import (
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
+from orchestrator.llm.stall import StalledWithoutAnswerError, stalled_without_answer
 from orchestrator.llm.structured_output import correction_message, validate_structured_output
 from orchestrator.llm.truncation import (
     OutputTruncatedError,
@@ -1317,6 +1318,21 @@ def build_react_graph(
                     "step_count_refund_pending": 0,
                 }
 
+        # B-186 —— 思考完停住、一个字的回答都没有。路由照旧交回半截(规划 / 复盘把空回复
+        # 当 fail-open),主循环在这里让 run 可见地失败;照样记账,不进响应缓存。
+        if cache_hit_response is None:
+            stalled_s = stalled_without_answer(response)
+            if stalled_s is not None:
+                await _meter_without_caching(
+                    response,
+                    prompt=messages,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    after_llm_chain=after_llm_chain,
+                )
+                logger.warning("agent_node.stalled_without_answer idle_s=%s", stalled_s)
+                raise StalledWithoutAnswerError(stalled_s)
+
         # Stream RT-1 PR-3 (RT-ADR-4) — structured finalization. Only a
         # terminal candidate (no tool_calls) is constrained; tool-calling
         # rounds pass through untouched. The mechanism is deliberately
@@ -2184,21 +2200,42 @@ async def _check_truncation(
     if usable:
         logger.warning("agent_node.output_truncated_usable model=%s", model)
         return None
-    if after_llm_chain is not None:
-        prompt_messages = list(prompt)
-        ctx = MiddlewareContext(
-            payload={
-                "messages": [*prompt_messages, response],
-                "response": response,
-                "tenant_id": tenant_id,
-                "user_id": user_id,
-                "prompt_messages": prompt_messages,
-                "cache_hit": False,
-                SKIP_STORE_KEY: True,
-            }
-        )
-        await after_llm_chain.invoke(ctx, _noop)
+    await _meter_without_caching(
+        response,
+        prompt=prompt,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        after_llm_chain=after_llm_chain,
+    )
     return OutputTruncatedError(cap)
+
+
+async def _meter_without_caching(
+    response: AIMessage,
+    *,
+    prompt: Sequence[BaseMessage],
+    tenant_id: UUID | None,
+    user_id: UUID | None,
+    after_llm_chain: MiddlewareChain | None,
+) -> None:
+    """不可用的回答(B-105 截断 / B-186 停顿)照样计费:跑一遍 after-chain 让
+    ``TokenUsageMiddleware`` 按正常主循环口径落用量,但带 :data:`SKIP_STORE_KEY`,坏回答
+    不进响应缓存。"""
+    if after_llm_chain is None:
+        return
+    prompt_messages = list(prompt)
+    ctx = MiddlewareContext(
+        payload={
+            "messages": [*prompt_messages, response],
+            "response": response,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "prompt_messages": prompt_messages,
+            "cache_hit": False,
+            SKIP_STORE_KEY: True,
+        }
+    )
+    await after_llm_chain.invoke(ctx, _noop)
 
 
 #: B-158 —— 拆小提示的标记。节点开头看输入的最后一条是不是它,判「已经重试过」。
