@@ -335,6 +335,12 @@ jobs:
         env:
           # Empty when the prebuild step failed → fixtures build themselves.
           EXPERT_WORK_TEST_SANDBOX_IMAGE: ${{ steps.sandbox-image.outcome == 'success' && 'expert-work-sandbox:ci' || '' }}
+          # setup-buildx above made its docker-container builder the current
+          # one, and `docker compose build` (bake or not) uses the current
+          # builder — which cannot see the images pre-pulled into the daemon,
+          # so compose FROM lines would go back to anonymous ECR. The default
+          # (docker-driver) builder reads the local image store.
+          BUILDX_BUILDER: default
         run: uv run pytest -v -m integration --timeout=1800 --timeout-method=thread
 
   security:

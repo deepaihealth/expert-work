@@ -20,6 +20,7 @@ import importlib.util
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import defusedxml
@@ -143,6 +144,27 @@ _sqlite = subprocess.run(
 )
 if _sqlite.stdout.strip() != "2":
     raise RuntimeError(f"sqlite3 CLI failed rc={_sqlite.returncode} stderr={_sqlite.stderr!r}")
+# unzip extracts a member; curl reads it back over file:// (no network in the smoke).
+with zipfile.ZipFile("/workspace/smoke.zip", "w") as _zf:
+    _zf.writestr("smoke.txt", "zip-ok")
+_unzip = subprocess.run(
+    ["unzip", "-o", "-q", "/workspace/smoke.zip", "-d", "/workspace/smoke_unzip"],
+    capture_output=True,
+    text=True,
+    timeout=30,
+    check=False,
+)
+if _unzip.returncode != 0:
+    raise RuntimeError(f"unzip failed rc={_unzip.returncode} stderr={_unzip.stderr!r}")
+_curl = subprocess.run(
+    ["curl", "-sS", "file:///workspace/smoke_unzip/smoke.txt"],
+    capture_output=True,
+    text=True,
+    timeout=30,
+    check=False,
+)
+if _curl.stdout != "zip-ok":
+    raise RuntimeError(f"unzip/curl round-trip failed rc={_curl.returncode} err={_curl.stderr!r}")
 
 # Real conversion: pptx → pdf via LibreOffice headless (the xlsx-recalc /
 # pptx-thumbnail / docx-accept-changes paths all run soffice this way). A

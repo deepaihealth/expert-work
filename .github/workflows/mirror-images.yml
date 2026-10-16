@@ -47,6 +47,11 @@ name: Mirror images (GHCR)
 # 流量配额正是 CI 被卡的那一份。tests/test_mirror_images_workflow.py 保证仓库里每个
 # `public.ecr.aws/docker/library/` 引用都在下面的 matrix 里。
 #
+# 这 6 个新包(`mirror/redis` `python` `nginx` `debian` `node` `postgres`)首次由 GITHUB_TOKEN
+# 发布时多半是**私有**的。CI 不受影响(上面那段:本仓库 GITHUB_TOKEN 继承访问),但这条
+# 继承路径此前没实证过 —— pgvector / pgbouncer 是改成 Public 后才拉通的。若 integration
+# 的 prepull 出现「没走 GHCR mirror」警告,先按上面的手工步骤把这 6 个也改成 Public。
+#
 # 上游引用刻意拆成 `upstream` + `tag` 两个字段在 run 里拼:镜像来源卫兵
 # (tools/ci/check_image_registry.py)把这两个名字的 `name:tag` 裸引用视为
 # 违规,本文件是唯一合法提到上游的地方,拼接而不是字面量,卫兵才能零豁免。

@@ -231,8 +231,8 @@ ENV LANG=zh_CN.UTF-8 \
     LC_ALL=zh_CN.UTF-8
 
 # Python libraries (pins in requirements.txt) — these are the de-facto standard
-# libs every agent gets (requests-via-stdlib-urllib + pandas/openpyxl/docx/pptx/
-# pdf/Pillow/matplotlib/...).
+# libs every agent gets (requests + pandas/openpyxl/docx/pptx/pdf/Pillow/
+# matplotlib/...).
 COPY requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt

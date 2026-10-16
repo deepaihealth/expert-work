@@ -16,6 +16,7 @@ mirror 的 tag 手写在 workflow 的 matrix 里,compose 的 ``image:`` 也是�
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,11 @@ _ECR_REF_RE = re.compile(r"public\.ecr\.aws/docker/library/[a-z0-9]+:[A-Za-z0-9.
 #: 与 tools/ci/check_image_registry.py 同一扫描口径(后缀 + Dockerfile,跳过 worktree / 依赖)。
 _SCAN_SUFFIXES = (".yml", ".yaml", ".py", ".sh")
 _SKIP_PARTS = (".git", ".claude", "node_modules", ".venv", "dist", "__pycache__", ".mypy_cache")
+#: 这套机制自己的测试里写着示例引用,算作「仓库引用」会让 matrix 里过时的一格照样配得上。
+_FIXTURE_FILES = {
+    Path("tests/test_prepull_images.py"),
+    Path("tests/test_mirror_images_workflow.py"),
+}
 
 
 def _workflow() -> dict[str, Any]:
@@ -52,12 +58,17 @@ def _compose_image_refs() -> list[str]:
 
 def _repo_ecr_official_refs() -> set[str]:
     refs: set[str] = set()
-    for path in _REPO_ROOT.rglob("*"):
-        if not path.is_file() or any(part in _SKIP_PARTS for part in path.parts):
-            continue
-        if path.suffix not in _SCAN_SUFFIXES and not path.name.startswith("Dockerfile"):
-            continue
-        refs.update(_ECR_REF_RE.findall(path.read_text(encoding="utf-8", errors="ignore")))
+    # 剪枝只看仓库根以下的目录名:根自己的绝对路径里有 ``.claude``(agent worktree)不算,
+    # 否则一个文件都不扫、正向测试永远绿 —— check_image_registry.py 09-08 修过的同一个坑。
+    for dirpath, dirnames, filenames in os.walk(_REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_PARTS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.relative_to(_REPO_ROOT) in _FIXTURE_FILES:
+                continue
+            if path.suffix not in _SCAN_SUFFIXES and not name.startswith("Dockerfile"):
+                continue
+            refs.update(_ECR_REF_RE.findall(path.read_text(encoding="utf-8", errors="ignore")))
     return refs
 
 

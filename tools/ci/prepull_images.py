@@ -176,8 +176,11 @@ def pull_with_backoff(
             log(f"skip  {ref} (已在本机)")
             continue
         mirror = (mirrors or {}).get(ref)
-        if mirror is not None and pull_via_mirror(ref, mirror, runner=runner, log=log):
-            continue
+        if mirror is not None:
+            if pull_via_mirror(ref, mirror, runner=runner, log=log):
+                continue
+            # 退回能跑通,所以不出声就没人发现 mirror 坏了 —— 直到下一次限流。
+            log(f"::warning::{ref} 没走 GHCR mirror,退回匿名 ECR(mirror 同步坏了或包没权限)")
         for attempt, delay in enumerate((0, *backoff), start=1):
             if delay:
                 log(f"      {ref} 退避 {delay}s 后第 {attempt} 次")
@@ -211,7 +214,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         compose_output=_compose_config_images(subprocess.run),
         dockerfile_texts=[p.read_text(encoding="utf-8") for p in DOCKERFILES],
     )
-    mirrors = official_mirrors(MIRROR_WORKFLOW.read_text(encoding="utf-8"))
+    try:
+        mirrors = official_mirrors(MIRROR_WORKFLOW.read_text(encoding="utf-8"))
+    except Exception as exc:  # 这一步不许拦 job:读不出 mirror 就全走 ECR
+        print(f"::warning::读不出 mirror-images.yml 的 matrix,全部走 ECR: {exc!r}")
+        mirrors = {}
     print(f"== prepull: {len(refs)} 个镜像 ==")
     if ns.dry_run:
         for ref in refs:

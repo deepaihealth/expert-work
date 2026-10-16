@@ -195,6 +195,7 @@ def test_mirror_failure_falls_back_to_ecr_with_backoff() -> None:
     assert docker.tags == []
     assert docker.sleeps == [BACKOFF_S[0]]
     assert any("退回 ECR" in line for line in lines), "退回要说出来"
+    assert any(line.startswith("::warning::") for line in lines), "退回要进 Actions 注解"
 
 
 def test_official_mirrors_maps_only_docker_official_entries() -> None:
