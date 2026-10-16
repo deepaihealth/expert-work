@@ -18,7 +18,14 @@ exceeded``(nginx / mock-upstream / python 基础镜像 —— 全是 ECR Public,
 
 只在 Docker Hub 上有的 pgvector / pgbouncer 已改从自托管 GHCR mirror 拉
 (``.github/workflows/mirror-images.yml``,CI 用 ``GITHUB_TOKEN`` 登录,不吃匿名
-per-IP 限流);ECR Public 上的官方镜像仍是匿名拉,所以这里的退避还得留着。
+per-IP 限流)。
+
+2026-10-16 起 ECR Public 的官方镜像也**先从 GHCR mirror 拉**,再 ``docker tag`` 成
+源码里写的 ECR 名 —— 后面的 compose / ``docker build`` / ``docker run`` 认的是本地
+那个名字,源码一行不改(国内构建继续走 ECR)。起因:ECR 匿名拉取开始报
+``toomanyrequests: Data limit exceeded``,按出口 IP 的流量配额,一天三次 integration
+假红、每次 6 轮退避全拉不动。映射从 mirror workflow 的 matrix 读,不手抄;mirror
+里没有(或拉不下来)的照旧走 ECR + 退避。
 """
 
 from __future__ import annotations
@@ -28,8 +35,10 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
+
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "infra" / "docker-compose.yml"
@@ -58,6 +67,10 @@ EXTRA_REFS: tuple[str, ...] = (
 #: 令牌桶形态(同一条 pull 几秒后重试就成功过,#1403),不是 Docker Hub 那种
 #: 六小时配额,所以退避以分钟计就够。
 BACKOFF_S: tuple[int, ...] = (15, 30, 60, 90, 120)
+#: GHCR mirror 的 workflow —— 官方镜像 ECR 名 → mirror 名的映射从它的 matrix 读。
+MIRROR_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "mirror-images.yml"
+ECR_OFFICIAL = "public.ecr.aws/docker/library/"
+GHCR_MIRROR = "ghcr.io/deepaihealth/mirror/"
 
 _FROM_RE = re.compile(r"^FROM\s+(?:--platform=\S+\s+)?(\S+)", re.IGNORECASE | re.MULTILINE)
 
@@ -106,8 +119,40 @@ def collect_refs(
     return _dedupe(refs)
 
 
+def official_mirrors(workflow_text: str) -> dict[str, str]:
+    """源码里的 ECR 官方引用 → GHCR mirror 引用。
+
+    只收 Docker 官方镜像那几格(``upstream`` 是 ``library/<name>``、没写 ``registry``);
+    pgvector / minio 这类本来就直接写 ghcr 引用,不需要改名。
+    """
+    data = yaml.safe_load(workflow_text)
+    mirrors: dict[str, str] = {}
+    for entry in data["jobs"]["mirror"]["strategy"]["matrix"]["include"]:
+        upstream = str(entry["upstream"])
+        if entry.get("registry") or not upstream.startswith("library/"):
+            continue
+        tag = str(entry["tag"])
+        ecr = f"{ECR_OFFICIAL}{upstream.removeprefix('library/')}:{tag}"
+        mirrors[ecr] = f"{GHCR_MIRROR}{entry['name']}:{tag}"
+    return mirrors
+
+
 def _tail(text: str | None, n: int = 300) -> str:
     return (text or "").strip()[-n:]
+
+
+def pull_via_mirror(ref: str, mirror: str, *, runner: Runner, log: Logger) -> bool:
+    """从 GHCR mirror 拉 ``mirror``,再 tag 成 ``ref``;任一步失败返回 ``False``(调用方退回 ECR)。"""
+    pulled = runner(["docker", "pull", "--quiet", mirror], capture_output=True, text=True)
+    if pulled.returncode != 0:
+        log(f"WARN  {ref} 的 GHCR mirror 拉不下来,退回 ECR: {_tail(pulled.stderr)}")
+        return False
+    tagged = runner(["docker", "tag", mirror, ref], capture_output=True, text=True)
+    if tagged.returncode != 0:
+        log(f"WARN  {mirror} → {ref} 改名失败,退回 ECR: {_tail(tagged.stderr)}")
+        return False
+    log(f"ok    {ref} (← {mirror})")
+    return True
 
 
 def pull_with_backoff(
@@ -117,14 +162,25 @@ def pull_with_backoff(
     sleeper: Sleeper = time.sleep,
     backoff: Sequence[int] = BACKOFF_S,
     log: Logger = print,
+    mirrors: Mapping[str, str] | None = None,
 ) -> list[str]:
-    """逐个拉;返回**最终没拉下来**的引用(调用方决定要不要拦)。"""
+    """逐个拉;返回**最终没拉下来**的引用(调用方决定要不要拦)。
+
+    ``mirrors`` 里有的引用先走 GHCR mirror(带凭据,不吃匿名限流),不成再走下面的
+    ECR 退避。
+    """
     failed: list[str] = []
     for ref in refs:
         present = runner(["docker", "image", "inspect", ref], capture_output=True, text=True)
         if present.returncode == 0:
             log(f"skip  {ref} (已在本机)")
             continue
+        mirror = (mirrors or {}).get(ref)
+        if mirror is not None:
+            if pull_via_mirror(ref, mirror, runner=runner, log=log):
+                continue
+            # 退回能跑通,所以不出声就没人发现 mirror 坏了 —— 直到下一次限流。
+            log(f"::warning::{ref} 没走 GHCR mirror,退回匿名 ECR(mirror 同步坏了或包没权限)")
         for attempt, delay in enumerate((0, *backoff), start=1):
             if delay:
                 log(f"      {ref} 退避 {delay}s 后第 {attempt} 次")
@@ -158,12 +214,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         compose_output=_compose_config_images(subprocess.run),
         dockerfile_texts=[p.read_text(encoding="utf-8") for p in DOCKERFILES],
     )
+    try:
+        mirrors = official_mirrors(MIRROR_WORKFLOW.read_text(encoding="utf-8"))
+    except Exception as exc:  # 这一步不许拦 job:读不出 mirror 就全走 ECR
+        print(f"::warning::读不出 mirror-images.yml 的 matrix,全部走 ECR: {exc!r}")
+        mirrors = {}
     print(f"== prepull: {len(refs)} 个镜像 ==")
     if ns.dry_run:
         for ref in refs:
-            print(f"      {ref}")
+            print(f"      {ref}" + (f"  (← {mirrors[ref]})" if ref in mirrors else ""))
         return 0
-    failed = pull_with_backoff(refs)
+    failed = pull_with_backoff(refs, mirrors=mirrors)
     print(
         f"== prepull 完成: {len(refs) - len(failed)}/{len(refs)} 就绪"
         + (f",{len(failed)} 个交给测试" if failed else "")

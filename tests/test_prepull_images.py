@@ -25,6 +25,7 @@ from prepull_images import (
     collect_refs,
     compose_image_refs,
     dockerfile_base_refs,
+    official_mirrors,
     pull_with_backoff,
 )
 
@@ -95,11 +96,15 @@ class _Docker:
         self.present = present or set()
         self.pulls: list[str] = []
         self.sleeps: list[float] = []
+        self.tags: list[tuple[str, str]] = []
 
     def run(self, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         del kwargs
         if args[:3] == ["docker", "image", "inspect"]:
             return subprocess.CompletedProcess(args, 0 if args[3] in self.present else 1, "", "")
+        if args[:2] == ["docker", "tag"]:
+            self.tags.append((args[2], args[3]))
+            return subprocess.CompletedProcess(args, 0, "", "")
         assert args[:3] == ["docker", "pull", "--quiet"], args
         ref = args[3]
         self.pulls.append(ref)
@@ -147,6 +152,67 @@ def test_images_already_present_are_not_pulled_again() -> None:
     assert failed == []
     assert docker.pulls == ["c/d:2"]
     assert docker.sleeps == []
+
+
+_ECR_REDIS = "public.ecr.aws/docker/library/redis:7-alpine"
+_GHCR_REDIS = "ghcr.io/deepaihealth/mirror/redis:7-alpine"
+
+
+def test_official_image_comes_from_the_ghcr_mirror_and_keeps_its_ecr_name() -> None:
+    # 10-16:ECR 匿名拉取 `Data limit exceeded`。mirror 拉成功就不碰 ECR,
+    # 并 tag 回 ECR 名 —— compose / docker build 认的是那个名字。
+    docker = _Docker({})
+
+    failed = pull_with_backoff(
+        [_ECR_REDIS],
+        runner=docker.run,
+        sleeper=docker.sleep,
+        log=lambda _: None,
+        mirrors={_ECR_REDIS: _GHCR_REDIS},
+    )
+
+    assert failed == []
+    assert docker.pulls == [_GHCR_REDIS], "mirror 成功时不该再去 ECR"
+    assert docker.tags == [(_GHCR_REDIS, _ECR_REDIS)]
+    assert docker.sleeps == []
+
+
+def test_mirror_failure_falls_back_to_ecr_with_backoff() -> None:
+    # mirror 还没建好(新 PR 先于 mirror workflow)或 GHCR 出故障:照旧走 ECR + 退避。
+    docker = _Docker({_GHCR_REDIS: 1, _ECR_REDIS: 1})
+    lines: list[str] = []
+
+    failed = pull_with_backoff(
+        [_ECR_REDIS],
+        runner=docker.run,
+        sleeper=docker.sleep,
+        log=lines.append,
+        mirrors={_ECR_REDIS: _GHCR_REDIS},
+    )
+
+    assert failed == []
+    assert docker.pulls == [_GHCR_REDIS, _ECR_REDIS, _ECR_REDIS]
+    assert docker.tags == []
+    assert docker.sleeps == [BACKOFF_S[0]]
+    assert any("退回 ECR" in line for line in lines), "退回要说出来"
+    assert any(line.startswith("::warning::") for line in lines), "退回要进 Actions 注解"
+
+
+def test_official_mirrors_maps_only_docker_official_entries() -> None:
+    workflow = """
+jobs:
+  mirror:
+    strategy:
+      matrix:
+        include:
+          - {name: pgvector, upstream: pgvector/pgvector, tag: pg16}
+          - {name: minio, registry: cgr.dev, upstream: chainguard/minio, tag: latest-dev}
+          - {name: redis, upstream: library/redis, tag: 7-alpine}
+          - {name: python, upstream: library/python, tag: 3.12-slim}
+"""
+    ecr_python = "public.ecr.aws/docker/library/python:3.12-slim"
+    ghcr_python = "ghcr.io/deepaihealth/mirror/python:3.12-slim"
+    assert official_mirrors(workflow) == {_ECR_REDIS: _GHCR_REDIS, ecr_python: ghcr_python}
 
 
 #: 测试代码里会出现的两类 registry 字面量:ECR Public 的官方镜像,和 X-8 收官后

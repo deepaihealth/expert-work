@@ -31,3 +31,11 @@ pdf2image==1.17.0      # PDF→image; wraps the poppler-utils binaries
 imageio==2.38.0        # gif/video frames (slack-gif-creator)
 imageio-ffmpeg==0.6.0  # imageio's ffmpeg bridge (binary from apt ffmpeg)
 defusedxml==0.7.1      # office unpack/clean scripts import it directly
+# 2026-10-16 —— 测试环境 90 天、2663 个 run 里模型真撞过的缺包,加上两个公开测评集
+# (WorkBuddy Office / Harness-Bench)都用到的通用库。requests 给开了出网的 Agent:
+# 出网走平台代理(HTTPS_PROXY 带 token),requests 自己读环境变量带上鉴权,不需要
+# sitecustomize.py 那个只为 stdlib urllib 打的补丁。
+PyYAML==6.0.3          # YAML read/write (config files; benchmark inputs)
+pytz==2026.5           # time zones — pandas 3 no longer installs it; 3 runs hit ImportError
+beautifulsoup4==4.15.0 # HTML parsing (saved pages, HTML reports)
+requests==2.34.2       # HTTP client for agents whose egress is on
