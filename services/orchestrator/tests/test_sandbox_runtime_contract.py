@@ -1069,7 +1069,8 @@ def test_skills_flag_does_not_touch_the_isolation() -> None:
     from orchestrator.tools.sandbox import agent_key_envs
 
     with_skills = agent_key_envs("k", has_skills=True)
-    assert with_skills.pop("EXPERT_WORK_SKILLS_DIR")
+    skills_dir = with_skills.pop("EXPERT_WORK_SKILLS_DIR")
+    assert skills_dir
     assert with_skills == agent_key_envs("k")
     assert agent_key_envs("", has_skills=True) == agent_key_envs("") == {}
 
