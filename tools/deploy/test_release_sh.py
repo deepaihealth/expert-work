@@ -78,7 +78,10 @@ case " $* " in
         else
             echo closed
         fi >"${STUB_CANARY_STDIN_FILE:-/dev/null}"
-        [[ "${STUB_FAIL:-}" == "canary" ]] && { echo "RESULT: FAIL — the release is NOT good."; exit 1; }
+        if [[ "${STUB_FAIL:-}" == "canary" ]]; then
+            echo "RESULT: FAIL — the release is NOT good."
+            exit 1
+        fi
         [[ "${STUB_CANARY_SILENT:-}" == "1" ]] && exit 0
         echo "RESULT: PASS — real run + artifact chain verified."
         ;;
