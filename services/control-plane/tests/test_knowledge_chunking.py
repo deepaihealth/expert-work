@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from control_plane.knowledge.chunking import (
+    MIN_SEMANTIC_CHUNK_TOKENS,
     TextChunk,
     _cosine_distance,
     _hard_split,
@@ -240,9 +241,23 @@ def test_cosine_distance() -> None:
     assert _cosine_distance((0.0, 0.0), (1.0, 0.0)) == 1.0  # zero vector
 
 
+def _para(marker: str, word: str) -> str:
+    """A paragraph long enough to stand as a chunk of its own."""
+    text = f"{marker} {word}." + f" {word}" * MIN_SEMANTIC_CHUNK_TOKENS
+    assert count_tokens(text) >= MIN_SEMANTIC_CHUNK_TOKENS
+    return text
+
+
 @pytest.mark.asyncio
 async def test_semantic_split_at_topic_shift() -> None:
-    src = "TOPICA first.\n\nTOPICA second.\n\nTOPICB third.\n\nTOPICB fourth."
+    src = "\n\n".join(
+        [
+            _para("TOPICA", "first"),
+            _para("TOPICA", "second"),
+            _para("TOPICB", "third"),
+            _para("TOPICB", "fourth"),
+        ]
+    )
     embedder = _ScriptedEmbedder({"TOPICA": (1.0, 0.0), "TOPICB": (0.0, 1.0)})
     chunks = await chunk_markdown_semantic(
         src, max_tokens=512, overlap_tokens=0, embedder=embedder, tenant_id=uuid4()
@@ -296,3 +311,31 @@ async def test_semantic_empty_input() -> None:
         "", max_tokens=512, overlap_tokens=64, embedder=_FailEmbedder(), tenant_id=uuid4()
     )
     assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_semantic_short_block_joins_the_next_chunk() -> None:
+    """A title or question line on its own line reads as a topic of its own
+    (its embedding is far from both neighbours), but a chunk of just that
+    line answers nothing: below MIN_SEMANTIC_CHUNK_TOKENS the topic shift
+    after it is not a boundary, so it opens the chunk it introduces."""
+    body_a, body_c = _para("TOPICA", "alpha"), _para("TOPICC", "gamma")
+    src = f"{body_a}\n\n**TOPICB 四、产品搭配**\n\n{body_c}"
+    embedder = _ScriptedEmbedder(
+        {"TOPICA": (1.0, 0.0), "TOPICB": (0.0, 1.0), "TOPICC": (-1.0, 0.0)}
+    )
+    chunks = await chunk_markdown_semantic(
+        src, max_tokens=512, overlap_tokens=0, embedder=embedder, tenant_id=uuid4()
+    )
+    assert chunks == [body_a, f"**TOPICB 四、产品搭配**\n\n{body_c}"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_short_block_still_stops_at_a_heading() -> None:
+    """Only a topic shift is skipped; a section boundary still flushes."""
+    src = "# A\n\nTOPICA short.\n\n# B\n\n" + _para("TOPICB", "beta")
+    embedder = _ScriptedEmbedder({"TOPICA": (1.0, 0.0), "TOPICB": (0.0, 1.0)})
+    chunks = await chunk_markdown_semantic(
+        src, max_tokens=512, overlap_tokens=0, embedder=embedder, tenant_id=uuid4()
+    )
+    assert chunks == ["[Section: A]\n\nTOPICA short.", f"[Section: B]\n\n{_para('TOPICB', 'beta')}"]

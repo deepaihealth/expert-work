@@ -9,7 +9,8 @@
 2. 单库,库名 = 评测集 ``name``;解析在**进程池**里并发跑(PyMuPDF 非线程安全;每份有
    ``--parse-timeout``),落库按清单顺序逐份串行:``upsert_document(content=None)`` →
    ``control_plane.knowledge.ingestion.ingest_markdown``(语义切块 → 嵌入 → 落段,与上传后的
-   入库链路同一段代码)→ ``set_document_status(READY, chunk_count)``;失败按阶段
+   入库链路同一段代码,段上带文档名,``--doc-titles`` 可换成不带 / 在文档间打乱的对照组)→
+   ``set_document_status(READY, chunk_count)``;失败按阶段
    ``parse|embed|store|other`` 记进 ``ingest_failures``,文档标 FAILED,不中断;同名不同内容的
    文件后到的一份以「上级目录/文件名」入库,记进 ``name_collisions``;0 字节文件直接跳过;
    **可复现**:SQL 库默认固定读行顺序(关掉索引扫描、并行扫描、同步顺序扫描与
@@ -51,6 +52,7 @@ import asyncio
 import csv
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -60,7 +62,7 @@ from concurrent.futures import Executor, ProcessPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -96,7 +98,12 @@ from control_plane.knowledge.parsing import parse_document
 from expert_work.persistence import InMemoryKnowledgeStore, KnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
-from expert_work.protocol import DocumentStatus, RetrievalMethod
+from expert_work.protocol import (
+    DocumentStatus,
+    RetrievalMethod,
+    chunk_retrieval_text,
+    knowledge_document_title,
+)
 from orchestrator.llm import Embedder, LLMCaller
 from orchestrator.llm.embedder import QWEN_EMBEDDING_BASE_URL
 from orchestrator.tools.knowledge import (
@@ -119,6 +126,12 @@ DEFAULT_PARSE_TIMEOUT_S = 120.0
 #: 解析超过时限后接着等同一个解析,总共最多等这么多倍时限才记失败。时限是防卡死的,不是判慢:
 #: 10-15 两条评测并行跑时一份大 PDF 超过 120 秒被跳过,语料静默少了 4,130 段,结果照常输出。
 SLOW_PARSE_GRACE = 4
+#: 段上的文档名:``real`` = 生产入库同款(文件名清洗后);``none`` = 不带(PR2b 之前的入库);
+#: ``shuffled`` = 对照组,同一批文档名在文档间打乱,量「真名字」比「有个名字」多带来多少。
+DocTitles = Literal["real", "shuffled", "none"]
+DOC_TITLE_CHOICES: tuple[str, ...] = ("real", "shuffled", "none")
+#: ``shuffled`` 的固定种子:对照组每次跑同一种打乱,两次结果可比。
+DOC_TITLE_SHUFFLE_SEED = 20261016
 #: 与根 ``conftest.py`` 的 ``postgres_container`` 同一镜像(GHCR 镜像站,CI 卫兵只放行这个源)。
 PGVECTOR_IMAGE = "ghcr.io/deepaihealth/mirror/pgvector:pg16"
 ALEMBIC_INI = _REPO_ROOT / "packages" / "expert-work-persistence" / "alembic.ini"
@@ -404,6 +417,25 @@ def _basename(path: str) -> str:
     return path.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def doc_titles_for(rows: Sequence[Mapping[str, str]], mode: str) -> dict[str, str | None]:
+    """清单每行(``path``)入库时段上带的文档名,见 :data:`DocTitles`。``shuffled`` 按固定种子
+    把文档排成一圈,每份拿下一份的名字 —— 没有一份留着自己的名字(只有一份文档时除外)。"""
+    paths = [row["path"] for row in rows]
+    if mode == "none":
+        return dict.fromkeys(paths)
+    real = [knowledge_document_title(_basename(path)) for path in paths]
+    if mode == "real":
+        return dict(zip(paths, real, strict=True))
+    if mode != "shuffled":
+        raise ValueError(f"unknown doc title mode {mode!r}")
+    order = list(range(len(paths)))
+    random.Random(DOC_TITLE_SHUFFLE_SEED).shuffle(order)  # noqa: S311 - a reproducible control group
+    shuffled: list[str | None] = [None] * len(paths)
+    for position, index in enumerate(order):
+        shuffled[index] = real[order[(position + 1) % len(order)]]
+    return dict(zip(paths, shuffled, strict=True))
+
+
 def classify_failure(exc: BaseException) -> tuple[str, str]:
     """``(阶段, 异常类型名)``。``EmbedStageError`` 解包出原始异常类型。"""
     if isinstance(exc, EmbedStageError):
@@ -427,6 +459,7 @@ async def build_corpus(
     executor: Executor | None = None,
     parser: Callable[[str, bytes], str] = parse_document,
     parse_timeout_s: float = DEFAULT_PARSE_TIMEOUT_S,
+    doc_titles: str = "real",
 ) -> CorpusReport:
     """一次性建单库并把 ``selection`` 里的文档全部走真实入库链路。
 
@@ -434,6 +467,7 @@ async def build_corpus(
     ``parse_timeout_s`` 秒超时;落库(建文档行 → ``ingest_markdown`` 切块 / 嵌入 / 落段 → 置状态)
     **按清单顺序逐份串行**:行的物理顺序每次都一样,检索并列分数时谁排前面才不随并发抖动
     (10-14 实测:并发落库时同一份代码连跑两次,303 题里 28 题排序不同)。
+    段上的文档名按 ``doc_titles``(:func:`doc_titles_for`)。
     同名文件(不同目录、同 basename、又不是同一 ``dup_group``)只入第一份:库内
     ``(kb_id, filename)`` 唯一,再 upsert 会把前一份重置并删段;后到的记进 ``name_collisions``。
     ``EmbeddingDimensionError`` 不按文档失败记,直接抛出 —— 那是配置错。
@@ -444,6 +478,7 @@ async def build_corpus(
     claimed: dict[str, str] = {}
     collisions: list[NameCollision] = []
     total = len(selection.rows)
+    titles = doc_titles_for(selection.rows, doc_titles)
     loop = asyncio.get_running_loop()
 
     async def _parse(pool: Executor, filename: str, raw: bytes) -> str:
@@ -469,7 +504,7 @@ async def build_corpus(
                 raise _ParseStageError(exc) from exc
         return markdown
 
-    async def _ingest(doc_id: UUID, parsed: asyncio.Task[str]) -> int:
+    async def _ingest(doc_id: UUID, path: str, parsed: asyncio.Task[str]) -> int:
         markdown = await parsed
         return await ingest_markdown(
             store=store,
@@ -480,6 +515,7 @@ async def build_corpus(
             markdown=markdown,
             chunk_max_tokens=base.chunk_max_tokens,
             chunk_overlap_tokens=base.chunk_overlap_tokens,
+            doc_title=titles[path],
         )
 
     async def _one(
@@ -509,7 +545,7 @@ async def build_corpus(
             tenant_id=tenant_id, kb_id=base.id, filename=filename, content=None
         )
         try:
-            count = await _ingest(doc.id, parsed)
+            count = await _ingest(doc.id, path, parsed)
             await store.set_document_status(
                 tenant_id=tenant_id,
                 document_id=doc.id,
@@ -667,8 +703,10 @@ async def _all_chunk_texts(
         page, total = await store.list_chunks(
             tenant_id=tenant_id, document_id=document_id, offset=offset, limit=_CHUNK_PAGE
         )
-        # Same text retrieval matches against: breadcrumb + body.
-        texts.extend(c.retrieval_text for c in page)
+        # The text hits are judged on (``RetrievedChunk.retrieval_text``):
+        # breadcrumb + body, without the document title the index also
+        # carries — an anchor only in a title must not count as found.
+        texts.extend(chunk_retrieval_text(c.heading_path, c.content) for c in page)
         offset += len(page)
         if not page or offset >= total:
             return texts
@@ -1241,6 +1279,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="结果文件里带上每段的检索文本(汇集标注用;含语料原文,结果文件只留在仓库外)",
     )
+    parser.add_argument(
+        "--doc-titles",
+        default="real",
+        choices=DOC_TITLE_CHOICES,
+        help="段上的文档名:real = 生产同款;none = 不带(改前);shuffled = 在文档间打乱的对照组",
+    )
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument(
         "--parse-timeout",
@@ -1307,6 +1351,7 @@ async def _run(
                 selection=selection,
                 concurrency=args.concurrency,
                 parse_timeout_s=args.parse_timeout,
+                doc_titles=args.doc_titles,
             )
             if report.docs_ingested == 0:
                 raise SystemExit(
@@ -1344,6 +1389,7 @@ async def _run(
         "store": args.store,
         "vector_search": "ann" if args.ann else "exact",
         "doc_match": args.doc_match,
+        "doc_titles": args.doc_titles,
         "tiers": list(tiers),
         "limit_docs": args.limit_docs,
         "method": cfg.method.value,

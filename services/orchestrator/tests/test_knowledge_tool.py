@@ -752,3 +752,167 @@ async def test_chunk_with_unhashable_source_locator_is_retrievable() -> None:
         tenant_id=tenant, base_names=["kb"], query="deductible", limit=5
     )
     assert [r.chunk_id for r in results] == [chunk.id]
+
+
+class _RecordingReranker:
+    """Records the texts it was asked to rank; keeps their order."""
+
+    def __init__(self) -> None:
+        self.documents: list[str] = []
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        del query, tenant_id
+        self.documents.extend(documents)
+        return list(range(len(documents)))[:top_k]
+
+
+async def test_reranker_sees_the_document_title_but_the_agent_sees_it_once() -> None:
+    """The reranker ranks the retrieval text, title included (B-175 wave 2
+    PR2b); the agent already gets the file name in each result's header, so
+    its text carries no second ``[Document: …]`` line."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="guide.pdf")
+    chunk = _chunk(
+        tenant=tenant, kb=base.id, doc=document.id, index=0, content="deductible", embedding=(1.0,)
+    ).model_copy(update={"doc_title": "guide", "heading_path": ("Costs",)})
+    await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=[chunk])
+    reranker = _RecordingReranker()
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb"], query="deductible", limit=5
+    )
+
+    assert reranker.documents == ["[Document: guide]\n[Section: Costs]\n\ndeductible"]
+    assert [(r.filename, r.retrieval_text) for r in results] == [
+        ("guide.pdf", "[Section: Costs]\n\ndeductible")
+    ]
+
+
+class _ScoringReranker:
+    """A scoring reranker: each text's score comes from ``scores`` (unknown
+    texts score 0, or ``None`` throughout with ``unscored``); records each call."""
+
+    def __init__(self, scores: dict[str, float], *, unscored: bool = False) -> None:
+        self.scores = scores
+        self.unscored = unscored
+        self.calls: list[tuple[list[str], int]] = []
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        ranked = await self.rerank_scored(
+            query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+        )
+        return [index for index, _score in ranked]
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        del query, tenant_id
+        self.calls.append((list(documents), top_k))
+        order = sorted(
+            range(len(documents)), key=lambda i: (-self.scores.get(documents[i], 0.0), i)
+        )[:top_k]
+        if self.unscored:
+            return [(i, None) for i in order]
+        return [(i, self.scores.get(documents[i], 0.0)) for i in order]
+
+
+async def _titled_store(
+    bodies: Sequence[str], *, title: str | None
+) -> tuple[InMemoryKnowledgeStore, UUID, list[KnowledgeChunk]]:
+    """One base, one document; one chunk per body, all with the same vector."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="doc.pdf")
+    chunks = [
+        _chunk(
+            tenant=tenant, kb=base.id, doc=document.id, index=i, content=body, embedding=(1.0,)
+        ).model_copy(update={"doc_title": title})
+        for i, body in enumerate(bodies)
+    ]
+    await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=chunks)
+    return store, tenant, chunks
+
+
+async def test_two_view_rerank_ranks_by_the_weighted_mean_of_both_views() -> None:
+    """A question about a code: with the title every passage of the file named
+    after it looks on topic, so the boilerplate outranks the passage carrying
+    the code. The body view still tells them apart, and 0.7 x titled + 0.3 x
+    body puts the answer first (B-175 wave 2 PR2b eval)."""
+    store, tenant, _ = await _titled_store(
+        ["QXA-N7 strain", "claims boilerplate"], title="patent QXA-N7"
+    )
+    answer, boilerplate = "QXA-N7 strain", "claims boilerplate"
+    reranker = _ScoringReranker(
+        {
+            f"[Document: patent QXA-N7]\n\n{answer}": 0.80,
+            f"[Document: patent QXA-N7]\n\n{boilerplate}": 0.90,
+            answer: 0.90,
+            boilerplate: 0.10,
+        }
+    )
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+
+    results = await retriever.search(
+        tenant_id=tenant, base_names=["kb"], query="QXA-N7 专利", limit=5
+    )
+
+    # 0.7 x 0.80 + 0.3 x 0.90 = 0.83 beats 0.7 x 0.90 + 0.3 x 0.10 = 0.66.
+    assert [r.content for r in results] == [answer, boilerplate]
+    assert len(reranker.calls) == 2
+    assert sorted(reranker.calls[1][0]) == sorted([answer, boilerplate])
+
+
+async def test_two_view_rerank_judges_the_titled_top_20_on_the_body() -> None:
+    """The titled view returns its best 20 even for a 5-result search, the body
+    view re-judges exactly those, and the search still returns 5."""
+    bodies = [f"passage {i:02d}" for i in range(30)]
+    store, tenant, _ = await _titled_store(bodies, title="guide")
+    # Titled: passage 00 best, 29 worst. Body: reversed within the titled top 20.
+    scores = {f"[Document: guide]\n\n{b}": 1.0 - i / 100 for i, b in enumerate(bodies)}
+    scores |= {b: i / 100 for i, b in enumerate(bodies)}
+    reranker = _ScoringReranker(scores)
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+
+    results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+
+    (_titled_docs, titled_top_k), (body_docs, body_top_k) = reranker.calls
+    assert titled_top_k == 20
+    assert sorted(body_docs) == bodies[:20]
+    assert body_top_k == 20
+    assert len(results) == 5
+    # Titled gaps are 0.01 x 0.7, body gaps 0.01 x 0.3: the titled order holds.
+    assert [r.content for r in results] == bodies[:5]
+
+
+async def test_two_view_rerank_falls_back_to_the_titled_order_without_scores() -> None:
+    """A reranker that ranks without scoring (a chat model behind the resolving
+    reranker) is called once, on the titled text, and its order is kept."""
+    store, tenant, _ = await _titled_store(["first", "second"], title="guide")
+    reranker = _ScoringReranker({"[Document: guide]\n\nsecond": 0.9}, unscored=True)
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+
+    results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+
+    assert [r.content for r in results] == ["second", "first"]
+    assert len(reranker.calls) == 1
+
+
+async def test_two_view_rerank_skips_the_body_view_for_untitled_chunks() -> None:
+    """Chunks ingested before titles were stored read the same in both views:
+    one call, no second charge."""
+    store, tenant, _ = await _titled_store(["first", "second"], title=None)
+    reranker = _ScoringReranker({"second": 0.9, "first": 0.1})
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+
+    results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+
+    assert [r.content for r in results] == ["second", "first"]
+    assert len(reranker.calls) == 1

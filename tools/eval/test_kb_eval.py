@@ -33,6 +33,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     build_retriever,
     case_to_json,
     check_anchors,
+    doc_titles_for,
     fingerprint,
     format_summary_table,
     main,
@@ -224,6 +225,20 @@ def test_select_rows_filters_tier_dedupes_first_wins_and_limits(
 # ---------------------------------------------------------------------------
 
 
+def test_doc_titles_real_none_and_shuffled() -> None:
+    """``real`` = 生产入库时的文档名;``none`` = 不带(改前);``shuffled`` = 对照组:同一批文档名
+    在文档间打乱(长度与格式分布不变),每份都拿到别人的名字,固定种子可复现。"""
+    rows = [_row(f"docs/doc_{i}.md") for i in range(6)]
+    paths = [r["path"] for r in rows]
+    real = doc_titles_for(rows, "real")
+    assert real == {path: f"doc {i}" for i, path in enumerate(paths)}
+    assert doc_titles_for(rows, "none") == dict.fromkeys(paths)
+    shuffled = doc_titles_for(rows, "shuffled")
+    assert sorted(shuffled.values()) == sorted(real.values())  # type: ignore[type-var]
+    assert all(shuffled[path] != real[path] for path in paths)
+    assert doc_titles_for(rows, "shuffled") == shuffled
+
+
 async def _build(
     corpus: tuple[Path, Path],
     *,
@@ -282,6 +297,20 @@ async def test_build_corpus_ingests_once_per_dup_group_and_records_failures(
     assert "manual_a_copy.md" not in status
     ready = [d for d in docs if d.status is DocumentStatus.READY]
     assert all(d.chunk_count >= 1 for d in ready)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [("real", {"manual a", "manual b"}), ("none", {None})],
+)
+async def test_build_corpus_ingests_chunks_with_the_chosen_titles(
+    corpus: tuple[Path, Path], mode: str, expected: set[str | None]
+) -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    await _build(corpus, store=store, tenant=tenant, doc_titles=mode)
+    assert {c.doc_title for c in store._chunks} == expected
 
 
 @pytest.mark.asyncio
@@ -995,7 +1024,12 @@ _SHARED = "益生菌可通过正常饮食摄入"
 _COMMON = "请遵医嘱"
 
 
-async def _seed_docs(store: InMemoryKnowledgeStore, tenant: UUID, docs: dict[str, str]) -> UUID:
+async def _seed_docs(
+    store: InMemoryKnowledgeStore,
+    tenant: UUID,
+    docs: dict[str, str],
+    titles: dict[str, str] | None = None,
+) -> UUID:
     from control_plane.knowledge.ingestion import ingest_markdown
 
     embedder = build_fake_embedder()
@@ -1013,6 +1047,7 @@ async def _seed_docs(store: InMemoryKnowledgeStore, tenant: UUID, docs: dict[str
             markdown=text,
             chunk_max_tokens=base.chunk_max_tokens,
             chunk_overlap_tokens=base.chunk_overlap_tokens,
+            doc_title=(titles or {}).get(filename),
         )
         await store.set_document_status(
             tenant_id=tenant, document_id=doc.id, status=DocumentStatus.READY, chunk_count=count
@@ -1061,6 +1096,35 @@ async def test_resolve_anchor_documents_adds_other_documents_holding_the_anchor(
     assert shared.documents == frozenset({"faq-2025.md", "faq-2026.md"})
     assert unique.documents == frozenset({"notes.md"})
     assert (report.expanded, report.expanded_cases, report.too_common) == (1, 1, ())
+
+
+async def test_anchor_checks_ignore_the_document_title() -> None:
+    """Hits are judged on the text the agent sees, which has no title: an
+    anchor found only in a document's title is dead, and a document that got
+    the anchor-bearing title (the shuffled control group) is not credited."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    number = "ZL202410048761.8"
+    with rls_tenant(tenant):
+        kb_id = await _seed_docs(
+            store,
+            tenant,
+            {
+                "patent.md": "# 证书\n\n发明名称:一种组合物。\n",
+                "manual.md": "# 说明\n\n每日一袋。\n",
+            },
+            titles={"patent.md": f"专利证书 {number}", "manual.md": f"专利证书 {number}"},
+        )
+        dataset = _one_case_dataset(("patent.md", number))
+        anchors = await check_anchors(store=store, tenant_id=tenant, kb_id=kb_id, dataset=dataset)
+        resolved, report = await resolve_anchor_documents(
+            store=store, tenant_id=tenant, kb_id=kb_id, dataset=dataset
+        )
+    assert [(d.document, d.reason) for d in anchors.dead] == [
+        ("patent.md", "anchor_not_in_any_chunk")
+    ]
+    assert resolved.cases[0].expected[0].documents == frozenset({"patent.md"})
+    assert report.expanded == 0
 
 
 async def test_resolve_anchor_documents_leaves_a_too_common_anchor_alone() -> None:

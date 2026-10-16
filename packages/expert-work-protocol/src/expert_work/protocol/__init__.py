@@ -118,6 +118,7 @@ from expert_work.protocol.knowledge import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    KB_DOCUMENT_TITLE_MAX_CHARS,
     ChunkType,
     DocumentSourceType,
     DocumentStatus,
@@ -130,6 +131,7 @@ from expert_work.protocol.knowledge import (
     RetrievalMethod,
     ScoredChunk,
     chunk_retrieval_text,
+    knowledge_document_title,
 )
 from expert_work.protocol.mcp_connector_catalog import (
     McpConnectorAuthField,
@@ -299,6 +301,7 @@ __all__ = [
     "DEFAULT_WORKSPACE_BYTES_PER_USER",
     "DIMENSION_RESOURCE_KINDS",
     "FIELD_TIERS",
+    "KB_DOCUMENT_TITLE_MAX_CHARS",
     "MAX_RESULT_EXCERPT_CHARS",
     "MODEL_CATALOG",
     "PLATFORM_SCOPE_ROLES",
@@ -516,6 +519,7 @@ __all__ = [
     "chunk_retrieval_text",
     "dimension_applies",
     "enforce_security_floor",
+    "knowledge_document_title",
     "models_for_provider",
     "parse_agent_ref",
     "parse_extends_ref",

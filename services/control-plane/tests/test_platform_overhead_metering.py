@@ -437,6 +437,32 @@ async def test_llm_rerank_inside_a_run_is_metered_as_platform_overhead(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("make", [_dynamic, _static], ids=["dynamic", "static"])
+async def test_scored_llm_rerank_inside_a_run_is_metered_without_scores(
+    tracing: None, monkeypatch: pytest.MonkeyPatch, make: Callable[[], Any]
+) -> None:
+    # 知识检索走 rerank_scored(B-175 波 2 PR2b 两视角):LLM 分支照样记账,不给分数
+    # (检索据此只排一次、保留这个顺序)。
+    _patch_router(monkeypatch, _Caller(content="[2, 1]"))
+    store = InMemoryTokenUsageStore()
+    budget = TokenBudget(limit=10_000)
+    reranker = ScopedReranker(inner=make(), identity=_identity(store))
+    token = var_child_runnable_config.set(_config(budget))
+    try:
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "run"):
+            trace_id = current_trace_id_hex()
+            ranked = await reranker.rerank_scored(
+                query="q", documents=["a", "b"], top_k=2, tenant_id=_TENANT
+            )
+    finally:
+        var_child_runnable_config.reset(token)
+
+    assert ranked == [(1, None), (0, None)]
+    [row] = await _rows(store)
+    _assert_overhead_row(row, model=("qwen", "qwen-plus"), trace_id=trace_id)
+
+
+@pytest.mark.asyncio
 async def test_llm_rerank_outside_an_agent_build_records_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

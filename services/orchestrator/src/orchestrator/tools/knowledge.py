@@ -60,6 +60,15 @@ _RERANK_DOC_CHARS = 600
 #: ``knowledge_search`` result-count default + hard cap.
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 20
+#: Two-view rerank (B-175 wave 2 PR2b): a scoring reranker judges every
+#: candidate with its document title, then its best ``_BODY_VIEW_DEPTH`` again
+#: on the body alone, and they are ranked by ``_TITLED_VIEW_WEIGHT`` x titled +
+#: the rest x body. The title places a passage that never names its product;
+#: on its own it makes every passage of a file named after the code a question
+#: asks about (a patent certificate titled with the strain) look on topic, and
+#: they bury the passage that carries the code.
+_TITLED_VIEW_WEIGHT = 0.7
+_BODY_VIEW_DEPTH = 20
 
 
 @runtime_checkable
@@ -79,6 +88,18 @@ class Reranker(Protocol):
         most relevant first. Indices are positions in ``documents``."""
 
 
+@runtime_checkable
+class ScoredReranker(Protocol):
+    """A :class:`Reranker` that can also say how relevant each document is."""
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        """Like :meth:`Reranker.rerank`, each index paired with its relevance
+        score: ``None`` throughout when the backend ranks without scoring (a
+        chat-model reranker) or rerank was skipped."""
+
+
 @dataclass(frozen=True)
 class RetrievedChunk:
     """A retrieved chunk with its source document attribution.
@@ -96,8 +117,10 @@ class RetrievedChunk:
     and ``fused_score`` (the weighted RRF score that ordered the fusion).
 
     ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
-    The agent sees (and the reranker / eval match against)
-    :attr:`retrieval_text`, the two joined.
+    The agent sees (and the eval matches against) :attr:`retrieval_text`, the
+    two joined, under a ``[filename#index]`` header. The reranker ranks the
+    stored chunk's own retrieval text, which also carries the document title
+    — here it would only repeat the header.
     """
 
     content: str
@@ -309,12 +332,17 @@ class KnowledgeRetriever:
         # Capped after fusion: several bases (and an explicit recall_limit) can
         # fuse into more than one rerank request takes.
         candidates = fused[: min(self.recall_depth(limit), _MAX_RERANK_CANDIDATES)]
-        order = await self.reranker.rerank(
-            query=query,
-            documents=[chunk.retrieval_text for chunk in candidates],
-            top_k=limit,
-            tenant_id=tenant_id,
-        )
+        if isinstance(self.reranker, ScoredReranker):
+            order = await _two_view_order(
+                self.reranker, query, candidates, limit, tenant_id=tenant_id
+            )
+        else:
+            order = await self.reranker.rerank(
+                query=query,
+                documents=[chunk.retrieval_text for chunk in candidates],
+                top_k=limit,
+                tenant_id=tenant_id,
+            )
         return [candidates[i] for i in order]
 
     async def _attribute(
@@ -346,6 +374,44 @@ class KnowledgeRetriever:
             )
             for chunk in chunks
         ]
+
+
+async def _two_view_order(
+    reranker: ScoredReranker,
+    query: str,
+    candidates: Sequence[KnowledgeChunk],
+    limit: int,
+    *,
+    tenant_id: UUID,
+) -> list[int]:
+    """Indices of the ``limit`` best ``candidates``, ranked on both views (see
+    :data:`_TITLED_VIEW_WEIGHT`). Falls back to the titled order when the
+    reranker gives no scores, and skips the body view when no candidate it
+    would judge has a title (chunks ingested before titles were stored)."""
+    titled = await reranker.rerank_scored(
+        query=query,
+        documents=[chunk.retrieval_text for chunk in candidates],
+        top_k=max(limit, _BODY_VIEW_DEPTH),
+        tenant_id=tenant_id,
+    )
+    top = [index for index, _score in titled]
+    bodies = [chunk_retrieval_text(candidates[i].heading_path, candidates[i].content) for i in top]
+    titled_score = {index: score for index, score in titled if score is not None}
+    if len(titled_score) < len(top) or all(
+        body == candidates[i].retrieval_text for i, body in zip(top, bodies, strict=True)
+    ):
+        return top[:limit]
+    body_view = await reranker.rerank_scored(
+        query=query, documents=bodies, top_k=len(bodies), tenant_id=tenant_id
+    )
+    body_score = {top[j]: score for j, score in body_view if score is not None}
+    if len(body_score) < len(top):
+        return top[:limit]
+    combined = {
+        i: _TITLED_VIEW_WEIGHT * titled_score[i] + (1 - _TITLED_VIEW_WEIGHT) * body_score[i]
+        for i in top
+    }
+    return sorted(top, key=lambda i: (-combined[i], i))[:limit]
 
 
 @dataclass(frozen=True)

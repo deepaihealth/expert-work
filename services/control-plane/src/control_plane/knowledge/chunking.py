@@ -21,7 +21,9 @@ A parsed document (Markdown text) is sliced into retrieval chunks that:
 adds semantic refinement — it embeds blocks and additionally splits a
 section at topic shifts (adjacent blocks whose embeddings are far apart),
 so a long heading-less section is split where its subject actually
-changes rather than at an arbitrary size point. See
+changes rather than at an arbitrary size point — but never right after a
+fragment shorter than :data:`MIN_SEMANTIC_CHUNK_TOKENS` (a title or question
+line, a page number, an image), which joins the chunk that follows. See
 ``docs/streams/STREAM-J-DESIGN.md`` § 12.
 """
 
@@ -68,6 +70,14 @@ _OVERLAP_START = re.compile(r"\n\n|\n|(?<=[。！？.!?])")  # noqa: RUF001
 #: are treated as a topic shift — a semantic chunk boundary. Conservative
 #: so coherent prose is not over-fragmented; only genuine shifts split.
 _SEMANTIC_BREAK_THRESHOLD = 0.4
+
+#: A topic shift is a chunk boundary only once the chunk being built holds
+#: at least this many tokens. A line on its own — a bold title, a question
+#: heading its answer, a page number, an image — embeds far from both
+#: neighbours, so it would otherwise become a chunk of its own: about 29% of
+#: chunks in a 42k-chunk real corpus were such fragments, and a chunk holding
+#: only a question outranks its answer on keyword match.
+MIN_SEMANTIC_CHUNK_TOKENS = 32
 
 
 def count_tokens(text: str) -> int:
@@ -157,7 +167,8 @@ def _pack_blocks(
     semantic_breaks: frozenset[int],
 ) -> list[TextChunk]:
     """Pack blocks into chunks. Flush on a heading change, on a
-    ``semantic_breaks`` index (a topic shift), and on the token cap."""
+    ``semantic_breaks`` index (a topic shift) once the chunk holds
+    :data:`MIN_SEMANTIC_CHUNK_TOKENS`, and on the token cap."""
     chunks: list[TextChunk] = []
     trail: tuple[str, ...] = ()
     buffer: list[str] = []
@@ -177,8 +188,9 @@ def _pack_blocks(
         if block.heading_trail != trail:
             flush(carry_overlap=False)
             trail = block.heading_trail
-        elif index in semantic_breaks:
-            # Topic shift inside a section — a clean boundary, no overlap.
+        elif index in semantic_breaks and buffer_tokens >= MIN_SEMANTIC_CHUNK_TOKENS:
+            # Topic shift inside a section — a clean boundary, no overlap. A
+            # shorter fragment stays and opens the next chunk instead.
             flush(carry_overlap=False)
         for piece in _prepare_block(block, max_tokens):
             piece_tokens = count_tokens(piece)

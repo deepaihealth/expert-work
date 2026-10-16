@@ -288,6 +288,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 空腹时胃酸的pH值为1.5左右，为了减少胃酸对益生菌活性的破坏，建议在饭后半小时
     page: null
+  - document: 产品知识：代谢性问题的健康干预策略.docx
+    anchor: （除“清风”等有特殊说明的产品）。
+    page: null
+    via: pool-judge
   answer: 空腹时胃酸的pH值为1.5左右，为了减少胃酸对益生菌活性的破坏，建议在饭后半小时内服用益生菌，此时胃液的酸性没那么强，对活性益生菌的干扰也较少，同时食物中的膳食纤维可以促进益生菌更好起效，是益生菌的最佳服用时间。如果期间有吃抗生素，建议服用抗生素2小时后再摄入益生菌。
 - id: faq_xlsx-0013
   query: 哪一餐搭配益生菌效果更佳？
@@ -526,6 +530,10 @@ cases:
     via: pool-judge
   - document: 华大营养益生菌FAQ-2025.xlsx
     anchor: 食品用益生菌为可用于食品中的一种或多种益生菌，经发酵、富集、干燥或不干燥、混合或不混合、包装等工序制成的食品原料。
+    page: null
+    via: pool-judge
+  - document: 益生菌益生元常见问题.docx
+    anchor: 补充益生菌要靠专门的益生菌产品，如益生菌类保健食品或足量添加了益生菌的普通食品。
     page: null
     via: pool-judge
   answer: 根据中国食品科学技术学会制定的《食品用益生菌通则》团体标准规定，益生菌食品是指“添加了益生菌，并且在保质期内益生菌活菌数量符合一定要求的食品”。
@@ -1042,6 +1050,10 @@ cases:
     anchor: 非常适合。双歧杆菌，尤其是青春双歧杆菌，会随着年龄增长而大幅减少。补充畅青可以直接补充这些核心有益菌
     page: null
     via: pool-judge
+  - document: 产品说明书：畅青.docx
+    anchor: 饮食不规律、热爱高热量饮食，肠道提前衰老者
+    page: null
+    via: pool-judge
   answer: 3岁以上可食用，肠道早衰、消化难、经常使用抗生素治疗、消化不良食欲不振、消瘦、腹泻、腹痛、腹泻便秘交替、肠易激综合征、日常肠道养护
 - id: faq_xlsx-0046
   query: 畅青食用方法？
@@ -1398,6 +1410,10 @@ cases:
     anchor: 六步，工艺保障（专利冻干保护技术、十万级洁净车间）；第七步，文献支持（核心成分有临床研究背书）。
     page: null
     via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: 有效性：每袋150亿CFU活菌，有效改善肠胃健康，温和养胃
+    page: null
+    via: pool-judge
   answer: 四株华大益生菌帮助恢复胃部菌群平衡，提升免疫、给胃粘膜舒缓炎症；发酵大豆粉直接中和胃酸和阻止胃蛋白酶，牢牢护住粘膜病损部位，其中的营养成分能修复胃粘膜。
 - id: faq_xlsx-0063
   query: 益舒适用人群
@@ -1414,6 +1430,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 适合有消化不良、胃胀气、胃反酸灼痛、慢性胃炎、胃溃疡、饮酒应酬多的人群
     page: null
+  - document: 产品说明书：益舒.pdf
+    anchor: 覆盖3岁以上⼉童、成年⼈（包括孕产妇）、⽼年⼈。适合有消化不良、胃胀⽓、胃反酸灼痛、慢
+    page: null
+    via: pool-judge
   answer: 覆盖3岁以上儿童、成年人（包括孕产妇）、老年人。适合有消化不良、胃胀气、胃反酸灼痛、慢性胃炎、胃溃疡、饮酒应酬多的人群。
 - id: faq_xlsx-0064
   query: 益舒食用方法？
@@ -1964,6 +1984,10 @@ cases:
     anchor: 通过多种功能营养成分调理睡眠和情绪健康，放松大脑、促进深睡眠、缓解负情绪。
     page: null
     via: pool-judge
+  - document: 产品说明书 ：益休.docx
+    anchor: 2株专利菌株，作用有保障，功能细分且精准“靶向”，
+    page: null
+    via: pool-judge
   answer: γ-氨基丁酸、茶叶茶氨酸、酪蛋白肽，对脑部有安定作用、促进放松和消除神经紧张、保护神经、镇静、调节情绪、提高认知能力等方面有良好的保健作用；添加以助眠闻名的药膳成分酸枣仁，含有酸枣仁皂苷、黄酮苷类、维生素E等营养；“华大晚安菌组合”双歧杆菌+乳酸杆菌合成营养素和神经递质，调节脑肠轴，增强“情绪抵抗力”。
 - id: faq_xlsx-0092
   query: 益休适用人群
@@ -1980,6 +2004,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 适合因压力、疲劳、睡眠质量差（难眠、早醒、睡醒疲惫）、焦虑、易怒、情绪不稳人群的
     page: null
+  - document: 产品说明书 ：益休.docx
+    anchor: 熬夜、睡不着、睡得浅、易惊醒、睡的短、多梦不安、易疲劳、烦躁易怒、精神压力大
+    page: null
+    via: pool-judge
   answer: 3岁以上均可食用，考虑情况是否适合即可。适合因压力、疲劳、睡眠质量差（难眠、早醒、睡醒疲惫）、焦虑、易怒、情绪不稳人群的舒压、助眠优选
 - id: faq_xlsx-0093
   query: 益休食用方法？
@@ -2690,6 +2718,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 镜脂不是减肥药，是帮助超重/肥胖/高血脂人群尽快恢复肠道菌群平衡、提升糖脂代谢能
     page: null
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 大概吃了6周有明显见证改变，平均腰围下降率达1.6cm，持续变化
+    page: null
+    via: pool-judge
   answer: 镜脂不是减肥药，是帮助超重/肥胖/高血脂人群尽快恢复肠道菌群平衡、提升糖脂代谢能力、一定程度加速燃脂和排出肠垃圾，帮助这类人群在控制饮食和适当运动的基础上，加快恢复到健康的体重和血脂水平。有减肥需求的人群建议连续加量食用2～3个月。
 - id: faq_xlsx-0125
   query: 为什么吃镜脂没有效果?
@@ -3321,6 +3353,22 @@ cases:
     via: pool-judge
   - document: 镜脂系列产品课件.pdf
     anchor: 动物双歧杆菌乳亚种BGI-N3
+    page: null
+    via: pool-judge
+  - document: 镜脂系列产品课件.pdf
+    anchor: 3重优质蛋白、复配8大维生素、7大矿物质、膳食纤维（抗性糊精）
+    page: null
+    via: pool-judge
+  - document: 镜脂系列产品课件.pdf
+    anchor: 生姜绿茶复合微囊粉（茶多酚+姜辣素）
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 搭配四重活力植萃：菠菜粉、栗子粉、海藻粉、柑橘纤维粉
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 6菌协同，华大“减负菌”组合
     page: null
     via: pool-judge
   answer: "六株华大“燃动”菌\n动物双歧杆菌乳亚种BGI-N3   专利号：:ZL2024 11622228.4\n植物乳植杆菌BGI-N6\n格氏乳杆菌TF08  专利号：ZL201811514219.8\n鼠李糖乳酪杆菌OF44专利号：ZL202011248842.0 \n乳酸片球菌BGI-N9 \n戊糖片球菌BGI-N8\n\n“燃料”益生元组合\n⽔溶性膳⻝纤维（聚葡萄糖）、乳糖醇、\n低聚半乳糖、低聚果糖、抗性糊精\n\n糖油“阻”合\n栗⼦粉、海藻粉、柑橘纤维粉"
@@ -4729,6 +4777,10 @@ cases:
   - document: 华大营养产品知识库.xlsx
     anchor: 适合有消化不良、胃胀气、胃反酸灼痛、慢性胃炎、胃溃疡、饮酒应酬多的人群
     page: null
+  - document: 产品说明书：益舒.pdf
+    anchor: 覆盖3岁以上⼉童、成年⼈（包括孕产妇）、⽼年⼈。适合有消化不良、胃胀⽓、胃反酸灼痛、慢
+    page: null
+    via: pool-judge
   answer: 覆盖3岁以上儿童、成年人（包括孕产妇）、老年人。适合有消化不良、胃胀气、胃反酸灼痛、慢性胃炎、胃溃疡、饮酒应酬多的人群。
 - id: manual_qa-0077
   query: 孕妇、哺乳期妇女能吃吗？
@@ -4818,6 +4870,10 @@ cases:
   - document: 产品说明书：益舒.docx
     anchor: 如果中药中含有金银花、黄连、黄芩等广谱抗菌成分，间隔时间可延长至1-2小时
     page: null
+  - document: 产品说明书：益舒.pdf
+    anchor: 益舒能和治疗胃病的西药（如PPI、铋剂）、中成药⼀起吃吗？ 答：可以。建议间隔30分钟以上服⽤
+    page: null
+    via: pool-judge
   answer: 可以。建议间隔30分钟以上服用，以避免药物对益生菌活性的潜在影响；如果中药中含有金银花、黄连、黄芩等广谱抗菌成分，间隔时间可延长至1-2小时。与抗生素需间隔2小时以上
 - id: manual_qa-0085
   query: 正在根除Hp（吃四联疗法），能吃益舒吗？
@@ -4874,6 +4930,10 @@ cases:
   - document: 产品说明书 ：清风（尿酸管理）.docx
     anchor: 因为每个人身体状况不同，而且尿酸波动的情况、原因、程度都有差异，所以每个人刚开始
     page: null
+  - document: 华大营养益生菌FAQ-2026.xlsx
+    anchor: 根据以往用户反馈数据显示，需要坚持至少一个月可见一定降酸效果。
+    page: null
+    via: pool-judge
   answer: 因为每个人身体状况不同，而且尿酸波动的情况、原因、程度都有差异，所以每个人刚开始吃清风益生菌的感受和改善程度会不同，适合当做“控尿酸帮手”，但不能当做“药物”。根据人群实验调研的情况，食用1个月尿酸就有明显下降。
 - id: manual_qa-0090
   query: 清风适合什么人吃？孕妇乳母可以吃吗？
@@ -5328,6 +5388,10 @@ cases:
     anchor: （专利号：ZL202011248842.0）
     page: null
     via: pool-judge
+  - document: 益畅产品课件.pdf
+    anchor: 鼠李糖乳酪杆菌OF44 专利号：ZL202011248842.0
+    page: null
+    via: pool-judge
   answer: ZL202011248842.0
 - id: hard_exact-0002
   query: 植物乳植杆菌BGI-N6的专利申请号？
@@ -5427,6 +5491,10 @@ cases:
     anchor: 一种抗糖化的槐米粉及其制备方法和应用
     page: null
     via: pool-judge
+  - document: 益休产品课件.pdf
+    anchor: ZL202211480228.6
+    page: null
+    via: pool-judge
   answer: ZL202211480228.6
 - id: hard_exact-0006
   query: 副干酪乳酪杆菌BGI-N2的专利申请号？
@@ -5446,6 +5514,10 @@ cases:
     anchor: 副干酪乳酪杆菌BGI-N2 申请号：202311404362.2
     page: null
     via: pool-judge
+  - document: 优美达益家人产品介绍2026.pdf
+    anchor: （专利申请号：202311404362.2）
+    page: null
+    via: pool-judge
   answer: '2023114043622'
 - id: hard_exact-0007
   query: 戊糖片球菌BGI-N8的专利申请号是多少？
@@ -5457,6 +5529,14 @@ cases:
   - document: 产品说明书：玖伴益生菌（解酒）.docx
     anchor: 戊糖片球菌BGI-N8  专利申请号：2024105902551
     page: null
+  - document: 镜脂轻专利-戊糖片球菌BGI-N8 2024105902551-专利申请受理通知书(1).pdf
+    anchor: 申请号：2024105902551 申请日：2024 年05 月13 日 申请人：华大精准营养（深圳）科技有限公司
+    page: null
+    via: pool-judge
+  - document: 镜脂轻专利-戊糖片球菌BGI-N8 2024105902551-专利申请受理通知书(1).pdf
+    anchor: 申请号：202410590255.1
+    page: null
+    via: pool-judge
   answer: '2024105902551'
 - id: hard_exact-0008
   query: 青春双歧杆菌95的专利号？
@@ -5488,6 +5568,10 @@ cases:
     anchor: ü 专利可证青春95具有优异的产γ-氨 基丁酸GABA的能力
     page: null
     via: pool-judge
+  - document: 畅青专利-青春双歧杆菌95 ZL202010520225.5.pdf
+    anchor: 专 利 号：ZL 2020 1 0520225.5
+    page: null
+    via: pool-judge
   answer: ZL202010520225.5
 - id: hard_exact-0009
   query: ZL202011248842.0是哪个菌株的专利？
@@ -5504,6 +5588,26 @@ cases:
     page: null
   - document: 产品说明书 ：清风（尿酸管理）.docx
     anchor: 清风专利-鼠李糖乳杆菌OF44 ZL202011248842.0.pdf
+    page: null
+    via: pool-judge
+  - document: 产品说明书：玖伴益生菌（解酒）.docx
+    anchor: 鼠李糖乳酪杆菌OF44  专利号：ZL2020 1 1248842.0
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.docx
+    anchor: 专利号：ZL 2020 1 1248842.0
+    page: null
+    via: pool-judge
+  - document: 产品说明书 ：清风（尿酸管理）.docx
+    anchor: 专利号：ZL 2020 1 1248842.0
+    page: null
+    via: pool-judge
+  - document: 产品说明书：密蜜（女性闺蜜菌） V2.docx
+    anchor: 专利号：ZL2020 1 1248842.0
+    page: null
+    via: pool-judge
+  - document: 产品说明书：益舒.pdf
+    anchor: ZL202011248842.0
     page: null
     via: pool-judge
   answer: 鼠李糖乳酪杆菌OF44
@@ -5581,6 +5685,10 @@ cases:
     via: pool-judge
   - document: 华大营养产品知识库.xlsx
     anchor: 5株专利菌株（植物乳植杆菌BGI-N6、鼠李糖乳酪杆菌OF44、动物双歧杆菌乳亚种BGI-N3、格氏乳杆菌TF08-1、戊糖片球菌BGI-N8）
+    page: null
+    via: pool-judge
+  - document: 产品说明书：镜脂轻（体重管理）.docx
+    anchor: 6株核心“减负菌”（格氏乳杆菌TF08-1、动物双歧杆菌乳亚种BGI-N3、乳酸片球菌BGI-N9、戊糖片球菌BGI-N8、植物乳植杆菌BGI-N6、鼠李糖乳酪杆菌OF44）
     page: null
     via: pool-judge
   answer: null

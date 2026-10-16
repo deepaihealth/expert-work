@@ -7,6 +7,11 @@ autovacuum)时,规划器把「范围内分段数 / 各词命中数」两个单�
 
 另一个同源问题:idf 权重若被提升进逐行表达式,每个命中行都会重算全部 ``ln(...)``。
 
+第三个(10-15 PR2b 审查实测):asyncpg 缓存预编译语句,同一形状的语句在一条连接上跑到第 6 次,
+Postgres 可能改用通用计划,各词的 ``plainto_tsquery`` 不再折叠成常量、每个命中行重算一遍
+(4 万段上短问句 38 → 130 毫秒,40 词问句 156 → 885 毫秒)。关键词检索在自己的事务里把
+``plan_cache_mode`` 定为 ``force_custom_plan``。
+
 本地跑前: export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock
 """
 
@@ -89,6 +94,7 @@ async def _seed(store: SqlKnowledgeStore, chunks: int) -> tuple[UUID, UUID]:
                 document_id=document.id,
                 chunk_index=index,
                 content=f"{words[index % len(words)]} 第{index}条",
+                doc_title="水果手册" if index % 2 else None,
                 embedding=(1.0,) + (0.0,) * (EMBEDDING_DIM - 1),
             )
             for index in range(chunks)
@@ -148,3 +154,37 @@ async def test_per_query_parts_run_once_without_statistics(plan_db: PlanFixture)
         if node["Actual Rows"] * node["Actual Loops"] > 1
     ]
     assert not [output for output in per_row if "ln(" in output or "numeric" in output]
+
+
+async def test_keyword_search_always_plans_for_its_own_parameters(plan_db: PlanFixture) -> None:
+    """The keyword SELECT runs with ``plan_cache_mode = force_custom_plan`` in
+    its transaction — whatever number of times the prepared statement has run
+    on this connection — and the setting does not leak into the pool."""
+    store, engine = plan_db
+    tenant, kb_id = await _seed(store, 50)
+    seen: list[str] = []
+
+    def _probe(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
+        if "ts_rank" not in statement:
+            return
+        probe = conn.connection.cursor()
+        try:
+            probe.execute("SELECT current_setting('plan_cache_mode')")
+            row = probe.fetchone()
+        finally:
+            probe.close()
+        assert row is not None
+        seen.append(row[0])
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _probe)
+    try:
+        for _ in range(7):
+            await store.keyword_search_scored(
+                tenant_id=tenant, kb_ids=[kb_id], query="苹果和香蕉", limit=5
+            )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _probe)
+    assert seen == ["force_custom_plan"] * 7
+    async with engine.connect() as conn:
+        mode = (await conn.execute(text("SELECT current_setting('plan_cache_mode')"))).scalar_one()
+    assert mode == "auto"

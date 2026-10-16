@@ -1194,6 +1194,14 @@ class ResolvingReranker:
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
     ) -> list[int]:
+        ranked = await self.rerank_scored(
+            query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+        )
+        return [index for index, _score in ranked]
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
         if not documents:
             return []
         # 一期 Task 1 —— 同 ResolvingEmbedder.embed:凭据解析计时挂到调用方的
@@ -1210,7 +1218,7 @@ class ResolvingReranker:
                 self.provider,
                 tenant_id,
             )
-            return list(range(len(documents)))[:top_k]
+            return [(index, None) for index in range(min(len(documents), top_k))]
         t1 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
@@ -1221,7 +1229,7 @@ class ResolvingReranker:
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=self.model
-            ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
+            ).rerank_scored(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
         model_spec = ModelSpec.model_validate(
             {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
         )
@@ -1234,9 +1242,10 @@ class ResolvingReranker:
             rate_limiter_factory=self.rate_limiter_factory,
         )
         caller = _metered_rerank(router, self.provider, self.model)
-        return await LLMReranker(llm_caller=caller).rerank(
+        order = await LLMReranker(llm_caller=caller).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
+        return [(index, None) for index in order]
 
 
 @dataclass(frozen=True)
@@ -1314,9 +1323,17 @@ class DynamicResolvingReranker:
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
     ) -> list[int]:
+        ranked = await self.rerank_scored(
+            query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+        )
+        return [index for index, _score in ranked]
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
         if not documents:
             return []
-        # 一期 Task 1 —— 同 ResolvingReranker.rerank,但这条路径每次调用还多
+        # 一期 Task 1 —— 同 ResolvingReranker.rerank_scored,但这条路径每次调用还多
         # 一次 DB 读(平台配置)。config_ms/resolve_ms 挂到调用方的
         # ``memory.rerank`` span 上;secret_ms 只在 DashScope 分支打(LLM 分支
         # 走 build_llm_router)。三条早退路径(无 documents/cfg 未配置/无凭据)
@@ -1325,7 +1342,7 @@ class DynamicResolvingReranker:
         cfg = await self.config_service.effective_rerank_config()
         t1 = time.monotonic()
         if cfg is None:
-            return list(range(len(documents)))[:top_k]
+            return [(index, None) for index in range(min(len(documents), top_k))]
         provider, model = cfg
         try:
             secret_ref = await self.resolver.resolve_provider(
@@ -1337,7 +1354,7 @@ class DynamicResolvingReranker:
                 provider,
                 tenant_id,
             )
-            return list(range(len(documents)))[:top_k]
+            return [(index, None) for index in range(min(len(documents), top_k))]
         t2 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
@@ -1349,7 +1366,7 @@ class DynamicResolvingReranker:
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=model
-            ).rerank(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
+            ).rerank_scored(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
         model_spec = ModelSpec.model_validate(
             {"provider": provider, "name": model, "api_key_ref": secret_ref}
         )
@@ -1362,9 +1379,10 @@ class DynamicResolvingReranker:
             rate_limiter_factory=self.rate_limiter_factory,
         )
         caller = _metered_rerank(router, provider, model)
-        return await LLMReranker(llm_caller=caller).rerank(
+        order = await LLMReranker(llm_caller=caller).rerank(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
+        return [(index, None) for index in order]
 
 
 async def resolve_embedder(

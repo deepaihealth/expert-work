@@ -222,6 +222,10 @@ class KnowledgeChunkRow(Base):
     #: ``none_as_null`` — Python ``None`` must be SQL NULL, not a JSON ``null``
     #: scalar (array functions on a scalar raise; see migration 0165).
     heading_path: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    #: The document's title at ingest (migration ``0167``) — prefixed to the
+    #: retrieval text and indexed apart (weight A) in ``content_tsv``.
+    #: ``NULL`` for chunks ingested before it was stored.
+    doc_title: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_locator: Mapped[list[dict[str, Any]] | None] = mapped_column(
         JSONB(none_as_null=True), nullable=True
     )

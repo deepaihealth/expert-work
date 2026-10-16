@@ -64,6 +64,40 @@ async def test_reranker_drops_out_of_range_indices() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reranker_scored_pairs_each_index_with_its_relevance() -> None:
+    class _Client:
+        async def rerank(self, **_: Any) -> Mapping[str, Any]:
+            return {
+                "output": {
+                    "results": [
+                        {"index": 2, "relevance_score": 0.9},
+                        {"index": 0, "relevance_score": 1},
+                        {"index": 1},
+                        {"index": 3, "relevance_score": True},
+                    ]
+                }
+            }
+
+    out = await DashScopeReranker(client=_Client(), model="m").rerank_scored(
+        query="q", documents=["a", "b", "c", "d"], top_k=4, tenant_id=uuid4()
+    )
+    # A missing or non-numeric score is None, not a guess.
+    assert out == [(2, 0.9), (0, 1.0), (1, None), (3, None)]
+
+
+@pytest.mark.asyncio
+async def test_reranker_scored_degrades_to_input_order_without_scores() -> None:
+    class _Client:
+        async def rerank(self, **_: Any) -> Mapping[str, Any]:
+            return {"unexpected": "shape"}
+
+    out = await DashScopeReranker(client=_Client(), model="m").rerank_scored(
+        query="q", documents=["a", "b", "c"], top_k=2, tenant_id=uuid4()
+    )
+    assert out == [(0, None), (1, None)]
+
+
+@pytest.mark.asyncio
 async def test_http_client_posts_native_rerank_shape() -> None:
     seen: dict[str, Any] = {}
 
