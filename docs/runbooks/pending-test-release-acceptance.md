@@ -292,3 +292,10 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 - [x] **26.1 正常对话不受影响**:发测试后金丝雀 `RESULT: PASS`;调试台用任一思考模型的 Agent 发一条需要先想再答的问题。判据:正常回答,run 状态成功。**没修好时**:不适用(防回归:改动只在停顿超时分支,正常收尾不经过它)。 **10-16 测试 `93c8a246` 过**:发布金丝雀 `RESULT: PASS`;思考模型 `deepseek-flash`(eval-ssb)真跑一道表格题,run `success` / `text_response`,每轮都带思考、末轮 `finish_reason = stop`,47.8 s;smoke 新增的沙箱镜像缓存检查 OK。
 - [ ] **26.2 发生了就可见**:发测试一周后只读查 `SELECT status, created_at FROM agent_run WHERE error LIKE '%还没给出回答就中断了%'`,并在两个控制面 pod 日志里 `grep agent_node.stalled_without_answer`。判据:查到的 run 状态都是 `error`;同期不再有「状态成功、最后一轮只有思考、因停顿超时结束」的 run(`run_event` 里 `event_name = 'updates'` 且 `data::text LIKE '%stream_idle_timeout%'` 的帧,逐条看都带回答文字或工具调用)。一周内一次都没发生也算过(写明 0 次)。**没修好时**:停顿只有思考的 run 状态成功、回复为空。**分辨修没修好靠自动测试**(10-16 逐条变异验过):`test_react_graph.py::test_stall_after_reasoning_only_fails_the_run_visibly`(真路由 + 真图走 `run_agent`)撤掉主循环的判定 → 0 条错误帧、红;`test_stall_without_answer_is_metered_but_not_cached` 去掉记账 → 用量 0 行、红;`test_llm_stall.py::test_planner_still_falls_back_to_a_single_step_plan_on_a_stall` 把判定挪回路由直接报错 → 规划跟着报错、红。
+
+## §28 发版构建走阿里云 PyPI 镜像(B-190)
+
+**背景**:只影响 `tools/deploy/build-push.sh`(`release.sh` 第 1 步)构建的 control-plane 与 credential-proxy 两个镜像:下载 Python 包改走 `mirrors.aliyun.com`,装进镜像的包与改前逐个相同。CI、compose、本地 `docker build` 不传参数,照旧走官方源。admin-ui 不受影响。
+
+- [ ] **28.1 发版构建成功,依赖下载变快**:下一次 `tools/deploy/release.sh test …`,看两个镜像 `uv sync` 那一步的输出。判据:① 两个镜像都构建成功,没有 `uv.lock still has files.pythonhosted.org URLs` 报错;② 记下输出里 `Prepared N packages in X s` 的 X(10-17 本机实测:control-plane 约 11 s、credential-proxy 约 4 s;走官方源时分别约 25 s / 16 s,10-16 官方源慢时要几十分钟)。**没修好时**:构建参数没传进去时构建照样成功,只能从耗时看出来;构建输出不打印下载地址,地址是否走镜像已在 PR 里用带 `-v` 的副本逐条核过(两个镜像的锁内文件全部走 `mirrors.aliyun.com`)。
+- [ ] **28.2 退回开关可用(只在镜像出问题时做)**:镜像没同步到刚升级的版本、构建报 404 时,用 `EXPERT_WORK_PYPI_MIRROR= tools/deploy/release.sh …` 重发。判据:构建成功。平时不需要做,发生过就在这里记一笔。
