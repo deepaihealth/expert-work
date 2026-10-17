@@ -80,10 +80,11 @@ _READONLY_NOTE = (
 
 #: BUG-10 终审 F2 — pre-方案-a workspaces carry root-level PLAN.md/TODO.md/
 #: MEMORY.md whose embedded note still claims edits are ingested; that stopped
-#: being true the moment projection moved under ``threads/``. Overwrite them
-#: once (first thread-scoped projection) with this redirect so neither a human
-#: editor nor the agent's own ``read_file`` keeps consuming stale cross-thread
-#: state.
+#: being true the moment projection moved under ``threads/``. Once (first
+#: thread-scoped projection) their header line is replaced with this redirect
+#: (B-188: only the header — anything below it is kept) so neither a human
+#: editor nor the agent's own ``read_file`` takes the stale cross-thread state
+#: for live state.
 LEGACY_REDIRECT_NOTE = (
     "<!-- Moved: this workspace's plan/state files now live under "
     "threads/<thread_id>/ (one directory per conversation). This root file "
@@ -92,14 +93,26 @@ LEGACY_REDIRECT_NOTE = (
 )
 
 #: B-188 — how to recognise a legacy root projection: line 1 is the header its
-#: renderer wrote (the same text from CM-0 PR2b-i until 方案 a moved projection
-#: under ``threads/`` — if these notes ever change, pin the old text here).
-#: Only such a file is ours to redirect; anything else at the root — a user's
-#: own PLAN.md, an uploaded MEMORY.md, a file that isn't there — is left alone.
+#: renderer wrote. These are the literal texts root projection wrote from CM-0
+#: PR2b-i (#492) until 方案 a (#1268) moved projection under ``threads/`` —
+#: copied verbatim from git history, deliberately NOT the live ``_PLAN_NOTE`` /
+#: ``_READONLY_NOTE`` (editing those must not silently retire the repair). Only
+#: such a file is ours to redirect; anything else at the root — a user's own
+#: PLAN.md, an uploaded MEMORY.md, a file that isn't there — is left alone.
+_LEGACY_PLAN_HEADER = (
+    "<!-- Edit this file to steer the agent: change the goal, add/remove/"
+    "reorder steps, or flip a checkbox ([ ] todo / [~] in progress / [x] "
+    "done). Changes are ingested at the next run start; the database stays "
+    "the source of truth. -->"
+)
+_LEGACY_READONLY_HEADER = (
+    "<!-- Read-only projection (the database is the source of truth). Edits "
+    "here are NOT ingested — edit PLAN.md to steer the agent. -->"
+)
 _LEGACY_ROOT_HEADERS: dict[str, str] = {
-    PLAN_FILE: _PLAN_NOTE,
-    TODO_FILE: _READONLY_NOTE,
-    MEMORY_FILE: _READONLY_NOTE,
+    PLAN_FILE: _LEGACY_PLAN_HEADER,
+    TODO_FILE: _LEGACY_READONLY_HEADER,
+    MEMORY_FILE: _LEGACY_READONLY_HEADER,
 }
 
 #: Status ↔ checkbox marker. PLAN.md round-trips through these (render ↔ parse).
@@ -288,7 +301,7 @@ class WorkspaceProjector:
             return ProjectionResult(written=(), skipped=True, digest=digest)
 
         # 终审 F2 — on the thread's FIRST projection (no cursor yet), also
-        # overwrite the legacy root files with the redirect note. Deliberately
+        # redirect the legacy root files (header line → redirect note). Deliberately
         # OUTSIDE the digest (a one-shot repair, not projected state — putting
         # it in the digest would make turn 2's digest never match turn 1's)
         # and fully best-effort: a failure here neither blocks the thread
@@ -332,9 +345,11 @@ class WorkspaceProjector:
         )
 
     async def _legacy_root_repairs(self) -> list[tuple[str, str]]:
-        """B-188 — the ``(root file, redirect)`` writes for root files that
-        still open with their legacy projection header. Absent, foreign or
-        unreadable → no write (best-effort: a read failure is logged and the
+        """B-188 — the ``(root file, new content)`` writes for root files that
+        still open with their legacy projection header: that header line is
+        replaced with :data:`LEGACY_REDIRECT_NOTE`, everything below it is kept
+        (a human may have written there). Absent, foreign, already redirected
+        or unreadable → no write (best-effort: a read failure is logged and the
         file left alone; never creates a root file)."""
         repairs: list[tuple[str, str]] = []
         for name, header in _LEGACY_ROOT_HEADERS.items():
@@ -346,7 +361,8 @@ class WorkspaceProjector:
                 )
                 continue
             if text is not None and text.startswith(header):
-                repairs.append((name, LEGACY_REDIRECT_NOTE))
+                rest = text[len(header) :].removeprefix("\n")
+                repairs.append((name, LEGACY_REDIRECT_NOTE + rest))
         return repairs
 
 
