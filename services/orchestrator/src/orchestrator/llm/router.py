@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -246,14 +246,67 @@ def _stream(
     )
 
 
-def _provider_assembler(provider: object) -> Any:
-    """The innermost provider's stream assembler (unwraps ``.inner``)."""
+def _innermost(provider: object) -> Any:
+    """The adapter under any ``.inner`` wrapper layers (e.g. ``RateLimitedProvider``)."""
     p: Any = provider
     seen: set[int] = set()
     while hasattr(p, "inner") and id(p) not in seen:
         seen.add(id(p))
         p = p.inner
-    return p.new_stream_assembler()
+    return p
+
+
+def _provider_assembler(provider: object) -> Any:
+    """The innermost provider's stream assembler (unwraps ``.inner``)."""
+    return _innermost(provider).new_stream_assembler()
+
+
+def _flatten_params(fields: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Nested wire objects → dotted keys (``thinking.type``): Langfuse model
+    parameters take scalar values only (the SDK's ``MapValue``)."""
+    flat: dict[str, Any] = {}
+    for key, value in fields.items():
+        if isinstance(value, Mapping):
+            flat.update(_flatten_params(value, f"{prefix}{key}."))
+        else:
+            flat[f"{prefix}{key}"] = value
+    return flat
+
+
+def _streams(provider: object, output_schema: StructuredOutputSpec | None) -> bool:
+    """Whether one attempt streams — see :meth:`LLMRouter._invoke_provider`."""
+    return output_schema is None and supports_streaming(provider)
+
+
+def _served_request_fields(provider: object, *, structured: bool, stream: bool) -> dict[str, Any]:
+    """B-187 — ``model`` + ``model_parameters`` for this handle's Langfuse generation.
+
+    Read off the innermost adapter: it is built per model entry with every
+    platform rewrite already applied (catalog-fixed temperature, sampling
+    params dropped, vendor effort mapping, output-cap field, Anthropic's
+    default ``max_tokens``), so a fallback handle — or the CM-9 escalated
+    router, which shares the primary's handle keys — records its own values,
+    not the primary manifest's. ``{}`` for adapters without
+    ``request_params`` (test doubles), leaving the payload unchanged.
+
+    Observability only: a failure here is logged and yields ``{}`` — it must
+    never fail the call or skip fallback (same stance as
+    ``langfuse.start_span_failed``).
+    """
+    try:
+        adapter = _innermost(provider)
+        request_params = getattr(adapter, "request_params", None)
+        if request_params is None:
+            return {}
+        return {
+            "model": str(adapter.model),
+            "model_parameters": _flatten_params(
+                request_params(structured=structured, stream=stream)
+            ),
+        }
+    except Exception:
+        logger.warning("llm_router.request_params_failed", exc_info=True)
+        return {}
 
 
 def _llm_response_payload(response: AIMessage) -> dict[str, Any]:
@@ -571,6 +624,13 @@ class LLMRouter:
             "provider_key": handle.key,
             "messages": list(messages),
             "tools": list(tools),
+            # B-187 — read by the Langfuse middleware: the model this handle
+            # calls and the request parameters it actually sends.
+            **_served_request_fields(
+                handle.provider,
+                structured=output_schema is not None,
+                stream=_streams(handle.provider, output_schema),
+            ),
         }
         if output_schema is not None:
             # RT-1 — informational for observability middlewares; absent
@@ -622,7 +682,7 @@ class LLMRouter:
         Anthropic's tool-call structured path needs post-processing the
         streaming assembler cannot replicate.
         """
-        if output_schema is None and supports_streaming(handle.provider):
+        if _streams(handle.provider, output_schema):
             return await self._drive_stream(
                 handle,
                 _stream(handle.provider, messages=messages, tools=tools, output_schema=None),

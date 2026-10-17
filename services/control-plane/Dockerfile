@@ -46,11 +46,32 @@ COPY services/ services/
 #
 # 判据是「单连接好、并发坏」:同一时刻在容器里单独拉那个报错的 wheel
 # (certifi)3.1 秒就完整下来了,所以不是连不上、不是 DNS、也不是墙。
-# 换 PyPI 镜像源治不了这个 —— uv.lock 把每个 wheel 的完整 URL 和哈希都
-# 钉死了,`--frozen` 直接照那个 URL 拉,index 配置在下载阶段根本不参与。
+#
+# 发版构建走阿里云 PyPI 镜像(PYPI_MIRROR,tools/deploy/build-push.sh 默认传
+# https://mirrors.aliyun.com/pypi/):2026-10-16 发版时 files.pythonhosted.org
+# 只有 ~65 KB/s,多花近一小时。光改 index 没用 —— uv.lock 把每个文件的完整
+# URL 和哈希都钉死了,`--frozen` 直接照锁里的 URL 拉,index 只管锁外临时解析的
+# 构建依赖(hatchling / setuptools)。uv 0.9.30 实测:设了阿里云 index,锁里的
+# 包仍然全部走 files.pythonhosted.org;上游的 proxy index 还没发布
+# (astral-sh/uv#6349、#20790)。所以这一层只改镜像里这份锁文件副本的 URL 前缀
+# (仓库里的 uv.lock 不动):镜像的 packages/ 路径与官方逐字相同,哈希仍按锁校验,
+# 镜像给错文件只会让构建失败;改完还剩官方 URL 也直接失败,不悄悄回落。
+# PYPI_MIRROR 为空(CI、compose、本地 docker build)= 照旧直连 pypi.org。
+#
+# 镜像同步滞后时刚升级的版本可能 404 —— `EXPERT_WORK_PYPI_MIRROR= tools/deploy/
+# release.sh …` 退回 pypi.org 重发。
 ENV UV_CONCURRENT_DOWNLOADS=8 \
     UV_HTTP_TIMEOUT=120
-RUN uv sync --frozen --no-dev --no-editable --package expert-work-control-plane
+ARG PYPI_MIRROR=""
+RUN if [ -n "${PYPI_MIRROR}" ]; then \
+        mirror="${PYPI_MIRROR%/}/" \
+        && sed -i "s|https://files.pythonhosted.org/|${mirror}|g" uv.lock \
+        && if grep -q 'files.pythonhosted.org' uv.lock; then \
+            echo "uv.lock still has files.pythonhosted.org URLs after the PYPI_MIRROR rewrite" >&2; exit 1; \
+        fi \
+        && export UV_DEFAULT_INDEX="${mirror}simple/"; \
+    fi \
+    && uv sync --frozen --no-dev --no-editable --package expert-work-control-plane
 
 # B-106 —— 分词表构建期打进镜像。tiktoken 第一次 get_encoding 时同步去
 # openaipublic.blob.core.windows.net 下 BPE 文件(o200k_base 3.6MB),从

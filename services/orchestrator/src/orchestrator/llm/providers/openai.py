@@ -502,6 +502,21 @@ class OpenAIProvider:
     #: the application tier for its remaining lifetime (restart retries).
     _allowed_tools_disabled: bool = field(default=False, init=False, repr=False)
 
+    def request_params(self, *, structured: bool, stream: bool) -> dict[str, Any]:
+        """B-187 — the request fields one call sends beyond the structural ones
+        (model / messages / tools / tool_choice / response_format / stream
+        options), as on the wire (an omitted field is absent): what the
+        Langfuse generation records as its model parameters. Same sources and
+        merge order as :meth:`_prepare_request` + :func:`_build_request_body`,
+        plus :attr:`stream_extra_body` (glm ``tool_stream``) when the call
+        streams (:meth:`_apply_stream_extra_body`); a structured call sends
+        the same fields otherwise."""
+        del structured
+        sampling = {} if self.temperature is None else {"temperature": self.temperature}
+        extra = _merge_extra(self.thinking_payload, self.output_cap_payload) or {}
+        streamed = (self.stream_extra_body or {}) if stream else {}
+        return {**sampling, **extra, **streamed}
+
     async def _prepare_request(
         self,
         *,
