@@ -502,6 +502,17 @@ class OpenAIProvider:
     #: the application tier for its remaining lifetime (restart retries).
     _allowed_tools_disabled: bool = field(default=False, init=False, repr=False)
 
+    def request_params(self, *, structured: bool) -> dict[str, Any]:
+        """B-187 — the sampling / output-cap / thinking fields one request
+        sends, as on the wire (an omitted field is absent): what the Langfuse
+        generation records as its model parameters. Same sources and merge
+        order as :meth:`_prepare_request` + :func:`_build_request_body`;
+        a structured call sends the same ones. The stream-only
+        ``stream_extra_body`` (glm ``tool_stream``) is not a model parameter."""
+        del structured
+        sampling = {} if self.temperature is None else {"temperature": self.temperature}
+        return {**sampling, **(_merge_extra(self.thinking_payload, self.output_cap_payload) or {})}
+
     async def _prepare_request(
         self,
         *,

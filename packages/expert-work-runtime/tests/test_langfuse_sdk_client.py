@@ -7,6 +7,7 @@ degrade-to-recording behaviour.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from collections.abc import Sequence
@@ -16,6 +17,7 @@ from typing import Any
 import pytest
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from prometheus_client import REGISTRY
 
 from expert_work.runtime.middleware import (
@@ -120,6 +122,38 @@ def test_adapter_runs_against_a_real_langfuse_instance() -> None:
     span.end()
 
 
+def test_model_parameters_land_on_the_langfuse_model_parameters_attribute() -> None:
+    """B-187 — through the installed SDK, export captured in memory: the
+    request parameters ride ``langfuse.observation.model.parameters`` (the
+    SDK's ``LangfuseOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS``), which
+    Langfuse shows as the generation's model parameters."""
+    from langfuse import Langfuse
+
+    exporter = InMemorySpanExporter()
+    sdk = Langfuse(
+        public_key="pk-lf-b187-contract-test",
+        secret_key="sk-lf-b187-contract-test",
+        host="http://127.0.0.1:9",
+        # Own provider: the SDK must not install itself as the global one.
+        tracer_provider=TracerProvider(),
+        span_exporter=exporter,
+    )
+    params = {"temperature": 1.0, "max_tokens": 4096, "thinking.type": "enabled"}
+    try:
+        span = LangfuseSdkClient(sdk).start_span(
+            name="llm_call", input="x", metadata={"model": "kimi-k3"}, model_parameters=params
+        )
+        span.end()
+        sdk.flush()
+    finally:
+        sdk.shutdown()
+
+    [exported] = exporter.get_finished_spans()
+    attributes = exported.attributes or {}
+    assert json.loads(str(attributes["langfuse.observation.model.parameters"])) == params
+    assert attributes["langfuse.observation.model.name"] == "kimi-k3"
+
+
 # ---------------------------------------------------------------------------
 # Adapter mapping
 # ---------------------------------------------------------------------------
@@ -143,10 +177,18 @@ def test_start_span_maps_to_generation_with_model() -> None:
             "input": [{"role": "user", "content": "hi"}],
             "metadata": {"model": "qwen-max", "tenant_id": "t-1", "run_id": "r-1"},
             "model": "qwen-max",
+            "model_parameters": None,
         }
     ]
     span.end()
     assert sdk.created[0].ended is True
+
+
+def test_start_span_passes_model_parameters() -> None:
+    sdk = _FakeSdk()
+    params = {"temperature": 0.2, "reasoning_effort": "high"}
+    LangfuseSdkClient(sdk).start_span(name="n", input=None, model_parameters=params)
+    assert sdk.generations[0]["model_parameters"] == params
 
 
 def test_start_span_without_model_passes_none() -> None:

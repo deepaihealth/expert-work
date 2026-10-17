@@ -60,6 +60,7 @@ class _FailingClient:
         name: str,
         input: Any,
         metadata: Mapping[str, Any] | None = None,
+        model_parameters: Mapping[str, Any] | None = None,
     ) -> LangfuseSpan:
         if self.raise_on_start:
             raise RuntimeError("start_span blew up")
@@ -109,6 +110,23 @@ async def test_records_input_metadata_and_completion() -> None:
     assert span.usage == {"input_tokens": 12, "output_tokens": 6}
     assert span.error is None
     assert span.ended is True
+
+
+@pytest.mark.asyncio
+async def test_model_parameters_recorded_on_the_span() -> None:
+    """B-187 — the request parameters the router says were sent reach the span."""
+    client = RecordingLangfuseClient()
+    params = {"temperature": 1.0, "reasoning_effort": "high", "thinking.type": "enabled"}
+    ctx = MiddlewareContext(payload={"model": "kimi-k3", "model_parameters": params})
+    await LangfuseMiddleware(client=client)(ctx, _ok_terminal)
+    assert client.spans[0].model_parameters == params
+
+
+@pytest.mark.asyncio
+async def test_no_model_parameters_records_none() -> None:
+    client = RecordingLangfuseClient()
+    await LangfuseMiddleware(client=client)(MiddlewareContext(payload={}), _ok_terminal)
+    assert client.spans[0].model_parameters is None
 
 
 @pytest.mark.asyncio

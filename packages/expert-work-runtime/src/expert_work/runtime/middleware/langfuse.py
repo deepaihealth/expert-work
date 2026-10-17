@@ -20,6 +20,9 @@ Conventions read from ``ctx.payload``:
 
 - ``messages`` — input to the LLM (recorded as span ``input``)
 - ``model`` — model identifier (span metadata)
+- ``model_parameters`` — B-187: the request parameters actually sent
+  (temperature / output cap / thinking fields, flat ``{str: scalar}``),
+  recorded as the generation's model parameters
 - ``tenant_id`` — for grouping in Langfuse UI
 - ``agent_name`` — span ``name`` (falls back to ``"llm_call"``)
 - ``trace_id`` — optional W3C ``trace_id`` for cross-system correlation
@@ -106,6 +109,7 @@ class LangfuseClient(Protocol):
         name: str,
         input: Any,
         metadata: Mapping[str, Any] | None = None,
+        model_parameters: Mapping[str, Any] | None = None,
     ) -> LangfuseSpan:
         """Start a span and return its handle. Must not block."""
 
@@ -126,6 +130,7 @@ class RecordedSpan:
     usage: Mapping[str, int] | None = None
     error: str | None = None
     ended: bool = False
+    model_parameters: Mapping[str, Any] | None = None
 
     def record_output(self, output: Any) -> None:
         self.output = output
@@ -157,8 +162,14 @@ class RecordingLangfuseClient:
         name: str,
         input: Any,
         metadata: Mapping[str, Any] | None = None,
+        model_parameters: Mapping[str, Any] | None = None,
     ) -> LangfuseSpan:
-        span = RecordedSpan(name=name, input=input, metadata=dict(metadata or {}))
+        span = RecordedSpan(
+            name=name,
+            input=input,
+            metadata=dict(metadata or {}),
+            model_parameters=None if model_parameters is None else dict(model_parameters),
+        )
         self.spans.append(span)
         return span
 
@@ -209,10 +220,14 @@ class LangfuseMiddleware:
             for key in ("model", "tenant_id", "trace_id", "session_id", "run_id"):
                 if key in ctx.payload:
                     metadata[key] = ctx.payload[key]
+            model_parameters = ctx.payload.get("model_parameters")
             return self.client.start_span(
                 name=str(ctx.payload.get("agent_name", "llm_call")),
                 input=ctx.payload.get("messages"),
                 metadata=metadata,
+                model_parameters=(
+                    dict(model_parameters) if isinstance(model_parameters, Mapping) else None
+                ),
             )
         except Exception:
             logger.warning("langfuse.start_span_failed", exc_info=True)

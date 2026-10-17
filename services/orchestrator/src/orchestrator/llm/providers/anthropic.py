@@ -566,6 +566,38 @@ class AnthropicProvider:
     #: A restart retries the native tier.
     _native_search_disabled: bool = field(default=False, init=False, repr=False)
 
+    def _compute_controls(
+        self, *, structured: bool
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The ``(thinking, output_config)`` pair one request sends (``None`` = omitted)."""
+        if structured:
+            # Stream RT-1 — the API rejects a forced ``tool_choice`` when
+            # (extended/adaptive) thinking is active, and 4.6+ models may
+            # think by default when the field is omitted. Pin thinking off
+            # for structured calls; effort is moot once disabled.
+            return {"type": "disabled"}, None
+        if self.thinking_enabled is False:
+            # Stream Thinking-Toggle — explicit off; effort is moot once disabled.
+            return {"type": "disabled"}, None
+        thinking_payload = {"type": "adaptive"} if self.adaptive_thinking else None
+        output_config = {"effort": self.effort} if self.effort is not None else None
+        return thinking_payload, output_config
+
+    def request_params(self, *, structured: bool) -> dict[str, Any]:
+        """B-187 — the sampling / output-cap / thinking fields one request
+        sends, as on the wire (an omitted field is absent): what the Langfuse
+        generation records as its model parameters. Same sources as
+        :meth:`_prepare_anthropic_request` and the same None-means-omitted
+        rule as :func:`_build_messages_body`."""
+        thinking_payload, output_config = self._compute_controls(structured=structured)
+        fields = {
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "thinking": thinking_payload,
+            "output_config": output_config,
+        }
+        return {key: value for key, value in fields.items() if value is not None}
+
     async def _prepare_anthropic_request(
         self,
         *,
@@ -626,20 +658,9 @@ class AnthropicProvider:
         else:
             system_payload = system_text
 
-        if output_schema is not None:
-            # Stream RT-1 — the API rejects a forced ``tool_choice`` when
-            # (extended/adaptive) thinking is active, and 4.6+ models may
-            # think by default when the field is omitted. Pin thinking off
-            # for structured calls; effort is moot once disabled.
-            thinking_payload: dict[str, Any] | None = {"type": "disabled"}
-            output_config: dict[str, Any] | None = None
-        elif self.thinking_enabled is False:
-            # Stream Thinking-Toggle — explicit off; effort is moot once disabled.
-            thinking_payload = {"type": "disabled"}
-            output_config = None
-        else:
-            thinking_payload = {"type": "adaptive"} if self.adaptive_thinking else None
-            output_config = {"effort": self.effort} if self.effort is not None else None
+        thinking_payload, output_config = self._compute_controls(
+            structured=output_schema is not None
+        )
 
         return {
             "model": self.model,
