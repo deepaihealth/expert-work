@@ -497,6 +497,10 @@ class OpenAIProvider:
     #: OFF the non-streaming ``complete`` path (structured output) where glm may
     #: reject it. ``None`` (every other agent/provider) → request byte-identical.
     stream_extra_body: dict[str, Any] | None = None
+    #: B-195 —— 仅 DeepSeek 打开:请求带 tools 时,历史 assistant 消息的
+    #: ``reasoning_content``(``additional_kwargs`` 里存的思考内容)原样回传——
+    #: 官方文档要求带工具的请求回传全部历史思考。``False`` 时请求体逐字节不变。
+    replay_reasoning_content: bool = False
     #: Stream HX-13 (Mini-ADR HX-J4) — set after the allowed_tools
     #: constraint is rejected once: this provider instance falls back to
     #: the application tier for its remaining lifetime (restart retries).
@@ -531,7 +535,11 @@ class OpenAIProvider:
         if output_schema is not None and self.structured_output_capability != "native":
             messages = [*messages, SystemMessage(content=schema_instruction(output_schema))]
         messages = coalesce_system_messages(messages)
-        mapped = await _to_openai_messages(messages, self.image_resolver)
+        mapped = await _to_openai_messages(
+            messages,
+            self.image_resolver,
+            replay_reasoning=self.replay_reasoning_content and bool(tools),
+        )
         response_format: dict[str, Any] | None = None
         if output_schema is not None and self.structured_output_capability == "native":
             response_format = {
@@ -637,7 +645,10 @@ def _truncate(text: str) -> str:
 
 
 async def _to_openai_messages(
-    messages: Sequence[BaseMessage], resolver: ImageResolver | None
+    messages: Sequence[BaseMessage],
+    resolver: ImageResolver | None,
+    *,
+    replay_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for msg in messages:
@@ -646,7 +657,7 @@ async def _to_openai_messages(
         elif isinstance(msg, HumanMessage):
             out.append({"role": "user", "content": await _human_content(msg, resolver)})
         elif isinstance(msg, AIMessage):
-            out.append(_ai_message_to_openai(msg))
+            out.append(_ai_message_to_openai(msg, replay_reasoning=replay_reasoning))
         elif isinstance(msg, ToolMessage):
             out.append(
                 {
@@ -664,16 +675,20 @@ async def _to_openai_messages(
     return out
 
 
-def _ai_message_to_openai(msg: AIMessage) -> dict[str, Any]:
+def _ai_message_to_openai(msg: AIMessage, *, replay_reasoning: bool = False) -> dict[str, Any]:
     tool_calls = list(getattr(msg, "tool_calls", None) or [])
     text = _message_text(msg)
+    # B-195 —— 有思考内容才回传,没有的不造空串。
+    reasoning = msg.additional_kwargs.get("reasoning_content") if replay_reasoning else None
+    replayed = {"reasoning_content": reasoning} if isinstance(reasoning, str) and reasoning else {}
 
     if not tool_calls:
-        return {"role": "assistant", "content": text}
+        return {"role": "assistant", "content": text, **replayed}
 
     return {
         "role": "assistant",
         "content": text or None,
+        **replayed,
         "tool_calls": [
             {
                 "id": str(tc.get("id") or ""),

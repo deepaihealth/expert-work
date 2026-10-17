@@ -3079,6 +3079,8 @@ def _build_provider(
             thinking_payload=thinking_payload,
             output_cap_payload=output_cap_payload,
             stream_extra_body=stream_extra_body,
+            # B-195 —— DeepSeek 带工具的请求要回传历史思考内容;其它厂商不动。
+            replay_reasoning_content=provider == "deepseek",
         )
 
     if provider == "self-hosted":
