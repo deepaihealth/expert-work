@@ -330,7 +330,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 隐藏提示随 agent 那一步的 `updates` 帧落进 `run_event`(`data` 里带 `expert_work_truncation_retry` / `expert_work_empty_reply_retry` 标记);控制面日志里每次重试一行 `agent_node.output_truncated_retry` / `agent_node.empty_reply_retry`。
 
-- [ ] **31.1 正常对话不受影响**:发测试后金丝雀 `RESULT: PASS`;调试台任一 Agent 发一句话。判据:正常回答,run 状态成功。**没修好时**:不适用(防回归:改动只在截断 / 空回复的重试分支)。
+- [x] **31.1 正常对话不受影响**:发测试后金丝雀 `RESULT: PASS`;调试台任一 Agent 发一句话。判据:正常回答,run 状态成功。**没修好时**:不适用(防回归:改动只在截断 / 空回复的重试分支)。 **10-17 测试 `c28fcdae` 过**:SMOKE PASS,金丝雀 `RESULT: PASS`(5/5,run `48b5297f`);eval-hb 两轮带工具对话(32.3)都成功。
 - [ ] **31.2 连续截断后补上了(观察性)**:发测试一周后只读查哪些 run 落过截断提示、各落了几条:
   ```sql
   SELECT e.run_id, r.status, count(*) AS notices
@@ -356,7 +356,7 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 这几种 assistant 消息本来就没有思考内容,回传时照旧不带,属预期:安全拦截替换成的拒答;响应缓存命中的回复(只在温度 ≤ 0.1 且开了缓存的智能体上);由备用的 Anthropic 模型应答、或关了思考的步骤。
 
-- [ ] **32.1 发出去的请求体带思考(pod 内离线探针)**:发测试后执行下面的命令。脚本用平台自己的 `_build_provider` 建 deepseek 和 glm 两个模型适配器,HTTP 由 `httpx.MockTransport` 截住:不连外网,key 是假的,不读写库。三次请求喂的是同一段历史:先调工具,再文字回答,然后用户追问。判据:输出三行 `deepseek tools ['r1', 'r2']` / `deepseek no-tools [None, None]` / `glm tools [None, None]`。**没修好时**:第一行是 `[None, None]`。
+- [x] **32.1 发出去的请求体带思考(pod 内离线探针)**:发测试后执行下面的命令。脚本用平台自己的 `_build_provider` 建 deepseek 和 glm 两个模型适配器,HTTP 由 `httpx.MockTransport` 截住:不连外网,key 是假的,不读写库。三次请求喂的是同一段历史:先调工具,再文字回答,然后用户追问。判据:输出三行 `deepseek tools ['r1', 'r2']` / `deepseek no-tools [None, None]` / `glm tools [None, None]`。**没修好时**:第一行是 `[None, None]`。 **10-17 测试 `c28fcdae` 过**:输出 `deepseek tools ['r1', 'r2']` / `deepseek no-tools [None, None]` / `glm tools [None, None]`。
 
 ```bash
 kubectl exec deploy/control-plane -- python -c '
@@ -383,7 +383,7 @@ asyncio.run(main())
 '
 ```
 
-- [ ] **32.2 真实会话的历史里存着思考,并会被回传(读 checkpoint,只读)**:用 32.3 跑出来的那个会话,把会话 ID(thread_id)填进下面的脚本。脚本从 checkpoint 库只读取该会话最新的消息列表,然后照 32.1 的办法用假 HTTP 过一遍 deepseek 适配器。用的是 `from_conn_string`:不建表、不写库。判据:
+- [x] **32.2 真实会话的历史里存着思考,并会被回传(读 checkpoint,只读)**:用 32.3 跑出来的那个会话,把会话 ID(thread_id)填进下面的脚本。脚本从 checkpoint 库只读取该会话最新的消息列表,然后照 32.1 的办法用假 HTTP 过一遍 deepseek 适配器。用的是 `from_conn_string`:不建表、不写库。判据: **10-17 测试 `c28fcdae` 过**:32.3 的会话 `5abc63ac`:`ai 5 with_reasoning 5`,`wire 5`。
   - ① 输出 `ai N with_reasoning M`,M ≥ 2,且 M 接近 N。思考开着的 DeepSeek 每一步都带思考,差额只应来自背景里列的那几种消息。这一项证明思考跨步骤、跨轮次、经过 checkpoint 存取后都还在。改前也成立;10-17 本地用平台的 checkpoint 序列化器已验过两轮对话的思考都还在。
   - ② 输出 `wire K`,K = M。
 
@@ -416,10 +416,10 @@ asyncio.run(main())
 '
 ```
 
-- [ ] **32.3 真跑带工具的多步任务,第二轮也不报错**:发测试后在调试台用 eval-hb(主模型 `deepseek-v4-pro`,思考开)发一个至少要调两次工具的任务,例如「列出工作区根目录,再读其中一个文件的前 5 行,然后总结」。同一会话再追问一句仍要调工具的话,例如「再读另一个文件对比一下」。判据:
+- [x] **32.3 真跑带工具的多步任务,第二轮也不报错**:发测试后在调试台用 eval-hb(主模型 `deepseek-v4-pro`,思考开)发一个至少要调两次工具的任务,例如「列出工作区根目录,再读其中一个文件的前 5 行,然后总结」。同一会话再追问一句仍要调工具的话,例如「再读另一个文件对比一下」。判据: **10-17 测试 `c28fcdae` 过**:eval-hb 同一会话两轮,run `10dfe71e`(bash / list_dir / read_file 共 3 次调用)与 `e1732a90`(read_file 2 次)都 `success`;两个控制面 pod 30 分钟日志 `openai 400` 均 0 次;5 次 `llm_call` 全是 `deepseek-v4-pro`。
   - ① 两轮 run 都是 `success`。
   - ② 这段时间两个控制面 pod 日志 `grep -c 'openai 400'` 为 0。
   - ③ 两轮里每个 `llm_call` 在 Langfuse 的 Model 都是 `deepseek-v4-pro`(B-187),没有备用模型接管。
 
   厂商 4xx 不切备用模型,直接让这一轮失败,所以拒收一定会在 ① 里看到。**没修好时**:不适用,改前也不报错。这一条防的是「回传后厂商拒收」。
-- [ ] **32.4 厂商真的把思考拼进了上下文(观察性,可记不可判)**:取 32.3 那个 run 的 trace,按时间顺序看相邻两次 `llm_call` 的用量。判据:后一步的输入 token 减前一步的输入 token,应 ≥ 前一步的输出 token(输出含思考),多出来的大致是工具结果。原因是回传后,前一步的思考、回答、工具调用都进了下一步的输入。改前同一智能体的历史 run 里,这个差值约等于「前一步输出 − 前一步思考 + 工具结果」,在思考长、工具结果短的步骤上会小于前一步输出。可以拿 10-17 之前 eval-hb 的 run 做对照。工具结果很长的步骤看不出差别,跳过。若新旧看不出差别,记「不可判」(可能厂商不把回传的思考计入输入 token),不影响 32.1–32.3。
+- [ ] **32.4 厂商真的把思考拼进了上下文(观察性,可记不可判)**:取 32.3 那个 run 的 trace,按时间顺序看相邻两次 `llm_call` 的用量。判据:后一步的输入 token 减前一步的输入 token,应 ≥ 前一步的输出 token(输出含思考),多出来的大致是工具结果。原因是回传后,前一步的思考、回答、工具调用都进了下一步的输入。改前同一智能体的历史 run 里,这个差值约等于「前一步输出 − 前一步思考 + 工具结果」,在思考长、工具结果短的步骤上会小于前一步输出。可以拿 10-17 之前 eval-hb 的 run 做对照。工具结果很长的步骤看不出差别,跳过。若新旧看不出差别,记「不可判」(可能厂商不把回传的思考计入输入 token),不影响 32.1–32.3。 **10-17 记录(参考)**:32.3 的 5 次调用输入 5633→6261→6567→6803→7059,每步增量(628/306/236/256)都 ≥ 上一步输出(275/146/213/103);这几步思考很短、工具结果也短,区分度有限,只作参考;Harness-Bench 第 4 轮再看长思考步骤。
