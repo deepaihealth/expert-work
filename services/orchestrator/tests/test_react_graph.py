@@ -911,7 +911,7 @@ async def test_cache_hit_is_not_judged_again() -> None:
         thread_id="t-b191-cache",
         before_llm_chain=MiddlewareChain.from_middlewares(
             "before_llm_call",
-            [_CacheHit(response=_empty_stop())],  # type: ignore[list-item]
+            [_CacheHit(response=_empty_stop())],
         ),
     )
 
@@ -968,3 +968,96 @@ async def test_empty_reply_on_the_truncation_retry_fails_the_run() -> None:
     with pytest.raises(EmptyReplyError):
         await _invoke_scripted(llm, thread_id="t-cut-then-b191")
     assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reply_with_only_unparseable_tool_calls_is_retried() -> None:
+    # 图只派发 ``tool_calls``:只带解析失败的调用,原来会被当成说完了、记成空着的成功。
+    invalid = {"name": "write_file", "args": "{", "id": "call_x", "error": "bad json"}
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", invalid_tool_calls=[invalid], response_metadata=_STOP),
+            AIMessage(content="这次答了", response_metadata=_STOP),
+        ]
+    )
+
+    state = await _invoke_scripted(llm, thread_id="t-b191-invalid")
+
+    assert llm.calls == 2
+    assert len(_empty_notices(state)) == 1
+    assert state["messages"][-1].content == "这次答了"
+
+
+def _filtered_count() -> float:
+    return _empty_count("filtered")
+
+
+@pytest.mark.asyncio
+async def test_content_filtered_empty_reply_fails_without_retry() -> None:
+    # 厂商内容审核拦下、一个字没回:重来也是被拦,不重试,报的是「被审核拦了」而不是「没回答」。
+    before = _filtered_count()
+    llm = _StreamingScriptedLLM(
+        responses=[
+            AIMessage(content="", response_metadata={"finish_reason": "content_filter"}),
+            AIMessage(content="不该走到这里", response_metadata=_STOP),
+        ]
+    )
+
+    events, row = await _run_through_sse(llm, ToolRegistry())
+
+    errors = [e for e in events if e.event == "error"]
+    assert len(errors) == 1
+    assert errors[0].data["name"] == "ContentFilteredError"
+    assert "内容审核拦截" in errors[0].data["message"]
+    assert row is not None and row.status.value == "error"
+    assert llm.calls == 1
+    assert _filtered_count() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_content_filtered_reply_is_metered_but_not_cached() -> None:
+    from orchestrator.llm.empty_reply import ContentFilteredError
+
+    rows, cache, raised = await _run_with_usage(
+        AIMessage(content="", usage_metadata=_USAGE, response_metadata={"stop_reason": "refusal"})
+    )
+
+    assert isinstance(raised, ContentFilteredError)
+    assert [(r.input_tokens, r.output_tokens) for r in rows] == [(100, 2048)]
+    assert cache.puts == []
+
+
+def _frame_shapes(events: list[Any]) -> list[tuple[str, Any]]:
+    return [
+        (
+            e.event,
+            {k: sorted(v) if isinstance(v, dict) else None for k, v in e.data.items()}
+            if isinstance(e.data, dict)
+            else None,
+        )
+        for e in events
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_retry_takes_the_same_path_as_the_truncation_retry() -> None:
+    # 丢弃那一轮与 B-158 同一条路:同样的帧、同样形状的 updates,权威帧里只有那条隐藏提示
+    # (流式预览由它取代,与 B-158 一致)。
+    from orchestrator.graph_builder.builder import EMPTY_REPLY_RETRY_KEY, TRUNCATION_RETRY_KEY
+
+    shapes: dict[str, list[tuple[str, Any]]] = {}
+    discarded: dict[str, Any] = {}
+    for kind, first in (("b158", _cut()), ("b191", _empty_stop())):
+        llm = _StreamingScriptedLLM(
+            responses=[first, AIMessage(content="ok", response_metadata=_STOP)]
+        )
+        events, row = await _run_through_sse(llm, ToolRegistry())
+        assert row is not None and row.status.value == "success"
+        shapes[kind] = _frame_shapes(events)
+        discarded[kind] = next(e for e in events if e.event == "updates").data["agent"]["messages"]
+
+    assert shapes["b191"] == shapes["b158"]
+    for kind, key in (("b158", TRUNCATION_RETRY_KEY), ("b191", EMPTY_REPLY_RETRY_KEY)):
+        [only] = discarded[kind]
+        assert only["type"] == "human"
+        assert only["additional_kwargs"] == {"expert_work_hide_from_ui": True, key: True}

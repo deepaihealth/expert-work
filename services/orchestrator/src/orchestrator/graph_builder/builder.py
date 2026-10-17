@@ -175,7 +175,13 @@ from orchestrator.graph_builder.platform_context import (
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
-from orchestrator.llm.empty_reply import EmptyReplyError, empty_reply_total, is_empty_reply
+from orchestrator.llm.empty_reply import (
+    ContentFilteredError,
+    EmptyReplyError,
+    empty_reply_total,
+    is_empty_reply,
+    is_filtered,
+)
 from orchestrator.llm.stall import (
     STALLED_AFTER_S,
     StalledWithoutAnswerError,
@@ -1342,11 +1348,12 @@ def build_react_graph(
                 logger.warning("agent_node.stalled_without_answer idle_s=%s", stalled_s)
                 raise StalledWithoutAnswerError(stalled_s)
 
-        # B-191 —— 正常结束却空着:没有正文,也没有工具调用(实测:模型把要发的工具调用写进了
-        # 思考,调用没发出去,run 却记成「成功、空回复」)。照 B-158 丢弃、落一条隐藏提示、重来
-        # 一次;本轮输入已是任一种重试提示 = 这一步已经重试过,run 可见地失败。两种情况都照样
-        # 记账、不进响应缓存。排除项同 B-186,再加收尾轮:那一轮没绑工具、工具调用是平台剥掉
-        # 的,run 也按预算出口结束,不是「空着的成功」。
+        # B-191 —— 正常结束却空着:没有内容,也没有可执行的工具调用(实测:模型把要发的工具
+        # 调用写进了思考,调用没发出去,run 却记成「成功、空回复」)。照 B-158 丢弃、落一条隐藏
+        # 提示、重来一次(与 B-158 同样占一步);本轮输入已是任一种重试提示 = 这一步已经重试过,
+        # run 可见地失败。被厂商内容审核拦下的不重试,直接失败。都照样记账、不进响应缓存。
+        # 排除项同 B-186,再加预算收尾轮:那一轮没绑工具,剥掉工具调用后的空回复是平稳收尾的
+        # 设计结果,run 也按预算出口结束,不是「空着的成功」。
         if (
             cache_hit_response is None
             and output_schema is None
@@ -1364,6 +1371,10 @@ def build_react_graph(
             provider, model, _cap = (
                 output_cap_resolver(response) if output_cap_resolver is not None else ("", "", None)
             )
+            if is_filtered(response):
+                empty_reply_total.labels(provider=provider, model=model, outcome="filtered").inc()
+                logger.warning("agent_node.empty_reply_filtered model=%s", model)
+                raise ContentFilteredError()
             if _is_reply_retry(state["messages"][-1]):
                 empty_reply_total.labels(provider=provider, model=model, outcome="failed").inc()
                 logger.warning("agent_node.empty_reply_failed model=%s", model)
