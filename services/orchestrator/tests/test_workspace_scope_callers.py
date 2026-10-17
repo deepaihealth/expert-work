@@ -55,6 +55,11 @@ _CALL_SITES: dict[tuple[str, str], tuple[bool, str]] = {
         "状态回读 —— 与 SandboxWorkspaceWriter 成对,必须同进同退:"
         "一边搬一边不搬 = 写进 agent 根、从用户根读,回读恒空。",
     ),
+    ("file_ops.py", "SandboxWorkspaceWriter.read"): (
+        False,
+        "B-188 改写根目录旧投影之前的回读 —— 与 SandboxWorkspaceWriter.write 同一个调用形状、"
+        "同一个根,必须同进同退:读一处、写另一处,就会照着别处的内容改写这里的文件。",
+    ),
 }
 
 
