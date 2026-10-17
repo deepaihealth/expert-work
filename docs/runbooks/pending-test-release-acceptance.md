@@ -323,3 +323,23 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [ ] **30.1 新工作区根目录不再多文件(B-188)**:发测试后用一个新用户跑一个会用计划工具的任务(eval-hb 跑任一 Harness-Bench 题即可,或调试台让智能体「先列计划再做」)。跑完列工作区根目录。判据:根目录没有内容是 `<!-- Moved: this workspace's plan/state files now live under threads/…` 的文件;`threads/<thread_id>/PLAN.md` 照常存在。**没修好时**:根目录多出这三个文件。
 - [ ] **30.2 用户自己的根目录文件不被覆盖(B-188)**:新用户第一轮先让智能体在工作区根目录写 `PLAN.md`,内容随便一句话(如「我的计划:周三前交稿」),同一轮再让它用计划工具列两步计划。跑完读根目录 `PLAN.md`。判据:内容仍是那句话。**没修好时**:被改成「已迁移」提示。
 - [ ] **30.3 空回复不再记成功(B-191)**:观察性,无法按需触发(30 天 2803 个成功 run 里只有 1 次)。发测试一周后:① 两个控制面 pod 汇总 `expert_work_llm_empty_reply_total`,并 `grep agent_node.empty_reply_` 日志;② 重跑 10-17 的只读统计(成功 run 里最后一条回复既无正文也无工具调用的个数,停顿的除外)。判据:② 为 0;① 里 `outcome="failed"` 的 run 状态都是 `error` 且错误文案是「模型结束了这一轮,却既没有给出回答,也没有调用工具」。一周内一次都没发生也算过(写明 0 次)。**没修好时**:② 不为 0。
+
+## §31 截断补救每步最多 3 次(B-194)
+
+**背景**:回答撞上输出上限、又没法用(没有可用的正文,或工具调用被截断)时,平台丢弃这条回答、给模型一条隐藏提示 `[output limit notice]` 让它拆小重做(B-158);正常结束却空着的回答同样丢弃重来,提示是 `[empty reply notice]`(B-191)。改前两种合计每一步只重来 1 次,再不行 run 就报错;现在合计每一步最多 3 次,第 4 次还不行才报错。提示文案、丢弃方式不变,每次重试照旧占一步;空回复的报错文案改为「……(已自动重试过 3 次)」。一步成功之后(回答或工具调用落进了历史),下一步重新有 3 次。撞上限什么时候发生由模型决定,真栈没法按需触发:10-17 Harness-Bench 第 2 轮失败的 5 道题,同样的请求再发 4 次,有 2 步 4 次全写下、1 步写下 2 次、2 步一次都没写下。
+
+隐藏提示随 agent 那一步的 `updates` 帧落进 `run_event`(`data` 里带 `expert_work_truncation_retry` / `expert_work_empty_reply_retry` 标记);控制面日志里每次重试一行 `agent_node.output_truncated_retry` / `agent_node.empty_reply_retry`。
+
+- [ ] **31.1 正常对话不受影响**:发测试后金丝雀 `RESULT: PASS`;调试台任一 Agent 发一句话。判据:正常回答,run 状态成功。**没修好时**:不适用(防回归:改动只在截断 / 空回复的重试分支)。
+- [ ] **31.2 连续截断后补上了(观察性)**:发测试一周后只读查哪些 run 落过截断提示、各落了几条:
+  ```sql
+  SELECT e.run_id, r.status, count(*) AS notices
+  FROM run_event e JOIN agent_run r ON r.id = e.run_id
+  WHERE e.event_name = 'updates'
+    AND e.data::text LIKE '%expert_work_truncation_retry%'
+    AND e.created_at > '<发测试时间>'
+  GROUP BY e.run_id, r.status
+  ORDER BY notices DESC;
+  ```
+  对 `notices >= 2` 的 run,按 `seq` 顺序读它的 `updates` 帧,找「同一步里连着 2~3 条提示(中间没有回答帧、没有工具结果帧),紧接着是一条正常回答或工具调用」的地方;也可以在 Langfuse 打开这个 run,看提示之后那次 `llm_call` 的输入末尾连着 2~3 条 `[output limit notice]`。判据:找到至少一处这样的步骤,而且这一步过去了(run 成功,或后面因为别的原因失败)。**一周内没有任何一步连续截断 2 次就记 0 次、不可判**,这条是否修好靠自动测试分辨(10-17 逐条变异验过,见 31.3 末尾)。想主动造:用 eval-hb 重跑 Harness-Bench 139 / 147 / 154(10-17 探针里最难写下的三步所在的题),要花评测费,先按评测花费规矩估算、报用户再跑。**没修好时**:每一步最多 1 条提示,同一步第 2 次截断就报错。
+- [ ] **31.3 报错前确实重试满 3 次(观察性)**:同一时段只读查 `SELECT id, status, error FROM agent_run WHERE (error LIKE '%模型输出被截断%' OR error LIKE '%既没有给出回答%') AND created_at > '<发测试时间>'`,对每个 run 按 `seq` 看报错前最后几条 `updates` 帧。判据:报错前最后一步连着 3 条隐藏提示(截断提示、空回复提示两种合计),之后没有回答帧;空回复那种的报错文案带「已自动重试过 3 次」。一周内没有就记 0 次。**没修好时**:报错前那一步只有 1 条提示;空回复文案仍是「已自动重试过一次」。**分辨修没修好靠自动测试**(10-17 逐条变异验过,`test_react_graph.py`):每步次数 3 改 2 → 11 条红(含 `test_three_truncations_then_a_good_reply_completes_the_run`);3 改 4 → 10 条红(含 `test_fourth_consecutive_truncation_fails_the_run` 与两条交替重试的用例);只看最后一条提示 → 10 条红;只数截断提示、空回复提示不算 → 4 条红(含 `test_truncation_after_three_mixed_retries_fails_the_run` / `test_empty_reply_after_three_mixed_retries_fails_the_run`);数整段历史里的提示、不只数末尾连着的 → `test_each_step_gets_its_own_retry_budget` 红;截断 / 空回复任一处退回「只看最后一条」→ 9 / 4 条红;报错文案退回「重试过一次」→ `test_fourth_empty_reply_fails_the_run_visibly` 红。

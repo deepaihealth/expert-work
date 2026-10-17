@@ -400,10 +400,10 @@ async def _run_through_sse(llm: LLMCaller, registry: ToolRegistry) -> tuple[list
 
 @pytest.mark.asyncio
 async def test_truncated_empty_reply_fails_the_run_visibly() -> None:
-    # 思考模型截断的实测形态:额度全给了思考,正文为空。B-158:重试一次仍截断才报错。
+    # 思考模型截断的实测形态:额度全给了思考,正文为空。B-194:重试 3 次仍截断才报错。
     before = _truncated_count("false")
     truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
-    llm = _StreamingScriptedLLM(responses=[truncated, truncated])
+    llm = _StreamingScriptedLLM(responses=[truncated] * 4)
 
     events, row = await _run_through_sse(llm, ToolRegistry())
 
@@ -413,8 +413,8 @@ async def test_truncated_empty_reply_fails_the_run_visibly() -> None:
     assert "模型输出被截断" in errors[0].data["message"]
     assert "2048" in errors[0].data["message"]
     assert row is not None and row.error is not None and "模型输出被截断" in row.error
-    assert _truncated_count("false") == before + 2, "两次截断各计一次"
-    assert llm.calls == 2
+    assert _truncated_count("false") == before + 4, "四次截断各计一次"
+    assert llm.calls == 4
 
 
 @pytest.mark.asyncio
@@ -460,7 +460,7 @@ async def test_truncated_tool_call_fails_before_dispatch() -> None:
         tool_calls=[_tool_call("write_file", {}, "tc-1")],
         response_metadata={"stop_reason": "max_tokens"},
     )
-    llm = _StreamingScriptedLLM(responses=[truncated, truncated])
+    llm = _StreamingScriptedLLM(responses=[truncated] * 4)
     tool = _CountingTool(name="write_file")
     registry = ToolRegistry()
     registry.register(tool)
@@ -469,7 +469,7 @@ async def test_truncated_tool_call_fails_before_dispatch() -> None:
 
     assert [e.data["name"] for e in events if e.event == "error"] == ["OutputTruncatedError"]
     assert tool.calls == 0
-    assert llm.calls == 2
+    assert llm.calls == 4
 
 
 @pytest.mark.asyncio
@@ -493,7 +493,7 @@ async def test_truncation_without_wiring_labels_is_still_judged() -> None:
     from orchestrator.llm.truncation import OutputTruncatedError
 
     truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
-    llm = _ScriptedLLM(responses=[truncated, truncated])
+    llm = _ScriptedLLM(responses=[truncated] * 4)
     with pytest.raises(OutputTruncatedError, match="厂商默认值"):
         await _run_graph(llm, ToolRegistry())
 
@@ -534,7 +534,7 @@ async def test_fallback_served_truncation_reports_the_fallback_cap_and_label() -
         content="",
         response_metadata={"finish_reason": "length", SERVED_BY_KEY: "qwen:qwen3.6-plus#1"},
     )
-    llm = _ScriptedLLM(responses=[truncated, truncated])
+    llm = _ScriptedLLM(responses=[truncated] * 4)
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(
             build_react_graph(
@@ -548,7 +548,7 @@ async def test_fallback_served_truncation_reports_the_fallback_cap_and_label() -
             )
 
     assert info.value.cap == 8192 and "8192" in str(info.value)
-    assert _count("qwen", "qwen3.6-plus", "false") == before + 2
+    assert _count("qwen", "qwen3.6-plus", "false") == before + 4
 
 
 def test_served_output_cap_falls_back_to_the_primary_when_unstamped() -> None:
@@ -596,7 +596,7 @@ async def _run_with_usage(response: AIMessage) -> tuple[Any, _SpyCache, BaseExce
     async with make_checkpointer("memory") as cp:
         compiled = GraphRunner(checkpointer=cp).compile(
             build_react_graph(
-                llm_caller=_ScriptedLLM(responses=[response, response]),
+                llm_caller=_ScriptedLLM(responses=[response] * 4),
                 tool_registry=ToolRegistry(),
                 after_llm_chain=after,
                 output_cap_resolver=_GLM_CAPS,
@@ -628,7 +628,7 @@ async def test_unusable_truncation_is_metered_but_not_cached() -> None:
     assert isinstance(raised, OutputTruncatedError)
     assert [(r.model, r.input_tokens, r.output_tokens, r.usage_kind) for r in rows] == [
         ("glm-5.3", 100, 2048, "conversation")
-    ] * 2, "B-158:原调用与重试各计一行"
+    ] * 4, "B-158 / B-194:原调用与 3 次重试各计一行"
     assert cache.puts == []
 
 
@@ -849,9 +849,11 @@ async def test_empty_normal_stop_is_discarded_and_retried_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_second_empty_reply_fails_the_run_visibly() -> None:
+async def test_fourth_empty_reply_fails_the_run_visibly() -> None:
+    # B-194:重试 3 次仍空着才报错。
     before = _empty_count("failed")
-    llm = _StreamingScriptedLLM(responses=[_empty_stop(), _empty_stop()])
+    before_retried = _empty_count("retried")
+    llm = _StreamingScriptedLLM(responses=[_empty_stop() for _ in range(4)])
 
     events, row = await _run_through_sse(llm, ToolRegistry())
 
@@ -859,9 +861,11 @@ async def test_second_empty_reply_fails_the_run_visibly() -> None:
     assert len(errors) == 1
     assert errors[0].data["name"] == "EmptyReplyError"
     assert "既没有给出回答" in errors[0].data["message"]
+    assert "已自动重试过 3 次" in errors[0].data["message"]
     assert row is not None and row.status.value == "error"
     assert row.error is not None and "没有调用工具" in row.error
-    assert llm.calls == 2
+    assert llm.calls == 4
+    assert _empty_count("retried") == before_retried + 3
     assert _empty_count("failed") == before + 1
 
 
@@ -934,7 +938,7 @@ async def test_empty_reply_on_the_budget_wrap_up_turn_is_not_retried() -> None:
 
 @pytest.mark.asyncio
 async def test_discarded_empty_reply_is_metered_but_not_cached() -> None:
-    # 丢弃的空回复照样计费(思考花了钱),但不进响应缓存;重试那次同样。
+    # 丢弃的空回复照样计费(思考花了钱),但不进响应缓存;3 次重试同样。
     from orchestrator.llm.empty_reply import EmptyReplyError
 
     rows, cache, raised = await _run_with_usage(
@@ -944,30 +948,47 @@ async def test_discarded_empty_reply_is_metered_but_not_cached() -> None:
     assert isinstance(raised, EmptyReplyError)
     assert [(r.input_tokens, r.output_tokens, r.usage_kind) for r in rows] == [
         (100, 2048, "conversation")
-    ] * 2
+    ] * 4
     assert cache.puts == []
 
 
 @pytest.mark.asyncio
-async def test_truncation_on_the_empty_reply_retry_fails_the_run() -> None:
-    # 每一步合计只重试一次:空回复重试那一轮又截断,不再接着走 B-158 的重试。
+async def test_truncation_after_three_mixed_retries_fails_the_run() -> None:
+    # B-194 —— 每一步两种重试合计 3 次:空回复、截断交替着来,第 4 次截断照样报错,
+    # 不会各算各的再多重试。第 5 条是好回答:多重试一次就会成功收尾,测试照样红。
     from orchestrator.llm.truncation import OutputTruncatedError
 
-    llm = _ScriptedLLM(responses=[_empty_stop(), _cut()])
+    llm = _ScriptedLLM(
+        responses=[
+            _empty_stop(),
+            _cut(),
+            _empty_stop(),
+            _cut(),
+            AIMessage(content="不该走到这里", response_metadata=_STOP),
+        ]
+    )
     with pytest.raises(OutputTruncatedError):
         await _invoke_scripted(llm, thread_id="t-b191-then-cut")
-    assert llm.calls == 2
+    assert llm.calls == 4
 
 
 @pytest.mark.asyncio
-async def test_empty_reply_on_the_truncation_retry_fails_the_run() -> None:
-    # 反过来:B-158 截断重试那一轮回了空回复,同样不再重试。
+async def test_empty_reply_after_three_mixed_retries_fails_the_run() -> None:
+    # 反过来:截断、空回复交替,第 4 次空回复同样报错。
     from orchestrator.llm.empty_reply import EmptyReplyError
 
-    llm = _ScriptedLLM(responses=[_cut(), _empty_stop()])
+    llm = _ScriptedLLM(
+        responses=[
+            _cut(),
+            _empty_stop(),
+            _cut(),
+            _empty_stop(),
+            AIMessage(content="不该走到这里", response_metadata=_STOP),
+        ]
+    )
     with pytest.raises(EmptyReplyError):
         await _invoke_scripted(llm, thread_id="t-cut-then-b191")
-    assert llm.calls == 2
+    assert llm.calls == 4
 
 
 @pytest.mark.asyncio
@@ -1061,3 +1082,86 @@ async def test_empty_reply_retry_takes_the_same_path_as_the_truncation_retry() -
         [only] = discarded[kind]
         assert only["type"] == "human"
         assert only["additional_kwargs"] == {"expert_work_hide_from_ui": True, key: True}
+
+
+# ---------------------------------------------------------------------------
+# B-194 —— 每一步最多重试 3 次(截断 / 空回复合计)
+# ---------------------------------------------------------------------------
+
+
+def _truncation_notices(state: AgentState) -> list[BaseMessage]:
+    from orchestrator.graph_builder.builder import TRUNCATION_RETRY_KEY
+
+    return [m for m in state["messages"] if m.additional_kwargs.get(TRUNCATION_RETRY_KEY)]
+
+
+@pytest.mark.asyncio
+async def test_three_truncations_then_a_good_reply_completes_the_run() -> None:
+    # 评测实测:同一步同样的请求再发几次,有的第 2~4 次才写得下。连截 3 次、第 4 次答出来,
+    # run 照常完成;3 条提示都在历史里(隐藏),被截的回答一条都不进历史。
+    from orchestrator.graph_builder.builder import TRUNCATION_RETRY_KEY
+
+    llm = _ScriptedLLM(
+        responses=[_cut(), _cut(), _cut(), AIMessage(content="拆小写完了", response_metadata=_STOP)]
+    )
+    seen: list[Sequence[BaseMessage]] = []
+    inner = llm.__call__
+
+    async def spy(*, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]) -> AIMessage:
+        seen.append(list(messages))
+        return await inner(messages=messages, tools=tools)
+
+    state = await _invoke_scripted(spy, thread_id="t-b194-three")
+
+    assert llm.calls == 4
+    assert state["messages"][-1].content == "拆小写完了"
+    assert state.get("exit_reason") == "text_response"
+    assert len(_truncation_notices(state)) == 3
+    assert [m.content for m in state["messages"] if isinstance(m, AIMessage)] == ["拆小写完了"]
+    assert all(m.additional_kwargs.get(TRUNCATION_RETRY_KEY) for m in seen[3][-3:])
+    assert state["step_count"] == 4, "每次重试照旧占一步"
+
+
+@pytest.mark.asyncio
+async def test_fourth_consecutive_truncation_fails_the_run() -> None:
+    # 重试 3 次仍截断:第 4 次报错,不再重试。第 5 条是好回答:多重试一次就会成功收尾。
+    from orchestrator.llm.truncation import OutputTruncatedError
+
+    llm = _ScriptedLLM(
+        responses=[
+            *(_cut() for _ in range(4)),
+            AIMessage(content="不该走到这里", response_metadata=_STOP),
+        ]
+    )
+    with pytest.raises(OutputTruncatedError):
+        await _invoke_scripted(llm, thread_id="t-b194-four")
+    assert llm.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_each_step_gets_its_own_retry_budget() -> None:
+    # 只数末尾连着的提示:一步成功(这里是一次工具调用)之后,下一步重新有 3 次。
+    tool = _CountingTool(name="search")
+    registry = ToolRegistry()
+    registry.register(tool)
+    llm = _ScriptedLLM(
+        responses=[
+            _cut(),
+            _cut(),
+            _cut(),
+            AIMessage(
+                content="", tool_calls=[_tool_call("search", {}, "tc-1")], response_metadata=_STOP
+            ),
+            _cut(),
+            _cut(),
+            _cut(),
+            AIMessage(content="两步都做完了", response_metadata=_STOP),
+        ]
+    )
+
+    state = await _invoke_scripted(llm, thread_id="t-b194-reset", registry=registry, max_steps=20)
+
+    assert llm.calls == 8
+    assert tool.calls == 1
+    assert state["messages"][-1].content == "两步都做完了"
+    assert len(_truncation_notices(state)) == 6
