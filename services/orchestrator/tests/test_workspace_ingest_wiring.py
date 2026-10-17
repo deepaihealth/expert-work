@@ -214,6 +214,9 @@ class _FsWriter:
     async def write(self, *, rel: str, content: str) -> None:
         self.files[rel] = content
 
+    async def read(self, rel: str) -> str | None:
+        return self.files.get(rel)
+
 
 @dataclass
 class _StubTool:

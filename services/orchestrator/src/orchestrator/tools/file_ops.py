@@ -1466,6 +1466,31 @@ class SandboxWorkspaceWriter:
         env = parse_envelope(outcome, tool="workspace_projection")
         _raise_for_error(env, tool="workspace_projection")
 
+    async def read(self, rel: str) -> str | None:
+        """B-188 — the projector's legacy-root repair reads a root file before
+        rewriting it. Same ``run_in_sandbox`` call and labels as :meth:`write`,
+        so the read and the write it guards hit the same sandbox key and are
+        metered alike. ``None`` when absent; other failures raise.
+
+        Reads the whole file (cap = the snippet's byte ceiling, so the text can
+        never come back cut short): the repair writes the body back, and a
+        truncated read would silently drop its tail. A file over the ceiling
+        fails the read, and the projector leaves it alone."""
+        outcome = await run_in_sandbox(
+            self.client,
+            code=build_read_wrapper(rel, cap=_MAX_READ_BYTES),
+            timeout_s=None,
+            ctx=self.ctx,
+            tool_label="workspace_projection",
+            fallback_thread_id="workspace_projection",
+            seed_files=self.skill_seed_files,
+        )
+        env = parse_envelope(outcome, tool="workspace_projection")
+        if not env.get("ok") and env.get("error") == "not_found":
+            return None
+        _raise_for_error(env, tool="workspace_projection")
+        return str(env.get("content", ""))
+
 
 @dataclass(frozen=True)
 class SandboxWorkspaceReader:

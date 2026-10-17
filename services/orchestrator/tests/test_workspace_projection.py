@@ -8,6 +8,7 @@ and the digest does not advance so the next turn retries).
 
 from __future__ import annotations
 
+import ast
 import json
 from dataclasses import dataclass, field
 from uuid import uuid4
@@ -25,6 +26,10 @@ from orchestrator.context import (
     safe_thread_projection_prefix,
     thread_projection_prefix,
 )
+from orchestrator.context.workspace_projection import (
+    _LEGACY_ROOT_HEADERS,
+    LEGACY_REDIRECT_NOTE,
+)
 from orchestrator.tools.file_ops import FileOpError, SandboxWorkspaceWriter
 from orchestrator.tools.registry import ToolContext
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
@@ -36,16 +41,28 @@ from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
 @dataclass
 class _RecordingWriter:
-    """Records every ``write`` call; optionally raises for chosen paths."""
+    """Records every ``write`` call; optionally raises for chosen paths.
+    ``existing`` is what the workspace already holds — ``read`` serves it and
+    records every path it was asked for."""
 
     writes: dict[str, str] = field(default_factory=dict)
     fail_on: frozenset[str] = frozenset()
+    existing: dict[str, str] = field(default_factory=dict)
+    read_fail_on: frozenset[str] = frozenset()
+    reads: list[str] = field(default_factory=list)
 
     async def write(self, *, rel: str, content: str) -> None:
         if rel in self.fail_on:
             msg = f"sandbox write failed: {rel}"
             raise RuntimeError(msg)
         self.writes[rel] = content
+
+    async def read(self, rel: str) -> str | None:
+        self.reads.append(rel)
+        if rel in self.read_fail_on:
+            msg = f"sandbox read failed: {rel}"
+            raise RuntimeError(msg)
+        return self.existing.get(rel)
 
 
 def _plan() -> Plan:
@@ -234,6 +251,67 @@ async def test_sandbox_writer_raises_on_sandbox_failure() -> None:
         await writer.write(rel="PLAN.md", content="abc")
 
 
+async def test_sandbox_writer_read_shares_writes_sandbox_key_and_label() -> None:
+    # B-188 — read and write go through one run_in_sandbox shape: same sandbox
+    # key (no run_id → the fallback thread id) and the same tool label.
+    ctx = ToolContext(tenant_id=uuid4(), user_id=uuid4())  # no run_id
+    client = RecordingSandboxRuntime(outcome=_ok_envelope("PLAN.md"))
+    writer = SandboxWorkspaceWriter(client=client, ctx=ctx)
+    await writer.write(rel="PLAN.md", content="abc")
+    client.outcome = SandboxOutcome(
+        stdout=json.dumps({"ok": True, "content": "abc", "content_hash": "h", "size": 3}),
+        stderr="",
+        exit_code=0,
+        timed_out=False,
+    )
+    assert await writer.read("PLAN.md") == "abc"
+    assert [thread for _tenant, thread, _user, _seed in client.acquired] == [
+        "workspace_projection",
+        "workspace_projection",
+    ]
+    client.outcome = SandboxOutcome(
+        stdout=json.dumps({"ok": False, "error": "io_error", "detail": "x"}),
+        stderr="",
+        exit_code=0,
+        timed_out=False,
+    )
+    with pytest.raises(FileOpError) as write_err:
+        await writer.write(rel="PLAN.md", content="abc")
+    with pytest.raises(FileOpError) as read_err:
+        await writer.read("PLAN.md")
+    labels = {str(err.value).split(" ", 1)[0] for err in (write_err, read_err)}
+    assert labels == {"workspace_projection"}
+
+
+async def test_sandbox_writer_read_returns_content_or_none() -> None:
+    # B-188 — the legacy-root repair reads through the writer it writes with.
+    client = RecordingSandboxRuntime(
+        outcome=SandboxOutcome(
+            stdout=json.dumps({"ok": True, "content": "# x\n", "content_hash": "h", "size": 4}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    writer = SandboxWorkspaceWriter(client=client, ctx=_ctx())
+    assert await writer.read("PLAN.md") == "# x\n"
+    assert "PLAN.md" in client.execs[0][1]
+    # The repair writes the body back, so the read must be whole: a file either
+    # comes back in full or fails (over the byte ceiling) — never cut short.
+    params_line = client.execs[0][1].split("\n", 1)[0]
+    params = json.loads(ast.literal_eval(params_line.split(" = ", 1)[1]))
+    assert params["cap"] >= params["max_bytes"]
+    absent = RecordingSandboxRuntime(
+        outcome=SandboxOutcome(
+            stdout=json.dumps({"ok": False, "error": "not_found"}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    assert await SandboxWorkspaceWriter(client=absent, ctx=_ctx()).read("PLAN.md") is None
+
+
 # ---------------------------------------------------------------------------
 # BUG-10 (方案 a) — thread-scoped projection dir
 # ---------------------------------------------------------------------------
@@ -259,14 +337,10 @@ async def test_project_prefixes_rels_with_thread_dir() -> None:
     result = await WorkspaceProjector(writer=writer).project(
         plan=_plan(), memories=_memories(), last_digest=None, prefix="threads/t-1/"
     )
-    # First projection (no cursor) also rewrites the legacy roots (终审 F2).
     assert set(writer.writes) == {
         "threads/t-1/PLAN.md",
         "threads/t-1/TODO.md",
         "threads/t-1/MEMORY.md",
-        "PLAN.md",
-        "TODO.md",
-        "MEMORY.md",
     }
     assert set(result.written) == set(writer.writes)
 
@@ -285,18 +359,82 @@ async def test_same_content_different_thread_is_not_skipped() -> None:
     assert "threads/b/PLAN.md" in writer_b.writes
 
 
-async def test_first_thread_projection_rewrites_legacy_root_files() -> None:
+#: What root projection wrote before 方案 a (CM-0 PR2b-i … BUG-10), spelled
+#: out literally rather than re-rendered: these are historical files sitting in
+#: existing workspaces, so the match must not drift with today's renderers.
+#: Checked byte-for-byte against the renderers at ``b965caa7~1`` (the last
+#: commit that projected to the root) for this plan / memory.
+_LEGACY_ROOT = {
+    "PLAN.md": (
+        "<!-- Edit this file to steer the agent: change the goal, add/remove/reorder "
+        "steps, or flip a checkbox ([ ] todo / [~] in progress / [x] done). Changes "
+        "are ingested at the next run start; the database stays the source of truth. -->\n"
+        "\n# Plan\n\n**Goal:** old goal\n\n## Steps\n\n- [x] 1. old step\n"
+    ),
+    "TODO.md": (
+        "<!-- Read-only projection (the database is the source of truth). Edits "
+        "here are NOT ingested — edit PLAN.md to steer the agent. -->\n"
+        "\n# TODO\n\n- [x] 1. old step\n"
+    ),
+    "MEMORY.md": (
+        "<!-- Read-only projection (the database is the source of truth). Edits "
+        "here are NOT ingested — edit PLAN.md to steer the agent. -->\n"
+        "\n# Memory\n\n- (fact) old fact\n"
+    ),
+}
+
+
+def _redirected(name: str) -> str:
+    """``_LEGACY_ROOT[name]`` with its header line swapped for the redirect note."""
+    return LEGACY_REDIRECT_NOTE + _LEGACY_ROOT[name].split("\n", 1)[1]
+
+
+def test_legacy_header_literals_are_what_root_projection_wrote() -> None:
+    # Pinned against the historical fixture, not against today's _PLAN_NOTE /
+    # _READONLY_NOTE: editing those notes must not retire the repair.
+    for name, text in _LEGACY_ROOT.items():
+        assert _LEGACY_ROOT_HEADERS[name] == text.split("\n", 1)[0]
+
+
+async def test_first_projection_in_fresh_workspace_creates_no_root_files() -> None:
+    # B-188 — nothing at the root → nothing written there (was: three redirect
+    # files dropped into every new conversation's workspace).
     writer = _RecordingWriter()
+    await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=_memories(), last_digest=None, prefix="threads/t-1/"
+    )
+    assert [rel for rel in writer.writes if not rel.startswith("threads/")] == []
+
+
+async def test_user_authored_root_files_are_left_untouched() -> None:
+    # B-188 — a root PLAN.md / MEMORY.md the user wrote (or uploaded) is theirs;
+    # an already-redirected root file is not rewritten either.
+    writer = _RecordingWriter(
+        existing={
+            "PLAN.md": "# My plan\n\n- [ ] call the supplier\n",
+            "MEMORY.md": "notes the user keeps\n",
+            "TODO.md": LEGACY_REDIRECT_NOTE,
+        }
+    )
+    await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=_memories(), last_digest=None, prefix="threads/t-1/"
+    )
+    assert [rel for rel in writer.writes if not rel.startswith("threads/")] == []
+
+
+async def test_first_thread_projection_rewrites_legacy_root_files() -> None:
+    writer = _RecordingWriter(existing=dict(_LEGACY_ROOT))
     result = await WorkspaceProjector(writer=writer).project(
         plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
     )
-    # 终审 F2 — the one-shot legacy redirect lands at the root...
-    assert "no longer read" in writer.writes["PLAN.md"]
-    assert "no longer read" in writer.writes["TODO.md"]
-    assert "no longer read" in writer.writes["MEMORY.md"]
+    # 终审 F2 — the one-shot legacy redirect lands at the root (header line
+    # swapped for the note, the rest kept)...
+    for name in ("PLAN.md", "TODO.md", "MEMORY.md"):
+        assert writer.writes[name] == _redirected(name)
+        assert writer.writes[name].startswith(LEGACY_REDIRECT_NOTE)
     # ...while the digest still covers only the thread-scoped items: a second
     # unchanged projection must skip (no per-turn root rewrites).
-    writer2 = _RecordingWriter()
+    writer2 = _RecordingWriter(existing=dict(_LEGACY_ROOT))
     second = await WorkspaceProjector(writer=writer2).project(
         plan=_plan(), memories=[], last_digest=result.digest, prefix="threads/t-1/"
     )
@@ -304,26 +442,54 @@ async def test_first_thread_projection_rewrites_legacy_root_files() -> None:
     assert writer2.writes == {}
 
 
-async def test_changed_second_projection_does_not_rewrite_legacy_roots() -> None:
-    writer = _RecordingWriter()
+async def test_legacy_root_repair_keeps_what_a_human_wrote_below_the_header() -> None:
+    # B-188 — a legacy root PLAN.md a user kept writing in: only line 1 changes.
+    edited = _LEGACY_ROOT["PLAN.md"] + "\nmy own notes — keep me\n"
+    writer = _RecordingWriter(existing={"PLAN.md": edited})
+    await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
+    )
+    written = writer.writes["PLAN.md"]
+    assert written.splitlines()[0] == LEGACY_REDIRECT_NOTE.rstrip("\n")
+    assert written == LEGACY_REDIRECT_NOTE + edited.split("\n", 1)[1]
+    assert written.endswith("\nmy own notes — keep me\n")
+
+
+async def test_changed_second_projection_does_not_touch_root() -> None:
+    writer = _RecordingWriter(existing=dict(_LEGACY_ROOT))
     first = await WorkspaceProjector(writer=writer).project(
         plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
     )
     changed = Plan(goal="new goal", steps=_plan().steps)
-    writer2 = _RecordingWriter()
+    writer2 = _RecordingWriter(existing=dict(_LEGACY_ROOT))
     await WorkspaceProjector(writer=writer2).project(
         plan=changed, memories=[], last_digest=first.digest, prefix="threads/t-1/"
     )
-    # Cursor exists → repair already ran; only thread files rewritten.
+    # Cursor exists → repair already ran; only thread files rewritten, and the
+    # root is not even read.
     assert set(writer2.writes) == {"threads/t-1/PLAN.md", "threads/t-1/TODO.md"}
+    assert writer2.reads == []
 
 
 async def test_legacy_root_write_failure_does_not_pin_digest() -> None:
     # A failing ROOT repair write must not hold the projection cursor back.
-    writer = _RecordingWriter(fail_on=frozenset({"PLAN.md"}))
+    writer = _RecordingWriter(existing=dict(_LEGACY_ROOT), fail_on=frozenset({"PLAN.md"}))
     result = await WorkspaceProjector(writer=writer).project(
         plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
     )
+    assert "PLAN.md" not in writer.writes  # its repair write raised
+    assert writer.writes["TODO.md"] == _redirected("TODO.md")  # the others still landed
+    assert result.digest is not None
+
+
+async def test_legacy_root_read_failure_leaves_file_and_cursor() -> None:
+    # Can't tell what the root file is → leave it; the cursor still advances.
+    writer = _RecordingWriter(existing=dict(_LEGACY_ROOT), read_fail_on=frozenset({"PLAN.md"}))
+    result = await WorkspaceProjector(writer=writer).project(
+        plan=_plan(), memories=[], last_digest=None, prefix="threads/t-1/"
+    )
+    assert "PLAN.md" not in writer.writes
+    assert writer.writes["MEMORY.md"] == _redirected("MEMORY.md")
     assert result.digest is not None
 
 

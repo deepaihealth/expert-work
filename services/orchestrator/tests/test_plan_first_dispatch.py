@@ -341,6 +341,29 @@ async def test_stall_on_the_degraded_turn_fails_the_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_reply_on_a_dispatch_turn_takes_the_dispatch_retry() -> None:
+    # B-191:分发轮正常结束却空着,仍走 B-35 的重试 / 降级,不走主循环的空回复重试;
+    # 降级轮已不是分发轮,再空着就由 B-191 重试一次,run 照常收尾。
+    # 每次新建空回复:同一个实例落进历史后带上 id,再返回就成了「替换」而不是「追加」。
+    llm = _RecordingLLM(
+        responses=[
+            AIMessage(content="", tool_calls=[_update_plan_call("tc-1", _DELEGATE_STEPS)]),
+            *(AIMessage(content="", response_metadata={"finish_reason": "stop"}) for _ in range(3)),
+            AIMessage(content="final answer"),
+        ]
+    )
+    state = await _run(llm, thread_id="dispatch-empty")
+
+    # 分发轮与重试轮的空回复由 B-35 处理,原样留在历史里;第 4 次(降级轮)那条被 B-191 丢弃。
+    assert len(_hidden_with(state, _RETRY_MARKER)) == 1
+    assert len(_hidden_with(state, "[empty reply notice]")) == 1
+    empty_kept = [m for m in state["messages"] if isinstance(m, AIMessage) and m.content == ""]
+    assert len([m for m in empty_kept if not m.tool_calls]) == 2
+    assert str(state["messages"][-1].content) == "final answer"
+    assert llm.calls == 5
+
+
+@pytest.mark.asyncio
 async def test_dispatch_refusal_does_not_auto_complete_an_in_progress_delegate_step() -> None:
     """B-131 review round 1, finding 2 —— 派发打回的那一轮不是真正结束。要是在这里把
     「进行中」的委派步骤自动标完成,``pending_delegate`` 就空了,重试不会发生。"""

@@ -753,3 +753,311 @@ async def test_truncated_tool_call_is_discarded_and_retried_once() -> None:
     assert "2048" in str(notices[0].content)
     assert seen[1][-1] is not None and seen[1][-1].additional_kwargs.get(TRUNCATION_RETRY_KEY)
     assert _truncated_count("false") == before + 1
+
+
+# ---------------------------------------------------------------------------
+# B-191 —— 正常结束却既没有回答也没有工具调用:丢弃、加隐藏提示、重试一次
+# ---------------------------------------------------------------------------
+
+_STOP = {"finish_reason": "stop"}
+
+
+def _empty_stop() -> AIMessage:
+    # 每次新建:同一个实例落进历史会被分配 id,再次返回就成了「替换」而不是「追加」。
+    return AIMessage(content="", response_metadata=_STOP)
+
+
+def _cut() -> AIMessage:
+    return AIMessage(content="", response_metadata={"finish_reason": "length"})
+
+
+def _empty_count(outcome: str) -> float:
+    from prometheus_client import REGISTRY
+
+    value = REGISTRY.get_sample_value(
+        "expert_work_llm_empty_reply_total",
+        {"provider": "glm", "model": "glm-5.3", "outcome": outcome},
+    )
+    return value or 0.0
+
+
+def _empty_notices(state: AgentState) -> list[BaseMessage]:
+    from orchestrator.graph_builder.builder import EMPTY_REPLY_RETRY_KEY
+
+    return [m for m in state["messages"] if m.additional_kwargs.get(EMPTY_REPLY_RETRY_KEY)]
+
+
+async def _invoke_scripted(
+    llm: LLMCaller,
+    *,
+    thread_id: str,
+    registry: ToolRegistry | None = None,
+    step_count: int = 0,
+    max_steps: int = 5,
+    **graph_kwargs: Any,
+) -> AgentState:
+    async with make_checkpointer("memory") as cp:
+        compiled = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(
+                llm_caller=llm,
+                tool_registry=registry or ToolRegistry(),
+                output_cap_resolver=_GLM_CAPS,
+                **graph_kwargs,
+            )
+        )
+        return await compiled.ainvoke(
+            {
+                "messages": [HumanMessage(content="start")],
+                "step_count": step_count,
+                "max_steps": max_steps,
+            },
+            config={"configurable": {"thread_id": thread_id}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_empty_normal_stop_is_discarded_and_retried_once() -> None:
+    # 实测形态:工具调用写进了思考,正文与 tool_calls 都空、结束原因 stop。原来记成功。
+    from orchestrator.graph_builder.builder import EMPTY_REPLY_RETRY_KEY
+
+    before = _empty_count("retried")
+    llm = _ScriptedLLM(
+        responses=[_empty_stop(), AIMessage(content="这次答了", response_metadata=_STOP)]
+    )
+    seen: list[Sequence[BaseMessage]] = []
+    inner = llm.__call__
+
+    async def spy(*, messages: Sequence[BaseMessage], tools: Sequence[ToolSpec]) -> AIMessage:
+        seen.append(list(messages))
+        return await inner(messages=messages, tools=tools)
+
+    state = await _invoke_scripted(spy, thread_id="t-b191")
+
+    assert llm.calls == 2
+    assert state["messages"][-1].content == "这次答了"
+    assert [m.content for m in state["messages"] if isinstance(m, AIMessage)] == ["这次答了"], (
+        "空回复不进历史"
+    )
+    notices = _empty_notices(state)
+    assert len(notices) == 1
+    assert notices[0].additional_kwargs.get("expert_work_hide_from_ui") is True
+    assert "no answer and no tool call" in str(notices[0].content)
+    assert "base64" in str(notices[0].content)
+    assert seen[1][-1].additional_kwargs.get(EMPTY_REPLY_RETRY_KEY)
+    assert state.get("exit_reason") == "text_response"
+    assert _empty_count("retried") == before + 1
+
+
+@pytest.mark.asyncio
+async def test_second_empty_reply_fails_the_run_visibly() -> None:
+    before = _empty_count("failed")
+    llm = _StreamingScriptedLLM(responses=[_empty_stop(), _empty_stop()])
+
+    events, row = await _run_through_sse(llm, ToolRegistry())
+
+    errors = [e for e in events if e.event == "error"]
+    assert len(errors) == 1
+    assert errors[0].data["name"] == "EmptyReplyError"
+    assert "既没有给出回答" in errors[0].data["message"]
+    assert row is not None and row.status.value == "error"
+    assert row.error is not None and "没有调用工具" in row.error
+    assert llm.calls == 2
+    assert _empty_count("failed") == before + 1
+
+
+@pytest.mark.asyncio
+async def test_text_and_tool_call_replies_take_no_retry() -> None:
+    registry = ToolRegistry()
+    registry.register(_ScriptedTool(name="search", result="ok"))
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(
+                content="", tool_calls=[_tool_call("search", {}, "tc-1")], response_metadata=_STOP
+            ),
+            AIMessage(content="done", response_metadata=_STOP),
+        ]
+    )
+
+    state = await _invoke_scripted(llm, thread_id="t-b191-normal", registry=registry)
+
+    assert llm.calls == 2
+    assert state["messages"][-1].content == "done"
+    assert _empty_notices(state) == []
+
+
+@dataclass
+class _CacheHit:
+    """before-chain stub: every lookup hits with ``response``."""
+
+    response: AIMessage
+    name: str = "cache_hit_stub"
+    anchor: str = "before_llm_call"
+    after: tuple[str, ...] = ()
+    before: tuple[str, ...] = ()
+
+    async def __call__(self, ctx: Any, call_next: Any) -> None:
+        ctx.payload["llm_cache_hit"] = self.response
+        await call_next(ctx)
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_is_not_judged_again() -> None:
+    # 缓存命中的旧回答不再判(与 B-105 / B-186 同一口径)。
+    from expert_work.runtime.middleware import MiddlewareChain
+
+    llm = _ScriptedLLM(responses=[])
+    state = await _invoke_scripted(
+        llm,
+        thread_id="t-b191-cache",
+        before_llm_chain=MiddlewareChain.from_middlewares(
+            "before_llm_call",
+            [_CacheHit(response=_empty_stop())],
+        ),
+    )
+
+    assert llm.calls == 0
+    assert _empty_notices(state) == []
+    assert state["messages"][-1].content == ""
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_on_the_budget_wrap_up_turn_is_not_retried() -> None:
+    # 收尾轮没绑工具、run 按预算出口结束(不是「空着的成功」):不重试、不报错,照旧。
+    llm = _ScriptedLLM(responses=[_empty_stop()])
+
+    state = await _invoke_scripted(llm, thread_id="t-b191-wrapup", step_count=1, max_steps=1)
+
+    assert llm.calls == 1
+    assert _empty_notices(state) == []
+    assert state.get("exit_reason") == "max_steps"
+
+
+@pytest.mark.asyncio
+async def test_discarded_empty_reply_is_metered_but_not_cached() -> None:
+    # 丢弃的空回复照样计费(思考花了钱),但不进响应缓存;重试那次同样。
+    from orchestrator.llm.empty_reply import EmptyReplyError
+
+    rows, cache, raised = await _run_with_usage(
+        AIMessage(content="", usage_metadata=_USAGE, response_metadata=_STOP)
+    )
+
+    assert isinstance(raised, EmptyReplyError)
+    assert [(r.input_tokens, r.output_tokens, r.usage_kind) for r in rows] == [
+        (100, 2048, "conversation")
+    ] * 2
+    assert cache.puts == []
+
+
+@pytest.mark.asyncio
+async def test_truncation_on_the_empty_reply_retry_fails_the_run() -> None:
+    # 每一步合计只重试一次:空回复重试那一轮又截断,不再接着走 B-158 的重试。
+    from orchestrator.llm.truncation import OutputTruncatedError
+
+    llm = _ScriptedLLM(responses=[_empty_stop(), _cut()])
+    with pytest.raises(OutputTruncatedError):
+        await _invoke_scripted(llm, thread_id="t-b191-then-cut")
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_on_the_truncation_retry_fails_the_run() -> None:
+    # 反过来:B-158 截断重试那一轮回了空回复,同样不再重试。
+    from orchestrator.llm.empty_reply import EmptyReplyError
+
+    llm = _ScriptedLLM(responses=[_cut(), _empty_stop()])
+    with pytest.raises(EmptyReplyError):
+        await _invoke_scripted(llm, thread_id="t-cut-then-b191")
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reply_with_only_unparseable_tool_calls_is_retried() -> None:
+    # 图只派发 ``tool_calls``:只带解析失败的调用,原来会被当成说完了、记成空着的成功。
+    invalid = {"name": "write_file", "args": "{", "id": "call_x", "error": "bad json"}
+    llm = _ScriptedLLM(
+        responses=[
+            AIMessage(content="", invalid_tool_calls=[invalid], response_metadata=_STOP),
+            AIMessage(content="这次答了", response_metadata=_STOP),
+        ]
+    )
+
+    state = await _invoke_scripted(llm, thread_id="t-b191-invalid")
+
+    assert llm.calls == 2
+    assert len(_empty_notices(state)) == 1
+    assert state["messages"][-1].content == "这次答了"
+
+
+def _filtered_count() -> float:
+    return _empty_count("filtered")
+
+
+@pytest.mark.asyncio
+async def test_content_filtered_empty_reply_fails_without_retry() -> None:
+    # 厂商内容审核拦下、一个字没回:重来也是被拦,不重试,报的是「被审核拦了」而不是「没回答」。
+    before = _filtered_count()
+    llm = _StreamingScriptedLLM(
+        responses=[
+            AIMessage(content="", response_metadata={"finish_reason": "content_filter"}),
+            AIMessage(content="不该走到这里", response_metadata=_STOP),
+        ]
+    )
+
+    events, row = await _run_through_sse(llm, ToolRegistry())
+
+    errors = [e for e in events if e.event == "error"]
+    assert len(errors) == 1
+    assert errors[0].data["name"] == "ContentFilteredError"
+    assert "内容审核拦截" in errors[0].data["message"]
+    assert row is not None and row.status.value == "error"
+    assert llm.calls == 1
+    assert _filtered_count() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_content_filtered_reply_is_metered_but_not_cached() -> None:
+    from orchestrator.llm.empty_reply import ContentFilteredError
+
+    rows, cache, raised = await _run_with_usage(
+        AIMessage(content="", usage_metadata=_USAGE, response_metadata={"stop_reason": "refusal"})
+    )
+
+    assert isinstance(raised, ContentFilteredError)
+    assert [(r.input_tokens, r.output_tokens) for r in rows] == [(100, 2048)]
+    assert cache.puts == []
+
+
+def _frame_shapes(events: list[Any]) -> list[tuple[str, Any]]:
+    return [
+        (
+            e.event,
+            {k: sorted(v) if isinstance(v, dict) else None for k, v in e.data.items()}
+            if isinstance(e.data, dict)
+            else None,
+        )
+        for e in events
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_retry_takes_the_same_path_as_the_truncation_retry() -> None:
+    # 丢弃那一轮与 B-158 同一条路:同样的帧、同样形状的 updates,权威帧里只有那条隐藏提示
+    # (流式预览由它取代,与 B-158 一致)。
+    from orchestrator.graph_builder.builder import EMPTY_REPLY_RETRY_KEY, TRUNCATION_RETRY_KEY
+
+    shapes: dict[str, list[tuple[str, Any]]] = {}
+    discarded: dict[str, Any] = {}
+    for kind, first in (("b158", _cut()), ("b191", _empty_stop())):
+        llm = _StreamingScriptedLLM(
+            responses=[first, AIMessage(content="ok", response_metadata=_STOP)]
+        )
+        events, row = await _run_through_sse(llm, ToolRegistry())
+        assert row is not None and row.status.value == "success"
+        shapes[kind] = _frame_shapes(events)
+        discarded[kind] = next(e for e in events if e.event == "updates").data["agent"]["messages"]
+
+    assert shapes["b191"] == shapes["b158"]
+    for kind, key in (("b158", TRUNCATION_RETRY_KEY), ("b191", EMPTY_REPLY_RETRY_KEY)):
+        [only] = discarded[kind]
+        assert only["type"] == "human"
+        assert only["additional_kwargs"] == {"expert_work_hide_from_ui": True, key: True}

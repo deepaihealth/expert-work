@@ -37,6 +37,9 @@ class _RecordingWriter:
     async def write(self, *, rel: str, content: str) -> None:
         self.writes[rel] = content
 
+    async def read(self, rel: str) -> str | None:
+        return self.writes.get(rel)
+
 
 @dataclass
 class _ScriptedLLM:
@@ -122,18 +125,11 @@ async def test_turn_end_projection_writes_plan_files() -> None:
     writer = _RecordingWriter()
     state = await _run_one_turn(writer=writer, plan=_plan(), thread_id=T1)
     # BUG-10 (方案 a) — PLAN.md + TODO.md land under the THREAD's projection
-    # dir, never the user-scoped workspace root.
-    assert set(writer.writes) == {
-        f"threads/{T1}/PLAN.md",
-        f"threads/{T1}/TODO.md",
-        "PLAN.md",
-        "TODO.md",
-        "MEMORY.md",
-    }
+    # dir, never the user-scoped workspace root. B-188 — a fresh workspace has
+    # no legacy root files, so the first projection creates none.
+    assert set(writer.writes) == {f"threads/{T1}/PLAN.md", f"threads/{T1}/TODO.md"}
     assert "do the thing" in writer.writes[f"threads/{T1}/PLAN.md"]
     assert "[x]" in writer.writes[f"threads/{T1}/TODO.md"]
-    # 终审 F2 — first projection rewrites the legacy root files as redirects.
-    assert "no longer read" in writer.writes["PLAN.md"]
     # The projection cursor is persisted on the checkpointed state.
     assert state.get("last_projection_hash")
     # PLAN.md 完整性 —— 写进去的那份 PLAN.md 的摘要同样落检查点(tools_node 这一处;
