@@ -107,6 +107,7 @@ class LangfuseSdkClient:
         name: str,
         input: Any,
         metadata: Mapping[str, Any] | None = None,
+        model_parameters: Mapping[str, Any] | None = None,
     ) -> _SdkSpan:
         meta = dict(metadata or {})
         model = meta.get("model")
@@ -119,6 +120,10 @@ class LangfuseSdkClient:
             input=input,
             metadata=meta,
             model=str(model) if model is not None else None,
+            # B-187 — lands on the ``langfuse.observation.model.parameters``
+            # attribute (the generation's "model parameters" in the UI). The
+            # SDK does not run ``mask`` over it: scalars only, no secrets.
+            model_parameters=None if model_parameters is None else dict(model_parameters),
         )
         return _SdkSpan(generation)
 

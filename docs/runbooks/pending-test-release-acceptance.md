@@ -307,3 +307,11 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 - [ ] **28.1 发版构建成功,依赖下载变快**:下一次 `tools/deploy/release.sh test …`,看两个镜像 `uv sync` 那一步的输出。判据:① 两个镜像都构建成功,没有 `uv.lock still has files.pythonhosted.org URLs` 报错;② 记下输出里 `Prepared N packages in X s` 的 X(10-17 本机实测:control-plane 约 11 s、credential-proxy 约 4 s;走官方源时分别约 25 s / 16 s,10-16 官方源慢时要几十分钟)。**没修好时**:构建参数没传进去时构建照样成功,只能从耗时看出来;构建输出不打印下载地址,地址是否走镜像已在 PR 里用带 `-v` 的副本逐条核过(两个镜像的锁内文件全部走 `mirrors.aliyun.com`)。
 - [ ] **28.2 退回开关可用(只在镜像出问题时做)**:镜像没同步到刚升级的版本、构建报 404 时,用 `EXPERT_WORK_PYPI_MIRROR= tools/deploy/release.sh …` 重发。判据:构建成功。平时不需要做,发生过就在这里记一笔。
+
+## §29 Langfuse 记录实际发出的模型名与请求参数(B-187)
+
+**背景**:改前 Langfuse 里每次模型调用(名为 `llm_call` 的 GENERATION)模型名为空、没有任何请求参数;现在带上实际应答模型的名字,以及平台改写之后真正发给厂商的温度、输出上限、思考档位等字段(没发的字段不出现)。发给厂商的请求本身不变。Langfuse 会按它自带的价目表给认识的模型估一个费用,那不是平台计费。
+
+- [ ] **29.1 模型名与参数可见**:发测试后,用 eval-hb 跑一道题(或调试台任一 deepseek-v4-pro 智能体发一句话),Langfuse → Traces 打开该 run 的 trace,点 `llm_call`。判据:① 顶部 Model 显示 `deepseek-v4-pro`;② Model parameters 里有 `temperature: 1`、`max_tokens: 32768`、`reasoning_effort: high`(eval-hb 的配置);③ 没有任何 key、地址类字段。也可以用接口 `GET /api/public/observations/{id}` 看 `model` / `modelParameters`。**没修好时**:Model 为空,没有 Model parameters。
+- [ ] **29.2 平台改写过的值如实记录**:找一个用固定温度模型(如 kimi-k3)的智能体 run,看它的 `llm_call`。判据:`temperature` 是目录要求的固定值(kimi-k3 为 1),不是 manifest 里填的值。测试环境若没有这类智能体,记「不可判」,由自动测试 `test_langfuse_request_params.py` 覆盖。
+- [ ] **29.3 备用模型接管时各记各的**:观察性,不专门造故障。一周内若有主模型报错、备用模型接管的 run,看它的两个 `llm_call`。判据:报错那个是主模型名和参数,成功那个是备用模型自己的。一周内没发生就记 0 次。
