@@ -292,3 +292,11 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 - [x] **26.1 正常对话不受影响**:发测试后金丝雀 `RESULT: PASS`;调试台用任一思考模型的 Agent 发一条需要先想再答的问题。判据:正常回答,run 状态成功。**没修好时**:不适用(防回归:改动只在停顿超时分支,正常收尾不经过它)。 **10-16 测试 `93c8a246` 过**:发布金丝雀 `RESULT: PASS`;思考模型 `deepseek-flash`(eval-ssb)真跑一道表格题,run `success` / `text_response`,每轮都带思考、末轮 `finish_reason = stop`,47.8 s;smoke 新增的沙箱镜像缓存检查 OK。
 - [ ] **26.2 发生了就可见**:发测试一周后只读查 `SELECT status, created_at FROM agent_run WHERE error LIKE '%还没给出回答就中断了%'`,并在两个控制面 pod 日志里 `grep agent_node.stalled_without_answer`。判据:查到的 run 状态都是 `error`;同期不再有「状态成功、最后一轮只有思考、因停顿超时结束」的 run(`run_event` 里 `event_name = 'updates'` 且 `data::text LIKE '%stream_idle_timeout%'` 的帧,逐条看都带回答文字或工具调用)。一周内一次都没发生也算过(写明 0 次)。**没修好时**:停顿只有思考的 run 状态成功、回复为空。**分辨修没修好靠自动测试**(10-16 逐条变异验过):`test_react_graph.py::test_stall_after_reasoning_only_fails_the_run_visibly`(真路由 + 真图走 `run_agent`)撤掉主循环的判定 → 0 条错误帧、红;`test_stall_without_answer_is_metered_but_not_cached` 去掉记账 → 用量 0 行、红;`test_llm_stall.py::test_planner_still_falls_back_to_a_single_step_plan_on_a_stall` 把判定挪回路由直接报错 → 规划跟着报错、红。
+
+## §30 新对话不再往工作区根目录写文件(B-188)+ 空回复重试一次(B-191)
+
+**背景**:B-188 —— 改前每个新对话第一次记录计划时,平台往工作区根目录写 `PLAN.md` / `TODO.md` / `MEMORY.md` 三个「已迁移」提示文件,根目录已有的同名文件(用户自己写的)也会被覆盖;现在只改写平台旧版本留下的旧投影。B-191 —— 一轮正常结束却既没回答也没工具调用时,改前 run 记成功、回复为空;现在丢弃重试一次,再空就报错。
+
+- [ ] **30.1 新工作区根目录不再多文件(B-188)**:发测试后用一个新用户跑一个会用计划工具的任务(eval-hb 跑任一 Harness-Bench 题即可,或调试台让智能体「先列计划再做」)。跑完列工作区根目录。判据:根目录没有内容是 `<!-- Moved: this workspace's plan/state files now live under threads/…` 的文件;`threads/<thread_id>/PLAN.md` 照常存在。**没修好时**:根目录多出这三个文件。
+- [ ] **30.2 用户自己的根目录文件不被覆盖(B-188)**:新用户第一轮先让智能体在工作区根目录写 `PLAN.md`,内容随便一句话(如「我的计划:周三前交稿」),同一轮再让它用计划工具列两步计划。跑完读根目录 `PLAN.md`。判据:内容仍是那句话。**没修好时**:被改成「已迁移」提示。
+- [ ] **30.3 空回复不再记成功(B-191)**:观察性,无法按需触发(30 天 2803 个成功 run 里只有 1 次)。发测试一周后:① 两个控制面 pod 汇总 `expert_work_llm_empty_reply_total`,并 `grep agent_node.empty_reply_` 日志;② 重跑 10-17 的只读统计(成功 run 里最后一条回复既无正文也无工具调用的个数,停顿的除外)。判据:② 为 0;① 里 `outcome="failed"` 的 run 状态都是 `error` 且错误文案是「模型结束了这一轮,却既没有给出回答,也没有调用工具」。一周内一次都没发生也算过(写明 0 次)。**没修好时**:② 不为 0。
