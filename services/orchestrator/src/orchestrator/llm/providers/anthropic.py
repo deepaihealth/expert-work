@@ -583,12 +583,15 @@ class AnthropicProvider:
         output_config = {"effort": self.effort} if self.effort is not None else None
         return thinking_payload, output_config
 
-    def request_params(self, *, structured: bool) -> dict[str, Any]:
-        """B-187 — the sampling / output-cap / thinking fields one request
-        sends, as on the wire (an omitted field is absent): what the Langfuse
-        generation records as its model parameters. Same sources as
+    def request_params(self, *, structured: bool, stream: bool) -> dict[str, Any]:
+        """B-187 — the request fields one call sends beyond the structural ones
+        (model / system / messages / tools / tool_choice / stream), as on the
+        wire (an omitted field is absent): what the Langfuse generation
+        records as its model parameters. Same sources as
         :meth:`_prepare_anthropic_request` and the same None-means-omitted
-        rule as :func:`_build_messages_body`."""
+        rule as :func:`_build_messages_body`; streaming adds only the
+        structural ``stream: true``."""
+        del stream
         thinking_payload, output_config = self._compute_controls(structured=structured)
         fields = {
             "max_tokens": self.max_tokens,

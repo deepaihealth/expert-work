@@ -7,44 +7,54 @@
 这里用真工厂(``build_llm_router`` → ``_build_provider``,目录改写全在)+ 假 HTTP 传输
 (``httpx.MockTransport``,抓下真正发出去的请求体)+ ``LangfuseMiddleware``,逐条断言
 generation 上记的参数:是线上那份(与抓到的请求体逐项相等),也是改写后的值(写死的期望)。
-备用模型接管、思考升档的路由各记各自发出的那份。
+备用模型接管、思考升档的路由各记各自发出的那份。比对的是请求体去掉结构字段后的**全部**字段
+(见 ``_STRUCTURAL_FIELDS``):以后多发一个字段,这里就会红,逼着决定它记不记。
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from expert_work.protocol import ModelSpec, StructuredOutputSpec
 from expert_work.runtime.middleware import (
+    CallNext,
     LangfuseMiddleware,
     MiddlewareChain,
+    MiddlewareContext,
     RecordedSpan,
     RecordingLangfuseClient,
 )
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator.agent_factory import _escalated_model, build_llm_router
+from orchestrator.llm.router import LLMRouter, ProviderHandle
+from orchestrator.tools.registry import ToolSpec
 
 _KEY = "expert-work/dev/llm/any"
 #: 平台凭据的哨兵值:它确实上了线(请求头),但绝不能出现在 trace 字段里。
 _API_KEY = "sk-b187-sentinel-0123456789abcdef"
 
-#: 请求体里算「模型参数」的字段 —— 与 generation 上记的那份逐项比对用。
-_PARAM_FIELDS = (
-    "temperature",
-    "top_p",
-    "max_tokens",
-    "max_completion_tokens",
-    "reasoning_effort",
-    "thinking",
-    "enable_thinking",
-    "thinking_budget",
-    "output_config",
+#: 请求体里的结构字段(不算模型参数)。其余**每一个**字段都必须出现在 generation 的记录里。
+#: OpenAI 线格式:model / messages / tools / tool_choice / response_format(结构化)/
+#: stream / stream_options(流式);Anthropic 另有 system。Anthropic 的 betas 走请求头
+#: ``anthropic-beta``,不在请求体里。
+_STRUCTURAL_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "system",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "stream",
+        "stream_options",
+    }
 )
 #: generation 上允许出现的键(拍平后)—— 只有采样 / 输出上限 / 思考字段。
 _ALLOWED_KEYS = {
@@ -57,6 +67,7 @@ _ALLOWED_KEYS = {
     "enable_thinking",
     "thinking_budget",
     "output_config.effort",
+    "tool_stream",
 }
 
 _VERDICT = StructuredOutputSpec(
@@ -104,11 +115,20 @@ def _anthropic_reply(body: dict[str, Any]) -> httpx.Response:
     )
 
 
-def _openai_reply() -> httpx.Response:
+def _openai_reply(body: dict[str, Any]) -> httpx.Response:
+    if body.get("stream"):
+        return httpx.Response(
+            200,
+            content=_sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})
+            + b"data: [DONE]\n\n",
+        )
+    # 结构化调用走 complete();兼容厂商走 prompt 路径,正文就是 JSON。
     return httpx.Response(
         200,
-        content=_sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})
-        + b"data: [DONE]\n\n",
+        json={
+            "choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        },
     )
 
 
@@ -128,7 +148,7 @@ class _Wire:
             return httpx.Response(503, text="upstream unavailable")
         if request.url.path.endswith("/v1/messages"):
             return _anthropic_reply(body)
-        return _openai_reply()
+        return _openai_reply(body)
 
 
 async def _any_key(provider: str) -> list[str]:
@@ -160,12 +180,11 @@ async def _call(
 
 
 def _sent(body: dict[str, Any]) -> dict[str, Any]:
-    """一份请求体里的参数字段,按 trace 的口径拍平(``thinking.type``)。"""
+    """一份请求体去掉结构字段后的全部字段,按 trace 的口径拍平(``thinking.type``)。"""
     flat: dict[str, Any] = {}
-    for key in _PARAM_FIELDS:
-        if key not in body:
+    for key, value in body.items():
+        if key in _STRUCTURAL_FIELDS:
             continue
-        value = body[key]
         if isinstance(value, dict):
             flat.update({f"{key}.{sub}": v for sub, v in value.items()})
         else:
@@ -211,6 +230,8 @@ async def test_no_sampling_model_records_no_temperature() -> None:
                 "thinking.type": "enabled",
                 "reasoning_effort": "high",
                 "max_tokens": 8000,
+                # glm 流式调用都带 tool_stream(工具参数逐段流出)。
+                "tool_stream": True,
             },
         ),
         # 豆包没有 max 档,映射到 high;输出上限字段是 max_completion_tokens。
@@ -240,6 +261,24 @@ async def test_vendor_mapped_thinking_records_the_wire_values(
 
     assert span.model_parameters == expected
     assert span.model_parameters == _sent(wire.bodies[0])
+
+
+@pytest.mark.asyncio
+async def test_glm_records_tool_stream_only_when_the_call_streams() -> None:
+    """glm 的 ``tool_stream`` 只在流式调用里发;结构化调用走 complete(),不发也不记。"""
+    wire = _Wire()
+    streamed, structured = await _call(
+        ModelSpec(provider="glm", name="glm-5.3"), wire, output_schemas=(None, _VERDICT)
+    )
+
+    assert wire.bodies[0].get("stream") is True
+    assert streamed.model_parameters is not None
+    assert streamed.model_parameters["tool_stream"] is True
+    assert streamed.model_parameters == _sent(wire.bodies[0])
+    assert "stream" not in wire.bodies[1]
+    assert structured.model_parameters is not None
+    assert "tool_stream" not in structured.model_parameters
+    assert structured.model_parameters == _sent(wire.bodies[1])
 
 
 @pytest.mark.asyncio
@@ -323,3 +362,65 @@ async def test_recorded_params_carry_no_secrets(model: ModelSpec) -> None:
     recorded = json.dumps([span.metadata, span.model_parameters])
     for secret in (_API_KEY, "llm.internal.example", "api.anthropic.com"):
         assert secret not in recorded
+
+
+@dataclass
+class _ParamsBlowUp:
+    """能正常应答、但 ``request_params`` 会抛的适配器。"""
+
+    model: str = "params-blow-up"
+
+    async def complete(
+        self,
+        *,
+        messages: Sequence[BaseMessage],
+        tools: Sequence[ToolSpec],
+        output_schema: StructuredOutputSpec | None = None,
+    ) -> AIMessage:
+        del messages, tools, output_schema
+        return AIMessage(content="ok")
+
+    def request_params(self, *, structured: bool, stream: bool) -> dict[str, Any]:
+        del structured, stream
+        raise RuntimeError("request_params blew up")
+
+
+@dataclass
+class _PayloadSpy:
+    """记下 around_llm_call 链上看到的 payload 键。"""
+
+    keys: list[set[str]] = field(default_factory=list)
+    name: str = "payload_spy"
+    anchor: str = "around_llm_call"
+    after: tuple[str, ...] = ()
+    before: tuple[str, ...] = ()
+
+    async def __call__(self, ctx: MiddlewareContext, call_next: CallNext) -> None:
+        self.keys.append(set(ctx.payload))
+        await call_next(ctx)
+
+
+@pytest.mark.asyncio
+async def test_request_params_failure_never_fails_the_call(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """记录参数只为观测:它抛了,调用照常成功(不换备用),payload 里没有这两个键,留一条 warning。"""
+    spy = _PayloadSpy()
+    client = RecordingLangfuseClient()
+    chain = MiddlewareChain.from_middlewares(
+        "around_llm_call", [spy, LangfuseMiddleware(client=client)]
+    )
+    router = LLMRouter(
+        providers=[ProviderHandle(provider=_ParamsBlowUp(), key="fake:params-blow-up")],
+        around_llm_chain=chain,
+    )
+
+    with caplog.at_level("WARNING", logger="orchestrator.llm.router"):
+        response = await router(messages=[HumanMessage(content="hi")], tools=[])
+
+    assert response.content == "ok"
+    assert spy.keys == [{"provider_key", "messages", "tools"}]
+    [span] = client.spans
+    assert span.error is None
+    assert span.model_parameters is None
+    assert "llm_router.request_params_failed" in caplog.text
