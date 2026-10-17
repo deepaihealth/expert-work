@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1242">
+<title>Expert Work 测评报告 · Harness-Bench · 2026.10</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&amp;family=Noto+Sans+SC:wght@400;500;700;900&amp;display=swap">
+<style>
+body{margin:0;background:#F4F0E8}
+a{color:#2152D9}a:hover{color:#163A9C}
+.n{font-family:"Archivo","Noto Sans SC",sans-serif;font-variant-numeric:tabular-nums lining-nums}
+</style>
+</head>
+<body>
+<div style="width: 1242px; box-sizing: border-box; background: #F4F0E8; color: #1B1814; font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif; padding: 76px 84px 64px; display: flex; flex-direction: column">
+
+<!-- 页眉 -->
+<div style="border-top: 4px solid #2152D9; padding-top: 34px; display: flex; flex-direction: column; gap: 14px">
+<span class="n" style="font-size: 24px; letter-spacing: 0.22em; color: #2152D9; font-weight: 500">EXPERT WORK · 测评报告 · 2026.10</span>
+<span class="n" style="font-size: 132px; line-height: 1; font-weight: 900; letter-spacing: -0.035em; margin-top: 18px">Expert Work</span>
+<span style="font-size: 52px; line-height: 1.3; font-weight: 900; margin-top: 8px">同一个模型，与 OpenAI、Anthropic 同处<span style="color: #E2590B">第一梯队</span></span>
+<span style="font-size: 21px; line-height: 1.6; color: #6E675E">测评集 Harness-Bench（北京大学与 Qiyuan Tech 发布）· 257 道真实工作任务 · 8 家统一使用 DeepSeek V4 Pro 模型</span>
+</div>
+
+<!-- 三个数 -->
+<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 40px; border-top: 1px solid #DCD5CA; border-bottom: 1px solid #DCD5CA">
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 26px 0">
+<span class="n" style="font-size: 64px; line-height: 1; font-weight: 800; color: #E2590B">68.4</span>
+<span style="font-size: 20px; color: #6E675E">综合得分 · 4 轮平均</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 26px 0 26px 32px; border-left: 1px solid #DCD5CA">
+<span class="n" style="font-size: 64px; line-height: 1; font-weight: 800">&lt; 1.3<span style="font-size: 28px; font-family: 'Noto Sans SC', sans-serif; font-weight: 700"> 分</span></span>
+<span style="font-size: 20px; color: #6E675E">前 4 名之间的差距，在误差之内</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 26px 0 26px 32px; border-left: 1px solid #DCD5CA">
+<span class="n" style="font-size: 64px; line-height: 1; font-weight: 800">¥1.3</span>
+<span style="font-size: 20px; color: #6E675E">每道题的模型费用，主流水平</span>
+</div>
+</div>
+
+<!-- 排名 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 56px">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">RANKING · 8 家同题同模型</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">综合得分排名：前 4 名属于同一梯队</span>
+<span style="font-size: 19px; line-height: 1.6; color: #6E675E">得分 = 257 道题的平均分（满分 100）· Expert Work 为 4 轮平均（69.7 / 68.4 / 66.5 / 69.2），其他 7 家为官方公布的 1 轮成绩 · 条形从 60 分画起</span>
+</div>
+<div style="display: grid; grid-template-columns: 88px minmax(0, 1fr) 140px 300px; column-gap: 20px; margin-top: 26px; padding: 0 0 12px; border-bottom: 1px solid #DCD5CA; font-size: 19px; color: #8A8278">
+<span style="padding-left: 18px">排名</span><span>框架</span><span style="text-align: right">得分</span><span></span>
+</div>
+<div style="display: flex; flex-direction: column; border-left: 5px solid #2152D9">
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 96px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 52px; font-weight: 800; padding-left: 14px; color: #1B1814">1</span>
+<div style="display: flex; flex-direction: column; gap: 2px"><span class="n" style="font-size: 34px; font-weight: 600">Codex</span><span style="font-size: 18px; color: #8A8278">OpenAI</span></div>
+<span class="n" style="font-size: 42px; font-weight: 800; text-align: right">69.25</span>
+<div style="height: 10px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 10px; width: 92.5%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 108px; border-bottom: 1px solid #E6E0D6; background: #FBEDE3; box-shadow: inset 5px 0 0 #E2590B">
+<span class="n" style="font-size: 60px; font-weight: 900; padding-left: 14px; color: #E2590B">2</span>
+<div style="display: flex; flex-direction: column; gap: 2px"><span class="n" style="font-size: 38px; font-weight: 800; color: #E2590B">Expert Work</span><span style="font-size: 18px; color: #8A6A55">4 轮平均</span></div>
+<span class="n" style="font-size: 48px; font-weight: 900; text-align: right; color: #E2590B">68.44</span>
+<div style="height: 12px; background: #EBD9CB; position: relative"><div style="position: absolute; left: 0; top: 0; height: 12px; width: 84.4%; background: #E2590B"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 96px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 52px; font-weight: 800; padding-left: 14px">3</span>
+<div style="display: flex; flex-direction: column; gap: 2px"><span class="n" style="font-size: 34px; font-weight: 600">OpenCode</span></div>
+<span class="n" style="font-size: 42px; font-weight: 800; text-align: right">68.19</span>
+<div style="height: 10px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 10px; width: 81.9%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 96px">
+<span class="n" style="font-size: 52px; font-weight: 800; padding-left: 14px">4</span>
+<div style="display: flex; flex-direction: column; gap: 2px"><span class="n" style="font-size: 34px; font-weight: 600">Claude Code</span><span style="font-size: 18px; color: #8A8278">Anthropic</span></div>
+<span class="n" style="font-size: 42px; font-weight: 800; text-align: right">68.01</span>
+<div style="height: 10px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 10px; width: 80.1%; background: #2152D9"></div></div>
+</div>
+</div>
+<div style="display: flex; flex-direction: column; border-left: 5px solid #C9C2B6; margin-top: 14px">
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 72px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 38px; font-weight: 700; padding-left: 14px; color: #A39B90">5</span>
+<span class="n" style="font-size: 28px; font-weight: 500; color: #4E483F">Hermes</span>
+<span class="n" style="font-size: 32px; font-weight: 700; text-align: right; color: #4E483F">66.66</span>
+<div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 66.6%; background: #A7A196"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 72px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 38px; font-weight: 700; padding-left: 14px; color: #A39B90">6</span>
+<span class="n" style="font-size: 28px; font-weight: 500; color: #4E483F">Goose</span>
+<span class="n" style="font-size: 32px; font-weight: 700; text-align: right; color: #4E483F">65.41</span>
+<div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 54.1%; background: #A7A196"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 72px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 38px; font-weight: 700; padding-left: 14px; color: #A39B90">7</span>
+<span class="n" style="font-size: 28px; font-weight: 500; color: #4E483F">Nanobot</span>
+<span class="n" style="font-size: 32px; font-weight: 700; text-align: right; color: #4E483F">64.92</span>
+<div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 49.2%; background: #A7A196"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 83px minmax(0, 1fr) 140px 300px; column-gap: 20px; align-items: center; height: 72px">
+<span class="n" style="font-size: 38px; font-weight: 700; padding-left: 14px; color: #A39B90">8</span>
+<span class="n" style="font-size: 28px; font-weight: 500; color: #4E483F">OpenClaw</span>
+<span class="n" style="font-size: 32px; font-weight: 700; text-align: right; color: #4E483F">63.10</span>
+<div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 31.0%; background: #A7A196"></div></div>
+</div>
+</div>
+<span style="font-size: 17px; color: #8A8278; margin-top: 12px">蓝色竖条 = 第一梯队 · 橙色 = Expert Work</span>
+
+<!-- 01 意味着什么 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 72px; padding-top: 30px; border-top: 1px solid #DCD5CA">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">01 · 意义</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">这对 Expert Work 意味着什么</span>
+</div>
+<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 36px; margin-top: 28px">
+<div style="display: flex; flex-direction: column; gap: 10px; border-top: 3px solid #1B1814; padding-top: 20px">
+<span style="font-size: 44px; line-height: 1.1; font-weight: 900">同档</span>
+<span style="font-size: 24px; font-weight: 700">自研执行层，能力不吃亏</span>
+<span style="font-size: 19px; line-height: 1.7; color: #4E483F">对手是 OpenAI、Anthropic 的官方框架。自研换来的可控与合规（客户数据隔离、全程留痕），没有拿能力做交换。</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 10px; border-top: 3px solid #1B1814; padding-top: 20px">
+<span class="n" style="font-size: 44px; line-height: 1.1; font-weight: 900">0<span style="font-size: 30px; font-family: 'Noto Sans SC', sans-serif"> 次故障</span></span>
+<span style="font-size: 24px; font-weight: 700">大规模运行稳定</span>
+<span style="font-size: 19px; line-height: 1.7; color: #4E483F">4 轮共 1,028 道题次，最多 8 个任务同时跑，平台没有一次崩溃或超时。</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 10px; border-top: 3px solid #1B1814; padding-top: 20px">
+<span class="n" style="font-size: 44px; line-height: 1.1; font-weight: 900">1<span style="font-size: 30px; font-family: 'Noto Sans SC', sans-serif"> 天</span></span>
+<span style="font-size: 24px; font-weight: 700">测评驱动的快速改进</span>
+<span style="font-size: 19px; line-height: 1.7; color: #4E483F">发现 5 处平台改进点，1 天内全部完成优化并上线测试环境；优化后失败题清零，见下方「优化之后」。</span>
+</div>
+</div>
+
+<!-- 02 做对了什么 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 72px; padding-top: 30px; border-top: 1px solid #DCD5CA">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">02 · 技术可解释性</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">Expert Work 做对了什么</span>
+<span style="font-size: 19px; line-height: 1.6; color: #6E675E">逐题对照 8 家的评分明细和执行过程后，有数据支撑的三点</span>
+</div>
+<div style="display: flex; flex-direction: column; margin-top: 22px">
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 240px; column-gap: 32px; align-items: center; padding: 28px 0; border-bottom: 1px solid #E6E0D6">
+<div style="display: flex; flex-direction: column; gap: 8px"><span style="font-size: 27px; font-weight: 700">模型一次写得太长，平台会自动补救，任务不中断</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">回答超出长度上限时，平台作废那半截、提示模型拆小重做。同样的情况，OpenCode、Goose、OpenClaw 直接停在半截，这道题得 0 分。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px; text-align: right"><span class="n" style="font-size: 56px; line-height: 1; font-weight: 800; color: #E2590B">32 / 41</span><span style="font-size: 17px; color: #8A8278">4 轮撞上限 41 次，救回 32 次</span></div>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 240px; column-gap: 32px; align-items: center; padding: 28px 0; border-bottom: 1px solid #E6E0D6">
+<div style="display: flex; flex-direction: column; gap: 8px"><span style="font-size: 27px; font-weight: 700">交付说明更完整</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">"交接说明"类评分项的通过率，比 Codex、OpenCode、Goose、Nanobot 高 4–6 个百分点。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px; text-align: right"><span class="n" style="font-size: 56px; line-height: 1; font-weight: 800; color: #E2590B">64%</span><span style="font-size: 17px; color: #8A8278">对方 57–60%</span></div>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 240px; column-gap: 32px; align-items: center; padding: 28px 0">
+<div style="display: flex; flex-direction: column; gap: 8px"><span style="font-size: 27px; font-weight: 700">不半途而废</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">1,028 次运行，没有一次因为格式出错而中断，也没有一次做两三步就收工。同一道题上，Goose、OpenCode 都因格式出错中断过。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px; text-align: right"><span class="n" style="font-size: 56px; line-height: 1; font-weight: 800; color: #E2590B">0<span style="font-size: 26px; font-family: 'Noto Sans SC', sans-serif"> 次</span></span><span style="font-size: 17px; color: #8A8278">中途放弃 / 格式出错中断</span></div>
+</div>
+</div>
+<span style="font-size: 16px; line-height: 1.6; color: #8A8278; margin-top: 4px">第 1 条有执行记录直接对应；第 2、3 条是观察到的行为差异，尚未单独做对照实验。</span>
+
+<!-- 03 分类对比 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 72px; padding-top: 30px; border-top: 1px solid #DCD5CA">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">03 · 分类对比</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">不偏科：5 个主要类别都<span style="color: #E2590B">高于 7 家平均</span></span>
+<span style="font-size: 19px; line-height: 1.6; color: #6E675E">Expert Work 为 4 轮平均 · 名次为在 8 家中的位置 · 网页开发只有 1 道题，只计入总分</span>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 150px 140px 250px 110px; column-gap: 16px; margin-top: 26px; padding-bottom: 12px; border-bottom: 1px solid #DCD5CA; font-size: 19px; color: #8A8278">
+<span>类别（题数）</span><span style="text-align: right; color: #E2590B">Expert Work</span><span style="text-align: right">7 家平均</span><span>该类第 1</span><span style="text-align: right">名次</span>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 150px 140px 250px 110px; column-gap: 16px; align-items: center; height: 80px; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 26px; font-weight: 700">软件开发 <span class="n" style="font-size: 19px; font-weight: 500; color: #8A8278">74</span></span>
+<span class="n" style="font-size: 36px; font-weight: 800; text-align: right; color: #E2590B">56.7</span>
+<span class="n" style="font-size: 28px; font-weight: 600; text-align: right; color: #4E483F">55.1</span>
+<span class="n" style="font-size: 22px; color: #4E483F">OpenCode 60.8</span>
+<span class="n" style="font-size: 30px; font-weight: 800; text-align: right">3</span>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 150px 140px 250px 110px; column-gap: 16px; align-items: center; height: 80px; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 26px; font-weight: 700">业务运营 <span class="n" style="font-size: 19px; font-weight: 500; color: #8A8278">66</span></span>
+<span class="n" style="font-size: 36px; font-weight: 800; text-align: right; color: #E2590B">75.2</span>
+<span class="n" style="font-size: 28px; font-weight: 600; text-align: right; color: #4E483F">73.8</span>
+<span class="n" style="font-size: 22px; color: #4E483F">Codex 79.2</span>
+<span class="n" style="font-size: 30px; font-weight: 800; text-align: right">4</span>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 150px 140px 250px 110px; column-gap: 16px; align-items: center; height: 80px; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 26px; font-weight: 700">系统运维 <span class="n" style="font-size: 19px; font-weight: 500; color: #8A8278">61</span></span>
+<span class="n" style="font-size: 36px; font-weight: 800; text-align: right; color: #E2590B">72.0</span>
+<span class="n" style="font-size: 28px; font-weight: 600; text-align: right; color: #4E483F">69.3</span>
+<span class="n" style="font-size: 22px; color: #4E483F">Codex 74.6</span>
+<span class="n" style="font-size: 30px; font-weight: 800; text-align: right">2</span>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 150px 140px 250px 110px; column-gap: 16px; align-items: center; height: 80px; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 26px; font-weight: 700">研究分析 <span class="n" style="font-size: 19px; font-weight: 500; color: #8A8278">40</span></span>
+<span class="n" style="font-size: 36px; font-weight: 800; text-align: right; color: #E2590B">71.5</span>
+<span class="n" style="font-size: 28px; font-weight: 600; text-align: right; color: #4E483F">69.8</span>
+<span class="n" style="font-size: 22px; color: #4E483F">Nanobot 73.1</span>
+<span class="n" style="font-size: 30px; font-weight: 800; text-align: right">4</span>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 150px 140px 250px 110px; column-gap: 16px; align-items: center; height: 80px; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 26px; font-weight: 700">内容生产 <span class="n" style="font-size: 19px; font-weight: 500; color: #8A8278">15</span></span>
+<span class="n" style="font-size: 36px; font-weight: 800; text-align: right; color: #E2590B">74.7</span>
+<span class="n" style="font-size: 28px; font-weight: 600; text-align: right; color: #4E483F">70.5</span>
+<span class="n" style="font-size: 22px; color: #4E483F">Hermes 74.9</span>
+<span class="n" style="font-size: 30px; font-weight: 800; text-align: right">2</span>
+</div>
+<div style="display: grid; grid-template-columns: minmax(0, 1fr) 150px 140px 250px 110px; column-gap: 16px; align-items: center; height: 64px">
+<span style="font-size: 22px; color: #8A8278">网页开发 <span class="n" style="font-size: 17px">1</span></span>
+<span class="n" style="font-size: 24px; text-align: right; color: #8A8278">60.0</span>
+<span class="n" style="font-size: 22px; text-align: right; color: #8A8278">68.6</span>
+<span class="n" style="font-size: 19px; color: #8A8278">多家 80.0</span>
+<span style="font-size: 17px; text-align: right; color: #8A8278">仅 1 题</span>
+</div>
+
+<!-- 04 成本 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 72px; padding-top: 30px; border-top: 1px solid #DCD5CA">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">04 · 成本</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">每道题约 <span style="color: #E2590B">1.3 元</span>，处于主流水平</span>
+<span style="font-size: 19px; line-height: 1.6; color: #6E675E">按 DeepSeek 官方价格计 · 从省到贵排列 · 条形 = 每题费用，从 0 画起</span>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; margin-top: 26px; padding-bottom: 12px; border-bottom: 1px solid #DCD5CA; font-size: 19px; color: #8A8278">
+<span>序号</span><span>框架</span><span style="text-align: right">每题费用</span><span style="text-align: right">得分</span><span></span>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 64px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 22px; color: #A39B90">01</span><span class="n" style="font-size: 26px; font-weight: 500">Codex</span><span class="n" style="font-size: 30px; font-weight: 800; text-align: right">¥0.83</span><span class="n" style="font-size: 24px; text-align: right; color: #6E675E">69.25</span><div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 37.7%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 64px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 22px; color: #A39B90">02</span><span class="n" style="font-size: 26px; font-weight: 500">OpenCode</span><span class="n" style="font-size: 30px; font-weight: 800; text-align: right">¥0.93</span><span class="n" style="font-size: 24px; text-align: right; color: #6E675E">68.19</span><div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 42.3%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 64px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 22px; color: #A39B90">03</span><span class="n" style="font-size: 26px; font-weight: 500">OpenClaw</span><span class="n" style="font-size: 30px; font-weight: 800; text-align: right">¥1.22</span><span class="n" style="font-size: 24px; text-align: right; color: #6E675E">63.10</span><div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 55.5%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 64px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 22px; color: #A39B90">04</span><span class="n" style="font-size: 26px; font-weight: 500">Claude Code</span><span class="n" style="font-size: 30px; font-weight: 800; text-align: right">¥1.24</span><span class="n" style="font-size: 24px; text-align: right; color: #6E675E">68.01</span><div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 56.4%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 72px; border-bottom: 1px solid #E6E0D6; background: #FBEDE3; box-shadow: inset 5px 0 0 #E2590B">
+<span class="n" style="font-size: 24px; font-weight: 800; padding-left: 14px; color: #E2590B">05</span><span class="n" style="font-size: 28px; font-weight: 800; color: #E2590B">Expert Work</span><span class="n" style="font-size: 34px; font-weight: 900; text-align: right; color: #E2590B">¥1.26</span><span class="n" style="font-size: 26px; font-weight: 800; text-align: right; color: #E2590B">68.44</span><div style="height: 10px; background: #EBD9CB; position: relative"><div style="position: absolute; left: 0; top: 0; height: 10px; width: 57.3%; background: #E2590B"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 64px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 22px; color: #A39B90">06</span><span class="n" style="font-size: 26px; font-weight: 500">Hermes</span><span class="n" style="font-size: 30px; font-weight: 800; text-align: right">¥1.31</span><span class="n" style="font-size: 24px; text-align: right; color: #6E675E">66.66</span><div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 59.5%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 64px; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 22px; color: #A39B90">07</span><span class="n" style="font-size: 26px; font-weight: 500">Nanobot</span><span class="n" style="font-size: 30px; font-weight: 800; text-align: right">¥1.69</span><span class="n" style="font-size: 24px; text-align: right; color: #6E675E">64.92</span><div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 76.8%; background: #2152D9"></div></div>
+</div>
+<div style="display: grid; grid-template-columns: 70px minmax(0, 1fr) 150px 130px 300px; column-gap: 18px; align-items: center; height: 64px">
+<span class="n" style="font-size: 22px; color: #A39B90">08</span><span class="n" style="font-size: 26px; font-weight: 500">Goose</span><span class="n" style="font-size: 30px; font-weight: 800; text-align: right">¥2.13</span><span class="n" style="font-size: 24px; text-align: right; color: #6E675E">65.41</span><div style="height: 8px; background: #E1DBD0; position: relative"><div style="position: absolute; left: 0; top: 0; height: 8px; width: 96.8%; background: #2152D9"></div></div>
+</div>
+
+<!-- 05 指标 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 72px; padding-top: 30px; border-top: 1px solid #DCD5CA">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">05 · 指标</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">每个指标是什么意思</span>
+<span style="font-size: 19px; line-height: 1.6; color: #6E675E">Expert Work 的数字为 4 轮平均</span>
+</div>
+<div style="display: grid; grid-template-columns: 170px 170px minmax(0, 1fr) 200px; column-gap: 20px; margin-top: 26px; padding-bottom: 12px; border-bottom: 1px solid #DCD5CA; font-size: 19px; color: #8A8278">
+<span>指标</span><span style="text-align: right; color: #E2590B">Expert Work</span><span>含义</span><span style="text-align: right">其他 7 家</span>
+</div>
+<div style="display: grid; grid-template-columns: 170px 170px minmax(0, 1fr) 200px; column-gap: 20px; align-items: center; padding: 22px 0; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 24px; font-weight: 700">综合得分</span><span class="n" style="font-size: 38px; font-weight: 800; text-align: right; color: #E2590B">68.4</span><span style="font-size: 18px; line-height: 1.6; color: #4E483F">每道题按做到了多少项要求给 0–1 分，257 道取平均再乘 100，相当于考试的平均分</span><span class="n" style="font-size: 24px; text-align: right; color: #4E483F">63.1–69.3</span>
+</div>
+<div style="display: grid; grid-template-columns: 170px 170px minmax(0, 1fr) 200px; column-gap: 20px; align-items: center; padding: 22px 0; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 24px; font-weight: 700">满分题</span><span class="n" style="font-size: 38px; font-weight: 800; text-align: right; color: #E2590B">74<span style="font-size: 20px; font-family: 'Noto Sans SC', sans-serif; font-weight: 700"> 道</span></span><span style="font-size: 18px; line-height: 1.6; color: #4E483F">每项要求都做到的题</span><span class="n" style="font-size: 24px; text-align: right; color: #4E483F">58–70 道</span>
+</div>
+<div style="display: grid; grid-template-columns: 170px 170px minmax(0, 1fr) 200px; column-gap: 20px; align-items: center; padding: 22px 0; border-bottom: 1px solid #E6E0D6">
+<span style="font-size: 24px; font-weight: 700">零分题</span><span class="n" style="font-size: 38px; font-weight: 800; text-align: right; color: #E2590B">18<span style="font-size: 20px; font-family: 'Noto Sans SC', sans-serif; font-weight: 700"> 道</span></span><span style="font-size: 18px; line-height: 1.6; color: #4E483F">完全没做成、或触犯安全规则被判零的题</span><span class="n" style="font-size: 24px; text-align: right; color: #4E483F">16–38 道</span>
+</div>
+<div style="display: grid; grid-template-columns: 170px 170px minmax(0, 1fr) 200px; column-gap: 20px; align-items: center; padding: 22px 0">
+<span style="font-size: 24px; font-weight: 700">高分题</span><span class="n" style="font-size: 38px; font-weight: 800; text-align: right; color: #E2590B">141<span style="font-size: 20px; font-family: 'Noto Sans SC', sans-serif; font-weight: 700"> 道</span></span><span style="font-size: 18px; line-height: 1.6; color: #4E483F">得 0.8 分以上、关键要求全部达成的题</span><span class="n" style="font-size: 24px; text-align: right; color: #4E483F">132–149 道</span>
+</div>
+
+<!-- 06 为什么可信 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 72px; padding-top: 30px; border-top: 1px solid #DCD5CA">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">06 · 可信度</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">为什么可信</span>
+</div>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 48px; margin-top: 28px">
+<div style="display: flex; flex-direction: column; gap: 22px">
+<span style="font-size: 28px; font-weight: 900; padding-bottom: 12px; border-bottom: 3px solid #1B1814">测评集权威</span>
+<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-size: 22px; font-weight: 700">北京大学与 Qiyuan Tech 发布</span><span style="font-size: 18px; line-height: 1.7; color: #4E483F">2026 年发表论文；题目和评分程序全部开源，任何人都可复查。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-size: 22px; font-weight: 700">专门比较"智能体框架"</span><span style="font-size: 18px; line-height: 1.7; color: #4E483F">同一个模型换不同框架去做同一批工作，比的正是 Expert Work 自研的这一层。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-size: 22px; font-weight: 700"><span class="n">274</span> 道真实工作任务，<span class="n">1,408</span> 个评分点</span><span style="font-size: 18px; line-height: 1.7; color: #4E483F">覆盖 6 大类；机器对照隐藏的标准答案打分，只看交付结果，不靠人工主观判断。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-size: 22px; font-weight: 700">7 家框架的逐题成绩公开</span><span style="font-size: 18px; line-height: 1.7; color: #4E483F">每道题都可以和 Claude Code、Codex 等逐一对照。</span></div>
+</div>
+<div style="display: flex; flex-direction: column; gap: 22px">
+<span style="font-size: 28px; font-weight: 900; padding-bottom: 12px; border-bottom: 3px solid #1B1814">测评方式公平</span>
+<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-size: 22px; font-weight: 700">同一个模型 · 同一批题</span><span style="font-size: 18px; line-height: 1.7; color: #4E483F">都用 DeepSeek V4 Pro，关键设置与官方一致；题目原文照发，8 家按同样 257 道计分。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-size: 22px; font-weight: 700">同一个裁判</span><span style="font-size: 18px; line-height: 1.7; color: #4E483F">用官方开源的评分程序，按官方当时的评分口径打分。</span></div>
+<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-size: 22px; font-weight: 700">不开小灶</span><span style="font-size: 18px; line-height: 1.7; color: #4E483F">最简配置，不开记忆、知识库，不针对题目做调整。</span></div>
+<div style="display: flex; flex-direction: column; gap: 8px; background: #FBEDE3; padding: 20px 22px; box-shadow: inset 5px 0 0 #E2590B">
+<span style="font-size: 22px; font-weight: 900; color: #E2590B">4 轮平均，不挑最好的一次</span>
+<span style="font-size: 18px; line-height: 1.7; color: #4E483F">连跑 4 轮：69.7、68.4、66.5、69.2。只跑一次，运气就能差 3 分；别家是官方 1 轮成绩。</span>
+</div>
+</div>
+</div>
+
+<!-- 07 下一步 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 72px; padding-top: 30px; border-top: 1px solid #DCD5CA">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">07 · 下一步</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">下一步</span>
+</div>
+<div style="display: flex; flex-direction: column; margin-top: 18px">
+<div style="display: grid; grid-template-columns: 90px minmax(0, 1fr); column-gap: 20px; align-items: baseline; padding: 22px 0; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 44px; font-weight: 800; color: #E2590B">01</span>
+<div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 26px; font-weight: 700">优化进入生产</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">这次测评中完成的 5 处优化，随下一次发布进入生产环境，客户直接受益。</span></div>
+</div>
+<div style="display: grid; grid-template-columns: 90px minmax(0, 1fr); column-gap: 20px; align-items: baseline; padding: 22px 0; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 44px; font-weight: 800; color: #E2590B">02</span>
+<div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 26px; font-weight: 700">建立自有业务测评</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">公开测评考的是通用能力。下一步用客户真实场景的任务，衡量对业务真正有用的能力。</span></div>
+</div>
+<div style="display: grid; grid-template-columns: 90px minmax(0, 1fr); column-gap: 20px; align-items: baseline; padding: 22px 0">
+<span class="n" style="font-size: 44px; font-weight: 800; color: #E2590B">03</span>
+<div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 26px; font-weight: 700">定期复测</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">每次重要更新后重跑这套公开测评，持续跟踪 Expert Work 与主流框架的差距。</span></div>
+</div>
+</div>
+
+<!-- 第二部分：优化之后 -->
+<div style="border-top: 4px solid #2152D9; padding-top: 34px; margin-top: 96px; display: flex; flex-direction: column; gap: 14px">
+<span class="n" style="font-size: 24px; letter-spacing: 0.22em; color: #2152D9; font-weight: 500">EXPERT WORK · 优化后效果 · 2026.10</span>
+<span style="font-size: 104px; line-height: 1.1; font-weight: 900; letter-spacing: -0.01em; margin-top: 18px">优化之后</span>
+<span style="font-size: 52px; line-height: 1.3; font-weight: 900; margin-top: 4px">失败题从每轮 2–5 道降到<span class="n" style="color: #E2590B"> 0 </span>道</span>
+<span style="font-size: 21px; line-height: 1.6; color: #6E675E">测评中发现的改进点当天完成优化、上线测试环境后，用同一套 257 道题、同一个模型、同样的评分口径再跑一轮</span>
+</div>
+
+<!-- 优化之后：三个数 -->
+<div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 40px; border-top: 1px solid #DCD5CA; border-bottom: 1px solid #DCD5CA">
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 26px 0">
+<span class="n" style="font-size: 64px; line-height: 1; font-weight: 800; color: #E2590B">0<span style="font-size: 28px; font-family: 'Noto Sans SC', sans-serif; font-weight: 700"> 道</span></span>
+<span style="font-size: 20px; line-height: 1.5; color: #6E675E">失败题，优化前每轮 2–5 道</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 26px 0 26px 32px; border-left: 1px solid #DCD5CA">
+<span class="n" style="font-size: 64px; line-height: 1; font-weight: 800">11 / 11</span>
+<span style="font-size: 20px; line-height: 1.5; color: #6E675E">模型写超长的情况全部救回，优化前 30 次只救回 21 次</span>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 26px 0 26px 32px; border-left: 1px solid #DCD5CA">
+<span class="n" style="font-size: 64px; line-height: 1; font-weight: 800">¥1.25</span>
+<span style="font-size: 20px; line-height: 1.5; color: #6E675E">每道题的模型费用，优化前 ¥1.26，没有增加</span>
+</div>
+</div>
+
+<!-- 优化之后：改了什么 -->
+<div style="display: flex; flex-direction: column; gap: 10px; margin-top: 64px">
+<span class="n" style="font-size: 20px; letter-spacing: 0.18em; color: #2152D9; font-weight: 500">优化之后 · 改了什么</span>
+<span style="font-size: 40px; line-height: 1.35; font-weight: 900">两处优化</span>
+</div>
+<div style="display: flex; flex-direction: column; margin-top: 18px">
+<div style="display: grid; grid-template-columns: 90px minmax(0, 1fr); column-gap: 20px; align-items: baseline; padding: 24px 0; border-bottom: 1px solid #E6E0D6">
+<span class="n" style="font-size: 44px; font-weight: 800; color: #E2590B">01</span>
+<div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 26px; font-weight: 700">模型一次写得太长时，最多补救 3 次</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">原来只补救 1 次，再写超长就整道题失败；现在每一步最多补救 3 次，次数和 Claude Code 一样。</span></div>
+</div>
+<div style="display: grid; grid-template-columns: 90px minmax(0, 1fr); column-gap: 20px; align-items: baseline; padding: 24px 0">
+<span class="n" style="font-size: 44px; font-weight: 800; color: #E2590B">02</span>
+<div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 26px; font-weight: 700">让模型看得到自己之前的思考</span><span style="font-size: 19px; line-height: 1.7; color: #4E483F">按 DeepSeek 官方要求，把模型前面每一步的思考过程一并发回，它不必每一步都从头想起。</span></div>
+</div>
+</div>
+
+<!-- 页脚 -->
+<div style="margin-top: 72px; padding-top: 22px; border-top: 2px solid #2152D9; display: flex; flex-direction: column; gap: 6px; font-size: 16px; line-height: 1.7; color: #8A8278">
+<span>数据来源：Harness-Bench 论文（arXiv 2605.27922）；题目与评分程序 github.com/Qihoo360/harness-bench；7 家成绩取自官方公开的逐题数据，7 家费用取自论文公布的每题平均值（274 道题，按同一价格折算成人民币）。</span>
+<span>Expert Work 的成绩：2026 年 10 月 17 日，测试环境，4 轮，用官方评分程序在本地打分，评分口径与官方当时一致。「优化之后」部分：优化前为前 3 轮，优化后为第 4 轮。官方共 274 道通用题，其中 17 道依赖 Expert Work 的接入方式无法原样复现的条件，8 家都不计入。</span>
+</div>
+</div>
+</body>
+</html>
