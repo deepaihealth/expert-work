@@ -91,6 +91,17 @@ LEGACY_REDIRECT_NOTE = (
     "steer that conversation. -->\n"
 )
 
+#: B-188 — how to recognise a legacy root projection: line 1 is the header its
+#: renderer wrote (the same text from CM-0 PR2b-i until 方案 a moved projection
+#: under ``threads/`` — if these notes ever change, pin the old text here).
+#: Only such a file is ours to redirect; anything else at the root — a user's
+#: own PLAN.md, an uploaded MEMORY.md, a file that isn't there — is left alone.
+_LEGACY_ROOT_HEADERS: dict[str, str] = {
+    PLAN_FILE: _PLAN_NOTE,
+    TODO_FILE: _READONLY_NOTE,
+    MEMORY_FILE: _READONLY_NOTE,
+}
+
 #: Status ↔ checkbox marker. PLAN.md round-trips through these (render ↔ parse).
 _STATUS_BOX: dict[PlanStepStatus, str] = {"pending": " ", "in_progress": "~", "completed": "x"}
 _BOX_STATUS: dict[str, PlanStepStatus] = {" ": "pending", "~": "in_progress", "x": "completed"}
@@ -193,6 +204,10 @@ class WorkspaceFileWriter(Protocol):
     async def write(self, *, rel: str, content: str) -> None:
         """Create/overwrite workspace-relative ``rel`` with ``content``."""
 
+    async def read(self, rel: str) -> str | None:
+        """Return the text of workspace-relative ``rel``, or ``None`` if absent
+        (B-188: the legacy-root repair looks before it overwrites)."""
+
 
 @dataclass(frozen=True)
 class ProjectionResult:
@@ -277,12 +292,12 @@ class WorkspaceProjector:
         # OUTSIDE the digest (a one-shot repair, not projected state — putting
         # it in the digest would make turn 2's digest never match turn 1's)
         # and fully best-effort: a failure here neither blocks the thread
-        # files nor pins the cursor.
+        # files nor pins the cursor. B-188 — only root files that exist AND
+        # are still a legacy projection; a fresh workspace gets no root files
+        # and a user's own root PLAN.md / MEMORY.md is never touched.
         to_write: list[tuple[str, str]] = list(items)
         if prefix and last_digest is None:
-            to_write.extend(
-                (name, LEGACY_REDIRECT_NOTE) for name in (PLAN_FILE, TODO_FILE, MEMORY_FILE)
-            )
+            to_write.extend(await self._legacy_root_repairs())
 
         written: list[str] = []
         all_ok = True
@@ -315,6 +330,24 @@ class WorkspaceProjector:
             digest=out_digest,
             plan_md_digest=written_plan_md_digest,
         )
+
+    async def _legacy_root_repairs(self) -> list[tuple[str, str]]:
+        """B-188 — the ``(root file, redirect)`` writes for root files that
+        still open with their legacy projection header. Absent, foreign or
+        unreadable → no write (best-effort: a read failure is logged and the
+        file left alone; never creates a root file)."""
+        repairs: list[tuple[str, str]] = []
+        for name, header in _LEGACY_ROOT_HEADERS.items():
+            try:
+                text = await self.writer.read(name)
+            except Exception:
+                logger.warning(
+                    "workspace_projection.legacy_read_failed", extra={"rel": name}, exc_info=True
+                )
+                continue
+            if text is not None and text.startswith(header):
+                repairs.append((name, LEGACY_REDIRECT_NOTE))
+        return repairs
 
 
 # ---------------------------------------------------------------------------

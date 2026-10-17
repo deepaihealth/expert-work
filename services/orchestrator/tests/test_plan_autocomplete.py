@@ -150,6 +150,9 @@ class _Writer:
     async def write(self, *, rel: str, content: str) -> None:
         self.writes[rel] = content
 
+    async def read(self, rel: str) -> str | None:
+        return self.writes.get(rel)
+
 
 _THREAD = "aaaaaaaa-bbbb-cccc-dddd-eeeeffff0131"
 

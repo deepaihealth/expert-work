@@ -1466,6 +1466,15 @@ class SandboxWorkspaceWriter:
         env = parse_envelope(outcome, tool="workspace_projection")
         _raise_for_error(env, tool="workspace_projection")
 
+    async def read(self, rel: str) -> str | None:
+        """B-188 — the projector's legacy-root repair reads a root file before
+        overwriting it. Same channel and contract as
+        :class:`SandboxWorkspaceReader` (``None`` when absent, else raises)."""
+        reader = SandboxWorkspaceReader(
+            client=self.client, ctx=self.ctx, skill_seed_files=self.skill_seed_files
+        )
+        return await reader.read(rel)
+
 
 @dataclass(frozen=True)
 class SandboxWorkspaceReader:

@@ -49,6 +49,9 @@ class _RecordingWriter:
     async def write(self, *, rel: str, content: str) -> None:
         self.writes[rel] = content
 
+    async def read(self, rel: str) -> str | None:
+        return self.writes.get(rel)
+
 
 @dataclass
 class _FailingWriter:
@@ -57,6 +60,10 @@ class _FailingWriter:
     async def write(self, *, rel: str, content: str) -> None:
         del rel, content
         self.attempts += 1
+        raise OSError("sandbox unreachable")
+
+    async def read(self, rel: str) -> str | None:
+        del rel
         raise OSError("sandbox unreachable")
 
 
