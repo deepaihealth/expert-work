@@ -300,3 +300,10 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 - [x] **27.1 新镜像里工具都在**:换 tag 后进一台待命沙箱只读检查 `command -v unzip sqlite3 curl` 与 `python3 -c "import yaml, pytz, bs4, requests"`。判据:都在、版本与 `requirements.txt` 钉的一致。**没修好时**:`command not found` / `ModuleNotFoundError`。 **10-17 测试沙箱 `5fd494fe` 过**:三个命令都在(sqlite3 3.46.1),PyYAML 6.0.3 / pytz 2026.5 / bs4 4.15.0 / requests 2.34.2;池 2 台都是新 tag。
 - [x] **27.2 工具说明与镜像一致**:控制面 pod 里调 `orchestrator.tools.sandbox_image_contract.preinstalled_note()`。判据:7 个名字都在。**没修好时**:说明里缺新工具(模型会再去 pip / apt 装),或镜像没换而说明先换了(模型被告知有、实际没有)。 **10-17 测试 `5fd494fe` 过**:7 个都在;发布 smoke `SMOKE PASS`、金丝雀 5 项 PASS。
 - [ ] **27.3 一周后看缺失工具是否下降**:只读统计(`run_event` 里工具输出的空格存成 `\u2581` 转义,`LIKE '%No module named%'` 一条都匹配不到,要先把各种转义归一成空格再正则)发布后 7 天的 `No module named` / `command not found`。判据:unzip / curl / pytz / requests / yaml / bs4 不再出现。
+
+## §28 发版构建走阿里云 PyPI 镜像(B-190)
+
+**背景**:只影响 `tools/deploy/build-push.sh`(`release.sh` 第 1 步)构建的 control-plane 与 credential-proxy 两个镜像:下载 Python 包改走 `mirrors.aliyun.com`,装进镜像的包与改前逐个相同。CI、compose、本地 `docker build` 不传参数,照旧走官方源。admin-ui 不受影响。
+
+- [ ] **28.1 发版构建成功,依赖下载变快**:下一次 `tools/deploy/release.sh test …`,看两个镜像 `uv sync` 那一步的输出。判据:① 两个镜像都构建成功,没有 `uv.lock still has files.pythonhosted.org URLs` 报错;② 记下输出里 `Prepared N packages in X s` 的 X(10-17 本机实测:control-plane 约 11 s、credential-proxy 约 4 s;走官方源时分别约 25 s / 16 s,10-16 官方源慢时要几十分钟)。**没修好时**:构建参数没传进去时构建照样成功,只能从耗时看出来;构建输出不打印下载地址,地址是否走镜像已在 PR 里用带 `-v` 的副本逐条核过(两个镜像的锁内文件全部走 `mirrors.aliyun.com`)。
+- [ ] **28.2 退回开关可用(只在镜像出问题时做)**:镜像没同步到刚升级的版本、构建报 404 时,用 `EXPERT_WORK_PYPI_MIRROR= tools/deploy/release.sh …` 重发。判据:构建成功。平时不需要做,发生过就在这里记一笔。

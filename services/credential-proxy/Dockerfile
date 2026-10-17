@@ -24,9 +24,21 @@ COPY services/ services/
 # 与 services/control-plane/Dockerfile 同一处修法(2026-08-25):uv 默认并发 50 个下载、
 # 30 秒超时,从这个网络出去会集体超时。这里一直没跟上,2026-10-09 发测试时
 # credential-proxy 构建在这一行报 `operation timed out`(markupsafe),control-plane 同批成功。
+#
+# PYPI_MIRROR(发版构建默认阿里云,空 = pypi.org):为什么要改锁文件副本的 URL、
+# 镜像滞后怎么退回,见 services/control-plane/Dockerfile 同一层的注释。两处要一起改。
 ENV UV_CONCURRENT_DOWNLOADS=8 \
     UV_HTTP_TIMEOUT=120
-RUN uv sync --frozen --no-dev --no-editable --package expert-work-credential-proxy
+ARG PYPI_MIRROR=""
+RUN if [ -n "${PYPI_MIRROR}" ]; then \
+        mirror="${PYPI_MIRROR%/}/" \
+        && sed -i "s|https://files.pythonhosted.org/|${mirror}|g" uv.lock \
+        && if grep -q 'files.pythonhosted.org' uv.lock; then \
+            echo "uv.lock still has files.pythonhosted.org URLs after the PYPI_MIRROR rewrite" >&2; exit 1; \
+        fi \
+        && export UV_DEFAULT_INDEX="${mirror}simple/"; \
+    fi \
+    && uv sync --frozen --no-dev --no-editable --package expert-work-credential-proxy
 
 
 FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
