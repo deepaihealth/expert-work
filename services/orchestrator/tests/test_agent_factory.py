@@ -2028,6 +2028,32 @@ def test_non_glm_compat_has_no_stream_extra_body() -> None:
     assert ds.stream_extra_body is None
 
 
+def test_deepseek_replays_reasoning_content() -> None:
+    # B-195 —— DeepSeek 文档:带 tools 的请求要回传历史 reasoning_content。
+    for name in ("deepseek-v4-pro", "deepseek-flash", "deepseek-v4-flash"):
+        ds = _build_provider(_vendor_model("deepseek", name), "k")
+        assert isinstance(ds, OpenAICompatibleProvider)
+        assert ds.replay_reasoning_content is True
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"provider": "glm", "name": "glm-5.2"},
+        {"provider": "kimi", "name": "kimi-k3"},
+        {"provider": "qwen", "name": "qwen3.7-max"},
+        {"provider": "doubao", "name": "doubao-seed-2.0-pro"},
+        {"provider": "openai", "name": "gpt-5.5"},
+        {"provider": "self-hosted", "name": "my-private-model", "base_url": "http://vllm:8000"},
+    ],
+)
+def test_non_deepseek_does_not_replay_reasoning_content(model: dict[str, str]) -> None:
+    # B-195 只动 DeepSeek;其它厂商请求体不变(未知字段可能被拒)。
+    provider = _build_provider(ModelSpec.model_validate(model), "k")
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.replay_reasoning_content is False
+
+
 # ---------------------------------------------------------------------------
 # B-33 — catalog-declared temperature constraint (ModelEntry.temperature_fixed)
 # ---------------------------------------------------------------------------

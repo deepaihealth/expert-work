@@ -343,3 +343,83 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
   ```
   对 `notices >= 2` 的 run,按 `seq` 顺序读它的 `updates` 帧,找「同一步里连着 2~3 条提示(中间没有回答帧、没有工具结果帧),紧接着是一条正常回答或工具调用」的地方;也可以在 Langfuse 打开这个 run,看提示之后那次 `llm_call` 的输入末尾连着 2~3 条 `[output limit notice]`。判据:找到至少一处这样的步骤,而且这一步过去了(run 成功,或后面因为别的原因失败)。**一周内没有任何一步连续截断 2 次就记 0 次、不可判**,这条是否修好靠自动测试分辨(10-17 逐条变异验过,见 31.3 末尾)。想主动造:用 eval-hb 重跑 Harness-Bench 139 / 147 / 154(10-17 探针里最难写下的三步所在的题),要花评测费,先按评测花费规矩估算、报用户再跑。**没修好时**:每一步最多 1 条提示,同一步第 2 次截断就报错。
 - [ ] **31.3 报错前确实重试满 3 次(观察性)**:同一时段只读查 `SELECT id, status, error FROM agent_run WHERE (error LIKE '%模型输出被截断%' OR error LIKE '%既没有给出回答%') AND created_at > '<发测试时间>'`,对每个 run 按 `seq` 看报错前最后几条 `updates` 帧。判据:报错前最后一步连着 3 条隐藏提示(截断提示、空回复提示两种合计),之后没有回答帧;空回复那种的报错文案带「已自动重试过 3 次」。一周内没有就记 0 次。**没修好时**:报错前那一步只有 1 条提示;空回复文案仍是「已自动重试过一次」。**分辨修没修好靠自动测试**(10-17 逐条变异验过,`test_react_graph.py`):每步次数 3 改 2 → 11 条红(含 `test_three_truncations_then_a_good_reply_completes_the_run`);3 改 4 → 10 条红(含 `test_fourth_consecutive_truncation_fails_the_run` 与两条交替重试的用例);只看最后一条提示 → 10 条红;只数截断提示、空回复提示不算 → 4 条红(含 `test_truncation_after_three_mixed_retries_fails_the_run` / `test_empty_reply_after_three_mixed_retries_fails_the_run`);数整段历史里的提示、不只数末尾连着的 → `test_each_step_gets_its_own_retry_budget` 红;截断 / 空回复任一处退回「只看最后一条」→ 9 / 4 条红;报错文案退回「重试过一次」→ `test_fourth_empty_reply_fails_the_run_visibly` 红。
+
+## §32 DeepSeek 回传历史思考内容(B-195)
+
+**背景**:DeepSeek 官方文档(Thinking Mode)要求:请求带工具(`tools`)时,之前每一条 assistant 消息的思考内容 `reasoning_content` 都要原样回传,厂商会把它拼进上下文;没调工具的那一轮也要回传。文档写的是不回传会返回 400,但目前厂商实际没拦。不带工具的请求不用回传,传了也会被忽略。改前平台从不回传,模型每一步都看不到自己前面的思考。
+
+现在只对供应商 `deepseek` 生效:请求带工具时,历史里有思考内容的 assistant 消息都带上 `reasoning_content`。没有思考内容的消息(不补空串)、不带工具的请求、其它厂商的请求(包括备用模型接管时)都不变。
+
+**Langfuse 记录的是交给厂商适配层之前的消息列表,看不到实际请求体,所以不能拿 Langfuse 验这一条**,要用下面 32.1 / 32.2 的 pod 内离线探针。
+
+预期副作用:每次请求的输入 token 会变多(前面的思考进了上下文)。
+
+这几种 assistant 消息本来就没有思考内容,回传时照旧不带,属预期:安全拦截替换成的拒答;响应缓存命中的回复(只在温度 ≤ 0.1 且开了缓存的智能体上);由备用的 Anthropic 模型应答、或关了思考的步骤。
+
+- [ ] **32.1 发出去的请求体带思考(pod 内离线探针)**:发测试后执行下面的命令。脚本用平台自己的 `_build_provider` 建 deepseek 和 glm 两个模型适配器,HTTP 由 `httpx.MockTransport` 截住:不连外网,key 是假的,不读写库。三次请求喂的是同一段历史:先调工具,再文字回答,然后用户追问。判据:输出三行 `deepseek tools ['r1', 'r2']` / `deepseek no-tools [None, None]` / `glm tools [None, None]`。**没修好时**:第一行是 `[None, None]`。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, json, httpx
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from expert_work.protocol import ModelSpec
+from orchestrator.agent_factory import _build_provider
+from orchestrator.tools.registry import ToolSpec
+H = [HumanMessage("q1"), AIMessage(content="", tool_calls=[{"id": "c1", "name": "t", "args": {}}], additional_kwargs={"reasoning_content": "r1"}), ToolMessage(content="x", tool_call_id="c1"), AIMessage(content="a1", additional_kwargs={"reasoning_content": "r2"}), HumanMessage("q2")]
+async def probe(provider, name, tools):
+    bodies = []
+    def h(req):
+        bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as http:
+        p = _build_provider(ModelSpec.model_validate({"provider": provider, "name": name}), "dummy", http_client=http)
+        await p.complete(messages=H, tools=[ToolSpec(name="t", description="d")] if tools else [])
+    print(provider, "tools" if tools else "no-tools", [m.get("reasoning_content") for m in bodies[0]["messages"] if m["role"] == "assistant"])
+async def main():
+    await probe("deepseek", "deepseek-v4-pro", True)
+    await probe("deepseek", "deepseek-v4-pro", False)
+    await probe("glm", "glm-5.2", True)
+asyncio.run(main())
+'
+```
+
+- [ ] **32.2 真实会话的历史里存着思考,并会被回传(读 checkpoint,只读)**:用 32.3 跑出来的那个会话,把会话 ID(thread_id)填进下面的脚本。脚本从 checkpoint 库只读取该会话最新的消息列表,然后照 32.1 的办法用假 HTTP 过一遍 deepseek 适配器。用的是 `from_conn_string`:不建表、不写库。判据:
+  - ① 输出 `ai N with_reasoning M`,M ≥ 2,且 M 接近 N。思考开着的 DeepSeek 每一步都带思考,差额只应来自背景里列的那几种消息。这一项证明思考跨步骤、跨轮次、经过 checkpoint 存取后都还在。改前也成立;10-17 本地用平台的 checkpoint 序列化器已验过两轮对话的思考都还在。
+  - ② 输出 `wire K`,K = M。
+
+  **没修好时**:② 为 `wire 0`。
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, json, httpx
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from expert_work.protocol import ModelSpec
+from expert_work.runtime.checkpointer.serde import make_checkpoint_serde
+from control_plane.settings import Settings
+from orchestrator.agent_factory import _build_provider
+from orchestrator.tools.registry import ToolSpec
+THREAD_ID = "<填会话 ID>"
+async def main():
+    async with AsyncPostgresSaver.from_conn_string(Settings().checkpointer_dsn, serde=make_checkpoint_serde()) as cp:
+        tup = await cp.aget_tuple({"configurable": {"thread_id": THREAD_ID, "checkpoint_ns": ""}})
+    msgs = tup.checkpoint["channel_values"]["messages"]
+    ai = [m for m in msgs if m.type == "ai"]
+    print("ai", len(ai), "with_reasoning", sum(1 for m in ai if m.additional_kwargs.get("reasoning_content")))
+    bodies = []
+    def h(req):
+        bodies.append(json.loads(req.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as http:
+        p = _build_provider(ModelSpec.model_validate({"provider": "deepseek", "name": "deepseek-v4-pro"}), "dummy", http_client=http)
+        await p.complete(messages=msgs, tools=[ToolSpec(name="t", description="d")])
+    print("wire", sum(1 for m in bodies[0]["messages"] if m.get("reasoning_content")))
+asyncio.run(main())
+'
+```
+
+- [ ] **32.3 真跑带工具的多步任务,第二轮也不报错**:发测试后在调试台用 eval-hb(主模型 `deepseek-v4-pro`,思考开)发一个至少要调两次工具的任务,例如「列出工作区根目录,再读其中一个文件的前 5 行,然后总结」。同一会话再追问一句仍要调工具的话,例如「再读另一个文件对比一下」。判据:
+  - ① 两轮 run 都是 `success`。
+  - ② 这段时间两个控制面 pod 日志 `grep -c 'openai 400'` 为 0。
+  - ③ 两轮里每个 `llm_call` 在 Langfuse 的 Model 都是 `deepseek-v4-pro`(B-187),没有备用模型接管。
+
+  厂商 4xx 不切备用模型,直接让这一轮失败,所以拒收一定会在 ① 里看到。**没修好时**:不适用,改前也不报错。这一条防的是「回传后厂商拒收」。
+- [ ] **32.4 厂商真的把思考拼进了上下文(观察性,可记不可判)**:取 32.3 那个 run 的 trace,按时间顺序看相邻两次 `llm_call` 的用量。判据:后一步的输入 token 减前一步的输入 token,应 ≥ 前一步的输出 token(输出含思考),多出来的大致是工具结果。原因是回传后,前一步的思考、回答、工具调用都进了下一步的输入。改前同一智能体的历史 run 里,这个差值约等于「前一步输出 − 前一步思考 + 工具结果」,在思考长、工具结果短的步骤上会小于前一步输出。可以拿 10-17 之前 eval-hb 的 run 做对照。工具结果很长的步骤看不出差别,跳过。若新旧看不出差别,记「不可判」(可能厂商不把回传的思考计入输入 token),不影响 32.1–32.3。
