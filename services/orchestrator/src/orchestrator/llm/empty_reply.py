@@ -82,12 +82,12 @@ def is_filtered(message: AIMessage) -> bool:
 
 
 class EmptyReplyError(RuntimeError):
-    """重试过一次,模型还是正常结束却既没有回答也没有工具调用。在 agent 节点、路由之后抛出,
-    run 以可见错误结束。"""
+    """重试过 3 次(B-194,次数同 ``builder.MAX_REPLY_RETRIES``),模型还是正常结束却既没有
+    回答也没有工具调用。在 agent 节点、路由之后抛出,run 以可见错误结束。"""
 
     def __init__(self) -> None:
         super().__init__(
-            "模型结束了这一轮,却既没有给出回答,也没有调用工具(已自动重试过一次)。"
+            "模型结束了这一轮,却既没有给出回答,也没有调用工具(已自动重试过 3 次)。"
             "可以重试;经常出现的话,可以换用别的模型。"
         )
 

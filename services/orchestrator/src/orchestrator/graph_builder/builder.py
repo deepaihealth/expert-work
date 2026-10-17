@@ -1317,10 +1317,11 @@ def build_react_graph(
             # B-158 —— 不可用的截断先丢弃重来一次:被截的回答不进历史(工具调用一个都不
             # 执行),只落一条隐藏的拆小提示,路由回 agent。本轮输入的最后一条已经是这条
             # 提示 = 重试过了,照旧报错。其余通道不动,重试那次照原样重新推导。
-            # B-191 —— 「重试过了」认两种提示:每一步合计只重试一次,空回复重试那一轮又截断
-            # 同样报错,两种提示不会互相接力。
+            # B-191 —— 「重试过了」认两种提示:空回复重试那一轮又截断,两种提示合计,不会
+            # 互相接力。
+            # B-194 —— 每一步合计最多重试 MAX_REPLY_RETRIES 次:数本轮输入末尾连着几条提示。
             if truncated is not None:
-                if _is_reply_retry(state["messages"][-1]):
+                if _trailing_reply_retries(state["messages"]) >= MAX_REPLY_RETRIES:
                     raise truncated
                 logger.warning("agent_node.output_truncated_retry cap=%s", truncated.cap)
                 return {
@@ -1350,8 +1351,8 @@ def build_react_graph(
 
         # B-191 —— 正常结束却空着:没有内容,也没有可执行的工具调用(实测:模型把要发的工具
         # 调用写进了思考,调用没发出去,run 却记成「成功、空回复」)。照 B-158 丢弃、落一条隐藏
-        # 提示、重来一次(与 B-158 同样占一步);本轮输入已是任一种重试提示 = 这一步已经重试过,
-        # run 可见地失败。被厂商内容审核拦下的不重试,直接失败。都照样记账、不进响应缓存。
+        # 提示、重来一次(与 B-158 同样占一步);这一步两种重试合计已满 MAX_REPLY_RETRIES 次
+        # (B-194),run 可见地失败。被厂商内容审核拦下的不重试,直接失败。都照样记账、不进响应缓存。
         # 排除项同 B-186,再加预算收尾轮:那一轮没绑工具,剥掉工具调用后的空回复是平稳收尾的
         # 设计结果,run 也按预算出口结束,不是「空着的成功」。
         if (
@@ -1375,7 +1376,7 @@ def build_react_graph(
                 empty_reply_total.labels(provider=provider, model=model, outcome="filtered").inc()
                 logger.warning("agent_node.empty_reply_filtered model=%s", model)
                 raise ContentFilteredError()
-            if _is_reply_retry(state["messages"][-1]):
+            if _trailing_reply_retries(state["messages"]) >= MAX_REPLY_RETRIES:
                 empty_reply_total.labels(provider=provider, model=model, outcome="failed").inc()
                 logger.warning("agent_node.empty_reply_failed model=%s", model)
                 raise EmptyReplyError()
@@ -2246,7 +2247,7 @@ async def _check_truncation(
     resolver: ServedOutputCap | None,
 ) -> OutputTruncatedError | None:
     """B-105 —— 被截断的回答:可用就计数放行(``None``);不可用就记账后交回
-    :class:`OutputTruncatedError`,抛不抛由调用方定(B-158 先重试一次)。
+    :class:`OutputTruncatedError`,抛不抛由调用方定(B-158 先重试,B-194 每步至多 3 次)。
 
     不可用时这次调用照样计费(常常整个上限都花在思考上),所以先跑一遍 after-chain 让
     ``TokenUsageMiddleware`` 按正常主循环口径落用量,但带 :data:`SKIP_STORE_KEY`,坏回答
@@ -2296,8 +2297,12 @@ async def _meter_without_caching(
     await after_llm_chain.invoke(ctx, _noop)
 
 
-#: B-158 —— 拆小提示的标记。节点开头看输入的最后一条是不是它,判「已经重试过」。
+#: B-158 —— 拆小提示的标记。节点数输入末尾连着几条它(或空回复提示),判「重试过几次」。
 TRUNCATION_RETRY_KEY = "expert_work_truncation_retry"
+
+#: B-194 —— 每一步最多重试几次(截断 / 空回复两种合计)。原来 1 次:评测里同一步同样的请求
+#: 再发 4 次,有的 4 次全成、有的 2 次成;Claude Code 每步 3 次、Codex 5 次。平台默认,不开配置。
+MAX_REPLY_RETRIES = 3
 
 
 def _build_truncation_retry(cap: int | None) -> HumanMessage:
@@ -2341,10 +2346,21 @@ def _build_empty_reply_retry() -> HumanMessage:
 
 
 def _is_reply_retry(message: BaseMessage) -> bool:
-    """B-191 —— 这条是任一种重试提示(B-158 截断 / B-191 空回复):每一步合计只重试一次。"""
+    """B-191 —— 这条是任一种重试提示(B-158 截断 / B-191 空回复):两种合计一份重试次数。"""
     return _is_truncation_retry(message) or bool(
         message.additional_kwargs.get(EMPTY_REPLY_RETRY_KEY)
     )
+
+
+def _trailing_reply_retries(messages: Sequence[BaseMessage]) -> int:
+    """B-194 —— 末尾连着几条重试提示 = 这一步已经重试了几次。被丢弃的回答不进历史,所以同一步
+    的提示首尾相接;这一步一旦有回答落进历史(工具调用 / 正文),下一步从 0 数起。"""
+    count = 0
+    for message in reversed(messages):
+        if not _is_reply_retry(message):
+            break
+        count += 1
+    return count
 
 
 def _with_plan_close(
@@ -2972,8 +2988,8 @@ def _should_continue(state: AgentState) -> Literal["tools", "agent", "__end__"]:
     last = state["messages"][-1]
     if _extract_tool_calls(last):
         return "tools"
-    # B-158 / B-191 —— 截断或空回复作废、刚落了重试提示:回 agent 重做这一步(至多一次,
-    # 见 agent_node)。
+    # B-158 / B-191 —— 截断或空回复作废、刚落了重试提示:回 agent 重做这一步(B-194 每步
+    # 至多 MAX_REPLY_RETRIES 次,见 agent_node)。
     if _is_reply_retry(last):
         return "agent"
     # B-35 — a dispatch turn that produced no tool calls must not end the
