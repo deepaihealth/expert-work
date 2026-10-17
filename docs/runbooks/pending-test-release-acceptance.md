@@ -305,14 +305,14 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 **背景**:只影响 `tools/deploy/build-push.sh`(`release.sh` 第 1 步)构建的 control-plane 与 credential-proxy 两个镜像:下载 Python 包改走 `mirrors.aliyun.com`,装进镜像的包与改前逐个相同。CI、compose、本地 `docker build` 不传参数,照旧走官方源。admin-ui 不受影响。
 
-- [ ] **28.1 发版构建成功,依赖下载变快**:下一次 `tools/deploy/release.sh test …`,看两个镜像 `uv sync` 那一步的输出。判据:① 两个镜像都构建成功,没有 `uv.lock still has files.pythonhosted.org URLs` 报错;② 记下输出里 `Prepared N packages in X s` 的 X(10-17 本机实测:control-plane 约 11 s、credential-proxy 约 4 s;走官方源时分别约 25 s / 16 s,10-16 官方源慢时要几十分钟)。**没修好时**:构建参数没传进去时构建照样成功,只能从耗时看出来;构建输出不打印下载地址,地址是否走镜像已在 PR 里用带 `-v` 的副本逐条核过(两个镜像的锁内文件全部走 `mirrors.aliyun.com`)。
+- [x] **28.1 发版构建成功,依赖下载变快**:下一次 `tools/deploy/release.sh test …`,看两个镜像 `uv sync` 那一步的输出。判据:① 两个镜像都构建成功,没有 `uv.lock still has files.pythonhosted.org URLs` 报错;② 记下输出里 `Prepared N packages in X s` 的 X(10-17 本机实测:control-plane 约 11 s、credential-proxy 约 4 s;走官方源时分别约 25 s / 16 s,10-16 官方源慢时要几十分钟)。**没修好时**:构建参数没传进去时构建照样成功,只能从耗时看出来;构建输出不打印下载地址,地址是否走镜像已在 PR 里用带 `-v` 的副本逐条核过(两个镜像的锁内文件全部走 `mirrors.aliyun.com`)。 **10-17 测试 `202a9eb6` 过**:两个镜像都构建成功、无 pythonhosted 残留报错;control-plane `Prepared 155 packages in 10.94s`,credential-proxy `Prepared 83 packages in 3.99s`(与本机实测一致)。
 - [ ] **28.2 退回开关可用(只在镜像出问题时做)**:镜像没同步到刚升级的版本、构建报 404 时,用 `EXPERT_WORK_PYPI_MIRROR= tools/deploy/release.sh …` 重发。判据:构建成功。平时不需要做,发生过就在这里记一笔。
 
 ## §29 Langfuse 记录实际发出的模型名与请求参数(B-187)
 
 **背景**:改前 Langfuse 里每次模型调用(名为 `llm_call` 的 GENERATION)模型名为空、没有任何请求参数;现在带上实际应答模型的名字,以及平台改写之后真正发给厂商的温度、输出上限、思考档位等字段(没发的字段不出现)。发给厂商的请求本身不变。Langfuse 会按它自带的价目表给认识的模型估一个费用,那不是平台计费。
 
-- [ ] **29.1 模型名与参数可见**:发测试后,用 eval-hb 跑一道题(或调试台任一 deepseek-v4-pro 智能体发一句话),Langfuse → Traces 打开该 run 的 trace,点 `llm_call`。判据:① 顶部 Model 显示 `deepseek-v4-pro`;② Model parameters 里有 `temperature: 1`、`max_tokens: 32768`、`reasoning_effort: high`(eval-hb 的配置);③ 没有任何 key、地址类字段。也可以用接口 `GET /api/public/observations/{id}` 看 `model` / `modelParameters`。**没修好时**:Model 为空,没有 Model parameters。
+- [x] **29.1 模型名与参数可见**:发测试后,用 eval-hb 跑一道题(或调试台任一 deepseek-v4-pro 智能体发一句话),Langfuse → Traces 打开该 run 的 trace,点 `llm_call`。判据:① 顶部 Model 显示 `deepseek-v4-pro`;② Model parameters 里有 `temperature: 1`、`max_tokens: 32768`、`reasoning_effort: high`(eval-hb 的配置);③ 没有任何 key、地址类字段。也可以用接口 `GET /api/public/observations/{id}` 看 `model` / `modelParameters`。**没修好时**:Model 为空,没有 Model parameters。 **10-17 测试 `202a9eb6` 过**:eval-hb 验收 run `21d6bec9` 的 3 次 `llm_call` 在 Langfuse ClickHouse `observations` 里 `provided_model_name = deepseek-v4-pro`、`model_parameters = {"temperature":1,"reasoning_effort":"high","max_tokens":32768}`;同时段金丝雀(glm-5.3)记 `{"temperature":0,"tool_stream":"true"}`;发布前(13:43)的记录模型为空、参数 `{}`;无密钥 / 地址类字段。
 - [ ] **29.2 平台改写过的值如实记录**:找一个用固定温度模型(如 kimi-k3)的智能体 run,看它的 `llm_call`。判据:`temperature` 是目录要求的固定值(kimi-k3 为 1),不是 manifest 里填的值。测试环境若没有这类智能体,记「不可判」,由自动测试 `test_langfuse_request_params.py` 覆盖。
 - [ ] **29.3 备用模型接管时各记各的**:观察性,不专门造故障。一周内若有主模型报错、备用模型接管的 run,看它的两个 `llm_call`。判据:报错那个是主模型名和参数,成功那个是备用模型自己的。一周内没发生就记 0 次。
 
@@ -320,8 +320,8 @@ langgraph / langchain-core 管图执行与检查点,opentelemetry / langfuse 管
 
 **背景**:B-188 —— 改前每个新对话第一次记录计划时,平台往工作区根目录写 `PLAN.md` / `TODO.md` / `MEMORY.md` 三个「已迁移」提示文件,根目录已有的同名文件(用户自己写的)也会被覆盖;现在只改写平台旧版本留下的旧投影。B-191 —— 一轮正常结束却既没回答也没工具调用时,改前 run 记成功、回复为空;现在丢弃重试一次,再空就报错。
 
-- [ ] **30.1 新工作区根目录不再多文件(B-188)**:发测试后用一个新用户跑一个会用计划工具的任务(eval-hb 跑任一 Harness-Bench 题即可,或调试台让智能体「先列计划再做」)。跑完列工作区根目录。判据:根目录没有内容是 `<!-- Moved: this workspace's plan/state files now live under threads/…` 的文件;`threads/<thread_id>/PLAN.md` 照常存在。**没修好时**:根目录多出这三个文件。
-- [ ] **30.2 用户自己的根目录文件不被覆盖(B-188)**:新用户第一轮先让智能体在工作区根目录写 `PLAN.md`,内容随便一句话(如「我的计划:周三前交稿」),同一轮再让它用计划工具列两步计划。跑完读根目录 `PLAN.md`。判据:内容仍是那句话。**没修好时**:被改成「已迁移」提示。
+- [x] **30.1 新工作区根目录不再多文件(B-188)**:发测试后用一个新用户跑一个会用计划工具的任务(eval-hb 跑任一 Harness-Bench 题即可,或调试台让智能体「先列计划再做」)。跑完列工作区根目录。判据:根目录没有内容是 `<!-- Moved: this workspace's plan/state files now live under threads/…` 的文件;`threads/<thread_id>/PLAN.md` 照常存在。**没修好时**:根目录多出这三个文件。 **10-17 测试 `202a9eb6` 过**:新用户 eval-hb 验收 run `21d6bec9`(调了 `write_file` + `update_plan`)跑完,根目录只有用户自己写的 `PLAN.md`,没有 `TODO.md` / `MEMORY.md`,也没有「Moved」提示;`threads/<thread_id>/PLAN.md`、`TODO.md` 照常生成。
+- [x] **30.2 用户自己的根目录文件不被覆盖(B-188)**:新用户第一轮先让智能体在工作区根目录写 `PLAN.md`,内容随便一句话(如「我的计划:周三前交稿」),同一轮再让它用计划工具列两步计划。跑完读根目录 `PLAN.md`。判据:内容仍是那句话。**没修好时**:被改成「已迁移」提示。 **10-17 测试 `202a9eb6` 过**:同一 run 读回根目录 `PLAN.md` = 「我的计划:周三前交稿」(29 字节),未被改写。
 - [ ] **30.3 空回复不再记成功(B-191)**:观察性,无法按需触发(30 天 2803 个成功 run 里只有 1 次)。发测试一周后:① 两个控制面 pod 汇总 `expert_work_llm_empty_reply_total`,并 `grep agent_node.empty_reply_` 日志;② 重跑 10-17 的只读统计(成功 run 里最后一条回复既无正文也无工具调用的个数,停顿的除外)。判据:② 为 0;① 里 `outcome="failed"` 的 run 状态都是 `error` 且错误文案是「模型结束了这一轮,却既没有给出回答,也没有调用工具」。一周内一次都没发生也算过(写明 0 次)。**没修好时**:② 不为 0。
 
 ## §31 截断补救每步最多 3 次(B-194)
