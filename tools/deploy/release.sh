@@ -10,6 +10,9 @@
 #      (control-plane :<tag>; admin-ui :<tag>-test with the env's OIDC +
 #      Langfuse build args baked in — see build-push.sh header for why
 #      the admin-ui image is environment-specific)
+#      (control-plane + credential-proxy download Python packages from the
+#      Aliyun PyPI mirror; `EXPERT_WORK_PYPI_MIRROR= tools/deploy/release.sh
+#      ...` uses pypi.org instead — see the build-push.sh header)
 #   2. pin the overlay's `images:` newTags to the fresh tags
 #      (kustomize edit; the ACS image cache resolves tags WITHOUT
 #      consulting the registry, so every release must mint fresh tags —
