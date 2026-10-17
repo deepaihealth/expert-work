@@ -28,6 +28,17 @@
 # generic image. Built WITHOUT them (the default), the image is generic
 # and falls back to token-paste login (no OIDC configured).
 #
+# PyPI mirror (EXPERT_WORK_PYPI_MIRROR): control-plane and credential-proxy
+# get `--build-arg PYPI_MIRROR=<url>`, defaulting to the Aliyun mirror
+# https://mirrors.aliyun.com/pypi/ — 2026-10-16 files.pythonhosted.org ran at
+# ~65 KB/s from this network and cost the release close to an hour. The
+# Dockerfiles rewrite the file URLs in their copy of uv.lock to that prefix
+# (the committed uv.lock stays on pypi.org; hashes are still checked against
+# it) — see the comment above `uv sync` in services/control-plane/Dockerfile.
+# Set it to the empty string (`EXPERT_WORK_PYPI_MIRROR= tools/deploy/...`) to
+# download from pypi.org instead, e.g. when the mirror lags behind a version
+# bump and 404s. admin-ui has no Python packages and never gets the arg.
+#
 # Usage:
 #   tools/deploy/build-push.sh [--images control-plane,admin-ui,credential-proxy] [--tag <tag>] [--push|--no-push] \
 #       [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \
@@ -71,6 +82,9 @@ langfuse_base_url="${VITE_LANGFUSE_BASE_URL:-}"
 app_version="${VITE_APP_VERSION:-}"
 app_env="${VITE_APP_ENV:-}"
 build_time="${VITE_BUILD_TIME:-}"
+# PyPI mirror for the Python images — see the header comment. `-` not `:-`:
+# unset means the Aliyun default, set-but-empty means pypi.org.
+pypi_mirror="${EXPERT_WORK_PYPI_MIRROR-https://mirrors.aliyun.com/pypi/}"
 
 usage() {
     cat >&2 <<EOF
@@ -96,6 +110,10 @@ Options:
 Any --oidc-* / --langfuse-* value set makes the built admin-ui image
 environment-specific — see the admin-ui OIDC paragraph in this file's
 header comment.
+
+Environment:
+  EXPERT_WORK_PYPI_MIRROR  PyPI mirror for control-plane / credential-proxy
+                        (default: https://mirrors.aliyun.com/pypi/; set to empty for pypi.org)
 EOF
     exit 2
 }
@@ -222,7 +240,8 @@ IFS=',' read -ra selected <<<"${images}"
 for image in "${selected[@]}"; do
     case "${image}" in
         control-plane)
-            build_image "control-plane" "${REPO_ROOT}/services/control-plane/Dockerfile" "${REPO_ROOT}"
+            build_image "control-plane" "${REPO_ROOT}/services/control-plane/Dockerfile" "${REPO_ROOT}" \
+                --build-arg "PYPI_MIRROR=${pypi_mirror}"
             ;;
         admin-ui)
             admin_ui_build_args=()
@@ -242,7 +261,8 @@ for image in "${selected[@]}"; do
             ;;
         credential-proxy)
             # Same workspace build as control-plane (uv --package), context = repo root.
-            build_image "credential-proxy" "${REPO_ROOT}/services/credential-proxy/Dockerfile" "${REPO_ROOT}"
+            build_image "credential-proxy" "${REPO_ROOT}/services/credential-proxy/Dockerfile" "${REPO_ROOT}" \
+                --build-arg "PYPI_MIRROR=${pypi_mirror}"
             ;;
         *)
             echo "Unknown image: ${image} (expected: control-plane, admin-ui, credential-proxy)" >&2
