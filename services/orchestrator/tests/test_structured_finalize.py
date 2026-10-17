@@ -285,6 +285,21 @@ async def test_stalled_empty_candidate_goes_to_the_structured_resend() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_normal_stop_candidate_goes_to_the_structured_resend() -> None:
+    # B-191:结构化智能体正常结束却空着 —— 同样交给按格式重发,不走主循环的空回复重试。
+    empty = AIMessage(content="", response_metadata={"finish_reason": "stop"})
+    caller = _RecordingCaller(responses=[empty, AIMessage(content=_VALID)])
+
+    final = await _run(caller, output_schema=_SPEC)
+
+    assert len(caller.calls) == 2
+    assert caller.calls[1]["output_schema"] is _SPEC
+    last = final["messages"][-1]
+    assert isinstance(last, AIMessage)
+    assert last.additional_kwargs["parsed"] == {"score": 4}
+
+
+@pytest.mark.asyncio
 async def test_resend_still_invalid_propagates_validation_error() -> None:
     caller = _RecordingCaller(
         responses=[AIMessage(content=_INVALID)],

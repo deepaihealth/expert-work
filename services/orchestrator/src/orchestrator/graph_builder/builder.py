@@ -175,6 +175,7 @@ from orchestrator.graph_builder.platform_context import (
 from orchestrator.graph_builder.reflect import ReflectNode
 from orchestrator.graph_builder.streaming_redact import make_token_sink
 from orchestrator.llm import LLMCaller
+from orchestrator.llm.empty_reply import EmptyReplyError, empty_reply_total, is_empty_reply
 from orchestrator.llm.stall import (
     STALLED_AFTER_S,
     StalledWithoutAnswerError,
@@ -1310,8 +1311,10 @@ def build_react_graph(
             # B-158 —— 不可用的截断先丢弃重来一次:被截的回答不进历史(工具调用一个都不
             # 执行),只落一条隐藏的拆小提示,路由回 agent。本轮输入的最后一条已经是这条
             # 提示 = 重试过了,照旧报错。其余通道不动,重试那次照原样重新推导。
+            # B-191 —— 「重试过了」认两种提示:每一步合计只重试一次,空回复重试那一轮又截断
+            # 同样报错,两种提示不会互相接力。
             if truncated is not None:
-                if _is_truncation_retry(state["messages"][-1]):
+                if _is_reply_retry(state["messages"][-1]):
                     raise truncated
                 logger.warning("agent_node.output_truncated_retry cap=%s", truncated.cap)
                 return {
@@ -1338,6 +1341,40 @@ def build_react_graph(
                 )
                 logger.warning("agent_node.stalled_without_answer idle_s=%s", stalled_s)
                 raise StalledWithoutAnswerError(stalled_s)
+
+        # B-191 —— 正常结束却空着:没有正文,也没有工具调用(实测:模型把要发的工具调用写进了
+        # 思考,调用没发出去,run 却记成「成功、空回复」)。照 B-158 丢弃、落一条隐藏提示、重来
+        # 一次;本轮输入已是任一种重试提示 = 这一步已经重试过,run 可见地失败。两种情况都照样
+        # 记账、不进响应缓存。排除项同 B-186,再加收尾轮:那一轮没绑工具、工具调用是平台剥掉
+        # 的,run 也按预算出口结束,不是「空着的成功」。
+        if (
+            cache_hit_response is None
+            and output_schema is None
+            and not dispatch_active
+            and not budget_exhausted
+            and is_empty_reply(response)
+        ):
+            await _meter_without_caching(
+                response,
+                prompt=messages,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                after_llm_chain=after_llm_chain,
+            )
+            provider, model, _cap = (
+                output_cap_resolver(response) if output_cap_resolver is not None else ("", "", None)
+            )
+            if _is_reply_retry(state["messages"][-1]):
+                empty_reply_total.labels(provider=provider, model=model, outcome="failed").inc()
+                logger.warning("agent_node.empty_reply_failed model=%s", model)
+                raise EmptyReplyError()
+            empty_reply_total.labels(provider=provider, model=model, outcome="retried").inc()
+            logger.warning("agent_node.empty_reply_retry model=%s", model)
+            return {
+                "messages": _stamp_agent_messages([_build_empty_reply_retry()], config),
+                "step_count": step_count + 1,
+                "step_count_refund_pending": 0,
+            }
 
         # Stream RT-1 PR-3 (RT-ADR-4) — structured finalization. Only a
         # terminal candidate (no tool_calls) is constrained; tool-calling
@@ -2275,6 +2312,30 @@ def _is_truncation_retry(message: BaseMessage) -> bool:
     return bool(message.additional_kwargs.get(TRUNCATION_RETRY_KEY))
 
 
+#: B-191 —— 空回复重试提示的标记,用法同 :data:`TRUNCATION_RETRY_KEY`。
+EMPTY_REPLY_RETRY_KEY = "expert_work_empty_reply_retry"
+
+
+def _build_empty_reply_retry() -> HumanMessage:
+    """B-191 —— 空回复作废后给模型的隐藏提示(与 :func:`_build_truncation_retry` 同一形态)。"""
+    return HumanMessage(
+        content=(
+            "[empty reply notice] Your previous reply contained no answer and no tool call, "
+            "so nothing ran. If you meant to call a tool, call it through the tool interface. "
+            "Keep tool arguments small: write large content in pieces, and never inline large "
+            "base64 data."
+        ),
+        additional_kwargs={HIDE_FROM_UI: True, EMPTY_REPLY_RETRY_KEY: True},
+    )
+
+
+def _is_reply_retry(message: BaseMessage) -> bool:
+    """B-191 —— 这条是任一种重试提示(B-158 截断 / B-191 空回复):每一步合计只重试一次。"""
+    return _is_truncation_retry(message) or bool(
+        message.additional_kwargs.get(EMPTY_REPLY_RETRY_KEY)
+    )
+
+
 def _with_plan_close(
     route: Callable[[AgentState], str],
 ) -> Callable[[AgentState], str]:
@@ -2900,8 +2961,9 @@ def _should_continue(state: AgentState) -> Literal["tools", "agent", "__end__"]:
     last = state["messages"][-1]
     if _extract_tool_calls(last):
         return "tools"
-    # B-158 —— 截断作废、刚落了拆小提示:回 agent 重做这一步(至多一次,见 agent_node)。
-    if _is_truncation_retry(last):
+    # B-158 / B-191 —— 截断或空回复作废、刚落了重试提示:回 agent 重做这一步(至多一次,
+    # 见 agent_node)。
+    if _is_reply_retry(last):
         return "agent"
     # B-35 — a dispatch turn that produced no tool calls must not end the
     # run (the plan still has undone work): route back to ``agent``, whose
