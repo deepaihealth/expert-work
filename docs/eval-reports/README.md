@@ -29,3 +29,4 @@ docs/eval-reports/
 | 日期 | 维度 | 测评集 | 结论 | 目录 |
 |---|---|---|---|---|
 | 2026-10-17 | harness | Harness-Bench（257 题，DeepSeek V4 Pro，4 轮） | 4 轮平均 68.44，8 家中第 2（第 1 名 Codex 69.25） | [harness/2026-10-17-harness-bench](harness/2026-10-17-harness-bench/) |
+| 2026-10-16 | harness | SpreadsheetBench Verified 前 50 题（DeepSeek V4.1 Flash，2 轮） | 2 轮平均答对率 84.3%，5 家中第 2（第 1 名 Pi 85.1%） | [harness/2026-10-16-spreadsheetbench](harness/2026-10-16-spreadsheetbench/) |
