@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -292,6 +294,7 @@ async def test_create_base_with_config_and_get_single(setup: Setup) -> None:
         "score_threshold": 0.4,
         "method": "vector",
         "rerank_enabled": False,
+        "rerank_score_threshold": None,
     }
     assert body["stats"] == {"document_count": 0, "chunk_count": 0}
 
@@ -466,6 +469,119 @@ async def test_retrieval_test_returns_scored_results(full_setup: FullSetup) -> N
     first = body["results"][0]
     assert set(first) >= {"content", "source", "filename", "chunk_index", "score", "recall_source"}
     assert first["source"].startswith("h.md#")
+
+
+@pytest.mark.asyncio
+async def test_rerank_score_threshold_create_patch_clear(setup: Setup) -> None:
+    """B-175 wave 2 PR3 — the per-base rerank-score threshold round-trips
+    through create / PATCH, and an explicit null clears it."""
+    client, _ = setup
+    created = await client.post(
+        "/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.7}
+    )
+    assert created.json()["retrieval_config"]["rerank_score_threshold"] == 0.7
+    kept = await client.patch("/v1/knowledge/bases/kb", json={"retrieval_top_k": 9})
+    assert kept.json()["retrieval_config"]["rerank_score_threshold"] == 0.7
+    cleared = await client.patch("/v1/knowledge/bases/kb", json={"rerank_score_threshold": None})
+    assert cleared.json()["retrieval_config"]["rerank_score_threshold"] is None
+    bad = await client.patch("/v1/knowledge/bases/kb", json={"rerank_score_threshold": 1.5})
+    assert bad.status_code == 422
+    bad_create = await client.post(
+        "/v1/knowledge/bases", json={"name": "kb2", "rerank_score_threshold": -0.1}
+    )
+    assert bad_create.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_reports_how_the_search_ended(full_setup: FullSetup) -> None:
+    client, runner, _ = full_setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb"})
+    await client.post(
+        "/v1/knowledge/bases/kb/documents",
+        files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
+    )
+    await runner.drain()
+    body = (await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})).json()
+    assert body["status"] == "ok"
+    assert body["candidates"] >= 1
+    assert body["rerank_degraded"] is False
+    assert "rerank_score" in body["results"][0]
+
+
+class _RaisingReranker:
+    async def rerank(self, **_: Any) -> list[int]:
+        raise RuntimeError("dashscope rerank failed: 500")
+
+    async def rerank_scored(self, **_: Any) -> list[tuple[int, float | None]]:
+        raise RuntimeError("dashscope rerank failed: 500")
+
+
+class _LowScoreReranker:
+    async def rerank(self, **kwargs: Any) -> list[int]:
+        return [i for i, _ in await self.rerank_scored(**kwargs)]
+
+    async def rerank_scored(
+        self, *, documents: Sequence[str], top_k: int, **_: Any
+    ) -> list[tuple[int, float | None]]:
+        return [(i, 0.2) for i in range(min(len(documents), top_k))]
+
+
+@asynccontextmanager
+async def _client_with_reranker(reranker: Any) -> AsyncIterator[AsyncClient]:
+    store = InMemoryKnowledgeStore()
+    embedder = FakeEmbedder()
+    runner = KnowledgeIngestionRunner(store=store, embedder=embedder)
+    app = create_app(
+        settings=_settings(),
+        knowledge_repo=store,
+        knowledge_ingestion_runner=runner,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    app.state.knowledge_retriever = KnowledgeRetriever(
+        store=store, embedder=embedder, reranker=reranker
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://cp.test", headers=_headers()
+    ) as client:
+        await client.post("/v1/knowledge/bases", json={"name": "kb"})
+        await client.post(
+            "/v1/knowledge/bases/kb/documents",
+            files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
+        )
+        await runner.drain()
+        yield client
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_survives_a_failing_reranker() -> None:
+    """A rerank vendor error used to be an unhandled 500 on the hit-test."""
+    async with _client_with_reranker(_RaisingReranker()) as client:
+        resp = await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rerank_degraded"] is True
+    assert body["count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_threshold_override_reports_below_threshold() -> None:
+    async with _client_with_reranker(_LowScoreReranker()) as client:
+        plain = await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
+        resp = await client.post(
+            "/v1/knowledge/bases/kb/test",
+            json={"query": "deductible", "rerank_score_threshold": 0.5},
+        )
+    unfiltered = plain.json()
+    assert unfiltered["status"] == "ok"
+    assert [r["rerank_score"] for r in unfiltered["results"]] == pytest.approx(
+        [0.2] * unfiltered["count"]
+    )
+    body = resp.json()
+    assert body["status"] == "below_threshold"
+    assert body["count"] == 0
+    assert body["candidates"] >= 1
 
 
 @pytest.mark.asyncio

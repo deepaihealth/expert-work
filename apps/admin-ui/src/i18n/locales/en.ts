@@ -498,6 +498,9 @@ export interface TranslationKeys {
     method_hybrid: string;
     field_rerank: string;
     field_rerank_hint: string;
+    field_rerank_threshold: string;
+    field_rerank_threshold_hint: string;
+    field_rerank_threshold_placeholder: string;
     col_description: string;
     col_documents: string;
     col_chunks_total: string;
@@ -3802,6 +3805,10 @@ const en: TranslationKeys = {
     field_rerank: "LLM rerank",
     field_rerank_hint:
       "Reorder fused results by an LLM when one is configured.",
+    field_rerank_threshold: "Rerank score floor",
+    field_rerank_threshold_hint:
+      "Applies when rerank is on: chunks whose rerank score (0–1) is below this are dropped; if all are, the search returns nothing found. Meant to stop clearly off-topic questions — it cannot tell an on-topic question the documents don't answer. A reference value is 0.70 (measured with qwen3-vl-rerank). The scale depends on the rerank model: recalibrate after changing it. Off by default (empty).",
+    field_rerank_threshold_placeholder: "Empty = off (e.g. 0.70)",
     col_description: "Description",
     col_documents: "Docs",
     col_chunks_total: "Chunks",

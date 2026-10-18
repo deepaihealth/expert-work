@@ -23,7 +23,8 @@ from orchestrator.tools import (
     ToolBlockedError,
     ToolContext,
 )
-from orchestrator.tools.knowledge import _parse_rerank_order
+from orchestrator.tools.error_classifier import GuidedToolError, classify_tool_error
+from orchestrator.tools.knowledge import KNOWLEDGE_ANSWERABILITY_RULE, _parse_rerank_order
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -916,3 +917,379 @@ async def test_two_view_rerank_skips_the_body_view_for_untitled_chunks() -> None
 
     assert [r.content for r in results] == ["second", "first"]
     assert len(reranker.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# B-175 W2 PR3 — rerank scores, rerank-score threshold, rerank failure, outcomes
+# ---------------------------------------------------------------------------
+
+
+class _RaisingReranker:
+    """A reranker whose backend is down (e.g. DashScope answering 500)."""
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        raise RuntimeError("dashscope rerank failed: 500")
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        raise RuntimeError("dashscope rerank failed: 500")
+
+
+class _EmptyReranker:
+    """A reranker that answers with no results for a non-empty candidate list."""
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        return []
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        return []
+
+
+class _TimingOutEmbedder:
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        raise TimeoutError("embedding endpoint timed out")
+
+
+class _UnscoredBodyViewReranker(_ScoringReranker):
+    """Scores the titled view but returns the body view without scores."""
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        ranked = await super().rerank_scored(
+            query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+        )
+        if len(self.calls) == 1:
+            return ranked
+        return [(index, None) for index, _score in ranked]
+
+
+async def _set_threshold(store: InMemoryKnowledgeStore, tenant: UUID, value: float) -> None:
+    base = await store.get_base(tenant_id=tenant, name="kb")
+    assert base is not None
+    await store.update_base(tenant_id=tenant, kb_id=base.id, rerank_score_threshold=value)
+
+
+def _scored(store: InMemoryKnowledgeStore, reranker: Any) -> KnowledgeRetriever:
+    return KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+
+
+async def test_each_result_reports_its_rerank_score() -> None:
+    store, tenant, _ = await _titled_store(["first", "second"], title=None)
+    retriever = _scored(store, _ScoringReranker({"second": 0.9, "first": 0.4}))
+
+    results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+
+    assert [(r.content, r.rerank_score) for r in results] == [("second", 0.9), ("first", 0.4)]
+
+
+async def test_two_view_results_report_the_weighted_score_they_were_ranked_by() -> None:
+    store, tenant, _ = await _titled_store(["answer", "boilerplate"], title="guide")
+    retriever = _scored(
+        store,
+        _ScoringReranker(
+            {
+                "[Document: guide]\n\nanswer": 0.80,
+                "[Document: guide]\n\nboilerplate": 0.90,
+                "answer": 0.90,
+                "boilerplate": 0.10,
+            }
+        ),
+    )
+
+    results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+
+    assert [r.content for r in results] == ["answer", "boilerplate"]
+    assert [r.rerank_score for r in results] == pytest.approx([0.83, 0.66])
+
+
+async def test_rerank_threshold_keeps_hits_at_or_above_it() -> None:
+    store, tenant, _ = await _titled_store(["high", "edge", "low"], title=None)
+    await _set_threshold(store, tenant, 0.5)
+    retriever = _scored(store, _ScoringReranker({"high": 0.9, "edge": 0.5, "low": 0.49}))
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+
+    assert [r.content for r in outcome.results] == ["high", "edge"]
+    assert outcome.status == "ok"
+
+
+async def test_every_hit_below_the_threshold_is_a_below_threshold_outcome() -> None:
+    store, tenant, _ = await _titled_store(["a", "b", "c"], title=None)
+    await _set_threshold(store, tenant, 0.7)
+    retriever = _scored(store, _ScoringReranker({"a": 0.69, "b": 0.3, "c": 0.1}))
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+
+    assert outcome.results == ()
+    assert outcome.status == "below_threshold"
+    assert outcome.candidates == 3
+
+
+async def test_threshold_override_beats_the_base_setting() -> None:
+    store, tenant, _ = await _titled_store(["a", "b"], title=None)
+    await _set_threshold(store, tenant, 0.95)
+    retriever = _scored(store, _ScoringReranker({"a": 0.9, "b": 0.2}))
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5, rerank_score_threshold=0.5
+    )
+
+    assert [r.content for r in outcome.results] == ["a"]
+
+
+async def test_threshold_does_not_apply_without_rerank_scores() -> None:
+    """A chat-model reranker ranks without scores: nothing to compare, keep all."""
+    store, tenant, _ = await _titled_store(["a", "b"], title=None)
+    await _set_threshold(store, tenant, 0.99)
+    retriever = _scored(store, _ScoringReranker({"b": 0.9}, unscored=True))
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+
+    assert [r.content for r in outcome.results] == ["b", "a"]
+    assert [r.rerank_score for r in outcome.results] == [None, None]
+
+
+async def test_threshold_does_not_apply_when_rerank_is_off() -> None:
+    store, tenant, _ = await _titled_store(["a", "b"], title=None)
+    await _set_threshold(store, tenant, 0.99)
+    retriever = _scored(store, _ScoringReranker({"a": 0.1, "b": 0.1}))
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5, rerank=False
+    )
+
+    assert len(outcome.results) == 2
+    assert outcome.status == "ok"
+
+
+async def test_each_base_applies_its_own_threshold() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    strict = await store.create_base(tenant_id=tenant, name="strict", rerank_score_threshold=0.5)
+    loose = await store.create_base(tenant_id=tenant, name="loose")
+    for base, body in ((strict, "strict passage"), (loose, "loose passage")):
+        document = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename=f"{base.name}.pdf"
+        )
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=document.id,
+            chunks=[
+                _chunk(
+                    tenant=tenant,
+                    kb=base.id,
+                    doc=document.id,
+                    index=0,
+                    content=body,
+                    embedding=(1.0,),
+                )
+            ],
+        )
+    retriever = _scored(store, _ScoringReranker({"strict passage": 0.3, "loose passage": 0.3}))
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["strict", "loose"], query="q", limit=5
+    )
+
+    assert [r.content for r in outcome.results] == ["loose passage"]
+
+
+async def test_a_strict_base_dropping_the_top_hits_leaves_room_for_another_base() -> None:
+    """The threshold applies before the cut to ``limit``: the strict base's hits
+    outrank the loose base's, all fall under its floor, and the loose base's hit
+    below the cut still comes back instead of a ``below_threshold``."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    strict = await store.create_base(tenant_id=tenant, name="strict", rerank_score_threshold=0.8)
+    loose = await store.create_base(tenant_id=tenant, name="loose")
+    for base, bodies in ((strict, ("strict one", "strict two")), (loose, ("loose one",))):
+        document = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename=f"{base.name}.pdf"
+        )
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=document.id,
+            chunks=[
+                _chunk(
+                    tenant=tenant,
+                    kb=base.id,
+                    doc=document.id,
+                    index=i,
+                    content=body,
+                    embedding=(1.0,),
+                )
+                for i, body in enumerate(bodies)
+            ],
+        )
+    retriever = _scored(
+        store, _ScoringReranker({"strict one": 0.7, "strict two": 0.6, "loose one": 0.3})
+    )
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["strict", "loose"], query="q", limit=1
+    )
+
+    assert [r.content for r in outcome.results] == ["loose one"]
+    assert outcome.status == "ok"
+    assert outcome.candidates == 3
+
+
+async def test_an_unscored_body_view_keeps_the_titled_order_without_scores() -> None:
+    """Titled-only scores run higher than the weighted scores a threshold is
+    calibrated on, so when the body view comes back unscored the hits carry no
+    score and the threshold lets them through."""
+    store, tenant, _ = await _titled_store(["answer", "boilerplate"], title="guide")
+    await _set_threshold(store, tenant, 0.85)
+    reranker = _UnscoredBodyViewReranker(
+        {"[Document: guide]\n\nanswer": 0.90, "[Document: guide]\n\nboilerplate": 0.80}
+    )
+
+    outcome = await _scored(store, reranker).search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+
+    assert len(reranker.calls) == 2
+    assert [(r.content, r.rerank_score) for r in outcome.results] == [
+        ("answer", None),
+        ("boilerplate", None),
+    ]
+
+
+async def test_a_failing_reranker_degrades_to_the_fused_order() -> None:
+    """Rerank is an optional quality pass: a vendor 500 must not fail the search
+    (it used to surface as a tool error / console 500). No scores, so the
+    threshold does not apply either."""
+    store, tenant = await _seed_store()
+    await _set_threshold(store, tenant, 0.99)
+    plain = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0, 0.0)))
+    failing = KnowledgeRetriever(
+        store=store, embedder=_FixedEmbedder((1.0, 0.0)), reranker=_RaisingReranker()
+    )
+
+    expected = await plain.search(tenant_id=tenant, base_names=["kb"], query="policy", limit=5)
+    outcome = await failing.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="policy", limit=5
+    )
+
+    assert [r.chunk_id for r in outcome.results] == [r.chunk_id for r in expected]
+    assert outcome.rerank_degraded is True
+    assert outcome.status == "ok"
+
+
+async def test_an_empty_rerank_answer_degrades_instead_of_finding_nothing() -> None:
+    store, tenant = await _seed_store()
+    retriever = KnowledgeRetriever(
+        store=store, embedder=_FixedEmbedder((1.0, 0.0)), reranker=_EmptyReranker()
+    )
+
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="policy", limit=5
+    )
+
+    assert len(outcome.results) == 2
+    assert outcome.rerank_degraded is True
+
+
+async def test_unknown_bases_and_empty_bases_are_different_outcomes() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    await store.create_base(tenant_id=tenant, name="kb")  # exists, holds nothing
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0, 0.0)))
+
+    missing = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["gone"], query="q", limit=5
+    )
+    empty = await retriever.search_detailed(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+
+    assert (missing.status, missing.results) == ("no_bases", ())
+    assert (empty.status, empty.results) == ("no_hits", ())
+
+
+# --- the knowledge_search tool: what the model reads for each outcome ---
+
+
+async def test_results_carry_the_answerability_notice_outside_the_content() -> None:
+    """The rule reaches the model as a trusted platform notice; the fenced
+    content stays the passages alone."""
+    store, tenant = await _seed_store()
+    result = await _tool(store).call({"query": "deductible"}, ctx=ToolContext(tenant_id=tenant))
+
+    assert result.notice is not None
+    assert "explicitly states is not supported by the knowledge base" in result.notice
+    assert result.notice not in result.content
+    assert result.meta["status"] == "ok"
+
+
+async def test_no_hits_keeps_its_message_and_suggests_one_rephrased_search() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    await store.create_base(tenant_id=tenant, name="kb")
+    result = await _tool(store).call({"query": "anything"}, ctx=ToolContext(tenant_id=tenant))
+
+    assert result.content.startswith("[no relevant knowledge found for the query")
+    assert result.notice is not None
+    assert "a search in their terms" in result.notice
+    assert result.meta == {"hits": 0, "status": "no_hits"}
+
+
+async def test_below_threshold_says_how_many_passages_were_turned_down() -> None:
+    store, tenant, _ = await _titled_store(["a", "b", "c"], title=None)
+    await _set_threshold(store, tenant, 0.7)
+    retriever = _scored(store, _ScoringReranker({"a": 0.2, "b": 0.2, "c": 0.2}))
+    tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
+
+    result = await tool.call({"query": "q"}, ctx=ToolContext(tenant_id=tenant))
+
+    assert result.content.startswith("[no relevant knowledge found for the query")
+    assert "3 passages" in result.content
+    assert result.meta == {"hits": 0, "status": "below_threshold"}
+
+
+async def test_missing_bases_are_a_guided_error_not_an_empty_result() -> None:
+    tool = _tool(InMemoryKnowledgeStore())
+    with pytest.raises(GuidedToolError) as raised:
+        await tool.call({"query": "q"}, ctx=ToolContext(tenant_id=uuid4()))
+    assert "says nothing about whether the information exists" in raised.value.advice
+
+
+async def test_a_timed_out_search_stays_a_transient_failure() -> None:
+    """A failed search propagates as-is, so an outage keeps the ``transient``
+    class (no effort escalation over a blip) and its generic advice."""
+    store, tenant = await _seed_store()
+    retriever = KnowledgeRetriever(store=store, embedder=_TimingOutEmbedder())
+    tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
+
+    with pytest.raises(TimeoutError) as raised:
+        await tool.call({"query": "q"}, ctx=ToolContext(tenant_id=tenant))
+
+    classified = classify_tool_error(
+        tool_name="knowledge_search", error=raised.value, spec=tool.spec
+    )
+    assert classified.error_class == "transient"
+
+
+async def test_a_degraded_rerank_is_flagged_in_meta() -> None:
+    store, tenant = await _seed_store()
+    result = await _tool(store, reranker=_RaisingReranker()).call(
+        {"query": "policy"}, ctx=ToolContext(tenant_id=tenant)
+    )
+    assert result.meta["rerank_degraded"] is True
+    assert result.meta["hits"] == 2
+
+
+def test_the_tool_description_states_the_answerability_rule() -> None:
+    assert KNOWLEDGE_ANSWERABILITY_RULE in _tool(InMemoryKnowledgeStore()).spec.description

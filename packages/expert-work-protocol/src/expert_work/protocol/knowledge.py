@@ -201,6 +201,16 @@ class KnowledgeBase(BaseModel):
     rerank_enabled: bool = Field(
         default=True, description="apply the LLM reranker after fusion when configured"
     )
+    rerank_score_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "minimum rerank score to keep a hit (B-175 wave 2 PR3); a search whose every "
+            "hit falls below it returns nothing. Only applies when the reranker scores "
+            "(not a chat-model reranker, not when rerank failed). None disables it"
+        ),
+    )
     #: Embedding model that produced this base's vectors. Captured at create
     #: time; compared against the live platform model to derive ``needs_reindex``.
     embedding_provider: str | None = None

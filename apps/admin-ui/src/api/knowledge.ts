@@ -25,6 +25,8 @@ export interface RetrievalConfig {
   score_threshold: number | null;
   method: RetrievalMethod;
   rerank_enabled: boolean;
+  /** Minimum rerank score to keep a hit (B-175 wave 2 PR3); ``null`` = off. */
+  rerank_score_threshold?: number | null;
 }
 
 export interface KnowledgeBaseStats {
@@ -164,6 +166,7 @@ export interface UpdateBaseBody {
   retrieval_score_threshold?: number | null;
   retrieval_method?: RetrievalMethod;
   rerank_enabled?: boolean;
+  rerank_score_threshold?: number | null;
 }
 
 export interface RetrievalTestBody {

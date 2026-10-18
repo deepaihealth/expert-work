@@ -294,9 +294,14 @@ def score_case(
     *,
     threshold: float | None,
     match: str = "any",
+    rerank_threshold: float | None = None,
 ) -> CaseScore:
+    """``rerank_threshold`` (B-175 wave 2 PR3) is the rerank-score floor the
+    retriever already applied: with it set, an empty result is a refusal."""
     _check_match(match)
     refused = is_refused(results, threshold=threshold)
+    if rerank_threshold is not None:
+        refused = bool(refused) or not results
     zero_hit = not results
     best = best_score(results)
     if not expected:

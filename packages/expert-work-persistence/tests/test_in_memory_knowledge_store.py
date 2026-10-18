@@ -133,6 +133,25 @@ async def test_update_base_clear_vs_omit_nullable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rerank_score_threshold_round_trip() -> None:
+    """B-175 wave 2 PR3 — stored at create; an update that omits it keeps it,
+    an explicit None clears it."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb", rerank_score_threshold=0.7)
+    assert base.rerank_score_threshold == 0.7
+    kept = await store.update_base(tenant_id=tenant, kb_id=base.id, retrieval_top_k=9)
+    assert kept is not None
+    assert kept.rerank_score_threshold == 0.7
+    changed = await store.update_base(tenant_id=tenant, kb_id=base.id, rerank_score_threshold=0.6)
+    assert changed is not None
+    assert changed.rerank_score_threshold == 0.6
+    cleared = await store.update_base(tenant_id=tenant, kb_id=base.id, rerank_score_threshold=None)
+    assert cleared is not None
+    assert cleared.rerank_score_threshold is None
+
+
+@pytest.mark.asyncio
 async def test_update_missing_base_returns_none() -> None:
     store = InMemoryKnowledgeStore()
     assert await store.update_base(tenant_id=uuid4(), kb_id=uuid4(), description="x") is None

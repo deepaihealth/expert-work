@@ -40,6 +40,7 @@ interface SettingsFormValues {
   retrieval_score_threshold?: number | null;
   retrieval_method?: RetrievalMethod;
   rerank_enabled?: boolean;
+  rerank_score_threshold?: number | null;
 }
 
 function errMessage(err: unknown): string {
@@ -74,6 +75,7 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
     retrieval_score_threshold: config?.score_threshold ?? null,
     retrieval_method: config?.method,
     rerank_enabled: config?.rerank_enabled,
+    rerank_score_threshold: config?.rerank_score_threshold ?? null,
   };
 
   const handleSave = useCallback(
@@ -88,6 +90,7 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
           retrieval_score_threshold: values.retrieval_score_threshold ?? null,
           retrieval_method: values.retrieval_method,
           rerank_enabled: values.rerank_enabled,
+          rerank_score_threshold: values.rerank_score_threshold ?? null,
         });
         message.success(t("knowledge_page.settings_saved"));
         await onSaved();
@@ -200,6 +203,21 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
             valuePropName="checked"
           >
             <Switch aria-label={t("knowledge_page.field_rerank")} />
+          </Form.Item>
+          <Form.Item
+            name="rerank_score_threshold"
+            label={t("knowledge_page.field_rerank_threshold")}
+            tooltip={t("knowledge_page.field_rerank_threshold_hint")}
+          >
+            <InputNumber
+              min={0}
+              max={1}
+              step={0.05}
+              style={{ width: "100%" }}
+              placeholder={t("knowledge_page.field_rerank_threshold_placeholder")}
+              aria-label={t("knowledge_page.field_rerank_threshold")}
+              data-testid="kb-settings-rerank-threshold"
+            />
           </Form.Item>
           <ReadonlyTooltip on={readonly}>
             <Button

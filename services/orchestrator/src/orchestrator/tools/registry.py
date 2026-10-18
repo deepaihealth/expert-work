@@ -425,7 +425,9 @@ class ToolResult:
     The tools node appends it after ``content`` **outside** the spotlight
     fence, so the model reads it as trusted platform text and file content
     that imitates it stays fenced. It must never carry tool output — only
-    facts the tool computed (counts, the next argument to pass).
+    facts the tool computed (counts, the next argument to pass) or fixed
+    platform text about how to read this kind of result (``knowledge_search``,
+    B-175 wave 2 PR3), stated as facts rather than commands (B-163).
     """
 
     content: str

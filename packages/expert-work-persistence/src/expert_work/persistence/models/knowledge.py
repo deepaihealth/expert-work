@@ -75,6 +75,8 @@ class KnowledgeBaseRow(Base):
     rerank_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+    #: B-175 wave 2 PR3 — minimum rerank score to keep a hit (NULL = off).
+    rerank_score_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
     #: Embedding model that produced this base's vectors (captured at create).
     #: Compared against the live platform model to derive ``needs_reindex``.
     embedding_provider: Mapped[str | None] = mapped_column(Text, nullable=True)

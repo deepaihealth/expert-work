@@ -509,6 +509,10 @@ const zhCN: TranslationKeys = {
     method_hybrid: "混合",
     field_rerank: "LLM 重排",
     field_rerank_hint: "配置了重排模型时，用 LLM 对融合结果重新排序。",
+    field_rerank_threshold: "重排分数下限",
+    field_rerank_threshold_hint:
+      "开启重排时生效：重排分数低于此值（0–1）的分块丢弃，全部低于则本次检索按「没找到」返回。只用来挡明显离题的问题；主题相关但资料没写的问题它分不开。参考值 0.70（按 qwen3-vl-rerank 实测）；分数尺度随重排模型而定，换模型后要重新标定。默认关（留空）。",
+    field_rerank_threshold_placeholder: "留空 = 不过滤（参考 0.70）",
     col_description: "描述",
     col_documents: "文档",
     col_chunks_total: "分块",

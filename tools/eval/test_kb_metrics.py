@@ -208,6 +208,16 @@ def test_ndcg_counts_only_positions_within_k() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_rerank_threshold_refusal_is_an_empty_result() -> None:
+    """B-175 wave 2 PR3 — the rerank-score threshold filters inside the
+    retriever, so with it set, refused = nothing came back."""
+    expected = [_EXP_A]
+    assert score_case([], expected, threshold=None, rerank_threshold=0.7).refused is True
+    hit = [_r("a.md", _ANCHOR, None)]
+    assert score_case(hit, expected, threshold=None, rerank_threshold=0.7).refused is False
+    assert score_case(hit, expected, threshold=None).refused is None
+
+
 def test_refused_is_none_without_threshold() -> None:
     # #5:没给阈值就没有「拒答」这回事,恒定的 0 / 1 不是指标。
     assert is_refused([], threshold=None) is None
