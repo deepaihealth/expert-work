@@ -394,7 +394,7 @@ def test_special_token_text_is_counted_as_ordinary_text(special: str) -> None:
 
 @pytest.mark.parametrize("special", _SPECIAL_TOKENS)
 def test_special_token_text_survives_chunking(special: str) -> None:
-    src = f"# Tokenizer\n\nEach sample ends with {special} before padding.\n\n# Next\n\nOther text.\n"
+    src = f"# Tokenizer\n\nEach sample ends with {special} before padding.\n\n# Next\n\nOther.\n"
     text = "\n".join(chunk_markdown(src, max_tokens=512, overlap_tokens=0))
     assert f"Each sample ends with {special} before padding." in text
 
