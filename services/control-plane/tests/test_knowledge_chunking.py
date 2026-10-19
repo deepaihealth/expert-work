@@ -12,6 +12,7 @@ from control_plane.knowledge.chunking import (
     MIN_SEMANTIC_CHUNK_TOKENS,
     TextChunk,
     _cosine_distance,
+    _encoding,
     _hard_split,
     _split_by_tokens,
     _tail_text,
@@ -379,3 +380,28 @@ def test_cr_and_crlf_still_break_lines(brk: str) -> None:
         (("A",), "intro"),
         (("B",), "Refund window is 14 days."),
     ]
+
+
+# A document about LLMs quotes the tokenizer's special tokens as plain text;
+# tiktoken refuses to encode them unless told they are ordinary text.
+_SPECIAL_TOKENS = sorted(_encoding.special_tokens_set)
+
+
+@pytest.mark.parametrize("special", _SPECIAL_TOKENS)
+def test_special_token_text_is_counted_as_ordinary_text(special: str) -> None:
+    assert count_tokens(f"the model stops at {special} here") > 1
+
+
+@pytest.mark.parametrize("special", _SPECIAL_TOKENS)
+def test_special_token_text_survives_chunking(special: str) -> None:
+    src = f"# Tokenizer\n\nEach sample ends with {special} before padding.\n\n# Next\n\nOther text.\n"
+    text = "\n".join(chunk_markdown(src, max_tokens=512, overlap_tokens=0))
+    assert f"Each sample ends with {special} before padding." in text
+
+
+def test_special_token_text_survives_token_window_split_and_overlap() -> None:
+    text = "".join(f"x{i}{special}" for i in range(20) for special in _SPECIAL_TOKENS)
+    parts = _split_by_tokens(text, 7)
+    assert len(parts) > 1
+    assert "".join(parts) == text
+    assert text.endswith(_tail_text(text, 5))
