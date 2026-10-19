@@ -339,3 +339,43 @@ async def test_semantic_short_block_still_stops_at_a_heading() -> None:
         src, max_tokens=512, overlap_tokens=0, embedder=embedder, tenant_id=uuid4()
     )
     assert chunks == ["[Section: A]\n\nTOPICA short.", f"[Section: B]\n\n{_para('TOPICB', 'beta')}"]
+
+
+# str.splitlines also breaks on these; markdown-it, whose token line numbers
+# the chunker slices by, breaks only on \r\n, \r and \n.
+_ODD_LINE_BREAKS = ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+
+
+@pytest.mark.parametrize("brk", _ODD_LINE_BREAKS)
+def test_odd_line_break_inside_a_line_loses_no_text(brk: str) -> None:
+    text = "\n".join(
+        chunk_markdown(f"para one\n{brk}para two\n\npara three\n", max_tokens=512, overlap_tokens=0)
+    )
+    assert "para two" in text
+    assert "para three" in text
+
+
+@pytest.mark.parametrize("brk", _ODD_LINE_BREAKS)
+def test_odd_line_break_at_a_line_end_loses_no_later_section(brk: str) -> None:
+    src = f"# Chapter 1\n\nIntro paragraph.{brk}\n\n# Chapter 2\n\nRefund window is 14 days.\n"
+    text = "\n".join(chunk_markdown(src, max_tokens=512, overlap_tokens=0))
+    assert "Refund window is 14 days." in text
+
+
+def test_odd_line_break_in_a_table_cell_keeps_the_row_whole() -> None:
+    rows = "".join(f"| item {i} | {i} |\n" for i in range(40))
+    table = "| name | qty |\n| --- | --- |\n" + rows + "| two\u2028lines | 99 |\n"
+    parts = chunk_markdown(table, max_tokens=60, overlap_tokens=0)
+    assert len(parts) > 1
+    assert any("| two\u2028lines | 99 |" in part for part in parts)
+    assert all(part.startswith("| name | qty |\n| --- | --- |") for part in parts)
+
+
+@pytest.mark.parametrize("brk", ["\r", "\r\n"])
+def test_cr_and_crlf_still_break_lines(brk: str) -> None:
+    src = brk.join(["# A", "", "intro", "", "# B", "", "Refund window is 14 days.", ""])
+    chunks = _chunk_markdown(src, max_tokens=512, overlap_tokens=0)
+    assert [(c.heading_path, c.body) for c in chunks] == [
+        (("A",), "intro"),
+        (("B",), "Refund window is 14 days."),
+    ]

@@ -423,3 +423,38 @@ asyncio.run(main())
 
   厂商 4xx 不切备用模型,直接让这一轮失败,所以拒收一定会在 ① 里看到。**没修好时**:不适用,改前也不报错。这一条防的是「回传后厂商拒收」。
 - [ ] **32.4 厂商真的把思考拼进了上下文(观察性,可记不可判)**:取 32.3 那个 run 的 trace,按时间顺序看相邻两次 `llm_call` 的用量。判据:后一步的输入 token 减前一步的输入 token,应 ≥ 前一步的输出 token(输出含思考),多出来的大致是工具结果。原因是回传后,前一步的思考、回答、工具调用都进了下一步的输入。改前同一智能体的历史 run 里,这个差值约等于「前一步输出 − 前一步思考 + 工具结果」,在思考长、工具结果短的步骤上会小于前一步输出。可以拿 10-17 之前 eval-hb 的 run 做对照。工具结果很长的步骤看不出差别,跳过。若新旧看不出差别,记「不可判」(可能厂商不把回传的思考计入输入 token),不影响 32.1–32.3。 **10-17 记录(参考)**:32.3 的 5 次调用输入 5633→6261→6567→6803→7059,每步增量(628/306/236/256)都 ≥ 上一步输出(275/146/213/103);这几步思考很短、工具结果也短,区分度有限,只作参考;Harness-Bench 第 4 轮再看长思考步骤。
+
+## §34 B-181 UTF-8 文本按 UTF-8 解析 + 切分不再丢内容(ROADMAP B-181)
+
+**背景**:两处问题,都会让文档入库后少内容或错字:
+
+1. **猜编码**:`.md` / `.txt` / `.csv` 原来全交给 MarkItDown,它只拿文件前 4096 字节猜编码。① 前 4KB 全是英文时猜成 `ascii`,后面一出现 `—`、弯引号就整篇解析失败;② 只有零星 `¥` 时猜成别的编码,入库后是乱码;③ 行尾两个空格(Markdown 的硬换行)被删掉。现在 `.md` / `.txt` 只要是合法 UTF-8 就直接按 UTF-8 用(去掉开头的 BOM;CRLF 换成 LF;行尾除普通空格外的空白照旧删掉;连续空行合并成一个,和原来一样);含 NUL 字节的(例如没有 BOM 的 UTF-16)不当 UTF-8,照旧自动识别;所有格式解析结果里零星的 NUL 字节都删掉(原来会让入库在写库那一步失败);`.csv` 仍交给 MarkItDown 转表格,但告诉它是 UTF-8。`.html` / Office / PDF 的解析不变。
+2. **切分丢内容(所有格式)**:切分器按 markdown-it 给的行号从原文截段落,原文却用 Python 的 `splitlines` 拆行,它把换页符、垂直制表符、U+2028 等也当换行,markdown-it 不当。文中出现一个,后面的段落就截错行,整段整段丢掉,文档照样显示「就绪」。现在按 markdown-it 的规则拆行。华大评测语料 597 份里 1 份中招(一份英文专利 PDF,17 个换页符,1,597 字只切出 86 字),没有评测题用到它。
+
+**已经入库失败、成了乱码或丢了内容的文档不会自动重来**:在控制台文档列表点「重新摄取」(用保存的原文件重新解析);只有很早上传、没保存原文件的文档会提示要重新上传。
+
+- [ ] **34.1 解析与切分结果(pod 内离线探针)**:发测试后执行下面的命令。只调解析和切分函数:不连外网,不读写库。判据:输出 6 行,每行末尾都是 `True`。**没修好时**:`late.txt` / `late.csv` 两行是 `FAIL DocumentParseError`,`price.md` / `hard.md` / `formfeed` 三行是 `False`。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+from control_plane.knowledge.chunking import chunk_markdown
+from control_plane.knowledge.parsing import parse_document
+pad = "Line of plain ascii text for padding.\n" * 120
+cases = [
+    ("late.txt", (pad + "Price \u2014 fine\n").encode(), "\u2014"),
+    ("late.csv", ("col,val\n" + "x,1\n" * 1200 + "dash,\u2014\n").encode(), "\u2014"),
+    ("price.md", "价目:¥198 ¥298\n".encode(), "¥198 ¥298"),
+    ("hard.md", "原价¥198  \n下一行\n".encode(), "原价¥198  \n"),
+    ("gbk.txt", ("公司简介:我们专注于营养健康产品的研发与销售,产品包括益生菌、膳食纤维和蛋白粉等。\n" * 5).encode("gbk"), "膳食纤维"),
+]
+for name, raw, want in cases:
+    try:
+        print(name, want in parse_document(name, raw))
+    except Exception as exc:
+        print(name, "FAIL", type(exc).__name__)
+chunks = chunk_markdown("para one\n\x0cpara two\n\npara three\n", max_tokens=512, overlap_tokens=0)
+print("formfeed", "para three" in "\n".join(c.text for c in chunks))
+'
+```
+
+- [ ] **34.2 真实上传(控制台)**:本机生成一个前 4KB 全是英文、后面带 `—` 和一个换页符的文件:`python3 -c 'print("Line of plain ascii text for padding.\n" * 120 + "Refund window — 14 days from delivery.\n\x0cReturns are free for members.\n", end="")' > b181-late.txt`。在测试环境新建一个知识库(名字如 `b181-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund window`,结果含 `Refund window — 14 days`(`—` 原样显示,不是乱码);③ 搜 `returns free for members`,结果含 `Returns are free for members.`。**没修好时**:解析没修好,文档状态「失败」,错误信息含 `UnicodeDecodeError`;只是切分没修好,①② 过而 ③ 搜不到这句(换页符后面的内容丢了)。验完删掉这个知识库。
