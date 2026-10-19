@@ -433,7 +433,7 @@ asyncio.run(main())
 
 **已经入库失败、成了乱码或丢了内容的文档不会自动重来**:在控制台文档列表点「重新摄取」(用保存的原文件重新解析);只有很早上传、没保存原文件的文档会提示要重新上传。
 
-- [ ] **34.1 解析与切分结果(pod 内离线探针)**:发测试后执行下面的命令。只调解析和切分函数:不连外网,不读写库。判据:输出 6 行,每行末尾都是 `True`。**没修好时**:`late.txt` / `late.csv` 两行是 `FAIL DocumentParseError`,`price.md` / `hard.md` / `formfeed` 三行是 `False`。
+- [x] **34.1 解析与切分结果(pod 内离线探针)**:发测试后执行下面的命令。只调解析和切分函数:不连外网,不读写库。判据:输出 6 行,每行末尾都是 `True`。**没修好时**:`late.txt` / `late.csv` 两行是 `FAIL DocumentParseError`,`price.md` / `hard.md` / `formfeed` 三行是 `False`。 **10-19 测试 `1f595bef` 过**:两个 control-plane pod 各输出 6 行 `True`。
 
 ```bash
 kubectl exec deploy/control-plane -- python -c '
@@ -457,4 +457,4 @@ print("formfeed", "para three" in "\n".join(c.text for c in chunks))
 '
 ```
 
-- [ ] **34.2 真实上传(控制台)**:本机生成一个前 4KB 全是英文、后面带 `—` 和一个换页符的文件:`python3 -c 'print("Line of plain ascii text for padding.\n" * 120 + "Refund window — 14 days from delivery.\n\x0cReturns are free for members.\n", end="")' > b181-late.txt`。在测试环境新建一个知识库(名字如 `b181-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund window`,结果含 `Refund window — 14 days`(`—` 原样显示,不是乱码);③ 搜 `returns free for members`,结果含 `Returns are free for members.`。**没修好时**:解析没修好,文档状态「失败」,错误信息含 `UnicodeDecodeError`;只是切分没修好,①② 过而 ③ 搜不到这句(换页符后面的内容丢了)。验完删掉这个知识库。
+- [x] **34.2 真实上传(控制台)**:本机生成一个前 4KB 全是英文、后面带 `—` 和一个换页符的文件:`python3 -c 'print("Line of plain ascii text for padding.\n" * 120 + "Refund window — 14 days from delivery.\n\x0cReturns are free for members.\n", end="")' > b181-late.txt`。在测试环境新建一个知识库(名字如 `b181-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund window`,结果含 `Refund window — 14 days`(`—` 原样显示,不是乱码);③ 搜 `returns free for members`,结果含 `Returns are free for members.`。**没修好时**:解析没修好,文档状态「失败」,错误信息含 `UnicodeDecodeError`;只是切分没修好,①② 过而 ③ 搜不到这句(换页符后面的内容丢了)。验完删掉这个知识库。 **10-19 测试 `1f595bef` 过(pod 内等价做法,未走控制台)**:在 pod 里用平台自己的 store 建临时库 `b181-probe`(租户 dd068302)、写入同一个文件,由恢复工作进程按真实链路入库(测试环境嵌入模型):① 「就绪」、3 段、无错误;② 分段含 `Refund window — 14 days`;③ 分段含 `Returns are free for members.`;验完已删库并确认不存在。没覆盖的只有控制台上传那一步的 HTTP / 页面。
