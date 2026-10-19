@@ -500,7 +500,7 @@ print("formfeed", "para three" in "\n".join(c.text for c in chunks))
 
 **已经失败的文档不会自动重来**:发版后在控制台文档列表点「重新摄取」。
 
-- [ ] **35.1 切分结果(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数:不连外网,不读写库。判据:输出 5 行(每个特殊记号一行),每行末尾都是 `True`。**没修好时**:每行是 `FAIL ValueError`。
+- [x] **35.1 切分结果(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数:不连外网,不读写库。判据:输出 5 行(每个特殊记号一行),每行末尾都是 `True`。**没修好时**:每行是 `FAIL ValueError`。 **10-19 测试 `a488eb7eb` 过**:两个 control-plane pod 各输出 5 行 `True`(修复前的代码在本机跑同一段命令是 5 行 `FAIL ValueError`)。
 
 ```bash
 kubectl exec deploy/control-plane -- python -c '
@@ -515,4 +515,4 @@ for special in sorted(_encoding.special_tokens_set):
 '
 ```
 
-- [ ] **35.2 真实入库**:本机生成文件:`printf 'Tokenizer notes.\n\nEach training sample ends with <|endoftext|> before padding.\n' > b197-special.txt`。在测试环境新建一个知识库(名字如 `b197-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `training sample ends`,结果含 `<|endoftext|>` 原样文字。**没修好时**:文档状态「失败」,错误信息含 `disallowed special token`。验完删掉这个知识库。
+- [x] **35.2 真实入库**:本机生成文件:`printf 'Tokenizer notes.\n\nEach training sample ends with <|endoftext|> before padding.\n' > b197-special.txt`。在测试环境新建一个知识库(名字如 `b197-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `training sample ends`,结果含 `<|endoftext|>` 原样文字。**没修好时**:文档状态「失败」,错误信息含 `disallowed special token`。验完删掉这个知识库。 **10-19 测试 `a488eb7eb` 过(pod 内等价做法,未走控制台)**:在 pod 里用平台自己的 store 建临时库 `b197-probe`、写入同一个文件,由恢复工作进程按真实链路入库(测试环境嵌入模型):① 「就绪」、1 段、无错误;② 分段里原样含 `<|endoftext|>`;验完已删库并确认不存在。发版前在旧版 `a4bc1b38` 上同样跑过:5 分钟后仍是「处理中」,恢复工作进程的重试日志报的就是特殊记号错误(这条路径要等重试次数用完才标「失败」;控制台上传走快路径,当场标「失败」),说明这条验证在没修好时会失败。没覆盖的只有控制台上传那一步的 HTTP / 页面。
