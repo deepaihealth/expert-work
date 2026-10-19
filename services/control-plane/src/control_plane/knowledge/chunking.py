@@ -55,6 +55,13 @@ _CONTENT_OPENERS = frozenset(
 #: markdown-it standalone block tokens that are content.
 _CONTENT_STANDALONE = frozenset({"fence", "code_block", "html_block"})
 
+#: Line breaks as markdown-it counts them (its ``normalize`` rule). Blocks are
+#: cut out of the source by markdown-it's token line numbers, so the source
+#: must be split the same way: ``str.splitlines`` also breaks on form feed,
+#: vertical tab, \x1c to \x1e, NEL and U+2028 / U+2029, and one of those
+#: shifted every later block onto the wrong lines — text silently lost (B-181).
+_LINE_BREAK = re.compile(r"\r\n?|\n")
+
 #: Sentence-ish boundary for hard-splitting an oversized paragraph. Zero
 #: width, so splitting is lossless: after a CJK sentence mark always (CJK
 #: prose has no space after 。), after an ASCII mark or a newline only when
@@ -229,7 +236,7 @@ def _parse_blocks(markdown: str) -> list[_Block]:
     """Parse ``markdown`` into top-level content / table blocks, each
     tagged with the heading breadcrumb of the section it sits in."""
     tokens = MarkdownIt().enable("table").parse(markdown)
-    lines = markdown.splitlines()
+    lines = _LINE_BREAK.split(markdown)
     blocks: list[_Block] = []
     trail_stack: list[tuple[int, str]] = []
     for index, token in enumerate(tokens):
@@ -276,7 +283,7 @@ def _prepare_block(block: _Block, max_tokens: int) -> list[str]:
 def _split_table(table: str, max_tokens: int) -> list[str]:
     """Split an oversized Markdown table by rows, repeating the header +
     separator rows in every part so each part is a valid table."""
-    lines = table.splitlines()
+    lines = _LINE_BREAK.split(table)
     if len(lines) <= 2:  # header + separator only — nothing to split
         return [table]
     header = "\n".join(lines[:2])
