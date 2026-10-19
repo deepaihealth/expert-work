@@ -89,7 +89,14 @@ MIN_SEMANTIC_CHUNK_TOKENS = 32
 
 def count_tokens(text: str) -> int:
     """Token count of ``text`` under the chunking tokenizer."""
-    return len(_encoding.encode(text))
+    return len(_encode(text))
+
+
+def _encode(text: str) -> list[int]:
+    """Token ids of ``text``. Special-token strings such as ``<|endoftext|>``
+    are ordinary document text here: a page about LLMs quotes them, and
+    tiktoken's default refuses them — which failed the whole ingest."""
+    return _encoding.encode(text, disallowed_special=())
 
 
 @dataclass(frozen=True)
@@ -331,7 +338,7 @@ def _split_by_tokens(text: str, max_tokens: int) -> list[str]:
     """Last-resort split of an unbreakable run on token windows, cut at
     character offsets so a multi-byte character is never torn in two
     (a plain ``decode`` of a token slice yields U+FFFD for CJK)."""
-    token_ids = _encoding.encode(text)
+    token_ids = _encode(text)
     decoded, offsets = _encoding.decode_with_offsets(token_ids)
     bounds = [offsets[i] for i in range(0, len(token_ids), max_tokens)] + [len(decoded)]
     return [decoded[a:b] for a, b in pairwise(bounds) if decoded[a:b]]
@@ -343,7 +350,7 @@ def _tail_text(text: str, overlap_tokens: int) -> str:
     earliest paragraph / line / sentence boundary inside that window."""
     if overlap_tokens <= 0:
         return ""
-    token_ids = _encoding.encode(text)
+    token_ids = _encode(text)
     if len(token_ids) <= overlap_tokens:
         return text
     decoded, offsets = _encoding.decode_with_offsets(token_ids)

@@ -493,3 +493,26 @@ print("formfeed", "para three" in "\n".join(c.text for c in chunks))
 ```
 
 - [x] **34.2 真实上传(控制台)**:本机生成一个前 4KB 全是英文、后面带 `—` 和一个换页符的文件:`python3 -c 'print("Line of plain ascii text for padding.\n" * 120 + "Refund window — 14 days from delivery.\n\x0cReturns are free for members.\n", end="")' > b181-late.txt`。在测试环境新建一个知识库(名字如 `b181-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund window`,结果含 `Refund window — 14 days`(`—` 原样显示,不是乱码);③ 搜 `returns free for members`,结果含 `Returns are free for members.`。**没修好时**:解析没修好,文档状态「失败」,错误信息含 `UnicodeDecodeError`;只是切分没修好,①② 过而 ③ 搜不到这句(换页符后面的内容丢了)。验完删掉这个知识库。 **10-19 测试 `1f595bef` 过(pod 内等价做法,未走控制台)**:在 pod 里用平台自己的 store 建临时库 `b181-probe`(租户 dd068302)、写入同一个文件,由恢复工作进程按真实链路入库(测试环境嵌入模型):① 「就绪」、3 段、无错误;② 分段含 `Refund window — 14 days`;③ 分段含 `Returns are free for members.`;验完已删库并确认不存在。没覆盖的只有控制台上传那一步的 HTTP / 页面。
+
+## §35 B-197 正文含分词器特殊记号的文档能入库(ROADMAP B-197)
+
+**背景**:切分器用 tiktoken 数 token,tiktoken 默认不让 `<|endoftext|>` 这类特殊记号当普通文字编码,直接报错。文档正文里出现一个,整篇入库失败(状态「失败」,错误含 `disallowed special token`),重新摄取也一样。现在当普通文字切。智能体对话里数 token 的地方原本就没问题,不在本节验收范围。
+
+**已经失败的文档不会自动重来**:发版后在控制台文档列表点「重新摄取」。
+
+- [ ] **35.1 切分结果(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数:不连外网,不读写库。判据:输出 5 行(每个特殊记号一行),每行末尾都是 `True`。**没修好时**:每行是 `FAIL ValueError`。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+from control_plane.knowledge.chunking import _encoding, chunk_markdown
+for special in sorted(_encoding.special_tokens_set):
+    src = "# Tokenizer\n\nEach sample ends with " + special + " before padding.\n"
+    try:
+        chunks = chunk_markdown(src, max_tokens=512, overlap_tokens=0)
+        print(special, ("ends with " + special) in "\n".join(c.text for c in chunks))
+    except Exception as exc:
+        print(special, "FAIL", type(exc).__name__)
+'
+```
+
+- [ ] **35.2 真实入库**:本机生成文件:`printf 'Tokenizer notes.\n\nEach training sample ends with <|endoftext|> before padding.\n' > b197-special.txt`。在测试环境新建一个知识库(名字如 `b197-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `training sample ends`,结果含 `<|endoftext|>` 原样文字。**没修好时**:文档状态「失败」,错误信息含 `disallowed special token`。验完删掉这个知识库。
