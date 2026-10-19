@@ -23,7 +23,7 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -37,6 +37,7 @@ from expert_work.protocol import (
     RetrievalMethod,
     chunk_retrieval_text,
 )
+from orchestrator.tools.error_classifier import GuidedToolError
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
 if TYPE_CHECKING:
@@ -69,6 +70,45 @@ _MAX_LIMIT = 20
 #: they bury the passage that carries the code.
 _TITLED_VIEW_WEIGHT = 0.7
 _BODY_VIEW_DEPTH = 20
+
+#: B-175 wave 2 PR3 — what the model is told about a knowledge result. Results
+#: are the closest passages, which are often on topic without stating the fact
+#: asked (a question about a product the documents cover, for a detail they never
+#: give): a rerank score cannot tell those apart, the model reading them can. The
+#: rule is worded on whether a passage *states* the answer, not on whether it is
+#: related — "related" is exactly what such passages are. It ships only with this
+#: tool, so an agent with no knowledge base never sees it. The rule itself sits in
+#: the tool description; the text appended to results states facts rather than
+#: commands (B-163: command-voiced out-of-band text trips injection defenses).
+KNOWLEDGE_ANSWERABILITY_RULE = (
+    "Results are the closest passages, not confirmed answers: rely only on what they "
+    "explicitly state, and if none states the specific fact asked, say the knowledge "
+    "base does not state it instead of inferring or guessing it."
+)
+_RESULTS_NOTICE = (
+    "[knowledge_search: these are the closest passages found, which is not the same as "
+    "passages that answer the question. What none of them explicitly states is not "
+    "supported by the knowledge base, so an answer that infers or guesses it is not "
+    "grounded in it; the related information they do contain can still be mentioned. "
+    "Documents may word a fact differently from the query, so a search in their terms "
+    "can find what this one missed.]"
+)
+_NO_HITS_NOTICE = (
+    "[knowledge_search: documents may word a fact differently from the query, so a "
+    "search in their terms can find what this one missed; if that finds nothing either, "
+    "the knowledge base does not cover this.]"
+)
+_NO_BASES_ADVICE = (
+    "None of the knowledge bases this agent is configured with exists, so nothing was "
+    "searched: this says nothing about whether the information exists, and the same "
+    "search fails the same way until the agent's knowledge base setting is fixed."
+)
+
+#: How a search ended — the tool words its result per outcome (B-175 wave 2 PR3):
+#: ``ok`` hits returned; ``no_bases`` none of the named bases exists; ``no_hits``
+#: recall found nothing; ``below_threshold`` every hit fell under a base's
+#: rerank-score threshold.
+SearchStatus = Literal["ok", "no_bases", "no_hits", "below_threshold"]
 
 
 @runtime_checkable
@@ -115,6 +155,9 @@ class RetrievedChunk:
     ``None`` when a path did not surface the chunk: ``vector_score`` (same
     value as ``score``), ``keyword_score`` (the keyword path's rank value)
     and ``fused_score`` (the weighted RRF score that ordered the fusion).
+    ``rerank_score`` is the score the reranker ranked it by — the two-view
+    weighted score when both views ran — and ``None`` when rerank was off,
+    failed, or ranked without scores.
 
     ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
     The agent sees (and the eval matches against) :attr:`retrieval_text`, the
@@ -133,10 +176,28 @@ class RetrievedChunk:
     vector_score: float | None = None
     keyword_score: float | None = None
     fused_score: float | None = None
+    rerank_score: float | None = None
 
     @property
     def retrieval_text(self) -> str:
         return chunk_retrieval_text(self.heading_path, self.content)
+
+
+@dataclass(frozen=True)
+class KnowledgeSearchOutcome:
+    """One search's results and how it ended (B-175 wave 2 PR3).
+
+    ``candidates`` is how many ranked passages the rerank-score threshold was
+    applied to — the reranker's output, not the recall depth (``0`` for
+    ``no_bases`` / ``no_hits``). ``rerank_degraded`` is set
+    when the reranker failed or answered with nothing and the fused order was
+    used instead — then no threshold applied either.
+    """
+
+    results: tuple[RetrievedChunk, ...]
+    status: SearchStatus
+    candidates: int = 0
+    rerank_degraded: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,6 +207,19 @@ class _SubScores:
     vector: Mapping[UUID, float]
     keyword: Mapping[UUID, float]
     fused: Mapping[UUID, float]
+    rerank: Mapping[UUID, float]
+
+
+@dataclass(frozen=True)
+class _Reranked:
+    """The rerank stage's output: chunks best first — at least ``limit`` of them
+    when there are that many, more when the reranker scored more, so a
+    threshold that drops some can still fill ``limit`` — each one's rerank score
+    when the reranker gave one, and whether rerank fell back."""
+
+    chunks: list[KnowledgeChunk]
+    scores: Mapping[UUID, float]
+    degraded: bool = False
 
 
 def default_recall_depth(limit: int) -> int:
@@ -233,20 +307,51 @@ class KnowledgeRetriever:
         method: RetrievalMethod | None = None,
         score_threshold: float | None = None,
         rerank: bool | None = None,
+        rerank_score_threshold: float | None = None,
     ) -> list[RetrievedChunk]:
         """Hybrid-search ``base_names`` for ``query``, returning the
-        ``limit`` most relevant chunks with source attribution + scores.
+        ``limit`` most relevant chunks with source attribution + scores —
+        :meth:`search_detailed` without the outcome."""
+        outcome = await self.search_detailed(
+            tenant_id=tenant_id,
+            base_names=base_names,
+            query=query,
+            limit=limit,
+            method=method,
+            score_threshold=score_threshold,
+            rerank=rerank,
+            rerank_score_threshold=rerank_score_threshold,
+        )
+        return list(outcome.results)
 
-        ``method`` / ``score_threshold`` / ``rerank`` are *overrides*: when
-        ``None`` each spanned base's own configured default is used. The
-        recall method and similarity threshold are applied **per base**
-        (a query may span bases with different configs); ``rerank`` is
-        resolved query-wide (override > "any spanned base enables it").
-        Base names that do not resolve to a knowledge base are skipped.
+    async def search_detailed(
+        self,
+        *,
+        tenant_id: UUID,
+        base_names: Sequence[str],
+        query: str,
+        limit: int,
+        method: RetrievalMethod | None = None,
+        score_threshold: float | None = None,
+        rerank: bool | None = None,
+        rerank_score_threshold: float | None = None,
+    ) -> KnowledgeSearchOutcome:
+        """Hybrid-search ``base_names`` for ``query``: the ``limit`` most
+        relevant chunks with source attribution + scores, and how it ended.
+
+        ``method`` / ``score_threshold`` / ``rerank`` / ``rerank_score_threshold``
+        are *overrides*: when ``None`` each spanned base's own configured default
+        is used. The recall method, similarity threshold and rerank-score
+        threshold are applied **per base** (a query may span bases with
+        different configs); ``rerank`` is resolved query-wide (override > "any
+        spanned base enables it"). Base names that do not resolve to a
+        knowledge base are skipped; when none resolves the outcome is
+        ``no_bases``. The rerank-score threshold only applies to chunks the
+        reranker scored.
         """
         bases = await self._resolve_bases(tenant_id, base_names)
         if not bases:
-            return []
+            return KnowledgeSearchOutcome(results=(), status="no_bases")
         query_embedding = (await self.embedder.embed([query], tenant_id=tenant_id))[0]
         depth = self.recall_depth(limit)
 
@@ -296,18 +401,43 @@ class KnowledgeRetriever:
 
         fused_scored = weighted_rrf_fuse_scored(rankings)
         if not fused_scored:
-            return []
+            return KnowledgeSearchOutcome(results=(), status="no_hits")
         fused = [chunk_by_id[chunk_id] for chunk_id, _score in fused_scored]
         rerank_enabled = rerank if rerank is not None else any(b.rerank_enabled for b in bases)
-        chunks = await self._rerank(
+        ranked = await self._rerank(
             query, fused, limit, tenant_id=tenant_id, enabled=rerank_enabled
         )
+        floor = {
+            b.id: (
+                rerank_score_threshold
+                if rerank_score_threshold is not None
+                else b.rerank_score_threshold
+            )
+            for b in bases
+        }
+        # Filtered before the cut to ``limit``: with several bases, one base's
+        # floor dropping the top hits must leave room for another base's.
+        kept = [c for c in ranked.chunks if _clears_floor(c, ranked.scores, floor)][:limit]
+        if not kept:
+            return KnowledgeSearchOutcome(
+                results=(),
+                status="below_threshold",
+                candidates=len(ranked.chunks),
+                rerank_degraded=ranked.degraded,
+            )
         scores = _SubScores(
             vector=vector_score,
             keyword=keyword_score,
             fused=dict(fused_scored),
+            rerank=ranked.scores,
         )
-        return await self._attribute(tenant_id, chunks, scores, sources)
+        results = await self._attribute(tenant_id, kept, scores, sources)
+        return KnowledgeSearchOutcome(
+            results=tuple(results),
+            status="ok",
+            candidates=len(ranked.chunks),
+            rerank_degraded=ranked.degraded,
+        )
 
     async def _resolve_bases(
         self, tenant_id: UUID, base_names: Sequence[str]
@@ -326,24 +456,39 @@ class KnowledgeRetriever:
         *,
         tenant_id: UUID,
         enabled: bool,
-    ) -> list[KnowledgeChunk]:
+    ) -> _Reranked:
         if self.reranker is None or not enabled:
-            return fused[:limit]
+            return _Reranked(chunks=fused[:limit], scores={})
         # Capped after fusion: several bases (and an explicit recall_limit) can
         # fuse into more than one rerank request takes.
         candidates = fused[: min(self.recall_depth(limit), _MAX_RERANK_CANDIDATES)]
-        if isinstance(self.reranker, ScoredReranker):
-            order = await _two_view_order(
-                self.reranker, query, candidates, limit, tenant_id=tenant_id
-            )
-        else:
-            order = await self.reranker.rerank(
-                query=query,
-                documents=[chunk.retrieval_text for chunk in candidates],
-                top_k=limit,
-                tenant_id=tenant_id,
-            )
-        return [candidates[i] for i in order]
+        try:
+            if isinstance(self.reranker, ScoredReranker):
+                ranked = await _two_view_order(
+                    self.reranker, query, candidates, limit, tenant_id=tenant_id
+                )
+            else:
+                order = await self.reranker.rerank(
+                    query=query,
+                    documents=[chunk.retrieval_text for chunk in candidates],
+                    top_k=limit,
+                    tenant_id=tenant_id,
+                )
+                ranked = [(index, None) for index in order]
+        except Exception:
+            # Rerank is an optional quality pass (B-175 wave 2 PR3): a vendor
+            # error used to surface as a tool error / console 500.
+            logger.warning("knowledge.rerank_failed — using the fused order", exc_info=True)
+            return _Reranked(chunks=fused[:limit], scores={}, degraded=True)
+        if not ranked:
+            # An empty answer for a non-empty candidate list is a rerank fault,
+            # not "nothing relevant" — that is the threshold's call.
+            logger.warning("knowledge.rerank_empty — using the fused order")
+            return _Reranked(chunks=fused[:limit], scores={}, degraded=True)
+        return _Reranked(
+            chunks=[candidates[i] for i, _score in ranked],
+            scores={candidates[i].id: score for i, score in ranked if score is not None},
+        )
 
     async def _attribute(
         self,
@@ -371,6 +516,7 @@ class KnowledgeRetriever:
                 vector_score=scores.vector.get(chunk.id),
                 keyword_score=scores.keyword.get(chunk.id),
                 fused_score=scores.fused.get(chunk.id),
+                rerank_score=scores.rerank.get(chunk.id),
             )
             for chunk in chunks
         ]
@@ -383,11 +529,17 @@ async def _two_view_order(
     limit: int,
     *,
     tenant_id: UUID,
-) -> list[int]:
-    """Indices of the ``limit`` best ``candidates``, ranked on both views (see
-    :data:`_TITLED_VIEW_WEIGHT`). Falls back to the titled order when the
-    reranker gives no scores, and skips the body view when no candidate it
-    would judge has a title (chunks ingested before titles were stored)."""
+) -> list[tuple[int, float | None]]:
+    """The best ``candidates`` as ``(index, score)``, ranked on both views (see
+    :data:`_TITLED_VIEW_WEIGHT`) — every one the titled view returned, at least
+    ``limit``, so the caller can apply a threshold before cutting to ``limit``;
+    the score is the weighted one they were ranked by. Uses the titled order and
+    its scores (``None`` when it gave none) when the titled view is not fully
+    scored, or when no candidate it would judge has a title (chunks ingested
+    before titles were stored — both views are then the same text, so the
+    titled score is on the weighted scale). When only the body view comes back
+    without scores, the titled order is kept with no scores: titled-only scores
+    run higher than the weighted ones a threshold is calibrated on."""
     titled = await reranker.rerank_scored(
         query=query,
         documents=[chunk.retrieval_text for chunk in candidates],
@@ -400,18 +552,29 @@ async def _two_view_order(
     if len(titled_score) < len(top) or all(
         body == candidates[i].retrieval_text for i, body in zip(top, bodies, strict=True)
     ):
-        return top[:limit]
+        return list(titled)
     body_view = await reranker.rerank_scored(
         query=query, documents=bodies, top_k=len(bodies), tenant_id=tenant_id
     )
     body_score = {top[j]: score for j, score in body_view if score is not None}
     if len(body_score) < len(top):
-        return top[:limit]
+        return [(i, None) for i in top]
     combined = {
         i: _TITLED_VIEW_WEIGHT * titled_score[i] + (1 - _TITLED_VIEW_WEIGHT) * body_score[i]
         for i in top
     }
-    return sorted(top, key=lambda i: (-combined[i], i))[:limit]
+    order = sorted(top, key=lambda i: (-combined[i], i))
+    return [(i, combined[i]) for i in order]
+
+
+def _clears_floor(
+    chunk: KnowledgeChunk, scores: Mapping[UUID, float], floor: Mapping[UUID, float | None]
+) -> bool:
+    """Whether ``chunk`` survives its base's rerank-score threshold: always when
+    the base sets none or the reranker gave this chunk no score."""
+    threshold = floor.get(chunk.kb_id)
+    score = scores.get(chunk.id)
+    return threshold is None or score is None or score >= threshold
 
 
 @dataclass(frozen=True)
@@ -434,7 +597,7 @@ class KnowledgeSearchTool:
             description=(
                 "Search the tenant's knowledge base for information relevant "
                 "to a query. Use it to ground answers in internal documents "
-                "rather than guessing."
+                f"rather than guessing. {KNOWLEDGE_ANSWERABILITY_RULE}"
             ),
             parameters={
                 "type": "object",
@@ -463,18 +626,42 @@ class KnowledgeSearchTool:
             raise ToolBlockedError(msg)
         query = self._require_query(args)
         limit = _coerce_limit(args.get("limit"))
-        results = await self.retriever.search(
+        # A failed search propagates as-is: the classifier keeps a timeout or
+        # outage ``transient``, and its advice already says a failure is no
+        # evidence about the target.
+        outcome = await self.retriever.search_detailed(
             tenant_id=ctx.tenant_id,
             base_names=self.knowledge_base_refs,
             query=query,
             limit=limit,
         )
-        if not results:
+        if outcome.status == "no_bases":
+            msg = "none of this agent's knowledge bases exists: " + ", ".join(
+                self.knowledge_base_refs
+            )
+            raise GuidedToolError(msg, advice=_NO_BASES_ADVICE)
+        meta: dict[str, Any] = {"hits": len(outcome.results), "status": outcome.status}
+        if outcome.rerank_degraded:
+            meta["rerank_degraded"] = True
+        if outcome.status == "below_threshold":
+            return ToolResult(
+                content=(
+                    "[no relevant knowledge found for the query: "
+                    f"{outcome.candidates} passages were retrieved but none was relevant "
+                    "enough]"
+                ),
+                meta=meta,
+                notice=_NO_HITS_NOTICE,
+            )
+        if not outcome.results:
             return ToolResult(
                 content="[no relevant knowledge found for the query]",
-                meta={"hits": 0},
+                meta=meta,
+                notice=_NO_HITS_NOTICE,
             )
-        return ToolResult(content=_format_results(results), meta={"hits": len(results)})
+        return ToolResult(
+            content=_format_results(outcome.results), meta=meta, notice=_RESULTS_NOTICE
+        )
 
     def _require_query(self, args: Mapping[str, Any]) -> str:
         raw = args.get("query")

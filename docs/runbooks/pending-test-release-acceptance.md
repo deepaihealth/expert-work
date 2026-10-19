@@ -424,6 +424,41 @@ asyncio.run(main())
   厂商 4xx 不切备用模型,直接让这一轮失败,所以拒收一定会在 ① 里看到。**没修好时**:不适用,改前也不报错。这一条防的是「回传后厂商拒收」。
 - [ ] **32.4 厂商真的把思考拼进了上下文(观察性,可记不可判)**:取 32.3 那个 run 的 trace,按时间顺序看相邻两次 `llm_call` 的用量。判据:后一步的输入 token 减前一步的输入 token,应 ≥ 前一步的输出 token(输出含思考),多出来的大致是工具结果。原因是回传后,前一步的思考、回答、工具调用都进了下一步的输入。改前同一智能体的历史 run 里,这个差值约等于「前一步输出 − 前一步思考 + 工具结果」,在思考长、工具结果短的步骤上会小于前一步输出。可以拿 10-17 之前 eval-hb 的 run 做对照。工具结果很长的步骤看不出差别,跳过。若新旧看不出差别,记「不可判」(可能厂商不把回传的思考计入输入 token),不影响 32.1–32.3。 **10-17 记录(参考)**:32.3 的 5 次调用输入 5633→6261→6567→6803→7059,每步增量(628/306/236/256)都 ≥ 上一步输出(275/146/213/103);这几步思考很短、工具结果也短,区分度有限,只作参考;Harness-Bench 第 4 轮再看长思考步骤。
 
+## §33 B-175 知识库 v2 波 2 PR3 重排分数门槛 + 「相关但没写」的提示 + 出错与没找到分开(ROADMAP B-175;计划 `docs/superpowers/plans/2026-10-14-b175-wave2-plan.md` PR3 节)
+
+**背景**:10-18。① 每个库可设「重排分数下限」(迁移 0168,默认不设 = 行为不变),低于它的段丢掉,全部丢掉 = 这次检索按「没找到」返回;② `knowledge_search` 的工具说明与每次返回末尾带一段平台提示(`[knowledge_search: …]`,在防注入围栏**外**):只按段落明确写了的内容回答,没写就说知识库没写、可换资料里的说法再搜一次;③ 重排服务出错不再让工具报错 / 检索测试 500,退回不重排的顺序并标「降级」;库不存在、检索出错、零命中、全部低于门槛四种情况给模型的话分开。同 §22:用登录账号所在租户建临时库(`b175-w2pr3-*`)和临时智能体,验完即删,不碰对接方 Agent。临时库放两份 docx:`验收产品甲说明书.docx`(正文「每日一袋,温水冲服。不适宜人群:孕妇。」,不写认证、价格)、`验收产品乙说明书.docx`(正文「每日两袋」)。
+
+- [ ] **33.1 设置页存取重排分数下限**:新建的临时库「设置」页「重排分数下限」为空(不设默认值),输入框灰字「留空 = 不过滤（参考 0.70）」;填 `0.7` 保存,刷新后仍是 0.7;清空保存,刷新后为空。判据:两次都对;只读查 `SELECT rerank_score_threshold FROM knowledge_base WHERE name = '<临时库>'` 依次为 `0.7` / NULL。**没修好时**:页面没有这一项,库表没有这一列。
+- [ ] **33.2 门槛只挡离题问题(检索测试)**:临时库开重排、下限设 `0.7`。「检索测试」方式「混合」:① 查 `验收产品甲怎么吃`;② 查 `哈佛蔬菜汤能喝吗`。看 DevTools 里 `POST …/test` 的响应。判据:① `status = ok`、甲的段排第一、每条结果带 `rerank_score`;② `status = below_threshold`、`count = 0`、`candidates ≥ 1`。再把下限清空重查 ②:`status = ok` 且有结果(门槛关掉即恢复原行为)。**没修好时**:响应没有 `status` / `rerank_score`;② 照样返回几段不相干的内容(关键词路总能凑出命中)。说明:0.7 只是这次验收用的值,来自华大资料评测(10-18,两套题有答案的 445 道零误拒);分数尺度随重排模型而定,别的库要重新标定(检索测试页 PR4 才展示重排分,现在看接口响应;返回条数别超过 25,这样候选与智能体默认同为 50 段,重排分是同一请求内的相对分)。
+- [ ] **33.3 智能体在「相关但没写」时说没写(调试台)**:建临时智能体,只绑临时库(不设下限),问 `验收产品甲有清真认证吗`。判据:① 回答说资料 / 知识库里没写认证信息(可以顺带说资料里有服用方法),**不说「有」或「没有」**;② run 详情里 `knowledge_search` 的工具结果末尾有 `[knowledge_search: these are the closest passages found, which is not the same as passages that answer the question. …]`,且这段在围栏外(围栏里只有段落)。**没修好时**:没有这段提示;模型拿着甲的说明书段落有时会直接答「有」或「没有」(10-18 调研:主流平台都不默认处理这种情况,RAG 教程里「没有相关信息就说找不到」的写法正好放过它)。这一条是「能答对」不是「一定答对」,模型偶发违背记「不过」并附 run id,不当作代码回归。
+- [ ] **33.4 没绑知识库的智能体看不到这段规则**:用一个没绑知识库的智能体(如 eval-hb)跑一轮,在 Langfuse 看这次请求。判据:请求的工具列表里没有 `knowledge_search`;系统提示与工具说明里都搜不到 `the knowledge base does not state`。**没修好时**:不适用(这条防的是把规则加进全局提示,单测 `test_tool_assembly.py::test_the_knowledge_answerability_rule_ships_only_with_a_bound_base` 同时锁住)。
+- [ ] **33.5 库被删后智能体知道是「查不了」不是「没有」**:删掉 33.3 的临时库,用同一智能体再问一次。判据:run 详情里 `knowledge_search` 是一次失败的工具调用(`[tool error] GuidedToolError: none of this agent's knowledge bases exists: …`),末尾 `<recovery-advisory>` 里有 `this says nothing about whether the information exists`;回答告诉用户知识库不可用,不说「资料里没有」。**没修好时**:工具返回 `[no relevant knowledge found for the query]`,模型会说「资料里没有这方面信息」。
+- [ ] **33.6 重排出错时退回不重排的顺序(pod 内离线探针)**:发测试后执行下面的命令。脚本建一个内存库(两段)和一个**指向假 HTTP 的** DashScope 重排器(`httpx.MockTransport` 一律回 500,不连外网、key 是假的、不读写库)。判据:输出 `degraded True hits 2 status ok`。**没修好时**:抛出 `HTTPStatusError`(工具报错 / 检索测试 500)。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, httpx
+from uuid import uuid4
+from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.protocol import KnowledgeChunk
+from orchestrator.llm.rerank import DashScopeReranker, HTTPDashScopeRerankClient
+from orchestrator.tools.knowledge import KnowledgeRetriever
+class E:
+    async def embed(self, texts, *, tenant_id):
+        return [(1.0, 0.0) for _ in texts]
+async def main():
+    store, t = InMemoryKnowledgeStore(), uuid4()
+    b = await store.create_base(tenant_id=t, name="kb", rerank_score_threshold=0.9)
+    d = await store.upsert_document(tenant_id=t, kb_id=b.id, filename="a.md")
+    await store.replace_chunks(tenant_id=t, document_id=d.id, chunks=[KnowledgeChunk(id=uuid4(), tenant_id=t, kb_id=b.id, document_id=d.id, chunk_index=i, content=c, embedding=(1.0, 0.0)) for i, c in enumerate(["policy one", "policy two"])])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500, text="boom"))) as http:
+        rr = DashScopeReranker(client=HTTPDashScopeRerankClient(api_key="dummy", http=http), model="qwen3-vl-rerank")
+        o = await KnowledgeRetriever(store=store, embedder=E(), reranker=rr).search_detailed(tenant_id=t, base_names=["kb"], query="policy", limit=5)
+    print("degraded", o.rerank_degraded, "hits", len(o.results), "status", o.status)
+asyncio.run(main())
+'
+```
+
 ## §34 B-181 UTF-8 文本按 UTF-8 解析 + 切分不再丢内容(ROADMAP B-181)
 
 **背景**:两处问题,都会让文档入库后少内容或错字:

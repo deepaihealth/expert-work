@@ -147,6 +147,7 @@ class KnowledgeStore(abc.ABC):
         retrieval_score_threshold: float | None = None,
         retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
         rerank_enabled: bool = True,
+        rerank_score_threshold: float | None = None,
         embedding_provider: str | None = None,
         embedding_model: str | None = None,
     ) -> KnowledgeBase:
@@ -168,11 +169,13 @@ class KnowledgeStore(abc.ABC):
         retrieval_score_threshold: float | _Unset | None = UNSET,
         retrieval_method: RetrievalMethod | None = None,
         rerank_enabled: bool | None = None,
+        rerank_score_threshold: float | _Unset | None = UNSET,
     ) -> KnowledgeBase | None:
         """Patch an existing base. Each argument left at its default is not
         touched; ``None`` for a nullable field (``description``,
-        ``retrieval_score_threshold``) clears it — the sentinel :data:`UNSET`
-        is how "not supplied" is told apart from an explicit ``None``.
+        ``retrieval_score_threshold``, ``rerank_score_threshold``) clears it —
+        the sentinel :data:`UNSET` is how "not supplied" is told apart from an
+        explicit ``None``.
         Renaming is deliberately not offered (manifests reference bases by
         name). ``updated_at`` is bumped. Returns the updated base, or
         ``None`` if no base matched."""

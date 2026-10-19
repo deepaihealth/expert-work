@@ -184,6 +184,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         retrieval_score_threshold: float | None = None,
         retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
         rerank_enabled: bool = True,
+        rerank_score_threshold: float | None = None,
         embedding_provider: str | None = None,
         embedding_model: str | None = None,
     ) -> KnowledgeBase:
@@ -202,6 +203,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             retrieval_score_threshold=retrieval_score_threshold,
             retrieval_method=retrieval_method,
             rerank_enabled=rerank_enabled,
+            rerank_score_threshold=rerank_score_threshold,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
             created_at=now,
@@ -222,6 +224,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         retrieval_score_threshold: float | _Unset | None = UNSET,
         retrieval_method: RetrievalMethod | None = None,
         rerank_enabled: bool | None = None,
+        rerank_score_threshold: float | _Unset | None = UNSET,
     ) -> KnowledgeBase | None:
         base = next((b for b in self._bases if b.tenant_id == tenant_id and b.id == kb_id), None)
         if base is None:
@@ -241,6 +244,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             update["retrieval_method"] = retrieval_method
         if rerank_enabled is not None:
             update["rerank_enabled"] = rerank_enabled
+        if not isinstance(rerank_score_threshold, _Unset):
+            update["rerank_score_threshold"] = rerank_score_threshold
         updated = base.model_copy(update=update)
         self._bases[self._bases.index(base)] = updated
         return updated

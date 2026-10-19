@@ -262,6 +262,52 @@ describe("KnowledgeDetail", () => {
     await waitFor(() => expect(updateSpy).toHaveBeenCalledWith("support-docs", expect.any(Object)));
   });
 
+  it("settings save sends the rerank score floor (B-175 wave 2 PR3)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue({
+      ...BASE,
+      retrieval_config: { ...BASE.retrieval_config!, rerank_score_threshold: 0.7 },
+    });
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    const updateSpy = vi.spyOn(knowledgeSdk, "updateBase").mockResolvedValue(BASE);
+
+    renderDetail("/knowledge/support-docs/settings");
+    await waitFor(() => expect(screen.getByTestId("knowledge-settings-tab")).toBeInTheDocument());
+    const tab = screen.getByTestId("knowledge-settings-tab");
+    expect(within(tab).getByTestId("kb-settings-rerank-threshold")).toHaveAttribute(
+      "aria-valuenow",
+      "0.7",
+    );
+    await userEvent.click(within(tab).getByTestId("kb-settings-save"));
+
+    await waitFor(() =>
+      expect(updateSpy).toHaveBeenCalledWith(
+        "support-docs",
+        expect.objectContaining({ rerank_score_threshold: 0.7 }),
+      ),
+    );
+  });
+
+  it("rerank score floor has no default — empty, with a reference placeholder (B-175 wave 2 PR3)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    const updateSpy = vi.spyOn(knowledgeSdk, "updateBase").mockResolvedValue(BASE);
+
+    renderDetail("/knowledge/support-docs/settings");
+    await waitFor(() => expect(screen.getByTestId("knowledge-settings-tab")).toBeInTheDocument());
+    const tab = screen.getByTestId("knowledge-settings-tab");
+    const input = within(tab).getByTestId("kb-settings-rerank-threshold");
+    expect(input).toHaveValue("");
+    expect(input).toHaveAttribute("placeholder", "Empty = off (e.g. 0.70)");
+    await userEvent.click(within(tab).getByTestId("kb-settings-save"));
+
+    await waitFor(() =>
+      expect(updateSpy).toHaveBeenCalledWith(
+        "support-docs",
+        expect.objectContaining({ rerank_score_threshold: null }),
+      ),
+    );
+  });
+
   it("切入态置灰重建索引/文档删除(两态:home 态由上方用例覆盖)", async () => {
     isTenantSwitchedMock.mockReturnValue(true);
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);

@@ -90,6 +90,7 @@ class _CreateBaseBody(BaseModel):
     retrieval_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     retrieval_method: RetrievalMethod | None = None
     rerank_enabled: bool | None = None
+    rerank_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class _UpdateBaseBody(BaseModel):
@@ -108,6 +109,7 @@ class _UpdateBaseBody(BaseModel):
     retrieval_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     retrieval_method: RetrievalMethod | None = None
     rerank_enabled: bool | None = None
+    rerank_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class _TestBody(BaseModel):
@@ -118,6 +120,7 @@ class _TestBody(BaseModel):
     method: RetrievalMethod | None = None
     score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     rerank: bool | None = None
+    rerank_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 def _get_knowledge_store(request: Request) -> KnowledgeStore:
@@ -223,6 +226,7 @@ def _base_dict(
             "score_threshold": base.retrieval_score_threshold,
             "method": base.retrieval_method.value,
             "rerank_enabled": base.rerank_enabled,
+            "rerank_score_threshold": base.rerank_score_threshold,
         },
         "embedding_provider": base.embedding_provider,
         "embedding_model": base.embedding_model,
@@ -323,6 +327,7 @@ def build_knowledge_router() -> APIRouter:
                 retrieval_score_threshold=body.retrieval_score_threshold,
                 retrieval_method=body.retrieval_method or RetrievalMethod.HYBRID,
                 rerank_enabled=body.rerank_enabled if body.rerank_enabled is not None else True,
+                rerank_score_threshold=body.rerank_score_threshold,
                 embedding_provider=provider,
                 embedding_model=model,
             )
@@ -484,6 +489,9 @@ def build_knowledge_router() -> APIRouter:
             ),
             retrieval_method=body.retrieval_method if "retrieval_method" in sent else None,
             rerank_enabled=body.rerank_enabled if "rerank_enabled" in sent else None,
+            rerank_score_threshold=(
+                body.rerank_score_threshold if "rerank_score_threshold" in sent else UNSET
+            ),
         )
         if updated is None:  # pragma: no cover - guarded by _require_base above
             raise HTTPException(status_code=404, detail="knowledge base not found")
@@ -873,7 +881,7 @@ def build_knowledge_router() -> APIRouter:
                     status_code=503,
                     detail="knowledge retrieval unavailable: no embedding model configured",
                 )
-            results = await retriever.search(
+            outcome = await retriever.search_detailed(
                 tenant_id=scope.tenant_id,
                 base_names=[base.name],
                 query=body.query,
@@ -881,6 +889,7 @@ def build_knowledge_router() -> APIRouter:
                 method=body.method,
                 score_threshold=body.score_threshold,
                 rerank=body.rerank,
+                rerank_score_threshold=body.rerank_score_threshold,
             )
         return JSONResponse(
             content={
@@ -893,11 +902,19 @@ def build_knowledge_router() -> APIRouter:
                         "filename": r.filename,
                         "chunk_index": r.chunk_index,
                         "score": r.score,
+                        "rerank_score": r.rerank_score,
                         "recall_source": r.recall_source,
                     }
-                    for r in results
+                    for r in outcome.results
                 ],
-                "count": len(results),
+                "count": len(outcome.results),
+                # B-175 wave 2 PR3 — how the search ended: ok / no_hits /
+                # below_threshold (every hit under the rerank-score threshold,
+                # ``candidates`` of them); rerank failure degrades to the fused
+                # order instead of a 500.
+                "status": outcome.status,
+                "candidates": outcome.candidates,
+                "rerank_degraded": outcome.rerank_degraded,
             }
         )
 

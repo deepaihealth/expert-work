@@ -26,6 +26,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     CountingEmbedder,
     EmbeddingDimensionError,
     EvalConfig,
+    RerankDegradedError,
     _build_parser,
     baseline_benchmark,
     build_corpus,
@@ -44,6 +45,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     summarise,
 )
 from kb_metrics import score_case  # type: ignore[import-not-found]
+from kb_rerank import RerankCacheMissError  # type: ignore[import-not-found]
 
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
@@ -734,6 +736,71 @@ async def test_run_eval_no_answer_refusal_and_false_refusal(
     assert summary["overall"]["false_refusal_rate"] == 1.0
 
 
+class _FlatScoreReranker:
+    """Scores every candidate 0.3 (a scoring reranker, like DashScope's)."""
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        return list(range(min(len(documents), top_k)))
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        return [(i, 0.3) for i in range(min(len(documents), top_k))]
+
+
+@pytest.mark.asyncio
+async def test_run_eval_rerank_threshold_refuses_and_records_rerank_scores(
+    corpus: tuple[Path, Path], dataset_path: Path
+) -> None:
+    dataset, plain, _store, (tenant, _report) = await _built(corpus, dataset_path)
+    retriever = replace(plain, reranker=_FlatScoreReranker())
+
+    strict = EvalConfig(top_k=20, rerank=True, rerank_threshold=0.5)
+    rows = await run_eval(
+        dataset=dataset, retriever=retriever, tenant_id=tenant, cfg=strict, concurrency=1
+    )
+    assert all(row.results == () and row.score.refused is True for row in rows)
+
+    loose = EvalConfig(top_k=20, rerank=True, rerank_threshold=0.1)
+    rows = await run_eval(
+        dataset=dataset, retriever=retriever, tenant_id=tenant, cfg=loose, concurrency=1
+    )
+    storage = next(r for r in rows if r.case_id == "q-storage")
+    assert storage.score.refused is False
+    assert {r.rerank_score for r in storage.results} == {0.3}
+    assert case_to_json(storage)["best_rerank_score"] == 0.3
+
+
+class _CacheMissReranker(_FlatScoreReranker):
+    """An offline rerun whose request is not in the rerank cache."""
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        raise RerankCacheMissError("rerank cache miss (offline key)")
+
+
+@pytest.mark.asyncio
+async def test_run_eval_aborts_when_rerank_degrades(
+    corpus: tuple[Path, Path], dataset_path: Path
+) -> None:
+    """The retriever degrades a failed rerank to the fused order; the eval must
+    not score that silently (B-175 wave 2 PR3)."""
+    dataset, plain, _store, (tenant, _report) = await _built(corpus, dataset_path)
+    retriever = replace(plain, reranker=_CacheMissReranker())
+
+    with pytest.raises(RerankDegradedError, match="fused order"):
+        await run_eval(
+            dataset=dataset,
+            retriever=retriever,
+            tenant_id=tenant,
+            cfg=EvalConfig(top_k=20, rerank=True),
+            concurrency=1,
+        )
+
+
 @pytest.mark.asyncio
 async def test_summary_groups_by_source_and_tag(
     corpus: tuple[Path, Path], dataset_path: Path
@@ -998,6 +1065,42 @@ def test_main_rerank_on_needs_llm_env(
     argv = _cli(dataset_path, root, tmp_path / "unit.jsonl", tmp_path / "b.yaml", "--rerank", "on")
     with pytest.raises(SystemExit, match="EXPERT_WORK_EVAL_LLM"):
         main(argv)
+
+
+def test_main_rerank_threshold_needs_dashscope(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
+) -> None:
+    _manifest, root = corpus
+    argv = _cli(
+        dataset_path,
+        root,
+        tmp_path / "unit.jsonl",
+        tmp_path / "b.yaml",
+        "--rerank-threshold",
+        "0.7",
+    )
+    with pytest.raises(SystemExit, match="needs --rerank dashscope"):
+        main(argv)
+
+
+def test_main_refuses_baseline_with_rerank_threshold(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
+) -> None:
+    _manifest, root = corpus
+    argv = _cli(
+        dataset_path,
+        root,
+        tmp_path / "unit.jsonl",
+        tmp_path / "b.yaml",
+        "--rerank",
+        "dashscope",
+        "--rerank-threshold",
+        "0.7",
+        "--update-baseline",
+    )
+    with pytest.raises(SystemExit, match="refusing to update baseline with --rerank-threshold"):
+        main(argv)
+    assert not (tmp_path / "b.yaml").exists()
 
 
 def test_main_real_embedder_needs_env(

@@ -51,6 +51,7 @@ from orchestrator.tools import (
     WriteFileTool,
     build_tool_registry,
 )
+from orchestrator.tools.knowledge import KNOWLEDGE_ANSWERABILITY_RULE
 
 
 def _knowledge_retriever() -> KnowledgeRetriever:
@@ -336,6 +337,20 @@ async def test_no_knowledge_block_registers_no_search_tool() -> None:
     env = ToolEnv(knowledge_retriever=_knowledge_retriever())
     registry = await build_tool_registry([], tool_env=env)
     assert registry.get("knowledge_search") is None
+
+
+@pytest.mark.asyncio
+async def test_the_knowledge_answerability_rule_ships_only_with_a_bound_base() -> None:
+    """B-175 wave 2 PR3 — the platform's "say the knowledge base does not state
+    it" rule lives in knowledge_search's own description and result notices, so
+    an agent with no knowledge base never sees it."""
+    env = ToolEnv(knowledge_retriever=_knowledge_retriever())
+    unbound = await build_tool_registry([], tool_env=env)
+    bound = await build_tool_registry(
+        [], tool_env=env, knowledge=KnowledgeSpec(knowledge_base_refs=["hr"])
+    )
+    assert all(KNOWLEDGE_ANSWERABILITY_RULE not in s.description for s in unbound.all_specs())
+    assert any(KNOWLEDGE_ANSWERABILITY_RULE in s.description for s in bound.all_specs())
 
 
 # ---------------------------------------------------------------------------

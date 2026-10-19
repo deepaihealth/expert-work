@@ -264,6 +264,29 @@ async def test_update_base_clear_vs_omit(sql_store: SqlStoreFixture) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rerank_score_threshold_round_trip(sql_store: SqlStoreFixture) -> None:
+    """B-175 wave 2 PR3 — migration 0168's column: stored at create, kept by an
+    update that omits it, cleared by an explicit None."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb", rerank_score_threshold=0.7)
+        fetched = await store.get_base(tenant_id=tenant, name="kb")
+        assert fetched is not None
+        assert fetched.rerank_score_threshold == 0.7
+        kept = await store.update_base(tenant_id=tenant, kb_id=base.id, retrieval_top_k=9)
+        assert kept is not None
+        assert kept.rerank_score_threshold == 0.7
+        cleared = await store.update_base(
+            tenant_id=tenant, kb_id=base.id, rerank_score_threshold=None
+        )
+        assert cleared is not None
+        assert cleared.rerank_score_threshold is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_base_stats_aggregate(sql_store: SqlStoreFixture) -> None:
     store, engine = sql_store
     try:

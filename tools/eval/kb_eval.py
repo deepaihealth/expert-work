@@ -169,6 +169,8 @@ class EvalConfig:
     top_k: int = DEFAULT_TOP_K
     threshold: float | None = None
     rerank: bool = False
+    #: 重排分数下限(B-175 波 2 PR3,``--rerank-threshold``);设了以后「拒答」= 检索返回空
+    rerank_threshold: float | None = None
     #: off | llm(聊天模型排序)| dashscope(生产同款 ``qwen3-vl-rerank``,带缓存)
     rerank_mode: str = "off"
     #: 结果里带上每段的 retrieval 文本(``--with-text``,汇集标注要用;默认不带,结果文件形状不变)
@@ -274,6 +276,8 @@ class ResultRow:
     score: float | None
     recall_source: str | None
     text: str | None = None
+    #: 重排分数(B-175 波 2 PR3);没开重排 / 重排没给分时 None,结果文件里不出现这个键
+    rerank_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -293,6 +297,15 @@ class EmbeddingDimensionError(RuntimeError):
 
 class EmbedStageError(RuntimeError):
     """嵌入器抛出的任何异常都包成它,让建库那边把失败归到 ``embed`` 阶段。"""
+
+
+class RerankDegradedError(RuntimeError):
+    """开了重排却有一题退回了融合序(B-175 波 2 PR3)—— 整轮退出。
+
+    检索器把重排出错 / 返回空降级成融合序、不再抛错(生产要这样),评测不能:离线复跑缓存
+    没命中(:class:`kb_rerank.RerankCacheMissError`)或线上 429 / 5xx 会让那一题悄悄按融合序
+    计分,汇总混进没重排的题,结果文件里也看不出来。
+    """
 
 
 class FakeKbEmbedder(KeywordEmbedder):  # type: ignore[misc]
@@ -797,7 +810,7 @@ async def run_eval(
 
     async def _one(case: KbCase) -> CaseRow:
         async with sem:
-            results = await retriever.search(
+            outcome = await retriever.search_detailed(
                 tenant_id=tenant_id,
                 base_names=[dataset.name],
                 query=case.query,
@@ -805,7 +818,15 @@ async def run_eval(
                 method=cfg.method,
                 score_threshold=cfg.threshold,
                 rerank=cfg.rerank,
+                rerank_score_threshold=cfg.rerank_threshold,
             )
+        if cfg.rerank and outcome.rerank_degraded:
+            msg = (
+                f"rerank degraded on case {case.id} (see the knowledge.rerank_failed / "
+                "rerank_empty warning): its numbers would be the fused order"
+            )
+            raise RerankDegradedError(msg)
+        results = list(outcome.results)
         alive: bool | None = None
         if anchors is not None and case.expected:
             alive = case.id in anchors.alive_cases
@@ -814,7 +835,13 @@ async def run_eval(
             source=case.source,
             tags=case.tags,
             results=tuple(_result_row(r, with_text=cfg.with_text) for r in results),
-            score=score_case(results, case.expected, threshold=cfg.threshold, match=case.match),
+            score=score_case(
+                results,
+                case.expected,
+                threshold=cfg.threshold,
+                match=case.match,
+                rerank_threshold=cfg.rerank_threshold,
+            ),
             match=case.match,
             anchors_alive=alive,
         )
@@ -829,6 +856,7 @@ def _result_row(result: RetrievedChunk, *, with_text: bool = False) -> ResultRow
         score=result.score,
         recall_source=result.recall_source,
         text=result.retrieval_text if with_text else None,
+        rerank_score=result.rerank_score,
     )
 
 
@@ -900,8 +928,9 @@ def baseline_section(summary: Mapping[str, Any]) -> dict[str, Any]:
 
 def _result_json(result: ResultRow) -> dict[str, Any]:
     out = asdict(result)
-    if out["text"] is None:
-        del out["text"]
+    for key in ("text", "rerank_score"):
+        if out[key] is None:
+            del out[key]
     return out
 
 
@@ -915,6 +944,9 @@ def case_to_json(row: CaseRow) -> dict[str, Any]:
         "refused": row.score.refused,
         "zero_hit": row.score.zero_hit,
         "best_score": row.score.best_score,
+        "best_rerank_score": max(
+            (r.rerank_score for r in row.results if r.rerank_score is not None), default=None
+        ),
         "anchors_alive": row.anchors_alive,
         "results": [_result_json(r) for r in row.results],
         "hits": {
@@ -1037,6 +1069,7 @@ def fingerprint(
         "top_k": cfg.top_k,
         "threshold": cfg.threshold,
         "rerank": cfg.rerank_mode,
+        "rerank_threshold": cfg.rerank_threshold,
     }
 
 
@@ -1258,6 +1291,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--threshold", type=float, default=None, help="向量路相似度下限")
     parser.add_argument(
+        "--rerank-threshold",
+        type=float,
+        default=None,
+        help="重排分数下限(要配 --rerank);设了以后「拒答」= 检索返回空",
+    )
+    parser.add_argument(
         "--rerank",
         default="off",
         choices=("off", "on", "llm", "dashscope"),
@@ -1396,6 +1435,7 @@ async def _run(
         "top_k": cfg.top_k,
         "threshold": cfg.threshold,
         "rerank": cfg.rerank_mode,
+        "rerank_threshold": cfg.rerank_threshold,
         "label": args.label,
     }
     summary = summarise(
@@ -1425,11 +1465,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         else _EVAL_DIR / "baselines" / f"kb_{dataset.name}_baseline.yaml"
     )
     rerank_mode = "llm" if args.rerank == "on" else args.rerank
+    if args.rerank_threshold is not None and rerank_mode != "dashscope":
+        raise SystemExit(
+            "--rerank-threshold needs --rerank dashscope: other modes give no rerank scores, "
+            "so the floor would filter nothing while every empty result counted as a refusal"
+        )
+    if args.rerank_threshold is not None and args.update_baseline:
+        raise SystemExit(
+            "refusing to update baseline with --rerank-threshold: the baseline section is "
+            "keyed by rerank mode only, so a thresholded run would overwrite the plain one"
+        )
     cfg = EvalConfig(
         method=RetrievalMethod(args.method),
         top_k=args.top_k,
         threshold=args.threshold,
         rerank=rerank_mode != "off",
+        rerank_threshold=args.rerank_threshold,
         rerank_mode=rerank_mode,
         with_text=args.with_text,
     )
