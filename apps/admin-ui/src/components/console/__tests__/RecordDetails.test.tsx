@@ -10,7 +10,7 @@ import { App } from "antd";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import "../../../i18n";
+import i18n from "../../../i18n";
 
 import type { AgentToolSchema } from "../../../api/agents";
 import type { SseEvent } from "../../../api/sessions";
@@ -406,6 +406,24 @@ describe("RecordDetails", () => {
     expect(button.textContent).not.toContain("#23");
     await userEvent.click(button);
     expect(props.onOpenRequest).toHaveBeenCalledWith(23);
+  });
+
+  it("B-203 — 中文界面的层级链接是中文(与 ASSISTANT / TOOL 类型标签对得上)", async () => {
+    const prior = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      const assistant = rec(assistantRow());
+      const first = renderRecord({ record: rec(toolRow(), { parentId: assistant.id }), parent: assistant });
+      expect(screen.getByTestId("console-detail-hier-assistant").textContent).toContain(
+        "模型调用（ASSISTANT）",
+      );
+      first.unmount();
+      const tool = rec(toolRow());
+      renderRecord({ record: rec(subagentRow(), { parentId: tool.id }), parent: tool });
+      expect(screen.getByTestId("console-detail-hier-tool").textContent).toContain("工具调用（TOOL）");
+    } finally {
+      await i18n.changeLanguage(prior);
+    }
   });
 
   it("层级:tool / memory 写回 + parent → 「Assistant Message ›」抛 onOpenRecord", async () => {
