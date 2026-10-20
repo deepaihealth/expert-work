@@ -343,6 +343,26 @@ describe("ledgerRowsOf", () => {
     expect(assistant).toMatchObject({ id: "assistant:0", text: "", reasoning: "", toolCallCount: 1 });
   });
 
+  it("B-202 — ledgerRowsOf: the assistant row carries each tool call's name + args", () => {
+    const rows = ledgerRowsOf([
+      upd("agent", {
+        step_count: 1,
+        messages: [{
+          type: "ai", content: "",
+          tool_calls: [
+            { id: "a", name: "web_search", args: { q: "退款" } },
+            { id: "b", name: "mcp__crm__lookup", args: { id: 7 } },
+          ],
+        }],
+      }),
+    ], INPUT);
+    const assistant = rows.find((r): r is AssistantRow => r.kind === "assistant");
+    expect(assistant?.toolCalls).toEqual([
+      { name: "web_search", args: { q: "退款" } },
+      { name: "lookup", args: { id: 7 } },
+    ]);
+  });
+
   it("ledgerRowsOf: step error → assistant status error", () => {
     const rows = ledgerRowsOf([
       upd("agent", { step_count: 1, messages: [{ type: "ai", content: "试试", tool_calls: [{ id: "a", name: "t1", args: {} }] }] }),

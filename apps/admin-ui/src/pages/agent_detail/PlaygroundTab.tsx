@@ -743,6 +743,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               isSystemAdmin={isSystemAdmin}
               focusRequest={focusRequest}
               onEnsureLoaded={handleEnsureLoaded}
+              rateBook={rateBook}
               onFireResult={handleFireResult}
             />
           </ViewPane>

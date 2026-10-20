@@ -25,7 +25,7 @@ function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
   return {
     id: "assistant:1", kind: "assistant", seq: 1, step: 1, status: "ok", durationMs: 120,
     eventIndexes: [], serverMs: null, text: "我来查一下", reasoning: "", model: "glm-5.2",
-    inputTokens: 10, outputTokens: 4, finishReason: "stop", toolCallCount: 1, ...over,
+    inputTokens: 10, outputTokens: 4, finishReason: "stop", toolCallCount: 1, toolCalls: [], ...over,
   };
 }
 const toolRow: ToolRow = {
@@ -47,6 +47,7 @@ function rec(over: Partial<LedgerRecord> & Pick<LedgerRecord, "id" | "index" | "
 }
 function request(over: Partial<LedgerRequest> & Pick<LedgerRequest, "no" | "recordId">): LedgerRequest {
   return {
+    noInTurn: over.no,
     turnKey: "t1", turnSeq: 0, step: 1, status: "ok", model: "glm-5.2", finishReason: "stop",
     usage: { input: 10, output: 4, reasoning: 0, cacheRead: 0 },
     cumulative: { input: 10, output: 4 }, toolCalls: 1,
@@ -92,7 +93,7 @@ function baseProps(over: Partial<TrajectoryLedgerProps> = {}): TrajectoryLedgerP
     requestsByRecordId: new Map([
       ["t1/assistant:1", request({ no: 1, recordId: "t1/assistant:1" })],
       ["t1/assistant:2", request({ no: 2, recordId: "t1/assistant:2", step: 2, status: "error" })],
-      ["t2/assistant:1", request({ no: 3, recordId: "t2/assistant:1", turnKey: "t2", turnSeq: 1, status: "running" })],
+      ["t2/assistant:1", request({ no: 3, noInTurn: 1, recordId: "t2/assistant:1", turnKey: "t2", turnSeq: 1, status: "running" })],
     ]),
     selectedId: null, onSelect: vi.fn(),
     selectedRequestNo: null, onSelectRequest: vi.fn(),
@@ -175,6 +176,9 @@ describe("TrajectoryLedger", () => {
     expect(dots[0]).not.toHaveAttribute("data-active");
     expect(dots[0]).toHaveAttribute("aria-label", "请求 #1 · 第 1 轮 · 第 1 步");
     expect(dots[0]).toHaveAttribute("title", "请求 #1 · 第 1 轮 · 第 1 步");
+    // B-202 —— 第 2 轮的第 1 次请求显示 #1(按轮编号);`data-no` 仍是整本账的键。
+    expect(dots[2]).toHaveAttribute("aria-label", "请求 #1 · 第 2 轮 · 第 1 步");
+    expect(dots[2]).toHaveAttribute("data-no", "3");
     // tool 行没有请求 → 它那格没有圆点。
     const toolRowEl = screen.getAllByTestId("console-traj-row")[2];
     expect(within(toolRowEl).queryByTestId("console-traj-request-dot")).toBeNull();
@@ -306,7 +310,7 @@ describe("TrajectoryLedger", () => {
       { kind: "record", record: records[0] },
       {
         kind: "turn-summary", turnKey: "t1", turnSeq: 0, runId: "run-1", hasError: false, anchorIndex: 0,
-        summary: { think: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
+        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
       },
     ];
     render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn })} />);
@@ -467,13 +471,13 @@ describe("TrajectoryLedger", () => {
       { kind: "record", record: records[0] },
       {
         kind: "turn-summary", turnKey: "t1", turnSeq: 0, runId: "run-1", hasError: false, anchorIndex: 0,
-        summary: { think: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
+        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
       },
     ];
     render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn })} />);
     const summary = screen.getByTestId("console-traj-turn-summary");
     expect(summary).toHaveAttribute("data-turn-key", "t1");
-    expect(summary).toHaveTextContent("思考 2 次 · 工具 1 次（bash ×1） · 1.5s");
+    expect(summary).toHaveTextContent("模型调用 2 次 · 工具 1 次（bash ×1） · 1.5s");
 
     fireEvent.click(summary);
     expect(onToggleTurn).toHaveBeenCalledWith("t1");

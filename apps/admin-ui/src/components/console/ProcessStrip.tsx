@@ -19,11 +19,15 @@ import type { CompactRow as CompactRowT } from "../../api/trajectory_rows";
 import type { FireNowResult } from "../../api/triggers";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { CompactRow } from "./CompactRow";
+import type { ModelCall } from "./live_rows";
 import { processHeadline, summarizeProcess } from "./process_summary";
 import "./process_strip.css";
 
 export interface ProcessStripProps {
   rows: readonly { row: CompactRowT; liveText?: string }[];
+  /** 本轮全部模型调用(`modelCallsOf`)—— 标题的「模型调用 N 次」与时长都按它算,
+   *  不按 `rows` 里的 think 行(没写思考的步骤不出 think 行,B-202)。 */
+  modelCalls: readonly ModelCall[];
   running: boolean;
   /** 已展开详情的行 id 集合 + 切换(TurnBlock 持有,行详情跟着轮走)。 */
   expandedRowIds: ReadonlySet<string>;
@@ -40,6 +44,7 @@ const AUTO_VISIBLE_ROWS = 3;
 
 export function ProcessStrip({
   rows,
+  modelCalls,
   running,
   expandedRowIds,
   onToggleRow,
@@ -51,8 +56,8 @@ export function ProcessStrip({
   /** `null` = 跟随 `running` 自动;点过头部之后固定成用户选的那个。 */
   const [open, setOpen] = useState<boolean | null>(null);
   const summary = useMemo(
-    () => summarizeProcess(rows.map((r) => r.row)),
-    [rows],
+    () => summarizeProcess(rows.map((r) => r.row), modelCalls),
+    [rows, modelCalls],
   );
 
   if (rows.length === 0) return null;

@@ -7,9 +7,10 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import i18n from "../../../i18n";
 
+import { rateKey, type RateBook } from "../../../api/cost";
 import type { RunTrace, TraceSpan } from "../../../api/trace_facade";
 import type { SpanMatch } from "../../../api/trace_match";
-import type { AssistantRow, ThinkRow } from "../../../api/trajectory_rows";
+import type { AssistantRow, ThinkRow, ToolRow } from "../../../api/trajectory_rows";
 import { RowDetailTiming } from "../RowDetailTiming";
 
 function thinkRow(over: Partial<ThinkRow> = {}): ThinkRow {
@@ -51,6 +52,7 @@ function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
     outputTokens: 60,
     finishReason: "stop",
     toolCallCount: 1,
+    toolCalls: [],
     ...over,
   };
 }
@@ -265,5 +267,76 @@ describe("RowDetailTiming", () => {
     const table = screen.getByTestId("console-detail-timing");
     expect(table.textContent).toContain("gpt-a");
     expect(table.textContent).toContain("200 / 60");
+  });
+});
+
+// B-202 —— 用户拍板:成本按平台价目表、人民币算。原来只取 Langfuse 的 costUsd,
+// Langfuse 没数据时整行「—」。
+describe("RowDetailTiming — 成本按平台价目表(B-202)", () => {
+  // 3 / 0.3 / 15 元每百万 token(输入 / 缓存命中 / 输出)。
+  const BOOK: RateBook = {
+    agentKey: rateKey("zhipu", "glm-5.3"),
+    byModel: new Map([
+      [
+        rateKey("zhipu", "glm-5.3"),
+        {
+          id: "rc-1", tenant_id: null, provider: "zhipu", model: "glm-5.3",
+          input_per_mtok_micros: 3_000_000, output_per_mtok_micros: 15_000_000,
+          cache_creation_per_mtok_micros: 0, cache_read_per_mtok_micros: 300_000,
+        },
+      ],
+    ]),
+  };
+  /** 「成本」那一行的各个单元格文本(Langfuse 列整列一条说明时只剩 SSE 列)。 */
+  function costCells(): string[] {
+    const tr = screen.getByText("Cost").closest("tr");
+    return [...(tr?.querySelectorAll("td") ?? [])].map((td) => td.textContent ?? "");
+  }
+  const toolRow: ToolRow = {
+    id: "tool:1:0", kind: "tool", seq: 1, step: 1, status: "ok", durationMs: 300,
+    eventIndexes: [], serverMs: null,
+    entry: {
+      id: "c1", rawName: "web_search", isMcp: false, server: null, toolName: "web_search",
+      args: {}, status: "success", resultPreview: "ok", durationMs: 300,
+    },
+  };
+  const noTrace = { match: { span: null, reason: "no_trace" } as SpanMatch, trace: { status: "unavailable" } as RunTrace };
+
+  it("模型调用行:按平台价目表折成人民币,Langfuse 拿不到也有数", () => {
+    render(
+      <RowDetailTiming
+        row={assistantRow({ inputTokens: 200_000, outputTokens: 10_000, cacheReadTokens: 100_000 })}
+        {...noTrace}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        rateBook={BOOK}
+      />,
+    );
+    // (200k − 100k) × 3 + 100k × 0.3 + 10k × 15,每百万 → ¥0.48
+    expect(costCells()).toEqual(["¥0.4800"]);
+  });
+
+  it("没有价目表(非 system_admin)→ 「—」;非模型调用的行也是「—」", () => {
+    const { unmount } = render(
+      <RowDetailTiming
+        row={assistantRow()}
+        {...noTrace}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        rateBook={null}
+      />,
+    );
+    expect(costCells()).toEqual(["—"]);
+    unmount();
+    render(
+      <RowDetailTiming
+        row={toolRow}
+        {...noTrace}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        rateBook={BOOK}
+      />,
+    );
+    expect(costCells()).toEqual(["—"]);
   });
 });

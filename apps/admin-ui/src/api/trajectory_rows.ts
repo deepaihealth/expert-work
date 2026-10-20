@@ -79,6 +79,9 @@ export type AssistantRow = RowBase & {
   finishReason: string | null;
   /** 该步发起的工具调用数(含 update_plan)。 */
   toolCallCount: number;
+  /** 该步发起的每个工具调用:名字 + 参数(B-202 —— 只调工具、没有正文的步骤,
+   *  「预览」「原文」靠它显示这一步干了什么)。运行中还没落帧的步参数未知,为 {}。 */
+  toolCalls: { name: string; args: Record<string, unknown> }[];
 };
 export type TrajectoryRow = UserRow | SystemRow | CompactRow | AssistantRow;
 
@@ -153,6 +156,7 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
             reasoningTokens: item.reasoningTokens, cacheReadTokens: item.cacheReadTokens,
             firstTokenMs: item.firstTokenMs,
             finishReason: item.finishReason, toolCallCount: item.tools.length,
+            toolCalls: item.tools.map((entry) => ({ name: entry.toolName, args: entry.args })),
             status: item.hasError ? "error" : "ok", durationMs: item.durationMs,
             eventIndexes: idx(item), serverMs: item.serverMs ?? null,
           });

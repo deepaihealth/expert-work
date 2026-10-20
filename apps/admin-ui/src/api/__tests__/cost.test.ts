@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { costCnyOfBuckets, rateKey, type RateBook } from "../cost";
+import { costCnyOfBuckets, costCnyOfMainLineCall, rateKey, type RateBook } from "../cost";
 import type { RateCardRecord } from "../rate_card";
 import type { TurnUsage, UsageBucket } from "../turn_summary";
 
@@ -112,5 +112,23 @@ describe("costCnyOfBuckets", () => {
       book([AGENT]),
     );
     expect(cost).toBeNull();
+  });
+});
+
+describe("costCnyOfMainLineCall (B-202)", () => {
+  it("prices one main-line call at the agent's card — the same formula the turn total uses", () => {
+    const u = usage(200_000, 10_000, 100_000);
+    expect(costCnyOfMainLineCall({ input: 200_000, output: 10_000, cacheRead: 100_000 }, book([AGENT]))).toBe(
+      legacyCostCny(u, AGENT),
+    );
+    // A worker card in the book changes nothing: main-line usage is unattributed.
+    expect(
+      costCnyOfMainLineCall({ input: 200_000, output: 10_000, cacheRead: 100_000 }, book([AGENT, WORKER])),
+    ).toBe(legacyCostCny(u, AGENT));
+  });
+
+  it("returns null without a rate book or without the agent's card", () => {
+    expect(costCnyOfMainLineCall({ input: 1, output: 1, cacheRead: 0 }, null)).toBeNull();
+    expect(costCnyOfMainLineCall({ input: 1, output: 1, cacheRead: 0 }, book([WORKER], null))).toBeNull();
   });
 });

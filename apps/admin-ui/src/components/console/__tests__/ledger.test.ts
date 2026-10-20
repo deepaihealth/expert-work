@@ -213,6 +213,14 @@ describe("buildLedger", () => {
     expect(ledger.requests[3]).toMatchObject({ no: 4, status: "running", step: 2, toolCalls: 1, endedAt: NOW });
   });
 
+  it("B-202 — the displayed request number restarts every turn; `no` stays the window-wide key", () => {
+    // 第 2 轮第 1 步原来显示「请求 #23」(跨轮累计),而「第 M 步」按轮重数。
+    const ledger = build();
+    expect(ledger.requests.map((r) => [r.turnKey, r.no, r.noInTurn])).toEqual([
+      ["A", 1, 1], ["A", 2, 2], ["C", 3, 1], ["C", 4, 2],
+    ]);
+  });
+
   it("lane by kind: user/memory-recall → 0, assistant/reflect/compaction → 1, tool/subagent/plan/memory-writeback/markers → 2", () => {
     const events: SseEvent[] = [
       upd("memory_recall", { recalled_memories: [{ id: "m1", kind: "fact", content: "老客户 A\n第二行", importance: 0.5, confidence: 0.5 }] }, 100),

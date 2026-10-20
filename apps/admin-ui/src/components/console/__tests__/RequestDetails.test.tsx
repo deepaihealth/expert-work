@@ -10,6 +10,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
 
+import { rateKey } from "../../../api/cost";
 import type { TraceSpan } from "../../../api/trace_facade";
 import type { AssistantRow } from "../../../api/trajectory_rows";
 import type { LedgerRecord, LedgerRequest } from "../ledger_types";
@@ -36,6 +37,7 @@ function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
     cacheReadTokens: 7,
     finishReason: "stop",
     toolCallCount: 2,
+    toolCalls: [],
     ...over,
   };
 }
@@ -72,6 +74,7 @@ function record(over: Partial<LedgerRecord> = {}): LedgerRecord {
 function request(over: Partial<LedgerRequest> = {}): LedgerRequest {
   return {
     no: 4,
+    noInTurn: 4,
     turnKey: "t1",
     turnSeq: 1,
     step: 1,
@@ -159,6 +162,14 @@ describe("RequestDetails", () => {
     renderRequest();
     const header = screen.getByTestId("console-detail-header");
     expect(header.textContent).toContain("Request #4");
+    expect(header.textContent).toContain("Turn 2 · step 1");
+  });
+
+  it("B-202 — 头部的「请求 #N」按轮编号(`noInTurn`),不是跨轮累计的 `no`", () => {
+    renderRequest({ request: request({ no: 23, noInTurn: 1 }) });
+    const header = screen.getByTestId("console-detail-header");
+    expect(header.textContent).toContain("Request #1");
+    expect(header.textContent).not.toContain("#23");
     expect(header.textContent).toContain("Turn 2 · step 1");
     for (const key of ["summary", "input", "usage", "timing"]) {
       expect(screen.getByTestId(`console-detail-tab-${key}`)).toBeInTheDocument();
@@ -251,5 +262,26 @@ describe("RequestDetails", () => {
       trace: { status: "incomplete" },
     });
     expect(screen.getByTestId("console-timing-langfuse")).toHaveAttribute("href", "https://lf/t/1");
+  });
+
+  it("B-202 — 计时页的成本按透传进来的平台价目表算人民币", () => {
+    renderRequest({
+      activeTab: "timing",
+      rateBook: {
+        agentKey: rateKey("p", "gpt-x"),
+        byModel: new Map([
+          [
+            rateKey("p", "gpt-x"),
+            {
+              id: "rc", tenant_id: null, provider: "p", model: "gpt-x",
+              input_per_mtok_micros: 3_000_000, output_per_mtok_micros: 15_000_000,
+              cache_creation_per_mtok_micros: 0, cache_read_per_mtok_micros: 300_000,
+            },
+          ],
+        ]),
+      },
+    });
+    // (120 − 7) × 3 + 7 × 0.3 + 30 × 15,每百万 = ¥0.000791…
+    expect(screen.getByTestId("console-detail-timing").textContent).toContain("¥0.0008");
   });
 });

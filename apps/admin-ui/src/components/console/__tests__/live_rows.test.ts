@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { liveLedgerRows, liveSyntheticRows, settledStepsOf } from "../live_rows";
+import { liveLedgerRows, liveSyntheticRows, modelCallsOf, settledStepsOf } from "../live_rows";
 import type { SseEvent } from "../../../api/sessions";
 import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
 
@@ -26,6 +26,25 @@ describe("settledStepsOf", () => {
   });
   it("returns an empty set for events with no settled agent step", () => {
     expect(settledStepsOf([])).toEqual(new Set());
+  });
+});
+
+describe("modelCallsOf", () => {
+  it("B-202 — one call per settled agent step (reasoning or not) plus one per unsettled live step", () => {
+    const withDuration: SseEvent = {
+      id: null, event: "updates", rawData: "", receivedAt: "",
+      data: { agent: { step_count: 2, _duration_ms: 1500, messages: [{ type: "ai", content: "", tool_calls: [] }] } },
+    };
+    const liveByStep = new Map<number, LiveStep>([
+      [2, liveStep({ content: "settled leftover" })], // 已落帧 —— 不重复计
+      [3, liveStep()], // 还在跑,思考 / 正文都还是空的,照样是一次调用
+    ]);
+    expect(modelCallsOf([agentUpdate(1), withDuration], liveByStep)).toEqual([
+      { durationMs: null },
+      { durationMs: 1500 },
+      { durationMs: null },
+    ]);
+    expect(modelCallsOf([], undefined)).toEqual([]);
   });
 });
 
@@ -82,6 +101,11 @@ describe("liveLedgerRows", () => {
       durationMs: null, eventIndexes: [], serverMs: null,
     });
     expect(rows[3]).toMatchObject({ kind: "assistant", step: 3, text: "", reasoning: "", toolCallCount: 0 });
+    // B-202 —— 还没落帧的步只知道工具名,参数未知(与 live tool 行的 `args: {}` 同口径)。
+    expect(rows[0]).toMatchObject({
+      toolCalls: [{ name: "query_crm", args: {} }, { name: "search", args: {} }],
+    });
+    expect(rows[3]).toMatchObject({ toolCalls: [] });
     expect(rows[1]).toMatchObject({
       kind: "tool", seq: -1, step: 2, status: "running",
       entry: { id: "live-2-call_a", toolName: "query_crm", status: "pending" },

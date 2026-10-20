@@ -118,11 +118,43 @@ export function RenderedIo({ io }: { io: RunTraceIo }) {
  *  (它没有 `reasoning`,折叠段自然不出)。 */
 export type TextRow = UserRow | AssistantRow;
 
+/** 没有正文、只调了工具的那一步的工具调用;其它情况(USER 行、有正文)→ []。
+ *  账本行写「（仅工具调用）」的同一个条件(`text === ""`)。 */
+function toolCallsOnly(row: TextRow): AssistantRow["toolCalls"] {
+  return row.kind === "assistant" && row.text === "" ? row.toolCalls : [];
+}
+
+/** B-202 —— 只调工具的步骤原来「预览」「原文」都是空白(会话 0e878fd6 第 1 轮
+ *  22 步里 15 步):列出这一步调了哪些工具、各自的参数。 */
+function ToolCallsBlock({ calls, raw }: { calls: AssistantRow["toolCalls"]; raw: boolean }) {
+  const { t } = useTranslation();
+  return (
+    <div data-testid="console-detail-tool-calls" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        {t("console.detail_tool_calls_only")}
+      </Text>
+      {raw ? (
+        <Pre>{calls.map((c) => `${c.name} ${JSON.stringify(c.args, null, 2)}`).join("\n\n")}</Pre>
+      ) : (
+        calls.map((c, i) => (
+          <div key={i} data-testid="console-detail-tool-call">
+            <Text strong style={{ fontSize: 12.5, fontFamily: "var(--ew-font-mono)" }}>
+              {c.name}
+            </Text>
+            <JsonBlock value={c.args} />
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
 /** 「预览」= Markdown 正文,上方一段可折叠的思考。 */
 export function AssistantPreview({ row }: { row: TextRow }) {
   const { t } = useTranslation();
   const reasoning = row.kind === "assistant" ? row.reasoning : "";
   const n = (row.kind === "assistant" ? row.reasoningTokens : undefined) ?? reasoning.length;
+  const calls = toolCallsOnly(row);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {reasoning !== "" && (
@@ -133,7 +165,11 @@ export function AssistantPreview({ row }: { row: TextRow }) {
           <Pre>{reasoning}</Pre>
         </details>
       )}
-      <MarkdownView>{row.text}</MarkdownView>
+      {calls.length > 0 ? (
+        <ToolCallsBlock calls={calls} raw={false} />
+      ) : (
+        <MarkdownView>{row.text}</MarkdownView>
+      )}
     </div>
   );
 }
@@ -157,6 +193,7 @@ export function AssistantRawText({
       )}
     </div>
   );
+  const calls = toolCallsOnly(row);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {/* 思考段折叠(同「预览」tab)—— 原来与正文裸拼在一起,分不出哪段
@@ -169,7 +206,11 @@ export function AssistantRawText({
           {block(reasoning, t("console.detail_thinking", { n }))}
         </details>
       )}
-      {block(row.text, t("console.detail_tab_rawtext"))}
+      {calls.length > 0 ? (
+        <ToolCallsBlock calls={calls} raw />
+      ) : (
+        block(row.text, t("console.detail_tab_rawtext"))
+      )}
     </div>
   );
 }

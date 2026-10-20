@@ -103,7 +103,7 @@ describe("displayRowsOf", () => {
         turnKey: "t1",
         turnSeq: 0,
         runId: "run-1",
-        summary: { think: 2, tools: 1, other: 0, failed: 1, toolBreakdown: "bash ×1", skills: [], durationMs: 400 },
+        summary: { modelCalls: 2, tools: 1, other: 0, failed: 1, toolBreakdown: "bash ×1", skills: [], durationMs: 400 },
         hasError: true,
         anchorIndex: 0,
       },
@@ -198,7 +198,7 @@ describe("displayRowsOf", () => {
 });
 
 describe("turnSummaryOf", () => {
-  it("counts assistant as think and excludes assistant errors from failed", () => {
+  it("counts every assistant record as a model call and excludes assistant errors from failed", () => {
     const records = [
       rec({ id: "a1", index: 0, kind: "assistant", isError: true }),
       rec({ id: "a2", index: 1, kind: "assistant", isError: false }),
@@ -208,7 +208,7 @@ describe("turnSummaryOf", () => {
       }),
     ];
 
-    expect(turnSummaryOf(records)).toMatchObject({ think: 2, tools: 1, failed: 1 });
+    expect(turnSummaryOf(records)).toMatchObject({ modelCalls: 2, tools: 1, failed: 1 });
   });
 
   // 终审 M9 —— 原先是逐条时长相加,并行发出的工具会被重复计一遍,折叠行报出

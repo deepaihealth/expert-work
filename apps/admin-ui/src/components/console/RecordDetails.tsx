@@ -15,10 +15,10 @@
  */
 import { useState, type ReactNode } from "react";
 import { Typography } from "antd";
-import { ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
+import type { RateBook } from "../../api/cost";
 import type { RunTrace } from "../../api/trace_facade";
 import type { SpanMatch } from "../../api/trace_match";
 import type { AssistantRow, UserRow } from "../../api/trajectory_rows";
@@ -27,6 +27,7 @@ import { fmtDuration } from "../../pages/agent_detail/playground/duration_format
 import { EventCard } from "../EventCard";
 import { FullTextModal, type FullTextState } from "../turn/FullTextModal";
 import { DetailRow, DetailsFrame, HierLink } from "./DetailsFrame";
+import { DetailSection } from "./DetailSection";
 import { kindLabel } from "./kind_label";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import {
@@ -108,6 +109,8 @@ export interface RecordDetailsProps {
   /** PR-A.3 §十.2 — the Schema tab's lazy fetch state; the parent owns the
    *  `useAgentTools` hook so it survives switching between records. */
   toolSchemas: ToolSchemaState;
+  /** B-202 —— 透传给「计时」tab 的成本行(平台价目表);省略 = 不算成本。 */
+  rateBook?: RateBook | null;
   activeTab: RecordTab;
   onTabChange: (t: RecordTab) => void;
   onClose: () => void;
@@ -122,40 +125,10 @@ function asTextRow(record: LedgerRecord): UserRow | AssistantRow | null {
   return row.kind === "user" || row.kind === "assistant" ? row : null;
 }
 
-function DetailSection({
-  tab,
-  label,
-  onOpen,
-  children,
-}: {
-  tab: RecordTab;
-  label: string;
-  onOpen: () => void;
-  children: ReactNode;
-}) {
-  const { t } = useTranslation();
-  return (
-    <section className="ew-detail__section" data-testid={`console-detail-section-${tab}`}>
-      <h3 className="ew-detail__section-h">
-        <button
-          type="button"
-          className="ew-detail__section-btn"
-          aria-label={t("console.detail_open_tab", { tab: label })}
-          onClick={onOpen}
-        >
-          <span>{label}</span>
-          <ChevronRight size={12} strokeWidth={1.75} aria-hidden />
-        </button>
-      </h3>
-      <div className="ew-detail__preview">{children}</div>
-    </section>
-  );
-}
-
 export function RecordDetails(props: RecordDetailsProps) {
   const { record, ownerRequest, parent, threadId, isSystemAdmin, langfuseUrl } = props;
   const { match, trace, traceLoading, onRefreshTrace, onOpenRecord, onOpenRequest } = props;
-  const { activeTab, onTabChange, onFireResult, toolSchemas, readOnly = false } = props;
+  const { activeTab, onTabChange, onFireResult, toolSchemas, readOnly = false, rateBook = null } = props;
   const { t } = useTranslation();
   const [fullText, setFullText] = useState<FullTextState | null>(null);
 
@@ -205,6 +178,7 @@ export function RecordDetails(props: RecordDetailsProps) {
             traceLoading={traceLoading}
             onRefreshTrace={onRefreshTrace}
             langfuseUrl={langfuseUrl}
+            rateBook={rateBook}
           />
         );
       case "raw":
@@ -220,7 +194,7 @@ export function RecordDetails(props: RecordDetailsProps) {
       <HierLink
         key="request"
         testId="console-detail-hier-request"
-        label={t("console.detail_hier_request", { n: ownerRequest.no })}
+        label={t("console.detail_hier_request", { n: ownerRequest.noInTurn })}
         onClick={() => onOpenRequest(ownerRequest.no)}
       />,
     );

@@ -140,6 +140,10 @@ describe("TurnBlock", () => {
     // §八.3 — a settled turn's process strip starts collapsed; the compact
     // rows only exist once it is opened.
     expect(screen.queryByTestId("console-row-think")).not.toBeInTheDocument();
+    // B-202 —— 两次模型调用都算,第 2 步没写思考(不出 think 行)也一样。
+    expect(screen.getByTestId("console-process-head")).toHaveTextContent(
+      "Model calls ×2 · Tools ×1 (query_crm ×1)",
+    );
     await userEvent.click(screen.getByTestId("console-process-head"));
     expect(screen.getByTestId("console-row-think")).toHaveTextContent("先查客户资料");
     expect(screen.getByTestId("console-row-tool")).toHaveTextContent("query_crm");

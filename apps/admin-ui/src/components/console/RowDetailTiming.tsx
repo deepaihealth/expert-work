@@ -16,6 +16,7 @@ import { Button, Typography } from "antd";
 import { RefreshCw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { costCnyOfMainLineCall, type RateBook } from "../../api/cost";
 import type { RunTrace } from "../../api/trace_facade";
 import type { SpanMatch } from "../../api/trace_match";
 import type { TrajectoryRow } from "../../api/trajectory_rows";
@@ -41,10 +42,14 @@ export interface RowDetailTimingProps {
   /** Langfuse deep link (system_admin only, else null) — offered when the
    *  trace is `incomplete`. */
   langfuseUrl?: string | null;
+  /** B-202 —— 平台价目表(`useRateBook`;非 system_admin 为 null)。模型调用行的
+   *  「成本」按它折成人民币;省略 / null → 「—」。 */
+  rateBook?: RateBook | null;
 }
 
 export function RowDetailTiming(props: RowDetailTimingProps) {
-  const { row, match, trace, traceLoading, onRefreshTrace, langfuseUrl = null } = props;
+  const { row, match, trace, traceLoading, onRefreshTrace, langfuseUrl = null, rateBook = null } =
+    props;
   const { t } = useTranslation();
 
   const dash = t("console.detail_none");
@@ -55,6 +60,14 @@ export function RowDetailTiming(props: RowDetailTimingProps) {
   const metered = row.kind === "think" || row.kind === "assistant";
   const sseModel = metered ? (row.model ?? dash) : dash;
   const sseTokens = metered ? `${row.inputTokens} / ${row.outputTokens}` : dash;
+  // B-202 —— 用户拍板:成本按平台价目表、人民币算,不再只靠 Langfuse 的美元
+  // (拿不到 trace 时整行都是「—」)。
+  const sseCostCny = metered
+    ? costCnyOfMainLineCall(
+        { input: row.inputTokens, output: row.outputTokens, cacheRead: row.cacheReadTokens ?? 0 },
+        rateBook,
+      )
+    : null;
 
   const span = match.reason === "matched" ? match.span : null;
   const isError = span !== null && span.level === "error";
@@ -160,7 +173,7 @@ export function RowDetailTiming(props: RowDetailTimingProps) {
         </tr>
         <tr>
           {th(t("console.timing_row_cost"))}
-          {td(dash)}
+          {td(sseCostCny !== null ? `¥${sseCostCny.toFixed(4)}` : dash)}
           {lfMessage === null && td(lfCost !== null ? `$${lfCost.toFixed(4)}` : dash, lfColor)}
         </tr>
         {isError && span?.statusMessage && (

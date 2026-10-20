@@ -1384,6 +1384,16 @@ describe("PlaygroundTab", () => {
     await user.click(screen.getAllByTestId("console-traj-row")[0]);
     const runLink = await screen.findByTestId("console-inspect-run-link");
     expect(runLink).toHaveAttribute("href", `/runs/${sampleThread.thread_id}/run-77`);
+
+    // B-202 —— 「计时」页模型调用行的成本按平台价目表算人民币(同一张卡:
+    // 1000 × 3 + 100 × 15,每百万 → ¥0.0045)。
+    const assistantRow = screen
+      .getAllByTestId("console-traj-row")
+      .find((row) => row.dataset.kind === "assistant");
+    expect(assistantRow).toBeDefined();
+    await user.click(assistantRow!);
+    await user.click(await screen.findByTestId("console-detail-tab-timing"));
+    expect(screen.getByTestId("console-detail-timing")).toHaveTextContent("¥0.0045");
   });
 
   // B-42 — worker 换了模型(dynamic_workers.model)时,它的 token 按它自己的

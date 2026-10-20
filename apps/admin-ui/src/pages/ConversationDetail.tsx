@@ -16,7 +16,7 @@
  * mismatch, failed lookup, cross-tenant drill-in) the page degrades to the
  * flat M1.5 message block it has always rendered.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Alert,
   Button,
@@ -33,6 +33,7 @@ import {
 import { useLocation, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 
+import { getAgent } from "../api/agents";
 import { decideApprovals, type ApprovalItem } from "../api/approvals";
 
 import { ApiError, errMessage } from "../api/client";
@@ -40,7 +41,7 @@ import { getConversation, type ConversationDetail as ConversationDetailModel } f
 import { cancelRun, streamRunEvents } from "../api/runs";
 import { configChangePoints } from "./conversation_detail/configChanges";
 import { reducePlan } from "../api/plan_reducer";
-import { computeSessionStats } from "../api/session_stats";
+import { attributedModelsOf, computeSessionStats } from "../api/session_stats";
 import {
   getSessionFeedback,
   getSessionMessages,
@@ -59,12 +60,14 @@ import { TrajectoryView } from "../components/console/TrajectoryView";
 import type { ConsoleTurn, TurnTiming } from "../components/console/types";
 import type { FocusRequest } from "../components/console/use_trajectory_state";
 import { ViewPane, type ConsoleView } from "../components/console/ViewPane";
+import { readModel } from "../components/manifest-editor/form_model";
 import { CommentarySegmentLine } from "../components/turn/CommentarySegmentLine";
 import { downloadJson } from "../components/turn/download_json";
 import type { Turn } from "../components/turn/types";
 import { useHistoryTurns } from "../components/turn/useHistoryTurns";
 import { NON_TERMINAL_RUN_STATUSES } from "../api/runs";
 import type { LiveStep } from "./agent_detail/playground/useTokenStream";
+import { useRateBook, type ModelRef } from "./agent_detail/playground/useRateBook";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { formatCompact } from "../utils/runFormat";
 
@@ -88,6 +91,18 @@ const EMPTY_TASK_RESULTS: readonly FireNowResult[] = [];
 const EMPTY_FLAT_HISTORY: readonly HistoryMessage[] = [];
 const EMPTY_LIVE_TURNS: readonly Turn[] = [];
 const EMPTY_TIMINGS: Readonly<Record<string, TurnTiming>> = {};
+// B-202 —— 轨迹视图要一个定高的外框:账本(`.ew-ledger`)和详情面板都按「父级
+// 高度有界」写,只在框内滚动(`trajectory_view.css`)。调试台的 `.ew-console`
+// 给了这个框;本页原来直接放在 Card 里,账本有多长整页就多高,点账本下面的行时
+// 详情面板停在页面顶上、在视口之外。框高 = 视口高减 64px(Shell 的 Content 上下
+// 各 24px 留白 + Card 内边距的余量),不高于视口:滚到框露全时,账本和面板同时
+// 都在视口里。
+const TRAJECTORY_BOX_STYLE: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  height: "calc(100dvh - 64px)",
+  minHeight: 480,
+};
 export function ConversationDetail() {
   const { t } = useTranslation();
   const location = useLocation();
@@ -224,6 +239,40 @@ export function ConversationDetail() {
   const viewedReady = viewedConvo !== null;
   const viewedTenantId = viewedConvo?.tenant_id;
 
+  // B-202 —— 成本按平台价目表、人民币算(用户拍板),与调试台同一套:价目表只有
+  // system_admin 读得到(租户用户不发请求,成本照现有「无数据」态隐藏);主线用量按
+  // agent 自己的模型定价,所以 system_admin 还要读一次这个 agent 版本的 manifest
+  // 拿 provider / 模型名。结果按 (agent, 版本, 租户) 记,换会话不会串到上一个 agent。
+  const costAgentName = isSystemAdmin ? (viewedConvo?.agent_name ?? null) : null;
+  const costAgentVersion = isSystemAdmin ? (viewedConvo?.agent_version ?? null) : null;
+  const agentKey =
+    costAgentName !== null && costAgentVersion !== null
+      ? `${costAgentName}@${costAgentVersion}@${viewedTenantId ?? ""}`
+      : null;
+  const [agentModelOf, setAgentModelOf] = useState<{ key: string; model: ModelRef | null } | null>(
+    null,
+  );
+  useEffect(() => {
+    if (agentKey === null || costAgentName === null || costAgentVersion === null) return;
+    let cancelled = false;
+    void getAgent(costAgentName, costAgentVersion, viewedTenantId)
+      .then((detail) => {
+        if (cancelled) return;
+        const model = readModel(detail.record.spec);
+        setAgentModelOf({
+          key: agentKey,
+          model: model.provider && model.name ? { provider: model.provider, model: model.name } : null,
+        });
+      })
+      .catch(() => {
+        // 读不到 manifest → 主线用量没有价目卡,成本照「无数据」隐藏。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentKey, costAgentName, costAgentVersion, viewedTenantId]);
+  const agentModel = agentModelOf !== null && agentModelOf.key === agentKey ? agentModelOf.model : null;
+
   // D-5 (终审 I-4) — one growth-triggered re-pair per ``convo.runs``
   // INSTANCE: each refresh hands a fresh array, so a transiently-stale
   // ``listThreadRuns`` read gets another chance on the next refresh, while a
@@ -319,9 +368,12 @@ export function ConversationDetail() {
         : turn,
     );
   }, [historyTurns, historyLoads, convoRuns, decidedRunIds]);
+  const statsInputs = useMemo(() => consoleTurns.map(statsInputOf), [consoleTurns]);
+  const attributedModels = useMemo(() => attributedModelsOf(statsInputs), [statsInputs]);
+  const rateBook = useRateBook({ enabled: isSystemAdmin, agentModel, models: attributedModels });
   const stats = useMemo(
-    () => computeSessionStats(consoleTurns.map(statsInputOf), null),
-    [consoleTurns],
+    () => computeSessionStats(statsInputs, rateBook),
+    [statsInputs, rateBook],
   );
   // 配置改动立刻对新一轮生效(含正在进行的会话),所以同一个会话可能前后跑在
   // 两套配置上。事后看「第 5 轮起答复不对」时,这条是唯一能把「模型的问题」
@@ -757,7 +809,7 @@ export function ConversationDetail() {
                     streamTurnKey={null}
                     liveByStep={EMPTY_LIVE_BY_STEP}
                     registerHistoryRow={registerHistoryRow}
-                    rateBook={null}
+                    rateBook={rateBook}
                     isSystemAdmin={isSystemAdmin}
                     readOnly
                     allowDecide={canOperate}
@@ -775,20 +827,23 @@ export function ConversationDetail() {
                   />
                 </ViewPane>
                 <ViewPane view="trajectory" active={view === "trajectory"}>
-                  <TrajectoryView
-                    turns={consoleTurns}
-                    threadId={threadId}
-                    agentName={convo.agent_name ?? ""}
-                    agentVersion={convo.agent_version ?? ""}
-                    readOnly
-                    streamTurnKey={null}
-                    liveByStep={EMPTY_LIVE_BY_STEP}
-                    running={runInFlight}
-                    visible={view === "trajectory"}
-                    isSystemAdmin={isSystemAdmin}
-                    focusRequest={focusRequest}
-                    onEnsureLoaded={handleEnsureLoaded}
-                  />
+                  <div style={TRAJECTORY_BOX_STYLE} data-testid="conversation-trajectory-box">
+                    <TrajectoryView
+                      turns={consoleTurns}
+                      threadId={threadId}
+                      agentName={convo.agent_name ?? ""}
+                      agentVersion={convo.agent_version ?? ""}
+                      readOnly
+                      streamTurnKey={null}
+                      liveByStep={EMPTY_LIVE_BY_STEP}
+                      running={runInFlight}
+                      visible={view === "trajectory"}
+                      isSystemAdmin={isSystemAdmin}
+                      focusRequest={focusRequest}
+                      onEnsureLoaded={handleEnsureLoaded}
+                      rateBook={rateBook}
+                    />
+                  </div>
                 </ViewPane>
               </div>
             </>
