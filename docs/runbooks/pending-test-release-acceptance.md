@@ -620,3 +620,86 @@ run("embed-setting", embed_setting)
 ```
 
 - [ ] **38.2 真实入库**:本机生成一个表格单元格特别长的文件(约 52KB 印地文,最后一格末尾是标记词):`python3 -c 'open("b200-wide-row.md", "w", encoding="utf-8").write("| id | content |\n| - | - |\n| 1 | " + "धनवापसी की अवधि चौदह दिन है। " * 700 + "refund-marker-b200 |\n")'`。在测试环境新建一个知识库(名字如 `b200-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund-marker-b200`,结果里有这篇文档的段,正文含 `refund-marker-b200`。**没修好时**:① 文档「失败」,错误信息里有 `Range of input length should be [1, 16000]`(本机用修复前代码 + 真实嵌入接口跑过,正是这样失败;修复后入库成功、最长一段 503 token)。验完删掉这个知识库。
+
+## §39 B-201 「计时」的 Langfuse 列:查询不卡后台、平台 span 进 Langfuse、超过 2 分钟显示「数据不完整」(ROADMAP B-201)
+
+**背景**:会话详情页轨迹「计时」tab 的「Langfuse 精确」一列至少一周没显示过数据,三个原因叠在一起:① 查 trace 的接口在事件循环里同步调 Langfuse(10-20 测试环境一条 34 个观测点的 trace 要 8.8 秒,这段时间该副本的所有请求都在排队);② SDK 默认 5 秒超时,超时被吞成 `unavailable`、不留日志;③ langfuse SDK 4.x 默认只导出跟大模型有关的 span,平台自己的请求 / 运行 / 节点 / 工具 span 全被丢掉,Langfuse 里每个 `llm_call` 都挂在不存在的父节点下,页面永远「入库中」。现在:查询放线程里跑、每次请求 30 秒超时、失败记 warning;平台自己的 span 照常导出;运行结束 2 分钟后 trace 仍不完整,显示「数据不完整」,系统管理员另有「去 Langfuse 查看」链接,不再重试。
+
+**修复前的 trace 补不回来**:发版前跑的运行,「计时」里显示「数据不完整」是预期。发版后 Langfuse 里每个打了 trace 的 HTTP 请求(控制台的查询也算)会各成一条 trace,和 SDK 3.x 时一样。
+
+- [ ] **39.1 三处改动(pod 内离线探针)**:发测试后执行下面的命令。只调导出过滤函数和 trace 门面(喂假的 Langfuse 客户端):不连外网,不读写库。判据:输出 3 行,每行末尾都是 `True`(前面可能多一行 `trace_facade.incomplete trace_id=probe reason=partial_tree`,是探针故意触发的日志)。**没修好时**:`export-filter FAIL ImportError`、`incomplete FAIL TypeError`、`read-timeout False`(10-20 在测试环境发版前的镜像上跑过,正是这三行)。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from opentelemetry.sdk.trace import TracerProvider
+def run(label, check):
+    try:
+        print(label, check())
+    except Exception as exc:
+        print(label, "FAIL", type(exc).__name__)
+def export_filter():
+    from expert_work.common.observability import TRACER_NAME
+    from expert_work.runtime.middleware.langfuse_sdk import should_export_span
+    span = TracerProvider().get_tracer(TRACER_NAME).start_span("expert_work.session.run")
+    span.end()
+    return should_export_span(span)
+class Api:
+    def __init__(self):
+        self.options = []
+    def get(self, trace_id, request_options=None):
+        self.options.append(request_options)
+        orphan = SimpleNamespace(id="g1", type="GENERATION", name="llm_call", parent_observation_id="never-ingested", start_time=None, latency=1.0)
+        return SimpleNamespace(name="", latency=1.0, total_cost=None, observations=[orphan])
+def fetch(api, ago):
+    from control_plane.api.trace_facade import fetch_and_normalize
+    client = SimpleNamespace(api=SimpleNamespace(trace=api))
+    return fetch_and_normalize(client, "probe", finished_at=datetime.now(UTC) - ago)["status"]
+run("export-filter", export_filter)
+run("incomplete", lambda: (fetch(Api(), timedelta(seconds=30)), fetch(Api(), timedelta(minutes=3))) == ("not_ready", "incomplete"))
+def read_timeout():
+    from control_plane.api.trace_facade import fetch_span_raw
+    api = Api()
+    fetch_span_raw(SimpleNamespace(api=SimpleNamespace(trace=api)), "probe", "g1", "input")
+    return api.options == [{"timeout_in_seconds": 30}]
+run("read-timeout", read_timeout)
+'
+```
+
+- [ ] **39.2 平台 span 进了 Langfuse(真栈)**:在调试台给任一智能体发一句不调工具的话(如「你好」),结束后等 1 分钟。拿这一轮的 trace id(`GET /v1/sessions/{thread}/runs/{run}` 返回的 `trace_id`;系统管理员也可从会话详情「概要」的 Langfuse 链接末尾取),把下面命令末尾的 `<trace_id>` 换掉执行。只读 Langfuse。判据:① `types` 里除了 `GENERATION` 还有 `SPAN`;② `dangling 0`;③ `session-run True`;④ `facade ok`。**没修好时**:`types` 只有 `GENERATION`,`dangling` 等于观测点总数,`session-run False`,`facade not_ready`(结束超过 2 分钟后是 `incomplete`)—— 10-20 用发版前的 trace `26e8313c55a5d992f234e718c7668df6` 跑过:`types {'GENERATION': 34}`、`dangling 34`、`session-run False`、`facade not_ready`。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import collections, sys
+from langfuse import Langfuse
+from control_plane.api.trace_facade import fetch_and_normalize
+from control_plane.settings import Settings
+s = Settings()
+client = Langfuse(public_key=s.langfuse_public_key, secret_key=s.langfuse_secret_key, host=s.langfuse_host, tracing_enabled=False)
+trace_id = sys.argv[1]
+obs = client.api.trace.get(trace_id, request_options={"timeout_in_seconds": 60}).observations
+ids = {o.id for o in obs}
+print("types", dict(collections.Counter(o.type for o in obs)))
+print("dangling", sum(1 for o in obs if o.parent_observation_id and o.parent_observation_id not in ids))
+print("session-run", any(o.name == "expert_work.session.run" for o in obs))
+print("facade", fetch_and_normalize(client, trace_id)["status"])
+' <trace_id>
+```
+
+- [ ] **39.3 页面(真栈)**:系统管理员打开 39.2 那一轮的会话详情,轨迹里点模型回复那一行 →「计时」tab。判据:「Langfuse 精确」一列显示开始 / 时长 / 模型 / tokens(「成本」要看 Langfuse 认不认这个模型的价格,B-202 另修,这里不判)。再打开一条**发版前**跑的、结束超过 2 分钟的运行,同样点「计时」:显示「数据不完整」和「去 Langfuse 查看 ↗」,点链接在新标签页打开这条 trace;浏览器开发者工具 Network 里这条运行的 `/trace` 请求不再每 1.5 秒重复。换非系统管理员账号看同一行:只有「数据不完整」,没有链接。**没修好时**:两条运行都显示「Langfuse 入库中，稍后自动重试」(或「trace 不可用」),`/trace` 每 1.5 秒重发、最多 6 次。
+
+- [ ] **39.4 查询不再卡住副本(真栈)**:先 `kubectl get pod -l app.kubernetes.io/name=control-plane -o name` 拿到两个 pod 名,在两个 pod 里**同时**跑下面的探针(各开一个终端,或命令末尾加 `&` 再 `wait`):它在 60 秒里每 0.05 秒打一次本 pod 的 `/healthz/live`,记最慢一次。窗口内打开一条模型调用多的运行(几十次 `llm_call`)的「计时」tab,点 3 次「刷新」页面。只读。判据:两个 pod 的 `worst healthz/live` 都小于 0.5 秒。**没修好时**:接到 `/trace` 请求的那个 pod,最慢一次约等于那次 Langfuse 查询的耗时(数秒)。这条「没修好时」是推断:10-20 在测试 pod 里单独起进程对比过,同一条 34 个观测点的 trace,在事件循环里直接查,循环卡 8.77 秒;挪到线程里查,卡 0.02 秒;没有经过线上接口实测。
+
+```bash
+kubectl exec pod/<pod 名> -- python -c '
+import time, urllib.request
+end, worst = time.monotonic() + 60, 0.0
+while time.monotonic() < end:
+    t0 = time.monotonic()
+    urllib.request.urlopen("http://127.0.0.1:8000/healthz/live", timeout=30).read()
+    worst = max(worst, time.monotonic() - t0)
+    time.sleep(0.05)
+print("worst healthz/live %.2fs" % worst)
+'
+```
