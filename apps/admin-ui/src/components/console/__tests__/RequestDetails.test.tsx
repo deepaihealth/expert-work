@@ -242,4 +242,14 @@ describe("RequestDetails", () => {
     expect(timing.textContent).toContain("1.2s");
     expect(timing.textContent).toContain("gpt-x");
   });
+
+  it("计时:trace 不完整时把 Langfuse 链接带进计时 tab(B-201)", () => {
+    renderRequest({
+      activeTab: "timing",
+      isSystemAdmin: true,
+      langfuseUrl: "https://lf/t/1",
+      trace: { status: "incomplete" },
+    });
+    expect(screen.getByTestId("console-timing-langfuse")).toHaveAttribute("href", "https://lf/t/1");
+  });
 });

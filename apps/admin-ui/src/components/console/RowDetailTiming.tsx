@@ -8,7 +8,8 @@
  * The Langfuse column is governed by `match.reason`: "matched" renders real
  * per-row values (danger colour + `statusMessage` on `span.level === "error"`);
  * the other three reasons collapse the whole column into one explanatory
- * message spanning all rows (`rowSpan`), "not_ready" adding a refresh button.
+ * message spanning all rows (`rowSpan`), "not_ready" adding a refresh button
+ * and "incomplete" a Langfuse link (B-201).
  */
 import type { ReactNode } from "react";
 import { Button, Typography } from "antd";
@@ -37,10 +38,13 @@ export interface RowDetailTimingProps {
   trace: RunTrace | null;
   traceLoading: boolean;
   onRefreshTrace: () => void;
+  /** Langfuse deep link (system_admin only, else null) — offered when the
+   *  trace is `incomplete`. */
+  langfuseUrl?: string | null;
 }
 
 export function RowDetailTiming(props: RowDetailTimingProps) {
-  const { row, match, trace, traceLoading, onRefreshTrace } = props;
+  const { row, match, trace, traceLoading, onRefreshTrace, langfuseUrl = null } = props;
   const { t } = useTranslation();
 
   const dash = t("console.detail_none");
@@ -58,6 +62,7 @@ export function RowDetailTiming(props: RowDetailTimingProps) {
 
   let lfMessage: string | null = null;
   let showRefresh = false;
+  let showLangfuseLink = false;
   if (match.reason === "count_mismatch") {
     lfMessage = t("console.timing_mismatch");
   } else if (match.reason === "unsupported") {
@@ -68,6 +73,9 @@ export function RowDetailTiming(props: RowDetailTimingProps) {
     } else if (trace?.status === "not_ready") {
       lfMessage = t("console.timing_not_ready");
       showRefresh = true;
+    } else if (trace?.status === "incomplete") {
+      lfMessage = t("console.timing_incomplete");
+      showLangfuseLink = true;
     } else if (trace?.status === "unavailable") {
       lfMessage = t("console.timing_unavailable");
     } else {
@@ -118,6 +126,17 @@ export function RowDetailTiming(props: RowDetailTimingProps) {
                 >
                   {t("common.refresh")}
                 </Button>
+              )}
+              {showLangfuseLink && langfuseUrl !== null && (
+                <a
+                  data-testid="console-timing-langfuse"
+                  href={langfuseUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ marginLeft: 8 }}
+                >
+                  {t("console.timing_open_langfuse")} ↗
+                </a>
               )}
             </td>
           ) : (

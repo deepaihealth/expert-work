@@ -5,7 +5,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import "../../../i18n";
+import i18n from "../../../i18n";
 
 import type { RunTrace, TraceSpan } from "../../../api/trace_facade";
 import type { SpanMatch } from "../../../api/trace_match";
@@ -146,6 +146,73 @@ describe("RowDetailTiming", () => {
     );
     expect(screen.getByTestId("console-detail-timing").textContent).toContain("Trace unavailable");
     expect(screen.queryByTestId("console-timing-refresh")).not.toBeInTheDocument();
+  });
+
+  it("incomplete (B-201): 数据不完整 + 去 Langfuse 查看 link, no refresh; no link without a URL", () => {
+    const { rerender } = render(
+      <RowDetailTiming
+        row={thinkRow()}
+        match={{ span: null, reason: "no_trace" }}
+        trace={{ status: "incomplete" }}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        langfuseUrl="https://lf/trace/t1"
+      />,
+    );
+    expect(screen.getByTestId("console-detail-timing").textContent).toContain("Incomplete data");
+    const link = screen.getByTestId("console-timing-langfuse");
+    expect(link).toHaveAttribute("href", "https://lf/trace/t1");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link.textContent).toContain("View in Langfuse");
+    expect(screen.queryByTestId("console-timing-refresh")).not.toBeInTheDocument();
+
+    // Non-admins get no deep link (Langfuse has no tenant isolation) — the message alone.
+    rerender(
+      <RowDetailTiming
+        row={thinkRow()}
+        match={{ span: null, reason: "no_trace" }}
+        trace={{ status: "incomplete" }}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        langfuseUrl={null}
+      />,
+    );
+    expect(screen.getByTestId("console-detail-timing").textContent).toContain("Incomplete data");
+    expect(screen.queryByTestId("console-timing-langfuse")).not.toBeInTheDocument();
+
+    // The link belongs to `incomplete` only: `not_ready` keeps just its refresh button.
+    rerender(
+      <RowDetailTiming
+        row={thinkRow()}
+        match={{ span: null, reason: "no_trace" }}
+        trace={{ status: "not_ready" }}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        langfuseUrl="https://lf/trace/t1"
+      />,
+    );
+    expect(screen.queryByTestId("console-timing-langfuse")).not.toBeInTheDocument();
+  });
+
+  it("incomplete shows 数据不完整 / 去 Langfuse 查看 in zh-CN", async () => {
+    const before = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      render(
+        <RowDetailTiming
+          row={thinkRow()}
+          match={{ span: null, reason: "no_trace" }}
+          trace={{ status: "incomplete" }}
+          traceLoading={false}
+          onRefreshTrace={() => {}}
+          langfuseUrl="https://lf/trace/t1"
+        />,
+      );
+      expect(screen.getByTestId("console-detail-timing").textContent).toContain("数据不完整");
+      expect(screen.getByTestId("console-timing-langfuse").textContent).toContain("去 Langfuse 查看");
+    } finally {
+      await i18n.changeLanguage(before);
+    }
   });
 
   it("matched span with level=error renders the Langfuse column in danger colour with the status message", () => {

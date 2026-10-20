@@ -204,6 +204,7 @@ export function RecordDetails(props: RecordDetailsProps) {
             trace={trace}
             traceLoading={traceLoading}
             onRefreshTrace={onRefreshTrace}
+            langfuseUrl={langfuseUrl}
           />
         );
       case "raw":

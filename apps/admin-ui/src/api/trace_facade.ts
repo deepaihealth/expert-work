@@ -6,7 +6,9 @@
  */
 import { apiClient, withTenantScope, type TenantScope } from "./client";
 
-export type TraceStatus = "ok" | "not_ready" | "unavailable" | "no_trace";
+/** `incomplete` (B-201): the run ended over two minutes ago and its trace
+ *  still isn't a complete tree — the missing part won't arrive, stop polling. */
+export type TraceStatus = "ok" | "not_ready" | "incomplete" | "unavailable" | "no_trace";
 
 /** A single rendered chat message inside a structured trace I/O payload. */
 export type RenderedMessage = {

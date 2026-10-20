@@ -1399,6 +1399,8 @@ export interface TranslationKeys {
     timing_row_cost: string;
     timing_loading: string;
     timing_not_ready: string;
+    timing_incomplete: string;
+    timing_open_langfuse: string;
     timing_unavailable: string;
     timing_no_trace: string;
     timing_mismatch: string;
@@ -4820,6 +4822,8 @@ const en: TranslationKeys = {
     timing_row_cost: "Cost",
     timing_loading: "Loading…",
     timing_not_ready: "Langfuse still ingesting — retrying shortly",
+    timing_incomplete: "Incomplete data",
+    timing_open_langfuse: "View in Langfuse",
     timing_unavailable: "Trace unavailable",
     timing_no_trace: "No trace for this run",
     timing_mismatch: "Could not align with a span",

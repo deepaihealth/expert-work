@@ -132,6 +132,27 @@ describe("useRunTrace", () => {
     expect(getRunTraceMock).toHaveBeenCalledTimes(TRACE_NOT_READY_MAX_RETRIES + 1);
   });
 
+  it("does not poll an incomplete trace (B-201)", async () => {
+    getRunTraceMock.mockResolvedValue({ status: "incomplete" });
+
+    const { result } = renderHook(() =>
+      useRunTrace({
+        threadId: "th-1",
+        runId: "r1",
+        enabled: true,
+        turnStatus: "done",
+        wantTraceId: false,
+      }),
+    );
+    await flushMicrotasks();
+    expect(result.current.trace).toEqual({ status: "incomplete" });
+    const calls = getRunTraceMock.mock.calls.length;
+
+    await advanceOneRetry();
+    await advanceOneRetry();
+    expect(getRunTraceMock).toHaveBeenCalledTimes(calls);
+  });
+
   it("re-arms one fetch when the turn turns done", async () => {
     getRunTraceMock.mockResolvedValue(notReady);
 
