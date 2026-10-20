@@ -523,13 +523,11 @@ for special in sorted(_encoding.special_tokens_set):
 
 **已经入库的受影响文档不会自动重来**:发版后在控制台点「重新摄取」才能找回正文、去掉巨型标题;在那之前,重排靠截断兜底不再失败。
 
-- [ ] **36.1 切分与截断(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数和一个假的重排客户端:不连外网,不读写库。判据:输出 4 行,每行末尾都是 `True`。**没修好时**:`multiline` / `longline` 两行是 `False`,`rerank-cut` 一行是 `False`(`short-heading` 修好前后都是 `True`,它守的是正常标题不被误伤;B-199 起下划线式标题不再认,这里用 `#` 标题)。
+- [ ] **36.1 切分与截断(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数和送重排前的截断函数:不连外网,不读写库。判据:输出 4 行,每行末尾都是 `True`。**没修好时**:`multiline` / `longline` 两行是 `False`,`rerank-cut` 一行是 `FAIL ImportError`(B-200 起截断在调用方,`orchestrator.tools.knowledge.rerank_documents`)(`short-heading` 修好前后都是 `True`,它守的是正常标题不被误伤;B-199 起下划线式标题不再认,这里用 `#` 标题)。
 
 ```bash
 kubectl exec deploy/control-plane -- python -c '
-import asyncio, uuid
 from control_plane.knowledge.chunking import chunk_markdown
-from orchestrator.llm import DashScopeReranker
 def chunks(src):
     return chunk_markdown(src, max_tokens=512, overlap_tokens=0)
 c = chunks("Header:\nDate: 2026-09-18\nAttendees: Maya, Priya\n---\n[00:00] Maya: hi\n[00:16] Priya: hello\n----\n")
@@ -539,13 +537,11 @@ c = chunks("# " + line + "\n\nBody text.\n")
 print("longline", all(x.heading_path == () for x in c) and line in "\n".join(x.body for x in c))
 c = chunks("# Refunds\n\nRefund window is 14 days.\n")
 print("short-heading", [(x.heading_path, x.body) for x in c] == [(("Refunds",), "Refund window is 14 days.")])
-sent = []
-class Client:
-    async def rerank(self, *, model, query, documents, top_n):
-        sent.extend(documents)
-        return {"output": {"results": [{"index": 0}]}}
-asyncio.run(DashScopeReranker(client=Client(), model="m").rerank(query="q", documents=["x" * 40000], top_k=1, tenant_id=uuid.uuid4()))
-print("rerank-cut", len(sent[0]) <= 3000)
+try:
+    from orchestrator.tools.knowledge import rerank_documents
+    print("rerank-cut", len(rerank_documents(["x" * 40000])[0]) <= 3000)
+except Exception as exc:
+    print("rerank-cut", "FAIL", type(exc).__name__)
 '
 ```
 
@@ -583,3 +579,44 @@ except Exception as exc:
 ```
 
 - [ ] **37.2 真实入库**:本机生成两个文件:`printf '# 不是标题\n第一行\n---\n第二行\n' > b199-plain.txt`;`printf '# 概述\n# 细节\n\n正文写在这里。\n\n[参考]: https://example.com/b199\n' > b199-marked.md`。在测试环境新建一个知识库(名字如 `b199-probe`),上传这两个文件。判据:① 两个文档都变成「就绪」;② `b199-plain.txt` 的分段标题路径为空,正文里含 `# 不是标题` 和 `---`;③ `b199-marked.md` 的分段里能找到 `概述` 和 `https://example.com/b199`。**没修好时**:② `# 不是标题` 被当成标题、不在正文里;③ 找不到 `概述` 和这个网址。验完删掉这个知识库。
+
+## §38 B-200 每条送嵌入 / 重排的文本都有上限(ROADMAP B-200)
+
+**背景**:B-198 / B-199 的后续。三道上限:① 段长上限管住整段嵌入文本——文档标题、标题路径、重叠、正文加起来不超过上限(对齐 Onyx);标题路径太长先丢最外层;表格里一行就超上限的(单元格里塞了整段导出的聊天记录),这一行像正文一样切开、每块带表头,以前整行原样成一段。② 送嵌入前每条截到 8,000 字节(`EXPERT_WORK_EMBEDDING_MAX_INPUT_BYTES`):阿里云 text-embedding-v4 单条超过 16,000 token 时整次请求回 400,整篇入库失败;按字节截,因为别的分词器数出来的 token 管不住它的数(同样 8,000 个 o200k token 的印地文,它数出 2 万多),而每个 token 至少占一个字节。③ 送重排的每份候选截到 3,000 字,改在调用方截(知识检索、记忆召回),不管接的是哪家重排。
+
+**已入库的文档不会自动重来**:新规则下段的划分几乎全变(华大 74% 的段文本有变),点「重新摄取」的文档要重新嵌入、按量计费;不点就照旧。
+
+- [ ] **38.1 三道上限(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数、嵌入截断函数和读配置:不连外网,不读写库。判据:输出 4 行,每行末尾都是 `True`。**没修好时**:`title-in-cap` 是 `FAIL TypeError`,`table-row` 是 `False`,`embed-cap` 是 `FAIL ImportError`,`embed-setting` 是 `FAIL AttributeError`。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+from control_plane.knowledge.chunking import chunk_markdown, count_tokens
+from expert_work.protocol import chunk_retrieval_text
+def run(label, check):
+    try:
+        print(label, check())
+    except Exception as exc:
+        print(label, "FAIL", type(exc).__name__)
+def title_in_cap():
+    title = " ".join("title%d" % i for i in range(12))
+    body = " ".join("word%d." % i for i in range(400))
+    chunks = chunk_markdown(body, max_tokens=64, overlap_tokens=8, doc_title=title)
+    return max(count_tokens(chunk_retrieval_text(c.heading_path, c.body, title)) for c in chunks) <= 64 + 4
+def table_row():
+    record = " ".join("msg%d" % i for i in range(400))
+    chunks = chunk_markdown("| id | content |\n| - | - |\n| 1 | " + record + " |\n", max_tokens=64, overlap_tokens=0)
+    return max(count_tokens(c.text) for c in chunks) <= 64
+def embed_cap():
+    from orchestrator.llm.embedder import fit_embedding_input
+    return len(fit_embedding_input("ध" * 4000, 8000).encode()) <= 8000
+def embed_setting():
+    from control_plane.settings import Settings
+    return Settings().embedding_max_input_bytes == 8000
+run("title-in-cap", title_in_cap)
+run("table-row", table_row)
+run("embed-cap", embed_cap)
+run("embed-setting", embed_setting)
+'
+```
+
+- [ ] **38.2 真实入库**:本机生成一个表格单元格特别长的文件(约 52KB 印地文,最后一格末尾是标记词):`python3 -c 'open("b200-wide-row.md", "w", encoding="utf-8").write("| id | content |\n| - | - |\n| 1 | " + "धनवापसी की अवधि चौदह दिन है। " * 700 + "refund-marker-b200 |\n")'`。在测试环境新建一个知识库(名字如 `b200-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund-marker-b200`,结果里有这篇文档的段,正文含 `refund-marker-b200`。**没修好时**:① 文档「失败」,错误信息里有 `Range of input length should be [1, 16000]`(本机用修复前代码 + 真实嵌入接口跑过,正是这样失败;修复后入库成功、最长一段 503 token)。验完删掉这个知识库。
