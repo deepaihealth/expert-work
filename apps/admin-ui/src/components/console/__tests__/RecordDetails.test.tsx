@@ -10,7 +10,7 @@ import { App } from "antd";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import "../../../i18n";
+import i18n from "../../../i18n";
 
 import type { AgentToolSchema } from "../../../api/agents";
 import type { SseEvent } from "../../../api/sessions";
@@ -406,6 +406,78 @@ describe("RecordDetails", () => {
     expect(button.textContent).not.toContain("#23");
     await userEvent.click(button);
     expect(props.onOpenRequest).toHaveBeenCalledWith(23);
+  });
+
+  it("B-203 — 工具「结果」tab:结果直接摊开,不再重复「载荷」里的入参", () => {
+    renderRecord({ record: rec(toolRow()), activeTab: "result" });
+    const result = screen.getByTestId("console-detail-result");
+    // 原来卡片折叠着(Collapse 收起时面板内容不挂载),结果要再点一下才出来。
+    expect(within(result).getByText("3 条记录")).toBeInTheDocument();
+    expect(within(result).queryByText("Arguments")).not.toBeInTheDocument();
+    expect(within(result).queryByText(/"id": "C-1"/)).not.toBeInTheDocument();
+  });
+
+  it("B-203 — 概要的「结果」分节同样直接给出结果", () => {
+    renderRecord({ record: rec(toolRow()) });
+    const section = screen.getByTestId("console-detail-section-result");
+    expect(within(section).getByText("3 条记录")).toBeInTheDocument();
+    expect(within(section).queryByText("Arguments")).not.toBeInTheDocument();
+  });
+
+  it("B-203 — 计时 tab 的开始时刻用账本给这条记录排出的起点", () => {
+    function clock(ms: number): string {
+      const d = new Date(ms);
+      const pad = (n: number, len = 2): string => String(n).padStart(len, "0");
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+    }
+    renderRecord({ record: rec(toolRow(), { startedAt: BASE - 5_000 }), activeTab: "timing" });
+    const tr = screen.getByText("Started at").closest("tr");
+    expect(tr?.querySelector("td")?.textContent).toBe(clock(BASE - 5_000));
+  });
+
+  it("B-203 — USER / SYSTEM 记录的概要不写「时长」(它们不是一步,原来恒为 0ms)", () => {
+    const user = renderRecord({ record: rec(userRow(), { startedAt: BASE, endedAt: BASE }) });
+    const summaryOf = () => screen.getByTestId("console-detail-summary");
+    expect(within(summaryOf()).queryByText("Duration")).not.toBeInTheDocument();
+    user.unmount();
+    const system = renderRecord({ record: rec(systemRow("你是评审员"), { startedAt: BASE, endedAt: BASE }) });
+    expect(within(summaryOf()).queryByText("Duration")).not.toBeInTheDocument();
+    system.unmount();
+    // 一步一条的记录照旧有。
+    renderRecord({ record: rec(toolRow()) });
+    expect(within(summaryOf()).getByText("Duration").nextSibling?.textContent).toBe("1.2s");
+  });
+
+  it("B-203 — 概要里的 token 数带千分位(与轮脚同一写法)", () => {
+    renderRecord({
+      record: rec(
+        assistantRow({ inputTokens: 57_803, outputTokens: 2_364, reasoningTokens: 1_024, cacheReadTokens: 51_200 }),
+      ),
+    });
+    const summary = screen.getByTestId("console-detail-summary");
+    const valueOf = (label: string) => within(summary).getByText(label).nextSibling?.textContent;
+    expect(valueOf("Input")).toBe("57,803");
+    expect(valueOf("Output")).toBe("2,364");
+    expect(valueOf("Reasoning")).toBe("1,024");
+    expect(valueOf("Cache read")).toBe("51,200");
+  });
+
+  it("B-203 — 中文界面的层级链接是中文(与 ASSISTANT / TOOL 类型标签对得上)", async () => {
+    const prior = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      const assistant = rec(assistantRow());
+      const first = renderRecord({ record: rec(toolRow(), { parentId: assistant.id }), parent: assistant });
+      expect(screen.getByTestId("console-detail-hier-assistant").textContent).toContain(
+        "模型调用（ASSISTANT）",
+      );
+      first.unmount();
+      const tool = rec(toolRow());
+      renderRecord({ record: rec(subagentRow(), { parentId: tool.id }), parent: tool });
+      expect(screen.getByTestId("console-detail-hier-tool").textContent).toContain("工具调用（TOOL）");
+    } finally {
+      await i18n.changeLanguage(prior);
+    }
   });
 
   it("层级:tool / memory 写回 + parent → 「Assistant Message ›」抛 onOpenRecord", async () => {

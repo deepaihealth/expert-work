@@ -16,7 +16,7 @@
  * mismatch, failed lookup, cross-tenant drill-in) the page degrades to the
  * flat M1.5 message block it has always rendered.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -59,6 +59,7 @@ import { Transcript } from "../components/console/Transcript";
 import { TrajectoryView } from "../components/console/TrajectoryView";
 import type { ConsoleTurn, TurnTiming } from "../components/console/types";
 import type { FocusRequest } from "../components/console/use_trajectory_state";
+import { TRAJECTORY_BOX_STYLE } from "../components/console/trajectory_box";
 import { ViewPane, type ConsoleView } from "../components/console/ViewPane";
 import { readModel } from "../components/manifest-editor/form_model";
 import { CommentarySegmentLine } from "../components/turn/CommentarySegmentLine";
@@ -91,18 +92,6 @@ const EMPTY_TASK_RESULTS: readonly FireNowResult[] = [];
 const EMPTY_FLAT_HISTORY: readonly HistoryMessage[] = [];
 const EMPTY_LIVE_TURNS: readonly Turn[] = [];
 const EMPTY_TIMINGS: Readonly<Record<string, TurnTiming>> = {};
-// B-202 —— 轨迹视图要一个定高的外框:账本(`.ew-ledger`)和详情面板都按「父级
-// 高度有界」写,只在框内滚动(`trajectory_view.css`)。调试台的 `.ew-console`
-// 给了这个框;本页原来直接放在 Card 里,账本有多长整页就多高,点账本下面的行时
-// 详情面板停在页面顶上、在视口之外。框高 = 视口高减 64px(Shell 的 Content 上下
-// 各 24px 留白 + Card 内边距的余量),不高于视口:滚到框露全时,账本和面板同时
-// 都在视口里。
-const TRAJECTORY_BOX_STYLE: CSSProperties = {
-  display: "flex",
-  flexDirection: "column",
-  height: "calc(100dvh - 64px)",
-  minHeight: 480,
-};
 export function ConversationDetail() {
   const { t } = useTranslation();
   const location = useLocation();

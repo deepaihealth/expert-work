@@ -1395,11 +1395,14 @@ export interface TranslationKeys {
     detail_none: string;
     timing_col_sse: string;
     timing_col_langfuse: string;
+    timing_row_start_at: string;
     timing_row_end: string;
     timing_row_start: string;
+    timing_row_end_rel: string;
     timing_row_latency: string;
     timing_row_model: string;
     timing_row_tokens: string;
+    timing_row_vision_tokens: string;
     timing_row_cost: string;
     timing_loading: string;
     timing_not_ready: string;
@@ -4822,11 +4825,14 @@ const en: TranslationKeys = {
     detail_none: "—",
     timing_col_sse: "SSE timestamps",
     timing_col_langfuse: "Langfuse (exact)",
+    timing_row_start_at: "Started at",
     timing_row_end: "Ended at",
     timing_row_start: "Start (from trace start)",
+    timing_row_end_rel: "End (from trace start)",
     timing_row_latency: "Latency",
     timing_row_model: "Model",
-    timing_row_tokens: "tokens",
+    timing_row_tokens: "Tokens (in / out)",
+    timing_row_vision_tokens: "Vision model tokens (in / out)",
     timing_row_cost: "Cost",
     timing_loading: "Loading…",
     timing_not_ready: "Langfuse still ingesting — retrying shortly",

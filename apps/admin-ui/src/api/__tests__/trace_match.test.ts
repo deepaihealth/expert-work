@@ -40,6 +40,31 @@ describe("matchTraceSpans", () => {
     expect(m.get("tool:0:1")?.span?.id).toBe("t2");
     expect(m.get("tool:1:0")).toEqual({ span: null, reason: "count_mismatch" });
   });
+  // B-203 —— 门面(`control_plane/api/trace_facade.py` `_classify`)给每个工具 span 的
+  // label 都是「工具调用」,工具名在 `detail`(span 属性 `tool`,即模型调用时的原名,
+  // MCP 工具带 `mcp__server__` 前缀)。原来按 label 配,工具行永远 count_mismatch。
+  it("B-203 — tool rows pair with the facade's tool spans by detail (the raw tool name), not the generic label", () => {
+    const mcp: TrajectoryRow = {
+      ...base, id: "tool:1:0", kind: "tool",
+      entry: { id: "tool:1:0", rawName: "mcp__crm__lookup", isMcp: true, server: "crm", toolName: "lookup", args: {}, status: "success", resultPreview: null, durationMs: 1 },
+    };
+    const plan: TrajectoryRow = { ...base, id: "plan:2", seq: 2, kind: "plan", source: "update_plan", callId: "call-1", plannerSeq: null, stepsTotal: 2, goal: null, reason: null, plan: null };
+    const rows = [tool("tool:0:0", "query_crm"), tool("tool:0:1", "query_crm"), mcp, plan];
+    const m = matchTraceSpans(
+      rows,
+      okTrace([
+        span({ id: "t1", kind: "tool", label: "工具调用", detail: "query_crm" }),
+        span({ id: "t2", kind: "tool", label: "工具调用", detail: "query_crm" }),
+        span({ id: "t3", kind: "tool", label: "工具调用", detail: "mcp__crm__lookup" }),
+        span({ id: "t4", kind: "tool", label: "工具调用", detail: "update_plan" }),
+      ]),
+    );
+    expect(m.get("tool:0:0")).toMatchObject({ reason: "matched", span: { id: "t1" } });
+    expect(m.get("tool:0:1")).toMatchObject({ reason: "matched", span: { id: "t2" } });
+    expect(m.get("tool:1:0")).toMatchObject({ reason: "matched", span: { id: "t3" } });
+    expect(m.get("plan:2")).toMatchObject({ reason: "matched", span: { id: "t4" } });
+  });
+
   it("aux rows pair by purpose; user/assistant/markers are unsupported", () => {
     const rows: TrajectoryRow[] = [
       { ...base, id: "user", seq: -1, kind: "user", text: "q", attachmentNames: [], inputs: {} },

@@ -49,6 +49,7 @@ import { useAuth } from "../auth/AuthContext";
 import { PageHeader } from "../components/PageHeader";
 import { buildConsoleTurns } from "../components/console/console_turns";
 import { PlanCard } from "../components/console/PlanCard";
+import { TRAJECTORY_BOX_STYLE } from "../components/console/trajectory_box";
 import { TrajectoryView } from "../components/console/TrajectoryView";
 import type { ConsoleTurn, TurnTiming } from "../components/console/types";
 import { usePlanCard } from "../components/console/usePlanCard";
@@ -418,18 +419,22 @@ export function RunDetail() {
             <Empty description={t("run_detail.trajectory_pairing_failed")} />
           </Card>
         ) : (
-          <TrajectoryView
-            turns={trajectoryTurns}
-            threadId={threadId}
-            agentName={agentName}
-            agentVersion={agentVersion}
-            streamTurnKey={null}
-            liveByStep={NO_LIVE_BY_STEP}
-            running={running}
-            isSystemAdmin={isSystemAdmin}
-            focusRequest={null}
-            onEnsureLoaded={handleEnsureLoaded}
-          />
+          // B-203 ⑦ —— 与对话详情页同一个定高外框(B-202 ②):账本在框内滚动,
+          // 点下面的行时详情面板还在视口里。
+          <div style={TRAJECTORY_BOX_STYLE} data-testid="run-detail-trajectory-box">
+            <TrajectoryView
+              turns={trajectoryTurns}
+              threadId={threadId}
+              agentName={agentName}
+              agentVersion={agentVersion}
+              streamTurnKey={null}
+              liveByStep={NO_LIVE_BY_STEP}
+              running={running}
+              isSystemAdmin={isSystemAdmin}
+              focusRequest={null}
+              onEnsureLoaded={handleEnsureLoaded}
+            />
+          </div>
         )}
       </div>
     </div>

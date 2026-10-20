@@ -29,6 +29,7 @@ import { FullTextModal, type FullTextState } from "../turn/FullTextModal";
 import { DetailRow, DetailsFrame, HierLink } from "./DetailsFrame";
 import { DetailSection } from "./DetailSection";
 import { kindLabel } from "./kind_label";
+import { CONTEXT_KINDS } from "./ledger_collapse";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import {
   AssistantPreview,
@@ -179,6 +180,7 @@ export function RecordDetails(props: RecordDetailsProps) {
             onRefreshTrace={onRefreshTrace}
             langfuseUrl={langfuseUrl}
             rateBook={rateBook}
+            startedAtMs={record.startedAt}
           />
         );
       case "raw":
@@ -240,22 +242,31 @@ export function RecordDetails(props: RecordDetailsProps) {
         <DetailRow label={t("console.detail_status")}>
           {t(`console.traj_status_${row.status}`)}
         </DetailRow>
-        <DetailRow label={t("console.detail_duration")}>
-          {durationMs !== null ? fmtDuration(durationMs) : dash}
-        </DetailRow>
+        {/* B-203 —— USER / SYSTEM 是上下文,不是一步:它们的时序钉在轮的创建时刻,
+            「时长」恒为 0ms,写出来只是噪音。 */}
+        {!CONTEXT_KINDS.has(record.kind) && (
+          <DetailRow label={t("console.detail_duration")}>
+            {durationMs !== null ? fmtDuration(durationMs) : dash}
+          </DetailRow>
+        )}
+        {/* B-203 —— token 数带千分位,与轮脚「1,119,191 tok」同一写法。 */}
         {row.kind === "assistant" && (
           <>
             <DetailRow label={t("console.detail_model")}>{row.model ?? dash}</DetailRow>
-            <DetailRow label={t("console.detail_usage_input")}>{row.inputTokens}</DetailRow>
-            <DetailRow label={t("console.detail_usage_output")}>{row.outputTokens}</DetailRow>
+            <DetailRow label={t("console.detail_usage_input")}>
+              {row.inputTokens.toLocaleString()}
+            </DetailRow>
+            <DetailRow label={t("console.detail_usage_output")}>
+              {row.outputTokens.toLocaleString()}
+            </DetailRow>
             {row.reasoningTokens !== undefined && (
               <DetailRow label={t("console.detail_usage_reasoning")}>
-                {row.reasoningTokens}
+                {row.reasoningTokens.toLocaleString()}
               </DetailRow>
             )}
             {row.cacheReadTokens !== undefined && (
               <DetailRow label={t("console.detail_usage_cache_read")}>
-                {row.cacheReadTokens}
+                {row.cacheReadTokens.toLocaleString()}
               </DetailRow>
             )}
           </>

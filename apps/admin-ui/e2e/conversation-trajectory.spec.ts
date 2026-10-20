@@ -1,5 +1,5 @@
 /**
- * Conversation detail — trajectory layout E2E (B-202).
+ * Conversation / run detail — trajectory layout E2E (B-202, B-203).
  *
  * ② The ledger and the details panel are written for a bounded parent: the
  *   debug console's grid gives them one, the conversation page did not, so a
@@ -9,6 +9,8 @@
  * ③ The 概要 preview is cut at a fixed height; it must say so (「查看全文」)
  *   and never stop inside a table (the bug left a header row and blank
  *   space). Also real layout.
+ * ⑦ (B-203) The run detail page renders the same TrajectoryView and had
+ *   the same unbounded layout.
  *
  * Every request the page makes is stubbed: the conversation, its paired
  * messages / runs, and one run's SSE replay (31 model calls, 30 tool calls).
@@ -94,7 +96,8 @@ function sseBody(): string {
 
 const ok = (data: unknown) => ({ success: true, error: null, data });
 
-async function openConversation(page: Page): Promise<void> {
+/** Every API the two pages read for this thread, stubbed. */
+async function stubThread(page: Page): Promise<void> {
   await page.route(`**/v1/conversations/${THREAD}`, async (route: Route) => {
     await route.fulfill({
       json: ok({
@@ -175,7 +178,9 @@ async function openConversation(page: Page): Promise<void> {
       await route.fulfill({ json: { status: "no_trace" } });
     },
   );
+}
 
+async function login(page: Page): Promise<void> {
   await page.goto("/login");
   await expect(page.getByTestId("login-card")).toBeVisible();
   const tokenField = page.getByTestId("login-token");
@@ -185,34 +190,88 @@ async function openConversation(page: Page): Promise<void> {
   await tokenField.fill(SAMPLE_JWT);
   await page.getByTestId("login-submit").click();
   await expect(page).toHaveURL(/\/agents$/);
+}
+
+/** The replay landed (not just the unreplayed placeholder): a replayed tool
+ *  call is in the ledger. Which one is rendered depends on where the
+ *  (virtualized) ledger starts: the conversation page tails to the latest
+ *  record, the run detail page starts at the top. */
+async function waitForReplay(page: Page, toolArg: string): Promise<void> {
+  await expect(
+    page.getByTestId("console-traj-row").filter({ hasText: toolArg }),
+  ).toHaveCount(1);
+}
+
+async function openConversation(page: Page): Promise<void> {
+  await stubThread(page);
+  await login(page);
   await page.goto(`/conversations/${THREAD}`);
   await page.getByTestId("console-view-tab-trajectory").click();
-  // The replay landed (not just the unreplayed placeholder): the last tool
-  // call is in the ledger.
-  await expect(
-    page.getByTestId("console-traj-row").filter({ hasText: "query 30" }),
-  ).toHaveCount(1);
+  await waitForReplay(page, "query 30");
+}
+
+/** B-203 ⑦ — the run detail page renders the same TrajectoryView. */
+async function openRunDetail(page: Page): Promise<void> {
+  await stubThread(page);
+  await page.route(
+    (url) => url.pathname === `/v1/sessions/${THREAD}/runs/${RUN}`,
+    async (route: Route) => {
+      await route.fulfill({
+        json: { run_id: RUN, thread_id: THREAD, status: "success", trace_id: null, pending_approval: null },
+      });
+    },
+  );
+  await page.route(
+    (url) => url.pathname === `/v1/sessions/${THREAD}/plan`,
+    async (route: Route) => {
+      await route.fulfill({ status: 204, body: "" });
+    },
+  );
+  await login(page);
+  await page.goto(`/runs/${THREAD}/${RUN}`);
+  await waitForReplay(page, `"query 1"`);
+}
+
+/** Click the last ledger row; the details panel's header and tabs must stay
+ *  fully in the viewport, and the box holding the ledger must not be taller
+ *  than the viewport. */
+async function expectPanelInViewAfterBottomClick(page: Page, boxTestId: string): Promise<void> {
+  // Wheel over the ledger to its end: with a bounded box the ledger scrolls
+  // itself; without one the wheel scrolls the page and every row is in the
+  // DOM anyway.
+  await page.getByTestId("console-traj-ledger").hover();
+  await page.mouse.wheel(0, 20_000);
+  // Pin the row by its record id: the virtualized ledger re-renders its
+  // window as it scrolls, so `.last()` may point elsewhere after the click.
+  const recordId = await page.getByTestId("console-traj-row").last().getAttribute("data-record-id");
+  expect(recordId).not.toBeNull();
+  const row = page.locator(`[data-testid="console-traj-row"][data-record-id="${recordId}"]`);
+  await row.click();
+  await expect(row).toHaveAttribute("data-selected", "true");
+  await expect(page.getByTestId("console-detail-header")).toBeInViewport({ ratio: 1 });
+  await expect(page.getByTestId("console-detail-tab-summary")).toBeInViewport({ ratio: 1 });
+  const box = await page.getByTestId(boxTestId).boundingBox();
+  const viewport = page.viewportSize();
+  expect(box).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  expect(box!.height).toBeLessThanOrEqual(viewport!.height);
 }
 
 test("② a long trajectory: clicking a row near the bottom keeps the details panel in view", async ({
   page,
 }) => {
   await openConversation(page);
-  const rows = page.getByTestId("console-traj-row");
   // user + 31 assistant + 30 tool records — far taller than the viewport.
-  const last = rows.last();
-  await last.click();
-  await expect(last).toHaveAttribute("data-selected", "true");
   // Header and tab bar sit at the panel's top: with the page-height ledger
   // they were scrolled out of view, with the bounded box they stay in it.
-  await expect(page.getByTestId("console-detail-header")).toBeInViewport({ ratio: 1 });
-  await expect(page.getByTestId("console-detail-tab-summary")).toBeInViewport({ ratio: 1 });
-  // …and the ledger scrolls inside its own box instead of growing the page.
-  const box = await page.getByTestId("conversation-trajectory-box").boundingBox();
-  const viewport = page.viewportSize();
-  expect(box).not.toBeNull();
-  expect(viewport).not.toBeNull();
-  expect(box!.height).toBeLessThanOrEqual(viewport!.height);
+  await expectPanelInViewAfterBottomClick(page, "conversation-trajectory-box");
+});
+
+test("⑦ (B-203) the run detail page: same long trajectory, the details panel stays in view", async ({
+  page,
+}) => {
+  await openRunDetail(page);
+  await expectPanelInViewAfterBottomClick(page, "run-detail-trajectory-box");
 });
 
 test("③ the summary preview of a long answer says it is cut and never stops inside the table", async ({
