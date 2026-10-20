@@ -1388,6 +1388,9 @@ export interface TranslationKeys {
     detail_worker_steps: string;
     detail_need_langfuse: string;
     detail_no_frames: string;
+    raw_time_server_hint: string;
+    raw_time_received: string;
+    raw_time_received_hint: string;
     detail_none: string;
     timing_col_sse: string;
     timing_col_langfuse: string;
@@ -4811,6 +4814,9 @@ const en: TranslationKeys = {
     detail_worker_steps: "Sub-agent steps",
     detail_need_langfuse: "LLM input is only available from the Langfuse trace; no span matched this row yet.",
     detail_no_frames: "No raw frames for this row.",
+    raw_time_server_hint: "When the server recorded this frame",
+    raw_time_received: "received {{time}}",
+    raw_time_received_hint: "This frame carries no server time; this is when the browser received it (for a replayed run, the moment of replay)",
     detail_none: "—",
     timing_col_sse: "SSE timestamps",
     timing_col_langfuse: "Langfuse (exact)",

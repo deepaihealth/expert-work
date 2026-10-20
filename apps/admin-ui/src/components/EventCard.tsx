@@ -3,12 +3,16 @@
  * ``RecordDetails`` "原始" tab (one card per frame). Originally a Batch 1
  * merge of two near-duplicate copies in RunDetail's EventStreamPanel and
  * the agent Playground (both retired by PR-B). Shows the event tag, the
- * received-at timestamp (when present) and the frame's ``id`` (when
- * non-null), plus the raw payload with a copy affordance.
+ * time the server recorded the frame (the ``{server_ms}-{seq}`` id's ms
+ * segment; frames without such an id fall back to the labelled client
+ * receive time), the frame's ``id`` (when non-null), plus the raw payload
+ * with a copy affordance.
  */
 import { Tag, Typography } from "antd";
+import { useTranslation } from "react-i18next";
 
 import type { SseEvent } from "../api/sessions";
+import { serverMsOf } from "../api/sse_id";
 import { CopyButton } from "./CopyButton";
 
 const { Text } = Typography;
@@ -27,7 +31,13 @@ const EVENT_COLOR: Record<string, string> = {
 };
 
 export function EventCard({ evt }: { evt: SseEvent }) {
+  const { t } = useTranslation();
   const tagColor = EVENT_COLOR[evt.event] ?? "default";
+  // B-202 —— 显示事件发生(服务器落这一帧)的时刻,取帧 id 的毫秒段。`receivedAt`
+  // 是浏览器收到的时刻:回放历史 run 时就是点开的那一刻(会话 0e878fd6:事件
+  // 15:34:40,原来显示 15:55:24)。没带合法 id 的帧(`end` / `token` / `gap`…)
+  // 只剩收到时刻,标明「收到」,不冒充事件时刻。
+  const serverMs = serverMsOf(evt.id);
   const display = typeof evt.data === "string" ? evt.data : JSON.stringify(evt.data, null, 2);
   return (
     <div
@@ -51,10 +61,28 @@ export function EventCard({ evt }: { evt: SseEvent }) {
         <Tag color={tagColor} bordered={false} style={{ margin: 0 }}>
           {evt.event}
         </Tag>
-        {evt.receivedAt && (
-          <Text type="secondary" style={{ fontSize: 11 }} className="mono">
-            {new Date(evt.receivedAt).toLocaleTimeString()}
+        {serverMs !== null ? (
+          <Text
+            type="secondary"
+            style={{ fontSize: 11 }}
+            className="mono"
+            data-testid="event-card-time"
+            title={t("console.raw_time_server_hint")}
+          >
+            {new Date(serverMs).toLocaleTimeString()}
           </Text>
+        ) : (
+          evt.receivedAt && (
+            <Text
+              type="secondary"
+              style={{ fontSize: 11 }}
+              className="mono"
+              data-testid="event-card-time"
+              title={t("console.raw_time_received_hint")}
+            >
+              {t("console.raw_time_received", { time: new Date(evt.receivedAt).toLocaleTimeString() })}
+            </Text>
+          )
         )}
         {evt.id !== null && (
           <Text type="secondary" style={{ fontSize: 11 }} className="mono">
