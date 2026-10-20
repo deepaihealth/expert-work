@@ -244,7 +244,7 @@
   font-weight: 600;
 }
 
-/* 分节预览 —— 标题按钮跳 tab,内容 120px 封顶 + 底部渐隐 */
+/* 分节预览 —— 标题按钮跳 tab,内容 180px 封顶;真被裁了才渐隐 + 「查看全文」 */
 .ew-detail__sections {
   display: flex;
   flex-direction: column;
@@ -300,7 +300,9 @@
   pointer-events: none;
 }
 
-.ew-detail__preview::after {
+/* B-202 —— 渐隐只在真被裁时出(`DetailSection` 量出来写 `data-truncated`):
+   原来常驻,短内容的最后一行也被盖成半透明,真被裁的却没有任何别的提示。 */
+.ew-detail__preview[data-truncated="true"]::after {
   position: absolute;
   right: 0;
   bottom: 0;
@@ -309,4 +311,26 @@
   background: linear-gradient(to bottom, transparent, var(--ew-surface-base));
   content: "";
   pointer-events: none;
+}
+
+/* 预览被裁时的「查看全文」—— 在预览区外(预览区关了指针事件),跳到对应 tab。 */
+.ew-detail__preview-more {
+  align-self: flex-start;
+  margin: 2px 14px 0;
+  padding: 0;
+  border: 0;
+  color: var(--ew-text-link);
+  background: transparent;
+  cursor: pointer;
+  font-size: var(--ew-font-size-xs);
+}
+
+.ew-detail__preview-more:hover {
+  color: var(--ew-text-link-hover);
+  text-decoration: underline;
+}
+
+.ew-detail__preview-more:focus-visible {
+  outline: 1px solid var(--ew-border-focus);
+  outline-offset: 1px;
 }

@@ -15,7 +15,6 @@
  */
 import { useState, type ReactNode } from "react";
 import { Typography } from "antd";
-import { ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
@@ -28,6 +27,7 @@ import { fmtDuration } from "../../pages/agent_detail/playground/duration_format
 import { EventCard } from "../EventCard";
 import { FullTextModal, type FullTextState } from "../turn/FullTextModal";
 import { DetailRow, DetailsFrame, HierLink } from "./DetailsFrame";
+import { DetailSection } from "./DetailSection";
 import { kindLabel } from "./kind_label";
 import type { LedgerRecord, LedgerRequest } from "./ledger_types";
 import {
@@ -123,36 +123,6 @@ export interface RecordDetailsProps {
 function asTextRow(record: LedgerRecord): UserRow | AssistantRow | null {
   const row = record.row;
   return row.kind === "user" || row.kind === "assistant" ? row : null;
-}
-
-function DetailSection({
-  tab,
-  label,
-  onOpen,
-  children,
-}: {
-  tab: RecordTab;
-  label: string;
-  onOpen: () => void;
-  children: ReactNode;
-}) {
-  const { t } = useTranslation();
-  return (
-    <section className="ew-detail__section" data-testid={`console-detail-section-${tab}`}>
-      <h3 className="ew-detail__section-h">
-        <button
-          type="button"
-          className="ew-detail__section-btn"
-          aria-label={t("console.detail_open_tab", { tab: label })}
-          onClick={onOpen}
-        >
-          <span>{label}</span>
-          <ChevronRight size={12} strokeWidth={1.75} aria-hidden />
-        </button>
-      </h3>
-      <div className="ew-detail__preview">{children}</div>
-    </section>
-  );
 }
 
 export function RecordDetails(props: RecordDetailsProps) {
