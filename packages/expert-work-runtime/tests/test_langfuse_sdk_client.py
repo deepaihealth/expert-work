@@ -636,3 +636,26 @@ def test_export_filter_adds_our_tracer_and_keeps_the_sdk_default() -> None:
     assert should_export_span(_span_from("some.http.client", {"gen_ai.system": "openai"}))
     # Still a filter: an unrelated library's spans stay out of Langfuse.
     assert not should_export_span(_span_from("sqlalchemy"))
+
+
+@pytest.mark.parametrize(
+    ("method", "exported"),
+    [
+        # The console polls with GETs (~65k a day on the test env against ~600
+        # runs); none of them starts a run, so their request spans would only
+        # add single-span traces.
+        ("GET", False),
+        ("HEAD", False),
+        ("OPTIONS", False),
+        # Inline runs start under a POST request span — it is the run tree's root.
+        ("POST", True),
+        ("PATCH", True),
+        # Run / node / tool spans carry no http.method.
+        (None, True),
+    ],
+)
+def test_export_filter_drops_read_only_request_spans(method: str | None, exported: bool) -> None:
+    from expert_work.common.observability import TRACER_NAME
+
+    attributes = None if method is None else {"http.method": method, "http.target": "/v1/x"}
+    assert should_export_span(_span_from(TRACER_NAME, attributes)) is exported

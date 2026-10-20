@@ -202,6 +202,14 @@ def build_langfuse_span_exporter(
     )
 
 
+#: HTTP methods whose request spans stay out of Langfuse (B-201). A read-only
+#: request never starts a run — inline runs start under a POST, queued runs root
+#: at ``control_plane.queued_run`` in a trace of their own — so its request span
+#: would only be a single-span trace; on the test env that is ~65k console
+#: polls a day against ~600 runs.
+_UNEXPORTED_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
 def should_export_span(span: ReadableSpan) -> bool:
     """Which spans the Langfuse span processor ships — B-201.
 
@@ -210,13 +218,15 @@ def should_export_span(span: ReadableSpan) -> bool:
     scopes; our ``expert-work`` tracer is none of those. On the default every
     request / run / node / tool span was dropped while the generations under
     them were kept, so each observation in Langfuse pointed at a parent that
-    never arrived. Ours are added on top of the default, nothing else.
+    never arrived. Ours are added on top of the default, except the request
+    spans of read-only methods (:data:`_UNEXPORTED_HTTP_METHODS`).
     """
     from langfuse.span_filter import is_default_export_span
 
     scope = span.instrumentation_scope
     if scope is not None and scope.name == TRACER_NAME:
-        return True
+        method = (span.attributes or {}).get("http.method")
+        return method not in _UNEXPORTED_HTTP_METHODS
     return is_default_export_span(span)
 
 
