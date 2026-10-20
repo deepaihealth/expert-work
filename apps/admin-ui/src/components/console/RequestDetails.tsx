@@ -14,6 +14,7 @@ import { Typography } from "antd";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
+import type { RateBook } from "../../api/cost";
 import type { RunTrace } from "../../api/trace_facade";
 import type { SpanMatch } from "../../api/trace_match";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
@@ -43,6 +44,8 @@ export interface RequestDetailsProps {
   traceLoading: boolean;
   onRefreshTrace: () => void;
   onOpenRecord: (id: string) => void;
+  /** B-202 —— 透传给「计时」tab 的成本行(平台价目表);省略 = 不算成本。 */
+  rateBook?: RateBook | null;
   activeTab: RequestTab;
   onTabChange: (t: RequestTab) => void;
   onClose: () => void;
@@ -72,7 +75,7 @@ function UsagePanel({ request }: { request: LedgerRequest }) {
 
 export function RequestDetails(props: RequestDetailsProps) {
   const { request, record, threadId, isSystemAdmin, langfuseUrl } = props;
-  const { match, trace, traceLoading, onRefreshTrace, onOpenRecord, activeTab } = props;
+  const { match, trace, traceLoading, onRefreshTrace, onOpenRecord, activeTab, rateBook = null } = props;
   const { t } = useTranslation();
   const dash = t("console.detail_none");
   const io = match.reason === "matched" ? (match.span?.input ?? null) : null;
@@ -142,6 +145,7 @@ export function RequestDetails(props: RequestDetailsProps) {
         traceLoading={traceLoading}
         onRefreshTrace={onRefreshTrace}
         langfuseUrl={langfuseUrl}
+        rateBook={rateBook}
       />
     );
   }

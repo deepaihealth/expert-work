@@ -15,7 +15,7 @@
  * bit-identical number.
  */
 import type { RateCardRecord } from "./rate_card";
-import type { UsageBucket } from "./turn_summary";
+import type { TurnUsage, UsageBucket } from "./turn_summary";
 
 /** Rate cards a session has on hand, keyed by {@link rateKey}. */
 export interface RateBook {
@@ -81,4 +81,23 @@ export function costCnyOfBuckets(
       t.output * rate.output_per_mtok_micros;
   }
   return micros / 1e12;
+}
+
+/** One main-line model call's cost (B-202 — the trajectory 「计时」 tab prices
+ *  each ASSISTANT step). Main-line usage carries no model attribution, so it
+ *  prices exactly like the turn total does: one unattributed bucket at the
+ *  agent's own card. ``null`` without a book / card. */
+export function costCnyOfMainLineCall(
+  tokens: { input: number; output: number; cacheRead: number },
+  book: RateBook | null,
+): number | null {
+  const usage: TurnUsage = {
+    inputTokens: tokens.input,
+    outputTokens: tokens.output,
+    totalTokens: tokens.input + tokens.output,
+    cacheReadTokens: tokens.cacheRead,
+    cacheCreationTokens: 0,
+    reasoningTokens: 0,
+  };
+  return costCnyOfBuckets([{ provider: null, model: null, usage }], book);
 }

@@ -17,6 +17,7 @@ import { useEffect, useMemo, useRef, useState, type JSX, type KeyboardEvent } fr
 import { Empty } from "antd";
 import { useTranslation } from "react-i18next";
 
+import type { RateBook } from "../../api/cost";
 import { matchTraceSpans, type SpanMatch } from "../../api/trace_match";
 import type { FireNowResult } from "../../api/triggers";
 import { buildLangfuseTraceUrl } from "../../config/env";
@@ -65,6 +66,9 @@ export interface TrajectoryViewProps {
    *  ToolCallCard,``true`` 时「立即触发」整卡不渲染。Default false —
    *  PlaygroundTab 不传即旧行为。 */
   readOnly?: boolean;
+  /** B-202 —— 平台价目表(`useRateBook`),详情「计时」tab 按它给模型调用行算人民币
+   *  成本。省略 / null = 不算(非 system_admin 拿不到价目表;运行详情页不传)。 */
+  rateBook?: RateBook | null;
 }
 
 /** 详情侧栏的可用宽:`ResizeObserver` 量 `.ew-traj__split`,jsdom 没有它就退到
@@ -90,6 +94,7 @@ function useSplitWidth(ref: React.RefObject<HTMLDivElement | null>, enabled: boo
 export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
   const { turns, threadId, agentName, agentVersion, isSystemAdmin, onFireResult } = props;
   const readOnly = props.readOnly ?? false;
+  const rateBook = props.rateBook ?? null;
   const { t } = useTranslation();
   const splitRef = useRef<HTMLDivElement>(null);
   const [detailsWidth, setDetailsWidth] = useState(DETAILS_DEFAULT_WIDTH);
@@ -169,6 +174,7 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
           traceLoading={traceLoading}
           onRefreshTrace={refreshTrace}
           onOpenRecord={state.selectRecord}
+          rateBook={rateBook}
           activeTab={requestTab}
           onTabChange={setRequestTab}
           onClose={state.closeDetails}
@@ -196,6 +202,7 @@ export function TrajectoryView(props: TrajectoryViewProps): JSX.Element {
         onFireResult={onFireResult}
         readOnly={readOnly}
         toolSchemas={toolSchemas}
+        rateBook={rateBook}
         activeTab={recordTab}
         onTabChange={setRecordTab}
         onClose={state.closeDetails}

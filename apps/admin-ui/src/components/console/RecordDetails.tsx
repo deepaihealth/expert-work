@@ -19,6 +19,7 @@ import { ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
+import type { RateBook } from "../../api/cost";
 import type { RunTrace } from "../../api/trace_facade";
 import type { SpanMatch } from "../../api/trace_match";
 import type { AssistantRow, UserRow } from "../../api/trajectory_rows";
@@ -108,6 +109,8 @@ export interface RecordDetailsProps {
   /** PR-A.3 §十.2 — the Schema tab's lazy fetch state; the parent owns the
    *  `useAgentTools` hook so it survives switching between records. */
   toolSchemas: ToolSchemaState;
+  /** B-202 —— 透传给「计时」tab 的成本行(平台价目表);省略 = 不算成本。 */
+  rateBook?: RateBook | null;
   activeTab: RecordTab;
   onTabChange: (t: RecordTab) => void;
   onClose: () => void;
@@ -155,7 +158,7 @@ function DetailSection({
 export function RecordDetails(props: RecordDetailsProps) {
   const { record, ownerRequest, parent, threadId, isSystemAdmin, langfuseUrl } = props;
   const { match, trace, traceLoading, onRefreshTrace, onOpenRecord, onOpenRequest } = props;
-  const { activeTab, onTabChange, onFireResult, toolSchemas, readOnly = false } = props;
+  const { activeTab, onTabChange, onFireResult, toolSchemas, readOnly = false, rateBook = null } = props;
   const { t } = useTranslation();
   const [fullText, setFullText] = useState<FullTextState | null>(null);
 
@@ -205,6 +208,7 @@ export function RecordDetails(props: RecordDetailsProps) {
             traceLoading={traceLoading}
             onRefreshTrace={onRefreshTrace}
             langfuseUrl={langfuseUrl}
+            rateBook={rateBook}
           />
         );
       case "raw":

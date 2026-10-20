@@ -15,8 +15,10 @@ import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from 
 import "../../i18n";
 
 import { setStoredToken } from "../../api/client";
+import * as agentsSdk from "../../api/agents";
 import * as approvalsSdk from "../../api/approvals";
 import * as convoSdk from "../../api/conversations";
+import * as rateCardSdk from "../../api/rate_card";
 import type { ThreadPlan } from "../../api/plan";
 import * as runsSdk from "../../api/runs";
 import * as sessionsSdk from "../../api/sessions";
@@ -1349,5 +1351,110 @@ describe("B-139 一轮在跑、一轮排队", () => {
     renderPage();
     await screen.findByTestId("console-turn-queued");
     expect(screen.queryByTestId("console-cancel-queued")).not.toBeInTheDocument();
+  });
+});
+
+// B-202 —— 用户拍板:成本按平台价目表、人民币算。对话详情页原来给统计条传的价目表
+// 是 null(没有成本),「计时」页的成本只取 Langfuse 的美元。
+describe("B-202 成本按平台价目表(人民币)", () => {
+  // 一步模型调用:输入 200k / 输出 10k token;价目 3 / 15 元每百万 → ¥0.75。
+  const pricedEvents: SseEvent[] = [
+    { id: "1792481680000-1", event: "metadata", data: { run_id: RUN_1 }, rawData: "", receivedAt: "" },
+    {
+      id: "1792481681000-2",
+      event: "updates",
+      data: {
+        agent: {
+          step_count: 1,
+          messages: [
+            {
+              type: "ai",
+              content: "Refund case opened",
+              response_metadata: { finish_reason: "stop", model_name: "glm-5.3" },
+              usage_metadata: { input_tokens: 200_000, output_tokens: 10_000, total_tokens: 210_000 },
+            },
+          ],
+        },
+      },
+      rawData: "",
+      receivedAt: "",
+    },
+    { id: null, event: "end", data: {}, rawData: "", receivedAt: "" },
+  ];
+  const CARD: rateCardSdk.RateCardRecord = {
+    id: "rc-1", tenant_id: null, provider: "zhipu", model: "glm-5.3",
+    input_per_mtok_micros: 3_000_000, output_per_mtok_micros: 15_000_000,
+    cache_creation_per_mtok_micros: 0, cache_read_per_mtok_micros: 300_000,
+  };
+  const AGENT_DETAIL: agentsSdk.AgentDetailResponse = {
+    record: {
+      id: "a-1", tenant_id: TENANT_ID, name: "code-reviewer", version: "1.0.0", status: "active",
+      spec_sha256: "x", created_by: "u", created_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z",
+      spec: { apiVersion: "v1", kind: "Agent", spec: { model: { provider: "zhipu", name: "glm-5.3" } } },
+    },
+  };
+
+  function arrange(events: SseEvent[] = pricedEvents) {
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue([
+      { role: "user", content: "I was charged twice" },
+      { role: "assistant", content: "Refund case opened" },
+    ]);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([TWO_RUNS[0]]);
+    vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() => makeStream(events));
+    return {
+      agentSpy: vi.spyOn(agentsSdk, "getAgent").mockResolvedValue(AGENT_DETAIL),
+      rateSpy: vi.spyOn(rateCardSdk, "listRateCards").mockResolvedValue([CARD]),
+    };
+  }
+
+  it("system_admin:统计条和「计时」页的模型调用行都显示人民币成本", async () => {
+    setStoredToken(jwt({ sub: "u", tenant_id: TENANT_ID, roles: ["system_admin"] }));
+    const { agentSpy, rateSpy } = arrange();
+    renderPage();
+
+    // 主线按 agent 自己的模型定价:先读 manifest 拿 provider / 模型名(带会话的租户)。
+    await waitFor(() => expect(agentSpy).toHaveBeenCalledWith("code-reviewer", "1.0.0", TENANT_ID));
+    await waitFor(() => expect(rateSpy).toHaveBeenCalledWith({ provider: "zhipu", model: "glm-5.3" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("console-stats-row").textContent).toContain("¥0.75"),
+    );
+
+    fireEvent.click(screen.getByTestId("console-view-tab-trajectory"));
+    const rows = await screen.findAllByTestId("console-traj-row");
+    const assistant = rows.find((r) => r.dataset.kind === "assistant");
+    expect(assistant).toBeDefined();
+    fireEvent.click(assistant!);
+    fireEvent.click(await screen.findByTestId("console-detail-tab-timing"));
+    expect(screen.getByTestId("console-detail-timing").textContent).toContain("¥0.7500");
+  });
+
+  it("非 system_admin:不读 manifest、不读价目表,成本照旧不显示", async () => {
+    // 再带一个换了模型的子智能体:它的用量有模型归属,价目表一旦对非管理员放开
+    // 就会为它发请求 —— 只靠「主线模型拿不到」挡不住。
+    const workerEnd: SseEvent = {
+      id: "1792481681500-3",
+      event: "worker",
+      data: {
+        worker_id: "w-1", kind: "end",
+        data: {
+          usage: { input_tokens: 1_000, output_tokens: 100, total_tokens: 1_100 },
+          usage_by_model: [
+            { provider: "zhipu", model: "glm-5.3-flashx", input_tokens: 1_000, output_tokens: 100, total_tokens: 1_100 },
+          ],
+        },
+      },
+      rawData: "",
+      receivedAt: "",
+    };
+    const { agentSpy, rateSpy } = arrange([...pricedEvents.slice(0, 2), workerEnd, pricedEvents[2]]);
+    renderPage();
+    // 回放落定、统计条算完(入 200k + 子智能体 1k)之后再断言「没发请求」。
+    await waitFor(() =>
+      expect(screen.getByTestId("console-stats-row").textContent).toContain("201.0k"),
+    );
+    expect(agentSpy).not.toHaveBeenCalled();
+    expect(rateSpy).not.toHaveBeenCalled();
+    expect(screen.queryByText("¥0.75")).not.toBeInTheDocument();
   });
 });

@@ -57,7 +57,7 @@ export interface TurnBlockProps {
    *  (`runHrefOf` 同款 opt-in:调试台不传,零变化)。 */
   plan?: ThreadPlan | null;
   /** #4 cost — rate cards keyed by (provider, model) (B-42); ``null`` hides
-   *  the cost (non-admin, or the conversation page which never prices). */
+   *  the cost (non-admin: rate cards are system_admin-only). */
   rateBook: RateBook | null;
   isSystemAdmin: boolean;
   readOnly: boolean;
