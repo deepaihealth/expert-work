@@ -94,6 +94,14 @@ class HTTPDashScopeRerankClient:
         return data
 
 
+#: Longest document sent to the rerank API. DashScope refuses the whole
+#: request (HTTP 400, it does not truncate) when any one document is over the
+#: model's per-document limit — 4,000 tokens for qwen3-rerank, 8,000 for
+#: qwen3-vl-rerank — so one over-long candidate cost a search its rerank
+#: (B-198). A normal chunk is far shorter; only the tail of an outlier is cut.
+_MAX_DOC_CHARS = 3000
+
+
 @dataclass(frozen=True)
 class DashScopeReranker:
     """:class:`orchestrator.tools.knowledge.Reranker` (and ``ScoredReranker``)
@@ -116,7 +124,7 @@ class DashScopeReranker:
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
     ) -> list[tuple[int, float | None]]:
         del tenant_id  # credential is baked into ``client``
-        items = list(documents)
+        items = [document[:_MAX_DOC_CHARS] for document in documents]
         if not items:
             return []
         body = await self.client.rerank(model=self.model, query=query, documents=items, top_n=top_k)

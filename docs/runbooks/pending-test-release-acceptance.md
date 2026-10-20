@@ -516,3 +516,37 @@ for special in sorted(_encoding.special_tokens_set):
 ```
 
 - [x] **35.2 真实入库**:本机生成文件:`printf 'Tokenizer notes.\n\nEach training sample ends with <|endoftext|> before padding.\n' > b197-special.txt`。在测试环境新建一个知识库(名字如 `b197-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `training sample ends`,结果含 `<|endoftext|>` 原样文字。**没修好时**:文档状态「失败」,错误信息含 `disallowed special token`。验完删掉这个知识库。 **10-19 测试 `a488eb7eb` 过(pod 内等价做法,未走控制台)**:在 pod 里用平台自己的 store 建临时库 `b197-probe`、写入同一个文件,由恢复工作进程按真实链路入库(测试环境嵌入模型):① 「就绪」、1 段、无错误;② 分段里原样含 `<|endoftext|>`;验完已删库并确认不存在。发版前在旧版 `a4bc1b38` 上同样跑过:5 分钟后仍是「处理中」,恢复工作进程的重试日志报的就是特殊记号错误(这条路径要等重试次数用完才标「失败」;控制台上传走快路径,当场标「失败」),说明这条验证在没修好时会失败。没覆盖的只有控制台上传那一步的 HTTP / 页面。
+
+## §36 B-198 多行段落 / 超长标题当正文 + 重排候选截断(ROADMAP B-198)
+
+**背景**:切分器认标题用 markdown-it 的规则,「一段文字下一行紧跟 `---` / `===`」会被当成标题,不管这段有多少行。会议纪要、导出的聊天记录常这么写:整篇纪要成了一个「标题」,内容不进任何一段的正文,每一段都带着这个巨型标题;送重排时超过模型单条上限,阿里云整次请求回 400,这次检索就没有重排。现在:标题只认单行且不超过 200 字的,其余当正文;送重排的每份候选先截到 3,000 字。
+
+**已经入库的受影响文档不会自动重来**:发版后在控制台点「重新摄取」才能找回正文、去掉巨型标题;在那之前,重排靠截断兜底不再失败。
+
+- [ ] **36.1 切分与截断(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数和一个假的重排客户端:不连外网,不读写库。判据:输出 4 行,每行末尾都是 `True`。**没修好时**:`multiline` / `longline` 两行是 `False`,`rerank-cut` 一行是 `False`(`short-setext` 修好前后都是 `True`,它守的是正常标题不被误伤)。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, uuid
+from control_plane.knowledge.chunking import chunk_markdown
+from orchestrator.llm import DashScopeReranker
+def chunks(src):
+    return chunk_markdown(src, max_tokens=512, overlap_tokens=0)
+c = chunks("Header:\nDate: 2026-09-18\nAttendees: Maya, Priya\n---\n[00:00] Maya: hi\n[00:16] Priya: hello\n----\n")
+print("multiline", all(x.heading_path == () for x in c) and "[00:16] Priya: hello" in "\n".join(x.body for x in c))
+line = " ".join("word%d" % i for i in range(60))
+c = chunks("# " + line + "\n\nBody text.\n")
+print("longline", all(x.heading_path == () for x in c) and line in "\n".join(x.body for x in c))
+c = chunks("Refunds\n-------\n\nRefund window is 14 days.\n")
+print("short-setext", [(x.heading_path, x.body) for x in c] == [(("Refunds",), "Refund window is 14 days.")])
+sent = []
+class Client:
+    async def rerank(self, *, model, query, documents, top_n):
+        sent.extend(documents)
+        return {"output": {"results": [{"index": 0}]}}
+asyncio.run(DashScopeReranker(client=Client(), model="m").rerank(query="q", documents=["x" * 40000], top_k=1, tenant_id=uuid.uuid4()))
+print("rerank-cut", len(sent[0]) <= 3000)
+'
+```
+
+- [ ] **36.2 真实入库**:本机生成一个纪要格式的文件:`printf 'Header:\nDate: 2026-09-18\nAttendees: Maya, Priya\n---\n[00:00] Maya: we will scope the refund policy today\n[00:16] Priya: refund window is 14 days for members\n----\n' > b198-transcript.txt`。在测试环境新建一个知识库(名字如 `b198-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund window members`,结果的正文里含 `refund window is 14 days for members`;③ 这条结果的标题路径为空(不是整段纪要)。**没修好时**:② 正文里没有这句,它只出现在标题路径里。验完删掉这个知识库。

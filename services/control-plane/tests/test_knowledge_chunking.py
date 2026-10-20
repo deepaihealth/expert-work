@@ -405,3 +405,34 @@ def test_special_token_text_survives_token_window_split_and_overlap() -> None:
     assert len(parts) > 1
     assert "".join(parts) == text
     assert text.endswith(_tail_text(text, 5))
+
+
+# markdown-it reads any paragraph right above a `---` / `===` line as a setext
+# heading, however many lines it has: a meeting transcript became one 17 KB
+# "heading", its text in no chunk body and on every chunk's breadcrumb (B-198).
+def test_multi_line_setext_heading_is_kept_as_content() -> None:
+    src = (
+        "Header:\nDate: 2026-09-18\nAttendees: Maya, Priya\n---\n"
+        "[00:00] Maya: hi everyone\n[00:16] Priya: hello\n----\n"
+    )
+    chunks = _chunk_markdown(src, max_tokens=512, overlap_tokens=0)
+    assert all(c.heading_path == () for c in chunks)
+    text = "\n".join(c.body for c in chunks)
+    assert "Attendees: Maya, Priya" in text
+    assert "[00:16] Priya: hello" in text
+
+
+def test_overlong_heading_line_is_kept_as_content() -> None:
+    line = " ".join(f"word{i}" for i in range(60))
+    chunks = _chunk_markdown(f"# {line}\n\nBody text.\n", max_tokens=512, overlap_tokens=0)
+    assert all(c.heading_path == () for c in chunks)
+    assert line in "\n".join(c.body for c in chunks)
+
+
+def test_short_setext_heading_still_names_its_section() -> None:
+    chunks = _chunk_markdown(
+        "Refunds\n-------\n\nRefund window is 14 days.\n", max_tokens=512, overlap_tokens=0
+    )
+    assert [(c.heading_path, c.body) for c in chunks] == [
+        (("Refunds",), "Refund window is 14 days.")
+    ]

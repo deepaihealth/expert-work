@@ -62,6 +62,13 @@ _CONTENT_STANDALONE = frozenset({"fence", "code_block", "html_block"})
 #: shifted every later block onto the wrong lines — text silently lost (B-181).
 _LINE_BREAK = re.compile(r"\r\n?|\n")
 
+#: Longest heading taken as a section title. markdown-it reads any paragraph
+#: right above a ``---`` / ``===`` line as a setext heading, however many lines
+#: it has: a meeting transcript became one 17 KB "heading", its text in no
+#: chunk body and repeated on every chunk's breadcrumb (B-198). A heading that
+#: spans lines or runs past this is kept as content instead.
+_MAX_HEADING_CHARS = 200
+
 #: Sentence-ish boundary for hard-splitting an oversized paragraph. Zero
 #: width, so splitting is lossless: after a CJK sentence mark always (CJK
 #: prose has no space after 。), after an ASCII mark or a newline only when
@@ -250,12 +257,13 @@ def _parse_blocks(markdown: str) -> list[_Block]:
         if token.level != 0 or token.map is None:
             continue
         if token.type == "heading_open":
-            level = int(token.tag[1:])
             text = tokens[index + 1].content.strip() if index + 1 < len(tokens) else ""
-            while trail_stack and trail_stack[-1][0] >= level:
-                trail_stack.pop()
-            trail_stack.append((level, text))
-            continue
+            if "\n" not in text and len(text) <= _MAX_HEADING_CHARS:
+                level = int(token.tag[1:])
+                while trail_stack and trail_stack[-1][0] >= level:
+                    trail_stack.pop()
+                trail_stack.append((level, text))
+                continue
         start, end = token.map
         block_text = "\n".join(lines[start:end]).strip()
         if not block_text:
@@ -263,7 +271,11 @@ def _parse_blocks(markdown: str) -> list[_Block]:
         trail = tuple(text for _, text in trail_stack)
         if token.type == "table_open":
             blocks.append(_Block("table", block_text, trail))
-        elif token.type in _CONTENT_OPENERS or token.type in _CONTENT_STANDALONE:
+        elif (
+            token.type in _CONTENT_OPENERS
+            or token.type in _CONTENT_STANDALONE
+            or token.type == "heading_open"
+        ):
             blocks.append(_Block("content", block_text, trail))
     return blocks
 
