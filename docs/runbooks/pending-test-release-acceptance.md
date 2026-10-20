@@ -523,7 +523,7 @@ for special in sorted(_encoding.special_tokens_set):
 
 **已经入库的受影响文档不会自动重来**:发版后在控制台点「重新摄取」才能找回正文、去掉巨型标题;在那之前,重排靠截断兜底不再失败。
 
-- [ ] **36.1 切分与截断(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数和一个假的重排客户端:不连外网,不读写库。判据:输出 4 行,每行末尾都是 `True`。**没修好时**:`multiline` / `longline` 两行是 `False`,`rerank-cut` 一行是 `False`(`short-setext` 修好前后都是 `True`,它守的是正常标题不被误伤)。
+- [ ] **36.1 切分与截断(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数和一个假的重排客户端:不连外网,不读写库。判据:输出 4 行,每行末尾都是 `True`。**没修好时**:`multiline` / `longline` 两行是 `False`,`rerank-cut` 一行是 `False`(`short-heading` 修好前后都是 `True`,它守的是正常标题不被误伤;B-199 起下划线式标题不再认,这里用 `#` 标题)。
 
 ```bash
 kubectl exec deploy/control-plane -- python -c '
@@ -537,8 +537,8 @@ print("multiline", all(x.heading_path == () for x in c) and "[00:16] Priya: hell
 line = " ".join("word%d" % i for i in range(60))
 c = chunks("# " + line + "\n\nBody text.\n")
 print("longline", all(x.heading_path == () for x in c) and line in "\n".join(x.body for x in c))
-c = chunks("Refunds\n-------\n\nRefund window is 14 days.\n")
-print("short-setext", [(x.heading_path, x.body) for x in c] == [(("Refunds",), "Refund window is 14 days.")])
+c = chunks("# Refunds\n\nRefund window is 14 days.\n")
+print("short-heading", [(x.heading_path, x.body) for x in c] == [(("Refunds",), "Refund window is 14 days.")])
 sent = []
 class Client:
     async def rerank(self, *, model, query, documents, top_n):
@@ -550,3 +550,36 @@ print("rerank-cut", len(sent[0]) <= 3000)
 ```
 
 - [ ] **36.2 真实入库**:本机生成一个纪要格式的文件:`printf 'Header:\nDate: 2026-09-18\nAttendees: Maya, Priya\n---\n[00:00] Maya: we will scope the refund policy today\n[00:16] Priya: refund window is 14 days for members\n----\n' > b198-transcript.txt`。在测试环境新建一个知识库(名字如 `b198-probe`),上传这个文件。判据:① 文档状态变成「就绪」;② 在该库的命中测试里搜 `refund window members`,结果的正文里含 `refund window is 14 days for members`;③ 这条结果的标题路径为空(不是整段纪要)。**没修好时**:② 正文里没有这句,它只出现在标题路径里。验完删掉这个知识库。
+
+## §37 B-199 txt 按纯文本切、只认 # 标题、切分不丢字(ROADMAP B-199)
+
+**背景**:B-198 的后续,做法对齐 Dify / RAGFlow / Onyx:① `.txt` 按纯文本切(只按空行分段,`#`、`---`、缩进都不当结构),`.md` 和其他转换来的格式照旧按 Markdown;② Markdown 只认 `#` 标题,下划线式标题(`---` / `===`)不再认;③ 切分不丢字:下面没有正文的标题、`[名字]: 网址` 这种被 Markdown 解析器吞掉的行,都留作正文;④ 按 token 硬切时在词与词之间下刀,不再把一个词切成两半。
+
+**已入库的文档不会自动重来**:想按新规则切的文档在控制台点「重新摄取」。
+
+- [ ] **37.1 切分规则(pod 内离线探针)**:发测试后执行下面的命令。只调切分函数:不连外网,不读写库。判据:输出 6 行,每行末尾都是 `True`。**没修好时**:`txt-plain` / `txt-flag` 两行是 `FAIL`,其余四行是 `False`。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import re
+from control_plane.knowledge.chunking import chunk_markdown
+def run(label, src, check, max_tokens=512, **kw):
+    try:
+        print(label, check(" ".join(x.text for x in chunk_markdown(src, max_tokens=max_tokens, overlap_tokens=0, **kw))))
+    except Exception as exc:
+        print(label, "FAIL", type(exc).__name__)
+run("txt-plain", "# not a heading\nSummary\n---\nmore\n", lambda t: "[Section:" not in t and "# not a heading" in t and "---" in t, plain_text=True)
+run("md-setext-off", "Refunds\n-------\n\nRefund window is 14 days.\n", lambda t: "[Section:" not in t and "Refunds" in t)
+run("empty-heading", "# Overview\n# Details\n\nBody text.\n", lambda t: "Overview" in t)
+run("ref-definition", "See it.\n\n[policy]: https://example.com/refunds\n", lambda t: "https://example.com/refunds" in t)
+line = "\\n- ".join("Triage%d: identify affected routes" % i for i in range(200))
+run("whole-words", line, lambda t: set(re.findall(r"\w+", line)) <= set(re.findall(r"\w+", t)), max_tokens=64)
+try:
+    from control_plane.knowledge.parsing import is_plain_text_file
+    print("txt-flag", is_plain_text_file("notes.TXT") and not is_plain_text_file("notes.md"))
+except Exception as exc:
+    print("txt-flag", "FAIL", type(exc).__name__)
+'
+```
+
+- [ ] **37.2 真实入库**:本机生成两个文件:`printf '# 不是标题\n第一行\n---\n第二行\n' > b199-plain.txt`;`printf '# 概述\n# 细节\n\n正文写在这里。\n\n[参考]: https://example.com/b199\n' > b199-marked.md`。在测试环境新建一个知识库(名字如 `b199-probe`),上传这两个文件。判据:① 两个文档都变成「就绪」;② `b199-plain.txt` 的分段标题路径为空,正文里含 `# 不是标题` 和 `---`;③ `b199-marked.md` 的分段里能找到 `概述` 和 `https://example.com/b199`。**没修好时**:② `# 不是标题` 被当成标题、不在正文里;③ 找不到 `概述` 和这个网址。验完删掉这个知识库。
