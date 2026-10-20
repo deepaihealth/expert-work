@@ -16,9 +16,14 @@
  *    otherwise every such row is ``count_mismatch``. 旧投影末尾那条整轮合成
  *    的 ``assistant`` 行 ``step`` 为 ``null``,不参与,落到 rule 5。
  * 3. ``tool`` rows and ``update_plan`` plan rows ↔ ``kind === "tool"``
- *    spans, matched by name (tool name / ``"update_plan"``), nth
- *    occurrence to nth occurrence; a name with fewer spans than rows
- *    leaves the extra rows ``count_mismatch``.
+ *    spans, matched by name (the raw tool name as the model called it —
+ *    ``mcp__server__tool`` for MCP — / ``"update_plan"``), nth occurrence
+ *    to nth occurrence; a name with fewer spans than rows leaves the extra
+ *    rows ``count_mismatch``. A span's name is its ``detail``: the facade
+ *    labels every tool span 「工具调用」 and puts the tool name (the span's
+ *    ``tool`` attribute) in ``detail`` (``trace_facade.py`` ``_classify`` /
+ *    ``_tool_detail``); ``label`` is only the fallback for a span without
+ *    one (B-203 — keyed on ``label`` alone, no tool row ever matched).
  * 4. Aux rows (memory recall/writeback, planner, reflect, compaction) ↔
  *    ``kind === "llm"`` spans sharing the same ``purpose``, same
  *    nth-of-purpose pairing as rule 3.
@@ -110,9 +115,9 @@ export function matchTraceSpans(
   pairByKey(
     result,
     toolLikeRows,
-    (row) => (row.kind === "tool" ? row.entry.toolName : "update_plan"),
+    (row) => (row.kind === "tool" ? row.entry.rawName : "update_plan"),
     toolSpans,
-    (span) => span.label,
+    (span) => span.detail ?? span.label,
   );
 
   // Rule 4 — aux rows ↔ llm spans, nth-of-purpose.
