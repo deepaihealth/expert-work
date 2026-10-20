@@ -54,20 +54,22 @@ export interface RequestDetailsProps {
   splitWidth: number;
 }
 
+/** B-203 —— token 数带千分位,与轮脚「1,119,191 tok」同一写法。 */
 function UsagePanel({ request }: { request: LedgerRequest }) {
   const { t } = useTranslation();
+  const n = (v: number): string => v.toLocaleString();
   return (
     <div data-testid="console-detail-usage">
       <dl className="ew-detail__ov">
-        <DetailRow label={t("console.detail_usage_input")}>{request.usage.input}</DetailRow>
-        <DetailRow label={t("console.detail_usage_output")}>{request.usage.output}</DetailRow>
-        <DetailRow label={t("console.detail_usage_reasoning")}>{request.usage.reasoning}</DetailRow>
-        <DetailRow label={t("console.detail_usage_cache_read")}>{request.usage.cacheRead}</DetailRow>
+        <DetailRow label={t("console.detail_usage_input")}>{n(request.usage.input)}</DetailRow>
+        <DetailRow label={t("console.detail_usage_output")}>{n(request.usage.output)}</DetailRow>
+        <DetailRow label={t("console.detail_usage_reasoning")}>{n(request.usage.reasoning)}</DetailRow>
+        <DetailRow label={t("console.detail_usage_cache_read")}>{n(request.usage.cacheRead)}</DetailRow>
       </dl>
       <h4 className="ew-detail__usage-h">{t("console.detail_usage_cumulative")}</h4>
       <dl className="ew-detail__ov">
-        <DetailRow label={t("console.detail_usage_input")}>{request.cumulative.input}</DetailRow>
-        <DetailRow label={t("console.detail_usage_output")}>{request.cumulative.output}</DetailRow>
+        <DetailRow label={t("console.detail_usage_input")}>{n(request.cumulative.input)}</DetailRow>
+        <DetailRow label={t("console.detail_usage_output")}>{n(request.cumulative.output)}</DetailRow>
       </dl>
     </div>
   );

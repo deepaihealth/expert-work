@@ -264,6 +264,22 @@ describe("RequestDetails", () => {
     expect(screen.getByTestId("console-timing-langfuse")).toHaveAttribute("href", "https://lf/t/1");
   });
 
+  it("B-203 — 用量页的 token 数带千分位", () => {
+    renderRequest({
+      activeTab: "usage",
+      request: request({
+        usage: { input: 57_803, output: 2_364, reasoning: 1_024, cacheRead: 51_200 },
+        cumulative: { input: 1_119_191, output: 20_000 },
+      }),
+    });
+    const usage = screen.getByTestId("console-detail-usage");
+    expect(within(usage).getAllByText("Input")[0]!.nextSibling?.textContent).toBe("57,803");
+    expect(within(usage).getAllByText("Output")[0]!.nextSibling?.textContent).toBe("2,364");
+    expect(within(usage).getByText("Reasoning").nextSibling?.textContent).toBe("1,024");
+    expect(within(usage).getByText("Cache read").nextSibling?.textContent).toBe("51,200");
+    expect(within(usage).getAllByText("Input")[1]!.nextSibling?.textContent).toBe("1,119,191");
+  });
+
   it("B-202 — 计时页的成本按透传进来的平台价目表算人民币", () => {
     renderRequest({
       activeTab: "timing",
