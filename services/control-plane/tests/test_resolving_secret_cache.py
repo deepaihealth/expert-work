@@ -130,7 +130,7 @@ def _resolver() -> CredentialsResolver:
 class _FakeEmbedDelegate:
     """替身 ``OpenAICompatibleEmbedder``——不碰网络。"""
 
-    def __init__(self, *, client: Any, model: str) -> None:
+    def __init__(self, *, client: Any, model: str, max_input_bytes: int | None = None) -> None:
         self.client = client
         self.model = model
 

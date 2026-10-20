@@ -44,7 +44,7 @@ async def test_embedder_reads_current_config_each_call(monkeypatch):
     captured: list[str] = []
 
     class _FakeDelegate:
-        def __init__(self, *, client, model):
+        def __init__(self, *, client, model, **_):
             captured.append(model)
 
         async def embed(self, texts, *, tenant_id):
@@ -73,7 +73,7 @@ async def test_pin_fixes_one_model_for_the_whole_unit_of_work(monkeypatch):
     captured: list[str] = []
 
     class _FakeDelegate:
-        def __init__(self, *, client, model):
+        def __init__(self, *, client, model, **_):
             self.model = model
 
         async def embed(self, texts, *, tenant_id):
@@ -92,6 +92,20 @@ async def test_pin_fixes_one_model_for_the_whole_unit_of_work(monkeypatch):
     cfg.embedding = ("glm", "embedding-3")  # admin changes config mid-ingest
     await pinned.embed(["a"], tenant_id=uuid4())
     assert captured == ["text-embedding-v4"]
+
+
+@pytest.mark.asyncio
+async def test_pinned_embedder_carries_the_input_byte_cap(monkeypatch):
+    # B-200 — the deployment's cap reaches the embedder that sends the request.
+    monkeypatch.setattr("control_plane.runtime.HTTPEmbeddingClient", lambda **kw: object())
+    emb = DynamicResolvingEmbedder(
+        config_service=_Cfg(),
+        resolver=_Resolver(),
+        secret_store=_SecretStore(),
+        max_input_bytes=512,
+    )
+    _, pinned = await emb.pin(tenant_id=uuid4())
+    assert pinned.max_input_bytes == 512
 
 
 @pytest.mark.asyncio

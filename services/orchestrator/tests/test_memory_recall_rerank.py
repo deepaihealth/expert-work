@@ -20,6 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from expert_work.protocol import MemoryItem
 from orchestrator.graph_builder.memory import _MEMORY_RECALL_WIDE_LIMIT, make_memory_recall_node
 from orchestrator.llm import FakeEmbedder
+from orchestrator.tools.knowledge import RERANK_DOC_MAX_CHARS
 
 _DIM = 16
 
@@ -171,3 +172,18 @@ async def test_empty_recall_skips_rerank() -> None:
     recalled = await _run(node, tenant, user)
     assert recalled == []
     assert reranker.seen == []  # rerank not called on empty recall
+
+
+@pytest.mark.asyncio
+async def test_reranker_gets_memories_cut_to_the_cap() -> None:
+    tenant, user = uuid4(), uuid4()
+    store = _ListStore(items=[_mem("m" * 5000, tenant, user), _mem("short", tenant, user)])
+    reranker = _OrderReranker(order=[0, 1])
+    node = make_memory_recall_node(
+        memory_store=store,  # type: ignore[arg-type]
+        embedder=FakeEmbedder(dim=_DIM),
+        top_k=2,
+        reranker=reranker,  # type: ignore[arg-type]
+    )
+    await _run(node, tenant, user)
+    assert reranker.seen == [["m" * RERANK_DOC_MAX_CHARS, "short"]]

@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from orchestrator.llm import (
+    DEFAULT_MAX_INPUT_BYTES,
     FakeEmbedder,
     HTTPEmbeddingClient,
     OpenAICompatibleEmbedder,
@@ -188,3 +189,28 @@ async def test_http_embedding_client_error_surfaces_response_body() -> None:
         await client.embeddings(model="text-embedding-v4", texts=["x"])
 
     assert "batch size is invalid" in str(excinfo.value)
+
+
+# An input over the model's limit makes the embeddings API refuse the whole
+# request; the embedder cuts each input to ``max_input_bytes`` first (B-200).
+@pytest.mark.asyncio
+async def test_openai_compatible_embedder_cuts_inputs_over_the_byte_cap() -> None:
+    client = _EchoEmbeddingClient()
+    embedder = OpenAICompatibleEmbedder(client=client, model="m", max_input_bytes=50)
+    long = "退款期限十四天" * 20  # 3 bytes a character
+    await embedder.embed(["short text", long], tenant_id=uuid4())
+    (sent,) = client.calls
+    assert sent[0] == "short text"
+    assert sent[1] == long[:16]  # 48 bytes: the 17th character would end at 51
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_embedder_caps_inputs_by_default() -> None:
+    # 8,000 o200k tokens of Hindi are over 20,000 text-embedding-v4 tokens;
+    # bytes bound every tokenizer, so the default cap holds for any script.
+    client = _EchoEmbeddingClient()
+    long = "धनवापसी की अवधि चौदह दिन है। " * 400
+    await OpenAICompatibleEmbedder(client=client, model="m").embed([long], tenant_id=uuid4())
+    ((sent,),) = client.calls
+    assert long.startswith(sent)
+    assert DEFAULT_MAX_INPUT_BYTES - 4 < len(sent.encode()) <= DEFAULT_MAX_INPUT_BYTES

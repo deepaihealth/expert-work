@@ -1733,6 +1733,7 @@ def create_app(
                     secret_store=resolved_secret_store,
                     http=shared_http,
                     secret_cache=credential_value_cache,
+                    max_input_bytes=resolved_settings.embedding_max_input_bytes,
                 )
                 # Stream K.K6 — memory CRUD endpoint needs the embedder
                 # for the PATCH path (re-embed on content change). GET /

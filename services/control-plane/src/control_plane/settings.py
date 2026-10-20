@@ -509,6 +509,14 @@ class Settings(BaseSettings):
     #: Bounded ingest attempts before a document goes terminally failed.
     knowledge_ingest_max_attempts: int = Field(default=5, gt=0)
 
+    #: Longest embedding input, in UTF-8 bytes (B-200): every text is cut to
+    #: this before the embeddings request, so a long query or an over-sized
+    #: chunk never makes the vendor refuse the call. Bytes bound the token
+    #: count under any tokenizer; the default (orchestrator's
+    #: ``DEFAULT_MAX_INPUT_BYTES``) fits every model that takes 8k tokens —
+    #: lower it for an embedding model with a smaller limit.
+    embedding_max_input_bytes: int = Field(default=8000, gt=0)
+
     #: Upload size cap for one knowledge document (bytes). Over the cap the
     #: upload endpoint answers 413 ``{"error": "file_too_large", "limit_bytes": N}``.
     knowledge_document_max_bytes: int = Field(default=50 * 1024 * 1024, gt=0)

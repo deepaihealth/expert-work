@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
@@ -109,6 +109,21 @@ _NO_BASES_ADVICE = (
 #: recall found nothing; ``below_threshold`` every hit fell under a base's
 #: rerank-score threshold.
 SearchStatus = Literal["ok", "no_bases", "no_hits", "below_threshold"]
+
+
+#: Longest document handed to a reranker. DashScope refuses the whole request
+#: (HTTP 400, it does not truncate) when any one document is over the model's
+#: per-document limit — 4,000 tokens for qwen3-rerank, 8,000 for
+#: qwen3-vl-rerank — so one over-long candidate cost a search its rerank
+#: (B-198). Every caller cuts with :func:`rerank_documents`, whichever
+#: reranker it holds (B-200); a normal chunk is far shorter.
+RERANK_DOC_MAX_CHARS = 3000
+
+
+def rerank_documents(texts: Iterable[str]) -> list[str]:
+    """``texts`` each cut to :data:`RERANK_DOC_MAX_CHARS` — what a caller
+    hands any reranker."""
+    return [text[:RERANK_DOC_MAX_CHARS] for text in texts]
 
 
 @runtime_checkable
@@ -470,7 +485,7 @@ class KnowledgeRetriever:
             else:
                 order = await self.reranker.rerank(
                     query=query,
-                    documents=[chunk.retrieval_text for chunk in candidates],
+                    documents=rerank_documents(chunk.retrieval_text for chunk in candidates),
                     top_k=limit,
                     tenant_id=tenant_id,
                 )
@@ -542,7 +557,7 @@ async def _two_view_order(
     run higher than the weighted ones a threshold is calibrated on."""
     titled = await reranker.rerank_scored(
         query=query,
-        documents=[chunk.retrieval_text for chunk in candidates],
+        documents=rerank_documents(chunk.retrieval_text for chunk in candidates),
         top_k=max(limit, _BODY_VIEW_DEPTH),
         tenant_id=tenant_id,
     )
@@ -554,7 +569,7 @@ async def _two_view_order(
     ):
         return list(titled)
     body_view = await reranker.rerank_scored(
-        query=query, documents=bodies, top_k=len(bodies), tenant_id=tenant_id
+        query=query, documents=rerank_documents(bodies), top_k=len(bodies), tenant_id=tenant_id
     )
     body_score = {top[j]: score for j, score in body_view if score is not None}
     if len(body_score) < len(top):
