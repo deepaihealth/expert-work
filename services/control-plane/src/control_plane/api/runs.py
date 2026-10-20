@@ -2100,7 +2100,15 @@ def build_runs_router() -> APIRouter:
             return JSONResponse(content={"status": "no_trace"})
 
         client = getattr(request.app.state, "langfuse_read_client", None)
-        return JSONResponse(content=fetch_and_normalize(client, trace_id))
+        # B-201 —— SDK 查询是同步 HTTP(测试环境每条 4-9 秒),放线程里跑,
+        # 不卡事件循环;run 的结束时刻用来判「过了 2 分钟仍不完整」。
+        result = await asyncio.to_thread(
+            fetch_and_normalize,
+            client,
+            trace_id,
+            finished_at=persisted.finished_at if persisted is not None else None,
+        )
+        return JSONResponse(content=result)
 
     @router.get(
         "/{thread_id}/runs/{run_id}/trace/raw",
@@ -2154,7 +2162,8 @@ def build_runs_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="trace not found")
 
         client = getattr(request.app.state, "langfuse_read_client", None)
-        content = fetch_span_raw(client, trace_id, span, field)
+        # B-201 —— 同 ``get_run_trace``:同步 SDK 调用放线程里跑。
+        content = await asyncio.to_thread(fetch_span_raw, client, trace_id, span, field)
         if content is None:
             raise HTTPException(status_code=404, detail="span not found")
         return JSONResponse(content={"spanId": span, "field": field, "content": content})

@@ -1804,6 +1804,10 @@ def create_app(
                 ):
                     from langfuse import Langfuse
 
+                    # Same public key as the write client above, so the SDK hands
+                    # back that client's resources (first constructor wins) and
+                    # ignores options passed here — the read timeout rides on each
+                    # request instead (``trace_facade.READ_TIMEOUT_SECONDS``, B-201).
                     langfuse_read_client = Langfuse(
                         public_key=resolved_settings.langfuse_public_key,
                         secret_key=resolved_settings.langfuse_secret_key,

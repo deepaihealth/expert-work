@@ -14,12 +14,18 @@ None)``), and exactly how other tests seed ``app.state.run_store`` /
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+import asyncio
+import logging
+import threading
+import time
+from collections.abc import AsyncIterator, Awaitable
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from langfuse.api import NotFoundError
@@ -72,13 +78,20 @@ spec:
 class _FakeTraceApi:
     """Stands in for the real SDK's ``client.api.trace`` resource."""
 
-    def __init__(self, *, trace: Any = None, exc: BaseException | None = None) -> None:
+    def __init__(
+        self, *, trace: Any = None, exc: BaseException | None = None, delay: float = 0.0
+    ) -> None:
         self._trace = trace
         self._exc = exc
+        self._delay = delay
         self.calls = 0
+        self.request_options: list[Any] = []
 
-    def get(self, trace_id: str) -> Any:
+    def get(self, trace_id: str, *, request_options: Any = None) -> Any:
         self.calls += 1
+        self.request_options.append(request_options)
+        if self._delay:
+            time.sleep(self._delay)  # the real SDK call is blocking HTTP
         if self._exc is not None:
             raise self._exc
         return self._trace
@@ -88,8 +101,10 @@ class _FakeLangfuseClient:
     """Stands in for a real ``langfuse.Langfuse`` instance — only the
     ``.api.trace.get`` surface ``fetch_and_normalize`` touches."""
 
-    def __init__(self, *, trace: Any = None, exc: BaseException | None = None) -> None:
-        self.trace_api = _FakeTraceApi(trace=trace, exc=exc)
+    def __init__(
+        self, *, trace: Any = None, exc: BaseException | None = None, delay: float = 0.0
+    ) -> None:
+        self.trace_api = _FakeTraceApi(trace=trace, exc=exc, delay=delay)
         self.api = SimpleNamespace(trace=self.trace_api)
 
 
@@ -157,7 +172,13 @@ async def _create_session(client: AsyncClient, headers: dict[str, str]) -> str:
     return str(response.json()["data"]["thread_id"])
 
 
-async def _seed_run(client: AsyncClient, *, thread_id: str, trace_id: str | None) -> UUID:
+async def _seed_run(
+    client: AsyncClient,
+    *,
+    thread_id: str,
+    trace_id: str | None,
+    finished_ago: timedelta = timedelta(0),
+) -> UUID:
     run_id = uuid4()
     now = datetime.now(UTC)
     app = client._transport.app  # type: ignore[attr-defined,union-attr]
@@ -173,7 +194,7 @@ async def _seed_run(client: AsyncClient, *, thread_id: str, trace_id: str | None
             error=None,
             created_at=now,
             updated_at=now,
-            finished_at=now,
+            finished_at=now - finished_ago,
             trace_id=trace_id,
         )
     )
@@ -598,3 +619,280 @@ async def test_trace_raw_client_none_returns_404(trace_client: AsyncClient) -> N
         headers=headers,
     )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# B-201 — the Langfuse fetch runs off the event loop
+# ---------------------------------------------------------------------------
+#
+# ``client.api.trace.get`` is synchronous HTTP; on the test environment
+# Langfuse took 4-5 s per trace, and with the call made straight from the
+# async handler every other request on that replica waited it out.
+
+_BLOCKING_FETCH_S = 0.6
+
+
+async def _longest_loop_stall(request: Awaitable[httpx.Response]) -> tuple[httpx.Response, float]:
+    """Await ``request`` while a ticker on the same event loop records the
+    longest gap between two of its ticks (~10 ms when the loop is free)."""
+    done = asyncio.Event()
+    gaps: list[float] = []
+
+    async def tick() -> None:
+        last = time.monotonic()
+        while not done.is_set():
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    ticker = asyncio.create_task(tick())
+    await asyncio.sleep(0)  # let the ticker take its first timestamp
+    try:
+        response = await request
+    finally:
+        done.set()
+        await ticker
+    return response, max(gaps, default=0.0)
+
+
+@pytest.mark.asyncio
+async def test_trace_fetch_does_not_block_the_event_loop(trace_client: AsyncClient) -> None:
+    headers = _owner_headers()
+    thread_id = await _create_session(trace_client, headers)
+    run_id = await _seed_run(trace_client, thread_id=thread_id, trace_id="trace-1")
+    app = trace_client._transport.app  # type: ignore[attr-defined,union-attr]
+    app.state.langfuse_read_client = _FakeLangfuseClient(
+        trace=_fake_trace(), delay=_BLOCKING_FETCH_S
+    )
+
+    resp, stall = await _longest_loop_stall(
+        trace_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}/trace", headers=headers)
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "ok"
+    assert stall < _BLOCKING_FETCH_S / 2
+
+
+@pytest.mark.asyncio
+async def test_trace_raw_fetch_does_not_block_the_event_loop(trace_client: AsyncClient) -> None:
+    headers = _owner_headers()
+    thread_id = await _create_session(trace_client, headers)
+    run_id = await _seed_run(trace_client, thread_id=thread_id, trace_id="trace-1")
+    app = trace_client._transport.app  # type: ignore[attr-defined,union-attr]
+    app.state.langfuse_read_client = _FakeLangfuseClient(
+        trace=_fake_trace(), delay=_BLOCKING_FETCH_S
+    )
+
+    resp, stall = await _longest_loop_stall(
+        trace_client.get(
+            f"/v1/sessions/{thread_id}/runs/{run_id}/trace/raw",
+            params={"span": "obs-1", "field": "output"},
+            headers=headers,
+        )
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["content"] == "hello"
+    assert stall < _BLOCKING_FETCH_S / 2
+
+
+# ---------------------------------------------------------------------------
+# B-201 — read timeout above the SDK's 5 s default
+# ---------------------------------------------------------------------------
+
+
+def test_both_fetches_pass_the_read_timeout() -> None:
+    from control_plane.api.trace_facade import (
+        READ_TIMEOUT_SECONDS,
+        fetch_and_normalize,
+        fetch_span_raw,
+    )
+
+    assert READ_TIMEOUT_SECONDS > 5  # the SDK default that timed out on the test env
+    client = _FakeLangfuseClient(trace=_fake_trace())
+
+    fetch_and_normalize(client, "trace-1")
+    fetch_span_raw(client, "trace-1", "obs-1", "output")
+
+    assert client.trace_api.request_options == [
+        {"timeout_in_seconds": READ_TIMEOUT_SECONDS},
+        {"timeout_in_seconds": READ_TIMEOUT_SECONDS},
+    ]
+
+
+class _SlowNotFound(BaseHTTPRequestHandler):
+    """Answers every trace GET with a 404 after 1.5 s."""
+
+    def do_GET(self) -> None:
+        time.sleep(1.5)
+        body = b'{"message": "Trace not found"}'
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args: Any) -> None:
+        pass
+
+
+def test_read_timeout_wins_over_the_clients_own_sdk_timeout() -> None:
+    """Through the installed SDK. The control-plane's read client shares its SDK
+    resources with the write client (one set per public key, first constructor
+    wins), so a ``timeout=`` given to the read client's constructor is ignored —
+    the timeout has to ride on each request. Here the client's own timeout is
+    1 s and Langfuse answers after 1.5 s: only the per-request timeout lets the
+    answer (a 404 → ``not_ready``) through instead of a ``ReadTimeout``."""
+    from langfuse import Langfuse
+
+    from control_plane.api.trace_facade import fetch_and_normalize
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SlowNotFound)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = Langfuse(
+        public_key=f"pk-lf-b201-{uuid4().hex}",
+        secret_key="sk-lf-b201",
+        host=f"http://127.0.0.1:{server.server_address[1]}",
+        timeout=1,
+        tracing_enabled=False,
+    )
+    try:
+        assert fetch_and_normalize(client, "a" * 32) == {"status": "not_ready"}
+    finally:
+        client.shutdown()
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# B-201 — every failure branch leaves a log line
+# ---------------------------------------------------------------------------
+
+_FACADE_LOGGER = "control_plane.api.trace_facade"
+
+
+def _only_warning(caplog: pytest.LogCaptureFixture) -> str:
+    records = [r for r in caplog.records if r.name == _FACADE_LOGGER]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    return records[0].getMessage()
+
+
+def test_fetch_failure_logs_class_and_trace_id_not_the_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from control_plane.api.trace_facade import fetch_and_normalize
+
+    client = _FakeLangfuseClient(exc=httpx.ReadTimeout("payload-ish detail"))
+    with caplog.at_level(logging.WARNING, logger=_FACADE_LOGGER):
+        assert fetch_and_normalize(client, "trace-b201") == {"status": "unavailable"}
+
+    message = _only_warning(caplog)
+    assert "trace-b201" in message
+    assert "ReadTimeout" in message
+    assert "payload-ish detail" not in message
+
+
+def test_normalize_failure_logs(caplog: pytest.LogCaptureFixture) -> None:
+    from control_plane.api.trace_facade import fetch_and_normalize
+
+    trace = _fake_trace()
+    trace.observations = [SimpleNamespace(id="o1")]  # missing every other field
+    with caplog.at_level(logging.WARNING, logger=_FACADE_LOGGER):
+        assert fetch_and_normalize(_FakeLangfuseClient(trace=trace), "trace-b201") == {
+            "status": "unavailable"
+        }
+
+    message = _only_warning(caplog)
+    assert "trace-b201" in message
+    assert "AttributeError" in message
+
+
+def test_raw_fetch_failure_logs(caplog: pytest.LogCaptureFixture) -> None:
+    from control_plane.api.trace_facade import fetch_span_raw
+
+    client = _FakeLangfuseClient(exc=httpx.ConnectError("payload-ish detail"))
+    with caplog.at_level(logging.WARNING, logger=_FACADE_LOGGER):
+        assert fetch_span_raw(client, "trace-b201", "obs-1", "input") is None
+
+    message = _only_warning(caplog)
+    assert "trace-b201" in message
+    assert "ConnectError" in message
+    assert "payload-ish detail" not in message
+
+
+# ---------------------------------------------------------------------------
+# B-201 — 运行结束 2 分钟后仍拼不成完整的树 → ``incomplete``(用户 2026-10-20 拍板)
+# ---------------------------------------------------------------------------
+
+
+def _orphaned_trace() -> SimpleNamespace:
+    """A closed trace whose only observation points at a parent that never
+    arrived — the shape every test-env trace had before the export fix."""
+    trace = _fake_trace()
+    trace.observations[0].parent_observation_id = "parent-never-ingested"
+    return trace
+
+
+def _unclosed_trace() -> SimpleNamespace:
+    trace = _fake_trace()
+    trace.latency = None  # Langfuse hasn't closed the trace out
+    return trace
+
+
+def _ago(**kwargs: float) -> datetime:
+    return datetime.now(UTC) - timedelta(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("label", "client"),
+    [
+        ("partial tree", lambda: _FakeLangfuseClient(trace=_orphaned_trace())),
+        ("not found", lambda: _FakeLangfuseClient(exc=NotFoundError(body="not found"))),
+        ("no latency", lambda: _FakeLangfuseClient(trace=_unclosed_trace())),
+    ],
+)
+def test_still_not_ready_two_minutes_after_the_run_is_incomplete(
+    label: str, client: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    from control_plane.api.trace_facade import fetch_and_normalize
+
+    assert fetch_and_normalize(client(), "trace-b201", finished_at=_ago(seconds=30)) == {
+        "status": "not_ready"
+    }
+    assert fetch_and_normalize(client(), "trace-b201", finished_at=None) == {"status": "not_ready"}
+    with caplog.at_level(logging.WARNING, logger=_FACADE_LOGGER):
+        assert fetch_and_normalize(client(), "trace-b201", finished_at=_ago(minutes=3)) == {
+            "status": "incomplete"
+        }
+    assert "trace-b201" in _only_warning(caplog)
+
+
+def test_complete_trace_stays_ok_long_after_the_run() -> None:
+    from control_plane.api.trace_facade import fetch_and_normalize
+
+    result = fetch_and_normalize(
+        _FakeLangfuseClient(trace=_fake_trace()), "trace-1", finished_at=_ago(hours=1)
+    )
+    assert result["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_trace_endpoint_reports_incomplete_from_the_runs_finished_at(
+    trace_client: AsyncClient,
+) -> None:
+    headers = _owner_headers()
+    thread_id = await _create_session(trace_client, headers)
+    fresh = await _seed_run(trace_client, thread_id=thread_id, trace_id="trace-1")
+    stale = await _seed_run(
+        trace_client, thread_id=thread_id, trace_id="trace-2", finished_ago=timedelta(minutes=3)
+    )
+    app = trace_client._transport.app  # type: ignore[attr-defined,union-attr]
+    app.state.langfuse_read_client = _FakeLangfuseClient(trace=_orphaned_trace())
+
+    resp = await trace_client.get(f"/v1/sessions/{thread_id}/runs/{fresh}/trace", headers=headers)
+    assert resp.json() == {"status": "not_ready"}
+    resp = await trace_client.get(f"/v1/sessions/{thread_id}/runs/{stale}/trace", headers=headers)
+    assert resp.json() == {"status": "incomplete"}

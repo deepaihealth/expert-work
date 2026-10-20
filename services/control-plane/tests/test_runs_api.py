@@ -2211,7 +2211,7 @@ class _StubTraceApi:
     def __init__(self, trace: Any) -> None:
         self._trace = trace
 
-    def get(self, trace_id: str) -> Any:
+    def get(self, trace_id: str, *, request_options: Any = None) -> Any:
         return self._trace
 
 

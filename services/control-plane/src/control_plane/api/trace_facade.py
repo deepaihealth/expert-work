@@ -26,14 +26,37 @@ extraction defends against both.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from langfuse.api import NotFoundError
 
 from expert_work.common.observability import LLM_SPAN_PURPOSES
 
-__all__ = ["TraceSpan", "fetch_and_normalize", "fetch_span_raw", "normalize_trace"]
+__all__ = [
+    "INCOMPLETE_AFTER",
+    "READ_TIMEOUT_SECONDS",
+    "TraceSpan",
+    "fetch_and_normalize",
+    "fetch_span_raw",
+    "normalize_trace",
+]
+
+logger = logging.getLogger(__name__)
+
+#: B-201 — per-request read timeout for ``api.trace.get``. Langfuse took 4-9 s
+#: per trace on the test environment, so the SDK's 5 s default timed out on
+#: most fetches. Passed per request because the read client shares the write
+#: client's SDK resources (one set per public key, first constructor wins):
+#: a ``timeout=`` on the read client's constructor is silently ignored.
+READ_TIMEOUT_SECONDS = 30
+_READ_OPTIONS = {"timeout_in_seconds": READ_TIMEOUT_SECONDS}
+
+#: B-201 (用户 2026-10-20 拍板) —— run 结束超过这么久,trace 仍拼不成一棵完整的树,
+#: 就报 ``incomplete``(控制台「数据不完整」),不再报 ``not_ready`` 让它一直重试。
+INCOMPLETE_AFTER = timedelta(minutes=2)
 
 _NAME_PREFIX = "expert_work."
 _TRUNCATION_SUFFIX = "…(已截断)"
@@ -196,7 +219,9 @@ def normalize_trace(trace: object) -> dict[str, object]:
     }
 
 
-def fetch_and_normalize(client: Any, trace_id: str) -> dict[str, object]:
+def fetch_and_normalize(
+    client: Any, trace_id: str, *, finished_at: datetime | None = None
+) -> dict[str, object]:
     """Fetch one trace from Langfuse and normalize it — Batch 4b Task 2.
 
     Unlike :func:`normalize_trace` this DOES touch the network (via the
@@ -204,28 +229,40 @@ def fetch_and_normalize(client: Any, trace_id: str) -> dict[str, object]:
     deliberate fail-soft degrade boundary, not a swallowed error: every
     branch returns an explicit ``status`` so the debug console can render
     "tracing off" vs "not ingested yet" vs a real trace, and a Langfuse
-    outage never turns into a 500 for the caller.
+    outage never turns into a 500 for the caller. The SDK call is blocking
+    HTTP — async callers run this in a worker thread (B-201).
+
+    ``finished_at`` is the run's end: once it is more than
+    :data:`INCOMPLETE_AFTER` ago, a trace that still isn't a complete tree is
+    ``incomplete`` rather than ``not_ready`` (see :func:`_not_ready`).
     """
     if client is None:
         return {"status": "unavailable"}
     try:
-        trace = client.api.trace.get(trace_id)
+        trace = client.api.trace.get(trace_id, request_options=_READ_OPTIONS)
     except NotFoundError:
         # Genuinely unknown, or Langfuse's async ingestion pipeline just
         # hasn't landed it yet — distinct from tracing being disabled.
-        return {"status": "not_ready"}
-    except Exception:
+        return _not_ready(trace_id, finished_at, reason="not_found")
+    except Exception as exc:
+        # Class only: SDK error messages can carry the response body.
+        logger.warning(
+            "trace_facade.fetch_failed trace_id=%s error=%s", trace_id, type(exc).__name__
+        )
         return {"status": "unavailable"}
     # Trace exists but Langfuse's aggregation hasn't finished yet (latency is
     # populated once the trace closes out) — tell the caller to retry rather
     # than rendering a bogus zero-latency row.
     if getattr(trace, "latency", None) is None:
-        return {"status": "not_ready"}
+        return _not_ready(trace_id, finished_at, reason="no_latency")
     try:
         normalized = normalize_trace(trace)
-    except Exception:
+    except Exception as exc:
         # Belt-and-suspenders: no code path from a successful trace.get()
         # should ever reach an uncaught exception (硬约束「降级永不 500」).
+        logger.warning(
+            "trace_facade.normalize_failed trace_id=%s error=%s", trace_id, type(exc).__name__
+        )
         return {"status": "unavailable"}
     # Langfuse ingestion is NOT atomic under load: a multi-span run's child
     # observations can land in Langfuse BEFORE their session-root parent does
@@ -242,8 +279,19 @@ def fetch_and_normalize(client: Any, trace_id: str) -> dict[str, object]:
     # instead of a confusing empty ruler.
     spans = normalized.get("spans")
     if not isinstance(spans, list) or not _is_renderable_tree(spans):
-        return {"status": "not_ready"}
+        return _not_ready(trace_id, finished_at, reason="partial_tree")
     return normalized
+
+
+def _not_ready(trace_id: str, finished_at: datetime | None, *, reason: str) -> dict[str, object]:
+    """``not_ready`` while Langfuse may still be ingesting; ``incomplete`` once
+    the run has been over for longer than :data:`INCOMPLETE_AFTER` — the
+    missing part is not coming any more, so the console stops retrying and
+    points at Langfuse instead (B-201)."""
+    if finished_at is None or datetime.now(UTC) - finished_at < INCOMPLETE_AFTER:
+        return {"status": "not_ready"}
+    logger.warning("trace_facade.incomplete trace_id=%s reason=%s", trace_id, reason)
+    return {"status": "incomplete"}
 
 
 def fetch_span_raw(client: Any, trace_id: str, span_id: str, field: str) -> str | None:
@@ -263,7 +311,7 @@ def fetch_span_raw(client: Any, trace_id: str, span_id: str, field: str) -> str 
     # degrade to None → 404, never a 500 (硬约束「降级永不 500」). Mirrors the
     # defensive ``json.dumps`` guard in :func:`_render_io`.
     try:
-        trace = client.api.trace.get(trace_id)
+        trace = client.api.trace.get(trace_id, request_options=_READ_OPTIONS)
         for o in getattr(trace, "observations", None) or []:
             if str(getattr(o, "id", "")) != span_id:
                 continue
@@ -277,7 +325,10 @@ def fetch_span_raw(client: Any, trace_id: str, span_id: str, field: str) -> str 
             return (
                 value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
             )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "trace_facade.raw_fetch_failed trace_id=%s error=%s", trace_id, type(exc).__name__
+        )
         return None
     return None
 
