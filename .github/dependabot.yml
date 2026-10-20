@@ -28,6 +28,12 @@ updates:
       - dependency-name: "mcp"
         update-types:
           - "version-update:semver-major"
+      # langfuse SDK v5 只支持自托管服务端 >= 4.59.0,我们跑 3.122.0;v5 还删了
+      # trace_facade.py 在用的 api.trace.get(#1860 混进周更组把 pytest 弄红)。
+      # 先升服务端再单独迁 SDK,迁完连同这条 ignore 和 protected_pins 条目一起删。
+      - dependency-name: "langfuse"
+        update-types:
+          - "version-update:semver-major"
 
   # apps/admin-ui(pnpm-lock.yaml 归 npm 生态)与 infra/sandbox-image 此前都
   # 不在本文件里,意味着只有 Dependabot **security updates** 会碰它们——那条

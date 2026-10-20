@@ -28,6 +28,7 @@ def test_tampered_pin_is_caught(tmp_path: Path) -> None:
         "services/orchestrator/pyproject.toml",
         "services/control-plane/pyproject.toml",
         "services/sandbox-supervisor/pyproject.toml",
+        "packages/expert-work-runtime/pyproject.toml",
     ):
         dst = root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
