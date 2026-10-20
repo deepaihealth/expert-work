@@ -531,9 +531,9 @@ async def test_oversized_table_block_is_split_before_embedding() -> None:
     assert count > 1
     assert embedder.inputs
     # Every embedding input (block embeddings for topic detection *and* the
-    # chunk texts) is bounded: body cap + carried overlap + heading prefix —
-    # never the 30k-token whole table.
-    assert max(count_tokens(text) for text in embedder.inputs) <= 512 + 64 + 16
+    # chunk texts) stays within the chunk cap — title, breadcrumb, carried
+    # overlap and body together (B-200) — never the 30k-token whole table.
+    assert max(count_tokens(text) for text in embedder.inputs) <= 512 + 4
 
 
 @pytest.mark.asyncio
@@ -744,3 +744,26 @@ async def test_concurrent_parses_survive_one_broken_pool(
 
     assert list(await asyncio.gather(first, second)) == ["# 标题\n\n正文", "# 标题\n\n正文"]
     assert len(_KillablePool.created) == 2  # the broken pool + exactly one rebuild
+
+
+@pytest.mark.asyncio
+async def test_embedding_inputs_count_the_document_title_against_the_cap() -> None:
+    # B-200 — the title each chunk's retrieval text carries is part of the cap.
+    store = InMemoryKnowledgeStore()
+    kb_id, doc_id = await _seed(store)
+    embedder = _RecordingEmbedder()
+    title_words = " ".join(f"title{i}" for i in range(30))
+    body = "\n\n".join(" ".join(f"w{p}x{i}." for i in range(60)) for p in range(12))
+    await ingest_document_bytes(
+        store=store,
+        embedder=embedder,
+        tenant_id=_TENANT,
+        document_id=doc_id,
+        kb_id=kb_id,
+        filename=f"{title_words}.md",
+        raw=body.encode(),
+        chunk_max_tokens=128,
+        chunk_overlap_tokens=16,
+    )
+    assert embedder.inputs
+    assert max(count_tokens(text) for text in embedder.inputs) <= 128 + 4

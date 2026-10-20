@@ -425,6 +425,7 @@ async def ingest_markdown(
         embedder=retrying,
         tenant_id=tenant_id,
         plain_text=plain_text,
+        doc_title=doc_title,
     )
     if not pieces:
         _ensure_written(

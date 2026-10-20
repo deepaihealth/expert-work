@@ -24,7 +24,11 @@ from orchestrator.tools import (
     ToolContext,
 )
 from orchestrator.tools.error_classifier import GuidedToolError, classify_tool_error
-from orchestrator.tools.knowledge import KNOWLEDGE_ANSWERABILITY_RULE, _parse_rerank_order
+from orchestrator.tools.knowledge import (
+    KNOWLEDGE_ANSWERABILITY_RULE,
+    RERANK_DOC_MAX_CHARS,
+    _parse_rerank_order,
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -794,6 +798,24 @@ async def test_reranker_sees_the_document_title_but_the_agent_sees_it_once() -> 
     ]
 
 
+async def test_every_document_handed_to_the_reranker_is_cut_to_the_cap() -> None:
+    # One over-long candidate made DashScope refuse the whole request, so the
+    # search lost its rerank (B-198); every caller cuts them first (B-200).
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="guide.pdf")
+    chunk = _chunk(
+        tenant=tenant, kb=base.id, doc=document.id, index=0, content="x" * 5000, embedding=(1.0,)
+    ).model_copy(update={"heading_path": ("Costs",)})
+    await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=[chunk])
+    reranker = _RecordingReranker()
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    await retriever.search(tenant_id=tenant, base_names=["kb"], query="x", limit=5)
+    (sent,) = reranker.documents
+    assert sent == chunk.retrieval_text[:RERANK_DOC_MAX_CHARS]
+
+
 class _ScoringReranker:
     """A scoring reranker: each text's score comes from ``scores`` (unknown
     texts score 0, or ``None`` throughout with ``unscored``); records each call."""
@@ -840,6 +862,15 @@ async def _titled_store(
     ]
     await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=chunks)
     return store, tenant, chunks
+
+
+async def test_two_view_rerank_cuts_both_views_to_the_cap() -> None:
+    store, tenant, _chunks = await _titled_store(["y" * 5000, "z" * 10], title="guide")
+    reranker = _ScoringReranker({})
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    await retriever.search(tenant_id=tenant, base_names=["kb"], query="y", limit=5)
+    assert len(reranker.calls) == 2
+    assert all(len(doc) <= RERANK_DOC_MAX_CHARS for docs, _ in reranker.calls for doc in docs)
 
 
 async def test_two_view_rerank_ranks_by_the_weighted_mean_of_both_views() -> None:

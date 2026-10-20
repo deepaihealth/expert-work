@@ -46,6 +46,17 @@ _DEFAULT_MAX_BATCH_SIZE = 10
 #: the reason, bounded so a stray HTML page can't flood it.
 _ERROR_BODY_LIMIT = 500
 
+#: Longest input sent to the embeddings API, in UTF-8 bytes (B-200). An input
+#: over the model's token limit makes the vendor refuse the whole request
+#: (text-embedding-v4 answers 400 past 16,000 tokens). Every token covers at
+#: least one byte, so a byte cap bounds the vendor's count whatever its
+#: tokenizer and the script; a count from another tokenizer does not (8,000
+#: o200k tokens of Hindi are over 20,000 text-embedding-v4 tokens). 8,000
+#: bytes fits every model that takes 8k tokens (OpenAI 8,191;
+#: text-embedding-v4 documents 8,192). Chunks sit well inside it; this is the
+#: last guard — for a long query, or a chunk size set past the model's limit.
+DEFAULT_MAX_INPUT_BYTES = 8000
+
 
 @runtime_checkable
 class Embedder(Protocol):
@@ -112,6 +123,15 @@ class HTTPEmbeddingClient:
             return body
 
 
+def fit_embedding_input(text: str, max_bytes: int) -> str:
+    """``text`` cut to its longest prefix within ``max_bytes`` UTF-8 bytes,
+    never inside a character; unchanged when it fits."""
+    raw = text.encode()
+    if len(raw) <= max_bytes:
+        return text
+    return raw[:max_bytes].decode(errors="ignore")
+
+
 @dataclass(frozen=True)
 class OpenAICompatibleEmbedder:
     """:class:`Embedder` over an OpenAI-compatible ``/v1/embeddings`` API."""
@@ -121,12 +141,16 @@ class OpenAICompatibleEmbedder:
     #: Inputs per request — split larger sets so qwen's 10-input cap (and any
     #: other vendor batch limit) is never exceeded. See _DEFAULT_MAX_BATCH_SIZE.
     max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE
+    #: Each input is cut to this many UTF-8 bytes before it is sent; ``None``
+    #: sends inputs whole. See DEFAULT_MAX_INPUT_BYTES.
+    max_input_bytes: int | None = DEFAULT_MAX_INPUT_BYTES
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         # Fixed-key embedder — the credential is baked into ``client``;
         # ``tenant_id`` is accepted for protocol conformance and ignored.
         del tenant_id
-        items = list(texts)
+        cap = self.max_input_bytes
+        items = [fit_embedding_input(text, cap) for text in texts] if cap else list(texts)
         if not items:
             return []
         vectors: list[tuple[float, ...]] = []

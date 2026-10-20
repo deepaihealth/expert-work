@@ -22,6 +22,7 @@ from control_plane.knowledge.chunking import (
 )
 from control_plane.knowledge.chunking import chunk_markdown as _chunk_markdown
 from control_plane.knowledge.chunking import chunk_markdown_semantic as _chunk_markdown_semantic
+from expert_work.protocol import chunk_retrieval_text
 
 
 # The cases below assert on the retrieval text (breadcrumb + body) — the exact
@@ -148,6 +149,26 @@ def test_oversized_table_splits_by_rows_keeping_header() -> None:
     # Every part is a valid table — the header row is repeated.
     for chunk in chunks:
         assert "| name | value |" in chunk
+
+
+def test_table_row_over_the_cap_is_cut_under_its_header() -> None:
+    # A spreadsheet cell holding a whole exported chat record made one row —
+    # and so one chunk — 30 times the cap (B-200).
+    record = " ".join(f"msg{i}" for i in range(400))
+    src = f"| id | content |\n| - | - |\n| 1 | short |\n| 2 | {record} |\n| 3 | tail |\n"
+    chunks = chunk_markdown(src, max_tokens=64, overlap_tokens=0)
+    assert all(count_tokens(chunk) <= 64 for chunk in chunks)
+    assert all(chunk.startswith("| id | content |\n| - | - |") for chunk in chunks)
+    words = set(re.findall(r"\w+", " ".join(chunks)))
+    assert {f"msg{i}" for i in range(400)} | {"short", "tail"} <= words
+
+
+def test_table_whose_header_fills_the_cap_is_cut_like_prose() -> None:
+    header = "| " + " | ".join(f"col{i}" for i in range(80)) + " |"
+    separator = "|" + " - |" * 80
+    chunks = chunk_markdown(f"{header}\n{separator}\n| 1 | 2 |\n", max_tokens=64, overlap_tokens=0)
+    assert len(chunks) > 1
+    assert all(count_tokens(chunk) <= 64 for chunk in chunks)
 
 
 def test_oversized_paragraph_is_hard_split() -> None:
@@ -531,3 +552,37 @@ def test_long_unbroken_line_keeps_every_word_whole() -> None:
     line = "\\\\n- ".join(f"Triage{i}: identify affected routes" for i in range(200))
     joined = " ".join(c.text for c in _chunk_markdown(line, max_tokens=64, overlap_tokens=8))
     assert set(re.findall(r"\w+", line)) <= set(re.findall(r"\w+", joined))
+
+
+# The chunk cap bounds the whole embedded text — document title + breadcrumb +
+# body, as Onyx sizes chunks (B-200) — not the body alone.
+def test_chunk_cap_bounds_title_breadcrumb_and_body_together() -> None:
+    title = " ".join(f"title{i}" for i in range(12))
+    headings = "".join(
+        f"{'#' * (i + 1)} " + " ".join(f"h{i}w{j}" for j in range(8)) + "\n\n" for i in range(5)
+    )
+    body = " ".join(f"word{i}." for i in range(400))
+    chunks = _chunk_markdown(headings + body, max_tokens=64, overlap_tokens=8, doc_title=title)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert count_tokens(chunk_retrieval_text(c.heading_path, c.body, title)) <= 64 + 4
+
+
+def test_long_breadcrumb_drops_outer_headings_first() -> None:
+    headings = "".join(f"{'#' * (i + 1)} level{i} " + "pad " * 10 + "\n\n" for i in range(5))
+    chunks = _chunk_markdown(headings + "Body text.\n", max_tokens=64, overlap_tokens=0)
+    (chunk,) = chunks
+    assert chunk.heading_path
+    assert chunk.heading_path[-1].startswith("level4")
+    assert not any(h.startswith("level0") for h in chunk.heading_path)
+    assert count_tokens(chunk_retrieval_text(chunk.heading_path, "")) <= 64 // 4
+
+
+def test_overlap_is_dropped_when_it_would_push_a_chunk_past_the_cap() -> None:
+    # Two paragraphs each just under the cap: carrying the first one's tail
+    # in front of the second would overrun it, so that chunk opens without.
+    para_a = " ".join(f"alpha{i}" for i in range(26))
+    para_b = " ".join(f"beta{i}" for i in range(26))
+    chunks = _chunk_markdown(f"{para_a}\n\n{para_b}\n", max_tokens=64, overlap_tokens=16)
+    assert len(chunks) == 2
+    assert all(count_tokens(c.text) <= 64 for c in chunks)

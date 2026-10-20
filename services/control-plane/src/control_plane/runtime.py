@@ -93,6 +93,7 @@ from orchestrator.agent_factory import (
 )
 from orchestrator.errors import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.llm import (
+    DEFAULT_MAX_INPUT_BYTES,
     DashScopeReranker,
     Embedder,
     HTTPDashScopeRerankClient,
@@ -1128,6 +1129,8 @@ class ResolvingEmbedder:
     #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
     #: yet wired) reads the vault every call (pre-T3 behaviour).
     secret_cache: CredentialValueCache | None = None
+    #: B-200 — each input is cut to this many UTF-8 bytes before it is sent.
+    max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
@@ -1147,7 +1150,9 @@ class ResolvingEmbedder:
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
         span.set_attribute("secret_ms", round((t2 - t1) * 1000))
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key, http=self.http), model=self.model
+            client=HTTPEmbeddingClient(api_key=api_key, http=self.http),
+            model=self.model,
+            max_input_bytes=self.max_input_bytes,
         )
         return await delegate.embed(texts, tenant_id=tenant_id)
 
@@ -1262,6 +1267,8 @@ class DynamicResolvingEmbedder:
     #: 二期 PR2 T3 — process-level secret-value cache. ``None`` (tests / not
     #: yet wired) reads the vault every call (pre-T3 behaviour).
     secret_cache: CredentialValueCache | None = None
+    #: B-200 — each input is cut to this many UTF-8 bytes before it is sent.
+    max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         if not texts:
@@ -1297,7 +1304,9 @@ class DynamicResolvingEmbedder:
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
         span.set_attribute("secret_ms", round((t3 - t2) * 1000))
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key, http=self.http), model=model
+            client=HTTPEmbeddingClient(api_key=api_key, http=self.http),
+            model=model,
+            max_input_bytes=self.max_input_bytes,
         )
         return f"{provider}/{model}", delegate
 

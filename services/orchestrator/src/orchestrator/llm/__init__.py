@@ -14,6 +14,7 @@ Public surface:
 
 from orchestrator.llm.caller import LLMCaller as LLMCaller
 from orchestrator.llm.embedder import DEFAULT_EMBEDDINGS_PATH as DEFAULT_EMBEDDINGS_PATH
+from orchestrator.llm.embedder import DEFAULT_MAX_INPUT_BYTES as DEFAULT_MAX_INPUT_BYTES
 from orchestrator.llm.embedder import QWEN_EMBEDDING_BASE_URL as QWEN_EMBEDDING_BASE_URL
 from orchestrator.llm.embedder import Embedder as Embedder
 from orchestrator.llm.embedder import EmbeddingClient as EmbeddingClient
@@ -143,6 +144,7 @@ __all__ = [
     "DEEPSEEK_BASE_URL",
     "DEFAULT_CHAT_COMPLETIONS_PATH",
     "DEFAULT_EMBEDDINGS_PATH",
+    "DEFAULT_MAX_INPUT_BYTES",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_TIME_PERIOD_S",
     "DOUBAO_BASE_URL",

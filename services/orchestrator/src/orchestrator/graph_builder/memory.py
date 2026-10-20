@@ -73,7 +73,7 @@ from orchestrator.graph_builder._config import (
 )
 from orchestrator.llm import Embedder, LLMCaller
 from orchestrator.state import AgentState
-from orchestrator.tools.knowledge import Reranker
+from orchestrator.tools.knowledge import Reranker, rerank_documents
 
 logger = logging.getLogger(__name__)
 
@@ -356,7 +356,7 @@ async def _rerank_memories(
         order = await token.run_cancellable(
             reranker.rerank(
                 query=query,
-                documents=[m.content for m in candidates],
+                documents=rerank_documents(m.content for m in candidates),
                 top_k=top_k,
                 tenant_id=tenant_id,
             )

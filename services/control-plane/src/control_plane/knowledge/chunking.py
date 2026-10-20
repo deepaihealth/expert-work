@@ -61,6 +61,10 @@ _CONTENT_STANDALONE = frozenset({"fence", "code_block", "html_block"})
 #: shifted every later block onto the wrong lines — text silently lost (B-181).
 _LINE_BREAK = re.compile(r"\r\n?|\n")
 
+#: Tokens the ``\n\n`` between two packed pieces costs (at most; it can merge
+#: with a neighbour). Counted so the packed body stays within its budget.
+_JOIN_TOKENS = 1
+
 #: Longest heading taken as a section title; a longer one is kept as content.
 #: A 17 KB "heading" (a whole meeting transcript above a ``---`` line, read as
 #: a setext heading) put its text in no chunk body and on every chunk's
@@ -140,22 +144,29 @@ class TextChunk:
 
 
 def chunk_markdown(
-    markdown: str, *, max_tokens: int, overlap_tokens: int, plain_text: bool = False
+    markdown: str,
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+    plain_text: bool = False,
+    doc_title: str | None = None,
 ) -> list[TextChunk]:
     """Slice ``markdown`` into retrieval chunks — the structural chunker (no
     semantic refinement).
 
-    ``max_tokens`` bounds a chunk's body; ``overlap_tokens`` of the
-    previous chunk's tail is carried into the next chunk *within the
-    same section*. ``plain_text`` reads the input as plain text, not
-    Markdown (a ``.txt`` file). Returns chunk texts in document order;
-    empty input yields an empty list.
+    ``max_tokens`` bounds a chunk's whole embedded text — ``doc_title`` (the
+    title its retrieval text will carry), breadcrumb and body together;
+    ``overlap_tokens`` of the previous chunk's tail is carried into the next
+    chunk *within the same section*. ``plain_text`` reads the input as plain
+    text, not Markdown (a ``.txt`` file). Returns chunk texts in document
+    order; empty input yields an empty list.
     """
     return _pack_blocks(
         _blocks(markdown, plain_text=plain_text),
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         semantic_breaks=frozenset(),
+        doc_title=doc_title,
     )
 
 
@@ -167,6 +178,7 @@ async def chunk_markdown_semantic(
     embedder: Embedder,
     tenant_id: UUID,
     plain_text: bool = False,
+    doc_title: str | None = None,
 ) -> list[TextChunk]:
     """Like :func:`chunk_markdown`, but additionally splits a section at
     *topic shifts* — adjacent blocks whose embeddings are far apart.
@@ -190,6 +202,7 @@ async def chunk_markdown_semantic(
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         semantic_breaks=semantic_breaks,
+        doc_title=doc_title,
     )
 
 
@@ -199,12 +212,18 @@ def _pack_blocks(
     max_tokens: int,
     overlap_tokens: int,
     semantic_breaks: frozenset[int],
+    doc_title: str | None = None,
 ) -> list[TextChunk]:
     """Pack blocks into chunks. Flush on a heading change, on a
     ``semantic_breaks`` index (a topic shift) once the chunk holds
-    :data:`MIN_SEMANTIC_CHUNK_TOKENS`, and on the token cap."""
+    :data:`MIN_SEMANTIC_CHUNK_TOKENS`, and on the section's body budget
+    (the cap less the title and breadcrumb, see :func:`_section_budget`)."""
     chunks: list[TextChunk] = []
     trail: tuple[str, ...] = ()
+    shown, budget = _section_budget(trail, doc_title, max_tokens)
+    # A piece cut from an oversized block leaves room for the overlap carried
+    # in front of it, so the cap holds overlap included.
+    reserve = overlap_tokens + _JOIN_TOKENS if overlap_tokens > 0 else 0
     buffer: list[str] = []
     buffer_tokens = 0
 
@@ -213,7 +232,7 @@ def _pack_blocks(
         if not buffer:
             return
         body = "\n\n".join(buffer)
-        chunks.append(TextChunk(body=body, heading_path=trail))
+        chunks.append(TextChunk(body=body, heading_path=shown))
         tail = _tail_text(body, overlap_tokens) if carry_overlap else ""
         buffer = [tail] if tail.strip() else []
         buffer_tokens = count_tokens(tail) if buffer else 0
@@ -222,18 +241,40 @@ def _pack_blocks(
         if block.heading_trail != trail:
             flush(carry_overlap=False)
             trail = block.heading_trail
+            shown, budget = _section_budget(trail, doc_title, max_tokens)
         elif index in semantic_breaks and buffer_tokens >= MIN_SEMANTIC_CHUNK_TOKENS:
             # Topic shift inside a section — a clean boundary, no overlap. A
             # shorter fragment stays and opens the next chunk instead.
             flush(carry_overlap=False)
-        for piece in _prepare_block(block, max_tokens):
+        for piece in _prepare_block(block, budget, reserve=reserve):
             piece_tokens = count_tokens(piece)
-            if buffer and buffer_tokens + piece_tokens > max_tokens:
+            if buffer and buffer_tokens + _JOIN_TOKENS + piece_tokens > budget:
                 flush(carry_overlap=True)
+                if buffer and buffer_tokens + _JOIN_TOKENS + piece_tokens > budget:
+                    # No room for the carried overlap beside this piece — the
+                    # cap bounds the whole text, so the chunk opens without it.
+                    buffer, buffer_tokens = [], 0
+            buffer_tokens += piece_tokens + (_JOIN_TOKENS if buffer else 0)
             buffer.append(piece)
-            buffer_tokens += piece_tokens
     flush(carry_overlap=False)
     return chunks
+
+
+def _section_budget(
+    trail: tuple[str, ...], doc_title: str | None, max_tokens: int
+) -> tuple[tuple[str, ...], int]:
+    """The breadcrumb a section's chunks carry and the body budget left
+    beside it. The cap bounds the whole embedded text — title, breadcrumb and
+    body, as Onyx sizes its chunks (B-200) — so no embedding input outgrows
+    the chunk size. A breadcrumb over a quarter of the cap loses its outermost
+    headings first; the body keeps at least half the cap."""
+
+    def prefix_tokens(path: tuple[str, ...]) -> int:
+        return count_tokens(chunk_retrieval_text(path, "", doc_title))
+
+    while trail and prefix_tokens(trail) > max_tokens // 4:
+        trail = trail[1:]
+    return trail, max(max_tokens - prefix_tokens(trail), max_tokens // 2)
 
 
 def _semantic_breaks(blocks: list[_Block], embeddings: Sequence[Sequence[float]]) -> frozenset[int]:
@@ -351,25 +392,39 @@ def _presplit_blocks(blocks: list[_Block], max_tokens: int) -> list[_Block]:
     ]
 
 
-def _prepare_block(block: _Block, max_tokens: int) -> list[str]:
-    """Return ``block`` as one or more pieces, each within ``max_tokens``."""
+def _prepare_block(block: _Block, max_tokens: int, *, reserve: int = 0) -> list[str]:
+    """Return ``block`` as one or more pieces, each within ``max_tokens``. A
+    block that has to be cut is cut ``reserve`` tokens shorter (but to no less
+    than a quarter of the cap), leaving room for what is packed in front of
+    each piece."""
     if count_tokens(block.text) <= max_tokens:
         return [block.text]
+    size = max(max_tokens - reserve, max_tokens // 4)
     if block.kind == "table":
-        return _split_table(block.text, max_tokens)
-    return _hard_split(block.text, max_tokens)
+        return _split_table(block.text, size)
+    return _hard_split(block.text, size)
 
 
 def _split_table(table: str, max_tokens: int) -> list[str]:
     """Split an oversized Markdown table by rows, repeating the header +
-    separator rows in every part so each part is a valid table."""
+    separator rows in every part so each part is a valid table. A row that
+    alone outruns the cap (a cell holding a whole exported chat record) is cut
+    like prose, each piece under the header; a header that leaves under a
+    quarter of the cap is cut along with the rest of the table."""
     lines = _LINE_BREAK.split(table)
-    if len(lines) <= 2:  # header + separator only — nothing to split
-        return [table]
     header = "\n".join(lines[:2])
+    room = max_tokens - count_tokens(header) - _JOIN_TOKENS
+    if room < max_tokens // 4:
+        return _hard_split(table, max_tokens)
     parts: list[str] = []
     current: list[str] = []
     for row in lines[2:]:
+        if count_tokens(row) > room:
+            if current:
+                parts.append("\n".join([header, *current]))
+                current = []
+            parts.extend(f"{header}\n{piece}" for piece in _hard_split(row, room))
+            continue
         candidate = "\n".join([header, *current, row])
         if current and count_tokens(candidate) > max_tokens:
             parts.append("\n".join([header, *current]))
