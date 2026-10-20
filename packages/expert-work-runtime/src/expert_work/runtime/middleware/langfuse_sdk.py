@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
+from expert_work.common.observability import TRACER_NAME
 from expert_work.runtime.audit.redactor import (
     DEFAULT_PATTERNS,
     PII_PATTERNS,
@@ -201,6 +202,24 @@ def build_langfuse_span_exporter(
     )
 
 
+def should_export_span(span: ReadableSpan) -> bool:
+    """Which spans the Langfuse span processor ships — B-201.
+
+    langfuse 4.x's default (``is_default_export_span``) keeps only its own
+    spans, spans with ``gen_ai.*`` attributes and known LLM instrumentation
+    scopes; our ``expert-work`` tracer is none of those. On the default every
+    request / run / node / tool span was dropped while the generations under
+    them were kept, so each observation in Langfuse pointed at a parent that
+    never arrived. Ours are added on top of the default, nothing else.
+    """
+    from langfuse.span_filter import is_default_export_span
+
+    scope = span.instrumentation_scope
+    if scope is not None and scope.name == TRACER_NAME:
+        return True
+    return is_default_export_span(span)
+
+
 def make_langfuse_client(
     *,
     host: str | None,
@@ -242,6 +261,8 @@ def make_langfuse_client(
         "span_exporter": build_langfuse_span_exporter(
             host=host, public_key=public_key, secret_key=secret_key
         ),
+        # B-201 — without it langfuse 4.x drops every span of our own tracer.
+        "should_export_span": should_export_span,
     }
     if pii_masking_enabled:
         kwargs["mask"] = _build_pii_mask()
