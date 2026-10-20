@@ -107,7 +107,7 @@
 | 每库按 30~50 条业务查询校准重排阈值 | Cohere 官方方法 | 采纳,管理端提供校准助手 |
 | 隐式过滤(模型从问题抽元数据条件) | Bedrock | 智能体工具的 `filters` 参数覆盖,不另做 |
 | 知识图谱 / GraphRAG | GraphRAG 成本高;LazyGraphRAG 0.1% 成本;LightRAG | **暂缓**:先把「整理成条目」做扎实,图谱只给全局总结类需求 |
-| 查询改写 / HyDE | Anthropic 实测 HyDE 效果差;智能体自己写查询 | 智能体场景**默认不做**;对外检索 API 提供 `rewrite_query` 选项,默认关 |
+| 查询改写 / HyDE | ~~Anthropic 实测 HyDE 效果差~~(**2026-10-21 更正**:Anthropic 文章只列举了 HyDE、没有测;「效果低 / 收益有限」说的是摘要索引与通用文档摘要);智能体自己写查询 | 智能体场景是否做**以 [B-206](2026-10-21-b206-kb-retrieval-loss-driven-optimization-design.md) K-10 为准**(多路查询,必须保留原问题一路);对外检索 API 提供 `rewrite_query` 选项,默认关 |
 | 回调 webhook | 6 家开源**都没有** | 我们做(第三方必需,差异点),放开放 API 第二期 |
 
 ### 3.3 本地仓库借鉴
