@@ -15,7 +15,7 @@ function span(p: Partial<TraceSpan> & Pick<TraceSpan, "id" | "kind" | "label">):
 const okTrace = (spans: TraceSpan[]): RunTrace => ({ status: "ok", trace: { name: "run", latencyMs: 100, totalCostUsd: 0.01, spanCount: spans.length }, spans });
 const think = (id: string, seq: number): TrajectoryRow => ({ ...base, id, seq, kind: "think", text: "", content: null, model: null, inputTokens: 0, outputTokens: 0, finishReason: null });
 const tool = (id: string, name: string): TrajectoryRow => ({ ...base, id, kind: "tool", entry: { id, rawName: name, isMcp: false, server: null, toolName: name, args: {}, status: "success", resultPreview: null, durationMs: 1 } });
-const assistant = (id: string, seq: number, step: number | null): TrajectoryRow => ({ ...base, id, seq, step, kind: "assistant", text: "", reasoning: "", model: null, inputTokens: 0, outputTokens: 0, finishReason: null, toolCallCount: 0 });
+const assistant = (id: string, seq: number, step: number | null): TrajectoryRow => ({ ...base, id, seq, step, kind: "assistant", text: "", reasoning: "", model: null, inputTokens: 0, outputTokens: 0, finishReason: null, toolCallCount: 0, toolCalls: [] });
 
 describe("matchTraceSpans", () => {
   it("no trace / not ok → every row no_trace", () => {

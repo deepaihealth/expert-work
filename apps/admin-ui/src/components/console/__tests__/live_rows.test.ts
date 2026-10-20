@@ -101,6 +101,11 @@ describe("liveLedgerRows", () => {
       durationMs: null, eventIndexes: [], serverMs: null,
     });
     expect(rows[3]).toMatchObject({ kind: "assistant", step: 3, text: "", reasoning: "", toolCallCount: 0 });
+    // B-202 —— 还没落帧的步只知道工具名,参数未知(与 live tool 行的 `args: {}` 同口径)。
+    expect(rows[0]).toMatchObject({
+      toolCalls: [{ name: "query_crm", args: {} }, { name: "search", args: {} }],
+    });
+    expect(rows[3]).toMatchObject({ toolCalls: [] });
     expect(rows[1]).toMatchObject({
       kind: "tool", seq: -1, step: 2, status: "running",
       entry: { id: "live-2-call_a", toolName: "query_crm", status: "pending" },

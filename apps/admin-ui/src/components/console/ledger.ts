@@ -137,7 +137,7 @@ function placeholderAssistantRow(turn: ConsoleTurn): TrajectoryRow {
     durationMs: null, eventIndexes: [], serverMs: null,
     text: turn.fallbackLines[0]?.text ?? "",
     reasoning: "", model: null, inputTokens: 0, outputTokens: 0,
-    finishReason: null, toolCallCount: 0,
+    finishReason: null, toolCallCount: 0, toolCalls: [],
   };
 }
 

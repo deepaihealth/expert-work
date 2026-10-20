@@ -36,6 +36,7 @@ function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
     cacheReadTokens: 7,
     finishReason: "stop",
     toolCallCount: 2,
+    toolCalls: [],
     ...over,
   };
 }

@@ -25,7 +25,7 @@ function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
   return {
     id: "assistant:1", kind: "assistant", seq: 1, step: 1, status: "ok", durationMs: 120,
     eventIndexes: [], serverMs: null, text: "我来查一下", reasoning: "", model: "glm-5.2",
-    inputTokens: 10, outputTokens: 4, finishReason: "stop", toolCallCount: 1, ...over,
+    inputTokens: 10, outputTokens: 4, finishReason: "stop", toolCallCount: 1, toolCalls: [], ...over,
   };
 }
 const toolRow: ToolRow = {

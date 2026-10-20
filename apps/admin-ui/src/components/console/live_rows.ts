@@ -155,6 +155,7 @@ export function liveLedgerRows(
       outputTokens: 0,
       finishReason: null,
       toolCallCount: live.toolNames.size,
+      toolCalls: [...live.toolNames.values()].map((name) => ({ name, args: {} })),
     });
     for (const row of liveToolRows(step, live)) rows.push(row);
   }

@@ -51,6 +51,7 @@ function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
     outputTokens: 60,
     finishReason: "stop",
     toolCallCount: 1,
+    toolCalls: [],
     ...over,
   };
 }

@@ -80,6 +80,7 @@ function assistantRow(over: Partial<AssistantRow> = {}): AssistantRow {
     cacheReadTokens: 7,
     finishReason: "stop",
     toolCallCount: 2,
+    toolCalls: [],
     ...over,
   };
 }
@@ -508,6 +509,49 @@ describe("RecordDetails", () => {
     const thinking = screen.getByTestId("console-detail-rawtext-thinking");
     expect(thinking.tagName).toBe("DETAILS");
     expect(thinking.textContent).toContain("先查客户档案");
+  });
+
+  // B-202 —— 只调工具、没有正文的步骤(会话 0e878fd6 第 1 轮 22 步里 15 步):
+  // 账本写「（仅工具调用）」,而「预览」「原文」原来一片空白。
+  const toolOnly = (): AssistantRow =>
+    assistantRow({
+      text: "",
+      reasoning: "",
+      reasoningTokens: undefined,
+      toolCallCount: 2,
+      toolCalls: [
+        { name: "web_search", args: { q: "退款时效" } },
+        { name: "read_document", args: { doc_id: "d-1", page: 3 } },
+      ],
+    });
+
+  it("B-202 — 只调工具的 assistant 预览:列出每个工具和参数", () => {
+    renderRecord({ record: rec(toolOnly()), activeTab: "preview" });
+    const block = screen.getByTestId("console-detail-tool-calls");
+    expect(block.textContent).toContain("No text in this step; it only called tools:");
+    const calls = within(block).getAllByTestId("console-detail-tool-call");
+    expect(calls).toHaveLength(2);
+    expect(calls[0].textContent).toContain("web_search");
+    expect(calls[0].textContent).toContain('"q": "退款时效"');
+    expect(calls[1].textContent).toContain("read_document");
+    expect(calls[1].textContent).toContain('"page": 3');
+  });
+
+  it("B-202 — 只调工具的 assistant 原文:工具名 + 参数 JSON 原样", () => {
+    renderRecord({ record: rec(toolOnly()), activeTab: "rawtext" });
+    const block = screen.getByTestId("console-detail-tool-calls");
+    expect(block.querySelector("pre")?.textContent).toBe(
+      'web_search {\n  "q": "退款时效"\n}\n\nread_document {\n  "doc_id": "d-1",\n  "page": 3\n}',
+    );
+  });
+
+  it("B-202 — 有正文的步骤照旧只显示正文,不列工具调用", () => {
+    renderRecord({
+      record: rec(assistantRow({ toolCalls: [{ name: "web_search", args: { q: "x" } }] })),
+      activeTab: "preview",
+    });
+    expect(screen.queryByTestId("console-detail-tool-calls")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "结论" })).toBeInTheDocument();
   });
 
   it("user 预览:没有思考折叠段", () => {

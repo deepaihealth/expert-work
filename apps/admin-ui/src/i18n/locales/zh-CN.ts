@@ -1481,6 +1481,7 @@ const zhCN: TranslationKeys = {
     detail_worker_steps: "子智能体步数",
     detail_need_langfuse: "模型输入只在 Langfuse 精确轨迹里有；本行还没配到 span。",
     detail_no_frames: "该行没有对应的原始帧。",
+    detail_tool_calls_only: "这一步没有正文,只调用了工具:",
     raw_time_server_hint: "服务器记录这一帧的时刻",
     raw_time_received: "收到 {{time}}",
     raw_time_received_hint: "这一帧没带服务器时间,显示的是浏览器收到它的时刻(回放历史运行时就是回放那一刻)",
