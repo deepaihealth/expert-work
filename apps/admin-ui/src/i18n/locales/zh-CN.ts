@@ -1509,7 +1509,7 @@ const zhCN: TranslationKeys = {
     stats_chip_in: "入",
     stats_chip_out: "出",
     stats_chip_cost: "费用",
-    process_think: "思考 {{n}} 次",
+    process_model_calls: "模型调用 {{n}} 次",
     process_tools: "工具 {{n}} 次",
     process_tools_detailed: "工具 {{n}} 次（{{breakdown}}）",
     process_other: "其他 {{n}} 步",

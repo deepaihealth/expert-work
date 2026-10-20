@@ -59,6 +59,32 @@ export function liveSyntheticRows(
   return rows;
 }
 
+/** 一次模型调用 —— 过程条数「模型调用 N 次」、加时长都按它来(B-202)。 */
+export interface ModelCall {
+  /** 该步 agent 节点的 `_duration_ms`;没报 / 还在跑 → null。 */
+  durationMs: number | null;
+}
+
+/** 一轮的全部模型调用:每个已落帧的 agent 步一次,外加 live 轮里还没落帧的步
+ *  各一次(还在跑,时长 null)。B-202 —— 不能从紧凑行反推:紧凑投影只在步骤
+ *  写了思考时才出 think 行,直接调工具的步骤一行都不出,过程条因此漏掉了它们的
+ *  次数和耗时(会话 0e878fd6 第 1 轮:22 次调用只有 7 次带思考,时长少 2m42s)。 */
+export function modelCallsOf(
+  events: readonly SseEvent[],
+  liveByStep: ReadonlyMap<number, LiveStep> | undefined,
+): ModelCall[] {
+  const calls: ModelCall[] = [];
+  for (const item of parseTimeline(events)) {
+    if (item.kind === "agent") calls.push({ durationMs: item.durationMs });
+  }
+  if (liveByStep) {
+    for (const step of unsettledSteps(events, liveByStep)) {
+      if (liveByStep.has(step)) calls.push({ durationMs: null });
+    }
+  }
+  return calls;
+}
+
 /** 一个未落帧步里每个「已报名字、还没结果」的工具调用一条行 —— 中栏紧凑投影
  *  与账本投影共用(两处的工具行完全同形,只有 agent 步的投影不同)。 */
 function liveToolRows(step: number, live: LiveStep): ToolRow[] {

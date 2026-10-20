@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { liveLedgerRows, liveSyntheticRows, settledStepsOf } from "../live_rows";
+import { liveLedgerRows, liveSyntheticRows, modelCallsOf, settledStepsOf } from "../live_rows";
 import type { SseEvent } from "../../../api/sessions";
 import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
 
@@ -26,6 +26,25 @@ describe("settledStepsOf", () => {
   });
   it("returns an empty set for events with no settled agent step", () => {
     expect(settledStepsOf([])).toEqual(new Set());
+  });
+});
+
+describe("modelCallsOf", () => {
+  it("B-202 — one call per settled agent step (reasoning or not) plus one per unsettled live step", () => {
+    const withDuration: SseEvent = {
+      id: null, event: "updates", rawData: "", receivedAt: "",
+      data: { agent: { step_count: 2, _duration_ms: 1500, messages: [{ type: "ai", content: "", tool_calls: [] }] } },
+    };
+    const liveByStep = new Map<number, LiveStep>([
+      [2, liveStep({ content: "settled leftover" })], // 已落帧 —— 不重复计
+      [3, liveStep()], // 还在跑,思考 / 正文都还是空的,照样是一次调用
+    ]);
+    expect(modelCallsOf([agentUpdate(1), withDuration], liveByStep)).toEqual([
+      { durationMs: null },
+      { durationMs: 1500 },
+      { durationMs: null },
+    ]);
+    expect(modelCallsOf([], undefined)).toEqual([]);
   });
 });
 

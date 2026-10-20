@@ -1416,7 +1416,7 @@ export interface TranslationKeys {
     stats_chip_in: string;
     stats_chip_out: string;
     stats_chip_cost: string;
-    process_think: string;
+    process_model_calls: string;
     process_tools: string;
     process_tools_detailed: string;
     process_other: string;
@@ -4839,7 +4839,7 @@ const en: TranslationKeys = {
     stats_chip_in: "In",
     stats_chip_out: "Out",
     stats_chip_cost: "Cost",
-    process_think: "Thinking ×{{n}}",
+    process_model_calls: "Model calls ×{{n}}",
     process_tools: "Tools ×{{n}}",
     process_tools_detailed: "Tools ×{{n}} ({{breakdown}})",
     process_other: "{{n}} other steps",

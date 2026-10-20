@@ -67,8 +67,8 @@ function childrenOf(records: readonly LedgerRecord[], ownerId: string): LedgerRe
   return [...direct, ...transitive];
 }
 
-/** A turn's process summary: assistant records count as "think" (spec §九
- *  — one ASSISTANT record per step replaces the compact THINK row), tool
+/** A turn's process summary: assistant records count as "modelCalls" (spec §九
+ *  — one ASSISTANT record per step, i.e. per model call), tool
  *  records count as "tools" (and feed ``toolBreakdown``), every other
  *  non-context kind (``CONTEXT_KINDS`` — not user, not the PR-A.3 SYSTEM
  *  row) counts as "other". ``failed`` is the non-assistant
@@ -77,7 +77,7 @@ function childrenOf(records: readonly LedgerRecord[], ownerId: string): LedgerRe
  *  timestamps (``null`` when none do). Summing each record's own span
  *  instead would count parallel tool calls twice over. */
 export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary {
-  let think = 0;
+  let modelCalls = 0;
   let tools = 0;
   let other = 0;
   let failed = 0;
@@ -87,7 +87,7 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
   const skillsByName = new Map<string, TurnSkill>();
 
   for (const r of records) {
-    if (r.kind === "assistant") think += 1;
+    if (r.kind === "assistant") modelCalls += 1;
     else if (r.kind === "tool") {
       tools += 1;
       if (r.row.kind === "tool") {
@@ -109,7 +109,7 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
   }
 
   return {
-    think,
+    modelCalls,
     tools,
     other,
     failed,

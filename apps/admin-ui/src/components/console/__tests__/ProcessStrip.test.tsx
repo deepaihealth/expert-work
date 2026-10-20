@@ -12,7 +12,8 @@ import userEvent from "@testing-library/user-event";
 import i18n from "../../../i18n";
 
 import type { SseEvent } from "../../../api/sessions";
-import { compactRowsOf, type CompactRow } from "../../../api/trajectory_rows";
+import { compactRowsOf } from "../../../api/trajectory_rows";
+import { modelCallsOf } from "../live_rows";
 import { ProcessStrip, type ProcessStripProps } from "../ProcessStrip";
 
 function ev(event: string, data: unknown): SseEvent {
@@ -48,13 +49,17 @@ function stepEvents(n: number): SseEvent[] {
   return out;
 }
 
-function stripRows(rows: readonly CompactRow[]): ProcessStripProps["rows"] {
-  return rows.map((row) => ({ row }));
+/** TurnBlock 同款:紧凑行 + 这一轮的全部模型调用。 */
+function fromEvents(events: readonly SseEvent[]): Pick<ProcessStripProps, "rows" | "modelCalls"> {
+  return {
+    rows: compactRowsOf(events).map((row) => ({ row })),
+    modelCalls: modelCallsOf(events, undefined),
+  };
 }
 
 function makeProps(over: Partial<ProcessStripProps> = {}): ProcessStripProps {
   return {
-    rows: stripRows(compactRowsOf(stepEvents(1))),
+    ...fromEvents(stepEvents(1)),
     running: false,
     expandedRowIds: new Set<string>(),
     onToggleRow: vi.fn(),
@@ -90,7 +95,7 @@ describe("ProcessStrip", () => {
     renderStrip(makeProps());
 
     const head = screen.getByTestId("console-process-head");
-    expect(head).toHaveTextContent("思考 1 次 · 工具 1 次（web_search ×1）");
+    expect(head).toHaveTextContent("模型调用 1 次 · 工具 1 次（web_search ×1）");
     expect(head).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("console-process-steps")).not.toBeInTheDocument();
     expect(screen.queryByTestId("console-process-spinner")).not.toBeInTheDocument();
@@ -118,7 +123,7 @@ describe("ProcessStrip", () => {
         ],
       }),
     ];
-    renderStrip(makeProps({ rows: stripRows(compactRowsOf(events)) }));
+    renderStrip(makeProps(fromEvents(events)));
 
     // 折叠态(settled 默认收起)chips 仍在 —— 「用了哪些技能」不该要求展开。
     expect(screen.queryByTestId("console-process-steps")).not.toBeInTheDocument();
@@ -134,19 +139,19 @@ describe("ProcessStrip", () => {
   });
 
   it("the head button's accessible name is the headline itself — no aria-label masking it", () => {
-    renderStrip(makeProps({ rows: stripRows(compactRowsOf(stepEvents(3))) }));
+    renderStrip(makeProps(fromEvents(stepEvents(3))));
 
     // 头部原来挂着 `aria-label="展开过程"`,它把摘要整段盖掉了 —— 屏幕阅读器
-    // 只听得到「展开过程」,听不到「思考 3 次 · 工具 3 次…」。名字必须来自
+    // 只听得到「展开过程」,听不到「模型调用 3 次 · 工具 3 次…」。名字必须来自
     // 可见文本,开合状态交给 `aria-expanded`。
-    const head = screen.getByRole("button", { name: /思考 3 次/ });
+    const head = screen.getByRole("button", { name: /模型调用 3 次/ });
     expect(head).toBe(screen.getByTestId("console-process-head"));
     expect(head).not.toHaveAttribute("aria-label");
     expect(head).toHaveAttribute("aria-expanded", "false");
   });
 
   it("expands automatically while running and shows the last 3 rows + a 'more' button", async () => {
-    renderStrip(makeProps({ rows: stripRows(compactRowsOf(stepEvents(4))), running: true }));
+    renderStrip(makeProps({ ...fromEvents(stepEvents(4)), running: true }));
 
     expect(screen.getByTestId("console-process-head")).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("console-process-spinner")).toBeInTheDocument();
@@ -166,8 +171,8 @@ describe("ProcessStrip", () => {
   });
 
   it("a manual toggle wins over the automatic state and is kept when running flips", async () => {
-    const rows = stripRows(compactRowsOf(stepEvents(1)));
-    const { rerender } = renderStrip(makeProps({ rows, running: true }));
+    const fixture = fromEvents(stepEvents(1));
+    const { rerender } = renderStrip(makeProps({ ...fixture, running: true }));
     expect(screen.getByTestId("console-process-steps")).toBeInTheDocument();
 
     await userEvent.click(screen.getByTestId("console-process-head"));
@@ -177,7 +182,7 @@ describe("ProcessStrip", () => {
     // manual choice is what's remembered — and re-expanding stays possible.
     rerender(
       <App>
-        <ProcessStrip {...makeProps({ rows, running: false })} />
+        <ProcessStrip {...makeProps({ ...fixture, running: false })} />
       </App>,
     );
     expect(screen.queryByTestId("console-process-steps")).not.toBeInTheDocument();
@@ -218,20 +223,50 @@ describe("ProcessStrip", () => {
         ],
       }),
     ];
-    const { container, unmount } = renderStrip(
-      makeProps({ rows: stripRows(compactRowsOf(failing)) }),
-    );
+    const { container, unmount } = renderStrip(makeProps(fromEvents(failing)));
     const tail = container.querySelector(".ew-process__failed");
     expect(tail).not.toBeNull();
     expect(tail).toHaveTextContent("1 次失败");
     expect(screen.getByTestId("console-process-head")).toHaveTextContent(
-      "思考 1 次 · 工具 1 次（http ×1） · 1 次失败",
+      "模型调用 1 次 · 工具 1 次（http ×1） · 1 次失败",
     );
     unmount();
 
     // Same shape, nothing failed → no tail at all.
     const clean = renderStrip(makeProps());
     expect(clean.container.querySelector(".ew-process__failed")).toBeNull();
+  });
+
+  it("B-202 — counts and times a step that only called tools (no reasoning, so no think row)", () => {
+    // 第 1 步直接调工具、没写思考 —— 紧凑投影不给它出 think 行。原来时长按行
+    // 相加,这 4s 模型耗时整段丢了,标题也少数一次。
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        _duration_ms: 4_000,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            tool_calls: [{ id: "c1", name: "web_search", args: { q: "q1" } }],
+          },
+        ],
+      }),
+      upd("tools", {
+        messages: [
+          {
+            type: "tool", tool_call_id: "c1", name: "web_search", content: "ok", status: "success",
+            additional_kwargs: { duration_ms: 1_000 },
+          },
+        ],
+      }),
+      upd("agent", { step_count: 2, _duration_ms: 2_000, messages: [{ type: "ai", content: "答复" }] }),
+    ];
+    renderStrip(makeProps(fromEvents(events)));
+    const head = screen.getByTestId("console-process-head");
+    expect(head).toHaveTextContent("模型调用 2 次 · 工具 1 次（web_search ×1）");
+    // 4s + 1s + 2s = 7.0s,不是只数工具行的 1.0s。
+    expect(head).toHaveTextContent("7.0s");
   });
 
   it("renders nothing for a turn without process rows", () => {

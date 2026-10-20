@@ -306,7 +306,7 @@ describe("TrajectoryLedger", () => {
       { kind: "record", record: records[0] },
       {
         kind: "turn-summary", turnKey: "t1", turnSeq: 0, runId: "run-1", hasError: false, anchorIndex: 0,
-        summary: { think: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
+        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
       },
     ];
     render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn })} />);
@@ -467,13 +467,13 @@ describe("TrajectoryLedger", () => {
       { kind: "record", record: records[0] },
       {
         kind: "turn-summary", turnKey: "t1", turnSeq: 0, runId: "run-1", hasError: false, anchorIndex: 0,
-        summary: { think: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
+        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
       },
     ];
     render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn })} />);
     const summary = screen.getByTestId("console-traj-turn-summary");
     expect(summary).toHaveAttribute("data-turn-key", "t1");
-    expect(summary).toHaveTextContent("思考 2 次 · 工具 1 次（bash ×1） · 1.5s");
+    expect(summary).toHaveTextContent("模型调用 2 次 · 工具 1 次（bash ×1） · 1.5s");
 
     fireEvent.click(summary);
     expect(onToggleTurn).toHaveBeenCalledWith("t1");

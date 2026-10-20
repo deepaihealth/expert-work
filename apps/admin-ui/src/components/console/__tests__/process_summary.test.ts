@@ -10,6 +10,7 @@ import i18n from "../../../i18n";
 
 import type { SseEvent } from "../../../api/sessions";
 import { compactRowsOf } from "../../../api/trajectory_rows";
+import { modelCallsOf } from "../live_rows";
 import { processHeadline, summarizeProcess } from "../process_summary";
 
 const t = (key: string, opts?: Record<string, unknown>): string => i18n.t(key, opts);
@@ -19,6 +20,10 @@ function ev(event: string, data: unknown): SseEvent {
 }
 function upd(node: string, channels: Record<string, unknown>): SseEvent {
   return ev("updates", { [node]: channels });
+}
+/** 过程条的真实输入:显示的紧凑行 + 这一轮的全部模型调用(TurnBlock 同款)。 */
+function summarize(events: readonly SseEvent[]) {
+  return summarizeProcess(compactRowsOf(events), modelCallsOf(events, undefined));
 }
 
 interface ToolCall {
@@ -64,8 +69,8 @@ function toolResults(
   });
 }
 
-// 3 think rows + 5 tool rows (web_search ×4, http ×1), exactly one of which
-// failed. Two deliberate fixture choices: the failing `http` call sits in a
+// 4 model calls (3 of them with reasoning → 3 think rows) + 5 tool rows
+// (web_search ×4, http ×1), exactly one of which failed. Two deliberate fixture choices: the failing `http` call sits in a
 // step with no reasoning of its own so the failure stays a single row
 // (`parseTimeline` marks an agent item `hasError` when any of its tools
 // errored, which would otherwise paint that step's think row red too), and
@@ -89,10 +94,11 @@ const EVENTS_3THINK_5TOOLS: SseEvent[] = [
 ];
 
 describe("summarizeProcess", () => {
-  it("counts think / tool rows and builds the tool breakdown by count desc", () => {
-    const s = summarizeProcess(compactRowsOf(EVENTS_3THINK_5TOOLS));
+  it("counts model calls / tool rows and builds the tool breakdown by count desc", () => {
+    const s = summarize(EVENTS_3THINK_5TOOLS);
     expect(s).toMatchObject({
-      think: 3,
+      // 4 次调用里第 1 步没写思考、不出 think 行 —— 照样算一次(B-202)。
+      modelCalls: 4,
       tools: 5,
       other: 0,
       failed: 1,
@@ -112,7 +118,11 @@ describe("summarizeProcess", () => {
     const rows = compactRowsOf(events);
     // Guard the premise: the think row really is `error` here.
     expect(rows.filter((r) => r.status === "error")).toHaveLength(2);
-    expect(summarizeProcess(rows)).toMatchObject({ think: 1, tools: 1, failed: 1 });
+    expect(summarizeProcess(rows, modelCallsOf(events, undefined))).toMatchObject({
+      modelCalls: 1,
+      tools: 1,
+      failed: 1,
+    });
   });
 
   it("books a skill_view call as skill:<name> in the breakdown and lists the skill", () => {
@@ -137,7 +147,7 @@ describe("summarizeProcess", () => {
         { id: "c1", name: "web_search", ok: true },
       ]),
     ];
-    const s = summarizeProcess(compactRowsOf(events));
+    const s = summarize(events);
     expect(s.toolBreakdown).toBe("skill:pptx ×2 · web_search ×1");
     expect(s.skills).toEqual([{ name: "pptx", reads: 2 }]);
   });
@@ -156,7 +166,7 @@ describe("summarizeProcess", () => {
       }),
       toolResults([{ id: "s1", name: "skill_view", ok: false }]),
     ];
-    const s = summarizeProcess(compactRowsOf(events));
+    const s = summarize(events);
     expect(s.toolBreakdown).toBe("skill:gone ×1");
     expect(s.skills).toEqual([]);
   });
@@ -169,12 +179,31 @@ describe("summarizeProcess", () => {
       // not poison the sum.
       agentStep(2, "再想一下", []),
     ];
-    expect(summarizeProcess(compactRowsOf(events)).durationMs).toBe(1500);
-    expect(summarizeProcess([]).durationMs).toBeNull();
+    expect(summarize(events).durationMs).toBe(1500);
+    expect(summarizeProcess([], []).durationMs).toBeNull();
     // Rows that all lack a duration read as "unknown" (null), not 0.
-    expect(
-      summarizeProcess(compactRowsOf([agentStep(1, "只想不干", [])])).durationMs,
-    ).toBeNull();
+    expect(summarize([agentStep(1, "只想不干", [])]).durationMs).toBeNull();
+  });
+
+  it("B-202 — a step that only calls tools (no reasoning → no think row) still counts, time included", () => {
+    // glm 系列常见:22 次调用只有 7 次写了思考。没思考的步骤在紧凑投影里不出
+    // think 行,原来过程条按行求和,它们的模型耗时整段丢了(会话 0e878fd6
+    // 第 1 轮 5m57s vs 总耗时 8m41s)。
+    const events: SseEvent[] = [
+      agentStep(1, null, [{ id: "c1", name: "web_search" }], 4_000),
+      toolResults([{ id: "c1", name: "web_search", ok: true, durationMs: 500 }]),
+      agentStep(2, "想一下", [{ id: "c2", name: "web_search" }], 1_000),
+      toolResults([{ id: "c2", name: "web_search", ok: true, durationMs: 300 }]),
+      agentStep(3, null, [], 2_000),
+    ];
+    const rows = compactRowsOf(events);
+    // Premise: only step 2 projects a think row.
+    expect(rows.filter((r) => r.kind === "think")).toHaveLength(1);
+    expect(summarizeProcess(rows, modelCallsOf(events, undefined))).toMatchObject({
+      modelCalls: 3,
+      tools: 2,
+      durationMs: 4_000 + 500 + 1_000 + 300 + 2_000,
+    });
   });
 
   it("counts a worker's wall clock once — the subagent row repeats its parent tool's span", () => {
@@ -205,7 +234,7 @@ describe("summarizeProcess", () => {
     // still carries its own duration for per-row display — only the total
     // must not add it on top of the parent tool's.
     expect(rows.some((r) => r.kind === "subagent" && r.durationMs === 933_000)).toBe(true);
-    expect(summarizeProcess(rows).durationMs).toBe(939_112);
+    expect(summarizeProcess(rows, modelCallsOf(events, undefined)).durationMs).toBe(939_112);
   });
 });
 
@@ -219,32 +248,32 @@ describe("processHeadline", () => {
     await i18n.changeLanguage(priorLang);
   });
 
-  it("renders the spec's full sentence: think · tools(breakdown) · failed tail", () => {
-    const s = summarizeProcess(compactRowsOf(EVENTS_3THINK_5TOOLS));
+  it("renders the spec's full sentence: model calls · tools(breakdown) · failed tail", () => {
+    const s = summarize(EVENTS_3THINK_5TOOLS);
     expect(processHeadline(s, t)).toBe(
-      "思考 3 次 · 工具 5 次（web_search ×4 · http ×1） · 1 次失败",
+      "模型调用 4 次 · 工具 5 次（web_search ×4 · http ×1） · 1 次失败",
     );
   });
 
   it("headline omits the tool parenthesis without tools and the failed tail without failures", () => {
     expect(
       processHeadline(
-        { think: 2, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: 1200 },
+        { modelCalls: 2, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: 1200 },
         t,
       ),
-    ).toBe("思考 2 次");
+    ).toBe("模型调用 2 次");
     expect(
       processHeadline(
-        { think: 0, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
+        { modelCalls: 0, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
         t,
       ),
     ).toBe("无过程");
   });
 
-  it("counts every non-think / non-tool row （plan / memory / marker …） as 其他 N 步", () => {
+  it("counts every non-model-call / non-tool row （plan / memory / marker …） as 其他 N 步", () => {
     expect(
       processHeadline(
-        { think: 0, tools: 0, other: 3, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
+        { modelCalls: 0, tools: 0, other: 3, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
         t,
       ),
     ).toBe("其他 3 步");
