@@ -291,7 +291,8 @@ def test_factory_complete_settings_build_sdk_client(
     span_exporter = kwargs.pop("span_exporter")
     assert isinstance(span_exporter, FailureCountingSpanExporter)
     # B-201 — our own spans pass the SDK's export filter.
-    assert kwargs.pop("should_export_span") is should_export_span
+    export_filter = kwargs.pop("should_export_span")
+    assert export_filter is should_export_span
     assert kwargs == {
         "public_key": "pk",
         "secret_key": "sk",

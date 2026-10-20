@@ -652,7 +652,7 @@ async def _longest_loop_stall(request: Awaitable[httpx.Response]) -> tuple[httpx
         response = await request
     finally:
         done.set()
-        await ticker
+        await asyncio.wait([ticker])
     return response, max(gaps, default=0.0)
 
 
