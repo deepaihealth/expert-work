@@ -52,6 +52,10 @@ export interface ToolCallEntry {
   /** ``manage_task`` 动作(create/update/…),取自 wire ``artifact.action``。
    *  「立即触发」按钮据此收紧为仅 create 卡。 */
   action?: string | null;
+  /** B-203 —— ``ask_image`` 另调的那一次看图模型的用量,取自 wire
+   *  ``artifact.vl_usage``(``usage_metadata`` 形状,``tools/vision.py``)。只有
+   *  token 数:看图模型的名字不随帧回来。没有 → 缺省。 */
+  vlUsage?: { input: number; output: number };
 }
 
 const MCP_PREFIX = "mcp__";
@@ -254,6 +258,13 @@ export function parseToolCalls(
           if (typeof tid === "string" && tid !== "") entry.triggerId = tid;
           const act = rec.action;
           if (typeof act === "string" && act !== "") entry.action = act;
+          const vl = rec.vl_usage;
+          if (vl !== null && typeof vl === "object") {
+            const u = vl as Record<string, unknown>;
+            if (typeof u.input_tokens === "number" && typeof u.output_tokens === "number") {
+              entry.vlUsage = { input: u.input_tokens, output: u.output_tokens };
+            }
+          }
           // PR-D — sandbox exec tools stash their raw (pre-datamark) streams
           // here; the rendered content's newlines don't survive spotlight.
           // Final-review fix wave — builder.py has piped meta → artifact

@@ -180,6 +180,7 @@ export function RecordDetails(props: RecordDetailsProps) {
             onRefreshTrace={onRefreshTrace}
             langfuseUrl={langfuseUrl}
             rateBook={rateBook}
+            startedAtMs={record.startedAt}
           />
         );
       case "raw":

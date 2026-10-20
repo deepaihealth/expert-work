@@ -408,6 +408,17 @@ describe("RecordDetails", () => {
     expect(props.onOpenRequest).toHaveBeenCalledWith(23);
   });
 
+  it("B-203 — 计时 tab 的开始时刻用账本给这条记录排出的起点", () => {
+    function clock(ms: number): string {
+      const d = new Date(ms);
+      const pad = (n: number, len = 2): string => String(n).padStart(len, "0");
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+    }
+    renderRecord({ record: rec(toolRow(), { startedAt: BASE - 5_000 }), activeTab: "timing" });
+    const tr = screen.getByText("Started at").closest("tr");
+    expect(tr?.querySelector("td")?.textContent).toBe(clock(BASE - 5_000));
+  });
+
   it("B-203 — USER / SYSTEM 记录的概要不写「时长」(它们不是一步,原来恒为 0ms)", () => {
     const user = renderRecord({ record: rec(userRow(), { startedAt: BASE, endedAt: BASE }) });
     const summaryOf = () => screen.getByTestId("console-detail-summary");

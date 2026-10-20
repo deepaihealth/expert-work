@@ -264,6 +264,17 @@ describe("RequestDetails", () => {
     expect(screen.getByTestId("console-timing-langfuse")).toHaveAttribute("href", "https://lf/t/1");
   });
 
+  it("B-203 — 计时页的开始时刻用账本给这条记录排出的起点", () => {
+    const clock = (ms: number): string => {
+      const d = new Date(ms);
+      const pad = (n: number, len = 2): string => String(n).padStart(len, "0");
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+    };
+    renderRequest({ activeTab: "timing", record: record({ startedAt: BASE - 5_000 }) });
+    const tr = screen.getByText("Started at").closest("tr");
+    expect(tr?.querySelector("td")?.textContent).toBe(clock(BASE - 5_000));
+  });
+
   it("B-203 — 用量页的 token 数带千分位", () => {
     renderRequest({
       activeTab: "usage",

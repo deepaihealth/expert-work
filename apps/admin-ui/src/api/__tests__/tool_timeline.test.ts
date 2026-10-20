@@ -157,6 +157,35 @@ describe("parseToolCalls", () => {
   });
 });
 
+describe("parseToolCalls artifact.vl_usage (B-203)", () => {
+  it("lifts ask_image's vision-model usage into vlUsage", () => {
+    const events = [
+      updates("agent", [aiCall("v1", "ask_image", { image: "a.png", question: "?" })]),
+      updates("tools", [
+        toolResultWithArtifact("v1", "a cat", {
+          image_ref: "a.png",
+          depth: "quick",
+          vl_usage: { input_tokens: 1234, output_tokens: 56, total_tokens: 1290 },
+        }),
+      ]),
+    ];
+    expect(parseToolCalls(events)[0].vlUsage).toEqual({ input: 1234, output: 56 });
+  });
+
+  it("leaves vlUsage unset without a usable vl_usage", () => {
+    const events = [
+      updates("agent", [aiCall("v1", "ask_image", {}), aiCall2("v2", "ask_image", {})]),
+      updates("tools", [
+        toolResultWithArtifact("v1", "a cat", { image_ref: "a.png" }),
+        toolResultWithArtifact("v2", "a dog", { vl_usage: { input_tokens: "12" } }),
+      ]),
+    ];
+    const [a, b] = parseToolCalls(events);
+    expect(a.vlUsage).toBeUndefined();
+    expect(b.vlUsage).toBeUndefined();
+  });
+});
+
 describe("parseToolCalls artifact.trigger_id (Spec 1 PR4 Task 4)", () => {
   it("reads triggerId from the ToolMessage artifact (manage_task create)", () => {
     const events = [

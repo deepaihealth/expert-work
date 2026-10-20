@@ -10,7 +10,7 @@ import i18n from "../../../i18n";
 import { rateKey, type RateBook } from "../../../api/cost";
 import type { RunTrace, TraceSpan } from "../../../api/trace_facade";
 import type { SpanMatch } from "../../../api/trace_match";
-import type { AssistantRow, ThinkRow, ToolRow } from "../../../api/trajectory_rows";
+import type { AssistantRow, ThinkRow, ToolRow, TrajectoryRow } from "../../../api/trajectory_rows";
 import { RowDetailTiming } from "../RowDetailTiming";
 
 function thinkRow(over: Partial<ThinkRow> = {}): ThinkRow {
@@ -316,7 +316,7 @@ describe("RowDetailTiming — 成本按平台价目表(B-202)", () => {
     expect(costCells()).toEqual(["¥0.4800"]);
   });
 
-  it("没有价目表(非 system_admin)→ 「—」;非模型调用的行也是「—」", () => {
+  it("没有价目表(非 system_admin)→ 「—」;非模型调用的行没有成本这一行(B-203)", () => {
     const { unmount } = render(
       <RowDetailTiming
         row={assistantRow()}
@@ -337,6 +337,98 @@ describe("RowDetailTiming — 成本按平台价目表(B-202)", () => {
         rateBook={BOOK}
       />,
     );
-    expect(costCells()).toEqual(["—"]);
+    expect(screen.queryByText("Cost")).not.toBeInTheDocument();
+  });
+});
+
+// B-203 —— 计时页排版:标签列有左边距;有开始时刻;tokens 标明输入 / 输出、带千分位;
+// 工具行不列模型 / tokens / 成本(原来三行全是「—」),看图工具单列看图模型用量。
+describe("RowDetailTiming — 排版(B-203)", () => {
+  /** 与组件同一种钟面写法(本地时区 HH:mm:ss.SSS)。 */
+  function clock(ms: number): string {
+    const d = new Date(ms);
+    const pad = (n: number, len = 2): string => String(n).padStart(len, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+  }
+  /** 第 `label` 行的各单元格文本(th 之后的 td)。 */
+  function cellsOf(label: string): string[] {
+    const tr = screen.getByText(label).closest("tr");
+    return [...(tr?.querySelectorAll("td") ?? [])].map((td) => td.textContent ?? "");
+  }
+  const tool: ToolRow = {
+    id: "tool:1:0", kind: "tool", seq: 1, step: 1, status: "ok", durationMs: 300,
+    eventIndexes: [], serverMs: 1_700_000_000_500,
+    entry: {
+      id: "c1", rawName: "web_search", isMcp: false, server: null, toolName: "web_search",
+      args: {}, status: "success", resultPreview: "ok", durationMs: 300,
+    },
+  };
+  const renderRow = (row: TrajectoryRow, extra: Partial<Parameters<typeof RowDetailTiming>[0]> = {}) =>
+    render(
+      <RowDetailTiming
+        row={row}
+        match={{ span: null, reason: "no_trace" }}
+        trace={null}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        {...extra}
+      />,
+    );
+
+  it("标签列有 14px 左边距,与概要等其它 tab 对齐", () => {
+    renderRow(assistantRow());
+    expect(screen.getByText("Latency").closest("th")?.style.padding).toBe("4px 8px 4px 14px");
+  });
+
+  it("开始时刻:优先账本排出的起点,否则结束 − 时长", () => {
+    const row = assistantRow({ serverMs: 1_700_000_000_123, durationMs: 1_500 });
+    const first = renderRow(row);
+    expect(cellsOf("Started at")[0]).toBe(clock(1_700_000_000_123 - 1_500));
+    expect(cellsOf("Ended at")[0]).toBe(clock(1_700_000_000_123));
+    first.unmount();
+    renderRow(row, { startedAtMs: 1_699_999_990_000 });
+    expect(cellsOf("Started at")[0]).toBe(clock(1_699_999_990_000));
+  });
+
+  it("结束时刻一行:Langfuse 列给相对 trace 起点的结束(起点 + 时长)", () => {
+    renderRow(assistantRow({ serverMs: 1_700_000_000_123 }), {
+      match: { span: span({ startMs: 1_000, latencyMs: 2_000 }), reason: "matched" },
+    });
+    expect(cellsOf("Ended at")).toEqual([clock(1_700_000_000_123), "End (from trace start): 3.0s"]);
+  });
+
+  it("tokens 标明输入 / 输出并带千分位(SSE 与 Langfuse 两列)", () => {
+    renderRow(assistantRow({ inputTokens: 57_803, outputTokens: 2_364 }), {
+      match: { span: span({ inputTokens: 57_810, outputTokens: 2_364 }), reason: "matched" },
+    });
+    expect(cellsOf("Tokens (in / out)")).toEqual(["57,803 / 2,364", "57,810 / 2,364"]);
+  });
+
+  it("工具行:只有开始 / 结束 / 时长,不列模型 / tokens / 成本", () => {
+    const { container } = renderRow(tool);
+    expect(screen.queryByText("Model")).not.toBeInTheDocument();
+    expect(screen.queryByText("Tokens (in / out)")).not.toBeInTheDocument();
+    expect(screen.queryByText("Cost")).not.toBeInTheDocument();
+    // Langfuse 那列的整列说明跨的行数跟着变(3 行),不多跨出空行。
+    expect(container.querySelector("td[rowspan]")?.getAttribute("rowspan")).toBe("3");
+  });
+
+  it("看图工具:单列一行看图模型的 tokens(只有 token 数,模型名不在帧里)", () => {
+    const { container } = renderRow({ ...tool, entry: { ...tool.entry, toolName: "ask_image", rawName: "ask_image", vlUsage: { input: 1_234, output: 56 } } });
+    expect(cellsOf("Vision model tokens (in / out)")[0]).toBe("1,234 / 56");
+    expect(screen.queryByText("Model")).not.toBeInTheDocument();
+    expect(container.querySelector("td[rowspan]")?.getAttribute("rowspan")).toBe("4");
+  });
+
+  it("模型调用行 6 行都在;配上 LLM span 的辅助记录也给模型 / tokens / 成本(Langfuse 列有数)", () => {
+    const first = renderRow(assistantRow());
+    expect(first.container.querySelector("td[rowspan]")?.getAttribute("rowspan")).toBe("6");
+    first.unmount();
+    const reflect: TrajectoryRow = {
+      id: "reflect:3", kind: "reflect", seq: 3, step: null, status: "ok", durationMs: 800,
+      eventIndexes: [], serverMs: 1_700_000_001_000, verdict: "pass", detail: {},
+    };
+    renderRow(reflect, { match: { span: span({ model: "glm-judge" }), reason: "matched" } });
+    expect(cellsOf("Model")).toEqual(["—", "glm-judge"]);
   });
 });

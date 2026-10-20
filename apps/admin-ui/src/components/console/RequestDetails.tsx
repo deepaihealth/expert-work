@@ -148,6 +148,7 @@ export function RequestDetails(props: RequestDetailsProps) {
         onRefreshTrace={onRefreshTrace}
         langfuseUrl={langfuseUrl}
         rateBook={rateBook}
+        startedAtMs={record.startedAt}
       />
     );
   }
