@@ -408,6 +408,22 @@ describe("RecordDetails", () => {
     expect(props.onOpenRequest).toHaveBeenCalledWith(23);
   });
 
+  it("B-203 — 工具「结果」tab:结果直接摊开,不再重复「载荷」里的入参", () => {
+    renderRecord({ record: rec(toolRow()), activeTab: "result" });
+    const result = screen.getByTestId("console-detail-result");
+    // 原来卡片折叠着(Collapse 收起时面板内容不挂载),结果要再点一下才出来。
+    expect(within(result).getByText("3 条记录")).toBeInTheDocument();
+    expect(within(result).queryByText("Arguments")).not.toBeInTheDocument();
+    expect(within(result).queryByText(/"id": "C-1"/)).not.toBeInTheDocument();
+  });
+
+  it("B-203 — 概要的「结果」分节同样直接给出结果", () => {
+    renderRecord({ record: rec(toolRow()) });
+    const section = screen.getByTestId("console-detail-section-result");
+    expect(within(section).getByText("3 条记录")).toBeInTheDocument();
+    expect(within(section).queryByText("Arguments")).not.toBeInTheDocument();
+  });
+
   it("B-203 — 计时 tab 的开始时刻用账本给这条记录排出的起点", () => {
     function clock(ms: number): string {
       const d = new Date(ms);

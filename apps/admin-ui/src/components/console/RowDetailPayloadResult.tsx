@@ -337,7 +337,10 @@ export function RowDetailResult({
   let body: ReactNode;
   switch (row.kind) {
     case "tool":
-      body = <ToolCallCard entry={row.entry} onFireResult={onFireResult} readOnly={readOnly} />;
+      // B-203 —— 入参在「载荷」tab;这里只给结果,而且直接摊开。
+      body = (
+        <ToolCallCard entry={row.entry} onFireResult={onFireResult} readOnly={readOnly} resultOnly />
+      );
       break;
     case "think":
       body = (

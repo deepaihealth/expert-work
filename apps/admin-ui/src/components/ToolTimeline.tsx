@@ -39,6 +39,7 @@ export function ToolCallCard({
   entry,
   onFireResult,
   readOnly = false,
+  resultOnly = false,
 }: {
   entry: ToolCallEntry;
   /** See ``ToolTimelineProps.onFireResult``. */
@@ -46,10 +47,14 @@ export function ToolCallCard({
   /** PR-B Task 1 — 对话记录只读链路:「立即触发」是写操作,``true`` 时整卡
    *  不渲染(不是 disable)。Default false — RunDetail 等既有写页面零改动。 */
   readOnly?: boolean;
+  /** B-203 —— 轨迹详情「结果」tab 用:不出「入参」(「载荷」tab 已经是它),结果
+   *  直接摊开(原来折叠着,要再点一下才看得到)。Default false = 中栏紧凑行的
+   *  老样子(入参 + 结果,都折叠)。 */
+  resultOnly?: boolean;
 }) {
   const { t } = useTranslation();
   const statusLabel = t(`tool_timeline.status_${entry.status}`);
-  const hasArgs = Object.keys(entry.args).length > 0;
+  const hasArgs = !resultOnly && Object.keys(entry.args).length > 0;
 
   const items: { key: string; label: ReactNode; children: ReactNode }[] = [];
   if (hasArgs) {
@@ -185,15 +190,28 @@ export function ToolCallCard({
           <FireNowButton triggerId={entry.triggerId} onFireResult={onFireResult} />
         ) : null}
       </div>
-      {items.length > 0 && (
-        <Collapse
-          ghost
-          size="small"
-          items={items}
-          style={{ marginTop: 4 }}
-          data-testid="tool-call-detail"
-        />
-      )}
+      {items.length > 0 &&
+        (resultOnly ? (
+          // 不走 Collapse:结果在运行中才到,`defaultActiveKey` 只认挂载那一刻的项。
+          <div data-testid="tool-call-detail" style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+            {items.map((item) => (
+              <div key={item.key}>
+                <div style={{ fontSize: 11, color: "var(--ew-text-tertiary)", marginBottom: 2 }}>
+                  {item.label}
+                </div>
+                {item.children}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <Collapse
+            ghost
+            size="small"
+            items={items}
+            style={{ marginTop: 4 }}
+            data-testid="tool-call-detail"
+          />
+        ))}
     </div>
   );
 }
