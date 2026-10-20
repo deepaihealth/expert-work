@@ -37,3 +37,9 @@ file = "services/orchestrator/pyproject.toml"
 match = 'rev = "ce3b859c54d00eaa58395a3905d880fb3c5573fe"'
 reason = "kruise-agents 是未发布的 GitHub-only 包,rev 钉死 = 供应链面收窄;patch_e2b 对该 rev 验证过"
 roadmap = "X-13(动沙箱链路依赖必跑 deployment.md contract-run)"
+
+[[pin]]
+file = "packages/expert-work-runtime/pyproject.toml"
+match = '"langfuse>=3,<5"'
+reason = "langfuse SDK v5 只支持自托管服务端 >= 4.59.0(我们跑 3.122.0,v5 明文 Unsupported);且 v5 删了 api.trace.get,control_plane/api/trace_facade.py 两处在用,失败被 except 吞成 status=unavailable(测试用假 client 全绿)"
+roadmap = "待立项:先升 Langfuse 服务端到 >= 4.59 → trace_facade 迁 api.observations.get_many → build_langfuse_span_exporter 对齐 v5 默认(x-langfuse-ingestion-version: 4 + gzip)→ 再放开 <5"

@@ -26,6 +26,8 @@ dependencies = [
     # Stream HX-7 — Langfuse SDK adapter behind the E.5 LangfuseClient
     # protocol (ADR-0005). v3 is OTel-based, sharing the existing
     # TracerProvider so trace ids line up across Langfuse and Tempo.
+    # <5: SDK v5 needs a self-hosted Langfuse server >= 4.59.0 (we run 3.122.0)
+    # and drops api.trace.get, which control_plane/api/trace_facade.py calls.
     "langfuse>=3,<5",
 ]
 
