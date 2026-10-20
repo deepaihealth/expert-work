@@ -623,11 +623,11 @@ run("embed-setting", embed_setting)
 
 ## §39 B-201 「计时」的 Langfuse 列:查询不卡后台、平台 span 进 Langfuse、超过 2 分钟显示「数据不完整」(ROADMAP B-201)
 
-**背景**:会话详情页轨迹「计时」tab 的「Langfuse 精确」一列至少一周没显示过数据,三个原因叠在一起:① 查 trace 的接口在事件循环里同步调 Langfuse(10-20 测试环境一条 34 个观测点的 trace 要 8.8 秒,这段时间该副本的所有请求都在排队);② SDK 默认 5 秒超时,超时被吞成 `unavailable`、不留日志;③ langfuse SDK 4.x 默认只导出跟大模型有关的 span,平台自己的请求 / 运行 / 节点 / 工具 span 全被丢掉,Langfuse 里每个 `llm_call` 都挂在不存在的父节点下,页面永远「入库中」。现在:查询放线程里跑、每次请求 30 秒超时、失败记 warning;平台自己的 span 照常导出;运行结束 2 分钟后 trace 仍不完整,显示「数据不完整」,系统管理员另有「去 Langfuse 查看」链接,不再重试。
+**背景**:会话详情页轨迹「计时」tab 的「Langfuse 精确」一列至少一周没显示过数据,三个原因叠在一起:① 查 trace 的接口在事件循环里同步调 Langfuse(10-20 测试环境一条 34 个观测点的 trace 要 8.8 秒,这段时间该副本的所有请求都在排队);② SDK 默认 5 秒超时,超时被吞成 `unavailable`、不留日志;③ langfuse SDK 4.x 默认只导出跟大模型有关的 span,平台自己的请求 / 运行 / 节点 / 工具 span 全被丢掉,Langfuse 里每个 `llm_call` 都挂在不存在的父节点下,页面永远「入库中」。现在:查询放线程里跑、每次请求 30 秒超时、失败记 warning;平台自己的 span 照常导出(只读请求 GET / HEAD / OPTIONS 的请求 span 除外,它们从不起 run);运行结束 2 分钟后 trace 仍不完整,显示「数据不完整」,系统管理员另有「去 Langfuse 查看」链接,不再重试。
 
-**修复前的 trace 补不回来**:发版前跑的运行,「计时」里显示「数据不完整」是预期。发版后 Langfuse 里每个打了 trace 的 HTTP 请求(控制台的查询也算)会各成一条 trace,和 SDK 3.x 时一样。
+**修复前的 trace 补不回来**:发版前跑的运行,「计时」里显示「数据不完整」是预期。发版后 Langfuse 里会多出写请求(POST / PATCH / PUT / DELETE)各自的单 span trace,测试环境一天几十条;控制台的查询(GET)不会出现。
 
-- [ ] **39.1 三处改动(pod 内离线探针)**:发测试后执行下面的命令。只调导出过滤函数和 trace 门面(喂假的 Langfuse 客户端):不连外网,不读写库。判据:输出 3 行,每行末尾都是 `True`(前面可能多一行 `trace_facade.incomplete trace_id=probe reason=partial_tree`,是探针故意触发的日志)。**没修好时**:`export-filter FAIL ImportError`、`incomplete FAIL TypeError`、`read-timeout False`(10-20 在测试环境发版前的镜像上跑过,正是这三行)。
+- [ ] **39.1 三处改动(pod 内离线探针)**:发测试后执行下面的命令。只调导出过滤函数和 trace 门面(喂假的 Langfuse 客户端):不连外网,不读写库。判据:输出 4 行,每行末尾都是 `True`(前面可能多一行 `trace_facade.incomplete trace_id=probe reason=partial_tree`,是探针故意触发的日志)。**没修好时**:`export-filter FAIL ImportError`、`get-dropped FAIL ImportError`、`incomplete FAIL TypeError`、`read-timeout False`(10-20 在测试环境发版前的镜像上跑过,正是这四行);只加回平台 span、没排除只读请求时,`get-dropped` 是 `False`。
 
 ```bash
 kubectl exec deploy/control-plane -- python -c '
@@ -645,6 +645,12 @@ def export_filter():
     span = TracerProvider().get_tracer(TRACER_NAME).start_span("expert_work.session.run")
     span.end()
     return should_export_span(span)
+def get_dropped():
+    from expert_work.common.observability import TRACER_NAME
+    from expert_work.runtime.middleware.langfuse_sdk import should_export_span
+    span = TracerProvider().get_tracer(TRACER_NAME).start_span("expert_work.control_plane.http_request", attributes={"http.method": "GET"})
+    span.end()
+    return not should_export_span(span)
 class Api:
     def __init__(self):
         self.options = []
@@ -657,6 +663,7 @@ def fetch(api, ago):
     client = SimpleNamespace(api=SimpleNamespace(trace=api))
     return fetch_and_normalize(client, "probe", finished_at=datetime.now(UTC) - ago)["status"]
 run("export-filter", export_filter)
+run("get-dropped", get_dropped)
 run("incomplete", lambda: (fetch(Api(), timedelta(seconds=30)), fetch(Api(), timedelta(minutes=3))) == ("not_ready", "incomplete"))
 def read_timeout():
     from control_plane.api.trace_facade import fetch_span_raw
