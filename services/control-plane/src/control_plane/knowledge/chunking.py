@@ -33,7 +33,6 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from itertools import pairwise
 from typing import Literal
 from uuid import UUID
 
@@ -62,11 +61,11 @@ _CONTENT_STANDALONE = frozenset({"fence", "code_block", "html_block"})
 #: shifted every later block onto the wrong lines — text silently lost (B-181).
 _LINE_BREAK = re.compile(r"\r\n?|\n")
 
-#: Longest heading taken as a section title. markdown-it reads any paragraph
-#: right above a ``---`` / ``===`` line as a setext heading, however many lines
-#: it has: a meeting transcript became one 17 KB "heading", its text in no
-#: chunk body and repeated on every chunk's breadcrumb (B-198). A heading that
-#: spans lines or runs past this is kept as content instead.
+#: Longest heading taken as a section title; a longer one is kept as content.
+#: A 17 KB "heading" (a whole meeting transcript above a ``---`` line, read as
+#: a setext heading) put its text in no chunk body and on every chunk's
+#: breadcrumb (B-198); setext headings are off now (B-199), and this bounds
+#: an ATX ``#`` line the same way.
 _MAX_HEADING_CHARS = 200
 
 #: Sentence-ish boundary for hard-splitting an oversized paragraph. Zero
@@ -106,6 +105,16 @@ def _encode(text: str) -> list[int]:
     return _encoding.encode(text, disallowed_special=())
 
 
+@dataclass
+class _Heading:
+    """An open section while parsing: ``used`` once any block sits under it,
+    so a heading with no content can be kept as content itself."""
+
+    level: int
+    text: str
+    used: bool = False
+
+
 @dataclass(frozen=True)
 class _Block:
     """One top-level Markdown block, tagged with its section path."""
@@ -130,17 +139,20 @@ class TextChunk:
         return chunk_retrieval_text(self.heading_path, self.body)
 
 
-def chunk_markdown(markdown: str, *, max_tokens: int, overlap_tokens: int) -> list[TextChunk]:
+def chunk_markdown(
+    markdown: str, *, max_tokens: int, overlap_tokens: int, plain_text: bool = False
+) -> list[TextChunk]:
     """Slice ``markdown`` into retrieval chunks — the structural chunker (no
     semantic refinement).
 
     ``max_tokens`` bounds a chunk's body; ``overlap_tokens`` of the
     previous chunk's tail is carried into the next chunk *within the
-    same section*. Returns chunk texts in document order; empty input
-    yields an empty list.
+    same section*. ``plain_text`` reads the input as plain text, not
+    Markdown (a ``.txt`` file). Returns chunk texts in document order;
+    empty input yields an empty list.
     """
     return _pack_blocks(
-        _parse_blocks(markdown),
+        _blocks(markdown, plain_text=plain_text),
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         semantic_breaks=frozenset(),
@@ -154,6 +166,7 @@ async def chunk_markdown_semantic(
     overlap_tokens: int,
     embedder: Embedder,
     tenant_id: UUID,
+    plain_text: bool = False,
 ) -> list[TextChunk]:
     """Like :func:`chunk_markdown`, but additionally splits a section at
     *topic shifts* — adjacent blocks whose embeddings are far apart.
@@ -167,7 +180,7 @@ async def chunk_markdown_semantic(
     # they are embedded for topic detection, so no single embedding input ever
     # exceeds the cap (the embedding API rejects inputs past its token limit
     # and the whole document would fail).
-    blocks = _presplit_blocks(_parse_blocks(markdown), max_tokens)
+    blocks = _presplit_blocks(_blocks(markdown, plain_text=plain_text), max_tokens)
     semantic_breaks: frozenset[int] = frozenset()
     if len(blocks) >= 2:
         embeddings = await embedder.embed([block.text for block in blocks], tenant_id=tenant_id)
@@ -248,36 +261,84 @@ def _cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
 
 def _parse_blocks(markdown: str) -> list[_Block]:
     """Parse ``markdown`` into top-level content / table blocks, each
-    tagged with the heading breadcrumb of the section it sits in."""
-    tokens = MarkdownIt().enable("table").parse(markdown)
+    tagged with the heading breadcrumb of the section it sits in.
+
+    No source text is dropped (B-199): lines markdown-it consumes without a
+    block token (a link reference definition) are kept as content, and a
+    heading no content ever sits under is kept as content too — otherwise its
+    text would reach no chunk. Only ATX ``#`` headings name a section: a line
+    above ``---`` / ``===`` is a paragraph, as Dify and FastGPT read it."""
+    tokens = MarkdownIt().enable("table").disable("lheading").parse(markdown)
     lines = _LINE_BREAK.split(markdown)
     blocks: list[_Block] = []
-    trail_stack: list[tuple[int, str]] = []
+    trail_stack: list[_Heading] = []
+    covered = 0  # lines before this index are already in a block or a heading
+
+    def emit(kind: Literal["content", "table"], text: str) -> None:
+        for heading in trail_stack:
+            heading.used = True
+        blocks.append(_Block(kind, text, tuple(h.text for h in trail_stack)))
+
+    def keep(upto: int) -> None:
+        text = "\n".join(lines[covered:upto]).strip()
+        if text:
+            emit("content", text)
+
+    def close_sections(level: int) -> None:
+        while trail_stack and trail_stack[-1].level >= level:
+            heading = trail_stack.pop()
+            if not heading.used:
+                emit("content", heading.text)
+
     for index, token in enumerate(tokens):
         if token.level != 0 or token.map is None:
             continue
+        start, end = token.map
+        if start > covered:
+            keep(start)
+        covered = max(covered, end)
         if token.type == "heading_open":
             text = tokens[index + 1].content.strip() if index + 1 < len(tokens) else ""
-            if "\n" not in text and len(text) <= _MAX_HEADING_CHARS:
+            if len(text) <= _MAX_HEADING_CHARS:
                 level = int(token.tag[1:])
-                while trail_stack and trail_stack[-1][0] >= level:
-                    trail_stack.pop()
-                trail_stack.append((level, text))
+                close_sections(level)
+                trail_stack.append(_Heading(level, text))
                 continue
-        start, end = token.map
         block_text = "\n".join(lines[start:end]).strip()
         if not block_text:
             continue
-        trail = tuple(text for _, text in trail_stack)
         if token.type == "table_open":
-            blocks.append(_Block("table", block_text, trail))
+            emit("table", block_text)
         elif (
             token.type in _CONTENT_OPENERS
             or token.type in _CONTENT_STANDALONE
             or token.type == "heading_open"
         ):
-            blocks.append(_Block("content", block_text, trail))
+            emit("content", block_text)
+    keep(len(lines))
+    close_sections(0)
     return blocks
+
+
+def _parse_plain_blocks(text: str) -> list[_Block]:
+    """Plain text (``.txt``) as paragraphs between blank lines, none of them
+    in a section: nothing in a line is Markdown structure (B-199) — the way
+    Dify, RAGFlow and Onyx read a text file."""
+    blocks: list[_Block] = []
+    paragraph: list[str] = []
+    for line in [*_LINE_BREAK.split(text), ""]:
+        if line.strip():
+            paragraph.append(line)
+            continue
+        body = "\n".join(paragraph).strip()
+        if body:
+            blocks.append(_Block("content", body, ()))
+        paragraph = []
+    return blocks
+
+
+def _blocks(text: str, *, plain_text: bool) -> list[_Block]:
+    return _parse_plain_blocks(text) if plain_text else _parse_blocks(text)
 
 
 def _presplit_blocks(blocks: list[_Block], max_tokens: int) -> list[_Block]:
@@ -347,13 +408,32 @@ def _hard_split(text: str, max_tokens: int) -> list[str]:
 
 
 def _split_by_tokens(text: str, max_tokens: int) -> list[str]:
-    """Last-resort split of an unbreakable run on token windows, cut at
-    character offsets so a multi-byte character is never torn in two
-    (a plain ``decode`` of a token slice yields U+FFFD for CJK)."""
+    """Last-resort split of an unbreakable run on token windows. Each cut
+    moves back to the last word boundary inside its window, so a word is torn
+    only when it alone outruns the window (a torn "Triage" matched nothing,
+    B-199); cuts are character offsets, so a multi-byte character is never
+    torn in two (a plain ``decode`` of a token slice yields U+FFFD for CJK)."""
     token_ids = _encode(text)
     decoded, offsets = _encoding.decode_with_offsets(token_ids)
-    bounds = [offsets[i] for i in range(0, len(token_ids), max_tokens)] + [len(decoded)]
-    return [decoded[a:b] for a, b in pairwise(bounds) if decoded[a:b]]
+    count = len(token_ids)
+    pieces: list[str] = []
+    start = 0
+    while start < count:
+        end = min(start + max_tokens, count)
+        if end < count:
+            end = next(
+                (t for t in range(end, start, -1) if _between_words(decoded, offsets[t])), end
+            )
+        piece = decoded[offsets[start] : offsets[end] if end < count else len(decoded)]
+        if piece:
+            pieces.append(piece)
+        start = end
+    return pieces
+
+
+def _between_words(text: str, at: int) -> bool:
+    """Whether a cut at character ``at`` of ``text`` falls on whitespace."""
+    return 0 < at < len(text) and (text[at].isspace() or text[at - 1].isspace())
 
 
 def _tail_text(text: str, overlap_tokens: int) -> str:

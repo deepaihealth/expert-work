@@ -93,6 +93,11 @@ def parse_document(filename: str, raw: bytes) -> str:
     return markdown
 
 
+def is_plain_text_file(filename: str) -> bool:
+    """A ``.txt`` file — chunked as plain text, not as Markdown (B-199)."""
+    return Path(filename).suffix.lower() == ".txt"
+
+
 def strip_lone_surrogates(text: str) -> str:
     """Drop lone UTF-16 surrogates and NUL so ``text`` can always be UTF-8
     encoded and stored.

@@ -316,6 +316,27 @@ async def test_build_corpus_ingests_chunks_with_the_chosen_titles(
 
 
 @pytest.mark.asyncio
+async def test_build_corpus_reads_txt_as_plain_text_md_as_markdown(tmp_path: Path) -> None:
+    # Same chunking as production ingest (B-199): a .txt file is plain text.
+    root = tmp_path / "corpus"
+    root.mkdir()
+    text = "# 保存方式\n常温密封保存即可。\n"
+    (root / "plain.txt").write_text(text, encoding="utf-8")
+    (root / "marked.md").write_text(text, encoding="utf-8")
+    manifest = tmp_path / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(MANIFEST_FIELDS))
+        writer.writeheader()
+        writer.writerows([_row("plain.txt"), _row("marked.md")])
+    store = InMemoryKnowledgeStore()
+    await _build((manifest, root), store=store, tenant=uuid4())
+    assert {c.doc_title: tuple(c.heading_path) for c in store._chunks} == {
+        "plain": (),
+        "marked": ("保存方式",),
+    }
+
+
+@pytest.mark.asyncio
 async def test_build_corpus_same_basename_different_content_ingests_both_under_qualified_name(
     corpus: tuple[Path, Path],
 ) -> None:

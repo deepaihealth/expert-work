@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+import re
 from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
@@ -429,10 +431,103 @@ def test_overlong_heading_line_is_kept_as_content() -> None:
     assert line in "\n".join(c.body for c in chunks)
 
 
-def test_short_setext_heading_still_names_its_section() -> None:
+def test_setext_underline_is_not_a_heading() -> None:
+    # Only ATX ``#`` headings name a section (the Dify / FastGPT rule, B-199):
+    # a line above ``---`` is a paragraph and the ``---`` a rule.
     chunks = _chunk_markdown(
         "Refunds\n-------\n\nRefund window is 14 days.\n", max_tokens=512, overlap_tokens=0
     )
-    assert [(c.heading_path, c.body) for c in chunks] == [
-        (("Refunds",), "Refund window is 14 days.")
+    assert all(c.heading_path == () for c in chunks)
+    text = "\n".join(c.body for c in chunks)
+    assert "Refunds" in text
+    assert "Refund window is 14 days." in text
+
+
+def test_heading_with_no_content_keeps_its_text() -> None:
+    src = "# Overview\n# Details\n\nBody text.\n## Empty tail\n"
+    joined = " ".join(c.text for c in _chunk_markdown(src, max_tokens=512, overlap_tokens=0))
+    assert "Overview" in joined
+    assert "Empty tail" in joined
+
+
+def test_reference_definition_line_keeps_its_text() -> None:
+    src = "See the policy.\n\n[policy]: https://example.com/refunds\n\nMore text.\n"
+    joined = " ".join(c.text for c in _chunk_markdown(src, max_tokens=512, overlap_tokens=0))
+    assert "https://example.com/refunds" in joined
+
+
+# Plain text (.txt) is not Markdown (B-199, as Dify / RAGFlow / Onyx read it):
+# paragraphs split on blank lines, and nothing in a line is structure.
+def test_plain_text_mode_reads_no_markdown_structure() -> None:
+    src = (
+        "# not a heading\nSummary line\n---\n    indented line\n"
+        "[1]: http://example.com/ref\n\nNext paragraph.\n"
+    )
+    chunks = _chunk_markdown(src, max_tokens=512, overlap_tokens=0, plain_text=True)
+    assert all(c.heading_path == () for c in chunks)
+    text = "\n".join(c.body for c in chunks)
+    for piece in (
+        "# not a heading",
+        "Summary line\n---",
+        "    indented line",
+        "[1]: http://example.com/ref",
+        "Next paragraph.",
+    ):
+        assert piece in text
+
+
+def _random_line(rng: random.Random, words: list[str]) -> str:
+    def w() -> str:
+        return " ".join(rng.sample(words, rng.randint(1, 4)))
+
+    makers = [
+        lambda: f"# {w()}",
+        lambda: f"## {w()}",
+        lambda: "---",
+        lambda: "===",
+        lambda: "***",
+        lambda: f"[{rng.choice(words)}]: https://example.com/{rng.choice(words)}",
+        lambda: f"- {w()}",
+        lambda: f"1. {w()}",
+        lambda: f"> {w()}",
+        lambda: f"    {w()}",
+        lambda: "```",
+        lambda: f"| {rng.choice(words)} | {rng.choice(words)} |",
+        lambda: "|---|---|",
+        lambda: f"<div>{rng.choice(words)}</div>",
+        lambda: "",
+        w,
+        w,
     ]
+    return rng.choice(makers)()
+
+
+@pytest.mark.parametrize("plain_text", [False, True])
+def test_no_source_word_is_lost(plain_text: bool) -> None:
+    # Every word of the source reaches some chunk's retrieval text (body or
+    # breadcrumb), whatever mix of Markdown-looking lines it is made of.
+    rng = random.Random(1234)  # noqa: S311 — reproducible test data, not crypto
+    words = [f"w{i}" for i in range(400)]
+    for _ in range(200):
+        src = "\n".join(_random_line(rng, words) for _ in range(rng.randint(1, 25)))
+        chunks = _chunk_markdown(src, max_tokens=512, overlap_tokens=0, plain_text=plain_text)
+        joined = " ".join(c.text for c in chunks)
+        missing = set(re.findall(r"w\d+", src)) - set(re.findall(r"w\d+", joined))
+        assert not missing, (src, missing)
+
+
+def test_token_window_split_cuts_between_words() -> None:
+    # A run with no sentence break is cut on token windows; a cut inside a
+    # word left "T" and "riage" in the chunk, so "Triage" matched nothing.
+    text = " ".join(f"Triage{i} affected routes" for i in range(80))
+    parts = _split_by_tokens(text, 7)
+    assert len(parts) > 1
+    assert "".join(parts) == text
+    found = set(re.findall(r"\w+", " ".join(parts)))
+    assert set(re.findall(r"\w+", text)) <= found
+
+
+def test_long_unbroken_line_keeps_every_word_whole() -> None:
+    line = "\\\\n- ".join(f"Triage{i}: identify affected routes" for i in range(200))
+    joined = " ".join(c.text for c in _chunk_markdown(line, max_tokens=64, overlap_tokens=8))
+    assert set(re.findall(r"\w+", line)) <= set(re.findall(r"\w+", joined))
