@@ -94,7 +94,7 @@ from longmem.runner import update_baseline  # type: ignore[import-not-found]
 
 from control_plane.knowledge.chunking import count_tokens
 from control_plane.knowledge.ingestion import ingest_markdown
-from control_plane.knowledge.parsing import parse_document
+from control_plane.knowledge.parsing import is_plain_text_file, parse_document
 from expert_work.persistence import InMemoryKnowledgeStore, KnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
@@ -529,6 +529,7 @@ async def build_corpus(
             chunk_max_tokens=base.chunk_max_tokens,
             chunk_overlap_tokens=base.chunk_overlap_tokens,
             doc_title=titles[path],
+            plain_text=is_plain_text_file(path),
         )
 
     async def _one(

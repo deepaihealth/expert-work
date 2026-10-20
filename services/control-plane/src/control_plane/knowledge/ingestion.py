@@ -43,6 +43,7 @@ import httpx
 from control_plane.knowledge.chunking import chunk_markdown_semantic
 from control_plane.knowledge.parsing import (
     DocumentParseError,
+    is_plain_text_file,
     parse_document,
     strip_lone_surrogates,
 )
@@ -380,6 +381,7 @@ async def ingest_document_bytes(
         chunk_overlap_tokens=chunk_overlap_tokens,
         generation=generation,
         doc_title=knowledge_document_title(filename),
+        plain_text=is_plain_text_file(filename),
     )
 
 
@@ -395,6 +397,7 @@ async def ingest_markdown(
     chunk_overlap_tokens: int,
     generation: int | None = None,
     doc_title: str | None = None,
+    plain_text: bool = False,
 ) -> int:
     """Chunk → embed → store already-parsed Markdown; return the chunk count.
 
@@ -408,7 +411,8 @@ async def ingest_markdown(
     text is the three joined (``KnowledgeChunk.retrieval_text``). A
     chunk whose retrieval text is unchanged from the version being replaced
     keeps its stored vector (matched by ``content_hash`` **and** the pinned
-    embedding model) instead of being embedded again.
+    embedding model) instead of being embedded again. ``plain_text`` chunks
+    the text as plain text, not Markdown (a ``.txt`` file).
     """
     model_key, pinned = await pin_embedder(embedder, tenant_id=tenant_id)
     retrying = _BackoffEmbedder(pinned)
@@ -420,6 +424,7 @@ async def ingest_markdown(
         overlap_tokens=chunk_overlap_tokens,
         embedder=retrying,
         tenant_id=tenant_id,
+        plain_text=plain_text,
     )
     if not pieces:
         _ensure_written(

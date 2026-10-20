@@ -557,6 +557,31 @@ async def test_parsed_markdown_skips_parsing() -> None:
     assert "识别出来的正文" in chunks[0].content
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "heading_path"), [("notes.txt", ()), ("notes.md", ("Refunds",))]
+)
+async def test_txt_is_chunked_as_plain_text_md_as_markdown(
+    filename: str, heading_path: tuple[str, ...]
+) -> None:
+    store = InMemoryKnowledgeStore()
+    kb_id, doc_id = await _seed(store)
+    await ingest_document_bytes(
+        store=store,
+        embedder=FakeEmbedder(),
+        tenant_id=_TENANT,
+        document_id=doc_id,
+        kb_id=kb_id,
+        filename=filename,
+        raw=b"# Refunds\nRefund window is 14 days.\n",
+        chunk_max_tokens=512,
+        chunk_overlap_tokens=64,
+    )
+    chunks, _ = await store.list_chunks(tenant_id=_TENANT, document_id=doc_id)
+    assert [tuple(c.heading_path) for c in chunks] == [heading_path]
+    assert "Refund window is 14 days." in chunks[0].content
+
+
 class _FakeProcess:
     def __init__(self) -> None:
         self.terminated = False
