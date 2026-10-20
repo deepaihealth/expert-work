@@ -236,16 +236,21 @@ function requestsOf(records: readonly LedgerRecord[]): LedgerRequest[] {
   }
 
   const requests: LedgerRequest[] = [];
+  /** 轮 key → 该轮已经数到第几次请求(显示用的 `noInTurn`)。 */
+  const countInTurn = new Map<string, number>();
   let cumInput = 0;
   let cumOutput = 0;
   for (const record of records) {
     if (record.requestNo === null || record.row.kind !== "assistant") continue;
     const row = record.row;
+    const noInTurn = (countInTurn.get(record.turnKey) ?? 0) + 1;
+    countInTurn.set(record.turnKey, noInTurn);
     cumInput += row.inputTokens;
     cumOutput += row.outputTokens;
     const { startedAt, endedAt } = record;
     requests.push({
       no: record.requestNo,
+      noInTurn,
       turnKey: record.turnKey,
       turnSeq: record.turnSeq,
       step: row.step,

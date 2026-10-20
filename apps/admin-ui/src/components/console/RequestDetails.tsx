@@ -163,7 +163,7 @@ export function RequestDetails(props: RequestDetailsProps) {
         <>
           <span className="ew-detail__dot" aria-hidden />
           <span className="ew-detail__req-no">
-            {t("console.detail_request_title", { n: request.no })}
+            {t("console.detail_request_title", { n: request.noInTurn })}
           </span>
           <span className="ew-detail__loc">
             {request.step === null

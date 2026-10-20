@@ -72,6 +72,7 @@ function record(over: Partial<LedgerRecord> = {}): LedgerRecord {
 function request(over: Partial<LedgerRequest> = {}): LedgerRequest {
   return {
     no: 4,
+    noInTurn: 4,
     turnKey: "t1",
     turnSeq: 1,
     step: 1,
@@ -159,6 +160,14 @@ describe("RequestDetails", () => {
     renderRequest();
     const header = screen.getByTestId("console-detail-header");
     expect(header.textContent).toContain("Request #4");
+    expect(header.textContent).toContain("Turn 2 · step 1");
+  });
+
+  it("B-202 — 头部的「请求 #N」按轮编号(`noInTurn`),不是跨轮累计的 `no`", () => {
+    renderRequest({ request: request({ no: 23, noInTurn: 1 }) });
+    const header = screen.getByTestId("console-detail-header");
+    expect(header.textContent).toContain("Request #1");
+    expect(header.textContent).not.toContain("#23");
     expect(header.textContent).toContain("Turn 2 · step 1");
     for (const key of ["summary", "input", "usage", "timing"]) {
       expect(screen.getByTestId(`console-detail-tab-${key}`)).toBeInTheDocument();

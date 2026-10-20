@@ -189,6 +189,7 @@ function rec(row: TrajectoryRow, over: Partial<LedgerRecord> = {}): LedgerRecord
 function request(over: Partial<LedgerRequest> = {}): LedgerRequest {
   return {
     no: 4,
+    noInTurn: 4,
     turnKey: "t1",
     turnSeq: 1,
     step: 1,
@@ -392,6 +393,18 @@ describe("RecordDetails", () => {
     expect(button.textContent).toContain("Request #4");
     await userEvent.click(button);
     expect(props.onOpenRequest).toHaveBeenCalledWith(4);
+  });
+
+  it("B-202 — 层级里的「请求 #N」显示本轮序号,跳转仍按整本账的 `no`", async () => {
+    const { props } = renderRecord({
+      record: rec(assistantRow(), { ownerRequestNo: 23, requestNo: 23 }),
+      ownerRequest: request({ no: 23, noInTurn: 1 }),
+    });
+    const button = screen.getByTestId("console-detail-hier-request");
+    expect(button.textContent).toContain("Request #1");
+    expect(button.textContent).not.toContain("#23");
+    await userEvent.click(button);
+    expect(props.onOpenRequest).toHaveBeenCalledWith(23);
   });
 
   it("层级:tool / memory 写回 + parent → 「Assistant Message ›」抛 onOpenRecord", async () => {

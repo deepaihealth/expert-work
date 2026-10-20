@@ -151,7 +151,7 @@ export function LedgerRow(props: LedgerRowProps): JSX.Element {
   const requestLabel = request === undefined
     ? undefined
     : t("console.ledger_request_label", {
-      n: request.no,
+      n: request.noInTurn,
       turn: request.turnSeq + 1,
       // `step` 只在没落过帧的占位步上才是 null,那种记录也拿不到请求号;
       // 真出现就写 `?` 而不是把标签渲染成「第  步」。

@@ -220,7 +220,7 @@ export function RecordDetails(props: RecordDetailsProps) {
       <HierLink
         key="request"
         testId="console-detail-hier-request"
-        label={t("console.detail_hier_request", { n: ownerRequest.no })}
+        label={t("console.detail_hier_request", { n: ownerRequest.noInTurn })}
         onClick={() => onOpenRequest(ownerRequest.no)}
       />,
     );

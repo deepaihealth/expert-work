@@ -56,7 +56,12 @@ export interface LedgerRecord {
 }
 
 export interface LedgerRequest {
+  /** 整本账(加载窗口)内唯一、跨轮递增 —— 选中 / 跳转 / `ownerRequestNo` 都认它,
+   *  **不拿来显示**。 */
   no: number;
+  /** 本轮里的第几次请求(1-based,每轮从 1 起),与「第 N 轮 · 第 M 步」同口径 ——
+   *  界面上的「请求 #N」显示它(B-202:原来显示 `no`,第 2 轮第 1 步写成「请求 #23」)。 */
+  noInTurn: number;
   turnKey: string;
   turnSeq: number;
   step: number | null;
