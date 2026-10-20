@@ -439,6 +439,16 @@ describe("RecordDetails", () => {
     expect(link).toHaveAttribute("target", "_blank");
   });
 
+  it("计时:trace 不完整时把 Langfuse 链接带进计时 tab(B-201)", () => {
+    renderRecord({
+      activeTab: "timing",
+      isSystemAdmin: true,
+      langfuseUrl: "https://lf/t/1",
+      trace: { status: "incomplete" },
+    });
+    expect(screen.getByTestId("console-timing-langfuse")).toHaveAttribute("href", "https://lf/t/1");
+  });
+
   it("概要分节:tool 有载荷 / 结果两节(计时不再内嵌),标题按钮跳对应 tab", async () => {
     // 2026-08-26 用户反馈 —— 概要顶部 `<dl>` 已列状态/时长/模型/tokens,
     // 「计时」分节再嵌整张双列表(还带刷新按钮)纯属重复且被预览高度裁断;

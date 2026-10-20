@@ -141,6 +141,7 @@ export function RequestDetails(props: RequestDetailsProps) {
         trace={trace}
         traceLoading={traceLoading}
         onRefreshTrace={onRefreshTrace}
+        langfuseUrl={langfuseUrl}
       />
     );
   }

@@ -13,6 +13,7 @@ import threading
 from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
@@ -29,6 +30,7 @@ from expert_work.runtime.middleware import (
 from expert_work.runtime.middleware.langfuse_sdk import (
     FailureCountingSpanExporter,
     build_langfuse_span_exporter,
+    should_export_span,
 )
 
 # ---------------------------------------------------------------------------
@@ -288,6 +290,9 @@ def test_factory_complete_settings_build_sdk_client(
     # B-153 follow-up — the export-failure counting seam.
     span_exporter = kwargs.pop("span_exporter")
     assert isinstance(span_exporter, FailureCountingSpanExporter)
+    # B-201 — our own spans pass the SDK's export filter.
+    export_filter = kwargs.pop("should_export_span")
+    assert export_filter is should_export_span
     assert kwargs == {
         "public_key": "pk",
         "secret_key": "sk",
@@ -551,3 +556,107 @@ def test_counting_exporter_ships_exactly_like_the_sdk_default(
         ours.shutdown()
     finally:
         sdk_processor.shutdown()  # type: ignore[no-untyped-call]
+
+
+# ---------------------------------------------------------------------------
+# B-201 — our own spans reach Langfuse, not only the generations under them
+# ---------------------------------------------------------------------------
+#
+# langfuse 4.x exports only what its default filter calls LLM-related: its own
+# tracer, spans with ``gen_ai.*`` attributes, and a list of known LLM
+# instrumentation scopes. The ``expert-work`` tracer is none of those, so every
+# request / run / node / tool span was dropped and only the generations were
+# kept — each observation in Langfuse pointed at a parent that never arrived,
+# and the console's trace view stayed on "not ready" forever.
+
+
+def test_factory_exports_our_spans_with_the_generations_under_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chain as the control-plane wires it: a process TracerProvider (what
+    ``init_tracing`` installs), the SDK client from ``make_langfuse_client``
+    attaching its processor to that provider, spans from ``expert_work_span``
+    and a generation from the adapter underneath them. Only the export
+    endpoint is swapped for an in-memory exporter."""
+    from opentelemetry import trace
+
+    from expert_work.common.observability import ExpertWorkComponent, expert_work_span
+    from expert_work.runtime.middleware import langfuse_sdk
+
+    provider = TracerProvider()
+    # Stands in for the process-global provider without replacing the real one
+    # (OTel only lets it be set once per process).
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: provider)
+    exporter = InMemorySpanExporter()
+    monkeypatch.setattr(langfuse_sdk, "build_langfuse_span_exporter", lambda **_: exporter)
+
+    client = make_langfuse_client(
+        host="http://127.0.0.1:9",
+        # The SDK keeps one set of resources per public key — a fresh key keeps
+        # this client from reusing another test's processor.
+        public_key=f"pk-lf-b201-{uuid4().hex}",
+        secret_key="sk-lf-b201",
+    )
+    assert isinstance(client, LangfuseSdkClient)
+    try:
+        with (
+            expert_work_span(ExpertWorkComponent.SESSION, "run"),
+            expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"),
+        ):
+            client.start_span(name="llm_call", input="x", metadata={"model": "m"}).end()
+        client.flush()
+    finally:
+        client.shutdown()
+
+    exported = exporter.get_finished_spans()
+    assert sorted(span.name for span in exported) == [
+        "expert_work.orchestrator.llm_call",
+        "expert_work.session.run",
+        "llm_call",
+    ]
+    exported_ids = {span.context.span_id for span in exported}
+    assert all(span.parent is None or span.parent.span_id in exported_ids for span in exported)
+
+
+def _span_from(scope: str, attributes: dict[str, str] | None = None) -> ReadableSpan:
+    span = TracerProvider().get_tracer(scope).start_span("s", attributes=attributes)
+    span.end()
+    assert isinstance(span, ReadableSpan)
+    return span
+
+
+def test_export_filter_adds_our_tracer_and_keeps_the_sdk_default() -> None:
+    from langfuse.span_filter import is_default_export_span
+
+    from expert_work.common.observability import TRACER_NAME
+
+    ours = _span_from(TRACER_NAME)
+    assert not is_default_export_span(ours)  # what B-201 was: the SDK drops it
+    assert should_export_span(ours)
+    assert should_export_span(_span_from("langfuse-sdk"))
+    assert should_export_span(_span_from("some.http.client", {"gen_ai.system": "openai"}))
+    # Still a filter: an unrelated library's spans stay out of Langfuse.
+    assert not should_export_span(_span_from("sqlalchemy"))
+
+
+@pytest.mark.parametrize(
+    ("method", "exported"),
+    [
+        # The console polls with GETs (~65k a day on the test env against ~600
+        # runs); none of them starts a run, so their request spans would only
+        # add single-span traces.
+        ("GET", False),
+        ("HEAD", False),
+        ("OPTIONS", False),
+        # Inline runs start under a POST request span — it is the run tree's root.
+        ("POST", True),
+        ("PATCH", True),
+        # Run / node / tool spans carry no http.method.
+        (None, True),
+    ],
+)
+def test_export_filter_drops_read_only_request_spans(method: str | None, exported: bool) -> None:
+    from expert_work.common.observability import TRACER_NAME
+
+    attributes = None if method is None else {"http.method": method, "http.target": "/v1/x"}
+    assert should_export_span(_span_from(TRACER_NAME, attributes)) is exported

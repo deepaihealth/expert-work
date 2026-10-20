@@ -1492,6 +1492,8 @@ const zhCN: TranslationKeys = {
     timing_row_cost: "成本",
     timing_loading: "加载中…",
     timing_not_ready: "Langfuse 入库中，稍后自动重试",
+    timing_incomplete: "数据不完整",
+    timing_open_langfuse: "去 Langfuse 查看",
     timing_unavailable: "trace 不可用",
     timing_no_trace: "本次运行没有 trace",
     timing_mismatch: "无法与 span 对齐",

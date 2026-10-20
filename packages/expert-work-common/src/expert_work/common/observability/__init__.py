@@ -66,6 +66,9 @@ from expert_work.common.observability.tracing import (
     TRACED_SPANS as TRACED_SPANS,
 )
 from expert_work.common.observability.tracing import (
+    TRACER_NAME as TRACER_NAME,
+)
+from expert_work.common.observability.tracing import (
     ExpertWorkComponent as ExpertWorkComponent,
 )
 from expert_work.common.observability.tracing import (
@@ -83,6 +86,7 @@ __all__ = [
     "LLM_SPAN_PURPOSES",
     "TRACED_SPANS",
     "TRACEPARENT_HEADER",
+    "TRACER_NAME",
     "TRACESTATE_HEADER",
     "ExpertWorkComponent",
     "ExpertWorkJsonFormatter",

@@ -128,7 +128,9 @@ TRACED_SPANS: frozenset[str] = frozenset(
 )
 
 
-_TRACER_NAME: Final[str] = "expert-work"
+#: Instrumentation scope of every span this codebase creates. The Langfuse
+#: export filter (``expert_work.runtime.middleware.langfuse_sdk``) keys on it.
+TRACER_NAME: Final[str] = "expert-work"
 
 # Mutable process-wide state populated by ``init_tracing``. The
 # ``expert_work_span`` context manager reads these to auto-inject service / env
@@ -229,7 +231,7 @@ def get_tracer() -> Tracer:
     no-op tracer so unit tests can import code that creates spans
     without a global provider.
     """
-    return trace.get_tracer(_TRACER_NAME)
+    return trace.get_tracer(TRACER_NAME)
 
 
 def expert_work_span(
