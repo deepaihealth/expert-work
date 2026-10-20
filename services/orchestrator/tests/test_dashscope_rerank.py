@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from orchestrator.llm import DashScopeReranker, HTTPDashScopeRerankClient
+from orchestrator.llm.rerank import _MAX_DOC_CHARS
 
 
 @pytest.mark.asyncio
@@ -132,3 +133,24 @@ async def test_http_client_surfaces_error_body() -> None:
     with pytest.raises(httpx.HTTPStatusError) as excinfo:
         await client.rerank(model="bad", query="q", documents=["a"], top_n=1)
     assert "Model not exist" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_reranker_cuts_each_document_under_the_api_limit() -> None:
+    # One document over the model's per-document limit makes DashScope refuse
+    # the whole request (HTTP 400), costing the search its rerank (B-198).
+    sent: list[str] = []
+
+    class _Client:
+        async def rerank(
+            self, *, model: str, query: str, documents: Sequence[str], top_n: int
+        ) -> Mapping[str, Any]:
+            sent.extend(documents)
+            return {"output": {"results": [{"index": 1}, {"index": 0}]}}
+
+    long = "x" * (_MAX_DOC_CHARS + 500)
+    out = await DashScopeReranker(client=_Client(), model="m").rerank(
+        query="q", documents=["short", long], top_k=2, tenant_id=uuid4()
+    )
+    assert sent == ["short", long[:_MAX_DOC_CHARS]]
+    assert out == [1, 0]
