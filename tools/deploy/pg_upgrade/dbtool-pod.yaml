@@ -1,0 +1,28 @@
+# One-off pod for the PG major-upgrade window (B-207,
+# docs/runbooks/rds-pg-major-upgrade.md §4): the control-plane image and its
+# DB config, but `sleep` instead of the server — no traffic, no workers, so
+# the snapshots can be taken while every writer is scaled to 0.
+# __CONTROL_PLANE_IMAGE__ is filled in by the runbook command (sed), from the
+# control-plane Deployment's current image. Delete the pod after the window.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-upgrade-dbtool
+  namespace: expert-work
+  labels:
+    app.kubernetes.io/name: pg-upgrade-dbtool
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 14400
+  containers:
+    - name: tool
+      image: __CONTROL_PLANE_IMAGE__
+      command: ["sleep", "14400"]
+      envFrom:
+        - configMapRef:
+            name: control-plane-config
+        - secretRef:
+            name: control-plane-secrets
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {cpu: "1", memory: 1Gi}
