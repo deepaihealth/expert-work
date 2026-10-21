@@ -10,10 +10,12 @@ and the finalized tool description.
 
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -35,6 +37,7 @@ from orchestrator.tools import (
     ToolContext,
     knowledge,
     knowledge_result,
+    knowledge_types,
 )
 from orchestrator.tools.knowledge import (
     KNOWLEDGE_ANSWERABILITY_RULE,
@@ -393,29 +396,33 @@ async def test_the_budget_drops_the_lowest_ranked_first(monkeypatch: pytest.Monk
 
 
 async def test_the_budget_counts_what_the_model_reads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Measured on the rendered text, not on the bodies alone: a result
-    estimated within budget renders within budget."""
+    """Measured on the rendered text by the platform estimator: the size the
+    meta reports is what the model reads, and it is within the budget."""
     monkeypatch.setattr(knowledge_result, "RESULT_TOKEN_BUDGET", 500)
-    tool, _ = _tool(_distinct_docs(20, body="b" * 40))
+    words = " ".join(f"note{i}" for i in range(30))
+    tool = _platform_tool(_distinct_docs(20, body=words))
 
     result = await _search(tool)
 
     assert 1 < result.meta["hits"] < 10
-    assert len(result.content) <= result.meta["result_tokens"] <= 500
+    assert result.meta["result_tokens"] == default_estimator().count(result.content)
+    assert result.meta["result_tokens"] <= 500
+    assert result.meta["result_cut"] is False
 
 
 async def test_the_first_passage_is_kept_and_cut_to_fit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(knowledge_result, "RESULT_TOKEN_BUDGET", 300)
-    huge = "h" * 5_000
-    tool, _ = _tool([_hit(_doc(1), 0, huge), _hit(_doc(2, filename="b.md"), 0, "small")])
+    huge = " ".join(f"word{i}" for i in range(3_000))
+    tool = _platform_tool([_hit(_doc(1), 0, huge), _hit(_doc(2, filename="b.md"), 0, "small")])
 
     result = await _search(tool)
 
     assert result.meta["hits"] == 1
     assert result.meta["first_passage_cut"] is True
-    assert "h" * 50 in result.content
+    assert "word0 word1 word2" in result.content
     assert "passage cut here to fit the result size" in result.content
-    assert len(result.content) <= 300
+    assert default_estimator().count(result.content) <= 300
+    assert result.meta["result_cut"] is False  # the passage cut fits; no last-resort trim
     assert "small" not in result.content
 
 
@@ -426,7 +433,8 @@ async def test_nothing_is_cut_when_everything_fits() -> None:
 
     assert result.meta["hits"] == 4
     assert result.meta["first_passage_cut"] is False
-    assert "passage cut here" not in result.content
+    assert result.meta["result_cut"] is False
+    assert "cut here" not in result.content
 
 
 async def test_the_budget_is_counted_by_the_platform_estimator() -> None:
@@ -651,3 +659,164 @@ def test_the_limit_parameter_states_the_defaults() -> None:
     assert (limit["minimum"], limit["maximum"]) == (1, 20)
     assert "default 10" in limit["description"]
     assert "at most 3 per document" in limit["description"]
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up: the budget is a hard bound, safe arithmetic, safe meta,
+# the title rule, and no import cycle between the knowledge modules
+# ---------------------------------------------------------------------------
+
+
+def _platform_tool(results: Sequence[RetrievedChunk]) -> KnowledgeSearchTool:
+    """The tool as shipped: the platform estimator counts the budget."""
+    return KnowledgeSearchTool(
+        retriever=cast(KnowledgeRetriever, _FixedRetriever(results=tuple(results))),
+        knowledge_base_refs=("kb",),
+    )
+
+
+class _QuarterEstimator:
+    """``len // 4`` with no floor: a body of up to 3 characters counts 0 tokens."""
+
+    def count(self, text: str) -> int:
+        return len(text) // 4
+
+
+async def test_long_names_and_section_paths_are_capped() -> None:
+    document = _doc(5, filename="report " + "x" * 5_000 + ".md", title="Summary " + "t" * 5_000)
+    hit = _hit(document, 0, "Body.", heading=("Part " + "h" * 3_000, "Sub " + "g" * 3_000))
+    tool, _ = _tool([hit])
+
+    content = (await _search(tool)).content
+
+    header = content.splitlines()[0]
+    assert header.startswith("[doc 5] Summary tttt")
+    assert len(header) < 400
+    assert "x" * 200 not in content and "t" * 200 not in content
+    assert "[Section: Part hhhh" in content
+    assert "h" * 300 not in content and "g" * 300 not in content
+
+
+async def test_a_long_file_name_is_capped_where_it_labels_passages() -> None:
+    document = _doc(None, filename="y" * 5_000 + ".md", title=None)
+    tool, _ = _tool([_hit(document, 0, "Body.")])
+
+    content = (await _search(tool)).content
+
+    assert all(len(line) < 200 for line in content.splitlines())
+    assert "· passage 1/9]" in content
+
+
+async def test_the_rendered_result_never_exceeds_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixed overhead the selection cannot cut (a long header, the cut note)
+    is trimmed off the rendered text: the result never exceeds the budget by
+    the platform estimator, and nothing downstream cuts this tool's result."""
+    monkeypatch.setattr(knowledge_result, "RESULT_TOKEN_BUDGET", 40)
+    name = " ".join(f"name{i}" for i in range(40)) + ".md"
+    tool = _platform_tool([_hit(_doc(5, filename=name, title=None), 0, "Body words here.")])
+
+    result = await _search(tool)
+
+    assert default_estimator().count(result.content) <= 40
+    assert result.meta["result_tokens"] == default_estimator().count(result.content)
+    assert result.meta["result_cut"] is True
+    assert result.content.endswith("[... result cut here to fit the result size]")
+
+
+async def test_the_selection_counts_separators_so_no_last_resort_trim_is_needed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With an estimator that adds up exactly, the selection's estimate covers
+    every separator the rendered text has: it stops at four documents (111
+    tokens each) rather than taking a fifth that fits only when a separator is
+    left uncounted (five render to 548), so the result is never trimmed
+    mid-passage."""
+    monkeypatch.setattr(knowledge_result, "RESULT_TOKEN_BUDGET", 546)
+    tool, _ = _tool(_distinct_docs(6, body="b" * 40))
+
+    result = await _search(tool)
+
+    assert result.meta["hits"] == 4
+    assert result.meta["result_cut"] is False
+
+
+async def test_a_first_passage_whose_body_counts_no_tokens_is_still_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(knowledge_result, "RESULT_TOKEN_BUDGET", 20)
+    document = _doc(1, filename="storage_guide_" + "z" * 60 + ".docx")
+    tool, _ = _tool([_hit(document, 0, "abc")], estimator=_QuarterEstimator())
+
+    result = await _search(tool)
+
+    assert result.meta["hits"] == 1
+    assert result.meta["first_passage_cut"] is True
+    assert result.meta["result_tokens"] <= 20
+
+
+@pytest.mark.parametrize(
+    ("filename", "title", "name"),
+    [
+        ("storage_guide.docx", "storage_guide", "storage_guide.docx"),
+        ("storage_guide.docx", "storage_guide.docx", "storage_guide.docx"),
+        ("archive.tar.gz", "archive.tar", "archive.tar.gz"),
+        ("dept/notes.txt", "dept/notes", "dept/notes.txt"),
+        ("dept/notes.txt", "notes", "dept/notes.txt"),
+        ("storage_guide.docx", "storage", "storage (storage_guide.docx)"),
+        ("storage_guide.docx", "Storage Guide", "Storage Guide (storage_guide.docx)"),
+    ],
+)
+async def test_the_title_shows_only_when_it_is_more_than_the_file_name(
+    filename: str, title: str, name: str
+) -> None:
+    tool, _ = _tool([_hit(_doc(2, filename=filename, title=title), 0, "Body.")])
+
+    header = (await _search(tool)).content.splitlines()[0]
+
+    assert header == f"[doc 2] {name} · uploaded 2026-03-12"
+
+
+async def test_non_finite_scores_are_recorded_as_none() -> None:
+    hit = replace(
+        _hit(_doc(1), 0, "Body.", rerank=float("nan")),
+        vector_score=float("inf"),
+        keyword_score=float("-inf"),
+    )
+    tool, _ = _tool([hit])
+
+    meta = (await _search(tool)).meta
+
+    first = meta["results"][0]
+    assert first["vector_score"] is None
+    assert first["keyword_score"] is None
+    assert first["rerank_score"] is None
+    assert first["fused_score"] == 0.0325
+    json.dumps(meta, allow_nan=False)  # Postgres JSONB rejects NaN / Infinity
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """Every module a file imports, anywhere in it (module level, under
+    ``TYPE_CHECKING``, inside functions)."""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            names |= {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            names.add(node.module)
+    return names
+
+
+def test_the_knowledge_modules_import_in_one_direction_only() -> None:
+    """CodeQL ``py/unsafe-cyclic-import``: ``knowledge`` imports the result and
+    type modules, so neither imports ``knowledge`` back, and none of the three
+    goes through the ``orchestrator.tools`` package, which imports ``knowledge``."""
+    for module in (knowledge_result, knowledge_types):
+        assert module.__file__ is not None
+        imported = _imported_modules(Path(module.__file__))
+        assert "orchestrator.tools.knowledge" not in imported, module.__name__
+        assert "orchestrator.tools" not in imported, module.__name__
+    assert knowledge.__file__ is not None
+    assert "orchestrator.tools" not in _imported_modules(Path(knowledge.__file__))
+    assert knowledge.RetrievedChunk is knowledge_types.RetrievedChunk

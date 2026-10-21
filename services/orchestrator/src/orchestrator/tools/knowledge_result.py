@@ -7,24 +7,26 @@ document whose title matches the query cannot crowd out the rest (Onyx
 :data:`RESULT_TOKEN_BUDGET` tokens by the platform estimator, dropping the
 lowest-ranked first and always keeping the first — renders them grouped by
 document under a short ``[doc N]`` id, and describes every ranked passage for
-the trajectory panel (``ToolResult.meta``, never the model's input). No ids or
-scores reach the text. A passage is a retrieved chunk today; with parent
-chunks (K-1) it becomes the parent and nothing here changes shape. The budget
-is a platform default: no existing knowledge-base field can hold it.
+the trajectory panel (``ToolResult.meta``, never the model's input). The
+``[doc N]`` short id (``doc_seq``) is meant for the model; no UUIDs or scores
+reach the text. The budget is a hard bound on the rendered text: this tool's
+result skips the tools node's generic preview, so nothing downstream cuts it.
+A passage is a retrieved chunk today; with parent chunks (K-1) it becomes the
+parent and nothing here changes shape. The budget is a platform default: no
+existing knowledge-base field can hold it.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Literal
+from pathlib import PurePosixPath
+from typing import Any, Literal
 
-from expert_work.protocol import DocumentSourceType
+from expert_work.protocol import DocumentSourceType, chunk_retrieval_text
 from expert_work.runtime.tokens import TokenEstimator
-
-if TYPE_CHECKING:
-    # Typing only: ``orchestrator.tools.knowledge`` imports this module.
-    from orchestrator.tools.knowledge import RetrievedChunk
+from orchestrator.tools.knowledge_types import RetrievedChunk
 
 MAX_PER_DOCUMENT = 3
 RESULT_TOKEN_BUDGET = 8_000
@@ -35,10 +37,17 @@ _DOCUMENT_SEPARATOR = "\n\n---\n\n"
 #: ``metadata`` keys a document header shows when present, with their labels —
 #: the platform's convention for these three (K-15 fills them automatically).
 _HEADER_METADATA = (("version", "version"), ("effective_date", "effective"), ("source", "source"))
+#: Longest file name / title / metadata value / section path shown: they are
+#: tenant-supplied and repeat on every passage, so a long one must not eat the
+#: budget the passages are for.
+_NAME_MAX_CHARS = 120
 _METADATA_VALUE_MAX_CHARS = 80
+_SECTION_MAX_CHARS = 200
 #: Marks the end of a first passage cut to fit the budget (a base chunked far
 #: larger than the budget, or an oversized legacy chunk).
 _PASSAGE_CUT_NOTE = "\n[... passage cut here to fit the result size]"
+#: Marks a rendered result trimmed to the budget as a last resort.
+_RESULT_CUT_NOTE = "\n[... result cut here to fit the result size]"
 
 #: Why a ranked passage is not shown.
 DropReason = Literal["per_document", "limit", "budget"]
@@ -50,16 +59,24 @@ class PassageSelection:
 
     ``shown`` best first, the first one possibly cut to fit the budget
     (``first_cut``); ``dropped`` why each input passage is not shown, aligned
-    with the input (``None`` = shown); ``tokens`` the shown text's size by the
-    estimator, separators included."""
+    with the input (``None`` = shown)."""
 
     shown: tuple[RetrievedChunk, ...]
     dropped: tuple[DropReason | None, ...]
-    tokens: int
     first_cut: bool = False
 
     def left_out(self, reason: DropReason) -> int:
         return sum(1 for dropped in self.dropped if dropped == reason)
+
+
+@dataclass(frozen=True)
+class RenderedResult:
+    """The text the model reads, its size by the estimator, and whether it had
+    to be trimmed to the budget after rendering (``cut``)."""
+
+    text: str
+    tokens: int
+    cut: bool = False
 
 
 def select_passages(
@@ -102,9 +119,27 @@ def select_passages(
         dropped.append(None)
         per_document[key] = per_document.get(key, 0) + 1
         tokens += cost
-    return PassageSelection(
-        shown=tuple(shown), dropped=tuple(dropped), tokens=tokens, first_cut=first_cut
-    )
+    return PassageSelection(shown=tuple(shown), dropped=tuple(dropped), first_cut=first_cut)
+
+
+def render(selection: PassageSelection, *, estimator: TokenEstimator) -> RenderedResult:
+    """:func:`format_results` of the shown passages, held to
+    :data:`RESULT_TOKEN_BUDGET` by the estimator. Selection sums block by block,
+    which a fixed overhead (a header, the cut note) or a tokenizer merging across
+    blocks can still overrun, so the rendered text is measured once more and, if
+    over, trimmed — the last cut this result gets."""
+    budget = RESULT_TOKEN_BUDGET
+    text = format_results(selection.shown)
+    tokens = estimator.count(text)
+    if tokens <= budget:
+        return RenderedResult(text=text, tokens=tokens)
+    keep = len(text) * budget // max(1, tokens)
+    while True:
+        trimmed = text[:keep] + _RESULT_CUT_NOTE
+        tokens = estimator.count(trimmed)
+        if tokens <= budget or keep == 0:
+            return RenderedResult(text=trimmed, tokens=tokens, cut=True)
+        keep = keep * 9 // 10
 
 
 def format_results(results: Sequence[RetrievedChunk]) -> str:
@@ -127,7 +162,11 @@ def format_results(results: Sequence[RetrievedChunk]) -> str:
 
 
 def selection_meta(
-    results: Sequence[RetrievedChunk], selection: PassageSelection, *, limit: int
+    results: Sequence[RetrievedChunk],
+    selection: PassageSelection,
+    rendered: RenderedResult,
+    *,
+    limit: int,
 ) -> dict[str, Any]:
     """Hit details for the trajectory panel: every ranked passage with its ids,
     four scores and whether / why it was not shown. JSON-safe — it rides the
@@ -137,9 +176,10 @@ def selection_meta(
         "relevant": len(results),
         "limit": limit,
         "truncated": len(selection.shown) < len(results),
-        "result_tokens": selection.tokens,
+        "result_tokens": rendered.tokens,
         "token_budget": RESULT_TOKEN_BUDGET,
         "first_passage_cut": selection.first_cut,
+        "result_cut": rendered.cut,
         "results": [
             _hit_meta(rank, result, dropped)
             for rank, (result, dropped) in enumerate(
@@ -189,12 +229,12 @@ def _passage_cost(result: RetrievedChunk, estimator: TokenEstimator) -> int:
 
 def _cut_passage(result: RetrievedChunk, budget: int, estimator: TokenEstimator) -> RetrievedChunk:
     """``result`` with its body cut, in proportion to its token count, so its
-    block fits ``budget`` tokens."""
+    block fits ``budget`` tokens (:func:`render` makes the bound exact)."""
     overhead = _passage_cost(replace(result, content=""), estimator) + estimator.count(
         _PASSAGE_CUT_NOTE
     )
     room = max(0, budget - overhead)
-    keep = len(result.content) * room // estimator.count(result.content)
+    keep = len(result.content) * room // max(1, estimator.count(result.content))
     return replace(result, content=result.content[:keep] + _PASSAGE_CUT_NOTE)
 
 
@@ -208,19 +248,23 @@ def _document_label(result: RetrievedChunk) -> str:
     document = result.document
     if document is not None and document.doc_seq is not None:
         return f"doc {document.doc_seq}"
-    return _one_line(result.filename)
+    return _clip(result.filename, _NAME_MAX_CHARS)
 
 
 def _document_header(result: RetrievedChunk) -> str:
     """``[doc N] title (file) · uploaded date · version / effective / source ·
-    source type`` — each part only when recorded; the title only when it is
-    more than the file name without its extension."""
+    source type`` — each part only when recorded; the title only when it says
+    more than the file name (see :func:`_title_adds`)."""
     document = result.document
     if document is None:
         return f"[{_document_label(result)}]"
-    filename = _one_line(document.filename)
+    filename = _clip(document.filename, _NAME_MAX_CHARS)
     title = _one_line(document.title or "")
-    name = filename if not title or filename.startswith(title) else f"{title} ({filename})"
+    name = (
+        f"{_clip(title, _NAME_MAX_CHARS)} ({filename})"
+        if _title_adds(title, _one_line(document.filename))
+        else filename
+    )
     head = f"[doc {document.doc_seq}] {name}" if document.doc_seq is not None else f"[{name}]"
     fields = [head]
     if document.created_at is not None:
@@ -234,13 +278,25 @@ def _document_header(result: RetrievedChunk) -> str:
     return " · ".join(fields)
 
 
+def _title_adds(title: str, filename: str) -> bool:
+    """Whether ``title`` says more than ``filename``: not when it is the file
+    name, the file name without its last extension (the title a store derives
+    on upload, ``DocumentFileFacts``), or that name's bare stem."""
+    path = PurePosixPath(filename)
+    derived = filename[: -len(path.suffix)] if path.suffix else filename
+    return bool(title) and title not in {filename, derived, path.stem}
+
+
 def _passage_block(result: RetrievedChunk) -> str:
     """``[doc N · passage n/N]`` then the passage's section and body. ``N`` is
     left out when the document's chunk count does not cover the passage."""
     position = result.chunk_index + 1
     total = result.document.chunk_count if result.document is not None else 0
     where = f"passage {position}/{total}" if position <= total else f"passage {position}"
-    return f"[{_document_label(result)} · {where}]\n{result.retrieval_text}"
+    section = (
+        (_clip(" > ".join(result.heading_path), _SECTION_MAX_CHARS),) if result.heading_path else ()
+    )
+    return f"[{_document_label(result)} · {where}]\n{chunk_retrieval_text(section, result.content)}"
 
 
 def _metadata_text(value: object) -> str | None:
@@ -248,14 +304,23 @@ def _metadata_text(value: object) -> str | None:
     non-empty string or number."""
     if isinstance(value, bool) or not isinstance(value, str | int | float):
         return None
-    text = _one_line(str(value))
-    if len(text) > _METADATA_VALUE_MAX_CHARS:
-        text = text[: _METADATA_VALUE_MAX_CHARS - 1] + "…"
-    return text or None
+    return _clip(str(value), _METADATA_VALUE_MAX_CHARS) or None
+
+
+def _clip(text: str, max_chars: int) -> str:
+    """``text`` on one line, cut to ``max_chars`` with a trailing ``…``."""
+    line = _one_line(text)
+    return line if len(line) <= max_chars else line[: max_chars - 1] + "…"
 
 
 def _one_line(text: str) -> str:
     return " ".join(text.split())
+
+
+def _finite(score: float | None) -> float | None:
+    """``score``, or ``None`` when it is NaN / infinite: the meta is stored as
+    JSON (Postgres JSONB rejects both)."""
+    return score if score is not None and math.isfinite(score) else None
 
 
 def _hit_meta(rank: int, result: RetrievedChunk, dropped: DropReason | None) -> dict[str, Any]:
@@ -270,8 +335,8 @@ def _hit_meta(rank: int, result: RetrievedChunk, dropped: DropReason | None) -> 
         "doc_seq": None if document is None else document.doc_seq,
         "filename": result.filename,
         "recall_source": result.recall_source,
-        "vector_score": result.vector_score,
-        "keyword_score": result.keyword_score,
-        "fused_score": result.fused_score,
-        "rerank_score": result.rerank_score,
+        "vector_score": _finite(result.vector_score),
+        "keyword_score": _finite(result.keyword_score),
+        "fused_score": _finite(result.fused_score),
+        "rerank_score": _finite(result.rerank_score),
     }

@@ -865,8 +865,12 @@ async def run_eval(
             tool, {"query": case.query}, tenant_id=tenant_id, call_id=case.id
         )
         shown_text = str(message.content)
-        # 工具要的条数比这次检索的 top_k 还多时,截下来的前几名不是它自己搜会拿到的,不算。
-        faithful = replay.requested is not None and replay.requested <= cfg.top_k
+        # 工具总是要前 20 条来挑(B-206 K-4)。这次检索按 top_k 截过、而工具要的比 top_k 多时,
+        # 交给它的不是它自己搜会拿到的,不算;检索返回的不足 top_k 条就没被截过(top_k ≤ 20 时
+        # 召回深度与重排前段都不随条数变),与工具自己搜到的一样,照算。
+        faithful = replay.requested is not None and (
+            replay.requested <= cfg.top_k or len(outcome.results) < cfg.top_k
+        )
         alive: bool | None = None
         if anchors is not None and case.expected:
             alive = case.id in anchors.alive_cases

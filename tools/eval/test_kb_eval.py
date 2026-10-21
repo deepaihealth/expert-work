@@ -1436,6 +1436,22 @@ async def test_context_hit_leaves_the_existing_metrics_unchanged() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_hit_counts_when_the_search_returned_fewer_than_top_k() -> None:
+    """The tool ranks from 20, but a search that came back with fewer than
+    ``--top-k`` was not cut by it: the tool sees exactly what it would have
+    searching itself, so the context hit counts."""
+    rows = await run_eval(
+        dataset=_one_case_dataset(("manual_a.md", _ANCHOR_A)),
+        retriever=cast(KnowledgeRetriever, _FixedRetriever(_ranked(4))),
+        tenant_id=uuid4(),
+        cfg=EvalConfig(top_k=10),
+        concurrency=1,
+    )
+    assert len(_ranked(4)) < 10
+    assert rows[0].score.context_hit == 1.0
+
+
+@pytest.mark.asyncio
 async def test_context_hit_is_none_when_the_tool_wants_more_than_top_k() -> None:
     """With ``--top-k 3`` the first 3 are not what the tool (ranking its top 20)
     would have shown, so no context hit is claimed either way."""

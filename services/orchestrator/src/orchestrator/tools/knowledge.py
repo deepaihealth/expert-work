@@ -34,14 +34,19 @@ from expert_work.persistence import KnowledgeStore
 from expert_work.protocol import (
     KnowledgeBase,
     KnowledgeChunk,
-    KnowledgeDocument,
     RetrievalMethod,
     chunk_retrieval_text,
 )
 from expert_work.runtime.tokens import TokenEstimator, default_estimator
-from orchestrator.tools import knowledge_result
 from orchestrator.tools.error_classifier import GuidedToolError
-from orchestrator.tools.knowledge_result import MAX_PER_DOCUMENT
+from orchestrator.tools.knowledge_result import (
+    MAX_PER_DOCUMENT,
+    render,
+    select_passages,
+    selection_meta,
+    truncation_notice,
+)
+from orchestrator.tools.knowledge_types import RetrievedChunk as RetrievedChunk
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
 if TYPE_CHECKING:
@@ -185,51 +190,6 @@ class ScoredReranker(Protocol):
         """Like :meth:`Reranker.rerank`, each index paired with its relevance
         score: ``None`` throughout when the backend ranks without scoring (a
         chat-model reranker) or rerank was skipped."""
-
-
-@dataclass(frozen=True)
-class RetrievedChunk:
-    """A retrieved chunk with its source document attribution.
-
-    ``score`` is the vector cosine similarity in [0, 1] when the chunk was
-    surfaced by vector recall (``None`` for keyword-only hits, whose
-    ``ts_rank`` is not a comparable similarity). ``recall_source`` records
-    which recall path(s) found it. Both default to ``None`` so the tool's
-    formatted output is unaffected — they exist for the retrieval-test
-    endpoint's transparency.
-
-    The per-path sub-scores (B-175 wave 2) are kept for diagnostics and are
-    ``None`` when a path did not surface the chunk: ``vector_score`` (same
-    value as ``score``), ``keyword_score`` (the keyword path's rank value)
-    and ``fused_score`` (the weighted RRF score that ordered the fusion).
-    ``rerank_score`` is the score the reranker ranked it by — the two-view
-    weighted score when both views ran — and ``None`` when rerank was off,
-    failed, or ranked without scores.
-
-    ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
-    The agent sees (and the eval matches against) :attr:`retrieval_text`, the
-    two joined, under its document's ``[doc N]`` header (B-206 K-4). The
-    reranker ranks the stored chunk's own retrieval text, which also carries
-    the document title — here it would only repeat the header. ``document`` is
-    the source document that header is drawn from (``None`` when it is gone).
-    """
-
-    content: str
-    filename: str
-    chunk_index: int
-    score: float | None = None
-    recall_source: str | None = None
-    heading_path: tuple[str, ...] = ()
-    chunk_id: UUID | None = None
-    vector_score: float | None = None
-    keyword_score: float | None = None
-    fused_score: float | None = None
-    rerank_score: float | None = None
-    document: KnowledgeDocument | None = None
-
-    @property
-    def retrieval_text(self) -> str:
-        return chunk_retrieval_text(self.heading_path, self.content)
 
 
 @dataclass(frozen=True)
@@ -716,15 +676,14 @@ class KnowledgeSearchTool:
                 meta=meta,
                 notice=_NO_HITS_NOTICE,
             )
-        selection = knowledge_result.select_passages(
-            outcome.results, limit=limit, estimator=self.estimator
-        )
-        trailer = knowledge_result.truncation_notice(selection, limit=limit, max_limit=_MAX_LIMIT)
+        selection = select_passages(outcome.results, limit=limit, estimator=self.estimator)
+        rendered = render(selection, estimator=self.estimator)
+        trailer = truncation_notice(selection, limit=limit, max_limit=_MAX_LIMIT)
         return ToolResult(
-            content=knowledge_result.format_results(selection.shown),
+            content=rendered.text,
             meta={
                 **meta,
-                **knowledge_result.selection_meta(outcome.results, selection, limit=limit),
+                **selection_meta(outcome.results, selection, rendered, limit=limit),
                 "candidates": outcome.candidates,
             },
             notice=_RESULTS_NOTICE if trailer is None else f"{_RESULTS_NOTICE}\n{trailer}",
