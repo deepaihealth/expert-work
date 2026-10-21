@@ -97,18 +97,41 @@ def test_every_ecr_official_reference_in_the_repo_is_mirrored() -> None:
     )
 
 
-def test_the_ci_sandbox_prebuild_overrides_the_dockerfile_base_image() -> None:
-    """沙箱 Dockerfile 换了基础镜像 tag 而 ci.yml 的 build-contexts 没跟上:覆盖静默
-    失效,预构建又去匿名 ECR 解析 FROM —— 这里红。"""
+def _sandbox_image_build_steps() -> list[tuple[str, dict[str, Any]]]:
+    """每个 workflow 里用 build-push-action 构建 ``infra/sandbox-image`` 的步骤。"""
+    steps: list[tuple[str, dict[str, Any]]] = []
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for job_name, job in (data.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                uses = str(step.get("uses", ""))
+                with_ = step.get("with") or {}
+                if uses.startswith("docker/build-push-action@") and with_.get("context") == (
+                    "infra/sandbox-image"
+                ):
+                    steps.append((f"{path.name}:{job_name}:{step.get('name', '?')}", with_))
+    return steps
+
+
+def test_every_sandbox_image_build_overrides_the_dockerfile_base_image() -> None:
+    """构建沙箱镜像的步骤漏了 build-contexts,FROM 就去匿名 ECR 解析 —— 10-20 / 10-21
+    sandbox-image.yml 与 platform-skills.yml 一共 6 次 ``429 Too Many Requests``,
+    其中两次在 push main,#1838 的镜像因此没推上 ACR。以前这里只查 ci.yml 一处;
+    沙箱 Dockerfile 换基础镜像 tag 而某处 build-contexts 没跟上,同样在这里红。"""
     match = re.search(r"^FROM\s+(\S+)", _SANDBOX_DOCKERFILE.read_text(encoding="utf-8"), re.M)
     assert match is not None, "沙箱 Dockerfile 没有 FROM"
     base = match.group(1)
     tag = base.rsplit(":", 1)[1]
     name = base.removeprefix(_ECR_OFFICIAL).split(":", 1)[0]
     expected = f"{base}=docker-image://ghcr.io/deepaihealth/mirror/{name}:{tag}"
-    assert expected in _CI.read_text(encoding="utf-8"), (
-        f"ci.yml 的沙箱预构建应带 build-contexts `{expected}`"
-    )
+    steps = _sandbox_image_build_steps()
+    covered = {where.split(":", 1)[0] for where, _ in steps}
+    # 扫描本身坏了(一个步骤都没认出来)时这条会空转成绿 —— 至少要认出这两处。
+    assert {"ci.yml", "sandbox-image.yml"} <= covered, f"只认出了 {sorted(covered)}"
+    missing = [
+        where for where, with_ in steps if expected not in str(with_.get("build-contexts", ""))
+    ]
+    assert not missing, f"这些构建沙箱镜像的步骤缺 build-contexts `{expected}`:{missing}"
 
 
 def test_the_workflow_can_actually_push_to_ghcr() -> None:
