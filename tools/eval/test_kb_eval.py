@@ -54,7 +54,7 @@ from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import DocumentStatus, RetrievalMethod
-from orchestrator.tools import knowledge
+from orchestrator.tools import knowledge, knowledge_result
 from orchestrator.tools.knowledge import (
     KnowledgeRetriever,
     KnowledgeSearchOutcome,
@@ -1357,12 +1357,17 @@ class _FixedRetriever:
         )
 
 
-def _ranked(anchor_rank: int, n: int = 8) -> tuple[RetrievedChunk, ...]:
-    """``n`` results; only the one at ``anchor_rank`` is manual_a.md's anchor chunk."""
+def _ranked(anchor_rank: int, n: int = 8, *, crowded: bool = False) -> tuple[RetrievedChunk, ...]:
+    """``n`` results; only the one at ``anchor_rank`` is manual_a.md's anchor chunk.
+    ``crowded``: every result above it is another manual_a.md chunk."""
     return tuple(
         RetrievedChunk(
             content=f"益生菌{_ANCHOR_A}。" if rank == anchor_rank else f"无关段落第 {rank} 条。",
-            filename="manual_a.md" if rank == anchor_rank else f"other{rank}.md",
+            filename=(
+                "manual_a.md"
+                if rank == anchor_rank or (crowded and rank < anchor_rank)
+                else f"other{rank}.md"
+            ),
             chunk_index=rank,
             chunk_id=uuid4(),
             fused_score=1.0 / (60 + rank),
@@ -1371,10 +1376,12 @@ def _ranked(anchor_rank: int, n: int = 8) -> tuple[RetrievedChunk, ...]:
     )
 
 
-async def _context_rows(anchor_rank: int) -> list[CaseRow]:
+async def _context_rows(anchor_rank: int, n: int = 8, *, crowded: bool = False) -> list[CaseRow]:
     return await run_eval(
         dataset=_one_case_dataset(("manual_a.md", _ANCHOR_A)),
-        retriever=cast(KnowledgeRetriever, _FixedRetriever(_ranked(anchor_rank))),
+        retriever=cast(
+            KnowledgeRetriever, _FixedRetriever(_ranked(anchor_rank, n, crowded=crowded))
+        ),
         tenant_id=uuid4(),
         cfg=EvalConfig(top_k=20),
         concurrency=1,
@@ -1383,12 +1390,21 @@ async def _context_rows(anchor_rank: int) -> list[CaseRow]:
 
 @pytest.mark.asyncio
 async def test_context_hit_counts_only_what_the_tool_hands_the_model() -> None:
-    """The tool shows its default 5 results: an anchor ranked 7th is a chunk hit
-    within 10 but never reached the model."""
-    shown = (await _context_rows(3))[0].score
-    hidden = (await _context_rows(7))[0].score
+    """An anchor ranked 4th is a chunk hit within 10 either way, but reaches the
+    model only when its document has not already filled the tool's 3 passages
+    per document (B-206 K-4)."""
+    shown = (await _context_rows(4))[0].score
+    hidden = (await _context_rows(4, crowded=True))[0].score
     assert (shown.chunk_hit_10, shown.context_hit) == (1.0, 1.0)
     assert (hidden.chunk_hit_10, hidden.context_hit) == (1.0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_context_hit_follows_the_tools_default_of_ten() -> None:
+    within = (await _context_rows(10, 14))[0].score
+    beyond = (await _context_rows(11, 14))[0].score
+    assert (within.chunk_hit_10, within.context_hit) == (1.0, 1.0)
+    assert (beyond.chunk_hit_20, beyond.context_hit) == (1.0, 0.0)
 
 
 @pytest.mark.asyncio
@@ -1397,11 +1413,12 @@ async def test_context_hit_follows_the_tools_own_limit_and_rendering(
 ) -> None:
     """Computed on the tool's real output, not on chunk ids: when the tool's
     default count or its rendering changes (parent chunks later), so does it."""
-    monkeypatch.setattr(knowledge, "_DEFAULT_LIMIT", 8)
     assert (await _context_rows(7))[0].score.context_hit == 1.0
+    monkeypatch.setattr(knowledge, "_DEFAULT_LIMIT", 5)
+    assert (await _context_rows(7))[0].score.context_hit == 0.0
     monkeypatch.setattr(
-        knowledge,
-        "_format_results",
+        knowledge_result,
+        "format_results",
         lambda results: "\n".join(f"[{r.filename}#{r.chunk_index}]" for r in results),
     )
     assert (await _context_rows(3))[0].score.context_hit == 0.0
@@ -1420,8 +1437,8 @@ async def test_context_hit_leaves_the_existing_metrics_unchanged() -> None:
 
 @pytest.mark.asyncio
 async def test_context_hit_is_none_when_the_tool_wants_more_than_top_k() -> None:
-    """With ``--top-k 3`` the first 3 are not what the tool (5 by default) would
-    have shown, so no context hit is claimed either way."""
+    """With ``--top-k 3`` the first 3 are not what the tool (ranking its top 20)
+    would have shown, so no context hit is claimed either way."""
     rows = await run_eval(
         dataset=_one_case_dataset(("manual_a.md", _ANCHOR_A)),
         retriever=cast(KnowledgeRetriever, _FixedRetriever(_ranked(2)[:3])),
@@ -1464,7 +1481,7 @@ async def test_replayed_search_renders_what_the_tool_gets_searching_itself(
             tenant,
             {
                 f"doc{i}.md": f"# 说明 {i}\n\n益生菌第 {i} 款,每日 {i} 袋,冷藏保存。\n"
-                for i in range(9)
+                for i in range(14)
             },
         )
         retriever = KnowledgeRetriever(
@@ -1474,7 +1491,8 @@ async def test_replayed_search_renders_what_the_tool_gets_searching_itself(
             outcome = await retriever.search_detailed(
                 tenant_id=tenant, base_names=["kb"], query=query, limit=20
             )
-            assert len(outcome.results) > 5  # the tool's default count must actually cut
+            # the tool's default count must actually cut
+            assert len(outcome.results) > knowledge._DEFAULT_LIMIT
             replayed = KnowledgeSearchTool(
                 retriever=cast(KnowledgeRetriever, _ReplayRetriever(retriever, outcome)),
                 knowledge_base_refs=("kb",),
@@ -1489,7 +1507,9 @@ async def test_replayed_search_renders_what_the_tool_gets_searching_itself(
 
 @pytest.mark.asyncio
 async def test_search_log_records_every_returned_chunk_and_what_was_shown() -> None:
-    row = (await _context_rows(7))[0]
+    """``shown`` is what the tool picked — rank 4 is the 4th passage of one
+    document, so the tool skipped it and showed the ones below it."""
+    row = (await _context_rows(4, crowded=True))[0]
     log = search_log_json(row)
     assert (log["case_id"], log["query"], log["limit"], log["status"]) == (
         "q1",
@@ -1497,11 +1517,11 @@ async def test_search_log_records_every_returned_chunk_and_what_was_shown() -> N
         20,
         "ok",
     )
-    assert log["shown"] == 5
+    assert log["shown"] == 7
     assert log["shown_chars"] > 0
-    ranked = _ranked(7)
+    ranked = _ranked(4, crowded=True)
     assert [r["rank"] for r in log["results"]] == list(range(1, 9))
-    assert [r["shown"] for r in log["results"]] == [True] * 5 + [False] * 3
+    assert [r["shown"] for r in log["results"]] == [True] * 3 + [False] + [True] * 4
     assert [(r["filename"], r["chunk_index"]) for r in log["results"]] == [
         (c.filename, c.chunk_index) for c in ranked
     ]

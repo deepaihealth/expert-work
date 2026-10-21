@@ -19,8 +19,8 @@
 3. 入库后核「锚文本存活」:每条 expected 的 anchor 至少出现在其文档的某一段里,不存活的 case
    单列(是数据集 / 切块的问题,不是检索的问题);
 4. 每条 case 调 ``KnowledgeRetriever.search(limit=top_k)``,按 ``kb_metrics`` 打分(``match``
-   取 case 自己的 any|all);同一次检索的前几名再交给生产 ``knowledge_search`` 工具按默认条数渲染
-   (工具节点同一段代码),锚文本是否落在这段**给模型的文本**里记 ``context_hit``(B-206
+   取 case 自己的 any|all);同一次检索的前 20 名再交给生产 ``knowledge_search`` 工具,按它自己的
+   默认挑出来渲染(工具节点同一段代码),锚文本是否落在这段**给模型的文本**里记 ``context_hit``(B-206
    「父段级段命中」,与 ``chk_hit@10`` 并列);总体 / 按 ``source`` / 按 ``tag`` 各出一份汇总;
    结果 JSONL 每 case 一行(含 ``best_score`` 便于离线扫阈值)+ 末尾一行汇总;
    ``--search-log`` 另写每次检索的逐段记录(段号、名次、各路分数、是否交给了模型,默认不写);
@@ -68,6 +68,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
+
+from langchain_core.messages import ToolMessage
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -292,8 +294,9 @@ class ResultRow:
 
 @dataclass(frozen=True)
 class SearchLog:
-    """一次检索返回了什么(``--search-log``):逐段的段号、各路分数,以及前 ``shown`` 名交给了
-    ``knowledge_search``(工具默认条数),诊断时不用再重跑。"""
+    """一次检索返回了什么(``--search-log``):逐段的段号、各路分数,以及 ``knowledge_search``
+    把其中哪几名交给了模型(``shown_ranks``,从 1 起;B-206 K-4 起按条数 / 每文档上限 / 预算挑,
+    不一定是前几名),诊断时不用再重跑。"""
 
     query: str
     limit: int
@@ -301,7 +304,7 @@ class SearchLog:
     candidates: int
     rerank_degraded: bool
     results: tuple[RetrievedChunk, ...]
-    shown: int
+    shown_ranks: frozenset[int]
     shown_chars: int  # 工具渲染给模型的文本长度
 
 
@@ -858,9 +861,10 @@ async def run_eval(
         tool = KnowledgeSearchTool(
             retriever=cast(KnowledgeRetriever, replay), knowledge_base_refs=(dataset.name,)
         )
-        shown_text = await tool_message_text(
+        message = await tool_message(
             tool, {"query": case.query}, tenant_id=tenant_id, call_id=case.id
         )
+        shown_text = str(message.content)
         # 工具要的条数比这次检索的 top_k 还多时,截下来的前几名不是它自己搜会拿到的,不算。
         faithful = replay.requested is not None and replay.requested <= cfg.top_k
         alive: bool | None = None
@@ -888,7 +892,7 @@ async def run_eval(
                 candidates=outcome.candidates,
                 rerank_degraded=outcome.rerank_degraded,
                 results=outcome.results,
-                shown=min(replay.requested or 0, len(results)),
+                shown_ranks=shown_ranks(message),
                 shown_chars=len(shown_text),
             ),
         )
@@ -898,10 +902,11 @@ async def run_eval(
 
 @dataclass
 class _ReplayRetriever:
-    """``knowledge_search`` 那次检索不重跑:给它这次检索结果的前 ``limit`` 条(模型不传条数时
-    就是工具默认条数)。召回深度只在 ``limit`` > 25、双视图重排的前段只在 ``limit`` > 20 时才随
-    ``limit`` 变,所以默认 ``--top-k 20`` 下与工具自己搜一次逐条相同,也不多花一次嵌入 / 重排;
-    其余属性转给真检索器(工具以后要从库里取父段之类的,照样拿得到)。"""
+    """``knowledge_search`` 那次检索不重跑:给它这次检索结果的前 ``limit`` 条(工具总是要排序用的
+    前 20 条,再自己挑给模型的几条,B-206 K-4)。召回深度只在 ``limit`` > 25、双视图重排的前段
+    只在 ``limit`` > 20 时才随 ``limit`` 变,所以默认 ``--top-k 20`` 下与工具自己搜一次逐条
+    相同,也不多花一次嵌入 / 重排;其余属性转给真检索器(工具以后要从库里取父段之类的,照样
+    拿得到)。"""
 
     inner: KnowledgeRetriever
     outcome: KnowledgeSearchOutcome
@@ -915,12 +920,13 @@ class _ReplayRetriever:
         return getattr(self.inner, name)
 
 
-async def tool_message_text(
+async def tool_message(
     tool: Tool, args: Mapping[str, Any], *, tenant_id: UUID, call_id: str
-) -> str:
-    """工具节点交给模型的那段文本 —— 直接走生产的 ``_invoke_tool``:参数校验、调用、出错时的
-    报错格式、超长外置(默认智能体不开工作区,没有外置)、防注入围栏、围栏外的提示,都与生产
-    同一段代码,工具的渲染 / 条数 / 截断以后怎么改都跟着走。"""
+) -> ToolMessage:
+    """工具节点交给模型的那条消息 —— 直接走生产的 ``_invoke_tool``:参数校验、调用、出错时的
+    报错格式、超长外置(默认智能体不开工作区,没有外置;``knowledge_search`` 有工作区也不外置,
+    B-206 K-4)、防注入围栏、围栏外的提示,都与生产同一段代码,工具的渲染 / 条数 / 截断以后
+    怎么改都跟着走。"""
     message, _updates, _refund, _error = await _invoke_tool(
         tool,
         dict(args),
@@ -928,7 +934,21 @@ async def tool_message_text(
         ToolContext(tenant_id=tenant_id),
         spotlight_nonce=TOOL_SPOTLIGHT_NONCE,
     )
-    return str(message.content)
+    return message
+
+
+async def tool_message_text(
+    tool: Tool, args: Mapping[str, Any], *, tenant_id: UUID, call_id: str
+) -> str:
+    """:func:`tool_message` 的正文:模型读到的那段文本。"""
+    return str((await tool_message(tool, args, tenant_id=tenant_id, call_id=call_id)).content)
+
+
+def shown_ranks(message: ToolMessage) -> frozenset[int]:
+    """``knowledge_search`` 把这次检索的哪几名交给了模型(从 1 起)—— 读它 meta 里的逐条明细
+    (随 ``ToolMessage.artifact`` 走,不进模型);没有结果 / 工具报错时为空。"""
+    meta = message.artifact if isinstance(message.artifact, Mapping) else {}
+    return frozenset(hit["rank"] for hit in meta.get("results", ()) if hit.get("shown"))
 
 
 def _result_row(result: RetrievedChunk, *, with_text: bool = False) -> ResultRow:
@@ -1065,7 +1085,7 @@ def search_log_json(row: CaseRow) -> dict[str, Any]:
         "status": log.status,
         "candidates": log.candidates,
         "rerank_degraded": log.rerank_degraded,
-        "shown": log.shown,
+        "shown": len(log.shown_ranks),
         "shown_chars": log.shown_chars,
         "results": [
             {
@@ -1078,7 +1098,7 @@ def search_log_json(row: CaseRow) -> dict[str, Any]:
                 "keyword_score": r.keyword_score,
                 "fused_score": r.fused_score,
                 "rerank_score": r.rerank_score,
-                "shown": rank <= log.shown,
+                "shown": rank in log.shown_ranks,
             }
             for rank, r in enumerate(log.results, start=1)
         ],

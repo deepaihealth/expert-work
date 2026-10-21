@@ -51,7 +51,10 @@ from orchestrator.tools import (
     WriteFileTool,
     build_tool_registry,
 )
-from orchestrator.tools.knowledge import KNOWLEDGE_ANSWERABILITY_RULE
+from orchestrator.tools.knowledge import (
+    KNOWLEDGE_ANSWERABILITY_RULE,
+    KNOWLEDGE_SEARCH_GUIDANCE,
+)
 
 
 def _knowledge_retriever() -> KnowledgeRetriever:
@@ -351,6 +354,22 @@ async def test_the_knowledge_answerability_rule_ships_only_with_a_bound_base() -
     )
     assert all(KNOWLEDGE_ANSWERABILITY_RULE not in s.description for s in unbound.all_specs())
     assert any(KNOWLEDGE_ANSWERABILITY_RULE in s.description for s in bound.all_specs())
+
+
+@pytest.mark.asyncio
+async def test_the_knowledge_search_guidance_ships_only_with_a_bound_base() -> None:
+    """B-206 K-6 — how to search and the ``[doc N]`` result format ride the
+    tool description, so an agent with no knowledge base sees none of it."""
+    env = ToolEnv(knowledge_retriever=_knowledge_retriever())
+    tools = [BuiltinToolSpec(name="ask_for_approval")]
+    unbound = await build_tool_registry(tools, tool_env=env)
+    bound = await build_tool_registry(
+        tools, tool_env=env, knowledge=KnowledgeSpec(knowledge_base_refs=["hr"])
+    )
+    assert unbound.all_specs()  # the unbound agent has tools, so the check below is not vacuous
+    for text in (KNOWLEDGE_SEARCH_GUIDANCE, "[doc N]"):
+        assert all(text not in s.description for s in unbound.all_specs())
+        assert any(text in s.description for s in bound.all_specs())
 
 
 # ---------------------------------------------------------------------------

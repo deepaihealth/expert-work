@@ -118,6 +118,14 @@ FALLBACK_MAX_CHARS = 30_000
 #: results are NOT cheaply re-readable, so it must still be externalized).
 EXEMPT_TOOLS = frozenset({"read_document", "read_file", "list_dir"})
 
+#: Tools that size their own result for the model and must reach it whole
+#: (B-206 K-4: ``knowledge_search`` cuts to a token budget, which in English is
+#: well over ``EXTERNALIZE_MIN_CHARS``). The generalized externalization would
+#: swap such a result for the head+tail preview, so they skip it; the persist
+#: floor still applies at any size (full result in context, a copy on disk), so
+#: a later prune can still collapse it to a lossless reference.
+SELF_BUDGETED_TOOLS = frozenset({"knowledge_search"})
+
 
 def _elide(text: str, *, head: int, tail: int, note: str) -> str:
     """Keep ``head`` chars from the front + ``tail`` from the back, ``note`` between."""

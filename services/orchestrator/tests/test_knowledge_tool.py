@@ -351,8 +351,8 @@ def test_knowledge_search_spec() -> None:
 async def test_knowledge_search_tool_returns_attributed_block() -> None:
     store, tenant = await _seed_store()
     result = await _tool(store).call({"query": "deductible"}, ctx=ToolContext(tenant_id=tenant))
-    assert "[doc.pdf#0]" in result.content
-    assert "deductible" in result.content
+    assert result.content.startswith("[doc 1] doc.pdf · uploaded ")
+    assert "[doc 1 · passage 1]\nthe deductible" in result.content
     assert result.meta["hits"] >= 1
 
 
