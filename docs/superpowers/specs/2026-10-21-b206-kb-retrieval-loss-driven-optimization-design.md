@@ -2,6 +2,7 @@
 
 - **状态**:设计稿 **v2**(2026-10-21 重调研修订),**登记不排期**(用户拍板:方案落库 + 登记 ROADMAP,开工时间等指令)。
 - **v2 修订记录(2026-10-21)**:用户要求「对整个设计重新调研和评估,确保合理性,该细化的细化」+「不要只针对 qwen,会有不同厂家的向量 / 重排模型;文档也不只有示例和评测集」。第二轮调研五路(切块与父子块 / 查询侧与关键词路 / 重排与结果呈现 / 智能体检索与索引增强 / 各厂商嵌入与重排接口),都读原文;仓库现状逐条重核;ERB 正确文档的结构形态新算了一遍。改动汇总见 §0。
+- **v2.1(2026-10-21 晚)**:用户「WeKnora 是目前比较火的知识库项目,深度探索一下,有什么可以参考借鉴」→ 四路深读本机 `/Users/mac/src/github/WeKnora`(v0.8.3,2026-10-21,Go)入库切块 / 检索流水线 / 智能体工具层 / 前端管理面,逐条 file:line,借鉴清单见 §5.6,已并进对应 K 项与 §6;同时核实阿里云 RDS 插件表:**`pg_textsearch`(BM25)在 PG 17 / 18 可装、PG 16 不可**,K-9 改成两条路。
 - **与 B-175 的关系**:K-2(读文档)、K-12(生成问题)、K-13(列文档)、K-15(元数据抽取)是 [B-175 设计](2026-10-10-b175-knowledge-base-v2-design.md) 里计划过、一直没做的能力;本文给出评测证据和先后顺序,开工时按本文的批次走,B-175 对应条目以本文为准。B-175 §3.2「Anthropic 实测 HyDE 效果差」是误读,已更正(见 §8.3)。
 - **用户约束**:① 方案必须**通用**,不能只针对某批资料设计(10-20);② 参考开源项目与行业最佳实践(10-20);③ 加父子块要同时设计 **Web 前端怎么展示**(10-20);④ 评测集只用来诊断,不拿来调参数(10-18 拍板,开发验证仍用华大题);⑤ **不能只针对阿里云 qwen 系列**,平台会接不同厂家的向量模型和重排模型(10-21);⑥ **文档形态不只示例资料和评测集**(10-21)。
 - **依据**:
@@ -32,6 +33,8 @@
 | §7 不做 | — | AtlasNav 条理由改(它当时是榜首,找全 66.98);RAPTOR「+20%」注明口径;HyDE 理由改「收益不稳 + 延迟 3 倍」 | 调研核实 |
 | §6 前端 | 一张表 | 三处页面 + 设置页逐项字段、接口要补什么 | 用户约束 ③ |
 | §9 / §10 | — | 评测资产清单、每批判据、**批 0 评测地基** | 智能体层 A/B 脚本还在会话目录没入库 |
+| K-9 路径(v2.1) | tsvector 自算 | **两条路**:RDS 升 PG 17 + `pg_textsearch`(阿里云已上架 1.3.1,仅 PG 17 / 18)或留 PG 16 自算 | 实测测试库 PG 16.13 无任何 BM25 扩展;插件表逐行核对 |
+| WeKnora 深读(v2.1) | — | 借 15 条进 K-1 / K-2 / K-3 / K-4 / K-6 / K-7 / K-10 / K-12 / K-14 / K-15 / §6 / §9,清单见 §5.6 | 用户 10-21「比较火的知识库项目,分析借鉴」 |
 
 ---
 
@@ -167,6 +170,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
   - **检索**:召回、融合、重排仍在子段上做(不变);之后**按父段折叠**:父段分数 = 子段最高分(Dify 同款),记录命中的子段编号;同一父段只出一次;按 K-4 的每文档上限和总预算截断;`limit` 数的是父段。
   - **返回**:父段整段正文(不是「前后各 1 段」);父段超出剩余预算时,只给命中子段前后能装下的部分并标 `[已截断,用 knowledge_read 读全]`。
   - **维护**:父段正文由子段拼出(存一份便于读取);子段被人工编辑(`edited`)时重拼它的父段;重切块 = 新版本整套替换(B-175 规矩)。
+  - **细节(WeKnora 同款,v2.1)**:整篇只有一个子段且与父段相同时不建父行(短文档省一份正文);父段行只存不索引,召回 SQL 用「可检索类型白名单」(text / question / faq …)而不是排除法;入库时记子段在父段里的字符区间(`start / end`),§6 的子段高亮靠它。
 - 治哪类:诊断里「正确文档已显示、答案在没返回的段里」约 22 题(C 11、B 4、D 7);2.1 的根因在呈现侧的那一半。
 - 依据(v2 核实):
   - 业界实现都是「子段命中 → 父段整体返回、父段分数取子段最高」:Dify 源码(`retrieval_service.format_retrieval_documents`,父段 = max 子段分;父 `\n\n` / 1,024 token、子 `\n` / 512,**无重叠**)、RAGFlow(子块带 `Mom` = 父块全文)、LangChain `ParentDocumentRetriever`(示例父 2,000 / 子 400 字符)、AWS Bedrock(层级切块时子块以父块替换返回)。
@@ -179,7 +183,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 **K-2 「读文档」工具(模型自己决定读多少)** —— M
 
-- 改什么:新增 `knowledge_read(document, section | page)`:`document` 用结果里的文档短编号(`doc_seq`,租户内递增整数,结果里显示为 `[doc 1234]`)或文件名;`section` 读某个标题下整节;`page` 按父段顺序分页读,每页默认 4,000 token(上限 16,000,与 Onyx `read_file` 的 16,000 字符同量级),返回 `第 n / N 页` 与下一页编号。结果同样带标题路径。工具说明写清何时用(结果被截断、要核对相邻内容、「找全」题逐篇核对)。
+- 改什么:新增 `knowledge_read(document, section | page | around | find)`:`document` 用结果里的文档短编号(`doc_seq`,租户内递增整数,结果里显示为 `[doc 1234]`)或文件名;四种读法——`section` 读某个标题下整节;`page` 按父段顺序分页读,每页默认 4,000 token(上限 16,000,与 Onyx `read_file` 的 16,000 字符同量级),返回 `第 n / N 页` 与下一页编号,页码超界时报「有效范围 0..N」而不是返回空;`around = <父段编号>, k` 读命中父段前后各 k 个父段(k ≤ 5,WeKnora `read_document(context=k)` 同款,直接对着「答案在相邻块里」这个头号丢分);`find = <关键词>` 在该文档内做关键词查找(每个词都要命中、大小写不敏感,最多 20 处,每处带前后各 1 个父段,给「找全」题逐篇核对用)。每次结果先给文档元数据头(标题、上传时间、版本、父段总数),正文带标题路径;结果里每个父段标 `match / context_before / context_after`,给轨迹面板用。工具说明写清何时用(结果被截断、要核对相邻内容、「找全」题逐篇核对),并写明「本轮已拿到全文的父段不必再读」。
 - 治哪类:同 K-1,加「找全」题、长文档综合题。
 - 依据(v2 核实):Mixedbread(2026-03)BrowseComp-Plus 上给智能体加「读整篇」工具,两种检索器都提分:80.00 → 90.48、79.52 → 87.59(上限 93.5);但同一家 toast-1(2026-08)在「文件系统智能体」基线上加搜索 / 读工具只省 token(80.6M → 23M)不提分(都 55)——**提分的前提是基线只看片段**,我们正是。产品先例:Onyx `read_file(file_id, start_char, num_chars ≤ 16000)`、Glean「Read document」、Vectara `web_get(head_lines / tail_lines)`、PageIndex 按树节点读。
 - 厂商:与模型无关。
@@ -195,6 +199,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
   - **重叠默认 64 → 0**:上下文由父段提供。
   - **对话体 / 一行一句**:纯文本里一段的各行多数以「说话人:」开头或行中位长度 < 40 字 → 按行成块,不把多句合成一个超长段再硬切;会议纪要「人名:发言」同理。
   - 表格:仍按行切、重复表头(B-199 / B-200 已有),父段见 K-1。
+  - **规则细节(WeKnora 同款,v2.1)**:短节合并的目标长度取 max(200 token, 子段上限 / 2),只并相邻且标题前缀相同的节;无标题长文本(Ⓑ)除空行外再认「编号行 / 第 X 章 / `---` / 换页符」为切点;表格列数与表头不一致视为新表;**「重叠 = 0」要用显式开关,不能拿 0 值兜底**(WeKnora `overlap <= 0` 被当成默认 80,想关关不掉);切块结果校验四条(单块且文档长 > 2 倍上限;不足 50 字的碎块超过 25%;最大块不足上限 1/4;有块超过 2 倍上限)直接当 §9 形态测试集的 CI 判据。
   - 切块参数变更按 B-175「新版本」规矩:文档上记切块参数指纹,管理端能看出哪些文档是旧版本,「重新摄取」按文档或整库。
 - 治哪类:根因,A / B / C / D 都有。
 - 依据(v2 核实):
@@ -218,7 +223,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
     § 保存方式 > 常温
     <父段正文>
     ```
-  - 结尾提示:「共 N 个父段相关,显示 10 个;要读更多用 knowledge_read 或换词再搜」。
+  - 结尾提示:「共 N 个父段相关,显示 10 个;要读更多用 knowledge_read 或换词再搜」。只在**真的裁剪了**时出现(WeKnora `RetrievalTruncation` 同款),没裁剪不加任何免责声明;「候选 N 条但都没过重排分数下限」单独一句(现在只打 `rerank_degraded` 标记,模型看不到);预算截断按分数从低往高丢,第 1 条永远保留。
   - 这些字段也拼进送重排的文本(见 K-14)。
   - 结构化命中明细(父段 / 子段 id、四个分数、是否降级)放进 `ToolResult.meta`,给轨迹面板用(§6),不给模型。
 - 治哪类:找全、相似文档混淆、项目关联;重放里「排得进前 20、但只给 5 条」的 37 对(18%),按文档分组取前 10 篇可显示其中 20 对(§2.4)。
@@ -236,7 +241,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
   - 各厂商怎么提供(2026-10 逐家读原文):见 **表 5-A**(§5.5)。目录里现有三家里只有阿里有(要原生口);OpenAI、智谱没有 → `none`,行为不变。
   - 向量分数阈值:加标记后查询向量分布会变,库级 `score_threshold` 要在开发集上重标;同时记录「标记前后同一查询的相似度差」给运维看。
 - 治哪类:A 类向量那一路。
-- 依据(v2 核实):阿里云 text-embedding-v4 文档「当使用短文本去匹配长文本时,应区分 query 和 document」、`instruct`「仅在 text_type 为 query 时生效…约 1%–5%」(出处是 API 参考与 HF 模型卡,技术报告 2506.05176 没有消融);Qwen3-Embedding 查询格式 `{Instruction} {Query}`、「leaving the document unchanged」;Cohere / Jina / Voyage / Google 都把 query / document 作为必填或建议参数;OpenAI 没有。
+- 依据(v2 核实):阿里云 text-embedding-v4 文档「当使用短文本去匹配长文本时,应区分 query 和 document」、`instruct`「仅在 text_type 为 query 时生效…约 1%–5%」(出处是 API 参考与 HF 模型卡,技术报告 2506.05176 没有消融);Qwen3-Embedding 查询格式 `{Instruction} {Query}`、「leaving the document unchanged」;Cohere / Jina / Voyage / Google 都把 query / document 作为必填或建议参数;OpenAI 没有。WeKnora 把这层抽象了(`EmbedInputType document|query` + 厂商声明 `InputTypeField / InputTypeValues`)但只有 NVIDIA 声明,阿里那家故意不声明,注释「text_type / instruct… both change the document vectors」——印证「标记进嵌入指纹、换了当换模型」。
 - 厂商:核心就是厂商中立字段;目录里现有三家:openai(无)、glm embedding-3(无)、qwen v4(参数,要原生口)。
 - 形态:与文档形态无关。
 - 代价:几乎为 0(DashScope `instruct` 按查询条数计 token);一个新客户端;阈值重标一次。
@@ -248,9 +253,10 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
   1. *Use several small, targeted searches rather than one broad one; if a result does not state the fact asked, search again in the documents' own terms — do not repeat the same or a very similar query.*
   2. *For questions that ask for all / every / how many, keep searching with different terms until a search returns no document you have not seen, then read each candidate (knowledge_read) and check it meets every condition in the question before counting it.*
   3. *Before concluding, verify each condition in the question against text you have actually read; conflicting documents are reported as conflicting, not resolved by guessing.*
+  4. *Content already returned in full for this task does not need to be read again. A document list shows what exists but cannot prove a base lacks the answer — say you searched and found nothing only when a search actually ran.*(WeKnora `grounding_prompt.go` 同款)
   - 结果末尾的事实型提示(不是命令,B-163)相应加一句「还有 N 个相关父段没显示」。
 - 治哪类:C 里漏条件 / 读错;B 里搜两次就停;找全题。
-- 依据(v2 核实,口径更正):Onyx ERB 论文 Table 7 找全题(20 题)多轮探索(Bash Agent)**文档召回 59.0 > BM25 46.5,但正确率 35.0 < 40.0**——「搜得全」必须配「读到再下结论」,所以第 2 条把「换词再搜」和「逐篇核对」绑在一起;metor 博客「makes the agent read before it claims」;Onyx `tool_prompts.py`「try again with different tools or arguments. Do not repeat the same or very similar queries」;Anthropic 工具写作指南「making many small and targeted searches instead of a single, broad search」、多智能体研究「start with short, broad queries, then progressively narrow」;OpenAI GPT-4.1 指南「do NOT guess or make up an answer」;Azure agentic retrieval 一问平均拆 3 个子查询(官方数字;「相关性 +40%」只是厂商转述,不引)。
+- 依据(v2 核实,口径更正):Onyx ERB 论文 Table 7 找全题(20 题)多轮探索(Bash Agent)**文档召回 59.0 > BM25 46.5,但正确率 35.0 < 40.0**——「搜得全」必须配「读到再下结论」,所以第 2 条把「换词再搜」和「逐篇核对」绑在一起;metor 博客「makes the agent read before it claims」;Onyx `tool_prompts.py`「try again with different tools or arguments. Do not repeat the same or very similar queries」;Anthropic 工具写作指南「making many small and targeted searches instead of a single, broad search」、多智能体研究「start with short, broad queries, then progressively narrow」;OpenAI GPT-4.1 指南「do NOT guess or make up an answer」;Azure agentic retrieval 一问平均拆 3 个子查询(官方数字;「相关性 +40%」只是厂商转述,不引)。WeKnora `config/prompt_templates/agent_system_prompt.yaml:44-52`、`internal/agent/grounding_prompt.go:14-87`:「Rephrase an unproductive query; for exact terms switch to mode=keyword rather than repeating」「Full content already returned for the task does not require another read」「directory profiles… cannot prove a base lacks the answer」「say you searched or found nothing only when a search tool actually ran」;它的失败措辞分三档(整体失败 = 不是「没有」的证据;部分库失败;候选 N 条全被重排拒),其测试对措辞做**正反断言**(空结果必须含「found N candidate chunks」、不得含「switching mode will not help」),§9 照做。
 - 厂商 / 形态:与模型、文档形态无关。
 - 代价:每题可能多搜一两次。
 - 判据:智能体层 60 题编造数不升、「找全」类召回上升;每题平均检索次数增幅 ≤ 1。
@@ -260,8 +266,9 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 **K-7 重排:上限按模型配置、限流排队、退避重试、单视图** —— M
 
 - 改什么:
-  - 模型目录加重排能力字段:`rerank_api`(`dashscope` / `cohere_style` / `vertex` / `bedrock` / `llm`)、`max_documents`、`max_doc_tokens`(注明单位:token 或字符——智谱、腾讯按字符)、`max_total_tokens`、`query_max_tokens`、`supports_instruction`、`score_scale`(0~1 归一 / sigmoid / 原始 logit / 请求内相对)、`rpm`;代码里的常量 `_MAX_RERANK_CANDIDATES = 100`、`RERANK_DOC_MAX_CHARS = 3000` 改成按模型取值(qwen3-vl-rerank 100 条 / 8,000 token;qwen3-rerank 500 条 / 4,000;qwen3.7-text-rerank 500 条 / 30,000;Cohere 1,000 / 4,096;腾讯 60 条 / 总 2,000 字符……全表见 5-B)。候选池 = min(目录上限, 100 或 K-14 定的值),总 token 超限先按长度截单条再减条数,不让厂商返回 400。
+  - 模型目录加重排能力字段:`rerank_api`(`dashscope` / `cohere_style` / `vertex` / `bedrock` / `llm`)、`max_documents`、`max_doc_tokens`(注明单位:token 或字符——智谱、腾讯按字符)、`max_total_tokens`、`query_max_tokens`(查询单独校验,拆批救不了)、`max_concurrency`、`supports_instruction`、`score_scale`(0~1 归一 / sigmoid / 原始 logit / 请求内相对;logit 统一过 sigmoid)、`rpm`(WeKnora `RerankSettings` 字段集同构,它支持 7 种重排协议);代码里的常量 `_MAX_RERANK_CANDIDATES = 100`、`RERANK_DOC_MAX_CHARS = 3000` 改成按模型取值(qwen3-vl-rerank 100 条 / 8,000 token;qwen3-rerank 500 条 / 4,000;qwen3.7-text-rerank 500 条 / 30,000;Cohere 1,000 / 4,096;腾讯 60 条 / 总 2,000 字符……全表见 5-B)。候选池 = min(目录上限, 100 或 K-14 定的值),总 token 超限先按长度截单条再减条数,不让厂商返回 400。
   - **分数阈值绑定模型**:库级 `rerank_score_threshold` 记录它是在哪个重排模型下标定的;重排模型换了就清零并在设置页提示重标(各家分数语义不同:Cohere 按域校准、bce 建议 0.35、腾讯是负 logit、阿里请求内相对)。
+  - **阈值阶梯降级 + 结果档位**(WeKnora `internal/reranking/rerank.go` 同款,v2.1):全部低于下限时先按 max(0.7 × 下限, 0.3) 再试,仍空则保留最高分 1 条(≥ 0.15),再空才返回「候选 N 条都没过」;精确编号类查询只排序不过滤(重排模型给裸编号打分偏低);`rerank_degraded` 一位扩成 `rerank_outcome` 枚举(`ok / threshold_degraded / fallback_top1 / all_below_threshold / model_error / model_unavailable / no_model`)写进 `ToolResult.meta`,轨迹面板与检索测试都显示。候选超过模型单次上限时自动分批(并发 ≤ 4)再合并排序,不是截掉。
   - 纯文本知识库用纯文本重排模型(目录加 `qwen3-rerank` / `qwen3.7-text-rerank`;其它厂商的在表 5-B);图片分段(B-175 P11)才用多模态重排。
   - 客户端**按秒排队**(阿里按 RPS = RPM / 60 也限,「Request rate increased too quickly」会触发 BurstRate),复用 B-44 的全局厂商 RPM 桶;429 / 5xx / 超时按**指数退避 0.5 s × 2ⁿ 带抖动、上限 8 s、最多 3 次**(外部没有标准数字,这是推断值),仍失败才退回融合序并保留 `rerank_degraded`。
   - **单视图**(K-14 的结论先用):每次检索调一次重排,不再调两次——`qwen3-vl-rerank` 600 RPM 的等效容量翻倍。
@@ -277,10 +284,13 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 ### 5.3 第二梯队:等重放 / 对比结果再定
 
-**K-9 关键词路补成完整 BM25(对比试验)** —— M
+**K-9 关键词路补成完整 BM25(两条路,对比试验)** —— 路 A:S + 一次 RDS 大版本升级;路 B:M
 
-- 改什么:在现有 tsvector 上自算 BM25:词频 tf = tsvector 里该词的位置数(Postgres 每词最多存 256 个位置,够用);文档长度 dl = 入库时存的子段 token 数(新列,**不要用 `length(tsvector)`**,那是去重词数);每库一张词表 `knowledge_term_stats(kb_id, lexeme, df)` + 库级 `avgdl`,在 `replace_chunks` / 删除时增量更新(**不要查询时跑 `ts_stat`**,那是全表扫描);分数 = Σ idf · tf(k1+1) / (tf + k1(1 − b + b·dl/avgdl)),k1 = 1.2、b = 0.75;现有的编号 / 整句命中加分保留。零成本对照组:`ts_rank_cd` 开长度归一(normalization = 1)。
-- 依据(v2 核实):Onyx ERB 论文 Table 6(500 题)BM25 正确率 68.8 vs 单路向量 51.4(但对照是 top-10 无重排的单路向量,**论文没测混合 + 重排**,只能推出「关键词路值得做好」);《BM25 Wins at Scale》51 万篇全量 BM25 50.5 vs 稠密 29.9(稠密是 0.6B 小模型);BGE-M3 论文 Table 11 分词器对 BM25 影响 ≥ 10 点 → 保留 jieba。**RDS 装不了任何 BM25 扩展**(阿里云 RDS PG16 插件表 2026-09-23:有 pg_jieba / zhparser / rum / pgvector 0.8.0,没有 ParadeDB `pg_search`(AGPL)、VectorChord-BM25(AGPL / ELv2)、`pg_textsearch`(PG 许可但只支持 PG 17 / 18));博客实测 SciFact nDCG@10 ts_rank 0.07 / 自算 BM25 0.69 / pgvector 0.66 / 混合 0.70。
+- 改什么(二选一,按 ⑦ 拍板):
+  - **路 A:RDS 升 PG 17 + `pg_textsearch`**(v2.1 新增)。阿里云 RDS 插件表(2026-09-23)`pg_textsearch` 1.3.1 列在 PG 18 / 17,PG 16 及以下「无」;10-21 实测测试库 PG 16.13 可用扩展 146 个里没有它。装上后:`CREATE INDEX … USING bm25 ((标题 ∥ 正文)) WITH (text_config = '<jieba / zhparser 配置>', k1 = 1.2, b = 0.75)`,查询 `ORDER BY 列 <@> to_bm25query(查询, 索引名)`(分数是负数,越小越相关);分词复用 PostgreSQL 的 text search configuration,RDS 上 `pg_jieba` / `zhparser` 都可装。要想清楚两点:① 它的 idf 按**整个索引**算(所有租户所有库),我们现在的计分按**本库**算 idf,多租户大库下有差别,开发集验;② 布尔过滤 + BM25 排序「还没优化成单次索引扫描」,过滤出的行少时最好——我们每次查询都带 `tenant_id + kb_id`,正是这种,但要实测。前置:测试库大版本升级 16 → 17(阿里云支持本地升级 / 克隆 / 零停机三种方式,升级保留白名单、参数、插件),跑完整回归(pgvector 0.8、全部迁移、asyncpg / psycopg);生产另排窗口。这是平台级运维动作,不在 B-206 范围内。
+  - **路 B:留在 PG 16,在现有 tsvector 上自算 BM25**:词频 tf = tsvector 里该词的位置数(Postgres 每词最多存 256 个位置,够用);文档长度 dl = 入库时存的子段 token 数(新列,**不要用 `length(tsvector)`**,那是去重词数);每库一张词表 `knowledge_term_stats(kb_id, lexeme, df)` + 库级 `avgdl`,在 `replace_chunks` / 删除时增量更新(**不要查询时跑 `ts_stat`**,那是全表扫描);分数 = Σ idf · tf(k1+1) / (tf + k1(1 − b + b·dl/avgdl)),k1 = 1.2、b = 0.75;现有的编号 / 整句命中加分保留。
+  - 零成本对照组:`ts_rank_cd` 开长度归一(normalization = 1)。两条路都与现有计分在同一开发集上三方对比。
+- 依据(v2 核实):Onyx ERB 论文 Table 6(500 题)BM25 正确率 68.8 vs 单路向量 51.4(但对照是 top-10 无重排的单路向量,**论文没测混合 + 重排**,只能推出「关键词路值得做好」);《BM25 Wins at Scale》51 万篇全量 BM25 50.5 vs 稠密 29.9(稠密是 0.6B 小模型);BGE-M3 论文 Table 11 分词器对 BM25 影响 ≥ 10 点 → 保留 jieba。**RDS PG 16 装不了 BM25 扩展,PG 17 / 18 可以**(10-21 实测测试库:有 pg_jieba / zhparser / rum / pg_bigm / pase 可装,pgvector 0.8.0 与 pg_trgm 已装;阿里云 RDS 插件表 2026-09-23 版:`pg_textsearch`(TigerData,PostgreSQL 许可,1.0 于 2026-03 发布,只支持 PG 17 / 18)1.3.1 列在 PG 18 / 17;ParadeDB `pg_search`(AGPL)、VectorChord-BM25(AGPL / ELv2)各版本都没有;WeKnora 走的是自带 ParadeDB 镜像的 `pg_search`,托管 RDS 照搬不了);博客实测 SciFact nDCG@10 ts_rank 0.07 / 自算 BM25 0.69 / pgvector 0.66 / 混合 0.70。
 - 厂商:与模型无关(纯数据库侧)。
 - 形态:Ⓓ 表格行子段很短、长度归一会抬高它们——判据里单看表格题不退。
 - 判据:华大开发集 keyword-only 的 mrr@10 / 零命中率优于现有计分;混合 + 重排不退;表格题不退。
@@ -291,6 +301,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
   - 三路:**原问题(权重 1.0,锚)** + **换说法一路**(改写式,保留所有专有名词、编号、数字;权重 1.0)+ **关键词一路**(照 Onyx 的 prompt:「purely keywords… as few keywords as necessary… if there are no useful expansions, simply return the original query」;权重 0.7);小模型一次调用同时产出两路,与原问题那一路并行跑;同一轮对话里智能体重复检索时跳过扩写。
   - 融合 A/B:现有等权 RRF(k = 60)vs **归一化(min-max)加权和**,α 取 0.3 / 0.5 两档。
   - 不做 HyDE(见 §7)。
+  - 换说法一路的 prompt 借 WeKnora `config/prompt_templates/rewrite.yaml` 两句:「MUST preserve specific entities, keywords」「Do NOT generate meta-instructions like 请在知识库中查找」;关键词一路再加一个零成本对照:本地规则(去疑问词、引号短语、按分隔符切段)不调模型。**反例**:WeKnora 改写后用改写结果替换原问题、原问题不留(`search.go:376`)——正是 K-10 要避免的。
 - 依据(v2 核实,**降预期**):Onyx `constants.py` 权重 `LLM_SEMANTIC_QUERY_WEIGHT 1.3 / KEYWORD 1.0 / NON_CUSTOM 0.7 / ORIGINAL 0.5`,EE 搜索页改成原问题 2.0 / 关键词 1.0;《Searching for Best Practices in RAG》(2407.01219)Table 6 查询改写 −2.3 / 分解 −4.1 nDCG@10,HyDE +5.2 但延迟 2.6 s → 7.2 s;《When do Generative Query and Document Expansions Fail?》(2309.08541)扩写**对弱检索器有益、对强检索器有害**(BM25 −4.0、E5 −3.4、MonoT5 −2.8);2505.12694:生成式扩写在「模型不懂该领域 / 问题歧义」时显著变差,**错的专有名词伤检索**,改写式(GaQR)「never fell below the baseline」。融合:《An Analysis of Fusion Functions》(2210.11934)凸组合优于 RRF 且 RRF 对 k 敏感;Weaviate 1.24 起默认 relativeScoreFusion,内部基准召回 +6%;Elasticsearch 仍推荐 RRF(rank_constant 60)。
 - 厂商:扩写用平台默认小模型(任一聊天模型);融合与模型无关。
 - 形态:Ⓑ Ⓔ(口语、内部术语多)最容易被扩写带偏 → 判据按题看。
@@ -310,6 +321,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 - 改什么:每个子段生成 ≤ 3 个用户可能的问法,存成 `chunk_type = 'question'` 的行(`parent_chunk_id` 指向子段,再经子段折到父段),只进索引不进返回;召回时折叠回子段再折叠到父段;prompt 照 RAGFlow(「propose the top N important questions… no overlapping meanings… one per line」,temperature 0.2)。
 - 依据(v2 核实,**口径更正**):Doc2Query--(2301.03266)MS MARCO 段落检索 BM25 RR@10 0.185 → Doc2Query(每段 80 条)0.279(+51%)→ 过滤留 30% 后 0.323(再 +16%,索引 −33%)——v1 的「+16% / −33%」是过滤前后对比,不是相对 BM25;且那是短段落 + 几十条问题的设定。RAGFlow `auto_questions` **默认 0(关)**,ES 字段权重 `question_tks^20` vs 正文 ^2;FastGPT「多向量映射」一段多组向量任一命中即召回。
+- 实现细节(WeKnora 同款,v2.1):prompt 要点「生成这段**最能回答**的问题;每题自包含、无代词;不出一个词就能答的题」,带前后段与文档名做上下文,温度 0.7;问题记录所属子段的 `revision`,子段被编辑后标「过期」并可重生成;存法二选一——`chunk_type = 'question'` 行(B-175 设计)或「同一子段多条索引行」(WeKnora 生成问题与 FAQ 相似问同构:索引行 `source_id = 子段-序号`,命中天然折回子段)。**建议统一成「一个分段多条索引行」机制**,K-12、FAQ 相似问、FAQ 反例问题(命中即剔除)共用。
 - 厂商 / 形态:同 K-11;Ⓓ 表格行生成问题特别有效(「X 的价格是多少」)。
 - 代价:每段一次短输出;索引行 ×(1 + 3);存储。
 - 判据:同 K-11;**K-11 与 K-12 不二选一**——各自单独 A/B 再同开一组(RAGFlow 两者并列可同开),按 ¥ / 提升点择优,可以都上或都不上。
@@ -324,7 +336,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 **K-14 重排环节调参** —— S~M
 
 - 改什么,三项分别在开发集对比:
-  - ① **单视图**:送重排的文本改成一串结构化文本(Cohere 建议的 YAML 风格,键序固定):`title: <文档标题>\nsection: <标题路径>\ndate: <有就带>\ncontent: <子段正文>`,支持 `instruct` 的模型加任务说明(英文:「Given a question, judge whether the passage content itself states the answer; the title only identifies the document」),一次打分。对照组 = 现有双视图 0.7 / 0.3。**必查** B-175 PR2b 当时引入双视图的那个案例(专利证书文件名含菌株号、所有段都「看起来相关」:精确编号 0.958 → 0.917 那组题)。
+  - ① **单视图**:送重排的文本改成一串结构化文本(Cohere 建议的 YAML 风格,键序固定):`title: <文档标题>\nsection: <标题路径>\ndate: <有就带>\ncontent: <子段正文>`,支持 `instruct` 的模型加任务说明(英文:「Given a question, judge whether the passage content itself states the answer; the title only identifies the document」),一次打分。对照组 = 现有双视图 0.7 / 0.3;再加一组**正文清洗**(送重排前去掉 Markdown 标记 / URL / 表格线 / HTML,WeKnora `internal/reranking/passage.go` 同款,它的单串 = 标题 + 面包屑 + 清洗正文 + 生成问题)。**必查** B-175 PR2b 当时引入双视图的那个案例(专利证书文件名含菌株号、所有段都「看起来相关」:精确编号 0.958 → 0.917 那组题)。
   - ② 重排候选池从合并后前 50 加到前 100(按模型 `max_documents` 封顶,总 token 按 `max_total_tokens` 卡)。
   - ③ 若双视图保留:两个视图都在整池上打分,或把 `_TITLED_VIEW_WEIGHT` 0.7 降到 0.3~0.5。
 - 依据(v2 核实):重放(§2.4):合并后掉出前 50 的 21 对全部在前 100 内;被带标题视图截掉 13 对(含重排池前 16 的 3 对);诊断里标题相似的干扰文档占先的题(0384 / 0400 / 0354 / 0447 / 0082 / 0404)。**双视图加权没有任何外部先例**;Cohere 最佳实践把 Title / Date / Content 以 YAML 拼成一个文档一次打分;Onyx 把 title / metadata 与正文一起送模型选段;Qwen3-Reranker 的训练输入就是「指令 + 查询 + 文档」单串。
@@ -346,6 +358,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 - 改:入库时按知识库字段配置(`knowledge_base.metadata_schema` 已有)抽实体 / 金额 / 日期 / 项目 / 负责人,写进文档 `metadata`,支持 K-13 过滤与计数;K-4 显示、K-13 过滤先作为便宜版。
 - 依据(v2 核实):ERB 榜 Flexor(91.48,第 2)博客原话「Extract the tabular truth. Entities, amounts, dates, parties pulled into structured tables… Enumeration and aggregation stop being search problems and become queries, with completeness by construction」,且「Both patterns belong in the same platform, chosen per question」(点查走检索、枚举聚合走查表);TAG 论文(2408.14717)「常规方法 ≤ 20%」的语境是**结构化数据库题**(RAG 基线 0%、Text2SQL 17%),不能直接套到文档库;RAGFlow 元数据生成、Dify 自动元数据过滤、Onyx 由模型推断时间 / 来源过滤。
 - 厂商:任一聊天模型抽取。形态:Ⓐ Ⓒ Ⓓ 有稳定字段的最适合;Ⓑ Ⓔ 字段难定。
+- **便宜版先行(WeKnora 同款,v2.1)**:固定 schema 的文档画像——`summary / gist / topics(3~5)/ doc_type / typical_question`,每篇入库时一次调用、只取开头 8k 字采样;不用租户定字段就能给 K-4 显示、K-13 过滤、§6 库信息。租户自定义字段抽取 WeKnora 也没做。
 - 通用:中高——**每个租户要定自己的字段**,这是代价(待拍板)。
 
 **K-16 稀疏向量** —— L,要重新嵌入,**K-9 之后再评估**
@@ -405,6 +418,31 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 读法:共性参数 = `query + documents[] + top_n`(名字有 `top_k` / `topN` / `numberOfResults` 之别;火山、腾讯没有)+ `return_documents`;上限差异极大(条数 60 ~ 10,000,单条 512 token ~ 32k,有的按字符),**所以 K-7 必须按模型配置而不是常量**;指令只有阿里、Voyage 2.5+、火山 seed、自部署 Qwen3 支持,Cohere 明示不支持 → K-14 的 `instruct` 是「有则用」;**分数阈值不可跨模型复用**(Cohere 要按域校准、bce 0.35、腾讯是负 logit、阿里请求内相对)→ 库级 `rerank_score_threshold` 绑定重排模型,换模型清零并提示重标。
 
+### 5.6 WeKnora 深读借鉴清单(v2.1,2026-10-21)
+
+本机 `/Users/mac/src/github/WeKnora`(腾讯开源,v0.8.3,HEAD e18fb23,2026-10-21;Go 后端 + Python docreader + Vue 前端),四路逐文件读;file:line 相对其根目录。B-175 时已记过它的产品层做法,这次只看检索质量相关的实现。
+
+| 借 → 放哪 | WeKnora 的做法(file:line) | 怎么借 |
+|---|---|---|
+| K-2 | `read_document(id = doc://N \| chunk://N, offset, limit, query, regex, context ≤ 5)`(`internal/agent/tools/read_document.go:26-77`);永远先返回文档元数据头;超界报「valid offsets 0..N」 | `around` / `find` 两个参数、元数据头、超界提示 |
+| K-6 | `agent_system_prompt.yaml:44-52`、`grounding_prompt.go:14-87`;失败三档措辞(`search_knowledge.go:262-268,438-466`);测试对措辞正反断言(`search_knowledge_test.go:97-113`) | 第 4 条说明;「候选 N 条都没过」写进结果;§9 测试写法 |
+| K-7 / K-14 | 重排阈值阶梯(`internal/reranking/rerank.go:24-33,289-307`)+ `outcome` 枚举(`types/rerank.go:47-71`);`RerankSettings{MaxDocuments, MaxQueryChars, MaxDocumentChars, MaxRequestChars, MaxConcurrency, ScoreScale}`(`models/api/rerank_settings.go:49-58`)+ 7 种重排协议(`models/api/rerank.go:12-38`)+ 超限自动分批并发合并(`models/rerank/protocol.go:32-112`);送重排单串 = 标题 + 面包屑 + 清洗正文(`reranking/passage.go:63-187`) | 阶梯降级 + `rerank_outcome`;补 `max_concurrency / query_max_tokens`;单串对照 + 正文清洗对照 |
+| K-4 | `RetrievalTruncation` 只在真裁剪时提示(`types/chat_manage.go:131-162`);模型视图按文档分组、元数据每文档一次、不给分数 / UUID(`modelcontext/model_output.go:569-659`);预算丢低分留首条(`tools/truncate.go`) | 结尾提示的触发条件;预算截断规则 |
+| K-1 | 父行 `chunk_type = parent_text` 只存不索引、白名单可检索类型(`knowledgebase_search_results.go:383-388`);单子段 == 父段不建父行(`chunker/strategy.go:172`);`ContextHeader` 与正文分离只在嵌入时拼(`types/chunk.go:225-234`) | 白名单过滤;不建冗余父行;子段字符区间 |
+| K-3 | `coalesceTinyChunks` 目标 max(200, size/2) 同标题前缀才并(`chunker/heading_splitter.go:139-146`);校验四条(`chunker/validator.go:26-70`);heuristic 切点(`chunker/profiler.go:215-236`);表格列数不一致 = 新表(`chunker/splitter.go:403-520`);坑:`overlap <= 0` 当默认 80(`chunker/strategy.go:325`) | 短节合并规则;形态测试集判据;Ⓑ 切点;显式开关 |
+| K-10 | `rewrite.yaml:24-78` 两句;本地规则扩展(`query_expansion.go:14-186`);**反例** 改写后不留原问题(`chat_pipeline/search.go:376`) | 换说法 prompt;零成本对照;坚持留原问题 |
+| K-12 / FAQ | 生成问题存 `chunk.metadata`、每题一条索引行指回原块(`knowledge_process.go:2114-2140`,`types/chunk.go:805-815`);`generate_questions.yaml`;FAQ 相似问每条一行 + 反例问题过滤(`knowledge_faq.go:1935-1985`,`knowledgebase_search_faq.go:188-193`) | 「一个分段多条索引行」统一机制;prompt 要点;过期标记 |
+| K-15 | 文档画像 `{summary, gist, topics, doc_type, typical_question}` 头 8k 字采样(`generate_summary.yaml`,`knowledge_profile.go:30-39`) | 便宜版先行 |
+| K-5 | `EmbedInputType document\|query` + 厂商 `InputTypeField / InputTypeValues`(`models/api/embeddings_settings.go:83-84`),阿里故意不声明(`providers/aliyun.go:167-169`) | 印证标记进嵌入指纹 |
+| §6 | 切块预览抽屉 `KBChunkingDebug.vue:12-200` + `POST /chunker/preview` 返回 `Diagnostics{selected_tier, rejected, profile}`;配置摘要「父 4096 / 子 384」(`KBInfoPopover.vue:299-345`);索引策略变更即问「重新处理 N 篇」(`KnowledgeBaseEditorModal.vue:1829-1850`);生成问题 stale 标记;回答级「未从知识库中检索到相关内容,以上为模型直接回答」(`AgentStreamDisplay.vue:515`);`read_document` 结果 `role: match \| context_before \| context_after`(`types/tool-results.ts:314`) | 见 §6 v2.1 补充 |
+| §9 | `logSearchResultChunkTypes` 按分段类型统计命中来源(`knowledge_process.go:295-317`);前端读 `token_count` 后端却不返回(`doc-content.vue:1048-1058` vs `types/chunk.go:134-200`) | K-11 / K-12 线上观测;接口契约测试钉字段 |
+
+**我们已有 / 已超出**:加权 RRF;父段卡片 + 子段折叠(它是子段平铺、父段靠弹层);检索测试页四个分数 + 降级 + 预算(它文档库没有检索测试页,三分数前端不读);轨迹侧栏分数 / 降级(它不显);B-175 的「新版本 + 复用解析结果」重切(它无版本、无缓存、全量重跑);分段启停 / 编辑 / 修订历史(B-175)。
+
+**不借(理由)**:字符计量(我们按 token);父子都带重叠、返回「父 + 子拼接」(我们纯父段);三层自动选切块策略(多一层不可预期);合成分 0.6 模型 + 0.3 检索 + 0.1 来源 + MMR(无外部依据,MMR 压同文档相邻段与 K-1 相反);知识图谱(它默认也关);PG 路径关键词阈值(没落地,不是先例);书本图标内联引用(与 `[doc 1234]` 冲突);`source_locators` 页码 / bbox 定位(要改入库产物,记后续);库画像注入(解决多库路由,B-175 候选);跨轮 KB 结果一行占位(记 B-126 后续)。
+
+**转记别处**:Ⓕ 扫描件判定三常量 + 两段 VLM OCR prompt + OCR 子块挂文本块(`docreader/parser/pdf_parser.py:176-185`、`internal/application/service/image_multimodal.go:32-54`)→ B-175 P5。
+
 ---
 
 ## 6. Web 前端展示(K-1 / K-2 / K-4 / K-11 / K-12 落地时同步做)
@@ -419,6 +457,15 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 | **库设置**(`SettingsTab.tsx`) | 切块上限 / 重叠 / top_k / 阈值 / 方式 / 重排 | 字段改成:**子段上限**(默认 400)、**父段上限**(默认 1,024)、**返回预算 token**(默认 8,000)、每文档父段上限(默认 3);重叠、语义断点不再暴露(平台默认 0 / 关;A/B 用环境开关);显示「切块参数版本」与库里有多少文档还是旧版本 + 「全库重新摄取」按钮(复用 DocumentsTab 已有的重新摄取) | 库字段 `parent_max_tokens / result_token_budget / max_parents_per_doc`;文档 `chunk_params_hash` |
 
 轨迹面板的「侧栏」只给 system_admin / 租户管理员(与成本列同门)。
+
+**v2.1 补充(WeKnora 前端对照后加的)**:
+- **切块预览抽屉**(库设置页,新):粘一段文本或选一个形态样例(§4 的六种形态当预设)→ 不入库,调同一套切块器 → 显示父段 / 子段数、每段 token、标题路径、短节合并了几处、校验四条的结果;改子段 / 父段上限立刻重算。参考 WeKnora `KBChunkingDebug.vue` + `POST /chunker/preview`。
+- **配置摘要行**:库卡片 / 库信息弹层显示「子段 400 / 父段 1,024 / 预算 8,000 token」,一眼看出这个库用的什么参数。
+- **保存即问**:库设置保存成功后,若有文档的切块参数指纹与新参数不一致,立刻弹「N 篇文档还是旧参数,是否全库重新摄取」,不等人去找按钮。
+- **生成问题的过期标记**(K-12 做了才有):子段被编辑后,其生成问题灰标「基于编辑前内容生成」,可重生成。
+- **回答级提示**(对话页,面向普通用户):本轮所有检索 0 命中、或重排 / 嵌入降级时,回答旁一枚小标「未从知识库检索到相关内容,以上为模型直接回答」;轨迹侧栏的细节仍只给管理员。
+- **读文档结果标记**:`knowledge_read` 的 `ToolResult.meta` 标每个父段是 `match / context_before / context_after`,侧栏「读了哪几页」按它高亮。
+- **接口契约测试**:`listChunks` / `testRetrieval` 新增字段(`chunk_type / token_count / parent_chunk_id / context_header / rerank_outcome`)写进契约测试——WeKnora 前端读 `token_count` 后端却从不返回,这种漏洞 lint 查不出。
 
 ---
 
@@ -440,6 +487,8 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 | 按来源 / 连接器划范围、按目录树导航 | 租户是上传文件,没有 Slack / Jira 连接器与有意义的目录 |
 | 无向量树索引(PageIndex)替代向量检索 | FinanceBench 98.7% 是厂商自报(Mafin 2.5,歧义题人工判);第三方 2604.14222 单文档树推理 0.938 vs 向量 0.821,但 1,200 份 SEC 多文档上向量式智能体检索 68% 胜率;10 万篇级没有数字。思路(按目录推理)已被 K-2 的 `section` 读法吸收 |
 | 用 grep 代替向量 / 关键词检索(「Claude Code 不用 RAG」) | 只有访谈没有数字;ERB 论文 Bash Agent 60.6 < BM25 68.8、每题 10 分钟;《BM25 Wins at Scale》文件系统智能体 30.7 vs BM25 50.5、每题 895K token;「Iteration helps most after global ranking, not in place of it」——迭代探索应该叠在排序检索之上(K-2 / K-13),不是替代 |
+| 重排后合成分(模型分 × 0.6 + 检索分 × 0.3 + 来源分 × 0.1)+ MMR 去冗余(WeKnora) | 没有外部依据;MMR 会压掉同一文档的相邻段,与 K-1「父段整体返回」方向相反;B-175 PR3 模拟过 MMR 无收益 |
+| 自建 PostgreSQL 装 ParadeDB `pg_search`(WeKnora 的路) | 与「生产用 RDS 托管」的决策冲突,多一套数据库运维,且社区版 AGPL;RDS 上 PG 17 有 `pg_textsearch` 可走(K-9 路 A) |
 | 照搬榜单前几名的答题模型 | 不是检索问题 |
 
 ---
@@ -462,6 +511,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 - B-175 设计 §3.2「查询改写 / HyDE」一行写「Anthropic 实测 HyDE 效果差」:Anthropic 文章只**列举**了 HyDE,没有测;「效果低 / 收益有限」说的是摘要索引与通用文档摘要。已改(#1873),结论见 K-10 与 §7。
 - v1 → v2 引用更正:Doc2Query-- 的「+16% / −33%」是过滤 vs 不过滤(K-12);RAPTOR「+20%」是跨模型(§7);Onyx「±5 段」是模型分类后扩展(K-1);Onyx 找全题 59.0 是文档召回、正确率反降(K-6 / K-13);BGE-M3 MLDR 中文数字(K-16);RAGFlow 已重写为 Go,`rag/app/naive.py` 不存在(§11);NVIDIA 博客标题是《Finding the Best Chunking Strategy for Accurate AI Responses》;Dify 父子模式无重叠、「全文模式 10,000 token」只在文档没在源码;AtlasNav 不是「仍弱」(§7);榜单分档按 2026-10-20 更新(§1)。
+- v2 → v2.1 更正:「RDS 装不了任何 BM25 扩展」只对 PG 16 成立,`pg_textsearch` 1.3.1 在阿里云 RDS PG 17 / 18 可装(K-9 路 A);B-175 设计 §3.1 WeKnora 一行里「切块在 Python docreader」已过时,v0.8 起切块在 Go `internal/infrastructure/chunker/`。
 
 ---
 
@@ -495,10 +545,10 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 | **批 0** 评测地基 | 智能体层脚本入库、逐次检索记录、父段级段命中、形态测试集;模型目录能力字段(嵌入 / 重排)骨架 | S~M;不改检索行为,先有尺子再动刀 |
 | **批 1** 不用重新入库 | K-14 ①②(单视图 + 池 100)→ K-7、K-8 → K-5 → K-4 → K-6 | 每条独立 PR,各自在开发集前后对比;K-4 的条数加法要过智能体层 |
 | **批 2** 要重新入库 | K-3 → K-1 → K-2 + §6 四处前端 | 父子块整体;测试环境重新摄取;合入后做 ERB 留出复测 |
-| **批 3** 第二梯队 | K-10(+ 融合 A/B)‖ K-9 → K-13 → K-11 / K-12 各自 A/B(选中的与下一次重切同批入库) | 顺序理由见 §5.3 末 |
+| **批 3** 第二梯队 | K-10(+ 融合 A/B)‖ K-9 → K-13 → K-11 / K-12 各自 A/B(选中的与下一次重切同批入库) | 顺序理由见 §5.3 末;**K-9 前置:测试库 RDS 升 PG 17 并装 `pg_textsearch`(待拍板 ⑦),不升就走路 B 自算** |
 | 后续 | K-15(先定租户字段配置方式)、K-16(K-9 之后再评估)、K-17(触发式) | |
 
-**待拍板**:① 梯队与顺序;② 语义断点默认关、重叠默认 0(省一遍入库嵌入,但现有库要重切);③ 默认 10 个父段 / 8k token 预算(每次检索 token 约 2~3 倍);④ K-15 每个租户要定字段的代价接不接受;⑤ ERB 留出复测(约 ¥250)做不做、放在批 2 之后还是批 3 之后;⑥ 现有知识库(测试环境 1 篇中文文档;生产开工前再查)何时重新摄取。
+**待拍板**:① 梯队与顺序;② 语义断点默认关、重叠默认 0(省一遍入库嵌入,但现有库要重切);③ 默认 10 个父段 / 8k token 预算(每次检索 token 约 2~3 倍);④ K-15 每个租户要定字段的代价接不接受;⑤ ERB 留出复测(约 ¥250)做不做、放在批 2 之后还是批 3 之后;⑥ 现有知识库(测试环境 1 篇中文文档;生产开工前再查)何时重新摄取;⑦ **RDS 大版本升级 16 → 17**(先测试库、跑完整回归,生产另排窗口)做不做、何时做——决定 K-9 走路 A 还是路 B。
 
 ---
 
@@ -526,3 +576,5 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 - ★ 产品工具:OpenAI file search https://platform.openai.com/docs/guides/tools-file-search ;Glean https://docs.glean.com/actions/glean/read-document/ ;Vectara https://docs.vectara.com/docs/agents/tools ;AWS Bedrock KB https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-config.html ;Azure agentic retrieval https://learn.microsoft.com/en-us/azure/search/agentic-retrieval-overview ;Cursor https://cursor.com/docs/context/codebase-indexing
 - ★ 厂商接口(表 5-A / 5-B,2026-10 读原文):OpenAI https://platform.openai.com/docs/guides/embeddings ;Cohere https://docs.cohere.com/reference/embed 、https://docs.cohere.com/reference/rerank 、https://docs.cohere.com/docs/rate-limits ;Jina https://api.jina.ai/openapi.json 、https://jina.ai/reranker ;Voyage https://docs.voyageai.com/reference/embeddings-api 、https://docs.voyageai.com/reference/reranker-api 、https://docs.voyageai.com/docs/rate-limits ;智谱 https://docs.bigmodel.cn/api-reference/模型-api/文本嵌入 、…/文本重排序 ;火山 https://www.volcengine.com/docs/82379/1302003 、https://www.volcengine.com/docs/84313/1254474 ;百度千帆 https://cloud.baidu.com/doc/qianfan-api/s/Fm7u3ropn 、https://cloud.baidu.com/doc/qianfan-docs/s/em95lyyjw ;腾讯 https://cloud.tencent.com/document/product/1729/102832 、https://cloud.tencent.com/document/product/1772/115339 ;MiniMax https://platform.minimaxi.com/document/Embeddings ;SiliconFlow https://docs.siliconflow.com/en/api-reference/embeddings/create-embeddings 、…/rerank/create-rerank ;Google https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/task-types 、https://cloud.google.com/generative-ai-app-builder/docs/ranking ;AWS https://docs.aws.amazon.com/bedrock/latest/userguide/titan-embedding-models.html 、https://docs.aws.amazon.com/bedrock/latest/userguide/rerank.html ;Azure https://learn.microsoft.com/azure/ai-foundry/openai/quotas-limits ;开源模型卡 BAAI/bge-m3、bge-large-zh-v1.5、bge-reranker-v2-m3、Qwen/Qwen3-Embedding-8B、Qwen3-Reranker-8B、nomic-ai/nomic-embed-text-v1.5、intfloat/multilingual-e5-large-instruct、maidalun1020/bce-reranker-base_v1(HuggingFace);vLLM `docs/models/pooling_models/scoring.md`、TEI openapi 1.9.4、Xinference 文档
 - pgvector:https://github.com/pgvector/pgvector
+- ★ v2.1 WeKnora(本机 `/Users/mac/src/github/WeKnora`,HEAD e18fb23,2026-10-21,https://github.com/Tencent/WeKnora):`internal/infrastructure/chunker/{strategy,heading_splitter,validator,profiler,splitter}.go`、`internal/types/{chunk,knowledgebase,rerank,retrieval_config}.go`、`internal/reranking/{rerank,passage,mmr}.go`、`internal/models/api/{rerank,rerank_settings,embeddings,embeddings_settings}.go`、`internal/agent/tools/{search_knowledge,read_document,list_documents}.go`、`internal/agent/{grounding_prompt,observe}.go`、`internal/modelcontext/{model_output,citations}.go`、`config/prompt_templates/{agent_system_prompt,rewrite,generate_questions,generate_summary}.yaml`、`frontend/src/views/knowledge/settings/{KBChunkingSettings,KBChunkingDebug}.vue`、`website-docs/03-features/{04-chunking,04-rag-pipeline,05-retrieval-engines}.md`
+- ★ v2.1 RDS:插件列表 https://help.aliyun.com/zh/rds/apsaradb-rds-for-postgresql/plug-ins-1/(2026-09-23,`pg_textsearch` 行);大版本升级 https://help.aliyun.com/zh/rds/apsaradb-rds-for-postgresql/upgrade-the-major-engine-version-of-an-apsaradb-rds-for-postgresql-instance(2026-07-30);pg_textsearch https://github.com/timescale/pg_textsearch 、https://www.tigerdata.com/docs/learn/search/using-pg-textsearch
