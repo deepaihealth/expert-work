@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -558,7 +559,7 @@ class _QueryEmbedFailingEmbedder(FakeEmbedder):
     """Ingests fine; every search query fails to embed (B-206 K-8)."""
 
     async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
-        raise RuntimeError("embeddings request failed: 503")
+        raise httpx.ConnectError("embedding endpoint unreachable")
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
+import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
@@ -103,6 +104,14 @@ _NO_BASES_ADVICE = (
     "searched: this says nothing about whether the information exists, and the same "
     "search fails the same way until the agent's knowledge base setting is fixed."
 )
+
+#: B-206 K-8 —— what a failed query embedding raises when the vendor, not the
+#: platform, failed: ``HTTPEmbeddingClient`` raises ``httpx.HTTPStatusError`` for
+#: any error status (4xx / 5xx, the vendor's body in the message) and httpx's
+#: transport errors (timeouts, refused / reset connections) — all ``httpx.HTTPError``;
+#: ``OSError`` (``TimeoutError`` and ``ConnectionError`` among it) covers an
+#: embedder that times out or loses its socket outside httpx.
+_EMBEDDING_VENDOR_FAILURES = (httpx.HTTPError, OSError)
 
 #: How a search ended — the tool words its result per outcome (B-175 wave 2 PR3):
 #: ``ok`` hits returned; ``no_bases`` none of the named bases exists; ``no_hits``
@@ -468,9 +477,14 @@ class KnowledgeRetriever:
         )
 
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
-        """The query's vector — ``None`` when embedding it failed (B-206 K-8):
-        the search then runs on keywords alone and says so, logged here and
-        flagged ``embedding_degraded``, instead of failing outright.
+        """The query's vector — ``None`` when the embedding vendor failed (B-206
+        K-8): the search then runs on keywords alone and says so, logged here
+        and flagged ``embedding_degraded``, instead of failing outright.
+
+        Only :data:`_EMBEDDING_VENDOR_FAILURES` degrade. Anything else — the
+        deployment has no embedding configured, a bug, a body that is not an
+        embeddings response — propagates as before K-8: those fail every search
+        the same way, and keyword results flagged "degraded" would hide them.
 
         K-5 —— an embedder with ``embed_query`` (the platform's) adds the model's
         query-side marker; long-term memory recall calls ``embed`` and gets none.
@@ -481,7 +495,7 @@ class KnowledgeRetriever:
                 vector: tuple[float, ...] = await embed_query(query, tenant_id=tenant_id)
                 return vector
             return (await self.embedder.embed([query], tenant_id=tenant_id))[0]
-        except Exception:
+        except _EMBEDDING_VENDOR_FAILURES:
             logger.warning(
                 "knowledge.embedding_degraded — query embedding failed, searching by keyword only",
                 exc_info=True,

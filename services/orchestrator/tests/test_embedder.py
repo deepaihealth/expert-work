@@ -23,7 +23,7 @@ from orchestrator.llm.embedder import (
     NO_MARKER,
     EmbeddingMarker,
     EmbeddingSide,
-    catalog_request_limits,
+    catalog_batch_size,
     embedding_marker,
     marked_model_key,
 )
@@ -268,8 +268,16 @@ async def test_an_embedder_without_a_marker_posts_only_model_and_input() -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("side", ["query", "document"])
-async def test_asymmetry_none_adds_nothing_on_either_side(side: EmbeddingSide) -> None:
-    marker = embedding_marker(_caps("openai", "text-embedding-3-large"), side)
+@pytest.mark.parametrize(
+    ("provider", "name"),
+    [("openai", "text-embedding-3-large"), ("glm", "embedding-3"), ("qwen", "text-embedding-v4")],
+)
+async def test_asymmetry_none_adds_nothing_on_either_side(
+    provider: str, name: str, side: EmbeddingSide
+) -> None:
+    # Every catalog embedding model today — qwen v4 included (its instruct
+    # showed no gain in the dev-set A/B, so it is not enabled).
+    marker = embedding_marker(_caps(provider, name), side)
     assert await _bodies(["q"], marker) == [{"model": "m", "input": ["q"]}]
 
 
@@ -324,8 +332,10 @@ async def test_prefix_asymmetry_wraps_documents_when_it_declares_a_template() ->
 
 
 @pytest.mark.asyncio
-async def test_qwen_v4_sends_instruct_with_queries_and_nothing_with_documents() -> None:
-    caps = _caps("qwen", "text-embedding-v4")
+async def test_query_field_sends_the_instruction_with_queries_and_nothing_with_documents() -> None:
+    # The shape DashScope's ``instruct`` has (measured on text-embedding-v4,
+    # which the catalog nonetheless leaves at "none" — see its entry).
+    caps = EmbeddingCaps(asymmetry="query_field", query_marker="instruct", instruction=_TASK)
     assert await _bodies(["q"], embedding_marker(caps, "query")) == [
         {"model": "m", "input": ["q"], "instruct": _TASK}
     ]
@@ -355,20 +365,19 @@ def test_the_model_key_names_a_marker_only_when_there_is_one() -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider", "name", "limits"),
+    ("provider", "name", "batch"),
     [
-        ("qwen", "text-embedding-v4", (10, 8_000)),
-        ("openai", "text-embedding-3-large", (2_048, 8_000)),
-        ("glm", "embedding-3", (64, 3_072)),
+        ("qwen", "text-embedding-v4", 10),
+        ("openai", "text-embedding-3-large", 2_048),
+        ("glm", "embedding-3", 64),
     ],
 )
-def test_request_limits_come_from_the_catalog(
-    provider: str, name: str, limits: tuple[int, int]
-) -> None:
-    # K-8 — the per-input limit is the catalog's number read as bytes, never
-    # above the deployment's cap (8,000 here).
-    assert catalog_request_limits(_caps(provider, name), 8_000) == limits
+def test_batch_size_comes_from_the_catalog(provider: str, name: str, batch: int) -> None:
+    # K-8 — only the batch size: the catalog's per-input token figure is a doc
+    # value, not a hard limit, so the input cap stays the deployment's.
+    assert catalog_batch_size(_caps(provider, name)) == batch
 
 
-def test_request_limits_default_without_caps() -> None:
-    assert catalog_request_limits(None, 8_000) == (10, 8_000)
+def test_batch_size_defaults_without_a_declared_one() -> None:
+    assert catalog_batch_size(None) == 10
+    assert catalog_batch_size(EmbeddingCaps(asymmetry="none")) == 10

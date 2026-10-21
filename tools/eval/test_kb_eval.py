@@ -623,8 +623,9 @@ async def test_query_marker_arms_do_not_share_cached_query_vectors(
 ) -> None:
     """B-206 K-5 A/B: the marker changes the query vector, so the cache key must
     change with it — else the second arm is served the first arm's vectors and
-    the comparison measures nothing. Documents (no qwen v4 document marker)
-    stay shared, so the corpus is not embedded twice."""
+    the comparison measures nothing. Documents (no document marker) stay
+    shared, so the corpus is not embedded twice."""
+    from expert_work.protocol.model_catalog import EmbeddingCaps
     from orchestrator.llm.embedder import HTTPEmbeddingClient
 
     sent: list[dict[str, str]] = []
@@ -643,6 +644,10 @@ async def test_query_marker_arms_do_not_share_cached_query_vectors(
     monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_API_KEY", "unit-test-key")
     monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_MODEL", "text-embedding-v4")
     tenant = uuid4()
+    # The real catalog entry enables no marker, so "on" sends nothing extra.
+    assert build_embedder("real", concurrency=1, query_marker=True).query_marker == "none"
+    caps = EmbeddingCaps(asymmetry="query_field", query_marker="instruct", instruction=_TASK)
+    monkeypatch.setattr(kb_eval, "catalog_embedding_caps", lambda model: caps)
 
     off = build_embedder("real", concurrency=1, query_marker=False)
     on = build_embedder("real", concurrency=1, query_marker=True)
@@ -674,9 +679,12 @@ async def test_run_eval_aborts_when_query_embedding_degrades(
     corpus: tuple[Path, Path], dataset_path: Path
 ) -> None:
     """The retriever degrades a failed query embedding to keyword search
-    (B-206 K-8); the eval must not score that as the hybrid result."""
+    (B-206 K-8); the eval must not score that as the hybrid result. Through the
+    eval's own CountingEmbedder: it must hand the vendor error to the retriever
+    unwrapped, or the retriever cannot tell it from a bug."""
     dataset, plain, _store, (tenant, _report) = await _built(corpus, dataset_path)
-    retriever = replace(plain, embedder=_FailingQueryEmbedder())
+    embedder = CountingEmbedder(_FailingQueryEmbedder(), expected_dim=EMBEDDING_DIM)
+    retriever = replace(plain, embedder=embedder)
 
     with pytest.raises(EmbeddingDegradedError, match="keyword"):
         await run_eval(

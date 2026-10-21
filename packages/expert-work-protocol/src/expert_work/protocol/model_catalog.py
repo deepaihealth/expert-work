@@ -62,8 +62,8 @@ class EmbeddingCaps(BaseModel):
     #               ``{task}``,填 ``instruction``);``document_marker`` 可选(nomic 文档侧
     #               也要前缀),是含 ``{document}`` 的模板。
     #   "query_field" —— 只在查询请求里多发一个请求体字段,值是 ``instruction``;文档侧原样
-    #               (阿里 text-embedding-v4 的 ``instruct``,见该条目的实测注释):
-    #               ``query_marker`` 是字段名。
+    #               (阿里 text-embedding-v4 的 ``instruct`` 就是这个形态:实测改变查询向量,
+    #               但开发集 A/B 没有收益,目录里没开,见该条目注释):``query_marker`` 是字段名。
     # 入库和查询必须用同一套标记(只有 Voyage 承诺带 / 不带互相兼容):文档侧有标记时,它进
     # 段上记的嵌入模型指纹(``knowledge_chunk.embedding_model``),换了不复用旧向量。
     asymmetry: Literal["none", "param", "prefix", "query_field"]
@@ -79,7 +79,10 @@ class EmbeddingCaps(BaseModel):
     native_endpoint: str | None = None
     # K-8 —— 每次请求最多几条输入,多了要拆批(超了厂商整次 400)。
     max_batch: int | None = None
-    # K-8 —— 单条输入上限(厂商文档值),单位见 ``length_unit``。
+    # K-8 —— 单条输入上限(厂商文档值),单位见 ``length_unit``。只作记录,平台不按它截:
+    # 文档值不是硬限(B-200 实测 text-embedding-v4 超过 16,000 token 才 400,文档写
+    # 8,192),当字节套用又会无据地截短(embedding-3 会从 8,000 字节截到 3,072)。单条上限
+    # 仍是部署的 ``embedding_max_input_bytes``。
     max_input_tokens: int | None = None
     length_unit: LengthUnit = "token"
 
@@ -661,25 +664,20 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         # 原生口生效」:``text_type=query`` / ``document`` / 不发,在兼容口和原生口上向量都
         # **逐位相同**,单发它没有作用;兼容口请求体顶层加 ``"instruct": <任务说明>`` 会改变
         # 查询向量(与不加余弦 0.9185),与原生口 ``text_type=query`` + ``instruct`` 完全相同;
-        # ``instruct`` 配 ``text_type=document`` 无作用;放进 ``parameters`` 里兼容口不认;
-        # 把说明拼进文本(``Instruct: …\nQuery: …``)向量近似但不相同(余弦 0.997)。所以它
-        # 的不对称 = 只在查询请求里发 ``instruct``(英文平台默认说明),文档侧原样 → 已入库的
-        # 向量不用重嵌入。每次请求 10 条,单条 8,192 token(K-8)。B-200 真接口实测超过
-        # 16,000 token 才整次 400:8,192 是文档值不是硬限;平台数不了它的 token,落地按
-        # 字节截(见 ``LengthUnit``)。
+        # ``instruct`` 配 ``text_type=document`` 无作用;放进 ``parameters`` 里兼容口不认。即它
+        # 能做的不对称只有「查询请求多发 ``instruct``」(``asymmetry="query_field"``、
+        # ``query_marker="instruct"``),文档侧不变。
+        # **没有开**:2026-10-22 开发集 A/B(主集 303 题 + 真实问法 172 题,英文平台默认说明)
+        # 没有收益 —— 带重排 mrr@10 主集 0.945→0.945、真实问法 0.793→0.795(噪声);只走向量路
+        # 主集 mrr@10 0.797→0.793、chk_hit@10 0.908→0.887,真实问法 mrr@10 0.637→0.629、
+        # ctx_hit 0.783→0.737。设计判据「向量路单独 mrr 上升」不成立,所以按 "none" 声明,
+        # 两侧都原样发。
+        # 每次请求 10 条(K-8);单条 8,192 token 是文档值,B-200 真接口实测超过 16,000 token
+        # 才整次 400,不是硬限,平台不按它截(见 ``max_input_tokens``)。
         ModelEntry(
             name="text-embedding-v4",
             embeddings=True,
-            embedding_caps=EmbeddingCaps(
-                asymmetry="query_field",
-                query_marker="instruct",
-                # K-5 的平台默认指令(英文)。
-                instruction=(
-                    "Given a search query, retrieve relevant passages that answer the query"
-                ),
-                max_batch=10,
-                max_input_tokens=8_192,
-            ),
+            embedding_caps=EmbeddingCaps(asymmetry="none", max_batch=10, max_input_tokens=8_192),
         ),
         # Platform rerank model (Stream T, user-specified).
         # B-206 §5.5 表 5-B, 2026-10 vendor docs —— DashScope 原生口;文本输入每次 100 篇、

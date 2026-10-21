@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage
 
@@ -14,6 +15,7 @@ from expert_work.common.search.rrf import rrf_fuse as _rrf_fuse
 from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.protocol import KnowledgeChunk, RetrievalMethod, ScoredChunk
+from orchestrator.errors import PlatformNotConfiguredError
 from orchestrator.tools import (
     KnowledgeRetriever,
     KnowledgeSearchTool,
@@ -1379,6 +1381,66 @@ async def test_a_degraded_embedding_is_flagged_in_meta() -> None:
     # Nothing found by keywords either: still flagged, not a plain "no hits".
     missed = await tool.call({"query": "zzz"}, ctx=ToolContext(tenant_id=tenant))
     assert missed.meta == {"hits": 0, "status": "no_hits", "embedding_degraded": True}
+
+
+def _embed_status_error(code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://embed.test/v1/embeddings")
+    response = httpx.Response(code, request=request, text="upstream failure")
+    return httpx.HTTPStatusError(
+        f"embeddings request failed: {code}", request=request, response=response
+    )
+
+
+class _RaisingEmbedder:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _embed_status_error(503),
+        _embed_status_error(400),
+        httpx.ReadTimeout("slow"),
+        httpx.ConnectError("refused"),
+        TimeoutError("deadline"),
+        ConnectionResetError("reset"),
+    ],
+    ids=["5xx", "4xx", "read-timeout", "connect", "timeout", "os-error"],
+)
+async def test_every_vendor_or_transport_failure_degrades_to_keywords(exc: Exception) -> None:
+    store, tenant = await _seed_store()
+    retriever = KnowledgeRetriever(store=store, embedder=_RaisingEmbedder(exc))
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="vacation", limit=5
+    )
+    assert outcome.embedding_degraded is True
+    assert [r.chunk_index for r in outcome.results] == [1]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # Embedding not configured for this deployment — a setup error the
+        # search reported before K-8 and still must, not a degraded search.
+        PlatformNotConfiguredError("platform embedding is not configured"),
+        # A bug, or a body that is not an embeddings response: keyword results
+        # flagged "degraded" on every search would hide it.
+        TypeError("unexpected keyword argument"),
+        KeyError("data"),
+    ],
+    ids=["not-configured", "type-error", "malformed-body"],
+)
+async def test_errors_that_are_not_vendor_failures_propagate(exc: Exception) -> None:
+    store, tenant = await _seed_store()
+    retriever = KnowledgeRetriever(store=store, embedder=_RaisingEmbedder(exc))
+    with pytest.raises(type(exc)):
+        await retriever.search_detailed(
+            tenant_id=tenant, base_names=["kb"], query="vacation", limit=5
+        )
 
 
 async def test_a_healthy_search_is_not_flagged() -> None:

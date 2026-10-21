@@ -469,14 +469,10 @@ def test_declared_caps_match_b206_tables() -> None:
     assert _e("glm", "embedding-3").embedding_caps == EmbeddingCaps(
         asymmetry="none", max_batch=64, max_input_tokens=3_072
     )
-    # Measured 2026-10-21 (not the docs' text_type): only a query-side ``instruct``
-    # body field changes the vector, on the endpoint the platform already calls.
+    # A query-side ``instruct`` field does change its query vector (measured
+    # 2026-10-21) but a dev-set A/B showed no gain (2026-10-22), so it is not enabled.
     assert _e("qwen", "text-embedding-v4").embedding_caps == EmbeddingCaps(
-        asymmetry="query_field",
-        query_marker="instruct",
-        instruction="Given a search query, retrieve relevant passages that answer the query",
-        max_batch=10,
-        max_input_tokens=8_192,
+        asymmetry="none", max_batch=10, max_input_tokens=8_192
     )
     assert _e("qwen", "qwen3-vl-rerank").rerank_caps == RerankCaps(
         rerank_api="dashscope",

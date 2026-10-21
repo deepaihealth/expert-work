@@ -402,19 +402,20 @@ class CountingEmbedder:
         self._tokens = 0
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
-        return await self._embed(self._inner, texts, tenant_id=tenant_id)
-
-    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
-        (vector,) = await self._embed(self._query_inner, [query], tenant_id=tenant_id)
-        return vector
-
-    async def _embed(
-        self, inner: Any, texts: Sequence[str], *, tenant_id: UUID
-    ) -> list[tuple[float, ...]]:
         try:
-            vectors = await inner.embed(texts, tenant_id=tenant_id)
+            vectors = await self._inner.embed(texts, tenant_id=tenant_id)
         except Exception as exc:
             raise EmbedStageError(f"{type(exc).__name__}: {exc}") from exc
+        return self._counted(texts, vectors)
+
+    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        # 不包成 EmbedStageError(那是给建库归阶段用的):检索器按原始异常决定降不降级
+        # (B-206 K-8),与生产同一个判断;降级了 run_eval 会整轮退出。
+        vectors = await self._query_inner.embed([query], tenant_id=tenant_id)
+        (vector,) = self._counted([query], vectors)
+        return vector
+
+    def _counted(self, texts: Sequence[str], vectors: Any) -> list[tuple[float, ...]]:
         for vector in vectors:
             if len(vector) != self._expected_dim:
                 raise EmbeddingDimensionError(

@@ -17,6 +17,7 @@ from expert_work.common.credentials import CredentialsResolverError
 from expert_work.protocol import ModelEntry
 from expert_work.protocol.model_catalog import EmbeddingCaps
 from orchestrator.errors import AgentFactoryError
+from orchestrator.llm import DEFAULT_MAX_INPUT_BYTES
 
 
 class _Cfg:
@@ -136,17 +137,31 @@ def _recording_embedder(cfg: _Cfg) -> tuple[DynamicResolvingEmbedder, list[dict]
     return emb, bodies
 
 
+def _declare_caps(monkeypatch: pytest.MonkeyPatch, caps: EmbeddingCaps) -> None:
+    """Make the live model's catalog entry declare ``caps`` (no catalog model
+    has a marker enabled today)."""
+    monkeypatch.setattr(
+        "control_plane.runtime.catalog_entry",
+        lambda provider, name: ModelEntry(name=name, embeddings=True, embedding_caps=caps),
+    )
+
+
+_QUERY_FIELD = EmbeddingCaps(asymmetry="query_field", query_marker="instruct", instruction=_TASK)
+
+
 @pytest.mark.asyncio
-async def test_memory_path_embed_sends_no_marker():
+async def test_memory_path_embed_sends_no_marker(monkeypatch):
     # Long-term memory recall / write-back call ``embed``: byte-for-byte the
     # request it sent before K-5, even on a model with a query marker.
+    _declare_caps(monkeypatch, _QUERY_FIELD)
     emb, bodies = _recording_embedder(_Cfg())
     await emb.embed(["what did I order"], tenant_id=uuid4())
     assert bodies == [{"model": "text-embedding-v4", "input": ["what did I order"]}]
 
 
 @pytest.mark.asyncio
-async def test_knowledge_query_carries_the_catalog_query_marker():
+async def test_knowledge_query_carries_the_catalog_query_marker(monkeypatch):
+    _declare_caps(monkeypatch, _QUERY_FIELD)
     emb, bodies = _recording_embedder(_Cfg())
     vector = await emb.embed_query("what did I order", tenant_id=uuid4())
     assert vector == (0.5,)
@@ -156,14 +171,19 @@ async def test_knowledge_query_carries_the_catalog_query_marker():
 
 
 @pytest.mark.asyncio
-async def test_qwen_v4_documents_keep_their_key_and_request():
-    # Document side unchanged for qwen v4 → the key stored on chunks is the one
-    # every existing chunk already carries, so they are still reused.
+async def test_qwen_v4_queries_and_documents_go_out_unmarked():
+    # The real catalog entry: no marker enabled (dev-set A/B showed no gain), so
+    # knowledge queries and documents send what they sent before K-5, and the
+    # key stored on chunks is the one every existing chunk carries.
     emb, bodies = _recording_embedder(_Cfg())
+    await emb.embed_query("what did I order", tenant_id=uuid4())
     model_key, pinned = await emb.pin(tenant_id=uuid4())
     await pinned.embed(["a passage"], tenant_id=uuid4())
     assert model_key == "qwen/text-embedding-v4"
-    assert bodies == [{"model": "text-embedding-v4", "input": ["a passage"]}]
+    assert bodies == [
+        {"model": "text-embedding-v4", "input": ["what did I order"]},
+        {"model": "text-embedding-v4", "input": ["a passage"]},
+    ]
 
 
 @pytest.mark.asyncio
@@ -173,10 +193,7 @@ async def test_a_document_marker_is_part_of_the_stored_model_key(monkeypatch):
         query_marker="input_type=search_query",
         document_marker="input_type=search_document",
     )
-    monkeypatch.setattr(
-        "control_plane.runtime.catalog_entry",
-        lambda provider, name: ModelEntry(name=name, embeddings=True, embedding_caps=caps),
-    )
+    _declare_caps(monkeypatch, caps)
     emb, bodies = _recording_embedder(_Cfg())
     model_key, pinned = await emb.pin(tenant_id=uuid4())
     await pinned.embed(["a passage"], tenant_id=uuid4())
@@ -190,13 +207,15 @@ async def test_a_document_marker_is_part_of_the_stored_model_key(monkeypatch):
 @pytest.mark.asyncio
 async def test_knowledge_sides_batch_by_the_catalog_and_memory_keeps_ten():
     cfg = _Cfg()
-    cfg.embedding = ("glm", "embedding-3")  # catalog: 64 per request, 3,072 per input
+    cfg.embedding = ("glm", "embedding-3")  # catalog: 64 per request, doc says 3,072 tokens
     emb, bodies = _recording_embedder(cfg)
     texts = [f"t{i}" for i in range(11)]
     _, pinned = await emb.pin(tenant_id=uuid4())
     await pinned.embed(texts, tenant_id=uuid4())
     assert [len(body["input"]) for body in bodies] == [11]
-    assert pinned.max_input_bytes == 3_072
+    # The per-input cap stays the deployment's: a vendor's documented token
+    # figure is not a hard limit (B-200) and is not applied as bytes.
+    assert pinned.max_input_bytes == DEFAULT_MAX_INPUT_BYTES
     bodies.clear()
     await emb.embed(texts, tenant_id=uuid4())
     assert [len(body["input"]) for body in bodies] == [10, 1]

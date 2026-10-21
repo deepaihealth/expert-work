@@ -104,7 +104,7 @@ from orchestrator.llm import (
 )
 from orchestrator.llm.embedder import (
     EmbeddingSide,
-    catalog_request_limits,
+    catalog_batch_size,
     embedding_marker,
     marked_model_key,
 )
@@ -1332,16 +1332,16 @@ class DynamicResolvingEmbedder:
             )
             return f"{provider}/{model}", delegate
         # B-206 K-5 / K-8 —— knowledge sides: the catalog's marker for this side and
-        # its per-request limits (an off-catalog model keeps the platform defaults).
+        # its batch size (an off-catalog model keeps the platform default); the
+        # per-input cap stays the deployment's.
         entry = catalog_entry(provider, model)
         caps = entry.embedding_caps if entry is not None else None
-        batch, input_bytes = catalog_request_limits(caps, self.max_input_bytes)
         marker = embedding_marker(caps, side)
         delegate = OpenAICompatibleEmbedder(
             client=client,
             model=model,
-            max_batch_size=batch,
-            max_input_bytes=input_bytes,
+            max_batch_size=catalog_batch_size(caps),
+            max_input_bytes=self.max_input_bytes,
             marker=marker,
         )
         return marked_model_key(f"{provider}/{model}", marker), delegate

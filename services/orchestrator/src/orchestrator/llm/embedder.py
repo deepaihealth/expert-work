@@ -200,19 +200,15 @@ def marked_model_key(model_key: str, marker: EmbeddingMarker) -> str:
     return f"{model_key}#{marker.fingerprint}" if marker.fingerprint else model_key
 
 
-def catalog_request_limits(caps: EmbeddingCaps | None, max_input_bytes: int) -> tuple[int, int]:
-    """B-206 K-8 —— ``(inputs per request, UTF-8 bytes per input)`` for a model
-    with catalog ``caps``: the vendor's documented limits where the catalog
-    declares them, the platform defaults where not. The per-input limit is
-    applied as the same number of bytes (a token or a character is at least one
-    byte, see ``LengthUnit``) and never above ``max_input_bytes``, the
-    deployment's cap."""
-    if caps is None:
-        return _DEFAULT_MAX_BATCH_SIZE, max_input_bytes
-    batch = caps.max_batch or _DEFAULT_MAX_BATCH_SIZE
-    if caps.max_input_tokens is None:
-        return batch, max_input_bytes
-    return batch, min(max_input_bytes, caps.max_input_tokens)
+def catalog_batch_size(caps: EmbeddingCaps | None) -> int:
+    """B-206 K-8 —— inputs per request for a model with catalog ``caps``: the
+    vendor's documented batch limit where declared, the platform default
+    otherwise. The per-input cap is not taken from the catalog — its token
+    figure is a doc value, not a hard limit (see ``EmbeddingCaps.max_input_tokens``)
+    — and stays the deployment's ``max_input_bytes``."""
+    if caps is None or caps.max_batch is None:
+        return _DEFAULT_MAX_BATCH_SIZE
+    return caps.max_batch
 
 
 @dataclass(frozen=True)
