@@ -25,9 +25,133 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from expert_work.protocol.provider_catalog import PROVIDER_CATALOG, Provider
+
+#: B-206 —— 厂商写长度上限用的计数单位(``EmbeddingCaps`` / ``RerankCaps`` 的
+#: ``*_tokens`` 字段都按它读)。
+#:   "token" —— 按厂商自己的分词器数。平台数不了(B-200:同样 8,000 个 o200k token,
+#:              印地文在 text-embedding-v4 那边是 2.6 倍),所以落地时按同数值的 UTF-8
+#:              字节截:每个 token 至少一个字节,N 字节必然 ≤ N token。
+#:   "char"  —— 按字符数(表 5-B:智谱、腾讯重排),平台能精确数。
+#: 默认 "token" 是保守的一侧:按字符的上限被误标成 token,字节截只会更短,不会超限。
+LengthUnit = Literal["token", "char"]
+
+
+class EmbeddingCaps(BaseModel):
+    """B-206 K-5 / K-8 —— an embedding model's request capabilities.
+
+    Batch 0 only declares them; nothing reads them until batch 1. Values come
+    from B-206 design §5.5 table 5-A (vendor docs read 2026-10). ``None`` =
+    the vendor docs say nothing / not checked yet → callers keep the platform
+    default.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # How the vendor tells a search query from a document being indexed —
+    # table 5-A shows exactly three shapes:
+    #   "none"   —— 什么都不发,两侧原样嵌入(OpenAI / 智谱 / 火山 / 自部署 bge-m3 …)。
+    #   "param"  —— 枚举请求参数(Cohere ``input_type``、Jina ``task``、阿里原生口
+    #               ``text_type`` …):``query_marker`` / ``document_marker`` 写成
+    #               ``"name=value"``。
+    #   "prefix" —— 平台拼进输入文本的前缀,通常只加在查询侧(bge-zh / nomic / E5 /
+    #               自部署 Qwen3):``query_marker`` 是含 ``{query}`` 的模板;
+    #               ``document_marker`` 可选(nomic 文档侧也要前缀),是含 ``{document}``
+    #               的模板。
+    # 入库和查询必须用同一套标记(只有 Voyage 承诺带 / 不带互相兼容),批 1 会把它记进
+    # 知识库的嵌入模型指纹,换了当换模型处理。
+    asymmetry: Literal["none", "param", "prefix"]
+    query_marker: str | None = None
+    document_marker: str | None = None
+    # Instruction text sent with queries only: the ``{task}`` of a "prefix"
+    # template, or 阿里 ``instruct``. None = the model takes no instruction.
+    instruction: str | None = None
+    # Path of the vendor-native endpoint the markers need, when the vendor's
+    # OpenAI-compatible endpoint drops them (DashScope). None = the markers, if
+    # any, work on the endpoint the platform already calls.
+    native_endpoint: str | None = None
+    # K-8 —— 每次请求最多几条输入,多了要拆批(超了厂商整次 400)。
+    max_batch: int | None = None
+    # K-8 —— 单条输入上限(厂商文档值),单位见 ``length_unit``。
+    max_input_tokens: int | None = None
+    length_unit: LengthUnit = "token"
+
+    @model_validator(mode="after")
+    def _markers_match_asymmetry(self) -> EmbeddingCaps:
+        if self.asymmetry == "none":
+            declared = (
+                self.query_marker,
+                self.document_marker,
+                self.instruction,
+                self.native_endpoint,
+            )
+            if any(value is not None for value in declared):
+                # Nothing is sent for "none" — a declared marker would be silently dropped.
+                msg = "asymmetry='none' takes no markers, instruction or native_endpoint"
+                raise ValueError(msg)
+        elif self.asymmetry == "param":
+            if self.query_marker is None or self.document_marker is None:
+                msg = "asymmetry='param' needs query_marker and document_marker"
+                raise ValueError(msg)
+            for marker in (self.query_marker, self.document_marker):
+                name, sep, value = marker.partition("=")
+                if not (name and sep and value):
+                    msg = f"asymmetry='param' markers are 'name=value', got {marker!r}"
+                    raise ValueError(msg)
+        else:
+            if self.query_marker is None or "{query}" not in self.query_marker:
+                msg = "asymmetry='prefix' needs a query_marker template containing '{query}'"
+                raise ValueError(msg)
+            if self.document_marker is not None and "{document}" not in self.document_marker:
+                msg = "asymmetry='prefix' document_marker must contain '{document}'"
+                raise ValueError(msg)
+        return self
+
+
+class RerankCaps(BaseModel):
+    """B-206 K-7 —— a rerank model's request capabilities.
+
+    Batch 0 only declares them; batch 1 replaces the hard-coded
+    ``_MAX_RERANK_CANDIDATES`` / ``RERANK_DOC_MAX_CHARS`` with these. Values
+    come from B-206 design §5.5 table 5-B (vendor docs read 2026-10).
+    ``None`` = the vendor docs say nothing / not checked yet → callers keep
+    the platform default.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Request shape:
+    #   "dashscope"    —— DashScope 原生重排接口;
+    #   "cohere_style" —— ``POST …/rerank`` + ``{model, query, documents, top_n}``(Cohere /
+    #                     Jina / Voyage / 智谱 / SiliconFlow / 千帆 / vLLM / TEI …,
+    #                     ``top_n`` / ``top_k`` 之类的名字差异归客户端的适配表);
+    #   "vertex"       —— Google ``rankingConfigs:rank``(``title`` 独立字段);
+    #   "bedrock"      —— AWS agent-runtime ``Rerank``(``numberOfResults``);
+    #   "llm"          —— 聊天模型排序,给没有重排接口的厂商。
+    rerank_api: Literal["dashscope", "cohere_style", "vertex", "bedrock", "llm"]
+    # 每次请求最多几篇文档(厂商上限)。
+    max_documents: int | None = None
+    # 长度上限,全部按 ``length_unit`` 计:单篇文档 / 整次请求(查询 + 全部文档;阿里超限
+    # 整次 400、不截断)/ 查询本身(查询超长拆批也救不了,要单独校验)。
+    max_doc_tokens: int | None = None
+    max_total_tokens: int | None = None
+    query_max_tokens: int | None = None
+    length_unit: LengthUnit = "token"
+    # 厂商容许的并发请求数。None = 平台默认。
+    max_concurrency: int | None = None
+    # 接受任务指令(阿里 ``instruct``、Voyage 2.5+、doubao-seed、自部署 Qwen3)。
+    # False = 不发(K-14「有则用」;Cohere 文档明说不支持)。
+    supports_instruction: bool = False
+    # What a score means — decides whether a threshold can carry over:
+    #   "normalized" —— 绝对的 0~1;
+    #   "sigmoid"    —— sigmoid / yes-no 头给出的 0~1 概率;
+    #   "logit"      —— 原始 logit,可为负,批 1 统一过 sigmoid;
+    #   "relative"   —— 请求内相对分,不可跨请求比较。
+    score_scale: Literal["normalized", "sigmoid", "logit", "relative"] | None = None
+    # 厂商限流,每分钟请求数。None = 平台默认。
+    rpm: int | None = None
 
 
 class ModelEntry(BaseModel):
@@ -106,6 +230,20 @@ class ModelEntry(BaseModel):
     thinking_cap: bool = False
     # B-105 —— 平台档位 → 厂商档位取值;缺的键按平台档位原样发。None = 全部原样。
     effort_map: dict[str, str] | None = None
+    # B-206 批 0(K-5 / K-7 / K-8)—— 嵌入 / 重排模型的请求能力,只能挂在 ``embeddings`` /
+    # ``rerank`` 为 True 的条目上。None = 未声明。批 0 只是骨架:运行时还没有任何地方读它们。
+    embedding_caps: EmbeddingCaps | None = None
+    rerank_caps: RerankCaps | None = None
+
+    @model_validator(mode="after")
+    def _caps_match_flags(self) -> ModelEntry:
+        if self.embedding_caps is not None and not self.embeddings:
+            msg = f"{self.name}: embedding_caps needs embeddings=True"
+            raise ValueError(msg)
+        if self.rerank_caps is not None and not self.rerank:
+            msg = f"{self.name}: rerank_caps needs rerank=True"
+            raise ValueError(msg)
+        return self
 
 
 #: Provider → its models. Verify names/capabilities against official docs when
@@ -178,7 +316,13 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             tool_disclosure="allowed_tools",
             output_cap_field="max_completion_tokens",
         ),
-        ModelEntry(name="text-embedding-3-large", embeddings=True),
+        # B-206 §5.5 表 5-A, 2026-10 vendor docs —— 没有查询 / 文档标记;每次请求
+        # 2,048 条,单条 8,192 token(另有每请求合计 300k token,目录不记这一项)。
+        ModelEntry(
+            name="text-embedding-3-large",
+            embeddings=True,
+            embedding_caps=EmbeddingCaps(asymmetry="none", max_batch=2_048, max_input_tokens=8_192),
+        ),
         ModelEntry(name="gpt-4o", vision=True, context_window=128_000, deprecated=True),
         ModelEntry(name="gpt-4o-mini", vision=True, context_window=128_000, deprecated=True),
     ),
@@ -401,7 +545,13 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             max_output_tokens=16_384,
         ),
         # Platform embedding model (Stream T, user-specified).
-        ModelEntry(name="embedding-3", embeddings=True),
+        # B-206 §5.5 表 5-A, 2026-10 vendor docs —— 没有查询 / 文档标记;每次请求 64 条,
+        # 单条 3,072 token。
+        ModelEntry(
+            name="embedding-3",
+            embeddings=True,
+            embedding_caps=EmbeddingCaps(asymmetry="none", max_batch=64, max_input_tokens=3_072),
+        ),
         ModelEntry(name="glm-4-plus", vision=False, context_window=128_000, deprecated=True),
         ModelEntry(name="glm-4v-plus", vision=True, context_window=8_000, deprecated=True),
         ModelEntry(name="glm-4.1v-thinking", vision=True, context_window=32_000, deprecated=True),
@@ -483,9 +633,44 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking_cap=True,
         ),
         # Platform embedding model (Stream T, user-specified).
-        ModelEntry(name="text-embedding-v4", embeddings=True),
+        # B-206 §5.5 表 5-A, 2026-10 vendor docs —— 查询 / 文档标记是 ``text_type``,指令是
+        # ``instruct``(只作用于查询侧,建议英文),两者都只在 DashScope 原生口生效,OpenAI
+        # 兼容口不认(K-5)。每次请求 10 条,单条 8,192 token(K-8)。B-200 真接口实测超过
+        # 16,000 token 才整次 400:8,192 是文档值不是硬限;平台数不了它的 token,落地按
+        # 字节截(见 ``LengthUnit``)。
+        ModelEntry(
+            name="text-embedding-v4",
+            embeddings=True,
+            embedding_caps=EmbeddingCaps(
+                asymmetry="param",
+                query_marker="text_type=query",
+                document_marker="text_type=document",
+                # K-5 的平台默认指令(英文)。
+                instruction=(
+                    "Given a search query, retrieve relevant passages that answer the query"
+                ),
+                native_endpoint="/api/v1/services/embeddings/text-embedding/text-embedding",
+                max_batch=10,
+                max_input_tokens=8_192,
+            ),
+        ),
         # Platform rerank model (Stream T, user-specified).
-        ModelEntry(name="qwen3-vl-rerank", rerank=True),
+        # B-206 §5.5 表 5-B, 2026-10 vendor docs —— DashScope 原生口;文本输入每次 100 篇、
+        # 单篇 8,000 token、整次 120,000 token(超限 400 不截断);支持 ``instruct``;
+        # 请求内相对分、不可跨请求比较;限流 600 RPM。查询单独上限、并发数文档没写。
+        ModelEntry(
+            name="qwen3-vl-rerank",
+            rerank=True,
+            rerank_caps=RerankCaps(
+                rerank_api="dashscope",
+                max_documents=100,
+                max_doc_tokens=8_000,
+                max_total_tokens=120_000,
+                supports_instruction=True,
+                score_scale="relative",
+                rpm=600,
+            ),
+        ),
         ModelEntry(name="qwen-max", vision=False, context_window=32_000, deprecated=True),
         ModelEntry(name="qwen-vl-max", vision=True, context_window=32_000, deprecated=True),
     ),
