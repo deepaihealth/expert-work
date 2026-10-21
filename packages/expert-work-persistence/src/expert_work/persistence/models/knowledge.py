@@ -165,6 +165,15 @@ class KnowledgeDocumentRow(Base):
     progress: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: B-209 (migration ``0169``) — one record per PDF page (how its text was
+    #: obtained, recognition model and outcome) and their counts. The records
+    #: can run to a thousand entries: deferred, read only by the page view.
+    page_records: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True, deferred=True
+    )
+    page_stats: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     mime: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -247,6 +256,35 @@ class KnowledgeChunkRow(Base):
         Index("knowledge_chunk_document_idx", "document_id"),
         Index("knowledge_chunk_tsv_idx", "content_tsv", postgresql_using="gin"),
         UniqueConstraint("document_id", "chunk_index", name="knowledge_chunk_document_index_uniq"),
+    )
+
+
+class KnowledgeParseCacheRow(Base):
+    """``knowledge_parse_cache`` (migration ``0169``, B-209 §5.5) — a model's
+    cleaned reading of one image, per tenant: the same page uploaded again,
+    re-chunked or recognized again is never billed twice. Per tenant on
+    purpose (a shared cache would tell a tenant that another uploaded the same
+    page). ``cache_key`` = sha256 of the image bytes sent + model + prompt
+    version + render parameters."""
+
+    __tablename__ = "knowledge_parse_cache"
+
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    #: ``page_ocr`` (PR-1); ``figure_desc`` / ``figure_ocr`` reserved for PR-2.
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    cache_key: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "kind", "cache_key", name="knowledge_parse_cache_pkey"),
+        CheckConstraint(
+            "kind IN ('page_ocr', 'figure_desc', 'figure_ocr')",
+            name="knowledge_parse_cache_kind_enum",
+        ),
     )
 
 

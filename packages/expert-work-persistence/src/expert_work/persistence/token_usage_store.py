@@ -152,6 +152,9 @@ PLATFORM_OVERHEAD_USAGE_KIND = "platform_overhead"
 #: 不进租户侧合计的 kind:客户账单、控制台 run / 会话 / agent 用户合计、用量页总计
 #: 都排除它们(只在用量页「按用途」表里单列)。与对外口径、账单口径一致。
 NON_BILLABLE_USAGE_KINDS: tuple[str, ...] = (PLATFORM_OVERHEAD_USAGE_KIND,)
+#: B-209 §5.8 —— 知识库入库:扫描页识别 / 图片描述调用与入库的嵌入,记在**上传文档的租户**
+#: 名下(``agent_name`` 留空),**计入账单**(不在 :data:`NON_BILLABLE_USAGE_KINDS` 里)。
+KNOWLEDGE_INGEST_USAGE_KIND = "knowledge_ingest"
 
 
 @dataclass(frozen=True)

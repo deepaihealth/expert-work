@@ -53,18 +53,20 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables.config import var_child_runnable_config
 
 from expert_work.persistence.token_usage_store import PLATFORM_OVERHEAD_USAGE_KIND, TokenUsageStore
+from expert_work.protocol.billing import provider_for_model
 from expert_work.runtime.middleware import (
     CallNext,
     MiddlewareChain,
     MiddlewareContext,
     TokenUsageMiddleware,
 )
+from orchestrator.llm.embedder import embedding_usage_sink
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget, usage_total
 from orchestrator.tools.knowledge import ScoredReranker
 
 if TYPE_CHECKING:
     from expert_work.protocol import ModelSpec, StructuredOutputSpec
-    from orchestrator.llm import LLMCaller
+    from orchestrator.llm import Embedder, LLMCaller
     from orchestrator.llm.providers._streaming import LLMDelta
     from orchestrator.tools.knowledge import Reranker
     from orchestrator.tools.registry import ToolSpec
@@ -393,3 +395,37 @@ class ScopedReranker:
                 query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
             )
             return [(index, None) for index in order]
+
+
+@dataclass(frozen=True)
+class ScopedEmbedder:
+    """B-209 §5.8 —— 检索时 run 内的查询嵌入:平台嵌入模型的调用,与重排同口径记
+    ``platform_overhead``(运营用量可见、计入 run 的 token 池、不进账单),记在本次构建的
+    agent 名下。用量取厂商嵌入接口返回的 ``usage``(:func:`~orchestrator.llm.embedding_usage_sink`);
+    run 外(检索测试接口等)什么都不记 —— 同 :class:`ScopedReranker`。
+    """
+
+    inner: Embedder
+    identity: UsageIdentity
+
+    async def embed(
+        self, texts: Sequence[str], *, tenant_id: UUID, **kwargs: Any
+    ) -> list[tuple[float, ...]]:
+        spent: dict[str, int] = {}
+
+        def tally(model: str, usage: Mapping[str, Any]) -> None:
+            tokens = int(usage.get("prompt_tokens") or usage.get("total_tokens") or 0)
+            spent[model] = spent.get(model, 0) + tokens
+
+        with embedding_usage_sink(tally):
+            vectors = await self.inner.embed(texts, tenant_id=tenant_id, **kwargs)
+        for model, tokens in spent.items():
+            if tokens <= 0:
+                continue
+            response = AIMessage(
+                content="",
+                usage_metadata={"input_tokens": tokens, "output_tokens": 0, "total_tokens": tokens},
+            )
+            meter = self.identity.meter(default=(provider_for_model(model) or "", model))
+            await charge_in_run(meter, response)
+        return vectors

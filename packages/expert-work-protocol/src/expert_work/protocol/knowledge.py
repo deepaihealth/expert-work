@@ -56,6 +56,8 @@ class IngestStage(StrEnum):
 
     QUEUED = "queued"
     PARSING = "parsing"
+    #: B-209 —— 扫描页送识别模型(只有判出要识别的页时才经过)。
+    RECOGNIZING = "recognizing"
     CHUNKING = "chunking"
     EMBEDDING = "embedding"
     INDEXING = "indexing"
@@ -77,6 +79,97 @@ class IngestErrorCode(StrEnum):
     #: Crash recovery used up its retry budget.
     ATTEMPTS_EXHAUSTED = "attempts_exhausted"
     INTERNAL_ERROR = "internal_error"
+
+
+class PageDecision(StrEnum):
+    """B-209 §5.2 —— how one PDF page's text was obtained."""
+
+    #: The page's own text layer (incl. a hidden OCR layer a scanner left).
+    TEXT = "text"
+    #: The whole page is rendered and read by a recognition model.
+    OCR = "ocr"
+    #: No text and nothing drawn — nothing to read.
+    BLANK = "blank"
+
+
+class PageReason(StrEnum):
+    """B-209 §5.2 —— why a page was decided the way it was (recorded per page)."""
+
+    #: Signal 1: fewer than 50 characters, with an image or a non-rectangular
+    #: vector path on the page.
+    SPARSE_TEXT = "sparse_text"
+    #: Signal 2: images cover at least 80 % of the page.
+    FULL_PAGE_IMAGE = "full_page_image"
+    #: Signal 3: at least 30 % of the text layer is private-use / U+FFFD / CID.
+    GARBLED_TEXT = "garbled_text"
+    #: A page image with the scanner's invisible OCR text layer: the layer is
+    #: kept, the page is not recognized again (a bad layer trips signal 3).
+    HIDDEN_TEXT_LAYER = "hidden_text_layer"
+
+
+class PageStatus(StrEnum):
+    """B-209 §5.6 —— where a page that needs recognition stands. Text / blank
+    pages have none."""
+
+    RECOGNIZED = "recognized"
+    #: Primary and fallback model both failed — can be recognized again.
+    FAILED = "failed"
+    #: No recognition model configured / vendor unavailable — recognized once
+    #: it is configured (「补识别」).
+    PENDING = "pending"
+    #: Past the per-document recognition page cap.
+    OVER_LIMIT = "over_limit"
+
+
+class DocumentPage(BaseModel):
+    """B-209 §5.6 —— one PDF page's record: how its text was obtained and,
+    for a recognized page, by which model and with what result. No page is
+    ever silently empty: a page that needed recognition and got no text says
+    so in ``status`` / ``error``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    page: int = Field(ge=1, description="1-based page number")
+    decision: PageDecision
+    reason: PageReason | None = None
+    status: PageStatus | None = Field(default=None, description="only for decision=ocr")
+    provider: str | None = None
+    model: str | None = Field(default=None, description="the model whose text was kept")
+    chars: int = Field(default=0, ge=0, description="characters of text the page contributed")
+    images: int = Field(default=0, ge=0, description="image objects on the page")
+    cached: bool = Field(default=False, description="text reused from the recognition cache")
+    error: str | None = None
+
+
+class PageStats(BaseModel):
+    """B-209 §5.6 —— a document's page counts, for the list badge
+    「已识别 N 页 · 失败 M 页 · 待识别 K 页」."""
+
+    model_config = ConfigDict(frozen=True)
+
+    pages_total: int = Field(default=0, ge=0)
+    pages_ocr: int = Field(default=0, ge=0, description="pages recognized by a model")
+    pages_failed: int = Field(default=0, ge=0)
+    pages_pending: int = Field(default=0, ge=0)
+    pages_over_limit: int = Field(default=0, ge=0)
+
+    @classmethod
+    def of(cls, pages: Sequence[DocumentPage]) -> PageStats:
+        def count(status: PageStatus) -> int:
+            return sum(1 for page in pages if page.status is status)
+
+        return cls(
+            pages_total=len(pages),
+            pages_ocr=count(PageStatus.RECOGNIZED),
+            pages_failed=count(PageStatus.FAILED),
+            pages_pending=count(PageStatus.PENDING),
+            pages_over_limit=count(PageStatus.OVER_LIMIT),
+        )
+
+    @property
+    def needs_recognition(self) -> bool:
+        """Pages are failed or pending — 「补识别」 has something to do."""
+        return self.pages_failed > 0 or self.pages_pending > 0
 
 
 class KnowledgeBaseKind(StrEnum):
@@ -279,6 +372,9 @@ class KnowledgeDocument(BaseModel):
         default=None, description="machine-readable failure reason"
     )
     page_count: int | None = Field(default=None, ge=0)
+    #: B-209 —— page counts of the latest PDF ingest (``None``: not a PDF, or
+    #: ingested before page records existed).
+    page_stats: PageStats | None = None
     size_bytes: int | None = Field(
         default=None, ge=0, description="size of the serving version's original file"
     )

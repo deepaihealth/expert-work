@@ -10,6 +10,7 @@
 * Ⓔ 对话不在一句话中间切开;
 * Ⓓ 带表格行的分段都带表头,表格行不被切开、且排在表头之下;
 * Ⓕ 没有文字层的文件:带错误码的解析失败,或零个分段 —— 不出别的异常、不出垃圾段。
+* Ⓕ 混合 PDF(B-209):每页都有记录,扫描页认不出也不静默为空;认得出时按页序插回。
 
 现在不成立、B-206 要修的标 ``xfail(strict=True)``:修好那天它变红,逼着把标记摘掉。
 B-206 有意要改的(段长分布、父段数)不在这里断言,见文末 TODO。
@@ -18,7 +19,7 @@ B-206 有意要改的(段长分布、父段数)不在这里断言,见文末 TODO
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from uuid import UUID, uuid4
@@ -26,17 +27,31 @@ from uuid import UUID, uuid4
 import pytest
 
 from control_plane.knowledge.chunking import count_tokens
-from control_plane.knowledge.ingestion import failure_code, ingest_document_bytes
+from control_plane.knowledge.ingestion import (
+    failure_code,
+    ingest_document_bytes,
+    shutdown_parse_pool,
+)
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
+from control_plane.knowledge.recognition.clients import Reading
+from control_plane.knowledge.recognition.recognizer import (
+    DocumentRecognizer,
+    ModelChoice,
+    RecognitionSettings,
+)
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
+    DocumentPage,
     IngestErrorCode,
     KnowledgeChunk,
+    PageDecision,
+    PageStats,
+    PageStatus,
 )
 from orchestrator.llm import Embedder, FakeEmbedder
-from tests.knowledge_form_fixtures import SCANNED_DOCS, TEXT_FORM_DOCS, FormDoc
+from tests.knowledge_form_fixtures import MIXED_DOCS, SCANNED_DOCS, TEXT_FORM_DOCS, FormDoc
 
 #: Tokens are counted on the joined text and a join can merge with its
 #: neighbour — the same slack ``test_knowledge_chunking`` allows the cap.
@@ -315,6 +330,112 @@ async def test_scanned_document_yields_no_chunks(doc: FormDoc) -> None:
         assert failure_code(exc) in {IngestErrorCode.PARSE_FAILED, IngestErrorCode.UNSUPPORTED_FILE}
     else:
         assert ingested.chunks == []
+
+
+# ---------------------------------------------------------------------------
+# Ⓕ 混合 PDF(B-209):文字页夹着扫描页 —— 不允许静默空页
+# ---------------------------------------------------------------------------
+
+_SCANNED_PAGE_TEXT = "第二章 薪酬\n\n工资于每月十日发放,遇节假日提前。"
+
+
+@pytest.fixture(scope="module")
+def _parse_pool() -> Iterator[None]:
+    # The PDF path analyses and renders pages in the real parse pool.
+    yield
+    shutdown_parse_pool()
+
+
+class _ScanReader:
+    async def read(self, image: bytes) -> Reading:
+        del image
+        return Reading(text=_SCANNED_PAGE_TEXT)
+
+
+async def _no_key(*, tenant_id: UUID, provider: str) -> str:
+    del tenant_id
+    msg = f"no platform credential for provider {provider!r}"
+    raise LookupError(msg)
+
+
+async def _key(*, tenant_id: UUID, provider: str) -> str:
+    del tenant_id
+    return f"key-{provider}"
+
+
+@dataclass
+class _PlatformRecognition:
+    async def recognition_settings(self) -> RecognitionSettings:
+        return RecognitionSettings(
+            primary=ModelChoice("glm", "glm-ocr"),
+            fallback=ModelChoice("qwen", "qwen3.7-flash"),
+            max_pages=1000,
+        )
+
+
+async def _ingest_pdf(doc: FormDoc, *, recognized: bool) -> tuple[str, list[DocumentPage]]:
+    """``doc`` through the production PDF path (page analysis, recognition,
+    page records) — the chunks' text in order (each chunk's heading path, then
+    its body: a heading may sit on the path) and the page records."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=base.id, filename=doc.filename, content=doc.raw
+    )
+    recognizer = DocumentRecognizer(
+        store=store,
+        settings=_PlatformRecognition(),
+        api_keys=_key if recognized else _no_key,
+        client_factory=lambda choice, key: _ScanReader(),
+    )
+    await ingest_document_bytes(
+        store=store,
+        embedder=FakeEmbedder(),
+        tenant_id=tenant,
+        document_id=document.id,
+        kb_id=base.id,
+        filename=doc.filename,
+        raw=doc.raw,
+        chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+        chunk_overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
+        recognizer=recognizer,
+    )
+    chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=document.id, limit=10_000)
+    pages = await store.list_document_pages(tenant_id=tenant, document_id=document.id)
+    assert pages is not None
+    text = "".join("".join(chunk.heading_path) + chunk.content for chunk in chunks)
+    return _squash(text), pages
+
+
+@pytest.mark.parametrize("doc", _params(MIXED_DOCS))
+async def test_mixed_pdf_has_no_silently_empty_page(doc: FormDoc, _parse_pool: None) -> None:
+    # Nothing can read the scanned page: the text pages still ingest, and the
+    # scanned page is on record as waiting — never a silent gap.
+    bodies, pages = await _ingest_pdf(doc, recognized=False)
+    assert [u for u in doc.units if _squash(u) not in bodies] == []
+    assert [page.decision for page in pages] == [
+        PageDecision.TEXT,
+        PageDecision.OCR,
+        PageDecision.TEXT,
+    ]
+    scanned = pages[1]
+    assert scanned.status is PageStatus.PENDING
+    assert scanned.error and "no platform credential" in scanned.error
+    assert PageStats.of(pages).needs_recognition
+
+
+@pytest.mark.parametrize("doc", _params(MIXED_DOCS))
+async def test_mixed_pdf_scanned_page_is_read_in_place(doc: FormDoc, _parse_pool: None) -> None:
+    bodies, pages = await _ingest_pdf(doc, recognized=True)
+    assert [u for u in doc.units if _squash(u) not in bodies] == []
+    scanned = _squash(_SCANNED_PAGE_TEXT)
+    assert scanned in bodies
+    # Page order: chapter 1 (page 1) < the scanned chapter 2 < chapter 3 (page 3).
+    assert bodies.index(_squash(doc.units[0])) < bodies.index(scanned)
+    assert bodies.index(scanned) < bodies.index(_squash(doc.units[2]))
+    assert pages[1].status is PageStatus.RECOGNIZED
+    assert pages[1].chars == len(scanned)
 
 
 # ---------------------------------------------------------------------------

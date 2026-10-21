@@ -39,7 +39,7 @@ import {
   Upload,
 } from "antd";
 import type { TableColumnsType, TablePaginationConfig } from "antd";
-import { Eye, RefreshCw, Trash2, Undo2 } from "lucide-react";
+import { Eye, RefreshCw, ScanText, Trash2, Undo2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -47,6 +47,7 @@ import {
   discardPendingDocument,
   KNOWLEDGE_DOCUMENT_MAX_BYTES,
   listDocuments,
+  recognizeDocument,
   reingestDocument,
   uploadDocument,
   type DocumentStatus,
@@ -57,6 +58,7 @@ import {
 import { ApiError } from "../../api/client";
 import { formatBytes } from "../../components/console/workspace_format";
 import { DEFAULT_UPLOAD_STALL_TIMEOUT_MS, useUploadQueue } from "../../hooks/useUploadQueue";
+import { needsRecognition, PageRecognitionTags } from "./PageRecognitionTags";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
 import { UploadQueuePanel } from "./UploadQueuePanel";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
@@ -291,6 +293,23 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     [t, baseName, message, refresh],
   );
 
+  const handleRecognize = useCallback(
+    async (documentId: string) => {
+      try {
+        await recognizeDocument(baseName, documentId);
+        message.success(t("knowledge_page.recognize_started"));
+      } catch (err) {
+        message.error(
+          err instanceof ApiError && err.status === 409
+            ? t("knowledge_page.recognize_nothing")
+            : errMessage(err),
+        );
+      }
+      await refresh();
+    },
+    [t, baseName, message, refresh],
+  );
+
   const handleDiscardPending = useCallback(
     async (documentId: string) => {
       try {
@@ -342,7 +361,17 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
             ) : (
               tag
             );
-          if (!record.has_pending) return statusTag;
+          const pages = (
+            <PageRecognitionTags stats={record.page_stats} documentId={record.id} />
+          );
+          if (!record.has_pending) {
+            return (
+              <Space size={4} wrap>
+                {statusTag}
+                {pages}
+              </Space>
+            );
+          }
           // A re-upload is pending: say which version retrieval uses now.
           const serving = record.chunk_count > 0;
           return (
@@ -369,6 +398,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
                   )}
                 </Tag>
               </Tooltip>
+              {pages}
             </Space>
           );
         },
@@ -406,7 +436,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
       {
         title: "",
         key: "actions",
-        width: 160,
+        width: 190,
         render: (_: unknown, record) => (
           <Space size={4}>
             <Tooltip title={t("knowledge_page.view_chunks")}>
@@ -432,6 +462,21 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
                 />
               </Tooltip>
             </ReadonlyTooltip>
+            {needsRecognition(record.page_stats) && (
+              <ReadonlyTooltip on={readonly}>
+                <Tooltip title={t("knowledge_page.recognize")}>
+                  <Button
+                    size="small"
+                    type="text"
+                    disabled={readonly}
+                    icon={<ScanText size={14} strokeWidth={1.5} />}
+                    onClick={() => void handleRecognize(record.id)}
+                    aria-label={t("knowledge_page.recognize")}
+                    data-testid={`doc-recognize-${record.id}`}
+                  />
+                </Tooltip>
+              </ReadonlyTooltip>
+            )}
             {record.has_pending && (
               <ReadonlyTooltip on={readonly}>
                 <Popconfirm
@@ -483,7 +528,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         ),
       },
     ],
-    [t, handleReingest, handleDiscardPending, handleDelete, readonly],
+    [t, handleReingest, handleRecognize, handleDiscardPending, handleDelete, readonly],
   );
 
   const pagination = useMemo<TablePaginationConfig>(

@@ -10,8 +10,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -45,7 +45,7 @@ from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from orchestrator import MemoryEnv, MiddlewareEnv, ToolEnv, build_agent
 from orchestrator.graph_builder import make_reflect_node
-from orchestrator.llm import FakeEmbedder
+from orchestrator.llm import FakeEmbedder, OpenAICompatibleEmbedder
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools._guards import TOKEN_BUDGET_KEY, TokenBudget
@@ -470,6 +470,60 @@ async def test_knowledge_rerank_carries_the_platform_identity(
     _assert_platform_identity(reranker.identities[0])
     # 主循环两轮两行,重排序替身不调模型,不多出行。
     assert [r.input_tokens for r in run.rows] == [100, 100]
+
+
+@dataclass
+class _ReportingEmbeddingsApi:
+    """OpenAI-compatible embeddings endpoint that reports ``usage`` (B-209 §5.8)."""
+
+    async def embeddings(
+        self, *, model: str, texts: Sequence[str], fields: Mapping[str, str] | None = None
+    ) -> Mapping[str, Any]:
+        del model, fields
+        return {
+            "data": [{"index": i, "embedding": [1.0, 0.0]} for i in range(len(texts))],
+            "usage": {"prompt_tokens": 9, "total_tokens": 9},
+        }
+
+
+@pytest.mark.asyncio
+async def test_knowledge_query_embedding_is_metered_as_platform_overhead(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-209 §5.8 —— 检索时的查询嵌入是 run 内的平台模型调用:与重排同口径记
+    ``platform_overhead``,记在本 agent 名下、同一个 trace、计入 run 的 token 池。"""
+    search = {
+        "name": "knowledge_search",
+        "args": {"query": "deductible"},
+        "id": "call-1",
+        "type": "tool_call",
+    }
+    brain = _Brain(
+        main_replies=[AIMessage(content="", tool_calls=[search], usage_metadata=_usage("main"))]
+    )
+    _patch_providers(monkeypatch, brain)
+    env = await _knowledge_env(_SpyReranker())
+    assert env.knowledge_retriever is not None
+    env = replace(
+        env,
+        knowledge_retriever=replace(
+            env.knowledge_retriever,
+            embedder=OpenAICompatibleEmbedder(
+                client=_ReportingEmbeddingsApi(), model="text-embedding-v4"
+            ),
+        ),
+    )
+    spec = _spec({"knowledge": {"knowledge_base_refs": ["kb"]}})
+
+    run = await _run(spec, brain, tool_env=env)
+
+    [row] = [r for r in run.rows if r.model == "text-embedding-v4"]
+    assert (row.provider, row.usage_kind) == ("qwen", PLATFORM_OVERHEAD_USAGE_KIND)
+    assert (row.input_tokens, row.output_tokens) == (9, 0)
+    assert (row.agent_name, row.agent_version) == ("ai-health-plan", "1.2.0")
+    assert (row.tenant_id, row.user_id) == (_TENANT, _USER)
+    assert row.trace_id == run.trace_id
+    assert run.budget.spent == 2 * (_PURPOSE_INPUT["main"] + 1) + 9
 
 
 @pytest.mark.asyncio

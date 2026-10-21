@@ -18,13 +18,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Final
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    DocumentPage,
     DocumentStatus,
     IngestErrorCode,
     IngestStage,
@@ -116,6 +117,20 @@ class ClaimedIngestion:
     #: worker makes (``replace_chunks`` / ``set_document_status`` /
     #: ``mark_document_failed_terminal``) passes it as the fence.
     generation: int
+
+
+#: B-209 §5.5 —— what a ``knowledge_parse_cache`` row holds: a scanned page's
+#: text (PR-1); a figure's description / text (reserved for PR-2).
+ParseCacheKind = Literal["page_ocr", "figure_desc", "figure_ocr"]
+
+
+@dataclass(frozen=True)
+class ParseCacheEntry:
+    """One cached model reading: the model that produced it and its cleaned
+    result (``{"text": …}`` for ``page_ocr``)."""
+
+    model: str
+    result: dict[str, Any]
 
 
 class DuplicateKnowledgeBaseError(Exception):
@@ -461,6 +476,53 @@ class KnowledgeStore(abc.ABC):
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         """Delete a document and cascade its chunks. ``False`` if no
         document matched."""
+
+    @abc.abstractmethod
+    async def set_document_pages(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        pages: Sequence[DocumentPage],
+        generation: int | None = None,
+    ) -> bool:
+        """B-209 §5.6 —— record a PDF ingest's per-page outcome: the page
+        records, their :class:`~expert_work.protocol.PageStats` and
+        ``page_count``. Written once recognition is done, before chunking — so
+        a document that then fails still shows which pages failed and why.
+        Fenced like :meth:`set_document_stage` when ``generation`` is given
+        (``False`` = no longer this worker's document)."""
+
+    @abc.abstractmethod
+    async def list_document_pages(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[DocumentPage] | None:
+        """The page records of the document's latest PDF ingest, in page
+        order; ``[]`` when none were recorded (not a PDF, or ingested before
+        page records existed); ``None`` when there is no such document."""
+
+    # -- recognition cache (B-209 §5.5) -------------------------------------
+
+    @abc.abstractmethod
+    async def get_parse_cache(
+        self, *, tenant_id: UUID, kind: ParseCacheKind, keys: Sequence[str]
+    ) -> dict[str, ParseCacheEntry]:
+        """The tenant's cached readings for ``keys`` (absent keys: not
+        cached). Never another tenant's (the cache is per tenant on purpose)."""
+
+    @abc.abstractmethod
+    async def put_parse_cache(
+        self,
+        *,
+        tenant_id: UUID,
+        kind: ParseCacheKind,
+        key: str,
+        model: str,
+        result: dict[str, Any],
+    ) -> None:
+        """Cache one reading. An existing entry for the key is kept (the same
+        image bytes, model, prompt version and render parameters read the
+        same; the first reading stands)."""
 
     # -- chunks -------------------------------------------------------------
 

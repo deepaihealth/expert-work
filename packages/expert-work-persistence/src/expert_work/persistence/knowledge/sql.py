@@ -42,6 +42,8 @@ from expert_work.persistence.knowledge.base import (
     DocumentFileFacts,
     DuplicateKnowledgeBaseError,
     KnowledgeStore,
+    ParseCacheEntry,
+    ParseCacheKind,
     _Unset,
 )
 from expert_work.persistence.knowledge.text_search import (
@@ -58,12 +60,14 @@ from expert_work.persistence.models import (
     KnowledgeChunkRow,
     KnowledgeDocSeqRow,
     KnowledgeDocumentRow,
+    KnowledgeParseCacheRow,
 )
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
     ChunkType,
+    DocumentPage,
     DocumentSourceType,
     DocumentStatus,
     IngestErrorCode,
@@ -72,6 +76,7 @@ from expert_work.protocol import (
     KnowledgeBaseKind,
     KnowledgeChunk,
     KnowledgeDocument,
+    PageStats,
     RetrievalMethod,
     ScoredChunk,
     chunk_retrieval_text,
@@ -209,6 +214,7 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         progress=row.progress,
         error_code=_enum_or(IngestErrorCode, row.error_code, IngestErrorCode.INTERNAL_ERROR),
         page_count=row.page_count,
+        page_stats=PageStats.model_validate(row.page_stats) if row.page_stats else None,
         size_bytes=row.size_bytes,
         mime=row.mime,
         created_at=row.created_at,
@@ -1221,6 +1227,90 @@ class SqlKnowledgeStore(KnowledgeStore):
             )
             await session.commit()
         return True
+
+    async def set_document_pages(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        pages: Sequence[DocumentPage],
+        generation: int | None = None,
+    ) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(KnowledgeDocumentRow)
+                .where(
+                    KnowledgeDocumentRow.tenant_id == tenant_id,
+                    KnowledgeDocumentRow.id == document_id,
+                    *_fence(generation),
+                )
+                .values(
+                    page_records=[page.model_dump(mode="json") for page in pages],
+                    page_stats=PageStats.of(pages).model_dump(mode="json"),
+                    page_count=len(pages),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def list_document_pages(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[DocumentPage] | None:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(KnowledgeDocumentRow.page_records).where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id == document_id,
+                    )
+                )
+            ).one_or_none()
+        if row is None:
+            return None
+        return [DocumentPage.model_validate(record) for record in row[0] or ()]
+
+    # -- recognition cache (B-209 §5.5) -------------------------------------
+
+    async def get_parse_cache(
+        self, *, tenant_id: UUID, kind: ParseCacheKind, keys: Sequence[str]
+    ) -> dict[str, ParseCacheEntry]:
+        if not keys:
+            return {}
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        KnowledgeParseCacheRow.cache_key,
+                        KnowledgeParseCacheRow.model,
+                        KnowledgeParseCacheRow.result,
+                    ).where(
+                        KnowledgeParseCacheRow.tenant_id == tenant_id,
+                        KnowledgeParseCacheRow.kind == kind,
+                        KnowledgeParseCacheRow.cache_key.in_(list(keys)),
+                    )
+                )
+            ).all()
+        return {
+            key: ParseCacheEntry(model=model, result=dict(result)) for key, model, result in rows
+        }
+
+    async def put_parse_cache(
+        self,
+        *,
+        tenant_id: UUID,
+        kind: ParseCacheKind,
+        key: str,
+        model: str,
+        result: dict[str, Any],
+    ) -> None:
+        async with self._sf() as session:
+            await session.execute(
+                pg_insert(KnowledgeParseCacheRow)
+                .values(tenant_id=tenant_id, kind=kind, cache_key=key, model=model, result=result)
+                .on_conflict_do_nothing(index_elements=["tenant_id", "kind", "cache_key"])
+            )
+            await session.commit()
 
     # -- chunks -------------------------------------------------------------
 

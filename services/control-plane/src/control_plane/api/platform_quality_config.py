@@ -74,7 +74,7 @@ def _is_chat_model(provider: str, model: str) -> bool:
     """True iff ``model`` is a chat-capable (non-embedding, non-rerank) model."""
     for entry in models_for_provider(provider):
         if entry.name == model:
-            return not entry.embeddings and not entry.rerank
+            return not entry.embeddings and not entry.rerank and not entry.ocr_only
     return False
 
 

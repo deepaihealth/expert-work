@@ -59,7 +59,10 @@ def build_model_catalog_router() -> APIRouter:
         rows = [
             {
                 "provider": p,
-                "models": [m.model_dump(mode="json") for m in models_for_provider(p)],
+                # B-209: a layout-parsing recognition model (glm-ocr) is no agent model.
+                "models": [
+                    m.model_dump(mode="json") for m in models_for_provider(p) if not m.ocr_only
+                ],
             }
             for p in PROVIDER_CATALOG
             if p in usable and models_for_provider(p)

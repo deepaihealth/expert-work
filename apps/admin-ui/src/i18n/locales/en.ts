@@ -561,6 +561,14 @@ export interface TranslationKeys {
     reingest: string;
     reingest_started: string;
     reingest_no_bytes: string;
+    pages_recognized: string;
+    pages_failed: string;
+    pages_pending: string;
+    pages_over_limit: string;
+    pages_hint: string;
+    recognize: string;
+    recognize_started: string;
+    recognize_nothing: string;
     upload_queue_unchanged: string;
     pending_previous_serving: string;
     pending_nothing_serving: string;
@@ -2262,6 +2270,26 @@ export interface TranslationKeys {
     judge_err_INVALID_JUDGE_PAIR: string;
     judge_err_JUDGE_PROVIDER_KEY_MISSING: string;
     judge_err_INVALID_JUDGE_MODEL: string;
+    recognition_heading: string;
+    recognition_help_title: string;
+    recognition_help_body: string;
+    recognition_default: string;
+    recognition_off: string;
+    recognition_ocr_label: string;
+    recognition_ocr_hint: string;
+    recognition_fallback_label: string;
+    recognition_fallback_hint: string;
+    recognition_figure_label: string;
+    recognition_figure_hint: string;
+    recognition_max_pages_label: string;
+    recognition_max_pages_hint: string;
+    recognition_save: string;
+    recognition_saved: string;
+    recognition_save_failed: string;
+    recognition_load_failed: string;
+    recognition_err_INVALID_RECOGNITION_PAIR: string;
+    recognition_err_RECOGNITION_PROVIDER_KEY_MISSING: string;
+    recognition_err_INVALID_RECOGNITION_MODEL: string;
     billing_heading: string;
     billing_help_title: string;
     billing_help_body: string;
@@ -3170,6 +3198,7 @@ export interface TranslationKeys {
     kind_skill_evolution: string;
     kind_memory_consolidation: string;
     kind_platform_overhead: string;
+    kind_knowledge_ingest: string;
     realtime: string;
     realtime_note: string;
     empty: string;
@@ -3881,6 +3910,14 @@ const en: TranslationKeys = {
     reingest_started: "Re-ingestion started.",
     reingest_no_bytes:
       "The original file was not retained for this document — please re-upload it.",
+    pages_recognized: "{{count}} pages recognized",
+    pages_failed: "{{count}} pages failed",
+    pages_pending: "{{count}} pages waiting",
+    pages_over_limit: "{{count}} pages over the limit",
+    pages_hint: "This PDF has scanned pages. Pages that failed or wait for recognition are not in the knowledge base yet; use Recognize.",
+    recognize: "Recognize",
+    recognize_started: "Recognition started: only the failed and waiting pages are sent to the model.",
+    recognize_nothing: "No page failed or waits for recognition.",
     upload_queue_unchanged: "Unchanged — not re-ingested",
     pending_previous_serving: "Previous version still in use",
     pending_nothing_serving: "New version pending, nothing in use yet",
@@ -5772,6 +5809,26 @@ const en: TranslationKeys = {
       "This provider has no configured key — add it under Providers above first.",
     judge_err_INVALID_JUDGE_MODEL:
       "That model can't be used as a judge (pick a chat model).",
+    recognition_heading: "Document recognition",
+    recognition_help_title: "What is document recognition?",
+    recognition_help_body: "When a knowledge base receives a scanned PDF (or one mixing scanned and text pages), these models read the scanned pages into text before it is indexed. Every tenant shares these settings; recognition is billed to the tenant that uploaded the document. Leaving a model empty switches it off: scanned pages are marked as waiting, and can be recognized later from the document list.",
+    recognition_default: "Platform defaults in effect",
+    recognition_off: "Off",
+    recognition_ocr_label: "Scanned-page recognition model",
+    recognition_ocr_hint: "Reads every scanned page first. Only models that can read scanned pages, from providers with a platform key, are listed.",
+    recognition_fallback_label: "Fallback recognition model",
+    recognition_fallback_hint: "Reads again any page the primary model could not read or read badly (empty, cut off, repeating); if it fails too, the page is marked as failed.",
+    recognition_figure_label: "Figure description model",
+    recognition_figure_hint: "Describes figures inside documents (diagrams, screenshots, charts). Must be a vision model that takes a prompt.",
+    recognition_max_pages_label: "Recognition page limit per document",
+    recognition_max_pages_hint: "At most this many scanned pages of one document are recognized; pages past it are marked as over the limit.",
+    recognition_save: "Save",
+    recognition_saved: "Document recognition settings saved.",
+    recognition_save_failed: "Save failed",
+    recognition_load_failed: "Failed to load document recognition settings",
+    recognition_err_INVALID_RECOGNITION_PAIR: "Provide both provider and model, or leave both empty to switch it off.",
+    recognition_err_RECOGNITION_PROVIDER_KEY_MISSING: "This provider has no configured key — add it under Credentials first.",
+    recognition_err_INVALID_RECOGNITION_MODEL: "That model can't be used here (pick one from the list).",
     billing_heading: "Cost rollup",
     billing_help_title: "What is cost rollup?",
     billing_help_body:
@@ -6786,6 +6843,7 @@ const en: TranslationKeys = {
     kind_skill_evolution: "Skill evolution",
     kind_memory_consolidation: "Memory consolidation",
     kind_platform_overhead: "Platform overhead (not billed)",
+    kind_knowledge_ingest: "Knowledge ingest",
     realtime: "Realtime",
     realtime_note:
       "Live current-month counters; billed cost above lags by up to an hour.",

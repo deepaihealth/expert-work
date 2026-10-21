@@ -16,7 +16,9 @@ maps to the same vector — so memory tests need no network.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
@@ -57,6 +59,31 @@ _ERROR_BODY_LIMIT = 500
 #: text-embedding-v4 documents 8,192). Chunks sit well inside it; this is the
 #: last guard — for a long query, or a chunk size set past the model's limit.
 DEFAULT_MAX_INPUT_BYTES = 8000
+
+#: B-209 §5.8 —— 嵌入用量的接收方:``(model, 厂商返回的 usage)``。调用方在一段 asyncio 上下文里
+#: 设上它(知识库入库记租户的 ``knowledge_ingest``;检索时 run 内的查询嵌入记
+#: ``platform_overhead``),这段时间里每次嵌入请求的用量都交给它。没设时什么都不做。
+EmbeddingUsageSink = Callable[[str, Mapping[str, Any]], None]
+_EMBEDDING_USAGE_SINK: ContextVar[EmbeddingUsageSink | None] = ContextVar(
+    "expert_work_embedding_usage_sink", default=None
+)
+
+
+@contextmanager
+def embedding_usage_sink(sink: EmbeddingUsageSink) -> Iterator[None]:
+    """Hand every embeddings response's ``usage`` made inside the block to ``sink``."""
+    token = _EMBEDDING_USAGE_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _EMBEDDING_USAGE_SINK.reset(token)
+
+
+def _report_usage(model: str, body: Mapping[str, Any]) -> None:
+    sink = _EMBEDDING_USAGE_SINK.get()
+    usage = body.get("usage")
+    if sink is not None and isinstance(usage, Mapping):
+        sink(model, usage)
 
 
 @runtime_checkable
@@ -241,6 +268,7 @@ class OpenAICompatibleEmbedder:
         for start in range(0, len(items), self.max_batch_size):
             batch = items[start : start + self.max_batch_size]
             body = await self.client.embeddings(model=self.model, texts=batch, fields=fields)
+            _report_usage(self.model, body)
             # ``index`` is per-request (0-based within this batch); sort then
             # append so vectors stay aligned to inputs across batches.
             rows = sorted(body["data"], key=lambda row: row["index"])

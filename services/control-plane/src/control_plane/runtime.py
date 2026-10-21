@@ -1164,6 +1164,22 @@ class ResolvingEmbedder:
         return await delegate.embed(texts, tenant_id=tenant_id)
 
 
+@dataclass(frozen=True)
+class ResolvingProviderKeys:
+    """B-209 —— 知识库扫描页识别调用的厂商密钥:与嵌入同一套解析(按上传文档的租户解析凭据
+    引用,再读密钥值,走进程内缓存)。没有凭据时抛错 —— 识别器把这一页记「待识别」。"""
+
+    resolver: CredentialsResolver
+    secret_store: SecretStore
+    secret_cache: CredentialValueCache | None = None
+
+    async def __call__(self, *, tenant_id: UUID, provider: str) -> str:
+        secret_ref = await self.resolver.resolve_provider(
+            tenant_id=tenant_id, provider=cast(Provider, provider)
+        )
+        return await _cached_secret(self.secret_cache, self.secret_store, tenant_id, secret_ref)
+
+
 def _is_dashscope_rerank_model(provider: str, model: str) -> bool:
     """DashScope (``qwen``) dedicated rerank models (``qwen3-vl-rerank``,
     ``gte-rerank``, ``text-rerank-*``) are NOT served over the OpenAI-compat

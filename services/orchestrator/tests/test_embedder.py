@@ -18,6 +18,7 @@ from orchestrator.llm import (
     FakeEmbedder,
     HTTPEmbeddingClient,
     OpenAICompatibleEmbedder,
+    embedding_usage_sink,
 )
 from orchestrator.llm.embedder import (
     NO_MARKER,
@@ -381,3 +382,39 @@ def test_batch_size_comes_from_the_catalog(provider: str, name: str, batch: int)
 def test_batch_size_defaults_without_a_declared_one() -> None:
     assert catalog_batch_size(None) == 10
     assert catalog_batch_size(EmbeddingCaps(asymmetry="none")) == 10
+
+
+# ---------------------------------------------------------------------------
+# B-209 §5.8 — embedding usage reaches the caller's sink
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _UsageReportingClient:
+    """EmbeddingClient stub that reports ``usage`` like the vendors do."""
+
+    calls: int = 0
+
+    async def embeddings(
+        self, *, model: str, texts: Sequence[str], fields: Mapping[str, str] | None = None
+    ) -> Mapping[str, Any]:
+        del model, fields
+        self.calls += 1
+        return {
+            "data": [{"index": i, "embedding": [0.5]} for i in range(len(texts))],
+            "usage": {"prompt_tokens": 3 * len(texts), "total_tokens": 3 * len(texts)},
+        }
+
+
+@pytest.mark.asyncio
+async def test_each_request_usage_goes_to_the_sink() -> None:
+    client = _UsageReportingClient()
+    embedder = OpenAICompatibleEmbedder(client=client, model="text-embedding-v4", max_batch_size=2)
+    seen: list[tuple[str, int]] = []
+    with embedding_usage_sink(lambda model, usage: seen.append((model, usage["prompt_tokens"]))):
+        await embedder.embed(["a", "b", "c"], tenant_id=uuid4())
+    assert client.calls == 2
+    assert seen == [("text-embedding-v4", 6), ("text-embedding-v4", 3)]
+    # Outside the block nothing is reported (and nothing breaks).
+    await embedder.embed(["d"], tenant_id=uuid4())
+    assert len(seen) == 2

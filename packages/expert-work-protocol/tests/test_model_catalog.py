@@ -11,7 +11,7 @@ from expert_work.protocol import (
     catalog_entry,
     models_for_provider,
 )
-from expert_work.protocol.model_catalog import EmbeddingCaps, RerankCaps
+from expert_work.protocol.model_catalog import EmbeddingCaps, OcrCaps, RerankCaps
 from expert_work.protocol.provider_catalog import PROVIDER_CATALOG
 
 
@@ -391,6 +391,8 @@ def test_thinking_cap_only_on_qwen_thinking_models() -> None:
         "qwen3-max",
         "qwen3-vl-plus",
         "qwen3-vl-flash",
+        "qwen3.7-flash",
+        "qwen3.8-flash",
     }
     from expert_work.protocol.model_catalog import MODEL_CATALOG
 
@@ -621,3 +623,44 @@ def test_no_embedding_model_needs_a_native_endpoint_yet() -> None:
     for provider, entry in _flagged("embeddings"):
         assert entry.embedding_caps is not None
         assert entry.embedding_caps.native_endpoint is None, f"{provider}/{entry.name}"
+
+
+# ---------------------------------------------------------------------------
+# B-209 — scanned-page recognition capabilities / B-210 — retired qwen3-vl-flash
+# ---------------------------------------------------------------------------
+
+
+def test_recognition_models_declare_ocr_caps() -> None:
+    """B-209 §4 / §5.7: glm-ocr (default, layout-parsing API, concurrency 2) and
+    the two in-sale qwen flash vision models (fallback / figures, OpenAI-compatible
+    vision chat with an 8,192-token output cap)."""
+    assert _e("glm", "glm-ocr").ocr_caps == OcrCaps(api="layout_parsing", max_concurrency=2)
+    for name in ("qwen3.7-flash", "qwen3.8-flash"):
+        entry = _e("qwen", name)
+        assert entry.vision is True
+        assert entry.ocr_caps == OcrCaps(api="chat_vlm", max_output_tokens=8_192)
+        # Thinking can be switched off (recognition runs with it off).
+        assert entry.thinking == "budget"
+
+
+def test_layout_parsing_model_is_not_a_chat_model() -> None:
+    assert _e("glm", "glm-ocr").ocr_only is True
+    assert _e("glm", "glm-ocr").vision is False
+    assert _e("qwen", "qwen3.7-flash").ocr_only is False
+    assert ModelEntry(name="x").ocr_only is False
+
+
+def test_chat_vlm_ocr_caps_need_vision() -> None:
+    with pytest.raises(ValidationError, match="ocr_caps api='chat_vlm' needs vision=True"):
+        ModelEntry(name="text-only", ocr_caps=OcrCaps(api="chat_vlm"))
+    # A layout-parsing model reads images without being a vision chat model.
+    ModelEntry(name="ocr", ocr_caps=OcrCaps(api="layout_parsing"))
+    ModelEntry(name="vlm", vision=True, ocr_caps=OcrCaps(api="chat_vlm"))
+
+
+def test_retired_qwen3_vl_flash_is_deprecated_but_resolvable() -> None:
+    # B-210: the vendor answers 404 model_not_found; kept so saved configs resolve.
+    entry = _e("qwen", "qwen3-vl-flash")
+    assert entry.deprecated is True
+    assert "qwen3-vl-flash" not in {e.name for e in models_for_provider("qwen")}
+    assert {"qwen3.7-flash", "qwen3.8-flash"} <= {e.name for e in models_for_provider("qwen")}

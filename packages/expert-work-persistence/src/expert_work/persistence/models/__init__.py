@@ -29,6 +29,7 @@ from expert_work.persistence.models.knowledge import (
     KnowledgeDocSeqRow,
     KnowledgeDocumentRow,
     KnowledgeDocumentTagRow,
+    KnowledgeParseCacheRow,
     KnowledgeTagRow,
     KnowledgeTaskRow,
 )
@@ -58,6 +59,9 @@ from expert_work.persistence.models.platform_judge_config import (
 )
 from expert_work.persistence.models.platform_quality_config import (
     PlatformQualityConfigRow,
+)
+from expert_work.persistence.models.platform_recognition_config import (
+    PlatformRecognitionConfigRow,
 )
 from expert_work.persistence.models.platform_secret import (
     PlatformProviderSecretRow,
@@ -133,6 +137,7 @@ __all__ = [
     "KnowledgeDocSeqRow",
     "KnowledgeDocumentRow",
     "KnowledgeDocumentTagRow",
+    "KnowledgeParseCacheRow",
     "KnowledgeTagRow",
     "KnowledgeTaskRow",
     "McpConnectorCatalogRow",
@@ -149,6 +154,7 @@ __all__ = [
     "PlatformJudgeConfigRow",
     "PlatformProviderSecretRow",
     "PlatformQualityConfigRow",
+    "PlatformRecognitionConfigRow",
     "PlatformToolBudgetConfigRow",
     "PlatformToolSecretRow",
     "QualityDriftAlertRow",

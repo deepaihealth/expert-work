@@ -27,6 +27,8 @@ from control_plane.knowledge.ingestion import (
     ingest_document_bytes,
     renew_lease_periodically,
 )
+from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
+from control_plane.knowledge.usage import IngestUsageRecorder
 from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
@@ -68,12 +70,16 @@ class KnowledgeIngestRecoveryWorker:
         concurrency: int,
         lease_seconds: int,
         max_attempts: int,
+        recognizer: DocumentRecognizer | None = None,
+        usage: IngestUsageRecorder | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
             raise ValueError(msg)
         self._store = store
         self._embedder = embedder
+        self._recognizer = recognizer
+        self._usage = usage
         self._interval_s = interval_s
         # One cycle claims at most ``concurrency`` documents and drives them
         # all at once — never more claims than can be worked, so no lease
@@ -196,6 +202,8 @@ class KnowledgeIngestRecoveryWorker:
                 chunk_max_tokens=claim.chunk_max_tokens,
                 chunk_overlap_tokens=claim.chunk_overlap_tokens,
                 generation=claim.generation,
+                recognizer=self._recognizer,
+                usage=self._usage,
             )
             settled = await self._store.set_document_status(
                 tenant_id=claim.tenant_id,

@@ -85,6 +85,7 @@ from control_plane.api import (
     build_platform_embedding_config_router,
     build_platform_judge_config_router,
     build_platform_quality_config_router,
+    build_platform_recognition_config_router,
     build_platform_skills_router,
     build_platform_tool_budget_config_router,
     build_quality_router,
@@ -162,7 +163,9 @@ from control_plane.keycloak import (
     ServiceAccountTokenProvider,
 )
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
+from control_plane.knowledge.recognition.recognizer import DocumentRecognizer, default_client
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
+from control_plane.knowledge.usage import IngestUsageRecorder
 from control_plane.manifest import ManifestLoader
 from control_plane.mcp_oauth import default_http_client
 from control_plane.mcp_oauth_refresh import McpOAuthRefresher
@@ -205,6 +208,7 @@ from control_plane.platform_embedding_config import PlatformEmbeddingConfigServi
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolService
 from control_plane.platform_quality_config import PlatformQualityConfigService
+from control_plane.platform_recognition_config import PlatformRecognitionConfigService
 from control_plane.platform_secrets import PlatformSecretsService
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
 from control_plane.quality_drift_worker import QualityDriftWorker
@@ -226,6 +230,7 @@ from control_plane.runtime import (
     AgentRuntime,
     DynamicResolvingEmbedder,
     DynamicResolvingReranker,
+    ResolvingProviderKeys,
     _build_mcp_client,
     _resolve_template_extends,
     build_mcp_pool,
@@ -406,6 +411,11 @@ from expert_work.persistence.platform_quality_config import (
     InMemoryPlatformQualityConfigStore,
     PlatformQualityConfigStore,
     SqlPlatformQualityConfigStore,
+)
+from expert_work.persistence.platform_recognition_config import (
+    InMemoryPlatformRecognitionConfigStore,
+    PlatformRecognitionConfigStore,
+    SqlPlatformRecognitionConfigStore,
 )
 from expert_work.persistence.platform_secrets import (
     InMemoryPlatformSecretStore,
@@ -999,6 +1009,15 @@ def create_app(
     # Stream 12.4 — platform billing-rollup toggle, read by the offline rollup job.
     resolved_platform_billing_config_store: PlatformBillingConfigStore = (
         sql_stores.platform_billing_config if sql_stores else InMemoryPlatformBillingConfigStore()
+    )
+    # B-209 — platform 「文档识别」 config, read per knowledge ingest.
+    resolved_platform_recognition_config_service = PlatformRecognitionConfigService(
+        store=(
+            sql_stores.platform_recognition_config
+            if sql_stores
+            else InMemoryPlatformRecognitionConfigStore()
+        ),
+        ttl_seconds=float(resolved_settings.tenant_config_cache_ttl_s),
     )
     resolved_platform_judge_config_service = PlatformJudgeConfigService(
         store=resolved_platform_judge_config_store,
@@ -2053,12 +2072,29 @@ def create_app(
                     workers=resolved_settings.knowledge_parse_workers,
                     timeout_s=resolved_settings.knowledge_parse_timeout_s,
                 )
+                # B-209 — scanned PDF pages are read by the platform's
+                # recognition models; recognition and ingest embeddings are
+                # billed to the uploading tenant (``knowledge_ingest``).
+                ingest_usage = IngestUsageRecorder(resolved_token_usage)
+                document_recognizer = DocumentRecognizer(
+                    store=resolved_knowledge_store,
+                    settings=resolved_platform_recognition_config_service,
+                    api_keys=ResolvingProviderKeys(
+                        resolver=credentials_resolver,
+                        secret_store=resolved_secret_store,
+                        secret_cache=credential_value_cache,
+                    ),
+                    usage=ingest_usage,
+                    client_factory=default_client(shared_http),
+                )
                 _app.state.knowledge_ingestion_runner = KnowledgeIngestionRunner(
                     store=resolved_knowledge_store,
                     embedder=embedder,
                     lease_seconds=resolved_settings.knowledge_ingest_lease_s,
                     max_attempts=resolved_settings.knowledge_ingest_max_attempts,
                     concurrency=resolved_settings.knowledge_ingest_concurrency,
+                    recognizer=document_recognizer,
+                    usage=ingest_usage,
                 )
                 # Stream KB — durable crash recovery for ingestion: claims stuck
                 # documents (pending / lease-expired processing) and re-drives
@@ -2071,6 +2107,8 @@ def create_app(
                         concurrency=resolved_settings.knowledge_ingest_concurrency,
                         lease_seconds=resolved_settings.knowledge_ingest_lease_s,
                         max_attempts=resolved_settings.knowledge_ingest_max_attempts,
+                        recognizer=document_recognizer,
+                        usage=ingest_usage,
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker
@@ -2589,6 +2627,7 @@ def create_app(
     # app.state to upsert the row + invalidate the cache for immediate effect.
     app.state.platform_embedding_config_service = resolved_platform_embedding_config_service
     app.state.platform_judge_config_service = resolved_platform_judge_config_service
+    app.state.platform_recognition_config_service = resolved_platform_recognition_config_service
     app.state.platform_tool_budget_config_service = resolved_platform_tool_budget_config_service
     app.state.platform_delegation_config_service = resolved_platform_delegation_config_service
     app.state.platform_dynamic_worker_config_service = (
@@ -2825,6 +2864,7 @@ def create_app(
     app.include_router(build_platform_config_router())
     app.include_router(build_platform_embedding_config_router())
     app.include_router(build_platform_judge_config_router())
+    app.include_router(build_platform_recognition_config_router())
     app.include_router(build_platform_tool_budget_config_router())
     app.include_router(build_platform_delegation_config_router())
     app.include_router(build_platform_dynamic_worker_config_router())
@@ -2927,6 +2967,7 @@ class _SqlStores:
     platform_secret: PlatformSecretStore
     platform_embedding_config: PlatformEmbeddingConfigStore  # Stream T (PR B)
     platform_judge_config: PlatformJudgeConfigStore  # Stream PI-3-A1
+    platform_recognition_config: PlatformRecognitionConfigStore  # B-209
     platform_tool_budget_config: PlatformToolBudgetConfigStore  # Phase 3
     platform_delegation_config: PlatformDelegationConfigStore  # perf phase2 PR3
     platform_dynamic_worker_config: PlatformDynamicWorkerConfigStore  # B3 PR2
@@ -3156,6 +3197,7 @@ def _build_sql_stores(settings: Settings) -> _SqlStores:
         platform_secret=SqlPlatformSecretStore(session_factory),
         platform_embedding_config=SqlPlatformEmbeddingConfigStore(session_factory),
         platform_judge_config=SqlPlatformJudgeConfigStore(session_factory),
+        platform_recognition_config=SqlPlatformRecognitionConfigStore(session_factory),
         platform_tool_budget_config=SqlPlatformToolBudgetConfigStore(session_factory),
         platform_delegation_config=SqlPlatformDelegationConfigStore(session_factory),
         platform_dynamic_worker_config=SqlPlatformDynamicWorkerConfigStore(session_factory),

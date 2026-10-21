@@ -561,6 +561,7 @@ async def test_build_baked_config_handlers_drop_config_and_all_builds(kind: str,
         ("platform_dynamic_worker", "platform_dynamic_worker_config_service"),
         ("platform_delegation", "platform_delegation_config_service"),
         ("platform_quality", "quality_config_service"),
+        ("platform_recognition", "platform_recognition_config_service"),
     ],
 )
 async def test_read_at_use_config_handlers_do_not_touch_builds(kind: str, attr: str) -> None:
