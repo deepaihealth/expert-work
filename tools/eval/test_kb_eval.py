@@ -1254,6 +1254,71 @@ def test_main_refuses_baseline_with_rerank_threshold(
     assert not (tmp_path / "b.yaml").exists()
 
 
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        ((), ("single", 100, False)),
+        (
+            ("--rerank-view", "dual", "--rerank-pool", "50", "--rerank-instruct"),
+            ("dual", 50, True),
+        ),
+        (("--rerank-view", "single_clean"), ("single_clean", 100, False)),
+    ],
+)
+def test_main_rerank_arm_flags_reach_the_retriever_and_are_recorded(
+    tmp_path: Path,
+    dataset_path: Path,
+    corpus: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    flags: tuple[str, ...],
+    expected: tuple[str, int, bool],
+) -> None:
+    """B-206 K-14 A/B: ``--rerank-view`` / ``--rerank-pool`` / ``--rerank-instruct`` set the
+    product retriever's own knobs (no flag = the product default), and the run records them."""
+    built: list[KnowledgeRetriever] = []
+
+    def _spy(**kwargs: Any) -> KnowledgeRetriever:
+        retriever = cast(KnowledgeRetriever, build_retriever(**kwargs))
+        built.append(retriever)
+        return retriever
+
+    monkeypatch.setattr("kb_eval.build_retriever", _spy)
+    _manifest, root = corpus
+    out = tmp_path / "unit.jsonl"
+    argv = _cli(dataset_path, root, out, tmp_path / "b.yaml", "--limit-docs", "1", *flags)
+    assert main(argv) == 0
+    (retriever,) = built
+    assert (retriever.rerank_view, retriever.rerank_pool, retriever.rerank_instruction) == expected
+    config = json.loads(out.read_text(encoding="utf-8").splitlines()[-1])["summary"]["config"]
+    recorded = (config["rerank_view"], config["rerank_pool"], config["rerank_instruct"])
+    assert recorded == expected
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [("--rerank-view", "dual"), ("--rerank-pool", "50"), ("--rerank-instruct",)],
+)
+def test_main_refuses_baseline_for_a_non_default_rerank_arm(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path], flags: tuple[str, ...]
+) -> None:
+    _manifest, root = corpus
+    argv = _cli(
+        dataset_path, root, tmp_path / "unit.jsonl", tmp_path / "b.yaml", "--update-baseline"
+    )
+    with pytest.raises(SystemExit, match="refusing to update baseline with a K-14 arm"):
+        main([*argv, *flags])
+    assert not (tmp_path / "b.yaml").exists()
+
+
+def test_main_rerank_pool_must_be_positive(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
+) -> None:
+    _manifest, root = corpus
+    argv = _cli(dataset_path, root, tmp_path / "unit.jsonl", tmp_path / "b.yaml")
+    with pytest.raises(SystemExit, match="--rerank-pool"):
+        main([*argv, "--rerank-pool", "0"])
+
+
 def test_main_real_embedder_needs_env(
     tmp_path: Path,
     dataset_path: Path,

@@ -4,7 +4,8 @@
 ``--rerank on`` 走聊天模型排序(``LLMReranker``),量的不是生产那条路。这里用生产同一个
 ``DashScopeReranker`` / ``HTTPDashScopeRerankClient``,外面套一层 sqlite 缓存:
 
-* 键 = (模型, 查询, 候选全文按序, ``top_n``) 的 sha256 —— 任一变化都是新请求,候选顺序变了也算;
+* 键 = (模型, 查询, 候选全文按序, ``top_n``, 有就带任务说明) 的 sha256 —— 任一变化都是新请求,
+  候选顺序变了也算(B-206 K-14 各对照组的送审文本 / 候选数 / 任务说明不同,不会互相串分数);
 * 值 = 接口返回的整个 JSON;复跑同样的候选不再花钱,结果也逐条一致(评测可复现,见 #1811);
 * 密钥为 :data:`OFFLINE_KEY` 时不建网络客户端,缓存没命中直接 :class:`RerankCacheMissError`
   —— 与嵌入缓存的零成本复跑同一个约定。检索器把重排出错降级成融合序(PR3),``kb_eval``
@@ -60,10 +61,18 @@ class CachedRerankClient:
             )
 
     async def rerank(
-        self, *, model: str, query: str, documents: Sequence[str], top_n: int
+        self,
+        *,
+        model: str,
+        query: str,
+        documents: Sequence[str],
+        top_n: int,
+        instruction: str | None = None,
     ) -> Mapping[str, Any]:
         self._calls += 1
-        key = _cache_key(model=model, query=query, documents=documents, top_n=top_n)
+        key = _cache_key(
+            model=model, query=query, documents=documents, top_n=top_n, instruction=instruction
+        )
         with sqlite3.connect(self.path) as conn:
             row = conn.execute("SELECT body FROM rerank_cache WHERE key = ?", (key,)).fetchone()
         if row is not None:
@@ -73,7 +82,10 @@ class CachedRerankClient:
         if self.inner is None:
             msg = f"rerank cache miss in offline mode (model={model!r}, query={query[:40]!r})"
             raise RerankCacheMissError(msg)
-        body = await self.inner.rerank(model=model, query=query, documents=documents, top_n=top_n)
+        extra: dict[str, Any] = {} if instruction is None else {"instruction": instruction}
+        body = await self.inner.rerank(
+            model=model, query=query, documents=documents, top_n=top_n, **extra
+        )
         usage = body.get("usage")
         if isinstance(usage, Mapping) and isinstance(usage.get("total_tokens"), int):
             self._tokens += usage["total_tokens"]
@@ -93,12 +105,19 @@ class CachedRerankClient:
         }
 
 
-def _cache_key(*, model: str, query: str, documents: Sequence[str], top_n: int) -> str:
-    payload = json.dumps(
-        {"model": model, "query": query, "documents": list(documents), "top_n": top_n},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+def _cache_key(
+    *, model: str, query: str, documents: Sequence[str], top_n: int, instruction: str | None
+) -> str:
+    fields: dict[str, Any] = {
+        "model": model,
+        "query": query,
+        "documents": list(documents),
+        "top_n": top_n,
+    }
+    if instruction is not None:
+        # 不带任务说明的请求键与 K-14 之前逐字相同:旧缓存照样命中。
+        fields["instruction"] = instruction
+    payload = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

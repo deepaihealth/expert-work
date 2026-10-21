@@ -44,6 +44,7 @@ from orchestrator.multimodal import (
     ObjectStoreImageResolver,
 )
 from orchestrator.tools import KnowledgeRetriever
+from orchestrator.tools.knowledge import DEFAULT_RERANK_POOL, DEFAULT_RERANK_VIEW
 
 _MINIMAL_MANIFEST: dict[str, Any] = {
     "apiVersion": "expert_work.io/v1",
@@ -152,6 +153,13 @@ def test_make_knowledge_retriever_builds_with_embedder() -> None:
         store=InMemoryKnowledgeStore(), embedder=FakeEmbedder(), reranker=None
     )
     assert isinstance(retriever, KnowledgeRetriever)
+    # B-206 K-14 — the one retriever both ``knowledge_search`` and the console's
+    # retrieval test use carries the product rerank defaults.
+    assert (retriever.rerank_view, retriever.rerank_pool, retriever.rerank_instruction) == (
+        DEFAULT_RERANK_VIEW,
+        DEFAULT_RERANK_POOL,
+        False,
+    )
 
 
 def test_make_image_resolver_builds_object_store_resolver() -> None:

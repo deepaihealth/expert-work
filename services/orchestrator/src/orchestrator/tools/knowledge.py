@@ -40,6 +40,7 @@ from expert_work.protocol import (
 )
 from orchestrator.tools.error_classifier import GuidedToolError
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.rerank_passage import rerank_passage
 
 if TYPE_CHECKING:
     # Imported under TYPE_CHECKING only — a runtime import of
@@ -53,8 +54,9 @@ logger = logging.getLogger(__name__)
 #: top-k so fusion and the reranker have candidates to work with.
 _RECALL_DEPTH_FACTOR = 2
 _MIN_RECALL_DEPTH = 50
-#: ``qwen3-vl-rerank`` takes at most 100 documents per request: the ceiling of
-#: the default recall depth and a hard cap on rerank candidates.
+#: The ceiling of the default recall depth (``qwen3-vl-rerank`` takes at most
+#: 100 documents per request). A model's own per-request cap is applied by its
+#: reranker, from the model catalog (B-206 K-14).
 _MAX_RERANK_CANDIDATES = 100
 #: Each candidate is truncated to this many characters in the rerank
 #: prompt — enough to judge relevance without an enormous prompt.
@@ -71,6 +73,26 @@ _MAX_LIMIT = 20
 #: they bury the passage that carries the code.
 _TITLED_VIEW_WEIGHT = 0.7
 _BODY_VIEW_DEPTH = 20
+
+#: B-206 K-14 — how a search's candidates are put to the reranker:
+#: ``dual`` the two views above (B-175 wave 2 PR2b); ``single`` each candidate
+#: once, as one structured text (:func:`~orchestrator.tools.rerank_passage.rerank_passage`:
+#: title, section, body); ``single_clean`` the same with the body's Markdown /
+#: URLs / table rules / HTML stripped first. Two views weighted together have no
+#: outside precedent; Cohere, Onyx and Qwen3-Reranker all judge one string.
+RerankView = Literal["dual", "single", "single_clean"]
+RERANK_VIEWS: tuple[RerankView, ...] = ("dual", "single", "single_clean")
+DEFAULT_RERANK_VIEW: RerankView = "single"
+#: How many of the fused candidates the reranker judges (K-14: up from the
+#: 50-deep recall — the 2026-10-21 replay found every correct document that fell
+#: out of the fused top 50 within the top 100).
+DEFAULT_RERANK_POOL = 100
+#: The task a single view states to a reranker whose model takes an instruction
+#: (English, as the vendors advise). Off by default (``KnowledgeRetriever.rerank_instruction``).
+RERANK_INSTRUCTION = (
+    "Given a question, judge whether the passage content itself states the answer; "
+    "the title only identifies the document"
+)
 
 #: B-175 wave 2 PR3 — what the model is told about a knowledge result. Results
 #: are the closest passages, which are often on topic without stating the fact
@@ -154,10 +176,20 @@ class Reranker(Protocol):
 
 @runtime_checkable
 class ScoredReranker(Protocol):
-    """A :class:`Reranker` that can also say how relevant each document is."""
+    """A :class:`Reranker` that can also say how relevant each document is.
+
+    ``instruction`` (B-206 K-14) is a task statement for a model that takes one;
+    a reranker whose model takes none ignores it. Callers pass it only when they
+    have one, so a scoring reranker written before it existed keeps working."""
 
     async def rerank_scored(
-        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+        self,
+        *,
+        query: str,
+        documents: Sequence[str],
+        top_k: int,
+        tenant_id: UUID,
+        instruction: str | None = None,
     ) -> list[tuple[int, float | None]]:
         """Like :meth:`Reranker.rerank`, each index paired with its relevance
         score: ``None`` throughout when the backend ranks without scoring (a
@@ -185,9 +217,9 @@ class RetrievedChunk:
 
     ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
     The agent sees (and the eval matches against) :attr:`retrieval_text`, the
-    two joined, under a ``[filename#index]`` header. The reranker ranks the
-    stored chunk's own retrieval text, which also carries the document title
-    — here it would only repeat the header.
+    two joined, under a ``[filename#index]`` header. The reranker judges a
+    text built from the stored chunk (see :data:`RerankView`), which also
+    carries the document title — here it would only repeat the header.
     """
 
     content: str
@@ -311,6 +343,12 @@ class KnowledgeRetriever:
     derives it per call (:func:`default_recall_depth`). ``vector_weight`` /
     ``keyword_weight`` weight the two paths in the fusion; equal weights
     give plain RRF.
+
+    B-206 K-14 — internal knobs, not tenant settings (the eval sets them for
+    A/B arms): ``rerank_view`` how candidates are put to the reranker
+    (:data:`RerankView`), ``rerank_pool`` how many of the fused candidates it
+    judges, ``rerank_instruction`` whether a single view sends
+    :data:`RERANK_INSTRUCTION`.
     """
 
     store: KnowledgeStore
@@ -319,6 +357,9 @@ class KnowledgeRetriever:
     recall_limit: int | None = None
     vector_weight: float = 1.0
     keyword_weight: float = 1.0
+    rerank_view: RerankView = DEFAULT_RERANK_VIEW
+    rerank_pool: int = DEFAULT_RERANK_POOL
+    rerank_instruction: bool = False
 
     def recall_depth(self, limit: int) -> int:
         """Per-path recall depth for a ``limit``-result search."""
@@ -522,22 +563,12 @@ class KnowledgeRetriever:
     ) -> _Reranked:
         if self.reranker is None or not enabled:
             return _Reranked(chunks=fused[:limit], scores={})
-        # Capped after fusion: several bases (and an explicit recall_limit) can
-        # fuse into more than one rerank request takes.
-        candidates = fused[: min(self.recall_depth(limit), _MAX_RERANK_CANDIDATES)]
+        # Cut after fusion: several bases (and an explicit recall_limit) can fuse
+        # into more than the pool; a reranker whose model takes fewer per request
+        # keeps the leading ones.
+        candidates = fused[: self.rerank_pool]
         try:
-            if isinstance(self.reranker, ScoredReranker):
-                ranked = await _two_view_order(
-                    self.reranker, query, candidates, limit, tenant_id=tenant_id
-                )
-            else:
-                order = await self.reranker.rerank(
-                    query=query,
-                    documents=rerank_documents(chunk.retrieval_text for chunk in candidates),
-                    top_k=limit,
-                    tenant_id=tenant_id,
-                )
-                ranked = [(index, None) for index in order]
+            ranked = await self._order(self.reranker, query, candidates, limit, tenant_id=tenant_id)
         except Exception:
             # Rerank is an optional quality pass (B-175 wave 2 PR3): a vendor
             # error used to surface as a tool error / console 500.
@@ -552,6 +583,44 @@ class KnowledgeRetriever:
             chunks=[candidates[i] for i, _score in ranked],
             scores={candidates[i].id: score for i, score in ranked if score is not None},
         )
+
+    async def _order(
+        self,
+        reranker: Reranker,
+        query: str,
+        candidates: Sequence[KnowledgeChunk],
+        limit: int,
+        *,
+        tenant_id: UUID,
+    ) -> list[tuple[int, float | None]]:
+        """``candidates`` best first as ``(index, score)``, judged per
+        :attr:`rerank_view`; a reranker that cannot score ranks the best ``limit``."""
+        if self.rerank_view == "dual":
+            if isinstance(reranker, ScoredReranker):
+                return await _two_view_order(
+                    reranker, query, candidates, limit, tenant_id=tenant_id
+                )
+            texts = [chunk.retrieval_text for chunk in candidates]
+        else:
+            clean = self.rerank_view == "single_clean"
+            texts = [rerank_passage(chunk, clean=clean) for chunk in candidates]
+        documents = rerank_documents(texts)
+        if isinstance(reranker, ScoredReranker):
+            # Every candidate is ranked, so a threshold can still fill ``limit``.
+            extra: dict[str, Any] = (
+                {"instruction": RERANK_INSTRUCTION} if self.rerank_instruction else {}
+            )
+            return await reranker.rerank_scored(
+                query=query,
+                documents=documents,
+                top_k=len(documents),
+                tenant_id=tenant_id,
+                **extra,
+            )
+        order = await reranker.rerank(
+            query=query, documents=documents, top_k=limit, tenant_id=tenant_id
+        )
+        return [(index, None) for index in order]
 
     async def _attribute(
         self,
