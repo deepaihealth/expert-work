@@ -554,6 +554,45 @@ async def _client_with_reranker(reranker: Any) -> AsyncIterator[AsyncClient]:
         yield client
 
 
+class _QueryEmbedFailingEmbedder(FakeEmbedder):
+    """Ingests fine; every search query fails to embed (B-206 K-8)."""
+
+    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        raise RuntimeError("embeddings request failed: 503")
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_reports_a_failed_query_embedding() -> None:
+    """The hit-test shows keyword results and says the vector path was skipped,
+    instead of passing them off as a hybrid search."""
+    store = InMemoryKnowledgeStore()
+    embedder = _QueryEmbedFailingEmbedder()
+    runner = KnowledgeIngestionRunner(store=store, embedder=embedder)
+    app = create_app(
+        settings=_settings(),
+        knowledge_repo=store,
+        knowledge_ingestion_runner=runner,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    app.state.knowledge_retriever = KnowledgeRetriever(store=store, embedder=embedder)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://cp.test", headers=_headers()
+    ) as client:
+        await client.post("/v1/knowledge/bases", json={"name": "kb"})
+        await client.post(
+            "/v1/knowledge/bases/kb/documents",
+            files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
+        )
+        await runner.drain()
+        resp = await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["embedding_degraded"] is True
+    assert body["count"] >= 1
+    assert {r["recall_source"] for r in body["results"]} == {"keyword"}
+
+
 @pytest.mark.asyncio
 async def test_retrieval_test_survives_a_failing_reranker() -> None:
     """A rerank vendor error used to be an unhandled 500 on the hit-test."""

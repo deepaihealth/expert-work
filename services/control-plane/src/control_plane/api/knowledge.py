@@ -915,6 +915,8 @@ def build_knowledge_router() -> APIRouter:
                 "status": outcome.status,
                 "candidates": outcome.candidates,
                 "rerank_degraded": outcome.rerank_degraded,
+                # B-206 K-8 — the query could not be embedded: keyword results only.
+                "embedding_degraded": outcome.embedding_degraded,
             }
         )
 

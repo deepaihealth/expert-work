@@ -1297,11 +1297,21 @@ async def test_missing_bases_are_a_guided_error_not_an_empty_result() -> None:
     assert "says nothing about whether the information exists" in raised.value.advice
 
 
+class _TimingOutKeywordStore(InMemoryKnowledgeStore):
+    async def keyword_search_scored(
+        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], query: str, limit: int = 5
+    ) -> list[ScoredChunk]:
+        raise TimeoutError("database statement timed out")
+
+
 async def test_a_timed_out_search_stays_a_transient_failure() -> None:
     """A failed search propagates as-is, so an outage keeps the ``transient``
-    class (no effort escalation over a blip) and its generic advice."""
-    store, tenant = await _seed_store()
-    retriever = KnowledgeRetriever(store=store, embedder=_TimingOutEmbedder())
+    class (no effort escalation over a blip) and its generic advice. (A failed
+    query *embedding* no longer fails the search — it degrades to keywords.)"""
+    store = _TimingOutKeywordStore()
+    tenant = uuid4()
+    await store.create_base(tenant_id=tenant, name="kb")
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0, 0.0)))
     tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
 
     with pytest.raises(TimeoutError) as raised:
@@ -1320,6 +1330,88 @@ async def test_a_degraded_rerank_is_flagged_in_meta() -> None:
     )
     assert result.meta["rerank_degraded"] is True
     assert result.meta["hits"] == 2
+
+
+# ---------------------------------------------------------------------------
+# B-206 K-8 —— a failed query embedding degrades to keyword search, visibly
+# ---------------------------------------------------------------------------
+
+
+async def test_a_failed_query_embedding_falls_back_to_keyword_search(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store, tenant = await _seed_store()
+    retriever = KnowledgeRetriever(store=store, embedder=_TimingOutEmbedder())
+    with caplog.at_level("WARNING", logger="orchestrator.tools.knowledge"):
+        outcome = await retriever.search_detailed(
+            tenant_id=tenant, base_names=["kb"], query="vacation", limit=5
+        )
+    assert outcome.status == "ok"
+    assert outcome.embedding_degraded is True
+    assert [(r.chunk_index, r.recall_source) for r in outcome.results] == [(1, "keyword")]
+    assert any(
+        "knowledge.embedding_degraded" in record.getMessage() and record.exc_info
+        for record in caplog.records
+    )
+
+
+async def test_a_vector_only_base_still_searches_keywords_when_embedding_fails() -> None:
+    store, tenant = await _seed_store()
+    retriever = KnowledgeRetriever(store=store, embedder=_TimingOutEmbedder())
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant,
+        base_names=["kb"],
+        query="deductible",
+        limit=5,
+        method=RetrievalMethod.VECTOR,
+    )
+    assert outcome.embedding_degraded is True
+    assert [r.chunk_index for r in outcome.results] == [0]
+
+
+async def test_a_degraded_embedding_is_flagged_in_meta() -> None:
+    store, tenant = await _seed_store()
+    retriever = KnowledgeRetriever(store=store, embedder=_TimingOutEmbedder())
+    tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
+    result = await tool.call({"query": "vacation"}, ctx=ToolContext(tenant_id=tenant))
+    assert result.meta["embedding_degraded"] is True
+    assert result.meta["hits"] == 1
+    # Nothing found by keywords either: still flagged, not a plain "no hits".
+    missed = await tool.call({"query": "zzz"}, ctx=ToolContext(tenant_id=tenant))
+    assert missed.meta == {"hits": 0, "status": "no_hits", "embedding_degraded": True}
+
+
+async def test_a_healthy_search_is_not_flagged() -> None:
+    store, tenant = await _seed_store()
+    result = await _tool(store).call({"query": "vacation"}, ctx=ToolContext(tenant_id=tenant))
+    assert "embedding_degraded" not in result.meta
+
+
+class _QuerySidedEmbedder:
+    """The platform embedder's shape: ``embed`` (memory, documents) and
+    ``embed_query`` (knowledge search queries, B-206 K-5)."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        raise AssertionError("a knowledge search query must go through embed_query")
+
+    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        self.queries.append(query)
+        return (1.0, 0.0)
+
+
+async def test_a_search_query_goes_through_embed_query_when_the_embedder_has_one() -> None:
+    store, tenant = await _seed_store()
+    embedder = _QuerySidedEmbedder()
+    retriever = KnowledgeRetriever(store=store, embedder=embedder)
+    outcome = await retriever.search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="deductible", limit=5
+    )
+    assert embedder.queries == ["deductible"]
+    assert outcome.embedding_degraded is False
+    assert outcome.results[0].recall_source == "both"
 
 
 def test_the_tool_description_states_the_answerability_rule() -> None:

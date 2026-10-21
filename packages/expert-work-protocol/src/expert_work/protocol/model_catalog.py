@@ -42,35 +42,40 @@ LengthUnit = Literal["token", "char"]
 class EmbeddingCaps(BaseModel):
     """B-206 K-5 / K-8 —— an embedding model's request capabilities.
 
-    Batch 0 only declares them; nothing reads them until batch 1. Values come
-    from B-206 design §5.5 table 5-A (vendor docs read 2026-10). ``None`` =
-    the vendor docs say nothing / not checked yet → callers keep the platform
+    Read by the knowledge-base embedding paths (search queries and ingestion,
+    ``orchestrator.llm.embedder.embedding_marker``); long-term memory does not
+    use them. Values come from B-206 design §5.5 table 5-A (vendor docs read
+    2026-10), corrected where a live measurement disagreed. ``None`` = the
+    vendor docs say nothing / not checked yet → callers keep the platform
     default.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # How the vendor tells a search query from a document being indexed —
-    # table 5-A shows exactly three shapes:
+    # table 5-A shows three shapes, plus one found by measurement:
     #   "none"   —— 什么都不发,两侧原样嵌入(OpenAI / 智谱 / 火山 / 自部署 bge-m3 …)。
-    #   "param"  —— 枚举请求参数(Cohere ``input_type``、Jina ``task``、阿里原生口
-    #               ``text_type`` …):``query_marker`` / ``document_marker`` 写成
-    #               ``"name=value"``。
+    #   "param"  —— 枚举请求参数(Cohere ``input_type``、Jina ``task`` …):
+    #               ``query_marker`` / ``document_marker`` 写成 ``"name=value"``,两侧都发。
     #   "prefix" —— 平台拼进输入文本的前缀,通常只加在查询侧(bge-zh / nomic / E5 /
-    #               自部署 Qwen3):``query_marker`` 是含 ``{query}`` 的模板;
-    #               ``document_marker`` 可选(nomic 文档侧也要前缀),是含 ``{document}``
-    #               的模板。
-    # 入库和查询必须用同一套标记(只有 Voyage 承诺带 / 不带互相兼容),批 1 会把它记进
-    # 知识库的嵌入模型指纹,换了当换模型处理。
-    asymmetry: Literal["none", "param", "prefix"]
+    #               自部署 Qwen3):``query_marker`` 是含 ``{query}`` 的模板(可含
+    #               ``{task}``,填 ``instruction``);``document_marker`` 可选(nomic 文档侧
+    #               也要前缀),是含 ``{document}`` 的模板。
+    #   "query_field" —— 只在查询请求里多发一个请求体字段,值是 ``instruction``;文档侧原样
+    #               (阿里 text-embedding-v4 的 ``instruct``,见该条目的实测注释):
+    #               ``query_marker`` 是字段名。
+    # 入库和查询必须用同一套标记(只有 Voyage 承诺带 / 不带互相兼容):文档侧有标记时,它进
+    # 段上记的嵌入模型指纹(``knowledge_chunk.embedding_model``),换了不复用旧向量。
+    asymmetry: Literal["none", "param", "prefix", "query_field"]
     query_marker: str | None = None
     document_marker: str | None = None
     # Instruction text sent with queries only: the ``{task}`` of a "prefix"
-    # template, or 阿里 ``instruct``. None = the model takes no instruction.
+    # template, or the value of a "query_field" field. None = none sent.
     instruction: str | None = None
     # Path of the vendor-native endpoint the markers need, when the vendor's
-    # OpenAI-compatible endpoint drops them (DashScope). None = the markers, if
-    # any, work on the endpoint the platform already calls.
+    # OpenAI-compatible endpoint drops them. None = the markers, if any, work on
+    # the endpoint the platform already calls. The platform has no native
+    # embedding client yet, so no catalog entry may declare one (a test pins it).
     native_endpoint: str | None = None
     # K-8 —— 每次请求最多几条输入,多了要拆批(超了厂商整次 400)。
     max_batch: int | None = None
@@ -100,12 +105,31 @@ class EmbeddingCaps(BaseModel):
                 if not (name and sep and value):
                     msg = f"asymmetry='param' markers are 'name=value', got {marker!r}"
                     raise ValueError(msg)
+        elif self.asymmetry == "query_field":
+            if self.query_marker is None:
+                msg = "asymmetry='query_field' needs query_marker (the field name)"
+                raise ValueError(msg)
+            if any(char in self.query_marker for char in "={} "):
+                msg = (
+                    "asymmetry='query_field' query_marker is a bare field name, "
+                    f"got {self.query_marker!r}"
+                )
+                raise ValueError(msg)
+            if self.instruction is None:
+                msg = "asymmetry='query_field' needs an instruction (the field's value)"
+                raise ValueError(msg)
+            if self.document_marker is not None:
+                msg = "asymmetry='query_field' takes no document_marker: documents are sent as is"
+                raise ValueError(msg)
         else:
             if self.query_marker is None or "{query}" not in self.query_marker:
                 msg = "asymmetry='prefix' needs a query_marker template containing '{query}'"
                 raise ValueError(msg)
             if self.document_marker is not None and "{document}" not in self.document_marker:
                 msg = "asymmetry='prefix' document_marker must contain '{document}'"
+                raise ValueError(msg)
+            if "{task}" in self.query_marker and self.instruction is None:
+                msg = "asymmetry='prefix' query_marker '{task}' needs an instruction"
                 raise ValueError(msg)
         return self
 
@@ -633,23 +657,26 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             thinking_cap=True,
         ),
         # Platform embedding model (Stream T, user-specified).
-        # B-206 §5.5 表 5-A, 2026-10 vendor docs —— 查询 / 文档标记是 ``text_type``,指令是
-        # ``instruct``(只作用于查询侧,建议英文),两者都只在 DashScope 原生口生效,OpenAI
-        # 兼容口不认(K-5)。每次请求 10 条,单条 8,192 token(K-8)。B-200 真接口实测超过
+        # B-206 K-5 —— 2026-10-21 真接口实测(中文查询),推翻表 5-A 的「``text_type``,只在
+        # 原生口生效」:``text_type=query`` / ``document`` / 不发,在兼容口和原生口上向量都
+        # **逐位相同**,单发它没有作用;兼容口请求体顶层加 ``"instruct": <任务说明>`` 会改变
+        # 查询向量(与不加余弦 0.9185),与原生口 ``text_type=query`` + ``instruct`` 完全相同;
+        # ``instruct`` 配 ``text_type=document`` 无作用;放进 ``parameters`` 里兼容口不认;
+        # 把说明拼进文本(``Instruct: …\nQuery: …``)向量近似但不相同(余弦 0.997)。所以它
+        # 的不对称 = 只在查询请求里发 ``instruct``(英文平台默认说明),文档侧原样 → 已入库的
+        # 向量不用重嵌入。每次请求 10 条,单条 8,192 token(K-8)。B-200 真接口实测超过
         # 16,000 token 才整次 400:8,192 是文档值不是硬限;平台数不了它的 token,落地按
         # 字节截(见 ``LengthUnit``)。
         ModelEntry(
             name="text-embedding-v4",
             embeddings=True,
             embedding_caps=EmbeddingCaps(
-                asymmetry="param",
-                query_marker="text_type=query",
-                document_marker="text_type=document",
+                asymmetry="query_field",
+                query_marker="instruct",
                 # K-5 的平台默认指令(英文)。
                 instruction=(
                     "Given a search query, retrieve relevant passages that answer the query"
                 ),
-                native_endpoint="/api/v1/services/embeddings/text-embedding/text-embedding",
                 max_batch=10,
                 max_input_tokens=8_192,
             ),

@@ -267,6 +267,36 @@ async def test_embed_backoff_does_not_retry_client_errors(_no_sleep: list[float]
     assert _no_sleep == []
 
 
+def _vendor_internal_400() -> httpx.HTTPStatusError:
+    # B-206 K-8 —— a vendor reporting its own transient fault as a 400 (seen live
+    # on an embedding warm-up: InternalError.Algo.Embedding_pipeline_Error).
+    request = httpx.Request("POST", "https://embed.test/v1/embeddings")
+    body = '{"error": {"code": "InternalError.Algo.Embedding_pipeline_Error", "message": "x"}}'
+    response = httpx.Response(400, request=request, text=body)
+    return httpx.HTTPStatusError(
+        f"embeddings request failed: 400 {body}", request=request, response=response
+    )
+
+
+@pytest.mark.asyncio
+async def test_embed_backoff_retries_a_vendor_internal_400_once(_no_sleep: list[float]) -> None:
+    embedder = _FlakyEmbedder(_vendor_internal_400(), failures=1)
+    assert len(await embed_with_backoff(embedder, ["a"], tenant_id=_TENANT)) == 1
+    assert embedder.calls == 2
+    assert _no_sleep == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_embed_backoff_gives_up_on_a_second_vendor_internal_400(
+    _no_sleep: list[float],
+) -> None:
+    embedder = _FlakyEmbedder(_vendor_internal_400(), failures=10)
+    with pytest.raises(httpx.HTTPStatusError, match="InternalError"):
+        await embed_with_backoff(embedder, ["a"], tenant_id=_TENANT)
+    assert embedder.calls == 2  # one retry, not the 5xx schedule
+    assert _no_sleep == [1.0]
+
+
 @pytest.mark.asyncio
 async def test_embed_backoff_retries_timeouts(_no_sleep: list[float]) -> None:
     embedder = _FlakyEmbedder(httpx.ReadTimeout("slow"), failures=1)

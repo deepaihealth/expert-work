@@ -479,7 +479,7 @@ def _row(case_id: str, label: str, answerable: bool, cat: str, **searches: Any) 
 def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> None:
     out = tmp_path / "agent.jsonl"
     rows = [
-        _row("n1", "main", False, "正确说没写", status="ok"),
+        _row("n1", "main", False, "正确说没写", status="ok", embedding_degraded=True),
         _row("n2", "chat", False, "编造", degraded=True),
         _row("a1", "main", True, "答对", error="[tool error] x"),
         _row("a2", "main", True, "误拒", skipped=True),
@@ -497,7 +497,9 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
     assert text[5] == "  all  n=3 答对 1 误拒 1 编造 1 答偏 0 判分失败 0"
     assert text[6] == "  main n=2 答对 1 误拒 1 编造 0 答偏 0 判分失败 0"
     assert text[8] == "total n=5 正确说没写 1 答对 1 编造 2 误拒 1"
-    assert text[9] == "searches per question 0.80; degraded 1, errors 1, skipped 1"
+    assert text[9] == (
+        "searches per question 0.80; degraded 1, embedding degraded 1, errors 1, skipped 1"
+    )
     assert text[10] == "spend ¥1.95 (answer ¥1.25, judge ¥0.50, rerank ¥0.20 over 1 run(s))"
 
 

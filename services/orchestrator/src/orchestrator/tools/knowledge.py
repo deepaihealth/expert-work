@@ -206,13 +206,16 @@ class KnowledgeSearchOutcome:
     applied to — the reranker's output, not the recall depth (``0`` for
     ``no_bases`` / ``no_hits``). ``rerank_degraded`` is set
     when the reranker failed or answered with nothing and the fused order was
-    used instead — then no threshold applied either.
+    used instead — then no threshold applied either. ``embedding_degraded``
+    (B-206 K-8) is set when the query could not be embedded and every base was
+    searched by keywords alone.
     """
 
     results: tuple[RetrievedChunk, ...]
     status: SearchStatus
     candidates: int = 0
     rerank_degraded: bool = False
+    embedding_degraded: bool = False
 
 
 @dataclass(frozen=True)
@@ -367,7 +370,8 @@ class KnowledgeRetriever:
         bases = await self._resolve_bases(tenant_id, base_names)
         if not bases:
             return KnowledgeSearchOutcome(results=(), status="no_bases")
-        query_embedding = (await self.embedder.embed([query], tenant_id=tenant_id))[0]
+        query_embedding = await self._embed_query(query, tenant_id)
+        degraded = query_embedding is None
         depth = self.recall_depth(limit)
 
         # Per-base recall, honouring each base's method + threshold. Each
@@ -382,10 +386,17 @@ class KnowledgeRetriever:
         sources: dict[UUID, set[str]] = {}
         for base in bases:
             eff_method = method if method is not None else base.retrieval_method
+            if query_embedding is None:
+                # K-8 —— no query vector: keywords for every base, a vector-only one
+                # included — some results beat none, and the outcome says so.
+                eff_method = RetrievalMethod.KEYWORD
             eff_threshold = (
                 score_threshold if score_threshold is not None else base.retrieval_score_threshold
             )
-            if eff_method in (RetrievalMethod.HYBRID, RetrievalMethod.VECTOR):
+            if query_embedding is not None and eff_method in (
+                RetrievalMethod.HYBRID,
+                RetrievalMethod.VECTOR,
+            ):
                 vector = await self.store.search_scored(
                     tenant_id=tenant_id,
                     kb_ids=[base.id],
@@ -416,7 +427,7 @@ class KnowledgeRetriever:
 
         fused_scored = weighted_rrf_fuse_scored(rankings)
         if not fused_scored:
-            return KnowledgeSearchOutcome(results=(), status="no_hits")
+            return KnowledgeSearchOutcome(results=(), status="no_hits", embedding_degraded=degraded)
         fused = [chunk_by_id[chunk_id] for chunk_id, _score in fused_scored]
         rerank_enabled = rerank if rerank is not None else any(b.rerank_enabled for b in bases)
         ranked = await self._rerank(
@@ -439,6 +450,7 @@ class KnowledgeRetriever:
                 status="below_threshold",
                 candidates=len(ranked.chunks),
                 rerank_degraded=ranked.degraded,
+                embedding_degraded=degraded,
             )
         scores = _SubScores(
             vector=vector_score,
@@ -452,7 +464,29 @@ class KnowledgeRetriever:
             status="ok",
             candidates=len(ranked.chunks),
             rerank_degraded=ranked.degraded,
+            embedding_degraded=degraded,
         )
+
+    async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
+        """The query's vector — ``None`` when embedding it failed (B-206 K-8):
+        the search then runs on keywords alone and says so, logged here and
+        flagged ``embedding_degraded``, instead of failing outright.
+
+        K-5 —— an embedder with ``embed_query`` (the platform's) adds the model's
+        query-side marker; long-term memory recall calls ``embed`` and gets none.
+        """
+        embed_query = getattr(self.embedder, "embed_query", None)
+        try:
+            if embed_query is not None:
+                vector: tuple[float, ...] = await embed_query(query, tenant_id=tenant_id)
+                return vector
+            return (await self.embedder.embed([query], tenant_id=tenant_id))[0]
+        except Exception:
+            logger.warning(
+                "knowledge.embedding_degraded — query embedding failed, searching by keyword only",
+                exc_info=True,
+            )
+            return None
 
     async def _resolve_bases(
         self, tenant_id: UUID, base_names: Sequence[str]
@@ -658,6 +692,8 @@ class KnowledgeSearchTool:
         meta: dict[str, Any] = {"hits": len(outcome.results), "status": outcome.status}
         if outcome.rerank_degraded:
             meta["rerank_degraded"] = True
+        if outcome.embedding_degraded:
+            meta["embedding_degraded"] = True
         if outcome.status == "below_threshold":
             return ToolResult(
                 content=(

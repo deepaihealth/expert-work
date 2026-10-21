@@ -375,6 +375,8 @@ async def _search(
         "limit": args.get("limit"),
         "status": result.meta.get("status"),
         "degraded": bool(result.meta.get("rerank_degraded")),
+        # B-206 K-8: the query was not embedded, this search ran on keywords alone.
+        "embedding_degraded": bool(result.meta.get("embedding_degraded")),
         "content": result.content,
     }
 
@@ -706,6 +708,7 @@ def tally(path: Path) -> str:
     lines.append(
         f"searches per question {len(searches) / max(1, len(rows)):.2f}; "
         f"degraded {sum(1 for s in searches if s.get('degraded'))}, "
+        f"embedding degraded {sum(1 for s in searches if s.get('embedding_degraded'))}, "
         f"errors {sum(1 for s in searches if s.get('error'))}, "
         f"skipped {sum(1 for s in searches if s.get('skipped'))}"
     )
@@ -746,6 +749,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry", action="store_true", help="假模型空跑,不花钱")
     parser.add_argument("--store", default="sql", choices=("sql", "memory"))
     parser.add_argument("--embedder", default="real", choices=("real", "fake"))
+    parser.add_argument(
+        "--query-marker",
+        default="on",
+        choices=("on", "off"),
+        help="查询侧标记(B-206 K-5,同 kb_eval):off = 对照臂,查询不带标记",
+    )
     parser.add_argument("--rerank", default="dashscope", choices=("dashscope", "off"))
     return parser
 
@@ -816,7 +825,9 @@ async def _run(
     selection = select_rows(
         read_manifest(manifest), tiers=_resolve_tiers(None, main_set), limit_docs=0
     )
-    bundle = build_embedder(args.embedder, concurrency=args.concurrency)
+    bundle = build_embedder(
+        args.embedder, concurrency=args.concurrency, query_marker=args.query_marker == "on"
+    )
     reranker, rerank_client = build_rerank_mode(args.rerank)
 
     def rerank_cny() -> float:
@@ -872,14 +883,16 @@ async def _run(
         "questions": written,
         "answer_model": models.answer_model,
         "judge_model": models.judge_model,
+        "query_marker": bundle.query_marker,
         "calls": {"answer": spend.answer_calls, "judge": spend.judge_calls},
         "spend_cny": {
             "answer": round(spend.answer_cny, 6),
             "judge": round(spend.judge_cny, 6),
             "rerank": round(rerank_cny(), 6),
         },
-        # 嵌入几乎全命中缓存;这是按送入嵌入器的 token 算的名义值,不计入预算。
-        "embed_cny_nominal": bundle.embedder.stats().cost_cny,
+        # 嵌入不计入预算:实花只算缓存没命中、真送到接口的;名义值假设一条都没缓存。
+        "embed_cny_actual": bundle.embedder.stats().cost_cny_actual,
+        "embed_cny_nominal": bundle.embedder.stats().cost_cny_nominal,
     }
     with out.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"run": run}, ensure_ascii=False) + "\n")

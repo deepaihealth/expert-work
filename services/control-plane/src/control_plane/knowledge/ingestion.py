@@ -240,6 +240,21 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
+#: B-206 K-8 —— DashScope reports some of its own transient faults as HTTP 400
+#: with an ``InternalError.*`` code (an embedding warm-up hit
+#: ``InternalError.Algo.Embedding_pipeline_Error``). Retried once only: a 400
+#: may as well be a real input error, which no number of retries fixes.
+_VENDOR_INTERNAL_400 = "InternalError"
+
+
+def _is_vendor_internal_400(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == 400
+        and _VENDOR_INTERNAL_400 in exc.response.text
+    )
+
+
 async def embed_with_backoff(
     embedder: Embedder, texts: Sequence[str], *, tenant_id: UUID
 ) -> list[tuple[float, ...]]:
@@ -250,7 +265,8 @@ async def embed_with_backoff(
     :data:`_EMBED_BATCH_SIZE` and each slice retries on its own — a 429 on the
     90th request of a large document re-sends that one request, not all 90.
     Client errors (4xx other than 429, e.g. an over-long input) are not
-    retried — they will not get better."""
+    retried — they will not get better — except a vendor-internal 400, retried
+    once (B-206 K-8, :data:`_VENDOR_INTERNAL_400`)."""
     vectors: list[tuple[float, ...]] = []
     items = list(texts)
     for start in range(0, len(items), _EMBED_BATCH_SIZE):
@@ -265,12 +281,15 @@ async def embed_with_backoff(
 async def _embed_slice_with_backoff(
     embedder: Embedder, texts: Sequence[str], *, tenant_id: UUID
 ) -> list[tuple[float, ...]]:
+    retried_internal_400 = False
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
             return await embedder.embed(texts, tenant_id=tenant_id)
         except Exception as exc:
-            if delay is None or not _is_retryable(exc):
+            internal_400 = not retried_internal_400 and _is_vendor_internal_400(exc)
+            if delay is None or not (_is_retryable(exc) or internal_400):
                 raise
+            retried_internal_400 = retried_internal_400 or internal_400
             logger.warning(
                 "knowledge.embed_retry attempt=%d delay=%.0fs error=%s", attempt + 1, delay, exc
             )

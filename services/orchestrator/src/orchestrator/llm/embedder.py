@@ -18,11 +18,12 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 import httpx
 
+from expert_work.protocol.model_catalog import EmbeddingCaps
 from orchestrator.llm.providers._http import client_for
 
 #: OpenAI-compatible embeddings path — qwen DashScope compatible-mode,
@@ -77,9 +78,12 @@ class EmbeddingClient(Protocol):
     """The embeddings HTTP surface — sized to the one endpoint we use so
     tests can fake it without mocking httpx."""
 
-    async def embeddings(self, *, model: str, texts: Sequence[str]) -> Mapping[str, Any]:
+    async def embeddings(
+        self, *, model: str, texts: Sequence[str], fields: Mapping[str, str] | None = None
+    ) -> Mapping[str, Any]:
         """POST the embeddings endpoint; return the parsed JSON body.
 
+        ``fields`` are extra top-level request-body fields (B-206 K-5 markers).
         Expected shape: ``{"data": [{"embedding": [...], "index": int}, ...]}``.
         """
 
@@ -99,14 +103,16 @@ class HTTPEmbeddingClient:
     #: outlives every individual call.
     http: httpx.AsyncClient | None = None
 
-    async def embeddings(self, *, model: str, texts: Sequence[str]) -> Mapping[str, Any]:
+    async def embeddings(
+        self, *, model: str, texts: Sequence[str], fields: Mapping[str, str] | None = None
+    ) -> Mapping[str, Any]:
         async with client_for(
             self.http, timeout=_DEFAULT_TIMEOUT_S, transport=self.transport
         ) as client:
             response = await client.post(
                 f"{self.base_url}{self.embeddings_path}",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": model, "input": list(texts)},
+                json={**(fields or {}), "model": model, "input": list(texts)},
                 timeout=_DEFAULT_TIMEOUT_S,  # per-request — governs even when sharing a client
             )
             if response.is_error:
@@ -132,6 +138,83 @@ def fit_embedding_input(text: str, max_bytes: int) -> str:
     return raw[:max_bytes].decode(errors="ignore")
 
 
+#: B-206 K-5 —— which side of knowledge retrieval a text is embedded for.
+EmbeddingSide = Literal["query", "document"]
+
+
+@dataclass(frozen=True)
+class EmbeddingMarker:
+    """B-206 K-5 —— what one side adds to an embeddings request so the vendor
+    can tell a search query from a document being indexed (see
+    :func:`embedding_marker`). The default adds nothing."""
+
+    #: Extra top-level request-body fields ("param" enum, "query_field" instruction).
+    fields: tuple[tuple[str, str], ...] = ()
+    #: Text put around every input ("prefix" templates).
+    prefix: str = ""
+    suffix: str = ""
+
+    def wrap(self, text: str) -> str:
+        return f"{self.prefix}{text}{self.suffix}"
+
+    @property
+    def fingerprint(self) -> str:
+        """Everything this marker changes about a request, as one string — ``""``
+        when it changes nothing. Changing it changes the vectors."""
+        parts = [f"{name}={value}" for name, value in self.fields]
+        if self.prefix or self.suffix:
+            parts.append(f"{self.prefix}{{text}}{self.suffix}")
+        return "&".join(parts)
+
+
+NO_MARKER = EmbeddingMarker()
+
+
+def embedding_marker(caps: EmbeddingCaps | None, side: EmbeddingSide) -> EmbeddingMarker:
+    """B-206 K-5 —— the marker the model catalog declares for ``side``. A model
+    with no declared caps (off-catalog, custom gateway) or ``asymmetry="none"``
+    gets none: its requests stay exactly what they were."""
+    if caps is None or caps.asymmetry == "none":
+        return NO_MARKER
+    marker = caps.query_marker if side == "query" else caps.document_marker
+    if marker is None:
+        return NO_MARKER  # only a "prefix" document side may be undeclared
+    if caps.asymmetry == "param":
+        name, _, value = marker.partition("=")
+        return EmbeddingMarker(fields=((name, value),))
+    if caps.asymmetry == "query_field":
+        # The validator guarantees an instruction; ``or ""`` only narrows the type.
+        return EmbeddingMarker(fields=((marker, caps.instruction or ""),))
+    if caps.instruction is not None:
+        marker = marker.replace("{task}", caps.instruction)
+    # Split on the placeholder rather than ``str.format``: the text itself may hold braces.
+    prefix, _, suffix = marker.partition("{query}" if side == "query" else "{document}")
+    return EmbeddingMarker(prefix=prefix, suffix=suffix)
+
+
+def marked_model_key(model_key: str, marker: EmbeddingMarker) -> str:
+    """The key a vector made with ``marker`` is stored / cached under:
+    ``model_key`` itself when the marker changes nothing (so vectors made
+    before markers existed stay reusable), else ``model_key#<marker>`` — a
+    vector made under another marker is never taken for this one."""
+    return f"{model_key}#{marker.fingerprint}" if marker.fingerprint else model_key
+
+
+def catalog_request_limits(caps: EmbeddingCaps | None, max_input_bytes: int) -> tuple[int, int]:
+    """B-206 K-8 —— ``(inputs per request, UTF-8 bytes per input)`` for a model
+    with catalog ``caps``: the vendor's documented limits where the catalog
+    declares them, the platform defaults where not. The per-input limit is
+    applied as the same number of bytes (a token or a character is at least one
+    byte, see ``LengthUnit``) and never above ``max_input_bytes``, the
+    deployment's cap."""
+    if caps is None:
+        return _DEFAULT_MAX_BATCH_SIZE, max_input_bytes
+    batch = caps.max_batch or _DEFAULT_MAX_BATCH_SIZE
+    if caps.max_input_tokens is None:
+        return batch, max_input_bytes
+    return batch, min(max_input_bytes, caps.max_input_tokens)
+
+
 @dataclass(frozen=True)
 class OpenAICompatibleEmbedder:
     """:class:`Embedder` over an OpenAI-compatible ``/v1/embeddings`` API."""
@@ -144,19 +227,24 @@ class OpenAICompatibleEmbedder:
     #: Each input is cut to this many UTF-8 bytes before it is sent; ``None``
     #: sends inputs whole. See DEFAULT_MAX_INPUT_BYTES.
     max_input_bytes: int | None = DEFAULT_MAX_INPUT_BYTES
+    #: B-206 K-5 —— the query or document marker every request carries. Only the
+    #: knowledge-base paths set one; the default (long-term memory, …) adds nothing.
+    marker: EmbeddingMarker = NO_MARKER
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
         # Fixed-key embedder — the credential is baked into ``client``;
         # ``tenant_id`` is accepted for protocol conformance and ignored.
         del tenant_id
         cap = self.max_input_bytes
-        items = [fit_embedding_input(text, cap) for text in texts] if cap else list(texts)
+        wrapped = [self.marker.wrap(text) for text in texts]
+        items = [fit_embedding_input(text, cap) for text in wrapped] if cap else wrapped
         if not items:
             return []
+        fields = dict(self.marker.fields)
         vectors: list[tuple[float, ...]] = []
         for start in range(0, len(items), self.max_batch_size):
             batch = items[start : start + self.max_batch_size]
-            body = await self.client.embeddings(model=self.model, texts=batch)
+            body = await self.client.embeddings(model=self.model, texts=batch, fields=fields)
             # ``index`` is per-request (0-based within this batch); sort then
             # append so vectors stay aligned to inputs across batches.
             rows = sorted(body["data"], key=lambda row: row["index"])

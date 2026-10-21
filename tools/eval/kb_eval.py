@@ -43,7 +43,10 @@
 ``--rerank on`` 另要 ``EXPERT_WORK_EVAL_LLM_API_KEY`` / ``_MODEL`` / ``_BASE_URL``),没有命令行开关。
 真嵌入包在 ``longmem.embedders.CachedEmbedder`` 里(``eval-out/kb/embed_cache.sqlite``),
 第二次跑近零费用;这里不截断输入(上限设到 1M 字符,超长文本让嵌入 API 自己报错),
-汇总里报送入嵌入器的文本数 / 超过 8000 字符的条数 / token 数与估算费用(假嵌入报 0)。
+汇总里报送入嵌入器的文本数 / 超过 8000 字符的条数 / token 数,费用分两个数:实花
+(``cost_cny_actual``,只算缓存没命中、真送到接口的)与名义(``cost_cny_nominal``,假设
+一条都没缓存;假嵌入都报 0)。真嵌入与生产同一套 B-206 K-5 查询侧标记(按模型目录,
+``--query-marker off`` 是不带标记的对照臂);标记进缓存键,两臂各用各的查询向量。
 
 **测试覆盖的只有内存库 + 假嵌入 + ``tmp_path`` 小语料那条路**(``test_kb_eval.py``);
 ``--store sql`` 与 ``--embedder real`` 在仓库外手工跑,CI 不碰真语料、不建容器、不调嵌入 API。
@@ -103,14 +106,21 @@ from expert_work.persistence import InMemoryKnowledgeStore, KnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import (
+    MODEL_CATALOG,
     DocumentStatus,
     RetrievalMethod,
     chunk_retrieval_text,
     knowledge_document_title,
 )
+from expert_work.protocol.model_catalog import EmbeddingCaps
 from orchestrator.graph_builder.builder import _invoke_tool
 from orchestrator.llm import Embedder, LLMCaller
-from orchestrator.llm.embedder import QWEN_EMBEDDING_BASE_URL
+from orchestrator.llm.embedder import (
+    NO_MARKER,
+    QWEN_EMBEDDING_BASE_URL,
+    EmbeddingMarker,
+    embedding_marker,
+)
 from orchestrator.tools.knowledge import (
     KnowledgeRetriever,
     KnowledgeSearchOutcome,
@@ -225,7 +235,12 @@ class EmbedStats:
     chars: int
     overlong: int  # 超过 EMBED_OVERLONG_CHARS 的条数
     tokens: int  # 只有真嵌入计;含缓存命中(按送入嵌入器的文本算)
-    cost_cny: float
+    #: tokens 乘单价:缓存一条都没命中时要花的钱(上限,不是实花)
+    cost_cny_nominal: float
+    fetched: int  # 真送到嵌入接口的条数(缓存没命中的;前面没有缓存时 = texts)
+    fetched_tokens: int
+    #: fetched_tokens 乘单价:这次跑实际花的钱
+    cost_cny_actual: float
 
 
 @dataclass(frozen=True)
@@ -334,6 +349,13 @@ class RerankDegradedError(RuntimeError):
     """
 
 
+class EmbeddingDegradedError(RuntimeError):
+    """有一题的查询嵌入失败、检索退成了只走关键词(B-206 K-8)—— 整轮退出。
+
+    同 :class:`RerankDegradedError`:生产要降级,评测不能把只走关键词的结果当混合检索计分。
+    """
+
+
 class FakeKbEmbedder(KeywordEmbedder):  # type: ignore[misc]
     """关键词桶向量(CJK 二元组 + ASCII 词),维度对齐库的向量列。
 
@@ -353,6 +375,9 @@ class CountingEmbedder:
     """包在任何嵌入器外面:校维度、计数、把嵌入失败归到 ``embed`` 阶段。
 
     计数是进程内累计(文本数 / 字符数 / 超长条数 / token / 费用),``stats()`` 取快照。
+    ``embed`` 走 ``inner``(入库的段);``embed_query``(检索器给查询用,B-206 K-5)走
+    ``query_inner``,没给就也走 ``inner``——两臂 A/B 时查询侧带不带标记由它决定。
+    实花只算真送到嵌入接口的(内层缓存没命中的,见 ``CachedEmbedder.fetched_*``)。
     """
 
     def __init__(
@@ -360,11 +385,13 @@ class CountingEmbedder:
         inner: Any,
         *,
         expected_dim: int,
+        query_inner: Any = None,
         count_tokens: bool = False,
         price_cny_per_1k_tokens: float = 0.0,
         overlong_chars: int = EMBED_OVERLONG_CHARS,
     ) -> None:
         self._inner = inner
+        self._query_inner = query_inner if query_inner is not None else inner
         self._expected_dim = expected_dim
         self._count_tokens = count_tokens
         self._price = price_cny_per_1k_tokens
@@ -375,8 +402,17 @@ class CountingEmbedder:
         self._tokens = 0
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        return await self._embed(self._inner, texts, tenant_id=tenant_id)
+
+    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        (vector,) = await self._embed(self._query_inner, [query], tenant_id=tenant_id)
+        return vector
+
+    async def _embed(
+        self, inner: Any, texts: Sequence[str], *, tenant_id: UUID
+    ) -> list[tuple[float, ...]]:
         try:
-            vectors = await self._inner.embed(texts, tenant_id=tenant_id)
+            vectors = await inner.embed(texts, tenant_id=tenant_id)
         except Exception as exc:
             raise EmbedStageError(f"{type(exc).__name__}: {exc}") from exc
         for vector in vectors:
@@ -394,12 +430,28 @@ class CountingEmbedder:
         return cast(list[tuple[float, ...]], vectors)
 
     def stats(self) -> EmbedStats:
+        fetched, fetched_tokens = self._fetched()
         return EmbedStats(
             texts=self._texts,
             chars=self._chars,
             overlong=self._overlong,
             tokens=self._tokens,
-            cost_cny=round(self._tokens / 1000 * self._price, 6),
+            cost_cny_nominal=round(self._tokens / 1000 * self._price, 6),
+            fetched=fetched,
+            fetched_tokens=fetched_tokens,
+            cost_cny_actual=round(fetched_tokens / 1000 * self._price, 6),
+        )
+
+    def _fetched(self) -> tuple[int, int]:
+        """``(条数, token)`` 真送到嵌入接口的:内层是缓存就读它的计数;没有缓存的内层
+        (假嵌入)每条都送了,等于名义值。"""
+        inners = {id(inner): inner for inner in (self._inner, self._query_inner)}.values()
+        cached = [inner for inner in inners if hasattr(inner, "fetched_texts")]
+        if not cached:
+            return self._texts, self._tokens
+        return (
+            sum(int(inner.fetched_texts) for inner in cached),
+            sum(int(inner.fetched_tokens) for inner in cached),
         )
 
 
@@ -853,6 +905,12 @@ async def run_eval(
                 "rerank_empty warning): its numbers would be the fused order"
             )
             raise RerankDegradedError(msg)
+        if outcome.embedding_degraded:
+            msg = (
+                f"query embedding failed on case {case.id} (see the knowledge.embedding_degraded "
+                "warning): its numbers would be keyword search alone"
+            )
+            raise EmbeddingDegradedError(msg)
         results = list(outcome.results)
         replay = _ReplayRetriever(inner=retriever, outcome=outcome)
         tool = KnowledgeSearchTool(
@@ -1148,7 +1206,9 @@ def format_summary_table(summary: Mapping[str, Any]) -> str:
             lines.append(
                 f"embed: texts={embed['texts']} chars={embed['chars']} "
                 f"overlong(>{EMBED_OVERLONG_CHARS})={embed['overlong']} tokens={embed['tokens']} "
-                f"cost_cny={embed['cost_cny']}"
+                f"fetched={embed['fetched']} fetched_tokens={embed['fetched_tokens']} "
+                f"cost_cny_actual={embed['cost_cny_actual']} "
+                f"cost_cny_nominal={embed['cost_cny_nominal']} (nominal = if nothing were cached)"
             )
     anchors = summary.get("anchors")
     if anchors:
@@ -1166,6 +1226,7 @@ def fingerprint(
     corpus_root: Path,
     embedder: str,
     embed_base_url: str | None,
+    query_marker: str,
     store: str,
     tiers: Sequence[str],
     limit_docs: int,
@@ -1180,6 +1241,8 @@ def fingerprint(
         "corpus_root": corpus_root.resolve().name,
         "embedder": embedder,
         "embed_base_url": embed_base_url,
+        # B-206 K-5: the query-side marker changes every query vector.
+        "query_marker": query_marker,
         "embedding_dim": EMBEDDING_DIM,
         "store": store,
         # exact = reproducible (serial writes + exact KNN); ann = production HNSW.
@@ -1323,27 +1386,59 @@ class EmbedderBundle:
     embedder: CountingEmbedder
     tag: str  # fake | 模型名
     base_url: str | None  # 假嵌入 None
+    #: 查询侧标记(B-206 K-5):``off`` = 关掉了;``none`` = 开着但模型没有(假嵌入 / 目录外 /
+    #: asymmetry="none");其余 = 实际发出去的标记(``EmbeddingMarker.fingerprint``)。
+    query_marker: str = "none"
 
 
-def build_embedder(kind: str, *, concurrency: int) -> EmbedderBundle:
+def catalog_embedding_caps(model: str) -> EmbeddingCaps | None:
+    """评测只知道模型名(``EXPERT_WORK_EVAL_EMBED_MODEL``):在模型目录里按名找嵌入模型的能力。
+    找不到 = 目录外模型,与生产一样不加标记。"""
+    for entries in MODEL_CATALOG.values():
+        for entry in entries:
+            if entry.name == model and entry.embeddings:
+                return entry.embedding_caps
+    return None
+
+
+def build_embedder(kind: str, *, concurrency: int, query_marker: bool = True) -> EmbedderBundle:
     """``real`` 的凭据只从 ``EXPERT_WORK_EVAL_EMBED_*`` 读,缺了就退出;两种都包进
-    :class:`CountingEmbedder`(校维度 / 计数 / 失败归阶段)。"""
+    :class:`CountingEmbedder`(校维度 / 计数 / 失败归阶段)。
+
+    ``real`` 与生产同一套 B-206 K-5 标记:入库的段带模型目录的文档侧标记,查询带查询侧
+    标记(``query_marker=False`` 关掉查询侧,做 A/B 的对照臂)。标记进嵌入缓存的键,两臂
+    不会互相读到对方的查询向量;文档侧两臂相同,语料只嵌一次。"""
     if kind == "fake":
         return EmbedderBundle(
             embedder=CountingEmbedder(build_fake_embedder(), expected_dim=EMBEDDING_DIM),
             tag="fake",
             base_url=None,
         )
-    backend = build_real_embedder(
-        cache_db=EMBED_CACHE_DB, concurrency=concurrency, max_text_chars=EMBED_MAX_TEXT_CHARS
-    )
+    model = os.environ.get("EXPERT_WORK_EVAL_EMBED_MODEL", "")
+    caps = catalog_embedding_caps(model)
+    query_side = embedding_marker(caps, "query") if query_marker else NO_MARKER
+
+    def _cached(marker: EmbeddingMarker) -> Any:
+        return build_real_embedder(
+            cache_db=EMBED_CACHE_DB,
+            concurrency=concurrency,
+            max_text_chars=EMBED_MAX_TEXT_CHARS,
+            marker=marker,
+            count_tokens=count_tokens,
+        )
+
     price = float(os.environ.get(EMBED_PRICE_ENV, DEFAULT_EMBED_PRICE_CNY_PER_1K))
     return EmbedderBundle(
         embedder=CountingEmbedder(
-            backend, expected_dim=EMBEDDING_DIM, count_tokens=True, price_cny_per_1k_tokens=price
+            _cached(embedding_marker(caps, "document")),
+            query_inner=_cached(query_side),
+            expected_dim=EMBEDDING_DIM,
+            count_tokens=True,
+            price_cny_per_1k_tokens=price,
         ),
         tag=os.environ["EXPERT_WORK_EVAL_EMBED_MODEL"],
         base_url=os.environ.get("EXPERT_WORK_EVAL_EMBED_BASE_URL") or QWEN_EMBEDDING_BASE_URL,
+        query_marker=(query_side.fingerprint or "none") if query_marker else "off",
     )
 
 
@@ -1408,6 +1503,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-docs", type=int, default=0, help="去重后只入前 N 份文档;0 = 全部")
     parser.add_argument("--store", default="sql", choices=("memory", "sql"))
     parser.add_argument("--embedder", default="fake", choices=("fake", "real"))
+    parser.add_argument(
+        "--query-marker",
+        default="on",
+        choices=("on", "off"),
+        help="查询侧标记(B-206 K-5,按模型目录;生产默认开):off = 对照臂,查询不带标记",
+    )
     parser.add_argument(
         "--method", default="hybrid", choices=tuple(m.value for m in RetrievalMethod)
     )
@@ -1555,6 +1656,7 @@ async def _run(
     config = {
         "store": args.store,
         "vector_search": "ann" if args.ann else "exact",
+        "query_marker": bundle.query_marker,
         "doc_match": args.doc_match,
         "doc_titles": args.doc_titles,
         "tiers": list(tiers),
@@ -1614,7 +1716,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         rerank_mode=rerank_mode,
         with_text=args.with_text,
     )
-    bundle = build_embedder(args.embedder, concurrency=args.concurrency)
+    bundle = build_embedder(
+        args.embedder, concurrency=args.concurrency, query_marker=args.query_marker == "on"
+    )
     reranker, rerank_client = build_rerank_mode(rerank_mode)
 
     rows, summary, report = asyncio.run(
@@ -1656,6 +1760,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 corpus_root=corpus_root,
                 embedder=bundle.tag,
                 embed_base_url=bundle.base_url,
+                query_marker=bundle.query_marker,
                 store=args.store,
                 tiers=tiers,
                 limit_docs=args.limit_docs,
