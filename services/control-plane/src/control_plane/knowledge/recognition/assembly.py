@@ -11,6 +11,28 @@ from control_plane.knowledge.recognition.pages import PdfAnalysis
 from control_plane.knowledge.recognition.recognizer import PageOutcome
 from expert_work.protocol import DocumentPage, PageDecision, PageStats, PageStatus
 
+#: Recognized text one document may add (review H1: 1,000 pages of 30,000
+#: characters is 30 M). A dense scanned page reads to ~3,000 characters, so
+#: the cap is far above a real 1,000-page document.
+MAX_RECOGNIZED_CHARS_PER_DOCUMENT = 5_000_000
+#: Error class of a page whose text did not fit under the document cap.
+ERROR_DOCUMENT_TEXT_LIMIT = "document_text_limit"
+
+
+def cap_recognized_text(outcomes: Mapping[int, PageOutcome], limit: int) -> dict[int, PageOutcome]:
+    """``outcomes`` with recognized pages past ``limit`` characters (in page
+    order) turned into failed pages — recorded, not silently dropped."""
+    capped: dict[int, PageOutcome] = {}
+    used = 0
+    for index in sorted(outcomes):
+        outcome = outcomes[index]
+        if outcome.status is PageStatus.RECOGNIZED and outcome.text:
+            used += len(outcome.text)
+            if used > limit:
+                outcome = PageOutcome(status=PageStatus.FAILED, error=ERROR_DOCUMENT_TEXT_LIMIT)
+        capped[index] = outcome
+    return capped
+
 
 def page_records(analysis: PdfAnalysis, outcomes: Mapping[int, PageOutcome]) -> list[DocumentPage]:
     """Every page's record (B-209 §5.6): how its text was obtained and, for a

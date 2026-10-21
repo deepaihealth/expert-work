@@ -45,14 +45,15 @@ def _parse_pool_teardown() -> Iterator[None]:
     shutdown_parse_pool()
 
 
-def _mixed_pdf() -> bytes:
+def _mixed_pdf(scans: int = 1) -> bytes:
     picture = pymupdf.open()
     picture.new_page().insert_text((72, 72), "Scanned words on paper " * 6, fontsize=14)
     scan = picture[0].get_pixmap(dpi=72).tobytes("png")
     doc = pymupdf.open()
     doc.new_page().insert_text((72, 72), "Leave requests go to the manager. " * 8, fontsize=8)
-    page = doc.new_page()
-    page.insert_image(page.rect, stream=scan)
+    for _ in range(scans):
+        page = doc.new_page()
+        page.insert_image(page.rect, stream=scan)
     return bytes(doc.tobytes())
 
 
@@ -61,10 +62,11 @@ class _Switchable:
     """Platform settings an admin can switch on mid-test."""
 
     on: bool = False
+    max_pages: int = 1000
 
     async def recognition_settings(self) -> RecognitionSettings:
         primary = ModelChoice("glm", "glm-ocr") if self.on else None
-        return RecognitionSettings(primary=primary, fallback=None, max_pages=1000)
+        return RecognitionSettings(primary=primary, fallback=None, max_pages=self.max_pages)
 
 
 class _Reader:
@@ -152,7 +154,8 @@ async def test_pending_pages_are_listed_and_recognized_on_request(setup: Setup) 
         (1, "text", None),
         (2, "ocr", "pending"),
     ]
-    assert pages["pages"][1]["error"] == "no recognition model configured"
+    assert pages["pages"][1]["error"] == "not_configured"
+    assert (pages["total"], pages["offset"], pages["limit"]) == (2, 0, 200)
 
     settings.on = True  # the admin configures 「文档识别」
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{document_id}/recognize")
@@ -184,7 +187,7 @@ async def test_recognize_a_document_without_page_records_is_409(setup: Setup) ->
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{document['id']}/recognize")
     assert resp.status_code == 409
     pages = (await client.get(f"/v1/knowledge/bases/kb/documents/{document['id']}/pages")).json()
-    assert pages == {"pages": [], "page_stats": None}
+    assert pages == {"pages": [], "total": 0, "offset": 0, "limit": 200, "page_stats": None}
 
 
 async def test_recognize_and_pages_of_a_missing_document_are_404(setup: Setup) -> None:
@@ -195,3 +198,31 @@ async def test_recognize_and_pages_of_a_missing_document_are_404(setup: Setup) -
         await client.post(f"/v1/knowledge/bases/kb/documents/{ghost}/recognize")
     ).status_code == 404
     assert (await client.get(f"/v1/knowledge/bases/kb/documents/{ghost}/pages")).status_code == 404
+
+
+async def test_pages_over_the_limit_are_recognized_once_the_limit_is_raised(setup: Setup) -> None:
+    # Review: over-limit pages used to be stuck — 「补识别」 refused them.
+    client, runner, settings = setup
+    settings.on, settings.max_pages = True, 1
+    document_id = await _upload(client, runner, "book.pdf", _mixed_pdf(scans=2))
+    listed = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert (listed["page_stats"]["pages_ocr"], listed["page_stats"]["pages_over_limit"]) == (1, 1)
+
+    settings.max_pages = 1000  # the admin raises the limit
+    resp = await client.post(f"/v1/knowledge/bases/kb/documents/{document_id}/recognize")
+    assert resp.status_code == 202, resp.text
+    await runner.drain()
+    listed = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert (listed["page_stats"]["pages_ocr"], listed["page_stats"]["pages_over_limit"]) == (2, 0)
+
+
+async def test_page_records_are_paged(setup: Setup) -> None:
+    client, runner, settings = setup
+    settings.on = True
+    document_id = await _upload(client, runner, "book.pdf", _mixed_pdf(scans=2))
+    url = f"/v1/knowledge/bases/kb/documents/{document_id}/pages"
+    page = (await client.get(url, params={"offset": 1, "limit": 1})).json()
+    assert [p["page"] for p in page["pages"]] == [2]
+    assert (page["total"], page["offset"], page["limit"]) == (3, 1, 1)
+    capped = (await client.get(url, params={"limit": 100_000})).json()
+    assert capped["limit"] == 1000

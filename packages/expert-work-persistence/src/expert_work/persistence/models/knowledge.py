@@ -261,15 +261,24 @@ class KnowledgeChunkRow(Base):
 
 class KnowledgeParseCacheRow(Base):
     """``knowledge_parse_cache`` (migration ``0169``, B-209 §5.5) — a model's
-    cleaned reading of one image, per tenant: the same page uploaded again,
-    re-chunked or recognized again is never billed twice. Per tenant on
-    purpose (a shared cache would tell a tenant that another uploaded the same
-    page). ``cache_key`` = sha256 of the image bytes sent + model + prompt
-    version + render parameters."""
+    raw reading of one page image, per **document**: the same document
+    uploaded again, re-chunked or recognized again is never billed twice for a
+    page, and deleting the document deletes its readings (they can be health
+    data — review M1). ``cache_key`` = sha256 of the image bytes sent + model +
+    request parameters + render parameters."""
 
     __tablename__ = "knowledge_parse_cache"
 
     tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "knowledge_document.id",
+            ondelete="CASCADE",
+            name="fk_knowledge_parse_cache_document",
+        ),
+        nullable=False,
+    )
     #: ``page_ocr`` (PR-1); ``figure_desc`` / ``figure_ocr`` reserved for PR-2.
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     cache_key: Mapped[str] = mapped_column(Text, nullable=False)
@@ -280,7 +289,7 @@ class KnowledgeParseCacheRow(Base):
     )
 
     __table_args__ = (
-        PrimaryKeyConstraint("tenant_id", "kind", "cache_key", name="knowledge_parse_cache_pkey"),
+        PrimaryKeyConstraint("document_id", "kind", "cache_key", name="knowledge_parse_cache_pkey"),
         CheckConstraint(
             "kind IN ('page_ocr', 'figure_desc', 'figure_ocr')",
             name="knowledge_parse_cache_kind_enum",

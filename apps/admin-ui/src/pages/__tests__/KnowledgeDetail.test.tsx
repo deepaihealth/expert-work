@@ -225,6 +225,27 @@ describe("KnowledgeDetail", () => {
     );
   });
 
+  it("offers 「补识别」 for pages over the limit (B-209 review)", async () => {
+    const capped: knowledgeSdk.KnowledgeDocument = {
+      ...DOCS[0],
+      page_stats: {
+        pages_total: 5,
+        pages_ocr: 2,
+        pages_failed: 0,
+        pages_pending: 0,
+        pages_over_limit: 3,
+      },
+    };
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([capped]));
+
+    renderDetail();
+    expect(await screen.findByTestId(`doc-pages-${capped.id}`)).toHaveTextContent(
+      "3 pages over the limit",
+    );
+    expect(screen.getByTestId(`doc-recognize-${capped.id}`)).toBeInTheDocument();
+  });
+
   it("offers no 「补识别」 when every scanned page was recognized", async () => {
     const done: knowledgeSdk.KnowledgeDocument = {
       ...DOCS[0],

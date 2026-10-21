@@ -34,6 +34,9 @@ SPARSE_CHARS = 50
 #: WeKnora's 0.5: on the B-209 corpus 0.5 also took 623 template pages (real
 #: text over a background image), where the text layer reads better.
 FULL_PAGE_IMAGE_COVERAGE = 0.8
+#: Signal 2 looks at no more image placements than this (the union is
+#: quadratic in them); a page with more is recognized as a whole.
+MAX_IMAGE_PLACEMENTS = 500
 #: Signal 3 — share of private-use / U+FFFD / CID characters (RAGFlow's 30 %).
 GARBLED_SHARE = 0.3
 
@@ -86,25 +89,27 @@ def render_params(max_pixels: int | None = None) -> str:
 def analyse_pdf(filename: str, raw: bytes) -> PdfAnalysis:
     """Decide every page of a PDF (see module doc).
 
-    :raises DocumentParseError: the PDF cannot be opened, or (no page needs
-        recognition) it parses to nothing — the same errors as
-        :func:`parse_document`."""
-    doc = _open(raw)
+    A PDF with no page to recognize parses exactly as before: ``markdown`` is
+    :func:`parse_document`'s output, its MarkItDown fallback and its errors
+    included. Analysis never fails a document that parsed before: a PDF
+    PyMuPDF cannot walk falls back to :func:`parse_document` (no page
+    records), a page whose signals cannot be read is kept as a text page.
+
+    :raises DocumentParseError: only as :func:`parse_document` raises it."""
     try:
-        pages = [_decide(page) for page in doc]
+        doc = pymupdf.open(stream=raw, filetype="pdf")
+    except Exception:
+        return PdfAnalysis(pages=(), markdown=parse_document(filename, raw))
+    try:
+        try:
+            pages = [_decide_or_text(doc, index) for index in range(doc.page_count)]
+        except Exception:
+            return PdfAnalysis(pages=(), markdown=parse_document(filename, raw))
         if not any(page.decision is PageDecision.OCR for page in pages):
-            doc.close()
             return PdfAnalysis(pages=tuple(pages), markdown=parse_document(filename, raw))
-        chunks = pymupdf4llm.to_markdown(doc, page_chunks=True)
-    except DocumentParseError:
-        raise
-    except Exception as exc:
-        msg = f"PDF parse failed: {exc}"
-        raise DocumentParseError(msg) from exc
+        texts = _page_texts(doc, pages)
     finally:
-        if not doc.is_closed:
-            doc.close()
-    texts = [str(chunk.get("text") or "") for chunk in chunks]
+        doc.close()
     return PdfAnalysis(
         pages=tuple(
             page
@@ -115,12 +120,53 @@ def analyse_pdf(filename: str, raw: bytes) -> PdfAnalysis:
                 reason=page.reason,
                 chars=page.chars,
                 images=page.images,
-                text=texts[page.index] if page.index < len(texts) else "",
+                text=texts.get(page.index, ""),
             )
             for page in pages
         ),
         markdown=None,
     )
+
+
+def _decide_or_text(doc: pymupdf.Document, index: int) -> PdfPage:
+    """:func:`_decide` for one page; a page PyMuPDF cannot inspect is a text
+    page (what it was before B-209)."""
+    try:
+        return _decide(doc[index])
+    except Exception:
+        return PdfPage(index, PageDecision.TEXT, None, 0, 0)
+
+
+def _page_texts(doc: pymupdf.Document, pages: Sequence[PdfPage]) -> dict[int, str]:
+    """Each kept page's Markdown (pymupdf4llm page chunks). A text page with no
+    chunk text — the chunked parse failed, or skipped the page — falls back to
+    PyMuPDF's plain text, so it never goes silently empty."""
+    try:
+        chunks = pymupdf4llm.to_markdown(doc, page_chunks=True)
+    except Exception:
+        chunks = []
+    by_index: dict[int, str] = {}
+    for position, chunk in enumerate(chunks):
+        metadata = chunk.get("metadata") or {}
+        number = metadata.get("page_number") if isinstance(metadata, dict) else None
+        index = number - 1 if isinstance(number, int) and number >= 1 else position
+        by_index[index] = str(chunk.get("text") or "")
+    texts: dict[int, str] = {}
+    for page in pages:
+        if page.decision is PageDecision.OCR:
+            continue
+        text = by_index.get(page.index, "")
+        if not text.strip() and page.decision is PageDecision.TEXT:
+            text = _plain_text(doc, page.index)
+        texts[page.index] = text
+    return texts
+
+
+def _plain_text(doc: pymupdf.Document, index: int) -> str:
+    try:
+        return str(doc[index].get_text())
+    except Exception:
+        return ""
 
 
 def render_pages(raw: bytes, indexes: Sequence[int], max_pixels: int | None = None) -> list[bytes]:
@@ -155,6 +201,9 @@ def _decide(page: pymupdf.Page) -> PdfPage:
         if images or _has_non_rectangular_path(page):
             return decided(PageDecision.OCR, PageReason.SPARSE_TEXT)
         return decided(PageDecision.TEXT if chars else PageDecision.BLANK)
+    if len(images) > MAX_IMAGE_PLACEMENTS:
+        # Too many placements to union cheaply: a page drawn as image tiles.
+        return decided(PageDecision.OCR, PageReason.MANY_IMAGES)
     if _image_coverage(page.rect, [info["bbox"] for info in images]) >= FULL_PAGE_IMAGE_COVERAGE:
         if _invisible_chars(page) >= SPARSE_CHARS:
             return decided(PageDecision.TEXT, PageReason.HIDDEN_TEXT_LAYER)

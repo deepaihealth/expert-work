@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from collections.abc import Callable
@@ -44,8 +45,13 @@ LAYOUT_REPLY: dict[str, Any] = {
         [
             {"index": 0, "label": "text", "bbox_2d": [60, 40, 900, 90], "content": "## 第二章"},
             {"index": 1, "label": "text", "bbox_2d": [60, 100, 900, 160], "content": "员工请假"},
-            {"index": 2, "label": "image", "bbox_2d": [57, 199, 995, 637], "content": ""},
-            {"index": 3, "label": "table", "bbox_2d": [60, 660, 900, 900], "content": "<table>"},
+            {"index": 2, "label": "image", "bbox_2d": [57, 199, 995, 637], "content": "图"},
+            {
+                "index": 3,
+                "label": "table",
+                "bbox_2d": [60, 660, 900, 900],
+                "content": "<table><tr><td>年假</td></tr></table>",
+            },
         ]
     ],
     "data_info": {"num_pages": 1, "pages": [{"width": 1414, "height": 2000}]},
@@ -97,7 +103,8 @@ async def test_layout_parsing_request_and_reply() -> None:
     }
     assert reading.text == LAYOUT_REPLY["md_results"]
     assert reading.finish_reason is None
-    assert reading.layout_blocks == 3  # the image region holds no text
+    # Text of the text-bearing blocks only (image region excluded, markup dropped).
+    assert reading.layout_chars == len("##第二章") + len("员工请假") + len("年假")
     assert (reading.input_tokens, reading.output_tokens, reading.usage_reported) == (
         1180,
         212,
@@ -171,31 +178,32 @@ async def test_chat_vlm_reads_content_parts_and_length_finish() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "body", "retryable", "unavailable"),
+    ("status", "body", "retryable", "unavailable", "kind"),
     [
         # Zhipu 1302: too many concurrent requests — load, retried.
-        (429, {"error": {"code": "1302", "message": "您当前使用该API的并发数过高"}}, True, False),
-        (429, {"error": {"code": "1303", "message": "您当前使用该API的频率过高"}}, True, False),
+        (429, {"error": {"code": "1302", "message": "并发数过高"}}, True, False, "busy"),
+        (429, {"error": {"code": "1303", "message": "频率过高"}}, True, False, "busy"),
         # 1113: account in arrears — waits for 「补识别」, no retry.
-        (429, {"error": {"code": "1113", "message": "您的账户已欠费"}}, False, True),
-        (429, {}, True, False),
-        (401, {"error": {"code": "1000", "message": "身份验证失败"}}, False, True),
-        (402, {}, False, True),
-        (403, {}, False, True),
-        (408, {}, True, False),
-        (500, {}, True, False),
-        (503, {}, True, False),
-        (400, {"error": {"code": "1210", "message": "图片尺寸不符合要求"}}, False, False),
+        (429, {"error": {"code": "1113", "message": "您的账户已欠费"}}, False, True, "quota"),
+        (429, {}, True, False, "busy"),
+        (401, {"error": {"code": "1000", "message": "身份验证失败"}}, False, True, "auth"),
+        (402, {}, False, True, "quota"),
+        (403, {}, False, True, "auth"),
+        (408, {}, True, False, "busy"),
+        (500, {}, True, False, "busy"),
+        (503, {}, True, False, "busy"),
+        (400, {"error": {"code": "1210", "message": "图片尺寸不符"}}, False, False, "rejected"),
     ],
 )
 async def test_http_errors_are_classified(
-    status: int, body: dict[str, Any], retryable: bool, unavailable: bool
+    status: int, body: dict[str, Any], retryable: bool, unavailable: bool, kind: str
 ) -> None:
     async with _http(lambda _: httpx.Response(status, json=body)) as http:
         client = LayoutParsingClient(url="https://x/lp", api_key="k", model="glm-ocr", http=http)
         with pytest.raises(RecognitionCallError) as caught:
             await client.read(_IMAGE)
     assert (caught.value.retryable, caught.value.unavailable) == (retryable, unavailable)
+    assert caught.value.kind == kind
     assert str(status) in str(caught.value)
 
 
@@ -231,7 +239,7 @@ async def test_retry_backs_off_then_answers() -> None:
     async def sleep(delay: float) -> None:
         delays.append(delay)
 
-    busy = RecognitionCallError("429", retryable=True)
+    busy = RecognitionCallError("429", kind="busy")
     client = _Scripted(busy, busy)
     reading = await read_with_retry(client, _IMAGE, sleep=sleep)
     assert reading.text == "ok"
@@ -245,7 +253,7 @@ async def test_retry_gives_up_after_three_retries() -> None:
     async def sleep(delay: float) -> None:
         delays.append(delay)
 
-    busy = RecognitionCallError("503", retryable=True)
+    busy = RecognitionCallError("503", kind="busy")
     client = _Scripted(busy, busy, busy, busy, busy)
     with pytest.raises(RecognitionCallError):
         await read_with_retry(client, _IMAGE, sleep=sleep)
@@ -257,7 +265,47 @@ async def test_client_errors_are_not_retried() -> None:
     async def sleep(delay: float) -> None:
         raise AssertionError("no backoff for a 400")
 
-    client = _Scripted(RecognitionCallError("400"), RecognitionCallError("400"))
+    client = _Scripted(
+        RecognitionCallError("400", kind="rejected"), RecognitionCallError("400", kind="rejected")
+    )
     with pytest.raises(RecognitionCallError):
         await read_with_retry(client, _IMAGE, sleep=sleep)
     assert client.calls == 1
+
+
+@pytest.mark.parametrize("api", ["layout", "chat"])
+async def test_a_malformed_answer_still_carries_the_usage_billed(api: str) -> None:
+    # Review #6: the vendor charged for the call whatever its shape.
+    body = {"id": "x", "usage": {"prompt_tokens": 900, "completion_tokens": 40}}
+    async with _http(lambda _: httpx.Response(200, json=body)) as http:
+        client: Any = (
+            LayoutParsingClient(url="https://x/lp", api_key="k", model="glm-ocr", http=http)
+            if api == "layout"
+            else ChatVlmClient(url="https://x/c", api_key="k", model="m", http=http)
+        )
+        with pytest.raises(RecognitionCallError) as caught:
+            await client.read(_IMAGE)
+    assert caught.value.kind == "bad_response"
+    assert (caught.value.input_tokens, caught.value.output_tokens) == (900, 40)
+
+
+def test_api_keys_stay_out_of_reprs() -> None:
+    layout = LayoutParsingClient(url="https://x/lp", api_key="sk-secret-1", model="glm-ocr")
+    chat = ChatVlmClient(url="https://x/c", api_key="sk-secret-2", model="m")
+    assert "sk-secret" not in repr(layout) + repr(chat)
+
+
+async def test_the_concurrency_slot_is_not_held_while_backing_off() -> None:
+    # Review #7: a page backing off for a retry must not starve the others.
+    limit = asyncio.Semaphore(1)
+    held_while_sleeping: list[bool] = []
+
+    async def sleep(delay: float) -> None:
+        del delay
+        held_while_sleeping.append(limit.locked())
+
+    busy = RecognitionCallError("429", kind="busy")
+    reading = await read_with_retry(_Scripted(busy, busy), _IMAGE, sleep=sleep, limit=limit)
+    assert reading.text == "ok"
+    assert held_while_sleeping == [False, False]
+    assert not limit.locked()

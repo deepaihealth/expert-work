@@ -35,6 +35,7 @@ import multiprocessing
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -49,12 +50,18 @@ from control_plane.knowledge.parsing import (
     strip_lone_surrogates,
 )
 from control_plane.knowledge.recognition.assembly import (
+    MAX_RECOGNIZED_CHARS_PER_DOCUMENT,
     assemble_pages,
+    cap_recognized_text,
     no_text_message,
     page_records,
 )
 from control_plane.knowledge.recognition.pages import analyse_pdf, render_pages
-from control_plane.knowledge.recognition.recognizer import DocumentRecognizer, PageOutcome
+from control_plane.knowledge.recognition.recognizer import (
+    ERROR_NOT_CONFIGURED,
+    DocumentRecognizer,
+    PageOutcome,
+)
 from control_plane.knowledge.usage import IngestUsageRecorder, billed_embeddings
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
@@ -213,23 +220,41 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
     return await _in_parse_pool(filename, parse_document, filename, raw)
 
 
-async def _in_parse_pool[T](filename: str, fn: Callable[..., T], *args: object) -> T:
+@dataclass
+class _PoolBudget:
+    """B-209 (review M2) —— one parse-pool time budget per document: page
+    analysis plus every render batch share :data:`_parse_timeout_s`, as the
+    single ``parse_document`` call did before. Time queued for a slot is not
+    charged."""
+
+    remaining: float
+
+
+async def _in_parse_pool[T](
+    filename: str, fn: Callable[..., T], *args: object, budget: _PoolBudget | None = None
+) -> T:
     """``fn(*args)`` in the parse pool, with :func:`parse_document_in_pool`'s
     slot, timeout and broken-pool handling (B-209: PDF page analysis and page
-    rendering use PyMuPDF too, so they run there as well)."""
+    rendering use PyMuPDF too, so they run there as well). With ``budget`` the
+    call may only use what is left of the document's budget."""
     async with _get_parse_slots():
         for attempt in (1, 2):
             loop = asyncio.get_running_loop()
+            timeout = _parse_timeout_s if budget is None else budget.remaining
+            if timeout <= 0:
+                msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
+                raise DocumentParseError(msg)
             executor = _get_parse_executor()
+            started = loop.time()
             try:
                 # ``submit`` itself raises on a broken pool — keep it in the try.
                 future = loop.run_in_executor(executor, fn, *args)
-                return await asyncio.wait_for(future, timeout=_parse_timeout_s)
+                return await asyncio.wait_for(future, timeout=timeout)
             except TimeoutError as exc:
                 logger.warning(
                     "knowledge.parse_timeout document=%r timeout=%gs — killing the parse pool",
                     filename,
-                    _parse_timeout_s,
+                    timeout,
                 )
                 _discard_parse_pool(executor)
                 msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
@@ -243,6 +268,9 @@ async def _in_parse_pool[T](filename: str, fn: Callable[..., T], *args: object) 
                 _discard_parse_pool(executor)
                 if attempt == 2:
                     raise
+            finally:
+                if budget is not None:
+                    budget.remaining -= loop.time() - started
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -453,10 +481,19 @@ async def _parse_pdf_pages(
 ) -> str:
     """B-209 §5.1 / §5.6 —— decide every page, recognize the scanned ones,
     record each page's outcome, then join the pages back into Markdown in
-    page order. A PDF with no scanned page parses exactly as before."""
-    analysis = await _in_parse_pool(filename, analyse_pdf, filename, raw)
-    outcomes: dict[int, PageOutcome] = {}
-    if analysis.markdown is None:
+    page order.
+
+    Never worse than before: a PDF with no scanned page — or whose scanned
+    pages gave no text (nothing configured, everything failed) — gets exactly
+    :func:`parse_document`'s text, MarkItDown fallback included; only the
+    error, if that is empty too, names the pages and why."""
+    budget = _PoolBudget(_parse_timeout_s)
+    analysis = await _in_parse_pool(filename, analyse_pdf, filename, raw, budget=budget)
+    if not analysis.pages:  # PyMuPDF could not walk it: parsed as before, no records
+        return analysis.markdown or ""
+
+    async def recognizing() -> None:
+        # Fenced: raises once a re-upload / another claim took the document.
         await _advance(
             store,
             tenant_id=tenant_id,
@@ -464,20 +501,29 @@ async def _parse_pdf_pages(
             stage=IngestStage.RECOGNIZING,
             generation=generation,
         )
+
+    outcomes: dict[int, PageOutcome] = {}
+    if analysis.markdown is None:
+        await recognizing()
         scanned = [page.index for page in analysis.ocr_pages]
         if recognizer is None:
-            pending = PageOutcome(
-                status=PageStatus.PENDING, error="document recognition is not set up"
-            )
+            pending = PageOutcome(status=PageStatus.PENDING, error=ERROR_NOT_CONFIGURED)
             outcomes = dict.fromkeys(scanned, pending)
         else:
 
             async def render(indexes: list[int], max_pixels: int | None) -> list[bytes]:
-                return await _in_parse_pool(filename, render_pages, raw, indexes, max_pixels)
+                return await _in_parse_pool(
+                    filename, render_pages, raw, indexes, max_pixels, budget=budget
+                )
 
             outcomes = await recognizer.recognize_document(
-                tenant_id=tenant_id, pages=scanned, render=render
+                tenant_id=tenant_id,
+                document_id=document_id,
+                pages=scanned,
+                render=render,
+                before_batch=recognizing,
             )
+        outcomes = cap_recognized_text(outcomes, MAX_RECOGNIZED_CHARS_PER_DOCUMENT)
     pages = page_records(analysis, outcomes)
     if not await store.set_document_pages(
         tenant_id=tenant_id, document_id=document_id, pages=pages, generation=generation
@@ -486,10 +532,12 @@ async def _parse_pdf_pages(
         raise StaleIngestionError(msg)
     if analysis.markdown is not None:
         return analysis.markdown
-    markdown = assemble_pages(analysis, outcomes)
-    if not strip_lone_surrogates(markdown).strip():
-        raise DocumentParseError(no_text_message(filename, pages))
-    return markdown
+    if not any(o.status is PageStatus.RECOGNIZED and o.text.strip() for o in outcomes.values()):
+        try:
+            return await _in_parse_pool(filename, parse_document, filename, raw, budget=budget)
+        except DocumentParseError as exc:
+            raise DocumentParseError(no_text_message(filename, pages), exc.code) from exc
+    return assemble_pages(analysis, outcomes)
 
 
 async def ingest_markdown(

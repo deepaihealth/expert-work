@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
+from expert_work.common.observability import expert_work_counter
 from expert_work.persistence.token_usage_store import (
     KNOWLEDGE_INGEST_USAGE_KIND,
     TokenUsageRecord,
@@ -24,6 +25,13 @@ from expert_work.protocol.billing import provider_for_model
 from orchestrator.llm import embedding_usage_sink
 
 logger = logging.getLogger(__name__)
+
+#: A usage row is written at most this many times (one in-line retry).
+_WRITE_ATTEMPTS = 2
+_usage_write_failures = expert_work_counter(
+    "expert_work_knowledge_ingest_usage_write_failures_total",
+    "knowledge_ingest usage rows that could not be written (spend left unbilled).",
+)
 
 
 @dataclass(frozen=True)
@@ -43,26 +51,36 @@ class IngestUsageRecorder:
     ) -> None:
         if input_tokens <= 0 and output_tokens <= 0:
             return
-        try:
-            await self.store.insert(
-                TokenUsageRecord(
-                    tenant_id=tenant_id,
-                    agent_name="",
-                    agent_version="",
-                    model=model,
-                    provider=provider,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    usage_kind=KNOWLEDGE_INGEST_USAGE_KIND,
+        record = TokenUsageRecord(
+            tenant_id=tenant_id,
+            agent_name="",
+            agent_version="",
+            model=model,
+            provider=provider,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            usage_kind=KNOWLEDGE_INGEST_USAGE_KIND,
+        )
+        for attempt in range(1, _WRITE_ATTEMPTS + 1):
+            try:
+                await self.store.insert(record)
+                return
+            except Exception:
+                if attempt < _WRITE_ATTEMPTS:
+                    continue
+                # Unbilled spend: the counter alerts, the line carries what to back-fill.
+                _usage_write_failures.inc()
+                logger.warning(
+                    "knowledge.ingest_usage_write_failed tenant=%s provider=%s model=%s "
+                    "input_tokens=%d output_tokens=%d attempts=%d",
+                    tenant_id,
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    attempt,
+                    exc_info=True,
                 )
-            )
-        except Exception:
-            logger.warning(
-                "knowledge.ingest_usage_write_failed tenant=%s model=%s",
-                tenant_id,
-                model,
-                exc_info=True,
-            )
 
 
 @dataclass

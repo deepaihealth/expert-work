@@ -294,9 +294,10 @@ def test_page_stats_count_each_status() -> None:
     )
 
 
-def test_page_stats_needs_recognition_only_for_failed_or_pending() -> None:
+def test_page_stats_needs_recognition_for_failed_pending_or_over_limit() -> None:
     assert not PageStats.of([_page(1, PageStatus.RECOGNIZED)]).needs_recognition
-    # Over the cap is not fixed by recognizing again — raising the cap is.
-    assert not PageStats.of([_page(1, PageStatus.OVER_LIMIT)]).needs_recognition
+    assert not PageStats.of([_page(1, None)]).needs_recognition
+    # Past the page limit: read once the platform limit is raised.
+    assert PageStats.of([_page(1, PageStatus.OVER_LIMIT)]).needs_recognition
     assert PageStats.of([_page(1, PageStatus.FAILED)]).needs_recognition
     assert PageStats.of([_page(1, PageStatus.PENDING)]).needs_recognition

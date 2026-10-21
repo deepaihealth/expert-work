@@ -238,6 +238,11 @@ def _base_dict(
     }
 
 
+#: B-209 —— page records per ``GET …/pages`` response (default / ceiling).
+PAGES_PAGE_DEFAULT = 200
+PAGES_PAGE_MAX = 1000
+
+
 def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
     return {
         "id": str(document.id),
@@ -820,7 +825,7 @@ def build_knowledge_router() -> APIRouter:
         if document.page_stats is None or not document.page_stats.needs_recognition:
             raise HTTPException(
                 status_code=409,
-                detail="document has no page that failed or waits for recognition",
+                detail="document has no page that failed, waits or is past the page limit",
             )
         reset = await _redrive(store, runner, tenant_id, base, document)
         await _audit_write(
@@ -849,12 +854,15 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        offset: int = 0,
+        limit: int = PAGES_PAGE_DEFAULT,
         # W3 read scope — subordinate detail read: concrete tenant only.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """B-209 §5.6 —— the document's per-page records (how each PDF page's
-        text was obtained; for a scanned page the model, outcome and error).
-        Empty for a document that is not a PDF."""
+        text was obtained; for a scanned page the model, outcome and error
+        class), a page of them at a time (``offset`` / ``limit``, at most
+        :data:`PAGES_PAGE_MAX`). Empty for a document that is not a PDF."""
         scope = await ensure_single_tenant_scope(
             request.state.principal,
             tenant_id,
@@ -871,9 +879,18 @@ def build_knowledge_router() -> APIRouter:
             pages = await store.list_document_pages(
                 tenant_id=scope.tenant_id, document_id=document_id
             )
+        records = pages or []
+        safe_offset = max(0, offset)
+        safe_limit = max(1, min(limit, PAGES_PAGE_MAX))
         return JSONResponse(
             content={
-                "pages": [page.model_dump(mode="json") for page in pages or ()],
+                "pages": [
+                    page.model_dump(mode="json")
+                    for page in records[safe_offset : safe_offset + safe_limit]
+                ],
+                "total": len(records),
+                "offset": safe_offset,
+                "limit": safe_limit,
                 "page_stats": _document_dict(document)["page_stats"],
             }
         )

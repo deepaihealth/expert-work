@@ -4,9 +4,13 @@
   文字(文字层 / 识别 / 空白)、识别模型与成败,以及「已识别 N 页 · 失败 M 页 · 待识别 K 页」
   计数。设计 §5.6 允许「新表或文档上的 JSON 列,按数据量定」:单份上限 1,000 页、每页一条
   百来字节,放文档行上;读列表只取 ``page_stats``,逐页明细单独读。
-* ``knowledge_parse_cache``:识别结果缓存,**按租户隔离**(设计 ⑩)。键 = 送模型的图片字节
-  sha256 + 模型 + 提示词版本 + 渲染参数;同一页重传 / 补识别 / 重新切分都先查它,不重复付费。
-  带 ``tenant_id`` + 与 0165 同形的 ``app.tenant_id`` 策略(ENABLE + FORCE)。
+* ``knowledge_parse_cache``:识别结果缓存,**按文档**(复核 M1:识别文字可能是健康资料,
+  文档删了它必须跟着删)。``document_id`` 外键指向 ``knowledge_document``、``ON DELETE
+  CASCADE``(删文档、删库都带走;``delete_document`` / ``delete_base`` 另有显式 DELETE,
+  外键是兜底,同 0136)。键 = 送模型的图片字节 sha256 + 模型 + 请求参数 + 渲染参数;同一份
+  文档重传 / 补识别 / 重新切分都先查它,不重复付费;同一个文件传成另一份文档会再付一次。
+  存厂商原始回答(读出时按当前规则清洗)。带 ``tenant_id`` + 与 0165 同形的 ``app.tenant_id``
+  策略(ENABLE + FORCE)。
 * ``platform_recognition_config``:平台级单行配置(``id = 'singleton'``,无租户、无 RLS,
   同 ``platform_judge_config``):扫描页识别模型、兜底模型、图片描述模型、单份文档识别页数
   上限。没有行 = 用默认(glm-ocr / qwen3.7-flash / qwen3.8-flash / 1,000)。
@@ -59,6 +63,16 @@ def upgrade() -> None:
     op.create_table(
         _CACHE,
         sa.Column("tenant_id", UUID(as_uuid=True), nullable=False),
+        sa.Column(
+            "document_id",
+            UUID(as_uuid=True),
+            sa.ForeignKey(
+                "knowledge_document.id",
+                ondelete="CASCADE",
+                name="fk_knowledge_parse_cache_document",
+            ),
+            nullable=False,
+        ),
         sa.Column("kind", sa.Text(), nullable=False),
         sa.Column("cache_key", sa.Text(), nullable=False),
         sa.Column("model", sa.Text(), nullable=False),
@@ -70,7 +84,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
         ),
         sa.PrimaryKeyConstraint(
-            "tenant_id", "kind", "cache_key", name="knowledge_parse_cache_pkey"
+            "document_id", "kind", "cache_key", name="knowledge_parse_cache_pkey"
         ),
         sa.CheckConstraint(
             "kind IN ('page_ocr', 'figure_desc', 'figure_ocr')",

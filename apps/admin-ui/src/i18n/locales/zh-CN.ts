@@ -579,7 +579,7 @@ const zhCN: TranslationKeys = {
     pages_failed: "识别失败 {{count}} 页",
     pages_pending: "待识别 {{count}} 页",
     pages_over_limit: "超上限未识别 {{count}} 页",
-    pages_hint: "这份 PDF 里有扫描页。失败或待识别的页还没进知识库，可点「补识别」。",
+    pages_hint: "这份 PDF 里有扫描页。识别失败、待识别或超上限的页还没进知识库，可点「补识别」（超上限的页要先在平台设置里调高识别页数上限）。",
     recognize: "补识别",
     recognize_started: "已开始补识别：只把失败和待识别的页送去识别。",
     recognize_nothing: "没有失败或待识别的页。",

@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 import pymupdf
 import pytest
 
+from control_plane.knowledge import ingestion
 from control_plane.knowledge.ingestion import (
     KnowledgeIngestionRunner,
     StaleIngestionError,
@@ -22,7 +23,7 @@ from control_plane.knowledge.ingestion import (
     ingest_document_bytes,
     shutdown_parse_pool,
 )
-from control_plane.knowledge.parsing import DocumentParseError
+from control_plane.knowledge.parsing import DocumentParseError, parse_document
 from control_plane.knowledge.recognition import recognizer as recognizer_module
 from control_plane.knowledge.recognition.clients import Reading, RecognitionClient
 from control_plane.knowledge.recognition.pages import render_pages
@@ -246,7 +247,7 @@ async def test_without_a_recognizer_the_scanned_page_is_recorded_not_silently_em
     await _ingest(doc, "handbook.pdf", raw, recognizer=None)
     pages = await _pages(doc)
     assert pages[1].status is PageStatus.PENDING
-    assert pages[1].error == "document recognition is not set up"
+    assert pages[1].error == "not_configured"
     document = await doc.store.get_document(tenant_id=doc.tenant, document_id=doc.document_id)
     assert document is not None and document.page_stats is not None
     assert document.page_stats.pages_pending == 1
@@ -265,7 +266,8 @@ async def test_scanned_pdf_with_no_usable_model_fails_with_the_reason_and_record
     message = str(caught.value)
     assert "2 of 2 pages scanned" in message
     assert "2 waiting for recognition" in message
-    assert "no platform credential for provider 'glm'" in message
+    assert "glm/glm-ocr: credential_missing" in message
+    assert "no platform credential" not in message  # resolver text stays in server logs
     assert reader.calls == 0
     # The pages are on record even though the document failed.
     assert [p.status for p in await _pages(doc)] == [PageStatus.PENDING, PageStatus.PENDING]
@@ -447,3 +449,123 @@ async def test_runner_recognizes_through_the_parse_process_pool() -> None:
     assert fetched.status is DocumentStatus.READY, fetched.error
     assert fetched.page_stats == PageStats(pages_total=2, pages_ocr=1)
     assert reader.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# 复核修复:不比改前差、每份文档一个解析时间预算、换了主人就停、整份文字上限
+# ---------------------------------------------------------------------------
+
+
+class _PoolSpy:
+    """Records which functions went to the parse pool and with which budget."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[tuple[str, object]] = []
+        real = ingestion._in_parse_pool
+
+        async def spy(filename: str, fn: Any, *args: object, budget: Any = None) -> Any:
+            self.calls.append((fn.__name__, budget))
+            return await real(filename, fn, *args, budget=budget)
+
+        monkeypatch.setattr(ingestion, "_in_parse_pool", spy)
+
+    @property
+    def names(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+
+async def test_scanned_pages_that_gave_no_text_leave_the_document_as_it_parsed_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing could read the scan: the document's text is exactly what
+    # ``parse_document`` (MarkItDown fallback included) gives, as before B-209.
+    spy = _PoolSpy(monkeypatch)
+    raw = _pdf("text", "scan", "text")
+    doc = await _document("handbook.pdf", raw)
+    await _ingest(doc, "handbook.pdf", raw, recognizer=None)
+    assert spy.names == ["analyse_pdf", "parse_document"]
+    expected = parse_document("handbook.pdf", raw)
+    assert "".join((await _bodies(doc)).split()) == "".join(expected.split())
+
+
+async def test_a_recognized_page_skips_the_legacy_parse(monkeypatch: pytest.MonkeyPatch) -> None:
+    spy = _PoolSpy(monkeypatch)
+    raw = _pdf("text", "scan")
+    doc = await _document("mixed.pdf", raw)
+    await _ingest(doc, "mixed.pdf", raw, recognizer=_recognizer(doc.store, _Reader()))
+    assert spy.names == ["analyse_pdf", "render_pages"]
+
+
+async def test_analysis_and_every_render_share_one_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review M2: one parse-pool budget per document, not 600 s per batch.
+    monkeypatch.setattr(recognizer_module, "RENDER_BATCH", 1)
+    spy = _PoolSpy(monkeypatch)
+    raw = _pdf("scan", "scan", "scan")
+    doc = await _document("book.pdf", raw)
+    await _ingest(doc, "book.pdf", raw, recognizer=_recognizer(doc.store, _Reader()))
+    assert spy.names == ["analyse_pdf", "render_pages", "render_pages", "render_pages"]
+    budgets = {id(budget) for _, budget in spy.calls}
+    assert len(budgets) == 1 and spy.calls[0][1] is not None
+
+
+async def test_the_pool_budget_is_spent_and_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(ingestion, "_parse_executor", executor)
+    monkeypatch.setattr(ingestion, "_parse_slots", None)
+    budget = ingestion._PoolBudget(remaining=5.0)
+    assert await ingestion._in_parse_pool("a.pdf", time.sleep, 0.05, budget=budget) is None
+    assert 4.8 < budget.remaining < 4.96
+    budget.remaining = 0.0
+    with pytest.raises(DocumentParseError, match="timed out"):
+        await ingestion._in_parse_pool("a.pdf", time.sleep, 0, budget=budget)
+    budget.remaining = 0.05
+    with pytest.raises(DocumentParseError, match="timed out"):
+        await ingestion._in_parse_pool("a.pdf", time.sleep, 0.5, budget=budget)
+    executor.shutdown(wait=True)
+
+
+class _LosesTheDocumentStore(_StageStore):
+    """The document is re-uploaded while page batch 2 is about to start."""
+
+    async def set_document_stage(self, **kwargs: Any) -> bool:
+        if (
+            kwargs["stage"] is IngestStage.RECOGNIZING
+            and self.stages.count(IngestStage.RECOGNIZING) >= 2
+        ):
+            self.stages.append(kwargs["stage"])
+            return False
+        return await super().set_document_stage(**kwargs)
+
+
+async def test_a_worker_that_lost_the_document_stops_paying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(recognizer_module, "RENDER_BATCH", 1)
+    raw = _pdf("scan", "scan", "scan")
+    store, tenant = _LosesTheDocumentStore(), uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=base.id, filename="book.pdf", content=raw
+    )
+    doc = _Doc(store, tenant, base.id, document.id)
+    reader = _Reader()
+    with pytest.raises(StaleIngestionError):
+        await _ingest(doc, "book.pdf", raw, recognizer=_recognizer(store, reader))
+    # Stage write #1 (entering RECOGNIZING) and #2 (before batch 1) pass; the
+    # guard before batch 2 is refused — only one page was read.
+    assert reader.calls == 1
+
+
+async def test_recognized_text_past_the_document_limit_is_recorded_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ingestion, "MAX_RECOGNIZED_CHARS_PER_DOCUMENT", len(_RECOGNIZED) + 5)
+    raw = _pdf("scan", "scan")
+    doc = await _document("two.pdf", raw)
+    await _ingest(doc, "two.pdf", raw, recognizer=_recognizer(doc.store, _Reader()))
+    pages = await _pages(doc)
+    assert [p.status for p in pages] == [PageStatus.RECOGNIZED, PageStatus.FAILED]
+    assert pages[1].error == "document_text_limit"

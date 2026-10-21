@@ -17,12 +17,13 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 
-from control_plane.knowledge.recognition.cleaning import NO_TEXT_SENTENCE
+from control_plane.knowledge.recognition.cleaning import NO_TEXT_SENTENCE, layout_text_chars
 from orchestrator.llm import (
     DEEPSEEK_BASE_URL,
     DEFAULT_CHAT_COMPLETIONS_PATH,
@@ -89,16 +90,50 @@ _ACCOUNT_429_CODES = frozenset({"1113", "1304"})
 #: Layout block labels that are not text (their area holds no characters).
 _NON_TEXT_LABELS = frozenset({"image", "figure", "chart", "seal"})
 
+#: A response body larger than this is not parsed (a page reads to ~10 KB;
+#: the cleaner caps a reading at 64 KB anyway).
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+#: What went wrong with a recognition call (B-209 review L2: the tenant sees
+#: only this class, never the vendor's text):
+#:   "auth"         —— 401 / 403:密钥无效或无权限;
+#:   "quota"        —— 402、智谱 429 欠费 / 当日额度用完:账户状态;
+#:   "busy"         —— 429 限流、408、5xx、超时、连接错误、回包不是 JSON:可重试;
+#:   "rejected"     —— 其余 4xx:厂商拒了这次请求(换模型才可能好);
+#:   "bad_response" —— 回包形状不对(没有 md_results / choices)、或大得离谱。
+CallErrorKind = Literal["auth", "quota", "busy", "rejected", "bad_response"]
+
 
 class RecognitionCallError(Exception):
-    """One recognition call failed. ``retryable``: load / transport — try the
-    same call again. ``unavailable``: the model cannot be used right now (no
-    or bad key, account out of credit) — the page waits for 「补识别」."""
+    """One recognition call failed (``str(exc)`` holds the vendor detail —
+    server logs only). ``retryable``: try the same call again. ``unavailable``:
+    the model cannot be used right now — the page waits for 「补识别」. A
+    response that was parsed but failed its shape check still carries the
+    ``usage`` the vendor billed for (``input_tokens`` / ``output_tokens``)."""
 
-    def __init__(self, message: str, *, retryable: bool = False, unavailable: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: CallErrorKind,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        usage_reported: bool = False,
+    ) -> None:
         super().__init__(message)
-        self.retryable = retryable
-        self.unavailable = unavailable
+        self.kind: CallErrorKind = kind
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.usage_reported = usage_reported
+
+    @property
+    def retryable(self) -> bool:
+        return self.kind == "busy"
+
+    @property
+    def unavailable(self) -> bool:
+        return self.kind in ("auth", "quota")
 
 
 @dataclass(frozen=True)
@@ -108,8 +143,9 @@ class Reading:
     text: str
     #: Chat API ``finish_reason`` (``None`` for layout parsing).
     finish_reason: str | None = None
-    #: Text blocks the vendor's layout model found (layout parsing only).
-    layout_blocks: int | None = None
+    #: Characters of text in the vendor layout model's text blocks (layout
+    #: parsing only; :func:`~control_plane.knowledge.recognition.cleaning.layout_text_chars`).
+    layout_chars: int | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     #: The response carried a ``usage`` object (billing needs it).
@@ -138,30 +174,35 @@ async def _post(
             async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
                 response = await client.post(url, json=body, headers=headers)
     except httpx.HTTPError as exc:  # timeouts + transport errors
-        raise RecognitionCallError(f"{type(exc).__name__}: {exc}", retryable=True) from exc
+        raise RecognitionCallError(f"{type(exc).__name__}: {exc}", kind="busy") from exc
     if response.is_error:
         raise _status_error(response)
+    if len(response.content) > _MAX_RESPONSE_BYTES:
+        msg = f"response of {len(response.content)} bytes"
+        raise RecognitionCallError(msg, kind="bad_response")
     try:
         data = response.json()
     except ValueError as exc:
-        raise RecognitionCallError("response is not JSON", retryable=True) from exc
+        raise RecognitionCallError("response is not JSON", kind="busy") from exc
     if not isinstance(data, dict):
-        raise RecognitionCallError("response is not a JSON object", retryable=True)
+        raise RecognitionCallError("response is not a JSON object", kind="busy")
     return data
 
 
 def _status_error(response: httpx.Response) -> RecognitionCallError:
     status = response.status_code
     message = f"{status} {response.text[:_ERROR_BODY_LIMIT]}"
-    if status in (401, 402, 403):
-        return RecognitionCallError(message, unavailable=True)
+    if status in (401, 403):
+        return RecognitionCallError(message, kind="auth")
+    if status == 402:
+        return RecognitionCallError(message, kind="quota")
     if status == 429:
         if _vendor_error_code(response) in _ACCOUNT_429_CODES:
-            return RecognitionCallError(message, unavailable=True)
-        return RecognitionCallError(message, retryable=True)
+            return RecognitionCallError(message, kind="quota")
+        return RecognitionCallError(message, kind="busy")
     if status == 408 or status >= 500:
-        return RecognitionCallError(message, retryable=True)
-    return RecognitionCallError(message)
+        return RecognitionCallError(message, kind="busy")
+    return RecognitionCallError(message, kind="rejected")
 
 
 def _vendor_error_code(response: httpx.Response) -> str | None:
@@ -178,7 +219,24 @@ def _usage(data: Mapping[str, Any]) -> tuple[int, int, bool]:
     usage = data.get("usage")
     if not isinstance(usage, Mapping):
         return 0, 0, False
-    return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0), True
+    try:
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0, 0, False
+    return max(prompt, 0), max(completion, 0), True
+
+
+def _shape_error(message: str, usage: tuple[int, int, bool]) -> RecognitionCallError:
+    """A parsed response of the wrong shape — still billed by the vendor."""
+    input_tokens, output_tokens, reported = usage
+    return RecognitionCallError(
+        message,
+        kind="bad_response",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        usage_reported=reported,
+    )
 
 
 @dataclass(frozen=True)
@@ -186,7 +244,7 @@ class LayoutParsingClient:
     """``layout_parsing`` adapter (glm-ocr)."""
 
     url: str
-    api_key: str
+    api_key: str = field(repr=False)
     model: str
     http: httpx.AsyncClient | None = None
 
@@ -194,31 +252,37 @@ class LayoutParsingClient:
         data = await _post(
             self.http, self.url, self.api_key, {"model": self.model, "file": _data_uri(image)}
         )
+        usage = _usage(data)  # before any shape check: a malformed answer is billed too
         markdown = data.get("md_results")
         if not isinstance(markdown, str):
-            raise RecognitionCallError("layout_parsing response has no md_results")
-        input_tokens, output_tokens, reported = _usage(data)
+            raise _shape_error("layout_parsing response has no md_results", usage)
+        input_tokens, output_tokens, reported = usage
         return Reading(
             text=markdown,
-            layout_blocks=_text_blocks(data.get("layout_details")),
+            layout_chars=_layout_chars(data.get("layout_details")),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             usage_reported=reported,
         )
 
 
-def _text_blocks(details: object) -> int | None:
-    """Text blocks in ``layout_details`` (a list per page of block dicts)."""
+def _layout_chars(details: object) -> int | None:
+    """Characters of text in ``layout_details`` (a list per page of block
+    dicts): only text-bearing blocks (not image / figure / chart / seal) with
+    a string ``content`` count — a form of many short labels expects only as
+    much text as those labels hold."""
     if not isinstance(details, list):
         return None
-    blocks = [
-        block
+    contents = [
+        str(block.get("content"))
         for page in details
         if isinstance(page, list)
         for block in page
         if isinstance(block, dict)
+        and isinstance(block.get("content"), str)
+        and str(block.get("label", "")).lower() not in _NON_TEXT_LABELS
     ]
-    return sum(1 for block in blocks if str(block.get("label", "")).lower() not in _NON_TEXT_LABELS)
+    return layout_text_chars(contents)
 
 
 @dataclass(frozen=True)
@@ -226,7 +290,7 @@ class ChatVlmClient:
     """``chat_vlm`` adapter (OpenAI-compatible vision chat)."""
 
     url: str
-    api_key: str
+    api_key: str = field(repr=False)
     model: str
     #: Vendor fields: thinking off + output cap (catalog-driven).
     request_fields: Mapping[str, Any] = field(default_factory=dict)
@@ -249,12 +313,13 @@ class ChatVlmClient:
             **self.request_fields,
         }
         data = await _post(self.http, self.url, self.api_key, body)
+        usage = _usage(data)  # before any shape check: a malformed answer is billed too
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-            raise RecognitionCallError("chat response has no choices")
+            raise _shape_error("chat response has no choices", usage)
         choice = choices[0]
         message = choice.get("message")
-        input_tokens, output_tokens, reported = _usage(data)
+        input_tokens, output_tokens, reported = usage
         finish = choice.get("finish_reason")
         return Reading(
             text=_message_text(message.get("content") if isinstance(message, dict) else None),
@@ -278,14 +343,17 @@ async def read_with_retry(
     image: bytes,
     *,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    limit: AbstractAsyncContextManager[Any] | None = None,
 ) -> Reading:
     """``client.read`` retried on load / transport errors (see module doc);
-    the last error propagates."""
+    the last error propagates. ``limit`` (the model's concurrency slot) is
+    held per attempt only — never while backing off."""
     for attempt in range(_RETRIES + 1):
         try:
-            return await client.read(image)
+            async with limit if limit is not None else nullcontext():
+                return await client.read(image)
         except RecognitionCallError as exc:
             if not exc.retryable or attempt == _RETRIES:
                 raise
-            await sleep(min(_RETRY_BASE_S * 2**attempt, _RETRY_CAP_S))
+        await sleep(min(_RETRY_BASE_S * 2**attempt, _RETRY_CAP_S))
     raise AssertionError("unreachable")  # pragma: no cover

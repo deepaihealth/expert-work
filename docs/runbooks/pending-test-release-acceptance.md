@@ -766,10 +766,11 @@ PY
 - [ ] **42.3 混合 PDF**:任一知识库上传 `b209-mixed.pdf`。判据:① 文档 ready,列表显示「已识别 1 页」;② `GET …/documents/{id}/pages` 第 2 页 `decision=ocr`、`status=recognized`、`model=glm-ocr`;③ 分段预览里 `SCAN-PAGE-MARKER 7319` 那段排在第 1、3 页文字之间;④ `token_usage` 有一行 `usage_kind=knowledge_ingest`、`model=glm-ocr`、token > 0。**没有这行**:查日志 `knowledge.recognition_usage_missing` —— glm-ocr 回包的 usage 形状与实现假设不同,判 bug。**没修好时**:第 2 页文字不在任何分段里,文档照样 ready。
 - [ ] **42.4 全扫描 PDF**:上传 `b209-scan5.pdf`。判据:ready,`page_stats.pages_ocr=5`;检索测试搜「SCAN-PAGE-MARKER 7319」能命中。**没修好时**:`parse_failed`。
 - [ ] **42.5 兜底模型通路 + 关思考**:平台设置把识别模型临时设成 qwen3.7-flash,再传一次 `b209-mixed.pdf`(换个文件名)。判据:识别成功、没有 400;用量行 `model=qwen3.7-flash`;厂商回包 / 日志里思考 token 为 0,`max_completion_tokens` 被接受(B-105 上架探针)。测完改回 glm-ocr。
-- [ ] **42.6 未配置 → 待识别 → 补识别**:把识别和兜底两项都清空,上传混合 PDF;再恢复设置,点该文档「补识别」。判据:清空时文档 ready、显示「待识别 1 页」、逐页记录 error 为 `no recognition model configured`;补识别后变「已识别」,只新增一行 glm-ocr 用量。
-- [ ] **42.7 缓存不重复计费**:对 42.3 的文档点「重新摄取」。判据:没有新增识别用量行;`knowledge_parse_cache` 行数不变。
-- [ ] **42.8 页数上限**:上限设为 1,上传 `b209-scan5.pdf`(换文件名)。判据:`pages_ocr=1`、`pages_over_limit=4`,列表出现「超上限未识别 4 页」。测完改回 1000。
+- [ ] **42.6 未配置 → 待识别 → 补识别**:把识别和兜底两项都清空,上传混合 PDF;再恢复设置,点该文档「补识别」。判据:清空时文档 ready、显示「待识别 1 页」、逐页记录 error 为 `not_configured`(给租户看的只有固定错误类,厂商原文 / 凭据报错只在服务端日志);补识别后变「已识别」,只新增一行 glm-ocr 用量。
+- [ ] **42.7 缓存不重复计费(按文档)**:对 42.3 的文档点「重新摄取」。判据:没有新增识别用量行;`SELECT count(*) FROM knowledge_parse_cache WHERE document_id = '<42.3 的文档 id>'` 不变。再把同一个文件传进**另一个**知识库:判据:新文档的扫描页**再识别一次**、新增一行 glm-ocr 用量(缓存按文档,复核 M1 拍板的代价)。
+- [ ] **42.8 页数上限 → 调高后补识别**:上限设为 1,上传 `b209-scan5.pdf`(换文件名)。判据:`pages_ocr=1`、`pages_over_limit=4`,列表出现「超上限未识别 4 页」**和「补识别」按钮**。上限改回 1000,点「补识别」。判据:`pages_ocr=5`、`pages_over_limit=0`;只新增 4 行 glm-ocr 用量(第 1 页走缓存)。**没修好时**:超上限的页没有「补识别」按钮,接口回 409。
 - [ ] **42.9 入库嵌入记账**:上传一份 .md 文档。判据:`token_usage` 有 `knowledge_ingest` / `qwen` / `text-embedding-v4` 一行;用量页「按用途」出现「知识库入库」。**没修好时**:入库嵌入没有任何用量行。
 - [ ] **42.10 查询嵌入记 platform_overhead**:让挂了知识库的智能体跑一次 `knowledge_search`。判据:有一行 `platform_overhead`、`model=text-embedding-v4`、`agent_name` 是该智能体、`trace_id` 与该 run 相同。
 - [ ] **42.11 纯文字 PDF 不受影响**:对已入库的纯文字 PDF 点「重新摄取」。判据:日志 `knowledge.ingest_vectors` 显示 `embedded=0`、分段数不变;没有经过 recognizing 阶段。
 - [ ] **42.12 模型下拉(B-210)**:智能体配置页与 judge 设置的模型下拉。判据:两处都没有 glm-ocr;智能体下拉里没有 qwen3-vl-flash;已配 qwen3-vl-flash 的智能体仍能正常加载。
+- [ ] **42.13 删文档即删识别文字(复核 M1)**:删掉 42.3 的文档。判据:`SELECT count(*) FROM knowledge_parse_cache WHERE document_id = '<该文档 id>'` 为 0;删整个知识库同样清空其下文档的缓存行。

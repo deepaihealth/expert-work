@@ -10,9 +10,13 @@ import { useTranslation } from "react-i18next";
 
 import type { PageStats } from "../../api/knowledge";
 
-/** Scanned pages that failed or wait — what 「补识别」 retries. */
+/** Scanned pages that failed, wait, or are past the page limit — what
+ *  「补识别」 retries (an over-limit page is read once the platform limit
+ *  is raised). */
 export function needsRecognition(stats: PageStats | null | undefined): boolean {
-  return stats != null && stats.pages_failed + stats.pages_pending > 0;
+  return (
+    stats != null && stats.pages_failed + stats.pages_pending + stats.pages_over_limit > 0
+  );
 }
 
 export interface PageRecognitionTagsProps {

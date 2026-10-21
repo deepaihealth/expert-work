@@ -15,6 +15,7 @@ from PIL import Image
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
 from control_plane.knowledge.recognition import pages as pages_module
 from control_plane.knowledge.recognition.pages import (
+    MAX_IMAGE_PLACEMENTS,
     RENDER_MAX_EDGE_PX,
     analyse_pdf,
     render_pages,
@@ -214,3 +215,71 @@ def test_render_honours_a_model_pixel_cap() -> None:
 
 def test_render_params_name_every_setting() -> None:
     assert render_params() == "dpi=200;edge=2000;jpeg=85"
+
+
+# ---------------------------------------------------------------------------
+# 复核 #3 —— 判定出错不能让改前解析得了的 PDF 失败
+# ---------------------------------------------------------------------------
+
+
+def test_a_page_whose_signals_cannot_be_read_is_a_text_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(page: object) -> object:
+        raise RuntimeError("damaged page object")
+
+    monkeypatch.setattr(pages_module, "_decide", broken)
+    raw = _pdf(_text_page, _text_page)
+    analysis = analyse_pdf("doc.pdf", raw)
+    assert [page.decision for page in analysis.pages] == [PageDecision.TEXT, PageDecision.TEXT]
+    assert analysis.markdown == parse_document("doc.pdf", raw)
+
+
+def test_a_pdf_pymupdf_cannot_walk_parses_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(doc: object, index: int) -> object:
+        raise RuntimeError("page tree is broken")
+
+    monkeypatch.setattr(pages_module, "_decide_or_text", broken)
+    raw = _pdf(_text_page, _scanned_page)
+    analysis = analyse_pdf("doc.pdf", raw)
+    assert analysis.pages == ()
+    assert analysis.markdown == parse_document("doc.pdf", raw)
+
+
+@pytest.mark.parametrize("chunks", ["raise", "empty"])
+def test_a_text_page_without_chunk_text_keeps_its_plain_text(
+    monkeypatch: pytest.MonkeyPatch, chunks: str
+) -> None:
+    real = pages_module.pymupdf4llm.to_markdown
+
+    def to_markdown(doc: object, **kwargs: object) -> object:
+        if not kwargs.get("page_chunks"):
+            return real(doc, **kwargs)
+        if chunks == "raise":
+            raise RuntimeError("layout model failed")
+        return [{"metadata": {"page_number": 1}, "text": ""}]
+
+    monkeypatch.setattr(pages_module.pymupdf4llm, "to_markdown", to_markdown)
+    analysis = analyse_pdf("mixed.pdf", _pdf(_text_page, _scanned_page))
+    assert analysis.markdown is None
+    assert "Submit a request three working days ahead" in analysis.pages[0].text
+
+
+# ---------------------------------------------------------------------------
+# 复核 L1 —— 图片放置太多不算并集,整页识别
+# ---------------------------------------------------------------------------
+
+
+def _tiled_page(page: pymupdf.Page) -> None:
+    page.insert_text((72, 72), _TEXT * 3, fontsize=9)
+    tile = _scan_image()
+    for n in range(MAX_IMAGE_PLACEMENTS + 1):
+        x, y = 20 + (n % 25) * 22, 120 + (n // 25) * 30
+        page.insert_image(pymupdf.Rect(x, y, x + 20, y + 20), stream=tile)
+
+
+def test_a_page_of_many_image_tiles_is_recognized_whole() -> None:
+    analysis = analyse_pdf("tiles.pdf", _pdf(_tiled_page))
+    page = analysis.pages[0]
+    assert (page.decision, page.reason) == (PageDecision.OCR, PageReason.MANY_IMAGES)
+    assert page.images == MAX_IMAGE_PLACEMENTS + 1

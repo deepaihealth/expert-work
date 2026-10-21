@@ -100,7 +100,8 @@ export interface PageStats {
   pages_failed: number;
   /** No usable recognition model when ingested — 「补识别」 once configured. */
   pages_pending: number;
-  /** Past the per-document recognition page limit. */
+  /** Past the per-document recognition page limit — 「补识别」 reads them
+   *  once the platform limit is raised. */
   pages_over_limit: number;
 }
 

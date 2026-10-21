@@ -712,6 +712,18 @@ class SqlKnowledgeStore(KnowledgeStore):
                     KnowledgeChunkRow.kb_id == kb_id,
                 )
             )
+            # B-209 — the base's documents' recognized text (the FK cascades too).
+            await session.execute(
+                delete(KnowledgeParseCacheRow).where(
+                    KnowledgeParseCacheRow.tenant_id == tenant_id,
+                    KnowledgeParseCacheRow.document_id.in_(
+                        select(KnowledgeDocumentRow.id).where(
+                            KnowledgeDocumentRow.tenant_id == tenant_id,
+                            KnowledgeDocumentRow.kb_id == kb_id,
+                        )
+                    ),
+                )
+            )
             await session.execute(
                 delete(KnowledgeDocumentRow).where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
@@ -1219,6 +1231,13 @@ class SqlKnowledgeStore(KnowledgeStore):
                     KnowledgeChunkRow.document_id == document_id,
                 )
             )
+            # B-209 — the document's recognized text (the FK cascades too).
+            await session.execute(
+                delete(KnowledgeParseCacheRow).where(
+                    KnowledgeParseCacheRow.tenant_id == tenant_id,
+                    KnowledgeParseCacheRow.document_id == document_id,
+                )
+            )
             await session.execute(
                 delete(KnowledgeDocumentRow).where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
@@ -1273,7 +1292,12 @@ class SqlKnowledgeStore(KnowledgeStore):
     # -- recognition cache (B-209 §5.5) -------------------------------------
 
     async def get_parse_cache(
-        self, *, tenant_id: UUID, kind: ParseCacheKind, keys: Sequence[str]
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        kind: ParseCacheKind,
+        keys: Sequence[str],
     ) -> dict[str, ParseCacheEntry]:
         if not keys:
             return {}
@@ -1286,6 +1310,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                         KnowledgeParseCacheRow.result,
                     ).where(
                         KnowledgeParseCacheRow.tenant_id == tenant_id,
+                        KnowledgeParseCacheRow.document_id == document_id,
                         KnowledgeParseCacheRow.kind == kind,
                         KnowledgeParseCacheRow.cache_key.in_(list(keys)),
                     )
@@ -1299,6 +1324,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         self,
         *,
         tenant_id: UUID,
+        document_id: UUID,
         kind: ParseCacheKind,
         key: str,
         model: str,
@@ -1307,8 +1333,15 @@ class SqlKnowledgeStore(KnowledgeStore):
         async with self._sf() as session:
             await session.execute(
                 pg_insert(KnowledgeParseCacheRow)
-                .values(tenant_id=tenant_id, kind=kind, cache_key=key, model=model, result=result)
-                .on_conflict_do_nothing(index_elements=["tenant_id", "kind", "cache_key"])
+                .values(
+                    tenant_id=tenant_id,
+                    document_id=document_id,
+                    kind=kind,
+                    cache_key=key,
+                    model=model,
+                    result=result,
+                )
+                .on_conflict_do_nothing(index_elements=["document_id", "kind", "cache_key"])
             )
             await session.commit()
 

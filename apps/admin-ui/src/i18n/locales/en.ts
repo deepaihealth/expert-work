@@ -3914,7 +3914,7 @@ const en: TranslationKeys = {
     pages_failed: "{{count}} pages failed",
     pages_pending: "{{count}} pages waiting",
     pages_over_limit: "{{count}} pages over the limit",
-    pages_hint: "This PDF has scanned pages. Pages that failed or wait for recognition are not in the knowledge base yet; use Recognize.",
+    pages_hint: "This PDF has scanned pages. Pages that failed, wait for recognition or are over the page limit are not in the knowledge base yet; use Recognize (raise the platform page limit first for pages over it).",
     recognize: "Recognize",
     recognize_started: "Recognition started: only the failed and waiting pages are sent to the model.",
     recognize_nothing: "No page failed or waits for recognition.",

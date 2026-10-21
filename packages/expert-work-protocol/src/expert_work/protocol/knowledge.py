@@ -105,6 +105,9 @@ class PageReason(StrEnum):
     #: A page image with the scanner's invisible OCR text layer: the layer is
     #: kept, the page is not recognized again (a bad layer trips signal 3).
     HIDDEN_TEXT_LAYER = "hidden_text_layer"
+    #: More image placements than the coverage check looks at (a page drawn
+    #: as hundreds of image tiles, e.g. text rendered glyph by glyph).
+    MANY_IMAGES = "many_images"
 
 
 class PageStatus(StrEnum):
@@ -168,8 +171,9 @@ class PageStats(BaseModel):
 
     @property
     def needs_recognition(self) -> bool:
-        """Pages are failed or pending — 「补识别」 has something to do."""
-        return self.pages_failed > 0 or self.pages_pending > 0
+        """Pages are failed, pending or past the page limit — 「补识别」 has
+        something to do (an over-limit page is read once the limit is raised)."""
+        return self.pages_failed > 0 or self.pages_pending > 0 or self.pages_over_limit > 0
 
 
 class KnowledgeBaseKind(StrEnum):

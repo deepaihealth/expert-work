@@ -421,7 +421,10 @@ async def test_mixed_pdf_has_no_silently_empty_page(doc: FormDoc, _parse_pool: N
     ]
     scanned = pages[1]
     assert scanned.status is PageStatus.PENDING
-    assert scanned.error and "no platform credential" in scanned.error
+    # Tenant-visible: error classes only, never the resolver's text.
+    assert scanned.error == (
+        "glm/glm-ocr: credential_missing; qwen/qwen3.7-flash: credential_missing"
+    )
     assert PageStats.of(pages).needs_recognition
 
 

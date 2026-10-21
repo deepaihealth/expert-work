@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -105,6 +106,32 @@ def test_parse_cache_is_row_level_secured(fresh_db: str) -> None:
             "WHERE relname = 'knowledge_parse_cache'"
         ).fetchone()
     assert row == (True, True)
+
+
+def test_deleting_a_document_row_cascades_to_its_cache(fresh_db: str) -> None:
+    # Review M1: a document's recognized text never outlives the document, also
+    # when the row goes by a path that bypasses the store (FK ON DELETE CASCADE).
+    command.upgrade(_alembic(fresh_db), "head")
+    tenant, base, document = uuid4(), uuid4(), uuid4()
+    with psycopg.connect(fresh_db, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO knowledge_base (id, tenant_id, name) VALUES (%s, %s, 'kb')",
+            (base, tenant),
+        )
+        conn.execute(
+            "INSERT INTO knowledge_document (id, tenant_id, kb_id, filename, status) "
+            "VALUES (%s, %s, %s, 'scan.pdf', 'ready')",
+            (document, tenant, base),
+        )
+        conn.execute(
+            "INSERT INTO knowledge_parse_cache "
+            "(tenant_id, document_id, kind, cache_key, model, result) "
+            "VALUES (%s, %s, 'page_ocr', 'k1', 'glm/glm-ocr', '{\"raw\": \"x\"}')",
+            (tenant, document),
+        )
+        conn.execute("DELETE FROM knowledge_document WHERE id = %s", (document,))
+        left = conn.execute("SELECT count(*) FROM knowledge_parse_cache").fetchone()
+    assert left == (0,)
 
 
 def test_downgrade_round_trip(fresh_db: str) -> None:

@@ -120,14 +120,14 @@ class ClaimedIngestion:
 
 
 #: B-209 §5.5 —— what a ``knowledge_parse_cache`` row holds: a scanned page's
-#: text (PR-1); a figure's description / text (reserved for PR-2).
+#: raw reading (PR-1); a figure's description / text (reserved for PR-2).
 ParseCacheKind = Literal["page_ocr", "figure_desc", "figure_ocr"]
 
 
 @dataclass(frozen=True)
 class ParseCacheEntry:
-    """One cached model reading: the model that produced it and its cleaned
-    result (``{"text": …}`` for ``page_ocr``)."""
+    """One cached model reading: the model that produced it and its result
+    (``{"raw": …, "finish_reason": …, "layout_chars": …}`` for ``page_ocr``)."""
 
     model: str
     result: dict[str, Any]
@@ -474,8 +474,8 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
-        """Delete a document and cascade its chunks. ``False`` if no
-        document matched."""
+        """Delete a document and cascade its chunks, page records and
+        recognition cache. ``False`` if no document matched."""
 
     @abc.abstractmethod
     async def set_document_pages(
@@ -505,16 +505,24 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def get_parse_cache(
-        self, *, tenant_id: UUID, kind: ParseCacheKind, keys: Sequence[str]
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        kind: ParseCacheKind,
+        keys: Sequence[str],
     ) -> dict[str, ParseCacheEntry]:
-        """The tenant's cached readings for ``keys`` (absent keys: not
-        cached). Never another tenant's (the cache is per tenant on purpose)."""
+        """The document's cached readings for ``keys`` (absent keys: not
+        cached). Per document on purpose: a deleted document's readings go
+        with it (:meth:`delete_document` / :meth:`delete_base` remove them),
+        and no tenant learns what another uploaded."""
 
     @abc.abstractmethod
     async def put_parse_cache(
         self,
         *,
         tenant_id: UUID,
+        document_id: UUID,
         kind: ParseCacheKind,
         key: str,
         model: str,

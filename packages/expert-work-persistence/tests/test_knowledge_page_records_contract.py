@@ -168,21 +168,88 @@ async def test_page_records_of_a_missing_or_foreign_document(store: KnowledgeSto
     assert await store.list_document_pages(tenant_id=tenant, document_id=uuid4()) is None
 
 
-async def test_parse_cache_is_per_tenant_and_first_reading_stands(store: KnowledgeStore) -> None:
+_RAW = {"raw": "第一页", "finish_reason": None, "layout_chars": 3}
+
+
+async def _cache(store: KnowledgeStore, tenant: UUID, document: UUID, key: str = "k1") -> None:
+    await store.put_parse_cache(
+        tenant_id=tenant,
+        document_id=document,
+        kind="page_ocr",
+        key=key,
+        model="glm/glm-ocr",
+        result=_RAW,
+    )
+
+
+async def _cached(store: KnowledgeStore, tenant: UUID, document: UUID) -> dict[str, object]:
+    return dict(
+        await store.get_parse_cache(
+            tenant_id=tenant, document_id=document, kind="page_ocr", keys=["k1", "k2"]
+        )
+    )
+
+
+async def test_parse_cache_is_per_document_and_first_reading_stands(store: KnowledgeStore) -> None:
     tenant, other = uuid4(), uuid4()
-    assert await store.get_parse_cache(tenant_id=tenant, kind="page_ocr", keys=["k1"]) == {}
+    document_id, _ = await _document(store, tenant)
+    assert await _cached(store, tenant, document_id) == {}
+    await _cache(store, tenant, document_id)
     await store.put_parse_cache(
-        tenant_id=tenant, kind="page_ocr", key="k1", model="glm/glm-ocr", result={"text": "第一页"}
+        tenant_id=tenant,
+        document_id=document_id,
+        kind="page_ocr",
+        key="k1",
+        model="glm/glm-ocr",
+        result={"raw": "另一份"},
     )
-    await store.put_parse_cache(
-        tenant_id=tenant, kind="page_ocr", key="k1", model="glm/glm-ocr", result={"text": "另一份"}
+    assert await _cached(store, tenant, document_id) == {
+        "k1": ParseCacheEntry(model="glm/glm-ocr", result=_RAW)
+    }
+    # Another tenant / another document holding the same page learn nothing.
+    assert await _cached(store, other, document_id) == {}
+    second = await store.upsert_document(
+        tenant_id=tenant,
+        kb_id=(await store.get_base(tenant_id=tenant, name="kb")).id,  # type: ignore[union-attr]
+        filename="copy.pdf",
+        content=b"%PDF",
     )
-    found = await store.get_parse_cache(tenant_id=tenant, kind="page_ocr", keys=["k1", "k2"])
-    assert found == {"k1": ParseCacheEntry(model="glm/glm-ocr", result={"text": "第一页"})}
-    # Another tenant uploading the same page learns nothing (and pays again).
-    assert await store.get_parse_cache(tenant_id=other, kind="page_ocr", keys=["k1"]) == {}
+    assert await _cached(store, tenant, second.id) == {}
     # Kinds do not mix.
-    assert await store.get_parse_cache(tenant_id=tenant, kind="figure_desc", keys=["k1"]) == {}
+    assert (
+        await store.get_parse_cache(
+            tenant_id=tenant, document_id=document_id, kind="figure_desc", keys=["k1"]
+        )
+        == {}
+    )
+
+
+async def test_deleting_a_document_deletes_its_recognized_text(store: KnowledgeStore) -> None:
+    tenant = uuid4()
+    document_id, _ = await _document(store, tenant)
+    await _cache(store, tenant, document_id)
+    assert await store.delete_document(tenant_id=tenant, document_id=document_id)
+    assert await _cached(store, tenant, document_id) == {}
+
+
+async def test_deleting_a_base_deletes_its_documents_recognized_text(store: KnowledgeStore) -> None:
+    tenant = uuid4()
+    document_id, _ = await _document(store, tenant)
+    await _cache(store, tenant, document_id)
+    base = await store.get_base(tenant_id=tenant, name="kb")
+    assert base is not None
+    assert await store.delete_base(tenant_id=tenant, kb_id=base.id)
+    assert await _cached(store, tenant, document_id) == {}
+
+
+async def test_a_reading_for_a_deleted_document_is_refused(store: KnowledgeStore) -> None:
+    # An in-flight recognition finishing after the delete must not leave text behind.
+    tenant = uuid4()
+    document_id, _ = await _document(store, tenant)
+    await store.delete_document(tenant_id=tenant, document_id=document_id)
+    with pytest.raises(Exception):  # noqa: B017 — KeyError in memory, IntegrityError in SQL
+        await _cache(store, tenant, document_id)
+    assert await _cached(store, tenant, document_id) == {}
 
 
 async def test_recognition_config_round_trip(config_store: PlatformRecognitionConfigStore) -> None:
