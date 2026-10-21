@@ -149,7 +149,10 @@ awk -F'\t' '$2 == "client_connections"' "$OUT/precheck-before.tsv"
 ```
 
 判据:写方 pod 全部消失;`client_connections` 只剩个位数(工具 pod 自己 + RDS 的
-监控连接);两份输出没有 `ERROR`。快照约 3 秒,内容是每张表的精确行数 + 向量检索
+管理账号 `aurora` 的连接,测试实测 10 = 9 个 `aurora` + 1 个工具 pod;拿不准就在工具 pod 里
+`select usename, datname, application_name, count(*) from pg_stat_activity group by 1, 2, 3`
+看清是谁);两份输出没有 `ERROR`。**再隔 20 秒拍第二份快照,两份必须逐字一致** ——
+这才证明写真的停了(测试实测一致)。快照约 3 秒,内容是每张表的精确行数 + 向量检索
 (HNSW)和关键词检索各 3 条固定探针的前 10 个 id,不调模型、不含数据。
 
 ## 5. 升级(用户,控制台)
@@ -161,6 +164,11 @@ awk -F'\t' '$2 == "client_connections"' "$OUT/precheck-before.tsv"
 2. 系统在升级前后各自动做一次全量备份(文档原文:「在升级前后,均会对实例进行全量备份」)。
    在实例的备份列表里记下**升级前那份备份的时间**,回退用(§8)。
 3. 等实例回到「运行中」、版本显示 17。
+
+测试实测时间线(2026-10-21):14:48 点升级 → 14:54:43 进入只读(前 6 分钟在做升级前备份等,
+库照常可读写)→ 14:59:30 切到 17.11 并可读写。**只读 4 分 47 秒;每 5 秒一次的连接探测全程
+没有连不上过。** 内核小版本随之从 20260630 升到 20260915。窗口里可以在工具 pod 里每 5 秒探一次
+`show server_version` + `current_setting('transaction_read_only')`,记下只读起止。
 
 ## 6. 升级后检查(写还停着)
 
@@ -177,18 +185,24 @@ kubectl -n $NS exec pg-upgrade-dbtool -- python -c "$(cat tools/deploy/pg_upgrad
 
 - `precheck-after`:`server_version` 17.x;扩展清单与升级前相同(版本号可能随 17 的
   插件版本变,如 `vector`);collation 不一致 0;没有 `ERROR`。
-- 快照:**行数行必须全部一致**,不一致 = 停下来查,不恢复写。检索探针行也应一致;
-  只有向量探针不同而行数全同时,多半是 pgvector 版本变化带来的近似检索差异 ——
-  逐条比前 10 个 id 的重合度,≥ 9/10 记进 §10 后继续,低于就停下来查。
+- 快照:**行数行必须全部一致**,不一致 = 停下来查,不恢复写。关键词探针行也必须一致。
+- 向量探针行不一致时,不要直接判坏,先请精确结果当裁判:
+  `kubectl -n $NS exec pg-upgrade-dbtool -- python -c "$(cat tools/deploy/pg_upgrade/exact_knn.py)"`
+  (同样的种子和查询,关掉索引走全表扫描算真正的前 10),逐条算升级前 / 升级后与精确结果的重合度。
+  **升级后 ≥ 9/10 → 继续**(测试实测:升级后 6 条全部 10/10,升级前只有 1~6/10,
+  差异是升级修好了,不是弄坏了 —— 见 B-208);升级后低于 9/10 → 停下来查,不恢复写。
 - `analyze`:每个库 `ok`,`tables_without_stats=0`(测试 16 上实测主库 0.9 秒)。
+- 向量检索准确度:恢复写之后跑 `tools/deploy/pg_upgrade/vector_recall_check.sh <环境>`(只读,只出数字)。
+  `[A]` 段(强制走 HNSW)必须 100%;`[B]` / `[C]` 是应用真实检索形态,也必须 100%。测试 17.11 实测全部 100%;
+  升级前的生产 16.14 实测 `[A]` 只有 60%(B-208)—— 生产升级后这一行必须变成 100%,否则停下来查。
 
-**顺带装 `pg_textsearch`(推荐在窗口内做,可能触发一次自动重启)**:上游 README 要求
-把它加进 `shared_preload_libraries` 再重启;阿里云的「需要预加载的插件列表」里没有它,
-文档没写到底要不要。阿里云插件管理页原文:插件需要预加载而未配置时,安装会**自动重启
-实例**。所以趁写还停着装:控制台「插件管理」里给 `expert_work_dev` 安装
-`pg_textsearch`(或用高权限账号执行 `CREATE EXTENSION pg_textsearch;`)。装完确认
-(`select extversion from pg_extension where extname = 'pg_textsearch'` 为 1.3.1),
-再跑一遍 §6 的 precheck,把 `shared_preload_libraries` 前后的变化记进 §10 —— 生产要照做。
+**顺带装 `pg_textsearch`(在窗口内做,会自动重启一次)**:阿里云文档没写它要不要预加载,
+**测试实测要**:控制台「插件管理」给 `expert_work_dev` 安装 `pg_textsearch` 后,
+`shared_preload_libraries` 自动多了 `pg_textsearch`,实例自动重启了一次(15:06:14)。所以必须
+趁写还停着装。装完确认:`select extversion from pg_extension where extname = 'pg_textsearch'`
+为 1.3.1;再拍一次快照,与升级后那份逐字一致(测试实测一致)。可选的功能自检:在一个事务里
+建临时表 + `USING bm25 (body) WITH (text_config = 'simple')` 索引、`ORDER BY body <@> to_bm25query(...)`
+查一次、然后回滚(测试实测:相关行分数为负、越小越相关,不相关为 0,回滚后不留对象)。
 
 ## 7. 恢复写 + 验收
 
@@ -238,14 +252,14 @@ tools/deploy/pg_upgrade/run_canary.sh test  # 真跑一轮 + 产物下载,RESULT
 3. 窗口选低峰,提前通知生产用户(含对接方)会有分钟级只读;方式与测试相同 —— 本地升级(§2),不换方式。
    生产的对象数以 §1.4 自查为准,数量级与测试不同时先停下来重估只读时长。
 4. 顺序:§4 停写 → §5 升级 → §6 检查(含 `pg_textsearch`,若测试装了)→ §7 恢复写 + 验收
-   → 再用 `release.sh prod` 发 B-206 版本。库的升级和应用的发布分开验收,出问题好定位。
+   (含 `vector_recall_check.sh prod`,`[A]` 段从升级前的 60% 变成 100%)→ 再用 `release.sh prod` 发 B-206 版本。库的升级和应用的发布分开验收,出问题好定位。
 5. 执行记录写进 §10 生产一栏。
 
 ## 10. 执行记录
 
 | 环境 | 日期 | 窗口起止 | 只读时长 | 快照比对 | `pg_textsearch` / 预加载变化 | 问题 |
 |---|---|---|---|---|---|---|
-| 测试 | | | | | | |
+| 测试 | 2026-10-21 | 14:45:55 停写 → 15:15:20 恢复写(约 30 分钟);15:2x 用户验登录 / Langfuse / 检索测试正常 | 14:54:43–14:59:30,**4 分 47 秒**;连接探测全程可连 | 行数 / 关键词探针逐行一致;向量探针升级后 = 精确 10/10(升级前 1~6/10,B-208) | 插件管理装 1.3.1 → 自动加入预加载 + 自动重启 1 次;BM25 功能自检通过 | 无阻塞;用户在窗口中途登录失败 = Keycloak 停着,预期内 |
 | 生产 | | | | | | |
 
 ## 出处(2026-10-21 读原文)
