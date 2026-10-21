@@ -445,7 +445,7 @@ async def test_budget_gate_ignores_a_budget_not_above_what_was_spent(tmp_path: P
 
     writer = asyncio.create_task(operator())
     assert await asyncio.wait_for(gate.wait_for_raise(lambda: 3.0), timeout=5) is True
-    await writer
+    await asyncio.wait_for(writer, timeout=5)
     assert gate.budget == 10.0
     gate.control.write_text("stop", encoding="utf-8")
     assert await asyncio.wait_for(gate.wait_for_raise(lambda: 12.0), timeout=5) is False
