@@ -9,10 +9,11 @@ counts and settings only, never row data or credentials.
 
 The checks mirror what blocks or warns in the Alibaba RDS upgrade check report
 (``pg_upgrade`` limits, pgcrypto in ``pg_catalog``, replication slots,
-subscriptions) plus what the zero-downtime mode additionally needs
-(``wal_level``, tables without a primary / unique key, materialized views,
-foreign tables, large objects, sequence count). The console check report is
-still the gate; this only lets us fix things before asking for it.
+subscriptions). The zero-downtime-mode items (``wal_level``, tables without a
+primary / unique key, materialized views, foreign tables, large objects,
+sequence count) are printed too, as the recorded reason that mode is not used
+(runbook §2). The console check report is still the gate; this only lets us
+fix things before asking for it.
 """
 
 from __future__ import annotations
