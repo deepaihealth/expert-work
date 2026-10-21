@@ -78,17 +78,29 @@ _BODY_VIEW_DEPTH = 20
 #: ``dual`` the two views above (B-175 wave 2 PR2b); ``single`` each candidate
 #: once, as one structured text (:func:`~orchestrator.tools.rerank_passage.rerank_passage`:
 #: title, section, body); ``single_clean`` the same with the body's Markdown /
-#: URLs / table rules / HTML stripped first. Two views weighted together have no
-#: outside precedent; Cohere, Onyx and Qwen3-Reranker all judge one string.
+#: URLs / table rules / HTML stripped first. Cohere, Onyx and Qwen3-Reranker all
+#: judge one string, but on the dev set (main 303 / chat 172 questions,
+#: qwen3-vl-rerank, 2026-10-22) single / 100 took main MRR@10 0.945 → 0.938 and
+#: the exact-number group (12) 0.917 → 0.699 — the case the dual view was made
+#: for — and the instruction / cleaned body did worse still on main. So ``dual``
+#: stays the default; the single views are internal options (parent chunks, K-1,
+#: may change the picture). A per-base ``rerank_score_threshold`` was calibrated
+#: on the dual view's weighted score and keeps its meaning under this default; a
+#: single view scores on another scale, so making it the default would need every
+#: such threshold recalibrated.
 RerankView = Literal["dual", "single", "single_clean"]
 RERANK_VIEWS: tuple[RerankView, ...] = ("dual", "single", "single_clean")
-DEFAULT_RERANK_VIEW: RerankView = "single"
+DEFAULT_RERANK_VIEW: RerankView = "dual"
 #: How many of the fused candidates the reranker judges (K-14: up from the
 #: 50-deep recall — the 2026-10-21 replay found every correct document that fell
-#: out of the fused top 50 within the top 100).
+#: out of the fused top 50 within the top 100). Dev set, dual / 100 against
+#: dual / 50: chat chunk hit@10 0.934 → 0.967, MRR@10 0.793 → 0.801, context hit
+#: 0.895 → 0.914; main MRR@10 (0.945) and the exact-number group (0.917) unchanged.
 DEFAULT_RERANK_POOL = 100
 #: The task a single view states to a reranker whose model takes an instruction
-#: (English, as the vendors advise). Off by default (``KnowledgeRetriever.rerank_instruction``).
+#: (English, as the vendors advise; DashScope reads it as ``parameters.instruct``,
+#: checked live 2026-10-22). Off by default (``KnowledgeRetriever.rerank_instruction``);
+#: the dual view sends none.
 RERANK_INSTRUCTION = (
     "Given a question, judge whether the passage content itself states the answer; "
     "the title only identifies the document"
@@ -174,13 +186,32 @@ class Reranker(Protocol):
         most relevant first. Indices are positions in ``documents``."""
 
 
+class RerankRanking(list[tuple[int, float | None]]):
+    """A scoring reranker's ranking that also says how many of the documents it
+    was handed it never judged (B-206 K-14): the trailing ones its model's
+    per-request cap, or a vendor size refusal, left out. A plain list from a
+    reranker means it judged them all."""
+
+    def __init__(
+        self, ranked: Iterable[tuple[int, float | None]] = (), *, dropped: int = 0
+    ) -> None:
+        super().__init__(ranked)
+        self.dropped = dropped
+
+
+def _dropped(ranked: Sequence[tuple[int, float | None]]) -> int:
+    return ranked.dropped if isinstance(ranked, RerankRanking) else 0
+
+
 @runtime_checkable
 class ScoredReranker(Protocol):
     """A :class:`Reranker` that can also say how relevant each document is.
 
     ``instruction`` (B-206 K-14) is a task statement for a model that takes one;
     a reranker whose model takes none ignores it. Callers pass it only when they
-    have one, so a scoring reranker written before it existed keeps working."""
+    have one, so a scoring reranker written before it existed keeps working. A
+    reranker that judges only some of the documents returns a
+    :class:`RerankRanking` saying how many it left out."""
 
     async def rerank_scored(
         self,
@@ -250,6 +281,9 @@ class KnowledgeSearchOutcome:
     used instead — then no threshold applied either. ``embedding_degraded``
     (B-206 K-8) is set when the query could not be embedded and every base was
     searched by keywords alone.
+    ``rerank_dropped`` (B-206 K-14) counts candidates the reranker was handed
+    but never judged (its model's per-request cap, or a size refusal it retried
+    with fewer): the rerank ran, over part of the pool.
     """
 
     results: tuple[RetrievedChunk, ...]
@@ -257,6 +291,7 @@ class KnowledgeSearchOutcome:
     candidates: int = 0
     rerank_degraded: bool = False
     embedding_degraded: bool = False
+    rerank_dropped: int = 0
 
 
 @dataclass(frozen=True)
@@ -274,11 +309,13 @@ class _Reranked:
     """The rerank stage's output: chunks best first — at least ``limit`` of them
     when there are that many, more when the reranker scored more, so a
     threshold that drops some can still fill ``limit`` — each one's rerank score
-    when the reranker gave one, and whether rerank fell back."""
+    when the reranker gave one, whether rerank fell back, and how many
+    candidates it never judged."""
 
     chunks: list[KnowledgeChunk]
     scores: Mapping[UUID, float]
     degraded: bool = False
+    dropped: int = 0
 
 
 def default_recall_depth(limit: int) -> int:
@@ -346,9 +383,11 @@ class KnowledgeRetriever:
 
     B-206 K-14 — internal knobs, not tenant settings (the eval sets them for
     A/B arms): ``rerank_view`` how candidates are put to the reranker
-    (:data:`RerankView`), ``rerank_pool`` how many of the fused candidates it
-    judges, ``rerank_instruction`` whether a single view sends
-    :data:`RERANK_INSTRUCTION`.
+    (:data:`RerankView`; default ``dual``, under which a base's
+    ``rerank_score_threshold`` keeps its calibrated meaning), ``rerank_pool`` how
+    many of the fused candidates it judges, ``rerank_instruction`` whether a
+    single view sends :data:`RERANK_INSTRUCTION` — refused with ``dual``, which
+    sends none, so no caller believes it instructed a rerank that was not.
     """
 
     store: KnowledgeStore
@@ -360,6 +399,11 @@ class KnowledgeRetriever:
     rerank_view: RerankView = DEFAULT_RERANK_VIEW
     rerank_pool: int = DEFAULT_RERANK_POOL
     rerank_instruction: bool = False
+
+    def __post_init__(self) -> None:
+        if self.rerank_instruction and self.rerank_view == "dual":
+            msg = "rerank_instruction needs a single view: the dual view sends no instruction"
+            raise ValueError(msg)
 
     def recall_depth(self, limit: int) -> int:
         """Per-path recall depth for a ``limit``-result search."""
@@ -501,6 +545,7 @@ class KnowledgeRetriever:
                 candidates=len(ranked.chunks),
                 rerank_degraded=ranked.degraded,
                 embedding_degraded=degraded,
+                rerank_dropped=ranked.dropped,
             )
         scores = _SubScores(
             vector=vector_score,
@@ -515,6 +560,7 @@ class KnowledgeRetriever:
             candidates=len(ranked.chunks),
             rerank_degraded=ranked.degraded,
             embedding_degraded=degraded,
+            rerank_dropped=ranked.dropped,
         )
 
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
@@ -582,6 +628,7 @@ class KnowledgeRetriever:
         return _Reranked(
             chunks=[candidates[i] for i, _score in ranked],
             scores={candidates[i].id: score for i, score in ranked if score is not None},
+            dropped=_dropped(ranked),
         )
 
     async def _order(
@@ -684,19 +731,20 @@ async def _two_view_order(
     if len(titled_score) < len(top) or all(
         body == candidates[i].retrieval_text for i, body in zip(top, bodies, strict=True)
     ):
-        return list(titled)
+        return RerankRanking(titled, dropped=_dropped(titled))
     body_view = await reranker.rerank_scored(
         query=query, documents=rerank_documents(bodies), top_k=len(bodies), tenant_id=tenant_id
     )
+    dropped = _dropped(titled) + _dropped(body_view)
     body_score = {top[j]: score for j, score in body_view if score is not None}
     if len(body_score) < len(top):
-        return [(i, None) for i in top]
+        return RerankRanking(((i, None) for i in top), dropped=dropped)
     combined = {
         i: _TITLED_VIEW_WEIGHT * titled_score[i] + (1 - _TITLED_VIEW_WEIGHT) * body_score[i]
         for i in top
     }
     order = sorted(top, key=lambda i: (-combined[i], i))
-    return [(i, combined[i]) for i in order]
+    return RerankRanking(((i, combined[i]) for i in order), dropped=dropped)
 
 
 def _clears_floor(
@@ -777,6 +825,8 @@ class KnowledgeSearchTool:
             meta["rerank_degraded"] = True
         if outcome.embedding_degraded:
             meta["embedding_degraded"] = True
+        if outcome.rerank_dropped:
+            meta["rerank_dropped"] = outcome.rerank_dropped
         if outcome.status == "below_threshold":
             return ToolResult(
                 content=(

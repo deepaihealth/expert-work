@@ -34,7 +34,8 @@
         tools/eval/kb_agent_eval.py ... --dry
 
 B-206 K-14 对照组:``--rerank-view dual|single|single_clean`` / ``--rerank-pool N`` /
-``--rerank-instruct``(与 ``kb_eval.py`` 同义,默认 = 生产默认);每组写自己的 ``--out``,
+``--rerank-instruct``(与 ``kb_eval.py`` 同义,默认 = 生产默认 dual + 100;``--rerank-instruct``
+只能配单视图);每组写自己的 ``--out``,
 组别记在结果文件末尾的 run 行里。
 
 ``--answer-model`` / ``--judge-model`` 换模型(默认 glm-5.3 / deepseek-v4-pro);不在
@@ -75,6 +76,7 @@ from kb_dataset import KbCase, KbDataset, load_dataset  # type: ignore[import-no
 from kb_eval import (  # type: ignore[import-not-found]
     EVAL_OUT_DIR,
     EVAL_TENANT_ID,
+    INSTRUCT_NEEDS_SINGLE_VIEW,
     _all_chunk_texts,
     _resolve_manifest,
     _resolve_tiers,
@@ -778,6 +780,8 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
             parser.error(f"--{name.replace('_', '-')} is required (unless --tally)")
     if args.rerank_pool < 1:
         parser.error(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
+    if args.rerank_instruct and args.rerank_view == "dual":
+        parser.error(INSTRUCT_NEEDS_SINGLE_VIEW)
     cache_only = args.embedder == "real" or args.rerank == "dashscope"
     if args.dry and cache_only and os.environ.get(RERANK_KEY_ENV) != OFFLINE_KEY:
         parser.error(

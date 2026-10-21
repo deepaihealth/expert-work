@@ -917,6 +917,9 @@ def build_knowledge_router() -> APIRouter:
                 "rerank_degraded": outcome.rerank_degraded,
                 # B-206 K-8 — the query could not be embedded: keyword results only.
                 "embedding_degraded": outcome.embedding_degraded,
+                # B-206 K-14 — candidates the reranker was handed but never
+                # judged (its model's per-request cap, or a length refusal).
+                "rerank_dropped": outcome.rerank_dropped,
             }
         )
 

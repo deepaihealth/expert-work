@@ -196,10 +196,15 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   `anchors.too_common` 里报。`listed` = 只认手列文档(旧规则,对照用)。指纹记 `doc_match`。
 - **重排(`--rerank`)**:`dashscope` = 生产同款 `qwen3-vl-rerank`(DashScope 原生接口,密钥沿用
   `EXPERT_WORK_EVAL_EMBED_API_KEY`,模型可用 `EXPERT_WORK_EVAL_RERANK_MODEL` 覆盖),结果缓存在
-  `eval-out/kb/rerank_cache.sqlite`(键 = 模型 + 查询 + 候选全文按序 + `top_n`),复跑同样的候选零成本;密钥为
+  `eval-out/kb/rerank_cache.sqlite`(键 = 模型 + 查询 + 候选全文按序 + `top_n`,带任务说明时再加上它),复跑同样的候选零成本;密钥为
   `offline-cache-only` 时缓存没命中直接报错。按 ¥0.5 / 百万 token 记费用,汇总 `rerank` 块里有调用数 / 命中 / token /
   金额。`llm` = 聊天模型排序(`on` 是它的旧名)。**基线分两条**:不开重排写在评测集名下(召回层),开了重排写在
   `<评测集名>@rerank-<模式>` 下(最终排序),互不覆盖。
+- **重排对照组(B-206 K-14)**:`--rerank-view dual|single|single_clean`、`--rerank-pool N`、`--rerank-instruct`
+  直接设到生产检索器上;不给 = 生产默认 **dual(带标题 / 正文两视图加权)+ 池 100**、不带任务说明。`--rerank-pool 50` =
+  K-14 之前的生产,请求逐字相同、重排缓存照样命中。`--rerank-instruct` 只能配单视图(双视图不发任务说明,会被拒)。
+  组别记进汇总 `config` 和指纹;非默认组拒绝写基线;某题的重排只判了候选池的一部分(池超过模型单次上限,或超长被拒后
+  少送重试)时整轮退出。开发集(主集 303 / 真实问法集 172)上单视图把精确编号组 MRR@10 从 0.917 拉到 0.699,所以默认仍是 dual。
 - **留出集** `datasets/kb/huada_v1.holdout.yaml`(精确编号 16 + 无答案 6,只用主评测集没出过题的条目):波 2 期间
   不看结果、不针对它调参,收官时跑一次。
 - **为什么基线必须 `--store sql`**:关键词路 SQL 是 `plainto_tsquery` 全 AND,内存库是任一词重叠打分,两套语义不同;

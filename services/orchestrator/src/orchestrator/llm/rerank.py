@@ -15,6 +15,7 @@ Response shape: ``{"output": {"results": [{"index": int, "relevance_score": floa
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -24,6 +25,7 @@ import httpx
 
 from expert_work.protocol.model_catalog import RerankCaps, catalog_entry
 from orchestrator.llm.providers._http import client_for
+from orchestrator.tools.knowledge import RerankRanking
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,14 @@ DASHSCOPE_RERANK_URL = (
 _CATALOG_PROVIDER = "qwen"
 _DEFAULT_TIMEOUT_S = 30.0
 _ERROR_BODY_LIMIT = 500
+#: How DashScope words a refusal for length (B-206 K-14). The only wording on
+#: record is the embedding endpoint's (B-200: HTTP 400, code ``InvalidParameter``,
+#: "Range of input length should be [1, 16000]"); the rerank endpoint's is not,
+#: so this matches conservatively — a parameter error that talks about length,
+#: tokens or a limit being exceeded. Anything else is raised as it was (the
+#: search falls back to the fused order) rather than answered with a shorter pool.
+_SIZE_REFUSAL_CODE = "InvalidParameter"
+_SIZE_REFUSAL_WORDING = re.compile(r"length|too long|exceed|token", re.IGNORECASE)
 
 
 @runtime_checkable
@@ -130,10 +140,13 @@ class DashScopeReranker:
     B-206 K-14 — what the model catalog says about ``model``
     (:class:`~expert_work.protocol.model_catalog.RerankCaps`) shapes the request:
     only the leading ``max_documents`` are sent (callers hand them best first),
-    an ``instruction`` goes only to a model that takes one, and a request the
-    vendor refuses (HTTP 400) as over ``max_total_tokens`` is sent again with the
-    leading documents that surely fit (:func:`_fit_total`). Off-catalog models
-    get none of this."""
+    ``top_n`` never asks for more than were sent, an ``instruction`` goes only to
+    a model that takes one, and a request the vendor refuses for length (HTTP 400,
+    see :data:`_SIZE_REFUSAL_WORDING`) when ``max_total_tokens`` is declared is
+    sent again with the leading documents that surely fit (:func:`_fit_total`).
+    Documents left out either way are reported, not silent: the ranking is a
+    :class:`~orchestrator.tools.knowledge.RerankRanking` whose ``dropped`` counts
+    them. Off-catalog models get none of this."""
 
     client: RerankClient
     model: str
@@ -168,14 +181,18 @@ class DashScopeReranker:
             extra["instruction"] = instruction
         try:
             body = await self.client.rerank(
-                model=self.model, query=query, documents=items, top_n=top_k, **extra
+                model=self.model,
+                query=query,
+                documents=items,
+                top_n=min(top_k, len(items)),
+                **extra,
             )
         except httpx.HTTPStatusError as exc:
             fitted = _fit_total(query, items, extra.get("instruction"), caps)
-            if exc.response.status_code != 400 or not fitted or len(fitted) == len(items):
+            if not _is_size_refusal(exc) or not fitted or len(fitted) == len(items):
                 raise
             logger.warning(
-                "dashscope rerank refused %d documents (HTTP 400); retrying with the %d that "
+                "dashscope rerank refused %d documents for length; retrying with the %d that "
                 "surely fit model=%s",
                 len(items),
                 len(fitted),
@@ -183,12 +200,18 @@ class DashScopeReranker:
             )
             items = fitted
             body = await self.client.rerank(
-                model=self.model, query=query, documents=items, top_n=top_k, **extra
+                model=self.model,
+                query=query,
+                documents=items,
+                top_n=min(top_k, len(items)),
+                **extra,
             )
+        dropped = len(documents) - len(items)
         output = body.get("output")
         results = output.get("results") if isinstance(output, Mapping) else None
         if not isinstance(results, list):
-            return [(index, None) for index in range(min(len(items), top_k))]
+            unscored = ((index, None) for index in range(min(len(items), top_k)))
+            return RerankRanking(unscored, dropped=dropped)
         ranked = [
             (row["index"], _relevance(row.get("relevance_score")))
             for row in results
@@ -197,7 +220,23 @@ class DashScopeReranker:
             and not isinstance(row.get("index"), bool)
             and 0 <= row["index"] < len(items)
         ]
-        return ranked[:top_k]
+        return RerankRanking(ranked[:top_k], dropped=dropped)
+
+
+def _is_size_refusal(exc: httpx.HTTPStatusError) -> bool:
+    """Whether DashScope refused the request for its length (see
+    :data:`_SIZE_REFUSAL_WORDING`): HTTP 400 with a JSON body whose ``code`` is
+    ``InvalidParameter`` and whose ``message`` talks about length."""
+    if exc.response.status_code != 400:
+        return False
+    try:
+        body = exc.response.json()
+    except ValueError:
+        return False
+    if not isinstance(body, Mapping) or body.get("code") != _SIZE_REFUSAL_CODE:
+        return False
+    message = body.get("message")
+    return isinstance(message, str) and _SIZE_REFUSAL_WORDING.search(message) is not None
 
 
 def _fit_total(

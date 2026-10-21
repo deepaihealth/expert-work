@@ -40,8 +40,9 @@
         --update-baseline
 
 B-206 K-14 重排对照组:``--rerank-view dual|single|single_clean`` / ``--rerank-pool N`` /
-``--rerank-instruct`` 直接设到生产检索器上(不给 = 生产默认 single + 100、不带任务说明;
-K-14 之前的生产 = ``--rerank-view dual --rerank-pool 50``,请求与那时逐字相同,重排缓存照样命中)。
+``--rerank-instruct`` 直接设到生产检索器上(不给 = 生产默认 dual + 100、不带任务说明;
+``--rerank-instruct`` 只能配单视图;K-14 之前的生产 = ``--rerank-pool 50``,请求与那时逐字相同,
+重排缓存照样命中)。重排只判了候选池的一部分(池超过模型单次上限,或超长被拒后少送重试)时整轮退出。
 
 凭据只从环境变量读(``EXPERT_WORK_EVAL_EMBED_API_KEY`` / ``_MODEL`` / ``_BASE_URL``;
 ``--rerank on`` 另要 ``EXPERT_WORK_EVAL_LLM_API_KEY`` / ``_MODEL`` / ``_BASE_URL``),没有命令行开关。
@@ -182,6 +183,12 @@ _STORE_EXC_MODULES = ("sqlalchemy", "asyncpg", "psycopg", "expert_work.persisten
 _CHUNK_PAGE = 200
 #: 工具结果的防注入围栏 nonce(生产默认开 spotlight,每次构建随机取);固定下来渲染结果才可复现。
 TOOL_SPOTLIGHT_NONCE = "kbeval0nonce"
+#: B-206 K-14:双视图不发任务说明,这样的组合会被记成「带了说明」而请求里其实没有;
+#: 建库前就拒绝(检索器自己也拒,但那要等建完库)。
+INSTRUCT_NEEDS_SINGLE_VIEW = (
+    "--rerank-instruct needs --rerank-view single (or single_clean): the dual view, the "
+    "default, sends no instruction, so the run would be recorded as instructed without one"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +361,8 @@ class EmbedStageError(RuntimeError):
 
 
 class RerankDegradedError(RuntimeError):
-    """开了重排却有一题退回了融合序(B-175 波 2 PR3)—— 整轮退出。
+    """开了重排却有一题退回了融合序(B-175 波 2 PR3),或只判了候选池的一部分(B-206 K-14)
+    —— 整轮退出。
 
     检索器把重排出错 / 返回空降级成融合序、不再抛错(生产要这样),评测不能:离线复跑缓存
     没命中(:class:`kb_rerank.RerankCacheMissError`)或线上 429 / 5xx 会让那一题悄悄按融合序
@@ -935,6 +943,13 @@ async def run_eval(
                 "warning): its numbers would be keyword search alone"
             )
             raise EmbeddingDegradedError(msg)
+        if cfg.rerank and outcome.rerank_dropped:
+            msg = (
+                f"rerank on case {case.id} never judged {outcome.rerank_dropped} of its "
+                "candidates (the model's per-request cap or a length refusal): its numbers "
+                "would not be this arm's pool"
+            )
+            raise RerankDegradedError(msg)
         results = list(outcome.results)
         replay = _ReplayRetriever(inner=retriever, outcome=outcome)
         tool = KnowledgeSearchTool(
@@ -1566,8 +1581,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RERANK_VIEW,
         choices=RERANK_VIEWS,
         help=(
-            "B-206 K-14 对照组:dual = 带标题 / 正文两视图加权(K-14 之前);single = 结构化单串"
-            "打一次分;single_clean = 单串、正文先去 Markdown / URL / 表格线 / HTML。默认 = 生产默认"
+            "B-206 K-14 对照组:dual = 带标题 / 正文两视图加权(生产默认);single = 结构化单串"
+            "打一次分;single_clean = 单串、正文先去 Markdown / URL / 表格线 / HTML"
         ),
     )
     parser.add_argument(
@@ -1579,7 +1594,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rerank-instruct",
         action="store_true",
-        help="单视图带英文任务说明(只发给支持的模型,生产默认关)",
+        help=(
+            "单视图带英文任务说明(要配 --rerank-view single|single_clean;"
+            "只发给支持的模型,生产默认关)"
+        ),
     )
     parser.add_argument(
         "--doc-match",
@@ -1771,6 +1789,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.rerank_pool < 1:
         raise SystemExit(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
+    if args.rerank_instruct and args.rerank_view == "dual":
+        raise SystemExit(INSTRUCT_NEEDS_SINGLE_VIEW)
     cfg = EvalConfig(
         method=RetrievalMethod(args.method),
         top_k=args.top_k,

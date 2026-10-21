@@ -677,6 +677,18 @@ def test_rerank_arm_flags_reach_the_tools_retriever_and_the_run_row(
     assert network_attempts == []
 
 
+def test_an_instruction_with_the_dual_view_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Default view is dual, which sends no instruction: refused before any ingest.
+    for name in (*ANSWER_ENV, *JUDGE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit):
+        main(_dry_argv(tmp_path, "--rerank-instruct"))
+    assert "--rerank-instruct needs --rerank-view single" in capsys.readouterr().err
+    assert not (tmp_path / "agent.jsonl").exists()
+
+
 def test_real_run_needs_the_model_endpoints(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
