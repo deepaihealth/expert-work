@@ -11,9 +11,9 @@ import json
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -28,6 +28,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     EvalConfig,
     RerankDegradedError,
     _build_parser,
+    _ReplayRetriever,
     baseline_benchmark,
     build_corpus,
     build_fake_embedder,
@@ -41,8 +42,10 @@ from kb_eval import (  # type: ignore[import-not-found]
     resolve_anchor_documents,
     rls_tenant,
     run_eval,
+    search_log_json,
     select_rows,
     summarise,
+    tool_message_text,
 )
 from kb_metrics import score_case  # type: ignore[import-not-found]
 from kb_rerank import RerankCacheMissError  # type: ignore[import-not-found]
@@ -51,7 +54,13 @@ from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import DocumentStatus, RetrievalMethod
-from orchestrator.tools.knowledge import KnowledgeRetriever
+from orchestrator.tools import knowledge
+from orchestrator.tools.knowledge import (
+    KnowledgeRetriever,
+    KnowledgeSearchOutcome,
+    KnowledgeSearchTool,
+    RetrievedChunk,
+)
 
 _ANCHOR_A = "常温密封保存即可"
 _ANCHOR_B = "专利号 ZL2019-1234567"
@@ -1329,3 +1338,218 @@ async def test_with_text_keeps_the_retrieved_text_and_default_leaves_it_out(
     assert any(_ANCHOR_A in (res.text or "") for r in rows_text for res in r.results)
     assert all("text" not in res for r in rows_plain for res in case_to_json(r)["results"])
     assert all("text" in res for res in case_to_json(hit)["results"])
+
+
+# ---------------------------------------------------------------------------
+# 给模型的文本里的锚文本命中 / 逐次检索记录(B-206 批 0)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _FixedRetriever:
+    """Returns the same ranked chunks for every query, so a test controls the ranks."""
+
+    results: tuple[RetrievedChunk, ...]
+
+    async def search_detailed(self, **_kwargs: Any) -> KnowledgeSearchOutcome:
+        return KnowledgeSearchOutcome(
+            results=self.results, status="ok", candidates=len(self.results)
+        )
+
+
+def _ranked(anchor_rank: int, n: int = 8) -> tuple[RetrievedChunk, ...]:
+    """``n`` results; only the one at ``anchor_rank`` is manual_a.md's anchor chunk."""
+    return tuple(
+        RetrievedChunk(
+            content=f"益生菌{_ANCHOR_A}。" if rank == anchor_rank else f"无关段落第 {rank} 条。",
+            filename="manual_a.md" if rank == anchor_rank else f"other{rank}.md",
+            chunk_index=rank,
+            chunk_id=uuid4(),
+            fused_score=1.0 / (60 + rank),
+        )
+        for rank in range(1, n + 1)
+    )
+
+
+async def _context_rows(anchor_rank: int) -> list[CaseRow]:
+    return await run_eval(
+        dataset=_one_case_dataset(("manual_a.md", _ANCHOR_A)),
+        retriever=cast(KnowledgeRetriever, _FixedRetriever(_ranked(anchor_rank))),
+        tenant_id=uuid4(),
+        cfg=EvalConfig(top_k=20),
+        concurrency=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_hit_counts_only_what_the_tool_hands_the_model() -> None:
+    """The tool shows its default 5 results: an anchor ranked 7th is a chunk hit
+    within 10 but never reached the model."""
+    shown = (await _context_rows(3))[0].score
+    hidden = (await _context_rows(7))[0].score
+    assert (shown.chunk_hit_10, shown.context_hit) == (1.0, 1.0)
+    assert (hidden.chunk_hit_10, hidden.context_hit) == (1.0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_context_hit_follows_the_tools_own_limit_and_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Computed on the tool's real output, not on chunk ids: when the tool's
+    default count or its rendering changes (parent chunks later), so does it."""
+    monkeypatch.setattr(knowledge, "_DEFAULT_LIMIT", 8)
+    assert (await _context_rows(7))[0].score.context_hit == 1.0
+    monkeypatch.setattr(
+        knowledge,
+        "_format_results",
+        lambda results: "\n".join(f"[{r.filename}#{r.chunk_index}]" for r in results),
+    )
+    assert (await _context_rows(3))[0].score.context_hit == 0.0
+
+
+@pytest.mark.asyncio
+async def test_context_hit_leaves_the_existing_metrics_unchanged() -> None:
+    """Every other field of the case score is what scoring the same results
+    without the rendered text gives."""
+    for anchor_rank in (3, 7):
+        row = (await _context_rows(anchor_rank))[0]
+        dataset = _one_case_dataset(("manual_a.md", _ANCHOR_A))
+        expected = score_case(_ranked(anchor_rank), dataset.cases[0].expected, threshold=None)
+        assert replace(row.score, context_hit=None) == expected
+
+
+@pytest.mark.asyncio
+async def test_context_hit_is_none_when_the_tool_wants_more_than_top_k() -> None:
+    """With ``--top-k 3`` the first 3 are not what the tool (5 by default) would
+    have shown, so no context hit is claimed either way."""
+    rows = await run_eval(
+        dataset=_one_case_dataset(("manual_a.md", _ANCHOR_A)),
+        retriever=cast(KnowledgeRetriever, _FixedRetriever(_ranked(2)[:3])),
+        tenant_id=uuid4(),
+        cfg=EvalConfig(top_k=3),
+        concurrency=1,
+    )
+    assert rows[0].score.chunk_hit_10 == 1.0
+    assert rows[0].score.context_hit is None
+
+
+class _ReversingReranker:
+    """A scoring reranker that puts the fused order upside down."""
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        return list(reversed(range(len(documents))))[:top_k]
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        order = list(reversed(range(len(documents))))[:top_k]
+        return [(i, 1.0 - n / 100) for n, i in enumerate(order)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reranker", [None, _ReversingReranker()])
+async def test_replayed_search_renders_what_the_tool_gets_searching_itself(
+    reranker: Any,
+) -> None:
+    """The eval hands the tool the first results of its own top-20 search instead
+    of searching again; at the default top_k that must be exactly what the tool
+    would have shown searching by itself."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with rls_tenant(tenant):
+        await _seed_docs(
+            store,
+            tenant,
+            {
+                f"doc{i}.md": f"# 说明 {i}\n\n益生菌第 {i} 款,每日 {i} 袋,冷藏保存。\n"
+                for i in range(9)
+            },
+        )
+        retriever = KnowledgeRetriever(
+            store=store, embedder=build_fake_embedder(), reranker=reranker
+        )
+        for query in ("益生菌每日几袋", "冷藏保存"):
+            outcome = await retriever.search_detailed(
+                tenant_id=tenant, base_names=["kb"], query=query, limit=20
+            )
+            assert len(outcome.results) > 5  # the tool's default count must actually cut
+            replayed = KnowledgeSearchTool(
+                retriever=cast(KnowledgeRetriever, _ReplayRetriever(retriever, outcome)),
+                knowledge_base_refs=("kb",),
+            )
+            searching = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
+            texts = [
+                await tool_message_text(tool, {"query": query}, tenant_id=tenant, call_id="c")
+                for tool in (replayed, searching)
+            ]
+            assert texts[0] == texts[1]
+
+
+@pytest.mark.asyncio
+async def test_search_log_records_every_returned_chunk_and_what_was_shown() -> None:
+    row = (await _context_rows(7))[0]
+    log = search_log_json(row)
+    assert (log["case_id"], log["query"], log["limit"], log["status"]) == (
+        "q1",
+        "益生菌怎么补",
+        20,
+        "ok",
+    )
+    assert log["shown"] == 5
+    assert log["shown_chars"] > 0
+    ranked = _ranked(7)
+    assert [r["rank"] for r in log["results"]] == list(range(1, 9))
+    assert [r["shown"] for r in log["results"]] == [True] * 5 + [False] * 3
+    assert [(r["filename"], r["chunk_index"]) for r in log["results"]] == [
+        (c.filename, c.chunk_index) for c in ranked
+    ]
+    assert [r["fused_score"] for r in log["results"]] == [c.fused_score for c in ranked]
+    assert all(isinstance(r["chunk_id"], str) for r in log["results"])
+    assert all(r["rerank_score"] is None for r in log["results"])
+
+
+@pytest.mark.asyncio
+async def test_search_log_keeps_rerank_scores(
+    corpus: tuple[Path, Path], dataset_path: Path
+) -> None:
+    dataset, plain, _store, (tenant, _report) = await _built(corpus, dataset_path)
+    rows = await run_eval(
+        dataset=dataset,
+        retriever=replace(plain, reranker=_FlatScoreReranker()),
+        tenant_id=tenant,
+        cfg=EvalConfig(top_k=20, rerank=True),
+        concurrency=1,
+    )
+    storage = search_log_json(next(r for r in rows if r.case_id == "q-storage"))
+    assert storage["results"]
+    assert {r["rerank_score"] for r in storage["results"]} == {0.3}
+
+
+def test_main_writes_the_search_log_only_when_asked(
+    tmp_path: Path,
+    dataset_path: Path,
+    corpus: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _manifest, root = corpus
+    log = tmp_path / "searches.jsonl"
+    argv = _cli(dataset_path, root, tmp_path / "plain.jsonl", tmp_path / "b.yaml")
+    assert main(argv) == 0
+    assert not log.exists()
+    assert "ctx_hit" in capsys.readouterr().out  # reported next to chk_hit@10
+
+    argv = _cli(dataset_path, root, tmp_path / "logged.jsonl", tmp_path / "b.yaml")
+    assert main([*argv, "--search-log", str(log)]) == 0
+    lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert sorted(line["case_id"] for line in lines) == sorted(c["id"] for c in _cases())
+    summary = json.loads((tmp_path / "logged.jsonl").read_text(encoding="utf-8").splitlines()[-1])[
+        "summary"
+    ]
+    assert summary["overall"]["context_hit"] is not None
+
+    argv = _cli(dataset_path, root, tmp_path / "x.jsonl", tmp_path / "b.yaml")
+    with pytest.raises(SystemExit, match="refusing to overwrite"):
+        main([*argv, "--search-log", str(log)])
+    assert not (tmp_path / "x.jsonl").exists()

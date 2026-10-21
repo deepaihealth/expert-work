@@ -19,8 +19,12 @@
 3. 入库后核「锚文本存活」:每条 expected 的 anchor 至少出现在其文档的某一段里,不存活的 case
    单列(是数据集 / 切块的问题,不是检索的问题);
 4. 每条 case 调 ``KnowledgeRetriever.search(limit=top_k)``,按 ``kb_metrics`` 打分(``match``
-   取 case 自己的 any|all);总体 / 按 ``source`` / 按 ``tag`` 各出一份汇总;结果 JSONL 每 case
-   一行(含 ``best_score`` 便于离线扫阈值)+ 末尾一行汇总;``--update-baseline`` 把汇总与指纹
+   取 case 自己的 any|all);同一次检索的前几名再交给生产 ``knowledge_search`` 工具按默认条数渲染
+   (工具节点同一段代码),锚文本是否落在这段**给模型的文本**里记 ``context_hit``(B-206
+   「父段级段命中」,与 ``chk_hit@10`` 并列);总体 / 按 ``source`` / 按 ``tag`` 各出一份汇总;
+   结果 JSONL 每 case 一行(含 ``best_score`` 便于离线扫阈值)+ 末尾一行汇总;
+   ``--search-log`` 另写每次检索的逐段记录(段号、名次、各路分数、是否交给了模型,默认不写);
+   ``--update-baseline`` 把汇总与指纹
    并进基线 YAML(复用 ``longmem.runner.update_baseline``);**有任何失败 / 同名冲突时拒绝
    更新基线**(退出码非 0)。
 
@@ -104,14 +108,18 @@ from expert_work.protocol import (
     chunk_retrieval_text,
     knowledge_document_title,
 )
+from orchestrator.graph_builder.builder import _invoke_tool
 from orchestrator.llm import Embedder, LLMCaller
 from orchestrator.llm.embedder import QWEN_EMBEDDING_BASE_URL
 from orchestrator.tools.knowledge import (
     KnowledgeRetriever,
+    KnowledgeSearchOutcome,
+    KnowledgeSearchTool,
     Reranker,
     RetrievedChunk,
     default_recall_depth,
 )
+from orchestrator.tools.registry import Tool, ToolContext
 
 _EVAL_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _EVAL_DIR.parents[1]
@@ -154,6 +162,8 @@ FAILURE_STAGES: tuple[str, ...] = ("parse", "embed", "store", "other")
 _STORE_EXC_MODULES = ("sqlalchemy", "asyncpg", "psycopg", "expert_work.persistence")
 #: ``list_chunks`` 翻页大小(锚文本存活检查)。
 _CHUNK_PAGE = 200
+#: 工具结果的防注入围栏 nonce(生产默认开 spotlight,每次构建随机取);固定下来渲染结果才可复现。
+TOOL_SPOTLIGHT_NONCE = "kbeval0nonce"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +291,21 @@ class ResultRow:
 
 
 @dataclass(frozen=True)
+class SearchLog:
+    """一次检索返回了什么(``--search-log``):逐段的段号、各路分数,以及前 ``shown`` 名交给了
+    ``knowledge_search``(工具默认条数),诊断时不用再重跑。"""
+
+    query: str
+    limit: int
+    status: str
+    candidates: int
+    rerank_degraded: bool
+    results: tuple[RetrievedChunk, ...]
+    shown: int
+    shown_chars: int  # 工具渲染给模型的文本长度
+
+
+@dataclass(frozen=True)
 class CaseRow:
     case_id: str
     source: str
@@ -289,6 +314,7 @@ class CaseRow:
     score: CaseScore
     match: str = "any"
     anchors_alive: bool | None = None  # 无答案 case 为 None
+    search: SearchLog | None = None
 
 
 class EmbeddingDimensionError(RuntimeError):
@@ -828,6 +854,15 @@ async def run_eval(
             )
             raise RerankDegradedError(msg)
         results = list(outcome.results)
+        replay = _ReplayRetriever(inner=retriever, outcome=outcome)
+        tool = KnowledgeSearchTool(
+            retriever=cast(KnowledgeRetriever, replay), knowledge_base_refs=(dataset.name,)
+        )
+        shown_text = await tool_message_text(
+            tool, {"query": case.query}, tenant_id=tenant_id, call_id=case.id
+        )
+        # 工具要的条数比这次检索的 top_k 还多时,截下来的前几名不是它自己搜会拿到的,不算。
+        faithful = replay.requested is not None and replay.requested <= cfg.top_k
         alive: bool | None = None
         if anchors is not None and case.expected:
             alive = case.id in anchors.alive_cases
@@ -842,12 +877,58 @@ async def run_eval(
                 threshold=cfg.threshold,
                 match=case.match,
                 rerank_threshold=cfg.rerank_threshold,
+                shown_text=shown_text if faithful else None,
             ),
             match=case.match,
             anchors_alive=alive,
+            search=SearchLog(
+                query=case.query,
+                limit=cfg.top_k,
+                status=outcome.status,
+                candidates=outcome.candidates,
+                rerank_degraded=outcome.rerank_degraded,
+                results=outcome.results,
+                shown=min(replay.requested or 0, len(results)),
+                shown_chars=len(shown_text),
+            ),
         )
 
     return list(await asyncio.gather(*(_one(c) for c in dataset.cases)))
+
+
+@dataclass
+class _ReplayRetriever:
+    """``knowledge_search`` 那次检索不重跑:给它这次检索结果的前 ``limit`` 条(模型不传条数时
+    就是工具默认条数)。召回深度只在 ``limit`` > 25、双视图重排的前段只在 ``limit`` > 20 时才随
+    ``limit`` 变,所以默认 ``--top-k 20`` 下与工具自己搜一次逐条相同,也不多花一次嵌入 / 重排;
+    其余属性转给真检索器(工具以后要从库里取父段之类的,照样拿得到)。"""
+
+    inner: KnowledgeRetriever
+    outcome: KnowledgeSearchOutcome
+    requested: int | None = None
+
+    async def search_detailed(self, *, limit: int, **_overrides: Any) -> KnowledgeSearchOutcome:
+        self.requested = limit
+        return replace(self.outcome, results=self.outcome.results[:limit])
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+async def tool_message_text(
+    tool: Tool, args: Mapping[str, Any], *, tenant_id: UUID, call_id: str
+) -> str:
+    """工具节点交给模型的那段文本 —— 直接走生产的 ``_invoke_tool``:参数校验、调用、出错时的
+    报错格式、超长外置(默认智能体不开工作区,没有外置)、防注入围栏、围栏外的提示,都与生产
+    同一段代码,工具的渲染 / 条数 / 截断以后怎么改都跟着走。"""
+    message, _updates, _refund, _error = await _invoke_tool(
+        tool,
+        dict(args),
+        call_id,
+        ToolContext(tenant_id=tenant_id),
+        spotlight_nonce=TOOL_SPOTLIGHT_NONCE,
+    )
+    return str(message.content)
 
 
 def _result_row(result: RetrievedChunk, *, with_text: bool = False) -> ResultRow:
@@ -972,12 +1053,53 @@ def write_jsonl(path: Path, rows: Sequence[CaseRow], summary: Mapping[str, Any])
         fh.write(json.dumps({"summary": summary}, ensure_ascii=False) + "\n")
 
 
+def search_log_json(row: CaseRow) -> dict[str, Any]:
+    """``--search-log`` 的一行:这一题那次检索返回的每一段(不含正文)。"""
+    log = row.search
+    if log is None:
+        raise ValueError(f"case {row.case_id} has no search log")
+    return {
+        "case_id": row.case_id,
+        "query": log.query,
+        "limit": log.limit,
+        "status": log.status,
+        "candidates": log.candidates,
+        "rerank_degraded": log.rerank_degraded,
+        "shown": log.shown,
+        "shown_chars": log.shown_chars,
+        "results": [
+            {
+                "rank": rank,
+                "filename": r.filename,
+                "chunk_index": r.chunk_index,
+                "chunk_id": None if r.chunk_id is None else str(r.chunk_id),
+                "recall_source": r.recall_source,
+                "vector_score": r.vector_score,
+                "keyword_score": r.keyword_score,
+                "fused_score": r.fused_score,
+                "rerank_score": r.rerank_score,
+                "shown": rank <= log.shown,
+            }
+            for rank, r in enumerate(log.results, start=1)
+        ],
+    }
+
+
+def write_search_log(path: Path, rows: Sequence[CaseRow]) -> None:
+    refuse_existing(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(search_log_json(row), ensure_ascii=False) + "\n")
+
+
 _TABLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("n", "n"),
     ("doc_hit@10", "doc_hit@10"),
     ("doc_hit@20", "doc_hit@20"),
     ("doc_cov@20", "doc_coverage@20"),
     ("chk_hit@10", "chunk_hit@10"),
+    ("ctx_hit", "context_hit"),
     ("chk_hit@20", "chunk_hit@20"),
     ("chk_cov@20", "chunk_coverage@20"),
     ("mrr@10", "mrr@10"),
@@ -1335,6 +1457,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label", default="run", help="结果文件名;--out 未给时用它")
     parser.add_argument("--out", type=Path, help=f"结果 JSONL(默认 {EVAL_OUT_DIR}/<label>.jsonl)")
     parser.add_argument(
+        "--search-log",
+        type=Path,
+        help="另写每次检索的逐段记录 JSONL(每题一行:段号、名次、各路分数、是否交给了模型);默认不写",
+    )
+    parser.add_argument(
         "--baseline-out",
         type=Path,
         help="基线 YAML(默认 tools/eval/baselines/kb_<dataset name>_baseline.yaml)",
@@ -1460,6 +1587,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     tiers = _resolve_tiers(args.tiers, dataset)
     out = cast(Path, args.out) if args.out is not None else EVAL_OUT_DIR / f"{args.label}.jsonl"
     refuse_existing(out)
+    if args.search_log is not None:
+        refuse_existing(args.search_log)
     baseline_out = (
         cast(Path, args.baseline_out)
         if args.baseline_out is not None
@@ -1506,6 +1635,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_jsonl(out, rows, summary)
     print(format_summary_table(summary))
     print(f"results: {out}")
+    if args.search_log is not None:
+        write_search_log(args.search_log, rows)
+        print(f"search log: {args.search_log}")
     if args.update_baseline:
         if report.docs_failed:
             raise SystemExit(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 from kb_metrics import (  # type: ignore[import-not-found]
@@ -12,6 +12,7 @@ from kb_metrics import (  # type: ignore[import-not-found]
     best_score,
     chunk_coverage,
     chunk_hits,
+    context_hit,
     coverage_at_k,
     document_coverage,
     document_hits,
@@ -334,6 +335,28 @@ def test_score_case_empty_results_is_zero_hit() -> None:
     assert score.best_score is None
     assert score.doc_hit_10 == 0.0
     assert score.mrr_10 == 0.0
+
+
+def test_context_hit_any_all_and_normalised_matching() -> None:
+    both = f"[a.md#0]\n**常温 密封保存** 即可\n\n---\n\n[b.txt#0]\n{_ANCHOR_B}"
+    only_a = f"[a.md#0]\n{_ANCHOR}"
+    assert context_hit(both, [_EXP_A, _EXP_B], match="all") == 1.0
+    assert context_hit(only_a, [_EXP_A, _EXP_B], match="all") == 0.0
+    assert context_hit(only_a, [_EXP_A, _EXP_B], match="any") == 1.0
+    assert context_hit("[a.md#0]\n菌株编号 BL-98", [_EXP_A2], match="any") == 0.0
+
+
+def test_score_case_context_hit_only_with_rendered_text_and_nothing_else_moves() -> None:
+    results = [*_miss(6), _r("a.md", _ANCHOR)]
+    plain = score_case(results, [_EXP_A], threshold=None)
+    shown = score_case(results, [_EXP_A], threshold=None, shown_text="无关内容 0")
+    assert plain.context_hit is None
+    assert shown.context_hit == 0.0
+    assert shown.metrics()["context_hit"] == 0.0
+    assert shown == replace(plain, context_hit=0.0)
+    assert score_case([], [], threshold=None, shown_text=_ANCHOR).context_hit is None
+    agg = aggregate([shown, score_case(results, [_EXP_A], threshold=None, shown_text=_ANCHOR)])
+    assert agg["context_hit"] == 0.5
 
 
 def test_score_case_no_answer_has_no_rank_metrics() -> None:

@@ -20,6 +20,11 @@
 * ``ndcg@10``:``any`` → 理想序只有 1 条相关;``all`` → 理想序 = 全部期望依次在前 n 名;
   同一名次覆盖两条期望时第二条按「下一名次」记(与连续两段命中等价),保证 ≤ 1。
 
+``context_hit``(B-206「父段级段命中」)不看名次也不看段号:锚文本(归一后)是否落在
+``knowledge_search`` 按默认条数**渲染给模型的那段文本**里(``any`` 任一条、``all`` 全部);
+运行器把工具真正的输出传进来,所以工具改成返回父段 / 改了条数或格式,它跟着变。没给渲染文本时
+为 ``None``。
+
 「拒答」只在给了阈值时有定义:结果为空,或每条结果都带分数且都低于阈值;``score is None``
 (只被关键词路召回)的结果会被工具原样返回给模型,算作「给出了结果」。阈值未设时
 ``refused`` / 两个拒答率都是 ``None``;每条 case 的 ``best_score``(最佳向量分数)另存,
@@ -53,6 +58,7 @@ MEAN_FIELDS: tuple[tuple[str, str], ...] = (
     ("chunk_coverage@20", "chunk_coverage_20"),
     ("mrr@10", "mrr_10"),
     ("ndcg@10", "ndcg_10"),
+    ("context_hit", "context_hit"),
 )
 
 #: 归一时去掉的 HTML 标签(``<br>``、``<u>`` 之类;PDF / 表格转出来的文字里常见)。
@@ -135,6 +141,7 @@ class CaseScore:
     ndcg_10: float | None
     doc_hit_ranks: tuple[int, ...]  # 1-based 结果名次,每个期望文档首次出现的那名
     chunk_hit_ranks: tuple[int, ...]  # 1-based 结果名次,首次覆盖到某条期望的那些名
+    context_hit: float | None = None  # 没给渲染文本 / 无答案 case 为 None
 
     def metrics(self) -> dict[str, float | None]:
         data = asdict(self)
@@ -178,6 +185,13 @@ def chunk_coverage(
 ) -> list[frozenset[int]]:
     """逐名次首次覆盖到的期望条目索引;一段含两锚则两条一起记。"""
     return _first_coverage(results, lambda r: _matching_expected(r, expected))
+
+
+def context_hit(shown_text: str, expected: Sequence[ExpectedLike], *, match: str) -> float:
+    """锚文本是否落在交给模型的文本里:``any`` 任一条、``all`` 全部(见模块说明)。"""
+    _check_match(match)
+    found = [anchor_in(exp.anchor, shown_text) for exp in expected]
+    return 1.0 if (all(found) if match == "all" else any(found)) else 0.0
 
 
 def _matching_expected(result: ResultLike, expected: Sequence[ExpectedLike]) -> list[int]:
@@ -295,9 +309,12 @@ def score_case(
     threshold: float | None,
     match: str = "any",
     rerank_threshold: float | None = None,
+    shown_text: str | None = None,
 ) -> CaseScore:
     """``rerank_threshold`` (B-175 wave 2 PR3) is the rerank-score floor the
-    retriever already applied: with it set, an empty result is a refusal."""
+    retriever already applied: with it set, an empty result is a refusal.
+    ``shown_text`` is what ``knowledge_search`` handed the model for this
+    query; it only feeds ``context_hit``."""
     _check_match(match)
     refused = is_refused(results, threshold=threshold)
     if rerank_threshold is not None:
@@ -347,6 +364,9 @@ def score_case(
         ndcg_10=ndcg_at_k(chunk_cov, n_expected=n_exp, k=RANK_K, match=match),
         doc_hit_ranks=tuple(i + 1 for i, covered in enumerate(doc_cov) if covered),
         chunk_hit_ranks=tuple(i + 1 for i, covered in enumerate(chunk_cov) if covered),
+        context_hit=(
+            None if shown_text is None else context_hit(shown_text, expected, match=match)
+        ),
     )
 
 
@@ -416,6 +436,7 @@ __all__ = [
     "best_score",
     "chunk_coverage",
     "chunk_hits",
+    "context_hit",
     "coverage_at_k",
     "document_coverage",
     "document_hits",

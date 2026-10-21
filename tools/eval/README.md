@@ -226,6 +226,12 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   (结果为空或全部低于阈值算拒答),没给阈值报 `-`,每行 case 的 `best_score`(最佳向量分数)落在 JSONL 里便于离线扫阈值。
   总体 / 按 `source` / 按每个 `tag`(同一 case 重复 tag 只算一次)各一份。
   注意混合模式下关键词命中总会进融合,所以「无答案」判定要配 `--method vector --threshold <x>`。
+- **给模型的文本里的锚文本命中(`context_hit`,B-206「父段级段命中」)**:每题那次检索的前几名交给生产
+  `knowledge_search` 工具,经工具节点同一段代码(`_invoke_tool`)渲染成模型拿到的文本(工具默认条数;默认智能体不开工作区,
+  不外置截断),锚文本归一后落在里面记 1(`match=all` 要全部锚文本都在);汇总表 `ctx_hit` 列紧挨 `chk_hit@10`。工具改成
+  返回父段 / 改条数 / 改格式,这个数自动跟着变。`--top-k` 小于工具要的条数时不算(报 `-`)。
+- **逐次检索记录(`--search-log <path>`,默认不写)**:每题一行 —— 查询、状态、候选数、是否降级、交给模型的条数与字数,
+  以及每个返回段的名次、文件名、段号、段 id、召回路、向量 / 关键词 / 融合 / 重排分数、是否交给了模型(不含正文)。
 - **产出**:`eval-out/kb/<label>.jsonl`(每 case 一行:`match`、`best_score`、`anchors_alive`、返回的 (filename, chunk_index, score, recall_source)、
   命中名次、指标;末尾一行汇总;已存在就拒绝覆盖)、终端一张汇总表;`--update-baseline` 把汇总(去掉 `base_id` / `elapsed_s` / `label`
   这些每次都变的字段)与指纹(评测集 sha256、清单 sha256、`corpus_root`、嵌入模型 / base URL / 维度、store、git commit + dirty 标记、
@@ -238,3 +244,10 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   (选文档 / 去重 / 同名冲突 / 失败分阶段 / 解析超时 / 维度校验 / 嵌入计数 / 锚存活 / any|all 两级命中 / 拒答 / 分组 / 拒绝覆盖 /
   拒绝写基线 / 指纹字段)。`--store sql`、`--embedder real`、`--rerank on` 三条路**没有测试**,在仓库外手工跑;
   CI 不读真语料、不起容器、不调嵌入 API。
+
+## B-206 知识库智能体层评测(`kb_agent_eval.py`,真模型答题 + 判分,不进 CI)
+
+60 题(主集与真实问法集各取全部「资料没写」题 + 固定种子各抽 15 道有答案题),检索与 `kb_eval.py` 同一条建库链路、库开重排,
+工具就是主干的 `knowledge_search`(结果经工具节点渲染);答题模型(默认 glm-5.3)最多搜 3 次,判分模型(默认
+deepseek-v4-pro)归成 答对 / 编造 / 正确说没写 / 误拒。一轮约 ¥15;`--dry` 换假模型零花费;`--budget` 到了暂停
+(往 `<out>.budget` 写新上限继续、写 `stop` 收尾),结果可续跑;`--tally <out>` 只出统计。用法、环境变量、计费规则见脚本开头说明。
