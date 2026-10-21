@@ -1,11 +1,17 @@
 """MODEL_CATALOG shape + lookup — Stream S PR B (Mini-ADR S-4)."""
 
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
 from expert_work.protocol import (
     MODEL_CATALOG,
     ModelEntry,
     catalog_entry,
     models_for_provider,
 )
+from expert_work.protocol.model_catalog import EmbeddingCaps, RerankCaps
 from expert_work.protocol.provider_catalog import PROVIDER_CATALOG
 
 
@@ -416,3 +422,160 @@ def test_max_high_low_effort_map_moved_into_catalog() -> None:
     for name in ("glm-5.3", "glm-5.3-flash", "glm-5.2"):
         assert _e("glm", name).effort_map == mhl
     assert _e("kimi", "kimi-k3").effort_map == mhl
+
+
+# ---------------------------------------------------------------------------
+# B-206 批 0 —— 嵌入 / 重排能力字段骨架(K-5 / K-7 / K-8)
+# ---------------------------------------------------------------------------
+
+
+def _flagged(flag: str) -> list[tuple[str, ModelEntry]]:
+    found: list[tuple[str, ModelEntry]] = [
+        (provider, entry)
+        for provider, entries in MODEL_CATALOG.items()
+        for entry in entries
+        if getattr(entry, flag) is True
+    ]
+    assert found, f"no {flag} model in the catalog — the checks below would pass vacuously"
+    return found
+
+
+def test_caps_default_to_undeclared() -> None:
+    entry = ModelEntry(name="x")
+    assert entry.embedding_caps is None
+    assert entry.rerank_caps is None
+
+
+def test_every_embedding_model_declares_asymmetry() -> None:
+    # ``asymmetry`` is required inside ``EmbeddingCaps``, so declared caps ⇔ declared asymmetry.
+    for provider, entry in _flagged("embeddings"):
+        assert entry.embedding_caps is not None, f"{provider}/{entry.name}"
+
+
+def test_every_rerank_model_declares_rerank_api() -> None:
+    # ``rerank_api`` is required inside ``RerankCaps``, so declared caps ⇔ declared API.
+    # Limits stay optional: several vendors document none (表 5-B「—」) → platform default.
+    for provider, entry in _flagged("rerank"):
+        assert entry.rerank_caps is not None, f"{provider}/{entry.name}"
+
+
+def test_declared_caps_match_b206_tables() -> None:
+    """B-206 §5.5 表 5-A / 5-B (2026-10 vendor docs). Batch 1 sends these to
+    the vendor, where a wrong value is a 400 or a silently weaker request —
+    whole-object equality also pins every field left undeclared."""
+    assert _e("openai", "text-embedding-3-large").embedding_caps == EmbeddingCaps(
+        asymmetry="none", max_batch=2_048, max_input_tokens=8_192
+    )
+    assert _e("glm", "embedding-3").embedding_caps == EmbeddingCaps(
+        asymmetry="none", max_batch=64, max_input_tokens=3_072
+    )
+    assert _e("qwen", "text-embedding-v4").embedding_caps == EmbeddingCaps(
+        asymmetry="param",
+        query_marker="text_type=query",
+        document_marker="text_type=document",
+        instruction="Given a search query, retrieve relevant passages that answer the query",
+        native_endpoint="/api/v1/services/embeddings/text-embedding/text-embedding",
+        max_batch=10,
+        max_input_tokens=8_192,
+    )
+    assert _e("qwen", "qwen3-vl-rerank").rerank_caps == RerankCaps(
+        rerank_api="dashscope",
+        max_documents=100,
+        max_doc_tokens=8_000,
+        max_total_tokens=120_000,
+        supports_instruction=True,
+        score_scale="relative",
+        rpm=600,
+    )
+
+
+def test_caps_only_on_entries_with_the_matching_flag() -> None:
+    with pytest.raises(ValidationError, match="embedding_caps needs embeddings=True"):
+        ModelEntry(name="chat", embedding_caps=EmbeddingCaps(asymmetry="none"))
+    with pytest.raises(ValidationError, match="rerank_caps needs rerank=True"):
+        ModelEntry(name="chat", rerank_caps=RerankCaps(rerank_api="dashscope"))
+    # The other capability flag does not stand in for the matching one.
+    with pytest.raises(ValidationError, match="rerank_caps needs rerank=True"):
+        ModelEntry(name="emb", embeddings=True, rerank_caps=RerankCaps(rerank_api="dashscope"))
+    with pytest.raises(ValidationError, match="embedding_caps needs embeddings=True"):
+        ModelEntry(name="rr", rerank=True, embedding_caps=EmbeddingCaps(asymmetry="none"))
+
+
+@pytest.mark.parametrize(
+    ("caps", "message"),
+    [
+        # "none" sends nothing, so anything declared would be silently dropped.
+        ({"asymmetry": "none", "query_marker": "input_type=query"}, "asymmetry='none'"),
+        ({"asymmetry": "none", "document_marker": "input_type=document"}, "asymmetry='none'"),
+        ({"asymmetry": "none", "instruction": "Given a search query"}, "asymmetry='none'"),
+        ({"asymmetry": "none", "native_endpoint": "/api/v1/embed"}, "asymmetry='none'"),
+        # "param" needs both sides, each "name=value".
+        (
+            {"asymmetry": "param", "query_marker": "text_type=query"},
+            "needs query_marker and document_marker",
+        ),
+        (
+            {"asymmetry": "param", "document_marker": "text_type=document"},
+            "needs query_marker and document_marker",
+        ),
+        (
+            {
+                "asymmetry": "param",
+                "query_marker": "query",
+                "document_marker": "text_type=document",
+            },
+            "'name=value'",
+        ),
+        (
+            {
+                "asymmetry": "param",
+                "query_marker": "=query",
+                "document_marker": "text_type=document",
+            },
+            "'name=value'",
+        ),
+        (
+            {
+                "asymmetry": "param",
+                "query_marker": "text_type=query",
+                "document_marker": "text_type=",
+            },
+            "'name=value'",
+        ),
+        # "prefix" needs a query template that places the query.
+        ({"asymmetry": "prefix"}, r"'\{query\}'"),
+        ({"asymmetry": "prefix", "query_marker": "search_query: "}, r"'\{query\}'"),
+        (
+            {
+                "asymmetry": "prefix",
+                "query_marker": "search_query: {query}",
+                "document_marker": "search_document: ",
+            },
+            r"'\{document\}'",
+        ),
+    ],
+)
+def test_embedding_caps_reject_inconsistent_markers(caps: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        EmbeddingCaps.model_validate(caps)
+
+
+def test_embedding_caps_accept_each_shape() -> None:
+    # One valid instance per shape (table 5-A rows) — the validator rejects only
+    # the inconsistent combos above, not the shapes vendors actually use.
+    EmbeddingCaps(asymmetry="none")
+    EmbeddingCaps(
+        asymmetry="param",
+        query_marker="input_type=search_query",
+        document_marker="input_type=search_document",
+    )
+    EmbeddingCaps(
+        asymmetry="prefix",
+        query_marker="Instruct: {task}\nQuery: {query}",
+        instruction="Given a search query, retrieve relevant passages that answer the query",
+    )
+    EmbeddingCaps(
+        asymmetry="prefix",
+        query_marker="search_query: {query}",
+        document_marker="search_document: {document}",
+    )
