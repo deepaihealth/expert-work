@@ -121,12 +121,12 @@ def vendor_reranker(
         native = HTTPDashScopeRerankClient(api_key=api_key, http=http)
         client = guards.wrap(native, provider=provider, model=model, secret_ref=secret_ref)
         return DashScopeReranker(client=client, model=model)
-    if api == "cohere_style":
-        cohere = cohere_style_client(provider, api_key=api_key, http=http)
-        entry = catalog_entry(provider, model)
-        return CohereStyleReranker(
-            client=guards.wrap(cohere, provider=provider, model=model, secret_ref=secret_ref),
-            model=model,
-            caps=entry.rerank_caps if entry is not None else None,
-        )
-    return assert_never(api)
+    if api != "cohere_style":
+        assert_never(api)
+    cohere = cohere_style_client(provider, api_key=api_key, http=http)
+    entry = catalog_entry(provider, model)
+    return CohereStyleReranker(
+        client=guards.wrap(cohere, provider=provider, model=model, secret_ref=secret_ref),
+        model=model,
+        caps=entry.rerank_caps if entry is not None else None,
+    )
