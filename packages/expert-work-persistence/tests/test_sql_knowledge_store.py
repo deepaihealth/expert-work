@@ -287,6 +287,39 @@ async def test_rerank_score_threshold_round_trip(sql_store: SqlStoreFixture) -> 
 
 
 @pytest.mark.asyncio
+async def test_rerank_threshold_model_round_trip(sql_store: SqlStoreFixture) -> None:
+    """B-206 K-7b — migration 0171's column: stored at create, kept by an update
+    that omits it, replaced or cleared by an explicit value."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(
+            tenant_id=tenant,
+            name="kb",
+            rerank_score_threshold=0.7,
+            rerank_threshold_model="qwen/qwen3-vl-rerank",
+        )
+        fetched = await store.get_base(tenant_id=tenant, name="kb")
+        assert fetched is not None
+        assert fetched.rerank_threshold_model == "qwen/qwen3-vl-rerank"
+        kept = await store.update_base(tenant_id=tenant, kb_id=base.id, rerank_score_threshold=0.6)
+        assert kept is not None
+        assert kept.rerank_threshold_model == "qwen/qwen3-vl-rerank"
+        moved = await store.update_base(
+            tenant_id=tenant, kb_id=base.id, rerank_threshold_model="qwen/qwen3-rerank"
+        )
+        assert moved is not None
+        assert moved.rerank_threshold_model == "qwen/qwen3-rerank"
+        cleared = await store.update_base(
+            tenant_id=tenant, kb_id=base.id, rerank_threshold_model=None
+        )
+        assert cleared is not None
+        assert cleared.rerank_threshold_model is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_base_stats_aggregate(sql_store: SqlStoreFixture) -> None:
     store, engine = sql_store
     try:

@@ -13,6 +13,11 @@
 
 计费:``qwen3-vl-rerank`` 文本输入 ¥0.5 / 百万 token(百炼控制台,2026-10-14);按接口返回的
 ``usage.total_tokens`` 累计,只算真发出去的请求。
+
+B-206 K-7b 换模型对照:``--rerank-model``(:func:`resolve_rerank_model`,只收模型目录里的
+重排模型)> 环境变量 ``EXPERT_WORK_EVAL_RERANK_MODEL`` > 生产同款。模型在缓存键里,各组不串。
+纯文本重排模型(``qwen3-rerank`` / ``qwen3.7-text-rerank``)同样 ¥0.5 / 百万 token;2026-10-22
+探针:同一请求计费 token 比 ``qwen3-vl-rerank`` 少(每篇约少 50),``usage.total_tokens`` 三个都有。
 """
 
 from __future__ import annotations
@@ -21,11 +26,13 @@ import hashlib
 import json
 import os
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from expert_work.protocol import catalog_entry
 from orchestrator.llm.rerank import DashScopeReranker, HTTPDashScopeRerankClient, RerankClient
 from orchestrator.llm.rerank_guard import RerankGuards
 
@@ -37,6 +44,8 @@ RERANK_PRICE_ENV = "EXPERT_WORK_EVAL_RERANK_PRICE_CNY_PER_M"
 DEFAULT_RERANK_PRICE_CNY_PER_M = 0.5
 #: 与嵌入缓存同一个假密钥约定:只读缓存,未命中即报错。
 OFFLINE_KEY = "offline-cache-only"
+#: DashScope 的模型在模型目录里记在这个厂商下。
+_CATALOG_PROVIDER = "qwen"
 
 
 class RerankCacheMissError(RuntimeError):
@@ -122,12 +131,36 @@ def _cache_key(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def build_dashscope_reranker(*, cache_path: Path) -> tuple[DashScopeReranker, CachedRerankClient]:
-    """``--rerank dashscope``:生产同款重排器 + 缓存客户端(后者用于汇总里的调用 / 费用统计)。"""
+def resolve_rerank_model(requested: str | None, *, rerank_mode: str) -> str | None:
+    """这次跑用哪个重排模型(B-206 K-7b):``--rerank-model`` > 环境变量 > 生产同款;
+    只有 ``--rerank dashscope`` 有模型可选(其它取法回 ``None``,给了 ``--rerank-model`` 就拒)。
+    不在模型目录里的拒掉:没有目录的 ``rpm`` / 单次上限,请求既不限速也不按上限截。"""
+    if rerank_mode != "dashscope":
+        if requested is not None:
+            raise SystemExit("--rerank-model needs --rerank dashscope (the native rerank models)")
+        return None
+    model = requested or os.environ.get(RERANK_MODEL_ENV) or DEFAULT_RERANK_MODEL
+    entry = catalog_entry(_CATALOG_PROVIDER, model)
+    if entry is None or not entry.rerank:
+        raise SystemExit(f"{model!r} is not a rerank model in the model catalog")
+    return model
+
+
+def rerank_outcome_counts(outcomes: Iterable[str | None]) -> dict[str, int]:
+    """每种 ``rerank_outcome`` 的检索次数(没要重排的不计)。``partial`` 只计数不退出:
+    整轮只在 ``rerank_degraded`` 时退出。"""
+    return dict(sorted(Counter(o for o in outcomes if o is not None).items()))
+
+
+def build_dashscope_reranker(
+    *, cache_path: Path, model: str | None = None
+) -> tuple[DashScopeReranker, CachedRerankClient]:
+    """``--rerank dashscope``:生产同款重排器 + 缓存客户端(后者用于汇总里的调用 / 费用统计)。
+    ``model`` 不给 = 环境变量 / 生产同款。"""
     key = os.environ.get(RERANK_KEY_ENV)
     if not key:
         raise SystemExit(f"--rerank dashscope requires env {RERANK_KEY_ENV} (the DashScope key)")
-    model = os.environ.get(RERANK_MODEL_ENV) or DEFAULT_RERANK_MODEL
+    model = model or os.environ.get(RERANK_MODEL_ENV) or DEFAULT_RERANK_MODEL
     # B-206 K-7a —— 网络客户端套生产同款限流 / 退避(按目录 rpm 匀速、429 重试),
     # 套在缓存里面:命中缓存不占令牌、不等待。
     inner = (
@@ -151,4 +184,6 @@ __all__ = [
     "CachedRerankClient",
     "RerankCacheMissError",
     "build_dashscope_reranker",
+    "rerank_outcome_counts",
+    "resolve_rerank_model",
 ]

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
@@ -41,6 +41,7 @@ from orchestrator.tools.knowledge_rerank import (
     RerankOutcome,
     current_rerank_budget,
     ranking_dropped,
+    ranking_model,
     ranking_outcome,
     rerank_budget,
     weighted_views,
@@ -48,6 +49,7 @@ from orchestrator.tools.knowledge_rerank import (
 from orchestrator.tools.knowledge_rerank import Reranker as Reranker
 from orchestrator.tools.knowledge_rerank import RerankRanking as RerankRanking
 from orchestrator.tools.knowledge_rerank import ScoredReranker as ScoredReranker
+from orchestrator.tools.knowledge_threshold import apply_threshold, code_kept_notice, search_floors
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.rerank_passage import rerank_passage
 
@@ -253,6 +255,12 @@ class KnowledgeSearchOutcome:
     ``rerank_dropped`` (B-206 K-14) counts candidates the reranker was handed
     but never judged (its model's per-request cap, or a size refusal it retried
     with fewer): the rerank ran, over part of the pool.
+    B-206 K-7b (:mod:`orchestrator.tools.knowledge_threshold`):
+    ``rerank_threshold_paused`` is set when a base's stored threshold was left
+    out because another rerank model scored this search;
+    ``rerank_threshold_code_kept`` counts the results kept under a stored
+    threshold only because they hold a code the query names; ``rerank_model`` is
+    the model that scored (``None`` without scores, or when the reranker did not say).
     """
 
     results: tuple[RetrievedChunk, ...]
@@ -262,6 +270,9 @@ class KnowledgeSearchOutcome:
     embedding_degraded: bool = False
     rerank_dropped: int = 0
     rerank_outcome: RerankOutcome | None = None
+    rerank_threshold_paused: bool = False
+    rerank_threshold_code_kept: int = 0
+    rerank_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -279,13 +290,15 @@ class _Reranked:
     """The rerank stage's output: chunks best first — at least ``limit`` of them
     when there are that many, more when the reranker scored more, so a
     threshold that drops some can still fill ``limit`` — each one's rerank score
-    when the reranker gave one, how many candidates it never judged, and how
-    the rerank ended (``None`` when it was not asked for)."""
+    when the reranker gave one, how many candidates it never judged, how
+    the rerank ended (``None`` when it was not asked for), and the model that
+    scored (``None`` when it did not say)."""
 
     chunks: list[KnowledgeChunk]
     scores: Mapping[UUID, float]
     dropped: int = 0
     outcome: RerankOutcome | None = None
+    model: str | None = None
 
     @property
     def degraded(self) -> bool:
@@ -464,27 +477,30 @@ class KnowledgeRetriever:
         ranked = await self._rerank(
             query, fused, limit, tenant_id=tenant_id, enabled=rerank_enabled
         )
-        floor = {
-            b.id: (
-                rerank_score_threshold
-                if rerank_score_threshold is not None
-                else b.rerank_score_threshold
-            )
-            for b in bases
-        }
+        floors = search_floors(
+            bases,
+            override=rerank_score_threshold,
+            scored=bool(ranked.scores),
+            scoring_model=ranked.model,
+        )
         # Filtered before the cut to ``limit``: with several bases, one base's
         # floor dropping the top hits must leave room for another base's.
-        kept = [c for c in ranked.chunks if _clears_floor(c, ranked.scores, floor)][:limit]
+        cut = apply_threshold(ranked.chunks, ranked.scores, floors, query=query)
+        kept = cut.chunks[:limit]
+        below = KnowledgeSearchOutcome(
+            results=(),
+            status="below_threshold",
+            candidates=len(ranked.chunks),
+            rerank_degraded=ranked.degraded,
+            embedding_degraded=degraded,
+            rerank_dropped=ranked.dropped,
+            rerank_outcome=ranked.outcome,
+            rerank_threshold_paused=floors.paused,
+            rerank_threshold_code_kept=sum(chunk.id in cut.code_kept for chunk in kept),
+            rerank_model=ranked.model if ranked.scores else None,
+        )
         if not kept:
-            return KnowledgeSearchOutcome(
-                results=(),
-                status="below_threshold",
-                candidates=len(ranked.chunks),
-                rerank_degraded=ranked.degraded,
-                embedding_degraded=degraded,
-                rerank_dropped=ranked.dropped,
-                rerank_outcome=ranked.outcome,
-            )
+            return below
         scores = _SubScores(
             vector=vector_score,
             keyword=keyword_score,
@@ -492,15 +508,7 @@ class KnowledgeRetriever:
             rerank=ranked.scores,
         )
         results = await self._attribute(tenant_id, kept, scores, sources)
-        return KnowledgeSearchOutcome(
-            results=tuple(results),
-            status="ok",
-            candidates=len(ranked.chunks),
-            rerank_degraded=ranked.degraded,
-            embedding_degraded=degraded,
-            rerank_dropped=ranked.dropped,
-            rerank_outcome=ranked.outcome,
-        )
+        return replace(below, results=tuple(results), status="ok")
 
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
         """The query's vector — ``None`` when the embedding vendor failed (B-206
@@ -596,6 +604,7 @@ class KnowledgeRetriever:
             scores={candidates[i].id: score for i, score in ranked if score is not None},
             dropped=ranking_dropped(ranked),
             outcome=outcome,
+            model=ranking_model(ranked),
         )
 
     async def _order(
@@ -701,7 +710,10 @@ async def _two_view_order(
         body == candidates[i].retrieval_text for i, body in zip(top, bodies, strict=True)
     ):
         return RerankRanking(
-            titled, dropped=ranking_dropped(titled), outcome=ranking_outcome(titled)
+            titled,
+            dropped=ranking_dropped(titled),
+            outcome=ranking_outcome(titled),
+            model=ranking_model(titled),
         )
     try:
         body_view = await reranker.rerank_scored(
@@ -730,16 +742,6 @@ def _titled_only(top: Sequence[int], dropped: int, why: str) -> RerankRanking:
         why,
     )
     return RerankRanking(((i, None) for i in top), dropped=dropped, outcome="partial")
-
-
-def _clears_floor(
-    chunk: KnowledgeChunk, scores: Mapping[UUID, float], floor: Mapping[UUID, float | None]
-) -> bool:
-    """Whether ``chunk`` survives its base's rerank-score threshold: always when
-    the base sets none or the reranker gave this chunk no score."""
-    threshold = floor.get(chunk.kb_id)
-    score = scores.get(chunk.id)
-    return threshold is None or score is None or score >= threshold
 
 
 @dataclass(frozen=True)
@@ -814,6 +816,10 @@ class KnowledgeSearchTool:
             meta["rerank_dropped"] = outcome.rerank_dropped
         if outcome.rerank_outcome not in (None, "ok"):
             meta["rerank_outcome"] = outcome.rerank_outcome
+        if outcome.rerank_threshold_paused:
+            meta["rerank_threshold_paused"] = True
+        if outcome.rerank_threshold_code_kept:
+            meta["rerank_threshold_code_kept"] = outcome.rerank_threshold_code_kept
         if outcome.status == "below_threshold":
             return ToolResult(
                 content=(
@@ -830,9 +836,10 @@ class KnowledgeSearchTool:
                 meta=meta,
                 notice=_NO_HITS_NOTICE,
             )
-        return ToolResult(
-            content=_format_results(outcome.results), meta=meta, notice=_RESULTS_NOTICE
-        )
+        notice = _RESULTS_NOTICE
+        if outcome.rerank_threshold_code_kept:
+            notice += " " + code_kept_notice(outcome.rerank_threshold_code_kept)
+        return ToolResult(content=_format_results(outcome.results), meta=meta, notice=notice)
 
     def _require_query(self, args: Mapping[str, Any]) -> str:
         raw = args.get("query")

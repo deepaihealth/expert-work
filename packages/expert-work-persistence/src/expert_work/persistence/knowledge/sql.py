@@ -178,6 +178,7 @@ def _to_base(row: KnowledgeBaseRow) -> KnowledgeBase:
         retrieval_method=RetrievalMethod(row.retrieval_method),
         rerank_enabled=row.rerank_enabled,
         rerank_score_threshold=row.rerank_score_threshold,
+        rerank_threshold_model=row.rerank_threshold_model,
         embedding_provider=row.embedding_provider,
         embedding_model=row.embedding_model,
         reindex_requested_at=row.reindex_requested_at,
@@ -464,6 +465,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         rerank_score_threshold: float | None = None,
         embedding_provider: str | None = None,
         embedding_model: str | None = None,
+        rerank_threshold_model: str | None = None,
     ) -> KnowledgeBase:
         row = KnowledgeBaseRow(
             tenant_id=tenant_id,
@@ -477,6 +479,7 @@ class SqlKnowledgeStore(KnowledgeStore):
             retrieval_method=retrieval_method.value,
             rerank_enabled=rerank_enabled,
             rerank_score_threshold=rerank_score_threshold,
+            rerank_threshold_model=rerank_threshold_model,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
         )
@@ -502,6 +505,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         retrieval_method: RetrievalMethod | None = None,
         rerank_enabled: bool | None = None,
         rerank_score_threshold: float | _Unset | None = UNSET,
+        rerank_threshold_model: str | _Unset | None = UNSET,
     ) -> KnowledgeBase | None:
         async with self._sf() as session:
             row = (
@@ -530,6 +534,8 @@ class SqlKnowledgeStore(KnowledgeStore):
                 row.rerank_enabled = rerank_enabled
             if not isinstance(rerank_score_threshold, _Unset):
                 row.rerank_score_threshold = rerank_score_threshold
+            if not isinstance(rerank_threshold_model, _Unset):
+                row.rerank_threshold_model = rerank_threshold_model
             row.updated_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(row)

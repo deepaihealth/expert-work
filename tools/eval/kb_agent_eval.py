@@ -34,8 +34,8 @@
         tools/eval/kb_agent_eval.py ... --dry
 
 B-206 K-14 对照组:``--rerank-view dual|single|single_clean`` / ``--rerank-pool N`` /
-``--rerank-instruct``(与 ``kb_eval.py`` 同义,默认 = 生产默认 dual + 100;``--rerank-instruct``
-只能配单视图);每组写自己的 ``--out``,
+``--rerank-instruct`` / ``--rerank-model``(与 ``kb_eval.py`` 同义,默认 = 生产默认 dual + 100、
+生产同款模型;``--rerank-instruct`` 只能配单视图);每组写自己的 ``--out``,
 组别记在结果文件末尾的 run 行里。
 
 ``--answer-model`` / ``--judge-model`` 换模型(默认 glm-5.3 / deepseek-v4-pro);不在
@@ -91,11 +91,15 @@ from kb_eval import (  # type: ignore[import-not-found]
     tool_message_text,
 )
 from kb_metrics import anchor_in  # type: ignore[import-not-found]
-from kb_rerank import OFFLINE_KEY, RERANK_KEY_ENV  # type: ignore[import-not-found]
+from kb_rerank import (  # type: ignore[import-not-found]
+    OFFLINE_KEY,
+    RERANK_KEY_ENV,
+    resolve_rerank_model,
+)
 
 from expert_work.common.spotlight import SPOTLIGHT_SYSTEM_CLAUSE
 from expert_work.persistence import KnowledgeStore
-from expert_work.protocol import DocumentStatus
+from expert_work.protocol import DocumentStatus, rerank_model_key
 from orchestrator.llm.providers.openai import _to_openai_tool
 from orchestrator.tools.knowledge import (
     DEFAULT_RERANK_POOL,
@@ -388,6 +392,12 @@ async def _search(
         "degraded": bool(result.meta.get("rerank_degraded")),
         # B-206 K-8: the query was not embedded, this search ran on keywords alone.
         "embedding_degraded": bool(result.meta.get("embedding_degraded")),
+        # B-206 K-7: how the rerank ended. The eval's base always asks for rerank, so a
+        # result without the key ended ``ok``; K-7b: the base's threshold left out
+        # (set under another model), and results kept under it for a code in the query.
+        "rerank_outcome": result.meta.get("rerank_outcome", "ok"),
+        "rerank_threshold_paused": bool(result.meta.get("rerank_threshold_paused")),
+        "rerank_threshold_code_kept": int(result.meta.get("rerank_threshold_code_kept", 0)),
         "content": result.content,
     }
 
@@ -723,6 +733,14 @@ def tally(path: Path) -> str:
         f"errors {sum(1 for s in searches if s.get('error'))}, "
         f"skipped {sum(1 for s in searches if s.get('skipped'))}"
     )
+    ran = [s for s in searches if "status" in s]
+    outcomes = Counter(s.get("rerank_outcome") or "ok" for s in ran)
+    lines.append(
+        "rerank outcomes "
+        + ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
+        + f"; threshold paused {sum(1 for s in ran if s.get('rerank_threshold_paused'))}, "
+        f"results kept for a code {sum(s.get('rerank_threshold_code_kept', 0) for s in ran)}"
+    )
     answer = sum(r["cost_cny"]["answer"] for r in rows)
     judge = sum(r["cost_cny"]["judge"] for r in rows)
     rerank = sum(run["spend_cny"]["rerank"] for run in runs)
@@ -771,6 +789,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rerank-view", default=DEFAULT_RERANK_VIEW, choices=RERANK_VIEWS)
     parser.add_argument("--rerank-pool", type=int, default=DEFAULT_RERANK_POOL)
     parser.add_argument("--rerank-instruct", action="store_true")
+    parser.add_argument("--rerank-model")  # B-206 K-7b
+    # B-206 K-7b:设到库上的重排分数下限(绑到这次的重排模型),智能体层看到的与生产相同
+    # (低于下限但含问题里编号的结果最多留 3 条);不给 = 不设。
+    parser.add_argument("--rerank-threshold", type=float)
     return parser
 
 
@@ -782,6 +804,10 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
         parser.error(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
     if args.rerank_instruct and args.rerank_view == "dual":
         parser.error(INSTRUCT_NEEDS_SINGLE_VIEW)
+    if args.rerank_threshold is not None and args.rerank != "dashscope":
+        parser.error("--rerank-threshold needs --rerank dashscope (a model that scores)")
+    if args.rerank_threshold is not None and not 0 <= args.rerank_threshold <= 1:
+        parser.error(f"--rerank-threshold must be within [0, 1], got {args.rerank_threshold}")
     cache_only = args.embedder == "real" or args.rerank == "dashscope"
     if args.dry and cache_only and os.environ.get(RERANK_KEY_ENV) != OFFLINE_KEY:
         parser.error(
@@ -847,7 +873,8 @@ async def _run(
     bundle = build_embedder(
         args.embedder, concurrency=args.concurrency, query_marker=args.query_marker == "on"
     )
-    reranker, rerank_client = build_rerank_mode(args.rerank)
+    rerank_model = resolve_rerank_model(args.rerank_model, rerank_mode=args.rerank)
+    reranker, rerank_client = build_rerank_mode(args.rerank, model=rerank_model)
 
     def rerank_cny() -> float:
         return float(rerank_client.stats()["cost_cny"]) if rerank_client is not None else 0.0
@@ -873,7 +900,15 @@ async def _run(
                 raise SystemExit(f"no document ingested — check --corpus-root ({corpus_root})")
             # 控制面建库默认开重排;评测建库时没开,工具读的是库上的设置。
             await store.update_base(
-                tenant_id=EVAL_TENANT_ID, kb_id=report.base_id, rerank_enabled=True
+                tenant_id=EVAL_TENANT_ID,
+                kb_id=report.base_id,
+                rerank_enabled=True,
+                rerank_score_threshold=args.rerank_threshold,
+                rerank_threshold_model=(
+                    None
+                    if args.rerank_threshold is None or rerank_model is None
+                    else rerank_model_key("qwen", rerank_model)
+                ),
             )
             gold = await gold_passages(
                 store,
@@ -915,6 +950,8 @@ async def _run(
             "view": args.rerank_view,
             "pool": args.rerank_pool,
             "instruct": args.rerank_instruct,
+            "model": rerank_model,
+            "threshold": args.rerank_threshold,
         },
         "calls": {"answer": spend.answer_calls, "judge": spend.judge_calls},
         "spend_cny": {

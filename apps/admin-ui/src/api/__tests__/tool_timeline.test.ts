@@ -212,6 +212,31 @@ describe("parseToolCalls artifact.rerank_outcome (B-206 K-7)", () => {
     expect(parseToolCalls(events)[0].rerankOutcome).toBe("partial");
   });
 
+  it("lifts a threshold left out, and results kept for a code (K-7b)", () => {
+    const events = [
+      updates("agent", [aiCall("k1", "knowledge_search", {}), aiCall2("k2", "knowledge_search", {})]),
+      updates("tools", [
+        toolResultWithArtifact("k1", "a", { hits: 2, rerank_threshold_paused: true }),
+        toolResultWithArtifact("k2", "b", { hits: 2, rerank_threshold_code_kept: 2 }),
+      ]),
+    ];
+    const [a, b] = parseToolCalls(events);
+    expect([a.rerankThresholdPaused, a.rerankThresholdCodeKept]).toEqual([true, undefined]);
+    expect([b.rerankThresholdPaused, b.rerankThresholdCodeKept]).toEqual([undefined, 2]);
+  });
+
+  it("leaves rerankThresholdCodeKept unset for zero or a non-number", () => {
+    const events = [
+      updates("agent", [aiCall("k1", "knowledge_search", {}), aiCall2("k2", "knowledge_search", {})]),
+      updates("tools", [
+        toolResultWithArtifact("k1", "a", { hits: 1, rerank_threshold_code_kept: 0 }),
+        toolResultWithArtifact("k2", "b", { hits: 1, rerank_threshold_code_kept: "2" }),
+      ]),
+    ];
+    const [a, b] = parseToolCalls(events);
+    expect([a.rerankThresholdCodeKept, b.rerankThresholdCodeKept]).toEqual([undefined, undefined]);
+  });
+
   it("leaves rerankOutcome unset for ok, missing or unknown values", () => {
     const events = [
       updates("agent", [aiCall("k1", "knowledge_search", {}), aiCall2("k2", "knowledge_search", {})]),

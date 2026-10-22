@@ -29,6 +29,7 @@ import {
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { thresholdPausedNotice } from "./thresholdPausedNotice";
 
 const { Text } = Typography;
 
@@ -65,6 +66,7 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
   const [form] = Form.useForm<SettingsFormValues>();
   const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
+  const [confirming, setConfirming] = useState(false);
 
   const config = base.retrieval_config;
   const initialValues: SettingsFormValues = {
@@ -81,6 +83,9 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
   const handleSave = useCallback(
     async (values: SettingsFormValues) => {
       setSaving(true);
+      // B-206 K-7b —— 重排分数下限一送出就算「在当前重排模型下标定」:只在改过这一栏时送,
+      // 存别的设置不会把别的模型下标定的旧下限算成新模型的。
+      const thresholdEdited = form.isFieldTouched("rerank_score_threshold");
       try {
         await updateBase(base.name, {
           description: values.description ?? null,
@@ -90,8 +95,11 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
           retrieval_score_threshold: values.retrieval_score_threshold ?? null,
           retrieval_method: values.retrieval_method,
           rerank_enabled: values.rerank_enabled,
-          rerank_score_threshold: values.rerank_score_threshold ?? null,
+          ...(thresholdEdited
+            ? { rerank_score_threshold: values.rerank_score_threshold ?? null }
+            : {}),
         });
+        form.setFields([{ name: "rerank_score_threshold", touched: false }]);
         message.success(t("knowledge_page.settings_saved"));
         await onSaved();
       } catch (err) {
@@ -100,8 +108,24 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
         setSaving(false);
       }
     },
-    [base.name, t, message, onSaved],
+    [base.name, form, t, message, onSaved],
   );
+
+  /** B-206 K-7b —— 下限值不变,确认它在当前重排模型下也成立。 */
+  const handleConfirmThreshold = useCallback(async () => {
+    setConfirming(true);
+    try {
+      await updateBase(base.name, {
+        rerank_score_threshold: config?.rerank_score_threshold ?? null,
+      });
+      message.success(t("knowledge_page.rerank_threshold_confirmed"));
+      await onSaved();
+    } catch (err) {
+      message.error(errMessage(err));
+    } finally {
+      setConfirming(false);
+    }
+  }, [base.name, config?.rerank_score_threshold, t, message, onSaved]);
 
   const handleReindex = useCallback(async () => {
     setReindexing(true);
@@ -204,6 +228,32 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
           >
             <Switch aria-label={t("knowledge_page.field_rerank")} />
           </Form.Item>
+          {config?.rerank_threshold_paused && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 8 }}
+              message={thresholdPausedNotice(
+                t,
+                config.rerank_threshold_model,
+                config.current_rerank_model,
+              )}
+              action={
+                <ReadonlyTooltip on={readonly}>
+                  <Button
+                    size="small"
+                    loading={confirming}
+                    disabled={readonly}
+                    onClick={() => void handleConfirmThreshold()}
+                    data-testid="kb-settings-rerank-threshold-confirm"
+                  >
+                    {t("knowledge_page.rerank_threshold_confirm")}
+                  </Button>
+                </ReadonlyTooltip>
+              }
+              data-testid="kb-settings-rerank-threshold-paused"
+            />
+          )}
           <Form.Item
             name="rerank_score_threshold"
             label={t("knowledge_page.field_rerank_threshold")}

@@ -195,7 +195,9 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   是没手列的 FAQ-2026,按文件名判就被算错)。锚文本出现在 5 份以上文档里算「太常见」,不扩展、只在汇总
   `anchors.too_common` 里报。`listed` = 只认手列文档(旧规则,对照用)。指纹记 `doc_match`。
 - **重排(`--rerank`)**:`dashscope` = 生产同款 `qwen3-vl-rerank`(DashScope 原生接口,密钥沿用
-  `EXPERT_WORK_EVAL_EMBED_API_KEY`,模型可用 `EXPERT_WORK_EVAL_RERANK_MODEL` 覆盖),结果缓存在
+  `EXPERT_WORK_EVAL_EMBED_API_KEY`;换模型对照用 `--rerank-model qwen3-rerank|qwen3.7-text-rerank`(B-206 K-7b,
+  只收模型目录里的重排模型,其次才看 `EXPERT_WORK_EVAL_RERANK_MODEL`;换了模型不能 `--update-baseline`;汇总
+  `rerank_outcomes` 记每种重排结局的检索次数,`partial` 只计数不退出),结果缓存在
   `eval-out/kb/rerank_cache.sqlite`(键 = 模型 + 查询 + 候选全文按序 + `top_n`,带任务说明时再加上它),复跑同样的候选零成本;密钥为
   `offline-cache-only` 时缓存没命中直接报错。按 ¥0.5 / 百万 token 记费用,汇总 `rerank` 块里有调用数 / 命中 / token /
   金额。`llm` = 聊天模型排序(`on` 是它的旧名)。**基线分两条**:不开重排写在评测集名下(召回层),开了重排写在

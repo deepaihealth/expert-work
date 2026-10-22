@@ -11,6 +11,7 @@ from expert_work.persistence.knowledge.text_search import (
     build_kb_keyword_query,
     is_searchable_token,
     kb_index_text,
+    kb_query_identifiers,
     tokenize_for_search,
 )
 
@@ -336,3 +337,21 @@ def test_kb_query_keeps_a_number_list_as_terms(query: str, numbers: tuple[str, .
     assert built is not None
     assert built.phrases == ()
     assert set(numbers) <= set(built.terms)
+
+
+@pytest.mark.parametrize(
+    ("query", "identifiers"),
+    [
+        # The text as typed after NFKC, dash folding and joining a spaced number —
+        # what ``build_kb_keyword_query`` turns into phrases (B-206 K-7b).
+        ("ZL 2024 1 0048761.8 的专利", ("ZL202410048761.8",)),
+        ("QXA–N7 每天吃几次", ("QXA-N7",)),
+        ("ＺＸ－９０４１ 保修多久", ("ZX-9041",)),
+        ("HbA1c 和 CD4 正常值", ("HbA1c", "CD4")),
+        ("每次 500mg、一天 2 粒", ()),
+    ],
+)
+def test_kb_query_identifiers_are_the_phrases_as_typed(
+    query: str, identifiers: tuple[str, ...]
+) -> None:
+    assert kb_query_identifiers(query) == identifiers

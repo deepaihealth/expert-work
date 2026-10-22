@@ -341,6 +341,15 @@ def _raw_form(unit: str, raw_text: str) -> str | None:
     return raw if raw and raw != own else None
 
 
+def kb_query_identifiers(query: str) -> tuple[str, ...]:
+    """The identifiers in ``query`` that :func:`build_kb_keyword_query` makes
+    phrases of, as typed after NFKC, dash folding and spaced-number joining, in
+    order and deduplicated — for a caller that looks for them in passages (B-206 K-7b)."""
+    normalised, _ = _join_spaced_numbers(*_normalise(query))
+    found = (match.group() for match in _IDENTIFIER_RE.finditer(normalised))
+    return tuple(dict.fromkeys(code for code in found if _is_identifier(code)))
+
+
 def build_kb_keyword_query(query: str) -> KbKeywordQuery | None:
     """Turn a natural-language question into a knowledge-base keyword query.
 

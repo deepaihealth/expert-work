@@ -23,6 +23,8 @@ from expert_work.protocol import (
     ScoredChunk,
     chunk_retrieval_text,
     knowledge_document_title,
+    rerank_model_key,
+    rerank_threshold_paused,
 )
 
 
@@ -301,3 +303,42 @@ def test_page_stats_needs_recognition_for_failed_pending_or_over_limit() -> None
     assert PageStats.of([_page(1, PageStatus.OVER_LIMIT)]).needs_recognition
     assert PageStats.of([_page(1, PageStatus.FAILED)]).needs_recognition
     assert PageStats.of([_page(1, PageStatus.PENDING)]).needs_recognition
+
+
+# --- B-206 K-7b: a rerank-score threshold is bound to the model it was set under ---
+
+
+def _base(threshold: float | None, model: str | None) -> KnowledgeBase:
+    return KnowledgeBase(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        name="kb",
+        rerank_score_threshold=threshold,
+        rerank_threshold_model=model,
+    )
+
+
+def test_rerank_model_key_names_provider_and_model() -> None:
+    assert rerank_model_key("qwen", "qwen3-rerank") == "qwen/qwen3-rerank"
+
+
+def test_a_threshold_under_the_scoring_model_is_in_force() -> None:
+    base = _base(0.7, "qwen/qwen3-vl-rerank")
+    assert rerank_threshold_paused(base, "qwen/qwen3-vl-rerank") is False
+
+
+def test_a_threshold_set_under_another_model_is_paused() -> None:
+    base = _base(0.7, "qwen/qwen3-vl-rerank")
+    assert rerank_threshold_paused(base, "qwen/qwen3-rerank") is True
+
+
+def test_a_threshold_with_no_recorded_model_is_paused_once_a_model_scores() -> None:
+    """Calibrated under an unknown model: it cannot be told apart from a stale one."""
+    assert rerank_threshold_paused(_base(0.7, None), "qwen/qwen3-rerank") is True
+
+
+def test_nothing_is_paused_without_a_threshold_or_a_scoring_model() -> None:
+    assert rerank_threshold_paused(_base(None, None), "qwen/qwen3-rerank") is False
+    # A reranker that does not say its model (test doubles, chat-model rerank,
+    # which gives no scores) keeps the threshold as before.
+    assert rerank_threshold_paused(_base(0.7, "qwen/qwen3-vl-rerank"), None) is False

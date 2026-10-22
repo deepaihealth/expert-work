@@ -194,6 +194,30 @@ async def test_put_embedding_and_rerank(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["qwen3-rerank", "qwen3.7-text-rerank"])
+async def test_a_text_rerank_model_can_be_the_platform_rerank(
+    admin_client: tuple[AsyncClient, UUID], model: str
+) -> None:
+    """B-206 K-7b — choosing a text rerank model as the platform default is a
+    setting, not a code change: it is offered and accepted."""
+    client, admin = admin_client
+    options = (await client.get("/v1/platform/embedding-config", headers=_headers(admin))).json()
+    assert {"provider": "qwen", "model": model} in options["data"]["available_rerank"]
+    resp = await client.put(
+        "/v1/platform/embedding-config",
+        headers=_headers(admin),
+        json={
+            "embedding_provider": "qwen",
+            "embedding_model": "text-embedding-v4",
+            "rerank_provider": "qwen",
+            "rerank_model": model,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["rerank"] == {"provider": "qwen", "model": model}
+
+
+@pytest.mark.asyncio
 async def test_put_invalid_rerank_pair(
     admin_client: tuple[AsyncClient, UUID],
 ) -> None:

@@ -511,7 +511,7 @@ const zhCN: TranslationKeys = {
     field_rerank_hint: "配置了重排模型时，用 LLM 对融合结果重新排序。",
     field_rerank_threshold: "重排分数下限",
     field_rerank_threshold_hint:
-      "开启重排时生效：重排分数低于此值（0–1）的分块丢弃，全部低于则本次检索按「没找到」返回。只用来挡明显离题的问题；主题相关但资料没写的问题它分不开。参考值 0.70（按 qwen3-vl-rerank 实测）；分数尺度随重排模型而定，换模型后要重新标定。默认关（留空）。",
+      "开启重排时生效：重排分数低于此值（0–1）的分块丢弃，全部低于则本次检索按「没找到」返回；低于此值、但原文里有问题提到的编号（型号、专利号之类，不分大小写和全半角）的分块，每次检索最多保留 3 条。只用来挡明显离题的问题；主题相关但资料没写的问题它分不开。参考值 0.70（按 qwen3-vl-rerank 实测）。下限绑定设它（改这一栏保存，或点「按当前模型确认此下限」）时的平台重排模型，平台换了重排模型就暂停生效，直到重新标定。默认关（留空）。",
     field_rerank_threshold_placeholder: "留空 = 不过滤（参考 0.70）",
     col_description: "描述",
     col_documents: "文档",
@@ -619,6 +619,14 @@ const zhCN: TranslationKeys = {
     rerank_outcome_model_unavailable: "重排模型的凭据不可用，本次结果按召回顺序排列。",
     rerank_outcome_model_unsupported: "当前重排模型平台暂不支持调用，本次结果按召回顺序排列。",
     rerank_outcome_no_model: "平台没有配置重排模型，本次结果按召回顺序排列。",
+    rerank_threshold_paused:
+      "重排分数下限是在 {{calibrated}} 下标定的，当前重排模型是 {{current}}。不同模型的分数不能互比，这个下限已暂停生效，请重新标定。",
+    rerank_threshold_model_unrecorded: "未记录的模型",
+    rerank_threshold_confirm: "按当前模型确认此下限",
+    rerank_threshold_confirmed: "已按当前重排模型确认此下限，恢复生效。",
+    rerank_threshold_code_kept: "其中 {{count}} 条低于重排分数下限，因含问题里的编号而保留。",
+    rerank_threshold_paused_generic:
+      "这次检索没有用知识库的重排分数下限：它是在另一个重排模型下标定的，请到知识库设置里重新标定。",
     settings_title: "检索设置",
     settings_saved: "设置已保存。",
     settings_rename_note: "不支持重命名——智能体按名称引用知识库。",

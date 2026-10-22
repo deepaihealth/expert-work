@@ -77,6 +77,9 @@ class KnowledgeBaseRow(Base):
     )
     #: B-175 wave 2 PR3 — minimum rerank score to keep a hit (NULL = off).
     rerank_score_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: B-206 K-7b (migration ``0171``) — the rerank model (``provider/model``) the
+    #: threshold was set under; a search scored by another model leaves it out.
+    rerank_threshold_model: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: Embedding model that produced this base's vectors (captured at create).
     #: Compared against the live platform model to derive ``needs_reindex``.
     embedding_provider: Mapped[str | None] = mapped_column(Text, nullable=True)

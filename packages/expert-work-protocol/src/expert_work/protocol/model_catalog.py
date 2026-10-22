@@ -796,6 +796,37 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
                 rpm=600,
             ),
         ),
+        # B-206 K-7b —— 纯文本重排。B-206 §5.5 表 5-B(阿里云百炼重排文档,2026-10 读):
+        # qwen3-rerank 每次 500 篇、单篇 4,000 token、整次 120,000 token(超限 400 不截断),
+        # qwen3.7-text-rerank 500 篇、单篇 30,000 token,整次上限文档没写;两个都支持
+        # ``instruct``、请求内相对分。限流 5,400 / 3,000 RPM:§5.2 K-7 依据(阿里限流文档
+        # 2026-10-12 / 10-19 版)。2026-10-22 探针:原生口都收、回包形状与 qwen3-vl-rerank
+        # 相同、``instruct`` 改变分数;同一请求计费 token 比 qwen3-vl-rerank 少(每篇约少 50)。
+        ModelEntry(
+            name="qwen3-rerank",
+            rerank=True,
+            rerank_caps=RerankCaps(
+                rerank_api="dashscope",
+                max_documents=500,
+                max_doc_tokens=4_000,
+                max_total_tokens=120_000,
+                supports_instruction=True,
+                score_scale="relative",
+                rpm=5_400,
+            ),
+        ),
+        ModelEntry(
+            name="qwen3.7-text-rerank",
+            rerank=True,
+            rerank_caps=RerankCaps(
+                rerank_api="dashscope",
+                max_documents=500,
+                max_doc_tokens=30_000,
+                supports_instruction=True,
+                score_scale="relative",
+                rpm=3_000,
+            ),
+        ),
         ModelEntry(name="qwen-max", vision=False, context_window=32_000, deprecated=True),
         ModelEntry(name="qwen-vl-max", vision=True, context_window=32_000, deprecated=True),
     ),
