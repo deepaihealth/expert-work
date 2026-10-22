@@ -1367,8 +1367,8 @@ def test_main_can_put_the_threshold_on_the_base(
 ) -> None:
     """B-206 K-7b — ``--rerank-threshold-on-base`` stores the threshold on the base,
     bound to the run's rerank model, instead of passing it with each search: the
-    searches meet it as production does (a code the query names keeps up to three
-    passages under it), and refuse as with the passed threshold."""
+    searches meet it as production does (the model binding checked), and refuse as
+    with the passed threshold."""
     built: list[KnowledgeRetriever] = []
 
     def _spy(**kwargs: Any) -> KnowledgeRetriever:
@@ -1407,7 +1407,6 @@ def test_main_can_put_the_threshold_on_the_base(
     assert summary["config"]["rerank_threshold_on_base"] is True
     cases = [json.loads(line) for line in lines[:-1]]
     assert all(case["refused"] is True for case in cases)  # every flat 0.3 is under 0.5
-    assert summary["rerank_threshold_code_kept"] == 0
 
 
 def test_main_needs_a_threshold_to_put_on_the_base(

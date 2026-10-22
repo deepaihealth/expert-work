@@ -189,8 +189,6 @@ export interface RetrievalTestResponse {
   rerank_threshold_model?: string | null;
   /** The model that scored this search; ``null`` without scores. */
   rerank_model?: string | null;
-  /** Results kept under the base's threshold only for a code the query names. */
-  rerank_threshold_code_kept?: number;
 }
 
 /** Update payload — only supplied keys are applied; ``null`` clears a
@@ -204,6 +202,8 @@ export interface UpdateBaseBody {
   retrieval_method?: RetrievalMethod;
   rerank_enabled?: boolean;
   rerank_score_threshold?: number | null;
+  /** B-206 K-7b — bind the stored threshold, unchanged, to the current rerank model. */
+  rerank_threshold_confirm?: boolean;
 }
 
 export interface RetrievalTestBody {

@@ -111,13 +111,12 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
     [base.name, form, t, message, onSaved],
   );
 
-  /** B-206 K-7b —— 下限值不变,确认它在当前重排模型下也成立。 */
+  /** B-206 K-7b —— 确认库上存的下限在当前重排模型下也成立:不送值,只让服务端改绑模型,
+   *  不会把别人刚改过的值改回本页打开时的旧值。 */
   const handleConfirmThreshold = useCallback(async () => {
     setConfirming(true);
     try {
-      await updateBase(base.name, {
-        rerank_score_threshold: config?.rerank_score_threshold ?? null,
-      });
+      await updateBase(base.name, { rerank_threshold_confirm: true });
       message.success(t("knowledge_page.rerank_threshold_confirmed"));
       await onSaved();
     } catch (err) {
@@ -125,7 +124,7 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
     } finally {
       setConfirming(false);
     }
-  }, [base.name, config?.rerank_score_threshold, t, message, onSaved]);
+  }, [base.name, t, message, onSaved]);
 
   const handleReindex = useCallback(async () => {
     setReindexing(true);

@@ -13,33 +13,32 @@ from __future__ import annotations
 
 from typing import Any
 
-from expert_work.protocol import (
-    KnowledgeBase,
-    catalog_entry,
-    rerank_model_key,
-    rerank_threshold_paused,
-)
+from control_plane.rerank_vendors import callable_rerank_api
+from expert_work.protocol import KnowledgeBase, rerank_model_key, rerank_threshold_paused
 
 
 async def current_rerank_model(config_service: Any | None) -> str | None:
     """The live platform rerank model as :func:`~expert_work.protocol.rerank_model_key`
-    names it — ``None`` when none is configured, or it is a chat model (one the
-    catalog does not mark ``rerank``): that ranks without scores, so no threshold
-    applies under it to pause or to be set under."""
+    names it, decided as the search routes it
+    (:func:`~control_plane.rerank_vendors.callable_rerank_api`): a model served by
+    a vendor rerank endpoint, whose rankings carry this name. ``None`` when none
+    is configured, or it ranks by a chat model (no scores, so no threshold applies
+    under it to pause or to be set under), or the platform cannot call it."""
     if config_service is None:
         return None
     pair: tuple[str, str] | None = await config_service.effective_rerank_config()
     if pair is None:
         return None
-    entry = catalog_entry(*pair)
-    return rerank_model_key(*pair) if entry is not None and entry.rerank else None
+    vendor = callable_rerank_api(*pair) in ("dashscope", "cohere_style")
+    return rerank_model_key(*pair) if vendor else None
 
 
 def model_for_threshold(threshold: float | None, current: str | None) -> str | None:
-    """The model a threshold being written is bound to: the live one; none
-    when the threshold is cleared. Writing a threshold — the same value included —
-    is calibrating it: the settings page sends it only when the field was edited
-    or the binding was confirmed, so saving other settings does not rebind it."""
+    """The model a threshold is bound to when it is written, or its stored value
+    confirmed: the live one; none when there is no threshold. Writing one — the
+    same value included — is calibrating it: the settings page sends it only when
+    the field was edited, so saving other settings does not rebind it; confirming
+    sends no value, so it cannot put back one another admin has changed since."""
     return current if threshold is not None else None
 
 

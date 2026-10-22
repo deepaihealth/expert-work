@@ -150,21 +150,6 @@ describe("RetrievalTestTab rerank-score threshold (B-206 K-7b)", () => {
   it("says nothing about the threshold when it was in force", async () => {
     await run("ok");
     expect(screen.queryByTestId("kb-test-rerank-threshold-paused")).toBeNull();
-    expect(screen.queryByTestId("kb-test-rerank-threshold-code-kept")).toBeNull();
-  });
-
-  it("says how many results were kept under the threshold for a code, as information", async () => {
-    await inChinese(async () => {
-      await run("ok", { rerank_threshold_code_kept: 2 });
-      const notice = screen.getByTestId("kb-test-rerank-threshold-code-kept");
-      expect(notice).toHaveTextContent("其中 2 条低于重排分数下限，因含问题里的编号而保留。");
-      expect(notice).toHaveClass("ant-alert-info");
-    });
-  });
-
-  it("says nothing of codes when none kept a result", async () => {
-    await run("ok", { rerank_threshold_code_kept: 0 });
-    expect(screen.queryByTestId("kb-test-rerank-threshold-code-kept")).toBeNull();
   });
 });
 

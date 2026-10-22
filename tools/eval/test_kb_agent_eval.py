@@ -262,8 +262,8 @@ async def test_run_agent_uses_the_tool_as_shipped_and_caps_searches() -> None:
 
 
 class _ThresholdRetriever(_FixedRetriever):
-    """A search whose rerank ended ``partial``, its base's threshold left out for
-    another model, and two results kept under a threshold for a code (B-206 K-7b)."""
+    """A search whose rerank ended ``partial`` and its base's threshold left out
+    for another model (B-206 K-7b)."""
 
     async def search_detailed(self, **_kwargs: Any) -> KnowledgeSearchOutcome:
         return KnowledgeSearchOutcome(
@@ -272,7 +272,6 @@ class _ThresholdRetriever(_FixedRetriever):
             candidates=len(self.results),
             rerank_outcome="partial",
             rerank_threshold_paused=True,
-            rerank_threshold_code_kept=2,
         )
 
 
@@ -285,19 +284,14 @@ async def test_each_search_records_how_its_rerank_and_threshold_ended() -> None:
         _KeepSearching(), tool, question="q", tenant_id=uuid4(), spend=Spend()
     )
     first = run["searches"][0]
-    assert (
-        first["rerank_outcome"],
-        first["rerank_threshold_paused"],
-        first["rerank_threshold_code_kept"],
-    ) == ("partial", True, 2)
+    assert (first["rerank_outcome"], first["rerank_threshold_paused"]) == ("partial", True)
     plain = (
         await run_agent(_KeepSearching(), _tool(), question="q", tenant_id=uuid4(), spend=Spend())
     )[0]
     assert (
         plain["searches"][0]["rerank_outcome"],
         plain["searches"][0]["rerank_threshold_paused"],
-        plain["searches"][0]["rerank_threshold_code_kept"],
-    ) == ("ok", False, 0)
+    ) == ("ok", False)
 
 
 @pytest.mark.asyncio
@@ -533,7 +527,6 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
             embedding_degraded=True,
             rerank_outcome="partial",
             rerank_threshold_paused=True,
-            rerank_threshold_code_kept=2,
         ),
         _row("n2", "chat", False, "编造", status="ok", degraded=True, rerank_outcome="ok"),
         _row("a1", "main", True, "答对", error="[tool error] x"),
@@ -555,11 +548,8 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
     assert text[9] == (
         "searches per question 0.80; degraded 1, embedding degraded 1, errors 1, skipped 1"
     )
-    # B-206 K-7b — how each search's rerank ended, its threshold left out, and results
-    # kept under it for a code.
-    assert text[10] == (
-        "rerank outcomes ok 1, partial 1; threshold paused 1, results kept for a code 2"
-    )
+    # B-206 K-7b — how each search's rerank ended, and its threshold left out.
+    assert text[10] == "rerank outcomes ok 1, partial 1; threshold paused 1"
     assert text[11] == "spend ¥1.95 (answer ¥1.25, judge ¥0.50, rerank ¥0.20 over 1 run(s))"
 
 
@@ -799,7 +789,6 @@ def test_a_base_threshold_is_set_bound_and_each_search_says_how_it_ended(
     assert searches
     assert all(s["rerank_outcome"] == "ok" for s in searches)
     assert all(s["rerank_threshold_paused"] is True for s in searches)
-    assert all(s["rerank_threshold_code_kept"] == 0 for s in searches)
     (run,) = [line["run"] for line in lines if "run" in line]
     assert run["rerank_arm"]["threshold"] == 0.7
     assert network_attempts == []

@@ -80,7 +80,7 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
   // B-206 K-7 —— 重排没定顺序(退回召回顺序)时的原因;重排正常 / 没开 → null。
   const [rerankFallback, setRerankFallback] = useState<RerankFallback | null>(null);
   // B-206 K-7b —— 这次检索没用库的重排分数下限:在别的重排模型下标定的(提示里写这次检索
-  // 自己的两个模型名,不用页面早先读到的);或有结果低于下限、因含问题里的编号而保留。
+  // 自己的两个模型名,不用页面早先读到的)。
   const [rerankFloor, setRerankFloor] = useState<RetrievalTestResponse | null>(null);
   const [running, setRunning] = useState(false);
 
@@ -211,17 +211,6 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
             rerankFloor.rerank_model,
           )}
           data-testid="kb-test-rerank-threshold-paused"
-        />
-      )}
-      {results !== null && (rerankFloor?.rerank_threshold_code_kept ?? 0) > 0 && (
-        <Alert
-          type="info"
-          showIcon
-          style={{ marginBottom: 12 }}
-          message={t("knowledge_page.rerank_threshold_code_kept", {
-            count: rerankFloor?.rerank_threshold_code_kept,
-          })}
-          data-testid="kb-test-rerank-threshold-code-kept"
         />
       )}
       {results === null ? (

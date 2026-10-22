@@ -154,7 +154,7 @@ describe("SettingsTab sends the rerank-score threshold only to calibrate it (B-2
     }
   });
 
-  it("confirms a paused threshold under the current model without changing it", async () => {
+  it("confirms a paused threshold under the current model without sending a value", async () => {
     const update = vi.spyOn(knowledgeSdk, "updateBase").mockResolvedValue(base({}));
     const onSaved = vi.fn();
     const restore = await renderInChinese(base(PAUSED), { onSaved });
@@ -163,7 +163,8 @@ describe("SettingsTab sends the rerank-score threshold only to calibrate it (B-2
       expect(confirm).toHaveTextContent("按当前模型确认此下限");
       await userEvent.click(confirm);
       await waitFor(() => expect(onSaved).toHaveBeenCalled());
-      expect(update).toHaveBeenCalledWith("support-docs", { rerank_score_threshold: 0.7 });
+      // No value: confirming must not put back one another admin has changed since.
+      expect(update).toHaveBeenCalledWith("support-docs", { rerank_threshold_confirm: true });
     } finally {
       await restore();
     }

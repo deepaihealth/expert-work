@@ -70,13 +70,14 @@ class CohereStyleReranker:
     Returns a :class:`~orchestrator.tools.knowledge.RerankRanking`: best first,
     at most ``top_k``, saying how many documents went unjudged; an answer it
     cannot read degrades to the input order without scores (``model_error``).
-    With ``provider`` the ranking names its ``model`` (B-206 K-7b), so a base's
-    threshold set under another model is left out."""
+    The ranking names its ``provider`` / ``model`` (B-206 K-7b), so a base's
+    threshold set under another model is left out — required, so no reranker
+    scores without saying which model did."""
 
     client: RerankClient
     model: str
+    provider: str
     caps: RerankCaps | None = None
-    provider: str | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -108,7 +109,7 @@ class CohereStyleReranker:
         extra: dict[str, Any] = {} if instruction is None else {"instruction": instruction}
         answers = await self._all(query, items, slices, top_k, extra)
         dropped = len(documents) - sum(len(sent) for sent, _rows in answers)
-        model = None if self.provider is None else rerank_model_key(self.provider, self.model)
+        model = rerank_model_key(self.provider, self.model)
         if any(rows is None for _sent, rows in answers):
             unscored = ((index, None) for index in range(min(len(documents), top_k)))
             return RerankRanking(unscored, dropped=dropped, outcome="model_error", model=model)

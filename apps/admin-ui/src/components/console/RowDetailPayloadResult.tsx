@@ -360,17 +360,6 @@ export function RowDetailResult({
               {t("knowledge_page.rerank_threshold_paused_generic")}
             </Text>
           )}
-          {row.entry.rerankThresholdCodeKept !== undefined && (
-            <Text
-              type="secondary"
-              style={{ display: "block", fontSize: 12.5, marginBottom: 6 }}
-              data-testid="console-detail-rerank-threshold-code-kept"
-            >
-              {t("knowledge_page.rerank_threshold_code_kept", {
-                count: row.entry.rerankThresholdCodeKept,
-              })}
-            </Text>
-          )}
           <ToolCallCard entry={row.entry} onFireResult={onFireResult} readOnly={readOnly} resultOnly />
         </>
       );

@@ -49,7 +49,7 @@ from orchestrator.tools.knowledge_rerank import (
 from orchestrator.tools.knowledge_rerank import Reranker as Reranker
 from orchestrator.tools.knowledge_rerank import RerankRanking as RerankRanking
 from orchestrator.tools.knowledge_rerank import ScoredReranker as ScoredReranker
-from orchestrator.tools.knowledge_threshold import apply_threshold, code_kept_notice, search_floors
+from orchestrator.tools.knowledge_threshold import clears_floor, search_floors
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.rerank_passage import rerank_passage
 
@@ -257,10 +257,8 @@ class KnowledgeSearchOutcome:
     with fewer): the rerank ran, over part of the pool.
     B-206 K-7b (:mod:`orchestrator.tools.knowledge_threshold`):
     ``rerank_threshold_paused`` is set when a base's stored threshold was left
-    out because another rerank model scored this search;
-    ``rerank_threshold_code_kept`` counts the results kept under a stored
-    threshold only because they hold a code the query names; ``rerank_model`` is
-    the model that scored (``None`` without scores, or when the reranker did not say).
+    out because another rerank model scored this search; ``rerank_model`` is the
+    model that scored (``None`` without scores, or when the reranker did not say).
     """
 
     results: tuple[RetrievedChunk, ...]
@@ -271,7 +269,6 @@ class KnowledgeSearchOutcome:
     rerank_dropped: int = 0
     rerank_outcome: RerankOutcome | None = None
     rerank_threshold_paused: bool = False
-    rerank_threshold_code_kept: int = 0
     rerank_model: str | None = None
 
 
@@ -485,8 +482,7 @@ class KnowledgeRetriever:
         )
         # Filtered before the cut to ``limit``: with several bases, one base's
         # floor dropping the top hits must leave room for another base's.
-        cut = apply_threshold(ranked.chunks, ranked.scores, floors, query=query)
-        kept = cut.chunks[:limit]
+        kept = [c for c in ranked.chunks if clears_floor(c, ranked.scores, floors.by_base)][:limit]
         below = KnowledgeSearchOutcome(
             results=(),
             status="below_threshold",
@@ -496,7 +492,6 @@ class KnowledgeRetriever:
             rerank_dropped=ranked.dropped,
             rerank_outcome=ranked.outcome,
             rerank_threshold_paused=floors.paused,
-            rerank_threshold_code_kept=sum(chunk.id in cut.code_kept for chunk in kept),
             rerank_model=ranked.model if ranked.scores else None,
         )
         if not kept:
@@ -818,8 +813,6 @@ class KnowledgeSearchTool:
             meta["rerank_outcome"] = outcome.rerank_outcome
         if outcome.rerank_threshold_paused:
             meta["rerank_threshold_paused"] = True
-        if outcome.rerank_threshold_code_kept:
-            meta["rerank_threshold_code_kept"] = outcome.rerank_threshold_code_kept
         if outcome.status == "below_threshold":
             return ToolResult(
                 content=(
@@ -836,10 +829,9 @@ class KnowledgeSearchTool:
                 meta=meta,
                 notice=_NO_HITS_NOTICE,
             )
-        notice = _RESULTS_NOTICE
-        if outcome.rerank_threshold_code_kept:
-            notice += " " + code_kept_notice(outcome.rerank_threshold_code_kept)
-        return ToolResult(content=_format_results(outcome.results), meta=meta, notice=notice)
+        return ToolResult(
+            content=_format_results(outcome.results), meta=meta, notice=_RESULTS_NOTICE
+        )
 
     def _require_query(self, args: Mapping[str, Any]) -> str:
         raw = args.get("query")

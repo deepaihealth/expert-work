@@ -201,6 +201,102 @@ async def test_a_chat_model_reranker_pauses_nothing_and_binds_nothing(setup: Set
 
 
 @pytest.mark.asyncio
+async def test_an_off_catalog_dashscope_rerank_model_is_the_current_model(setup: Setup) -> None:
+    """The settings page names the model the search names: an off-catalog
+    DashScope rerank model is routed to the native endpoint and scores, so a
+    threshold set under it binds to it, and it pauses one set under another."""
+    client, config, runner = setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.7})
+    await client.post(
+        "/v1/knowledge/bases/kb/documents",
+        files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
+    )
+    await runner.drain()
+    config.rerank = ("qwen", "gte-rerank")
+    retrieval = await _config(client)
+    assert (retrieval["rerank_threshold_paused"], retrieval["current_rerank_model"]) == (
+        True,
+        "qwen/gte-rerank",
+    )
+    saved = await client.patch("/v1/knowledge/bases/kb", json={"rerank_score_threshold": 0.6})
+    retrieval = saved.json()["retrieval_config"]
+    assert (retrieval["rerank_threshold_model"], retrieval["rerank_threshold_paused"]) == (
+        "qwen/gte-rerank",
+        False,
+    )
+    # …and the search, scored by that model (0.5 each), applies it.
+    body = (await client.post("/v1/knowledge/bases/kb/test", json={"query": "x"})).json()
+    assert (body["status"], body["rerank_threshold_paused"]) == ("below_threshold", False)
+
+
+@pytest.mark.asyncio
+async def test_a_cohere_style_rerank_model_is_the_current_model(setup: Setup) -> None:
+    client, config, _ = setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.7})
+    config.rerank = ("glm", "rerank")
+    retrieval = await _config(client)
+    assert (retrieval["rerank_threshold_paused"], retrieval["current_rerank_model"]) == (
+        True,
+        "glm/rerank",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rerank_model_the_platform_cannot_call_is_no_current_model(setup: Setup) -> None:
+    client, config, _ = setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.7})
+    config.rerank = ("openai", "some-rerank")  # no rerank client for it
+    retrieval = await _config(client)
+    assert (retrieval["rerank_threshold_paused"], retrieval["current_rerank_model"]) == (
+        False,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirming_binds_the_stored_threshold_without_sending_it(setup: Setup) -> None:
+    client, config, _ = setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.7})
+    config.rerank = _TEXT
+    saved = await client.patch("/v1/knowledge/bases/kb", json={"rerank_threshold_confirm": True})
+    retrieval = saved.json()["retrieval_config"]
+    assert (
+        retrieval["rerank_score_threshold"],
+        retrieval["rerank_threshold_model"],
+        retrieval["rerank_threshold_paused"],
+    ) == (0.7, "qwen/qwen3-rerank", False)
+
+
+@pytest.mark.asyncio
+async def test_confirming_after_another_admins_change_keeps_their_value(setup: Setup) -> None:
+    """One admin's page still shows 0.7 (paused); another has since set 0.5.
+    Confirming must not put 0.7 back."""
+    client, config, _ = setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.7})
+    config.rerank = _TEXT
+    await client.patch("/v1/knowledge/bases/kb", json={"rerank_score_threshold": 0.5})
+    saved = await client.patch("/v1/knowledge/bases/kb", json={"rerank_threshold_confirm": True})
+    retrieval = saved.json()["retrieval_config"]
+    assert (retrieval["rerank_score_threshold"], retrieval["rerank_threshold_model"]) == (
+        0.5,
+        "qwen/qwen3-rerank",
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirming_without_a_threshold_binds_nothing(setup: Setup) -> None:
+    client, config, _ = setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb"})
+    config.rerank = _TEXT
+    saved = await client.patch("/v1/knowledge/bases/kb", json={"rerank_threshold_confirm": True})
+    retrieval = saved.json()["retrieval_config"]
+    assert (retrieval["rerank_score_threshold"], retrieval["rerank_threshold_model"]) == (
+        None,
+        None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_without_a_platform_rerank_model_nothing_is_paused(setup: Setup) -> None:
     client, config, _ = setup
     await client.post("/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.7})
@@ -241,22 +337,3 @@ async def test_the_retrieval_test_reports_a_threshold_left_out(setup: Setup) -> 
         "qwen/qwen3-vl-rerank",
         "qwen/qwen3-rerank",
     )
-    assert left_out["rerank_threshold_code_kept"] == 0
-
-
-@pytest.mark.asyncio
-async def test_the_retrieval_test_reports_results_kept_for_a_code(setup: Setup) -> None:
-    client, _, runner = setup
-    await client.post("/v1/knowledge/bases", json={"name": "kb", "rerank_score_threshold": 0.9})
-    await client.post(
-        "/v1/knowledge/bases/kb/documents",
-        files={
-            "file": ("h.md", b"# H\n\nModel ZX-9041 has an 18-month warranty.", "text/markdown")
-        },
-    )
-    await runner.drain()
-    body = (
-        await client.post("/v1/knowledge/bases/kb/test", json={"query": "ZX-9041 warranty"})
-    ).json()
-    assert (body["status"], body["rerank_threshold_code_kept"]) == ("ok", body["count"])
-    assert body["count"] >= 1

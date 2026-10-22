@@ -1,8 +1,7 @@
 """B-206 K-7b — a knowledge base's rerank-score threshold: what clears it is kept
-and a search it turns everything down for finds nothing, as before; a passage
-holding a code the query names is kept under a stored threshold (at most three a
-search); and the threshold is bound to the rerank model it was set under (left
-out, and reported, when another model scored). Codes here are synthetic."""
+and a search it turns everything down for finds nothing, as before; and the
+threshold is bound to the rerank model it was set under (left out, and reported,
+when another model scored)."""
 
 from __future__ import annotations
 
@@ -10,18 +9,10 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
-import pytest
-
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.protocol import KnowledgeChunk
 from orchestrator.tools import KnowledgeRetriever, KnowledgeSearchTool, ToolContext
 from orchestrator.tools.knowledge_rerank import RerankRanking
-from orchestrator.tools.knowledge_threshold import (
-    CODE_KEEP_MAX,
-    Floors,
-    apply_threshold,
-    code_kept_notice,
-)
 
 _SET_UNDER = "qwen/qwen3-vl-rerank"
 _OTHER = "qwen/qwen3-rerank"
@@ -125,7 +116,6 @@ async def test_a_threshold_keeps_what_clears_it() -> None:
     outcome = await _search(store, tenant, _ModelReranker({"high": 0.9, "low": 0.2}))
     assert [r.content for r in outcome.results] == ["high"]
     assert (outcome.status, outcome.rerank_outcome) == ("ok", "ok")
-    assert outcome.rerank_threshold_code_kept == 0
 
 
 async def test_a_threshold_that_turns_every_candidate_down_finds_nothing() -> None:
@@ -134,145 +124,6 @@ async def test_a_threshold_that_turns_every_candidate_down_finds_nothing() -> No
     assert outcome.results == ()
     assert (outcome.status, outcome.candidates) == ("below_threshold", 2)
     assert (outcome.rerank_outcome, outcome.rerank_degraded) == ("ok", False)
-
-
-# --- a code the query names keeps its passage ---------------------------------------
-
-
-async def test_a_passage_holding_the_querys_code_is_kept_under_the_threshold() -> None:
-    store, tenant = await _store(["QK7 dose: two a day", "boilerplate"], threshold=0.7)
-    reranker = _ModelReranker({"QK7 dose: two a day": 0.1, "boilerplate": 0.05})
-    outcome = await _search(store, tenant, reranker, query="QK7 每天吃几次")
-    assert [r.content for r in outcome.results] == ["QK7 dose: two a day"]
-    assert (outcome.status, outcome.rerank_threshold_code_kept) == ("ok", 1)
-
-
-async def test_without_the_code_in_its_text_a_passage_is_filtered() -> None:
-    store, tenant = await _store(["QK8 dose: two a day", "boilerplate"], threshold=0.7)
-    reranker = _ModelReranker({"QK8 dose: two a day": 0.1, "boilerplate": 0.05})
-    outcome = await _search(store, tenant, reranker, query="QK7 每天吃几次")
-    assert outcome.status == "below_threshold"
-    assert outcome.rerank_threshold_code_kept == 0
-
-
-async def test_a_query_without_a_code_keeps_nothing_under_the_threshold() -> None:
-    store, tenant = await _store(["take 2 a day", "b"], threshold=0.7)
-    reranker = _ModelReranker({"take 2 a day": 0.1})
-    outcome = await _search(store, tenant, reranker, query="每天吃 2 次可以吗")
-    assert outcome.status == "below_threshold"
-
-
-async def test_the_code_in_the_document_title_alone_does_not_keep_a_passage() -> None:
-    """Every passage of a file named after a code would match."""
-    store, tenant = await _store(["boilerplate"], threshold=0.7, title="ZX-9041 manual")
-    outcome = await _search(
-        store, tenant, _ModelReranker({"boilerplate": 0.1}), query="ZX-9041 保修多久"
-    )
-    assert outcome.status == "below_threshold"
-
-
-def _chunk(content: str, *, kb: UUID, heading: tuple[str, ...] = ()) -> KnowledgeChunk:
-    return KnowledgeChunk(
-        id=uuid4(),
-        tenant_id=uuid4(),
-        kb_id=kb,
-        document_id=uuid4(),
-        chunk_index=0,
-        content=content,
-        heading_path=heading,
-        embedding=(1.0,),
-    )
-
-
-def _cut(contents: Sequence[str], query: str, *, heading: tuple[str, ...] = ()) -> list[str]:
-    """What a stored threshold of 0.7 keeps of ``contents``, all scored 0.1."""
-    kb = uuid4()
-    chunks = [_chunk(content, kb=kb, heading=heading) for content in contents]
-    floors = Floors({kb: 0.7}, stored=True)
-    cut = apply_threshold(chunks, {c.id: 0.1 for c in chunks}, floors, query=query)
-    return [c.content for c in cut.chunks]
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "model ZX-9041 has an 18-month warranty",
-        "MODEL zx-9041",
-        "型号ZX-9041的保修",  # CJK on both sides
-        "\uff3a\uff38\uff0d\uff19\uff10\uff14\uff11 fullwidth",
-        "ZX\u20139041 en dash",
-        "ZX 9041 spaced",
-        "ZX_9041 underscored",
-    ],
-)
-def test_a_code_matches_across_case_width_and_joiners(text: str) -> None:
-    assert _cut([text], "zx-9041 保修多久") == [text]
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "ZX-90412 is another model",  # a longer number
-        "AZX-9041 is another model",  # a longer letter run
-        "ZX9041 written as one word",  # one token to the keyword search too
-        "ZX-904",
-    ],
-)
-def test_a_code_does_not_match_inside_another(text: str) -> None:
-    assert _cut([text], "ZX-9041 保修多久") == []
-
-
-def test_the_section_path_counts() -> None:
-    assert _cut(["see the table"], "AB-N2 用量", heading=("AB-N2", "dosage")) == ["see the table"]
-
-
-def test_at_most_three_passages_are_kept_for_a_code_best_scored_first() -> None:
-    kb = uuid4()
-    chunks = [_chunk(f"QK7 note {i}", kb=kb) for i in range(5)]
-    scores = {c.id: 0.1 + i / 100 for i, c in enumerate(chunks)}  # the last scores best
-    cut = apply_threshold(chunks, scores, Floors({kb: 0.7}, stored=True), query="QK7 怎么用")
-    assert CODE_KEEP_MAX == 3
-    assert [c.content for c in cut.chunks] == ["QK7 note 2", "QK7 note 3", "QK7 note 4"]
-    assert cut.code_kept == {chunks[2].id, chunks[3].id, chunks[4].id}
-
-
-async def test_the_cap_spans_every_base() -> None:
-    store, tenant = await _store(["QK7 one", "QK7 two"], threshold=0.7, name="first")
-    await _store(
-        ["QK7 three", "QK7 four"], threshold=0.7, store=store, tenant=tenant, name="second"
-    )
-    reranker = _ModelReranker({"QK7 one": 0.2, "QK7 two": 0.1, "QK7 three": 0.12, "QK7 four": 0.05})
-    retriever = KnowledgeRetriever(store=store, embedder=_Embedder(), reranker=reranker)
-    outcome = await retriever.search_detailed(
-        tenant_id=tenant, base_names=["first", "second"], query="QK7 怎么用", limit=5
-    )
-    assert [r.content for r in outcome.results] == ["QK7 one", "QK7 three", "QK7 two"]
-    assert outcome.rerank_threshold_code_kept == 3
-
-
-async def test_a_threshold_passed_with_the_search_keeps_no_passage_for_a_code() -> None:
-    """The retrieval test / eval passing a threshold is calibrating it: it applies as is."""
-    store, tenant = await _store(["QK7 dose: two a day"], threshold=None)
-    outcome = await _search(
-        store,
-        tenant,
-        _ModelReranker({"QK7 dose: two a day": 0.1}),
-        query="QK7 每天吃几次",
-        rerank_score_threshold=0.7,
-    )
-    assert outcome.status == "below_threshold"
-    assert outcome.rerank_threshold_code_kept == 0
-
-
-async def test_only_returned_results_count_as_kept_for_a_code() -> None:
-    store, tenant = await _store(["a", "b", "QK7 note"], threshold=0.5)
-    reranker = _ModelReranker({"a": 0.9, "b": 0.8, "QK7 note": 0.1})
-    retriever = KnowledgeRetriever(store=store, embedder=_Embedder(), reranker=reranker)
-    outcome = await retriever.search_detailed(
-        tenant_id=tenant, base_names=["kb"], query="QK7 怎么用", limit=2
-    )
-    assert [r.content for r in outcome.results] == ["a", "b"]
-    assert outcome.rerank_threshold_code_kept == 0
 
 
 # --- the threshold is bound to the model it was set under -------------------------
@@ -299,16 +150,6 @@ async def test_the_model_is_known_through_both_views_and_the_single_view() -> No
         outcome = await _search(store, tenant, reranker, view=view)
         assert outcome.rerank_threshold_paused is True, (title, view)
         assert len(outcome.results) == 2, (title, view)
-
-
-async def test_a_threshold_left_out_for_its_model_keeps_nothing_for_a_code() -> None:
-    """Left out, it filters nothing — so nothing is kept for a code either."""
-    store, tenant = await _store(["ZX-9041 warranty", "b"], threshold=0.9)
-    reranker = _ModelReranker({"ZX-9041 warranty": 0.1}, model=_OTHER)
-    outcome = await _search(store, tenant, reranker, query="ZX-9041 保修多久")
-    assert len(outcome.results) == 2
-    assert outcome.rerank_threshold_paused is True
-    assert outcome.rerank_threshold_code_kept == 0
 
 
 async def test_the_search_names_the_model_that_scored_it() -> None:
@@ -398,30 +239,6 @@ async def _tool_meta(
     retriever = KnowledgeRetriever(store=store, embedder=_Embedder(), reranker=reranker)
     tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
     return (await tool.call({"query": query}, ctx=ToolContext(tenant_id=tenant))).meta
-
-
-async def _tool_result(
-    store: InMemoryKnowledgeStore, tenant: UUID, reranker: Any, query: str
-) -> Any:
-    retriever = KnowledgeRetriever(store=store, embedder=_Embedder(), reranker=reranker)
-    tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
-    return await tool.call({"query": query}, ctx=ToolContext(tenant_id=tenant))
-
-
-async def test_the_tool_says_how_many_results_were_kept_for_a_code() -> None:
-    store, tenant = await _store(["ZX-9041 warranty", "a"], threshold=0.7)
-    reranker = _ModelReranker({"a": 0.9, "ZX-9041 warranty": 0.1})
-    result = await _tool_result(store, tenant, reranker, "ZX-9041 保修多久")
-    assert result.meta == {"hits": 2, "status": "ok", "rerank_threshold_code_kept": 1}
-    assert result.notice.endswith(code_kept_notice(1))
-    assert "1 of these passages scored below" in code_kept_notice(1)
-
-
-async def test_the_tool_says_nothing_of_codes_when_none_kept_a_result() -> None:
-    store, tenant = await _store(["a"], threshold=0.7)
-    result = await _tool_result(store, tenant, _ModelReranker({"a": 0.9}), "ZX-9041 保修多久")
-    assert "rerank_threshold_code_kept" not in result.meta
-    assert "below the knowledge base's relevance threshold" not in result.notice
 
 
 async def test_the_tool_reports_a_paused_threshold() -> None:

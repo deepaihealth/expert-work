@@ -115,6 +115,8 @@ class _UpdateBaseBody(BaseModel):
     retrieval_method: RetrievalMethod | None = None
     rerank_enabled: bool | None = None
     rerank_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: B-206 K-7b — bind the stored threshold, unchanged, to the live rerank model.
+    rerank_threshold_confirm: bool = False
 
 
 class _TestBody(BaseModel):
@@ -577,6 +579,8 @@ def build_knowledge_router() -> APIRouter:
             rerank_threshold_model=(
                 model_for_threshold(body.rerank_score_threshold, rerank_model)
                 if "rerank_score_threshold" in sent
+                else model_for_threshold(base.rerank_score_threshold, rerank_model)
+                if body.rerank_threshold_confirm
                 else UNSET
             ),
         )
@@ -1088,12 +1092,10 @@ def build_knowledge_router() -> APIRouter:
                 "rerank_dropped": outcome.rerank_dropped,
                 # B-206 K-7b — the base's threshold was set under another rerank
                 # model than the one that scored, so this search left it out (both
-                # named here, so the notice never contradicts the search); and how
-                # many results it kept only for a code the query names.
+                # named here, so the notice never contradicts the search).
                 "rerank_threshold_paused": outcome.rerank_threshold_paused,
                 "rerank_threshold_model": base.rerank_threshold_model,
                 "rerank_model": outcome.rerank_model,
-                "rerank_threshold_code_kept": outcome.rerank_threshold_code_kept,
             }
         )
 

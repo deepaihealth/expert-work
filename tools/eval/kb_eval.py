@@ -45,8 +45,7 @@ B-206 K-14 重排对照组:``--rerank-view dual|single|single_clean`` / ``--rera
 重排缓存照样命中)。重排只判了候选池的一部分(池超过模型单次上限,或超长被拒后少送重试)时整轮退出。
 B-206 K-7b 换模型对照:``--rerank-model``(配 ``--rerank dashscope``,模型在缓存键里);
 ``--rerank-threshold-on-base`` 把 ``--rerank-threshold`` 存到库上(绑这次的重排模型)而不是随检索传,
-检索按生产的库上门槛走(低于门槛但含问题里编号的段每次最多留 3 条,
-汇总 ``rerank_threshold_code_kept``);汇总 ``rerank_outcomes`` 记每种重排结局的检索次数
+走生产的库上门槛那条路(含绑定模型的检查);汇总 ``rerank_outcomes`` 记每种重排结局的检索次数
 (``partial`` 只计数,整轮只在 ``rerank_degraded`` 时退出)。
 
 凭据只从环境变量读(``EXPERT_WORK_EVAL_EMBED_API_KEY`` / ``_MODEL`` / ``_BASE_URL``;
@@ -352,7 +351,6 @@ class SearchLog:
     shown: int
     shown_chars: int  # 工具渲染给模型的文本长度
     rerank_outcome: str | None = None  # B-206 K-7:这次重排怎么结束的(没要重排 = None)
-    rerank_threshold_code_kept: int = 0  # B-206 K-7b:低于库上门槛、因含编号留下的结果
 
 
 @dataclass(frozen=True)
@@ -1005,7 +1003,6 @@ async def run_eval(
                 shown=min(replay.requested or 0, len(results)),
                 shown_chars=len(shown_text),
                 rerank_outcome=outcome.rerank_outcome,
-                rerank_threshold_code_kept=outcome.rerank_threshold_code_kept,
             ),
         )
 
@@ -1183,7 +1180,6 @@ def search_log_json(row: CaseRow) -> dict[str, Any]:
         "candidates": log.candidates,
         "rerank_degraded": log.rerank_degraded,
         "rerank_outcome": log.rerank_outcome,
-        "rerank_threshold_code_kept": log.rerank_threshold_code_kept,
         "shown": log.shown,
         "shown_chars": log.shown_chars,
         "results": [
@@ -1881,9 +1877,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cfg.rerank:
         summary["rerank_outcomes"] = rerank_outcome_counts(
             row.search.rerank_outcome for row in rows if row.search is not None
-        )
-        summary["rerank_threshold_code_kept"] = sum(
-            row.search.rerank_threshold_code_kept for row in rows if row.search is not None
         )
     if rerank_client is not None:
         summary["rerank"] = {"model": cast(Any, reranker).model, **rerank_client.stats()}

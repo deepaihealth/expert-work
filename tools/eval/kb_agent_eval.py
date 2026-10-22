@@ -394,10 +394,9 @@ async def _search(
         "embedding_degraded": bool(result.meta.get("embedding_degraded")),
         # B-206 K-7: how the rerank ended. The eval's base always asks for rerank, so a
         # result without the key ended ``ok``; K-7b: the base's threshold left out
-        # (set under another model), and results kept under it for a code in the query.
+        # (set under another model).
         "rerank_outcome": result.meta.get("rerank_outcome", "ok"),
         "rerank_threshold_paused": bool(result.meta.get("rerank_threshold_paused")),
-        "rerank_threshold_code_kept": int(result.meta.get("rerank_threshold_code_kept", 0)),
         "content": result.content,
     }
 
@@ -738,8 +737,7 @@ def tally(path: Path) -> str:
     lines.append(
         "rerank outcomes "
         + ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
-        + f"; threshold paused {sum(1 for s in ran if s.get('rerank_threshold_paused'))}, "
-        f"results kept for a code {sum(s.get('rerank_threshold_code_kept', 0) for s in ran)}"
+        + f"; threshold paused {sum(1 for s in ran if s.get('rerank_threshold_paused'))}"
     )
     answer = sum(r["cost_cny"]["answer"] for r in rows)
     judge = sum(r["cost_cny"]["judge"] for r in rows)
@@ -790,8 +788,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rerank-pool", type=int, default=DEFAULT_RERANK_POOL)
     parser.add_argument("--rerank-instruct", action="store_true")
     parser.add_argument("--rerank-model")  # B-206 K-7b
-    # B-206 K-7b:设到库上的重排分数下限(绑到这次的重排模型),智能体层看到的与生产相同
-    # (低于下限但含问题里编号的结果最多留 3 条);不给 = 不设。
+    # B-206 K-7b:设到库上的重排分数下限(绑到这次的重排模型),智能体层看到的与生产相同;
+    # 不给 = 不设。
     parser.add_argument("--rerank-threshold", type=float)
     return parser
 

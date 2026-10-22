@@ -100,23 +100,9 @@ describe("RowDetailResult rerank-score threshold (B-206 K-7b)", () => {
     }
   });
 
-  it("says how many results were kept under the threshold for a code", async () => {
-    const prior = i18n.language;
-    await i18n.changeLanguage("zh-CN");
-    try {
-      renderResult(knowledgeRow({ rerankThresholdCodeKept: 1 }));
-      const notice = screen.getByTestId("console-detail-rerank-threshold-code-kept");
-      expect(notice).toHaveTextContent("其中 1 条低于重排分数下限，因含问题里的编号而保留。");
-      expect(notice).toHaveClass("ant-typography-secondary");
-    } finally {
-      await i18n.changeLanguage(prior);
-    }
-  });
-
   it("says nothing about the threshold otherwise", () => {
     renderResult(knowledgeRow({ rerankOutcome: "rate_limited" }));
     expect(screen.queryByTestId("console-detail-rerank-threshold-paused")).toBeNull();
-    expect(screen.queryByTestId("console-detail-rerank-threshold-code-kept")).toBeNull();
   });
 });
 

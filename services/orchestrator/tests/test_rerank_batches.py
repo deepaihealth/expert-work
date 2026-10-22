@@ -81,7 +81,9 @@ def _sigmoid(x: float) -> float:
 async def test_logit_scores_come_back_through_a_sigmoid() -> None:
     client = _Scorer({"a": 22.265625, "b": 4.0351562, "c": -3.0})
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=_caps(score_scale="logit")),
+        CohereStyleReranker(
+            client=client, model="m", provider="glm", caps=_caps(score_scale="logit")
+        ),
         ["a", "b", "c"],
     )
     assert [index for index, _ in ranked] == [0, 1, 2]
@@ -98,7 +100,9 @@ async def test_logit_scores_come_back_through_a_sigmoid() -> None:
 @pytest.mark.parametrize("scale", ["normalized", "sigmoid", "relative", None])
 async def test_only_a_logit_model_carries_logits(scale: str | None) -> None:
     ranked = await _scored(
-        CohereStyleReranker(client=_Scorer({"a": 0.5}), model="m", caps=_caps(score_scale=scale)),
+        CohereStyleReranker(
+            client=_Scorer({"a": 0.5}), model="m", provider="glm", caps=_caps(score_scale=scale)
+        ),
         ["a"],
     )
     assert isinstance(ranked, RerankRanking)
@@ -112,7 +116,9 @@ async def test_a_split_pool_merges_on_the_logit_not_the_saturated_sigmoid() -> N
     client = _Scorer({"d0": 40.0, "d1": -2.0, "d2": 45.0})
     caps = _caps(max_documents=2, score_scale="logit")
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps), ["d0", "d1", "d2"], top_k=2
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
+        ["d0", "d1", "d2"],
+        top_k=2,
     )
     assert _sigmoid(40.0) == _sigmoid(45.0) == 1.0
     assert [index for index, _ in ranked] == [2, 0]
@@ -124,7 +130,9 @@ async def test_a_split_pool_merges_on_the_logit_not_the_saturated_sigmoid() -> N
 async def test_a_very_negative_logit_does_not_overflow() -> None:
     client = _Scorer({"a": -1000.0, "b": 1000.0})
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=_caps(score_scale="logit")),
+        CohereStyleReranker(
+            client=client, model="m", provider="glm", caps=_caps(score_scale="logit")
+        ),
         ["a", "b"],
     )
     assert ranked == [(1, 1.0), (0, 0.0)]
@@ -135,7 +143,10 @@ async def test_a_very_negative_logit_does_not_overflow() -> None:
 async def test_other_scales_keep_the_vendor_score(scale: str | None) -> None:
     client = _Scorer({"a": 0.25, "b": 3.5})
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=_caps(score_scale=scale)), ["a", "b"]
+        CohereStyleReranker(
+            client=client, model="m", provider="glm", caps=_caps(score_scale=scale)
+        ),
+        ["a", "b"],
     )
     assert ranked == [(1, 3.5), (0, 0.25)]
 
@@ -154,13 +165,15 @@ async def test_rows_it_cannot_read_are_left_out_or_unscored() -> None:
                 ]
             }
 
-    ranked = await _scored(CohereStyleReranker(client=_Client(), model="m"), ["a", "b", "c"])
+    ranked = await _scored(
+        CohereStyleReranker(client=_Client(), model="m", provider="glm"), ["a", "b", "c"]
+    )
     assert ranked == [(2, None), (0, 0.5)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scale", ["logit", "relative", None])
-async def test_the_ranking_names_its_model_when_the_provider_is_known(scale: str | None) -> None:
+async def test_the_ranking_names_its_model(scale: str | None) -> None:
     """B-206 K-7b: a base's threshold is bound to the model that scored, so the
     ranking must say which one — on every scale, and on a ``model_error``."""
 
@@ -171,19 +184,23 @@ async def test_the_ranking_names_its_model_when_the_provider_is_known(scale: str
     key = rerank_model_key("glm", "m")
     caps = _caps(score_scale=scale)
     scored = await _scored(
-        CohereStyleReranker(client=_Scorer({"a": 2.0}), model="m", caps=caps, provider="glm"),
+        CohereStyleReranker(client=_Scorer({"a": 2.0}), model="m", provider="glm", caps=caps),
         ["a"],
     )
     failed = await _scored(
-        CohereStyleReranker(client=_Empty(), model="m", caps=caps, provider="glm"), ["a"]
+        CohereStyleReranker(client=_Empty(), model="m", provider="glm", caps=caps), ["a"]
     )
-    unnamed = await _scored(CohereStyleReranker(client=_Scorer({"a": 2.0}), model="m"), ["a"])
     assert isinstance(scored, RerankRanking) and scored.model == key
     assert isinstance(failed, RerankRanking) and (failed.outcome, failed.model) == (
         "model_error",
         key,
     )
-    assert isinstance(unnamed, RerankRanking) and unnamed.model is None
+
+
+def test_a_cohere_style_reranker_cannot_be_built_without_its_provider() -> None:
+    """B-206 K-7b: no construction can score without naming its model."""
+    with pytest.raises(TypeError, match="provider"):
+        CohereStyleReranker(client=_Scorer({}), model="m")  # type: ignore[call-arg]
 
 
 @pytest.mark.asyncio
@@ -193,7 +210,7 @@ async def test_an_answer_without_results_is_a_model_error() -> None:
             return {}
 
     ranked = await _scored(
-        CohereStyleReranker(client=_Client(), model="m"), ["a", "b", "c"], top_k=2
+        CohereStyleReranker(client=_Client(), model="m", provider="glm"), ["a", "b", "c"], top_k=2
     )
     assert ranked == [(0, None), (1, None)]
     assert isinstance(ranked, RerankRanking)
@@ -203,13 +220,13 @@ async def test_an_answer_without_results_is_a_model_error() -> None:
 @pytest.mark.asyncio
 async def test_empty_documents_send_nothing() -> None:
     client = _Scorer()
-    assert await _scored(CohereStyleReranker(client=client, model="m"), []) == []
+    assert await _scored(CohereStyleReranker(client=client, model="m", provider="glm"), []) == []
     assert client.requests == []
 
 
 @pytest.mark.asyncio
 async def test_plain_rerank_returns_indices() -> None:
-    reranker = CohereStyleReranker(client=_Scorer({"b": 1.0}), model="m")
+    reranker = CohereStyleReranker(client=_Scorer({"b": 1.0}), model="m", provider="glm")
     out = await reranker.rerank(query="q", documents=["a", "b"], top_k=1, tenant_id=uuid4())
     assert out == [1]
 
@@ -222,7 +239,7 @@ async def test_a_char_model_gets_query_and_documents_cut_to_its_limits() -> None
     client = _Scorer()
     caps = _caps(length_unit="char", max_doc_tokens=4, query_max_tokens=3)
     await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps),
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
         ["法律条文", "法律条文第五条", "ab"],
         query="问题很长",
     )
@@ -236,7 +253,7 @@ async def test_a_token_model_is_sent_the_text_as_handed() -> None:
     client = _Scorer()
     caps = _caps(max_doc_tokens=4, query_max_tokens=3)
     await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps),
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
         ["法律条文第五条"],
         query="问题很长",
     )
@@ -267,7 +284,7 @@ async def test_a_size_refusal_is_answered_once_with_what_surely_fits() -> None:
     client = _RefusesLong(limit=30)
     caps = _caps(max_doc_tokens=6, query_max_tokens=3, max_total_tokens=20)
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps),
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
         ["法律条文", "abcdefgh", "xyz", "tail"],
         query="问题",
     )
@@ -294,7 +311,9 @@ async def test_other_refusals_are_not_answered_with_less(failure: str) -> None:
     client = _Client()
     caps = _caps(max_doc_tokens=1)  # a size refusal would be answered with "a"
     with pytest.raises(RerankCallError):
-        await _scored(CohereStyleReranker(client=client, model="m", caps=caps), ["abc"])
+        await _scored(
+            CohereStyleReranker(client=client, model="m", provider="glm", caps=caps), ["abc"]
+        )
     assert client.calls == 1
 
 
@@ -302,7 +321,9 @@ async def test_other_refusals_are_not_answered_with_less(failure: str) -> None:
 async def test_a_size_refusal_nothing_can_shrink_is_raised() -> None:
     client = _RefusesLong(limit=0)
     with pytest.raises(RerankCallError):
-        await _scored(CohereStyleReranker(client=client, model="m", caps=_caps()), ["abc"])
+        await _scored(
+            CohereStyleReranker(client=client, model="m", provider="glm", caps=_caps()), ["abc"]
+        )
     assert len(client.requests) == 1
 
 
@@ -316,7 +337,9 @@ async def test_a_pool_over_the_cap_is_split_and_merged_by_score(scale: str) -> N
     client = _Scorer(scores)
     caps = _caps(max_documents=3, score_scale=scale)
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps), list(scores), top_k=2
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
+        list(scores),
+        top_k=2,
     )
     assert [request["documents"] for request in client.requests] == [
         ["d0", "d1", "d2"],
@@ -337,7 +360,7 @@ async def test_scores_that_do_not_compare_keep_the_leading_documents(scale: str 
     client = _Scorer({"d0": 0.1, "d1": 0.7, "d2": 0.9})
     caps = _caps(max_documents=2, score_scale=scale)
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps), ["d0", "d1", "d2"]
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps), ["d0", "d1", "d2"]
     )
     assert [request["documents"] for request in client.requests] == [["d0", "d1"]]
     assert [index for index, _ in ranked] == [1, 0]
@@ -348,7 +371,9 @@ async def test_scores_that_do_not_compare_keep_the_leading_documents(scale: str 
 @pytest.mark.asyncio
 async def test_an_off_catalog_model_sends_the_whole_pool_at_once() -> None:
     client = _Scorer()
-    await _scored(CohereStyleReranker(client=client, model="m"), [f"d{i}" for i in range(300)])
+    await _scored(
+        CohereStyleReranker(client=client, model="m", provider="glm"), [f"d{i}" for i in range(300)]
+    )
     assert [len(request["documents"]) for request in client.requests] == [300]
 
 
@@ -369,7 +394,9 @@ async def test_the_split_requests_are_in_flight_together() -> None:
             return await super().rerank(**kwargs)
 
     caps = _caps(max_documents=1, score_scale="normalized")
-    ranked = await _scored(CohereStyleReranker(client=_Client(), model="m", caps=caps), ["a", "b"])
+    ranked = await _scored(
+        CohereStyleReranker(client=_Client(), model="m", provider="glm", caps=caps), ["a", "b"]
+    )
     assert len(ranked) == 2
 
 
@@ -383,7 +410,9 @@ async def test_one_failed_request_fails_the_split_rerank() -> None:
 
     caps = _caps(max_documents=1, score_scale="normalized")
     with pytest.raises(RerankCallError):
-        await _scored(CohereStyleReranker(client=_Client(), model="m", caps=caps), ["a", "b"])
+        await _scored(
+            CohereStyleReranker(client=_Client(), model="m", provider="glm", caps=caps), ["a", "b"]
+        )
 
 
 @pytest.mark.asyncio
@@ -404,7 +433,10 @@ async def test_the_first_failure_cancels_the_other_requests() -> None:
     caps = _caps(max_documents=1, score_scale="normalized")
     with pytest.raises(RerankCallError) as excinfo:
         await asyncio.wait_for(
-            _scored(CohereStyleReranker(client=_Client(), model="m", caps=caps), ["a", "b"]),
+            _scored(
+                CohereStyleReranker(client=_Client(), model="m", provider="glm", caps=caps),
+                ["a", "b"],
+            ),
             timeout=2.0,
         )
     assert excinfo.value.failure == "rate_limited"
@@ -427,7 +459,9 @@ async def test_a_classified_failure_is_raised_over_an_unclassified_one() -> None
     asyncio.get_running_loop().call_later(0.05, release.set)
     caps = _caps(max_documents=1, score_scale="normalized")
     with pytest.raises(RerankCallError):
-        await _scored(CohereStyleReranker(client=_Client(), model="m", caps=caps), ["a", "b"])
+        await _scored(
+            CohereStyleReranker(client=_Client(), model="m", provider="glm", caps=caps), ["a", "b"]
+        )
 
 
 @pytest.mark.asyncio
@@ -439,7 +473,9 @@ async def test_one_unreadable_answer_makes_the_split_rerank_a_model_error() -> N
             return await super().rerank(**kwargs)
 
     caps = _caps(max_documents=1, score_scale="normalized")
-    ranked = await _scored(CohereStyleReranker(client=_Client(), model="m", caps=caps), ["a", "b"])
+    ranked = await _scored(
+        CohereStyleReranker(client=_Client(), model="m", provider="glm", caps=caps), ["a", "b"]
+    )
     assert ranked == [(0, None), (1, None)]
     assert isinstance(ranked, RerankRanking)
     assert ranked.outcome == "model_error"
@@ -452,7 +488,7 @@ async def test_a_char_model_packs_requests_within_its_total() -> None:
     client = _Scorer({"cccc": 0.9})
     caps = _caps(length_unit="char", max_total_tokens=10, score_scale="logit")
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps),
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
         ["aaa", "bbb", "cccc", "dd"],
         query="qq",
     )
@@ -470,7 +506,7 @@ async def test_a_char_model_with_relative_scores_keeps_what_fits_one_request() -
     client = _Scorer()
     caps = _caps(length_unit="char", max_total_tokens=10, score_scale="relative")
     ranked = await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps),
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
         ["aaa", "bbb", "cccc", "dd"],
         query="qq",
     )
@@ -484,7 +520,9 @@ async def test_a_char_document_longer_than_the_total_allows_is_cut_to_fit() -> N
     client = _Scorer()
     caps = _caps(length_unit="char", max_total_tokens=6, score_scale="logit")
     await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps), ["abcdefgh"], query="qq"
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
+        ["abcdefgh"],
+        query="qq",
     )
     assert client.requests[0]["documents"] == ["abcd"]
 
@@ -504,7 +542,9 @@ async def test_a_split_pool_judges_every_slice_against_the_same_query() -> None:
     client = _RefusesSecond()
     caps = _caps(max_documents=1, max_doc_tokens=3, query_max_tokens=3, score_scale="logit")
     await _scored(
-        CohereStyleReranker(client=client, model="m", caps=caps), ["aaaaaa", "bbbbbb"], query="问题"
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=caps),
+        ["aaaaaa", "bbbbbb"],
+        query="问题",
     )
     sent = [request for request in client.requests if "refused" not in request]
     assert sorted(request["documents"][0] for request in sent) == ["aaaaaa", "bbb"]
@@ -518,12 +558,18 @@ async def test_a_split_pool_judges_every_slice_against_the_same_query() -> None:
 async def test_the_instruction_goes_only_to_a_model_that_takes_one() -> None:
     client = _Scorer()
     await _scored(
-        CohereStyleReranker(client=client, model="m", caps=_caps(supports_instruction=True)),
+        CohereStyleReranker(
+            client=client, model="m", provider="glm", caps=_caps(supports_instruction=True)
+        ),
         ["a"],
         instruction="judge it",
     )
     await _scored(
-        CohereStyleReranker(client=client, model="m", caps=_caps()), ["a"], instruction="judge it"
+        CohereStyleReranker(client=client, model="m", provider="glm", caps=_caps()),
+        ["a"],
+        instruction="judge it",
     )
-    await _scored(CohereStyleReranker(client=client, model="m"), ["a"], instruction="judge it")
+    await _scored(
+        CohereStyleReranker(client=client, model="m", provider="glm"), ["a"], instruction="judge it"
+    )
     assert [request["instruction"] for request in client.requests] == ["judge it", None, None]

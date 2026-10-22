@@ -608,7 +608,6 @@ export interface TranslationKeys {
     rerank_threshold_model_unrecorded: string;
     rerank_threshold_confirm: string;
     rerank_threshold_confirmed: string;
-    rerank_threshold_code_kept: string;
     rerank_threshold_paused_generic: string;
     settings_title: string;
     settings_saved: string;
@@ -3857,7 +3856,7 @@ const en: TranslationKeys = {
       "Reorder fused results by an LLM when one is configured.",
     field_rerank_threshold: "Rerank score floor",
     field_rerank_threshold_hint:
-      "Applies when rerank is on: chunks whose rerank score (0–1) is below this are dropped; if all are, the search returns nothing found. Up to 3 chunks below it are kept per search when their text contains a code the question names (a model or patent number; case and width do not matter). Meant to stop clearly off-topic questions — it cannot tell an on-topic question the documents don't answer. A reference value is 0.70 (measured with qwen3-vl-rerank). The floor is bound to the platform rerank model it was set under (by saving an edited value, or \"Confirm for the current model\"): when the platform rerank model changes it is paused until recalibrated. Off by default (empty).",
+      "Applies when rerank is on: chunks whose rerank score (0–1) is below this are dropped; if all are, the search returns nothing found. Meant to stop clearly off-topic questions — it cannot tell an on-topic question the documents don't answer. A reference value is 0.70 (measured with qwen3-vl-rerank). The floor is bound to the platform rerank model it was set under (by saving an edited value, or \"Confirm for the current model\"): when the platform rerank model changes it is paused until recalibrated. Off by default (empty).",
     field_rerank_threshold_placeholder: "Empty = off (e.g. 0.70)",
     col_description: "Description",
     col_documents: "Docs",
@@ -3976,8 +3975,6 @@ const en: TranslationKeys = {
     rerank_threshold_model_unrecorded: "an unrecorded model",
     rerank_threshold_confirm: "Confirm for the current model",
     rerank_threshold_confirmed: "The floor now applies under the current rerank model.",
-    rerank_threshold_code_kept:
-      "{{count}} of these results scored below the rerank score floor and are kept because they contain a code from the question.",
     rerank_threshold_paused_generic:
       "This search did not use the knowledge base's rerank score floor: it was set under another rerank model. Recalibrate it in the base's settings.",
     settings_title: "Retrieval settings",
