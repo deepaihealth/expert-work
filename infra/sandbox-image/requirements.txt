@@ -22,7 +22,9 @@ weasyprint==70.0       # HTML+CSS → PDF (report generation)
 # 68.0 配 pydyf 0.12.x 会在 write_pdf 时抛 ``super().transform``
 # AttributeError,所以此前把 pydyf 钉在 0.11.0。2026-08-06 两者一起升到
 # 69.0 + 0.12.1,md→HTML→PDF 路径由镜像 smoke(smoke_payload.py)实测覆盖。
-# 只升其中一个的 dependabot PR 一律不要单独合。
+# 只升其中一个的 dependabot PR 默认不要单独合;要单升,先读 release notes 确认
+# 没动 weasyprint 用到的接口,并看镜像 smoke + platform-skills layer 2 真渲染过。
+# 2026-10-22 pydyf 单升 0.13.0(只把下限提到 Python 3.11、新增 name 函数)按此核验后合入。
 pydyf==0.13.0          # weasyprint PDF backend (与 weasyprint 成对,见上)
 Pillow==13.0.0         # image read/write/convert
 matplotlib==3.11.2     # charts (CJK rendering via fonts-noto-cjk)
