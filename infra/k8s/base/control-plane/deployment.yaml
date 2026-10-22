@@ -64,7 +64,7 @@ spec:
               memory: 1Gi
             limits:
               cpu: "1"
-              # PLACEHOLDER (B-209 option 1, pending the user's choice): paired
+              # B-209 PR-2 (2026-10-22 decision): 4Gi, paired
               # with EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB in
               # configmap.yaml — tools/deploy/test_parse_worker_memory_budget.py
               # fails when the two stop fitting together.

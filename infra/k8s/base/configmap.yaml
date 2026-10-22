@@ -104,10 +104,12 @@ data:
   # ------------------------------------------------- knowledge parse workers
   # B-209 PR-2: address-space ceiling of one parse / figure worker (MiB). A
   # heavy document past it fails alone instead of the cgroup OOM-killing the
-  # pod. PLACEHOLDER (option 1, pending the user's choice): paired with the
-  # control-plane memory limit in control-plane/deployment.yaml — change the
-  # two together; tools/deploy/test_parse_worker_memory_budget.py checks them.
-  EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB: "2550"
+  # pod. 2400 with the 4Gi control-plane limit (2026-10-22 decision): photos up
+  # to about 48 MP are described, larger ones skipped, and about 300 MiB is
+  # left for the server to grow past its idle size. Paired with the memory
+  # limit in control-plane/deployment.yaml — change the two together;
+  # tools/deploy/test_parse_worker_memory_budget.py checks them.
+  EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB: "2400"
 
   # --------------------------------------------------------------- keycloak
   EXPERT_WORK_KEYCLOAK_ENABLED: "false"

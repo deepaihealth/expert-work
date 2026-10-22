@@ -97,7 +97,8 @@ def test_the_worker_ceiling_fires_before_the_pod_limit(overlay: str) -> None:
 @pytest.mark.parametrize(
     ("limit_mib", "workers", "cap_mib", "fits"),
     [
-        (4096, 2, 2550, True),  # option 1 (placeholder)
+        (4096, 2, 2400, True),  # shipped: about 300 MiB to spare
+        (4096, 2, 2550, True),  # option 1 as measured: 2 MiB to spare
         (4096, 2, 2560, False),  # 18 MiB over
         (2048, 2, 1800, False),  # option 2
         (2048, 1, 1800, True),  # option 2b
