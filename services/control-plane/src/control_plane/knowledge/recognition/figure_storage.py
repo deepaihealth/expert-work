@@ -132,28 +132,33 @@ class FigureStorage:
         document_id: UUID,
         figure: str,
         generation: int | None = None,
-        any_generation: bool = False,
     ) -> bytes | None:
-        """The figure's bytes from ``generation``; with ``any_generation``
-        also from whichever generation still holds it (chunks of an earlier
-        version keep serving while a re-upload ingests, or after a pending
-        upload was discarded) — the caller allows that only for figures the
-        document's chunks name. ``None`` when there is none."""
-        key = self.key(tenant_id, kb_id, document_id, generation, figure)
+        """The figure's bytes from ``generation``; ``None`` when it holds none."""
+        return await self.read(self.key(tenant_id, kb_id, document_id, generation, figure))
+
+    async def read(self, key: str) -> bytes | None:
         try:
             return await self._store.get(key)
         except ObjectNotFoundError:
-            pass
-        if not any_generation:
             return None
+
+    async def other_generation_key(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        document_id: UUID,
+        figure: str,
+        generation: int | None,
+    ) -> str | None:
+        """Where another generation of the document holds ``figure`` (chunks of
+        an earlier version keep serving while a re-upload ingests, or after a
+        pending upload was discarded); ``None`` when none does. One listing of
+        the document's own prefix."""
+        current = self.key(tenant_id, kb_id, document_id, generation, figure)
         suffix = f"/{figure}.jpg"
-        for other in await self._store.list_prefix(_document_prefix(tenant_id, kb_id, document_id)):
-            if other.endswith(suffix) and other != key:
-                try:
-                    return await self._store.get(other)
-                except ObjectNotFoundError:
-                    continue
-        return None
+        listed = await self._store.list_prefix(_document_prefix(tenant_id, kb_id, document_id))
+        return next((key for key in listed if key.endswith(suffix) and key != current), None)
 
     async def figure_ids(self, *, tenant_id: UUID, kb_id: UUID, document_id: UUID) -> set[str]:
         """Ids of the figures stored for the document (any generation)."""

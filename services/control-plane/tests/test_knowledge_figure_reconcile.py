@@ -392,3 +392,53 @@ async def test_a_young_original_of_an_orphaned_document_stays() -> None:
     assert await setup.reconciler().run_once() == ReconcileOutcome(orphans=1, deleted=1)
     remaining = await setup.objects.list_prefix("")
     assert young_key in remaining and old_key not in remaining
+
+
+async def test_the_re_listing_stops_at_the_pass_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Round 5 (D): orphaned documents past the quota are not listed again.
+    monkeypatch.setattr(figure_reconcile, "MAX_DELETES_PER_PASS", 1)
+    setup = _Setup()
+    await setup.documents(kept=3, gone=3)
+    storage = _CountingStorage(setup.objects)
+    reconciler = FigureReconciler(
+        store=setup.store, storage=storage, interval_s=60, delete=True, now=_later
+    )
+    assert await reconciler.run_once() == ReconcileOutcome(orphans=3, deleted=1)
+    assert len(storage.relisted) == 1
+
+
+async def test_a_dry_run_counts_orphaned_documents_without_listing_them() -> None:
+    setup = _Setup()
+    await setup.documents(kept=3, gone=2)
+    storage = _CountingStorage(setup.objects)
+    reconciler = FigureReconciler(store=setup.store, storage=storage, interval_s=60, now=_later)
+    assert await reconciler.run_once() == ReconcileOutcome(orphans=2)
+    assert storage.relisted == []
+
+
+async def test_the_share_override_warns_on_every_pass(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Round 5 (H): an override left on does not go unnoticed.
+    setup = _Setup()
+    await setup.documents(kept=2, gone=1)
+    reconciler = setup.reconciler(ignore_orphan_share=True, delete=False)
+    with caplog.at_level("WARNING"):
+        await reconciler.run_once()
+        await reconciler.run_once()
+    assert caplog.text.count("knowledge.figure_reconcile_orphan_share_override") == 2
+    assert figure_reconcile._override._value.get() == 1
+    await setup.reconciler().run_once()
+    assert figure_reconcile._override._value.get() == 0
+
+
+async def test_one_documents_many_originals_still_respect_the_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(figure_reconcile, "MAX_DELETES_PER_PASS", 1)
+    setup = _Setup()
+    _, (gone,) = await setup.documents(kept=2, gone=1)
+    (key,) = [k for k in await setup.objects.list_prefix("") if str(gone) in k]
+    await setup.objects.put(key.replace("/g0/", "/g1/"), b"jpeg")
+    assert await setup.reconciler().run_once() == ReconcileOutcome(orphans=1, deleted=1)
+    assert len([k for k in await setup.objects.list_prefix("") if str(gone) in k]) == 1

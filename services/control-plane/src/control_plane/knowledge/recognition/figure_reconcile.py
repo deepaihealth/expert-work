@@ -20,10 +20,15 @@
 * 只动最后修改时间早于 :data:`MIN_AGE` 的原图(刚写的不碰);每轮最多删 :data:`MAX_DELETES_PER_PASS`
   个,剩下的下一轮。
 * 启动后先等一个周期再跑第一轮;多个副本之间用 Postgres 事务级 advisory 锁单飞
-  (``FIGURE_RECONCILE_LOCK_CLASSID``),没抢到锁的副本这一轮什么都不做。
+  (``FIGURE_RECONCILE_LOCK_CLASSID``),没抢到锁的副本这一轮什么都不做。锁跟着一个一直开着的事务:
+  持锁的节点要是整个死掉,锁要等 TCP keepalive 断开或空闲事务超时(这里设 6 小时)才放,这期间
+  对账照样不跑 —— 不会出错,只是晚。
+* 打开 ``knowledge_figure_reconcile_ignore_orphan_share`` 期间,每一轮都记警告,指标
+  ``expert_work_knowledge_figure_reconcile_orphan_share_override`` 为 1。
 
 **内存**:列桶按页流式读,每个文档只记它的租户 / 知识库和「有没有一天前写的原图」,不把所有键攒在
-内存里;要删(或演练计数)的孤儿文档,删之前再按它自己的前缀重新列一遍。
+内存里;演练只报孤儿文档数,不重新列;真删时按文档前缀重新列,攒够本轮配额(每轮最多删的个数)
+就停。
 
 放弃时记警告和 ``expert_work_knowledge_figure_reconcile_aborted_total{reason}``。
 键名对不上格式的对象不碰。删除是幂等的。
@@ -71,7 +76,11 @@ _deleted = expert_work_counter(
 )
 _orphans = expert_work_gauge(
     "expert_work_knowledge_figure_orphans",
-    "Original figures the last reconcile pass found without a document (old enough to delete).",
+    "Documents the last reconcile pass found gone with originals old enough to delete.",
+)
+_override = expert_work_gauge(
+    "expert_work_knowledge_figure_reconcile_orphan_share_override",
+    "1 while the reconciler runs with its orphan-share guard switched off.",
 )
 _aborted = expert_work_counter(
     "expert_work_knowledge_figure_reconcile_aborted_total",
@@ -217,22 +226,30 @@ class FigureReconciler:
         if not existing:
             return self._abort("no_documents_found")
         orphaned = [document_id for document_id in seen if document_id not in existing]
+        _override.set(1 if self._ignore_orphan_share else 0)
+        if self._ignore_orphan_share:
+            logger.warning(
+                "knowledge.figure_reconcile_orphan_share_override documents=%d orphaned=%d",
+                len(seen),
+                len(orphaned),
+            )
         share_counts = len(seen) >= MIN_DOCUMENTS_FOR_SHARE and not self._ignore_orphan_share
         if share_counts and len(orphaned) / len(seen) > MAX_ORPHAN_SHARE:
             return self._abort("orphan_share")
-        keys = await self._old_keys([d for d in orphaned if seen[d].old], seen)
-        _orphans.set(len(keys))
-        if not keys:
+        documents = [document_id for document_id in orphaned if seen[document_id].old]
+        _orphans.set(len(documents))
+        if not documents:
             return ReconcileOutcome()
         if not self._delete:
-            logger.info("knowledge.figure_orphans_found count=%d dry_run=true", len(keys))
-            return ReconcileOutcome(orphans=len(keys))
-        deleted = await self._storage.delete_keys(keys[:MAX_DELETES_PER_PASS])
+            logger.info("knowledge.figure_orphans_found documents=%d dry_run=true", len(documents))
+            return ReconcileOutcome(orphans=len(documents))
+        keys = await self._old_keys(documents, seen)
+        deleted = await self._storage.delete_keys(keys)
         _deleted.inc(deleted)
         logger.info(
-            "knowledge.figure_orphans_deleted count=%d remaining=%d", deleted, len(keys) - deleted
+            "knowledge.figure_orphans_deleted count=%d documents=%d", deleted, len(documents)
         )
-        return ReconcileOutcome(orphans=len(keys), deleted=deleted)
+        return ReconcileOutcome(orphans=len(documents), deleted=deleted)
 
     async def _listing(self) -> dict[UUID, _Seen]:
         """The bucket, page by page, folded into one small record per document."""
@@ -250,17 +267,21 @@ class FigureReconciler:
         return seen
 
     async def _old_keys(self, documents: list[UUID], seen: dict[UUID, _Seen]) -> list[str]:
-        """The orphaned documents' originals older than MIN_AGE, listed again
-        now (a key written since the scan is not swept up with them)."""
+        """Up to :data:`MAX_DELETES_PER_PASS` originals older than MIN_AGE of
+        the orphaned documents, each document listed again now (a key written
+        since the scan is not swept up); listing stops once the pass's quota
+        is reached — the rest wait for the next pass."""
         cutoff = self._now() - MIN_AGE
         keys: list[str] = []
         for document_id in documents:
+            if len(keys) >= MAX_DELETES_PER_PASS:
+                break
             record = seen[document_id]
             listed = await self._storage.document_keys_modified(
                 tenant_id=record.tenant_id, kb_id=record.kb_id, document_id=document_id
             )
             keys.extend(key for key, modified in listed if modified < cutoff)
-        return keys
+        return keys[:MAX_DELETES_PER_PASS]
 
     def _abort(self, reason: str) -> ReconcileOutcome:
         _aborted.labels(reason=reason).inc()

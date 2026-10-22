@@ -1,31 +1,41 @@
-"""B-209 PR-2 —— the parse workers' memory ceiling must fire before the pod's.
+"""B-209 PR-2 —— the parse workers' memory ceilings must fire before the pod's.
 
-Every parse worker (``EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS``, plus the one
-figure worker) carries an address-space ceiling
-(``EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB``). It only protects the pod
-when the processes at that ceiling still fit in the container's memory limit;
-otherwise the cgroup OOM-kills workers (or the server) first and the ceiling
-never fires. Both values live in different files — this checks them together,
-for every overlay as rendered (base config map + the overlay's patch).
+Every parse worker (``EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS``) carries an
+address-space ceiling (``EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB``), the
+one figure worker its own (``EXPERT_WORK_KNOWLEDGE_FIGURE_WORKER_MAX_VM_MB``).
+They only protect the pod when the processes at their ceilings still fit in
+the container's memory limit; otherwise the cgroup OOM-kills workers (or the
+server) first and the ceilings never fire. The values live in different files
+and overlays can patch any of them — so every overlay directory is rendered
+(``kustomize build``, else ``kubectl kustomize``) and the rendered Deployment
+and ConfigMap are checked together, container env overriding the ConfigMap.
 
 Constants and where they come from (control-plane image f4a075a54,
-``MALLOC_ARENA_MAX=2``, linux/amd64, two documents parsed at once):
+``MALLOC_ARENA_MAX=2`` and the thread pins of the Deployment, linux/amd64,
+one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
+``/proc/<pid>/status`` read — review round 5):
 
-* :data:`MAIN_PROCESS_MIB` — the uvicorn server process at idle on the live
-  test pod (614 MiB RSS, measured 2026-10-22).
-* :data:`WORKER_NEVER_RESIDENT_MIB` — the part of a parse worker's address
-  space that never becomes resident: the smallest gap between peak address
-  space and peak RSS across every measured parse (text PDF 1522 vs 507 MiB;
-  48 MP photo in Word 2368 vs 1272; 58 MP 2581 vs 1484; 110 MB of text 2533
-  vs 1434). A worker held to ``cap`` MiB of address space therefore peaks at
-  most ``cap - WORKER_NEVER_RESIDENT_MIB`` resident.
-* :data:`FIGURE_WORKER_PEAK_MIB` — the figure worker's peak (410 MiB, figures
-  of a PDF with a 48 MP image). It never decodes a picture at full size: it
-  renders clips and pages at most 2,000 px on the long edge.
+* :data:`MAIN_PROCESS_MIB` — the server process: 614 MiB RSS idle on the live
+  test pod, plus the 531 MiB it grew by running two ingests of an 11 MB-text
+  Word file at once through the real pipeline (uploads held in memory; two
+  48 MP Word files: +12 MiB). Not covered: a document whose text alone is
+  huge — two ingests of a 110 MB-text Word file (60,000 chunks) took the
+  server to 5.5 GB, which no worker ceiling can bound (that needs a cap on a
+  document's parsed size).
+* :data:`PARSE_WORKER_NEVER_RESIDENT_MIB` — the part of a parse worker's
+  address space that is not resident when its RSS peaks: the smallest
+  same-instant gap at the peak (two 48 MP Word parses at once: 699 and 705
+  MiB). A worker held to ``cap`` MiB peaks at most ``cap - gap`` resident.
+* :data:`FIGURE_WORKER_NEVER_RESIDENT_MIB` — the same for the figure worker
+  (654 MiB; 59 MP JPEG / flate images on a text page and a 59 MP scanned
+  page). The figure worker is counted at its own ceiling, not at a measured
+  peak.
 """
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -36,17 +46,46 @@ from control_plane.settings import Settings
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _K8S = _REPO_ROOT / "infra" / "k8s"
-_CONFIG_MAP = "control-plane-config"
+_CONTAINER = "control-plane"
 
-MAIN_PROCESS_MIB = 614
-WORKER_NEVER_RESIDENT_MIB = 1015
-FIGURE_WORKER_PEAK_MIB = 410
+MAIN_PROCESS_MIB = 1150
+PARSE_WORKER_NEVER_RESIDENT_MIB = 699
+FIGURE_WORKER_NEVER_RESIDENT_MIB = 654
+
+_WORKERS = "EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS"
+_CAP = "EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB"
+_FIGURE_CAP = "EXPERT_WORK_KNOWLEDGE_FIGURE_WORKER_MAX_VM_MB"
 
 
-def worst_case_mib(*, workers: int, cap_mib: int) -> int:
-    """The container's memory with every parse worker at its ceiling."""
-    worker = cap_mib - WORKER_NEVER_RESIDENT_MIB
-    return MAIN_PROCESS_MIB + workers * worker + min(FIGURE_WORKER_PEAK_MIB, worker)
+def worst_case_mib(*, workers: int, cap_mib: int, figure_cap_mib: int) -> int:
+    """The container's memory with every worker at its ceiling."""
+    parse = cap_mib - PARSE_WORKER_NEVER_RESIDENT_MIB
+    figure = figure_cap_mib - FIGURE_WORKER_NEVER_RESIDENT_MIB
+    return MAIN_PROCESS_MIB + workers * parse + figure
+
+
+def largest_cap_mib(*, limit_mib: int, workers: int, figure_cap_mib: int) -> int:
+    """The largest parse-worker ceiling that still fits ``limit_mib``."""
+    figure = figure_cap_mib - FIGURE_WORKER_NEVER_RESIDENT_MIB
+    return (limit_mib - MAIN_PROCESS_MIB - figure) // workers + PARSE_WORKER_NEVER_RESIDENT_MIB
+
+
+def _renderer() -> list[str] | None:
+    if shutil.which("kustomize"):
+        return ["kustomize", "build"]
+    if shutil.which("kubectl"):
+        return ["kubectl", "kustomize"]
+    return None
+
+
+def _render(overlay: Path) -> list[dict[str, Any]]:
+    command = _renderer()
+    if command is None:
+        pytest.skip("neither kustomize nor kubectl is installed — overlays cannot be rendered")
+    rendered = subprocess.run(  # noqa: S603 — fixed argv list, no shell
+        [*command, str(overlay)], capture_output=True, text=True, check=True, timeout=120
+    ).stdout
+    return [doc for doc in yaml.safe_load_all(rendered) if doc]
 
 
 def _quantity_mib(value: str) -> int:
@@ -57,52 +96,145 @@ def _quantity_mib(value: str) -> int:
     return int(int(value) / (1024 * 1024))  # plain bytes
 
 
-def _config(overlay: str) -> dict[str, str]:
-    data: dict[str, str] = {}
-    for path in (
-        _K8S / "base" / "configmap.yaml",
-        _K8S / "overlays" / overlay / "configmap-patch.yaml",
-    ):
-        for doc in yaml.safe_load_all(path.read_text()):
-            if doc and doc.get("kind") == "ConfigMap" and doc["metadata"]["name"] == _CONFIG_MAP:
-                data.update({key: str(value) for key, value in (doc.get("data") or {}).items()})
-    return data
-
-
-def _limit_mib() -> int:
-    doc: dict[str, Any] = yaml.safe_load(
-        (_K8S / "base" / "control-plane" / "deployment.yaml").read_text()
-    )
-    (container,) = [
-        c for c in doc["spec"]["template"]["spec"]["containers"] if c["name"] == "control-plane"
+def budget_of(docs: list[dict[str, Any]]) -> tuple[int, int, int, int]:
+    """``(workers, cap, figure cap, limit)`` (MiB) of the rendered manifests."""
+    (deployment,) = [
+        d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == _CONTAINER
     ]
-    return _quantity_mib(container["resources"]["limits"]["memory"])
+    (container,) = [
+        c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == _CONTAINER
+    ]
+    maps = {d["metadata"]["name"]: d.get("data") or {} for d in docs if d["kind"] == "ConfigMap"}
+    values: dict[str, str] = {}
+    for source in container.get("envFrom") or []:
+        name = (source.get("configMapRef") or {}).get("name")
+        values.update({k: str(v) for k, v in maps.get(name, {}).items()})
+    values.update({e["name"]: str(e["value"]) for e in container.get("env") or [] if "value" in e})
+    fields = Settings.model_fields
+    workers = int(values.get(_WORKERS, fields["knowledge_parse_workers"].default))
+    cap = int(values.get(_CAP, fields["knowledge_parse_worker_max_vm_mb"].default))
+    figure_cap = int(values.get(_FIGURE_CAP, fields["knowledge_figure_worker_max_vm_mb"].default))
+    limit = _quantity_mib(container["resources"]["limits"]["memory"])
+    return workers, cap, figure_cap, limit
 
 
-@pytest.mark.parametrize("overlay", ["test", "prod"])
-def test_the_worker_ceiling_fires_before_the_pod_limit(overlay: str) -> None:
-    config = _config(overlay)
-    default_workers = Settings.model_fields["knowledge_parse_workers"].default
-    workers = int(config.get("EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS", default_workers))
-    cap = int(config.get("EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB", "0"))
-    assert cap > WORKER_NEVER_RESIDENT_MIB, "no usable parse-worker memory ceiling is configured"
-    limit = _limit_mib()
-    needed = worst_case_mib(workers=workers, cap_mib=cap)
-    assert needed <= limit, (
-        f"{overlay}: {workers} parse workers + 1 figure worker at a {cap} MiB ceiling need up to "
-        f"{needed} MiB with the server, but the container may use {limit} MiB"
+def _problem(docs: list[dict[str, Any]]) -> str | None:
+    workers, cap, figure_cap, limit = budget_of(docs)
+    if cap <= PARSE_WORKER_NEVER_RESIDENT_MIB or figure_cap <= FIGURE_WORKER_NEVER_RESIDENT_MIB:
+        return "no usable worker memory ceiling is configured"
+    needed = worst_case_mib(workers=workers, cap_mib=cap, figure_cap_mib=figure_cap)
+    if needed <= limit:
+        return None
+    largest = largest_cap_mib(limit_mib=limit, workers=workers, figure_cap_mib=figure_cap)
+    return (
+        f"{workers} parse workers at {cap} MiB + the figure worker at {figure_cap} MiB need up to "
+        f"{needed} MiB with the server, but the container may use {limit} MiB "
+        f"(the largest parse-worker ceiling that fits is {largest} MiB)"
     )
+
+
+_OVERLAYS = sorted(path.parent for path in (_K8S / "overlays").glob("*/kustomization.yaml"))
+
+
+@pytest.mark.parametrize("overlay", _OVERLAYS, ids=[path.name for path in _OVERLAYS])
+def test_the_worker_ceilings_fire_before_the_pod_limit(overlay: Path) -> None:
+    problem = _problem(_render(overlay))
+    assert problem is None, f"{overlay.name}: {problem}"
+
+
+#: What the constants above were measured with (see module doc).
+_MEASURED_WITH = {"MALLOC_ARENA_MAX": "2", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"}
+
+
+@pytest.mark.parametrize("overlay", _OVERLAYS, ids=[path.name for path in _OVERLAYS])
+def test_the_pod_runs_as_the_constants_were_measured(overlay: Path) -> None:
+    (deployment,) = [
+        d
+        for d in _render(overlay)
+        if d["kind"] == "Deployment" and d["metadata"]["name"] == _CONTAINER
+    ]
+    (container,) = [
+        c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == _CONTAINER
+    ]
+    env = {e["name"]: str(e.get("value")) for e in container.get("env") or []}
+    assert {name: env.get(name) for name in _MEASURED_WITH} == _MEASURED_WITH
+
+
+def _container_patch(body: str) -> str:
+    return (
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: control-plane\n"
+        "spec:\n  template:\n    spec:\n      containers:\n        - name: control-plane\n" + body
+    )
+
+
+def _env_patch(**values: int) -> str:
+    listed = "".join(
+        f'            - name: {name}\n              value: "{value}"\n'
+        for name, value in values.items()
+    )
+    return _container_patch("          env:\n" + listed)
+
+
+def _prod_with(tmp_path: Path, patches: dict[str, str]) -> Path:
+    """A copy of the manifests whose prod overlay also applies ``patches``
+    (file name → patch document)."""
+    tree = tmp_path / "k8s"
+    shutil.copytree(_K8S, tree)
+    prod = tree / "overlays" / "prod"
+    for name, body in patches.items():
+        (prod / name).write_text(body)
+    listed = "".join(f"- path: {name}\n" for name in patches)
+    kustomization = prod / "kustomization.yaml"
+    text = kustomization.read_text()
+    assert text.count("patches:\n") == 1
+    kustomization.write_text(text.replace("patches:\n", f"patches:\n{listed}"))
+    return prod
+
+
+def test_an_overlay_lowering_the_pod_limit_is_caught(tmp_path: Path) -> None:
+    # Review round 5 (C, the reviewer's overlay): a patch setting the prod
+    # memory limit to 2Gi must fail the check — shown on a ceiling that fits
+    # the base limit, so only the patch can make it fail.
+    fitting = {"cap-patch.yaml": _env_patch(**{_CAP: 1500})}
+    assert _problem(_render(_prod_with(tmp_path / "fits", fitting))) is None
+    limit = _container_patch(
+        "          resources:\n            limits:\n              memory: 2Gi\n"
+    )
+    lowered = _render(_prod_with(tmp_path / "lowered", {**fitting, "memory-patch.yaml": limit}))
+    assert budget_of(lowered)[3] == 2048
+    assert _problem(lowered) is not None
+
+
+def test_the_config_map_and_a_container_env_override_are_both_read(tmp_path: Path) -> None:
+    config = (
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: control-plane-config\n"
+        f'data:\n  {_WORKERS}: "3"\n  {_CAP}: "1234"\n  {_FIGURE_CAP}: "777"\n'
+    )
+    from_map = _render(_prod_with(tmp_path / "map", {"config-patch.yaml": config}))
+    assert budget_of(from_map)[:3] == (3, 1234, 777)
+    overridden = _prod_with(
+        tmp_path / "env",
+        {
+            "config-patch.yaml": config,
+            "env-patch.yaml": _env_patch(**{_WORKERS: 4, _CAP: 9999, _FIGURE_CAP: 888}),
+        },
+    )
+    assert budget_of(_render(overridden))[:3] == (4, 9999, 888)
 
 
 @pytest.mark.parametrize(
-    ("limit_mib", "workers", "cap_mib", "fits"),
+    ("limit_mib", "workers", "cap_mib", "figure_cap_mib", "fits"),
     [
-        (4096, 2, 2400, True),  # shipped: about 300 MiB to spare
-        (4096, 2, 2550, True),  # option 1 as measured: 2 MiB to spare
-        (4096, 2, 2560, False),  # 18 MiB over
-        (2048, 2, 1800, False),  # option 2
-        (2048, 1, 1800, True),  # option 2b
+        (4096, 2, 2400, 1536, False),  # the 2026-10-22 choice: 1338 MiB over
+        (4096, 2, 1731, 1536, True),  # the largest ceiling that fits 4Gi
+        (4096, 2, 1732, 1536, False),
+        (4096, 1, 2400, 1536, True),  # one parse worker
+        (6144, 2, 2400, 1536, True),
+        (2048, 2, 1800, 1536, False),
     ],
 )
-def test_the_budget_arithmetic(limit_mib: int, workers: int, cap_mib: int, fits: bool) -> None:
-    assert (worst_case_mib(workers=workers, cap_mib=cap_mib) <= limit_mib) is fits
+def test_the_budget_arithmetic(
+    limit_mib: int, workers: int, cap_mib: int, figure_cap_mib: int, fits: bool
+) -> None:
+    needed = worst_case_mib(workers=workers, cap_mib=cap_mib, figure_cap_mib=figure_cap_mib)
+    assert (needed <= limit_mib) is fits

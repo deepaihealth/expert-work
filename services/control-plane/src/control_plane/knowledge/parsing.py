@@ -23,6 +23,7 @@ import pymupdf
 import pymupdf4llm
 from markitdown import MarkItDown, StreamInfo
 
+from control_plane.knowledge.office_docx import FIGURE_TOKEN, ConvertImage, docx_markdown
 from expert_work.protocol import IngestErrorCode
 
 #: Document extensions the knowledge pipeline accepts.
@@ -94,6 +95,19 @@ class MarkdownPicture:
     data: str = ""
 
 
+#: After ``](``: a Word picture's token (:mod:`~.office_docx`) — its id, or ``skipped``.
+_FIGURE_TOKEN_TAIL = re.compile(rf"{FIGURE_TOKEN}(?P<id>\d{{1,6}}|skipped)\)")
+
+
+def find_token_pictures(text: str) -> list[MarkdownPicture]:
+    """The Word pictures the converter left as tokens, in text order
+    (``data``: the picture's id, or ``skipped``)."""
+    return [
+        MarkdownPicture(start, match.end(), "", match.group("id"))
+        for start, match in _find_pictures(text, f"]({FIGURE_TOKEN}", _FIGURE_TOKEN_TAIL)
+    ]
+
+
 def find_data_uri_pictures(text: str) -> list[MarkdownPicture]:
     """The pictures MarkItDown kept inline as data URIs, in text order."""
     return [
@@ -135,6 +149,7 @@ def strip_picture_markup(text: str) -> str:
     pictures = [
         *(_find_pictures(text, "](data:", _TRUNCATED_URI_TAIL)),
         *(_find_pictures(text, "](", _SLIDE_PICTURE_TAIL)),
+        *(_find_pictures(text, f"]({FIGURE_TOKEN}", _FIGURE_TOKEN_TAIL)),
     ]
     parts: list[str] = []
     position = 0
@@ -275,17 +290,29 @@ def _strip_line_end(line: str) -> str:
     return body + tail if body and tail.strip(" ") == "" else body
 
 
-def office_markdown(raw: bytes, ext: str) -> str:
-    """MarkItDown's Markdown of a Word / slide file with its pictures inline
-    as data URIs (:func:`find_data_uri_pictures`) — the figure step's input,
-    used only when figures are described (each picture's bytes are expanded
-    into the text: the caller bounds them first).
+def office_markdown(raw: bytes, ext: str, *, docx_pictures: ConvertImage | None = None) -> str:
+    """MarkItDown's Markdown of a Word / slide file for the figure step: a
+    Word file's pictures as tokens ``docx_pictures`` hands out
+    (:func:`find_token_pictures`), a slide file's inline as data URIs
+    (:func:`find_data_uri_pictures` — the caller bounds them first).
 
     :raises DocumentParseError: MarkItDown cannot read the file."""
+    if ext == ".docx" and docx_pictures is not None:
+        return _parse_docx(raw, docx_pictures)
     return _parse_with_markitdown(raw, ext, keep_data_uris=True)
 
 
+def _parse_docx(raw: bytes, convert_image: ConvertImage | None = None) -> str:
+    try:
+        return docx_markdown(raw, convert_image) if convert_image else docx_markdown(raw)
+    except Exception as exc:
+        msg = f"MarkItDown parse failed: {exc}"
+        raise DocumentParseError(msg) from exc
+
+
 def _parse_with_markitdown(raw: bytes, ext: str, *, keep_data_uris: bool = False) -> str:
+    if ext == ".docx":  # pictures never read (no figure step here): office_docx
+        return _parse_docx(raw)
     # The bytes stay as they are; ``utf-8-sig`` also drops a leading BOM.
     utf8 = ext in _UTF8_HINTED_EXTENSIONS and _decode_utf8(raw) is not None
     info = StreamInfo(extension=ext, charset="utf-8-sig" if utf8 else None)

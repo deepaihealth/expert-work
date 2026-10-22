@@ -2096,6 +2096,7 @@ def create_app(
                     workers=resolved_settings.knowledge_parse_workers,
                     timeout_s=resolved_settings.knowledge_parse_timeout_s,
                     max_vm_mb=resolved_settings.knowledge_parse_worker_max_vm_mb,
+                    figure_max_vm_mb=resolved_settings.knowledge_figure_worker_max_vm_mb,
                 )
                 # B-209 — scanned PDF pages are read by the platform's
                 # recognition models; recognition and ingest embeddings are

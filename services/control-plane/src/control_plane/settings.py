@@ -533,6 +533,11 @@ class Settings(BaseSettings):
     #: threads); with ``MALLOC_ARENA_MAX=2`` it is ~1.65 GB, which would allow a
     #: much lower ceiling. The default leaves ~1.5 GB of headroom on the first.
     knowledge_parse_worker_max_vm_mb: int = Field(default=6144, ge=0)
+    #: B-209 PR-2 (review round 5) —— the figure worker's own ceiling (MiB; 0 =
+    #: none). It renders clips and pages at most 2,000 px on the long edge, so it
+    #: needs far less than a parse worker (a 59 MP picture peaks at ~1.04 GB of
+    #: address space) — see ``tools/deploy/test_parse_worker_memory_budget.py``.
+    knowledge_figure_worker_max_vm_mb: int = Field(default=1536, ge=0)
     #: B-209 PR-2 (review H5) —— how often original figures of deleted documents
     #: are swept from the object store (s3-compatible backend + SQL store only;
     #: the first pass waits one interval after start).

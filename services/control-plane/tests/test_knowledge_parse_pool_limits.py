@@ -110,7 +110,7 @@ def test_the_setting_reaches_both_pools_worker_initializers(
     monkeypatch.setattr(parse_workers, "ProcessPoolExecutor", _Pool)
     monkeypatch.setattr(ingestion, "_parse_executor", None)
     monkeypatch.setattr(FIGURE_POOL, "_executor", None)
-    ingestion.configure_parse_pool(workers=2, timeout_s=60, max_vm_mb=1536)
+    ingestion.configure_parse_pool(workers=2, timeout_s=60, max_vm_mb=2400, figure_max_vm_mb=1536)
     try:
         ingestion._get_parse_executor()
         FIGURE_POOL._get_executor()
@@ -121,8 +121,34 @@ def test_the_setting_reaches_both_pools_worker_initializers(
     main, figures = created
     for kwargs in (main, figures):
         assert kwargs["initializer"] is parse_workers.limit_worker_memory
-        assert kwargs["initargs"] == (1536 << 20,)
+    # Round 5 (B): the figure worker has its own, lower ceiling.
+    assert (main["initargs"], figures["initargs"]) == ((2400 << 20,), (1536 << 20,))
     assert (main["max_workers"], figures["max_workers"]) == (2, 1)
+
+
+async def test_the_lifespan_hands_both_ceilings_to_the_pools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from control_plane import app as app_module
+    from control_plane.settings import Settings
+    from tests.auth_fixtures import build_test_jwt_verifier
+
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(app_module, "configure_parse_pool", lambda **kwargs: seen.append(kwargs))
+    settings = Settings(
+        checkpointer_backend="memory",
+        knowledge_parse_worker_max_vm_mb=2222,
+        knowledge_figure_worker_max_vm_mb=1111,
+    )
+    app = app_module.create_app(
+        settings=settings,
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+        enable_scheduler=False,
+    )
+    async with app.router.lifespan_context(app):
+        pass
+    assert [(k["max_vm_mb"], k["figure_max_vm_mb"]) for k in seen] == [(2222, 1111)]
 
 
 @pytest.fixture

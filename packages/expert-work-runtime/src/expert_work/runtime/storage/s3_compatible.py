@@ -45,6 +45,30 @@ _BATCH_SHAPE_ERRORS = frozenset(
 )
 
 
+#: Error codes about the bucket / the service, not one key.
+_STORE_WIDE_ERRORS = frozenset(
+    {
+        "AccessDenied",
+        "AllAccessDisabled",
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "SlowDown",
+        "Throttling",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "InternalError",
+    }
+)
+
+
+def _store_wide(exc: Exception) -> bool:
+    """Whether a rejection is about the bucket / service, not one key."""
+    response = getattr(exc, "response", None) or {}
+    code = response.get("Error", {}).get("Code")
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0
+    return code in _STORE_WIDE_ERRORS or status >= 500 or status in (401, 403, 429)
+
+
 def add_content_md5(request: Any, **_: Any) -> None:
     """``before-sign`` handler for ``DeleteObjects``: Aliyun OSS requires a
     ``Content-MD5`` on a batch delete, and botocore (1.36+) sends only a CRC32
@@ -286,12 +310,17 @@ class S3CompatibleObjectStore:
             raise ObjectStoreError(msg)
 
     async def _delete_each(self, keys: Sequence[str]) -> list[str]:
-        """Delete ``keys`` one request each; the keys that failed."""
+        """Delete ``keys`` one request each; the keys that failed. An error that
+        is not about the one key (refused, throttled, the service failing)
+        raises at once — the rest would only fail the same way."""
         failed = []
         for key in keys:
             try:
-                await self.delete(key)
-            except ObjectStoreError:
+                await self._client.delete_object(Bucket=self._bucket, Key=key)
+            except self._client.exceptions.ClientError as exc:
+                if _store_wide(exc):
+                    msg = f"delete failed for key={key!r}: {exc}"
+                    raise ObjectStoreError(msg) from exc
                 failed.append(key)
         return failed
 

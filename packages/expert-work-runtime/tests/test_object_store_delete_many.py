@@ -31,8 +31,11 @@ async def test_memory_delete_many_removes_only_the_keys_given() -> None:
     assert await store.list_prefix("") == ["b/1"]
 
 
-def _client_error(operation: str, code: str = "InvalidDigest") -> ClientError:
-    return ClientError({"Error": {"Code": code, "Message": "no"}}, operation)
+def _client_error(operation: str, code: str = "InvalidDigest", status: int = 400) -> ClientError:
+    return ClientError(
+        {"Error": {"Code": code, "Message": "no"}, "ResponseMetadata": {"HTTPStatusCode": status}},
+        operation,
+    )
 
 
 class _FakeClient:
@@ -44,12 +47,14 @@ class _FakeClient:
         errors: list[dict[str, str]] | None = None,
         reject_batches: bool | str = False,
         reject_keys: frozenset[str] = frozenset(),
+        key_error: tuple[str, int] = ("InvalidObjectState", 400),
     ) -> None:
         self.batches: list[list[str]] = []
         self.single: list[str] = []
         self._errors = errors or []
         self._reject_batches = reject_batches
         self._reject_keys = reject_keys
+        self._key_error = key_error
 
     async def delete_objects(self, **kw: Any) -> dict[str, Any]:
         assert kw["Bucket"] == "bucket"
@@ -65,7 +70,7 @@ class _FakeClient:
 
     async def delete_object(self, **kw: Any) -> dict[str, Any]:
         if kw["Key"] in self._reject_keys:
-            raise _client_error("DeleteObject")
+            raise _client_error("DeleteObject", *self._key_error)
         self.single.append(kw["Key"])
         return {}
 
@@ -185,3 +190,17 @@ async def test_every_batch_is_sent_before_the_failures_are_raised() -> None:
     with pytest.raises(ObjectStoreError, match=r"2 keys \(first: 'k/0'\)"):
         await store.delete_many([f"k/{n}" for n in range(2_001)])
     assert [len(batch) for batch in client.batches] == [1000, 1000, 1]
+
+
+@pytest.mark.parametrize(
+    ("code", "status"), [("AccessDenied", 403), ("SlowDown", 503), ("Oops", 500)]
+)
+async def test_a_store_wide_error_stops_the_single_deletes_at_once(code: str, status: int) -> None:
+    # Round 5 (E): only per-key failures are collected.
+    client = _FakeClient(
+        reject_batches=True, reject_keys=frozenset({"k/1", "k/2"}), key_error=(code, status)
+    )
+    store = S3CompatibleObjectStore(client=client, bucket="bucket")
+    with pytest.raises(ObjectStoreError, match="k/1"):
+        await store.delete_many(["k/1", "k/2", "k/3"])
+    assert client.single == []

@@ -47,6 +47,18 @@ spec:
             # of the container being OOM-killed.
             - name: MALLOC_ARENA_MAX
               value: "2"
+            # B-209 PR-2 (review round 5) —— one thread per numeric library in
+            # every process (the pod has one CPU; the parse / figure workers
+            # would otherwise each start a pool per core): a parse worker's
+            # address space at its peak drops from ~2.4 GB to ~1.9 GB.
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OPENBLAS_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+            - name: NUMEXPR_NUM_THREADS
+              value: "1"
           # local_dev SecretStore dotenv vault (EXPERT_WORK_SECRET_STORE_ENV_FILE
           # in configmap.yaml) — resolves the object-store `secret://` refs.
           # Without this mount the file simply doesn't exist and every

@@ -279,3 +279,27 @@ async def test_chunk_lists_confirm_only_figures_the_document_holds(setup: _Setup
         await setup.other.get(f"/v1/knowledge/bases/kb/documents/{setup.other_document}/chunks")
     ).json()
     assert theirs["figure_ids"] == []
+
+
+async def test_a_miss_no_other_generation_holds_asks_no_chunk_query(
+    setup: _Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 5 (F): the chunk check runs only when another generation holds
+    # the figure — one listing of the document's prefix decides.
+    asked: list[str] = []
+    real = setup.store.chunks_contain
+
+    async def counting(**kwargs: object) -> bool:
+        asked.append("asked")
+        return await real(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(setup.store, "chunks_contain", counting)
+    unknown = "fedcba9876543210"
+    assert (await setup.client.get(setup.url(setup.document, unknown))).status_code == 404
+    assert asked == []
+    await _serve_chunk_naming(setup, _ID)
+    await setup.store.upsert_document(
+        tenant_id=_TENANT, kb_id=setup.kb, filename="manual.docx", content=b"v2", force=True
+    )
+    assert (await setup.client.get(setup.url(setup.document))).status_code == 200
+    assert asked == ["asked"]

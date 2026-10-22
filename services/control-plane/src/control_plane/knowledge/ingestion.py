@@ -144,16 +144,16 @@ def failure_code(exc: BaseException) -> IngestErrorCode:
     return tagged if isinstance(tagged, IngestErrorCode) else IngestErrorCode.INTERNAL_ERROR
 
 
-def configure_parse_pool(*, workers: int, timeout_s: float, max_vm_mb: int = 0) -> None:
-    """Set the parse pool's size, per-document timeout and per-worker address
-    space ceiling (lifespan wiring). Takes effect for the next pool creation;
-    call before the first ingest."""
+def configure_parse_pool(
+    *, workers: int, timeout_s: float, max_vm_mb: int = 0, figure_max_vm_mb: int = 0
+) -> None:
+    """Pool size, parse timeout, parse / figure worker VM ceilings (before the first ingest)."""
     global _parse_workers, _parse_timeout_s, _parse_slots, _parse_worker_max_vm_bytes
     _parse_workers = max(1, workers)
     _parse_timeout_s = timeout_s
     _parse_worker_max_vm_bytes = max(0, max_vm_mb) * 1024 * 1024
     _parse_slots = None
-    FIGURE_POOL.configure(workers=FIGURE_POOL_WORKERS, max_vm_bytes=_parse_worker_max_vm_bytes)
+    FIGURE_POOL.configure(workers=FIGURE_POOL_WORKERS, max_vm_bytes=max(0, figure_max_vm_mb) << 20)
 
 
 def shutdown_parse_pool(*, kill: bool = False) -> None:

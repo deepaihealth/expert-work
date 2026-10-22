@@ -95,19 +95,22 @@ def build_knowledge_figures_router() -> APIRouter:
             generation=document.ingest_generation,
         )
         if image is None:
-            async with applied_scope(scope):
-                named = await chunks_name_figure(
-                    store, tenant_id=scope.tenant_id, document_id=document.id, figure=figure_id
-                )
-            if named:
-                image = await storage.get(
-                    tenant_id=scope.tenant_id,
-                    kb_id=base.id,
-                    document_id=document.id,
-                    figure=figure_id,
-                    generation=document.ingest_generation,
-                    any_generation=True,
-                )
+            # Only when another generation holds it (one listing of this
+            # document's prefix) are the chunks asked whether they still name
+            # it — a miss on a figure no generation holds costs no query.
+            other = await storage.other_generation_key(
+                tenant_id=scope.tenant_id,
+                kb_id=base.id,
+                document_id=document.id,
+                figure=figure_id,
+                generation=document.ingest_generation,
+            )
+            if other is not None:
+                async with applied_scope(scope):
+                    named = await chunks_name_figure(
+                        store, tenant_id=scope.tenant_id, document_id=document.id, figure=figure_id
+                    )
+                image = await storage.read(other) if named else None
         if image is None:
             raise HTTPException(status_code=404, detail=_NOT_FOUND)
         return Response(content=image, media_type=FIGURE_CONTENT_TYPE, headers=headers)

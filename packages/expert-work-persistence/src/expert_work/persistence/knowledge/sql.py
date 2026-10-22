@@ -1542,8 +1542,9 @@ class SqlKnowledgeStore(KnowledgeStore):
         return [_to_chunk(row) for row in rows], int(total)
 
     async def chunks_contain(self, *, tenant_id: UUID, document_id: UUID, text: str) -> bool:
-        # One query on the document's chunks (the (tenant, document) index
-        # narrows them), not a page-by-page read into the application.
+        # One query on the document's chunks (``knowledge_chunk_document_idx``
+        # on ``document_id`` narrows them), not a page-by-page read into the
+        # application.
         stmt = select(
             select(KnowledgeChunkRow.id)
             .where(

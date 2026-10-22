@@ -110,6 +110,9 @@ data:
   # limit in control-plane/deployment.yaml — change the two together;
   # tools/deploy/test_parse_worker_memory_budget.py checks them.
   EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB: "2400"
+  # The figure worker's own ceiling: it renders clips and pages at most
+  # 2,000 px long (a 59 MP picture peaks at ~1.04 GB of address space).
+  EXPERT_WORK_KNOWLEDGE_FIGURE_WORKER_MAX_VM_MB: "1536"
 
   # --------------------------------------------------------------- keycloak
   EXPERT_WORK_KEYCLOAK_ENABLED: "false"
