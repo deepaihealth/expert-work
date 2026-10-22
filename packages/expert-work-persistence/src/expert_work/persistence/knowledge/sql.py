@@ -1354,6 +1354,17 @@ class SqlKnowledgeStore(KnowledgeStore):
             ).all()
         return {str(digest): int(count) for digest, count in rows}
 
+    async def sees_every_tenant(self) -> bool:
+        # Row security that applies to this connection's role filters the rows
+        # by tenant (bypassing it application-side only skips the tenant
+        # setting — the policy then shows nothing). Postgres says whether it
+        # applies: superuser, BYPASSRLS, an owner without FORCE, or RLS off.
+        async with self._sf() as session:
+            active = (
+                await session.execute(text("SELECT row_security_active('knowledge_document')"))
+            ).scalar_one()
+        return active is False
+
     async def existing_document_ids(self, *, document_ids: Sequence[UUID]) -> set[UUID]:
         if not document_ids:
             return set()

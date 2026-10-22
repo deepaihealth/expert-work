@@ -193,7 +193,7 @@ class KnowledgeIngestRecoveryWorker:
             )
             _failed_terminal.inc()
             return True
-        ready = False
+        ready = written = False
         try:
             chunk_count = await ingest_document_bytes(
                 store=self._store,
@@ -210,6 +210,7 @@ class KnowledgeIngestRecoveryWorker:
                 usage=self._usage,
                 figures=self._figures,
             )
+            written = True  # this claim's chunks are in place
             settled = await self._store.set_document_status(
                 tenant_id=claim.tenant_id,
                 document_id=claim.document_id,
@@ -270,7 +271,7 @@ class KnowledgeIngestRecoveryWorker:
         finally:
             if self._figures is not None:
                 # B-209 PR-2 (review H5): same tidy-up as the fast path.
-                await self._figures.tidy(claim, settled=ready)
+                await self._figures.tidy(claim, settled=ready, serving=written)
         _recovered.inc()
         return True
 

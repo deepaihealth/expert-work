@@ -211,13 +211,15 @@ class FigureDescriber:
     def storage(self) -> FigureStorage | None:
         return self._storage
 
-    async def tidy(self, claim: ClaimedIngestion, *, settled: bool) -> None:
+    async def tidy(self, claim: ClaimedIngestion, *, settled: bool, serving: bool = False) -> None:
         """After an ingest ends (review H5): settled READY → the document's
         originals of earlier generations go; not settled → what this
         generation wrote goes, unless the same generation is still being
-        ingested (another worker took the lease) or served. Best effort: the
-        reconciler removes whatever a failure here leaves."""
-        if self._storage is None:
+        ingested (another worker took the lease) or served — ``serving``:
+        this claim's chunks were written (whatever became of the status write
+        after, re-review L1), and they name this generation's originals. Best
+        effort: the reconciler removes whatever a failure here leaves."""
+        if self._storage is None or (serving and not settled):
             return
         where = {
             "tenant_id": claim.tenant_id,

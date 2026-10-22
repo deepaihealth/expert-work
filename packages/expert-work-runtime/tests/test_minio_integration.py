@@ -141,3 +141,19 @@ async def test_put_stream_multipart_round_trip(store: ObjectStore) -> None:
 
     await small_parts.put_stream("stream/big.bin", _chunks(), content_type="application/gzip")
     assert await store.get("stream/big.bin") == payload
+
+
+@pytest.mark.asyncio
+async def test_delete_many_and_listing_with_times(store: ObjectStore) -> None:
+    """B-209 PR-2: a real ``DeleteObjects`` (signed Content-MD5 added by the
+    factory's client) and the listing the figure reconciler ages keys by."""
+    assert isinstance(store, S3CompatibleObjectStore)
+    keys = [f"batch-delete/{n}.bin" for n in range(3)]
+    for key in keys:
+        await store.put(key, b"x")
+    listed = await store.list_prefix_modified("batch-delete/")
+    assert [key for key, _ in listed] == keys
+    assert all(modified.tzinfo is not None for _, modified in listed)
+    await store.delete_many([*keys[:2], "batch-delete/missing.bin"])
+    assert await store.list_prefix("batch-delete/") == keys[2:]
+    await store.delete_many(keys[2:])

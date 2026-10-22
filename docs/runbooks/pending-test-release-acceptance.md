@@ -787,7 +787,7 @@ PY
 
 ## §44 B-209 PR-2 文档内图片:描述成文字插回原位 + 原图显示 + 计费(ROADMAP B-209)
 
-**背景**:PDF 文字页的插图、扫描页上识别模型报出的图片区域、Word / 幻灯片里的图片,先过滤(任一边 < 80 px、占 PDF 页面 < 1%、压缩后 < 10 KB、同一文档 ≥ 3 页 / ≥ 3 次出现、同租户 ≥ 3 份文档出现、每份最多 50 张按面积留),再由平台「文档识别」里的图片描述模型(默认 qwen3.8-flash;兜底 = 兜底识别模型,只在配了图片描述模型时才顶上)「先观察再描述」;没配图片描述模型(或它的 key 不可用)时整个图片步骤不跑,文档按改前的样子入库;文字大段的再走识别模型拿图中文字、图表再转成数据;短边 < 400 px 的只描述不抄字。描述以引用块 `> 〔图 <16 位 id>〕描述` 插回原位(不挪到页尾),进切块 / 检索;原图(规整后的 JPEG)存对象存储 `knowledge_figures/{租户}/{库}/{文档}/g{入库代}/{id}.jpg`(入库收尾删掉更早的代;文档行没了的原图由每小时一次的对账任务删),分段预览只给服务端确认属于该文档的图显示缩略图。超大图片(像素 > 6000 万、Office 内单个媒体 > 40 MiB)不解码,计为「不支持」;解析进程有地址空间上限(`EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB`,默认 6144,Linux 才生效),超了只让这份文档解析失败。缓存按文档(`knowledge_parse_cache` 的 `figure_desc` / `figure_ocr`),每次调用按租户记 `knowledge_ingest`。迁移 0170(`knowledge_document.figure_stats` / `figure_hashes`)。改前:PDF 插图整张消失;Word 图片变成 `![](data:image/png;base64...)` 占位符混进正文;纯图片的 Word / PPT「成功」入库成一段占位符垃圾段。
+**背景**:PDF 文字页的插图、扫描页上识别模型报出的图片区域、Word / 幻灯片里的图片,先过滤(任一边 < 80 px、占 PDF 页面 < 1%、压缩后 < 10 KB、同一文档 ≥ 3 页 / ≥ 3 次出现、同租户 ≥ 3 份文档出现、每份最多 50 张按面积留),再由平台「文档识别」里的图片描述模型(默认 qwen3.8-flash;兜底 = 兜底识别模型,只在配了图片描述模型时才顶上)「先观察再描述」;没配图片描述模型(或它的 key 不可用)时整个图片步骤不跑,文档按改前的样子入库;文字大段的再走识别模型拿图中文字、图表再转成数据;短边 < 400 px 的只描述不抄字。描述以引用块 `> 〔图 <16 位 id>〕描述` 插回原位(不挪到页尾),进切块 / 检索;原图(规整后的 JPEG)存对象存储 `knowledge_figures/{租户}/{库}/{文档}/g{入库代}/{id}.jpg`(入库收尾删掉更早的代;文档行没了的原图由对账任务找出 —— 默认只记日志和指标,`EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_DELETE=true` 才删;只跟 SQL 库一起跑,先证明这次查询看得到所有租户、库里查不到任何文档或过半孤儿就放弃、只动一天前写的原图、每轮最多删 1000 个、启动后等一个周期才跑第一轮),分段预览只给服务端确认属于该文档的图显示缩略图。超大图片(像素 > 6000 万、Office 内单个媒体 > 40 MiB)不解码,计为「不支持」;解析进程有地址空间上限(`EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB`,默认 6144,Linux 才生效;控制面 pod 设了 `MALLOC_ARENA_MAX=2`),超了的图片跳过(计「不支持」),别的分配超了只让这份文档解析失败;插图收集 / 裁图在自己的单进程池里跑,它超时只杀它自己。缓存按文档(`knowledge_parse_cache` 的 `figure_desc` / `figure_ocr`),每次调用按租户记 `knowledge_ingest`。迁移 0170(`knowledge_document.figure_stats` / `figure_hashes`)。改前:PDF 插图整张消失;Word 图片变成 `![](data:image/png;base64...)` 占位符混进正文;纯图片的 Word / PPT「成功」入库成一段占位符垃圾段。
 
 **怎么进**:测试环境控制台用 **system_admin** 登录(平台租户);数据库只读查询走测试库;平台设置「文档识别」保持默认(glm-ocr / qwen3.7-flash / qwen3.8-flash)。**测试文件(零租户内容,本机生成)**:
 
@@ -839,7 +839,7 @@ PY
 - [ ] **44.11 删文档 / 删库即删原图**:记下 44.4 的原图 URL,删掉 44.2 的文档。判据:同一 URL 回 404;对象存储里 `knowledge_figures/{平台租户}/{库 id}/{文档 id}/` 前缀为空(运维侧列桶)。删整个临时库后,`knowledge_figures/{平台租户}/{库 id}/` 前缀为空。
 - [ ] **44.12 WMF / EMF 图片计数不报错**(可选,有带 WMF 的 PPT 时):判据:文档 ready,`figure_stats.unsupported` 计数 ≥ 1,其余图片照常描述。镜像里没有 WMF / EMF 栅格化工具,这类图跳过不描述(已知限制)。
 - [ ] **44.13 换图重传只留新一代原图**:把 44.3 的 `b209-picture.docx` 换一张图(`picture_docx(photo(seed=9), before=..., after=...)`)同名重传。判据:ready 后 `knowledge_figures/{平台租户}/{库 id}/{文档 id}/` 下只有 `g{新代}/` 一个目录、一张图;分段预览缩略图是新图。**没修好时**:旧图留在桶里(文档删了也只删得掉当前代)。
-- [ ] **44.14 对账任务删孤儿原图**:运维侧往桶里放一个 `knowledge_figures/{平台租户}/{随机 uuid}/{随机 uuid}/g0/0123456789abcdef.jpg`。判据:一小时内(`EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_INTERVAL_S`,默认 3600)这个键被删,日志 `knowledge.figure_orphans_deleted count=1`,指标 `expert_work_knowledge_figure_orphans_deleted_total` +1;桶里其他前缀不动。
+- [ ] **44.14 对账任务:默认只演练、查询可信才动**:① 发版后一个周期(`EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_INTERVAL_S`,默认 3600)内,日志里**没有** `knowledge.figure_reconcile_aborted`(有的话看 `reason`:`rls_not_bypassed` = 连接受行级安全约束、`no_documents_found` / `orphan_share` = 库和桶对不上),指标 `expert_work_knowledge_figure_orphans` 出现(值 0 或 N)。② 运维侧往桶里放一个 `knowledge_figures/{平台租户}/{随机 uuid}/{随机 uuid}/g0/0123456789abcdef.jpg`;**一天后**(只动 24 小时前写的)的下一轮:日志 `knowledge.figure_orphans_found count=1 dry_run=true`,这个键**还在**。③ 只有决定打开删除时:设 `EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_DELETE=true` 重启,下一轮这个键被删,日志 `knowledge.figure_orphans_deleted count=1 remaining=0`,指标 `expert_work_knowledge_figure_orphans_deleted_total` +1;桶里其他前缀不动。
 - [ ] **44.15 超大图片不解码、不拖垮 pod**:本机生成两份(都很小,压缩率高):
 
 ```bash
@@ -864,7 +864,28 @@ open("/tmp/b209-media-bomb.docx", "wb").write(dst.getvalue())
 PY
 ```
 
-  上传两份。判据:都 ready、文字(`HUGE-PICTURE-MARKER` / `BOMB-BEFORE-MARKER`)在;`figure_stats.unsupported=1`、`described=0`;控制面 pod 没有重启(`kubectl get pod` 的 RESTARTS 不变)。**顺带**:`kubectl exec` 进控制面 pod,对解析子进程 `grep "Max address space" /proc/<pid>/limits` 为 `6442450944`(默认 6144 MiB)。
+  上传两份。判据:都 ready、文字(`HUGE-PICTURE-MARKER` / `BOMB-BEFORE-MARKER`)在;`figure_stats.unsupported=1`、`described=0`;控制面 pod 没有重启(`kubectl get pod` 的 RESTARTS 不变,`kubectl describe pod` 的 Last State 没有 `OOMKilled`)。**顺带**:`kubectl exec` 进控制面 pod,`cat /proc/1/environ | tr '\0' '\n' | grep MALLOC_ARENA_MAX` 为 `2`;对解析子进程 `grep "Max address space" /proc/<pid>/limits` 为所配上限(默认 6144 MiB = `6442450944`)。
+- [ ] **44.16 内存上限只让一份文档失败,不让 pod 重启**(临时把 `EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB` 设成 `1800` 重启;测完改回):本机生成一份解压后约 110 MB 文字的 Word(压缩后约 0.5 MB)和一份 4800 万像素照片的 Word:
+
+```bash
+uv run --no-sync python - <<'PY'
+import io, sys, zipfile
+from PIL import Image, ImageFilter
+sys.path.insert(0, "services/control-plane")
+from tests.knowledge_form_fixtures import _docx, _docx_paragraph, picture_docx
+line = "MEMORY-GUARD-MARKER ordinary words of a long manual paragraph " * 14
+src = zipfile.ZipFile(io.BytesIO(_docx("".join(_docx_paragraph(line, None) for _ in range(120_000))))); dst = io.BytesIO()
+with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+    for item in src.infolist(): z.writestr(item.filename, src.read(item))
+open("/tmp/b209-bigtext.docx", "wb").write(dst.getvalue())
+small = Image.effect_noise((1000, 750), 60).convert("RGB").filter(ImageFilter.GaussianBlur(4))
+photo = Image.blend(small.resize((8000, 6000)), Image.effect_noise((8000, 6000), 12).convert("RGB"), 0.25)
+out = io.BytesIO(); photo.save(out, "JPEG", quality=90)
+open("/tmp/b209-photo48.docx", "wb").write(picture_docx(out.getvalue(), before="PHOTO-MARKER " * 20))
+PY
+```
+
+  先传 `b209-photo48.docx`。判据:ready、`PHOTO-MARKER` 在、`figure_stats.unsupported=1`(这张图超了上限被跳过),控制面日志有 `knowledge.figure_out_of_memory`。再传 `b209-bigtext.docx`,同时另传一份普通文档。判据:`b209-bigtext.docx` FAILED,`error` 是 `needs more memory than a parse may use` **或** `A process in the process pool was terminated abruptly`(本机实测:C 扩展里分配失败时子进程直接退出,表现为后者;解析池会重建、重试一次);那份普通文档 ready;RESTARTS 不变、没有 `OOMKilled`。测完把上限改回原值。
 
 ## §45 B-206 第 1 步续:K-6 工具说明(#1901)+ K-7a 重排限速 / 重试 / 结果状态
 

@@ -11,10 +11,13 @@
 单文档的过滤(§5.4 第 1~4 道)在这里做:没过的图不带字节出进程,只计数。先只看图片头里的尺寸
 和字节数筛、按面积留一个短名单,只解码短名单里的图。
 
-**内存上限**(安全复核 S-H2):``keep_data_uris`` 会把每张图的字节以 base64 展开进正文。交给
-MarkItDown 之前先看压缩包里每个图片条目声明的解压后大小:单张超过 :data:`MAX_IMAGE_BYTES`、
-或合计超过 :data:`MAX_OFFICE_MEDIA_BYTES`(从最大的开始)的,换成一个 1 像素的替身,计作
-``unsupported``。压缩包条目声明的大小就是读出来的上限(``zipfile`` 读到声明的长度为止并校验)。
+**内存上限**(安全复核 S-H2,二轮复核 M1):``keep_data_uris`` 会把每张图的字节以 base64 展开进
+正文,而关系文件可以把图片指到压缩包里任何位置。所以交给 MarkItDown 之前,按压缩包里**每个**
+不是 ``.xml`` / ``.rels`` 的条目声明的解压后大小(不看目录)限额:单个超过 :data:`MAX_IMAGE_BYTES`、
+或合计超过 :data:`MAX_OFFICE_MEDIA_BYTES`(从最大的开始)的,换成一个 1 像素的替身(图片计作
+``unsupported``);整个包声明的解压后大小超过 :data:`MAX_OFFICE_PACKAGE_BYTES` 的,这份文档直接
+解析失败。改写时逐条流式拷贝,不把别的条目整个读进内存。压缩包条目声明的大小就是读出来的上限
+(``zipfile`` 读到声明的长度为止并校验)。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import base64
 import binascii
 import hashlib
 import io
+import shutil
 import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -30,6 +34,7 @@ from dataclasses import dataclass, replace
 from PIL import Image
 
 from control_plane.knowledge.parsing import (
+    DocumentParseError,
     find_data_uri_pictures,
     office_markdown,
     scrub_data_uris,
@@ -49,8 +54,19 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 #: The pictures of one Word / slide file read at most this much together
 #: (the largest are left out first) — they are base64-expanded in memory.
 MAX_OFFICE_MEDIA_BYTES = 40 * 1024 * 1024
-#: Where a Word / slide package keeps its pictures.
-_MEDIA_DIRS = ("word/media/", "ppt/media/")
+#: A Word / slide package that unpacks to more than this is not read at all
+#: (uploads are capped at 25 MB; a real file of pictures and text stays far
+#: below — past this is a zip bomb).
+MAX_OFFICE_PACKAGE_BYTES = 256 * 1024 * 1024
+#: Package parts that are markup, never pictures.
+_MARKUP_SUFFIXES = (".xml", ".rels")
+#: Picture file types (a replaced part of another type is not a picture).
+_PICTURE_SUFFIXES = (
+    *(".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico"),
+    *(".emf", ".wmf", ".svg"),
+)
+#: Bytes per read while copying a package part.
+_COPY_CHUNK = 1024 * 1024
 
 
 def _stand_in() -> bytes:
@@ -162,18 +178,29 @@ def parse_office_figures(raw: bytes, ext: str) -> OfficeParse:
 
 
 def bound_office_media(raw: bytes) -> tuple[bytes, int]:
-    """``raw`` with every picture over the limits (see module doc) replaced
-    by a 1-pixel stand-in, and how many were replaced. A file that is not a
-    readable zip is returned as it is (MarkItDown reports it)."""
+    """``raw`` with every non-markup part over the limits (see module doc)
+    replaced by a 1-pixel stand-in, and how many pictures were replaced. A
+    file that is not a readable zip is returned as it is (MarkItDown reports
+    it).
+
+    :raises DocumentParseError: the package unpacks past
+        :data:`MAX_OFFICE_PACKAGE_BYTES`."""
     try:
         package = zipfile.ZipFile(io.BytesIO(raw))
         entries = package.infolist()
     except (zipfile.BadZipFile, ValueError):
         return raw, 0
-    media = [entry for entry in entries if entry.filename.startswith(_MEDIA_DIRS)]
-    over = {entry.filename for entry in media if entry.file_size > MAX_IMAGE_BYTES}
-    total = sum(entry.file_size for entry in media if entry.filename not in over)
-    for entry in sorted(media, key=lambda e: -e.file_size):
+    if sum(entry.file_size for entry in entries) > MAX_OFFICE_PACKAGE_BYTES:
+        msg = "the file unpacks to more than a document may (a zip bomb?)"
+        raise DocumentParseError(msg)
+    parts = [
+        entry
+        for entry in entries
+        if not entry.is_dir() and not entry.filename.lower().endswith(_MARKUP_SUFFIXES)
+    ]
+    over = {entry.filename for entry in parts if entry.file_size > MAX_IMAGE_BYTES}
+    total = sum(entry.file_size for entry in parts if entry.filename not in over)
+    for entry in sorted(parts, key=lambda e: -e.file_size):
         if total <= MAX_OFFICE_MEDIA_BYTES:
             break
         if entry.filename not in over:
@@ -184,9 +211,15 @@ def bound_office_media(raw: bytes) -> tuple[bytes, int]:
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w") as bounded:
         for entry in entries:
-            data = _STAND_IN if entry.filename in over else package.read(entry)
-            bounded.writestr(entry, data, compress_type=entry.compress_type)
-    return out.getvalue(), len(over)
+            copy = zipfile.ZipInfo(entry.filename, entry.date_time)
+            copy.compress_type, copy.external_attr = entry.compress_type, entry.external_attr
+            if entry.filename in over:
+                bounded.writestr(copy, _STAND_IN)
+                continue
+            with package.open(entry) as source, bounded.open(copy, "w") as target:
+                shutil.copyfileobj(source, target, _COPY_CHUNK)
+    pictures = sum(1 for name in over if name.lower().endswith(_PICTURE_SUFFIXES))
+    return out.getvalue(), pictures
 
 
 def _office_candidates(

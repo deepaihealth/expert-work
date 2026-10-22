@@ -537,6 +537,12 @@ class KnowledgeStore(abc.ABC):
         """Which of ``document_ids`` still have a document row, whatever the
         tenant — the figure reconciler's check (run with RLS bypassed)."""
 
+    async def sees_every_tenant(self) -> bool:
+        """Whether a lookup made here (with RLS bypassed) is proven to see
+        every tenant's documents — only then may "no such document" be
+        trusted to delete anything. A store that cannot prove it says no."""
+        return False
+
     # -- recognition cache (B-209 §5.5) -------------------------------------
 
     @abc.abstractmethod

@@ -548,6 +548,34 @@ async def test_a_failed_ingest_drops_only_what_it_stored(path: str) -> None:
     assert await _generations(pipeline) == {"g0"}
 
 
+class _ReadyWriteFails(InMemoryKnowledgeStore):
+    """The READY write fails (a database blip) after the chunks are written."""
+
+    async def set_document_status(self, **kwargs: Any) -> bool:
+        if kwargs.get("status") is DocumentStatus.READY:
+            raise ConnectionError("database blip")
+        return await super().set_document_status(**kwargs)
+
+
+@pytest.mark.parametrize("path", ["runner", "recovery"])
+async def test_originals_of_written_chunks_stay_when_the_ready_write_fails(path: str) -> None:
+    # Re-review L1: the document ends FAILED, but this claim's chunks are the
+    # ones served — and they name this generation's originals.
+    store = _ReadyWriteFails()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    raw = picture_docx(noise_png(640, 480))
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=base.id, filename="a.docx", content=raw
+    )
+    doc = _Doc(store, tenant, base.id, document.id, "a.docx", raw)
+    pipeline = _pipeline(store)
+    await _drive(doc, pipeline, path, FakeEmbedder())
+    fetched = await store.get_document(tenant_id=tenant, document_id=document.id)
+    assert fetched is not None and fetched.status is DocumentStatus.FAILED
+    assert await _generations(pipeline) == {"g0"}
+
+
 async def test_figures_are_described_in_the_documents_language() -> None:
     raw = picture_docx(
         noise_png(640, 480),

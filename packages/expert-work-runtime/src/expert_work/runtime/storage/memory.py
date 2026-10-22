@@ -27,6 +27,7 @@ class _StoredObject:
     # not locked. The pair always moves together.
     retain_until: datetime | None = None
     lock_mode: LockMode | None = None
+    modified_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryObjectStore:
@@ -96,6 +97,14 @@ class InMemoryObjectStore:
 
     async def list_prefix(self, prefix: str) -> list[str]:
         return sorted(k for k in self._objects if k.startswith(prefix))
+
+    async def list_prefix_modified(self, prefix: str) -> list[tuple[str, datetime]]:
+        """``(key, last modified)`` of every object under ``prefix``, by key."""
+        return sorted(
+            (key, record.modified_at)
+            for key, record in self._objects.items()
+            if key.startswith(prefix)
+        )
 
     async def presigned_url(
         self,

@@ -33,17 +33,23 @@ import functools
 import hashlib
 import logging
 import multiprocessing
-import sys
+import weakref
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import httpx
 
 from control_plane.knowledge.chunking import chunk_markdown_semantic
+from control_plane.knowledge.parse_workers import (
+    FIGURE_POOL,
+    FIGURE_POOL_WORKERS,
+    PoolBudget,
+    limit_worker_memory,
+    terminate_workers,
+)
 from control_plane.knowledge.parsing import (
     DocumentParseError,
     is_plain_text_file,
@@ -105,6 +111,10 @@ _parse_timeout_s: float = 600.0
 _parse_worker_max_vm_bytes = 0
 #: B-209 PR-2 (review H3) —— the figure collection's share of a document's parse budget.
 FIGURE_POOL_SHARE = 0.25
+#: Parse pools killed for a timeout: a parse broken by one is a sibling's victim.
+_killed_pools: weakref.WeakSet[Executor] = weakref.WeakSet()
+#: Retries such a victim gets on top of its own two attempts.
+_MAX_SPARED = 3
 
 # Patched by tests so backoff does not actually sleep.
 _sleep = asyncio.sleep
@@ -143,42 +153,24 @@ def configure_parse_pool(*, workers: int, timeout_s: float, max_vm_mb: int = 0) 
     _parse_timeout_s = timeout_s
     _parse_worker_max_vm_bytes = max(0, max_vm_mb) * 1024 * 1024
     _parse_slots = None
-
-
-def _on_linux() -> bool:
-    return sys.platform.startswith("linux")
-
-
-def limit_worker_memory(max_bytes: int) -> None:
-    """Parse-pool worker initializer (security review S-M1): cap the worker's
-    address space (``RLIMIT_AS``) so a document that needs too much memory
-    fails its own parse with ``MemoryError`` instead of the kernel killing the
-    pod. Linux only (macOS does not enforce it); ``0`` = no cap; never raises
-    an existing hard limit."""
-    if max_bytes <= 0 or not _on_linux():
-        return
-    try:
-        import resource
-    except ImportError:  # pragma: no cover - not POSIX
-        return
-    _, hard = resource.getrlimit(resource.RLIMIT_AS)
-    cap = max_bytes if hard == resource.RLIM_INFINITY else min(max_bytes, hard)
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
-    except (ValueError, OSError):
-        logger.warning("knowledge.parse_worker_memory_limit_failed", exc_info=True)
+    FIGURE_POOL.configure(workers=FIGURE_POOL_WORKERS, max_vm_bytes=_parse_worker_max_vm_bytes)
 
 
 def shutdown_parse_pool(*, kill: bool = False) -> None:
-    """Tear down the process pool (lifespan shutdown / tests / recovery from a
-    broken or wedged pool). ``kill`` terminates the worker processes — the
-    only way to free a worker stuck in a parse that timed out."""
+    """Tear down the parse pool and the figure pool (lifespan shutdown / tests)."""
+    _shutdown_executor(kill=kill)
+    FIGURE_POOL.shutdown(kill=kill)
+
+
+def _shutdown_executor(*, kill: bool) -> None:
+    """Drop the parse pool; ``kill`` terminates its workers — the only way to
+    free a worker stuck in a parse that timed out."""
     global _parse_executor
     executor, _parse_executor = _parse_executor, None
     if executor is None:
         return
     if kill:
-        _terminate_workers(executor)
+        terminate_workers(executor)
     executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -189,19 +181,7 @@ def _discard_parse_pool(executor: Executor) -> None:
     replacement, which would break the parses already resubmitted to it
     (B-184: one dead worker failed several documents for good)."""
     if _parse_executor is executor:
-        shutdown_parse_pool(kill=True)
-
-
-def _terminate_workers(executor: Executor) -> None:
-    # ``ProcessPoolExecutor`` has no public kill; its ``_processes`` map is
-    # the stable-enough way to reach the workers (guarded: a thread pool or a
-    # test double has none).
-    processes = getattr(executor, "_processes", None) or {}
-    for process in list(processes.values()):
-        try:
-            process.terminate()
-        except Exception:  # pragma: no cover - best effort
-            logger.warning("knowledge.parse_pool_terminate_failed", exc_info=True)
+        _shutdown_executor(kill=True)
 
 
 def _get_parse_executor() -> Executor:
@@ -243,31 +223,17 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
     return await _in_parse_pool(filename, parse_document, filename, raw)
 
 
-@dataclass
-class _PoolBudget:
-    """B-209 (review M2) —— one parse-pool time budget per document: page
-    analysis plus every render batch share :data:`_parse_timeout_s`, as the
-    single ``parse_document`` call did before. Time queued for a slot is not
-    charged. A sub-budget (``parent`` set) also spends its parent's."""
-
-    remaining: float
-    parent: _PoolBudget | None = None
-
-    def charge(self, seconds: float) -> None:
-        self.remaining -= seconds
-        if self.parent is not None:
-            self.parent.charge(seconds)
-
-
 async def _in_parse_pool[T](
-    filename: str, fn: Callable[..., T], *args: object, budget: _PoolBudget | None = None
+    filename: str, fn: Callable[..., T], *args: object, budget: PoolBudget | None = None
 ) -> T:
     """``fn(*args)`` in the parse pool, with :func:`parse_document_in_pool`'s
     slot, timeout and broken-pool handling (B-209: PDF page analysis and page
     rendering use PyMuPDF too, so they run there as well). With ``budget`` the
     call may only use what is left of the document's budget."""
+    attempt = spared = 0
     async with _get_parse_slots():
-        for attempt in (1, 2):
+        while True:
+            attempt += 1
             loop = asyncio.get_running_loop()
             timeout = _parse_timeout_s if budget is None else budget.remaining
             if timeout <= 0:
@@ -285,17 +251,24 @@ async def _in_parse_pool[T](
                     filename,
                     timeout,
                 )
+                _killed_pools.add(executor)
                 _discard_parse_pool(executor)
                 msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
                 raise DocumentParseError(msg) from exc
             except BrokenProcessPool:
+                # Killed for another document's timeout: not this one's
+                # failure — retried without spending its attempt (review M2).
+                sibling = executor in _killed_pools and spared < _MAX_SPARED
                 logger.warning(
-                    "knowledge.parse_pool_broken document=%r attempt=%d — rebuilding",
+                    "knowledge.parse_pool_broken document=%r attempt=%d sibling=%s — rebuilding",
                     filename,
                     attempt,
+                    sibling,
                 )
                 _discard_parse_pool(executor)
-                if attempt == 2:
+                if sibling:
+                    spared, attempt = spared + 1, attempt - 1
+                elif attempt == 2:
                     raise
             except MemoryError as exc:
                 # The worker hit its address-space ceiling (S-M1): this
@@ -305,7 +278,6 @@ async def _in_parse_pool[T](
             finally:
                 if budget is not None:
                     budget.charge(loop.time() - started)
-    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -519,18 +491,18 @@ async def ingest_document_bytes(
 def _pool_runners(filename: str) -> tuple[PoolRunner, PoolRunner]:
     """The document's parse-pool calls (analysis, renders, fallback parse)
     share one time budget (B-209 review M2); the figure collection runs on a
-    sub-budget of it (:data:`FIGURE_POOL_SHARE`, review H3)."""
-    budget = _PoolBudget(_parse_timeout_s)
-    figures = _PoolBudget(_parse_timeout_s * FIGURE_POOL_SHARE, parent=budget)
+    sub-budget of it (:data:`FIGURE_POOL_SHARE`, review H3), in its own pool."""
+    budget = PoolBudget(_parse_timeout_s)
+    figures = PoolBudget(_parse_timeout_s * FIGURE_POOL_SHARE, parent=budget)
 
-    def runner(spend: _PoolBudget) -> PoolRunner:
-        async def run[T](fn: Callable[..., T], /, *args: object) -> T:
-            spend.remaining = min(spend.remaining, budget.remaining)
-            return await _in_parse_pool(filename, fn, *args, budget=spend)
+    async def run[T](fn: Callable[..., T], /, *args: object) -> T:
+        return await _in_parse_pool(filename, fn, *args, budget=budget)
 
-        return run
+    async def run_figures[T](fn: Callable[..., T], /, *args: object) -> T:
+        figures.remaining = min(figures.remaining, budget.remaining)
+        return await FIGURE_POOL.run(filename, fn, *args, budget=figures)
 
-    return runner(budget), runner(figures)
+    return run, run_figures
 
 
 async def ingest_markdown(
@@ -832,7 +804,7 @@ class KnowledgeIngestionRunner:
         token = current_tenant_id_var.set(tenant_id)
         renewer: asyncio.Task[None] | None = None
         claim: ClaimedIngestion | None = None
-        ready = False
+        ready = written = False
         lost = asyncio.Event()
         owner = asyncio.current_task()
         try:
@@ -890,6 +862,7 @@ class KnowledgeIngestionRunner:
                     usage=self._usage,
                     figures=self._figures,
                 )
+                written = True  # this claim's chunks are in place
                 settled = await self._store.set_document_status(
                     tenant_id=tenant_id,
                     document_id=document_id,
@@ -952,7 +925,7 @@ class KnowledgeIngestionRunner:
         finally:
             await _stop_renewer(renewer)
             if claim is not None and self._figures is not None:
-                await self._figures.tidy(claim, settled=ready)  # B-209 PR-2 originals
+                await self._figures.tidy(claim, settled=ready, serving=written)
             current_tenant_id_var.reset(token)
 
     async def _run_reindex(

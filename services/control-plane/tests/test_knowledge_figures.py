@@ -12,7 +12,7 @@ import io
 import pytest
 from PIL import Image
 
-from control_plane.knowledge.recognition import figure_filters
+from control_plane.knowledge.recognition import figure_filters, figure_images
 from control_plane.knowledge.recognition.cleaning import clean_reading
 from control_plane.knowledge.recognition.figure_describe import (
     describe_prompt,
@@ -282,3 +282,18 @@ def test_alignment_wrappers_are_stripped_and_their_text_kept() -> None:
     cleaned = clean_reading(raw)
     assert "<" not in cleaned
     assert cleaned == "## 第一章\n\n季度销量(台)\n\n表 1\n\n注\n\n正文"
+
+
+def test_a_picture_past_the_workers_memory_ceiling_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Re-review H2: under the parse worker's RLIMIT_AS a big picture fails to
+    # allocate — that picture is skipped (counted unsupported), the document
+    # goes on.
+    def out_of_memory(image: object) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(figure_images, "_flatten", out_of_memory)
+    with caplog.at_level("WARNING"):
+        assert figure_images.normalize(noise_png(64, 48)) is None
+    assert "knowledge.figure_out_of_memory" in caplog.text

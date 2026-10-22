@@ -28,6 +28,7 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.knowledge.base import UNSET, KnowledgeStore
+from expert_work.persistence.rls import bypass_rls_var
 from expert_work.protocol import FigureStats
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
@@ -229,3 +230,15 @@ async def test_existing_document_ids_span_tenants(store: KnowledgeStore) -> None
     found = await store.existing_document_ids(document_ids=[mine, theirs, gone, uuid4()])
     assert found == {mine, theirs}
     assert await store.existing_document_ids(document_ids=[]) == set()
+
+
+async def test_only_an_unrestricted_sql_connection_proves_it_sees_every_tenant(
+    store: KnowledgeStore,
+) -> None:
+    # Re-review H1: the in-memory store cannot prove it; the SQL store on a
+    # connection row security does not apply to (the test superuser) can.
+    bypass = bypass_rls_var.set(True)
+    try:
+        assert await store.sees_every_tenant() is isinstance(store, SqlKnowledgeStore)
+    finally:
+        bypass_rls_var.reset(bypass)

@@ -513,10 +513,12 @@ async def test_the_pool_budget_is_spent_and_enforced(monkeypatch: pytest.MonkeyP
     import time
     from concurrent.futures import ThreadPoolExecutor
 
+    from control_plane.knowledge.parse_workers import PoolBudget
+
     executor = ThreadPoolExecutor(max_workers=1)
     monkeypatch.setattr(ingestion, "_parse_executor", executor)
     monkeypatch.setattr(ingestion, "_parse_slots", None)
-    budget = ingestion._PoolBudget(remaining=5.0)
+    budget = PoolBudget(remaining=5.0)
     assert await ingestion._in_parse_pool("a.pdf", time.sleep, 0.05, budget=budget) is None
     assert 4.8 < budget.remaining < 4.96
     budget.remaining = 0.0

@@ -168,7 +168,10 @@ from control_plane.knowledge.recognition.figure_pipeline import (
     FigureDescriber,
     default_figure_client,
 )
-from control_plane.knowledge.recognition.figure_reconcile import FigureReconciler
+from control_plane.knowledge.recognition.figure_reconcile import (
+    FigureReconciler,
+    build_figure_reconciler,
+)
 from control_plane.knowledge.recognition.figure_storage import FigureStorage
 from control_plane.knowledge.recognition.recognizer import (
     DocumentRecognizer,
@@ -2134,12 +2137,13 @@ def create_app(
                     client_factory=default_figure_client(shared_http),
                     limits=model_limits,
                 )
-                if figure_storage is not None:
-                    figure_reconciler = FigureReconciler(
-                        store=resolved_knowledge_store,
-                        storage=figure_storage,
-                        interval_s=resolved_settings.knowledge_figure_reconcile_interval_s,
-                    )
+                figure_reconciler = build_figure_reconciler(
+                    store=resolved_knowledge_store,
+                    storage=figure_storage,
+                    interval_s=resolved_settings.knowledge_figure_reconcile_interval_s,
+                    delete=resolved_settings.knowledge_figure_reconcile_delete,
+                )
+                if figure_reconciler is not None:
                     figure_reconciler.start()
                     _app.state.knowledge_figure_reconciler = figure_reconciler
                 _app.state.knowledge_ingestion_runner = KnowledgeIngestionRunner(

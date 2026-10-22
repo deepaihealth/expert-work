@@ -196,14 +196,60 @@ async def test_recognize_re_drives_a_document_whose_figures_wait(setup: _Setup) 
     assert (await setup.client.post(url)).status_code == 202
 
 
+async def _serve_chunk_naming(setup: _Setup, figure: str) -> None:
+    await setup.store.replace_chunks(
+        tenant_id=_TENANT,
+        document_id=setup.document,
+        chunks=[
+            KnowledgeChunk(
+                id=uuid4(),
+                tenant_id=_TENANT,
+                kb_id=setup.kb,
+                document_id=setup.document,
+                chunk_index=0,
+                content=f"Intro.\n\n> {_LABEL} {figure}\u3015A chair.",
+                embedding=(0.1, 0.2),
+            )
+        ],
+    )
+
+
 async def test_a_figure_of_an_earlier_generation_still_shows(setup: _Setup) -> None:
     # Chunks of the serving version keep their thumbnails while a re-upload
     # (a newer generation) is ingesting.
+    await _serve_chunk_naming(setup, _ID)
     await setup.store.upsert_document(
         tenant_id=_TENANT, kb_id=setup.kb, filename="manual.docx", content=b"v2", force=True
     )
     response = await setup.client.get(setup.url(setup.document))
     assert response.status_code == 200 and response.content == _IMAGE
+
+
+async def test_an_earlier_generations_figure_no_chunk_names_is_not_served(
+    setup: _Setup,
+) -> None:
+    # Re-review L2: what a superseded ingest left behind is not fetchable by
+    # id once the document's chunks no longer name it.
+    await _serve_chunk_naming(setup, "fedcba9876543210")
+    await setup.store.upsert_document(
+        tenant_id=_TENANT, kb_id=setup.kb, filename="manual.docx", content=b"v2", force=True
+    )
+    assert (await setup.client.get(setup.url(setup.document))).status_code == 404
+
+
+async def test_a_revalidation_is_answered_without_reading_the_store(
+    setup: _Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Re-review L5: the id is the content hash — a matching If-None-Match
+    # needs no download.
+    async def no_reads(key: str) -> bytes:
+        raise AssertionError(f"read {key}")
+
+    monkeypatch.setattr(setup.objects, "get", no_reads)
+    response = await setup.client.get(
+        setup.url(setup.document), headers={"If-None-Match": f'"{_ID}"'}
+    )
+    assert response.status_code == 304
 
 
 async def test_chunk_lists_confirm_only_figures_the_document_holds(setup: _Setup) -> None:

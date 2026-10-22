@@ -22,17 +22,23 @@ import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
+from expert_work.persistence import KnowledgeStore
 from expert_work.runtime.storage import ObjectNotFoundError, ObjectStore
 
 logger = logging.getLogger(__name__)
 
 FIGURE_CONTENT_TYPE = "image/jpeg"
+#: Chunks read per page when looking for a figure's quote block.
+_CHUNK_PAGE = 200
 ROOT = "knowledge_figures/"
 _FIGURE_ID = re.compile(r"[0-9a-f]{16}")
+#: A canonical (lower-case, hyphenated) UUID.
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _KEY = re.compile(
-    rf"{ROOT}(?P<tenant>[0-9a-f-]{{36}})/(?P<kb>[0-9a-f-]{{36}})/(?P<document>[0-9a-f-]{{36}})"
+    rf"{ROOT}(?P<tenant>{_UUID})/(?P<kb>{_UUID})/(?P<document>{_UUID})"
     r"/g(?P<generation>\d{1,12})/(?P<figure>[0-9a-f]{16})\.jpg"
 )
 
@@ -58,16 +64,21 @@ class FigureKey:
 
 
 def parse_key(key: str) -> FigureKey | None:
+    """The key's parts; ``None`` for anything that is not a figure key (one
+    odd object never stops a scan)."""
     match = _KEY.fullmatch(key)
     if match is None:
         return None
-    return FigureKey(
-        UUID(match.group("tenant")),
-        UUID(match.group("kb")),
-        UUID(match.group("document")),
-        int(match.group("generation")),
-        match.group("figure"),
-    )
+    try:
+        return FigureKey(
+            UUID(match.group("tenant")),
+            UUID(match.group("kb")),
+            UUID(match.group("document")),
+            int(match.group("generation")),
+            match.group("figure"),
+        )
+    except ValueError:
+        return None
 
 
 def _base_prefix(tenant_id: UUID, kb_id: UUID) -> str:
@@ -123,15 +134,20 @@ class FigureStorage:
         document_id: UUID,
         figure: str,
         generation: int | None = None,
+        any_generation: bool = False,
     ) -> bytes | None:
-        """The figure's bytes — from ``generation`` first, else from whichever
-        generation still holds it (chunks of an earlier version keep serving
-        while a re-upload ingests); ``None`` when there is none."""
+        """The figure's bytes from ``generation``; with ``any_generation``
+        also from whichever generation still holds it (chunks of an earlier
+        version keep serving while a re-upload ingests, or after a pending
+        upload was discarded) — the caller allows that only for figures the
+        document's chunks name. ``None`` when there is none."""
         key = self.key(tenant_id, kb_id, document_id, generation, figure)
         try:
             return await self._store.get(key)
         except ObjectNotFoundError:
             pass
+        if not any_generation:
+            return None
         suffix = f"/{figure}.jpg"
         for other in await self._store.list_prefix(_document_prefix(tenant_id, kb_id, document_id)):
             if other.endswith(suffix) and other != key:
@@ -175,9 +191,14 @@ class FigureStorage:
         ]
         return await self.delete_keys(older)
 
-    async def all_keys(self) -> list[str]:
-        """Every stored figure key (the reconciler's scan)."""
-        return await self._store.list_prefix(ROOT)
+    async def all_keys_modified(self) -> list[tuple[str, datetime]] | None:
+        """Every stored figure key with its last-modified time (the
+        reconciler's scan); ``None`` when the store cannot tell the times."""
+        listing = getattr(self._store, "list_prefix_modified", None)
+        if not callable(listing):
+            return None
+        found: list[tuple[str, datetime]] = await listing(ROOT)
+        return found
 
     async def delete_keys(self, keys: Sequence[str]) -> int:
         """Delete ``keys`` — in batches when the store can (S3 ``DeleteObjects``)."""
@@ -218,6 +239,22 @@ async def confirmed_figure_ids(
         tenant_id=tenant_id, kb_id=kb_id, document_id=document_id
     )
     return sorted(named & stored)
+
+
+async def chunks_name_figure(
+    store: KnowledgeStore, *, tenant_id: UUID, document_id: UUID, figure: str
+) -> bool:
+    """Whether the document's current chunks name ``figure`` in a quote block."""
+    offset = 0
+    while True:
+        page, total = await store.list_chunks(
+            tenant_id=tenant_id, document_id=document_id, offset=offset, limit=_CHUNK_PAGE
+        )
+        if any(figure in _FIGURE_ID_IN_TEXT.findall(chunk.content) for chunk in page):
+            return True
+        offset += len(page)
+        if not page or offset >= total:
+            return False
 
 
 async def delete_figures_quietly(

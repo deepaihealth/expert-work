@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 from dataclasses import dataclass
 
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+logger = logging.getLogger(__name__)
 
 FIGURE_MAX_EDGE_PX = 2000
 FIGURE_JPEG_QUALITY = 85
@@ -72,7 +75,9 @@ def image_size(blob: bytes) -> tuple[int, int] | None:
 
 def normalize(blob: bytes) -> NormalizedImage | None:
     """``blob`` as the figure JPEG (see module doc); ``None`` when it cannot
-    be decoded here (unsupported format, damaged, too large)."""
+    be decoded here (unsupported format, damaged, too large — also when the
+    parse worker's memory ceiling stops it: that picture is skipped, the
+    document goes on)."""
     try:
         with Image.open(io.BytesIO(blob)) as image:
             width, height = image.size
@@ -81,9 +86,12 @@ def normalize(blob: bytes) -> NormalizedImage | None:
             image.load()
             upright = ImageOps.exif_transpose(image) or image
             rgb = _flatten(upright)
+        return _encode(rgb, width, height)
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
         return None
-    return _encode(rgb, width, height)
+    except MemoryError:
+        logger.warning("knowledge.figure_out_of_memory bytes=%d", len(blob))
+        return None
 
 
 def from_rgb(image: Image.Image) -> NormalizedImage:

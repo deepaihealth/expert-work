@@ -37,6 +37,7 @@ from expert_work.persistence import (
 from expert_work.persistence.artifact import SqlArtifactStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.feedback_store import DbFeedbackStore, FeedbackRecord
+from expert_work.persistence.knowledge import SqlKnowledgeStore
 from expert_work.persistence.memory import SqlMemoryStore
 from expert_work.persistence.rls import (
     build_rls_sessionmaker,
@@ -239,6 +240,27 @@ async def test_bypass_var_does_not_subvert_rls_for_application_role(
         bypass_rls_var.set(True)
         listed = await store.list_by_tenant(tenant_a, limit=10, offset=0)
         assert listed == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_figure_reconcilers_check_fails_on_a_row_security_bound_role(
+    postgres_container: PostgresContainer,
+) -> None:
+    """B-209 PR-2 (re-review H1): on the application role, bypassing RLS
+    application-side shows no rows — the knowledge store must say it cannot
+    see every tenant, so the figure reconciler deletes nothing."""
+    cfg = Config(str(ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", _sync_dsn(postgres_container))
+    command.upgrade(cfg, "head")
+    _provision_app_role(_sync_dsn(postgres_container))
+    app_async_dsn = _rewrite_credentials(_async_dsn(postgres_container), APP_ROLE, APP_PASSWORD)
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=app_async_dsn))
+    store = SqlKnowledgeStore(build_rls_sessionmaker(create_async_session_factory(engine)))
+    bypass_rls_var.set(True)
+    try:
+        assert await store.sees_every_tenant() is False
     finally:
         await engine.dispose()
 

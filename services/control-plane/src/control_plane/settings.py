@@ -534,8 +534,13 @@ class Settings(BaseSettings):
     #: much lower ceiling. The default leaves ~1.5 GB of headroom on the first.
     knowledge_parse_worker_max_vm_mb: int = Field(default=6144, ge=0)
     #: B-209 PR-2 (review H5) —— how often original figures of deleted documents
-    #: are swept from the object store (s3-compatible backend only).
+    #: are swept from the object store (s3-compatible backend + SQL store only;
+    #: the first pass waits one interval after start).
     knowledge_figure_reconcile_interval_s: int = Field(default=3600, gt=0)
+    #: B-209 PR-2 (re-review H1) —— off: the sweep only counts and logs what it
+    #: would delete (``knowledge.figure_orphans_found``, gauge
+    #: ``expert_work_knowledge_figure_orphans``); on: it deletes them.
+    knowledge_figure_reconcile_delete: bool = False
 
     # ------------------------------------------------------------------ memory DLQ (K.K7)
     #: Stream K.K7 — how often the memory writeback DLQ worker scans

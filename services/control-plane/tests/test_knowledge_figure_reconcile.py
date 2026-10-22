@@ -1,116 +1,258 @@
-"""B-209 PR-2 (review H5 / security review S-M2) —— the original-figure
-reconciler deletes originals whose document row is gone."""
+"""B-209 PR-2 (review H5 / security review S-M2 / re-review H1) —— the
+original-figure reconciler deletes originals whose document row is gone, and
+only when that "gone" can be trusted."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 
 from control_plane.knowledge.recognition import figure_reconcile
-from control_plane.knowledge.recognition.figure_reconcile import FigureReconciler
-from control_plane.knowledge.recognition.figure_storage import FigureStorage
+from control_plane.knowledge.recognition.figure_reconcile import (
+    FigureReconciler,
+    ReconcileOutcome,
+    build_figure_reconciler,
+)
+from control_plane.knowledge.recognition.figure_storage import FigureStorage, parse_key
 from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.persistence.knowledge import SqlKnowledgeStore
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.runtime.storage import InMemoryObjectStore
 
 _FIGURE = "0123456789abcdef"
 
 
-class _Store(InMemoryKnowledgeStore):
-    """Records the RLS context and the batches of each lookup."""
+def _later() -> datetime:
+    """A clock a day and an hour ahead: everything stored now is old enough."""
+    return datetime.now(UTC) + timedelta(hours=25)
 
-    def __init__(self) -> None:
+
+class _Store(InMemoryKnowledgeStore):
+    """Proves (or not) that it sees every tenant; records each lookup's RLS
+    context and batch size."""
+
+    def __init__(self, *, sees_all: bool = True) -> None:
         super().__init__()
+        self.sees_all = sees_all
+        self.checked_with_bypass: list[bool] = []
         self.lookups: list[tuple[bool, UUID | None, int]] = []
+
+    async def sees_every_tenant(self) -> bool:
+        self.checked_with_bypass.append(bypass_rls_var.get())
+        return self.sees_all
 
     async def existing_document_ids(self, *, document_ids: Sequence[UUID]) -> set[UUID]:
         self.lookups.append((bypass_rls_var.get(), current_tenant_id_var.get(), len(document_ids)))
         return await super().existing_document_ids(document_ids=document_ids)
 
 
-async def _setup() -> tuple[_Store, InMemoryObjectStore, FigureStorage, UUID, UUID, UUID]:
-    store, objects = _Store(), InMemoryObjectStore()
-    storage = FigureStorage(objects)
-    tenant = uuid4()
-    base = await store.create_base(tenant_id=tenant, name="kb")
-    kept = await store.upsert_document(
-        tenant_id=tenant, kb_id=base.id, filename="a.pdf", content=b"a"
-    )
-    gone = await store.upsert_document(
-        tenant_id=tenant, kb_id=base.id, filename="b.pdf", content=b"b"
-    )
-    for document, generation in ((kept.id, 0), (gone.id, 0), (gone.id, 1)):
-        await storage.put(
-            tenant_id=tenant,
-            kb_id=base.id,
-            document_id=document,
-            generation=generation,
-            figure=_FIGURE,
-            image=b"jpeg",
-        )
-    assert await store.delete_document(tenant_id=tenant, document_id=gone.id)
-    return store, objects, storage, tenant, kept.id, gone.id
+class _Setup:
+    def __init__(self, *, sees_all: bool = True, objects: InMemoryObjectStore | None = None):
+        self.store = _Store(sees_all=sees_all)
+        self.objects = objects or InMemoryObjectStore()
+        self.storage = FigureStorage(self.objects)
+        self.tenant = uuid4()
+
+    async def documents(self, kept: int, gone: int) -> tuple[list[UUID], list[UUID]]:
+        """``kept`` live documents and ``gone`` deleted ones, one original each."""
+        base = await self.store.create_base(tenant_id=self.tenant, name=f"kb-{uuid4().hex[:6]}")
+        made: list[UUID] = []
+        for n in range(kept + gone):
+            document = await self.store.upsert_document(
+                tenant_id=self.tenant, kb_id=base.id, filename=f"{n}.pdf", content=b"%PDF"
+            )
+            await self.storage.put(
+                tenant_id=self.tenant,
+                kb_id=base.id,
+                document_id=document.id,
+                generation=0,
+                figure=_FIGURE,
+                image=b"jpeg",
+            )
+            made.append(document.id)
+        for document_id in made[kept:]:
+            assert await self.store.delete_document(tenant_id=self.tenant, document_id=document_id)
+        return made[:kept], made[kept:]
+
+    def reconciler(self, **kwargs: object) -> FigureReconciler:
+        options: dict[str, object] = {"interval_s": 60, "delete": True, "now": _later}
+        options.update(kwargs)
+        return FigureReconciler(store=self.store, storage=self.storage, **options)  # type: ignore[arg-type]
+
+    async def holders(self) -> set[str]:
+        """Document ids that still have an original."""
+        keys = await self.objects.list_prefix("knowledge_figures/")
+        return {str(parsed.document_id) for parsed in map(parse_key, keys) if parsed is not None}
 
 
 async def test_originals_of_a_deleted_document_are_deleted() -> None:
-    store, objects, storage, _, kept, _ = await _setup()
+    setup = _Setup()
+    kept, _ = await setup.documents(kept=2, gone=1)
     unrelated = ["knowledge_figures/notes.txt", "other/prefix/x.jpg"]
     for key in unrelated:
-        await objects.put(key, b"x")
-    deleted = await FigureReconciler(store=store, storage=storage, interval_s=60).run_once()
-    assert deleted == 2
-    remaining = await objects.list_prefix("")
-    figures = [key for key in remaining if key not in unrelated]
-    assert len(remaining) == 3 and len(figures) == 1
-    assert f"/{kept}/g0/{_FIGURE}.jpg" in figures[0]
+        await setup.objects.put(key, b"x")
+    outcome = await setup.reconciler().run_once()
+    assert outcome == ReconcileOutcome(orphans=1, deleted=1)
+    assert await setup.holders() == {str(d) for d in kept}
+    remaining = await setup.objects.list_prefix("")
+    assert all(key in remaining for key in unrelated)
+
+
+async def test_a_key_that_only_looks_like_a_figure_never_stops_a_pass() -> None:
+    # Re-review L3: 36 characters of hex and hyphens that are no UUID.
+    setup = _Setup()
+    await setup.documents(kept=2, gone=1)
+    odd = "-" * 36
+    bad = f"knowledge_figures/{odd}/{odd}/{odd}/g0/{_FIGURE}.jpg"
+    await setup.objects.put(bad, b"x")
+    assert (await setup.reconciler().run_once()).deleted == 1
+    assert bad in await setup.objects.list_prefix("knowledge_figures/")
+
+
+async def test_by_default_it_only_counts() -> None:
+    # Re-review H1 (1): dry run unless the setting turns deleting on.
+    setup = _Setup()
+    _, gone = await setup.documents(kept=2, gone=1)
+    reconciler = FigureReconciler(
+        store=setup.store, storage=setup.storage, interval_s=60, now=_later
+    )
+    assert await reconciler.run_once() == ReconcileOutcome(orphans=1)
+    assert str(gone[0]) in await setup.holders()
+
+
+async def test_recent_originals_are_left_alone() -> None:
+    # Re-review H1 (5): only originals older than a day.
+    setup = _Setup()
+    _, gone = await setup.documents(kept=2, gone=1)
+    young = setup.reconciler(now=lambda: datetime.now(UTC) + timedelta(hours=23))
+    assert await young.run_once() == ReconcileOutcome()
+    assert str(gone[0]) in await setup.holders()
+
+
+async def test_a_lookup_that_cannot_see_every_tenant_deletes_nothing() -> None:
+    # Re-review H1 (4): row security still on for the connection.
+    setup = _Setup(sees_all=False)
+    await setup.documents(kept=2, gone=1)
+    outcome = await setup.reconciler().run_once()
+    assert outcome.aborted == "rls_not_bypassed" and outcome.deleted == 0
+    assert len(await setup.holders()) == 3
+    assert setup.store.checked_with_bypass == [True]
+    assert setup.store.lookups == []
+
+
+async def test_no_document_found_at_all_deletes_nothing() -> None:
+    # Re-review H1 (3): originals in the bucket, none of their documents in
+    # the database — the wrong database or an empty table, not "all deleted".
+    setup = _Setup()
+    await setup.documents(kept=0, gone=2)
+    outcome = await setup.reconciler().run_once()
+    assert outcome.aborted == "no_documents_found"
+    assert len(await setup.holders()) == 2
+
+
+async def test_most_documents_orphaned_deletes_nothing() -> None:
+    # Re-review H1 (3): over half of 20+ documents gone means the lookup is off.
+    setup = _Setup()
+    await setup.documents(kept=9, gone=11)
+    outcome = await setup.reconciler().run_once()
+    assert outcome.aborted == "orphan_share"
+    assert len(await setup.holders()) == 20
+
+
+async def test_half_the_documents_orphaned_is_still_trusted() -> None:
+    setup = _Setup()
+    await setup.documents(kept=10, gone=10)
+    outcome = await setup.reconciler().run_once()
+    assert outcome == ReconcileOutcome(orphans=10, deleted=10)
+
+
+async def test_a_pass_deletes_at_most_its_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(figure_reconcile, "MAX_DELETES_PER_PASS", 1)
+    setup = _Setup()
+    await setup.documents(kept=2, gone=2)
+    assert await setup.reconciler().run_once() == ReconcileOutcome(orphans=2, deleted=1)
+    assert len(await setup.holders()) == 3
+
+
+async def test_a_store_without_modification_times_deletes_nothing() -> None:
+    class _NoTimes(InMemoryObjectStore):
+        list_prefix_modified = None  # type: ignore[assignment]
+
+    setup = _Setup(objects=_NoTimes())
+    await setup.documents(kept=2, gone=1)
+    assert (await setup.reconciler().run_once()).aborted == "no_modification_times"
+    assert len(await setup.holders()) == 3
 
 
 async def test_the_lookup_spans_tenants_and_runs_in_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store, _, storage, _, _, _ = await _setup()
+    setup = _Setup()
+    await setup.documents(kept=1, gone=1)
     monkeypatch.setattr(figure_reconcile, "_LOOKUP_BATCH", 1)
     token = current_tenant_id_var.set(uuid4())
     try:
-        await FigureReconciler(store=store, storage=storage, interval_s=60).run_once()
+        await setup.reconciler().run_once()
     finally:
         current_tenant_id_var.reset(token)
-    assert store.lookups == [(True, None, 1), (True, None, 1)]
+    assert setup.store.lookups == [(True, None, 1), (True, None, 1)]
     assert bypass_rls_var.get() is False
 
 
 async def test_nothing_stored_means_no_lookup() -> None:
-    store = _Store()
-    reconciler = FigureReconciler(
-        store=store, storage=FigureStorage(InMemoryObjectStore()), interval_s=60
+    setup = _Setup()
+    assert await setup.reconciler().run_once() == ReconcileOutcome()
+    assert setup.store.lookups == [] and setup.store.checked_with_bypass == []
+
+
+def test_it_runs_only_on_a_durable_store_and_the_sql_document_store() -> None:
+    # Re-review H1 (2): "not found" from the in-memory store proves nothing.
+    storage = FigureStorage(InMemoryObjectStore())
+    sql = SqlKnowledgeStore(session_factory=None)  # type: ignore[arg-type]
+    built = build_figure_reconciler(store=sql, storage=storage, interval_s=60, delete=False)
+    assert isinstance(built, FigureReconciler)
+    assert (
+        build_figure_reconciler(
+            store=InMemoryKnowledgeStore(), storage=storage, interval_s=60, delete=True
+        )
+        is None
     )
-    assert await reconciler.run_once() == 0
-    assert store.lookups == []
+    assert build_figure_reconciler(store=sql, storage=None, interval_s=60, delete=True) is None
 
 
-async def test_the_loop_runs_a_pass_and_survives_a_failing_one() -> None:
-    store, objects, storage, *_ = await _setup()
+async def _passes_within(reconciler: FigureReconciler, seconds: float) -> int:
     passes: list[int] = []
+    original = reconciler.run_once
 
-    class _Flaky(FigureReconciler):
-        async def run_once(self) -> int:
-            passes.append(1)
-            if len(passes) == 1:
-                raise RuntimeError("object store down")
-            return await super().run_once()
+    async def counting() -> ReconcileOutcome:
+        passes.append(1)
+        if len(passes) == 1:
+            raise RuntimeError("object store down")
+        return await original()
 
-    reconciler = _Flaky(store=store, storage=storage, interval_s=0.01)
+    reconciler.run_once = counting  # type: ignore[method-assign]
     reconciler.start()
-    for _ in range(200):
-        if len(passes) >= 2:
-            break
-        await asyncio.sleep(0.01)
+    await asyncio.sleep(seconds)
     await reconciler.stop()
-    assert len(passes) >= 2
-    assert len(await objects.list_prefix("")) == 1
+    return len(passes)
+
+
+async def test_the_first_pass_waits_after_start() -> None:
+    # Re-review H1 (6): a fresh replica does not sweep at once.
+    setup = _Setup()
+    assert await _passes_within(setup.reconciler(initial_delay_s=30), 0.1) == 0
+
+
+async def test_the_loop_runs_passes_and_survives_a_failing_one() -> None:
+    setup = _Setup()
+    await setup.documents(kept=2, gone=1)
+    reconciler = setup.reconciler(interval_s=0.01, initial_delay_s=0)
+    assert await _passes_within(reconciler, 0.3) >= 2
+    assert len(await setup.holders()) == 2
 
 
 class _Batching(InMemoryObjectStore):

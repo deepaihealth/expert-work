@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import types
+
 import pytest
 from botocore.config import Config as BotoConfig
 
@@ -10,6 +12,7 @@ from expert_work.runtime.storage import (
     S3CompatibleConfig,
     make_object_store,
 )
+from expert_work.runtime.storage.s3_compatible import add_content_md5
 
 
 @pytest.mark.asyncio
@@ -58,11 +61,27 @@ def test_config_addressing_style_defaults_to_path() -> None:
     assert config.addressing_style == "path"
 
 
+class _FakeEvents:
+    def __init__(self) -> None:
+        self.registered: list[tuple[str, object]] = []
+
+    def register(self, event_name: str, handler: object) -> None:
+        self.registered.append((event_name, handler))
+
+
+class _FakeClient:
+    def __init__(self) -> None:
+        self.meta = types.SimpleNamespace(events=_FakeEvents())
+
+
 class _FakeClientCM:
     """Stands in for ``session.create_client(...)``'s async context manager."""
 
+    def __init__(self, client: _FakeClient) -> None:
+        self._client = client
+
     async def __aenter__(self) -> object:
-        return object()
+        return self._client
 
     async def __aexit__(self, *exc_info: object) -> bool:
         return False
@@ -73,11 +92,12 @@ class _FakeSession:
 
     def __init__(self) -> None:
         self.captured_kwargs: dict[str, object] = {}
+        self.client = _FakeClient()
 
     def create_client(self, service_name: str, **kwargs: object) -> _FakeClientCM:
         assert service_name == "s3"
         self.captured_kwargs = kwargs
-        return _FakeClientCM()
+        return _FakeClientCM(self.client)
 
 
 @pytest.mark.asyncio
@@ -107,6 +127,10 @@ async def test_s3_backend_wires_virtual_addressing_and_checksum_config(
     assert boto_config.s3 == {"addressing_style": "virtual"}
     assert boto_config.request_checksum_calculation == "when_required"
     assert boto_config.response_checksum_validation == "when_required"
+    # B-209 PR-2 (re-review H3): OSS batch deletes need a Content-MD5.
+    assert fake_session.client.meta.events.registered == [
+        ("before-sign.s3.DeleteObjects", add_content_md5)
+    ]
 
 
 @pytest.mark.asyncio
