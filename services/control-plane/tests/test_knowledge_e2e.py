@@ -55,6 +55,7 @@ async def test_ingest_then_knowledge_search_round_trip() -> None:
 
     assert "deductible" in result.content
     # Source attribution + the chunker's heading-path prefix survive.
-    assert "[handbook.md#" in result.content
+    assert result.content.startswith(f"[doc {ready.doc_seq}] handbook.md · uploaded ")
+    assert f"[doc {ready.doc_seq} · passage " in result.content
     assert "[Section: Benefits" in result.content
     assert result.meta["hits"] >= 1

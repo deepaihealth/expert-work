@@ -225,6 +225,7 @@ from orchestrator.tools.overflow import (
     EXEMPT_TOOLS,
     EXTERNALIZE_MIN_CHARS,
     PERSIST_MIN_CHARS,
+    SELF_BUDGETED_TOOLS,
     TOOL_RESULT_PATH_ARTIFACT_KEY,
     clamp_overflow,
     fallback_truncate,
@@ -4367,6 +4368,8 @@ async def _externalize_tool_overflow(
     point at a file that does not exist). The fetch-back readers
     (:data:`EXEMPT_TOOLS`) are skipped — their source is cheaply re-readable, so
     externalizing them would just create a persist→read→persist loop (CM-F3).
+    The self-budgeted tools (:data:`SELF_BUDGETED_TOOLS`) never get the preview:
+    they already cut their result to what the model should read whole.
     """
     if writer is None or tool.spec.name in EXEMPT_TOOLS:
         return None, None, None
@@ -4377,7 +4380,11 @@ async def _externalize_tool_overflow(
         source = result.full_content
         replacement: str | None = None  # keep the tool's already-truncated body
         footer_mode = True
-    elif budget_on and len(result.content) > EXTERNALIZE_MIN_CHARS:
+    elif (
+        budget_on
+        and len(result.content) > EXTERNALIZE_MIN_CHARS
+        and tool.spec.name not in SELF_BUDGETED_TOOLS
+    ):
         # #859 — generalized externalization: replace bulk with a preview.
         source = result.content
         replacement = make_preview(result.content)
@@ -4385,7 +4392,8 @@ async def _externalize_tool_overflow(
     elif budget_on and len(result.content) > PERSIST_MIN_CHARS:
         # Item 2 — persist floor: keep the full result in context (no preview, no
         # footer) but write a full copy so a later CM-12 prune can collapse it to
-        # a lossless reference (path recorded in the ToolMessage artifact).
+        # a lossless reference (path recorded in the ToolMessage artifact). A
+        # self-budgeted tool's result lands here at any size (B-206 K-4).
         source = result.content
         replacement = None
         footer_mode = False

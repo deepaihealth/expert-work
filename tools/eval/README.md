@@ -227,9 +227,10 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   总体 / 按 `source` / 按每个 `tag`(同一 case 重复 tag 只算一次)各一份。
   注意混合模式下关键词命中总会进融合,所以「无答案」判定要配 `--method vector --threshold <x>`。
 - **给模型的文本里的锚文本命中(`context_hit`,B-206「父段级段命中」)**:每题那次检索的前几名交给生产
-  `knowledge_search` 工具,经工具节点同一段代码(`_invoke_tool`)渲染成模型拿到的文本(工具默认条数;默认智能体不开工作区,
-  不外置截断),锚文本归一后落在里面记 1(`match=all` 要全部锚文本都在);汇总表 `ctx_hit` 列紧挨 `chk_hit@10`。工具改成
-  返回父段 / 改条数 / 改格式,这个数自动跟着变。`--top-k` 小于工具要的条数时不算(报 `-`)。
+  `knowledge_search` 工具,经工具节点同一段代码(`_invoke_tool`)渲染成模型拿到的文本(工具从前 20 名里按默认 10 条、
+  每文档最多 3 条、8,000 token 预算挑,B-206 K-4;这个工具的结果不做外置预览截断,有没有工作区看到的都一样),
+  锚文本归一后落在里面记 1(`match=all` 要全部锚文本都在);汇总表 `ctx_hit` 列紧挨 `chk_hit@10`。工具改成
+  返回父段 / 改条数 / 改格式,这个数自动跟着变。`--top-k` 小于工具要的条数(20)时不算(报 `-`)。
 - **逐次检索记录(`--search-log <path>`,默认不写)**:每题一行 —— 查询、状态、候选数、是否降级、交给模型的条数与字数,
   以及每个返回段的名次、文件名、段号、段 id、召回路、向量 / 关键词 / 融合 / 重排分数、是否交给了模型(不含正文)。
 - **产出**:`eval-out/kb/<label>.jsonl`(每 case 一行:`match`、`best_score`、`anchors_alive`、返回的 (filename, chunk_index, score, recall_source)、

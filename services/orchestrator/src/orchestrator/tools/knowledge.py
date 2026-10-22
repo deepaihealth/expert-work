@@ -22,7 +22,7 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -37,7 +37,16 @@ from expert_work.protocol import (
     RetrievalMethod,
     chunk_retrieval_text,
 )
+from expert_work.runtime.tokens import TokenEstimator, default_estimator
 from orchestrator.tools.error_classifier import GuidedToolError
+from orchestrator.tools.knowledge_result import (
+    MAX_PER_DOCUMENT,
+    render,
+    select_passages,
+    selection_meta,
+    truncation_notice,
+)
+from orchestrator.tools.knowledge_types import RetrievedChunk as RetrievedChunk
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 
 if TYPE_CHECKING:
@@ -58,8 +67,15 @@ _MAX_RERANK_CANDIDATES = 100
 #: Each candidate is truncated to this many characters in the rerank
 #: prompt — enough to judge relevance without an enormous prompt.
 _RERANK_DOC_CHARS = 600
-#: ``knowledge_search`` result-count default + hard cap.
-_DEFAULT_LIMIT = 5
+#: ``knowledge_search`` result count (B-206 K-4). The tool ranks from the
+#: retriever's top ``_MAX_LIMIT`` — recall depth is the same for any limit up to
+#: 25 and the rerank already scores 20, so this costs no extra recall or rerank
+#: — and shows ``limit`` of them (default ``_DEFAULT_LIMIT``), picked per
+#: document and token budget by :mod:`orchestrator.tools.knowledge_result`.
+#: Platform defaults, no per-base override: ``retrieval_top_k`` (5 on every
+#: existing base) is the console retrieval test's count, which this tool never
+#: read.
+_DEFAULT_LIMIT = 10
 _MAX_LIMIT = 20
 #: Two-view rerank (B-175 wave 2 PR2b): a scoring reranker judges every
 #: candidate with its document title, then its best ``_BODY_VIEW_DEPTH`` again
@@ -84,6 +100,27 @@ KNOWLEDGE_ANSWERABILITY_RULE = (
     "Results are the closest passages, not confirmed answers: rely only on what they "
     "explicitly state, and if none states the specific fact asked, say the knowledge "
     "base does not state it instead of inferring or guessing it."
+)
+#: B-206 K-6 — how to search, also in the tool description only. Searching more
+#: widely is paired with checking what was read: on find-all questions an agent
+#: exploring with more searches found more of the right documents yet answered
+#: fewer correctly (Onyx EnterpriseRAG-Bench, table 7). The wording follows the
+#: design's final text; reading a candidate in full (``knowledge_read``) and
+#: listing documents come with those tools (K-2, K-13).
+KNOWLEDGE_SEARCH_GUIDANCE = (
+    "Use several small, targeted searches rather than one broad one; if a result does not "
+    "state the fact asked, search again in the documents' own terms, and do not repeat the "
+    "same or a very similar query. For questions that ask for all / every / how many, keep "
+    "searching with different terms until a search returns no document you have not seen, "
+    "then check each candidate against every condition in the question before counting it. "
+    "Before concluding, verify each condition in the question against text you have actually "
+    "read; conflicting documents are reported as conflicting, not resolved by guessing. Say "
+    "you searched and found nothing only when a search actually ran."
+)
+_RESULT_FORMAT = (
+    "Results are grouped by document: [doc N] is a document's short id, shared by its "
+    "passages, followed by its title, upload date and, when recorded, version, effective "
+    "date and source; 'passage n/N' is where a passage sits in that document."
 )
 _RESULTS_NOTICE = (
     "[knowledge_search: these are the closest passages found, which is not the same as "
@@ -153,49 +190,6 @@ class ScoredReranker(Protocol):
         """Like :meth:`Reranker.rerank`, each index paired with its relevance
         score: ``None`` throughout when the backend ranks without scoring (a
         chat-model reranker) or rerank was skipped."""
-
-
-@dataclass(frozen=True)
-class RetrievedChunk:
-    """A retrieved chunk with its source document attribution.
-
-    ``score`` is the vector cosine similarity in [0, 1] when the chunk was
-    surfaced by vector recall (``None`` for keyword-only hits, whose
-    ``ts_rank`` is not a comparable similarity). ``recall_source`` records
-    which recall path(s) found it. Both default to ``None`` so the tool's
-    formatted output is unaffected — they exist for the retrieval-test
-    endpoint's transparency.
-
-    The per-path sub-scores (B-175 wave 2) are kept for diagnostics and are
-    ``None`` when a path did not surface the chunk: ``vector_score`` (same
-    value as ``score``), ``keyword_score`` (the keyword path's rank value)
-    and ``fused_score`` (the weighted RRF score that ordered the fusion).
-    ``rerank_score`` is the score the reranker ranked it by — the two-view
-    weighted score when both views ran — and ``None`` when rerank was off,
-    failed, or ranked without scores.
-
-    ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
-    The agent sees (and the eval matches against) :attr:`retrieval_text`, the
-    two joined, under a ``[filename#index]`` header. The reranker ranks the
-    stored chunk's own retrieval text, which also carries the document title
-    — here it would only repeat the header.
-    """
-
-    content: str
-    filename: str
-    chunk_index: int
-    score: float | None = None
-    recall_source: str | None = None
-    heading_path: tuple[str, ...] = ()
-    chunk_id: UUID | None = None
-    vector_score: float | None = None
-    keyword_score: float | None = None
-    fused_score: float | None = None
-    rerank_score: float | None = None
-
-    @property
-    def retrieval_text(self) -> str:
-        return chunk_retrieval_text(self.heading_path, self.content)
 
 
 @dataclass(frozen=True)
@@ -532,6 +526,7 @@ class KnowledgeRetriever:
                 keyword_score=scores.keyword.get(chunk.id),
                 fused_score=scores.fused.get(chunk.id),
                 rerank_score=scores.rerank.get(chunk.id),
+                document=docs.get(chunk.document_id),
             )
             for chunk in chunks
         ]
@@ -598,12 +593,15 @@ class KnowledgeSearchTool:
 
     One instance per agent whose manifest declares a ``knowledge:``
     block; ``knowledge_base_refs`` are the base names it may query. The
-    LLM calls it with a natural-language ``query``; the result is a
-    formatted block of relevant chunks, each tagged with its source.
+    LLM calls it with a natural-language ``query``; the result is the
+    relevant passages grouped by source document (B-206 K-4), within a token
+    budget counted by ``estimator`` — the platform's shared estimator (HX-1),
+    the one the context window is measured with.
     """
 
     retriever: KnowledgeRetriever
     knowledge_base_refs: tuple[str, ...]
+    estimator: TokenEstimator = field(default_factory=default_estimator)
 
     @property
     def spec(self) -> ToolSpec:
@@ -612,7 +610,8 @@ class KnowledgeSearchTool:
             description=(
                 "Search the tenant's knowledge base for information relevant "
                 "to a query. Use it to ground answers in internal documents "
-                f"rather than guessing. {KNOWLEDGE_ANSWERABILITY_RULE}"
+                f"rather than guessing. {KNOWLEDGE_ANSWERABILITY_RULE} {_RESULT_FORMAT} "
+                f"{KNOWLEDGE_SEARCH_GUIDANCE}"
             ),
             parameters={
                 "type": "object",
@@ -625,7 +624,10 @@ class KnowledgeSearchTool:
                         "type": "integer",
                         "minimum": 1,
                         "maximum": _MAX_LIMIT,
-                        "description": f"Max results (default {_DEFAULT_LIMIT}).",
+                        "description": (
+                            f"Max passages to show (default {_DEFAULT_LIMIT}, at most "
+                            f"{MAX_PER_DOCUMENT} per document)."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -648,7 +650,7 @@ class KnowledgeSearchTool:
             tenant_id=ctx.tenant_id,
             base_names=self.knowledge_base_refs,
             query=query,
-            limit=limit,
+            limit=_MAX_LIMIT,
         )
         if outcome.status == "no_bases":
             msg = "none of this agent's knowledge bases exists: " + ", ".join(
@@ -674,8 +676,17 @@ class KnowledgeSearchTool:
                 meta=meta,
                 notice=_NO_HITS_NOTICE,
             )
+        selection = select_passages(outcome.results, limit=limit, estimator=self.estimator)
+        rendered = render(selection, estimator=self.estimator)
+        trailer = truncation_notice(selection, limit=limit, max_limit=_MAX_LIMIT)
         return ToolResult(
-            content=_format_results(outcome.results), meta=meta, notice=_RESULTS_NOTICE
+            content=rendered.text,
+            meta={
+                **meta,
+                **selection_meta(outcome.results, selection, rendered, limit=limit),
+                "candidates": outcome.candidates,
+            },
+            notice=_RESULTS_NOTICE if trailer is None else f"{_RESULTS_NOTICE}\n{trailer}",
         )
 
     def _require_query(self, args: Mapping[str, Any]) -> str:
@@ -728,10 +739,3 @@ def _coerce_limit(raw: object) -> int:
     if not isinstance(raw, int) or isinstance(raw, bool):
         return _DEFAULT_LIMIT
     return max(1, min(raw, _MAX_LIMIT))
-
-
-def _format_results(results: Sequence[RetrievedChunk]) -> str:
-    blocks = [
-        f"[{result.filename}#{result.chunk_index}]\n{result.retrieval_text}" for result in results
-    ]
-    return "\n\n---\n\n".join(blocks)
