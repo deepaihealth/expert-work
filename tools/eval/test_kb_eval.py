@@ -24,6 +24,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     EMBED_OVERLONG_CHARS,
     CaseRow,
     CountingEmbedder,
+    EmbeddingDegradedError,
     EmbeddingDimensionError,
     EvalConfig,
     RerankDegradedError,
@@ -31,6 +32,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     _ReplayRetriever,
     baseline_benchmark,
     build_corpus,
+    build_embedder,
     build_fake_embedder,
     build_retriever,
     case_to_json,
@@ -49,7 +51,9 @@ from kb_eval import (  # type: ignore[import-not-found]
 )
 from kb_metrics import score_case  # type: ignore[import-not-found]
 from kb_rerank import RerankCacheMissError  # type: ignore[import-not-found]
+from longmem.embedders import CachedEmbedder  # type: ignore[import-not-found]
 
+from control_plane.knowledge.chunking import count_tokens
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
@@ -416,6 +420,7 @@ def test_fingerprint_records_vector_search_mode(tmp_path: Path) -> None:
         "corpus_root": tmp_path,
         "embedder": "fake",
         "embed_base_url": None,
+        "query_marker": "none",
         "store": "sql",
         "tiers": ("A",),
         "limit_docs": 0,
@@ -566,7 +571,8 @@ async def test_counting_embedder_counts_texts_overlong_and_tokens() -> None:
     assert stats.overlong == 1
     assert stats.chars == len("短文本") + len(long_text) + len("再来一条")
     assert stats.tokens == 0  # 假嵌入不计 token、不计费
-    assert stats.cost_cny == 0.0
+    assert stats.cost_cny_nominal == 0.0
+    assert stats.cost_cny_actual == 0.0
 
     priced = CountingEmbedder(
         inner, expected_dim=EMBEDDING_DIM, count_tokens=True, price_cny_per_1k_tokens=0.5
@@ -574,7 +580,119 @@ async def test_counting_embedder_counts_texts_overlong_and_tokens() -> None:
     await priced.embed(["益生菌需要放冰箱冷藏吗"], tenant_id=uuid4())
     stats = priced.stats()
     assert stats.tokens > 0
-    assert stats.cost_cny == pytest.approx(stats.tokens / 1000 * 0.5)
+    assert stats.cost_cny_nominal == pytest.approx(stats.tokens / 1000 * 0.5)
+    # No cache in front: every text went to the embedder, so actual = nominal.
+    assert (stats.fetched, stats.fetched_tokens) == (stats.texts, stats.tokens)
+    assert stats.cost_cny_actual == stats.cost_cny_nominal
+
+
+@pytest.mark.asyncio
+async def test_embed_cost_counts_only_cache_misses_as_actual_spend(tmp_path: Path) -> None:
+    # B-206 —— a cache hit costs nothing: the old single cost_cny counted every
+    # text handed to the embedder, an upper bound reported as if it were spent.
+    cached = CachedEmbedder(
+        build_fake_embedder(),
+        model_key="m",
+        db_path=tmp_path / "emb.sqlite",
+        count_tokens=count_tokens,
+    )
+    embedder = CountingEmbedder(
+        cached, expected_dim=EMBEDDING_DIM, count_tokens=True, price_cny_per_1k_tokens=0.5
+    )
+    await embedder.embed(["益生菌需要放冰箱冷藏吗"], tenant_id=uuid4())
+    await embedder.embed(["益生菌需要放冰箱冷藏吗", "开封后怎么保存"], tenant_id=uuid4())
+    stats = embedder.stats()
+    assert stats.texts == 3
+    assert stats.fetched == 2  # the repeated text came from the cache
+    assert stats.fetched_tokens == count_tokens("益生菌需要放冰箱冷藏吗") + count_tokens(
+        "开封后怎么保存"
+    )
+    assert stats.cost_cny_actual == pytest.approx(stats.fetched_tokens / 1000 * 0.5)
+    assert stats.cost_cny_nominal == pytest.approx(stats.tokens / 1000 * 0.5)
+    assert stats.cost_cny_actual < stats.cost_cny_nominal
+    cached.close()
+
+
+_TASK = "Given a search query, retrieve relevant passages that answer the query"
+
+
+@pytest.mark.asyncio
+async def test_query_marker_arms_do_not_share_cached_query_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-206 K-5 A/B: the marker changes the query vector, so the cache key must
+    change with it — else the second arm is served the first arm's vectors and
+    the comparison measures nothing. Documents (no document marker) stay
+    shared, so the corpus is not embedded twice."""
+    from expert_work.protocol.model_catalog import EmbeddingCaps
+    from orchestrator.llm.embedder import HTTPEmbeddingClient
+
+    sent: list[dict[str, str]] = []
+
+    async def _fake_embeddings(
+        self: Any, *, model: str, texts: Sequence[str], fields: Any = None
+    ) -> dict[str, Any]:
+        sent.append(dict(fields or {}))
+        value = 2.0 if fields else 1.0
+        return {
+            "data": [{"index": i, "embedding": [value] * EMBEDDING_DIM} for i in range(len(texts))]
+        }
+
+    monkeypatch.setattr(HTTPEmbeddingClient, "embeddings", _fake_embeddings)
+    monkeypatch.setattr("kb_eval.EMBED_CACHE_DB", tmp_path / "embed_cache.sqlite")
+    monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_API_KEY", "unit-test-key")
+    monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_MODEL", "text-embedding-v4")
+    tenant = uuid4()
+    # The real catalog entry enables no marker, so "on" sends nothing extra.
+    assert build_embedder("real", concurrency=1, query_marker=True).query_marker == "none"
+    caps = EmbeddingCaps(asymmetry="query_field", query_marker="instruct", instruction=_TASK)
+    monkeypatch.setattr("kb_eval.catalog_embedding_caps", lambda model: caps)
+
+    off = build_embedder("real", concurrency=1, query_marker=False)
+    on = build_embedder("real", concurrency=1, query_marker=True)
+    assert off.query_marker == "off"
+    assert on.query_marker == f"instruct={_TASK}"
+
+    plain = await off.embedder.embed_query("开封后怎么保存", tenant_id=tenant)
+    marked = await on.embedder.embed_query("开封后怎么保存", tenant_id=tenant)
+    assert sent == [{}, {"instruct": _TASK}]
+    assert plain != marked
+    # Each arm keeps reading its own cached vector.
+    assert await off.embedder.embed_query("开封后怎么保存", tenant_id=tenant) == plain
+    assert await on.embedder.embed_query("开封后怎么保存", tenant_id=tenant) == marked
+    assert len(sent) == 2
+
+    await off.embedder.embed(["开封后请尽快食用"], tenant_id=tenant)
+    await on.embedder.embed(["开封后请尽快食用"], tenant_id=tenant)
+    assert sent[2:] == [{}]  # one document request for both arms
+    assert on.embedder.stats().fetched == 1  # the on arm's document came from the cache
+
+
+class _FailingQueryEmbedder:
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        raise ConnectionError("embedding endpoint down")
+
+
+@pytest.mark.asyncio
+async def test_run_eval_aborts_when_query_embedding_degrades(
+    corpus: tuple[Path, Path], dataset_path: Path
+) -> None:
+    """The retriever degrades a failed query embedding to keyword search
+    (B-206 K-8); the eval must not score that as the hybrid result. Through the
+    eval's own CountingEmbedder: it must hand the vendor error to the retriever
+    unwrapped, or the retriever cannot tell it from a bug."""
+    dataset, plain, _store, (tenant, _report) = await _built(corpus, dataset_path)
+    embedder = CountingEmbedder(_FailingQueryEmbedder(), expected_dim=EMBEDDING_DIM)
+    retriever = replace(plain, embedder=embedder)
+
+    with pytest.raises(EmbeddingDegradedError, match="keyword"):
+        await run_eval(
+            dataset=dataset,
+            retriever=retriever,
+            tenant_id=tenant,
+            cfg=EvalConfig(top_k=20),
+            concurrency=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -983,6 +1101,8 @@ def test_main_writes_jsonl_and_baseline_fingerprint(
     assert summary_line["anchors"]["dead_cases"] == 2
     assert summary_line["config"]["method"] == "hybrid"
     assert summary_line["config"]["label"] == "unit"
+    # The fake embedder has no catalog entry → no marker, whatever the switch says.
+    assert summary_line["config"]["query_marker"] == "none"
 
     data = yaml.safe_load(baseline.read_text(encoding="utf-8"))
     section = data["kb"]["unit_kb"]
@@ -997,6 +1117,7 @@ def test_main_writes_jsonl_and_baseline_fingerprint(
         "manifest_sha256",
         "embedder",
         "embed_base_url",
+        "query_marker",
         "embedding_dim",
         "store",
         "commit",

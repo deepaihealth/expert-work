@@ -57,6 +57,7 @@ from expert_work.protocol import (
     Provider,
     SkillStatus,
     TenantPlan,
+    catalog_entry,
     parse_extends_ref,
     resolve_extends,
     tier_satisfies,
@@ -100,6 +101,12 @@ from orchestrator.llm import (
     HTTPEmbeddingClient,
     OpenAICompatibleEmbedder,
     RateLimiterFactory,
+)
+from orchestrator.llm.embedder import (
+    EmbeddingSide,
+    catalog_batch_size,
+    embedding_marker,
+    marked_model_key,
 )
 from orchestrator.multimodal import (
     CachingImageResolver,
@@ -1276,14 +1283,28 @@ class DynamicResolvingEmbedder:
         _, delegate = await self._resolve(tenant_id)
         return await delegate.embed(texts, tenant_id=tenant_id)
 
+    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        """B-206 K-5 —— a knowledge-base search query, with the query-side
+        marker the model catalog declares for the live model. Long-term memory
+        recall calls :meth:`embed` and keeps its unmarked request."""
+        _, delegate = await self._resolve(tenant_id, side="query")
+        (vector,) = await delegate.embed([query], tenant_id=tenant_id)
+        return vector
+
     async def pin(self, *, tenant_id: UUID) -> tuple[str, OpenAICompatibleEmbedder]:
         """Resolve the live config once: ``provider/model`` plus an embedder
         bound to it. A knowledge ingest / re-index embeds every chunk with the
         one model it pinned (and tags the chunks with it) even if an admin
-        switches the platform model meanwhile."""
-        return await self._resolve(tenant_id)
+        switches the platform model meanwhile.
 
-    async def _resolve(self, tenant_id: UUID) -> tuple[str, OpenAICompatibleEmbedder]:
+        B-206 K-5 —— the embedder sends the model's document-side marker, and
+        the key names that marker when there is one, so a chunk embedded under
+        another marker is never reused as if it matched."""
+        return await self._resolve(tenant_id, side="document")
+
+    async def _resolve(
+        self, tenant_id: UUID, side: EmbeddingSide | None = None
+    ) -> tuple[str, OpenAICompatibleEmbedder]:
         # 一期 Task 1 —— 同 ResolvingEmbedder.embed,但这条路径每次调用还多一次
         # DB 读(平台配置),所以是三段计时。挂到调用方的 ``memory.embed`` span
         # 上。``cfg is None`` 的早退直接抛错,没有 embed 可言,不打属性。
@@ -1303,12 +1324,27 @@ class DynamicResolvingEmbedder:
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
         span.set_attribute("secret_ms", round((t3 - t2) * 1000))
+        client = HTTPEmbeddingClient(api_key=api_key, http=self.http)
+        if side is None:
+            # Unsided callers (long-term memory …): the request they always sent.
+            delegate = OpenAICompatibleEmbedder(
+                client=client, model=model, max_input_bytes=self.max_input_bytes
+            )
+            return f"{provider}/{model}", delegate
+        # B-206 K-5 / K-8 —— knowledge sides: the catalog's marker for this side and
+        # its batch size (an off-catalog model keeps the platform default); the
+        # per-input cap stays the deployment's.
+        entry = catalog_entry(provider, model)
+        caps = entry.embedding_caps if entry is not None else None
+        marker = embedding_marker(caps, side)
         delegate = OpenAICompatibleEmbedder(
-            client=HTTPEmbeddingClient(api_key=api_key, http=self.http),
+            client=client,
             model=model,
+            max_batch_size=catalog_batch_size(caps),
             max_input_bytes=self.max_input_bytes,
+            marker=marker,
         )
-        return f"{provider}/{model}", delegate
+        return marked_model_key(f"{provider}/{model}", marker), delegate
 
 
 @dataclass(frozen=True)

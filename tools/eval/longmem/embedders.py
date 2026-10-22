@@ -23,11 +23,15 @@ import hashlib
 import os
 import sqlite3
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from longmem.transient import with_retries
+
+if TYPE_CHECKING:
+    from orchestrator.llm.embedder import EmbeddingMarker
 
 
 class KeywordEmbedder:
@@ -66,6 +70,10 @@ class CachedEmbedder:
     DashScope compatible-mode caps embedding batches at 10 inputs and
     rate-limits per-second, so both knobs matter for a 350k-doc pass.
     sqlite access is synchronous-but-cheap (single-process eval tool).
+
+    ``fetched_texts`` / ``fetched_tokens`` count what actually reached the
+    backend (cache misses that came back) — the spend, as opposed to every
+    text asked for; tokens only with a ``count_tokens`` function.
     """
 
     def __init__(
@@ -77,12 +85,16 @@ class CachedEmbedder:
         backend_batch: int = 10,
         concurrency: int = 4,
         max_text_chars: int = 8000,
+        count_tokens: Callable[[str], int] | None = None,
     ) -> None:
         self._backend = backend
         self._model = model_key
         self._batch = max(1, backend_batch)
         self._max_text_chars = max(1, max_text_chars)
         self._sem = asyncio.Semaphore(max(1, concurrency))
+        self._count_tokens = count_tokens
+        self.fetched_texts = 0
+        self.fetched_tokens = 0
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path)
         self._db.execute(
@@ -112,11 +124,15 @@ class CachedEmbedder:
                 # transport drops (round 4 ReadTimeout) self-heal on the
                 # shared policy; genuine content 400s re-raise at once.
                 async with self._sem:
-                    return await with_retries(
+                    vectors: list[tuple[float, ...]] = await with_retries(
                         lambda: self._backend.embed(  # type: ignore[attr-defined]
                             [texts[i] for i in batch], tenant_id=tenant_id
                         )
                     )
+                self.fetched_texts += len(batch)
+                if self._count_tokens is not None:
+                    self.fetched_tokens += sum(self._count_tokens(texts[i]) for i in batch)
+                return vectors
 
             fetched = await asyncio.gather(*[_fetch(b) for b in batches])
             for batch, vectors in zip(batches, fetched, strict=True):
@@ -150,7 +166,12 @@ _EMBED_ENV = ("EXPERT_WORK_EVAL_EMBED_API_KEY", "EXPERT_WORK_EVAL_EMBED_MODEL")
 
 
 def build_real_embedder(
-    *, cache_db: Path | None = None, concurrency: int = 4, max_text_chars: int = 8000
+    *,
+    cache_db: Path | None = None,
+    concurrency: int = 4,
+    max_text_chars: int = 8000,
+    marker: EmbeddingMarker | None = None,
+    count_tokens: Callable[[str], int] | None = None,
 ) -> object:
     """OpenAI-compatible embedder from ``EXPERT_WORK_EVAL_EMBED_*`` env.
 
@@ -161,6 +182,9 @@ def build_real_embedder(
     :class:`CachedEmbedder` (multi-arm runs embed each corpus once);
     ``max_text_chars`` is its truncation cap (the kb eval raises it so the
     vendor reports over-long inputs instead of silently embedding a head).
+    ``marker`` (B-206 K-5) is sent with every request and is part of the cache
+    key, so vectors made with and without it are never mixed up;
+    ``count_tokens`` lets the cache count the tokens it actually fetched.
     """
     missing = [name for name in _EMBED_ENV if not os.environ.get(name)]
     if missing:
@@ -168,7 +192,12 @@ def build_real_embedder(
             f"--embedder real requires env {', '.join(missing)} "
             "(plus optional EXPERT_WORK_EVAL_EMBED_BASE_URL)"
         )
-    from orchestrator.llm.embedder import HTTPEmbeddingClient, OpenAICompatibleEmbedder
+    from orchestrator.llm.embedder import (
+        NO_MARKER,
+        HTTPEmbeddingClient,
+        OpenAICompatibleEmbedder,
+        marked_model_key,
+    )
 
     base_url = os.environ.get("EXPERT_WORK_EVAL_EMBED_BASE_URL")
     client = (
@@ -177,13 +206,15 @@ def build_real_embedder(
         else HTTPEmbeddingClient(api_key=os.environ["EXPERT_WORK_EVAL_EMBED_API_KEY"])
     )
     model = os.environ["EXPERT_WORK_EVAL_EMBED_MODEL"]
-    backend = OpenAICompatibleEmbedder(client=client, model=model)
+    marker = marker or NO_MARKER
+    backend = OpenAICompatibleEmbedder(client=client, model=model, marker=marker)
     if cache_db is None:
         return backend
     return CachedEmbedder(
         backend,
-        model_key=model,
+        model_key=marked_model_key(model, marker),
         db_path=cache_db,
         concurrency=concurrency,
         max_text_chars=max_text_chars,
+        count_tokens=count_tokens,
     )

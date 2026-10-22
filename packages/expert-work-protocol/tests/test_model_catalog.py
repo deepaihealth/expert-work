@@ -469,14 +469,10 @@ def test_declared_caps_match_b206_tables() -> None:
     assert _e("glm", "embedding-3").embedding_caps == EmbeddingCaps(
         asymmetry="none", max_batch=64, max_input_tokens=3_072
     )
+    # A query-side ``instruct`` field does change its query vector (measured
+    # 2026-10-21) but a dev-set A/B showed no gain (2026-10-22), so it is not enabled.
     assert _e("qwen", "text-embedding-v4").embedding_caps == EmbeddingCaps(
-        asymmetry="param",
-        query_marker="text_type=query",
-        document_marker="text_type=document",
-        instruction="Given a search query, retrieve relevant passages that answer the query",
-        native_endpoint="/api/v1/services/embeddings/text-embedding/text-embedding",
-        max_batch=10,
-        max_input_tokens=8_192,
+        asymmetry="none", max_batch=10, max_input_tokens=8_192
     )
     assert _e("qwen", "qwen3-vl-rerank").rerank_caps == RerankCaps(
         rerank_api="dashscope",
@@ -542,6 +538,33 @@ def test_caps_only_on_entries_with_the_matching_flag() -> None:
             },
             "'name=value'",
         ),
+        # "query_field" names one body field and sends the instruction in it,
+        # queries only — the document side is sent as is.
+        (
+            {"asymmetry": "query_field", "instruction": "Given a search query"},
+            "needs query_marker",
+        ),
+        (
+            {"asymmetry": "query_field", "query_marker": "instruct"},
+            "needs .*instruction",
+        ),
+        (
+            {
+                "asymmetry": "query_field",
+                "query_marker": "instruct=query",
+                "instruction": "Given a search query",
+            },
+            "bare field name",
+        ),
+        (
+            {
+                "asymmetry": "query_field",
+                "query_marker": "instruct",
+                "document_marker": "instruct",
+                "instruction": "Given a search query",
+            },
+            "no document_marker",
+        ),
         # "prefix" needs a query template that places the query.
         ({"asymmetry": "prefix"}, r"'\{query\}'"),
         ({"asymmetry": "prefix", "query_marker": "search_query: "}, r"'\{query\}'"),
@@ -552,6 +575,11 @@ def test_caps_only_on_entries_with_the_matching_flag() -> None:
                 "document_marker": "search_document: ",
             },
             r"'\{document\}'",
+        ),
+        # A "{task}" with no instruction would reach the vendor as the literal text.
+        (
+            {"asymmetry": "prefix", "query_marker": "Instruct: {task}\nQuery: {query}"},
+            r"'\{task\}' needs an instruction",
         ),
     ],
 )
@@ -579,3 +607,17 @@ def test_embedding_caps_accept_each_shape() -> None:
         query_marker="search_query: {query}",
         document_marker="search_document: {document}",
     )
+    EmbeddingCaps(
+        asymmetry="query_field",
+        query_marker="instruct",
+        instruction="Given a search query, retrieve relevant passages that answer the query",
+    )
+
+
+def test_no_embedding_model_needs_a_native_endpoint_yet() -> None:
+    # The platform's embedding client speaks only the OpenAI-compatible
+    # endpoint; a marker declared for a native one would be sent where the
+    # vendor drops it — a silently weaker request.
+    for provider, entry in _flagged("embeddings"):
+        assert entry.embedding_caps is not None
+        assert entry.embedding_caps.native_endpoint is None, f"{provider}/{entry.name}"
