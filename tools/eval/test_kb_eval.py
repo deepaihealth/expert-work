@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-import kb_eval  # type: ignore[import-not-found]
 import pytest
 import yaml
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
@@ -640,14 +639,14 @@ async def test_query_marker_arms_do_not_share_cached_query_vectors(
         }
 
     monkeypatch.setattr(HTTPEmbeddingClient, "embeddings", _fake_embeddings)
-    monkeypatch.setattr(kb_eval, "EMBED_CACHE_DB", tmp_path / "embed_cache.sqlite")
+    monkeypatch.setattr("kb_eval.EMBED_CACHE_DB", tmp_path / "embed_cache.sqlite")
     monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_API_KEY", "unit-test-key")
     monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_MODEL", "text-embedding-v4")
     tenant = uuid4()
     # The real catalog entry enables no marker, so "on" sends nothing extra.
     assert build_embedder("real", concurrency=1, query_marker=True).query_marker == "none"
     caps = EmbeddingCaps(asymmetry="query_field", query_marker="instruct", instruction=_TASK)
-    monkeypatch.setattr(kb_eval, "catalog_embedding_caps", lambda model: caps)
+    monkeypatch.setattr("kb_eval.catalog_embedding_caps", lambda model: caps)
 
     off = build_embedder("real", concurrency=1, query_marker=False)
     on = build_embedder("real", concurrency=1, query_marker=True)
