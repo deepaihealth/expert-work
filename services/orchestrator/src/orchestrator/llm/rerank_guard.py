@@ -49,7 +49,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from aiolimiter import AsyncLimiter
 
@@ -68,9 +68,31 @@ from orchestrator.tools.knowledge_rerank import (
 if TYPE_CHECKING:
     import redis.asyncio as redis_async
 
-    from orchestrator.llm.rerank import RerankClient
-
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class RerankClient(Protocol):
+    """The one rerank endpoint we use — sized so tests fake it without httpx.
+
+    ``instruction`` (B-206 K-14) is passed only when there is one, so a client
+    written before it existed keeps working. A failed request raises
+    :class:`~orchestrator.llm.rerank_guard.RerankCallError` saying what kind of
+    failure it was (B-206 K-7) — the one thing
+    :class:`~orchestrator.llm.rerank_guard.RerankGuards` needs from a vendor
+    client to pace, retry and give up for it."""
+
+    async def rerank(
+        self,
+        *,
+        model: str,
+        query: str,
+        documents: Sequence[str],
+        top_n: int,
+        instruction: str | None = None,
+    ) -> Mapping[str, Any]:
+        """POST the rerank endpoint; return the parsed JSON body."""
+
 
 #: How a rerank request failed, as the vendor client judged it:
 #: ``rate_limited`` the vendor asked us to slow down (HTTP 429);

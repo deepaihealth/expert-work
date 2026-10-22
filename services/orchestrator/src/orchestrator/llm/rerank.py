@@ -1,6 +1,6 @@
 """DashScope native rerank — for dedicated rerank models.
 
-expert_work's default reranker (:class:`orchestrator.tools.knowledge.LLMReranker`)
+expert_work's default reranker (:class:`orchestrator.tools.llm_reranker.LLMReranker`)
 prompts a **chat** model to rank candidates. DashScope's dedicated rerank
 models (``qwen3-vl-rerank``, ``gte-rerank``, ``text-rerank-*``) are NOT served
 over the OpenAI-compatible chat endpoint — calling them there returns
@@ -24,7 +24,7 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 from uuid import UUID
 
 import httpx
@@ -37,6 +37,7 @@ from orchestrator.llm.rerank_guard import (
     retry_after_seconds,
     status_failure,
 )
+from orchestrator.llm.rerank_guard import RerankClient as RerankClient
 from orchestrator.tools.knowledge import RerankRanking
 
 logger = logging.getLogger(__name__)
@@ -60,29 +61,6 @@ _SIZE_REFUSAL_WORDING = re.compile(r"length|too long|exceed|token", re.IGNORECAS
 #: B-206 K-7a — the code prefixes of an HTTP 400 that is not the request's fault.
 _THROTTLING_CODE = "Throttling"
 _INTERNAL_ERROR_CODE = "InternalError"
-
-
-@runtime_checkable
-class RerankClient(Protocol):
-    """The one rerank endpoint we use — sized so tests fake it without httpx.
-
-    ``instruction`` (B-206 K-14) is passed only when there is one, so a client
-    written before it existed keeps working. A failed request raises
-    :class:`~orchestrator.llm.rerank_guard.RerankCallError` saying what kind of
-    failure it was (B-206 K-7) — the one thing
-    :class:`~orchestrator.llm.rerank_guard.RerankGuards` needs from a vendor
-    client to pace, retry and give up for it."""
-
-    async def rerank(
-        self,
-        *,
-        model: str,
-        query: str,
-        documents: Sequence[str],
-        top_n: int,
-        instruction: str | None = None,
-    ) -> Mapping[str, Any]:
-        """POST the rerank endpoint; return the parsed JSON body."""
 
 
 @dataclass(frozen=True)

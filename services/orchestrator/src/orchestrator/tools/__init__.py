@@ -70,13 +70,13 @@ from orchestrator.tools.knowledge import (
     KnowledgeSearchTool as KnowledgeSearchTool,
 )
 from orchestrator.tools.knowledge import (
-    LLMReranker as LLMReranker,
-)
-from orchestrator.tools.knowledge import (
     Reranker as Reranker,
 )
 from orchestrator.tools.knowledge import (
     RetrievedChunk as RetrievedChunk,
+)
+from orchestrator.tools.llm_reranker import (
+    LLMReranker as LLMReranker,
 )
 from orchestrator.tools.locks import (
     NullWorkspaceLock as NullWorkspaceLock,

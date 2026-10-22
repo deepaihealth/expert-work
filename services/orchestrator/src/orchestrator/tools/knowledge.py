@@ -47,8 +47,6 @@ from orchestrator.tools.knowledge_rerank import (
 from orchestrator.tools.knowledge_rerank import Reranker as Reranker
 from orchestrator.tools.knowledge_rerank import RerankRanking as RerankRanking
 from orchestrator.tools.knowledge_rerank import ScoredReranker as ScoredReranker
-from orchestrator.tools.llm_reranker import LLMReranker as LLMReranker
-from orchestrator.tools.llm_reranker import _parse_rerank_order as _parse_rerank_order
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.rerank_passage import rerank_passage
 

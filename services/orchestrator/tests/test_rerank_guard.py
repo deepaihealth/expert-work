@@ -443,7 +443,7 @@ async def test_waiting_for_a_concurrency_slot_past_the_budget_is_a_model_error(
     with rerank_budget(0.02), pytest.raises(RerankUnavailableError) as raised:
         await _call(guards.wrap(inner, provider="x", model="one-at-a-time", secret_ref="s"))
     gate.release.set()
-    await busy
+    await asyncio.wait([busy])
     assert raised.value.outcome == "model_error"
     assert inner.calls == []
 
