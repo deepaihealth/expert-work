@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import time
 
 import pytest
@@ -191,11 +192,21 @@ def test_a_table_growing_past_four_times_its_html_is_written_as_cell_text() -> N
 )
 def test_degenerate_markup_is_cleaned_in_linear_time(reading: str) -> None:
     # The largest reading that still gets cleaned; each runs in ~0.05 s or less,
-    # a quadratic pattern takes 0.5 s and more.
+    # a quadratic pattern takes 0.5 s and more. Timed in this thread's CPU time
+    # with automatic GC off: a wall-clock bound went red under `-n auto` when a
+    # full collection (0.2-0.45 s in a long-lived xdist worker) or a busy
+    # runner landed inside the call.
     assert not reading_too_large(reading)
-    started = time.perf_counter()
-    clean_reading(reading)
-    assert time.perf_counter() - started < 0.25
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        started = time.thread_time()
+        clean_reading(reading)
+        spent = time.thread_time() - started
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    assert spent < 0.25
 
 
 def test_a_raw_reading_past_64_kib_is_too_large() -> None:
