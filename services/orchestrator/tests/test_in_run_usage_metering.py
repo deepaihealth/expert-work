@@ -526,6 +526,54 @@ async def test_knowledge_query_embedding_is_metered_as_platform_overhead(
     assert run.budget.spent == 2 * (_PURPOSE_INPUT["main"] + 1) + 9
 
 
+@dataclass
+class _QuerySideEmbedder:
+    """An embedder with a query side — :class:`DynamicResolvingEmbedder`'s shape (B-206 K-5)."""
+
+    inner: OpenAICompatibleEmbedder
+    queries: list[str] = field(default_factory=list)
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        return await self.inner.embed(texts, tenant_id=tenant_id)
+
+    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        self.queries.append(query)
+        (vector,) = await self.inner.embed([query], tenant_id=tenant_id)
+        return vector
+
+
+@pytest.mark.asyncio
+async def test_metered_query_embedding_keeps_the_query_side(
+    tracing: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-206 K-5 with B-209 —— the run's metering wrapper must not hide the embedder's
+    query side: ``knowledge_search`` still embeds through ``embed_query`` (where the
+    catalog's query marker is added), and the call is still metered once."""
+    search = {
+        "name": "knowledge_search",
+        "args": {"query": "deductible"},
+        "id": "call-1",
+        "type": "tool_call",
+    }
+    brain = _Brain(
+        main_replies=[AIMessage(content="", tool_calls=[search], usage_metadata=_usage("main"))]
+    )
+    _patch_providers(monkeypatch, brain)
+    env = await _knowledge_env(_SpyReranker())
+    assert env.knowledge_retriever is not None
+    embedder = _QuerySideEmbedder(
+        inner=OpenAICompatibleEmbedder(client=_ReportingEmbeddingsApi(), model="text-embedding-v4")
+    )
+    env = replace(env, knowledge_retriever=replace(env.knowledge_retriever, embedder=embedder))
+    spec = _spec({"knowledge": {"knowledge_base_refs": ["kb"]}})
+
+    run = await _run(spec, brain, tool_env=env)
+
+    assert embedder.queries == ["deductible"]
+    [row] = [r for r in run.rows if r.model == "text-embedding-v4"]
+    assert (row.usage_kind, row.input_tokens) == (PLATFORM_OVERHEAD_USAGE_KIND, 9)
+
+
 @pytest.mark.asyncio
 async def test_non_conversation_build_labels_every_in_run_call_with_the_build_kind(
     tracing: None, monkeypatch: pytest.MonkeyPatch

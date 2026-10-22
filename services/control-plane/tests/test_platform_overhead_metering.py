@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -487,8 +487,10 @@ async def test_llm_rerank_outside_an_agent_build_records_nothing(
 
 @dataclass
 class _EmbeddingsApi:
-    async def embeddings(self, *, model: str, texts: Sequence[str]) -> Any:
-        del model
+    async def embeddings(
+        self, *, model: str, texts: Sequence[str], fields: Mapping[str, str] | None = None
+    ) -> Any:
+        del model, fields
         return {
             "data": [{"index": i, "embedding": [1.0, 0.0]} for i in range(len(texts))],
             "usage": {"prompt_tokens": 11, "total_tokens": 11},

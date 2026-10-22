@@ -46,7 +46,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage
@@ -397,6 +397,9 @@ class ScopedReranker:
             return [(index, None) for index in order]
 
 
+_T = TypeVar("_T")
+
+
 @dataclass(frozen=True)
 class ScopedEmbedder:
     """B-209 §5.8 —— 检索时 run 内的查询嵌入:平台嵌入模型的调用,与重排同口径记
@@ -411,6 +414,22 @@ class ScopedEmbedder:
     async def embed(
         self, texts: Sequence[str], *, tenant_id: UUID, **kwargs: Any
     ) -> list[tuple[float, ...]]:
+        return await self._metered(self.inner.embed(texts, tenant_id=tenant_id, **kwargs))
+
+    async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        """B-206 K-5 —— the knowledge-search query side passes through to an inner
+        embedder that has one (it adds the model catalog's query marker), metered
+        like :meth:`embed`; an inner without one embeds the query plainly."""
+        embed_query = getattr(self.inner, "embed_query", None)
+        if embed_query is None:
+            (vector,) = await self._metered(self.inner.embed([query], tenant_id=tenant_id))
+            return vector
+        query_vector: tuple[float, ...] = await self._metered(
+            embed_query(query, tenant_id=tenant_id)
+        )
+        return query_vector
+
+    async def _metered(self, call: Awaitable[_T]) -> _T:
         spent: dict[str, int] = {}
 
         def tally(model: str, usage: Mapping[str, Any]) -> None:
@@ -418,7 +437,7 @@ class ScopedEmbedder:
             spent[model] = spent.get(model, 0) + tokens
 
         with embedding_usage_sink(tally):
-            vectors = await self.inner.embed(texts, tenant_id=tenant_id, **kwargs)
+            vectors = await call
         for model, tokens in spent.items():
             if tokens <= 0:
                 continue
