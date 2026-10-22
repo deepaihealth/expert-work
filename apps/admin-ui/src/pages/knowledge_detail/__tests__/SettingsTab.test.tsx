@@ -179,4 +179,3 @@ describe("SettingsTab sends the rerank-score threshold only to calibrate it (B-2
     }
   });
 });
-

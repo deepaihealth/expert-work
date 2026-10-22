@@ -152,4 +152,3 @@ describe("RetrievalTestTab rerank-score threshold (B-206 K-7b)", () => {
     expect(screen.queryByTestId("kb-test-rerank-threshold-paused")).toBeNull();
   });
 });
-

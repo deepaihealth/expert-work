@@ -105,4 +105,3 @@ describe("RowDetailResult rerank-score threshold (B-206 K-7b)", () => {
     expect(screen.queryByTestId("console-detail-rerank-threshold-paused")).toBeNull();
   });
 });
-
