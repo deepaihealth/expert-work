@@ -1172,6 +1172,11 @@ def _is_dashscope_rerank_model(provider: str, model: str) -> bool:
     return provider == "qwen" and "rerank" in model.lower()
 
 
+def _instruction_kwargs(instruction: str | None) -> dict[str, Any]:
+    """B-206 K-14 —— 任务说明只在有的时候才往下传(见 ``ScoredReranker``);LLM 重排分支不用它。"""
+    return {} if instruction is None else {"instruction": instruction}
+
+
 def _metered_rerank(router: LLMCaller, provider: str, model: str) -> LLMCaller:
     """B-104 —— 重排序的 LLM 分支:run 内(``ScopedReranker`` 放了记账身份)套记账,
     记 ``platform_overhead``、记在调用它的 agent 名下;run 外(检索测试接口等)原样。"""
@@ -1212,7 +1217,13 @@ class ResolvingReranker:
         return [index for index, _score in ranked]
 
     async def rerank_scored(
-        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+        self,
+        *,
+        query: str,
+        documents: Sequence[str],
+        top_k: int,
+        tenant_id: UUID,
+        instruction: str | None = None,
     ) -> list[tuple[int, float | None]]:
         if not documents:
             return []
@@ -1241,7 +1252,13 @@ class ResolvingReranker:
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=self.model
-            ).rerank_scored(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
+            ).rerank_scored(
+                query=query,
+                documents=documents,
+                top_k=top_k,
+                tenant_id=tenant_id,
+                **_instruction_kwargs(instruction),
+            )
         model_spec = ModelSpec.model_validate(
             {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
         )
@@ -1374,7 +1391,13 @@ class DynamicResolvingReranker:
         return [index for index, _score in ranked]
 
     async def rerank_scored(
-        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+        self,
+        *,
+        query: str,
+        documents: Sequence[str],
+        top_k: int,
+        tenant_id: UUID,
+        instruction: str | None = None,
     ) -> list[tuple[int, float | None]]:
         if not documents:
             return []
@@ -1411,7 +1434,13 @@ class DynamicResolvingReranker:
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
             return await DashScopeReranker(
                 client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=model
-            ).rerank_scored(query=query, documents=documents, top_k=top_k, tenant_id=tenant_id)
+            ).rerank_scored(
+                query=query,
+                documents=documents,
+                top_k=top_k,
+                tenant_id=tenant_id,
+                **_instruction_kwargs(instruction),
+            )
         model_spec = ModelSpec.model_validate(
             {"provider": provider, "name": model, "api_key_ref": secret_ref}
         )

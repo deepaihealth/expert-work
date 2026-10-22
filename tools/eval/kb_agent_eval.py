@@ -33,6 +33,11 @@
     EXPERT_WORK_EVAL_EMBED_API_KEY=offline-cache-only uv run --no-sync python \\
         tools/eval/kb_agent_eval.py ... --dry
 
+B-206 K-14 对照组:``--rerank-view dual|single|single_clean`` / ``--rerank-pool N`` /
+``--rerank-instruct``(与 ``kb_eval.py`` 同义,默认 = 生产默认 dual + 100;``--rerank-instruct``
+只能配单视图);每组写自己的 ``--out``,
+组别记在结果文件末尾的 run 行里。
+
 ``--answer-model`` / ``--judge-model`` 换模型(默认 glm-5.3 / deepseek-v4-pro);不在
 :data:`PRICES` 里的模型要配 ``--answer-price`` / ``--judge-price``
 (元 / 百万 token:输入,缓存命中,输出)。
@@ -71,6 +76,7 @@ from kb_dataset import KbCase, KbDataset, load_dataset  # type: ignore[import-no
 from kb_eval import (  # type: ignore[import-not-found]
     EVAL_OUT_DIR,
     EVAL_TENANT_ID,
+    INSTRUCT_NEEDS_SINGLE_VIEW,
     _all_chunk_texts,
     _resolve_manifest,
     _resolve_tiers,
@@ -91,7 +97,12 @@ from expert_work.common.spotlight import SPOTLIGHT_SYSTEM_CLAUSE
 from expert_work.persistence import KnowledgeStore
 from expert_work.protocol import DocumentStatus
 from orchestrator.llm.providers.openai import _to_openai_tool
-from orchestrator.tools.knowledge import KnowledgeSearchTool
+from orchestrator.tools.knowledge import (
+    DEFAULT_RERANK_POOL,
+    DEFAULT_RERANK_VIEW,
+    RERANK_VIEWS,
+    KnowledgeSearchTool,
+)
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 
 AGENT_SYSTEM = (
@@ -756,6 +767,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="查询侧标记(B-206 K-5,同 kb_eval):off = 对照臂,查询不带标记",
     )
     parser.add_argument("--rerank", default="dashscope", choices=("dashscope", "off"))
+    # B-206 K-14 对照组,与 kb_eval.py 同名同义;默认 = 生产默认。
+    parser.add_argument("--rerank-view", default=DEFAULT_RERANK_VIEW, choices=RERANK_VIEWS)
+    parser.add_argument("--rerank-pool", type=int, default=DEFAULT_RERANK_POOL)
+    parser.add_argument("--rerank-instruct", action="store_true")
     return parser
 
 
@@ -763,6 +778,10 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
     for name in ("dataset", "chat_dataset", "out"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required (unless --tally)")
+    if args.rerank_pool < 1:
+        parser.error(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
+    if args.rerank_instruct and args.rerank_view == "dual":
+        parser.error(INSTRUCT_NEEDS_SINGLE_VIEW)
     cache_only = args.embedder == "real" or args.rerank == "dashscope"
     if args.dry and cache_only and os.environ.get(RERANK_KEY_ENV) != OFFLINE_KEY:
         parser.error(
@@ -862,7 +881,14 @@ async def _run(
                 kb_id=report.base_id,
                 cases=[case for _label, case in todo],
             )
-            retriever = build_retriever(store=store, embedder=bundle.embedder, reranker=reranker)
+            retriever = build_retriever(
+                store=store,
+                embedder=bundle.embedder,
+                reranker=reranker,
+                rerank_view=args.rerank_view,
+                rerank_pool=args.rerank_pool,
+                rerank_instruction=args.rerank_instruct,
+            )
             written = await run_questions(
                 todo=todo,
                 models=models,
@@ -884,6 +910,12 @@ async def _run(
         "answer_model": models.answer_model,
         "judge_model": models.judge_model,
         "query_marker": bundle.query_marker,
+        # B-206 K-14:这次跑的是哪个重排对照组(不同组请写不同的 --out)。
+        "rerank_arm": {
+            "view": args.rerank_view,
+            "pool": args.rerank_pool,
+            "instruct": args.rerank_instruct,
+        },
         "calls": {"answer": spend.answer_calls, "judge": spend.judge_calls},
         "spend_cny": {
             "answer": round(spend.answer_cny, 6),

@@ -39,6 +39,11 @@
         --store sql --embedder real --tiers A,D-A --label baseline-$(git rev-parse --short HEAD) \\
         --update-baseline
 
+B-206 K-14 重排对照组:``--rerank-view dual|single|single_clean`` / ``--rerank-pool N`` /
+``--rerank-instruct`` 直接设到生产检索器上(不给 = 生产默认 dual + 100、不带任务说明;
+``--rerank-instruct`` 只能配单视图;K-14 之前的生产 = ``--rerank-pool 50``,请求与那时逐字相同,
+重排缓存照样命中)。重排只判了候选池的一部分(池超过模型单次上限,或超长被拒后少送重试)时整轮退出。
+
 凭据只从环境变量读(``EXPERT_WORK_EVAL_EMBED_API_KEY`` / ``_MODEL`` / ``_BASE_URL``;
 ``--rerank on`` 另要 ``EXPERT_WORK_EVAL_LLM_API_KEY`` / ``_MODEL`` / ``_BASE_URL``),没有命令行开关。
 真嵌入包在 ``longmem.embedders.CachedEmbedder`` 里(``eval-out/kb/embed_cache.sqlite``),
@@ -122,10 +127,14 @@ from orchestrator.llm.embedder import (
     embedding_marker,
 )
 from orchestrator.tools.knowledge import (
+    DEFAULT_RERANK_POOL,
+    DEFAULT_RERANK_VIEW,
+    RERANK_VIEWS,
     KnowledgeRetriever,
     KnowledgeSearchOutcome,
     KnowledgeSearchTool,
     Reranker,
+    RerankView,
     RetrievedChunk,
     default_recall_depth,
 )
@@ -174,6 +183,12 @@ _STORE_EXC_MODULES = ("sqlalchemy", "asyncpg", "psycopg", "expert_work.persisten
 _CHUNK_PAGE = 200
 #: 工具结果的防注入围栏 nonce(生产默认开 spotlight,每次构建随机取);固定下来渲染结果才可复现。
 TOOL_SPOTLIGHT_NONCE = "kbeval0nonce"
+#: B-206 K-14:双视图不发任务说明,这样的组合会被记成「带了说明」而请求里其实没有;
+#: 建库前就拒绝(检索器自己也拒,但那要等建完库)。
+INSTRUCT_NEEDS_SINGLE_VIEW = (
+    "--rerank-instruct needs --rerank-view single (or single_clean): the dual view, the "
+    "default, sends no instruction, so the run would be recorded as instructed without one"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +210,11 @@ class EvalConfig:
     rerank_mode: str = "off"
     #: 结果里带上每段的 retrieval 文本(``--with-text``,汇集标注要用;默认不带,结果文件形状不变)
     with_text: bool = False
+    #: B-206 K-14 对照组(``--rerank-view`` / ``--rerank-pool`` / ``--rerank-instruct``):
+    #: 直接设到生产检索器上,默认即生产默认。
+    rerank_view: RerankView = DEFAULT_RERANK_VIEW
+    rerank_pool: int = DEFAULT_RERANK_POOL
+    rerank_instruction: bool = False
 
 
 @dataclass(frozen=True)
@@ -341,7 +361,8 @@ class EmbedStageError(RuntimeError):
 
 
 class RerankDegradedError(RuntimeError):
-    """开了重排却有一题退回了融合序(B-175 波 2 PR3)—— 整轮退出。
+    """开了重排却有一题退回了融合序(B-175 波 2 PR3),或只判了候选池的一部分(B-206 K-14)
+    —— 整轮退出。
 
     检索器把重排出错 / 返回空降级成融合序、不再抛错(生产要这样),评测不能:离线复跑缓存
     没命中(:class:`kb_rerank.RerankCacheMissError`)或线上 429 / 5xx 会让那一题悄悄按融合序
@@ -868,12 +889,22 @@ def build_retriever(
     embedder: Embedder,
     reranker: Reranker | None,
     top_k: int = DEFAULT_TOP_K,
+    rerank_view: RerankView = DEFAULT_RERANK_VIEW,
+    rerank_pool: int = DEFAULT_RERANK_POOL,
+    rerank_instruction: bool = False,
 ) -> KnowledgeRetriever:
     """两路召回深度跟生产同一个默认(:func:`default_recall_depth`);只有 ``top_k`` 超过它时
-    才把深度抬到 ``top_k``,否则前 k 名凑不满。"""
+    才把深度抬到 ``top_k``,否则前 k 名凑不满。``rerank_*`` 是生产检索器自己的 K-14 旋钮
+    (默认 = 生产默认)。"""
     recall_limit = top_k if top_k > default_recall_depth(top_k) else None
     return KnowledgeRetriever(
-        store=store, embedder=embedder, reranker=reranker, recall_limit=recall_limit
+        store=store,
+        embedder=embedder,
+        reranker=reranker,
+        recall_limit=recall_limit,
+        rerank_view=rerank_view,
+        rerank_pool=rerank_pool,
+        rerank_instruction=rerank_instruction,
     )
 
 
@@ -912,6 +943,13 @@ async def run_eval(
                 "warning): its numbers would be keyword search alone"
             )
             raise EmbeddingDegradedError(msg)
+        if cfg.rerank and outcome.rerank_dropped:
+            msg = (
+                f"rerank on case {case.id} never judged {outcome.rerank_dropped} of its "
+                "candidates (the model's per-request cap or a length refusal): its numbers "
+                "would not be this arm's pool"
+            )
+            raise RerankDegradedError(msg)
         results = list(outcome.results)
         replay = _ReplayRetriever(inner=retriever, outcome=outcome)
         tool = KnowledgeSearchTool(
@@ -959,7 +997,8 @@ async def run_eval(
 class _ReplayRetriever:
     """``knowledge_search`` 那次检索不重跑:给它这次检索结果的前 ``limit`` 条(模型不传条数时
     就是工具默认条数)。召回深度只在 ``limit`` > 25、双视图重排的前段只在 ``limit`` > 20 时才随
-    ``limit`` 变,所以默认 ``--top-k 20`` 下与工具自己搜一次逐条相同,也不多花一次嵌入 / 重排;
+    ``limit`` 变(单视图整池排序,不随 ``limit`` 变),所以默认 ``--top-k 20`` 下与工具自己搜一次
+    逐条相同,也不多花一次嵌入 / 重排;
     其余属性转给真检索器(工具以后要从库里取父段之类的,照样拿得到)。"""
 
     inner: KnowledgeRetriever
@@ -1257,6 +1296,16 @@ def fingerprint(
         "threshold": cfg.threshold,
         "rerank": cfg.rerank_mode,
         "rerank_threshold": cfg.rerank_threshold,
+        **rerank_arm(cfg),
+    }
+
+
+def rerank_arm(cfg: EvalConfig) -> dict[str, Any]:
+    """B-206 K-14:这次跑的是哪个重排对照组(结果汇总 / 基线指纹里都记)。"""
+    return {
+        "rerank_view": cfg.rerank_view,
+        "rerank_pool": cfg.rerank_pool,
+        "rerank_instruct": cfg.rerank_instruction,
     }
 
 
@@ -1528,6 +1577,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="dashscope = 生产同款 qwen3-vl-rerank(带缓存);llm = 聊天模型排序(on 是它的旧名)",
     )
     parser.add_argument(
+        "--rerank-view",
+        default=DEFAULT_RERANK_VIEW,
+        choices=RERANK_VIEWS,
+        help=(
+            "B-206 K-14 对照组:dual = 带标题 / 正文两视图加权(生产默认);single = 结构化单串"
+            "打一次分;single_clean = 单串、正文先去 Markdown / URL / 表格线 / HTML"
+        ),
+    )
+    parser.add_argument(
+        "--rerank-pool",
+        type=int,
+        default=DEFAULT_RERANK_POOL,
+        help="重排候选数(融合后前 N 条,再按模型单次上限封顶);K-14 之前等于 50。默认 = 生产默认",
+    )
+    parser.add_argument(
+        "--rerank-instruct",
+        action="store_true",
+        help=(
+            "单视图带英文任务说明(要配 --rerank-view single|single_clean;"
+            "只发给支持的模型,生产默认关)"
+        ),
+    )
+    parser.add_argument(
         "--doc-match",
         default="anchor",
         choices=("anchor", "listed"),
@@ -1642,7 +1714,13 @@ async def _run(
                     file=sys.stderr,
                 )
             retriever = build_retriever(
-                store=store, embedder=bundle.embedder, reranker=reranker, top_k=cfg.top_k
+                store=store,
+                embedder=bundle.embedder,
+                reranker=reranker,
+                top_k=cfg.top_k,
+                rerank_view=cfg.rerank_view,
+                rerank_pool=cfg.rerank_pool,
+                rerank_instruction=cfg.rerank_instruction,
             )
             rows = await run_eval(
                 dataset=dataset,
@@ -1667,6 +1745,7 @@ async def _run(
         "threshold": cfg.threshold,
         "rerank": cfg.rerank_mode,
         "rerank_threshold": cfg.rerank_threshold,
+        **rerank_arm(cfg),
         "label": args.label,
     }
     summary = summarise(
@@ -1708,6 +1787,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "refusing to update baseline with --rerank-threshold: the baseline section is "
             "keyed by rerank mode only, so a thresholded run would overwrite the plain one"
         )
+    if args.rerank_pool < 1:
+        raise SystemExit(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
+    if args.rerank_instruct and args.rerank_view == "dual":
+        raise SystemExit(INSTRUCT_NEEDS_SINGLE_VIEW)
     cfg = EvalConfig(
         method=RetrievalMethod(args.method),
         top_k=args.top_k,
@@ -1716,7 +1799,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         rerank_threshold=args.rerank_threshold,
         rerank_mode=rerank_mode,
         with_text=args.with_text,
+        rerank_view=args.rerank_view,
+        rerank_pool=args.rerank_pool,
+        rerank_instruction=args.rerank_instruct,
     )
+    if args.update_baseline and rerank_arm(cfg) != rerank_arm(EvalConfig()):
+        raise SystemExit(
+            "refusing to update baseline with a K-14 arm (--rerank-view / --rerank-pool / "
+            "--rerank-instruct off the product default): the baseline section is keyed by "
+            "rerank mode only, so an A/B arm would overwrite the product's numbers"
+        )
     bundle = build_embedder(
         args.embedder, concurrency=args.concurrency, query_marker=args.query_marker == "on"
     )

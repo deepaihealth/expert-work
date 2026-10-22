@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -14,8 +17,18 @@ from langchain_core.messages import AIMessage
 from expert_work.common.search.rrf import rrf_fuse as _rrf_fuse
 from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence import InMemoryKnowledgeStore
-from expert_work.protocol import KnowledgeChunk, RetrievalMethod, ScoredChunk
+from expert_work.protocol import (
+    KnowledgeChunk,
+    RetrievalMethod,
+    ScoredChunk,
+    chunk_retrieval_text,
+)
 from orchestrator.errors import PlatformNotConfiguredError
+from orchestrator.llm.rerank import (
+    DASHSCOPE_RERANK_URL,
+    DashScopeReranker,
+    HTTPDashScopeRerankClient,
+)
 from orchestrator.tools import (
     KnowledgeRetriever,
     KnowledgeSearchTool,
@@ -27,10 +40,16 @@ from orchestrator.tools import (
 )
 from orchestrator.tools.error_classifier import GuidedToolError, classify_tool_error
 from orchestrator.tools.knowledge import (
+    DEFAULT_RERANK_POOL,
+    DEFAULT_RERANK_VIEW,
     KNOWLEDGE_ANSWERABILITY_RULE,
     RERANK_DOC_MAX_CHARS,
+    RERANK_INSTRUCTION,
+    RerankRanking,
     _parse_rerank_order,
 )
+from orchestrator.tools.rerank_passage import rerank_passage
+from orchestrator.usage_metering import ScopedReranker, UsageIdentity
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -492,30 +511,6 @@ async def test_explicit_recall_limit_is_respected(recall_limit: int) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("limit", "recall_limit", "candidates"),
-    [(5, None, 50), (60, None, 100), (5, 150, 100)],
-)
-async def test_rerank_candidates_follow_recall_depth_capped_at_100(
-    limit: int, recall_limit: int | None, candidates: int
-) -> None:
-    # Two bases x 120 chunks: fusion yields up to 240 candidates; the
-    # reranker (qwen3-vl-rerank: <= 100 documents per request) never gets more
-    # than 100, however many bases are searched or how deep recall goes.
-    store = InMemoryKnowledgeStore()
-    tenant = await _seed_bases(store, bases=2, per_base=120)
-    reranker = _CountingReranker()
-    retriever = KnowledgeRetriever(
-        store=store,
-        embedder=_FixedEmbedder((1.0, 0.0)),
-        reranker=reranker,
-        recall_limit=recall_limit,
-    )
-    await retriever.search(tenant_id=tenant, base_names=["kb0", "kb1"], query="policy", limit=limit)
-    assert reranker.sizes == [candidates]
-
-
-@pytest.mark.asyncio
 async def test_without_rerank_the_candidate_cap_does_not_cut_results() -> None:
     # The 100 cap is the reranker's request limit; a fused-order search still
     # returns its full ``limit`` beyond it.
@@ -866,10 +861,19 @@ async def _titled_store(
     return store, tenant, chunks
 
 
+def _dual(store: InMemoryKnowledgeStore, reranker: Any) -> KnowledgeRetriever:
+    """The two-view rerank (B-175 wave 2 PR2b), kept as the ``dual`` view since
+    B-206 K-14 made the single view the default: its scores and order are pinned
+    by the tests below."""
+    return KnowledgeRetriever(
+        store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker, rerank_view="dual"
+    )
+
+
 async def test_two_view_rerank_cuts_both_views_to_the_cap() -> None:
     store, tenant, _chunks = await _titled_store(["y" * 5000, "z" * 10], title="guide")
     reranker = _ScoringReranker({})
-    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    retriever = _dual(store, reranker)
     await retriever.search(tenant_id=tenant, base_names=["kb"], query="y", limit=5)
     assert len(reranker.calls) == 2
     assert all(len(doc) <= RERANK_DOC_MAX_CHARS for docs, _ in reranker.calls for doc in docs)
@@ -892,7 +896,7 @@ async def test_two_view_rerank_ranks_by_the_weighted_mean_of_both_views() -> Non
             boilerplate: 0.10,
         }
     )
-    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    retriever = _dual(store, reranker)
 
     results = await retriever.search(
         tenant_id=tenant, base_names=["kb"], query="QXA-N7 专利", limit=5
@@ -913,7 +917,7 @@ async def test_two_view_rerank_judges_the_titled_top_20_on_the_body() -> None:
     scores = {f"[Document: guide]\n\n{b}": 1.0 - i / 100 for i, b in enumerate(bodies)}
     scores |= {b: i / 100 for i, b in enumerate(bodies)}
     reranker = _ScoringReranker(scores)
-    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    retriever = _dual(store, reranker)
 
     results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
 
@@ -931,7 +935,7 @@ async def test_two_view_rerank_falls_back_to_the_titled_order_without_scores() -
     reranker) is called once, on the titled text, and its order is kept."""
     store, tenant, _ = await _titled_store(["first", "second"], title="guide")
     reranker = _ScoringReranker({"[Document: guide]\n\nsecond": 0.9}, unscored=True)
-    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    retriever = _dual(store, reranker)
 
     results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
 
@@ -944,12 +948,356 @@ async def test_two_view_rerank_skips_the_body_view_for_untitled_chunks() -> None
     one call, no second charge."""
     store, tenant, _ = await _titled_store(["first", "second"], title=None)
     reranker = _ScoringReranker({"second": 0.9, "first": 0.1})
-    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    retriever = _dual(store, reranker)
 
     results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
 
     assert [r.content for r in results] == ["second", "first"]
     assert len(reranker.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# B-206 K-14 — single view, rerank pool, task instruction
+# ---------------------------------------------------------------------------
+
+
+class _InstructedScoringReranker(_ScoringReranker):
+    """A scoring reranker that takes a task instruction; records what it got."""
+
+    def __init__(self, scores: dict[str, float]) -> None:
+        super().__init__(scores)
+        self.instructions: list[str | None] = []
+
+    async def rerank_scored(
+        self,
+        *,
+        query: str,
+        documents: Sequence[str],
+        top_k: int,
+        tenant_id: UUID,
+        instruction: str | None = None,
+    ) -> list[tuple[int, float | None]]:
+        self.instructions.append(instruction)
+        return await super().rerank_scored(
+            query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+        )
+
+
+def _single(store: InMemoryKnowledgeStore, reranker: Any) -> KnowledgeRetriever:
+    """A retriever judging the single view (an internal option; dual is the default)."""
+    return KnowledgeRetriever(
+        store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker, rerank_view="single"
+    )
+
+
+async def test_single_view_judges_every_candidate_once_on_its_passage() -> None:
+    """One call, each candidate as its structured passage, the whole pool ranked
+    (a threshold can still fill ``limit``), and each result carries the score it
+    was ranked by."""
+    store, tenant, chunks = await _titled_store(["answer", "boilerplate", "other"], title="guide")
+    reranker = _ScoringReranker(
+        {"title: guide\ncontent: answer": 0.9, "title: guide\ncontent: boilerplate": 0.4}
+    )
+    retriever = _single(store, reranker)
+
+    results = await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=2)
+
+    ((documents, top_k),) = reranker.calls
+    assert sorted(documents) == sorted(rerank_passage(chunk) for chunk in chunks)
+    assert top_k == 3
+    assert [(r.content, r.rerank_score) for r in results] == [
+        ("answer", 0.9),
+        ("boilerplate", 0.4),
+    ]
+
+
+async def test_single_clean_view_sends_the_cleaned_body() -> None:
+    store, tenant, chunks = await _titled_store(["**dose** 2 g"], title="guide")
+    reranker = _ScoringReranker({})
+    retriever = replace(_single(store, reranker), rerank_view="single_clean")
+
+    await retriever.search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+
+    assert reranker.calls == [(["title: guide\ncontent: dose 2 g"], 1)]
+    assert rerank_passage(chunks[0], clean=True) == "title: guide\ncontent: dose 2 g"
+
+
+async def test_single_view_passages_are_cut_to_the_cap() -> None:
+    store, tenant, _ = await _titled_store(["y" * 5000], title="guide")
+    reranker = _ScoringReranker({})
+    await _single(store, reranker).search(tenant_id=tenant, base_names=["kb"], query="y", limit=5)
+    ((documents, _top_k),) = reranker.calls
+    assert documents == [("title: guide\ncontent: " + "y" * 5000)[:RERANK_DOC_MAX_CHARS]]
+
+
+async def test_a_ranking_only_reranker_gets_the_single_view_passages() -> None:
+    store, tenant, chunks = await _titled_store(["first", "second"], title="guide")
+    reranker = _RecordingReranker()
+    await _single(store, reranker).search(tenant_id=tenant, base_names=["kb"], query="q", limit=5)
+    assert sorted(reranker.documents) == sorted(rerank_passage(chunk) for chunk in chunks)
+
+
+async def test_the_task_instruction_goes_only_with_a_single_view_when_enabled() -> None:
+    store, tenant, _ = await _titled_store(["first", "second"], title="guide")
+    # Off (the default): not even ``instruction=None`` — a scoring reranker
+    # written before K-14 takes no such argument, and must not degrade.
+    off = _ScoringReranker({})
+    off_outcome = await _single(store, off).search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+    on = _InstructedScoringReranker({})
+    await replace(_single(store, on), rerank_instruction=True).search(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+    assert len(off.calls) == 1
+    assert off_outcome.rerank_degraded is False
+    assert on.instructions == [RERANK_INSTRUCTION]
+    assert RERANK_INSTRUCTION == (
+        "Given a question, judge whether the passage content itself states the answer; "
+        "the title only identifies the document"
+    )
+
+
+def test_an_instruction_with_the_dual_view_is_refused() -> None:
+    """The dual view sends no instruction; a retriever set up to send one with it
+    would silently not, and a run would be recorded as instructed when it was not."""
+    with pytest.raises(ValueError, match="rerank_instruction needs a single view"):
+        KnowledgeRetriever(
+            store=InMemoryKnowledgeStore(),
+            embedder=_FixedEmbedder((1.0,)),
+            rerank_view="dual",
+            rerank_instruction=True,
+        )
+    with pytest.raises(ValueError, match="rerank_instruction needs a single view"):
+        replace(
+            KnowledgeRetriever(store=InMemoryKnowledgeStore(), embedder=_FixedEmbedder((1.0,))),
+            rerank_instruction=True,
+        )
+
+
+async def test_the_metering_wrapper_passes_an_instruction_on_and_none_when_absent() -> None:
+    identity = UsageIdentity(
+        store=None, agent_name="a", agent_version="1", usage_kind="platform_overhead"
+    )
+    instructed = _InstructedScoringReranker({})
+    await ScopedReranker(inner=instructed, identity=identity).rerank_scored(
+        query="q", documents=["a"], top_k=1, tenant_id=uuid4(), instruction="judge it"
+    )
+    # A scoring reranker that predates instructions is not handed ``instruction=None``.
+    plain = _ScoringReranker({})
+    await ScopedReranker(inner=plain, identity=identity).rerank_scored(
+        query="q", documents=["a"], top_k=1, tenant_id=uuid4()
+    )
+    assert instructed.instructions == ["judge it"]
+    assert plain.calls == [(["a"], 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rerank_pool", "limit", "recall_limit", "candidates"),
+    [(None, 5, None, 100), (50, 5, None, 50), (None, 5, 30, 60), (150, 5, 150, 150)],
+)
+async def test_the_rerank_pool_is_the_top_of_the_fused_candidates(
+    rerank_pool: int | None, limit: int, recall_limit: int | None, candidates: int
+) -> None:
+    # Two bases x 120 chunks: fusion yields up to 240 candidates. The default
+    # pool is 100 (it was the 50-deep recall before K-14); a smaller fusion is
+    # judged whole. The model's own per-request cap is the reranker's to apply.
+    store = InMemoryKnowledgeStore()
+    tenant = await _seed_bases(store, bases=2, per_base=120)
+    reranker = _CountingReranker()
+    retriever = KnowledgeRetriever(
+        store=store,
+        embedder=_FixedEmbedder((1.0, 0.0)),
+        reranker=reranker,
+        recall_limit=recall_limit,
+    )
+    if rerank_pool is not None:
+        retriever = replace(retriever, rerank_pool=rerank_pool)
+    await retriever.search(tenant_id=tenant, base_names=["kb0", "kb1"], query="policy", limit=limit)
+    assert reranker.sizes == [candidates]
+
+
+def test_the_product_defaults_are_dual_view_pool_100_no_instruction() -> None:
+    retriever = KnowledgeRetriever(store=InMemoryKnowledgeStore(), embedder=_FixedEmbedder((1.0,)))
+    assert (retriever.rerank_view, retriever.rerank_pool, retriever.rerank_instruction) == (
+        "dual",
+        100,
+        False,
+    )
+    assert (DEFAULT_RERANK_VIEW, DEFAULT_RERANK_POOL) == ("dual", 100)
+
+
+async def _split_paths_store(
+    *, bases: int, per_base: int
+) -> tuple[InMemoryKnowledgeStore, UUID, list[KnowledgeChunk]]:
+    """Bases ``kb0``.. of ``per_base`` titled chunks with a section. The vector
+    path favours the last chunks of a base and the keyword path the first, so
+    the two 50-deep paths fuse into up to 100 candidates per base (the fused
+    order is fixed)."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    chunks: list[KnowledgeChunk] = []
+    for b in range(bases):
+        base = await store.create_base(tenant_id=tenant, name=f"kb{b}")
+        document = await store.upsert_document(
+            tenant_id=tenant, kb_id=base.id, filename=f"guide{b}.pdf"
+        )
+        in_base = [
+            _chunk(
+                tenant=tenant,
+                kb=base.id,
+                doc=document.id,
+                index=i,
+                content=f"policy clause {i} 条款",
+                embedding=(1.0, (per_base - 1 - i) / per_base),
+            ).model_copy(update={"doc_title": "guide", "heading_path": ("Policy",)})
+            for i in range(per_base)
+        ]
+        await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=in_base)
+        chunks += in_base
+    return store, tenant, chunks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("bases", "per_base", "titled"), [(2, 120, 100), (1, 30, 30)])
+async def test_the_default_titled_view_judges_the_top_100_fused_candidates(
+    bases: int, per_base: int, titled: int
+) -> None:
+    """Default dual / 100: the titled view gets ``min(fused, 100)`` candidates
+    (200 fused → 100; 30 → 30) as their retrieval text, top 20 asked back."""
+    store, tenant, _ = await _split_paths_store(bases=bases, per_base=per_base)
+    reranker = _ScoringReranker({})
+    retriever = KnowledgeRetriever(
+        store=store, embedder=_FixedEmbedder((1.0, 0.0)), reranker=reranker
+    )
+    names = [f"kb{b}" for b in range(bases)]
+    await retriever.search(tenant_id=tenant, base_names=names, query="policy", limit=5)
+    (titled_docs, titled_top_k), *_ = reranker.calls
+    assert len(titled_docs) == titled
+    assert titled_top_k == 20
+    # The titled view's text, not a single-view passage.
+    assert all(doc.startswith("[Document: guide]\n[Section: Policy]") for doc in titled_docs)
+
+
+#: sha256 over the request bodies the pre-K-14 code (``63cabc03f``) POSTs for
+#: :func:`_golden_dual_store` — limit 5, then limit 20; titled then body view
+#: each. Recomputed with that commit's ``knowledge.py`` / ``llm/rerank.py``.
+_PRE_K14_REQUESTS_SHA256 = "a3eeac4e177cf7afdfa5658c2d465825d57555f3f202830e4587f39fb1a512ff"
+
+
+async def _golden_dual_store() -> tuple[InMemoryKnowledgeStore, UUID, list[KnowledgeChunk]]:
+    """One base of 120 chunks fusing into 100 candidates: more than 50, so the
+    pre-K-14 pool of 50 is full and cut."""
+    return await _split_paths_store(bases=1, per_base=120)
+
+
+def _pre_k14_bodies(query: str, fused: Sequence[KnowledgeChunk], limit: int) -> list[bytes]:
+    """What the pre-K-14 code sent: the fused top 50 as retrieval text with
+    ``top_n = max(limit, 20)``, then the titled top 20 (the fake answers in input
+    order) as body text with ``top_n = 20``."""
+    titled = [chunk.retrieval_text[:RERANK_DOC_MAX_CHARS] for chunk in fused[:50]]
+    bodies = [
+        chunk_retrieval_text(chunk.heading_path, chunk.content)[:RERANK_DOC_MAX_CHARS]
+        for chunk in fused[:20]
+    ]
+    return [
+        httpx.Request(
+            "POST",
+            DASHSCOPE_RERANK_URL,
+            json={
+                "model": "qwen3-vl-rerank",
+                "input": {"query": {"text": query}, "documents": [{"text": d} for d in docs]},
+                "parameters": {"return_documents": False, "top_n": top_n},
+            },
+        ).content
+        for docs, top_n in ((titled, max(limit, 20)), (bodies, 20))
+    ]
+
+
+async def test_dual_pool_50_sends_the_pre_k14_requests_byte_for_byte() -> None:
+    """``--rerank-view dual --rerank-pool 50`` is the pre-K-14 product: the same
+    HTTP bodies, so its rerank-cache rows still answer it."""
+    store, tenant, chunks = await _golden_dual_store()
+    sent: list[bytes] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.content)
+        top_n = json.loads(request.content)["parameters"]["top_n"]
+        results = [{"index": i, "relevance_score": 1 - i / 1000} for i in range(top_n)]
+        return httpx.Response(200, json={"output": {"results": results}})
+
+    client = HTTPDashScopeRerankClient(api_key="k", transport=httpx.MockTransport(_handler))
+    retriever = KnowledgeRetriever(
+        store=store,
+        embedder=_FixedEmbedder((1.0, 0.0)),
+        reranker=DashScopeReranker(client=client, model="qwen3-vl-rerank"),
+        rerank_view="dual",
+        rerank_pool=50,
+    )
+    # Same per-path recall depth (50) as a 5- or 20-result search.
+    plain = KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0, 0.0)), recall_limit=50)
+    by_id = {chunk.id: chunk for chunk in chunks}
+    expected: list[bytes] = []
+    for limit in (5, 20):
+        order = await plain.search(
+            tenant_id=tenant, base_names=["kb0"], query="policy", limit=50, rerank=False
+        )
+        fused = [by_id[r.chunk_id] for r in order if r.chunk_id is not None]
+        expected += _pre_k14_bodies("policy", fused, limit)
+        await retriever.search(tenant_id=tenant, base_names=["kb0"], query="policy", limit=limit)
+
+    assert sent == expected
+    assert hashlib.sha256(b"".join(sent)).hexdigest() == _PRE_K14_REQUESTS_SHA256
+
+
+class _CappedReranker(_ScoringReranker):
+    """Judges only the leading ``judged`` documents of a call — a model whose
+    per-request cap is below the pool — and says how many it left out."""
+
+    def __init__(self, judged: int) -> None:
+        super().__init__({})
+        self.judged = judged
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        ranked = await super().rerank_scored(
+            query=query, documents=documents[: self.judged], top_k=top_k, tenant_id=tenant_id
+        )
+        return RerankRanking(ranked, dropped=max(0, len(documents) - self.judged))
+
+
+async def test_candidates_the_reranker_never_judged_are_reported() -> None:
+    """A rerank over part of the pool is not silent: the outcome and the tool's
+    meta say how many candidates were never judged (dual: titled view 30 → 25)."""
+    store, tenant, _ = await _titled_store([f"passage {i:02d}" for i in range(30)], title="guide")
+    dual = await _dual(store, _CappedReranker(judged=25)).search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+    single = await _single(store, _CappedReranker(judged=25)).search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+    whole = await _dual(store, _ScoringReranker({})).search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+    assert (dual.rerank_dropped, single.rerank_dropped, whole.rerank_dropped) == (5, 5, 0)
+
+    ctx = ToolContext(tenant_id=tenant)
+    capped = KnowledgeSearchTool(
+        retriever=_dual(store, _CappedReranker(judged=25)), knowledge_base_refs=("kb",)
+    )
+    plain = KnowledgeSearchTool(
+        retriever=_dual(store, _ScoringReranker({})), knowledge_base_refs=("kb",)
+    )
+    assert (await capped.call({"query": "q"}, ctx=ctx)).meta["rerank_dropped"] == 5
+    assert "rerank_dropped" not in (await plain.call({"query": "q"}, ctx=ctx)).meta
+
+    await _set_threshold(store, tenant, 0.99)  # everything judged falls below it
+    below = await _dual(store, _CappedReranker(judged=25)).search_detailed(
+        tenant_id=tenant, base_names=["kb"], query="q", limit=5
+    )
+    assert (below.status, below.rerank_dropped) == ("below_threshold", 5)
 
 
 # ---------------------------------------------------------------------------
@@ -1011,7 +1359,8 @@ async def _set_threshold(store: InMemoryKnowledgeStore, tenant: UUID, value: flo
 
 
 def _scored(store: InMemoryKnowledgeStore, reranker: Any) -> KnowledgeRetriever:
-    return KnowledgeRetriever(store=store, embedder=_FixedEmbedder((1.0,)), reranker=reranker)
+    # These tests predate B-206 K-14 and key their scores on the dual view's texts.
+    return _dual(store, reranker)
 
 
 async def test_each_result_reports_its_rerank_score() -> None:

@@ -11,6 +11,7 @@ import pytest
 from control_plane.runtime import (
     DynamicResolvingEmbedder,
     DynamicResolvingReranker,
+    ResolvingReranker,
     _is_dashscope_rerank_model,
 )
 from expert_work.common.credentials import CredentialsResolverError
@@ -304,6 +305,36 @@ async def test_reranker_scored_keeps_the_native_api_scores(monkeypatch):
     )
     out = await rr.rerank_scored(query="q", documents=["a", "b"], top_k=2, tenant_id=uuid4())
     assert out == [(1, 0.8), (0, 0.3)]
+
+
+@pytest.mark.asyncio
+async def test_resolving_rerankers_pass_the_task_instruction_to_the_native_api(monkeypatch):
+    """B-206 K-14 — the single view's task instruction reaches DashScope through
+    both resolving rerankers (the model, qwen3-vl-rerank, takes one)."""
+    instructions = []
+
+    class _FakeRerankClient:
+        def __init__(self, **_kw):
+            pass
+
+        async def rerank(self, *, model, query, documents, top_n, instruction=None):
+            instructions.append(instruction)
+            return {"output": {"results": [{"index": 0, "relevance_score": 0.5}]}}
+
+    monkeypatch.setattr("control_plane.runtime.HTTPDashScopeRerankClient", _FakeRerankClient)
+    cfg = _Cfg()
+    cfg.rerank = ("qwen", "qwen3-vl-rerank")
+    dynamic = DynamicResolvingReranker(
+        config_service=cfg, resolver=_Resolver(), secret_store=_SecretStore()
+    )
+    resolving = ResolvingReranker(
+        resolver=_Resolver(), secret_store=_SecretStore(), provider="qwen", model="qwen3-vl-rerank"
+    )
+    for reranker in (dynamic, resolving):
+        await reranker.rerank_scored(
+            query="q", documents=["a"], top_k=1, tenant_id=uuid4(), instruction="judge it"
+        )
+    assert instructions == ["judge it", "judge it"]
 
 
 class _RaisingResolver:

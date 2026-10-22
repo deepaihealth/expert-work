@@ -45,7 +45,11 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
 )
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, KbExpected  # type: ignore[import-not-found]
-from kb_eval import build_fake_embedder, rls_tenant  # type: ignore[import-not-found]
+from kb_eval import (  # type: ignore[import-not-found]
+    build_fake_embedder,
+    build_retriever,
+    rls_tenant,
+)
 
 from expert_work.common.spotlight import DATAMARK_GLYPH, SPOTLIGHT_SYSTEM_CLAUSE, unspotlight
 from expert_work.persistence import InMemoryKnowledgeStore
@@ -638,6 +642,51 @@ def test_dry_run_makes_no_network_call_spends_nothing_and_resumes(
     ]
     assert sorted(r["case_id"] for r in rows_after) == sorted(r["case_id"] for r in rows)
     assert network_attempts == []
+
+
+def test_rerank_arm_flags_reach_the_tools_retriever_and_the_run_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_attempts: list[str],
+) -> None:
+    """B-206 K-14 A/B through the agent layer: the flags set the retriever the
+    ``knowledge_search`` tool searches with, and the run row says which arm it was."""
+    built: list[KnowledgeRetriever] = []
+
+    def _spy(**kwargs: Any) -> KnowledgeRetriever:
+        retriever = cast(KnowledgeRetriever, build_retriever(**kwargs))
+        built.append(retriever)
+        return retriever
+
+    monkeypatch.setattr("kb_agent_eval.build_retriever", _spy)
+    for name in (*ANSWER_ENV, *JUDGE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    argv = _dry_argv(
+        tmp_path, "--limit", "1", "--rerank-view", "single_clean", "--rerank-pool", "60"
+    )
+    assert main(argv) == 0
+    (retriever,) = built
+    assert (retriever.rerank_view, retriever.rerank_pool, retriever.rerank_instruction) == (
+        "single_clean",
+        60,
+        False,
+    )
+    lines = (tmp_path / "agent.jsonl").read_text(encoding="utf-8").splitlines()
+    (run,) = [json.loads(line)["run"] for line in lines if "run" in json.loads(line)]
+    assert run["rerank_arm"] == {"view": "single_clean", "pool": 60, "instruct": False}
+    assert network_attempts == []
+
+
+def test_an_instruction_with_the_dual_view_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Default view is dual, which sends no instruction: refused before any ingest.
+    for name in (*ANSWER_ENV, *JUDGE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit):
+        main(_dry_argv(tmp_path, "--rerank-instruct"))
+    assert "--rerank-instruct needs --rerank-view single" in capsys.readouterr().err
+    assert not (tmp_path / "agent.jsonl").exists()
 
 
 def test_real_run_needs_the_model_endpoints(

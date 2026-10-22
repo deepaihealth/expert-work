@@ -374,12 +374,20 @@ class ScopedReranker:
             )
 
     async def rerank_scored(
-        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+        self,
+        *,
+        query: str,
+        documents: Sequence[str],
+        top_k: int,
+        tenant_id: UUID,
+        instruction: str | None = None,
     ) -> list[tuple[int, float | None]]:
         with usage_identity_scope(self.identity):
             if isinstance(self.inner, ScoredReranker):
+                # 只在有任务说明时才传(B-206 K-14,见 ``ScoredReranker``)。
+                extra: dict[str, Any] = {} if instruction is None else {"instruction": instruction}
                 return await self.inner.rerank_scored(
-                    query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+                    query=query, documents=documents, top_k=top_k, tenant_id=tenant_id, **extra
                 )
             order = await self.inner.rerank(
                 query=query, documents=documents, top_k=top_k, tenant_id=tenant_id

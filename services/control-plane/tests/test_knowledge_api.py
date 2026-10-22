@@ -19,6 +19,7 @@ from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
+from orchestrator.tools.knowledge import RerankRanking
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -506,6 +507,7 @@ async def test_retrieval_test_reports_how_the_search_ended(full_setup: FullSetup
     assert body["status"] == "ok"
     assert body["candidates"] >= 1
     assert body["rerank_degraded"] is False
+    assert body["rerank_dropped"] == 0
     assert "rerank_score" in body["results"][0]
 
 
@@ -525,6 +527,19 @@ class _LowScoreReranker:
         self, *, documents: Sequence[str], top_k: int, **_: Any
     ) -> list[tuple[int, float | None]]:
         return [(i, 0.2) for i in range(min(len(documents), top_k))]
+
+
+class _CappedReranker:
+    """Scores what it judges but leaves 3 documents of every call unjudged, like a
+    model whose per-request cap is below the pool (B-206 K-14)."""
+
+    async def rerank(self, **kwargs: Any) -> list[int]:
+        return [i for i, _ in await self.rerank_scored(**kwargs)]
+
+    async def rerank_scored(
+        self, *, documents: Sequence[str], top_k: int, **_: Any
+    ) -> list[tuple[int, float | None]]:
+        return RerankRanking([(i, 0.5) for i in range(min(len(documents), top_k))], dropped=3)
 
 
 @asynccontextmanager
@@ -603,6 +618,16 @@ async def test_retrieval_test_survives_a_failing_reranker() -> None:
     body = resp.json()
     assert body["rerank_degraded"] is True
     assert body["count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_reports_candidates_the_reranker_never_judged() -> None:
+    async with _client_with_reranker(_CappedReranker()) as client:
+        resp = await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["rerank_degraded"] is False
+    assert body["rerank_dropped"] >= 3  # titled view, plus the body view when it runs
 
 
 @pytest.mark.asyncio

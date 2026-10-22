@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import sqlite3
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -57,6 +60,56 @@ async def test_any_input_change_is_a_new_key(tmp_path: Path) -> None:
     await client.rerank(model="m2", query="q", documents=["a", "b"], top_n=2)
     await client.rerank(model="m", query="q", documents=["a", "b"], top_n=1)
     assert len(inner.calls) == 5
+
+
+class _InstructedFakeClient(_FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.instructions: list[str | None] = []
+
+    async def rerank(
+        self,
+        *,
+        model: str,
+        query: str,
+        documents: Sequence[str],
+        top_n: int,
+        instruction: str | None = None,
+    ) -> Mapping[str, Any]:
+        self.instructions.append(instruction)
+        return await super().rerank(model=model, query=query, documents=documents, top_n=top_n)
+
+
+async def test_the_instruction_is_part_of_the_key_and_reaches_the_client(tmp_path: Path) -> None:
+    # K-14 A/B arms differ only by the instruction: they must not share scores.
+    inner = _InstructedFakeClient()
+    client = CachedRerankClient(inner=inner, path=tmp_path / "c.sqlite")
+    await client.rerank(model="m", query="q", documents=["a"], top_n=1)
+    await client.rerank(model="m", query="q", documents=["a"], top_n=1, instruction="judge")
+    await client.rerank(model="m", query="q", documents=["a"], top_n=1, instruction="other")
+    await client.rerank(model="m", query="q", documents=["a"], top_n=1, instruction="judge")
+    assert inner.instructions == [None, "judge", "other"]
+
+
+async def test_a_request_without_instruction_keeps_its_pre_k14_key(tmp_path: Path) -> None:
+    """Rows cached before the instruction existed still answer the same request
+    (the dual-view baseline replays for free)."""
+    path = tmp_path / "c.sqlite"
+    payload = json.dumps(
+        {"model": "m", "query": "q", "documents": ["a", "b"], "top_n": 2},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    old_key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE rerank_cache (key TEXT PRIMARY KEY, body TEXT)")
+        conn.execute(
+            "INSERT INTO rerank_cache VALUES (?, ?)",
+            (old_key, json.dumps({"output": {"results": [{"index": 1}]}})),
+        )
+    client = CachedRerankClient(inner=None, path=path)
+    body = await client.rerank(model="m", query="q", documents=["a", "b"], top_n=2)
+    assert body == {"output": {"results": [{"index": 1}]}}
 
 
 async def test_cache_survives_a_new_client(tmp_path: Path) -> None:
