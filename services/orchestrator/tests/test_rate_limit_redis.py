@@ -44,9 +44,11 @@ from orchestrator.tools.registry import ToolSpec
 class _FakeBucketRedis:
     """Fake async Redis whose ``evalsha`` re-implements the bucket arithmetic
     in Python over per-key state. Same units as the Lua: ARGV = (capacity,
-    refill_per_s, now_ms, ttl_ms); reply = ``[allowed, retry_ms]``."""
+    refill_per_s, now_ms, ttl_ms); reply = ``[allowed, retry_ms]``. A negative
+    ``now_ms`` reads the "server" clock ``server_ms``, as the Lua reads ``TIME``."""
 
     def __init__(self) -> None:
+        self.server_ms = 1_700_000_000_000
         self.buckets: dict[str, tuple[float, int]] = {}
         self.calls: list[tuple[str, list[str]]] = []
         self.script_loads = 0
@@ -67,6 +69,8 @@ class _FakeBucketRedis:
         if self.reply_override is not None:
             return self.reply_override
         cap, rate, now_ms = float(argv[0]), float(argv[1]), int(argv[2])
+        if now_ms < 0:
+            now_ms = self.server_ms
         tokens, last_ms = self.buckets.get(key, (cap, now_ms))
         tokens = min(cap, tokens + max(0, now_ms - last_ms) * rate / 1000)
         if tokens < 1:
@@ -192,6 +196,28 @@ async def test_argv_carries_capacity_in_requests_and_rate_in_requests_per_second
     assert argv_60[0] == "60" and argv_60[1] == "1.0", "60 rpm over 60 s = 1 req/s"
     assert argv_30[0] == "30" and argv_30[1] == "3.0", "30 per 10 s = 3 req/s"
     assert argv_60[2] == str(int(clock.now * 1000)), "now travels in milliseconds"
+
+
+@pytest.mark.asyncio
+async def test_without_an_injected_clock_the_bucket_runs_on_the_redis_server_clock() -> None:
+    """B-206 K-7a (L6) — every replica stamping its own wall clock lets their
+    skew move a shared bucket; at a 100 ms rerank spacing a few tens of ms is a
+    real share of the interval. Production injects no clock, so the limiter
+    stamps nothing and the script reads Redis ``TIME``; an injected clock (the
+    tests') still wins."""
+    redis = _FakeBucketRedis()
+    limiter = RedisRpmLimiter(
+        redis_client=redis,  # type: ignore[arg-type]
+        bucket_key="rl:llm:k",
+        rate_limit_rpm=1,
+        time_period_s=0.1,
+    )
+    factory_limiter = make_redis_rate_limiter_factory(redis)(  # type: ignore[arg-type]
+        key="openai:gpt-4o", secret_ref="secret://x", rate_limit_rpm=7
+    )
+    await limiter.acquire()
+    await factory_limiter.acquire()  # type: ignore[attr-defined]
+    assert [argv[2] for _key, argv in redis.calls] == ["-1", "-1"]
 
 
 def test_bucket_key_is_handle_key_plus_credential_ref() -> None:

@@ -11,6 +11,7 @@ import pytest
 
 from expert_work.protocol.model_catalog import RerankCaps, catalog_entry
 from orchestrator.llm import DashScopeReranker, HTTPDashScopeRerankClient
+from orchestrator.llm.rerank_guard import RerankCallError
 from orchestrator.tools.knowledge import RERANK_DOC_MAX_CHARS, RerankRanking, rerank_documents
 
 
@@ -103,6 +104,9 @@ async def test_reranker_scored_degrades_to_input_order_without_scores() -> None:
         query="q", documents=["a", "b", "c"], top_k=2, tenant_id=uuid4()
     )
     assert out == [(0, None), (1, None)]
+    # B-206 K-7 — an answer it cannot read is the model's fault, not a ranking.
+    assert isinstance(out, RerankRanking)
+    assert out.outcome == "model_error"
 
 
 @pytest.mark.asyncio
@@ -137,9 +141,99 @@ async def test_http_client_surfaces_error_body() -> None:
         return httpx.Response(400, json={"message": "Model not exist"})
 
     client = HTTPDashScopeRerankClient(api_key="k", transport=httpx.MockTransport(_handler))
-    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+    with pytest.raises(RerankCallError) as excinfo:
         await client.rerank(model="bad", query="q", documents=["a"], top_n=1)
     assert "Model not exist" in str(excinfo.value)
+    assert (excinfo.value.failure, excinfo.value.status) == ("rejected", 400)
+
+
+#: DashScope's answer to a request over the model's rate — the body recorded by
+#: the 2026-10-22 probe (``qwen3-vl-rerank``); it sent no ``Retry-After``.
+_THROTTLED = {
+    "request_id": "r",
+    "code": "Throttling.RateQuota",
+    "message": "Requests rate limit exceeded, please try again later.",
+}
+
+#: DashScope's body for an over-long request, worded as B-200 recorded it from
+#: the embedding endpoint (the rerank endpoint's own wording is not on record).
+_SIZE_REFUSAL = {
+    "code": "InvalidParameter",
+    "message": "Range of input length should be [1, 120000]",
+}
+_NO_MODEL = {"code": "InvalidParameter", "message": "Model not exist."}
+_BAD_KEY = {"code": "InvalidApiKey", "message": "Invalid API-key provided."}
+_THROTTLING_400 = {"code": "Throttling", "message": "Request rate limit exceeded."}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error", "headers", "failure", "retry_after"),
+    [
+        (429, _THROTTLED, {}, "rate_limited", None),
+        (429, _THROTTLED, {"Retry-After": "2"}, "rate_limited", 2.0),
+        (500, {"code": "InternalError", "message": "x"}, {}, "transient", None),
+        (503, "<html>Service Unavailable</html>", {}, "transient", None),
+        # A 5xx is not about size, whatever its body says.
+        (500, _SIZE_REFUSAL, {}, "transient", None),
+        (400, _SIZE_REFUSAL, {}, "too_large", None),
+        # A 400 that is not about size must surface, not quietly lose the pool's tail.
+        (400, _NO_MODEL, {}, "rejected", None),
+        (400, _BAD_KEY, {}, "rejected", None),
+        (400, "<html>Bad Request</html>", {}, "rejected", None),
+        # B-206 K-7a (M5) — DashScope also reports throttling and its own faults
+        # as HTTP 400 (tools/eval/longmem/transient.py; B-206 K-8's
+        # ``InternalError.Algo.Embedding_pipeline_Error``): the code decides.
+        (400, _THROTTLING_400, {}, "rate_limited", None),
+        (400, {"code": "Throttling.RateQuota", "message": "x"}, {}, "rate_limited", None),
+        (
+            400,
+            {"code": "InternalError.Algo.Embedding_pipeline_Error", "message": "x"},
+            {},
+            "transient",
+            None,
+        ),
+        # Only the code counts: the same words in a parameter error's message do not.
+        (400, {"code": "InvalidParameter", "message": "Throttling"}, {}, "rejected", None),
+    ],
+)
+async def test_http_client_classifies_each_refusal(
+    status: int,
+    error: Mapping[str, Any] | str,
+    headers: dict[str, str],
+    failure: str,
+    retry_after: float | None,
+) -> None:
+    """B-206 K-7 — the client's whole vendor-specific part: what a failed
+    request means, for the guard (:mod:`orchestrator.llm.rerank_guard`) to act on."""
+
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        if isinstance(error, str):
+            return httpx.Response(status, text=error, headers=headers)
+        return httpx.Response(status, json=error, headers=headers)
+
+    client = HTTPDashScopeRerankClient(api_key="k", transport=httpx.MockTransport(_handler))
+    with pytest.raises(RerankCallError) as excinfo:
+        await client.rerank(model="m", query="q", documents=["a"], top_n=1)
+    assert (excinfo.value.failure, excinfo.value.status) == (failure, status)
+    assert excinfo.value.retry_after_s == retry_after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [httpx.ConnectError("refused"), httpx.ReadTimeout("slow"), httpx.RemoteProtocolError("x")],
+)
+async def test_http_client_reports_an_unreachable_vendor_as_transient(
+    error: httpx.TransportError,
+) -> None:
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        raise error
+
+    client = HTTPDashScopeRerankClient(api_key="k", transport=httpx.MockTransport(_handler))
+    with pytest.raises(RerankCallError) as excinfo:
+        await client.rerank(model="m", query="q", documents=["a"], top_n=1)
+    assert (excinfo.value.failure, excinfo.value.status) == ("transient", None)
 
 
 def test_rerank_documents_cuts_each_to_the_cap() -> None:
@@ -156,43 +250,24 @@ def test_rerank_documents_cuts_each_to_the_cap() -> None:
 # ---------------------------------------------------------------------------
 
 
-#: DashScope's body for an over-long request, worded as B-200 recorded it from
-#: the embedding endpoint (the rerank endpoint's own wording is not on record).
-_SIZE_REFUSAL = {
-    "code": "InvalidParameter",
-    "message": "Range of input length should be [1, 120000]",
-}
-
-
 class _RecordingClient:
     """Records each request; answers best-first in input order. ``refuse_over``
-    makes it answer ``status`` with ``error`` as the body while a request carries
-    more than that many documents."""
+    makes it refuse with ``failure`` (as a vendor client classifies it) while a
+    request carries more than that many documents."""
 
-    def __init__(
-        self,
-        *,
-        refuse_over: int | None = None,
-        status: int = 400,
-        error: Mapping[str, Any] | str = _SIZE_REFUSAL,
-    ) -> None:
+    def __init__(self, *, refuse_over: int | None = None, failure: str = "too_large") -> None:
         self.requests: list[dict[str, Any]] = []
         self.refuse_over = refuse_over
-        self.status = status
-        self.error = error
+        self.failure = failure
 
     async def rerank(self, **kwargs: Any) -> Mapping[str, Any]:
         self.requests.append(kwargs)
         documents = kwargs["documents"]
         if self.refuse_over is not None and len(documents) > self.refuse_over:
-            request = httpx.Request("POST", "https://dashscope.test/rerank")
-            response = (
-                httpx.Response(self.status, request=request, text=self.error)
-                if isinstance(self.error, str)
-                else httpx.Response(self.status, request=request, json=self.error)
-            )
-            raise httpx.HTTPStatusError(
-                "dashscope rerank failed: refused", request=request, response=response
+            raise RerankCallError(
+                "dashscope rerank failed: refused",
+                failure=self.failure,  # type: ignore[arg-type]
+                status=400,
             )
         results = [{"index": i, "relevance_score": 1 - i / 1000} for i in range(len(documents))]
         return {"output": {"results": results}}
@@ -293,26 +368,21 @@ _BIG = ["文" * 1000] * 100
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "error", "documents"),
+    ("failure", "documents"),
     [
-        # A 5xx is not about size, however big the request.
-        (500, _SIZE_REFUSAL, _BIG),
-        # A 400 that is not about size, on a request big enough to be cut: it
-        # must surface, not quietly lose the tail of the pool.
-        (400, {"code": "InvalidParameter", "message": "Model not exist."}, _BIG),
-        (400, {"code": "InvalidApiKey", "message": "Invalid API-key provided."}, _BIG),
-        # Size-like wording under another code is not a length refusal either.
-        (400, {"code": "Throttling", "message": "Request rate limit exceeded."}, _BIG),
-        (400, "<html>Bad Request</html>", _BIG),
+        # Not about size, on a request big enough to be cut: it must surface
+        # (the guard has already retried what is worth retrying), not quietly
+        # lose the tail of the pool.
+        ("transient", _BIG),
+        ("rate_limited", _BIG),
+        ("rejected", _BIG),
         # Refused as too long although it already fits: it would be refused again.
-        (400, _SIZE_REFUSAL, ["d"] * 5),
+        ("too_large", ["d"] * 5),
     ],
 )
-async def test_other_refusals_are_not_retried(
-    status: int, error: Mapping[str, Any] | str, documents: list[str]
-) -> None:
-    client = _RecordingClient(refuse_over=0, status=status, error=error)
-    with pytest.raises(httpx.HTTPStatusError):
+async def test_other_refusals_are_not_retried(failure: str, documents: list[str]) -> None:
+    client = _RecordingClient(refuse_over=0, failure=failure)
+    with pytest.raises(RerankCallError):
         await DashScopeReranker(client=client, model="qwen3-vl-rerank").rerank_scored(
             query="q", documents=documents, top_k=5, tenant_id=uuid4()
         )

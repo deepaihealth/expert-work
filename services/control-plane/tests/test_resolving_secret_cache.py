@@ -163,6 +163,11 @@ class _FakeLLMReranker:
     ) -> list[int]:
         return list(range(len(documents)))[:top_k]
 
+    async def ranked(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        return [(index, None) for index in range(min(len(documents), top_k))]
+
 
 @pytest.fixture
 def no_network_embed(monkeypatch: pytest.MonkeyPatch) -> None:

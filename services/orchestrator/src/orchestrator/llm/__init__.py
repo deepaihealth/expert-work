@@ -128,6 +128,15 @@ from orchestrator.llm.rerank import (
 from orchestrator.llm.rerank import (
     RerankClient as RerankClient,
 )
+from orchestrator.llm.rerank_guard import (
+    RerankCallError as RerankCallError,
+)
+from orchestrator.llm.rerank_guard import (
+    RerankGuards as RerankGuards,
+)
+from orchestrator.llm.rerank_guard import (
+    redis_pacing_buckets as redis_pacing_buckets,
+)
 from orchestrator.llm.router import (
     AllProvidersExhaustedError as AllProvidersExhaustedError,
 )
@@ -181,7 +190,9 @@ __all__ = [
     "RateLimiterFactory",
     "RecordingAnthropicClient",
     "RecordingOpenAIClient",
+    "RerankCallError",
     "RerankClient",
+    "RerankGuards",
     "effective_rpm",
     "embedding_usage_sink",
     "make_azure_client",
@@ -191,4 +202,5 @@ __all__ = [
     "make_kimi_client",
     "make_qwen_client",
     "make_self_hosted_client",
+    "redis_pacing_buckets",
 ]

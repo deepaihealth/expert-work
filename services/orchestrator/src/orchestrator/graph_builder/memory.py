@@ -74,6 +74,7 @@ from orchestrator.graph_builder._config import (
 from orchestrator.llm import Embedder, LLMCaller
 from orchestrator.state import AgentState
 from orchestrator.tools.knowledge import Reranker, rerank_documents
+from orchestrator.tools.knowledge_rerank import rerank_budget
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,13 @@ MemoryNode = Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]
 #: knowledge retriever's recall limit; always applied since CM-6 (the
 #: stores fetch this many fusion candidates anyway — Mini-ADR CM-G5).
 _MEMORY_RECALL_WIDE_LIMIT = 20
+#: B-206 K-7a —— the rerank budget of one recall. Recall runs before the run's
+#: first model call, over at most ``_MEMORY_RECALL_WIDE_LIMIT`` memories: one
+#: request takes about 0.4 s (2026-10-22: 0.36-0.38 s for 20 passages) and a
+#: refusal for the rate comes back in under 0.2 s, so 2.5 s fits a request, one
+#: retry after an HTTP 429 (a 1-1.25 s backoff) and its request; anything slower
+#: falls back to the RRF order instead of holding up the run.
+MEMORY_RERANK_BUDGET_S = 2.5
 
 #: Per-message cap when rendering the trajectory for the extraction prompt.
 _TRAJECTORY_CHAR_CAP = 1000
@@ -353,14 +361,15 @@ async def _rerank_memories(
     propagates. Operates on raw content — redaction happens on the final set.
     """
     try:
-        order = await token.run_cancellable(
-            reranker.rerank(
-                query=query,
-                documents=rerank_documents(m.content for m in candidates),
-                top_k=top_k,
-                tenant_id=tenant_id,
+        with rerank_budget(MEMORY_RERANK_BUDGET_S):
+            order = await token.run_cancellable(
+                reranker.rerank(
+                    query=query,
+                    documents=rerank_documents(m.content for m in candidates),
+                    top_k=top_k,
+                    tenant_id=tenant_id,
+                )
             )
-        )
     except RunCancelledError:
         raise
     except Exception:

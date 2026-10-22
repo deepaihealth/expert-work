@@ -598,6 +598,11 @@ export interface TranslationKeys {
     recall_vector: string;
     recall_keyword: string;
     recall_both: string;
+    rerank_outcome_partial: string;
+    rerank_outcome_rate_limited: string;
+    rerank_outcome_model_error: string;
+    rerank_outcome_model_unavailable: string;
+    rerank_outcome_no_model: string;
     settings_title: string;
     settings_saved: string;
     settings_rename_note: string;
@@ -3949,6 +3954,14 @@ const en: TranslationKeys = {
     recall_vector: "vector",
     recall_keyword: "keyword",
     recall_both: "both",
+    rerank_outcome_partial:
+      "The rerank only partly completed (the other pass failed); results follow the pass that completed.",
+    rerank_outcome_rate_limited:
+      "The rerank model was rate-limited; these results are in recall order.",
+    rerank_outcome_model_error: "The rerank model failed; these results are in recall order.",
+    rerank_outcome_model_unavailable:
+      "The rerank model's credential is unavailable; these results are in recall order.",
+    rerank_outcome_no_model: "No rerank model is configured; these results are in recall order.",
     settings_title: "Retrieval settings",
     settings_saved: "Settings saved.",
     settings_rename_note:

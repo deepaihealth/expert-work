@@ -10,11 +10,11 @@ own retry formula agreed with):
 * ~1 s later it has a token back (refill is not zero).
 
 Time is **injected**: the limiter takes ``clock`` (what it stamps into
-``now_ms`` for the Lua — production uses the wall clock the same way, the
-script never reads the server clock) and ``sleep`` (here: record the
-requested duration and advance the clock). Every assertion is therefore
-exact and independent of CI speed, while the arithmetic under test is still
-Redis's.
+``now_ms`` for the Lua; production injects none and the script reads Redis
+``TIME`` instead — B-206 K-7a, pinned by the one real-time test below) and
+``sleep`` (here: record the requested duration and advance the clock). Every
+other assertion is therefore exact and independent of CI speed, while the
+arithmetic under test is still Redis's.
 
 Plus the properties the design rests on: two limiters on one key share the
 bucket and the 4th call waits for the refill; different keys are independent;
@@ -24,6 +24,7 @@ bucket instead of failing the call.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Iterator
 
@@ -117,6 +118,39 @@ async def test_lua_units_retry_in_ms_refill_per_second(redis_client: redis_async
     assert len(clock.sleeps) == 2, (
         "a full second at 1 req/s owes no wait at all (refill is not zero)"
     )
+
+
+@pytest.mark.asyncio
+async def test_without_an_injected_clock_the_script_reads_the_server_time(
+    redis_client: redis_async.Redis,
+) -> None:
+    """B-206 K-7a (L6) — production stamps no time and the Lua reads ``TIME``,
+    so replicas with skewed clocks still share one bucket. A one-token bucket
+    refilling every 200 ms (a 300 RPM rerank model's spacing) admits the first
+    call at once and holds the second until the server clock has moved ~200 ms.
+    A script that ignored the server clock would never refill (bounded by the
+    timeout below)."""
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.sleep(seconds)
+
+    limiter = RedisRpmLimiter(
+        redis_client=redis_client,
+        bucket_key="rl:llm:it:server-time",
+        rate_limit_rpm=1,
+        time_period_s=0.2,
+        sleep=_sleep,
+    )
+    start = time.monotonic()
+    async with asyncio.timeout(3.0):
+        await limiter.acquire()
+        await limiter.acquire()
+    elapsed = time.monotonic() - start
+    assert sleeps, "the second call had to wait"
+    assert 0.1 < sleeps[0] <= 0.2, "the deficit was measured on the server clock"
+    assert 0.18 <= elapsed < 1.0
 
 
 # ------------------------------------------------------------------ sharing

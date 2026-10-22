@@ -10,6 +10,7 @@ MMR stage is order-preserving and these tests stay rerank-focused
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
@@ -18,9 +19,14 @@ import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from expert_work.protocol import MemoryItem
-from orchestrator.graph_builder.memory import _MEMORY_RECALL_WIDE_LIMIT, make_memory_recall_node
+from orchestrator.graph_builder.memory import (
+    _MEMORY_RECALL_WIDE_LIMIT,
+    MEMORY_RERANK_BUDGET_S,
+    make_memory_recall_node,
+)
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools.knowledge import RERANK_DOC_MAX_CHARS
+from orchestrator.tools.knowledge_rerank import RERANK_BUDGET_S, current_rerank_budget
 
 _DIM = 16
 
@@ -89,6 +95,39 @@ async def _run(node: object, tenant: UUID, user: UUID) -> list[MemoryItem]:
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
     return out.get("recalled_memories", [])
+
+
+@dataclass
+class _BudgetReranker:
+    """Records how much of a rerank budget it was given."""
+
+    left: list[float] = field(default_factory=list)
+
+    async def rerank(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[int]:
+        budget = current_rerank_budget()
+        assert budget is not None
+        self.left.append(budget.deadline - time.monotonic())
+        return list(range(len(documents)))[:top_k]
+
+
+@pytest.mark.asyncio
+async def test_memory_rerank_has_its_own_short_budget() -> None:
+    """B-206 K-7a (L2) — recall runs before the run's first model call; its
+    rerank gets :data:`MEMORY_RERANK_BUDGET_S`, not a search's 10 s."""
+    tenant, user = uuid4(), uuid4()
+    reranker = _BudgetReranker()
+    node = make_memory_recall_node(
+        memory_store=_ListStore(items=[_mem("m0", tenant, user)]),  # type: ignore[arg-type]
+        embedder=FakeEmbedder(dim=_DIM),
+        top_k=3,
+        reranker=reranker,  # type: ignore[arg-type]
+    )
+    await _run(node, tenant, user)
+    (left,) = reranker.left
+    assert MEMORY_RERANK_BUDGET_S - 0.5 < left <= MEMORY_RERANK_BUDGET_S
+    assert MEMORY_RERANK_BUDGET_S < RERANK_BUDGET_S
 
 
 @pytest.mark.asyncio

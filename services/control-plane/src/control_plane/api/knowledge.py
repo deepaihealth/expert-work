@@ -1045,6 +1045,8 @@ def build_knowledge_router() -> APIRouter:
                 "status": outcome.status,
                 "candidates": outcome.candidates,
                 "rerank_degraded": outcome.rerank_degraded,
+                # B-206 K-7 — how the rerank ended (null when none was asked for).
+                "rerank_outcome": outcome.rerank_outcome,
                 # B-206 K-8 — the query could not be embedded: keyword results only.
                 "embedding_degraded": outcome.embedding_degraded,
                 # B-206 K-14 — candidates the reranker was handed but never

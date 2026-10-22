@@ -16,6 +16,7 @@ import type { SseEvent } from "../../api/sessions";
 import type { RunTraceIo } from "../../api/trace_facade";
 import type { SpanMatch } from "../../api/trace_match";
 import type { AssistantRow, TrajectoryRow, UserRow } from "../../api/trajectory_rows";
+import { rerankNoticeTone } from "../../api/rerank_outcome";
 import type { FireNowResult } from "../../api/triggers";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
 import { CopyButton } from "../CopyButton";
@@ -338,8 +339,20 @@ export function RowDetailResult({
   switch (row.kind) {
     case "tool":
       // B-203 —— 入参在「载荷」tab;这里只给结果,而且直接摊开。
+      // B-206 K-7 —— 知识库检索的重排退回召回顺序时,在结果上方说明原因。
       body = (
-        <ToolCallCard entry={row.entry} onFireResult={onFireResult} readOnly={readOnly} resultOnly />
+        <>
+          {row.entry.rerankOutcome !== undefined && (
+            <Text
+              type={rerankNoticeTone(row.entry.rerankOutcome) === "info" ? "secondary" : "warning"}
+              style={{ display: "block", fontSize: 12.5, marginBottom: 6 }}
+              data-testid="console-detail-rerank-outcome"
+            >
+              {t(`knowledge_page.rerank_outcome_${row.entry.rerankOutcome}`)}
+            </Text>
+          )}
+          <ToolCallCard entry={row.entry} onFireResult={onFireResult} readOnly={readOnly} resultOnly />
+        </>
       );
       break;
     case "think":

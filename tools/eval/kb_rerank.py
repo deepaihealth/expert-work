@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.llm.rerank import DashScopeReranker, HTTPDashScopeRerankClient, RerankClient
+from orchestrator.llm.rerank_guard import RerankGuards
 
 #: 生产知识库重排模型(测试 / 生产平台配置均为它,10-14 核对)。
 DEFAULT_RERANK_MODEL = "qwen3-vl-rerank"
@@ -126,10 +127,21 @@ def build_dashscope_reranker(*, cache_path: Path) -> tuple[DashScopeReranker, Ca
     key = os.environ.get(RERANK_KEY_ENV)
     if not key:
         raise SystemExit(f"--rerank dashscope requires env {RERANK_KEY_ENV} (the DashScope key)")
-    inner = None if key == OFFLINE_KEY else HTTPDashScopeRerankClient(api_key=key)
+    model = os.environ.get(RERANK_MODEL_ENV) or DEFAULT_RERANK_MODEL
+    # B-206 K-7a —— 网络客户端套生产同款限流 / 退避(按目录 rpm 匀速、429 重试),
+    # 套在缓存里面:命中缓存不占令牌、不等待。
+    inner = (
+        None
+        if key == OFFLINE_KEY
+        else RerankGuards().wrap(
+            HTTPDashScopeRerankClient(api_key=key),
+            provider="qwen",
+            model=model,
+            secret_ref=RERANK_KEY_ENV,
+        )
+    )
     price = float(os.environ.get(RERANK_PRICE_ENV, DEFAULT_RERANK_PRICE_CNY_PER_M))
     client = CachedRerankClient(inner=inner, path=cache_path, price_cny_per_m=price)
-    model = os.environ.get(RERANK_MODEL_ENV) or DEFAULT_RERANK_MODEL
     return DashScopeReranker(client=client, model=model), client
 
 

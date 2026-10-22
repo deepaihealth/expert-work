@@ -13,6 +13,7 @@
  * originating MCP server from the name. Builtin tools (``web_search``,
  * ``exec_python``, …) keep their bare name.
  */
+import { rerankFallbackOf, type RerankFallback } from "./rerank_outcome";
 import { serverMsOf } from "./sse_id";
 import type { SseEvent } from "./sessions";
 import type { WorkerTimeline } from "./worker_timeline";
@@ -56,6 +57,9 @@ export interface ToolCallEntry {
    *  ``artifact.vl_usage``(``usage_metadata`` 形状,``tools/vision.py``)。只有
    *  token 数:看图模型的名字不随帧回来。没有 → 缺省。 */
   vlUsage?: { input: number; output: number };
+  /** B-206 K-7 —— ``knowledge_search`` 的重排没定顺序、退回召回顺序时的原因,取自 wire
+   *  ``artifact.rerank_outcome``(只在不是 ``ok`` 时才有);重排正常 → 缺省。 */
+  rerankOutcome?: RerankFallback;
 }
 
 const MCP_PREFIX = "mcp__";
@@ -265,6 +269,8 @@ export function parseToolCalls(
               entry.vlUsage = { input: u.input_tokens, output: u.output_tokens };
             }
           }
+          const rerank = rerankFallbackOf(rec.rerank_outcome);
+          if (rerank !== null) entry.rerankOutcome = rerank;
           // PR-D — sandbox exec tools stash their raw (pre-datamark) streams
           // here; the rendered content's newlines don't survive spotlight.
           // Final-review fix wave — builder.py has piped meta → artifact

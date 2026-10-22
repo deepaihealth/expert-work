@@ -20,6 +20,7 @@ from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge import RerankRanking
+from orchestrator.tools.knowledge_rerank import RerankUnavailableError
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -509,6 +510,8 @@ async def test_retrieval_test_reports_how_the_search_ended(full_setup: FullSetup
     assert body["rerank_degraded"] is False
     assert body["rerank_dropped"] == 0
     assert "rerank_score" in body["results"][0]
+    # B-206 K-7 — the base asks for rerank, this deployment has no reranker.
+    assert body["rerank_outcome"] == "no_model"
 
 
 class _RaisingReranker:
@@ -617,7 +620,25 @@ async def test_retrieval_test_survives_a_failing_reranker() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["rerank_degraded"] is True
+    assert body["rerank_outcome"] == "model_error"
     assert body["count"] >= 1
+
+
+class _RateLimitedReranker:
+    async def rerank(self, **_: Any) -> list[int]:
+        raise RerankUnavailableError("gave up", outcome="rate_limited")
+
+    async def rerank_scored(self, **_: Any) -> list[tuple[int, float | None]]:
+        raise RerankUnavailableError("gave up", outcome="rate_limited")
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_says_the_rerank_was_rate_limited() -> None:
+    async with _client_with_reranker(_RateLimitedReranker()) as client:
+        resp = await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
+    body = resp.json()
+    assert (body["rerank_outcome"], body["rerank_degraded"]) == ("rate_limited", True)
+    assert body["count"] >= 1  # the fused order
 
 
 @pytest.mark.asyncio
@@ -627,6 +648,7 @@ async def test_retrieval_test_reports_candidates_the_reranker_never_judged() -> 
     body = resp.json()
     assert body["status"] == "ok"
     assert body["rerank_degraded"] is False
+    assert body["rerank_outcome"] == "ok"
     assert body["rerank_dropped"] >= 3  # titled view, plus the body view when it runs
 
 
