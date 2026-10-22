@@ -541,6 +541,11 @@ class Settings(BaseSettings):
     #: would delete (``knowledge.figure_orphans_found``, gauge
     #: ``expert_work_knowledge_figure_orphans``); on: it deletes them.
     knowledge_figure_reconcile_delete: bool = False
+    #: B-209 PR-2 (re-review round 4) —— operator override: run a pass although
+    #: more than half the documents seen look orphaned (the guard that stops a
+    #: broken lookup from deleting everything). Only after confirming the
+    #: orphans really are from a mass deletion; switch it off again after.
+    knowledge_figure_reconcile_ignore_orphan_share: bool = False
 
     # ------------------------------------------------------------------ memory DLQ (K.K7)
     #: Stream K.K7 — how often the memory writeback DLQ worker scans

@@ -21,6 +21,7 @@ from PIL import Image
 from control_plane.knowledge.parsing import (
     DocumentParseError,
     find_data_uri_pictures,
+    office_markdown,
     parse_document,
     scrub_data_uris,
     strip_picture_markup,
@@ -245,6 +246,89 @@ def test_a_picture_outside_the_media_folder_is_bounded_too(
     parsed = parse_office_figures(raw, ".docx")
     assert (parsed.figures.extracted, parsed.figures.unsupported) == (1, 1)
     assert "Intro" in parsed.markdown
+
+
+def _renamed_picture(
+    raw: bytes, suffix: str, content_type: str = "image/png", relationship: str = "image"
+) -> bytes:
+    """``raw`` (a one-picture Word file) with its picture renamed to
+    ``word/media/image1<suffix>`` — the relationship and an Override for the
+    new name follow (the reviewer's probe)."""
+    source = zipfile.ZipFile(io.BytesIO(raw))
+    new = f"word/media/image1{suffix}"
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as package:
+        for item in source.infolist():
+            data, name = source.read(item), item.filename
+            if name == "word/media/image1.png":
+                name = new
+            elif name == "word/_rels/document.xml.rels":
+                data = data.replace(b"media/image1.png", f"media/image1{suffix}".encode())
+                data = data.replace(
+                    b"relationships/image", f"relationships/{relationship}".encode()
+                )
+            elif name == "[Content_Types].xml":
+                override = f'<Override PartName="/{new}" ContentType="{content_type}"/>'
+                data = data.replace(b"</Types>", f"{override}</Types>".encode())
+            package.writestr(name, data)
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("suffix", [".xml", ".rels"])
+def test_a_picture_named_like_markup_is_bounded_too(
+    monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    # Re-review round 4 (M1, the reviewer's probe): the name is the author's;
+    # the content type and the image relationship decide.
+    big = noise_png(400, 300, seed=1)
+    monkeypatch.setattr(figure_extract, "MAX_IMAGE_BYTES", len(big) - 1)
+    raw = _renamed_picture(picture_docx(big, before="Intro"), suffix)
+    bounded, replaced = bound_office_media(raw)
+    assert replaced == 1
+    pictures = find_data_uri_pictures(office_markdown(bounded, ".docx"))
+    assert max((len(p.data) for p in pictures), default=0) < len(big)
+    parsed = parse_office_figures(raw, ".docx")
+    assert (parsed.figures.extracted, parsed.figures.unsupported) == (1, 1)
+    assert parsed.figures.candidates == ()
+
+
+def test_an_image_relationship_target_typed_as_xml_is_still_a_picture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    big = noise_png(400, 300, seed=1)
+    monkeypatch.setattr(figure_extract, "MAX_IMAGE_BYTES", len(big) - 1)
+    raw = _renamed_picture(picture_docx(big), ".xml", content_type="application/xml")
+    assert bound_office_media(raw)[1] == 1
+
+
+def test_a_part_typed_as_an_image_is_bounded_whatever_points_at_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Override decides, also when no image relationship names the part.
+    big = noise_png(400, 300, seed=1)
+    monkeypatch.setattr(figure_extract, "MAX_IMAGE_BYTES", len(big) - 1)
+    raw = _renamed_picture(picture_docx(big), ".xml", relationship="package")
+    bounded, replaced = bound_office_media(raw)
+    assert replaced == 1
+    with zipfile.ZipFile(io.BytesIO(bounded)) as package:
+        assert package.read("word/media/image1.xml") != big
+
+
+def test_an_oversized_xml_part_fails_the_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = picture_docx(noise_png(400, 300), before="Intro " * 200)
+    monkeypatch.setattr(figure_extract, "MAX_XML_PART_BYTES", 1000)
+    with pytest.raises(DocumentParseError, match="part of the file"):
+        bound_office_media(raw)
+
+
+def test_a_package_of_too_many_parts_is_not_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = picture_docx(noise_png(400, 300))
+    parts = len(zipfile.ZipFile(io.BytesIO(raw)).infolist())
+    monkeypatch.setattr(figure_extract, "MAX_PACKAGE_ENTRIES", parts - 1)
+    with pytest.raises(DocumentParseError, match="parts"):
+        bound_office_media(raw)
+    monkeypatch.setattr(figure_extract, "MAX_PACKAGE_ENTRIES", parts)
+    assert bound_office_media(raw) == (raw, 0)
 
 
 def test_a_package_that_unpacks_too_large_is_not_read(monkeypatch: pytest.MonkeyPatch) -> None:

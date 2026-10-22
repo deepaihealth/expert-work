@@ -237,10 +237,13 @@ async def _in_parse_pool[T](
             loop = asyncio.get_running_loop()
             timeout = _parse_timeout_s if budget is None else budget.remaining
             if timeout <= 0:
-                msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
+                msg = (
+                    f"document {filename!r} parse timed out: its {_parse_timeout_s:g}s are used up"
+                )
                 raise DocumentParseError(msg)
             executor = _get_parse_executor()
             started = loop.time()
+            charged = True
             try:
                 # ``submit`` itself raises on a broken pool — keep it in the try.
                 future = loop.run_in_executor(executor, fn, *args)
@@ -253,7 +256,10 @@ async def _in_parse_pool[T](
                 )
                 _killed_pools.add(executor)
                 _discard_parse_pool(executor)
-                msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
+                msg = (
+                    f"document {filename!r} parse timed out after {timeout:g}s"
+                    f" (what was left of its {_parse_timeout_s:g}s)"
+                )
                 raise DocumentParseError(msg) from exc
             except BrokenProcessPool:
                 # Killed for another document's timeout: not this one's
@@ -266,8 +272,8 @@ async def _in_parse_pool[T](
                     sibling,
                 )
                 _discard_parse_pool(executor)
-                if sibling:
-                    spared, attempt = spared + 1, attempt - 1
+                if sibling:  # nor its time: the attempt was cut short by another
+                    spared, attempt, charged = spared + 1, attempt - 1, False
                 elif attempt == 2:
                     raise
             except MemoryError as exc:
@@ -276,7 +282,7 @@ async def _in_parse_pool[T](
                 msg = f"document {filename!r} needs more memory than a parse may use"
                 raise DocumentParseError(msg) from exc
             finally:
-                if budget is not None:
+                if budget is not None and charged:
                     budget.charge(loop.time() - started)
 
 

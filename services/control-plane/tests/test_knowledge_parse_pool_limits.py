@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import sys
+import threading
 import types
 from collections.abc import Callable, Iterator
 from concurrent.futures.process import BrokenProcessPool
@@ -259,3 +260,80 @@ async def test_a_parse_timeout_marks_its_pool_as_killed(monkeypatch: pytest.Monk
         await ingestion._in_parse_pool("a.pdf", _done)
     assert wedged in ingestion._killed_pools and wedged.killed
     await asyncio.sleep(0)
+
+
+class _Delayed(concurrent.futures.Executor):
+    """A pool whose call ends ``after`` seconds in: broken (killed for another
+    document's timeout) or done."""
+
+    def __init__(self, after: float, *, broken: bool) -> None:
+        self._after = after
+        self._broken = broken
+        self._processes: dict[int, Any] = {}
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        future: concurrent.futures.Future[str] = concurrent.futures.Future()
+        future.set_running_or_notify_cancel()
+
+        def finish() -> None:
+            if self._broken:
+                future.set_exception(BrokenProcessPool("killed"))
+            else:
+                future.set_result("done")
+
+        threading.Timer(self._after, finish).start()
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        return None
+
+
+async def test_a_spared_attempt_costs_the_document_no_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Re-review round 4 (M2, the reviewer's probe): killed 0.6 s into the call
+    # for another document's timeout; the retry needs 0.5 s of a 1 s budget.
+    killed = _Delayed(0.6, broken=True)
+    ingestion._killed_pools.add(killed)
+    monkeypatch.setattr(ingestion, "_parse_executor", killed)
+    monkeypatch.setattr(ingestion, "ProcessPoolExecutor", lambda **_: _Delayed(0.5, broken=False))
+    budget = PoolBudget(1.0)
+    assert await ingestion._in_parse_pool("victim.docx", _done, budget=budget) == "done"
+    assert 0.3 < budget.remaining < 0.55
+
+
+async def test_sparing_stops_after_three_sibling_kills(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Three sibling kills are spared; from the fourth on the attempts count.
+    pools = [_Executor("broken") for _ in range(5)]
+    for pool in pools:
+        ingestion._killed_pools.add(pool)
+    following = iter(pools[1:])
+    monkeypatch.setattr(ingestion, "_parse_executor", pools[0])
+    monkeypatch.setattr(ingestion, "ProcessPoolExecutor", lambda **_: next(following))
+    with pytest.raises(BrokenProcessPool):
+        await ingestion._in_parse_pool("a.pdf", _done)
+
+
+async def test_an_out_of_time_message_names_the_time_it_waited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ingestion, "_parse_executor", _Executor("never"))
+    monkeypatch.setattr(ingestion, "_parse_timeout_s", 600.0)
+    with pytest.raises(DocumentParseError, match=r"after 0\.05s \(what was left of its 600s\)"):
+        await ingestion._in_parse_pool("a.pdf", _done, budget=PoolBudget(0.05))
+    with pytest.raises(DocumentParseError, match="its 600s are used up"):
+        await ingestion._in_parse_pool("a.pdf", _done, budget=PoolBudget(0.0))
+
+
+async def test_a_figure_pool_found_broken_is_rebuilt_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Re-review round 4 (L11): its worker died earlier — the next document's
+    # figures still get a pool.
+    broken = _Executor("broken")
+    monkeypatch.setattr(FIGURE_POOL, "_executor", broken)
+    monkeypatch.setattr(parse_workers, "ProcessPoolExecutor", lambda **_: _Executor("ok"))
+    assert await FIGURE_POOL.run("a.pdf", _done, budget=PoolBudget(5.0)) == "done"
+    assert broken.shut_down
+    # Broken again right after the rebuild: the call gives up (no figures).
+    monkeypatch.setattr(FIGURE_POOL, "_executor", _Executor("broken"))
+    monkeypatch.setattr(parse_workers, "ProcessPoolExecutor", lambda **_: _Executor("broken"))
+    with pytest.raises(BrokenProcessPool):
+        await FIGURE_POOL.run("a.pdf", _done, budget=PoolBudget(5.0))
+    monkeypatch.setattr(FIGURE_POOL, "_executor", None)

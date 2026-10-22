@@ -66,6 +66,7 @@ from typing import Final
 
 __all__ = [
     "CLASSID_BY_OWNER",
+    "FIGURE_RECONCILE_LOCK_CLASSID",
     "MCP_OAUTH_REFRESH_LOCK_CLASSID",
     "MEMORY_CONSOLIDATOR_LOCK_CLASSID",
     "MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID",
@@ -121,6 +122,10 @@ WORKSPACE_JANITOR_LOCK_CLASSID: Final[int] = 8621
 #: lives in ``expert-work-persistence`` and gets this value from ``app.py``.
 MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID: Final[int] = 8622
 
+#: ``figure_reconcile`` (B-209 PR-2) — single-flight orphan-original sweep,
+#: key ``"figure_reconcile"``.
+FIGURE_RECONCILE_LOCK_CLASSID: Final[int] = 8623
+
 #: Every registered classid, keyed by the owning module. The self-audit test
 #: asserts the values are unique *and* that every ``*_CLASSID`` constant above
 #: appears here.
@@ -136,5 +141,6 @@ CLASSID_BY_OWNER: Final[Mapping[str, int]] = MappingProxyType(
         "supersede": SUPERSEDE_LOCK_CLASSID,
         "workspace_janitor": WORKSPACE_JANITOR_LOCK_CLASSID,
         "memory_writeback_job": MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID,
+        "figure_reconcile": FIGURE_RECONCILE_LOCK_CLASSID,
     }
 )

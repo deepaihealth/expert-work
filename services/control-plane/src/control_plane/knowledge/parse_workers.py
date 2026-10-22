@@ -19,6 +19,7 @@ from collections.abc import Callable
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from typing import Any
 
 from control_plane.knowledge.parsing import DocumentParseError
 
@@ -103,17 +104,18 @@ class FigurePool:
         self, filename: str, fn: Callable[..., T], *args: object, budget: PoolBudget
     ) -> T:
         """``fn(*args)`` in this pool within ``budget``; a timeout kills this
-        pool only. Raises :class:`DocumentParseError` (out of time / memory)
-        or ``BrokenProcessPool`` — the caller falls back to "no figures"."""
+        pool only. A pool found broken when the call is handed over (its
+        worker died earlier) is rebuilt and the call handed to the new one
+        once. Raises :class:`DocumentParseError` (out of time / memory) or
+        ``BrokenProcessPool`` — the caller falls back to "no figures"."""
         async with self._get_slots():
             if budget.remaining <= 0:
                 msg = f"figures of {filename!r} out of time"
                 raise DocumentParseError(msg)
             loop = asyncio.get_running_loop()
-            executor = self._get_executor()
+            executor, future = self._submit(fn, args)
             started = loop.time()
             try:
-                future = loop.run_in_executor(executor, fn, *args)
                 return await asyncio.wait_for(future, timeout=budget.remaining)
             except TimeoutError as exc:
                 logger.warning("knowledge.figure_pool_timeout document=%r — killing it", filename)
@@ -128,6 +130,20 @@ class FigurePool:
                 raise DocumentParseError(msg) from exc
             finally:
                 budget.charge(loop.time() - started)
+
+    def _submit(
+        self, fn: Callable[..., object], args: tuple[object, ...]
+    ) -> tuple[Executor, asyncio.Future[Any]]:
+        loop = asyncio.get_running_loop()
+        for attempt in (1, 2):
+            executor = self._get_executor()
+            try:
+                return executor, loop.run_in_executor(executor, fn, *args)
+            except BrokenProcessPool:
+                self._discard(executor)
+                if attempt == 2:
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def shutdown(self, *, kill: bool = False) -> None:
         executor, self._executor = self._executor, None

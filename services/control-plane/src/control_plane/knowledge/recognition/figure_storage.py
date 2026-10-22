@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
@@ -31,8 +31,6 @@ from expert_work.runtime.storage import ObjectNotFoundError, ObjectStore
 logger = logging.getLogger(__name__)
 
 FIGURE_CONTENT_TYPE = "image/jpeg"
-#: Chunks read per page when looking for a figure's quote block.
-_CHUNK_PAGE = 200
 ROOT = "knowledge_figures/"
 _FIGURE_ID = re.compile(r"[0-9a-f]{16}")
 #: A canonical (lower-case, hyphenated) UUID.
@@ -191,13 +189,26 @@ class FigureStorage:
         ]
         return await self.delete_keys(older)
 
-    async def all_keys_modified(self) -> list[tuple[str, datetime]] | None:
-        """Every stored figure key with its last-modified time (the
-        reconciler's scan); ``None`` when the store cannot tell the times."""
-        listing = getattr(self._store, "list_prefix_modified", None)
-        if not callable(listing):
-            return None
-        found: list[tuple[str, datetime]] = await listing(ROOT)
+    def can_list_times(self) -> bool:
+        """Whether the store tells when each object was last written (the
+        reconciler needs it to leave recent originals alone)."""
+        return all(
+            callable(getattr(self._store, name, None))
+            for name in ("iter_prefix_modified", "list_prefix_modified")
+        )
+
+    async def key_pages(self) -> AsyncIterator[list[tuple[str, datetime]]]:
+        """Every stored figure key with its last-modified time, a listing page
+        at a time (the reconciler's scan; requires :meth:`can_list_times`)."""
+        async for page in self._store.iter_prefix_modified(ROOT):  # type: ignore[attr-defined]
+            yield page
+
+    async def document_keys_modified(
+        self, *, tenant_id: UUID, kb_id: UUID, document_id: UUID
+    ) -> list[tuple[str, datetime]]:
+        """One document's figure keys with their last-modified times."""
+        prefix = _document_prefix(tenant_id, kb_id, document_id)
+        found: list[tuple[str, datetime]] = await self._store.list_prefix_modified(prefix)  # type: ignore[attr-defined]
         return found
 
     async def delete_keys(self, keys: Sequence[str]) -> int:
@@ -244,17 +255,11 @@ async def confirmed_figure_ids(
 async def chunks_name_figure(
     store: KnowledgeStore, *, tenant_id: UUID, document_id: UUID, figure: str
 ) -> bool:
-    """Whether the document's current chunks name ``figure`` in a quote block."""
-    offset = 0
-    while True:
-        page, total = await store.list_chunks(
-            tenant_id=tenant_id, document_id=document_id, offset=offset, limit=_CHUNK_PAGE
-        )
-        if any(figure in _FIGURE_ID_IN_TEXT.findall(chunk.content) for chunk in page):
-            return True
-        offset += len(page)
-        if not page or offset >= total:
-            return False
+    """Whether the document's current chunks name ``figure`` in a quote block
+    (one store query)."""
+    return await store.chunks_contain(
+        tenant_id=tenant_id, document_id=document_id, text=f"\u3014\u56fe {figure}\u3015"
+    )
 
 
 async def delete_figures_quietly(

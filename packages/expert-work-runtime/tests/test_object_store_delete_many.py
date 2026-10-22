@@ -31,8 +31,8 @@ async def test_memory_delete_many_removes_only_the_keys_given() -> None:
     assert await store.list_prefix("") == ["b/1"]
 
 
-def _client_error(operation: str) -> ClientError:
-    return ClientError({"Error": {"Code": "InvalidDigest", "Message": "no"}}, operation)
+def _client_error(operation: str, code: str = "InvalidDigest") -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": "no"}}, operation)
 
 
 class _FakeClient:
@@ -42,7 +42,7 @@ class _FakeClient:
         self,
         *,
         errors: list[dict[str, str]] | None = None,
-        reject_batches: bool = False,
+        reject_batches: bool | str = False,
         reject_keys: frozenset[str] = frozenset(),
     ) -> None:
         self.batches: list[list[str]] = []
@@ -54,10 +54,14 @@ class _FakeClient:
     async def delete_objects(self, **kw: Any) -> dict[str, Any]:
         assert kw["Bucket"] == "bucket"
         assert kw["Delete"]["Quiet"] is True
+        keys = [item["Key"] for item in kw["Delete"]["Objects"]]
         if self._reject_batches:
-            raise _client_error("DeleteObjects")
-        self.batches.append([item["Key"] for item in kw["Delete"]["Objects"]])
-        return {"Errors": self._errors}
+            code = (
+                self._reject_batches if isinstance(self._reject_batches, str) else "InvalidDigest"
+            )
+            raise _client_error("DeleteObjects", code)
+        self.batches.append(keys)
+        return {"Errors": [error for error in self._errors if error["Key"] in keys]}
 
     async def delete_object(self, **kw: Any) -> dict[str, Any]:
         if kw["Key"] in self._reject_keys:
@@ -92,12 +96,13 @@ async def test_a_rejected_batch_is_deleted_key_by_key() -> None:
 
 
 async def test_a_refused_single_delete_is_an_object_store_error() -> None:
-    client = _FakeClient(reject_batches=True, reject_keys=frozenset({"k/2"}))
+    client = _FakeClient(reject_batches=True, reject_keys=frozenset({"k/1"}))
     store = S3CompatibleObjectStore(client=client, bucket="bucket")
-    with pytest.raises(ObjectStoreError, match="k/2"):
+    with pytest.raises(ObjectStoreError, match="k/1"):
         await store.delete_many(["k/1", "k/2"])
+    assert client.single == ["k/2"]  # a refused key does not stop the rest (L9)
     with pytest.raises(ObjectStoreError):
-        await store.delete("k/2")
+        await store.delete("k/1")
 
 
 class _Raw:
@@ -159,3 +164,24 @@ async def test_listing_with_modification_times() -> None:
     listed = await store.list_prefix_modified("a/")
     assert [key for key, _ in listed] == ["a/1", "a/2"]
     assert all(before <= modified <= datetime.now(UTC) for _, modified in listed)
+
+
+@pytest.mark.parametrize("code", ["AccessDenied", "SlowDown"])
+async def test_only_a_rejected_request_shape_falls_back_to_single_deletes(code: str) -> None:
+    # Re-review round 4 (H3): a refused or throttled batch is raised, not
+    # turned into a thousand more requests.
+    client = _FakeClient(reject_batches=code)
+    store = S3CompatibleObjectStore(client=client, bucket="bucket")
+    with pytest.raises(ObjectStoreError, match=code):
+        await store.delete_many(["k/1", "k/2"])
+    assert client.single == []
+
+
+async def test_every_batch_is_sent_before_the_failures_are_raised() -> None:
+    # Re-review round 4 (L9): keys refused in the first batch do not stop the
+    # second; one error names them all.
+    client = _FakeClient(errors=[{"Key": "k/0", "Code": "AccessDenied"}, {"Key": "k/1500"}])
+    store = S3CompatibleObjectStore(client=client, bucket="bucket")
+    with pytest.raises(ObjectStoreError, match=r"2 keys \(first: 'k/0'\)"):
+        await store.delete_many([f"k/{n}" for n in range(2_001)])
+    assert [len(batch) for batch in client.batches] == [1000, 1000, 1]

@@ -27,10 +27,12 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge.base import UNSET, KnowledgeStore
 from expert_work.persistence.rls import bypass_rls_var
-from expert_work.protocol import FigureStats
+from expert_work.protocol import FigureStats, KnowledgeChunk
 
+_EMBEDDING = (1.0,) + (0.0,) * (EMBEDDING_DIM - 1)
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _DB = "knowledge_figures_contract"
 
@@ -242,3 +244,31 @@ async def test_only_an_unrestricted_sql_connection_proves_it_sees_every_tenant(
         assert await store.sees_every_tenant() is isinstance(store, SqlKnowledgeStore)
     finally:
         bypass_rls_var.reset(bypass)
+
+
+async def test_chunks_contain_looks_in_one_documents_chunks(store: KnowledgeStore) -> None:
+    # Re-review round 4 (L10): the figure endpoint's one-query check.
+    tenant, other = uuid4(), uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    mine = await _document(store, tenant, base.id, "a.pdf")
+    sibling = await _document(store, tenant, base.id, "b.pdf")
+    needle = "\u3014\u56fe 0123456789abcdef\u3015"
+    await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=mine,
+        chunks=[
+            KnowledgeChunk(
+                id=uuid4(),
+                tenant_id=tenant,
+                kb_id=base.id,
+                document_id=mine,
+                chunk_index=0,
+                content=f"Intro.\n\n> {needle}A chair.",
+                embedding=_EMBEDDING,
+            )
+        ],
+    )
+    assert await store.chunks_contain(tenant_id=tenant, document_id=mine, text=needle)
+    assert not await store.chunks_contain(tenant_id=tenant, document_id=mine, text="\u3014\u56fe f")
+    assert not await store.chunks_contain(tenant_id=tenant, document_id=sibling, text=needle)
+    assert not await store.chunks_contain(tenant_id=other, document_id=mine, text=needle)

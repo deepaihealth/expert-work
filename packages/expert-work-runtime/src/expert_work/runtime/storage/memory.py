@@ -98,6 +98,14 @@ class InMemoryObjectStore:
     async def list_prefix(self, prefix: str) -> list[str]:
         return sorted(k for k in self._objects if k.startswith(prefix))
 
+    async def iter_prefix_modified(
+        self, prefix: str, page_size: int = 1000
+    ) -> AsyncIterator[list[tuple[str, datetime]]]:
+        """:meth:`list_prefix_modified` in pages of ``page_size``."""
+        listed = await self.list_prefix_modified(prefix)
+        for start in range(0, len(listed), page_size):
+            yield listed[start : start + page_size]
+
     async def list_prefix_modified(self, prefix: str) -> list[tuple[str, datetime]]:
         """``(key, last modified)`` of every object under ``prefix``, by key."""
         return sorted(

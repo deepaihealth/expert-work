@@ -2142,6 +2142,10 @@ def create_app(
                     storage=figure_storage,
                     interval_s=resolved_settings.knowledge_figure_reconcile_interval_s,
                     delete=resolved_settings.knowledge_figure_reconcile_delete,
+                    ignore_orphan_share=(
+                        resolved_settings.knowledge_figure_reconcile_ignore_orphan_share
+                    ),
+                    session_factory=sql_stores.session_factory if sql_stores else None,
                 )
                 if figure_reconciler is not None:
                     figure_reconciler.start()

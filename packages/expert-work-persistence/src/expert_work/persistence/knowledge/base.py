@@ -144,6 +144,11 @@ class DuplicateKnowledgeBaseError(Exception):
         self.name = name
 
 
+class RowSecurityActiveError(RuntimeError):
+    """A cross-tenant lookup ran on a connection that row security still
+    filters — its "not found" would be a lie (the figure reconciler gives up)."""
+
+
 class KnowledgeStore(abc.ABC):
     """Tenant-scoped knowledge base / document / chunk repository."""
 
@@ -615,6 +620,20 @@ class KnowledgeStore(abc.ABC):
         """A page of a document's chunks ordered by ``chunk_index`` plus the
         total count — for segment preview. The (large) embedding vector is
         omitted from the returned chunks (``embedding == ()``)."""
+
+    async def chunks_contain(self, *, tenant_id: UUID, document_id: UUID, text: str) -> bool:
+        """Whether any chunk of the document holds ``text`` (the figure
+        endpoint's check that a document's chunks still name a figure)."""
+        offset = 0
+        while True:
+            page, total = await self.list_chunks(
+                tenant_id=tenant_id, document_id=document_id, offset=offset, limit=200
+            )
+            if any(text in chunk.content for chunk in page):
+                return True
+            offset += len(page)
+            if not page or offset >= total:
+                return False
 
     @abc.abstractmethod
     async def chunk_embeddings_by_hash(

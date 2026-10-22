@@ -11,13 +11,23 @@
 单文档的过滤(§5.4 第 1~4 道)在这里做:没过的图不带字节出进程,只计数。先只看图片头里的尺寸
 和字节数筛、按面积留一个短名单,只解码短名单里的图。
 
-**内存上限**(安全复核 S-H2,二轮复核 M1):``keep_data_uris`` 会把每张图的字节以 base64 展开进
-正文,而关系文件可以把图片指到压缩包里任何位置。所以交给 MarkItDown 之前,按压缩包里**每个**
-不是 ``.xml`` / ``.rels`` 的条目声明的解压后大小(不看目录)限额:单个超过 :data:`MAX_IMAGE_BYTES`、
-或合计超过 :data:`MAX_OFFICE_MEDIA_BYTES`(从最大的开始)的,换成一个 1 像素的替身(图片计作
-``unsupported``);整个包声明的解压后大小超过 :data:`MAX_OFFICE_PACKAGE_BYTES` 的,这份文档直接
-解析失败。改写时逐条流式拷贝,不把别的条目整个读进内存。压缩包条目声明的大小就是读出来的上限
-(``zipfile`` 读到声明的长度为止并校验)。
+**内存上限**(安全复核 S-H2,二轮复核 M1,四轮复核 M1):``keep_data_uris`` 会把每张图的字节以
+base64 展开进正文,而关系文件可以把图片指到压缩包里任何位置、起任何名字。所以交给 MarkItDown 之前,
+按压缩包里各条目声明的解压后大小限额:
+
+* 只有 ``[Content_Types].xml`` 里登记为 XML 类型(按 Override 或按扩展名的 Default)的条目算标记
+  —— 单个超过 :data:`MAX_XML_PART_BYTES` 的,文档直接解析失败;
+* 其余条目、以及**任何**图片关系指向的条目(不管叫什么名字、登记成什么类型)都按图片算:单个超过
+  :data:`MAX_IMAGE_BYTES`、或合计超过 :data:`MAX_OFFICE_MEDIA_BYTES`(从最大的开始)的,换成一个
+  1 像素的替身(图片计作 ``unsupported``);
+* 条目数超过 :data:`MAX_PACKAGE_ENTRIES`、或整个包声明的解压后大小超过
+  :data:`MAX_OFFICE_PACKAGE_BYTES` 的,文档直接解析失败。
+
+改写时逐条流式拷贝,不把别的条目整个读进内存。压缩包条目声明的大小就是读出来的上限(``zipfile``
+读到声明的长度为止并校验)。
+
+Word / 幻灯片的图片抽取(MarkItDown + 解码规整)跑在**主解析池**里(它就是这份文档的解析本身),
+不在插图专用的小进程池里:那个池只跑 PDF 插图收集和扫描页裁图。
 """
 
 from __future__ import annotations
@@ -26,6 +36,8 @@ import base64
 import binascii
 import hashlib
 import io
+import posixpath
+import re
 import shutil
 import zipfile
 from collections.abc import Mapping, Sequence
@@ -55,16 +67,23 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 #: (the largest are left out first) — they are base64-expanded in memory.
 MAX_OFFICE_MEDIA_BYTES = 40 * 1024 * 1024
 #: A Word / slide package that unpacks to more than this is not read at all
-#: (uploads are capped at 25 MB; a real file of pictures and text stays far
-#: below — past this is a zip bomb).
+#: (uploads are capped at 50 MiB by default, ``knowledge_document_max_bytes``; a
+#: real file of pictures and text unpacks to a few times its size at most —
+#: past this is a zip bomb).
 MAX_OFFICE_PACKAGE_BYTES = 256 * 1024 * 1024
-#: Package parts that are markup, never pictures.
-_MARKUP_SUFFIXES = (".xml", ".rels")
+#: One XML part (the document's text, a slide) may unpack to at most this.
+MAX_XML_PART_BYTES = 64 * 1024 * 1024
+#: Entries one package may hold (a 1,000-slide deck has a few thousand).
+MAX_PACKAGE_ENTRIES = 20_000
 #: Picture file types (a replaced part of another type is not a picture).
 _PICTURE_SUFFIXES = (
     *(".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico"),
     *(".emf", ".wmf", ".svg"),
 )
+_CONTENT_TYPES = "[Content_Types].xml"
+#: ``<Default …/>`` / ``<Override …/>`` / ``<Relationship …/>`` and their attributes.
+_TAG = re.compile(r"<(?:\w+:)?(Default|Override|Relationship)\b([^<>]{0,4000})>")
+_ATTRIBUTE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
 #: Bytes per read while copying a package part.
 _COPY_CHUNK = 1024 * 1024
 
@@ -178,26 +197,35 @@ def parse_office_figures(raw: bytes, ext: str) -> OfficeParse:
 
 
 def bound_office_media(raw: bytes) -> tuple[bytes, int]:
-    """``raw`` with every non-markup part over the limits (see module doc)
+    """``raw`` with every picture part over the limits (see module doc)
     replaced by a 1-pixel stand-in, and how many pictures were replaced. A
     file that is not a readable zip is returned as it is (MarkItDown reports
     it).
 
-    :raises DocumentParseError: the package unpacks past
+    :raises DocumentParseError: too many entries, an XML part past
+        :data:`MAX_XML_PART_BYTES`, or the package unpacks past
         :data:`MAX_OFFICE_PACKAGE_BYTES`."""
     try:
         package = zipfile.ZipFile(io.BytesIO(raw))
-        entries = package.infolist()
+        entries = [entry for entry in package.infolist() if not entry.is_dir()]
     except (zipfile.BadZipFile, ValueError):
         return raw, 0
+    if len(entries) > MAX_PACKAGE_ENTRIES:
+        msg = f"the file holds more than {MAX_PACKAGE_ENTRIES} parts"
+        raise DocumentParseError(msg)
     if sum(entry.file_size for entry in entries) > MAX_OFFICE_PACKAGE_BYTES:
         msg = "the file unpacks to more than a document may (a zip bomb?)"
         raise DocumentParseError(msg)
-    parts = [
-        entry
-        for entry in entries
-        if not entry.is_dir() and not entry.filename.lower().endswith(_MARKUP_SUFFIXES)
-    ]
+    types = _content_types(package, entries)
+    pictures = _image_targets(package, entries) | {
+        name for name, kind in types.items() if kind.lower().startswith("image/")
+    }
+    xml = {name for name, kind in types.items() if _is_xml_type(kind)} - pictures
+    xml.add(_CONTENT_TYPES)
+    if any(entry.file_size > MAX_XML_PART_BYTES for entry in entries if entry.filename in xml):
+        msg = "a part of the file unpacks to more than a document may"
+        raise DocumentParseError(msg)
+    parts = [entry for entry in entries if entry.filename not in xml]
     over = {entry.filename for entry in parts if entry.file_size > MAX_IMAGE_BYTES}
     total = sum(entry.file_size for entry in parts if entry.filename not in over)
     for entry in sorted(parts, key=lambda e: -e.file_size):
@@ -210,7 +238,7 @@ def bound_office_media(raw: bytes) -> tuple[bytes, int]:
         return raw, 0
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w") as bounded:
-        for entry in entries:
+        for entry in package.infolist():
             copy = zipfile.ZipInfo(entry.filename, entry.date_time)
             copy.compress_type, copy.external_attr = entry.compress_type, entry.external_attr
             if entry.filename in over:
@@ -218,8 +246,68 @@ def bound_office_media(raw: bytes) -> tuple[bytes, int]:
                 continue
             with package.open(entry) as source, bounded.open(copy, "w") as target:
                 shutil.copyfileobj(source, target, _COPY_CHUNK)
-    pictures = sum(1 for name in over if name.lower().endswith(_PICTURE_SUFFIXES))
-    return out.getvalue(), pictures
+    replaced = sum(
+        1 for name in over if name in pictures or name.lower().endswith(_PICTURE_SUFFIXES)
+    )
+    return out.getvalue(), replaced
+
+
+def _attributes(markup: str) -> list[tuple[str, dict[str, str]]]:
+    return [(tag, dict(_ATTRIBUTE.findall(body))) for tag, body in _TAG.findall(markup)]
+
+
+def _read_small(package: zipfile.ZipFile, entry: zipfile.ZipInfo) -> str:
+    """A markup part's text (``""`` when it is past the XML cap)."""
+    if entry.file_size > MAX_XML_PART_BYTES:
+        return ""
+    return package.read(entry).decode("utf-8", "replace")
+
+
+def _is_xml_type(content_type: str) -> bool:
+    kind = content_type.split(";")[0].strip().lower()
+    return kind.endswith("+xml") or kind in ("application/xml", "text/xml")
+
+
+def _content_types(package: zipfile.ZipFile, entries: Sequence[zipfile.ZipInfo]) -> dict[str, str]:
+    """Each part's type as ``[Content_Types].xml`` gives it — by Override,
+    else by the Default for its extension (``""``: not listed)."""
+    listed = next((entry for entry in entries if entry.filename == _CONTENT_TYPES), None)
+    defaults: dict[str, str] = {}
+    overrides: dict[str, str] = {}
+    if listed is not None:
+        for tag, attributes in _attributes(_read_small(package, listed)):
+            if tag == "Default" and "Extension" in attributes:
+                defaults[attributes["Extension"].lower()] = attributes.get("ContentType", "")
+            elif tag == "Override" and "PartName" in attributes:
+                overrides[attributes["PartName"].lstrip("/")] = attributes.get("ContentType", "")
+    found: dict[str, str] = {}
+    for entry in entries:
+        name = entry.filename
+        extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        found[name] = overrides.get(name, defaults.get(extension, ""))
+    return found
+
+
+def _image_targets(package: zipfile.ZipFile, entries: Sequence[zipfile.ZipInfo]) -> set[str]:
+    """Parts an image relationship points at, whatever their name or type."""
+    names = {entry.filename for entry in entries}
+    found: set[str] = set()
+    for entry in entries:
+        if not entry.filename.endswith(".rels"):
+            continue
+        # ``word/_rels/document.xml.rels`` describes ``word/document.xml``.
+        folder = posixpath.dirname(posixpath.dirname(entry.filename))
+        for tag, attributes in _attributes(_read_small(package, entry)):
+            kind, target = attributes.get("Type", ""), attributes.get("Target", "")
+            if tag != "Relationship" or not kind.endswith("/image") or not target:
+                continue
+            if attributes.get("TargetMode", "").lower() == "external":
+                continue
+            path = target.lstrip("/") if target.startswith("/") else posixpath.join(folder, target)
+            path = posixpath.normpath(path)
+            if path in names:
+                found.add(path)
+    return found
 
 
 def _office_candidates(

@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
+from control_plane.advisory_locks import FIGURE_RECONCILE_LOCK_CLASSID
 from control_plane.knowledge.recognition import figure_reconcile
 from control_plane.knowledge.recognition.figure_reconcile import (
     FigureReconciler,
@@ -20,8 +23,10 @@ from control_plane.knowledge.recognition.figure_reconcile import (
 from control_plane.knowledge.recognition.figure_storage import FigureStorage, parse_key
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.knowledge import SqlKnowledgeStore
+from expert_work.persistence.knowledge.base import RowSecurityActiveError
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.runtime.storage import InMemoryObjectStore
+from tests.fake_advisory_lock import FakeAdvisoryLockSessionFactory
 
 _FIGURE = "0123456789abcdef"
 
@@ -40,6 +45,8 @@ class _Store(InMemoryKnowledgeStore):
         self.sees_all = sees_all
         self.checked_with_bypass: list[bool] = []
         self.lookups: list[tuple[bool, UUID | None, int]] = []
+        #: The lookup that raises (1-based), and what it raises.
+        self.fail_at: tuple[int, Exception] | None = None
 
     async def sees_every_tenant(self) -> bool:
         self.checked_with_bypass.append(bypass_rls_var.get())
@@ -47,6 +54,8 @@ class _Store(InMemoryKnowledgeStore):
 
     async def existing_document_ids(self, *, document_ids: Sequence[UUID]) -> set[UUID]:
         self.lookups.append((bypass_rls_var.get(), current_tenant_id_var.get(), len(document_ids)))
+        if self.fail_at is not None and len(self.lookups) == self.fail_at[0]:
+            raise self.fail_at[1]
         return await super().existing_document_ids(document_ids=document_ids)
 
 
@@ -286,3 +295,100 @@ async def test_deletes_go_out_in_batches_when_the_store_can() -> None:
         )
     assert await storage.delete_document(tenant_id=tenant, kb_id=kb, document_id=document) == 3
     assert (objects.batches, objects.single) == ([3], [])
+
+
+async def test_under_twenty_documents_a_high_orphan_share_is_still_trusted() -> None:
+    # Re-review round 4 (L7): below MIN_DOCUMENTS_FOR_SHARE only the
+    # nothing-found guard applies.
+    setup = _Setup()
+    await setup.documents(kept=1, gone=2)
+    assert await setup.reconciler().run_once() == ReconcileOutcome(orphans=2, deleted=2)
+
+
+async def test_an_operator_can_let_a_mass_deletion_through() -> None:
+    setup = _Setup()
+    await setup.documents(kept=9, gone=11)
+    outcome = await setup.reconciler(ignore_orphan_share=True).run_once()
+    assert outcome == ReconcileOutcome(orphans=11, deleted=11)
+
+
+async def test_a_lookup_failing_midway_deletes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Re-review round 4 (L7): a batch that failed proves nothing missing.
+    monkeypatch.setattr(figure_reconcile, "_LOOKUP_BATCH", 1)
+    setup = _Setup()
+    await setup.documents(kept=2, gone=2)
+    setup.store.fail_at = (3, ConnectionError("database blip"))
+    assert (await setup.reconciler().run_once()).aborted == "lookup_failed"
+    assert len(await setup.holders()) == 4
+
+
+async def test_row_security_found_during_the_lookup_deletes_nothing() -> None:
+    # Re-review round 4 (L6): the store's same-transaction check.
+    setup = _Setup()
+    await setup.documents(kept=2, gone=1)
+    setup.store.fail_at = (1, RowSecurityActiveError("on"))
+    assert (await setup.reconciler().run_once()).aborted == "rls_not_bypassed"
+    assert len(await setup.holders()) == 3
+
+
+class _CountingStorage(FigureStorage):
+    """Spies on the listing pages and the per-document re-listing."""
+
+    def __init__(self, objects: InMemoryObjectStore) -> None:
+        super().__init__(objects)
+        self.pages = 0
+        self.relisted: list[UUID] = []
+
+    async def key_pages(self) -> Any:
+        async for page in self._store.iter_prefix_modified(  # type: ignore[attr-defined]
+            "knowledge_figures/", page_size=2
+        ):
+            self.pages += 1
+            yield page
+
+    async def document_keys_modified(self, **kwargs: Any) -> Any:
+        self.relisted.append(kwargs["document_id"])
+        return await super().document_keys_modified(**kwargs)
+
+
+async def test_the_bucket_is_read_page_by_page_and_orphans_listed_again() -> None:
+    # Re-review round 4: one record per document from the scan; the keys to
+    # delete come from listing each orphaned document again.
+    setup = _Setup()
+    kept, gone = await setup.documents(kept=3, gone=2)
+    storage = _CountingStorage(setup.objects)
+    reconciler = FigureReconciler(
+        store=setup.store, storage=storage, interval_s=60, delete=True, now=_later
+    )
+    assert await reconciler.run_once() == ReconcileOutcome(orphans=2, deleted=2)
+    assert storage.pages == 3  # 5 keys, 2 per page
+    assert sorted(storage.relisted) == sorted(gone)
+    assert await setup.holders() == {str(d) for d in kept}
+
+
+async def test_only_one_replica_runs_a_pass() -> None:
+    # Re-review round 4: a pg advisory lock makes the pass single-flight.
+    setup = _Setup()
+    await setup.documents(kept=2, gone=1)
+    factory = FakeAdvisoryLockSessionFactory()
+    holder = factory()
+    await holder.execute(object(), {"cid": FIGURE_RECONCILE_LOCK_CLASSID, "k": "figure_reconcile"})
+    blocked = setup.reconciler(session_factory=factory)
+    assert await blocked.run_once() == ReconcileOutcome(skipped=True)
+    assert setup.store.lookups == [] and len(await setup.holders()) == 3
+    await holder.rollback()
+    assert (await blocked.run_once()).deleted == 1
+
+
+async def test_a_young_original_of_an_orphaned_document_stays() -> None:
+    # The re-listing keeps the age rule: only keys older than a day go.
+    setup = _Setup()
+    _, (gone,) = await setup.documents(kept=2, gone=1)
+    (old_key,) = [key for key in await setup.objects.list_prefix("") if str(gone) in key]
+    young_key = old_key.replace("/g0/", "/g1/")
+    await setup.objects.put(young_key, b"jpeg")
+    record = setup.objects._objects[young_key]
+    setup.objects._objects[young_key] = replace(record, modified_at=_later())
+    assert await setup.reconciler().run_once() == ReconcileOutcome(orphans=1, deleted=1)
+    remaining = await setup.objects.list_prefix("")
+    assert young_key in remaining and old_key not in remaining

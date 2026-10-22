@@ -38,6 +38,7 @@ from expert_work.persistence.artifact import SqlArtifactStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.feedback_store import DbFeedbackStore, FeedbackRecord
 from expert_work.persistence.knowledge import SqlKnowledgeStore
+from expert_work.persistence.knowledge.base import RowSecurityActiveError
 from expert_work.persistence.memory import SqlMemoryStore
 from expert_work.persistence.rls import (
     build_rls_sessionmaker,
@@ -261,6 +262,9 @@ async def test_the_figure_reconcilers_check_fails_on_a_row_security_bound_role(
     bypass_rls_var.set(True)
     try:
         assert await store.sees_every_tenant() is False
+        # Re-review round 4 (L6): the lookup checks it in its own transaction.
+        with pytest.raises(RowSecurityActiveError):
+            await store.existing_document_ids(document_ids=[uuid4()])
     finally:
         await engine.dispose()
 

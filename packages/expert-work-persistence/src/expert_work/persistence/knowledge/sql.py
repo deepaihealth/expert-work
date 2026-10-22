@@ -45,6 +45,7 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     ParseCacheEntry,
     ParseCacheKind,
+    RowSecurityActiveError,
     _Unset,
 )
 from expert_work.persistence.knowledge.text_search import (
@@ -1369,6 +1370,14 @@ class SqlKnowledgeStore(KnowledgeStore):
         if not document_ids:
             return set()
         async with self._sf() as session:
+            # Same transaction as the lookup: a "not found" here is only
+            # trusted when row security did not filter it.
+            active = (
+                await session.execute(text("SELECT row_security_active('knowledge_document')"))
+            ).scalar_one()
+            if active is not False:
+                msg = "row security applies to this connection: the lookup would miss rows"
+                raise RowSecurityActiveError(msg)
             rows = (
                 await session.execute(
                     select(KnowledgeDocumentRow.id).where(
@@ -1531,6 +1540,21 @@ class SqlKnowledgeStore(KnowledgeStore):
             rows = (await session.execute(page_stmt)).all()
             total = (await session.execute(count_stmt)).scalar_one()
         return [_to_chunk(row) for row in rows], int(total)
+
+    async def chunks_contain(self, *, tenant_id: UUID, document_id: UUID, text: str) -> bool:
+        # One query on the document's chunks (the (tenant, document) index
+        # narrows them), not a page-by-page read into the application.
+        stmt = select(
+            select(KnowledgeChunkRow.id)
+            .where(
+                KnowledgeChunkRow.tenant_id == tenant_id,
+                KnowledgeChunkRow.document_id == document_id,
+                func.strpos(KnowledgeChunkRow.content, text) > 0,
+            )
+            .exists()
+        )
+        async with self._sf() as session:
+            return bool((await session.execute(stmt)).scalar_one())
 
     async def chunk_embeddings_by_hash(
         self,
