@@ -164,6 +164,7 @@ from orchestrator.tools.update_plan import UpdatePlanTool
 from orchestrator.tools.worker_policy import worker_policy_enabled
 from orchestrator.usage_metering import (
     MeteredLLMCaller,
+    ScopedEmbedder,
     ScopedReranker,
     UsageIdentity,
     UsageMeter,
@@ -909,13 +910,17 @@ async def build_agent(
     if token_usage_kind != "conversation":  # noqa: S105 — usage label, not a secret
         env = _bind_delegation_usage_kind(env, token_usage_kind)
     # B-104 —— 知识库重排序的 LLM 分支记在本 agent 名下(``platform_overhead``)。
+    # B-209 §5.8 —— 检索的查询嵌入同口径。
     retriever = env.knowledge_retriever
-    if retriever is not None and retriever.reranker is not None:
+    if retriever is not None:
         env = replace(
             env,
             knowledge_retriever=replace(
                 retriever,
-                reranker=ScopedReranker(inner=retriever.reranker, identity=platform_usage),
+                embedder=ScopedEmbedder(inner=retriever.embedder, identity=platform_usage),
+                reranker=ScopedReranker(inner=retriever.reranker, identity=platform_usage)
+                if retriever.reranker is not None
+                else None,
             ),
         )
 
@@ -2353,6 +2358,17 @@ def _thinking_disable_payload(model: ModelSpec, entry: ModelEntry) -> dict[str, 
     # toggle vendors (Kimi / GLM ≤5.1) share the disabled shape. (doubao no
     # longer reaches here — B-105 moved it into the effort branch above.)
     return {"thinking": {"type": "disabled"}}
+
+
+def thinking_off_request_fields(provider: str, name: str, *, max_tokens: int) -> dict[str, Any]:
+    """B-209 —— 平台自己发起的单次看图调用(知识库扫描页识别)要带的厂商字段:关思考 +
+    输出上限(含思考)。与 agent 构建同一套映射(:func:`_thinking_payload` /
+    :func:`_output_cap_payload`),换厂商、加模型只改目录,不改调用点。"""
+    model = ModelSpec.model_validate(
+        {"provider": provider, "name": name, "thinking_enabled": False, "max_tokens": max_tokens}
+    )
+    entry = catalog_entry(provider, name)
+    return {**(_thinking_payload(model) or {}), **(_output_cap_payload(model, entry) or {})}
 
 
 def _thinking_off(model: ModelSpec) -> ModelSpec:

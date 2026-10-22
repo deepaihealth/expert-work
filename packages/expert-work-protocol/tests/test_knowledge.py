@@ -10,10 +10,15 @@ from pydantic import ValidationError
 
 from expert_work.protocol import (
     KB_DOCUMENT_TITLE_MAX_CHARS,
+    DocumentPage,
     DocumentStatus,
+    IngestStage,
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeDocument,
+    PageDecision,
+    PageStats,
+    PageStatus,
     RetrievalMethod,
     ScoredChunk,
     chunk_retrieval_text,
@@ -257,3 +262,42 @@ def test_knowledge_chunk_retrieval_text_carries_its_document_title() -> None:
     assert chunk().doc_title is None
     assert chunk().retrieval_text == "[Section: A]\n\nbody"
     assert chunk(doc_title="Guide").retrieval_text == "[Document: Guide]\n[Section: A]\n\nbody"
+
+
+# ---------------------------------------------------------------------------
+# B-209 — per-page records
+# ---------------------------------------------------------------------------
+
+
+def test_recognizing_stage_sits_between_parsing_and_chunking() -> None:
+    stages = list(IngestStage)
+    assert stages.index(IngestStage.PARSING) + 1 == stages.index(IngestStage.RECOGNIZING)
+    assert stages.index(IngestStage.RECOGNIZING) + 1 == stages.index(IngestStage.CHUNKING)
+
+
+def _page(page: int, status: PageStatus | None) -> DocumentPage:
+    decision = PageDecision.TEXT if status is None else PageDecision.OCR
+    return DocumentPage(page=page, decision=decision, status=status)
+
+
+def test_page_stats_count_each_status() -> None:
+    pages = [
+        _page(1, None),
+        _page(2, PageStatus.RECOGNIZED),
+        _page(3, PageStatus.RECOGNIZED),
+        _page(4, PageStatus.FAILED),
+        _page(5, PageStatus.PENDING),
+        _page(6, PageStatus.OVER_LIMIT),
+    ]
+    assert PageStats.of(pages) == PageStats(
+        pages_total=6, pages_ocr=2, pages_failed=1, pages_pending=1, pages_over_limit=1
+    )
+
+
+def test_page_stats_needs_recognition_for_failed_pending_or_over_limit() -> None:
+    assert not PageStats.of([_page(1, PageStatus.RECOGNIZED)]).needs_recognition
+    assert not PageStats.of([_page(1, None)]).needs_recognition
+    # Past the page limit: read once the platform limit is raised.
+    assert PageStats.of([_page(1, PageStatus.OVER_LIMIT)]).needs_recognition
+    assert PageStats.of([_page(1, PageStatus.FAILED)]).needs_recognition
+    assert PageStats.of([_page(1, PageStatus.PENDING)]).needs_recognition

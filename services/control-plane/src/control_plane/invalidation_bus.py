@@ -54,6 +54,7 @@ KINDS = frozenset(
         "platform_dynamic_worker",  # dynamic-worker limits cache (read per run)
         "platform_delegation",  # delegation-gate capacity cache (read per check)
         "platform_quality",  # quality sampling/judge config cache (read by workers)
+        "platform_recognition",  # document-recognition config cache (read per ingest)
         "agent_template",  # template catalog change → every tenant's builds
         "platform_skill",  # platform skill change → every tenant's builds
         "tenant_status",  # tenant suspended/active TTL cache
@@ -446,6 +447,9 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
             "platform_delegation_config_service", rebuild=False
         ),
         "platform_quality": _platform_config("quality_config_service", rebuild=False),
+        "platform_recognition": _platform_config(
+            "platform_recognition_config_service", rebuild=False
+        ),
         # No inner cache of their own — the content is read from the store at
         # build time, so the build layer IS the cache.
         "agent_template": _agent_build_all,

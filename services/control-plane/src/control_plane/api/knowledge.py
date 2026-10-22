@@ -238,6 +238,11 @@ def _base_dict(
     }
 
 
+#: B-209 —— page records per ``GET …/pages`` response (default / ceiling).
+PAGES_PAGE_DEFAULT = 200
+PAGES_PAGE_MAX = 1000
+
+
 def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
     return {
         "id": str(document.id),
@@ -255,6 +260,10 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "size_bytes": document.size_bytes,
         "mime": document.mime,
         "page_count": document.page_count,
+        # B-209 —— 「已识别 N 页 · 失败 M 页 · 待识别 K 页」; null when not a PDF.
+        "page_stats": document.page_stats.model_dump(mode="json")
+        if document.page_stats is not None
+        else None,
         "enabled": document.enabled,
         "created_at": _iso(document.created_at),
         "updated_at": _iso(document.updated_at),
@@ -282,6 +291,55 @@ async def _require_base(store: KnowledgeStore, tenant_id: UUID, name: str) -> Kn
     if base is None:
         raise HTTPException(status_code=404, detail="knowledge base not found")
     return base
+
+
+async def _require_redrivable(
+    store: KnowledgeStore,
+    runner: KnowledgeIngestionRunner | None,
+    tenant_id: UUID,
+    base: KnowledgeBase,
+    document_id: UUID,
+) -> KnowledgeDocument:
+    """The base's document, provided ingestion is running and its bytes
+    were retained (404 / 409 / 503 otherwise) — shared by 「重新摄取」 and
+    「补识别」."""
+    if runner is None:
+        raise HTTPException(
+            status_code=503,
+            detail="knowledge ingestion unavailable: no embedding model configured",
+        )
+    document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
+    if document is None or document.kb_id != base.id:
+        raise HTTPException(status_code=404, detail="document not found")
+    content = await store.get_document_content(tenant_id=tenant_id, document_id=document_id)
+    if content is None and not document.has_pending:
+        # Legacy document predating retained bytes — cannot re-drive.
+        raise HTTPException(
+            status_code=409,
+            detail="original file not retained; please re-upload this document",
+        )
+    return document
+
+
+async def _redrive(
+    store: KnowledgeStore,
+    runner: KnowledgeIngestionRunner,
+    tenant_id: UUID,
+    base: KnowledgeBase,
+    document: KnowledgeDocument,
+) -> KnowledgeDocument:
+    # Reset to pending without touching either byte slot and re-drive the
+    # fast path: the claim picks the pending upload if there is one (retry
+    # a failed new version), else the serving bytes. ``force``: an explicit
+    # re-ingest must run even though the bytes are unchanged.
+    reset = await store.upsert_document(
+        tenant_id=tenant_id,
+        kb_id=base.id,
+        filename=document.filename,
+        force=True,
+    )
+    runner.submit(tenant_id=tenant_id, document_id=reset.id)
+    return reset
 
 
 def build_knowledge_router() -> APIRouter:
@@ -729,32 +787,9 @@ def build_knowledge_router() -> APIRouter:
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
-        if runner is None:
-            raise HTTPException(
-                status_code=503,
-                detail="knowledge ingestion unavailable: no embedding model configured",
-            )
-        document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
-        if document is None or document.kb_id != base.id:
-            raise HTTPException(status_code=404, detail="document not found")
-        content = await store.get_document_content(tenant_id=tenant_id, document_id=document_id)
-        if content is None and not document.has_pending:
-            # Legacy document predating retained bytes — cannot re-drive.
-            raise HTTPException(
-                status_code=409,
-                detail="original file not retained; please re-upload this document",
-            )
-        # Reset to pending without touching either byte slot and re-drive the
-        # fast path: the claim picks the pending upload if there is one (retry
-        # a failed new version), else the serving bytes. ``force``: an explicit
-        # re-ingest must run even though the bytes are unchanged.
-        reset = await store.upsert_document(
-            tenant_id=tenant_id,
-            kb_id=base.id,
-            filename=document.filename,
-            force=True,
-        )
-        runner.submit(tenant_id=tenant_id, document_id=reset.id)
+        document = await _require_redrivable(store, runner, tenant_id, base, document_id)
+        assert runner is not None  # noqa: S101 — checked above
+        reset = await _redrive(store, runner, tenant_id, base, document)
         await _audit_write(
             audit,
             request,
@@ -764,6 +799,101 @@ def build_knowledge_router() -> APIRouter:
             details={"kb": base.name, "filename": document.filename},
         )
         return JSONResponse(status_code=202, content=_document_dict(reset))
+
+    @router.post(
+        "/bases/{name}/documents/{document_id}/recognize",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
+    async def recognize_document(
+        name: str,
+        document_id: UUID,
+        request: Request,
+        store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> JSONResponse:
+        """B-209 §5.6 「补识别」 —— re-drive a document whose scanned pages failed
+        or waited for recognition (e.g. the model was configured since). The
+        whole document goes through the pipeline again, but pages already
+        recognized come from the recognition cache: only the failed / waiting
+        pages are sent to a model (and billed)."""
+        tenant_id: UUID = request.state.tenant_id
+        base = await _require_base(store, tenant_id, name)
+        document = await _require_redrivable(store, runner, tenant_id, base, document_id)
+        assert runner is not None  # noqa: S101 — checked above
+        if document.page_stats is None or not document.page_stats.needs_recognition:
+            raise HTTPException(
+                status_code=409,
+                detail="document has no page that failed, waits or is past the page limit",
+            )
+        reset = await _redrive(store, runner, tenant_id, base, document)
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_DOCUMENT_RECOGNIZE,
+            resource_type="knowledge_document",
+            resource_id=str(reset.id),
+            details={
+                "kb": base.name,
+                "filename": document.filename,
+                "pages_failed": document.page_stats.pages_failed,
+                "pages_pending": document.page_stats.pages_pending,
+            },
+        )
+        return JSONResponse(status_code=202, content=_document_dict(reset))
+
+    @router.get(
+        "/bases/{name}/documents/{document_id}/pages",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "read"))],
+    )
+    async def list_document_pages(
+        name: str,
+        document_id: UUID,
+        request: Request,
+        store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        offset: int = 0,
+        limit: int = PAGES_PAGE_DEFAULT,
+        # W3 read scope — subordinate detail read: concrete tenant only.
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+    ) -> JSONResponse:
+        """B-209 §5.6 —— the document's per-page records (how each PDF page's
+        text was obtained; for a scanned page the model, outcome and error
+        class), a page of them at a time (``offset`` / ``limit``, at most
+        :data:`PAGES_PAGE_MAX`). Empty for a document that is not a PDF."""
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/knowledge/bases/{name}/documents/{document_id}/pages",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            base = await _require_base(store, scope.tenant_id, name)
+            document = await store.get_document(tenant_id=scope.tenant_id, document_id=document_id)
+            if document is None or document.kb_id != base.id:
+                raise HTTPException(status_code=404, detail="document not found")
+            pages = await store.list_document_pages(
+                tenant_id=scope.tenant_id, document_id=document_id
+            )
+        records = pages or []
+        safe_offset = max(0, offset)
+        safe_limit = max(1, min(limit, PAGES_PAGE_MAX))
+        return JSONResponse(
+            content={
+                "pages": [
+                    page.model_dump(mode="json")
+                    for page in records[safe_offset : safe_offset + safe_limit]
+                ],
+                "total": len(records),
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "page_stats": _document_dict(document)["page_stats"],
+            }
+        )
 
     @router.post(
         "/bases/{name}/documents/{document_id}/discard-pending",

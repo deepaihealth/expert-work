@@ -181,6 +181,31 @@ class RerankCaps(BaseModel):
     rpm: int | None = None
 
 
+class OcrCaps(BaseModel):
+    """B-209 —— a model that can read a scanned page into text (知识库扫描页识别).
+
+    Values from B-209 design §4 / §5.3 / §5.7 (2026-10-21 model test).
+    ``None`` = not documented / not measured yet → the platform default.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Request shape (one thin adapter each, B-209 §5.3):
+    #   "layout_parsing" —— 版面解析接口(智谱 ``POST /api/paas/v4/layout_parsing``):
+    #                       只收图片、不收提示词;回 Markdown(表格是 HTML)+ 版面块。
+    #   "chat_vlm"       —— OpenAI 兼容的看图对话:图片走 ``image_url`` data URI,
+    #                       平台固定的识别提示词。
+    api: Literal["layout_parsing", "chat_vlm"]
+    # 单张图片的像素上限(宽乘高);超了先缩。None = 平台渲染上限(长边 2,000 px)就够。
+    max_pixels: int | None = None
+    # 一次识别的输出上限(``chat_vlm`` 发给厂商的 max_tokens)。None = 平台默认。
+    max_output_tokens: int | None = None
+    # 厂商容许的并发请求数(glm-ocr 实测并发 4 偶发 429)。None = 平台默认。
+    max_concurrency: int | None = None
+    # 厂商限流,每分钟请求数。None = 未声明。
+    rpm: int | None = None
+
+
 class ModelEntry(BaseModel):
     """One selectable model for a provider."""
 
@@ -261,6 +286,15 @@ class ModelEntry(BaseModel):
     # ``rerank`` 为 True 的条目上。None = 未声明。批 0 只是骨架:运行时还没有任何地方读它们。
     embedding_caps: EmbeddingCaps | None = None
     rerank_caps: RerankCaps | None = None
+    # B-209 —— 能做知识库扫描页识别的模型。``chat_vlm`` 形态只能挂在 ``vision=True`` 的
+    # 条目上;``layout_parsing`` 形态的模型不收提示词,不是对话模型(见 :attr:`ocr_only`)。
+    ocr_caps: OcrCaps | None = None
+
+    @property
+    def ocr_only(self) -> bool:
+        """A recognition-only model (a layout-parsing API): it takes no prompt,
+        so it is never offered where a chat model is chosen."""
+        return self.ocr_caps is not None and self.ocr_caps.api == "layout_parsing"
 
     @model_validator(mode="after")
     def _caps_match_flags(self) -> ModelEntry:
@@ -269,6 +303,9 @@ class ModelEntry(BaseModel):
             raise ValueError(msg)
         if self.rerank_caps is not None and not self.rerank:
             msg = f"{self.name}: rerank_caps needs rerank=True"
+            raise ValueError(msg)
+        if self.ocr_caps is not None and self.ocr_caps.api == "chat_vlm" and not self.vision:
+            msg = f"{self.name}: ocr_caps api='chat_vlm' needs vision=True"
             raise ValueError(msg)
         return self
 
@@ -579,6 +616,13 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             embeddings=True,
             embedding_caps=EmbeddingCaps(asymmetry="none", max_batch=64, max_input_tokens=3_072),
         ),
+        # B-209 知识库扫描页识别的默认模型(2026-10-21 选模型实测:错字率中位 1.8%、每页
+        # 1.6 s)。版面解析接口,不收提示词 —— 不是对话模型,不进对话模型下拉。并发 4 偶发
+        # 429,默认并发 2。
+        ModelEntry(
+            name="glm-ocr",
+            ocr_caps=OcrCaps(api="layout_parsing", max_concurrency=2),
+        ),
         ModelEntry(name="glm-4-plus", vision=False, context_window=128_000, deprecated=True),
         ModelEntry(name="glm-4v-plus", vision=True, context_window=8_000, deprecated=True),
         ModelEntry(name="glm-4.1v-thinking", vision=True, context_window=32_000, deprecated=True),
@@ -651,13 +695,40 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             output_cap_field="split",
             thinking_cap=True,
         ),
+        # B-210(2026-10-21 实调)—— 已下架:我们账号对它和快照 -2025-10-15 / -2026-01-22
+        # 都回 404 model_not_found,/v1/models 与阿里价目表(中 / 国际站)都没有它。留着
+        # 只为已有配置还能解析;在售的看图 flash 档是下面的 qwen3.7-flash / qwen3.8-flash。
         ModelEntry(
             name="qwen3-vl-flash",
             vision=True,
+            deprecated=True,
             thinking="budget",
             thinking_default=False,
             output_cap_field="split",
             thinking_cap=True,
+        ),
+        # B-209(2026-10-21 摸底,均关思考实调过看图):qwen3.7-flash = 扫描页兜底识别默认
+        # (错字率中位 2.2%、数字全对 94.9%);qwen3.8-flash = 图片描述默认(属性判断 38/40)。
+        # 思考形态 / 输出上限字段按同代 qwen3.x 填(budget、enable_thinking、
+        # max_completion_tokens 合计上限)—— B-105 的上架探针(开思考 + cap=300、关思考、
+        # cap=10,000,000)还没跑,随 B-209 的测试环境验收补跑;max_output_tokens 未实调不填。
+        ModelEntry(
+            name="qwen3.7-flash",
+            vision=True,
+            thinking="budget",
+            thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            thinking_cap=True,
+            ocr_caps=OcrCaps(api="chat_vlm", max_output_tokens=8_192),
+        ),
+        ModelEntry(
+            name="qwen3.8-flash",
+            vision=True,
+            thinking="budget",
+            thinking_default=True,
+            output_cap_field="max_completion_tokens",
+            thinking_cap=True,
+            ocr_caps=OcrCaps(api="chat_vlm", max_output_tokens=8_192),
         ),
         # Platform embedding model (Stream T, user-specified).
         # B-206 K-5 —— 2026-10-21 真接口实测(中文查询),推翻表 5-A 的「``text_type``,只在

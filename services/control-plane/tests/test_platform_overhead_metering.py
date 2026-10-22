@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -478,3 +478,44 @@ async def test_llm_rerank_outside_an_agent_build_records_nothing(
     assert order == [1, 0]
     assert len(factory.specs) == 1
     assert budget.spent == 0
+
+
+# ---------------------------------------------------------------------------
+# B-209 review #10 —— 查询嵌入只记一次,套两层也一样
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _EmbeddingsApi:
+    async def embeddings(
+        self, *, model: str, texts: Sequence[str], fields: Mapping[str, str] | None = None
+    ) -> Any:
+        del model, fields
+        return {
+            "data": [{"index": i, "embedding": [1.0, 0.0]} for i in range(len(texts))],
+            "usage": {"prompt_tokens": 11, "total_tokens": 11},
+        }
+
+
+@pytest.mark.asyncio
+async def test_a_query_embedding_is_metered_once_even_when_wrapped_twice() -> None:
+    # The innermost wrapper's usage sink shadows the outer one's (contextvar),
+    # so a retriever wrapped by two builds still writes one row.
+    from orchestrator.llm import OpenAICompatibleEmbedder
+    from orchestrator.usage_metering import ScopedEmbedder
+
+    store = InMemoryTokenUsageStore()
+    budget = TokenBudget(limit=10_000)
+    inner = OpenAICompatibleEmbedder(client=_EmbeddingsApi(), model="text-embedding-v4")
+    once = ScopedEmbedder(inner=inner, identity=_identity(store))
+    twice = ScopedEmbedder(inner=once, identity=_identity(store))
+    token = var_child_runnable_config.set(_config(budget))
+    try:
+        await twice.embed(["q"], tenant_id=_TENANT)
+    finally:
+        var_child_runnable_config.reset(token)
+    rows = await _rows(store)
+    assert [(r.model, r.input_tokens, r.usage_kind) for r in rows] == [
+        ("text-embedding-v4", 11, PLATFORM_OVERHEAD_USAGE_KIND)
+    ]
+    assert budget.spent == 11

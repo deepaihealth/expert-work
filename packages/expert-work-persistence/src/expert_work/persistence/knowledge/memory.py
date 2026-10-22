@@ -6,6 +6,7 @@ import math
 from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 from expert_work.persistence.knowledge.base import (
@@ -15,6 +16,8 @@ from expert_work.persistence.knowledge.base import (
     DocumentFileFacts,
     DuplicateKnowledgeBaseError,
     KnowledgeStore,
+    ParseCacheEntry,
+    ParseCacheKind,
     _Unset,
 )
 from expert_work.persistence.knowledge.text_search import (
@@ -31,6 +34,7 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    DocumentPage,
     DocumentSourceType,
     DocumentStatus,
     IngestErrorCode,
@@ -38,6 +42,7 @@ from expert_work.protocol import (
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeDocument,
+    PageStats,
     RetrievalMethod,
     ScoredChunk,
     chunk_retrieval_text,
@@ -168,6 +173,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._lease: dict[UUID, datetime | None] = {}
         #: Per-tenant ``doc_seq`` counter — the SQL ``knowledge_doc_seq`` table.
         self._doc_seq: dict[UUID, int] = {}
+        #: B-209 — page records per document (``page_records``, deferred in SQL)
+        #: and the per-document recognition cache (``knowledge_parse_cache``).
+        self._pages: dict[UUID, tuple[DocumentPage, ...]] = {}
+        #: (tenant, document, kind, key) → entry.
+        self._parse_cache: dict[tuple[UUID, UUID, str, str], ParseCacheEntry] = {}
 
     # -- knowledge bases ----------------------------------------------------
 
@@ -341,8 +351,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if base is None:
             return False
         self._bases.remove(base)
+        gone = {d.id for d in self._documents if d.kb_id == kb_id}
         self._documents = [d for d in self._documents if d.kb_id != kb_id]
         self._chunks = [c for c in self._chunks if c.kb_id != kb_id]
+        self._drop_document_state(gone)
         return True
 
     # -- documents ----------------------------------------------------------
@@ -655,7 +667,79 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return False
         self._documents.remove(document)
         self._chunks = [c for c in self._chunks if c.document_id != document_id]
+        self._drop_document_state({document_id})
         return True
+
+    def _drop_document_state(self, document_ids: set[UUID]) -> None:
+        """Page records and recognition cache of deleted documents (the SQL
+        store deletes them with the row / by FK cascade)."""
+        for document_id in document_ids:
+            self._pages.pop(document_id, None)
+        self._parse_cache = {
+            key: entry for key, entry in self._parse_cache.items() if key[1] not in document_ids
+        }
+
+    async def set_document_pages(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        pages: Sequence[DocumentPage],
+        generation: int | None = None,
+    ) -> bool:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None:
+            return False
+        if generation is not None and not _fence_matches(document, generation):
+            return False
+        self._pages[document_id] = tuple(pages)
+        self._patch(
+            tenant_id,
+            document_id,
+            {
+                "page_stats": PageStats.of(pages),
+                "page_count": len(pages),
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        return True
+
+    async def list_document_pages(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[DocumentPage] | None:
+        if await self.get_document(tenant_id=tenant_id, document_id=document_id) is None:
+            return None
+        return list(self._pages.get(document_id, ()))
+
+    async def get_parse_cache(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        kind: ParseCacheKind,
+        keys: Sequence[str],
+    ) -> dict[str, ParseCacheEntry]:
+        found = ((key, self._parse_cache.get((tenant_id, document_id, kind, key))) for key in keys)
+        return {key: entry for key, entry in found if entry is not None}
+
+    async def put_parse_cache(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        kind: ParseCacheKind,
+        key: str,
+        model: str,
+        result: dict[str, Any],
+    ) -> None:
+        if await self.get_document(tenant_id=tenant_id, document_id=document_id) is None:
+            # The SQL store's foreign key refuses a deleted document's reading.
+            msg = f"no document {document_id}"
+            raise KeyError(msg)
+        self._parse_cache.setdefault(
+            (tenant_id, document_id, kind, key),
+            ParseCacheEntry(model=model, result=dict(result)),
+        )
 
     # -- chunks -------------------------------------------------------------
 

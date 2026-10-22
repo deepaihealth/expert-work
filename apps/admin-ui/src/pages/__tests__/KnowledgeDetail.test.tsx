@@ -192,6 +192,81 @@ describe("KnowledgeDetail", () => {
     );
   });
 
+  it("shows scanned-page counts and recognizes failed / waiting pages (B-209)", async () => {
+    const scanned: knowledgeSdk.KnowledgeDocument = {
+      ...DOCS[0],
+      id: "33333333-3333-3333-3333-333333333333",
+      filename: "handbook.pdf",
+      page_stats: {
+        pages_total: 12,
+        pages_ocr: 3,
+        pages_failed: 1,
+        pages_pending: 2,
+        pages_over_limit: 0,
+      },
+    };
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([DOCS[0], scanned]));
+    const recognizeSpy = vi.spyOn(knowledgeSdk, "recognizeDocument").mockResolvedValue(scanned);
+
+    renderDetail();
+    const tags = await screen.findByTestId(`doc-pages-${scanned.id}`);
+    expect(tags).toHaveTextContent("3 pages recognized");
+    expect(tags).toHaveTextContent("1 pages failed");
+    expect(tags).toHaveTextContent("2 pages waiting");
+    expect(tags).not.toHaveTextContent("over the limit");
+    // A document without scanned pages shows no counts and no 「补识别」.
+    expect(screen.queryByTestId(`doc-pages-${DOCS[0].id}`)).toBeNull();
+    expect(screen.queryByTestId(`doc-recognize-${DOCS[0].id}`)).toBeNull();
+
+    await userEvent.click(screen.getByTestId(`doc-recognize-${scanned.id}`));
+    await waitFor(() =>
+      expect(recognizeSpy).toHaveBeenCalledWith("support-docs", scanned.id),
+    );
+  });
+
+  it("offers 「补识别」 for pages over the limit (B-209 review)", async () => {
+    const capped: knowledgeSdk.KnowledgeDocument = {
+      ...DOCS[0],
+      page_stats: {
+        pages_total: 5,
+        pages_ocr: 2,
+        pages_failed: 0,
+        pages_pending: 0,
+        pages_over_limit: 3,
+      },
+    };
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([capped]));
+
+    renderDetail();
+    expect(await screen.findByTestId(`doc-pages-${capped.id}`)).toHaveTextContent(
+      "3 pages over the limit",
+    );
+    expect(screen.getByTestId(`doc-recognize-${capped.id}`)).toBeInTheDocument();
+  });
+
+  it("offers no 「补识别」 when every scanned page was recognized", async () => {
+    const done: knowledgeSdk.KnowledgeDocument = {
+      ...DOCS[0],
+      page_stats: {
+        pages_total: 4,
+        pages_ocr: 4,
+        pages_failed: 0,
+        pages_pending: 0,
+        pages_over_limit: 0,
+      },
+    };
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([done]));
+
+    renderDetail();
+    expect(await screen.findByTestId(`doc-pages-${done.id}`)).toHaveTextContent(
+      "4 pages recognized",
+    );
+    expect(screen.queryByTestId(`doc-recognize-${done.id}`)).toBeNull();
+  });
+
   it("retrieval test runs the query and renders scored results", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
     vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));

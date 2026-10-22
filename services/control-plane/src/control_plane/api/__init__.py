@@ -53,6 +53,9 @@ from control_plane.api.platform_judge_config import (
 from control_plane.api.platform_quality_config import (
     build_platform_quality_config_router,
 )
+from control_plane.api.platform_recognition_config import (
+    build_platform_recognition_config_router,
+)
 from control_plane.api.platform_skills import build_platform_skills_router
 from control_plane.api.platform_tool_budget_config import (
     build_platform_tool_budget_config_router,
@@ -121,6 +124,7 @@ __all__ = [
     "build_platform_embedding_config_router",
     "build_platform_judge_config_router",
     "build_platform_quality_config_router",
+    "build_platform_recognition_config_router",
     "build_platform_skills_router",
     "build_platform_tool_budget_config_router",
     "build_quality_router",

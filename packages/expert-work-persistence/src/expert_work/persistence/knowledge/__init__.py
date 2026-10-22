@@ -12,6 +12,8 @@ from expert_work.persistence.knowledge.base import (
     DuplicateKnowledgeBaseError as DuplicateKnowledgeBaseError,
 )
 from expert_work.persistence.knowledge.base import KnowledgeStore as KnowledgeStore
+from expert_work.persistence.knowledge.base import ParseCacheEntry as ParseCacheEntry
+from expert_work.persistence.knowledge.base import ParseCacheKind as ParseCacheKind
 from expert_work.persistence.knowledge.memory import (
     InMemoryKnowledgeStore as InMemoryKnowledgeStore,
 )
@@ -23,5 +25,7 @@ __all__ = [
     "DuplicateKnowledgeBaseError",
     "InMemoryKnowledgeStore",
     "KnowledgeStore",
+    "ParseCacheEntry",
+    "ParseCacheKind",
     "SqlKnowledgeStore",
 ]

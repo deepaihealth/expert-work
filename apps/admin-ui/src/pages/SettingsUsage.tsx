@@ -259,6 +259,8 @@ export function SettingsUsage() {
                 ? t("usage.kind_memory_consolidation")
                 : key === "platform_overhead"
                   ? t("usage.kind_platform_overhead")
+                  : key === "knowledge_ingest"
+                  ? t("usage.kind_knowledge_ingest")
                   : key === "conversation"
                   ? t("usage.kind_conversation")
                   : key}

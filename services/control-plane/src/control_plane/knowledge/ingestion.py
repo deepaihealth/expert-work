@@ -35,7 +35,9 @@ import multiprocessing
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
@@ -47,6 +49,20 @@ from control_plane.knowledge.parsing import (
     parse_document,
     strip_lone_surrogates,
 )
+from control_plane.knowledge.recognition.assembly import (
+    MAX_RECOGNIZED_CHARS_PER_DOCUMENT,
+    assemble_pages,
+    cap_recognized_text,
+    no_text_message,
+    page_records,
+)
+from control_plane.knowledge.recognition.pages import analyse_pdf, render_pages
+from control_plane.knowledge.recognition.recognizer import (
+    ERROR_NOT_CONFIGURED,
+    DocumentRecognizer,
+    PageOutcome,
+)
+from control_plane.knowledge.usage import IngestUsageRecorder, billed_embeddings
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
 from expert_work.persistence.rls import current_tenant_id_var
@@ -56,6 +72,7 @@ from expert_work.protocol import (
     IngestStage,
     KnowledgeChunk,
     KnowledgeDocument,
+    PageStatus,
     chunk_retrieval_text,
     knowledge_document_title,
 )
@@ -200,19 +217,44 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
       necessarily this document's. Only the parse that finds the broken pool
       still current rebuilds it; the others retry on the replacement.
     """
+    return await _in_parse_pool(filename, parse_document, filename, raw)
+
+
+@dataclass
+class _PoolBudget:
+    """B-209 (review M2) —— one parse-pool time budget per document: page
+    analysis plus every render batch share :data:`_parse_timeout_s`, as the
+    single ``parse_document`` call did before. Time queued for a slot is not
+    charged."""
+
+    remaining: float
+
+
+async def _in_parse_pool[T](
+    filename: str, fn: Callable[..., T], *args: object, budget: _PoolBudget | None = None
+) -> T:
+    """``fn(*args)`` in the parse pool, with :func:`parse_document_in_pool`'s
+    slot, timeout and broken-pool handling (B-209: PDF page analysis and page
+    rendering use PyMuPDF too, so they run there as well). With ``budget`` the
+    call may only use what is left of the document's budget."""
     async with _get_parse_slots():
         for attempt in (1, 2):
             loop = asyncio.get_running_loop()
+            timeout = _parse_timeout_s if budget is None else budget.remaining
+            if timeout <= 0:
+                msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
+                raise DocumentParseError(msg)
             executor = _get_parse_executor()
+            started = loop.time()
             try:
                 # ``submit`` itself raises on a broken pool — keep it in the try.
-                future = loop.run_in_executor(executor, parse_document, filename, raw)
-                return await asyncio.wait_for(future, timeout=_parse_timeout_s)
+                future = loop.run_in_executor(executor, fn, *args)
+                return await asyncio.wait_for(future, timeout=timeout)
             except TimeoutError as exc:
                 logger.warning(
                     "knowledge.parse_timeout document=%r timeout=%gs — killing the parse pool",
                     filename,
-                    _parse_timeout_s,
+                    timeout,
                 )
                 _discard_parse_pool(executor)
                 msg = f"document {filename!r} parse timed out after {_parse_timeout_s:g}s"
@@ -226,6 +268,9 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
                 _discard_parse_pool(executor)
                 if attempt == 2:
                     raise
+            finally:
+                if budget is not None:
+                    budget.remaining -= loop.time() - started
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -366,6 +411,8 @@ async def ingest_document_bytes(
     chunk_overlap_tokens: int,
     generation: int | None = None,
     parsed_markdown: str | None = None,
+    recognizer: DocumentRecognizer | None = None,
+    usage: IngestUsageRecorder | None = None,
 ) -> int:
     """Parse → chunk → embed → store one document; return the chunk count.
 
@@ -374,7 +421,13 @@ async def ingest_document_bytes(
     the eval runner. ``generation`` fences the chunk write-back (pass the
     claim's generation; ``None`` only for callers that own the document
     outright, e.g. a fresh eval corpus). ``parsed_markdown`` skips parsing —
-    for callers that already hold the text (pre-parsed corpus, OCR path).
+    for callers that already hold the text (pre-parsed corpus).
+
+    B-209: a PDF is decided page by page; scanned pages go to ``recognizer``
+    (``RECOGNIZING`` stage) and every page's outcome is recorded on the
+    document — no page is silently empty. Without a ``recognizer`` scanned
+    pages are recorded as waiting for recognition. ``usage`` bills the
+    recognition and embedding calls to the tenant (``knowledge_ingest``).
 
     :raises StaleIngestionError: the fenced write-back was rejected.
     """
@@ -388,7 +441,18 @@ async def ingest_document_bytes(
             stage=IngestStage.PARSING,
             generation=generation,
         )
-        markdown = await parse_document_in_pool(filename, raw)
+        if Path(filename).suffix.lower() == ".pdf":
+            markdown = await _parse_pdf_pages(
+                store,
+                recognizer,
+                tenant_id=tenant_id,
+                document_id=document_id,
+                filename=filename,
+                raw=raw,
+                generation=generation,
+            )
+        else:
+            markdown = await parse_document_in_pool(filename, raw)
     return await ingest_markdown(
         store=store,
         embedder=embedder,
@@ -401,7 +465,79 @@ async def ingest_document_bytes(
         generation=generation,
         doc_title=knowledge_document_title(filename),
         plain_text=is_plain_text_file(filename),
+        usage=usage,
     )
+
+
+async def _parse_pdf_pages(
+    store: KnowledgeStore,
+    recognizer: DocumentRecognizer | None,
+    *,
+    tenant_id: UUID,
+    document_id: UUID,
+    filename: str,
+    raw: bytes,
+    generation: int | None,
+) -> str:
+    """B-209 §5.1 / §5.6 —— decide every page, recognize the scanned ones,
+    record each page's outcome, then join the pages back into Markdown in
+    page order.
+
+    Never worse than before: a PDF with no scanned page — or whose scanned
+    pages gave no text (nothing configured, everything failed) — gets exactly
+    :func:`parse_document`'s text, MarkItDown fallback included; only the
+    error, if that is empty too, names the pages and why."""
+    budget = _PoolBudget(_parse_timeout_s)
+    analysis = await _in_parse_pool(filename, analyse_pdf, filename, raw, budget=budget)
+    if not analysis.pages:  # PyMuPDF could not walk it: parsed as before, no records
+        return analysis.markdown or ""
+
+    async def recognizing() -> None:
+        # Fenced: raises once a re-upload / another claim took the document.
+        await _advance(
+            store,
+            tenant_id=tenant_id,
+            document_id=document_id,
+            stage=IngestStage.RECOGNIZING,
+            generation=generation,
+        )
+
+    outcomes: dict[int, PageOutcome] = {}
+    if analysis.markdown is None:
+        await recognizing()
+        scanned = [page.index for page in analysis.ocr_pages]
+        if recognizer is None:
+            pending = PageOutcome(status=PageStatus.PENDING, error=ERROR_NOT_CONFIGURED)
+            outcomes = dict.fromkeys(scanned, pending)
+        else:
+
+            async def render(indexes: list[int], max_pixels: int | None) -> list[bytes]:
+                return await _in_parse_pool(
+                    filename, render_pages, raw, indexes, max_pixels, budget=budget
+                )
+
+            outcomes = await recognizer.recognize_document(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                pages=scanned,
+                render=render,
+                before_batch=recognizing,
+            )
+        outcomes = cap_recognized_text(outcomes, MAX_RECOGNIZED_CHARS_PER_DOCUMENT)
+    pages = page_records(analysis, outcomes)
+    if not await store.set_document_pages(
+        tenant_id=tenant_id, document_id=document_id, pages=pages, generation=generation
+    ):
+        msg = f"document {document_id} was re-uploaded or settled by another claim"
+        raise StaleIngestionError(msg)
+    if analysis.markdown is not None:
+        return analysis.markdown
+    if not any(o.status is PageStatus.RECOGNIZED and o.text.strip() for o in outcomes.values()):
+        try:
+            return await _in_parse_pool(filename, parse_document, filename, raw, budget=budget)
+        except DocumentParseError as exc:
+            raise DocumentParseError(no_text_message(filename, pages), exc.code) from exc
+    return assemble_pages(analysis, outcomes)
 
 
 async def ingest_markdown(
@@ -417,6 +553,7 @@ async def ingest_markdown(
     generation: int | None = None,
     doc_title: str | None = None,
     plain_text: bool = False,
+    usage: IngestUsageRecorder | None = None,
 ) -> int:
     """Chunk → embed → store already-parsed Markdown; return the chunk count.
 
@@ -431,9 +568,42 @@ async def ingest_markdown(
     chunk whose retrieval text is unchanged from the version being replaced
     keeps its stored vector (matched by ``content_hash`` **and** the pinned
     embedding model) instead of being embedded again. ``plain_text`` chunks
-    the text as plain text, not Markdown (a ``.txt`` file).
+    the text as plain text, not Markdown (a ``.txt`` file). ``usage`` bills
+    the embedding calls to the tenant (B-209 §5.8, ``knowledge_ingest``).
     """
     model_key, pinned = await pin_embedder(embedder, tenant_id=tenant_id)
+    async with billed_embeddings(usage, tenant_id=tenant_id, model_key=model_key):
+        return await _chunk_embed_store(
+            store=store,
+            pinned=pinned,
+            model_key=model_key,
+            tenant_id=tenant_id,
+            document_id=document_id,
+            kb_id=kb_id,
+            markdown=markdown,
+            chunk_max_tokens=chunk_max_tokens,
+            chunk_overlap_tokens=chunk_overlap_tokens,
+            generation=generation,
+            doc_title=doc_title,
+            plain_text=plain_text,
+        )
+
+
+async def _chunk_embed_store(
+    *,
+    store: KnowledgeStore,
+    pinned: Embedder,
+    model_key: str | None,
+    tenant_id: UUID,
+    document_id: UUID,
+    kb_id: UUID,
+    markdown: str,
+    chunk_max_tokens: int,
+    chunk_overlap_tokens: int,
+    generation: int | None,
+    doc_title: str | None,
+    plain_text: bool,
+) -> int:
     retrying = _BackoffEmbedder(pinned)
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.CHUNKING, **stage_args)
@@ -596,9 +766,13 @@ class KnowledgeIngestionRunner:
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
         concurrency: int = _DEFAULT_CONCURRENCY,
+        recognizer: DocumentRecognizer | None = None,
+        usage: IngestUsageRecorder | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
+        self._recognizer = recognizer
+        self._usage = usage
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -716,6 +890,8 @@ class KnowledgeIngestionRunner:
                     chunk_max_tokens=claim.chunk_max_tokens,
                     chunk_overlap_tokens=claim.chunk_overlap_tokens,
                     generation=claim.generation,
+                    recognizer=self._recognizer,
+                    usage=self._usage,
                 )
                 settled = await self._store.set_document_status(
                     tenant_id=tenant_id,

@@ -18,9 +18,11 @@ from orchestrator.llm.embedder import DEFAULT_MAX_INPUT_BYTES as DEFAULT_MAX_INP
 from orchestrator.llm.embedder import QWEN_EMBEDDING_BASE_URL as QWEN_EMBEDDING_BASE_URL
 from orchestrator.llm.embedder import Embedder as Embedder
 from orchestrator.llm.embedder import EmbeddingClient as EmbeddingClient
+from orchestrator.llm.embedder import EmbeddingUsageSink as EmbeddingUsageSink
 from orchestrator.llm.embedder import FakeEmbedder as FakeEmbedder
 from orchestrator.llm.embedder import HTTPEmbeddingClient as HTTPEmbeddingClient
 from orchestrator.llm.embedder import OpenAICompatibleEmbedder as OpenAICompatibleEmbedder
+from orchestrator.llm.embedder import embedding_usage_sink as embedding_usage_sink
 from orchestrator.llm.oauth_provider import (
     OAuthCapableProvider as OAuthCapableProvider,
 )
@@ -160,6 +162,7 @@ __all__ = [
     "DashScopeReranker",
     "Embedder",
     "EmbeddingClient",
+    "EmbeddingUsageSink",
     "FakeEmbedder",
     "HTTPAnthropicClient",
     "HTTPDashScopeRerankClient",
@@ -180,6 +183,7 @@ __all__ = [
     "RecordingOpenAIClient",
     "RerankClient",
     "effective_rpm",
+    "embedding_usage_sink",
     "make_azure_client",
     "make_deepseek_client",
     "make_doubao_client",

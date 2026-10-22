@@ -9,7 +9,7 @@
 * Ⓒ 短文档(通知、FAQ 条目、一页纸);
 * Ⓓ 表格(csv / xlsx 价目表、库存表);
 * Ⓔ 对话体(客服 / 销售聊天,一行一句);
-* Ⓕ 扫描件 / 图片(没有文字层,目前没有 OCR)。
+* Ⓕ 扫描件 / 图片(没有文字层);混合 PDF(文字页夹着扫描页,B-209 逐页识别)。
 
 每篇都是**上传时的原始字节**(docx / xlsx / pdf / pptx 在这里现场生成),测试把它们
 走真实的解析 → 切块 → 落段路径。``units`` 是用户放进文档的文字,一行(或一格)
@@ -729,6 +729,27 @@ def _scanned_pdf(pages: int = 2) -> bytes:
     return bytes(document.tobytes())
 
 
+_MIXED_TEXT_PAGES = (
+    ("第一章 总则", "本手册适用于全体员工,自发布之日起施行。"),
+    ("第三章 考勤", "员工请假须提前三个工作日在系统中提交申请,由直属主管审批。"),
+)
+
+
+def _mixed_pdf() -> bytes:
+    """B-209 —— text page, scanned page, text page: a handbook whose middle
+    page was scanned in (the PDF form the corpus has 50 of). Before B-209 its
+    scanned page was silently empty (``_is_sparse`` averaged the whole file)."""
+    document = pymupdf.open()
+    for number, lines in enumerate(_MIXED_TEXT_PAGES):
+        page = document.new_page()
+        for row, line in enumerate(lines):
+            page.insert_text((72, 72 + 24 * row), line, fontname="china-s", fontsize=12)
+        if number == 0:
+            scan = document.new_page()
+            scan.insert_image(pymupdf.Rect(36, 36, 559, 806), stream=_gray_png())
+    return bytes(document.tobytes())
+
+
 def _scanned_docx() -> bytes:
     """A Word file holding one picture and no text (a scan pasted into Word)."""
     drawing = (
@@ -806,4 +827,16 @@ SCANNED_DOCS: tuple[FormDoc, ...] = (
     FormDoc("F", "scan-docx", "合同扫描件.docx", _scanned_docx(), ()),
     FormDoc("F", "scan-pptx", "培训材料扫描件.pptx", _scanned_pptx(), ()),
     FormDoc("F", "photo-png", "发票照片.png", _gray_png(), ()),
+)
+
+#: Ⓕ + text (B-209) — a PDF mixing text pages and a scanned page. ``units``
+#: are the text pages' lines; the scanned page holds none a parser can see.
+MIXED_DOCS: tuple[FormDoc, ...] = (
+    FormDoc(
+        "F",
+        "mixed-pdf",
+        "员工手册部分扫描.pdf",
+        _mixed_pdf(),
+        tuple(line for lines in _MIXED_TEXT_PAGES for line in lines),
+    ),
 )

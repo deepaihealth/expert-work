@@ -76,16 +76,33 @@ export interface KnowledgeDocument {
   title?: string | null;
   source_type?: string;
   /** Furthest pipeline step reached — ``queued`` / ``parsing`` /
-   *  ``chunking`` / ``embedding`` / ``indexing`` / ``ready``. */
+   *  ``recognizing`` (B-209, scanned pages only) / ``chunking`` /
+   *  ``embedding`` / ``indexing`` / ``ready``. */
   stage?: string | null;
   /** Machine-readable failure reason next to ``error``. */
   error_code?: string | null;
   size_bytes?: number | null;
   mime?: string | null;
   page_count?: number | null;
+  /** B-209 — page counts of the latest PDF ingest; ``null`` for other files. */
+  page_stats?: PageStats | null;
   enabled?: boolean;
   created_at: string | null;
   updated_at: string | null;
+}
+
+/** B-209 — 「已识别 N 页 · 失败 M 页 · 待识别 K 页」 for a PDF with scanned pages. */
+export interface PageStats {
+  pages_total: number;
+  /** Scanned pages a recognition model read. */
+  pages_ocr: number;
+  /** Both the recognition model and its fallback failed — 「补识别」 retries. */
+  pages_failed: number;
+  /** No usable recognition model when ingested — 「补识别」 once configured. */
+  pages_pending: number;
+  /** Past the per-document recognition page limit — 「补识别」 reads them
+   *  once the platform limit is raised. */
+  pages_over_limit: number;
 }
 
 /** Upload response — ``unchanged`` is true when the bytes matched the
@@ -342,6 +359,20 @@ export async function reingestDocument(
 ): Promise<KnowledgeDocument> {
   const response = await apiClient.post<KnowledgeDocument>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/reingest`,
+  );
+  return response.data;
+}
+
+/** B-209 「补识别」 — re-drive a document whose scanned pages failed or waited
+ *  for recognition (202). Pages already recognized come from the recognition
+ *  cache; only the failed / waiting pages are sent to a model. Throws (HTTP
+ *  409) when no page needs it. */
+export async function recognizeDocument(
+  baseName: string,
+  documentId: string,
+): Promise<KnowledgeDocument> {
+  const response = await apiClient.post<KnowledgeDocument>(
+    `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/recognize`,
   );
   return response.data;
 }

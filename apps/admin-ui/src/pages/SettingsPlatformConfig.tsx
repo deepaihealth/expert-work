@@ -67,6 +67,7 @@ import { PlatformDynamicWorkerSection } from "./settings_platform/PlatformDynami
 import { PlatformEmbeddingSection } from "./settings_platform/PlatformEmbeddingSection";
 import { PlatformJudgeSection } from "./settings_platform/PlatformJudgeSection";
 import { PlatformQualitySection } from "./settings_platform/PlatformQualitySection";
+import { PlatformRecognitionSection } from "./settings_platform/PlatformRecognitionSection";
 import { PlatformToolBudgetSection } from "./settings_platform/PlatformToolBudgetSection";
 
 const { Text } = Typography;
@@ -852,6 +853,12 @@ export function SettingsPlatformConfig() {
                       title={t("settings_platform.judge_heading")}
                     >
                       <PlatformJudgeSection />
+                    </Card>
+                    <Card
+                      size="small"
+                      title={t("settings_platform.recognition_heading")}
+                    >
+                      <PlatformRecognitionSection />
                     </Card>
                   </Space>
                 ),

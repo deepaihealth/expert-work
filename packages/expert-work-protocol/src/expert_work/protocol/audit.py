@@ -256,6 +256,9 @@ class AuditAction(StrEnum):
     KNOWLEDGE_DOCUMENT_UPLOAD = "knowledge:document_upload"
     KNOWLEDGE_DOCUMENT_DELETE = "knowledge:document_delete"
     KNOWLEDGE_DOCUMENT_REINGEST = "knowledge:document_reingest"
+    # B-209 — 「补识别」: re-drive a document whose scanned pages failed /
+    # waited for recognition (recognized pages come from the cache).
+    KNOWLEDGE_DOCUMENT_RECOGNIZE = "knowledge:document_recognize"
     KNOWLEDGE_DOCUMENT_DISCARD_PENDING = "knowledge:document_discard_pending"
     # triggers (Stream J.10 — Mini-ADR J-26 / J-42)
     TRIGGER_CREATE = "trigger:create"
@@ -379,6 +382,9 @@ class AuditAction(StrEnum):
     # platform judge-model config (Stream PI-3-A1) — system_admin-only write
     # to the platform judge-config row.
     PLATFORM_JUDGE_CONFIG_UPDATED = "platform_judge_config:updated"
+    # platform document-recognition config (B-209) — system_admin-only write
+    # to the platform recognition-config row (models + page cap).
+    PLATFORM_RECOGNITION_CONFIG_UPDATED = "platform_recognition_config:updated"
     # platform quality-monitor config (Stream RT-5 PR-3b) — system_admin-only
     # write to the platform quality-config row (sampling / judge / drift / enable).
     PLATFORM_QUALITY_CONFIG_UPDATED = "platform_quality_config:updated"
