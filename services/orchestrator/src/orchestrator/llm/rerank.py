@@ -30,7 +30,7 @@ from uuid import UUID
 import httpx
 
 from expert_work.protocol.knowledge import rerank_model_key
-from expert_work.protocol.model_catalog import RerankCaps, catalog_entry
+from expert_work.protocol.model_catalog import catalog_entry
 from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.rerank_guard import (
     RerankCallError,

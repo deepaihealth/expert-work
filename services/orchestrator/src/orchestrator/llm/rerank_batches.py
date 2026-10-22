@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+from expert_work.protocol.knowledge import rerank_model_key
 from expert_work.protocol.model_catalog import RerankCaps
 from orchestrator.llm.rerank_guard import RerankCallError, RerankClient
 from orchestrator.llm.rerank_limits import cut, fit_total, relevance
@@ -68,11 +69,14 @@ class CohereStyleReranker:
 
     Returns a :class:`~orchestrator.tools.knowledge.RerankRanking`: best first,
     at most ``top_k``, saying how many documents went unjudged; an answer it
-    cannot read degrades to the input order without scores (``model_error``)."""
+    cannot read degrades to the input order without scores (``model_error``).
+    With ``provider`` the ranking names its ``model`` (B-206 K-7b), so a base's
+    threshold set under another model is left out."""
 
     client: RerankClient
     model: str
     caps: RerankCaps | None = None
+    provider: str | None = None
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -104,9 +108,10 @@ class CohereStyleReranker:
         extra: dict[str, Any] = {} if instruction is None else {"instruction": instruction}
         answers = await self._all(query, items, slices, top_k, extra)
         dropped = len(documents) - sum(len(sent) for sent, _rows in answers)
+        model = None if self.provider is None else rerank_model_key(self.provider, self.model)
         if any(rows is None for _sent, rows in answers):
             unscored = ((index, None) for index in range(min(len(documents), top_k)))
-            return RerankRanking(unscored, dropped=dropped, outcome="model_error")
+            return RerankRanking(unscored, dropped=dropped, outcome="model_error", model=model)
         ranked = [
             (start + index, raw)
             for (start, _stop), (_sent, rows) in zip(slices, answers, strict=True)
@@ -116,11 +121,12 @@ class CohereStyleReranker:
             ranked.sort(key=_best_first)
         ranked = ranked[:top_k]
         if caps is None or caps.score_scale != "logit":
-            return RerankRanking(ranked, dropped=dropped)
+            return RerankRanking(ranked, dropped=dropped, model=model)
         return RerankRanking(
             ((index, None if raw is None else sigmoid(raw)) for index, raw in ranked),
             dropped=dropped,
             logits={index: raw for index, raw in ranked if raw is not None},
+            model=model,
         )
 
     async def _all(

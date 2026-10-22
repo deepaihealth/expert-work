@@ -19,6 +19,7 @@ from control_plane.rerank_vendors import rerank_api, rerank_is_callable
 from control_plane.runtime import DynamicResolvingReranker, ResolvingReranker
 from expert_work.common.credentials import CredentialsResolverError
 from expert_work.protocol import ModelEntry
+from expert_work.protocol.knowledge import rerank_model_key
 from expert_work.protocol.model_catalog import MODEL_CATALOG, RerankCaps
 from orchestrator.llm import RerankGuards
 from orchestrator.llm.rerank_cohere import COHERE_STYLE_SHAPES, RERANK_SHAPE_BY_PROVIDER
@@ -143,6 +144,9 @@ async def test_a_cohere_style_model_is_called_at_its_provider_endpoint(
             )
             assert isinstance(ranked, RerankRanking)
             assert ranked.outcome == "ok"
+            # B-206 K-7b: the ranking names its model, so a threshold set under
+            # another model is left out.
+            assert ranked.model == rerank_model_key("glm", "rerank")
     assert [request["url"] for request in seen] == [
         "https://open.bigmodel.cn/api/paas/v4/rerank"
     ] * 2

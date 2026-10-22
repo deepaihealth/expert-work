@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+from expert_work.protocol.knowledge import rerank_model_key
 from expert_work.protocol.model_catalog import RerankCaps
 from orchestrator.llm.rerank_batches import CohereStyleReranker
 from orchestrator.llm.rerank_guard import RerankCallError
@@ -155,6 +156,34 @@ async def test_rows_it_cannot_read_are_left_out_or_unscored() -> None:
 
     ranked = await _scored(CohereStyleReranker(client=_Client(), model="m"), ["a", "b", "c"])
     assert ranked == [(2, None), (0, 0.5)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scale", ["logit", "relative", None])
+async def test_the_ranking_names_its_model_when_the_provider_is_known(scale: str | None) -> None:
+    """B-206 K-7b: a base's threshold is bound to the model that scored, so the
+    ranking must say which one — on every scale, and on a ``model_error``."""
+
+    class _Empty:
+        async def rerank(self, **_: Any) -> Mapping[str, Any]:
+            return {}
+
+    key = rerank_model_key("glm", "m")
+    caps = _caps(score_scale=scale)
+    scored = await _scored(
+        CohereStyleReranker(client=_Scorer({"a": 2.0}), model="m", caps=caps, provider="glm"),
+        ["a"],
+    )
+    failed = await _scored(
+        CohereStyleReranker(client=_Empty(), model="m", caps=caps, provider="glm"), ["a"]
+    )
+    unnamed = await _scored(CohereStyleReranker(client=_Scorer({"a": 2.0}), model="m"), ["a"])
+    assert isinstance(scored, RerankRanking) and scored.model == key
+    assert isinstance(failed, RerankRanking) and (failed.outcome, failed.model) == (
+        "model_error",
+        key,
+    )
+    assert isinstance(unnamed, RerankRanking) and unnamed.model is None
 
 
 @pytest.mark.asyncio
