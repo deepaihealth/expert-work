@@ -154,16 +154,20 @@ async def test_every_other_failure_is_a_degraded_model_error(answer: Any) -> Non
 
 
 @pytest.mark.parametrize("view", ["dual", "single"])
-@pytest.mark.parametrize("skipped", ["no_model", "model_unavailable"])
+@pytest.mark.parametrize("skipped", ["no_model", "model_unavailable", "model_unsupported"])
 async def test_a_rerank_with_nothing_to_call_says_why_without_degrading(
-    view: str, skipped: RerankOutcome
+    view: str, skipped: RerankOutcome, caplog: pytest.LogCaptureFixture
 ) -> None:
     """``rerank_degraded`` keeps its meaning — the configured model was called
-    and failed; a search that could not call one says so in the outcome only."""
+    and failed; a search that could not call one says so in the outcome only,
+    and logs it as the deployment's configuration (INFO), not a failure."""
     store, tenant = await _store()
-    outcome = await _search(_retriever(store, _Reranker(_skipped(skipped)), view=view), tenant)
+    with caplog.at_level(logging.INFO, logger="orchestrator.tools.knowledge"):
+        outcome = await _search(_retriever(store, _Reranker(_skipped(skipped)), view=view), tenant)
     assert (outcome.rerank_outcome, outcome.rerank_degraded) == (skipped, False)
     assert [r.content for r in outcome.results] == list(_BODIES)  # the fused order
+    levels = {r.levelno for r in caplog.records if r.name == "orchestrator.tools.knowledge"}
+    assert levels == {logging.INFO}
 
 
 def _second_view(second: Any) -> Any:

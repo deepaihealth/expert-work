@@ -38,6 +38,9 @@ from expert_work.protocol.provider_catalog import PROVIDER_CATALOG, Provider
 #: 默认 "token" 是保守的一侧:按字符的上限被误标成 token,字节截只会更短,不会超限。
 LengthUnit = Literal["token", "char"]
 
+#: B-206 K-7 —— 重排请求的形状(见 ``RerankCaps.rerank_api``)。
+RerankApi = Literal["dashscope", "cohere_style", "vertex", "bedrock", "llm"]
+
 
 class EmbeddingCaps(BaseModel):
     """B-206 K-5 / K-8 —— an embedding model's request capabilities.
@@ -157,7 +160,7 @@ class RerankCaps(BaseModel):
     #   "vertex"       —— Google ``rankingConfigs:rank``(``title`` 独立字段);
     #   "bedrock"      —— AWS agent-runtime ``Rerank``(``numberOfResults``);
     #   "llm"          —— 聊天模型排序,给没有重排接口的厂商。
-    rerank_api: Literal["dashscope", "cohere_style", "vertex", "bedrock", "llm"]
+    rerank_api: RerankApi
     # 每次请求最多几篇文档(厂商上限)。
     max_documents: int | None = None
     # 长度上限,全部按 ``length_unit`` 计:单篇文档 / 整次请求(查询 + 全部文档;阿里超限
@@ -295,6 +298,12 @@ class ModelEntry(BaseModel):
         """A recognition-only model (a layout-parsing API): it takes no prompt,
         so it is never offered where a chat model is chosen."""
         return self.ocr_caps is not None and self.ocr_caps.api == "layout_parsing"
+
+    @property
+    def chat_model(self) -> bool:
+        """A model that can hold a conversation — not an embedding, rerank or
+        recognition-only model: what agent / judge / quality pickers offer."""
+        return not self.embeddings and not self.rerank and not self.ocr_only
 
     @model_validator(mode="after")
     def _caps_match_flags(self) -> ModelEntry:
@@ -615,6 +624,26 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             name="embedding-3",
             embeddings=True,
             embedding_caps=EmbeddingCaps(asymmetry="none", max_batch=64, max_input_tokens=3_072),
+        ),
+        # B-206 K-7c —— 表 5-B + 2026-10-22 真接口实测(``/api/paas/v4/rerank``,Cohere 风格):
+        # 128 篇过、129 篇回 400 ``1210``;整次「查询 + 全部文档」≤ 128,000 字符(查询只算一次;
+        # 128,000 过、128,001 回 400 ``1214``「query+document超长」;按字符不按 token:10 万个
+        # 汉字 ≈ 10 万 token 照收)。单篇 / 查询各 4,096 字符是文档值(实测 4,200 字也收)。
+        # 默认分数是 logit 过 sigmoid 后按 float32 取整,强相关的都是 1.0;客户端要原始 logit
+        # (``return_raw_scores``),平台自己过 sigmoid。不收任务说明;限流、并发文档没写
+        # (并发 16 没被拒)。
+        ModelEntry(
+            name="rerank",
+            rerank=True,
+            rerank_caps=RerankCaps(
+                rerank_api="cohere_style",
+                max_documents=128,
+                max_doc_tokens=4_096,
+                max_total_tokens=128_000,
+                query_max_tokens=4_096,
+                length_unit="char",
+                score_scale="logit",
+            ),
         ),
         # B-209 知识库扫描页识别的默认模型(2026-10-21 选模型实测:错字率中位 1.8%、每页
         # 1.6 s)。版面解析接口,不收提示词 —— 不是对话模型,不进对话模型下拉。并发 4 偶发

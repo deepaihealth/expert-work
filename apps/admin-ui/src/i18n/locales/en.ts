@@ -602,6 +602,7 @@ export interface TranslationKeys {
     rerank_outcome_rate_limited: string;
     rerank_outcome_model_error: string;
     rerank_outcome_model_unavailable: string;
+    rerank_outcome_model_unsupported: string;
     rerank_outcome_no_model: string;
     settings_title: string;
     settings_saved: string;
@@ -3961,6 +3962,8 @@ const en: TranslationKeys = {
     rerank_outcome_model_error: "The rerank model failed; these results are in recall order.",
     rerank_outcome_model_unavailable:
       "The rerank model's credential is unavailable; these results are in recall order.",
+    rerank_outcome_model_unsupported:
+      "The platform cannot call the configured rerank model yet; these results are in recall order.",
     rerank_outcome_no_model: "No rerank model is configured; these results are in recall order.",
     settings_title: "Retrieval settings",
     settings_saved: "Settings saved.",

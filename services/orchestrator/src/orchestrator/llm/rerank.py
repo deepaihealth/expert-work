@@ -23,13 +23,13 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
 import httpx
 
-from expert_work.protocol.model_catalog import RerankCaps, catalog_entry
+from expert_work.protocol.model_catalog import catalog_entry
 from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.rerank_guard import (
     RerankCallError,
@@ -38,6 +38,7 @@ from orchestrator.llm.rerank_guard import (
     status_failure,
 )
 from orchestrator.llm.rerank_guard import RerankClient as RerankClient
+from orchestrator.llm.rerank_limits import fit_total, relevance
 from orchestrator.tools.knowledge import RerankRanking
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ _INTERNAL_ERROR_CODE = "InternalError"
 class HTTPDashScopeRerankClient:
     """httpx-backed :class:`RerankClient` for the DashScope native rerank API."""
 
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str = DASHSCOPE_RERANK_URL
     timeout_s: float = _DEFAULT_TIMEOUT_S
     transport: httpx.AsyncBaseTransport | None = None
@@ -147,7 +148,7 @@ class DashScopeReranker:
     ``top_n`` never asks for more than were sent, an ``instruction`` goes only to
     a model that takes one, and a request the vendor refuses for length
     (``too_large``) when ``max_total_tokens`` is declared is sent again with the
-    leading documents that surely fit (:func:`_fit_total`).
+    leading documents that surely fit (:func:`~orchestrator.llm.rerank_limits.fit_total`).
     Documents left out either way are reported, not silent: the ranking is a
     :class:`~orchestrator.tools.knowledge.RerankRanking` whose ``dropped`` counts
     them. Off-catalog models get none of this."""
@@ -192,7 +193,7 @@ class DashScopeReranker:
                 **extra,
             )
         except RerankCallError as exc:
-            fitted = _fit_total(query, items, extra.get("instruction"), caps)
+            fitted = fit_total(query, items, extra.get("instruction"), caps)
             if exc.failure != "too_large" or not fitted or len(fitted) == len(items):
                 raise
             logger.warning(
@@ -217,7 +218,7 @@ class DashScopeReranker:
             unscored = ((index, None) for index in range(min(len(items), top_k)))
             return RerankRanking(unscored, dropped=dropped, outcome="model_error")
         ranked = [
-            (row["index"], _relevance(row.get("relevance_score")))
+            (row["index"], relevance(row.get("relevance_score")))
             for row in results
             if isinstance(row, Mapping)
             and isinstance(row.get("index"), int)
@@ -258,40 +259,3 @@ def _error_body(response: httpx.Response) -> Mapping[str, Any]:
     except ValueError:
         return {}
     return body if isinstance(body, Mapping) else {}
-
-
-def _fit_total(
-    query: str, documents: Sequence[str], instruction: str | None, caps: RerankCaps | None
-) -> list[str]:
-    """The leading ``documents`` a request surely stays within
-    ``caps.max_total_tokens`` with — all of them when no total is declared.
-
-    The platform cannot count the vendor's tokens, so it counts what bounds them:
-    UTF-8 bytes (a token is never shorter than one byte; see
-    :data:`~expert_work.protocol.model_catalog.LengthUnit`), or characters for a
-    ``"char"`` model. The query and instruction are charged to every document in
-    case the vendor counts each query-document pair. That bound is several times
-    the real count for prose, so it is used only after the vendor has refused."""
-    if caps is None or caps.max_total_tokens is None:
-        return list(documents)
-    by_char = caps.length_unit == "char"
-
-    def size(text: str) -> int:
-        return len(text) if by_char else len(text.encode("utf-8"))
-
-    per_document = size(query) + (size(instruction) if instruction is not None else 0)
-    room = caps.max_total_tokens
-    fitted: list[str] = []
-    for document in documents:
-        room -= per_document + size(document)
-        if room < 0:
-            break
-        fitted.append(document)
-    return fitted
-
-
-def _relevance(value: object) -> float | None:
-    """A result row's ``relevance_score``; ``None`` when missing or not a number."""
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        return float(value)
-    return None

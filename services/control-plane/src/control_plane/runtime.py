@@ -35,6 +35,7 @@ from control_plane.platform_embedding_config import PlatformEmbeddingConfigServi
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
+from control_plane.rerank_vendors import callable_rerank_api, instruction_kwargs, vendor_reranker
 from control_plane.settings import Settings
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from control_plane.tenant_mcp_pool import TenantMcpPoolProvider
@@ -95,9 +96,7 @@ from orchestrator.agent_factory import (
 from orchestrator.errors import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.llm import (
     DEFAULT_MAX_INPUT_BYTES,
-    DashScopeReranker,
     Embedder,
-    HTTPDashScopeRerankClient,
     HTTPEmbeddingClient,
     OpenAICompatibleEmbedder,
     RateLimiterFactory,
@@ -1182,19 +1181,6 @@ class ResolvingProviderKeys:
         return await _cached_secret(self.secret_cache, self.secret_store, tenant_id, secret_ref)
 
 
-def _is_dashscope_rerank_model(provider: str, model: str) -> bool:
-    """DashScope (``qwen``) dedicated rerank models (``qwen3-vl-rerank``,
-    ``gte-rerank``, ``text-rerank-*``) are NOT served over the OpenAI-compat
-    chat endpoint, so the chat-prompt ``LLMReranker`` 404s on them. Route those
-    to the native rerank API (:class:`DashScopeReranker`) instead."""
-    return provider == "qwen" and "rerank" in model.lower()
-
-
-def _instruction_kwargs(instruction: str | None) -> dict[str, Any]:
-    """B-206 K-14 —— 任务说明只在有的时候才往下传(见 ``ScoredReranker``);LLM 重排分支不用它。"""
-    return {} if instruction is None else {"instruction": instruction}
-
-
 def _unranked(documents: Sequence[str], top_k: int, outcome: RerankOutcome) -> RerankRanking:
     """B-206 K-7 —— 没有可调的重排模型:原样顺序、不打分,并说明原因
     (检索据此报 ``rerank_outcome``)。"""
@@ -1254,8 +1240,11 @@ class ResolvingReranker:
     ) -> list[tuple[int, float | None]]:
         if not documents:
             return []
+        api = callable_rerank_api(self.provider, self.model)
+        if api is None:
+            return _unranked(documents, top_k, "model_unsupported")
         # 一期 Task 1 —— 同 ResolvingEmbedder.embed:凭据解析计时挂到调用方的
-        # ``memory.rerank`` span 上。secret_store.get 只在 DashScope 分支里
+        # ``memory.rerank`` span 上。secret_store.get 只在厂商重排接口分支里
         # 调用(LLM 分支走 build_llm_router),所以两条子路径各自打点。
         t0 = time.monotonic()
         try:
@@ -1272,23 +1261,26 @@ class ResolvingReranker:
         t1 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
-        if _is_dashscope_rerank_model(self.provider, self.model):
+        if api != "llm":
             api_key = await _cached_secret(
                 self.secret_cache, self.secret_store, tenant_id, secret_ref
             )
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
-            client = self.rerank_guards.wrap(
-                HTTPDashScopeRerankClient(api_key=api_key, http=self.http),
+            reranker = vendor_reranker(
+                api,
                 provider=self.provider,
                 model=self.model,
+                api_key=api_key,
                 secret_ref=secret_ref,
+                http=self.http,
+                guards=self.rerank_guards,
             )
-            return await DashScopeReranker(client=client, model=self.model).rerank_scored(
+            return await reranker.rerank_scored(
                 query=query,
                 documents=documents,
                 top_k=top_k,
                 tenant_id=tenant_id,
-                **_instruction_kwargs(instruction),
+                **instruction_kwargs(instruction),
             )
         model_spec = ModelSpec.model_validate(
             {"provider": self.provider, "name": self.model, "api_key_ref": secret_ref}
@@ -1436,15 +1428,18 @@ class DynamicResolvingReranker:
             return []
         # 一期 Task 1 —— 同 ResolvingReranker.rerank_scored,但这条路径每次调用还多
         # 一次 DB 读(平台配置)。config_ms/resolve_ms 挂到调用方的
-        # ``memory.rerank`` span 上;secret_ms 只在 DashScope 分支打(LLM 分支
-        # 走 build_llm_router)。三条早退路径(无 documents/cfg 未配置/无凭据)
-        # 都没有 rerank 可言,不打属性。
+        # ``memory.rerank`` span 上;secret_ms 只在厂商重排接口分支打(LLM 分支
+        # 走 build_llm_router)。四条早退路径(无 documents/cfg 未配置/平台没有
+        # 该接口的客户端/无凭据)都没有 rerank 可言,不打属性。
         t0 = time.monotonic()
         cfg = await self.config_service.effective_rerank_config()
         t1 = time.monotonic()
         if cfg is None:
             return _unranked(documents, top_k, "no_model")
         provider, model = cfg
+        api = callable_rerank_api(provider, model)
+        if api is None:
+            return _unranked(documents, top_k, "model_unsupported")
         try:
             secret_ref = await self.resolver.resolve_provider(
                 tenant_id=tenant_id, provider=provider
@@ -1460,23 +1455,26 @@ class DynamicResolvingReranker:
         span = trace.get_current_span()
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
         span.set_attribute("resolve_ms", round((t2 - t1) * 1000))
-        if _is_dashscope_rerank_model(provider, model):
+        if api != "llm":
             api_key = await _cached_secret(
                 self.secret_cache, self.secret_store, tenant_id, secret_ref
             )
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
-            client = self.rerank_guards.wrap(
-                HTTPDashScopeRerankClient(api_key=api_key, http=self.http),
+            reranker = vendor_reranker(
+                api,
                 provider=provider,
                 model=model,
+                api_key=api_key,
                 secret_ref=secret_ref,
+                http=self.http,
+                guards=self.rerank_guards,
             )
-            return await DashScopeReranker(client=client, model=model).rerank_scored(
+            return await reranker.rerank_scored(
                 query=query,
                 documents=documents,
                 top_k=top_k,
                 tenant_id=tenant_id,
-                **_instruction_kwargs(instruction),
+                **instruction_kwargs(instruction),
             )
         model_spec = ModelSpec.model_validate(
             {"provider": provider, "name": model, "api_key_ref": secret_ref}

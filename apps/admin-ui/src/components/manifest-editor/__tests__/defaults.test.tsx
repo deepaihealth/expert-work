@@ -47,6 +47,38 @@ describe("buildDefaultManifest", () => {
     expect(m.spec.model.supports_vision).toBe(true);
   });
 
+  it("skips a model the backend says is no chat model (B-206 K-7c)", () => {
+    const catalog = {
+      providers: [
+        {
+          provider: "glm",
+          models: [
+            {
+              name: "rerank",
+              vision: false,
+              embeddings: false,
+              rerank: true,
+              chat_model: false,
+              context_window: null,
+              deprecated: false,
+            },
+            {
+              name: "glm-5.3",
+              vision: false,
+              embeddings: false,
+              chat_model: true,
+              context_window: 1000000,
+              deprecated: false,
+            },
+          ],
+        },
+      ],
+    };
+    const m = buildDefaultManifest(catalog) as Manifest;
+    expect(m.spec.model.provider).toBe("glm");
+    expect(m.spec.model.name).toBe("glm-5.3");
+  });
+
   it("falls back to the base template when no provider is configured", () => {
     const m = buildDefaultManifest({ providers: [] }) as Manifest;
     expect(m.spec.model.provider).toBeTruthy();

@@ -25,6 +25,7 @@ from control_plane.audit import emit
 from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_secrets import PlatformSecretsService
+from control_plane.rerank_vendors import rerank_is_callable
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.protocol import (
     PROVIDER_CATALOG,
@@ -93,7 +94,9 @@ def _available(configured: set[str], *, kind: str) -> list[dict[str, str]]:
         if provider not in configured:
             continue
         for entry in models_for_provider(provider):
-            if getattr(entry, kind) is True:
+            if getattr(entry, kind) is True and (
+                kind != "rerank" or rerank_is_callable(provider, entry.name)
+            ):
                 options.append({"provider": provider, "model": entry.name})
     return options
 
@@ -232,6 +235,19 @@ def build_platform_embedding_config_router() -> APIRouter:
                         "message": (
                             f"{payload.rerank_model!r} is not a rerank model for "
                             f"provider {payload.rerank_provider!r}"
+                        ),
+                    },
+                )
+            # B-206 K-7c —— 目录里有、但平台还没有它那种重排接口的客户端:存了也调不了。
+            if not rerank_is_callable(payload.rerank_provider, payload.rerank_model):
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "UNSUPPORTED_RERANK_MODEL",
+                        "message": (
+                            f"the platform cannot call {payload.rerank_model!r} yet: there "
+                            f"is no client for its rerank API on provider "
+                            f"{payload.rerank_provider!r}"
                         ),
                     },
                 )

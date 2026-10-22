@@ -318,3 +318,63 @@ async def test_put_broadcasts_platform_embedding(
     assert resp.status_code == 200, resp.text
     assert len(spy_bus.events) == 1
     assert spy_bus.events[0].kind == "platform_embedding"  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+async def glm_client(
+    settings: Settings,
+    lifecycle: Lifecycle,
+    jwt_verifier: JWTVerifier,
+) -> AsyncIterator[tuple[AsyncClient, UUID]]:
+    """B-206 K-7c — ``qwen`` and ``glm`` both configured."""
+    settings = settings.model_copy(
+        update={
+            "supported_providers": ["qwen", "glm"],
+            "platform_provider_credentials": {"qwen": "secret://x", "glm": "secret://g"},
+            "embedding_provider": "qwen",
+            "embedding_model": "text-embedding-v4",
+        }
+    )
+    app = create_app(settings=settings, lifecycle=lifecycle, jwt_verifier=jwt_verifier)
+    sys_admin_id = await _seed_admin(app)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://control-plane.test") as client:
+        yield client, sys_admin_id
+
+
+@pytest.mark.asyncio
+async def test_a_configured_glm_offers_its_rerank_model(
+    glm_client: tuple[AsyncClient, UUID],
+) -> None:
+    client, admin = glm_client
+    resp = await client.get("/v1/platform/embedding-config", headers=_headers(admin))
+    assert resp.status_code == 200, resp.text
+    assert {"provider": "glm", "model": "rerank"} in resp.json()["data"]["available_rerank"]
+
+
+@pytest.mark.asyncio
+async def test_a_rerank_model_the_platform_cannot_call_is_neither_offered_nor_accepted(
+    glm_client: tuple[AsyncClient, UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-206 K-7c — a catalog rerank model whose API has no client here."""
+    monkeypatch.setattr(
+        "control_plane.api.platform_embedding_config.rerank_is_callable",
+        lambda provider, model: provider != "glm",
+    )
+    client, admin = glm_client
+    resp = await client.get("/v1/platform/embedding-config", headers=_headers(admin))
+    options = resp.json()["data"]["available_rerank"]
+    assert {"provider": "glm", "model": "rerank"} not in options
+    assert {"provider": "qwen", "model": "qwen3-vl-rerank"} in options
+    resp = await client.put(
+        "/v1/platform/embedding-config",
+        headers=_headers(admin),
+        json={
+            "embedding_provider": "qwen",
+            "embedding_model": "text-embedding-v4",
+            "rerank_provider": "glm",
+            "rerank_model": "rerank",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["code"] == "UNSUPPORTED_RERANK_MODEL"

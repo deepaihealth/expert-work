@@ -93,6 +93,17 @@ KIMI_BASE_URL = "https://api.moonshot.cn"
 
 GLM_BASE_URL = "https://open.bigmodel.cn"
 GLM_CHAT_COMPLETIONS_PATH = "/api/paas/v4/chat/completions"
+#: Zhipu business codes that come with an HTTP 429 but are the account's state,
+#: not load — retrying within seconds cannot help (docs.bigmodel.cn 错误码 table,
+#: read 2026-10-22): 1113 欠费; 1304 当日调用次数用完 (no longer in the table, kept
+#: from B-209); 1308 / 1310 a usage cap until its reset time; 1309 / 1314 the plan
+#: expired; 1311 the plan lacks the model; 1313 a fair-use restriction; 1315 a key
+#: for another product; 1316-1321 a 5-hour / 7-day cap with no balance left to
+#: overflow into. 1302 (rate limit) and 1305 (model busy) are load: retried.
+GLM_ACCOUNT_429_CODES = frozenset(
+    {"1113", "1304", "1308", "1309", "1310", "1311", "1313", "1314", "1315"}
+    | {str(code) for code in range(1316, 1322)}
+)
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 

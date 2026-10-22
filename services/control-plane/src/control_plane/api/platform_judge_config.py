@@ -63,7 +63,7 @@ def _is_chat_model(provider: str, model: str) -> bool:
     """True iff ``model`` is a chat-capable (non-embedding, non-rerank) model."""
     for entry in models_for_provider(provider):
         if entry.name == model:
-            return not entry.embeddings and not entry.rerank and not entry.ocr_only
+            return entry.chat_model
     return False
 
 
@@ -81,8 +81,7 @@ def _available(configured: set[str]) -> list[dict[str, str]]:
         if provider not in configured:
             continue
         for entry in models_for_provider(provider):
-            chat = not entry.embeddings and not entry.rerank and not entry.ocr_only
-            if chat and not entry.deprecated:
+            if entry.chat_model and not entry.deprecated:
                 options.append({"provider": provider, "model": entry.name})
     return options
 

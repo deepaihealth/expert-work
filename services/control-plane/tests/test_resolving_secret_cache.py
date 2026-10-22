@@ -176,7 +176,7 @@ def no_network_embed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def no_network_rerank(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("control_plane.runtime.DashScopeReranker", _FakeDashScopeReranker)
+    monkeypatch.setattr("control_plane.rerank_vendors.DashScopeReranker", _FakeDashScopeReranker)
     monkeypatch.setattr("control_plane.runtime.LLMReranker", _FakeLLMReranker)
 
 

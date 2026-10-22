@@ -65,6 +65,7 @@ describe("RetrievalTestTab rerank outcome (B-206 K-7)", () => {
     ["rate_limited", "重排模型限流"],
     ["model_error", "重排模型调用失败"],
     ["model_unavailable", "重排模型的凭据不可用"],
+    ["model_unsupported", "当前重排模型平台暂不支持调用"],
     ["no_model", "平台没有配置重排模型"],
   ] as const)("says why the order is the recall order: %s", async (outcome, words) => {
     const prior = i18n.language;
@@ -100,6 +101,7 @@ describe("RetrievalTestTab rerank outcome (B-206 K-7)", () => {
   it.each([
     ["no_model", "ant-alert-info"],
     ["model_unavailable", "ant-alert-info"],
+    ["model_unsupported", "ant-alert-info"],
     ["rate_limited", "ant-alert-warning"],
     ["model_error", "ant-alert-warning"],
     ["partial", "ant-alert-warning"],
