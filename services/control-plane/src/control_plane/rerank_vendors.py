@@ -129,4 +129,4 @@ def vendor_reranker(
             model=model,
             caps=entry.rerank_caps if entry is not None else None,
         )
-    assert_never(api)
+    return assert_never(api)
