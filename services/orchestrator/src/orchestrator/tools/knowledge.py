@@ -120,6 +120,24 @@ KNOWLEDGE_ANSWERABILITY_RULE = (
     "explicitly state, and if none states the specific fact asked, say the knowledge "
     "base does not state it instead of inferring or guessing it."
 )
+#: B-206 K-6 — how to search, in the tool description only (so, like the rule
+#: above, an agent with no knowledge base never sees it). Searching more widely is
+#: paired with checking what was read: on find-all questions an agent exploring
+#: with more searches found more of the right documents yet answered fewer
+#: correctly (Onyx EnterpriseRAG-Bench). Dev-set agent layer (60 questions, the
+#: platform answer model) 2026-10-22: fabrications 2 → 1, wrong refusals 1 → 0
+#: with only this wording changed; the K-4 grouped result format measured on its
+#: own raised fabrications (2 → 7) and is held back.
+KNOWLEDGE_SEARCH_GUIDANCE = (
+    "Use several small, targeted searches rather than one broad one; if a result does not "
+    "state the fact asked, search again in the documents' own terms, and do not repeat the "
+    "same or a very similar query. For questions that ask for all / every / how many, keep "
+    "searching with different terms until a search returns no document you have not seen, "
+    "then check each candidate against every condition in the question before counting it. "
+    "Before concluding, verify each condition in the question against text you have actually "
+    "read; conflicting documents are reported as conflicting, not resolved by guessing. Say "
+    "you searched and found nothing only when a search actually ran."
+)
 _RESULTS_NOTICE = (
     "[knowledge_search: these are the closest passages found, which is not the same as "
     "passages that answer the question. What none of them explicitly states is not "
@@ -777,7 +795,7 @@ class KnowledgeSearchTool:
             description=(
                 "Search the tenant's knowledge base for information relevant "
                 "to a query. Use it to ground answers in internal documents "
-                f"rather than guessing. {KNOWLEDGE_ANSWERABILITY_RULE}"
+                f"rather than guessing. {KNOWLEDGE_ANSWERABILITY_RULE} {KNOWLEDGE_SEARCH_GUIDANCE}"
             ),
             parameters={
                 "type": "object",

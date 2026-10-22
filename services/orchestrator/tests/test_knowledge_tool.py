@@ -43,6 +43,7 @@ from orchestrator.tools.knowledge import (
     DEFAULT_RERANK_POOL,
     DEFAULT_RERANK_VIEW,
     KNOWLEDGE_ANSWERABILITY_RULE,
+    KNOWLEDGE_SEARCH_GUIDANCE,
     RERANK_DOC_MAX_CHARS,
     RERANK_INSTRUCTION,
     RerankRanking,
@@ -1827,3 +1828,28 @@ async def test_a_search_query_goes_through_embed_query_when_the_embedder_has_one
 
 def test_the_tool_description_states_the_answerability_rule() -> None:
     assert KNOWLEDGE_ANSWERABILITY_RULE in _tool(InMemoryKnowledgeStore()).spec.description
+
+
+def test_the_tool_description_states_how_to_search_and_conclude() -> None:
+    """B-206 K-6 — search / verify guidance, phrase by phrase."""
+    description = _tool(InMemoryKnowledgeStore()).spec.description
+    for phrase in (
+        KNOWLEDGE_SEARCH_GUIDANCE,
+        "several small, targeted searches rather than one broad one",
+        "search again in the documents' own terms",
+        "do not repeat the same or a very similar query",
+        "all / every / how many",
+        "until a search returns no document you have not seen",
+        "against every condition in the question before counting it",
+        "verify each condition in the question against text you have actually read",
+        "conflicting documents are reported as conflicting, not resolved by guessing",
+        "Say you searched and found nothing only when a search actually ran",
+    ):
+        assert phrase in description, phrase
+
+
+def test_the_tool_description_names_no_tool_that_does_not_exist() -> None:
+    # Reading a candidate in full / listing documents come with K-2 / K-13.
+    description = _tool(InMemoryKnowledgeStore()).spec.description
+    for absent in ("knowledge_read", "knowledge_list_documents", "list_documents"):
+        assert absent not in description, absent
