@@ -63,7 +63,7 @@ def _scan_with_ocr_layer(page: pymupdf.Page) -> None:
 
 
 def _blank_page(page: pymupdf.Page) -> None:
-    del page
+    """Leave the page as it is: no text, no image."""
 
 
 def _chart_page(page: pymupdf.Page) -> None:

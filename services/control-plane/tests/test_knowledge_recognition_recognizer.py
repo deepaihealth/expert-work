@@ -146,7 +146,7 @@ def _recognizer(
     max_pages: int = 1000,
 ) -> DocumentRecognizer:
     async def no_sleep(delay: float) -> None:
-        del delay
+        """Skip the backoff wait."""
 
     def factory(choice: ModelChoice, api_key: str) -> RecognitionClient:
         assert api_key == f"key-{choice.provider}"
