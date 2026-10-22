@@ -27,6 +27,7 @@ from expert_work.protocol import (
     DEFAULT_RETRIEVAL_TOP_K,
     DocumentPage,
     DocumentStatus,
+    FigureStats,
     IngestErrorCode,
     IngestStage,
     KnowledgeBase,
@@ -505,6 +506,37 @@ class KnowledgeStore(abc.ABC):
         order; ``[]`` when none were recorded (not a PDF, or ingested before
         page records existed); ``None`` when there is no such document."""
 
+    # -- figures (B-209 PR-2 §5.4) -------------------------------------------
+
+    @abc.abstractmethod
+    async def set_document_figures(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        stats: FigureStats | _Unset | None,
+        pixel_hashes: Sequence[str],
+        generation: int | None = None,
+    ) -> bool:
+        """Record the pixel hashes of the ingest's figures that passed the
+        per-document filters (read by :meth:`count_figure_documents`) and,
+        unless ``stats`` is :data:`UNSET`, what became of them
+        (``figure_stats``; ``None`` clears it). Fenced like
+        :meth:`set_document_pages` (``False`` = no longer this worker's)."""
+
+    @abc.abstractmethod
+    async def count_figure_documents(
+        self, *, tenant_id: UUID, pixel_hashes: Sequence[str], exclude_document_id: UUID
+    ) -> dict[str, int]:
+        """For each pixel hash, how many of the tenant's **other** documents
+        hold a figure with it (absent: none) — the tenant-wide repeated-image
+        filter (a logo / letterhead in every document of a tenant)."""
+
+    @abc.abstractmethod
+    async def existing_document_ids(self, *, document_ids: Sequence[UUID]) -> set[UUID]:
+        """Which of ``document_ids`` still have a document row, whatever the
+        tenant — the figure reconciler's check (run with RLS bypassed)."""
+
     # -- recognition cache (B-209 §5.5) -------------------------------------
 
     @abc.abstractmethod
@@ -534,7 +566,9 @@ class KnowledgeStore(abc.ABC):
     ) -> None:
         """Cache one reading. An existing entry for the key is kept (the same
         image bytes, model, prompt version and render parameters read the
-        same; the first reading stands)."""
+        same) is replaced: a reading cached under the key is only read again
+        when the current rules reject it, and the fresh one must then stand,
+        or every later ingest would pay for it again."""
 
     # -- chunks -------------------------------------------------------------
 

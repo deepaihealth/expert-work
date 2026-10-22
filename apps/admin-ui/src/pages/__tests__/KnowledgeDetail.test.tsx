@@ -267,6 +267,141 @@ describe("KnowledgeDetail", () => {
     expect(screen.queryByTestId(`doc-recognize-${done.id}`)).toBeNull();
   });
 
+  it("shows picture counts and offers 「补识别」 for pictures waiting (B-209 PR-2)", async () => {
+    const pictured: knowledgeSdk.KnowledgeDocument = {
+      ...DOCS[0],
+      id: "44444444-4444-4444-4444-444444444444",
+      filename: "manual.docx",
+      figure_stats: {
+        extracted: 6,
+        filtered: 2,
+        capped: 0,
+        unsupported: 1,
+        described: 2,
+        failed: 0,
+        pending: 1,
+      },
+    };
+    const allDescribed: knowledgeSdk.KnowledgeDocument = {
+      ...DOCS[0],
+      figure_stats: { ...pictured.figure_stats!, described: 3, pending: 0 },
+    };
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(
+      docPage([allDescribed, pictured]),
+    );
+    const recognizeSpy = vi.spyOn(knowledgeSdk, "recognizeDocument").mockResolvedValue(pictured);
+
+    renderDetail();
+    const tags = await screen.findByTestId(`doc-figures-${pictured.id}`);
+    expect(tags).toHaveTextContent("2 pictures described");
+    expect(tags).toHaveTextContent("1 pictures waiting");
+    expect(tags).not.toHaveTextContent("failed");
+    expect(screen.getByTestId(`doc-figures-${allDescribed.id}`)).toHaveTextContent(
+      "3 pictures described",
+    );
+    // Every picture described: nothing for 「补识别」 to do.
+    expect(screen.queryByTestId(`doc-recognize-${allDescribed.id}`)).toBeNull();
+    await userEvent.click(screen.getByTestId(`doc-recognize-${pictured.id}`));
+    await waitFor(() =>
+      expect(recognizeSpy).toHaveBeenCalledWith("support-docs", pictured.id),
+    );
+  });
+
+  it("segment preview shows the original next to a picture description (B-209 PR-2)", async () => {
+    const figure = "0123456789abcdef";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue({
+      chunks: [
+        {
+          id: "c1",
+          chunk_index: 0,
+          content: `Before the picture.\n\n> \u3014\u56fe ${figure}\u3015A device photo.\n\nAfter it.`,
+          heading_path: [],
+        },
+        { id: "c2", chunk_index: 1, content: "No picture here.", heading_path: [] },
+      ],
+      total: 2,
+      offset: 0,
+      limit: 20,
+      figure_ids: [figure],
+    });
+    const fetchSpy = vi.spyOn(knowledgeSdk, "fetchFigureUrl").mockResolvedValue("blob:figure");
+
+    renderDetail();
+    await userEvent.click(await screen.findByTestId(`doc-chunks-${DOCS[0].id}`));
+    const block = await screen.findByTestId(`kb-figure-block-${figure}`);
+    expect(block).toHaveTextContent("A device photo.");
+    const thumb = await screen.findByTestId(`kb-figure-thumb-${figure}`);
+    expect(within(thumb).getByRole("img", { name: "Original picture" })).toHaveAttribute(
+      "src",
+      "blob:figure",
+    );
+    expect(screen.getByText("Before the picture.")).toBeInTheDocument();
+    expect(screen.getByText("After it.")).toBeInTheDocument();
+    // Only the described picture is fetched — once, under its own document.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith("support-docs", DOCS[0].id, figure, undefined);
+  });
+
+  it("segment preview says when the original is not available (B-209 PR-2)", async () => {
+    const figure = "fedcba9876543210";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue({
+      chunks: [
+        {
+          id: "c1",
+          chunk_index: 0,
+          content: `> \u3014\u56fe ${figure}\u3015A chart.`,
+          heading_path: [],
+        },
+      ],
+      total: 1,
+      offset: 0,
+      limit: 20,
+      figure_ids: [figure],
+    });
+    vi.spyOn(knowledgeSdk, "fetchFigureUrl").mockRejectedValue(new Error("404"));
+
+    renderDetail();
+    await userEvent.click(await screen.findByTestId(`doc-chunks-${DOCS[0].id}`));
+    expect(await screen.findByTestId(`kb-figure-missing-${figure}`)).toHaveTextContent(
+      "Original not available",
+    );
+  });
+
+  it("segment preview shows thumbnails only for pictures the server confirmed (S-L1)", async () => {
+    const real = "0123456789abcdef";
+    const typed = "fedcba9876543210";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue({
+      chunks: [
+        {
+          id: "c1",
+          chunk_index: 0,
+          content: `> \u3014\u56fe ${real}\u3015A photo.\n\n> \u3014\u56fe ${typed}\u3015Typed by an author.`,
+          heading_path: [],
+        },
+      ],
+      total: 1,
+      offset: 0,
+      limit: 20,
+      figure_ids: [real],
+    });
+    const fetchSpy = vi.spyOn(knowledgeSdk, "fetchFigureUrl").mockResolvedValue("blob:figure");
+
+    renderDetail();
+    await userEvent.click(await screen.findByTestId(`doc-chunks-${DOCS[0].id}`));
+    expect(await screen.findByTestId(`kb-figure-thumb-${real}`)).toBeInTheDocument();
+    expect(screen.queryByTestId(`kb-figure-block-${typed}`)).toBeNull();
+    expect(screen.getByText(/Typed by an author\./)).toBeInTheDocument();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith("support-docs", DOCS[0].id, real, undefined);
+  });
+
   it("retrieval test runs the query and renders scored results", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
     vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));

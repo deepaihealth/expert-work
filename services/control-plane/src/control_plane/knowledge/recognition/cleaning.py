@@ -1,8 +1,10 @@
 """B-209 §5.3 —— 识别输出的清洗与校验(纯函数,不碰网络)。
 
 清洗:去代码围栏;HTML 表格转 Markdown 表(``colspan`` 展开、``rowspan`` 下延、实体解码);
-去掉版面解析接口留下的图片占位(``![](page=0,bbox=[…])``,图片在 PR-2 处理);LaTeX 包着的
-纯文本还原;去掉模型的固定空话(「No text content.」等,含出现在正文末尾的情况)。
+去掉版面解析接口留下的图片占位(``![](page=0,bbox=[…])``;PR-2 起识别器先用
+:func:`extract_image_regions` 把它们换成区域占位符、记下框,裁图描述后插回原位,这里只去掉
+剩下的);LaTeX 包着的纯文本还原;去掉模型的固定空话(「No text content.」等,含出现在正文
+末尾的情况)。
 
 校验:超长、空输出、截断(``finish_reason=length``)、复读(结尾的长周期重复占全文 ≥ 80%)、
 字数远低于版面里有字的块合计的字数 —— 任一条成立,这次识别算失败,换兜底模型。
@@ -18,6 +20,7 @@ HTML 的 :data:`_MAX_TABLE_GROWTH` 倍(超了按单元格原文写出,不展开)
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
@@ -81,6 +84,10 @@ _FENCE_LINE = re.compile(r"^[ \t]*```[\w-]*[ \t]*$", re.MULTILINE)
 _TABLE_OPEN = re.compile(r"<table\b", re.IGNORECASE)
 _TABLE_CLOSE = re.compile(r"</table\s{0,20}>", re.IGNORECASE)
 #: Layout-parsing image region markers, e.g. ``![](page=0,bbox=[57, 199, 995, 637])``.
+#: Layout wrappers a layout-parsing model puts around a centred title or
+#: caption (seen from glm-ocr: ``<div align="center">`` … ``</div>``): the tags
+#: go, the text inside stays. Tables are converted before this runs.
+_ALIGNMENT_WRAPPER = re.compile(r"</?(?:div|center|span|p)\b[^<>\n]{0,200}>", re.IGNORECASE)
 _IMAGE_REGION = re.compile(
     r"!\[[^\]\n]{0,200}\]\(\s{0,10}page=\d{1,5}\s{0,10},\s{0,10}bbox=\[[^\]\n]{0,200}\]\s{0,10}\)"
 )
@@ -95,6 +102,32 @@ _WHITESPACE = re.compile(r"\s+")
 _WORD_CHAR = re.compile(r"\w")
 
 
+_REGION_BOX = re.compile(r"bbox=\[([^\]\n]{0,200})\]")
+
+
+def extract_image_regions(
+    text: str, placeholder: Callable[[int], str]
+) -> tuple[str, list[tuple[float, float, float, float]]]:
+    """B-209 PR-2 —— the layout-parsing image regions (``![](page=0,bbox=[…])``,
+    pixel coordinates of the image sent) replaced by ``placeholder(i)`` as
+    their own paragraph, and their boxes in order. A marker whose box does
+    not read as four numbers is dropped (as :func:`clean_reading` drops it)."""
+    boxes: list[tuple[float, float, float, float]] = []
+
+    def swap(match: re.Match[str]) -> str:
+        box = _REGION_BOX.search(match.group(0))
+        try:
+            values = [float(v) for v in box.group(1).split(",")] if box else []
+        except ValueError:
+            values = []
+        if len(values) != 4:
+            return ""
+        boxes.append((values[0], values[1], values[2], values[3]))
+        return f"\n\n{placeholder(len(boxes) - 1)}\n\n"
+
+    return _IMAGE_REGION.sub(swap, text), boxes
+
+
 def reading_too_large(text: str) -> bool:
     """A raw reading over :data:`MAX_READING_BYTES` — failed, not cleaned."""
     return len(text) > MAX_READING_BYTES or len(text.encode("utf-8", "replace")) > MAX_READING_BYTES
@@ -105,6 +138,7 @@ def clean_reading(text: str) -> str:
     Callers check :func:`reading_too_large` first."""
     cleaned = _FENCE_LINE.sub("", text)
     cleaned = _replace_tables(cleaned)
+    cleaned = _ALIGNMENT_WRAPPER.sub("", cleaned)
     cleaned = _IMAGE_REGION.sub("", cleaned)
     cleaned = _MATH_SPAN.sub(_restore_plain_math, cleaned)
     cleaned = _strip_boilerplate(cleaned)

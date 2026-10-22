@@ -6,6 +6,7 @@ PDF 都在这里现场生成:「扫描页」= 一张写着字的图片铺满页�
 from __future__ import annotations
 
 import io
+import zlib
 from typing import Any
 
 import pymupdf
@@ -14,6 +15,7 @@ from PIL import Image
 
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
 from control_plane.knowledge.recognition import pages as pages_module
+from control_plane.knowledge.recognition.figure_images import MAX_DECODE_PIXELS
 from control_plane.knowledge.recognition.pages import (
     MAX_IMAGE_PLACEMENTS,
     RENDER_MAX_EDGE_PX,
@@ -283,3 +285,51 @@ def test_a_page_of_many_image_tiles_is_recognized_whole() -> None:
     page = analysis.pages[0]
     assert (page.decision, page.reason) == (PageDecision.OCR, PageReason.MANY_IMAGES)
     assert page.images == MAX_IMAGE_PLACEMENTS + 1
+
+
+def _huge_image_page(*, text_lines: int) -> pymupdf.Page:
+    """A page with a caption, ``text_lines`` lines of text and one image object that
+    declares 8,000 x 8,000 pixels (past ``MAX_DECODE_PIXELS``) but carries a
+    few KB of data: decoding it makes MuPDF warn that it padded a truncated
+    image — the sign it was decoded."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 500), "Figure 1", fontsize=10)
+    for row in range(text_lines):
+        page.insert_text((72, 520 + 14 * row), "A line of ordinary text. " * 3, fontsize=10)
+    xref = doc.get_new_xref()
+    doc.update_object(
+        xref,
+        "<< /Type /XObject /Subtype /Image /Width 8000 /Height 8000 "
+        "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode >>",
+    )
+    doc.update_stream(xref, zlib.compress(b"\0" * 4096), compress=False)
+    kind, value = doc.xref_get_key(page.xref, "Resources")
+    assert kind == "xref"
+    doc.xref_set_key(int(value.split()[0]), "XObject", f"<< /Im9 {xref} 0 R >>")
+    contents = page.get_contents()[0]
+    drawn = doc.xref_stream(contents) + b"\nq 500 0 0 420 48 40 cm /Im9 Do Q\n"
+    doc.update_stream(contents, drawn)
+    reopened = pymupdf.open(stream=doc.tobytes(), filetype="pdf")
+    return reopened[0]
+
+
+@pytest.mark.parametrize(
+    ("text_lines", "decision", "reason"),
+    [(8, PageDecision.TEXT, None), (0, PageDecision.OCR, PageReason.SPARSE_TEXT)],
+)
+def test_the_page_decision_never_decodes_an_image(
+    text_lines: int, decision: PageDecision, reason: PageReason | None
+) -> None:
+    # B-209 PR-2 follow-up: the decision reads placement boxes only — an image
+    # past the decode ceiling (here: one that would warn when decoded) is
+    # counted and placed, never decoded.
+    assert 8000 * 8000 > MAX_DECODE_PIXELS
+    page = _huge_image_page(text_lines=text_lines)
+    pymupdf.TOOLS.reset_mupdf_warnings()
+    decided = pages_module._decide(page)
+    assert "truncated" not in pymupdf.TOOLS.mupdf_warnings()
+    assert (decided.decision, decided.reason, decided.images) == (decision, reason, 1)
+    # The detector works: decoding the same image does warn.
+    page.get_image_info(xrefs=True)
+    assert "truncated" in pymupdf.TOOLS.mupdf_warnings()

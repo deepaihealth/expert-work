@@ -3,6 +3,7 @@
  *
  * Read-only paginated view of a document's chunks (the embedding is never
  * fetched). Lets an operator verify that chunking produced sensible segments.
+ * B-209 PR-2: a picture description shows the original's thumbnail beside it.
  */
 import { useCallback, useEffect, useState } from "react";
 import { App, Card, Drawer, Empty, Pagination, Skeleton, Typography } from "antd";
@@ -10,9 +11,10 @@ import { useTranslation } from "react-i18next";
 
 import { listChunks, type KnowledgeChunk, type KnowledgeDocument } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import { ChunkContent } from "./ChunkContent";
 import { HeadingPath } from "./HeadingPath";
 
-const { Text, Paragraph } = Typography;
+const { Text } = Typography;
 
 const PAGE_SIZE = 20;
 
@@ -44,6 +46,7 @@ export function SegmentPreviewDrawer({
   const { message } = App.useApp();
 
   const [chunks, setChunks] = useState<KnowledgeChunk[]>([]);
+  const [figureIds, setFigureIds] = useState<ReadonlySet<string>>(new Set());
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
@@ -65,6 +68,7 @@ export function SegmentPreviewDrawer({
           readScope,
         );
         setChunks(result.chunks);
+        setFigureIds(new Set(result.figure_ids ?? []));
         setTotal(result.total);
       } catch (err) {
         message.error(errMessage(err));
@@ -111,9 +115,15 @@ export function SegmentPreviewDrawer({
                 }
               >
                 <HeadingPath path={chunk.heading_path} testId={`kb-chunk-heading-${chunk.id}`} />
-                <Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0, fontSize: 13 }}>
-                  {chunk.content}
-                </Paragraph>
+                {documentId && (
+                  <ChunkContent
+                    baseName={baseName}
+                    documentId={documentId}
+                    readScope={readScope}
+                    content={chunk.content}
+                    figureIds={figureIds}
+                  />
+                )}
               </Card>
             ))}
             {total > PAGE_SIZE && (

@@ -56,7 +56,8 @@ class IngestStage(StrEnum):
 
     QUEUED = "queued"
     PARSING = "parsing"
-    #: B-209 —— 扫描页送识别模型(只有判出要识别的页时才经过)。
+    #: B-209 —— 扫描页送识别模型、文档里的图片送描述模型(只有判出要识别的页或要描述的
+    #: 图片时才经过)。
     RECOGNIZING = "recognizing"
     CHUNKING = "chunking"
     EMBEDDING = "embedding"
@@ -142,6 +143,36 @@ class DocumentPage(BaseModel):
     images: int = Field(default=0, ge=0, description="image objects on the page")
     cached: bool = Field(default=False, description="text reused from the recognition cache")
     error: str | None = None
+    #: B-209 PR-2 (§5.4 / §5.6) —— the page's figures that passed the filters
+    #: and the per-document cap, and those of them described into the text.
+    figures_kept: int = Field(default=0, ge=0)
+    figures_described: int = Field(default=0, ge=0)
+
+
+class FigureStats(BaseModel):
+    """B-209 PR-2 §5.4 / §5.6 —— what became of a document's figures (images
+    inside a PDF / Word / slide deck): extracted → filtered (too small, a tiny
+    share of the page, a few KB, repeated: logos, icons, backgrounds) → capped
+    (past the per-document limit, smallest first) → described / failed /
+    pending (no usable description model when ingested)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    extracted: int = Field(default=0, ge=0, description="images found in the document")
+    filtered: int = Field(default=0, ge=0, description="dropped by the figure filters")
+    capped: int = Field(default=0, ge=0, description="past the per-document figure limit")
+    unsupported: int = Field(
+        default=0, ge=0, description="formats that could not be decoded (WMF / EMF / SVG …)"
+    )
+    described: int = Field(default=0, ge=0, description="described into the document text")
+    failed: int = Field(default=0, ge=0, description="the description models gave no usable answer")
+    pending: int = Field(default=0, ge=0, description="no usable description model when ingested")
+
+    @property
+    def needs_description(self) -> bool:
+        """Figures failed or wait for a description model — 「补识别」 has
+        something to do (the described ones come from the cache)."""
+        return self.failed > 0 or self.pending > 0
 
 
 class PageStats(BaseModel):
@@ -405,6 +436,9 @@ class KnowledgeDocument(BaseModel):
     #: B-209 —— page counts of the latest PDF ingest (``None``: not a PDF, or
     #: ingested before page records existed).
     page_stats: PageStats | None = None
+    #: B-209 PR-2 —— figure counts of the latest ingest (``None``: ingested
+    #: before figures were described, or without a figure describer).
+    figure_stats: FigureStats | None = None
     size_bytes: int | None = Field(
         default=None, ge=0, description="size of the serving version's original file"
     )

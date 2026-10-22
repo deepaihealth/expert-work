@@ -13,6 +13,9 @@
 抓到)。一页判了要识别就整页识别,不和文字层混拼。
 
 **渲染**:200 DPI、长边上限 2,000 px(模型声明了像素上限的再按它缩)、JPEG 质量 85。
+
+**插图**(B-209 PR-2)另走一次进程池调用(:mod:`~.figure_pdf`);要描述插图而这份 PDF 原本整份
+解析(没有扫描页)时,用 :func:`pdf_page_texts` 取各页文字、按页拼回(同扫描页)。
 """
 
 from __future__ import annotations
@@ -128,6 +131,32 @@ def analyse_pdf(filename: str, raw: bytes) -> PdfAnalysis:
     )
 
 
+def pdf_page_texts(raw: bytes, analysis: PdfAnalysis) -> PdfAnalysis:
+    """``analysis`` (one parsed whole) with each kept page's own text, as
+    a PDF with scanned pages has them — for placing figures page by page."""
+    doc = open_pdf(raw)
+    try:
+        texts = _page_texts(doc, analysis.pages)
+    finally:
+        doc.close()
+    return PdfAnalysis(
+        pages=tuple(
+            page
+            if page.decision is PageDecision.OCR
+            else PdfPage(
+                index=page.index,
+                decision=page.decision,
+                reason=page.reason,
+                chars=page.chars,
+                images=page.images,
+                text=texts.get(page.index, ""),
+            )
+            for page in analysis.pages
+        ),
+        markdown=None,
+    )
+
+
 def _decide_or_text(doc: pymupdf.Document, index: int) -> PdfPage:
     """:func:`_decide` for one page; a page PyMuPDF cannot inspect is a text
     page (what it was before B-209)."""
@@ -171,14 +200,14 @@ def _plain_text(doc: pymupdf.Document, index: int) -> str:
 
 def render_pages(raw: bytes, indexes: Sequence[int], max_pixels: int | None = None) -> list[bytes]:
     """JPEG bytes of the given pages (0-based), in order — see :func:`render_params`."""
-    doc = _open(raw)
+    doc = open_pdf(raw)
     try:
-        return [_render(doc[index], max_pixels) for index in indexes]
+        return [render_page(doc[index], max_pixels) for index in indexes]
     finally:
         doc.close()
 
 
-def _open(raw: bytes) -> pymupdf.Document:
+def open_pdf(raw: bytes) -> pymupdf.Document:
     try:
         return pymupdf.open(stream=raw, filetype="pdf")
     except Exception as exc:
@@ -189,6 +218,9 @@ def _open(raw: bytes) -> pymupdf.Document:
 def _decide(page: pymupdf.Page) -> PdfPage:
     text = page.get_text()
     chars = len(_WHITESPACE.sub("", text))
+    # Placement boxes only: plain ``get_image_info()`` does not decode the
+    # images; ``xrefs=True`` / ``hashes=True`` decode every one of them
+    # (a 20,000 x 20,000 image: 2 s, 440 MB) — never pass them here.
     images = page.get_image_info()
     index = page.number or 0
 
@@ -285,7 +317,7 @@ def _union_area(boxes: Sequence[tuple[float, float, float, float]]) -> float:
     return total
 
 
-def _render(page: pymupdf.Page, max_pixels: int | None) -> bytes:
+def render_page(page: pymupdf.Page, max_pixels: int | None) -> bytes:
     zoom = RENDER_DPI / 72
     longest = max(page.rect.width, page.rect.height)
     if longest * zoom > RENDER_MAX_EDGE_PX:

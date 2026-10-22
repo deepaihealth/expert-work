@@ -190,7 +190,12 @@ async def _cached(store: KnowledgeStore, tenant: UUID, document: UUID) -> dict[s
     )
 
 
-async def test_parse_cache_is_per_document_and_first_reading_stands(store: KnowledgeStore) -> None:
+async def test_parse_cache_is_per_document_and_a_later_reading_replaces_it(
+    store: KnowledgeStore,
+) -> None:
+    # B-209 PR-2 (review M2): a reading is only written again when the current
+    # rules rejected the cached one — the fresh one must stand, or every later
+    # ingest pays for it again.
     tenant, other = uuid4(), uuid4()
     document_id, _ = await _document(store, tenant)
     assert await _cached(store, tenant, document_id) == {}
@@ -200,11 +205,11 @@ async def test_parse_cache_is_per_document_and_first_reading_stands(store: Knowl
         document_id=document_id,
         kind="page_ocr",
         key="k1",
-        model="glm/glm-ocr",
+        model="qwen/qwen3.7-flash",
         result={"raw": "另一份"},
     )
     assert await _cached(store, tenant, document_id) == {
-        "k1": ParseCacheEntry(model="glm/glm-ocr", result=_RAW)
+        "k1": ParseCacheEntry(model="qwen/qwen3.7-flash", result={"raw": "另一份"})
     }
     # Another tenant / another document holding the same page learn nothing.
     assert await _cached(store, other, document_id) == {}

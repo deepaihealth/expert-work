@@ -25,6 +25,7 @@ from control_plane.api.external_workspace import build_external_workspace_router
 from control_plane.api.feedback import build_feedback_router
 from control_plane.api.health import build_health_router
 from control_plane.api.knowledge import build_knowledge_router
+from control_plane.api.knowledge_figures import build_knowledge_figures_router
 from control_plane.api.mcp_catalog import build_mcp_catalog_router
 from control_plane.api.mcp_oauth_api import build_mcp_oauth_router
 from control_plane.api.mcp_servers import build_mcp_servers_router
@@ -107,6 +108,7 @@ __all__ = [
     "build_external_workspace_router",
     "build_feedback_router",
     "build_health_router",
+    "build_knowledge_figures_router",
     "build_knowledge_router",
     "build_mcp_catalog_router",
     "build_mcp_oauth_router",

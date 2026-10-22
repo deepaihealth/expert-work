@@ -26,6 +26,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    true,
     update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
@@ -70,6 +71,7 @@ from expert_work.protocol import (
     DocumentPage,
     DocumentSourceType,
     DocumentStatus,
+    FigureStats,
     IngestErrorCode,
     IngestStage,
     KnowledgeBase,
@@ -216,6 +218,7 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         error_code=_enum_or(IngestErrorCode, row.error_code, IngestErrorCode.INTERNAL_ERROR),
         page_count=row.page_count,
         page_stats=PageStats.model_validate(row.page_stats) if row.page_stats else None,
+        figure_stats=FigureStats.model_validate(row.figure_stats) if row.figure_stats else None,
         size_bytes=row.size_bytes,
         mime=row.mime,
         created_at=row.created_at,
@@ -1295,6 +1298,75 @@ class SqlKnowledgeStore(KnowledgeStore):
             return None
         return [DocumentPage.model_validate(record) for record in row[0] or ()]
 
+    async def set_document_figures(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        stats: FigureStats | _Unset | None,
+        pixel_hashes: Sequence[str],
+        generation: int | None = None,
+    ) -> bool:
+        values: dict[str, Any] = {
+            "figure_hashes": list(dict.fromkeys(pixel_hashes)),
+            "updated_at": datetime.now(UTC),
+        }
+        if not isinstance(stats, _Unset):
+            values["figure_stats"] = stats.model_dump(mode="json") if stats is not None else None
+        async with self._sf() as session:
+            result = await session.execute(
+                update(KnowledgeDocumentRow)
+                .where(
+                    KnowledgeDocumentRow.tenant_id == tenant_id,
+                    KnowledgeDocumentRow.id == document_id,
+                    *_fence(generation),
+                )
+                .values(**values)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def count_figure_documents(
+        self, *, tenant_id: UUID, pixel_hashes: Sequence[str], exclude_document_id: UUID
+    ) -> dict[str, int]:
+        if not pixel_hashes:
+            return {}
+        wanted = list(dict.fromkeys(pixel_hashes))
+        found = (
+            func.unnest(KnowledgeDocumentRow.figure_hashes)
+            .table_valued("digest")
+            .render_derived(name="h")
+        )
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(found.c.digest, func.count())
+                    .select_from(KnowledgeDocumentRow)
+                    .join(found, true())
+                    .where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id != exclude_document_id,
+                        KnowledgeDocumentRow.figure_hashes.overlap(wanted),
+                        found.c.digest.in_(wanted),
+                    )
+                    .group_by(found.c.digest)
+                )
+            ).all()
+        return {str(digest): int(count) for digest, count in rows}
+
+    async def existing_document_ids(self, *, document_ids: Sequence[UUID]) -> set[UUID]:
+        if not document_ids:
+            return set()
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(KnowledgeDocumentRow.id).where(
+                        KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids)))
+                    )
+                )
+            ).all()
+        return {row[0] for row in rows}
+
     # -- recognition cache (B-209 §5.5) -------------------------------------
 
     async def get_parse_cache(
@@ -1347,7 +1419,10 @@ class SqlKnowledgeStore(KnowledgeStore):
                     model=model,
                     result=result,
                 )
-                .on_conflict_do_nothing(index_elements=["document_id", "kind", "cache_key"])
+                .on_conflict_do_update(
+                    index_elements=["document_id", "kind", "cache_key"],
+                    set_={"model": model, "result": result, "created_at": func.now()},
+                )
             )
             await session.commit()
 

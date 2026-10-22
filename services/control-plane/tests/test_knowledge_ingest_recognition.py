@@ -24,6 +24,7 @@ from control_plane.knowledge.ingestion import (
     shutdown_parse_pool,
 )
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
+from control_plane.knowledge.recognition import ingest_parse
 from control_plane.knowledge.recognition import recognizer as recognizer_module
 from control_plane.knowledge.recognition.clients import Reading, RecognitionClient
 from control_plane.knowledge.recognition.pages import render_pages
@@ -562,7 +563,7 @@ async def test_a_worker_that_lost_the_document_stops_paying(
 async def test_recognized_text_past_the_document_limit_is_recorded_as_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ingestion, "MAX_RECOGNIZED_CHARS_PER_DOCUMENT", len(_RECOGNIZED) + 5)
+    monkeypatch.setattr(ingest_parse, "MAX_RECOGNIZED_CHARS_PER_DOCUMENT", len(_RECOGNIZED) + 5)
     raw = _pdf("scan", "scan")
     doc = await _document("two.pdf", raw)
     await _ingest(doc, "two.pdf", raw, recognizer=_recognizer(doc.store, _Reader()))

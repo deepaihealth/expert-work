@@ -29,15 +29,16 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 12.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 import multiprocessing
+import sys
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
@@ -49,19 +50,9 @@ from control_plane.knowledge.parsing import (
     parse_document,
     strip_lone_surrogates,
 )
-from control_plane.knowledge.recognition.assembly import (
-    MAX_RECOGNIZED_CHARS_PER_DOCUMENT,
-    assemble_pages,
-    cap_recognized_text,
-    no_text_message,
-    page_records,
-)
-from control_plane.knowledge.recognition.pages import analyse_pdf, render_pages
-from control_plane.knowledge.recognition.recognizer import (
-    ERROR_NOT_CONFIGURED,
-    DocumentRecognizer,
-    PageOutcome,
-)
+from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
+from control_plane.knowledge.recognition.ingest_parse import ParseJob, PoolRunner, parse_upload
+from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
 from control_plane.knowledge.usage import IngestUsageRecorder, billed_embeddings
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
@@ -72,7 +63,6 @@ from expert_work.protocol import (
     IngestStage,
     KnowledgeChunk,
     KnowledgeDocument,
-    PageStatus,
     chunk_retrieval_text,
     knowledge_document_title,
 )
@@ -111,6 +101,10 @@ _parse_executor: Executor | None = None
 _parse_slots: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
 _parse_workers = 2
 _parse_timeout_s: float = 600.0
+#: Address-space ceiling of one parse worker (bytes; 0 = none): :func:`limit_worker_memory`.
+_parse_worker_max_vm_bytes = 0
+#: B-209 PR-2 (review H3) —— the figure collection's share of a document's parse budget.
+FIGURE_POOL_SHARE = 0.25
 
 # Patched by tests so backoff does not actually sleep.
 _sleep = asyncio.sleep
@@ -140,13 +134,39 @@ def failure_code(exc: BaseException) -> IngestErrorCode:
     return tagged if isinstance(tagged, IngestErrorCode) else IngestErrorCode.INTERNAL_ERROR
 
 
-def configure_parse_pool(*, workers: int, timeout_s: float) -> None:
-    """Set the parse pool's size and per-document timeout (lifespan wiring).
-    Takes effect for the next pool creation; call before the first ingest."""
-    global _parse_workers, _parse_timeout_s, _parse_slots
+def configure_parse_pool(*, workers: int, timeout_s: float, max_vm_mb: int = 0) -> None:
+    """Set the parse pool's size, per-document timeout and per-worker address
+    space ceiling (lifespan wiring). Takes effect for the next pool creation;
+    call before the first ingest."""
+    global _parse_workers, _parse_timeout_s, _parse_slots, _parse_worker_max_vm_bytes
     _parse_workers = max(1, workers)
     _parse_timeout_s = timeout_s
+    _parse_worker_max_vm_bytes = max(0, max_vm_mb) * 1024 * 1024
     _parse_slots = None
+
+
+def _on_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def limit_worker_memory(max_bytes: int) -> None:
+    """Parse-pool worker initializer (security review S-M1): cap the worker's
+    address space (``RLIMIT_AS``) so a document that needs too much memory
+    fails its own parse with ``MemoryError`` instead of the kernel killing the
+    pod. Linux only (macOS does not enforce it); ``0`` = no cap; never raises
+    an existing hard limit."""
+    if max_bytes <= 0 or not _on_linux():
+        return
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - not POSIX
+        return
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    cap = max_bytes if hard == resource.RLIM_INFINITY else min(max_bytes, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+    except (ValueError, OSError):
+        logger.warning("knowledge.parse_worker_memory_limit_failed", exc_info=True)
 
 
 def shutdown_parse_pool(*, kill: bool = False) -> None:
@@ -191,7 +211,10 @@ def _get_parse_executor() -> Executor:
         # thread pools; the children only import the parsing module
         # (``control_plane.__init__`` exports the app lazily for this reason).
         _parse_executor = ProcessPoolExecutor(
-            max_workers=_parse_workers, mp_context=multiprocessing.get_context("spawn")
+            max_workers=_parse_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=limit_worker_memory,
+            initargs=(_parse_worker_max_vm_bytes,),
         )
     return _parse_executor
 
@@ -225,9 +248,15 @@ class _PoolBudget:
     """B-209 (review M2) —— one parse-pool time budget per document: page
     analysis plus every render batch share :data:`_parse_timeout_s`, as the
     single ``parse_document`` call did before. Time queued for a slot is not
-    charged."""
+    charged. A sub-budget (``parent`` set) also spends its parent's."""
 
     remaining: float
+    parent: _PoolBudget | None = None
+
+    def charge(self, seconds: float) -> None:
+        self.remaining -= seconds
+        if self.parent is not None:
+            self.parent.charge(seconds)
 
 
 async def _in_parse_pool[T](
@@ -268,9 +297,14 @@ async def _in_parse_pool[T](
                 _discard_parse_pool(executor)
                 if attempt == 2:
                     raise
+            except MemoryError as exc:
+                # The worker hit its address-space ceiling (S-M1): this
+                # document's parse fails, the worker and the pod live on.
+                msg = f"document {filename!r} needs more memory than a parse may use"
+                raise DocumentParseError(msg) from exc
             finally:
                 if budget is not None:
-                    budget.remaining -= loop.time() - started
+                    budget.charge(loop.time() - started)
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -413,6 +447,7 @@ async def ingest_document_bytes(
     parsed_markdown: str | None = None,
     recognizer: DocumentRecognizer | None = None,
     usage: IngestUsageRecorder | None = None,
+    figures: FigureDescriber | None = None,
 ) -> int:
     """Parse → chunk → embed → store one document; return the chunk count.
 
@@ -428,6 +463,8 @@ async def ingest_document_bytes(
     document — no page is silently empty. Without a ``recognizer`` scanned
     pages are recorded as waiting for recognition. ``usage`` bills the
     recognition and embedding calls to the tenant (``knowledge_ingest``).
+    B-209 PR-2: ``figures`` describes the images inside PDFs / Word / slide
+    files into the text, at their place (without it they are left out).
 
     :raises StaleIngestionError: the fenced write-back was rejected.
     """
@@ -441,18 +478,28 @@ async def ingest_document_bytes(
             stage=IngestStage.PARSING,
             generation=generation,
         )
-        if Path(filename).suffix.lower() == ".pdf":
-            markdown = await _parse_pdf_pages(
+        run, run_figures = _pool_runners(filename)
+        job = ParseJob(
+            store=store,
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            document_id=document_id,
+            filename=filename,
+            raw=raw,
+            generation=generation,
+            run=run,
+            run_figures=run_figures,
+            recognizing=functools.partial(
+                _advance,
                 store,
-                recognizer,
                 tenant_id=tenant_id,
                 document_id=document_id,
-                filename=filename,
-                raw=raw,
+                stage=IngestStage.RECOGNIZING,
                 generation=generation,
-            )
-        else:
-            markdown = await parse_document_in_pool(filename, raw)
+            ),
+            lost=lambda: StaleIngestionError(f"document {document_id} was taken by another claim"),
+        )
+        markdown = await parse_upload(job, recognizer=recognizer, figures=figures)
     return await ingest_markdown(
         store=store,
         embedder=embedder,
@@ -469,75 +516,21 @@ async def ingest_document_bytes(
     )
 
 
-async def _parse_pdf_pages(
-    store: KnowledgeStore,
-    recognizer: DocumentRecognizer | None,
-    *,
-    tenant_id: UUID,
-    document_id: UUID,
-    filename: str,
-    raw: bytes,
-    generation: int | None,
-) -> str:
-    """B-209 §5.1 / §5.6 —— decide every page, recognize the scanned ones,
-    record each page's outcome, then join the pages back into Markdown in
-    page order.
-
-    Never worse than before: a PDF with no scanned page — or whose scanned
-    pages gave no text (nothing configured, everything failed) — gets exactly
-    :func:`parse_document`'s text, MarkItDown fallback included; only the
-    error, if that is empty too, names the pages and why."""
+def _pool_runners(filename: str) -> tuple[PoolRunner, PoolRunner]:
+    """The document's parse-pool calls (analysis, renders, fallback parse)
+    share one time budget (B-209 review M2); the figure collection runs on a
+    sub-budget of it (:data:`FIGURE_POOL_SHARE`, review H3)."""
     budget = _PoolBudget(_parse_timeout_s)
-    analysis = await _in_parse_pool(filename, analyse_pdf, filename, raw, budget=budget)
-    if not analysis.pages:  # PyMuPDF could not walk it: parsed as before, no records
-        return analysis.markdown or ""
+    figures = _PoolBudget(_parse_timeout_s * FIGURE_POOL_SHARE, parent=budget)
 
-    async def recognizing() -> None:
-        # Fenced: raises once a re-upload / another claim took the document.
-        await _advance(
-            store,
-            tenant_id=tenant_id,
-            document_id=document_id,
-            stage=IngestStage.RECOGNIZING,
-            generation=generation,
-        )
+    def runner(spend: _PoolBudget) -> PoolRunner:
+        async def run[T](fn: Callable[..., T], /, *args: object) -> T:
+            spend.remaining = min(spend.remaining, budget.remaining)
+            return await _in_parse_pool(filename, fn, *args, budget=spend)
 
-    outcomes: dict[int, PageOutcome] = {}
-    if analysis.markdown is None:
-        await recognizing()
-        scanned = [page.index for page in analysis.ocr_pages]
-        if recognizer is None:
-            pending = PageOutcome(status=PageStatus.PENDING, error=ERROR_NOT_CONFIGURED)
-            outcomes = dict.fromkeys(scanned, pending)
-        else:
+        return run
 
-            async def render(indexes: list[int], max_pixels: int | None) -> list[bytes]:
-                return await _in_parse_pool(
-                    filename, render_pages, raw, indexes, max_pixels, budget=budget
-                )
-
-            outcomes = await recognizer.recognize_document(
-                tenant_id=tenant_id,
-                document_id=document_id,
-                pages=scanned,
-                render=render,
-                before_batch=recognizing,
-            )
-        outcomes = cap_recognized_text(outcomes, MAX_RECOGNIZED_CHARS_PER_DOCUMENT)
-    pages = page_records(analysis, outcomes)
-    if not await store.set_document_pages(
-        tenant_id=tenant_id, document_id=document_id, pages=pages, generation=generation
-    ):
-        msg = f"document {document_id} was re-uploaded or settled by another claim"
-        raise StaleIngestionError(msg)
-    if analysis.markdown is not None:
-        return analysis.markdown
-    if not any(o.status is PageStatus.RECOGNIZED and o.text.strip() for o in outcomes.values()):
-        try:
-            return await _in_parse_pool(filename, parse_document, filename, raw, budget=budget)
-        except DocumentParseError as exc:
-            raise DocumentParseError(no_text_message(filename, pages), exc.code) from exc
-    return assemble_pages(analysis, outcomes)
+    return runner(budget), runner(figures)
 
 
 async def ingest_markdown(
@@ -768,11 +761,13 @@ class KnowledgeIngestionRunner:
         concurrency: int = _DEFAULT_CONCURRENCY,
         recognizer: DocumentRecognizer | None = None,
         usage: IngestUsageRecorder | None = None,
+        figures: FigureDescriber | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
         self._recognizer = recognizer
         self._usage = usage
+        self._figures = figures
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -837,6 +832,7 @@ class KnowledgeIngestionRunner:
         token = current_tenant_id_var.set(tenant_id)
         renewer: asyncio.Task[None] | None = None
         claim: ClaimedIngestion | None = None
+        ready = False
         lost = asyncio.Event()
         owner = asyncio.current_task()
         try:
@@ -892,6 +888,7 @@ class KnowledgeIngestionRunner:
                     generation=claim.generation,
                     recognizer=self._recognizer,
                     usage=self._usage,
+                    figures=self._figures,
                 )
                 settled = await self._store.set_document_status(
                     tenant_id=tenant_id,
@@ -902,6 +899,7 @@ class KnowledgeIngestionRunner:
                 )
                 if not settled:
                     raise StaleIngestionError(document_id)
+                ready = True
                 logger.info(
                     "knowledge.ingest_ready document=%s chunks=%d", document_id, chunk_count
                 )
@@ -953,6 +951,8 @@ class KnowledgeIngestionRunner:
             )
         finally:
             await _stop_renewer(renewer)
+            if claim is not None and self._figures is not None:
+                await self._figures.tidy(claim, settled=ready)  # B-209 PR-2 originals
             current_tenant_id_var.reset(token)
 
     async def _run_reindex(

@@ -27,6 +27,7 @@ from control_plane.knowledge.ingestion import (
     ingest_document_bytes,
     renew_lease_periodically,
 )
+from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
 from control_plane.knowledge.usage import IngestUsageRecorder
 from expert_work.common.observability import expert_work_counter
@@ -72,6 +73,7 @@ class KnowledgeIngestRecoveryWorker:
         max_attempts: int,
         recognizer: DocumentRecognizer | None = None,
         usage: IngestUsageRecorder | None = None,
+        figures: FigureDescriber | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -80,6 +82,7 @@ class KnowledgeIngestRecoveryWorker:
         self._embedder = embedder
         self._recognizer = recognizer
         self._usage = usage
+        self._figures = figures
         self._interval_s = interval_s
         # One cycle claims at most ``concurrency`` documents and drives them
         # all at once — never more claims than can be worked, so no lease
@@ -190,6 +193,7 @@ class KnowledgeIngestRecoveryWorker:
             )
             _failed_terminal.inc()
             return True
+        ready = False
         try:
             chunk_count = await ingest_document_bytes(
                 store=self._store,
@@ -204,6 +208,7 @@ class KnowledgeIngestRecoveryWorker:
                 generation=claim.generation,
                 recognizer=self._recognizer,
                 usage=self._usage,
+                figures=self._figures,
             )
             settled = await self._store.set_document_status(
                 tenant_id=claim.tenant_id,
@@ -214,6 +219,7 @@ class KnowledgeIngestRecoveryWorker:
             )
             if not settled:
                 raise StaleIngestionError(claim.document_id)
+            ready = True
         except StaleIngestionError:
             # 重传 / 已被别的认领收尾 —— 本次驱动的结果作废,什么都不写。
             logger.info(
@@ -261,6 +267,10 @@ class KnowledgeIngestRecoveryWorker:
                 exc_info=True,
             )
             return False
+        finally:
+            if self._figures is not None:
+                # B-209 PR-2 (review H5): same tidy-up as the fast path.
+                await self._figures.tidy(claim, settled=ready)
         _recovered.inc()
         return True
 

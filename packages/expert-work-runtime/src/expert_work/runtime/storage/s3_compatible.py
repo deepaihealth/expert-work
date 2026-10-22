@@ -9,7 +9,7 @@ at construction time; no application code changes for migrations.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal
 
@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 #: S3 multipart 分片大小(spec § 4.2:常驻内存 ≤ 单分片;S3 硬下限 5 MiB,
 #: 10k 片上限 → 64 MiB x 10k = 640 GiB 单对象天花板,远超工作区配额量级)。
 _MULTIPART_PART_SIZE = 64 * 1024 * 1024
+#: Keys per ``DeleteObjects`` request (the S3 limit).
+_DELETE_BATCH = 1000
 
 
 class S3CompatibleObjectStore:
@@ -210,6 +212,20 @@ class S3CompatibleObjectStore:
         # S3 DeleteObject is idempotent — no error when key is absent —
         # matching the Protocol contract.
         await self._client.delete_object(Bucket=self._bucket, Key=key)
+
+    async def delete_many(self, keys: Sequence[str]) -> None:
+        """Delete ``keys`` with ``DeleteObjects``, 1,000 per request (the S3
+        limit). Idempotent like :meth:`delete`; a key the backend reports it
+        could not delete raises :class:`ObjectStoreError`."""
+        for start in range(0, len(keys), _DELETE_BATCH):
+            batch = [{"Key": key} for key in keys[start : start + _DELETE_BATCH]]
+            response = await self._client.delete_objects(
+                Bucket=self._bucket, Delete={"Objects": batch, "Quiet": True}
+            )
+            errors = response.get("Errors") or []
+            if errors:
+                msg = f"delete_objects failed for {len(errors)} keys (first: {errors[0]})"
+                raise ObjectStoreError(msg)
 
     async def list_prefix(self, prefix: str) -> list[str]:
         keys: list[str] = []

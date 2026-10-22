@@ -566,6 +566,12 @@ export interface TranslationKeys {
     pages_pending: string;
     pages_over_limit: string;
     pages_hint: string;
+    figures_described: string;
+    figures_failed: string;
+    figures_pending: string;
+    figures_hint: string;
+    figure_thumb_alt: string;
+    figure_unavailable: string;
     recognize: string;
     recognize_started: string;
     recognize_nothing: string;
@@ -3926,9 +3932,15 @@ const en: TranslationKeys = {
     pages_pending: "{{count}} pages waiting",
     pages_over_limit: "{{count}} pages over the limit",
     pages_hint: "This PDF has scanned pages. Pages that failed, wait for recognition or are over the page limit are not in the knowledge base yet; use Recognize (raise the platform page limit first for pages over it).",
+    figures_described: "{{count}} pictures described",
+    figures_failed: "{{count}} pictures failed",
+    figures_pending: "{{count}} pictures waiting",
+    figures_hint: "{{extracted}} pictures in this document: {{described}} described, {{filtered}} filtered (too small, repeated icons / logos), {{capped}} over the per-document limit, {{unsupported}} in a format that cannot be read, {{failed}} failed, {{pending}} waiting for a description model.",
+    figure_thumb_alt: "Original picture",
+    figure_unavailable: "Original not available",
     recognize: "Recognize",
-    recognize_started: "Recognition started: only the failed and waiting pages are sent to the model.",
-    recognize_nothing: "No page failed or waits for recognition.",
+    recognize_started: "Recognition started: only the failed and waiting pages and pictures are sent to a model.",
+    recognize_nothing: "No page or picture failed or waits for recognition.",
     upload_queue_unchanged: "Unchanged — not re-ingested",
     pending_previous_serving: "Previous version still in use",
     pending_nothing_serving: "New version pending, nothing in use yet",

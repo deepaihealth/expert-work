@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
@@ -87,6 +87,12 @@ class InMemoryObjectStore:
     async def delete(self, key: str) -> None:
         async with self._lock:
             self._objects.pop(key, None)
+
+    async def delete_many(self, keys: Sequence[str]) -> None:
+        """Delete ``keys`` in one call (S3 ``DeleteObjects``); idempotent."""
+        async with self._lock:
+            for key in keys:
+                self._objects.pop(key, None)
 
     async def list_prefix(self, prefix: str) -> list[str]:
         return sorted(k for k in self._objects if k.startswith(prefix))

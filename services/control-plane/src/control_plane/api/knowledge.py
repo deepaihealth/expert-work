@@ -33,6 +33,10 @@ from control_plane.api.knowledge_rerank_threshold import (
 from control_plane.audit import emit
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
+from control_plane.knowledge.recognition.figure_storage import (
+    confirmed_figure_ids,
+    delete_figures_quietly,
+)
 from control_plane.settings import Settings
 from control_plane.tenant_scope import (
     CrossTenant,
@@ -274,6 +278,10 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
         # B-209 —— 「已识别 N 页 · 失败 M 页 · 待识别 K 页」; null when not a PDF.
         "page_stats": document.page_stats.model_dump(mode="json")
         if document.page_stats is not None
+        else None,
+        # B-209 PR-2 —— 「已描述 N 张图」; null when ingested without figures.
+        "figure_stats": document.figure_stats.model_dump(mode="json")
+        if document.figure_stats is not None
         else None,
         "enabled": document.enabled,
         "created_at": _iso(document.created_at),
@@ -666,6 +674,10 @@ def build_knowledge_router() -> APIRouter:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         await store.delete_base(tenant_id=tenant_id, kb_id=base.id)
+        # B-209 PR-2 — the base's original figures go with it.
+        await delete_figures_quietly(
+            request.app.state.object_store, tenant_id=tenant_id, kb_id=base.id
+        )
         await _audit_write(
             audit,
             request,
@@ -797,9 +809,17 @@ def build_knowledge_router() -> APIRouter:
     ) -> Response:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
+        # B-209 PR-2 — its original figures go with it (keyed under its base).
+        document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
         deleted = await store.delete_document(tenant_id=tenant_id, document_id=document_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="document not found")
+        await delete_figures_quietly(
+            request.app.state.object_store,
+            tenant_id=tenant_id,
+            kb_id=document.kb_id if document is not None else base.id,
+            document_id=document_id,
+        )
         await _audit_write(
             audit,
             request,
@@ -860,10 +880,14 @@ def build_knowledge_router() -> APIRouter:
         base = await _require_base(store, tenant_id, name)
         document = await _require_redrivable(store, runner, tenant_id, base, document_id)
         assert runner is not None  # noqa: S101 — checked above
-        if document.page_stats is None or not document.page_stats.needs_recognition:
+        pages = document.page_stats
+        figures = document.figure_stats  # B-209 PR-2: pictures waiting / failed too
+        if not (pages is not None and pages.needs_recognition) and not (
+            figures is not None and figures.needs_description
+        ):
             raise HTTPException(
                 status_code=409,
-                detail="document has no page that failed, waits or is past the page limit",
+                detail="document has no page or picture that failed, waits or is past the limit",
             )
         reset = await _redrive(store, runner, tenant_id, base, document)
         await _audit_write(
@@ -875,8 +899,10 @@ def build_knowledge_router() -> APIRouter:
             details={
                 "kb": base.name,
                 "filename": document.filename,
-                "pages_failed": document.page_stats.pages_failed,
-                "pages_pending": document.page_stats.pages_pending,
+                "pages_failed": pages.pages_failed if pages is not None else 0,
+                "pages_pending": pages.pages_pending if pages is not None else 0,
+                "figures_failed": figures.failed if figures is not None else 0,
+                "figures_pending": figures.pending if figures is not None else 0,
             },
         )
         return JSONResponse(status_code=202, content=_document_dict(reset))
@@ -1004,9 +1030,18 @@ def build_knowledge_router() -> APIRouter:
                 offset=safe_offset,
                 limit=safe_limit,
             )
+        # B-209 PR-2 —— figures whose originals this document really has.
+        figure_ids = await confirmed_figure_ids(
+            request.app.state.object_store,
+            tenant_id=scope.tenant_id,
+            kb_id=base.id,
+            document_id=document_id,
+            contents=[c.content for c in chunks],
+        )
         return JSONResponse(
             content={
                 "chunks": [_chunk_dict(c) for c in chunks],
+                "figure_ids": figure_ids,
                 "total": total,
                 "offset": safe_offset,
                 "limit": safe_limit,

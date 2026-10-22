@@ -525,6 +525,17 @@ class Settings(BaseSettings):
     #: thread-safe): worker processes, and the per-document parse timeout.
     knowledge_parse_workers: int = Field(default=2, gt=0)
     knowledge_parse_timeout_s: int = Field(default=600, gt=0)
+    #: B-209 PR-2 (security review S-M1) —— address-space ceiling of one parse
+    #: worker (MiB, ``RLIMIT_AS``, Linux only; 0 = none): a document that needs
+    #: more fails its own parse instead of taking the pod down. Measured in the
+    #: control-plane image (2026-10-22): a worker's VmSize is ~0.3 GB idle and
+    #: ~4.5 GB after one parse (RSS ~0.55 GB; glibc per-thread arenas — 46
+    #: threads); with ``MALLOC_ARENA_MAX=2`` it is ~1.65 GB, which would allow a
+    #: much lower ceiling. The default leaves ~1.5 GB of headroom on the first.
+    knowledge_parse_worker_max_vm_mb: int = Field(default=6144, ge=0)
+    #: B-209 PR-2 (review H5) —— how often original figures of deleted documents
+    #: are swept from the object store (s3-compatible backend only).
+    knowledge_figure_reconcile_interval_s: int = Field(default=3600, gt=0)
 
     # ------------------------------------------------------------------ memory DLQ (K.K7)
     #: Stream K.K7 — how often the memory writeback DLQ worker scans

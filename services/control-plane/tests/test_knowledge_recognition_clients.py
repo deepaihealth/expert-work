@@ -105,6 +105,8 @@ async def test_layout_parsing_request_and_reply() -> None:
     assert reading.finish_reason is None
     # Text of the text-bearing blocks only (image region excluded, markup dropped).
     assert reading.layout_chars == len("##第二章") + len("员工请假") + len("年假")
+    # B-209 PR-2 (review H4): the frame the region boxes are measured in.
+    assert reading.layout_size == (1414, 2000)
     assert (reading.input_tokens, reading.output_tokens, reading.usage_reported) == (
         1180,
         212,
