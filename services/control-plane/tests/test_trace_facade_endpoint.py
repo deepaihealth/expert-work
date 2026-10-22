@@ -15,6 +15,7 @@ None)``), and exactly how other tests seed ``app.state.run_store`` /
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import threading
 import time
@@ -86,12 +87,16 @@ class _FakeTraceApi:
         self._delay = delay
         self.calls = 0
         self.request_options: list[Any] = []
+        #: ``(start, end)`` monotonic time of the last blocking sleep.
+        self.slept: tuple[float, float] | None = None
 
     def get(self, trace_id: str, *, request_options: Any = None) -> Any:
         self.calls += 1
         self.request_options.append(request_options)
         if self._delay:
+            start = time.monotonic()
             time.sleep(self._delay)  # the real SDK call is blocking HTTP
+            self.slept = (start, time.monotonic())
         if self._exc is not None:
             raise self._exc
         return self._trace
@@ -632,28 +637,42 @@ async def test_trace_raw_client_none_returns_404(trace_client: AsyncClient) -> N
 _BLOCKING_FETCH_S = 0.6
 
 
-async def _longest_loop_stall(request: Awaitable[httpx.Response]) -> tuple[httpx.Response, float]:
-    """Await ``request`` while a ticker on the same event loop records the
-    longest gap between two of its ticks (~10 ms when the loop is free)."""
+async def _loop_ticks_during_fetch(
+    request: Awaitable[httpx.Response], fetch: _FakeTraceApi
+) -> tuple[httpx.Response, int]:
+    """Await ``request`` while a ticker on the same event loop timestamps each
+    pass (~10 ms apart when the loop is free), and count the ticks that fall
+    inside ``fetch``'s blocking sleep. A fetch made on the loop thread holds
+    the loop for that whole sleep, so the count is then exactly 0 however busy
+    the machine is.
+
+    Automatic garbage collection is off meanwhile: a full collection stops
+    every thread, and in an xdist worker holding ~1M objects one took
+    0.2-0.45 s locally (126-191 of them per worker in one suite run). That is
+    what turned the earlier bound on the longest gap (< 0.3 s) red in 4 of 60
+    CI runs, at 0.80-0.91 s, with the endpoint already fetching in a thread."""
     done = asyncio.Event()
-    gaps: list[float] = []
+    ticks: list[float] = []
 
     async def tick() -> None:
-        last = time.monotonic()
         while not done.is_set():
             await asyncio.sleep(0.01)
-            now = time.monotonic()
-            gaps.append(now - last)
-            last = now
+            ticks.append(time.monotonic())
 
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
     ticker = asyncio.create_task(tick())
-    await asyncio.sleep(0)  # let the ticker take its first timestamp
+    await asyncio.sleep(0)  # start the ticker before the request
     try:
         response = await request
     finally:
         done.set()
         await asyncio.wait([ticker])
-    return response, max(gaps, default=0.0)
+        if gc_was_enabled:
+            gc.enable()
+    assert fetch.slept is not None, "the fetch never ran"
+    start, end = fetch.slept
+    return response, sum(start < at < end for at in ticks)
 
 
 @pytest.mark.asyncio
@@ -662,17 +681,17 @@ async def test_trace_fetch_does_not_block_the_event_loop(trace_client: AsyncClie
     thread_id = await _create_session(trace_client, headers)
     run_id = await _seed_run(trace_client, thread_id=thread_id, trace_id="trace-1")
     app = trace_client._transport.app  # type: ignore[attr-defined,union-attr]
-    app.state.langfuse_read_client = _FakeLangfuseClient(
-        trace=_fake_trace(), delay=_BLOCKING_FETCH_S
-    )
+    fake_client = _FakeLangfuseClient(trace=_fake_trace(), delay=_BLOCKING_FETCH_S)
+    app.state.langfuse_read_client = fake_client
 
-    resp, stall = await _longest_loop_stall(
-        trace_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}/trace", headers=headers)
+    resp, ticks = await _loop_ticks_during_fetch(
+        trace_client.get(f"/v1/sessions/{thread_id}/runs/{run_id}/trace", headers=headers),
+        fake_client.trace_api,
     )
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "ok"
-    assert stall < _BLOCKING_FETCH_S / 2
+    assert ticks > 0
 
 
 @pytest.mark.asyncio
@@ -681,21 +700,21 @@ async def test_trace_raw_fetch_does_not_block_the_event_loop(trace_client: Async
     thread_id = await _create_session(trace_client, headers)
     run_id = await _seed_run(trace_client, thread_id=thread_id, trace_id="trace-1")
     app = trace_client._transport.app  # type: ignore[attr-defined,union-attr]
-    app.state.langfuse_read_client = _FakeLangfuseClient(
-        trace=_fake_trace(), delay=_BLOCKING_FETCH_S
-    )
+    fake_client = _FakeLangfuseClient(trace=_fake_trace(), delay=_BLOCKING_FETCH_S)
+    app.state.langfuse_read_client = fake_client
 
-    resp, stall = await _longest_loop_stall(
+    resp, ticks = await _loop_ticks_during_fetch(
         trace_client.get(
             f"/v1/sessions/{thread_id}/runs/{run_id}/trace/raw",
             params={"span": "obs-1", "field": "output"},
             headers=headers,
-        )
+        ),
+        fake_client.trace_api,
     )
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["content"] == "hello"
-    assert stall < _BLOCKING_FETCH_S / 2
+    assert ticks > 0
 
 
 # ---------------------------------------------------------------------------
