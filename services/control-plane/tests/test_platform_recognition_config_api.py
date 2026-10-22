@@ -198,3 +198,15 @@ async def test_the_layout_parsing_model_is_never_offered_as_a_chat_model(
     names = {model["name"] for model in glm["models"]}
     assert "glm-ocr" not in names
     assert "glm-5.3" in names
+
+
+def test_only_chat_vision_models_describe_figures() -> None:
+    """B-206 K-7c — the figure-describing picker uses ``ModelEntry.chat_model``:
+    a vision-flagged embedding / rerank model is no figure describer."""
+    from control_plane.api.platform_recognition_config import _describes_figures
+    from expert_work.protocol import ModelEntry
+
+    assert _describes_figures(ModelEntry(name="vl", vision=True)) is True
+    assert _describes_figures(ModelEntry(name="vl-rerank", vision=True, rerank=True)) is False
+    assert _describes_figures(ModelEntry(name="vl-embed", vision=True, embeddings=True)) is False
+    assert _describes_figures(ModelEntry(name="text", vision=False)) is False

@@ -8,11 +8,11 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from control_plane.rerank_vendors import is_dashscope_rerank_model
 from control_plane.runtime import (
     DynamicResolvingEmbedder,
     DynamicResolvingReranker,
     ResolvingReranker,
-    _is_dashscope_rerank_model,
     resolve_reranker,
 )
 from expert_work.common.credentials import CredentialsResolverError
@@ -251,10 +251,10 @@ async def test_reranker_degrades_to_identity_when_unconfigured():
 
 
 def test_is_dashscope_rerank_model() -> None:
-    assert _is_dashscope_rerank_model("qwen", "qwen3-vl-rerank")
-    assert _is_dashscope_rerank_model("qwen", "gte-rerank-v2")
-    assert not _is_dashscope_rerank_model("qwen", "qwen-plus")  # chat model
-    assert not _is_dashscope_rerank_model("doubao", "doubao-rerank")  # only qwen/DashScope
+    assert is_dashscope_rerank_model("qwen", "qwen3-vl-rerank")
+    assert is_dashscope_rerank_model("qwen", "gte-rerank-v2")
+    assert not is_dashscope_rerank_model("qwen", "qwen-plus")  # chat model
+    assert not is_dashscope_rerank_model("doubao", "doubao-rerank")  # only qwen/DashScope
 
 
 @pytest.mark.asyncio
@@ -269,7 +269,7 @@ async def test_reranker_routes_dashscope_rerank_model_to_native_api(monkeypatch)
         async def rerank(self, *, model, query, documents, top_n):
             return {"output": {"results": [{"index": 1}, {"index": 0}]}}
 
-    monkeypatch.setattr("control_plane.runtime.HTTPDashScopeRerankClient", _FakeRerankClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FakeRerankClient)
 
     def _boom(*_a, **_k):
         raise AssertionError("LLM router (chat) path used for a native rerank model")
@@ -303,7 +303,7 @@ async def test_reranker_scored_keeps_the_native_api_scores(monkeypatch):
                 }
             }
 
-    monkeypatch.setattr("control_plane.runtime.HTTPDashScopeRerankClient", _FakeRerankClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FakeRerankClient)
     cfg = _Cfg()
     cfg.rerank = ("qwen", "qwen3-vl-rerank")
     rr = DynamicResolvingReranker(
@@ -327,7 +327,7 @@ async def test_resolving_rerankers_pass_the_task_instruction_to_the_native_api(m
             instructions.append(instruction)
             return {"output": {"results": [{"index": 0, "relevance_score": 0.5}]}}
 
-    monkeypatch.setattr("control_plane.runtime.HTTPDashScopeRerankClient", _FakeRerankClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FakeRerankClient)
     cfg = _Cfg()
     cfg.rerank = ("qwen", "qwen3-vl-rerank")
     dynamic = DynamicResolvingReranker(
@@ -416,7 +416,7 @@ async def test_both_resolving_rerankers_send_native_requests_through_the_guard(m
     async def _no_sleep(_delay: float) -> None:
         return None
 
-    monkeypatch.setattr("control_plane.runtime.HTTPDashScopeRerankClient", _FlakyClient)
+    monkeypatch.setattr("control_plane.rerank_vendors.HTTPDashScopeRerankClient", _FlakyClient)
     guards = RerankGuards(buckets=_buckets, sleep=_no_sleep)
     cfg = _Cfg()
     cfg.rerank = ("qwen", "qwen3-vl-rerank")

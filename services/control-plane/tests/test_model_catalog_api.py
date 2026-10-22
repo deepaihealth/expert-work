@@ -65,6 +65,18 @@ def test_lists_only_configured_enabled_providers_with_models() -> None:
     assert "deepseek-chat" not in names
 
 
+def test_every_row_says_whether_it_is_a_chat_model() -> None:
+    """B-206 K-7c — embedding and rerank rows stay listed (the rate-card page
+    reads them) but are flagged, so agent pickers leave them out."""
+    resp = _client({"glm"}).get("/v1/model-catalog")
+    glm = next(r for r in resp.json()["data"]["providers"] if r["provider"] == "glm")
+    flags = {m["name"]: m["chat_model"] for m in glm["models"]}
+    assert flags["glm-5.3"] is True
+    assert flags["embedding-3"] is False
+    assert flags["rerank"] is False
+    assert "glm-ocr" not in flags
+
+
 def test_empty_when_no_provider_configured() -> None:
     resp = _client(set()).get("/v1/model-catalog")
     assert resp.json()["data"]["providers"] == []

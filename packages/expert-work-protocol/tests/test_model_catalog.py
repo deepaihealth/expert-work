@@ -485,6 +485,18 @@ def test_declared_caps_match_b206_tables() -> None:
         score_scale="relative",
         rpm=600,
     )
+    # B-206 K-7c — table 5-B plus the 2026-10-22 live calls: 128 documents (129 is
+    # refused), query + documents within 128,000 characters (128,001 is refused),
+    # limits counted in characters, the raw logit asked for.
+    assert _e("glm", "rerank").rerank_caps == RerankCaps(
+        rerank_api="cohere_style",
+        max_documents=128,
+        max_doc_tokens=4_096,
+        max_total_tokens=128_000,
+        query_max_tokens=4_096,
+        length_unit="char",
+        score_scale="logit",
+    )
 
 
 def test_caps_only_on_entries_with_the_matching_flag() -> None:
@@ -648,6 +660,16 @@ def test_layout_parsing_model_is_not_a_chat_model() -> None:
     assert _e("glm", "glm-ocr").vision is False
     assert _e("qwen", "qwen3.7-flash").ocr_only is False
     assert ModelEntry(name="x").ocr_only is False
+
+
+def test_chat_model_excludes_embedding_rerank_and_recognition_only_models() -> None:
+    """B-206 K-7c — the one predicate every chat-model picker uses."""
+    assert _e("glm", "glm-5.3").chat_model is True
+    assert _e("qwen", "qwen3.7-flash").chat_model is True  # also reads scans
+    assert _e("glm", "embedding-3").chat_model is False
+    assert _e("glm", "rerank").chat_model is False
+    assert _e("qwen", "qwen3-vl-rerank").chat_model is False
+    assert _e("glm", "glm-ocr").chat_model is False
 
 
 def test_chat_vlm_ocr_caps_need_vision() -> None:

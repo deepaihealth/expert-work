@@ -74,6 +74,7 @@ describe("RowDetailResult rerank outcome (B-206 K-7)", () => {
   it.each([
     ["no_model", "ant-typography-secondary"],
     ["model_unavailable", "ant-typography-secondary"],
+    ["model_unsupported", "ant-typography-secondary"],
     ["rate_limited", "ant-typography-warning"],
     ["partial", "ant-typography-warning"],
   ] as const)(

@@ -324,6 +324,50 @@ describe("ModelSelect", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("offers only chat models: rerank / embedding rows flagged by the backend are left out (B-206 K-7c)", async () => {
+    const user = userEvent.setup();
+    const catalog: ModelCatalog = {
+      providers: [
+        {
+          provider: "glm",
+          models: [
+            {
+              name: "glm-5.3",
+              vision: false,
+              embeddings: false,
+              chat_model: true,
+              context_window: 1000000,
+              deprecated: false,
+            },
+            {
+              name: "rerank",
+              vision: false,
+              embeddings: false,
+              rerank: true,
+              chat_model: false,
+              context_window: null,
+              deprecated: false,
+            },
+            {
+              name: "embedding-3",
+              vision: false,
+              embeddings: true,
+              chat_model: false,
+              context_window: null,
+              deprecated: false,
+            },
+          ],
+        },
+      ],
+    };
+    render(<ModelSelect value={{ provider: "glm" }} catalog={catalog} onChange={vi.fn()} />);
+    const model = within(screen.getByTestId("model-select-name")).getByRole("combobox");
+    await user.click(model);
+    expect(await screen.findByText(optionContent("glm-5.3"))).toBeInTheDocument();
+    expect(screen.queryByText(optionContent("rerank"))).not.toBeInTheDocument();
+    expect(screen.queryByText(optionContent("embedding-3"))).not.toBeInTheDocument();
+  });
+
   // ---- Thinking-Toggle ----
 
   it("renders the thinking switch for a thinking-capable model, hidden otherwise", () => {

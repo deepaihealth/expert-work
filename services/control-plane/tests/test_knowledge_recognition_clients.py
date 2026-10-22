@@ -185,6 +185,8 @@ async def test_chat_vlm_reads_content_parts_and_length_finish() -> None:
         (429, {"error": {"code": "1303", "message": "频率过高"}}, True, False, "busy"),
         # 1113: account in arrears — waits for 「补识别」, no retry.
         (429, {"error": {"code": "1113", "message": "您的账户已欠费"}}, False, True, "quota"),
+        # 1308: a usage cap until its reset time — account state too (Zhipu 错误码 table).
+        (429, {"error": {"code": "1308", "message": "已达到使用上限"}}, False, True, "quota"),
         (429, {}, True, False, "busy"),
         (401, {"error": {"code": "1000", "message": "身份验证失败"}}, False, True, "auth"),
         (402, {}, False, True, "quota"),

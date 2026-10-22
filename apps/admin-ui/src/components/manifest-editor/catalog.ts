@@ -29,6 +29,17 @@ export function modelsFor(catalog: ModelCatalog, provider: string): CatalogModel
   return catalog.providers.find((p) => p.provider === provider)?.models ?? [];
 }
 
+/** B-206 K-7c — whether an agent can be built on ``model`` (see
+ *  ``CatalogModel.chat_model``). */
+export function isChatModel(model: CatalogModel): boolean {
+  return model.chat_model !== false;
+}
+
+/** ``provider``'s models an agent can be built on (see {@link isChatModel}). */
+export function chatModelsFor(catalog: ModelCatalog, provider: string): CatalogModel[] {
+  return modelsFor(catalog, provider).filter(isChatModel);
+}
+
 export function lookupModel(
   catalog: ModelCatalog,
   provider: string,

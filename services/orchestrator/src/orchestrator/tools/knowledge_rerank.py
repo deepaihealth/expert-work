@@ -14,8 +14,9 @@ Nothing here imports :mod:`orchestrator.llm`: the vendor-side guard
 
 from __future__ import annotations
 
+import math
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -30,16 +31,24 @@ from uuid import UUID
 #: the budget); ``model_error`` any other failure of the configured model (a
 #: refusal, a 5xx / timeout that retries did not clear, an empty or malformed
 #: answer, too little budget left to send a request); ``model_unavailable`` a
-#: model is configured but its credential could not be resolved; ``no_model``
-#: rerank was asked for but no rerank model is configured. In every case but
-#: ``ok`` and ``partial`` the search used the fused order. The score-threshold
-#: ladder will add its own values.
+#: model is configured but its credential could not be resolved;
+#: ``model_unsupported`` (B-206 K-7c) a model is configured whose rerank API the
+#: platform has no client for; ``no_model`` rerank was asked for but no rerank
+#: model is configured. In every case but ``ok`` and ``partial`` the search used
+#: the fused order. The score-threshold ladder will add its own values.
 RerankOutcome = Literal[
-    "ok", "partial", "rate_limited", "model_error", "model_unavailable", "no_model"
+    "ok",
+    "partial",
+    "rate_limited",
+    "model_error",
+    "model_unavailable",
+    "model_unsupported",
+    "no_model",
 ]
 
 #: The outcomes where the configured model was called and failed — what
-#: ``rerank_degraded`` reports. ``model_unavailable`` / ``no_model`` never called it.
+#: ``rerank_degraded`` reports. ``model_unavailable`` / ``model_unsupported`` /
+#: ``no_model`` never called it.
 RERANK_FAILED: frozenset[RerankOutcome] = frozenset({"rate_limited", "model_error"})
 
 #: The longest one search's rerank stage may take: every request of both views,
@@ -82,7 +91,14 @@ class RerankRanking(list[tuple[int, float | None]]):
     model's own: a reranker that had no model or credential to call, or got an
     answer it could not read, returns the input order with that outcome instead
     of raising (long-term memory recall shares the reranker and must not log a
-    failure for a deployment without rerank)."""
+    failure for a deployment without rerank).
+
+    ``logits`` (B-206 K-7c) — a model whose catalog ``score_scale`` is ``logit``
+    answers raw logits; every score in the ranking is then their
+    :func:`sigmoid`, in (0, 1), and ``logits`` keeps the raw logit behind each
+    (index → logit) so rankings can be merged or combined in logit space, where
+    a sigmoid's saturation near 1 does not hide differences. A score threshold
+    applies to the exposed (sigmoid) score. ``None`` for every other scale."""
 
     def __init__(
         self,
@@ -90,10 +106,12 @@ class RerankRanking(list[tuple[int, float | None]]):
         *,
         dropped: int = 0,
         outcome: RerankOutcome = "ok",
+        logits: Mapping[int, float] | None = None,
     ) -> None:
         super().__init__(ranked)
         self.dropped = dropped
         self.outcome: RerankOutcome = outcome
+        self.logits = logits
 
 
 def ranking_dropped(ranked: Sequence[tuple[int, float | None]]) -> int:
@@ -104,6 +122,51 @@ def ranking_dropped(ranked: Sequence[tuple[int, float | None]]) -> int:
 def ranking_outcome(ranked: Sequence[tuple[int, float | None]]) -> RerankOutcome:
     """How ``ranked`` came about (``ok`` for a plain list)."""
     return ranked.outcome if isinstance(ranked, RerankRanking) else "ok"
+
+
+def ranking_logits(ranked: Sequence[tuple[int, float | None]]) -> Mapping[int, float] | None:
+    """The raw logits behind ``ranked``'s scores (see :class:`RerankRanking`)."""
+    return ranked.logits if isinstance(ranked, RerankRanking) else None
+
+
+def sigmoid(logit: float) -> float:
+    """The logistic function, without overflow for a very negative ``logit``."""
+    if logit >= 0:
+        return 1.0 / (1.0 + math.exp(-logit))
+    tail = math.exp(logit)
+    return tail / (1.0 + tail)
+
+
+def weighted_views(
+    top: Sequence[int],
+    titled: Sequence[tuple[int, float | None]],
+    body: Sequence[tuple[int, float | None]],
+    weight: float,
+    *,
+    dropped: int,
+) -> RerankRanking:
+    """``top`` (the titled view's indices; ``body`` rows are positions in
+    ``top``) ranked by ``weight`` x the titled score + the rest x the body score.
+
+    Scores from a logit-scale model (both views carry ``logits``) are combined
+    as logits and exposed as the sigmoid of the combination: averaging
+    sigmoids lets one saturated view outweigh real evidence in the other (a
+    titled logit of 16 with a body logit of 0 would lose to 4 and 4). Callers
+    pass views whose every row is scored."""
+    titled_logits, body_logits = ranking_logits(titled), ranking_logits(body)
+    if titled_logits is not None and body_logits is not None:
+        first = {i: titled_logits[i] for i in top}
+        second = {top[j]: logit for j, logit in body_logits.items() if j < len(top)}
+    else:
+        first = {i: score for i, score in titled if score is not None}
+        second = {top[j]: score for j, score in body if score is not None}
+    combined = {i: weight * first[i] + (1 - weight) * second[i] for i in top}
+    order = sorted(top, key=lambda i: (-combined[i], i))
+    if titled_logits is None or body_logits is None:
+        return RerankRanking(((i, combined[i]) for i in order), dropped=dropped)
+    return RerankRanking(
+        ((i, sigmoid(combined[i])) for i in order), dropped=dropped, logits=combined
+    )
 
 
 @runtime_checkable

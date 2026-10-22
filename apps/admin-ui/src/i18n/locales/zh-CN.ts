@@ -617,6 +617,7 @@ const zhCN: TranslationKeys = {
     rerank_outcome_rate_limited: "重排模型限流，本次结果按召回顺序排列。",
     rerank_outcome_model_error: "重排模型调用失败，本次结果按召回顺序排列。",
     rerank_outcome_model_unavailable: "重排模型的凭据不可用，本次结果按召回顺序排列。",
+    rerank_outcome_model_unsupported: "当前重排模型平台暂不支持调用，本次结果按召回顺序排列。",
     rerank_outcome_no_model: "平台没有配置重排模型，本次结果按召回顺序排列。",
     settings_title: "检索设置",
     settings_saved: "设置已保存。",

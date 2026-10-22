@@ -13,8 +13,8 @@ import { useTranslation } from "react-i18next";
 import type { ModelCatalog } from "../../../api/model_catalog";
 import type { ModelFields } from "../form_model";
 import {
+  chatModelsFor,
   lookupModel,
-  modelsFor,
   providerNames,
   thinkingCannotFullyDisable,
 } from "../catalog";
@@ -49,10 +49,11 @@ export function ModelSelect({
   const allProviders = catalog ? providerNames(catalog) : [];
   const providers =
     catalog && visionOnly
-      ? allProviders.filter((p) => modelsFor(catalog, p).some((m) => m.vision))
+      ? allProviders.filter((p) => chatModelsFor(catalog, p).some((m) => m.vision))
       : allProviders;
+  // B-206 K-7c — embedding / rerank models are listed by the catalog but no agent model.
   const allModels =
-    catalog && value.provider ? modelsFor(catalog, value.provider) : [];
+    catalog && value.provider ? chatModelsFor(catalog, value.provider) : [];
   const models = visionOnly ? allModels.filter((m) => m.vision) : allModels;
 
   function onProvider(provider: string): void {

@@ -34,6 +34,7 @@ from orchestrator.llm import (
     KIMI_BASE_URL,
     QWEN_BASE_URL,
 )
+from orchestrator.llm.providers.openai_compatible import GLM_ACCOUNT_429_CODES
 
 #: Layout-parsing endpoints by provider (only Zhipu offers one today).
 LAYOUT_PARSING_URLS: Mapping[str, str] = {
@@ -81,11 +82,6 @@ _ERROR_BODY_LIMIT = 300
 _RETRY_BASE_S = 0.5
 _RETRY_CAP_S = 8.0
 _RETRIES = 3
-
-#: Zhipu 429 codes that are account state, not load: 1113 = 余额不足 / 欠费,
-#: 1304 = 当日调用次数用完. Any other 429 (1302 并发过高, 1303 频率过高, …) is load
-#: and retried.
-_ACCOUNT_429_CODES = frozenset({"1113", "1304"})
 
 #: Layout block labels that are not text (their area holds no characters).
 _NON_TEXT_LABELS = frozenset({"image", "figure", "chart", "seal"})
@@ -197,7 +193,8 @@ def _status_error(response: httpx.Response) -> RecognitionCallError:
     if status == 402:
         return RecognitionCallError(message, kind="quota")
     if status == 429:
-        if _vendor_error_code(response) in _ACCOUNT_429_CODES:
+        # Zhipu 429 codes that are account state, not load (shared with B-206 rerank).
+        if _vendor_error_code(response) in GLM_ACCOUNT_429_CODES:
             return RecognitionCallError(message, kind="quota")
         return RecognitionCallError(message, kind="busy")
     if status == 408 or status >= 500:

@@ -74,7 +74,7 @@ def _reads_pages(entry: ModelEntry) -> bool:
 
 
 def _describes_figures(entry: ModelEntry) -> bool:
-    return entry.vision and not entry.ocr_only and not entry.embeddings and not entry.rerank
+    return entry.vision and entry.chat_model
 
 
 def _options(configured: set[str], fits: Callable[[ModelEntry], bool]) -> list[dict[str, str]]:

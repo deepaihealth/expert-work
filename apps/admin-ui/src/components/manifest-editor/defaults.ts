@@ -29,6 +29,7 @@
  * default existing on new agents).
  */
 import { parseYaml } from "./yaml";
+import { isChatModel } from "./catalog";
 import type { CatalogModel, ModelCatalog } from "../../api/model_catalog";
 
 export const BASE_MANIFEST_YAML = `apiVersion: expert_work.io/v1
@@ -89,7 +90,7 @@ interface FirstChat {
 
 function firstChatModel(catalog: ModelCatalog): FirstChat | null {
   for (const p of catalog.providers) {
-    const chat = p.models.find((m) => !m.embeddings && !m.deprecated);
+    const chat = p.models.find((m) => !m.embeddings && isChatModel(m) && !m.deprecated);
     if (chat) return { provider: p.provider, model: chat };
   }
   return null;

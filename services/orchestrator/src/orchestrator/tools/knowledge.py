@@ -43,6 +43,7 @@ from orchestrator.tools.knowledge_rerank import (
     ranking_dropped,
     ranking_outcome,
     rerank_budget,
+    weighted_views,
 )
 from orchestrator.tools.knowledge_rerank import Reranker as Reranker
 from orchestrator.tools.knowledge_rerank import RerankRanking as RerankRanking
@@ -293,7 +294,7 @@ class _Reranked:
 
 #: B-206 K-7a —— outcomes that are a deployment's configuration, not a failure.
 _CONFIGURATION_STATES: frozenset[RerankOutcome | None] = frozenset(
-    {"no_model", "model_unavailable"}
+    {"no_model", "model_unavailable", "model_unsupported"}
 )
 
 
@@ -715,12 +716,7 @@ async def _two_view_order(
     body_score = {top[j]: score for j, score in body_view if score is not None}
     if len(body_score) < len(top):
         return _titled_only(top, dropped, "answered without scores")
-    combined = {
-        i: _TITLED_VIEW_WEIGHT * titled_score[i] + (1 - _TITLED_VIEW_WEIGHT) * body_score[i]
-        for i in top
-    }
-    order = sorted(top, key=lambda i: (-combined[i], i))
-    return RerankRanking(((i, combined[i]) for i in order), dropped=dropped)
+    return weighted_views(top, titled, body_view, _TITLED_VIEW_WEIGHT, dropped=dropped)
 
 
 def _titled_only(top: Sequence[int], dropped: int, why: str) -> RerankRanking:

@@ -9,6 +9,7 @@ export type RerankOutcome =
   | "rate_limited"
   | "model_error"
   | "model_unavailable"
+  | "model_unsupported"
   | "no_model";
 
 export type RerankFallback = Exclude<RerankOutcome, "ok">;
@@ -18,6 +19,7 @@ const RERANK_FALLBACKS: readonly string[] = [
   "rate_limited",
   "model_error",
   "model_unavailable",
+  "model_unsupported",
   "no_model",
 ];
 
@@ -30,8 +32,15 @@ export function rerankFallbackOf(value: unknown): RerankFallback | null {
     : null;
 }
 
-/** B-206 K-7a — no rerank model, or no credential for it, is how the
- *  deployment is set up (``info``); everything else is a failure (``warning``). */
+const CONFIGURATION_STATES: readonly RerankFallback[] = [
+  "no_model",
+  "model_unavailable",
+  "model_unsupported",
+];
+
+/** B-206 K-7a — no rerank model, no credential for it, or (K-7c) a model the
+ *  platform has no client for is how the deployment is set up (``info``);
+ *  everything else is a failure (``warning``). */
 export function rerankNoticeTone(fallback: RerankFallback): "info" | "warning" {
-  return fallback === "no_model" || fallback === "model_unavailable" ? "info" : "warning";
+  return CONFIGURATION_STATES.includes(fallback) ? "info" : "warning";
 }

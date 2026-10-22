@@ -11,6 +11,12 @@ export interface CatalogModel {
   name: string;
   vision: boolean;
   embeddings: boolean;
+  // B-206 K-7c — a rerank model (offered in the platform rerank settings).
+  rerank?: boolean;
+  // B-206 K-7c — the backend's verdict that this model can hold a conversation
+  // (not an embedding / rerank / recognition-only model). Agent model pickers
+  // offer only these; absent (an older backend) = offered, as before.
+  chat_model?: boolean;
   context_window: number | null;
   deprecated: boolean;
   // Thinking-Toggle — the vendor's runtime thinking-control shape (null = no

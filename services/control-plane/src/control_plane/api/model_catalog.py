@@ -60,8 +60,12 @@ def build_model_catalog_router() -> APIRouter:
             {
                 "provider": p,
                 # B-209: a layout-parsing recognition model (glm-ocr) is no agent model.
+                # B-206 K-7c: embedding / rerank rows stay (the rate-card page lists
+                # them) and say they are not chat models — the agent pickers filter.
                 "models": [
-                    m.model_dump(mode="json") for m in models_for_provider(p) if not m.ocr_only
+                    m.model_dump(mode="json") | {"chat_model": m.chat_model}
+                    for m in models_for_provider(p)
+                    if not m.ocr_only
                 ],
             }
             for p in PROVIDER_CATALOG
