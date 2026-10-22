@@ -148,7 +148,7 @@ async def _run_retrieval(args: argparse.Namespace) -> None:
     reranker = None
     arms = resolve_arms(args.arms)
     if any(cfg.rerank for cfg in arms.values()):
-        from orchestrator.tools.knowledge import LLMReranker
+        from orchestrator.tools.llm_reranker import LLMReranker
 
         llm_caller, _judge = _build_llm(args)
         reranker = LLMReranker(llm_caller=llm_caller)

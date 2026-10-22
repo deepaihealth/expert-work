@@ -784,3 +784,16 @@ PY
 - [x] **43.1 检索测试返回新字段**:判据:响应里有 `embedding_degraded: false`、`rerank_dropped: 0`,`rerank_degraded: false`。**没修好时**:没有这两个字段。 **10-22 测试 `f4a075a54` 过**:临时库 16 段,三次「混合」检索 `status=ok`、`candidates=16`、三个标记都为 false / 0。
 - [x] **43.2 重排候选加到 100 后耗时正常**:「混合」+ 重排同一库查 3 次,中位数不超过 5 秒。说明:候选数本身没有真栈观测点,由单测(默认 dual/100 给带标题视图 min(融合数, 100) 条、`--rerank-pool 50` 逐字节复现改前请求)与开发集 A/B 覆盖。 **10-22 测试 `f4a075a54` 过**:897 / 966 / 1028 ms,中位 966 ms(库只有 16 段,候选不到 100;PR3 基线 1508 ms 是 69 段库)。
 - [x] **43.3 查询嵌入失败降级关键词**:不在测试环境真触发(要弄坏平台嵌入配置,影响共用测试环境);由单测覆盖(6 种厂商 / 网络故障降级、未配置 / 代码错 / 畸形返回体照旧报错,变异自证)。42.10 的一轮里 4 次检索都没有 `embedding_degraded`。
+
+## §45 B-206 第 1 步续:K-6 工具说明(#1901)+ K-7a 重排限速 / 重试 / 结果状态
+
+**背景**:#1901 —— `knowledge_search` 的工具说明末尾加了「小而准的多次检索、找全题搜到没有新文档为止、下结论前逐条核对」一段(只在绑了知识库的智能体上出现)。K-7a —— 每次重排 HTTP 请求先从全局桶取额度:按模型目录 `rpm` 均匀间隔、不攒突发(`qwen3-vl-rerank` 600 RPM = 每 100 ms 一次;目录没写 `rpm` 的模型不限速、只靠并发上限 + 429 重试);有 Redis 时多副本共用,键 `rl:llm:rerank:{provider}:{model}:{secret_ref}`,桶时间改读 Redis `TIME`(同一段 Lua 也给 B-44 的 LLM 限速用);同模型并发上限;429 / 5xx / 超时 / 阿里 400 `Throttling*` `InternalError*` 退避重试(限流后首次至少等 1 s,上限 8 s,最多 3 次);一次检索两个视图共用 10 秒等待上限,剩余不足 1 s 不再发请求;一个视图失败保留另一个视图的顺序(`partial`),都失败才退回融合顺序;记忆召回单独 2.5 秒上限;新增 `rerank_outcome`(`ok / partial / rate_limited / model_error / model_unavailable / no_model`),检索测试页与轨迹面板在非 `ok` 时显示提示(没配模型 / 密钥缺失是提示样式,真失败是警告样式)。厂商探针(10-22,¥0.125):超限回 HTTP 429 `Throttling.RateQuota`,不带 Retry-After,按 RPM/60 每秒限。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时库 + 临时智能体;「检索测试」或 `POST /v1/knowledge/bases/{name}/test`;Redis 是阿里云托管实例(`EXPERT_WORK_QUOTA_REDIS_URL`),从控制面 pod 里 `kubectl exec` 跑一段 Python 只读 `SCAN MATCH rl:llm:rerank:*`(连接串从 pod 环境变量取,不打印)。
+
+- [ ] **45.1 K-6 说明只在绑库智能体出现**:绑了临时库的智能体跑一轮,轨迹里 `knowledge_search` 的工具说明含「several small, targeted searches」;没绑库的智能体工具列表里没有 `knowledge_search`。**没修好时**:绑库智能体的说明里没有这段。
+- [ ] **45.2 检索测试正常时状态为 ok**:「混合」+ 重排查一次,响应 `rerank_outcome: "ok"`、`rerank_degraded: false`,页面不出提示。**没修好时**:响应没有 `rerank_outcome` 字段。
+- [ ] **45.3 全局额度桶生效、匀速不触发限流**:连续发 20 次检索测试(并发 5),Redis 里出现 `rl:llm:rerank:*` 键;全部 `rerank_outcome: "ok"`;控制面日志这段时间 **`rerank.retry` 0 行**、`rerank_failed` / `rerank_partial` 0 行(每次检索 2 次重排,40 次请求按 100 ms 匀速排队约 4 秒,不该吃到 429)。**没修好时**:没有该键;或结果虽然 ok 但日志里有 `rerank.retry`(说明限速放多了、靠重试兜回来)。
+- [ ] **45.4 未配置重排模型时显示 no_model**:单测已覆盖;真栈只在平台本来就没配重排的租户上看(不去改共用配置):若有,响应 `rerank_outcome: "no_model"`、页面提示「平台没有配置重排模型，本次结果按召回顺序排列。」(提示样式)。没有这样的租户就标「不适用」。
+- [ ] **45.5 限流 / 出错退回融合顺序**:不在测试环境真触发(要压爆共用账号额度);由单测覆盖(每种可重试状态的退避序列、不可重试 4xx 不重试、10 秒上限两视图共用、超时归类,K-7a 与审查修复两轮变异自证,桶容量 / 间隔有专门断言)。
+- [ ] **45.6 Redis 读 `TIME` 后 LLM 限速照常**:发测试后跑一轮智能体对话 + 45.3,控制面与编排日志 **`rate_limit.redis_degraded` 0 行**(这段 Lua 改成读 Redis 服务器时钟,阿里云 Redis 若不认会退回各副本本地桶并打这条警告);`rl:llm:*` 下 LLM 的桶键照常更新。**没修好时**:出现 `rate_limit.redis_degraded ... error=ResponseError`。

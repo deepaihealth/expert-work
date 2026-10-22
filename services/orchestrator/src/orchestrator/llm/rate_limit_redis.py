@@ -27,8 +27,14 @@ own retry formula agreed with, so write them down): capacity and tokens are
 pre-scaled on the Python side. ``test_rate_limit_redis_integration.py``
 runs the script against a clock to pin this.
 
+Clock (B-206 K-7a): the script reads Redis ``TIME`` unless the limiter was
+given a ``clock`` (tests), whose reading then travels as ``now_ms``. Every
+replica stamping its own wall clock let their skew move the shared bucket — at
+a 100 ms rerank spacing tens of ms of skew are a real share of the interval.
+
 Degradation: any Redis failure — connection, timeout, malformed reply —
-flips **this bucket** to the local PROD-12 bucket and logs one warning;
+flips **this bucket** to a local bucket holding this replica's share
+(:func:`~orchestrator.llm.rate_limit.replica_share`) and logs one warning;
 Redis is re-probed after :attr:`RedisRpmLimiter.REPROBE_S` and recovery
 logs once. An LLM call never fails because Redis is down: the worst case is
 exactly the pre-波2 behaviour.
@@ -52,7 +58,7 @@ from orchestrator.llm.rate_limit import (
     DEFAULT_TIME_PERIOD_S,
     AdmissionLimiter,
     RateLimiterFactory,
-    effective_rpm,
+    replica_share,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,7 +70,8 @@ _WHITESPACE = re.compile(r"\s")
 _BUCKET_TTL_MS = 30 * 86_400 * 1_000
 
 # KEYS[1] = bucket key
-# ARGV: 1=capacity (requests) 2=refill_per_s (requests/s) 3=now_ms 4=ttl_ms
+# ARGV: 1=capacity (requests) 2=refill_per_s (requests/s) 3=now_ms (negative =
+# read Redis TIME) 4=ttl_ms
 # Returns {allowed (0/1), retry_after_ms}. Cost is always one request.
 _LUA_ACQUIRE_SOURCE = """\
 -- expert-work provider RPM bucket (波 2 线 A)
@@ -72,6 +79,10 @@ local b = redis.call('HMGET', KEYS[1], 'tokens', 'last_ms')
 local cap = tonumber(ARGV[1])
 local refill_per_s = tonumber(ARGV[2])
 local now_ms = tonumber(ARGV[3])
+if now_ms < 0 then
+  local t = redis.call('TIME')
+  now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+end
 local ttl_ms = tonumber(ARGV[4])
 local tokens = tonumber(b[1]) or cap
 local last_ms = tonumber(b[2]) or now_ms
@@ -115,7 +126,7 @@ class RedisRpmLimiter:
         bucket_key: str,
         rate_limit_rpm: int,
         time_period_s: float = DEFAULT_TIME_PERIOD_S,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if rate_limit_rpm <= 0:
@@ -126,11 +137,14 @@ class RedisRpmLimiter:
         self._key = bucket_key
         self._capacity = rate_limit_rpm
         self._refill_per_s = rate_limit_rpm / time_period_s
-        # Fallback = the pre-波2 per-process bucket, replica division included.
-        self._local = AsyncLimiter(
-            max_rate=effective_rpm(rate_limit_rpm), time_period=time_period_s
-        )
-        self._clock = clock
+        # Fallback = this replica's share in a per-process bucket (PROD-12's
+        # division; B-206 K-7a: a stretched spacing below one request per period).
+        local_rate, local_period_s = replica_share(rate_limit_rpm, time_period_s)
+        self._local = AsyncLimiter(max_rate=local_rate, time_period=local_period_s)
+        # ``None`` = the script reads Redis TIME (see the module docstring); the
+        # local clock still times the degraded bucket's re-probe.
+        self._stamp_clock = clock
+        self._clock = clock or time.time
         self._sleep = sleep
         self._lua_sha: str | None = None
         # Wall-clock time at which a degraded bucket re-probes Redis; ``None``
@@ -181,10 +195,11 @@ class RedisRpmLimiter:
             await self._sleep(max(retry_ms, 1) / 1000.0)
 
     async def _eval(self) -> tuple[bool, int]:
+        now_ms = -1 if self._stamp_clock is None else round(self._stamp_clock() * 1000)
         argv = [
             str(self._capacity),
             repr(self._refill_per_s),
-            str(round(self._clock() * 1000)),
+            str(now_ms),
             str(_BUCKET_TTL_MS),
         ]
         result: Any

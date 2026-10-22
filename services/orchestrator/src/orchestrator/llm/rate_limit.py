@@ -34,6 +34,8 @@ between the 2nd and 3rd call; it refills at 1 token per 30s.
 from __future__ import annotations
 
 import logging
+import math
+import os
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -62,22 +64,36 @@ DEFAULT_TIME_PERIOD_S = 60.0
 _REPLICA_COUNT_ENV = "EXPERT_WORK_REPLICA_COUNT"
 
 
-def effective_rpm(rate_limit_rpm: int) -> int:
-    """Per-replica RPM share: ``ceil(rpm / replicas)``, floor 1.
+def replica_count() -> int:
+    """``EXPERT_WORK_REPLICA_COUNT``, floor 1.
 
     读环境变量而不是构造期快照:测试可 monkeypatch;错误值(非整数 / <1)
     按 1 处理并不抛 —— 限流配置错不该让 Agent 构建失败。
     """
-    import math
-    import os
-
     raw = os.environ.get(_REPLICA_COUNT_ENV, "1")
     try:
-        replicas = max(1, int(raw))
+        return max(1, int(raw))
     except ValueError:
         logger.warning("rate_limit.bad_replica_count value=%r treated_as=1", raw)
-        replicas = 1
-    return max(1, math.ceil(rate_limit_rpm / replicas))
+        return 1
+
+
+def effective_rpm(rate_limit_rpm: int) -> int:
+    """Per-replica RPM share: ``ceil(rpm / replicas)``, floor 1."""
+    return max(1, math.ceil(rate_limit_rpm / replica_count()))
+
+
+def replica_share(per_period: int, period_s: float) -> tuple[int, float]:
+    """One replica's share of ``per_period`` requests every ``period_s``, as
+    ``(per_period, period_s)`` for its per-process bucket: PROD-12's
+    :func:`effective_rpm` division over the same period while that is at least
+    one request; below it, one request every ``period_s * replicas /
+    per_period`` seconds (B-206 K-7a — a one-token, evenly spaced rerank bucket
+    used to stay one token per replica, N times the configured rate)."""
+    replicas = replica_count()
+    if per_period >= replicas:
+        return math.ceil(per_period / replicas), period_s
+    return 1, period_s * replicas / per_period
 
 
 class AdmissionLimiter(Protocol):

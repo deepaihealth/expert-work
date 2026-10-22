@@ -8,6 +8,7 @@
  */
 import { useCallback, useState } from "react";
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -31,6 +32,11 @@ import {
   type RetrievalTestResult,
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
+import {
+  rerankFallbackOf,
+  rerankNoticeTone,
+  type RerankFallback,
+} from "../../api/rerank_outcome";
 import { HeadingPath } from "./HeadingPath";
 
 const { Text, Paragraph } = Typography;
@@ -69,6 +75,8 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
   const [rerank, setRerank] = useState<boolean>(config?.rerank_enabled ?? true);
 
   const [results, setResults] = useState<RetrievalTestResult[] | null>(null);
+  // B-206 K-7 —— 重排没定顺序(退回召回顺序)时的原因;重排正常 / 没开 → null。
+  const [rerankFallback, setRerankFallback] = useState<RerankFallback | null>(null);
   const [running, setRunning] = useState(false);
 
   const run = useCallback(async () => {
@@ -87,6 +95,7 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
         readScope,
       );
       setResults(response.results);
+      setRerankFallback(rerankFallbackOf(response.rerank_outcome));
     } catch (err) {
       const detail =
         err instanceof ApiError && err.status === 503
@@ -176,6 +185,15 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
         </Space>
       </Space>
 
+      {results !== null && rerankFallback !== null && (
+        <Alert
+          type={rerankNoticeTone(rerankFallback)}
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={t(`knowledge_page.rerank_outcome_${rerankFallback}`)}
+          data-testid="kb-test-rerank-outcome"
+        />
+      )}
       {results === null ? (
         <Empty description={t("knowledge_page.test_empty_hint")} />
       ) : results.length === 0 ? (

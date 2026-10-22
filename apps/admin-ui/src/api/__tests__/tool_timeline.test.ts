@@ -186,6 +186,46 @@ describe("parseToolCalls artifact.vl_usage (B-203)", () => {
   });
 });
 
+describe("parseToolCalls artifact.rerank_outcome (B-206 K-7)", () => {
+  it("lifts a knowledge search's rerank fallback into rerankOutcome", () => {
+    const events = [
+      updates("agent", [aiCall("k1", "knowledge_search", { query: "q" })]),
+      updates("tools", [
+        toolResultWithArtifact("k1", "[doc.md#0] ...", {
+          hits: 3,
+          status: "ok",
+          rerank_degraded: true,
+          rerank_outcome: "rate_limited",
+        }),
+      ]),
+    ];
+    expect(parseToolCalls(events)[0].rerankOutcome).toBe("rate_limited");
+  });
+
+  it("lifts a partly completed rerank (K-7a)", () => {
+    const events = [
+      updates("agent", [aiCall("k1", "knowledge_search", { query: "q" })]),
+      updates("tools", [
+        toolResultWithArtifact("k1", "[doc.md#0] ...", { hits: 3, rerank_outcome: "partial" }),
+      ]),
+    ];
+    expect(parseToolCalls(events)[0].rerankOutcome).toBe("partial");
+  });
+
+  it("leaves rerankOutcome unset for ok, missing or unknown values", () => {
+    const events = [
+      updates("agent", [aiCall("k1", "knowledge_search", {}), aiCall2("k2", "knowledge_search", {})]),
+      updates("tools", [
+        toolResultWithArtifact("k1", "a", { hits: 1, status: "ok", rerank_outcome: "ok" }),
+        toolResultWithArtifact("k2", "b", { hits: 1, status: "ok", rerank_outcome: "something_new" }),
+      ]),
+    ];
+    const [a, b] = parseToolCalls(events);
+    expect(a.rerankOutcome).toBeUndefined();
+    expect(b.rerankOutcome).toBeUndefined();
+  });
+});
+
 describe("parseToolCalls artifact.trigger_id (Spec 1 PR4 Task 4)", () => {
   it("reads triggerId from the ToolMessage artifact (manage_task create)", () => {
     const events = [

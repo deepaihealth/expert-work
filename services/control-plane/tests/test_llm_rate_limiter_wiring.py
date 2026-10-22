@@ -14,6 +14,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from aiolimiter import AsyncLimiter
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -252,6 +253,9 @@ class _FakeLLMReranker:
     async def rerank(self, **_kw: Any) -> list[int]:
         return [0]
 
+    async def ranked(self, **_kw: Any) -> list[tuple[int, float | None]]:
+        return [(0, None)]
+
 
 @pytest.mark.asyncio
 async def test_dynamic_reranker_llm_branch_passes_factory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -355,3 +359,39 @@ def test_without_quota_redis_url_no_factory_is_wired() -> None:
     app = create_app(settings=settings, jwt_verifier=build_test_jwt_verifier())
     with TestClient(app):
         assert app.state.llm_rate_limiter_factory is None
+
+
+def _rerank_pace(app: Any) -> Any:
+    """The pacing bucket the app's knowledge reranker gives qwen3-vl-rerank."""
+    reranker = app.state.knowledge_retriever.reranker
+    assert isinstance(reranker, DynamicResolvingReranker)
+    guarded = reranker.rerank_guards.wrap(
+        object(),  # type: ignore[arg-type]
+        provider="qwen",
+        model="qwen3-vl-rerank",
+        secret_ref="secret://x",
+    )
+    return guarded.pace
+
+
+def test_quota_redis_url_gives_rerank_pacing_the_global_bucket() -> None:
+    """B-206 K-7 — the native rerank branch is paced from the Redis bucket, so
+    every replica shares one model + credential's per-second rate."""
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        single_instance=False,
+        quota_redis_url="redis://localhost:6379/0",
+        apikey_rate_limit_hmac_salt="test-hmac-salt",
+    )
+    app = create_app(settings=settings, jwt_verifier=build_test_jwt_verifier())
+    with TestClient(app):
+        pace = _rerank_pace(app)
+        assert isinstance(pace, RedisRpmLimiter)
+        assert pace.bucket_key == "rl:llm:rerank:qwen:qwen3-vl-rerank:secret://x"
+
+
+def test_without_quota_redis_url_rerank_pacing_is_per_process() -> None:
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    app = create_app(settings=settings, jwt_verifier=build_test_jwt_verifier())
+    with TestClient(app):
+        assert isinstance(_rerank_pace(app), AsyncLimiter)

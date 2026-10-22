@@ -101,6 +101,7 @@ from orchestrator.llm import (
     HTTPEmbeddingClient,
     OpenAICompatibleEmbedder,
     RateLimiterFactory,
+    RerankGuards,
 )
 from orchestrator.llm.embedder import (
     EmbeddingSide,
@@ -141,6 +142,7 @@ from orchestrator.tools import (
     WorkspaceLock,
     WorkspaceStore,
 )
+from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
 from orchestrator.trajectory.recorder import TrajectoryRecorder
 from orchestrator.usage_metering import (
     MeteredLLMCaller,
@@ -1193,6 +1195,12 @@ def _instruction_kwargs(instruction: str | None) -> dict[str, Any]:
     return {} if instruction is None else {"instruction": instruction}
 
 
+def _unranked(documents: Sequence[str], top_k: int, outcome: RerankOutcome) -> RerankRanking:
+    """B-206 K-7 —— 没有可调的重排模型:原样顺序、不打分,并说明原因
+    (检索据此报 ``rerank_outcome``)。"""
+    return RerankRanking(((i, None) for i in range(min(len(documents), top_k))), outcome=outcome)
+
+
 def _metered_rerank(router: LLMCaller, provider: str, model: str) -> LLMCaller:
     """B-104 —— 重排序的 LLM 分支:run 内(``ScopedReranker`` 放了记账身份)套记账,
     记 ``platform_overhead``、记在调用它的 agent 名下;run 外(检索测试接口等)原样。"""
@@ -1223,6 +1231,9 @@ class ResolvingReranker:
     #: B-44 ② — global provider RPM bucket factory for the LLM-rerank branch,
     #: same as :class:`DynamicResolvingReranker`. ``None`` = per-process bucket.
     rate_limiter_factory: RateLimiterFactory | None = None
+    #: B-206 K-7 — pacing / concurrency / retry for the native rerank branch; the
+    #: control plane passes its process-wide one, the default is this instance's own.
+    rerank_guards: RerankGuards = field(default_factory=RerankGuards)
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -1257,7 +1268,7 @@ class ResolvingReranker:
                 self.provider,
                 tenant_id,
             )
-            return [(index, None) for index in range(min(len(documents), top_k))]
+            return _unranked(documents, top_k, "model_unavailable")
         t1 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("resolve_ms", round((t1 - t0) * 1000))
@@ -1266,9 +1277,13 @@ class ResolvingReranker:
                 self.secret_cache, self.secret_store, tenant_id, secret_ref
             )
             span.set_attribute("secret_ms", round((time.monotonic() - t1) * 1000))
-            return await DashScopeReranker(
-                client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=self.model
-            ).rerank_scored(
+            client = self.rerank_guards.wrap(
+                HTTPDashScopeRerankClient(api_key=api_key, http=self.http),
+                provider=self.provider,
+                model=self.model,
+                secret_ref=secret_ref,
+            )
+            return await DashScopeReranker(client=client, model=self.model).rerank_scored(
                 query=query,
                 documents=documents,
                 top_k=top_k,
@@ -1287,10 +1302,10 @@ class ResolvingReranker:
             rate_limiter_factory=self.rate_limiter_factory,
         )
         caller = _metered_rerank(router, self.provider, self.model)
-        order = await LLMReranker(llm_caller=caller).rerank(
+        # B-206 K-7a —— 聊天模型排序失败会原样返回输入顺序,``ranked`` 把它标成 model_error。
+        return await LLMReranker(llm_caller=caller).ranked(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
-        return [(index, None) for index in order]
 
 
 @dataclass(frozen=True)
@@ -1397,6 +1412,8 @@ class DynamicResolvingReranker:
     #: 波 2 线 A — global provider RPM bucket factory for the LLM-rerank
     #: branch (a real vendor call). ``None`` = per-process bucket.
     rate_limiter_factory: RateLimiterFactory | None = None
+    #: B-206 K-7 — see :attr:`ResolvingReranker.rerank_guards`.
+    rerank_guards: RerankGuards = field(default_factory=RerankGuards)
 
     async def rerank(
         self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
@@ -1426,7 +1443,7 @@ class DynamicResolvingReranker:
         cfg = await self.config_service.effective_rerank_config()
         t1 = time.monotonic()
         if cfg is None:
-            return [(index, None) for index in range(min(len(documents), top_k))]
+            return _unranked(documents, top_k, "no_model")
         provider, model = cfg
         try:
             secret_ref = await self.resolver.resolve_provider(
@@ -1438,7 +1455,7 @@ class DynamicResolvingReranker:
                 provider,
                 tenant_id,
             )
-            return [(index, None) for index in range(min(len(documents), top_k))]
+            return _unranked(documents, top_k, "model_unavailable")
         t2 = time.monotonic()
         span = trace.get_current_span()
         span.set_attribute("config_ms", round((t1 - t0) * 1000))
@@ -1448,9 +1465,13 @@ class DynamicResolvingReranker:
                 self.secret_cache, self.secret_store, tenant_id, secret_ref
             )
             span.set_attribute("secret_ms", round((time.monotonic() - t2) * 1000))
-            return await DashScopeReranker(
-                client=HTTPDashScopeRerankClient(api_key=api_key, http=self.http), model=model
-            ).rerank_scored(
+            client = self.rerank_guards.wrap(
+                HTTPDashScopeRerankClient(api_key=api_key, http=self.http),
+                provider=provider,
+                model=model,
+                secret_ref=secret_ref,
+            )
+            return await DashScopeReranker(client=client, model=model).rerank_scored(
                 query=query,
                 documents=documents,
                 top_k=top_k,
@@ -1469,10 +1490,10 @@ class DynamicResolvingReranker:
             rate_limiter_factory=self.rate_limiter_factory,
         )
         caller = _metered_rerank(router, provider, model)
-        order = await LLMReranker(llm_caller=caller).rerank(
+        # B-206 K-7a —— 聊天模型排序失败会原样返回输入顺序,``ranked`` 把它标成 model_error。
+        return await LLMReranker(llm_caller=caller).ranked(
             query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
         )
-        return [(index, None) for index in order]
 
 
 async def resolve_embedder(
@@ -1508,10 +1529,12 @@ async def resolve_reranker(
     model: str,
     supported_providers: Sequence[Provider],
     rate_limiter_factory: RateLimiterFactory | None = None,
+    rerank_guards: RerankGuards | None = None,
 ) -> Reranker | None:
     """Build the per-tenant credential-resolving reranker (Stream J.5 +
     Mini-ADR O-9). ``provider`` not in ``supported_providers`` → ``None``
-    (no rerank pass; hybrid search returns the RRF-fused order)."""
+    (no rerank pass; hybrid search returns the RRF-fused order).
+    ``rerank_guards`` (B-206 K-7a) is the process's; ``None`` = the reranker's own."""
     if provider not in supported_providers:
         return None
     return ResolvingReranker(
@@ -1520,6 +1543,7 @@ async def resolve_reranker(
         provider=provider,
         model=model,
         rate_limiter_factory=rate_limiter_factory,
+        rerank_guards=rerank_guards if rerank_guards is not None else RerankGuards(),
     )
 
 

@@ -13,12 +13,14 @@ from control_plane.runtime import (
     DynamicResolvingReranker,
     ResolvingReranker,
     _is_dashscope_rerank_model,
+    resolve_reranker,
 )
 from expert_work.common.credentials import CredentialsResolverError
 from expert_work.protocol import ModelEntry
 from expert_work.protocol.model_catalog import EmbeddingCaps
 from orchestrator.errors import AgentFactoryError
-from orchestrator.llm import DEFAULT_MAX_INPUT_BYTES
+from orchestrator.llm import DEFAULT_MAX_INPUT_BYTES, RerankCallError, RerankGuards
+from orchestrator.tools.knowledge import RerankRanking
 
 
 class _Cfg:
@@ -242,6 +244,10 @@ async def test_reranker_degrades_to_identity_when_unconfigured():
     )
     out = await rr.rerank(query="q", documents=["a", "b", "c"], top_k=2, tenant_id=uuid4())
     assert out == [0, 1]  # identity order, no error
+    # B-206 K-7 — and the search learns why.
+    scored = await rr.rerank_scored(query="q", documents=["a", "b"], top_k=2, tenant_id=uuid4())
+    assert isinstance(scored, RerankRanking)
+    assert scored.outcome == "no_model"
 
 
 def test_is_dashscope_rerank_model() -> None:
@@ -357,3 +363,138 @@ async def test_reranker_degrades_to_identity_when_credential_missing():
         query="q", documents=["a", "b", "c"], top_k=2, tenant_id=uuid4()
     )
     assert scored == [(0, None), (1, None)]  # no scores: the retriever keeps this order
+    # B-206 K-7 — a configured model whose credential is missing, for both rerankers.
+    static = ResolvingReranker(
+        resolver=_RaisingResolver(),
+        secret_store=_SecretStore(),
+        provider="qwen",
+        model="qwen3-vl-rerank",
+    )
+    for reranker in (rr, static):
+        ranked = await reranker.rerank_scored(
+            query="q", documents=["a"], top_k=1, tenant_id=uuid4()
+        )
+        assert isinstance(ranked, RerankRanking)
+        assert ranked.outcome == "model_unavailable"
+
+
+class _Bucket:
+    def __init__(self) -> None:
+        self.taken = 0
+
+    async def __aenter__(self) -> None:
+        self.taken += 1
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_both_resolving_rerankers_send_native_requests_through_the_guard(monkeypatch):
+    """B-206 K-7 — the DashScope branch is paced from the model's bucket (keyed
+    by the model and the credential reference, never the key) and retried on a
+    429 by the vendor-neutral guard, for the dynamic and the static reranker."""
+    built: list[tuple[str, int]] = []
+    shared = _Bucket()
+
+    def _buckets(*, bucket: str, rpm: int) -> _Bucket:
+        built.append((bucket, rpm))
+        return shared
+
+    calls: list[int] = []
+
+    class _FlakyClient:
+        def __init__(self, **_kw):
+            pass
+
+        async def rerank(self, *, model, query, documents, top_n):
+            calls.append(1)
+            if len(calls) % 2 == 1:
+                raise RerankCallError("429", failure="rate_limited", status=429)
+            return {"output": {"results": [{"index": 0, "relevance_score": 0.5}]}}
+
+    async def _no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("control_plane.runtime.HTTPDashScopeRerankClient", _FlakyClient)
+    guards = RerankGuards(buckets=_buckets, sleep=_no_sleep)
+    cfg = _Cfg()
+    cfg.rerank = ("qwen", "qwen3-vl-rerank")
+    dynamic = DynamicResolvingReranker(
+        config_service=cfg, resolver=_Resolver(), secret_store=_SecretStore(), rerank_guards=guards
+    )
+    static = ResolvingReranker(
+        resolver=_Resolver(),
+        secret_store=_SecretStore(),
+        provider="qwen",
+        model="qwen3-vl-rerank",
+        rerank_guards=guards,
+    )
+    for reranker in (dynamic, static):
+        out = await reranker.rerank_scored(query="q", documents=["a"], top_k=1, tenant_id=uuid4())
+        assert out == [(0, 0.5)]
+    assert len(calls) == 4  # each reranker: a 429, then its retry
+    assert shared.taken == 4  # every request, retries included, took a token
+    # One bucket for the model + credential, shared by both rerankers, at the catalog's 600 RPM.
+    assert built == [("rl:llm:rerank:qwen:qwen3-vl-rerank:secret://qwen", 600)]
+
+
+class _DownChatModel:
+    async def __call__(self, **_kwargs):
+        raise RuntimeError("chat model down")
+
+
+@pytest.mark.asyncio
+async def test_the_chat_model_rerank_branch_says_when_it_fell_back(monkeypatch):
+    """B-206 K-7a (M7) — the chat-model reranker swallows a failure and returns
+    the input order; the search must not report that as the model's ranking.
+    Long-term memory's plain ``rerank`` keeps its list of indices."""
+
+    async def _router(*_args, **_kwargs):
+        return _DownChatModel()
+
+    monkeypatch.setattr("control_plane.runtime.build_llm_router", _router)
+    cfg = _Cfg()
+    cfg.rerank = ("anthropic", "claude-haiku-4-5")  # a chat model → the LLM branch
+    dynamic = DynamicResolvingReranker(
+        config_service=cfg, resolver=_Resolver(), secret_store=_SecretStore()
+    )
+    static = ResolvingReranker(
+        resolver=_Resolver(),
+        secret_store=_SecretStore(),
+        provider="anthropic",
+        model="claude-haiku-4-5",
+    )
+    for reranker in (dynamic, static):
+        ranked = await reranker.rerank_scored(
+            query="q", documents=["a", "b"], top_k=2, tenant_id=uuid4()
+        )
+        assert isinstance(ranked, RerankRanking)
+        assert (list(ranked), ranked.outcome) == ([(0, None), (1, None)], "model_error")
+        plain = await reranker.rerank(query="q", documents=["a", "b"], top_k=2, tenant_id=uuid4())
+        assert plain == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_resolve_reranker_passes_the_process_guards_through():
+    """B-206 K-7a (L7)."""
+    guards = RerankGuards()
+    reranker = await resolve_reranker(
+        resolver=_Resolver(),
+        secret_store=_SecretStore(),
+        provider="qwen",
+        model="qwen3-vl-rerank",
+        supported_providers=["qwen"],
+        rerank_guards=guards,
+    )
+    assert isinstance(reranker, ResolvingReranker)
+    assert reranker.rerank_guards is guards
+
+
+def test_rerankers_holding_the_guards_stay_hashable():
+    """B-206 K-7a (L5) — frozen dataclasses hash their fields."""
+    cfg = _Cfg()
+    dynamic = DynamicResolvingReranker(
+        config_service=cfg, resolver=_Resolver(), secret_store=_SecretStore()
+    )
+    assert isinstance(hash(dynamic), int)

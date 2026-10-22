@@ -47,8 +47,8 @@ from orchestrator.tools.knowledge import (
     RERANK_DOC_MAX_CHARS,
     RERANK_INSTRUCTION,
     RerankRanking,
-    _parse_rerank_order,
 )
+from orchestrator.tools.llm_reranker import _parse_rerank_order
 from orchestrator.tools.rerank_passage import rerank_passage
 from orchestrator.usage_metering import ScopedReranker, UsageIdentity
 

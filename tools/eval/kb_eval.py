@@ -1507,7 +1507,7 @@ def build_reranker(enabled: bool) -> Reranker | None:
         OpenAICompatCaller,
     )
 
-    from orchestrator.tools.knowledge import LLMReranker
+    from orchestrator.tools.llm_reranker import LLMReranker
 
     caller = OpenAICompatCaller(
         api_key=os.environ["EXPERT_WORK_EVAL_LLM_API_KEY"],

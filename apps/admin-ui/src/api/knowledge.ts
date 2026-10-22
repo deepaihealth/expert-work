@@ -11,6 +11,9 @@
  * to the caller's home tenant as before.
  */
 import { apiClient, withTenantScope, type TenantScope } from "./client";
+import type { RerankOutcome } from "./rerank_outcome";
+
+export type { RerankOutcome } from "./rerank_outcome";
 
 /** Document ingestion lifecycle — mirrors the backend ``DocumentStatus``. */
 export type DocumentStatus = "pending" | "processing" | "ready" | "failed";
@@ -171,6 +174,8 @@ export interface RetrievalTestResponse {
   query: string;
   results: RetrievalTestResult[];
   count: number;
+  /** B-206 K-7 — ``null`` when the search asked for no rerank. */
+  rerank_outcome?: RerankOutcome | null;
 }
 
 /** Update payload — only supplied keys are applied; ``null`` clears a

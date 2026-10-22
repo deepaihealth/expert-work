@@ -553,7 +553,12 @@ from expert_work.runtime.secret_store import SecretStore, make_secret_store
 from expert_work.runtime.storage import make_object_store
 from expert_work.runtime.tokens import warm_default_estimator
 from orchestrator import MemoryEnv
-from orchestrator.llm import RateLimiterFactory, make_redis_rate_limiter_factory
+from orchestrator.llm import (
+    RateLimiterFactory,
+    RerankGuards,
+    make_redis_rate_limiter_factory,
+    redis_pacing_buckets,
+)
 from orchestrator.tools import (
     AgentSandboxClient,
     HTTPSupervisorRuntime,
@@ -1364,6 +1369,9 @@ def create_app(
             # 连接方式与本文件其它 Redis 消费者一致;Redis 故障在限流器内部
             # 降级为进程内桶,不会让 LLM 调用失败。
             llm_rate_limiter_factory: RateLimiterFactory | None = None
+            # B-206 K-7 —— 重排请求的按秒限流 / 并发上限 / 退避重试,进程内一份;有 Redis
+            # 时限流桶同样走全局桶(所有副本共用一个模型 + 凭据的桶)。
+            rerank_guards = RerankGuards()
             if resolved_settings.quota_redis_url:
                 import redis.asyncio as redis_async
 
@@ -1374,6 +1382,7 @@ def create_app(
                 )
                 stack.push_async_callback(llm_rate_limit_redis.aclose)
                 llm_rate_limiter_factory = make_redis_rate_limiter_factory(llm_rate_limit_redis)
+                rerank_guards = RerankGuards(buckets=redis_pacing_buckets(llm_rate_limit_redis))
             _app.state.llm_rate_limiter_factory = llm_rate_limiter_factory
             # 二期 PR2 T3 — process-level secret-value cache(LRU 256 / TTL
             # 300s,plan 拍定值 = 类默认参数)。embed / rerank / aux / judge
@@ -1772,6 +1781,7 @@ def create_app(
                     secret_cache=credential_value_cache,
                     # 波 2 线 A — the LLM-rerank branch is a real vendor call.
                     rate_limiter_factory=llm_rate_limiter_factory,
+                    rerank_guards=rerank_guards,
                 )
                 knowledge_retriever = make_knowledge_retriever(
                     store=resolved_knowledge_store, embedder=embedder, reranker=reranker

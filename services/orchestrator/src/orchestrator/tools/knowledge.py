@@ -18,18 +18,14 @@ rerank pass fixes ordering precision. See ``STREAM-J-DESIGN.md`` § 12.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 import httpx
-from langchain_core.messages import HumanMessage, SystemMessage
 
-from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.search.rrf import weighted_rrf_fuse_scored
 from expert_work.persistence import KnowledgeStore
 from expert_work.protocol import (
@@ -39,13 +35,25 @@ from expert_work.protocol import (
     chunk_retrieval_text,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
+from orchestrator.tools.knowledge_rerank import (
+    RERANK_FAILED,
+    RerankError,
+    RerankOutcome,
+    current_rerank_budget,
+    ranking_dropped,
+    ranking_outcome,
+    rerank_budget,
+)
+from orchestrator.tools.knowledge_rerank import Reranker as Reranker
+from orchestrator.tools.knowledge_rerank import RerankRanking as RerankRanking
+from orchestrator.tools.knowledge_rerank import ScoredReranker as ScoredReranker
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.rerank_passage import rerank_passage
 
 if TYPE_CHECKING:
     # Imported under TYPE_CHECKING only — a runtime import of
     # ``orchestrator.llm`` here would cycle (llm → tools.registry → tools).
-    from orchestrator.llm import Embedder, LLMCaller
+    from orchestrator.llm import Embedder
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +66,6 @@ _MIN_RECALL_DEPTH = 50
 #: 100 documents per request). A model's own per-request cap is applied by its
 #: reranker, from the model catalog (B-206 K-14).
 _MAX_RERANK_CANDIDATES = 100
-#: Each candidate is truncated to this many characters in the rerank
-#: prompt — enough to judge relevance without an enormous prompt.
-_RERANK_DOC_CHARS = 600
 #: ``knowledge_search`` result-count default + hard cap.
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 20
@@ -187,64 +192,6 @@ def rerank_documents(texts: Iterable[str]) -> list[str]:
     return [text[:RERANK_DOC_MAX_CHARS] for text in texts]
 
 
-@runtime_checkable
-class Reranker(Protocol):
-    """Reorders retrieval candidates by judged relevance to a query.
-
-    Stream O (Mini-ADR O-9) — ``tenant_id`` lets a credential-resolving
-    reranker pick the per-tenant API key at call time. Implementations
-    without per-tenant keys accept and ignore it. A resolving reranker
-    that finds no credential degrades to the fused order (rerank is
-    optional), so it is *not* gated at mode-switch time."""
-
-    async def rerank(
-        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
-    ) -> list[int]:
-        """Return the indices of the ``top_k`` most relevant ``documents``,
-        most relevant first. Indices are positions in ``documents``."""
-
-
-class RerankRanking(list[tuple[int, float | None]]):
-    """A scoring reranker's ranking that also says how many of the documents it
-    was handed it never judged (B-206 K-14): the trailing ones its model's
-    per-request cap, or a vendor size refusal, left out. A plain list from a
-    reranker means it judged them all."""
-
-    def __init__(
-        self, ranked: Iterable[tuple[int, float | None]] = (), *, dropped: int = 0
-    ) -> None:
-        super().__init__(ranked)
-        self.dropped = dropped
-
-
-def _dropped(ranked: Sequence[tuple[int, float | None]]) -> int:
-    return ranked.dropped if isinstance(ranked, RerankRanking) else 0
-
-
-@runtime_checkable
-class ScoredReranker(Protocol):
-    """A :class:`Reranker` that can also say how relevant each document is.
-
-    ``instruction`` (B-206 K-14) is a task statement for a model that takes one;
-    a reranker whose model takes none ignores it. Callers pass it only when they
-    have one, so a scoring reranker written before it existed keeps working. A
-    reranker that judges only some of the documents returns a
-    :class:`RerankRanking` saying how many it left out."""
-
-    async def rerank_scored(
-        self,
-        *,
-        query: str,
-        documents: Sequence[str],
-        top_k: int,
-        tenant_id: UUID,
-        instruction: str | None = None,
-    ) -> list[tuple[int, float | None]]:
-        """Like :meth:`Reranker.rerank`, each index paired with its relevance
-        score: ``None`` throughout when the backend ranks without scoring (a
-        chat-model reranker) or rerank was skipped."""
-
-
 @dataclass(frozen=True)
 class RetrievedChunk:
     """A retrieved chunk with its source document attribution.
@@ -296,7 +243,10 @@ class KnowledgeSearchOutcome:
     applied to — the reranker's output, not the recall depth (``0`` for
     ``no_bases`` / ``no_hits``). ``rerank_degraded`` is set
     when the reranker failed or answered with nothing and the fused order was
-    used instead — then no threshold applied either. ``embedding_degraded``
+    used instead — then no threshold applied either. ``rerank_outcome`` (B-206
+    K-7) says how the rerank ended (:data:`RerankOutcome`; ``None`` when none was
+    asked for or there was nothing to rerank): ``rerank_degraded`` is exactly its
+    failure values, ``rate_limited`` / ``model_error``. ``embedding_degraded``
     (B-206 K-8) is set when the query could not be embedded and every base was
     searched by keywords alone.
     ``rerank_dropped`` (B-206 K-14) counts candidates the reranker was handed
@@ -310,6 +260,7 @@ class KnowledgeSearchOutcome:
     rerank_degraded: bool = False
     embedding_degraded: bool = False
     rerank_dropped: int = 0
+    rerank_outcome: RerankOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -327,62 +278,29 @@ class _Reranked:
     """The rerank stage's output: chunks best first — at least ``limit`` of them
     when there are that many, more when the reranker scored more, so a
     threshold that drops some can still fill ``limit`` — each one's rerank score
-    when the reranker gave one, whether rerank fell back, and how many
-    candidates it never judged."""
+    when the reranker gave one, how many candidates it never judged, and how
+    the rerank ended (``None`` when it was not asked for)."""
 
     chunks: list[KnowledgeChunk]
     scores: Mapping[UUID, float]
-    degraded: bool = False
     dropped: int = 0
+    outcome: RerankOutcome | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return self.outcome in RERANK_FAILED
+
+
+#: B-206 K-7a —— outcomes that are a deployment's configuration, not a failure.
+_CONFIGURATION_STATES: frozenset[RerankOutcome | None] = frozenset(
+    {"no_model", "model_unavailable"}
+)
 
 
 def default_recall_depth(limit: int) -> int:
     """Production per-path recall depth for a ``limit``-result search:
     ``2 x limit`` clamped to [50, 100] (100 = the reranker's per-request cap)."""
     return max(_MIN_RECALL_DEPTH, min(_RECALL_DEPTH_FACTOR * limit, _MAX_RERANK_CANDIDATES))
-
-
-@dataclass(frozen=True)
-class LLMReranker:
-    """LLM-backed :class:`Reranker` — reuses an :class:`LLMCaller`.
-
-    A cheap, dependency-free reranker: the LLM is asked to rank the
-    candidates and reply with their numbers. A response it cannot parse
-    falls back to the input order, so a flaky rerank never breaks search.
-    """
-
-    llm_caller: LLMCaller
-
-    async def rerank(
-        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
-    ) -> list[int]:
-        del tenant_id  # fixed-key reranker — credential baked into llm_caller
-        if not documents:
-            return []
-        listing = "\n\n".join(
-            f"[{i + 1}] {doc[:_RERANK_DOC_CHARS]}" for i, doc in enumerate(documents)
-        )
-        prompt = [
-            SystemMessage(
-                content=(
-                    "You rank documents by relevance to a query. Reply with "
-                    "ONLY a JSON array of the document numbers, most relevant "
-                    "first, e.g. [3, 1, 5]. Include only genuinely relevant "
-                    "documents."
-                )
-            ),
-            HumanMessage(content=f"Query: {query}\n\nDocuments:\n{listing}"),
-        ]
-        try:
-            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "rerank"):
-                response = await self.llm_caller(messages=prompt, tools=[])
-            order = _parse_rerank_order(_message_text(response), len(documents))
-        except Exception:
-            logger.warning("knowledge.rerank_failed — using fused order", exc_info=True)
-            order = []
-        if not order:
-            order = list(range(len(documents)))
-        return order[:top_k]
 
 
 @dataclass(frozen=True)
@@ -564,6 +482,7 @@ class KnowledgeRetriever:
                 rerank_degraded=ranked.degraded,
                 embedding_degraded=degraded,
                 rerank_dropped=ranked.dropped,
+                rerank_outcome=ranked.outcome,
             )
         scores = _SubScores(
             vector=vector_score,
@@ -579,6 +498,7 @@ class KnowledgeRetriever:
             rerank_degraded=ranked.degraded,
             embedding_degraded=degraded,
             rerank_dropped=ranked.dropped,
+            rerank_outcome=ranked.outcome,
         )
 
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
@@ -626,27 +546,55 @@ class KnowledgeRetriever:
         enabled: bool,
     ) -> _Reranked:
         if self.reranker is None or not enabled:
-            return _Reranked(chunks=fused[:limit], scores={})
+            return _Reranked(
+                chunks=fused[:limit], scores={}, outcome="no_model" if enabled else None
+            )
         # Cut after fusion: several bases (and an explicit recall_limit) can fuse
         # into more than the pool; a reranker whose model takes fewer per request
         # keeps the leading ones.
         candidates = fused[: self.rerank_pool]
-        try:
-            ranked = await self._order(self.reranker, query, candidates, limit, tenant_id=tenant_id)
-        except Exception:
-            # Rerank is an optional quality pass (B-175 wave 2 PR3): a vendor
-            # error used to surface as a tool error / console 500.
-            logger.warning("knowledge.rerank_failed — using the fused order", exc_info=True)
-            return _Reranked(chunks=fused[:limit], scores={}, degraded=True)
+        # K-7 —— both views' requests share one time budget (queueing + retries).
+        with rerank_budget() as budget:
+            try:
+                ranked = await self._order(
+                    self.reranker, query, candidates, limit, tenant_id=tenant_id
+                )
+            except Exception as exc:
+                # Rerank is an optional quality pass (B-175 wave 2 PR3): a vendor
+                # error used to surface as a tool error / console 500.
+                failed: RerankOutcome = (
+                    exc.outcome if isinstance(exc, RerankError) else "model_error"
+                )
+                logger.warning(
+                    "knowledge.rerank_failed outcome=%s attempts=%d — using the fused order",
+                    failed,
+                    budget.attempts,
+                    exc_info=True,
+                )
+                return _Reranked(chunks=fused[:limit], scores={}, outcome=failed)
         if not ranked:
             # An empty answer for a non-empty candidate list is a rerank fault,
             # not "nothing relevant" — that is the threshold's call.
-            logger.warning("knowledge.rerank_empty — using the fused order")
-            return _Reranked(chunks=fused[:limit], scores={}, degraded=True)
+            logger.warning(
+                "knowledge.rerank_empty outcome=model_error attempts=%d — using the fused order",
+                budget.attempts,
+            )
+            return _Reranked(chunks=fused[:limit], scores={}, outcome="model_error")
+        outcome = ranking_outcome(ranked)
+        if outcome not in ("ok", "partial"):  # ``partial`` was logged by the dual view
+            # The reranker had nothing to call, or could not read its answer: the
+            # input order came back, which is the fused order.
+            logger.log(
+                logging.INFO if outcome in _CONFIGURATION_STATES else logging.WARNING,
+                "knowledge.rerank_fallback outcome=%s attempts=%d — using the fused order",
+                outcome,
+                budget.attempts,
+            )
         return _Reranked(
             chunks=[candidates[i] for i, _score in ranked],
             scores={candidates[i].id: score for i, score in ranked if score is not None},
-            dropped=_dropped(ranked),
+            dropped=ranking_dropped(ranked),
+            outcome=outcome,
         )
 
     async def _order(
@@ -734,9 +682,11 @@ async def _two_view_order(
     its scores (``None`` when it gave none) when the titled view is not fully
     scored, or when no candidate it would judge has a title (chunks ingested
     before titles were stored — both views are then the same text, so the
-    titled score is on the weighted scale). When only the body view comes back
-    without scores, the titled order is kept with no scores: titled-only scores
-    run higher than the weighted ones a threshold is calibrated on."""
+    titled score is on the weighted scale). When the body view fails or comes
+    back without scores, the titled order is kept with no scores — titled-only
+    scores run higher than the weighted ones a threshold is calibrated on — and
+    marked ``partial`` (B-206 K-7a: the titled view's paid-for ranking is not
+    thrown away for the fused order)."""
     titled = await reranker.rerank_scored(
         query=query,
         documents=rerank_documents(chunk.retrieval_text for chunk in candidates),
@@ -749,20 +699,41 @@ async def _two_view_order(
     if len(titled_score) < len(top) or all(
         body == candidates[i].retrieval_text for i, body in zip(top, bodies, strict=True)
     ):
-        return RerankRanking(titled, dropped=_dropped(titled))
-    body_view = await reranker.rerank_scored(
-        query=query, documents=rerank_documents(bodies), top_k=len(bodies), tenant_id=tenant_id
-    )
-    dropped = _dropped(titled) + _dropped(body_view)
+        return RerankRanking(
+            titled, dropped=ranking_dropped(titled), outcome=ranking_outcome(titled)
+        )
+    try:
+        body_view = await reranker.rerank_scored(
+            query=query,
+            documents=rerank_documents(bodies),
+            top_k=len(bodies),
+            tenant_id=tenant_id,
+        )
+    except RerankError as exc:
+        return _titled_only(top, ranking_dropped(titled), f"failed ({exc})")
+    dropped = ranking_dropped(titled) + ranking_dropped(body_view)
     body_score = {top[j]: score for j, score in body_view if score is not None}
     if len(body_score) < len(top):
-        return RerankRanking(((i, None) for i in top), dropped=dropped)
+        return _titled_only(top, dropped, "answered without scores")
     combined = {
         i: _TITLED_VIEW_WEIGHT * titled_score[i] + (1 - _TITLED_VIEW_WEIGHT) * body_score[i]
         for i in top
     }
     order = sorted(top, key=lambda i: (-combined[i], i))
     return RerankRanking(((i, combined[i]) for i in order), dropped=dropped)
+
+
+def _titled_only(top: Sequence[int], dropped: int, why: str) -> RerankRanking:
+    """The titled view's order, unscored and ``partial``: the body view
+    ``why``. Logged here, once per search, with the search's attempts."""
+    budget = current_rerank_budget()
+    logger.warning(
+        "knowledge.rerank_partial outcome=partial attempts=%d — the body view %s; "
+        "keeping the titled view's order",
+        budget.attempts if budget is not None else 0,
+        why,
+    )
+    return RerankRanking(((i, None) for i in top), dropped=dropped, outcome="partial")
 
 
 def _clears_floor(
@@ -845,6 +816,8 @@ class KnowledgeSearchTool:
             meta["embedding_degraded"] = True
         if outcome.rerank_dropped:
             meta["rerank_dropped"] = outcome.rerank_dropped
+        if outcome.rerank_outcome not in (None, "ok"):
+            meta["rerank_outcome"] = outcome.rerank_outcome
         if outcome.status == "below_threshold":
             return ToolResult(
                 content=(
@@ -873,29 +846,6 @@ class KnowledgeSearchTool:
         return raw.strip()
 
 
-def _parse_rerank_order(text: str, count: int) -> list[int]:
-    """Parse an LLM rerank reply into 0-based, in-range, de-duplicated
-    indices. An unparseable reply yields ``[]`` (caller falls back)."""
-    numbers: list[int] = []
-    match = re.search(r"\[[^\]]*\]", text)
-    if match is not None:
-        try:
-            parsed = json.loads(match.group())
-            numbers = [int(n) for n in parsed if isinstance(n, int | float)]
-        except (ValueError, TypeError):
-            numbers = []
-    if not numbers:
-        numbers = [int(n) for n in re.findall(r"\d+", text)]
-    seen: set[int] = set()
-    order: list[int] = []
-    for one_based in numbers:
-        index = one_based - 1
-        if 0 <= index < count and index not in seen:
-            seen.add(index)
-            order.append(index)
-    return order
-
-
 def _recall_source(found_by: set[str]) -> str | None:
     """Collapse the set of recall paths that surfaced a chunk into a label:
     ``"both"`` when vector and keyword agreed, else the single path."""
@@ -904,11 +854,6 @@ def _recall_source(found_by: set[str]) -> str | None:
     if found_by:
         return next(iter(found_by))
     return None
-
-
-def _message_text(message: object) -> str:
-    content = getattr(message, "content", "")
-    return content if isinstance(content, str) else str(content)
 
 
 def _coerce_limit(raw: object) -> int:

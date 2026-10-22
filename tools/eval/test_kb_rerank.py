@@ -18,7 +18,8 @@ from kb_rerank import (  # type: ignore[import-not-found]
     build_dashscope_reranker,
 )
 
-from orchestrator.llm.rerank import DashScopeReranker
+from orchestrator.llm.rerank import DashScopeReranker, HTTPDashScopeRerankClient
+from orchestrator.llm.rerank_guard import GuardedRerankClient
 
 
 class _FakeClient:
@@ -138,8 +139,11 @@ def test_build_dashscope_reranker_defaults_to_the_production_model(
     reranker, client = build_dashscope_reranker(cache_path=tmp_path / "c.sqlite")
     assert isinstance(reranker, DashScopeReranker)
     assert reranker.model == DEFAULT_RERANK_MODEL == "qwen3-vl-rerank"
-    assert client.inner is not None
     assert reranker.client is client
+    # B-206 K-7a (L3) — the network client sits behind the production guard
+    # (pacing, 429 retry), inside the cache: a cache hit takes no token.
+    assert isinstance(client.inner, GuardedRerankClient)
+    assert isinstance(client.inner.inner, HTTPDashScopeRerankClient)
 
 
 def test_build_dashscope_reranker_offline_key_has_no_network_client(
