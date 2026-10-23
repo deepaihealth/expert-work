@@ -887,7 +887,7 @@ open("/tmp/b209-photo48.docx", "wb").write(picture_docx(out.getvalue(), before="
 PY
 ```
 
-  先传 `b209-photo48.docx`。判据:ready、`PHOTO-MARKER` 在、`figure_stats.unsupported=1`(这张图超了上限被跳过),控制面日志有 `knowledge.figure_out_of_memory`。再传 `b209-bigtext.docx`。判据:配了图片描述模型时它在图片步骤之前就被拒,立刻 FAILED,`error` 含 `a part of the file unpacks to more than a document may`(单个 XML 部件 > 64 MiB,没占内存);图片描述模型没配(走普通解析)时同时另传一份普通文档,`b209-bigtext.docx` FAILED,`error` 是 `needs more memory than a parse may use` **或** `A process in the process pool was terminated abruptly`(本机实测:C 扩展里分配失败时子进程直接退出,表现为后者;解析池会重建、重试一次),那份普通文档 ready。两种情况都要 RESTARTS 不变、没有 `OOMKilled`。测完把上限改回原值。
+  先传 `b209-photo48.docx`。判据:ready、`PHOTO-MARKER` 在、`figure_stats.unsupported=1`(这张图超了上限被跳过),控制面日志有 `knowledge.figure_out_of_memory`。再传 `b209-bigtext.docx`。判据:配了图片描述模型时它在图片步骤之前就被拒,立刻 FAILED,`error` 含 `a part of the file unpacks to more than a document may`(单个 XML 部件 > 64 MiB,没占内存);图片描述模型没配(走普通解析)时同时另传一份普通文档,`b209-bigtext.docx` FAILED,`error` 是 `needs more memory than a parse may use` **或** `A process in the process pool was terminated abruptly` **或** `text too large`(§48 的单份字数上限:解析进程解析完、在送回主进程前拒收,`error_code=text_too_large`)(本机实测:C 扩展里分配失败时子进程直接退出,表现为后者;解析池会重建、重试一次),那份普通文档 ready。两种情况都要 RESTARTS 不变、没有 `OOMKilled`。测完把上限改回原值。
 
 ## §45 B-206 第 1 步续:K-6 工具说明(#1901)+ K-7a 重排限速 / 重试 / 结果状态
 
