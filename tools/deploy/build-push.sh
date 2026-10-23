@@ -28,6 +28,12 @@
 # generic image. Built WITHOUT them (the default), the image is generic
 # and falls back to token-paste login (no OIDC configured).
 #
+# Mirrors are picked per build (tools/deploy/pick_mirror.py, run in the
+# builder base image so it sees the build's network path): the Aliyun default
+# is kept while it serves >= 1 MiB/s — normal builds unchanged, layer cache
+# intact — and only a slow default makes the build probe the other mirrors
+# and take the fastest. Setting either variable below skips its probe.
+#
 # PyPI mirror (EXPERT_WORK_PYPI_MIRROR): control-plane and credential-proxy
 # get `--build-arg PYPI_MIRROR=<url>`, defaulting to the Aliyun mirror
 # https://mirrors.aliyun.com/pypi/ — 2026-10-16 files.pythonhosted.org ran at
@@ -90,10 +96,16 @@ app_version="${VITE_APP_VERSION:-}"
 app_env="${VITE_APP_ENV:-}"
 build_time="${VITE_BUILD_TIME:-}"
 # PyPI mirror for the Python images — see the header comment. `-` not `:-`:
-# unset means the Aliyun default, set-but-empty means pypi.org.
-pypi_mirror="${EXPERT_WORK_PYPI_MIRROR-https://mirrors.aliyun.com/pypi/}"
+# unset means "probe" (Aliyun kept while fast), set-but-empty means pypi.org.
+DEFAULT_PYPI_MIRROR="https://mirrors.aliyun.com/pypi/"
+pypi_mirror="${EXPERT_WORK_PYPI_MIRROR-}"
 # Debian mirror host for control-plane's builder stage — see the header.
-apt_mirror="${EXPERT_WORK_APT_MIRROR:-mirrors.aliyun.com}"
+DEFAULT_APT_MIRROR="mirrors.aliyun.com"
+apt_mirror="${EXPERT_WORK_APT_MIRROR:-}"
+# The probe runs in the builder stage's base image (already pulled for the
+# build; it carries the CA bundle the host Python may lack). Keep it equal
+# to the `AS builder` FROM of services/control-plane/Dockerfile.
+MIRROR_PROBE_IMAGE="ghcr.io/astral-sh/uv:python3.12-bookworm-slim"
 
 usage() {
     cat >&2 <<EOF
@@ -122,9 +134,9 @@ header comment.
 
 Environment:
   EXPERT_WORK_PYPI_MIRROR  PyPI mirror for control-plane / credential-proxy
-                        (default: https://mirrors.aliyun.com/pypi/; set to empty for pypi.org)
+                        (unset: probe, Aliyun kept while fast; set to empty for pypi.org)
   EXPERT_WORK_APT_MIRROR   Debian mirror host for control-plane's builder stage
-                        (default: mirrors.aliyun.com)
+                        (unset: probe, mirrors.aliyun.com kept while fast)
 EOF
     exit 2
 }
@@ -248,6 +260,35 @@ if [[ "${push}" -eq 1 ]]; then
 fi
 
 IFS=',' read -ra selected <<<"${images}"
+
+# Prints the mirror pick_mirror.py chooses; fails when the probe cannot run.
+pick_mirror() {
+    docker run --rm --platform linux/amd64 --entrypoint python3 \
+        -v "${REPO_ROOT}/tools/deploy/pick_mirror.py:/pick_mirror.py:ro" \
+        -v "${REPO_ROOT}/uv.lock:/uv.lock:ro" \
+        "${MIRROR_PROBE_IMAGE}" /pick_mirror.py "$1" --lock /uv.lock
+}
+case ",${images}," in
+    *,control-plane,* | *,credential-proxy,*)
+        if [[ -z "${EXPERT_WORK_PYPI_MIRROR+x}" ]]; then
+            pypi_mirror="$(pick_mirror pypi)" || {
+                echo "WARN PyPI mirror probe failed; using ${DEFAULT_PYPI_MIRROR}" >&2
+                pypi_mirror="${DEFAULT_PYPI_MIRROR}"
+            }
+        fi
+        ;;
+esac
+case ",${images}," in
+    *,control-plane,*)
+        if [[ -z "${apt_mirror}" ]]; then
+            apt_mirror="$(pick_mirror apt)" || {
+                echo "WARN Debian mirror probe failed; using ${DEFAULT_APT_MIRROR}" >&2
+                apt_mirror="${DEFAULT_APT_MIRROR}"
+            }
+        fi
+        ;;
+esac
+
 for image in "${selected[@]}"; do
     case "${image}" in
         control-plane)
