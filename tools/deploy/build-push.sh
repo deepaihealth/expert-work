@@ -39,6 +39,13 @@
 # download from pypi.org instead, e.g. when the mirror lags behind a version
 # bump and 404s. admin-ui has no Python packages and never gets the arg.
 #
+# Debian mirror (EXPERT_WORK_APT_MIRROR): control-plane's builder stage
+# apt-installs git from this host (default mirrors.aliyun.com). Set it to
+# another mirror host, e.g. `EXPERT_WORK_APT_MIRROR=mirrors.ustc.edu.cn`,
+# when that mirror is slow — 2026-10-23 every mirrors.aliyun.com download
+# (Debian and PyPI alike) ran at ~30 KB/s from this network; pair it with
+# EXPERT_WORK_PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/ in that case.
+#
 # Usage:
 #   tools/deploy/build-push.sh [--images control-plane,admin-ui,credential-proxy] [--tag <tag>] [--push|--no-push] \
 #       [--oidc-issuer <url>] [--oidc-client-id <id>] [--oidc-audience <aud>] \
@@ -85,6 +92,8 @@ build_time="${VITE_BUILD_TIME:-}"
 # PyPI mirror for the Python images — see the header comment. `-` not `:-`:
 # unset means the Aliyun default, set-but-empty means pypi.org.
 pypi_mirror="${EXPERT_WORK_PYPI_MIRROR-https://mirrors.aliyun.com/pypi/}"
+# Debian mirror host for control-plane's builder stage — see the header.
+apt_mirror="${EXPERT_WORK_APT_MIRROR:-mirrors.aliyun.com}"
 
 usage() {
     cat >&2 <<EOF
@@ -114,6 +123,8 @@ header comment.
 Environment:
   EXPERT_WORK_PYPI_MIRROR  PyPI mirror for control-plane / credential-proxy
                         (default: https://mirrors.aliyun.com/pypi/; set to empty for pypi.org)
+  EXPERT_WORK_APT_MIRROR   Debian mirror host for control-plane's builder stage
+                        (default: mirrors.aliyun.com)
 EOF
     exit 2
 }
@@ -241,7 +252,7 @@ for image in "${selected[@]}"; do
     case "${image}" in
         control-plane)
             build_image "control-plane" "${REPO_ROOT}/services/control-plane/Dockerfile" "${REPO_ROOT}" \
-                --build-arg "PYPI_MIRROR=${pypi_mirror}"
+                --build-arg "PYPI_MIRROR=${pypi_mirror}" --build-arg "APT_MIRROR=${apt_mirror}"
             ;;
         admin-ui)
             admin_ui_build_args=()

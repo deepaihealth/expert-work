@@ -31,8 +31,13 @@ WORKDIR /app
 # already built, so the runtime image needs neither git nor network.
 #
 # Aliyun mirror for the same reason infra/sandbox-image/Dockerfile uses
-# one: deb.debian.org 502s partway through from this network.
-RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+# one: deb.debian.org 502s partway through from this network. APT_MIRROR
+# (tools/deploy/build-push.sh: EXPERT_WORK_APT_MIRROR) swaps the host when
+# that mirror is the slow one — 2026-10-23 mirrors.aliyun.com served this
+# network at ~30 KB/s and two releases died here, while Tsinghua / USTC /
+# Huawei Cloud ran at 4-18 MB/s.
+ARG APT_MIRROR=mirrors.aliyun.com
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update -o Acquire::Retries=5 \
     && apt-get install -y -o Acquire::Retries=5 --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
