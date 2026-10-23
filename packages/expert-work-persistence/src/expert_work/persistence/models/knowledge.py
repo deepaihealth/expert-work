@@ -302,7 +302,8 @@ class KnowledgeParseCacheRow(Base):
         ),
         nullable=False,
     )
-    #: ``page_ocr`` (PR-1); ``figure_desc`` / ``figure_ocr`` reserved for PR-2.
+    #: ``page_ocr`` (PR-1); ``figure_desc`` / ``figure_ocr`` (PR-2);
+    #: ``semantic_break`` — the chunker's topic-shift decisions (B-215, 0173).
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     cache_key: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(Text, nullable=False)
@@ -314,7 +315,7 @@ class KnowledgeParseCacheRow(Base):
     __table_args__ = (
         PrimaryKeyConstraint("document_id", "kind", "cache_key", name="knowledge_parse_cache_pkey"),
         CheckConstraint(
-            "kind IN ('page_ocr', 'figure_desc', 'figure_ocr')",
+            "kind IN ('page_ocr', 'figure_desc', 'figure_ocr', 'semantic_break')",
             name="knowledge_parse_cache_kind_enum",
         ),
     )

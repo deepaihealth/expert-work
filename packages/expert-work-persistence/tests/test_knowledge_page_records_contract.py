@@ -190,6 +190,33 @@ async def _cached(store: KnowledgeStore, tenant: UUID, document: UUID) -> dict[s
     )
 
 
+async def test_the_chunkers_topic_decisions_are_cached_apart_from_readings(
+    store: KnowledgeStore,
+) -> None:
+    # B-215 (migration 0173): one row per document and embedding model.
+    tenant = uuid4()
+    document_id, _ = await _document(store, tenant)
+    decisions = {"breaks": ["0123456789abcdef"], "joins": ["fedcba9876543210"]}
+    await store.put_parse_cache(
+        tenant_id=tenant,
+        document_id=document_id,
+        kind="semantic_break",
+        key="v1:qwen/text-embedding-v4",
+        model="qwen/text-embedding-v4",
+        result=decisions,
+    )
+    key = ["v1:qwen/text-embedding-v4"]
+    assert await store.get_parse_cache(
+        tenant_id=tenant, document_id=document_id, kind="semantic_break", keys=key
+    ) == {key[0]: ParseCacheEntry(model="qwen/text-embedding-v4", result=decisions)}
+    assert (
+        await store.get_parse_cache(
+            tenant_id=tenant, document_id=document_id, kind="page_ocr", keys=key
+        )
+        == {}
+    )
+
+
 async def test_parse_cache_is_per_document_and_a_later_reading_replaces_it(
     store: KnowledgeStore,
 ) -> None:

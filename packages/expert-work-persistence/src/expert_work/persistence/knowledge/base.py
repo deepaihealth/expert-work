@@ -121,8 +121,9 @@ class ClaimedIngestion:
 
 
 #: B-209 §5.5 —— what a ``knowledge_parse_cache`` row holds: a scanned page's
-#: raw reading (PR-1); a figure's description / text (reserved for PR-2).
-ParseCacheKind = Literal["page_ocr", "figure_desc", "figure_ocr"]
+#: raw reading (PR-1); a figure's description / text (PR-2); the semantic
+#: chunker's topic-shift decisions for one embedding model (B-215).
+ParseCacheKind = Literal["page_ocr", "figure_desc", "figure_ocr", "semantic_break"]
 
 
 @dataclass(frozen=True)

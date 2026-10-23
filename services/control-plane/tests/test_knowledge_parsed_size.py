@@ -631,7 +631,7 @@ async def test_the_recovery_worker_fails_a_refused_document_on_the_first_attempt
 
 
 # ---------------------------------------------------------------------------
-# The budget: what is chunked / embedded / stored at once
+# The budget: what is embedded / stored at once
 # ---------------------------------------------------------------------------
 
 
@@ -725,7 +725,8 @@ async def test_the_budget_is_returned_when_an_ingest_fails() -> None:
 
 
 class _GatedEmbedder:
-    """FakeEmbedder whose first call waits for ``gate``."""
+    """FakeEmbedder whose first call for chunks (their texts carry the
+    document title; topic detection embeds bare blocks) waits for ``gate``."""
 
     def __init__(self) -> None:
         self.gate = asyncio.Event()
@@ -733,13 +734,13 @@ class _GatedEmbedder:
         self._first = True
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
-        if self._first:
+        if self._first and texts and texts[0].startswith("[Document: "):
             self._first = False
             await self.gate.wait()
         return await self._inner.embed(texts, tenant_id=tenant_id)
 
 
-async def test_concurrent_ingests_wait_for_the_budget_after_parsing(
+async def test_concurrent_ingests_wait_for_the_budget_after_chunking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = InMemoryKnowledgeStore()
@@ -759,9 +760,9 @@ async def test_concurrent_ingests_wait_for_the_budget_after_parsing(
     real = ingestion.admitted
 
     @asynccontextmanager
-    async def spy(chars: int) -> AsyncIterator[None]:
+    async def spy(chars: int, chunks: int = 0) -> AsyncIterator[None]:
         waiting.append(chars)
-        async with real(chars):
+        async with real(chars, chunks):
             inside.append(chars)
             yield
 
@@ -774,11 +775,13 @@ async def test_concurrent_ingests_wait_for_the_budget_after_parsing(
         while len(waiting) < 2:
             await asyncio.sleep(0.01)
     await _settle()
-    assert len(inside) == 1  # both parsed; only one is chunked / embedded at a time
+    # Both chunked (outside the budget: the text and a window of block
+    # vectors); only one is embedded / stored at a time (B-214).
+    assert len(inside) == 1
     documents = [await store.get_document(tenant_id=_TENANT, document_id=i) for i in ids]
     assert {doc.stage for doc in documents if doc is not None} == {
+        IngestStage.EMBEDDING,
         IngestStage.CHUNKING,
-        IngestStage.PARSING,
     }
     embedder.gate.set()
     await runner.drain()

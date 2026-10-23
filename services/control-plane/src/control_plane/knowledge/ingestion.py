@@ -34,15 +34,22 @@ import hashlib
 import logging
 import multiprocessing
 import weakref
+from array import array
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import httpx
 
-from control_plane.knowledge.chunking import chunk_markdown_semantic
+from control_plane.knowledge.break_cache import load_break_memo, store_break_memo
+from control_plane.knowledge.chunk_rows import ChunkRows, compact
+from control_plane.knowledge.chunking import (
+    TextChunk,
+    chunk_markdown_semantic,
+    structural_chunk_count,
+)
 from control_plane.knowledge.parse_workers import (
     FIGURE_POOL,
     FIGURE_POOL_WORKERS,
@@ -53,6 +60,7 @@ from control_plane.knowledge.parse_workers import (
 from control_plane.knowledge.parsed_size import (
     admitted,
     check_parsed_size,
+    ensure_chunk_count,
     max_parsed_chars,
     parse_within_cap,
     raw_bytes_held,
@@ -140,6 +148,12 @@ CONTENT_MISSING_ERROR = "original file not retained; re-upload required"
 #: so the failure handler can record *why* without the exception changing
 #: type (callers such as the eval runner match on the original type).
 _ERROR_CODE_ATTR = "knowledge_error_code"
+
+#: Chunks embedded per call while ingesting (B-214). The embedder's vectors
+#: arrive as Python floats (~32 KiB each) and are compacted as each window
+#: comes back, so a document never holds all of them in that form at once.
+#: A multiple of the usual embedding batch sizes: the requests sent are the same.
+CHUNK_EMBED_WINDOW = 200
 
 
 def failure_code(exc: BaseException) -> IngestErrorCode:
@@ -550,10 +564,7 @@ async def ingest_markdown(
     """
     check_parsed_size(markdown)
     model_key, pinned = await pin_embedder(embedder, tenant_id=tenant_id)
-    async with (
-        admitted(len(markdown)),
-        billed_embeddings(usage, tenant_id=tenant_id, model_key=model_key),
-    ):
+    async with billed_embeddings(usage, tenant_id=tenant_id, model_key=model_key):
         return await _chunk_embed_store(
             store=store,
             pinned=pinned,
@@ -588,15 +599,27 @@ async def _chunk_embed_store(
     retrying = _BackoffEmbedder(pinned)
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.CHUNKING, **stage_args)
+    text = strip_lone_surrogates(markdown)
+    sizes = {"max_tokens": chunk_max_tokens, "overlap_tokens": chunk_overlap_tokens}
+    # B-214: memory follows the chunk count. Refused before anything is
+    # embedded when even the structural chunks are too many; topic shifts
+    # only split further, so the semantic count is checked again below.
+    ensure_chunk_count(
+        structural_chunk_count(text, **sizes, plain_text=plain_text, doc_title=doc_title)
+    )
+    cache = {"tenant_id": tenant_id, "document_id": document_id, "model_key": model_key}
+    memo = await load_break_memo(store, **cache)
     pieces = await chunk_markdown_semantic(
-        strip_lone_surrogates(markdown),
-        max_tokens=chunk_max_tokens,
-        overlap_tokens=chunk_overlap_tokens,
+        text,
+        **sizes,
         embedder=retrying,
         tenant_id=tenant_id,
         plain_text=plain_text,
         doc_title=doc_title,
+        memo=memo,
     )
+    await store_break_memo(store, **cache, memo=memo)
+    ensure_chunk_count(len(pieces))
     if not pieces:
         _ensure_written(
             await store.replace_chunks(
@@ -605,6 +628,35 @@ async def _chunk_embed_store(
             document_id,
         )
         return 0
+    # Chunked outside the budget (that holds the text and one window of block
+    # vectors); embedded and stored inside it, weighed by its chunks.
+    async with admitted(len(markdown), len(pieces)):
+        return await _embed_store(
+            store,
+            retrying,
+            pieces=pieces,
+            tenant_id=tenant_id,
+            document_id=document_id,
+            kb_id=kb_id,
+            generation=generation,
+            doc_title=doc_title,
+            model_key=model_key,
+        )
+
+
+async def _embed_store(
+    store: KnowledgeStore,
+    retrying: Embedder,
+    *,
+    pieces: Sequence[TextChunk],
+    tenant_id: UUID,
+    document_id: UUID,
+    kb_id: UUID,
+    generation: int | None,
+    doc_title: str | None,
+    model_key: str | None,
+) -> int:
+    stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.EMBEDDING, **stage_args)
     texts = [chunk_retrieval_text(piece.heading_path, piece.body, doc_title) for piece in pieces]
     hashes = [content_hash(text) for text in texts]
@@ -617,22 +669,16 @@ async def _chunk_embed_store(
         hashes=hashes,
         model_key=model_key,
     )
-    chunks = [
-        KnowledgeChunk(
-            id=uuid4(),
-            tenant_id=tenant_id,
-            kb_id=kb_id,
-            document_id=document_id,
-            chunk_index=index,
-            content=piece.body,
-            heading_path=piece.heading_path,
-            doc_title=doc_title,
-            content_hash=digest,
-            embedding=vectors[digest],
-            embedding_model=model_key,
-        )
-        for index, (piece, digest) in enumerate(zip(pieces, hashes, strict=True))
-    ]
+    chunks = ChunkRows(
+        pieces=pieces,
+        hashes=hashes,
+        vectors=vectors,
+        tenant_id=tenant_id,
+        kb_id=kb_id,
+        document_id=document_id,
+        doc_title=doc_title,
+        model_key=model_key,
+    )
     await _advance(store, stage=IngestStage.INDEXING, **stage_args)
     _ensure_written(
         await store.replace_chunks(
@@ -652,11 +698,13 @@ async def _vectors_for(
     texts: Sequence[str],
     hashes: Sequence[str],
     model_key: str | None,
-) -> dict[str, tuple[float, ...]]:
+) -> dict[str, array[float]]:
     """One vector per distinct hash: the document's stored vectors for
     unchanged chunks made by the same model, fresh embeddings for the rest
-    (each distinct text once). No known model → nothing is reused."""
-    vectors = (
+    (each distinct text once). No known model → nothing is reused. Kept
+    compact (:func:`~control_plane.knowledge.chunk_rows.compact`): there is
+    one per chunk."""
+    stored = (
         await store.chunk_embeddings_by_hash(
             tenant_id=tenant_id,
             document_id=document_id,
@@ -666,12 +714,18 @@ async def _vectors_for(
         if model_key is not None
         else {}
     )
+    vectors = {digest: compact(vector) for digest, vector in stored.items()}
+    del stored
     missing = dict(zip(hashes, texts, strict=True))
     for digest in vectors:
         missing.pop(digest, None)
-    if missing:
-        fresh = await embedder.embed(list(missing.values()), tenant_id=tenant_id)
-        vectors.update(zip(missing, fresh, strict=True))
+    pending = list(missing.items())
+    for start in range(0, len(pending), CHUNK_EMBED_WINDOW):
+        window = pending[start : start + CHUNK_EMBED_WINDOW]
+        fresh = await embedder.embed([text for _, text in window], tenant_id=tenant_id)
+        vectors.update(
+            (digest, compact(vector)) for (digest, _), vector in zip(window, fresh, strict=True)
+        )
     # The only place a live check can see reuse: an embedding API returns the
     # same vector for the same text, so comparing stored vectors cannot tell.
     logger.info(

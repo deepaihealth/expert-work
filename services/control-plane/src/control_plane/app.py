@@ -2099,7 +2099,10 @@ def create_app(
                     max_vm_mb=resolved_settings.knowledge_parse_worker_max_vm_mb,
                     figure_max_vm_mb=resolved_settings.knowledge_figure_worker_max_vm_mb,
                 )
-                configure_parsed_size(max_chars=resolved_settings.knowledge_document_max_chars)
+                configure_parsed_size(
+                    max_chars=resolved_settings.knowledge_document_max_chars,
+                    max_chunks=resolved_settings.knowledge_document_max_chunks,
+                )
                 configure_raw_bytes(
                     budget=resolved_settings.knowledge_ingest_raw_bytes_budget,
                     upload_max_bytes=resolved_settings.knowledge_document_max_bytes,

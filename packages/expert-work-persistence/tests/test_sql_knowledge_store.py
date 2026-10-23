@@ -23,6 +23,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge import DuplicateKnowledgeBaseError, text_search
+from expert_work.persistence.knowledge import sql as sql_module
 from expert_work.persistence.knowledge.sql import _kb_keyword_tsquery
 from expert_work.persistence.knowledge.text_search import KbKeywordQuery
 from expert_work.persistence.models import KnowledgeBaseRow
@@ -127,6 +128,36 @@ async def test_replace_chunks_and_search_orders_by_cosine(sql_store: SqlStoreFix
         )
         assert [h.content for h in hits] == ["east", "ne", "north"]
         assert len(hits[0].embedding) == EMBEDDING_DIM
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_replace_chunks_writes_every_batch_in_order(
+    sql_store: SqlStoreFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B-214: rows are built and flushed a batch at a time (so a document's
+    # rows are never all in memory at once) — still all of them, in one swap.
+    monkeypatch.setattr(sql_module, "_CHUNK_INSERT_BATCH", 3)
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
+        chunks = [
+            _make_chunk(tenant, base.id, doc.id, i, f"part {i}", _vec(0.1 * i, 1.0 / (i + 1)))
+            for i in range(7)
+        ]
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=chunks[:2])
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=chunks)
+        stored, total = await store.list_chunks(tenant_id=tenant, document_id=doc.id, limit=50)
+        assert total == 7
+        assert [c.content for c in stored] == [f"part {i}" for i in range(7)]
+        hits = await store.search(
+            tenant_id=tenant, kb_ids=[base.id], query_embedding=_vec(0.6, 1.0 / 7), limit=1
+        )
+        assert hits[0].content == "part 6"
+        assert hits[0].embedding == pytest.approx(chunks[6].embedding)
     finally:
         await engine.dispose()
 

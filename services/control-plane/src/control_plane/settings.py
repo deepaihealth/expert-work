@@ -522,15 +522,20 @@ class Settings(BaseSettings):
     knowledge_document_max_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
 
     #: Longest parsed text one knowledge document may have, in characters —
-    #: and the most the server chunks / embeds / stores at once over all the
-    #: documents it is ingesting (``knowledge/parsed_size.py``). A compressed
-    #: upload can unpack to far more text than its size suggests, and every
-    #: character costs server memory after parsing: about 190 MiB per million
-    #: Chinese characters (production image, 2026-10-23), so the default keeps
-    #: the server's extra memory under ~0.5 GiB per pod (measured 463 MiB for one
-    #: document at the cap, 503 MiB for four at once). Over the cap a document
+    #: and the most the server embeds / stores at once over all the documents
+    #: it is ingesting (``knowledge/parsed_size.py``; a document also weighs its
+    #: chunks, see ``knowledge_document_max_chunks``). A compressed upload can
+    #: unpack to far more text than its size suggests. Over the cap a document
     #: fails with ``error_code=text_too_large``; raise it with the pod's memory.
     knowledge_document_max_chars: int = Field(default=2_500_000, gt=0)
+
+    #: Per-document cap on chunks (B-214), and with the characters the weight a
+    #: document holds of the ingest budget above: the server's memory for an
+    #: ingest follows its chunks (~11 KiB each + 20 MiB, measured 10-23), and
+    #: a document of short headed entries makes a chunk every ~43 characters —
+    #: 2.5M characters of those would be ~58,000. Over the cap a document fails
+    #: with ``error_code=too_many_chunks``, before any chunk is embedded.
+    knowledge_document_max_chunks: int = Field(default=40_000, gt=0)
 
     #: Original upload bytes the server holds at once, over every document it
     #: is ingesting (upload path and recovery worker together). A claim holds

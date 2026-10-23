@@ -582,6 +582,8 @@ export interface TranslationKeys {
     pending_failed_hint: string;
     error_text_too_large: string;
     error_text_too_large_unknown: string;
+    error_too_many_chunks: string;
+    error_too_many_chunks_unknown: string;
     discard_pending: string;
     discard_pending_confirm_title: string;
     discard_pending_confirm_body: string;
@@ -3952,6 +3954,10 @@ const en: TranslationKeys = {
       "Too much text: {{size}} characters, over the per-document limit of {{limit}}. Split it into smaller files and upload them separately.",
     error_text_too_large_unknown:
       "Too much text: over the per-document limit. Split it into smaller files and upload them separately.",
+    error_too_many_chunks:
+      "Too many segments: {{size}}, over the per-document limit of {{limit}}. Split it into smaller files and upload them separately.",
+    error_too_many_chunks_unknown:
+      "Too many segments: over the per-document limit. Split it into smaller files and upload them separately.",
     discard_pending: "Discard new version",
     discard_pending_confirm_title: "Discard the new version of \"{{name}}\"?",
     discard_pending_confirm_body: "The newly uploaded file is deleted and retrieval keeps using the previous version.",
