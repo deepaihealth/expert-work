@@ -37,7 +37,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, column_property, mapped_column
 
 from expert_work.persistence.base import Base
 from expert_work.persistence.embedding import EMBEDDING_DIM
@@ -144,13 +144,24 @@ class KnowledgeDocumentRow(Base):
     )
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    #: Both byte slots hold a whole upload (up to 50 MiB each) and are deferred
+    #: with raiseload: loading a document never reads them, and touching one on
+    #: a loaded row raises. The bytes are read by explicit column selects only
+    #: (``get_document_content``, the ingest claim); ``has_content`` /
+    #: ``has_pending`` say whether a slot is filled without reading it.
+    content: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True, deferred=True, deferred_raiseload=True
+    )
     content_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: The new version being ingested (migration ``0164``). ``content`` keeps
     #: the version whose chunks are serving; a successful ingest promotes the
     #: pending bytes into it, a failed one leaves both untouched.
-    pending_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    pending_content: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True, deferred=True, deferred_raiseload=True
+    )
     pending_content_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    has_content: Mapped[bool] = column_property(content.is_not(None))
+    has_pending: Mapped[bool] = column_property(pending_content.is_not(None))
     #: Model v2 (migration ``0165``). ``doc_seq`` comes from the per-tenant
     #: ``knowledge_doc_seq`` counter on insert and survives re-uploads.
     doc_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

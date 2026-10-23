@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -17,6 +18,7 @@ from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import DocumentStatus, KnowledgeChunk
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge import RerankRanking
@@ -793,6 +795,57 @@ async def test_reingest_without_bytes_returns_409(full_setup: FullSetup) -> None
     )
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{doc.id}/reingest")
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_reingest_without_serving_bytes_redrives_the_pending_upload(
+    full_setup: FullSetup,
+) -> None:
+    client, runner, store = full_setup
+    await client.post("/v1/knowledge/bases", json={"name": "kb"})
+    kb_id = UUID((await client.get("/v1/knowledge/bases/kb")).json()["id"])
+    # A legacy document: chunks serving, original bytes never kept.
+    doc = await store.upsert_document(tenant_id=_TENANT, kb_id=kb_id, filename="legacy.md")
+    claim = await store.claim_document(
+        tenant_id=_TENANT,
+        document_id=doc.id,
+        now=datetime.now(UTC),
+        lease_seconds=60,
+        max_attempts=5,
+    )
+    assert claim is not None and claim.content is None
+    chunk = KnowledgeChunk(
+        id=uuid4(),
+        tenant_id=_TENANT,
+        kb_id=kb_id,
+        document_id=doc.id,
+        chunk_index=0,
+        content="old text",
+        embedding=(1.0,),
+    )
+    assert await store.replace_chunks(
+        tenant_id=_TENANT, document_id=doc.id, chunks=[chunk], generation=claim.generation
+    )
+    assert await store.set_document_status(
+        tenant_id=_TENANT,
+        document_id=doc.id,
+        status=DocumentStatus.READY,
+        chunk_count=1,
+        generation=claim.generation,
+    )
+    # Its re-upload waits in the pending slot; re-ingest drives that one.
+    await store.upsert_document(
+        tenant_id=_TENANT,
+        kb_id=kb_id,
+        filename="legacy.md",
+        content=b"# L\n\nNew text.",
+        content_sha256="s",
+    )
+    resp = await client.post(f"/v1/knowledge/bases/kb/documents/{doc.id}/reingest")
+    assert resp.status_code == 202
+    await runner.drain()
+    row = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert (row["status"], row["has_pending"]) == ("ready", False)
 
 
 @pytest.mark.asyncio

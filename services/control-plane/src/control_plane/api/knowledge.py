@@ -330,8 +330,7 @@ async def _require_redrivable(
     document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
     if document is None or document.kb_id != base.id:
         raise HTTPException(status_code=404, detail="document not found")
-    content = await store.get_document_content(tenant_id=tenant_id, document_id=document_id)
-    if content is None and not document.has_pending:
+    if not document.has_content and not document.has_pending:
         # Legacy document predating retained bytes — cannot re-drive.
         raise HTTPException(
             status_code=409,

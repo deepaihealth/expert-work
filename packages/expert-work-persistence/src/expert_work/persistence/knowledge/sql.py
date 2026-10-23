@@ -155,6 +155,29 @@ def _claimable(now: datetime, max_attempts: int) -> ColumnElement[bool]:
     )
 
 
+#: What a claim's ``RETURNING`` reads: the document's identity and counters,
+#: and the bytes to ingest — the pending upload when there is one, else the
+#: serving version, with its hash. The other byte slot is never read.
+_CLAIM_COLUMNS = (
+    KnowledgeDocumentRow.id,
+    KnowledgeDocumentRow.tenant_id,
+    KnowledgeDocumentRow.kb_id,
+    KnowledgeDocumentRow.filename,
+    KnowledgeDocumentRow.attempts,
+    KnowledgeDocumentRow.ingest_generation,
+    func.coalesce(KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content).label(
+        "content"
+    ),
+    case(
+        (
+            KnowledgeDocumentRow.pending_content.is_not(None),
+            KnowledgeDocumentRow.pending_content_sha256,
+        ),
+        else_=KnowledgeDocumentRow.content_sha256,
+    ).label("content_sha256"),
+)
+
+
 def _enum_or[E: StrEnum](enum: type[E], value: str | None, default: E | None) -> E | None:
     """Read a free-text enum column without failing on a value this version
     does not know (written by a newer release before a rollback): unknown →
@@ -205,7 +228,8 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         chunk_count=row.chunk_count,
         attempts=row.attempts,
         ingest_generation=row.ingest_generation,
-        has_pending=row.pending_content is not None,
+        has_pending=row.has_pending,
+        has_content=row.has_content,
         doc_seq=row.doc_seq,
         title=row.title,
         source_type=_enum_or(DocumentSourceType, row.source_type, DocumentSourceType.FILE)
@@ -793,7 +817,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                 existing.claimed_at = None
                 existing.lease_until = None
                 if content is not None:
-                    if existing.content is None and existing.chunk_count == 0:
+                    if not existing.has_content and existing.chunk_count == 0:
                         existing.content = content  # nothing serving yet
                         existing.content_sha256 = content_sha256
                         existing.size_bytes = len(content)
@@ -886,26 +910,22 @@ class SqlKnowledgeStore(KnowledgeStore):
         lease_until = now + timedelta(seconds=lease_seconds)
         async with self._sf() as session:
             row = (
-                (
-                    await session.execute(
-                        update(KnowledgeDocumentRow)
-                        .where(
-                            KnowledgeDocumentRow.tenant_id == tenant_id,
-                            KnowledgeDocumentRow.id == document_id,
-                            _claimable(now, max_attempts),
-                        )
-                        .values(
-                            status=DocumentStatus.PROCESSING.value,
-                            claimed_at=now,
-                            lease_until=lease_until,
-                            attempts=KnowledgeDocumentRow.attempts + 1,
-                        )
-                        .returning(KnowledgeDocumentRow)
+                await session.execute(
+                    update(KnowledgeDocumentRow)
+                    .where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id == document_id,
+                        _claimable(now, max_attempts),
                     )
+                    .values(
+                        status=DocumentStatus.PROCESSING.value,
+                        claimed_at=now,
+                        lease_until=lease_until,
+                        attempts=KnowledgeDocumentRow.attempts + 1,
+                    )
+                    .returning(*_CLAIM_COLUMNS)
                 )
-                .scalars()
-                .first()
-            )
+            ).first()
             if row is None:
                 await session.commit()
                 return None
@@ -935,29 +955,26 @@ class SqlKnowledgeStore(KnowledgeStore):
                 await session.commit()
                 return []
             rows = (
-                (
-                    await session.execute(
-                        update(KnowledgeDocumentRow)
-                        .where(KnowledgeDocumentRow.id.in_(candidate_ids))
-                        .values(
-                            status=DocumentStatus.PROCESSING.value,
-                            claimed_at=now,
-                            lease_until=lease_until,
-                            attempts=KnowledgeDocumentRow.attempts + 1,
-                        )
-                        .returning(KnowledgeDocumentRow)
+                await session.execute(
+                    update(KnowledgeDocumentRow)
+                    .where(KnowledgeDocumentRow.id.in_(candidate_ids))
+                    .values(
+                        status=DocumentStatus.PROCESSING.value,
+                        claimed_at=now,
+                        lease_until=lease_until,
+                        attempts=KnowledgeDocumentRow.attempts + 1,
                     )
+                    .returning(*_CLAIM_COLUMNS)
                 )
-                .scalars()
-                .all()
-            )
+            ).all()
             claims = [await self._build_claim(session, row.tenant_id, row) for row in rows]
             await session.commit()
             return claims
 
     async def _build_claim(
-        self, session: AsyncSession, tenant_id: UUID, row: KnowledgeDocumentRow
+        self, session: AsyncSession, tenant_id: UUID, row: Row[Any]
     ) -> ClaimedIngestion:
+        """``row``: a :data:`_CLAIM_COLUMNS` row."""
         params = (
             await session.execute(
                 select(
@@ -971,14 +988,13 @@ class SqlKnowledgeStore(KnowledgeStore):
             if params is not None
             else (DEFAULT_CHUNK_MAX_TOKENS, DEFAULT_CHUNK_OVERLAP_TOKENS)
         )
-        pending = row.pending_content is not None
         return ClaimedIngestion(
             tenant_id=tenant_id,
             document_id=row.id,
             kb_id=row.kb_id,
             filename=row.filename,
-            content=row.pending_content if pending else row.content,
-            content_sha256=row.pending_content_sha256 if pending else row.content_sha256,
+            content=row.content,
+            content_sha256=row.content_sha256,
             chunk_max_tokens=chunk_max,
             chunk_overlap_tokens=chunk_overlap,
             attempts=row.attempts,
@@ -1058,7 +1074,7 @@ class SqlKnowledgeStore(KnowledgeStore):
             ).scalar_one_or_none()
             if row is None:
                 return None
-            if row.pending_content is None:
+            if not row.has_pending:
                 await session.commit()
                 return _to_document(row)
             serving = row.chunk_count > 0
