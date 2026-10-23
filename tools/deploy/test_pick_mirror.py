@@ -117,15 +117,19 @@ def test_exists(server: str) -> None:
     assert not exists(f"{server}/missing")
 
 
+def _lock_entry(path: str, size: int, uploaded: str) -> str:
+    return (
+        f'{{ url = "https://files.pythonhosted.org/packages/{path}", hash = "sha256:0", '
+        f'size = {size}, upload-time = "{uploaded}" }}'
+    )
+
+
 def test_lock_probe_files_times_a_big_file_and_checks_the_newest() -> None:
     lock = "\n".join(
         [
-            '{ url = "https://files.pythonhosted.org/packages/aa/small-1.0.whl", '
-            'hash = "sha256:0", size = 1000, upload-time = "2026-10-20T00:00:00Z" }',
-            '{ url = "https://files.pythonhosted.org/packages/bb/big-2.0.whl", hash = "sha256:1", '
-            'size = 9000000, upload-time = "2025-01-01T00:00:00Z" }',
-            '{ url = "https://files.pythonhosted.org/packages/cc/huge-3.0.whl", hash = "sha256:2", '
-            'size = 90000000, upload-time = "2025-01-01T00:00:00Z" }',
+            _lock_entry("aa/small-1.0.whl", 1000, "2026-10-20T00:00:00Z"),
+            _lock_entry("bb/big-2.0.whl", 9000000, "2025-01-01T00:00:00Z"),
+            _lock_entry("cc/huge-3.0.whl", 90000000, "2025-01-01T00:00:00Z"),
         ]
     )
     assert lock_probe_files(lock) == ("packages/bb/big-2.0.whl", "packages/aa/small-1.0.whl")
