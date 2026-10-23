@@ -1,6 +1,6 @@
-"""迁移 0170 —— B-209 PR-2:文档行上的图片计数(``figure_stats``)与像素哈希(``figure_hashes``)。
+"""迁移 0172 —— B-209 PR-2:文档行上的图片计数(``figure_stats``)与像素哈希(``figure_hashes``)。
 
-在升级前的版本(0169)上灌一份文档,再升到 head:旧行两列为空(改前入库的文档不报图片数),
+在升级前的版本(0171)上灌一份文档,再升到 head:旧行两列为空(改前入库的文档不报图片数),
 新值能写能读;降级把两列删掉、再升回来。用容器里另建的库(共享库会被别的测试升 / 降级)。
 """
 
@@ -19,8 +19,8 @@ from testcontainers.postgres import PostgresContainer
 pytestmark = pytest.mark.integration
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
-_DB = "migration_0170_test"
-_BEFORE = "0169_kb_scan_recognition"
+_DB = "migration_0172_test"
+_BEFORE = "0171_kb_rerank_threshold_model"
 
 
 def _sync_dsn(container: PostgresContainer, database: str | None = None) -> str:

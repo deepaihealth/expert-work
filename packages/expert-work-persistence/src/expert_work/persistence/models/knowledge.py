@@ -177,7 +177,7 @@ class KnowledgeDocumentRow(Base):
     page_stats: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB(none_as_null=True), nullable=True
     )
-    #: B-209 PR-2 (migration ``0170``) — figure counts of the latest ingest,
+    #: B-209 PR-2 (migration ``0172``) — figure counts of the latest ingest,
     #: and the pixel hashes of its figures (the tenant-wide repeated-image
     #: filter counts documents by them; deferred — only that query reads them).
     figure_stats: Mapped[dict[str, Any] | None] = mapped_column(

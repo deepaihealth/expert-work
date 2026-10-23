@@ -826,7 +826,7 @@ rep.save("/tmp/b209-logo3.pdf")
 PY
 ```
 
-- [ ] **44.1 迁移**:`SELECT version_num FROM alembic_version` 为 `0170_kb_document_figures`;`SELECT column_name, data_type FROM information_schema.columns WHERE table_name='knowledge_document' AND column_name IN ('figure_stats','figure_hashes')`。判据:两列都在(`jsonb` / `ARRAY`),旧文档两列为空。
+- [ ] **44.1 迁移**:`SELECT version_num FROM alembic_version` 为 `0172_kb_document_figures`;`SELECT column_name, data_type FROM information_schema.columns WHERE table_name='knowledge_document' AND column_name IN ('figure_stats','figure_hashes')`。判据:两列都在(`jsonb` / `ARRAY`),旧文档两列为空。
 - [ ] **44.2 混合 PDF 的插图插在原位**:任一临时库上传 `b209-figures.pdf`。判据:① 文档 ready;列表显示「已识别 1 页」**和**「已描述 2 张图」;② 分段预览里第 1 页的 `> 〔图 …〕` 引用块排在 `TEXT-ABOVE-MARKER` 与 `TEXT-BELOW-MARKER` 之间(不在页尾);第 2 页(扫描页)的图表引用块排在 `SCAN-WITH-CHART-MARKER` 之后、带 `〔图表数据〕` 和 120 / 180 / 150 / 240;③ `GET …/documents/{id}/pages` 两页都是 `figures_kept=1`、`figures_described=1`;④ 文档 `figure_stats` 为 `extracted=2, described=2`,其余 0。**没修好时**:第 1 页的图整张消失,扫描页只有标题文字。
 - [ ] **44.3 带图 Word / 纯图片 Word / 纯图片 PPT**:上传 `b209-picture.docx`、`b209-picture-only.docx`、`b209-picture-only.pptx`。判据:① 三份都 ready;② 分段里没有 `data:image`、没有 `![`;③ `b209-picture.docx` 的引用块在 `WORD-BEFORE-MARKER` 与 `WORD-AFTER-MARKER` 之间;④ 两份纯图片文件各一段,内容就是图片描述引用块,`figure_stats.described=1`。**没修好时**:纯图片文件「成功」入库成一段 `![](data:image/png;base64...)` / `![Picture 2](Picture2.jpg)` 垃圾段。
 - [ ] **44.4 原图显示**:打开 44.2 文档的分段预览。判据:每个 `〔图 …〕` 引用块右侧有原图缩略图,点开可放大;浏览器开发者工具里请求 `GET /v1/knowledge/bases/{库}/documents/{文档}/figures/{id}` 回 200、`content-type: image/jpeg`、`x-content-type-options: nosniff`、`cache-control: private, no-cache`、带 `etag`;刷新页面同一请求回 304(浏览器带 `If-None-Match`)。检索测试 / 智能体看到的只有文字。

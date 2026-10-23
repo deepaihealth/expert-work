@@ -1,4 +1,4 @@
-"""0170 — 知识库文档内图片(B-209 PR-2):图片计数与像素哈希。
+"""0172 — 知识库文档内图片(B-209 PR-2):图片计数与像素哈希。
 
 * ``knowledge_document.figure_stats``(JSONB,可空):这一份文档里的图片抽出 / 过滤 / 截掉 /
   无法解码 / 已描述 / 失败 / 待描述各多少张(列表与详情的「已描述 N 张图」)。``None`` = 改前
@@ -13,8 +13,8 @@
 
 expand-only:新列可空、旧镜像不读;回滚不需要 downgrade。
 
-Revision ID: 0170_kb_document_figures
-Revises: 0169_kb_scan_recognition
+Revision ID: 0172_kb_document_figures
+Revises: 0171_kb_rerank_threshold_model
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
-revision: str = "0170_kb_document_figures"
-down_revision: str | Sequence[str] | None = "0169_kb_scan_recognition"
+revision: str = "0172_kb_document_figures"
+down_revision: str | Sequence[str] | None = "0171_kb_rerank_threshold_model"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
