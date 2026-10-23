@@ -30,7 +30,9 @@ jobs:
   admin-ui:
     name: admin-ui (typecheck + test + build)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Green runs take 9.4-9.6 min (vitest alone ~7.5), so 10 cancelled
+    # passing runs right after the docs-site build finished.
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: apps/admin-ui
